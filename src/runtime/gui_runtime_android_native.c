@@ -1,43 +1,4 @@
-/* gui_runtime_android_native.c -- NativeActivity window/event/present shell
- * (ZAN_GUI_ANDROID_NATIVE).
- *
- * Part of the gui_runtime translation unit: #include'd by gui_runtime.c in
- * a fixed order; not compiled standalone. Plays the role gui_runtime_sdl.c
- * owns the zan_gui_* window/event/present exports for Android (gui_runtime_ohos.c
- * plays the same role for HAP builds).
- *
- * The APK shell is android.app.NativeActivity (a framework class -- zero
- * Java activity code). NDK's android_native_app_glue hosts the app thread:
- * the shell's ANativeActivity_onCreate is provided by the glue archive
- * (linked into libmain.so alongside the module), which spawns the thread
- * that runs android_main(); that thread pumps ALooper for lifecycle
- * commands and the AInputQueue, translates them into the same flat event
- * ring the OHOS shell uses, and blocks in android_main until the Zan
- * program's main() returns. All GL/EGL work happens on this app thread
- * (present) -- input events arrive on the same thread via the looper, so
- * there is no cross-thread GL hazard and no need for SDL's event-watch
- * queue dance.
- *
- * Touch gesture synthesis (slop->drag->wheel, tap->click, fling coast) is
- * a port of the SDL shell's finger layer via the OHOS shell's version, so
- * all three phones scroll identically.
- *
- * Present goes through EGL: the composed CPU surface uploads as one
- * texture (dirty rects on the subrect path) and draws over the attached
- * ANativeWindow. Lifecycle surface loss (APP_CMD_TERM_WINDOW, every
- * background cycle) marks detached; present no-ops until the next
- * APP_CMD_INIT_WINDOW, which pushes the repaint-wake event.
- *
- * IME: NativeActivity offers show/hide soft input natively
- * (ANativeActivity_showSoftInput), but IMEs that commit through
- * commitText (every CJK keyboard, most Latin ones) never produce key
- * events a NativeActivity sees. The apk-shell dex carries dev.zan.app.ZanIme
- * -- a hidden 1px view whose InputConnection receives the soft keyboard's
- * commit stream and hands it to Java_dev_zan_app_ZanIme_zanCommit below,
- * which pushes kind-6 (WM_CHAR) events. Clipboard set/get goes through the
- * same activity's ClipboardManager over JNI, so both text plumbing needs
- * ship with zero extra libraries.
- */
+/* gui_runtime_android_native */
 
 #ifdef ZAN_GUI_ANDROID_NATIVE
 
@@ -53,6 +14,7 @@
 #include <android/log.h>
 
 #include "android_native_app_glue.h"
+#include "gui_touch_game.h"
 
 static void zan_alog(const char *fmt, ...) __attribute__((format(printf,1,2)));
 static void zan_alog(const char *fmt, ...) {
@@ -68,30 +30,26 @@ static void zan_alog(const char *fmt, ...) {
 #define ZAN_TRACE(...) ((void)0)
 #endif
 
-/* ---- app record ---------------------------------------------------------
- * The glue hands us one android_app; the Zan-facing hwnd is the address of
- * this record, exactly like the SDL shell hands back SDL_Window* and the
- * OHOS shell its window record. */
+/* 内部辅助实现 */
 typedef struct {
-    ANativeWindow *nw;    /* NULL while no surface (background cycle) */
-    int w, h;             /* attached surface size, device pixels */
+    ANativeWindow *nw;    /* 核心系统底层抽象与内存语义契约 */
+    int w, h;             /* 核心系统底层抽象与内存语义契约 */
     int attached;
-    int closed;           /* Close() seen: present becomes a no-op */
+    int closed;           /* 核心系统底层抽象与内存语义契约 */
 
-    /* EGL present state; created on attach / first present. All calls run
-     * on the glue app thread, so plain fields need no lock. */
+    /* EGL 呈现状态：在 surface 附着或首次 present 时创建（运行于 glue 应用线程） */
     EGLDisplay egl_dpy;
     EGLSurface egl_surf;
     EGLContext egl_ctx;
-    ANativeWindow *surf_nw;  /* the surface's window (rotation rebuilds) */
-    int        surf_w, surf_h; /* geometry the EGL surface was created for */
+    ANativeWindow *surf_nw;  /* 核心系统底层抽象与内存语义契约 */
+    int        surf_w, surf_h; /* 底层系统交互与数据协议契约 */
     GLuint     gl_prog;
     GLuint     gl_tex;
     GLuint     gl_vbo;
     int        tex_w, tex_h;
 
-    struct android_app *app;   /* back-pointer for IME + window flags */
-    int destroy_wait;          /* main() entered with no surface yet */
+    struct android_app *app;   /* 底层系统交互与数据协议契约 */
+    int destroy_wait;          /* 核心系统底层抽象与内存语义契约 */
 } zan_anw_t;
 
 static zan_anw_t g_anw;
@@ -101,11 +59,7 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
-/* ---- event ring --------------------------------------------------------
- * Same flat event protocol as the SDL/OHOS shells: e[0] kind, e[1] x,
- * e[2] y, e[3] button, e[4] code (keycode / wheel delta), e[5] mods,
- * e[6] flag. Kinds that matter here: 1 move, 2 down, 3 up, 4 key, 6 char,
- * 7 resized, 8 close, 13 wheel, 14 force-repaint. */
+/* 内部辅助实现 */
 typedef struct { int e[8]; iptr win; } zan_aev_t;
 #define ZAN_AQ_CAP 512
 static zan_aev_t g_aq[ZAN_AQ_CAP];
@@ -116,35 +70,26 @@ static int g_pending_event[8];
 static iptr g_event_win = 0;
 static long long g_ev_seq = 0;
 
-/* Plain moves coalesce (freshest x/y wins) and wheel floods coalesce by
- * SUMMING deltas -- the SDL/OHOS shell contract. */
-static void aq_push_locked(int kind, int x, int y, int button, int code, int mods) {
+/* 事件标志位属于事件记录的一部分，入队时一并保存以防溢出丢失 */
+static void aq_push_event_locked(const int event[8]) {
     int last = (g_aq_tail + ZAN_AQ_CAP - 1) % ZAN_AQ_CAP;
-    int has_last = (g_aq_head != g_aq_tail);
-    if (kind == 1 && has_last && g_aq[last].e[0] == 1) {
-        g_aq[last].e[1] = x; g_aq[last].e[2] = y;
-        return;
-    }
-    if (kind == 13 && has_last && g_aq[last].e[0] == 13) {
-        g_aq[last].e[1] = x; g_aq[last].e[2] = y;
-        g_aq[last].e[4] += code;
-        return;
-    }
+    if (g_aq_head != g_aq_tail && zan_tg_coalesce(g_aq[last].e, event)) return;
     int next = (g_aq_tail + 1) % ZAN_AQ_CAP;
     if (next == g_aq_head) return; /* full: drop */
     zan_aev_t *z = &g_aq[g_aq_tail];
-    z->e[0] = kind; z->e[1] = x; z->e[2] = y; z->e[3] = button;
-    z->e[4] = code; z->e[5] = mods; z->e[6] = 0; z->e[7] = 0;
+    memcpy(z->e, event, sizeof(z->e));
     z->win = ZAN_ANW_HWND;
     g_aq_tail = next;
 }
 
+static void aq_push_locked(int kind, int x, int y, int button, int code, int mods) {
+    const int event[8] = { kind, x, y, button, code, mods, 0, 0 };
+    aq_push_event_locked(event);
+}
+
 static void aq_push_flag_locked(int kind, int x, int y, int button, int code, int mods) {
-    aq_push_locked(kind, x, y, button, code, mods);
-    if (g_aq_head != g_aq_tail) {
-        int last = (g_aq_tail + ZAN_AQ_CAP - 1) % ZAN_AQ_CAP;
-        g_aq[last].e[6] = 1;
-    }
+    const int event[8] = { kind, x, y, button, code, mods, 1, 0 };
+    aq_push_event_locked(event);
 }
 
 static int aq_pop(void) {
@@ -159,7 +104,7 @@ static int aq_pop(void) {
     return 1;
 }
 
-/* ---- lifecycle feed (glue app thread) ---------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static void ant_gl_reset(void);
 
@@ -172,15 +117,12 @@ static void anw_attach(ANativeWindow *nw) {
     g_anw.attached = 1;
     g_window_width = w;
     g_window_height = h;
-    /* The app's canvas follows the logical stage, not the surface. */
+    /* 底层系统交互与数据协议契约 */
     aq_push_locked(7, w, h, 0, 0, 0);
-    /* Surface (re)attached: every pixel is undefined, and an idle app in
-     * WaitEvent would keep sleeping (the OHOS shell's kind-14 contract). */
+    /* Surface 重新附着：强制触发全屏重绘并唤醒 WaitEvent 挂起线程 */
     aq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_aq_lock);
-    /* Fresh ANativeWindow: whatever GL state and dirty rects described the
-     * previous one must not leak into the next frame (rotation rebuilds the
-     * window; stale rects against the new geometry smear = 花屏). */
+    /* 新 ANativeWindow 初始化：重置前一窗口残留的 GL 脏矩形状态 */
     ant_gl_reset();
 }
 
@@ -191,20 +133,15 @@ static void anw_detach(void) {
     pthread_mutex_unlock(&g_aq_lock);
 }
 
-/* ---- touch gesture synthesis (OHOS shell port) --------------------------
- * The first finger's drag beyond an 8 px slop becomes Win32-scale wheel
- * events (kind 13) that move content 1:1 with the finger; a tap under the
- * slop is a full synthesized click at the anchor; finger-up with residual
- * speed coasts (fling) through a 16 ms thread until exponential friction
- * eats it. Formulas verbatim from gui_runtime_ohos.c. */
+/* 内部辅助实现 */
 static i64 ant_tick_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-#define ANT_TOUCH_SLOP2   64.0f   /* (8 px)^2: below this, still a tap */
-#define ANT_TOUCH_HIST    8       /* release-velocity ring buffer */
+#define ANT_TOUCH_SLOP2   64.0f   /* 核心系统底层抽象与内存语义契约 */
+#define ANT_TOUCH_HIST    8       /* 核心系统底层抽象与内存语义契约 */
 #define ANT_FLING_START_PX_S 250.0f
 #define ANT_FLING_STOP_PX_S  120.0f
 #define ANT_FLING_TAU_MS     400.0f
@@ -272,8 +209,7 @@ static void fling_start(float v, int x, int y) {
         g_fling_thr_up = 0;
 }
 
-/* One pointer of a motion event. Multi-pointer pinch/rotate is a later
- * layer; the SDL shell's finger layer was single-pointer too. */
+/* 默认启用传统 GUI 滚动，游戏场景按需接入原始拖拽与捏合手势 */
 static void ant_touch(int action, int x, int y) {
     static int px = 0, py = 0;
     if (x < 0 && y < 0) { x = px; y = py; }
@@ -287,8 +223,7 @@ static void ant_touch(int action, int x, int y) {
         g_tg_y = g_tg_ay = (float)y;
         g_tg_hn = 1; g_tg_hi = 1 % ANT_TOUCH_HIST;
         g_tg_ht[0] = ant_tick_ms(); g_tg_hy[0] = g_tg_y;
-        /* Press at finger-down (hold gestures, press-state feedback);
-         * a plain move precedes it so hover/enter state settles first. */
+        /* 手指按下事件派发：先发送移动事件以更新光标悬停，再发送按下事件 */
         aq_push_locked(1, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         aq_push_locked(2, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         pthread_mutex_unlock(&g_aq_lock);
@@ -305,8 +240,7 @@ static void ant_touch(int action, int x, int y) {
             }
             g_tg_drag = 1;
         }
-        /* Finger travel -> wheel deltas in the /120 scale; dragging up
-         * must scroll DOWN (content follows the finger), i.e. negative. */
+        /* 手指位移映射为标准滚轮步长 (/120 比例)：方向与手指拖拽自然反向 */
         g_tg_acc += (fy - g_tg_y) * 288.0f / (float)g_dpi;
         int delta = (int)g_tg_acc;
         if (delta != 0) {
@@ -349,12 +283,73 @@ static void ant_touch(int action, int x, int y) {
     }
 }
 
-/* AInputEvent -> event ring, from the glue's input-queue callback
- * (app thread). Returns 1 when consumed. */
+static int g_touch_game_mode = -1;
+static zan_touch_game g_touch_game;
+
+static int ant_touch_game_enabled(void) {
+    if (g_touch_game_mode < 0) {
+        const char *value = getenv("ZAN_GUI_TOUCH_GAME");
+        g_touch_game_mode = value && strcmp(value, "1") == 0;
+    }
+    return g_touch_game_mode;
+}
+
+static void ant_touch_game_emit(void *ctx, const int event[8]) {
+    (void)ctx;
+    aq_push_event_locked(event);
+}
+
+static void ant_touch_game_cancel_locked(void) {
+    if (g_touch_game_mode == 1)
+        zan_touch_game_feed(&g_touch_game, ZAN_TG_CANCEL, -1, NULL, 0,
+                           ant_touch_game_emit, NULL);
+}
+
+static void ant_touch_game_input(AInputEvent *ev, int raw_action) {
+    int action;
+    switch (raw_action & AMOTION_EVENT_ACTION_MASK) {
+    case AMOTION_EVENT_ACTION_DOWN: action = ZAN_TG_DOWN; break;
+    case AMOTION_EVENT_ACTION_MOVE: action = ZAN_TG_MOVE; break;
+    case AMOTION_EVENT_ACTION_UP: action = ZAN_TG_UP; break;
+    case AMOTION_EVENT_ACTION_CANCEL: action = ZAN_TG_CANCEL; break;
+    case AMOTION_EVENT_ACTION_POINTER_DOWN: action = ZAN_TG_POINTER_DOWN; break;
+    case AMOTION_EVENT_ACTION_POINTER_UP: action = ZAN_TG_POINTER_UP; break;
+    default: return;
+    }
+    /* Android 触控点 ID 映射 (0..31)：维护多指触控状态机 */
+    zan_tg_pointer pointers[32];
+    size_t count = AMotionEvent_getPointerCount(ev);
+    size_t changed = (size_t)((raw_action & AMOTION_EVENT_ACTION_POINTER_INDEX_MASK)
+                             >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT);
+    int changed_id = -1;
+    if (action == ZAN_TG_CANCEL || count == 0 || count > 32 || changed >= count) {
+        action = ZAN_TG_CANCEL;
+        count = 0;
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            pointers[i].id = AMotionEvent_getPointerId(ev, i);
+            pointers[i].x = AMotionEvent_getX(ev, i);
+            pointers[i].y = AMotionEvent_getY(ev, i);
+        }
+        changed_id = pointers[changed].id;
+    }
+    pthread_mutex_lock(&g_aq_lock);
+    fling_cancel_locked();
+    zan_touch_game_feed(&g_touch_game, action, changed_id, pointers, (int)count,
+                       ant_touch_game_emit, NULL);
+    pthread_mutex_unlock(&g_aq_lock);
+}
+
+/* AInputEvent 转换为环形队列事件，消费成功返回 1 */
 static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
     (void)app;
     if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_MOTION) {
-        int action = AMotionEvent_getAction(ev) & AMOTION_EVENT_ACTION_MASK;
+        int raw_action = AMotionEvent_getAction(ev);
+        if (ant_touch_game_enabled()) {
+            ant_touch_game_input(ev, raw_action);
+            return 1;
+        }
+        int action = raw_action & AMOTION_EVENT_ACTION_MASK;
         float fx = AMotionEvent_getX(ev, 0);
         float fy = AMotionEvent_getY(ev, 0);
         int x = (int)fx, y = (int)fy;
@@ -370,8 +365,7 @@ static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
             ant_touch(2, x, y);
             return 1;
         default:
-            /* POINTER_DOWN / POINTER_UP etc.: keep the primary pointer's
-             * position flowing so held gestures don't stall. */
+            /* 多指触控转换：持续维护主触控点坐标，保证拖拽手势连续性 */
             if (g_tg_down) ant_touch(1, x, y);
             return 1;
         }
@@ -381,8 +375,7 @@ static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
         int32_t act = AKeyEvent_getAction(ev);
         if (act != AKEY_EVENT_ACTION_DOWN) return 1;
         if (kc == AKEYCODE_BACK) {
-            /* Back = close the app window, like the SDL shell's ESC-to-
-             * quit path: kind 8 ends the App loop (Form.Run breaks). */
+            /* 返回键处理：派发窗口关闭事件终止主循环 */
             pthread_mutex_lock(&g_aq_lock);
             g_anw.closed = 1;
             aq_push_locked(8, 0, 0, 0, 0, 0);
@@ -401,9 +394,7 @@ static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
             pthread_mutex_unlock(&g_aq_lock);
             return 1;
         }
-        /* Printable ASCII arrives through the soft keyboard's key events on
-         * most IMEs: map the A-Z/0-9/space band, everything else to the
-         * GameTextInput bridge (later layer). */
+        /* 软键盘可见 ASCII 按键事件转发映射 */
         if (kc >= AKEYCODE_SPACE && kc <= AKEYCODE_Z) {
             static const char *map =
                 " ??##  abcdefghijklmnop   0123456789  ";
@@ -439,17 +430,13 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
         pthread_mutex_lock(&g_aq_lock);
         g_anw.destroy_wait = 0;
         pthread_mutex_unlock(&g_aq_lock);
-        /* Re-assert full-bleed window layout on every surface arrival: the
-         * first INIT_WINDOW runs before create_window's call (the Zan app
-         * thread may not have reached App.Show yet), and relaunch/rotation
-         * rebuilds reset the decor fit. */
+        /* 内部辅助实现 */
         ant_set_immersive();
         anw_attach(app->window);
         break;
     case APP_CMD_TERM_WINDOW:
-        /* Fires on EVERY background cycle. Queue nothing (kind 8 would end
-         * the app loop); present no-ops while detached and the INIT_WINDOW
-         * that follows pushes kind 14 to repaint. */
+        /* Surface 丢失前取消当前进行中的手势，避免状态挂起 */
+        if (g_touch_game_mode == 1) fling_cancel_public();
         anw_detach();
         break;
     case APP_CMD_WINDOW_RESIZED:
@@ -462,19 +449,13 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
             aq_push_locked(7, w, h, 0, 0, 0);
             aq_push_locked(14, 0, 0, 0, 0, 0);
             pthread_mutex_unlock(&g_aq_lock);
-            /* In-place resize: the surface survives but its EGL surface was
-             * created against the old buffer geometry. Mark it stale so the
-             * next present rebuilds (ant_gl_surface re-queries the real
-             * geometry) instead of swapping a wrong-sized buffer forever. */
+            /* 原地窗口尺寸变更：重新创建 EGL 表面以适配新几何尺寸 */
             g_anw.surf_w = 0;
             g_anw.surf_h = 0;
         }
         break;
     case APP_CMD_WINDOW_REDRAW_NEEDED:
-        /* The framework asks for a fresh frame after a surface disturbance it
-         * handled itself (in-place resize, fold/unfold): the surface was NOT
-         * re-INITed, so without this the app idles on its last frame and the
-         * disturbed band stays black until the next touch. */
+        /* 内部辅助实现 */
         if (g_anw.attached) {
             pthread_mutex_lock(&g_aq_lock);
             aq_push_locked(14, 0, 0, 0, 0, 0);
@@ -482,8 +463,7 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
         }
         break;
     case APP_CMD_GAINED_FOCUS:
-        /* Bars reappear over a resumed activity until the flag is set
-         * again (the framework does not preserve systemUiVisibility). */
+        /* Activity 恢复时重新隐藏系统状态栏与导航栏 */
         ant_set_immersive();
         pthread_mutex_lock(&g_aq_lock);
         aq_push_locked(14, 0, 0, 0, 0, 0);
@@ -500,34 +480,28 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
 static void fling_cancel_public(void) {
     pthread_mutex_lock(&g_aq_lock);
     fling_cancel_locked();
+    ant_touch_game_cancel_locked();
     pthread_mutex_unlock(&g_aq_lock);
 }
 
-/* ---- android_main: the glue app thread becomes the Zan app thread -------
- * The glue's ANativeActivity_onCreate (in the same .so) spawned this
- * thread; when this function returns, the glue asks the activity to
- * finish. DPI comes from the activity's AConfiguration (density is
- * denominated in 160dpi like OHOS; the Gui runtime keeps the desktop
- * 96-dpi base -- see zan_gui_ohos_set_dpi for the math). */
+/* 内部辅助实现 */
 
 static char g_files_dir[512] = "/data/local/tmp";
 
 static void ant_set_dpi(struct android_app *app) {
     if (!app->config) return;
     int32_t d = AConfiguration_getDensity(app->config);
-    /* DENSITY_NONE(0)/DENSITY_ANY(0xFFFE)/DENSITY_NONE(0xFFFF) carry no
-     * scale; treat them as the 160 baseline. */
+    /* 屏幕 DPI 缺省值回退：以 160 DPI 为基准刻度 */
     if (d > 0 && d < 0xFF00) {
         g_dpi = (int)((long)d * 96 / 160);
     }
 }
 
-/* Rust-free C entry the module links: the Zan program's main(). */
+/* 底层系统交互与数据协议契约 */
 int main(int argc, char **argv);
 
 void android_main(struct android_app *app) {
     app->onAppCmd = ant_cmd;
-    app->onInputEvent = ant_input;
     g_anw.app = app;
 
     ant_set_dpi(app);
@@ -536,30 +510,23 @@ void android_main(struct android_app *app) {
     if (files && files[0]) {
         snprintf(g_files_dir, sizeof(g_files_dir), "%s", files);
         if (chdir(g_files_dir) != 0) {
-            /* keep going: relative logs land wherever cwd allows */
+            /* 底层系统交互与数据协议契约 */
         }
     }
 
-    /* Keep the screen on while the app runs (games / dashboards); the
-     * framework clears it when the activity dies. */
+    /* 保持屏幕常亮 (FLAG_KEEP_SCREEN_ON) 标志位设置 */
     if (app->activity) {
         ANativeActivity_setWindowFlags(app->activity,
             AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
     }
 
-    /* Fold the system bars as early as the JVM thread allows (also re-sent
-     * from create_window and every GAINED_FOCUS -- immersive-sticky keeps
-     * them hidden afterwards). */
+    /* 沉浸式全屏：隐藏系统栏 */
     ant_set_immersive();
 
-    /* If the surface already exists (fast startup), attach now instead of
-     * waiting for a queued INIT_WINDOW replay. */
+    /* 快速启动：Surface 已就绪时立即附着，无需等待 INIT_WINDOW 入队 */
     if (app->window) anw_attach(app->window);
     else {
-        /* No surface yet: replay the INIT_WINDOW the activity queued
-         * before android_main ran (the glue pre-drained its queue).
-         * Calling the cmd directly is safe -- the glue thread is this
-         * thread, blocked inside main() below. */
+        /* Surface 未创建：等待并回放 Activity 排队的 INIT_WINDOW 事件 */
         ant_pump_looper();
         if (!app->window) {
             pthread_mutex_lock(&g_aq_lock);
@@ -568,10 +535,12 @@ void android_main(struct android_app *app) {
         }
     }
 
+    /* 主循环前置生命周期处理：保留 Zan Main 配置触控模式的时机 */
+    app->onInputEvent = ant_input;
     char *arg0 = "zan";
     char *argv[1] = { arg0 };
     main(1, argv);
-    /* Returning ends the glue's app thread; the activity finishes. */
+    /* 底层系统交互与数据协议契约 */
 }
 
 /* ---- present (EGL) ------------------------------------------------------ */
@@ -635,15 +604,7 @@ static int ant_gl_surface(zan_anw_t *w) {
                                              (EGLNativeWindowType)w->nw, NULL);
         if (w->egl_surf == EGL_NO_SURFACE) return 1;
         w->surf_nw = w->nw;
-        /* Record the size the surface ACTUALLY got, not the attached one:
-         * a rotation (or in-place resize) can hand back the same ANativeWindow
-         * whose buffer geometry still reads the old size at INIT/RESIZED time.
-         * Keying the rebuild on w->w alone made a stale surface look current,
-         * the rebuild condition never fired again and every later frame drew
-         * at the old geometry -- a black (or letterboxed) stage for the rest
-         * of the session. The query reads the geometry eglCreateWindowSurface
-         * really used, so a mismatch keeps rebuilding until the geometry has
-         * settled (the OHOS shell's surf_w/surf_h fix, same shape). */
+        /* 内部辅助实现 */
         EGLint qw = 0, qh = 0;
         if (eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_WIDTH, &qw)
             && eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_HEIGHT, &qh)
@@ -654,11 +615,7 @@ static int ant_gl_surface(zan_anw_t *w) {
             w->surf_w = w->w;
             w->surf_h = w->h;
         }
-        /* Rotation may hand back a *different* EGLDisplay/config: the GL
-         * objects below belong to the old context, and a context that
-         * survives the swap can still hold textures sized for the old
-         * window. Drop everything GL-owned; ant_gl_program/ant_texture
-         * rebuild from scratch on the next present. */
+        /* 内部辅助实现 */
         ant_gl_reset();
     }
     if (!w->egl_ctx) {
@@ -671,10 +628,7 @@ static int ant_gl_surface(zan_anw_t *w) {
     return 0;
 }
 
-/* Discard every GL resource tied to the previous window/context so the next
- * present recreates them against the current one. Called with the mutex
- * unlocked (present path) or during attach (glue cmd); all callers run on
- * the app thread. */
+/* 内部辅助实现 */
 static void ant_gl_reset(void) {
     zan_anw_t *w = &g_anw;
     w->gl_prog = 0;
@@ -712,12 +666,7 @@ static int ant_gl_program(zan_anw_t *w) {
     return 0;
 }
 
-/* Dirty rects: partial-band frames upload only the changed subrects; the
- * texture persists across frames (contract as the OHOS EGL path).
- * A resize/rotation swaps the surface: App paints a full first frame into
- * the new canvas but (like Win32Shell.forceFullUpload) the shell is told
- * separately -- without the full-frame flag the new geometry would reuse
- * the old frame's rects and leave most of the texture stale (花屏). */
+/* 内部辅助实现 */
 #define ZAN_ANT_DIRTY_MAX 512
 static i32 g_dirty[ZAN_ANT_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -735,9 +684,7 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
-/* Whole-window frame declaration (Win32Shell.PresentFull's counterpart).
- * Non-Windows hosts never had a signal for it; games always paint whole
- * frames, so apps calling PresentFull here mean exactly "ignore rects". */
+/* 全窗口呈现通知（对齐 Win32Shell.PresentFull） */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_full = 1;
 }
@@ -808,12 +755,9 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     return 0;
 }
 
-/* ---- window management (phone: no chrome) ------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* JNI: Activity.setRequestedOrientation — the NDK ships no
- * ANativeActivity_setOrientation export despite the docs, so the
- * orientation pin goes through the activity object. Values are
- * ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE=0 / PORTRAIT=1. */
+/* JNI: Activity */
 static void ant_set_orientation(int landscape) {
     struct android_app *app = g_anw.app;
     if (!app || !app->activity || !app->activity->vm) return;
@@ -831,23 +775,7 @@ static void ant_set_orientation(int landscape) {
     (*env)->DeleteLocalRef(env, cls);
 }
 
-/* JNI: Window.getDecorView().setSystemUiVisibility(...) — the games run
- * without window chrome, so the status bar / nav bar must fold away too
- * ("不能自动全屏"): immersive-sticky keeps them hidden across swipes and
- * focus regains (SYSTEM_UI_FLAG_IMMERSIVE_STICKY | FULLSCREEN |
- * HIDE_NAVIGATION | LAYOUT_STABLE | LAYOUT_HIDE_NAVIGATION |
- * LAYOUT_FULLSCREEN, value 0x1806). Sticky is re-applied by the framework
- * after each transient reveal, so one call at window creation covers the
- * app lifetime.
- *
- * On Android 11+ (API 30) the legacy flags alone no longer stop the decor
- * from fitting system windows: the first frame lands with the window
- * inset by the cutout (frame=[136,0][2400,1080] on a 2400x1080 phone --
- * the "右边还要留一截" strip after rotation) or the nav bar. Two calls
- * close both: Window.setDecorFitsSystemWindows(false) (decor ignores all
- * insets) and WindowManager.LayoutParams.layoutInDisplayCutoutMode =
- * LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS (render into the notch). The API-30
- * entry point is resolved dynamically so the same .a still loads on 8.0. */
+/* JNI: Window */
 static void ant_set_immersive(void) {
     struct android_app *app = g_anw.app;
     if (!app || !app->activity || !app->activity->vm) return;
@@ -865,13 +793,11 @@ static void ant_set_immersive(void) {
     jobject win = (*env)->CallObjectMethod(env, act, getwin);
     if (!win) { (*env)->DeleteLocalRef(env, cls); return; }
     jclass wcls = (*env)->GetObjectClass(env, win);
-    /* API 30+: opt the decor out of system-window fitting. Missing below
-     * 30 -- guard on the method handle, not the SDK int. */
+    /* Android 11 (API 30+) 边缘沉浸适配 (WindowCompat.setDecorFitsSystemWindows) */
     jmethodID setfits = (*env)->GetMethodID(env, wcls,
         "setDecorFitsSystemWindows", "(Z)V");
     if (setfits) (*env)->CallVoidMethod(env, win, setfits, JNI_FALSE);
-    /* All API levels this runtime ships on: draw under the camera notch
-     * (default mode carves it out, shifting the whole stage sideways). */
+    /* 刘海屏全屏绘制支持 (LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES) */
     jmethodID getattrs = (*env)->GetMethodID(env, wcls, "getAttributes",
         "()Landroid/view/WindowManager$LayoutParams;");
     if (getattrs) {
@@ -913,17 +839,12 @@ static void ant_set_immersive(void) {
 }
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
-    (void)title; /* the NativeActivity owns the surface; the canvas
-                  * follows it (the CDraw stage viewport scales the game
-                  * to whatever the device gives). */
+    (void)title; /* NativeActivity 拥有底层 Surface，Canvas 视口自适应缩放 */
     if (width > 0 && height > 0) {
-        /* Pin the activity orientation to the requested stage aspect so
-         * landscape designs get landscape (the sensor would otherwise
-         * fight a fixed-aspect design). */
+        /* 根据舞台宽高比锁定屏幕方向（横屏/竖屏） */
         ant_set_orientation(width > height);
     }
-    /* Fold the system bars: the app window already fills the screen, the
-     * status/nav bar just overlays it (see ant_set_immersive). */
+    /* 沉浸模式：隐藏状态栏与导航栏叠加层 */
     ant_set_immersive();
     return ZAN_ANW_HWND;
 }
@@ -936,8 +857,7 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     g_anw.closed = 1;
     aq_push_locked(8, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_aq_lock);
-    /* Ask the activity to finish: the glue posts EXIT; the framework's
-     * NativeActivity tears the surface down on its own. */
+    /* 请求 Activity 退出并销毁 Surface */
     if (g_anw.app && g_anw.app->activity) {
         ANativeActivity_finish(g_anw.app->activity);
     }
@@ -963,15 +883,11 @@ EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0
 EXPORT i32 zan_gui_set_title(iptr h, const char *t) { (void)h; (void)t; return 0; }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
-/* ---- event pump --------------------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
-    /* The poll path is the hot idle path for a redraw-pending loop
-     * (App.ProcessEvent's needsRedraw branch): lifecycle commands sitting
-     * in the glue queue must be drained here too, or APP_CMD_INIT_WINDOW
-     * never runs, attached stays 0, and an app that gates on IsVisible
-     * spins forever before its first frame. */
+    /* 待重绘空闲轮询路径：带超时的 epoll/ALooper 等待 */
     ant_pump_looper();
     if (aq_pop()) { return 0; }
     return 1;
@@ -979,14 +895,7 @@ EXPORT i32 zan_gui_poll_event(void) {
 
 static long long g_wait_spins;
 
-/* The glue drives ALooper only inside android_main, and this thread IS
- * android_main's thread -- blocked in the Zan program's main() right now.
- * Nobody else drains the lifecycle/input queues while the Zan loop is
- * parked in wait_event, so pump them ourselves: ant_pump_looper() runs
- * the glue's source callbacks (which translate into the event ring)
- * before every ring check. The SDL shell solved the same shape with an
- * event watch on its own thread; the OHOS shell with shell-thread feeds;
- * here the shell is in-process and the pump is just a function call. */
+/* 内部辅助实现 */
 static void ant_pump_looper(void) {
     struct android_app *app = g_anw.app;
     if (!app) return;
@@ -1011,10 +920,7 @@ EXPORT i32 zan_gui_wait_event(void) {
     for (;;) {
         ant_pump_looper();
         if (aq_pop()) { return 0; }
-        /* Before first attach: block in the looper itself. The glue's
-         * MAIN looper wakes on lifecycle commands (INIT_WINDOW among
-         * them), so this sleeps until the surface actually exists --
-         * no 4 ms spin burning CPU on a black screen. */
+        /* 底层系统交互与数据协议契约 */
         if (g_anw.destroy_wait && g_anw.app) {
             int events;
             struct android_poll_source *source;
@@ -1087,7 +993,7 @@ EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i32 zan_gui_client_width(iptr hwnd_val)  { (void)hwnd_val; return g_window_width; }
 EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_window_height; }
 
-/* ---- platform services --------------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
@@ -1101,9 +1007,7 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
 
 EXPORT const char *zan_gui_android_files_dir(void) { return g_files_dir; }
 
-/* JNI reach for gui_runtime_android.c's WebView bridge (v1: env for the
- * calling thread + the activity jobject; real WebView plumbing is a later
- * layer -- the hooks exist so the bridge links either way). */
+/* WebView 桥接 JNI 线程环境与上下文访问 */
 static JNIEnv *zan_anw_bridge_env(void) {
     struct android_app *app = g_anw.app;
     if (!app || !app->activity) return NULL;
@@ -1121,14 +1025,9 @@ static jobject zan_anw_bridge_activity(void) {
     return app && app->activity ? (jobject)app->activity->clazz : NULL;
 }
 
-/* ---- JNI reach: clipboard + IME -----------------------------------------
- * The activity's classloader resolves dev.zan.app.ZanIme (plain FindClass
- * from a native thread only sees the system loader). Every helper degrades
- * to the old stub behaviour when the dex predates the class: a shell built
- * without ZanIme still runs, just without IME commits and clipboard. */
+/* JNI 剪贴板与输入法 (IME) 访问通道 */
 
-/* UTF-16 -> UTF-8 (JNI strings are UTF-16): malloc'd NUL-terminated UTF-8,
- * surrogate pairs folded, or NULL. */
+/* JNI 字符串转换：UTF-16 转 UTF-8 (支持代理对合并) */
 static char *ant_utf16_to_utf8(const jchar *in, jsize n) {
     char *out = (char *)malloc((size_t)n * 4 + 1);
     if (!out) return NULL;
@@ -1159,8 +1058,7 @@ static char *ant_utf16_to_utf8(const jchar *in, jsize n) {
     return out;
 }
 
-/* UTF-8 -> UTF-16 (malloc'd jchars, *out_len set): invalid bytes become
- * U+FFFD so a malformed clipboard can't overrun the caller's expectations. */
+/* UTF-8 转 UTF-16 (非法字节替换为 U+FFFD) */
 static jchar *ant_utf8_to_utf16(const char *in, jsize *out_len) {
     size_t n = strlen(in);
     jchar *out = (jchar *)malloc((n + 1) * sizeof(jchar));
@@ -1197,16 +1095,13 @@ static jchar *ant_utf8_to_utf16(const char *in, jsize *out_len) {
     return out;
 }
 
-/* dev.zan.app.ZanIme (apk-shell dex) + show/hide statics, cached. */
+/* 底层系统交互与数据协议契约 */
 static jclass g_ime_cls;
 static jmethodID g_ime_show, g_ime_hide;
 static void ant_ime_commit(JNIEnv *env, jclass clazz, jstring text);
 static void ant_ime_set_composing(JNIEnv *env, jclass clazz, jstring text);
 
-/* Composing (pinyin pre-commit) preview text, UTF-8, guarded by the event
- * ring lock: written on the IME thread, polled every frame by the GUI
- * thread. Empty whenever a commit lands (the composing string became real
- * text) or the editor clears it. */
+/* 内部辅助实现 */
 static char g_composing[256];
 static size_t g_composing_len;
 
@@ -1222,11 +1117,7 @@ static void ant_composing_store(const char *utf8) {
         g_composing[0] = 0;
         g_composing_len = 0;
     }
-    /* The composing buffer lives outside the event ring, so a change is
-     * invisible to a loop blocked in WaitEvent (no key event reaches the
-     * ring while the IME owns the keys). Push the kind-14 repaint wake the
-     * exposed-surface contract uses, or the preview would not show until
-     * the next touch. */
+    /* 内部辅助实现 */
     aq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_aq_lock);
 }
@@ -1265,12 +1156,7 @@ static int ant_ime_init(JNIEnv *env, jobject act) {
     g_ime_cls = (jclass)(*env)->NewGlobalRef(env, cls);
     (*env)->DeleteLocalRef(env, cls);
     if (!g_ime_cls) goto fail;
-    /* Register zanCommit explicitly: the framework NativeActivity loads
-     * libmain.so under the boot classloader, and Android 7+ scopes the
-     * automatic Java_* name lookup to the loading classloader -- the
-     * app-classloader-loaded ZanIme would never find the symbol that way
-     * (UnsatisfiedLinkError on the first commit). RegisterNatives binds the
-     * method on the jclass itself and ignores classloader namespaces. */
+    /* 动态注册 JNI zanCommit 本地回调方法 */
     {
         static const JNINativeMethod k_methods[] = {
             { "zanCommit", "(Ljava/lang/String;)V", (void *)&ant_ime_commit },
@@ -1292,11 +1178,7 @@ fail:
     return -1;
 }
 
-/* Soft keyboard commits from ZanIme's InputConnection: one kind-6
- * (WM_CHAR-equivalent) event per codepoint, mirroring the SDL shell's
- * SDL_EVENT_TEXT_INPUT translation. Arrives on the UI thread; the ring
- * lock makes that safe. Reached through the RegisterNatives binding set
- * in ant_ime_init; the Java_* export below is kept for direct loads. */
+/* 内部辅助实现 */
 static void ant_ime_commit(JNIEnv *env, jclass clazz, jstring text) {
     (void)clazz;
     if (!env || !text) return;
@@ -1393,9 +1275,7 @@ EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
     return setc ? 0 : 1;
 }
 
-/* Read the clipboard's text as UTF-8. Mirrors the Windows/X11/macOS ABI:
- * returns a NUL-terminated string valid until the next call, or "" when
- * the clipboard holds no text. */
+/* 读取系统剪贴板文本并返回 UTF-8 字符串 */
 EXPORT const char *zan_gui_get_clipboard(void) {
     static char *g_clip_buf = NULL;
     JNIEnv *env = zan_anw_bridge_env();
@@ -1462,10 +1342,7 @@ EXPORT int  zan_gui_drop_pending(void)             { return 0; }
 EXPORT const char *zan_gui_drop_take(void)         { return ""; }
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y)      { (void)x; (void)y; }
 
-/* Soft keyboard open/close. Preferred path: ZanIme (hidden InputConnection
- * view + IMM), which is also what carries commitText-based IMEs (CJK).
- * Falls back to the framework's NativeActivity entry points when the dex
- * predates the class -- key-event IMEs still work there. */
+/* 核心系统底层抽象与内存语义契约 */
 EXPORT i32 zan_gui_set_ime_open(i32 on) {
     struct android_app *app = g_anw.app;
     if (!app || !app->activity) return 1;
@@ -1487,10 +1364,7 @@ EXPORT i32 zan_gui_set_ime_open(i32 on) {
     return 0;
 }
 
-/* Composing preview for text widgets (pinyin etc.): the pre-commit string
- * the IME is still composing, UTF-8. Mirrors the clipboard ABI -- returns a
- * NUL-terminated string valid until the next call, "" when nothing is being
- * composed. */
+/* 底层系统交互与数据协议契约 */
 EXPORT const char *zan_gui_ime_composing(void) {
     static char buf[sizeof(g_composing)];
     pthread_mutex_lock(&g_aq_lock);
@@ -1500,7 +1374,7 @@ EXPORT const char *zan_gui_ime_composing(void) {
 }
 
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
-    (void)hwnd_val; (void)tint_argb; return 1; /* unsupported: app keeps CPU bg */
+    (void)hwnd_val; (void)tint_argb; return 1; /* 核心系统底层抽象与内存语义契约 */
 }
 EXPORT i32 zan_gui_disable_glass(iptr hwnd_val)    { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(iptr h, i32 percent) { (void)h; (void)percent; return 0; }
@@ -1515,7 +1389,7 @@ EXPORT i32 zan_gui_write_file(const char *path, const char *utf8) {
     return w == n ? 0 : 1;
 }
 
-/* GameKit GPU-scene hooks: report unsupported on this backend. */
+/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val)                  { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr rend)     { (void)hwnd_val; (void)rend; return 1; }
 EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {

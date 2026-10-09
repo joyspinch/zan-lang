@@ -105,7 +105,7 @@ static void scope_add(zan_arena_t *arena, zan_scope_t *scope, zan_symbol_t *sym)
 
     /* 内部辅助实现 */
     sym->name_hash = istr_hash(sym->name);
-    if (scope->sym_count > scope->bucket_count)   /* load factor 1 */
+    if (scope->sym_count > scope->bucket_count)   /* 核心系统底层抽象与内存语义契约 */
         scope_index_grow(arena, scope);
     zan_symbol_t **tail =
         &scope->buckets[sym->name_hash & (uint32_t)(scope->bucket_count - 1)];
@@ -117,7 +117,7 @@ static void scope_add(zan_arena_t *arena, zan_scope_t *scope, zan_symbol_t *sym)
 static zan_symbol_t *scope_find(zan_scope_t *scope, zan_istr_t name) {
     uint32_t h = istr_hash(name);
     for (zan_scope_t *s = scope; s; s = s->parent) {
-        if (!s->bucket_count) continue;      /* empty scope: no index yet */
+        if (!s->bucket_count) continue;      /* 核心系统底层抽象与内存语义契约 */
         zan_symbol_t *sym = s->buckets[h & (uint32_t)(s->bucket_count - 1)];
         for (; sym; sym = sym->hash_next) {
             if (sym->name.len == name.len &&
@@ -152,7 +152,7 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_object = make_type(arena, TYPE_OBJECT, "object", 6);
     b->type_nint   = make_type(arena, TYPE_NINT,   "nint",   4);
     b->type_error  = make_type(arena, TYPE_ERROR,  "<error>", 7);
-    /* reflection: opaque handle on a type record (irgen_reflect.c) */
+    /* 底层系统交互与数据协议契约 */
     b->type_typeinfo = make_type(arena, TYPE_STRUCT, "TypeInfo", 8);
 }
 
@@ -172,7 +172,7 @@ static bool binder_type_equiv(const zan_type_t *a, const zan_type_t *b) {
     return true;
 }
 
-/* Full parameter-list identity: count plus each parameter's declared type */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static bool binder_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     if (a->member_count != b->member_count) return false;
     for (int i = 0; i < a->member_count; i++) {
@@ -194,15 +194,15 @@ static bool binder_type_params_equiv(zan_symbol_t *a, zan_symbol_t *b) {
     return atp == btp;
 }
 
-/* Per-type member-name index (struct zan_binder.member_idx). */
+/* 编译器代码生成与运行时系统底层调用契约 */
 
 typedef struct {
-    int member_idx; /* index into the type symbol's members[] */
-    int next;       /* next node in the bucket chain, -1 = end */
+    int member_idx; /* 底层系统交互与数据协议契约 */
+    int next;       /* 底层系统交互与数据协议契约 */
 } member_name_node_t;
 
 struct zan_member_name_index {
-    int *buckets; /* head node per bucket, -1 = empty */
+    int *buckets; /* 核心系统底层抽象与内存语义契约 */
     int bucket_cap;
     member_name_node_t *nodes;
     int node_count;
@@ -347,7 +347,7 @@ static bool member_clash_one(zan_binder_t *b, zan_symbol_t *type_sym,
                       type_sym->name.len, type_sym->name.str);
         return true;
     }
-    /* Two members of the same kind with the same name cannot coexist */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (m_is_data && a_is_data) {
         /* 内部辅助实现 */
         zan_ast_node_t *ad = added->decl;
@@ -448,7 +448,7 @@ static void check_member_name_clash(zan_binder_t *b, zan_symbol_t *type_sym,
     }
 }
 
-/* ---- type resolution ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static bool istr_eq(zan_istr_t a, const char *b, uint32_t len) {
     return a.len == len && memcmp(a.str, b, (size_t)len) == 0;
@@ -479,7 +479,7 @@ zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
-/* Grouping<T> is the System */
+/* 核心系统底层抽象与内存语义契约 */
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
     zan_type_t *t = make_type(b->arena, TYPE_CLASS, "Grouping", 8);
     t->type_args =
@@ -539,7 +539,7 @@ static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     return ok;
 }
 
-/* FNV-1a over a canonical encoding of a type structure */
+/* 底层系统交互与数据协议契约 */
 static uint64_t tuple_type_hash(zan_type_t *t) {
     uint64_t h = 0xcbf29ce484222325ULL;
     while (t) {
@@ -578,7 +578,7 @@ static uint64_t tuple_sig_hash(const char *s, int len) {
 zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
                                        int count) {
     if (!b || !elems || count <= 0) return b ? b->type_error : NULL;
-    /* canonical signature: "__tuple<N>:<sig1>,<sig2>,..." */
+    /* 核心系统底层抽象与内存语义契约 */
     char sig[4096];
     snprintf(sig, sizeof sig, "__tuple%d:", count);
     bool complete = true;
@@ -608,7 +608,7 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
     }
     zan_istr_t sig_istr = { (char *)sig, (uint32_t)strlen(sig) };
 
-    /* cache hit: structurally-identical tuple types are one struct */
+    /* 模块核心语义抽象与接口调用契约 */
     if (b->tuple_hash_cap) {
         size_t j = (size_t)tuple_sig_hash(sig_istr.str, (int)sig_istr.len)
                    & (size_t)(b->tuple_hash_cap - 1);
@@ -733,7 +733,7 @@ static bool type_is_value_kind(zan_type_t *t) {
     }
 }
 
-/* `T?` for a type no type reference spells, such as the result of `a? */
+/* 模块核心语义抽象与接口调用契约 */
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
     if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE ||
         !type_is_value_kind(elem))
@@ -805,9 +805,9 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
     else if (istr_eq(name, "Span", 4))
         base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
-    /* TypeInfo: what typeof(T)/obj.GetType() yields (see binder.h) */
+    /* 模块核心语义抽象与接口调用契约 */
     else if (istr_eq(name, "TypeInfo", 8)) base = b->type_typeinfo;
-    /* Task / Task<T>: a coroutine handle (opaque i64 at codegen) */
+    /* 底层系统交互与数据协议契约 */
     else if (istr_eq(name, "Task", 4))
         base = make_type(b->arena, TYPE_TASK, "Task", 4);
     /*  */
@@ -824,8 +824,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         return b->type_error;
     }
 
-    /* carry generic arguments (e */
-    /* A generic delegate instantiation (e */
+    /* 核心系统底层抽象与内存语义契约 */
+    /* 核心系统底层抽象与内存语义契约 */
     if (type_ref->type_ref.type_args.count > 0 && base->kind == TYPE_DELEGATE &&
         base->sym && base->sym->decl &&
         base->sym->decl->method_decl.type_params.count ==
@@ -925,7 +925,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         for (int i = 0; i < nargs; i++)
             fn->type_args[i] = zan_binder_resolve_type(
                 b, type_ref->type_ref.type_args.items[i]);
-        /* Func<TResult> is a zero-parameter delegate */
+        /* 核心系统底层抽象与内存语义契约 */
         fn->delegate_param_count = nargs - 1;
         if (fn->delegate_param_count > 0) {
             fn->delegate_param_types = (zan_type_t **)zan_arena_alloc(
@@ -960,14 +960,14 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
 
     zan_type_t *resolved = base;
     if (type_ref->type_ref.is_nullable) {
-        /* `T?` over a reference type is just T: the reference already carries null */
+        /* 模块核心语义抽象与接口调用契约 */
         if (resolved && resolved != b->type_error &&
             type_is_value_kind(resolved)) {
             zan_type_t *nullable = make_type(b->arena, TYPE_NULLABLE, name.str, name.len);
             nullable->element_type = resolved;
             resolved = nullable;
         }
-        /* Reference types are left unwrapped: `A?` is A, which already admits null */
+        /* 模块核心语义抽象与接口调用契约 */
     }
     /* 内部辅助逻辑 */
     if (type_ref->type_ref.is_array) {
@@ -1009,7 +1009,7 @@ static void register_type_param_list(zan_binder_t *b, zan_ast_list_t *tps) {
 static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *decl = decls->items[i];
-        /* delegate declarations may themselves be generic: delegate R F<T>( */
+        /* 底层系统交互与数据协议契约 */
         if (decl->kind == AST_DELEGATE_DECL) {
             register_type_param_list(b, &decl->method_decl.type_params);
             continue;
@@ -1019,7 +1019,7 @@ static void register_type_params(zan_binder_t *b, zan_ast_list_t *decls) {
             continue;
         }
         register_type_param_list(b, &decl->type_decl.type_params);
-        /* Method-level type parameters (static T Id<T>( */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int m = 0; m < decl->type_decl.members.count; m++) {
             zan_ast_node_t *member = decl->type_decl.members.items[m];
             if (member->kind == AST_METHOD_DECL)
@@ -1050,7 +1050,7 @@ static zan_type_kind_t ast_kind_to_type_kind(zan_ast_kind_t kind) {
     }
 }
 
-/* Pass 1: register type declarations */
+/* 核心系统底层抽象与内存语义契约 */
 static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     /* 内部辅助逻辑 */
     zan_symbol_t **syms = (zan_symbol_t **)zan_arena_alloc(
@@ -1117,7 +1117,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
         if (sym && host_sym) symbol_add_member(b->arena, host_sym, sym);
     }
 
-    /* Resolve delegate signatures only after every named type is registered */
+    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *node = decls->items[i];
         if (node->kind != AST_DELEGATE_DECL) continue;
@@ -1147,7 +1147,7 @@ static void bind_type_decls(zan_binder_t *b, zan_ast_list_t *decls) {
     }
 }
 
-/* Pass 3: resolve base types and inherit members */
+/* 底层系统交互与数据协议契约 */
 /* 内部辅助实现 */
 static bool base_args_resolvable(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (!type_ref || type_ref->kind != AST_TYPE_REF) return false;
@@ -1194,7 +1194,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
         int nif = 0;
         for (int bx = 0; bx < nbases; bx++) {
             zan_ast_node_t *base_ref = type_node->type_decl.bases.items[bx];
-            /* parse_type_ref can return a tuple-type or error node (e */
+            /* 模块核心语义抽象与接口调用契约 */
             if (base_ref->kind != AST_TYPE_REF) {
                 zan_diag_emit(b->diag, DIAG_ERROR, base_ref->loc,
                               "invalid base type");
@@ -1217,7 +1217,7 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                                   (int)base_name.len, base_name.str);
                     continue;
                 }
-                /* make sure the base has its own inherited fields first */
+                /* 编译器代码生成与运行时系统底层调用契约 */
                 if (base_sym->decl &&
                     (base_sym->decl->kind == AST_CLASS_DECL ||
                      base_sym->decl->kind == AST_STRUCT_DECL)) {
@@ -1291,7 +1291,7 @@ static bool binder_type_equal(zan_type_t *a, zan_type_t *b, int depth) {
     if (depth > 64 || a->kind != b->kind) return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
-            return false; /* int[,] is not int[] */
+            return false; /* 核心系统底层抽象与内存语义契约 */
         return binder_type_equal(a->element_type, b->element_type, depth + 1);
     }
     if (a->kind == TYPE_DELEGATE) {
@@ -1406,10 +1406,10 @@ static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,
         *copy = *m;
         zan_ast_list_push(&type_node->type_decl.members, copy, b->arena);
     }
-    /* an interface may itself extend interfaces carrying defaults */
+    /* 底层系统交互与数据协议契约 */
     for (int bx = 0; bx < iface_node->type_decl.bases.count; bx++) {
         zan_ast_node_t *bref = iface_node->type_decl.bases.items[bx];
-        if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+        if (bref->kind != AST_TYPE_REF) continue;   /* 核心系统底层抽象与内存语义契约 */
         zan_symbol_t *bs = scope_find(b->current_scope, bref->type_ref.name);
         if (bs && bs->kind == SYM_INTERFACE && bs->decl)
             inherit_default_methods(b, type_node, bs->decl, depth + 1);
@@ -1422,7 +1422,7 @@ static void bind_default_interface_methods(zan_binder_t *b, zan_ast_list_t *decl
         if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL) continue;
         for (int bx = 0; bx < decl->type_decl.bases.count; bx++) {
             zan_ast_node_t *bref = decl->type_decl.bases.items[bx];
-            if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+            if (bref->kind != AST_TYPE_REF) continue;   /* 核心系统底层抽象与内存语义契约 */
             zan_symbol_t *bs = scope_find(b->current_scope, bref->type_ref.name);
             if (bs && bs->kind == SYM_INTERFACE && bs->decl)
                 inherit_default_methods(b, decl, bs->decl, 0);
@@ -1482,7 +1482,7 @@ static void validate_interface_contract(zan_binder_t *b, zan_symbol_t *cls,
     }
     for (int i = 0; i < iface->type_decl.bases.count; i++) {
         zan_ast_node_t *bref = iface->type_decl.bases.items[i];
-        if (bref->kind != AST_TYPE_REF) continue;   /* invalid base: rejected at resolve time */
+        if (bref->kind != AST_TYPE_REF) continue;   /* 核心系统底层抽象与内存语义契约 */
         zan_symbol_t *base = scope_find(b->current_scope, bref->type_ref.name);
         if (base && base->kind == SYM_INTERFACE && base->decl)
             validate_interface_contract(b, cls, base->decl, NULL, depth + 1);
@@ -1504,8 +1504,8 @@ static void validate_interface_contracts(zan_binder_t *b, zan_ast_list_t *decls)
     }
 }
 
-/* Pass 2: bind member declarations */
-/* Fold an enum member initializer to its integer value */
+/* 核心系统底层抽象与内存语义契约 */
+/* 底层系统交互与数据协议契约 */
 static bool fold_enum_member_value(zan_binder_t *b, zan_symbol_t *type_sym,
                                    zan_ast_node_t *e, int64_t *out) {
     if (!e) return false;
@@ -1608,7 +1608,7 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             break;
         }
         case AST_METHOD_DECL: {
-            /* generic method: make its type params resolvable in the signature */
+            /* 模块核心语义抽象与接口调用契约 */
             register_type_param_list(b, &member->method_decl.type_params);
             zan_type_t *ret_type = zan_binder_resolve_type(b, member->method_decl.return_type);
             zan_symbol_t *method_sym = make_symbol(b->arena, SYM_METHOD,
@@ -1689,16 +1689,16 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
 void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
 
-    /* pass 1: collect type declarations */
+    /* 核心系统底层抽象与内存语义契约 */
     bind_type_decls(b, &unit->comp_unit.decls);
 
-    /* Type parameters must be resolvable by every later pass: pass 1 */
+    /* 模块核心语义抽象与接口调用契约 */
     register_type_params(b, &unit->comp_unit.decls);
 
     /* pass 1 */
     bind_default_interface_methods(b, &unit->comp_unit.decls);
 
-    /* pass 2: bind members of each type */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *decl = unit->comp_unit.decls.items[i];
         if (decl->kind == AST_CLASS_DECL || decl->kind == AST_STRUCT_DECL ||

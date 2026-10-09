@@ -1,4 +1,4 @@
-/* json.c -- Minimal JSON parser and writer (see json.h). */
+/* 底层系统交互与数据协议契约 */
 #include "json.h"
 #include <stdlib.h>
 #include <string.h>
@@ -9,9 +9,9 @@
 #include <stdint.h>
 
 #include "host_oom.h"
-/* ============================ construction ============================ */
+/* construction */
 
-/* small local strdup to avoid depending on the non-standard strdup */
+/* 平台兼容的轻量级字符串复制实现 */
 static char *strdup_key(const char *s) {
     size_t n = strlen(s);
     char *d = (char *)malloc(n + 1);
@@ -67,16 +67,7 @@ void json_arr_add(json_value *arr, json_value *val) {
     arr->as.arr.items[arr->as.arr.count++] = val;
 }
 
-/* ---- object key index ----------------------------------------------------
- * json_obj_set runs once per member while parsing and used to linear-scan
- * every existing key for the replace case, making object construction
- * O(n^2) strcmps -- a 20k-key message cost ~2e8 comparisons, a CPU
- * amplifier any peer gets for free. A small open-addressing index (key hash
- * -> ordinal+1, 0 = empty slot) sits next to the ordered arrays;
- * serialization still walks the arrays, so insertion order is preserved.
- * There is no per-key removal API, so the index never needs tombstones.
- * The index is optional at runtime: if its allocation fails, callers fall
- * back to the linear scan. */
+/* 内部辅助逻辑 */
 static uint64_t json_key_hash(const char *s) {
     uint64_t h = 1469598103934665603ULL;
     while (*s) {
@@ -86,8 +77,7 @@ static uint64_t json_key_hash(const char *s) {
     return h;
 }
 
-/* index_cap is always a power of two and at least twice the member count,
- * so the load factor stays <= 0.5 and probes terminate. */
+/* 内部辅助逻辑 */
 static int json_obj_index_find(const json_value *obj, const char *key,
                                uint64_t h) {
     int cap = obj->as.obj.index_cap;
@@ -113,17 +103,12 @@ static void json_obj_index_insert(json_value *obj, const char *key,
     obj->as.obj.index[i] = ordinal + 1;
 }
 
-/* (Re)build from the ordered arrays; ordinals are stable across growth, so
- * this is also correct after keys[] was realloc'd. A failed calloc leaves
- * the object without an index -- correctness never depends on it. */
+/* 内部辅助逻辑 */
 static void json_obj_index_rebuild(json_value *obj) {
-    /* All sizing math in 64-bit: at count ~2^30 the int expression
-     * `want * 2` would overflow before any guard could see it and wrap the
-     * ladder down to a uselessly small table. */
+    /* 内部辅助逻辑 */
     long long want = obj->as.obj.cap > 8 ? obj->as.obj.cap : 8;
     if (want > (INT_MAX >> 2)) {
-        /* Beyond ~2^29 members an index is not worth the address space;
-         * stay on the linear path, which stays correct. */
+        /* 内部辅助逻辑 */
         free(obj->as.obj.index);
         obj->as.obj.index = NULL;
         obj->as.obj.index_cap = 0;
@@ -142,8 +127,7 @@ static void json_obj_index_rebuild(json_value *obj) {
 void json_obj_set(json_value *obj, const char *key, json_value *val) {
     if (!obj || obj->type != JSON_OBJ || !key || !val) return;
 
-    /* replace existing: indexed when live, linear otherwise (tiny objects
-     * never pay for an index; a failed index allocation keeps working). */
+    /* 内部辅助逻辑 */
     int found = -1;
     if (obj->as.obj.index) {
         found = json_obj_index_find(obj, key, json_key_hash(key));
@@ -159,12 +143,7 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
     }
 
     if (obj->as.obj.count >= obj->as.obj.cap) {
-        /* Grow keys and vals independently. If one realloc fails we must not
-         * touch the still-valid original of the other: realloc returns NULL
-         * and leaves the old block intact, so only commit a pointer once its
-         * realloc succeeded. This avoids the dangling-pointer + leaked-val
-         * bug where freeing the failed-side buffer corrupted the surviving
-         * side and left the object half-grown. */
+        /* 核心系统底层抽象与内存语义契约 */
         if (obj->as.obj.cap > INT_MAX / 2) { json_free(val); return; }
         int nc = obj->as.obj.cap ? obj->as.obj.cap * 2 : 8;
         char **nk = (char **)realloc(obj->as.obj.keys, sizeof(char *) * (size_t)nc);
@@ -175,8 +154,7 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
             if (nv) obj->as.obj.vals = nv;
         }
         if (!nk || !nv) {
-            /* val was never stored, so we own it and must free it to avoid a
-             * leak. The object itself stays consistent at its old capacity. */
+            /* 未持久化挂载的瞬态节点由当前调用栈负责释放，防止内存泄漏 */
             json_free(val);
             return;
         }
@@ -188,8 +166,7 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
     obj->as.obj.vals[obj->as.obj.count] = val;
     obj->as.obj.count++;
 
-    /* Keep the index live once the object is big enough for O(n^2) to hurt:
-     * build on first entry past 16 members, grow before load passes 0.5. */
+    /* 内部辅助逻辑 */
     if (!obj->as.obj.index) {
         if (obj->as.obj.count >= 16) json_obj_index_rebuild(obj);
     } else if ((long long)(obj->as.obj.count + 1) * 2 >
@@ -201,7 +178,7 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
     }
 }
 
-/* ============================== free ================================= */
+/* free */
 
 void json_free(json_value *v) {
     if (!v) return;
@@ -228,7 +205,7 @@ void json_free(json_value *v) {
     free(v);
 }
 
-/* ============================ accessors ============================== */
+/* accessors */
 
 bool json_is(const json_value *v, json_type_t type) {
     return v && v->type == type;
@@ -284,7 +261,7 @@ json_value *json_path(const json_value *root, const char *dotted_path) {
     return (json_value *)cur;
 }
 
-/* ============================== parser =============================== */
+/* parser */
 
 typedef struct {
     const char *p;
@@ -293,13 +270,7 @@ typedef struct {
     int depth;
 } jparser;
 
-/* jp_value recurses once per nesting level and is fed directly by zan-lsp /
- * zan-dap with untrusted peer messages: without a cap, a few hundred KB of
- * `[[[[...` overflows the stack and kills the server. The cap has to clear
- * genmeta's compilation metadata too, whose nesting follows the expression
- * nesting of the compiled sources (ZanIDE's own unit reaches 144), so it is
- * set well above any hand-written code rather than at Json.NET's 128; a
- * thousand jp_value frames still cost well under a megabyte of stack. */
+/* 内部辅助逻辑 */
 #define JSON_MAX_DEPTH 1024
 
 static void jp_skip_ws(jparser *j) {
@@ -312,7 +283,7 @@ static json_value *jp_value(jparser *j);
 
 static json_value *jp_string(jparser *j) {
     if (j->p >= j->end || *j->p != '"') { j->ok = false; return NULL; }
-    j->p++; /* opening quote */
+    j->p++; /* 核心系统底层抽象与内存语义契约 */
     size_t cap = 16, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) { j->ok = false; return NULL; }
@@ -330,7 +301,7 @@ static json_value *jp_string(jparser *j) {
             case '\\': c = '\\'; break;
             case '"': c = '"';  break;
             case 'u': {
-                /* decode \uXXXX to UTF-8 (BMP only; surrogate pairs handled) */
+                /* 底层系统交互与数据协议契约 */
                 if (j->end - j->p < 4) { j->ok = false; free(buf); return NULL; }
                 unsigned code = 0;
                 for (int i = 0; i < 4; i++) {
@@ -341,11 +312,7 @@ static json_value *jp_string(jparser *j) {
                     else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
                     else { j->ok = false; free(buf); return NULL; }
                 }
-                /* \u0000 decodes to a raw NUL, which the NUL-terminated string
-                 * model cannot carry: every strlen/strcmp/serialize consumer
-                 * would silently truncate at it (parsing "a\u0000b" reads back
-                 * "a"; a re-encode would drop the tail -- a bytes-changing
-                 * round trip that masks peer desync). Fail closed instead. */
+                /* 内部辅助逻辑 */
                 if (code == 0) { j->ok = false; free(buf); return NULL; }
                 if (code >= 0xD800 && code <= 0xDBFF &&
                     j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
@@ -359,19 +326,14 @@ static json_value *jp_string(jparser *j) {
                         else if (h >= 'A' && h <= 'F') lo |= (unsigned)(h - 'A' + 10);
                         else { j->ok = false; free(buf); return NULL; }
                     }
-                    /* A high surrogate must pair with a low surrogate. The old
-                     * code accepted ANY tail value: "\uD800\u0041" wrapped
-                     * around into a wrong-but-valid code point, and a bad hex
-                     * digit in the tail silently passed. */
+                    /* UTF-16 高低代理对严格配对校验 */
                     if (lo < 0xDC00 || lo > 0xDFFF) {
-                        code = 0xFFFD;      /* U+FFFD, keep parsing */
+                        code = 0xFFFD;      /* 核心系统底层抽象与内存语义契约 */
                     } else {
                         code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
                     }
                 } else if (code >= 0xD800 && code <= 0xDFFF) {
-                    /* Lone surrogate (bare low, or high with no \u tail):
-                     * encode it as U+FFFD instead of emitting CESU-8 bytes no
-                     * strict decoder accepts. */
+                    /* 内部辅助逻辑 */
                     code = 0xFFFD;
                 }
                 char utf8[4];
@@ -403,10 +365,7 @@ static json_value *jp_string(jparser *j) {
                 continue;
             }
             default:
-                /* RFC 8259 section 7: unknown escapes are a syntax error.
-                 * Laundering "\q" into "q" accepts invalid input AND makes a
-                 * round-trip through json_serialize change the bytes, which
-                 * masks desync between peers. */
+                /* 底层系统交互与数据协议契约 */
                 free(buf); j->ok = false; return NULL;
             }
         }
@@ -420,7 +379,7 @@ static json_value *jp_string(jparser *j) {
         buf[len++] = c;
     }
     if (j->p >= j->end) { free(buf); j->ok = false; return NULL; }
-    j->p++; /* closing quote */
+    j->p++; /* 核心系统底层抽象与内存语义契约 */
     buf[len] = '\0';
     json_value *v = json_alloc(JSON_STR);
     if (!v) { free(buf); j->ok = false; return NULL; }
@@ -430,8 +389,7 @@ static json_value *jp_string(jparser *j) {
 
 static json_value *jp_number(jparser *j) {
     const char *start = j->p;
-    /* RFC 8259 grammar: no leading '+'. Accepting it round-tripped numbers
-     * json_serialize would never emit. */
+    /* RFC 8259 grammar: no leading '+' */
     if (j->p < j->end && *j->p == '-') j->p++;
     while (j->p < j->end &&
            (isdigit((unsigned char)*j->p) || *j->p == '.' ||
@@ -440,10 +398,7 @@ static json_value *jp_number(jparser *j) {
     char tmp[64];
     size_t n = (size_t)(j->p - start);
     if (n >= sizeof(tmp)) {
-        /* A token this long does not fit the strtod buffer. Silent
-         * truncation used to hand back a confidently wrong value (a
-         * 70-digit integer lost its tail); treat the magnitude as
-         * overflowing, the same path strtod already takes for 1e999. */
+        /* 超出浮点数解析缓冲区的长标记溢出保护 */
         return json_new_num(*start == '-' ? -HUGE_VAL : HUGE_VAL);
     }
     memcpy(tmp, start, n);
@@ -531,32 +486,26 @@ json_value *json_parse(const char *text) {
     j.depth = 0;
     json_value *v = jp_value(&j);
     if (!j.ok) { json_free(v); return NULL; }
-    /* A well-formed document is exactly one value; reject anything trailing
-     * other than whitespace, so a malformed `{"a":1} garbage` from an LSP/DAP
-     * peer isn't silently accepted (and the garbage dropped). */
+    /* 内部辅助逻辑 */
     jp_skip_ws(&j);
     if (j.p != j.end) { json_free(v); return NULL; }
     return v;
 }
 
-/* ============================ serialize ============================== */
+/* serialize */
 
 typedef struct {
     char  *buf;
     size_t len;
     size_t cap;
-    int    oom;     /* sticky: a realloc failed (test builds only -- the
-                     * production allocation policy aborts); writers stop
-                     * touching buf so a forced failure cannot corrupt it */
+    int    oom;     /* 内部辅助逻辑 */
 } sbuf;
 
 static void sb_ensure(sbuf *s, size_t extra) {
     if (s->len + extra + 1 > s->cap) {
         size_t nc = s->cap ? s->cap * 2 : 256;
         while (nc < s->len + extra + 1) nc *= 2;
-        /* Keep the old block on failure: committing `nc` with buf == NULL (or
-         * a stale cap) turned every later write into a NULL deref or an
-         * overflow. */
+        /* 内部辅助逻辑 */
         char *g = (char *)realloc(s->buf, nc);
         if (!g) { s->oom = 1; return; }
         s->buf = g;
@@ -612,10 +561,7 @@ static void sb_put_value(sbuf *s, const json_value *v) {
     case JSON_BOOL: sb_puts(s, v->as.b ? "true" : "false"); break;
     case JSON_NUM: {
         double n = v->as.num;
-        /* inf and nan serialize to invalid JSON ("inf"/"nan" via %g), which
-         * makes strict peers abort the whole response. The parser accepts
-         * overflowing literals like 1e999, so any arithmetic on them can
-         * reach this point. Emit null, JSON's canonical "no value". */
+        /* 内部辅助逻辑 */
         if (!isfinite(n)) { sb_puts(s, "null"); break; }
         char tmp[64];
         if (n == floor(n) && fabs(n) < 1e15) {
@@ -653,6 +599,6 @@ char *json_serialize(const json_value *v) {
     sb_put_value(&s, v);
     if (!s.buf) { s.buf = (char *)malloc(1); s.cap = 1; s.len = 0; }
     if (!s.oom) s.buf[s.len] = '\0';
-    else if (s.cap > 0) s.buf[0] = '\0';   /* best-effort prefix, terminated */
+    else if (s.cap > 0) s.buf[0] = '\0';   /* 核心系统底层抽象与内存语义契约 */
     return s.buf;
 }

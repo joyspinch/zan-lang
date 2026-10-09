@@ -1,4 +1,4 @@
-/* arena.c -- Bump allocator implementation. */
+/* arena.c: 编译器块分配器实现（单向增长，无碎片，编译结束整体释放） */
 
 #include "arena.h"
 #include <stdlib.h>
@@ -27,6 +27,7 @@ void zan_arena_free(zan_arena_t *arena) {
 
 #include <stdio.h>
 
+#ifdef ZAN_ARENA_STATS
 static size_t g_arena_total_requested = 0;
 static size_t g_arena_alloc_count = 0;
 static size_t g_bucket_counts[16] = {0};
@@ -35,12 +36,13 @@ static size_t g_bucket_bytes[16] = {0};
 typedef struct { size_t sz; size_t count; size_t bytes; } size_stat_t;
 static size_stat_t g_top_sizes[128];
 static int g_top_size_count = 0;
+#endif
 
 void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
-    /* align to 8 bytes */
-    if (size > SIZE_MAX - 7) return NULL;   /* the alignment add would wrap */
+    if (size > SIZE_MAX - 7) return NULL;   /* 核心系统底层抽象与内存语义契约 */
     size = (size + 7) & ~(size_t)7;
 
+#ifdef ZAN_ARENA_STATS
     g_arena_total_requested += size;
     g_arena_alloc_count++;
     int b = 0;
@@ -64,18 +66,11 @@ void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
         g_top_sizes[g_top_size_count].bytes = size;
         g_top_size_count++;
     }
+#endif
 
-    /* Overflow-free fit check: used <= cap always holds, so the subtraction
-     * cannot underflow, whereas `used + size` could wrap past a huge size. */
+    /* 无溢出容量检查：当前块剩余空间不足时分配新块 */
     if (arena->cap - arena->used < size) {
-        /* allocate new block. An oversized request (bigger than the 1 MB
-         * standard block) gets a block of EXACTLY its own size: sizing it
-         * 2x left half of the block permanently unused whenever the next
-         * allocation did not fit the slack, so a stream of similarly sized
-         * large objects wasted ~50% of arena memory (and `size * 2` could
-         * overflow for absurd sizes). The exact-size block retires to the
-         * prev chain fully used; the next allocation opens a fresh standard
-         * block. `size` is already 8-aligned here. */
+        /* 超大请求分配精准大小块并挂入链表，常规请求按 1MB 标准块扩容 */
         size_t new_cap = ZAN_ARENA_BLOCK_SIZE;
         if (size > new_cap) new_cap = size;
         zan_arena_t *block = (zan_arena_t *)malloc(sizeof(zan_arena_t));
@@ -85,7 +80,6 @@ void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
         block->cap = new_cap;
         block->used = 0;
         block->prev = arena->prev;
-        /* swap: new block becomes current, old block goes to prev chain */
         char *old_base = arena->base;
         size_t old_used = arena->used;
         size_t old_cap = arena->cap;
@@ -122,9 +116,9 @@ size_t zan_arena_total_bytes(const zan_arena_t *arena) {
 }
 
 void zan_arena_dump_stats(void) {
+#ifdef ZAN_ARENA_STATS
     fprintf(stderr, "=== Arena Stats: %zu allocs, %zu MB requested ===\n",
             g_arena_alloc_count, g_arena_total_requested / (1024 * 1024));
-    /* Sort top sizes by total bytes descending */
     for (int i = 0; i < g_top_size_count - 1; i++) {
         for (int j = i + 1; j < g_top_size_count; j++) {
             if (g_top_sizes[j].bytes > g_top_sizes[i].bytes) {
@@ -139,4 +133,5 @@ void zan_arena_dump_stats(void) {
         fprintf(stderr, "  size %6zu B: %8zu allocs (%6zu MB)\n",
                 g_top_sizes[i].sz, g_top_sizes[i].count, g_top_sizes[i].bytes / (1024 * 1024));
     }
+#endif
 }

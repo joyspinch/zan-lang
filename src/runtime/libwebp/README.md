@@ -1,8 +1,8 @@
 # Vendored libwebp — decode-only subset
 
 Source: [libwebp v1.6.0](https://github.com/webmproject/libwebp/releases/tag/v1.6.0)
-(BSD-3-Clause, see `COPYING`). Used by the `zan_gui` driver for WebP image
-decoding behind `zan_gui_image_load_mem` (see `gui_runtime.c`).
+(BSD-3-Clause, see `COPYING`). Used by the independent `zan_image` driver for
+WebP image decoding behind `zan_image_load_mem` (see `zan_image.c`).
 
 This is **not** the full library. What was dropped and why:
 
@@ -15,7 +15,7 @@ This is **not** the full library. What was dropped and why:
 - **mux / demux / multithreading**: `thread_utils.c` is compiled without
   `WEBP_USE_THREAD`, giving the synchronous no-worker fallback.
 - `src/webp/config.h` is a **hand stub** (not upstream, not generated):
-  `HAVE_CONFIG_H` is defined by `gui_runtime.c` around the vendored includes;
+  `HAVE_CONFIG_H` is defined by `zan_image.c` around the vendored includes;
   the stub turns SSE2 on for x86-64 and leaves SSE41/threads off (a single-TU
   compile cannot express per-file `-msse4.1`).
 
@@ -23,9 +23,9 @@ To upgrade: copy the same file set from the new tag (decoder `.c/.h` under
 `src/dec`, the carried `.c` set under `src/dsp`, decode-path utils, public
 headers `decode.h encode.h format_constants.h mux_types.h types.h` under
 `src/webp`) and re-apply the local transformations below. This tree is
-compiled **unity-build style**: `gui_runtime.c` `#include`s every `.c` file
-here directly, so `scripts/build_ide.ps1`, `build_gallery.ps1` and the CMake
-`zan_gui` target all keep working from the single `gui_runtime.c` compile.
+compiled **unity-build style**: `zan_image.c` `#include`s every `.c` file here
+directly. The CMake `zan_image` target and native-driver recipes compile that
+single translation unit independently of GUI.
 
 Local transformations (re-apply on upgrade; all three bit on 1.4.0→1.6.0):
 

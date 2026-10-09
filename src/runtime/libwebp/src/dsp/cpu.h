@@ -119,7 +119,10 @@
 // inclusion of arm64_neon.h; Visual Studio 2019 includes this file in
 // arm_neon.h. Compile errors were seen with Visual Studio 2019 16.4 with
 // vtbl4_u8(); a fix was made in 16.6.
+// A configured build may omit NEON implementations; target support alone must
+// not enable them (e.g. a decode-only unity build with scalar ARM DSP).
 #if defined(_MSC_VER) && \
+    (!defined(HAVE_CONFIG_H) || defined(WEBP_HAVE_NEON)) && \
     ((_MSC_VER >= 1700 && defined(_M_ARM)) || \
      (_MSC_VER >= 1926 && (defined(_M_ARM64) || defined(_M_ARM64EC))))
 #define WEBP_USE_NEON

@@ -1,24 +1,24 @@
 /* gui_runtime_glyph */
 
-/* What the key means */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_TILE_RUN   0
 #define ZAN_TILE_GLYPH 1
 
 typedef struct {
-    char    *key;      /* NULL marks a free slot */
+    char    *key;      /* 核心系统底层抽象与内存语义契约 */
     int      key_len;
     int      kind;
     int      size;
-    uint64_t used;     /* LRU tick */
-    uint64_t stamped;  /* store epoch of the last find/store (see sweep) */
-    size_t   bytes;    /* payload accounted against the budget */
+    uint64_t used;     /* 核心系统底层抽象与内存语义契约 */
+    uint64_t stamped;  /* 底层系统交互与数据协议契约 */
+    size_t   bytes;    /* 核心系统底层抽象与内存语义契约 */
     zan_glyph_tile tile;
 } zan_atlas_slot;
 
 /* 内部辅助逻辑 */
 #define ZAN_ATLAS_CAP   4096
 #define ZAN_ATLAS_PROBE 8
-/* Desktop workstations never notice the atlas; phones do */
+/* 底层系统交互与数据协议契约 */
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_BYTES (4u * 1024u * 1024u)
 #else
@@ -34,7 +34,7 @@ static uint64_t g_atlas_hits = 0;
 static uint64_t g_atlas_misses = 0;
 static uint64_t g_atlas_swept = 0;
 
-/* Coverage-buffer pool */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_ATLAS_POOL_CAP 256
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_POOL_BYTES (1u * 1024u * 1024u)
@@ -112,10 +112,10 @@ static void zan_atlas_trim(void) {
 
 /* 内部辅助逻辑 */
 #define ZAN_ATLAS_COLD_STORES 64
-/* Sweep cadence: amortises the full-slot scan over this many stores */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_ATLAS_SWEEP 64
 
-/* Drop every cold tile */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_atlas_sweep(void) {
     for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
         zan_atlas_slot *e = &g_atlas[i];
@@ -127,7 +127,7 @@ static void zan_atlas_sweep(void) {
     }
 }
 
-/* The cached tile for this key, or NULL when the caller has to rasterize */
+/* 底层系统交互与数据协议契约 */
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
     uint64_t h = zan_atlas_hash(kind, size, key, key_len);

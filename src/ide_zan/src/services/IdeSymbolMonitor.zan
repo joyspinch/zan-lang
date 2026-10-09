@@ -1,0 +1,129 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Component;
+
+
+/// 核心契约与语义定义。
+/// 核心契约与语义定义。
+class IdeSymbolRefresh {
+}
+
+class IdeSymbolMonitor {
+    string root;
+    int workspace;
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    BlockingQueue<IdeSymbolRefresh> requests = new BlockingQueue<IdeSymbolRefresh>();
+    TaskCompletionSource<bool> drained = new TaskCompletionSource<bool>();
+
+    void Cancel() {
+        cancellation.Cancel();
+        requests.Cancel();
+    }
+}
+
+partial class ZanIDE {
+    IdeSymbolMonitor symbolMonitor;
+    List<IdeSymbolMonitor> symbolWorkers = new List<IdeSymbolMonitor>();
+    List<LspSession> retiredLanguageServices = new List<LspSession>();
+
+    void StartSymbolMonitor() {
+        if (symbolMonitor != null) { symbolMonitor.Cancel(); }
+        symbolMonitor = null;
+        if (!haveProject || shuttingDown) { return; }
+        IdeSymbolMonitor monitor = new IdeSymbolMonitor();
+        monitor.root = root;
+        monitor.workspace = documentWorkspace;
+        symbolMonitor = monitor;
+        symbolWorkers.Add(monitor);
+        App host = app;
+        if (!Thread.Start(delegate () {
+            try {
+                this.RunSymbolMonitor(monitor, host);
+            } finally {
+                monitor.drained.TrySetResult(true);
+            }
+        })) {
+            monitor.drained.TrySetResult(true);
+            symbolMonitor = null;
+            log.Add("> Could not start symbol index monitor.");
+        }
+    }
+
+    void RunSymbolMonitor(IdeSymbolMonitor monitor, App host) {
+        long stamp = 0;
+        bool loaded = false;
+        string lastFailure = "";
+        string indexPath = ZanIDE.SymbolIndexPath(monitor.root);
+        CancellationToken token = monitor.cancellation.Token;
+        while (!token.IsCancellationRequested) {
+            try {
+                if (File.Exists(indexPath) && !token.IsCancellationRequested) {
+                    long nextStamp = FileInfo.GetLastWriteTime(indexPath);
+                    if (!loaded || nextStamp != stamp) {
+                        CodeEditorPreparedSymbolIndex prepared = CodeEditor.PrepareSymbolIndex(File.ReadAllText(indexPath));
+                        stamp = nextStamp;
+                        loaded = true;
+                        host.Post(delegate () {
+                            if (shuttingDown || symbolMonitor != monitor
+                                || monitor.workspace != documentWorkspace || token.IsCancellationRequested) { return; }
+                            CodeEditor.ApplyPreparedSymbolIndex(prepared);
+                            symbolIdxStamp = nextStamp;
+                            app.RequestRedraw();
+                        });
+                    }
+                }
+                lastFailure = "";
+            } catch (Exception error) {
+                // 核心契约与语义定义。
+                string failure = error.Message;
+                if (failure != lastFailure) {
+                    lastFailure = failure;
+                    host.Post(delegate () {
+                        if (!shuttingDown && symbolMonitor == monitor) {
+                            log.Add("> Symbol index: " + failure);
+                            app.RequestRedraw();
+                        }
+                    });
+                }
+            }
+            // 核心契约与语义定义。
+            // 核心契约与语义定义。
+            IdeSymbolRefresh next = monitor.requests.DequeueFor(500);
+            if (next != null && !token.IsCancellationRequested) {
+                try {
+                    string entry = ZanIDE.ProjectEntryPath(monitor.root);
+                    if (File.Exists(entry)) { ZanIDE.EmitSymbolsDetach(monitor.root, entry); }
+                } catch (Exception error) {
+                    // 核心契约与语义定义。
+                    string failure = error.Message;
+                    host.Post(delegate () {
+                        if (!shuttingDown && symbolMonitor == monitor) {
+                            log.Add("> Symbol index: " + failure);
+                            app.RequestRedraw();
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    void CancelSymbolWork() {
+        for (int i = 0; i < symbolWorkers.Count; i = i + 1) { symbolWorkers[i].Cancel(); }
+    }
+
+    async void DrainSymbolWorkAsync() {
+        for (int i = 0; i < symbolWorkers.Count; i = i + 1) {
+            IdeSymbolMonitor monitor = symbolWorkers[i];
+            await monitor.drained.Task;
+            monitor.requests.Dispose();
+            monitor.cancellation.Dispose();
+            monitor.drained.Close();
+        }
+        for (int i = 0; i < retiredLanguageServices.Count; i = i + 1) {
+            LspSession session = retiredLanguageServices[i];
+            await session.ShutdownAsync();
+        }
+    }
+}

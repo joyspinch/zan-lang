@@ -1,11 +1,4 @@
-/* builtin_api.c -- see builtin_api.h.
- *
- * Every entry below was verified by compiling and running a call to it; members
- * that compiled but produced a wrong result (string.PadLeft, List.Sort,
- * StringBuilder.Clear, ...) are deliberately absent so they either resolve to a
- * standard-library extension method or fail to compile. Dictionary.TryGetValue
- * is present: irgen_call.c lowers it to a hash probe + conditional store into
- * the out parameter (see the Dict method block there). */
+/* builtin_api.c: 编译器内建类型成员表与签名描述定义 */
 
 #include "builtin_api.h"
 
@@ -336,10 +329,28 @@ static const zan_builtin_member_t members_pixelops[] = {
     { "ResampleBilinearRow", 'M', "void ResampleBilinearRow(nint dst, nint src0, nint src1, nint xIndices, nint xWeights, int weightY, int width)" },
 };
 
+static const zan_builtin_member_t members_scalar[] = {
+    { "ToString",            'M', "string ToString()" },
+};
+
 #define BT(name, pub, disp, stat, arr) \
     { name, pub, disp, stat, arr, (int)(sizeof(arr) / sizeof((arr)[0])) }
 
 static const zan_builtin_type_t builtin_types[] = {
+    BT("int", "int", "int", 0, members_scalar),
+    BT("long", "long", "long", 0, members_scalar),
+    BT("short", "short", "short", 0, members_scalar),
+    BT("byte", "byte", "byte", 0, members_scalar),
+    BT("sbyte", "sbyte", "sbyte", 0, members_scalar),
+    BT("uint", "uint", "uint", 0, members_scalar),
+    BT("ulong", "ulong", "ulong", 0, members_scalar),
+    BT("ushort", "ushort", "ushort", 0, members_scalar),
+    BT("float", "float", "float", 0, members_scalar),
+    BT("double", "double", "double", 0, members_scalar),
+    BT("bool", "bool", "bool", 0, members_scalar),
+    BT("char", "char", "char", 0, members_scalar),
+    BT("nint", "nint", "nint", 0, members_scalar),
+    BT("object", "object", "object", 0, members_scalar),
     BT("string", "string", "string", 0, members_string),
     BT("List", "List", "List<T>", 0, members_list),
     BT("Dict", "Dictionary", "Dictionary<K,V>", 0, members_dict),
@@ -377,10 +388,7 @@ const zan_builtin_type_t *zan_builtin_find(const char *type) {
     return NULL;
 }
 
-/* Signatures start with the result type, so it is the text before the first
-   space (a property's signature is "int Count", a method's "int IndexOf(...)").
-   The names are static, so a small table of the results actually used keeps
-   this allocation-free. */
+/* 获取内建成员的返回值类型名称（解析方法/属性签名中首个空格前的类型名） */
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
     static const char *results[] = {

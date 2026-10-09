@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/* CPU feature detection (cached after first query) */
+/* 底层系统交互与数据协议契约 */
 int zan_hw_has_popcnt(void);
 int zan_hw_has_lzcnt(void);
 int zan_hw_has_sse42(void);
@@ -44,18 +44,16 @@ int64_t zan_hw_aes_cbc_encrypt(const uint8_t *in, int64_t len,
 int64_t zan_hw_aes_cbc_decrypt(const uint8_t *in, int64_t len,
                                const uint8_t *key, int keybits,
                                const uint8_t *iv, uint8_t *out);
-/* Single-block ECB: 16 bytes in -> 16 bytes out. 0 or -1. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_aes_ecb_block(const uint8_t *key, int keybits,
                              const uint8_t *in16, uint8_t *out16);
-/* CTR keystream XOR over len bytes; counter16 is the 128-bit big-endian
- * counter, advanced in place past the consumed blocks. Returns len or -1. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_aes_ctr_crypt(const uint8_t *in, int64_t len,
                              const uint8_t *key, int keybits,
                              uint8_t *counter16, uint8_t *out);
-/* GHASH universal hash step (GCM, NIST SP 800-38D): y = (y ^ x) * h in
- * GF(2^128). All three point at 16-byte blocks. 0 or -1. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_ghash_block(const uint8_t *h16, const uint8_t *x16, uint8_t *y16);
-/* Streamed GHASH: updates y with len bytes of data, zero-padding final block if needed. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_ghash_update(const uint8_t *h16, const uint8_t *data, int64_t len, uint8_t *y16);
 
 #pragma pack(push, 1)
@@ -82,8 +80,7 @@ int64_t zan_hw_aes_gcm_decrypt_ctx(const uint8_t *ctxBuf,
                                    const uint8_t *in, int64_t inLen,
                                    const uint8_t *tag16, uint8_t *out);
 
-/* High-throughput integrated AES-GCM (NIST SP 800-38D, RFC 5288/8446) with hardware AES-NI & PCLMUL.
- * Returns inLen on success, -1 on unsupported/invalid args, or -2 on tag mismatch (decrypt). */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_aes_gcm_encrypt(const uint8_t *key, int keybits,
                                const uint8_t *iv12,
                                const uint8_t *aad, int64_t aadLen,
@@ -95,8 +92,7 @@ int64_t zan_hw_aes_gcm_decrypt(const uint8_t *key, int keybits,
                                const uint8_t *in, int64_t inLen,
                                const uint8_t *tag16, uint8_t *out);
 
-/* Modular exponentiation: base^exp mod n for RSA/DH (up to 4096-bit odd modulus).
- * All inputs and outputs are big-endian byte buffers. Returns 0 on success, -1 otherwise. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_rsa_mod_pow(const uint8_t *base, int64_t bLen,
                            const uint8_t *exp, int64_t eLen,
                            const uint8_t *mod, int64_t mLen,
@@ -117,7 +113,7 @@ int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out)
 /* CRC-32C 硬件加速计算：基于 SSE4.2 crc32 / ARMv8 CRC 指令 */
 int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len);
 
-/* Vector128 / AES-NI single-cycle primitive helpers */
+/* 底层系统交互与数据协议契约 */
 void zan_hw_aes_encrypt(const void *val, const void *key, void *out);
 void zan_hw_aes_encrypt_last(const void *val, const void *key, void *out);
 void zan_hw_aes_decrypt(const void *val, const void *key, void *out);
@@ -128,15 +124,15 @@ void zan_hw_vec128_xor(const void *a, const void *b, void *out);
 void zan_hw_vec128_load(const void *addr, void *out);
 void zan_hw_vec128_store(void *addr, const void *val);
 
-/* Base64 High-Throughput SIMD / Pipelined Encoders (RFC 4648) */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_base64_encode(const uint8_t *src, int64_t len, char *dst);
 int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst);
 
-/* JSON High-Throughput SIMD Structural Scanners */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len);
 int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len);
 
-/* PixelOps SIMD acceleration */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_hw_pixel_blend_over(uint8_t *dst, const uint8_t *src, int64_t count);
 void zan_hw_pixel_swap_rb(uint8_t *dst, const uint8_t *src, int64_t count);
 void zan_hw_pixel_fill_rect(uint8_t *dst, int64_t stride, int64_t x, int64_t y,

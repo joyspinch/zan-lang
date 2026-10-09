@@ -1,0 +1,336 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+using Gui.Component.CodeEditor;
+
+// 接口数据协议与执行契约。
+class IdeDocumentDiskInput {
+    int workspace;
+    int epoch;
+    int slot;
+    int bodyVersion;
+    int baselineVersion;
+    int editorVersion;
+    bool editorBound;
+    bool tracked;
+    string path;
+    string body;
+    string baseline;
+    long stamp;
+}
+
+class IdeDocumentWatchSnapshot {
+    int workspace;
+    int epoch;
+    bool leased;
+    List<IdeDocumentDiskInput> files = new List<IdeDocumentDiskInput>();
+}
+
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+class IdeDocumentWrite {
+    string path;
+    string text;
+    int sequence;
+    IdeDocumentDiskInput input;
+
+    static IdeDocumentWrite Create(string path, string text) {
+        IdeDocumentWrite write = new IdeDocumentWrite();
+        write.path = path;
+        write.text = text;
+        return write;
+    }
+}
+
+class IdeDocumentDiskResult {
+    IdeDocumentDiskInput input;
+    IdeDocumentWrite write;
+    string text;
+    long stamp;
+    CodeEditorPreparedText prepared;
+    string failure = "";
+    bool canceled;
+    bool baselineOnly;
+}
+
+delegate void IdeDocumentDiskReady(IdeDocumentDiskResult result);
+
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+class IdeDocumentWatch {
+    App host;
+    IdeDocumentDiskReady apply;
+    CancellationTokenSource cancellation = new CancellationTokenSource();
+    TaskCompletionSource<bool> drained = new TaskCompletionSource<bool>();
+    nint sync = Mutex.Create();
+    IdeDocumentWatchSnapshot snapshot;
+    List<IdeDocumentWrite> writes = new List<IdeDocumentWrite>();
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    Dictionary<string, DocBaselineEntry> written = new Dictionary<string, DocBaselineEntry>();
+    List<TaskCompletionSource<bool>> pauseWaiters = new List<TaskCompletionSource<bool>>();
+    bool paused;
+    bool writing;
+    int pollAt;
+
+    bool Start(App host, IdeDocumentDiskReady apply) {
+        this.host = host;
+        this.apply = apply;
+        if (Thread.Start(this.Run)) { return true; }
+        this.cancellation.Cancel();
+        this.drained.TrySetResult(false);
+        return false;
+    }
+
+    void Submit(IdeDocumentWatchSnapshot next) {
+        Mutex.Lock(this.sync);
+        if (!this.cancellation.Token.IsCancellationRequested) { this.snapshot = next; }
+        Mutex.Unlock(this.sync);
+    }
+
+    bool Enqueue(IdeDocumentWrite write) {
+        Mutex.Lock(this.sync);
+        bool accepted = !this.paused && !this.cancellation.Token.IsCancellationRequested
+            && this.snapshot != null && !this.snapshot.leased;
+        if (accepted) { this.writes.Add(write); }
+        Mutex.Unlock(this.sync);
+        return accepted;
+    }
+
+    IdeDocumentWatchSnapshot ReadSnapshot() {
+        Mutex.Lock(this.sync);
+        IdeDocumentWatchSnapshot next = this.snapshot;
+        Mutex.Unlock(this.sync);
+        return next;
+    }
+
+    static bool Contains(IdeDocumentWatchSnapshot current, IdeDocumentDiskInput input) {
+        if (current == null || input == null || current.workspace != input.workspace
+            || current.epoch != input.epoch) { return false; }
+        for (int i = 0; i < current.files.Count; i = i + 1) {
+            IdeDocumentDiskInput file = current.files[i];
+            if (file.slot == input.slot && file.path == input.path) { return true; }
+        }
+        return false;
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    IdeDocumentWrite TakeWrite() {
+        Mutex.Lock(this.sync);
+        IdeDocumentWrite write = null;
+        if (!this.writing && this.writes.Count > 0) {
+            write = this.writes[0];
+            this.writes.RemoveAt(0);
+            // 接口数据协议与执行契约。
+            // 接口数据协议与执行契约。
+            this.writing = true;
+        }
+        Mutex.Unlock(this.sync);
+        return write;
+    }
+
+    void FinishWrite() {
+        List<TaskCompletionSource<bool>> waiting = null;
+        Mutex.Lock(this.sync);
+        this.writing = false;
+        if (this.paused && this.writes.Count == 0 && this.pauseWaiters.Count > 0) {
+            waiting = this.pauseWaiters;
+            this.pauseWaiters = new List<TaskCompletionSource<bool>>();
+        }
+        Mutex.Unlock(this.sync);
+        if (waiting != null) {
+            for (int i = 0; i < waiting.Count; i = i + 1) { waiting[i].TrySetResult(true); }
+        }
+    }
+
+    void Emit(IdeDocumentDiskResult result) {
+        Mutex.Lock(this.sync);
+        App target = this.host;
+        IdeDocumentDiskReady receiver = this.apply;
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        bool current = this.snapshot != null
+            && this.snapshot.workspace == result.input.workspace
+            && this.snapshot.epoch == result.input.epoch
+            && (result.write != null || !this.cancellation.Token.IsCancellationRequested);
+        Mutex.Unlock(this.sync);
+        if (current && target != null && receiver != null) {
+            target.Post(delegate () { receiver(result); });
+        }
+    }
+
+    void SaveOne(IdeDocumentWrite write) {
+        IdeDocumentDiskResult result = new IdeDocumentDiskResult();
+        result.input = write.input;
+        result.write = write;
+        result.text = write.text;
+        try {
+            IdeDocumentWatchSnapshot current = this.ReadSnapshot();
+            if (current == null || current.leased
+                || !IdeDocumentWatch.Contains(current, write.input)) {
+                result.canceled = true;
+            } else {
+                long before = FileInfo.GetLastWriteTime(write.path);
+                bool conflict = false;
+                if (write.input.tracked && before != 0 && before != write.input.stamp) {
+                    string onDisk = File.ReadAllText(write.path);
+                    long after = FileInfo.GetLastWriteTime(write.path);
+                    DocBaselineEntry previous = null;
+                    bool ownWrite = this.written.TryGetValue(write.path, out previous)
+                        && previous.stamp == before && DocBaseline.SameText(onDisk, previous.text);
+                    // 接口数据协议与执行契约。
+                    // 接口数据协议与执行契约。
+                    conflict = after != before || !ownWrite
+                        && !DocBaseline.SameText(onDisk, write.input.baseline)
+                        && !DocBaseline.SameText(onDisk, write.text);
+                }
+                if (conflict) {
+                    result.failure = "File changed on disk; reload or keep edits before saving.";
+                } else {
+                    File.WriteAllText(write.path, write.text);
+                    result.stamp = FileInfo.GetLastWriteTime(write.path);
+                    this.written[write.path] = DocBaselineEntry.Create(write.path, write.text, result.stamp, 0);
+                }
+            }
+        } catch (Exception error) {
+            // 接口数据协议与执行契约。
+            result.failure = error.Message;
+        } finally {
+            // 接口数据协议与执行契约。
+            // 接口数据协议与执行契约。
+            this.Emit(result);
+            this.FinishWrite();
+        }
+    }
+
+    static IdeDocumentDiskResult ReadOne(IdeDocumentDiskInput input) {
+        long stamp = FileInfo.GetLastWriteTime(input.path);
+        if (stamp == 0 || input.tracked && stamp == input.stamp) { return null; }
+        IdeDocumentDiskResult result = new IdeDocumentDiskResult();
+        result.input = input;
+        try {
+            result.text = File.ReadAllText(input.path);
+            // 接口数据协议与执行契约。
+            // 接口数据协议与执行契约。
+            long after = FileInfo.GetLastWriteTime(input.path);
+            if (after == 0 || after != stamp) { return null; }
+            result.stamp = stamp;
+            result.baselineOnly = !input.tracked || DocBaseline.SameText(result.text, input.baseline)
+                || DocBaseline.SameText(result.text, input.body);
+            if (!result.baselineOnly) { result.prepared = CodeEditor.PrepareText(result.text); }
+        } catch (Exception error) {
+            // 接口数据协议与执行契约。
+            result.failure = error.Message;
+        }
+        return result;
+    }
+
+    void PollOne(IdeDocumentWatchSnapshot current) {
+        if (current == null || current.leased) { return; }
+        for (int i = 0; i < current.files.Count; i = i + 1) {
+            if (this.cancellation.Token.IsCancellationRequested) { return; }
+            IdeDocumentDiskResult result = IdeDocumentWatch.ReadOne(current.files[i]);
+            if (result != null) { this.Emit(result); }
+        }
+    }
+
+    void Run() {
+        try {
+            while (true) {
+                IdeDocumentWrite write = this.TakeWrite();
+                if (write != null) {
+                    this.SaveOne(write);
+                } else if (this.cancellation.Token.IsCancellationRequested) { break; }
+                int now = Window.GetTickMs();
+                if (!this.cancellation.Token.IsCancellationRequested
+                    && now - this.pollAt >= ZanIDE.DiskPollMs()) {
+                    this.pollAt = now;
+                    this.PollOne(this.ReadSnapshot());
+                }
+                Thread.Sleep(20);
+            }
+        } finally {
+            this.FinishWrite();
+            this.drained.TrySetResult(true);
+        }
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    TaskCompletionSource<bool> PauseWrites() {
+        TaskCompletionSource<bool> ready = new TaskCompletionSource<bool>();
+        bool idle;
+        Mutex.Lock(this.sync);
+        this.paused = true;
+        idle = !this.writing && this.writes.Count == 0;
+        if (!idle) { this.pauseWaiters.Add(ready); }
+        Mutex.Unlock(this.sync);
+        if (idle) { ready.TrySetResult(true); }
+        return ready;
+    }
+
+    void ResumeWrites() {
+        Mutex.Lock(this.sync);
+        this.paused = false;
+        Mutex.Unlock(this.sync);
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void Cancel() {
+        this.cancellation.Cancel();
+        List<TaskCompletionSource<bool>> waiting = null;
+        Mutex.Lock(this.sync);
+        this.paused = false;
+        if (this.pauseWaiters.Count > 0) {
+            waiting = this.pauseWaiters;
+            this.pauseWaiters = new List<TaskCompletionSource<bool>>();
+        }
+        Mutex.Unlock(this.sync);
+        if (waiting != null) {
+            for (int i = 0; i < waiting.Count; i = i + 1) { waiting[i].TrySetResult(true); }
+        }
+    }
+
+    async void DrainAsync() {
+        this.Cancel();
+        await this.drained.Task;
+        Mutex.Lock(this.sync);
+        this.snapshot = null;
+        this.apply = null;
+        this.host = null;
+        Mutex.Unlock(this.sync);
+    }
+
+    ~IdeDocumentWatch() {
+        Mutex.Destroy(this.sync);
+    }
+}
+
+// 接口数据协议与执行契约。
+class IdeDocumentSlot {
+    int id;
+    int bodyVersion;
+    string body;
+    string storedBody;
+    string path;
+    bool bound;
+    int editorVersion;
+    int saveApplied;
+    TabRecord tab;
+    List<TabRecord> tabSet;
+    int workspace;
+}
+
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+class IdeDocumentSave {
+    IdeDocumentWrite write;
+    Action continuation;
+}

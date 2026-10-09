@@ -1,4 +1,4 @@
-/* stdlib_ext.c -- Extended standard library runtime. */
+/* 底层系统交互与数据协议契约 */
 
 #include "stdlib_ext.h"
 #include <stdio.h>
@@ -127,7 +127,7 @@ zan_http_response_t *zan_http_post(const char *url, const char *body, const char
     return resp;
 }
 
-#else /* POSIX - dynamic libcurl with raw socket fallback */
+#else /* 底层系统交互与数据协议契约 */
 
 #include <dlfcn.h>
 #include <sys/types.h>
@@ -593,9 +593,7 @@ static char *parse_json_string(const char **p, const char *end, size_t *out_len)
     return buf;
 }
 
-/* Nesting cap for the recursive-descent JSON reader: the input ultimately
- * comes from the network, so an adversarial `[[[[[...` must fail cleanly
- * instead of exhausting the C stack. */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_JSON_MAX_DEPTH 2048
 
 static zan_json_value_t *parse_json_value(const char **p, const char *end,

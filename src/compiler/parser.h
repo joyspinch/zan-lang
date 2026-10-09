@@ -1,4 +1,4 @@
-/* parser.h -- Recursive descent parser for the Zan language. */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_PARSER_H
 #define ZAN_PARSER_H
@@ -13,15 +13,15 @@ struct zan_parser {
     zan_diag_t *diag;
     zan_token_t current;
     zan_token_t previous;
-    int expr_depth; /* current expression recursion depth (stack-overflow guard) */
-    int expr_tail_depth; /* depth of the low-precedence right recursion (assignment `a = a */
+    int expr_depth; /* 底层系统交互与数据协议契约 */
+    int expr_tail_depth; /* 底层系统交互与数据协议契约 */
     bool expr_depth_reported; /* 内部辅助逻辑 */
-    int stmt_depth; /* current statement/block recursion depth (stack-overflow guard) */
-    int type_depth; /* current type-reference recursion depth (stack-overflow guard) */
+    int stmt_depth; /* 底层系统交互与数据协议契约 */
+    int type_depth; /* 底层系统交互与数据协议契约 */
     int type_no_nullable; /* 内部辅助逻辑 */
-    int checked_depth; /* >0 while inside checked( */
-    int unchecked_depth; /* >0 while inside unchecked( */
-    int synth_counter; /* unique-id seed for synthesized locals (using temp) */
+    int checked_depth; /* 核心系统底层抽象与内存语义契约 */
+    int unchecked_depth; /* 核心系统底层抽象与内存语义契约 */
+    int synth_counter; /* 底层系统交互与数据协议契约 */
     bool chain_cap_reported; /* 内部辅助逻辑 */
     /* 内部辅助逻辑 */
     zan_ast_list_t pending_members;
@@ -38,7 +38,7 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
-/* Hoist nested type declarations (e */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
                                      zan_diag_t *diag);
 /* 内部辅助逻辑 */

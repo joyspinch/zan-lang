@@ -1,4 +1,4 @@
-/* optimizer.c -- Zan compiler optimization passes implementation. */
+/* 底层系统交互与数据协议契约 */
 
 #include "optimizer.h"
 #include "irgen.h"
@@ -91,17 +91,17 @@ static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj)
     if (!inst) return false;
     LLVMOpcode opcode = LLVMGetInstructionOpcode(inst);
 
-    /* Terminators are not safe: do not cross basic block boundaries */
+    /* 底层系统交互与数据协议契约 */
     if (LLVMIsATerminatorInst(inst)) return false;
 
-    /* Calls: check for ARC calls on different objects or safe intrinsics/read-only calls */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (opcode == LLVMCall) {
         zan_arc_call_kind_t k = get_arc_call_kind(inst);
         if (k != ARC_NONE) {
             LLVMValueRef op = get_arc_operand(inst);
-            /* If it operates on the same object, stop: must pair in program order */
+            /* 底层系统交互与数据协议契约 */
             if (are_same_arc_object(op, target_obj)) return false;
-            /* ARC calls on other objects do not mutate target_obj's refcount */
+            /* 底层系统交互与数据协议契约 */
             return true;
         }
         LLVMValueRef callee = LLVMGetCalledValue(inst);
@@ -131,23 +131,23 @@ static bool is_safe_arc_intermediate(LLVMValueRef inst, LLVMValueRef target_obj)
         return false;
     }
 
-    /* Store: safe only if target_obj itself is not being stored and the underlying slot is not overwritten */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (opcode == LLVMStore) {
         LLVMValueRef val = LLVMGetOperand(inst, 0);
         LLVMValueRef dst = strip_pointer_casts(LLVMGetOperand(inst, 1));
         if (strip_pointer_casts(val) == target_obj) {
-            return false; /* Object stored to memory, potentially escaping */
+            return false; /* 核心系统底层抽象与内存语义契约 */
         }
         if (LLVMIsAInstruction(target_obj) && LLVMGetInstructionOpcode(target_obj) == LLVMLoad) {
             LLVMValueRef src_ptr = strip_pointer_casts(LLVMGetOperand(target_obj, 0));
             if (dst == src_ptr) {
-                return false; /* Underlying slot overwritten */
+                return false; /* 核心系统底层抽象与内存语义契约 */
             }
         }
         return true;
     }
 
-    /* Atomic operations and fences: unsafe */
+    /* 核心系统底层抽象与内存语义契约 */
     if (opcode == LLVMFence || opcode == LLVMAtomicRMW || opcode == LLVMAtomicCmpXchg) {
         return false;
     }
@@ -175,7 +175,7 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                     LLVMValueRef next = LLVMGetNextInstruction(inst);
                     zan_arc_call_kind_t k1 = get_arc_call_kind(inst);
 
-                    /* Eliminate no-op ARC operations on null pointers */
+                    /* 核心系统底层抽象与内存语义契约 */
                     if (k1 != ARC_NONE) {
                         LLVMValueRef op = get_arc_operand(inst);
                         if (op && (LLVMIsNull(op) || (LLVMIsAConstant(op) && LLVMIsNull(op)))) {
@@ -187,7 +187,7 @@ zan_arc_opt_stats_t zan_opt_arc(zan_irgen_t *g, zan_opt_level_t level) {
                         }
                     }
 
-                    /* Eliminate redundant pairs: retain(x) followed by release(x) within safe window */
+                    /* 底层系统交互与数据协议契约 */
                     if (k1 == ARC_RETAIN_OBJ || k1 == ARC_RETAIN_STR) {
                         LLVMValueRef op1 = get_arc_operand(inst);
                         if (op1) {
@@ -314,7 +314,7 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                 LLVMValueRef next = LLVMGetNextInstruction(inst);
                 unsigned opcode = LLVMGetInstructionOpcode(inst);
 
-                /* Check for binary ops on constants - LLVM handles via InstCombine */
+                /* 底层系统交互与数据协议契约 */
                 if (opcode == LLVMAdd || opcode == LLVMSub ||
                     opcode == LLVMMul || opcode == LLVMSDiv) {
                     LLVMValueRef lhs = LLVMGetOperand(inst, 0);
@@ -324,10 +324,9 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
                     }
                 }
 
-                /* Detect dead conditional branches */
+                /* 核心系统底层抽象与内存语义契约 */
 #if ZAN_LLVM_MAJOR >= 23
-                /* 23 split the br opcode: the 3-operand conditional form is
-                 * its own LLVMCondBr now. */
+                /* 编译器代码生成与运行时系统底层调用契约 */
                 if (opcode == LLVMCondBr && LLVMGetNumOperands(inst) == 3) {
 #else
                 if (opcode == LLVMBr && LLVMGetNumOperands(inst) == 3) {

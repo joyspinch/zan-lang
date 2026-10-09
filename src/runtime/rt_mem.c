@@ -1,7 +1,7 @@
 /* 内部辅助实现 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
-#define _WIN32_WINNT 0x0601   /* Windows 7+: FlsAlloc and its thread-exit callback */
+#define _WIN32_WINNT 0x0601   /* 底层系统交互与数据协议契约 */
 #endif
 
 /* 内部辅助逻辑 */
@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../common/zan_abi.h"
-#include "rt_timer.h"          /* zan_rt_fatal: slab-consistency funnel */
+#include "rt_timer.h"          /* 核心系统底层抽象与内存语义契约 */
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <sys/mman.h>
@@ -29,7 +29,7 @@
 #include <windows.h>
 #endif
 
-/* The real allocator, behind the linker wrap. */
+/* 底层系统交互与数据协议契约 */
 void *__real_malloc(size_t n);
 void  __real_free(void *p);
 void *__real_calloc(size_t n, size_t m);
@@ -50,10 +50,10 @@ _Static_assert(sizeof(zan_mem_hdr_t) == ZAN_OBJ_HDR_SIZE,
                "for the compiler's object header (zan_abi.h)");
 
 #define ZAN_MEM_MAGIC 0x5A414E4DU     /* "ZANM" */
-#define ZAN_MEM_FREED 0x5A414E46U     /* "ZANF": block currently on a free list */
+#define ZAN_MEM_FREED 0x5A414E46U     /* 核心系统底层抽象与内存语义契约 */
 #define ZAN_MEM_HDR   ((size_t)sizeof(zan_mem_hdr_t))
 
-/* Payload sizes, all multiples of 16. */
+/* 核心系统底层抽象与内存语义契约 */
 static const uint16_t k_class_size[] = {
       16,   32,   48,   64,   80,   96,  112,  128,
      160,  192,  224,  256,  320,  384,  448,  512,
@@ -61,7 +61,7 @@ static const uint16_t k_class_size[] = {
 };
 #define ZAN_MEM_NCLASS ((int)(sizeof(k_class_size) / sizeof(k_class_size[0])))
 
-/* size -> class table, filled on first use. */
+/* 底层系统交互与数据协议契约 */
 static unsigned char g_size_class[ZAN_MEM_MAX_SMALL + 1];
 static int g_class_ready;
 
@@ -71,7 +71,7 @@ static int g_class_ready;
 static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 static size_t g_slab_count;
 
-/* Slabs mapped so far */
+/* 核心系统底层抽象与内存语义契约 */
 size_t zan_mem_slabs(void) {
     return __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
 }
@@ -87,12 +87,12 @@ typedef struct zan_mem_cache {
     /* 内部辅助实现 */
     struct {
         void *head;
-        char pad[64 - sizeof(void *)];  /* one stripe per cache line */
+        char pad[64 - sizeof(void *)];  /* 核心系统底层抽象与内存语义契约 */
     } remote[ZAN_MEM_REMOTE_STRIPES];
-    struct zan_mem_cache *next_free;    /* retired-cache list, under the lock */
+    struct zan_mem_cache *next_free;    /* 底层系统交互与数据协议契约 */
 } zan_mem_cache;
 
-/* Retired caches waiting to be adopted. */
+/* 核心系统底层抽象与内存语义契约 */
 static zan_mem_cache *g_cache_pool;
 
 /* 内部辅助逻辑 */
@@ -114,7 +114,7 @@ static void WINAPI zan_mem_fls_cb(void *p) {
 #include <sched.h>
 static __thread zan_mem_cache *t_cache;
 static pthread_key_t g_exit_key;
-/* 0 = not created, 1 = being created on this thread, 2 = usable */
+/* 底层系统交互与数据协议契约 */
 static int g_exit_key_state;
 static void zan_mem_thread_exit(void *p) {
     t_cache = NULL;
@@ -124,7 +124,7 @@ static void zan_mem_thread_exit(void *p) {
 
 static volatile int g_slab_lock;
 
-/* Bounded TTAS backoff, same shape as rt_timer */
+/* 底层系统交互与数据协议契约 */
 static void zan_mem_backoff(int spins) {
     if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
@@ -157,7 +157,7 @@ static void zan_mem_build_classes(void) {
     __atomic_store_n(&g_class_ready, 1, __ATOMIC_RELEASE);
 }
 
-/* Build the size-class table once */
+/* 底层系统交互与数据协议契约 */
 static void zan_mem_ensure_classes(void) {
     if (__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE)) return;
     zan_mem_lock();
@@ -170,7 +170,7 @@ static unsigned zan_mem_hash(uintptr_t base) {
     return (unsigned)(h >> 40) & ZAN_MEM_SET_MASK;
 }
 
-/* True when `p` points into one of our slabs. */
+/* 底层系统交互与数据协议契约 */
 static int zan_mem_owns(const void *p) {
     uintptr_t base = (uintptr_t)p & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
     unsigned i = zan_mem_hash(base);
@@ -180,7 +180,7 @@ static int zan_mem_owns(const void *p) {
         if (v == base) return 1;
         if (v == 0) return 0;
     }
-    /* The probe chain is full */
+    /* 核心系统底层抽象与内存语义契约 */
     for (unsigned n = 0; n < ZAN_MEM_SET_SIZE; n++) {
         uintptr_t v = __atomic_load_n(&g_slab_set[n], __ATOMIC_ACQUIRE);
         if (v == base) return 1;
@@ -188,7 +188,7 @@ static int zan_mem_owns(const void *p) {
     return 0;
 }
 
-/* The calling thread's cache, created on first use */
+/* 底层系统交互与数据协议契约 */
 static zan_mem_cache *zan_mem_cache_get(void) {
 #if defined(_WIN32)
     int fst = __atomic_load_n(&g_fls_state, __ATOMIC_ACQUIRE);
@@ -202,7 +202,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                          __ATOMIC_RELEASE);
         fst = idx == FLS_OUT_OF_INDEXES ? 3 : 2;
     }
-    if (fst != 2) return NULL;      /* still being created, or unavailable */
+    if (fst != 2) return NULL;      /* 核心系统底层抽象与内存语义契约 */
     DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
     zan_mem_cache *c = (fls == FLS_OUT_OF_INDEXES)
                        ? NULL : (zan_mem_cache *)FlsGetValue(fls);
@@ -215,7 +215,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                __ATOMIC_ACQ_REL,
                                                __ATOMIC_ACQUIRE)) {
         int ok = pthread_key_create(&g_exit_key, zan_mem_thread_exit) == 0;
-        /* 3 = key unavailable, permanently */
+        /* 核心系统底层抽象与内存语义契约 */
         __atomic_store_n(&g_exit_key_state, ok ? 2 : 3, __ATOMIC_RELEASE);
         st = ok ? 2 : 3;
     } else {
@@ -225,7 +225,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
 #endif
         }
     }
-    if (st != 2) return NULL;       /* key unavailable: no cache, no leak */
+    if (st != 2) return NULL;       /* 核心系统底层抽象与内存语义契约 */
 #endif
     zan_mem_lock();
     c = g_cache_pool;
@@ -249,7 +249,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
     return c;
 }
 
-/* Move everything foreign threads have freed back into the class free lists */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void zan_mem_drain_remote(zan_mem_cache *c) {
     for (int s = 0; s < ZAN_MEM_REMOTE_STRIPES; s++) {
         void *p = __atomic_exchange_n(&c->remote[s].head, NULL, __ATOMIC_ACQUIRE);
@@ -266,7 +266,7 @@ static void zan_mem_drain_remote(zan_mem_cache *c) {
     }
 }
 
-/* Hand a cache back for adoption when its thread exits */
+/* 模块核心语义抽象与接口调用契约 */
 static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_drain_remote(c);
     zan_mem_lock();
@@ -311,13 +311,13 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     return 0;
 }
 
-/* Publish a slab base in the ownership set and hand it to `c` as its bump region */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     zan_mem_lock();
     unsigned i = zan_mem_hash(base);
     unsigned n = 0;
     while (n < 64 && g_slab_set[(i + n) & ZAN_MEM_SET_MASK] != 0) n++;
-    if (n == 64) {                       /* set full: stay out of our world */
+    if (n == 64) {                       /* 底层系统交互与数据协议契约 */
         zan_mem_unlock();
         return 0;
     }
@@ -331,7 +331,7 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     return 1;
 }
 
-/* Grab a fresh 1 MiB-aligned slab for this thread's bump region */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_mem_new_slab(zan_mem_cache *c) {
 #if defined(_WIN32)
     /* 内部辅助实现 */
@@ -384,11 +384,11 @@ static void *zan_mem_small(size_t n) {
         p = c->free_list[cls];
     }
     if (!p) {
-        /* Try to harvest a freed block from retired caches in the pool */
+        /* 模块核心语义抽象与接口调用契约 */
         p = zan_mem_harvest_free_block(c, cls);
     }
     if (p) {
-        /* If p was found in c->free_list, advance the list */
+        /* 底层系统交互与数据协议契约 */
         if (p == c->free_list[cls]) {
             c->free_list[cls] = *(void **)p;
         }
@@ -422,7 +422,7 @@ void *__wrap_malloc(size_t n) {
     return __real_malloc(n);
 }
 
-/* Validate the allocator header in front of a slab block */
+/* 底层系统交互与数据协议契约 */
 static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
     /* 内部辅助实现 */
@@ -432,9 +432,9 @@ static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
         snprintf(msg, sizeof msg, "double free of block %p", p);
         zan_rt_fatal("mem", msg);
     }
-    if (magic != ZAN_MEM_MAGIC) return -1;   /* not a block start: ignore */
+    if (magic != ZAN_MEM_MAGIC) return -1;   /* 核心系统底层抽象与内存语义契约 */
     uint32_t c = __atomic_load_n(&h->cls, __ATOMIC_ACQUIRE);
-    if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* header garbage: refuse to trust it */
+    if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* 核心系统底层抽象与内存语义契约 */
         char msg[80];
         snprintf(msg, sizeof msg, "corrupt block header at %p (class %u)",
                  p, (unsigned)c);
@@ -450,7 +450,7 @@ void __wrap_free(void *p) {
     uint32_t cls;
     if (zan_mem_hdr_check(p, &cls) != 0) return;
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    /* Claim the block: exactly one freer sees MAGIC and flips it to FREED */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     uint32_t expect = ZAN_MEM_MAGIC;
     if (!__atomic_compare_exchange_n(&h->magic, &expect, ZAN_MEM_FREED, 0,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -459,7 +459,7 @@ void __wrap_free(void *p) {
             snprintf(msg, sizeof msg, "double free of block %p", p);
             zan_rt_fatal("mem", msg);
         }
-        return;   /* header no longer ours: not a block start */
+        return;   /* 底层系统交互与数据协议契约 */
     }
     zan_mem_cache *owner = __atomic_load_n(&h->owner, __ATOMIC_RELAXED);
 #if defined(_WIN32)
@@ -475,8 +475,8 @@ void __wrap_free(void *p) {
         self->free_list[cls] = p;
         return;
     }
-    /* Foreign free: push onto the owner's remote stack */
-    if (!owner) return;                  /* header garbage we already refused */
+    /* 模块核心语义抽象与接口调用契约 */
+    if (!owner) return;                  /* 核心系统底层抽象与内存语义契约 */
     unsigned s;
     if (self)
         s = (unsigned)(((uintptr_t)self >> 4) & (ZAN_MEM_REMOTE_STRIPES - 1));
@@ -513,7 +513,7 @@ void *__wrap_realloc(void *p, size_t n) {
     if (!zan_mem_owns(p)) return __real_realloc(p, n);
     /* 内部辅助逻辑 */
     uint32_t cls;
-    if (zan_mem_hdr_check(p, &cls) != 0) return NULL;  /* not a block start: cannot realloc */
+    if (zan_mem_hdr_check(p, &cls) != 0) return NULL;  /* 核心系统底层抽象与内存语义契约 */
     size_t old = k_class_size[cls];
     if (n <= old) return p;
     void *np = __wrap_malloc(n);

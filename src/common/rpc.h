@@ -14,21 +14,21 @@ extern "C" {
 /* 内部辅助逻辑 */
 typedef int (*rpc_reader_fn)(void *ctx, char *buf, int n);
 
-/* Write exactly `n` bytes from `buf`; return true on success. */
+/* 底层系统交互与数据协议契约 */
 typedef bool (*rpc_writer_fn)(void *ctx, const char *buf, int n);
 
-/* Read one Content-Length framed message via `reader` */
+/* 底层系统交互与数据协议契约 */
 char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len);
 
-/* Default size cap applied by rpc_read_message (the FILE wrapper): 64 MB */
+/* 底层系统交互与数据协议契约 */
 #define RPC_MAX_MESSAGE (64L * 1024 * 1024)
 
-/* Write `payload` framed with a Content-Length header via `writer` */
+/* 底层系统交互与数据协议契约 */
 bool rpc_write_message_cb(rpc_writer_fn writer, void *ctx, const char *payload);
 
-/* ---- FILE-stream convenience wrappers ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Read one framed message from `in` */
+/* 核心系统底层抽象与内存语义契约 */
 char *rpc_read_message(FILE *in);
 
 /* 内部辅助逻辑 */

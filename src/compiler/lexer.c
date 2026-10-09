@@ -1,8 +1,4 @@
-/* lexer.c -- Tokenizer for the Zan language.
- *
- * Handles all token types from SPEC.md Section 2: keywords, identifiers,
- * integer/float/string/char literals, operators, and punctuation.
- */
+/* 内部辅助实现 */
 
 #include "lexer.h"
 #include "arena.h"
@@ -12,8 +8,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-
-/* ---- keyword table ---- */
 
 typedef struct {
     const char *name;
@@ -95,10 +89,7 @@ static const keyword_entry_t s_keywords[] = {
     {"unsafe",    TK_UNSAFE},
     {"ushort",    TK_USHORT},
     {"using",     TK_USING},
-    /* `value` is a contextual keyword like C#: it is only special inside a
-     * property setter body (the implicit incoming value). The lexer must NOT
-     * reserve it, or ordinary members named `value` (field.value) become
-     * impossible. When setters are implemented, scope it in the parser. */
+    /* 内部辅助实现 */
     {"var",       TK_VAR},
     {"virtual",   TK_VIRTUAL},
     {"void",      TK_VOID},
@@ -109,8 +100,6 @@ static const keyword_entry_t s_keywords[] = {
 };
 
 #define KEYWORD_COUNT (sizeof(s_keywords) / sizeof(s_keywords[0]))
-
-/* ---- token kind names ---- */
 
 static const char *s_token_names[TK__COUNT] = {
     [TK_INVALID]     = "INVALID",
@@ -176,20 +165,24 @@ const char *zan_token_kind_name(zan_token_kind_t kind) {
     if (kind >= 0 && kind < TK__COUNT && s_token_names[kind]) {
         return s_token_names[kind];
     }
-    /* keywords: use the keyword table */
     for (size_t i = 0; i < KEYWORD_COUNT; i++) {
         if (s_keywords[i].kind == kind) return s_keywords[i].name;
     }
     return "???";
 }
 
-/* ---- lexer helpers ---- */
+bool zan_is_keyword(const char *name) {
+    if (!name) return false;
+    for (size_t i = 0; i < KEYWORD_COUNT; i++) {
+        if (strcmp(s_keywords[i].name, name) == 0) return true;
+    }
+    return false;
+}
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag) {
     memset(lex, 0, sizeof(*lex));
-    /* Skip a leading UTF-8 byte-order mark (EF BB BF) if present so that
-     * files saved with a BOM (common on Windows editors) tokenize cleanly. */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (source && len >= 3 &&
         (unsigned char)source[0] == 0xEF &&
         (unsigned char)source[1] == 0xBB &&
@@ -206,8 +199,7 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
     lex->arena = arena;
     lex->diag = diag;
     lex->at_line_start = 1;
-    /* Lazily allocated on the first #define: allocating 640 KB eagerly per
-     * lexer invocation across thousands of files/passes burned >1.5 GB of arena. */
+    /* 内部辅助逻辑 */
     lex->defines = NULL;
     lex->define_count = 0;
     lex->define_cap = 0;
@@ -228,9 +220,7 @@ static inline char lexer_peek_ch2(zan_lexer_t *lex) {
 }
 
 static inline char lexer_advance(zan_lexer_t *lex) {
-    /* guard the read: callers generally check at_end first, but a stray
-     * advance at EOF must not step past the buffer (the NUL sentinel one
-     * past the text is not guaranteed on every source path) */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (lexer_at_end(lex)) return '\0';
     char ch = lex->source[lex->pos++];
     if (ch == '\n') {
@@ -261,9 +251,6 @@ static inline bool lexer_match(zan_lexer_t *lex, char expected) {
     lexer_advance(lex);
     return true;
 }
-
-
-/* ---- Preprocessor ---- */
 
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value) {
     if (!name || !lex->arena) return;
@@ -314,8 +301,7 @@ static void pp_undef(zan_lexer_t *lex, const char *name) {
 }
 
 static int pp_active(zan_lexer_t *lex) {
-    /* an over-deep frame (nesting past ZAN_PP_MAX_COND_DEPTH) is reported as an
-     * error and treated as inactive, so tokens inside it are skipped */
+    /* 模块核心语义抽象与接口调用契约 */
     if (lex->cond_overflow > 0) return 0;
     for (int i = 0; i < lex->cond_depth; i++) {
         if (!lex->cond_stack[i]) return 0;
@@ -335,8 +321,7 @@ static void pp_skip_hspaces(zan_lexer_t *lex) {
     }
 }
 
-/* 1 if the byte at `p` starts one of the conditional directives (endif/else/
- * elif) as a whole word. */
+/* 内部辅助逻辑 */
 static int pp_word_is_conditional(const char *src, size_t len, size_t p) {
     static const char *const words[] = { "endif", "else", "elif" };
     for (int w = 0; w < 3; w++) {
@@ -349,14 +334,7 @@ static int pp_word_is_conditional(const char *src, size_t len, size_t p) {
     return 0;
 }
 
-/* Consume the tail of a directive's line. A directive whose own work ends
- * before the newline must not swallow a second directive written on the same
- * line: `#if 0 x #endif` consumed the #endif along with `x`, so the conditional
- * stayed open and every later declaration was silently skipped (only an
- * "unterminated #if" warning hinted at it). Stop at the first conditional
- * directive in the remainder and leave the `#` for the next token pass; a line
- * or block comment ends the search. #define/#error/#warning take the rest of the
- * line as raw text and keep the plain skip. */
+/* 核心系统底层抽象与内存语义契约 */
 static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
     if (!honor_conditional) { pp_skip_to_eol(lex); return; }
     size_t stop = lex->pos;
@@ -365,16 +343,12 @@ static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
         char c = lex->source[stop];
         if (c == '/' && stop + 1 < lex->source_len
             && lex->source[stop + 1] == '/') {
-            /* a line comment hides the rest of the line, #endif included */
+            /* 模块核心语义抽象与接口调用契约 */
             break;
         }
         if (c == '/' && stop + 1 < lex->source_len
             && lex->source[stop + 1] == '*') {
-            /* a block comment that closes on this line hides only its own
-             * span: skip it and keep scanning. The old code broke on the
-             * comment opener unconditionally, so a conditional closed by
-             * a same-line #endif written after a closed block comment hid
-             * that #endif and the conditional stayed open. */
+            /* 内部辅助逻辑 */
             size_t end = stop + 2;
             while (end < lex->source_len && lex->source[end] != '\n'
                    && !(lex->source[end] == '*' && end + 1 < lex->source_len
@@ -385,8 +359,7 @@ static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
                 stop = end + 2;
                 continue;
             }
-            /* unterminated on this line: the comment (and the newline)
-             * belong to it, let the main lexer pass consume it */
+            /* 模块核心语义抽象与接口调用契约 */
             break;
         }
         if (c == '#') {
@@ -412,11 +385,7 @@ static void pp_read_ident(zan_lexer_t *lex, char *buf, int maxlen) {
     buf[i] = '\0';
 }
 
-/* Evaluate a simple preprocessor expression: supports identifiers (treated as
-   defined?1:0), integer literals, !, &&, ||, ==, !=, (, ).
-   `depth` bounds the `!`/`(` recursion: an unbounded chain like
-   `#if !!!!!!!!!...` is attacker-controlled source text and would otherwise
-   exhaust the C stack before any diagnostic fires. */
+/* 内部辅助逻辑 */
 static int pp_eval_expr(zan_lexer_t *lex, int depth);
 #define ZAN_PP_EVAL_MAX_DEPTH 2048
 
@@ -438,9 +407,7 @@ static int pp_eval_atom(zan_lexer_t *lex, int depth) {
         return v;
     }
     if (isdigit((unsigned char)ch)) {
-        /* Accumulate in a wider type and clamp to INT_MAX so a pathologically
-         * long digit run in a #if expression cannot overflow (signed overflow
-         * is UB and trips the sanitizer/fuzzer build). */
+        /* 内部辅助逻辑 */
         long long v = 0;
         while (!lexer_at_end(lex) && isdigit((unsigned char)lexer_peek_ch(lex))) {
             v = v * 10 + (lexer_advance(lex) - '0');
@@ -521,10 +488,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_seen_true[lex->cond_depth] = active;
             lex->cond_depth++;
         } else {
-            /* Over the limit: count the frame instead of pushing it. Writing
-             * cond_stack[MAX] is out of bounds and aliases cond_depth, which
-             * silently reset the stack; the matching #endif decrements this
-             * counter instead. */
+            /* 内部辅助实现 */
             zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
                           "conditional-compilation nesting too deep (max %d)",
                           ZAN_PP_MAX_COND_DEPTH);
@@ -558,8 +522,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_overflow++;
         }
     } else if (strcmp(dir, "elif") == 0) {
-        /* the directive belongs to an over-deep frame that was never pushed:
-         * leave the real stack alone */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         if (lex->cond_overflow > 0) {
             /* nothing to select on */
         } else if (lex->cond_depth > 0) {
@@ -576,7 +539,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             }
         }
     } else if (strcmp(dir, "else") == 0) {
-        /* the directive belongs to an over-deep frame that was never pushed */
+        /* 底层系统交互与数据协议契约 */
         if (lex->cond_overflow > 0) {
             /* nothing to flip */
         } else if (lex->cond_depth > 0) {
@@ -612,8 +575,7 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             zan_diag_emit(lex->diag, DIAG_WARNING, lexer_loc(lex), "#warning %s", msg);
         }
     }
-    /* End the directive's line (see pp_end_directive_line): the conditional
-     * directives keep a same-line trailing #endif/#else/#elif reachable. */
+    /* 内部辅助实现 */
     int honor_conditional =
         strcmp(dir, "if") == 0 || strcmp(dir, "ifdef") == 0 ||
         strcmp(dir, "ifndef") == 0 || strcmp(dir, "elif") == 0 ||
@@ -621,20 +583,18 @@ static void pp_handle_directive(zan_lexer_t *lex) {
     pp_end_directive_line(lex, honor_conditional);
 }
 
-/* ---- skip whitespace and comments ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static void lexer_skip_whitespace(zan_lexer_t *lex) {
     for (;;) {
         if (lexer_at_end(lex)) return;
         char ch = lexer_peek_ch(lex);
 
-        /* whitespace */
         if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
             lexer_advance(lex);
             continue;
         }
 
-        /* single-line comment */
         if (ch == '/' && lexer_peek_ch2(lex) == '/') {
             while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '\n') {
                 lexer_advance(lex);
@@ -642,11 +602,10 @@ static void lexer_skip_whitespace(zan_lexer_t *lex) {
             continue;
         }
 
-        /* multi-line comment */
         if (ch == '/' && lexer_peek_ch2(lex) == '*') {
             zan_loc_t start_loc = lexer_loc(lex);
             lexer_advance(lex); /* / */
-            lexer_advance(lex); /* * */
+            lexer_advance(lex); 
             int depth = 1;
             while (!lexer_at_end(lex) && depth > 0) {
                 if (lexer_peek_ch(lex) == '/' && lexer_peek_ch2(lex) == '*') {
@@ -672,8 +631,6 @@ static void lexer_skip_whitespace(zan_lexer_t *lex) {
     }
 }
 
-/* ---- identifier / keyword ---- */
-
 static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     size_t start = lex->pos;
@@ -690,7 +647,6 @@ static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
     size_t len = lex->pos - start;
     const char *text = lex->source + start;
 
-    /* check keywords */
     for (size_t i = 0; i < KEYWORD_COUNT; i++) {
         if (strlen(s_keywords[i].name) == len &&
             memcmp(s_keywords[i].name, text, len) == 0) {
@@ -698,18 +654,15 @@ static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
         }
     }
 
-    /* identifier */
     zan_token_t tok = lexer_make(lex, TK_IDENT, loc);
     tok.str_val.str = zan_arena_strdup(lex->arena, text, len);
     tok.str_val.len = (uint32_t)len;
     return tok;
 }
 
-/* ---- number literal ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Consume a C#-style integer literal suffix and return its encoding:
- * 0=none, 1=L/l (long), 2=U/u (uint), 3=UL/LU in either case (ulong).
- * Only one L and one U may appear, in either order. */
+/* 内部辅助逻辑 */
 static int lexer_int_suffix(zan_lexer_t *lex) {
     int enc = 0;
     char c = lexer_peek_ch(lex);
@@ -727,14 +680,7 @@ static int lexer_int_suffix(zan_lexer_t *lex) {
     return enc;
 }
 
-/* Parse a hex/binary/octal digit string into the token's 64-bit slot under the
- * same overflow discipline as the decimal path. strtoull clamps to
- * ulong.MaxValue with ERANGE above it -- keeping the clamp silently truncated a
- * 65-bit literal to 0xFFFFFFFFFFFFFFFF with no diagnostic. An explicit L suffix
- * cannot hold a value above long.MaxValue (C# CS0031), and an unsuffixed one is
- * typed ulong exactly like the decimal path's auto-promotion: keeping the raw
- * bit pattern made the checker type `var v = 0xFFFFFFFFFFFFFFFF` as a negative
- * long, silently CHANGING the written value to -1. */
+/* 内部辅助实现 */
 static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
                                      const char *buf, int radix,
                                      int *lit_suffix) {
@@ -752,7 +698,7 @@ static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
                       "integer literal is too large for 'long'");
         return (int64_t)uv;
     }
-    if (*lit_suffix == 0) *lit_suffix = 3; /* above long.MaxValue -> ulong */
+    if (*lit_suffix == 0) *lit_suffix = 3; /* 核心系统底层抽象与内存语义契约 */
     return (int64_t)uv;
 }
 
@@ -761,7 +707,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     size_t start = lex->pos;
     bool is_float = false;
 
-    /* check for 0x, 0b, 0o prefixes */
     if (lexer_peek_ch(lex) == '0' && lex->pos + 1 < lex->source_len) {
         char next = lex->source[lex->pos + 1];
         if (next == 'x' || next == 'X') {
@@ -777,7 +722,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                     break;
                 }
             }
-            /* A prefix with no digits must not silently become 0. */
+            /* 底层系统交互与数据协议契约 */
             if (!digit_seen) {
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "hexadecimal literal requires at least one digit after '0x'");
@@ -786,7 +731,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
             tok.lit_suffix = lexer_int_suffix(lex);
             tok.lit_radix = 16;
-            /* parse hex value, ignoring underscores */
             char buf[64];
             size_t bi = 0;
             int lit_truncated = 0;
@@ -859,7 +803,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                     break;
                 }
             }
-            /* `0o8` must be one diagnostic, not octal `0` followed by `8`. */
+            /* 底层系统交互与数据协议契约 */
             if (!digit_seen) {
                 char bad = lexer_peek_ch(lex);
                 if (bad >= '8' && bad <= '9')
@@ -894,7 +838,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    /* decimal digits */
     while (!lexer_at_end(lex)) {
         char ch = lexer_peek_ch(lex);
         if (isdigit((unsigned char)ch) || ch == '_') {
@@ -904,7 +847,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    /* fractional part */
     if (lexer_peek_ch(lex) == '.' && lexer_peek_ch2(lex) != '.') {
         is_float = true;
         lexer_advance(lex); /* . */
@@ -918,7 +860,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    /* exponent */
     if (lexer_peek_ch(lex) == 'e' || lexer_peek_ch(lex) == 'E') {
         is_float = true;
         lexer_advance(lex); /* e */
@@ -930,8 +871,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             lexer_advance(lex);
             exp_digit_seen = true;
         }
-        /* `1e` / `1e+` must not silently become 1.0 via strtod's prefix
-         * parse -- the mantissa is not the number the user wrote. */
+        /* 核心系统底层抽象与内存语义契约 */
         if (!exp_digit_seen) {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "exponent requires at least one digit after 'e'");
@@ -946,13 +886,12 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         lexer_advance(lex);
     }
 
-    /* suffix: L/l (long), U/u (uint), UL/LU (ulong) — integer literals only */
+    /* 底层系统交互与数据协议契约 */
     int lit_suffix = 0;
     if (!is_float) {
         lit_suffix = lexer_int_suffix(lex);
     }
 
-    /* build clean number string (no underscores, no suffixes) */
     char buf[128];
     size_t bi = 0;
     int lit_truncated = 0;
@@ -966,8 +905,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
     buf[bi] = '\0';
     if (lit_truncated) {
-        /* Silently keeping the first 127 digits would make the literal a
-         * DIFFERENT number than the one written. */
+        /* 内部辅助逻辑 */
         zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float
                       ? "floating-point literal is too long"
                       : "integer literal is too long");
@@ -981,18 +919,11 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
         tok.lit_suffix = lit_suffix;
         tok.lit_radix = 10;
-        /* Decimal literals above long.MaxValue are ulong in C#; strtoll would
-         * clamp them to LLONG_MAX, so keep the unsigned bit pattern instead
-         * (the hex/binary/octal paths already do). */
+        /* 核心系统底层抽象与内存语义契约 */
         errno = 0;
         long long sv = strtoll(buf, NULL, 10);
         if (errno == ERANGE) {
-            /* Above long.MaxValue. C# types an unsuffixed literal as ulong, so
-             * wrapping the bit pattern into a negative int64 made the literal
-             * silently CHANGE VALUE (`long x = 18446744073709551615` read back
-             * as -1, and the checker then typed it int). An explicit long suffix
-             * cannot be satisfied at all, and a value above ulong.MaxValue is
-             * not representable either -- both are diagnostics. */
+            /* 内部辅助实现 */
             errno = 0;
             unsigned long long uv = strtoull(buf, NULL, 10);
             if (errno == ERANGE) {
@@ -1004,7 +935,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                               "integer literal is too large for 'long'");
                 tok.int_val = (int64_t)uv;
             } else {
-                tok.lit_suffix = 3;   /* unsuffixed decimal above long.MaxValue -> ulong */
+                tok.lit_suffix = 3;   /* 底层系统交互与数据协议契约 */
                 tok.int_val = (int64_t)uv;
             }
         } else {
@@ -1014,19 +945,13 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
 }
 
-/* ---- string literal ---- */
-
-/* Unicode escape state shared by the string/char/interpolation paths. A \u
- * or \x sequence encodes one code point, which may be up to 4 UTF-8 bytes --
- * wider than the single char the escape table returns, so emitters append
- * through this small out-param struct instead of the bare char. */
+/* 内部辅助实现 */
 typedef struct {
     char bytes[4];
     int len;
 } zan_esc_out_t;
 
-/* Decode one UTF-8 code point into out->bytes and return its length
- * (0 means the caller should fall back to the literal char). */
+/* 内部辅助实现 */
 static int zan_utf8_encode(uint32_t cp, zan_esc_out_t *out) {
     if (cp < 0x80) {
         out->bytes[0] = (char)cp;
@@ -1050,16 +975,13 @@ static int zan_utf8_encode(uint32_t cp, zan_esc_out_t *out) {
     return 4;
 }
 
-/* Read `ndigits` hex characters after the escape letter. `count` is the
- * required digit count for \u (C# fixed width); \x is C#-style 1..4
- * variable width -- it stops at the first non-hex char. Returns -1 after
- * emitting a diagnostic when the digits are missing/invalid. */
+/* 内部辅助逻辑 */
 static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
                                 int ndigits) {
     uint32_t val = 0;
     int got = 0;
     if (kind == 'x') {
-        /* \x: 1..4 hex digits, greedy stop (C# spec) */
+        /* 核心系统底层抽象与内存语义契约 */
         while (got < 4) {
             char ch = lexer_peek_ch(lex);
             if (!isxdigit((unsigned char)ch)) break;
@@ -1075,7 +997,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
             return -1;
         }
     } else {
-        /* \u: exactly 4 hex digits (C# fixed width) */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int i = 0; i < ndigits; i++) {
             char ch = lexer_peek_ch(lex);
             if (!isxdigit((unsigned char)ch)) {
@@ -1089,8 +1011,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
             val = val * 16 + (uint32_t)d;
         }
     }
-    /* Surrogate halves are not standalone code points in UTF-8; C# would
-     * produce the raw value, but here they would corrupt the encoding. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (val >= 0xD800 && val <= 0xDFFF) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                       "'\\%c' escape value 0x%X is a surrogate code point",
@@ -1100,10 +1021,7 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
     return (int32_t)val;
 }
 
-/* Decode the escape sequence that follows a backslash into `out`. Returns
- * the byte count written (1 for the classic single-char escapes, up to 4
- * for \u/\x code points). The char-only callers (lexer_char) use only the
- * first byte, which keeps single-byte code points identical to before. */
+/* 内部辅助实现 */
 static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out) {
     char ch = lexer_advance(lex);
     switch (ch) {
@@ -1132,19 +1050,15 @@ static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out)
     }
 }
 
-/* Single-byte flavour for the char literal path: a char literal holds one
- * byte, so \u/\x code points beyond 0xFF keep their low byte (matching the
- * 8-bit char model documented in SPEC.md). */
+/* 内部辅助实现 */
 static char lexer_escape_char(zan_lexer_t *lex) {
     zan_esc_out_t out;
     int n = lexer_escape_seq(lex, lexer_loc(lex), &out);
-    return out.bytes[0]; /* n unused: char literal stores one byte */
+    return out.bytes[0]; /* 底层系统交互与数据协议契约 */
     (void)n;
 }
 
-/* Growable accumulator for string-literal bodies. Growth starts at one
- * 4 KiB block and doubles from there. OOM degrades to a truncated literal
- * plus a diagnostic -- the token stays terminated and lexing continues. */
+/* 内部辅助逻辑 */
 typedef struct {
     char *buf;
     size_t len;
@@ -1162,9 +1076,7 @@ static void zan_lex_strbuf_init(zan_lex_strbuf_t *sb) {
 static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
     if (sb->oom) return;
     if (sb->len + 1 > sb->cap) {
-        /* A wrapping cap*2 would hand realloc a too-small block and the
-         * push below would then write past it; treat the size overflow as
-         * OOM, which the take path already reports and recovers from. */
+        /* 内部辅助逻辑 */
         if (sb->cap > SIZE_MAX / 2) { sb->oom = true; return; }
         size_t ncap = sb->cap * 2;
         char *nbuf = (char *)realloc(sb->buf, ncap);
@@ -1175,15 +1087,13 @@ static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
     sb->buf[sb->len++] = ch;
 }
 
-/* Copy the accumulated body into the arena (empty literal -> ""). */
+/* 模块核心语义抽象与接口调用契约 */
 static char *zan_lex_strbuf_take(zan_lexer_t *lex, zan_lex_strbuf_t *sb,
                                  size_t *out_len) {
     if (sb->oom) {
         zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
                       "out of memory while lexing string literal");
-        /* A failed realloc leaves the old block allocated; init failure
-         * leaves NULL, and free(NULL) is a no-op -- releasing unconditionally
-         * covers both without a second flag. */
+        /* 内部辅助逻辑 */
         free(sb->buf);
         sb->buf = NULL;
         *out_len = 0;
@@ -1206,10 +1116,7 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
-            /* Always run the escape through the decoder, even on OOM: it
-             * consumes the escaped characters, so skipping them would let a
-             * `\"` be re-read as the closing quote and desynchronize the
-             * lexer for the rest of the file. */
+            /* 内部辅助实现 */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
@@ -1237,7 +1144,7 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     return tok;
 }
 
-/* ---- char literal ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static zan_token_t lexer_char(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
@@ -1262,8 +1169,7 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     return tok;
 }
 
-/* The bracket counters of the innermost open interpolation hole, or NULL when
- * the lexer is not inside one. */
+/* 内部辅助逻辑 */
 static zan_interp_level_t *lexer_interp_top(zan_lexer_t *lex) {
     if (lex->interp_depth <= 0) return NULL;
     int i = lex->interp_depth - 1;
@@ -1271,19 +1177,23 @@ static zan_interp_level_t *lexer_interp_top(zan_lexer_t *lex) {
     return &lex->interp_stack[i];
 }
 
-/* ---- interpolated string $"..." ---- */
-
 static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_t start_kind) {
     zan_loc_t loc = lexer_loc(lex);
     zan_lex_strbuf_t sb;
     zan_lex_strbuf_init(&sb);
 
-    while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"' && lexer_peek_ch(lex) != '{') {
-        if (lexer_peek_ch(lex) == '\\') {
+    while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
+        char ch = lexer_peek_ch(lex);
+        if ((ch == '{' || ch == '}') && lexer_peek_ch2(lex) == ch) {
+            /* 内部辅助逻辑 */
+            lexer_advance(lex);
+            lexer_advance(lex);
+            zan_lex_strbuf_push(&sb, ch);
+        } else if (ch == '{') {
+            break; /* 底层系统交互与数据协议契约 */
+        } else if (ch == '\\') {
             lexer_advance(lex); /* \ */
-            /* Same desync guard as lexer_string: the escaped characters must
-             * be consumed even on OOM, or a truncated `\"` ends the segment
-             * early and everything after is mistokenized. */
+            /* 内部辅助逻辑 */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
@@ -1304,26 +1214,20 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
-            /* Do not push: pushing would clamp the slot index to the last
-             * level, so this hole would share the enclosing hole's bracket
-             * counters and mistokenize everything after it. The diagnostic
-             * already fired; the enclosing string stays consistent. */
+            /* 内部辅助实现 */
         } else {
             lex->interp_stack[lex->interp_depth].brace = 0;
             lex->interp_stack[lex->interp_depth].paren = 0;
             lex->interp_stack[lex->interp_depth].bracket = 0;
             lex->interp_depth++;
         }
-        kind = start_kind; /* INTERP_START or INTERP_MID */
+        kind = start_kind;
     } else {
-        /* Closing " or EOF. The hole this segment followed was already popped
-         * by its `}`, so the depth is that of the enclosing hole, if any. */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         if (!lexer_at_end(lex)) {
             lexer_advance(lex); /* " */
         } else {
-            /* EOF where the closing quote belongs: without this the file
-             * would lex clean and the error would surface (if at all) as a
-             * confusing parser complaint past the string. */
+            /* 内部辅助逻辑 */
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "unterminated interpolated string");
         }
@@ -1338,16 +1242,13 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     return tok;
 }
 
-/* Format specifier of an interpolation hole: the text between the `:` and the
- * closing `}` of `{expr:D4}`. Captured verbatim (it is arbitrary text, not
- * tokens); the `}` is left for the next lexer call, which routes it through
- * the normal INTERP_MID/END path. */
+/* 内部辅助实现 */
 static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
     char buf[256];
     size_t bi = 0;
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '}') {
         if (bi < sizeof(buf) - 1) buf[bi++] = lexer_advance(lex);
-        else lexer_advance(lex); /* format longer than the buffer: skip it */
+        else lexer_advance(lex); /* 底层系统交互与数据协议契约 */
     }
     if (bi >= sizeof(buf) - 1) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
@@ -1364,8 +1265,6 @@ static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
     return tok;
 }
 
-/* ---- verbatim string @"..." ---- */
-
 static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     lexer_advance(lex); /* @ */
@@ -1377,7 +1276,6 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
     while (!lexer_at_end(lex)) {
         if (lexer_peek_ch(lex) == '"') {
             if (lexer_peek_ch2(lex) == '"') {
-                /* escaped quote "" → " */
                 lexer_advance(lex);
                 lexer_advance(lex);
                 zan_lex_strbuf_push(&sb, '"');
@@ -1390,9 +1288,7 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
         }
     }
     if (lexer_at_end(lex)) {
-        /* @"..." runs to EOF with no closing quote (and verbatim strings
-         * span newlines, so unlike the plain literal there is no newline
-         * stop to catch it earlier). */
+        /* 内部辅助逻辑 */
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                       "unterminated verbatim string literal");
     }
@@ -1404,8 +1300,6 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
     tok.str_val.len = (uint32_t)bi;
     return tok;
 }
-
-/* ---- main tokenizer ---- */
 
 zan_token_t zan_lexer_next(zan_lexer_t *lex) {
 pp_retry:
@@ -1419,14 +1313,12 @@ pp_retry:
         return lexer_make(lex, TK_EOF, lexer_loc(lex));
     }
 
-    /* ---- Preprocessor directive handling ---- */
     if (lexer_peek_ch(lex) == '#') {
         lexer_advance(lex); /* consume # */
         pp_handle_directive(lex);
         goto pp_retry;
     }
 
-    /* If inside a false #if/#else branch, skip tokens on this line */
     if (!pp_active(lex)) {
         while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '\n') {
             lexer_advance(lex);
@@ -1437,43 +1329,32 @@ pp_retry:
     zan_loc_t loc = lexer_loc(lex);
     char ch = lexer_peek_ch(lex);
 
-    /* identifiers and keywords */
     if (isalpha((unsigned char)ch) || ch == '_') {
-        /* check for @"..." verbatim string */
-        if (ch == '@' && lexer_peek_ch2(lex) == '"') {
-            /* handled below */
-        }
         return lexer_ident_or_keyword(lex);
     }
 
-    /* number literals */
     if (isdigit((unsigned char)ch)) {
         return lexer_number(lex);
     }
 
-    /* string literal */
     if (ch == '"') {
         return lexer_string(lex);
     }
 
-    /* char literal */
     if (ch == '\'') {
         return lexer_char(lex);
     }
 
-    /* verbatim string @"..." */
     if (ch == '@' && lexer_peek_ch2(lex) == '"') {
         return lexer_verbatim_string(lex);
     }
 
-    /* interpolated string $"..." */
     if (ch == '$' && lexer_peek_ch2(lex) == '"') {
         lexer_advance(lex); /* $ */
         lexer_advance(lex); /* " */
         return lexer_interp_string_segment(lex, TK_INTERP_START);
     }
 
-    /* operators and punctuation */
     lexer_advance(lex);
 
     switch (ch) {
@@ -1489,8 +1370,7 @@ pp_retry:
         return lexer_make(lex, TK_LBRACE, loc);
     case '}':
         if (lexer_interp_top(lex) && lexer_interp_top(lex)->brace == 0) {
-            /* end of interpolation expression — pop the hole and scan the
-             * text segment that follows it */
+            /* 内部辅助逻辑 */
             lex->interp_depth--;
             return lexer_interp_string_segment(lex, TK_INTERP_MID);
         }
@@ -1505,11 +1385,7 @@ pp_retry:
         return lexer_make(lex, TK_RBRACKET, loc);
     case ';': return lexer_make(lex, TK_SEMICOLON, loc);
     case ':':
-        /* Inside a $"..." hole, a `:` at the top nesting level (no surrounding
-         * (), [] or {}) starts the format specifier: `{v:D4}`. A conditional
-         * or slice colon sits at paren/bracket depth > 0 and stays a plain
-         * colon. The format text runs to the closing `}` (C#: everything after
-         * `:` is the format), so it is captured verbatim, not tokenized. */
+        /* Inside a $" */
         {
             zan_interp_level_t *lv = lexer_interp_top(lex);
             if (lv && lv->brace == 0 && lv->paren == 0 && lv->bracket == 0)
@@ -1601,7 +1477,6 @@ pp_retry:
 }
 
 static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
-    /* save state */
     size_t pos = lex->pos;
     uint32_t line = lex->line;
     uint32_t col = lex->col;
@@ -1610,15 +1485,9 @@ static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
-    /* A speculative peek can cross a `#define`/`#undef` line; without this
-     * save the directive permanently mutates the define table even though
-     * the parse backtracks (lexer.h documents restore-on-snapshot
-     * semantics for the full-struct snapshots; peek helpers must match). */
+    /* 内部辅助实现 */
     int dcount = lex->define_count;
-    /* A speculative peek can also cross a conditional directive: the next-token
-     * pass mutates cond_depth/cond_stack/cond_overflow, and leaving that behind
-     * permanently shifts every later #else/#endif (same restore-on-snapshot
-     * contract as the define table above). */
+    /* 内部辅助逻辑 */
     int cdep = lex->cond_depth;
     int cover = lex->cond_overflow;
     int cstack[ZAN_PP_MAX_COND_DEPTH];
@@ -1633,7 +1502,6 @@ static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
     for (int i = 0; i < n; i++)
         tok = zan_lexer_next(lex);
 
-    /* restore state */
     lex->pos = pos;
     lex->line = line;
     lex->col = col;

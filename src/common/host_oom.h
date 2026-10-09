@@ -3,10 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* OOM policy */
+/* 核心系统底层抽象与内存语义契约 */
 #if defined(ZAN_OOM_TO_RUNTIME)
 static inline void zan_host_oom(void) {
-    /* zan_rt_fatal never returns */
+    /* 核心系统底层抽象与内存语义契约 */
     zan_rt_fatal("oom", "host allocation failed");
 }
 #else
@@ -18,8 +18,8 @@ static inline void zan_host_oom(void) {
 
 /* 内部辅助逻辑 */
 #ifdef ZAN_ALLOC_INJECT
-extern int zan_alloc_fail_at;   /* 0 = disabled; >0 = fail at this count */
-extern int zan_alloc_counter;   /* running; a test resets it to 0 per probe */
+extern int zan_alloc_fail_at;   /* 核心系统底层抽象与内存语义契约 */
+extern int zan_alloc_counter;   /* 核心系统底层抽象与内存语义契约 */
 static inline int zan_alloc_tick_fail(void) {
     if (zan_alloc_fail_at > 0 && ++zan_alloc_counter >= zan_alloc_fail_at)
         return 1;

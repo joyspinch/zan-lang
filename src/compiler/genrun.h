@@ -19,14 +19,14 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size);
 /* 内部辅助逻辑 */
 int zan_gen_run(const char *exe, const char *meta_path, const char *out_path);
 
-/* Translate every */
+/* 核心系统底层抽象与内存语义契约 */
 char **zan_gen_design(const char *stdlib_root, const char *const *paths,
                       size_t count);
 
-/* True when `p` is a saved user component (" */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_is_zcomp_path(const char *p);
 
-/* True when `p` is a design document (" */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_is_design_path(const char *p);
 
 /* 内部辅助逻辑 */

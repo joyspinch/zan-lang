@@ -1,4 +1,4 @@
-/* rpc.c -- Content-Length framed transport over stdio (see rpc.h). */
+/* 底层系统交互与数据协议契约 */
 #include "rpc.h"
 #include <stdlib.h>
 #include <string.h>
@@ -9,20 +9,17 @@
 
 #include "host_oom.h"
 
-/* The message cap lives in rpc.h (RPC_MAX_MESSAGE) so callers see the same
- * number this file's default reader enforces -- keep it that way. */
+/* 底层系统交互与数据协议契约 */
 
-/* Parse the value of a "Content-Length:" header line (everything after the
- * colon). Returns the length on success, or -1 on any malformation: no digits,
- * trailing junk, out of long range, or negative. */
+/* 底层系统交互与数据协议契约 */
 static long parse_content_length(const char *s) {
     errno = 0;
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (end == s) return -1;                 /* no digits */
-    /* allow trailing spaces/tabs but nothing else */
+    /* 底层系统交互与数据协议契约 */
     while (*end == ' ' || *end == '\t') end++;
-    if (*end != '\0') return -1;             /* trailing junk */
+    if (*end != '\0') return -1;             /* 核心系统底层抽象与内存语义契约 */
     if (errno == ERANGE) return -1;
     if (v < 0) return -1;
     return v;
@@ -33,7 +30,7 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
     long content_length = -1;
     bool have_content_length = false;
 
-    /* read headers until a blank line */
+    /* 核心系统底层抽象与内存语义契约 */
     for (;;) {
         int len = 0;
         bool overflow = false;
@@ -41,21 +38,19 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
             char c;
             int r = reader(ctx, &c, 1);
             if (r <= 0) {
-                if (len == 0) return NULL; /* EOF before any header byte */
-                break;                     /* EOF mid-line: process what we have */
+                if (len == 0) return NULL; /* 核心系统底层抽象与内存语义契约 */
+                break;                     /* 底层系统交互与数据协议契约 */
             }
             if (len < (int)sizeof(line) - 1) {
                 line[len++] = c;
             } else if (c != '\n') {
-                /* header line longer than the buffer: a legitimate LSP/DAP
-                 * header is never this long; treat as protocol error rather
-                 * than silently truncating (which could mis-parse the length). */
+                /* 底层系统交互与数据协议契约 */
                 overflow = true;
             }
             if (c == '\n') break;
         }
 
-        /* strip trailing CR/LF */
+        /* 核心系统底层抽象与内存语义契约 */
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
             len--;
         line[len] = '\0';
@@ -64,7 +59,7 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
 
         if (len == 0) break; /* end of headers */
 
-        /* case-insensitive match of "Content-Length:" */
+        /* 核心系统底层抽象与内存语义契约 */
         const char *prefix = "content-length:";
         size_t plen = strlen(prefix);
         bool match = true;
@@ -73,7 +68,7 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
         }
         if (match) {
             long v = parse_content_length(line + plen);
-            if (v < 0) return NULL;          /* malformed Content-Length */
+            if (v < 0) return NULL;          /* 核心系统底层抽象与内存语义契约 */
             content_length = v;
             have_content_length = true;
         }
@@ -87,20 +82,15 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
 
     long got = 0;
     while (got < content_length) {
-        /* The reader ABI takes an int count. With max_len <= 0 ("no limit",
-         * which the contract allows) content_length can exceed INT_MAX, and
-         * the plain cast truncated the request to a negative or tiny count.
-         * Cap one read and loop for the rest. */
+        /* 底层系统交互与数据协议契约 */
         long want = content_length - got;
         if (want > 2147483647L) want = 2147483647L;
         int r = reader(ctx, body + got, (int)want);
-        if (r <= 0) break; /* stream closed mid-message */
+        if (r <= 0) break; /* 核心系统底层抽象与内存语义契约 */
         got += r;
     }
     body[got] = '\0';
-    /* A short read is a truncated message, not a complete one: a peer that
-     * sent fewer bytes than it declared (or hit EOF mid-body) must not be
-     * handed upstream as if the full body arrived. */
+    /* 底层系统交互与数据协议契约 */
     if (got != content_length) {
         free(body);
         return NULL;
@@ -111,9 +101,7 @@ char *rpc_read_message_cb(rpc_reader_fn reader, void *ctx, long max_len) {
 bool rpc_write_message_cb(rpc_writer_fn writer, void *ctx, const char *payload) {
     char header[64];
     size_t len = strlen(payload);
-    /* The writer ABI takes an int length; a >INT_MAX payload would truncate
-     * to a negative count and become a huge fwrite. Fail instead of
-     * corrupting the stream (the read side caps at RPC_MAX_MESSAGE anyway). */
+    /* 底层系统交互与数据协议契约 */
     if (len > (size_t)0x7FFFFFFF) return false;
     int hn = snprintf(header, sizeof(header), "Content-Length: %zu\r\n\r\n", len);
     if (hn < 0) return false;
@@ -121,7 +109,7 @@ bool rpc_write_message_cb(rpc_writer_fn writer, void *ctx, const char *payload) 
     return writer(ctx, payload, (int)len);
 }
 
-/* ---- FILE-stream wrappers ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static int file_reader(void *ctx, char *buf, int n) {
     return (int)fread(buf, 1, (size_t)n, (FILE *)ctx);

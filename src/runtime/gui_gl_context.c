@@ -96,7 +96,7 @@ typedef struct {
     HWND    wnd;
     HDC     dc;
     HGLRC   rc;
-    int     pf;              /* pixel format the context was created for */
+    int     pf;              /* 底层系统交互与数据协议契约 */
     HGLRC (WINAPI *CreateContext)(HDC);
     BOOL  (WINAPI *DeleteContext)(HGLRC);
     BOOL  (WINAPI *MakeCurrent)(HDC, HGLRC);
@@ -104,7 +104,7 @@ typedef struct {
     PROC  (WINAPI *GetProcAddress_)(LPCSTR);
 } zan_gl_ctx;
 
-/* The GL child windows, one per shell window that presents through GL */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     HWND host, child;
     HDC  dc;
@@ -186,7 +186,7 @@ static int zan_gl_ctx_create(void) {
     if (!boot) { zan_gl_ctx_destroy(); return 0; }
     g_glctx.MakeCurrent(g_glctx.dc, boot);
 
-    /* Ask for 3 */
+    /* 核心系统底层抽象与内存语义契约 */
     HGLRC (WINAPI *create_attribs)(HDC, HGLRC, const int *) =
         (HGLRC (WINAPI *)(HDC, HGLRC, const int *))
             g_glctx.GetProcAddress_("wglCreateContextAttribsARB");
@@ -339,7 +339,7 @@ typedef struct {
     GLXPbuffer_t pbuf;
     GLXContext_t rc;
     GLXFBConfig_t cfg;       /* 内部辅助逻辑 */
-    int can_present;         /* the config also does windows and double buffers */
+    int can_present;         /* 模块核心语义抽象与接口调用契约 */
     void *(*get_proc)(const char *);
     GLXFBConfig_t *(*choose_fbconfig)(Display *, int, const int *, int *);
     GLXPbuffer_t (*create_pbuffer)(Display *, GLXFBConfig_t, const int *);
@@ -362,7 +362,7 @@ static zan_gl_ctx g_glctx;
 typedef struct {
     Window       host, child;
     Colormap     cmap;
-    GLXPbuffer_t glxwin;   /* a GLXWindow: same XID type as the pbuffer */
+    GLXPbuffer_t glxwin;   /* 底层系统交互与数据协议契约 */
     int          w, h;
 } zan_gl_present_win;
 static zan_gl_present_win g_glpres[8];
@@ -382,7 +382,7 @@ static void *zan_gl_ctx_getproc(const char *name) {
     return p;
 }
 
-/* Same lookup, typed as a function pointer for the GLX entry points below */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_anyfn zan_gl_glxfn(const char *name) {
     union { void *obj; zan_anyfn fn; } u;
     u.obj = zan_gl_ctx_getproc(name);
@@ -671,7 +671,7 @@ static int zan_gl_ctx_create(void) {
     if (!g_glctx.ChoosePixelFormat || !g_glctx.CreateContext ||
         !g_glctx.SetCurrentContext) { zan_gl_ctx_destroy(); return 0; }
 
-    /* GL4 core first (GLSL 410 hardware), then the 3 */
+    /* 底层系统交互与数据协议契约 */
     const int profiles[] = { kCGLOGLPVersion_GL4_Core, kCGLOGLPVersion_3_2_Core };
     for (int i = 0; i < 2 && !g_glctx.pf; i++) {
         const int attribs[] = {

@@ -41,7 +41,7 @@
 #define remove zan_utf8_remove
 #define rename zan_utf8_rename
 #define system zan_utf8_system
-/* strtok_r is POSIX; the MSVC/MinGW CRT spells it strtok_s. */
+/* 模块核心语义抽象与接口调用契约 */
 #define strtok_r(str, delim, save) strtok_s((str), (delim), (save))
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
@@ -62,7 +62,7 @@
 
 #include "../common/host_oom.h"
 
-/* Link-invocation capacities; every site reports on overflow (link_cap_exceeded) */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_LINK_MAX_ARGV        8192
 #define ZAN_LINK_MAX_LIBS        2048
 #define ZAN_LINK_MAX_DIRS        1024
@@ -167,7 +167,7 @@ static void cmd_appendf(char *cmd, size_t cap, const char *fmt, ...) {
 static bool g_time_phases = false;
 static double g_phase_start = 0.0;
 
-/* Scale counters: --time observes repeated frontend work without changing it */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     size_t file_reads;
     size_t bytes_read;
@@ -200,7 +200,7 @@ static double now_ms(void) {
 
 static zan_arena_t *g_main_arena = NULL;
 
-/* Closes the phase opened by the previous call and reports how long it ran */
+/* 编译期中间表示与代码生成内部规范 */
 static void phase(const char *name) {
     if (!g_time_phases) return;
     double t = now_ms();
@@ -317,7 +317,7 @@ static int input_key_count = 0;
 static int input_key_cap = 0;
 /* 内部辅助逻辑 */
 static int *input_key_idx = NULL;
-static int input_key_idx_cap = 0; /* power of two, 0 = not built yet */
+static int input_key_idx_cap = 0; /* 核心系统底层抽象与内存语义契约 */
 #ifndef _WIN32
 /* 内部辅助逻辑 */
 static int *input_ino_idx = NULL;
@@ -452,7 +452,7 @@ static int input_file_present(const char *cand) {
     return 0;
 }
 
-/* Growable input list: explicit CLI args plus transitively auto-included stdlib */
+/* 模块核心语义抽象与接口调用契约 */
 static void input_files_push(const char ***files, int *count, int *cap,
                              const char *path) {
     if (*count == *cap) {
@@ -470,7 +470,7 @@ static void input_files_push(const char ***files, int *count, int *cap,
     input_key_add(path);
 }
 
-/* Append an auto-discovered stdlib file; skip if missing or already present */
+/* 模块核心语义抽象与接口调用契约 */
 static void add_stdlib_input(const char ***files, int *count, int *cap,
                              const char *path) {
     FILE *check = fopen(path, "rb");
@@ -544,7 +544,7 @@ static int stdlib_has_dir(const char *stdlib_root, const char *subdir) {
 #endif
 }
 
-/* Namespace directories already globbed (cache). */
+/* 核心系统底层抽象与内存语义契约 */
 static char **globbed_dirs = NULL;
 static int globbed_dir_count = 0;
 static int globbed_dir_cap = 0;
@@ -648,7 +648,7 @@ static int probe_file_namespace(const char *path, char *out_ns, size_t cap) {
     return 0;
 }
 
-/* Convert a slash-separated subdir path ("A/B/C") to dot-separated namespace ("A */
+/* 模块核心语义抽象与接口调用契约 */
 static void subdir_to_namespace(const char *subdir, char *out_ns, size_t cap) {
     size_t i = 0;
     for (; subdir[i] && i + 1 < cap; i++) {
@@ -657,7 +657,7 @@ static void subdir_to_namespace(const char *subdir, char *out_ns, size_t cap) {
     out_ns[i] = '\0';
 }
 
-/* Auto-include every * */
+/* 核心系统底层抽象与内存语义契约 */
 static int glob_stdlib_dir(const char *stdlib_root, const char *subdir,
                            const char ***files, int *count, int *cap) {
     int before = *count;
@@ -1072,7 +1072,7 @@ static void scan_using_tokens(const char *source, size_t len,
 
 static zan_arena_t *pi_arena = NULL;
 static int pi_filter_active = 0;
-/* The currently seeded input is itself a stdlib file (e */
+/* 底层系统交互与数据协议契约 */
 static int pi_seed_stdlib_input = 0;
 /* 内部辅助逻辑 */
 static int pi_seeding_stdlib = 0;
@@ -1082,10 +1082,10 @@ static int pi_repair_scanning = 0;
 typedef struct pi_name {
     const char *str;
     unsigned len;
-    int flagged;                /* live: some parsed source spells this name */
+    int flagged;                /* 底层系统交互与数据协议契约 */
     int flagged_stdlib;         /* 内部辅助实现 */
     int user_decl;              /* 内部辅助实现 */
-    int ns_root;                /* segment of a known namespace path */
+    int ns_root;                /* 核心系统底层抽象与内存语义契约 */
     struct pi_name *next;
 } pi_name_t;
 
@@ -1094,20 +1094,20 @@ static pi_name_t *pi_table[PI_BUCKETS];
 
 typedef struct pi_file {
     char *path;
-    pi_name_t **top; int top_count, top_cap;      /* declared type names */
-    pi_name_t **idents; int ident_count, ident_cap; /* every identifier */
-    char **usings; int using_count, using_cap;    /* dotted subdirs */
-    int has_ext;                /* hosts an extension method */
+    pi_name_t **top; int top_count, top_cap;      /* 核心系统底层抽象与内存语义契约 */
+    pi_name_t **idents; int ident_count, ident_cap; /* 核心系统底层抽象与内存语义契约 */
+    char **usings; int using_count, using_cap;    /* 核心系统底层抽象与内存语义契约 */
+    int has_ext;                /* 核心系统底层抽象与内存语义契约 */
     int pkg_src;                /* 内部辅助实现 */
     int gate_live;              /* 内部辅助实现 */
-    int included;               /* joins the parse */
-    int parsed;                 /* already appended to the input list */
-    int seeded;                 /* already parse-seeded in the fixpoint */
+    int included;               /* 核心系统底层抽象与内存语义契约 */
+    int parsed;                 /* 核心系统底层抽象与内存语义契约 */
+    int seeded;                 /* 核心系统底层抽象与内存语义契约 */
     struct pi_file *dnext;
 } pi_file_t;
 
 typedef struct pi_dir {
-    char *subdir;               /* 'A/B/C' form, as written after `using` */
+    char *subdir;               /* 核心系统底层抽象与内存语义契约 */
     pi_file_t *files;
     int file_count, file_cap;
     int reached;                /* globbed + metadata-scanned */
@@ -1117,7 +1117,7 @@ typedef struct pi_dir {
 static pi_dir_t *pi_dirs_head = NULL;
 static pi_dir_t *pi_dirs_tail = NULL;
 
-/* The preprocessor environment of the real parse */
+/* 底层系统交互与数据协议契约 */
 static zan_target_t pi_target;
 static const char *const *pi_pp_defines = NULL;
 static int pi_pp_define_count = 0;
@@ -1152,7 +1152,7 @@ static pi_name_t *pi_intern(const char *s, size_t len) {
     return p;
 }
 
-/* Growable per-file arrays backed by the pull-in arena (no realloc: copy) */
+/* 模块核心语义抽象与接口调用契约 */
 static int pi_reserve(void *arr_p, int count, int *cap, size_t elem_sz) {
     if (count < *cap) return 1;
     int ncap = *cap ? *cap * 2 : 8;
@@ -1183,7 +1183,7 @@ static void pi_reach(const char *subdir) {
     pi_dirs_tail = d;
 }
 
-/* The stdlib root every input-relative directory probe compares against */
+/* 模块核心语义抽象与接口调用契约 */
 static const char *pi_stdlib_root_buf;
 
 /* 内部辅助逻辑 */
@@ -1223,10 +1223,10 @@ static int pi_reach_input_dir(const char *file) {
             if (eq) { base = k; break; }
         }
     }
-    if (base < 0 || base == n - 1) return 0;  /* not under the stdlib root */
+    if (base < 0 || base == n - 1) return 0;  /* 核心系统底层抽象与内存语义契约 */
     char sub[1024];
     size_t used = 0;
-    for (int k = base + 1; k < n - 1; k++) {  /* last comp = file name */
+    for (int k = base + 1; k < n - 1; k++) {  /* 核心系统底层抽象与内存语义契约 */
         size_t cl = strlen(comps[k]);
         if (used && used + 1 < sizeof(sub)) sub[used++] = '/';
         if (used + cl + 1 > sizeof(sub)) return 1;
@@ -1269,7 +1269,7 @@ static void pi_add_file(pi_dir_t *d, const char *path) {
     f->dnext = NULL;
 }
 
-/* Mirror of glob_stdlib_dir's platform halves, filling a pi_dir */
+/* 模块核心语义抽象与接口调用契约 */
 static void pi_glob_into(pi_dir_t *d, const char *root, const char *subdir) {
     char target_ns[256];
     subdir_to_namespace(subdir, target_ns, sizeof(target_ns));
@@ -1400,7 +1400,7 @@ static void pi_flag_ident(pi_file_t *f, const char *s, size_t len) {
     pi_name_t *name = pi_intern(s, len);
     if (!name) return;
     if (!f) {
-        /* Seed pass: spelled by already-parsed sources, so live right away */
+        /* 模块核心语义抽象与接口调用契约 */
         name->flagged = 1;
         if (pi_seeding_stdlib) name->flagged_stdlib = 1;
         return;
@@ -1694,7 +1694,7 @@ static void pi_scan_file(pi_file_t *f) {
                           pi_publish_mode);
     int depth = 0;
     zan_token_kind_t prev = TK_EOF;
-    pi_name_t *last_id = NULL;  /* previous chain segment; read by the Task */
+    pi_name_t *last_id = NULL;  /* 底层系统交互与数据协议契约 */
     for (;;) {
         zan_token_t tok = zan_lexer_next(&lex);
         if (tok.kind == TK_EOF) break;
@@ -1745,7 +1745,7 @@ static void pi_scan_file(pi_file_t *f) {
             }
             break;
         case TK_DELEGATE:
-            /* `delegate Ret Name<T>( */
+            /* 核心系统底层抽象与内存语义契约 */
             if (depth <= 1 && prev != TK_COLON && prev != TK_COMMA) {
                 pi_name_t *name = NULL;
                 int angle = 0;
@@ -1763,13 +1763,13 @@ static void pi_scan_file(pi_file_t *f) {
                     pi_reserve((void *)&f->top, f->top_count, &f->top_cap,
                                sizeof(pi_name_t *)))
                     f->top[f->top_count++] = name;
-                /* identifiers inside the return type are references too */
+                /* 模块核心语义抽象与接口调用契约 */
                 prev = tok.kind;
                 continue;
             }
             break;
         case TK_THIS: {
-            /* Extension-declaration shape: `this` right after '(' AND followed by a type token */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_token_t next = zan_lexer_peek(&lex);
             if (prev == TK_LPAREN && (next.kind == TK_IDENT ||
                                       next.kind == TK_STRING ||
@@ -1789,7 +1789,7 @@ static void pi_scan_file(pi_file_t *f) {
             break;
         }
         case TK_IDENT:
-            /* `record Name( */
+            /* 核心系统底层抽象与内存语义契约 */
             if (depth <= 1 && tok.str_val.len == 6 &&
                 memcmp(tok.str_val.str, "record", 6) == 0 &&
                 zan_lexer_peek(&lex).kind == TK_IDENT) {
@@ -1806,7 +1806,7 @@ static void pi_scan_file(pi_file_t *f) {
                                           tok.str_val.len);
             if (prev != TK_DOT) last_id = cur_id;
             pi_flag_ident(f, tok.str_val.str, tok.str_val.len);
-            /* Mirror the parser's Task */
+            /* 核心系统底层抽象与内存语义契约 */
             if (prev == TK_DOT && last_id && last_id->len == 4 &&
                 memcmp(last_id->str, "Task", 4) == 0 && tok.str_val.len == 7 &&
                 (memcmp(tok.str_val.str, "WhenAll", 7) == 0 ||
@@ -1850,7 +1850,7 @@ static void pi_seed_source(const char *source, size_t len) {
         /* 内部辅助逻辑 */
         int ns_file_scoped = 0;
         zan_token_kind_t prev = TK_EOF;
-        pi_name_t *chain = NULL;    /* first segment of the dotted chain */
+        pi_name_t *chain = NULL;    /* 核心系统底层抽象与内存语义契约 */
         for (;;) {
             zan_token_t tok = zan_lexer_next(&lex);
             if (tok.kind == TK_EOF) break;
@@ -1880,7 +1880,7 @@ static void pi_seed_source(const char *source, size_t len) {
                 subdir[used] = 0;
                 if (tok.kind == TK_SEMICOLON && used > 0) {
                     pi_reach(subdir);
-                    /* every segment is a namespace root for pass 2 */
+                    /* 底层系统交互与数据协议契约 */
                     for (char *seg = subdir; *seg; ) {
                         char *dot = strchr(seg, '/');
                         if (dot) *dot = 0;
@@ -1895,7 +1895,7 @@ static void pi_seed_source(const char *source, size_t len) {
                 continue;
             }
             case TK_NAMESPACE: {
-                /* the file's own namespace: its segments are roots too */
+                /* 模块核心语义抽象与接口调用契约 */
                 char nsname[512];
                 size_t used = 0;
                 tok = zan_lexer_next(&lex);
@@ -1913,7 +1913,7 @@ static void pi_seed_source(const char *source, size_t len) {
                 }
                 nsname[used] = 0;
                 if (tok.kind == TK_SEMICOLON)
-                    ns_file_scoped = 1;   /* decls below are ns-scoped */
+                    ns_file_scoped = 1;   /* 核心系统底层抽象与内存语义契约 */
                 if (tok.kind == TK_SEMICOLON || tok.kind == TK_LBRACE) {
                     for (char *seg = nsname; *seg; ) {
                         char *dot = strchr(seg, '/');
@@ -1971,7 +1971,7 @@ static void pi_seed_source(const char *source, size_t len) {
                 }
                 break;
             case TK_IDENT:
-                /* `record Name(...)` lowers to a class. */
+                /* 核心系统底层抽象与内存语义契约 */
                 if (depth == 0 && !ns_file_scoped &&
                     tok.str_val.len == 6 &&
                     memcmp(tok.str_val.str, "record", 6) == 0 &&
@@ -1991,7 +1991,7 @@ static void pi_seed_source(const char *source, size_t len) {
                         if (prev != TK_DOT) {
                             chain = name;
                             zan_token_t next = zan_lexer_peek(&lex);
-                            /* Mirror the parser's Task */
+                            /* 核心系统底层抽象与内存语义契约 */
                             if (name->len == 4 &&
                                 memcmp(name->str, "Task", 4) == 0 &&
                                 next.kind == TK_DOT) {
@@ -2019,7 +2019,7 @@ static void pi_seed_source(const char *source, size_t len) {
                                     name->flagged_stdlib = 1;
                             }
                         } else if (chain && chain->ns_root) {
-                            /* `Ns.Segment` under a known namespace root. */
+                            /* 核心系统底层抽象与内存语义契约 */
                             name->flagged = 1;
                             if (pi_seeding_stdlib)
                                 name->flagged_stdlib = 1;
@@ -2028,7 +2028,7 @@ static void pi_seed_source(const char *source, size_t len) {
                                    name->len == 7 &&
                                    (memcmp(name->str, "WhenAll", 7) == 0 ||
                                     memcmp(name->str, "WhenAny", 7) == 0)) {
-                            /* parser desugars Task */
+                            /* 核心系统底层抽象与内存语义契约 */
                             pi_name_t *tj = pi_intern("TaskJoin", 8);
                             if (tj) { tj->flagged = 1; if (pi_seeding_stdlib) tj->flagged_stdlib = 1; }
                         }
@@ -2069,7 +2069,7 @@ static void pi_flag_istr(zan_istr_t name) {
     }
 }
 
-/* Flag a segment in a chain rooted at a known namespace segment (`Gui */
+/* 模块核心语义抽象与接口调用契约 */
 static void pi_flag_qualified(zan_istr_t name) {
     if (!name.str || name.len <= 0) return;
     pi_name_t *p = pi_intern(name.str, (size_t)name.len);
@@ -2090,7 +2090,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
     if (n->meta && n->meta->attributes.count > 0)
         pi_seed_list(&n->meta->attributes);
     switch (n->kind) {
-    /* type positions: the only places a simple name is a reference */
+    /* 模块核心语义抽象与接口调用契约 */
     case AST_TYPE_REF:
         /* 内部辅助逻辑 */
         if (n->type_ref.name.str) {
@@ -2113,7 +2113,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
             pi_flag_istr(n->qualified_name.parts.items[qi]->ident.name);
         return;
 
-    /* declarations: declared names are NOT references */
+    /* 底层系统交互与数据协议契约 */
     case AST_METHOD_DECL:
     case AST_CONSTRUCTOR_DECL:
     case AST_DESTRUCTOR_DECL:
@@ -2296,7 +2296,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         pi_seed_ast(n->unary.operand);
         return;
     case AST_CALL:
-        /* a bare callee names a method/delegate/local, not a type */
+        /* 模块核心语义抽象与接口调用契约 */
         if (n->call.callee && n->call.callee->kind != AST_IDENTIFIER)
             pi_seed_chain(n->call.callee, 0);
         pi_seed_list(&n->call.args);
@@ -2318,7 +2318,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         if (obj && obj->kind == AST_IDENTIFIER) {
             /* `Root */
             pi_flag_istr(obj->ident.name);
-            /* Mirror the parser's Task */
+            /* 核心系统底层抽象与内存语义契约 */
             if (obj->ident.name.len == 4 &&
                 memcmp(obj->ident.name.str, "Task", 4) == 0) {
                 zan_istr_t m = n->member.name;
@@ -2388,7 +2388,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         pi_seed_list(&n->coll_init.items);
         return;
 
-    /* literals, this/base, goto/label: no children, no names */
+    /* 底层系统交互与数据协议契约 */
     default:
         return;
     }
@@ -2400,7 +2400,7 @@ static void pi_add_package_source(const char *path, void *context) {
     if (d->file_count > 0) { d->files[d->file_count - 1].pkg_src = 1; }
 }
 
-/* Scan stdlib candidates and matching declared-namespace package sources */
+/* 模块核心语义抽象与接口调用契约 */
 static void pi_process_dir(pi_dir_t *d, const char *stdlib_root) {
     if (d->reached) return;
     d->reached = 1;
@@ -2456,11 +2456,11 @@ static int pi_close_once(const char *stdlib_root) {
     return changed;
 }
 
-/* Repair round: reach stdlib directories for flagged-but-unsatisfied live names */
+/* 模块核心语义抽象与接口调用契约 */
 
 static int pi_repair_done = 0;
 
-/* Unsatisfied = flagged live but declared by no scanned file */
+/* 底层系统交互与数据协议契约 */
 static pi_name_t *pi_unsatisfied_set[256];
 static int pi_unsatisfied_count = 0;
 
@@ -2500,7 +2500,7 @@ static int pi_name_in_unsatisfied(pi_name_t *n) {
     return 0;
 }
 
-/* Metadata-scan one */
+/* 核心系统底层抽象与内存语义契约 */
 static void pi_repair_scan_file(const char *path) {
     pi_file_t f;
     memset(&f, 0, sizeof(f));
@@ -2644,7 +2644,7 @@ static void pi_seed_parsed_unit(zan_ast_node_t *unit, int is_entry) {
                            d->kind != AST_DELEGATE_DECL))
                     continue;
                 if (zan_ast_ns_name(d).len > 0) continue;
-                /* `name` sits at offset 0 in both union arms */
+                /* 底层系统交互与数据协议契约 */
                 zan_istr_t name = d->type_decl.name;
                 if (!name.str || name.len <= 0) continue;
                 pi_name_t *nm = pi_intern(name.str,
@@ -2682,7 +2682,7 @@ static int pi_close_converged(const char *stdlib_root, const char ***files,
     return appended;
 }
 
-/* Append every included-but-unparsed file to the compiler's input list */
+/* 模块核心语义抽象与接口调用契约 */
 static int pi_append_included(const char ***files, int *count, int *cap) {
     int before = *count;
     for (pi_dir_t *d = pi_dirs_head; d; d = d->next)
@@ -3248,7 +3248,7 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
 #define ZAN_MAX_DRIVERS 1024
 typedef struct {
     char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
-    char module[512];  /* owning module path relative to its root, '/'-sep */
+    char module[512];  /* 底层系统交互与数据协议契约 */
     char sym[64];      /* 内部辅助逻辑 */
     char root[1024];   /* 内部辅助逻辑 */
 } zan_driver_entry_t;
@@ -3262,7 +3262,7 @@ static void zan_registry_add(zan_driver_registry_t *reg,
                              const char *sym, const char *root) {
     if (reg->count >= ZAN_MAX_DRIVERS) return;
     for (int i = 0; i < reg->count; i++)
-        if (strcmp(reg->entries[i].lib, lib) == 0) return; /* first wins */
+        if (strcmp(reg->entries[i].lib, lib) == 0) return; /* 核心系统底层抽象与内存语义契约 */
     snprintf(reg->entries[reg->count].lib,
              sizeof(reg->entries[0].lib), "%s", lib);
     snprintf(reg->entries[reg->count].module,
@@ -3274,7 +3274,7 @@ static void zan_registry_add(zan_driver_registry_t *reg,
     reg->count++;
 }
 
-/* Read one module's driver */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_read_driver_manifest(const char *manifest_path,
                                      const char *module,
                                      zan_driver_registry_t *reg,
@@ -3377,7 +3377,7 @@ static void zan_scan_driver_module(const char *dir_full, const char *rel,
 
 typedef char zan_package_source_root_t[1024];
 
-/* The package API reports at most cap roots, so a full result may be truncated */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_package_source_root_t *zan_collect_package_source_roots(int *count) {
     int cap = 32;
     zan_package_source_root_t *roots = NULL;
@@ -3409,7 +3409,7 @@ static void zan_discover_drivers(const char *stdlib_root,
         scan.root = stdlib_root;
         zan_walk_stdlib_dirs(stdlib_root, "", 0, zan_scan_driver_module, &scan);
     }
-    /* Packages own drivers too: walk every visible package source root the same way */
+    /* 编译期中间表示与代码生成内部规范 */
     int pkg_n;
     zan_package_source_root_t *pkg_roots = zan_collect_package_source_roots(&pkg_n);
     for (int i = 0; i < pkg_n; i++) {
@@ -3421,7 +3421,7 @@ static void zan_discover_drivers(const char *stdlib_root,
     free(pkg_roots);
 }
 
-/* Index of the discovered driver whose lib basename matches, or -1 */
+/* 模块核心语义抽象与接口调用契约 */
 static int zan_driver_find(const zan_driver_registry_t *reg,
                            const char *lname, int len) {
     for (int i = 0; i < reg->count; i++)
@@ -3504,7 +3504,7 @@ static bool zan_resolve_gui_resource_dir(const char *stdlib_root,
     return false;
 }
 
-/* Copy a file byte-for-byte (portable; no shell) */
+/* 底层系统交互与数据协议契约 */
 static int zan_copy_file_ex(const char *src, const char *dst, char *err_buf, size_t err_cap) {
     if (err_buf && err_cap > 0) err_buf[0] = '\0';
     /* 内部辅助逻辑 */
@@ -3766,7 +3766,7 @@ static void zan_driver_capture_conditions(zan_irgen_t *g, zan_arena_t *arena,
     for (int d = 0; d < reg->count; d++) {
         const zan_driver_entry_t *driver = &reg->entries[d];
         zan_driver_prefix_record(g, arena, snapshot, driver->sym);
-        /* Scan every registered owner's bundle even when only reached via @driver */
+        /* 模块核心语义抽象与接口调用契约 */
         for (int pass = 0; pass < (override_dir ? 2 : 1); pass++) {
             char dir[1200], manifest[1400];
             if (pass == 1)
@@ -3885,7 +3885,7 @@ static void zan_exe_dir(char *out, size_t outsz) {
 #endif
 }
 
-/* Portable existence check (files or directories). */
+/* 核心系统底层抽象与内存语义契约 */
 static bool zan_file_exists(const char *path) {
 #ifdef _WIN32
     return zan_utf8_get_file_attributes(path) != INVALID_FILE_ATTRIBUTES;
@@ -3894,7 +3894,7 @@ static bool zan_file_exists(const char *path) {
 #endif
 }
 
-/* Read the first usable runtime filename from a driver bundle manifest */
+/* 模块核心语义抽象与接口调用契约 */
 static bool zan_read_first_bundle_name(const char *path,
                                        char *out, size_t outsz) {
     FILE *f = fopen(path, "rb");
@@ -3921,7 +3921,7 @@ static bool zan_read_first_bundle_name(const char *path,
     return false;
 }
 
-/* Resolve a macOS driver's link input */
+/* 核心系统底层抽象与内存语义契约 */
 static bool zan_find_macos_driver_dylib(const char *dir,
                                         const char *name, int len,
                                         char *out, size_t outsz) {
@@ -3939,7 +3939,7 @@ static bool zan_find_macos_driver_dylib(const char *dir,
     return zan_file_exists(out);
 }
 
-/* Bare filename of a path (after the last '/' or '\\'). */
+/* 底层系统交互与数据协议契约 */
 static const char *zan_path_basename(const char *p) {
     const char *b = p;
     for (const char *q = p; *q; q++)
@@ -3958,7 +3958,7 @@ static int zan_path_is_under(const char *path, const char *root) {
     if (strncmp(path, root, rl) != 0) return 0;
 #endif
     char nc = path[rl];
-    if (nc == '\0') return 1;               /* the root itself */
+    if (nc == '\0') return 1;               /* 核心系统底层抽象与内存语义契约 */
     return nc == '/' || nc == '\\';
 }
 
@@ -3993,7 +3993,7 @@ static int wasm_obj_vec_refs_any(const generated_object_vec_t *objects,
     return 0;
 }
 
-/* Only compiler-owned runtime definitions may coalesce */
+/* 底层系统交互与数据协议契约 */
 static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
                                   bool use_comdat) {
     if (!value || LLVMIsDeclaration(value)) return;
@@ -4009,7 +4009,7 @@ static void zan_runtime_fallback(zan_irgen_t *g, LLVMValueRef value,
 static void zan_prepare_static_runtime(zan_irgen_t *g,
                                         const zan_target_t *target) {
     if (g->emit_lib && g->emit_shared) return;
-    /* Mach-O coalesces weak definitions without LLVM COMDAT groups */
+    /* 模块核心语义抽象与接口调用契约 */
     bool use_comdat = target->os != ZAN_OS_MACOS && target->os != ZAN_OS_IOS;
 
     /* 内部辅助逻辑 */
@@ -4030,7 +4030,7 @@ static void zan_prepare_static_runtime(zan_irgen_t *g,
                                  use_comdat);
     }
 
-    /* The pre-existing weak IO fallbacks also need a COMDAT on COFF: otherwise their */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef io_fallbacks[] = {
         g->rt_io_pump_timeout, g->rt_io_has_pending,
         LLVMGetNamedFunction(g->mod, "zan_io_pump")
@@ -4079,7 +4079,7 @@ static int zan_run_archiver(const char *tool, const char *format,
     free(wide_path);
     if (!path) return 1;
     argv[0] = path;
-    /* _wspawnv joins argv with spaces; quote each argument for the child's CRT parser */
+    /* 编译期中间表示与代码生成内部规范 */
     char *quoted[6] = {0};
     for (int i = 0; i < 5; i++) {
         size_t len = strlen(argv[i]);
@@ -4242,7 +4242,7 @@ static void print_usage(void) {
     fprintf(stderr, "                   whitespace separated, \"quoted\" for paths with spaces)\n");
 }
 
-/* `@file` response files: a command line outgrows what a shell accepts (cmd */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     char **items;
     int count;
@@ -4329,7 +4329,7 @@ static bool expand_arg_file(const char *path, arg_list_t *out, int depth) {
     return true;
 }
 
-/* Rewrites argv with every `@file` replaced by the arguments it holds */
+/* 模块核心语义抽象与接口调用契约 */
 static void expand_arg_files(int *argc, char ***argv) {
     bool any = false;
     for (int i = 1; i < *argc; i++) {
@@ -4380,7 +4380,7 @@ int main(int argc, char **argv) {
     bool do_dump_tokens = false;
     bool do_dump_ast = false;
     const char *emit_symbols_path = NULL; /* --emit-symbols <file> */
-    const char *gen_meta_path = NULL;     /* --gen-meta <file>: export metadata */
+    const char *gen_meta_path = NULL;     /* 核心系统底层抽象与内存语义契约 */
     bool do_emit_ir = false;
     /* 内部辅助逻辑 */
     int check_leaks_opt = -1;
@@ -4392,13 +4392,13 @@ int main(int argc, char **argv) {
     int obfuscate_strings_opt = -1;
     /* 内部辅助逻辑 */
     int error_limit = -1;
-    bool debug_info = false; /* -g / --debug: emit DWARF for source debugging */
+    bool debug_info = false; /* 底层系统交互与数据协议契约 */
     /* 小对象内存分配器管理池 */
     int fast_alloc_opt = 0;
     const char *stdlib_path = NULL;
     bool auto_stdlib = true;
     bool packages_disabled = false;
-    /* quiet: suppress the human progress lines ("Compiled N files -> */
+    /* 模块核心语义抽象与接口调用契约 */
     bool quiet = false;
     const char *package_api = NULL;
     const char *package_install_dir = NULL;
@@ -4407,34 +4407,34 @@ int main(int argc, char **argv) {
     bool package_list_missing = false;
     bool do_deny_warnings = false;
     zan_pkg_scope_t package_scope = ZAN_PKG_SCOPE_PROJECT;
-    int opt_level = -1; /* -1 = auto (O0 default, O2 for publish) */
+    int opt_level = -1; /* 核心系统底层抽象与内存语义契约 */
 #define ZAN_MAX_PP_DEFINES 1024
 #define ZAN_MAX_LINK_INPUTS 1024
 #define ZAN_MAX_EMBED_SPECS 1024
     const char *pp_defines[ZAN_MAX_PP_DEFINES];
     int pp_define_count = 0;
     const char *target_name = NULL; /* --target <name|triple>; NULL = host */
-    bool link_static_drivers = false; /* --link-mode static; default shared */
+    bool link_static_drivers = false; /* 核心系统底层抽象与内存语义契约 */
     const char *driver_dir_override = NULL; /* --driver-dir */
     /* 内部辅助逻辑 */
     const char *link_subsystem = NULL;
-    const char *icon_path = NULL;   /* --icon <file.ico>: Windows exe icon */
-    bool no_icon = false;           /* --no-icon: not even the built-in default */
-    bool emit_lib = false;          /* --emit-lib / -o lib suffix: library output */
-    bool lib_shared = false;        /* library is shared (.dll/.so/.dylib), not static */
-    const char *apk_path = NULL;    /* --emit-apk <file.apk>: package libmain.so */
-    const char *apk_package = NULL; /* --apk-package <name>: override manifest package */
-    const char *apk_label = NULL;   /* --apk-label <text>: override app label */
-    const char *ipa_path = NULL;    /* --emit-ipa <file.ipa>: package iOS App Bundle */
-    const char *ipa_bundle_id = NULL; /* --ipa-bundle-id <id>: override CFBundleIdentifier */
-    const char *ipa_name = NULL;    /* --ipa-name <name>: override CFBundleDisplayName */
+    const char *icon_path = NULL;   /* 底层系统交互与数据协议契约 */
+    bool no_icon = false;           /* 底层系统交互与数据协议契约 */
+    bool emit_lib = false;          /* 底层系统交互与数据协议契约 */
+    bool lib_shared = false;        /* 底层系统交互与数据协议契约 */
+    const char *apk_path = NULL;    /* 底层系统交互与数据协议契约 */
+    const char *apk_package = NULL; /* 底层系统交互与数据协议契约 */
+    const char *apk_label = NULL;   /* 底层系统交互与数据协议契约 */
+    const char *ipa_path = NULL;    /* 模块核心语义抽象与接口调用契约 */
+    const char *ipa_bundle_id = NULL; /* 核心系统底层抽象与内存语义契约 */
+    const char *ipa_name = NULL;    /* 核心系统底层抽象与内存语义契约 */
     const char *extra_link_inputs[ZAN_MAX_LINK_INPUTS]; int extra_link_input_count = 0;
     const char *embed_specs[ZAN_MAX_EMBED_SPECS]; int embed_spec_count = 0;
     const char *extra_link_libs[ZAN_LINK_MAX_LIBS]; int extra_link_lib_count = 0;
     const char *extra_lib_paths[ZAN_LINK_MAX_DIRS]; int extra_lib_path_count = 0;
     /* 内部辅助逻辑 */
     char resolved_stdlib_root[1024] = {0};
-    char **design_outs = NULL;   /* translated .html/.zscene texts, per input */
+    char **design_outs = NULL;   /* 底层系统交互与数据协议契约 */
     size_t design_count = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -4535,7 +4535,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-Oz") == 0) {
             opt_level = ZAN_OPT_SIZE_MIN;
         } else if (strncmp(argv[i], "-ferror-limit=", 14) == 0) {
-            /* Clang-style spelling; 0 = no cap */
+            /* 核心系统底层抽象与内存语义契约 */
             error_limit = atoi(argv[i] + 14);
         } else if (strcmp(argv[i], "--subsystem") == 0 && i + 1 < argc) {
             link_subsystem = argv[++i];
@@ -4545,7 +4545,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--emit-lib") == 0) {
             emit_lib = true;
         } else if (strcmp(argv[i], "--emit-apk") == 0 && i + 1 < argc) {
-            /* Android one-shot: compile + link libmain */
+            /* 底层系统交互与数据协议契约 */
             emit_lib = true;
             apk_path = argv[++i];
         } else if (strcmp(argv[i], "--apk-package") == 0 && i + 1 < argc) {
@@ -4631,7 +4631,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: no input file\n");
         return 1;
     }
-    /* The legacy */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int fi = 0; fi < input_count; fi++) {
         size_t pn = strlen(input_files[fi]);
         if (pn > 6 && strcmp(input_files[fi] + pn - 6, ".zform") == 0) {
@@ -4661,7 +4661,7 @@ int main(int argc, char **argv) {
         scan_namespace_tokens(nsrc, nlen);
         free(nsrc);
     }
-    /* When the input sits in a project with a zan */
+    /* 底层系统交互与数据协议契约 */
     if (project_root_has_manifest()) {
         scan_project_namespaces(package_project_root);
     }
@@ -4690,7 +4690,7 @@ int main(int argc, char **argv) {
         if (stdlib_path) {
             snprintf(stdlib_root, sizeof(stdlib_root), "%s", stdlib_path);
         } else {
-            /* try: executable_dir/../stdlib/ or executable_dir/stdlib/ */
+            /* 底层系统交互与数据协议契约 */
 #ifdef _WIN32
             char exe_path[1024];
             GetModuleFileNameA(NULL, exe_path, sizeof(exe_path));
@@ -4704,7 +4704,7 @@ int main(int argc, char **argv) {
                 }
             }
 #elif defined(__APPLE__)
-            /* macOS has no /proc; ask dyld for the executable path. */
+            /* 模块核心语义抽象与接口调用契约 */
             char exe_path[1024];
             uint32_t exe_sz = sizeof(exe_path);
             if (_NSGetExecutablePath(exe_path, &exe_sz) == 0) {
@@ -4727,7 +4727,7 @@ int main(int argc, char **argv) {
             }
 #endif
         }
-    /* Collapse any " */
+    /* 核心系统底层抽象与内存语义契约 */
     {
         /* 内部辅助逻辑 */
         char norm_root[4096];
@@ -4757,7 +4757,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
-        /* Auto-include stdlib modules by path: every `using X */
+        /* 底层系统交互与数据协议契约 */
         /* 内部辅助逻辑 */
         design_outs = zan_gen_design(
             resolved_stdlib_root, (const char *const *)input_files,
@@ -4790,7 +4790,7 @@ int main(int argc, char **argv) {
                 size_t slen3 = 0;
                 char *src3 = read_file(input_files[fi], &slen3);
                 if (!src3) continue;
-                /* A design input is a JSON model (projected from the */
+                /* 底层系统交互与数据协议契约 */
                 char *owned = NULL;
                 if ((size_t)fi < design_count && design_outs[fi]) {
                     free(src3);
@@ -4815,7 +4815,7 @@ int main(int argc, char **argv) {
 
     phase("scan inputs");
 
-    /* read first source (also used for --dump-tokens) */
+    /* 模块核心语义抽象与接口调用契约 */
     size_t source_len;
     char *source = read_file(input_file, &source_len);
     if (!source) return 1;
@@ -4838,7 +4838,7 @@ int main(int argc, char **argv) {
     for (;;) {
         int round_end = input_count;
     for (int fi = scanned; fi < round_end; fi++) {
-        /* A saved user component ( */
+        /* 核心系统底层抽象与内存语义契约 */
         if (fi > 0 && zan_is_zcomp_path(input_files[fi])) continue;
         size_t slen = 0;
         char *src = (fi == 0) ? source : read_file(input_files[fi], &slen);
@@ -4902,13 +4902,13 @@ int main(int argc, char **argv) {
         g_scale_stats.real_parses++;
         int parse_failed = !unit || diag->error_count > errors_before;
         zan_nsresolve_stamp(unit, arena);
-        /* Seed the live-name worklist from this file's AST (parse-once) */
+        /* 模块核心语义抽象与接口调用契约 */
         if (pi_filter_active) {
             int seed_entry = fi < explicit_input_count &&
                              !zan_is_zcomp_path(input_files[fi]);
             pi_seed_stdlib_input =
                 seed_entry ? pi_reach_input_dir(input_files[fi]) : 0;
-            /* Mentions from stdlib-authored files stamp flagged_stdlib */
+            /* 模块核心语义抽象与接口调用契约 */
             pi_seeding_stdlib =
                 fi > 0 && auto_stdlib && resolved_stdlib_root[0] &&
                 input_files[fi] &&
@@ -4962,7 +4962,7 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    free(design_outs); /* entries were moved into `source`/the arena */
+    free(design_outs); /* 底层系统交互与数据协议契约 */
 
     phase("parse");
     probe_phase_mem("parse");
@@ -5099,7 +5099,7 @@ int main(int argc, char **argv) {
         /* 内部辅助实现 */
         zan_compile_trace("nsresolve generated");
         zan_nsresolve_run(ast, arena, diag);
-        /* Drop stdlib declarations nothing references: a `using Gui */
+        /* 底层系统交互与数据协议契约 */
         zan_compile_trace("prune");
         zan_nsresolve_prune(ast, arena, diag);
         phase("prune");
@@ -5151,7 +5151,7 @@ int main(int argc, char **argv) {
     zan_checker_check(&checker, ast);
 
     if (do_dump_ast) {
-        /* already printed */
+        /* 核心系统底层抽象与内存语义契约 */
     }
 
     if (zan_diag_has_errors(diag)) {
@@ -5178,7 +5178,7 @@ int main(int argc, char **argv) {
         else
             irgen_triple = target.triple;
     }
-    /* Library output is selected by the -o extension ( */
+    /* 核心系统底层抽象与内存语义契约 */
     if (output_file && !emit_lib) {
         const char *ext = strrchr(output_file, '.');
         if (ext) {
@@ -5197,14 +5197,14 @@ int main(int argc, char **argv) {
             lib_shared = true;
     }
     if (apk_path) {
-        /* The APK output is a shared libmain */
+        /* 核心系统底层抽象与内存语义契约 */
         lib_shared = true;
         if (target.os != ZAN_OS_ANDROID) {
             fprintf(stderr, "error: --emit-apk requires --target "
                     "android-x64 or android-arm64\n");
             return 1;
         }
-        /* Pull androidPackage/androidLabel/androidPermissions from the project's zan */
+        /* 模块核心语义抽象与接口调用契约 */
         if (project_root_has_manifest()) {
             if (!load_proj_android_keys_done) {
                 load_proj_android_keys();
@@ -5263,7 +5263,7 @@ int main(int argc, char **argv) {
     irgen.publish_mode = publish_mode;
     /* 内部辅助逻辑 */
     irgen.rt_guard_split = !cross_compiling;
-    /* Obfuscate string literals: opt-in via --obfuscate-strings or ZAN_OBF=1 */
+    /* 模块核心语义抽象与接口调用契约 */
     const char *obf_env = getenv("ZAN_OBF");
     const char *no_obf_env = getenv("ZAN_NO_OBF");
     if (obfuscate_strings_opt >= 0) {
@@ -5285,7 +5285,7 @@ int main(int argc, char **argv) {
                         target.arch == ZAN_ARCH_AARCH64);
     bool shard_opt_out = (shard_env && shard_env[0] == '0') ||
                          (no_shard_env && no_shard_env[0] == '1');
-    /* Sharded emission splits function bodies into <obj> */
+    /* 底层系统交互与数据协议契约 */
     bool want_shard = native_arch && !cross_compiling && !shard_opt_out &&
                       ((shard_env && shard_env[0] == '1') || publish_mode);
 
@@ -5342,7 +5342,7 @@ int main(int argc, char **argv) {
         zan_arena_dump_stats();
     }
 
-    /* Release the frontend AST, binder and source excerpts now that irgen is done */
+    /* 编译期中间表示与代码生成内部规范 */
     if (arena) {
         for (int i = 0; i < irgen.extern_lib_count; i++) {
             zan_istr_t *lib = &irgen.extern_libs[i];
@@ -5381,7 +5381,7 @@ int main(int argc, char **argv) {
     bool mf_built = false;
     if (getenv("ZAN_CODEGEN_MANIFEST") || mf_json_path || want_shard) {
         zan_opt_strip_unused(&irgen);
-        /* All callers still live in this module */
+        /* 底层系统交互与数据协议契约 */
         zan_irgen_prune_extern_libs(&irgen);
         phase("manifest");
         probe_phase_mem("manifest");
@@ -5409,7 +5409,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "note: -g forces -O0 (debug info is emitted unoptimized)\n");
         effective_opt = ZAN_OPT_NONE;
     }
-    /* Determine output path early for shard planning */
+    /* 底层系统交互与数据协议契约 */
     char obj_path[1024];
     if (ipa_path) {
         snprintf(obj_path, sizeof(obj_path), "%s.macho_tmp", ipa_path);
@@ -5526,7 +5526,7 @@ int main(int argc, char **argv) {
                 const char *nm = zan_dllimport_lname(
                     irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len, &nlen);
-                if (!nm) continue; /* CRT/libc/libm: resolved by musl libc.a */
+                if (!nm) continue; /* 底层系统交互与数据协议契约 */
                 char archive[1200];
                 archive[0] = '\0';
                 int didx = zan_driver_find(&cross_reg, nm, nlen);
@@ -5688,7 +5688,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Native stdlib drivers (libpq, sqlite3, */
+        /* 核心系统底层抽象与内存语义契约 */
         /* 内部辅助逻辑 */
         /* 内部辅助逻辑 */
         if (cross_compiling && target.os == ZAN_OS_ANDROID) {
@@ -5755,9 +5755,9 @@ int main(int argc, char **argv) {
         int used_driver_len[ZAN_MAX_USED_DRIVERS];
         const char *used_driver_module[ZAN_MAX_USED_DRIVERS];
         const char *used_driver_root[ZAN_MAX_USED_DRIVERS];
-        bool used_driver_runtime[ZAN_MAX_USED_DRIVERS] = { false };  /* dlopen'd, not linked */
+        bool used_driver_runtime[ZAN_MAX_USED_DRIVERS] = { false };  /* 核心系统底层抽象与内存语义契约 */
         bool used_driver_static[ZAN_MAX_USED_DRIVERS] = { false };
-        bool used_driver_embedded[ZAN_MAX_USED_DRIVERS] = { false };  /* inside the executable */
+        bool used_driver_embedded[ZAN_MAX_USED_DRIVERS] = { false };  /* 核心系统底层抽象与内存语义契约 */
         char embedded_driver_file[ZAN_MAX_USED_DRIVERS][128];
         char static_driver_libs[ZAN_MAX_STATIC_DRV_LIBS][128];
         int static_driver_lib_count = 0;
@@ -5876,7 +5876,7 @@ int main(int argc, char **argv) {
         if (target.os == ZAN_OS_WINDOWS) {
             char win_exe_dir[1024] = {0};
             zan_exe_dir(win_exe_dir, sizeof(win_exe_dir));
-            /* Backwards: dropping a lib compacts extern_libs, shifting the remaining slots */
+            /* 模块核心语义抽象与接口调用契约 */
             for (int li = irgen.extern_lib_count - 1; li >= 0; li--) {
                 int nlen;
                 const char *nm = zan_dllimport_lname(
@@ -5932,7 +5932,7 @@ int main(int argc, char **argv) {
                     &irgen, irgen.extern_libs[li].str,
                     (int)irgen.extern_libs[li].len);
                 if (n > 0) {
-                    /* Snapshot the name before dropping: compacting shifts the array slots */
+                    /* 模块核心语义抽象与接口调用契约 */
                     char libname[128];
                     snprintf(libname, sizeof(libname), "%.*s",
                              (int)irgen.extern_libs[li].len,
@@ -5957,7 +5957,7 @@ int main(int argc, char **argv) {
                                              icons_dir, sizeof(icons_dir))) {
                 char *icon_spec = (char *)malloc(strlen(icons_dir) + 32);
                 if (icon_spec) {
-                    /* Resource name matches the reader's zan_embed_list("icons/") prefix scan */
+                    /* 模块核心语义抽象与接口调用契约 */
                     snprintf(icon_spec, strlen(icons_dir) + 32,
                              "%s=icons", icons_dir);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
@@ -5981,7 +5981,7 @@ int main(int argc, char **argv) {
                 ) {
                 char *pinyin_spec = (char *)malloc(strlen(pinyin_path) + 32);
                 if (pinyin_spec) {
-                    /* resource name matches the reader's File */
+                    /* 底层系统交互与数据协议契约 */
                     snprintf(pinyin_spec, strlen(pinyin_path) + 32,
                              "%s=text/pinyin.txt", pinyin_path);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
@@ -5996,7 +5996,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Gui skin packs + base */
+        /* 核心系统底层抽象与内存语义契约 */
         if (resolved_stdlib_root[0] &&
             zan_driver_prefix_live(&irgen, &driver_prefixes, "Skin_")) {
             bool skins_staged = false;
@@ -6019,13 +6019,13 @@ int main(int argc, char **argv) {
                                                  sizeof(skins_dir))) {
                     char *skin_spec = (char *)malloc(strlen(skins_dir) + 32);
                     if (skin_spec) {
-                        /* resource names "skins/<pack>/skin */
+                        /* 核心系统底层抽象与内存语义契约 */
                         snprintf(skin_spec, strlen(skins_dir) + 32,
                                  "%s=skins", skins_dir);
                         if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                             int spec_at = embed_spec_count++;
                             embed_specs[spec_at] = skin_spec;
-                            /* Project skin selection (zan */
+                            /* 核心系统底层抽象与内存语义契约 */
                             if (!load_proj_android_keys_done &&
                                 project_root_has_manifest()) {
                                 load_proj_android_keys();
@@ -6066,7 +6066,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Chart theme packs: ChartTheme */
+        /* 核心系统底层抽象与内存语义契约 */
         if (resolved_stdlib_root[0] &&
             zan_driver_prefix_live(&irgen, &driver_prefixes, "Chart_")) {
             bool chartthemes_staged = false;
@@ -6119,7 +6119,7 @@ int main(int argc, char **argv) {
                 if (zan_file_exists(assets_cands[assets_cand_count]))
                     assets_cand_count++;
                 else if (assets_cand_count < 3) {
-                    /* <proj>/src + <proj>/assets layout: try the parent */
+                    /* 模块核心语义抽象与接口调用契约 */
                     char *psep = strrchr(assets_dir, '/');
                     char *pback = strrchr(assets_dir, '\\');
                     if (!psep || (pback && pback > psep)) psep = pback;
@@ -6149,7 +6149,7 @@ int main(int argc, char **argv) {
                 assets_staged = true;
                 char *assets_spec = (char *)malloc(strlen(adir) + 32);
                 if (assets_spec) {
-                    /* resource names "assets/<file>" match the reader's File */
+                    /* 模块核心语义抽象与接口调用契约 */
                     snprintf(assets_spec, strlen(adir) + 32, "%s=assets", adir);
                     if (embed_spec_count < ZAN_MAX_EMBED_SPECS) {
                         embed_specs[embed_spec_count++] = assets_spec;
@@ -6212,7 +6212,7 @@ int main(int argc, char **argv) {
         zan_irgen_release_llvm(&irgen);
         probe_phase_mem("free llvm");
 
-        /* An icon is just another link input: compile the */
+        /* 底层系统交互与数据协议契约 */
         char icon_obj[1100];
         icon_obj[0] = '\0';
         if (!no_icon && !emit_lib && target.os == ZAN_OS_WINDOWS) {
@@ -6381,7 +6381,7 @@ int main(int argc, char **argv) {
             && target.os != ZAN_OS_ANDROID && target.os != ZAN_OS_OHOS
             && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
             /* 内部辅助实现 */
-            int needs_sync = 1;   /* conservative default */
+            int needs_sync = 1;   /* 核心系统底层抽象与内存语义契约 */
             if (target.os == ZAN_OS_WASI) {
                 static const char *const disp_pre[] = {
                     "zan_dispatch_", NULL
@@ -6440,7 +6440,7 @@ int main(int argc, char **argv) {
         }
 
 #ifdef __APPLE__
-        /* Homebrew installs into non-default prefixes, so add its standard lib dirs (incl */
+        /* 编译期中间表示与代码生成内部规范 */
         {
             char home_lib[512]; home_lib[0] = '\0';
             char home_pq[512];  home_pq[0] = '\0';
@@ -6476,7 +6476,7 @@ int main(int argc, char **argv) {
         /* 内部辅助逻辑 */
         for (int d = 0; d < used_driver_count; d++) {
             if (!driver_dirs[d][0]) continue;
-            /* Add the driver dir to the link search path for every link branch below */
+            /* 编译期中间表示与代码生成内部规范 */
             char linkdir[1100];
             bool added_shared = false;
             bool want_static = link_static_drivers &&
@@ -6683,7 +6683,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 char cmd[8192];
-                bool lib_spawned = false; /* Windows: linked via _spawnv */
+                bool lib_spawned = false; /* 核心系统底层抽象与内存语义契约 */
                 char exe_dir[1024];
                 zan_exe_dir(exe_dir, sizeof(exe_dir));
                 /* 内部辅助逻辑 */
@@ -6702,7 +6702,7 @@ int main(int argc, char **argv) {
                 }
                 if (target.os == ZAN_OS_WINDOWS) {
 #ifdef _WIN32
-                    /* The linker is spawned with an argv array, not system(): cmd */
+                    /* 模块核心语义抽象与接口调用契约 */
                     char dll_exe_dir[1024]; dll_exe_dir[0] = '\0';
                     GetModuleFileNameA(NULL, dll_exe_dir, sizeof(dll_exe_dir));
                     { char *s = strrchr(dll_exe_dir, '\\'); if (s) *s = '\0'; }
@@ -6720,7 +6720,7 @@ int main(int argc, char **argv) {
                                     ? "arm64pe" : "i386pep";
                     argv[a++] = "-shared";
                     argv[a++] = "-Bdynamic";
-                    /* DLL entry: prefer the bundled dllcrt2 */
+                    /* 底层系统交互与数据协议契约 */
                     char dllcrt2[1300];
                     snprintf(dllcrt2, sizeof(dllcrt2),
                              "%s\\mingw\\lib\\dllcrt2.o", dll_exe_dir);
@@ -6745,8 +6745,8 @@ int main(int argc, char **argv) {
                     argv[a++] = implib;
                     char ldirbufs[ZAN_LINK_MAX_DIRS * 2 + 4][520]; int nld = 0;
                     if (dll_exe_dir[0] &&
-                        zan_file_exists(dll_exe_dir + 0) /* always true */) {
-                        /* Bundled mingw runtime: must be on the search path for -lmingw32 etc */
+                        zan_file_exists(dll_exe_dir + 0) /* 核心系统底层抽象与内存语义契约 */) {
+                        /* 模块核心语义抽象与接口调用契约 */
                         char mlib[1300];
                         snprintf(mlib, sizeof(mlib), "%s\\mingw\\lib",
                                  dll_exe_dir);
@@ -6774,7 +6774,7 @@ int main(int argc, char **argv) {
                     }
                     /* 内部辅助逻辑 */
                     argv[a++] = "--start-group";
-                    /* winpthread: libgcc's unwinder reaches its per-thread state via gthr-default */
+                    /* 模块核心语义抽象与接口调用契约 */
                     static const char *const dllcrt[] = {
                         "-lmingw32", "-lgcc", "-lmoldname", "-lmingwex",
                         "-lmsvcrt", "-lkernel32", "-lshell32",
@@ -6784,7 +6784,7 @@ int main(int argc, char **argv) {
                             link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
                         argv[a++] = dllcrt[li];
                     }
-                    /* The IO reactor needs Winsock */
+                    /* 核心系统底层抽象与内存语义契约 */
                     if (rt_io_obj) argv[a++] = "-lws2_32";
                     char libbufs[ZAN_LINK_MAX_LIBS][128]; int nb = 0;
                     for (int li = 0; li < irgen.extern_lib_count; li++) {
@@ -6954,7 +6954,7 @@ int main(int argc, char **argv) {
                     }
                 } else if (cross_compiling &&
                            target.os == ZAN_OS_ANDROID) {
-                    /* Android shared library: the NativeActivity shell's libmain */
+                    /* 底层系统交互与数据协议契约 */
                     char exe_dir3[1024] = {0};
                     zan_exe_dir(exe_dir3, sizeof(exe_dir3));
                     const char *asub3 = (target.arch == ZAN_ARCH_AARCH64)
@@ -7046,7 +7046,7 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "[link] %s\n", cmd);
                     link_ret = system(cmd);
                 } else if (target.os == ZAN_OS_OHOS) {
-                    /* HarmonyOS shared library: the HAP's XComponent shell dlopens the app's "main" */
+                    /* 模块核心语义抽象与接口调用契约 */
                     const char *osub = (target.arch == ZAN_ARCH_AARCH64)
                                        ? "ohos-arm64" : "ohos-x64";
                     char sys4[1200];
@@ -7171,7 +7171,7 @@ int main(int argc, char **argv) {
             snprintf(sys, sizeof(sys), "%s/%s", exe_dir, sub);
 
             char cmd[4096];
-            /* gc-sections pairs with the per-function */
+            /* 底层系统交互与数据协议契约 */
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
                      publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
@@ -7205,7 +7205,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
             if (irgen.uses_embed_api) {
-                /* Embedded-resource API; compiled for the target in the same sysroot build */
+                /* 模块核心语义抽象与接口调用契约 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_embed_api.o\"", sys);
             }
             if (irgen.uses_inflate) {
@@ -7220,7 +7220,7 @@ int main(int argc, char **argv) {
                            " --wrap=calloc --wrap=realloc", memobj);
               } }
             { cmd_appendf(cmd, sizeof(cmd), " --start-group \"%s/libc.a\"", sys); }
-            /* soft-float / int128 builtins (aarch64 long double is fp128) */
+            /* 底层系统交互与数据协议契约 */
             { char gcclib[1300];
               snprintf(gcclib, sizeof(gcclib), "%s/libgcc.a", sys);
               if (zan_file_exists(gcclib)) {
@@ -7252,7 +7252,7 @@ int main(int argc, char **argv) {
                        " --end-group \"%s/crtn.o\"", sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_OHOS) {
-            /* OHOS executable cross-link with ld */
+            /* 核心系统底层抽象与内存语义契约 */
             char exe_dir[1024] = {0};
             zan_exe_dir(exe_dir, sizeof(exe_dir));
             const char *osub = (target.arch == ZAN_ARCH_AARCH64)
@@ -7294,7 +7294,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
-                /* The OHOS NDK sysroot lacks shm_open, so rt_sync */
+                /* 模块核心语义抽象与接口调用契约 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
@@ -7353,7 +7353,7 @@ int main(int argc, char **argv) {
             }
             char cmd[8192];
             if (drv_lib_count > 0) {
-                /* DYNAMIC: pie executable; the stub */
+                /* 核心系统底层抽象与内存语义契约 */
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -pie%s -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
@@ -7379,7 +7379,7 @@ int main(int argc, char **argv) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_io.o\"", sys);
             }
             if (irgen.uses_sync_runtime) {
-                /* bionic has pthread/epoll; its missing shm_open is shimmed inside rt_sync */
+                /* 模块核心语义抽象与接口调用契约 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_sync.o\"", sys);
             }
             if (irgen.uses_file_runtime) {
@@ -7394,7 +7394,7 @@ int main(int argc, char **argv) {
                          " \"%s/zan_inflate.o\"", sys);
             }
             if (drv_lib_count > 0) {
-                /* Dynamic: libc/libm/liblog/libdl from the stub */
+                /* 模块核心语义抽象与接口调用契约 */
                 cmd_appendf(cmd, sizeof(cmd), " --start-group");
             } else {
                 cmd_appendf(cmd, sizeof(cmd),
@@ -7430,7 +7430,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[link] %s\n", cmd);
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_WINDOWS) {
-            /* Windows PE executable cross-link via ld */
+            /* 核心系统底层抽象与内存语义契约 */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             const char *wsub = (target.arch == ZAN_ARCH_AARCH64)
@@ -7623,7 +7623,7 @@ int main(int argc, char **argv) {
                          extra_link_inputs[ei]);
             }
             if (irgen.uses_file_runtime) {
-                /* File runtime (pure libc + a mutex) links against the wasi-libc sysroot; rt_sync */
+                /* 编译期中间表示与代码生成内部规范 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"",
                          sys);
             }
@@ -7655,7 +7655,7 @@ int main(int argc, char **argv) {
                 static const char *const audio_pre[] = { "zan_audio_", NULL };
                 static const char *const game_pre[] = { "zan_game_", NULL };
                 int need_game = wasm_obj_vec_refs_any(&generated_objects, game_pre);
-                /* The game object uses both the image cache and GUI bridge. */
+                /* 模块核心语义抽象与接口调用契约 */
                 int need_gui = need_game || wasm_obj_vec_refs_any(&generated_objects, gui_pre);
                 const int need_module[] = {
                     need_game || wasm_obj_vec_refs_any(&generated_objects, image_pre),
@@ -7684,7 +7684,7 @@ int main(int argc, char **argv) {
                     }
                     cmd_appendf(cmd, sizeof(cmd), " \"%s\"", nativeobj);
                 }
-                /* The browser host feeds input through this core export. */
+                /* 模块核心语义抽象与接口调用契约 */
                 if (need_gui) {
                     char guiobj[1300];
                     snprintf(guiobj, sizeof(guiobj), "%s/zanrt_gui.o", sys);
@@ -7719,7 +7719,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (irgen.wasm_eh_used) {
-                /* try/throw programs raise the C++ exception tag (throw 0): zanrt_ehtag */
+                /* 模块核心语义抽象与接口调用契约 */
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_ehtag.o\"",
                          sys);
             }
@@ -7729,7 +7729,7 @@ int main(int argc, char **argv) {
                        sys, sys, sys, sys); }
             link_ret = system(cmd);
         } else if (cross_compiling && (target.os == ZAN_OS_MACOS || target.os == ZAN_OS_IOS)) {
-            /* macOS/iOS executable cross-link with ld64 */
+            /* 底层系统交互与数据协议契约 */
             char exe_dir2[1024];
             zan_exe_dir(exe_dir2, sizeof(exe_dir2));
             char tbd[1200];
@@ -7938,14 +7938,14 @@ int main(int argc, char **argv) {
             argv[a++] = ld_path;
             argv[a++] = "-m";      argv[a++] = "i386pep";
             argv[a++] = "-Bdynamic";
-            /* 256 MB stack: the self-hosted compiler recurses deeply. */
+            /* 底层系统交互与数据协议契约 */
             argv[a++] = "--stack"; argv[a++] = "268435456";
             if (publish_mode) {
                 argv[a++] = "-s";
-                /* publish objects carry one */
+                /* 核心系统底层抽象与内存语义契约 */
                 argv[a++] = "--gc-sections";
             }
-            /* GUI apps: hide the console window (still entered via main). */
+            /* 模块核心语义抽象与接口调用契约 */
             if (link_subsystem && strcmp(link_subsystem, "windows") == 0) {
                 argv[a++] = "--subsystem"; argv[a++] = "windows";
             }
@@ -7984,7 +7984,7 @@ int main(int argc, char **argv) {
                 argv[a++] = "--wrap=malloc";  argv[a++] = "--wrap=free";
                 argv[a++] = "--wrap=calloc"; argv[a++] = "--wrap=realloc";
             }
-            /* Caller-supplied objects/resources */
+            /* 核心系统底层抽象与内存语义契约 */
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 if (a >= ZAN_LINK_MAX_ARGV - ZAN_LINK_ARGV_TAIL)
                     link_cap_exceeded("linker arguments", ZAN_LINK_MAX_ARGV);
@@ -8225,7 +8225,7 @@ int main(int argc, char **argv) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " %s",
                      static_driver_libs[li]);
         }
-        /* Caller-supplied link inputs; --subsystem is Windows-only and ignored here */
+        /* 模块核心语义抽象与接口调用契约 */
         for (int di = 0; di < extra_lib_path_count; di++) {
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " -L\"%s\" -Wl,-rpath,\"%s\"", extra_lib_paths[di], extra_lib_paths[di]);
@@ -8341,7 +8341,7 @@ int main(int argc, char **argv) {
                 }
 
                 int copied = 0;
-                int dself = 0; /* files copied from this driver's own dir */
+                int dself = 0; /* 底层系统交互与数据协议契约 */
                 int copy_failed_count = 0;
                 for (int c = 0; c < ncand; c++) {
                     char src[1300], dst[1300];
@@ -8405,11 +8405,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* APK packaging (Android GUI one-shot): pack the linked libmain */
+        /* 模块核心语义抽象与接口调用契约 */
         if (apk_path) {
             const char *abi = (target.arch == ZAN_ARCH_AARCH64)
                               ? "arm64-v8a" : "x86_64";
-            /* Default package/label from the input file name unless set */
+            /* 模块核心语义抽象与接口调用契约 */
             char pkg[256], lbl[256];
             if (apk_package) {
                 if (strlen(apk_package) >= sizeof(pkg)) {
@@ -8432,7 +8432,7 @@ int main(int argc, char **argv) {
               snprintf(pkg, sizeof(pkg), "dev.zan.%s", base);
               { char *dot = strrchr(pkg, '.');
                 if (dot && strcmp(dot, ".zan") == 0) *dot = 0; }
-              /* package segments must be [a-zA-Z0-9_]; fold the rest */
+              /* 底层系统交互与数据协议契约 */
               for (char *c = pkg; *c; c++) {
                   if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')
                         || (*c >= '0' && *c <= '9') || *c == '_' || *c == '.'))
@@ -8461,7 +8461,7 @@ int main(int argc, char **argv) {
               { char *d2 = strrchr(lbl, '.');
                 if (d2 && strcmp(d2, ".zan") == 0) *d2 = 0; }
             }
-            /* bundled driver libs to carry inside lib/<abi>/ */
+            /* 底层系统交互与数据协议契约 */
             char *extras[256]; int nextra = 0;
             { char outdir_a[1024]; snprintf(outdir_a, sizeof(outdir_a), "%s", obj_path);
               { char *s1 = strrchr(outdir_a, '/'); char *s2 = strrchr(outdir_a, '\\');
@@ -8515,7 +8515,7 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            remove(obj_path); /* the .so is inside the APK now */
+            remove(obj_path); /* 核心系统底层抽象与内存语义契约 */
         }
 
         if (ipa_path) {
@@ -8546,7 +8546,7 @@ int main(int argc, char **argv) {
                 free(source);
                 return 1;
             }
-            remove(obj_path); /* the binary is inside the IPA now */
+            remove(obj_path); /* 底层系统交互与数据协议契约 */
         }
 
         if (!quiet) {

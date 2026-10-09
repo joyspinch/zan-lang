@@ -1,47 +1,8 @@
-/* rt_crash.h -- persistent native crash logging.
- *
- * Installs a Windows unhandled-exception filter that appends a diagnostic
- * record to <exe_dir>\zan_crash.log on any hard crash (access violation, heap
- * corruption 0xC0000374, illegal instruction, etc.). Each record carries the
- * timestamp, exe path, process/thread ids, exception code/flags, the faulting
- * read/write/execute address, key registers, the faulting module+offset, and a
- * return-address backtrace as module+offset lines.
- *
- * When the process image carries DWARF debug info (built with `zanc -g`, e.g.
- * a Debug publish), the handler additionally resolves every in-module frame to
- * `function  <file>.zan:line` right there in the log, so a crash points at the
- * exact source location with no manual addr2line step. Resolution shells out
- * to a symbolizer found next to the exe only (addr2line.exe /
- * llvm-symbolizer.exe) -- deliberately not PATH/CWD, which are
- * attacker-influenceable; if none is present the raw module+offset lines still
- * stand and can be resolved offline (scripts\symbolize_crash.ps1).
- *
- * Included by the always-linked runtime objects (rt_io.c reactor and the
- * gui_runtime DLL) so both console/async and GUI (ZanIDE) processes leave a
- * trace. Every symbol is static so multiple includers never collide at link
- * time, and installation is idempotent (only the first caller wins).
- *
- * Beyond logging, the file provides the fault guard (zan__guard_call, exported
- * as zan_gui_guard_call): work run through it survives a hard fault -- the
- * record is written and the callback abandoned, instead of the process dying.
- * The GUI loop wraps one event dispatch and one frame in it, so a bad pointer
- * or a failed bounds check in UI code costs that event or frame. Recording is
- * done by a vectored handler, which runs before any frame-based handler and
- * therefore also survives another component replacing the filter (an embedded
- * browser does), the case where a crash used to leave nothing at all behind.
- *
- * The recovery jump itself is x64-only: it needs __builtin_setjmp/longjmp and
- * a synthesized CONTEXT, which the other shipped Windows backend (arm64) does
- * not provide. There the callback runs unguarded -- a fault still gets its
- * first-chance record, then ends the process the ordinary way.
- */
+/* 内部辅助实现 */
 #ifndef ZAN_RT_CRASH_H
 #define ZAN_RT_CRASH_H
 
-/* Same source, many configurations: runtime objects like rt_io.c compile
- * under every reactor backend and driver combination, so a static helper can
- * be legitimately unreferenced in some of them. Mark those instead of
- * platform-guarding each definition -- the guards would fragment the file. */
+/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_MAYBE_UNUSED
 #  if defined(__GNUC__) || defined(__clang__)
 #    define ZAN_MAYBE_UNUSED __attribute__((unused))
@@ -52,11 +13,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-/* GetTickCount64 (used below): some MinGW header sets (TDM-GCC with the
- * plain -DZAN_GUI_STATIC build) hide its declaration behind a WINVER guard,
- * and windows.h may already be included before this header, so bumping
- * _WIN32_WINNT here would be too late. The prototype is a stable Win32 ABI;
- * a matching redeclaration is harmless where the header did declare it. */
+/* 内部辅助实现 */
 WINBASEAPI ULONGLONG WINAPI GetTickCount64(VOID);
 #include <stdio.h>
 #include <stdint.h>
@@ -78,12 +35,7 @@ static void zan__crash_modline(FILE *f, void *addr, const char *tag) {
     }
 }
 
-/* Preferred (link-time) ImageBase, read from the exe FILE on disk. The
- * symbolizer wants a section VMA (link ImageBase + RVA); the in-memory PE
- * header is unreliable here because on a relocated GNU-ld image the loader
- * rewrites OptionalHeader.ImageBase to the ASLR runtime base, which would make
- * every VMA collapse to a bare RVA and resolve to nothing. The on-disk header
- * still carries the true link base (0x140000000 for these builds). */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static uintptr_t zan__crash_image_base(const char *exe) {
     HANDLE h = CreateFileA(exe, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -100,7 +52,7 @@ static uintptr_t zan__crash_image_base(const char *exe) {
     if ((size_t)e_lfanew + 0x40 > (size_t)got) return 0;
     unsigned char *nt = buf + e_lfanew;
     if (!(nt[0] == 'P' && nt[1] == 'E' && nt[2] == 0 && nt[3] == 0)) return 0;
-    unsigned char *opt = nt + 24; /* 4 (sig) + 20 (file header) */
+    unsigned char *opt = nt + 24; /* 核心系统底层抽象与内存语义契约 */
     uint16_t magic;
     memcpy(&magic, opt, 2);
     if (magic == 0x20B) { /* PE32+ : ImageBase is a ULONGLONG at opt+24 */
@@ -116,7 +68,7 @@ static uintptr_t zan__crash_image_base(const char *exe) {
     return 0;
 }
 
-/* True when addr belongs to the main exe module (skip ntdll/kernel frames). */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
     HMODULE m = NULL;
     if (addr &&
@@ -128,11 +80,7 @@ static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
     return 0;
 }
 
-/* Locate a symbolizer beside the exe, so a Debug publish is self-contained
- * and the crash path never executes a binary whose location depends on CWD
- * or PATH (either is attacker-influenceable; the search was removed rather
- * than hardened). Returns 1/2 for addr2line/llvm-symbolizer and writes the
- * program path into out. */
+/* 内部辅助实现 */
 static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t outsz) {
     char cand[MAX_PATH];
     snprintf(cand, sizeof cand, "%saddr2line.exe", exe_dir);
@@ -146,11 +94,7 @@ static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t out
     return 0;
 }
 
-/* True for a symbolizer line that carries no information about the crashing
- * program: an unresolved frame (`??`), the compiler support frames DWARF
- * attributes to cygming-crtbegin.c, and the mingw CRT entry thunks. Dropping
- * them keeps the resolved block to application frames; the raw
- * module+offset backtrace above it still lists every address. */
+/* 内部辅助实现 */
 static int zan__crash_line_is_noise(const char *line) {
     static const char *const noise[] = {
         "cygming-crtbegin.c", "__tmainCRTStartup", "WinMainCRTStartup",
@@ -159,13 +103,12 @@ static int zan__crash_line_is_noise(const char *line) {
     };
     for (size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++)
         if (strstr(line, noise[i])) return 1;
-    /* `?? at ??:0` / `?? ??:?`: no function and no file. */
+    /* 核心系统底层抽象与内存语义契约 */
     if (line[0] == '?' && line[1] == '?') return 1;
     return 0;
 }
 
-/* Copy the symbolizer's output into the log, dropping noise lines. Returns the
- * number of lines kept. */
+/* 过滤符号化输出噪音行并写入崩溃日志 */
 static int zan__crash_append_filtered(const char *logpath, const char *tmppath,
                                       int keep_all) {
     FILE *in = fopen(tmppath, "rb");
@@ -184,10 +127,7 @@ static int zan__crash_append_filtered(const char *logpath, const char *tmppath,
     return kept;
 }
 
-/* Append `function  file:line` for every in-module frame to the (closed) log
- * by spawning the symbolizer with stdout redirected to a temp file, which is
- * then filtered into the log. Best-effort: any failure leaves the raw log
- * intact. */
+/* 内部辅助实现 */
 static void zan__crash_symbolize(const char *logpath, const char *exe,
                                  const char *exe_dir, uintptr_t exe_base,
                                  void *fault, void **frames, USHORT nframes,
@@ -198,7 +138,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
     int mode = zan__crash_find_symbolizer(exe_dir, sym, sizeof sym);
     if (!mode) return;
 
-    /* Collect the section VMAs of the fault site and each in-module frame. */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     char addrs[3200];
     size_t ap = 0;
     int count = 0;
@@ -226,12 +166,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
                  sym, exe, addrs);
 
     char tmppath[MAX_PATH];
-    /* Unpredictable name, created exclusively: a pid-only temp beside the exe
-     * is trivially pre-created by another local process, and CREATE_ALWAYS
-     * would then truncate whatever that handle holds -- poisoning the block
-     * this function later appends into the crash log. Tick count plus an ASLR-
-     * derived stack address give bits an outside process cannot guess; the
-     * CREATE_NEW loop closes the residual collision window. */
+    /* 内部辅助实现 */
     HANDLE h = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; attempt++) {
         unsigned long long salt =
@@ -239,8 +174,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
             ^ ((unsigned long long)(uintptr_t)&attempt << 17)
             ^ ((unsigned long long)GetCurrentProcessId() << 33)
             ^ ((unsigned long long)attempt * 0x9E3779B97F4A7C15ull);
-        /* QPC beats the ~15 ms tick granularity for same-process crashes
-         * that land within one tick of each other. */
+        /* 高精度时间戳 (QPC)：避免 ~15ms 粒度导致的日志覆盖 */
         LARGE_INTEGER qpc;
         if (QueryPerformanceCounter(&qpc))
             salt ^= (unsigned long long)qpc.QuadPart << 19;
@@ -274,8 +208,7 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
     }
     CloseHandle(h);
 
-    /* Header line so the resolved block is easy to find; the filtered child
-     * output follows it, in the same order as the frames above. */
+    /* 崩溃回溯块头部标识 */
     FILE *hf = fopen(logpath, "ab");
     if (hf) {
         fprintf(hf, "resolved source locations (%d in-module frame(s), top first%s):\n",
@@ -296,22 +229,17 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
     if (tf) { fprintf(tf, "\n"); fclose(tf); }
 }
 
-/* Resolve a single address (the release that quarantined a block under
- * --arc-guard) under its own header, so the log shows both the stale use and
- * the site that freed it. */
+/* 解析单个隔离地址（ARC 保护检测） */
 static void zan__crash_symbolize_one(const char *logpath, const char *exe,
                                     const char *exe_dir, uintptr_t exe_base,
                                     void *addr) {
     FILE *hf = fopen(logpath, "ab");
     if (hf) { fprintf(hf, "released (arc.freed_by) at:\n"); fclose(hf); }
-    /* Keep every line here: a release inside a synthesized destructor has no
-     * line table, and "?? at ??:?" from one address is still the answer that
-     * the freeing code is compiler-generated rather than user code. */
+    /* 保留所有符号化行，包括合成析构函数 */
     zan__crash_symbolize(logpath, exe, exe_dir, exe_base, addr, NULL, 0, 1);
 }
 
-/* <exe_dir>\zan_crash.log, plus the directory itself. Both fall back to the
- * bare file name in the current directory when the exe path is unavailable. */
+/* 崩溃日志路径：<exe_dir>/zan_crash.log 或当前目录回退 */
 static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     exe_dir[0] = '\0';
     DWORD n = GetModuleFileNameA(NULL, logpath, (DWORD)cap);
@@ -331,11 +259,7 @@ static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
 }
 
-/* One line into the crash log. Used for the markers that make "the program
- * vanished and there is no log" a distinguishable state: no file at all means
- * the image has no handler installed (or writes elsewhere), a file with only
- * a `run` line means the process left without any exception -- an exit()/
- * ExitProcess/TerminateProcess path rather than a crash. */
+/* 底层系统交互与数据协议契约 */
 static void zan__crash_note(const char *what, const char *detail) {
     char logpath[MAX_PATH];
     char exe_dir[MAX_PATH];
@@ -362,14 +286,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
 #define ZAN_CRASH_TLS __thread
 #endif
 
-/* One instance of the handler state per binary, not per translation unit.
- * This header is included by several runtime objects (the timer, the IO
- * reactor, the GUI runtime), and a produced program links more than one of
- * them: with `static` state each copy got its own guard stack, so the guard a
- * GUI event was entered through was invisible to the vectored handler in
- * another copy -- the fault was logged as unrecoverable and the process died
- * with a perfectly good recovery point one frame below. selectany puts the
- * definitions in COMDATs the linker folds into one. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define ZAN_CRASH_SHARED __attribute__((selectany))
 #elif defined(_MSC_VER)
@@ -378,9 +295,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
 #define ZAN_CRASH_SHARED
 #endif
 
-/* CONTEXT register names differ by architecture; the record writer and the
- * recovery redirect read them through these so the file compiles for both
- * shipped Windows targets (x64 and arm64). */
+/* 跨架构 CPU 寄存器上下文解析 */
 #if defined(_M_ARM64) || defined(__aarch64__)
 #define ZAN_CTX_SP(c) ((c)->Sp)
 #define ZAN_CTX_PC(c) ((c)->Pc)
@@ -392,7 +307,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
 #define ZAN_CTX_PC(c) (0)
 #endif
 
-/* Address range of the loaded main image, from its own PE headers. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void zan__crash_image_range(uintptr_t base, uintptr_t *lo,
                                   uintptr_t *hi) {
     *lo = base;
@@ -406,22 +321,13 @@ static void zan__crash_image_range(uintptr_t base, uintptr_t *lo,
     *hi = base + nh->OptionalHeader.SizeOfImage;
 }
 
-/* Return addresses left on the faulting stack, most frequent first.
- *
- * Used when no real backtrace could be taken -- a stack overflow leaves no
- * room to walk the stack from the handler. The overflowing call chain is still
- * written all over the stack, so scanning it upwards for values inside the
- * program's own code and counting them names the recursion: the few addresses
- * that repeat thousands of times are the cycle. */
+/* 返回addresses left on the faulting stack, most frequent first */
 static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     uintptr_t lo, hi;
     zan__crash_image_range(exe_base, &lo, &hi);
     if (hi <= lo) return;
 
-    /* Start clear of the low end of the stack: by the time this runs the guard
-     * page has been re-armed somewhere below the current frame, and reading it
-     * would raise the overflow a second time. The recursion repeats all the
-     * way up, so skipping its innermost frames costs nothing. */
+    /* 内部辅助实现 */
     ULONG_PTR start = rsp + 128 * 1024;
 
     MEMORY_BASIC_INFORMATION mbi;
@@ -430,7 +336,7 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return;
     ULONG_PTR region_end = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
 
-    /* Enough to cover a deep recursion without walking the whole stack. */
+    /* 模块核心语义抽象与接口调用契约 */
     ULONG_PTR end = start + 512 * 1024;
     if (end > region_end) end = region_end;
 
@@ -471,49 +377,33 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     }
 }
 
-/* Per-thread state for the handlers below, in a plain table keyed by thread id
- * rather than in thread-local variables.
- *
- * A vectored handler runs on whatever thread faulted, and __thread there is a
- * trap: the access compiles to TEB->ThreadLocalStoragePointer[_tls_index],
- * which is null on threads whose static TLS block is not in place (a thread
- * still starting up, one already torn down, threads a foreign component brings
- * with it). Reading it then faults *inside the handler*, and that fault is
- * what kills the process -- with no record written, since writing one is
- * exactly what never got started. Two words of table lookup instead. */
+/* 线程级崩溃恢复状态槽（以线程 ID 为键） */
 typedef struct zan__guard zan__guard_t;
 typedef struct zan__fault zan__fault_t;
 
 typedef struct zan__thread_slot {
-    volatile LONG tid;      /* owning thread id, 0 when free */
-    zan__guard_t *top;      /* innermost guard on that thread */
-    int ready;              /* one-time per-thread setup done */
-    int busy;               /* a handler is writing a record right now */
+    volatile LONG tid;      /* 核心系统底层抽象与内存语义契约 */
+    zan__guard_t *top;      /* 核心系统底层抽象与内存语义契约 */
+    int ready;              /* 底层系统交互与数据协议契约 */
+    int busy;               /* 核心系统底层抽象与内存语义契约 */
 } zan__thread_slot;
 
 #define ZAN_GUARD_SLOTS 64
 
-/* All the state the handlers share, in one COMDAT.
- *
- * It is deliberately one aggregate with a non-zero initialiser: a zeroed
- * selectany definition goes to .bss$name with gcc and to .data$name with
- * clang, and a program that links objects from both toolchains (the mingw-ABI
- * GUI runtime next to the clang-built runtime objects) then has two sections
- * the linker will not fold -- "multiple definition of zan__slots". `magic`
- * keeps the aggregate in initialised data for either compiler. */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct zan__shared {
     LONG magic;
-    volatile LONG busy;         /* record being written on a thread with no slot */
-    volatile LONG recovered;    /* faults recovered from, all threads */
-    volatile LONG logged;       /* records written for them */
-    volatile LONG firstchance;  /* hard faults seen that nothing recovered */
-    volatile LONG installed;    /* handlers registered (once per binary) */
+    volatile LONG busy;         /* 底层系统交互与数据协议契约 */
+    volatile LONG recovered;    /* 核心系统底层抽象与内存语义契约 */
+    volatile LONG logged;       /* 核心系统底层抽象与内存语义契约 */
+    volatile LONG firstchance;  /* 底层系统交互与数据协议契约 */
+    volatile LONG installed;    /* 核心系统底层抽象与内存语义契约 */
     zan__thread_slot slots[ZAN_GUARD_SLOTS];
 } zan__shared_t;
 
 ZAN_CRASH_SHARED zan__shared_t zan__shared = { 0x5A414353, 0, 0, 0, 0, 0, { { 0, 0, 0, 0 } } };
 
-/* Spelled as the plain names the code below reads best with. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #define zan__slots             zan__shared.slots
 #define zan__crash_busy_shared zan__shared.busy
 #define zan__guard_recovered   zan__shared.recovered
@@ -521,9 +411,7 @@ ZAN_CRASH_SHARED zan__shared_t zan__shared = { 0x5A414353, 0, 0, 0, 0, 0, { { 0,
 #define zan__guard_firstchance zan__shared.firstchance
 #define zan__crash_installed   zan__shared.installed
 
-/* Find this thread's slot, claiming a free one when `create`. Returns NULL if
- * the thread has none and none may be claimed -- the handlers treat that as
- * "nothing of ours is running here" and keep their hands off. */
+/* 查找或分配当前线程的崩溃恢复状态槽 */
 static zan__thread_slot *zan__slot(int create) {
     LONG tid = (LONG)GetCurrentThreadId();
     unsigned start = ((unsigned)tid * 2654435761u) % ZAN_GUARD_SLOTS;
@@ -539,13 +427,7 @@ static zan__thread_slot *zan__slot(int create) {
     return NULL;
 }
 
-/* Set while a handler is writing a record. A fault raised from inside the
- * handling of another one must not be handled again: on a stack overflow the
- * record writer itself (a few kilobytes of buffers) touches the guard page and
- * faults, and without this the vectored handler is re-entered for that fault,
- * faults again, and the process spins in KiUserExceptionDispatch until the
- * stack is gone -- a hang with an empty log instead of a crash. Threads
- * without a slot share one flag; they only ever reach the filter. */
+/* 核心系统底层抽象与内存语义契约 */
 static int zan__crash_busy_get(zan__thread_slot *s) {
     return s ? s->busy : (int)zan__crash_busy_shared;
 }
@@ -561,20 +443,13 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
     zan__crash_write_record(ep, "unhandled", NULL, 0);
     zan__crash_busy_set(s, 0);
     if (ep->ExceptionRecord->ExceptionCode == 0xE0A2C010) {
-        /* Generated code raised this only to get the record written; it exits
-         * with its own status right after the raise, so resume there rather
-         * than killing the process with a foreign exit code. */
+        /* 编译器内部生成的非致命崩溃记录触发信号 */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    return EXCEPTION_EXECUTE_HANDLER; /* log, then terminate (skip WER dialog) */
+    return EXCEPTION_EXECUTE_HANDLER; /* 底层系统交互与数据协议契约 */
 }
 
-/* Append one diagnostic record for `ep`. `reason` says how the exception was
- * seen: "unhandled" (the filter, process is about to die), "recovered" (the
- * fault guard below is about to abandon the faulting work and continue), or
- * "first-chance" (the vectored handler saw a hard fault that something else
- * may still handle -- logged because a hijacked filter would otherwise leave
- * no trace at all). */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                                    const char *reason,
                                    void **bt, unsigned btn) {
@@ -607,10 +482,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
         fprintf(f, "code=0x%08lX flags=0x%08lX\n",
                 (unsigned long)er->ExceptionCode,
                 (unsigned long)er->ExceptionFlags);
-        {   /* ARC integrity failures raised by generated code (the codes are
-             * defined in src/compiler/irgen.c): the reported frames are the
-             * retain/release that used a dangling reference, i.e. the cause of
-             * a use-after-free rather than its symptom. */
+        {   /* ARC 完整性断言崩溃代码判定 */
             const char *arc = NULL;
             switch (er->ExceptionCode) {
             case 0xE0A2C001: arc = "retain of an already-freed object"; break;
@@ -630,11 +502,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                              break;
             default: break;
             }
-            /* A failed runtime check (bounds, division by zero, a failed I/O
-             * guard) raised by generated code. It prints the message too, but
-             * a `--subsystem windows` program has no console, so the text
-             * would otherwise be lost and the process would just vanish. The
-             * pointer is a string literal in this same process. */
+            /* 运行时断言失败崩溃（越界、除零或 IO 门控断言） */
             if (er->ExceptionCode == 0xE0A2C010 &&
                 er->NumberParameters >= 1 && er->ExceptionInformation[0]) {
                 fprintf(f, "zan=%s", (const char *)er->ExceptionInformation[0]);
@@ -671,10 +539,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
             fprintf(f, "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
                     (void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx,
                     (void *)c->Rdx, (void *)c->Rsi, (void *)c->Rdi);
-            /* Raw stack words from Rsp: a fault in a frameless leaf stub
-             * (ARC fast paths, setjmp landings) stops the unwinder above,
-             * so the caller never shows in the backtrace -- its return
-             * address is simply the first word at Rsp. */
+            /* 内部辅助实现 */
             {
                 ULONG_PTR raw_rsp = ZAN_CTX_SP(c);
                 MEMORY_BASIC_INFORMATION raw_mbi;
@@ -705,8 +570,7 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
 #endif
 
         if (bt) {
-            /* Captured where the fault happened; this call site may already be
-             * the recovered frame, whose own stack says nothing. */
+            /* 捕获故障发生点调用栈帧 */
             fn = (USHORT)(btn < 62 ? btn : 62);
             for (USHORT i = 0; i < fn; i++) frames[i] = bt[i];
         } else {
@@ -723,18 +587,10 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
         fprintf(f, "\n");
         fclose(f);
 
-        /* Resolve to source when the image carries DWARF (Debug builds). Done
-         * after the raw record is flushed so a symbolizer failure never costs
-         * us the addresses -- and skipped entirely after an overflow, where
-         * this still runs on the stack that has just run out and spawning a
-         * symbolizer is more than it has left. Also skipped when the heap or
-         * fail-fast machinery reported itself broken: fopen/fprintf/spawn run
-         * on CRT state those codes declare untrustworthy, and hanging there
-         * costs more than the resolution is worth -- the module+offset lines
-         * above still resolve offline via scripts\symbolize_crash.ps1. */
+        /* 模块核心语义抽象与接口调用契约 */
         DWORD crash_code = er->ExceptionCode;
         if (crash_code != EXCEPTION_STACK_OVERFLOW &&
-            crash_code != 0xC0000374 /* heap corruption */ &&
+            crash_code != 0xC0000374 /* 核心系统底层抽象与内存语义契约 */ &&
             crash_code != 0xC0000409 /* fail-fast */) {
             zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
                                  exe_base, ep->ExceptionRecord->ExceptionAddress,
@@ -746,32 +602,9 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
     }
 }
 
-/* ------------------------------------------------------------------ *
- * Fault guard
- *
- * A hard fault (or a failed runtime check) inside GUI work used to end the
- * process: no window, no message, and -- if some other component had replaced
- * the unhandled-exception filter meanwhile -- no log either. The guard makes
- * that survivable. `zan_rt_guard_call` runs a callback with a recovery point
- * recorded for the calling thread; the vectored handler below turns a fault
- * raised inside it into a jump back to that point, so the work in progress
- * (one frame, one event) is abandoned with a logged record and the loop keeps
- * running instead of the program disappearing.
- *
- * Not everything may be resumed this way: heap corruption and fail-fast
- * reports say the process state itself is no longer trustworthy, so those keep
- * falling through to the filter and terminate as before.
- *
- * The handler itself does as little as possible on the faulting stack: it
- * copies the exception out and jumps back, and the record is written from the
- * recovered frame. Writing it in place is what a stack that has just run out
- * cannot afford -- the writer's own buffers fault again, and the handler is
- * re-entered for that fault, which is how an ordinary crash turns into a
- * process that spins in the exception dispatcher and cannot even be killed.
- * ------------------------------------------------------------------ */
+/* 内部辅助实现 */
 
-/* The exception, copied out of the faulting frame for the record the recovered
- * frame writes. Lives in the guard frame, which the fault left intact. */
+/* 拷贝故障帧异常信息以供恢复帧写入日志 */
 struct zan__fault {
     EXCEPTION_RECORD er;
     CONTEXT ctx;
@@ -781,29 +614,20 @@ struct zan__fault {
 };
 
 struct zan__guard {
-    void *jb[5];             /* __builtin_setjmp buffer (fp, sp, pc, ...) */
-    struct zan__guard *prev; /* enclosing guard on this thread */
-    ULONG_PTR sp;            /* stack pointer inside the guard frame */
+    void *jb[5];             /* 核心系统底层抽象与内存语义契约 */
+    struct zan__guard *prev; /* 核心系统底层抽象与内存语义契约 */
+    ULONG_PTR sp;            /* 底层系统交互与数据协议契约 */
     volatile LONG armed;
     zan__fault_t f;
 };
 
-/* Records written so far, and the ones after which the log thins out: a fault
- * that repeats every frame must not turn a 100 MB log file into the next
- * problem, while the beginning of the run -- where the first occurrence and
- * its backtrace are -- is always kept in full. */
+/* 内部辅助实现 */
 #define ZAN_GUARD_LOG_FULL 20
 #define ZAN_GUARD_LOG_EVERY 100
 
-/* Recovery is x64-only: it needs __builtin_setjmp/longjmp (no arm64 backend
- * in the shipped cross toolchains) and a synthesized CONTEXT, whose rewrite
- * below names Rsp/Rip. On other arches the guard degrades to record-only and
- * these two never run, so they compile only where they are used. */
+/* 内部辅助实现 */
 #if defined(_M_X64) || defined(__x86_64__)
-/* Codes it makes sense to abandon the current callback for. Deliberately
- * excludes EXCEPTION_STACK_OVERFLOW (there is no stack left to run on),
- * 0xC0000374 (heap corruption) and the fail-fast codes: continuing after those
- * buys a corrupted process rather than a working one. */
+/* 模块核心语义抽象与接口调用契约 */
 static int zan__guard_recoverable(DWORD code) {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -816,10 +640,7 @@ static int zan__guard_recoverable(DWORD code) {
     case EXCEPTION_INT_OVERFLOW:
     case EXCEPTION_FLT_DIVIDE_BY_ZERO:
     case EXCEPTION_FLT_INVALID_OPERATION:
-    /* Raised by generated code: the ARC integrity checks, and 0xE0A2C010 for
-     * a failed runtime check (bounds, division by zero, an I/O guard), which
-     * would otherwise exit() right after the raise. Inside a guard that means
-     * losing one frame or one event instead of the program. */
+    /* 内部辅助实现 */
     case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
     case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
     case 0xE0A2C009: case 0xE0A2C010:
@@ -829,19 +650,7 @@ static int zan__guard_recoverable(DWORD code) {
     }
 }
 
-/* Recovery abandons the faulting frame chain without any unwind, so every
- * lock and invariant it held stays held. That trade is worth it for generated
- * Zan frames (they own no OS state across a message callback), but never for
- * foreign code: a fault inside another module's allocator or loader leaves,
- * say, its heap critical section owned, and the resumed event loop then
- * blocks forever on the next allocation -- a frozen-but-alive process with a
- * "recovered" line in the log. Restrict recovery to the main image, where
- * generated code and its runtime live; DLL faults die through the normal
- * unhandled path with a full record instead.
- *
- * Known limit: a statically linked CRT puts its heap INSIDE the main image,
- * so this check cannot see it. Guard recovery remains what it always was for
- * that case -- a deliberate bet that the abandoned frames held no OS lock. */
+/* 崩溃恢复放弃故障帧调用链，不触发析构展开 */
 static int zan__guard_rip_recoverable(EXCEPTION_POINTERS *ep) {
     ULONG_PTR rip = ep->ContextRecord ? ZAN_CTX_PC(ep->ContextRecord) : 0;
     HMODULE m = NULL;
@@ -852,11 +661,9 @@ static int zan__guard_rip_recoverable(EXCEPTION_POINTERS *ep) {
         return 0;
     return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
 }
-#endif /* x64 recovery helpers */
+#endif /* 核心系统底层抽象与内存语义契约 */
 
-/* Hard faults worth a record even when something else might still handle them:
- * the filter is the reliable place to log, but any component in the process
- * (an embedded browser, a plugin) can replace it after us. */
+/* 过滤并记录致命硬件异常 (AV/非法指令等) */
 static int zan__guard_hard_fault(DWORD code) {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -865,13 +672,7 @@ static int zan__guard_hard_fault(DWORD code) {
     case EXCEPTION_PRIV_INSTRUCTION:
     case EXCEPTION_STACK_OVERFLOW:
     case 0xC0000374:
-    /* The ARC integrity reports from generated code. They are raised on
-     * purpose and the raising code prints the facts, but the record is what
-     * carries the backtrace -- and with a Debug build's line table, the source
-     * line holding the stale reference. Worth writing here because nothing
-     * else may: the raise is immediately followed by exit(), and a frame-based
-     * handler anywhere below (the CRT installs one) can swallow it before the
-     * unhandled-exception filter is ever consulted. */
+    /* 底层系统交互与数据协议契约 */
     case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
     case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
     case 0xE0A2C009:
@@ -882,10 +683,7 @@ static int zan__guard_hard_fault(DWORD code) {
 }
 
 #if defined(_M_X64) || defined(__x86_64__)
-/* Entered with a synthesized context (see the handler): a private stack and
- * this address in Rip, so the jump back runs on a frame the fault cannot have
- * damaged. __builtin_longjmp restores frame/stack/pc directly, without the
- * table-driven unwind msvcrt's longjmp would attempt from that frame. */
+/* 内部辅助实现 */
 static void zan__guard_resume(void) {
     zan__thread_slot *s = zan__slot(0);
     zan__guard_t *g = s ? s->top : NULL;
@@ -897,18 +695,14 @@ static void zan__guard_resume(void) {
 static void zan__crash_install(void);
 
 #if defined(_M_X64) || defined(__x86_64__)
-/* Write the record for the fault this thread just recovered from. Runs on the
- * restored stack, where a few kilobytes of buffers and a symbolizer are
- * affordable again. */
+/* 恢复栈上写入崩溃记录日志 */
 static void zan__guard_log_deferred(zan__thread_slot *s, zan__fault_t *flt) {
     if (!flt->have) return;
     flt->have = 0;
     if (zan__crash_busy_get(s)) return;
 
     LONG seen = InterlockedIncrement((LONG volatile *)&zan__guard_recovered);
-    /* Always recover -- there is no fault count at which killing the program
-     * is the better outcome -- but stop writing a full record for every one
-     * once the pattern is established. */
+    /* 线程崩溃恢复保护机制 */
     if (seen > ZAN_GUARD_LOG_FULL && seen % ZAN_GUARD_LOG_EVERY != 0) return;
 
     EXCEPTION_POINTERS p;
@@ -921,22 +715,18 @@ static void zan__guard_log_deferred(zan__thread_slot *s, zan__fault_t *flt) {
 }
 #endif /* x64 recovery */
 
-/* Run fn(arg) with a recovery point for this thread. Returns 1 when it
- * returned normally, 0 when a fault inside it was recovered from. */
+/* 在崩溃恢复点保护下执行函数 (正常返回 1，捕获故障返回 0) */
 static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
     if (!fn) return 1;
     zan__thread_slot *s = zan__slot(1);
     if (!s) { fn(arg); return 1; } /* out of slots: unguarded, as before */
-    /* Once per thread: this is on the path of every window message. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (!s->ready) {
         s->ready = 1;
-        /* Re-assert ownership of the filter: a component loaded after us (CEF
-         * and friends install their own) would otherwise take every unhandled
-         * fault with it and leave no record behind. */
+        /* 重新确立全局未处理异常过滤器所有权 */
         SetUnhandledExceptionFilter(zan__crash_filter);
         zan__crash_install();
-        /* Headroom below the guard page, so the handler still has a stack to
-         * write its record on when the fault is the stack running out. */
+        /* 保护页后备栈空间，保证栈溢出时有足够栈深度写入日志 */
         ULONG guarantee = 64 * 1024;
         SetThreadStackGuarantee(&guarantee);
     }
@@ -961,11 +751,7 @@ static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
     (void)frame_probe;
     return ok;
 #else
-    /* Other arches (win-arm64): __builtin_setjmp/longjmp has no backend there
-     * and the handler's recovery redirect is x64-only, so there is nothing to
-     * recover into. Run the callback unguarded; a fault still gets its
-     * first-chance record from the vectored handler and dies through the
-     * normal path. */
+    /* 内部辅助实现 */
     fn(arg);
     return 1;
 #endif
@@ -974,12 +760,9 @@ static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
 static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord)
         return EXCEPTION_CONTINUE_SEARCH;
-    /* No slot means no guard was ever entered on this thread: there is nothing
-     * to recover into, but a hard fault there is still worth a record (the
-     * faults before the first window message live here). */
+    /* 未受保护线程故障处理 */
     zan__thread_slot *s = zan__slot(0);
-    /* A fault taken while handling one: handling it again is how the process
-     * ends up spinning in the dispatcher instead of crashing. */
+    /* 递归二次故障防御，防止死循环 */
     if (zan__crash_busy_get(s)) return EXCEPTION_CONTINUE_SEARCH;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     zan__guard_t *g = s ? s->top : NULL;
@@ -987,20 +770,13 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
 #if defined(_M_X64) || defined(__x86_64__)
     if (g && g->armed && zan__guard_recoverable(code) &&
         zan__guard_rip_recoverable(ep)) {
-        g->armed = 0; /* one recovery per guard entry, no re-entry from here */
-        /* Everything expensive is deferred to the recovered frame; all that
-         * happens here is copying the exception out (the backtrace too, which
-         * only exists while the faulting frames are still on the stack) and
-         * redirecting execution. On a stack overflow even the walk is out of
-         * reach -- the record falls back to scanning the stack instead. */
+        g->armed = 0; /* 模块核心语义抽象与接口调用契约 */
+        /* 内部辅助实现 */
         g->f.er = *ep->ExceptionRecord;
         g->f.ctx = *ep->ContextRecord;
         g->f.btn = (unsigned)RtlCaptureStackBackTrace(0, 62, g->f.bt, NULL);
         g->f.have = 1;
-        /* Resume just below the guard's own frame: that memory is committed
-         * (the abandoned callees were using it) and cannot overlap the frame
-         * being jumped back into. x64 wants (rsp % 16) == 8 at a function's
-         * first instruction. */
+        /* 内部辅助实现 */
         ULONG_PTR sp = ((g->sp - 256) & ~(ULONG_PTR)15) - 8;
         ep->ContextRecord->Rsp = (DWORD64)sp;
         ep->ContextRecord->Rip = (DWORD64)(ULONG_PTR)&zan__guard_resume;
@@ -1008,10 +784,7 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     }
 #endif
 
-    /* Nothing to recover into: leave the disposition alone and only leave a
-     * trace, since the filter may no longer be ours by the time this dies.
-     * Throttled like the recoveries -- a hard fault another component handles
-     * on purpose (some do, while probing) would otherwise repeat forever. */
+    /* 内部辅助实现 */
     if (zan__guard_hard_fault(code)) {
         LONG seen = InterlockedIncrement((LONG volatile *)&zan__guard_firstchance);
         if (seen <= ZAN_GUARD_LOG_FULL || seen % ZAN_GUARD_LOG_EVERY == 0) {
@@ -1023,16 +796,13 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* Number of faults the guard has absorbed so far (a UI can surface it). */
+/* 模块核心语义抽象与接口调用契约 */
 static ZAN_MAYBE_UNUSED LONG zan__guard_recovered_count(void) {
     return zan__guard_recovered;
 }
 
 static void zan__crash_atexit(void) {
-    /* Reached on every ordinary shutdown too; the value is in the contrast --
-     * a log whose last line is `run` and nothing else means the process was
-     * killed outright (TerminateProcess, a fail-fast, a hard exit in native
-     * code) rather than crashing where we could see it. */
+    /* 内部辅助实现 */
     char detail[96];
     snprintf(detail, sizeof detail, "recovered=%ld logged=%ld first-chance=%ld",
              (long)zan__guard_recovered, (long)zan__guard_logged,
@@ -1040,41 +810,32 @@ static void zan__crash_atexit(void) {
     zan__crash_note("exit", detail);
 }
 
-/* True when this copy of the header lives in the main exe (vs a DLL that
- * embedded it, e.g. zan_gui). Used to keep atexit out of DLL copies: during
- * process exit the exe copy's handler already ran inside doexit, before
- * ExitProcess, while a DLL copy's handler runs later inside LdrShutdownProcess
- * -- under the loader lock, where Microsoft forbids any CRT file I/O. The
- * fopen there is also where injected sandbox hooks (third-party CreateFileW
- * interceptors) have been observed to fail-fast the whole process
- * (0xC0000409) on an ordinary, successful program exit. Skipping atexit in
- * DLL copies loses nothing: the exe copy still writes the "exit" record. */
+/* 主程序实例标记（区分 DLL 宿主副本） */
 static int zan__crash_in_main_image(void) {
     HMODULE m = NULL;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCSTR)(ULONG_PTR)&zan__crash_in_main_image, &m))
-        return 1; /* unresolved: assume the old behavior */
+        return 1; /* 核心系统底层抽象与内存语义契约 */
     return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
 }
 
 static void zan__crash_install(void) {
-    /* Shared across the copies of this header in one binary: three vectored
-     * handlers doing the same work only multiply the records. */
+#if defined(__SANITIZE_ADDRESS__)
+    return;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    return;
+#endif
+#endif
+    /* 单进程内共享的向量化异常处理程序 */
     if (InterlockedCompareExchange((LONG volatile *)&zan__crash_installed,
                                    1, 0) != 0) return;
     SetUnhandledExceptionFilter(zan__crash_filter);
-    /* First in line: a vectored handler runs before any frame-based one, so a
-     * fault is recorded (and recovered from) whatever else is installed. */
+    /* 向量化异常处理优先于帧异常拦截 */
     AddVectoredExceptionHandler(1, zan__crash_veh);
     zan__crash_note("run", "");
-    /* Only the main-image copy registers atexit. A DLL copy would have its
-     * handler called during DLL_PROCESS_DETACH, under the loader lock, where
-     * the fopen inside the record writer is both illegal (loader-lock file
-     * I/O) and -- with an injected file-op hook present -- fatal for the
-     * whole process (see zan__crash_in_main_image above). The exe copy's own
-     * atexit runs earlier, inside doexit and before ExitProcess, and already
-     * records the ordinary "exit" line for the process. */
+    /* 底层系统交互与数据协议契约 */
     if (zan__crash_in_main_image()) atexit(zan__crash_atexit);
 }
 
@@ -1085,17 +846,7 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #endif
 
 #else /* !_WIN32 */
-/* POSIX counterpart: a fatal signal (SIGSEGV/SIGBUS/SIGFPE/SIGILL/SIGABRT)
- * otherwise kills the process without a word, which is exactly the case that
- * matters for a supervised worker -- the master only sees its control socket
- * close. The handler writes one record to stderr (so a worker whose output is
- * redirected to a log file leaves it there) and appends the same record to
- * <exe_dir>/zan_crash.log, then re-raises with the default disposition so the
- * wait status still reports the signal.
- *
- * Everything here is async-signal-safe: write(2) plus hand-rolled integer
- * formatting, no malloc/stdio. The backtrace uses backtrace_symbols_fd, which
- * writes with the raw fd for that reason (glibc only; musl has no execinfo). */
+/* 内部辅助实现 */
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -1108,34 +859,28 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #include <sys/types.h>
 
 #if (defined(__GLIBC__) || defined(__APPLE__)) && !defined(ZAN_NO_EXECINFO)
-/* ZAN_NO_EXECINFO: the static GUI driver archive is built on glibc hosts but
- * linked by zanc against the musl sysroot (all linux publishes are
- * musl-static), so it must not carry glibc-only backtrace symbols; the
- * dladdr/frame-walk path below is what musl builds use anyway. */
+/* 内部辅助实现 */
 #include <execinfo.h>
 #define ZAN_CRASH_HAVE_BACKTRACE 1
 #endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
-/* dladdr: symbolize return addresses when execinfo is absent (musl/BSD).
- * Needs _GNU_SOURCE on both glibc and musl; the runtime builds define it. */
+/* dladdr 符号化解析（musl/BSD 无 execinfo 兜底） */
 #include <dlfcn.h>
 
 static void zan__crash_wr(int fd, const char *s) {
     size_t n = strlen(s);
     while (n) {
         ssize_t w = write(fd, s, n);
-        /* w < 0 with EAGAIN (non-blocking dup of stderr whose pipe is full)
-         * drops the remainder on purpose: blocking here inside a signal
-         * handler turns one wedged reader into a hung worker pool. */
+        /* 管道阻塞时安全丢弃剩余日志，防止死锁 */
         if (w <= 0) return;
         s += (size_t)w;
         n -= (size_t)w;
     }
 }
 
-/* Decimal, into a caller-owned buffer (>= 24 bytes). */
+/* 底层系统交互与数据协议契约 */
 static const char *zan__crash_dec(unsigned long long v, char *buf) {
     char *p = buf + 23;
     *p = '\0';
@@ -1153,13 +898,7 @@ static const char *zan__crash_hex(unsigned long long v, char *buf) {
     return p;
 }
 
-/* Print one backtrace line for a code address: "path+base_offset (symbol)"
- * when dladdr can attribute it, the raw hex otherwise. Safe enough for
- * crash reporting: dladdr does not malloc for modules already loaded,
- * which every address in our own image is.
- * dladdr/Dl_info are GNU extensions: both libcs declare them only when
- * _GNU_SOURCE was set before the libc headers. Without it we still print
- * the raw address -- the RIP itself is the critical triage datum. */
+/* 内部辅助实现 */
 #if defined(_GNU_SOURCE)
 #define ZAN_CRASH_HAVE_DLADDR 1
 #endif
@@ -1188,11 +927,7 @@ static void zan__crash_frame(int fd, void *pc) {
     zan__crash_wr(fd, "\n");
 }
 
-/* Frame-pointer chain walk for libcs without execinfo. Starts at `fp`
- * (the faulting frame's rbp from the signal context when available),
- * validating each link: aligned, strictly increasing, within 1 MiB of
- * the previous frame -- a corrupted or omitted-FP chain ends the walk
- * instead of producing garbage lines. */
+/* 模块核心语义抽象与接口调用契约 */
 static int zan__crash_fp_walk(int fd, void **fp) {
     int n = 0;
     while (fp && n < 48) {
@@ -1220,28 +955,13 @@ static const char *zan__crash_signame(int sig) {
     }
 }
 
-/* Own program path, and the directory the dated crash log goes in: $ZAN_LOG_DIR
- * when the process was started with one (the server master exports it for its
- * workers, so a worker's crash record lands in the pool's shared daily log),
- * else <exe_dir>/logs. Both are resolved at install time -- reading /proc or
- * the environment from inside a signal handler would be one more thing that
- * can fault. */
+/* 内部辅助实现 */
 static char zan__crash_exe[4096];
 static char zan__crash_logdir[4096];
-/* $ZAN_WORKER_ID, so a record tells which worker of the pool died. */
+/* 模块核心语义抽象与接口调用契约 */
 static char zan__crash_wid[32];
 
-/* State cached at install time because the signal handler must not touch
- * libc machinery that takes locks:
- *  - the timezone offset: localtime_r/strftime grab the tz lock and may read
- *    /etc/localtime; a crash on a thread holding that lock (the master's
- *    timestamp path runs continuously) would self-deadlock the handler.
- *  - a non-blocking dup of stderr: writing a full pipe from the handler
- *    blocks in-kernel forever if the reader stalled, hanging this worker
- *    instead of letting the supervisor respawn it. Partial records are
- *    dropped instead.
- *  - one warm-up call of backtrace(): glibc can dlopen libgcc_s on first
- *    use, which means malloc and the loader lock inside the handler. */
+/* 内部辅助实现 */
 static long zan__crash_tz_off;
 static int zan__crash_err_fd = -1;
 
@@ -1276,8 +996,7 @@ static void zan__crash_cache_handler_state(void) {
 #endif
 }
 
-/* days-since-epoch -> civil date, proleptic Gregorian. Integer-only
- * (Hinnant's civil_from_days), safe to run inside a signal handler. */
+/* 纯整数公历日期计算（信号安全） */
 static void zan__crash_civil(long long z, int *y, unsigned *m, unsigned *d) {
     z += 719468;
     long long era = (z >= 0 ? z : z - 146096) / 146097;
@@ -1335,10 +1054,7 @@ static void zan__crash_resolve_paths(void) {
     memcpy(zan__crash_logdir + dl, "logs", 5);
 }
 
-/* <logdir>/{yyyy}{MM}/{dd}.log -- the very file the master and the workers log
- * to, so the crash record sits right where the operator is already reading,
- * between the request that triggered it and the master's respawn line. Returns
- * 0 when the directory could not be made. */
+/* <logdir>/{yyyy}{MM}/{dd} */
 static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
     char month[16];
     char day[16];
@@ -1352,7 +1068,7 @@ static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
     char dir[4096];
     if ((size_t)snprintf(dir, sizeof dir, "%s/%s", zan__crash_logdir, month)
             >= sizeof dir) return 0;
-    mkdir(zan__crash_logdir, 0755); /* best effort; already-exists is fine */
+    mkdir(zan__crash_logdir, 0755); /* 核心系统底层抽象与内存语义契约 */
     mkdir(dir, 0755);
     return (size_t)snprintf(out, cap, "%s/%s.log", dir, day) < cap;
 }
@@ -1388,19 +1104,9 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp,
         backtrace_symbols_fd(frames, n, fd);
     }
 #else
-    /* No execinfo (musl/BSD). The faulting instruction pointer and frame
-     * pointer come from the signal context; the FP walk then covers the
-     * caller chain. Linux x86-64 reads gregs directly; every other target
-     * starts at this handler's own frame -- still enough to attribute the
-     * crash module. */
+    /* No execinfo (musl/BSD) */
 #  if defined(__linux__) && defined(__x86_64__)
-    /* Both libcs lay mcontext_t out as 32 words: 23 gregs, an fpregs
-     * pointer, 8 reserved. glibc names the first slice 'gregs'; musl
-     * only does so under _GNU_SOURCE and otherwise exposes opaque
-     * __space[32] -- same bytes either way. Index the raw word array,
-     * so one expression serves both (kernel sigcontext order:
-     * R8..R15=0..7 RDI=8 RSI=9 RBP=10 RBX=11 RDX=12 RAX=13 RCX=14
-     * RSP=15 RIP=16). */
+    /* glibc/musl mcontext_t 寄存器布局解析 */
     ucontext_t *uc = (ucontext_t *)uctx;
     if (uc) {
         unsigned long *mc = (unsigned long *)&uc->uc_mcontext;
@@ -1424,13 +1130,10 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp,
 
 static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
     void *addr = info ? info->si_addr : NULL;
-    /* Local time from the install-time timezone offset: localtime_r and
-     * strftime take the tz lock (and read /etc/localtime) and are not
-     * async-signal-safe. */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     time_t now = time(NULL) + (time_t)zan__crash_tz_off;
     char stamp[32];
-    /* Same broken-down time, kept for zan__crash_logpath_for()'s strftime
-     * below -- rebuilt by hand because localtime_r is not async-signal-safe. */
+    /* 信号安全格式化时间字符串 */
     struct tm lt;
     memset(&lt, 0, sizeof lt);
     {
@@ -1467,10 +1170,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
         *p = '\0';
     }
 
-    /* stderr first: a supervised worker has it redirected to its dated output
-     * file, which is where the operator looks anyway. The write goes to the
-     * non-blocking dup when there is one, so a full pipe cannot hang the
-     * handler (the record still reaches the crash log below). */
+    /* 优先输出至 stderr，供外部进程守护者重定向捕获 */
     zan__crash_record(zan__crash_err_fd >= 0 ? zan__crash_err_fd
                                              : STDERR_FILENO,
                       sig, addr, stamp, ctx);
@@ -1479,8 +1179,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
     if (zan__crash_logpath_for(&lt, path, sizeof path)) {
         int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         if (fd >= 0) {
-            /* A supervised worker already has stderr pointing at this same
-             * file; writing the record a second time would only double it. */
+            /* 避免向同一日志文件重复写入崩溃记录 */
             struct stat a, b;
             int same = fstat(STDERR_FILENO, &a) == 0 && fstat(fd, &b) == 0
                        && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
@@ -1488,7 +1187,7 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
             close(fd);
         }
     }
-    /* Die of the original signal so waitpid() reports WIFSIGNALED with it. */
+    /* 模块核心语义抽象与接口调用契约 */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1500,29 +1199,15 @@ static void zan__crash_install(void) {
     zan__crash_resolve_paths();
     zan__crash_cache_handler_state();
 #if defined(__linux__) && !defined(SA_ONSTACK)
-    /* SA_ONSTACK sits behind _GNU_SOURCE on glibc, and this header is
-     * routinely included after system headers, where a late feature-macro
-     * define cannot help. The flag is a kernel sigaction ABI bit (same
-     * value on glibc and musl, stable for decades), so take the literal
-     * when the macro never surfaced rather than failing every strict
-     * -std=c11 compile that reaches here. */
+    /* 内部辅助实现 */
 #define SA_ONSTACK 0x08000000
 #endif
 #if defined(__OHOS__) && !defined(SS_DISABLE)
-    /* OHOS's musl subset omits sigaltstack/SS_DISABLE from signal.h under
-     * the feature set this header compiles with, yet the libc exports the
-     * symbol (POSIX ABI; verified in the committed libc.a). Declare what
-     * the headers hide rather than lose the altstack on OHOS. */
+    /* 模块核心语义抽象与接口调用契约 */
 #define SS_DISABLE 2
 int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
 #endif
-    /* The handler is registered with SA_ONSTACK below, so it needs an
-     * alternative stack to run on: a SIGSEGV from stack exhaustion cannot
-     * deliver onto the overflowed stack it faulted on -- without this the
-     * handler itself faults and the crash report never happens. Fixed size
-     * because SIGSTKSZ is sysconf() (not a constant) on glibc >= 2.34 and
-     * this header must survive strict -std=c11. Leave an altstack the host
-     * program installed for itself untouched. */
+    /* 内部辅助实现 */
     {
         stack_t cur;
         if (sigaltstack(NULL, &cur) == 0 &&
@@ -1544,7 +1229,7 @@ int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
         struct sigaction cur;
-        /* Leave a disposition the program chose for itself alone. */
+        /* 模块核心语义抽象与接口调用契约 */
         if (sigaction(sigs[i], NULL, &cur) == 0 && cur.sa_handler != SIG_DFL) {
             continue;
         }

@@ -19,12 +19,12 @@ static void zan__env_present(i32 ptr, i32 w, i32 h);
 __attribute__((import_module("zan_env"), import_name("title")))
 static void zan__env_title(const char *text, i32 len);
 
-/* window record */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct {
-    int w, h;      /* canvas size, device pixels (host decides it) */
+    int w, h;      /* 底层系统交互与数据协议契约 */
     int shown;
-    int closed;    /* kind 8 seen: present becomes a no-op */
+    int closed;    /* 核心系统底层抽象与内存语义契约 */
 } zan_wasm_win_t;
 static zan_wasm_win_t g_wwin;
 #define ZAN_WASM_HWND ((i64)(intptr_t)&g_wwin)
@@ -32,7 +32,7 @@ static zan_wasm_win_t g_wwin;
 static int  g_window_width  = 0;
 static int  g_window_height = 0;
 
-/* event ring */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct { int e[8]; i64 win; } zan_wev_t;
 #define ZAN_WQ_CAP 512
@@ -46,7 +46,7 @@ static long long g_ev_seq = 0;
 /* 内部辅助逻辑 */
 static void wq_push(int kind, int x, int y, int button, int code, int mods,
                     int flag) {
-    if (kind == 7) { /* resize carries the new canvas size */
+    if (kind == 7) { /* 底层系统交互与数据协议契约 */
         g_window_width = x;
         g_window_height = y;
     }
@@ -70,7 +70,7 @@ static void wq_push(int kind, int x, int y, int button, int code, int mods,
     g_wq_tail = next;
 }
 
-/* Host -> C injection: one event from the SharedArrayBuffer ring */
+/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_wasm_feed(i32 kind, i32 x, i32 y, i32 button, i32 code,
                              i32 mods, i32 flag) {
     wq_push((int)kind, (int)x, (int)y, (int)button, (int)code, (int)mods,
@@ -88,7 +88,7 @@ static int wq_pop(void) {
     return 1;
 }
 
-/* window management (browser: no chrome) */
+/* 核心系统底层抽象与内存语义契约 */
 
 /* 内部辅助逻辑 */
 EXPORT i64 zan_gui_create_window(const char *title, i32 width, i32 height) {
@@ -151,7 +151,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     zan__env_pump();
     if (wq_pop()) return 0;
     if (ms > 0 && zan__env_wait(ms)) {
-        /* wait pumped on wake; drain what arrived inside the window */
+        /* 底层系统交互与数据协议契约 */
         if (wq_pop()) return 0;
     }
     return 1;
@@ -212,7 +212,7 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
         return 1;
     zan_surface_t *s = g_surfaces[surface_id];
-    /* A backend holding the frame elsewhere has to put it back first */
+    /* 底层系统交互与数据协议契约 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -223,7 +223,7 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     return 0;
 }
 
-/* platform services */
+/* 核心系统底层抽象与内存语义契约 */
 
 /* 内部辅助逻辑 */
 EXPORT i32 zan_gui_get_dpi_scale(void) { return 100; }
@@ -234,7 +234,7 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* wasm has no nanosleep: the wasi clock import only reads time */
+/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_sleep_ms(i32 ms) {
     if (ms > 0) zan__env_sleep(ms);
 }
@@ -339,7 +339,7 @@ void zan_dispatch_init(void) {
 int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
     int next = (g_wdisp_tail + 1) % ZAN_WDISP_CAP;
-    if (next == g_wdisp_head) return 0; /* full: dropped, like the ceiling */
+    if (next == g_wdisp_head) return 0; /* 核心系统底层抽象与内存语义契约 */
     wdisp_retain(fn);
     g_wdisp[g_wdisp_tail] = fn;
     g_wdisp_tail = next;
@@ -363,4 +363,4 @@ void zan_dispatch_clear(void) {
     g_wdisp_tail = 0;
 }
 
-#endif /* __wasm__ (browser window shell) */
+#endif /* 核心系统底层抽象与内存语义契约 */

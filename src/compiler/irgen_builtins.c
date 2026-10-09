@@ -321,7 +321,7 @@ static LLVMValueRef get_list_push_strn_fn(zan_irgen_t *g) {
     LLVMValueRef p = LLVMGetParam(fn, 1);
     LLVMValueRef n = LLVMGetParam(fn, 2);
     LLVMValueRef one64 = LLVMConstInt(i64, 1, 0);
-    /* fresh rc string with the segment bytes */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef ssz = zan_add(g->builder, n, one64, "ssz");
     LLVMValueRef str = emit_string_alloc_rc(g, ssz);
     zan_call2(g->builder, memcpy_ty, memcpy_fn,
@@ -490,7 +490,7 @@ static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, sini);
     LLVMValueRef strk = zan_icmp(b, LLVMIntNE, is_str, LLVMConstInt(i64, 0, 0), "strk");
     LLVMBuildCondBr(b, strk, scond, raw);
-    /* scalar key: splitmix-style finaliser over the raw bits */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMPositionBuilderAtEnd(b, raw);
     LLVMValueRef v = LLVMBuildPtrToInt(b, key, i64, "kv");
     v = zan_xor(b, v, zan_lshr(b, v, LLVMConstInt(i64, 33, 0), "s1"), "x1");
@@ -499,7 +499,7 @@ static LLVMValueRef get_dict_hash_fn(zan_irgen_t *g) {
     v = zan_mul(b, v, LLVMConstInt(i64, 0xc4ceb9fe1a85ec53ULL, 0), "m2");
     v = zan_xor(b, v, zan_lshr(b, v, LLVMConstInt(i64, 32, 0), "s3"), "x3");
     LLVMBuildRet(b, v);
-    /* string key: FNV-1a to the NUL terminator */
+    /* 底层系统交互与数据协议契约 */
     LLVMPositionBuilderAtEnd(b, scond);
     LLVMBuildStore(b, LLVMConstInt(i64, 1469598103934665603ULL, 0), h_a);
     LLVMBuildStore(b, key, p_a);
@@ -601,7 +601,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef grow = LLVMAppendBasicBlockInContext(c, fn, "rb.grow");
     LLVMBuildCondBr(b, empty, miss, live);
     LLVMPositionBuilderAtEnd(b, live);
-    /* Add only bumps the count, so the index reads as stale on the next lookup */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     LLVMValueRef fits = zan_icmp(b, LLVMIntSGE, icap,
         zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want4"), "fits");
     LLVMValueRef grew = zan_icmp(b, LLVMIntSLT, icnt, cnt, "grew");
@@ -612,7 +612,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(b, needc);
     LLVMBuildCondBr(b, append, grow, capc);
 
-    /* incremental: index the entries appended since the last build */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMPositionBuilderAtEnd(b, grow);
     LLVMBuildStore(b, ix, ix_a);
     LLVMBuildStore(b, zan_sub(b, icap, LLVMConstInt(i64, 1, 0), "gmask"), mask_a);
@@ -620,7 +620,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildStore(b, icnt, i_a);
     LLVMBuildBr(b, fcond);
 
-    /* rebuild: capacity = next power of two >= 4 * count, at least 16 */
+    /* 底层系统交互与数据协议契约 */
     LLVMPositionBuilderAtEnd(b, capc);
     LLVMBuildStore(b, LLVMConstInt(i64, 16, 0), cap_a);
     LLVMValueRef want = zan_mul(b, cnt, LLVMConstInt(i64, 4, 0), "want");
@@ -692,7 +692,7 @@ static LLVMValueRef get_dict_find_fn(zan_irgen_t *g) {
     LLVMBuildStore(b, zan_add(b, fi4, LLVMConstInt(i64, 1, 0), "fi.inc"), i_a);
     LLVMBuildBr(b, fcond);
 
-    /* probe for the requested key */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMPositionBuilderAtEnd(b, probe);
     LLVMValueRef pix = LLVMBuildLoad2(b, i64ptr, ixp, "pix");
     LLVMValueRef pcap = LLVMBuildLoad2(b, i64, icapp, "pcap");
@@ -756,7 +756,7 @@ static LLVMValueRef get_dict_remove_fn(zan_irgen_t *g) {
     LLVMValueRef dp = LLVMBuildBitCast(b, draw, LLVMPointerType(dty, 0), "dp");
     LLVMValueRef cntp = LLVMBuildStructGEP2(b, dty, dp, 0, "cntp");
     LLVMValueRef icntp = LLVMBuildStructGEP2(b, dty, dp, 6, "icntp");
-    /* entry to remove: the same lookup find performs. */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef fi = zan_call2(b, find_ty, findf,
         (LLVMValueRef[]){ draw, key, is_str }, 3, "rm.find");
     LLVMValueRef nokey = zan_icmp(b, LLVMIntSLT, fi, LLVMConstInt(i64, 0, 0), "nokey");
@@ -814,7 +814,7 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder, eq, hit_bb, app_bb);
     LLVMPositionBuilderAtEnd(g->builder, hit_bb);
     LLVMBuildRet(g->builder, ci);
-    /* append: grow when full */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMPositionBuilderAtEnd(g->builder, app_bb);
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64, capp, "cap");
     LLVMValueRef full = zan_icmp(g->builder, LLVMIntSGE, cnt, cap, "full");
@@ -852,16 +852,16 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
 
 /* 异常展开栈与处理器栈存储：每线程独立状态块 */
 
-/* Fields of the per-thread state block. */
+/* 底层系统交互与数据协议契约 */
 enum {
-    EH_F_TOP = 0,      /* i32: handler stack top, -1 = no handler armed */
-    EH_F_TMPS_TOP,     /* i32: unwind stack depth */
-    EH_F_EXC_OWNED,    /* i32: in-flight exception holds a +1 reference */
-    EH_F_PAD,          /* i32: keeps the pointer fields naturally aligned */
-    EH_F_EXC,          /* i8*: in-flight exception object */
-    EH_F_EXC_TID,      /* i8*: its class type descriptor (null = string) */
-    EH_F_BUFS,         /* [ZAN_EH_CHUNKS x i8*]: handler slot chunks */
-    EH_F_TMPS,         /* [ZAN_EH_CHUNKS x i8*]: unwind stack chunks */
+    EH_F_TOP = 0,      /* 核心系统底层抽象与内存语义契约 */
+    EH_F_TMPS_TOP,     /* 核心系统底层抽象与内存语义契约 */
+    EH_F_EXC_OWNED,    /* 核心系统底层抽象与内存语义契约 */
+    EH_F_PAD,          /* 底层系统交互与数据协议契约 */
+    EH_F_EXC,          /* 核心系统底层抽象与内存语义契约 */
+    EH_F_EXC_TID,      /* 底层系统交互与数据协议契约 */
+    EH_F_BUFS,         /* 核心系统底层抽象与内存语义契约 */
+    EH_F_TMPS,         /* 核心系统底层抽象与内存语义契约 */
     EH_F_COUNT
 };
 
@@ -891,7 +891,7 @@ static LLVMValueRef get_eh_self_slot(zan_irgen_t *g) {
     return v;
 }
 
-/* The layout of a thread's EH state */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
     if (g->eh_state_ty) return g->eh_state_ty;
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -911,7 +911,7 @@ static LLVMTypeRef get_eh_state_ty(zan_irgen_t *g) {
     return ty;
 }
 
-/* i64 id of the calling thread, non-zero on every supported target */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -931,7 +931,7 @@ static LLVMValueRef emit_eh_thread_id(zan_irgen_t *g) {
     return LLVMBuildPtrToInt(g->builder, self, i64t, "tid");
 }
 
-/* Table globals */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef get_eh_tab_keys(zan_irgen_t *g) {
     LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_keys");
     if (v) return v;
@@ -954,7 +954,7 @@ static LLVMValueRef get_eh_tab_cap(zan_irgen_t *g) {
                          LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
 }
 
-/* Spinlock guarding the table arrays and their capacity */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef get_eh_tab_lock(zan_irgen_t *g) {
     LLVMValueRef v = LLVMGetNamedGlobal(g->mod, "__zan_eh_tab_lock");
     if (v) return v;
@@ -976,7 +976,7 @@ static void emit_eh_tab_lock_acquire(zan_irgen_t *g, LLVMValueRef lock_gv) {
     zan_call2(g->builder, ty, fn, &p, 1, "");
 }
 
-/* Release the table mutex. */
+/* 核心系统底层抽象与内存语义契约 */
 static void emit_eh_tab_lock_release(zan_irgen_t *g, LLVMValueRef lock_gv) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
@@ -1006,7 +1006,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
 
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = LLVMGetBasicBlockParent(cur);
-    /* The caller's current block (under the lock) falls into the grow */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     LLVMBasicBlockRef head  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.head");
     LLVMBasicBlockRef walk  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.walk");
     LLVMBasicBlockRef body  = LLVMAppendBasicBlockInContext(g->ctx, fn, "gw.body");
@@ -1069,7 +1069,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
     LLVMBuildCondBr(g->builder, live, place, bump);
 
     LLVMPositionBuilderAtEnd(g->builder, place);
-    /* Same mix as the reader: key ^ (key >> 32), masked to the new width */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     LLVMValueRef h = zan_and(g->builder,
         LLVMBuildXor(g->builder, k,
             LLVMBuildLShr(g->builder, k, LLVMConstInt(i64t, 32, 0), "hi"),
@@ -1089,7 +1089,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
         full, npos);
 
     LLVMPositionBuilderAtEnd(g->builder, full);
-    /* Zeroed fresh array: this is a plain store. */
+    /* 底层系统交互与数据协议契约 */
     LLVMBuildStore(g->builder, k, nkp);
     /* 内部辅助逻辑 */
     LLVMValueRef nsp = LLVMBuildGEP2(g->builder, states_ptr_ty, sb, &p, 1,
@@ -1129,7 +1129,7 @@ static void emit_eh_tab_grow(zan_irgen_t *g, LLVMTypeRef state_ty,
         (LLVMValueRef[]){ LLVMBuildBitCast(g->builder, os, i8ptr, "os.c") }, 1, "");
     LLVMBuildBr(g->builder, done);
     LLVMPositionBuilderAtEnd(g->builder, done);
-    /* The builder is left at gw */
+    /* 核心系统底层抽象与内存语义契约 */
     (void)src;
 }
 
@@ -1149,7 +1149,7 @@ static LLVMBasicBlockRef eh_enter_entry_block(zan_irgen_t *g) {
     return cur;
 }
 
-/* The calling thread's state block, typed */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef emit_eh_state(zan_irgen_t *g) {
     LLVMBasicBlockRef cur = LLVMGetInsertBlock(g->builder);
     LLVMValueRef fn = cur ? LLVMGetBasicBlockParent(cur) : NULL;
@@ -1226,12 +1226,12 @@ static void get_eh_globals(zan_irgen_t *g, LLVMValueRef *top,
     if (bufs) *bufs = emit_eh_field_ptr(g, EH_F_BUFS, "eh.bufsp");
 }
 
-/* Aborts with a message: reached only when a stack cannot be extended */
+/* 模块核心语义抽象与接口调用契约 */
 static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef pty = LLVMFunctionType(i32t, &i8ptr, 1, 1);
-    /* Interned: dedups across the multiple EH chunk helpers. */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef fmt = zan_irgen_intern_string(g, msg);
     zan_call2(g->builder, pty, get_libc_fn(g, "printf", pty), &fmt, 1, "");
     LLVMTypeRef ety = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i32t, 1, 0);
@@ -1240,7 +1240,7 @@ static void emit_eh_oom_abort(zan_irgen_t *g, const char *msg) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* void __zan_eh_release(): drop the calling thread's EH state block */
+/* 模块核心语义抽象与接口调用契约 */
 static void emit_eh_release_fn(zan_irgen_t *g) {
     if (LLVMGetNamedFunction(g->mod, "__zan_eh_release")) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1307,7 +1307,7 @@ static void emit_eh_release_fn(zan_irgen_t *g) {
     LLVMBuildCondBr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, key, "is.mine"), found, next);
 
-    /* Not this thread's slot */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMPositionBuilderAtEnd(g->builder, next);
     LLVMValueRef k2 = LLVMBuildLoad2(g->builder, i64t,
         LLVMBuildLoad2(g->builder, LLVMPointerType(i64t, 0), kp_slot, "kp.v"),
@@ -1433,7 +1433,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         LLVMDeleteBasicBlock(hit);
     }
 
-    /* Slow path: under the table mutex, lookup or claim a slot */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMPositionBuilderAtEnd(g->builder, look);
     emit_eh_tab_lock_acquire(g, lock_gv);
     LLVMValueRef cap0 = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap0");
@@ -1446,7 +1446,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBuildBr(g->builder, probe);
 
     LLVMPositionBuilderAtEnd(g->builder, probe);
-    /* Key 0 marks a free slot, so shift the id out of that value. */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef key = zan_add(g->builder, emit_eh_thread_id(g),
         LLVMConstInt(i64t, 1, 0), "key");
     LLVMValueRef cap = LLVMBuildLoad2(g->builder, i64t, cap_gv, "st.cap");
@@ -1482,7 +1482,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
     LLVMBuildRet(g->builder, st_found);
 
     LLVMPositionBuilderAtEnd(g->builder, claim);
-    /* Free (never used) or a tombstone left by a thread that released its block */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     LLVMValueRef reusable = LLVMBuildOr(g->builder,
         zan_icmp(g->builder, LLVMIntEQ, k, LLVMConstInt(i64t, 0, 0), "is.free"),
         zan_icmp(g->builder, LLVMIntEQ, k,
@@ -1511,7 +1511,7 @@ static LLVMValueRef get_eh_state_fn(zan_irgen_t *g) {
         "zan: out of memory creating this thread's exception state\n");
 
     LLVMPositionBuilderAtEnd(g->builder, ready);
-    /* An empty handler stack is -1, the one field a zeroed block gets wrong */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     LLVMBuildStore(g->builder, LLVMConstInt(i32t, (unsigned long long)-1, 1),
         LLVMBuildStructGEP2(g->builder, state_ty,
             LLVMBuildBitCast(g->builder, st, LLVMPointerType(state_ty, 0),
@@ -1604,7 +1604,7 @@ static LLVMValueRef get_eh_chunk_fn(zan_irgen_t *g, const char *name,
     return fn;
 }
 
-/* Call one of the chunked-stack accessors for the calling thread */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static LLVMValueRef emit_eh_chunk_call(zan_irgen_t *g, LLVMValueRef fn,
                                       LLVMValueRef idx, const char *name) {
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1616,7 +1616,7 @@ static LLVMValueRef emit_eh_chunk_call(zan_irgen_t *g, LLVMValueRef fn,
         fn, args, 2, name);
 }
 
-/* First-touch chunk geometry */
+/* 核心系统底层抽象与内存语义契约 */
 static bool eh_bare_target(zan_irgen_t *g) {
     return strncmp(g->target_triple, "riscv", 5) == 0 &&
            !strstr(g->target_triple, "linux");
@@ -1636,12 +1636,12 @@ static LLVMValueRef get_eh_slot_fn(zan_irgen_t *g) {
         "zan: exception handler stack exhausted (too many nested try blocks)\n");
 }
 
-/* i8* to handler slot `idx`'s jmp_buf. */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef emit_eh_buf_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     return emit_eh_chunk_call(g, get_eh_slot_fn(g), idx, "eh.bufp");
 }
 
-/* i32* to handler slot `idx`'s unwind-stack mark, which trails its jmp_buf */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1651,7 +1651,7 @@ static LLVMValueRef emit_eh_mark_ptr(zan_irgen_t *g, LLVMValueRef idx) {
         LLVMPointerType(i32t, 0), "eh.markp");
 }
 
-/* Marks a function and a call to it with a simple enum attribute */
+/* 模块核心语义抽象与接口调用契约 */
 static void add_enum_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                           const char *name) {
     unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
@@ -1753,7 +1753,7 @@ static LLVMValueRef get_wasm_personality_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Attach the wasm personality to the function being emitted */
+/* 模块核心语义抽象与接口调用契约 */
 static void wasm_eh_set_personality(zan_irgen_t *g) {
     if (!g->target_is_wasm || !g->current_fn) return;
     LLVMSetPersonalityFn(g->current_fn, get_wasm_personality_fn(g));
@@ -1795,7 +1795,7 @@ static void emit_wasm_throw_op(zan_irgen_t *g, LLVMValueRef exc_obj) {
     LLVMBuildUnreachable(g->builder);
 }
 
-/* The landing pad of one armed try: catchswitch (unwinds to the caller, i */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static LLVMBasicBlockRef emit_wasm_lpad(zan_irgen_t *g,
                                         LLVMBasicBlockRef catch_bb) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1880,7 +1880,7 @@ static LLVMValueRef get_eh_tmp_slot_fast_fn(zan_irgen_t *g, LLVMValueRef slow) {
     return fn;
 }
 
-/* i8** to unwind-stack entry `idx`. */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef emit_eh_tmp_slot_ptr(zan_irgen_t *g, LLVMValueRef idx) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef fn = get_eh_tmp_slot_fast_fn(g,
@@ -2044,12 +2044,12 @@ static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
     LLVMBuildStore(g->builder, nslot, slot);
     LLVMBuildBr(g->builder, tryent);
     LLVMPositionBuilderAtEnd(g->builder, yes);
-    /* hit: return the pair's name */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMValueRef nmp = LLVMBuildStructGEP2(g->builder, ent_ty, entp, 1, "nmp");
     LLVMValueRef nm = LLVMBuildLoad2(g->builder, i8ptr, nmp, "nm");
     LLVMBuildRet(g->builder, nm);
     LLVMPositionBuilderAtEnd(g->builder, nextc);
-    /* step the descriptor chain: load the next link from *cur */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     {
         LLVMValueRef cp = LLVMBuildBitCast(g->builder, c,
             LLVMPointerType(i8ptr, 0), "cp");
@@ -2157,7 +2157,7 @@ static LLVMValueRef get_eh_tmp_unwind_fn(zan_irgen_t *g) {
     LLVMValueRef slot = emit_eh_tmp_slot_ptr(g, ntop);
     LLVMValueRef obj = LLVMBuildLoad2(g->builder, i8ptr, slot, "obj");
     LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), slot);
-    /* Entry flavours share the stack */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMValueRef obj_i = LLVMBuildPtrToInt(g->builder, obj,
         LLVMInt64TypeInContext(g->ctx), "obji");
     LLVMValueRef tagged = LLVMBuildTrunc(g->builder,
@@ -2299,7 +2299,7 @@ static void emit_eh_tmp_pop(zan_irgen_t *g) {
     zan_call2(g->builder, fnty, get_eh_tmp_pop_fn(g), NULL, 0, "");
 }
 
-/* void __zan_eh_tmp_drop(i8* obj): unregister one stacked temp by identity */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static LLVMValueRef get_eh_tmp_drop_fn(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "__zan_eh_tmp_drop");
     if (fn) return fn;
@@ -2408,7 +2408,7 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
     LLVMValueRef tot_a = LLVMBuildAlloca(g->builder, i64, "tot");
     LLVMValueRef pos_a = LLVMBuildAlloca(g->builder, i64, "pos");
     LLVMBuildStore(g->builder, LLVMConstInt(i64, 0, 0), idx_a);
-    /* total starts at seplen*(n-1), clamped at 0 for empty lists */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef nz = zan_icmp(g->builder, LLVMIntSGT, n, LLVMConstInt(i64, 0, 0), "nz");
     LLVMValueRef nm1 = zan_sub(g->builder, n, LLVMConstInt(i64, 1, 0), "nm1");
     LLVMValueRef sepsum = LLVMBuildSelect(g->builder, nz,
@@ -2421,7 +2421,7 @@ static LLVMValueRef get_str_join_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntSLT, mi, n, "mlt"), m_body, c_pre);
     LLVMPositionBuilderAtEnd(g->builder, m_body);
     LLVMValueRef slot = LLVMBuildGEP2(g->builder, i64, data, &mi, 1, "slot");
-    /* a list may legitimately hold null entries (xs */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef sv = emit_str_nonnull(g, LLVMBuildIntToPtr(g->builder,
         LLVMBuildLoad2(g->builder, i64, slot, "svi"), i8ptr, "sv"));
     LLVMValueRef sl = zan_call2(g->builder, strlen_ty, g->fn_strlen, &sv, 1, "sl");
@@ -2481,7 +2481,7 @@ static LLVMValueRef coerce_dict_key(zan_irgen_t *g, LLVMValueRef key,
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
-        /* Normalize to the declared key width (Dict<int, */
+        /* 底层系统交互与数据协议契约 */
         LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
         if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
             LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
@@ -2521,8 +2521,8 @@ static LLVMValueRef emit_dict_find(zan_irgen_t *g, zan_type_t *dict_type,
         (LLVMValueRef[]){ draw, key, is_str }, 3, "dfind");
 }
 
-/* Backing LLVM global for a static class/struct field `Class */
-/* The instantiation a static access names, if any: `Stat<int> */
+/* 模块核心语义抽象与接口调用契约 */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *static_access_inst(zan_irgen_t *g, zan_ast_node_t *obj_expr) {
     if (!obj_expr || !obj_expr->ident.inst_type_ref) return NULL;
     zan_type_t *t = zan_binder_resolve_type(g->binder, obj_expr->ident.inst_type_ref);
@@ -2541,7 +2541,7 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
     if (!((fsym->modifiers & MOD_STATIC) ||
           (fsym->decl->field_decl.modifiers & MOD_STATIC)))
         return NULL;
-    /* Static fields and properties belong to their declaring type */
+    /* 模块核心语义抽象与接口调用契约 */
     if (fsym->parent && (fsym->parent->kind == SYM_CLASS ||
                          fsym->parent->kind == SYM_STRUCT)) {
         class_sym = fsym->parent;
@@ -2667,12 +2667,12 @@ static void emit_invalidate_freed_string(zan_irgen_t *g, zan_ast_node_t *arg,
     LLVMBuildStore(g->builder, LLVMConstNull(map_type(g, field_type)), field_ptr);
 }
 
-/* Null-conditional access `a? */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
                                    zan_ast_node_t *qmem, local_scope_t *locals) {
     LLVMValueRef obj = emit_expr(g, qmem->member.object, locals);
     if (LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind) {
-        /* value receiver can never be null: plain access */
+        /* 底层系统交互与数据协议契约 */
         qmem->member.null_cond = 0;
         LLVMValueRef v = emit_expr(g, expr, locals);
         qmem->member.null_cond = 1;
@@ -2726,12 +2726,12 @@ static LLVMValueRef emit_null_cond(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMValueRef vals[] = { dflt, v };
     LLVMBasicBlockRef bbs[] = { entry_bb, then_end };
     LLVMAddIncoming(phi, vals, bbs, 2);
-    /* an owned receiver temp (e */
+    /* 核心系统底层抽象与内存语义契约 */
     emit_release_owned_call_temp(g, saved_obj, obj, locals);
     return phi;
 }
 
-/* `params T[] rest` call-site packing */
+/* 核心系统底层抽象与内存语义契约 */
 /* 内部辅助实现 */
 /* 内部辅助逻辑 */
 static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
@@ -2749,13 +2749,13 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
 
     zan_ast_list_t *ps = &decl->method_decl.params;
     int m = ps->count;
-    /* slot[i] = call-arg index placed at AST-parameter position i, or -1 */
+    /* 模块核心语义抽象与接口调用契约 */
     int *slot = (int *)malloc(sizeof(int) * (size_t)(m > n ? m : n));
     for (int i = 0; i < (m > n ? m : n); i++) slot[i] = -1;
     int *used_name = (int *)malloc(sizeof(int) * (size_t)n);
     for (int i = 0; i < n; i++) used_name[i] = 0;
 
-    /* First pass: bind named arguments by parameter name. */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < n; i++) {
         zan_ast_node_t *arg = args->items[i];
         if (!arg || arg->kind != AST_NAMED_ARG) continue;
@@ -2763,7 +2763,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
         for (int j = 0; j < m; j++) {
             zan_ast_node_t *p = ps->items[j];
             if (!p || p->kind != AST_PARAM) continue;
-            if (p->param.is_this) continue; /* extension receiver: not nameable */
+            if (p->param.is_this) continue; /* 核心系统底层抽象与内存语义契约 */
             if (p->param.name.len == arg->named_arg.name.len &&
                 memcmp(p->param.name.str, arg->named_arg.name.str,
                        (size_t)p->param.name.len) == 0) {
@@ -2787,7 +2787,7 @@ static void reorder_named_args_impl(zan_irgen_t *g, zan_ast_list_t *args,
         }
     }
 
-    /* Second pass: positional arguments fill the leftmost free slots */
+    /* 模块核心语义抽象与接口调用契约 */
     int j = 0;
     for (int i = 0; i < n; i++) {
         if (used_name[i]) continue;
@@ -2865,7 +2865,7 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
     if (argc == visible) {
         /* 内部辅助逻辑 */
         zan_ast_node_t *la = call->call.args.items[argc - 1];
-        if (la->kind == AST_NEW_EXPR) return; /* already packed / explicit array */
+        if (la->kind == AST_NEW_EXPR) return; /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *lt = infer_expr_type(g, la, locals);
         if (lt && lt->kind == TYPE_ARRAY) return;
     }
@@ -2873,7 +2873,7 @@ static void pack_params_args(zan_irgen_t *g, zan_ast_node_t *call,
     zan_ast_node_t *arr = zan_ast_new(g->arena, AST_NEW_EXPR, call->loc);
     arr->new_expr.type = last_p->param.type; /* T[] */
     arr->new_expr.is_array = true;
-    arr->new_expr.array_init = true; /* args are the elements */
+    arr->new_expr.array_init = true; /* 核心系统底层抽象与内存语义契约 */
     zan_ast_list_init(&arr->new_expr.args);
     for (int i = fixed; i < argc; i++)
         zan_ast_list_push(&arr->new_expr.args, call->call.args.items[i], g->arena);

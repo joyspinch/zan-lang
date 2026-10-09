@@ -3,13 +3,11 @@ using System.IO;
 using System.Threading;
 
 /// 一次发布的打包收尾活（拷资源、写 Chromium 子进程包、tar.gz 归档）。
-///
-/// 编译本身早就走分离进程了，但收尾这一段原来是在 GUI 线程上跑的：一个
+/// 编译本身早就走分离进程了
 /// macOS 发布目录里有可执行文件加上 libcrypto/libssl/libzan_gui 这些动态库，
 /// 光 `GZip.Compress(Tar.Create(...))` 就要把几十 MB 读进内存压一遍，
 /// 这段时间窗口不泵消息，用户看到的就是「ZanIDE（未响应）」——也就是
 /// 「发布 mac 程序总是未响应」的由来。
-///
 /// 所以收尾跟助手工具走同一套（见 AiWork）：`Start` 把这一次打包交给一条
 /// 自己的线程，事件循环每帧问一次 `Ready()`，拿到结果再把它那份日志倒进
 /// 输出窗。线程只碰自己 job 里的 List，不动 GUI 侧的任何状态。
@@ -20,11 +18,7 @@ class PubPack {
     /// 交给线程但还没被领走的活，以及看守它的锁。活本身走这个队列：
     /// 线程入口是静态方法组，只认队列，不碰共享字段。
     static List<PubJob> sPend;
-    #if WINDOWS
     static nint sLock;
-    #else
-    static string sLock;
-    #endif
 
     static void EnsureQueue() {
         if (PubPack.sPend == null) {
@@ -63,6 +57,7 @@ class PubPack {
             j.log.Add(ZanIDE.T("> Packaging failed: ", "> 打包失败：") + ex.Message);
         } finally {
             PubPack.Finish(j);
+            j.drained.TrySetResult(true);
         }
     }
 
@@ -167,6 +162,12 @@ class PubPack {
         }
     }
 
+    /// 核心契约与语义定义。
+    static async void DrainAsync() {
+        PubJob job = PubPack.sCur;
+        if (job != null) { await job.drained.Task; }
+    }
+
     static bool Busy() {
         if (PubPack.sCur == null) { return false; }
         return PubPack.DoneOf(PubPack.sCur) == 0;
@@ -236,4 +237,5 @@ class PubJob {
     string stage;
     bool ok;
     int done;
+    TaskCompletionSource<bool> drained = new TaskCompletionSource<bool>();
 }

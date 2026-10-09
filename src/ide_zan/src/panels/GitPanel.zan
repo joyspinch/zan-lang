@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 
@@ -8,8 +10,9 @@ using Gui.Widget;
 /// 列表、底部的提交信息行；空仓库时只显示提示和「初始化仓库」。
 /// 每个按钮的 `onClick` 是设计里的处理器名，由 `WireHandlers` 注册
 /// 到宿主 Form 的处理器表上（`.html` 的事件通路），这里的代码只
-/// 表达意图：真正跑 git 的是 `ZanIDE.GitBegin` 那一层，命令的输出
-/// 全部回到 OUTPUT 面板，界面永不阻塞。
+/// 表达意图：真正跑 git 的是 `BeginGitJob` 那一层（工作线程执行），
+/// 命令的输出全部回到 OUTPUT 面板；仓库探测与状态刷新走
+/// `SyncWorkspace` 的后台线程，渲染只读缓存，永不阻塞。
 partial class GitPanel {
     void OnInit() {
         this.Files.WithRow(GitFileRow.Of);
@@ -63,17 +66,45 @@ partial class GitPanel {
     /// 变更文件列表控件（外壳的行处理器读取选中项）。
     ListView<string> FileList() { return this.Files; }
 
+    /// 仓库探测（后台线程结果）与是否已扫过状态。渲染路径只读这两个缓存。
+    bool repoKnown;
+    bool repoState;
+
+    /// 仓库状态与变更列表的异步刷新入口：主流程在切换工作区、git 作业完成、
+    /// 手动刷新后调用。.git 探测与状态作业的发起都离开渲染线程；结果经
+    /// Post 回 UI 线程，并按「同一 IDE、同一根目录、未关停」核对后才生效。
+    void SyncWorkspace() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || ide.shuttingDown) { return; }
+        string rootAt = ide.root;
+        if (rootAt == "") {
+            this.repoKnown = true;
+            this.repoState = false;
+            return;
+        }
+        App host = ide.app;
+        Task.Run(delegate () {
+            bool repo = Directory.Exists(rootAt + "/.git");
+            host.Post(delegate () {
+                ZanIDE owner = ZanIDE.current;
+                if (owner == null || owner != ide || owner.root != rootAt
+                    || owner.shuttingDown) { return; }
+                this.repoKnown = true;
+                this.repoState = repo;
+                if (repo && !owner.gitLoaded && owner.gitJob == 0) {
+                    // 状态作业：refresh 变体在工作线程上跑 `git status` 等，
+                    // 结果由 job 监视器回填 gitFiles/gitBranch/gitHead。
+                    owner.BeginGitJob("", true);
+                }
+                owner.app.RequestRedraw();
+            });
+        });
+    }
+
     void Render(App app, Rect area) {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
-        bool repo = Directory.Exists(ide.root + "/.git");
-        // 第一次显示（以及每次刷新后）按需扫一遍状态：git 在后台跑，
-        // 结果由帧循环轮询，绘制不等它。
-        if (repo && !ide.gitLoaded && ide.gitJob == 0) {
-            ZanIDE.GitRefreshBegin(ide.root);
-            ide.gitJob = 1;
-            app.RequestAnimationFrame(120);
-        }
+        bool repo = this.repoKnown && this.repoState;
         this.NoRepo.SetShown(!repo);
         this.InitRow.SetShown(!repo);
         this.Branch.SetShown(repo);
@@ -123,8 +154,7 @@ partial class GitPanel {
     static void OnInitRepo() {
         ZanIDE ide = ZanIDE.current;
         if (ide == null || ide.gitJob != 0) { return; }
-        ZanIDE.GitBegin(ide.root, "init");
-        ide.gitJob = 2;
+        ide.BeginGitJob("init");
         ide.log.Add(ZanIDE.T("> git init ...", "> 正在初始化 git 仓库 ..."));
     }
 
@@ -132,14 +162,14 @@ partial class GitPanel {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
         ide.gitLoaded = false;
+        if (ide.gitPanel != null) { ide.gitPanel.SyncWorkspace(); }
     }
 
     static void OnStage() {
         ZanIDE ide = ZanIDE.current;
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
-            ZanIDE.GitBegin(ide.root, "add -A");
-            ide.gitJob = 2;
+            ide.BeginGitJob("add -A");
             ide.log.Add(ZanIDE.T("> Staging all changes ...",
                 "> 正在暂存全部变更 ..."));
         }
@@ -157,8 +187,7 @@ partial class GitPanel {
             ide.dock.Focus("output");
             return;
         }
-        ZanIDE.GitBegin(ide.root, "add -- \"" + p + "\"");
-        ide.gitJob = 2;
+        ide.BeginGitJob("add -- \"" + p + "\"");
         ide.log.Add("> git add -- \"" + p + "\" ...");
         ide.dock.Focus("output");
     }
@@ -175,8 +204,7 @@ partial class GitPanel {
             ide.dock.Focus("output");
             return;
         }
-        ZanIDE.GitBegin(ide.root, "reset -q -- \"" + p + "\"");
-        ide.gitJob = 2;
+        ide.BeginGitJob("reset -q -- \"" + p + "\"");
         ide.log.Add("> git reset -q -- \"" + p + "\" ...");
         ide.dock.Focus("output");
     }
@@ -192,8 +220,7 @@ partial class GitPanel {
         string what = "diff HEAD";
         if (ide.gitHead == "") { what = "diff --cached"; }
         if (ide.gitJob == 0) {
-            ZanIDE.GitBegin(ide.root, what + target);
-            ide.gitJob = 2;
+            ide.BeginGitJob(what + target);
             ide.log.Add("> git " + what + target + " ...");
         }
         ide.dock.Focus("output");
@@ -209,8 +236,7 @@ partial class GitPanel {
             return;
         }
         if (ide.gitJob == 0) {
-            ZanIDE.GitBegin(ide.root, "log --oneline --decorate -20");
-            ide.gitJob = 2;
+            ide.BeginGitJob("log --oneline --decorate -20");
             ide.log.Add("> git log ...");
         }
         ide.dock.Focus("output");
@@ -222,8 +248,7 @@ partial class GitPanel {
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
             ide.log.Add("> git pull ...");
-            ZanIDE.GitBegin(ide.root, "pull");
-            ide.gitJob = 2;
+            ide.BeginGitJob("pull");
         }
         ide.dock.Focus("output");
     }
@@ -233,8 +258,7 @@ partial class GitPanel {
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
             ide.log.Add("> git push ...");
-            ZanIDE.GitBegin(ide.root, "push");
-            ide.gitJob = 2;
+            ide.BeginGitJob("push");
         }
         ide.dock.Focus("output");
     }
@@ -255,8 +279,7 @@ partial class GitPanel {
                 "> 请先输入分支名。"));
         } else if (ide.gitJob == 0) {
             name = ZanIDE.GitEscape(name);
-            ZanIDE.GitBegin(ide.root, "checkout -b \"" + name + "\"");
-            ide.gitJob = 2;
+            ide.BeginGitJob("checkout -b \"" + name + "\"");
             ide.log.Add("> git checkout -b \"" + name + "\" ...");
             ide.gitPanel.BranchName.SetText("");
         }
@@ -274,8 +297,7 @@ partial class GitPanel {
                 "> 请先输入分支名。"));
         } else if (ide.gitJob == 0) {
             name = ZanIDE.GitEscape(name);
-            ZanIDE.GitBegin(ide.root, "checkout \"" + name + "\"");
-            ide.gitJob = 2;
+            ide.BeginGitJob("checkout \"" + name + "\"");
             ide.log.Add("> git checkout \"" + name + "\" ...");
             ide.gitPanel.BranchName.SetText("");
         }
@@ -292,8 +314,7 @@ partial class GitPanel {
                 "> 请先输入要合并的分支名。"));
         } else if (ide.gitJob == 0) {
             name = ZanIDE.GitEscape(name);
-            ZanIDE.GitBegin(ide.root, "merge \"" + name + "\"");
-            ide.gitJob = 2;
+            ide.BeginGitJob("merge \"" + name + "\"");
             ide.log.Add("> git merge \"" + name + "\" ...");
             ide.gitPanel.BranchName.SetText("");
         }
@@ -306,8 +327,7 @@ partial class GitPanel {
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
             ide.log.Add("> git stash ...");
-            ZanIDE.GitBegin(ide.root, "stash");
-            ide.gitJob = 2;
+            ide.BeginGitJob("stash");
         }
         ide.dock.Focus("output");
     }
@@ -318,8 +338,7 @@ partial class GitPanel {
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
             ide.log.Add("> git stash pop ...");
-            ZanIDE.GitBegin(ide.root, "stash pop");
-            ide.gitJob = 2;
+            ide.BeginGitJob("stash pop");
         }
         ide.dock.Focus("output");
     }
@@ -330,8 +349,7 @@ partial class GitPanel {
         if (ide == null) { return; }
         if (ide.gitJob == 0) {
             ide.log.Add("> git stash list ...");
-            ZanIDE.GitBegin(ide.root, "stash list");
-            ide.gitJob = 2;
+            ide.BeginGitJob("stash list");
         }
         ide.dock.Focus("output");
     }
@@ -347,11 +365,10 @@ partial class GitPanel {
                 "> 请先输入提交信息。"));
         } else if (ide.gitJob == 0) {
             msg = ZanIDE.GitEscape(msg);
-            ZanIDE.GitBegin(ide.root,
+            ide.BeginGitJob(
                 "diff --cached --quiet && git -C \"" + ide.root
                 + "\" commit -a -m \"" + msg
                 + "\" || git -C \"" + ide.root + "\" commit -m \"" + msg + "\"");
-            ide.gitJob = 2;
             ide.log.Add("> git commit ...");
             ide.gitPanel.Message.SetText("");
         }

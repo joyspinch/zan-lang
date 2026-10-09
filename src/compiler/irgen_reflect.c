@@ -1,6 +1,6 @@
-/* Reflection metadata: `typeof(T)` / `obj */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* record header offsets, from the TypeInfo value */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_METHODS_OFF (-88)
 #define ZAN_REFL_MCOUNT_OFF  (-80)
 #define ZAN_REFL_CTORS_OFF   (-72)
@@ -10,7 +10,7 @@
 #define ZAN_REFL_FIELDS_OFF (-40)
 #define ZAN_REFL_COUNT_OFF  (-32)
 #define ZAN_REFL_KIND_OFF   (-24)
-/* bytes in front of the name payload */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_REFL_PREFIX     88
 /* { i8*, i8*, i64, i64 } */
 #define ZAN_REFL_FIELD_SIZE 32
@@ -24,13 +24,13 @@
 #define ZAN_REFL_MO_THUNK    40
 #define ZAN_REFL_MO_FLAGS    48
 
-/* method flags */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_REFL_MF_STATIC   1
 #define ZAN_REFL_MF_VIRTUAL  2
 #define ZAN_REFL_MF_PROPGET  4
 #define ZAN_REFL_MF_PROPSET  8
 
-/* which table a reader walks */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_REFL_TBL_METHOD  0
 #define ZAN_REFL_TBL_CTOR    1
 
@@ -45,15 +45,15 @@
 #define ZAN_REFL_MI_FLAGS    2
 #define ZAN_REFL_MI_RETKIND  3
 
-/* how a value handed to __zan_refl_set was packed into its i64 slot */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_REFL_VK_INT      0   /* an integer, sign-extended */
 #define ZAN_REFL_VK_DOUBLE   1   /* a double, bit-cast */
 #define ZAN_REFL_VK_PTR      2   /* a string / reference, as an integer */
 
-/* the maximum number of arguments a reflected call can pack */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_REFL_ARG_SLOTS   64
 
-/* type kinds */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_REFL_TK_CLASS     1
 #define ZAN_REFL_TK_STRUCT    2
 #define ZAN_REFL_TK_ENUM      3
@@ -65,7 +65,7 @@
 #define ZAN_REFL_TK_DELEGATE  9
 #define ZAN_REFL_TK_LAST      9
 
-/* field kinds: how to load the slot the record points at */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_REFL_FK_BOOL   1
 #define ZAN_REFL_FK_SBYTE  2
 #define ZAN_REFL_FK_BYTE   3
@@ -82,7 +82,7 @@
 #define ZAN_REFL_FK_STRING 14
 #define ZAN_REFL_FK_REF    15
 #define ZAN_REFL_FK_OTHER  16
-/* an enum member: no storage, the `offset` slot holds its constant value */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_REFL_FK_ENUM_MEMBER 20
 
 /* `which` selector of __zan_refl_fname */
@@ -130,7 +130,7 @@ static LLVMValueRef refl_const_string(zan_irgen_t *g, const char *s, int len) {
     return LLVMConstGEP2(rec_ty, gv, idx, 3);
 }
 
-/* The load code for a field of `t`. */
+/* 核心系统底层抽象与内存语义契约 */
 static int refl_field_kind(zan_type_t *t) {
     if (!t) return ZAN_REFL_FK_OTHER;
     switch (t->kind) {
@@ -197,7 +197,7 @@ static struct zan_struct_type_entry *refl_struct_entry(zan_irgen_t *g,
     return NULL;
 }
 
-/* The byte offset of layout slot `slot` in `st`, as a relocatable constant */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_slot_offset(zan_irgen_t *g, LLVMTypeRef st, int slot) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -331,7 +331,7 @@ static int refl_accessor_flag(zan_symbol_t *sym, zan_symbol_t *msym) {
     return 0;
 }
 
-/* The reflected methods of `sym`, in declaration order. */
+/* 底层系统交互与数据协议契约 */
 static int refl_collect_methods(zan_symbol_t *sym, zan_symbol_t **out, int cap) {
     int n = 0;
     if (!sym) return 0;
@@ -382,7 +382,7 @@ static LLVMValueRef refl_slot_to(zan_irgen_t *g, LLVMValueRef slot,
     }
 }
 
-/* The inverse: a returned value packed back into its i64 slot. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_to_slot(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -417,7 +417,7 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     LLVMTypeRef vd = LLVMVoidTypeInContext(g->ctx);
 
     unsigned total = LLVMCountParamTypes(fn_ty);
-    /* instance thunks read args[0 */
+    /* 核心系统底层抽象与内存语义契约 */
     unsigned max_params = is_static ? ZAN_REFL_ARG_SLOTS : ZAN_REFL_ARG_SLOTS + 1;
     if (total > max_params) return NULL;
     LLVMTypeRef ptypes[ZAN_REFL_ARG_SLOTS + 1];
@@ -473,7 +473,7 @@ static LLVMValueRef refl_make_thunk(zan_irgen_t *g, LLVMValueRef fn,
     return LLVMConstBitCast(th, i8ptr);
 }
 
-/* The `[n x i8*]` type-name array of a parameter list, as an i8* */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (!params || params->count <= 0) return LLVMConstNull(i8ptr);
@@ -497,7 +497,7 @@ static LLVMValueRef refl_param_names(zan_irgen_t *g, zan_ast_list_t *params) {
     return LLVMConstBitCast(gv, i8ptr);
 }
 
-/* One method record */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef refl_method_record(zan_irgen_t *g, zan_symbol_t *sym,
                                        zan_symbol_t *msym, bool late) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -602,7 +602,7 @@ static LLVMValueRef refl_make_ctor_thunk(zan_irgen_t *g, zan_symbol_t *sym,
     return LLVMConstBitCast(th, i8ptr);
 }
 
-/* One constructor record: same shape as a method record, named " */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_ctor_record(zan_irgen_t *g, zan_symbol_t *sym,
                                      zan_ast_node_t *decl, bool late) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -705,7 +705,7 @@ static LLVMValueRef refl_shape_mtab(zan_irgen_t *g, zan_symbol_t *sym,
     return LLVMConstBitCast(gv, LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0));
 }
 
-/* The type record for `t` under the display name `disp`, emitted once */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
                                   const char *disp, int disp_len) {
     char namebuf[256];
@@ -789,7 +789,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
         t->element_type)
         elem = refl_meta_for(g, t->element_type, NULL, 0);
 
-    /* The generic arguments, as a null-terminated array of records */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef targs = LLVMConstNull(i8ptr);
     if (t && t->type_arg_count > 0 && t->type_args) {
         int n = t->type_arg_count;
@@ -837,7 +837,7 @@ static LLVMValueRef refl_meta_for(zan_irgen_t *g, zan_type_t *t,
     return rec;
 }
 
-/* Bind the thunks of every shaped method/constructor table */
+/* 模块核心语义抽象与接口调用契约 */
 static void refl_finalize_mtabs(zan_irgen_t *g) {
     for (int i = 0; i < g->refl_mtab_count; i++) {
         LLVMValueRef init = refl_mtab_init(g, g->refl_mtabs[i].sym,
@@ -847,7 +847,7 @@ static void refl_finalize_mtabs(zan_irgen_t *g) {
     }
 }
 
-/* Load one i64 header slot of the record `ti` points into. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_hdr_i64(zan_irgen_t *g, LLVMValueRef ti, int off,
                                  const char *name) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -940,7 +940,7 @@ static LLVMValueRef refl_find_fn(zan_irgen_t *g) {
 /* 内部辅助逻辑 */
 static LLVMValueRef refl_pget_fn(zan_irgen_t *g);
 
-/* The value a getter returned, converted the way the caller wants it */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef refl_pget_as_i64(zan_irgen_t *g, LLVMValueRef slot,
                                      LLVMValueRef kind) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -1020,7 +1020,7 @@ static LLVMValueRef refl_get_i64_fn(zan_irgen_t *g) {
     LLVMBasicBlockRef lookup = LLVMAppendBasicBlockInContext(g->ctx, fn, "lookup");
 
     LLVMPositionBuilderAtEnd(g->builder, entry);
-    /* a property with a real getter is read THROUGH it, not off its slot */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef pk = NULL;
     LLVMValueRef pv = refl_call_pget(g, ti, obj, name, &pk);
     LLVMBuildCondBr(g->builder,
@@ -1065,7 +1065,7 @@ static LLVMValueRef refl_get_i64_fn(zan_irgen_t *g) {
     LLVMPositionBuilderAtEnd(g->builder, slot);
     LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, obj, &foff, 1, "refl.slot");
 
-    /* one block per load width; the kind decides the extension */
+    /* 模块核心语义抽象与接口调用契约 */
     struct { int kind; LLVMTypeRef ty; int sext; const char *nm; } cases[] = {
         { ZAN_REFL_FK_BOOL,   i8,  0, "b" },
         { ZAN_REFL_FK_BYTE,   i8,  0, "u8" },
@@ -1268,7 +1268,7 @@ static LLVMValueRef refl_get_str_fn(zan_irgen_t *g) {
     LLVMValueRef sv = LLVMBuildLoad2(g->builder, i8ptr,
         LLVMBuildBitCast(g->builder, p, LLVMPointerType(i8ptr, 0), "refl.sp"),
         "refl.sv");
-    /* an unassigned string field is null; answer "" instead */
+    /* 底层系统交互与数据协议契约 */
     LLVMValueRef svr = LLVMBuildSelect(g->builder,
         LLVMBuildIsNull(g->builder, sv, "refl.snull"), empty, sv, "refl.str");
     zan_call2(g->builder, arc_ty, g->rt_str_retain, &svr, 1, "");
@@ -1471,7 +1471,7 @@ static LLVMValueRef refl_mfind_fn(zan_irgen_t *g) {
     LLVMValueRef rec = LLVMBuildGEP2(g->builder, i8, methods, &off, 1, "refl.mr");
     LLVMValueRef mname = refl_hdr_ptr(g, rec, ZAN_REFL_MO_NAME, "refl.mn");
     LLVMValueRef mflags = refl_hdr_i64(g, rec, ZAN_REFL_MO_FLAGS, "refl.mf");
-    /* an accessor lookup skips the `get_`/`set_` prefix of the record name */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef acc = LLVMBuildICmp(g->builder, LLVMIntNE, flags,
                                      LLVMConstInt(i64, 0, 0), "refl.isacc");
     LLVMValueRef four = LLVMBuildSelect(g->builder, acc,
@@ -1770,7 +1770,7 @@ static LLVMValueRef refl_pget_fn(zan_irgen_t *g) {
             LLVMConstInt(i64, ZAN_REFL_TBL_METHOD, 0), idx, obj, slots, kout },
         6, "refl.gv");
     LLVMValueRef k = LLVMBuildLoad2(g->builder, i64, kout, "refl.gkv");
-    /* the invoke reports 1 + kind; a not-called getter reads as "no property" */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMBuildStore(g->builder,
         LLVMBuildSelect(g->builder,
             LLVMBuildICmp(g->builder, LLVMIntEQ, k, LLVMConstInt(i64, 0, 0),
@@ -1866,7 +1866,7 @@ static LLVMValueRef refl_set_fn(zan_irgen_t *g) {
     LLVMValueRef fkind = refl_hdr_i64(g, fe, 16, "refl.fkind");
     LLVMValueRef foff = refl_hdr_i64(g, fe, 24, "refl.foff");
     LLVMValueRef p = LLVMBuildGEP2(g->builder, i8, obj, &foff, 1, "refl.fslot");
-    /* the value in both shapes, so each field kind picks the one it needs */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef is_fp = LLVMBuildICmp(g->builder, LLVMIntEQ, vkind,
         LLVMConstInt(i64, ZAN_REFL_VK_DOUBLE, 0), "refl.visfp");
     LLVMValueRef as_d = LLVMBuildSelect(g->builder, is_fp,
@@ -2082,14 +2082,14 @@ static LLVMValueRef refl_tainfo_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* The TypeInfo of `obj`, whose static type is `st`. */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef refl_emit_get_type(zan_irgen_t *g, zan_type_t *st,
                                        LLVMValueRef obj) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef fallback = refl_meta_for(g, st, NULL, 0);
     if (!st || (st->kind != TYPE_CLASS && st->kind != TYPE_INTERFACE &&
                 st->kind != TYPE_OBJECT))
-        return fallback;   /* value types have no runtime type to look up */
+        return fallback;   /* 底层系统交互与数据协议契约 */
     if (!obj || LLVMGetTypeKind(LLVMTypeOf(obj)) != LLVMPointerTypeKind)
         return fallback;
     obj = LLVMBuildBitCast(g->builder, obj, i8ptr, "refl.obj");
@@ -2148,7 +2148,7 @@ static LLVMValueRef refl_mfind(zan_irgen_t *g, LLVMValueRef ti,
             LLVMConstInt(i64, (unsigned long long)flags, 0) }, 3, "refl.mfi");
 }
 
-/* An index argument as an i64 (0 when the call has none). */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef refl_arg_index(zan_irgen_t *g, zan_ast_node_t *arg,
                                    local_scope_t *locals) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -2156,7 +2156,7 @@ static LLVMValueRef refl_arg_index(zan_irgen_t *g, zan_ast_node_t *arg,
     return emit_index_i64(g, emit_expr(g, arg, locals), "refl.i");
 }
 
-/* A name argument as an i8* ("" when the call has none). */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef refl_arg_str(zan_irgen_t *g, zan_ast_node_t *arg,
                                  local_scope_t *locals) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -2164,7 +2164,7 @@ static LLVMValueRef refl_arg_str(zan_irgen_t *g, zan_ast_node_t *arg,
     return LLVMBuildBitCast(g->builder, v, i8ptr, "refl.nm");
 }
 
-/* The i64 argument slots of a reflected call: `args[from */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef refl_pack_args(zan_irgen_t *g, zan_ast_node_t **args,
                                    int argc, int from,
                                    local_scope_t *locals) {
@@ -2317,7 +2317,7 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
     }
     }
     switch (code) {
-    case ZAN_REFL_M_NAME: /* Name: the record's payload already IS that string */
+    case ZAN_REFL_M_NAME: /* 底层系统交互与数据协议契约 */
         *out = ti;
         return true;
     case ZAN_REFL_M_KIND: {   /* Kind */
@@ -2376,7 +2376,7 @@ static bool refl_emit_typeinfo_member(zan_irgen_t *g, LLVMValueRef ti,
                           LLVMConstInt(i64, 0, 0), "refl.ge"),
             LLVMBuildICmp(g->builder, LLVMIntSLT, idx, count, "refl.lt"),
             "refl.ok");
-        /* a null-safe read: out-of-range answers 0 without branching */
+        /* 模块核心语义抽象与接口调用契约 */
         LLVMValueRef safe = LLVMBuildSelect(g->builder, ok, idx,
                                             LLVMConstInt(i64, 0, 0), "refl.si");
         LLVMValueRef off = LLVMBuildAdd(g->builder,
@@ -2422,7 +2422,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
     if (arg0) *nm_tmp = nm;
     nm = LLVMBuildBitCast(g->builder, nm, i8ptr, "refl.nm");
     LLVMTypeRef three[3] = { i8ptr, i8ptr, i8ptr };
-    /* SetField<T>(name, value): the setter of a property, else the field slot */
+    /* 模块核心语义抽象与接口调用契约 */
     if (code == ZAN_REFL_M_SETINT || code == ZAN_REFL_M_SETLONG ||
         code == ZAN_REFL_M_SETBOOL || code == ZAN_REFL_M_SETDOUBLE ||
         code == ZAN_REFL_M_SETSTRING) {
@@ -2446,7 +2446,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
                              LLVMConstInt(i64, 0, 0), "refl.omhas");
         return true;
     }
-    /* Invoke*(name, args...): the method's own thunk, by name */
+    /* 模块核心语义抽象与接口调用契约 */
     if (code == ZAN_REFL_M_IVOID || code == ZAN_REFL_M_IINT ||
         code == ZAN_REFL_M_ILONG || code == ZAN_REFL_M_IDOUBLE ||
         code == ZAN_REFL_M_ISTRING) {
@@ -2463,7 +2463,7 @@ static bool refl_emit_instance_call_1(zan_irgen_t *g, zan_type_t *rt,
         LLVMValueRef called = LLVMBuildICmp(g->builder, LLVMIntNE, kv,
             LLVMConstInt(i64, 0, 0), "refl.icalled");
         if (code == ZAN_REFL_M_IVOID) { *out = called; return true; }
-        /* the invoke reports 1 + the return kind */
+        /* 底层系统交互与数据协议契约 */
         LLVMValueRef k = LLVMBuildSub(g->builder, kv, LLVMConstInt(i64, 1, 0),
                                       "refl.ik1");
         if (code == ZAN_REFL_M_ISTRING) {
@@ -2627,7 +2627,7 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                                         LLVMConstInt(i64, 0, 0) };
                 tynames = LLVMBuildGEP2(g->builder, at, gv, idxs, 2, "tn.ptr");
             }
-            /* reflection type record (GetType); only when the module reflects */
+            /* 模块核心语义抽象与接口调用契约 */
             if (g->refl_used && sym->type)
                 meta = refl_meta_for(g, sym->type, sym->name.str,
                                      (int)sym->name.len);

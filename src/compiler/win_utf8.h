@@ -1,9 +1,7 @@
 #ifndef ZAN_COMPILER_WIN_UTF8_H
 #define ZAN_COMPILER_WIN_UTF8_H
 
-/* Windows' narrow CRT APIs use the active ANSI code page, while Zan project
- * files and IDE response files are UTF-8. Keep compiler paths UTF-8 all the
- * way through LLVM and convert only at the Windows API boundary. */
+/* 底层系统交互与数据协议契约 */
 
 #ifdef _WIN32
 
@@ -152,8 +150,7 @@ static inline int zan_utf8_system(const char *command) {
     return rc;
 }
 
-/* The CRT's narrow argv is lossy outside the current ANSI code page. Recover
- * the original Windows command line and expose a UTF-8 argv to the compiler. */
+/* 底层系统交互与数据协议契约 */
 static inline char **zan_utf8_command_line_argv(int *out_argc) {
     typedef LPWSTR *(WINAPI *command_line_to_argv_w_fn)(LPCWSTR, int *);
     HMODULE shell32 = LoadLibraryW(L"shell32.dll");

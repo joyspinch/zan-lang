@@ -1,9 +1,4 @@
-/* ipa.c -- one-shot iOS IPA packaging for zanc (--emit-ipa).
- *
- * Packages an arm64 Mach-O executable, Info.plist, and PkgInfo into a
- * standard .ipa zip archive without requiring macOS or official Apple
- * certificates.
- */
+/* 底层系统交互与数据协议契约 */
 
 #include "ipa.h"
 #include <stdio.h>
@@ -72,7 +67,7 @@ typedef struct {
     size_t offset;
     uint32_t crc;
     uint32_t size;
-    uint32_t mode; /* Unix permissions, e.g. 0755 or 0644 */
+    uint32_t mode; /* 核心系统底层抽象与内存语义契约 */
 } ipa_zip_ent_t;
 
 typedef struct {
@@ -118,18 +113,18 @@ static int zip_add(ipa_zip_t *z, const char *name, const void *data, size_t sz, 
 
     size_t name_len = strlen(name);
 
-    /* Local file header */
+    /* 核心系统底层抽象与内存语义契约 */
     buf_u32(&z->out, 0x04034b50u);
-    buf_u16(&z->out, 20);           /* version needed: 2.0 */
+    buf_u16(&z->out, 20);           /* 核心系统底层抽象与内存语义契约 */
     buf_u16(&z->out, 0);            /* flags */
     buf_u16(&z->out, 0);            /* method: 0 (store) */
-    buf_u16(&z->out, 0);            /* mod time */
-    buf_u16(&z->out, 0x21);         /* mod date (1980-01-01) */
+    buf_u16(&z->out, 0);            /* 核心系统底层抽象与内存语义契约 */
+    buf_u16(&z->out, 0x21);         /* 核心系统底层抽象与内存语义契约 */
     buf_u32(&z->out, e->crc);
-    buf_u32(&z->out, e->size);       /* compressed size */
-    buf_u32(&z->out, e->size);       /* uncompressed size */
+    buf_u32(&z->out, e->size);       /* 核心系统底层抽象与内存语义契约 */
+    buf_u32(&z->out, e->size);       /* 核心系统底层抽象与内存语义契约 */
     buf_u16(&z->out, (uint16_t)name_len);
-    buf_u16(&z->out, 0);            /* extra field len */
+    buf_u16(&z->out, 0);            /* 核心系统底层抽象与内存语义契约 */
     buf_write(&z->out, name, name_len);
     buf_write(&z->out, data, sz);
 
@@ -143,14 +138,14 @@ static int zip_finish(ipa_zip_t *z) {
         ipa_zip_ent_t *e = &z->ents[i];
         size_t name_len = strlen(e->name);
 
-        /* Central directory file header */
+        /* 核心系统底层抽象与内存语义契约 */
         buf_u32(&z->out, 0x02014b50u);
-        buf_u16(&z->out, 0x0314);   /* version made by: 0x03 (Unix), 20 (2.0) */
-        buf_u16(&z->out, 20);       /* version needed: 2.0 */
+        buf_u16(&z->out, 0x0314);   /* 核心系统底层抽象与内存语义契约 */
+        buf_u16(&z->out, 20);       /* 核心系统底层抽象与内存语义契约 */
         buf_u16(&z->out, 0);        /* flags */
         buf_u16(&z->out, 0);        /* compression: store */
-        buf_u16(&z->out, 0);        /* mod time */
-        buf_u16(&z->out, 0x21);     /* mod date */
+        buf_u16(&z->out, 0);        /* 核心系统底层抽象与内存语义契约 */
+        buf_u16(&z->out, 0x21);     /* 核心系统底层抽象与内存语义契约 */
         buf_u32(&z->out, e->crc);
         buf_u32(&z->out, e->size);
         buf_u32(&z->out, e->size);
@@ -158,8 +153,8 @@ static int zip_finish(ipa_zip_t *z) {
         buf_u16(&z->out, 0);        /* extra */
         buf_u16(&z->out, 0);        /* comment */
         buf_u16(&z->out, 0);        /* disk # */
-        buf_u16(&z->out, 0);        /* internal attrs */
-        /* External attributes: Unix permissions shifted left by 16 */
+        buf_u16(&z->out, 0);        /* 核心系统底层抽象与内存语义契约 */
+        /* 底层系统交互与数据协议契约 */
         uint32_t ext_attr = (e->mode ? e->mode : 0100644) << 16;
         buf_u32(&z->out, ext_attr);
         buf_u32(&z->out, (uint32_t)e->offset);
@@ -168,15 +163,15 @@ static int zip_finish(ipa_zip_t *z) {
 
     size_t cen_size = z->out.len - cen;
 
-    /* End of central directory record */
+    /* 核心系统底层抽象与内存语义契约 */
     buf_u32(&z->out, 0x06054b50u);
-    buf_u16(&z->out, 0);            /* disk number */
-    buf_u16(&z->out, 0);            /* disk with central dir */
+    buf_u16(&z->out, 0);            /* 核心系统底层抽象与内存语义契约 */
+    buf_u16(&z->out, 0);            /* 核心系统底层抽象与内存语义契约 */
     buf_u16(&z->out, (uint16_t)z->nent);
     buf_u16(&z->out, (uint16_t)z->nent);
     buf_u32(&z->out, (uint32_t)cen_size);
     buf_u32(&z->out, (uint32_t)cen);
-    buf_u16(&z->out, 0);            /* comment length */
+    buf_u16(&z->out, 0);            /* 核心系统底层抽象与内存语义契约 */
     return 0;
 }
 

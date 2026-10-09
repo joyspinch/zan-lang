@@ -2,18 +2,19 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 using Gui.Component;
 using Gui.Designer;
 using Game.Scene;
 
-// ---- design document entities (.html; .zform = legacy import) ------------
-// The form designer's interchange format (Designer.Inspector SaveJson /
-// LoadJson) is declared as classes for the IDE-side producers. Optional
-// fields the old builders omitted (required/wrap) serialize as explicit
-// false, which LoadJson reads identically to a missing key; legacy imports
-// use LegacyFormDoc so a blank winTitle can never overwrite the title.
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
 
 class FormFieldDoc {
     int type;
@@ -59,12 +60,537 @@ class IdeRenameDocument {
     int version;
 }
 
-/// ZanIDE part: code navigation (go to definition / find references,
-/// text-scan fallback + LSP-backed), the code outline, and the designer
-/// <-> code form serialization (.html model + code-behind emitter).
+// IDE 视图状态管理与用户交互调度。
+// 接口数据协议与执行契约。
+class IdeSourceSnapshot {
+    string path;
+    string key;
+    string body;
+    int version;
+
+    static IdeSourceSnapshot Create(string path, string body, int version) {
+        IdeSourceSnapshot source = new IdeSourceSnapshot();
+        source.path = path; source.key = ZanIDE.NormPath(path);
+        source.body = body; source.version = version;
+        return source;
+    }
+}
+
+class IdeNavigationSnapshot {
+    string root;
+    string path;
+    string body;
+    string word;
+    string owner;
+    string referenceOwner;
+    List<string> family;
+    bool lacksMember;
+    bool lacksReferenceMember;
+    int workspace;
+    int sourceRevision;
+    int designRevision;
+    int sequence;
+    int stamp;
+    int line;
+    int column;
+    List<IdeSourceSnapshot> documents;
+    CancellationToken cancellation;
+}
+
+class IdeNavigationGuard {
+    IdeNavigationSnapshot snapshot;
+    TabRecord origin;
+    List<TabRecord> tabSet;
+    List<TabRecord> sourceTabs;
+    LspSession session;
+    LspResult semantic;
+    bool synchronized;
+    bool editorBound;
+}
+
+class IdeProjectSourceCache {
+    string root;
+    int workspace;
+    int revision;
+    List<IdeSourceSnapshot> project;
+    List<IdeSourceSnapshot> search;
+    List<IdeSourceSnapshot> library;
+    Dictionary<string, IdeSourceSnapshot> byPath;
+}
+
+class IdeProjectSourceRead {
+    string root;
+    int workspace;
+    int revision;
+    List<IdeSourceSnapshot> library;
+    CancellationToken cancellation;
+}
+
+class IdeNavigationDiskText {
+    string body;
+    long stamp;
+}
+
+class IdeNavigationTarget {
+    string path = "";
+    string body = "";
+    int line;
+    int column;
+    bool valid;
+    bool fromDisk;
+    long diskStamp;
+    string message = "";
+    TabRecord prepared;
+}
+
+// IDE 视图状态管理与用户交互调度。
+// IDE 视图状态管理与用户交互调度。
+class IdeCodeNavigationWork {
+    nint syncLock = Mutex.Create();
+    int pending;
+    List<TaskCompletionSource<int>> waiting = new List<TaskCompletionSource<int>>();
+
+    void Begin() {
+        Mutex.Lock(syncLock);
+        pending = pending + 1;
+        Mutex.Unlock(syncLock);
+    }
+
+    void Complete() {
+        List<TaskCompletionSource<int>> ready = null;
+        Mutex.Lock(syncLock);
+        pending = pending - 1;
+        if (pending == 0) {
+            ready = waiting;
+            waiting = new List<TaskCompletionSource<int>>();
+        }
+        Mutex.Unlock(syncLock);
+        if (ready != null) {
+            for (int i = 0; i < ready.Count; i = i + 1) {
+                ready[i].SetResult(0);
+                // 接口数据协议与执行契约。
+                // 核心契约与语义定义。
+                ready[i].Close();
+            }
+        }
+    }
+
+    Task Run(Action worker) {
+        this.Begin();
+        try {
+            return Task.Run(delegate () {
+                try { worker(); }
+                finally {
+                    // 接口数据协议与执行契约。
+                    worker = null;
+                    this.Complete();
+                }
+            });
+        } catch (Exception error) {
+            this.Complete();
+            throw error;
+        }
+    }
+
+    Task DrainAsync() {
+        TaskCompletionSource<int> completion = null;
+        Mutex.Lock(syncLock);
+        if (pending > 0) {
+            completion = new TaskCompletionSource<int>();
+            waiting.Add(completion);
+        }
+        Mutex.Unlock(syncLock);
+        if (completion == null) {
+            // 接口数据协议与执行契约。
+            // 核心契约与语义定义。
+            TaskCompletionSource<int> ready = new TaskCompletionSource<int>();
+            ready.SetResult(0);
+            Task done = ready.Task;
+            ready.Close();
+            return done;
+        }
+        return completion.Task;
+    }
+
+    ~IdeCodeNavigationWork() { Mutex.Destroy(syncLock); }
+}
+
+class IdeRenamePlanEntry {
+    string path;
+    string originalText;
+    string newText;
+    bool open;
+    int version;
+    bool written;
+    CodeEditorPreparedText prepared;
+}
+
+class IdeRenamePlan {
+    bool valid;
+    string failure = "";
+    List<IdeRenamePlanEntry> entries = new List<IdeRenamePlanEntry>();
+    int buffers;
+    int disk;
+}
+
+class IdeRenameCommit {
+    bool committed;
+    string failure = "";
+}
+
+delegate void IdeRenameDiskWriter(string path, string text);
+
+/// 接口数据协议与执行契约。
+/// IDE 视图状态管理与用户交互调度。
+/// 接口数据协议与执行契约。
 partial class ZanIDE {
-    // ---- code navigation (go to definition / find references) ----
+    // 核心契约与语义定义。
     static IdeDefinitionCaret definitionCaret;
+    static int navigationSourceRevision;
+    static int projectSourceReadCursor;
+    int navigationWorkspace;
+    int navigationSequence;
+    int projectFeedSequence;
+    CancellationTokenSource navigationCancellation = new CancellationTokenSource();
+    CancellationTokenSource projectSourceCancellation = new CancellationTokenSource();
+    CancellationTokenSource projectFeedCancellation = new CancellationTokenSource();
+    IdeProjectSourceCache navigationSources;
+    IdeProjectSourceRead projectSourceRead;
+    List<Action> projectSourceWaiters = new List<Action>();
+    List<Action> navigationIdleWaiters = new List<Action>();
+    bool navigationCommitBusy;
+    bool navigationCommitWaiting;
+    bool navigationDocumentWritesPaused;
+    bool navigationDesignWritesPaused;
+    IdeCodeNavigationWork navigationWork = new IdeCodeNavigationWork();
+
+    bool CodeNavigationBusy() { return navigationCommitWaiting || navigationCommitBusy; }
+
+    // 接口数据协议与执行契约。
+    // IDE 视图状态管理与用户交互调度。
+    async void DrainCodeNavigationAsync() { await navigationWork.DrainAsync(); }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void CancelCodeNavigation() {
+        navigationWorkspace = navigationWorkspace + 1;
+        navigationSequence = navigationSequence + 1;
+        projectFeedSequence = projectFeedSequence + 1;
+        projectFeedCancellation.Cancel();
+        projectFeedCancellation = new CancellationTokenSource();
+        navigationCancellation.Cancel();
+        navigationCancellation = new CancellationTokenSource();
+        projectSourceCancellation.Cancel();
+        projectSourceCancellation = new CancellationTokenSource();
+        projectSourceRead = null;
+        navigationSources = null;
+        projectSourceWaiters.Clear();
+    }
+
+    void CancelCodeNavigationThen(Action continuation) {
+        this.CancelCodeNavigation();
+        if (continuation == null) { return; }
+        if (this.CodeNavigationBusy()) { navigationIdleWaiters.Add(continuation); }
+        else { app.Post(continuation); }
+    }
+
+    void ReleaseNavigationCommit() {
+        if (navigationDesignWritesPaused) {
+            navigationDesignWritesPaused = false;
+            this.ResumeDesignWrites();
+        }
+        if (navigationDocumentWritesPaused) {
+            navigationDocumentWritesPaused = false;
+            this.ResumeDocumentWrites();
+        }
+        navigationCommitWaiting = false;
+        navigationCommitBusy = false;
+        List<Action> waiting = navigationIdleWaiters;
+        navigationIdleWaiters = new List<Action>();
+        for (int i = 0; i < waiting.Count; i = i + 1) { app.Post(waiting[i]); }
+        app.RequestRedraw();
+    }
+
+    IdeNavigationGuard CaptureNavigation(bool synchronize, bool symbol) {
+        if (shuttingDown) { return null; }
+        int active = activeTab.Get();
+        if (active < 0 || active >= tabs.Count || editor == null) { return null; }
+        TabRecord origin = tabs[active];
+        bool bound = origin.path == editor.documentPath && !origin.designDoc
+            && !origin.path.StartsWith("@");
+        if (symbol && (!bound || origin.path.Length == 0)) { return null; }
+        string text = bound ? editor.GetText() : origin.body;
+        if (bound) { origin.body = text; }
+        IdeNavigationSnapshot snapshot = new IdeNavigationSnapshot();
+        snapshot.root = root; snapshot.path = origin.path; snapshot.body = text;
+        snapshot.workspace = navigationWorkspace;
+        snapshot.sourceRevision = ZanIDE.navigationSourceRevision;
+        snapshot.designRevision = this.DesignDocumentRevision();
+        snapshot.sequence = navigationSequence;
+        snapshot.stamp = bound ? editor.TextStamp() : 0;
+        snapshot.line = bound ? editor.CurLine() : origin.caretLine;
+        snapshot.column = bound ? editor.CurCol() : origin.caretCol;
+        snapshot.word = symbol ? editor.WordAtCaret() : "";
+        snapshot.owner = symbol ? editor.OwnerTypeAtCaret() : "";
+        snapshot.referenceOwner = snapshot.owner;
+        if (symbol && snapshot.referenceOwner.Length == 0) {
+            snapshot.referenceOwner = editor.EnclosingTypeOfCaretDecl();
+        }
+        snapshot.family = new List<string>();
+        if (snapshot.referenceOwner.Length > 0) {
+            snapshot.family.Add(snapshot.referenceOwner);
+            // IDE 视图状态管理与用户交互调度。
+            CodeEditor.SymbolSubtypesOf(snapshot.referenceOwner, snapshot.family);
+            snapshot.lacksReferenceMember = CodeEditor.SymbolTypeLacksMember(
+                snapshot.referenceOwner, snapshot.word);
+        }
+        snapshot.lacksMember = snapshot.owner.Length > 0
+            && CodeEditor.SymbolTypeLacksMember(snapshot.owner, snapshot.word);
+        snapshot.documents = new List<IdeSourceSnapshot>();
+        snapshot.cancellation = navigationCancellation.Token;
+        IdeNavigationGuard guard = new IdeNavigationGuard();
+        guard.snapshot = snapshot; guard.origin = origin; guard.tabSet = tabs;
+        guard.sourceTabs = new List<TabRecord>();
+        guard.session = lspSess; guard.editorBound = bound;
+        guard.synchronized = synchronize && lspSess != null && lspSess.Alive();
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            TabRecord tab = tabs[i];
+            if (!ZanIDE.NavigationSourcePath(tab.path)) { continue; }
+            int version = -1;
+            if (guard.synchronized && !tab.designDoc && tab.path.ToLower().EndsWith(".zan")) {
+                lspSess.SyncDoc(tab.path, tab.body);
+                version = lspSess.DocVersion(tab.path);
+            }
+            snapshot.documents.Add(IdeSourceSnapshot.Create(tab.path, tab.body, version));
+            guard.sourceTabs.Add(tab);
+        }
+        return guard;
+    }
+
+    static bool NavigationSnapshotCurrent(IdeNavigationSnapshot snapshot,
+            int workspace, int revision, int sequence, string path,
+            int stamp, int line, int column, bool caret) {
+        return snapshot != null && !snapshot.cancellation.IsCancellationRequested
+            && snapshot.workspace == workspace && snapshot.sourceRevision == revision
+            && snapshot.sequence == sequence && LspSession.SameDocumentPath(snapshot.path, path)
+            && snapshot.stamp == stamp && (!caret || snapshot.line == line && snapshot.column == column);
+    }
+
+    bool NavigationGuardCurrent(IdeNavigationGuard guard, bool caret, bool sequence) {
+        if (shuttingDown || guard == null || guard.tabSet != tabs || editor == null) { return false; }
+        IdeNavigationSnapshot snapshot = guard.snapshot;
+        int active = activeTab.Get();
+        int serial = sequence ? navigationSequence : snapshot.sequence;
+        if (active < 0 || active >= tabs.Count || tabs[active] != guard.origin) { return false; }
+        if (guard.editorBound && editor.documentPath != snapshot.path) { return false; }
+        int stamp = guard.editorBound ? editor.TextStamp() : 0;
+        int line = guard.editorBound ? editor.CurLine() : guard.origin.caretLine;
+        int column = guard.editorBound ? editor.CurCol() : guard.origin.caretCol;
+        if (!ZanIDE.NavigationSnapshotCurrent(snapshot, navigationWorkspace,
+                ZanIDE.navigationSourceRevision, serial, tabs[active].path,
+                stamp, line, column, caret)) { return false; }
+        int count = 0;
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (ZanIDE.NavigationSourcePath(tabs[i].path)) { count = count + 1; }
+        }
+        if (count != snapshot.documents.Count) { return false; }
+        for (int i = 0; i < snapshot.documents.Count; i = i + 1) {
+            IdeSourceSnapshot source = snapshot.documents[i];
+            int tab = ZanIDE.FindNavigationTab(tabs, source.path);
+            if (tab < 0 || tabs[tab] != guard.sourceTabs[i] || tabs[tab].body != source.body) { return false; }
+            if (guard.synchronized && source.version >= 0 && (guard.session != lspSess
+                || lspSess.DocVersion(source.path) != source.version)) { return false; }
+        }
+        LspResult semantic = guard.semantic;
+        return semantic == null || guard.session == lspSess && lspSess.IsCurrent(
+            semantic.path, semantic.version, semantic.generation, semantic.documentGeneration);
+    }
+
+    IdeNavigationGuard BeginCodeNavigation(bool synchronize, bool symbol) {
+        if (shuttingDown || this.CodeNavigationBusy()) { return null; }
+        navigationCancellation.Cancel();
+        navigationCancellation = new CancellationTokenSource();
+        navigationSequence = navigationSequence + 1;
+        this.RememberTabView();
+        return this.CaptureNavigation(synchronize, symbol);
+    }
+
+    static bool NavigationSourcePath(string path) {
+        if (path.Length == 0 || path.StartsWith("@")) { return false; }
+        string p = path.ToLower();
+        return p.EndsWith(".zan") || p.EndsWith(".html") || p.EndsWith(".htm")
+            || p.EndsWith(".zform") || p.EndsWith(".zscene") || p.EndsWith(".zcomp");
+    }
+
+    static bool NavigationPathInRoot(string path, string root) {
+        string normalized = ZanIDE.NormPath(root);
+        while (normalized.EndsWith("/")) { normalized = normalized.Substring(0, normalized.Length - 1); }
+        return normalized.Length > 0 && ZanIDE.NormPath(path).StartsWith(normalized + "/");
+    }
+
+    static IdeSourceSnapshot SnapshotSource(List<IdeSourceSnapshot> sources, string path) {
+        string key = ZanIDE.NormPath(path);
+        for (int i = 0; i < sources.Count; i = i + 1) {
+            if (sources[i].key == key) { return sources[i]; }
+        }
+        return null;
+    }
+
+    static List<IdeSourceSnapshot> ReadSourceSnapshots(string directory, CancellationToken cancellation) {
+        List<IdeSourceSnapshot> sources = new List<IdeSourceSnapshot>();
+        if (directory.Length == 0 || cancellation.IsCancellationRequested) { return sources; }
+        List<string> paths = ZanIDE.ListZanFiles(directory);
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (cancellation.IsCancellationRequested) { return sources; }
+            string path = paths[i];
+            if (!path.ToLower().EndsWith(".zan") || !File.Exists(path)) { continue; }
+            sources.Add(IdeSourceSnapshot.Create(path, File.ReadAllText(path), 0));
+        }
+        return sources;
+    }
+
+    static IdeProjectSourceCache LoadProjectSourceSnapshot(IdeProjectSourceRead request) {
+        IdeProjectSourceCache cache = new IdeProjectSourceCache();
+        cache.root = request.root; cache.workspace = request.workspace; cache.revision = request.revision;
+        cache.search = new List<IdeSourceSnapshot>();
+        cache.project = ZanIDE.ReadSourceSnapshots(request.root, request.cancellation);
+        cache.library = request.library;
+        if (cache.library == null) {
+            cache.library = ZanIDE.ReadSourceSnapshots(ZanIDE.StdlibDir(), request.cancellation);
+        }
+        cache.byPath = new Dictionary<string, IdeSourceSnapshot>();
+        for (int i = 0; i < cache.library.Count; i = i + 1) {
+            cache.byPath[cache.library[i].key] = cache.library[i];
+        }
+        for (int i = 0; i < cache.project.Count; i = i + 1) {
+            cache.byPath[cache.project[i].key] = cache.project[i];
+        }
+        // IDE 视图状态管理与用户交互调度。
+        if (request.cancellation.IsCancellationRequested || request.root.Length == 0) { return cache; }
+        List<string> searchPaths = new List<string>();
+        ZanIDE.GatherZanFiles(request.root, searchPaths);
+        for (int i = 0; i < searchPaths.Count; i = i + 1) {
+            if (request.cancellation.IsCancellationRequested) { return cache; }
+            string key = ZanIDE.NormPath(searchPaths[i]);
+            if (!cache.byPath.ContainsKey(key) && File.Exists(searchPaths[i])) {
+                cache.byPath[key] = IdeSourceSnapshot.Create(searchPaths[i], File.ReadAllText(searchPaths[i]), 0);
+            }
+            if (cache.byPath.ContainsKey(key)) { cache.search.Add(cache.byPath[key]); }
+        }
+        return cache;
+    }
+
+    void WithProjectSources(Action ready) {
+        if (shuttingDown) { return; }
+        if (navigationSources != null && navigationSources.root == root
+            && navigationSources.workspace == navigationWorkspace
+            && navigationSources.revision == ZanIDE.navigationSourceRevision) {
+            ready();
+            return;
+        }
+        bool current = projectSourceRead != null && projectSourceRead.root == root
+            && projectSourceRead.workspace == navigationWorkspace
+            && projectSourceRead.revision == ZanIDE.navigationSourceRevision;
+        if (!current) {
+            projectSourceCancellation.Cancel();
+            projectSourceCancellation = new CancellationTokenSource();
+            projectSourceWaiters.Clear();
+            IdeProjectSourceRead request = new IdeProjectSourceRead();
+            request.root = root; request.workspace = navigationWorkspace;
+            request.revision = ZanIDE.navigationSourceRevision;
+            request.library = navigationSources != null && navigationSources.revision == request.revision
+                ? navigationSources.library : null;
+            request.cancellation = projectSourceCancellation.Token;
+            projectSourceRead = request;
+            App host = app;
+            navigationWork.Run(delegate () {
+                IdeProjectSourceCache result = null;
+                string failure = "";
+                try { result = ZanIDE.LoadProjectSourceSnapshot(request); }
+                catch (Exception error) {
+                    // 代码导航与工程符号语义索引契约。
+                    failure = error.Message;
+                }
+                if (request.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () { this.CompleteProjectSources(request, result, failure); });
+            });
+        }
+        projectSourceWaiters.Add(ready);
+    }
+
+    void CompleteProjectSources(IdeProjectSourceRead request, IdeProjectSourceCache cache, string failure) {
+        if (request != projectSourceRead || request.cancellation.IsCancellationRequested
+            || request.workspace != navigationWorkspace || request.root != root
+            || request.revision != ZanIDE.navigationSourceRevision) { return; }
+        projectSourceRead = null;
+        if (failure != "" || cache == null) {
+            projectSourceWaiters.Clear();
+            log.Add("> Project sources: " + failure);
+            app.RequestRedraw();
+            return;
+        }
+        navigationSources = cache;
+        List<Action> waiting = projectSourceWaiters;
+        projectSourceWaiters = new List<Action>();
+        for (int i = 0; i < waiting.Count; i = i + 1) { waiting[i](); }
+    }
+
+    static List<IdeSourceSnapshot> MergeSourceSnapshots(List<IdeSourceSnapshot> project,
+            List<IdeSourceSnapshot> documents) {
+        Dictionary<string, IdeSourceSnapshot> opened = new Dictionary<string, IdeSourceSnapshot>();
+        for (int i = 0; i < documents.Count; i = i + 1) { opened[documents[i].key] = documents[i]; }
+        List<IdeSourceSnapshot> merged = new List<IdeSourceSnapshot>();
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        for (int i = 0; i < project.Count; i = i + 1) {
+            IdeSourceSnapshot source = project[i];
+            merged.Add(opened.ContainsKey(source.key) ? opened[source.key] : source);
+            seen[source.key] = true;
+        }
+        for (int i = 0; i < documents.Count; i = i + 1) {
+            if (!seen.ContainsKey(documents[i].key)) { merged.Add(documents[i]); }
+        }
+        return merged;
+    }
+
+    static List<string> ProjectSourceBodies(IdeProjectSourceCache cache,
+            IdeNavigationSnapshot snapshot) {
+        List<IdeSourceSnapshot> sources = ZanIDE.MergeSourceSnapshots(cache.project, snapshot.documents);
+        List<string> bodies = new List<string>();
+        string skip = ZanIDE.NormPath(snapshot.path);
+        for (int i = 0; i < sources.Count; i = i + 1) {
+            if (sources[i].key != skip && sources[i].path.ToLower().EndsWith(".zan")) {
+                bodies.Add(sources[i].body);
+            }
+        }
+        return bodies;
+    }
+
+    void RequestProjectSourcesAsync() {
+        if (!haveProject || editor == null) { return; }
+        IdeNavigationGuard guard = this.CaptureNavigation(false, false);
+        if (guard == null || !guard.editorBound) { return; }
+        projectFeedCancellation.Cancel();
+        projectFeedCancellation = new CancellationTokenSource();
+        guard.snapshot.cancellation = projectFeedCancellation.Token;
+        projectFeedSequence = projectFeedSequence + 1;
+        int feed = projectFeedSequence;
+        this.WithProjectSources(delegate () {
+            if (feed != projectFeedSequence || !this.NavigationGuardCurrent(guard, false, false)) { return; }
+            IdeProjectSourceCache cache = navigationSources;
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            App host = app;
+            navigationWork.Run(delegate () {
+                List<string> bodies = ZanIDE.ProjectSourceBodies(cache, snapshot);
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () {
+                    if (feed != projectFeedSequence || !this.NavigationGuardCurrent(guard, false, false)) { return; }
+                    editor.SetProjectFiles(bodies);
+                    projSrcFeed = false;
+                    app.RequestRedraw();
+                });
+            });
+        });
+    }
 
     static string RTrimS(string s) {
         int e = s.Length;
@@ -75,7 +601,7 @@ partial class ZanIDE {
         return s.Substring(0, e);
     }
 
-    /// True if `after` begins with `word` followed by a non-identifier char.
+    /// 接口数据协议与执行契约。
     static bool StartsWithWord(string after, string word) {
         int wl = word.Length;
         if (after.Length < wl) { return false; }
@@ -84,7 +610,7 @@ partial class ZanIDE {
         return !CodeEditor.IsIdentByte(after[wl]);
     }
 
-    /// True if the line declares a type named `word` (class/struct/enum/interface).
+    /// IDE 视图状态管理与用户交互调度。
     static bool IsTypeDecl(string line, string word) {
         string s = CodeEditor.LTrim(line);
         List<string> kws = new List<string>{
@@ -99,7 +625,7 @@ partial class ZanIDE {
         return false;
     }
 
-    /// Index of a whole-word `word(` occurrence in s, or -1.
+    /// 核心契约与语义定义。
     static int FindWordCall(string s, string word) {
         int wl = word.Length;
         if (wl == 0 || s == null) { return 0 - 1; }
@@ -113,9 +639,9 @@ partial class ZanIDE {
         return 0 - 1;
     }
 
-    /// Heuristic: the line is a method/function definition header for `word`
-    /// (a return-type token precedes `word(` and the line opens a block / ends
-    /// the signature), as opposed to a call site.
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static bool IsMethodDef(string line, string word) {
         string s = CodeEditor.LTrim(line);
         if (ZanIDE.StartsWithWord(s, "if") || ZanIDE.StartsWithWord(s, "while")
@@ -129,14 +655,14 @@ partial class ZanIDE {
         if (rt.Length == 0) { return false; }
         string last = rt.Substring(rt.Length - 1, 1);
         if (last == "{" || last == ")") { return true; }
-        // A body that opens and closes on the declaration's own line ends in
-        // '}', not '{': `WebApp Views(string d) { views = d; return this; }` is
-        // still where Views is declared.
+        // IDE 视图状态管理与用户交互调度。
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
         return CodeEditor.DeclNameAt(s) == word;
     }
 
-    /// First line index declaring `word` in `body` (type decls first, then
-    /// method definitions), or -1 when not found.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static int FindDeclLine(string body, string word) {
         List<string> ls = CodeEditor.SplitLines(body);
         for (int i = 0; i < ls.Count; i = i + 1) {
@@ -148,8 +674,8 @@ partial class ZanIDE {
         return 0 - 1;
     }
 
-    /// Net brace-nesting change contributed by one source line, ignoring
-    /// braces inside string/char literals or after a `//` line comment.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static int OutlineBraceDelta(string line) {
         int delta = 0;
         bool inStr = false;
@@ -174,13 +700,13 @@ partial class ZanIDE {
         return delta;
     }
 
-    /// True when `ch` is an identifier character.
+    /// 核心契约与语义定义。
     static bool OutlineIsIdentChar(string ch) {
         if (ch == null || ch.Length == 0) { return false; }
         return CodeEditor.IsIdentByte(ch[0]);
     }
 
-    /// Leading identifier of a token ("Foo<T>" -> "Foo", "bar;" -> "bar").
+    /// 接口数据协议与执行契约。
     static string OutlineIdent(string tok) {
         if (tok == null || tok.Length == 0) { return ""; }
         int i = 0;
@@ -192,13 +718,13 @@ partial class ZanIDE {
         return tok.Substring(0, i);
     }
 
-    /// Index of the first occurrence of single-char `ch` in `s`, or -1.
+    /// 代码导航与工程符号语义索引契约。
     static int OutlineFind(string s, string ch) {
         if (s == null || ch == null || ch.Length == 0) { return 0 - 1; }
         return s.IndexOf(ch);
     }
 
-    /// The type name declared on `s` (class/struct/enum/interface), or "".
+    /// 接口数据协议与执行契约。
     static string OutlineTypeName(string s) {
         List<string> toks = ZanIDE.SplitSpaces(s);
         for (int i = 0; i < toks.Count; i = i + 1) {
@@ -211,7 +737,7 @@ partial class ZanIDE {
         return "";
     }
 
-    /// "Name()" when `s` is a method/ctor definition header, else "".
+    /// 接口数据协议与执行契约。
     static string OutlineMethodName(string s) {
         int paren = ZanIDE.OutlineFind(s, "(");
         if (paren <= 0) { return ""; }
@@ -232,7 +758,7 @@ partial class ZanIDE {
         return name + "()";
     }
 
-    /// The field name when `s` is a field declaration, else "".
+    /// 接口数据协议与执行契约。
     static string OutlineFieldName(string s) {
         string rt = ZanIDE.RTrimS(s);
         if (rt.Length == 0) { return ""; }
@@ -252,11 +778,11 @@ partial class ZanIDE {
         return ZanIDE.OutlineIdent(toks[toks.Count - 1]);
     }
 
-    /// Builds a navigable code-structure outline of a source buffer for the
-    /// IDE's STRUCTURE panel: each top-level type becomes an expandable node
-    /// whose children are the type's direct methods and fields. Each node's
-    /// `path` carries the 0-based line to jump to. Best-effort and brace-depth
-    /// driven, so it stays responsive on large files without a full parse.
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static List<TreeNode> BuildOutline(string body) {
         List<TreeNode> outp = new List<TreeNode>();
         List<string> ls = CodeEditor.SplitLines(body);
@@ -304,7 +830,7 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// A small icon hint for a designer control type.
+    /// 接口数据协议与执行契约。
     static string ComponentIcon(string type) {
         if (type == "Label") { return "font"; }
         if (type == "Button") { return "grid"; }
@@ -315,8 +841,8 @@ partial class ZanIDE {
         return "layout";
     }
 
-    /// Depth-first flattens the designer's (possibly nested) field tree into
-    /// `outp`, so tree rows and selections can address fields by flat index.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
     static void FlattenFields(List<FormField> fields, List<FormField> outp) {
         for (int i = 0; i < fields.Count; i = i + 1) {
             outp.Add(fields[i]);
@@ -326,10 +852,10 @@ partial class ZanIDE {
         }
     }
 
-    /// Builds the designer component tree from the unified designer's field
-    /// model: the form as the root node with each field as a descendant
-    /// (label "name : Type", container children indented one level deeper).
-    /// A node's `path` carries the field's flat index for click-to-select.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
     static List<TreeNode> BuildFieldTree(string formName, List<FormField> fields) {
         List<TreeNode> outp = new List<TreeNode>();
         TreeNode root = TreeNode.Dir(formName, 0, true);
@@ -342,9 +868,9 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// Scene component tree for the sidebar STRUCTURE panel: the scene file as
-    /// root, then every element topmost-first. Node paths hold the element's
-    /// index into OrderedByZ() so clicks map back to the canvas selection.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static List<TreeNode> BuildSceneTree(string sceneName, SceneDesigner sd) {
         List<TreeNode> outp = new List<TreeNode>();
         TreeNode root = TreeNode.Dir(sceneName, 0, true);
@@ -381,8 +907,8 @@ partial class ZanIDE {
         }
     }
 
-    /// Parses a decimal line index previously stored in a TreeNode.path by
-    /// BuildOutline; returns -1 when the node carries no line.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static int OutlineLineOf(string path) {
         if (path == "") { return 0 - 1; }
         string digits = "0123456789";
@@ -396,8 +922,8 @@ partial class ZanIDE {
         return val;
     }
 
-    /// Loads the project's saved user components (components/*.zcomp) into the
-    /// designer's "My Components" palette group.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static void LoadUserComponents(string root, Designer d) {
         List<UserComponent> comps = new List<UserComponent>();
         string dir = root + "/components";
@@ -410,8 +936,8 @@ partial class ZanIDE {
         d.SetUserComponents(comps);
     }
 
-    /// Keeps only identifier-safe characters (letters, digits, underscore) of a
-    /// display name, for use as a component file / type name.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static string SanitizeName(string s) {
         string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
         string r = "";
@@ -426,13 +952,13 @@ partial class ZanIDE {
         return r;
     }
 
-    /// True when `name` is a stdlib class name that would conflict with the
-    /// class generated by the form designer's code-behind (e.g. "App" clashes
-    /// with the Gui.App type used inside every code-behind as `App app = ...`).
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
     static bool IsGuiReservedName(string name) {
-        // Gui namespace: App, Canvas, Window, Layer, Theme, Designer
-        // Gui.Widget: Button, Label, Input, Slider, Panel, TreeNode, CodeEditor
-        // System: String, Convert, Math, File, Directory, Path, Process, List, Timer
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // IDE 视图状态管理与用户交互调度。
         List<string> reserved = new List<string>{
             "App", "Canvas", "Window", "Layer", "Theme", "Designer",
             "Button", "Label", "Input", "Slider", "Panel", "TreeNode", "CodeEditor",
@@ -444,16 +970,16 @@ partial class ZanIDE {
         return false;
     }
 
-    /// Recursively collects every .zan file path under `dir`.
+    /// 接口数据协议与执行契约。
     static List<string> ListZanFiles(string dir) {
         List<string> outp = new List<string>();
         ZanIDE.CollectZan(dir, outp);
         return outp;
     }
 
-    /// First source file of the directory named `name` under `dir` (recursive),
-    /// or "". Namespaces map onto directories, so this is how a namespace name
-    /// -- which has no declaration line to jump to -- resolves to a file.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static string FindNamespaceDirFile(string dir, string name) {
         List<string> subs = DirectoryTree.SubNames(dir, PathFilter.Any());
         for (int i = 0; i < subs.Count; i = i + 1) {
@@ -468,16 +994,16 @@ partial class ZanIDE {
         return "";
     }
 
-    /// Recursive .zan/design-doc walk shared with the rest of the IDE;
-    /// build output holds generated copies of the sources, so it is skipped.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static void CollectZan(string dir, List<string> outp) {
         DirectoryTree.FilesInto(outp, dir,
             PathFilter.Only(".zan .zform .html .htm").Skip("build bin obj"));
     }
 
-    /// Column of `word` on line `ln` of `body`, or 0. A jump used to leave the
-    /// caret in the destination line's indentation, so the next command asked
-    /// about whatever word the line started with instead of the symbol.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
     static int ColOfWordAt(string body, int ln, string word) {
         // shell 的 ApplyGotoResult 仍用此接口；一次性消费已验证的语义目标列。
         IdeDefinitionCaret caret = ZanIDE.definitionCaret;
@@ -491,13 +1017,13 @@ partial class ZanIDE {
         return p;
     }
 
-    /// Every file on disk the navigation commands search: the project sources,
-    /// then the stdlib (whose sources are browsable here, and where most of what
-    /// a project calls is declared).
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与执行状态转移规范。
     ///
-    /// Walking the stdlib means walking a thousand-odd files, which made every
-    /// unresolved jump crawl: the list is built once per project and reused
-    /// until the project changes or its index is rebuilt (save / build).
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static List<string> NavSearchFiles(string root) {
         if (ZanIDE.navFiles != null && ZanIDE.navFilesRoot == root) {
             return ZanIDE.navFiles;
@@ -510,26 +1036,32 @@ partial class ZanIDE {
         return files;
     }
 
-    /// Forgets the cached search list, so a file added since is found.
+    /// 接口数据协议与执行契约。
     static void InvalidateNavFiles() {
         ZanIDE.navFiles = null;
         ZanIDE.navFilesRoot = "";
         ZanIDE.projSources = null;
         ZanIDE.projSrcRoot = "";
+        ZanIDE.projectSourceReadCursor = 0;
+        ZanIDE.navigationSourceRevision = ZanIDE.navigationSourceRevision + 1;
     }
 
-    /// The source of every project file plus the other open tabs, with the live
-    /// text of anything open. The editor needs it to count the uses of a member
-    /// that live in files other than the one being edited (its reference counts
-    /// used to see one buffer, so a method called from elsewhere read "0
-    /// references"). Read once per project, kept until the project changes or
-    /// its index is rebuilt.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与执行状态转移规范。
     static List<string> ProjectSources(List<TabRecord> tabs, string root,
                                        int skipTab) {
-        ZanIDE.ProjectSourcesStep(root, 0);
+        // 接口数据协议与执行契约。
+        // 代码导航与工程符号语义索引契约。
         List<string> outp = new List<string>();
-        for (int i = 0; i < ZanIDE.projSources.Count; i = i + 1) {
-            ProjectSourceItem item = ZanIDE.projSources[i];
+        List<ProjectSourceItem> cached = ZanIDE.projSrcRoot == root
+            ? ZanIDE.projSources : null;
+        if (cached == null) { cached = new List<ProjectSourceItem>(); }
+        for (int i = 0; i < cached.Count; i = i + 1) {
+            ProjectSourceItem item = cached[i];
             int t = ZanIDE.FindTabByPath(tabs, item.path);
             if (t == skipTab) { continue; }
             if (t >= 0) { outp.Add(tabs[t].body); }
@@ -540,17 +1072,14 @@ partial class ZanIDE {
             if (tabs[j].path.Length == 0 || tabs[j].path == "@start"
                 || tabs[j].path == "@docs") { continue; }
             if (!tabs[j].path.EndsWith(".zan")) { continue; }
-            if (ZanIDE.HasSameSourcePath(ZanIDE.projSources, tabs[j].path)) { continue; }
+            if (ZanIDE.HasSameSourcePath(cached, tabs[j].path)) { continue; }
             outp.Add(tabs[j].body);
         }
         return outp;
     }
 
-    /// 把项目源码读进缓存，本次至多读 `kbBudget` KB（<=0 表示一口气
-    /// 读完），读完返回 true。文件清单只列一次，读到哪个文件留在
-    /// 静态状态里，所以绘制路径可以每帧给一点预算，而不是在打开工程的
-    /// 第一帧把整个工程读完（本 IDE 工程实测 266 ms，更大的工程更久）
-    /// —— 与 CodeEditor.StepExternRefs 的分帧办法一致。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
     static bool ProjectSourcesStep(string root, int kbBudget) {
         if (ZanIDE.projSources == null || ZanIDE.projSrcRoot != root) {
             ZanIDE.projSources = new List<ProjectSourceItem>();
@@ -560,20 +1089,20 @@ partial class ZanIDE {
                 ZanIDE.projSources.Add(new ProjectSourceItem(all[i], ""));
             }
             ZanIDE.projSrcRoot = root;
+            ZanIDE.projectSourceReadCursor = 0;
         }
         int spent = 0;
-        for (int i = 0; i < ZanIDE.projSources.Count; i = i + 1) {
-            ProjectSourceItem item = ZanIDE.projSources[i];
-            if (item.body.Length > 0) { continue; }
+        while (ZanIDE.projectSourceReadCursor < ZanIDE.projSources.Count) {
             if (kbBudget > 0 && spent >= kbBudget) { return false; }
-            string body = File.ReadAllText(item.path);
-            item.body = body;
-            spent = spent + body.Length / 1024 + 1;
+            ProjectSourceItem item = ZanIDE.projSources[ZanIDE.projectSourceReadCursor];
+            item.body = File.ReadAllText(item.path);
+            ZanIDE.projectSourceReadCursor = ZanIDE.projectSourceReadCursor + 1;
+            spent = spent + item.body.Length / 1024 + 1;
         }
         return true;
     }
 
-    /// True when `items` holds an item with path `p` (path equality, not string equality).
+    /// IDE 视图状态管理与用户交互调度。
     static bool HasSameSourcePath(List<ProjectSourceItem> items, string p) {
         if (items == null) { return false; }
         for (int i = 0; i < items.Count; i = i + 1) {
@@ -582,7 +1111,7 @@ partial class ZanIDE {
         return false;
     }
 
-    /// True when `paths` holds `p` (path equality, not string equality).
+    /// 接口数据协议与执行契约。
     static bool HasSamePath(List<string> paths, string p) {
         for (int i = 0; i < paths.Count; i = i + 1) {
             if (ZanIDE.SamePath(paths[i], p)) { return true; }
@@ -590,9 +1119,9 @@ partial class ZanIDE {
         return false;
     }
 
-    /// `files` reordered so the ones named after `hint` come first: a type lives
-    /// in the file named after it far more often than not, so the search reads
-    /// one file instead of the whole stdlib before it answers.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static List<string> NameFirst(List<string> files, string hint) {
         if (hint.Length == 0) { return files; }
         List<string> head = new List<string>();
@@ -607,8 +1136,8 @@ partial class ZanIDE {
         return head;
     }
 
-    /// Where type `owner` declares `member`, as "file:line" for the log, or "".
-    /// Nothing is opened and no tab is switched: this only names the place.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
     static string FindMemberDeclFile(List<TabRecord> tabs, string root,
                                      string owner, string member) {
         for (int i = 0; i < tabs.Count; i = i + 1) {
@@ -630,9 +1159,9 @@ partial class ZanIDE {
         return "";
     }
 
-    /// Jumps to where type `owner` declares `member`, searching the open tabs
-    /// first and then the project and stdlib sources. Returns the line, or -1
-    /// when that type has no such member on disk.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static int FindMemberDecl(List<TabRecord> tabs, SignalInt active, string root,
                               string owner, string member, List<string> log) {
         int a = active.Get();
@@ -673,25 +1202,25 @@ partial class ZanIDE {
         return 0 - 1;
     }
 
-    /// Finds the definition of the symbol under the caret across the current
-    /// file, other open tabs, then the project's src tree. Switches/opens the
-    /// target tab and returns the destination line (-1 when not found).
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
     static int GoToDefinition(CodeEditor editor, List<TabRecord> tabs,
                               SignalInt active, string root, List<string> log) {
         string word = editor.WordAtCaret();
         if (word == "") { log.Add("> Go to Definition: no symbol under caret."); return 0 - 1; }
         int a = active.Get();
         if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
-        // A member access says which type declares the symbol, so the search is
-        // for that type's member rather than for the first same-named thing in
-        // the project (`WebApp.Create` used to land on another type's Create).
+        // IDE 视图状态管理与用户交互调度。
+        // IDE 视图状态管理与用户交互调度。
+        // 接口数据协议与执行契约。
         string owner = editor.OwnerTypeAtCaret();
         if (owner.Length > 0) {
             int ml = ZanIDE.FindMemberDecl(tabs, active, root, owner, word, log);
             if (ml >= 0) { return ml; }
-            // The receiver's type is indexed and has no such member: landing on
-            // a same-named member of an unrelated type (`app.maxBodyMB` used to
-            // open Cfg's field) is worse than saying so.
+            // 接口数据协议与执行契约。
+            // 接口数据协议与执行契约。
+            // 代码导航与工程符号语义索引契约。
             if (CodeEditor.SymbolTypeLacksMember(owner, word)) {
                 log.Add("> Go to Definition: '" + word + "' is not a member of '"
                     + owner + "'.");
@@ -716,9 +1245,9 @@ partial class ZanIDE {
                 }
             }
         }
-        // Most symbols a project uses are declared in the stdlib, and stdlib
-        // sources are browsable/openable here, so search them after the project
-        // instead of reporting "not found in project".
+        // IDE 视图状态管理与用户交互调度。
+        // IDE 视图状态管理与用户交互调度。
+        // 核心契约与语义定义。
         List<string> files = ZanIDE.NameFirst(ZanIDE.NavSearchFiles(root), word);
         for (int fi = 0; fi < files.Count; fi = fi + 1) {
             string fp = files[fi];
@@ -733,8 +1262,8 @@ partial class ZanIDE {
                 }
             }
         }
-        // Namespaces (`using System.Web;`) declare nothing, so fall back to the
-        // directory that backs them and open its first source file.
+        // 接口数据协议与执行契约。
+        // IDE 视图状态管理与用户交互调度。
         string nsFile = ZanIDE.FindNamespaceDirFile(ZanIDE.StdlibDir(), word);
         if (nsFile == "") { nsFile = ZanIDE.FindNamespaceDirFile(root + "/src", word); }
         if (nsFile != "") {
@@ -751,30 +1280,25 @@ partial class ZanIDE {
         return 0 - 1;
     }
 
-    /// Case-insensitive path equality with slash normalization (Windows
-    /// paths mix separators; LSP URIs always use forward slashes).
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static bool SamePath(string a, string b) {
         return ZanIDE.NormPath(a) == ZanIDE.NormPath(b);
     }
 
     static string NormPath(string p) {
-        string o = "";
-        for (int i = 0; i < p.Length; i = i + 1) {
-            string ch = p.Substring(i, 1);
-            if (ch == "\\") { o = o + "/"; } else { o = o + ch; }
-        }
-        return ZanIDE.ToLowerS(o);
+        return p.Replace("\\", "/").ToLower();
     }
 
-    /// Go to Definition preferring zan-lsp semantic results (compiler
-    /// binder/checker accuracy), with the text-scan heuristic as fallback.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static int GoToDefinitionSmart(LspSession lsp, CodeEditor editor, List<TabRecord> tabs,
                                    SignalInt active, string root, List<string> log) {
         ZanIDE.definitionCaret = null;
         int a = active.Get();
-        // The server indexes the project root only; querying it about a file
-        // outside that root (a stdlib source, say) costs a round trip that can
-        // never answer, so go straight to the text scan there.
+        // IDE 视图状态管理与用户交互调度。
+        // IDE 视图状态管理与用户交互调度。
+        // 接口数据协议与执行契约。
         string normalizedRoot = ZanIDE.NormPath(root);
         while (normalizedRoot.EndsWith("/")) { normalizedRoot = normalizedRoot.Substring(0, normalizedRoot.Length - 1); }
         bool inRoot = a >= 0 && a < tabs.Count && normalizedRoot.Length > 0
@@ -827,7 +1351,334 @@ partial class ZanIDE {
         return ZanIDE.GoToDefinition(editor, tabs, active, root, log);
     }
 
-    /// Counts whole-word occurrences of `word` in `line`.
+    static IdeNavigationDiskText ReadNavigationDiskText(string path) {
+        IdeNavigationDiskText read = new IdeNavigationDiskText();
+        read.stamp = FileInfo.GetLastWriteTime(path);
+        long length = FileInfo.GetLength(path);
+        read.body = File.ReadAllText(path);
+        if (length < 0 || read.stamp != FileInfo.GetLastWriteTime(path)
+            || length != FileInfo.GetLength(path)) {
+            throw new IOException("Navigation target changed while being read: " + path);
+        }
+        return read;
+    }
+
+    static IdeNavigationTarget PrepareNavigationTarget(string path, string body,
+            int line, int column, string word, bool utf16) {
+        IdeNavigationTarget result = new IdeNavigationTarget();
+        List<string> lines = CodeEditor.SplitLines(body);
+        if (line < 0 || line >= lines.Count) { return result; }
+        int byteColumn = column;
+        if (utf16) {
+            byteColumn = CodeEditor.Utf16ColumnToByte(lines[line], column);
+            if (CodeEditor.ByteColumnToUtf16(lines[line], byteColumn) != column) { return result; }
+        } else if (column < 0) {
+            byteColumn = CodeEditor.FindWordFrom(lines[line], word, 0);
+            if (byteColumn < 0) { byteColumn = 0; }
+        }
+        result.path = path; result.body = body; result.line = line; result.column = byteColumn;
+        result.prepared = TabRecord.Create(Path.GetFileName(path), body, path);
+        result.prepared.preparedText = CodeEditor.PrepareText(body);
+        result.prepared.preparedBody = body;
+        result.valid = true;
+        result.message = "> Definition in " + result.prepared.name + " at line " + Convert.ToString(line + 1) + ".";
+        return result;
+    }
+
+    static IdeNavigationTarget DefinitionInSnapshot(IdeNavigationSnapshot snapshot,
+            IdeProjectSourceCache cache, LspDefinitionTarget semantic) {
+        if (snapshot.cancellation.IsCancellationRequested) { return new IdeNavigationTarget(); }
+        if (semantic != null) {
+            IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, semantic.path);
+            bool exists = opened != null || File.Exists(semantic.path);
+            IdeNavigationDiskText read = opened == null && exists ? ZanIDE.ReadNavigationDiskText(semantic.path) : null;
+            string body = opened != null ? opened.body : read != null ? read.body : "";
+            if (exists) {
+                IdeNavigationTarget target = ZanIDE.PrepareNavigationTarget(semantic.path, body,
+                    semantic.line, semantic.column, snapshot.word, true);
+                if (target.valid) {
+                    target.fromDisk = read != null;
+                    target.diskStamp = read != null ? read.stamp : 0;
+                    return target;
+                }
+            }
+        }
+        List<IdeSourceSnapshot> ordered = new List<IdeSourceSnapshot>();
+        IdeSourceSnapshot origin = ZanIDE.SnapshotSource(snapshot.documents, snapshot.path);
+        if (origin != null) { ordered.Add(origin); }
+        for (int i = 0; i < snapshot.documents.Count; i = i + 1) {
+            if (snapshot.documents[i] != origin) { ordered.Add(snapshot.documents[i]); }
+        }
+        List<IdeSourceSnapshot> disk = new List<IdeSourceSnapshot>();
+        string hint = snapshot.owner.Length > 0 ? snapshot.owner : snapshot.word;
+        for (int i = 0; i < cache.project.Count; i = i + 1) { disk.Add(cache.project[i]); }
+        for (int i = 0; i < cache.library.Count; i = i + 1) { disk.Add(cache.library[i]); }
+        // 接口数据协议与执行契约。
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            for (int i = 0; i < disk.Count; i = i + 1) {
+                IdeSourceSnapshot source = disk[i];
+                if (ZanIDE.SnapshotSource(snapshot.documents, source.path) != null) { continue; }
+                string name = Path.GetFileName(source.path);
+                int dot = name.IndexOf(".");
+                if (dot >= 0) { name = name.Substring(0, dot); }
+                if ((name == hint) == (pass == 0)) { ordered.Add(source); }
+            }
+        }
+        for (int pass = 0; pass < 2; pass = pass + 1) {
+            if (pass == 0 && snapshot.owner.Length == 0) { continue; }
+            if (pass == 1 && snapshot.lacksMember) { break; }
+            for (int i = 0; i < ordered.Count; i = i + 1) {
+                if (snapshot.cancellation.IsCancellationRequested) { return new IdeNavigationTarget(); }
+                IdeSourceSnapshot source = ordered[i];
+                int line = pass == 0
+                    ? CodeEditor.FindMemberDeclLineIn(CodeEditor.SplitLines(source.body), snapshot.owner, snapshot.word)
+                    : ZanIDE.FindDeclLine(source.body, snapshot.word);
+                if (line < 0) { continue; }
+                string body = source.body;
+                IdeNavigationDiskText read = null;
+                if (ZanIDE.SnapshotSource(snapshot.documents, source.path) == null) {
+                    if (!File.Exists(source.path)) { continue; }
+                    read = ZanIDE.ReadNavigationDiskText(source.path);
+                    body = read.body;
+                    line = pass == 0
+                        ? CodeEditor.FindMemberDeclLineIn(CodeEditor.SplitLines(body), snapshot.owner, snapshot.word)
+                        : ZanIDE.FindDeclLine(body, snapshot.word);
+                    if (line < 0) { continue; }
+                }
+                IdeNavigationTarget target = ZanIDE.PrepareNavigationTarget(source.path, body, line, -1, snapshot.word, false);
+                target.fromDisk = read != null;
+                target.diskStamp = read != null ? read.stamp : 0;
+                return target;
+            }
+        }
+        if (!snapshot.lacksMember) {
+            string segment = "/" + snapshot.word + "/";
+            for (int i = 0; i < disk.Count; i = i + 1) {
+                if (snapshot.cancellation.IsCancellationRequested) { return new IdeNavigationTarget(); }
+                IdeSourceSnapshot source = disk[i];
+                if (source.path.Replace("\\", "/").IndexOf(segment) < 0) { continue; }
+                IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, source.path);
+                if (opened == null && !File.Exists(source.path)) { continue; }
+                IdeNavigationDiskText read = opened == null ? ZanIDE.ReadNavigationDiskText(source.path) : null;
+                string body = opened != null ? opened.body : read.body;
+                IdeNavigationTarget target = ZanIDE.PrepareNavigationTarget(source.path, body, 0, 0, snapshot.word, false);
+                target.fromDisk = read != null;
+                target.diskStamp = read != null ? read.stamp : 0;
+                target.message = "> Namespace '" + snapshot.word + "' -> " + Path.GetFileName(source.path) + ".";
+                return target;
+            }
+        }
+        IdeNavigationTarget missing = new IdeNavigationTarget();
+        missing.message = snapshot.lacksMember
+            ? "> Go to Definition: '" + snapshot.word + "' is not a member of '" + snapshot.owner + "'."
+            : "> Go to Definition: '" + snapshot.word + "' not found in project.";
+        return missing;
+    }
+
+    void GoToDefinitionAsync() {
+        IdeNavigationGuard guard = this.BeginCodeNavigation(true, true);
+        if (guard == null) { return; }
+        if (guard.snapshot.word.Length == 0) {
+            log.Add("> Go to Definition: no symbol under caret."); app.RequestRedraw(); return;
+        }
+        LspSession session = guard.session;
+        if (session != null && session.Alive()
+            && ZanIDE.NavigationPathInRoot(guard.snapshot.path, guard.snapshot.root)) {
+            session.DefinitionAsync(guard.snapshot.path, guard.snapshot.line, guard.snapshot.column,
+                delegate (LspDefinitionResult result) {
+                    if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+                    if (result != null && !session.IsCurrent(result.path, result.version,
+                            result.generation, result.documentGeneration)) { return; }
+                    guard.semantic = result;
+                    this.StartDefinitionScan(guard, result != null ? result.target : null);
+                });
+        } else { this.StartDefinitionScan(guard, null); }
+    }
+
+    void StartDefinitionScan(IdeNavigationGuard guard, LspDefinitionTarget semantic) {
+        this.WithProjectSources(delegate () {
+            if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            IdeProjectSourceCache cache = navigationSources;
+            App host = app;
+            navigationWork.Run(delegate () {
+                IdeNavigationTarget result = new IdeNavigationTarget();
+                try { result = ZanIDE.DefinitionInSnapshot(snapshot, cache, semantic); }
+                catch (Exception error) {
+                    // 接口数据协议与执行契约。
+                    result.message = "> Go to Definition: " + error.Message;
+                }
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () { this.ApplyNavigationTarget(guard, result); });
+            });
+        });
+    }
+
+    void ApplyNavigationTarget(IdeNavigationGuard guard, IdeNavigationTarget result) {
+        if (!this.NavigationGuardCurrent(guard, true, true) || this.CodeNavigationBusy()) { return; }
+        if (result.message.Length > 0) { log.Add(result.message); }
+        if (!result.valid) { app.RequestRedraw(); return; }
+        int tab = ZanIDE.FindNavigationTab(tabs, result.path);
+        if (tab < 0) {
+            // 接口数据协议与执行契约。
+            if (!result.fromDisk) { return; }
+            tabs.Add(result.prepared);
+            this.TrackPreparedDocument(result.path, result.body, result.diskStamp);
+            tab = tabs.Count - 1;
+        } else {
+            if (tabs[tab].body != result.body) { return; }
+            tabs[tab].preparedText = result.prepared.preparedText;
+            tabs[tab].preparedBody = result.body;
+        }
+        tabs[tab].caretLine = result.line; tabs[tab].caretCol = result.column;
+        activeTab.Set(tab);
+        pendingGotoLine = result.line; pendingGotoCol = result.column;
+        lastActive = -1;
+        this.UpdateActiveCodeTab();
+        app.RequestRedraw();
+    }
+
+    static void CollectRefsInSnapshot(IdeSourceSnapshot source, IdeNavigationSnapshot snapshot,
+            List<SearchHit> hits) {
+        List<string> lines = CodeEditor.SplitLines(source.body);
+        if (snapshot.referenceOwner.Length == 0) {
+            for (int i = 0; i < lines.Count && hits.Count < 2000; i = i + 1) {
+                if (ZanIDE.CountWord(lines[i], snapshot.word) > 0) {
+                    hits.Add(SearchHit.Create(source.path, i, CodeEditor.LTrim(lines[i])));
+                }
+            }
+            return;
+        }
+        CeFileIndex index = CeFileIndex.Of(lines);
+        List<string> receivers = new List<string>();
+        receivers.Add("this"); receivers.Add("base");
+        for (int i = 0; i < snapshot.family.Count; i = i + 1) {
+            string type = snapshot.family[i];
+            if (!CodeEditor.Has(receivers, type)) { receivers.Add(type); }
+            CodeEditor.CollectTypedVarsPre(index.stripped, type, receivers);
+        }
+        List<int> found = new List<int>();
+        CodeEditor.CountMemberRefsWith(index, snapshot.family, receivers, snapshot.word, found);
+        for (int i = 0; i < found.Count && hits.Count < 2000; i = i + 1) {
+            hits.Add(SearchHit.Create(source.path, found[i], CodeEditor.LTrim(lines[found[i]])));
+        }
+    }
+
+    static List<SearchHit> ReferencesInSnapshot(IdeNavigationSnapshot snapshot,
+            IdeProjectSourceCache cache, List<string> rows) {
+        List<SearchHit> hits = new List<SearchHit>();
+        Dictionary<string, List<string>> previews = new Dictionary<string, List<string>>();
+        if (rows != null) {
+            for (int i = 0; i < rows.Count && hits.Count < 2000; i = i + 1) {
+                if (snapshot.cancellation.IsCancellationRequested) { return hits; }
+                int separator = rows[i].IndexOf("\t");
+                if (separator <= 0) { continue; }
+                string path = rows[i].Substring(0, separator);
+                int line = ZanIDE.ParseInt(rows[i].Substring(separator + 1, rows[i].Length - separator - 1));
+                string key = ZanIDE.NormPath(path);
+                if (!previews.ContainsKey(key)) {
+                    IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, path);
+                    string body = opened != null ? opened.body : File.Exists(path) ? File.ReadAllText(path) : "";
+                    previews[key] = CodeEditor.SplitLines(body);
+                }
+                List<string> lines = previews[key];
+                if (line < 0 || line >= lines.Count) { continue; }
+                hits.Add(SearchHit.Create(path, line, CodeEditor.LTrim(lines[line])));
+            }
+            if (hits.Count > 0) { return hits; }
+        }
+        if (snapshot.lacksReferenceMember) { return hits; }
+        List<IdeSourceSnapshot> sources = ZanIDE.MergeSourceSnapshots(cache.project, snapshot.documents);
+        for (int i = 0; i < sources.Count && hits.Count < 2000; i = i + 1) {
+            if (snapshot.cancellation.IsCancellationRequested) { return hits; }
+            if (!sources[i].path.ToLower().EndsWith(".zan")) { continue; }
+            ZanIDE.CollectRefsInSnapshot(sources[i], snapshot, hits);
+        }
+        return hits;
+    }
+
+    void CollectReferencesAsync() {
+        IdeNavigationGuard guard = this.BeginCodeNavigation(true, true);
+        if (guard == null) { return; }
+        if (guard.snapshot.word.Length == 0) {
+            log.Add("> Find All References: no symbol under caret."); app.RequestRedraw(); return;
+        }
+        LspSession session = guard.session;
+        if (session != null && session.Alive()
+            && ZanIDE.NavigationPathInRoot(guard.snapshot.path, guard.snapshot.root)) {
+            session.ReferencesAsync(guard.snapshot.path, guard.snapshot.line, guard.snapshot.column,
+                delegate (LspReferencesResult result) {
+                    if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+                    if (result != null && !session.IsCurrent(result.path, result.version,
+                            result.generation, result.documentGeneration)) { return; }
+                    guard.semantic = result;
+                    this.StartReferenceScan(guard, result != null ? result.rows : null);
+                });
+        } else { this.StartReferenceScan(guard, null); }
+    }
+
+    void StartReferenceScan(IdeNavigationGuard guard, List<string> rows) {
+        this.WithProjectSources(delegate () {
+            if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            IdeProjectSourceCache cache = navigationSources;
+            App host = app;
+            navigationWork.Run(delegate () {
+                List<SearchHit> hits = new List<SearchHit>();
+                string failure = "";
+                try { hits = ZanIDE.ReferencesInSnapshot(snapshot, cache, rows); }
+                catch (Exception error) {
+                    // 接口数据协议与执行契约。
+                    failure = error.Message;
+                }
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () {
+                    if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+                    if (failure != "") { log.Add("> Find All References: " + failure); }
+                    else {
+                        log.Add("> " + Convert.ToString(hits.Count) + " reference(s) to '" + snapshot.word + "'.");
+                        refAnchorLine = snapshot.line;
+                        if (hits.Count > 0) { refList.Show(snapshot.word, hits, snapshot.root); }
+                    }
+                    app.RequestRedraw();
+                });
+            });
+        });
+    }
+
+    void GotoSearchHitAsync(List<SearchHit> hits, int index) {
+        if (index < 0 || index >= hits.Count) { return; }
+        SearchHit hit = hits[index];
+        string path = hit.path;
+        int line = hit.line;
+        string message = "> Match " + Convert.ToString(index + 1) + "/"
+            + Convert.ToString(hits.Count) + ": " + Path.GetFileName(path) + ":" + Convert.ToString(line + 1);
+        IdeNavigationGuard guard = this.BeginCodeNavigation(false, false);
+        if (guard == null) { return; }
+        IdeNavigationSnapshot snapshot = guard.snapshot;
+        App host = app;
+        navigationWork.Run(delegate () {
+            IdeNavigationTarget result = new IdeNavigationTarget();
+            try {
+                IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, path);
+                if (opened != null || File.Exists(path)) {
+                    IdeNavigationDiskText read = opened == null ? ZanIDE.ReadNavigationDiskText(path) : null;
+                    string body = opened != null ? opened.body : read.body;
+                    result = ZanIDE.PrepareNavigationTarget(path, body, line, 0, "", false);
+                    result.fromDisk = read != null;
+                    result.diskStamp = read != null ? read.stamp : 0;
+                }
+                result.message = message;
+            } catch (Exception error) {
+                // 接口数据协议与执行契约。
+                result.message = "> Match: " + error.Message;
+            }
+            if (snapshot.cancellation.IsCancellationRequested) { return; }
+            host.Post(delegate () { this.ApplyNavigationTarget(guard, result); });
+        });
+    }
+
+    /// 代码导航与工程符号语义索引契约。
     static int CountWord(string line, string word) {
         int wl = word.Length;
         if (wl == 0 || line == null) { return 0; }
@@ -847,10 +1698,10 @@ partial class ZanIDE {
         return count;
     }
 
-    /// Every use of the symbol under the caret as clickable hits, for the
-    /// reference list: zan-lsp's semantic answer when the server is up, else a
-    /// whole-word text scan of the open tabs and the project's files. Paths are
-    /// absolute, so a hit opens the file it lives in.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 代码导航与工程符号语义索引契约。
     static List<SearchHit> CollectReferences(LspSession lsp, CodeEditor editor,
                                             List<TabRecord> tabs,
                                             SignalInt active, string root) {
@@ -859,16 +1710,16 @@ partial class ZanIDE {
         if (word.Length == 0) { return hits; }
         int a = active.Get();
         if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
-        // The server indexes the project root only: querying it about a file
-        // outside that root (a stdlib source, say) costs a round trip that can
-        // never answer, so go straight to the text scan there.
+        // IDE 视图状态管理与用户交互调度。
+        // IDE 视图状态管理与用户交互调度。
+        // 接口数据协议与执行契约。
         bool inRoot = a >= 0 && a < tabs.Count
             && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
         if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
             lsp.SyncDoc(tabs[a].path, tabs[a].body);
             List<string> rows = lsp.References(
                 tabs[a].path, editor.CurLine(), editor.CurCol());
-            // One file is read once even when it holds twenty of the hits.
+            // IDE 视图状态管理与用户交互调度。
             string cachePath = "";
             List<string> cacheLines = new List<string>();
             for (int i = 0; i < rows.Count; i = i + 1) {
@@ -889,8 +1740,8 @@ partial class ZanIDE {
             }
             if (hits.Count > 0) { return hits; }
         }
-        // For a member access the references are the uses of THAT type's member,
-        // not of every same-named member in the project.
+        // IDE 视图状态管理与用户交互调度。
+        // 接口数据协议与执行契约。
         string owner = editor.OwnerTypeAtCaret();
         if (owner.Length == 0) { owner = editor.EnclosingTypeOfCaretDecl(); }
         if (owner.Length > 0 && CodeEditor.SymbolTypeLacksMember(owner, word)) {
@@ -910,9 +1761,9 @@ partial class ZanIDE {
         return hits;
     }
 
-    /// The uses of `word` in one file as hits, with the source line as their
-    /// preview. `owner` restricts them to that type's member. The list is capped
-    /// so a name like `Create` cannot build a 50k-row panel.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static void CollectRefsInFile(string path, string body, string word,
                                   string owner, List<SearchHit> hits) {
         List<string> ls = CodeEditor.SplitLines(body);
@@ -930,8 +1781,8 @@ partial class ZanIDE {
         }
     }
 
-    /// The lines of `path`, from the open tab when it is open (so an unsaved
-    /// edit previews correctly) and from disk otherwise. Empty when it is gone.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
     static List<string> SourceLines(List<TabRecord> tabs, string path) {
         int t = ZanIDE.FindTabByPath(tabs, path);
         if (t >= 0) { return CodeEditor.SplitLines(tabs[t].body); }
@@ -939,8 +1790,8 @@ partial class ZanIDE {
         return CodeEditor.SplitLines(File.ReadAllText(path));
     }
 
-    /// Replaces whole-word occurrences of `word` with `newName`, skipping
-    /// string/char literals and line/block comments (same rules as zan-lsp).
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
     static string ReplaceWholeWord(string text, string word, string newName) {
         if (text == null || text.Length == 0) { return ""; }
         StringBuilder sb = new StringBuilder();
@@ -988,13 +1839,13 @@ partial class ZanIDE {
     }
 
     // ================================================================
-    // Find/Replace in Files (project-wide, including unopened files)
+    // 接口数据协议与执行契约。
     // ================================================================
 
-    /// Searches every project source file for `needle`, filling `outHits` and
-    /// logging one row per hit. Open tabs are searched in their buffers so
-    /// unsaved edits count. Returns the number of hits (capped so a one-letter
-    /// query cannot flood the panel).
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static int FindInFiles(string root, string needle, bool matchCase,
                            List<TabRecord> tabs, List<SearchHit> outHits,
                            List<string> log) {
@@ -1033,9 +1884,9 @@ partial class ZanIDE {
         return hits;
     }
 
-    /// Replaces every occurrence of `needle` with `repl` across the project.
-    /// Open tabs are changed in their buffers (save to persist); other files
-    /// are rewritten on disk. Returns the number of files changed.
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static int ReplaceInFiles(string root, string needle, string repl,
                               bool matchCase, List<TabRecord> tabs,
                               List<string> log) {
@@ -1076,8 +1927,8 @@ partial class ZanIDE {
         return bufs + disk;
     }
 
-    /// Opens result `idx` of the last Find in Files run and jumps to its line.
-    /// Returns the 0-based line to move the caret to, or -1.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static int GotoSearchHit(List<SearchHit> hits, int idx,
                              List<TabRecord> tabs, SignalInt active,
                              List<string> log) {
@@ -1096,12 +1947,12 @@ partial class ZanIDE {
         return hit.line;
     }
 
-    /// True when `line` contains `needle` (case-insensitively unless asked).
+    /// 接口数据协议与执行契约。
     static bool LineContains(string line, string needle, bool matchCase) {
         return ZanIDE.FindOccurrence(line, needle, 0, matchCase) >= 0;
     }
 
-    /// Offset of the first occurrence of `needle` in `hay` at or after `from`,
+    /// 接口数据协议与执行契约。
     /// or -1.
     static int FindOccurrence(string hay, string needle, int from, bool matchCase) {
         int nl = needle.Length;
@@ -1149,7 +2000,7 @@ partial class ZanIDE {
         return outp;
     }
 
-    /// Drops leading spaces and tabs (search rows are shown unindented).
+    /// IDE 视图状态管理与用户交互调度。
     static string TrimLead(string s) {
         int i = 0;
         for (; i < s.Length && (s[i] == 32 || s[i] == 9); i = i + 1) { }
@@ -1195,10 +2046,10 @@ partial class ZanIDE {
         return true;
     }
 
-    /// Rename Symbol (F2) backed by zan-lsp: the server answers with a
-    /// project-wide WorkspaceEdit, so occurrences in files that were never
-    /// opened are rewritten on disk too. Open tabs are edited in their buffers
-    /// (save to persist); everything else is written immediately.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 代码导航与工程符号语义索引契约。
     /// 无有效语义结果时拒绝修改，文本替换无法区分同名但不同绑定的符号。
     static int RenameSymbolSmart(LspSession lsp, CodeEditor editor,
                                  List<TabRecord> tabs, SignalInt active,
@@ -1295,7 +2146,402 @@ partial class ZanIDE {
         return bufs + disk;
     }
 
-    /// Index of `path` in `paths` comparing with SamePath, or -1.
+    static LspDocumentSnapshot SemanticDocumentSnapshot(List<LspDocumentSnapshot> documents, string path) {
+        if (documents == null) { return null; }
+        for (int i = 0; i < documents.Count; i = i + 1) {
+            if (LspSession.SameDocumentPath(documents[i].path, path)) { return documents[i]; }
+        }
+        return null;
+    }
+
+    static IdeRenamePlan PrepareRenamePlan(IdeNavigationSnapshot snapshot,
+            List<LspRenameEdit> edits, List<LspDocumentSnapshot> synchronized) {
+        IdeRenamePlan plan = new IdeRenamePlan();
+        if (edits == null || edits.Count == 0) {
+            plan.failure = "no valid semantic edits; no files changed."; return plan;
+        }
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            if (snapshot.cancellation.IsCancellationRequested) {
+                plan.failure = "canceled; no files changed."; return plan;
+            }
+            string path = edits[i].path;
+            string key = ZanIDE.NormPath(path);
+            if (seen.ContainsKey(key)) { continue; }
+            seen[key] = true;
+            IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, path);
+            LspDocumentSnapshot semantic = ZanIDE.SemanticDocumentSnapshot(synchronized, path);
+            if (opened == null && !File.Exists(path)) {
+                plan.failure = "target file unavailable; no files changed."; return plan;
+            }
+            string text = opened != null ? opened.body : File.ReadAllText(path);
+            int version = semantic != null ? semantic.version : opened != null ? opened.version : 0;
+            if (semantic != null && semantic.text != text
+                || opened != null && semantic != null && opened.version != semantic.version) {
+                plan.failure = "target differs from synchronized text; no files changed."; return plan;
+            }
+            for (int e = 0; e < edits.Count; e = e + 1) {
+                if (LspSession.SameDocumentPath(edits[e].path, path)
+                    && edits[e].version >= 0 && edits[e].version != version) {
+                    plan.failure = "target version changed; no files changed."; return plan;
+                }
+            }
+            LspEditApplication applied = ZanIDE.ApplyRenameEdits(text, edits, path);
+            if (!applied.valid) {
+                plan.failure = "invalid or overlapping edit ranges; no files changed."; return plan;
+            }
+            if (applied.text == text) { continue; }
+            IdeRenamePlanEntry entry = new IdeRenamePlanEntry();
+            entry.path = path; entry.originalText = text; entry.newText = applied.text;
+            entry.open = opened != null; entry.version = version;
+            if (entry.open) { entry.prepared = CodeEditor.PrepareText(entry.newText); plan.buffers = plan.buffers + 1; }
+            else { plan.disk = plan.disk + 1; }
+            plan.entries.Add(entry);
+        }
+        plan.valid = true;
+        return plan;
+    }
+
+    // IDE 视图状态管理与用户交互调度。
+    // 接口数据协议与执行契约。
+    static string ValidateRenameDiskPlan(IdeRenamePlan plan, CancellationToken cancellation) {
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            if (cancellation.IsCancellationRequested) { return "canceled; no files changed."; }
+            IdeRenamePlanEntry entry = plan.entries[i];
+            if (entry.open) { continue; }
+            if (!File.Exists(entry.path) || File.ReadAllText(entry.path) != entry.originalText) {
+                return "target changed before apply; no files changed.";
+            }
+        }
+        return "";
+    }
+
+    static string RollbackRenameDiskPlan(IdeRenamePlan plan) {
+        string failure = "";
+        for (int i = plan.entries.Count - 1; i >= 0; i = i - 1) {
+            IdeRenamePlanEntry entry = plan.entries[i];
+            if (!entry.written) { continue; }
+            try {
+                // 接口数据协议与执行契约。
+                if (File.Exists(entry.path) && File.ReadAllText(entry.path) == entry.originalText) {
+                    entry.written = false;
+                    continue;
+                }
+                File.WriteAllText(entry.path, entry.originalText);
+                if (File.ReadAllText(entry.path) != entry.originalText) {
+                    throw new IOException("Could not restore original text: " + entry.path);
+                }
+                entry.written = false;
+            } catch (Exception error) {
+                // IDE 视图状态管理与用户交互调度。
+                failure = failure + " Restore failed for " + entry.path + ": " + error.Message;
+            }
+        }
+        return failure;
+    }
+
+    static IdeRenameCommit CommitRenameDiskPlan(IdeRenamePlan plan, CancellationToken cancellation) {
+        return ZanIDE.CommitRenameDiskPlanWithWriter(plan, cancellation, null);
+    }
+
+    // IDE 视图状态管理与用户交互调度。
+    // 接口数据协议与执行契约。
+    static IdeRenameCommit CommitRenameDiskPlanWithWriter(IdeRenamePlan plan,
+            CancellationToken cancellation, IdeRenameDiskWriter writer) {
+        IdeRenameCommit result = new IdeRenameCommit();
+        if (!plan.valid) { result.failure = plan.failure; return result; }
+        try {
+            result.failure = ZanIDE.ValidateRenameDiskPlan(plan, cancellation);
+            if (result.failure != "") { return result; }
+            for (int i = 0; i < plan.entries.Count; i = i + 1) {
+                if (cancellation.IsCancellationRequested) { throw new Exception("canceled before apply completed."); }
+                IdeRenamePlanEntry entry = plan.entries[i];
+                if (entry.open) { continue; }
+                if (!File.Exists(entry.path) || File.ReadAllText(entry.path) != entry.originalText) {
+                    throw new Exception("target changed before write: " + entry.path);
+                }
+                // IDE 视图状态管理与用户交互调度。
+                entry.written = true;
+                if (writer == null) { File.WriteAllText(entry.path, entry.newText); }
+                else { writer(entry.path, entry.newText); }
+                if (File.ReadAllText(entry.path) != entry.newText) {
+                    throw new IOException("Could not verify written text: " + entry.path);
+                }
+            }
+            if (cancellation.IsCancellationRequested) { throw new Exception("canceled before apply completed."); }
+            result.committed = true;
+        } catch (Exception error) {
+            // IDE 视图状态管理与用户交互调度。
+            result.failure = error.Message + ZanIDE.RollbackRenameDiskPlan(plan);
+        }
+        return result;
+    }
+
+    bool RenamePlanTabsCurrent(IdeNavigationGuard guard, IdeRenamePlan plan) {
+        if (!this.NavigationGuardCurrent(guard, true, true)
+            || guard.snapshot.designRevision != this.DesignDocumentRevision()) { return false; }
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            IdeRenamePlanEntry entry = plan.entries[i];
+            int tab = ZanIDE.FindNavigationTab(tabs, entry.path);
+            if (entry.open ? tab < 0 || tabs[tab].body != entry.originalText : tab >= 0) { return false; }
+            if (guard.synchronized && (!guard.session.DocTextMatches(entry.path, entry.originalText)
+                || guard.session.DocVersion(entry.path) != entry.version)) { return false; }
+        }
+        return true;
+    }
+
+    void RenameSymbolAsync(string word, string newName) {
+        if (word == "" || newName == "" || word == newName || this.CodeNavigationBusy()) { return; }
+        IdeNavigationGuard guard = this.BeginCodeNavigation(true, true);
+        if (guard == null) { return; }
+        LspSession session = guard.session;
+        if (session == null || !session.Alive() || !ZanIDE.NavigationPathInRoot(guard.snapshot.path, root)) {
+            log.Add("> Rename: semantic service unavailable; no files changed."); app.RequestRedraw(); return;
+        }
+        if (guard.snapshot.word != word) {
+            log.Add("> Rename: symbol changed before request; no files changed."); app.RequestRedraw(); return;
+        }
+        session.RenameAsync(guard.snapshot.path, guard.snapshot.line, guard.snapshot.column, newName,
+            delegate (LspRenameResult result) {
+                if (!this.NavigationGuardCurrent(guard, true, true) || result == null
+                    || !session.IsCurrent(result.path, result.version, result.generation, result.documentGeneration)) { return; }
+                guard.semantic = result;
+                IdeNavigationSnapshot snapshot = guard.snapshot;
+                List<LspRenameEdit> edits = result.edits;
+                List<LspDocumentSnapshot> documents = result.documents;
+                App host = app;
+                navigationWork.Run(delegate () {
+                    IdeRenamePlan plan = new IdeRenamePlan();
+                    try { plan = ZanIDE.PrepareRenamePlan(snapshot, edits, documents); }
+                    catch (Exception error) {
+                        // IDE 视图状态管理与用户交互调度。
+                        plan.failure = error.Message;
+                    }
+                    if (snapshot.cancellation.IsCancellationRequested) { return; }
+                    host.Post(delegate () {
+                        this.BeginRenamePlanCommit(guard, plan, "Rename", "Renamed '" + word + "' -> '" + newName + "' (semantic)");
+                    });
+                });
+            });
+    }
+
+    void BeginRenamePlanCommit(IdeNavigationGuard guard, IdeRenamePlan plan, string operation, string summary) {
+        if (!this.NavigationGuardCurrent(guard, true, true) || this.CodeNavigationBusy()) { return; }
+        if (!plan.valid) {
+            log.Add("> " + operation + ": " + plan.failure); app.RequestRedraw(); return;
+        }
+        if (!this.RenamePlanTabsCurrent(guard, plan)) {
+            log.Add("> " + operation + ": document changed before apply; no files changed."); app.RequestRedraw(); return;
+        }
+        if (plan.entries.Count == 0) {
+            log.Add("> " + operation + ": no changes."); app.RequestRedraw(); return;
+        }
+        navigationCommitWaiting = true;
+        navigationDocumentWritesPaused = true;
+        try {
+            this.PauseDocumentWritesThen(delegate () {
+                if (!this.RenamePlanTabsCurrent(guard, plan)) {
+                    log.Add("> " + operation + ": request canceled or document changed while waiting for saves; no files changed.");
+                    this.ReleaseNavigationCommit();
+                    return;
+                }
+                navigationDesignWritesPaused = true;
+                try {
+                    this.PauseDesignWritesThen(delegate () {
+                        this.StartRenamePlanDiskCommit(guard, plan, operation, summary);
+                    });
+                } catch (Exception error) {
+                    log.Add("> " + operation + ": could not pause design saves: " + error.Message);
+                    this.ReleaseNavigationCommit();
+                }
+            });
+        } catch (Exception error) {
+            log.Add("> " + operation + ": could not pause document saves: " + error.Message);
+            this.ReleaseNavigationCommit();
+        }
+        app.RequestRedraw();
+    }
+
+    void StartRenamePlanDiskCommit(IdeNavigationGuard guard, IdeRenamePlan plan,
+            string operation, string summary) {
+        if (!navigationCommitWaiting || !this.RenamePlanTabsCurrent(guard, plan)) {
+            this.ReleaseNavigationCommit();
+            return;
+        }
+        navigationCommitWaiting = false;
+        navigationCommitBusy = true;
+        IdeNavigationSnapshot snapshot = guard.snapshot;
+        App host = app;
+        try {
+            navigationWork.Run(delegate () {
+                IdeRenameCommit result = ZanIDE.CommitRenameDiskPlan(plan, snapshot.cancellation);
+                // IDE 视图状态管理与用户交互调度。
+                host.Post(delegate () { this.FinishRenamePlanCommit(guard, plan, result, operation, summary); });
+            });
+        } catch (Exception error) {
+            log.Add("> " + operation + ": " + error.Message);
+            this.ReleaseNavigationCommit();
+        }
+    }
+
+    void CompensateRenamePlan(IdeRenamePlan plan, string operation, string failure) {
+        App host = app;
+        navigationWork.Run(delegate () {
+            string rollback = ZanIDE.RollbackRenameDiskPlan(plan);
+            host.Post(delegate () {
+                log.Add("> " + operation + ": " + failure + rollback);
+                this.ReleaseNavigationCommit();
+            });
+        });
+    }
+
+    void FinishRenamePlanCommit(IdeNavigationGuard guard, IdeRenamePlan plan,
+            IdeRenameCommit result, string operation, string summary) {
+        if (!result.committed) {
+            log.Add("> " + operation + ": " + result.failure);
+            this.ReleaseNavigationCommit();
+            return;
+        }
+        if (!this.RenamePlanTabsCurrent(guard, plan)) {
+            this.CompensateRenamePlan(plan, operation, "request canceled or document changed; disk writes rolled back.");
+            return;
+        }
+        IdeNavigationSnapshot snapshot = guard.snapshot;
+        IdeRenamePlanEntry active = null;
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            if (plan.entries[i].open && LspSession.SameDocumentPath(plan.entries[i].path, snapshot.path)) {
+                active = plan.entries[i];
+            }
+        }
+        if (active != null && guard.editorBound) {
+            // IDE 视图状态管理与用户交互调度。
+            CodeEditorTextLoad request = editor.BeginTextLoad(snapshot.path, CodeEditor.LangForName(snapshot.path));
+            editor.SaveUndo();
+            if (!editor.ApplyPreparedText(request, active.prepared)) {
+                this.CompensateRenamePlan(plan, operation, "editor changed before apply; disk writes rolled back.");
+                return;
+            }
+            editor.GoToLineCol(snapshot.line, snapshot.column);
+            editor.SetScrollLine(guard.origin.scrollLine);
+        }
+        // 接口数据协议与执行契约。
+        for (int i = 0; i < plan.entries.Count; i = i + 1) {
+            IdeRenamePlanEntry entry = plan.entries[i];
+            if (entry.open) {
+                int tab = ZanIDE.FindNavigationTab(tabs, entry.path);
+                tabs[tab].body = entry.newText;
+                tabs[tab].preparedText = entry.prepared;
+                tabs[tab].preparedBody = entry.newText;
+                this.InvalidateLoadedDocument(tabs[tab].path);
+            }
+            if (lspSess != null && lspSess.Alive() && entry.path.ToLower().EndsWith(".zan")) {
+                lspSess.SyncDoc(entry.path, entry.newText);
+            }
+        }
+        ZanIDE.InvalidateNavFiles();
+        log.Add("> " + summary + ": " + Convert.ToString(plan.buffers) + " open tab(s), "
+            + Convert.ToString(plan.disk) + " file(s) on disk.");
+        this.ReleaseNavigationCommit();
+        this.RequestProjectSourcesAsync();
+    }
+
+    static List<IdeSourceSnapshot> SearchSourceSnapshots(IdeProjectSourceCache cache,
+            List<IdeSourceSnapshot> documents) {
+        List<IdeSourceSnapshot> sources = new List<IdeSourceSnapshot>();
+        for (int i = 0; i < cache.search.Count; i = i + 1) {
+            IdeSourceSnapshot disk = cache.search[i];
+            IdeSourceSnapshot opened = ZanIDE.SnapshotSource(documents, disk.path);
+            sources.Add(opened != null ? opened : disk);
+        }
+        return sources;
+    }
+
+    static List<SearchHit> FindInSourceSnapshot(IdeNavigationSnapshot snapshot,
+            IdeProjectSourceCache cache, string query) {
+        List<SearchHit> hits = new List<SearchHit>();
+        List<IdeSourceSnapshot> sources = ZanIDE.SearchSourceSnapshots(cache, snapshot.documents);
+        for (int i = 0; i < sources.Count && hits.Count < 2000; i = i + 1) {
+            if (snapshot.cancellation.IsCancellationRequested) { return hits; }
+            List<string> lines = CodeEditor.SplitLines(sources[i].body);
+            for (int line = 0; line < lines.Count && hits.Count < 2000; line = line + 1) {
+                if (ZanIDE.LineContains(lines[line], query, false)) {
+                    hits.Add(SearchHit.Create(sources[i].path, line, CodeEditor.LTrim(lines[line])));
+                }
+            }
+        }
+        return hits;
+    }
+
+    void FindInFilesAsync(string query) {
+        if (query.Length == 0) { return; }
+        IdeNavigationGuard guard = this.BeginCodeNavigation(false, false);
+        if (guard == null) { return; }
+        this.WithProjectSources(delegate () {
+            if (!this.NavigationGuardCurrent(guard, false, true)) { return; }
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            IdeProjectSourceCache cache = navigationSources;
+            App host = app;
+            navigationWork.Run(delegate () {
+                List<SearchHit> hits = ZanIDE.FindInSourceSnapshot(snapshot, cache, query);
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () {
+                    if (!this.NavigationGuardCurrent(guard, false, true)) { return; }
+                    fifHits = hits; fifSel = -1;
+                    log.Add("> " + Convert.ToString(hits.Count) + " match(es) for '" + query + "'.");
+                    coLog.Reset(); dock.Focus("output"); app.RequestRedraw();
+                });
+            });
+        });
+    }
+
+    static IdeRenamePlan PrepareReplacementPlan(IdeNavigationSnapshot snapshot,
+            IdeProjectSourceCache cache, string query, string replacement) {
+        IdeRenamePlan plan = new IdeRenamePlan();
+        List<IdeSourceSnapshot> sources = ZanIDE.SearchSourceSnapshots(cache, snapshot.documents);
+        for (int i = 0; i < sources.Count; i = i + 1) {
+            if (snapshot.cancellation.IsCancellationRequested) {
+                plan.failure = "canceled; no files changed."; return plan;
+            }
+            IdeSourceSnapshot source = sources[i];
+            string text = ZanIDE.ReplaceAllText(source.body, query, replacement, false);
+            if (text == source.body) { continue; }
+            IdeRenamePlanEntry entry = new IdeRenamePlanEntry();
+            entry.path = source.path; entry.originalText = source.body; entry.newText = text;
+            entry.open = ZanIDE.SnapshotSource(snapshot.documents, source.path) != null;
+            entry.version = source.version;
+            if (entry.open) { entry.prepared = CodeEditor.PrepareText(text); plan.buffers = plan.buffers + 1; }
+            else { plan.disk = plan.disk + 1; }
+            plan.entries.Add(entry);
+        }
+        plan.valid = true;
+        return plan;
+    }
+
+    void ReplaceInFilesAsync(string query, string replacement) {
+        if (query == "" || query == replacement) { return; }
+        IdeNavigationGuard guard = this.BeginCodeNavigation(false, false);
+        if (guard == null) { return; }
+        this.WithProjectSources(delegate () {
+            if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            IdeProjectSourceCache cache = navigationSources;
+            App host = app;
+            navigationWork.Run(delegate () {
+                IdeRenamePlan plan = new IdeRenamePlan();
+                try { plan = ZanIDE.PrepareReplacementPlan(snapshot, cache, query, replacement); }
+                catch (Exception error) {
+                    // 接口数据协议与执行契约。
+                    plan.failure = error.Message;
+                }
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () {
+                    this.BeginRenamePlanCommit(guard, plan, "Replace in Files", "Replaced '" + query + "' with '" + replacement + "'");
+                });
+            });
+        });
+    }
+
+    /// 代码导航与工程符号语义索引契约。
     static int IndexOfPath(List<string> paths, string path) {
         for (int i = 0; i < paths.Count; i = i + 1) {
             if (ZanIDE.SamePath(paths[i], path)) { return i; }
@@ -1308,9 +2554,9 @@ partial class ZanIDE {
         return LspSession.ApplyTextEdits(text, edits, path);
     }
 
-    /// Rename Symbol (F2): whole-word, comment/string-aware rename of the
-    /// symbol under the caret across every open tab (buffers only; save to
-    /// persist). Returns the number of tabs changed.
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 代码导航与工程符号语义索引契约。
     static int RenameSymbol(CodeEditor editor, List<TabRecord> tabs,
                             SignalInt active, List<string> log,
                             string word, string newName) {
@@ -1335,8 +2581,8 @@ partial class ZanIDE {
         return changed;
     }
 
-    /// Format Document (Ctrl+E): pipes the active buffer through zanfmt
-    /// (--stdout on a temp copy) and reloads the formatted result.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static void FormatDocument(CodeEditor editor, List<string> log) {
         string exe = ZanIDE.ToolchainDir() + "/zanfmt" + ZanIDE.ExeSuffix();
         if (!File.Exists(exe)) { exe = ZanIDE.ExeDir() + "/zanfmt" + ZanIDE.ExeSuffix(); }
@@ -1357,9 +2603,9 @@ partial class ZanIDE {
         log.Add("> Formatted document with zanfmt.");
     }
 
-    // ---- designer <-> code (form serialization) ----
+    // 核心契约与语义定义。
 
-    /// Splits a string on runs of spaces/tabs into tokens.
+    /// 接口数据协议与执行契约。
     static List<string> SplitSpaces(string s) {
         List<string> outp = new List<string>();
         string cur = "";
@@ -1379,39 +2625,39 @@ partial class ZanIDE {
         }
     }
 
-    // ==== C#-style form file model (.html design + .zan code-behind) ====
+    // 接口数据协议与执行契约。
 
-    /// True when the path names a LEGACY .zform design file (P8-4 removed
-    /// the .zform compile channel; these exist only in old projects and the
-    /// designer opens them read-convert via LegacyFormToJson). A .html tab's
-    /// designer state is content-based (TabRecord.designDoc), so a plain web
-    /// page never opens the designer. Path-only contexts that must accept
-    /// both use IsDesignFilePath below.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static bool IsFormPath(string p) {
         int n = p.Length;
         if (n < 6) { return false; }
         return p.Substring(n - 6, 6) == ".zform";
     }
 
-    /// True for any designer-document path regardless of storage format
-    /// (.html current, .zform legacy import). For compile-pairing / entry
-    /// resolution where no tab exists to consult content.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 代码导航与工程符号语义索引契约。
     static bool IsDesignFilePath(string p) {
         return ZanIDE.IsFormPath(p) || ZanIDE.IsHtmlPath(p);
     }
 
-    /// True when the path names an .html/.htm file - a candidate designer
-    /// document (P7a storage format). Body content decides, not the path:
-    /// see IsHtmlDesignBody / TabRecord.designDoc.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 核心契约与语义定义。
     static bool IsHtmlPath(string p) {
         int n = p.Length;
         if (n >= 5 && p.Substring(n - 5, 5) == ".html") { return true; }
         return n >= 4 && p.Substring(n - 4, 4) == ".htm";
     }
 
-    /// True when an .html body is a designer document (body data-zan-design
-    /// marker). Parsing is not free: the answer is cached per tab
-    /// (TabRecord.designDoc), never recomputed per frame.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 代码导航与工程符号语义索引契约。
     static bool IsHtmlDesignBody(string s) {
         return System.Web.DesignerHtml.IsDesignDoc(s);
     }
@@ -1422,7 +2668,7 @@ partial class ZanIDE {
         return p.Substring(n - 7, 7) == ".zscene";
     }
 
-    /// Base name of a .zscene (the scene name), e.g. src/Hud.zscene -> Hud.
+    /// IDE 视图状态管理与用户交互调度。
     static string SceneBaseName(string p) {
         string fn = Path.GetFileName(p);
         int n = fn.Length;
@@ -1430,8 +2676,8 @@ partial class ZanIDE {
         return fn;
     }
 
-    /// Base name of a design doc (the form/class name), e.g. src/Login.html
-    /// -> Login (legacy src/Login.zform also accepted).
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static string FormBaseName(string p) {
         string fn = Path.GetFileName(p);
         int n = fn.Length;
@@ -1441,12 +2687,12 @@ partial class ZanIDE {
         return fn;
     }
 
-    /// Code-behind path for a design doc, e.g. src/Login.html ->
-    /// src/Login.zan (legacy .zform also accepted).
-    /// Scans a code-behind file for bindable member variables: simple
-    /// `type name;` / `type name = ...;` declarations (skipping methods,
-    /// comments and the generated designer region). The designer offers the
-    /// names in its bind-path picker for two-way binding.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static List<string> ScanBindVars(string code) {
         List<string> vars = new List<string>();
         List<string> lines = CodeEditor.SplitLines(code);
@@ -1465,7 +2711,7 @@ partial class ZanIDE {
             string body = ln.Substring(0, ln.Length - 1);
             int eq = ZanIDE.IndexOfStr(body, "=");
             if (eq >= 0) { body = ZanIDE.TrimStr(body.Substring(0, eq)); }
-            // Tokenise "type name" (allow static/public prefixes).
+            // 接口数据协议与执行契约。
             List<string> toks = ZanIDE.SplitWords(body);
             if (toks.Count < 2) { continue; }
             string ty = toks[toks.Count - 2];
@@ -1527,9 +2773,9 @@ partial class ZanIDE {
         return formPath + ".zan";
     }
 
-    /// True when the legacy .zform body is a designer JSON document (as
-    /// saved by the unified form designer) rather than the older
-    /// `control ...` line format.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 核心契约与执行状态转移规范。
     static bool LooksLikeJson(string s) {
         for (int i = 0; i < s.Length; i = i + 1) {
             string ch = s.Substring(i, 1);
@@ -1540,8 +2786,8 @@ partial class ZanIDE {
         return false;
     }
 
-    /// Maps a legacy .zform control type to the closest form-designer field
-    /// type (legacy import path).
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static int LegacyFieldType(string ty) {
         if (ty == "Label") { return 16; }
         if (ty == "CheckBox") { return 5; }
@@ -1558,11 +2804,11 @@ partial class ZanIDE {
         return 0;
     }
 
-    /// Converts a legacy coordinate-based .zform file into the form designer's
-    /// JSON document so old forms open in the unified designer (each control
-    /// becomes a field row; free coordinates are dropped in favour of the
-    /// designer's automatic layout). Legacy-import only: the .zform compile
-    /// channel was removed in P8-4, new documents are .html.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static string LegacyFormToJson(string name, string text) {
         LegacyFormDoc o = new LegacyFormDoc();
         o.name = name;
@@ -1584,24 +2830,24 @@ partial class ZanIDE {
         return Json.Serialize<LegacyFormDoc>(o);
     }
 
-    // ---- form design model (2-file: .html design + .zan business) -----------
+    // 接口数据协议与执行契约。
 
-    /// True for a generated layout file (Name.g.zan) - a leftover from the
-    /// pre-formgen IDE; designs are projected by the compiler now.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static bool IsGenPath(string p) {
         int n = p.Length;
         if (n < 6) { return false; }
         return p.Substring(n - 6, 6) == ".g.zan";
     }
 
-    /// True for any Zan source file (.zan).
+    /// 接口数据协议与执行契约。
     static bool IsZanFilePath(string p) {
         int n = p.Length;
         if (n < 4) { return false; }
         return p.Substring(n - 4, 4) == ".zan";
     }
 
-    /// Escapes a string for embedding inside a Zan double-quoted literal.
+    /// 接口数据协议与执行契约。
     static string EscZ(string s) {
         string o = "";
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -1621,8 +2867,8 @@ partial class ZanIDE {
         return false;
     }
 
-    /// A fresh business file (Name.zan): the user's half of the partial class.
-    /// The designer never overwrites this - only creates it when missing.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
     static string GenBusinessShell(string name) {
         string s = "using System;\n";
         s = s + "using Gui;\n";
@@ -1641,11 +2887,11 @@ partial class ZanIDE {
         return s;
     }
 
-    /// A fresh free-canvas form design (Name.html, layoutMode 1): the window
-    /// with a starter login-style sample whose controls are absolutely placed,
-    /// mirroring the shipped "Free Layout Window" project template. The code
-    /// behind is GenFreeShell; zanc projects typed controls + Main at compile
-    /// time, so the design file is the single source of truth.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static string FreeFormBody(string name, int winW, int winH) {
         FormDoc o = new FormDoc();
         o.name = name;
@@ -1672,7 +2918,7 @@ partial class ZanIDE {
         return System.Web.DesignerHtml.FromJsonDoc(Json.Serialize<FormDoc>(o));
     }
 
-    /// One absolutely-placed field of the free-layout starter form.
+    /// 接口数据协议与执行契约。
     static FormFieldDoc FreeFormField(string type, string label, string fname,
             string span, string fx, string fy, string fw, string fh,
             bool required, bool wrap) {
@@ -1690,9 +2936,9 @@ partial class ZanIDE {
         return f;
     }
 
-    /// The business half (Name.zan) of a free-canvas form: same partial class
-    /// contract as GenBusinessShell, plus a demo of the generated
-    /// __ValidateForm() and the event-wiring surface for the starter sample.
+    /// IDE 视图状态管理与用户交互调度。
+    /// 代码导航与工程符号语义索引契约。
+    /// IDE 视图状态管理与用户交互调度。
     static string GenFreeShell(string name) {
         string s = "using System;\n";
         s = s + "using Gui;\n";
@@ -1721,13 +2967,13 @@ partial class ZanIDE {
         return s;
     }
 
-    // ---- scene code projection (.zscene, 2-file model) ----------------------
-    // A scene -> Foo.zscene (design data) + Foo.zan (your logic). The typed
-    // code below is what zanc's scenegen projects from the design at build
-    // time: each named element as a `static SceneElement`, the SceneDoc
-    // rebuilt exactly as designed, and the SceneView render loop. The IDE
-    // shows it in the read-only code view and feeds it to the language server
-    // for completion; nothing is written to disk (see src/compiler/scenegen.h).
+    // 代码导航与工程符号语义索引契约。
+    // IDE 视图状态管理与用户交互调度。
+    // IDE 视图状态管理与用户交互调度。
+    // 接口数据协议与执行契约。
+    // IDE 视图状态管理与用户交互调度。
+    // IDE 视图状态管理与用户交互调度。
+    // 接口数据协议与执行契约。
 
     static string SceneCodeBehindPath(string scenePath) {
         int n = scenePath.Length;
@@ -1905,7 +3151,7 @@ partial class ZanIDE {
         return s;
     }
 
-    // Business shell for a scene - created only when missing; never overwritten.
+    // IDE 视图状态管理与用户交互调度。
     static string GenSceneBusinessShell(string name) {
         string s = "using System;\n";
         s = s + "using Gui;\n";
@@ -1946,10 +3192,10 @@ partial class ZanIDE {
         return true;
     }
 
-    /// True when two plain label lists hold the same strings in the same
-    /// order. Used by retained widgets that cache a Tabs strip built from a
-    /// plain label list (docs section rail, debug panel) and rebuild only
-    /// when the labels actually change.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// 核心契约与语义定义。
     static bool StringListsEqual(List<string> a, List<string> b) {
         if (a == null || b == null) { return false; }
         if (a.Count != b.Count) { return false; }
@@ -1959,10 +3205,10 @@ partial class ZanIDE {
         return true;
     }
 
-    /// Keeps the retained editor tab bar in step with the tab model the IDE
-    /// owns (tabs / activeTab). The bar runs in host mode: close / add /
-    /// right-click are reported back so this class stays the single source of
-    /// truth; labels are rebuilt only when the model actually changes.
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
+    /// IDE 视图状态管理与用户交互调度。
     void SyncEditorTabs() {
         if (editorTabs == null) {
             editorTabs = new Tabs(Tabs.Card());
@@ -1980,5 +3226,5 @@ partial class ZanIDE {
         }
     }
 
-    // ---- dialog rendering ----
+    // 核心契约与执行状态转移规范。
 }

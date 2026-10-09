@@ -18,19 +18,19 @@
 typedef struct {
     json_value *calls;
     int call_id;
-    char cur_cls[128];   /* enclosing class name (call owner) */
-    char cur_fn[128];    /* enclosing method name ("" for field initializers) */
+    char cur_cls[128];   /* 核心系统底层抽象与内存语义契约 */
+    char cur_fn[128];    /* 底层系统交互与数据协议契约 */
     /* 内部辅助逻辑 */
     zan_ast_node_t **rec_nodes;
     int *rec_ids;
     int rec_count;
     int rec_cap;
-    /* receiver-is-a-call placeholders (defensive fallback only) */
+    /* 底层系统交互与数据协议契约 */
     zan_ast_node_t **pend_nodes;
     int *pend_ids;
     int pend_count;
     int pend_cap;
-    /* precomputed seed filters: most calls are discarded before any JSON allocation */
+    /* 底层系统交互与数据协议契约 */
     const char *const *expr_names;
     int expr_count;
     const char *const *table_names;
@@ -95,7 +95,7 @@ static void gm_type_str(zan_ast_node_t *t, char *out, size_t outsz) {
     }
     case AST_ARRAY_TYPE:
     case AST_NULLABLE_TYPE:
-        /* bare marker nodes (no union fields): leave unnamed */
+        /* 底层系统交互与数据协议契约 */
         out[0] = '\0';
         break;
     case AST_QUALIFIED_NAME: {
@@ -262,7 +262,7 @@ static json_value *gm_expr_tree(zan_ast_node_t *n) {
           json_obj_set(o, "a", args); }
         break;
     case AST_BLOCK:
-        /* a lambda with a block body: only the shape matters */
+        /* 底层系统交互与数据协议契约 */
         json_obj_set(o, "k", json_new_str("block"));
         break;
     case AST_LAMBDA: {
@@ -320,7 +320,7 @@ static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
     }
 }
 
-/* Reserve (or find) the placeholder id of a receiver call node */
+/* 底层系统交互与数据协议契约 */
 static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     for (int i = 0; i < c->pend_count; i++)
         if (c->pend_nodes[i] == recv) return c->pend_ids[i];
@@ -357,7 +357,7 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         if (callee->ident.name.str) name = callee->ident.name.str;
     }
 
-    /* 1. Reserved receiver placeholder */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < c->pend_count; i++) {
         if (c->pend_nodes[i] == call) return true;
     }
@@ -378,7 +378,7 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         strcmp(robj->ident.name.str, "Json") == 0)
         return true;
 
-    /* 5. Name is a known seed */
+    /* 核心系统底层抽象与内存语义契约 */
     static const char *const seeds[] = {
         "Serialize", "Deserialize",
         "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
@@ -390,11 +390,11 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
     if (name && gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
         return true;
 
-    /* 6. Name is an Expr<T> taking method */
+    /* 核心系统底层抽象与内存语义契约 */
     if (name && gm_name_in(name, c->expr_names, c->expr_count))
         return true;
 
-    /* 7. Receiver is a member access to a Table entity */
+    /* 核心系统底层抽象与内存语义契约 */
     if (robj && robj->kind == AST_MEMBER_ACCESS && robj->member.name.str &&
         gm_name_in(robj->member.name.str, c->table_names, c->table_count))
         return true;
@@ -525,10 +525,10 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
                                int expr_count, const char *const *table_names,
                                int table_count) {
     static const char *const seeds[] = {
-        /* route request readers */
+        /* 核心系统底层抽象与内存语义契约 */
         "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
         "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
-        /* database roots/accessors; fluent descendants are retained below */
+        /* 底层系统交互与数据协议契约 */
         "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
         "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
         "Read", "ReadAsync"
@@ -542,7 +542,7 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
     if (gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
         return true;
     if (gm_name_in(name, expr_names, expr_count)) return true;
-    /* accessor chain head: the receiver is `<obj> */
+    /* 底层系统交互与数据协议契约 */
     {
         json_value *recvx = json_obj_get(call, "recvx");
         if (recvx && recvx->type == JSON_OBJ) {
@@ -799,7 +799,7 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
         break;
     case AST_LABEL_STMT:
     case AST_GOTO_STMT:
-        /* plain name nodes, nothing to walk */
+        /* 核心系统底层抽象与内存语义契约 */
         break;
     case AST_QUERY_EXPR:
         gm_walk_expr(n->query.source, c);
@@ -980,7 +980,7 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 }
             } else if ((m->kind == AST_PROPERTY_DECL) &&
                        m->field_decl.initializer) {
-                /* property initializer defaults (`T X { get; set; } = v;`) */
+                /* 核心系统底层抽象与内存语义契约 */
                 json_value *p = json_new_obj();
                 json_obj_set(p, "name", json_new_str(
                     m->field_decl.name.str ? (const char *)m->field_decl.name.str
@@ -1516,7 +1516,7 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
         return n;
     }
     if (strcmp(k, "block") == 0) {
-        /* a lambda with a block body: only the shape matters */
+        /* 底层系统交互与数据协议契约 */
         n = zan_ast_new(arena, AST_BLOCK, loc);
         zan_ast_list_init(&n->block.stmts);
         return n;
@@ -1558,5 +1558,5 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
         n->ref_arg.is_out = 0;
         return n;
     }
-    return NULL; /* "other": unknown shape, caller skips the directive */
+    return NULL; /* 底层系统交互与数据协议契约 */
 }

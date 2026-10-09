@@ -46,7 +46,7 @@ typedef enum {
     TYPE_ENUM,
     TYPE_ARRAY,
     TYPE_NULLABLE,
-    TYPE_TASK,       /* Task / Task<T>: a coroutine handle (opaque i64) */
+    TYPE_TASK,       /* 核心系统底层抽象与内存语义契约 */
     TYPE_TYPE_PARAM,
     TYPE_DELEGATE,
     TYPE_ERROR,
@@ -56,37 +56,37 @@ typedef struct zan_type zan_type_t;
 struct zan_type {
     zan_type_kind_t kind;
     zan_istr_t name;
-    struct zan_symbol *sym;          /* back-pointer to declaring symbol */
-    zan_type_t *element_type;        /* for arrays and nullable */
-    int array_rank;                  /* TYPE_ARRAY: 1 = one-dimensional, N = rank-N rectangular array */
-    zan_type_t *base_type;           /* base class type (for inheritance) */
-    int bases_resolved;              /* 0 = not yet, 1 = in progress, 2 = done */
-    zan_type_t **interfaces;         /* implemented interfaces (for classes) */
+    struct zan_symbol *sym;          /* 核心系统底层抽象与内存语义契约 */
+    zan_type_t *element_type;        /* 核心系统底层抽象与内存语义契约 */
+    int array_rank;                  /* 底层系统交互与数据协议契约 */
+    zan_type_t *base_type;           /* 核心系统底层抽象与内存语义契约 */
+    int bases_resolved;              /* 核心系统底层抽象与内存语义契约 */
+    zan_type_t **interfaces;         /* 核心系统底层抽象与内存语义契约 */
     int interface_count;
-    zan_type_t **type_args;          /* for generic instantiation */
+    zan_type_t **type_args;          /* 核心系统底层抽象与内存语义契约 */
     int type_arg_count;
-    /* delegate signature (only for TYPE_DELEGATE) */
+    /* 底层系统交互与数据协议契约 */
     zan_type_t *delegate_ret_type;
     zan_type_t **delegate_param_types;
     int delegate_param_count;
-    int delegate_is_async;           /* declared `async delegate`: invocation yields a task handle (i8*) and is awaited */
+    int delegate_is_async;           /* 底层系统交互与数据协议契约 */
 };
 
 typedef struct zan_symbol zan_symbol_t;
 struct zan_symbol {
     zan_sym_kind_t kind;
     zan_istr_t name;
-    zan_type_t *type;                /* resolved type */
-    zan_ast_node_t *decl;            /* back-pointer to AST declaration */
+    zan_type_t *type;                /* 核心系统底层抽象与内存语义契约 */
+    zan_ast_node_t *decl;            /* 核心系统底层抽象与内存语义契约 */
     uint32_t modifiers;
-    zan_symbol_t *parent;            /* enclosing scope symbol */
+    zan_symbol_t *parent;            /* 核心系统底层抽象与内存语义契约 */
 
-    /* children (for types, namespaces, methods) */
+    /* 核心系统底层抽象与内存语义契约 */
     zan_symbol_t **members;
     int member_count;
     int member_cap;
 
-    /* Scope name-index chain, owned by the scope the symbol was added to */
+    /* 底层系统交互与数据协议契约 */
     uint32_t name_hash;
     zan_symbol_t *hash_next;
 };
@@ -97,9 +97,9 @@ struct zan_scope {
     zan_symbol_t **symbols;
     int sym_count;
     int sym_cap;
-    /* O(1) name index over `symbols` */
-    zan_symbol_t **buckets;          /* NULL until the first symbol is added */
-    int bucket_count;                /* power of two, or 0 when empty */
+    /* 核心系统底层抽象与内存语义契约 */
+    zan_symbol_t **buckets;          /* 底层系统交互与数据协议契约 */
+    int bucket_count;                /* 核心系统底层抽象与内存语义契约 */
 };
 
 struct zan_binder {
@@ -125,25 +125,25 @@ struct zan_binder {
     zan_type_t *type_object;
     zan_type_t *type_nint;
     zan_type_t *type_error;
-    /* `TypeInfo`, the static type of `typeof(T)` and `obj */
+    /* 底层系统交互与数据协议契约 */
     zan_type_t *type_typeinfo;
 
     /* 内部辅助逻辑 */
     bool binding_done;
 
-    /* Canonical tuple structs, one per distinct element-type signature */
+    /* 底层系统交互与数据协议契约 */
     zan_type_t **tuple_types;
     int tuple_type_count;
     int tuple_type_cap;
     /* 内部辅助逻辑 */
     zan_type_t **tuple_hash;
-    int tuple_hash_cap; /* power of two, 0 = not built */
+    int tuple_hash_cap; /* 核心系统底层抽象与内存语义契约 */
     /* 内部辅助逻辑 */
     struct zan_member_idx_slot {
-        zan_symbol_t *type; /* NULL = empty slot */
+        zan_symbol_t *type; /* 核心系统底层抽象与内存语义契约 */
         struct zan_member_name_index *idx;
     } *member_idx;
-    int member_idx_cap;   /* power of two, 0 = not built */
+    int member_idx_cap;   /* 核心系统底层抽象与内存语义契约 */
     int member_idx_count;
 };
 
@@ -157,7 +157,7 @@ zan_type_t *zan_binder_make_list_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem);
-/* Construct a Grouping<elem> instantiation (query `group e by k` lowering) */
+/* 底层系统交互与数据协议契约 */
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem);
 
 /* C# tuples `(T1, T2, */

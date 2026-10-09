@@ -1,17 +1,4 @@
-/* The slice of OpenGL 3.3 core the GPU backend uses, declared here rather than
- * taken from a system header.
- *
- * Every platform ships a usable GL 3.3 driver but none of them ship usable 3.3
- * *headers*: Windows' <GL/gl.h> stops at 1.1, and pulling in GLEW/GLAD/glcorearb
- * would add a dependency for what is, in the end, one struct of function
- * pointers. So the types, the enums and the entry points this backend actually
- * calls are spelled out below -- all of them are frozen ABI, so this cannot
- * drift the way a vendored header can.
- *
- * Every entry point is fetched at run time (wglGetProcAddress / glXGetProcAddress
- * / dlsym), so the shared library never links against libGL and keeps loading on
- * a machine with no GL at all -- the loader just fails and the CPU backend stays
- * in charge. */
+/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_GUI_GL_H
 #define ZAN_GUI_GL_H
 
@@ -36,9 +23,7 @@ typedef float         zgl_float;
 #define ZGL_SRC_ALPHA                    0x0302
 #define ZGL_ONE_MINUS_SRC_ALPHA          0x0303
 #define ZGL_ONE                          1
-/* Dual-source blending (core since 3.3): lets the text shader hand a *colour*
- * of coverage to the blender, which is what per-channel (subpixel) text AA
- * needs -- one alpha cannot express it. */
+/* 底层系统交互与数据协议契约 */
 #define ZGL_SRC1_COLOR                   0x88F9
 #define ZGL_ONE_MINUS_SRC1_COLOR         0x88FA
 #define ZGL_SRC1_ALPHA                   0x8589
@@ -169,17 +154,13 @@ typedef struct zan_gl_api_s {
     void      (*FramebufferRenderbuffer)(zgl_enum, zgl_enum, zgl_enum,
                                          zgl_uint);
     zgl_enum  (*CheckFramebufferStatus)(zgl_enum);
-    /* Presentation: the finished frame is copied from the surface's FBO to the
-     * window's back buffer, so presenting needs no shader or geometry of its
-     * own (core since GL 3.0, and this backend already demands 3.3). */
+    /* 底层系统交互与数据协议契约 */
     void      (*BlitFramebuffer)(zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_bitfield, zgl_enum);
 } zan_gl_api;
 
-/* Fills `api` from `getproc`, returning 0 when any entry point is missing --
- * a driver that cannot supply all of GL 3.3 core is not usable for this backend
- * and the caller keeps the CPU one. */
+/* 底层系统交互与数据协议契约 */
 int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name));
 
 #endif /* ZAN_GUI_GL_H */

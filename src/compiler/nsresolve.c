@@ -74,7 +74,7 @@ static zan_istr_t flatten_qname(zan_ast_node_t *q, zan_arena_t *ar) {
     return empty;
 }
 
-/* Nested declarations are hoisted only after the input units have been merged */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
                                zan_ast_list_t *usings, zan_arena_t *arena) {
     if (!d) return;
@@ -103,10 +103,10 @@ void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
 
 typedef struct {
     zan_ast_node_t *decl;
-    zan_istr_t simple;   /* declared simple name */
+    zan_istr_t simple;   /* 核心系统底层抽象与内存语义契约 */
     zan_istr_t ns;       /* namespace ("" if global) */
     zan_istr_t full;     /* ns.simple, or simple if global */
-    zan_istr_t final;    /* rewritten name (== simple unless mangled) */
+    zan_istr_t final;    /* 核心系统底层抽象与内存语义契约 */
     bool conflicting;
 } nr_type_t;
 
@@ -119,18 +119,18 @@ typedef struct {
 
 /* 内部辅助逻辑 */
 typedef struct nr_chain {
-    int idx;            /* index into ctx->items */
-    int next;           /* next node in the bucket chain, -1 ends */
+    int idx;            /* 核心系统底层抽象与内存语义契约 */
+    int next;           /* 底层系统交互与数据协议契约 */
 } nr_chain_t;
 
 typedef struct {
-    int *buckets;       /* head chain node per bucket, -1 empty */
+    int *buckets;       /* 底层系统交互与数据协议契约 */
     uint32_t mask;
     nr_chain_t *chains;
     int count;
 } nr_index_t;
 
-/* Ref-recording set used by the reachability prune (nr_ctx_t */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     zan_istr_t *items;
     int count;
@@ -160,7 +160,7 @@ typedef struct {
     zp_refs_t *refs;
 } nr_ctx_t;
 
-/* key_is_full: nonzero -> index by t->full, zero -> index by t->simple */
+/* 模块核心语义抽象与接口调用契约 */
 static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
                            int key_is_full, zan_arena_t *arena) {
     int nb = 16;
@@ -180,7 +180,7 @@ static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
     }
 }
 
-/* Earliest-declared item (lowest index) whose key equals `key`, or -1 */
+/* 模块核心语义抽象与接口调用契约 */
 static int nr_index_find(nr_index_t *ix, nr_type_t *items, int key_is_full,
                          zan_istr_t key) {
     int best = -1;
@@ -299,7 +299,7 @@ static zan_istr_t flatten_qname_buf(zan_ast_node_t *q, char *buf, size_t buf_cap
 }
 
 static int count_simple(nr_ctx_t *c, zan_istr_t simple) {
-    /* same-simple-name groups live in one bucket chain; count them there */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     int n = 0;
     for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
          node >= 0; node = c->by_simple.chains[node].next) {
@@ -385,7 +385,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     nr_type_t *t = NULL;
 
     if (ns_has_dot(R)) {
-        /* explicit qualified reference: try full, then using-prefixed */
+        /* 模块核心语义抽象与接口调用契约 */
         t = find_full(c, R);
         if (!t && usings) {
             char ubuf[256];
@@ -407,7 +407,7 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
             if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
             return;
         }
-        /* qualified reference to a non-declared (e */
+        /* 核心系统底层抽象与内存语义契约 */
         uint32_t last = 0;
         for (uint32_t i = 0; i < R.len; i++)
             if (R.str[i] == '.') last = i + 1;
@@ -471,7 +471,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     zan_istr_t R = id->ident.name;
     if (R.len == 0 || shadow_has(&c->shadow, R)) return;
 
-    /* The prune needs every receiver name as an edge: `DataTable */
+    /* 模块核心语义抽象与接口调用契约 */
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
     nr_type_t *t = NULL;
@@ -508,7 +508,7 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
     }
 }
 
-/* Flattens a receiver made of identifiers and member accesses (`Gui */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     zan_istr_t empty = {0};
     if (!n) return empty;
@@ -521,7 +521,7 @@ static zan_istr_t flatten_receiver(nr_ctx_t *c, zan_ast_node_t *n) {
     return empty;
 }
 
-/* Rewrites a namespace-qualified static receiver (`Beta */
+/* 底层系统交互与数据协议契约 */
 static void resolve_qualified_receiver(nr_ctx_t *c, zan_ast_node_t *recv) {
     zan_istr_t full = flatten_receiver(c, recv);
     if (full.len == 0 || !ns_has_dot(full)) return;
@@ -938,7 +938,7 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
         break;
 
     default:
-        /* literals, identifiers, this/base, labels, goto: no nested types */
+        /* 模块核心语义抽象与接口调用契约 */
         break;
     }
 }
@@ -963,7 +963,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.items = (nr_type_t *)zan_arena_alloc(arena,
                     sizeof(nr_type_t) * (size_t)(decls->count + 1));
 
-    /* 1. collect declared types */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];
         if (!d || !is_type_decl_kind(d->kind)) continue;
@@ -993,7 +993,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
         }
     }
 
-    /* 3. give each conflicting declaration a unique mangled name */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < c.count; i++) {
         if (!c.items[i].conflicting) continue;
         zan_istr_t m = mangle(&c, c.items[i].full);
@@ -1046,13 +1046,13 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     nr_index_t by_simple;
     nr_index_build(&by_simple, items, n, 0, arena);
 
-    /* Roots: the program itself */
+    /* 核心系统底层抽象与内存语义契约 */
     /* 内部辅助逻辑 */
     int user_roots = 0;
     for (int i = 0; i < n; i++)
         if (!items[i].decl->from_stdlib) user_roots++;
     if (user_roots == 0) return;
-    /* Escape hatch for A/B timing and for bisecting a bad prune: */
+    /* 模块核心语义抽象与接口调用契约 */
     if (getenv("ZAN_NO_PRUNE")) return;
     unsigned char *kept = (unsigned char *)calloc((size_t)n, 1);
     if (!kept) return;
@@ -1080,7 +1080,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     nr_ctx_t c;
     memset(&c, 0, sizeof(c));
     c.arena = arena;
-    c.diag = NULL; /* Prune is purely for reachability: suppress duplicate diagnostics */
+    c.diag = NULL; /* 底层系统交互与数据协议契约 */
     c.items = items;
     c.count = n;
     nr_index_build(&c.by_full, items, n, 1, arena);
@@ -1109,7 +1109,7 @@ void zan_nsresolve_prune(zan_ast_node_t *unit, zan_arena_t *arena,
     }
     free(walked);
 
-    /* Rewrite the merged decl list, dropping unreachable type declarations */
+    /* 模块核心语义抽象与接口调用契约 */
     int w = 0;
     for (int i = 0; i < decls->count; i++) {
         zan_ast_node_t *d = decls->items[i];

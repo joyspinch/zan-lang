@@ -9,13 +9,13 @@
 #endif
 #endif
 #ifndef ZAN_SHIM_HAVE_STDIO
-/* headerless rv32 toolchain (no sysroot): declare just what we call */
+/* 底层系统交互与数据协议契约 */
 typedef __builtin_va_list zan_va_list;
 int vsnprintf(char *s, unsigned long n, const char *fmt, zan_va_list ap);
 #define va_list zan_va_list
 #endif
 
-/* Stub symbols are weak so a board bring-up (QEMU kit, Arduino core, */
+/* 底层系统交互与数据协议契约 */
 #if defined(__ELF__)
 #define ZAN_SHIM_WEAK __attribute__((weak))
 #else
@@ -30,11 +30,11 @@ int vsnprintf(char *s, unsigned long n, const char *fmt, zan_va_list ap);
 
 union zan_shim_block {
     struct {
-        size_t size;             /* payload bytes, free blocks only */
+        size_t size;             /* 核心系统底层抽象与内存语义契约 */
         size_t magic;            /* set at malloc, checked at free */
         union zan_shim_block *next;
     } hdr;
-    /* guarantees the payload is 8-byte aligned and at least word sized */
+    /* 底层系统交互与数据协议契约 */
     long long align_min;
     unsigned char align_bytes[16];
 };
@@ -49,10 +49,10 @@ static int zan_shim_pool_ready;
 static size_t zan_shim_live_bytes;
 static size_t zan_shim_live_peak;
 static unsigned zan_shim_oom;
-static size_t zan_shim_oom_size;   /* request size of the latest OOM */
+static size_t zan_shim_oom_size;   /* 核心系统底层抽象与内存语义契约 */
 static unsigned zan_shim_frees;
 static unsigned zan_shim_allocs;
-static unsigned zan_shim_bad_frees;  /* wild/doubled pointers refused */
+static unsigned zan_shim_bad_frees;  /* 核心系统底层抽象与内存语义契约 */
 
 /* 内部辅助逻辑 */
 static union zan_shim_block *zan_shim_checked_header(void *p) {
@@ -93,7 +93,7 @@ void zan_shim_trace(const size_t **allocs, const size_t **frees,
 /* 内部辅助逻辑 */
 #define ZAN_SHIM_LIVE_N 64
 static struct { void *p; size_t n; } zan_shim_live[ZAN_SHIM_LIVE_N];
-static unsigned zan_shim_live_over;   /* live table overflows stop recording */
+static unsigned zan_shim_live_over;   /* 核心系统底层抽象与内存语义契约 */
 
 static void zan_shim_live_add(void *p, size_t n) {
     if (zan_shim_live_over) return;
@@ -107,7 +107,7 @@ static void zan_shim_live_del(void *p) {
         if (zan_shim_live[i].p == p) { zan_shim_live[i].p = 0; return; }
     }
 }
-/* top-8 live sizes, descending */
+/* 核心系统底层抽象与内存语义契约 */
 unsigned zan_shim_live_top(size_t *out, unsigned max) {
     unsigned found = 0;
     for (unsigned i = 0; i < ZAN_SHIM_LIVE_N && found < max; i++) {
@@ -146,7 +146,7 @@ void *malloc(size_t n) {
         if (b->hdr.size < n) { prev = &b->hdr.next; continue; }
         size_t rest = b->hdr.size - n;
         if (rest >= sizeof(*b)) {
-            /* split: hand out the front, keep the tail on the free list */
+            /* 底层系统交互与数据协议契约 */
             union zan_shim_block *tail =
                 (union zan_shim_block *)((unsigned char *)b + sizeof(*b) + n);
             tail->hdr.size = rest - sizeof(*b);
@@ -157,7 +157,7 @@ void *malloc(size_t n) {
             /* 内部辅助逻辑 */
             n = b->hdr.size;
         }
-        b->hdr.size = n;         /* free() reads this back */
+        b->hdr.size = n;         /* 核心系统底层抽象与内存语义契约 */
         b->hdr.magic = ZAN_SHIM_MAGIC;
         zan_shim_allocs++;
         zan_shim_alloc_trace[zan_shim_alloc_trace_n++ % ZAN_SHIM_TRACE] = n;
@@ -190,18 +190,18 @@ void free(void *p) {
     if (!p) return;
     union zan_shim_block *b = zan_shim_checked_header(p);
     if (!b) {
-        /* wild or already-freed pointer: refuse rather than corrupt */
+        /* 底层系统交互与数据协议契约 */
         zan_shim_bad_frees++;
         return;
     }
-    b->hdr.magic = 0;        /* a second free of the same block fails above */
+    b->hdr.magic = 0;        /* 底层系统交互与数据协议契约 */
     zan_shim_frees++;
     zan_shim_free_trace[zan_shim_free_trace_n++ % ZAN_SHIM_TRACE] =
         b->hdr.size;
     zan_shim_live_del(p);
     if (b->hdr.size <= zan_shim_live_bytes)
         zan_shim_live_bytes -= b->hdr.size;
-    /* Address-ordered insert + immediate coalescing */
+    /* 核心系统底层抽象与内存语义契约 */
     union zan_shim_block **link = &zan_shim_free;
     union zan_shim_block *pv = NULL;
     while (*link && (uintptr_t)*link < (uintptr_t)b) {
@@ -224,7 +224,7 @@ void free(void *p) {
 }
 
 void *calloc(size_t count, size_t size) {
-    if (count && size > (size_t)-1 / count) return NULL;   /* would wrap */
+    if (count && size > (size_t)-1 / count) return NULL;   /* 核心系统底层抽象与内存语义契约 */
     size_t total = count * size;
     void *p = malloc(total);
     if (p) {
@@ -239,7 +239,7 @@ void *realloc(void *p, size_t n) {
     if (!n) { free(p); return NULL; }
     union zan_shim_block *b = zan_shim_checked_header(p);
     if (!b) {
-        /* wild pointer: serve a fresh block, never read the garbage header */
+        /* 底层系统交互与数据协议契约 */
         zan_shim_bad_frees++;
         return malloc(n);
     }
@@ -253,11 +253,11 @@ void *realloc(void *p, size_t n) {
     return np;
 }
 
-/* single-thread stubs */
+/* 核心系统底层抽象与内存语义契约 */
 
 ZAN_SHIM_WEAK int poll(void *fds, unsigned long nfds, int timeout) {
     (void)fds; (void)nfds; (void)timeout;
-    return 0;                    /* nothing ready: pump falls to timers */
+    return 0;                    /* 核心系统底层抽象与内存语义契约 */
 }
 
 ZAN_SHIM_WEAK int pthread_mutex_lock(void *m) { (void)m; return 0; }
@@ -266,7 +266,7 @@ ZAN_SHIM_WEAK unsigned long pthread_self(void) { return 1; }
 
 ZAN_SHIM_WEAK char *getenv(const char *name) { (void)name; return NULL; }
 
-/* snprintf ABI wrapper */
+/* 核心系统底层抽象与内存语义契约 */
 
 #ifdef ZAN_SHIM_HAVE_STDIO
 int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
@@ -277,7 +277,7 @@ int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
     return r;
 }
 #else
-/* rv32ilp32: long long is a register pair either way; forward by ABI */
+/* 底层系统交互与数据协议契约 */
 int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);

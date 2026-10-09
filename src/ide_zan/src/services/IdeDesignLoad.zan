@@ -1,0 +1,629 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Designer;
+using Game.Scene;
+
+class IdeDesignWork {
+    bool saving;
+    int workspace;
+    List<TabRecord> tabSet;
+    TabRecord tab;
+    string path;
+    TaskCompletionSource<bool> drained = new TaskCompletionSource<bool>();
+    TaskCompletionSource<bool> pauseReady = new TaskCompletionSource<bool>();
+    AtomicInt cancelled = new AtomicInt(0);
+}
+
+/// 文件写入许可与导航暂停共享同一把锁；每个等待者独享完成源。
+class IdeDesignWriteGate {
+    nint sync = Mutex.Create();
+    bool paused;
+    int writing;
+    List<TaskCompletionSource<bool>> writers = new List<TaskCompletionSource<bool>>();
+    List<TaskCompletionSource<bool>> pauses = new List<TaskCompletionSource<bool>>();
+
+    async void EnterAsync() {
+        while (true) {
+            TaskCompletionSource<bool> ready = null;
+            Mutex.Lock(sync);
+            if (!paused) { writing = writing + 1; }
+            else { ready = new TaskCompletionSource<bool>(); writers.Add(ready); }
+            Mutex.Unlock(sync);
+            if (ready == null) { return; }
+            await ready.Task;
+        }
+    }
+
+    void Leave() {
+        List<TaskCompletionSource<bool>> ready = null;
+        Mutex.Lock(sync);
+        writing = writing - 1;
+        if (writing == 0) { ready = pauses; pauses = new List<TaskCompletionSource<bool>>(); }
+        Mutex.Unlock(sync);
+        if (ready != null) {
+            for (int i = 0; i < ready.Count; i = i + 1) { ready[i].TrySetResult(true); }
+        }
+    }
+
+    TaskCompletionSource<bool> Pause() {
+        TaskCompletionSource<bool> ready = new TaskCompletionSource<bool>();
+        Mutex.Lock(sync);
+        paused = true;
+        bool idle = writing == 0;
+        if (!idle) { pauses.Add(ready); }
+        Mutex.Unlock(sync);
+        if (idle) { ready.TrySetResult(true); }
+        return ready;
+    }
+
+    void Resume() {
+        Mutex.Lock(sync);
+        paused = false;
+        List<TaskCompletionSource<bool>> ready = writers;
+        writers = new List<TaskCompletionSource<bool>>();
+        Mutex.Unlock(sync);
+        for (int i = 0; i < ready.Count; i = i + 1) { ready[i].TrySetResult(true); }
+    }
+
+    ~IdeDesignWriteGate() { Mutex.Destroy(sync); }
+}
+
+/// UI 身份与版本；后台只读取另行捕获的值与独立模型。
+class IdeDesignDocument {
+    TabRecord tab;
+    List<TabRecord> tabSet;
+    int workspace;
+    string project;
+    string path;
+    string body;
+    int revision;
+    DesignerDocumentSnapshot form;
+    SceneDoc scene;
+    IdeDesignSave tail;
+}
+
+class IdeDesignLoad {
+    IdeDesignWork work;
+    IdeDesignDocument document;
+    int sequence;
+    int revision;
+    int mode; // 1 form, 2 scene, 3 formCode
+    string path;
+    string body;
+    string project;
+    bool html;
+    CodeEditorTextLoad textRequest;
+}
+
+/// 不可变保存输入；diskPath/diskText 在 drained 发布后只读。
+class IdeDesignSave {
+    IdeDesignWork work = new IdeDesignWork();
+    IdeDesignSave previous;
+    // 单一后继与关闭排空各有完成源；Gate 的一次 Signal 只唤醒一个等待者。
+    TaskCompletionSource<bool> successorReady = new TaskCompletionSource<bool>();
+    DesignerDocumentSnapshot form;
+    SceneDoc scene;
+    string path;
+    string sourceText;
+    string project;
+    string componentName;
+    int revision;
+    bool html;
+    bool upgrade;
+    string diskPath;
+    string diskText;
+    string text;
+    string componentPath = "";
+    string failure = "";
+    bool wrote;
+    bool migrated;
+    bool migrationConflict;
+    List<UserComponent> components;
+    LspSession session;
+}
+
+class IdeDesignSaveResult {
+    IdeDesignDocument document;
+    IdeDesignSave save;
+}
+
+partial class ZanIDE {
+    List<IdeDesignDocument> designDocuments = new List<IdeDesignDocument>();
+    List<IdeDesignWork> designWorkers = new List<IdeDesignWork>();
+    IdeDesignWriteGate designWriteGate = new IdeDesignWriteGate();
+    List<IdeDesignSaveResult> deferredDesignSaves = new List<IdeDesignSaveResult>();
+    IdeDesignDocument displayedForm;
+    IdeDesignDocument displayedScene;
+    IdeDesignDocument displayedFormCode;
+    IdeDesignLoad designLoad;
+    int designLoadSequence;
+    bool designStopping;
+    bool designCaptureQueued;
+    bool designWritesPausing;
+    IdeDesignWork designPauseWork;
+
+    IdeDesignWork TrackDesignWork() {
+        IdeDesignWork work = new IdeDesignWork();
+        designWorkers.Add(work);
+        return work;
+    }
+
+    bool DesignDocumentCurrent(IdeDesignDocument document) {
+        return !shuttingDown && this.DesignDocumentPresent(document);
+    }
+
+    bool DesignDocumentPresent(IdeDesignDocument document) {
+        if (document == null || document.workspace != documentWorkspace
+            || document.tabSet != tabs || document.project != root) { return false; }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (tabs[i] == document.tab && tabs[i].path == document.path) { return true; }
+        }
+        return false;
+    }
+
+    int DesignViewMode(TabRecord tab) {
+        bool scene = ZanIDE.IsScenePath(tab.path);
+        bool form = tab.designDoc || ZanIDE.IsFormPath(tab.path);
+        if (!scene && !form) { return 0; }
+        if (codeViewForm == tab.path) { return 3; }
+        return scene ? 2 : 1;
+    }
+
+    IdeDesignDocument DesignDocumentFor(TabRecord tab) {
+        for (int i = 0; i < designDocuments.Count; i = i + 1) {
+            IdeDesignDocument d = designDocuments[i];
+            if (d.workspace == documentWorkspace && d.tabSet == tabs && d.tab == tab
+                && d.path == tab.path && d.project == root) { return d; }
+        }
+        IdeDesignDocument document = new IdeDesignDocument();
+        document.tab = tab; document.tabSet = tabs; document.workspace = documentWorkspace;
+        document.project = root; document.path = tab.path; document.body = tab.body;
+        designDocuments.Add(document);
+        return document;
+    }
+
+    /// FrameTick 调用；绘制不推进读取、解析、序列化或文件写入。
+    void UpdateDesignDocument() {
+        if (designStopping || shuttingDown) { return; }
+        bool leased = this.CodeNavigationBusy() || designWritesPausing;
+        for (int i = 0; i < designWorkers.Count; i = i + 1) {
+            IdeDesignWork work = designWorkers[i];
+            if (!work.saving && work.tab != null && !work.drained.IsCompleted) {
+                bool current = work.workspace == documentWorkspace && work.tabSet == tabs;
+                bool present = false;
+                for (int k = 0; current && k < tabs.Count; k = k + 1) {
+                    if (tabs[k] == work.tab) { present = true; break; }
+                }
+                if (!present) { work.cancelled.Store(1); }
+            }
+        }
+        for (int i = designWorkers.Count - 1; i >= 0; i = i - 1) {
+            if (designWorkers[i].drained.IsCompleted) { designWorkers.RemoveAt(i); }
+        }
+        if (leased) {
+            if (designLoad != null) { designLoad.work.cancelled.Store(1); designLoad = null; }
+            return;
+        }
+        for (int i = 0; i < deferredDesignSaves.Count; i = i + 1) {
+            IdeDesignSaveResult result = deferredDesignSaves[i];
+            this.CompleteDesignSave(result.document, result.save);
+        }
+        deferredDesignSaves = new List<IdeDesignSaveResult>();
+        // 捕获上一视图的最后一次事件编辑，再允许新文档替换单例设计器。
+        this.CaptureDesignEdits();
+        int active = activeTab.Get();
+        if (active < 0 || active >= tabs.Count) { this.CancelDesignLoad(); return; }
+        TabRecord tab = tabs[active];
+        int mode = this.DesignViewMode(tab);
+        if (mode == 0) { this.CancelDesignLoad(); return; }
+        IdeDesignDocument document = this.DesignDocumentFor(tab);
+        if (document.body != tab.body) { this.InvalidateLoadedDocument(tab.path); document.body = tab.body; }
+        bool installed = mode == 1 ? displayedForm == document && loadedFormPath == tab.path
+            : mode == 2 ? displayedScene == document && loadedScenePath == tab.path
+            : displayedFormCode == document && formCodeLoaded == tab.path;
+        if (installed) { return; }
+        if (designLoad != null && designLoad.document == document && designLoad.mode == mode
+            && designLoad.body == tab.body && designLoad.revision == document.revision) { return; }
+        this.BeginDesignLoad(document, mode);
+    }
+
+    void CancelDesignLoad() {
+        if (designLoad != null) { designLoad.work.cancelled.Store(1); }
+        designLoad = null;
+        designLoadSequence = designLoadSequence + 1;
+    }
+
+    bool DesignLoadCurrent(IdeDesignLoad request) {
+        if (designStopping || designLoad != request || request.sequence != designLoadSequence
+            || request.work.cancelled.Load() != 0 || this.CodeNavigationBusy() || designWritesPausing
+            || !this.DesignDocumentCurrent(request.document)) { return false; }
+        int active = activeTab.Get();
+        return active >= 0 && active < tabs.Count && tabs[active] == request.document.tab
+            && request.path == tabs[active].path && request.body == tabs[active].body
+            && request.revision == request.document.revision && this.DesignViewMode(tabs[active]) == request.mode;
+    }
+
+    static List<UserComponent> ReadDesignComponents(string project) {
+        List<UserComponent> result = new List<UserComponent>();
+        string directory = project + "/components";
+        List<string> names = DirectoryTree.Names(directory, PathFilter.Only(".zcomp"));
+        for (int i = 0; i < names.Count; i = i + 1) {
+            string name = names[i];
+            result.Add(new UserComponent(name.Substring(0, name.Length - 6), File.ReadAllText(directory + "/" + name)));
+        }
+        return result;
+    }
+
+    void BeginDesignLoad(IdeDesignDocument document, int mode) {
+        this.CancelDesignLoad();
+        IdeDesignLoad request = new IdeDesignLoad();
+        request.work = this.TrackDesignWork(); request.document = document;
+        request.work.workspace = document.workspace; request.work.tabSet = document.tabSet;
+        request.work.tab = document.tab; request.work.path = document.path;
+        request.sequence = designLoadSequence; request.revision = document.revision; request.mode = mode;
+        request.path = document.path; request.body = document.tab.body; request.project = document.project;
+        request.html = document.tab.designDoc;
+        designLoad = request;
+        // 后台闭包只读取这些值与独立快照，不解引用 request.document/tab/Designer。
+        string path = request.path; string body = request.body; string project = request.project;
+        bool html = request.html;
+        bool scene = ZanIDE.IsScenePath(path);
+        DesignerDocumentSnapshot options = mode == 1 ? formDesigner.CaptureDocumentOptions() : null;
+        DesignerDocumentSnapshot localForm = document.form;
+        SceneDoc localScene = document.scene;
+        IdeDesignWork work = request.work;
+        if (mode == 3) { request.textRequest = formCodeEd.BeginTextLoad(path, CodeEditor.LangForName(path)); }
+        App host = app;
+        Task.Run(delegate () {
+            try {
+                if (work.cancelled.Load() != 0) { return; }
+                DesignerDocumentSnapshot form = null; DesignerDocumentSnapshot formBaseline = null;
+                ScenePreparedDocument sceneDocument = null; SceneDoc sceneBaseline = null;
+                CodeEditorPreparedText code = null;
+                List<UserComponent> components = null; List<string> bindVars = null;
+                string failure = "";
+                try {
+                    if (mode == 1) {
+                        if (localForm != null) { form = localForm.Copy(); }
+                        else {
+                            string json = html ? DesignerHtml.ToJsonDoc(body)
+                                : ZanIDE.LooksLikeJson(body) ? body : ZanIDE.LegacyFormToJson(ZanIDE.FormBaseName(path), body);
+                            form = Designer.PrepareJson(json, options);
+                        }
+                        formBaseline = form.Copy();
+                        components = ZanIDE.ReadDesignComponents(project);
+                        string codeBehind = ZanIDE.CodeBehindPath(path);
+                        bindVars = File.Exists(codeBehind) ? ZanIDE.ScanBindVars(File.ReadAllText(codeBehind)) : new List<string>();
+                    } else if (mode == 2) {
+                        sceneDocument = localScene != null ? new ScenePreparedDocument()
+                            : ZanIDE.LooksLikeJson(body) ? SceneDesigner.PrepareJson(body) : new ScenePreparedDocument();
+                        if (localScene != null) { sceneDocument.document = localScene.CaptureSnapshot(); }
+                        else if (!ZanIDE.LooksLikeJson(body)) { sceneDocument.document = new SceneDoc(ZanIDE.SceneBaseName(path), 1280, 720); }
+                        sceneBaseline = sceneDocument.document.CaptureSnapshot();
+                    } else {
+                        string text = localForm != null ? (html ? localForm.ToHtml() : localForm.ToJson())
+                            : localScene != null ? localScene.ToJson() : body;
+                        if (scene) { text = ZanIDE.GenSceneFile(ZanIDE.SceneBaseName(path), SceneDoc.Parse(text)); }
+                        code = CodeEditor.PrepareText(text);
+                    }
+                } catch (Exception error) {
+                    // 准备阶段失败在 UI 报告；不得让后台任务无声消失。
+                    failure = error.Message;
+                }
+                if (work.cancelled.Load() != 0) { return; }
+                host.Post(delegate () {
+                    if (!this.DesignLoadCurrent(request)) {
+                        if (designLoad == request) { designLoad = null; }
+                        return;
+                    }
+                    designLoad = null;
+                    if (failure != "") { log.Add("> Design load: " + failure); host.RequestRedraw(); return; }
+                    if (mode == 1) {
+                        if (!formDesigner.ApplyPreparedDocument(form)) { return; }
+                        document.form = form.loadError ? null : formBaseline;
+                        formDesigner.SetUserComponents(components); formDesigner.SetBindVars(bindVars);
+                        displayedForm = document; loadedFormPath = path; formCache = body;
+                        if (formDesigner.loadError) { log.Add("> Malformed design, opened blank: " + path + " (" + form.lastError + ")"); }
+                        else if (!html && (path.EndsWith(".json") || path.EndsWith(".zform"))) {
+                            this.QueueDesignSave(document, formBaseline, null, "", true);
+                        }
+                    } else if (mode == 2) {
+                        if (!sceneDesigner.ApplyPreparedDocument(sceneDocument)) { return; }
+                        document.scene = sceneDocument.loadError ? null : sceneBaseline;
+                        displayedScene = document; loadedScenePath = path; sceneCache = body;
+                        SceneDesigner.assetsDir = ZanIDE.AssetsDir(project);
+                        if (sceneDesigner.loadError) { log.Add("> Malformed scene, opened blank: " + path + " (" + sceneDocument.lastError + ")"); }
+                    } else {
+                        if (!formCodeEd.ApplyPreparedText(request.textRequest, code)) { return; }
+                        displayedFormCode = document; formCodeLoaded = path;
+                    }
+                    host.RequestRedraw();
+                });
+            } finally {
+                // 关闭等待此屏障，与 UI 消息泵是否还处理 Post 无关。
+                work.drained.TrySetResult(true);
+            }
+        });
+    }
+
+    bool FormDesignReady() {
+        int active = activeTab.Get();
+        return !designStopping && !designWritesPausing && !this.CodeNavigationBusy() && active >= 0 && active < tabs.Count
+            && this.DesignDocumentCurrent(displayedForm) && displayedForm.tab == tabs[active]
+            && loadedFormPath == tabs[active].path && displayedForm.body == tabs[active].body;
+    }
+
+    bool SceneDesignReady() {
+        int active = activeTab.Get();
+        return !designStopping && !designWritesPausing && !this.CodeNavigationBusy() && active >= 0 && active < tabs.Count
+            && this.DesignDocumentCurrent(displayedScene) && displayedScene.tab == tabs[active]
+            && loadedScenePath == tabs[active].path && displayedScene.body == tabs[active].body;
+    }
+
+    bool DesignCodeReady() {
+        int active = activeTab.Get();
+        return !designStopping && !designWritesPausing && !this.CodeNavigationBusy() && active >= 0 && active < tabs.Count
+            && this.DesignDocumentCurrent(displayedFormCode) && displayedFormCode.tab == tabs[active]
+            && formCodeLoaded == tabs[active].path && displayedFormCode.body == tabs[active].body;
+    }
+
+    /// 即时控件事件在 Render 内分发；Post 在事件末尾捕获模型，不在绘制里做保存工作。
+    void QueueDesignCapture() {
+        if (designCaptureQueued || designStopping || designWritesPausing || this.CodeNavigationBusy()) { return; }
+        designCaptureQueued = true;
+        app.Post(delegate () {
+            designCaptureQueued = false;
+            if (!designStopping && !shuttingDown && !this.CodeNavigationBusy()) { this.CaptureDesignEdits(); }
+        });
+    }
+
+    void CaptureDesignEdits() {
+        if (navigationCommitBusy || designWritesPausing) { return; }
+        if (this.DesignDocumentPresent(displayedForm) && displayedForm.body == displayedForm.tab.body
+            && loadedFormPath == displayedForm.path && !formDesigner.loadError) {
+            string component = "";
+            if (formDesigner.ConsumeSaveComponent()) {
+                component = ZanIDE.SanitizeName(formDesigner.FormNameText());
+                if (component == "") { component = ZanIDE.FormBaseName(displayedForm.path); }
+            }
+            if (component != "" || !formDesigner.DocumentMatchesSnapshot(displayedForm.form)) {
+                DesignerDocumentSnapshot snapshot = formDesigner.CaptureDocumentSnapshot();
+                displayedForm.form = snapshot;
+                this.QueueDesignSave(displayedForm, snapshot, null, component, false);
+            }
+            string openComponent = formDesigner.ConsumeOpenComponent();
+            if (openComponent != "" && !designStopping) {
+                this.OpenDocumentAsync(displayedForm.project + "/components/" + openComponent + ".zcomp", openComponent);
+            }
+        }
+        if (this.DesignDocumentPresent(displayedScene) && displayedScene.body == displayedScene.tab.body
+            && loadedScenePath == displayedScene.path && !sceneDesigner.loadError
+            && !sceneDesigner.DocumentMatchesSnapshot(displayedScene.scene)) {
+            SceneDoc snapshot = sceneDesigner.CaptureDocumentSnapshot();
+            displayedScene.scene = snapshot;
+            this.QueueDesignSave(displayedScene, null, snapshot, "", false);
+        }
+    }
+
+    void QueueDesignSave(IdeDesignDocument document, DesignerDocumentSnapshot form, SceneDoc scene,
+                         string componentName, bool upgrade) {
+        if (designStopping || navigationCommitBusy || designWritesPausing) { return; }
+        document.revision = document.revision + 1;
+        IdeDesignSave save = new IdeDesignSave();
+        save.previous = document.tail; save.form = form; save.scene = scene;
+        save.path = document.path; save.sourceText = document.tab.body; save.project = document.project;
+        save.componentName = componentName; save.html = document.tab.designDoc;
+        save.upgrade = upgrade || !save.html && (save.path.EndsWith(".json") || save.path.EndsWith(".zform"));
+        save.revision = document.revision; save.session = lspSess;
+        save.work.saving = true; save.work.workspace = document.workspace;
+        save.work.tabSet = document.tabSet; save.work.tab = document.tab; save.work.path = document.path;
+        // 同一文档串行写盘；中间快照可合并，组件导出请求必须各自保留。
+        if (save.previous != null && save.previous.componentName == "") { save.previous.work.cancelled.Store(1); }
+        document.tail = save; designWorkers.Add(save.work);
+        displayedFormCode = null; formCodeLoaded = "";
+        App host = app;
+        Task.Run(this.RunDesignSave(document, save, host, designWriteGate));
+    }
+
+    async void RunDesignSave(IdeDesignDocument document, IdeDesignSave save, App host, IdeDesignWriteGate writer) {
+        IdeDesignWork work = save.work;
+        try {
+            IdeDesignSave previous = save.previous;
+            if (previous != null) { await previous.successorReady.Task; }
+            save.diskPath = previous == null ? save.path : previous.diskPath;
+            save.diskText = previous == null ? save.sourceText : previous.diskText;
+            save.previous = null;
+            previous = null;
+            if (work.cancelled.Load() != 0) { return; }
+            await writer.EnterAsync();
+            try {
+                ZanIDE.WriteDesignSnapshot(save);
+                host.Post(delegate () { this.CompleteDesignSave(document, save); });
+            } finally {
+                // 保存回调先入队，导航暂停的后续回调才可发布。
+                writer.Leave();
+            }
+        } finally {
+            save.successorReady.TrySetResult(true);
+            work.pauseReady.TrySetResult(true);
+            work.drained.TrySetResult(true);
+        }
+    }
+
+    /// worker 入口，只消费独立快照；前驱结果经完成屏障发布后才能读取。
+    static void WriteDesignSnapshot(IdeDesignSave save) {
+        if (save.diskPath == null || save.diskPath == "") { save.diskPath = save.path; save.diskText = save.sourceText; }
+        if (save.work.cancelled.Load() != 0) { return; }
+        try {
+            save.text = save.form != null ? (save.html || save.diskPath.EndsWith(".html")
+                ? save.form.ToHtml() : save.form.ToJson()) : save.scene.ToJson();
+            if (save.work.cancelled.Load() != 0) { return; }
+            if (save.upgrade && !save.diskPath.EndsWith(".html")) {
+                int suffix = save.diskPath.EndsWith(".zform") ? 6 : 5;
+                string htmlPath = save.diskPath.Substring(0, save.diskPath.Length - suffix) + ".html";
+                if (!File.Exists(htmlPath)) {
+                    string html = save.form.ToHtml();
+                    if (File.Exists(save.diskPath) && File.ReadAllText(save.diskPath) != save.diskText) {
+                        throw new IOException("Design changed on disk: " + save.diskPath);
+                    }
+                    File.WriteAllText(htmlPath, html);
+                    if (File.ReadAllText(htmlPath) != html) { throw new IOException("Could not verify " + htmlPath); }
+                    File.Delete(save.diskPath);
+                    save.diskPath = htmlPath; save.text = html; save.migrated = true; save.wrote = true;
+                } else { save.migrationConflict = true; }
+            }
+            if (save.text != save.diskText || save.migrated) {
+                if (!save.migrated) {
+                    if (File.Exists(save.diskPath) && File.ReadAllText(save.diskPath) != save.diskText) {
+                        throw new IOException("Design changed on disk: " + save.diskPath);
+                    }
+                    File.WriteAllText(save.diskPath, save.text);
+                    if (File.ReadAllText(save.diskPath) != save.text) { throw new IOException("Could not verify " + save.diskPath); }
+                }
+                save.diskText = save.text; save.wrote = true;
+                string codeBehind = save.scene != null ? ZanIDE.SceneCodeBehindPath(save.diskPath) : ZanIDE.CodeBehindPath(save.diskPath);
+                if (!File.Exists(codeBehind)) {
+                    string shell = save.scene != null ? ZanIDE.GenSceneBusinessShell(ZanIDE.SceneBaseName(save.diskPath))
+                        : ZanIDE.GenBusinessShell(ZanIDE.FormBaseName(save.diskPath));
+                    File.WriteAllText(codeBehind, shell);
+                }
+                if (save.session != null && save.session.Alive()) { save.session.SyncDoc(save.diskPath, save.text); }
+            }
+            if (save.componentName != "") {
+                string directory = save.project + "/components";
+                Directory.CreateDirectoryRecursive(directory);
+                save.componentPath = directory + "/" + save.componentName + ".zcomp";
+                File.WriteAllText(save.componentPath, save.form.ToJson());
+                save.components = ZanIDE.ReadDesignComponents(save.project);
+            }
+        } catch (Exception error) {
+            // 文件边界报告明确失败，源文档与后续独立快照仍可继续重试。
+            save.failure = error.Message;
+        }
+    }
+
+    void CompleteDesignSave(IdeDesignDocument document, IdeDesignSave save) {
+        if (!this.DesignDocumentCurrent(document) || designStopping) { return; }
+        if (navigationCommitBusy) {
+            IdeDesignSaveResult pending = new IdeDesignSaveResult(); pending.document = document; pending.save = save;
+            deferredDesignSaves.Add(pending); return;
+        }
+        if (save.failure != "") { log.Add("> Design save: " + save.failure); app.RequestRedraw(); return; }
+        if (save.componentPath != "") {
+            log.Add("> Saved component -> " + save.componentPath + ".");
+            if (displayedForm == document && save.components != null) { formDesigner.SetUserComponents(save.components); }
+        }
+        if (document.revision != save.revision || save.work.cancelled.Load() != 0
+            || document.tab.body != save.sourceText) { return; }
+        if (save.migrationConflict) { log.Add("> Legacy form kept as-is: HTML target already exists."); }
+        if (save.diskPath != document.path) {
+            string oldPath = document.path;
+            document.path = save.diskPath; document.tab.path = save.diskPath;
+            document.tab.name = Path.GetFileName(save.diskPath); document.tab.designDoc = true;
+            if (loadedFormPath == oldPath) { loadedFormPath = save.diskPath; }
+            if (codeViewForm == oldPath) { codeViewForm = save.diskPath; }
+            log.Add("> legacy form upgraded -> " + save.diskPath);
+            rescan = true;
+        }
+        if (save.text != null) { document.body = save.text; document.tab.body = save.text; }
+        if (displayedForm == document) { formCache = document.body; }
+        if (displayedScene == document) { sceneCache = document.body; }
+        displayedFormCode = null; formCodeLoaded = "";
+        app.RequestRedraw();
+    }
+
+    /// CodeNav 已替换 tab.body 后调用；只失效凭据，下次 FrameTick 后台重载。
+    void InvalidateLoadedDocument(string path) {
+        if (loadedFormPath == path) { loadedFormPath = ""; displayedForm = null; }
+        if (loadedScenePath == path) { loadedScenePath = ""; displayedScene = null; }
+        if (formCodeLoaded == path) { formCodeLoaded = ""; displayedFormCode = null; }
+        if (designLoad != null && designLoad.path == path) { this.CancelDesignLoad(); }
+        for (int i = 0; i < designDocuments.Count; i = i + 1) {
+            IdeDesignDocument document = designDocuments[i];
+            if (document.workspace != documentWorkspace || document.tabSet != tabs || document.path != path) { continue; }
+            document.revision = document.revision + 1;
+            document.form = null; document.scene = null; document.body = document.tab.body;
+            for (int k = 0; k < designWorkers.Count; k = k + 1) {
+                IdeDesignWork work = designWorkers[k];
+                if (work.workspace == document.workspace && work.tabSet == document.tabSet && work.tab == document.tab) {
+                    work.cancelled.Store(1);
+                }
+            }
+            document.tail = null;
+        }
+        // 普通代码标签仍交给主侧的 prepared text 绑定服务。
+        if (editor.documentPath == path) { lastActive = -1; bindingCodeTab = null; }
+    }
+
+    int DesignDocumentRevision() {
+        int active = activeTab.Get();
+        if (active < 0 || active >= tabs.Count) { return 0; }
+        TabRecord tab = tabs[active];
+        if (displayedScene != null && displayedScene.tab == tab) { return displayedScene.revision; }
+        if (displayedForm != null && displayedForm.tab == tab) { return displayedForm.revision; }
+        if (displayedFormCode != null && displayedFormCode.tab == tab) { return displayedFormCode.revision; }
+        return 0;
+    }
+
+    /// waiting 冻结输入但允许保存回填；全部既有队列排空后才能建立磁盘租约。
+    void PauseDesignWritesThen(Action continuation) {
+        if (designStopping || shuttingDown) { return; }
+        this.CaptureDesignEdits();
+        designWritesPausing = true;
+        IdeDesignWork work = this.TrackDesignWork();
+        designPauseWork = work;
+        List<IdeDesignWork> pending = new List<IdeDesignWork>();
+        for (int i = 0; i < designWorkers.Count; i = i + 1) {
+            if (designWorkers[i].saving) { pending.Add(designWorkers[i]); }
+        }
+        Task.Run(this.WaitDesignPauseAsync(pending, continuation, app, work));
+    }
+
+    async void WaitDesignPauseAsync(List<IdeDesignWork> pending, Action continuation, App host, IdeDesignWork work) {
+        try {
+            for (int i = 0; i < pending.Count; i = i + 1) { await pending[i].pauseReady.Task; }
+            host.Post(delegate () {
+                if (designStopping || shuttingDown || designPauseWork != work || work.cancelled.Load() != 0) { return; }
+                // 新保存已在 UI 冻结，旧写入及其回填先于此回调完成。
+                designWriteGate.Pause();
+                continuation();
+            });
+        } finally {
+            work.drained.TrySetResult(true);
+        }
+    }
+
+    void ResumeDesignWrites() {
+        if (designPauseWork != null) { designPauseWork.cancelled.Store(1); designPauseWork = null; }
+        designWritesPausing = false;
+        designWriteGate.Resume();
+    }
+
+    void CancelDesignWork() {
+        if (designStopping) { return; }
+        // 可在 shuttingDown 已置位后捕获；不得丢掉最后一个 UI 事件的编辑。
+        this.CaptureDesignEdits();
+        this.CancelDesignLoad();
+        designStopping = true;
+        for (int i = 0; i < designWorkers.Count; i = i + 1) {
+            IdeDesignWork work = designWorkers[i];
+            if (!work.saving) { work.cancelled.Store(1); }
+        }
+    }
+
+    /// 主侧先排空/结束导航磁盘事务，再调用此方法放行最后的独立保存快照。
+    async void DrainDesignWorkAsync() {
+        this.ResumeDesignWrites();
+        for (int i = 0; i < designWorkers.Count; i = i + 1) {
+            IdeDesignWork work = designWorkers[i];
+            await work.drained.Task;
+        }
+        designWorkers = new List<IdeDesignWork>();
+        deferredDesignSaves = new List<IdeDesignSaveResult>();
+    }
+}

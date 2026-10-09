@@ -1,8 +1,8 @@
-/* Generic embedded-resource read API */
+/* 核心系统底层抽象与内存语义契约 */
 #include <string.h>
 #include <stdlib.h>
 
-#include "rt_timer.h"   /* ZAN_OOM_TO_RUNTIME: OOM joins the zan_rt_fatal funnel */
+#include "rt_timer.h"   /* 底层系统交互与数据协议契约 */
 
 #include "../common/host_oom.h"
 
@@ -15,7 +15,7 @@ typedef struct {
 static const zan_embed_ent* g_tab = 0;
 static long long            g_cnt = 0;
 
-/* Called by the generated data object's constructor. */
+/* 底层系统交互与数据协议契约 */
 void zan_embed_register(const zan_embed_ent* tbl, long long n) {
     g_tab = tbl;
     g_cnt = n;
@@ -30,7 +30,7 @@ static const zan_embed_ent* zan_embed_find(const char* name) {
     return 0;
 }
 
-/* NUL-terminated payload (text resources); "" when absent. */
+/* 底层系统交互与数据协议契约 */
 const char* zan_embed_read(const char* name) {
     const zan_embed_ent* e = zan_embed_find(name);
     return e ? (const char*)e->data : "";
@@ -40,7 +40,7 @@ int zan_embed_has(const char* name) {
     return zan_embed_find(name) ? 1 : 0;
 }
 
-/* Raw pointer + length (binary resources such as driver blobs / images) */
+/* 底层系统交互与数据协议契约 */
 const unsigned char* zan_embed_bytes(const char* name, int* outLen) {
     const zan_embed_ent* e = zan_embed_find(name);
     if (!e) { if (outLen) *outLen = 0; return 0; }
@@ -48,7 +48,7 @@ const unsigned char* zan_embed_bytes(const char* name, int* outLen) {
     return e->data;
 }
 
-/* '\n'-joined names carrying the given prefix (for enumeration) */
+/* 底层系统交互与数据协议契约 */
 const char* zan_embed_list(const char* prefix) {
     static char* buf = 0;
     static size_t cap = 0;

@@ -1,132 +1,59 @@
-/* zan_abi.h - object-model ABI shared by the compiler's emitted code
- * (src/compiler/irgen*.c) and the runtime allocator (src/runtime/rt_mem.c).
- *
- * Every heap object -- class instance, string, or array -- is a 16-byte
- * header followed by the payload, and the pointer a program holds points at
- * the payload so it can be handed to C unchanged:
- *
- *   obj - 16: i64 first header word -- refcount (classes/strings), or the
- *             element count (arrays)
- *   obj -  8: i64 second header word -- leak-site index, or
- *             ZAN_STRING_MAGIC on strings / ZAN_ARRAY_MAGIC on arrays
- *   obj +  0: user data
- *
- * These numbers are the ONLY layout facts shared across the two sides: the
- * compiler emits the header writes/reads inline as LLVM IR, the allocator
- * only has to keep payloads 16-byte aligned (its own 16-byte header, see
- * ZAN_MEM_HDR in rt_mem.c, is asserted against ZAN_OBJ_HDR_SIZE). Keep them
- * in sync here, never restate them as literals at call sites.
- *
- * Section 2 holds the exception-handling ABI, which is private to the code
- * the compiler emits (no runtime counterpart today) but kept here so the
- * whole generated-code object model lives in one place. */
+/* zan_abi */
 
 #ifndef ZAN_ABI_H
 #define ZAN_ABI_H
 
 #include <stdint.h>
 
-/* ---- 1. runtime-visible object ABI ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Size of the header in front of every object's payload. */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_OBJ_HDR_SIZE  16
 
-/* First header word: i64 refcount for RC-managed objects, element count for
- * arrays (see zan_array_alloc/zan_array_len). */
+/* 内部辅助逻辑 */
 #define ZAN_OBJ_RC_OFF    (-16)
 
-/* Second header word: i64 leak-site index (or the tag/length pair below on
- * strings). Tolerant retain/release probe this slot to tell a managed string
- * from a bare buffer before touching the refcount. */
+/* 内部辅助逻辑 */
 #define ZAN_OBJ_SITE_OFF  (-8)
 
-/* String RC header magic and sentinel refcount. The second header word
- * doubles as a guard for tolerant retain/release. */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_STRING_MAGIC       UINT64_C(0x5a414e5354524d47) /* "ZANSTRMG" */
 #define ZAN_STRING_SENTINEL_RC UINT64_C(0xffffffffffffffff)
 
-/* On strings the second header word is split: the high 32 bits keep the tag
- * that identifies a managed string, the low 32 bits cache its byte length so
- * `.Length` and every bounds check are O(1) instead of a strlen walk (an
- * index-per-character loop over an n-byte string was O(n^2)).
- *
- *   str - 8: [ u32 ZAN_STRING_TAG | u32 byte length ]
- *
- * ZAN_STR_LEN_UNKNOWN is the length half of the historical ZAN_STRING_MAGIC,
- * so a freshly allocated string still reads as "not measured yet" and the
- * value written by every producer that only knows a capacity stays valid.
- * Readers fall back to strlen for it and cache the result back into the word
- * (only when the refcount is not the literal sentinel, i.e. the header is
- * writable). A length that happens to equal ZAN_STR_LEN_UNKNOWN (~1.4 GB)
- * simply keeps measuring by strlen; lengths above 4 GB-1 are not cacheable
- * either and are left unknown. */
+/* 内部辅助逻辑 */
 #define ZAN_STRING_TAG         UINT64_C(0x5a414e53)         /* "ZANS" */
 #define ZAN_STR_LEN_UNKNOWN    UINT64_C(0x54524d47)         /* "TRMG" */
 #define ZAN_STR_LEN_MASK       UINT64_C(0xffffffff)
 #define ZAN_STR_HDR_WORD(len)  (((ZAN_STRING_TAG) << 32) | \
                                 ((uint64_t)(len) & ZAN_STR_LEN_MASK))
 
-/* Array header magic, in the same slot (arrays keep their element count in the
- * first word and take no leak-site index). It is what tells a byte[] apart
- * from a bare `char*` an extern handed back: both reach code typed `string`
- * with no string magic, but only the array actually has a count word in front
- * of its payload. Rectangular arrays (`int[,]`) spend this word on their rank
- * instead, so they are not classifiable this way -- they never reach a
- * `string`. */
+/* 内部辅助逻辑 */
 #define ZAN_ARRAY_MAGIC        UINT64_C(0x5a414e4152524159) /* "ZANARRAY" */
 
-/* Arrays prepend two further words to that pair, so an array payload sits
- * behind a 32-byte prefix:
- *   arr - 32: i64 refcount
- *   arr - 24: i64 ZAN_ARRAY_RC_MAGIC -- the guard tolerant array
- *             retain/release probe before touching the refcount, so a bare
- *             pointer typed `T[]` (an extern's buffer, a span base) costs
- *             nothing and is never freed
- *   arr - 16: i64 element count      (unchanged)
- *   arr -  8: i64 ZAN_ARRAY_MAGIC, or the rank of a rectangular array
- * The count/magic pair keeps its offsets, so every reader of a length, a rank
- * or the byte[]-vs-`char*` discriminator is unaffected; only the allocation
- * and the free need the wider prefix. 32 is a multiple of 16, so payloads stay
- * 16-byte aligned. */
+/* 内部辅助逻辑 */
 #define ZAN_ARR_HDR_SIZE       32
 #define ZAN_ARR_RC_OFF         (-32)
 #define ZAN_ARR_RC_MAGIC_OFF   (-24)
 #define ZAN_ARRAY_RC_MAGIC     UINT64_C(0x5a414e41525243) /* "ZANARRC" */
 
-/* Delegate values. One pointer with two shapes, told apart by bit 0:
- *   even -- a bare function pointer (static method or non-capturing lambda),
- *           so it can be handed to C as a plain callback;
- *   odd  -- a tagged pointer to a heap closure record
- *           { void *fn, void *dtor, void *target, <captured values> },
- *           allocated with the object allocator above (so it carries the
- *           16-byte rc header) and invoked as fn(record, args...).
- * Retain is an increment of the record's refcount; release goes through the
- * record's own dtor, which drops what the record captured and frees it at
- * zero. Runtime code that *keeps* a delegate past the call it arrived on (the
- * UI dispatch queue in rt_sync.c) must retain it, or the closure is freed
- * while its owner -- an event's handler list -- still holds it. */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_CLOSURE_TAG        1
 #define ZAN_CLOSURE_FN_OFF     0
 #define ZAN_CLOSURE_DTOR_OFF   8
 #define ZAN_CLOSURE_TARGET_OFF 16
 
-/* ---- 2. emitted-code ABI (no runtime counterpart yet) ----
- * Exception-handling chunk tables. The state is per-thread, reached through
- * __zan_eh_state(); the full design rationale lives in
- * src/compiler/irgen_builtins.c above emit_eh_state_ty. */
+/* 2 */
 
-#define ZAN_EH_CHUNKS      64     /* chunk-table entries, both stacks */
-#define ZAN_EH_SLOT_SHIFT  6      /* 64 handler slots per chunk */
-#define ZAN_EH_SLOT_BYTES  1040   /* jmp_buf (1024) + mark, 16-byte aligned */
+#define ZAN_EH_CHUNKS      64     /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_EH_SLOT_SHIFT  6      /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_EH_SLOT_BYTES  1040   /* 核心系统底层抽象与内存语义契约 */
 #define ZAN_EH_MARK_OFF    1024
-#define ZAN_EH_TMP_SHIFT   12     /* 4096 unwind-stack entries per chunk */
-#define ZAN_EH_THREADS     1024   /* live threads that can raise exceptions */
-/* A slot whose thread released its block: claimable again, but a probe must
- * pass through it or it would cut the chain of the keys stored after it. */
+#define ZAN_EH_TMP_SHIFT   12     /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_EH_THREADS     1024   /* 底层系统交互与数据协议契约 */
+/* 内部辅助逻辑 */
 #define ZAN_EH_TOMBSTONE   0xFFFFFFFFFFFFFFFFULL
 
-/* Unwind-stack entry flavours: the flavour of the skipped local decides how
- * a throw releases it while unwinding (see emit_eh_unwind_to_handler). */
+/* 内部辅助逻辑 */
 enum {
     ZAN_EH_SLOT_OBJ = 0,
     ZAN_EH_SLOT_STR = 1,

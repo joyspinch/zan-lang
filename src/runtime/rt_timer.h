@@ -15,9 +15,9 @@ typedef void (*zan_timer_callback_t)(void);
 typedef void (*zan_timer_step_t)(void *frame);
 
 void zan_timer_runtime_reset(void);
-/* Fail-soft fault report (see rt_timer */
+/* 底层系统交互与数据协议契约 */
 void zan_rt_soft_note(const char *text);
-/* Two-part soft report: `prefix` ("file */
+/* 底层系统交互与数据协议契约 */
 void zan_rt_soft_note2(const char *prefix, const char *msg);
 /* 内部辅助逻辑 */
 void zan_rt_guard_fail2(const char *prefix, const char *msg);
@@ -34,11 +34,11 @@ void zan_rt_set_strict(void);
 /* 内部辅助逻辑 */
 typedef void (*zan_fatal_fn)(const char *category, const char *message);
 void zan_rt_set_fatal_handler(zan_fatal_fn fn);
-/* The funnel itself */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_rt_fatal(const char *category, const char *message);
 /* 内部辅助逻辑 */
 unsigned char *zan_rt_soft_scratch(void);
-/* Shortest round-trip double -> C#-style "G" string (see rt_timer */
+/* 底层系统交互与数据协议契约 */
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v);
 /* double */
 double zan_rt_dbl_parse(const char *s, char **endp);
@@ -47,12 +47,12 @@ int zan_utf8_argv(int *argc, char ***argv);
 void zan_timer_set_ready_hook(void (*ready)(void *frame, zan_timer_step_t step));
 long long zan_timer_now_ms(void);
 void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step);
-/* Cancel every pending DELAY entry naming `frame` (see zan_timer_delay) */
+/* 底层系统交互与数据协议契约 */
 int zan_timer_cancel_delay(void *frame);
 long long zan_timer_next_timeout(void);
 /* 内部辅助逻辑 */
 long long zan_co_quantum_ms(void);
-/* Microsecond monotonic clock for slice/throttle accounting */
+/* 底层系统交互与数据协议契约 */
 long long zan_co_precise_us(void);
 /* 内部辅助逻辑 */
 long long zan_timer_dispatch_due(void);

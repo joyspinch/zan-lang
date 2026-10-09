@@ -1,8 +1,8 @@
 /* gui_runtime_x11 */
 
-/* Linux X11 Window Shell */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Linux/X11 window shell */
+/* 核心系统底层抽象与内存语义契约 */
 #if defined(__linux__)
 
 static Display *g_display = NULL;
@@ -24,7 +24,7 @@ static int g_btn_w_l = 46;
 static int g_caption_btn_count_l = 5;
 static int g_metrics_ready_linux = 0;
 
-/* Per-window state so one process can drive several top-level windows */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #define ZAN_MAX_WINDOWS 256
 typedef struct {
     Window xid;
@@ -37,7 +37,7 @@ typedef struct {
 static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
 static int g_lwin_count = 0;
 static Window g_primary_win = 0;
-/* xid of the window the event currently being decoded originated from */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static Window g_evwin_linux = 0;
 
 static zan_lwin_t *lwin_find(Window xid) {
@@ -68,7 +68,7 @@ static long long g_ev_seq_linux = 0;
 
 static void evq_push_linux(int kind, int x, int y, int button, int keycode, int mods) {
     int next = (g_evq_tail_linux + 1) % ZAN_EVQ_CAP;
-    if (next == g_evq_head_linux) return; /* queue full: drop */
+    if (next == g_evq_head_linux) return; /* 核心系统底层抽象与内存语义契约 */
     int *e = g_evq_linux[g_evq_tail_linux];
     e[0] = kind; e[1] = x; e[2] = y; e[3] = button;
     e[4] = keycode; e[5] = mods; e[6] = (int)g_evwin_linux; e[7] = 0;
@@ -84,7 +84,7 @@ static int evq_pop_linux(void) {
     return 1;
 }
 
-/* Decode one UTF-8 scalar, advancing *p past it. */
+/* 底层系统交互与数据协议契约 */
 static unsigned x11_utf8_next(const char **p) {
     const unsigned char *s = (const unsigned char *)*p;
     unsigned cp = *s;
@@ -96,7 +96,7 @@ static unsigned x11_utf8_next(const char **p) {
     return cp;
 }
 
-/* X11 modifier state -> Win32 encoding (bit0=Ctrl, bit1=Shift, bit2=Alt) */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int x11_mods(unsigned int state) {
     int m = 0;
     if (state & ControlMask) m |= 1;
@@ -105,7 +105,7 @@ static int x11_mods(unsigned int state) {
     return m;
 }
 
-/* X keysym -> Windows VK code the Zan `Keys` constants use. */
+/* 模块核心语义抽象与接口调用契约 */
 static int x11_vk_from_keysym(KeySym ks) {
     switch (ks) {
     case XK_Escape:    return 27;
@@ -142,7 +142,7 @@ static int x11_vk_from_keysym(KeySym ks) {
 
 static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
 
-/* Toggle/set an EWMH _NET_WM_STATE property via the window manager */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     if (!g_display || !win) return;
     XEvent xev;
@@ -160,7 +160,7 @@ static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     XFlush(g_display);
 }
 
-/* _NET_WM_MOVERESIZE directions. */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_NWMR_TOPLEFT     0
 #define ZAN_NWMR_TOP         1
 #define ZAN_NWMR_TOPRIGHT    2
@@ -201,7 +201,7 @@ static void x11_start_moveresize(Window win, int x_root, int y_root, int directi
     xev.xclient.data.l[1] = y_root;
     xev.xclient.data.l[2] = direction;
     xev.xclient.data.l[3] = 1; /* button 1 */
-    xev.xclient.data.l[4] = 1; /* source indication: application */
+    xev.xclient.data.l[4] = 1; /* 核心系统底层抽象与内存语义契约 */
     XSendEvent(g_display, DefaultRootWindow(g_display), False,
                SubstructureNotifyMask | SubstructureRedirectMask, &xev);
     XFlush(g_display);
@@ -233,7 +233,7 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     return -1;
 }
 
-/* Serve a clipboard paste request from another client (we own CLIPBOARD) */
+/* 模块核心语义抽象与接口调用契约 */
 static void x11_serve_selection(XSelectionRequestEvent *req) {
     XSelectionEvent resp;
     memset(&resp, 0, sizeof(resp));
@@ -270,7 +270,7 @@ static int x11_abi_button(unsigned int b) {
     return (int)b - 1;
 }
 
-/* Decode a raw XEvent into zero or more queued ABI events. */
+/* 模块核心语义抽象与接口调用契约 */
 static void x11_translate_event(XEvent *ev) {
     g_evwin_linux = ev->xany.window;
     switch (ev->type) {
@@ -285,7 +285,7 @@ static void x11_translate_event(XEvent *ev) {
             evq_push_linux(13, ev->xbutton.x, ev->xbutton.y, 0, delta,
                            x11_mods(ev->xbutton.state));
         } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
-            /* horizontal wheel: ignored */
+            /* 核心系统底层抽象与内存语义契约 */
         } else if (ev->xbutton.button == 1) {
             /* 内部辅助逻辑 */
             zan_lwin_t *bw = lwin_find(ev->xbutton.window);
@@ -458,7 +458,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
             XMoveWindow(g_display, xid, x, y);
         }
     }
-    /* Borderless window with app-drawn title bar (matches the Win32 backend) */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     x11_set_borderless(xid);
 
     return (i64)xid;
@@ -481,7 +481,7 @@ EXPORT i32 zan_gui_wait_event(void) {
     int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
-        /* Drain any X events already buffered in the client before blocking */
+        /* 模块核心语义抽象与接口调用契约 */
         while (XPending(g_display) > 0) {
             XNextEvent(g_display, &ev);
             if (ev.type == SelectionRequest) {
@@ -492,7 +492,7 @@ EXPORT i32 zan_gui_wait_event(void) {
             x11_translate_event(&ev);
             if (evq_pop_linux()) return 0;
         }
-        /* Block until the X connection or the wake pipe becomes readable */
+        /* 模块核心语义抽象与接口调用契约 */
         struct pollfd fds[2];
         fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
         int nfds = 1;
@@ -511,11 +511,11 @@ EXPORT i32 zan_gui_wait_event(void) {
             /* 返回a benign empty frame (kind 0) so the caller drains its dispatch queue */
             return 0;
         }
-        /* X connection readable: loop back to XPending/XNextEvent. */
+        /* 底层系统交互与数据协议契约 */
     }
 }
 
-/* Like wait_event but gives up after `ms` milliseconds */
+/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
@@ -563,7 +563,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     }
 }
 
-/* Wake a UI thread blocked in wait_event so it can drain the dispatch queue */
+/* 编译器代码生成与运行时系统底层调用契约 */
 EXPORT i32 zan_gui_wake(void) {
     if (g_wake_pipe[1] >= 0) {
         char b = 1;
@@ -591,7 +591,7 @@ EXPORT i32 zan_gui_poll_event(void) {
     }
 }
 
-/* Queue a synthetic input event for the automation driver (see Gui */
+/* 编译器代码生成与运行时系统底层调用契约 */
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
@@ -642,7 +642,7 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
-/* Whole-window frame declaration (Win32Shell */
+/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_count = 0;
     g_dirty_overflow = 0;
@@ -673,7 +673,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
 
     /* 内部辅助逻辑 */
     if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
-        /* A fresh back buffer holds no previous frame to patch. */
+        /* 底层系统交互与数据协议契约 */
         g_dirty_count = 0;
         g_dirty_overflow = 1;
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
@@ -787,10 +787,10 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
     nanosleep(&req, NULL);
 }
 
-/* libc compatibility shim for the bundled static X11 archive (packages/Zan */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #if defined(__GNUC__)
 __attribute__((weak)) int issetugid(void) {
     return (getuid() != geteuid() || getgid() != getegid()) ? 1 : 0;
 }
 #endif
-#endif /* __linux__ (X11 window shell) */
+#endif /* 核心系统底层抽象与内存语义契约 */

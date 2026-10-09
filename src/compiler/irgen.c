@@ -1,13 +1,4 @@
-/* irgen.c -- LLVM IR generation for the Zan language.
- *
- * For M1 this generates code for:
- *   - Static Main() method as program entry point
- *   - Console.WriteLine() calls → zan_rt_println / printf
- *   - Integer and floating-point arithmetic
- *   - Local variable declarations and assignments
- *   - Control flow (if, while, for)
- *   - String literals
- */
+/* 内部辅助实现 */
 
 #include "irgen.h"
 #include "irgen_compact.h"
@@ -20,18 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* ---- width-tolerant integer builders -------------------------------------
- * Zan's `int` lowers to i32 while lengths, counts, handles and every runtime
- * helper are i64, so mixed-width operands reach these builders constantly (an
- * i32 loop variable against an i64 `List.Count`, an i32 index plus an i64
- * offset). LLVM rejects that, and dozens of lowering sites would each have to
- * extend by hand. These wrappers sign-extend the narrower operand to the wider
- * one first and are otherwise the LLVM builders; irgen calls them instead. */
-/* Widen an integer, choosing the extension its Zan type calls for. Of the
- * narrow LLVM widths only i1 (`bool`) and i8 (`byte`) occur, and both are
- * unsigned -- `sbyte` and `short` are wider in this lowering -- so anything
- * up to a byte zero-extends. Sign-extending a byte is what made `byte b =
- * 255` read back as -1. */
+/* 内部辅助实现 */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef zan_iwiden(LLVMBuilderRef b, LLVMValueRef v, LLVMTypeRef to) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind) return v;
@@ -45,8 +26,7 @@ static void zan_ipair(LLVMBuilderRef b, LLVMValueRef *l, LLVMValueRef *r) {
         LLVMGetTypeKind(tr) != LLVMIntegerTypeKind) return;
     unsigned wl = LLVMGetIntTypeWidth(tl), wr = LLVMGetIntTypeWidth(tr);
     if (wl == wr) {
-        /* C# promotes byte operands to int before arithmetic, so `b + 1`
-         * with b = 255 is 256 and not a wrapped 0. */
+        /* 内部辅助逻辑 */
         if (wl == 8) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(LLVMGetTypeContext(tl));
             *l = LLVMBuildZExt(b, *l, i64, "zx");
@@ -85,11 +65,7 @@ static LLVMValueRef zan_icmp(LLVMBuilderRef b, LLVMIntPredicate p,
     return LLVMBuildICmp(b, p, l, r, n);
 }
 
-/* Normalize a condition to i1. Zan admits truthy conditions with a checker
- * warning, so the operand may be an integer, an object reference or a float.
- * All non-i1 cases compare against LLVMConstNull of the operand's own type:
- * LLVMConstInt(LLVMTypeOf(v), 0, 0) mints an invalid i0 constant for pointer
- * (and float) operands and fails LLVM verification. */
+/* Normalize a condition to i1 */
 static LLVMValueRef zan_tobool(LLVMBuilderRef b, LLVMValueRef v, const char *n) {
     LLVMTypeRef ty = LLVMTypeOf(v);
     LLVMTypeKind k = LLVMGetTypeKind(ty);
@@ -120,32 +96,14 @@ static LLVMValueRef zan_tobool(LLVMBuilderRef b, LLVMValueRef v, const char *n) 
 #define zan_getcwd getcwd
 #endif
 
-/* ---------------------------------------------------------------------------
- * DWARF debug information (opt-in via `zanc -g`).
- *
- * Emits DWARF line tables and one DISubprogram per emitted LLVM function so a
- * standard source-level debugger (gdb/lldb, driven by zan-dap) can set source
- * breakpoints, produce accurate call stacks and step through Zan code. Debug
- * metadata is only created when g->emit_debug is set, so default and --publish
- * builds are byte-for-byte unchanged.
- *
- * Subprograms are created lazily the first time a statement location is set for
- * a function, keyed off the LLVM function currently under the builder. The only
- * verifier-critical invariant is that an instruction's !dbg scope must belong to
- * the function containing it; since the builder keeps a *persistent* current
- * location, we clear it (di_clear) whenever we begin emitting a different
- * function's body, so instructions in synthetic/prologue positions never inherit
- * a neighbouring function's scope. Sloppy locations *within* one function are
- * harmless (same subprogram). */
+/* 底层系统交互与数据协议契约 */
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id);
 
 static void di_ensure(zan_irgen_t *g) {
     if (!g->emit_debug || g->di_builder) return;
     g->di_builder = LLVMCreateDIBuilder(g->mod);
 
-    /* Module flags required for a debugger to consume the info. DWARF (not
-     * CodeView) because Zan links Windows binaries with the bundled GNU ld
-     * (windows-gnu ABI), which gdb reads. */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMContextRef c = g->ctx;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
     LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorWarning,
@@ -160,15 +118,15 @@ static void di_ensure(zan_irgen_t *g) {
     g->di_cu = LLVMDIBuilderCreateCompileUnit(
         g->di_builder, LLVMDWARFSourceLanguageC, file,
         producer, strlen(producer),
-        /*isOptimized*/ 0, /*Flags*/ "", 0, /*RuntimeVer*/ 0,
-        /*SplitName*/ "", 0, LLVMDWARFEmissionFull,
-        /*DWOId*/ 0, /*SplitDebugInlining*/ 0,
-        /*DebugInfoForProfiling*/ 0, /*SysRoot*/ "", 0, /*SDK*/ "", 0);
+        /* isOptimized */ 0, /*Flags*/ "", 0, /*RuntimeVer*/ 0,
+        /* SplitName */ "", 0, LLVMDWARFEmissionFull,
+        /* DWOId */ 0, /*SplitDebugInlining*/ 0,
+        /* DebugInfoForProfiling */ 0, /*SysRoot*/ "", 0, /*SDK*/ "", 0);
 }
 
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     if (!g->emit_debug) return NULL;
-    /* Grows with the file table dynamically. */
+    /* 底层系统交互与数据协议契约 */
     if (!zan_tab_reserve((void **)&g->di_files, &g->di_file_cap,
                          sizeof(*g->di_files), (int)file_id, 64))
         return NULL;
@@ -180,11 +138,10 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
         path = g->diag->file_names[file_id];
     if (!path || !path[0]) path = g->src_file ? g->src_file : "<unknown>.zan";
 
-    /* Split into directory + filename so comp_dir lets the debugger resolve
-     * relative source paths. */
+    /* 内部辅助逻辑 */
     char dir[1024];
     if (path[0] == '/' || (path[0] && path[1] == ':')) {
-        /* absolute: keep the leading directory portion */
+        /* 底层系统交互与数据协议契约 */
         const char *slash = strrchr(path, '/');
         const char *bslash = strrchr(path, '\\');
         const char *cut = slash > bslash ? slash : bslash;
@@ -207,19 +164,7 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     return f;
 }
 
-/* Resolve the source file a node's location belongs to (leak-site descriptors,
- * runtime-check messages). Code that originates in an included file (notably
- * the stdlib pulled in by --auto-stdlib, or the source a design document is
- * projected into) carries its own loc.file_id, so attribute the site to that
- * file instead of the top-level module (g->src_file), which mislabels every
- * site as the program being compiled.
- *
- * The returned text is baked into every per-access null-guard string, so it
- * is shortened to the final two path components ("Gui/App.zan") — an absolute
- * path here duplicates megabytes of .rdata across a large program, and the
- * shortened form still locates the source inside the known stdlib/project
- * layout. Compiler diagnostics render from diag->file_names directly and
- * keep full paths. */
+/* 内部辅助逻辑 */
 static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
     const char *p = NULL;
     if (g->diag && g->diag->file_names &&
@@ -228,7 +173,7 @@ static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
         if (q && q[0]) p = q;
     }
     if (!p) p = g->src_file ? g->src_file : "<unknown>";
-    /* last two components, whichever separator the path uses */
+    /* 模块核心语义抽象与接口调用契约 */
     const char *slash = NULL, *prev = NULL;
     for (const char *c = p; *c; c++) {
         if (*c == '/' || *c == '\\') {
@@ -240,11 +185,7 @@ static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
     return p;
 }
 
-/* Intern a compiler-emitted guard text: identical strings share one private
- * global. LLVM does not merge identical string globals at the IR level, so
- * without this every duplicated emit re-allocates its .rdata copy; pointer
- * identity also IS the soft-report site identity (the runtime dedups on the
- * text pointer), so sharing is semantically exact. Lives on the arena. */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_STR_INTERN_BUCKETS 1024
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     if (!g->str_intern) {
@@ -267,8 +208,7 @@ LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     return e->gv;
 }
 
-/* Return the DISubprogram of the function currently under the builder, creating
- * it lazily (keyed off the LLVM function) the first time it is needed. */
+/* 内部辅助实现 */
 static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned line) {
     if (!g->emit_debug || !g->builder) return NULL;
     LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
@@ -287,16 +227,13 @@ static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned l
     unsigned l = line ? line : 1;
     sp = LLVMDIBuilderCreateFunction(
         g->di_builder, file, name, nlen, name, nlen, file, l, subty,
-        /*IsLocalToUnit*/ 0, /*IsDefinition*/ 1, /*ScopeLine*/ l,
-        LLVMDIFlagZero, /*IsOptimized*/ 0);
+        /* IsLocalToUnit */ 0, /*IsDefinition*/ 1, /*ScopeLine*/ l,
+        LLVMDIFlagZero, /* IsOptimized */ 0);
     LLVMSetSubprogram(fn, sp);
     return sp;
 }
 
-/* Clear the builder's current debug location. MUST be called when beginning to
- * emit a new function's body so prologue/synthetic instructions do not inherit a
- * neighbouring function's DISubprogram scope (a hard verifier error). No-op
- * unless debug info is enabled. */
+/* 底层系统交互与数据协议契约 */
 static void di_clear(zan_irgen_t *g) {
     if (!g->emit_debug || !g->builder) return;
     LLVMSetCurrentDebugLocation2(g->builder, NULL);
@@ -304,8 +241,7 @@ static void di_clear(zan_irgen_t *g) {
     g->di_cur_file = 0;
 }
 
-/* Attach a source location (and, lazily, a DISubprogram) to the function
- * currently under the builder. Called once per statement from emit_stmt. */
+/* 内部辅助逻辑 */
 static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     if (!g->emit_debug || !g->builder) return;
     LLVMMetadataRef sp = di_ensure_sp(g, loc.file_id, loc.line);
@@ -318,9 +254,7 @@ static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     LLVMSetCurrentDebugLocation2(g->builder, dl);
 }
 
-/* Map an LLVM storage type to a DIType for a local/parameter. Returns NULL for
- * aggregates (struct/array by value), whose contents we do not describe yet, so
- * the caller skips emitting a declare rather than showing wrong bytes. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
     LLVMTypeKind k = LLVMGetTypeKind(ty);
     switch (k) {
@@ -328,23 +262,23 @@ static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
         unsigned w = LLVMGetIntTypeWidth(ty);
         if (w == 1)
             return LLVMDIBuilderCreateBasicType(g->di_builder, "bool", 4, 8,
-                                                /*DW_ATE_boolean*/ 0x02,
+                                                /* DW_ATE_boolean */ 0x02,
                                                 LLVMDIFlagZero);
         char nm[16];
         int n = snprintf(nm, sizeof(nm), "i%u", w);
         return LLVMDIBuilderCreateBasicType(g->di_builder, nm, (size_t)n, w,
-                                            /*DW_ATE_signed*/ 0x05,
+                                            /* DW_ATE_signed */ 0x05,
                                             LLVMDIFlagZero);
     }
     case LLVMDoubleTypeKind:
         return LLVMDIBuilderCreateBasicType(g->di_builder, "f64", 3, 64,
-                                            /*DW_ATE_float*/ 0x04, LLVMDIFlagZero);
+                                            /* DW_ATE_float */ 0x04, LLVMDIFlagZero);
     case LLVMFloatTypeKind:
         return LLVMDIBuilderCreateBasicType(g->di_builder, "f32", 3, 32,
-                                            /*DW_ATE_float*/ 0x04, LLVMDIFlagZero);
+                                            /* DW_ATE_float */ 0x04, LLVMDIFlagZero);
     case LLVMPointerTypeKind: {
         LLVMMetadataRef byte = LLVMDIBuilderCreateBasicType(
-            g->di_builder, "byte", 4, 8, /*DW_ATE_unsigned_char*/ 0x08,
+            g->di_builder, "byte", 4, 8, /* DW_ATE_unsigned_char */ 0x08,
             LLVMDIFlagZero);
         return LLVMDIBuilderCreatePointerType(g->di_builder, byte, 64, 0, 0,
                                               "ptr", 3);
@@ -354,28 +288,13 @@ static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
     }
 }
 
-/* Emit an llvm.dbg.declare tying a named source variable to its stack slot, so
- * the debugger can list and read it. `storage` must be an alloca (frame-resident
- * async locals and non-alloca slots are skipped). Called for every local scope
- * entry via local_add; g comes from the file-static emit context. */
+/* 发射an llvm */
 static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage,
                            zan_type_t *zt);
 
-/* ================== 五期: structured DWARF types for locals ==================
- *
- * di_type_from_llvm above only sees LLVM types, and under opaque pointers a
- * class reference is a bare `ptr` — so class/List locals showed up as
- * `byte *` with no fields in gdb/DAP. The builders below take the Zan type
- * (available at every local_add) and emit named DWARF structures for class
- * payloads, arrays and strings, so `ptype p` names the struct and `p *p`
- * lists field name/value pairs.
- *
- * Cycles (class Node { Node next; }) go through a replaceable placeholder
- * composite: recursion resolving to a type that is currently being built
- * gets the placeholder, and LLVMMetadataReplaceAllUsesWith rewires every
- * reference when the real composite replaces it. */
+/* 内部辅助实现 */
 
-/* DWARF tags/encodings used below */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_DI_TAG_STRUCTURE 0x13u /* DW_TAG_structure_type */
 #define ZAN_DI_ATE_BOOLEAN   0x02u
 #define ZAN_DI_ATE_FLOAT     0x04u
@@ -384,28 +303,23 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 #define ZAN_DI_ATE_UCHAR     0x08u
 #define ZAN_DI_ATE_UTF       0x10u
 
-/* defined further down in this translation unit */
+/* 底层系统交互与数据协议契约 */
 static bool class_has_virtual_methods(zan_symbol_t *sym);
 static bool field_member_is_static(zan_symbol_t *m);
 static unsigned long abi_size_of(LLVMTypeRef t);
 static unsigned long abi_align_of(LLVMTypeRef t);
 
 typedef struct {
-    zan_type_t *type;        /* key: the Zan type pointer */
-    LLVMMetadataRef placeholder; /* replaceable composite while building */
-    LLVMMetadataRef composite;   /* completed composite (after RAUW) */
+    zan_type_t *type;        /* 核心系统底层抽象与内存语义契约 */
+    LLVMMetadataRef placeholder; /* 核心系统底层抽象与内存语义契约 */
+    LLVMMetadataRef composite;   /* 核心系统底层抽象与内存语义契约 */
     int building;
 } zan_di_type_rec_t;
-/* Records are individually allocated and the table only holds pointers:
- * di_class_composite / di_array_composite hold a rec across the recursive
- * di_type_for_zan member walk, and a realloc that moved the records turned
- * every outer rec into freed heap (ASAN heap-use-after-free in
- * di_class_composite; the -g IDE-input crash this fixes). */
+/* 内部辅助实现 */
 static zan_di_type_rec_t **g_di_types = NULL;
 static int g_di_type_count = 0, g_di_type_cap = 0;
 
-/* Clear the per-run type cache: the metadata belongs to the module of one
- * zan_irgen_emit, so the next run must not reuse pointers into it. */
+/* 内部辅助实现 */
 static void di_debug_types_reset(void) {
     for (int i = 0; i < g_di_type_count; i++) free(g_di_types[i]);
     free(g_di_types);
@@ -443,14 +357,14 @@ static LLVMMetadataRef di_basic(zan_irgen_t *g, const char *nm, uint64_t bits,
                                         encoding, LLVMDIFlagZero);
 }
 
-/* The fallback reference type: what every opaque pointer shows today. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_byte_ptr(zan_irgen_t *g) {
     LLVMMetadataRef byte = di_basic(g, "byte", 8, ZAN_DI_ATE_UCHAR);
     return LLVMDIBuilderCreatePointerType(g->di_builder, byte, 64, 0, 0,
                                           "", 0);
 }
 
-/* Display name of a Zan type ("Point", "List<int>", "int[]"). */
+/* 模块核心语义抽象与接口调用契约 */
 static void di_type_name(zan_type_t *t, char *buf, size_t cap) {
     if (cap == 0) return;
     buf[0] = '\0';
@@ -482,10 +396,7 @@ static void di_type_name(zan_type_t *t, char *buf, size_t cap) {
     }
 }
 
-/* Rewrite a type parameter to its concrete binding for the instantiation
- * `inst` being described (List<int>'s `T[] items` field reads int[]). Type
- * params match by NAME: the binder interns the parameter type separately
- * from the class symbol's SYM_TYPE_PARAM entries, so identity never holds. */
+/* 内部辅助实现 */
 static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
     if (t->kind != TYPE_TYPE_PARAM || !inst || !inst->sym ||
         inst->type_arg_count <= 0 || !t->name.str)
@@ -500,7 +411,7 @@ static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
             return inst->type_args[idx];
         idx++;
     }
-    /* fall back to the declaration's parameter list (same order) */
+    /* 模块核心语义抽象与接口调用契约 */
     if (cls->decl &&
         cls->decl->type_decl.type_params.count == inst->type_arg_count) {
         zan_ast_list_t *tps = &cls->decl->type_decl.type_params;
@@ -515,8 +426,7 @@ static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
     return NULL;
 }
 
-/* The payload-struct registry entry for a class/struct symbol, if its LLVM
- * body was materialized in this module. */
+/* 内部辅助逻辑 */
 static struct zan_struct_type_entry *di_struct_entry(zan_irgen_t *g,
                                                      zan_symbol_t *sym) {
     for (int i = 0; i < g->struct_type_count; i++)
@@ -530,20 +440,17 @@ static unsigned long di_align_up(unsigned long v, unsigned long a) {
     return r ? v + (a - r) : v;
 }
 
-/* One member of a class payload: DWARF member at byte offset `off`. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_member(zan_irgen_t *g, LLVMMetadataRef scope,
                                  LLVMMetadataRef file, const char *nm,
                                  LLVMMetadataRef ty, unsigned long off,
                                  unsigned long size_bytes, unsigned line) {
     return LLVMDIBuilderCreateMemberType(
         g->di_builder, scope, nm, strlen(nm), file, line,
-        size_bytes * 8, /*AlignInBits*/ 0, off * 8, LLVMDIFlagZero, ty);
+        size_bytes * 8, /* AlignInBits */ 0, off * 8, LLVMDIFlagZero, ty);
 }
 
-/* The intrinsic collections and Span: TYPE_CLASS/struct values the binder
- * synthesizes without a class declaration, so they never reach the payload
- * registry. Their layouts are the compiler's own (list_struct_type etc.),
- * mirrored here for the debugger. */
+/* 内部辅助实现 */
 static int di_type_named(zan_type_t *t, const char *n) {
     return t && t->kind != TYPE_ARRAY && t->name.str &&
            (int)t->name.len == (int)strlen(n) &&
@@ -558,10 +465,7 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
     LLVMMetadataRef i64 = di_basic(g, "long", 64, ZAN_DI_ATE_SIGNED);
     LLVMMetadataRef bytep = di_byte_ptr(g);
 
-    /* { i64 count, i64 capacity, T* data } -- List<T> and StringBuilder.
-     * List elements live in 8-byte erased slots (generic_field_slot widens
-     * every T binding to a full word), so `data` is described as long*
-     * -- describing it as T* would index at half stride for int elements. */
+    /* 底层系统交互与数据协议契约 */
     if (di_type_named(t, "List") || di_type_named(t, "StringBuilder")) {
         LLVMMetadataRef data = i64;
         if (di_type_named(t, "StringBuilder")) data = bytep;
@@ -579,8 +483,7 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
                                               0, "", 0);
     }
 
-    /* { i64 count, i64 capacity, i8** keys, i64* values, ... } -- Dict / Dictionary; the
-     * four documented fields are described, the hash-index tail stays out. */
+    /* { i64 count, i64 capacity, i8** keys, i64* values, */
     if (di_type_named(t, "Dict") || di_type_named(t, "Dictionary")) {
         LLVMMetadataRef keys = LLVMDIBuilderCreatePointerType(
             g->di_builder, bytep, 64, 0, 0, "", 0);
@@ -613,7 +516,7 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
                                               0, "", 0);
     }
 
-    /* { i8* base, i64 length } -- Span<T>, a value, returned by value */
+    /* 底层系统交互与数据协议契约 */
     if (di_type_named(t, "Span")) {
         LLVMMetadataRef members[2] = {
             di_member(g, file, file, "base", bytep, 0, 8, 1),
@@ -626,9 +529,7 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
     return NULL;
 }
 
-/* Composite for a class/interface payload: named structure whose members sit
- * at their payload offsets (the ARC header in front of the payload is runtime
- * detail, same as a malloc header in C). Returns a pointer to it. */
+/* 内部辅助实现 */
 static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
                                           int depth) {
     zan_symbol_t *sym = t->sym;
@@ -638,7 +539,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
 
     zan_di_type_rec_t *rec = di_type_rec(t);
     if (!rec) return NULL;
-    if (rec->building) return rec->placeholder; /* cycle: hand out the fwd */
+    if (rec->building) return rec->placeholder; /* 核心系统底层抽象与内存语义契约 */
     if (rec->composite) {
         return LLVMDIBuilderCreatePointerType(g->di_builder, rec->composite,
                                               64, 0, 0, "", 0);
@@ -653,12 +554,11 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
 
     rec->placeholder = LLVMDIBuilderCreateReplaceableCompositeType(
         g->di_builder, ZAN_DI_TAG_STRUCTURE, name, strlen(name),
-        /*Scope*/ file, file, line, /*RuntimeLang*/ 0,
-        /*SizeInBits*/ 0, /*AlignInBits*/ 0, LLVMDIFlagZero, NULL, 0);
+        /* Scope */ file, file, line, /*RuntimeLang*/ 0,
+        /* SizeInBits */ 0, /*AlignInBits*/ 0, LLVMDIFlagZero, NULL, 0);
     rec->building = 1;
 
-    /* Member slots in LLVM body order (vptr first when present), with
-     * C-like offsets for sequential layout and [FieldOffset] for explicit. */
+    /* 内部辅助实现 */
     int nslots = e->field_count;
     int vptr = class_has_virtual_methods(sym) ? 1 : 0;
     LLVMMetadataRef *members =
@@ -681,7 +581,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
             if (fa > max_align) max_align = fa;
             if (cursor > size) size = cursor;
         }
-        LLVMMetadataRef mty = di_byte_ptr(g); /* hidden vtable pointer */
+        LLVMMetadataRef mty = di_byte_ptr(g); /* 核心系统底层抽象与内存语义契约 */
         members[slot] = di_member(g, rec->placeholder, file, "$vptr", mty, off,
                                   fsize, line);
         slot++;
@@ -721,11 +621,11 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
                               ? 0
                               : di_align_up(size, max_align);
     LLVMMetadataRef composite = LLVMDIBuilderCreateStructType(
-        g->di_builder, /*Scope*/ file, name, strlen(name),
+        g->di_builder, /* Scope */ file, name, strlen(name),
         file, line, total * 8,
         (uint32_t)(max_align > 1 ? di_align_up(max_align, 8) : 0) * 8,
-        LLVMDIFlagZero, /*DerivedFrom*/ NULL, members, (unsigned)slot,
-        /*RunTimeLang*/ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
+        LLVMDIFlagZero, /* DerivedFrom */ NULL, members, (unsigned)slot,
+        /* RunTimeLang */ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
     free(members);
     LLVMMetadataReplaceAllUsesWith(rec->placeholder, composite);
     rec->composite = composite;
@@ -734,9 +634,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
                                           "", 0);
 }
 
-/* Composite for a T[] payload: the element count lives in the ARC header
- * (at -16 relative to the payload the reference points at — DWARF member
- * offsets are signed, so it is described in place), elements follow. */
+/* 内部辅助实现 */
 static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
                                           zan_type_t *inst, int depth) {
     zan_di_type_rec_t *rec = di_type_rec(t);
@@ -753,8 +651,8 @@ static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
 
     rec->placeholder = LLVMDIBuilderCreateReplaceableCompositeType(
         g->di_builder, ZAN_DI_TAG_STRUCTURE, name, strlen(name),
-        /*Scope*/ file, file, /*Line*/ 1, /*RuntimeLang*/ 0,
-        /*SizeInBits*/ 0, /*AlignInBits*/ 0, LLVMDIFlagZero, NULL, 0);
+        /* Scope */ file, file, /*Line*/ 1, /*RuntimeLang*/ 0,
+        /* SizeInBits */ 0, /*AlignInBits*/ 0, LLVMDIFlagZero, NULL, 0);
     rec->building = 1;
 
     LLVMMetadataRef i64 = di_basic(g, "long", 64, ZAN_DI_ATE_SIGNED);
@@ -764,20 +662,20 @@ static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
     LLVMMetadataRef elem = di_type_for_zan(g, t->element_type, inst, depth + 1);
     if (!elem) elem = di_byte_ptr(g);
     LLVMMetadataRef subs[1] = {
-        LLVMDIBuilderGetOrCreateSubrange(g->di_builder, /*LowerBound*/ 0,
-                                         /*Count*/ 0)
+        LLVMDIBuilderGetOrCreateSubrange(g->di_builder, /* LowerBound */ 0,
+                                         /* Count */ 0)
     };
     LLVMMetadataRef arrty = LLVMDIBuilderCreateArrayType(
-        g->di_builder, /*SizeInBits*/ 0, /*AlignInBits*/ 0, elem, subs, 1);
+        g->di_builder, /* SizeInBits */ 0, /*AlignInBits*/ 0, elem, subs, 1);
     LLVMMetadataRef elemsm = di_member(g, rec->placeholder, file, "elements",
                                        arrty, 0, 0, 1);
 
     LLVMMetadataRef members[2] = { lenm, elemsm };
     LLVMMetadataRef composite = LLVMDIBuilderCreateStructType(
-        g->di_builder, /*Scope*/ file, name, strlen(name),
-        file, /*Line*/ 1, /*SizeInBits*/ 0, /*AlignInBits*/ 0,
-        LLVMDIFlagZero, /*DerivedFrom*/ NULL, members, 2,
-        /*RunTimeLang*/ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
+        g->di_builder, /* Scope */ file, name, strlen(name),
+        file, /* Line */ 1, /*SizeInBits*/ 0, /*AlignInBits*/ 0,
+        LLVMDIFlagZero, /* DerivedFrom */ NULL, members, 2,
+        /* RunTimeLang */ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
     LLVMMetadataReplaceAllUsesWith(rec->placeholder, composite);
     rec->composite = composite;
     rec->building = 0;
@@ -785,7 +683,7 @@ static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
                                           "", 0);
 }
 
-/* Composite for a value struct (stored by value in the slot). */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_struct_composite(zan_irgen_t *g, zan_type_t *t,
                                            zan_type_t *inst, int depth) {
     zan_symbol_t *sym = t->sym;
@@ -836,19 +734,16 @@ static LLVMMetadataRef di_struct_composite(zan_irgen_t *g, zan_type_t *t,
     unsigned long total = e->explicit_layout ? 0
                                              : di_align_up(size, max_align);
     LLVMMetadataRef composite = LLVMDIBuilderCreateStructType(
-        g->di_builder, /*Scope*/ file, name, strlen(name),
+        g->di_builder, /* Scope */ file, name, strlen(name),
         file, line, total * 8,
         (uint32_t)(max_align > 1 ? di_align_up(max_align, 8) : 0) * 8,
-        LLVMDIFlagZero, /*DerivedFrom*/ NULL, members, (unsigned)slot,
-        /*RunTimeLang*/ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
+        LLVMDIFlagZero, /* DerivedFrom */ NULL, members, (unsigned)slot,
+        /* RunTimeLang */ 0, /*VTableHolder*/ NULL, /*UniqueId*/ NULL, 0);
     free(members);
     return composite;
 }
 
-/* Master DI type builder for a Zan type. `inst` carries the instantiation
- * whose bindings replace type parameters encountered in member positions
- * (NULL outside class member construction). Returns NULL when the type has
- * no useful description; the caller falls back to di_type_from_llvm. */
+/* 底层系统交互与数据协议契约 */
 static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
                                        zan_type_t *inst, int depth) {
     if (!g->emit_debug || !g->di_builder || !t || depth > 8) return NULL;
@@ -879,22 +774,20 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
     case TYPE_CHAR:
         return di_basic(g, "char", 16, ZAN_DI_ATE_UTF);
     case TYPE_STRING: {
-        /* The reference points at the char payload, so gdb already prints
-         * the text; give the type its source name. */
+        /* 内部辅助逻辑 */
         LLVMMetadataRef byte = di_basic(g, "byte", 8, ZAN_DI_ATE_UCHAR);
         LLVMMetadataRef ptr = LLVMDIBuilderCreatePointerType(
             g->di_builder, byte, 64, 0, 0, "", 0);
         return LLVMDIBuilderCreateTypedef(g->di_builder, ptr, "string", 6,
                                           di_file_for(g, g->di_cur_file),
-                                          1, /*Scope*/ NULL, 0);
+                                          1, /* Scope */ NULL, 0);
     }
     case TYPE_ARRAY:
         if (t->array_rank != 1) return di_byte_ptr(g);
         return di_array_composite(g, t, inst, depth);
     case TYPE_CLASS:
     case TYPE_INTERFACE:
-        /* intrinsic collections/Dict/Span have no class declaration; they
-         * carry the compiler's own layout */
+        /* 内部辅助逻辑 */
         if (!t->sym) {
             LLVMMetadataRef bi = di_builtin_composite(g, t, depth);
             if (bi) return bi;
@@ -920,12 +813,7 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
     }
 }
 
-/* Emit an llvm.dbg.declare tying a named source variable to its stack slot, so
- * the debugger can list and read it. `storage` must be an alloca (frame-resident
- * async locals and non-alloca slots are skipped). Called for every local scope
- * entry via local_add; g comes from the file-static emit context. The Zan type
- * `zt` drives the structured description above; LLVM-type heuristics are the
- * fallback for types it cannot describe. */
+/* 发射an llvm */
 static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage,
                            zan_type_t *zt) {
     if (!g || !g->emit_debug || !g->builder) return;
@@ -939,17 +827,15 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
     LLVMMetadataRef ty = NULL;
     if (zt) ty = di_type_for_zan(g, zt, zt, 0);
     if (!ty && LLVMIsAAllocaInst(storage)) ty = di_type_from_llvm(g, LLVMGetAllocatedType(storage));
-    if (!ty) return; /* aggregate: not described yet */
+    if (!ty) return; /* 核心系统底层抽象与内存语义契约 */
     LLVMMetadataRef file = di_file_for(g, g->di_cur_file);
     unsigned line = g->di_cur_line ? g->di_cur_line : 1;
     LLVMMetadataRef var = LLVMDIBuilderCreateAutoVariable(
         g->di_builder, sp, name.str, name.len, file, line, ty,
-        /*AlwaysPreserve*/ 1, LLVMDIFlagZero, /*AlignInBits*/ 0);
+        /* AlwaysPreserve */ 1, LLVMDIFlagZero, /*AlignInBits*/ 0);
     LLVMMetadataRef expr = LLVMDIBuilderCreateExpression(g->di_builder, NULL, 0);
     LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(g->ctx, line, 0, sp, NULL);
-    /* The debug-record API (LLVMDIBuilderInsertDeclareRecordAtEnd) is LLVM 19+;
-     * LLVM 18 and earlier only provide the intrinsic-based InsertDeclareAtEnd.
-     * Both take the same arguments, so select by version. */
+    /* 内部辅助实现 */
 #if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR < 19
     LLVMDIBuilderInsertDeclareAtEnd(g->di_builder, storage, var, expr, dl, bb);
 #else
@@ -957,38 +843,22 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 #endif
 }
 
-/* The active codegen context, set for the duration of zan_irgen_emit so the
- * g-free local_add can forward variables to di_declare_var. Codegen is
- * single-threaded per module, so a file-static is safe here. */
+/* 内部辅助实现 */
 static zan_irgen_t *g_di_emit_ctx = NULL;
 
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
-/* Maximum number of distinct ARC destructor shapes tracked by the runtime.
- * Allocation sites with the same concrete class/generic/collection shape share
- * one slot; aliasing different shapes would dispatch the wrong destructor.
- *
- * Check-leaks builds used to index fixed [4096 x ...] runtime tables keyed on
- * the site id, which made the number a hard compile-time ceiling.
- * The tables are now emitted at finalize with the real site count and reached
- * through pointer globals, so nothing bounds the site count here anymore. */
+/* 模块核心语义抽象与接口调用契约 */
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm);
 static void emit_weak_runtime(zan_irgen_t *g);
 
-/* The one live irgen context. zan_call2 is a leaf helper 450+ call sites pass
- * only the builder to, but its wasm32 try lowering needs the context's target
- * flags and landing-pad stack; main.c drives exactly one irgen per process, so
- * a file-static set at init/destroy (the pattern class_index_reset already
- * uses) reaches it without touching every call site. */
+/* 核心系统底层抽象与内存语义契约 */
 static zan_irgen_t *s_current_irgen = NULL;
 
-/* True when `word` -- a string/object second header word -- belongs to a
- * managed string. Only the high half is the tag: the low half caches the byte
- * length (see ZAN_STRING_TAG in zan_abi.h), so identity is a tag test rather
- * than equality with the whole ZAN_STRING_MAGIC word. */
+/* 内部辅助逻辑 */
 static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                                      const char *nm) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -998,16 +868,7 @@ static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                     LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
 }
 
-/* i1 telling whether the 8 header bytes at obj-8 may be read, or NULL when
- * the target needs no probe. Same contract as emit_header_read_guard, but as
- * a value: callers that must produce a length instead of returning early
- * branch on it themselves. Takes the payload object, not the header pointer:
- * a null reference has no header and must never reach the probe — probing
- * null-8 sends IsBadReadPtr through kernel space, where it faults on some
- * Windows builds. Folding the null test in with an AND would still execute
- * the call unconditionally, so the short-circuit is emitted as control flow.
- * Only Windows has IsBadReadPtr; elsewhere the ARC runtime reads a string
- * header unprobed as well. */
+/* 内部辅助逻辑 */
 static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     if (!g->target_is_windows) return NULL;
     LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
@@ -1047,10 +908,7 @@ static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     return phi;
 }
 
-/* Create the per-shape descriptor global for a freshly reserved site: an
- * internal constant {i8* dtor, i8* tynames, i8* meta, i64 site}. Created at
- * reserve time (allocation sites reference it immediately); the initializer
- * is filled in at finalize once every release/typeinfo function exists. */
+/* 内部辅助实现 */
 static LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1066,10 +924,7 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     LLVMValueRef dg = LLVMAddGlobal(g->mod, dt, dname);
     LLVMSetLinkage(dg, LLVMInternalLinkage);
     LLVMSetGlobalConstant(dg, 1);
-    /* all-null until finalize fills the real {dtor, tynames, meta, site};
-     * a zeroed record makes every reader take its fallback (plain release,
-     * not-a-T, fallback typeinfo), which is also the safe state if the
-     * module dies before finalize */
+    /* 内部辅助实现 */
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
         (LLVMValueRef[]){ z, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
@@ -1077,10 +932,7 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     return dg;
 }
 
-/* Host-side per-site arrays (the `site_*` parallel tables and, in descriptor
- * mode, `desc_gv`). These grow dynamically; the RUNTIME tables they mirror are
- * emitted at finalize with the real site count (see emit_site_live_tables),
- * so no build is bounded by a fixed slot count anymore. */
+/* 内部辅助逻辑 */
 static bool site_arrays_reserve(zan_irgen_t *g, int want) {
     if (want <= g->leak_site_cap) return true;
     int newcap = g->leak_site_cap ? g->leak_site_cap * 2 : 256;
@@ -1136,13 +988,7 @@ static bool desc_gv_reserve(zan_irgen_t *g, int want) {
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
-    /* check-leaks reports name each site's own "file:line:col", so the site
-     * must be per LOCATION there: keyed by shape alone, every same-class
-     * `new` would share one slot and the report's name (stored on every
-     * allocation) would pin the site that allocated last, not the leaking
-     * one (A64b). Without -g the debug location is unknown (0/0) and the key
-     * degrades to shape-only -- same aliasing as before, same counts. Other
-     * builds never report, so they keep the compact shape key. */
+    /* 内部辅助实现 */
     uint32_t key_file = g->check_leaks ? g->di_cur_file : 0;
     uint32_t key_line = g->check_leaks ? g->di_cur_line : 0;
     for (int i = 0; i < g->leak_site_count; i++) {
@@ -1160,9 +1006,7 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
             if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
         }
     }
-    /* The runtime tables are sized to the real site count at
-     * finalize, so there is no cap to enforce here anymore; the host-side
-     * metadata arrays just grow. */
+    /* 内部辅助实现 */
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
         fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
@@ -1179,9 +1023,7 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     return site_idx;
 }
 
-/* A closure record carries its own destructor in the record, so its site index
- * exists only for leak accounting -- and there it must be unique per lambda,
- * otherwise every closure in the program reports under one source location. */
+/* 内部辅助实现 */
 static int reserve_closure_site(zan_irgen_t *g) {
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
@@ -1194,17 +1036,13 @@ static int reserve_closure_site(zan_irgen_t *g) {
     if (g->site_coll) g->site_coll[site_idx] = 0;
     if (g->site_coll_elem) g->site_coll_elem[site_idx] = NULL;
     if (g->desc_hdr) {
-        /* closure shape: the record releases its own captures, so the
-         * descriptor's dtor stays null and release falls back to the plain
-         * rc decrement (same as the table's null entry did) */
+        /* 内部辅助实现 */
         create_arc_desc(g, site_idx);
     }
     return site_idx;
 }
 
-/* The second zan_rt_alloc argument: in check-leaks builds the site index the
- * leak report keys on; in descriptor builds the per-shape descriptor pointer
- * release_dyn / is-as / reflect read back from the object header. */
+/* 内部辅助实现 */
 static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
     if (!g->desc_hdr)
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
@@ -1213,21 +1051,13 @@ static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
                              LLVMInt64TypeInContext(g->ctx), "desc.arg");
 }
 
-/* String RC header magic and sentinel refcount, and the object header layout
- * (ZAN_OBJ_* / ZAN_STRING_*), are defined in ../common/zan_abi.h. */
+/* 内部辅助逻辑 */
 
 /* ---- initialization ---- */
 
-/* Register a user-defined function so call sites can resolve it. The table
- * grows on demand: a fixed cap would silently drop functions in large
- * multi-file programs, leaving later calls unresolved and mis-typed. */
+/* 模块核心语义抽象与接口调用契约 */
 
-/* Build a call, tolerating a callee whose module-level declaration has a
- * different (ABI-compatible) signature than the call site expects. That
- * happens when a stdlib `static extern int fopen(...)` (Zan int = i64) and a
- * compiler-lowered builtin (`i8* fopen(...)`) both name the same libc symbol:
- * with typed-pointer LLVM builds the direct call would fail verification, so
- * route it through a bitcast of the function pointer instead. */
+/* 内部辅助实现 */
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm) {
     LLVMValueRef callee = fn;
@@ -1236,27 +1066,10 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     } else if (fn && !LLVMIsAFunction(fn) &&
                LLVMGetTypeKind(LLVMTypeOf(fn)) == LLVMPointerTypeKind &&
                LLVMTypeOf(fn) != LLVMPointerType(ty, 0)) {
-        /* Indirect callee: a delegate's function pointer and a closure
-         * record's destructor are both loaded as i8*, which a typed-pointer
-         * LLVM (<= 14) rejects as "Called function is not the same type as
-         * the call". Retype the pointer here rather than at every call site;
-         * on an opaque-pointer LLVM the types already match and this is a
-         * no-op. */
+        /* 内部辅助实现 */
         fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
     }
-    /* wasm32 inside a try body: every call can raise, so it must carry the
-     * unwind edge (invoke) to this try's landing pad -- a plain call that
-     * raises would skip every armed handler. The invoke's "then" block
-     * continues the current block; the value flows to followers unchanged.
-     * The wasm throw intrinsic itself must stay a plain call: it is noreturn
-     * and runs inside the catch pad (a funclet that must not unwind to the
-     * pad's own catchswitch).
-     *
-     * Dead as of the EH-free wasm32 lowering (irgen_stmt.c AST_TRY_STMT):
-     * wasm32 never arms a landing pad anymore -- the mini-game V8 builds
-     * reject the Exception section, so wasm_try_depth stays 0 and every call
-     * is a plain call. Kept compiling so a future wasm EH revival flips one
-     * branch, not three files. */
+    /* 内部辅助实现 */
     if (false && s_current_irgen && s_current_irgen->target_is_wasm &&
         s_current_irgen->wasm_try_depth > 0 &&
         !s_current_irgen->in_wasm_throw_op &&
@@ -1265,14 +1078,11 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
         LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
         LLVMValueRef parent = LLVMGetBasicBlockParent(cur);
         LLVMBasicBlockRef lpad = g->wasm_lpad_stack[g->wasm_try_depth - 1];
-        /* only convert calls of the function that armed this try: helper
-         * functions (the out-of-line __zan_eh_* builders) are emitted with
-         * the builder switched away while a try is open, and an invoke there
-         * would name a landing pad from another function */
+        /* 内部辅助实现 */
         if (!lpad ||
             LLVMGetBasicBlockParent(cur) != LLVMGetBasicBlockParent(lpad)) {
             LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
-            /* Carry the callee's sub-`int` promotions onto the call site. */
+            /* 模块核心语义抽象与接口调用契约 */
             if (callee && LLVMIsAFunction(callee)) {
                 static const char *ext[2] = { "signext", "zeroext" };
                 for (int e = 0; e < 2; e++) {
@@ -1308,9 +1118,7 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
         return inv;
     }
     LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
-    /* Carry the callee's sub-`int` promotions onto the call site: once the
-     * callee is bitcast the backend sees an opaque pointer and has nothing
-     * left to read the extension off. */
+    /* 内部辅助实现 */
     if (callee && LLVMIsAFunction(callee)) {
         static const char *ext[2] = { "signext", "zeroext" };
         for (int e = 0; e < 2; e++) {
@@ -1327,16 +1135,7 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     return call;
 }
 
-/* Release an async coroutine frame (`frame` as i8*).
- *
- * Plain free() is only correct while one thread owns the frame. Under
- * an external async executor can still hold a reference when the program
- * drops the frame -- an awaiter freeing a completed sub-task runs concurrently
- * with the worker whose step() just completed it, and a cancelled or reaped
- * frame may still name a task sitting in some worker's queue. So the
- * multi-worker driver takes the free through __zan_co_frame_free, which frees
- * immediately when nothing references the frame and otherwise hands the free
- * to the worker that will drop the last reference. */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
     if (g->external_async_executor && g->rt_co_frame_free) {
         zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
@@ -1347,8 +1146,7 @@ static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
               &frame_i8, 1, "");
 }
 
-
-/* Grow one of the IR registries to hold `need` entries. */
+/* 底层系统交互与数据协议契约 */
 static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     if (need <= *cap) return base;
     int ncap = *cap ? *cap * 2 : 256;
@@ -1362,19 +1160,19 @@ static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     return p;
 }
 
-/* Bucket for `p` in a table of `cap` (a power of two) slots. */
+/* 底层系统交互与数据协议契约 */
 static size_t irgen_ptr_bucket(const void *p, int cap) {
     uint64_t h = (uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull;
     return (size_t)((h >> 32) & (uint64_t)(cap - 1));
 }
 
-/* ---- function registry index (see zan_irgen.fn_index) ---- */
+/* 底层系统交互与数据协议契约 */
 
 static size_t fn_index_hash(zan_symbol_t *sym, int cap) {
     return irgen_ptr_bucket(sym, cap);
 }
 
-/* Record sym -> idx, keeping the entry already stored for a duplicate sym. */
+/* 模块核心语义抽象与接口调用契约 */
 static void fn_index_put(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
     size_t i = fn_index_hash(sym, g->fn_index_cap);
     while (g->fn_index[i].sym) {
@@ -1385,7 +1183,7 @@ static void fn_index_put(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
     g->fn_index[i].idx = idx;
 }
 
-/* Grow the index to `ncap` slots and reinsert every registered function. */
+/* 模块核心语义抽象与接口调用契约 */
 static void fn_index_rehash(zan_irgen_t *g, int ncap) {
     struct zan_fn_index_slot *slots =
         calloc((size_t)ncap, sizeof(*g->fn_index));
@@ -1400,7 +1198,7 @@ static void fn_index_rehash(zan_irgen_t *g, int ncap) {
         if (g->functions[i].sym) fn_index_put(g, g->functions[i].sym, i);
 }
 
-/* Index of `sym` in g->functions, or -1 when it was never registered. */
+/* 底层系统交互与数据协议契约 */
 static int irgen_find_function(zan_irgen_t *g, zan_symbol_t *sym) {
     if (!sym || !g->fn_index) return -1;
     size_t i = fn_index_hash(sym, g->fn_index_cap);
@@ -1423,30 +1221,23 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->functions[g->function_count].fn = fn;
     g->functions[g->function_count].fn_type = fn_type;
     g->functions[g->function_count].modifiers = sym ? sym->modifiers : 0;
-    /* Keep the index under 50% load so probe chains stay short. */
+    /* 模块核心语义抽象与接口调用契约 */
     if ((g->function_count + 1) * 2 >= g->fn_index_cap)
         fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);
     if (sym) fn_index_put(g, sym, g->function_count);
     g->function_count++;
 }
 
-/* ---- per-class member index ------------------------------------------------
- * Member lookup by name (get_method_sym, resolve_overload, get_field_sym) and
- * by declaration node (method_sym_for_decl): each class gets a lazily built hash
- * index of its members. Buckets chain in declaration order, so the
- * "first match wins" behaviour is preserved, and an index is
- * rebuilt when its class gains members (specialization appends members while
- * irgen runs). The table is file-static because the lookups are leaf helpers
- * without access to the irgen state; zan_irgen_init/destroy reset it. */
+/* 内部辅助实现 */
 
 typedef struct {
     zan_symbol_t *owner;
-    int built_count;    /* owner->member_count when the index was built */
-    int cap;            /* bucket count, a power of two */
-    int *name_buckets;  /* cap entries: first member index, or -1 */
-    int *name_next;     /* per member: next index in its bucket, or -1 */
-    int *decl_buckets;  /* cap entries: first member index, or -1 */
-    int *decl_next;     /* per member: next index in its bucket, or -1 */
+    int built_count;    /* 模块核心语义抽象与接口调用契约 */
+    int cap;            /* 核心系统底层抽象与内存语义契约 */
+    int *name_buckets;  /* 核心系统底层抽象与内存语义契约 */
+    int *name_next;     /* 底层系统交互与数据协议契约 */
+    int *decl_buckets;  /* 核心系统底层抽象与内存语义契约 */
+    int *decl_next;     /* 底层系统交互与数据协议契约 */
 } zan_class_index_t;
 
 static zan_class_index_t *g_class_indexes;
@@ -1495,7 +1286,7 @@ static void class_index_build(zan_class_index_t *ci, zan_symbol_t *owner) {
         ci->name_buckets[i] = -1;
         ci->decl_buckets[i] = -1;
     }
-    /* Insert back to front so every chain runs in declaration order. */
+    /* 模块核心语义抽象与接口调用契约 */
     for (int i = n - 1; i >= 0; i--) {
         zan_symbol_t *m = owner->members[i];
         size_t nb = (size_t)(istr_hash(m->name) & (uint64_t)(cap - 1));
@@ -1549,9 +1340,7 @@ static zan_class_index_t *class_index_for(zan_symbol_t *owner) {
     return ci;
 }
 
-/* First member index in `owner`'s bucket for `name`; -1 when the bucket is
- * empty. Walk on with member_next_named. Names still have to be compared: a
- * bucket may hold members of other names. */
+/* 模块核心语义抽象与接口调用契约 */
 static int member_first_named(zan_class_index_t *ci, zan_istr_t name) {
     return ci->name_buckets[istr_hash(name) & (uint64_t)(ci->cap - 1)];
 }
@@ -1565,14 +1354,10 @@ static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
            memcmp(m->name.str, name.str, (size_t)name.len) == 0;
 }
 
-/* Defined in irgen_generics.c, included at the bottom of this translation
- * unit. */
+/* Defined in irgen_generics */
 static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
 
-/* Guard a malloc/realloc result inside `fn`: if it is null, print "out of
- * memory" and exit(1) rather than carrying a null buffer into the store that
- * follows. Without this an exhausted heap surfaces as a SIGSEGV at a tiny
- * address (the element offset added to null) with no usable diagnosis. */
+/* 内部辅助实现 */
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, raw,
@@ -1581,20 +1366,13 @@ void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw)
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom.ok");
     LLVMBuildCondBr(g->builder, isnull, oom_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, oom_bb);
-    /* interned: every allocation site emits this same text; without the
-     * intern table each site carried its own @oomtxt.N .rdata copy. */
+    /* 内部辅助逻辑 */
     LLVMValueRef text = zan_irgen_intern_string(g, "out of memory\n");
     emit_fatal_report(g, text, 1);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* Add `delta` to a leak-tracking counter (`__zan_live` or a `__zan_site_live`
- * bucket). Allocation and release happen on every thread the scheduler runs --
- * `Thread.Start` bodies and coroutine workers alike -- so a load/add/store
- * trio loses updates whenever two threads allocate at once, which reported a
- * random handful of "still reachable" objects for programs that leaked
- * nothing. Relaxed ordering is enough: only the counter value matters, and the
- * report runs from atexit. */
+/* 内部辅助逻辑 */
 static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMBuildAtomicRMW(g->builder,
@@ -1603,8 +1381,7 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
         LLVMAtomicOrderingMonotonic, 0);
 }
 
-/* SEH codes for ARC integrity failures, recognized by the crash filter in
- * src/runtime/rt_crash.h (keep the two in sync). */
+/* 内部辅助逻辑 */
 #define ZAN_ARC_FAULT_RETAIN      0xE0A2C001u
 #define ZAN_ARC_FAULT_RELEASE     0xE0A2C002u
 #define ZAN_ARC_FAULT_STR_RETAIN  0xE0A2C003u
@@ -1615,20 +1392,10 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
 #define ZAN_ARC_FAULT_ARR_RELEASE 0xE0A2C008u
 #define ZAN_ARC_FAULT_USE_ARR     0xE0A2C009u
 
-/* Refcount value written over a quarantined block under --arc-guard. Picked so
- * it can never be a live count and is recognizable in a memory dump. */
+/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_ARC_FREED_MARK 0xDEAD0000DEAD0000ull
 
-/* Trap a retain/release of an object whose refcount is already zero: the
- * reference being used is dangling, so this is the *cause* of a later
- * use-after-free read, caught at the operation that corrupts the count rather
- * than frames later when the freed memory is dereferenced.
- *
- * On Windows the report is a non-continuable SEH exception carrying
- * (obj, refcount, site), which the installed crash filter turns into the usual
- * zan_crash.log record -- with the symbolized backtrace of the offending
- * retain/release. Elsewhere it prints the same facts and exits, since there is
- * no filter to hand them to. Ends the current block; never returns. */
+/* 内部辅助实现 */
 static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
                                   LLVMValueRef rc_old, LLVMValueRef site,
                                   unsigned code, const char *what) {
@@ -1670,21 +1437,14 @@ static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
     LLVMBuildUnreachable(g->builder);
 }
 
-/* Defined in irgen_arc.c: the shared destroy tail (leak counters, then
- * --arc-guard quarantine or a plain free of the 16-byte header), factored so
- * zan_rt_release's free path and the per-class/collection/closure release
- * bodies all free through one code path. */
+/* Defined in irgen_arc */
 static LLVMValueRef get_arc_free_decl(zan_irgen_t *g);
 
 static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc_old, LLVMValueRef obj,
                                     LLVMValueRef site, unsigned code,
                                     const char *what) {
-    /* --arc-guard (diagnostic builds): report the full fault (object, site,
-     * backtrace) and exit(70). An over-release is a real bug, but today it
-     * only leaks (the count never reaches zero, so nothing is freed), and
-     * programs that carry one still run -- aborting them by default would
-     * turn a leak into a crash, so the trap is opt-in. */
+    /* 内部辅助逻辑 */
     if (g->arc_guard) {
         if (!g->runtime_checks) return;
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1698,12 +1458,7 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
         LLVMPositionBuilderAtEnd(g->builder, ok_bb);
         return;
     }
-    /* --publish net: the same comparison, but the report is a fail-soft note
-     * (once per kind: stderr + the runtime log) and execution CONTINUES --
-     * the decrement already happened either way, so the only thing the net
-     * changes is that the leak now announces itself. Same shape as the
-     * runtime-check guards: split prefix/msg notes where the linked runtime
-     * has them, merged one-arg text on the cross-target fallback. */
+    /* 内部辅助实现 */
     if (!g->arc_net) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
@@ -1741,11 +1496,7 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* --arc-guard: a block whose refcount slot carries the quarantine marker is
- * being retained or released through a reference that outlived its owner -- a
- * *missing* retain, which plain refcounting cannot notice because the counts
- * balanced. Reported at the first later use, whose backtrace names the code
- * holding the stale reference. */
+/* 内部辅助实现 */
 static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc, LLVMValueRef obj,
                                     unsigned code, const char *what) {
@@ -1758,9 +1509,7 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.ok");
     LLVMBuildCondBr(g->builder, freed, bad_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    /* The quarantine stashed the address that released the block in the site
-     * word, so the report names both ends of the bug: this backtrace is the
-     * stale use, `freed_by` is the release that ended the block's life. */
+    /* 内部辅助实现 */
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8t, obj,
         (LLVMValueRef[]){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1, "uafsp");
     LLVMValueRef sip = LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "uafsip");
@@ -1769,10 +1518,7 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* --arc-guard: instead of returning the block to the allocator, mark it
- * quarantined and poison the first payload byte. The block is intentionally
- * leaked so its address is never recycled, which is what makes a stale
- * reference detectable instead of silently pointing at somebody else's data. */
+/* 内部辅助逻辑 */
 static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
                                LLVMValueRef rc_iptr) {
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
@@ -1781,9 +1527,7 @@ static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
     LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), rc_iptr);
     LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
-    /* Overwrite the site word with the caller of this release: with the block
-     * quarantined the site index is no longer needed, and the return address
-     * is what tells a later stale use *where* the block was freed. */
+    /* 内部辅助实现 */
     LLVMTypeRef ra_ty = LLVMFunctionType(i8p, &i32t, 1, 0);
     LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
     if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
@@ -1795,15 +1539,7 @@ static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
     LLVMBuildStore(g->builder, LLVMBuildPtrToInt(g->builder, ra, i64t, "ran"), sip);
 }
 
-/* On Windows, guard an about-to-be-dereferenced string header pointer (obj-8,
- * the STRING_MAGIC slot) against freed/unmapped pages. The tolerant retain and
- * release probe [obj-8] to decide whether a pointer is a managed string; for a
- * bare buffer (e.g. a [DllImport] calloc result typed as string) that was
- * manually free()d, the page may already be unmapped, so the probe load itself
- * would fault. If IsBadReadPtr(ptr8, 8) is true we treat the pointer as
- * non-managed and branch to ret_bb. kernel32 is always linked on Windows, so
- * no extra runtime object is required. On Windows this leaves the builder
- * positioned in a fresh "readable" block; elsewhere it is a no-op. */
+/* 内部辅助实现 */
 static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
                                    LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb) {
     if (!g->target_is_windows) return;
@@ -1824,9 +1560,7 @@ static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, readable_bb);
 }
 
-/* Emit one __zan_arc_trace_ev call: tag letter, object, post-op refcount,
- * allocation-site index, and the immediate caller's return address
- * (diagnostic; the trace function itself gates printing on $ZAN_ARC_TRACE). */
+/* 内部辅助实现 */
 static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 const char *tag, LLVMValueRef obj,
                                 LLVMValueRef rc, LLVMValueRef site) {
@@ -1857,15 +1591,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
-    /* The ARC runtime functions are emitted from this call, so their guards
-     * have to be decided before it runs -- not by a later field assignment.
-     * reserve_arc_site also keys on it: only check-leaks builds keep the
-     * fixed-size site tables. */
+    /* 内部辅助实现 */
     g->runtime_checks = runtime_checks;
     g->arc_guard = arc_guard;
     g->arc_net = arc_net;
     g->check_leaks = check_leaks;
-    /* Set target before runtime codegen so Sleep/poll selection is correct. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;
@@ -1878,25 +1609,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->target_is_macos = true;
 #endif
     }
-    /* Must be set before the inline coroutine driver is (conditionally)
-     * emitted below, so the multi-worker mode can skip it. */
+    /* 内部辅助逻辑 */
     g->external_async_executor = external_async_executor;
     g->has_async_work = false;
 
-    /* --publish string obfuscation is off unless the driver turns it on. This
-     * scrambling pad is not encryption: the key ships in the image next to the
-     * tables the startup constructor walks, so it only raises the cost of
-     * `strings`-style extraction. It is derived per build from the module name
-     * and target rather than being one constant shared by every Zan program,
-     * so a script written against one binary's pad does not unscramble the
-     * next one -- and it stays a pure function of the build inputs, so a
-     * rebuild of the same sources still reproduces the same image. */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         static const unsigned char zan_obf_pad[16] = {
             0x5a, 0x67, 0xa3, 0x1c, 0xd9, 0x84, 0x2f, 0x70,
             0xbe, 0x11, 0x4d, 0xe6, 0x93, 0x28, 0xc5, 0x7a
         };
-        uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a over the build identity */
+        uint64_t h = 0xcbf29ce484222325ULL; /* 核心系统底层抽象与内存语义契约 */
         const char *seeds[2] = { module_name ? module_name : "",
                                  g->target_triple };
         for (int s = 0; s < 2; s++) {
@@ -1930,8 +1653,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
     g->builder = LLVMCreateBuilderInContext(g->ctx);
 
-    /* Debug info off by default; the driver flips emit_debug on for `-g` before
-     * calling zan_irgen_emit. */
+    /* 内部辅助逻辑 */
     g->emit_debug = false;
     g->di_builder = NULL;
     g->di_cu = NULL;
@@ -1940,19 +1662,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->di_cur_line = 0;
     g->di_cur_file = 0;
 
-    /* runtime-diagnostics defaults */
+    /* 核心系统底层抽象与内存语义契约 */
     g->src_file = module_name;
 
-    /* leak-tracking globals are always created; instrumentation and reporting
-     * are gated on g->check_leaks, so normal builds still optimize them away. */
+    /* 内部辅助实现 */
     g->g_live = LLVMAddGlobal(g->mod, LLVMInt64TypeInContext(g->ctx), "__zan_live");
     LLVMSetInitializer(g->g_live, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
     LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
 
     g->leak_site_count = 0;
-    /* descriptor mode (default; check_leaks keeps the site-index layout):
-     * one record global per alloc-site shape, created lazily at reserve time
-     * and initialized at finalize */
+    /* 内部辅助实现 */
     g->desc_hdr = !check_leaks;
     g->desc_gv_cap = 0;
     g->leak_site_cap = 256;
@@ -1960,12 +1679,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         if (!g->desc_hdr) {
-            /* The site tables are emitted at finalize with the real
-             * site count, so instrumentation reaches them through pointer
-             * globals (a global's type is fixed at creation, long before the
-             * count is known) and every runtime index check loads
-             * __zan_site_count instead of comparing against a fixed cap.
-             * Host-side per-site metadata below still grows dynamically. */
+            /* 内部辅助实现 */
             g->g_site_count = LLVMAddGlobal(g->mod, i64t, "__zan_site_count");
             LLVMSetInitializer(g->g_site_count, LLVMConstInt(i64t, 0, 0));
             LLVMSetLinkage(g->g_site_count, LLVMInternalLinkage);
@@ -1975,13 +1689,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             g->g_site_names = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_names");
             LLVMSetInitializer(g->g_site_names, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
-            /* per-site concrete destructor for release dispatch, ancestor-name
-             * list pointers for runtime `is`/`as` checks, and the reflection
-             * type record for obj.GetType(). The three per-shape tables below
-             * exist ONLY in check-leaks mode: descriptor builds (default)
-             * store one {dtor, tynames, meta, site} record pointer in the
-             * object header instead, so no global array pins every class's
-             * methods and --gc-sections can drop dead ones. */
+            /* 内部辅助实现 */
             g->g_site_dtors = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_dtors");
             LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
@@ -2000,7 +1708,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->site_loc_line = (uint32_t *)calloc(g->leak_site_cap, sizeof(uint32_t));
     }
 
-    /* declare printf */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef printf_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef printf_type = LLVMFunctionType(
         LLVMInt32TypeInContext(g->ctx), printf_args, 1, 1 /* varargs */);
@@ -2008,13 +1716,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->fn_printf = printf_fn;
     g->printf_type = printf_type;
 
-    /* declare zan_rt_println(const char*) → calls printf("%s\n", str) */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMTypeRef println_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef println_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), println_args, 1, 0);
     g->rt_println = LLVMAddFunction(g->mod, "zan_rt_println", println_type);
 
-    /* implement zan_rt_println */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_println, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
@@ -2023,7 +1731,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_int(int64) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef pint_args[] = { LLVMInt64TypeInContext(g->ctx) };
     LLVMTypeRef pint_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), pint_args, 1, 0);
@@ -2036,7 +1744,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_uint(uint64) → unsigned (%llu) println for ulong */
+    /* 模块核心语义抽象与接口调用契约 */
     g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
@@ -2046,7 +1754,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, uargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* declare zan_rt_print_double(double) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef pdbl_args[] = { LLVMDoubleTypeInContext(g->ctx) };
     LLVMTypeRef pdbl_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), pdbl_args, 1, 0);
@@ -2054,8 +1762,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef pdbl_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_double, "entry");
     LLVMPositionBuilderAtEnd(g->builder, pdbl_entry);
-    /* shortest round-trip spelling, not %g (audit D6/D25): %g kept six
-     * significant digits and printed the specials as 1.#INF / 1.#QNAN */
+    /* 内部辅助逻辑 */
     {
         LLVMTypeRef i8p_t = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64_t = LLVMInt64TypeInContext(g->ctx);
@@ -2076,12 +1783,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     LLVMBuildRetVoid(g->builder);
 
-    /* declare C library functions for string interpolation */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
 
-    /* int snprintf(char*, size_t, const char*, ...) */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef snprintf_args[] = { i8ptr, i64, i8ptr };
     LLVMTypeRef snprintf_type = LLVMFunctionType(i32, snprintf_args, 3, 1);
     g->fn_snprintf = LLVMAddFunction(g->mod, "snprintf", snprintf_type);
@@ -2091,18 +1798,18 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef malloc_type = LLVMFunctionType(i8ptr, malloc_args, 1, 0);
     g->fn_malloc = LLVMAddFunction(g->mod, "malloc", malloc_type);
 
-    /* void free(void*) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef free_args[] = { i8ptr };
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
 
-    /* void exit(int) → used by runtime-check panics */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
     if (g->check_leaks) {
-        /* int atexit(void(*)(void)) → used to schedule the leak report */
+        /* 模块核心语义抽象与接口调用契约 */
         LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
         LLVMTypeRef atexit_args[] = { void_fn_ptr };
@@ -2115,74 +1822,53 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef realloc_type = LLVMFunctionType(i8ptr, realloc_args, 2, 0);
     g->fn_realloc = LLVMAddFunction(g->mod, "realloc", realloc_type);
 
-    /* List struct type: { i64 count, i64 capacity, i64* data } */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef list_fields[] = { i64, i64, LLVMPointerType(i64, 0) };
     g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
     LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
 
-    /* Span<T> value type: { i8* base, i64 length }. A non-owning view over a
-     * contiguous run of T (a compact array or raw memory); it is a value
-     * struct, copied by value and never ARC-released. */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef span_fields[] = { i8ptr, i64 };
     g->span_struct_type = LLVMStructCreateNamed(g->ctx, "Span");
     LLVMStructSetBody(g->span_struct_type, span_fields, 2, 0);
 
-    /* Dict struct type:
-     *   { i64 count, i64 capacity, i8** keys, i64* values,
-     *     i64* index, i64 index_capacity, i64 indexed_count }
-     * Entries stay in insertion order in the parallel keys/values buffers (so
-     * enumeration order and the ARC release walk are unchanged); `index` is an
-     * open-addressed hash index over them holding `entry + 1` per slot (0 =
-     * empty), rebuilt lazily by __zan_dict_find whenever `indexed_count` no
-     * longer matches `count` or a removal invalidated it (index_capacity 0). */
+    /* 内部辅助实现 */
     LLVMTypeRef dict_fields[] = { i64, i64, LLVMPointerType(i8ptr, 0), LLVMPointerType(i64, 0),
                                   LLVMPointerType(i64, 0), i64, i64, i64 };
     g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
     LLVMStructSetBody(g->dict_struct_type, dict_fields, 8, 0);
 
-    /* Task struct: { completed: i64, result: i64, thread_handle: i64 } */
+    /* 底层系统交互与数据协议契约 */
     g->task_struct_type = LLVMStructCreateNamed(g->ctx, "Task");
     LLVMTypeRef task_fields[] = { i64, i64, i64 };
     LLVMStructSetBody(g->task_struct_type, task_fields, 3, 0);
 
-    /* StringBuilder struct type: { i64 count, i64 capacity, i8* data } */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef sb_fields[] = { i64, i64, i8ptr };
     g->sb_struct_type = LLVMStructCreateNamed(g->ctx, "StringBuilder");
     LLVMStructSetBody(g->sb_struct_type, sb_fields, 3, 0);
 
-    /* async/await CPS driver ABI (see docs/ASYNC_CPS_DESIGN.md):
-     *   typedef void (*zan_co_step_t)(void *frame);
-     *   void zan_co_ready(void *frame, zan_co_step_t step);
-     * A resume/step fn takes the heap frame (as i8*) and re-enters the state
-     * machine. zan_co_ready enqueues (frame, step) on the cooperative driver. */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMTypeRef co_step_args[] = { i8ptr };
     g->co_step_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_step_args, 1, 0);
     g->co_step_ptr = LLVMPointerType(g->co_step_type, 0);
     LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
     g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
-    /* i32 zan_co_poll(void): cooperative preemption checkpoint. The compiler
-     * plants a call at every loop back-edge inside an async function; a
-     * non-zero return means the running frame has held the worker past its
-     * slice and must requeue itself (the exact Task.Yield sequence). */
+    /* 底层系统交互与数据协议契约 */
     g->rt_co_poll_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_poll = LLVMAddFunction(g->mod, "zan_co_poll", g->rt_co_poll_type);
-    /* void __zan_co_frame_free(void *frame): release an async frame through the
-     * multi-worker driver, which defers the free while the scheduler still
-     * references the frame (running on some worker, or queued on another). */
+    /* 内部辅助实现 */
     g->rt_co_frame_free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
     g->rt_co_frame_free = LLVMAddFunction(g->mod, "__zan_co_frame_free",
                                           g->rt_co_frame_free_type);
-    /* void zan_co_sched_init(void) / void zan_co_sched_run(void): root drive */
+    /* 编译期中间表示与代码生成内部规范 */
     g->rt_co_sched_init_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
     g->rt_co_sched_run_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_run = LLVMAddFunction(g->mod, "zan_co_sched_run", g->rt_co_sched_run_type);
-    /* void zan_co_sched_run_until(i32* done): the same pump, stopping as soon as
-     * the flag it is given is set. A synchronous context awaiting one coroutine
-     * uses it so that a background coroutine which never completes (a flusher
-     * loop, a spawned server) cannot keep the await from returning. */
+    /* 内部辅助逻辑 */
     g->rt_co_sched_run_until_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
         (LLVMTypeRef[]){ LLVMPointerType(LLVMInt32TypeInContext(g->ctx), 0) }, 1, 0);
     g->rt_co_sched_run_until = LLVMAddFunction(g->mod, "zan_co_sched_run_until",
@@ -2194,11 +1880,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_co_delay = LLVMAddFunction(g->mod, "zan_co_delay", g->rt_co_delay_type);
     }
 
-    /* Socket-async readiness reactor (S4b-2). zan_io_wait_co is an external
-     * symbol resolved from the shipped zanrt_io object only when a program uses
-     * socket await (otherwise unreferenced, so no link dependency).
-     * zan_io_pump_timeout has a WEAK timer-only fallback; linking zanrt_io
-     * overrides it with the real timeout-bounded reactor pump. */
+    /* 核心系统底层抽象与内存语义契约 */
     {
         LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32d = LLVMInt32TypeInContext(g->ctx);
@@ -2240,8 +1922,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g->rt_io_pump_timeout,
             g->external_async_executor ? LLVMExternalLinkage : LLVMExternalWeakLinkage);
 
-        /* Pending-work predicate for the scheduler's termination decision;
-         * same weak pattern as the pump so timer-only programs link. */
+        /* 内部辅助实现 */
         g->rt_io_has_pending_type = LLVMFunctionType(i32d, NULL, 0, 0);
         g->rt_io_has_pending = LLVMAddFunction(g->mod, "zan_io_has_pending",
             g->rt_io_has_pending_type);
@@ -2262,19 +1943,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     g->uses_socket_async = false;
 
-    /* Emit the cooperative coroutine driver inline (the whole Zan runtime is
-     * emitted into the module, so produced programs are self-contained → see
-     * the ARC/List helpers below). The ready queue is a singly-linked FIFO of
-     * malloc'd nodes {next, frame, step}; zan_co_ready appends, zan_co_sched_run
-     * drains, popping+freeing a node before invoking its step (which may itself
-     * enqueue). Semantically equivalent to src/runtime/rt_co.c.
-     *
-     * Skipped when an external executor is selected: the driver symbols are
-     * then left as external declarations and resolved from the selected
-     * external executor object at link time. */
+    /* 内部辅助实现 */
     if (!g->external_async_executor) {
         LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
-        LLVMTypeRef node_fields[] = { i8ptr /*next*/, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
+        LLVMTypeRef node_fields[] = { i8ptr /* next */, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
         LLVMTypeRef node_ty = LLVMStructCreateNamed(g->ctx, "zan.co.node");
         LLVMStructSetBody(node_ty, node_fields, 3, 0);
         LLVMValueRef g_head = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_head");
@@ -2283,46 +1955,28 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef g_tail = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_tail");
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
-        /* Retired queue nodes are recycled through this free list instead of
-         * going back to malloc: every await costs one enqueue, so a keep-alive
-         * HTTP request paid six malloc/free pairs purely for queue plumbing.
-         * The list is bounded by the peak ready-queue depth. */
+        /* 内部辅助实现 */
         LLVMValueRef g_nodes = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_nodes");
         LLVMSetInitializer(g_nodes, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_nodes, LLVMInternalLinkage);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
 
-        /* Preemption bookkeeping: __zan_co_quantum_us caches the
-         * cooperative slice length (zan_co_quantum_ms * 1000, from the
-         * linked timer runtime; 0 = disabled) and __zan_co_slice_start is
-         * stamped by the dispatch path below, so zan_co_poll can decide
-         * whether the running frame has outrun its budget. Both live in
-         * monotonic microseconds: the ms wall clock ticks at ~15.6ms on
-         * Windows and would stretch the 2ms default to a clock tick. */
+        /* 内部辅助实现 */
         LLVMValueRef g_slice_start = LLVMAddGlobal(g->mod, i64t, "__zan_co_slice_start");
         LLVMSetInitializer(g_slice_start, LLVMConstInt(i64t, 0, 0));
-        /* Poll clock-read gate: zan_co_poll runs at every loop
-         * back-edge, and the per-iteration clock call was ~85% of a compute
-         * loop's cost. The M:1 driver is single-threaded, so a plain global
-         * counter skips 255 of 256 polls; the 2ms quantum overshoots by at
-         * most 256 iterations of ns-grade work. */
+        /* 内部辅助实现 */
         LLVMValueRef g_poll_tick = LLVMAddGlobal(g->mod, i64t, "__zan_co_poll_tick");
         LLVMSetInitializer(g_poll_tick, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_slice_start, LLVMInternalLinkage);
         LLVMValueRef g_quantum = LLVMAddGlobal(g->mod, i64t, "__zan_co_quantum_us");
         LLVMSetInitializer(g_quantum, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_quantum, LLVMInternalLinkage);
-        /* extern long long zan_co_quantum_ms(void) / zan_co_precise_us(void):
-         * both resolved from the linked timer runtime, which the driver
-         * already depends on for zan_timer_delay. The timer heap's deadlines
-         * AND slice bookkeeping both run on precise_us. */
+        /* 内部辅助实现 */
         LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
         LLVMValueRef co_quantum = LLVMAddFunction(g->mod, "zan_co_quantum_ms", now_type);
         LLVMValueRef precise_now = LLVMAddFunction(g->mod, "zan_co_precise_us", now_type);
 
-        /* The unified timer runtime owns a dynamic-array min-heap shared by
-         * Task.Delay and public Timer entries. Public clear operations filter by
-         * entry kind, so they cannot remove coroutine delays. */
+        /* 模块核心语义抽象与接口调用契约 */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef timer_reset_type = LLVMFunctionType(voidt, NULL, 0, 0);
         LLVMValueRef timer_reset = LLVMAddFunction(g->mod, "zan_timer_runtime_reset", timer_reset_type);
@@ -2336,8 +1990,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef timer_next = LLVMAddFunction(g->mod, "zan_timer_next_timeout", timer_next_type);
         LLVMValueRef timer_dispatch = LLVMAddFunction(g->mod, "zan_timer_dispatch_due", timer_next_type);
 
-        /* Declare the platform sleep primitive for the *target* OS (not host):
-         * Sleep (kernel32) on Windows, poll(NULL,0,ms) on POSIX/Linux. */
+        /* 内部辅助实现 */
         LLVMTypeRef sleep_args[] = { i32t };
         LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
         LLVMValueRef fn_sleep = NULL;
@@ -2349,7 +2002,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         else
             fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
 
-        /* Timer-only fallback for programs that do not link the IO reactor. */
+        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_io_pump_timeout, "entry");
@@ -2377,9 +2030,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
-        /* Weak has-pending fallback for programs that do not link the IO
-         * reactor: nothing can be pending, so the scheduler's termination
-         * rule degenerates to the old woke/timer check. */
+        /* 内部辅助实现 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_io_has_pending, "entry");
@@ -2387,7 +2038,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
-        /* void zan_co_sched_init(void): reset queues and timer heap. */
+        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_init, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2404,11 +2055,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* i32 zan_co_poll(void): 1 when the running frame has held the
-         * worker past its quantum. The clock call is gated to every 256th
-         * back-edge (__zan_co_poll_tick, see the global above); the dispatch
-         * path restamps __zan_co_slice_start, so a requeued frame gets a
-         * fresh slice. */
+        /* 内部辅助逻辑 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "entry");
             LLVMBasicBlockRef check = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "check");
@@ -2444,8 +2091,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
         }
 
-        /* void zan_co_delay(i64 ms, i8* frame, step): register in the unified
-         * timer runtime's min-heap. */
+        /* 内部辅助逻辑 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_delay, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2456,7 +2102,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_ready(void* frame, step): if step, append a node. */
+        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "entry");
             LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "cont");
@@ -2472,7 +2118,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCondBr(g->builder, step_null, ret, cont);
 
             LLVMPositionBuilderAtEnd(g->builder, cont);
-            /* node = freelist ? pop(freelist) : malloc(node) */
+            /* 底层系统交互与数据协议契约 */
             LLVMBasicBlockRef reuse_bb = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_co_ready, "node.reuse");
             LLVMBasicBlockRef alloc_bb = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2495,8 +2141,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef fresh = zan_call2(g->builder, malloc_type, g->fn_malloc,
                 (LLVMValueRef[]){ LLVMSizeOf(node_ty) }, 1, "node");
             zan_irgen_emit_oom_check(g, g->rt_co_ready, fresh);
-            /* the check splits alloc_bb: the edge into have_bb now leaves its
-             * continuation block, which is what the phi must name. */
+            /* 内部辅助逻辑 */
             LLVMBasicBlockRef fresh_bb = LLVMGetInsertBlock(g->builder);
             LLVMBuildBr(g->builder, have_bb);
 
@@ -2532,12 +2177,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_sched_run_until(i32* done): drain the ready queue,
-         * invoking each step. When it empties, poll IO up to the earliest timer
-         * deadline. Re-check after every wake or timeout and exit when ready
-         * work, timers, and IO are all exhausted -- or, before every step, as
-         * soon as `done` (an awaited frame's DONE flag; null = drain) is set.
-         * zan_co_sched_run() below is this function with a null flag. */
+        /* 内部辅助逻辑 */
         {
             LLVMValueRef runfn = g->rt_co_sched_run_until;
             LLVMTypeRef i32p = LLVMPointerType(i32t, 0);
@@ -2556,7 +2196,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef doneptr = LLVMGetParam(runfn, 0);
             LLVMBuildBr(g->builder, head_bb);
 
-            /* loop head: stop early once the flag we were handed is set. */
+            /* 模块核心语义抽象与接口调用契约 */
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
             LLVMValueRef no_flag = zan_icmp(g->builder, LLVMIntEQ, doneptr,
                 LLVMConstNull(i32p), "done.noflag");
@@ -2591,23 +2231,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, after_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, after_bb);
-            /* recycle the node (push on the free list) rather than free it;
-             * the step below may enqueue again and pop it right back. */
+            /* 内部辅助逻辑 */
             LLVMBuildStore(g->builder,
                 LLVMBuildLoad2(g->builder, i8ptr, g_nodes, "nodes.head"),
                 LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.recycle"));
             LLVMBuildStore(g->builder, head, g_nodes);
-            /* Busy-path timer dispatch: a frame that requeues itself every
-             * slice (a preempted compute loop) never lets the queue drain,
-             * and the idle path below would never pump due timers. Firing
-             * due timers here (cheap heap peek under the timer lock) keeps
-             * Delay/Timer deliveries alive under sustained load. */
+            /* 内部辅助实现 */
             (void)zan_call2(g->builder, timer_next_type, timer_dispatch,
                 NULL, 0, "due.busy");
-            /* stamp the slice start: zan_co_poll measures from here, so a
-             * requeued (preempted) frame gets a fresh budget on redispatch.
-             * Microsecond grade (zan_co_precise_us) -- the ms wall clock's
-             * ~15.6ms Windows tick would stretch slices to a clock tick. */
+            /* 内部辅助实现 */
             LLVMValueRef slice_now = zan_call2(g->builder, now_type, precise_now,
                 NULL, 0, "slice.now");
             LLVMBuildStore(g->builder, slice_now, g_slice_start);
@@ -2635,12 +2267,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ timeout }, 1, "woke");
             LLVMValueRef more = zan_icmp(g->builder, LLVMIntSGT, woke,
                 LLVMConstInt(i64t, 0, 0), "io.more");
-            /* A wake-less pump turn is NOT quiescence while IO ops or
-             * blocking jobs are still in flight: their completions (and a
-             * blocking worker's wake packet that outlived its already-drained
-             * job) arrive through later pumps. Exiting here would terminate
-             * parked frames mid-program; keep running until nothing is
-             * parked anywhere -- no ready work, no timer, no pending IO. */
+            /* 内部辅助实现 */
             LLVMValueRef pend = zan_call2(g->builder,
                 g->rt_io_has_pending_type, g->rt_io_has_pending, NULL, 0,
                 "io.pending");
@@ -2656,7 +2283,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* void zan_co_sched_run(void): pump with no stop flag, i.e. drain. */
+        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_co_sched_run, "entry");
@@ -2668,23 +2295,19 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         }
         (void)voidt;
     }
-    /* Shared frame header, identical prefix of every async frame, so the await
-     * protocol can touch a sub-frame's header fields through an i8* without
-     * knowing its concrete frame type (see ASYNC_FRAME_* indices). */
+    /* 内部辅助实现 */
     LLVMTypeRef co_hdr_fields[] = {
         i64, g->co_step_ptr,   /* SCHED, SCHED_STEP: scheduler-owned */
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
         i8ptr, g->co_step_ptr, i64,
         g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
-        g->co_step_ptr, /* SELF_STEP: frame's own resume fn */
-        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx), /* pending exception */
-        LLVMInt32TypeInContext(g->ctx), /* CANCEL: cancellation requested */
-        i8ptr, /* CHILD: sub-frame currently awaited */
-        i8ptr  /* LNEXT: live detached-frame list link */
+        g->co_step_ptr, /* 核心系统底层抽象与内存语义契约 */
+        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx), /* 核心系统底层抽象与内存语义契约 */
+        LLVMInt32TypeInContext(g->ctx), /* 核心系统底层抽象与内存语义契约 */
+        i8ptr, /* 核心系统底层抽象与内存语义契约 */
+        i8ptr  /* 底层系统交互与数据协议契约 */
     };
-    /* Stops before ASYNC_FRAME_HSTACK: the per-handler arrays are sized per
-     * function (one slot per try in that body), so they are not part of the
-     * shared prefix. Only the fields above are reached through this type. */
+    /* 内部辅助实现 */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
     LLVMStructSetBody(g->co_header_type, co_hdr_fields, 16, 0);
     g->current_async_frame = NULL;
@@ -2701,38 +2324,34 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_sub_rethrow_bb = NULL;
     g->current_async_sub_rethrow_phi_sub = NULL;
     g->current_async_sub_rethrow_phi_ev = NULL;
+    g->current_async_sub_slot_ptr = NULL;
 
-    /* int strcmp(const char*, const char*) */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcmp_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), strcmp_args, 2, 0);
     g->fn_strcmp = LLVMAddFunction(g->mod, "strcmp", strcmp_type);
 
-    /* char *strrchr(const char*, int) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strrchr_args[] = { i8ptr, LLVMInt32TypeInContext(g->ctx) };
     LLVMTypeRef strrchr_type = LLVMFunctionType(i8ptr, strrchr_args, 2, 0);
     LLVMAddFunction(g->mod, "strrchr", strrchr_type);
 
-    /* size_t strlen(const char*) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strlen_args[] = { i8ptr };
     LLVMTypeRef strlen_type = LLVMFunctionType(i64, strlen_args, 1, 0);
     g->fn_strlen = LLVMAddFunction(g->mod, "strlen", strlen_type);
 
-    /* char *strcpy(char*, const char*) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strcpy_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcpy_type = LLVMFunctionType(i8ptr, strcpy_args, 2, 0);
     g->fn_strcpy = LLVMAddFunction(g->mod, "strcpy", strcpy_type);
 
-    /* char *strcat(char*, const char*) */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strcat_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcat_type = LLVMFunctionType(i8ptr, strcat_args, 2, 0);
     g->fn_strcat = LLVMAddFunction(g->mod, "strcat", strcat_type);
 
-    /* Per-event ARC trace for check-leaks builds. The events
-     * are printed only when ZAN_ARC_TRACE is set in the environment, so plain
-     * --check-leaks runs stay quiet. Each event records the tag (A=alloc,
-     * R=retain, r=release, D=release-dispatch), the object, its allocation
-     * site index, the post-op refcount, and the caller's return address --
-     * enough to attribute a stray +1 to the exact call site offline. */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef arc_trace_ev = NULL;
     LLVMTypeRef arc_ra_ty = NULL;
     LLVMTypeRef arc_ev_ty = NULL;
@@ -2801,24 +2420,24 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         (void)ev_tag;
     }
 
-    /* ARC runtime: zan_rt_retain(void*) -> void */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef retain_args[] = { i8ptr };
     LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
     g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
 
-    /* implement zan_rt_retain: atomically increment refcount at offset -16 */
+    /* 底层系统交互与数据协议契约 */
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_retain, 0);
-        /* null check */
+        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj,
             LLVMConstNull(i8ptr), "isnull");
         LLVMBasicBlockRef do_retain = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "retain");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_retain);
         LLVMPositionBuilderAtEnd(g->builder, do_retain);
-        /* refcount is the first header word, at (int64_t*)(obj - 16) */
+        /* 底层系统交互与数据协议契约 */
         LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
@@ -2851,18 +2470,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* The weak registry helpers go here rather than with the other early
-     * runtime pieces: zan_rt_weak_load_retain's body calls zan_rt_retain, so
-     * the retain definition must exist first. zan_rt_weak_nil_all is still
-     * emitted before zan_rt_release, whose free path calls it. */
+    /* 内部辅助实现 */
     emit_weak_runtime(g);
 
-    /* ARC runtime: zan_rt_release(void*) -> void */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef release_args[] = { i8ptr };
     LLVMTypeRef release_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
     g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
 
-    /* implement zan_rt_release: decrement refcount, free if 0 */
+    /* 底层系统交互与数据协议契约 */
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2885,7 +2501,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                                      "release through a stale reference "
                                      "(object was already freed)");
         }
-        /* atomically decrement; LLVMBuildAtomicRMW returns the pre-op value */
+        /* 底层系统交互与数据协议契约 */
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
         {
@@ -2908,7 +2524,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 "rrsite");
             emit_arc_trace_call(g, arc_trace_ev, "r", obj, rc1, rsite);
         }
-        /* if rc1 == 0, free the object (16-byte header precedes obj) */
+        /* 底层系统交互与数据协议契约 */
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(i64, 0, 0), "iszero");
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
@@ -2923,13 +2539,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* ARC runtime: zan_rt_release_dyn(void*) -> void
-     * Read the allocation-site index recorded in the header and dispatch to
-     * that site's concrete per-class destructor (releases the object's RC
-     * fields, then decrements/frees). Falls back to a plain zan_rt_release
-     * when the site has no destructor. Using the recorded (concrete) site
-     * makes release follow the *runtime* type, so derived-instance fields are
-     * freed even when the value is held through a base-typed reference. */
+    /* 内部辅助实现 */
     {
         if (!g->rt_arr_release) {
             LLVMTypeRef arr_fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
@@ -2948,12 +2558,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
         LLVMPositionBuilderAtEnd(g->builder, cont);
-        /* Interned string literals carry ZAN_STRING_SENTINEL_RC and live in
-         * static (read-only) storage; their second header word is
-         * the string tag plus length, not a site index, so without this guard
-         * they fall through to the plain-object releaser and fault writing the
-         * refcount.
-         * A sentinel rc means immortal: nothing to release. */
+        /* 内部辅助实现 */
         LLVMValueRef sent16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef sent_rc = LLVMBuildLoad2(g->builder, i64,
             LLVMBuildBitCast(g->builder,
@@ -2985,9 +2590,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef dpp;
         if (!g->desc_hdr) {
-            /* site-index mode (check-leaks): dispatch through the dtor table.
-             * The bound and the table pointer load at runtime -- the
-             * table is sized at finalize, after this code is emitted. */
+            /* 模块核心语义抽象与接口调用契约 */
             LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
             LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
                 g->g_site_count, "bound");
@@ -3003,8 +2606,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
             LLVMBuildCondBr(g->builder, hasd, calld, fb);
         } else {
-            /* descriptor mode: the header word is the record pointer itself;
-             * load its dtor field (offset 0) and call it when non-null */
+            /* 内部辅助逻辑 */
             LLVMValueRef desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc");
             LLVMValueRef is_arr_magic = zan_icmp(g->builder, LLVMIntEQ, desc,
                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrmagic");
@@ -3047,12 +2649,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* ARC runtime: zan_rt_alloc(int64_t size, int64_t site, char *name) -> void*
-     * Allocates (16 + size) bytes laid out as
-     *   [i64 refcount][i64 site index][... user data ...]
-     * sets refcount=1, records the site index in the header, bumps the total
-     * and per-site live counts, remembers the site's "file:line:col" name, and
-     * returns the pointer to the user data. */
+    /* 内部辅助实现 */
     LLVMTypeRef alloc_args[] = { i64, i64, i8ptr };
     LLVMTypeRef alloc_type = LLVMFunctionType(i8ptr, alloc_args, 3, 0);
     g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
@@ -3063,7 +2660,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef size = LLVMGetParam(g->rt_alloc, 0);
         LLVMValueRef site = LLVMGetParam(g->rt_alloc, 1);
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
-        /* total = size + the 16-byte header */
+        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
@@ -3071,18 +2668,16 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
-        /* site index at raw[8..15] (second header word) */
+        /* 底层系统交互与数据协议契约 */
         LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
         LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
         LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
         LLVMBuildStore(g->builder, site, site_iptr);
-        /* user data = raw + header */
+        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
-            /* leak tracking: total + per-site count, and record the site name.
-             * Tables are reached through pointer globals -- the arrays
-             * behind them are created at finalize with the real site count. */
+            /* 模块核心语义抽象与接口调用契约 */
             emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
                 LLVMPointerType(i64, 0), g->g_site_live, "ltbl");
@@ -3098,14 +2693,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRet(g->builder, user_ptr);
     }
 
-    /* ARC runtime for strings: zan_rt_str_alloc(int64_t size) -> void*
-     * Allocates (16 + size) bytes laid out as
-     *   [i64 refcount][u32 STRING_TAG | u32 byte length][... user data ...]
-     * sets refcount=1, bumps the global live count, and returns the pointer
-     * to the user data. `size` is a capacity, not the final byte length, so
-     * the length half starts out ZAN_STR_LEN_UNKNOWN and the first reader
-     * measures and caches it. Strings intentionally do not participate in the
-     * per-site leak table. */
+    /* 内部辅助实现 */
     {
         LLVMTypeRef str_alloc_args[] = { i64 };
         LLVMTypeRef str_alloc_type = LLVMFunctionType(i8ptr, str_alloc_args, 1, 0);
@@ -3133,16 +2721,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRet(g->builder, user_ptr);
     }
 
-    /* ARC runtime for arrays: tolerant retain/release guarded by
-     * ZAN_ARRAY_RC_MAGIC in the array prefix (see zan_abi.h). A pointer that
-     * did not come from zan_array_alloc -- an extern's buffer, a span base, a
-     * `T[]`-typed field never assigned -- has no guard word and is left alone,
-     * so the two are safe to call on any array-typed value. Elements are not
-     * touched here: a release site whose element type is itself rc-managed
-     * goes through the per-type wrapper (__zan_arr_release_*), which drops the
-     * elements just before this decrement takes the count to zero.
-     * Emitted before the string pair so the string retain/release can forward
-     * byte[]/char[] values that crossed the byte[]<->string boundary to them. */
+    /* 内部辅助逻辑 */
     for (int rel = 0; rel < 2; rel++) {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
@@ -3215,14 +2794,7 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* ARC runtime for strings: tolerant retain/release guarded by STRING_MAGIC.
-     * Non-string/bare pointers and sentinel literals are ignored -- except a
-     * managed array: a byte[] implicitly read as a `string` (the shared
-     * pointer carrier) arrives here when the value is stored into an owning
-     * string slot. Ignoring it would leave the slot pointing at a buffer whose
-     * real refcount was never bumped, freed as soon as the source temporary
-     * dies; forward to the array pair so the retain/release lands on the true
-     * header. */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -3428,11 +3000,7 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->function_compactor = NULL;
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
-    /* Keep the context alive past main(): its ~LLVMContextImpl frees LiveInfo
-     * and assorted caches, and the CRT exit table runs its own dtor over a
-     * separate garbage-pImpl static that frees cross-linked users first — a
-     * second full teardown double-frees that graph (c0000005, TASKS.md A80).
-     * The leak is bounded and a compiler is short-lived; correctness first. */
+    /* 内部辅助实现 */
     /* if (g->ctx) LLVMContextDispose(g->ctx); */
     if (g->ctx) g->ctx = NULL;
     free(g->functions);
@@ -3538,9 +3106,9 @@ void zan_irgen_shard_buf_free(zan_irgen_t *g) {
     g->streaming_shard_count = g->streaming_shard_cap = g->streaming_shard_cur_fns = 0;
 }
 
-/* ---- type mapping ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* forward decls into later-included parts of this translation unit */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **bind);
 static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
@@ -3548,37 +3116,25 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_type_t *owner_inst);
 static void emit_pending_method_specs(zan_irgen_t *g);
 
-/* Resolve a type reference appearing in the body currently being emitted,
- * substituting the active method specialization's type parameters (T -> the
- * concrete type bound at the call site that created the specialization). */
+/* 内部辅助实现 */
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 
 static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
     zan_type_t *t = zan_binder_resolve_type(g->binder, tref);
     if (g->cur_mtps && t) t = subst_method_tp(g, t, g->cur_mtps, g->cur_mbind);
-    /* A type written in the source of a specialized body means the concrete
-     * type: a local declared `T` in Box<Square> holds a Square and owns it like
-     * one, and `new List<T>()` builds a list of Squares. Left as a type
-     * parameter, such a local was not rc-managed, so it borrowed a value that
-     * was released underneath it. */
+    /* 内部辅助实现 */
     if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
     return t;
 }
 
-/* The type a field of the enclosing type has in the body being emitted: in
- * Box<Vec>'s specialization a `T` field holds a Vec. */
+/* 内部辅助实现 */
 static zan_type_t *field_type_here(zan_irgen_t *g, zan_type_t *t) {
     if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
     return t;
 }
 
-/* ---- nullable value types (`int?`, `Point?`) -------------------------------
- *
- * A nullable value type lowers to `{ payload, i1 }`: the value itself plus a
- * has-value flag. The struct is *named* (`zan.nullable.<payload>`) so that the
- * wrap/unwrap boundaries below can recognise it from the LLVM type alone
- * without ever mistaking a user struct that happens to have the same shape. */
+/* 内部辅助实现 */
 #define ZAN_NULLABLE_PREFIX "zan.nullable."
 
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);
@@ -3594,9 +3150,7 @@ static LLVMTypeRef nullable_payload_type(LLVMTypeRef t) {
     return LLVMStructGetTypeAtIndex(t, 0);
 }
 
-/* The nullable struct for a payload LLVM type, created once per payload. The
- * payload's own printed name keys the type, so `int?` written in two places is
- * one LLVM type and the values are interchangeable. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMTypeRef nullable_type_of(zan_irgen_t *g, LLVMTypeRef payload) {
     char name[256];
     size_t off = 0;
@@ -3618,15 +3172,12 @@ static LLVMTypeRef nullable_type_of(zan_irgen_t *g, LLVMTypeRef payload) {
     return st;
 }
 
-/* The `null` of a nullable type: a zeroed payload with the flag clear. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef nullable_none(LLVMTypeRef nty) {
     return LLVMConstNull(nty);
 }
 
-/* Wrap a payload value, fitting it to the payload slot first (an i64 literal
- * meeting an `int?` narrows exactly as it would meeting an `int`). Returns NULL
- * when the value cannot be a payload of this type, so callers can leave the
- * value alone instead of building invalid IR. */
+/* 内部辅助实现 */
 static LLVMValueRef nullable_some(zan_irgen_t *g, LLVMTypeRef nty, LLVMValueRef v) {
     LLVMTypeRef pl = nullable_payload_type(nty);
     LLVMValueRef fit = coerce_int_to(g, v, pl);
@@ -3648,11 +3199,7 @@ static LLVMValueRef nullable_get_payload(zan_irgen_t *g, LLVMValueRef v) {
 
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym);
 
-/* A synthesized tuple struct (`(T1, T2, ...)`, see zan_binder_make_tuple_type)
- * is created lazily -- often during expression typing, after pass 1 registered
- * the source-declared structs -- so map_type registers it on first use. Its
- * symbol has no AST declaration (it is synthesized in the binder), which is
- * how it is told apart from a user struct that pass 1 would have covered. */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
     if (!type || !type->sym) return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = 0; i < g->struct_type_count; i++) {
@@ -3683,7 +3230,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_UINT:   return LLVMInt32TypeInContext(g->ctx);
     case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
-    case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx); /* coroutine handle */
+    case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx); /* 核心系统底层抽象与内存语义契约 */
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
     case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
@@ -3692,22 +3239,19 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_ENUM:
         return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NULLABLE:
-        /* Only value types reach here: the binder leaves `T?` over a reference
-         * type as plain T, which already admits null. */
+        /* 内部辅助逻辑 */
         if (type->element_type)
             return nullable_type_of(g, map_type(g, type->element_type));
         return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_DELEGATE: {
-        /* delegate types map to function pointer types */
+        /* 底层系统交互与数据协议契约 */
         int pc = type->delegate_param_count;
         LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
             (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
         for (int i = 0; i < pc; i++) {
             param_types[i] = map_type(g, type->delegate_param_types[i]);
         }
-        /* An `async delegate` lowers like an async method's ramp: invoking it
-         * returns an i8* task handle (the coroutine frame), which `await` then
-         * drives -- not the declared return type directly. */
+        /* 内部辅助实现 */
         LLVMTypeRef ret = type->delegate_is_async
             ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
             : (type->delegate_ret_type
@@ -3721,7 +3265,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_CLASS: {
         if (type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0)
             return g->span_struct_type;
-        /* look up registered struct type */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int i = 0; i < g->struct_type_count; i++) {
             if (g->struct_types[i].sym == type->sym) {
                 if (type->kind == TYPE_CLASS) {
@@ -3730,21 +3274,14 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
                 return g->struct_types[i].llvm_type;
             }
         }
-        /* a synthesized tuple struct created after pass 1 registers on demand */
+        /* 模块核心语义抽象与接口调用契约 */
         return map_tuple_struct(g, type);
     }
     default:          return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     }
 }
 
-/* Widen a value just loaded from a slot of `type` back to the register form
- * the rest of irgen expects. Memory keeps every integer at its declared width,
- * but the extension a load needs is a property of the Zan type, not of the
- * LLVM width: i8 is `byte` (zero) or `sbyte` (sign), i16 is `short` (sign) or
- * `ushort` (zero), i32 is `int` (sign) or `uint` (zero). The width-driven
- * default handles the signed side and `byte`; the unsigned wide types and
- * `sbyte` are the cases it gets backwards, so they extend explicitly and land
- * in the 64-bit masked form that casts and arithmetic already assume. */
+/* 内部辅助逻辑 */
 static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
                                    zan_type_t *type) {
     if (!v || !type) return v;
@@ -3763,11 +3300,9 @@ static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
     }
 }
 
-/* ---- struct type registry helpers ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Forward decl: classes with any virtual/override method carry a hidden
- * vtable pointer as struct field 0, so field indexing and layout are shifted
- * by one for them. */
+/* 内部辅助实现 */
 static bool class_has_virtual_methods(zan_symbol_t *sym);
 static int class_vptr_offset(zan_symbol_t *sym) {
     return class_has_virtual_methods(sym) ? 1 : 0;
@@ -3788,11 +3323,7 @@ static struct zan_struct_type_entry *get_struct_entry(zan_irgen_t *g,
     return NULL;
 }
 
-/* Address a field of an instance. A sequential struct is laid out by LLVM
- * exactly like the C compiler would, so its fields are reached by index; an
- * explicit-layout struct is one opaque block, so the field's own offset is
- * applied and then re-typed (a GEP of the field type, so that a store to it
- * still sees what it is storing into). */
+/* Address a field of an instance */
 static LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
                                    LLVMTypeRef st, LLVMValueRef base,
                                    int fi, const char *name) {
@@ -3802,18 +3333,14 @@ static LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         e->field_offsets[fi], 0);
         LLVMValueRef raw = LLVMBuildInBoundsGEP2(g->builder,
             LLVMInt8TypeInContext(g->ctx), base, &off, 1, "fld.off");
-        /* Re-typed as a one-field struct rather than as the bare field type:
-         * a store to it then recovers what it is storing into the same way it
-         * does for a sequential field, instead of writing the value's own
-         * width over the neighbouring fields. */
+        /* 内部辅助实现 */
         LLVMTypeRef wrap = LLVMStructTypeInContext(g->ctx, &e->field_llvm[fi], 1, 0);
         return LLVMBuildStructGEP2(g->builder, wrap, raw, 0, name);
     }
     return LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
 }
 
-/* Static fields live in module globals, not in the instance struct: they are
- * excluded from instance layout and field indexing. */
+/* 内部辅助实现 */
 static bool field_member_is_static(zan_symbol_t *m) {
     if (m->modifiers & MOD_STATIC) return true;
     if (m->kind == SYM_FIELD && m->decl &&
@@ -3821,12 +3348,7 @@ static bool field_member_is_static(zan_symbol_t *m) {
     return false;
 }
 
-/* The slot of `field_name` in `type_sym`'s layout, or -1. Inherited fields form
- * the prefix (see resolve_bases), so a derived declaration that hides a base
- * field appears twice in the member list and the LAST match is the one the
- * static type in hand declares: code compiled against the base sees only the
- * base member list and keeps the prefix slot, while the derived class reaches
- * its own. */
+/* 底层系统交互与数据协议契约 */
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     int idx = class_vptr_offset(type_sym);
     int found = -1;
@@ -3844,8 +3366,7 @@ static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     return found;
 }
 
-/* Last match, for the same reason as get_field_index: the hiding declaration
- * wins over the inherited one it shadows. */
+/* 内部辅助逻辑 */
 static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name) {
     zan_class_index_t *ci = class_index_for(type_sym);
     zan_symbol_t *found = NULL;
@@ -3861,7 +3382,7 @@ static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name
 }
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_name) {
-    /* search in current type first */
+    /* 核心系统底层抽象与内存语义契约 */
     zan_class_index_t *ci = class_index_for(type_sym);
     for (int i = member_first_named(ci, method_name); i >= 0;
          i = member_next_named(ci, i)) {
@@ -3869,14 +3390,11 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
         if (m->kind == SYM_METHOD && member_name_is(m, method_name))
             return m;
     }
-    /* search in base type (inheritance) */
+    /* 核心系统底层抽象与内存语义契约 */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         return get_method_sym(type_sym->type->base_type->sym, method_name);
     }
-    /* An interface re-exports the members of the interfaces it extends, and
-     * those sit in the extends list rather than in base_type. Without this the
-     * call's static type is unknown at the call site, so e.g. an owned string
-     * returned through the derived interface is never released. */
+    /* 内部辅助实现 */
     if (type_sym->kind == SYM_INTERFACE && type_sym->type) {
         for (int i = 0; i < type_sym->type->interface_count; i++) {
             zan_type_t *it = type_sym->type->interfaces[i];
@@ -3888,10 +3406,7 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
     return NULL;
 }
 
-/* Return the symbol that was created for a specific method-declaration AST node.
- * With method overloading, several same-named SYM_METHOD members coexist on a
- * type; each corresponds to exactly one AST_METHOD_DECL. Matching on the decl
- * back-pointer (not the name) is the only way to recover the right one. */
+/* 返回the symbol that was created for a specific method-declaration AST node */
 static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t *decl) {
     zan_class_index_t *ci = class_index_for(type_sym);
     for (int i = ci->decl_buckets[irgen_ptr_bucket(decl, ci->cap)]; i >= 0;
@@ -3902,10 +3417,7 @@ static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t 
     return NULL;
 }
 
-/* Overload-aware method resolution used at call sites. A same-named method is
- * usable only when its arity matches, or when its final parameter is variadic.
- * Falling back to an unrelated same-named method creates invalid calls and can
- * leave interface dispatch with a fabricated function pointer. */
+/* 底层系统交互与数据协议契约 */
 static int method_is_params_variadic(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->method_decl.params.count == 0) return 0;
     zan_ast_node_t *last =
@@ -3913,18 +3425,12 @@ static int method_is_params_variadic(zan_symbol_t *m) {
     return last->kind == AST_PARAM && last->param.is_params;
 }
 
-/* True when a call with `argc` arguments can invoke `m`: the exact declared
- * arity, a params tail covering the rest, or trailing default parameters
- * filling the missing arguments (`Mix(1)` matches
- * `Mix(int a, int b = 2, string s = "xy")`; fill_default_args completes the
- * call). The default-parameter case is what lets a caller omit trailing
- * arguments, so an arity-exact resolver must accept it or every such call
- * falls through to no method and reads garbage parameters. */
+/* 内部辅助实现 */
 static int method_accepts_arity(zan_symbol_t *m, int argc) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
     int pc = m->decl->method_decl.params.count;
     if (pc == argc) return 1;
-    /* a [DllImport(..., Variadic = true)] extern absorbs any tail */
+    /* 底层系统交互与数据协议契约 */
     if (m->decl->method_decl.is_variadic && argc > pc) return 1;
     if (method_is_params_variadic(m) && argc >= pc - 1) return 1;
     if (argc < pc) {
@@ -3937,11 +3443,7 @@ static int method_accepts_arity(zan_symbol_t *m, int argc) {
     return 0;
 }
 
-/* Generic-method arity is part of overload identity (mirrors the checker):
- * `M<T>(x)` and `M(x)` coexist, so a call carrying explicit type arguments
- * must never bind to the non-generic same-arity sibling -- the checker types
- * the call as `T-substituted` while this phase would emit it against the
- * plain signature, and the call returned garbage at runtime. */
+/* 内部辅助实现 */
 static int method_type_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
     return m->decl->method_decl.type_params.count;
@@ -3961,8 +3463,7 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
                 method_type_param_count(m) != type_arg_count)
                 continue;
             if (m->decl && method_accepts_arity(m, argc)) {
-                /* keep variadic as a fallback: an exact/default-filled
-                 * overload wins over the params tail */
+                /* 内部辅助逻辑 */
                 if (method_is_params_variadic(m)) {
                     if (!variadic) variadic = m;
                 } else {
@@ -3979,11 +3480,7 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
     return NULL;
 }
 
-/* Overload resolution for a receiver whose static type is an interface. An
- * interface re-exports the members of the interfaces it extends
- * (`interface IDbConnection : IDbExecutor`), and those live in the extends
- * list rather than in base_type, so resolve_overload alone would miss an
- * inherited method and the call would dispatch to nothing. */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *resolve_iface_overload_depth(zan_symbol_t *iface,
                                                    zan_istr_t name, int argc,
                                                    int type_arg_count,
@@ -4007,7 +3504,7 @@ static zan_symbol_t *resolve_iface_overload(zan_symbol_t *iface, zan_istr_t name
     return resolve_iface_overload_depth(iface, name, argc, type_arg_count, 0);
 }
 
-/* Defined in irgen_abi.c, which is part of this translation unit. */
+/* Defined in irgen_abi */
 static unsigned long abi_size_of(LLVMTypeRef t);
 static unsigned long abi_align_of(LLVMTypeRef t);
 
@@ -4017,8 +3514,7 @@ static bool decl_is_explicit_layout(zan_symbol_t *sym) {
            sym->decl->type_decl.is_explicit_layout;
 }
 
-/* [FieldOffset(n)] -- the byte offset a field of an explicit-layout type sits
- * at. Two fields may name the same offset, which is how a union is written. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     if (!field->decl) return false;
     zan_ast_list_t *attrs = zan_ast_attributes(field->decl);
@@ -4036,10 +3532,7 @@ static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     return false;
 }
 
-/* A `T`-typed field is one erased slot shared by every instantiation, so the
- * slot must be wide enough for the widest concrete type bound to T: a
- * Box<Vec> stores the struct itself into the slot, and a pointer-sized slot
- * would have written over the next field. */
+/* 内部辅助实现 */
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 static unsigned long abi_size_of(LLVMTypeRef t);
@@ -4067,10 +3560,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
                                  g->struct_type_count + 1,
                                  sizeof(*g->struct_types));
 
-    /* Create and register the named struct *before* resolving field types,
-     * so that a self- or mutually-referential class field (a pointer to this
-     * type) resolves to `%struct.X*` via map_type instead of falling back to
-     * i8* → which produced type-mismatched IR (rejected under typed pointers). */
+    /* 内部辅助实现 */
     char name_buf[256];
     snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len, sym->name.str);
     LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
@@ -4078,7 +3568,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     g->struct_types[g->struct_type_count].llvm_type = st;
     g->struct_type_count++;
 
-    /* count fields (including auto-property backing fields; statics excluded) */
+    /* 模块核心语义抽象与接口调用契约 */
     int field_count = 0;
     for (int i = 0; i < sym->member_count; i++) {
         if ((sym->members[i]->kind == SYM_FIELD ||
@@ -4086,10 +3576,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
             !field_member_is_static(sym->members[i])) field_count++;
     }
 
-    /* Reserve field 0 for a hidden vtable pointer on classes that participate
-     * in virtual dispatch. Base fields are flattened in first, so a derived
-     * instance stays layout-compatible with its base (vptr at 0, then base
-     * fields, then derived fields). */
+    /* 内部辅助逻辑 */
     int vptr = class_has_virtual_methods(sym) ? 1 : 0;
     LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)(field_count + vptr), sizeof(LLVMTypeRef));
     int fi = 0;
@@ -4111,8 +3598,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     entry->explicit_layout = decl_is_explicit_layout(sym);
 
     if (!entry->explicit_layout) {
-        /* Sequential (the default, and what [StructLayout] asks for): LLVM
-         * already pads and aligns a non-packed struct the way C does. */
+        /* 内部辅助实现 */
         LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
         return;
     }
@@ -4122,8 +3608,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     unsigned long size = 0, align = 1;
     int slot = vptr;
     if (vptr) {
-        /* A vtable pointer has no [FieldOffset] to place it at, and a type
-         * whose layout C code depends on has no business dispatching. */
+        /* 内部辅助实现 */
         zan_diag_emit(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0),
                       "explicit-layout type '%.*s' cannot have virtual methods",
                       (int)sym->name.len, sym->name.str);
@@ -4153,8 +3638,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     }
     if (size % align) size += align - size % align;
 
-    /* One block, with a leading integer of the widest field's alignment so
-     * that the block itself is aligned the way the C type is. */
+    /* 内部辅助实现 */
     LLVMTypeRef body[2];
     unsigned nbody = 0;
     body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
@@ -4164,7 +3648,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     LLVMStructSetBody(st, body, nbody, 0);
 }
 
-/* ---- virtual dispatch helpers ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static bool class_has_virtual_methods(zan_symbol_t *sym) {
     for (int i = 0; i < sym->member_count; i++) {
@@ -4173,11 +3657,9 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
             return true;
         }
     }
-    /* a class implementing an interface needs a field-0 vtable pointer to serve
-     * as a runtime type tag for interface (tag) dispatch, even with no virtual
-     * methods of its own. */
+    /* 内部辅助实现 */
     if (sym->type && sym->type->interface_count > 0) return true;
-    /* check base class */
+    /* 核心系统底层抽象与内存语义契约 */
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         return class_has_virtual_methods(sym->type->base_type->sym);
     }
@@ -4186,11 +3668,11 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
 
 static int count_virtual_methods(zan_symbol_t *sym) {
     int count = 0;
-    /* count from base first */
+    /* 核心系统底层抽象与内存语义契约 */
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         count = count_virtual_methods(sym->type->base_type->sym);
     }
-    /* add new virtual methods from this class */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < sym->member_count; i++) {
         if (sym->members[i]->kind == SYM_METHOD &&
             (sym->members[i]->modifiers & MOD_VIRTUAL) &&
@@ -4201,16 +3683,7 @@ static int count_virtual_methods(zan_symbol_t *sym) {
     return count;
 }
 
-/* Declared parameter count of a method symbol, -1 when it is not a plain
- * method declaration. Virtual slot lookup compares this against each
- * slot-defining virtual declaration: overloaded virtual methods occupy one
- * slot per distinct declaration, so matching on the name alone sent every
- * same-named call to the first-declared overload's slot -- x.F(1,2,3,4)
- * dispatched through the 2-param F's slot and ran the wrong body (the
- * signature still verified because the slot pointer is bitcast to the
- * resolved overload's fn type, and the extra arguments were dropped by the
- * calling convention). This mirrors how emit_vtables fills the slots:
- * resolve_overload(name, declared arity) picks the most-derived impl. */
+/* 内部辅助逻辑 */
 static int method_declared_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
     return m->decl->method_decl.params.count;
@@ -4219,12 +3692,12 @@ static int method_declared_param_count(zan_symbol_t *m) {
 static int get_virtual_method_index(zan_symbol_t *type_sym,
                                     zan_symbol_t *method_sym) {
     if (!method_sym) return -1;
-    /* search base classes first for the method slot */
+    /* 模块核心语义抽象与接口调用契约 */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         int idx = get_virtual_method_index(type_sym->type->base_type->sym, method_sym);
         if (idx >= 0) return idx;
     }
-    /* search current class virtual methods */
+    /* 核心系统底层抽象与内存语义契约 */
     int base_count = 0;
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         base_count = count_virtual_methods(type_sym->type->base_type->sym);
@@ -4236,10 +3709,7 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
         if (m->kind == SYM_METHOD &&
             (m->modifiers & MOD_VIRTUAL) &&
             !(m->modifiers & MOD_OVERRIDE)) {
-            /* a resolved override has no slot of its own: it takes the base
-             * declaration's slot, which the (name, declared arity) pair
-             * identifies -- exactly the key resolve_overload used when the
-             * vtable was filled with the most-derived implementation */
+            /* 内部辅助实现 */
             if (member_name_is(m, method_sym->name) &&
                 method_declared_param_count(m) == want) {
                 return idx;
@@ -4250,7 +3720,7 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
     return -1;
 }
 
-/* ---- local variables (simple stack-based storage) ---- */
+/* 底层系统交互与数据协议契约 */
 
 #define INITIAL_LOCALS 16
 
@@ -4258,76 +3728,38 @@ typedef struct {
     zan_istr_t name;
     LLVMValueRef alloca;
     zan_type_t *type;
-    /* ARC: 1 when this local owns a heap class reference that must be released
-     * on overwrite and at function exit; 0 for params, borrowed, escaped or
-     * non-class locals. See the ARC helpers below. */
+    /* 内部辅助实现 */
     int arc_owned;
-    /* For any local initialized with `new T[n]`, the i64 alloca holding the
-     * element count so `a.Length` can read it; NULL when unknown. */
+    /* 内部辅助逻辑 */
     LLVMValueRef arr_len_slot;
-    /* 1 when this local's slot is registered on the unwind stack, so an
-     * exception thrown below this frame releases it (A8-12). Scope exit pops
-     * the entry along with the release it emits. */
+    /* 内部辅助逻辑 */
     int eh_slot;
-    /* A33-2b: for a local a lambda assigns to, the heap cell holding its value
-     * (closure-record shaped, see the boxed-local comment in irgen_expr.c).
-     * `alloca` then points *into* that cell, so the enclosing method and every
-     * closure read and write the one variable. NULL for an ordinary local. */
+    /* 内部辅助实现 */
     LLVMValueRef box_cell;
-    /* Tagged cell reference stored in an unwind-visible slot for the declaring
-     * binding. A longjmp releases and nulls this slot; lambda-body bindings
-     * borrow their closure's cell and therefore leave it NULL. */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef box_owner_slot;
-    /* 1 when this binding owns a reference to the cell (the declaring scope);
-     * a lambda body's binding borrows the cell its closure record holds. */
+    /* 内部辅助实现 */
     int          box_owned;
-    /* String parameters are also used as raw byte buffers with an explicit
-     * length; their NUL terminator is not a reliable bounds source. */
+    /* 内部辅助实现 */
     int          opaque_string;
-    /* An `object` slot holds whatever the language puts in a pointer-wide slot:
-     * a heap class reference, a string literal in static storage, or an
-     * unboxed scalar. Its static type therefore cannot decide ownership, so an
-     * i1 slot records whether the *current* occupant is an owned heap
-     * reference; the next store and scope exit release it only when set. NULL
-     * for every other local. */
+    /* 内部辅助实现 */
     LLVMValueRef obj_rc_flag;
-    /* 1 for a `ref`/`out` parameter: `alloca` is the caller's slot, not an
-     * alloca in this frame. The caller owns the reference it holds, so a
-     * write through the slot must release the old occupant and retain the
-     * new one -- while scope exit must NOT release it. */
+    /* 内部辅助逻辑 */
     int          byref_slot;
-    /* Non-NULL for a binding synthesized from a declaration node (currently
-     * switch pattern variables): the declaration identity is kept separately
-     * from its spelling so the guard-time binding and the case-body binding can
-     * alias one shared cell without confusing same-named sibling cases. */
+    /* 内部辅助实现 */
     zan_ast_node_t *binding_decl;
-    /* Non-NULL only on the pre-added async frame-slot entries: the declaration
-     * node the slot was scanned from. Binding looks the slot up by node, never
-     * by name, so same-named shadowing declarations cannot alias each other's
-     * storage. Reads resolve by name through the runtime entry each
-     * declaration adds when it binds, keeping scope truncation semantics. */
+    /* 内部辅助逻辑 */
     zan_ast_node_t *async_decl;
-    int async_role; /* separates iteration state slots belonging to one AST node */
-    /* Index of the pre-added frame-slot entry a bind-time name entry aliases,
-     * -1 otherwise. The alias itself is release-inert (arc_owned stays 0: the
-     * frame protocol owns the storage and releases it exactly once), so an
-     * assignment through the alias must route its capture-release to the slot
-     * entry via this index rather than rely on its own ownership flags. */
+    int async_role; /* 模块核心语义抽象与接口调用契约 */
+    /* 内部辅助逻辑 */
     int frame_owner;
-    /* 1 for a struct-typed slot whose aggregate embeds rc-managed
-     * fields (directly or through nested value structs). The slot owns its
-     * fields' +1s: a write must release the old occupant / retain a borrowed
-     * new one, and scope exit releases every field. Only private allocas are
-     * flagged -- by-ref params and the borrowed `this` pointer are not. */
+    /* 内部辅助逻辑 */
     int struct_rc;
-    /* 1 on a variable declared in a `for` init clause: a closure
-     * capturing it takes a fresh per-iteration cell holding the value at
-     * capture time, not a reference to the one loop-carried cell. */
+    /* 内部辅助实现 */
     int per_iteration;
 } local_var_t;
 
-/* A function's locals live in a single flat scope. The backing array grows
- * on demand to support functions with arbitrary numbers of locals. */
+/* 底层系统交互与数据协议契约 */
 typedef struct {
     zan_ast_node_t *decl;
     LLVMValueRef cell;
@@ -4363,17 +3795,14 @@ static local_scope_t *local_scope_new(zan_arena_t *arena) {
     return s;
 }
 
-/* Storage slot type of a local. A `ref`/`out` parameter's slot is the raw
- * incoming pointer parameter (not an alloca instruction), so derive the type
- * from the zan type instead of LLVMGetAllocatedType in that case. */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type);
 static LLVMTypeRef local_slot_type(zan_irgen_t *g, local_var_t *v) {
     if (LLVMIsAAllocaInst(v->alloca)) return LLVMGetAllocatedType(v->alloca);
     return map_type(g, v->type);
 }
 
-/* Bumped whenever a local is declared: the expression type cache keys on it so
- * a changed binding can never be served a stale inference. */
+/* 内部辅助实现 */
 static unsigned g_local_gen;
 
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
@@ -4407,9 +3836,7 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].struct_rc = 0;
     scope->vars[scope->count].per_iteration = 0;
     scope->count++;
-    /* Record the variable for the debugger (no-op unless building with -g). The
-     * emit context supplies the compiler state; local_add itself is g-free.
-     * The Zan type drives the structured DWARF description. */
+    /* 模块核心语义抽象与接口调用契约 */
     di_declare_var(g_di_emit_ctx, name, alloca, type);
 }
 
@@ -4421,14 +3848,7 @@ static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char
     if (term) LLVMPositionBuilderBefore(g->builder, term);
     else LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
-    /* Pointer-shaped slots are defined from entry: the entry block
-     * statically dominates every setjmp landing, so the co.exc cleanup's
-     * owned-local release reads at worst null there. Without this, -Os folds
-     * the landing load of a slot whose first store sits after an await to
-     * `ptr undef`, and release_dyn materializes the undef as whatever the
-     * argument register holds -- a raw heap pointer -- corrupting the heap.
-     * In synchronous functions the extra store is dead the moment
-     * the declaration stores and the optimizer drops it. */
+    /* 内部辅助逻辑 */
     if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
         LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
     LLVMPositionBuilderAtEnd(g->builder, cur);
@@ -4445,10 +3865,7 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
-/* Find the pre-added async frame slot of one declaration node (see
- * local_var_t.async_decl). A name lookup cannot serve here: two same-named
- * declarations each pre-add their own entry, and picking by name would hand
- * the emit whichever entry happens to sit last in the flat list. */
+/* 编译期中间表示与代码生成内部规范 */
 enum {
     ASYNC_LOCAL_VALUE = 0,
     ASYNC_FOREACH_INDEX,
@@ -4470,9 +3887,7 @@ static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *
     return local_find_async_role(scope, decl, ASYNC_LOCAL_VALUE);
 }
 
-/* Find a live binding entry synthesized from one declaration node. The switch
- * lowering emits the same pattern twice (once for `when`, once for the body),
- * so declaration identity—not the source spelling—selects the shared cell. */
+/* 模块核心语义抽象与接口调用契约 */
 static local_var_t *local_find_binding_decl(local_scope_t *scope,
                                             zan_ast_node_t *decl) {
     if (!scope || !decl) return NULL;
@@ -4509,22 +3924,13 @@ static pattern_binding_t *local_add_pattern_binding(local_scope_t *scope,
     return p;
 }
 
-/* Name-based recognition of the intrinsic collections. An array type carries
- * its element's name (List<string>[] is named "List"), so the kind test is
- * what keeps `new List<string>[3]` from being lowered as a bare list. */
+/* 底层系统交互与数据协议契约 */
 static int type_named(zan_type_t *t, const char *n, int len) {
     return t && t->kind != TYPE_ARRAY && t->name.str &&
            (int)t->name.len == len && memcmp(t->name.str, n, (size_t)len) == 0;
 }
 
-/* The built-in generic collections (List/Dict) and StringBuilder share
- * TYPE_CLASS with user classes but are lowered to intrinsic structs, not user
- * classes with a member layout. List and StringBuilder now carry the same
- * 16-byte rc header (allocated via zan_rt_alloc) and participate in ARC like
- * classes; Dict remains header-less (its backing buffers are still not
- * reclaimed) so ARC must continue to exclude it by name → retaining/releasing a
- * header-less struct reads a refcount at obj-16 that lands in unrelated heap
- * memory and corrupts it. */
+/* 内部辅助实现 */
 static int is_builtin_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -4533,9 +3939,7 @@ static int is_builtin_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* List, Dict and StringBuilder are refcounted collections: they carry the rc
- * header and are freed (backing buffers + struct) via a per-site collection
- * destructor. */
+/* 内部辅助实现 */
 static int is_rc_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -4544,14 +3948,10 @@ static int is_rc_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* Helper: check if a type is ARC-managed (carries the zan_rt_alloc rc header:
- * user class instances plus the refcounted collections List/StringBuilder; not
- * string/int/struct/enum, and not the header-less Dict). */
+/* 内部辅助实现 */
 static int is_arc_managed_type(zan_type_t *t) {
     if (!t) return 0;
-    /* An interface-typed value is a heap class pointer carrying the same rc
-     * header; retain/release apply, and release_dyn dispatches on the object's
-     * recorded concrete type, so it is ARC-managed exactly like a class ref. */
+    /* 内部辅助实现 */
     if (t->kind == TYPE_INTERFACE) return 1;
     if (t->kind != TYPE_CLASS) return 0;
     if (is_builtin_collection_type(t)) return is_rc_collection_type(t);
@@ -4559,13 +3959,7 @@ static int is_arc_managed_type(zan_type_t *t) {
 }
 
 static int is_rc_managed_type(zan_type_t *t) {
-    /* A delegate is rc-managed in the closure shape only; the retain/release
-     * helpers test the tag bit, so a bare function pointer costs nothing.
-     * An array carries a refcount in its prefix (see zan_abi.h) and its
-     * retain/release are guarded by that prefix, so a `T[]`-typed value that
-     * never came from `new T[n]` -- an extern's buffer, a span base -- is left
-     * alone. Ownership then follows the same rules as any other reference:
-     * returning an array hands the caller +1, passing one lends it. */
+    /* 内部辅助实现 */
     return t && (t->kind == TYPE_STRING || t->kind == TYPE_DELEGATE ||
                  t->kind == TYPE_ARRAY || is_arc_managed_type(t));
 }
@@ -4587,12 +3981,10 @@ static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot);
 static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 
-/* Release all RC-managed local variables in scope (for throw/exception cleanup) */
+/* 模块核心语义抽象与接口调用契约 */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = 0; i < locals->count; i++) {
-        /* A boxed binding owns one cell, not the payload slot separately. The
-         * owner is registered as an EH delegate temp and its destructor releases
-         * the payload during unwind; releasing the slot here would double-drop. */
+        /* 模块核心语义抽象与接口调用契约 */
         if (locals->vars[i].box_cell) continue;
         if (locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
@@ -4608,9 +4000,7 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
-/* Byte size of a scalar-or-scalar-aggregate LLVM type, or 0 when it cannot be
- * computed here (no target data is available during irgen). Used only to decide
- * whether a value struct fits a collection's 8-byte slot. */
+/* 内部辅助实现 */
 static unsigned llvm_scalar_size(LLVMTypeRef t) {
     switch (LLVMGetTypeKind(t)) {
     case LLVMIntegerTypeKind: return (LLVMGetIntTypeWidth(t) + 7) / 8;
@@ -4623,7 +4013,7 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
         for (unsigned i = 0; i < n; i++) {
             unsigned fs = llvm_scalar_size(LLVMStructGetTypeAtIndex(t, i));
             if (!fs) return 0;
-            if (fs > 1 && total % fs) total += fs - (total % fs);  /* natural align */
+            if (fs > 1 && total % fs) total += fs - (total % fs);  /* 核心系统底层抽象与内存语义契约 */
             total += fs;
         }
         return total;
@@ -4632,10 +4022,7 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
     }
 }
 
-/* A List element occupies a whole number of 8-byte words in the data buffer.
- * Everything the language can put in a collection is one word wide except a
- * value struct, which lives inline across ceil(size/8) words; capacity math
- * and every slot address scale by that stride. */
+/* 模块核心语义抽象与接口调用契约 */
 static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
     if (!elem || elem->kind != TYPE_STRUCT) return 1;
     LLVMTypeRef st = map_type(g, elem);
@@ -4645,7 +4032,7 @@ static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
     return (sz + 7) / 8;
 }
 
-/* Scale an element index to the word index of that element's first slot. */
+/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
                                     unsigned words) {
     if (words <= 1) return idx;
@@ -4653,7 +4040,7 @@ static LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
                    LLVMConstInt(LLVMTypeOf(idx), words, 0), "slot.wi");
 }
 
-/* A struct with a layout this pass cannot compute has no inline form. */
+/* 模块核心语义抽象与接口调用契约 */
 static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
     if (llvm_scalar_size(st)) return;
     zan_loc_t loc; memset(&loc, 0, sizeof(loc));
@@ -4663,8 +4050,7 @@ static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_
         "cannot compute its layout; use a class instead");
 }
 
-/* Store a struct element inline: the slot pointer addresses enough words for
- * the whole value, so it is written through a pointer of the struct's type. */
+/* 内部辅助实现 */
 static void store_struct_in_slot(zan_irgen_t *g, LLVMValueRef v,
                                  LLVMValueRef slot_ptr, zan_ast_node_t *at) {
     LLVMTypeRef st = LLVMTypeOf(v);
@@ -4681,10 +4067,7 @@ static LLVMValueRef load_struct_from_slot(zan_irgen_t *g, LLVMValueRef slot_ptr,
     return LLVMBuildLoad2(g->builder, st, sp, "slot.struct");
 }
 
-/* Widen a narrow integer element into an i64 collection slot: zero-extend
- * unsigned element types and sign-extend signed ones, so a stored value
- * round-trips with its numeric meaning (a bool stays 1, not the -1 that a bare
- * i1 sign-extension would yield). */
+/* 内部辅助实现 */
 static LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
                                         zan_type_t *elem_type,
                                         LLVMTypeRef slot_ty) {
@@ -4701,11 +4084,7 @@ static LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
                : LLVMBuildSExt(g->builder, v, slot_ty, "slot.sx");
 }
 
-/* Store `value` into a collection slot, retaining the new occupant when needed
- * and releasing the old occupant when overwrite_old is true.
- *
- * The slot may be typed (arrays) or i64/raw-pointer-encoded (List/Dict slots).
- * RC-managed values are class instances or strings. */
+/* 内部辅助实现 */
 static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                                        LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
                                        LLVMValueRef value,
@@ -4725,20 +4104,12 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
     return f;
 }
 
-/* Allocate a refcounted built-in collection struct through zan_rt_alloc so it
- * carries the 16-byte rc header. Records the collection kind (and, for List and
- * Dict, the element/dict type) at a fresh allocation site; the per-site
- * destructor emitted at finalize releases the occupants and frees the backing
- * buffers before the struct itself. `coll_kind` is 1=List, 2=StringBuilder,
- * 3=Dict.
- * Returns the user pointer (i8*), i.e. the struct base past the header. */
+/* 内部辅助逻辑 */
 static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                              long size, int coll_kind,
                                              zan_type_t *elem_type) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    /* `new List<T>()` in a specialized body allocates a list of the concrete
-     * argument: the site destructor has to release real elements, matching the
-     * retain their stores emit. */
+    /* 内部辅助实现 */
     if (g->cur_inst) elem_type = subst_type_param_deep(g, elem_type, g->cur_inst);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int site_idx = reserve_arc_site(g, NULL, NULL, coll_kind, elem_type);
@@ -4762,10 +4133,7 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     return zan_call2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
 }
 
-/* Unwind-stack entry flavours (see emit_eh_tmp_push_slot): a throw releases
- * what a registered variable slot holds, and the release differs by type --
- * strings carry their own header, a delegate may be a bare function pointer
- * that must not be released at all. (Constants: ZAN_EH_SLOT_* in zan_abi.h) */
+/* 内部辅助实现 */
 
 static int eh_slot_kind_of(zan_type_t *t) {
     if (!t) return ZAN_EH_SLOT_OBJ;
@@ -4775,9 +4143,7 @@ static int eh_slot_kind_of(zan_type_t *t) {
     return ZAN_EH_SLOT_OBJ;
 }
 
-/* i64 __zan_itoa64(i8 *buf, i64 v, i32 uns): write `v` in decimal into `buf`
- * (at least 21 bytes), NUL-terminate it and return the digit count; `uns` != 0
- * formats the value as unsigned. Built once per module on first use. */
+/* 内部辅助实现 */
 static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     if (g->fn_itoa64) return g->fn_itoa64;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -4803,8 +4169,7 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
     LLVMValueRef ten = LLVMConstInt(i64, 10, 0);
     LLVMValueRef one = LLVMConstInt(i64, 1, 0);
-    /* digits are produced least-significant first, so they land at the end of
-     * a scratch buffer and the finished run is copied out in one go */
+    /* 内部辅助实现 */
     LLVMValueRef cap = LLVMConstInt(i64, 24, 0);
 
     LLVMPositionBuilderAtEnd(g->builder, entry);
@@ -4813,8 +4178,7 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
         LLVMBuildICmp(g->builder, LLVMIntSLT, v, zero64, "itoa.slt"),
         LLVMBuildICmp(g->builder, LLVMIntEQ, uns,
                       LLVMConstInt(i32, 0, 0), "itoa.signed"), "itoa.neg");
-    /* negating INT64_MIN wraps to itself, which is the right magnitude read as
-     * unsigned -- the digit loop divides unsigned */
+    /* 内部辅助逻辑 */
     LLVMValueRef mag = LLVMBuildSelect(g->builder, is_neg,
         LLVMBuildNeg(g->builder, v, "itoa.negv"), v, "itoa.mag");
     LLVMBuildBr(g->builder, digit);
@@ -4868,8 +4232,7 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Format `v` (already widened to i64) into `buf`, which must hold at least 21
- * bytes, and return the number of bytes written. */
+/* 内部辅助实现 */
 static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
                                    LLVMValueRef v, int is_unsigned) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -4882,11 +4245,7 @@ static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
     return zan_call2(g->builder, fn_ty, fn, args, 3, "itoa");
 }
 
-/* Write `v` as the shortest round-trip C#-style decimal string into `buf`
- * (zan_rt_dbl_str, linked from the timer object every program carries).
- * Replaces the %g snprintf emission at the double->string sites: %g kept
- * six significant digits (round-trip broken) and rendered the specials in
- * MSVC's legacy 1.#INF / 1.#QNAN spelling that no parser reads back. */
+/* 内部辅助实现 */
 static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
                          LLVMValueRef v) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -4903,8 +4262,7 @@ static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
     zan_call2(g->builder, fn_ty, fn, args, 3, "");
 }
 
-/* The emitter must stop using instruction/block handles before this call;
- * function and global identities remain stable through these local passes. */
+/* 内部辅助实现 */
 static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     if (!g->function_compactor || zan_diag_has_errors(g->diag)) return;
     char error[4096];
@@ -4915,11 +4273,7 @@ static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     }
 }
 
-/* ---- irgen translation-unit parts (order matters) ---------------------
- * The IR generator is split by concern into the files below; they are
- * plain #include'd here so every helper keeps internal (static) linkage
- * inside this single translation unit. Do not add them to CMake.
- */
+/* 内部辅助实现 */
 #include "irgen_expr_core.c"
 #include "irgen_weak.c"
 #include "irgen_arc.c"

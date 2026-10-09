@@ -1,40 +1,4 @@
-/* dap_main.c -- Zan Debug Adapter (M9).
- *
- * A Debug Adapter Protocol (DAP) implementation for Zan. It speaks DAP over
- * stdio (Content-Length framed JSON) and exposes the IDE debugger engine
- * (src/ide/debugger.c) to any DAP-capable client (VS Code, etc.):
- *
- *   - initialize / launch / configurationDone / disconnect
- *   - setBreakpoints (source breakpoints, verified, with conditions)
- *   - threads / stackTrace / scopes / variables
- *   - continue / next / stepIn / stepOut / pause
- *   - evaluate (watch expressions and hover evaluation)
- *   - setVariable (modify variables at runtime)
- *   - stopped / continued / terminated / exited / output events
- *
- * Enhanced features:
- *   - Conditional breakpoints with expression evaluation
- *   - Hit-count breakpoints (gdb ignore-count: "==K"/">=K" stop on the Kth hit)
- *   - Logpoints (tracepoints): log and continue without stopping
- *   - Real pause: the running inferior is interrupted (DebugBreakProcess /
- *     SIGINT) while the adapter pumps gdb output; pending client requests are
- *     serviced through the debugger wait hook — no second thread needed
- *   - Watch expression evaluation
- *   - Variable modification (setVariable)
- *   - Multiple scopes (Locals, Watch)
- *
- * Runtime process control is delegated to the debugger engine, which drives a
- * real gdb in machine-interface mode (the compiler emits DWARF via `zanc -g`),
- * so breakpoints, stepping, stack frames and variables are genuine.
- *
- * Usage:
- *   zan-dap                (communicates over stdin/stdout)
- *   zan-dap --port <N>     (listens on 127.0.0.1:<N> for a single DAP client)
- *
- * The TCP server mode exists for clients that cannot easily drive a child
- * process over bidirectional pipes (e.g. the self-hosted Zan IDE, which speaks
- * DAP through the standard-library TCP socket layer).
- */
+/* dap_main */
 #include "json.h"
 #include "rpc.h"
 #include "debugger.h"
@@ -66,18 +30,18 @@ typedef int dap_sock_t;
 typedef struct {
     debugger_t dbg;
     FILE      *out;
-    int        seq;              /* outgoing message sequence */
-    char       program[1024];    /* launched executable */
-    char       prog_args[1024];  /* inferior arguments */
-    char       source_file[1024];/* main source file (for stack frames) */
+    int        seq;              /* 核心系统底层抽象与内存语义契约 */
+    char       program[1024];    /* 核心系统底层抽象与内存语义契约 */
+    char       prog_args[1024];  /* 核心系统底层抽象与内存语义契约 */
+    char       source_file[1024];/* 底层系统交互与数据协议契约 */
     bool       terminated;
     bool       launched;
-    int        attach_pid;       /* >0 when the client asked to attach */
-    bool       use_sock;         /* true when framing over a TCP socket */
-    dap_sock_t sock;             /* connected client socket (server mode) */
+    int        attach_pid;       /* 核心系统底层抽象与内存语义契约 */
+    bool       use_sock;         /* 底层系统交互与数据协议契约 */
+    dap_sock_t sock;             /* 核心系统底层抽象与内存语义契约 */
 } dap_t;
 
-/* ---- TCP transport (server mode) -------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
     int sent = 0;
@@ -89,26 +53,15 @@ static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
     return true;
 }
 
-/* Byte-level transport callbacks over the client socket; the Content-Length
- * framing itself is shared with the stdio path (see common/rpc.c).
- *
- * A DAP session may idle freely BETWEEN frames (the debugger client sits on
- * breakpoints for minutes), so the wait for a frame's first byte stays
- * unbounded -- exactly like the stdio transport. But once a frame has
- * started, the peer must finish it: a client that dribbles one byte per
- * recv, or dies mid-frame with a half-open connection, would otherwise
- * park the server thread forever. The deadline is per frame: armed on the
- * first byte, never extended per chunk, disarmed by rpc_read_message_sock
- * when the frame ends. Even the 64MB cap moves over loopback in seconds,
- * so a minute is far past any legitimate peer. */
+/* 内部辅助逻辑 */
 #ifndef DAP_FRAME_DEADLINE_MS
 #define DAP_FRAME_DEADLINE_MS 60000
 #endif
 
 typedef struct {
     dap_sock_t s;
-    bool started;        /* a frame is in flight: the deadline is armed */
-    long long deadline;  /* monotonic ms when the frame must be complete */
+    bool started;        /* 核心系统底层抽象与内存语义契约 */
+    long long deadline;  /* 底层系统交互与数据协议契约 */
 } dap_frame_reader_t;
 
 static long long dap_now_ms(void) {
@@ -124,8 +77,7 @@ static long long dap_now_ms(void) {
 static int sock_reader(void *ctx, char *buf, int n) {
     dap_frame_reader_t *r = (dap_frame_reader_t *)ctx;
     if (r->started) {
-        /* Bounded wait for the next chunk; a blown deadline or a select
-         * error reads as EOF, which ends the frame and the session. */
+        /* 内部辅助逻辑 */
         long long wait = r->deadline - dap_now_ms();
         if (wait <= 0) return 0;
         fd_set fds;
@@ -148,12 +100,11 @@ static bool sock_writer(void *ctx, const char *buf, int n) {
     return sock_send_all(*(dap_sock_t *)ctx, buf, n);
 }
 
-/* Read one Content-Length framed message from the socket. Returns a malloc'd
- * NUL-terminated body, or NULL on disconnect. */
+/* 底层系统交互与数据协议契约 */
 static char *rpc_read_message_sock(dap_sock_t s) {
-    static dap_frame_reader_t r;   /* the reader loop is single-threaded */
+    static dap_frame_reader_t r;   /* 核心系统底层抽象与内存语义契约 */
     r.s = s;
-    r.started = false;             /* each frame arms fresh on first byte */
+    r.started = false;             /* 底层系统交互与数据协议契约 */
     return rpc_read_message_cb(sock_reader, &r, 64 * 1024 * 1024);
 }
 
@@ -161,11 +112,11 @@ static void rpc_write_message_sock(dap_sock_t s, const char *payload) {
     rpc_write_message_cb(sock_writer, &s, payload);
 }
 
-/* Reference ids used by scopes/variables. */
+/* 核心系统底层抽象与内存语义契约 */
 #define VARREF_LOCALS  1000
 #define VARREF_WATCHES 2000
 
-/* ============================ message I/O ============================ */
+/* message I/O */
 
 static void dap_send(dap_t *d, json_value *msg) {
     json_obj_set(msg, "seq", json_new_num(d->seq++));
@@ -206,7 +157,7 @@ static void dap_output(dap_t *d, const char *category, const char *text) {
     dap_send_event(d, "output", body);
 }
 
-/* Emit a "stopped" event for the single thread. */
+/* 底层系统交互与数据协议契约 */
 static void dap_send_stopped(dap_t *d, const char *reason) {
     json_value *body = json_new_obj();
     json_obj_set(body, "reason", json_new_str(reason));
@@ -215,8 +166,7 @@ static void dap_send_stopped(dap_t *d, const char *reason) {
     dap_send_event(d, "stopped", body);
 }
 
-/* Flush any buffered engine output (inferior stdout + debug notes) to the
- * client's debug console, then reset the buffer. */
+/* 内部辅助逻辑 */
 static void dap_flush_output(dap_t *d) {
     if (d->dbg.output_len > 0) {
         dap_output(d, "stdout", d->dbg.output);
@@ -233,11 +183,11 @@ static void dap_terminate_with_code(dap_t *d, int exit_code) {
     dap_send_event(d, "exited", body);
 }
 
-/* Map a gdb/MI stop reason to a DAP `stopped` reason. */
+/* 底层系统交互与数据协议契约 */
 static const char *dap_stop_reason(const char *mi) {
     if (!mi || !mi[0]) return "breakpoint";
     if (strcmp(mi, "pause") == 0) return "pause";
-    if (strcmp(mi, "signal-received") == 0) return "pause"; /* manual interrupt */
+    if (strcmp(mi, "signal-received") == 0) return "pause"; /* 核心系统底层抽象与内存语义契约 */
     if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
     if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
     if (strstr(mi, "watchpoint")) return "data breakpoint";
@@ -246,8 +196,7 @@ static const char *dap_stop_reason(const char *mi) {
     return "breakpoint";
 }
 
-/* Basename of a path (both slash flavours) — mirrors the engine's matching,
- * which compares gdb-reported locations against client paths by basename. */
+/* 内部辅助逻辑 */
 static const char *dap_basename(const char *path) {
     const char *b = path;
     for (const char *p = path; *p; p++)
@@ -255,8 +204,7 @@ static const char *dap_basename(const char *path) {
     return b;
 }
 
-/* The logpoint stopped at (basename + line match), or NULL. A location that
- * also carries a stopping breakpoint wins over the logpoint. */
+/* 底层系统交互与数据协议契约 */
 static dbg_breakpoint_t *dap_logpoint_here(dap_t *d) {
     if (d->dbg.state != DBG_PAUSED) return NULL;
     dbg_breakpoint_t *lp = NULL;
@@ -267,13 +215,12 @@ static dbg_breakpoint_t *dap_logpoint_here(dap_t *d) {
         if (strcmp(dap_basename(bp->file), dap_basename(d->dbg.current_file)) != 0)
             continue;
         if (bp->type == BP_LOGPOINT) lp = bp;
-        else return NULL; /* a real breakpoint shares the line: it decides */
+        else return NULL; /* 底层系统交互与数据协议契约 */
     }
     return lp;
 }
 
-/* Interpolate a DAP logMessage: "{expr}" segments are evaluated in the
- * current frame; everything else is copied verbatim. Appends a newline. */
+/* 内部辅助逻辑 */
 static void dap_format_log(dap_t *d, const char *msg, char *out, int cap) {
     int o = 0;
     for (int i = 0; msg[i]; i++) {
@@ -308,9 +255,7 @@ static void dap_format_log(dap_t *d, const char *msg, char *out, int cap) {
     }
 }
 
-/* After an execution command: report the resulting stop or termination. A
- * stop on a logpoint is not surfaced: the message is emitted and the target
- * resumes, until a real stop or exit is reached. */
+/* 底层系统交互与数据协议契约 */
 static void dap_report_stop(dap_t *d) {
     dap_flush_output(d);
     int guard = 0;
@@ -329,7 +274,7 @@ static void dap_report_stop(dap_t *d) {
         dap_terminate_with_code(d, d->dbg.last_exit_code);
 }
 
-/* ============================== handlers ============================= */
+/* handlers */
 
 static void handle_initialize(dap_t *d, json_value *request) {
     json_value *caps = json_new_obj();
@@ -346,8 +291,7 @@ static void handle_initialize(dap_t *d, json_value *request) {
     json_obj_set(caps, "supportsExceptionInfoRequest", json_new_bool(true));
     json_obj_set(caps, "supportsExceptionFilterOptions", json_new_bool(true));
     {
-        /* The filters a client shows in its Breakpoints pane. They map onto
-         * breakpoints in the compiler-emitted throw hooks. */
+        /* 底层系统交互与数据协议契约 */
         json_value *filters = json_new_arr();
         const char *ids[2]   = { "throw", "unhandled" };
         const char *labels[2] = { "Thrown exceptions", "Unhandled exceptions" };
@@ -361,7 +305,7 @@ static void handle_initialize(dap_t *d, json_value *request) {
         json_obj_set(caps, "exceptionBreakpointFilters", filters);
     }
     dap_send_response(d, request, true, caps);
-    /* signal readiness for configuration (breakpoints, etc.) */
+    /* 底层系统交互与数据协议契约 */
     dap_send_event(d, "initialized", NULL);
 }
 
@@ -372,7 +316,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
     json_value *bps = json_obj_get(args, "breakpoints");
 
     if (path) {
-        /* drop existing breakpoints for this file */
+        /* 底层系统交互与数据协议契约 */
         for (int i = d->dbg.bp_count - 1; i >= 0; i--) {
             if (strcmp(d->dbg.breakpoints[i].file, path) == 0)
                 dbg_remove_breakpoint(&d->dbg, d->dbg.breakpoints[i].id);
@@ -388,7 +332,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         const char *cond = json_get_str(json_obj_get(bp, "condition"));
         const char *hit_cond = json_get_str(json_obj_get(bp, "hitCondition"));
         const char *log_msg = json_get_str(json_obj_get(bp, "logMessage"));
-        const char *reject = NULL; /* why this breakpoint was not placed */
+        const char *reject = NULL; /* 底层系统交互与数据协议契约 */
 
         int id = -1;
         if (path) {
@@ -396,10 +340,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
                 /* Logpoint */
                 id = dbg_add_logpoint(&d->dbg, path, line, log_msg);
             } else if (hit_cond && hit_cond[0]) {
-                /* Hit-count breakpoint. DAP forms: "K", "==K", ">=K" (map
-                 * onto a gdb ignore-count of K-1); "%K" has no ignore-count
-                 * equivalent and is honestly rejected rather than silently
-                 * mis-honoured. */
+                /* 核心系统底层抽象与内存语义契约 */
                 const char *h = hit_cond;
                 while (*h == ' ') h++;
                 bool modulo = (h[0] == '%');
@@ -415,10 +356,10 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
                     reject = why;
                 }
             } else if (cond && cond[0]) {
-                /* Conditional breakpoint */
+                /* 核心系统底层抽象与内存语义契约 */
                 id = dbg_add_conditional_bp(&d->dbg, path, line, cond);
             } else {
-                /* Normal breakpoint */
+                /* 核心系统底层抽象与内存语义契约 */
                 id = dbg_add_breakpoint(&d->dbg, path, line);
             }
         }
@@ -455,14 +396,13 @@ static void handle_launch(dap_t *d, json_value *request) {
     d->launched = true;
     dap_output(d, "console", "Launching Zan program under gdb...\n");
 
-    /* The program is actually started at configurationDone, once the client
-     * has delivered its breakpoints. */
+    /* 内部辅助逻辑 */
     dap_send_response(d, request, true, NULL);
 }
 
 static void handle_configuration_done(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    /* Breakpoints have now been delivered; start or attach under gdb. */
+    /* 底层系统交互与数据协议契约 */
     if (d->attach_pid > 0)
         dbg_attach(&d->dbg, d->program, d->attach_pid);
     else
@@ -480,8 +420,7 @@ static void handle_threads(dap_t *d, json_value *request) {
         json_arr_add(threads, thread);
     }
     if (d->dbg.thread_count == 0) {
-        /* Not running yet (or gdb told us nothing): the client still needs a
-         * thread to hang its stack request on. */
+        /* 内部辅助逻辑 */
         json_value *thread = json_new_obj();
         json_obj_set(thread, "id", json_new_num(1));
         json_obj_set(thread, "name", json_new_str("main"));
@@ -519,7 +458,7 @@ static void handle_stack_trace(dap_t *d, json_value *request) {
 static void handle_scopes(dap_t *d, json_value *request) {
     json_value *scopes = json_new_arr();
 
-    /* Locals scope */
+    /* 核心系统底层抽象与内存语义契约 */
     json_value *locals_scope = json_new_obj();
     json_obj_set(locals_scope, "name", json_new_str("Locals"));
     json_obj_set(locals_scope, "variablesReference", json_new_num(VARREF_LOCALS));
@@ -527,7 +466,7 @@ static void handle_scopes(dap_t *d, json_value *request) {
     json_obj_set(locals_scope, "presentationHint", json_new_str("locals"));
     json_arr_add(scopes, locals_scope);
 
-    /* Watch scope (if there are watches) */
+    /* 核心系统底层抽象与内存语义契约 */
     if (d->dbg.watch_count > 0) {
         json_value *watch_scope = json_new_obj();
         json_obj_set(watch_scope, "name", json_new_str("Watch"));
@@ -558,8 +497,7 @@ static void handle_variables(dap_t *d, json_value *request) {
             json_arr_add(vars, var);
         }
     } else if (ref >= 3000 && ref < 3000 + DBG_MAX_LOCALS) {
-        /* field expansion of a structured local (五期): the DWARF struct
-         * types irgen emits let gdb varobjs list real fields */
+        /* 内部辅助逻辑 */
         dbg_var_t kids[64];
         int n = dbg_expand_variables(&d->dbg, ref, kids, 64);
         for (int i = 0; i < n; i++) {
@@ -584,7 +522,7 @@ static void handle_variables(dap_t *d, json_value *request) {
             json_arr_add(vars, var);
         }
     } else if (ref == VARREF_WATCHES) {
-        /* Return watch expression values */
+        /* 核心系统底层抽象与内存语义契约 */
         dbg_evaluate_watches(&d->dbg);
         for (int i = 0; i < d->dbg.watch_count; i++) {
             dbg_watch_t *w = &d->dbg.watches[i];
@@ -603,7 +541,7 @@ static void handle_variables(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, body);
 }
 
-/* NEW: Evaluate expression (watch, hover, repl) */
+/* 底层系统交互与数据协议契约 */
 static void handle_evaluate(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     const char *expression = json_get_str(json_obj_get(args, "expression"));
@@ -621,9 +559,9 @@ static void handle_evaluate(dap_t *d, json_value *request) {
     json_obj_set(body, "result", json_new_str(result));
     json_obj_set(body, "variablesReference", json_new_num(0));
 
-    /* If this is a "watch" context, add the watch expression */
+    /* 底层系统交互与数据协议契约 */
     if (context_str && strcmp(context_str, "watch") == 0) {
-        /* ensure it's in the watch list */
+        /* 核心系统底层抽象与内存语义契约 */
         bool found = false;
         for (int i = 0; i < d->dbg.watch_count; i++) {
             if (strcmp(d->dbg.watches[i].expression, expression) == 0) {
@@ -637,7 +575,7 @@ static void handle_evaluate(dap_t *d, json_value *request) {
     dap_send_response(d, request, success, body);
 }
 
-/* NEW: Set variable value */
+/* 核心系统底层抽象与内存语义契约 */
 static void handle_set_variable(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     const char *name = json_get_str(json_obj_get(args, "name"));
@@ -655,7 +593,7 @@ static void handle_set_variable(dap_t *d, json_value *request) {
     dap_send_response(d, request, success, body);
 }
 
-/* NEW: Exception info request */
+/* 核心系统底层抽象与内存语义契约 */
 static void handle_exception_info(dap_t *d, json_value *request) {
     char info[256] = {0};
     bool has_info = dbg_get_exception_info(&d->dbg, info, sizeof(info));
@@ -666,7 +604,7 @@ static void handle_exception_info(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, body);
 }
 
-/* continue / next / stepIn / stepOut share a shape */
+/* 底层系统交互与数据协议契约 */
 static void handle_continue(dap_t *d, json_value *request) {
     json_value *body = json_new_obj();
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
@@ -693,10 +631,7 @@ static void handle_step_out(dap_t *d, json_value *request) {
     dap_report_stop(d);
 }
 
-/* Pause the running target. The normal path is the wait hook (the request is
- * consumed while the adapter pumps gdb output during a run); if it lands here
- * with the target running (e.g. a console stdin that cannot be polled), the
- * interrupt + wait still happen synchronously. */
+/* 核心系统底层抽象与内存语义契约 */
 static void handle_pause(dap_t *d, json_value *request) {
     if (d->dbg.state != DBG_RUNNING) {
         json_value *body = json_new_obj();
@@ -728,8 +663,7 @@ static void handle_set_exception_breakpoints(dap_t *d, json_value *request) {
         else if (strcmp(f, "unhandled") == 0 || strcmp(f, "uncaught") == 0)
             on_unhandled = true;
     }
-    /* Before the process exists this only records the request; dbg_start and
-     * dbg_attach place the breakpoints once gdb is up. */
+    /* 内部辅助逻辑 */
     dbg_set_exception_breakpoints(&d->dbg, on_throw, on_unhandled);
     dap_send_response(d, request, true, NULL);
 }
@@ -758,17 +692,7 @@ static void handle_select_thread(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
 }
 
-/* ---- input polling: service client requests while the target runs ----
- *
- * The adapter is single-threaded by design. While an execution command pumps
- * gdb output (mi_wait_stopped), the wait hook below runs whenever gdb output
- * goes quiet: it checks the client transport for a pending request, answers
- * `pause` right away (triggering the inferior interrupt) and parks any other
- * request until the current handler settles.
- *
- * stdin is read through the raw fd (not stdio), so "bytes available at the OS
- * level" is exactly "the next message arrived" — nothing is ever buffered
- * out of sight of the pending check. */
+/* 内部辅助逻辑 */
 
 static dap_t *g_dap;
 
@@ -793,13 +717,12 @@ static bool rd_input_pending(dap_t *d) {
     }
     HANDLE h = (HANDLE)_get_osfhandle(0);
     DWORD avail = 0;
-    /* console stdin has no pipe to peek: pause then only works through the
-     * synchronous handle_pause path */
+    /* 内部辅助逻辑 */
     return h != INVALID_HANDLE_VALUE && h != NULL &&
            PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0;
 }
 
-/* rpc reader over the raw stdin fd */
+/* 底层系统交互与数据协议契约 */
 static int rd_reader(void *ctx, char *buf, int n) {
     (void)ctx;
     DWORD r = 0;
@@ -825,14 +748,14 @@ static int rd_reader(void *ctx, char *buf, int n) {
 }
 #endif
 
-/* Runs inside the debugger's stop-wait loop when gdb output goes quiet. */
+/* 语言服务与调试协议交互规范 */
 static void dap_wait_hook(void *user) {
     dap_t *d = user;
     if (!rd_input_pending(d)) return;
     char *body = d->use_sock
         ? rpc_read_message_sock(d->sock)
         : rpc_read_message_cb(rd_reader, NULL, RPC_MAX_MESSAGE);
-    if (!body) return; /* client went away mid-run */
+    if (!body) return; /* 核心系统底层抽象与内存语义契约 */
     json_value *msg = json_parse(body);
     if (!msg) {
         free(body);
@@ -840,22 +763,21 @@ static void dap_wait_hook(void *user) {
     }
     const char *cmd = json_get_str(json_obj_get(msg, "command"));
     if (cmd && strcmp(cmd, "pause") == 0) {
-        /* acknowledge now; the resulting stop is reported by whichever
-         * handler is pumping the target (it owns dap_report_stop) */
+        /* 内部辅助逻辑 */
         dap_send_response(d, msg, true, NULL);
         json_free(msg);
         free(body);
         dbg_interrupt(&d->dbg);
     } else if (g_parked_tail < DAP_PARK_MAX) {
-        g_parked[g_parked_tail++] = body; /* main loop takes ownership */
+        g_parked[g_parked_tail++] = body; /* 核心系统底层抽象与内存语义契约 */
         json_free(msg);
     } else {
         json_free(msg);
-        free(body); /* overloaded client: drop */
+        free(body); /* 核心系统底层抽象与内存语义契约 */
     }
 }
 
-/* ============================== dispatch ============================= */
+/* dispatch */
 
 static void dispatch(dap_t *d, json_value *request) {
     const char *cmd = json_get_str(json_obj_get(request, "command"));
@@ -885,8 +807,7 @@ static void dispatch(dap_t *d, json_value *request) {
     else                                            dap_send_response(d, request, true, NULL);
 }
 
-/* Listen on 127.0.0.1:port and accept a single client. Returns the connected
- * socket, or DAP_INVALID_SOCK on failure. */
+/* Listen on 127 */
 static dap_sock_t dap_listen_accept(int port) {
 #ifdef _WIN32
     WSADATA wsa;

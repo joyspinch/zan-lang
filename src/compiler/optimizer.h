@@ -1,4 +1,4 @@
-/* optimizer.h -- Zan compiler optimization passes. */
+/* 核心系统底层抽象与内存语义契约 */
 
 #ifndef ZAN_OPTIMIZER_H
 #define ZAN_OPTIMIZER_H
@@ -15,7 +15,7 @@ typedef enum {
     ZAN_OPT_FULL = 2,
     ZAN_OPT_SIZE = 3,
     ZAN_OPT_AGGRESSIVE = 4,
-    /* Oz: minimum-size codegen for edge/embedded deployments. */
+    /* 底层系统交互与数据协议契约 */
     ZAN_OPT_SIZE_MIN = 5
 } zan_opt_level_t;
 
@@ -71,7 +71,7 @@ void zan_opt_report_print(const zan_opt_report_t *report);
 void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level);
 void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level);
 
-/* Reachability-only sweep (LLVM globaldce), for builds that run no pipeline. */
+/* 底层系统交互与数据协议契约 */
 void zan_opt_strip_unused(zan_irgen_t *g);
 
 #endif /* ZAN_OPTIMIZER_H */

@@ -18,7 +18,7 @@ char *zan_genmeta_export_files(struct zan_ast_node *unit,
 /* 内部辅助逻辑 */
 struct zan_ast_node *zan_genmeta_find_call(struct zan_ast_node *unit, int id);
 
-/* Snapshot the call-site nodes: nodes[k-1] gets the node of id k, for k <= cap */
+/* 底层系统交互与数据协议契约 */
 int zan_genmeta_index_calls(struct zan_ast_node *unit,
                             struct zan_ast_node **nodes, int cap);
 

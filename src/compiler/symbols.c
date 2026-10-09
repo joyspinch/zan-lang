@@ -1,4 +1,4 @@
-/* symbols.c -- see symbols.h. */
+/* 核心系统底层抽象与内存语义契约 */
 
 #include "symbols.h"
 #include "builtin_api.h"
@@ -11,7 +11,7 @@
 #define fopen zan_utf8_fopen
 #endif
 
-/* Renders a type reference ("List<string>", "byte[]", "int?") into buf. */
+/* 底层系统交互与数据协议契约 */
 static int type_name(const zan_ast_node_t *t, char *buf, int cap) {
     int n = 0;
     if (!t || cap < 2) { if (cap > 0) buf[0] = 0; return 0; }
@@ -50,7 +50,7 @@ static int type_name(const zan_ast_node_t *t, char *buf, int cap) {
     return n;
 }
 
-/* "string Substring(int start, int length)" for a method declaration. */
+/* 底层系统交互与数据协议契约 */
 static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     char ret[256];
     type_name(m->method_decl.return_type, ret, (int)sizeof(ret));
@@ -73,10 +73,7 @@ static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     if (n < cap - 1) { buf[n++] = ')'; buf[n] = 0; }
 }
 
-/* True for a bodyless extern / [DllImport] declaration: an FFI binding (crt
- * fopen, a libpq entry point) that happens to be declared inside a class, so
- * completion offered it as one of the type's own methods. Same test irgen uses
- * to emit them as plain external declarations. */
+/* 底层系统交互与数据协议契约 */
 static int is_extern_decl(const zan_ast_node_t *m) {
     return m->kind == AST_METHOD_DECL && !m->method_decl.body &&
            (zan_ast_method_extern_lib(m).str != NULL ||

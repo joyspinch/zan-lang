@@ -1,17 +1,7 @@
-/* intellisense.c -- Code intelligence implementation.
- *
- * Enhanced with:
- *   - Dot-triggered member completion for user-defined types
- *   - Snippet completions (if, for, foreach, class, etc.)
- *   - Signature help for method calls
- *   - Multi-file symbol indexing
- *   - Variable type resolution for member access
- *   - Better doc-comment extraction
- */
+/* intellisense */
 #include "intellisense.h"
 #include "../common/json.h"
-/* The compiler's own table of built-in type members: irgen and this server
- * must not disagree about what `string`, `List<T>` or `Console` support. */
+/* 内部辅助逻辑 */
 #include "../compiler/builtin_api.h"
 #include "../compiler/parser.h"
 #include "../compiler/arena.h"
@@ -35,14 +25,14 @@
 #endif
 #include "../common/host_oom.h"
 
-/* Built-in type completions */
+/* 核心系统底层抽象与内存语义契约 */
 static const char *builtin_types[] = {
     "int", "float", "double", "bool", "string", "char", "byte", "long",
     "short", "void", "var", "object", "decimal", "uint", "ulong",
     "ushort", "sbyte", NULL
 };
 
-/* Built-in keyword completions */
+/* 核心系统底层抽象与内存语义契约 */
 static const char *builtin_keywords[] = {
     "abstract", "as", "async", "await", "base", "break",
     "case", "catch", "class", "const", "continue",
@@ -57,20 +47,9 @@ static const char *builtin_keywords[] = {
     NULL
 };
 
-/* The member surface of the compiler's built-in types (string, List<T>,
- * Dictionary<K,V>, Console, Math, File, ...) is NOT described here: those
- * types are lowered by irgen instead of being declared in the standard
- * library, and src/compiler/builtin_api.c is the single table that says what
- * they support. A hand-maintained copy in this file drifted from it and
- * offered members the compiler rejects (`string.PadLeft`, `string.PadRight`,
- * `List.Sort`, ... were deliberately removed from builtin_api.c because they
- * compiled to a wrong result) while hiding real ones (`File.GetSize`).
- * Completion, hover and signature help below query that table directly. */
+/* 内部辅助逻辑 */
 
-/* Resolves a receiver name as spelled in source to its built-in type entry.
- * `List<int>` and `byte[]` arrive with their decoration, and the language
- * spells some entries differently from irgen's internal name
- * (`Dictionary` -> "Dict", `string` -> "string"). */
+/* 模块核心语义抽象与接口调用契约 */
 static const zan_builtin_type_t *builtin_receiver(const char *type_name) {
     if (!type_name || !type_name[0]) return NULL;
     char bare[64];
@@ -91,7 +70,7 @@ static const zan_builtin_type_t *builtin_receiver(const char *type_name) {
     return NULL;
 }
 
-/* Whether the pending completion list already carries `label`. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool already_offered(const intellisense_t *is, const char *label) {
     for (int i = 0; i < is->completion_count; i++) {
         if (strcmp(is->completions[i].label, label) == 0) return true;
@@ -99,17 +78,9 @@ static bool already_offered(const intellisense_t *is, const char *label) {
     return false;
 }
 
-/* The standard library is NOT tabulated here. Thread, Stopwatch, Mutex,
- * SharedTable, Encoding, Convert's Zan-side neighbours and every GUI widget
- * (Control/Input/Button/...) are ordinary Zan types with real source in
- * stdlib/ and packages/, so their members come from the same index as the
- * user's own classes -- see intel_index_project / ensure_stdlib_indexed.
- * Copies of those members used to live here and drifted: they listed
- * `File.OpenRead`, `Math.Clamp`, `Convert.ToDecimal` (none of which exist)
- * while hiding `File.GetSize`, and they froze the GUI widget surface at
- * whatever it looked like the day they were written. */
+/* 底层系统交互与数据协议契约 */
 
-/* Grows the symbol table to hold at least `need` entries. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_symbols(intellisense_t *is, int need) {
     if (need <= is->symbol_cap) return true;
     int cap = is->symbol_cap ? is->symbol_cap * 2 : INTEL_INIT_SYMBOLS;
@@ -121,7 +92,7 @@ static bool reserve_symbols(intellisense_t *is, int need) {
     return true;
 }
 
-/* Grows the method-extent table to hold at least `need` entries. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_methods(intellisense_t *is, int need) {
     if (need <= is->method_cap) return true;
     int cap = is->method_cap ? is->method_cap * 2 : 64;
@@ -133,7 +104,7 @@ static bool reserve_methods(intellisense_t *is, int need) {
     return true;
 }
 
-/* Grows the indexed-file list to hold at least `need` paths. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_files(intellisense_t *is, int need) {
     if (need <= is->indexed_file_cap) return true;
     int cap = is->indexed_file_cap ? is->indexed_file_cap * 2 : INTEL_INIT_FILES;
@@ -191,7 +162,7 @@ static void add_symbol(intellisense_t *is, const char *name,
     sym->col = col;
 }
 
-/* Add symbol with extra metadata */
+/* 核心系统底层抽象与内存语义契约 */
 static void add_symbol_ex(intellisense_t *is, const char *name,
                           const char *type_name, const char *parent,
                           const char *signature, const char *file,
@@ -215,7 +186,7 @@ static void add_symbol_ex(intellisense_t *is, const char *name,
     sym->param_count = param_count;
 }
 
-/* Register built-in code snippets */
+/* 核心系统底层抽象与内存语义契约 */
 void intel_register_snippets(intellisense_t *is) {
     is->snippet_count = 0;
 
@@ -251,27 +222,9 @@ void intel_register_snippets(intellisense_t *is) {
     }
 }
 
-/* ---- design-document indexing helpers ----
- *
- * Design documents (.zscene JSON, .html/.htm designer docs) are not Zan
- * source: the GenForm/GenScene generators (stdlib/System/Compiler) project
- * them onto synthetic `partial class <Name>` code with a widget field per
- * entry and event bindings wired by handler name. The index mirrors that
- * projection so the business file's autocomplete, go-to-def and hover see
- * the typed fields and event handlers without the compiler having to run:
- *
- *   - the doc name becomes a class symbol (Form for .html design docs,
- *     object for .zscene),
- *   - each field/element becomes a static field whose type is the mapped
- *     widget class,
- *   - each on*Event handler name and the top-level "submit" name become
- *     method symbols on the class.
- */
+/* 底层系统交互与数据协议契约 */
 
-/* Concrete Gui widget type for a legacy numeric field type (must match the
- * stdlib/System/Compiler/GenForm.zan widget map). .html design docs carry
- * the widget class name directly in data-kind; a bare number only survives
- * in hand-written docs. */
+/* 内部辅助逻辑 */
 static const char *intel_design_widget(int ft) {
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";
@@ -287,9 +240,7 @@ static const char *intel_design_widget(int ft) {
     return "Label";
 }
 
-/* Scan a JSON design document's raw text for `"name": "xxx"` key/value pairs
- * and record the 0-based line of each so symbols can point at their JSON
- * definition. */
+/* 内部辅助逻辑 */
 static int intel_doc_name_lines(const char *text, size_t len,
                                   const char *lines[64], const char *vals[64],
                                   int max) {
@@ -333,22 +284,9 @@ static int intel_doc_name_lines(const char *text, size_t len,
     return n;
 }
 
-/* ---- .html designer-document indexing (P7d storage format) ----
- *
- * A .html design doc (stdlib/System/Web/DesignerHtml) is the designer's
- * JSON form model serialized as HTML: the body tag carries the
- * data-zan-design marker + id="FormName" (+ data-submit for the form-level
- * submit handler), each field element carries id="Name" +
- * data-kind="WidgetType", and event handlers ride data-on-<event>="Handler".
- * The encoder writes one element per line, so the index scans line-wise and
- * flattens nested containers (one symbol per field, kids included).
- * Hand-edited elements wrapped across lines are not seen until the
- * designer re-saves. Only docs carrying the marker are indexed; plain HTML
- * pages produce no symbols. */
+/* 内部辅助实现 */
 
-/* Read attr="value" off one HTML line. `attr` must sit at a tag boundary
- * (start of line, or preceded by space/tab/'<') so "id" does not match
- * inside "data-id". Entity-decoded via intel_html_decode. */
+/* 底层系统交互与数据协议契约 */
 static size_t intel_html_decode(const char *v, size_t n, char *out,
                                 size_t cap);
 static bool intel_html_attr(const char *line, size_t len, const char *attr,
@@ -369,12 +307,7 @@ static bool intel_html_attr(const char *line, size_t len, const char *attr,
     return false;
 }
 
-/* Decode the entities the design encoder emits (&amp; &lt; &gt; &quot;
- * &#39; and numeric &#NN;) so hand-authored attrs like id="A&amp;B" index
- * under the real name. Attr values the indexer consumes are identifiers,
- * so this is a no-op on designer-written docs. Returns the decoded length,
- * or 0 when the value does not fit `cap` (empty values decode to 0 too,
- * which is valid). */
+/* 内部辅助实现 */
 static size_t intel_html_decode(const char *v, size_t n, char *out,
                                 size_t cap) {
     size_t r = 0, w = 0;
@@ -422,8 +355,7 @@ static bool intel_html_has(const char *line, size_t len, const char *needle) {
     return false;
 }
 
-/* Every data-on-<event>="Handler" value on one line (fields can carry
- * several, e.g. data-on-click + data-on-submit). */
+/* 模块核心语义抽象与接口调用契约 */
 static int intel_html_handlers(const char *line, size_t len,
                                char outs[][128], int max) {
     static const char kOn[] = "data-on-";
@@ -452,7 +384,7 @@ static int intel_html_handlers(const char *line, size_t len,
 
 static void intel_parse_design_html(intellisense_t *is, const char *filepath,
                                    const char *content, size_t len) {
-    /* pass 1: the marker line names the form and the form-level handlers */
+    /* 语言服务与调试协议交互规范 */
     bool has_marker = false;
     char class_name[128] = {0};
     char submit[128] = {0};
@@ -476,7 +408,7 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
         return;
     }
 
-    /* the form class, base type Form (member completion walks inheritance) */
+    /* 模块核心语义抽象与接口调用契约 */
     add_symbol_ex(is, class_name, "Form", NULL, NULL, filepath, NULL,
                   ISYM_CLASS, 0, 0, false, 0);
     if (submit[0])
@@ -487,7 +419,7 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
                    filepath, ISYM_METHOD, 0, 0);
     }
 
-    /* pass 2: one line per field element */
+    /* 底层系统交互与数据协议契约 */
     p = content;
     int line = 0;
     while (p < end) {
@@ -499,8 +431,7 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
             char fname[128];
             if (intel_html_attr(p, ll, "id", fname, sizeof(fname)) &&
                 fname[0] && isalpha((unsigned char)fname[0])) {
-                /* data-kind holds the widget class name; a bare number is
-                 * the legacy numeric field type */
+                /* 内部辅助逻辑 */
                 const char *wtype = "Panel";
                 if (isalpha((unsigned char)kind[0])) {
                     wtype = kind;
@@ -523,17 +454,7 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
     }
 }
 
-/* ---- .zscene design-document indexing ----
- *
- * A .zscene file is the scene designer's JSON description (see
- * stdlib/Game/Scene/SceneDoc.zan). The IDE regenerates <Name>.g.zan from it,
- * declaring each validly-named element as `static SceneElement <name>` on
- * `partial class <Name>`, plus the runtime layer helpers (OpenLayer/
- * CloseLayer/ToggleLayer/LayerOpen on SceneDoc) and the on* action keys
- * (SceneElement.On/OnAction, interpreted by SceneDoc.RunActions /
- * SceneView.HandleClicks). Index that same projection
- * directly from the JSON so the business file's completion sees the elements
- * even while the generated file is stale or missing. */
+/* 内部辅助实现 */
 static void intel_parse_zscene(intellisense_t *is, const char *filepath,
                                const char *content, size_t len) {
     char *text = (char *)malloc(len + 1);
@@ -551,7 +472,7 @@ static void intel_parse_zscene(intellisense_t *is, const char *filepath,
     add_symbol_ex(is, class_name, "object", NULL, NULL, filepath, NULL,
                   ISYM_CLASS, 0, 0, false, 0);
 
-    /* element name -> JSON line map for go-to-def */
+    /* 底层系统交互与数据协议契约 */
     const char *name_lines[64], *name_vals[64];
     int name_count = intel_doc_name_lines(content, len, name_lines,
                                           name_vals, 64);
@@ -583,9 +504,7 @@ static void intel_parse_zscene(intellisense_t *is, const char *filepath,
     json_free(root);
 }
 
-/* Declaration ownership comes exclusively from the compiler AST. The lexer
- * supplies name locations and delimiter extents missing from zan_ast_node_t;
- * it never discovers declarations or provides a parser fallback. */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     zan_token_t token;
     int mate;
@@ -634,7 +553,7 @@ static void intel_ast_position(const intel_ast_ctx_t *c, int offset,
     }
     *line = lo;
     *col = intel_utf16_col(c->source + c->lines[lo], off - c->lines[lo]);
-    if (offset > 0 && (size_t)offset > c->len) (*col)++; /* editable EOF in an unclosed scope */
+    if (offset > 0 && (size_t)offset > c->len) (*col)++; /* 核心系统底层抽象与内存语义契约 */
 }
 
 static int intel_ast_token_at(const intel_ast_ctx_t *c, int offset) {
@@ -665,8 +584,7 @@ static void intel_ast_type(const zan_ast_node_t *n, char *out, size_t cap) {
             while (element->kind == AST_TYPE_REF && element->type_ref.array_element)
                 element = element->type_ref.array_element;
             intel_ast_type(element, out, cap);
-            /* The parser wraps source ranks right-to-left: the outer rank is
-             * the first suffix in `int[][,]`, not the last one. */
+            /* 内部辅助逻辑 */
             for (element = n; element->kind == AST_TYPE_REF && element->type_ref.array_element;
                  element = element->type_ref.array_element) {
                 intel_ast_append(out, cap, "[");
@@ -713,8 +631,7 @@ static void intel_ast_type(const zan_ast_node_t *n, char *out, size_t cap) {
     }
 }
 
-/* End of an AST type in the real token stream, used only to disambiguate
- * `Widget Widget` and generic return types from the declaration name. */
+/* 内部辅助逻辑 */
 static int intel_ast_type_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n) {
     if (!n) return 0;
     int i = intel_ast_token_at(c, (int)n->loc.offset);
@@ -753,9 +670,7 @@ static int intel_ast_name_token(const intel_ast_ctx_t *c, const zan_ast_node_t *
         const zan_token_t *t = &c->tokens[i].token;
         if (t->kind == TK_IDENT && t->str_val.len == name.len &&
             memcmp(t->str_val.str, name.str, name.len) == 0) return i;
-        /* Comma declarators share the first declaration's AST location.
-         * Skip earlier initializers so a reference to the later name cannot
-         * be mistaken for that later declaration's token. */
+        /* 模块核心语义抽象与接口调用契约 */
         if (t->kind == TK_EQ && (n->kind == AST_VAR_DECL || n->kind == AST_FIELD_DECL)) {
             for (i++; i < c->token_count; i++) {
                 zan_token_kind_t k = c->tokens[i].token.kind;
@@ -768,7 +683,7 @@ static int intel_ast_name_token(const intel_ast_ctx_t *c, const zan_ast_node_t *
         if (t->kind == TK_SEMICOLON || t->kind == TK_LBRACE ||
             t->kind == TK_RBRACE || t->kind == TK_EQ) break;
     }
-    return -1; /* generated parser names have no source declaration */
+    return -1; /* 底层系统交互与数据协议契约 */
 }
 
 static int intel_ast_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n, int limit) {
@@ -793,8 +708,7 @@ static int intel_ast_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n, int 
     int i = intel_ast_token_at(c, (int)n->loc.offset);
     if (i < c->token_count && c->tokens[i].token.kind == TK_LBRACE)
         return c->tokens[i].mate >= i ? (int)c->tokens[c->tokens[i].mate].token.loc.offset + 1 : limit;
-    /* Synthetic embedded-statement/expression bodies have no opening brace.
-     * Walk lexer delimiters to their terminator; do not parse their syntax. */
+    /* 模块核心语义抽象与接口调用契约 */
     for (; i < c->token_count && (int)c->tokens[i].token.loc.offset < limit; i++) {
         zan_token_kind_t kind = c->tokens[i].token.kind;
         if (kind == TK_SEMICOLON) return (int)c->tokens[i].token.loc.offset + 1;
@@ -812,9 +726,7 @@ static void intel_ast_scope(const intel_ast_ctx_t *c, isym_t *s, intel_scope_t s
     intel_ast_position(c, scope.end, &s->scope_end_line, &s->scope_end_col);
 }
 
-/* snprintf truncates at a byte boundary, which can split a trailing UTF-8
- * sequence and send invalid UTF-8 to LSP clients (every frame must be valid
- * UTF-8). Trim any incomplete trailing sequence after a size-capped copy. */
+/* 内部辅助逻辑 */
 static void utf8_trim_end(char *s) {
     size_t n = strlen(s);
     size_t i = n;
@@ -822,8 +734,8 @@ static void utf8_trim_end(char *s) {
     if (i > 0 && (unsigned char)s[i - 1] >= 0x80) {
         unsigned char b = (unsigned char)s[i - 1];
         size_t need = b >= 0xF0 ? 4 : (b >= 0xE0 ? 3 : 2);
-        if (n - (i - 1) < need) i--; /* incomplete sequence: drop lead + stray continuations */
-        else i = n;                  /* complete sequence: nothing to trim */
+        if (n - (i - 1) < need) i--; /* 底层系统交互与数据协议契约 */
+        else i = n;                  /* 核心系统底层抽象与内存语义契约 */
     }
     if (i < n) s[i] = '\0';
 }
@@ -1055,7 +967,7 @@ static void intel_ast_callable(intel_ast_ctx_t *c, const zan_ast_node_t *n,
     snprintf(sig, sizeof(sig), "%s%s%s%s%s%s(", mods & MOD_STATIC ? "static " : "",
              mods & MOD_ASYNC ? "async " : "", ctor ? "" : type, ctor ? "" : " ",
              parent && parent[0] ? parent : "", parent && parent[0] ? "." : "");
-    /* Append the source callable name before the parameter list. */
+    /* 模块核心语义抽象与接口调用契约 */
     size_t sl = strlen(sig);
     if (sl) sig[sl - 1] = '\0';
     intel_ast_append(sig, sizeof(sig), name);
@@ -1078,8 +990,7 @@ static void intel_ast_callable(intel_ast_ctx_t *c, const zan_ast_node_t *n,
                          mods, n->method_decl.params.count, scope);
         return;
     }
-    /* Parser-generated accessors are traversed through their property node,
-     * not through synthesized names which have no source declaration. */
+    /* 内部辅助逻辑 */
     if (intel_ast_name_token(c, n, n->method_decl.name, floor) < 0) return;
     intel_scope_t body = intel_ast_body(c, n->method_decl.body ? n->method_decl.body : n,
                                         parent, name, (int)n->loc.offset, scope);
@@ -1372,8 +1283,7 @@ static void intel_ast_walk(intel_ast_ctx_t *c, const zan_ast_node_t *n,
     }
 }
 
-/* Use the compiler token stream directly: interpolation literals and format
- * text are string tokens, while identifiers inside real holes remain code. */
+/* 内部辅助逻辑 */
 int intel_find_text_references(const char *text, const char *word, size_t *offsets, int max) {
     int count = 0;
     size_t wlen = strlen(word);
@@ -1433,8 +1343,7 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
         else if (depth && (k == TK_RBRACE || k == TK_RPAREN || k == TK_RBRACKET)) {
             zan_token_kind_t expected = k == TK_RBRACE ? TK_LBRACE : k == TK_RPAREN ? TK_LPAREN : TK_LBRACKET;
             int match = depth - 1;
-            /* An unfinished call/index must not hide the method's closing
-             * brace while the user is editing its last statement. */
+            /* 内部辅助逻辑 */
             while (match >= 0 && c.tokens[stack[match]].token.kind != expected) {
                 if (c.tokens[stack[match]].token.kind == TK_LBRACE) break;
                 match--;
@@ -1446,9 +1355,7 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
         }
     }
     free(stack);
-    /* Completion arrives with unfinished `receiver.` or `var x =` text.
-     * Mask dangling punctuation while preserving every source byte position;
-     * the real compiler parser still owns all recovered declarations. */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i + 1 < c.token_count; i++) {
         zan_token_kind_t k = c.tokens[i].token.kind, next = c.tokens[i + 1].token.kind;
         if ((k == TK_DOT || k == TK_QUESTION_DOT || k == TK_EQ) &&
@@ -1471,8 +1378,7 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
     snprintf(saved_file, sizeof(saved_file), "%s", is->current_file);
     snprintf(is->current_file, sizeof(is->current_file), "%s", file);
     intel_scope_t scope = {0, (int)len + 1, -1};
-    /* Index return/field types before walking initializers and bodies, so
-     * `var x = LaterDeclaredMethod()` does not depend on member order. */
+    /* 内部辅助逻辑 */
     c.declarations_only = true;
     intel_ast_walk(&c, unit, "", scope);
     c.declarations_only = false;
@@ -1484,7 +1390,7 @@ done:
     zan_arena_free(arena);
 }
 
-/* Native paths are case-insensitive on Windows, including separator aliases. */
+/* 模块核心语义抽象与接口调用契约 */
 bool intel_same_file(const char *a, const char *b) {
 #ifdef _WIN32
     while (*a && *b) {
@@ -1499,10 +1405,10 @@ bool intel_same_file(const char *a, const char *b) {
 #endif
 }
 
-/* Design documents keep their compile-time projection. */
+/* 底层系统交互与数据协议契约 */
 void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char *filepath,
                          const char *content, size_t len) {
-    /* clear previous symbols from this file */
+    /* 底层系统交互与数据协议契约 */
     int dst = 0;
     for (int i = 0; i < is->symbol_count; i++) {
         if (!intel_same_file(is->symbols[i].file, filepath)) {
@@ -1512,7 +1418,7 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
     }
     is->symbol_count = dst;
 
-    /* same for the method-extent table */
+    /* 底层系统交互与数据协议契约 */
     int mdst = 0;
     for (int i = 0; i < is->method_count; i++) {
         if (!intel_same_file(is->methods[i].file, filepath)) {
@@ -1522,7 +1428,7 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
     }
     is->method_count = mdst;
 
-    /* track this file as indexed */
+    /* 核心系统底层抽象与内存语义契约 */
     int fdst = 0;
     for (int i = 0; i < is->indexed_file_count; i++) {
         if (intel_same_file(is->indexed_files[i], filepath)) continue;
@@ -1536,9 +1442,7 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
 
     if (!content || len == 0) return;
 
-    /* designer documents are not Zan source (.zscene JSON, .html/.htm
-     * P7d): index their compile-time projection (class + typed
-     * fields + event handlers) instead. */
+    /* 底层系统交互与数据协议契约 */
     {
         size_t fl = strlen(filepath);
         if (fl > 7 && strcmp(filepath + fl - 7, ".zscene") == 0) {
@@ -1566,7 +1470,7 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 bool intel_position_in(int line, int col, int start_line, int start_col,
                        int end_line, int end_col) {
     if (line < start_line || line > end_line) return false;
-    if (col < 0) return true; /* compatibility for callers with no column */
+    if (col < 0) return true; /* 核心系统底层抽象与内存语义契约 */
     return (line != start_line || col >= start_col) &&
            (line != end_line || col < end_col);
 }
@@ -1588,7 +1492,7 @@ bool intel_symbol_visible_at(const intellisense_t *is, const isym_t *sym, int li
     if (sym->kind != ISYM_VARIABLE && sym->kind != ISYM_PARAMETER) return true;
     if (line < 0 || sym->method_offset < 0) return false;
     if (is->current_file[0] && !intel_same_file(sym->file, is->current_file)) return false;
-    /* A multiline parameter declaration may precede the body's opening brace. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (sym->offset >= 0 && col >= 0 && line == sym->line && col >= sym->col &&
         col < sym->col + intel_utf16_col(sym->name, strlen(sym->name))) return true;
     const imethod_t *m = intel_method_at(is, line, col);
@@ -1641,11 +1545,7 @@ const isym_t *intel_lookup_symbol_at(intellisense_t *is, const char *word, int l
     return best;
 }
 
-/* Name-only lookup across an aggregate index (project/stdlib/packages).
- * `current_file` on such an index is just the last parsed file, so the
- * same-file preference in intel_lookup_symbol_at would hide every symbol
- * from other files; prefer type members (fields/methods/...) over
- * declarations, otherwise the newest match wins. */
+/* 模块核心语义抽象与接口调用契约 */
 const isym_t *intel_lookup_symbol_any(intellisense_t *is, const char *word) {
     if (!is || !word || !word[0]) return NULL;
     const isym_t *best = NULL;
@@ -1677,7 +1577,7 @@ const char *intel_resolve_type(intellisense_t *is, const char *var_name) {
     return intel_resolve_type_at(is, var_name, -1);
 }
 
-/* Return the base type of a user-defined class/struct, or NULL. */
+/* 返回the base type of a user-defined class/struct, or NULL */
 static const char *class_base(intellisense_t *is, const char *cls) {
     char bare[128];
     snprintf(bare, sizeof(bare), "%s", cls);
@@ -1703,8 +1603,7 @@ static bool intel_type_owner_is(const char *type, const char *owner) {
     return strcmp(simple ? simple + 1 : bare, owner) == 0;
 }
 
-/* Distance in the enclosing type's actual base chain, not in the member's
- * chain: unrelated public members must never become bare-name candidates. */
+/* 内部辅助逻辑 */
 static int intel_owner_distance(intellisense_t *is, const char *type, const char *owner) {
     for (int depth = 0; type && type[0] && depth < 16; depth++) {
         if (intel_type_owner_is(type, owner)) return depth;
@@ -1713,10 +1612,7 @@ static int intel_owner_distance(intellisense_t *is, const char *type, const char
     return -1;
 }
 
-/* Whether a member declared at `vis` may be offered to a receiver used from
- * inside `from_class`. Private members are only visible inside their own
- * type: that is what used to fill `Stopwatch.` with `running`, `accumulated`
- * and `cachedFrequency`. */
+/* 内部辅助逻辑 */
 static bool member_visible(const intellisense_t *is, ivis_t vis,
                            const char *parent, const char *from_class) {
     if (vis == IVIS_PUBLIC) return true;
@@ -1726,8 +1622,7 @@ static bool member_visible(const intellisense_t *is, ivis_t vis,
            intel_owner_distance((intellisense_t *)is, from_class, parent) >= 0;
 }
 
-/* Complete members of a given type.
- * If line >= 0, resolves type_name as a variable in the enclosing method scope first. */
+/* 核心系统底层抽象与内存语义契约 */
 int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                                const char *prefix, int line, int col) {
     is->completion_count = 0;
@@ -1735,10 +1630,7 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
     size_t plen = prefix ? strlen(prefix) : 0;
 
-    /* The caller may pass a variable name (`p.` after `Player p = ...`)
-     * or a special receiver keyword like `this`/`self`.
-     * When no type of that name exists, resolve the receiver's declared
-     * type and complete against it instead. */
+    /* 底层系统交互与数据协议契约 */
     if (strcmp(type_name, "this") == 0 || strcmp(type_name, "self") == 0) {
         const char *encl = intel_enclosing_type_at(is, line, col);
         if (encl && encl[0]) type_name = encl;
@@ -1761,8 +1653,7 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
     const char *rank = intel_array_suffix(type_name);
     if (rank) {
-        /* checker/irgen expose Length/Count for arrays, and GetLength for
-         * rectangular arrays. Element members require an index operation. */
+        /* 内部辅助逻辑 */
         const char *members[] = {"Length", "Count", "GetLength"};
         int count = rank[1] == ',' ? 3 : 2;
         for (int i = 0; i < count; i++) {
@@ -1778,19 +1669,16 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
         return is->completion_count;
     }
 
-    /* Strip generic arguments for the class-name walk: members of
-     * `List<string>` live under `List`. */
+    /* 内部辅助逻辑 */
     char bare_type[64];
     snprintf(bare_type, sizeof(bare_type), "%s", type_name);
     { char *lt = strchr(bare_type, '<'); if (lt) *lt = '\0';
       char *br = strstr(bare_type, "[]"); if (br) *br = '\0'; }
 
-    /* Whose body the request comes from: a class sees its own privates and
-     * its bases' protected members, callers see only the public surface. */
+    /* 内部辅助逻辑 */
     const char *from_class = intel_enclosing_type_at(is, line, col);
 
-    /* Check user-defined type members, walking the inheritance chain so
-     * inherited members from base classes are offered too. */
+    /* 内部辅助逻辑 */
     const char *cls = bare_type;
     int guard = 0;
     while (cls && cls[0] && guard < 16 &&
@@ -1812,7 +1700,7 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
             if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
-            /* skip members already added (e.g. overridden in a derived class) */
+            /* 核心系统底层抽象与内存语义契约 */
             bool dup = false;
             for (int k = 0; k < is->completion_count; k++) {
                 if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
@@ -1837,10 +1725,7 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
         guard++;
     }
 
-    /* Member surface of a compiler built-in type (string, List<T>, Console,
-     * Math, File, ...): every entry comes from builtin_api.c, the table irgen
-     * itself uses, so completion can no longer offer a member the compiler
-     * rejects. */
+    /* 内部辅助逻辑 */
     const zan_builtin_type_t *bt = builtin_receiver(bare_type);
     if (bt) {
         for (int i = 0; i < bt->member_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
@@ -1853,18 +1738,17 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                 snprintf(c->insert_text, sizeof(c->insert_text), "%s(", m->name);
             else
                 snprintf(c->insert_text, sizeof(c->insert_text), "%s", m->name);
-            /* detail carries the real signature from builtin_api.c, so hover
-             * and the completion tooltip agree with what irgen accepts. */
+            /* 模块核心语义抽象与接口调用契约 */
             snprintf(c->detail, sizeof(c->detail), "%s", m->sig);
             c->kind = (m->kind == 'M') ? ISYM_METHOD : ISYM_FIELD;
             c->sort_priority = 1;
         }
     }
 
-    /* Enum member access */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, bare_type) == 0) {
-            /* found enum type, list its members */
+            /* 底层系统交互与数据协议契约 */
             for (int j = 0; j < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
                 if (is->symbols[j].kind == ISYM_ENUM_MEMBER &&
                     strcmp(is->symbols[j].parent, bare_type) == 0) {
@@ -1903,9 +1787,7 @@ static int intel_bare_symbol_rank(intellisense_t *is, const isym_t *sym,
             intel_lookup_symbol_at(is, sym->name, line, col) != sym) return -1;
         return 0;
     case ISYM_METHOD: case ISYM_FIELD: case ISYM_PROPERTY: case ISYM_EVENT: {
-        /* from_class empty already blocks positional no-scope calls; an
-         * explicitly supplied class (project supplement on behalf of the
-         * open document) enables members without a position. */
+        /* 内部辅助逻辑 */
         if (!from_class[0]) return -1;
         int distance = intel_owner_distance(is, from_class, sym->parent);
         if (distance < 0 || !member_visible(is, sym->visibility, sym->parent, from_class)) return -1;
@@ -1926,10 +1808,7 @@ bool intel_is_keyword(const char *word) {
     return false;
 }
 
-/* Generate completions matching prefix.
- * `from_class_override` lets a caller supply the enclosing class from the
- * OPEN document (the index's own copy may be stale, or lack the class when
- * the file has never been saved) so its members complete from this index. */
+/* 核心系统底层抽象与内存语义契约 */
 static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
                                  const char *context_class,
                                  const char *from_class_override,
@@ -1943,12 +1822,12 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         return 0;
     }
 
-    /* If we have a context class (dot completion), delegate */
+    /* 底层系统交互与数据协议契约 */
     if (context_class && context_class[0]) {
         return intel_complete_members_pos(is, context_class, prefix, line, col);
     }
 
-    /* Match snippets first (highest priority) */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < is->snippet_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(is->snippets[i].trigger, prefix, plen) != 0) continue;
         completion_t *c = &is->completions[is->completion_count++];
@@ -1967,8 +1846,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         if (_strnicmp(sym->name, prefix, plen) != 0) continue;
         int rank = intel_bare_symbol_rank(is, sym, from_class, line, col);
         if (rank < 0 || already_offered(is, sym->name)) continue;
-        /* A visible local wins over a member; a derived member wins over its
-         * inherited namesake. Duplicates from project copies add no label. */
+        /* 内部辅助逻辑 */
         bool hidden = false;
         for (int j = 0; j < is->symbol_count; j++) {
             if (j == i || strcmp(is->symbols[j].name, sym->name) != 0) continue;
@@ -1996,10 +1874,10 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 0;
     }
 
-    /* add matching keywords */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_keywords[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(builtin_keywords[i], prefix, plen) != 0) continue;
-        /* avoid duplicates with snippets */
+        /* 核心系统底层抽象与内存语义契约 */
         bool dup = false;
         for (int j = 0; j < is->completion_count; j++) {
             if (strcmp(is->completions[j].insert_text, builtin_keywords[i]) == 0 ||
@@ -2016,7 +1894,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 2;
     }
 
-    /* add matching types */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_types[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(builtin_types[i], prefix, plen) != 0) continue;
         bool dup = false;
@@ -2032,10 +1910,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 1;
     }
 
-    /* The compiler's built-in static classes (Console, Math, File,
-     * NativeMemory, Vector128, ...). They have no declaration in any source
-     * file, so neither the project index nor a keyword list can produce
-     * them -- builtin_api.c is the only place that knows they exist. */
+    /* 内部辅助逻辑 */
     {
         int btcount = 0;
         const zan_builtin_type_t *all = zan_builtin_types(&btcount);
@@ -2061,10 +1936,7 @@ int intel_complete_pos(intellisense_t *is, const char *prefix,
     return intel_complete_pos_ex(is, prefix, context_class, NULL, line, col);
 }
 
-/* Bare-identifier completion against a project/stdlib/package index on
- * behalf of the open document: `from_class` comes from the live buffer, so
- * designer-projected widget fields (which exist only in the index, as
- * members of the partial class) and cross-file class members complete. */
+/* 内部辅助实现 */
 int intel_complete_bare(intellisense_t *is, const char *prefix,
                         const char *from_class) {
     return intel_complete_pos_ex(is, prefix, NULL, from_class, -1, -1);
@@ -2085,12 +1957,9 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
     if (!is || !word || !word[0]) return info;
 
     const isym_t *selected = intel_lookup_symbol_at(is, word, line, col);
-    /* Aggregate indexes (project/stdlib/packages) hold many files; when the
-     * lexical selection above finds nothing, fall back to a name-only match
-     * so cross-file members still hover. */
+    /* 内部辅助逻辑 */
     if (!selected) selected = intel_lookup_symbol_any(is, word);
-    /* Keep built-in hover below, but user symbols use the same lexical
-     * selection as completion and definition. */
+    /* 内部辅助逻辑 */
     for (int i = 0; i < is->symbol_count; i++) {
         if (&is->symbols[i] == selected) {
             isym_kind_t hk = is->symbols[i].kind;
@@ -2118,7 +1987,7 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
         }
     }
 
-    /* check built-in types */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_types[i]; i++) {
         if (strcmp(builtin_types[i], word) == 0) {
             snprintf(info.text, sizeof(info.text), "type %s (built-in)", word);
@@ -2127,9 +1996,7 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
         }
     }
 
-    /* check the compiler's built-in type members (`File.GetSize`, `Math.Abs`,
-     * `s.Substring`): hover must describe the same surface completion offers
-     * and irgen accepts. */
+    /* 检查the compiler's built-in type members (`File */
     {
         int btcount = 0;
         const zan_builtin_type_t *all = zan_builtin_types(&btcount);
@@ -2150,7 +2017,7 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
         }
     }
 
-    /* check keywords */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_keywords[i]; i++) {
         if (strcmp(builtin_keywords[i], word) == 0) {
             snprintf(info.text, sizeof(info.text), "keyword %s", word);
@@ -2166,9 +2033,7 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
     return intel_hover_pos(is, word, line, -1);
 }
 
-/* The member symbol declared on type_name (walking its base chain); NULL
- * when this index knows neither the type nor the member. Shared by member
- * hover and member go-to-definition. */
+/* 内部辅助逻辑 */
 static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
                                       const char *member) {
     if (!is || !type_name || !type_name[0] || !member || !member[0]) return NULL;
@@ -2199,10 +2064,7 @@ static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
     return NULL;
 }
 
-/* Hover for `receiver.member` where the receiver's type is already resolved:
- * describe the member of THAT type (walking its base chain, then the
- * compiler's builtin table), not a namesake that merely shares the member
- * name in some unrelated indexed class. */
+/* 核心系统底层抽象与内存语义契约 */
 hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
                                 const char *member) {
     hover_info_t info = {0};
@@ -2220,9 +2082,7 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
         return info;
     }
 
-    /* No user-declared owner: the receiver may be a compiler builtin
-     * (string, List<T>, Console, ...) whose member surface lives in
-     * builtin_api.c. */
+    /* 内部辅助逻辑 */
     char bare[64];
     snprintf(bare, sizeof(bare), "%s", type_name);
     { char *lt = strchr(bare, '<'); if (lt) *lt = '\0';
@@ -2240,9 +2100,7 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
     return info;
 }
 
-/* Go-to-definition for `receiver.member` with the receiver's type resolved:
- * jump to the member declared on that type (base walk), not to a namesake
- * that the name-only index walk happens to reach first. */
+/* 核心系统底层抽象与内存语义契约 */
 bool intel_goto_member(intellisense_t *is, const char *type_name,
                        const char *member, goto_def_t *out) {
     if (!out) return false;
@@ -2264,7 +2122,7 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
 
     for (int i = 0; i < is->symbol_count; i++) {
         if (strcmp(is->symbols[i].name, word) == 0) {
-            /* prefer type/class definitions over usages */
+            /* 底层系统交互与数据协议契约 */
             if (is->symbols[i].kind == ISYM_CLASS || is->symbols[i].kind == ISYM_STRUCT ||
                 is->symbols[i].kind == ISYM_ENUM || is->symbols[i].kind == ISYM_INTERFACE ||
                 !result.found) {
@@ -2281,8 +2139,7 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
     return result;
 }
 
-/* Splits the parameter list inside a signature's parentheses into
- * name/type pairs, for signature help's active-parameter display. */
+/* 内部辅助逻辑 */
 static void sig_param_list(param_info_t *params, int *count, int max,
                            const char *signature) {
     const char *pstart = strchr(signature, '(');
@@ -2295,9 +2152,7 @@ static void sig_param_list(param_info_t *params, int *count, int max,
     memcpy(params_copy, pstart, (size_t)plen2);
     params_copy[plen2] = '\0';
 
-    /* Split by top-level commas (ignore commas nested in generics,
-     * arrays/blocks, or parentheses so param types like
-     * Dictionary<string,int> stay intact). */
+    /* 内部辅助逻辑 */
     char *tok = params_copy;
     while (*tok && *count < max) {
         while (*tok == ' ') tok++;
@@ -2318,14 +2173,14 @@ static void sig_param_list(param_info_t *params, int *count, int max,
             memcpy(param_str, tok, (size_t)tlen);
             param_str[tlen] = '\0';
 
-            /* drop a default value if present ("Type name = expr") */
+            /* 底层系统交互与数据协议契约 */
             char *eq = strchr(param_str, '=');
             if (eq) {
                 while (eq > param_str && eq[-1] == ' ') eq--;
                 *eq = '\0';
             }
 
-            /* split "Type name" */
+            /* 核心系统底层抽象与内存语义契约 */
             char *space = strrchr(param_str, ' ');
             if (space) {
                 *space = '\0';
@@ -2344,8 +2199,7 @@ static void sig_param_list(param_info_t *params, int *count, int max,
 static void substitute_generics(const char *parent_type, const char *declaration,
                                  const char *raw_ret, char *out, size_t cap);
 
-/* Signature help retains the receiver's constructed type until substitution.
- * A name without a known owner must not match another class's method. */
+/* 模块核心语义抽象与接口调用契约 */
 signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
                                              const char *method_name, const char *class_context,
                                              int line, int col) {
@@ -2381,8 +2235,7 @@ signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t 
     if (!receiver[0] || intel_array_suffix(receiver)) return sig;
 
     for (int depth = 0; receiver[0] && depth < 16; depth++) {
-        /* Compiler builtins are authoritative even if an indexed stub has
-         * the same owner and member name but an outdated signature. */
+        /* 内部辅助逻辑 */
         const zan_builtin_type_t *bt = builtin_receiver(receiver);
         if (bt) {
             for (int i = 0; i < bt->member_count; i++) {
@@ -2438,7 +2291,7 @@ signature_info_t intel_signature_help(intellisense_t *is, const char *method_nam
     return intel_signature_help_pos(is, method_name, class_context, -1, -1);
 }
 
-/* Find all references to a symbol */
+/* 核心系统底层抽象与内存语义契约 */
 int intel_find_references(intellisense_t *is, const char *word,
                           goto_def_t *results, int max_results) {
     int count = 0;
@@ -2492,14 +2345,9 @@ void intel_dismiss(intellisense_t *is) {
     is->signature_visible = false;
 }
 
-/* --- Chain-call type resolution --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Extract return type from a signature or builtin member definition:
- * e.g. "string Substring(int start[, int length])" -> "string"
- *      "List<string> Split(string separator)" -> "List<string>"
- *      "int Length" -> "int"
- *      "T[] ToArray()" -> "T[]"
- */
+/* 模块核心语义抽象与接口调用契约 */
 static bool extract_return_type_from_sig(const char *sig, char *out, size_t cap) {
     if (!sig || !sig[0] || !out || cap == 0) return false;
     out[0] = '\0';
@@ -2567,8 +2415,7 @@ static intel_type_arg_t intel_generic_arg(const char *type, int index) {
     return empty;
 }
 
-/* Substitute identifier tokens, retaining nested generics and array ranks.
- * User types supply their actual formal names through the AST signature. */
+/* 模块核心语义抽象与接口调用契约 */
 static void substitute_generics(const char *parent_type, const char *declaration,
                                  const char *raw_ret, char *out, size_t cap) {
     if (!out || !cap) return;
@@ -2606,7 +2453,7 @@ const char *intel_resolve_method_return_ex(intellisense_t *is, intellisense_t *p
     snprintf(current, sizeof(current), "%s", type_name);
     buf[0] = '\0';
 
-    /* Array members belong to the array, not to its scalar element type. */
+    /* 模块核心语义抽象与接口调用契约 */
     const char *rank = intel_array_suffix(current);
     if (rank) {
         if (strcmp(method_name, "Length") == 0 || strcmp(method_name, "Count") == 0 ||
@@ -2688,8 +2535,7 @@ static int intel_chain_indexes(const char *part) {
     return count;
 }
 
-/* A call suffix belongs to this receiver only when it precedes any index.
- * Parentheses inside an index or its string keys are not receiver calls. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool intel_chain_name(const char *part, char *out, size_t cap) {
     const char *start = part;
     while (isspace((unsigned char)*start)) start++;
@@ -2715,7 +2561,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
 
     if (!chain || !chain[0]) return NULL;
 
-    /* Parse chain: split by '.' outside parentheses and angles */
+    /* 底层系统交互与数据协议契约 */
     char parts[16][128];
     int part_count = 0;
     int paren_depth = 0;
@@ -2751,12 +2597,9 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         ci++;
     }
 
-    /* Remainder after the last dot */
+    /* 核心系统底层抽象与内存语义契约 */
     int rem_len = ci - part_start;
-    /* A single-segment expression (no dot) never enters the split loop; make
-     * it the root part so a bare receiver (`MainStatusBar` under hover)
-     * resolves. Dotted chains keep the remainder out of parts: it is the
-     * completion prefix carried in final_member. */
+    /* 内部辅助实现 */
     if (part_count == 0 && rem_len > 0 && rem_len < 127) {
         memcpy(parts[0], chain + part_start, (size_t)rem_len);
         parts[0][rem_len] = '\0';
@@ -2770,7 +2613,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
 
     if (part_count == 0) return NULL;
 
-    /* Step 1: Resolve the root (parts[0]) */
+    /* 核心系统底层抽象与内存语义契约 */
     char first_name[128];
     bool is_root_call = intel_chain_name(parts[0], first_name, sizeof(first_name));
     char *fn = first_name;
@@ -2783,7 +2626,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
     const char *current_type = NULL;
     const char *encl_cls = intel_enclosing_type_at(is, line, col);
 
-    /* Literal roots: "text"/'c' are strings, digits are ints. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (parts[0][0] == '"' || parts[0][0] == '\'') {
         current_type = "string";
     } else if (parts[0][0] >= '0' && parts[0][0] <= '9') {
@@ -2795,12 +2638,12 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (!base && project && encl_cls[0]) base = class_base(project, encl_cls);
         current_type = base;
     } else if (is_root_call) {
-        /* Method call in enclosing class or current file: e.g. GetList() */
+        /* 底层系统交互与数据协议契约 */
         if (encl_cls[0]) {
             current_type = intel_resolve_method_return_ex(is, project, encl_cls, fn);
         }
     } else {
-        /* Check local/param in enclosing method scope */
+        /* 底层系统交互与数据协议契约 */
         if (is && line >= 0) {
             current_type = intel_resolve_type_pos(is, fn, line, col);
         }
@@ -2811,13 +2654,13 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
             if (project) current_type = intel_resolve_type(project, fn);
         }
         if (!current_type || !current_type[0]) {
-            /* Field or property in enclosing class */
+            /* 核心系统底层抽象与内存语义契约 */
             if (encl_cls[0]) {
                 current_type = intel_resolve_method_return_ex(is, project, encl_cls, fn);
             }
         }
         if (!current_type || !current_type[0]) {
-            /* Static class, struct, enum or builtin receiver name */
+            /* 底层系统交互与数据协议契约 */
             if (builtin_receiver(root_owner)) {
                 current_type = fn;
             } else if (is) {
@@ -2856,7 +2699,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (strcmp(resolved_type, "var") == 0) return NULL;
     }
 
-    /* Step 2: Walk each subsequent part in the chain */
+    /* 底层系统交互与数据协议契约 */
     for (int pi = 1; pi < part_count; pi++) {
         char member_name[128];
         intel_chain_name(parts[pi], member_name, sizeof(member_name));
@@ -2870,7 +2713,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (next_type && next_type[0]) {
             strncpy(resolved_type, next_type, sizeof(resolved_type) - 1);
             resolved_type[sizeof(resolved_type) - 1] = '\0';
-        } else return NULL; /* Unknown or void calls cannot continue a typed chain. */
+        } else return NULL; /* 底层系统交互与数据协议契约 */
         for (int i = 0; i < indexes; i++) {
             char collection[128];
             snprintf(collection, sizeof(collection), "%s", resolved_type);
@@ -2893,13 +2736,9 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
     return intel_resolve_chain_pos(is, NULL, chain, final_member, final_cap, -1, -1);
 }
 
-/* --- Project-wide indexing --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Directories that never carry indexable sources of the project at hand:
- * VCS metadata, build/package output and throwaway scratch. Scanning them
- * is pure waste (build/dist) or actively divergent (a _scratch with
- * thousands of probe files), and monorepo-scale roots used to take minutes
- * and gigabytes because of them. */
+/* 内部辅助实现 */
 static bool index_skip_dir(const char *name) {
     return strcmp(name, "bin") == 0 ||
            strcmp(name, "obj") == 0 ||
@@ -2911,8 +2750,7 @@ static bool index_skip_dir(const char *name) {
            strcmp(name, ".git") == 0;
 }
 
-/* Cooperative abort for the project index scan; the host clears it before
- * the next scan (see intellisense.h). Checked per file / per directory. */
+/* 内部辅助逻辑 */
 volatile int intel_cancel_flag = 0;
 
 #ifdef _WIN32
@@ -2941,12 +2779,12 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
         snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, filename_utf8);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            /* recurse into subdirectories (skip VCS/build/scratch dirs) */
+            /* 模块核心语义抽象与接口调用契约 */
             if (!index_skip_dir(filename_utf8)) {
                 index_directory_recursive(is, full_path);
             }
         } else {
-            /* check if it's a .zan or designer document file */
+            /* 核心系统底层抽象与内存语义契约 */
             size_t name_len = strlen(filename_utf8);
             bool is_zan = name_len > 4 &&
                           strcmp(filename_utf8 + name_len - 4, ".zan") == 0;
@@ -2987,7 +2825,7 @@ void intel_index_project(intellisense_t *is, const char *project_root) {
     index_directory_recursive(is, project_root);
 }
 
-#else /* Non-Windows: use dirent.h */
+#else /* 核心系统底层抽象与内存语义契约 */
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
     if (intel_cancel_flag) return;
     DIR *dir = opendir(dir_path);
@@ -3052,7 +2890,7 @@ void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
         if (intel_cancel_flag) break;
         if (!filepaths[i]) continue;
 
-        /* Read the file */
+        /* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
         wchar_t wfp[1024];
         FILE *f = NULL;
@@ -3081,9 +2919,9 @@ void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
     }
 }
 
-/* --- Auto-using management --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Standard library namespace -> types mapping */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     const char *ns;
     const char *types[32];
@@ -3107,7 +2945,7 @@ static const ns_types_t stdlib_namespace_map[] = {
     {NULL, {NULL}}
 };
 
-/* Find which namespace a type belongs to */
+/* 核心系统底层抽象与内存语义契约 */
 static const char *find_namespace_for_type(const char *type_name) {
     for (int i = 0; stdlib_namespace_map[i].ns; i++) {
         for (int j = 0; stdlib_namespace_map[i].types[j]; j++) {
@@ -3142,9 +2980,7 @@ int intel_complete_usings(intellisense_t *is, intellisense_t *project,
     is->completion_active = true;
     if (!ns_prefix) ns_prefix = "";
 
-    /* Namespaces declared in this file, then across the project index
-     * (Gui, Game, ... come from the indexed stdlib sources), then the
-     * built-in stdlib map which covers unopened System.* modules. */
+    /* 模块核心语义抽象与接口调用契约 */
     for (int pass = 0; pass < 2; pass++) {
         intellisense_t *src = pass == 0 ? is : project;
         if (!src) continue;
@@ -3170,25 +3006,25 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
     int line_num = 0;
     bool in_using_block = true;
 
-    /* Phase 1: Extract all "using" statements from the top of the file */
+    /* 模块核心语义抽象与接口调用契约 */
     while (p < end && in_using_block) {
         while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
         if (p >= end) break;
         if (*p == '\n') { line_num++; p++; continue; }
 
-        /* skip comments */
+        /* 核心系统底层抽象与内存语义契约 */
         if (p + 1 < end && p[0] == '/' && p[1] == '/') {
             while (p < end && *p != '\n') p++;
             continue;
         }
 
-        /* look for "using" keyword */
+        /* 核心系统底层抽象与内存语义契约 */
         if (p + 5 < end && memcmp(p, "using", 5) == 0 &&
             !isalnum((unsigned char)p[5]) && p[5] != '_') {
             p += 5;
             while (p < end && (*p == ' ' || *p == '\t')) p++;
 
-            /* extract namespace name */
+            /* 核心系统底层抽象与内存语义契约 */
             const char *ns_start = p;
             while (p < end && *p != ';' && *p != '\n') p++;
             int ns_len = (int)(p - ns_start);
@@ -3211,15 +3047,14 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         }
     }
 
-    /* Phase 2: Scan the file body for type references and check which
-     * namespaces are actually used */
+    /* 内部辅助逻辑 */
     p = content;
     line_num = 0;
     while (p < end) {
         if (*p == '\n') { line_num++; p++; continue; }
         if (!isalpha((unsigned char)*p) && *p != '_') { p++; continue; }
 
-        /* extract identifier */
+        /* 核心系统底层抽象与内存语义契约 */
         const char *word_start = p;
         while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
         int wlen = (int)(p - word_start);
@@ -3229,7 +3064,7 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         memcpy(word, word_start, (size_t)wlen);
         word[wlen] = '\0';
 
-        /* skip common keywords */
+        /* 核心系统底层抽象与内存语义契约 */
         if (strcmp(word, "using") == 0 || strcmp(word, "namespace") == 0 ||
             strcmp(word, "class") == 0 || strcmp(word, "struct") == 0 ||
             strcmp(word, "if") == 0 || strcmp(word, "else") == 0 ||
@@ -3239,11 +3074,11 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
             strcmp(word, "string") == 0 || strcmp(word, "var") == 0)
             continue;
 
-        /* Check if this type belongs to a namespace */
+        /* 核心系统底层抽象与内存语义契约 */
         const char *ns = find_namespace_for_type(word);
         if (!ns) continue;
 
-        /* Mark the namespace as used if it's in the using list */
+        /* 底层系统交互与数据协议契约 */
         bool found_using = false;
         for (int i = 0; i < result.using_count; i++) {
             if (strcmp(result.usings[i].namespace_name, ns) == 0) {
@@ -3253,7 +3088,7 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
             }
         }
 
-        /* If not in the using list, it's a missing using */
+        /* 底层系统交互与数据协议契约 */
         if (!found_using) {
             bool already_missing = false;
             for (int i = 0; i < result.missing_count; i++) {
@@ -3268,10 +3103,10 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         }
     }
 
-    /* Phase 3: Identify unused usings */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < result.using_count; i++) {
         if (!result.usings[i].is_used) {
-            /* Also check if any symbol in the indexed symbols uses this namespace */
+            /* 模块核心语义抽象与接口调用契约 */
             bool used_by_symbol = false;
             for (int s = 0; s < is->symbol_count; s++) {
                 if (is->symbols[s].kind == ISYM_NAMESPACE &&
@@ -3293,11 +3128,11 @@ void intel_format_using(const char *namespace_name, char *out, size_t out_cap) {
     snprintf(out, out_cap, "using %s;", namespace_name);
 }
 
-/* Sort comparison for using statements (alphabetical) */
+/* 底层系统交互与数据协议契约 */
 static int using_sort_cmp(const void *a, const void *b) {
     const using_entry_t *ua = (const using_entry_t *)a;
     const using_entry_t *ub = (const using_entry_t *)b;
-    /* System.* namespaces come first */
+    /* 核心系统底层抽象与内存语义契约 */
     bool a_sys = (strncmp(ua->namespace_name, "System", 6) == 0);
     bool b_sys = (strncmp(ub->namespace_name, "System", 6) == 0);
     if (a_sys && !b_sys) return -1;
@@ -3311,16 +3146,13 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
 
     using_analysis_t analysis = intel_analyze_usings(is, content, len);
 
-    /* Build the new using block:
-     * 1. Keep used usings
-     * 2. Add missing usings
-     * 3. Sort alphabetically (System.* first) */
+    /* 核心系统底层抽象与内存语义契约 */
     using_entry_t new_usings[INTEL_MAX_USINGS * 2];
     int new_count = 0;
 
-    /* Add kept usings */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < analysis.using_count; i++) {
-        /* skip if it's in the unused list */
+        /* 核心系统底层抽象与内存语义契约 */
         bool is_unused = false;
         for (int j = 0; j < analysis.unused_count; j++) {
             if (analysis.unused_indices[j] == i) { is_unused = true; break; }
@@ -3331,7 +3163,7 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         }
     }
 
-    /* Add missing usings */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < analysis.missing_count; i++) {
         using_entry_t *u = &new_usings[new_count++];
         memset(u, 0, sizeof(*u));
@@ -3339,14 +3171,12 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         u->is_used = true;
     }
 
-    /* Sort the using list */
+    /* 核心系统底层抽象与内存语义契约 */
     qsort(new_usings, (size_t)new_count, sizeof(using_entry_t), using_sort_cmp);
 
-    /* Reconstruct the file:
-     * - Replace all lines from the first using to the last using with new usings
-     * - Keep everything else as-is */
+    /* 内部辅助逻辑 */
 
-    /* Find the range of using statements in the original content */
+    /* 模块核心语义抽象与接口调用契约 */
     int first_using_line = -1, last_using_line = -1;
     for (int i = 0; i < analysis.using_count; i++) {
         if (first_using_line < 0 || analysis.usings[i].line < first_using_line)
@@ -3356,12 +3186,12 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
     }
 
     if (first_using_line < 0) {
-        /* No existing usings - insert at top after any initial comments */
+        /* 模块核心语义抽象与接口调用契约 */
         first_using_line = 0;
         last_using_line = -1;
     }
 
-    /* Find byte offsets for the using range */
+    /* 底层系统交互与数据协议契约 */
     size_t using_start_off = 0;
     size_t using_end_off = 0;
     int cur_line = 0;
@@ -3383,30 +3213,30 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         using_end_off = using_start_off;
     }
 
-    /* Build new file content */
+    /* 核心系统底层抽象与内存语义契约 */
     size_t buf_cap = len + (size_t)new_count * 140 + 64;
     char *buf = (char *)malloc(buf_cap);
     if (!buf) { *out_len = 0; return NULL; }
     size_t buf_len = 0;
 
-    /* Copy content before usings */
+    /* 核心系统底层抽象与内存语义契约 */
     memcpy(buf, content, using_start_off);
     buf_len = using_start_off;
 
-    /* Write new using block */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < new_count; i++) {
         int n = snprintf(buf + buf_len, buf_cap - buf_len, "using %s;\n",
                         new_usings[i].namespace_name);
         if (n > 0) buf_len += (size_t)n;
     }
 
-    /* Add blank line after usings if there isn't one */
+    /* 模块核心语义抽象与接口调用契约 */
     if (buf_len > 0 && buf[buf_len - 1] == '\n' && using_end_off < len &&
         content[using_end_off] != '\n') {
         buf[buf_len++] = '\n';
     }
 
-    /* Copy content after usings */
+    /* 核心系统底层抽象与内存语义契约 */
     size_t remaining = len - using_end_off;
     if (remaining > 0) {
         memcpy(buf + buf_len, content + using_end_off, remaining);
@@ -3418,22 +3248,19 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
     return buf;
 }
 
-/* --- Inlay hints collection ---
- * 1. Type hints for 'var': if variable declaration uses 'var x = ...',
- *    infer the type and emit ': Type' after the variable name.
- * 2. Parameter hints for call sites: func(a, b) -> func(param1: a, param2: b). */
+/* 核心系统底层抽象与内存语义契约 */
 int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t len,
                              intel_inlay_hint_t *hints, int max_hints) {
     if (!content || len == 0 || !hints || max_hints <= 0) return 0;
     int count = 0;
 
-    /* First pass: emit type hints for 'var' variables recorded in is->symbols */
+    /* 模块核心语义抽象与接口调用契约 */
     if (is) {
         for (int i = 0; i < is->symbol_count && count < max_hints; i++) {
             isym_t *sym = &is->symbols[i];
             if (sym->kind == ISYM_VARIABLE && sym->type_name[0] &&
                 strcmp(sym->type_name, "var") != 0 && strcmp(sym->type_name, "void") != 0) {
-                /* Find this symbol's line in content */
+                /* 核心系统底层抽象与内存语义契约 */
                 int cur_line = 0;
                 const char *p = content;
                 const char *end = content + len;
@@ -3444,18 +3271,18 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 if (p < end && cur_line == sym->line) {
                     const char *le = p;
                     while (le < end && *le != '\n') le++;
-                    /* Check if the line has 'var ' */
+                    /* 核心系统底层抽象与内存语义契约 */
                     const char *var_pos = strstr(p, "var ");
                     if (var_pos && var_pos < le) {
-                        /* Check if sym->name is on this line after var */
+                        /* 底层系统交互与数据协议契约 */
                         const char *name_pos = strstr(var_pos + 4, sym->name);
                         if (name_pos && name_pos < le) {
-                            /* Found declaration of var <name> */
+                            /* 核心系统底层抽象与内存语义契约 */
                             int col = (int)(name_pos - p) + (int)strlen(sym->name);
                             intel_inlay_hint_t *h = &hints[count++];
                             h->line = sym->line;
                             h->col = col;
-                            h->kind = 1; /* Type hint */
+                            h->kind = 1; /* 核心系统底层抽象与内存语义契约 */
                             snprintf(h->label, sizeof(h->label), ": %s", sym->type_name);
                         }
                     }
@@ -3464,7 +3291,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
         }
     }
 
-    /* Second pass: Parameter hints at call sites */
+    /* 底层系统交互与数据协议契约 */
     if (is && count < max_hints) {
         const char *p = content;
         const char *end = content + len;
@@ -3493,7 +3320,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 continue;
             }
 
-            /* Identify potential function call: word followed by '(' */
+            /* 底层系统交互与数据协议契约 */
             if (isalpha((unsigned char)*p) || *p == '_') {
                 const char *w_start = p;
                 while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
@@ -3509,7 +3336,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 const char *peek = p;
                 while (peek < end && (*peek == ' ' || *peek == '\t')) peek++;
                 if (peek < end && *peek == '(') {
-                    /* Exclude control keywords */
+                    /* 核心系统底层抽象与内存语义契约 */
                     if (strcmp(fn_name, "if") == 0 || strcmp(fn_name, "while") == 0 ||
                         strcmp(fn_name, "for") == 0 || strcmp(fn_name, "foreach") == 0 ||
                         strcmp(fn_name, "switch") == 0 || strcmp(fn_name, "catch") == 0) {
@@ -3517,7 +3344,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                         continue;
                     }
 
-                    /* Find method symbol in is->symbols */
+                    /* 核心系统底层抽象与内存语义契约 */
                     isym_t *method_sym = NULL;
                     for (int s = 0; s < is->symbol_count; s++) {
                         if (is->symbols[s].kind == ISYM_METHOD &&
@@ -3529,7 +3356,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                     }
 
                     if (method_sym && method_sym->signature[0]) {
-                        /* Extract parameter names from signature: "...(Type1 name1, Type2 name2)" */
+                        /* 核心系统底层抽象与内存语义契约 */
                         const char *sig_paren = strchr(method_sym->signature, '(');
                         if (sig_paren) {
                             sig_paren++;
@@ -3539,7 +3366,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                             while (*sp && *sp != ')' && pcount < 8) {
                                 while (*sp == ' ' || *sp == '\t') sp++;
                                 if (!*sp || *sp == ')') break;
-                                /* skip type */
+                                /* 核心系统底层抽象与内存语义契约 */
                                 while (*sp && *sp != ' ' && *sp != ')' && *sp != ',') sp++;
                                 while (*sp == ' ' || *sp == '\t') sp++;
                                 const char *pn_s = sp;
@@ -3554,7 +3381,7 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                                 if (*sp == ',') sp++;
                             }
 
-                            /* Now step through argument expressions in '(' ... ')' */
+                            /* 核心系统底层抽象与内存语义契约 */
                             const char *arg_p = peek + 1;
                             int arg_idx = 0;
                             int paren_lvl = 1;
@@ -3562,16 +3389,16 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                                 while (arg_p < end && (*arg_p == ' ' || *arg_p == '\t')) arg_p++;
                                 if (arg_p >= end || *arg_p == ')') break;
 
-                                /* Emit inlay hint for parameter arg_idx */
+                                /* 底层系统交互与数据协议契约 */
                                 int arg_col = (int)(arg_p - line_start);
                                 intel_inlay_hint_t *h = &hints[count++];
                                 h->line = line_num;
                                 h->col = arg_col;
-                                h->kind = 2; /* Parameter hint */
+                                h->kind = 2; /* 核心系统底层抽象与内存语义契约 */
                                 snprintf(h->label, sizeof(h->label), "%s:", pnames[arg_idx]);
                                 arg_idx++;
 
-                                /* Skip to next argument comma at paren_lvl == 1 */
+                                /* 底层系统交互与数据协议契约 */
                                 while (arg_p < end && paren_lvl > 0) {
                                     if (*arg_p == '(') paren_lvl++;
                                     else if (*arg_p == ')') {

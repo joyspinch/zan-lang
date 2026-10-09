@@ -1,15 +1,4 @@
-/* Fortify/glibc-alias shims so distro-built static libraries link on musl.
- *
- * The static GUI driver archive merges distro libX11/libXau/libxcb objects
- * (scripts/build_linux_gui_static.sh). On Ubuntu >= 24.04 those are built
- * with _FORTIFY_SOURCE, so their call sites reference __memcpy_chk and
- * friends -- symbols that exist only in glibc's libc, while zanc links every
- * linux publish against the musl sysroot. The same for glibc's __isocNN_*
- * versioned aliases of sscanf. This object provides direct forwards (no
- * bounds checking: exactly the pre-fortify code shape those libraries would
- * have without the flag); merged into libzan_gui.a, it satisfies the
- * references without changing what the program calls. musl's own
- * __stack_chk_fail needs no shim. */
+/* 底层系统交互与数据协议契约 */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -76,14 +65,11 @@ int __vfprintf_chk(FILE *o, int f, const char *fmt, va_list ap) {
 ssize_t __read_chk(int fd, void *buf, size_t n, size_t bs) {
     (void)bs; return read(fd, buf, n);
 }
-/* FD_SET index helper: glibc aborts when the fd exceeds FD_SETSIZE, musl
- * callers never hit that; plain division is what the check folds into. */
+/* 底层系统交互与数据协议契约 */
 unsigned long __fdelt_chk(unsigned long d) {
     return d >> 6;
 }
-/* glibc versioned aliases of sscanf/strtol (isoc99 from C99 %a scanning, isoc23
- * from C23 binary literals, glibc >= 2.38); musl's sscanf/strtol already
- * implement the same syntaxes. */
+/* 底层系统交互与数据协议契约 */
 int __isoc99_sscanf(const char *s, const char *fmt, ...) {
     va_list ap; int r;
     va_start(ap, fmt); r = vsscanf(s, fmt, ap); va_end(ap);

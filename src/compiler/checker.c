@@ -26,7 +26,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
              memcmp(recv->name.str, "StringBuilder", 13) == 0)
         bt = "StringBuilder";
     if (!bt) return NULL;
-    /* Methods only: a property invoked with parentheses (`items */
+    /* 底层系统交互与数据协议契约 */
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
     if (!res) return NULL;
@@ -47,7 +47,7 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     return NULL;
 }
 
-/* Depth cap for every walk that follows base_type / interface chains */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #define CHECKER_DERIVES_MAX_DEPTH 8192
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
@@ -107,7 +107,7 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
 
 /* 内部辅助实现 */
 
-/* The declared field of `type_sym` named `name`, walking the base chain */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name) {
     while (type_sym) {
         zan_symbol_t *found = NULL;
@@ -129,7 +129,7 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
 
 static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup);
 
-/* Length of the module key of dotted namespace `ns`. */
+/* 底层系统交互与数据协议契约 */
 static uint32_t access_module_len(zan_istr_t ns) {
     int dots = 0;
     for (uint32_t i = 0; i < ns.len; i++) {
@@ -202,14 +202,14 @@ static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m) {
     if (!c->current_type_sym || !m->parent ||
         !m->parent->type || !c->current_type_sym->type)
         return false;
-    /* private: the declaring type's own bodies */
+    /* 底层系统交互与数据协议契约 */
     if (c->current_type_sym == m->parent) return true;
-    /* protected: plus bodies of derived types */
+    /* 核心系统底层抽象与内存语义契约 */
     if ((m->modifiers & MOD_PROTECTED) &&
         checker_type_derives_from(c->current_type_sym->type,
                                   m->parent->type))
         return true;
-    /* internal: any type whose namespace shares the module prefix */
+    /* 模块核心语义抽象与接口调用契约 */
     if ((m->modifiers & MOD_INTERNAL) &&
         access_same_module(access_symbol_ns(c->current_type_sym),
                            access_symbol_ns(m)))
@@ -217,7 +217,7 @@ static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m) {
     return false;
 }
 
-/* Field lookup for assignment targets etc */
+/* 底层系统交互与数据协议契约 */
 static zan_symbol_t *checker_field_visible(zan_checker_t *c,
                                            zan_symbol_t *ts, zan_loc_t loc,
                                            zan_istr_t name) {
@@ -283,7 +283,7 @@ static bool field_is_readonly(zan_symbol_t *field) {
            (field->decl->field_decl.modifiers & MOD_READONLY) != 0;
 }
 
-/* A getter-only property (`{ get; }` / `{ get { */
+/* 核心系统底层抽象与内存语义契约 */
 static bool property_is_readonly(zan_symbol_t *prop) {
     if (!prop || prop->kind != SYM_PROPERTY || !prop->decl) return false;
     return !prop->decl->field_decl.has_setter &&
@@ -328,7 +328,7 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
         return;
     zan_symbol_t *owner = NULL;
     zan_symbol_t *field = assign_target_field(c, expr->binary.left, &owner);
-    /* a getter-only property has no setter: the write cannot be dispatched */
+    /* 模块核心语义抽象与接口调用契约 */
     if (property_is_readonly(field)) {
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                       "property '%.*s' has no setter and cannot be assigned",
@@ -434,7 +434,7 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
             memcmp(m->name.str, op_name.str, op_name.len) != 0) continue;
         if (!m->decl || m->decl->kind != AST_METHOD_DECL)
             continue;
-        /* Two declared shapes: parser-synthesized indexers carry (index */
+        /* 模块核心语义抽象与接口调用契约 */
         zan_ast_list_t *ps = &m->decl->method_decl.params;
         int n = ps->count;
         if (n < 2) continue;
@@ -518,7 +518,7 @@ static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
         }
         return false;
     case AST_LAMBDA:
-        /* Nested lambda inside lambda */
+        /* 核心系统底层抽象与内存语义契约 */
         return expr_captures_this(c, node->lambda.body);
     case AST_BLOCK:
         for (int i = 0; i < node->block.stmts.count; i++) {
@@ -582,7 +582,7 @@ static bool has_closure_capturing_this(zan_checker_t *c, zan_ast_node_t *node) {
 static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
                                        zan_ast_node_t *rhs, zan_loc_t loc) {
     if (!c->current_type_sym || !lhs || !rhs) return;
-    /* Only classes participate in ARC cycles */
+    /* 核心系统底层抽象与内存语义契约 */
     if (c->current_type_sym->kind != SYM_CLASS) return;
 
     /* 检查if lhs is a member of 'this', e */
@@ -620,9 +620,9 @@ static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
     }
 }
 
-/* ---- generic constraint checking ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* True when `arg` is, implements, or derives from `cons` */
+/* 底层系统交互与数据协议契约 */
 static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
                                             int depth) {
     if (!arg || !cons) return true;
@@ -694,7 +694,7 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
     }
 }
 
-/* ---- expression type checking ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 static const char *type_name(zan_type_t *t) {
     if (!t) return "<unknown>";
@@ -937,7 +937,7 @@ static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
     if (a->kind != b->kind) return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
-            return false; /* int[,] is not int[] */
+            return false; /* 核心系统底层抽象与内存语义契约 */
         return checker_type_equal(a->element_type, b->element_type);
     }
     if (a->name.len != b->name.len ||
@@ -967,8 +967,8 @@ static bool iface_edge_derives_params_ast(zan_ast_node_t *edge_ref,
         zan_ast_node_t *ea = eargs->items[j];
         if (!ea) return false;
         if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0)
-            return false; /* concrete generic argument: conservative reject */
-        /* A bare name in type position parses as an AST_TYPE_REF (parser */
+            return false; /* 核心系统底层抽象与内存语义契约 */
+        /* 模块核心语义抽象与接口调用契约 */
         zan_istr_t ename;
         if (ea->kind == AST_IDENTIFIER) ename = ea->ident.name;
         else if (ea->kind == AST_TYPE_REF) ename = ea->type_ref.name;
@@ -1044,10 +1044,10 @@ static bool checker_type_is_ref(zan_type_t *t) {
     return t->kind == TYPE_OBJECT || t->kind == TYPE_INTERFACE ||
            t->kind == TYPE_STRING || t->kind == TYPE_CLASS ||
            t->kind == TYPE_ARRAY || t->kind == TYPE_DELEGATE ||
-           t->kind == TYPE_TASK; /* Task is a reference type in C#; null is legal */
+           t->kind == TYPE_TASK; /* 核心系统底层抽象与内存语义契约 */
 }
 
-/* Merge the then/else branch types of a conditional expression */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *merge_conditional_types(zan_checker_t *c,
                                            zan_type_t *a, zan_type_t *b);
 static bool expr_is_null_literal(zan_ast_node_t *e);
@@ -1061,10 +1061,10 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
     /* 内部辅助逻辑 */
     if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return a;
 
-    /* identical types (same kind, name and generic arguments) */
+    /* 模块核心语义抽象与接口调用契约 */
     if (a->kind == b->kind && checker_type_equal(a, b)) return a;
 
-    /* numeric promotion: int widens to long, float to double, ... */
+    /* 底层系统交互与数据协议契约 */
     if ((type_is_numeric(a) || a->kind == TYPE_CHAR) &&
         (type_is_numeric(b) || b->kind == TYPE_CHAR))
         return promote_numeric(c->binder, a, b);
@@ -1077,16 +1077,16 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
             if (checker_type_derives_from(b, t)) return t;
             if (!t->base_type) break;
         }
-        return NULL; /* unrelated references have no implicit common type */
+        return NULL; /* 底层系统交互与数据协议契约 */
     }
 
     /* 内部辅助实现 */
     if (a->kind == TYPE_ENUM || b->kind == TYPE_ENUM) return a;
 
-    return NULL; /* unrelated value types, or a value mixed with a reference */
+    return NULL; /* 底层系统交互与数据协议契约 */
 }
 
-/* True when `a` and `b` are the same generic container class (List< */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static bool same_generic_container(zan_type_t *a, zan_type_t *b) {
     if (!a || !b || a->kind != b->kind) return false;
     if (a->type_arg_count != b->type_arg_count || a->type_arg_count == 0)
@@ -1123,7 +1123,7 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         return checker_type_assignable(target->type_args[0], value);
     }
 
-    /* Nullable value types accept null and the underlying non-nullable value */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (target->kind == TYPE_NULLABLE && value->kind == TYPE_OBJECT)
         return true; /* null -> T? */
     if (target->kind == TYPE_NULLABLE && value->kind != TYPE_NULLABLE &&
@@ -1150,7 +1150,7 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
 
     /* 内部辅助实现 */
     if (value->kind == TYPE_OBJECT) {
-        return checker_type_is_ref(target); /* null literal */
+        return checker_type_is_ref(target); /* 核心系统底层抽象与内存语义契约 */
     }
     switch (target->kind) {
     case TYPE_STRING:
@@ -1340,7 +1340,7 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
         src == c->binder->type_void)
         return true;
     if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return true;
-    /* object is the boxed carrier (and the null literal's type). */
+    /* 模块核心语义抽象与接口调用契约 */
     if (dst->kind == TYPE_OBJECT || src->kind == TYPE_OBJECT) return true;
     /* 内部辅助实现 */
     if (dst->kind == TYPE_NINT || src->kind == TYPE_NINT) return true;
@@ -1373,7 +1373,7 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     }
     if (target == c->binder->type_error || value == c->binder->type_error)
         return;
-    /* A void call used as a value is invalid; reject with diagnostic */
+    /* 模块核心语义抽象与接口调用契约 */
     if (value == c->binder->type_void && target != c->binder->type_void) {
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "cannot convert 'void' to '%s' in %s: no implicit "
@@ -1429,7 +1429,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee);
 static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
-/* How many arguments `m` accepts: [min */
+/* 核心系统底层抽象与内存语义契约 */
 static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
     /* a [DllImport( */
@@ -1447,13 +1447,13 @@ static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     return true;
 }
 
-/* Same test irgen's resolve_overload applies (irgen */
+/* 底层系统交互与数据协议契约 */
 static bool method_accepts_argc(zan_symbol_t *m, int argc) {
     int lo, hi;
     if (method_arity(m, &lo, &hi)) return argc >= lo && argc <= hi;
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *ps = &m->decl->method_decl.params;
-    /* a Variadic DllImport takes every declared parameter and any tail */
+    /* 模块核心语义抽象与接口调用契约 */
     if (m->decl->method_decl.is_variadic) return argc >= ps->count;
     if (ps->count == 0) return false;
     zan_ast_node_t *last = ps->items[ps->count - 1];
@@ -1469,7 +1469,7 @@ static bool method_is_params_tail(zan_symbol_t *m) {
     return last && last->kind == AST_PARAM && last->param.is_params;
 }
 
-/* The same-named method a call with `argc` arguments can actually invoke */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
                                                zan_istr_t name, int argc,
                                                int type_arg_count) {
@@ -1498,7 +1498,7 @@ static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
     return fallback;
 }
 
-/* Match concrete argument types after checking each argument once */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
@@ -1552,7 +1552,7 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
     return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);
 }
 
-/* Reject a call that passes the wrong number of arguments */
+/* 模块核心语义抽象与接口调用契约 */
 static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                              zan_type_t *recv) {
     zan_ast_node_t *callee = call->call.callee;
@@ -1716,7 +1716,7 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
     return only;
 }
 
-/* True for `Task */
+/* 核心系统底层抽象与内存语义契约 */
 static bool arg_is_spawn_callee(zan_ast_node_t *call) {
     if (!call || call->call.callee == NULL ||
         call->call.callee->kind != AST_MEMBER_ACCESS ||
@@ -1875,7 +1875,7 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
                   type_name(type));
 }
 
-/* Comparisons, which consume the *value* of both operands */
+/* 底层系统交互与数据协议契约 */
 /* 内部辅助实现 */
 static bool type_is_concatable(zan_type_t *t) {
     /* 内部辅助实现 */
@@ -1897,7 +1897,7 @@ static bool binary_op_compares(zan_token_kind_t op) {
     }
 }
 
-/* The method a value-position member access names, if any: `set */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     if (!e || e->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = e->member.object;
@@ -2082,7 +2082,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
         zan_symbol_t *sym = zan_binder_lookup(c->binder, expr->ident.name);
         if (!sym) {
-            /* don't error — may be resolved in later phases */
+            /* 底层系统交互与数据协议契约 */
             return c->binder->type_error;
         }
         return sym->type;
@@ -2091,7 +2091,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_BINARY: {
         zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
-        /* A method group as an operand is a forgotten '()' */
+        /* 核心系统底层抽象与内存语义契约 */
         if (binary_op_compares(expr->binary.op)) {
             if (right->kind != TYPE_DELEGATE)
                 reject_method_group(c, expr->binary.left);
@@ -2101,7 +2101,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
         switch (expr->binary.op) {
         case TK_PLUS:
-            /* string concatenation */
+            /* 核心系统底层抽象与内存语义契约 */
             if (left->kind == TYPE_STRING || right->kind == TYPE_STRING) {
                 zan_type_t *other = left->kind == TYPE_STRING ? right : left;
                 if (!type_is_concatable(other)) {
@@ -2113,9 +2113,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 no_runtime_reject(c, expr->loc, "string concatenation");
                 return c->binder->type_string;
             }
-            /* fall through */
+            /* 核心系统底层抽象与内存语义契约 */
         case TK_MINUS: case TK_STAR: case TK_SLASH: case TK_PERCENT:
-            /* A delegate operand reached the arithmetic path */
+            /* 底层系统交互与数据协议契约 */
             if (left->kind == TYPE_DELEGATE || right->kind == TYPE_DELEGATE) {
                 if (expr->binary.op == TK_PLUS || expr->binary.op == TK_MINUS)
                     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -2204,7 +2204,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (left->kind == TYPE_TYPE_PARAM && right->kind == TYPE_TYPE_PARAM &&
                 checker_type_equal(left, right))
                 return c->binder->type_bool;
-            /* Comparing a generic type parameter against null or object (`T a == null`) */
+            /* 模块核心语义抽象与接口调用契约 */
             if ((left->kind == TYPE_TYPE_PARAM && (right->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.right))) ||
                 (right->kind == TYPE_TYPE_PARAM && (left->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.left))))
                 return c->binder->type_bool;
@@ -2356,7 +2356,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
-        /* Builtin scalar instance methods (string */
+        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
         /* 内部辅助实现 */
@@ -2412,7 +2412,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
             arg_types[i] = arg_type;
-            /* An async call passed as an argument is the spawn idiom (Task */
+            /* 模块核心语义抽象与接口调用契约 */
             if (!arg_sig && arg && arg_type == c->binder->type_void &&
                 arg->kind != AST_REF_ARG && !arg_is_spawn_callee(expr)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
@@ -2497,7 +2497,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     no_runtime_warn_arc_return(c, expr, ret);
                     return ret;
                 }
-                return c->binder->type_void; /* explicit void return */
+                return c->binder->type_void; /* 核心系统底层抽象与内存语义契约 */
             }
         }
         /* 内部辅助逻辑 */
@@ -2529,11 +2529,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             no_runtime_warn_arc_return(c, expr, ret);
             return ret;
         }
-        /* Resolved call of a uniquely-named method (`obj */
+        /* 底层系统交互与数据协议契约 */
         if (arg_sig && arg_sig->decl &&
             arg_sig->decl->kind == AST_METHOD_DECL) {
             if (arg_sig->decl->method_decl.return_type) {
-                /* Fluent `return this` methods (`Control Gap( */
+                /* 底层系统交互与数据协议契约 */
                 if (expr_is_this_call(c, arg_sig, recv)) {
                     no_runtime_warn_arc_return(c, expr, recv);
                     return recv;
@@ -2544,7 +2544,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return ret;
             }
             no_runtime_warn_arc_return(c, expr, c->binder->type_void);
-            return c->binder->type_void; /* explicit void return */
+            return c->binder->type_void; /* 核心系统底层抽象与内存语义契约 */
         }
         no_runtime_warn_arc_return(c, expr, callee_is_method ? callee_type : NULL);
         return c->binder->type_error;
@@ -2675,7 +2675,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
         if (!target && expr->binary.left->kind == AST_INDEX) {
             target = checker_index_set_target(c, expr->binary.left, right);
-            /* No op_index_set overload accepted the written index/value */
+            /* 模块核心语义抽象与接口调用契约 */
             if (!target) {
                 zan_type_t *iobj = zan_checker_check_expr(
                     c, expr->binary.left->index.object);
@@ -2716,7 +2716,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             /* `FactoryCall( */
             type = zan_checker_check_expr(c, expr->new_expr.call_init);
         } else if (!expr->new_expr.type) {
-            /* Anonymous object literal `new { a */
+            /* 核心系统底层抽象与内存语义契约 */
             for (int i = 0; i < expr->new_expr.args.count; i++) {
                 zan_checker_check_expr(c, expr->new_expr.args.items[i]);
             }
@@ -2771,7 +2771,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                                   (long long)prod);
             }
         }
-        /* A postfix generic-type initializer (`List<int> { */
+        /* 底层系统交互与数据协议契约 */
         int ctor_argc = (!factory_init && !expr->new_expr.is_array && type && type->sym)
             ? ctor_arg_count(c, expr, type->sym) : 0;
         zan_type_t *ctor_arg_types[256];
@@ -2937,13 +2937,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_LAMBDA:
         no_runtime_reject(c, expr->loc, "a lambda");
         for (int i = 0; i < expr->lambda.params.count; i++) {
-            /* params type-checked later */
+            /* 核心系统底层抽象与内存语义契约 */
         }
         zan_checker_check_expr(c, expr->lambda.body);
-        return c->binder->type_error; /* lambda type resolved in */
+        return c->binder->type_error; /* 核心系统底层抽象与内存语义契约 */
 
     case AST_THIS_EXPR:
-        /* `this` is the type whose body is being checked */
+        /* 底层系统交互与数据协议契约 */
         if (c->current_type_sym && c->current_type_sym->type) {
             return c->current_type_sym->type;
         }
@@ -3012,7 +3012,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_SWITCH_EXPR: {
-        /* `expr switch { arm, */
+        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *disc_type = zan_checker_check_expr(c, expr->switch_expr.expr);
         zan_type_t *merged = NULL;
         bool has_result = false;
@@ -3078,7 +3078,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
 
-        /* Enum exhaustiveness check: if disc_type is enum and no wildcard arm exists */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         if (disc_type && disc_type->kind == TYPE_ENUM && disc_type->sym && !seen_wildcard) {
             zan_symbol_t *esym = disc_type->sym;
             for (int mi = 0; mi < esym->member_count; mi++) {
@@ -3116,7 +3116,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_WITH_EXPR: {
-        /* `recv with { field = value, */
+        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *rt = zan_checker_check_expr(c, expr->with_expr.expr);
         if (!rt || (rt->kind != TYPE_CLASS && rt->kind != TYPE_STRUCT)) {
             if (rt && rt->kind != TYPE_ERROR)
@@ -3177,7 +3177,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 }
 
-/* ---- statement checking ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     if (!stmt) return;
@@ -3271,7 +3271,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_FOREACH_STMT:
-        /* iterating a managed collection walks rc-managed elements */
+        /* 底层系统交互与数据协议契约 */
         no_runtime_reject(c, stmt->loc, "`foreach`");
         {
             zan_type_t *col = zan_checker_check_expr(c, stmt->foreach_stmt.collection);
@@ -3302,7 +3302,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_CHECKED_STMT:
-        /* overflow-checking context wrapper: only the body needs checking */
+        /* 模块核心语义抽象与接口调用契约 */
         zan_checker_check_stmt(c, stmt->checked_stmt.body);
         break;
 
@@ -3407,7 +3407,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     }
 }
 
-/* ---- check entire compilation unit ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 /* 内部辅助实现 */
 /* 内部辅助实现 */
@@ -3507,13 +3507,13 @@ static bool is_named_ident(zan_ast_node_t *n, zan_istr_t name) {
 static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
                              zan_loc_t use) {
     if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
-    /* See node_loc_prunable: the loc prune is only sound on statements */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (node_loc_prunable(n->kind) && loc_at_or_after(n->loc, use)) {
         return false;
     }
     switch (n->kind) {
     case AST_BINARY:
-        /* `x == null` / `x != null` / `x ?? fallback`, either operand order */
+        /* 底层系统交互与数据协议契约 */
         if ((is_named_ident(n->binary.left, name) &&
              (n->binary.right && n->binary.right->kind == AST_NULL_LITERAL)) ||
             (is_named_ident(n->binary.right, name) &&
@@ -3621,7 +3621,7 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         if (obj != c->last_call_node) return;
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
-        /* a local holding a nullable call result, tested before this access */
+        /* 模块核心语义抽象与接口调用契约 */
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
         if (!l || !l->null_src) return;
         if (!c->current_body) return;
@@ -3668,7 +3668,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             return c->binder->type_error;
         }
     }
-    /* Static enum member access: EnumType */
+    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
         expr->member.object->kind == AST_IDENTIFIER) {
         zan_symbol_t *os = zan_binder_lookup(c->binder,
@@ -3700,7 +3700,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             }
         }
     }
-    /* Nullable value types (T?): only */
+    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && obj_type->kind == TYPE_NULLABLE) {
         zan_istr_t mn = expr->member.name;
         if (mn.len == 8 && memcmp(mn.str, "HasValue", 8) == 0) {
@@ -3718,7 +3718,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                       (int)mn.len, mn.str, elem_name);
         return c->binder->type_error;
     }
-    /* resolve field/method on known struct/class types */
+    /* 底层系统交互与数据协议契约 */
     if (obj_type && obj_type->sym) {
         for (zan_symbol_t *s = obj_type->sym; s;
              s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
@@ -3756,7 +3756,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             }
         }
     }
-    /* Reflection members (`ti */
+    /* 核心系统底层抽象与内存语义契约 */
     {
         zan_type_t *rt = zan_refl_member_type(c->binder, obj_type,
                                               expr->member.name);
@@ -3770,7 +3770,7 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             memcmp(expr->member.name.str, "Count", 5) == 0;
         if (is_len || is_cnt) return c->binder->type_int;
     }
-    /* Builtin scalar types (string, int, */
+    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && type_is_scalar_primitive(obj_type)) {
         if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
             memcmp(expr->member.name.str, "Length", 6) == 0) {
@@ -3836,9 +3836,9 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->in_ctor = saved_ctor;
 }
 
-/* Completed-subtree set for the struct-cycle walk */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
-    zan_ast_node_t **slots;      /* open addressing, NULL = empty */
+    zan_ast_node_t **slots;      /* 核心系统底层抽象与内存语义契约 */
     int cap;                     /* power of two, 0 = unset */
     int count;
 } zan_struct_visited_t;
@@ -3904,7 +3904,7 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
                       struct_decl->type_decl.name.str);
         return false;
     }
-    /* already walked to completion without a cycle below: skip */
+    /* 底层系统交互与数据协议契约 */
     if (struct_visit_seen(visited, struct_decl)) return false;
     stack[depth] = struct_decl;
 
@@ -3956,7 +3956,7 @@ static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
 
 /* 内部辅助实现 */
 
-/* Declared parameter count of a method symbol, -1 for non-method decls */
+/* 模块核心语义抽象与接口调用契约 */
 static int checker_method_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
     return m->decl->method_decl.params.count;

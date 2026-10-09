@@ -1,32 +1,15 @@
-/* irgen_arc.c -- ARC (automatic reference counting) for heap class objects, the
- * object-graph release destructors and virtual dispatch (vtables).
- *
- * Part of the irgen translation unit: this file is #include'd by irgen.c
- * (in a fixed order) and must not be compiled standalone. Splitting keeps
- * the single-TU static linkage while keeping each concern in its own file.
- */
+/* irgen_arc */
 
-/* ===== ARC (automatic reference counting) for heap class objects ===========
- * Only TYPE_CLASS instances are heap-allocated with the 16-byte rc header
- * (zan_rt_alloc); struct values live on the stack and List/Dict/StringBuilder
- * are raw-malloc'd without a header, so retain/release apply strictly to class
- * pointers. Ownership model (classifier-based, no temp pool):
- *   - `new C(...)` and calls yield an already-owned (+1) reference;
- *   - identifier / member / index loads yield a borrowed reference.
- * A borrowed reference is retained when captured into an owning class slot
- * (local or field) or returned; owning class locals are released when
- * overwritten and at every function exit. A class local passed as a call
- * argument is conservatively treated as escaped (ownership handed off) and not
- * released, which keeps collections/stores that capture it use-after-free
- * safe. Strings, async frames and collection element release are follow-ups. */
+/* 内部辅助实现 */
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static bool type_is_concrete(zan_type_t *t);
+static int type_is_binding(zan_type_t *t);
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 
 static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
-    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
+    if (g->current_fn_no_runtime) return;   /* 核心系统底层抽象与内存语义契约 */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rt");
@@ -36,7 +19,7 @@ static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
-    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
+    if (g->current_fn_no_runtime) return;   /* 核心系统底层抽象与内存语义契约 */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rl");
@@ -46,7 +29,7 @@ static void emit_arc_release(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_string_retain(zan_irgen_t *g, LLVMValueRef v) {
-    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
+    if (g->current_fn_no_runtime) return;   /* 核心系统底层抽象与内存语义契约 */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "str.rt");
@@ -56,7 +39,7 @@ static void emit_string_retain(zan_irgen_t *g, LLVMValueRef v) {
 }
 
 static void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
-    if (g->current_fn_no_runtime) return;   /* [NoRuntime]: no ARC helpers */
+    if (g->current_fn_no_runtime) return;   /* 核心系统底层抽象与内存语义契约 */
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "str.rl");
@@ -65,21 +48,7 @@ static void emit_string_release(zan_irgen_t *g, LLVMValueRef v) {
         g->rt_str_release, &v, 1, "");
 }
 
-/* ---- delegate closures (A33-2) -------------------------------------------
- * A delegate value is one pointer with two shapes, told apart by bit 0:
- *   even -- a bare function pointer: a static method or a non-capturing
- *           lambda, so it can still be handed to C as a plain callback;
- *   odd  -- a tagged pointer to a heap closure record
- *           { ptr fn, ptr dtor, ptr target, <captured values> }, allocated with
- *           the object allocator (so it carries an rc header) and invoked as
- *           fn(record, args...). `target` is the bound receiver of an instance
- *           method group and null for a lambda; it gives `==` (and therefore
- *           `event -= obj.Handler`) C#'s target+method identity.
- * Retain/release therefore test the tag at run time: on a bare function
- * pointer both are no-ops, on a closure they drive the record's refcount and,
- * at zero, its dtor (which releases the captured rc values).
- * The shape itself (ZAN_CLOSURE_*) lives in ../common/zan_abi.h: runtime code
- * that keeps a delegate alive across calls has to read the same layout. */
+/* 内部辅助实现 */
 
 static LLVMValueRef emit_closure_is_tagged(zan_irgen_t *g, LLVMValueRef v) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -98,8 +67,7 @@ static LLVMValueRef emit_closure_untag(zan_irgen_t *g, LLVMValueRef v) {
     return LLVMBuildIntToPtr(g->builder, cl, i8ptr, "clo.rec");
 }
 
-/* { ptr fn, ptr dtor, ptr target }: the prefix every closure record starts
- * with; captured values follow it. */
+/* 内部辅助逻辑 */
 #define ZAN_CLOSURE_HDR_FIELDS 3
 static LLVMTypeRef closure_header_type(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -107,10 +75,7 @@ static LLVMTypeRef closure_header_type(zan_irgen_t *g) {
     return LLVMStructTypeInContext(g->ctx, fields, ZAN_CLOSURE_HDR_FIELDS, 0);
 }
 
-/* Delegate equality, as C# defines it: the same function and the same bound
- * receiver. Bare function pointers compare directly; two closure records are
- * equal when they wrap the same method-group target. Separately created
- * capturing lambdas have a null target and so stay distinct, matching C#. */
+/* 内部辅助逻辑 */
 static LLVMValueRef emit_delegate_equals(zan_irgen_t *g, LLVMValueRef a,
                                          LLVMValueRef b) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -174,10 +139,7 @@ static void emit_closure_retain(zan_irgen_t *g, LLVMValueRef v) {
     LLVMPositionBuilderAtEnd(g->builder, done);
 }
 
-/* Drop one reference to an (untagged) closure-shaped record through the
- * destructor it carries: it releases what the record owns when the count
- * reaches zero, then frees the record. Boxed locals (A33-2b) use the same
- * shape and therefore the same release. */
+/* 内部辅助实现 */
 static void emit_closure_record_release(zan_irgen_t *g, LLVMValueRef rec) {
     if (g->current_fn_no_runtime) return;
     if (!rec || LLVMGetTypeKind(LLVMTypeOf(rec)) != LLVMPointerTypeKind) return;
@@ -205,10 +167,7 @@ static void emit_closure_release(zan_irgen_t *g, LLVMValueRef v) {
     LLVMPositionBuilderAtEnd(g->builder, done);
 }
 
-/* Invoke a delegate value: a bare function pointer is called directly, a
- * closure through the record's function with the record as leading argument.
- * Both shapes are possible in the same value, so the tag test is emitted at
- * every call site. */
+/* 内部辅助实现 */
 static LLVMValueRef emit_delegate_invoke(zan_irgen_t *g, LLVMValueRef dv,
                                          LLVMTypeRef fn_type, LLVMTypeRef ret,
                                          LLVMValueRef *args, int argc,
@@ -352,14 +311,7 @@ static void emit_collection_value_release(zan_irgen_t *g, zan_type_t *type,
     }
 }
 
-/* ---- struct value slots that embed rc-managed fields ----------------
- * `is_rc_managed_type` only ever matches pointer shapes, so a value struct
- * holding a `string`/List/delegate field had no lifecycle at all: every field
- * write was a raw store (leaking the old occupant, aliasing a borrowed one)
- * and scope exit never released anything. A struct_rc-flagged slot owns the
- * +1s of the rc fields inside its aggregate; these helpers give it the same
- * capture/release contract reference slots already have, walking the fields
- * by value with the collection helpers above. */
+/* 内部辅助实现 */
 
 static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot) {
@@ -379,9 +331,7 @@ static void emit_struct_local_retain(zan_irgen_t *g, zan_type_t *type,
     emit_collection_value_retain(g, type, cur, 0);
 }
 
-/* Whole-struct assignment `a = b` into an owning struct slot: the mirror of
- * emit_rc_capture_local for aggregates (release old fields, retain borrowed
- * new ones, store). */
+/* 内部辅助逻辑 */
 static void emit_struct_local_capture(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot_alloca,
                                       LLVMValueRef v, zan_ast_node_t *rhs,
@@ -396,8 +346,7 @@ static void emit_struct_local_capture(zan_irgen_t *g, zan_type_t *type,
     emit_collection_value_release(g, type, old, 0);
 }
 
-/* Field store `x.inner = v` where the field itself is a struct with rc
- * fields: same capture contract, addressed by field pointer. */
+/* 核心系统底层抽象与内存语义契约 */
 static void emit_struct_field_capture(zan_irgen_t *g, zan_type_t *ftype,
                                       LLVMValueRef field_ptr, LLVMValueRef v,
                                       zan_ast_node_t *rhs,
@@ -441,8 +390,7 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMValueRef stored = value;
     LLVMTypeKind slot_kind = LLVMGetTypeKind(slot_ty);
     LLVMTypeKind value_kind = LLVMGetTypeKind(LLVMTypeOf(stored));
-    /* An integer landing in a `double` element is converted before it is
-     * reinterpreted into the i64 slot. */
+    /* 内部辅助逻辑 */
     if (elem_kind == LLVMDoubleTypeKind && value_kind == LLVMIntegerTypeKind &&
         LLVMGetIntTypeWidth(LLVMTypeOf(stored)) > 1) {
         stored = LLVMBuildSIToFP(g->builder, stored, elem_llvm, "slot.sitofp");
@@ -474,11 +422,7 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                     stored = extend_int_for_slot(g, stored, elem_type, slot_ty);
             } else if (value_kind == LLVMDoubleTypeKind) {
                 if (elem_llvm && LLVMGetTypeKind(elem_llvm) == LLVMFloatTypeKind) {
-                    /* a const-folded float literal arrives as a double: a
-                     * float slot must hold the f32 bit pattern widened to the
-                     * 64-bit slot (see the float branch below and
-                     * load_collection_slot_value's reader), not double bits
-                     * the float reader would trunc into a denormal. */
+                    /* 内部辅助实现 */
                     LLVMValueRef f32 = LLVMBuildFPTrunc(g->builder, stored,
                         LLVMFloatTypeInContext(g->ctx), "slot.f32d");
                     LLVMValueRef bits = LLVMBuildBitCast(g->builder, f32,
@@ -488,11 +432,7 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                     stored = LLVMBuildBitCast(g->builder, stored, slot_ty, "slot.fb");
                 }
             } else if (value_kind == LLVMFloatTypeKind) {
-                /* List<float> slots carry the f32 bit pattern widened to the
-                 * 64-bit slot; the load side (load_collection_slot_value)
-                 * truncs back to i32 and bitcasts to float. Without this the
-                 * raw float value was reinterpreted as an integer, so
-                 * `l.Add(1.5f); x = l[0]` read 4.6e18. */
+                /* 内部辅助逻辑 */
                 LLVMValueRef bits = LLVMBuildBitCast(g->builder, stored,
                     LLVMInt32TypeInContext(g->ctx), "slot.f32b");
                 stored = LLVMBuildZExt(g->builder, bits, slot_ty, "slot.f32w");
@@ -515,8 +455,7 @@ static void emit_typed_out_store(zan_irgen_t *g, zan_type_t *value_type,
     LLVMTypeRef value_llvm = map_type(g, value_type);
     LLVMValueRef old = LLVMBuildLoad2(g->builder, value_llvm, out_ptr,
                                       "out.old");
-    /* The dictionary slot is borrowed. Retain the incoming value before
-     * replacing the caller's owner, then release the overwritten value. */
+    /* 核心系统底层抽象与内存语义契约 */
     emit_collection_value_retain(g, value_type, value, 0);
     LLVMValueRef stored = value;
     if (LLVMGetTypeKind(LLVMTypeOf(stored)) == LLVMPointerTypeKind &&
@@ -546,23 +485,9 @@ static void emit_collection_release_raw_slot(zan_irgen_t *g, zan_type_t *elem_ty
     emit_collection_value_release(g, elem_type, value, 0);
 }
 
-/* ---- object-graph release (per-class destructors) ------------------------
- * User class instances carry a 16-byte rc header; their RC-managed fields
- * (strings, other class instances, and the elements held by a List field) are
- * retained on capture but were never released when the owning object died,
- * leaking the whole object graph. For each class we synthesise
- *   void __zan_release_<T>(i8* obj):
- *     if (obj == null) return;
- *     if (*refcount == 1)          // this release drops the last reference
- *         <release each RC-managed field>;
- *     zan_rt_release(obj);         // decrement + free (+ leak bookkeeping)
- * Peeking the refcount keeps field release aliasing-safe: fields are dropped
- * exactly once, on the release that brings the object to zero. */
+/* 内部辅助实现 */
 
-/* One destructor per (class, instantiation): a field declared `T` holds a
- * different type in Acc<Node> than in Acc<int>, so one shared destructor keyed
- * by the class symbol alone skipped every type-parameter field and leaked
- * whatever it held. `inst` is NULL for non-generic classes. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
                                           zan_type_t *inst) {
     if (!sym) return NULL;
@@ -573,7 +498,7 @@ static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
         if (ci == inst) return g->class_release[i].fn;
         if (ci && inst && types_equal(ci, inst)) return g->class_release[i].fn;
     }
-    /* only classes with a registered struct layout can be walked */
+    /* 模块核心语义抽象与接口调用契约 */
     if (!get_struct_llvm_type(g, sym)) return NULL;
     g->class_release = irgen_grow(g->class_release, &g->class_release_cap,
                                   g->class_release_count + 1,
@@ -592,10 +517,7 @@ static LLVMValueRef get_class_release_decl(zan_irgen_t *g, zan_symbol_t *sym,
     return fn;
 }
 
-/* Release the RC-managed elements held by a List<T> value `col` (an i8* to the
- * bare List struct { i64 count, i64 cap, i64* data }). No-op for null lists or
- * non-RC element types. Only the tracked elements are released; the header-less
- * List struct/buffer are not rc-counted and are left as-is. */
+/* 内部辅助实现 */
 static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMValueRef col) {
     if (!elem_type || !type_contains_collection_rc(g, elem_type, 0)) return;
     if (!col || LLVMGetTypeKind(LLVMTypeOf(col)) != LLVMPointerTypeKind) return;
@@ -640,10 +562,7 @@ static void emit_list_release_elems(zan_irgen_t *g, zan_type_t *elem_type, LLVMV
     LLVMPositionBuilderAtEnd(b, done);
 }
 
-/* Release the rc-managed keys/values held by a Dict value `col` (an i8* to
- * the bare Dict struct { i64 count, i64 cap, i8** keys, i64* vals }). The
- * header-less Dict struct/buffers are calloc'd and not rc-counted; only the
- * tracked occupants are released. No-op for a null dict. */
+/* 内部辅助实现 */
 static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMValueRef col) {
     zan_type_t *kt = dict_key_type(g, dict_type);
     zan_type_t *vt = dict_value_type(dict_type);
@@ -703,9 +622,7 @@ static void emit_dict_release_elems(zan_irgen_t *g, zan_type_t *dict_type, LLVMV
     LLVMPositionBuilderAtEnd(b, done);
 }
 
-/* Release the rc-managed elements of an array payload. The count is threaded
- * in explicitly so the same walk serves a plain array (count at arr-16, data
- * at arr) and a rectangular one (data behind the shape). Null is a no-op. */
+/* 底层系统交互与数据协议契约 */
 static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
                                      LLVMValueRef arr, LLVMValueRef len) {
     if (!elem_type || !is_rc_managed_type(elem_type)) return;
@@ -749,9 +666,7 @@ static void emit_array_release_elems(zan_irgen_t *g, zan_type_t *elem_type,
     LLVMPositionBuilderAtEnd(b, done);
 }
 
-/* Retain of an array value: the tolerant runtime helper only touches a buffer
- * carrying the array rc guard, so a `T[]`-typed value that never came from
- * `new T[n]` (an extern's buffer, a span base) costs a load and a compare. */
+/* 内部辅助逻辑 */
 static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v) {
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -762,16 +677,10 @@ static void emit_array_retain(zan_irgen_t *g, LLVMValueRef v) {
         g->rt_arr_retain, &a, 1, "");
 }
 
-/* Per-element-type array destructor __zan_arr_release_<T>: release the
- * elements when this release is the one that takes the count to zero, then let
- * zan_rt_arr_release do the decrement and the free. Emitted only for element
- * types that own something; a `byte[]`/`int[]` release is the plain helper. */
+/* 内部辅助实现 */
 static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t);
 
-/* FNV-1a over a canonical byte encoding of a type structure (kind tag,
- * length-prefixed name, then type arguments). Unlike the readable token this
- * neither truncates nor leaves separators ambiguous, so two distinct element
- * types share a cache key only on a 64-bit hash match. */
+/* 内部辅助逻辑 */
 static void arr_rel_hash_mix(uint64_t *h, const void *data, size_t len) {
     const unsigned char *p = (const unsigned char *)data;
     for (size_t i = 0; i < len; i++) {
@@ -811,11 +720,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     size_t off = 0;
     tok[0] = '\0';
     mangle_type_token(tok, sizeof(tok), &off, elem_type);
-    /* the readable token alone is not a safe cache key: it truncates at
-     * 192 bytes and is ambiguous (`string[]` mangles to "stringA", colliding
-     * with a class literally named stringA), so a same-named earlier body
-     * would be silently reused for the wrong element type. Mix in the
-     * structure hash. */
+    /* 内部辅助实现 */
     char name[256];
     snprintf(name, sizeof(name), "__zan_arr_release_%s_%016llx%s",
              tok, (unsigned long long)arr_rel_type_key(elem_type),
@@ -832,7 +737,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     LLVMSetLinkage(fn, LLVMInternalLinkage);
 
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(g->builder);
-    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    di_clear(g); /* 底层系统交互与数据协议契约 */
     LLVMBuilderRef b = g->builder;
     LLVMValueRef arr = LLVMGetParam(fn, 0);
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
@@ -844,7 +749,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     LLVMBuildCondBr(b, zan_icmp(b, LLVMIntEQ, arr, LLVMConstNull(i8ptr), "isnull"),
                     ret, guard);
     LLVMPositionBuilderAtEnd(b, guard);
-    /* only a buffer with the rc guard has a count word to walk */
+    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef gmoff = LLVMConstInt(i64, (unsigned long long)ZAN_ARR_RC_MAGIC_OFF, 1);
     LLVMValueRef gmp = LLVMBuildGEP2(b, i8, arr, &gmoff, 1, "magicp");
     emit_header_read_guard(g, fn, gmp, ret);
@@ -864,9 +769,7 @@ static LLVMValueRef get_array_release_decl(zan_irgen_t *g, zan_type_t *elem_type
     LLVMPositionBuilderAtEnd(b, relel);
     LLVMValueRef data = arr;
     if (rect) {
-        /* a rectangular array keeps its shape between the count word and the
-         * payload: rank at arr-8, dims at arr+0, elements at arr + 8*rank
-         * (see zan_mdarray_alloc) */
+        /* 内部辅助逻辑 */
         LLVMValueRef rkoff = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef rank = LLVMBuildLoad2(b, i64,
             LLVMBuildBitCast(b, LLVMBuildGEP2(b, i8, arr, &rkoff, 1, "rankp"),
@@ -911,9 +814,7 @@ static LLVMValueRef get_array_desc(zan_irgen_t *g, zan_type_t *elem_type) {
     return dg;
 }
 
-/* Release of an array value: an element type that owns something goes through
- * the per-element-type destructor (rectangular arrays get the shape-aware
- * variant), anything else through the plain runtime helper. */
+/* 内部辅助逻辑 */
 static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -928,11 +829,7 @@ static void emit_array_release(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v)
         fn, &a, 1, "");
 }
 
-/* Shared tail of every destroy: leak accounting, then --arc-guard quarantine
- * or a plain free of the 16-byte header. Callers have already claimed the
- * destroy (the fetch_sub came back 1) and released the fields; weak targets
- * have had their registry slots nulled before the fields went. Saves and
- * restores the builder so release-body construction can call it mid-emission. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     LLVMValueRef existing = LLVMGetNamedFunction(g->mod, "__zan_arc_free");
     if (existing) return existing;
@@ -945,19 +842,18 @@ static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     LLVMSetLinkage(fn, LLVMInternalLinkage);
     LLVMBasicBlockRef saved_bb = LLVMGetInsertBlock(b);
     LLVMValueRef saved_fn = g->current_fn;
-    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    di_clear(g); /* 底层系统交互与数据协议契约 */
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(c, fn, "entry");
     LLVMPositionBuilderAtEnd(b, entry);
     g->current_fn = fn;
     LLVMValueRef obj = LLVMGetParam(fn, 0);
     if (g->check_leaks) {
-        /* read the allocation-site index while the object memory is still live */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         LLVMValueRef neg8 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_SITE_OFF, 1);
         LLVMValueRef site_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg8, 1, "sptr");
         LLVMValueRef site_iptr = LLVMBuildBitCast(b, site_ptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef site = LLVMBuildLoad2(b, i64, site_iptr, "site");
-        /* leak tracking: one fewer live object, and one fewer at this site.
-         * The table is reached through its pointer global. */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         emit_leak_counter_add(g, g->g_live, -1);
         LLVMValueRef ltbl = LLVMBuildLoad2(b, LLVMPointerType(i64, 0),
             g->g_site_live, "ltbl");
@@ -970,7 +866,7 @@ static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
         LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
         emit_arc_quarantine(g, obj, rcip);
     } else {
-        /* free(obj - 16) to include the header */
+        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef header_ptr = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "hdr");
         LLVMTypeRef free_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
@@ -982,13 +878,10 @@ static LLVMValueRef get_arc_free_decl(zan_irgen_t *g) {
     return fn;
 }
 
-/* Emit the body of __zan_release_<T>: null-guard, atomically claim the destroy
- * (fetch_sub hands the pre-op value 1 to exactly one caller), release the
- * RC-managed fields, then free through __zan_arc_free. A pre-op <= 0 defers
- * to zan_rt_release, whose underflow checks report the over-release. */
+/* 内部辅助实现 */
 static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
                                     zan_type_t *inst, LLVMValueRef fn) {
-    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    di_clear(g); /* 底层系统交互与数据协议契约 */
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -1007,9 +900,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    /* Atomically claim the destroy decision. A plain `load rc == 1` peek let
-     * two concurrent final releases both observe 1 and release the fields
-     * twice; fetch_sub hands the pre-op value to exactly one caller. */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
         LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
     LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
@@ -1019,12 +910,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMPositionBuilderAtEnd(b, last_bb);
     LLVMBasicBlockRef begin_bb = LLVMAppendBasicBlockInContext(c, fn, "begin");
     LLVMBuildCondBr(b, is1, begin_bb, ret);
-    /* Commit gate BEFORE any field is released: zan_rt_weak_destroy_begin
-     * nulls every registry slot pointing at this object under the weak lock
-     * and only commits when the count is still zero. A weak reader that
-     * retained between our claim and its lock resurrected the object -- the
-     * gate aborts, our decrement is absorbed by the reader's +1, and the
-     * reader's own release claims the destroy. */
+    /* 内部辅助实现 */
     LLVMPositionBuilderAtEnd(b, begin_bb);
     LLVMValueRef weak_ok = zan_call2(b,
         LLVMGlobalGetValueType(g->rt_weak_destroy_begin),
@@ -1040,11 +926,14 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
         int idx = fi++;
         zan_type_t *ft = m->type;
         if (!ft) continue;
-        /* resolve `T` / `List<T>` fields against the instantiation being freed */
+        /* 模块核心语义抽象与接口调用契约 */
         if (inst) ft = subst_type_param_deep(g, ft, inst);
         if (!ft || ft->kind == TYPE_TYPE_PARAM) continue;
-        /* weak fields are non-owning back-references: unregister the slot
-         * before the containing object is freed, but never release its value. */
+        /* 模块核心语义抽象与接口调用契约 */
+        if (type_is_binding(inst ? inst : sym->type) &&
+            m->name.len == 6 && memcmp(m->name.str, "target", 6) == 0)
+            continue;
+        /* 内部辅助逻辑 */
         if ((m->modifiers & MOD_WEAK) && is_arc_managed_type(ft) &&
             (ft->kind == TYPE_INTERFACE ||
              (ft->kind == TYPE_CLASS && ft->sym != NULL))) {
@@ -1062,26 +951,18 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             LLVMValueRef s = LLVMBuildLoad2(b, i8ptr, fp, "fs");
             emit_string_release(g, s);
         } else if (ft->kind == TYPE_DELEGATE) {
-            /* A delegate field may hold a closure record (captured values or
-             * a bound receiver); on a bare function pointer the release is a
-             * no-op. The tag test splits the block, which the remaining field
-             * releases tolerate: `self` dominates every successor. */
+            /* 内部辅助实现 */
             LLVMValueRef fp = LLVMBuildStructGEP2(g->builder, structT, self,
                                                   (unsigned)idx, "fp");
             LLVMValueRef dv = LLVMBuildLoad2(g->builder, i8ptr, fp, "fd");
             emit_closure_release(g, dv);
         } else if (ft->kind == TYPE_ARRAY) {
-            /* An array field holds the same +1 a local would (field stores
-             * retain), so the owner drops it here; a field that was never
-             * given a `new T[n]` buffer -- an extern's pointer -- lacks the
-             * rc prefix and the release is a no-op. */
+            /* 内部辅助实现 */
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef av = LLVMBuildLoad2(b, i8ptr, fp, "fa");
             emit_array_release(g, ft, av);
         } else if (is_arc_managed_type(ft)) {
-            /* User class instances and the refcounted collections List/
-             * StringBuilder: release via the recorded site destructor (which
-             * releases elements and frees the backing buffer + struct). */
+            /* 内部辅助逻辑 */
             LLVMValueRef fp = LLVMBuildStructGEP2(b, structT, self, (unsigned)idx, "fp");
             LLVMValueRef cv = LLVMBuildLoad2(b, map_type(g, ft), fp, "fc");
             emit_arc_release_typed(g, ft, cv);
@@ -1091,9 +972,7 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
             emit_release_obj_value(g, cv);
         }
     }
-    /* The destroy was committed by the gate above (slots nulled, count zero),
-     * so free here: handing back to zan_rt_release would decrement again and
-     * underflow the count this path already took. */
+    /* 内部辅助逻辑 */
     LLVMBasicBlockRef freebb = LLVMAppendBasicBlockInContext(c, fn, "freebb");
     LLVMBuildBr(b, freebb);
     LLVMPositionBuilderAtEnd(b, freebb);
@@ -1108,14 +987,10 @@ static void build_class_release_body(zan_irgen_t *g, zan_symbol_t *sym,
     LLVMBuildRetVoid(b);
 }
 
-/* Emit the body of a per-site collection destructor (List/StringBuilder):
- * null-guard, peek the refcount, and when this release brings it to zero
- * release the RC-managed elements (List) and free the separately-malloc'd
- * backing buffer, then hand off to zan_rt_release for the struct decrement +
- * free. Peeking the refcount keeps buffer release aliasing-safe. */
+/* 内部辅助实现 */
 static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
                                           zan_type_t *elem_type, LLVMValueRef fn) {
-    di_clear(g); /* synthetic fn: don't inherit a user fn's DISubprogram scope */
+    di_clear(g); /* 底层系统交互与数据协议契约 */
     LLVMContextRef c = g->ctx;
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(c), 0);
@@ -1133,9 +1008,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMValueRef neg16 = LLVMConstInt(i64, (unsigned long long)ZAN_OBJ_RC_OFF, 1);
     LLVMValueRef rcp = LLVMBuildGEP2(b, LLVMInt8TypeInContext(c), obj, &neg16, 1, "rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0), "rcip");
-    /* Atomically claim the destroy decision. A plain `load rc == 1` peek let
-     * two concurrent final releases both observe 1 and release the fields
-     * twice; fetch_sub hands the pre-op value to exactly one caller. */
+    /* 核心系统底层抽象与内存语义契约 */
     LLVMValueRef rc_old = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpSub, rcip,
         LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
     LLVMValueRef is1 = zan_icmp(b, LLVMIntEQ, rc_old, LLVMConstInt(i64, 1, 0), "is1");
@@ -1147,9 +1020,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMPositionBuilderAtEnd(b, relf);
     LLVMTypeRef free_ty = LLVMFunctionType(LLVMVoidTypeInContext(c), &i8ptr, 1, 0);
     if (coll_kind == 1) {
-        /* List: release RC-managed elements, then free the i64* data buffer.
-         * emit_list_release_elems may split the block and leaves the builder at
-         * its own terminator block; capture the data pointer beforehand. */
+        /* 模块核心语义抽象与接口调用契约 */
         LLVMValueRef lp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->list_struct_type, 0), "lp");
         LLVMValueRef dp = LLVMBuildStructGEP2(b, g->list_struct_type, lp, 2, "dp");
         LLVMValueRef data = LLVMBuildLoad2(b, LLVMPointerType(i64, 0), dp, "data");
@@ -1157,9 +1028,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
         LLVMValueRef d8 = LLVMBuildBitCast(b, data, i8ptr, "d8");
         zan_call2(b, free_ty, g->fn_free, &d8, 1, "");
     } else if (coll_kind == 3) {
-        /* Dict: release rc-managed keys/values, then free the keys, values and
-         * hash-index buffers. `elem_type` carries the dict type itself so the
-         * key/value types stay recoverable here. */
+        /* 内部辅助逻辑 */
         LLVMValueRef dp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->dict_struct_type, 0), "dp");
         LLVMValueRef ks = LLVMBuildLoad2(b, i8ptr,
             LLVMBuildStructGEP2(b, g->dict_struct_type, dp, 2, "kp"), "ks8");
@@ -1172,7 +1041,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
         zan_call2(b, free_ty, g->fn_free, &vs, 1, "");
         zan_call2(b, free_ty, g->fn_free, &ix, 1, "");
     } else if (coll_kind == 2) {
-        /* StringBuilder: free the i8* data buffer (free tolerates null). */
+        /* 模块核心语义抽象与接口调用契约 */
         LLVMValueRef sp = LLVMBuildBitCast(b, obj, LLVMPointerType(g->sb_struct_type, 0), "sp");
         LLVMValueRef dp = LLVMBuildStructGEP2(b, g->sb_struct_type, sp, 2, "dp");
         LLVMValueRef data = LLVMBuildLoad2(b, i8ptr, dp, "data");
@@ -1192,8 +1061,7 @@ static void build_collection_release_body(zan_irgen_t *g, int coll_kind,
     LLVMBuildRetVoid(b);
 }
 
-/* Get (creating on first use) the per-site collection destructor for a List/
- * StringBuilder allocation site, building its body immediately. */
+/* 内部辅助逻辑 */
 static LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
     char name[64];
     snprintf(name, sizeof(name), "__zan_release_coll_%d", site);
@@ -1207,25 +1075,18 @@ static LLVMValueRef get_collection_release_decl(zan_irgen_t *g, int site) {
     return fn;
 }
 
-/* Release a class value `v` of static type `type` via its synthesised
- * __zan_release_<T> (which releases RC fields then frees). Falls back to the
- * plain rc decrement when no per-class function exists (unregistered type). */
+/* 内部辅助逻辑 */
 static void emit_arc_release_typed(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v) {
     (void)type;
     if (!v || LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return;
-    /* Dispatch on the object's recorded allocation site (its concrete type)
-     * rather than the static type, so a base-typed reference still frees the
-     * derived instance's fields. zan_rt_release_dyn falls back to a plain
-     * decrement when the site has no per-class destructor. */
+    /* 内部辅助实现 */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     if (LLVMTypeOf(v) != i8ptr) v = LLVMBuildBitCast(g->builder, v, i8ptr, "arc.rlt");
     zan_call2(g->builder, LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), &i8ptr, 1, 0),
                    g->rt_release_dyn, &v, 1, "");
 }
 
-/* Build the bodies of every class release function. Called at finalize, once
- * all class types are registered. Iterating the registered struct types covers
- * every function get_class_release_decl may lazily create for nested fields. */
+/* 构建the bodies of every class release function */
 static void emit_all_class_releases(zan_irgen_t *g) {
     for (int i = 0; i < g->struct_type_count; i++) {
         zan_symbol_t *sym = g->struct_types[i].sym;
@@ -1233,8 +1094,7 @@ static void emit_all_class_releases(zan_irgen_t *g) {
         LLVMValueRef fn = get_class_release_decl(g, sym, NULL);
         if (fn) build_class_release_body(g, sym, NULL, fn);
     }
-    /* plus one per generic instantiation that was actually allocated, so its
-     * type-parameter fields are released with their concrete types */
+    /* 内部辅助逻辑 */
     for (int i = 0; g->site_inst && i < g->leak_site_count; i++) {
         zan_symbol_t *sym = g->site_syms ? g->site_syms[i] : NULL;
         zan_type_t *inst = g->site_inst[i];
@@ -1250,10 +1110,7 @@ static void emit_all_class_releases(zan_irgen_t *g) {
     }
 }
 
-/* Create the live-count and site-name arrays behind their pointer globals and
- * publish the site count for every runtime index check. Both arrays start
- * zeroed -- instrumentation mutates them at run time; nothing to fill here.
- * Runs at finalize once leak_site_count is final; check-leaks only. */
+/* 内部辅助实现 */
 static void emit_site_live_tables(zan_irgen_t *g) {
     if (g->desc_hdr || !g->g_site_live || !g->g_site_count) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1274,13 +1131,7 @@ static void emit_site_live_tables(zan_irgen_t *g) {
     LLVMSetInitializer(g->g_site_count, LLVMConstInt(i64t, n, 0));
 }
 
-/* Fill the per-site destructor table (reached through the __zan_site_dtors
- * pointer global) with the concrete per-class destructor recorded for that
- * allocation site, so zan_rt_release_dyn can dispatch on runtime type. Must
- * run after emit_all_class_releases (all destructors declared). The
- * array is created here with the real site count -- the pointer global's
- * target could not be typed during emission. Descriptor builds keep no table:
- * the descriptor's dtor field is filled by emit_arc_desc_init below. */
+/* 内部辅助实现 */
 static void emit_site_dtor_table(zan_irgen_t *g) {
     if (!g->site_syms || g->desc_hdr) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1308,13 +1159,7 @@ static void emit_site_dtor_table(zan_irgen_t *g) {
     free(elems);
 }
 
-/* Fill the per-site ancestor-name table (through the __zan_site_tynames
- * pointer global) with a pointer to the site class's ancestor name list: the
- * class itself plus every base class, most-derived first, with a trailing
- * null. `x is T` (T a strict base of the static type) walks it to test the
- * object's runtime class against the target. Collections contribute their
- * intrinsic name (List/StringBuilder/Dict). Runs at finalize, after all sites
- * are registered; sizes the array to the real site count. */
+/* 内部辅助实现 */
 static void emit_site_tyname_table(zan_irgen_t *g) {
     if (!g->site_syms || g->desc_hdr) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -1368,25 +1213,10 @@ static void emit_site_tyname_table(zan_irgen_t *g) {
     free(elems);
 }
 
-/* Descriptor builds (default): fill each __zan_desc_<site> with
- * {dtor, tynames, meta, site}, replacing the three [4096 x i8*] tables. The
- * per-field logic mirrors emit_site_dtor_table / emit_site_tyname_table /
- * emit_site_meta_table; each descriptor is a small per-shape constant only
- * live code references, so --gc-sections can drop every unreachable class's
- * release function. Runs at finalize, after emit_all_class_releases declared
- * every destructor. Defined at the end of irgen_reflect.c (needs
- * refl_meta_for); declared here so the finalize sequence in irgen_emit.c
- * reaches it. */
+/* 内部辅助实现 */
 void zan_irgen_emit_arc_desc_init(zan_irgen_t *g);
 
-
-/* ---- virtual dispatch: vtable globals + dynamic call ---------------------
- * Each class with virtual/override methods gets an internal global
- * __zan_vtable_<Class> : [N x i8*], one slot per virtual method (base-first
- * ordering shared across the hierarchy). Objects store &vtable[0] in field 0
- * at construction; a virtual call loads the slot and calls through it, so the
- * runtime (most-derived) implementation runs even via a base-typed reference
- * or a List<Base> element. */
+/* 内部辅助实现 */
 
 static LLVMValueRef find_fn_for_sym(zan_irgen_t *g, zan_symbol_t *msym) {
     if (!msym) return NULL;
@@ -1394,9 +1224,7 @@ static LLVMValueRef find_fn_for_sym(zan_irgen_t *g, zan_symbol_t *msym) {
     return i >= 0 ? g->functions[i].fn : NULL;
 }
 
-/* Enumerate the virtual *slot-defining* methods (MOD_VIRTUAL and not an
- * override) of a class hierarchy, base classes first, matching the slot
- * numbering used by get_virtual_method_index/count_virtual_methods. */
+/* 内部辅助逻辑 */
 static void collect_vslot_decls(zan_symbol_t *sym, zan_symbol_t **out, int *n, int cap) {
     if (sym->type && sym->type->base_type && sym->type->base_type->sym)
         collect_vslot_decls(sym->type->base_type->sym, out, n, cap);
@@ -1425,8 +1253,7 @@ static LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
     return gv;
 }
 
-/* Populate every instantiable class's vtable with the most-derived function
- * for each slot. Runs at finalize, after all methods are registered. */
+/* 内部辅助逻辑 */
 static void emit_vtables(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = 0; i < g->struct_type_count; i++) {
@@ -1434,9 +1261,7 @@ static void emit_vtables(zan_irgen_t *g) {
         if (!sym || !class_has_virtual_methods(sym)) continue;
         int n = count_virtual_methods(sym);
         if (n < 1) continue;
-        /* The slot-defining decl list is as large as the slot count; a fixed
-         * 128-entry stack array silently truncated deep hierarchies, leaving
-         * the tail slots null and any virtual call through them a null call. */
+        /* 内部辅助逻辑 */
         zan_symbol_t **decls = (zan_symbol_t **)calloc((size_t)n,
                                                        sizeof(zan_symbol_t *));
         int nd = 0;
@@ -1460,12 +1285,7 @@ static void emit_vtables(zan_irgen_t *g) {
     }
 }
 
-/* Reinterpret/convert a value to a target LLVM type across the generic
- * erased-pointer boundary. A generic type parameter T lowers to an opaque
- * pointer, so a value-type argument (i64/double/i1) passed where T is expected
- * — and the reverse, a T-typed field/return consumed as a concrete value —
- * must be bit-reinterpreted (mirrors the List<T> slot store/load). Matching
- * types pass through unchanged, so non-generic code is never affected. */
+/* 内部辅助逻辑 */
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);
 
 static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
@@ -1518,8 +1338,7 @@ static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
     return v;
 }
 
-/* Coerce each argument to the callee's declared parameter type (generic
- * erased-pointer boundary). No-op when types already agree. */
+/* 内部辅助逻辑 */
 static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
                                   LLVMValueRef *call_args, int argc) {
     unsigned npt = LLVMCountParamTypes(fn_type);
@@ -1532,10 +1351,7 @@ static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
     for (int i = 0; i < n; i++)
         call_args[i] = emit_boundary_coerce(g, call_args[i], pts[i]);
     free(pts);
-    /* C default argument promotions on a Variadic = true extern's tail
-     * (A2-3): small integers widen to int, float widens to double; i64 and
-     * pointers pass unchanged. Narrow signed Zan types read back signed like
-     * a C char/short -- pass an `int` when the width matters. */
+    /* 内部辅助实现 */
     for (int i = (int)npt; va && i < argc; i++) {
         LLVMValueRef v = call_args[i];
         if (!v) continue;
@@ -1553,12 +1369,7 @@ static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
     }
 }
 
-/* If `t` is a generic type parameter of `recv`'s instantiated class, resolve it
- * to the corresponding concrete type argument (e.g. T -> int for Box<int>);
- * otherwise return `t` unchanged. */
-/* Like subst_type_param, but reaches inside type arguments as well, so a field
- * declared List<T> in Box<Square> reads back as List<Square> rather than
- * leaving T unresolved for whatever indexes it. */
+/* 内部辅助实现 */
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv) {
     if (!t || !recv || !recv->sym || !recv->sym->decl) return t;
@@ -1582,13 +1393,7 @@ static zan_type_t *subst_type_param(zan_type_t *t, zan_type_t *recv) {
     return t;
 }
 
-/* For a call to a generic method (one declaring its own <T,...>), determine the
- * concrete return type at this call site when the declared return type is one
- * of those type parameters. Uses explicit type arguments (f<int>(...)) when
- * present, otherwise infers from the argument bound to that type parameter.
- * Returns NULL when the method is non-generic or its return type is not a bare
- * type parameter (e.g. bool / List<T>), in which case no boundary coercion of
- * the erased-pointer result is required. */
+/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *call, local_scope_t *locals) {
     if (!msym || !msym->decl || msym->decl->kind != AST_METHOD_DECL) return NULL;
@@ -1620,11 +1425,7 @@ static zan_type_t *generic_method_ret(zan_irgen_t *g, zan_symbol_t *msym,
     return NULL;
 }
 
-/* Structural equality of two resolved types, used to match a call site's
- * concrete type arguments against a discovered instantiation. Compares kind +
- * simple name + (recursively) generic type arguments; arrays/nullable compare
- * their element type. Good enough for the closed set of types that appear as
- * generic arguments (builtins, user classes/structs, nested generics). */
+/* 内部辅助实现 */
 static bool types_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
@@ -1634,7 +1435,7 @@ static bool types_equal(zan_type_t *a, zan_type_t *b) {
         return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
-            return false; /* int[,] is not int[] */
+            return false; /* 核心系统底层抽象与内存语义契约 */
         return types_equal(a->element_type, b->element_type);
     }
     if (a->type_arg_count != b->type_arg_count) return false;
@@ -1650,8 +1451,7 @@ static bool type_arglists_equal(zan_type_t **a, int an, zan_type_t **b, int bn) 
     return true;
 }
 
-/* True when `t` mentions no unresolved generic type parameter (directly or in a
- * type argument / element type) — i.e. it is a fully concrete instantiation. */
+/* 内部辅助逻辑 */
 static bool type_is_concrete(zan_type_t *t) {
     if (!t) return false;
     if (t->kind == TYPE_TYPE_PARAM || t->kind == TYPE_ERROR) return false;
@@ -1662,16 +1462,13 @@ static bool type_is_concrete(zan_type_t *t) {
     return true;
 }
 
-/* Substitute a type parameter to its concrete argument using the instantiation
- * currently being specialized (`g->cur_inst`); no-op when not specializing or
- * when `t` is not one of this instantiation's parameters. */
+/* 内部辅助逻辑 */
 static zan_type_t *concretize(zan_irgen_t *g, zan_type_t *t) {
     if (!g->cur_inst) return t;
     return subst_type_param(t, g->cur_inst);
 }
 
-/* A user generic class/struct is one declaring at least one type parameter and
- * not a built-in intrinsic (List/Dict/StringBuilder handled elsewhere). */
+/* 内部辅助逻辑 */
 static bool is_user_generic_sym(zan_symbol_t *sym) {
     if (!sym || !sym->decl) return false;
     zan_ast_node_t *d = sym->decl;
@@ -1696,8 +1493,7 @@ static void add_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
     g->generic_fn_count++;
 }
 
-/* Find the specialized function for `msym` at the instantiation carrying
- * `args`; NULL when none was emitted (caller falls back to the erased fn). */
+/* 内部辅助逻辑 */
 static LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
                                     zan_type_t **args, int argc,
                                     LLVMTypeRef *out_fn_type) {
@@ -1750,7 +1546,7 @@ static LLVMValueRef find_generic_ctor(zan_irgen_t *g, zan_symbol_t *type_sym,
     return NULL;
 }
 
-/* Record a distinct concrete instantiation of a user generic class. */
+/* 底层系统交互与数据协议契约 */
 static void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
     if (!inst || !inst->sym || inst->type_arg_count <= 0) return;
     if (!is_user_generic_sym(inst->sym)) return;
@@ -1760,7 +1556,7 @@ static void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
             type_arglists_equal(g->generic_insts[i].inst->type_args,
                                 g->generic_insts[i].inst->type_arg_count,
                                 inst->type_args, inst->type_arg_count))
-            return; /* already recorded */
+            return; /* 核心系统底层抽象与内存语义契约 */
     if (g->generic_inst_count >= g->generic_inst_cap) {
         int ncap = g->generic_inst_cap ? g->generic_inst_cap * 2 : 32;
         g->generic_insts = realloc(g->generic_insts,
@@ -1772,8 +1568,7 @@ static void add_generic_inst(zan_irgen_t *g, zan_type_t *inst) {
     g->generic_inst_count++;
 }
 
-/* Append a readable, LLVM-symbol-safe token for a concrete type argument
- * (e.g. `string`, `int`, or `List_string` for a nested generic). */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t) {
     if (!t) return;
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE) {
@@ -1792,8 +1587,7 @@ static void mangle_type_token(char *buf, size_t n, size_t *off, zan_type_t *t) {
     }
 }
 
-/* Build the function-name suffix for an instantiation, e.g. HashSet<string>
- * yields "$string" and Pair<int,string> yields "$int$string". */
+/* 构建the function-name suffix for an instantiation, e */
 static void mangle_inst_suffix(char *buf, size_t n, zan_type_t *inst) {
     size_t off = 0;
     buf[0] = '\0';

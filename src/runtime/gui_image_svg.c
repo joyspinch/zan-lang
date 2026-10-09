@@ -1,5 +1,4 @@
-/* SVG rasterization for zan_image's cache. Raster pixels use the same
- * straight-alpha ARGB32 layout as the stb_image and libwebp paths. */
+/* 底层系统交互与数据协议契约 */
 
 #include <math.h>
 #include <stdint.h>
@@ -8,15 +7,11 @@
 
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg/nanosvg.h"
-/* Upstream spells the raster gate without the "ER" (NANOSVGRAST_H). */
+/* 底层系统交互与数据协议契约 */
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvg/nanosvgrast.h"
 
-/* Rasterize `len` bytes of SVG source (NUL-terminated text is not required)
- * into outPix (malloc'd ARGB32, owned and freed inside zan_image).
- * boxW/boxH: fit the document inside, preserving aspect (contain); values
- * <= 0 mean "use the document's intrinsic size". Returns 1 and sets
- * outPix/outW/outH on success, 0 on parse or allocation failure. */
+/* 底层系统交互与数据协议契约 */
 int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
                    int *outH, int boxW, int boxH) {
     char *doc;
@@ -37,16 +32,14 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
     if (!img) { free(doc); return 0; }
     iw = img->width;
     ih = img->height;
-    /* No width/height and no viewBox: nothing drawable, treat as a decode
-     * failure rather than inventing an intrinsic size. */
+    /* 底层系统交互与数据协议契约 */
     if (iw <= 0.0f || ih <= 0.0f) {
         nsvgDelete(img); free(doc); return 0;
     }
     if (boxW <= 0) boxW = (int)(iw + 0.5f);
     if (boxH <= 0) boxH = (int)(ih + 0.5f);
     if (boxW <= 0 || boxH <= 0) { nsvgDelete(img); free(doc); return 0; }
-    /* Contain fit: uniform scale, document centered on (0,0) origin. Cap the
-     * output -- a raster is w*h*4 bytes and the box comes from layout. */
+    /* 底层系统交互与数据协议契约 */
     scale = boxW / iw < boxH / ih ? boxW / iw : boxH / ih;
     if (scale <= 0.0f || !(scale < 1e6f)) scale = 1.0f;
     w = (int)(iw * scale + 0.5f);
@@ -65,8 +58,7 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
         nsvgRasterize(rast, img, 0.0f, 0.0f, scale, rgba, w, h, w * 4);
         pix = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
         if (pix) {
-            /* nanosvg emits straight-alpha RGBA; the surface wants the
-             * runtime's ARGB32 layout (same conversion as the stb path). */
+            /* 底层系统交互与数据协议契约 */
             n = w * h;
             for (x = 0; x < n; x++) {
                 unsigned char r = rgba[x*4], g = rgba[x*4+1],

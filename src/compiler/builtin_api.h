@@ -6,22 +6,22 @@
 typedef struct {
     const char *name;
     char kind;        /* 'M' method, 'P' property, 'F' field */
-    const char *sig;  /* display signature for completion / signature help */
+    const char *sig;  /* 底层系统交互与数据协议契约 */
 } zan_builtin_member_t;
 
 typedef struct {
-    const char *type;         /* receiver type name as irgen sees it */
-    const char *name_public;  /* name the language spells it with ("Dictionary") */
-    const char *display;      /* name shown in diagnostics ("Dictionary<K,V>") */
-    int is_static;            /* 1 = static class (Console.X), 0 = instance */
+    const char *type;         /* 核心系统底层抽象与内存语义契约 */
+    const char *name_public;  /* 底层系统交互与数据协议契约 */
+    const char *display;      /* 核心系统底层抽象与内存语义契约 */
+    int is_static;            /* 核心系统底层抽象与内存语义契约 */
     const zan_builtin_member_t *members;
     int member_count;
 } zan_builtin_type_t;
 
-/* All built-in types, in declaration order. */
+/* 核心系统底层抽象与内存语义契约 */
 const zan_builtin_type_t *zan_builtin_types(int *count);
 
-/* The entry for `type` (irgen's internal name, e */
+/* 底层系统交互与数据协议契约 */
 const zan_builtin_type_t *zan_builtin_find(const char *type);
 
 /* 检查是否`type` has a member named `name` (length-delimited, not NUL-terminated) */

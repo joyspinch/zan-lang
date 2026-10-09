@@ -1,11 +1,11 @@
 /* gui_runtime_text */
 
-/* Text Rendering — Platform-specific (Win32: GDI, Linux: Xft/fallback) */
+/* 底层系统交互与数据协议契约 */
 
 #ifdef _WIN32
 
 static HDC g_text_dc = NULL;
-static HFONT g_fonts[16]; /* cached fonts by size index */
+static HFONT g_fonts[16]; /* 核心系统底层抽象与内存语义契约 */
 static int g_font_count = 0;
 static int g_text_stats_enabled = 0;
 static uint64_t g_text_draw_calls = 0;
@@ -66,7 +66,7 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
         case 9: return (i64)g_text_draw_us;
         case 10: return (i64)g_text_measure_us;
         case 11: return (i64)g_text_height_us;
-        /* glyph-atlas internals (gui_runtime_glyph */
+        /* 底层系统交互与数据协议契约 */
         case 76: return (i64)g_atlas_bytes;
         case 77: return (i64)g_atlas_stores;
         case 78: return (i64)g_atlas_swept;
@@ -86,15 +86,15 @@ static void ensure_text_dc(void) {
 }
 
 static int g_font_sizes[16];
-static int g_font_bold[16];   /* 1 = FW_BOLD slot; the table is keyed by (size, weight) */
+static int g_font_bold[16];   /* 底层系统交互与数据协议契约 */
 /* 内部辅助逻辑 */
 static wchar_t g_font_family[64] = L"Segoe UI";
 static int g_font_family_env_done = 0;
 static int g_font_family_explicit = 0;
 /* 内部辅助逻辑 */
-static int g_os2_asc = 0;    /* usWinAscent, font units */
-static int g_os2_desc = 0;   /* usWinDescent, font units */
-static int g_os2_upem = 0;   /* unitsPerEm ('head'), 0 = fall back to GDI */
+static int g_os2_asc = 0;    /* 核心系统底层抽象与内存语义契约 */
+static int g_os2_desc = 0;   /* 核心系统底层抽象与内存语义契约 */
+static int g_os2_upem = 0;   /* 核心系统底层抽象与内存语义契约 */
 static int g_os2_tried = 0;
 
 static HFONT get_or_create_font(int size, int bold) {
@@ -105,12 +105,12 @@ static HFONT get_or_create_font(int size, int bold) {
             return g_fonts[i];
         }
     }
-    /* Find empty slot */
+    /* 核心系统底层抽象与内存语义契约 */
     int slot = -1;
     for (int i = 0; i < 16; i++) {
         if (!g_fonts[i]) { slot = i; break; }
     }
-    if (slot < 0) slot = 15; /* reuse last */
+    if (slot < 0) slot = 15; /* 核心系统底层抽象与内存语义契约 */
 
     /* 内部辅助实现 */
     if (!g_font_family_explicit && !g_font_family_env_done) {
@@ -138,7 +138,7 @@ static HFONT get_or_create_font(int size, int bold) {
     return g_fonts[slot];
 }
 
-/* Programmatic face selection (games: a rounder face matching the art) */
+/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -146,13 +146,13 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (n <= 0 || n > 64) return 0;
     memcpy(g_font_family, want, (size_t)n * sizeof(wchar_t));
     g_font_family_explicit = 1;
-    /* Drop cached HFONTs so the next draw rebuilds with the new face */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < 16; i++) {
         if (g_fonts[i]) { DeleteObject(g_fonts[i]); g_fonts[i] = NULL; }
         g_font_sizes[i] = 0;
         g_font_bold[i] = 0;
     }
-    /* OS/2 vertical metrics belong to the face: force a reload. */
+    /* 底层系统交互与数据协议契约 */
     g_os2_tried = 0;
     g_os2_upem = 0;
     return 1;
@@ -197,7 +197,7 @@ static uint64_t zan_text_hash(const char *s, int size) {
     return h;
 }
 
-/* Runs are cached per (text, size, weight) */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_RUN_BOLD_FLAG 0x10000
 static int run_key_size(int size, int bold) {
     return bold ? (size | ZAN_RUN_BOLD_FLAG) : size;
@@ -213,13 +213,13 @@ extern int zan_dw_render(const wchar_t *w, int len,
 
 /* 内部辅助实现 */
 static int win_cp_is_emoji(unsigned int cp) {
-    if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;   /* SMP emoji + tags */
-    if (cp >= 0xD83C && cp <= 0xD83E) return 1;     /* SMP high surrogates */
-    if (cp >= 0x2600 && cp <= 0x27BF) return 1;     /* misc symbols+dingbats */
+    if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;   /* 核心系统底层抽象与内存语义契约 */
+    if (cp >= 0xD83C && cp <= 0xD83E) return 1;     /* 核心系统底层抽象与内存语义契约 */
+    if (cp >= 0x2600 && cp <= 0x27BF) return 1;     /* 核心系统底层抽象与内存语义契约 */
     if (cp >= 0x2B00 && cp <= 0x2BFF) return 1;     /* stars/arrows */
-    if (cp >= 0xFE00 && cp <= 0xFE0F) return 1;     /* variation selectors */
-    if (cp == 0x200D) return 1;                     /* ZWJ sequences */
-    if (cp == 0x20E3) return 1;                     /* keycap combine */
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return 1;     /* 核心系统底层抽象与内存语义契约 */
+    if (cp == 0x200D) return 1;                     /* 核心系统底层抽象与内存语义契约 */
+    if (cp == 0x20E3) return 1;                     /* 核心系统底层抽象与内存语义契约 */
     if (cp >= 0x2190 && cp <= 0x21AA) return 1;     /* arrows/hands */
     if (cp >= 0x231A && cp <= 0x231B) return 1;
     if (cp >= 0x23E9 && cp <= 0x23FA) return 1;
@@ -395,7 +395,7 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
-/* Bold variant of zan_gui_draw_text */
+/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -472,7 +472,7 @@ EXPORT void zan_gui_draw_text_rot(
 
         double rad = (double)angle * 3.14159265358979323846 / 180.0;
         double cs = cos(rad), sn = sin(rad);
-        /* Rotated bbox of the padded box [0 */
+        /* 核心系统底层抽象与内存语义契约 */
         double cx0 = 0.0, cx1 = cs * w, cx2 = -sn * h, cx3 = cs * w - sn * h;
         double cy0 = 0.0, cy1 = sn * w, cy2 = cs * h, cy3 = sn * w + cs * h;
         double mnx = cx0;
@@ -563,10 +563,10 @@ EXPORT void zan_gui_draw_text_rot(
 
 /* 内部辅助实现 */
 typedef struct {
-    char    *text;   /* UTF-8 key; NULL marks an empty slot */
+    char    *text;   /* 底层系统交互与数据协议契约 */
     int      size;
     int      width;
-    uint64_t used;   /* LRU tick */
+    uint64_t used;   /* 核心系统底层抽象与内存语义契约 */
 } zan_measure_cache_t;
 
 #define ZAN_MEAS_CACHE_CAP 2048
@@ -585,7 +585,7 @@ static int measure_text_gdi(const char *text, int size) {
     GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
     int missing = win_run_has_emoji(wtext, wlen - 1);
     SelectObject(g_text_dc, old_font);
-    /* Emoji runs: GDI measures the */
+    /* 核心系统底层抽象与内存语义契约 */
     int w = 0;
     if (missing) {
         w = win_dw_text_width(wtext, wlen - 1, size, 0);
@@ -648,7 +648,7 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     return (i64)w;
 }
 
-/* Font height depends only on size; only a handful of sizes are ever used */
+/* 底层系统交互与数据协议契约 */
 static int g_fh_size[16];
 static int g_fh_val[16];
 static int g_fh_count = 0;
@@ -729,7 +729,7 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     load_os2_vertical_metrics();
     int val;
     if (g_os2_upem > 0) {
-        /* Chrome content box: floor(size*usWinAscent/upem) + floor(size*usWinDescent/upem) */
+        /* 底层系统交互与数据协议契约 */
         val = (size * g_os2_asc) / g_os2_upem
             + (size * g_os2_desc) / g_os2_upem;
     } else {

@@ -55,7 +55,7 @@ static void queue_grow(void) {
 void zan_co_ready(void *frame, zan_co_step_t step) {
     if (!step) return;
     if (g_len == g_cap) queue_grow();
-    if (g_len == g_cap) return;   /* grow failed (OOM): resumption dropped */
+    if (g_len == g_cap) return;   /* 核心系统底层抽象与内存语义契约 */
     size_t tail = (g_head + g_len) % g_cap;
     g_queue[tail].frame = frame;
     g_queue[tail].step  = step;

@@ -1,14 +1,4 @@
-/* debugger.h -- Integrated debugger for the Zan IDE.
- *
- * Enhanced with:
- *   - Conditional breakpoints (expression-based)
- *   - Hit count breakpoints
- *   - Watch expressions
- *   - Variable inspection with type info
- *   - Call stack with parameter values
- *   - Debug output panel integration
- *   - Logpoint support (breakpoint that only logs)
- */
+/* 语言服务与调试协议交互规范 */
 #ifndef ZAN_DEBUGGER_H
 #define ZAN_DEBUGGER_H
 
@@ -25,20 +15,20 @@ extern "C" {
 #define DBG_MAX_THREADS      64
 #define DBG_MAX_OUTPUT       8192
 
-/* Debugger state machine */
+/* 核心系统底层抽象与内存语义契约 */
 typedef enum {
-    DBG_IDLE,       /* not debugging */
-    DBG_RUNNING,    /* program running */
-    DBG_PAUSED,     /* hit a breakpoint or step complete */
-    DBG_STEPPING,   /* in the middle of a step operation */
-    DBG_TERMINATED  /* program ended */
+    DBG_IDLE,       /* 核心系统底层抽象与内存语义契约 */
+    DBG_RUNNING,    /* 核心系统底层抽象与内存语义契约 */
+    DBG_PAUSED,     /* 核心系统底层抽象与内存语义契约 */
+    DBG_STEPPING,   /* 核心系统底层抽象与内存语义契约 */
+    DBG_TERMINATED  /* 核心系统底层抽象与内存语义契约 */
 } dbg_state_t;
 
-/* Breakpoint type */
+/* 核心系统底层抽象与内存语义契约 */
 typedef enum {
-    BP_NORMAL,      /* always breaks */
-    BP_CONDITIONAL, /* breaks when expression is true */
-    BP_HITCOUNT,    /* breaks after N hits */
+    BP_NORMAL,      /* 核心系统底层抽象与内存语义契约 */
+    BP_CONDITIONAL, /* 核心系统底层抽象与内存语义契约 */
+    BP_HITCOUNT,    /* 核心系统底层抽象与内存语义契约 */
     BP_LOGPOINT     /* doesn't break, logs a message */
 } bp_type_t;
 
@@ -47,31 +37,31 @@ typedef struct {
     char      file[512];
     int       line;             /* 0-based */
     bool      enabled;
-    bool      verified;         /* set once we confirm the BP was placed */
-    int       id;               /* unique breakpoint ID */
+    bool      verified;         /* 底层系统交互与数据协议契约 */
+    int       id;               /* 核心系统底层抽象与内存语义契约 */
 
     bp_type_t type;
-    char      condition[256];   /* expression for conditional BP */
-    int       hit_count_target; /* for hit-count BP */
-    int       hit_count;        /* current hit count */
-    char      log_message[256]; /* for logpoint */
+    char      condition[256];   /* 核心系统底层抽象与内存语义契约 */
+    int       hit_count_target; /* 核心系统底层抽象与内存语义契约 */
+    int       hit_count;        /* 核心系统底层抽象与内存语义契约 */
+    char      log_message[256]; /* 核心系统底层抽象与内存语义契约 */
 } dbg_breakpoint_t;
 
-/* A watch expression */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     char      expression[256];
-    char      value[256];       /* last evaluated value */
-    char      type[64];         /* resolved type */
-    bool      valid;            /* was evaluation successful? */
-    bool      has_children;     /* is it a complex object? */
+    char      value[256];       /* 核心系统底层抽象与内存语义契约 */
+    char      type[64];         /* 核心系统底层抽象与内存语义契约 */
+    bool      valid;            /* 核心系统底层抽象与内存语义契约 */
+    bool      has_children;     /* 核心系统底层抽象与内存语义契约 */
 } dbg_watch_t;
 
-/* A local variable */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     char      name[128];
     char      value[256];
     char      type[64];
-    int       scope;            /* 0 = current scope, 1 = parent, etc. */
+    int       scope;            /* 核心系统底层抽象与内存语义契约 */
     bool      has_children;
 } dbg_local_t;
 
@@ -80,22 +70,22 @@ typedef struct {
     char      name[128];
     char      value[256];
     char      type[128];
-    int       expand_ref;       /* DAP variablesReference when expandable, 0 = leaf */
+    int       expand_ref;       /* 核心系统底层抽象与内存语义契约 */
 } dbg_var_t;
 
-/* Variable-expansion refs above DBG_VARREF_DYN map to gdb varobj names. */
+/* 模块核心语义抽象与接口调用契约 */
 #define DBG_VARREF_DYN      4000
 #define DBG_MAX_VAR_REFS    128
 #define DBG_VAR_NAME_CAP    64
 
-/* A thread of the debuggee, as reported by gdb's -thread-info */
+/* 底层系统交互与数据协议契约 */
 typedef struct {
-    int       id;               /* gdb thread number, used as the DAP id */
-    char      name[128];        /* thread name or gdb target-id */
+    int       id;               /* 底层系统交互与数据协议契约 */
+    char      name[128];        /* 核心系统底层抽象与内存语义契约 */
     bool      running;
 } dbg_thread_t;
 
-/* A call stack frame */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     char      function_name[128];
     char      file[512];
@@ -104,13 +94,13 @@ typedef struct {
     int       frame_id;
 } dbg_frame_t;
 
-/* Debug output entry */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     char      text[512];
     int       category;     /* 0=stdout, 1=stderr, 2=debug, 3=info */
 } dbg_output_entry_t;
 
-/* Main debugger state */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     dbg_state_t     state;
 
@@ -119,42 +109,41 @@ typedef struct {
     int              bp_count;
     int              bp_next_id;
 
-    /* watch expressions */
+    /* 核心系统底层抽象与内存语义契约 */
     dbg_watch_t     watches[DBG_MAX_WATCHES];
     int             watch_count;
 
-    /* current locals */
+    /* 核心系统底层抽象与内存语义契约 */
     dbg_local_t     locals[DBG_MAX_LOCALS];
     int             local_count;
 
-    /* variable expansion: one varobj per local (recreated per stop) plus a
-     * ref table for nested children handed out through DAP references */
+    /* 语言服务与调试协议交互规范 */
     bool            var_created[DBG_MAX_LOCALS];
-    long            var_gen;            /* bumped per stop: varobj name prefix */
+    long            var_gen;            /* 底层系统交互与数据协议契约 */
     char            var_refs[DBG_MAX_VAR_REFS][DBG_VAR_NAME_CAP];
     int             var_ref_count;
 
-    /* threads (refreshed on every stop) */
+    /* 核心系统底层抽象与内存语义契约 */
     dbg_thread_t    threads[DBG_MAX_THREADS];
     int             thread_count;
     int             current_thread;
 
-    /* call stack */
+    /* 核心系统底层抽象与内存语义契约 */
     dbg_frame_t     callstack[DBG_MAX_CALLSTACK];
     int             callstack_depth;
-    int             active_frame;   /* selected frame index */
+    int             active_frame;   /* 核心系统底层抽象与内存语义契约 */
 
-    /* debug output buffer */
+    /* 核心系统底层抽象与内存语义契约 */
     char            output[DBG_MAX_OUTPUT];
     int             output_len;
 
-    /* current stopped location */
+    /* 核心系统底层抽象与内存语义契约 */
     char            current_file[512];
     int             current_line;
     int             current_col;
-    char            stop_reason[128];   /* reason for pause */
+    char            stop_reason[128];   /* 核心系统底层抽象与内存语义契约 */
 
-    /* process information (platform-specific) */
+    /* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
     void           *process_handle;
     void           *thread_handle;
@@ -164,90 +153,75 @@ typedef struct {
     int             child_pid;
 #endif
 
-    /* GDB/MI backend: the real debugger is driven by spawning gdb in machine
-     * interface mode and exchanging MI commands over redirected pipes. */
+    /* 语言服务与调试协议交互规范 */
 #ifdef _WIN32
-    void           *gdb_in_w;   /* HANDLE: write end of gdb's stdin */
-    void           *gdb_out_r;  /* HANDLE: read end of gdb's stdout */
-    void           *gdb_proc;   /* HANDLE: the gdb process */
+    void           *gdb_in_w;   /* 核心系统底层抽象与内存语义契约 */
+    void           *gdb_out_r;  /* 核心系统底层抽象与内存语义契约 */
+    void           *gdb_proc;   /* 核心系统底层抽象与内存语义契约 */
 #else
-    int             gdb_in_fd;  /* write end of gdb's stdin */
-    int             gdb_out_fd; /* read end of gdb's stdout */
+    int             gdb_in_fd;  /* 核心系统底层抽象与内存语义契约 */
+    int             gdb_out_fd; /* 核心系统底层抽象与内存语义契约 */
     int             gdb_pid;
 #endif
-    char            gdb_path[512];  /* resolved gdb executable */
+    char            gdb_path[512];  /* 核心系统底层抽象与内存语义契约 */
     char            program_path[1024];
-    int             mi_token;       /* monotonically increasing MI command token */
-    char            mi_buf[8192];   /* leftover bytes between line reads */
+    int             mi_token;       /* 核心系统底层抽象与内存语义契约 */
+    char            mi_buf[8192];   /* 核心系统底层抽象与内存语义契约 */
     int             mi_buf_len;
     int             last_exit_code;
 
-    /* async interruption: the inferior's pid (from the
-     * =thread-group-started notify) and whether the client asked us to pause
-     * the run — the next *stopped is then reported as a pause, not a signal */
+    /* 语言服务与调试协议交互规范 */
     long            inferior_pid;
     bool            interrupt_requested;
 
-    /* Called (from the stop-wait loop) whenever gdb output goes quiet, so a
-     * single-threaded adapter can service client requests — notably `pause` —
-     * while the target runs. */
+    /* 语言服务与调试协议交互规范 */
     void          (*wait_hook)(void *user);
     void           *wait_hook_user;
 
     /* settings */
-    bool            break_on_entry;     /* pause at program start */
-    bool            break_on_exception; /* pause on unhandled exceptions */
-    bool            break_on_throw;     /* pause on every throw */
-    int             exc_bp_throw;       /* gdb bp number, -1 when unset */
+    bool            break_on_entry;     /* 核心系统底层抽象与内存语义契约 */
+    bool            break_on_exception; /* 核心系统底层抽象与内存语义契约 */
+    bool            break_on_throw;     /* 核心系统底层抽象与内存语义契约 */
+    int             exc_bp_throw;       /* 核心系统底层抽象与内存语义契约 */
     int             exc_bp_unhandled;
-    bool            attached;           /* attached to a running process */
-    bool            skip_stdlib;        /* don't step into stdlib */
+    bool            attached;           /* 核心系统底层抽象与内存语义契约 */
+    bool            skip_stdlib;        /* 核心系统底层抽象与内存语义契约 */
 } debugger_t;
 
-/* Override the gdb executable used by the backend (else it is auto-detected
- * from PATH / bundled toolchain / known install locations). */
+/* 语言服务与调试协议交互规范 */
 void dbg_set_gdb_path(debugger_t *dbg, const char *path);
 
-/* Initialize debugger */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_init(debugger_t *dbg);
 
-/* Start debugging a program */
+/* 核心系统底层抽象与内存语义契约 */
 bool dbg_start(debugger_t *dbg, const char *program, const char *args);
 
-/* Attach to an already running process. `program` supplies the symbols and
- * may be "" when gdb can read them from the process itself. */
+/* 语言服务与调试协议交互规范 */
 bool dbg_attach(debugger_t *dbg, const char *program, int pid);
 
-/* Break when an exception is thrown and/or when one goes unhandled. The
- * compiler emits __zan_eh_throw / __zan_eh_unhandled hooks for `zanc -g`,
- * and these are breakpoints on them. Returns the number that were placed. */
+/* 语言服务与调试协议交互规范 */
 int dbg_set_exception_breakpoints(debugger_t *dbg, bool on_throw, bool on_unhandled);
 
-/* Refresh the thread list from gdb. */
+/* 底层系统交互与数据协议契约 */
 void dbg_refresh_threads(debugger_t *dbg);
 
-/* Make `thread_id` the thread whose stack and locals are reported. */
+/* 模块核心语义抽象与接口调用契约 */
 bool dbg_select_thread(debugger_t *dbg, int thread_id);
 
-/* Stop debugging (terminate the program) */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_stop(debugger_t *dbg);
 
-/* Continue execution */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_continue(debugger_t *dbg);
 
-/* Register a callback invoked from the stop-wait loop whenever gdb output
- * goes quiet. The adapter uses it to read pending client requests (a `pause`
- * while the target runs) without a second thread. */
+/* 语言服务与调试协议交互规范 */
 void dbg_set_wait_hook(debugger_t *dbg, void (*fn)(void *user), void *user);
 
-/* Interrupt the running inferior (DebugBreakProcess on Windows, SIGINT on
- * POSIX). Returns true when the interrupt was actually requested — the stop
- * then arrives as a normal *stopped record and is reported with the DAP
- * reason "pause". */
+/* 语言服务与调试协议交互规范 */
 bool dbg_interrupt(debugger_t *dbg);
 
-/* Wait synchronously for the running target to stop and refresh the paused
- * view (threads, stack, locals, watches). No-op when not running. */
+/* 语言服务与调试协议交互规范 */
 void dbg_wait_stop(debugger_t *dbg);
 
 /* Stepping */
@@ -258,19 +232,19 @@ void dbg_step_out(debugger_t *dbg);
 /* Run to cursor */
 void dbg_run_to_cursor(debugger_t *dbg, const char *file, int line);
 
-/* --- Breakpoint management --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Add a simple breakpoint. Returns breakpoint ID or -1. */
+/* 核心系统底层抽象与内存语义契约 */
 int dbg_add_breakpoint(debugger_t *dbg, const char *file, int line);
 
-/* Add a conditional breakpoint */
+/* 核心系统底层抽象与内存语义契约 */
 int dbg_add_conditional_bp(debugger_t *dbg, const char *file, int line,
                            const char *condition);
 
-/* Add a hit-count breakpoint */
+/* 核心系统底层抽象与内存语义契约 */
 int dbg_add_hitcount_bp(debugger_t *dbg, const char *file, int line, int count);
 
-/* Add a logpoint (breakpoint that logs but doesn't stop) */
+/* 模块核心语义抽象与接口调用契约 */
 int dbg_add_logpoint(debugger_t *dbg, const char *file, int line,
                      const char *message);
 
@@ -280,7 +254,7 @@ bool dbg_remove_breakpoint(debugger_t *dbg, int bp_id);
 /* Remove a breakpoint by location */
 bool dbg_remove_breakpoint_at(debugger_t *dbg, const char *file, int line);
 
-/* Toggle breakpoint at location */
+/* 核心系统底层抽象与内存语义契约 */
 int dbg_toggle_breakpoint(debugger_t *dbg, const char *file, int line);
 
 /* Enable/disable a breakpoint */
@@ -289,65 +263,63 @@ void dbg_enable_breakpoint(debugger_t *dbg, int bp_id, bool enabled);
 /* Edit a breakpoint's condition */
 void dbg_set_bp_condition(debugger_t *dbg, int bp_id, const char *condition);
 
-/* Check if line has a breakpoint */
+/* 核心系统底层抽象与内存语义契约 */
 bool dbg_has_breakpoint(debugger_t *dbg, const char *file, int line);
 
-/* Get breakpoint at location (NULL if none) */
+/* 核心系统底层抽象与内存语义契约 */
 dbg_breakpoint_t *dbg_get_breakpoint_at(debugger_t *dbg, const char *file, int line);
 
-/* --- Watch expressions --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Add a watch expression */
+/* 核心系统底层抽象与内存语义契约 */
 int dbg_add_watch(debugger_t *dbg, const char *expression);
 
-/* Remove a watch expression by index */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_remove_watch(debugger_t *dbg, int index);
 
-/* Edit a watch expression */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_edit_watch(debugger_t *dbg, int index, const char *new_expression);
 
-/* Evaluate all watch expressions (called when paused) */
+/* 底层系统交互与数据协议契约 */
 void dbg_evaluate_watches(debugger_t *dbg);
 
-/* Evaluate a single expression and return value as string */
+/* 底层系统交互与数据协议契约 */
 bool dbg_evaluate(debugger_t *dbg, const char *expression, char *result, int result_size);
 
-/* --- Locals and Call Stack --- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* Refresh local variables for current frame */
+/* 底层系统交互与数据协议契约 */
 void dbg_refresh_locals(debugger_t *dbg);
 
-/* Does a gdb-reported type string describe something with fields? */
+/* 模块核心语义抽象与接口调用契约 */
 bool dbg_type_expandable(const char *ty);
 
-/* Expand the children of local `ref - 3000` (the locals list references), or
- * of a nested node handed out earlier as `ref >= DBG_VARREF_DYN`. Returns the
- * child count (<= cap), 0 when the node has nothing to show. */
+/* 语言服务与调试协议交互规范 */
 int dbg_expand_variables(debugger_t *dbg, int ref, dbg_var_t *out, int cap);
 
-/* Refresh call stack */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_refresh_callstack(debugger_t *dbg);
 
-/* Select a different stack frame (updates locals) */
+/* 底层系统交互与数据协议契约 */
 void dbg_select_frame(debugger_t *dbg, int frame_index);
 
 /* --- Output --- */
 
-/* Append text to debug output */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_append_output(debugger_t *dbg, const char *text);
 
-/* Clear debug output */
+/* 核心系统底层抽象与内存语义契约 */
 void dbg_clear_output(debugger_t *dbg);
 
 /* --- Utility --- */
 
-/* Check if debugger is paused at specific file:line */
+/* 底层系统交互与数据协议契约 */
 bool dbg_is_current_line(debugger_t *dbg, const char *file, int line);
 
-/* Set value of a variable (in current scope) */
+/* 核心系统底层抽象与内存语义契约 */
 bool dbg_set_variable(debugger_t *dbg, const char *name, const char *value);
 
-/* Get exception info if stopped on exception */
+/* 核心系统底层抽象与内存语义契约 */
 bool dbg_get_exception_info(debugger_t *dbg, char *info, int info_size);
 
 #ifdef __cplusplus

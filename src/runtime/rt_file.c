@@ -1,14 +1,4 @@
-/* rt_file.c -- file metadata + FILE*-stream IO helpers (System.IO.FileInfo,
- * System.IO.FileStream).
- *
- * Split out of rt_sync.c so that file IO does not drag the atomics/threads/
- * shared-table runtime into a program that only touches files: zanc links
- * this object on `uses_file_runtime` (zan_file_* externs) and rt_sync.o only
- * on `uses_sync_runtime` (zan_atomic_int_*, zan_shared_table_*, zan_thread_*,
- * ...). That separation is what lets a wasm32 (WASI) cross-build link a
- * file-IO program against plain libc -- wasm has no pthread/shm, so rt_sync.c
- * cannot be built for it, while this file is pure libc + a single mutex.
- */
+/* 内部辅助实现 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601
@@ -16,15 +6,12 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
-/* O_NOFOLLOW/O_CLOEXEC are GNU extensions; glibc gates them on
- * _DEFAULT_SOURCE. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
 
-/* flock(2) is a BSD extension, and the cross builds compile this with
- * -std=c11 (so __STRICT_ANSI__): the Darwin and musl headers hide it unless
- * their BSD flavour is asked for, before any system header is pulled in. */
+/* 内部辅助逻辑 */
 #if !defined(_WIN32) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE 1
 #endif
@@ -44,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifndef __wasm__
@@ -61,8 +49,7 @@
 #define O_CLOEXEC 0
 #endif
 
-/* Zan strings are UTF-8. Windows narrow CRT paths follow the active ANSI code
- * page, so every public File path enters through this conversion boundary. */
+/* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
 static wchar_t *zan_win_utf8_to_wide(const char *text) {
     if (!text) return NULL;
@@ -118,15 +105,9 @@ int zan_file_rename(const char *source, const char *dest) {
 #endif
 }
 
-/* --- File metadata -------------------------------------------------------
- *
- * The standard library had whole-file text IO and nothing else, so nothing
- * could ask when a file last changed -- which is what incremental builds and
- * hot reload are made of. These report Unix seconds (0 when the file does not
- * exist) and the DOS/Unix attribute bits behind System.IO.FileInfo.
- */
+/* 内部辅助实现 */
 
-/* 0 = last write, 1 = creation, 2 = last access. */
+/* 核心系统底层抽象与内存语义契约 */
 long long zan_file_time(const char *path, int which) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
@@ -142,7 +123,7 @@ long long zan_file_time(const char *path, int which) {
     unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32)
                          | (unsigned long long)ft.dwLowDateTime;
     if (t == 0) return 0;
-    /* 100 ns ticks since 1601 -> seconds since 1970 */
+    /* 核心系统底层抽象与内存语义契约 */
     return (long long)(t / 10000000ULL) - 11644473600LL;
 #else
     struct stat st;
@@ -153,7 +134,7 @@ long long zan_file_time(const char *path, int which) {
 #endif
 }
 
-/* Size in bytes, or -1 when the path does not exist. */
+/* 模块核心语义抽象与接口调用契约 */
 long long zan_file_length(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
@@ -172,46 +153,13 @@ long long zan_file_length(const char *path) {
 #endif
 }
 
-/* Bundled read-only resources: a program's data (config/, views/, wwwroot/,
- * assets/) ships next to its executable, but a relative path only resolves
- * against the WORKING directory -- which is the launcher's directory for a
- * single-file package, and whatever directory a service manager, a shortcut or
- * a shell happened to start the program in otherwise. A published program then
- * silently falls back to its built-in defaults because "config/app.json" was
- * looked up somewhere it was never installed.
- *
- * So a relative READ that misses in the working directory is retried against,
- * in order:
- *   0. ZAN_PKG_DIR -- where a single-file launcher unpacked the payload,
- *   1. the executable's own directory (ZAN_APP_DIR when a launcher exported
- *      it, so the fallback is the installed program's directory rather than
- *      the per-user extraction cache).
- *
- * Writes never take this path: a program that creates `save/state.json` must
- * create it next to itself, not inside a cache the next publish replaces. */
+/* 内部辅助实现 */
 
-/* The directory the running executable lives in ("" when it cannot be
- * determined), cached after the first call.
- *
- * Workers call this concurrently (every relative-read fallback resolves
- * through it), so the naive `static int resolved` was a race: thread B could
- * observe resolved==1 while thread A was still mid-copy into `dir`, and read
- * a half-written path. The flag is now a store-release / load-acquire pair:
- * B either sees the flag clear and resolves on its own thread (double work,
- * never a torn read -- `dir` is only read once the flag is acquired), or
- * sees it set together with the complete copy. Resolving twice yields the
- * same bytes (GetModuleFileNameA is stable for a running exe), so both
- * writers produce identical content.
- *
- * stdatomic.h cannot be used here: MSVC's C11 mode gates C11 atomics behind
- * an /experimental flag this project does not set. The same handshake is
- * spelled with Interlocked* (the runtime's usual idiom, also what rt_sync.c
- * uses) on Windows and __atomic_* builtins elsewhere; wasm is single-threaded
- * and keeps plain accesses. */
+/* 内部辅助逻辑 */
 #if defined(_WIN32)
 static volatile LONG g_appdir_resolved;
 #elif defined(__wasm__)
-static int g_appdir_resolved;   /* single-threaded target */
+static int g_appdir_resolved;   /* 核心系统底层抽象与内存语义契约 */
 #else
 static volatile int g_appdir_resolved;
 #endif
@@ -219,17 +167,41 @@ static volatile int g_appdir_resolved;
 const char *zan_file_app_dir(void) {
     static char dir[4096];
 #if defined(_WIN32)
-    if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 0, 0)) return dir;
+    for (;;) {
+        if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 0, 0) == 1)
+            return dir;
+        if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 2, 0) == 0)
+            break;                      /* 核心系统底层抽象与内存语义契约 */
+        SwitchToThread();               /* 核心系统底层抽象与内存语义契约 */
+    }
 #elif defined(__wasm__)
     if (g_appdir_resolved) return dir;
 #else
-    if (__atomic_load_n(&g_appdir_resolved, __ATOMIC_ACQUIRE)) return dir;
+    for (;;) {
+        if (__atomic_load_n(&g_appdir_resolved, __ATOMIC_ACQUIRE) == 1)
+            return dir;
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&g_appdir_resolved, &expected, 2, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            break;                      /* 核心系统底层抽象与内存语义契约 */
+        sched_yield();                  /* 核心系统底层抽象与内存语义契约 */
+    }
 #endif
     const char *env = getenv("ZAN_APP_DIR");
     char local[4096];
     local[0] = '\0';
-    if (env && env[0] && strlen(env) < sizeof(local)) {
-        memcpy(local, env, strlen(env) + 1);
+    if (env && env[0]) {
+        size_t n = strlen(env);
+        if (n < sizeof(local)) {
+            memcpy(local, env, n + 1);
+        } else {
+            /* 内部辅助逻辑 */
+            fprintf(stderr,
+                    "zan: ZAN_APP_DIR too long (%zu bytes, limit %zu) -- "
+                    "falling back to the executable directory\n",
+                    n, sizeof(local) - 1);
+            fflush(stderr);
+        }
     } else {
         char exe[4096];
         exe[0] = 0;
@@ -255,11 +227,10 @@ const char *zan_file_app_dir(void) {
             }
         }
     }
-    /* only the winning writer publishes; latecomers overwrite with identical
-     * bytes, so a reader can never observe a torn or mixed path */
+    /* 内部辅助逻辑 */
     memcpy(dir, local, strlen(local) + 1);
 #if defined(_WIN32)
-    InterlockedCompareExchangeRelease(&g_appdir_resolved, 1, 0);
+    InterlockedCompareExchangeRelease(&g_appdir_resolved, 1, 2);
 #elif defined(__wasm__)
     g_appdir_resolved = 1;
 #else
@@ -268,8 +239,7 @@ const char *zan_file_app_dir(void) {
     return dir;
 }
 
-/* `<base>/<path>` for candidate `which` (0 payload, 1 executable directory),
- * or NULL when that base is unknown or `path` is not relative. */
+/* 内部辅助逻辑 */
 static const char *zan_alt_path(const char *path, int which, char *out,
                                 size_t cap) {
     if (!path || !path[0]) return NULL;
@@ -287,21 +257,13 @@ static const char *zan_alt_path(const char *path, int which, char *out,
 
 #define ZAN_ALT_BASES 2
 
-/* Bit 0 read-only, bit 1 hidden, bit 2 directory; -1 when missing. */
+/* 模块核心语义抽象与接口调用契约 */
 static long long zan_file_attributes_at(const char *path);
 
-/* The bundled copy of a relative read path that is missing in the working
- * directory, or "" when there is no better candidate. Directory listings
- * (System.IO.Directory) resolve through this, so a published program finds its
- * views/ and wwwroot/ the same way File does.
- *
- * Never returns its own argument: a managed Zan string handed back as the
- * return value would be released once more than it was retained. */
+/* 内部辅助实现 */
 const char *zan_file_read_path(const char *path) {
     if (zan_file_attributes_at(path) >= 0) return "";
-    /* Thread-local, not a plain static: workers call this concurrently and a
-     * shared buffer would let one thread overwrite the path another is still
-     * returning to its caller (see the same pattern in rt_io.c / rt_sync.c). */
+    /* 内部辅助逻辑 */
     static _Thread_local char alt[4096];
     for (int which = 0; which < ZAN_ALT_BASES; which++) {
         const char *p = zan_alt_path(path, which, alt, sizeof(alt));
@@ -310,9 +272,7 @@ const char *zan_file_read_path(const char *path) {
     return "";
 }
 
-/* fopen() that falls back to the bundled copies for reads (see zan_file_read_path).
- * The stdlib's read paths import this instead of fopen so a published or
- * packaged program finds its resources whatever directory it was started in. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 void *zan_pkg_fopen(const char *path, const char *mode) {
     FILE *f = (FILE *)zan_file_fopen(path, mode);
     if (f) return f;
@@ -341,7 +301,6 @@ long long zan_file_attributes(const char *path) {
     return -1;
 }
 
-
 static long long zan_file_attributes_at(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
@@ -369,13 +328,7 @@ static long long zan_file_attributes_at(const char *path) {
 }
 
 #ifndef _WIN32
-/* POSIX: resolve `path` to a descriptor once, then operate on the fd. This
- * closes the TOCTOU window between stat()-ing a path and chmod/utimens-ing
- * it (a swapped path now acts on the file actually opened), and O_NOFOLLOW
- * refuses to reach a target through a symlink (a symlink chain is ELOOP).
- * O_RDONLY opens files and directories on every POSIX; O_PATH (Linux) is the
- * fallback for read-protected targets where O_RDONLY would fail EACCES.
- * Returns the fd, or -1 with errno set on failure. */
+/* 模块核心语义抽象与接口调用契约 */
 static int zan_posix_open_nofollow(const char *path) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 #if defined(O_PATH)
@@ -387,7 +340,7 @@ static int zan_posix_open_nofollow(const char *path) {
 }
 #endif
 
-/* Marks the file read-only (`on`) or writable. Returns 1 on success. */
+/* 底层系统交互与数据协议契约 */
 long long zan_file_set_readonly(const char *path, int on) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
@@ -402,14 +355,14 @@ long long zan_file_set_readonly(const char *path, int on) {
     return ok;
 #else
     int fd = zan_posix_open_nofollow(path);
-    if (fd < 0) return 0;   /* missing, ELOOP symlink, EACCES, ... */
+    if (fd < 0) return 0;   /* 核心系统底层抽象与内存语义契约 */
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return 0; }
     mode_t m = st.st_mode;
     if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
     else    m |= S_IWUSR;
 #if defined(__wasi__)
-    /* WASI has no fchmod; report unsupported so callers degrade. */
+    /* 底层系统交互与数据协议契约 */
     int ok = 0;
 #else
     int ok = fchmod(fd, m) == 0 ? 1 : 0;
@@ -419,10 +372,7 @@ long long zan_file_set_readonly(const char *path, int on) {
 #endif
 }
 
-/* Sets one file timestamp to a Unix timestamp. `which` matches zan_file_time:
- * 0 = last write, 1 = creation (best-effort), 2 = last access. Returns 1 on
- * success. Creation time is only settable on Windows; elsewhere it is a no-op
- * that returns 0 so callers can degrade gracefully. */
+/* 底层系统交互与数据协议契约 */
 long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     if (!path || !path[0]) return 0;
     if (which != 0 && which != 1 && which != 2) return 0;
@@ -434,7 +384,7 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     free(wide_path);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    /* Unix seconds since 1970 -> 100ns ticks since 1601. */
+    /* 核心系统底层抽象与内存语义契约 */
     unsigned long long ticks = (unsigned long long)(unix_sec + 11644473600LL)
                              * 10000000ULL;
     FILETIME ft;
@@ -447,7 +397,7 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     CloseHandle(h);
     return ok ? 1 : 0;
 #else
-    if (which == 1) return 0;   /* creation time: not settable on POSIX */
+    if (which == 1) return 0;   /* 核心系统底层抽象与内存语义契约 */
     int fd = zan_posix_open_nofollow(path);
     if (fd < 0) return 0;
     struct stat st;
@@ -464,38 +414,17 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
 #endif
 }
 
-/* ---- file handles (System.IO.FileStream) ---------------------------------
- * FILE*-based stream IO with 64-bit offsets, exposed as an opaque 64-bit
- * handle so zan code never spells FILE* (its size and the width of fseek's
- * offset both vary by platform). Handles are unforgeable: a handle is
- * (gen << 32) | index into a growable table of { FILE*, gen, open } slots,
- * and every operation first checks the index range, the generation and the
- * open flag under a mutex. A fabricated integer, a stale handle from a closed
- * slot, or a double close no longer reaches fread/fclose on a bogus FILE*.
- * A handle is 0 when the open failed; every other call treats 0 (and every
- * other invalid handle) as a no-op so a failed open cannot corrupt memory.
- * Table access is serialized; the captured FILE* is used outside the lock so
- * blocking I/O never holds it.
- *
- * Because the FILE* is used outside the lock, resolving it is not enough:
- * every operation therefore *pins* its slot under the lock (inuse++),
- * so Close hands the FILE* to the slot's `dying` field instead of closing it,
- * and the last unpin performs the fclose. A slot with a dying FILE* is not
- * claimable by a new open until then.
- */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* The table starts at ZAN_FH_CAP0 slots and doubles on demand up to
- * ZAN_FH_CAP_MAX, so a program pays for the slots it has actually used
- * instead of pinning 16 KB of bss for a fixed 1024. */
+/* 内部辅助逻辑 */
 #define ZAN_FH_CAP0 64
 #define ZAN_FH_CAP_MAX (1024 * 1024)
 typedef struct {
     FILE *fp;
-    uint32_t gen;   /* bumped on every close; stale handles stop matching */
+    uint32_t gen;   /* 底层系统交互与数据协议契约 */
     int open;
-    int inuse;      /* operations that pinned `fp` for use outside the lock */
-    FILE *dying;    /* a closed fp still pinned by an in-flight operation;
-                     * fclose'd by the last unpin */
+    int inuse;      /* 模块核心语义抽象与接口调用契约 */
+    FILE *dying;    /* 模块核心语义抽象与接口调用契约 */
 } zan_fh_slot;
 static zan_fh_slot *g_fh_table = NULL;
 static uint32_t g_fh_cap = 0;
@@ -503,15 +432,11 @@ static uint32_t g_fh_cap = 0;
 static void zan_fh_ensure(void) {
     if (g_fh_table) return;
     g_fh_table = (zan_fh_slot *)calloc(ZAN_FH_CAP0, sizeof(*g_fh_table));
-    if (!g_fh_table) return;  /* without a table every handle resolves forged */
+    if (!g_fh_table) return;  /* 底层系统交互与数据协议契约 */
     g_fh_cap = ZAN_FH_CAP0;
 }
 
-/* Double the table, called under the lock only when every slot is open. The
- * calloc'ed tail reads as closed slots with generation 0, and the claim path
- * below bumps a 0 generation to 1, so a claimed slot's handle never reads as
- * the 0 error sentinel. Returns 0 at the ceiling or when the allocation
- * fails -- the same "table full" answer a full fixed table gave. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_fh_grow(void) {
     uint32_t ncap;
     zan_fh_slot *ntab;
@@ -528,9 +453,7 @@ static int zan_fh_grow(void) {
 }
 
 #ifdef _WIN32
-/* Same lazy-init discipline as the runtime's other tables: INIT_ONCE runs the
- * critical-section constructor exactly once, so two threads opening files for
- * the first time cannot race the table's first use. */
+/* 内部辅助逻辑 */
 static CRITICAL_SECTION g_fh_cs;
 static INIT_ONCE g_fh_once = INIT_ONCE_STATIC_INIT;
 
@@ -546,8 +469,7 @@ static void zan_fh_lock(void) {
 }
 static void zan_fh_unlock(void) { LeaveCriticalSection(&g_fh_cs); }
 #elif defined(__wasm__)
-/* Single-threaded wasm (WASI): the sysroot has no pthreads, and none are
- * needed -- one thread cannot race the handle table. */
+/* 内部辅助逻辑 */
 static void zan_fh_lock(void) {}
 static void zan_fh_unlock(void) {}
 #else
@@ -556,9 +478,7 @@ static void zan_fh_lock(void) { pthread_mutex_lock(&g_fh_mx); }
 static void zan_fh_unlock(void) { pthread_mutex_unlock(&g_fh_mx); }
 #endif
 
-/* Resolve `handle` to the table slot of a live open file, or -1 when the
- * handle is forged: index out of range, wrong generation, or a closed slot.
- * Call under the table lock. */
+/* 内部辅助逻辑 */
 static long zan_fh_index(long long handle) {
     unsigned long long h = (unsigned long long)handle;
     uint32_t idx = (uint32_t)(h & 0xFFFFFFFFULL);
@@ -569,9 +489,7 @@ static long zan_fh_index(long long handle) {
     return (long)idx;
 }
 
-/* Resolve `handle` and pin its slot so the FILE* stays valid while the caller
- * uses it outside the lock. *idx_out receives the slot index to unpin, or -1.
- * Call from the same thread that will unpin. */
+/* 内部辅助逻辑 */
 static FILE *zan_fh_pin(long long handle, long *idx_out) {
     zan_fh_lock();
     zan_fh_ensure();
@@ -586,9 +504,7 @@ static FILE *zan_fh_pin(long long handle, long *idx_out) {
     return f;
 }
 
-/* Drop a pin. The last pin on a slot whose handle was closed performs the
- * deferred fclose, so the FILE* is never freed under an in-flight user. Call
- * without the lock. */
+/* Drop a pin */
 static void zan_fh_unpin(long idx) {
     FILE *dying = NULL;
     if (idx < 0) return;
@@ -604,7 +520,7 @@ static void zan_fh_unpin(long idx) {
     if (dying) fclose(dying);
 }
 
-/* `mode` is a stdio mode string ("rb", "wb", "r+b", "ab", ...). */
+/* 核心系统底层抽象与内存语义契约 */
 long long zan_file_open(const char *path, const char *mode) {
     if (!path || !path[0] || !mode || !mode[0]) return 0;
     FILE *f = (FILE *)zan_file_fopen(path, mode);
@@ -617,17 +533,12 @@ long long zan_file_open(const char *path, const char *mode) {
             uint32_t i = 0;
             while (i < g_fh_cap) {
                 zan_fh_slot *s = &g_fh_table[i];
-                /* A slot holding a dying FILE* (a closed handle an operation
-                 * is still using) must not be claimed: the fclose still has
-                 * to happen and its reader still holds the old handle.
-                 * Likewise, a slot whose generation wrapped to UINT32_MAX
-                 * is retired to prevent reviving old handle copies. */
+                /* 内部辅助实现 */
                 if (!s->open && !s->dying && s->gen != UINT32_MAX) {
-                    if (s->gen == 0) { s->gen = 1; }   /* keep slot 0's handle nonzero */
+                    if (s->gen == 0) { s->gen = 1; }   /* 核心系统底层抽象与内存语义契约 */
                     s->fp = f;
                     s->open = 1;
-                    /* build in unsigned to avoid signed-shift UB when gen's high bit
-                     * is set (a long long is bit-preserving on the Zan side) */
+                    /* 内部辅助逻辑 */
                     handle = (long long)(((unsigned long long)s->gen << 32)
                                          | (unsigned long long)i);
                     break;
@@ -635,11 +546,11 @@ long long zan_file_open(const char *path, const char *mode) {
                 i = i + 1;
             }
             if (i < g_fh_cap) break;    /* claimed a slot */
-            if (!zan_fh_grow()) break;  /* ceiling or OOM: report "table full" */
+            if (!zan_fh_grow()) break;  /* 核心系统底层抽象与内存语义契约 */
         }
     }
     zan_fh_unlock();
-    if (handle == 0) { fclose(f); return 0; }  /* table full: fail gracefully */
+    if (handle == 0) { fclose(f); return 0; }  /* 核心系统底层抽象与内存语义契约 */
     return handle;
 }
 
@@ -663,8 +574,7 @@ long long zan_file_write(long long handle, long long buf, long long count) {
     return n;
 }
 
-/* `origin`: 0 = begin, 1 = current, 2 = end. Returns the new absolute
- * position, or -1 on failure. */
+/* `origin`: 0 = begin, 1 = current, 2 = end */
 long long zan_file_seek(long long handle, long long offset, int origin) {
     long idx;
     FILE *f = zan_fh_pin(handle, &idx);
@@ -712,9 +622,7 @@ long long zan_file_close(long long handle) {
         zan_fh_slot *s = &g_fh_table[idx];
         s->open = 0;
         if (s->inuse > 0) {
-            /* An operation is using this FILE* outside the lock: closing it
-             * now would be a use-after-free for that reader. Hand it
-             * to `dying`; the last unpin fclose's it. */
+            /* 内部辅助逻辑 */
             s->dying = s->fp;
             s->fp = NULL;
             deferred = 1;
@@ -722,21 +630,17 @@ long long zan_file_close(long long handle) {
             f = s->fp;
             s->fp = NULL;
         }
-        /* Invalidate every outstanding copy of the handle -- except at
-         * generation wrap: resetting to 1 there would revalidate surviving
-         * handles from the previous cycle, because zan_file_open reuses
-         * closed slots without bumping. Leave gen at its max and open at 0:
-         * the slot retires (once per 2^32 closes of one slot). */
+        /* 内部辅助实现 */
         uint32_t next_gen = (uint32_t)(s->gen + 1);
         if (next_gen != 0) s->gen = next_gen;
     }
     zan_fh_unlock();
-    if (deferred) return 1;   /* closed; the FILE* is freed when the pin drops */
-    if (!f) return 0;         /* unknown or already-closed handle */
+    if (deferred) return 1;   /* 模块核心语义抽象与接口调用契约 */
+    if (!f) return 0;         /* 核心系统底层抽象与内存语义契约 */
     return fclose(f) == 0 ? 1 : 0;
 }
 
-/* 1 once a read hit end-of-file on this handle. */
+/* 底层系统交互与数据协议契约 */
 long long zan_file_eof(long long handle) {
     long idx;
     FILE *f = zan_fh_pin(handle, &idx);
@@ -746,14 +650,7 @@ long long zan_file_eof(long long handle) {
     return e;
 }
 
-/* ---- whole-file locks (System.IO.File.TryLock) ---------------------------
- * A lock nobody has to clean up: it lives in an open OS handle, so the kernel
- * releases it when the process exits -- including when it is killed. That is
- * what makes it usable for "which copy of this program owns which data
- * directory": a crashed instance leaves no stale marker behind, unlike a pid
- * file. Non-blocking: taken or refused, never waits.
- * Handles are slots in a small table so zan code never holds a raw HANDLE/fd,
- * matching the file-stream table above. */
+/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_LK_CAP 32
 typedef struct {
@@ -763,14 +660,11 @@ typedef struct {
     int fd;
 #endif
     int used;
-    uint32_t gen;   /* stale-handle defence, same scheme as the stream table */
+    uint32_t gen;   /* 模块核心语义抽象与接口调用契约 */
 } zan_lk_slot;
 static zan_lk_slot g_lk_table[ZAN_LK_CAP];
 
-/* Handles encode (gen << 32) | slot. Without the generation, the sequence
- * "take lock -> release -> anyone retakes -> a delayed duplicate unlock of
- * the FIRST handle" closed the SECOND holder's active OS lock; the generation
- * makes the stale copy simply fail. */
+/* 核心系统底层抽象与内存语义契约 */
 static long zan_lk_index(long long handle) {
     if (handle <= 0) return -1;
     unsigned long long h = (unsigned long long)handle;
@@ -781,25 +675,19 @@ static long zan_lk_index(long long handle) {
     return (long)slot;
 }
 
-/* Takes an exclusive lock on `path` (created when missing). Returns a handle,
- * or 0 when another process holds it or the path is unusable. */
+/* 底层系统交互与数据协议契约 */
 long long zan_file_try_lock(const char *path) {
     if (!path || !path[0]) return 0;
 #if defined(__wasm__)
     (void)path;
-    return 0;               /* no processes to contend with */
+    return 0;               /* 核心系统底层抽象与内存语义契约 */
 #else
-    zan_fh_lock();          /* the table lock is shared with the stream table */
+    zan_fh_lock();          /* 模块核心语义抽象与接口调用契约 */
     long slot = -1;
     for (long i = 0; i < ZAN_LK_CAP; i++) {
         if (!g_lk_table[i].used) {
             slot = i;
-            /* Reserve the slot INSIDE this critical section. Picking it
-             * unlocked and registering later let two threads of this process
-             * choose the same free slot; the second registration then
-             * overwrites the first's OS handle -- leaked as an exclusive
-             * sharing-0 lock until process exit -- and bumps the generation
-             * out from under the first caller's just-minted handle. */
+            /* 底层系统交互与数据协议契约 */
             g_lk_table[slot].used = 1;
             break;
         }
@@ -824,12 +712,7 @@ long long zan_file_try_lock(const char *path) {
 #else
     g_lk_table[slot].fd = fd;
 #endif
-    /* New generation: every outstanding copy of this slot's previous handle
-     * stops matching, so a late unlock cannot release somebody else's lock.
-     * At wrap, retire instead of resetting to 1: a reset would validate a
-     * surviving handle minted 2^32 locks ago against this cycle. Refusing
-     * one attempt per slot per four billion locks is the cheap side of that
-     * trade. */
+    /* 内部辅助实现 */
     uint32_t next_gen = (uint32_t)(g_lk_table[slot].gen + 1);
     if (next_gen == 0) {
 #ifdef _WIN32
@@ -837,12 +720,12 @@ long long zan_file_try_lock(const char *path) {
 #else
         g_lk_table[slot].fd = -1;
 #endif
-        g_lk_table[slot].used = 2;          /* retired: index rejects it */
+        g_lk_table[slot].used = 2;          /* 核心系统底层抽象与内存语义契约 */
         zan_fh_unlock();
 #ifdef _WIN32
         CloseHandle(h);
 #else
-        close(fd);              /* drops nothing; flock was not taken yet */
+        close(fd);              /* 底层系统交互与数据协议契约 */
 #endif
         return 0;
     }
@@ -855,13 +738,13 @@ long long zan_file_try_lock(const char *path) {
 
 fail_reserve:
     zan_fh_lock();
-    g_lk_table[slot].used = 0;   /* give the reserved slot back */
+    g_lk_table[slot].used = 0;   /* 核心系统底层抽象与内存语义契约 */
     zan_fh_unlock();
     return 0;
 #endif /* !__wasm__ */
 }
 
-/* Releases a lock from zan_file_try_lock. Returns 1 when a lock was held. */
+/* 底层系统交互与数据协议契约 */
 long long zan_file_unlock(long long handle) {
     zan_fh_lock();
     long slot = zan_lk_index(handle);
@@ -878,21 +761,16 @@ long long zan_file_unlock(long long handle) {
     s->fd = -1;
 #endif
     s->used = 0;
-    s->gen = s->gen + 1;   /* a second unlock of the same value now fails */
+    s->gen = s->gen + 1;   /* 底层系统交互与数据协议契约 */
     if (s->gen == 0) {
-        /* Same wrap policy as try_lock: a reset to 1 would
-         * revalidate a surviving handle minted 2^32 locks ago. Retire the
-         * slot instead -- used=2 makes zan_lk_index reject it and the
-         * reserve scan skip it, exactly like try_lock's own wrap path.
-         * One slot retired per 2^32 unlocks is the cheap side of that
-         * trade. */
+        /* 内部辅助逻辑 */
         s->used = 2;
     }
     zan_fh_unlock();
 #ifdef _WIN32
     CloseHandle(h);
 #else
-    close(fd);              /* drops the flock */
+    close(fd);              /* 核心系统底层抽象与内存语义契约 */
 #endif
     return 1;
 }

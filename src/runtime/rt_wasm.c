@@ -21,6 +21,6 @@ int pthread_mutex_destroy(void *m) { (void)m; return 0; }
 
 void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
 
-/* The async guard's arm (irgen_builtins */
+/* 底层系统交互与数据协议契约 */
 __attribute__((returns_twice))
 int setjmp(void *env) { (void)env; return 0; }

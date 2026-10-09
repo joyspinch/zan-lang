@@ -1,4 +1,4 @@
-/* diag.c -- Diagnostic reporting implementation. */
+/* 核心系统底层抽象与内存语义契约 */
 
 #include "diag.h"
 #include "arena.h"
@@ -59,7 +59,7 @@ void zan_diag_add_file(zan_diag_t *diag, const char *name, const char *source) {
     diag->file_count = new_count;
 }
 
-/* find the line containing `offset` in `source` and return its start */
+/* 底层系统交互与数据协议契约 */
 static const char *find_line_start(const char *source, uint32_t offset) {
     const char *p = source + offset;
     while (p > source && p[-1] != '\n') p--;
@@ -159,8 +159,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
             diag->dup_line_notice_shown = false;
         }
         if (++diag->dup_line_errors > ZAN_DIAG_MAX_ERRORS_PER_LINE) {
-            /* Same reasoning as the global cap: record the drop and report it
-             * once per line. */
+            /* 底层系统交互与数据协议契约 */
             diag->dup_line_suppressed++;
             if (!diag->dup_line_notice_shown && !diag->capture) {
                 diag->dup_line_notice_shown = true;
@@ -173,7 +172,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
         }
     }
 
-    /* structured capture path: store and skip stderr rendering */
+    /* 底层系统交互与数据协议契约 */
     if (diag->capture) {
         zan_diag_entry_t *e = diag_capture_entry(diag, level, loc);
         if (e) snprintf(e->message, sizeof(e->message), "%s", msgbuf);
@@ -203,8 +202,7 @@ void zan_diag_emit(zan_diag_t *diag, zan_diag_level_t level, zan_loc_t loc,
         if (source && loc.offset < strlen(source)) {
             const char *line_start = find_line_start(source, loc.offset);
             int line_len = find_line_len(line_start);
-            /* Window the excerpt around the error column so the caret lands
-             * on the right character without echoing the whole long line. */
+            /* 底层系统交互与数据协议契约 */
             int col0 = loc.col > 0 ? (int)loc.col - 1 : 0;
             int vis_start = 0;
             if (line_len > ZAN_DIAG_MAX_SOURCE_ECHO) {
@@ -231,8 +229,7 @@ bool zan_diag_has_errors(zan_diag_t *diag) {
     return diag->error_count > 0;
 }
 
-/* A phase-per-line trace (ZANC_TRACE): the last line printed is the one that
- * never came back. */
+/* 底层系统交互与数据协议契约 */
 void zan_compile_trace(const char *fmt, ...) {
     static int on = -1;
     if (on < 0) on = getenv("ZANC_TRACE") ? 1 : 0;

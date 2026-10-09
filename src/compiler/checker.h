@@ -1,4 +1,4 @@
-/* checker.h -- Basic type checker for the Zan language. */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_CHECKER_H
 #define ZAN_CHECKER_H
@@ -7,7 +7,7 @@
 #include "ast.h"
 #include "binder.h"
 
-/* locals of the method body being checked; see checker.c */
+/* 底层系统交互与数据协议契约 */
 struct checker_local;
 
 struct zan_checker {
@@ -15,23 +15,17 @@ struct zan_checker {
     zan_arena_t *arena;
     zan_diag_t *diag;
     zan_type_t *current_return_type;
-    /* inside a [NoRuntime] body: anything needing the managed runtime
-     * (allocation, ARC, exceptions, the monitor) is an error there */
+    /* 底层系统交互与数据协议契约 */
     bool in_no_runtime;
-    /* the type whose member body is being checked, and whether that body is a
-     * constructor: a `readonly` field may only be assigned there */
+    /* 底层系统交互与数据协议契约 */
     zan_symbol_t *current_type_sym;
     bool in_ctor;
-    /* linked list of the current body's locals/params, so a bare name in an
-     * expression resolves local-first, then fields, then scope -- the same
-     * precedence irgen uses */
+    /* 底层系统交互与数据协议契约 */
     struct checker_local *locals;
-    /* the call expression typed most recently and the method it resolved to,
-     * so a member access on a call result can tell whether the callee can
-     * hand back null (`o.PathGet("k").AsString(...)`) */
+    /* 底层系统交互与数据协议契约 */
     zan_ast_node_t *last_call_node;
     zan_symbol_t *last_call_method;
-    /* body of the method being checked, scanned for a local's null guard */
+    /* 底层系统交互与数据协议契约 */
     zan_ast_node_t *current_body;
 };
 

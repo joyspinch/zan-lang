@@ -1,4 +1,4 @@
-/* lexer.h -- Tokenizer for the Zan language. */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_LEXER_H
 #define ZAN_LEXER_H
@@ -24,7 +24,7 @@ struct zan_token {
     union {
         int64_t int_val;
         double float_val;
-        zan_istr_t str_val; /* for string/char/ident: pointer + length */
+        zan_istr_t str_val; /* 底层系统交互与数据协议契约 */
     };
 };
 
@@ -54,14 +54,14 @@ struct zan_lexer {
     zan_pp_define_t *defines;
     int define_count;
     int define_cap;
-    /* Conditional compilation stack: 1=active, 0=skipping */
+    /* 核心系统底层抽象与内存语义契约 */
     int cond_stack[ZAN_PP_MAX_COND_DEPTH];
     int cond_depth;
-    /* Track whether current #if group had a true branch (for #elif) */
+    /* 底层系统交互与数据协议契约 */
     int cond_seen_true[ZAN_PP_MAX_COND_DEPTH];
     /* 条件编译预处理嵌套深度溢出计数 */
     int cond_overflow;
-    int at_line_start; /* 1 if next non-ws char is at start of logical line */
+    int at_line_start; /* 底层系统交互与数据协议契约 */
 };
 
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
@@ -71,7 +71,7 @@ zan_token_t zan_lexer_peek(zan_lexer_t *lex);
 /* 向前预看两个词法单元（不消费 token，完全恢复词法状态） */
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex);
 
-/* Preprocessor API: add a define before lexing begins */
+/* 底层系统交互与数据协议契约 */
 void zan_lexer_define(zan_lexer_t *lex, const char *name, const char *value);
 
 #endif /* ZAN_LEXER_H */

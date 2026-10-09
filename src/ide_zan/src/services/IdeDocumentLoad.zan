@@ -1,0 +1,300 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+class IdeDocumentRead {
+    string path;
+    string name;
+    int sequence;
+    int workspace;
+    List<TabRecord> tabSet;
+    CancellationToken cancellation;
+    bool activate;
+}
+
+partial class ZanIDE {
+    List<IdeDocumentRead> documentReads = new List<IdeDocumentRead>();
+    CancellationTokenSource documentReadCancellation = new CancellationTokenSource();
+    int documentReadSequence;
+    int documentWorkspace;
+    bool shuttingDown;
+    string adoptedSymbolRoot = "";
+    bool adoptedSymbolProject;
+    TabRecord bindingCodeTab;
+    int codeBindingSequence;
+    List<Task> documentWorkers = new List<Task>();
+
+    void TrackDocumentWorker(Task worker) {
+        for (int i = documentWorkers.Count - 1; i >= 0; i = i - 1) {
+            if (documentWorkers[i].IsCompleted) { documentWorkers.RemoveAt(i); }
+        }
+        documentWorkers.Add(worker);
+    }
+
+    async void DrainDocumentWorkAsync() {
+        for (int i = 0; i < documentWorkers.Count; i = i + 1) {
+            Task worker = documentWorkers[i];
+            await worker;
+        }
+    }
+
+    void RememberBoundCodeTab() {
+        if (lastActive < 0 || lastActive >= tabs.Count) { return; }
+        TabRecord previous = tabs[lastActive];
+        if (previous.path != editor.documentPath || previous.designDoc
+            || ZanIDE.IsFormPath(previous.path) || ZanIDE.IsScenePath(previous.path)) { return; }
+        previous.caretLine = editor.CurLine();
+        previous.caretCol = editor.CurCol();
+        previous.scrollLine = editor.ScrollLine();
+    }
+
+    void UpdateActiveCodeTab() {
+        if (shuttingDown || this.CodeNavigationBusy()) { return; }
+        int act = activeTab.Get();
+        if (act < 0 || act >= tabs.Count) { return; }
+        TabRecord tab = tabs[act];
+        if (tab.path == "@start" || tab.path == "@docs" || tab.designDoc
+            || ZanIDE.IsFormPath(tab.path) || ZanIDE.IsScenePath(tab.path)) {
+            if (lastActive != act) { this.RememberBoundCodeTab(); }
+            bindingCodeTab = null;
+            lastActive = act;
+            codeBindingSequence = codeBindingSequence + 1;
+            return;
+        }
+        if (bindingCodeTab == tab || lastActive == act && editor.documentPath == tab.path) { return; }
+        this.RememberBoundCodeTab();
+        bindingCodeTab = tab;
+        codeBindingSequence = codeBindingSequence + 1;
+        int binding = codeBindingSequence;
+        int workspace = documentWorkspace;
+        string text = tab.body;
+        CodeEditorTextLoad request = editor.BeginTextLoad(tab.path, CodeEditor.LangForName(tab.path));
+        CodeEditorPreparedText prepared = tab.preparedBody == text ? tab.preparedText : null;
+        if (prepared != null && prepared.applied) { prepared = null; }
+        if (prepared != null) {
+            this.ApplyCodeTab(tab, request, prepared, text, binding, workspace);
+            return;
+        }
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            CodeEditorPreparedText result = CodeEditor.PrepareText(text);
+            host.Post(delegate () { this.ApplyCodeTab(tab, request, result, text, binding, workspace); });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void ApplyCodeTab(TabRecord tab, CodeEditorTextLoad request, CodeEditorPreparedText prepared,
+                      string text, int binding, int workspace) {
+        int act = activeTab.Get();
+        if (shuttingDown || documentWorkspace != workspace || codeBindingSequence != binding
+            || act < 0 || act >= tabs.Count || tabs[act] != tab || tab.body != text) { return; }
+        if (this.CodeNavigationBusy()) {
+            bindingCodeTab = null;
+            return;
+        }
+        if (!editor.ApplyPreparedText(request, prepared)) {
+            bindingCodeTab = null;
+            app.RequestRedraw();
+            return;
+        }
+        tab.preparedText = prepared;
+        tab.preparedBody = text;
+        lastActive = act;
+        editor.GoToLineCol(tab.caretLine, tab.caretCol);
+        editor.SetScrollLine(tab.scrollLine);
+        this.RequestProjectSourcesAsync();
+        this.ApplyPendingCodeCaret();
+        this.RefreshFoldRanges();
+        app.RequestRedraw();
+    }
+
+    void ApplyPendingCodeCaret() {
+        int act = activeTab.Get();
+        if (pendingGotoLine < 0 || act < 0 || act >= tabs.Count
+            || tabs[act].path != editor.documentPath) { return; }
+        editor.GoToLineCol(pendingGotoLine, pendingGotoCol);
+        pendingGotoLine = -1;
+        app.RequestRedraw();
+    }
+
+    void OpenDocumentAsync(string path, string name, bool activate = true) {
+        if (shuttingDown) { return; }
+        if (this.CodeNavigationBusy()) {
+            this.CancelCodeNavigationThen(delegate () { this.OpenDocumentAsync(path, name, activate); });
+            return;
+        }
+        int existing = ZanIDE.FindTabByPath(tabs, path);
+        if (activate) { documentReadSequence = documentReadSequence + 1; }
+        if (existing >= 0) {
+            if (activate) { activeTab.Set(existing); }
+            app.RequestRedraw();
+            return;
+        }
+        for (int i = 0; i < documentReads.Count; i = i + 1) {
+            IdeDocumentRead pending = documentReads[i];
+            if (pending.workspace == documentWorkspace && ZanIDE.SamePath(pending.path, path)) {
+                if (activate) {
+                    pending.sequence = documentReadSequence;
+                    pending.activate = true;
+                }
+                return;
+            }
+        }
+        IdeDocumentRead request = new IdeDocumentRead();
+        request.path = path;
+        request.name = name;
+        request.sequence = documentReadSequence;
+        request.workspace = documentWorkspace;
+        request.tabSet = tabs;
+        request.cancellation = documentReadCancellation.Token;
+        request.activate = activate;
+        documentReads.Add(request);
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            if (request.cancellation.IsCancellationRequested) { return; }
+            string text = "";
+            string failure = "";
+            long stamp = 0;
+            try {
+                if (!File.Exists(request.path)) { throw new Exception("File does not exist."); }
+                stamp = FileInfo.GetLastWriteTime(request.path);
+                text = File.ReadAllText(request.path);
+            } catch (Exception error) {
+                // 核心契约与语义定义。
+                failure = error.Message;
+            }
+            TabRecord loaded = TabRecord.Create(request.name, text, request.path);
+            loaded.preparedText = CodeEditor.PrepareText(text);
+            loaded.preparedBody = text;
+            if (request.cancellation.IsCancellationRequested) { return; }
+            host.Post(delegate () { this.CompleteDocumentRead(request, loaded, stamp, failure); });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void OpenPickedDocumentAsync(string path) {
+        if (shuttingDown) { return; }
+        if (this.CodeNavigationBusy()) {
+            this.CancelCodeNavigationThen(delegate () { this.OpenPickedDocumentAsync(path); });
+            return;
+        }
+        documentReadSequence = documentReadSequence + 1;
+        int sequence = documentReadSequence;
+        int workspace = documentWorkspace;
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            string project = "";
+            string failure = "";
+            try {
+                project = ZanIDE.FindProjectRoot(path);
+            } catch (Exception error) {
+                // 核心契约与语义定义。
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || documentWorkspace != workspace
+                    || documentReadSequence != sequence) { return; }
+                if (failure != "") {
+                    log.Add("> " + failure);
+                    app.RequestRedraw();
+                    return;
+                }
+                string nextRoot = project == "" ? ZanIDE.DirOf(path) : project;
+                bool nextProject = project != "";
+                if (haveProject == nextProject && ZanIDE.SamePath(root, nextRoot)) {
+                    this.OpenDocumentAsync(path, Path.GetFileName(path));
+                    return;
+                }
+                this.CancelCodeNavigationThen(delegate () {
+                    if (shuttingDown || documentWorkspace != workspace
+                        || documentReadSequence != sequence) { return; }
+                    root = nextRoot;
+                    haveProject = nextProject;
+                    this.AdoptSymbolIndex();
+                    this.AdoptProjectChats();
+                    if (haveProject) { this.RememberWorkspaceAsync(root); }
+                    this.OpenDocumentAsync(path, Path.GetFileName(path));
+                    rescan = true;
+                    app.RequestRedraw();
+                });
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void CompleteDocumentRead(IdeDocumentRead request, TabRecord loaded, long stamp, string failure) {
+        if (shuttingDown || request.workspace != documentWorkspace
+            || request.tabSet != tabs || request.cancellation.IsCancellationRequested) { return; }
+        if (this.CodeNavigationBusy()) {
+            this.CancelCodeNavigationThen(delegate () { this.CompleteDocumentRead(request, loaded, stamp, failure); });
+            return;
+        }
+        for (int i = documentReads.Count - 1; i >= 0; i = i - 1) {
+            if (documentReads[i] == request) { documentReads.RemoveAt(i); }
+        }
+        if (failure != "") {
+            log.Add(ZanIDE.T("> Could not open ", "> 无法打开 ") + request.path + ": " + failure);
+            app.RequestRedraw();
+            return;
+        }
+        int target = ZanIDE.FindTabByPath(tabs, request.path);
+        if (target < 0) {
+            tabs.Add(loaded);
+            this.TrackPreparedDocument(request.path, loaded.body, stamp);
+            target = tabs.Count - 1;
+        }
+        // 核心契约与语义定义。
+        if (request.activate && request.sequence == documentReadSequence) { activeTab.Set(target); }
+        app.RequestRedraw();
+    }
+
+    int treeScanSequence;
+
+    void RequestTreeScan() {
+        treeScanSequence = treeScanSequence + 1;
+        int sequence = treeScanSequence;
+        int workspace = documentWorkspace;
+        string scanRoot = root;
+        bool project = haveProject;
+        List<string> expanded = ZanIDE.ExpandedPaths(tree);
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            List<TreeNode> result = new List<TreeNode>();
+            string failure = "";
+            try {
+                if (project) {
+                    result = ZanIDE.ScanTree(scanRoot);
+                    ZanIDE.ApplyExpanded(result, expanded);
+                }
+            } catch (Exception error) {
+                // 核心契约与语义定义。
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || documentWorkspace != workspace || treeScanSequence != sequence
+                    || root != scanRoot) { return; }
+                if (failure != "") {
+                    log.Add("> " + failure);
+                } else {
+                    tree = result;
+                    treeSel.Set(-1);
+                }
+                app.RequestRedraw();
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void CancelDocumentReads() {
+        documentWorkspace = documentWorkspace + 1;
+        documentReadSequence = documentReadSequence + 1;
+        documentReadCancellation.Cancel();
+        documentReadCancellation = new CancellationTokenSource();
+        documentReads.Clear();
+        bindingCodeTab = null;
+        codeBindingSequence = codeBindingSequence + 1;
+    }
+}

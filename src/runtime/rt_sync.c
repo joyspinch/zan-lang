@@ -4,16 +4,14 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
-/* getifaddrs/IFF_* and the BSD socket extras used by the zan_plat_* platform
- * services live outside strict POSIX; glibc gates them on _DEFAULT_SOURCE. */
+/* 内部辅助逻辑 */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
-/* glibc declares gettid() only under _GNU_SOURCE; without it the call below
- * is an implicit declaration, which clang 16+ rejects outright. */
+/* 内部辅助逻辑 */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1
 #endif
@@ -26,7 +24,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "rt_timer.h"           /* zan_rt_fatal: OOM funnel */
+#include "rt_timer.h"           /* 核心系统底层抽象与内存语义契约 */
 #include "../common/zan_abi.h"
 
 #ifdef _WIN32
@@ -50,22 +48,12 @@
 #endif
 
 #if defined(__ANDROID__) || (defined(__OHOS__) && !defined(ZAN_SYNC_NO_SHM_SHIM))
-/* bionic does not implement shm_open/shm_unlink (_POSIX_SHARED_MEMORY_OBJECTS
- * is __BIONIC_POSIX_FEATURE_MISSING); OHOS's musl libc.a also lacks shm_open
- * (only libc.so carries it). Back the calls with regular files in a
- * writable directory -- ZAN_SHM_DIR if set, else /data/local/tmp, where adb/hdc-run
- * CLI programs live; an app embedding the runtime sets ZAN_SHM_DIR to its own
- * files dir at startup. The anonymous-table path (shm_open + immediate
- * shm_unlink) keeps its fd-open mapping semantics; the name is just a path. */
+/* 内部辅助实现 */
 static const char *zan_android_shm_dir(void) {
     const char *d = getenv("ZAN_SHM_DIR");
     return (d && d[0]) ? d : "/data/local/tmp";
 }
-/* Formats <dir>/<name> and fails loudly (ENAMETOOLONG) when it does not fit:
- * the old 288-byte buffer + unchecked snprintf silently truncated -- an app
- * file dir on Android (getFilesDir + a long package name) already clears
- * 250 bytes, and a truncated path makes open() succeed on the WRONG file or
- * unlink() miss the one that matters. */
+/* 内部辅助实现 */
 static int zan_android_shm_path(const char *name, char *path, size_t cap) {
     if (name[0] == '/') name++;
     int n = snprintf(path, cap, "%s/%s", zan_android_shm_dir(), name);
@@ -97,14 +85,11 @@ static int zan_android_shm_unlink(const char *name) {
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-/* Version 5: Expanded ZAN_TABLE_MAX_COLUMNS from 32 to 64, expanding header to 3136 bytes.
- * Older mappings (version <= 4) are rejected on Open/Attach to prevent row offset shifts. */
+/* 内部辅助逻辑 */
 #define ZAN_TABLE_VERSION 5
 #define ZAN_TABLE_MAX_COLUMNS 64
 #define ZAN_TABLE_COLUMN_NAME 32
-/* Schema ceilings. The checker rejects a constant width past these where it
- * is declared (checker.c: CHECKER_SHARED_MAX_*), so raising one here means
- * raising it there. */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_TABLE_MAX_KEY 1024
 #define ZAN_TABLE_MAX_STRING 1048576
 #define ZAN_TABLE_MAX_CAPACITY (UINT64_C(1) << 30)
@@ -143,9 +128,7 @@ typedef struct {
     uint32_t key_size;
     uint32_t row_stride;
     uint32_t column_count;
-    /* Structural lock, held only while a slot is claimed, tombstoned or the
-     * table is cleared. It lives in the mapping itself, so it serializes
-     * processes without a syscall; value reads and writes never take it. */
+    /* 内部辅助逻辑 */
     uint32_t struct_lock;
     zan_shared_column columns[ZAN_TABLE_MAX_COLUMNS];
 } zan_shared_header;
@@ -154,11 +137,9 @@ typedef struct {
     zan_shared_header *header;
     size_t mapped_size;
     char map_name[256];
-    /* Anonymous tables have no name at all: they are reached through an
-     * inherited descriptor, so map_name stays empty and there is
-     * nothing for destroy to unlink. */
+    /* 内部辅助逻辑 */
     int anonymous;
-    int attached;   /* mapped a handle a parent created, does not own the table */
+    int attached;   /* 模块核心语义抽象与接口调用契约 */
 #ifdef _WIN32
     HANDLE mapping;
 #else
@@ -168,12 +149,7 @@ typedef struct {
 #endif
 } zan_shared_table;
 
-/* The buffer is claimed per thread on first use (FLS on Windows, a pthread
- * key elsewhere) and freed at thread exit. A 64 KB thread-local static per
- * thread was too high a price for programs that never touch shared tables,
- * and the old Windows path answered FLS failure with one shared static
- * buffer that two threads could scratch concurrently. Allocation failures
- * are fatal (host_oom), matching the runtime's OOM policy. */
+/* 内部辅助逻辑 */
 #ifdef _WIN32
 static INIT_ONCE zan_shared_string_once = INIT_ONCE_STATIC_INIT;
 static DWORD zan_shared_string_slot = FLS_OUT_OF_INDEXES;
@@ -356,58 +332,15 @@ static void zan_make_names(const char *name, char map_name[256]) {
 #endif
 }
 
-/* Structural lock: a compare-and-swap spinlock on a word inside the shared
- * mapping. It replaces the per-operation flock()/named-mutex pair, which cost
- * two syscalls on every get and set and serialized every process on one kernel
- * lock -- with four processes that collapsed the table from ~4M to ~110k
- * operations per second each. Only slot allocation, delete and clear take it
- * now; reads and writes of an existing row are guarded by that row's own
- * spinlock, so unrelated keys never contend. */
-/* ---- cross-process lock words -------------------------------------------
- * A lock word is 0 when free; while held, bit 31 is set and bits 30:0 carry
- * the holding process's id. A plain 0/1 word cannot survive a crashed
- * holder -- every other process would spin on it forever. With the id in
- * the word, a waiter that has exhausted its backoff ladder tests whether
- * the holder still exists (OpenProcess / kill(pid,0)) and reclaims the word
- * with a CAS when it does not, so a killed writer cannot wedge the table
- * for every other process attached to it.
- *
- * PID truncation can alias a live process; the probe then reports alive and
- * the waiter keeps spinning. Reclamation is a heuristic safety net, never
- * the primary mutual-exclusion mechanism: a live holder's word is only ever
- * cleared by the holder's own release-store of 0.
- *
- * KNOWN LIMITATION (documented, not yet fixed): the word carries only
- * bit31|pid, so a RECYCLED pid of a dead holder reads as alive and reclaim
- * never fires -- a waiter can spin on an orphaned lock until the holder
- * slot is otherwise released. Sharpest case: the waiter's own pid was
- * recycled from the dead holder. Mutual exclusion itself is never violated
- * (reclaim is gated on the liveness probe); fixing this properly means
- * mixing a per-process creation-time nonce into bits 30:0 across both
- * platforms and every probe site.
- *
- * The liveness probe runs between the word load and the reclaim CAS, so a
- * second narrow window exists: the probe may see the holder dead, the OS may
- * then recycle the pid to a NEW process that acquires the word (bit-identical
- * value), and the CAS would clear a live holder's lock. The re-load before
- * the CAS only proves the word did not change in between, which is exactly
- * the hazard, so reclaim re-runs the probe and aborts if the pid has come
- * back alive. This shrinks the window from "pid recycled between probe and
- * CAS" to "recycled AND re-acquired AND died again within one probe"; a
- * nonce in the word is the complete fix. */
+/* CAS 自旋锁保护共享内存结构 */
+/* 内部辅助实现 */
 #define ZAN_LOCK_HELD_BIT 0x80000000u
 #define ZAN_LOCK_PID_MASK 0x7FFFFFFFu
 
 static int zan_pid_alive(uint32_t pid) {
     if (!pid) return 0;
 #ifdef _WIN32
-    /* SYNCHRONIZE is required for WaitForSingleObject to work at all: a
-     * QUERY_LIMITED_INFORMATION-only handle fails every wait with
-     * WAIT_FAILED (verified empirically), which would report every live
-     * holder as dead and let a waiter steal a held lock. Any wait result
-     * other than WAIT_TIMEOUT keeps the holder conservatively alive --
-     * reclaim only ever fires when OpenProcess itself says the pid is
-     * gone. */
+    /* 内部辅助实现 */
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                            FALSE, (DWORD)pid);
     if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
@@ -438,11 +371,7 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             LONG hpid = held & (LONG)ZAN_LOCK_PID_MASK;
             if ((held & (LONG)ZAN_LOCK_HELD_BIT) && hpid &&
                 !zan_pid_alive((uint32_t)hpid)) {
-                /* Re-read before the second probe so it tests the word as it
-                 * is NOW, not this spin loop's stale snapshot: probe and CAS
-                 * are far apart in wall time, and a lock released and
-                 * re-acquired in between must not be reclaimed. The CAS
-                 * still requires the word to be bit-identical at commit. */
+                /* 内部辅助实现 */
                 LONG now = InterlockedCompareExchange((volatile LONG *)word,
                                                       0, 0);
                 if (now == held && !zan_pid_alive((uint32_t)hpid)) {
@@ -472,7 +401,7 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             uint32_t hpid = held & ZAN_LOCK_PID_MASK;
             if ((held & ZAN_LOCK_HELD_BIT) && hpid &&
                 !zan_pid_alive(hpid)) {
-                /* Same re-read-then-reprobe as the Windows side above. */
+                /* 模块核心语义抽象与接口调用契约 */
                 uint32_t now = __atomic_load_n(word, __ATOMIC_ACQUIRE);
                 if (now == held && !zan_pid_alive(hpid)) {
                     uint32_t expected = held;
@@ -503,10 +432,7 @@ static void zan_struct_unlock(zan_shared_header *header) {
     zan_lock_word_release(&header->struct_lock);
 }
 
-/* Resolves a key to its row, claiming a slot when `create` is set. The lookup
- * runs without the structural lock (slot states only move forward and the key
- * bytes are published before the state), so the hot path -- a key that already
- * exists -- is lock-free apart from the row spinlock the caller takes. */
+/* 按键查找或分配共享表行槽位 */
 static unsigned char *zan_row_for(
     zan_shared_header *header, const char *key, int create);
 
@@ -581,14 +507,7 @@ static char *zan_row_key(unsigned char *row) {
     return (char *)(row + ZAN_SLOT_PREFIX);
 }
 
-/* Re-validate a resolved row after acquiring its lock. Between the lock-free
- * lookup and the row lock another process can tombstone the slot (delete or
- * expiry) and a third can claim it for a DIFFERENT key -- without this check
- * a suspended writer commits its value into the new owner's row. Key-based
- * callers pass the key and compare bytes exactly as zan_find_row does;
- * hash-keyed (_at) callers pass key=NULL and rely on the 64-bit hash. A 0
- * return means "the row I resolved no longer exists": callers fail the
- * operation (0 / empty / -1), which is what racing a concurrent delete means. */
+/* 获取行锁后重新校验有效性 */
 static int zan_row_revalidate(
     unsigned char *row, uint64_t hash, const char *key, uint32_t key_size) {
     if (zan_load_state(row) != ZAN_SLOT_USED) return 0;
@@ -703,12 +622,7 @@ static int64_t zan_wall_now_ms(void) {
 #endif
 }
 
-/* Opportunistic expiry sweep tuning: the hot path calls this before every
- * table op. The interval skips even the clock read when nothing can have
- * expired recently; the batch cap bounds how long ONE unlucky caller holds
- * the structural lock when many rows share a deadline -- the rest drain on
- * later ops instead of stalling every other process behind one giant
- * critical section. */
+/* 共享表惰性过期淘汰机制 */
 #define ZAN_PURGE_MIN_INTERVAL_MS 16
 #define ZAN_PURGE_MAX_BATCH 64
 
@@ -721,10 +635,7 @@ static void zan_purge_expired_locked(
         if (*zan_row_expires_at(row) > now_ms) break;
         zan_row_lock(row);
         zan_expiry_remove(header, row);
-        /* Wipe the payload but keep word 4 -- it IS this thread's lock:
-         * zeroing it lets another process acquire the row mid-purge and
-         * write into memory being erased. State is republished last so a
-         * lock-free lookup never sees content whose state disagrees. */
+        /* 内部辅助实现 */
         memset(row + 8, 0, header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         header->count--;
@@ -734,17 +645,10 @@ static void zan_purge_expired_locked(
 }
 
 static void zan_purge_expired(zan_shared_header *header) {
-    /* Relaxed loads: this peek races writers that hold the struct lock. On
-     * LP64 the aligned 64-bit loads are single-copy atomic and every
-     * consequence is re-validated under the struct lock below, so a torn or
-     * stale peek can only cause a wasted attempt -- but read them as atomics
-     * anyway and range-check the index before it becomes a row pointer. */
+    /* 模块核心语义抽象与接口调用契约 */
     if (__atomic_load_n(&header->expiry_count, __ATOMIC_RELAXED) == 0)
         return;
-    /* Process-wide throttle: once any TTL exists, every op would otherwise
-     * pay a wall-clock syscall plus a heap-top compare. A plain static with
-     * relaxed atomics is enough -- worst case two threads both run the peek,
-     * which is exactly what happened before the throttle existed. */
+    /* 内部辅助逻辑 */
     static int64_t last_attempt_ms;
     int64_t now_ms = zan_wall_now_ms();
     int64_t last = __atomic_load_n(&last_attempt_ms, __ATOMIC_RELAXED);
@@ -752,7 +656,7 @@ static void zan_purge_expired(zan_shared_header *header) {
     __atomic_store_n(&last_attempt_ms, now_ms, __ATOMIC_RELAXED);
     uint64_t *heap = zan_expiry_heap(header);
     uint64_t top = __atomic_load_n(&heap[0], __ATOMIC_RELAXED);
-    if (top >= header->capacity) return; /* torn peek: let the real pass run */
+    if (top >= header->capacity) return; /* 底层系统交互与数据协议契约 */
     unsigned char *row = zan_row_at(header, top);
     if (*zan_row_expires_at(row) > now_ms) return;
     zan_struct_lock(header);
@@ -765,11 +669,7 @@ static unsigned char *zan_find_row(
     size_t key_len = zan_strnlen(key, header->key_size + 1u);
     if (!key || key_len == 0 || key_len > header->key_size) return NULL;
 
-    /* Refuse inserts past a 7/8 load factor. Linear probing degrades towards
-     * O(capacity) per op as the table fills, and the last percent is where
-     * every request lands once writers pile up; failing the insert early
-     * (the caller sees 0 / empty, same as a full table) keeps the probe
-     * chains short for the readers that share the mapping. */
+    /* 共享表负载因子达到 7/8 时拒绝插入并扩容 */
     if (create && header->count >= header->capacity - header->capacity / 8)
         return NULL;
 
@@ -792,19 +692,12 @@ static unsigned char *zan_find_row(
         }
         if (!create) return NULL;
         if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
-        /* No payload wipe here: EMPTY and TOMBSTONE rows are already
-         * payload-zero -- fresh mappings hand out zero pages, and clear()
-         * plus every tombstone producer wipe row+8..stride before they
-         * publish. Writing only identity keeps this O(key) instead of
-         * O(stride) under the structural lock (a stride can reach ~64KB),
-         * and it never touches word 4, which a purger may transiently still
-         * hold when its TOMBSTONE becomes visible. */
+        /* 内部辅助实现 */
         *zan_row_hash(row) = hash;
         memcpy(zan_row_key(row), key, key_len);
         if ((size_t)key_len < header->key_size)
             zan_row_key(row)[key_len] = '\0';
-        /* Key and hash are published before the slot becomes visible as USED,
-         * so a concurrent lock-free lookup never matches a half-written row. */
+        /* 内部辅助逻辑 */
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
         return row;
@@ -812,7 +705,7 @@ static unsigned char *zan_find_row(
 
     if (create && first_tombstone != UINT64_MAX) {
         unsigned char *row = zan_row_at(header, first_tombstone);
-        /* Same payload-zero reasoning as the claim above. */
+        /* 底层系统交互与数据协议契约 */
         *zan_row_hash(row) = hash;
         memcpy(zan_row_key(row), key, key_len);
         if ((size_t)key_len < header->key_size)
@@ -829,23 +722,18 @@ static unsigned char *zan_row_for(
     zan_purge_expired(header);
     unsigned char *row = zan_find_row(header, key, 0);
     if (row || !create) return row;
-    /* Missing and we may create it: take the structural lock and look again,
-     * since another process may have inserted the same key meanwhile. */
+    /* 内部辅助逻辑 */
     zan_struct_lock(header);
     row = zan_find_row(header, key, 1);
     zan_struct_unlock(header);
     return row;
 }
 
-/* ---- rows addressed by a caller-computed hash ----
- * A server hashes "GET_/user/list" once per request and reuses that value for
- * the route attribute table and the statistics table, instead of formatting it
- * back into a key string and having the table hash it again. Identity is the
- * hash itself, so a table is used either by key or by hash, never both. */
+/* 内部辅助实现 */
 
 static unsigned char *zan_find_row_hash(
     zan_shared_header *header, uint64_t hash, int create) {
-    /* Same 7/8 load-factor refusal as zan_find_row. */
+    /* 底层系统交互与数据协议契约 */
     if (create && header->count >= header->capacity - header->capacity / 8)
         return NULL;
     if (!hash) hash = 1;
@@ -864,8 +752,7 @@ static unsigned char *zan_find_row_hash(
         }
         if (!create) return NULL;
         if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
-        /* No payload wipe: EMPTY and TOMBSTONE rows are already payload-zero
-         * (see zan_find_row); write identity only. */
+        /* 内部辅助逻辑 */
         *zan_row_hash(row) = hash;
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
@@ -873,7 +760,7 @@ static unsigned char *zan_find_row_hash(
     }
     if (create && first_tombstone != UINT64_MAX) {
         unsigned char *row = zan_row_at(header, first_tombstone);
-        /* Same payload-zero reasoning as the claim above. */
+        /* 底层系统交互与数据协议契约 */
         *zan_row_hash(row) = hash;
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
@@ -908,19 +795,11 @@ static void zan_shared_table_free(zan_shared_table *table) {
     free(table);
 }
 
-/* ---- Thread spawn: run a Zan delegate on a new detached OS thread ---- */
+/* 在独立操作系统线程上派生运行 Zan 委托 */
 
 typedef void (*zan_thread_body_fn)(void);
 
-/* A delegate value has one of two shapes (zan_abi.h): a bare function
- * pointer -- a static method or non-capturing lambda -- or a tagged heap
- * closure record -- an instance method group or a capturing lambda -- whose
- * thunk sits at record slot 0 and is invoked rec-first, fn(record).
- * Run whichever shape arrived: the record also owns the bound
- * target and the captures, and the worker outlives the Thread.Start call, so
- * the thread holds its own reference (retain before spawn, release after the
- * body). The helpers are shared with the UI dispatch queue below, which keeps
- * delegates across calls under the same contract. */
+/* 模块核心语义抽象与接口调用契约 */
 static void *zan_delegate_record(void *d);
 static void zan_delegate_retain(void *d);
 static void zan_delegate_release(void *d);
@@ -936,21 +815,14 @@ static void zan_thread_invoke(void *body) {
     if (fn) fn(rec);
 }
 
-/* Emitted code defines this when the program can throw; it drops the calling
- * thread's exception-handling state. The fallback here is a weak *definition*
- * rather than a weak reference: a weak undefined symbol resolves to null on
- * ELF but is a link error on Mach-O, and this object is linked into static
- * macOS binaries too. The emitted strong definition wins wherever it exists. */
+/* 内部辅助逻辑 */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void __zan_eh_release(void) { }
 #else
 void __zan_eh_release(void) { }
 #endif
 
-/* Release whatever per-thread runtime state the calling thread accumulated.
- * Public so a thread the runtime did not start -- an X11 / SDL / Cocoa
- * callback thread that ran Zan code -- can hand its slot back instead of
- * holding one for the life of the process. */
+/* 模块核心语义抽象与接口调用契约 */
 void zan_thread_detach(void) {
     __zan_eh_release();
 }
@@ -958,42 +830,38 @@ void zan_thread_detach(void) {
 #ifdef _WIN32
 static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
     zan_thread_invoke(arg);
-    zan_delegate_release(arg); /* drop the reference zan_thread_start took */
+    zan_delegate_release(arg); /* 底层系统交互与数据协议契约 */
     zan_thread_detach();
     return 0;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    /* The caller still owns the temporary it passed -- it releases it at the
-     * end of its statement -- while the worker outlives this call, so the
-     * thread takes its own reference and drops it in the trampoline. */
+    /* 内部辅助逻辑 */
     zan_delegate_retain(body);
     HANDLE h = CreateThread(NULL, 0, zan_thread_trampoline, body, 0, NULL);
     if (!h) {
-        zan_delegate_release(body); /* never ran: drop the thread's reference */
+        zan_delegate_release(body); /* 底层系统交互与数据协议契约 */
         return 0;
     }
-    CloseHandle(h); /* detach: the worker runs to completion on its own */
+    CloseHandle(h); /* 底层系统交互与数据协议契约 */
     return 1;
 }
 #else
 static void *zan_thread_trampoline(void *arg) {
     zan_thread_invoke(arg);
-    zan_delegate_release(arg); /* drop the reference zan_thread_start took */
+    zan_delegate_release(arg); /* 底层系统交互与数据协议契约 */
     zan_thread_detach();
     return NULL;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    /* The caller still owns the temporary it passed -- it releases it at the
-     * end of its statement -- while the worker outlives this call, so the
-     * thread takes its own reference and drops it in the trampoline. */
+    /* 内部辅助逻辑 */
     zan_delegate_retain(body);
     pthread_t t;
     if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) {
-        zan_delegate_release(body); /* never ran: drop the thread's reference */
+        zan_delegate_release(body); /* 底层系统交互与数据协议契约 */
         return 0;
     }
     pthread_detach(t);
@@ -1002,12 +870,7 @@ int32_t zan_thread_start(void *body) {
 #endif
 
 #if defined(__linux__)
-/* glibc >= 2.30 exposes gettid(); older libcs need the syscall directly.
- * The TID is the per-thread id -- getpid() returns the same PID for every
- * thread, which is exactly the confusion Thread.CurrentId() must avoid.
- * Nested #ifs keep __GLIBC_PREREQ out of any #if expression on musl (which
- * sets __GLIBC__ for compatibility but never defines the glibc-only feature
- * macro; zig cc escalates the resulting -Wundef to an error). */
+/* 内部辅助实现 */
 #if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 30)
 #define zan_tid() gettid()
@@ -1029,35 +892,24 @@ int64_t zan_thread_current_id(void) {
 #elif defined(__linux__)
     return (int64_t)zan_tid();
 #elif defined(__APPLE__)
-    /* pthread_self() is a pointer and varies run to run; pthread_threadid_np
-     * yields a stable per-thread numeric id. */
+    /* 内部辅助逻辑 */
     uint64_t tid = 0;
     if (pthread_threadid_np(NULL, &tid) != 0) return 0;
     return (int64_t)tid;
 #else
-    /* Other POSIX: hash the pthread_t (typically a pointer) into a stable
-     * number. Address-space layout randomization makes the raw pointer vary
-     * between runs, so fold it to a 32-bit id. */
+    /* 模块核心语义抽象与接口调用契约 */
     uintptr_t self = (uintptr_t)pthread_self();
     return (int64_t)((self >> 16) ^ (self & 0xffffffffu));
 #endif
 }
 
-/* ---- lock-statement monitor ---------------------------------------------
- * Backs the `lock (obj) { ... }` statement. C# gives every object its own
- * monitor; a single process-wide mutex would make two threads locking two
- * unrelated objects wait on each other, so the monitors are striped: the
- * object's address picks one of ZAN_MONITOR_STRIPES recursive locks. Two
- * objects can still share a stripe, which only over-serializes -- it never
- * loses mutual exclusion, and re-entry stays legal because each stripe is
- * recursive. Enter and exit hash the same pointer, so they always agree. */
+/* 内部辅助逻辑 */
 
 #define ZAN_MONITOR_STRIPES 64
 
 static unsigned zan_monitor_stripe(void *obj) {
     uintptr_t bits = (uintptr_t)obj;
-    /* Allocator addresses are 8- or 16-byte aligned, so the low bits are dead;
-     * fold the pointer before taking the index. */
+    /* 内部辅助逻辑 */
     bits ^= bits >> 20;
     bits ^= bits >> 8;
     return (unsigned)((bits >> 4) & (ZAN_MONITOR_STRIPES - 1));
@@ -1099,29 +951,10 @@ void zan_monitor_exit(void *obj) {
 }
 #endif
 
-/* ---- UI-thread dispatch queue (Control.Invoke equivalent) --------------
- * A fixed-capacity ring of Zan delegate values. Background threads enqueue
- * with zan_dispatch_post(); the UI thread drains with zan_dispatch_take()
- * once per frame and invokes each on the UI thread. The queue itself is
- * guarded by an OS mutex.
- *
- * A queued entry is an owning reference: a capturing lambda is a heap closure
- * record (see ZAN_CLOSURE_* in zan_abi.h), and while it sits in the ring the
- * only thing keeping it alive is this queue. Post retains it, take hands that
- * count to the caller (emitted code treats a call result as owned and releases
- * it after invoking), and clear releases what it drops. Without the retain the
- * drain's release dropped a count the queue never held, so a handler an event
- * still owned -- `btn.Click += () => { ... }` -- was freed the first time it
- * was posted, and the next use or rebuild of that handler list read freed
- * memory. Posting into free space allocates nothing -- a background thread only
- * touches the record's refcount, never the Zan allocator; growing the ring is
- * the one exception, and it happens only once per doubling. */
+/* UI 主线程安全分发任务队列 */
 
-/* The ring starts in static storage -- the common case never allocates -- and
- * doubles onto the heap when a burst fills it. Growth is bounded so a runaway
- * producer cannot eat the address space; at the ceiling the post is refused. */
-/* A 64-entry static ring is only the seed: growth below doubles it on demand
- * (bounded), so an idle program pays 512 B of bss instead of 8 KB. */
+/* 内部辅助逻辑 */
+/* 内部辅助逻辑 */
 #define ZAN_DISPATCH_CAP0 64
 #define ZAN_DISPATCH_CAP_MAX (1u << 20)
 static void *g_dispatch_static[ZAN_DISPATCH_CAP0];
@@ -1131,12 +964,7 @@ static int g_dispatch_head = 0;
 static int g_dispatch_tail = 0;
 
 #ifdef _WIN32
-/* The lock is created by the OS on first use rather than by a `ready` flag the
- * callers test: two threads posting for the first time both saw the flag clear
- * and both ran InitializeCriticalSection on the same section, and a thread
- * could enter it while the other was still initializing it. zan_dispatch_take
- * did not check the flag at all, so draining before the first post entered an
- * uninitialized section. */
+/* 内部辅助实现 */
 static CRITICAL_SECTION g_dispatch_cs;
 static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
 
@@ -1158,25 +986,50 @@ static void zan_dispatch_lock(void) { pthread_mutex_lock(&g_dispatch_mx); }
 static void zan_dispatch_unlock(void) { pthread_mutex_unlock(&g_dispatch_mx); }
 #endif
 
-/* Initialise the queue on the UI thread before any worker is spawned. */
+static volatile uintptr_t g_ui_thread_id = 0;
+
+void zan_ui_thread_set(void) {
+#ifdef _WIN32
+    g_ui_thread_id = (uintptr_t)GetCurrentThreadId();
+#else
+    g_ui_thread_id = (uintptr_t)pthread_self();
+#endif
+}
+
+int32_t zan_ui_thread_check(void) {
+    if (!g_ui_thread_id) return 1; /* 核心系统底层抽象与内存语义契约 */
+#ifdef _WIN32
+    return (uintptr_t)GetCurrentThreadId() == g_ui_thread_id ? 1 : 0;
+#else
+    return pthread_equal((pthread_t)g_ui_thread_id, pthread_self()) ? 1 : 0;
+#endif
+}
+
+void zan_ui_thread_assert(const char *msg) {
+    if (!zan_ui_thread_check()) {
+        fprintf(stderr, "fatal error: UI thread assertion failed: %s (called from background thread)\n",
+                msg ? msg : "must be called on UI thread");
+        abort();
+    }
+}
+
+/* 模块核心语义抽象与接口调用契约 */
 void zan_dispatch_init(void) {
+    zan_ui_thread_set();
     zan_dispatch_lock();
     g_dispatch_head = 0;
     g_dispatch_tail = 0;
     zan_dispatch_unlock();
 }
 
-/* Is this delegate value a heap closure record (rather than a bare function
- * pointer, which owns nothing and needs no counting)? */
+/* 内部辅助逻辑 */
 static void *zan_delegate_record(void *d) {
     uintptr_t v = (uintptr_t)d;
     if (!(v & (uintptr_t)ZAN_CLOSURE_TAG)) return NULL;
     return (void *)(v & ~(uintptr_t)ZAN_CLOSURE_TAG);
 }
 
-/* Take a reference to a queued delegate. Safe from any thread: the refcount is
- * the first header word and is updated atomically, exactly as emitted code
- * does it (zan_rt_retain). */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_delegate_retain(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
@@ -1188,10 +1041,7 @@ static void zan_delegate_retain(void *d) {
 #endif
 }
 
-/* Drop a reference the queue held. Goes through the record's own destructor,
- * which releases the captured values and frees the record at zero -- so this
- * touches the Zan heap and belongs on the UI thread (its only caller,
- * zan_dispatch_clear, is documented as UI-thread only). */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_delegate_release(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
@@ -1199,10 +1049,7 @@ static void zan_delegate_release(void *d) {
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
 
-/* Double the ring, keeping FIFO order. Called with the lock held and only when
- * the ring is full, so the entries are exactly cap-1 in queue order starting at
- * head. Returns 0 when the ceiling is reached or the allocation failed, leaving
- * the queue untouched. */
+/* 底层系统交互与数据协议契约 */
 static int zan_dispatch_grow(void) {
     if ((unsigned)g_dispatch_cap >= ZAN_DISPATCH_CAP_MAX) return 0;
     int ncap = g_dispatch_cap * 2;
@@ -1220,8 +1067,7 @@ static int zan_dispatch_grow(void) {
     return 1;
 }
 
-/* Enqueue a delegate to run on the UI thread. Thread-safe. Returns 1 on
- * success, 0 if the delegate was null or the queue is at its ceiling. */
+/* Enqueue a delegate to run on the UI thread */
 int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
     int32_t ok = 0;
@@ -1237,9 +1083,7 @@ int32_t zan_dispatch_post(void *fn) {
     }
     zan_dispatch_unlock();
     if (!ok) {
-        /* Report once: the queue is full at a million pending handlers, which
-         * means the UI thread has stopped draining, and the caller discards
-         * this answer. Silence here is how posted work disappears. */
+        /* 内部辅助逻辑 */
         static int reported;
         if (!reported) {
             reported = 1;
@@ -1250,9 +1094,7 @@ int32_t zan_dispatch_post(void *fn) {
     return ok;
 }
 
-/* Pop the next queued delegate (UI thread), or NULL when the queue is empty.
- * The queue's reference travels with the value: the caller invokes it and then
- * releases it, which is what emitted code does with any call result. */
+/* 模块核心语义抽象与接口调用契约 */
 void *zan_dispatch_take(void) {
     void *fn = NULL;
     zan_dispatch_lock();
@@ -1264,14 +1106,9 @@ void *zan_dispatch_take(void) {
     return fn;
 }
 
-/* Drop every queued delegate. Called on the UI thread when a window closes:
- * work a background worker posted for the dead window must not run on the
- * next window, whose frame loop reuses the same global queue. */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_dispatch_clear(void) {
-    /* Drained in fixed batches rather than one stack array of the whole ring:
-     * the ring grows to a million entries, and each batch is released outside
-     * the lock because a record's destructor runs Zan code, which must not
-     * re-enter the queue while it is held. */
+    /* 内部辅助实现 */
     for (;;) {
         void *drop[64];
         int n = 0;
@@ -1361,9 +1198,7 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
 #endif
 }
 
-/* The geometry a schema implies: how big the mapping has to be and what the
- * header must say about it. Shared by the named and the anonymous constructor,
- * which differ only in where the memory comes from. */
+/* 内部辅助逻辑 */
 typedef struct {
     uint64_t capacity;
     uint32_t key_size;
@@ -1404,13 +1239,12 @@ static int zan_table_layout_of(
     return 1;
 }
 
-/* Re-derive and validate the geometry a header claims from its own fields
- * before deriving addresses from them. */
+/* 内部辅助逻辑 */
 static int zan_header_geometry_ok(const zan_shared_header *header) {
     if (header->capacity == 0 ||
         header->capacity > ZAN_TABLE_MAX_CAPACITY ||
         (header->capacity & (header->capacity - 1)) != 0)
-        return 0;   /* power of two, probed with & mask everywhere */
+        return 0;   /* 底层系统交互与数据协议契约 */
     if (header->key_size == 0 || header->key_size > ZAN_TABLE_MAX_KEY)
         return 0;
     if (header->column_count > ZAN_TABLE_MAX_COLUMNS)
@@ -1427,9 +1261,7 @@ static int zan_header_geometry_ok(const zan_shared_header *header) {
         if (c->size == 0 ||
             (uint64_t)c->offset + c->size > header->row_stride)
             return 0;
-        /* Column lookup does strcmp(column->name, ...); require a terminator
-         * inside the field so a hostile header cannot walk the compare off
-         * the end of the mapping. */
+        /* 底层系统交互与数据协议契约 */
         if (!memchr(c->name, '\0', sizeof(c->name)))
             return 0;
     }
@@ -1440,15 +1272,11 @@ static int zan_header_geometry_ok(const zan_shared_header *header) {
     return expected == header->total_size;
 }
 
-/* Stamps the header of a freshly mapped table and publishes it. */
+/* 初始化并发布共享内存表头部结构 */
 static void zan_table_init_header(
     zan_shared_table *table, const zan_table_layout *layout) {
     table->mapped_size = layout->total_size;
-    /* Only the header is zeroed. The rows and the index behind it are already
-     * zero -- the mapping is freshly created, page-file backed (Windows) or a
-     * newly created, ftruncate'd file (POSIX), and both hand out zero pages --
-     * and writing them here would fault in the whole mapping, making a table's
-     * reserved size its resident size in every process that maps it. */
+    /* 核心系统底层抽象与内存语义契约 */
     memset(table->header, 0, sizeof(zan_shared_header));
     table->header->magic = ZAN_TABLE_MAGIC;
     table->header->version = ZAN_TABLE_VERSION;
@@ -1481,19 +1309,7 @@ static zan_shared_table *zan_table_alloc(void) {
     return table;
 }
 
-/* ---- anonymous tables: no name, reached through an inherited handle ----
- *
- * A named table is addressable by anything running on the machine, which makes
- * it two problems at once: an unrelated process can read and write a server's
- * table, and on POSIX the name is a file that outlives a killed process, so the
- * next run finds the previous run's rows. Anonymous tables have neither: the
- * memory is owned by the process that created it and handed to its children as
- * an inheritable descriptor (POSIX fd / Windows HANDLE), the way Swoole's
- * fork-inherited tables are reachable only inside the server. The kernel frees
- * it when the last of those processes goes, whether they exited or were killed.
- *
- * The creator passes zan_shared_table_handle() to a child (an environment
- * variable), and the child attaches to it with zan_shared_table_attach(). */
+/* 内部辅助实现 */
 int64_t zan_shared_table_create_anon(
     int32_t capacity_value, int32_t key_size_value, const char *schema) {
     zan_table_layout layout;
@@ -1506,8 +1322,7 @@ int64_t zan_shared_table_create_anon(
     table->anonymous = 1;
 
 #ifdef _WIN32
-    /* Inheritable, so CreateProcess with bInheritHandles hands the child the
-     * same handle value; NULL name keeps it out of the object namespace. */
+    /* 内部辅助逻辑 */
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
@@ -1528,17 +1343,10 @@ int64_t zan_shared_table_create_anon(
         return 0;
     }
 #else
-    /* shm_open + immediate shm_unlink: the mapping keeps living through the fd
-     * while its name is gone the moment it exists, so nothing can open it by
-     * name and nothing is left in /dev/shm if this process is killed. The name
-     * only has to survive between the two calls, hence pid + a counter.
-     *
-     * memfd_create would do the same in one call, but it is Linux-only and this
-     * runtime also builds for macOS. */
+    /* 内部辅助实现 */
     static uint32_t anon_seq = 0;
     char shm_name[64];
-    /* Two threads creating anonymous tables concurrently raced this counter
-     * and could collide on the O_EXCL name, failing one create spuriously. */
+    /* 内部辅助逻辑 */
     uint32_t seq = __atomic_fetch_add(&anon_seq, 1, __ATOMIC_RELAXED);
     snprintf(shm_name, sizeof(shm_name), "/zan_table_%ld_%u_%u",
              (long)getpid(), (unsigned)time(NULL), seq);
@@ -1548,8 +1356,7 @@ int64_t zan_shared_table_create_anon(
         return 0;
     }
     shm_unlink(shm_name);
-    /* shm_open sets FD_CLOEXEC, which a worker started by exec would lose the
-     * table to; the descriptor has to survive into the child. */
+    /* 内部辅助逻辑 */
     if (fcntl(fd, F_SETFD, 0) != 0) {
         close(fd);
         zan_shared_table_free(table);
@@ -1573,8 +1380,7 @@ int64_t zan_shared_table_create_anon(
     return (int64_t)(intptr_t)table;
 }
 
-/* The value a child needs to attach: a file descriptor on POSIX, a handle on
- * Windows. 0 for a named table, which is reached by name instead. */
+/* 内部辅助逻辑 */
 int64_t zan_shared_table_handle(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !table->anonymous) return 0;
@@ -1585,9 +1391,7 @@ int64_t zan_shared_table_handle(int64_t handle) {
 #endif
 }
 
-/* Child side: map the table its parent created, given the inherited handle.
- * Everything the mapping needs to be read is inside it, so no schema is
- * passed -- and a handle that is not a table of this version is rejected. */
+/* 内部实现与并发/内存约束规范 */
 int64_t zan_shared_table_attach(int64_t os_handle) {
     if (os_handle <= 0) return 0;
     zan_shared_table *table = zan_table_alloc();
@@ -1603,10 +1407,7 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         zan_shared_table_free(table);
         return 0;
     }
-    /* Anchor the extent in what the OS actually mapped, not in the header
-     * (which a hostile co-process controls): a squatting process can publish
-     * a self-consistent header for a section far smaller than total_size.
-     * The validation chain below then compares against the real extent. */
+    /* 内部辅助实现 */
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(table->header, &mbi, sizeof(mbi)) ||
@@ -1624,11 +1425,7 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         return 0;
     }
     table->mapped_size = (size_t)stat_buf.st_size;
-    /* Unlike open() -- which demands exact equality -- attach tolerates a
-     * file LARGER than the header claims: named table files can be extended
-     * by anyone with write access, and geometry identity plus the later
-     * total_size <= mapped_size check already bound every access, so the
-     * extra bytes are simply never touched. */
+    /* 内部辅助实现 */
     table->header = (zan_shared_header *)mmap(
         NULL, table->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED,
         table->fd, 0);
@@ -1739,7 +1536,7 @@ int64_t zan_shared_table_open(const char *name) {
         zan_shared_table_free(table);
         return 0;
     }
-    /* Same OS-anchored extent as attach: the header is untrusted input. */
+    /* 模块核心语义抽象与接口调用契约 */
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(table->header, &mbi, sizeof(mbi)) ||
@@ -1786,10 +1583,7 @@ int64_t zan_shared_table_open(const char *name) {
         return 0;
     }
 #ifndef _WIN32
-    /* File-backed POSIX mappings must match the header's claim exactly; a
-     * Windows section may be larger than total_size (allocation granularity)
-     * and that is harmless -- only exceeding the mapped extent is, and the
-     * chain above rejects it. */
+    /* 内部辅助实现 */
     if (table->header->total_size != table->mapped_size) {
         zan_shared_table_free(table);
         return 0;
@@ -1807,8 +1601,7 @@ int32_t zan_shared_table_destroy(int64_t handle) {
     if (!table) return 0;
     int32_t result = 1;
 #ifndef _WIN32
-    /* An anonymous table has no name in the filesystem to remove: dropping the
-     * last reference IS its destruction. */
+    /* 内部辅助逻辑 */
     if (!table->anonymous) {
         if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
     }
@@ -1826,9 +1619,7 @@ typedef struct {
 typedef BOOL(WINAPI *zan_query_ws_ex_fn)(HANDLE, zan_ws_ex_info *, DWORD);
 #endif
 
-/* How much of the mapping this process is actually paying for. A table reserves
- * its whole capacity up front, but a page only becomes resident when a row on
- * it is touched, so the reserved size says nothing about memory in use. */
+/* 模块核心语义抽象与接口调用契约 */
 static int64_t zan_table_resident_bytes(const zan_shared_table *table) {
     if (!table->header || !table->mapped_size) return 0;
 #ifdef _WIN32
@@ -1878,7 +1669,7 @@ static int64_t zan_table_resident_bytes(const zan_shared_table *table) {
 #else
     long page_conf = sysconf(_SC_PAGESIZE);
     size_t page_size = page_conf > 0 ? (size_t)page_conf : 4096u;
-    enum { ZAN_MINCORE_BATCH = 16384 };  /* pages per call: 16 KB of vector */
+    enum { ZAN_MINCORE_BATCH = 16384 };  /* 核心系统底层抽象与内存语义契约 */
     unsigned char *vec = (unsigned char *)malloc(ZAN_MINCORE_BATCH);
     if (!vec) return -1;
     unsigned char *base = (unsigned char *)table->header;
@@ -2032,10 +1823,7 @@ int32_t zan_shared_table_set_string(
         return 0;
     }
     char *destination = (char *)(row + column->offset);
-    /* O(len), not O(column): bytes past the terminator are never observable
-     * (readers use a size-bounded strnlen / strncmp), and the old full-column
-     * wipe turned every short update into a up-to-64KB critical section under
-     * this row's spinlock. value_len < column->size is checked by the caller. */
+    /* 内部辅助实现 */
     memcpy(destination, value, value_len);
     destination[value_len] = '\0';
     zan_row_unlock(row);
@@ -2087,21 +1875,14 @@ int64_t zan_shared_table_increment(
     return value;
 }
 
-/* Monotonic microseconds. Per-request timing needs better resolution than
- * GetTickCount64's ~15ms and must not allocate, which the Zan-side
- * clock_gettime wrapper does on every call. */
+/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_monotonic_us(void) {
 #ifdef _WIN32
     static LARGE_INTEGER frequency;
     if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    /* Divide BEFORE scaling: QPC ticks since boot reach 9.5e12 after ~11
-     * days, and ticks*1000000 overflows int64 then -- the product wraps
-     * negative and every duration derived from a difference between a
-     * wrapped and an unwrapped reading becomes garbage (observed as
-     * ServerMetrics series slots indexing ~-2.3 modulo 300). Stopwatch
-     * documents the same trap in MonoScaled (divide first, then scale). */
+    /* 模块核心语义抽象与接口调用契约 */
     return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000
         + ((now.QuadPart % frequency.QuadPart) * 1000000) / frequency.QuadPart);
 #else
@@ -2111,19 +1892,14 @@ int64_t zan_monotonic_us(void) {
 #endif
 }
 
-/* Monotonic nanoseconds, for System.Diagnostics.Stopwatch. The clock id must
- * not be hardcoded on the Zan side: CLOCK_MONOTONIC is 1 on Linux but 6 on
- * macOS, and the struct timespec layout is not portable either. C compiles
- * the real macro and layout in. */
+/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_monotonic_ns(void) {
 #ifdef _WIN32
     static LARGE_INTEGER frequency;
     if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    /* Same overflow as the us path above, only sooner: ticks*1e9 overflows
-     * after ~9.2 hours of uptime. Divide first (quotient to ns in the
-     * 64-bit remainder-scaled form keeps full resolution). */
+    /* 模块核心语义抽象与接口调用契约 */
     return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000000
         + ((now.QuadPart % frequency.QuadPart) * 1000000000) / frequency.QuadPart);
 #else
@@ -2161,7 +1937,7 @@ int64_t zan_monotonic_frequency(void) {
     return zan_stopwatch_frequency();
 }
 
-/* ---- the same operations against a caller-computed hash ---- */
+/* 底层系统交互与数据协议契约 */
 
 int64_t zan_shared_table_hash(const char *value) {
     return (int64_t)zan_hash_bytes(value);
@@ -2228,10 +2004,7 @@ int64_t zan_shared_table_increment_at(
     return value;
 }
 
-/* Keeps the smaller (or larger, when `keep_larger`) of the stored value and
- * `value`, in one row-locked step. Slowest/fastest response times are the
- * reason the statistics table exists and read-modify-write from Zan would race
- * between processes. A zero stored value counts as unset for the minimum. */
+/* 内部辅助逻辑 */
 int64_t zan_shared_table_extreme_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t value,
     int64_t keep_larger) {
@@ -2277,10 +2050,7 @@ int32_t zan_shared_table_set_string_at(
         return 0;
     }
     char *destination = (char *)(row + column->offset);
-    /* O(len), not O(column): bytes past the terminator are never observable
-     * (readers use a size-bounded strnlen / strncmp), and the old full-column
-     * wipe turned every short update into a up-to-64KB critical section under
-     * this row's spinlock. value_len < column->size is checked by the caller. */
+    /* 内部辅助实现 */
     memcpy(destination, value, value_len);
     destination[value_len] = '\0';
     zan_row_unlock(row);
@@ -2310,10 +2080,7 @@ const char *zan_shared_table_get_string_at(
     return result;
 }
 
-/* Compares a string column against `text` without handing the stored bytes
- * back to the caller. The route table verifies the original path on every
- * lookup to rule out a hash collision, and returning the column would allocate
- * a string per request just to throw it away. */
+/* 内部辅助逻辑 */
 int32_t zan_shared_table_match_at(
     int64_t handle, int64_t key_hash, const char *column_name,
     const char *text) {
@@ -2344,17 +2111,14 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    /* Batched, not UINT64_MAX: the delete below matches the row by key either
-     * way, so deferring part of the sweep to later ops cannot change the
-     * result -- it only keeps a mass shared-TTL table from holding this
-     * cross-process lock for one giant critical section. */
+    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row_hash(
         table->header, (uint64_t)key_hash, 0);
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        /* Keep the lock word we hold (offset 4): see zan_purge_expired_locked */
+        /* 模块核心语义抽象与接口调用契约 */
         memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -2377,11 +2141,7 @@ int32_t zan_shared_table_expire_at(
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !key || expires_at_ms < 0) return 0;
     zan_struct_lock(table->header);
-    /* Batched, not UINT64_MAX: the expiry_set below overwrites the deadline
-     * regardless of whether the row's old expiry was swept, so deferring part
-     * of the sweep to later ops cannot change the result -- same argument as
-     * the delete_at batch. UINT64_MAX here let one Expire call on a mass-TTL
-     * table hold this cross-process lock for a full wipe of every row. */
+    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(),
                              ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
@@ -2438,15 +2198,9 @@ int32_t zan_shared_table_rate_allow(
 
     int allowed = 0;
     zan_struct_lock(table->header);
-    /* Batched: an expired window row either was purged (fresh create) or is
-     * still found with start far enough back that the reset branch fires --
-     * both paths open a new window, so the batch cap cannot change the
-     * verdict, only shorten this cross-process critical section. */
+    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, now_ms, ZAN_PURGE_MAX_BATCH);
-    /* Existence-first, like zan_lock_row_for: the 7/8 load-factor refusal in
-     * zan_find_row(create=1) fires before the probe loop, so a direct create
-     * call would deny requests for LONG-EXISTING keys once the table nears
-     * capacity -- an invisible fail-closed outage for a rate limiter. */
+    /* 内部辅助实现 */
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (!row) row = zan_find_row(table->header, key, 1);
     if (row) {
@@ -2515,8 +2269,7 @@ int32_t zan_shared_table_lock_release(
 
     int released = 0;
     zan_struct_lock(table->header);
-    /* Batched (NOT lock_acquire): release matches the row by key and owner
-     * regardless of expiry, so a deferred sweep cannot change the outcome. */
+    /* 内部辅助逻辑 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
@@ -2525,8 +2278,7 @@ int32_t zan_shared_table_lock_release(
         memcpy(&current_owner, row + owner_column->offset, sizeof(current_owner));
         if (current_owner == owner) {
             zan_expiry_remove(table->header, row);
-            /* Keep the lock word we hold (offset 4): see
-             * zan_purge_expired_locked. */
+            /* 模块核心语义抽象与接口调用契约 */
             memset(row + 8, 0, table->header->row_stride - 8);
             zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
             table->header->count--;
@@ -2542,14 +2294,13 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    /* Batched: same reasoning as delete_at -- the key match below hits the row
-     * whether or not its expiry was swept this call. */
+    /* 内部辅助逻辑 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        /* Keep the lock word we hold (offset 4): see zan_purge_expired_locked */
+        /* 模块核心语义抽象与接口调用契约 */
         memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -2576,34 +2327,22 @@ int64_t zan_shared_table_count(int64_t handle) {
 void zan_shared_table_clear(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return;
-    /* Clear row by row under each row's own lock. The previous version took
-     * and immediately released every row lock and then wiped the whole row
-     * area under only the structural lock -- but value writers never take
-     * the structural lock, so a set that acquired its row lock after the
-     * walk returned success and then had its value erased by the memset:
-     * an acknowledged write silently lost. Holding each row's lock across
-     * its own wipe makes clear serialize against writers per row. The
-     * structural lock is still taken so slot claims and expiry mutations
-     * cannot interleave with the sweep. */
+    /* 模块核心语义抽象与接口调用契约 */
     zan_struct_lock(table->header);
     for (uint64_t i = 0; i < table->header->capacity; i++) {
         unsigned char *row = zan_row_at(table->header, i);
         uint32_t state = zan_load_state(row);
-        if (state == ZAN_SLOT_EMPTY) continue;   /* untouched page: skip */
+        if (state == ZAN_SLOT_EMPTY) continue;   /* 核心系统底层抽象与内存语义契约 */
         zan_row_lock(row);
         if (zan_load_state(row) != ZAN_SLOT_EMPTY) {
-            /* Keep the lock word we hold (offset 4); see
-             * zan_purge_expired_locked for why word 4 must survive. A
-             * tombstone row is already all-zero by invariant, so only USED
-             * rows need the payload wipe. */
+            /* 内部辅助逻辑 */
             if (zan_load_state(row) == ZAN_SLOT_USED)
                 memset(row + 8, 0, table->header->row_stride - 8);
             zan_publish_state(row, ZAN_SLOT_EMPTY);
         }
         zan_row_unlock(row);
     }
-    /* The expiry heap sits behind the row area; every mutation of it holds
-     * the structural lock, which we hold, so a wholesale reset is safe. */
+    /* 内部辅助逻辑 */
     memset(zan_expiry_heap(table->header), 0,
            (size_t)table->header->capacity * sizeof(uint64_t));
     table->header->count = 0;
@@ -2611,10 +2350,9 @@ void zan_shared_table_clear(int64_t handle) {
     zan_struct_unlock(table->header);
 }
 
-/* ---- filesystem helpers for the compiler driver ---- */
+/* 底层系统交互与数据协议契约 */
 
-/* Write the directory containing the running executable into `out`
- * (NUL-terminated, truncated at `cap`). Returns the length written. */
+/* 内部辅助逻辑 */
 long long zan_exe_dir_into(char *out, long long cap) {
     if (!out || cap <= 0) return 0;
     out[0] = '\0';
@@ -2622,7 +2360,7 @@ long long zan_exe_dir_into(char *out, long long cap) {
     char buf[1024];
     DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
     while (n > 0 && buf[n - 1] != '\\') n--;
-    if (n > 0) n--; /* drop the trailing separator */
+    if (n > 0) n--; /* 核心系统底层抽象与内存语义契约 */
     if ((long long)n >= cap) n = (DWORD)(cap - 1);
     memcpy(out, buf, n);
     out[n] = '\0';
@@ -2640,9 +2378,7 @@ long long zan_exe_dir_into(char *out, long long cap) {
 #endif
 }
 
-/* List the file names matching `pattern` (a glob such as dir\*.zan) into
- * `out`, one name per line ('\n'-separated, NUL-terminated, truncated at
- * `cap`). Returns the length written; 0 when nothing matches. */
+/* 模块核心语义抽象与接口调用契约 */
 long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
     if (!out || cap <= 0) return 0;
     out[0] = '\0';
@@ -2679,12 +2415,7 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
     return len;
 }
 
-/* ---- memory-mapped files (System.IO.MemoryMappedFile) -------------------
- * A handle is an opaque 64-bit value: on Windows a HANDLE to a file mapping
- * object, on POSIX a heap pointer to a small struct holding the shm/fd pair.
- * 0 means failure. `map` returns the view address (0 on failure); `unmap`
- * must be called with the same size that was mapped.
- */
+/* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
 typedef struct {
     HANDLE h;
@@ -2692,24 +2423,19 @@ typedef struct {
 #else
 typedef struct {
     int fd;
-    int owner;         /* 1 = this handle created the region: only its close
-                        * (or an explicit Unlink) may shm_unlink the name */
-    char name[256];    /* shm name (kept for shm_unlink), or "" for file-backed */
+    int owner;         /* 内部辅助逻辑 */
+    char name[256];    /* 模块核心语义抽象与接口调用契约 */
 } zan_mmap_handle;
 #endif
 
-/* Creates a NEW named shared-memory region of `size` bytes. Fails (returns 0)
- * when a region with the same name already exists. `name` may include a
- * leading "Global\\" or "Local\\" prefix (Windows). */
+/* 创建指定字节大小的具名共享内存区 */
 long long zan_mmap_create(const char *name, long long size) {
     if (!name || !name[0] || size <= 0) return 0;
 #ifdef _WIN32
     DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
     DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* invalid UTF-8: calloc(0) would hand a
-                                * zero-byte buffer to the conversion call and
-                                * the API would scan it as a wide string */
+    if (wlen <= 0) return 0;   /* 内部辅助逻辑 */
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2742,14 +2468,13 @@ long long zan_mmap_create(const char *name, long long size) {
 #endif
 }
 
-/* Opens an EXISTING named shared-memory region. Returns 0 when it does not
- * exist or `size` is nonzero and does not match the region. */
+/* 打开已存在的具名共享内存区 */
 long long zan_mmap_open(const char *name, long long size) {
     if (!name || !name[0]) return 0;
 #ifdef _WIN32
     (void)size;
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* invalid UTF-8: see zan_mmap_create */
+    if (wlen <= 0) return 0;   /* 底层系统交互与数据协议契约 */
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2777,14 +2502,12 @@ long long zan_mmap_open(const char *name, long long size) {
 #endif
 }
 
-/* Creates a mapping over an existing FILE. `size` <= 0 maps the whole file.
- * The view is read-write; writes are visible to other mappers of the same
- * file (MAP_SHARED). */
+/* 在已有文件句柄上建立内存映射 */
 long long zan_mmap_from_file(const char *path, long long size) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* invalid UTF-8: see zan_mmap_create */
+    if (wlen <= 0) return 0;   /* 底层系统交互与数据协议契约 */
     wchar_t *wpath = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wpath) return 0;
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
@@ -2813,8 +2536,7 @@ long long zan_mmap_from_file(const char *path, long long size) {
 #endif
 }
 
-/* Maps `size` bytes of the region into the address space. Returns the view
- * address, or 0 on failure. */
+/* 模块核心语义抽象与接口调用契约 */
 long long zan_mmap_map(long long handle, long long size) {
     if (!handle || size <= 0) return 0;
 #ifdef _WIN32
@@ -2830,7 +2552,7 @@ long long zan_mmap_map(long long handle, long long size) {
 #endif
 }
 
-/* Unmaps a view returned by zan_mmap_map. `size` must match the mapped size. */
+/* 底层系统交互与数据协议契约 */
 long long zan_mmap_unmap(long long ptr, long long size) {
     if (!ptr) return 0;
 #ifdef _WIN32
@@ -2841,7 +2563,7 @@ long long zan_mmap_unmap(long long ptr, long long size) {
 #endif
 }
 
-/* Flushes a mapped view to disk (no-op for shm on Windows). */
+/* 底层系统交互与数据协议契约 */
 long long zan_mmap_flush(long long ptr, long long size) {
     if (!ptr) return 1;
 #ifdef _WIN32
@@ -2851,9 +2573,7 @@ long long zan_mmap_flush(long long ptr, long long size) {
 #endif
 }
 
-/* Closes a mapping handle. Only the handle that CREATED a named POSIX
- * region unlinks it on close; a plain opener's close leaves the name in
- * place so the creator and other clients keep working. */
+/* 核心系统底层抽象与内存语义契约 */
 long long zan_mmap_close(long long handle) {
     if (!handle) return 0;
 #ifdef _WIN32
@@ -2868,10 +2588,7 @@ long long zan_mmap_close(long long handle) {
 #endif
 }
 
-/* Explicitly removes a named POSIX region, regardless of open handles.
- * On Windows named regions are reference-counted kernel objects -- the name
- * disappears with the last handle -- so there is nothing to unlink and this
- * is a harmless no-op returning success. */
+/* 模块核心语义抽象与接口调用契约 */
 long long zan_mmap_unlink(const char *name) {
     if (!name || !name[0]) return 0;
 #ifdef _WIN32
@@ -2884,16 +2601,7 @@ long long zan_mmap_unlink(const char *name) {
 #endif
 }
 
-
-/* ========================================================================
- * POSIX platform services (zan_plat_*)
- *
- * Native backends for POSIX platforms:
- * adapter enumeration (System.Net.NetworkInterface) and ICMP echo
- * (System.Net.Ping). Windows keeps its own iphlpapi path in Zan, so these
- * are POSIX-only; the Windows builds compile to explicit failures rather
- * than silent success.
- * ======================================================================== */
+/* 内部辅助实现 */
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -2910,10 +2618,7 @@ long long zan_mmap_unlink(const char *name) {
 #endif
 #endif
 
-/* Adapter-snapshot scratch, POSIX only (the Windows branch of
- * zan_plat_net_interfaces answers ""). Claimed per thread on first use via a
- * pthread key and freed at thread exit: a 64 KB thread-local static charged
- * every thread in the process for a buffer almost none of them ever use. */
+/* 内部辅助逻辑 */
 #ifndef _WIN32
 #define ZAN_PLAT_TEXT_MAX 65536
 static pthread_key_t zan_plat_text_key;
@@ -2968,11 +2673,7 @@ static void zan_plat_mac_from_sockaddr(struct sockaddr *sa, char *out,
 }
 #endif
 
-/* '\n'-separated adapter snapshot, one line per interface:
- *   name '\t' index '\t' up(0|1) '\t' mac '\t' addr[,addr...]
- * getifaddrs reports one node per address, so addresses are folded into the
- * line of the interface that owns them (matching GetAdaptersAddresses, which
- * hands out one adapter record with a unicast list). */
+/* 内部辅助逻辑 */
 const char *zan_plat_net_interfaces(void) {
 #ifdef _WIN32
     return "";
@@ -2985,7 +2686,7 @@ const char *zan_plat_net_interfaces(void) {
     size_t used = 0;
     for (struct ifaddrs *it = list; it; it = it->ifa_next) {
         if (!it->ifa_name) continue;
-        /* One line per name: skip a name already emitted. */
+        /* 模块核心语义抽象与接口调用契约 */
         int seen = 0;
         for (struct ifaddrs *p = list; p != it; p = p->ifa_next) {
             if (p->ifa_name && strcmp(p->ifa_name, it->ifa_name) == 0) {
@@ -3054,15 +2755,7 @@ static long long zan_plat_now_us(void) {
 }
 #endif
 
-/* Sends one ICMP echo request to the IPv4 literal `address` and waits up to
- * `timeout_ms` for the reply. Returns the round-trip time in milliseconds
- * (>= 0), or a negative status: -1 timed out, -2 destination unreachable,
- * -3 socket/permission error, -4 malformed address.
- *
- * SOCK_DGRAM/IPPROTO_ICMP ("ping sockets") needs no privileges when
- * net.ipv4.ping_group_range covers the caller's gid, and the kernel rewrites
- * the echo id for us; SOCK_RAW is the fallback for older kernels and for
- * macOS, and needs root or CAP_NET_RAW. */
+/* 内部辅助逻辑 */
 int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
 #ifdef _WIN32
     (void)address;
@@ -3081,7 +2774,7 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
     if (fd < 0) fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (fd < 0) return -3;
 
-    /* 8-byte ICMP header + "zan-ping" payload, matching the Windows path. */
+    /* 模块核心语义抽象与接口调用契约 */
     unsigned char packet[16];
     memset(packet, 0, sizeof packet);
     packet[0] = 8;                                  /* ICMP_ECHO */
@@ -3136,7 +2829,7 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
             close(fd);
             return -3;
         }
-        /* A raw socket hands back the IPv4 header; a ping socket does not. */
+        /* 模块核心语义抽象与接口调用契约 */
         size_t offset = 0;
         if (!datagram) {
             if (got < 20) continue;
@@ -3152,23 +2845,20 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
             long long rtt_ms = rtt_us / 1000;
             return (int32_t)(rtt_ms > 0x7FFFFFFF ? 0x7FFFFFFF : rtt_ms);
         }
-        if (type == 3) {                            /* destination unreachable */
+        if (type == 3) {                            /* 核心系统底层抽象与内存语义契约 */
             close(fd);
             return -2;
         }
-        if (type == 11) {                           /* TTL expired in transit */
+        if (type == 11) {                           /* 核心系统底层抽象与内存语义契约 */
             close(fd);
             return -2;
         }
-        /* Anything else (e.g. our own echo request looped back on a raw
-         * socket) is not an answer: keep waiting until the deadline. */
+        /* 核心系统底层抽象与内存语义契约 */
     }
 #endif
 }
 
-/* ========================================================================
- * Cross-platform safe process execution (avoids shell invocation & injection)
- * ======================================================================== */
+/* 跨平台安全子进程创建与执行 */
 
 #ifdef _WIN32
 static void zan_win_buf_append(char *buf, size_t cap, size_t *len, const char *s) {
@@ -3267,9 +2957,7 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     CloseHandle(pi.hThread);
     return (int32_t)code;
 #else
-    /* Build argv before fork: malloc between fork and exec is not
-     * async-signal-safe, and in a multithreaded parent the child can
-     * deadlock on an arena lock held by a thread that no longer exists. */
+    /* 内部辅助逻辑 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) return -1;
     argv[0] = (char *)exe;
@@ -3284,7 +2972,7 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
         return -1;
     }
     if (pid == 0) {
-        /* Child: exec only, the parent's free below cannot touch this COW copy */
+        /* 内部实现与并发/内存约束规范 */
         execvp(exe, argv);
         _exit(127);
     }
@@ -3298,6 +2986,57 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     return -1;
 #endif
 }
+
+#ifndef _WIN32
+#if !defined(__linux__)
+/* 模块核心语义抽象与接口调用契约 */
+static pthread_mutex_t g_proc_pipe_guard = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_proc_pipe_once = PTHREAD_ONCE_INIT;
+static int g_proc_pipe_guard_error;
+static void zan_proc_pipe_fork_prepare(void) { pthread_mutex_lock(&g_proc_pipe_guard); }
+static void zan_proc_pipe_fork_done(void) { pthread_mutex_unlock(&g_proc_pipe_guard); }
+static void zan_proc_pipe_guard_init(void) {
+    g_proc_pipe_guard_error = pthread_atfork(zan_proc_pipe_fork_prepare,
+                                            zan_proc_pipe_fork_done,
+                                            zan_proc_pipe_fork_done);
+}
+#endif
+
+static int zan_proc_launch_pipe(int fds[2]) {
+#if defined(__linux__)
+    if (pipe2(fds, O_CLOEXEC) < 0) return -1;
+#else
+    pthread_once(&g_proc_pipe_once, zan_proc_pipe_guard_init);
+    if (g_proc_pipe_guard_error) return -1;
+    pthread_mutex_lock(&g_proc_pipe_guard);
+    if (pipe(fds) < 0) {
+        pthread_mutex_unlock(&g_proc_pipe_guard);
+        return -1;
+    }
+    if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) goto failed;
+#endif
+    /* 模块核心语义抽象与接口调用契约 */
+    for (int i = 0; i < 2; i++) {
+        if (fds[i] >= 3) continue;
+        int moved = fcntl(fds[i], F_DUPFD_CLOEXEC, 3);
+        if (moved < 0) goto failed;
+        close(fds[i]);
+        fds[i] = moved;
+    }
+#if !defined(__linux__)
+    pthread_mutex_unlock(&g_proc_pipe_guard);
+#endif
+    return 0;
+failed:
+    close(fds[0]);
+    close(fds[1]);
+#if !defined(__linux__)
+    pthread_mutex_unlock(&g_proc_pipe_guard);
+#endif
+    return -1;
+}
+#endif
 
 int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc) {
     if (!exe) return -1;
@@ -3327,7 +3066,7 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     CloseHandle(pi.hThread);
     return 0;
 #else
-    /* argv before fork, same async-signal-safe reasoning as start_sync */
+    /* 模块核心语义抽象与接口调用契约 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) return -1;
     argv[0] = (char *)exe;
@@ -3336,20 +3075,23 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     }
     argv[argc + 1] = NULL;
 
+    /* 内部辅助逻辑 */
+    int launch_pipe[2];
+    if (zan_proc_launch_pipe(launch_pipe) < 0) { free(argv); return -1; }
     pid_t pid = fork();
     if (pid < 0) {
+        close(launch_pipe[0]);
+        close(launch_pipe[1]);
         free(argv);
         return -1;
     }
     if (pid == 0) {
-        /* Intermediate child: fork again and exit at once so the actual
-         * process is reparented to init and reaped there. A single fork
-         * left the child a zombie for as long as this process lived. */
-        if (setsid() < 0) _exit(127);
+        close(launch_pipe[0]);
+        /* 双重 fork 隔离守护子进程 */
+        if (setsid() < 0) goto launch_failed;
         pid_t gc = fork();
-        if (gc < 0) _exit(127);
+        if (gc < 0) goto launch_failed;
         if (gc == 0) {
-            /* Grandchild: the detached process itself. */
             int devnull = open("/dev/null", O_RDWR);
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
@@ -3358,17 +3100,28 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
                 if (devnull > STDERR_FILENO) close(devnull);
             }
             execvp(exe, argv);
+            goto launch_failed;
+        }
+        close(launch_pipe[1]);
+        _exit(0);
+launch_failed: {
+            char failed = 1;
+            while (write(launch_pipe[1], &failed, 1) < 0 && errno == EINTR) {}
             _exit(127);
         }
-        _exit(0);
     }
     free(argv);
-    /* Reap the intermediate; it exits immediately after the second fork. */
+    close(launch_pipe[1]);
+    char failed;
+    ssize_t launch_result;
+    do { launch_result = read(launch_pipe[0], &failed, 1); }
+    while (launch_result < 0 && errno == EINTR);
+    close(launch_pipe[0]);
     int st;
     while (waitpid(pid, &st, 0) < 0) {
         if (errno != EINTR) return -1;
     }
-    return 0;
+    return launch_result == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : -1;
 #endif
 }
 
@@ -3410,7 +3163,7 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
         flags = CREATE_NO_WINDOW;
     }
 
-    /* Wrap exe path in quotes for Windows CreateProcessW */
+    /* 路径安全转义包装防注入 */
     int wexe_len = MultiByteToWideChar(CP_UTF8, 0, exe, -1, NULL, 0);
     if (wexe_len <= 0) {
         if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
@@ -3423,7 +3176,7 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     }
     wcmd[0] = L'"';
     MultiByteToWideChar(CP_UTF8, 0, exe, -1, wcmd + 1, wexe_len);
-    /* MultiByteToWideChar includes null terminator, replace with closing quote */
+    /* 模块核心语义抽象与接口调用契约 */
     wcmd[wexe_len] = L'"';
     wcmd[wexe_len + 1] = L'\0';
 
@@ -3439,14 +3192,12 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* Intermediate child: fork again and exit at once so the actual
-         * process is reparented to init and reaped there (same zombie
-         * reasoning as zan_proc_start_detached_safe). */
+        /* 内部辅助逻辑 */
         if (setsid() < 0) _exit(127);
         pid_t gc = fork();
         if (gc < 0) _exit(127);
         if (gc == 0) {
-            /* Grandchild: the detached process itself. */
+            /* 核心系统底层抽象与内存语义契约 */
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
@@ -3475,7 +3226,7 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
         }
         _exit(0);
     }
-    /* Reap the intermediate; it exits immediately after the second fork. */
+    /* 回收中间引导进程防止僵尸进程 */
     int st;
     while (waitpid(pid, &st, 0) < 0) {
         if (errno != EINTR) return -1;
@@ -3532,7 +3283,7 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     free(wcmd);
-    CloseHandle(hWrite); /* Close write end in parent so ReadFile returns EOF */
+    CloseHandle(hWrite); /* 底层系统交互与数据协议契约 */
 
     if (!ok) {
         CloseHandle(hRead);
@@ -3578,7 +3329,7 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
-    /* argv before fork (async-signal-safe; see start_sync) */
+    /* 模块核心语义抽象与接口调用契约 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) {
         close(pipefd[0]);

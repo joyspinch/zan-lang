@@ -1,4 +1,4 @@
-/* Module-local weak-reference registry */
+/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_WEAK_BUCKET_COUNT 8192
 
@@ -79,7 +79,7 @@ static void emit_weak_unlock(zan_irgen_t *g) {
         LLVMAtomicOrderingRelease, 0);
 }
 
-/* Ensure the bucket array exists, calloc'ing it on first use */
+/* 底层系统交互与数据协议契约 */
 static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
                                         LLVMValueRef calloc_fn) {
     LLVMBuilderRef b = g->builder;
@@ -430,7 +430,7 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMSetAlignment(g->weak_count, 8);
     (void)weak_node_type(g);
 
-    /* void *calloc(size_t, size_t) -- the lazy bucket array */
+    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef calloc_args[] = { i64, i64 };
     LLVMTypeRef calloc_type = LLVMFunctionType(i8ptr, calloc_args, 2, 0);
     LLVMValueRef weak_calloc = LLVMAddFunction(g->mod, "calloc", calloc_type);

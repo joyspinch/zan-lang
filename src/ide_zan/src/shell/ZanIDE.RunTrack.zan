@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Json;
+using System.Threading;
 using Gui;
 using Gui.Widget;
 using Gui.Backend;
@@ -30,31 +31,31 @@ partial class ZanIDE {
         return ZanIDE.CacheDir() + "/runs/" + ZanIDE.PathKey(root) + ".json";
     }
 
-    /// 写检查点。写盘失败绝不能反过来打断正在跑的任务 —— 记录能力自己出问题，
-    /// 顶多是丢了续跑点。
+    /// 核心契约与语义定义。
     void AiRunSave() {
-        if (aiRun == null) { return; }
-        try {
-            string p = this.AiRunCheckpointPath();
-            Directory.CreateDirectoryRecursive(Path.GetDirectoryName(p));
-            File.WriteAllText(p, aiRun.ToJson());
-        } catch (Exception ex) {
-            UiErrorLog.Record("ai-run-save", ex.Message);
+        int version = this.AiSessionVersion();
+        if (!Dispatcher.CheckUiThread()) {
+            App host = app;
+            if (host != null) { host.Post(delegate () {
+                if (this.IsAiSessionVersion(version)) { this.AiRunSave(); }
+            }); }
+            return;
         }
+        if (aiRun != null) { this.QueueAiRunCheckpoint(); }
     }
 
-    /// 打开项目时读回检查点，让「继续」接着上次那一拍跑。读不出来就当没有。
+    /// 核心契约与语义定义。
     void AiRunLoad() {
-        aiRun = null;
-        try {
-            string p = this.AiRunCheckpointPath();
-            if (!File.Exists(p)) { return; }
-            aiRun = AiRun.FromJson(File.ReadAllText(p));
-        } catch (Exception ex) {
-            UiErrorLog.Record("ai-run-load", ex.Message);
-            aiRun = null;
+        int version = this.AiSessionVersion();
+        if (!Dispatcher.CheckUiThread()) {
+            App host = app;
+            if (host != null) { host.Post(delegate () {
+                if (this.IsAiSessionVersion(version)) { this.AiRunLoad(); }
+            }); }
+            return;
         }
-        if (aiRun != null && aiRun.Finished()) { aiRun = null; }
+        aiRun = null;
+        this.RequestAiRunLoad(false, "");
     }
 
     /// 把交付进度切到某个会话存档里带的那一份（`AiPackCur` 存的 `run`）。
@@ -64,28 +65,33 @@ partial class ZanIDE {
     /// 挂着上一段对话的「T1 交付 · 11/12」。存档里没有这一份（旧存档，或者本来
     /// 就没开始过交付）就清掉，连项目检查点一起删，免得下次打开又冒出来。
     void AiRunRestore(string json) {
-        aiRun = null;
-        if (AiAgent.Trim(json) != "") {
-            try {
-                aiRun = AiRun.FromJson(json);
-            } catch (Exception ex) {
-                UiErrorLog.Record("ai-run-restore", ex.Message);
-                aiRun = null;
-            }
+        int version = this.AiSessionVersion();
+        if (!Dispatcher.CheckUiThread()) {
+            App host = app;
+            if (host != null) { host.Post(delegate () {
+                if (this.IsAiSessionVersion(version)) { this.AiRunRestore(json); }
+            }); }
+            return;
         }
-        if (aiRun != null && aiRun.Finished()) { aiRun = null; }
-        if (aiRun == null) { this.AiRunForget(); } else { this.AiRunSave(); }
+        aiRun = null;
+        if (AiAgent.Trim(json) == "") { this.QueueAiRunCheckpoint(); }
+        else { this.RequestAiRunLoad(true, json); }
     }
 
-    /// 丢掉这个项目的交付检查点。删不掉不算错（顶多下次打开多读一次旧的，
-    /// 而会话存档才是权威的那一份）。
+    /// 删除也排进同一条 FIFO，不能越过稍早的 checkpoint save。
     void AiRunForget() {
-        try {
-            string p = this.AiRunCheckpointPath();
-            if (File.Exists(p)) { File.Delete(p); }
-        } catch (Exception ex) {
-            UiErrorLog.Record("ai-run-forget", ex.Message);
+        int version = this.AiSessionVersion();
+        if (!Dispatcher.CheckUiThread()) {
+            App host = app;
+            if (host != null) { host.Post(delegate () {
+                if (this.IsAiSessionVersion(version)) { this.AiRunForget(); }
+            }); }
+            return;
         }
+        AiRun keep = aiRun;
+        aiRun = null;
+        this.QueueAiRunCheckpoint();
+        aiRun = keep;
     }
 
     /// 团队模式下「一个任务节点 = 一次交付」：换节点就换一份十二拍记录，编号

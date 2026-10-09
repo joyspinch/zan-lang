@@ -1,112 +1,72 @@
-/* gui_gl_backend.c -- the GPU rasterizer behind the backend seam.
- *
- * Part of the gui_runtime translation unit (#include'd by gui_runtime.c), like
- * the platform shells: it needs zan_surface_t, the glyph atlas and the CPU
- * backend as its own fallback.
- *
- * Shape of the thing:
- *
- *  - every primitive is one quad whose fragment shader evaluates a signed
- *    distance field, so corner rounding, rings, sector edges and thick lines
- *    come out anti-aliased without a coverage pass and without geometry;
- *  - quads accumulate into one vertex buffer and are submitted in as few draw
- *    calls as the state allows -- clip rectangle and colour travel *with* the
- *    vertex, so a whole frame of unrelated widgets is one call;
- *  - text arrives as the coverage tiles of gui_runtime_glyph.c, which are
- *    uploaded into an atlas texture once per (tile, revision) and then drawn
- *    from the GPU for every later frame that shows the same string;
- *  - GDI's per-channel (ClearType) coverage is preserved exactly, by blending
- *    with dual-source output (core since GL 3.3) rather than collapsing it to
- *    one alpha and losing subpixel AA.
- *
- * Primitives this backend does not implement yet (blur, shadow, snapshot /
- * restore, image blit) are left NULL in the vtable, so the seam runs the CPU
- * code for them; the frame is moved between GPU and CPU by the sync_* entries
- * around such a call. That is the point of a partial vtable: the GPU path can
- * land primitive by primitive, and correctness never depends on the part that
- * is not there yet.
- *
- * Presentation goes two ways: `present` blits the finished framebuffer into the
- * window's back buffer and swaps it (no CPU copy at all), and `read_pixels`
- * pulls the frame into the surface bitmap for the shells and windows that need
- * one -- the layered glass window, screenshots, pixel-compare tests. A shell
- * that has no window handle to offer, or a window GL cannot attach to, simply
- * keeps the read-back path. */
+/* gui_gl_backend */
 
 #include "gui_gl.h"
 #include "gui_gl_context.c"
 
-/* ---------------------------------------------------------------- plumbing */
+/* plumbing */
 
 static zan_gl_api gl;
-/* GL 3.3 core; local to this backend's coverage pass. */
+/* 底层系统交互与数据协议契约 */
 #define ZGL_MAX 0x8008
 #define ZGL_FUNC_ADD 0x8006
 static void (*zgl_blend_equation)(zgl_enum);
 static int g_gl_state = 0;   /* 0 untried, 1 ready, -1 unusable */
 
-#define ZGL_VF 34            /* floats per vertex, see zgl_push */
+#define ZGL_VF 34            /* 底层系统交互与数据协议契约 */
 
 typedef enum {
     ZGL_MODE_NONE = 0,
     ZGL_MODE_BLEND,     /* shapes, source-over */
-    ZGL_MODE_REPLACE,   /* shapes, overwrite (clear_rect, opaque gradients) */
-    ZGL_MODE_TEXT,      /* glyph runs, per-channel coverage */
-    ZGL_MODE_UNION      /* capsules into coverage FBO, maximum not source-over */
-    /* ZGL_MODE_COMPOSITE was folded into ZGL_MODE_BLEND: the shape shader's
-     * uComposite path does the straight-alpha source-over itself and is fed by
-     * per-primitive state, not by a distinct pipeline mode. */
+    ZGL_MODE_REPLACE,   /* 底层系统交互与数据协议契约 */
+    ZGL_MODE_TEXT,      /* 核心系统底层抽象与内存语义契约 */
+    ZGL_MODE_UNION      /* 模块核心语义抽象与接口调用契约 */
+    /* 内部辅助逻辑 */
 } zgl_mode;
 
-/* Shape kinds, as the fragment shader switches on them. */
+/* 底层系统交互与数据协议契约 */
 #define ZGL_K_RECT    0
 #define ZGL_K_CIRCLE  1
 #define ZGL_K_RADIAL  2
 #define ZGL_K_SECTOR  3
 #define ZGL_K_CAPSULE 4
-#define ZGL_K_TEXT1   5   /* single-channel coverage tile (FreeType glyph) */
-#define ZGL_K_TEXT4   6   /* per-channel coverage tile (GDI run) */
-#define ZGL_K_UNION   7   /* sample completed polyline coverage */
-#define ZGL_K_TEXTRGBA 9 /* color glyph tile: own BGRA + straight alpha */
-#define ZGL_K_SURFACE 8   /* combined rounded fill and border */
-#define ZGL_K_SPRITE  10  /* textured quad from the sprite registry */
+#define ZGL_K_TEXT1   5   /* 底层系统交互与数据协议契约 */
+#define ZGL_K_TEXT4   6   /* 底层系统交互与数据协议契约 */
+#define ZGL_K_UNION   7   /* 核心系统底层抽象与内存语义契约 */
+#define ZGL_K_TEXTRGBA 9 /* 底层系统交互与数据协议契约 */
+#define ZGL_K_SURFACE 8   /* 核心系统底层抽象与内存语义契约 */
+#define ZGL_K_BITMAP  10  /* 核心系统底层抽象与内存语义契约 */
 
-/* Tile side for the upload comparison below: 64x64 is 16 KiB of pixels, small
- * enough that a scrolled list or a hovered button touches few tiles, large
- * enough that a full-surface change is a few hundred TexSubImage2D calls. */
+/* 内部辅助逻辑 */
 #define ZGL_TILE 64
 
 typedef struct {
     zgl_uint tex, fbo;
-    zgl_uint cov_tex, cov_fbo; /* lazy, surface-sized R8 union scratch */
+    zgl_uint cov_tex, cov_fbo; /* 核心系统底层抽象与内存语义契约 */
     int w, h;
-    int gpu_ahead;   /* GPU framebuffer holds pixels s->pixels does not */
-    int cpu_ahead;   /* s->pixels holds pixels the GPU framebuffer does not */
-    /* Last pixels this target uploaded or read back, so an upload can send the
-     * tiles the CPU actually changed instead of the whole surface. NULL when
-     * the allocation failed, which just means whole-surface uploads. */
+    int gpu_ahead;   /* 底层系统交互与数据协议契约 */
+    int cpu_ahead;   /* 模块核心语义抽象与接口调用契约 */
+    /* 内部辅助逻辑 */
     unsigned char *shadow;
+    int shadow_valid;
 } zgl_target;
 
 static zgl_target g_zgl_targets[64];
 
-/* One vertex buffer for every surface: draws are always flushed before the
- * render target changes, so the batch never spans two framebuffers. */
+/* 内部辅助逻辑 */
 static struct {
     zgl_uint prog_shape, prog_text, vao, vbo;
     zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
              u_destination;
-    zgl_uint atlas1, atlas4;         /* R8 and RGBA8 glyph atlases */
-    zgl_int  u_atlas2;               /* sprite batch sampler (shape program) */
-    int      sprite_handle;          /* handle whose texture unit 2 holds */
-    zgl_uint sprite_tex;             /* 0 = no sprite batch in flight */
+    zgl_uint atlas1, atlas4;         /* 核心系统底层抽象与内存语义契约 */
+    zgl_int  u_atlas2;               /* 核心系统底层抽象与内存语义契约 */
+    zgl_uint bitmap_tex;             /* 核心系统底层抽象与内存语义契约 */
     float   *verts;
     size_t   count, cap;             /* in floats */
     zgl_mode mode;
     zan_surface_t *target;
 } g_zgl;
 
-/* --------------------------------------------------------------- shaders */
+/* shaders */
 
 static const char *ZGL_VS =
 "#version 330 core\n"
@@ -119,7 +79,7 @@ static const char *ZGL_VS =
 "in vec4 a_col1;\n"
 "in vec4 a_col2;\n"
 "in vec4 a_clip;\n"    /* x0, y0, x1, y1 (exclusive) */
-"in vec4 a_seg;\n"     /* capsule endpoints */
+"in vec4 a_seg;\n"     /* 核心系统底层抽象与内存语义契约 */
 "in vec2 a_uv;\n"
 "flat out vec2 v_center;\n"
 "flat out vec4 v_shape;\n"
@@ -134,15 +94,13 @@ static const char *ZGL_VS =
 "    v_center = a_center; v_shape = a_shape; v_kind = a_kind;\n"
 "    v_col0 = a_col0; v_col1 = a_col1; v_col2 = a_col2;\n"
 "    v_clip = a_clip; v_seg = a_seg; v_uv = a_uv;\n"
-/* Surface coordinates are top-left origin, GL's are bottom-left: flip here so
- * everything above (and every clip rectangle) can stay in surface space. */
+/* 内部辅助逻辑 */
 "    vec2 ndc = vec2(a_pos.x / uViewport.x * 2.0 - 1.0,\n"
 "                    1.0 - a_pos.y / uViewport.y * 2.0);\n"
 "    gl_Position = vec4(ndc, 0.0, 1.0);\n"
 "}\n";
 
-/* Shared prologue of both fragment shaders: the pixel this fragment covers, in
- * surface coordinates, and the clip test. */
+/* 内部辅助逻辑 */
 #define ZGL_FS_COMMON \
 "uniform vec2 uViewport;\n" \
 "flat in vec2 v_center;\n" \
@@ -173,15 +131,11 @@ ZGL_FS_COMMON
 "    if (s.a <= 0.0) return dst;\n"
 "    float da = floor(d.a * (255.0-s.a) / 255.0);\n"
 "    float a = s.a + da;\n"
-"    /* blend_over, byte for byte: the stored RGB is normalised by the RESULT\n"
-"     * alpha (straight alpha) and quantised with integer division, so the\n"
-"     * layered present and any CPU readback see the same bytes the CPU path\n"
-"     * would have written for the same geometry. */\n"
+"    /* 内部辅助逻辑 */\n"
 "    return vec4(floor((s.rgb*s.a+d.rgb*da)/a), a)/255.0;\n"
 "}\n"
 "out vec4 o_color;\n"
-/* Rounded-box distance with per-corner radius: a corner whose mask bit is
- * clear is square, which is how welded controls share a straight seam. */
+/* 内部辅助逻辑 */
 "float sd_round(vec2 p, vec2 half_, float r, int mask) {\n"
 "    float rr = r;\n"
 "    int bit = (p.x < 0.0) ? ((p.y < 0.0) ? 1 : 8) : ((p.y < 0.0) ? 2 : 4);\n"
@@ -194,8 +148,7 @@ ZGL_FS_COMMON
 "    float t = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);\n"
 "    return length(pa - ba * t);\n"
 "}\n"
-/* grad_sample's three-stop lerp, in floats: `via` is used only when its flag
- * (v_kind.z) says the caller passed one. */
+/* 内部辅助逻辑 */
 "vec4 grad(float t) {\n"
 "    if (v_kind.z > 0.5) {\n"
 "        return (t < 0.5) ? mix(v_col0, v_col2, t * 2.0)\n"
@@ -207,8 +160,7 @@ ZGL_FS_COMMON
 "    vec2 p = zpix();\n"
 "    zclip(p);\n"
 "    int kind = int(v_kind.x + 0.5);\n"
-/* Circle/sector and capsules use pixel centres. The radial glow alone keeps
- * the CPU's integer-lattice squared-distance falloff. */
+/* 底层系统交互与数据协议契约 */
 "    vec2 lp = p - v_center;\n"
 "    if (kind == 2) lp -= vec2(0.5);\n"
 "    float cov = 0.0;\n"
@@ -217,8 +169,7 @@ ZGL_FS_COMMON
 "        float sd = sd_round(lp, v_shape.xy, v_shape.z, int(v_kind.y + 0.5));\n"
 "        if (v_shape.w > 0.0) sd = abs(sd + v_shape.w * 0.5) - v_shape.w * 0.5;\n"
 "        cov = clamp(0.5 - sd, 0.0, 1.0);\n"
-/* Gradient direction, matching zan_gui_fill_grad_mask: 0 vertical, 1
- * horizontal, 2 to bottom-right, 3 to bottom-left. */
+/* 内部辅助逻辑 */
 "        int gdir = int(v_kind.w + 0.5);\n"
 "        if (gdir >= 0) {\n"
 "            vec2 h = v_shape.xy;\n"
@@ -232,13 +183,12 @@ ZGL_FS_COMMON
 "            col = grad(clamp(t, 0.0, 1.0));\n"
 "        }\n"
 "    } else if (kind == 1) {\n"
-/* Filled: coverage ramps across the last half pixel of the radius. Stroked:
- * the ring straddles the radius, half its thickness on each side. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 "        float sd = (v_shape.w > 0.0)\n"
 "                 ? abs(length(lp) - v_shape.z) - v_shape.w * 0.5\n"
 "                 : length(lp) - v_shape.z;\n"
 "        cov = clamp(0.5 - sd, 0.0, 1.0);\n"
-/* Soft glow: the CPU path's squared falloff, alpha only. */
+/* 模块核心语义抽象与接口调用契约 */
 "    } else if (kind == 2) {\n"
 "        float r = v_shape.z;\n"
 "        float d2 = dot(lp, lp);\n"
@@ -255,7 +205,7 @@ ZGL_FS_COMMON
 "        if (dist > ro - 0.5) radc = ro + 0.5 - dist;\n"
 "        else if (ri > 0.0 && dist < ri + 0.5) radc = dist - (ri - 0.5);\n"
 "        float a0 = v_kind.y, a1 = v_kind.w;\n"
-/* Degrees clockwise from 12 o'clock, like zan_gui_fill_sector. */
+/* 模块核心语义抽象与接口调用契约 */
 "        float ang = degrees(atan(lp.x, -lp.y));\n"
 "        if (ang < 0.0) ang += 360.0;\n"
 "        float angc = 1.0;\n"
@@ -289,8 +239,7 @@ ZGL_FS_COMMON
 "        o_color = over(vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha));\n"
 "        return;\n"
 "    }\n"
-/* Textured sprite: straight-alpha texel scaled by the tint colour; the
-   regular BLEND pipeline does the source-over. */
+/* 内部辅助逻辑 */
 "    if (kind == 10) {\n"
 "        col = texture(uAtlas2, v_uv) * v_col0;\n"
 "        cov = 1.0;\n"
@@ -298,25 +247,17 @@ ZGL_FS_COMMON
 "    if (cov <= 0.0) discard;\n"
 "    o_color = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
 "                                          : vec4(col.rgb, col.a * cov);\n"
-"    /* Straight-alpha source-over computed in the shader, byte-faithful to the\n"
-"     * CPU's blend_over: fixed-function blending accumulates RGB without the\n"
-"     * /alpha normalisation, which on transparent destinations (shaped/glass\n"
-"     * windows) fringes every translucent edge. Kinds 7/8 always need it; the\n"
-"     * coverage/destination samplers are bound only for those draws. */\n"
+"    /* 内部辅助逻辑 */\n"
 "    if (kind == 7 || kind == 8) o_color = over(o_color);\n"
 "}\n";
 
-/* Text: two fragment outputs, colour and per-channel coverage, blended as
- * SRC1_COLOR / ONE_MINUS_SRC1_COLOR. That is what keeps GDI's subpixel
- * (ClearType) coverage intact on the GPU -- averaging the three channels into
- * one alpha would visibly change every label in the app. */
+/* 内部辅助逻辑 */
 static const char *ZGL_FS_TEXT =
 "#version 330 core\n"
 ZGL_FS_COMMON
 "uniform sampler2D uAtlas1;\n"
 "uniform sampler2D uAtlas4;\n"
-/* The two dual-source slots are pinned here rather than left to the linker, so
- * which output the blender reads as SRC1 does not depend on the driver. */
+/* 内部辅助逻辑 */
 "layout(location = 0, index = 0) out vec4 o_color;\n"
 "layout(location = 0, index = 1) out vec4 o_cov;\n"
 "void main() {\n"
@@ -324,9 +265,7 @@ ZGL_FS_COMMON
 "    zclip(p);\n"
 "    int kind = int(v_kind.x + 0.5);\n"
 "    if (kind == 9) {\n"
-/* Color glyph tile (CBDT emoji): own straight-alpha BGRA pixels, blended
- * source-over through the same dual-source equation -- out = t.rgb * t.a
- * + dst * (1 - t.a); the run color does not participate. */
+/* 内部辅助逻辑 */
 "        vec4 t = texture(uAtlas4, v_uv);\n"
 "        if (t.a <= 0.0) discard;\n"
 "        o_color = vec4(t.rgb, 1.0);\n"
@@ -341,7 +280,7 @@ ZGL_FS_COMMON
 "    o_cov = vec4(c, max(max(c.r, c.g), c.b));\n"
 "}\n";
 
-/* ------------------------------------------------------------ GL bootstrap */
+/* GL bootstrap */
 
 static zgl_uint zgl_compile(zgl_enum type, const char *src) {
     zgl_uint sh = gl.CreateShader(type);
@@ -384,8 +323,7 @@ static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
     return prog;
 }
 
-/* The vertex layout, declared once and applied to both programs: the attribute
- * names are the same in each, so one VAO can feed them both. */
+/* 内部辅助逻辑 */
 static void zgl_bind_attribs(zgl_uint prog) {
     struct { const char *name; int size; } a[] = {
         { "a_pos", 2 }, { "a_center", 2 }, { "a_shape", 4 }, { "a_kind", 4 },
@@ -424,8 +362,7 @@ static int zgl_init(void) {
     if (g_gl_state) return g_gl_state > 0;
     g_gl_state = -1;
     if (!zan_gl_ctx_create()) return 0;
-    /* Creating leaves the context current; binding it again is how the thread
-     * that will draw claims it (and the last check that it is usable). */
+    /* 内部辅助逻辑 */
     if (!zan_gl_ctx_make_current()) { zan_gl_ctx_destroy(); return 0; }
     if (!zan_gl_api_load(&gl, zan_gl_ctx_getproc)) { zan_gl_ctx_destroy(); return 0; }
     zgl_blend_equation = (void (*)(zgl_enum))zan_gl_ctx_getproc("glBlendEquation");
@@ -463,11 +400,9 @@ static int zgl_init(void) {
     return 1;
 }
 
-/* ------------------------------------------------------- render targets */
+/* 核心系统底层抽象与内存语义契约 */
 
-/* The framebuffer a surface is drawn into, created on first use. Returns NULL
- * when the GPU cannot host this surface, and the caller falls back to the CPU
- * path for that primitive. */
+/* 模块核心语义抽象与接口调用契约 */
 static zgl_target *zgl_target_of(zan_surface_t *s) {
     if (s->id < 0 || s->id >= (int)(sizeof(g_zgl_targets) / sizeof(g_zgl_targets[0])))
         return NULL;
@@ -502,8 +437,7 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
         t->w = s->width;
         t->h = s->height;
         t->shadow = (unsigned char *)malloc((size_t)s->width * (size_t)s->height * 4);
-        /* A fresh target starts from whatever the surface holds, so a backend
-         * installed mid-run does not begin with a black window. */
+        /* 内部辅助逻辑 */
         t->cpu_ahead = 1;
     }
     return t;
@@ -511,7 +445,7 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
 
 static void zgl_flush(void);
 
-/* Copy one tile's rows between the surface and the shadow. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void zgl_shadow_store(zan_surface_t *s, zgl_target *t,
                              int x, int y, int tw, int th) {
     size_t row = (size_t)tw * 4;
@@ -521,7 +455,7 @@ static void zgl_shadow_store(zan_surface_t *s, zgl_target *t,
                row);
 }
 
-/* Does this tile differ from what the GPU already has? */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static int zgl_tile_dirty(zan_surface_t *s, zgl_target *t,
                           int x, int y, int tw, int th) {
     size_t row = (size_t)tw * 4;
@@ -534,72 +468,55 @@ static int zgl_tile_dirty(zan_surface_t *s, zgl_target *t,
     return 0;
 }
 
-/* s->pixels -> GPU, when the CPU path drew the most recent pixels.
- *
- * A frame that mixes CPU and GPU primitives (a blur, an image, a shadow) syncs
- * this way every time, so uploading the whole surface would spend the GPU's
- * bandwidth on pixels it already has. Comparing 64x64 tiles against the last
- * uploaded copy costs a memcmp over the surface -- cheap next to the transfer
- * -- and sends only what changed. The result is identical either way: the
- * pixels the GPU ends up with are exactly `s->pixels`. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     if (!t->cpu_ahead) return;
     gl.BindTexture(ZGL_TEXTURE_2D, t->tex);
-    /* stride == width for every surface the runtime allocates; a padded one
-     * would need a row loop, so assert the assumption rather than corrupt it. */
+    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
+    /* 编译器代码生成与运行时系统底层调用契约 */
     if (!t->shadow) {
-        if (s->stride == s->width) {
-            gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, 0, 0, s->width, s->height,
-                             ZGL_BGRA, ZGL_UNSIGNED_BYTE, s->pixels);
-        } else {
-            for (int y = 0; y < s->height; y++) {
-                gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, 0, y, s->width, 1,
-                                 ZGL_BGRA, ZGL_UNSIGNED_BYTE,
-                                 s->pixels + (size_t)y * (size_t)s->stride);
-            }
+        for (int y = 0; y < s->height; y++) {
+            gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, 0, s->height - 1 - y,
+                             s->width, 1, ZGL_BGRA, ZGL_UNSIGNED_BYTE,
+                             s->pixels + (size_t)y * (size_t)s->stride);
         }
         t->cpu_ahead = 0;
         return;
     }
-
-    /* Sub-rectangles come out of a wider image, so GL has to be told the real
-     * row length; it goes back to 0 ("as wide as the transfer") afterwards. */
-    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, s->stride);
+    u32 tile[ZGL_TILE * ZGL_TILE];
     for (int y = 0; y < s->height; y += ZGL_TILE) {
         int th = s->height - y < ZGL_TILE ? s->height - y : ZGL_TILE;
         for (int x = 0; x < s->width; x += ZGL_TILE) {
             int tw = s->width - x < ZGL_TILE ? s->width - x : ZGL_TILE;
-            if (!zgl_tile_dirty(s, t, x, y, tw, th)) continue;
-            gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, x, y, tw, th,
-                             ZGL_BGRA, ZGL_UNSIGNED_BYTE,
-                             s->pixels + (size_t)y * (size_t)s->stride + (size_t)x);
+            if (t->shadow_valid && !zgl_tile_dirty(s, t, x, y, tw, th)) continue;
+            for (int row = 0; row < th; row++)
+                memcpy(tile + row * tw,
+                       s->pixels + (size_t)(y + th - 1 - row) * s->stride + x,
+                       (size_t)tw * sizeof(u32));
+            gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, x, s->height - y - th, tw, th,
+                             ZGL_BGRA, ZGL_UNSIGNED_BYTE, tile);
             zgl_shadow_store(s, t, x, y, tw, th);
         }
     }
-    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
+    t->shadow_valid = 1;
     t->cpu_ahead = 0;
 }
 
-/* Staging rows for GPU readback: GL hands the frame back bottom-up and the
- * surface is top-down, so the flip runs through here. Reused across calls --
- * present-path shells read back every frame, and a malloc/free of
- * W*H*4 per present showed up as pure allocator churn. Grow-only, like the
- * polyline coverage scratch on the CPU side. */
+/* 内部辅助逻辑 */
 static unsigned char *g_zgl_rb = NULL;
 static size_t g_zgl_rb_cap = 0;
 
-/* GPU -> s->pixels, for the shells' present path and for any primitive still
- * running on the CPU. */
+/* 内部辅助逻辑 */
 static void zgl_readback(zan_surface_t *s, zgl_target *t) {
     if (!t->gpu_ahead) return;
     if (s->width <= 0 || s->height <= 0) return;
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-    /* GL hands back rows bottom-up; the surface is top-down. */
+    /* 模块核心语义抽象与接口调用契约 */
     size_t row = (size_t)s->width * 4;
     size_t need = row * (size_t)s->height;
     if (need > g_zgl_rb_cap) {
         unsigned char *ng = (unsigned char *)realloc(g_zgl_rb, need);
-        if (!ng) return;   /* keep the old block; skip this readback */
+        if (!ng) return;   /* 底层系统交互与数据协议契约 */
         g_zgl_rb = ng;
         g_zgl_rb_cap = need;
     }
@@ -609,9 +526,11 @@ static void zgl_readback(zan_surface_t *s, zgl_target *t) {
         memcpy(s->pixels + (size_t)y * (size_t)s->stride,
                g_zgl_rb + row * (size_t)(s->height - 1 - y), row);
     }
-    /* The surface and the GPU now agree, so this is also the newest shadow --
-     * without it every tile would read as dirty on the next upload. */
-    if (t->shadow) zgl_shadow_store(s, t, 0, 0, s->width, s->height);
+    /* 内部辅助逻辑 */
+    if (t->shadow) {
+        zgl_shadow_store(s, t, 0, 0, s->width, s->height);
+        t->shadow_valid = 1;
+    }
     t->gpu_ahead = 0;
 }
 
@@ -621,241 +540,25 @@ static void gl_sync_to_cpu(zan_surface_t *s) {
     zgl_target *t = zgl_target_of(s);
     if (!t) return;
     zgl_readback(s, t);
-    t->cpu_ahead = 1;   /* whatever runs next writes into s->pixels */
+    t->cpu_ahead = 1;   /* 底层系统交互与数据协议契约 */
 }
 
-/* ------------------------------------------------------------- 3D pipeline
- *
- * Depth-tested, texture-mapped triangles drawn into the surface's FBO. The
- * 2D batch above owns state (blending, scissor-off, no depth), so every 3D
- * draw is a self-contained pass: flush the 2D batch first, attach the lazy
- * depth renderbuffer, set its own program/VAO, draw, and restore 2D state.
- * Y is flipped inside the shader (surface space is top-down, like the 2D
- * path), so an app composes one matrix chain and both backends agree. */
+static void (*g_gpu_cleanup[8])(int32_t);
+static int g_gpu_cleanup_count;
+static uint64_t g_gpu_epoch = 1;
 
-#define ZGL_MESH_VCAP 24
-typedef struct {
-    zgl_uint vbo, ebo, vao;
-    int index_count;
-    int used;
-} zgl_mesh;
-
-static zgl_mesh g_zgl_meshes[ZGL_MESH_VCAP];
-
-/* Lazily created per-target depth attachment (kept across frames; grown with
- * the surface resize in zgl_target_of by the drop-recreate there). */
-static zgl_uint zgl_depth_of(zgl_target *t) {
-    static zgl_uint rb[64];
-    static int rw[64], rh[64];
-    if (t - g_zgl_targets < 0 || t - g_zgl_targets >= 64) return 0;
-    int slot = (int)(t - g_zgl_targets);
-    if (rb[slot] && rw[slot] == t->w && rh[slot] == t->h) return rb[slot];
-    if (rb[slot]) gl.DeleteRenderbuffers(1, &rb[slot]);
-    rb[slot] = 0;
-    gl.GenRenderbuffers(1, &rb[slot]);
-    gl.BindRenderbuffer(ZGL_RENDERBUFFER, rb[slot]);
-    gl.RenderbufferStorage(ZGL_RENDERBUFFER, ZGL_DEPTH_COMPONENT16,
-                           t->w, t->h);
-    gl.FramebufferRenderbuffer(ZGL_FRAMEBUFFER, ZGL_DEPTH_ATTACHMENT,
-                               ZGL_RENDERBUFFER, rb[slot]);
-    rw[slot] = t->w;
-    rh[slot] = t->h;
-    return rb[slot];
-}
-
-/* Texture for a draw: the runtime's image cache ("file path" or "mem:" key),
- * uploaded linearly sampled; a 1x1 white stand-in when there is none, so a
- * plain-coloured mesh needs no null branch in the shader. */
-static zgl_uint zgl_3d_texture(const char *path, int *out_w, int *out_h) {
-    static zgl_uint white = 0;
-    struct { const char *key; zgl_uint tex; int w, h; } cache[8];
-    static int cache_n = 0;
-    *out_w = *out_h = 1;
-    if (!white) {
-        gl.GenTextures(1, &white);
-        gl.BindTexture(ZGL_TEXTURE_2D, white);
-        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
-        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
-        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
-        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
-        unsigned int px = 0xFFFFFFFFu;
-        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, 1, 1, 0, ZGL_RGBA,
-                      ZGL_UNSIGNED_BYTE, &px);
-    }
-    if (!path || !path[0]) return white;
-    zan_img_t *e = zan_img_find(path);
-    if (!e && strncmp(path, "mem:", 4) == 0) e = zan_img_mem_find(path);
-    if (!e) return white;
-    for (int i = 0; i < cache_n; i++)
-        if (strcmp(cache[i].key, path) == 0) {
-            *out_w = cache[i].w; *out_h = cache[i].h;
-            return cache[i].tex;
-        }
-    zgl_uint tex = 0;
-    gl.GenTextures(1, &tex);
-    gl.BindTexture(ZGL_TEXTURE_2D, tex);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
-    gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
-    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
-    /* zan_img_t holds ARGB32 (a<<24|r<<16|g<<8|b, memory B,G,R,A); GL wants
-     * bytes in sampling order -- BGRA reads the same memory straight across. */
-    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, e->w, e->h, 0, ZGL_BGRA,
-                  ZGL_UNSIGNED_BYTE, e->pix);
-    if (gl.GetError() != ZGL_NO_ERROR) { gl.DeleteTextures(1, &tex); return white; }
-    if (cache_n < 8) {
-        cache[cache_n].key = strdup(path);
-        cache[cache_n].tex = tex;
-        cache[cache_n].w = e->w;
-        cache[cache_n].h = e->h;
-        cache_n++;
-    } else {
-        /* Cache full: keep the texture alive for this frame only. */
-        return tex;
-    }
-    *out_w = e->w;
-    *out_h = e->h;
-    return tex;
-}
-
-static const char *ZGL_3D_VS =
-"#version 330 core\n"
-"uniform mat4 uMVP;\n"
-"uniform vec2 uViewport;\n"
-"in vec3 a_pos;\n"
-"in vec3 a_normal;\n"
-"in vec2 a_uv;\n"
-"out vec2 v_uv;\n"
-"out vec3 v_normal;\n"
-"void main() {\n"
-"    v_uv = a_uv;\n"
-"    v_normal = a_normal;\n"
-"    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
-/* Surface space is top-down: flip Y after projection so a Zan-composed matrix
- * (Math3D.zan, +y up, -z forward) lands the way the 2D path reads pixels. */
-"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
-"}\n";
-
-static const char *ZGL_3D_FS =
-"#version 330 core\n"
-"uniform sampler2D uTex;\n"
-"uniform vec4 uColor;\n"
-"in vec2 v_uv;\n"
-"in vec3 v_normal;\n"
-"out vec4 frag;\n"
-"void main() {\n"
-/* Half-Lambert wrap keeps back faces readable without a second light. */
-"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
-"    float shade = 0.55 + 0.45 * lam;\n"
-"    vec4 tex = texture(uTex, v_uv);\n"
-"    frag = vec4(tex.rgb * uColor.rgb * shade, tex.a * uColor.a);\n"
-"}\n";
-
-static zgl_uint g_zgl_prog3d;
-static zgl_int g_zgl_u3d_mvp, g_zgl_u3d_tex, g_zgl_u3d_color;
-
-static int gl_mesh_create(zan_surface_t *s, const zan_mesh_data *m) {
-    (void)s;
-    if (g_gl_state <= 0 || !m || !m->verts || m->count <= 0 ||
-        m->count > 65536 || m->index_count <= 0 || !m->indices) return 0;
-    int slot = -1;
-    for (int i = 0; i < ZGL_MESH_VCAP; i++)
-        if (!g_zgl_meshes[i].used) { slot = i; break; }
-    if (slot < 0) return 0;
-    zgl_mesh *ms = &g_zgl_meshes[slot];
-    if (!g_zgl_prog3d) {
-        g_zgl_prog3d = zgl_link(ZGL_3D_VS, ZGL_3D_FS);
-        if (!g_zgl_prog3d) return 0;
-        g_zgl_u3d_mvp = gl.GetUniformLocation(g_zgl_prog3d, "uMVP");
-        g_zgl_u3d_tex = gl.GetUniformLocation(g_zgl_prog3d, "uTex");
-        g_zgl_u3d_color = gl.GetUniformLocation(g_zgl_prog3d, "uColor");
-    }
-    zan_gl_ctx_make_current();
-    gl.GenVertexArrays(1, &ms->vao);
-    gl.BindVertexArray(ms->vao);
-    gl.GenBuffers(1, &ms->vbo);
-    gl.BindBuffer(ZGL_ARRAY_BUFFER, ms->vbo);
-    gl.BufferData(ZGL_ARRAY_BUFFER,
-                  (zgl_sizeiptr)(size_t)m->count * 8 * sizeof(float),
-                  m->verts, ZGL_STATIC_DRAW);
-    gl.GenBuffers(1, &ms->ebo);
-    gl.BindBuffer(ZGL_ELEMENT_ARRAY_BUFFER, ms->ebo);
-    gl.BufferData(ZGL_ELEMENT_ARRAY_BUFFER,
-                  (zgl_sizeiptr)(size_t)m->index_count * sizeof(unsigned short),
-                  m->indices, ZGL_STATIC_DRAW);
-    struct { const char *name; int size; size_t off; } a[] = {
-        { "a_pos", 3, 0 }, { "a_normal", 3, 3 * sizeof(float) },
-        { "a_uv", 2, 6 * sizeof(float) },
-    };
-    for (size_t i = 0; i < 3; i++) {
-        zgl_int loc = gl.GetAttribLocation(g_zgl_prog3d, a[i].name);
-        if (loc >= 0) {
-            gl.EnableVertexAttribArray((zgl_uint)loc);
-            gl.VertexAttribPointer((zgl_uint)loc, a[i].size, ZGL_FLOAT,
-                                   ZGL_FALSE, 8 * (zgl_sizei)sizeof(float),
-                                   (const void *)a[i].off);
-        }
-    }
-    gl.BindVertexArray(0);
-    ms->index_count = m->index_count;
-    ms->used = 1;
-    return slot + 1;   /* 1-based mesh id; 0 stays "no mesh" */
-}
-
-static int gl_draw3d(zan_surface_t *s, int mesh, const zan_draw3d *d) {
-    if (g_gl_state <= 0 || !d) return 0;
-    if (mesh <= 0 || mesh > ZGL_MESH_VCAP || !g_zgl_meshes[mesh - 1].used)
-        return 0;
-    zgl_target *t = zgl_target_of(s);
-    if (!t) return 0;
-    zgl_flush();               /* 2D batch lands before the 3D pass */
-    zgl_upload(s, t);          /* newest CPU pixels in, incl. clear_rect */
-    if (!g_zgl_prog3d) return 0;
-    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-    zgl_depth_of(t);
-    gl.Viewport(0, 0, t->w, t->h);
-    /* The depth renderbuffer starts at 1.0 and only the 3D pass writes it, so
-     * clearing it here is what makes two 3D passes on one frame independent;
-     * colour keeps whatever the 2D passes painted. */
-    gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-    gl.Clear(ZGL_DEPTH_BUFFER_BIT);
-    gl.Enable(ZGL_DEPTH_TEST);
-    gl.DepthFunc(ZGL_LEQUAL);
-    gl.Disable(ZGL_BLEND);
-    gl.UseProgram(g_zgl_prog3d);
-    gl.UniformMatrix4fv(g_zgl_u3d_mvp, 1, ZGL_FALSE, d->mvp);
-    gl.Uniform4f(g_zgl_u3d_color,
-                 (float)((d->color >> 16) & 0xFF) / 255.0f,
-                 (float)((d->color >> 8) & 0xFF) / 255.0f,
-                 (float)(d->color & 0xFF) / 255.0f,
-                 (float)((d->color >> 24) & 0xFF) / 255.0f);
-    int tw, th;
-    zgl_uint tex = zgl_3d_texture(d->texture, &tw, &th);
-    gl.ActiveTexture(ZGL_TEXTURE0);
-    gl.BindTexture(ZGL_TEXTURE_2D, tex);
-    gl.Uniform1i(g_zgl_u3d_tex, 0);
-    zgl_mesh *ms = &g_zgl_meshes[mesh - 1];
-    gl.BindVertexArray(ms->vao);
-    gl.DrawElements(ZGL_TRIANGLES, ms->index_count, ZGL_UNSIGNED_SHORT, 0);
-    gl.BindVertexArray(0);
-    gl.Disable(ZGL_DEPTH_TEST);
-    gl.Enable(ZGL_BLEND);
-    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-    t->gpu_ahead = 1;
+EXPORT i32 zan_gui_gpu_register_cleanup(void (*cleanup)(int32_t)) {
+    if (!cleanup) return 0;
+    for (int i = 0; i < g_gpu_cleanup_count; i++)
+        if (g_gpu_cleanup[i] == cleanup) return 1;
+    if (g_gpu_cleanup_count == 8) return 0;
+    g_gpu_cleanup[g_gpu_cleanup_count++] = cleanup;
     return 1;
 }
 
-static void gl_mesh_drop_all(void) {
-    if (g_gl_state <= 0) return;
-    for (int i = 0; i < ZGL_MESH_VCAP; i++) {
-        zgl_mesh *ms = &g_zgl_meshes[i];
-        if (!ms->used) continue;
-        gl.DeleteBuffers(1, &ms->vbo);
-        gl.DeleteBuffers(1, &ms->ebo);
-        gl.DeleteVertexArrays(1, &ms->vao);
-        memset(ms, 0, sizeof(*ms));
-    }
+static void zgl_cleanup_extensions(int surface_id) {
+    for (int i = 0; i < g_gpu_cleanup_count; i++)
+        g_gpu_cleanup[i](surface_id);
 }
 
 static void gl_sync_from_cpu(zan_surface_t *s) {
@@ -866,7 +569,7 @@ static void gl_sync_from_cpu(zan_surface_t *s) {
     zgl_upload(s, t);
 }
 
-/* --------------------------------------------------------------- batching */
+/* batching */
 
 static void zgl_flush(void) {
     if (!g_zgl.count || !g_zgl.target) { g_zgl.count = 0; return; }
@@ -884,9 +587,7 @@ static void zgl_flush(void) {
     gl.BufferData(ZGL_ARRAY_BUFFER,
                   (zgl_sizeiptr)(g_zgl.count * sizeof(float)),
                   g_zgl.verts, ZGL_STREAM_DRAW);
-    /* Kinds 7/8 do their source-over in the shader and need the destination
-     * texels as they sit on the GPU right now; a snapshot that lags the
-     * framebuffer would composite against stale pixels. */
+    /* 内部辅助逻辑 */
     int shader_over = 0;
     for (size_t v = 0; v + 8 <= g_zgl.count; v += ZGL_VF) {
         int k = (int)(g_zgl.verts[v + 8] + 0.5f);
@@ -905,9 +606,7 @@ static void zgl_flush(void) {
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
         gl.Uniform1i(g_zgl.u_atlas4, 1);
         gl.Enable(ZGL_BLEND);
-        /* Colour blends against the per-channel coverage; the alpha channel takes
-         * that coverage as one scalar, so text on a transparent surface
-         * accumulates alpha the way blend_over does. */
+        /* 内部辅助逻辑 */
         gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
                              ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
     } else {
@@ -915,17 +614,11 @@ static void zgl_flush(void) {
         zgl_bind_attribs(g_zgl.prog_shape);
         gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
         gl.ActiveTexture(ZGL_TEXTURE0);
-        /* Union capsules write coverage into the scratch R8 attachment; nothing
-         * is sampled. The shader-over kinds sample the completed coverage and
-         * the destination snapshot below. */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         if (g_zgl.mode == ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, 0);
         } else if (shader_over) {
-            /* Snapshot the destination at its current state, then draw over
-             * that copy with blending disabled so the shader sees the true
-             * destination and writes the composited result, not a blend of
-             * itself. Snapshot is a process-wide scratch: sized on demand,
-             * copied for each draw batch that needs it, freed with the context. */
+            /* 内部辅助逻辑 */
             if (snap_w != t->w || snap_h != t->h) {
                 if (snap_tex) { gl.DeleteTextures(1, &snap_tex); gl.DeleteFramebuffers(1, &snap_fbo); snap_tex = snap_fbo = 0; }
                 snap_w = snap_h = 0;
@@ -959,22 +652,19 @@ static void zgl_flush(void) {
                 gl.Uniform1i(g_zgl.u_destination, 1);
                 gl.ActiveTexture(ZGL_TEXTURE0);
             } else {
-                /* Snapshot unavailable: skip the shader-over path for this
-                 * batch rather than composite against a missing texture. */
+                /* 内部辅助逻辑 */
                 shader_over = 0;
             }
         }
-        /* Never sample the attachment being written (including union passes). */
+        /* 模块核心语义抽象与接口调用契约 */
         if (g_zgl.mode != ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
             gl.Uniform1i(g_zgl.u_coverage, 0);
         }
-        /* Sprite batch texture rides unit 2 (0 = coverage, 1 = destination
-         * snapshot / text atlas4). Bound whenever a sprite batch is in
-         * flight; sticky across flushes until the handle changes. */
-        if (g_zgl.sprite_tex) {
+        /* 内部辅助逻辑 */
+        if (g_zgl.bitmap_tex) {
             gl.ActiveTexture(ZGL_TEXTURE2);
-            gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.sprite_tex);
+            gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
             gl.Uniform1i(g_zgl.u_atlas2, 2);
             gl.ActiveTexture(ZGL_TEXTURE0);
         }
@@ -982,10 +672,7 @@ static void zgl_flush(void) {
             gl.Disable(ZGL_BLEND);
         } else {
             gl.Enable(ZGL_BLEND);
-            /* Straight-alpha source-over, as blend_over does it: the colour
-             * weights by the source alpha, the alpha channel accumulates
-             * (sa + da*(1-sa)) so a surface cleared transparent keeps a
-             * meaningful alpha for the layered-window present. */
+            /* 内部辅助逻辑 */
             gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
         }
@@ -995,14 +682,11 @@ static void zgl_flush(void) {
     g_zgl.count = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
     zgl_blend_equation(ZGL_FUNC_ADD);
-    /* shader-over batches ran with blending disabled; restore the default
-     * enabled state so a later REPLACE batch (which relies on Disable) and the
-     * normal blend path both start from a known state. */
+    /* 内部辅助逻辑 */
     gl.Enable(ZGL_BLEND);
 }
 
-/* Start (or continue) a batch for this surface in this mode; returns 0 when the
- * GPU cannot take the primitive. */
+/* 内部辅助逻辑 */
 static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
     if (g_gl_state <= 0) return 0;
     zgl_target *t = zgl_target_of(s);
@@ -1017,14 +701,14 @@ static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
 }
 
 typedef struct {
-    float cx, cy;              /* shape centre, surface pixels */
-    float hw, hh;              /* half extents */
+    float cx, cy;              /* 核心系统底层抽象与内存语义契约 */
+    float hw, hh;              /* 核心系统底层抽象与内存语义契约 */
     float radius, stroke;
     int   kind;
     float p0, p1, p2;          /* kind-specific */
     float col0[4], col1[4], col2[4];
     float seg[4];
-    float u0, v0, u1, v1;      /* atlas coords for textured kinds */
+    float u0, v0, u1, v1;      /* 核心系统底层抽象与内存语义契约 */
 } zgl_quad;
 
 static void zgl_color(float *out, u32 c, int force_opaque) {
@@ -1035,12 +719,10 @@ static void zgl_color(float *out, u32 c, int force_opaque) {
     out[3] = force_opaque ? 1.0f : (float)a / 255.0f;
 }
 
-/* Emits the quad covering [x0,x1) x [y0,y1) with the fragment parameters of
- * `q`, clipped to the surface's clip window. */
+/* 内部辅助逻辑 */
 static void zgl_push(zan_surface_t *s, const zgl_quad *q,
                      float x0, float y0, float x1, float y1) {
-    /* Trim to the clip window up front: the fragment shader still tests, but a
-     * quad entirely outside costs nothing this way. */
+    /* 内部辅助逻辑 */
     float cx0 = (float)s->clip_x0, cy0 = (float)s->clip_y0;
     float cx1 = (float)s->clip_x1, cy1 = (float)s->clip_y1;
     if (x0 < cx0) x0 = cx0;
@@ -1060,8 +742,7 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         { x0, y0 }, { x1, y0 }, { x1, y1 },
         { x0, y0 }, { x1, y1 }, { x0, y1 },
     };
-    /* uv follows the quad's corners so a trimmed quad still samples the right
-     * part of the tile. */
+    /* 内部辅助逻辑 */
     float du = (q->u1 - q->u0), dv = (q->v1 - q->v0);
     float qw = (x1 - x0), qh = (y1 - y0);
     (void)qw; (void)qh;
@@ -1079,7 +760,7 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         v[24] = (float)s->clip_x0; v[25] = (float)s->clip_y0;
         v[26] = (float)s->clip_x1; v[27] = (float)s->clip_y1;
         memcpy(v + 28, q->seg, 4 * sizeof(float));
-        /* Textured kinds: map the quad's own extent onto the tile. */
+        /* 编译器代码生成与运行时系统底层调用契约 */
         float fu = (q->hw > 0.0f) ? (px - (q->cx - q->hw)) / (2.0f * q->hw) : 0.0f;
         float fv = (q->hh > 0.0f) ? (py - (q->cy - q->hh)) / (2.0f * q->hh) : 0.0f;
         v[32] = q->u0 + du * fu;
@@ -1088,7 +769,7 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
     }
 }
 
-/* ------------------------------------------------------------- primitives */
+/* primitives */
 
 static void zgl_rect_quad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, int stroke, int gdir,
@@ -1165,14 +846,12 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
     q.p0 = (float)(corners & 15);
     zgl_color(q.col0, fill, 0); zgl_color(q.col1, border, 0);
     zgl_push(s, &q, (float)x, (float)y, (float)x + (float)w, (float)y + (float)h);
-    zgl_flush(); /* shader-over kinds composite against a destination snapshot;
-                    they must not sit in a batch blended a second time */
+    zgl_flush(); /* 内部辅助逻辑 */
 }
 
 static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 top, u32 bottom) {
-    /* Overwrites its rect (alpha forced opaque), like the CPU path -- except on
-     * the rounded corners, where the arc has to blend or the AA is lost. */
+    /* 内部辅助逻辑 */
     int rounded = (radius > 0 && (corners & 15) != 0);
     if (!zgl_begin(s, rounded ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE)) {
         cpu_fill_vgrad(s, x, y, w, h, radius, corners, top, bottom); return;
@@ -1200,7 +879,7 @@ static void gl_circle(zan_surface_t *s, int cx, int cy, int radius, u32 c,
     q.cy = (float)cy;
     q.radius = (float)radius;
     q.stroke = (float)stroke;
-    /* A stroke straddles the radius, so the quad has to reach past it. */
+    /* 模块核心语义抽象与接口调用契约 */
     q.hw = (float)radius + (float)stroke * 0.5f + 2.0f;
     q.hh = q.hw;
     zgl_color(q.col0, c, 0);
@@ -1292,15 +971,13 @@ static void gl_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         cpu_draw_line(s, x0, y0, x1, y1, c, thickness); return;
     }
     float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
-    /* Thin Wu lines retain the legacy pixel-index convention. */
+    /* 模块核心语义抽象与接口调用契约 */
     float offset = thickness > 1 ? 0.0f : 0.5f;
     gl_capsule(s, (float)x0 + offset, (float)y0 + offset,
                (float)x1 + offset, (float)y1 + offset, half, c);
 }
 
-/* GL_MAX is idempotent even at fractional AA edges. Accumulate into a
- * separate R8 attachment, then composite once; never blend capsules directly
- * into the colour target. Scratch is lazy and follows the target lifetime. */
+/* 核心系统底层抽象与内存语义契约 */
 static int zgl_union_target(zgl_target *t) {
     if (t->cov_fbo) return 1;
     gl.ActiveTexture(ZGL_TEXTURE0);
@@ -1335,8 +1012,7 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
         cpu_polyline(s, pts, n, c, thickness, fx);
         return;
     }
-    /* Bound clear and composite to this path intersected with the clip. Every
-     * sampled texel is cleared; stale coverage elsewhere is never sampled. */
+    /* 编译器代码生成与运行时系统底层调用契约 */
     float scale = fx == 0 ? 1.0f : 1.0f / 256.0f;
     float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
     float lo_x = (float)s->width, lo_y = (float)s->height, hi_x = 0, hi_y = 0;
@@ -1360,10 +1036,10 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
     if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
     int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
     int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
-    zgl_flush(); /* painter order before clearing/reusing scratch */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
     zgl_target *t = zgl_target_of(s);
     if (!zgl_union_target(t)) {
-        /* Resource failure only, not a rasterization workaround. */
+        /* 底层系统交互与数据协议契约 */
         fprintf(stderr, "[zan_gui] GL polyline coverage framebuffer unavailable; CPU fallback\n");
         gl_sync_to_cpu(s);
         cpu_polyline(s, pts, n, c, thickness, fx);
@@ -1374,7 +1050,7 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.Clear(ZGL_COLOR_BUFFER_BIT);
-    gl.Disable(ZGL_SCISSOR_TEST); /* normal clipping travels in vertices */
+    gl.Disable(ZGL_SCISSOR_TEST); /* 核心系统底层抽象与内存语义契约 */
     g_zgl.mode = ZGL_MODE_UNION;
     for (int i = 0; i + 1 < n; i++) {
         float ax = (float)pts[i * 2] * scale;
@@ -1382,20 +1058,20 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
         float bx = (float)pts[i * 2 + 2] * scale;
         float by = (float)pts[i * 2 + 3] * scale;
         float dx = bx - ax, dy = by - ay;
-        if (dx * dx + dy * dy < 0.0001f) continue; /* CPU degenerate policy */
+        if (dx * dx + dy * dy < 0.0001f) continue; /* 核心系统底层抽象与内存语义契约 */
         gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
     }
-    zgl_flush(); /* includes all segments across allocation-pressure flushes */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
     g_zgl.mode = ZGL_MODE_BLEND;
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_UNION;
     zgl_color(q.col0, c, 0);
     zgl_push(s, &q, lo_x, lo_y, hi_x, hi_y);
-    zgl_flush(); /* finish sampling before scratch is overwritten/released */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
 }
 
-/* Per-path CPU fallback shared by the batch entry's failure paths. */
+/* 编译器代码生成与运行时系统底层调用契约 */
 static void cpu_polybatch_loop(zan_surface_t *s, const int32_t *pts,
                                const int32_t *counts, int n_paths, u32 c,
                                int thickness, int fx) {
@@ -1407,10 +1083,7 @@ static void cpu_polybatch_loop(zan_surface_t *s, const int32_t *pts,
     }
 }
 
-/* N disconnected same-color paths in ONE coverage cycle: clear the union
- * scratch once for the whole batch's bbox, sample every path's capsules,
- * composite once. Thousands of single-path calls would each pay a clear +
- * composite (dense lane charts marshal 30k+ paths per frame). */
+/* 内部辅助逻辑 */
 static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
                          const int32_t *counts, int n_paths, u32 c,
                          int thickness, int fx) {
@@ -1450,10 +1123,10 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
     int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
     int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
-    zgl_flush(); /* painter order before clearing/reusing scratch */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
     zgl_target *t = zgl_target_of(s);
     if (!zgl_union_target(t)) {
-        /* Resource failure only, not a rasterization workaround. */
+        /* 底层系统交互与数据协议契约 */
         fprintf(stderr, "[zan_gui] GL polybatch coverage framebuffer unavailable; CPU fallback\n");
         gl_sync_to_cpu(s);
         cpu_polybatch_loop(s, pts, counts, n_paths, c, thickness, fx);
@@ -1464,7 +1137,7 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.Clear(ZGL_COLOR_BUFFER_BIT);
-    gl.Disable(ZGL_SCISSOR_TEST); /* normal clipping travels in vertices */
+    gl.Disable(ZGL_SCISSOR_TEST); /* 核心系统底层抽象与内存语义契约 */
     g_zgl.mode = ZGL_MODE_UNION;
     off = 0;
     for (int p = 0; p < n_paths; p++) {
@@ -1475,26 +1148,24 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
             float bx = (float)pts[off + i * 2 + 2] * scale;
             float by = (float)pts[off + i * 2 + 3] * scale;
             float dx = bx - ax, dy = by - ay;
-            if (dx * dx + dy * dy < 0.0001f) continue; /* CPU degenerate policy */
+            if (dx * dx + dy * dy < 0.0001f) continue; /* 核心系统底层抽象与内存语义契约 */
             gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
         }
         off += n * 2;
     }
-    zgl_flush(); /* includes all segments across allocation-pressure flushes */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
     g_zgl.mode = ZGL_MODE_BLEND;
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_UNION;
     zgl_color(q.col0, c, 0);
     zgl_push(s, &q, lo_x, lo_y, hi_x, hi_y);
-    zgl_flush(); /* finish sampling before scratch is overwritten/released */
+    zgl_flush(); /* 底层系统交互与数据协议契约 */
 }
 
-/* ------------------------------------------------------------------- text */
+/* text */
 
-/* Where a coverage tile lives in the GPU atlas. Tile ids are never reused
- * (gui_runtime_glyph.c hands out fresh ones), so a stale entry is only wasted
- * space and the whole atlas is reset when it fills up. */
+/* 底层系统交互与数据协议契约 */
 typedef struct {
     uint32_t id, rev;
     int x, y, w, h;
@@ -1516,7 +1187,7 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     zgl_tile_slot *slot = &g_zgl_tiles[tile->id % ZGL_TILES];
     if (slot->id == tile->id && slot->rev == tile->rev &&
         slot->w == tile->w && slot->h == tile->h) {
-        return slot;   /* already on the GPU: nothing to upload */
+        return slot;   /* 核心系统底层抽象与内存语义契约 */
     }
 
     int shelf = (tile->bpp == 4) ? 1 : 0;
@@ -1526,9 +1197,7 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
         g_zgl_shelf[shelf].row_h = 0;
     }
     if (g_zgl_shelf[shelf].y + tile->h > ZGL_ATLAS_DIM) {
-        /* Full: drop everything rather than evict cleverly -- it happens when
-         * the app changed its whole font set, and one re-upload of what the
-         * next frames draw costs less than tracking ages. */
+        /* 内部辅助逻辑 */
         zgl_flush();
         zgl_atlas_reset();
     }
@@ -1542,7 +1211,7 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     g_zgl_shelf[shelf].x += tile->w;
     if (tile->h > g_zgl_shelf[shelf].row_h) g_zgl_shelf[shelf].row_h = tile->h;
 
-    /* A pending batch may sample the region about to be overwritten. */
+    /* 模块核心语义抽象与接口调用契约 */
     zgl_flush();
     gl.BindTexture(ZGL_TEXTURE_2D, shelf ? g_zgl.atlas4 : g_zgl.atlas1);
     gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, slot->x, slot->y, slot->w, slot->h,
@@ -1554,13 +1223,12 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     if (!run || run->count <= 0) return;
     if (!zgl_begin(s, ZGL_MODE_TEXT)) { cpu_glyph_run(s, run); return; }
     u32 color = run->color;
-    if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;  /* as text always did */
+    if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;  /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < run->count; i++) {
         const zan_glyph_tile *tile = run->items[i].tile;
         zgl_tile_slot *slot = zgl_tile_upload(tile);
         if (!slot) continue;
-        /* zgl_tile_upload may have flushed (atlas reset / region overwrite),
-         * which leaves the batch empty but the mode intact. */
+        /* 内部辅助逻辑 */
         if (!zgl_begin(s, ZGL_MODE_TEXT)) return;
         zgl_quad q;
         memset(&q, 0, sizeof(q));
@@ -1581,11 +1249,10 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     }
 }
 
-/* --------------------------------------------------------- frame boundaries */
+/* 核心系统底层抽象与内存语义契约 */
 
 static void gl_set_clip(zan_surface_t *s, int x0, int y0, int x1, int y1) {
-    /* The clip travels with each vertex, so there is no GL state to change --
-     * but a batch already built carries the old window. */
+    /* 内部辅助逻辑 */
     (void)x0; (void)y0; (void)x1; (void)y1;
     if (g_zgl.target == s) zgl_flush();
 }
@@ -1603,27 +1270,19 @@ static void gl_read_pixels(zan_surface_t *s) {
     if (t) zgl_readback(s, t);
 }
 
-/* Straight to the screen: the finished FBO is blitted into the back buffer of
- * the window's GL child and swapped, so the frame never travels through
- * s->pixels. Anything this cannot do (no GL child window for that handle, a
- * surface whose newest pixels are on the CPU side) returns 0 and the shell
- * blits the bitmap exactly as it did before. */
+/* 内部辅助逻辑 */
 static int gl_present(zan_surface_t *s, void *native_window) {
     if (g_gl_state <= 0 || !native_window) return 0;
     zgl_flush();
     zgl_target *t = zgl_target_of(s);
     if (!t) return 0;
-    /* The CPU drew the newest pixels (a blur, a shadow, an image): upload them
-     * so the swap shows this frame and not the last GPU one. */
+    /* 内部辅助逻辑 */
     zgl_upload(s, t);
     if (!zan_gl_ctx_present_begin(native_window, t->w, t->h)) return 0;
 
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
     gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, 0);
-    /* No flip: the vertex shader already turns surface coordinates upside down
-     * on the way into the framebuffer, so the FBO and the window agree on
-     * GL's bottom-up rows -- flipping the frame here is what read_pixels does
-     * for the top-down CPU bitmap, not what the screen wants. */
+    /* 内部辅助逻辑 */
     gl.BlitFramebuffer(0, 0, t->w, t->h,
                        0, 0, t->w, t->h,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
@@ -1637,16 +1296,15 @@ static void gl_drop_window(void *native_window) {
     zan_gl_ctx_present_drop(native_window);
 }
 
-/* Surface ids are recycled, so the texture, framebuffer and upload shadow of a
- * destroyed surface must not be inherited by the next one that lands in the
- * slot -- it would start from stale pixels and see stale tiles as unchanged. */
+/* 内部辅助逻辑 */
 static void gl_drop_surface(zan_surface_t *s) {
     if (s->id < 0 || s->id >= (int)(sizeof(g_zgl_targets) / sizeof(g_zgl_targets[0])))
         return;
     zgl_target *t = &g_zgl_targets[s->id];
     if (g_gl_state > 0 && t->fbo) {
         if (g_zgl.target == s) zgl_flush();
-        zan_gl_ctx_make_current();
+        if (!zan_gl_ctx_make_current()) return;
+        zgl_cleanup_extensions(s->id);
         gl.DeleteFramebuffers(1, &t->fbo);
         gl.DeleteTextures(1, &t->tex);
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
@@ -1659,70 +1317,93 @@ static void gl_drop_surface(zan_surface_t *s) {
 
 static void gl_drop_tex(unsigned int tex) {
     if (g_gl_state > 0 && tex) {
-        if (g_zgl.sprite_tex == tex) {
+        if (g_zgl.bitmap_tex == tex) {
             zgl_flush();
-            g_zgl.sprite_tex = 0;
-            g_zgl.sprite_handle = 0;
+            g_zgl.bitmap_tex = 0;
         }
         zan_gl_ctx_make_current();
         gl.DeleteTextures(1, &tex);
     }
 }
 
-/* ---- textured sprite batch -----------------------------------*/
-
-/* Upload the handle's image once; the texture lives in the sprite registry
- * entry, so decode-cache eviction + re-decode does not re-create it. */
-static zgl_uint zgl_sprite_tex(int handle) {
-    zan_sprite_t *sp = zan_sprite_get(handle);
-    zan_img_t *img;
+/* 底层系统交互与数据协议契约 */
+#define ZGL_BITMAP_CAP 256
+#define ZGL_BITMAP_BYTES (64u * 1024u * 1024u)
+typedef struct {
+    uint64_t serial, last_use;
     zgl_uint tex;
-    if (!sp) return 0;
-    if (sp->tex) return (zgl_uint)sp->tex;
-    img = zan_img_load(sp->key);
-    if (!img) return 0;
+    size_t bytes;
+} zgl_bitmap_texture;
+static zgl_bitmap_texture g_bitmap_textures[ZGL_BITMAP_CAP];
+static uint64_t g_bitmap_tick;
+static size_t g_bitmap_bytes;
+
+static void zgl_bitmap_drop(int slot) {
+    zgl_bitmap_texture *t = &g_bitmap_textures[slot];
+    if (t->tex) gl_drop_tex(t->tex);
+    g_bitmap_bytes -= t->bytes;
+    memset(t, 0, sizeof(*t));
+}
+
+static zgl_uint zgl_bitmap_tex(const zan_bitmap *img) {
+    if (!zan_bitmap_valid(img) || g_gl_state <= 0) return 0;
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < ZGL_BITMAP_CAP; i++) {
+        zgl_bitmap_texture *t = &g_bitmap_textures[i];
+        if (img->serial && t->tex && t->serial == img->serial) {
+            t->last_use = ++g_bitmap_tick;
+            return t->tex;
+        }
+        if (!t->tex && slot < 0) slot = i;
+        if (t->tex && (!g_bitmap_textures[oldest].tex ||
+                       t->last_use < g_bitmap_textures[oldest].last_use)) oldest = i;
+    }
+    if (slot < 0) { slot = oldest; zgl_bitmap_drop(slot); }
+    size_t bytes = (size_t)img->width * (size_t)img->height * 4;
+    while (g_bitmap_bytes && g_bitmap_bytes + bytes > ZGL_BITMAP_BYTES) {
+        int victim = -1;
+        for (int i = 0; i < ZGL_BITMAP_CAP; i++)
+            if (g_bitmap_textures[i].tex && (victim < 0 ||
+                g_bitmap_textures[i].last_use < g_bitmap_textures[victim].last_use))
+                victim = i;
+        if (victim < 0) break;
+        zgl_bitmap_drop(victim);
+    }
+    zgl_flush();
+    if (!zan_gl_ctx_make_current()) return 0;
+    zgl_uint tex = 0;
     gl.GenTextures(1, &tex);
     gl.BindTexture(ZGL_TEXTURE_2D, tex);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_LINEAR);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_LINEAR);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+    gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, img->stride);
+    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->width, img->height, 0,
+                  ZGL_BGRA, ZGL_UNSIGNED_BYTE, img->pixels);
     gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
-    /* zan_img_t holds ARGB32 (a<<24|r<<16|g<<8|b, memory B,G,R,A); GL wants
-     * bytes in sampling order -- BGRA reads the same memory straight across. */
-    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->w, img->h, 0, ZGL_BGRA,
-                  ZGL_UNSIGNED_BYTE, img->pix);
     if (gl.GetError() != ZGL_NO_ERROR) { gl.DeleteTextures(1, &tex); return 0; }
-    sp->tex = (unsigned int)tex;
+    g_bitmap_textures[slot].serial = img->serial;
+    g_bitmap_textures[slot].last_use = ++g_bitmap_tick;
+    g_bitmap_textures[slot].tex = tex;
+    g_bitmap_textures[slot].bytes = bytes;
+    g_bitmap_bytes += bytes;
     return tex;
 }
 
-static void zgl_sprite_batch(zan_surface_t *s, int handle,
-                             const float *quads, int count) {
-    zan_sprite_t *sp;
-    zan_img_t *img;
-    zgl_uint tex;
-    int iw, ih, i;
-    tex = zgl_sprite_tex(handle);
-    if (!tex) {
-        cpu_sprite_batch(s, handle, quads, count);
+static void zgl_blit_pixels_batch(zan_surface_t *s, const zan_bitmap *img,
+                                  const float *quads, int count) {
+    zgl_uint tex = zgl_bitmap_tex(img);
+    if (!tex || !zgl_begin(s, ZGL_MODE_BLEND)) {
+        gl_sync_to_cpu(s);
+        cpu_blit_pixels_batch(s, img, quads, count);
         return;
     }
-    if (!zgl_begin(s, ZGL_MODE_BLEND)) {
-        /* GPU cannot take the primitive (no target / dead context): the
-         * surface's pixels are the truth, same seam the shape entries use. */
-        cpu_sprite_batch(s, handle, quads, count);
-        return;
+    if (g_zgl.bitmap_tex != tex) {
+        zgl_flush();
+        g_zgl.bitmap_tex = tex;
     }
-    if (g_zgl.sprite_handle != handle || g_zgl.sprite_tex != tex) {
-        zgl_flush();             /* never switch atlases mid-batch */
-        g_zgl.sprite_handle = handle;
-        g_zgl.sprite_tex = tex;
-    }
-    sp = zan_sprite_get(handle);
-    img = zan_img_load(sp->key);
-    if (!img) return;
-    iw = img->w; ih = img->h;
+    int iw = img->width, ih = img->height, i;
     for (i = 0; i < count; i++) {
         const float *q = quads + i * 10;
         u32 tint_raw;
@@ -1731,7 +1412,7 @@ static void zgl_sprite_batch(zan_surface_t *s, int handle,
         float sx = q[4], sy = q[5], sw = q[6], sh = q[7];
         memcpy(&tint_raw, q + 8, sizeof(u32));
         memset(&sq, 0, sizeof(sq));
-        sq.kind = ZGL_K_SPRITE;
+        sq.kind = ZGL_K_BITMAP;
         if (dw <= 0.0f) dw = (float)iw;
         if (dh <= 0.0f) dh = (float)ih;
         if (sw <= 0.0f) { sx = 0.0f; sw = (float)iw; }
@@ -1749,27 +1430,14 @@ static void zgl_sprite_batch(zan_surface_t *s, int handle,
     }
 }
 
-static void zgl_blit_image(zan_surface_t *s, const char *path,
-                           int dx, int dy, int dw, int dh,
-                           int sx, int sy, int sw, int sh) {
-    int handle = zan_sprite_handle(path);
-    if (!handle) {
-        cpu_blit_image(s, path, dx, dy, dw, dh, sx, sy, sw, sh);
-        return;
-    }
-    float quad[10];
-    quad[0] = (float)dx;
-    quad[1] = (float)dy;
-    quad[2] = (float)dw;
-    quad[3] = (float)dh;
-    quad[4] = (float)sx;
-    quad[5] = (float)sy;
-    quad[6] = (float)sw;
-    quad[7] = (float)sh;
+static void zgl_blit_pixels(zan_surface_t *s, const zan_bitmap *img,
+                            int dx, int dy, int dw, int dh,
+                            int sx, int sy, int sw, int sh) {
+    float quad[10] = { (float)dx, (float)dy, (float)dw, (float)dh,
+                       (float)sx, (float)sy, (float)sw, (float)sh, 0, 0 };
     u32 tint = 0xFFFFFFFFu;
-    memcpy(&quad[8], &tint, sizeof(u32));
-    quad[9] = 0.0f;
-    zgl_sprite_batch(s, handle, quad, 1);
+    memcpy(&quad[8], &tint, sizeof(tint));
+    zgl_blit_pixels_batch(s, img, quad, 1);
 }
 
 static const zan_gui_backend zan_gl_backend = {
@@ -1781,8 +1449,7 @@ static const zan_gui_backend zan_gl_backend = {
     .surface_round = gl_surface_round,
     .fill_vgrad   = gl_fill_vgrad,
     .fill_grad    = gl_fill_grad,
-    /* shadow_round, blur, snapshot and restore are the CPU's for
-     * now: the seam syncs the frame across for them (sync_to_cpu below). */
+    /* 内部辅助逻辑 */
     .shadow_round = NULL,
     .fill_circle  = gl_fill_circle,
     .draw_circle  = gl_draw_circle,
@@ -1796,35 +1463,84 @@ static const zan_gui_backend zan_gl_backend = {
     .restore      = NULL,
     .draw_text    = NULL,
     .glyph_run    = gl_glyph_run,
-    .blit_image   = zgl_blit_image,
-    .sprite_batch = zgl_sprite_batch,
-    .mesh_create  = gl_mesh_create,
-    .draw3d       = gl_draw3d,
+    .blit_pixels  = zgl_blit_pixels,
+    .blit_pixels_batch = zgl_blit_pixels_batch,
     .set_clip     = gl_set_clip,
     .flush        = gl_flush,
     .read_pixels  = gl_read_pixels,
     .present      = gl_present,
     .drop_window  = gl_drop_window,
     .drop_surface = gl_drop_surface,
-    .drop_tex     = gl_drop_tex,
     .sync_to_cpu  = gl_sync_to_cpu,
     .sync_from_cpu = gl_sync_from_cpu,
 };
 
-/* Brings up a context and installs the GPU backend, returning 0 (and leaving
- * every surface on the CPU) when this machine cannot provide GL 3.3 core. */
+/* 内部辅助逻辑 */
 int zan_gui_internal_gl_install(void) {
     if (!zgl_init()) return 0;
     zan_gui_internal_set_backend(&zan_gl_backend);
     return 1;
 }
 
-/* Tears down every GL child window, for the moment the application switches
- * back to the CPU rasterizer: the shells then blit their bitmaps into a client
- * area nothing covers any more. Doing nothing before GL ever came up is the
- * whole point of the state check. */
+/* 内部辅助逻辑 */
 void zan_gui_internal_gl_drop_present(void) {
     if (g_gl_state <= 0) return;
+    if (!zan_gl_ctx_make_current()) return;
+    zgl_flush();
+    zgl_cleanup_extensions(-1);
+    ++g_gpu_epoch;
+    for (int i = 0; i < ZGL_BITMAP_CAP; i++) zgl_bitmap_drop(i);
+    for (int i = 0; i < g_surface_count; i++)
+        if (g_surfaces[i]) gl_drop_surface(g_surfaces[i]);
     zan_gl_ctx_present_drop_all();
-    gl_mesh_drop_all();
+}
+
+EXPORT i32 zan_gui_gpu_begin(i32 surface_id, zan_gpu_frame *frame) {
+    if (!frame || surface_id < 0 || surface_id >= g_surface_count) return 0;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || s->be != &zan_gl_backend || g_gl_state <= 0
+        || !zan_gl_ctx_make_current()) return 0;
+    zgl_flush();
+    zgl_target *t = zgl_target_of(s);
+    if (!t) return 0;
+    zgl_upload(s, t);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    gl.Viewport(0, 0, s->width, s->height);
+    frame->api = &gl;
+    frame->framebuffer = t->fbo;
+    frame->width = s->width;
+    frame->height = s->height;
+    frame->clip_x = s->clip_x0;
+    frame->clip_y = s->clip_y0;
+    frame->clip_w = s->clip_x1 - s->clip_x0;
+    frame->clip_h = s->clip_y1 - s->clip_y0;
+    frame->epoch = g_gpu_epoch;
+    return 1;
+}
+
+EXPORT void zan_gui_gpu_end(i32 surface_id) {
+    if (surface_id < 0 || surface_id >= g_surface_count) return;
+    zan_surface_t *s = g_surfaces[surface_id];
+    if (!s || s->be != &zan_gl_backend || g_gl_state <= 0) return;
+    zgl_target *t = zgl_target_of(s);
+    if (!t) return;
+    gl.Disable(ZGL_DEPTH_TEST);
+    gl.Disable(ZGL_SCISSOR_TEST);
+    gl.Enable(ZGL_BLEND);
+    gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                          ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+    gl.BindVertexArray(0);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    t->gpu_ahead = 1;
+    s->painted = 1;
+}
+
+EXPORT u32 zan_gui_gpu_program(const char *vertex, const char *fragment) {
+    if (!vertex || !fragment || g_gl_state <= 0
+        || !zan_gl_ctx_make_current()) return 0;
+    return zgl_link(vertex, fragment);
+}
+
+EXPORT u32 zan_gui_gpu_texture(const zan_bitmap *bitmap) {
+    return zgl_bitmap_tex(bitmap);
 }

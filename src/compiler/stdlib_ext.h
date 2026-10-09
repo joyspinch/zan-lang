@@ -48,13 +48,13 @@ void zan_mutex_lock(zan_mutex_t mtx);
 void zan_mutex_unlock(zan_mutex_t mtx);
 void zan_mutex_destroy(zan_mutex_t mtx);
 
-/* Event/signal operations */
+/* 核心系统底层抽象与内存语义契约 */
 zan_event_t zan_event_create(void);
 void zan_event_signal(zan_event_t evt);
 void zan_event_wait(zan_event_t evt);
 void zan_event_destroy(zan_event_t evt);
 
-/* Atomic operations */
+/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_atomic_add(volatile int64_t *ptr, int64_t val);
 int64_t zan_atomic_load(volatile int64_t *ptr);
 void zan_atomic_store(volatile int64_t *ptr, int64_t val);
@@ -86,20 +86,20 @@ struct zan_json_value {
     };
 };
 
-/* Parse JSON string into value tree */
+/* 底层系统交互与数据协议契约 */
 zan_json_value_t *zan_json_parse(const char *json, size_t len);
 
-/* Serialize value tree to JSON string */
+/* 核心系统底层抽象与内存语义契约 */
 char *zan_json_serialize(const zan_json_value_t *val, bool pretty);
 
-/* Access helpers */
+/* 核心系统底层抽象与内存语义契约 */
 zan_json_value_t *zan_json_get(const zan_json_value_t *obj, const char *key);
 zan_json_value_t *zan_json_index(const zan_json_value_t *arr, int idx);
 const char *zan_json_as_string(const zan_json_value_t *val);
 double zan_json_as_number(const zan_json_value_t *val);
 bool zan_json_as_bool(const zan_json_value_t *val);
 
-/* Builder helpers */
+/* 核心系统底层抽象与内存语义契约 */
 zan_json_value_t *zan_json_new_object(void);
 zan_json_value_t *zan_json_new_array(void);
 zan_json_value_t *zan_json_new_string(const char *str);
@@ -109,7 +109,7 @@ zan_json_value_t *zan_json_new_null(void);
 void zan_json_object_set(zan_json_value_t *obj, const char *key, zan_json_value_t *val);
 void zan_json_array_push(zan_json_value_t *arr, zan_json_value_t *val);
 
-/* Free a JSON value tree */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_json_free(zan_json_value_t *val);
 
 typedef struct {

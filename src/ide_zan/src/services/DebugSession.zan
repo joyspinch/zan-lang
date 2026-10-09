@@ -2,12 +2,14 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using System.Json;
+using System.Threading;
+using System.Net.Sockets;
 
-// ---- DAP protocol entities ------------------------------------------------
-// Envelopes and arguments are serialized with Json.Serialize<T>; responses
-// are parsed with Json.Deserialize<T>. `arguments`/`body` are JsonValue
-// because they are optional (null) and carry per-command structure; the
-// zan-dap accessors treat a null node exactly like a missing key.
+// 核心契约与执行状态转移规范。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
 
 class DapRequest {
     int seq;
@@ -70,7 +72,7 @@ class DapVariablesArgs {
     int variablesReference;
 }
 
-// ---- DAP response entities (parsed with Json.Deserialize<T>) -------------
+// 接口数据协议与执行契约。
 
 class DapFrame {
     int id;
@@ -124,13 +126,13 @@ class DapEvent {
     JsonValue body;
 }
 
-/// A live Debug Adapter Protocol client that drives a spawned `zan-dap` over a
-/// loopback TCP socket (127.0.0.1). Replaces the IDE's former static
-/// source-instrumentation debugger: stop locations, the call stack, scopes and
-/// variables are all produced by a real gdb-backed inferior via zan-dap. The
-/// request/response model is synchronous -- each user action (start / continue
-/// / step) sends a request and blocks until the next `stopped` or `exited`
-/// event -- which fits the single-threaded IDE event loop (gdb steps are fast).
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
+/// 接口数据协议与执行契约。
 class DebugSession {
     #if WINDOWS
     [DllImport("ws2_32", EntryPoint = "WSAStartup")]
@@ -172,7 +174,9 @@ class DebugSession {
     [DllImport("crt")]
     static extern int strlen(string str);
 
-    int sock;
+    nint sock;
+    CancellationToken cancellation;
+    CancellationTokenSource interrupted = new CancellationTokenSource();
     int seq;
     bool paused;
     bool alive;
@@ -187,11 +191,12 @@ class DebugSession {
 
     // ---- lifecycle --------------------------------------------------------
 
-    /// Connects to a zan-dap listening on 127.0.0.1:port and runs the DAP
-    /// launch handshake. Returns null if the socket cannot be reached.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     static DebugSession Open(int port, string program, string source,
-            List<DbgBreakpoint> bps) {
+            List<DbgBreakpoint> bps, CancellationToken cancellation = null) {
         DebugSession d = new DebugSession();
+        d.cancellation = cancellation;
         d.sock = 0 - 1;
         d.seq = 1;
         d.paused = false;
@@ -205,25 +210,29 @@ class DebugSession {
         d.stack = new List<DbgFrame>();
         d.console = new List<string>();
 
-        #if WINDOWS
-        byte[] wsa = new byte[512];
-        ws_startup(514, wsa);
-        #endif
-
-        int s = ws_socket(2, 1, 6);
-        if (s < 0) { return null; }
-        d.sock = s;
-
-        // zan-dap may still be binding its listener; retry the connect briefly.
+        Socket.Initialize();
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
         bool connected = false;
-        int tries = 0;
-        while (tries < 100 && !connected) {
+        for (int tries = 0; tries < 100 && !connected && !d.Cancelled(); tries = tries + 1) {
+            nint s = Socket.socket(2, 1, 6);
+            if (s < 0) { return null; }
+            d.sock = s;
+            if (Socket.SetNonBlocking(s) != 0) { d.Stop(); return null; }
             byte[] addr = d.BuildAddr(port);
-            int r = ws_connect(s, addr, 16);
-            if (r == 0) { connected = true; }
-            else { d.SnoozeMs(20); tries = tries + 1; }
+            int status = Socket.SysConnect(s, addr, 16);
+            if (status == 0) { connected = true; }
+            else {
+                status = Socket.ConnectStatus(s);
+                while (status == -2 && !d.Cancelled()) {
+                    d.SnoozeMs(20);
+                    status = Socket.ConnectStatus(s);
+                }
+                connected = status == 0 && !d.Cancelled();
+            }
+            if (!connected) { d.Stop(); d.SnoozeMs(20); }
         }
-        if (!connected) { ws_close(s); return null; }
+        if (!connected) { d.Stop(); return null; }
         d.alive = true;
 
         d.Request("initialize", DebugSession.InitArgs());
@@ -293,7 +302,7 @@ class DebugSession {
         return Json.Serialize<DapSetBreakpointsArgs>(o);
     }
 
-    // ---- public control ---------------------------------------------------
+    // 核心契约与执行状态转移规范。
 
     bool Paused() { return this.paused; }
     bool Alive() { return this.alive; }
@@ -309,9 +318,9 @@ class DebugSession {
     void StepIn() { this.Resume("stepIn"); }
     void StepOut() { this.Resume("stepOut"); }
 
-    /// Evaluates `expr` in the current (top) frame via the DAP `evaluate`
-    /// request. Returns the adapter's result string, or "<error>" when the
-    /// expression cannot be evaluated.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 核心契约与执行状态转移规范。
     string Evaluate(string expr) {
         if (!this.alive || !this.paused) { return ""; }
         DapEvaluateArgs args = new DapEvaluateArgs();
@@ -336,32 +345,51 @@ class DebugSession {
         this.PumpUntilStop();
     }
 
+    bool Cancelled() {
+        return interrupted.Token.IsCancellationRequested
+            || (cancellation != null && cancellation.IsCancellationRequested);
+    }
+
+    // 接口数据协议与执行契约。
+    void CancelWait() { interrupted.Cancel(); }
+
     void Stop() {
         if (this.sock >= 0) {
             if (this.alive) {
                 DapDisconnectArgs args = new DapDisconnectArgs();
                 args.terminateDebuggee = true;
-                this.Request("disconnect", Json.Serialize<DapDisconnectArgs>(args));
+                DapRequest request = new DapRequest();
+                request.seq = this.seq;
+                request.type = "request";
+                request.command = "disconnect";
+                request.arguments = JsonValue.ParseLenient(Json.Serialize<DapDisconnectArgs>(args));
+                string body = Json.Serialize<DapRequest>(request);
+                string message = "Content-Length: " + Convert.ToString(strlen(body)) + "\r\n\r\n" + body;
+                // 接口数据协议与执行契约。
+                long sent = Socket.ReactorSend(this.sock, message, strlen(message), 0);
             }
-            ws_close(this.sock);
-            this.sock = 0 - 1;
+            Socket.ReactorCloseNotify(this.sock);
+            Socket.SysClose(this.sock);
+            this.sock = -1;
         }
         this.alive = false;
         this.paused = false;
     }
 
-    // ---- transport (Content-Length framing over the socket) ---------------
+    // 接口数据协议与执行契约。
 
     void SendAll(string data) {
         int total = strlen(data);
         int off = 0;
-        while (off < total) {
+        while (off < total && !this.Cancelled()) {
             string chunk = data;
             if (off > 0) { chunk = data.Substring(off, total - off); }
-            int n = ws_send(this.sock, chunk, total - off, 0);
+            long n = Socket.ReactorSend(this.sock, chunk, total - off, 0);
+            if (n == -1) { this.SnoozeMs(20); continue; }
             if (n <= 0) { this.alive = false; return; }
-            off = off + n;
+            off = off + (int)n;
         }
+        if (this.Cancelled()) { this.alive = false; }
     }
 
     void SendMsg(string body) {
@@ -385,12 +413,16 @@ class DebugSession {
     string RecvChunk() {
         int cap = 65536;
         byte[] buf = new byte[cap + 1];
-        int n = ws_recv(this.sock, buf, cap, 0);
-        if (n <= 0) { return ""; }
-        return buf.ToStr(0, n);
+        while (!this.Cancelled()) {
+            long n = Socket.ReactorRecv(this.sock, buf, cap, 0);
+            if (n == -1) { this.SnoozeMs(20); continue; }
+            if (n <= 0) { return ""; }
+            return buf.ToStr(0, (int)n);
+        }
+        return "";
     }
 
-    /// Reads one Content-Length-framed message; "" on disconnect.
+    /// 接口数据协议与执行契约。
     string ReadMsg() {
         int guard = 0;
         while (guard < 1000000) {
@@ -414,10 +446,10 @@ class DebugSession {
         return "";
     }
 
-    // ---- protocol pumps ---------------------------------------------------
+    // 核心契约与执行状态转移规范。
 
-    /// Handles events that may arrive between a request and its response:
-    /// captured program stdout, and exit/termination.
+    /// 接口数据协议与执行契约。
+    /// 核心契约与语义定义。
     void Aside(string m) {
         DapEvent ev = Json.Deserialize<DapEvent>(m);
         if (ev == null) { return; }
@@ -437,7 +469,7 @@ class DebugSession {
         }
     }
 
-    /// True when `m` is a JSON object message whose `key` field equals
+    /// 接口数据协议与执行契约。
     /// `value`（树解析取值，杜绝引号子串匹配——值里含引号或字段名
     /// 是别的键的子串时，子串匹配会误判）。
     static bool FieldIs(string m, string key, string value) {
@@ -479,8 +511,8 @@ class DebugSession {
         }
     }
 
-    /// Reads events until the inferior stops (breakpoint/step) or exits, then
-    /// refreshes the call stack + variables on a stop.
+    /// 接口数据协议与执行契约。
+    /// 核心契约与语义定义。
     void PumpUntilStop() {
         int guard = 0;
         while (guard < 100000) {
@@ -502,8 +534,8 @@ class DebugSession {
         }
     }
 
-    /// Pulls the current call stack, the top frame's Locals scope and its
-    /// variables from the adapter into this session's lists.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     void Refresh() {
         while (this.stack.Count > 0) { this.stack.RemoveAt(this.stack.Count - 1); }
         while (this.locals.Count > 0) { this.locals.RemoveAt(this.locals.Count - 1); }
@@ -538,8 +570,8 @@ class DebugSession {
         }
     }
 
-    /// Parses the stackTrace body. Frame fields are emitted in the order
-    /// id, name, line, column, source{path}; the first frame is the stop point.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
     void ParseFrames(string m) {
         if (m.Length == 0) { return; }
         DapStackResponse r = Json.Deserialize<DapStackResponse>(m);
@@ -559,9 +591,9 @@ class DebugSession {
         }
     }
 
-    /// Parses the variables body into DbgVar rows (the format the IDE's
-    /// Variables panel / inline hints consume). Variable fields are emitted
-    /// in the order name, value, type.
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 核心契约与语义定义。
     void ParseVariables(string m) {
         if (m.Length == 0) { return; }
         DapVarsResponse r = Json.Deserialize<DapVarsResponse>(m);
@@ -572,7 +604,7 @@ class DebugSession {
         }
     }
 
-    // ---- tiny JSON scanning helpers (ASCII payloads only) -----------------
+    // 接口数据协议与执行契约。
 
     static int IndexOf(string hay, string needle, int from) {
         int hl = hay.Length;

@@ -1,4 +1,4 @@
-/* ast.h -- Abstract Syntax Tree node types for Zan. */
+/* 模块核心语义抽象与接口调用契约 */
 
 #ifndef ZAN_AST_H
 #define ZAN_AST_H
@@ -66,24 +66,24 @@ typedef enum {
     AST_POSTFIX_UNARY,
     AST_STRING_INTERP,  /* $"text {expr} text" */
 
-    /* tuple: (e1, e2, ...) literal and its type (T1, T2) */
+    /* 核心系统底层抽象与内存语义契约 */
     AST_TUPLE_EXPR,
     AST_TUPLE_TYPE,
 
-    /* deconstruction statement: var (a, b) = rhs; */
+    /* 核心系统底层抽象与内存语义契约 */
     AST_TUPLE_DECON,
 
-    /* type references */
+    /* 核心系统底层抽象与内存语义契约 */
     AST_TYPE_REF,
     AST_ARRAY_TYPE,
     AST_NULLABLE_TYPE,
     AST_GENERIC_TYPE,
     AST_QUALIFIED_NAME,
 
-    /* `ref x` / `out x` / `out T x` call argument */
+    /* 核心系统底层抽象与内存语义契约 */
     AST_REF_ARG,
 
-    /* named call argument: `F(b: 2)` */
+    /* 核心系统底层抽象与内存语义契约 */
     AST_NAMED_ARG,
 
     /* 内部辅助实现 */
@@ -93,26 +93,26 @@ typedef enum {
     AST_ENUM_MEMBER,
     AST_CATCH_CLAUSE,
     AST_SWITCH_CASE,
-    AST_WHERE_CLAUSE, /* generic constraint: where T : C1, C2 */
-    AST_YIELD_STMT,   /* yield return expr; / yield break; (desugared in parser) */
+    AST_WHERE_CLAUSE, /* 核心系统底层抽象与内存语义契约 */
+    AST_YIELD_STMT,   /* 底层系统交互与数据协议契约 */
     AST_LOCK_STMT,    /* lock (expr) body */
     AST_CHECKED_STMT, 
-/* checked { body } / unchecked { body }: an overflow- checking context wrapper (checked/unchecked field) */
-    AST_GOTO_STMT,    /* goto label; */
+/* 模块核心语义抽象与接口调用契约 */
+    AST_GOTO_STMT,    /* 核心系统底层抽象与内存语义契约 */
     AST_LABEL_STMT,   /* label: */
-    AST_QUERY_EXPR,   /* from x in src where c ... select e */
-    AST_QUERY_WHERE,  /* query clause: where c */
-    AST_QUERY_LET,    /* query clause: let v = e */
-    AST_QUERY_ORDERBY,/* query clause: orderby k [ascending|descending] */
-    AST_QUERY_JOIN,   /* query clause: join y in s on k1 equals k2 [into g] */
-    AST_SWITCH_EXPR,  /* `expr switch { arm, ... }` (expression form) */
-    AST_SWITCH_ARM,   /* one arm of a switch expression */
-    AST_WITH_EXPR,    /* `recv with { field = value, ... }` (record copy) */
+    AST_QUERY_EXPR,   /* 核心系统底层抽象与内存语义契约 */
+    AST_QUERY_WHERE,  /* 核心系统底层抽象与内存语义契约 */
+    AST_QUERY_LET,    /* 核心系统底层抽象与内存语义契约 */
+    AST_QUERY_ORDERBY,/* 核心系统底层抽象与内存语义契约 */
+    AST_QUERY_JOIN,   /* 核心系统底层抽象与内存语义契约 */
+    AST_SWITCH_EXPR,  /* 核心系统底层抽象与内存语义契约 */
+    AST_SWITCH_ARM,   /* 核心系统底层抽象与内存语义契约 */
+    AST_WITH_EXPR,    /* 底层系统交互与数据协议契约 */
 
     AST__COUNT,
 } zan_ast_kind_t;
 
-/* dynamic child list */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     zan_ast_node_t **items;
     int count;
@@ -121,10 +121,10 @@ typedef struct {
 
 /* 内部辅助实现 */
 typedef struct {
-    zan_istr_t extern_lib;        /* DllImport library name, {NULL,0} if none */
-    zan_istr_t *entry_point;      /* DllImport entry point override, NULL if none */
-    zan_ast_list_t where_clauses; /* AST_WHERE_CLAUSE generic constraints */
-    zan_ast_list_t base_args;     /* constructor `: base(...)` argument exprs */
+    zan_istr_t extern_lib;        /* 核心系统底层抽象与内存语义契约 */
+    zan_istr_t *entry_point;      /* 底层系统交互与数据协议契约 */
+    zan_ast_list_t where_clauses; /* 核心系统底层抽象与内存语义契约 */
+    zan_ast_list_t base_args;     /* 核心系统底层抽象与内存语义契约 */
 } zan_method_ext_t;
 
 /* 内部辅助实现 */
@@ -139,16 +139,16 @@ struct zan_ast_node {
     zan_ast_kind_t kind;
     zan_loc_t loc;
 
-    /* Integer literal suffix (AST_INT_LITERAL only): 0=none, 1=L/l (long), 2=U/u (uint), 3=UL/LU in either case (ulong) */
+    /* 模块核心语义抽象与接口调用契约 */
     uint8_t lit_suffix;
 
-    /* Integer literal radix (AST_INT_LITERAL only): 2/8/10/16 */
+    /* 底层系统交互与数据协议契约 */
     uint8_t lit_radix;
-    /* True for declarations supplied by the auto-included standard library. */
+    /* 模块核心语义抽象与接口调用契约 */
     unsigned char from_stdlib;
     uint8_t _pad;
 
-    /* Optional declaration metadata for type/member declarations (NULL for exprs). */
+    /* 模块核心语义抽象与接口调用契约 */
     zan_decl_meta_t *meta;
 
     union {
@@ -161,35 +161,35 @@ struct zan_ast_node {
         /* identifier / name */
         struct {
             zan_istr_t name;
-            /* Generic type used in expression position, AST_IDENTIFIER only. */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_ast_node_t *inst_type_ref;
         } ident;
 
         /* binary / assignment */
         struct {
             zan_token_kind_t op;
-            /* AST_ASSIGNMENT only: base operator of a desugared `lhs op= rhs` (TK_EOF for a plain assignment) */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_token_kind_t compound_base;
-            /* AST_BINARY only: 1 when the expression was written inside `checked( */
+            /* 模块核心语义抽象与接口调用契约 */
             int checked;
             zan_ast_node_t *left;
             zan_ast_node_t *right;
         } binary;
 
-        /* unary (prefix and postfix) */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_token_kind_t op;
             zan_ast_node_t *operand;
         } unary;
 
-        /* call expression */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *callee;
             zan_ast_list_t args;
-            zan_ast_list_t type_args; /* explicit generic args: f<int>(...) */
+            zan_ast_list_t type_args; /* 核心系统底层抽象与内存语义契约 */
         } call;
 
-        /* member access: expr.name (null_cond: `expr?.name`) */
+        /* 模块核心语义抽象与接口调用契约 */
         struct {
             zan_ast_node_t *object;
             zan_istr_t name;
@@ -199,8 +199,8 @@ struct zan_ast_node {
         /* index: obj[i] or obj[i,j] (multi-dimensional) */
         struct {
             zan_ast_node_t *object;
-            zan_ast_node_t *index;   /* first index */
-            zan_ast_list_t extra;    /* remaining indices for rank > 1 */
+            zan_ast_node_t *index;   /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_list_t extra;    /* 核心系统底层抽象与内存语义契约 */
         } index;
 
         /* conditional: cond ? then : else */
@@ -210,20 +210,20 @@ struct zan_ast_node {
             zan_ast_node_t *else_expr;
         } conditional;
 
-        /* new expression */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *type;
             /* `FactoryCall( */
             zan_ast_node_t *call_init;
             zan_ast_list_t args;
-            /* Member-writes of an object initializer on a postfix generic type reference (`List<int> { */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_ast_list_t arg_inits;
-            bool is_array;       /* new Type[size] */
-            bool array_init;     /* new Type[] { a, b } -- args are elements */
+            bool is_array;       /* 核心系统底层抽象与内存语义契约 */
+            bool array_init;     /* 核心系统底层抽象与内存语义契约 */
             int array_rank;      
-/* number of dimension sizes at args start (0 = no dims: plain object or unsized init) */
+/* 模块核心语义抽象与接口调用契约 */
             bool list_copy;      
-/* new List<T>(src): copy-construct from another List (checker-flagged; without it args were silently initializer items) */
+/* 模块核心语义抽象与接口调用契约 */
         } new_expr;
 
         /* cast: (Type)expr */
@@ -236,11 +236,11 @@ struct zan_ast_node {
         struct {
             zan_ast_node_t *expr;
             zan_ast_node_t *type;
-            zan_istr_t var_name; /* pattern variable: `is T x` (empty if none) */
-            bool is_not;         /* `is not T` / `is not null` */
+            zan_istr_t var_name; /* 核心系统底层抽象与内存语义契约 */
+            bool is_not;         /* 核心系统底层抽象与内存语义契约 */
         } type_test;
 
-    /* var / let declaration */
+    /* 核心系统底层抽象与内存语义契约 */
     struct {
         zan_istr_t name;
         zan_ast_node_t *type;        /* NULL if var (inferred) */
@@ -249,12 +249,12 @@ struct zan_ast_node {
         bool is_let;                 /* let (immutable) */
     } var_decl;
 
-    /* tuple expression: (e1, e2, ...) */
+    /* 核心系统底层抽象与内存语义契约 */
     struct {
         zan_ast_list_t items;
     } tuple_expr;
 
-    /* tuple type: (T1, T2, ...) in type position */
+    /* 核心系统底层抽象与内存语义契约 */
     struct {
         zan_ast_list_t elems;
     } tuple_type;
@@ -273,7 +273,7 @@ struct zan_ast_node {
 
         /* return */
         struct {
-            zan_ast_node_t *value; /* NULL for bare return */
+            zan_ast_node_t *value; /* 核心系统底层抽象与内存语义契约 */
         } ret;
 
         /* if */
@@ -317,7 +317,7 @@ struct zan_ast_node {
             zan_ast_node_t *finally_body; /* NULL if none */
         } try_stmt;
 
-        /* catch clause */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *type;
             zan_istr_t var_name;
@@ -330,77 +330,74 @@ struct zan_ast_node {
             zan_ast_list_t cases;
         } switch_stmt;
 
-        /* switch case */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
-            zan_ast_node_t *pattern; /* constant expr, or NULL for default */
-            zan_ast_node_t *type_pattern; /* `case T x:` type node (else NULL) */
-            zan_ast_node_t *when_cond;    /* `case ... when guard:` guard (else NULL) */
+            zan_ast_node_t *pattern; /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *type_pattern; /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *when_cond;    /* 底层系统交互与数据协议契约 */
             zan_ast_node_t *body;
-            zan_istr_t var_name; /* pattern variable for `case T x:` */
+            zan_istr_t var_name; /* 核心系统底层抽象与内存语义契约 */
         } switch_case;
 
-        /* switch expression: `expr switch { arm, ... }` */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *expr;
             zan_ast_list_t arms;
         } switch_expr;
 
-        /* with expression: `recv with { field = value, */
+        /* 底层系统交互与数据协议契约 */
         struct {
             zan_ast_node_t *expr;
             zan_ast_list_t assigns;
         } with_expr;
 
-        /* switch expression arm: `pattern => result` / `pattern when g => result` */
+        /* 模块核心语义抽象与接口调用契约 */
         struct {
-            zan_ast_node_t *pattern;     /* constant expr, NULL for default/discard */
-            zan_ast_node_t *type_pattern; /* `int i =>` type node (else NULL) */
-            zan_ast_node_t *when_cond;    /* `... when g =>` guard (else NULL) */
+            zan_ast_node_t *pattern;     /* 底层系统交互与数据协议契约 */
+            zan_ast_node_t *type_pattern; /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *when_cond;    /* 核心系统底层抽象与内存语义契约 */
             zan_ast_node_t *result;
-            zan_istr_t var_name;          /* pattern variable for `int i =>` */
+            zan_istr_t var_name;          /* 核心系统底层抽象与内存语义契约 */
             bool is_default;              /* `_ =>` / `default =>` */
         } switch_arm;
 
-        /* expression statement */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *expr;
         } expr_stmt;
 
-        /* using declaration */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
-            zan_ast_node_t *name;     /* qualified name */
+            zan_ast_node_t *name;     /* 核心系统底层抽象与内存语义契约 */
             bool is_static;
         } using_decl;
 
         /* namespace */
         struct {
-            zan_ast_node_t *name;     /* qualified name */
-            zan_ast_list_t members;   /* type declarations */
+            zan_ast_node_t *name;     /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_list_t members;   /* 核心系统底层抽象与内存语义契约 */
             bool is_file_scoped;
         } namespace_decl;
 
-        /* compilation unit */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_list_t usings;
             zan_ast_node_t *ns;       /* namespace */
-            zan_ast_list_t decls;     /* type declarations */
+            zan_ast_list_t decls;     /* 核心系统底层抽象与内存语义契约 */
         } comp_unit;
 
         /* class / struct / interface */
         struct {
             zan_istr_t name;
             zan_ast_list_t type_params;
-            zan_ast_list_t bases;      /* base types */
+            zan_ast_list_t bases;      /* 核心系统底层抽象与内存语义契约 */
             zan_ast_list_t members;
             uint32_t modifiers;
             bool is_c_layout;  /* [StructLayout(LayoutKind.Sequential)] for C ABI */
             bool is_explicit_layout; 
-/*
- * [StructLayout(LayoutKind.Explicit)]:
- * every field carries [FieldOffset(n)]
- */
-            zan_ast_list_t *where_clauses; /* AST_WHERE_CLAUSE generic constraints (NULL if none) */
-            /* Set by hoist_nested_types: the type this declaration was nested in before being lifted to unit level */
+/* 底层系统交互与数据协议契约 */
+            zan_ast_list_t *where_clauses; /* 底层系统交互与数据协议契约 */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_ast_node_t *nested_host;
         } type_decl;
 
@@ -414,10 +411,10 @@ struct zan_ast_node {
             uint32_t modifiers;
             bool is_variadic;        
 /* [DllImport( */
-            bool has_base_init;     /* constructor declared a `: base(...)` initializer */
+            bool has_base_init;     /* 核心系统底层抽象与内存语义契约 */
             bool has_this_init;
-            bool is_task_return;    /* declared Task/Task<T>/ValueTask<T> before async desugaring */
-            zan_method_ext_t *ext;   /* DllImport, where_clauses, base_args (NULL if none) */
+            bool is_task_return;    /* 底层系统交互与数据协议契约 */
+            zan_method_ext_t *ext;   /* 底层系统交互与数据协议契约 */
         } method_decl;
 
         /* field */
@@ -426,7 +423,7 @@ struct zan_ast_node {
             zan_ast_node_t *type;
             zan_ast_node_t *initializer;
             uint32_t modifiers;
-            /* Property accessor bodies (AST_PROPERTY_DECL only) */
+            /* 底层系统交互与数据协议契约 */
             zan_ast_node_t *getter_body;
             zan_ast_node_t *setter_body;
             /* 检查是否the corresponding accessor keyword was present at all (`get`/`set` in the `{ */
@@ -437,13 +434,13 @@ struct zan_ast_node {
             zan_ast_list_t *indexer_params;
         } field_decl;
 
-        /* generic constraint clause: where T : C1, C2 */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_istr_t param_name;
-            zan_ast_list_t constraints; /* AST_TYPE_REF list */
+            zan_ast_list_t constraints; /* 核心系统底层抽象与内存语义契约 */
         } where_clause;
 
-        /* yield return expr; (value set) or yield break; (value NULL) */
+        /* 模块核心语义抽象与接口调用契约 */
         struct {
             zan_ast_node_t *value;
         } yield_stmt;
@@ -465,25 +462,22 @@ struct zan_ast_node {
             zan_istr_t var;
             zan_ast_node_t *source;
             zan_ast_list_t clauses; 
-/*
- * AST_QUERY_WHERE/LET/ORDERBY/JOIN, in
- * source order
- */
+/* 模块核心语义抽象与接口调用契约 */
             zan_ast_node_t *group_expr; /* `group <expr> by <key>` element */
-            zan_ast_node_t *group_key;  /* group key expression */
+            zan_ast_node_t *group_key;  /* 核心系统底层抽象与内存语义契约 */
             zan_istr_t group_into;      /* `into <name>` var (empty = none) */
             zan_ast_node_t *select;
         } query;
 
-        /* sub-clause payloads (AST_QUERY_WHERE, AST_QUERY_LET, AST_QUERY_ORDERBY, AST_QUERY_JOIN) */
+        /* 模块核心语义抽象与接口调用契约 */
         struct {
-            zan_istr_t name;        /* let v / join y / into g var name */
-            zan_ast_node_t *expr;   /* where cond, let value or orderby key */
+            zan_istr_t name;        /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *expr;   /* 底层系统交互与数据协议契约 */
             int descending;         /* orderby: 1 = descending */
-            zan_ast_node_t *source;     /* join source collection */
-            zan_ast_node_t *left_key;   /* join left key (outer range var) */
-            zan_ast_node_t *right_key;  /* join right key (inner range var) */
-            zan_istr_t into;            /* join ... into g (group join) */
+            zan_ast_node_t *source;     /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *left_key;   /* 底层系统交互与数据协议契约 */
+            zan_ast_node_t *right_key;  /* 底层系统交互与数据协议契约 */
+            zan_istr_t into;            /* 核心系统底层抽象与内存语义契约 */
         } query_clause;
 
         /* parameter */
@@ -491,19 +485,19 @@ struct zan_ast_node {
             zan_istr_t name;
             zan_ast_node_t *type;
             zan_ast_node_t *default_val;
-            int is_params; /* trailing `params T[]` variadic parameter */
+            int is_params; /* 核心系统底层抽象与内存语义契约 */
             int by_ref;    /* 0 = by value, 1 = `ref`, 2 = `out` */
-            int is_this;   /* leading `this T recv` extension-method receiver */
+            int is_this;   /* 底层系统交互与数据协议契约 */
         } param;
 
-        /* by-reference call argument: `ref x`, `out x`, `out T x` */
+        /* 底层系统交互与数据协议契约 */
         struct {
-            zan_ast_node_t *expr;      /* the referenced lvalue (identifier) */
-            zan_ast_node_t *decl_type; /* non-NULL for inline `out T x` decl */
+            zan_ast_node_t *expr;      /* 核心系统底层抽象与内存语义契约 */
+            zan_ast_node_t *decl_type; /* 底层系统交互与数据协议契约 */
             int is_out;
         } ref_arg;
 
-        /* named call argument: `F(b: 2)` -- the arg name and its expression */
+        /* 模块核心语义抽象与接口调用契约 */
         struct {
             zan_istr_t name;
             zan_ast_node_t *expr;
@@ -515,23 +509,23 @@ struct zan_ast_node {
             zan_ast_list_t items;
         } coll_init;
 
-        /* type reference */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_istr_t name;
             zan_ast_list_t type_args;
             bool is_nullable;
             bool is_array;
-            /* Array shape beyond the boolean: `array_rank` is 1 for `[]`, 2 for `[,]`, 3 for `[,,]` */
+            /* 模块核心语义抽象与接口调用契约 */
             int array_rank;
             zan_ast_node_t *array_element;
-            /* Scope-sensitive binder memo; AST_TYPE_REF only. */
+            /* 模块核心语义抽象与接口调用契约 */
             void *rt_type;
             void *rt_scope;
         } type_ref;
 
-        /* qualified name: a.b.c */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
-            zan_ast_list_t parts; /* list of AST_IDENTIFIER nodes */
+            zan_ast_list_t parts; /* 核心系统底层抽象与内存语义契约 */
         } qualified_name;
 
         /* attribute */
@@ -540,13 +534,13 @@ struct zan_ast_node {
             zan_ast_list_t args;
         } attribute;
 
-        /* enum member */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_istr_t name;
-            zan_ast_node_t *value; /* NULL for auto */
+            zan_ast_node_t *value; /* 核心系统底层抽象与内存语义契约 */
         } enum_member;
 
-        /* await expression */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
             zan_ast_node_t *expr;
         } await_expr;
@@ -557,16 +551,16 @@ struct zan_ast_node {
             zan_ast_node_t *body; /* block or expr */
         } lambda;
 
-        /* string interpolation: $"text {expr} text" */
+        /* 核心系统底层抽象与内存语义契约 */
         struct {
-            zan_ast_list_t parts; /* alternating STRING_LITERAL and expr nodes */
-            /* Parallel to the expr parts: the format specifier of each hole (e */
+            zan_ast_list_t parts; /* 底层系统交互与数据协议契约 */
+            /* 模块核心语义抽象与接口调用契约 */
             zan_ast_list_t formats;
         } string_interp;
     };
 };
 
-/* ---- modifier flags ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 #define MOD_PUBLIC    0x0001
 #define MOD_PRIVATE   0x0002
@@ -584,7 +578,7 @@ struct zan_ast_node {
 #define MOD_WEAK      0x2000
 #define MOD_EVENT     0x4000
 #define MOD_PARTIAL   0x8000
-#define MOD_REF       0x10000  /* `ref struct` / `ref` return-annotated member */
+#define MOD_REF       0x10000  /* 底层系统交互与数据协议契约 */
 
 zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t loc);
 size_t zan_ast_node_count(void);

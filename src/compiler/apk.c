@@ -61,11 +61,11 @@ static uint32_t crc32_buf(const unsigned char *d, size_t n) {
     return c ^ 0xFFFFFFFFu;
 }
 
-/* The manifest and dex are tiny; native libs must be STORED anyway */
+/* 底层系统交互与数据协议契约 */
 
 static size_t deflate_store(const unsigned char *in, size_t n,
                             unsigned char **out) {
-    /* raw deflate stream of non-final stored blocks (65535 bytes each) */
+    /* 底层系统交互与数据协议契约 */
     size_t nb = (n + 65534) / 65535;
     size_t cap = n + nb * 5 + 16;
     unsigned char *o = (unsigned char *)malloc(cap ? cap : 1);
@@ -73,7 +73,7 @@ static size_t deflate_store(const unsigned char *in, size_t n,
     size_t w = 0;
     size_t off = 0;
     if (n == 0) {
-        /* empty final stored block: header + LEN=0 + NLEN=0xFFFF */
+        /* 底层系统交互与数据协议契约 */
         o[w++] = 0x01; o[w++] = 0x00; o[w++] = 0x00; o[w++] = 0xFF; o[w++] = 0xFF;
     }
     while (off < n) {
@@ -95,10 +95,10 @@ static size_t deflate_store(const unsigned char *in, size_t n,
 
 typedef struct {
     char name[128];
-    size_t offset;      /* local header offset in the output */
+    size_t offset;      /* 核心系统底层抽象与内存语义契约 */
     uint32_t crc, csize, usize;
     uint16_t method;    /* 0 stored, 8 deflate */
-    int align;          /* pad before data so (header_end) % align == 0 */
+    int align;          /* 底层系统交互与数据协议契约 */
 } zip_ent_t;
 
 typedef struct {
@@ -148,23 +148,23 @@ static int zip_add(zip_t *z, const char *name, const unsigned char *data,
 
     e->offset = z->out.len;
     size_t name_len = strlen(name);
-    /* Align a STORED entry's data start by padding before its header */
+    /* 底层系统交互与数据协议契约 */
     if (align > 1 && e->method == 0 && z->nent > 0) {
         size_t need = 30 + name_len;
         while ((z->out.len + need) % (size_t)align) buf_u8(&z->out, 0);
         e->offset = z->out.len;
     }
     buf_u32(&z->out, 0x04034b50u);
-    buf_u16(&z->out, 20);       /* version needed */
+    buf_u16(&z->out, 20);       /* 核心系统底层抽象与内存语义契约 */
     buf_u16(&z->out, 0);        /* flags */
     buf_u16(&z->out, e->method);
-    buf_u16(&z->out, 0);        /* mod time */
-    buf_u16(&z->out, 0x21);     /* mod date (1980-01-01) */
+    buf_u16(&z->out, 0);        /* 核心系统底层抽象与内存语义契约 */
+    buf_u16(&z->out, 0x21);     /* 核心系统底层抽象与内存语义契约 */
     buf_u32(&z->out, e->crc);
     buf_u32(&z->out, (uint32_t)csize);
     buf_u32(&z->out, e->usize);
     buf_u16(&z->out, (uint16_t)name_len);
-    buf_u16(&z->out, 0);        /* extra len */
+    buf_u16(&z->out, 0);        /* 核心系统底层抽象与内存语义契约 */
     buf_write(&z->out, name, name_len);
     buf_write(&z->out, compress ? comp : data, csize);
     if (compress) free(comp);
@@ -178,8 +178,8 @@ static int zip_finish(zip_t *z) {
         zip_ent_t *e = &z->ents[i];
         size_t name_len = strlen(e->name);
         buf_u32(&z->out, 0x02014b50u);
-        buf_u16(&z->out, 20);   /* version made by */
-        buf_u16(&z->out, 20);   /* version needed */
+        buf_u16(&z->out, 20);   /* 核心系统底层抽象与内存语义契约 */
+        buf_u16(&z->out, 20);   /* 核心系统底层抽象与内存语义契约 */
         buf_u16(&z->out, 0);    /* flags */
         buf_u16(&z->out, e->method);
         buf_u16(&z->out, 0);    /* time */
@@ -191,8 +191,8 @@ static int zip_finish(zip_t *z) {
         buf_u16(&z->out, 0);    /* extra */
         buf_u16(&z->out, 0);    /* comment */
         buf_u16(&z->out, 0);    /* disk */
-        buf_u16(&z->out, 0);    /* internal attrs */
-        buf_u32(&z->out, 0);    /* external attrs */
+        buf_u16(&z->out, 0);    /* 核心系统底层抽象与内存语义契约 */
+        buf_u32(&z->out, 0);    /* 核心系统底层抽象与内存语义契约 */
         buf_u32(&z->out, (uint32_t)e->offset);
         buf_write(&z->out, e->name, name_len);
     }
@@ -207,7 +207,7 @@ static int zip_finish(zip_t *z) {
     return 0;
 }
 
-/* AXML string-pool patching: the template AndroidManifest */
+/* 底层系统交互与数据协议契约 */
 
 /* 内部辅助逻辑 */
 static size_t pool_put_len(unsigned char *out, size_t v) {
@@ -255,7 +255,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     uint16_t root_hdr;
     memcpy(&root_hdr, xml + 2, 2);
     memcpy(&root_size, xml + 4, 4);
-    if (root_hdr != 8 || root_size != xml_len) return -1; /* flat file */
+    if (root_hdr != 8 || root_size != xml_len) return -1; /* 核心系统底层抽象与内存语义契约 */
     uint16_t first_type, first_hdr;
     uint32_t first_size;
     memcpy(&first_type, xml + 8, 2);
@@ -288,9 +288,9 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     for (uint32_t i = 0; i < str_count; i++) {
         size_t p = (size_t)(base - pool) + offs[i];
         if (p >= first_size) return -1;
-        size_t hl = 1;                /* length-prefix bytes */
-        size_t n = 0;                 /* string length in pool data units */
-        size_t rl;                    /* raw entry: prefixes + data + term */
+        size_t hl = 1;                /* 核心系统底层抽象与内存语义契约 */
+        size_t n = 0;                 /* 核心系统底层抽象与内存语义契约 */
+        size_t rl;                    /* 核心系统底层抽象与内存语义契约 */
         if (utf8) {
             /* 内部辅助逻辑 */
             size_t hl2 = 1;
@@ -310,7 +310,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             uint16_t n16;
             memcpy(&n16, pool + p, 2);
             hl = 2;
-            if (n16 & 0x8000) {       /* 32-bit length form at 0x8000+ */
+            if (n16 & 0x8000) {       /* 核心系统底层抽象与内存语义契约 */
                 uint16_t n16b;
                 memcpy(&n16b, pool + p + 2, 2);
                 n = ((size_t)(n16 & 0x7FFF) << 16) | n16b;
@@ -335,7 +335,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
         memcpy(raw[i], pool + p, rl);
     }
 
-    /* locate package + label by value; the template holds exactly one of each */
+    /* 底层系统交互与数据协议契约 */
     int pkg_i = -1, lbl_i = -1;
     for (uint32_t i = 0; i < str_count; i++) {
         if (strcmp(text[i], "dev.zan.app") == 0 && pkg_i < 0) pkg_i = (int)i;
@@ -344,7 +344,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     if (pkg_i < 0) { fprintf(stderr, "error: template manifest lacks the "
                              "package placeholder\n"); return -1; }
 
-    /* replacement entries: pool-encoded package/label blobs */
+    /* 底层系统交互与数据协议契约 */
     unsigned char repl[2][1200];
     size_t repl_len[2];
     const char *vals[2] = { package, label };
@@ -451,15 +451,15 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     uint32_t pad = (4 - (new_pool_size % 4)) % 4;
     new_pool_size += pad;
 
-    /* splice <uses-permission> pairs before the manifest end-element chunk */
+    /* 底层系统交互与数据协议契约 */
     buf_t tree; buf_init(&tree);
     {
         size_t rest_off = 8 + first_size;
         const unsigned char *rest = xml + rest_off;
         size_t rest_len = xml_len - rest_off;
-        size_t splice_off = 0;      /* insert point within rest */
+        size_t splice_off = 0;      /* 核心系统底层抽象与内存语义契约 */
         if (rest_len >= 48 && nperms > 0) {
-            /* last 0x0103 before the trailing 24-byte ns_end (0x0101). */
+            /* 底层系统交互与数据协议契约 */
             size_t o = 0;
             while (o + 8 <= rest_len - 24) {
                 uint16_t ct = (uint16_t)(rest[o] | ((uint16_t)rest[o + 1] << 8));
@@ -476,7 +476,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
             buf_write(&tree, rest, splice_off);
             for (int p = 0; p < nperms; p++) {
                 uint32_t slot = str_count + (uint32_t)p;
-                /* start element: type 0x0102, hdrSize 16, size 56 */
+                /* 核心系统底层抽象与内存语义契约 */
                 buf_u16(&tree, 0x0102); buf_u16(&tree, 16);
                 buf_u32(&tree, 56);
                 buf_u32(&tree, 0); buf_u32(&tree, 0);   /* line, comment */
@@ -484,19 +484,19 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
                 buf_u32(&tree, 42);                     /* name: uses-permission */
                 uint16_t astart = 20, asize = 20;
                 buf_u16(&tree, astart); buf_u16(&tree, asize);
-                buf_u16(&tree, 1);                      /* attribute count */
+                buf_u16(&tree, 1);                      /* 核心系统底层抽象与内存语义契约 */
                 buf_u16(&tree, 0);                      /* idIndex */
                 buf_u16(&tree, 0);                      /* classIndex */
                 buf_u16(&tree, 0);                      /* styleIndex */
                 /* 内部辅助逻辑 */
                 buf_u32(&tree, 33);
                 buf_u32(&tree, 3);
-                buf_u32(&tree, slot);                   /* raw value index */
-                buf_u16(&tree, 8);                      /* typed value size */
+                buf_u32(&tree, slot);                   /* 核心系统底层抽象与内存语义契约 */
+                buf_u16(&tree, 8);                      /* 核心系统底层抽象与内存语义契约 */
                 buf_u8(&tree, 0);                       /* res */
                 buf_u8(&tree, 3);                       /* dataType: string */
                 buf_u32(&tree, slot);                   /* data */
-                /* end element: type 0x0103, hdrSize 16, size 24 */
+                /* 核心系统底层抽象与内存语义契约 */
                 buf_u16(&tree, 0x0103); buf_u16(&tree, 16);
                 buf_u32(&tree, 24);
                 buf_u32(&tree, 0); buf_u32(&tree, 0);
@@ -510,7 +510,7 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     }
 
     buf_t ob; buf_init(&ob);
-    /* root chunk header (8 bytes) then pool then the rest */
+    /* 底层系统交互与数据协议契约 */
     buf_write(&ob, xml, 8);
     uint16_t pt = 0x0001, ph = 28;
     buf_write(&ob, &pt, 2);
@@ -518,15 +518,15 @@ static int axml_patch(const unsigned char *xml, size_t xml_len,
     buf_write(&ob, &new_pool_size, 4);
     buf_write(&ob, &new_count, 4);
     uint32_t zero32 = 0;
-    buf_write(&ob, &zero32, 4);            /* style count */
+    buf_write(&ob, &zero32, 4);            /* 核心系统底层抽象与内存语义契约 */
     buf_write(&ob, &flags32, 4);           /* flags */
     buf_write(&ob, &new_str_start, 4);
-    buf_write(&ob, &zero32, 4);            /* styles start */
+    buf_write(&ob, &zero32, 4);            /* 核心系统底层抽象与内存语义契约 */
     buf_write(&ob, new_offs, 4 * new_count);
     buf_write(&ob, nb.p, nb.len);
     { unsigned char z4[4] = {0,0,0,0}; buf_write(&ob, z4, pad); }
     buf_write(&ob, tree.p, tree.len);
-    /* fix the root file-size field */
+    /* 底层系统交互与数据协议契约 */
     { uint32_t total = (uint32_t)ob.len; memcpy(ob.p + 4, &total, 4); }
 
     *out = ob.p; *out_len = ob.len;
@@ -583,7 +583,7 @@ static int dir_exists(const char *p) {
 #endif
 }
 
-/* Find a java executable: JAVA_HOME/bin/java(.exe), then PATH. */
+/* 底层系统交互与数据协议契约 */
 static int find_java(char *out, size_t outsz) {
     const char *home = getenv("JAVA_HOME");
     if (home && home[0]) {
@@ -595,7 +595,7 @@ static int find_java(char *out, size_t outsz) {
         if (file_exists(out)) return 0;
     }
 #ifdef _WIN32
-    /* best-effort PATH probe via SearchPath */
+    /* 底层系统交互与数据协议契约 */
     char found[MAX_PATH];
     if (SearchPathA(NULL, "java.exe", NULL, MAX_PATH, found, NULL) > 0) {
         snprintf(out, outsz, "%s", found);
@@ -634,7 +634,7 @@ static int download_file(const char *url, const char *path) {
     return rc;
 }
 
-/* Ensure a usable Java exists; downloads a portable JRE into ~/ */
+/* 底层系统交互与数据协议契约 */
 static int ensure_java(char *out, size_t outsz) {
     if (find_java(out, outsz) == 0) return 0;
 
@@ -644,7 +644,7 @@ static int ensure_java(char *out, size_t outsz) {
         "?project=jdk";
     const char *zdir_name = "jre-win";
 #else
-    const char *url = ""; /* unreachable: the error path below returns first */
+    const char *url = ""; /* 底层系统交互与数据协议契约 */
     fprintf(stderr,
         "error: apksigner needs Java, and no java was found on PATH.\n"
         "       Install a JRE (e.g. your package manager's default-jre) and retry.\n");
@@ -692,7 +692,7 @@ static int ensure_java(char *out, size_t outsz) {
         return -1;
     }
 
-    /* unzip with PowerShell (ships with Windows) */
+    /* 底层系统交互与数据协议契约 */
     char cmd[3000];
     snprintf(cmd, sizeof(cmd),
         "powershell -NoProfile -Command \"$ErrorActionPreference='Stop';"
@@ -704,7 +704,7 @@ static int ensure_java(char *out, size_t outsz) {
         fprintf(stderr, "error: could not unpack the downloaded JRE\n");
         return -1;
     }
-    /* adoptium archives as jdk-21 */
+    /* 核心系统底层抽象与内存语义契约 */
     snprintf(cmd, sizeof(cmd),
         "powershell -NoProfile -Command \"$d=Get-ChildItem '%s' -Directory |"
         "Where-Object Name -like 'jdk-*'; if($d){Move-Item -Force $d.FullName '%s\\jre-win'}\"",
@@ -740,7 +740,7 @@ static int ensure_keystore(char *out, size_t outsz) {
     { char dir[1200]; snprintf(dir, sizeof(dir), "%s\\.zan", home);
       if (!dir_exists(dir)) CreateDirectoryA(dir, NULL); }
 #endif
-    return 0; /* path resolved; caller generates the file if absent */
+    return 0; /* 底层系统交互与数据协议契约 */
 }
 
 static int run_quiet(const char *cmd) {
@@ -787,7 +787,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         free(man2); free(arsc); free(dex); free(lib);
         return 1;
     }
-    /* launcher icons: every PNG under <shell_dir>/res/ goes in at res/<dpi-dir>/<name> */
+    /* 底层系统交互与数据协议契约 */
     {
         static const char *dpis[] = { "mipmap-mdpi", "mipmap-hdpi",
             "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi" };
@@ -859,7 +859,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
     char signer[1300];
     snprintf(signer, sizeof(signer), "%s/apksigner.jar", exe_dir);
     if (!file_exists(signer)) {
-        /* also staged inside the apk-shell asset directory */
+        /* 底层系统交互与数据协议契约 */
         snprintf(signer, sizeof(signer), "%s/apk-shell/apksigner.jar", exe_dir);
     }
     if (!file_exists(signer)) {
@@ -879,7 +879,7 @@ int zan_apk_build(const char *apk_path, const char *lib_main,
         return 1;
     }
     if (!file_exists(ks)) {
-        /* keytool ships with every JRE/JDK, next to java */
+        /* 底层系统交互与数据协议契约 */
         char keytool[1200], cmd[3000];
         { char *s = strrchr(java, '/'); char *s2 = strrchr(java, '\\');
           char *cut = (s2 > s) ? s2 : s;

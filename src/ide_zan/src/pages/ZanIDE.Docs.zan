@@ -1,339 +1,689 @@
 using System;
-using System.IO;
+using System.Threading;
+using Gui;
 using Gui.Backend;
+using Gui.Component;
+using Gui.Component.CodeEditor;
 
-/// One disk baseline entry: the file path, the text last known to be on disk,
-/// and the file's timestamp at that moment. One entity instead of the old
-/// parallel paths/texts/stamps lists.
 class DocBaselineEntry {
     string path;
     string text;
     long stamp;
+    int version;
 
-    static DocBaselineEntry Create(string path, string text, long stamp) {
-        DocBaselineEntry e = new DocBaselineEntry();
-        e.path = path;
-        e.text = text;
-        e.stamp = stamp;
-        return e;
+    static DocBaselineEntry Create(string path, string text, long stamp, int version) {
+        DocBaselineEntry entry = new DocBaselineEntry();
+        entry.path = path;
+        entry.text = text;
+        entry.stamp = stamp;
+        entry.version = version;
+        return entry;
     }
 }
 
-/// What the IDE last read from (or wrote to) disk for every open file: the text
-/// that was on disk and the file's timestamp at that moment.
-///
-/// That baseline is all the shell needs to answer the two questions an editor
-/// tab has to ask before it does anything destructive -- "does this tab hold
-/// unsaved edits?" and "did someone change this file behind our back?" -- so
-/// neither answer has to be guessed from a flag that some code path forgot to
-/// set. Virtual tabs (`@start`, `@docs`) and designer documents are simply never
-/// tracked: `Track` ignores them.
+// 接口数据协议与执行契约。
+// 接口数据协议与执行契约。
 class DocBaseline {
-    List<DocBaselineEntry> entries;
+    Dictionary<string, DocBaselineEntry> entries;
+    int revision;
 
     static DocBaseline Create() {
-        DocBaseline d = new DocBaseline();
-        d.entries = new List<DocBaselineEntry>();
-        return d;
+        DocBaseline docs = new DocBaseline();
+        docs.entries = new Dictionary<string, DocBaselineEntry>();
+        return docs;
     }
 
-    /// True for paths that have a real file behind them, i.e. the ones worth a
-    /// baseline: not the virtual tabs and not the designer-owned documents.
     static bool IsFileTab(string path) {
-        if (path == "") { return false; }
-        if (path.Substring(0, 1) == "@") { return false; }
-        if (ZanIDE.IsFormPath(path) || ZanIDE.IsScenePath(path)
-            || ZanIDE.IsHtmlPath(path)) { return false; }
+        return path != "" && !path.StartsWith("@")
+            && !ZanIDE.IsFormPath(path) && !ZanIDE.IsScenePath(path);
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    static bool SameText(string left, string right) {
+        if (left == right) { return true; }
+        int a = 0;
+        int b = 0;
+        while (a < left.Length || b < right.Length) {
+            while (a < left.Length && left[a] == '\r') { a = a + 1; }
+            while (b < right.Length && right[b] == '\r') { b = b + 1; }
+            if (a == left.Length || b == right.Length) {
+                return a == left.Length && b == right.Length;
+            }
+            if (left[a] != right[b]) { return false; }
+            a = a + 1;
+            b = b + 1;
+        }
         return true;
     }
 
-    int IndexOf(string path) {
-        for (int i = 0; i < entries.Count; i = i + 1) {
-            if (entries[i].path == path) { return i; }
-        }
-        return -1;
+    DocBaselineEntry Entry(string path) {
+        DocBaselineEntry entry = null;
+        entries.TryGetValue(path, out entry);
+        return entry;
     }
 
-    bool Tracked(string path) { return this.IndexOf(path) >= 0; }
+    bool Tracked(string path) { return entries.ContainsKey(path); }
 
-    /// Records `text` as what is on disk for `path`, together with the file's
-    /// current timestamp. Called after opening, saving and reloading a file.
-    void Note(string path, string text) {
+    void Note(string path, string text, long stamp) {
         if (!DocBaseline.IsFileTab(path)) { return; }
-        long stamp = FileInfo.GetLastWriteTime(path);
-        int i = this.IndexOf(path);
-        if (i >= 0) {
-            entries[i].text = text;
-            entries[i].stamp = stamp;
-            return;
-        }
-        entries.Add(DocBaselineEntry.Create(path, text, stamp));
+        revision = revision + 1;
+        entries[path] = DocBaselineEntry.Create(path, text, stamp, revision);
     }
 
-    /// Baselines `path` only if it is not tracked yet, so a tab opened by any of
-    /// the many paths that add tabs gets its baseline the first frame it is seen.
-    void Track(string path, string text) {
-        if (this.Tracked(path)) { return; }
-        this.Note(path, text);
+    void Track(string path, string text, long stamp) {
+        if (!this.Tracked(path)) { this.Note(path, text, stamp); }
     }
 
-    void Forget(string path) {
-        int i = this.IndexOf(path);
-        if (i < 0) { return; }
-        entries.RemoveAt(i);
-    }
+    void Forget(string path) { entries.Remove(path); }
 
-    /// The text last known to be on disk ("" when the path is not tracked).
     string TextOf(string path) {
-        int i = this.IndexOf(path);
-        if (i < 0) { return ""; }
-        return entries[i].text;
+        DocBaselineEntry entry = this.Entry(path);
+        return entry == null ? "" : entry.text;
     }
 
-    /// True when `text` differs from what was last written to / read from disk.
-    /// An untracked path is never dirty: a virtual tab has nothing to lose.
-    /// Line endings are ignored (CRLF stripped from both sides): the editor
-    /// normalises a CRLF file to LF when it loads it (CodeEditor.SplitLines
-    /// removes '\r', GetText joins with '\n'), so an untouched CRLF file would
-    /// otherwise be reported dirty forever.
+    long StampOf(string path) {
+        DocBaselineEntry entry = this.Entry(path);
+        return entry == null ? 0 : entry.stamp;
+    }
+
+    int VersionOf(string path) {
+        DocBaselineEntry entry = this.Entry(path);
+        return entry == null ? 0 : entry.version;
+    }
+
     bool IsDirty(string path, string text) {
-        int i = this.IndexOf(path);
-        if (i < 0) { return false; }
-        return entries[i].text.Replace("\r", "") != text.Replace("\r", "");
+        if (!DocBaseline.IsFileTab(path)) { return false; }
+        DocBaselineEntry entry = this.Entry(path);
+        // 接口数据协议与执行契约。
+        return entry == null || !DocBaseline.SameText(entry.text, text);
     }
 
-    /// True when the file's timestamp moved since the baseline was taken, i.e.
-    /// something outside the IDE wrote it. A file that has been deleted (or is
-    /// momentarily unreadable) reports false: dropping the buffer on the floor
-    /// would be the one unrecoverable answer here.
-    bool ChangedOutside(string path) {
-        int i = this.IndexOf(path);
-        if (i < 0) { return false; }
-        long now = FileInfo.GetLastWriteTime(path);
-        if (now == 0) { return false; }
-        return now != entries[i].stamp;
+    bool ChangedOutside(string path, long stamp) {
+        DocBaselineEntry entry = this.Entry(path);
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        return entry == null || (stamp != 0 && stamp != entry.stamp);
     }
 
-    /// Accepts the file's current timestamp without touching the text baseline:
-    /// used when the user keeps their own edits after an outside change, so the
-    /// same change is not reported again on the next poll.
-    void AcceptStamp(string path) {
-        int i = this.IndexOf(path);
-        if (i < 0) { return; }
-        entries[i].stamp = FileInfo.GetLastWriteTime(path);
+    void AcceptStamp(string path, long stamp) {
+        DocBaselineEntry entry = this.Entry(path);
+        if (entry == null || stamp == 0) { return; }
+        this.Note(path, entry.text, stamp);
     }
 }
 
-/// The file lifecycle of the editor tabs: unsaved edits are never dropped
-/// without asking, and a file edited outside the IDE (git checkout, formatter,
-/// another editor) is picked up instead of being silently overwritten by a stale
-/// buffer on the next save.
 partial class ZanIDE {
-    /// How often the open files are checked against disk. Cheap (one timestamp
-    /// per open file) but pointless every frame.
+    IdeDocumentWatch documentWatch;
+    List<IdeDocumentWatch> retiredDocumentWatches = new List<IdeDocumentWatch>();
+    List<IdeDocumentSlot> documentSlots = new List<IdeDocumentSlot>();
+    Dictionary<int, IdeDocumentSave> documentSaves = new Dictionary<int, IdeDocumentSave>();
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    List<IdeDocumentSave> pendingDocumentSaves = new List<IdeDocumentSave>();
+    List<IdeDocumentSave> pendingSaveContinuations = new List<IdeDocumentSave>();
+    List<IdeDocumentDiskResult> pendingDocumentResults = new List<IdeDocumentDiskResult>();
+    int documentWatchEpoch;
+    int documentSlotSequence;
+    int documentSaveSequence;
+    int documentWritePauseDepth;
+    IdeDocumentSlot closeDocumentSlot;
+    int closeDocumentEpoch;
+    IdeDocumentDiskResult reloadDocumentResult;
+
     static int DiskPollMs() { return 1000; }
 
     void InitDocState() {
         docs = DocBaseline.Create();
         closeAsk = null;
-        closeAskTab = 0 - 1;
+        closeAskTab = -1;
         closeOthersKeepPath = "";
         reloadAsk = null;
-        reloadAskTab = 0 - 1;
+        reloadAskTab = -1;
         diskPollMs = 0;
     }
 
-    /// The text tab `i` currently holds: the editor's live buffer for the active
-    /// code tab (a tab body only catches up with the editor on a tab switch),
-    /// the stored body for every other tab.
     string TabText(int i) {
         if (i < 0 || i >= tabs.Count) { return ""; }
-        if (i == activeTab.Get() && DocBaseline.IsFileTab(tabs[i].path)) {
-            return editor.GetText();
-        }
-        return tabs[i].body;
+        TabRecord tab = tabs[i];
+        if (i == activeTab.Get() && !tab.designDoc && DocBaseline.IsFileTab(tab.path)
+            && editor.documentPath == tab.path) { return editor.GetText(); }
+        return tab.body;
     }
 
-    /// True when tab `i` holds edits that are not on disk.
     bool TabDirty(int i) {
-        if (i < 0 || i >= tabs.Count) { return false; }
+        if (i < 0 || i >= tabs.Count || tabs[i].designDoc) { return false; }
         return docs.IsDirty(tabs[i].path, this.TabText(i));
     }
 
-    /// Baselines any open file tab that has none yet. Tabs are added from a
-    /// dozen places (explorer, wizard, go-to-definition, session restore, ...);
-    /// doing this once per frame means none of them has to remember to.
-    void TrackOpenTabs() {
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void TrackPreparedDocument(string path, string text, long stamp) {
+        int i = ZanIDE.FindTabByPath(tabs, path);
+        if (i >= 0 && tabs[i].designDoc) { return; }
+        docs.Note(path, text, stamp);
+    }
+
+    IdeDocumentSlot DocumentSlotAt(int i) {
+        if (i < 0 || i >= tabs.Count) { return null; }
+        TabRecord tab = tabs[i];
+        for (int j = 0; j < documentSlots.Count; j = j + 1) {
+            IdeDocumentSlot existing = documentSlots[j];
+            if (existing.tab == tab && existing.tabSet == tabs && existing.workspace == documentWorkspace) {
+                return existing;
+            }
+        }
+        IdeDocumentSlot slot = new IdeDocumentSlot();
+        documentSlotSequence = documentSlotSequence + 1;
+        slot.id = documentSlotSequence;
+        slot.tab = tab;
+        slot.tabSet = tabs;
+        slot.workspace = documentWorkspace;
+        documentSlots.Add(slot);
+        return slot;
+    }
+
+    int DocumentSlotIndex(IdeDocumentSlot slot) {
+        if (slot == null || slot.tabSet != tabs || slot.workspace != documentWorkspace) { return -1; }
         for (int i = 0; i < tabs.Count; i = i + 1) {
-            docs.Track(tabs[i].path, tabs[i].body);
+            if (tabs[i] == slot.tab) { return i; }
+        }
+        return -1;
+    }
+
+    IdeDocumentSlot DocumentSlotById(int id) {
+        for (int i = 0; i < documentSlots.Count; i = i + 1) {
+            if (documentSlots[i].id == id) { return documentSlots[i]; }
+        }
+        return null;
+    }
+
+    IdeDocumentDiskInput CaptureDocumentAt(int i) {
+        if (i < 0 || i >= tabs.Count || tabs[i].designDoc
+            || !DocBaseline.IsFileTab(tabs[i].path)) { return null; }
+        IdeDocumentSlot slot = this.DocumentSlotAt(i);
+        if (slot == null) { return null; }
+        string text = this.TabText(i);
+        bool bound = i == activeTab.Get() && editor.documentPath == tabs[i].path;
+        int version = bound ? editor.TextStamp() : 0;
+        if (slot.path != tabs[i].path || slot.body != text || slot.storedBody != tabs[i].body) {
+            slot.bodyVersion = slot.bodyVersion + 1;
+            slot.path = tabs[i].path;
+            slot.body = text;
+            slot.storedBody = tabs[i].body;
+        }
+        slot.bound = bound;
+        slot.editorVersion = version;
+        IdeDocumentDiskInput input = new IdeDocumentDiskInput();
+        input.workspace = documentWorkspace;
+        input.epoch = documentWatchEpoch;
+        input.slot = slot.id;
+        input.path = slot.path;
+        input.body = text;
+        input.bodyVersion = slot.bodyVersion;
+        input.editorBound = bound;
+        input.editorVersion = version;
+        input.tracked = docs.Tracked(input.path);
+        input.baseline = docs.TextOf(input.path);
+        input.stamp = docs.StampOf(input.path);
+        input.baselineVersion = docs.VersionOf(input.path);
+        return input;
+    }
+
+    bool EnsureDocumentWatch() {
+        if (shuttingDown || app == null) { return false; }
+        if (documentWatch != null) { return true; }
+        IdeDocumentWatch watch = new IdeDocumentWatch();
+        documentWatch = watch;
+        if (watch.Start(app, this.ApplyDocumentDiskResult)) { return true; }
+        documentWatch = null;
+        retiredDocumentWatches.Add(watch);
+        log.Add(ZanIDE.T("> Document worker could not start.", "> 文档后台任务无法启动。"));
+        return false;
+    }
+
+    void PublishDocumentWatch() {
+        if (shuttingDown || !this.EnsureDocumentWatch()) { return; }
+        IdeDocumentWatchSnapshot snapshot = new IdeDocumentWatchSnapshot();
+        snapshot.workspace = documentWorkspace;
+        snapshot.epoch = documentWatchEpoch;
+        snapshot.leased = this.CodeNavigationBusy() || documentWritePauseDepth > 0;
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            IdeDocumentDiskInput input = this.CaptureDocumentAt(i);
+            if (input != null) { snapshot.files.Add(input); }
+        }
+        for (int i = documentSlots.Count - 1; i >= 0; i = i - 1) {
+            if (this.DocumentSlotIndex(documentSlots[i]) < 0) { documentSlots.RemoveAt(i); }
+        }
+        documentWatch.Submit(snapshot);
+    }
+
+    // 接口数据协议与执行契约。
+    void PumpDocumentWatch() {
+        if (shuttingDown) { return; }
+        this.ProcessDocumentDialogs();
+        this.FlushPendingDocumentWork();
+        this.PublishDocumentWatch();
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void TrackOpenTabs() { this.PublishDocumentWatch(); }
+    void PollDiskChanges() { this.PublishDocumentWatch(); }
+
+    bool DocumentWritesPaused() { return documentWritePauseDepth > 0; }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    bool DocumentResultCurrent(IdeDocumentDiskInput input, bool body, bool baseline) {
+        if (input == null || shuttingDown || input.workspace != documentWorkspace
+            || input.epoch != documentWatchEpoch) { return false; }
+        IdeDocumentSlot slot = this.DocumentSlotById(input.slot);
+        if (slot == null) { return false; }
+        int i = this.DocumentSlotIndex(slot);
+        if (i < 0 || slot.tab.path != input.path || slot.tab.designDoc) { return false; }
+        if (baseline && docs.VersionOf(input.path) != input.baselineVersion) { return false; }
+        if (!body) { return true; }
+        IdeDocumentDiskInput current = this.CaptureDocumentAt(i);
+        return current != null && current.bodyVersion == input.bodyVersion
+            && current.body == input.body && current.editorBound == input.editorBound
+            && current.editorVersion == input.editorVersion;
+    }
+
+    void QueueDocumentSave(IdeDocumentSave save, IdeDocumentDiskInput input) {
+        documentSaveSequence = documentSaveSequence + 1;
+        save.write.sequence = documentSaveSequence;
+        save.write.input = input;
+        if (documentWatch != null && documentWatch.Enqueue(save.write)) {
+            documentSaves[save.write.sequence] = save;
+            return;
+        }
+        // 接口数据协议与执行契约。
+        pendingDocumentSaves.Add(save);
+    }
+
+    void SaveTabAtThen(int i, Action continuation) {
+        if (shuttingDown || i < 0 || i >= tabs.Count || tabs[i].designDoc
+            || !DocBaseline.IsFileTab(tabs[i].path)) { return; }
+        string text = this.TabText(i);
+        tabs[i].body = text;
+        IdeDocumentSave save = new IdeDocumentSave();
+        save.write = IdeDocumentWrite.Create(tabs[i].path, text);
+        save.continuation = continuation;
+        this.PublishDocumentWatch();
+        IdeDocumentDiskInput input = this.CaptureDocumentAt(i);
+        if (input == null || input.path != save.write.path) {
+            log.Add(ZanIDE.T("> Could not save ", "> 无法保存 ") + save.write.path + ".");
+            app.RequestRedraw();
+            return;
+        }
+        this.QueueDocumentSave(save, input);
+    }
+
+    void SaveTabAt(int i) { this.SaveTabAtThen(i, null); }
+    void SaveActiveTab() { this.SaveActiveTabThen(null); }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void SaveActiveTabThen(Action continuation) {
+        if (shuttingDown) { return; }
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabs.Count) { return; }
+        IdeDocumentWrite write = ZanIDE.SaveActive(editor, tabs, activeTab, root, log);
+        if (write == null) {
+            // 接口数据协议与执行契约。
+            if (continuation != null) { app.Post(continuation); }
+            return;
+        }
+        IdeDocumentSave save = new IdeDocumentSave();
+        save.write = write;
+        save.continuation = continuation;
+        this.PublishDocumentWatch();
+        IdeDocumentDiskInput input = this.CaptureDocumentAt(a);
+        if (input == null || input.path != write.path) {
+            log.Add(ZanIDE.T("> Could not save ", "> 无法保存 ") + write.path + ".");
+            app.RequestRedraw();
+            return;
+        }
+        this.QueueDocumentSave(save, input);
+    }
+
+    void FlushPendingDocumentWork() {
+        if (shuttingDown || this.CodeNavigationBusy() || documentWritePauseDepth > 0) { return; }
+        if (pendingSaveContinuations.Count > 0) {
+            List<IdeDocumentSave> conts = pendingSaveContinuations;
+            pendingSaveContinuations = new List<IdeDocumentSave>();
+            for (int i = 0; i < conts.Count; i = i + 1) {
+                if (this.DocumentResultCurrent(conts[i].write.input, true, false)) { conts[i].continuation(); }
+            }
+        }
+        if (pendingDocumentSaves.Count > 0) {
+            List<IdeDocumentSave> saves = pendingDocumentSaves;
+            pendingDocumentSaves = new List<IdeDocumentSave>();
+            for (int i = 0; i < saves.Count; i = i + 1) {
+                IdeDocumentSave save = saves[i];
+                if (documentSaves.ContainsKey(save.write.sequence)) { continue; }
+                int index = ZanIDE.FindTabByPath(tabs, save.write.path);
+                IdeDocumentDiskInput input = this.CaptureDocumentAt(index);
+                if (input == null || input.path != save.write.path) { continue; }
+                this.QueueDocumentSave(save, input);
+            }
+        }
+        if (pendingDocumentResults.Count > 0) {
+            List<IdeDocumentDiskResult> results = pendingDocumentResults;
+            pendingDocumentResults = new List<IdeDocumentDiskResult>();
+            for (int i = 0; i < results.Count; i = i + 1) { this.ApplyDocumentDiskResult(results[i]); }
         }
     }
 
-    /// Writes tab `i` to its own file and re-baselines it. Works for any tab,
-    /// not just the active one, so a background tab can be saved from the dialog
-    /// that asked about it.
-    void SaveTabAt(int i) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        string p = tabs[i].path;
-        if (!DocBaseline.IsFileTab(p)) { return; }
-        string text = this.TabText(i);
-        tabs[i].body = text;
-        File.WriteAllText(p, text);
-        docs.Note(p, text);
-        log.Add("> Saved " + p + ".");
-    }
-
-    /// Saves the active tab and re-baselines it, so nothing that is already on
-    /// disk is ever reported as an unsaved edit or as an outside change.
-    void SaveActiveTab() {
-        ZanIDE.SaveActive(editor, tabs, activeTab, root, log);
-        int a = activeTab.Get();
-        if (a >= 0 && a < tabs.Count) { docs.Note(tabs[a].path, tabs[a].body); }
-        // The code the compiler indexed just changed: a type, a member or a
-        // `using` added since the last index run is invisible to completion
-        // until it runs again, so saving refreshes it (throttled, detached).
+    void CompleteDocumentSave(IdeDocumentDiskResult result) {
+        IdeDocumentSave save = null;
+        if (result.write == null || !documentSaves.TryGetValue(result.write.sequence, out save)) { return; }
+        documentSaves.Remove(result.write.sequence);
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        if (!this.DocumentResultCurrent(result.input, false, false)) { return; }
+        if (result.failure != "" || result.canceled) {
+            string message = result.canceled
+                ? ZanIDE.T("deferred by a document transaction", "被文档事务推迟")
+                : result.failure;
+            log.Add(ZanIDE.T("> Could not save ", "> 无法保存 ") + result.write.path + ": " + message);
+            // 接口数据协议与执行契约。
+            closeOthersKeepPath = "";
+            closeDocumentSlot = null;
+            app.RequestRedraw();
+            return;
+        }
+        IdeDocumentSlot slot = this.DocumentSlotById(result.input.slot);
+        if (slot == null) { return; }
+        if (result.write.sequence <= slot.saveApplied) { return; }
+        slot.saveApplied = result.write.sequence;
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        docs.Note(result.write.path, result.text, result.stamp);
+        log.Add("> Saved " + result.write.path + ".");
         this.RefreshSymbolIndex(false);
+        bool sameBody = this.DocumentResultCurrent(result.input, true, false);
+        bool busy = this.CodeNavigationBusy() || documentWritePauseDepth > 0;
+        if (save.continuation != null) {
+            if (!sameBody) {
+                // 接口数据协议与执行契约。
+                closeOthersKeepPath = "";
+                closeDocumentSlot = null;
+            } else if (busy) {
+                pendingSaveContinuations.Add(save);
+            } else {
+                save.continuation();
+            }
+        }
+        this.PublishDocumentWatch();
+        app.RequestRedraw();
     }
 
-    /// Replaces tab `i`'s buffer with `text` (what is on disk now) and makes it
-    /// the new baseline. The editor is reloaded when the tab is the visible one.
-    void AdoptDiskText(int i, string text) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        tabs[i].body = text;
-        if (i == activeTab.Get()) { editor.LoadText(text); }
-        docs.Note(tabs[i].path, text);
+    void ApplyDocumentDiskResult(IdeDocumentDiskResult result) {
+        if (result == null) { return; }
+        if (result.write != null) { this.CompleteDocumentSave(result); return; }
+        if (result.input == null || shuttingDown || result.input.workspace != documentWorkspace
+            || result.input.epoch != documentWatchEpoch) { return; }
+        if (result.failure != "") { return; }
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        if (documentWritePauseDepth > 0 || this.CodeNavigationBusy()
+            || (closeAsk != null && closeAsk.open) || (reloadAsk != null && reloadAsk.open)) {
+            for (int i = 0; i < pendingDocumentResults.Count; i = i + 1) {
+                if (pendingDocumentResults[i].input.path == result.input.path) { return; }
+            }
+            pendingDocumentResults.Add(result);
+            return;
+        }
+        if (!this.DocumentResultCurrent(result.input, true, true)) { return; }
+        if (!result.input.tracked || DocBaseline.SameText(result.text, result.input.body)) {
+            docs.Note(result.input.path, result.text, result.stamp);
+            this.PublishDocumentWatch();
+            return;
+        }
+        if (DocBaseline.SameText(result.text, result.input.baseline)) {
+            docs.AcceptStamp(result.input.path, result.stamp);
+            this.PublishDocumentWatch();
+            return;
+        }
+        IdeDocumentSlot slot = this.DocumentSlotById(result.input.slot);
+        int i = this.DocumentSlotIndex(slot);
+        if (!this.TabDirty(i)) {
+            this.AdoptDiskText(result);
+            return;
+        }
+        reloadDocumentResult = result;
+        reloadAskTab = i;
+        reloadAsk = LayerState.Choose(
+            ZanIDE.T("Changed on disk", "文件已被外部修改"),
+            tabs[i].name + ZanIDE.T(" changed outside the IDE. Reload and lose your unsaved edits?",
+                " 已在 IDE 外被修改。要重新加载并丢弃未保存的修改吗？"),
+            2, ZanIDE.T("Reload", "重新加载"), "", ZanIDE.T("Keep my edits", "保留我的修改"));
+        reloadAsk.Open();
+        app.RequestRedraw();
     }
 
-    /// Closes tab `i` outright, dropping its baseline with it.
-    void CloseTabNow(int i) {
-        if (i < 0 || i >= tabs.Count) { return; }
-        docs.Forget(tabs[i].path);
-        ZanIDE.CloseTabAt(tabs, activeTab, i);
-        lastActive = 0 - 1;
+    void AdoptDiskText(IdeDocumentDiskResult result) {
+        if (documentWritePauseDepth > 0 || this.CodeNavigationBusy()
+            || !this.DocumentResultCurrent(result.input, true, true)
+            || result.prepared == null || result.prepared.applied) { return; }
+        IdeDocumentSlot slot = this.DocumentSlotById(result.input.slot);
+        if (slot == null) { return; }
+        int i = this.DocumentSlotIndex(slot);
+        if (i == activeTab.Get() && editor.documentPath == slot.path) {
+            CodeEditorTextLoad request = editor.BeginTextLoad(slot.path, CodeEditor.LangForName(slot.path));
+            if (!editor.ApplyPreparedText(request, result.prepared)) { return; }
+            editor.GoToLineCol(slot.tab.caretLine, slot.tab.caretCol);
+            editor.SetScrollLine(slot.tab.scrollLine);
+            bindingCodeTab = slot.tab;
+            lastActive = i;
+        } else if (i == activeTab.Get()) {
+            // 接口数据协议与执行契约。
+            // 接口数据协议与执行契约。
+            bindingCodeTab = null;
+            lastActive = -1;
+        }
+        slot.tab.body = result.prepared.text;
+        slot.tab.preparedBody = slot.tab.body;
+        slot.tab.preparedText = result.prepared;
+        docs.Note(slot.path, result.text, result.stamp);
+        log.Add("> Reloaded " + slot.path + " (changed on disk).");
+        Layer.Msg(ZanIDE.T("Reloaded ", "已重新加载：") + slot.tab.name, 0);
+        this.RefreshSymbolIndex(false);
+        this.PublishDocumentWatch();
+        app.RequestRedraw();
     }
 
-    /// Closes tab `i`, asking what to do with unsaved edits first (Save / Don't
-    /// save / Cancel). A clean tab closes straight away.
+    void CloseTabNow(int i) { this.CloseTabNowThen(i, null); }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void CloseTabNowThen(int i, Action continuation) {
+        if (i < 0 || i >= tabs.Count || shuttingDown) { return; }
+        IdeDocumentSlot slot = this.DocumentSlotAt(i);
+        if (slot == null) { return; }
+        int epoch = documentWatchEpoch;
+        string path = slot.tab.path;
+        string body = this.TabText(i);
+        this.CancelCodeNavigationThen(delegate () {
+            if (shuttingDown || epoch != documentWatchEpoch || this.DocumentSlotIndex(slot) < 0
+                || slot.tab.path != path) { return; }
+            this.PauseDocumentWritesThen(delegate () {
+                int target = this.DocumentSlotIndex(slot);
+                if (shuttingDown || epoch != documentWatchEpoch || target < 0 || slot.tab.path != path) {
+                    this.ResumeDocumentWrites();
+                    return;
+                }
+                if (this.TabText(target) != body) {
+                    this.ResumeDocumentWrites();
+                    this.RequestCloseTab(target);
+                    return;
+                }
+                docs.Forget(path);
+                ZanIDE.CloseTabAt(tabs, activeTab, target);
+                bindingCodeTab = null;
+                lastActive = -1;
+                this.ResumeDocumentWrites();
+                this.PublishDocumentWatch();
+                app.RequestRedraw();
+                if (continuation != null) { continuation(); }
+            });
+        });
+    }
+
     void RequestCloseTab(int i) {
-        if (i < 0 || i >= tabs.Count) { return; }
+        if (i < 0 || i >= tabs.Count || shuttingDown) { return; }
+        if (this.CodeNavigationBusy()) {
+            IdeDocumentSlot slot = this.DocumentSlotAt(i);
+            int epoch = documentWatchEpoch;
+            this.CancelCodeNavigationThen(delegate () {
+                if (!shuttingDown && epoch == documentWatchEpoch) { this.RequestCloseTab(this.DocumentSlotIndex(slot)); }
+            });
+            return;
+        }
         if (!this.TabDirty(i)) { this.CloseTabNow(i); return; }
         closeAskTab = i;
+        closeDocumentSlot = this.DocumentSlotAt(i);
+        closeDocumentEpoch = documentWatchEpoch;
         closeAsk = LayerState.Choose(
             ZanIDE.T("Unsaved changes", "尚未保存"),
             ZanIDE.T("Save the changes to ", "是否保存对 ") + tabs[i].name
                 + ZanIDE.T(" before closing?", " 的修改？"),
-            2,
-            ZanIDE.T("Save", "保存"),
-            ZanIDE.T("Don't save", "不保存"),
-            ZanIDE.T("Cancel", "取消"));
+            2, ZanIDE.T("Save", "保存"), ZanIDE.T("Don't save", "不保存"), ZanIDE.T("Cancel", "取消"));
         closeAsk.Open();
         app.RequestRedraw();
     }
 
-    /// Closes every tab but the one holding `keepPath`, asking about each tab
-    /// with unsaved edits one dialog at a time (the answer resumes the run).
     void RequestCloseOthers(string keepPath) {
-        int i = 0;
-        for (i = 0; i < tabs.Count; i = i + 1) {
-            if (tabs[i].path != keepPath && this.TabDirty(i)) {
+        if (shuttingDown) { return; }
+        if (this.CodeNavigationBusy()) {
+            int epoch = documentWatchEpoch;
+            this.CancelCodeNavigationThen(delegate () {
+                if (!shuttingDown && epoch == documentWatchEpoch) { this.RequestCloseOthers(keepPath); }
+            });
+            return;
+        }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (tabs[i].path != keepPath) {
                 closeOthersKeepPath = keepPath;
-                this.RequestCloseTab(i);
+                if (this.TabDirty(i)) { this.RequestCloseTab(i); }
+                else { this.CloseDocumentThen(this.DocumentSlotAt(i), keepPath); }
                 return;
             }
         }
         closeOthersKeepPath = "";
-        i = tabs.Count - 1;
-        for (i = tabs.Count - 1; i >= 0; i = i - 1) {
-            if (tabs[i].path != keepPath) { this.CloseTabNow(i); }
-        }
     }
 
-    /// Checks the open files against disk a few times a second. A tab whose
-    /// file was changed outside the IDE follows the file when it has nothing to
-    /// lose; when it has unsaved edits the user is asked instead, because either
-    /// answer throws work away. Writes the IDE itself made are recognised by
-    /// content (the file matches what we hold), so saving never looks like an
-    /// outside change.
-    void PollDiskChanges() {
-        if (closeAsk != null && closeAsk.open) { return; }
-        if (reloadAsk != null && reloadAsk.open) { return; }
-        int now = Window.GetTickMs();
-        if (now - diskPollMs < ZanIDE.DiskPollMs()) { return; }
-        diskPollMs = now;
-        for (int i = 0; i < tabs.Count; i = i + 1) {
-            string p = tabs[i].path;
-            if (docs.ChangedOutside(p)) {
-                string onDisk = File.ReadAllText(p);
-                if (onDisk == docs.TextOf(p)) {
-                    // Touched but unchanged (a rebuild, a copy back).
-                    docs.AcceptStamp(p);
-                } else if (onDisk == this.TabText(i)) {
-                    // We wrote it, or the outside edit matches ours exactly.
-                    docs.Note(p, onDisk);
-                } else if (!this.TabDirty(i)) {
-                    this.AdoptDiskText(i, onDisk);
-                    log.Add("> Reloaded " + p + " (changed on disk).");
-                    Layer.Msg(ZanIDE.T("Reloaded ", "已重新加载：") + tabs[i].name, 0);
-                    app.RequestRedraw();
-                } else {
-                    reloadAskTab = i;
-                    reloadAsk = LayerState.Choose(
-                        ZanIDE.T("Changed on disk", "文件已被外部修改"),
-                        tabs[i].name + ZanIDE.T(
-                            " changed outside the IDE. Reload and lose your unsaved edits?",
-                            " 已在 IDE 外被修改。要重新加载并丢弃未保存的修改吗？"),
-                        2,
-                        ZanIDE.T("Reload", "重新加载"),
-                        "",
-                        ZanIDE.T("Keep my edits", "保留我的修改"));
-                    reloadAsk.Open();
-                    app.RequestRedraw();
-                    return;
-                }
+    // 接口数据协议与执行契约。
+    // 核心契约与语义定义。
+    void CloseDocumentThen(IdeDocumentSlot slot, string keepPath) {
+        int target = this.DocumentSlotIndex(slot);
+        if (target < 0) { return; }
+        this.CloseTabNowThen(target, delegate () {
+            if (keepPath != "" && closeOthersKeepPath == keepPath) { this.RequestCloseOthers(keepPath); }
+        });
+    }
+
+    // 核心契约与语义定义。
+    void ProcessDocumentDialogs() {
+        if (closeAsk != null && closeAsk.open && closeAsk.action != 0) {
+            int action = closeAsk.action;
+            closeAsk.action = 0;
+            closeAsk.open = false;
+            IdeDocumentSlot slot = closeDocumentSlot;
+            int target = this.DocumentSlotIndex(slot);
+            string keep = closeOthersKeepPath;
+            if (target >= 0 && closeDocumentEpoch == documentWatchEpoch) {
+                if (action == 1) {
+                    this.SaveTabAtThen(target, delegate () { this.CloseDocumentThen(slot, keep); });
+                } else if (action == 4) {
+                    this.CloseDocumentThen(slot, keep);
+                } else { closeOthersKeepPath = ""; }
+            } else { closeOthersKeepPath = ""; }
+            app.RequestRedraw();
+        }
+        if (reloadAsk != null && reloadAsk.open && reloadAsk.action != 0) {
+            int action = reloadAsk.action;
+            reloadAsk.action = 0;
+            reloadAsk.open = false;
+            IdeDocumentDiskResult result = reloadDocumentResult;
+            reloadDocumentResult = null;
+            if (result != null && documentWritePauseDepth == 0
+                && this.DocumentResultCurrent(result.input, true, true)) {
+                if (action == 1) { this.AdoptDiskText(result); }
+                else { docs.AcceptStamp(result.input.path, result.stamp); }
             }
+            app.RequestRedraw();
         }
     }
 
-    /// Draws the pending file questions (in the overlay pass, above everything)
-    /// and applies the answer.
     void RenderDocDialogs() {
-        if (closeAsk != null && closeAsk.open) {
-            Layer.Render(app, closeAsk);
-            int a = closeAsk.action;
-            if (a != 0) {
-                closeAsk.action = 0;
-                closeAsk.open = false;
-                int target = closeAskTab;
-                if (a == 1) {
-                    this.SaveTabAt(target);
-                    this.CloseTabNow(target);
-                } else if (a == 4) {
-                    this.CloseTabNow(target);
-                } else {
-                    closeOthersKeepPath = "";
-                }
-                if (closeOthersKeepPath != "") {
-                    this.RequestCloseOthers(closeOthersKeepPath);
-                }
-                app.RequestRedraw();
-            }
+        if (closeAsk != null && closeAsk.open) { Layer.Render(app, closeAsk); }
+        if (reloadAsk != null && reloadAsk.open) { Layer.Render(app, reloadAsk); }
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    void PauseDocumentWritesThen(Action continuation) {
+        if (shuttingDown || continuation == null) { return; }
+        documentWritePauseDepth = documentWritePauseDepth + 1;
+        int epoch = documentWatchEpoch;
+        if (documentWatch == null) {
+            app.Post(delegate () {
+                if (!shuttingDown && epoch == documentWatchEpoch) { continuation(); }
+            });
+            return;
         }
-        if (reloadAsk != null && reloadAsk.open) {
-            Layer.Render(app, reloadAsk);
-            int a = reloadAsk.action;
-            if (a != 0) {
-                reloadAsk.action = 0;
-                reloadAsk.open = false;
-                int target = reloadAskTab;
-                if (a == 1 && target >= 0 && target < tabs.Count) {
-                    this.AdoptDiskText(target, File.ReadAllText(tabs[target].path));
-                } else if (target >= 0 && target < tabs.Count) {
-                    // Keeping the edits still acknowledges the change, or the
-                    // same question would come back on the next poll.
-                    docs.AcceptStamp(tabs[target].path);
-                }
-                app.RequestRedraw();
-            }
+        TaskCompletionSource<bool> paused = documentWatch.PauseWrites();
+        App host = app;
+        this.AwaitDocumentPauseAsync(paused, host, continuation, epoch);
+    }
+
+    async void AwaitDocumentPauseAsync(TaskCompletionSource<bool> paused, App host,
+                                       Action continuation, int epoch) {
+        await paused.Task;
+        host.Post(delegate () {
+            if (!shuttingDown && epoch == documentWatchEpoch) { continuation(); }
+        });
+    }
+
+    void ResumeDocumentWrites() {
+        if (documentWritePauseDepth > 0) { documentWritePauseDepth = documentWritePauseDepth - 1; }
+        if (documentWritePauseDepth == 0 && documentWatch != null) {
+            documentWatch.ResumeWrites();
+            this.PublishDocumentWatch();
         }
+    }
+
+    void CancelDocumentWatch() {
+        documentWatchEpoch = documentWatchEpoch + 1;
+        IdeDocumentWatch watch = documentWatch;
+        documentWatch = null;
+        if (watch != null) { watch.Cancel(); retiredDocumentWatches.Add(watch); }
+        documentSlots = new List<IdeDocumentSlot>();
+        documentSaves.Clear();
+        pendingDocumentSaves = new List<IdeDocumentSave>();
+        pendingSaveContinuations = new List<IdeDocumentSave>();
+        pendingDocumentResults = new List<IdeDocumentDiskResult>();
+        documentWritePauseDepth = 0;
+        docs = DocBaseline.Create();
+        closeAsk = null;
+        reloadAsk = null;
+        closeDocumentSlot = null;
+        reloadDocumentResult = null;
+        closeOthersKeepPath = "";
+    }
+
+    // 接口数据协议与执行契约。
+    // 接口数据协议与执行契约。
+    async void DrainDocumentWatchAsync() {
+        this.CancelDocumentWatch();
+        List<IdeDocumentWatch> retired = retiredDocumentWatches;
+        retiredDocumentWatches = new List<IdeDocumentWatch>();
+        for (int i = 0; i < retired.Count; i = i + 1) { await retired[i].DrainAsync(); }
     }
 }

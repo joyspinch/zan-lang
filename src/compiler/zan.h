@@ -1,7 +1,4 @@
-/* zan.h -- Common types and forward declarations for the Zan compiler.
- *
- * Every compiler module includes this header.
- */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_H
 #define ZAN_H
@@ -10,7 +7,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* ---- status codes ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef enum {
     ZAN_OK = 0,
@@ -18,7 +15,7 @@ typedef enum {
     ZAN_OOM,
 } zan_status_t;
 
-/* ---- source location ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct {
     uint32_t file_id;
@@ -32,7 +29,7 @@ static inline zan_loc_t zan_loc(uint32_t file_id, uint32_t line, uint32_t col, u
     return loc;
 }
 
-/* ---- forward declarations ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct zan_arena zan_arena_t;
 typedef struct zan_intern zan_intern_t;
@@ -48,7 +45,7 @@ typedef struct zan_irgen zan_irgen_t;
 typedef struct zan_type zan_type_t;
 typedef struct zan_symbol zan_symbol_t;
 
-/* ---- interned string handle ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct {
     const char *str;

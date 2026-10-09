@@ -1,16 +1,16 @@
-/* Part of the irgen translation unit: this file is #include'd by irgen */
+/* 底层系统交互与数据协议契约 */
 
 enum {
-    ZAN_MF_USER = 0,       /* registered user method/ctor (g->functions) */
-    ZAN_MF_ASYNC_RESUME,   /* "<ramp>$resume" body of an async method */
-    ZAN_MF_RELEASE,        /* __zan_release_* / __zan_arr_release_* etc. */
-    ZAN_MF_VTABLE,         /* __zan_vtable_* interface dispatch thunks */
+    ZAN_MF_USER = 0,       /* 核心系统底层抽象与内存语义契约 */
+    ZAN_MF_ASYNC_RESUME,   /* 核心系统底层抽象与内存语义契约 */
+    ZAN_MF_RELEASE,        /* 底层系统交互与数据协议契约 */
+    ZAN_MF_VTABLE,         /* 核心系统底层抽象与内存语义契约 */
     ZAN_MF_REFLECT,        /* __zan.refl.* / __zan_refl* thunks */
-    ZAN_MF_ADAPTER,        /* __zan_w32ir_* cross-target adapters */
-    ZAN_MF_OTHER           /* any other synthesized body */
+    ZAN_MF_ADAPTER,        /* 核心系统底层抽象与内存语义契约 */
+    ZAN_MF_OTHER           /* 核心系统底层抽象与内存语义契约 */
 };
 
-/* reason buckets for the audit's ineligible summary */
+/* 底层系统交互与数据协议契约 */
 enum {
     ZAN_MF_R_ASYNC, ZAN_MF_R_SPEC, ZAN_MF_R_VIRTUAL, ZAN_MF_R_ADDR,
     ZAN_MF_R_INDIRECT, ZAN_MF_R_ABI, ZAN_MF_R_SYNTH, ZAN_MF_R_POLICY,
@@ -99,13 +99,13 @@ static void mf_push(int **arr, int *cnt, int *cap, int v) {
     if (*cnt < *cap) { (*arr)[(*cnt)++] = v; return; }
     int ncap = *cap ? *cap * 2 : 8;
     int *n = (int *)realloc(*arr, (size_t)ncap * sizeof(int));
-    if (!n) { *cnt = 0; return; } /* audit-only: drop edges rather than die */
+    if (!n) { *cnt = 0; return; } /* 底层系统交互与数据协议契约 */
     *arr = n; *cap = ncap; (*arr)[(*cnt)++] = v;
 }
 
 static void mf_push_name(const char ***arr, int *cnt, int *cap, const char *v) {
     for (int i = 0; i < *cnt; i++)
-        if (!strcmp((*arr)[i], v)) return; /* dedupe: keep edge lists small */
+        if (!strcmp((*arr)[i], v)) return; /* 核心系统底层抽象与内存语义契约 */
     if (*cnt < *cap) { (*arr)[(*cnt)++] = v; return; }
     int ncap = *cap ? *cap * 2 : 8;
     const char **n = (const char **)realloc(*arr,
@@ -114,7 +114,7 @@ static void mf_push_name(const char ***arr, int *cnt, int *cap, const char *v) {
     *arr = n; *cap = ncap; (*arr)[(*cnt)++] = v;
 }
 
-/* Defined-function name -> manifest index, bsearched. */
+/* 底层系统交互与数据协议契约 */
 typedef struct { const char *name; int idx; } mf_name_map_t;
 
 static int mf_name_map_cmp(const void *a, const void *b) {
@@ -172,7 +172,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                                                  sizeof(LLVMValueRef));
     if (!fns || !llfns) { free(fns); free(llfns); return; }
 
-    /* pass 1: enumerate functions with their static facts */
+    /* 底层系统交互与数据协议契约 */
     for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
          fn = LLVMGetNextFunction(fn)) {
         if (m->fn_count >= cap) {
@@ -217,7 +217,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
          gv = LLVMGetNextGlobal(gv))
         m->global_count++;
 
-    /* registry cross-reference and per-body facts */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < m->fn_count; i++) {
         zan_mf_fn *F = &fns[i];
         F->reg_idx = -1;
@@ -231,7 +231,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         F->simple_abi = mf_simple_abi(g->functions[F->reg_idx].fn_type);
     }
 
-    /* name map over defined fns for O(log n) edge resolution */
+    /* 底层系统交互与数据协议契约 */
     mf_name_map_t *map = (mf_name_map_t *)malloc(
         (size_t)(m->defined_count ? m->defined_count : 1) * sizeof(*map));
     int mi = 0;
@@ -243,7 +243,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         }
     qsort(map, (size_t)mi, sizeof(*map), mf_name_map_cmp);
 
-    /* pass 2: per-body edges (calls, address-taken, globals) */
+    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < m->fn_count; i++) {
         zan_mf_fn *F = &fns[i];
         if (!F->defined) continue;
@@ -276,7 +276,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                     continue;
                 }
                 if (LLVMGetInstructionOpcode(in) == LLVMLandingPad)
-                    continue; /* personality fn is not an address escape */
+                    continue; /* 核心系统底层抽象与内存语义契约 */
                 unsigned nop = LLVMGetNumOperands(in);
                 for (unsigned k = 0; k < nop; k++)
                     mf_scan_insn_operand(F, fns, map, mi,
@@ -361,7 +361,7 @@ static void mf_report(zan_irgen_t *g, const zan_cg_manifest_t *m) {
     int reasons[ZAN_MF_R_REASON_COUNT] = {0};
     for (int i = 0; i < m->fn_count; i++) {
         const zan_mf_fn *F = &m->fns[i];
-        if (!F->defined) continue; /* kinds tally defined bodies only */
+        if (!F->defined) continue; /* 核心系统底层抽象与内存语义契约 */
         kind_count[F->kind]++;
         if (F->kind == ZAN_MF_USER) {
             if (F->is_async) async++;
@@ -524,7 +524,7 @@ static int mf_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
     return fclose(out) == 0 ? ZAN_OK : ZAN_ERROR;
 }
 
-/* Entry points called from main.c (declared in irgen.h). */
+/* 底层系统交互与数据协议契约 */
 void zan_irgen_manifest_build(zan_irgen_t *g, zan_cg_manifest_t *m,
                               bool native) {
     g->mf_native = native;

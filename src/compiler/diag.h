@@ -1,4 +1,4 @@
-/* diag.h -- Diagnostic reporting (errors, warnings, notes). */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_DIAG_H
 #define ZAN_DIAG_H
@@ -17,7 +17,7 @@ typedef enum {
 /* 诊断回显源码行最大字符宽度，超长行截断居中展示 */
 #define ZAN_DIAG_MAX_SOURCE_ECHO 200
 
-/* A single captured diagnostic (used by the language server). */
+/* 底层系统交互与数据协议契约 */
 typedef struct {
     zan_diag_level_t level;
     zan_loc_t        loc;
@@ -66,7 +66,7 @@ bool zan_diag_has_errors(zan_diag_t *diag);
 /* 开启或关闭结构化诊断捕获（开启后诊断不打印至 stderr 而是存入内存数组） */
 void zan_diag_set_capture(zan_diag_t *diag, bool enabled);
 
-/* Access captured diagnostics. */
+/* 核心系统底层抽象与内存语义契约 */
 int  zan_diag_entry_count(const zan_diag_t *diag);
 const zan_diag_entry_t *zan_diag_entry_at(const zan_diag_t *diag, int index);
 

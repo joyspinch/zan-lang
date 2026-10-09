@@ -1,9 +1,4 @@
-/* json.h -- Minimal dependency-free JSON parser and writer.
- *
- * Used by the Zan language server (LSP) and debug adapter (DAP) to speak
- * their JSON-RPC based protocols. Supports the full JSON grammar with a
- * simple owned-tree representation.
- */
+/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_JSON_H
 #define ZAN_JSON_H
 
@@ -32,33 +27,30 @@ struct json_value {
         char  *str;                 /* owned, NUL-terminated */
         struct { json_value **items; int count; int cap; } arr;
         struct { char **keys; json_value **vals; int count; int cap;
-                 /* Open-addressing key -> ordinal+1 index over keys[] (NULL
-                  * until the object grows past a few members); keeps
-                  * construction and lookup O(1) per member. */
+                 /* 底层系统交互与数据协议契约 */
                  int *index; int index_cap; } obj;
     } as;
 };
 
 /* ---- parsing ---- */
 
-/* Parse a NUL-terminated JSON document. Returns NULL on syntax error.
- * The returned tree must be released with json_free(). */
+/* 底层系统交互与数据协议契约 */
 json_value *json_parse(const char *text);
 
-/* Free a value tree (safe on NULL). */
+/* 核心系统底层抽象与内存语义契约 */
 void json_free(json_value *v);
 
-/* ---- accessors (all NULL/def tolerant) ---- */
+/* 核心系统底层抽象与内存语义契约 */
 
 json_value *json_obj_get(const json_value *obj, const char *key);
-const char *json_get_str(const json_value *v);         /* NULL if not string */
+const char *json_get_str(const json_value *v);         /* 核心系统底层抽象与内存语义契约 */
 double      json_get_num(const json_value *v, double def);
 bool        json_get_bool(const json_value *v, bool def);
 int         json_arr_count(const json_value *v);
 json_value *json_arr_at(const json_value *v, int index);
 bool        json_is(const json_value *v, json_type_t type);
 
-/* Convenience: obj.key traversal returning the leaf value or NULL. */
+/* 底层系统交互与数据协议契约 */
 json_value *json_path(const json_value *root, const char *dotted_path);
 
 /* ---- construction ---- */
@@ -70,11 +62,11 @@ json_value *json_new_str(const char *s);   /* copies s */
 json_value *json_new_obj(void);
 json_value *json_new_arr(void);
 
-/* Takes ownership of `val`. */
+/* 核心系统底层抽象与内存语义契约 */
 void json_obj_set(json_value *obj, const char *key, json_value *val);
 void json_arr_add(json_value *arr, json_value *val);
 
-/* Serialize to a freshly malloc'd NUL-terminated string (caller frees). */
+/* 底层系统交互与数据协议契约 */
 char *json_serialize(const json_value *v);
 
 #ifdef __cplusplus

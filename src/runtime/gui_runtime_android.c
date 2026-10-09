@@ -12,7 +12,7 @@ static jobject  zan_anw_bridge_activity(void);
 #include <string.h>
 #include <time.h>
 
-/* Diagnostics go to logcat under "zan_awv"; the bridge has no other console */
+/* 底层系统交互与数据协议契约 */
 #include <android/log.h>
 #define AWV_LOG(...) \
     __android_log_print(ANDROID_LOG_INFO, "zan_awv", __VA_ARGS__)
@@ -21,9 +21,9 @@ static jobject  zan_anw_bridge_activity(void);
 #define ZAN_ANDROID_WV_MAX 128
 #endif
 #define ZAN_AWV_MSG_MAX 128     /* queued "<handler>\t<body>" entries */
-#define ZAN_AWV_EVAL_TIMEOUT 3  /* seconds, matching the macOS spin */
+#define ZAN_AWV_EVAL_TIMEOUT 3  /* 核心系统底层抽象与内存语义契约 */
 
-/* Event kinds sent by org */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_AWV_EV_PAGE_STARTED 1
 #define ZAN_AWV_EV_PAGE_FINISHED 2
 #define ZAN_AWV_EV_TITLE 3
@@ -35,14 +35,14 @@ static jobject  zan_anw_bridge_activity(void);
 
 typedef struct {
     int used;
-    /* per-handle string buffers returned to Zan (strdup-replaced, owned) */
+    /* 底层系统交互与数据协议契约 */
     char *urlBuf, *titleBuf, *reqBuf, *evalBuf, *takeBuf, *cookieBuf, *clipBuf;
     int canBack, canFwd, loading, navSeq, status;
     int frameX, frameY, frameW, frameH;
-    /* JS -> Zan message ring */
+    /* 核心系统底层抽象与内存语义契约 */
     char *msgs[ZAN_AWV_MSG_MAX];
     int msgHead, msgCount, msgDropped;
-    /* eval synchronization: UI thread bumps evalSeq, waiter waits for it */
+    /* 底层系统交互与数据协议契约 */
     unsigned evalSeq;
 } zaw_t;
 
@@ -118,7 +118,7 @@ static char *awv_cstr(JNIEnv *env, jstring s) {
     return out;
 }
 
-/* Cache the bridge class and entry points */
+/* 底层系统交互与数据协议契约 */
 static int awv_init(void) {
     static int done = -1;
     if (done == 0) { return 0; }
@@ -326,7 +326,7 @@ static void awv_call_ss(jmethodID mid, i32 a, const char *s1, const char *s2) {
     (*env)->DeleteLocalRef(env, act);
 }
 
-/* The single event sink */
+/* 核心系统底层抽象与内存语义契约 */
 EXPORT void JNICALL
 Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
                                        jint kind, jstring s1, jstring s2,
@@ -401,11 +401,11 @@ Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
     free(b);
 }
 
-/* zan_gui_webview_* exports (see WebViewBackend */
+/* 底层系统交互与数据协议契约 */
 
 EXPORT i32 zan_gui_webview_create(i64 hwnd, const char *profileId) {
-    (void)hwnd;      /* one app window == the whole activity surface */
-    (void)profileId; /* CookieManager is process-global: no per-profile stores */
+    (void)hwnd;      /* 底层系统交互与数据协议契约 */
+    (void)profileId; /* 底层系统交互与数据协议契约 */
     if (awv_init() != 0) { AWV_LOG("create: init failed"); return 0; }
     pthread_mutex_lock(&g_awv_lock);
     int h = 0;
@@ -624,7 +624,7 @@ EXPORT void zan_gui_webview_clear_cookies(i32 h) {
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); }
 }
 
-/* optional bridge layer (dlopen-probed by WebViewBackend */
+/* 底层系统交互与数据协议契约 */
 
 EXPORT i32 zan_gui_webview_add_handler(i32 h, const char *name) {
     if (!awv_slot(h) || !name || !*name) { return 0; }

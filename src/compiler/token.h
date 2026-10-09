@@ -1,30 +1,23 @@
-/* token.h -- Token kinds for the Zan lexer.
- *
- * Generated from SPEC.md Section 2.
- */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_TOKEN_H
 #define ZAN_TOKEN_H
 
 typedef enum {
-    /* sentinel */
     TK_INVALID = 0,
     TK_EOF,
 
-    /* literals */
     TK_INT_LIT,         /* 42, 0xFF, 0b1010, 0o77 */
     TK_FLOAT_LIT,       /* 3.14, 1.0e10 */
     TK_STRING_LIT,      /* "hello" */
     TK_CHAR_LIT,        /* 'A' */
-    TK_INTERP_START,    /* $" ... start of interpolated string */
-    TK_INTERP_MID,      /* ... } text { ... middle fragment */
-    TK_INTERP_END,      /* ... } text " end fragment */
-    TK_INTERP_FMT,      /* {expr:D4} — the format specifier inside a hole */
+    TK_INTERP_START,    /* 核心系统底层抽象与内存语义契约 */
+    TK_INTERP_MID,      /* 核心系统底层抽象与内存语义契约 */
+    TK_INTERP_END,      /* 核心系统底层抽象与内存语义契约 */
+    TK_INTERP_FMT,      /* 底层系统交互与数据协议契约 */
 
-    /* identifier */
     TK_IDENT,
 
-    /* keywords */
     TK_ABSTRACT,
     TK_AS,
     TK_ASYNC,
@@ -108,7 +101,6 @@ typedef enum {
     TK_WHERE,
     TK_WHILE,
 
-    /* punctuation & operators */
     TK_LPAREN,          /* ( */
     TK_RPAREN,          /* ) */
     TK_LBRACE,          /* { */
@@ -126,18 +118,15 @@ typedef enum {
     TK_TILDE,           /* ~ */
     TK_ARROW,           /* => */
 
-    /* arithmetic */
     TK_PLUS,            /* + */
     TK_MINUS,           /* - */
     TK_STAR,            /* * */
     TK_SLASH,           /* / */
     TK_PERCENT,         /* % */
 
-    /* increment / decrement */
     TK_PLUS_PLUS,       /* ++ */
     TK_MINUS_MINUS,     /* -- */
 
-    /* comparison */
     TK_LESS,            /* < */
     TK_GREATER,         /* > */
     TK_LESS_EQ,         /* <= */
@@ -145,20 +134,17 @@ typedef enum {
     TK_EQ_EQ,           /* == */
     TK_BANG_EQ,         /* != */
 
-    /* logical */
     TK_BANG,            /* ! */
     TK_AMP_AMP,         /* && */
     TK_PIPE_PIPE,       /* || */
 
-    /* bitwise */
     TK_AMP,             /* & */
     TK_PIPE,            /* | */
     TK_CARET,           /* ^ */
     TK_LESS_LESS,       /* << */
     TK_GREATER_GREATER, /* >> */
-    TK_GREATER_GREATER_GREATER, /* >>> unsigned right shift (audit D16) */
+    TK_GREATER_GREATER_GREATER, /* 核心系统底层抽象与内存语义契约 */
 
-    /* assignment */
     TK_EQ,              /* = */
     TK_PLUS_EQ,         /* += */
     TK_MINUS_EQ,        /* -= */
@@ -175,7 +161,8 @@ typedef enum {
     TK__COUNT
 } zan_token_kind_t;
 
-/* human-readable token name (defined in lexer.c) */
+/* 底层系统交互与数据协议契约 */
 const char *zan_token_kind_name(zan_token_kind_t kind);
+bool zan_is_keyword(const char *name);
 
 #endif /* ZAN_TOKEN_H */

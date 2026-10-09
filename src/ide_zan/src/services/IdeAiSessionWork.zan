@@ -1,0 +1,474 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using System.Data;
+using System.Data.Sqlite;
+using Gui;
+
+/// 核心契约与语义定义。
+class IdeAiSessionImage {
+    List<ChatMessage> messages;
+    List<AiPlanStep> plan;
+    ChatTeamSave team;
+    AiRun run;
+
+    static IdeAiSessionImage Empty() {
+        IdeAiSessionImage image = new IdeAiSessionImage();
+        image.messages = new List<ChatMessage>();
+        image.plan = new List<AiPlanStep>();
+        image.team = ChatTeamSave.Create();
+        return image;
+    }
+
+    static AiRun CopyRun(AiRun source) {
+        if (source == null) { return null; }
+        AiRun copy = AiRun.Begin(source.taskId, source.title, source.createdMs);
+        copy.updatedMs = source.updatedMs;
+        copy.phase = source.phase;
+        copy.status = source.status;
+        copy.resumeAt = source.resumeAt;
+        copy.repairs = source.repairs;
+        copy.fault = source.fault;
+        copy.lastError = source.lastError;
+        copy.steps = new List<AiRunStep>();
+        for (int i = 0; i < source.steps.Count; i = i + 1) {
+            AiRunStep s = source.steps[i];
+            AiRunStep d = AiRunStep.Create(s.phase);
+            d.status = s.status; d.title = s.title; d.command = s.command;
+            d.calls = s.calls; d.exitCode = s.exitCode;
+            d.startedMs = s.startedMs; d.endedMs = s.endedMs;
+            d.retries = s.retries; d.fault = s.fault; d.error = s.error;
+            for (int g = 0; g < s.diagnostics.Count; g = g + 1) { d.diagnostics.Add(s.diagnostics[g]); }
+            for (int a = 0; a < s.artifacts.Count; a = a + 1) { d.artifacts.Add(s.artifacts[a]); }
+            copy.steps.Add(d);
+        }
+        if (source.changes != null) {
+            for (int c = 0; c < source.changes.Count; c = c + 1) {
+                AiFileChange change = source.changes[c];
+                copy.changes.Add(new AiFileChange(change.path, change.adds, change.dels));
+            }
+        }
+        return copy;
+    }
+
+    static IdeAiSessionImage Capture(List<ChatMessage> messages, List<AiPlanStep> plan,
+                                     bool teamOn, AiTeamState state, List<AiTask> tasks, AiRun run) {
+        IdeAiSessionImage copy = IdeAiSessionImage.Empty();
+        if (messages != null) {
+            for (int i = 0; i < messages.Count; i = i + 1) {
+                ChatMessage s = messages[i];
+                ChatMessage d = ChatMessage.CreateWithReason(s.role, s.text, s.reason);
+                d.agent = s.agent; d.to = s.to; d.kind = s.kind;
+                d.taskId = s.taskId; d.progress = s.progress; d.call = s.call; d.at = s.at;
+                copy.messages.Add(d);
+            }
+        }
+        if (plan != null) {
+            for (int p = 0; p < plan.Count; p = p + 1) {
+                copy.plan.Add(AiPlanStep.Create(plan[p].text, plan[p].done));
+            }
+        }
+        if (teamOn) { copy.team.on = 1; }
+        if (state != null) {
+            copy.team.st.activeAgent = state.activeAgent;
+            copy.team.st.activeTask = state.activeTask;
+            copy.team.st.awaitingUser = state.awaitingUser;
+            copy.team.st.askedBy = state.askedBy;
+        }
+        if (tasks != null) {
+            for (int t = 0; t < tasks.Count; t = t + 1) {
+                AiTask s = tasks[t];
+                AiTask d = AiTask.Create(s.id, s.title, s.owner);
+                d.state = s.state; d.progress = s.progress;
+                d.accept = s.accept; d.outcome = s.outcome;
+                if (s.deps != null) {
+                    for (int k = 0; k < s.deps.Count; k = k + 1) { d.deps.Add(s.deps[k]); }
+                }
+                if (s.parts != null) {
+                    for (int k = 0; k < s.parts.Count; k = k + 1) {
+                        AiTaskPart part = AiTaskPart.Create(s.parts[k].role);
+                        part.model = s.parts[k].model; part.rounds = s.parts[k].rounds; part.lastTs = s.parts[k].lastTs;
+                        d.parts.Add(part);
+                    }
+                }
+                if (s.items != null) {
+                    for (int k = 0; k < s.items.Count; k = k + 1) { d.items.Add(AiPlanStep.Create(s.items[k].text, s.items[k].done)); }
+                }
+                copy.team.tasks.Add(d);
+            }
+        }
+        copy.run = IdeAiSessionImage.CopyRun(run);
+        return copy;
+    }
+
+    IdeAiSessionImage Copy() {
+        return IdeAiSessionImage.Capture(this.messages, this.plan, this.team.on == 1,
+            this.team.st, this.team.tasks, this.run);
+    }
+
+    string Pack() {
+        ChatTeamSave team = ChatTeamSave.Create();
+        team.on = this.team.on; team.st = this.team.st; team.tasks = this.team.tasks;
+        if (this.run != null) { team.run = this.run.ToJson(); }
+        return ChatArea.ChatPack(this.messages, this.plan, team);
+    }
+
+    static IdeAiSessionImage Read(string pack) {
+        IdeAiSessionImage image = IdeAiSessionImage.Empty();
+        ChatArea.ChatUnpack(pack, image.messages, image.plan, image.team);
+        image.run = AiRun.FromJson(image.team.run);
+        if (image.run != null && image.run.Finished()) { image.run = null; }
+        return image;
+    }
+
+    bool HasContent() {
+        return this.messages.Count > 0 || this.plan.Count > 0 || this.team.on != 0
+            || this.team.tasks.Count > 0 || this.run != null;
+    }
+}
+
+class IdeAiSessionEntry {
+    string pack = "";
+    string title = "";
+    string derived = "";
+    int archived;
+    IdeAiSessionImage image;
+
+    IdeAiSessionEntry Copy() {
+        IdeAiSessionEntry copy = new IdeAiSessionEntry();
+        copy.pack = this.pack; copy.title = this.title; copy.derived = this.derived;
+        copy.archived = this.archived; copy.image = this.image;
+        return copy;
+    }
+}
+
+/// 核心契约与语义定义。
+class IdeAiSessionContext {
+    string path;
+    string checkpoint;
+    string shared;
+    string sharedArchive;
+    string legacy;
+    string root;
+    bool project;
+    bool ready;
+    string failure = "";
+    List<IdeAiSessionEntry> baseline = new List<IdeAiSessionEntry>();
+    int current;
+}
+
+class IdeAiSessionResult {
+    List<IdeAiSessionEntry> entries = new List<IdeAiSessionEntry>();
+    int current;
+    AiRun run;
+    string error = "";
+    bool cancelled;
+}
+
+delegate void IdeAiSessionCompleted(IdeAiSessionResult result);
+
+class IdeAiSessionRequest {
+    // 核心契约与语义定义。
+    int kind;
+    IdeAiSessionContext context;
+    List<IdeAiSessionEntry> entries = new List<IdeAiSessionEntry>();
+    int current;
+    int index;
+    bool mergeBaseline;
+    bool hasDrafts;
+    bool restoreCheckpoint;
+    string packedRun = "";
+    AiRun run;
+    CancellationToken cancellation;
+    App host;
+    IdeAiSessionCompleted completed;
+}
+
+/// 核心契约与语义定义。
+class IdeAiSessionWork {
+    nint queueLock = Mutex.Create();
+    List<IdeAiSessionRequest> pending = new List<IdeAiSessionRequest>();
+    bool running;
+    bool closing;
+    string failure = "";
+    AtomicInt cancelled = new AtomicInt(0);
+    TaskCompletionSource<int> stopped = new TaskCompletionSource<int>();
+
+    bool Enqueue(IdeAiSessionRequest request) {
+        bool start = false;
+        Mutex.Lock(this.queueLock);
+        if (this.closing) { Mutex.Unlock(this.queueLock); return false; }
+        this.pending.Add(request);
+        if (!this.running) { this.running = true; start = true; }
+        Mutex.Unlock(this.queueLock);
+        if (start) {
+            IdeAiSessionWork worker = this;
+            Task.Run(delegate () { worker.Pump(); });
+        }
+        return true;
+    }
+
+    TaskCompletionSource<int> Seal() {
+        Mutex.Lock(this.queueLock);
+        this.closing = true;
+        bool idle = !this.running;
+        Mutex.Unlock(this.queueLock);
+        if (idle) { this.CompleteDrain(); }
+        return this.stopped;
+    }
+
+    string Error() {
+        Mutex.Lock(this.queueLock);
+        string error = this.failure;
+        Mutex.Unlock(this.queueLock);
+        return error;
+    }
+
+    int CancelledLoads() { return (int)this.cancelled.Load(); }
+
+    void CompleteDrain() {
+        string error = this.Error();
+        if (error == "") { this.stopped.TrySetResult(1); }
+        else { this.stopped.TrySetException(new Exception(error)); }
+    }
+
+    void Pump() {
+        while (true) {
+            IdeAiSessionRequest request = null;
+            Mutex.Lock(this.queueLock);
+            if (this.pending.Count > 0) {
+                request = this.pending[0];
+                this.pending.RemoveAt(0);
+            } else {
+                this.running = false;
+            }
+            bool ending = this.closing;
+            Mutex.Unlock(this.queueLock);
+            if (request == null) {
+                if (ending) { this.CompleteDrain(); }
+                return;
+            }
+            this.Process(request);
+        }
+    }
+
+    void Process(IdeAiSessionRequest request) {
+        IdeAiSessionResult result = new IdeAiSessionResult();
+        try {
+            if (request.kind == 2) {
+                IdeAiSessionWork.ReadBaseline(request.context);
+                result.entries = IdeAiSessionWork.CopyEntries(request.context.baseline);
+                result.current = request.context.current;
+                result.run = IdeAiSessionWork.ReadRun(request.context.checkpoint);
+            } else if (request.kind == 3) {
+                IdeAiSessionWork.WriteRun(request.context.checkpoint, request.run);
+            } else if (request.kind == 4) {
+                if (request.restoreCheckpoint) {
+                    result.run = AiRun.FromJson(request.packedRun);
+                    if (result.run != null && result.run.Finished()) { result.run = null; }
+                    IdeAiSessionWork.WriteRun(request.context.checkpoint, result.run);
+                } else {
+                    result.run = IdeAiSessionWork.ReadRun(request.context.checkpoint);
+                }
+            } else {
+                if (request.mergeBaseline) { IdeAiSessionWork.ReadBaseline(request.context); }
+                if (request.context.failure != "") { throw new Exception(request.context.failure); }
+                result.entries = IdeAiSessionWork.Merge(request);
+                result.current = request.current;
+                if (request.mergeBaseline) {
+                    if (request.hasDrafts) { result.current = request.context.baseline.Count + request.current; }
+                    else { result.current = request.context.current; }
+                }
+                IdeAiSessionWork.WriteSessions(request.context.path, result.entries, result.current,
+                    request.kind == 1 && !request.mergeBaseline ? request.index : -1);
+            }
+        } catch (Exception error) {
+            // 核心契约与语义定义。
+            result.error = error.Message;
+            if (request.kind == 2) { request.context.failure = error.Message; }
+            Mutex.Lock(this.queueLock);
+            if (this.failure == "") { this.failure = error.Message; }
+            Mutex.Unlock(this.queueLock);
+            Console.WriteLine("ai-session-work: " + request.context.path + ": " + error.Message);
+            try {
+                string log = Path.GetDirectoryName(request.context.shared) + "/ai_sessions.errors.log";
+                Directory.CreateDirectoryRecursive(Path.GetDirectoryName(log));
+                File.AppendAllText(log, request.context.path + ": " + error.Message + "\n");
+            } catch (Exception logError) {
+                // 核心契约与语义定义。
+            }
+        }
+        if (request.cancellation != null && request.cancellation.IsCancellationRequested) {
+            result.cancelled = true;
+            this.cancelled.Increment();
+        }
+        if (request.completed != null && request.host != null) {
+            App host = request.host;
+            IdeAiSessionCompleted apply = request.completed;
+            host.Post(delegate () { apply(result); });
+        }
+    }
+
+    static List<IdeAiSessionEntry> CopyEntries(List<IdeAiSessionEntry> source) {
+        List<IdeAiSessionEntry> copies = new List<IdeAiSessionEntry>();
+        for (int i = 0; i < source.Count; i = i + 1) { copies.Add(source[i].Copy()); }
+        return copies;
+    }
+
+    static List<IdeAiSessionEntry> Merge(IdeAiSessionRequest request) {
+        List<IdeAiSessionEntry> entries = new List<IdeAiSessionEntry>();
+        if (request.mergeBaseline) { entries = IdeAiSessionWork.CopyEntries(request.context.baseline); }
+        if (!request.mergeBaseline || request.hasDrafts) {
+            for (int i = 0; i < request.entries.Count; i = i + 1) { entries.Add(request.entries[i].Copy()); }
+        }
+        for (int i = 0; i < entries.Count; i = i + 1) {
+            IdeAiSessionEntry entry = entries[i];
+            if (entry.image != null) {
+                entry.pack = entry.image.Pack();
+                entry.derived = ChatArea.FirstUserOf(entry.image.messages);
+            }
+        }
+        return entries;
+    }
+
+    static SqliteConnection OpenDb(string path) {
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(path));
+        SqliteConnection db = SqliteConnection.Open(path);
+        if (db == null || !db.IsConnected()) {
+            if (db != null) { db.Close(); }
+            throw new Exception("Could not open chat database: " + path);
+        }
+        try {
+            db.Execute("PRAGMA journal_mode=WAL");
+            db.Execute("PRAGMA synchronous=NORMAL");
+            db.Execute("PRAGMA busy_timeout=5000");
+            db.Execute("CREATE TABLE IF NOT EXISTS sessions (id INTEGER PRIMARY KEY, pack TEXT NOT NULL)");
+            db.Execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+        } catch (Exception error) {
+            db.Close();
+            throw error;
+        }
+        return db;
+    }
+
+    static void WriteSessions(string path, List<IdeAiSessionEntry> entries, int current, int only) {
+        SqliteConnection db = IdeAiSessionWork.OpenDb(path);
+        try {
+            db.BeginTransaction();
+            try {
+                if (only < 0) { db.Execute("DELETE FROM sessions"); }
+                for (int i = 0; i < entries.Count; i = i + 1) {
+                    if (only >= 0 && only != i) { continue; }
+                    db.Execute("INSERT OR REPLACE INTO sessions (id, pack) VALUES (?, ?)",
+                        new DbParams().AddInt(i).Add(entries[i].pack));
+                }
+                db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('cur', ?)",
+                    new DbParams().Add(Convert.ToString(current)));
+                if (only < 0) {
+                    StringBuilder flags = new StringBuilder();
+                    AiTitlesDoc titles = new AiTitlesDoc();
+                    titles.t = new List<string>();
+                    for (int i = 0; i < entries.Count; i = i + 1) {
+                        if (i > 0) { flags.Append(","); }
+                        flags.Append(Convert.ToString(entries[i].archived));
+                        titles.t.Add(entries[i].title);
+                    }
+                    db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('arch', ?)",
+                        new DbParams().Add(flags.ToString()));
+                    db.Execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('titles', ?)",
+                        new DbParams().Add(Json.Serialize<AiTitlesDoc>(titles)));
+                }
+                db.Commit();
+            } catch (Exception error) {
+                try { db.Rollback(); } catch (Exception rollbackError) {
+                    // 核心契约与语义定义。
+                }
+                throw error;
+            }
+        } finally { db.Close(); }
+    }
+
+    static void ReadBaseline(IdeAiSessionContext context) {
+        if (context.ready) { return; }
+        try {
+            // 核心契约与语义定义。
+            if (context.project && !File.Exists(context.path) && File.Exists(context.shared)) {
+                SqliteConnection shared = IdeAiSessionWork.OpenDb(context.shared);
+                try {
+                    Directory.CreateDirectoryRecursive(Path.GetDirectoryName(context.path));
+                    shared.Execute("VACUUM INTO ?", new DbParams().Add(context.path));
+                } finally { shared.Close(); }
+                if (File.Exists(context.sharedArchive)) { File.Delete(context.sharedArchive); }
+                File.Move(context.shared, context.sharedArchive);
+            }
+            if (!File.Exists(context.path) && File.Exists(context.legacy)) {
+                JsonValue legacy = JsonValue.ParseLenient(File.ReadAllText(context.legacy));
+                if (legacy == null) { throw new Exception("Invalid legacy chat archive: " + context.legacy); }
+                JsonValue sessions = legacy.Get("s");
+                if (sessions != null && sessions.IsArray()) {
+                    for (int i = 0; i < sessions.Count(); i = i + 1) {
+                        JsonValue item = sessions.At(i);
+                        if (item != null) {
+                            IdeAiSessionEntry entry = new IdeAiSessionEntry();
+                            entry.pack = item.AsString("");
+                            context.baseline.Add(entry);
+                        }
+                    }
+                }
+                context.current = legacy.Int("cur", 0);
+                if (context.baseline.Count == 0) { context.baseline.Add(new IdeAiSessionEntry()); }
+                if (context.current < 0 || context.current >= context.baseline.Count) { context.current = 0; }
+                IdeAiSessionWork.WriteSessions(context.path, context.baseline, context.current, -1);
+            }
+            if (File.Exists(context.path)) {
+                SqliteConnection db = IdeAiSessionWork.OpenDb(context.path);
+                try {
+                    List<IdeAiSessionEntry> entries = new List<IdeAiSessionEntry>();
+                    DbResult rows = db.Query("SELECT id, pack FROM sessions ORDER BY id");
+                    for (int i = 0; i < rows.RowCount(); i = i + 1) {
+                        IdeAiSessionEntry entry = new IdeAiSessionEntry();
+                        entry.pack = rows.GetString(i, 1);
+                        entry.image = IdeAiSessionImage.Read(entry.pack);
+                        entry.derived = ChatArea.FirstUserOf(entry.image.messages);
+                        entries.Add(entry);
+                    }
+                    context.current = ZanIDE.ParseIntSafe(db.ExecuteScalar("SELECT value FROM meta WHERE key = 'cur'"));
+                    List<int> flags = ZanIDE.ParseFlagCsv(db.ExecuteScalar("SELECT value FROM meta WHERE key = 'arch'"));
+                    for (int i = 0; i < flags.Count && i < entries.Count; i = i + 1) { entries[i].archived = flags[i]; }
+                    string json = db.ExecuteScalar("SELECT value FROM meta WHERE key = 'titles'");
+                    if (json != "") {
+                        AiTitlesDoc titles = Json.Deserialize<AiTitlesDoc>(json);
+                        if (titles != null && titles.t != null) {
+                            for (int i = 0; i < titles.t.Count && i < entries.Count; i = i + 1) { entries[i].title = titles.t[i]; }
+                        }
+                    }
+                    context.baseline = entries;
+                } finally { db.Close(); }
+            }
+            if (context.current < 0 || context.current >= context.baseline.Count) { context.current = 0; }
+            context.ready = true;
+        } catch (Exception error) {
+            context.failure = error.Message;
+            throw error;
+        }
+    }
+
+    static AiRun ReadRun(string path) {
+        if (!File.Exists(path)) { return null; }
+        AiRun run = AiRun.FromJson(File.ReadAllText(path));
+        if (run != null && run.Finished()) { return null; }
+        return run;
+    }
+
+    static void WriteRun(string path, AiRun run) {
+        if (run == null) {
+            if (File.Exists(path)) { File.Delete(path); }
+            return;
+        }
+        Directory.CreateDirectoryRecursive(Path.GetDirectoryName(path));
+        File.WriteAllText(path, run.ToJson());
+    }
+
+    ~IdeAiSessionWork() { Mutex.Destroy(this.queueLock); }
+}

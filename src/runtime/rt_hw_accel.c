@@ -25,7 +25,7 @@
   #endif
 #endif
 
-/* ===== 1. CPU Feature Detection ===== */
+/* 核心系统底层抽象与内存语义契约 */
 static int g_cpuid_inited = 0;
 static int g_has_popcnt   = 0;
 static int g_has_lzcnt    = 0;
@@ -37,7 +37,7 @@ static int g_has_neon     = 0;
 static int g_has_shani    = 0;
 static int g_has_pclmul   = 0;
 
-/* ARMv8 crypto extension availability (aarch64 only) */
+/* 底层系统交互与数据协议契约 */
 static int g_a_hw_aes    = 0;
 static int g_a_hw_sha1   = 0;
 static int g_a_hw_sha2   = 0;
@@ -49,7 +49,7 @@ static int g_a_hw_crc32  = 0;
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 #if !defined(_WIN32) && !defined(__APPLE__)
-/* Linux HWCAP bits (uapi/asm/hwcap.h). */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_HWCAP_FP      (1u << 0)
 #define ZAN_HWCAP_ASIMD   (1u << 1)
 #define ZAN_HWCAP_AES     (1u << 3)
@@ -100,7 +100,7 @@ static void zan_arm_probe(void) {
 }
 #endif /* aarch64 */
 
-/* ZAN_NO_HWACCEL=1 forces every dispatch onto the portable C path */
+/* 底层系统交互与数据协议契约 */
 static int zan_hw_soft_forced(void) {
     const char *e = getenv("ZAN_NO_HWACCEL");
     return e != NULL && e[0] != '\0' && e[0] != '0';
@@ -117,7 +117,7 @@ static void zan_hw_init_cpu_features(void) {
     g_has_aesni   = (ecx & (1u << 25)) != 0;
     g_has_pclmul  = (ecx & (1u << 1)) != 0;
 
-    // EAX=7, ECX=0: Extended Features
+    // 核心契约与语义定义。
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
     g_has_avx2  = (ebx & (1u << 5)) != 0;
     g_has_shani = (ebx & (1u << 29)) != 0;
@@ -231,7 +231,7 @@ int zan_cpu_feature(int id) {
     }
 }
 
-/* ===== 2. SHA-256 Hardware Kernel & Streaming Driver ===== */
+/* 核心系统底层抽象与内存语义契约 */
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 
@@ -543,7 +543,7 @@ static const uint32_t K256_C[64] = {
     0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
 };
 
-/* ARMv8 Cryptographic Extension SHA-2 (FEAT_SHA2: sha256h/h2/su0/su1) */
+/* 底层系统交互与数据协议契约 */
 #if (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
 #include <arm_neon.h>
 
@@ -647,7 +647,7 @@ static int zan_sha256_kat_arm(void) {
     return 1;
 }
 
-/* FEAT_SHA1 (sha1c/sha1p/sha1m rounds, sha1h rotate, su0/su1 schedule) */
+/* 底层系统交互与数据协议契约 */
 __attribute__((target("sha2")))
 static void zan_sha1_transform_arm(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
     uint32x4_t abcd = vld1q_u32(&state[0]);
@@ -736,7 +736,7 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
 #endif
     }
 
-    // Stack tail padding: fixed 128 bytes
+    // 核心契约与语义定义。
     uint8_t tail[128];
     size_t rem = (size_t)len % 64;
     if (rem > 0 && data) {
@@ -769,7 +769,7 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
 /* 2 */
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 
-/* Canonical Intel SHA Extensions pipeline (public domain, noloader/SHA-Intrinsics) */
+/* 底层系统交互与数据协议契约 */
 __attribute__((target("sha,sse4.1")))
 static void zan_sha1_transform_ni(uint32_t state[5], const uint8_t *data, size_t num_blocks) {
     __m128i ABCD, ABCD_SAVE, E0, E0_SAVE, E1;
@@ -1048,7 +1048,7 @@ static void zan_aes_init_sbox(void) {
     inited = 1;
 }
 
-/* FIPS-197 key expansion into nr+1 16-byte round keys (big-endian words) */
+/* 底层系统交互与数据协议契约 */
 static void zan_aes_expand_key(const uint8_t *key, int keybits,
                                uint8_t rk[15][16], int *nr_out) {
     zan_aes_init_sbox();
@@ -1230,7 +1230,7 @@ static int64_t zan_aes_ctr_ni(const uint8_t *in, int64_t len,
             memcpy(out + off, tmp, (size_t)avail);
         }
 
-        /* 128-bit big-endian counter increment */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int j = 15; j >= 0; j--) {
             if (++ctr[j] != 0) break;
         }
@@ -1240,7 +1240,7 @@ static int64_t zan_aes_ctr_ni(const uint8_t *in, int64_t len,
     return len;
 }
 
-/* GHASH over PCLMULQDQ */
+/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_XSHIFT_R(x, n) _mm_xor_si128(_mm_srli_epi64(x, n), _mm_srli_si128(_mm_slli_epi64(x, 64-(n)), 8))
 #define ZAN_XSHIFT_L(x, n) _mm_xor_si128(_mm_slli_epi64(x, n), _mm_slli_si128(_mm_srli_epi64(x, 64-(n)), 8))
 #define ZAN_BSWAP128 _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)
@@ -1360,7 +1360,7 @@ static inline int64_t zan_ghash_block_clmul(const uint8_t *h16, const uint8_t *x
     return zan_ghash_update_clmul(h16, x16, 16, y16);
 }
 
-/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, SSE4 */
+/* 核心系统底层抽象与内存语义契约 */
 __attribute__((target("sse4.2,crc32")))
 static uint32_t zan_crc32c_sse42(uint32_t crc, const uint8_t *p, int64_t n) {
     uint64_t c = crc;
@@ -1510,7 +1510,7 @@ static int64_t zan_aes_ctr_arm(const uint8_t *in, int64_t len,
             memcpy(out + off, tmp, (size_t)avail);
         }
 
-        /* 128-bit big-endian counter increment */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int j = 15; j >= 0; j--) {
             if (++ctr[j] != 0) break;
         }
@@ -1574,7 +1574,7 @@ static inline int64_t zan_ghash_block_pmull(const uint8_t *h16, const uint8_t *x
     return zan_ghash_update_pmull(h16, x16, 16, y16);
 }
 
-/* CRC-32C (Castagnoli), reflected poly 0x82F63B78, FEAT_CRC32 */
+/* 底层系统交互与数据协议契约 */
 __attribute__((target("crc")))
 static uint32_t zan_crc32c_pmull_arm(uint32_t crc, const uint8_t *p, int64_t n) {
     uint64_t c = crc;
@@ -1588,9 +1588,9 @@ static uint32_t zan_crc32c_pmull_arm(uint32_t crc, const uint8_t *p, int64_t n) 
 
 #endif /* aarch64 aes/ghash/crc32c */
 
-/* ---- KAT gates: published vectors only ---- */
+/* 核心系统底层抽象与内存语义契约 */
 static int zan_aes_kat(void) {
-    /* FIPS-197 appendix C: single ECB blocks for all three key sizes */
+    /* 底层系统交互与数据协议契约 */
     static const uint8_t pt[16] = {
         0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff
     };
@@ -1731,7 +1731,7 @@ static int zan_ghash_kat(void) {
 static int zan_crc32c_kat(void) {
     /* RFC 4960 B.8: CRC-32C("123456789") = 0xE3069283 */
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
-    /* the kernel is a continuation (no final complement): raw state = ~E3069283 */
+    /* 底层系统交互与数据协议契约 */
     return zan_crc32c_sse42(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
 #elif (defined(__aarch64__) || defined(_M_ARM64)) && (defined(__GNUC__) || defined(__clang__))
     return zan_crc32c_pmull_arm(0xFFFFFFFFu, (const uint8_t*)"123456789", 9) == 0x1CF96D7Cu;
@@ -2179,7 +2179,7 @@ int64_t zan_hw_aes_gcm_init(uint8_t *ctxBuf, int64_t ctxLen, const uint8_t *key,
         ctx->h_bswap[i] = ctx->h16[15 - i];
     }
 
-    /* Precompute H^1 ... H^8 powers for parallel GHASH */
+    /* 核心系统底层抽象与内存语义契约 */
     memcpy(ctx->h_powers[0], ctx->h16, 16);
     for (int p = 1; p < 8; p++) {
         uint8_t zero16_t[16] = {0};
@@ -2377,7 +2377,7 @@ int64_t zan_hw_crc32c_update(uint32_t crc, const uint8_t *p, int64_t len) {
     return -1;
 }
 
-/* Software Reference Fallbacks for Single-Cycle Intrinsics */
+/* 底层系统交互与数据协议契约 */
 static uint8_t zan_aes_inv_sbox[256];
 static int zan_aes_tables_inited = 0;
 
@@ -2506,7 +2506,7 @@ static void zan_aes_decrypt_round_soft(const void *val, const void *key, void *o
     }
 }
 
-/* InvMixColumns alone (_mm_aesimc_si128) */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_aes_imc_soft(const void *val, void *out) {
     const uint8_t *s = (const uint8_t *)val;
     uint8_t *res = (uint8_t *)out;
@@ -2520,7 +2520,7 @@ static void zan_aes_imc_soft(const void *val, void *out) {
     }
 }
 
-/* Key generation assist (_mm_aeskeygenassist_si128) */
+/* 核心系统底层抽象与内存语义契约 */
 static void zan_aes_keygenassist_soft(const void *val, uint8_t rcon, void *out) {
     zan_aes_init_tables();
     const uint8_t *s = (const uint8_t *)val;
@@ -2532,7 +2532,7 @@ static void zan_aes_keygenassist_soft(const void *val, uint8_t rcon, void *out) 
     res[2] = zan_aes_sbox[s[6]];
     res[3] = zan_aes_sbox[s[7]];
 
-    /* Word 1 (bytes 4..7): RotWord(SubWord(SRC[63:32])) ^ RCON */
+    /* 底层系统交互与数据协议契约 */
     res[4] = zan_aes_sbox[s[5]] ^ rcon;
     res[5] = zan_aes_sbox[s[6]];
     res[6] = zan_aes_sbox[s[7]];
@@ -2544,14 +2544,14 @@ static void zan_aes_keygenassist_soft(const void *val, uint8_t rcon, void *out) 
     res[10] = zan_aes_sbox[s[14]];
     res[11] = zan_aes_sbox[s[15]];
 
-    /* Word 3 (bytes 12..15): RotWord(SubWord(SRC[127:96])) ^ RCON */
+    /* 底层系统交互与数据协议契约 */
     res[12] = zan_aes_sbox[s[13]] ^ rcon;
     res[13] = zan_aes_sbox[s[14]];
     res[14] = zan_aes_sbox[s[15]];
     res[15] = zan_aes_sbox[s[12]];
 }
 
-/* ===== 4. Single-Cycle Intrinsics Implementation ===== */
+/* 核心系统底层抽象与内存语义契约 */
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 
 __attribute__((target("aes,sse4.1")))
@@ -2822,7 +2822,7 @@ void zan_hw_vec128_store(void *addr, const void *val) {
 
 #endif
 
-/* ===== 5. SIMD-Accelerated PixelOps ===== */
+/* 核心系统底层抽象与内存语义契约 */
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)) && (defined(__GNUC__) || defined(__clang__))
 
 __attribute__((target("sse2")))
@@ -3029,7 +3029,7 @@ static void zan_sm3_transform_arm(uint32_t state[8], const uint8_t *data, size_t
             uint32x4_t wprime = veorq_u32(cur, W[(g + 1) % 4]);
             uint32x4_t kc = vld1q_u32(&zan_sm3_kc_arm[4 * g]);
 
-            /* Extend the schedule by four words into the rolling slot */
+            /* 底层系统交互与数据协议契约 */
             uint32x4_t n1 = vextq_u32(W[(g + 1) % 4], W[(g + 2) % 4], 3);
             uint32x4_t n2 = vextq_u32(W[(g + 2) % 4], W[(g + 3) % 4], 2);
             uint32x4_t m2 = vextq_u32(W[g % 4], W[(g + 1) % 4], 3);
@@ -3119,7 +3119,7 @@ int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
 #endif
     }
 
-    // Stack tail padding: fixed 128 bytes
+    // 核心契约与语义定义。
     uint8_t tail[128];
     size_t rem = (size_t)len % 64;
     if (rem > 0 && data) {
@@ -3750,7 +3750,7 @@ int64_t zan_hw_base64_encode(const uint8_t *src, int64_t len, char *dst) {
     char *d = dst;
     int64_t rem = len;
 
-    /* 4-way unrolled pipeline: 12 input bytes -> 16 output characters */
+    /* 底层系统交互与数据协议契约 */
     while (rem >= 12) {
         uint32_t w0 = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2];
         uint32_t w1 = ((uint32_t)s[3] << 16) | ((uint32_t)s[4] << 8) | s[5];
@@ -3782,7 +3782,7 @@ int64_t zan_hw_base64_encode(const uint8_t *src, int64_t len, char *dst) {
         rem -= 12;
     }
 
-    /* Scalar 3-byte loop */
+    /* 核心系统底层抽象与内存语义契约 */
     while (rem >= 3) {
         uint32_t w = ((uint32_t)s[0] << 16) | ((uint32_t)s[1] << 8) | s[2];
         d[0] = ZAN_B64_ENC_TABLE[(w >> 18) & 0x3F];
@@ -3831,7 +3831,7 @@ int64_t zan_hw_base64_decode(const char *src, int64_t len, uint8_t *dst) {
     uint8_t *d = dst;
     int64_t rem = len - (pad ? 4 : 0);
 
-    /* 4-way unrolled pipeline: 16 characters -> 12 bytes */
+    /* 核心系统底层抽象与内存语义契约 */
     while (rem >= 16) {
         uint8_t a0 = ZAN_B64_DEC_TABLE[s[0]],  b0 = ZAN_B64_DEC_TABLE[s[1]],  c0 = ZAN_B64_DEC_TABLE[s[2]],  d0 = ZAN_B64_DEC_TABLE[s[3]];
         uint8_t a1 = ZAN_B64_DEC_TABLE[s[4]],  b1 = ZAN_B64_DEC_TABLE[s[5]],  c1 = ZAN_B64_DEC_TABLE[s[6]],  d1 = ZAN_B64_DEC_TABLE[s[7]];
@@ -3905,7 +3905,7 @@ static inline int zan_ctz32_local(uint32_t x) {
 #endif
 }
 
-/* ===== 9. SIMD JSON Structural Scanners ===== */
+/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_hw_json_skip_whitespace(const uint8_t *buf, int64_t pos, int64_t len) {
     if (!buf || pos >= len) return pos;
     const uint8_t *p = buf;
@@ -3978,7 +3978,7 @@ int64_t zan_hw_json_scan_string(const uint8_t *buf, int64_t pos, int64_t len) {
     return len;
 }
 
-/* RFC 7748 Curve25519 (X25519) Constant-Time Key Exchange */
+/* 底层系统交互与数据协议契约 */
 #if defined(__SIZEOF_INT128__) || (defined(__clang__) || defined(__GNUC__))
 typedef unsigned __int128 zan_fe_u128;
 #else
@@ -4259,7 +4259,7 @@ int64_t zan_hw_x25519(const uint8_t *scalar, const uint8_t *point, uint8_t *out)
     return 0;
 }
 
-/* Montgomery Modular Exponentiation (RSA / DH up to 4096-bit odd modulus) */
+/* 底层系统交互与数据协议契约 */
 typedef unsigned __int128 zan_u128_t;
 
 static void zan_load_be64_limbs(const uint8_t *src, int64_t slen, uint64_t *dst, int k) {
@@ -4340,7 +4340,7 @@ typedef struct {
 
 static int zan_mont_ctx_init(zan_mont_ctx_t *ctx, const uint8_t *mod, int64_t mLen) {
     if (!ctx || !mod || mLen <= 0 || mLen > 512) return -1;
-    if ((mod[mLen - 1] & 1) == 0) return -1; /* Modulus must be odd */
+    if ((mod[mLen - 1] & 1) == 0) return -1; /* 核心系统底层抽象与内存语义契约 */
     int k = (int)((mLen + 7) / 8);
     if (k <= 0 || k > 64) return -1;
     ctx->k = k;
@@ -4556,7 +4556,7 @@ int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
     uint64_t s2[66] = {0};
     zan_mont_exp_ctx(&ctx_q, m_q, dq_limbs, dq_k, s2);
 
-    // Garner recombination:
+    // 核心契约与执行状态转移规范。
     // s2_p = s2 mod p
     uint64_t s2_p[66];
     for (int i = 0; i < k; i++) s2_p[i] = s2[i];

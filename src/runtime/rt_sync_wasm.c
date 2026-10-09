@@ -16,8 +16,7 @@ int32_t zan_thread_start(void *body) {
     void *arg;
     if (v & 1) {
         void *rec = (void *)(v & ~(uintptr_t)1);
-        /* wasm32 record layout: { fn, dtor, target } -- pointer slots are
-         * 4 bytes wide (see gui_runtime_wasm.c wdisp). */
+        /* 底层系统交互与数据协议契约 */
         fn = *(void (**)(void *))((char *)rec + 0 * sizeof(void *));
         arg = rec;
     } else {
@@ -33,7 +32,7 @@ int64_t zan_thread_current_id(void) {
     return 1;
 }
 
-/* ---- atomics (plain cells; one thread) ---------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct {
     i64 value;
@@ -83,12 +82,12 @@ i64 zan_atomic_int_add(i64 handle, i64 delta) {
     return old;
 }
 
-/* ---- monitor (lock statement) ------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 void zan_monitor_enter(void *obj) { (void)obj; }
 void zan_monitor_exit(void *obj)  { (void)obj; }
 
-/* ---- monotonic clocks ---------------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 
 i64 zan_monotonic_us(void) {
     struct timespec ts;
@@ -118,16 +117,14 @@ i64 zan_monotonic_frequency(void) {
     return 1000000000;
 }
 
-/* ---- shared table (cross-process; impossible here -> graceful stubs) ----- */
+/* 底层系统交互与数据协议契约 */
 
 #define ZAN_TABLE_MAX_STRING 1048576
 
 static char g_wasm_shared_string[ZAN_TABLE_MAX_STRING + 1];
 
 i64 zan_shared_table_hash(const char *value) {
-    /* FNV-1a, same as zan_hash_bytes in rt_sync.c -- callers may persist
-     * hashes, keep the algorithm identical. Remap 0 to 1 like the native
-     * side: a persisted 0 doubles as "no hash" downstream. */
+    /* 底层系统交互与数据协议契约 */
     if (!value) return 0;
     uint64_t h = 1469598103934665603ull;
     for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
@@ -245,7 +242,7 @@ int32_t zan_shared_table_rate_allow(i64 handle, const char *key, i64 now_ms,
 int32_t zan_shared_table_lock_acquire(i64 handle, const char *key, i64 owner,
                                       i64 now_ms, i64 lease_ms) {
     (void)handle; (void)key; (void)owner; (void)now_ms; (void)lease_ms;
-    return 1;   /* single thread: the lease is always ours */
+    return 1;   /* 底层系统交互与数据协议契约 */
 }
 
 int32_t zan_shared_table_lock_release(i64 handle, const char *key, i64 owner) {
@@ -362,8 +359,7 @@ int zan_io_socket_alive(long long sock) {
     return 0;
 }
 
-/* Close-notification hook: wasm32 has no reactor and no waiters to
- * fail; Socket.Close still calls it, so provide the symbol. */
+/* 底层系统交互与数据协议契约 */
 void zan_io_close_notify(long long sock) {
     (void)sock;
 }
@@ -435,13 +431,12 @@ int zan_io_sockaddr_ip_str_into(int sa, long long buf, int cap) {
     return -1;
 }
 
-/* ---- setjmp/longjmp (async trampoline) ----------------------------------- wasi-libc ships neither symbol */
+/* 底层系统交互与数据协议契约 */
 int _setjmp(void *env) {
     (void)env;
     return 0;
 }
-/* longjmp itself already comes from rt_wasm.c's abort-shaped shim; no
- * second definition here (wasm-ld rejects the duplicate). */
+/* 底层系统交互与数据协议契约 */
 
 /* 内部辅助实现 */
 void *TLS_server_method(void) { return 0; }
@@ -481,7 +476,7 @@ int SSL_write(void *ssl, const void *buf, int num) {
     (void)ssl; (void)buf; (void)num; return -1;
 }
 int SSL_get_error(const void *ssl, int ret) {
-    (void)ssl; (void)ret; return 1;   /* SSL_ERROR_SSL: tls layer is dead */
+    (void)ssl; (void)ret; return 1;   /* 底层系统交互与数据协议契约 */
 }
 int SSL_set_verify(void *ssl, int mode, const void *cb) {
     (void)ssl; (void)mode; (void)cb; return 0;
@@ -542,7 +537,7 @@ void CRYPTO_free(long long p, int file, int line) {
     free((void *)(uintptr_t)p);
 }
 
-/* ---- coroutine IO reactor stubs (irgen */
+/* 核心系统底层抽象与内存语义契约 */
 typedef void (*zan_co_step)(void *frame);
 
 static void zan_wasm_co_fail(void *frame, zan_co_step step) {
@@ -586,14 +581,13 @@ void zan_rt_blocking_co(void *fn, int32_t argc, long long a0, long long a1,
                         long long a2, long long a3, void *frame, zan_co_step step,
                         long long *out) {
     (void)fn; (void)argc; (void)a0; (void)a1; (void)a2; (void)a3;
-    /* No worker threads to park this on; the stub has nothing to run. */
+    /* 底层系统交互与数据协议契约 */
     if (out) *out = 0;
     zan_wasm_co_fail(frame, step);
 }
 
-/* ---- libc surface wasi-libc lacks ---------------------------------------- */
-/* Process.Start's POSIX path (Process.zan) declares system(); a browser tab
- * has neither a shell nor child processes, so the command never runs. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 底层系统交互与数据协议契约 */
 int system(const char *cmd) {
     (void)cmd;
     return -1;
@@ -605,7 +599,7 @@ char *getenv(const char *name) {
     return 0;
 }
 
-/* ---- safe process execution stubs (cross-platform consistency) --------- */
+/* 底层系统交互与数据协议契约 */
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     (void)exe; (void)args; (void)argc;
     return -1;
@@ -629,7 +623,7 @@ void zan_proc_free_buf(char *buf) {
     if (buf) free(buf);
 }
 
-/* ---- memory mapped file stubs (WASM browser/sandbox has no mmap/shm) --- */
+/* 底层系统交互与数据协议契约 */
 long long zan_mmap_create(const char *name, long long size) {
     (void)name; (void)size;
     return 0;

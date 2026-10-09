@@ -1,32 +1,11 @@
-/* ------------------------------------------------------------------------- *
- * Opt-in object sharding (stage 4): ZAN_SHARD=1 splits eligible function
- * bodies into separate object files so the coordinator module the optimizer
- * and LLVMTargetMachineEmitToFile see shrinks by the moved share. Included
- * textually at the end of irgen.c (like irgen_emit.c / irgen_manifest.c).
- *
- * Cloning strategy — text round-trip, not handle surgery. Cloning
- * instructions into a fresh LLVMContext is not expressible with the LLVM C
- * API this toolchain ships (no LLVMGetGEPSourceElementType for BuildGEP2,
- * no LLVMCloneModule, no comdat reader, no instruction removal), but the
- * assembly printer already knows everything: each shard is assembled as .ll
- * text — member bodies printed verbatim, synthesized `declare` lines for
- * referenced functions, verbatim definitions for private constants that
- * travel, synthesized `external` declarations for globals that stay — and
- * parsed into a fresh context with LLVMParseIRInContext. Named struct types
- * are harvested by scanning the assembled text for %identifiers and
- * resolving them against the coordinator's type table (the GEP source type,
- * unreadable through the C API, only ever appears in printed text).
- *
- * Safety net: any parse/verify/emit failure, and every referenced symbol the
- * rules below cannot prove safe, falls back cleanly — linkages and
- * demotions are restored, temporary objects are deleted, and the compile
- * continues with the untouched single module. The coordinator's own bodies
- * are only deleted after every shard object has been emitted AND the
- * post-move module verifies.
- * ------------------------------------------------------------------------- */
+/* 内部辅助实现 */
 
 #include <llvm-c/IRReader.h>
+#include <limits.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -44,24 +23,22 @@ static void sh_probe_mem(const char *tag) {
 }
 
 enum {
-    SH_F_DECL = 0,  /* referenced fn: safe to declare external */
-    SH_F_DEMOTE,    /* internal __zan_* helper: demote to external + declare */
-    SH_F_EXT,       /* internal user fn: stays, exports on reference + declare */
-    SH_F_BLOCK      /* unusable reference (alias etc.): dirty */
+    SH_F_DECL = 0,  /* 核心系统底层抽象与内存语义契约 */
+    SH_F_DEMOTE,    /* 底层系统交互与数据协议契约 */
+    SH_F_EXT,       /* 底层系统交互与数据协议契约 */
+    SH_F_BLOCK      /* 核心系统底层抽象与内存语义契约 */
 };
 
 enum {
-    SH_G_DECL = 0,  /* referenced global: synthesized external declaration */
-    SH_G_TRAVEL,    /* private/internal constant: definition duplicated into
-                     * every shard whose body references it */
-    SH_G_BLOCK      /* travel impossible (initializer escapes an internal
-                     * fn / alias / TLS state): referers stay in coordinator */
+    SH_G_DECL = 0,  /* 核心系统底层抽象与内存语义契约 */
+    SH_G_TRAVEL,    /* 内部常量：定义直接复制到每个引用它的分片模块中 */
+    SH_G_BLOCK      /* 无法迁移的全局状态（初始化器逃逸至内部函数/别名/TLS）：保留在协调器模块 */
 };
 
-/* ---- open-addressing pointer -> int map --------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     void     **keys;
-    int       *vals;      /* val >= 0 stored, -1 = empty slot */
+    int       *vals;      /* 核心系统底层抽象与内存语义契约 */
     int        mask;
     int        n;
 } sh_map_t;
@@ -117,7 +94,7 @@ static bool sh_map_put(sh_map_t *m, void *k, int v) {
     return true;
 }
 
-/* ---- growable string buffer --------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct { char *p; size_t n, cap; bool oom; } sh_sbuf_t;
 
 static void sh_sb_putn(sh_sbuf_t *b, const char *s, size_t n) {
@@ -136,20 +113,20 @@ static void sh_sb_putn(sh_sbuf_t *b, const char *s, size_t n) {
 
 static void sh_sb_puts(sh_sbuf_t *b, const char *s) { sh_sb_putn(b, s, strlen(s)); }
 
-/* ---- shard state --------------------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct { LLVMValueRef fn; LLVMValueRef glob; unsigned old_linkage; } sh_link_rec_t;
 typedef struct { LLVMValueRef orig, decl; char *origname; } sh_move_rec_t;
 
 typedef struct {
     zan_irgen_t      *g;
-    sh_map_t          fn_v;        /* fn      -> SH_F_*  */
-    sh_map_t          glob_v;      /* global  -> SH_G_*  */
-    sh_map_t          members_all; /* every fn planned for any shard -> 1 */
-    sh_map_t          needs_decl;  /* fn needs an external decl in coord */
-    sh_map_t          type_done;   /* named type emitted in CURRENT shard */
+    sh_map_t          fn_v;        /* fn      -> SH_F_* */
+    sh_map_t          glob_v;      /* global  -> SH_G_* */
+    sh_map_t          members_all; /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t          needs_decl;  /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t          type_done;   /* 核心系统底层抽象与内存语义契约 */
     sh_link_rec_t    *link_recs;   int link_n, link_cap;
-    sh_map_t          ext_globs;   /* DECL globals referenced from shards */
-    sh_map_t          ext_fns;     /* internal fns exported on shard reference */
+    sh_map_t          ext_globs;   /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t          ext_fns;     /* 核心系统底层抽象与内存语义契约 */
     bool              failed;
     char              reason[256];
 } sh_state_t;
@@ -168,9 +145,9 @@ static bool sh_name_is(const LLVMValueRef v, const char *pfx) {
     return n && strncmp(n, pfx, strlen(pfx)) == 0;
 }
 
-/* ---- fast module body index (single-pass extraction) --------------------- */
+/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
-    const char *start;
+    long long   offset;       /* 核心系统底层抽象与内存语义契约 */
     size_t      len;
 } sh_body_slice_t;
 
@@ -190,85 +167,163 @@ static size_t sh_hash_str(const char *s, size_t len) {
     return h;
 }
 
-static void sh_build_body_index(sh_body_index_t *idx, const char *buf, size_t buf_len) {
-    int cap = 32768;
-    idx->mask = cap - 1;
-    idx->count = 0;
-    idx->keys = (char **)calloc((size_t)cap, sizeof(char *));
-    idx->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(sh_body_slice_t));
-    if (!idx->keys || !idx->vals) return;
+static int sh_hex_digit(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-    const char *p = buf;
-    const char *end = buf + buf_len;
-    while (p < end) {
-        const char *def_start = NULL;
-        if (p == buf && strncmp(p, "define ", 7) == 0) {
-            def_start = p;
-        } else {
-            const char *hit = strstr(p, "\ndefine ");
-            if (!hit || hit >= end) break;
-            def_start = hit + 1;
-        }
-        const char *at = strchr(def_start, '@');
-        if (!at || at >= end) break;
-        at++;
-        const char *name_start = at;
-        const char *name_end = NULL;
-        if (*at == '"') {
-            name_start = at + 1;
-            name_end = strchr(name_start, '"');
-            if (!name_end || name_end >= end) break;
-        } else {
-            name_end = name_start;
-            while (name_end < end && *name_end && *name_end != '(' && *name_end != ' ')
-                name_end++;
-        }
-        size_t name_len = (size_t)(name_end - name_start);
-        const char *close_brace = strstr(name_end, "\n}");
-        if (!close_brace || close_brace >= end) break;
-        const char *def_end = close_brace + 2;
-        if (def_end < end && *def_end == '\r') def_end++;
-        if (def_end < end && *def_end == '\n') def_end++;
-
-        char *key = (char *)malloc(name_len + 1);
-        if (key) {
-            memcpy(key, name_start, name_len);
-            key[name_len] = '\0';
-            /* Expand when load factor reaches 75% to prevent infinite probe loop */
-            if ((idx->count + 1) * 4 >= (idx->mask + 1) * 3) {
-                int old_cap = idx->mask + 1;
-                int new_cap = old_cap * 2;
-                char **new_keys = (char **)calloc((size_t)new_cap, sizeof(char *));
-                sh_body_slice_t *new_vals = (sh_body_slice_t *)calloc((size_t)new_cap, sizeof(sh_body_slice_t));
-                if (new_keys && new_vals) {
-                    int new_mask = new_cap - 1;
-                    for (int i = 0; i < old_cap; i++) {
-                        if (idx->keys[i]) {
-                            size_t kl = strlen(idx->keys[i]);
-                            size_t nh = sh_hash_str(idx->keys[i], kl) & (size_t)new_mask;
-                            while (new_keys[nh]) nh = (nh + 1) & (size_t)new_mask;
-                            new_keys[nh] = idx->keys[i];
-                            new_vals[nh] = idx->vals[i];
-                        }
-                    }
-                    free(idx->keys);
-                    free(idx->vals);
-                    idx->keys = new_keys;
-                    idx->vals = new_vals;
-                    idx->mask = new_mask;
-                }
-            }
-            size_t h = sh_hash_str(key, name_len) & (size_t)idx->mask;
-            while (idx->keys[h]) {
-                h = (h + 1) & (size_t)idx->mask;
-            }
-            idx->keys[h] = key;
-            idx->vals[h].start = def_start;
-            idx->vals[h].len = (size_t)(def_end - def_start);
-            idx->count++;
-        }
-        p = def_end;
+/* 解码 LLVM 打印器输出的 @name 标识符 */
+static char *sh_body_header_name(const char *header) {
+    bool quoted = false;
+    const char *p = header + 7;
+    for (; *p; p++) {
+        if (*p == '"') quoted = !quoted;
+        else if (*p == '@' && !quoted) break;
     }
+    if (*p != '@') return NULL;
+    p++;
+    const char *start = p;
+    if (*p == '"') {
+        start = ++p;
+        while (*p && *p != '"') p++;
+        if (*p != '"') return NULL;
+        size_t len = (size_t)(p - start);
+        char *name = (char *)malloc(len + 1);
+        if (!name) return NULL;
+        size_t n = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)start[i];
+            if (c == '\\') {
+                if (i + 2 >= len) { free(name); return NULL; }
+                int hi = sh_hex_digit((unsigned char)start[i + 1]);
+                int lo = sh_hex_digit((unsigned char)start[i + 2]);
+                if (hi < 0 || lo < 0) { free(name); return NULL; }
+                c = (unsigned char)((hi << 4) | lo);
+                i += 2;
+            }
+            /* 模块核心语义抽象与接口调用契约 */
+            if (!c) { free(name); return NULL; }
+            name[n++] = (char)c;
+        }
+        name[n] = '\0';
+        if (!n) { free(name); return NULL; }
+        return name;
+    }
+    while (*p && *p != '(' && *p != ' ' && *p != '\t' &&
+           *p != '\r' && *p != '\n') p++;
+    size_t len = (size_t)(p - start);
+    if (!len) return NULL;
+    char *name = (char *)malloc(len + 1);
+    if (name) { memcpy(name, start, len); name[len] = '\0'; }
+    return name;
+}
+
+static bool sh_body_index_add(sh_body_index_t *idx, char *name,
+                              long long offset, size_t len) {
+    /* 内存不足拒绝不完整索引构建 */
+    if ((size_t)(idx->count + 1) * 4 >= (size_t)(idx->mask + 1) * 3) {
+        int old_cap = idx->mask + 1;
+        if (old_cap > INT_MAX / 2) return false;
+        int new_cap = old_cap * 2, new_mask = new_cap - 1;
+        char **keys = (char **)calloc((size_t)new_cap, sizeof(*keys));
+        sh_body_slice_t *vals = (sh_body_slice_t *)calloc((size_t)new_cap,
+                                                         sizeof(*vals));
+        if (!keys || !vals) { free(keys); free(vals); return false; }
+        for (int i = 0; i < old_cap; i++) {
+            if (!idx->keys[i]) continue;
+            size_t h = sh_hash_str(idx->keys[i], strlen(idx->keys[i])) &
+                       (size_t)new_mask;
+            while (keys[h]) h = (h + 1) & (size_t)new_mask;
+            keys[h] = idx->keys[i];
+            vals[h] = idx->vals[i];
+        }
+        free(idx->keys); free(idx->vals);
+        idx->keys = keys; idx->vals = vals; idx->mask = new_mask;
+    }
+    size_t h = sh_hash_str(name, strlen(name)) & (size_t)idx->mask;
+    while (idx->keys[h]) {
+        if (!strcmp(idx->keys[h], name)) return false;
+        h = (h + 1) & (size_t)idx->mask;
+    }
+    idx->keys[h] = name;
+    idx->vals[h].offset = offset;
+    idx->vals[h].len = len;
+    idx->count++;
+    return true;
+}
+
+static bool sh_build_body_index(sh_body_index_t *idx, FILE *file) {
+    int cap = 1024;
+    idx->mask = cap - 1;
+    idx->keys = (char **)calloc((size_t)cap, sizeof(*idx->keys));
+    idx->vals = (sh_body_slice_t *)calloc((size_t)cap, sizeof(*idx->vals));
+    if (!idx->keys || !idx->vals) return false;
+
+    /* 逐块读取长行：仅保留 define 函数头信息 */
+    char chunk[16384];
+    sh_sbuf_t header = {0};
+    char *name = NULL;
+    long long pos = 0, body_start = 0;
+    bool line_start = true, in_body = false, in_header = false;
+    bool ok = true;
+    while (fgets(chunk, sizeof(chunk), file)) {
+        size_t n = strlen(chunk);
+        if (!n || (unsigned long long)n > (unsigned long long)(LLONG_MAX - pos)) {
+            ok = false; break;
+        }
+        bool line_end = chunk[n - 1] == '\n';
+        if (line_start && !in_body && !strncmp(chunk, "define ", 7)) {
+            in_body = in_header = true;
+            body_start = pos;
+            header.n = 0;
+        }
+        if (in_header) {
+            sh_sb_putn(&header, chunk, n);
+            if (header.oom) { ok = false; break; }
+            if (line_end) {
+                name = sh_body_header_name(header.p);
+                if (!name) { ok = false; break; }
+                in_header = false;
+            }
+        } else if (in_body && line_start && chunk[0] == '}') {
+            unsigned long long span = (unsigned long long)(pos - body_start) + n;
+            if (!line_end || span > (unsigned long long)SIZE_MAX ||
+                !sh_body_index_add(idx, name, body_start, (size_t)span)) {
+                ok = false; break;
+            }
+            name = NULL; /* 核心系统底层抽象与内存语义契约 */
+            in_body = false;
+        }
+        pos += (long long)n;
+        line_start = line_end;
+    }
+    if (ferror(file) || in_body) ok = false;
+    free(name);
+    free(header.p);
+    return ok;
+}
+
+static bool sh_append_body_slice(FILE *file, const sh_body_slice_t *slice,
+                                 sh_sbuf_t *bodies) {
+#ifdef _WIN32
+    if (_fseeki64(file, slice->offset, SEEK_SET)) return false;
+#else
+    off_t offset = (off_t)slice->offset;
+    if ((long long)offset != slice->offset || fseeko(file, offset, SEEK_SET))
+        return false;
+#endif
+    char chunk[16384];
+    size_t left = slice->len;
+    while (left) {
+        size_t n = left < sizeof(chunk) ? left : sizeof(chunk);
+        if (fread(chunk, 1, n, file) != n) return false;
+        sh_sb_putn(bodies, chunk, n);
+        if (bodies->oom) return false;
+        left -= n;
+    }
+    return true;
 }
 
 static const sh_body_slice_t *sh_find_body_slice(const sh_body_index_t *idx, const char *name) {
@@ -283,22 +338,18 @@ static const sh_body_slice_t *sh_find_body_slice(const sh_body_index_t *idx, con
 }
 
 static void sh_free_body_index(sh_body_index_t *idx) {
-    if (!idx || !idx->keys) return;
-    int cap = idx->mask + 1;
-    for (int i = 0; i < cap; i++) free(idx->keys[i]);
+    if (!idx) return;
+    if (idx->keys) {
+        int cap = idx->mask + 1;
+        for (int i = 0; i < cap; i++) free(idx->keys[i]);
+    }
     free(idx->keys);
     free(idx->vals);
     memset(idx, 0, sizeof(*idx));
 }
 
-/* ---- function verdicts ---------------------------------------------------- */
-/* A coordinator body referenced from a shard must be reachable through an
- * external symbol. Declarations already are; defined bodies exported by the
- * coordinator are; internal helpers with the compiler-owned __zan_ prefix
- * can safely be demoted to external (no libc collision is possible); any
- * other internal body (user fns made module-local, generic specs) stays in
- * the coordinator and is exported when a shard references it — mangled Zan
- * names are unique, so the linkage flip is a pure visibility change. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 分片引用的协调器函数必须通过外部导出符号可达 */
 static int sh_fn_verdict(sh_state_t *st, LLVMValueRef f) {
     int hit = sh_map_get(&st->fn_v, f);
     if (hit >= 0) return hit;
@@ -312,11 +363,7 @@ static int sh_fn_verdict(sh_state_t *st, LLVMValueRef f) {
     return v;
 }
 
-/* True when the function or any instruction in it carries attached metadata.
- * The fragment printer cannot emit metadata definitions, so a moved body with
- * attachments would parse as "use of undefined metadata !N" — the -O2
- * pipeline attaches !llvm.loop / !llvm.access.group to vectorized loops. Such
- * bodies must stay coordinator-side. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool sh_has_attached_metadata(LLVMValueRef f) {
     if (LLVMHasMetadata(f)) return true;
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
@@ -327,18 +374,13 @@ static bool sh_has_attached_metadata(LLVMValueRef f) {
     return false;
 }
 
-/* ---- global verdicts (with initializer closure) --------------------------- */
-/* A global travels only when it is a private/internal constant whose whole
- * initializer closure can be reconstructed inside the shard: function
- * references must be declarable (SH_F_BLOCK poisons), nested constants must
- * resolve, aliases and TLS state poison. Cyclic initializers (constant A
- * referencing constant B referencing A) poison both members: the -2
- * in-progress memo makes the re-entrant query conservative. */
+/* 全局判定（含初始化器闭包依赖扫描） */
+/* 内部辅助实现 */
 typedef struct { LLVMValueRef v; int depth; } sh_cw_item_t;
 
 static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv);
 
-/* Recursive initializer walk; returns false when the closure poisons. */
+/* 模块核心语义抽象与接口调用契约 */
 static bool sh_glob_closure_ok(sh_state_t *st, LLVMValueRef init,
                                sh_map_t *done, int depth) {
     if (!init || depth > 32) return true;
@@ -368,21 +410,18 @@ static bool sh_glob_closure_ok(sh_state_t *st, LLVMValueRef init,
 static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv) {
     int hit = sh_map_get(&st->glob_v, gv);
     if (hit >= 0) return hit;
-    if (hit == -2) return SH_G_BLOCK;   /* cyclic initializer */
+    if (hit == -2) return SH_G_BLOCK;   /* 核心系统底层抽象与内存语义契约 */
 
     int verdict;
     if (!LLVMIsAGlobalVariable(gv)) {
-        verdict = SH_G_BLOCK;           /* alias: cannot declare safely */
+        verdict = SH_G_BLOCK;           /* 核心系统底层抽象与内存语义契约 */
     } else if (LLVMHasMetadata(gv)) {
-        /* attached metadata nodes print as bare !N references; the fragment
-         * carries no metadata definitions, so the parsed shard would reject
-         * them ("use of undefined metadata"). Stay coordinator-side. */
+        /* 剥离无定义的 !N 元数据节点引用 */
         verdict = SH_G_BLOCK;
     } else if (LLVMIsDeclaration(gv)) {
         verdict = SH_G_DECL;
     } else if (LLVMIsThreadLocal(gv)) {
-        /* mutable per-thread state: a synthesized plain external declaration
-         * would drop the TLS attribute and silently change addressing */
+        /* 线程局部 (TLS) 全局变量声明：保持线程局部属性 */
         verdict = SH_G_BLOCK;
     } else {
         unsigned lk = LLVMGetLinkage(gv);
@@ -406,11 +445,11 @@ static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv) {
 
 typedef struct {
     sh_state_t *st;
-    sh_map_t    decl_fns;    /* fn -> 1: synthesize declare */
-    sh_map_t    decl_globs;  /* global -> 1: synthesize external decl */
-    sh_map_t    travel;      /* global -> 1: print definition */
-    sh_map_t    body_done;   /* global: closure already marked */
-    sh_map_t   *closure_seen;/* shard-level: init closure walked once */
+    sh_map_t    decl_fns;    /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t    decl_globs;  /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t    travel;      /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t    body_done;   /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t   *closure_seen;/* 底层系统交互与数据协议契约 */
 } sh_refs_t;
 
 static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f);
@@ -434,14 +473,9 @@ static bool sh_link_glob(sh_state_t *st, LLVMValueRef gv) {
 }
 static bool sh_refs_note_global(sh_refs_t *r, LLVMValueRef gv);
 
-/* A traveling global is DUPLICATED into the shard: its initializer text
- * references every symbol it closes over from the shard's copy too, so any
- * function it touches must gain an external declaration in the coordinator
- * (the coordinator's own copy of the global keeps pointing at it) and a
- * declare line in this shard's fragment. */
+/* 内部辅助实现 */
 static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
-    /* no cross-shard memo here: the fn refs it finds must land in EVERY
-     * referencing shard's declare set (needs_decl itself is idempotent) */
+    /* 跨分片函数引用记录：分片间独立记录声明集 */
     sh_map_t walk_done; sh_map_init(&walk_done);
     sh_cw_item_t *stack = (sh_cw_item_t *)malloc(64 * sizeof(*stack));
     if (!stack) { sh_fail(st, "out of memory"); return; }
@@ -456,9 +490,7 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
         if (LLVMIsAFunction(v)) {
             if (sh_map_get(&st->members_all, v) >= 0) {
                 sh_map_put(&st->needs_decl, v, 1);
-                /* the referencing shard's declare set: pass 2 emits declares
-                 * from r->decl_fns, not from the state-level needs_decl, and
-                 * skips local members at emission time */
+                /* 模块核心语义抽象与接口调用契约 */
                 if (sh_map_get(&r->decl_fns, v) < 0)
                     sh_map_put(&r->decl_fns, v, 1);
             } else
@@ -477,13 +509,11 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
                 stack = ns;
             }
             if (gvv == SH_G_TRAVEL) {
-                /* nested travel global: its verbatim definition must be
-                 * printed in this fragment too, or the text references it
-                 * undefined */
+                /* 嵌套可迁移全局变量：完整定义打印至当前分片 */
                 if (sh_map_get(&r->travel, v) < 0)
                     sh_map_put(&r->travel, v, 1);
             } else {
-                /* DECL: needs an external-global declaration; BLOCK: fails */
+                /* 底层系统交互与数据协议契约 */
                 if (!sh_refs_note_global(r, v)) { break; }
                 continue;
             }
@@ -492,8 +522,7 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
             stack[sn].depth = it.depth + 1; sn++;
             continue;
         }
-        /* aggregate constants (ConstantStruct/ConstantArray literal
-         * initializers) are NOT ConstantExpr but carry fn/global pointers */
+        /* 复合常量（结构体/数组字面量）递归遍历其包含的指针 */
         if (LLVMIsAConstant(v)) {
             unsigned nop = LLVMGetNumOperands(v);
             for (unsigned i = 0; i < nop; i++) {
@@ -513,7 +542,7 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
     sh_map_free(&walk_done);
 }
 
-/* ---- trace breadcrumbs (ZAN_SHARD_TRACE=1) --------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 static time_t sh_trace_t0(void) {
     static time_t t0 = 0;
     if (!t0) t0 = time(NULL);
@@ -530,18 +559,12 @@ static int sh_trace_on(void) {
         fprintf(stderr, __VA_ARGS__); \
         fflush(stderr); } } while (0)
 
-/* ---- body reference walk --------------------------------------------------- */
-/* Every function/global operand of a member body must be resolvable inside
- * the shard: functions and globals route through their verdicts. A member of
- * another shard needs an external declare (it is emitted with external
- * linkage); an internal non-member body stays in the coordinator and is
- * EXPORTED on this reference — its mangled name is unique, so internal →
- * external linkage is a pure visibility change with no collision risk. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 内部辅助实现 */
 static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f) {
     sh_state_t *st = r->st;
     if (sh_map_get(&st->members_all, f) >= 0) {
-        /* member of another shard: it will be emitted with external
-         * linkage, so this shard declares it */
+        /* 跨分片成员：目标分片以 external 链接发射，本分片仅声明 */
         sh_map_put(&st->needs_decl, f, 1);
         if (sh_map_get(&r->decl_fns, f) < 0)
             if (!sh_map_put(&r->decl_fns, f, 1)) { sh_fail(st, "out of memory"); return false; }
@@ -549,8 +572,7 @@ static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f) {
     }
     int v = sh_fn_verdict(st, f);
     if (v == SH_F_EXT) {
-        /* export the coordinator-side body so the shard's declare resolves;
-         * recorded for rollback like every other linkage change */
+        /* 导出协调器端函数体以供分片解析，记录回滚状态 */
         if (sh_map_get(&st->ext_fns, f) < 0) {
             if (!sh_map_put(&st->ext_fns, f, 1)) { sh_fail(st, "out of memory"); return false; }
             sh_link_rec(st, f, false);
@@ -561,7 +583,7 @@ static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f) {
                 LLVMGetValueName(f));
         return false;
     }
-    /* every non-member verdict needs a declare line in this fragment */
+    /* 模块核心语义抽象与接口调用契约 */
     if (sh_map_get(&r->decl_fns, f) < 0)
         if (!sh_map_put(&r->decl_fns, f, 1)) { sh_fail(st, "out of memory"); return false; }
     return true;
@@ -578,16 +600,13 @@ static bool sh_refs_note_global(sh_refs_t *r, LLVMValueRef gv) {
     if (v == SH_G_TRAVEL) {
         if (sh_map_get(&r->travel, gv) < 0)
             if (!sh_map_put(&r->travel, gv, 1)) { sh_fail(st, "out of memory"); return false; }
-        /* one closure walk per shard: the results land in this shard's
-         * decl sets; a state-level memo would starve the later shards */
+        /* 每分片独立计算闭包，结果计入本分片声明集合 */
         if (!r->closure_seen || sh_map_get(r->closure_seen, gv) < 0) {
             if (r->closure_seen) sh_map_put(r->closure_seen, gv, 1);
             sh_mark_closure_fns(st, r, gv);
         }
     } else {
-        /* DECL global: the shard gets an external declaration and the
-         * coordinator copy must export the symbol — internal linkage would
-         * leave the shard's .refptr relocation undefined at link time */
+        /* 外部声明全局变量：协调器端导出对应符号 */
         if (sh_map_get(&r->decl_globs, gv) < 0)
             if (!sh_map_put(&r->decl_globs, gv, 1)) { sh_fail(st, "out of memory"); return false; }
         if (LLVMIsDeclaration(gv)) return true;
@@ -605,9 +624,7 @@ static bool sh_refs_walk_value(sh_refs_t *r, LLVMValueRef v, int depth) {
         sh_fail(st, "reference to alias '%s'", LLVMGetValueName(v));
         return false;
     }
-    /* constant aggregates (struct/array literals) are not ConstantExpr but
-     * carry the same fn/global pointers; fns/globals/aliases returned above,
-     * and instructions never arrive through an operand walk */
+    /* 复合常量内嵌符号引用遍历 */
     if (LLVMIsAConstant(v)) {
         unsigned nop = LLVMGetNumOperands(v);
         for (unsigned i = 0; i < nop; i++)
@@ -619,20 +636,14 @@ static bool sh_refs_walk_value(sh_refs_t *r, LLVMValueRef v, int depth) {
 
 static bool sh_refs_scan_fn(sh_refs_t *r, LLVMValueRef fn) {
     sh_state_t *st = r->st;
-    /* NOTE: no LLVMGetPersonalityFn here — it segfaults in this LLVM build
-     * even on a plain function handle. Eligible Zan bodies use the setjmp
-     * EH path and carry no personality; if one ever does, its printed
-     * fragment references an undeclared symbol and the parse fails into the
-     * clean single-module fallback. */
+    /* 规避当前 LLVM 版本的 LLVMGetPersonalityFn 空指针缺陷 */
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb;
          bb = LLVMGetNextBasicBlock(bb)) {
         for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
              in = LLVMGetNextInstruction(in)) {
             unsigned nop = LLVMGetNumOperands(in);
             for (unsigned i = 0; i < nop; i++) {
-                /* a direct call's callee is its last operand; the generic
-                 * walk covers it (a non-call fn operand cannot happen for
-                 * eligible fns — address-taken ones never got here) */
+                /* 直接调用的被调函数位于操作数末位 */
                 if (!sh_refs_walk_value(r, LLVMGetOperand(in, (int)i), 0))
                     return false;
             }
@@ -644,14 +655,14 @@ static bool sh_refs_scan_fn(sh_refs_t *r, LLVMValueRef fn) {
 
 /* ---- planning -------------------------------------------------------------- */
 typedef struct {
-    int         *idx;        /* manifest indices */
-    int          n;
+    int         *idx;        /* 核心系统底层抽象与内存语义契约 */
+    int          n, cap;
     long long    insns;
     const char  *minname;
 } sh_comp_t;
 
 typedef struct {
-    int mf_i;                /* manifest index */
+    int mf_i;                /* 核心系统底层抽象与内存语义契约 */
     LLVMValueRef fn;
     int  comp;
     bool needs_decl;
@@ -668,18 +679,10 @@ static int sh_cmp_name_ref(const void *a, const void *b) {
     return strcmp(LLVMGetValueName(x), LLVMGetValueName(y));
 }
 
-/* ---- module text carving --------------------------------------------------- */
-/* LLVMPrintValueToString builds a module-wide SlotTracker on every call, so
- * printing member bodies one by one costs O(members x module size) — 331s of
- * the ~400s IDE shard run. Print the module text once and carve each member's
- * `define` block out of it. */
-/* ---- type harvest ----------------------------------------------------------- */
-/* Scan .ll text for %identifiers and emit `= type {...}` lines for the ones
- * the coordinator's type table knows (named structs). GEP source element
- * types exist ONLY in printed text, so this — not the C API — is the
- * complete source of the shard's type table. Post-order: a struct's element
- * strings are scanned (and their types emitted) before the struct's own
- * line, so the parser never sees a forward reference. */
+/* 核心系统底层抽象与内存语义契约 */
+/* 内部辅助实现 */
+/* 核心系统底层抽象与内存语义契约 */
+/* 内部辅助实现 */
 static bool sh_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '.' ||
@@ -720,8 +723,7 @@ static void sh_harvest_types(sh_state_t *st, sh_sbuf_t *types, const char *text)
             sh_sb_puts(types, line);
             continue;
         }
-        /* children first: element strings may name further structs; elems
-         * lives until after the emit loop below reuses it */
+        /* 递归打印依赖的子结构体类型 */
         unsigned ne = LLVMCountStructElementTypes(ty);
         LLVMTypeRef *elems = NULL;
         if (ne) {
@@ -784,7 +786,7 @@ static char *sh_type_name_clean(LLVMTypeRef ty) {
     return res;
 }
 
-/* ---- synthesized declarations ------------------------------------------------ */
+/* 核心系统底层抽象与内存语义契约 */
 static void sh_emit_fn_decl(sh_sbuf_t *b, LLVMValueRef f) {
     LLVMTypeRef ft = LLVMGlobalGetValueType(f);
     LLVMTypeRef rt = LLVMGetReturnType(ft);
@@ -814,9 +816,7 @@ static void sh_emit_fn_decl(sh_sbuf_t *b, LLVMValueRef f) {
 
 static void sh_emit_global_decl(sh_state_t *st, sh_sbuf_t *b, LLVMValueRef gv) {
     if (!LLVMIsDeclaration(gv)) {
-        /* defined in the coordinator: rewrite the definition into an
-         * external declaration (keeps `constant` for constants; alignment
-         * and initializer stay coordinator-only) */
+        /* 模块核心语义抽象与接口调用契约 */
         sh_sb_puts(b, "@");
         sh_sb_puts(b, LLVMGetValueName(gv));
         sh_sb_puts(b, " = external ");
@@ -827,14 +827,13 @@ static void sh_emit_global_decl(sh_state_t *st, sh_sbuf_t *b, LLVMValueRef gv) {
         sh_sb_puts(b, "\n");
         return;
     }
-    /* coordinator declaration: print verbatim (thread_local, addrspace,
-     * dllimport all round-trip) */
+    /* 协调器外部声明：原样打印属性修饰符 */
     char *txt = LLVMPrintValueToString(gv);
     if (txt) { sh_sb_puts(b, txt); sh_sb_puts(b, "\n"); LLVMDisposeMessage(txt); }
     (void)st;
 }
 
-/* ---- fragment build + emit ---------------------------------------------------- */
+/* 核心系统底层抽象与内存语义契约 */
 static LLVMTargetMachineRef sh_make_tm(sh_state_t *st) {
     LLVMTargetMachineRef tm = NULL;
     if (zan_bind_target_layout(st->g, &tm) != ZAN_OK) return NULL;
@@ -881,47 +880,32 @@ static bool sh_emit_one_file(sh_state_t *st, const char *frag_path,
         if (sf) fclose(sf);
         if (df) fclose(df);
     }
-    FILE *f = fopen(frag_path, "rb");
-    if (!f) {
-        snprintf(errbuf, errsz, "cannot open shard fragment file '%s'", frag_path);
+    LLVMMemoryBufferRef mb = NULL;
+    char *perr = NULL;
+    if (LLVMCreateMemoryBufferWithContentsOfFile(frag_path, &mb, &perr)) {
+        snprintf(errbuf, errsz, "cannot read shard fragment: %.160s",
+                 perr ? perr : "?");
+        if (perr) LLVMDisposeMessage(perr);
         return false;
     }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) {
-        fclose(f);
-        snprintf(errbuf, errsz, "cannot stat shard fragment file '%s'", frag_path);
-        return false;
-    }
-    char *buf = (char *)malloc((size_t)sz + 1);
-    if (!buf) {
-        fclose(f);
-        snprintf(errbuf, errsz, "out of memory reading shard fragment");
-        return false;
-    }
-    size_t nr = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    buf[nr] = '\0';
-
     LLVMContextRef ctx = LLVMContextCreate();
     if (!ctx) {
-        free(buf);
+        LLVMDisposeMemoryBuffer(mb);
         snprintf(errbuf, errsz, "context create failed");
         return false;
     }
-    SH_TRACE("shard emit: frag %d bytes -> parse\n", (int)nr);
-    LLVMMemoryBufferRef mb = LLVMCreateMemoryBufferWithMemoryRangeCopy(
-        buf, nr, "zan-shard");
-    free(buf);
+    SH_TRACE("shard emit: frag %zu bytes -> parse\n", LLVMGetBufferSize(mb));
     LLVMModuleRef mod = NULL;
-    char *perr = NULL;
+    /* 模块核心语义抽象与接口调用契约 */
     if (LLVMParseIRInContext(ctx, mb, &mod, &perr)) {
         snprintf(errbuf, errsz, "parse: %.160s", perr ? perr : "?");
         if (perr) LLVMDisposeMessage(perr);
         LLVMContextDispose(ctx);
         return false;
     }
+    /* 模块核心语义抽象与接口调用契约 */
+    LLVMSetModuleIdentifier(mod, "zan-shard", strlen("zan-shard"));
+    LLVMSetSourceFileName(mod, "zan-shard", strlen("zan-shard"));
     const char *triple = LLVMGetTarget(g->mod);
     if (triple && *triple) LLVMSetTarget(mod, triple);
     LLVMSetDataLayout(mod, LLVMGetDataLayoutStr(g->mod));
@@ -952,7 +936,7 @@ static bool sh_emit_one_file(sh_state_t *st, const char *frag_path,
     return true;
 }
 
-/* ---- move (rename + decl + RAUW + delete), fully rollback-able -------------- */
+/* 符号迁移（重命名 + 外部声明 + 全局替换 RAUW），支持完全回滚 */
 static bool sh_unique_fn_name(zan_irgen_t *g, const char *base, const char *sfx,
                               int *counter, char *out, size_t outsz) {
     for (int i = 0; i < 10000; i++) {
@@ -964,13 +948,9 @@ static bool sh_unique_fn_name(zan_irgen_t *g, const char *base, const char *sfx,
     return false;
 }
 
-/* ---- streaming shard harvesting & instant eviction ---- */
+/* 核心系统底层抽象与内存语义契约 */
 /* ---- entry ---------------------------------------------------------------- */
-/*
- * Returns the number of shard objects written (>= 0, may be 0 = clean
- * fallback), or -1 on an internal error the caller should treat as fatal.
- * `out_objs` receives a malloc'd array of malloc'd path strings.
- */
+/* 内部辅助实现 */
 static void sh_planner_mark(sh_state_t *st, LLVMValueRef v, int depth) {
     if (!v || depth > 8) return;
     if (LLVMIsAFunction(v)) {
@@ -985,8 +965,7 @@ static void sh_planner_mark(sh_state_t *st, LLVMValueRef v, int depth) {
     }
 }
 
-/* trace-only: find surviving references to moved-and-renamed bodies inside
- * global initializer constants */
+/* 追溯全局初始化常量中已重命名的函数引用 */
 static void sh_trace_scan_const(LLVMValueRef owner, LLVMValueRef v, int depth) {
     if (!v || depth > 8) return;
     if (LLVMIsAFunction(v)) {
@@ -1023,7 +1002,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     sh_map_init(&st.ext_globs);
     sh_map_init(&st.ext_fns);
 
-    /* ---- seeds: manifest-eligible user bodies, entry points excluded ---- */
+    /* 模块核心语义抽象与接口调用契约 */
     sh_member_t *mem = (sh_member_t *)calloc((size_t)(m->fn_count ? m->fn_count : 1),
                                              sizeof(*mem));
     int *uf = (int *)calloc((size_t)(m->fn_count ? m->fn_count : 1), sizeof(*uf));
@@ -1055,19 +1034,18 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         return 0;
     }
 
-    /* member lookup: manifest index -> member slot */
+    /* 底层系统交互与数据协议契约 */
     sh_map_t mf2mem; sh_map_init(&mf2mem);
     for (int k = 0; k < nm; k++) sh_map_put(&mf2mem, mem[k].fn, k);
 
-    /* ---- dirty fixpoint: drop members whose reference closure cannot be
-     * proven resolvable through external symbols ---- */
+    /* 脏不动点迭代：剔除无法通过外部链接解析的跨分片成员 */
     bool changed = true;
     int iter_guard = 0;
     while (changed && iter_guard++ < 64) {
         changed = false;
         for (int k = 0; k < nm; k++) {
             sh_member_t *M = &mem[k];
-            if (M->comp < 0) continue;   /* already dirty */
+            if (M->comp < 0) continue;   /* 核心系统底层抽象与内存语义契约 */
             const zan_mf_fn *F = &m->fns[M->mf_i];
             bool dirty = false;
             for (int c = 0; c < F->call_cnt && !dirty; c++) {
@@ -1106,9 +1084,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
     }
 
-    /* Direct bin-packing: do not union-find call edges into a single giant
-     * connected component that concentrates 90% of the project in shard 0.
-     * Inter-shard calls are safely lowered via external declarations. */
+    /* 装箱启发式分片：防止调用图合并为超大连通块导致分片倾斜 */
     for (int k = 0; k < nm; k++) {
         if (mem[k].comp < 0) continue;
         mem[k].comp = k;
@@ -1118,29 +1094,46 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     sh_map_t root2comp; sh_map_init(&root2comp);
     sh_comp_t *comps = (sh_comp_t *)calloc((size_t)nm, sizeof(*comps));
     int ncomp = 0;
-    for (int k = 0; k < nm; k++) {
+    bool comp_ok = comps != NULL;
+    for (int k = 0; k < nm && comp_ok; k++) {
         if (mem[k].comp < 0) continue;
         int root = mem[k].comp;
         int ci = sh_map_get(&root2comp, mem[root].fn);
         if (ci < 0) {
             ci = ncomp++;
-            sh_map_put(&root2comp, mem[root].fn, ci);
-            comps[ci].idx = (int *)malloc((size_t)(nm - k + 1) * sizeof(int));
-            comps[ci].n = 0;
-            comps[ci].insns = 0;
+            if (!sh_map_put(&root2comp, mem[root].fn, ci)) {
+                comp_ok = false; break;
+            }
             comps[ci].minname = LLVMGetValueName(mem[k].fn);
+        }
+        /* 单节点连通块容量优化 */
+        if (comps[ci].n == comps[ci].cap) {
+            if (comps[ci].cap > INT_MAX / 2) { comp_ok = false; break; }
+            int cap = comps[ci].cap ? comps[ci].cap * 2 : 1;
+            int *idx = (int *)realloc(comps[ci].idx, (size_t)cap * sizeof(*idx));
+            if (!idx) { comp_ok = false; break; }
+            comps[ci].idx = idx;
+            comps[ci].cap = cap;
         }
         comps[ci].idx[comps[ci].n++] = k;
         comps[ci].insns += m->fns[mem[k].mf_i].insns;
         const char *nm2 = LLVMGetValueName(mem[k].fn);
         if (strcmp(nm2, comps[ci].minname) < 0) comps[ci].minname = nm2;
     }
-    for (int c = 0; c < ncomp; c++)
-        comps[c].idx = (int *)realloc(comps[c].idx,
-                                      (size_t)comps[c].n * sizeof(int));
+    if (!comp_ok) {
+        for (int c = 0; c < ncomp; c++) free(comps[c].idx);
+        free(comps); free(uf); free(mem);
+        sh_map_free(&root2comp); sh_map_free(&mf2mem);
+        sh_map_free(&st.fn_v); sh_map_free(&st.glob_v);
+        sh_map_free(&st.members_all); sh_map_free(&st.needs_decl);
+        sh_map_free(&st.ext_globs); sh_map_free(&st.ext_fns);
+        free(st.link_recs);
+        fprintf(stderr, "shard: out of memory planning components — single module\n");
+        return 0;
+    }
     qsort(comps, (size_t)ncomp, sizeof(*comps), sh_cmp_comp);
 
-    /* ---- packing: whole components into shards ---- */
+    /* 核心系统底层抽象与内存语义契约 */
     int nshard = 0;
     long long cur_fn = 0, cur_insn = 0;
     int *shard_of_comp = (int *)malloc((size_t)(ncomp ? ncomp : 1) * sizeof(int));
@@ -1163,7 +1156,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             nm + dropped + meta_skip, nm - dropped, mov_insns, dropped,
             meta_skip, nshard);
     if (nshard <= 1) {
-        /* 0 or 1 shard: no benefit from splitting across files, keep single module */
+        /* 模块核心语义抽象与接口调用契约 */
         for (int c = 0; c < ncomp; c++) free(comps[c].idx);
         free(comps); free(shard_of_comp); free(mem);
         sh_map_free(&mf2mem);
@@ -1173,19 +1166,13 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         return 0;
     }
 
-    /* member -> shard via comp */
+    /* 核心系统底层抽象与内存语义契约 */
     for (int c = 0; c < ncomp; c++)
         for (int j = 0; j < comps[c].n; j++)
             mem[comps[c].idx[j]].comp = shard_of_comp[c];
-    /* dirty members keep comp == -1 */
+    /* 核心系统底层抽象与内存语义契约 */
 
-    /* Coordinator-side callers force an external declaration: Main, generic
-     * specs, static ctors — every defined body that STAYS in the coordinator
-     * module and references a member (direct call OR address taken into a
-     * table) keeps that member's symbol alive. Scanning the actual operands
-     * (not the manifest's call edges) also covers fn-pointer stores; same-
-     * shard callers are exempt: both bodies move together and the use
-     * disappears with them. Member callers' edges come from pass 1. */
+    /* 内部辅助实现 */
     for (int i = 0; i < m->fn_count; i++) {
         const zan_mf_fn *F = &m->fns[i];
         if (!F->defined) continue;
@@ -1198,7 +1185,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
                  in = LLVMGetNextInstruction(in)) {
                 if (LLVMGetInstructionOpcode(in) == LLVMLandingPad)
-                    continue; /* personality ref is not an address escape */
+                    continue; /* 核心系统底层抽象与内存语义契约 */
                 unsigned nop = LLVMGetNumOperands(in);
                 for (unsigned k = 0; k < nop; k++)
                     sh_planner_mark(&st, LLVMGetOperand(in, (int)k), 0);
@@ -1206,17 +1193,9 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
     }
 
-    /* Coordinator-side member references must be marked BEFORE linkage, and
-     * fn pointers reach bodies not only bare but wrapped in constant
-     * expressions (bitcast into dispatch tables), so the operand walk
-     * descends constants. */
+    /* 内部辅助实现 */
 
-    /* ---- global-initializer closure: vtables, reflection tables and const
-     * dispatch tables keep member addresses alive from the COORDINATOR side.
-     * Members referenced only from a global would never be marked (pass 1/2
-     * scan shard bodies, the planner scans fn operands) and would be deleted
-     * while the table still points at them — mark them before the linkage
-     * externalization so the shard text prints them as `define external`. */
+    /* 内部辅助实现 */
     {
         sh_refs_t scratch;
         memset(&scratch, 0, sizeof(scratch));
@@ -1234,8 +1213,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         sh_map_free(&scratch.travel); sh_map_free(&scratch.body_done);
     }
 
-    /* ---- pass 1: reference walks per shard (fills needs_decl / demotions
-     * only through verdicts; actual linkage changes deferred to pass 2) ---- */
+    /* 第 1 遍：分片引用遍历并填充 needs_decl 需求表 */
     for (int s = 0; s < nshard && !st.failed; s++) {
         sh_refs_t refs;
         memset(&refs, 0, sizeof(refs));
@@ -1260,8 +1238,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     char **objs = NULL;
     LLVMTargetMachineRef tm = NULL;
     if (st.failed) {
-        /* pass 1 may already have externalized globals — undo before the
-         * single-module continue */
+        /* 回滚第 1 遍已外化修改的全局变量属性 */
         for (int i = 0; i < st.link_n; i++)
             LLVMSetLinkage(st.link_recs[i].glob ? st.link_recs[i].glob
                                                : st.link_recs[i].fn,
@@ -1271,8 +1248,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         goto cleanup_planning;
     }
 
-    /* ---- linkage: members with outside references go external (recorded),
-     * internal __zan_ helpers referenced by shards get demoted ---- */
+    /* 调整外部引用函数的符号链接为 external */
     for (int k = 0; k < nm; k++) {
         if (mem[k].comp < 0) continue;
         if (sh_map_get(&st.needs_decl, mem[k].fn) >= 0) {
@@ -1280,7 +1256,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             LLVMSetLinkage(mem[k].fn, LLVMExternalLinkage);
         }
     }
-    /* demote referenced internal __zan_* helpers (verdict memo has them) */
+    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i <= st.fn_v.mask; i++) {
         if (st.fn_v.vals[i] != SH_F_DEMOTE) continue;
         LLVMValueRef f = st.fn_v.keys[i];
@@ -1298,44 +1274,43 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     objs = (char **)calloc((size_t)nshard, sizeof(*objs));
     if (!objs) { snprintf(st.reason, sizeof(st.reason), "out of memory"); st.failed = true; }
 
-    char tmp_ll[1024];
+    char tmp_ll[1200];
     tmp_ll[0] = '\0';
-    char *ll_buf = NULL;
+    FILE *body_file = NULL;
     sh_body_index_t body_idx = {0};
-    if (obj_base && !st.failed) {
-        snprintf(tmp_ll, sizeof(tmp_ll), "%s.shard.tmp.ll", obj_base);
-        char *err_msg = NULL;
-        if (LLVMPrintModuleToFile(g->mod, tmp_ll, &err_msg) == 0) {
-            FILE *f = fopen(tmp_ll, "rb");
-            if (f) {
-                fseek(f, 0, SEEK_END);
-                long sz = ftell(f);
-                fseek(f, 0, SEEK_SET);
-                if (sz > 0) {
-                    ll_buf = (char *)malloc((size_t)sz + 1);
-                    if (ll_buf) {
-                        size_t nr = fread(ll_buf, 1, (size_t)sz, f);
-                        ll_buf[nr] = '\0';
-                        sh_build_body_index(&body_idx, ll_buf, nr);
-                    }
-                }
-                fclose(f);
-            }
-        } else {
-            if (err_msg) LLVMDisposeMessage(err_msg);
+    if (!st.failed) {
+        if (!obj_base || !*obj_base) {
+            sh_fail(&st, "missing shard output path");
+        } else if (snprintf(tmp_ll, sizeof(tmp_ll), "%s.shard.tmp.ll", obj_base) >=
+                   (int)sizeof(tmp_ll)) {
             tmp_ll[0] = '\0';
+            sh_fail(&st, "shard module text path too long");
+        } else {
+            char *err_msg = NULL;
+            if (LLVMPrintModuleToFile(g->mod, tmp_ll, &err_msg)) {
+                sh_fail(&st, "cannot write shard module text: %.160s",
+                        err_msg ? err_msg : "?");
+            } else {
+                body_file = fopen(tmp_ll, "rb");
+                if (!body_file) {
+                    sh_fail(&st, "cannot open shard module text (errno=%d)", errno);
+                } else if (!sh_build_body_index(&body_idx, body_file)) {
+                    sh_fail(&st, "cannot build complete shard body index");
+                }
+            }
+            if (err_msg) LLVMDisposeMessage(err_msg);
         }
     }
 
     for (int s = 0; s < nshard && !st.failed; s++) {
         SH_TRACE("shard %d: assembling\n", s);
-        sh_sbuf_t bodies = {0}, gdecls = {0}, types = {0}, frag = {0};
+        sh_sbuf_t bodies = {0}, gdecls = {0}, types = {0};
         sh_map_t decl_fns, decl_globs, travel;
         sh_map_init(&decl_fns); sh_map_init(&decl_globs); sh_map_init(&travel);
         sh_map_init(&st.type_done);
 
         bool ok = true;
-        /* collect this shard's local members */
+        /* 核心系统底层抽象与内存语义契约 */
         sh_map_t local; sh_map_init(&local);
         sh_map_t closure_memo; sh_map_init(&closure_memo);
         for (int c = 0; c < ncomp && ok; c++) {
@@ -1344,7 +1319,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 if (!sh_map_put(&local, mem[comps[c].idx[j]].fn, 1)) ok = false;
         }
 
-        /* reference scan + body assembly */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int c = 0; c < ncomp && ok; c++) {
             if (shard_of_comp[c] != s) continue;
             LLVMValueRef *mbrs = (LLVMValueRef *)malloc(
@@ -1355,7 +1330,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             qsort(mbrs, (size_t)comps[c].n, sizeof(*mbrs), sh_cmp_name_ref);
             for (int j = 0; j < comps[c].n && ok; j++) {
                 LLVMValueRef fn = mbrs[j];
-                /* reference scan (fresh per shard so decl sets stay local) */
+                /* 模块核心语义抽象与接口调用契约 */
                 {
                     sh_refs_t refs;
                     memset(&refs, 0, sizeof(refs));
@@ -1383,55 +1358,35 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 }
                 const char *fn_name = LLVMGetValueName(fn);
                 const sh_body_slice_t *sl = sh_find_body_slice(&body_idx, fn_name);
-                if (sl) {
-                    const char *hnl = (const char *)memchr(sl->start, '\n', sl->len);
-                    size_t hlen = hnl ? (size_t)(hnl - sl->start) : sl->len;
-                    char hbuf[4096];
-                    if (hlen >= sizeof(hbuf)) hlen = sizeof(hbuf) - 1;
-                    memcpy(hbuf, sl->start, hlen);
-                    hbuf[hlen] = '\0';
-                    if (strstr(hbuf, " comdat($")) {
-                        sh_fail(&st, "body '%s' carries comdat", fn_name);
-                        ok = false;
-                        break;
-                    }
-                    sh_sb_putn(&bodies, sl->start, sl->len);
-                    sh_sb_puts(&bodies, "\n");
-                } else {
-                    char *fntxt = LLVMPrintValueToString(fn);
-                    if (!fntxt) {
-                        sh_fail(&st, "body '%s' print failed", fn_name);
-                        ok = false;
-                        break;
-                    }
-                    /* comdat/alias can only appear on the define header line */
-                    {
-                        const char *hnl = strchr(fntxt, '\n');
-                        size_t hlen = hnl ? (size_t)(hnl - fntxt) : strlen(fntxt);
-                        char hbuf[4096];
-                        if (hlen >= sizeof(hbuf)) hlen = sizeof(hbuf) - 1;
-                        memcpy(hbuf, fntxt, hlen);
-                        hbuf[hlen] = '\0';
-                        if (strstr(hbuf, " comdat($")) {
-                            sh_fail(&st, "body '%s' carries comdat", fn_name);
-                            LLVMDisposeMessage(fntxt);
-                            ok = false;
-                            break;
-                        }
-                    }
-                    sh_sb_puts(&bodies, fntxt);
-                    sh_sb_puts(&bodies, "\n");
-                    LLVMDisposeMessage(fntxt);
+                if (!sl) {
+                    sh_fail(&st, "body '%s' missing from shard module text", fn_name);
+                    ok = false;
+                    break;
                 }
+                size_t body_start = bodies.n;
+                if (!sh_append_body_slice(body_file, sl, &bodies)) {
+                    sh_fail(&st, "cannot read body '%s' from shard module text", fn_name);
+                    ok = false;
+                    break;
+                }
+                /* 检查完整 define 头，无需克隆函数体 */
+                char *header = bodies.p + body_start;
+                char *hnl = (char *)memchr(header, '\n', sl->len);
+                if (hnl) *hnl = '\0';
+                bool has_comdat = strstr(header, " comdat") != NULL;
+                if (hnl) *hnl = '\n';
+                if (has_comdat) {
+                    sh_fail(&st, "body '%s' carries comdat", fn_name);
+                    ok = false;
+                    break;
+                }
+                sh_sb_puts(&bodies, "\n");
             }
             free(mbrs);
         }
 
         SH_TRACE("shard %d: bodies done (%d bytes)\n", s, (int)bodies.n);
-        /* global lines. The decl/travel maps are pointer-keyed, so their
-         * bucket order varies run to run with heap layout — collect and sort
-         * by name, or the fragment (and thus the object file) is not
-         * reproducible. */
+        /* 核心系统底层抽象与内存语义契约 */
         int ntrav = 0;
         for (int i = 0; i <= travel.mask; i++)
             if (travel.vals[i] > 0) ntrav++;
@@ -1478,10 +1433,9 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         SH_TRACE("shard %d: globals done (%d bytes)\n", s, (int)gdecls.n);
-        /* fn declares: everything referenced that is not a local member */
+        /* 底层系统交互与数据协议契约 */
         if (ok) {
-            /* union with needs_decl-marked other-shard members that this
-             * body walk recorded */
+            /* 合并跨分片引用的外部声明标记集合 */
             int nfd = 0;
             for (int i = 0; i <= decl_fns.mask; i++)
                 if (decl_fns.vals[i] > 0 &&
@@ -1505,34 +1459,37 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         SH_TRACE("shard %d: declares done\n", s);
-        /* types from all text so far */
+        /* 核心系统底层抽象与内存语义契约 */
         if (ok) {
             sh_harvest_types(&st, &types, bodies.p ? bodies.p : "");
             sh_harvest_types(&st, &types, gdecls.p ? gdecls.p : "");
         }
 
-        /* final fragment */
-        if (ok) {
-            sh_sb_puts(&frag, types.p ? types.p : "");
-            sh_sb_puts(&frag, gdecls.p ? gdecls.p : "");
-            sh_sb_puts(&frag, bodies.p ? bodies.p : "");
-            if (frag.oom || bodies.oom || gdecls.oom || types.oom) {
-                sh_fail(&st, "out of memory assembling fragment");
-                ok = false;
-            }
+        /* 直接流式输出三段内容以降低内存驻留 */
+        if (bodies.oom || gdecls.oom || types.oom) {
+            sh_fail(&st, "out of memory assembling fragment");
+            ok = false;
         }
-
+        if (st.failed) ok = false;
         if (ok) {
             char frag_path[1200];
             snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
             FILE *ff = fopen(frag_path, "wb");
             if (ff) {
-                if (frag.n > 0) fwrite(frag.p, 1, frag.n, ff);
-                fclose(ff);
+                bool wrote = (!types.n || fwrite(types.p, 1, types.n, ff) == types.n) &&
+                             (!gdecls.n || fwrite(gdecls.p, 1, gdecls.n, ff) == gdecls.n) &&
+                             (!bodies.n || fwrite(bodies.p, 1, bodies.n, ff) == bodies.n);
+                if (fclose(ff)) wrote = false;
+                if (!wrote) {
+                    sh_fail(&st, "cannot write complete shard fragment '%s'", frag_path);
+                    ok = false;
+                }
             } else {
-                sh_fail(&st, "cannot open shard fragment file '%s'", frag_path);
+                sh_fail(&st, "cannot open shard fragment file '%s' for write (errno=%d)", frag_path, errno);
                 ok = false;
             }
+        } else if (!st.failed) {
+            sh_fail(&st, "shard %d: assembling failed before write", s);
         }
 
         sh_map_free(&local);
@@ -1540,20 +1497,17 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         sh_map_free(&decl_fns); sh_map_free(&decl_globs); sh_map_free(&travel);
         sh_map_free(&st.type_done);
         st.type_done.keys = NULL; st.type_done.vals = NULL;
-        free(bodies.p); free(gdecls.p); free(types.p); free(frag.p);
+        free(bodies.p); free(gdecls.p); free(types.p);
     }
 
     sh_free_body_index(&body_idx);
-    free(ll_buf);
-    ll_buf = NULL;
+    if (body_file) fclose(body_file);
     if (tmp_ll[0]) {
         remove(tmp_ll);
         tmp_ll[0] = '\0';
     }
 
-    /* Pass 2b: emit each shard from its fragment file.
-     * At this point, the module text buffer (~150MB) and body index have been
-     * freed, freeing peak memory before LLVM parses and codegens each shard. */
+    /* 第 2b 遍：从片段文件流式发射分片，限制峰值内存占用 */
     for (int s = 0; s < nshard && !st.failed; s++) {
         char frag_path[1200];
         snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
@@ -1582,7 +1536,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
             remove(frag_path);
         }
-        /* restore every linkage change, drop partial objects, fall back */
+        /* 模块核心语义抽象与接口调用契约 */
         for (int i = 0; i < st.link_n; i++)
             LLVMSetLinkage(st.link_recs[i].glob ? st.link_recs[i].glob
                                                : st.link_recs[i].fn,
@@ -1597,12 +1551,11 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         goto cleanup_planning;
     }
 
-    /* ---- move: rename + external decl + RAUW for needs_decl members,
-     * verify the coordinator, then bulk-delete the moved bodies ---- */
+    /* 符号迁移：重命名、外部声明并执行 RAUW 批量替换 */
     {
         bool moved_ok = true;
         int rename_counter = 0;
-        /* move records for rollback */
+        /* 核心系统底层抽象与内存语义契约 */
         sh_move_rec_t *moves = (sh_move_rec_t *)calloc((size_t)nm,
                                                         sizeof(*moves));
         int nmoves = 0;
@@ -1610,11 +1563,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             if (mem[k].comp < 0) continue;
             if (sh_map_get(&st.needs_decl, mem[k].fn) < 0) continue;
             LLVMValueRef orig = mem[k].fn;
-            /* LLVMGetValueName points into LLVM's own name storage: the
-             * moment orig is renamed below, that storage is freed. Copy the
-             * name out FIRST — every later read of the stale pointer sees
-             * the new name instead (this exact UAF is what uniqued decls
-             * into X.zsh$#N.NNNN before). */
+            /* 复制 LLVMGetValueName 内部字符串以防重命名后内存失效 */
             char oname[512];
             {
                 const char *n = LLVMGetValueName(orig);
@@ -1632,12 +1581,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                                    origtmp, sizeof(origtmp))) {
                 moved_ok = false; break;
             }
-            /* No-window construction: the decl is born under a name verified
-             * free, so LLVM cannot unique it behind our back (a uniqued decl
-             * would carry X.zsa$#k.NNNN, phase C's clean-name lookup would
-             * miss it, and the reference would dangle into link). The clean
-             * name only moves onto the decl after the original provably
-             * vacates it. */
+            /* 内部辅助实现 */
             LLVMValueRef decl = LLVMAddFunction(
                 g->mod, decltmp, LLVMGlobalGetValueType(orig));
             LLVMSetFunctionCallConv(decl, LLVMGetFunctionCallConv(orig));
@@ -1669,12 +1613,10 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             if (vmsg) LLVMDisposeMessage(vmsg);
         }
         if (!moved_ok) {
-            /* rollback: point uses back at the originals, restore names and
-             * linkage, drop the decls — the module returns to its pre-shard
-             * state and the compile continues single-module */
+            /* 回滚：恢复函数使用点、原始符号名称与链接属性并删除声明 */
             for (int i = 0; i < nmoves; i++) {
                 LLVMReplaceAllUsesWith(moves[i].decl, moves[i].orig);
-                LLVMDeleteFunction(moves[i].decl); /* frees the clean name */
+                LLVMDeleteFunction(moves[i].decl); /* 核心系统底层抽象与内存语义契约 */
                 LLVMSetValueName2(moves[i].orig, moves[i].origname,
                                   strlen(moves[i].origname));
                 free(moves[i].origname);
@@ -1693,19 +1635,13 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             free(objs);
             goto cleanup_planning;
         }
-        /* success: delete originals. A body with surviving references is only
-         * deleted when the reference can be pointed at the external
-         * declaration the shard object defines; otherwise the body STAYS in
-         * the coordinator — the shard's internal copy is dead weight, while
-         * synthesizing a declaration for an internal shard copy would
-         * reference a symbol no object defines. */
+        /* 核心系统底层抽象与内存语义契约 */
         for (int k = 0; k < nm; k++) {
             if (mem[k].comp < 0) continue;
             LLVMValueRef orig = mem[k].fn;
             if (LLVMGetFirstUse(orig)) {
                 if (sh_map_get(&st.needs_decl, orig) >= 0) {
-                    /* phase A's decl carries the member's clean name and the
-                     * shard exports it */
+                    /* 阶段 A 生成干净名称的声明供分片导出 */
                     const char *on = LLVMGetValueName(orig);
                     char clean[512];
                     const char *cut = strstr(on, ".zsb$");
@@ -1736,7 +1672,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 
         char *vmsg = NULL;
             if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &vmsg)) {
-                /* bodies are gone — cannot fall back; this is a bug */
+                /* 模块核心语义抽象与接口调用契约 */
                 fprintf(stderr,
                         "error: shard: coordinator verify failed after delete: "
                         "%.160s\n", vmsg ? vmsg : "?");
@@ -1744,8 +1680,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 rc = -1;
             } else {
                 if (sh_trace_on()) {
-                    /* any leftover reference to a moved-and-renamed body
-                     * would surface as an undefined symbol at link time */
+                    /* 校验所有迁移函数的引用点，防止链接期未定义符号 */
                     for (LLVMValueRef f = LLVMGetFirstFunction(g->mod); f;
                          f = LLVMGetNextFunction(f)) {
                         if (LLVMIsDeclaration(f)) continue;

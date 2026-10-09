@@ -3,9 +3,9 @@
 #define ZAN_RT_IO_H
 
 #include <stdint.h>
-#include "rt_co.h"   /* zan_co_step_t (stackless bridge) */
+#include "rt_co.h"   /* 核心系统底层抽象与内存语义契约 */
 
-/* Readiness interest flags accepted by zan_io_wait_co(). */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_IO_READ  1
 #define ZAN_IO_WRITE 2
 
@@ -37,7 +37,7 @@ int32_t zan_io_resolve_ipv4(const char *hostname);
 int32_t zan_io_resolve_sa(const char *name, int32_t port, void *buf,
                           int32_t cap);
 
-/* Resolve every IPv4/IPv6 candidate into caller-owned fixed-size records */
+/* 底层系统交互与数据协议契约 */
 #define ZAN_IO_SA_STRIDE 32
 int32_t zan_io_resolve_all(const char *name, int32_t port, void *buf,
                            int32_t cap);
@@ -68,7 +68,7 @@ void zan_io_resolve_sa_co(const char *name, int32_t port, void *buf,
 #if defined(_WIN32)
 /* 从 Windows PCCERT_CONTEXT 读取编码的 DER 证书指针与长度 */
 const unsigned char *zan_crypto_cert_encoded(const void *cert, int *out_len);
-/* Verify the exact TLS peer DER sequence against Windows chain + SSL policy */
+/* 底层系统交互与数据协议契约 */
 int32_t zan_io_crypto_windows_ssl_policy(const unsigned char *certs, int32_t total_len,
                                        int32_t count, const char *host, int32_t host_len);
 #endif
@@ -103,18 +103,18 @@ int32_t zan_io_pump(void);
 /* 定时器感知的空闲调度桥接：在超时时间内轮询 IO 事件并驱动定时任务 */
 int32_t zan_io_pump_timeout(int64_t timeout_ms);
 
-/* ---- coroutine-facing ABI (stackful rt_sched fibers) ---- */
+/* 底层系统交互与数据协议契约 */
 
 /* 挂起当前协程直至 fd 可读：成功返回 0，失败返回 -1 */
 int64_t zan_io_wait_readable(intptr_t fd);
 
-/* Suspend the current coroutine until `fd` is writable. */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_io_wait_writable(intptr_t fd);
 
 /* 挂起当前协程直至 fd 可读或超时：可读返回 1，超时返回 0，错误返回 -1 */
 int64_t zan_io_wait_readable_timeout(intptr_t fd, int64_t timeout_ms);
 
-/* Asynchronously connect socket `fd` to `ip`:`port` (IPv4 dotted-quad) */
+/* 底层系统交互与数据协议契约 */
 int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port);
 
 /* ---- scheduler-facing ---- */
@@ -122,10 +122,10 @@ int64_t zan_io_connect(intptr_t fd, const char *ip, int32_t port);
 /* 带超时轮询底层 IO 事件：返回唤醒并投递至就绪队列的协程数 */
 int32_t zan_io_poll(int64_t timeout_ms);
 
-/* Returns non-zero if there are pending IO watchers. */
+/* 底层系统交互与数据协议契约 */
 int32_t zan_io_has_pending(void);
 
-/* Set a file descriptor to non-blocking mode. */
+/* 底层系统交互与数据协议契约 */
 int32_t zan_io_set_nonblocking(intptr_t fd);
 
 #endif /* ZAN_RT_IO_H */

@@ -14,13 +14,13 @@ typedef struct {
     char prerelease[32];  /* e.g. "alpha", "beta.1" */
 } zan_version_t;
 
-/* Parse "1.2.3" or "1.2.3-beta" into version struct */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_version_parse(const char *str, zan_version_t *out);
 
-/* Compare two versions: <0, 0, >0 */
+/* 核心系统底层抽象与内存语义契约 */
 int zan_version_compare(const zan_version_t *a, const zan_version_t *b);
 
-/* Format version to string (writes to buf, returns buf) */
+/* 底层系统交互与数据协议契约 */
 char *zan_version_format(const zan_version_t *v, char *buf, int buf_size);
 
 typedef enum {
@@ -31,25 +31,25 @@ typedef enum {
 } zan_dep_kind_t;
 
 typedef struct {
-    char name[128];         /* package name */
-    char source[512];       /* git URL or local path */
+    char name[128];         /* 核心系统底层抽象与内存语义契约 */
+    char source[512];       /* 核心系统底层抽象与内存语义契约 */
     zan_dep_kind_t kind;
     zan_version_t min_ver;
-    zan_version_t max_ver;  /* for range constraints */
+    zan_version_t max_ver;  /* 核心系统底层抽象与内存语义契约 */
 } zan_dependency_t;
 
 typedef struct {
-    char name[128];              /* package name */
-    zan_version_t version;       /* package version */
-    bool has_version;            /* manifest declared a parseable version */
-    char description[256];       /* short description */
-    char author[128];            /* author name */
-    char license[64];            /* license identifier */
-    char entry_point[256];       /* main source file */
+    char name[128];              /* 核心系统底层抽象与内存语义契约 */
+    zan_version_t version;       /* 核心系统底层抽象与内存语义契约 */
+    bool has_version;            /* 核心系统底层抽象与内存语义契约 */
+    char description[256];       /* 核心系统底层抽象与内存语义契约 */
+    char author[128];            /* 核心系统底层抽象与内存语义契约 */
+    char license[64];            /* 核心系统底层抽象与内存语义契约 */
+    char entry_point[256];       /* 核心系统底层抽象与内存语义契约 */
     zan_dependency_t *deps;      /* dependencies */
     int dep_count;
     int dep_cap;
-    char **source_dirs;          /* source directories to compile */
+    char **source_dirs;          /* 核心系统底层抽象与内存语义契约 */
     int source_dir_count;
     char plugin_id[64];          /* 商业插件包标识 */
 } zan_package_t;
@@ -57,48 +57,48 @@ typedef struct {
 typedef struct {
     char *cache_dir;             /* .zan-packages/ */
     char *lock_file;             /* zan.lock */
-    zan_package_t **resolved;    /* resolved dependency tree */
+    zan_package_t **resolved;    /* 核心系统底层抽象与内存语义契约 */
     int resolved_count;
 } zan_pkg_registry_t;
 
-/* Initialize package system for a project */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir);
 
-/* Load package manifest from zan.pkg file */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path);
 
 /* 编译时输出商业插件使用标识至 stderr */
 void zan_pkg_note_usage(const char *store, const char *package_name);
 
-/* Save package manifest to zan.pkg file */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path);
 
-/* Create a new empty package manifest */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_pkg_new(zan_package_t *pkg, const char *name, const char *version);
 
-/* Add a dependency to the manifest */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_pkg_add_dep(zan_package_t *pkg, const char *name, const char *source,
                      const char *version_constraint);
 
-/* Remove a dependency from the manifest */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_pkg_remove_dep(zan_package_t *pkg, const char *name);
 
-/* Resolve all dependencies (download + version check) */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root);
 
-/* Fetch a package from its source (git clone or copy) */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep);
 
-/* Check if a version satisfies a dependency constraint */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t *ver);
 
-/* Get list of all source files from resolved packages */
+/* 底层系统交互与数据协议契约 */
 char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count);
 
-/* Write lock file with resolved versions */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_write_lock(zan_pkg_registry_t *reg);
 
-/* Read lock file for reproducible builds */
+/* 底层系统交互与数据协议契约 */
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg);
 
 typedef enum {

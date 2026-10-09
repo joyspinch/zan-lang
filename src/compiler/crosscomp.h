@@ -1,4 +1,4 @@
-/* crosscomp.h -- Cross-compilation target support for Zan. */
+/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_CROSSCOMP_H
 #define ZAN_CROSSCOMP_H
@@ -36,32 +36,32 @@ typedef struct {
     zan_arch_t arch;
     zan_os_t os;
     zan_abi_t abi;
-    char triple[128];       /* LLVM target triple string */
-    char cpu[64];           /* target CPU (e.g. "generic", "apple-m1") */
-    char features[256];     /* target features (e.g. "+sse2,+avx") */
+    char triple[128];       /* 核心系统底层抽象与内存语义契约 */
+    char cpu[64];           /* 核心系统底层抽象与内存语义契约 */
+    char features[256];     /* 核心系统底层抽象与内存语义契约 */
     int pointer_size;       /* in bytes: 4 or 8 */
-    bool pic;               /* position-independent code */
+    bool pic;               /* 核心系统底层抽象与内存语义契约 */
 } zan_target_t;
 
-/* Parse a target triple string like "x86_64-windows-msvc" */
+/* 底层系统交互与数据协议契约 */
 bool zan_target_parse(const char *triple_str, zan_target_t *out);
 
-/* Get the host platform target */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_target_host(zan_target_t *out);
 
-/* Get LLVM triple string for target */
+/* 底层系统交互与数据协议契约 */
 const char *zan_target_llvm_triple(const zan_target_t *target);
 
-/* Get list of available targets */
+/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
-    const char *name;       /* short name: "win-x64", "linux-arm64" */
-    const char *triple;     /* LLVM triple */
-    const char *desc;       /* human description */
+    const char *name;       /* 核心系统底层抽象与内存语义契约 */
+    const char *triple;     /* 核心系统底层抽象与内存语义契约 */
+    const char *desc;       /* 核心系统底层抽象与内存语义契约 */
 } zan_target_info_t;
 
 int zan_target_list(const zan_target_info_t **out);
 
-/* Configure LLVM target machine for cross-compilation */
+/* 底层系统交互与数据协议契约 */
 void *zan_target_create_machine(const zan_target_t *target, int opt_level);
 
 #endif /* ZAN_CROSSCOMP_H */

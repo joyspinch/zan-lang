@@ -8,10 +8,10 @@
 #define ZAN_ARENA_BLOCK_SIZE (1024 * 1024) /* 1 MB blocks */
 
 struct zan_arena {
-    char *base;     /* start of current block */
-    size_t used;    /* bytes used in current block */
-    size_t cap;     /* capacity of current block */
-    struct zan_arena *prev; /* linked list of previous blocks */
+    char *base;     /* 核心系统底层抽象与内存语义契约 */
+    size_t used;    /* 核心系统底层抽象与内存语义契约 */
+    size_t cap;     /* 核心系统底层抽象与内存语义契约 */
+    struct zan_arena *prev; /* 核心系统底层抽象与内存语义契约 */
 };
 
 zan_arena_t *zan_arena_new(void);

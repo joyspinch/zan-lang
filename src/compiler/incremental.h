@@ -1,11 +1,4 @@
-/* incremental.h -- Incremental compilation support for Zan compiler.
- *
- * Tracks file modification times and content hashes to skip recompilation
- * of unchanged source files. Uses a .zan-cache directory to store:
- *   - File content hashes (SHA-256 simplified as CRC-based)
- *   - Compiled object files (.o)
- *   - Symbol dependency graph
- */
+/* 编译器代码生成与运行时系统底层调用契约 */
 
 #ifndef ZAN_INCREMENTAL_H
 #define ZAN_INCREMENTAL_H
@@ -16,76 +9,75 @@
 
 typedef struct {
     uint64_t hash;
-    uint64_t mtime;     /* last modification time */
-    uint64_t size;      /* file size */
+    uint64_t mtime;     /* 核心系统底层抽象与内存语义契约 */
+    uint64_t size;      /* 核心系统底层抽象与内存语义契约 */
 } zan_file_stamp_t;
 
 typedef struct {
-    char *source_path;         /* source .zan file */
+    char *source_path;         /* 核心系统底层抽象与内存语义契约 */
     char *object_path;         /* cached .o file */
-    zan_file_stamp_t stamp;    /* file stamp when last compiled */
-    char **deps;               /* files this depends on (imports) */
+    zan_file_stamp_t stamp;    /* 核心系统底层抽象与内存语义契约 */
+    char **deps;               /* 核心系统底层抽象与内存语义契约 */
     int dep_count;
-    bool needs_rebuild;        /* set during analysis */
+    bool needs_rebuild;        /* 核心系统底层抽象与内存语义契约 */
 } zan_compile_unit_t;
 
 typedef struct {
-    char *cache_dir;                /* .zan-cache directory path */
-    zan_compile_unit_t *units;      /* array of compilation units */
+    char *cache_dir;                /* 核心系统底层抽象与内存语义契约 */
+    zan_compile_unit_t *units;      /* 核心系统底层抽象与内存语义契约 */
     int unit_count;
     int unit_cap;
-    bool cache_valid;               /* whether cache was loaded successfully */
-    void *lock;                     /* internal mutex; workers may share one
-                                       cache across parallel compile threads */
+    bool cache_valid;               /* 核心系统底层抽象与内存语义契约 */
+    void *lock;                     /* 编译器代码生成与运行时系统底层调用契约 */
 } zan_incr_cache_t;
 
-/* Initialize incremental cache for a project directory */
+/* 底层系统交互与数据协议契约 */
 void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir);
 
-/* Load cache from .zan-cache/manifest.bin */
+/* 底层系统交互与数据协议契约 */
 bool zan_incr_load(zan_incr_cache_t *cache);
 
-/* Save cache to .zan-cache/manifest.bin */
+/* 底层系统交互与数据协议契约 */
 bool zan_incr_save(zan_incr_cache_t *cache);
 
-/* Check if a source file needs recompilation */
+/* 核心系统底层抽象与内存语义契约 */
 bool zan_incr_needs_rebuild(zan_incr_cache_t *cache, const char *source_path);
 
-/* Register a compiled unit in the cache */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_incr_register(zan_incr_cache_t *cache, const char *source_path,
                        const char *object_path, const char **deps, int dep_count);
 
-/* Get cached object file path (NULL if needs rebuild) */
+/* 模块核心语义抽象与接口调用契约 */
 const char *zan_incr_get_object(zan_incr_cache_t *cache, const char *source_path);
 
-/* Invalidate all entries depending on a given file */
+/* 底层系统交互与数据协议契约 */
 void zan_incr_invalidate(zan_incr_cache_t *cache, const char *changed_file);
 
-/* Clean cache (remove all cached objects) */
+/* 底层系统交互与数据协议契约 */
 void zan_incr_clean(zan_incr_cache_t *cache);
 
-/* Destroy cache and free memory */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_incr_destroy(zan_incr_cache_t *cache);
 
-/* Compute a fast 64-bit hash of file contents */
+/* 底层系统交互与数据协议契约 */
 uint64_t zan_hash_file(const char *path);
 
-/* Compute hash of a memory buffer */
+/* 核心系统底层抽象与内存语义契约 */
 uint64_t zan_hash_buffer(const void *data, size_t len);
 
-/* Get file modification time (0 on error) */
+/* 核心系统底层抽象与内存语义契约 */
 uint64_t zan_file_mtime(const char *path);
 
-/* Get file size (0 on error) */
+/* 核心系统底层抽象与内存语义契约 */
 uint64_t zan_file_size(const char *path);
 
 typedef struct {
-    const char **source_files;  /* array of source file paths */
+    const char **source_files;  /* 核心系统底层抽象与内存语义契约 */
     int file_count;
-    int thread_count;           /* 0 = auto-detect CPU count */
+    int thread_count;           /* 核心系统底层抽象与内存语义契约 */
     const char *output_dir;     /* where to place .o files */
-    bool incremental;           /* use incremental cache */
-    zan_incr_cache_t *cache;    /* incremental cache (may be NULL) */
+    bool incremental;           /* 核心系统底层抽象与内存语义契约 */
+    zan_incr_cache_t *cache;    /* 核心系统底层抽象与内存语义契约 */
 } zan_parallel_opts_t;
 
 typedef struct {
@@ -95,13 +87,13 @@ typedef struct {
     char *error_msg;            /* NULL on success */
 } zan_compile_result_t;
 
-/* Compile multiple files in parallel using thread pool */
+/* 底层系统交互与数据协议契约 */
 zan_compile_result_t *zan_parallel_compile(zan_parallel_opts_t *opts);
 
-/* Free results array */
+/* 核心系统底层抽象与内存语义契约 */
 void zan_parallel_results_free(zan_compile_result_t *results, int count);
 
-/* Get number of available CPU cores */
+/* 核心系统底层抽象与内存语义契约 */
 int zan_cpu_count(void);
 
 #endif /* ZAN_INCREMENTAL_H */

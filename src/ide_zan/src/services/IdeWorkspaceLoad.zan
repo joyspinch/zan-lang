@@ -1,0 +1,362 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+class IdeShellSettings {
+    int treeWidth;
+    int bottomHeight;
+    int width;
+    int height;
+    int autoRun;
+    string skin;
+    int rightWidth;
+    int opacity;
+    string wallpaper;
+    int wallpaperOpacity;
+    int partialFrames;
+    int renderBackend;
+}
+
+class IdeRecentWorkspace {
+    int kind;
+    string root;
+    string layout;
+    IdeShellSettings settings;
+}
+
+partial class ZanIDE {
+    BlockingQueue<IdeRecentWorkspace> recentWorkspaceQueue;
+    TaskCompletionSource<bool> recentWorkspaceDrained;
+    int projectOpenSequence;
+
+    void QueueWorkspacePersistence(IdeRecentWorkspace next) {
+        if (recentWorkspaceQueue == null) {
+            recentWorkspaceQueue = new BlockingQueue<IdeRecentWorkspace>();
+            recentWorkspaceDrained = new TaskCompletionSource<bool>();
+            BlockingQueue<IdeRecentWorkspace> queue = recentWorkspaceQueue;
+            TaskCompletionSource<bool> drained = recentWorkspaceDrained;
+            App host = app;
+            if (!Thread.Start(delegate () {
+                try {
+                    IdeRecentWorkspace item = queue.Dequeue();
+                    while (item != null) {
+                        try {
+                            if (item.kind == 1) {
+                                ZanIDE.WriteDockLayout(item.layout);
+                            } else if (item.kind == 2) {
+                                IdeShellSettings s = item.settings;
+                                if (s != null) {
+                                    ZanIDE.SaveSettings(s.treeWidth, s.bottomHeight, s.width, s.height,
+                                        s.autoRun, s.skin, s.rightWidth, s.opacity, s.wallpaper,
+                                        s.wallpaperOpacity, s.partialFrames, s.renderBackend);
+                                }
+                            } else {
+                                ZanIDE.WriteLastProject(item.root);
+                            }
+                        } catch (Exception error) {
+                            // 接口数据协议与执行契约。
+                            string failure = error.Message;
+                            host.Post(delegate () {
+                                if (!shuttingDown) { log.Add("> Recent project: " + failure); }
+                            });
+                        }
+                        item = queue.Dequeue();
+                    }
+                } finally {
+                    drained.TrySetResult(true);
+                }
+            })) {
+                queue.Complete();
+                drained.TrySetResult(true);
+                log.Add("> Could not start recent project writer.");
+                return;
+            }
+        }
+        recentWorkspaceQueue.Enqueue(next);
+    }
+
+    void RememberWorkspaceAsync(string path) {
+        if (path == "" || shuttingDown) { return; }
+        IdeRecentWorkspace next = new IdeRecentWorkspace();
+        next.root = path;
+        this.QueueWorkspacePersistence(next);
+    }
+
+    void RememberDockLayoutAsync(string layout) {
+        if (shuttingDown) { return; }
+        IdeRecentWorkspace next = new IdeRecentWorkspace();
+        next.kind = 1;
+        next.layout = layout;
+        this.QueueWorkspacePersistence(next);
+    }
+
+    void SaveShellSettingsAsync(IdeShellSettings settings) {
+        IdeRecentWorkspace next = new IdeRecentWorkspace();
+        next.kind = 2;
+        next.settings = settings;
+        this.QueueWorkspacePersistence(next);
+    }
+
+    static string FirstWorkspaceDocument(string workspaceRoot) {
+        string form = workspaceRoot + "/src/" + Path.GetFileName(workspaceRoot) + ".html";
+        if (File.Exists(form)) { return form; }
+        string main = workspaceRoot + "/src/main.zan";
+        if (File.Exists(main)) { return main; }
+        string lib = workspaceRoot + "/src/lib.zan";
+        if (File.Exists(lib)) { return lib; }
+        string readme = workspaceRoot + "/README.md";
+        if (File.Exists(readme)) { return readme; }
+        string first = ZanIDE.FirstSourceFile(workspaceRoot + "/src");
+        if (first == "") { first = ZanIDE.FirstSourceFile(workspaceRoot); }
+        return first;
+    }
+
+    void RequestFirstDocumentAsync(bool activate = true) {
+        string scanRoot = root;
+        int workspace = documentWorkspace;
+        int choice = documentReadSequence;
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            string path = "";
+            string failure = "";
+            try {
+                path = ZanIDE.FirstWorkspaceDocument(scanRoot);
+            } catch (Exception error) {
+                // 接口数据协议与执行契约。
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || workspace != documentWorkspace || root != scanRoot
+                    || choice != documentReadSequence) { return; }
+                if (failure != "") { log.Add("> " + failure); }
+                else if (path != "") { this.OpenDocumentAsync(path, Path.GetFileName(path), activate); }
+                app.RequestRedraw();
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void OpenProjectAsync(string picked) {
+        if (shuttingDown) { return; }
+        projectOpenSequence = projectOpenSequence + 1;
+        int sequence = projectOpenSequence;
+        int workspace = documentWorkspace;
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            string project = "";
+            bool failureSeen = false;
+            string failure = "";
+            try {
+                project = File.Exists(picked + "/zan.proj") ? picked : ZanIDE.FindProjectRoot(picked + "/x");
+            } catch (Exception error) {
+                // 接口数据协议与执行契约。
+                failureSeen = true;
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || workspace != documentWorkspace || sequence != projectOpenSequence) { return; }
+                if (failureSeen) {
+                    log.Add("> " + failure);
+                    app.RequestRedraw();
+                    return;
+                }
+                this.CancelCodeNavigationThen(delegate () {
+                    if (shuttingDown || workspace != documentWorkspace || sequence != projectOpenSequence) { return; }
+                    // 接口数据协议与执行契约。
+                    // 接口数据协议与执行契约。
+                    // 接口数据协议与执行契约。
+                    bool asProject = project != "";
+                    root = asProject ? project : picked;
+                    haveProject = asProject;
+                    tabs = new List<TabRecord>();
+                    tabs.Add(TabRecord.Create(ZanIDE.T("Start", "开始"), "", "@start"));
+                    activeTab.Set(0);
+                    lastActive = -1;
+                    this.AdoptSymbolIndex();
+                    if (asProject) {
+                        this.AdoptProjectChats();
+                        this.RememberWorkspaceAsync(root);
+                        log.Add(ZanIDE.T("> Opened project ", "> 已打开项目 ") + root);
+                    } else {
+                        log.Add(ZanIDE.T("> Opened folder ", "> 已打开文件夹 ")
+                            + root + ZanIDE.T(" (no zan.proj).", "（无 zan.proj）。"));
+                    }
+                    this.RequestFirstDocumentAsync();
+                    rescan = true;
+                    app.RequestRedraw();
+                });
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    async void DrainWorkspaceWorkAsync() {
+        if (recentWorkspaceQueue == null) { return; }
+        recentWorkspaceQueue.Complete();
+        await recentWorkspaceDrained.Task;
+        recentWorkspaceQueue.Dispose();
+        recentWorkspaceDrained.Close();
+        // 接口数据协议与执行契约。
+        // 核心契约与语义定义。
+        recentWorkspaceQueue = null;
+        recentWorkspaceDrained = null;
+    }
+
+    bool closeRequested;
+    List<string> errParseSnapshot;
+    List<string> errParseLog;
+    int errParseCount;
+
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    void BeginShutdown() {
+        if (closeRequested) { return; }
+        closeRequested = true;
+        app.RequestRedraw();
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        // 核心契约与执行状态转移规范。
+        this.CancelCodeNavigationThen(delegate () { this.FinishShutdown(); });
+    }
+
+    void FinishShutdown() {
+        shuttingDown = true;
+        this.CancelDocumentReads();
+        this.CancelDocumentWatch();
+        this.CancelSymbolWork();
+        this.CancelDesignWork();
+        this.CancelAiSessionLoads();
+        if (editor != null) { editor.DetachAnalysis(); }
+        if (formCodeEd != null) { formCodeEd.DetachAnalysis(); }
+        if (lspSess != null) {
+            lspSess.Shutdown();
+            retiredLanguageServices.Add(lspSess);
+            lspSess = null;
+        }
+        // 接口数据协议与执行契约。
+        // 接口数据协议与执行契约。
+        this.SaveAiSessions();
+        IdeShellSettings settings = new IdeShellSettings();
+        settings.treeWidth = treeW.Get();
+        settings.bottomHeight = bottomPanelH.Get();
+        settings.width = savedW;
+        settings.height = savedH;
+        settings.autoRun = autoRun ? 1 : 0;
+        settings.skin = app.SkinNameAt(app.ThemeMenuIndex());
+        settings.rightWidth = rightW.Get();
+        settings.opacity = winOpacity;
+        settings.wallpaper = app.UserWallpaperPath();
+        settings.wallpaperOpacity = app.UserWallpaperOpacity();
+        settings.partialFrames = app.PartialFrames() ? 1 : 0;
+        settings.renderBackend = app.RenderBackendMode();
+        this.SaveShellSettingsAsync(settings);
+        this.DrainAllWorkAsync();
+    }
+
+    async void DrainAllWorkAsync() {
+        await this.DrainDocumentWorkAsync();
+        await this.DrainDocumentWatchAsync();
+        await this.DrainSymbolWorkAsync();
+        await this.DrainDesignWorkAsync();
+        await this.DrainCodeNavigationAsync();
+        await this.DrainAiSessionWorkAsync();
+        await this.StopJobMonitorAsync();
+        await this.DrainWorkspaceWorkAsync();
+        App host = app;
+        host.Post(delegate () { host.StopLoop(); });
+    }
+
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    /// 接口数据协议与执行契约。
+    void RequestBuildErrors() {
+        if (log == null) { return; }
+        if (errCacheLog == log && errCacheCount == log.Count) { return; }
+        if (errParseSnapshot != null && errParseLog == log && errParseCount == log.Count) { return; }
+        List<string> snapshot = new List<string>();
+        for (int i = 0; i < log.Count; i = i + 1) { snapshot.Add(log[i]); }
+        errParseSnapshot = snapshot;
+        errParseLog = log;
+        errParseCount = log.Count;
+        App host = app;
+        List<string> source = log;
+        Task worker = Task.Run(delegate () {
+            List<DiagnosticRecord> parsed = new List<DiagnosticRecord>();
+            ZanIDE.ParseErrorList(snapshot, parsed);
+            host.Post(delegate () {
+                if (shuttingDown || log != source || log.Count != snapshot.Count) { return; }
+                errCache = parsed;
+                errCacheLog = log;
+                errCacheCount = snapshot.Count;
+                app.RequestRedraw();
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void OpenNewProjectWizardAsync() {
+        string scanRoot = root;
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            List<Tpl> catalog = new List<Tpl>();
+            List<WizardTemplate> templates = new List<WizardTemplate>();
+            List<string> categories = new List<string>();
+            string lastDir = "";
+            string failure = "";
+            try {
+                catalog = ZanIDE.BuildCatalog(scanRoot);
+                templates = ZanIDE.WizTemplates(catalog);
+                categories = ZanIDE.CatsOf(catalog);
+                lastDir = ZanIDE.ReadLastPickerDirectory(ZanIDE.ProjectsHome());
+            } catch (Exception error) {
+                // 接口数据协议与执行契约。
+                // 接口数据协议与执行契约。
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || dlg != null) { return; }
+                if (failure != "") { log.Add("> " + failure); }
+                tpls = catalog;
+                wizTpls = templates;
+                catNames = categories;
+                catSel.Set(0);
+                pSel.Set(0);
+                pSizeSeededFor = 0 - 1;
+                pNameInput.SetText("NewProject");
+                pLocInput.SetText(lastDir);
+                Wizard.notice = "";
+                this.OpenWizardHost(app, ZanIDE.T("New Project", "新建项目"), 1180, 700, 1);
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+
+    void OpenPublishWindowAsync() {
+        int workspace = documentWorkspace;
+        string projectRoot = root;
+        App host = app;
+        Task worker = Task.Run(delegate () {
+            List<PublishTargetOption> options = new List<PublishTargetOption>();
+            string failure = "";
+            try {
+                options = ZanIDE.ReadProjectPlatformOptions(projectRoot);
+            } catch (Exception error) {
+                // 接口数据协议与执行契约。
+                // 核心契约与语义定义。
+                failure = error.Message;
+            }
+            host.Post(delegate () {
+                if (shuttingDown || documentWorkspace != workspace) { return; }
+                if (failure != "") { log.Add("> " + failure); }
+                if (pubWin == null) {
+                    pubWin = PublishWindow.OpenWithOptions(app, root, options, ZanIDE.uiLang);
+                }
+                app.RequestRedraw();
+            });
+        });
+        this.TrackDocumentWorker(worker);
+    }
+}

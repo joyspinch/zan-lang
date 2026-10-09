@@ -1,7 +1,7 @@
 /* incremental.c: 增量编译与并行构建缓存管理 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
-#define _WIN32_WINNT 0x0601 /* Windows 7+: SRW locks */
+#define _WIN32_WINNT 0x0601 /* 核心系统底层抽象与内存语义契约 */
 #endif
 
 #include "incremental.h"
@@ -141,8 +141,7 @@ void zan_incr_init(zan_incr_cache_t *cache, const char *project_dir) {
 #define CACHE_MAGIC 0x5A414E43
 #define CACHE_VERSION 1
 
-/* Read one length-prefixed string into buf; false on truncation or a
- * corrupted length. */
+/* 底层系统交互与数据协议契约 */
 static bool incr_read_str(FILE *f, char *buf, size_t bufsz) {
     uint16_t slen;
     if (fread(&slen, 2, 1, f) != 1) return false;
@@ -152,8 +151,7 @@ static bool incr_read_str(FILE *f, char *buf, size_t bufsz) {
     return true;
 }
 
-/* Release a unit's strings without touching the cache array (the unit is
- * about to be discarded, not stored). */
+/* 底层系统交互与数据协议契约 */
 static void incr_unit_discard(zan_compile_unit_t *unit) {
     free(unit->source_path);
     free(unit->object_path);
@@ -385,8 +383,7 @@ const char *zan_incr_get_object(zan_incr_cache_t *cache, const char *source_path
     zan_compile_unit_t *unit = find_unit(cache, source_path);
     if (!unit) { zan_incr_unlock(cache); return NULL; }
 
-    /* Copy the stamp and object path out: find_unit pointers do not survive
-     * a concurrent register() that reallocates the units array. */
+    /* 底层系统交互与数据协议契约 */
     zan_file_stamp_t stamp = unit->stamp;
     char object_path[1024];
     snprintf(object_path, sizeof(object_path), "%s", unit->object_path);

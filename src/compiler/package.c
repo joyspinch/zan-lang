@@ -1,4 +1,4 @@
-/* package.c -- Zan package manager implementation. */
+/* 核心系统底层抽象与内存语义契约 */
 
 #include "package.h"
 #include <stdio.h>
@@ -25,7 +25,6 @@
 #endif
 
 #include "../common/host_oom.h"
-/* ---- version parsing ---- */
 
 bool zan_version_parse(const char *str, zan_version_t *out) {
     memset(out, 0, sizeof(*out));
@@ -37,8 +36,7 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
         if (n < 2) return false;
         out->patch = 0;
     }
-    /* versions are non-negative by definition; %d would otherwise accept
-     * signs that later comparisons treat inconsistently */
+    /* 内部辅助逻辑 */
     if (out->major < 0 || out->minor < 0 || out->patch < 0) return false;
     if (str[consumed] == '-') {
         const char *pre = str + consumed + 1;
@@ -50,8 +48,7 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
     return true;
 }
 
-/* Sign-normalized integer compare: subtracting two ints directly can
- * overflow (INT_MAX vs INT_MIN) and flip the result. */
+/* 内部辅助逻辑 */
 static int version_cmp_int(int x, int y) {
     return (x > y) - (x < y);
 }
@@ -79,8 +76,6 @@ char *zan_version_format(const zan_version_t *v, char *buf, int buf_size) {
     }
     return buf;
 }
-
-/* ---- manifest parsing ---- */
 
 static void skip_ws(const char **p) {
     while (**p && isspace((unsigned char)**p)) (*p)++;
@@ -251,8 +246,6 @@ bool zan_pkg_remove_dep(zan_package_t *pkg, const char *name) {
     return false;
 }
 
-/* ---- resolution ---- */
-
 static bool pkg_is_dir(const char *path);
 
 static void ensure_dir_pkg(const char *path) {
@@ -271,6 +264,8 @@ void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir) {
     ensure_dir_pkg(reg->cache_dir);
     reg->lock_file = (char *)malloc(dlen + 16);
     snprintf(reg->lock_file, dlen + 16, "%s" PATH_SEP "zan.lock", project_dir);
+    reg->resolved = (zan_package_t **)calloc(256, sizeof(zan_package_t *));
+    reg->resolved_count = 0;
 }
 
 bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t *ver) {
@@ -289,11 +284,7 @@ bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t 
     return false;
 }
 
-/* A dependency source and version are interpolated into a shell command below.
- * They originate from an untrusted zan.pkg manifest, so anything outside the
- * character set legitimately used by git remote URLs / semver strings is
- * rejected to prevent OS command injection. When '%' is present, require that
- * it is part of a valid URL percent-encoded sequence (%[0-9a-fA-F]{2}). */
+/* 内部辅助逻辑 */
 static bool pkg_token_is_shell_safe(const char *s) {
     if (!s) return true;
     for (const char *p = s; *p; p++) {
@@ -312,20 +303,14 @@ static bool pkg_token_is_shell_safe(const char *s) {
     return true;
 }
 
-/* The dependency name becomes a path segment under cache_dir (pkg_dir,
- * manifest_path), so it must be a single safe path component: the shell-safe
- * whitelist alone allows `.` and would let `../../evil` clone a repository
- * outside the cache directory. Forward declaration below: defined with the
- * installed-package store helpers. */
+/* 内部辅助逻辑 */
 static bool pkg_safe_component(const char *s);
 
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     char pkg_dir[1024];
     snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", reg->cache_dir, dep->name);
     if (pkg_is_dir(pkg_dir)) return true;
-    /* Path-traversal guard first: `..` or separators in the name would make
-     * pkg_dir escape the cache directory regardless of where the source
-     * points. */
+    /* 核心系统底层抽象与内存语义契约 */
     if (!pkg_safe_component(dep->name)) {
         fprintf(stderr,
                 "error: refusing to fetch '%s': package name must be a single "
@@ -355,11 +340,7 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     return false;
 }
 
-/* Resolve `root`'s dependency tree. `seen` carries the names already resolved
- * during this run: the resolver has no other memory of what it visited, so a
- * dependency cycle (A -> B -> A) would otherwise recurse until zanc's stack
- * is exhausted. An already-seen name is simply not re-entered -- its own deps
- * were resolved when it was first seen. */
+/* 核心系统底层抽象与内存语义契约 */
 static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                                  char (*seen)[128], int *seen_count) {
     bool all_ok = true;
@@ -379,8 +360,23 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                 char ver_buf[64]; zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
                 fprintf(stderr, "warning: package '%s' version %s may not satisfy constraint\n", dep->name, ver_buf);
             }
-            /* Propagate transitive resolution failures instead of dropping
-             * them: an unresolved sub-dependency must fail the whole resolve. */
+            if (reg->resolved && reg->resolved_count < 256) {
+                bool already_resolved = false;
+                for (int r = 0; r < reg->resolved_count; r++) {
+                    if (reg->resolved[r] && strcmp(reg->resolved[r]->name, fetched_pkg.name) == 0) {
+                        already_resolved = true;
+                        break;
+                    }
+                }
+                if (!already_resolved) {
+                    zan_package_t *rp = (zan_package_t *)calloc(1, sizeof(zan_package_t));
+                    strncpy(rp->name, fetched_pkg.name, sizeof(rp->name) - 1);
+                    rp->version = fetched_pkg.version;
+                    rp->has_version = true;
+                    reg->resolved[reg->resolved_count++] = rp;
+                }
+            }
+            /* 内部辅助逻辑 */
             if (fetched_pkg.dep_count > 0) {
                 bool seen_before = false;
                 for (int s = 0; s < *seen_count; s++) {
@@ -412,8 +408,7 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
 bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
     char seen[256][128];
     int seen_count = 0;
-    /* seed with the root itself: a transitive dep on the root package must
-     * terminate too */
+    /* 内部辅助逻辑 */
     if (root->name[0]) {
         snprintf(seen[seen_count++], 128, "%s", root->name);
     }
@@ -440,9 +435,94 @@ bool zan_pkg_write_lock(zan_pkg_registry_t *reg) {
     return ok;
 }
 
-bool zan_pkg_read_lock(zan_pkg_registry_t *reg) { (void)reg; return false; }
+static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char *ver_str) {
+    if (!name || !name[0] || !ver_str || !ver_str[0]) return false;
+    if (!pkg_safe_component(name)) {
+        fprintf(stderr, "error: unsafe package name '%s' in lock file\n", name);
+        return false;
+    }
+    zan_version_t v;
+    if (!zan_version_parse(ver_str, &v)) {
+        fprintf(stderr, "error: invalid version '%s' for package '%s' in lock file\n", ver_str, name);
+        return false;
+    }
+    if (!reg->resolved) {
+        reg->resolved = (zan_package_t **)calloc(256, sizeof(zan_package_t *));
+        reg->resolved_count = 0;
+    }
+    for (int i = 0; i < reg->resolved_count; i++) {
+        if (reg->resolved[i] && strcmp(reg->resolved[i]->name, name) == 0) {
+            /* 底层系统交互与数据协议契约 */
+            return zan_version_compare(&reg->resolved[i]->version, &v) == 0;
+        }
+    }
+    if (reg->resolved_count >= 256) {
+        fprintf(stderr, "error: lock file contains too many packages (>256)\n");
+        return false;
+    }
+    zan_package_t *pkg = (zan_package_t *)calloc(1, sizeof(zan_package_t));
+    strncpy(pkg->name, name, sizeof(pkg->name) - 1);
+    pkg->version = v;
+    pkg->has_version = true;
+    reg->resolved[reg->resolved_count++] = pkg;
+    return true;
+}
 
-/* ---- installed package stores / safe local installation ---- */
+bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
+    if (!reg || !reg->lock_file) return false;
+    FILE *f = fopen(reg->lock_file, "r");
+    if (!f) return false;
+
+    char line[1024];
+    char cur_name[128] = {0};
+    char cur_ver[64] = {0};
+    bool in_pkg = false;
+    bool ok = true;
+
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        skip_ws(&p);
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
+        if (*p == '[') {
+            if (strncmp(p, "[[package]]", 11) == 0) {
+                if (in_pkg) {
+                    if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver)) {
+                        ok = false;
+                        break;
+                    }
+                }
+                in_pkg = true;
+                cur_name[0] = 0;
+                cur_ver[0] = 0;
+            }
+            continue;
+        }
+        if (!in_pkg) continue;
+        char key[128] = {0};
+        int ki = 0;
+        while (*p && *p != '=' && !isspace((unsigned char)*p) && ki < 127) { key[ki++] = *p; p++; }
+        key[ki] = 0;
+        skip_ws(&p);
+        if (*p == '=') p++;
+        skip_ws(&p);
+        char val[256] = {0};
+        if (*p == '"') { read_qstr(&p, val, sizeof(val)); }
+        else { int vi = 0; while (*p && *p != '\n' && *p != '\r' && vi < 255) { val[vi++] = *p; p++; } val[vi] = 0; }
+
+        if (strcmp(key, "name") == 0) {
+            strncpy(cur_name, val, sizeof(cur_name) - 1);
+        } else if (strcmp(key, "version") == 0) {
+            strncpy(cur_ver, val, sizeof(cur_ver) - 1);
+        }
+    }
+    if (ok && in_pkg) {
+        if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver)) {
+            ok = false;
+        }
+    }
+    fclose(f);
+    return ok;
+}
 
 static bool pkg_safe_component(const char *s) {
     if (!s || !*s || strcmp(s, ".") == 0 || strcmp(s, "..") == 0) return false;
@@ -472,11 +552,7 @@ static bool pkg_safe_namespace_path(const char *s) {
 
 static bool pkg_is_dir(const char *path) {
 #ifdef _WIN32
-    /* namespace_path arrives with '/' separators (the auto-stdlib using-scan
-     * normalises dots to '/'), while the prefix built here uses '\'. Win32
-     * accepts '/' OR '\' consistently, but REJECTS a '\' immediately
-     * followed by a '/' ("...\stdlib\System/Scripting" → path-not-found), so
-     * normalise every separator before the attribute query. */
+    /* 内部辅助逻辑 */
     char norm[1024];
     snprintf(norm, sizeof(norm), "%s", path);
     for (char *p = norm; *p; p++)
@@ -515,12 +591,7 @@ static bool pkg_dir_in_list(const char (*out_dirs)[1024], int count, const char 
     return false;
 }
 
-/* ---- sorted directory enumeration ----
- * The OS hands out directory entries in no contracted order (NTFS sorts by
- * name, ext4 by hash), so discovery order leaked into the source join order
- * and two machines compiled identical inputs to different bytes. Every
- * enumeration that feeds source discovery iterates the name-sorted
- * snapshot this helper returns. */
+/* 内部辅助逻辑 */
 
 static int pkg_names_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
@@ -612,16 +683,16 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
         if (lstat(root, &st) != 0 || !S_ISDIR(st.st_mode) ||
             S_ISLNK(st.st_mode)) continue;
 #endif
-        /* 1. Prefer standard source package layout: <pkg>/src/<namespace_path> */
+        /* 1 */
         snprintf(cand, sizeof(cand), "%s" PATH_SEP "src" PATH_SEP "%s",
                  root, namespace_path);
         if (!pkg_is_dir(cand)) {
-            /* 2. Legacy package layout: <pkg>/stdlib/<namespace_path> */
+            /* 底层系统交互与数据协议契约 */
             snprintf(cand, sizeof(cand), "%s" PATH_SEP "stdlib" PATH_SEP "%s",
                      root, namespace_path);
         }
         if (!pkg_is_dir(cand)) {
-            /* 3. Flat package layout: <pkg>/<namespace_path> */
+            /* 底层系统交互与数据协议契约 */
             snprintf(cand, sizeof(cand), "%s" PATH_SEP "%s",
                      root, namespace_path);
         }
@@ -635,28 +706,87 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
     return count;
 }
 
-/* Walk package source roots without mapping namespace names onto directory names.
- * MVC deliberately keeps Framework/ and Modules/ in its original source tree,
- * while its declarations use e.g. ZanWeb.Ai and ZanWeb.Web. Selecting individual
- * original files avoids aliases, duplicate compilation and source-tree changes. */
+/* 内部辅助逻辑 */
 
-/* Namespace match for package source discovery: the declared namespace equals
- * the reached namespace, or — for project-package namespaces only (the caller
- * gates stdlib-rooted ones to exact matching) — lives underneath it
- * (ZanWeb.Controllers under ZanWeb), supporting hierarchical package sub-namespaces. */
-static int pkg_ns_match(const char *declared, const char *target_ns,
-                        int hierarchical) {
-    if (strcmp(declared, target_ns) == 0) return 1;
-    if (!hierarchical) return 0;
-    size_t tl = strlen(target_ns);
-    return strncmp(declared, target_ns, tl) == 0 && declared[tl] == '.';
+#define PKG_NAMESPACE_BUCKETS 1024
+
+typedef struct pkg_index_package {
+    char *store;
+    char *name;
+    struct pkg_index_package *next;
+} pkg_index_package_t;
+
+typedef struct pkg_index_source {
+    char *path;
+    pkg_index_package_t *package;
+    struct pkg_index_source *next;
+} pkg_index_source_t;
+
+typedef struct {
+    pkg_index_source_t *source;
+    int descendant;
+} pkg_namespace_source_t;
+
+typedef struct pkg_index_namespace {
+    char name[256];
+    pkg_namespace_source_t *sources;
+    int count, capacity;
+    struct pkg_index_namespace *next;
+} pkg_index_namespace_t;
+
+struct zan_pkg_source_index {
+    pkg_index_namespace_t *namespaces[PKG_NAMESPACE_BUCKETS];
+    pkg_index_package_t *packages;
+    pkg_index_source_t *sources;
+};
+
+static char *pkg_index_copy(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *copy = (char *)malloc(n);
+    memcpy(copy, s, n);
+    return copy;
 }
 
-/* Namespace-less source files (global-namespace helpers such as MySqlWire,
- * pure-function libraries merged from async/sync twins) are discovered
- * through their source-root-relative directory: separators map to dots and
- * the result must equal the reached namespace, so the file joins exactly
- * the one directory whose namespace its siblings declare. */
+static unsigned pkg_namespace_hash(const char *name, size_t len) {
+    unsigned h = 2166136261u;
+    for (size_t i = 0; i < len; i++)
+        h = (h ^ (unsigned char)name[i]) * 16777619u;
+    return h & (PKG_NAMESPACE_BUCKETS - 1);
+}
+
+static pkg_index_namespace_t *pkg_index_find_namespace(
+    const zan_pkg_source_index_t *index, const char *name, size_t len) {
+    unsigned bucket = pkg_namespace_hash(name, len);
+    for (pkg_index_namespace_t *ns = index->namespaces[bucket]; ns; ns = ns->next)
+        if (strlen(ns->name) == len && memcmp(ns->name, name, len) == 0)
+            return ns;
+    return NULL;
+}
+
+/* 底层系统交互与数据协议契约 */
+static void pkg_index_add_namespace(zan_pkg_source_index_t *index,
+                                    const char *name, size_t len,
+                                    pkg_index_source_t *source, int descendant) {
+    if (!len) return;
+    pkg_index_namespace_t *ns = pkg_index_find_namespace(index, name, len);
+    if (!ns) {
+        unsigned bucket = pkg_namespace_hash(name, len);
+        ns = (pkg_index_namespace_t *)calloc(1, sizeof(*ns));
+        memcpy(ns->name, name, len);
+        ns->name[len] = 0;
+        ns->next = index->namespaces[bucket];
+        index->namespaces[bucket] = ns;
+    }
+    if (ns->count == ns->capacity) {
+        int cap = ns->capacity ? ns->capacity * 2 : 8;
+        ns->sources = (pkg_namespace_source_t *)realloc(
+            ns->sources, (size_t)cap * sizeof(*ns->sources));
+        ns->capacity = cap;
+    }
+    ns->sources[ns->count++] = (pkg_namespace_source_t){source, descendant};
+}
+
+/* 内部辅助逻辑 */
 static void pkg_rel_dir_ns(const char *dir, const char *src_root,
                            char *out, size_t cap) {
     size_t rl = strlen(src_root);
@@ -671,16 +801,15 @@ static void pkg_rel_dir_ns(const char *dir, const char *src_root,
     out[w] = '\0';
 }
 
-static int pkg_visit_source_tree(const char *dir, const char *target_ns,
-                                 zan_pkg_namespace_probe_t probe,
-                                 zan_pkg_source_visitor_t visitor, void *context,
-                                 int depth, const char *src_root,
-                                 int hierarchical) {
-    if (depth > 64) return 0;
-    int found = 0;
+static void pkg_index_source_tree(zan_pkg_source_index_t *index,
+                                   pkg_index_package_t *package, const char *dir,
+                                   zan_pkg_namespace_probe_t probe,
+                                   int depth, const char *src_root,
+                                   int project_owned) {
+    if (depth > 64) return;
     int n = 0;
     char **names = pkg_dir_names_sorted(dir, &n);
-    if (!names) return 0;
+    if (!names) return;
     for (int i = 0; i < n; i++) {
         const char *name = names[i];
         if (!pkg_safe_component(name)) continue;
@@ -701,28 +830,30 @@ static int pkg_visit_source_tree(const char *dir, const char *target_ns,
         is_reg = S_ISREG(st.st_mode) != 0;
 #endif
         if (is_dir) {
-            found += pkg_visit_source_tree(path, target_ns, probe, visitor, context,
-                                           depth + 1, src_root, hierarchical);
+            pkg_index_source_tree(index, package, path, probe, depth + 1,
+                                   src_root, project_owned);
         } else if (is_reg) {
             size_t len = strlen(name);
             if (len < 5 || strcmp(name + len - 4, ".zan") != 0) continue;
             char declared[256] = {0};
-            int ok;
-            if (probe(path, declared, sizeof(declared)) && declared[0]) {
-                ok = pkg_ns_match(declared, target_ns, hierarchical);
-            } else {
-                char relns[256];
-                pkg_rel_dir_ns(dir, src_root, relns, sizeof(relns));
-                ok = relns[0] != '\0' && strcmp(relns, target_ns) == 0;
-            }
-            if (ok) {
-                visitor(path, context);
-                found++;
+            int has_namespace = probe(path, declared, sizeof(declared)) && declared[0];
+            if (!has_namespace)
+                pkg_rel_dir_ns(dir, src_root, declared, sizeof(declared));
+            if (!declared[0]) continue;
+            pkg_index_source_t *source = (pkg_index_source_t *)malloc(sizeof(*source));
+            source->path = pkg_index_copy(path);
+            source->package = package;
+            source->next = index->sources;
+            index->sources = source;
+            pkg_index_add_namespace(index, declared, strlen(declared), source, 0);
+            if (has_namespace && project_owned) {
+                for (size_t k = 0; declared[k]; k++)
+                    if (declared[k] == '.')
+                        pkg_index_add_namespace(index, declared, k, source, 1);
             }
         }
     }
     pkg_dir_names_free(names, n);
-    return found;
 }
 
 typedef struct {
@@ -731,9 +862,7 @@ typedef struct {
     int capacity;
 } pkg_seen_names_t;
 
-/* One package can be present in project/packages and the installed cache (or
- * in the SDK/global store). The first store wins; scanning both would compile
- * identical declarations from two different absolute paths. */
+/* 内部辅助逻辑 */
 static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
     for (int i = 0; i < seen->count; i++)
         if (strcmp(seen->names[i], name) == 0) return false;
@@ -750,15 +879,13 @@ static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
     return true;
 }
 
-static int pkg_visit_store(const char *store, const char *target_ns,
-                           zan_pkg_namespace_probe_t probe,
-                           zan_pkg_source_visitor_t visitor, void *context,
-                           pkg_seen_names_t *seen, int hierarchical) {
-    if (!pkg_is_dir(store)) return 0;
-    int found = 0;
+static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
+                             zan_pkg_namespace_probe_t probe,
+                             pkg_seen_names_t *seen, int project_owned) {
+    if (!pkg_is_dir(store)) return;
     int n = 0;
     char **names = pkg_dir_names_sorted(store, &n);
-    if (!names) return 0;
+    if (!names) return;
     for (int i = 0; i < n; i++) {
         const char *name = names[i];
         if (!pkg_safe_component(name)) continue;
@@ -782,60 +909,43 @@ static int pkg_visit_store(const char *store, const char *target_ns,
             if (!pkg_is_dir(source)) snprintf(source, sizeof(source), "%s", root);
         }
         if (!pkg_mark_seen(seen, name)) continue;
-        int hits = pkg_visit_source_tree(source, target_ns, probe, visitor, context, 0,
-                                         source, hierarchical);
-        if (hits) zan_pkg_note_usage(store, name);
-        found += hits;
+        pkg_index_package_t *package = (pkg_index_package_t *)malloc(sizeof(*package));
+        package->store = pkg_index_copy(store);
+        package->name = pkg_index_copy(name);
+        package->next = index->packages;
+        index->packages = package;
+        pkg_index_source_tree(index, package, source, probe, 0, source, project_owned);
     }
     pkg_dir_names_free(names, n);
-    return found;
 }
 
-int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
-                            zan_pkg_namespace_probe_t probe,
-                            zan_pkg_source_visitor_t visitor, void *context,
-                            int hierarchical) {
-    /* Empty project root = packages disabled (--no-packages, the generator
-     * child): user packages must not leak into that closure, because pkg
-     * files skip the live-name gate and may carry generator-magic calls
-     * (Json.Serialize, db.Insert<T>) that cannot resolve under --no-gen. */
-    if (!project_dir || !project_dir[0] ||
-        !pkg_safe_namespace_path(namespace_path) || !probe || !visitor) return 0;
-    char target_ns[256]; size_t n = strlen(namespace_path);
-    if (n >= sizeof(target_ns)) return 0;
-    for (size_t i = 0; i <= n; i++)
-        target_ns[i] = (namespace_path[i] == '/' || namespace_path[i] == '\\') ? '.' : namespace_path[i];
-    char store[1024]; int found = 0;
+zan_pkg_source_index_t *zan_pkg_source_index_create(
+    const char *project_dir, zan_pkg_namespace_probe_t probe) {
+    /* 底层系统交互与数据协议契约 */
+    if (!project_dir || !project_dir[0] || !probe) return NULL;
+    zan_pkg_source_index_t *index = (zan_pkg_source_index_t *)calloc(1, sizeof(*index));
+    char store[1024];
     pkg_seen_names_t seen = {0};
-    /* Hierarchy expansion is a project-package privilege: `using ZanWeb;`
-     * in a project that owns the ZanWeb package must reach
-     * ZanWeb.Controllers underneath it. An installed/SDK package must stay
-     * exact-match, or one ubiquitous parent `using` (System.Data beside the
-     * ORM) sweeps EVERY sibling namespace of the package into the compile --
-     * Postgres/Firebird/SqlServer included, each dragging its native driver
-     * onto the publish link line. The old stdlib_has_dir caller-side gate
-     * said "exact while stdlib owns the directory"; once a namespace family
-     * moved out of stdlib into a package the gate flipped to hierarchical
-     * for code that only ever wanted the exact namespace. */
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
-    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+    pkg_index_store(index, store, probe, &seen, 1);
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
-    found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, hierarchical);
+    pkg_index_store(index, store, probe, &seen, 1);
+    /* 底层系统交互与数据协议契约 */
     char exe_dir[1024] = {0};
 #ifdef _WIN32
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
         char *sep = strrchr(exe_dir, '\\'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s\\..\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0);
         snprintf(store, sizeof(store), "%s\\packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0);
     }
 #elif defined(__APPLE__)
     uint32_t size = sizeof(exe_dir);
     if (_NSGetExecutablePath(exe_dir, &size) == 0) {
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0);
     }
 #else
     ssize_t len = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
@@ -843,33 +953,98 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
         exe_dir[len] = 0;
         char *sep = strrchr(exe_dir, '/'); if (sep) *sep = 0;
         snprintf(store, sizeof(store), "%s/../packages", exe_dir);
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0);
     }
 #endif
     if (zan_pkg_global_store(store, sizeof(store)))
-        found += pkg_visit_store(store, target_ns, probe, visitor, context, &seen, 0);
+        pkg_index_store(index, store, probe, &seen, 0);
     for (int i = 0; i < seen.count; i++) free(seen.names[i]);
     free(seen.names);
+    return index;
+}
+
+int zan_pkg_source_index_visit(const zan_pkg_source_index_t *index,
+                                const char *namespace_path,
+                                zan_pkg_source_visitor_t visitor, void *context,
+                                int hierarchical) {
+    if (!index || !pkg_safe_namespace_path(namespace_path) || !visitor) return 0;
+    char target_ns[256];
+    size_t n = strlen(namespace_path);
+    if (n >= sizeof(target_ns)) return 0;
+    for (size_t i = 0; i <= n; i++)
+        target_ns[i] = (namespace_path[i] == '/' || namespace_path[i] == '\\') ? '.' : namespace_path[i];
+    pkg_index_namespace_t *ns = pkg_index_find_namespace(index, target_ns, n);
+    if (!ns) return 0;
+    int found = 0;
+    pkg_index_package_t *used = NULL;
+    for (int i = 0; i < ns->count; i++) {
+        const pkg_namespace_source_t *ref = &ns->sources[i];
+        if (ref->descendant && !hierarchical) continue;
+        pkg_index_package_t *package = ref->source->package;
+        if (used && used != package)
+            zan_pkg_note_usage(used->store, used->name);
+        used = package;
+        visitor(ref->source->path, context);
+        found++;
+    }
+    if (used) zan_pkg_note_usage(used->store, used->name);
     return found;
 }
 
-/* Append one package's source root to the list. Layout precedence per
- * package: src/ (standard) > stdlib/ (legacy) > the package dir itself.
- * Roots keep '/' separators throughout; pkg_is_dir normalizes them where
- * the platform needs it and every consumer accepts them. */
+void zan_pkg_source_index_destroy(zan_pkg_source_index_t *index) {
+    if (!index) return;
+    for (int i = 0; i < PKG_NAMESPACE_BUCKETS; i++) {
+        pkg_index_namespace_t *ns = index->namespaces[i];
+        while (ns) {
+            pkg_index_namespace_t *next = ns->next;
+            free(ns->sources);
+            free(ns);
+            ns = next;
+        }
+    }
+    while (index->sources) {
+        pkg_index_source_t *source = index->sources;
+        index->sources = source->next;
+        free(source->path);
+        free(source);
+    }
+    while (index->packages) {
+        pkg_index_package_t *package = index->packages;
+        index->packages = package->next;
+        free(package->store);
+        free(package->name);
+        free(package);
+    }
+    free(index);
+}
+
+int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
+                            zan_pkg_namespace_probe_t probe,
+                            zan_pkg_source_visitor_t visitor, void *context,
+                            int hierarchical) {
+    if (!pkg_safe_namespace_path(namespace_path) || !visitor ||
+        strlen(namespace_path) >= 256) return 0;
+    zan_pkg_source_index_t *index = zan_pkg_source_index_create(project_dir, probe);
+    int found = zan_pkg_source_index_visit(index, namespace_path, visitor, context,
+                                           hierarchical);
+    zan_pkg_source_index_destroy(index);
+    return found;
+}
+
+/* 底层系统交互与数据协议契约 */
 static int pkg_add_package_root(const char *store, const char *name,
                                 char (*out_roots)[1024], int count,
                                 int max_roots) {
     char root[1024], cand[1024];
     snprintf(root, sizeof(root), "%s/%s", store, name);
-    /* 1. Standard source package layout: <pkg>/src */
+    /* 底层系统交互与数据协议契约 */
     snprintf(cand, sizeof(cand), "%s/src", root);
     if (!pkg_is_dir(cand)) {
-        /* 2. Legacy package layout: <pkg>/stdlib */
+        /* 核心系统底层抽象与内存语义契约 */
         snprintf(cand, sizeof(cand), "%s/stdlib", root);
     }
     if (!pkg_is_dir(cand)) {
-        /* 3. Flat package layout: the package dir itself */
+        /* 底层系统交互与数据协议契约 */
         snprintf(cand, sizeof(cand), "%s", root);
     }
     if (!pkg_is_dir(cand) || count >= max_roots ||
@@ -957,13 +1132,13 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
         !pkg_safe_namespace_path(namespace_path) ||
         !out_dirs || max_dirs <= 0) return 0;
     char store[1024]; int count = 0;
-    /* 1. Project packages/ directory (monorepo / local packages) */
+    /* 底层系统交互与数据协议契约 */
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
     count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
-    /* 2. Project-local .zan-packages cache */
+    /* 核心系统底层抽象与内存语义契约 */
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
     count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
-    /* 3. SDK / toolchain sibling packages/ directory */
+    /* 核心系统底层抽象与内存语义契约 */
     {
         char exe_dir[1024] = {0};
 #ifdef _WIN32
@@ -998,7 +1173,7 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
         }
 #endif
     }
-    /* 4. Global installed packages */
+    /* 核心系统底层抽象与内存语义契约 */
     if (zan_pkg_global_store(store, sizeof(store)))
         count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
     return count;
@@ -1111,15 +1286,13 @@ bool zan_pkg_install_local(const char *source_dir, const char *package_name,
         snprintf(status, status_size, "ZANPKG_STATUS action=install status=invalid_manifest package=%s", package_name);
         return false;
     }
-    /* An unversioned package cannot be upgraded, pinned or audited, so the
-     * secure installer refuses it outright. */
+    /* 内部辅助逻辑 */
     if (!pkg.has_version) {
         snprintf(status, status_size, "ZANPKG_STATUS action=install status=missing_version package=%s", package_name);
         zan_pkg_destroy(&pkg);
         return false;
     }
-    /* Namespace discovery accepts src/<namespace> (preferred) or
-     * stdlib/<namespace>; require one of the two explicit source roots. */
+    /* 内部辅助逻辑 */
     char pkg_src[1024], pkg_stdlib[1024];
     snprintf(pkg_src, sizeof(pkg_src), "%s" PATH_SEP "src", source_dir);
     snprintf(pkg_stdlib, sizeof(pkg_stdlib), "%s" PATH_SEP "stdlib", source_dir);
@@ -1196,14 +1369,7 @@ void zan_pkg_registry_destroy(zan_pkg_registry_t *reg) {
     memset(reg, 0, sizeof(*reg));
 }
 
-/* ---- commercial plugin build-time usage accounting ----
- *
- * When the compiler resolves namespaces through an installed package store and
- * the hit package carries a plugin_id (a commercial plugin), emit one
- * "ZANPKG_USAGE ... action=build" line on stderr. The IDE tees build output
- * and asynchronously reports it; zanc itself never opens a socket. Signals
- * are deduped per process so one build reports a plugin once no matter how
- * many namespaces it provides. */
+/* 内部辅助逻辑 */
 
 typedef struct {
     char pkg[128];
