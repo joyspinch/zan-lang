@@ -21,17 +21,14 @@ typedef struct {
     int          frame_index;
 } zan_async_slot_t;
 
-/* One entry of the compiler-emitted guard-text intern table (see
- * zan_irgen_intern_string): the source text and the single private global
- * every identical emit reuses. */
+/* 编译器生成的保护文本驻留表项 */
 typedef struct zan_str_intern {
     char *text;
     LLVMValueRef gv;
     struct zan_str_intern *next;
 } zan_str_intern_t;
 
-/* Growth helpers for the generator's heap tables; every table that scales with
- * program size uses these. Both return false only when the allocation fails. */
+/* 代码生成器动态堆表扩容辅助原语 */
 static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
                                 int initial) {
     int ncap = *cap ? *cap * 2 : initial;
@@ -42,8 +39,7 @@ static inline bool zan_tab_grow(void **items, int *cap, size_t elem,
     return true;
 }
 
-/* Ensure `index` is addressable, zero-filling the newly added slots (tables
- * addressed by an id rather than appended to). */
+/* 确保表容量覆盖指定索引，新扩展槽位清零 */
 static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
                                   int index, int initial) {
     if (index < *cap) return true;
@@ -61,9 +57,7 @@ static inline bool zan_tab_reserve(void **items, int *cap, size_t elem,
 #define ZAN_TAB_ENSURE(tab, cnt, cap, initial) \
     ((cnt) < (cap) || zan_tab_grow((void **)&(tab), &(cap), sizeof(*(tab)), (initial)))
 
-/* Depth at which expression inference is treated as non-terminating: past it
- * the compiler reports where it gave up instead of recursing forever.
- * Matches ZAN_PARSER_MAX_BINOP_CHAIN. */
+/* 表达式推导递归深度上限（防止类型循环推导死循环） */
 #define ZAN_MAX_INFER_DEPTH 16384
 
 /* Nesting depth of try/finally regions a single function body may be inside. */
@@ -98,21 +92,17 @@ typedef struct zan_goto_label_rec {
     zan_irgen_pending_scope_t *label_owner;
 } zan_goto_label_rec_t;
 
-/* One `catch` body being emitted: the handler owns the caught exception (see the exc */
+/* catch 块异常清理上下文项：记录异常变量局部索引以供作用域展开 */
 typedef struct zan_irgen_catch_cleanup {
     LLVMValueRef exc_slot;   /* i8* slot holding the caught exception */
     LLVMValueRef owned_slot; /* i32 slot: non-zero when the handler owns it */
-    LLVMValueRef tid_slot;   /* i8* slot: its class type descriptor, used by
-                              * a bare `throw;` to rethrow with the original
-                              * dynamic type */
+    LLVMValueRef tid_slot;   /* 当前捕获异常类型描述符，供无参 throw; 原样重抛 */
 } zan_irgen_catch_cleanup_t;
 
 /* One `finally` (or `lock`) region being emitted. */
 typedef struct zan_irgen_finally_entry {
     zan_ast_node_t *body;   /* the finally block's AST */
-    LLVMValueRef monitor_obj; /* set instead of `body` by `lock (obj)`: the
-                               * alloca holding the locked object, whose
-                               * monitor every exit path must release */
+    LLVMValueRef monitor_obj; /* lock (obj) 锁对象槽位，退出时释放监视器 */
     LLVMValueRef continuation_slot; /* frame-resident pending-exit selector */
     struct zan_irgen_finally_shared *shared; /* compatible pending-exit bodies */
     int outer_armed_depth;
@@ -120,7 +110,7 @@ typedef struct zan_irgen_finally_entry {
     int outer_throw_catch_base;
     zan_irgen_pending_scope_t *pending_parent;
     zan_irgen_pending_scope_t *pending_scope;
-    bool in_try_body;       /* emitting the guarded body: a throw here is taken by this try's own handler, which runs the finally itself */
+    bool in_try_body;       /* 正在发射 try 保护块体 */
 } zan_irgen_finally_entry_t;
 
 typedef struct zan_goto_fixup {
@@ -171,13 +161,9 @@ struct zan_irgen {
     zan_symbol_t *current_type_sym;  /* type symbol for 'this' */
     zan_ast_node_t *current_fn_body; /* root AST body of the fn being compiled */
     bool current_fn_is_ctor;         /* the fn being compiled is a constructor */
-    bool current_fn_is_main;         /* the fn being compiled is program entry:
-                                      * every `return` in it leaves the program,
-                                      * so it must also release static fields */
+    bool current_fn_is_main;         /* 程序主入口函数：退出前释放静态对象 */
     bool current_fn_no_runtime;      /* [NoRuntime]: emit no ARC in this body */
-    /* >0 while emitting a lambda body: lambdas are non-capturing, so current_this
-     * is NULL inside them and a `this`/`base` reference would silently load a
-     * garbage receiver. Emitting AST_THIS_EXPR checks this to reject. */
+    /* 处于 Lambda 函数体内部：此时 current_this 为 NULL */
     int lambda_depth;
 
     /* runtime function declarations */
@@ -192,17 +178,13 @@ struct zan_irgen {
     LLVMValueRef fn_free;
     LLVMValueRef fn_strlen;
     LLVMValueRef fn_strcpy;
-    /* __zan_itoa64(i8 *buf, i64 v, i32 unsigned): decimal formatting without
-     * the printf machinery, built on first use (see get_itoa64_fn). */
+    /* 内部 64 位十进制格式化实现 */
     LLVMValueRef fn_itoa64;
     LLVMValueRef fn_strcat;
-    /* shared "" literal: a null string concatenates as empty (C#), and
-     * strlen/memcpy on NULL are UB, so concat sites coerce NULL operands to
-     * this pointer instead of branching on every operand. */
+    /* 模块共享空字符串常量字面量 */
     LLVMValueRef str_empty;
 
-    /* struct type registry (grown on demand: a class whose layout does not fit
-     * would silently lower to a non-pointer and fail LLVM verification) */
+    /* 结构体类型注册表 */
     struct zan_struct_type_entry {
         zan_symbol_t *sym;
         LLVMTypeRef llvm_type;
@@ -215,9 +197,7 @@ struct zan_irgen {
     int struct_type_count;
     int struct_type_cap;
 
-    /* per-class ARC release functions: __zan_release_<T>(i8*) releases the
-     * object's RC-managed fields when its refcount reaches zero, then frees it
-     * via zan_rt_release. Built lazily and cached by class symbol. */
+    /* 类级 ARC 字段级联释放函数表 */
     struct zan_class_release_entry {
         zan_symbol_t *sym;
         zan_type_t   *inst;  /* instantiation walked (Acc<Node>), NULL if none */
@@ -231,14 +211,12 @@ struct zan_irgen {
         zan_symbol_t *sym;
         LLVMValueRef fn;
         LLVMTypeRef fn_type;
-        /* method_decl.modifiers copied at registration: the codegen manifest
-         * needs the virtual/override/abstract fact after the frontend arena
-         * is freed (the symbol itself is arena memory). */
+        /* 方法修饰符快照，供虚表与代码清单生成 */
         uint32_t modifiers;
     } *functions;
     int function_count;
     int function_cap;
-    /* symbol -> index into `functions`, so a call site resolves its callee in O(1) */
+    /* 符号名至函数索引的 O(1) 查找映射表 */
     struct zan_fn_index_slot {
         zan_symbol_t *sym;
         int idx;
@@ -248,8 +226,7 @@ struct zan_irgen {
     /* break/continue targets */
     LLVMBasicBlockRef break_target;
     LLVMBasicBlockRef continue_target;
-    /* first body-scope local of the innermost loop: `break`/`continue`
-     * release owned locals from this index before leaving the body */
+    /* 最内层循环首个局部变量索引：break/continue 据此释放局部变量 */
     int loop_locals_base;
     /* 内部辅助实现 */
     int throw_locals_base;
@@ -257,14 +234,12 @@ struct zan_irgen {
     zan_irgen_catch_cleanup_t *catch_cleanups;
     int catch_cleanup_count;
     int catch_cleanup_cap;
-    /* catch_cleanups entries entered inside the innermost loop: `break` and
-     * `continue` leave only those */
+    /* 最内层循环内的 catch 清理项数量 */
     int loop_catch_base;
-    /* catch_cleanups entries entered inside the innermost enclosing try body:
-     * a `throw` unwinds past exactly those handlers */
+    /* 当前 try 块内的 catch 清理项数量 */
     int throw_catch_base;
 
-    /* `finally` bodies of the try statements currently being emitted, innermost last */
+    /* 当前激活的 finally 代码块栈（由内至外排布） */
     zan_irgen_finally_entry_t finallys[ZAN_MAX_FINALLY_DEPTH];
     int finally_count;
     /* finallys entered inside the innermost loop: break/continue run only those */
@@ -272,7 +247,7 @@ struct zan_irgen {
     /* Executing cleanup ancestry survives truncation of the finallys stack. */
     zan_irgen_pending_context_t pending;
 
-    /* Overflow-checking context while emitting a statement/expression: >0 inside `checked( */
+    /* 算术溢出检测嵌套深度：大于 0 时在 checked 块内发射溢出检测 */
     int irgen_checked_depth;
 
     /* try statements whose handler is currently armed, innermost last */
@@ -280,8 +255,7 @@ struct zan_irgen {
         LLVMValueRef old_top_slot; /* i32 alloca: __zan_eh_top at try entry */
     } eh_armed[ZAN_MAX_ARMED_TRY];
     int eh_armed_count;
-    /* entries belonging to the body being emitted: a nested body (lambda,
-     * async $resume) leaves the enclosing function's handlers alone */
+    /* 当前函数体拥有的作用域清理项 */
     int eh_armed_base;
     /* entries armed inside the innermost loop: break/continue leave only those */
     int eh_armed_loop_base;
@@ -289,15 +263,13 @@ struct zan_irgen {
     /* 内部辅助实现 */
     LLVMBasicBlockRef wasm_lpad_stack[ZAN_MAX_ARMED_TRY];
     int wasm_try_depth;
-    bool in_wasm_throw_op; /* inside the wasm throw emission: keep its calls
-                            * plain (a funclet must not unwind to itself) */
+    bool in_wasm_throw_op; /* WebAssembly 异常抛出中：禁止 funclet 递归展开 */
     /* cached per-module declarations (irgen_builtins.c) */
     LLVMValueRef wasm_eh_throw_fn;      /* void @__cxa_throw(ptr,ptr,ptr) */
     LLVMValueRef wasm_eh_throw_intrinsic_fn; /* @llvm.wasm.throw(i32, i8*) */
     LLVMValueRef wasm_eh_personality_fn;/* i32 @__gxx_wasm_personality_v0(...) */
     bool wasm_eh_used;                  /* program uses try or throw at all */
-    LLVMValueRef wasm_eh_state_fn;      /* __zan_eh_state_fast: never raises,
-                                         * stays a plain call even in try bodies */
+    LLVMValueRef wasm_eh_state_fn;      /* 异常状态查询原语：无抛出保证 */
 
     /* constructors */
     struct zan_ctor_entry {
@@ -312,9 +284,7 @@ struct zan_irgen {
 
     /* 内部辅助实现 */
     zan_type_t *collect_inst_ctx; /* 内部辅助实现 */
-    zan_type_t *cur_inst;   /* active instantiation while emitting a specialized
-                             * body (a class type carrying concrete type_args);
-                             * NULL when emitting erased/non-generic code. */
+    zan_type_t *cur_inst;   /* 当前泛型类单态化实例化上下文 */
     struct zan_generic_fn {
         zan_symbol_t *msym;      /* the (erased) generic method symbol */
         zan_type_t  **args;      /* concrete type args of the instantiation */
@@ -343,7 +313,7 @@ struct zan_irgen {
     int generic_inst_count;
     int generic_inst_cap;
 
-    /* method-level monomorphization: specialized copies of a *generic method* (one declaring its own <T, */
+    /* 泛型方法单态化特化实例表 */
     struct zan_method_spec {
         zan_symbol_t   *msym;      /* the generic method symbol */
         zan_symbol_t   *type_sym;  /* declaring class */
@@ -353,18 +323,14 @@ struct zan_irgen {
         int             bindc;
         LLVMValueRef    fn;
         LLVMTypeRef     fn_type;
-        /* an async specialization is a ramp/resume/frame triple:
-         * `fn` is the ramp and `async_ir` the method_body_work_t carrying its
-         * frame layout, kept until the body is emitted from the queue. */
+        /* 异步方法特化元组：ramp、resume 与协程帧类型 */
         bool            is_async;
         void           *async_ir;
     } *method_specs;
     int method_spec_count;
     int method_spec_cap;
     int method_spec_emitted;   /* queue cursor: bodies [0..emitted) are done */
-    /* active method specialization while emitting its body (else NULL): the
-     * declared type-param list and the bound concrete types, applied when
-     * resolving type refs in the body (see resolve_type_ctx). */
+    /* 正在发射的方法特化形参和实参映射 */
     zan_ast_list_t *cur_mtps;
     zan_type_t    **cur_mbind;
 
@@ -406,16 +372,11 @@ struct zan_irgen {
     LLVMValueRef g_site_live;     /* ptr to [N x i64]: live count per alloc site */
     LLVMValueRef g_site_names;    /* ptr to [N x i8*]: "file:line:col" per site */
     LLVMValueRef g_site_dtors;    /* ptr to [N x i8*]: release fn per alloc site */
-    LLVMValueRef g_site_tynames;  /* ptr to [N x i8*]: ancestor-name list ptr
-                                   * per site, for runtime `is`/`as` checks */
-    LLVMValueRef g_site_meta;     /* ptr to [N x i8*]: reflection type record
-                                   * per alloc site, so obj.GetType() answers
-                                   * the object's CONCRETE type (irgen_reflect.c) */
+    LLVMValueRef g_site_tynames;  /* 祖先类型名称数组指针，供运行时 is/as 检查 */
+    LLVMValueRef g_site_meta;     /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
     LLVMValueRef g_site_count;    /* i64: number of slots in the site tables */
     zan_symbol_t **site_syms;    /* concrete class symbol per alloc site */
-    zan_type_t   **site_inst;    /* per site: the instantiated class type, so a
-                                  * generic class's destructor releases the
-                                  * fields its type arguments really hold */
+    zan_type_t   **site_inst;    /* 分配点特化类类型：确保泛型析构释放对应字段 */
     int          *site_coll;     /* per site: 0=class, 1=List, 2=StringBuilder */
     zan_type_t   **site_coll_elem; /* per site: List element type (for release) */
     /* 内部辅助实现 */
@@ -436,25 +397,18 @@ struct zan_irgen {
     const char  *src_file;        /* source path, for runtime diagnostics */
     bool         runtime_checks;  /* insert div-by-zero (etc.) guards; default true */
     LLVMValueRef expect_false_fn; /* cached llvm */
-    LLVMValueRef soft_scratch_slot; /* per-function entry alloca holding the
-                                   * zan_rt_soft_scratch() page pointer */
+    LLVMValueRef soft_scratch_slot; /* 函数入口轻量刮擦页指针 */
     LLVMValueRef soft_scratch_fn;   /* the function soft_scratch_slot lives in */
     bool         publish_mode;    /* --publish: release build without unused bodies */
     bool         strict_runtime;  /* 内部辅助实现 */
     bool         check_leaks;     /* emit a leak report at program exit */
-    bool         arc_guard;       /* quarantine freed objects/strings and trap
-                                   * any later retain/release of them
-                                   * (use-after-free detection; leaks memory) */
+    bool         arc_guard;       /* 释放对象隔离区 (UAF 检测) */
     bool         arc_net;         /* 内部辅助实现 */
     bool         fast_codegen;    /* machine codegen at -O0 (fast turnaround) */
-    bool         emit_lib;        /* library output: keep `public` members as
-                                     exported (external-linkage) symbols */
-    bool         emit_shared;     /* shared library (not static archive): emit a
-                                     real entry point for the platform (DllMain) */
+    bool         emit_lib;        /* 库构建模式：保持 public 成员导出链接 */
+    bool         emit_shared;     /* 动态共享库模式：发射平台标准入口 (DllMain) */
 
-    /* Binding<T> lowering: synthesized per-(class,field) accessor functions
-     * (see emit_binding_value in irgen_expr.c), cached so each field pair is
-     * emitted once per module. */
+    /* Binding<T> 属性访问器函数降解缓存 */
     struct {
         zan_symbol_t *cls;
         zan_symbol_t *field;
@@ -481,9 +435,7 @@ struct zan_irgen {
     int string_literal_count;
     int string_literal_cap;
 
-    /* reflection (irgen_reflect.c): per-type static records, emitted on first
-     * use by typeof(T) / obj.GetType(). `metas` caches one record per
-     * (symbol, display name) so repeated typeof's share it. */
+    /* 分配点反射类型记录，供 GetType() 获取具体运行期类型 */
     struct {
         zan_symbol_t *sym;      /* declaring symbol; NULL for builtin types */
         const char   *name;     /* display name the record carries */
@@ -492,8 +444,7 @@ struct zan_irgen {
     int refl_meta_count;
     int refl_meta_cap;
     int refl_str_count;           /* names emitted, for unique global names */
-    bool refl_used;               /* a typeof/GetType was lowered: emit the
-                                   * per-site record table */
+    bool refl_used;               /* 标记已使用 typeof/GetType：需生成分配点记录表 */
     LLVMTypeRef  refl_field_type;   /* { i8* name, i8* typeName, i64 kind, i64 off } */
     LLVMValueRef refl_empty_str;    /* "" as an immortal Zan string */
     LLVMValueRef fn_refl_find;      /* i64 (i8* ti, i8* name) */
@@ -504,9 +455,7 @@ struct zan_irgen {
     LLVMValueRef fn_refl_obj_type;  /* i8* (i8* obj, i8* fallback) */
     /* second layer: the method / constructor tables */
     LLVMTypeRef  refl_method_type;
-    /* Method tables are shaped when the record is emitted but filled at the
-     * end of the module: a typeof(T) lowered from a top-level function runs
-     * before the class's methods are even declared. */
+    /* 反射元数据静态记录表 */
     struct {
         LLVMValueRef  gv;        /* [n x method record] global */
         LLVMTypeRef   arr_ty;
@@ -532,8 +481,7 @@ struct zan_irgen {
     /* --publish string obfuscation */
     bool obfuscate_strings;
     unsigned char obf_key[16];
-    /* Grown on demand: a fixed cap would silently leave later literals
-     * in plain text. */
+    /* 字符串混淆动态增长表 */
     struct { LLVMValueRef global; uint32_t len; } *obf_literals;
     int obf_literal_count;
     int obf_literal_cap;
@@ -558,24 +506,20 @@ struct zan_irgen {
     LLVMTypeRef  rt_co_sched_run_until_type;
     LLVMValueRef rt_co_delay;     /* void zan_co_delay(i64 ms, void* frame, step) */
     LLVMTypeRef  rt_co_delay_type;
-    /* socket async: the readiness reactor, provided by the shipped zanrt_io object (built from src/runtime/rt_io */
+    /* 套接字就绪反应堆外部驱动绑定 */
     LLVMValueRef rt_io_wait_co;   /* void zan_io_wait_co(iptr fd,i32 interest,i8* frame,step) */
     LLVMTypeRef  rt_io_wait_co_type;
     LLVMValueRef rt_io_recv_co;   /* void zan_io_recv_co(iptr fd,i8* buf,i32 len,i8* frame,step,i64* out_n) */
     LLVMTypeRef  rt_io_recv_co_type;
-    LLVMValueRef rt_io_recv_to_co; /* void zan_io_recv_to_co(iptr fd,i8* buf,i32 len,
-                                       i64 timeout_ms,i8* frame,step,i64* out_n);
-                                       deadline delivers *out_n = -1 */
+    LLVMValueRef rt_io_recv_to_co; /* zan_io_recv_to_co 外部符号：超时重叠套接字读取挂起 */
     LLVMTypeRef  rt_io_recv_to_co_type;
     LLVMValueRef rt_io_accept_co; /* void zan_io_accept_co(iptr fd,i8* frame,step,iptr* out_fd) */
     LLVMTypeRef  rt_io_accept_co_type;
     LLVMValueRef rt_io_resolve_co; /* void zan_io_resolve_co(i8* host,i8* frame,step,i32* out) */
     LLVMTypeRef  rt_io_resolve_co_type;
-    LLVMValueRef rt_io_resolve_sa_co; /* void zan_io_resolve_sa_co(i8* name,i32 port,
-                                          i8* buf,i32 cap,i8* frame,step,i32* out) */
+    LLVMValueRef rt_io_resolve_sa_co; /* zan_io_resolve_sa_co 外部符号：异步套接字地址解析挂起 */
     LLVMTypeRef  rt_io_resolve_sa_co_type;
-    LLVMValueRef rt_blocking_co;       /* void zan_rt_blocking_co(fn,argc,a0..a3,
-                                           frame,step,out) */
+    LLVMValueRef rt_blocking_co;       /* 阻塞调用协程化转派原语 */
     LLVMTypeRef  rt_blocking_co_type;
     LLVMValueRef rt_io_pump_timeout;      /* i32 zan_io_pump_timeout(i64 timeout_ms) */
     LLVMTypeRef  rt_io_pump_timeout_type;
@@ -597,31 +541,25 @@ struct zan_irgen {
     zan_goto_fixup_t *goto_fixups;
     int goto_fixup_count;
     int goto_fixup_cap;
-    /* exception class-name registry: one {descriptor address, name} pair per class that got a __zan_tid_<Class> descriptor */
+    /* 异常类类型名注册表 */
     struct {
         LLVMValueRef tid;   /* address of the __zan_tid_<Class> global */
         const char     *name;
     } *tid_names;
     int tid_name_count;
     int tid_name_cap;
-    /* the registry global + its element struct type, created on first use of
-     * the runtime name lookup; filled from tid_names right before the module
-     * is emitted */
+    /* 异常类描述符全局表及其元素类型 */
     LLVMValueRef tid_name_reg_global;
     LLVMTypeRef  tid_name_reg_ent_ty;
     /* 内部辅助实现 */
     LLVMValueRef current_async_frame;
     LLVMTypeRef  current_async_frame_type;
     LLVMValueRef current_async_resume_fn; /* the $resume fn being emitted */
-    /* body AST of that async method: current_fn_body stays NULL while a
-     * $resume is lowered, so whole-body analyses (array escape) read this. */
+    /* 正在发射的异步函数体 AST */
     zan_ast_node_t *current_async_body;
-    /* declared return type of the async method being emitted: the frame result
-     * slot is encoded/decoded against it (see coerce_to_frame_result) */
+    /* 异步方法声明返回类型，用于协程结果槽编解码 */
     zan_type_t  *current_async_ret_type;
-    /* await state-machine context, valid only when current_async_frame is set:
-     * the entry switch, the next state number, and the typed proxies for the
-     * params / named locals whose storage lives directly in the heap frame. */
+    /* await 协程状态机上下文：状态分发 switch、下一状态编号及恢复块 */
     LLVMValueRef current_async_switch;
     int          current_async_next_state;
     int          current_async_sub_base; /* frame index of first sub-task slot */
@@ -629,9 +567,7 @@ struct zan_irgen {
     int          current_async_ret_agg_slot; /* frame index of aggregate return slot (-1 if none) */
     zan_async_slot_t *current_async_slots;
     int          current_async_slot_count;
-    /* Completion is shared by returns, cancellation and the EH trampoline.
-     * The prefix of locals owns the frame fields; lexical suffix locals are
-     * released on the incoming edge before joining the result phi. */
+    /* 异步协程完成汇聚块：共享析构局部变量并发布完成状态 */
     int          current_async_frame_local_count;
     LLVMBasicBlockRef current_async_complete_bb;
     LLVMValueRef current_async_result_phi;
@@ -655,22 +591,16 @@ struct zan_irgen {
     LLVMValueRef current_async_eh_entry;
     LLVMBasicBlockRef current_async_exc_bb;
     LLVMValueRef current_async_rearm_switch;
-    /* re-arm time: per-handler block that restores the eh bookkeeping the
-     * try's entry wrote in the invocation that armed it */
+    /* 异常处理器重新布防块：恢复调用帧异常簿记 */
     LLVMValueRef current_async_rearm_init_switch;
     LLVMBasicBlockRef current_async_rearm_next_bb;
     int          current_async_handler_next;
-    /* how many per-handler slots this frame has: the number of try statements
-     * the body lowers (counted by the async scan, which sees the finally-body
-     * copies too), so `current_async_handler_next` can never run past it */
+    /* 协程帧内异常处理器槽位数 */
     int          current_async_handler_cap;
     int          current_async_try_count;    /* 0 if the async body has no lexical try statements */
-    /* per-function id of the next `foreach` emitted inside an async body;
-     * indexes its frame-resident iteration state (see AST_FOREACH_STMT) */
+    /* 协程内 foreach 编号，索引常驻帧槽 */
     int          current_async_foreach_next;
-    /* the frame of the async body being emitted owns a +1 on its receiver
-     * (the ramp retained it), so completion releases it -- see the receiver
-     * retain in declare_async_method */
+    /* 协程帧持有的接收者强引用（析构时释放） */
     int          current_async_this_owned;
     /* the receiver type that +1 belongs to */
     zan_type_t  *current_async_this_type;
@@ -679,13 +609,10 @@ struct zan_irgen {
     zan_istr_t *extern_libs;
     int extern_lib_count;
     int extern_lib_cap;
-    /* DllImport: every extern declaration with its owning lib, so a lib that
-     * cannot be resolved when cross-linking a fully static Linux binary can
-     * have its functions stubbed out (see zan_irgen_stub_extern_lib). */
+    /* DllImport 外部库符号列表（用于跨平台链接检测） */
     struct {
         zan_istr_t lib;
-        zan_istr_t name; /* symbol name; looked up at stub time because
-                            optimization may delete unused declarations */
+        zan_istr_t name; /* 外部符号名称 */
     } *extern_fns;
     int extern_fn_count;
     int extern_fn_cap;
@@ -703,26 +630,19 @@ struct zan_irgen {
     /* cross-compilation target */
     char target_triple[128];
     bool target_is_windows;   /* true when emitting for Windows (Sleep vs poll) */
-    bool target_is_macos;     /* true when emitting for Darwin: libSystem exports
-                               * the stdio streams as __std{in,out,err}p, not as
-                               * the ELF libc `stdin`/`stdout`/`stderr` globals */
-    bool target_is_wasm;      /* true for wasm32: EH lowers to WebAssembly
-                               * exception handling instead of setjmp/longjmp */
+    bool target_is_macos;     /* Darwin 平台 stdio 流导出符号适配 */
+    bool target_is_wasm;      /* WebAssembly 原生异常处理模式标记 */
     bool external_async_executor; /* target/runtime capability: omit the inline
                                    * coroutine driver and link the external
                                    * executor object instead. */
-    bool mf_native;           /* codegen-manifest policy: the target is a
-                               * native host (not wasm32/RV32 cross) — set by
-                               * zan_irgen_manifest_build from the driver. */
+    bool mf_native;           /* 本机宿主平台构建标记 (x64/arm64) */
 
     /* Cached results of prefix queries (e.g. WebView, CEF, icons, etc.) */
     char prefix_cache[32][64];
     bool prefix_cache_val[32];
     int  prefix_cache_count;
 
-    /* DWARF debug info (opt-in via `zanc -g`). When emit_debug is false these
-     * remain NULL and no debug metadata is produced (default/--publish builds
-     * are unchanged). See the di_* helpers in irgen.c. */
+    /* DWARF 调试信息构建器状态 (-g 选项激活) */
     bool             emit_debug;
     LLVMDIBuilderRef di_builder;
     LLVMMetadataRef  di_cu;
@@ -731,7 +651,7 @@ struct zan_irgen {
     uint32_t         di_cur_line;   /* source line of the statement in progress */
     uint32_t         di_cur_file;   /* its file_id (for local-variable declares) */
 
-    /* ARC: nesting depth of the statement currently being emitted, counting only control-flow bodies (if/loop/switch/try) */
+    /* ARC 语句控制流作用域嵌套深度 */
     int arc_stmt_depth;
 
     /* 内部辅助实现 */
@@ -747,9 +667,7 @@ struct zan_irgen {
     unsigned body_write_memo_count;
     zan_ast_node_t *body_write_scan_done; /* body the full scan last covered */
 
-    /* Streaming sharding state: harvest function bodies to shard text buffers
-     * as soon as they emit, immediately clearing their LLVM BasicBlocks to keep
-     * coordinator module peak memory bounded under 300~500 MB. */
+    /* 流式分片状态：发射后即时回收函数体至文本缓冲区以控制内存峰值 */
     bool enable_streaming_shard;
     int  streaming_shard_count;
     int  streaming_shard_cap;
@@ -784,17 +702,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 void zan_irgen_destroy(zan_irgen_t *g);
 void zan_irgen_release_llvm(zan_irgen_t *g);
 
-/* Intern a compiler-emitted guard text (see irgen.c): identical strings share
- * one private global instead of each emit site allocating its own .rdata. */
+/* 编译器生成的保护文本驻留符号 */
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
 
 /* 内部辅助实现 */
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw);
 
 zan_status_t zan_irgen_emit(zan_irgen_t *g, zan_ast_node_t *unit);
-/* --publish only: emit the .ctors constructor that un-scrambles string
- * literals. No-op unless g->obfuscate_strings and at least one literal was
- * recorded. Call after all codegen, before module verification. */
+/* 模块初始化解密构造函数 (.ctors) 发射 */
 void zan_irgen_emit_string_deobf(zan_irgen_t *g);
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path);
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path);
@@ -810,8 +725,7 @@ typedef struct zan_mf_fn {
     unsigned char eligible, clean_root;
     unsigned char kind;    /* ZAN_MF_* from irgen_manifest.c */
     int reg_idx;           /* index into zan_irgen.functions, or -1 */
-    /* direct-call edges: manifest indices of defined callees; external
-     * callee names and referenced global names (deduped, unsorted) */
+    /* 直接调用边图：函数清单索引及引用的全局符号 */
     int        *calls;     int call_cnt, call_cap;
     const char **exts;     int ext_cnt,  ext_cap;
     const char **globs;    int glob_cnt, glob_cap;
@@ -824,9 +738,7 @@ typedef struct zan_cg_manifest {
     int defined_count, extern_count, global_count;
 } zan_cg_manifest_t;
 
-/* `native` = true when the target is a native host (x64/arm64 Windows,
- * Linux or macOS), false for wasm32/RV32 cross targets: the allowlist only
- * admits native-host builds. */
+/* 目标是否为原生宿主架构 (x64/arm64) */
 void zan_irgen_manifest_build(zan_irgen_t *g, zan_cg_manifest_t *m,
                               bool native);
 void zan_irgen_manifest_report(zan_irgen_t *g, const zan_cg_manifest_t *m);
@@ -841,16 +753,16 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 /* Binds the target triple + data layout to the module early */
 void zan_irgen_bind_target(zan_irgen_t *g);
 
-/* Turns every bodyless [DllImport] declaration owned by `lib` into a strong definition returning -1/null/0 */
+/* DllImport 外部库符号列表（用于跨平台链接检测） */
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
-/* Removes `lib` from the extern_libs list so the linker line stops asking for it (-l<lib>) */
+/* 从外部依赖库列表中移除指定库名，消除 -l 参数 */
 int zan_irgen_drop_extern_lib(zan_irgen_t *g, const char *lib, int lib_len);
 
 /* 内部辅助实现 */
 int zan_irgen_prune_extern_libs(zan_irgen_t *g);
 
-/* True when the module defines a function whose (mangled `Class_Member`) name starts with `prefix` */
+/* 检查模块中是否存在以指定前缀开头的方法实现 */
 bool zan_irgen_defines_prefix(zan_irgen_t *g, const char *prefix);
 
 #endif /* ZAN_IRGEN_H */

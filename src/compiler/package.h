@@ -1,10 +1,4 @@
-/* package.h -- Zan package manager.
- *
- * Simple dependency resolution with source-based packages.
- * Package manifest: zan.pkg (JSON-like format)
- * Package sources: git repositories with version tags
- * Local cache: .zan-packages/
- */
+/* package.h: Zan 包管理器，支持源码包多层存储解析 */
 
 #ifndef ZAN_PACKAGE_H
 #define ZAN_PACKAGE_H
@@ -12,8 +6,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
-
-/* ---- version ---- */
 
 typedef struct {
     int major;
@@ -31,8 +23,6 @@ int zan_version_compare(const zan_version_t *a, const zan_version_t *b);
 /* Format version to string (writes to buf, returns buf) */
 char *zan_version_format(const zan_version_t *v, char *buf, int buf_size);
 
-/* ---- dependency specification ---- */
-
 typedef enum {
     ZAN_DEP_EXACT,    /* =1.2.3 */
     ZAN_DEP_COMPAT,   /* ^1.2.3 (>=1.2.3, <2.0.0) */
@@ -48,8 +38,6 @@ typedef struct {
     zan_version_t max_ver;  /* for range constraints */
 } zan_dependency_t;
 
-/* ---- package manifest (zan.pkg) ---- */
-
 typedef struct {
     char name[128];              /* package name */
     zan_version_t version;       /* package version */
@@ -63,12 +51,8 @@ typedef struct {
     int dep_cap;
     char **source_dirs;          /* source directories to compile */
     int source_dir_count;
-    char plugin_id[64];          /* commercial plugin identity written into the
-                                    package manifest; non-empty marks the
-                                    package as a protected commercial plugin */
+    char plugin_id[64];          /* 商业插件包标识 */
 } zan_package_t;
-
-/* ---- package registry/cache ---- */
 
 typedef struct {
     char *cache_dir;             /* .zan-packages/ */
@@ -83,8 +67,7 @@ void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir);
 /* Load package manifest from zan.pkg file */
 bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path);
 
-/* Emit one build-time usage signal on stderr for a commercial plugin found in
- * a package store (no-op for packages without plugin_id). */
+/* 编译时输出商业插件使用标识至 stderr */
 void zan_pkg_note_usage(const char *store, const char *package_name);
 
 /* Save package manifest to zan.pkg file */
@@ -100,8 +83,6 @@ void zan_pkg_add_dep(zan_package_t *pkg, const char *name, const char *source,
 /* Remove a dependency from the manifest */
 bool zan_pkg_remove_dep(zan_package_t *pkg, const char *name);
 
-/* ---- dependency resolution ---- */
-
 /* Resolve all dependencies (download + version check) */
 bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root);
 
@@ -114,62 +95,54 @@ bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t 
 /* Get list of all source files from resolved packages */
 char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count);
 
-/* ---- lock file ---- */
-
 /* Write lock file with resolved versions */
 bool zan_pkg_write_lock(zan_pkg_registry_t *reg);
 
 /* Read lock file for reproducible builds */
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg);
 
-/* ---- package store / marketplace client foundation ---- */
-
 typedef enum {
     ZAN_PKG_SCOPE_PROJECT,
     ZAN_PKG_SCOPE_GLOBAL
 } zan_pkg_scope_t;
 
-/* Resolve the platform global store (Windows LOCALAPPDATA, POSIX XDG/HOME). */
+/* 解析平台全局包存储路径 (Windows: LOCALAPPDATA, POSIX: XDG/HOME) */
 bool zan_pkg_global_store(char *out, size_t out_size);
 
-/* Find installed package stdlib directories containing namespace_path.
- * Project packages are searched before the user-global store. */
+/* 查找包含指定命名空间路径的已安装包目录，项目包优先于全局包 */
 int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
                            char (*out_dirs)[1024], int max_dirs);
 
-/* Enumerate every visible package's source root across all stores (project
- * packages/, .zan-packages/, toolchain-relative packages/, global store) —
- * one root per package, layout precedence src/ > stdlib/ (legacy) > flat.
- * Non-namespace assets a package owns (driver manifests, skin/icon packs)
- * are discovered by walking these roots. */
+/* 遍历所有包存储区内可见的包源码根目录 */
 int zan_pkg_all_source_roots(const char *project_dir,
                              char (*out_roots)[1024], int max_roots);
 
-/* Visit installed package files by declared namespace, regardless of their
- * physical directories. Paths refer to original sources, never copies.
- * `hierarchical` also matches namespaces underneath the target (and
- * namespace-less files through their source-relative directory); callers
- * must pass 0 for namespaces the stdlib also provides, or a ubiquitous
- * `using System;` would reach every package's System.* sources. */
+/* 按声明的命名空间访问已安装包文件（忽略物理目录结构） */
 typedef void (*zan_pkg_source_visitor_t)(const char *path, void *context);
 typedef int (*zan_pkg_namespace_probe_t)(const char *path, char *out_ns, size_t cap);
+
+/* 编译期包快照：一次性扫描存储区并缓存，保证后续查询 O(1) */
+typedef struct zan_pkg_source_index zan_pkg_source_index_t;
+zan_pkg_source_index_t *zan_pkg_source_index_create(
+    const char *project_dir, zan_pkg_namespace_probe_t probe);
+int zan_pkg_source_index_visit(const zan_pkg_source_index_t *index,
+                                const char *namespace_path,
+                                zan_pkg_source_visitor_t visitor, void *context,
+                                int hierarchical);
+void zan_pkg_source_index_destroy(zan_pkg_source_index_t *index);
+
 int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
                             zan_pkg_namespace_probe_t probe,
                             zan_pkg_source_visitor_t visitor, void *context,
                             int hierarchical);
 
-/* Secure local-directory install foundation. The source must contain a valid
- * zan.pkg whose name matches package_name. Symlinks/reparse points and unsafe
- * names are rejected; installation is staged then atomically renamed. */
+/* 本地安全目录安装基础原语：校验包内 zan.pkg 清单文件 */
 bool zan_pkg_install_local(const char *source_dir, const char *package_name,
                            zan_pkg_scope_t scope, const char *project_dir,
                            char *status, size_t status_size);
 
-/* Validate marketplace transport configuration. Remote transfer is not
- * available until an in-process HTTP/archive/signature provider is linked. */
+/* 校验插件市场传输协议与配置 */
 bool zan_pkg_api_validate(const char *api_url, char *status, size_t status_size);
-
-/* ---- cleanup ---- */
 
 void zan_pkg_destroy(zan_package_t *pkg);
 void zan_pkg_registry_destroy(zan_pkg_registry_t *reg);

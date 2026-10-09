@@ -17,12 +17,9 @@ typedef struct {
 struct zan_token {
     zan_token_kind_t kind;
     zan_loc_t loc;
-    /* Integer literal suffix encoding (TK_INT_LIT only): 0=none, 1=L/l
-     * (long), 2=U/u (uint), 3=UL/LU in either case (ulong). */
+    /* 整数字面量类型后缀编码 (0=无, 1=L, 2=U, 3=UL) */
     int lit_suffix;
-    /* Integer literal radix (TK_INT_LIT only): 2/8/10/16. Hex/binary/octal
-     * literals up to 0xFFFFFFFF type as int with two's-complement wrap
-     * (ARGB colors), decimal keeps the value-fit rule (checker). */
+    /* 整数字面量进制 (2/8/10/16) */
     unsigned char lit_radix;
     union {
         int64_t int_val;
@@ -33,8 +30,7 @@ struct zan_token {
 
 #define ZAN_MAX_INTERP_DEPTH 512
 
-/* Bracket nesting inside one interpolation hole, so that a `}` is told apart
- * from the one that closes the hole and a `:` from a conditional's colon. */
+/* 字符串插值挖洞内的括号嵌套深度，用于区分闭合大括号 */
 typedef struct {
     int brace;
     int paren;
@@ -50,17 +46,11 @@ struct zan_lexer {
     uint32_t file_id;
     zan_arena_t *arena;
     zan_diag_t *diag;
-    /* Interpolation holes currently open, innermost last. A hole can hold
-     * another $"..." with holes of its own, so the bracket counters are per
-     * hole. */
+    /* 当前打开的嵌套字符串插值洞栈 */
     int interp_depth;
     zan_interp_level_t interp_stack[ZAN_MAX_INTERP_DEPTH];
 
-    /* Arena-allocated rather than inline: the parser snapshots whole lexers
-     * into stack locals for speculative lookahead, and the 40 KB table inline
-     * overflowed the 1 MB stack at modest expression nesting. The snapshot
-     * carries `define_count`, so restoring it truncates any #define a
-     * speculative pass appended (live entries are always [0, define_count)). */
+    /* 词法分析器 arena 堆分配状态（支持语法分析器回溯快照） */
     zan_pp_define_t *defines;
     int define_count;
     int define_cap;
@@ -69,9 +59,7 @@ struct zan_lexer {
     int cond_depth;
     /* Track whether current #if group had a true branch (for #elif) */
     int cond_seen_true[ZAN_PP_MAX_COND_DEPTH];
-    /* Frames pushed past ZAN_PP_MAX_COND_DEPTH are counted here instead of
-     * writing cond_stack[MAX] (out of bounds; its address aliases cond_depth).
-     * pp_active() treats an overflow frame as inactive. */
+    /* 条件编译预处理嵌套深度溢出计数 */
     int cond_overflow;
     int at_line_start; /* 1 if next non-ws char is at start of logical line */
 };
@@ -80,7 +68,7 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag);
 zan_token_t zan_lexer_next(zan_lexer_t *lex);
 zan_token_t zan_lexer_peek(zan_lexer_t *lex);
-/* Two tokens ahead without consuming (state fully restored, like peek). */
+/* 向前预看两个词法单元（不消费 token，完全恢复词法状态） */
 zan_token_t zan_lexer_peek2(zan_lexer_t *lex);
 
 /* Preprocessor API: add a define before lexing begins */
