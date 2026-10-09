@@ -1,13 +1,4 @@
-/* definite.c -- Definite-assignment analysis.
- *
- * Flow analysis over each method body: branches are analysed independently and
- * merged by intersection (assigned after an `if` only when both arms assigned),
- * statements that cannot fall through contribute nothing to the merge, and
- * loop bodies may run zero times so their writes do not survive the loop
- * unless it cannot exit normally. Deliberately conservative, because a false
- * positive is a program that no longer compiles: bodies with goto/labels are
- * skipped entirely, lambdas mark everything they could capture as assigned,
- * and the right operand of && / || / ?? / ?: never counts as a definite write. */
+/* definite.c: 确定性赋值（Definite-Assignment）静态数据流分析 */
 
 #include <stdint.h>
 #include <string.h>
@@ -56,8 +47,7 @@ static bool da_name_eq(zan_istr_t a, zan_istr_t b) {
            memcmp(a.str, b.str, (size_t)a.len) == 0;
 }
 
-/* Innermost declaration wins, so a shadowing local is found before the outer
- * one it hides. */
+/* 内层作用域优先查找局部变量符号 */
 static int da_find(struct da_ctx *c, zan_istr_t name) {
     for (int i = c->count - 1; i >= 0; i--) {
         if (da_name_eq(c->v[i].name, name)) return i;
@@ -119,7 +109,7 @@ static void da_use(struct da_ctx *c, zan_ast_node_t *n) {
                   (int)n->ident.name.len, n->ident.name.str);
 }
 
-/* Every `out` parameter has to be written on the path leaving the method. */
+/* 校验方法退出路径上所有 out 参数是否均已赋值 */
 static void da_check_out_params(struct da_ctx *c, zan_loc_t loc) {
     for (int i = 0; i < c->count; i++) {
         bool assigned = (c->assigned.words[i / 64] & ((uint64_t)1 << (i % 64))) != 0;
@@ -179,8 +169,7 @@ static void da_call_args(struct da_ctx *c, zan_ast_list_t *args) {
     }
 }
 
-/* Operands that run conditionally: reads are checked against the state at
- * hand, writes are rolled back because the operand may not run. */
+/* 条件执行操作数：检查读取合法性，回滚写入状态（因可能未实际执行） */
 static void da_maybe(struct da_ctx *c, zan_ast_node_t *n) {
     da_state_t snap;
     da_save(c, &snap);
@@ -236,10 +225,7 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
             da_mark(c, lhs);
             return;
         }
-        /* `p.x = 1` on a struct local writes the variable rather than reading
-         * it: field-by-field initialisation is how a struct without a
-         * constructor is filled in, so the root counts as assigned instead of
-         * being flagged. */
+        /* 对结构体局部变量的字段赋值视作写入根变量，支持逐字段初始化 */
         zan_ast_node_t *root = lhs;
         while (root && root->kind == AST_MEMBER_ACCESS) root = root->member.object;
         if (root && root->kind == AST_IDENTIFIER && da_find(c, root->ident.name) >= 0) {
@@ -254,8 +240,7 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
     }
 
     case AST_BINARY:
-        /* Short-circuit operands run conditionally: whatever they assign is
-         * not definite afterwards. */
+        /* 短路运算符右操作数属于条件执行，其内部赋值不视为确定性赋值 */
         if (n->binary.op == TK_AMP_AMP || n->binary.op == TK_PIPE_PIPE ||
             n->binary.op == TK_QUESTION_QUESTION) {
             da_expr(c, n->binary.left);
@@ -328,9 +313,7 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
         da_expr(c, n->named_arg.expr);
         return;
 
-    /* member collection initializer inside an object initializer: only the
-     * element expressions run as ordinary reads (the Add() lowering happens
-     * in irgen against the new object, never against a local slot) */
+    /* 对象初始化器内的集合元素表达式按普通读取求值 */
     case AST_COLL_INIT:
         da_list(c, &n->coll_init.items);
         return;
@@ -346,8 +329,7 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
 
     case AST_LAMBDA:
     case AST_QUERY_EXPR:
-        /* The body runs somewhere this analysis cannot see and may write any
-         * captured local, so nothing it touches can be reported afterwards. */
+        /* Lambda 及查询表达式可在外部任意时机执行，将捕获变量均视作已赋值 */
         da_assign_all(c);
         return;
 
@@ -361,7 +343,7 @@ static void da_block(struct da_ctx *c, zan_ast_node_t *n) {
     for (int i = 0; i < n->block.stmts.count && !c->bail; i++) {
         da_stmt(c, n->block.stmts.items[i]);
     }
-    /* Locals leave scope with the block. */
+    /* 局部变量在块结束时离开作用域 */
     c->count = mark;
 }
 
@@ -396,8 +378,7 @@ static void da_if(struct da_ctx *c, zan_ast_node_t *n) {
     }
 }
 
-/* while / for / foreach: the body may run zero times, so only the state at
- * loop entry (intersected with every `break`) survives. */
+/* 循环体可能执行 0 次：仅循环入口状态与所有 break 路径的交集在循环后有效 */
 static void da_loop(struct da_ctx *c, zan_ast_node_t *body,
                     zan_ast_node_t *step, bool endless) {
     da_state_t entry;
@@ -419,7 +400,7 @@ static void da_loop(struct da_ctx *c, zan_ast_node_t *body,
             da_restore(c, &exit.state);
             c->reachable = true;
         } else {
-            /* `while (true)` with no break: the code after it is dead. */
+            /* 无 break 的死循环：后续代码不可达 */
             da_restore(c, &entry);
             c->reachable = false;
         }
@@ -442,8 +423,7 @@ static void da_try(struct da_ctx *c, zan_ast_node_t *n) {
     for (int i = 0; i < n->try_stmt.catches.count; i++) {
         zan_ast_node_t *cc = n->try_stmt.catches.items[i];
         if (!cc) continue;
-        /* A catch runs from anywhere in the try, so it starts from the state
-         * the try began with. */
+        /* catch 块可在 try 内任意位置触发，起始采用 try 入口状态 */
         da_restore(c, &entry);
         c->reachable = true;
         int mark = c->count;
@@ -471,8 +451,7 @@ static void da_try(struct da_ctx *c, zan_ast_node_t *n) {
     c->reachable = any;
 
     if (n->try_stmt.finally_body) {
-        /* The finally block runs on every path, so its writes are definite --
-         * even when the protected code left the method. */
+        /* finally 块在所有分支上必然执行，其赋值属于确定性赋值 */
         bool saved = c->reachable;
         c->reachable = true;
         da_stmt(c, n->try_stmt.finally_body);
