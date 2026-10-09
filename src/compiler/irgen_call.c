@@ -481,7 +481,7 @@ static LLVMValueRef emit_string_copy_range(zan_irgen_t *g,
     return buf;
 }
 
-/* True when `n` (a lambda body) contains a `return <expr>;` anywhere below it */
+/* 检查 Lambda 函数体内是否包含显式带值返回 (return <expr>;) */
 static bool lambda_body_has_value_return(zan_ast_node_t *n) {
     if (!n) return false;
     switch (n->kind) {
@@ -1820,7 +1820,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
                         LLVMValueRef parsed;
                         if (ak == LLVMPointerTypeKind) {
-                            /* string -> strtoll(s, NULL, 10): full signed 64-bit (atoi's i32 would truncate) */
+                            /* 字符串转 64 位有符号整数 (strtoll 规避 atoi 的 32 位截断) */
                             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                             LLVMTypeRef i8pp = LLVMPointerType(i8ptr, 0);
                             LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
@@ -1878,8 +1878,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                         st->element_type->kind == TYPE_ULONG);
                             return emit_to_cstr_u(g, arg, uns ? 1 : 0);
                         }
-                        /* 40 bytes fits the longest shortest-round-trip
-                         * double. */
+                        /* 双精度浮点数最短往返格式化缓冲区 (40 字节容量) */
                         LLVMValueRef buf_size = LLVMConstInt(i64, 40, 0);
                         LLVMValueRef buf = emit_string_alloc_rc(g, buf_size);
                         LLVMTypeKind atk = LLVMGetTypeKind(LLVMTypeOf(arg));
@@ -1990,7 +1989,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     memcpy_fn, mcargs, 3, "");
                 LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &slen, 1, "endp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
-                /* the slice was cut inside a NUL-free range, so `slen` is the result's own length */
+                /* 无   范围内的切片：slen 为切片结果字符串长度 */
                 emit_string_len_set(g, buf, slen);
                 LLVMBuildBr(g->builder, bb_join);
 
@@ -2451,7 +2450,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                                     g->ctx, fn, "em.hit");
                                 LLVMBuildCondBr(g->builder, hit, hitbbs[i],
                                                 miss);
-                                /* the literal is materialized inside its hit block so the phi incoming dominates */
+                                /* 字面量在对应分支基本块内具化以保证支配 PHI 节点输入 */
                                 LLVMPositionBuilderAtEnd(g->builder, hitbbs[i]);
                                 lits[i] = emit_string_literal_rc(g,
                                     mems[i]->name);
@@ -5095,7 +5094,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
-        /* bare function name call: Compute(21) → look up in current class then global */
+        /* 裸名函数调用：优先查找当前类实例/静态方法，未匹配则查找全局函数 */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER) {
             zan_istr_t fn_name = expr->call.callee->ident.name;
 

@@ -1706,7 +1706,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                     conv_ret = true;
                 }
             }
-            /* ARC: hand the caller an owned (+1) reference, then release our owning locals */
+            /* ARC 返回契约：向调用方移交 +1 强引用所有权，随后释放本作用域局部变量 */
             zan_type_t *ret_type = concretize(g,
                 infer_expr_type(g, stmt->ret.value, locals));
             if (conv_ret) ret_type = g->current_fn_zan_ret_type;
@@ -3604,7 +3604,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                         /* 内部辅助实现 */
                         emit_rc_retain_for_type(g, tt, vail);
                     zan_store_fit(g, LLVMConstInt(i32t, 1, 0), owned_g);
-                    /* record the thrown class's type descriptor so catch clauses can dispatch by type */
+                    /* 记录抛出异常类的类型描述符，供 catch 子句按动态类型分发 */
                     if (tt->kind == TYPE_CLASS && tt->sym) {
                         LLVMValueRef tid = get_class_tid_global(g, tt->sym);
                         zan_store_fit(g,

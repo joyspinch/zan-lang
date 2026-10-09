@@ -850,7 +850,7 @@ static LLVMValueRef get_dict_set_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* Handler-stack and unwind-stack storage: one independent state block per thread */
+/* 异常展开栈与处理器栈存储：每线程独立状态块 */
 
 /* Fields of the per-thread state block. */
 enum {
@@ -2007,7 +2007,7 @@ static LLVMValueRef get_eh_tid_name_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntEQ, c, LLVMConstNull(i8ptr), "cnull"),
         no, ent);
     LLVMPositionBuilderAtEnd(g->builder, ent);
-    /* for each registry entry, compare its tid against the current chain link; entry */
+    /* 遍历异常注册表，比对类型标识与当前继承链节点 */
     LLVMTypeRef ent_ty = LLVMStructTypeInContext(g->ctx,
         (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
     LLVMTypeRef reg_ty = LLVMArrayType(ent_ty, 0);
@@ -2546,7 +2546,7 @@ static LLVMValueRef get_static_field_global(zan_irgen_t *g, zan_symbol_t *class_
                          fsym->parent->kind == SYM_STRUCT)) {
         class_sym = fsym->parent;
     }
-    /* A static of a generic class is per closed instantiation (C# rules): Stat<int> */
+    /* 泛型类的静态字段按闭合特化类型独立隔离 (如 Stat<int> 与 Stat<string> 拥有独立静态槽) */
     if (!inst && g->cur_inst && g->cur_inst->sym == class_sym) inst = g->cur_inst;
     char suffix[256];
     suffix[0] = '\0';
