@@ -86,6 +86,9 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   - **协程帧单例子任务槽位复用（2026-10-09 落地）**：
     原先编译器在 `declare_async_method` 中计算协程帧结构体时，按 `w->sub_base + w->await_count` 为每一个 await 挂起点分配一个独立的 `i8*` 子任务句柄槽位，导致包含数十甚至上百个 await 的方法堆帧字段数 $O(N)$ 线性暴涨，结构体膨胀上千字节。
     正确定式：一个协程在任意时刻至多挂起在 1 个子任务上，且在 `rk` 恢复块消费子任务结果并 `zan_emit_frame_free` 后才可能进入下一个 await。因此整个协程帧只需分配至多 1 个共享单例子任务槽位（`w->await_count > 0 ? 1 : 0`），所有 await 点统一读写 `g->current_async_sub_base`。帧类型字段数与内存开销从 $O(N)$ 彻底收敛为 $O(1)$。
+  - **子协程异常传播块单例共享（`co.sub_rethrow`，2026-10-09 落地）**：
+    原先每个 await 挂起点在 `cont_bb` 中调用 `emit_async_check_sub_exc` 时，均就地内联生成 `sub.rethrow` 基本块，重复发射读取 `sub.exc.tid`、`sub.exc.own`，写 3 个全局 EH 变量，并调用 `zan_emit_frame_free` 与 `get_async_rethrow_bb`。这导致 N 个 await 点生成 N 个同构异常转移基本块与数十条重复指令。
+    正确定式：在同一个 `$resume` 方法中，惰性分配一个共享的 `co.sub_rethrow` 基本块，头部放置 `phi_sub` 与 `phi_ev` 两个 PHI 节点收集异常来源；各个 await 点检测到 `sub.exc != NULL` 时直接分支到该共享块。全方法只需 1 组 GEP/Store/FrameFree 展开，消除 $O(N)$ 个冗余异常处理块。
 
 - **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
   在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。

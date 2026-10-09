@@ -1,12 +1,8 @@
-/* irgen_async.c -- async/await CPS lowering, await A-normal-form normalization and
- * the rc-element array escape analysis.
+/* irgen_async.c -- async/await CPS lowering, await A-normal-form normalization
+ * and the rc-element array escape analysis.
  *
- * Part of the irgen translation unit: this file is #include'd by irgen.c
- * (in a fixed order) and must not be compiled standalone. Splitting keeps
- * the single-TU static linkage while keeping each concern in its own file.
+ * #include'd by irgen.c in a fixed order; must not be compiled standalone.
  */
-
-/* ---- async/await CPS lowering helpers ---- */
 
 /* Does `t` fill the frame result slot with zeros rather than a sign bit? The
  * slot is 64 bits wide, so a narrower value is extended into it and truncated
@@ -29,10 +25,9 @@ static bool type_is_unsigned_scalar(zan_type_t *t) {
 
 /* Encode a completed coroutine's return value into the 64-bit frame result
  * slot, using the callee's declared return type `ty` (may be NULL when it is
- * not known). `coerce_from_frame_result` is the exact inverse: the pair is what
- * makes `await` give back the value the coroutine returned rather than the
- * bits that happened to fit an i64, for a narrow (`short`), unsigned (`uint`)
- * or 32-bit floating (`float`) type -- and for `int` once it is 32 bits (A0). */
+ * not known). `coerce_from_frame_result` is the exact inverse: the pair is
+ * what makes `await` give back the value the coroutine returned rather than
+ * the bits that happened to fit an i64. */
 static LLVMValueRef coerce_to_frame_result(zan_irgen_t *g, LLVMValueRef v,
                                            zan_type_t *ty) {
     if (!v) return NULL;
@@ -513,9 +508,10 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
     }
     emit_async_eh_unarm(g);
 
-    /* A32-4: race-free completion handshake via atomic exchange with sentinel (1).
-     * If an awaiter was already registered (old_aw > 1), ready it. If no awaiter
-     * was registered or it was already marked done (old_aw <= 1), do nothing. */
+    /* Race-free completion handshake via atomic exchange with sentinel (1).
+     * If an awaiter was already registered (old_aw > 1), ready it. If no
+     * awaiter was registered or it was already marked done (old_aw <= 1), do
+     * nothing. */
     LLVMTypeRef ptr_int_ty = g->target_is_wasm ? i32 : i64;
     LLVMValueRef aw_ptr = LLVMBuildStructGEP2(g->builder, ft, frame,
         ASYNC_FRAME_AWAITER, "fr.awaiter");
@@ -546,10 +542,7 @@ static void emit_async_complete_epilogue(zan_irgen_t *g, local_scope_t *locals) 
 
 /* Declare one of the runtime's live-frame registry entry points
  * (zan_co_live_add / _del / _has, rt_colive.c), creating the declaration once
- * per module. The registry replaced a compiler-emitted intrusive list rooted in
- * a global: unlinking walked the list (O(live coroutines) per completion) and,
- * with the multi-worker driver, two OS threads splicing it concurrently
- * corrupted it -- a crash inside the emitted unlink helper. */
+ * per module. */
 static LLVMValueRef get_co_live_fn(zan_irgen_t *g, const char *name,
                                    bool returns_i32, LLVMTypeRef *out_ty) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -639,14 +632,13 @@ static LLVMValueRef get_co_untrack_fn(zan_irgen_t *g) {
 
 /* Return the module's `__zan_co_cancel(i8*)`, creating it once.
  *
- * Cancellation is cooperative and never touches the scheduler: it only sets the
+ * Cancellation is cooperative and never touches the scheduler: it sets the
  * CANCEL flag on the target frame and, following the CHILD links, on the
- * coroutines it is transitively suspended on. Each of those frames observes the
- * flag at its next state block and completes early (see
- * emit_async_cancel_check), so every frame still finishes through the normal
- * completion protocol -- its awaiter is woken, its sub-frame is consumed and
- * freed, and nothing is resumed twice. The cost is that a coroutine parked on a
- * timer or socket wait is only cancelled once that wait completes.
+ * coroutines it is transitively suspended on. Each frame observes the flag at
+ * its next state block and completes early (see emit_async_cancel_check), so
+ * every frame still finishes through the normal completion protocol. The cost
+ * is that a coroutine parked on a timer or socket wait is only cancelled once
+ * that wait completes.
  *
  * The handle comes from Task.Spawn and may name a frame the reaper has already
  * freed, so the root handle is looked up in the runtime's live-frame registry
@@ -680,7 +672,6 @@ static LLVMValueRef get_co_cancel_fn(zan_irgen_t *g) {
         zan_icmp(g->builder, LLVMIntNE, live, LLVMConstInt(i32, 0, 0), "cc.islive"),
         head_bb, ret_bb);
 
-    /* while (cur != null) { cur->cancel = 1; cur = cur->child; } */
     LLVMPositionBuilderAtEnd(g->builder, head_bb);
     LLVMValueRef f = LLVMBuildLoad2(g->builder, i8ptr, cur, "cc.f");
     LLVMValueRef nn = zan_icmp(g->builder, LLVMIntNE, f, LLVMConstNull(i8ptr), "cc.nn");
@@ -999,7 +990,8 @@ static bool emit_async_preempt_site(zan_irgen_t *g, LLVMBasicBlockRef resume_tar
 
 /* ---- await A-normal-form (ANF) normalization ----
  *
- * S3 keeps a value alive across a suspension only when it is a named scalar
+ * The state machine keeps a value alive across a suspension only when it is a
+ * named scalar
  * local (those live directly in the heap frame across every state).
  * An intermediate SSA temp produced *before* an await and consumed *after* it
  * does not survive: the resume-k block is entered from the entry switch, so a
@@ -1564,9 +1556,7 @@ typedef struct {
     /* The declaration (or foreach/catch) node this slot was scanned from.
      * Every declaration owns its own slot and binding finds it by NODE, so
      * same-named shadowing declarations never alias each other's storage
-     * (A31x: name-dedup let a `string k` declared after a `foreach (k ...)`
-     * bind through the loop's borrowed-element slot, and its first
-     * capture-release freed the collection's internal key). */
+     * (name-dedup did exactly that). */
     zan_ast_node_t *decl;
     int role;
 } async_local_t;
@@ -1795,10 +1785,8 @@ static int async_count_transfers(zan_ast_node_t *st) {
     }
 }
 
-/* Walk statements to collect named scalar locals (which must live in the frame)
- * and count await points anywhere in the body. */
-/* A43-B22①: the foreach iteration protocol (GetEnumerator/MoveNext/Current).
- * These predicates are shared by the async frame scan and the AST_FOREACH_STMT
+/* The foreach iteration protocol (GetEnumerator/MoveNext/Current). These
+ * predicates are shared by the async frame scan and the AST_FOREACH_STMT
  * emitter so both passes agree on which loops carry a $fe.e enumerator slot.
  * `Current` may be a 0-arg method or a property with a custom getter; the
  * enumerator must be a concrete class (an interface enumerator would need
@@ -1855,11 +1843,9 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
         break;
     case AST_VAR_DECL: {
         /* `var x = e` must reach the frame just like `T x = e`: infer its type
-         * here with the same inference the emitter uses. Skipping inferred
-         * declarations left them stack-only, so their value was garbage after
-         * any suspension. */
-        /* resolved in the specialization's context, so a `T`/`U` local in a
-         * monomorphized async body gets its concrete frame slot */
+         * here with the same inference the emitter uses, resolved in the
+         * specialization's context so a `T`/`U` local in a monomorphized
+         * async body gets its concrete frame slot. */
         zan_type_t *t = st->var_decl.type
             ? resolve_type_ctx(s->g, st->var_decl.type)
             : NULL;
@@ -2012,13 +1998,13 @@ static void async_scan_stmt(async_scan_t *s, zan_ast_node_t *st) {
 
 static void emit_eh_hook_call(zan_irgen_t *g, const char *name);
 
-/* ---- async exception propagation -----------------------------------------
- * A coroutine cannot longjmp into the frame that awaits it: that frame's
- * invocation returned to the scheduler at the suspension. Instead each
- * $resume invocation arms one trampoline handler around its whole body; an
- * exception that escapes the body lands there, is parked in the frame's
- * exception slots, and completes the coroutine. The awaiting frame finds it
- * at its resume point and re-throws it in its own (live) invocation. */
+/* Async exception propagation: a coroutine cannot longjmp into the frame that
+ * awaits it -- that frame's invocation returned to the scheduler at the
+ * suspension. Instead each $resume invocation arms one trampoline handler
+ * around its whole body; an exception that escapes the body lands there, is
+ * parked in the frame's exception slots, and completes the coroutine. The
+ * awaiting frame finds it at its resume point and re-throws it in its own
+ * (live) invocation. */
 
 /* Arm the trampoline plus every handler recorded in the frame, then leave the
  * builder in the block where the state dispatch belongs. Emitted at the top of
@@ -2043,9 +2029,8 @@ static void emit_async_eh_prologue(zan_irgen_t *g) {
 
     if (g->current_async_try_count == 0) {
         /* Trampoline only: no inner try statements exist in this coroutine, so
-         * no handlers will ever be re-armed upon resumption. Branching took directly
-         * to co.dispatch eliminates 5 unreachable basic blocks, 2 frame allocas,
-         * and the rearm switches. */
+         * no handlers will ever be re-armed upon resumption. Branch directly
+         * to co.dispatch, skipping the rearm machinery entirely. */
         LLVMValueRef t = LLVMBuildLoad2(g->builder, i32, top_g, "eh.t");
         LLVMValueRef t1 = zan_add(g->builder, t, LLVMConstInt(i32, 1, 0), "eh.t1");
         LLVMBuildStore(g->builder, t1, top_g);
@@ -2364,6 +2349,57 @@ static LLVMBasicBlockRef get_async_rethrow_bb(zan_irgen_t *g) {
     return bb;
 }
 
+/* Shared sub-coroutine exception transfer block within a single $resume invocation.
+ * Awaited coroutines that threw branch here with their (sub, exc) values; the
+ * shared block reads TID/OWNED, commits to EH globals, frees the sub-frame,
+ * and enters the invocation's rethrow / EH handler. This turns O(N) inline
+ * exception handling blocks into O(1). */
+static LLVMBasicBlockRef get_async_sub_rethrow_bb(zan_irgen_t *g) {
+    if (!g->current_async_resume_fn) return NULL;
+    if (g->current_async_sub_rethrow_bb) return g->current_async_sub_rethrow_bb;
+
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef hdr = g->co_header_type;
+    LLVMValueRef top_g, bufs_g, exc_g;
+    get_eh_globals(g, &top_g, &bufs_g, &exc_g);
+
+    LLVMBasicBlockRef here = LLVMGetInsertBlock(g->builder);
+    LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
+        g->current_async_resume_fn, "co.sub_rethrow");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+
+    LLVMValueRef phi_sub = LLVMBuildPhi(g->builder, i8ptr, "sub.phi");
+    LLVMValueRef phi_ev  = LLVMBuildPhi(g->builder, i8ptr, "ev.phi");
+    g->current_async_sub_rethrow_phi_sub = phi_sub;
+    g->current_async_sub_rethrow_phi_ev  = phi_ev;
+
+    LLVMValueRef tp = LLVMBuildStructGEP2(g->builder, hdr, phi_sub, ASYNC_FRAME_EXC_TID, "sub.exc.tid.p");
+    LLVMValueRef tv = LLVMBuildLoad2(g->builder, i8ptr, tp, "sub.exc.tid");
+    LLVMValueRef op = LLVMBuildStructGEP2(g->builder, hdr, phi_sub, ASYNC_FRAME_EXC_OWNED, "sub.exc.own.p");
+    LLVMValueRef ov = LLVMBuildLoad2(g->builder, i32, op, "sub.exc.own");
+
+    LLVMBuildStore(g->builder, phi_ev, exc_g);
+    LLVMBuildStore(g->builder, tv, get_eh_exc_tid_global(g));
+    LLVMBuildStore(g->builder, ov, get_eh_exc_owned_global(g));
+
+    /* the sub-frame is dead once its exception has been taken over */
+    zan_emit_frame_free(g, phi_sub);
+
+    LLVMBasicBlockRef rethrow_bb = get_async_rethrow_bb(g);
+    if (rethrow_bb) {
+        LLVMBuildBr(g->builder, rethrow_bb);
+    } else {
+        emit_eh_rethrow_current(g);
+        if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
+            LLVMBuildUnreachable(g->builder);
+    }
+
+    if (here) LLVMPositionBuilderAtEnd(g->builder, here);
+    g->current_async_sub_rethrow_bb = bb;
+    return bb;
+}
+
 /* At an await resume point: if the awaited coroutine completed by throwing,
  * move its exception back into the globals and re-throw it here, inside a live
  * invocation of this frame. `sub` is the (still owned) sub-frame handle.
@@ -2386,8 +2422,22 @@ static void emit_async_check_sub_exc(zan_irgen_t *g, LLVMValueRef sub,
     LLVMValueRef ev = LLVMBuildLoad2(g->builder, i8ptr, ep, "sub.exc");
     LLVMValueRef threw = zan_icmp(g->builder, LLVMIntNE, ev,
         LLVMConstNull(i8ptr), "sub.threw");
-    LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
+
+    LLVMBasicBlockRef cur_bb = LLVMGetInsertBlock(g->builder);
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.ok");
+
+    if (!tmp_mark && g->current_async_resume_fn) {
+        /* In an async $resume invocation without root tmp_mark, route exception
+         * handling through the shared sub-rethrow block. */
+        LLVMBasicBlockRef sub_rethrow_bb = get_async_sub_rethrow_bb(g);
+        LLVMAddIncoming(g->current_async_sub_rethrow_phi_sub, &sub, &cur_bb, 1);
+        LLVMAddIncoming(g->current_async_sub_rethrow_phi_ev, &ev, &cur_bb, 1);
+        LLVMBuildCondBr(g->builder, threw, sub_rethrow_bb, ok_bb);
+        LLVMPositionBuilderAtEnd(g->builder, ok_bb);
+        return;
+    }
+
+    LLVMBasicBlockRef thr_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "sub.rethrow");
     LLVMBuildCondBr(g->builder, threw, thr_bb, ok_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, thr_bb);

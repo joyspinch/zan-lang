@@ -775,6 +775,9 @@ struct zan_irgen {
     LLVMBasicBlockRef current_async_requeue_bb; /* shared Task.Yield/preempt ready-and-ret block */
     LLVMBasicBlockRef current_async_cancel_bb;  /* shared top-level cancel exit block */
     LLVMBasicBlockRef current_async_rethrow_bb; /* shared sub-task exception rethrow block */
+    LLVMBasicBlockRef current_async_sub_rethrow_bb; /* shared sub-task exception transfer block */
+    LLVMValueRef      current_async_sub_rethrow_phi_sub; /* PHI collecting threw sub-frame */
+    LLVMValueRef      current_async_sub_rethrow_phi_ev;  /* PHI collecting threw exception ptr */
     LLVMValueRef current_async_state_ptr;       /* cached &frame->state GEP */
     LLVMValueRef current_async_cancel_ptr;      /* cached &frame->cancel GEP */
     LLVMValueRef current_async_self_i8;         /* cached (i8*)frame bitcast */

@@ -966,6 +966,10 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         LLVMValueRef saved_result_phi = g->current_async_result_phi;
         LLVMBasicBlockRef saved_requeue_bb = g->current_async_requeue_bb;
         LLVMBasicBlockRef saved_cancel_bb = g->current_async_cancel_bb;
+        LLVMBasicBlockRef saved_rethrow_bb = g->current_async_rethrow_bb;
+        LLVMBasicBlockRef saved_sub_rethrow_bb = g->current_async_sub_rethrow_bb;
+        LLVMValueRef saved_sub_rethrow_phi_sub = g->current_async_sub_rethrow_phi_sub;
+        LLVMValueRef saved_sub_rethrow_phi_ev = g->current_async_sub_rethrow_phi_ev;
         LLVMValueRef saved_state_ptr = g->current_async_state_ptr;
         LLVMValueRef saved_cancel_ptr = g->current_async_cancel_ptr;
         LLVMValueRef saved_self_i8 = g->current_async_self_i8;
@@ -1029,6 +1033,9 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_requeue_bb = NULL;
         g->current_async_cancel_bb = NULL;
         g->current_async_rethrow_bb = NULL;
+        g->current_async_sub_rethrow_bb = NULL;
+        g->current_async_sub_rethrow_phi_sub = NULL;
+        g->current_async_sub_rethrow_phi_ev = NULL;
         g->current_async_state_ptr = NULL;
         g->current_async_cancel_ptr = NULL;
         g->current_async_self_i8 = NULL;
@@ -1147,6 +1154,10 @@ static void emit_async_method_ir(zan_irgen_t *g, method_body_work_t *w) {
         g->current_async_result_phi = saved_result_phi;
         g->current_async_requeue_bb = saved_requeue_bb;
         g->current_async_cancel_bb = saved_cancel_bb;
+        g->current_async_rethrow_bb = saved_rethrow_bb;
+        g->current_async_sub_rethrow_bb = saved_sub_rethrow_bb;
+        g->current_async_sub_rethrow_phi_sub = saved_sub_rethrow_phi_sub;
+        g->current_async_sub_rethrow_phi_ev = saved_sub_rethrow_phi_ev;
         g->current_async_state_ptr = saved_state_ptr;
         g->current_async_cancel_ptr = saved_cancel_ptr;
         g->current_async_self_i8 = saved_self_i8;

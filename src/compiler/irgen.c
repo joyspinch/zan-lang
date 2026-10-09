@@ -2698,6 +2698,9 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_ret_agg_slot = -1;
     g->current_async_slots = NULL;
     g->current_async_slot_count = 0;
+    g->current_async_sub_rethrow_bb = NULL;
+    g->current_async_sub_rethrow_phi_sub = NULL;
+    g->current_async_sub_rethrow_phi_ev = NULL;
 
     /* int strcmp(const char*, const char*) */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
