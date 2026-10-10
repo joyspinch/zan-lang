@@ -558,6 +558,12 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   fire-and-forget。排查停机路径先想"自己关的连接被自己当 master 之死"
   竞态（如 ChannelLoop 对 handoff 通道 EOF 无条件 exit(0)，把整个排空
   等待短路）。
+- **多窗口/离屏事件分发中鼠标按下 blocker 必须严格判定几何（禁止 hitId < 0 一票否决）**：
+  在多窗口/子窗口与离屏设计器交互中，`ApplyEvent` 在鼠标按下（`kind == 2`）时记录 `pressOnBlocker`，
+  必须严格为 `hitId < 0 && hitTester.BlockerAt(mouseX, mouseY)`，绝不能写成 `hitId < 0`。
+  设计器画布、未注册几何热区的面板或空白工作区点击时 `hitId < 0` 是常态，若无条件置位 `pressOnBlocker = true`，
+  后续鼠标抬起（`kind == 3`）会误入阻挡逻辑清空 `clickTargetId = -1`，导致整窗/全 IDE 所有点击事件被全局吞噬静默瘫痪；
+  同时 FocusManager 的 `PushIds(first)` 分配段必须与 `PushId(first)` 作用域栈同步绑定，确保即时模式控件的 ID 跨帧连续且完全隔离。
 - **外壳非客户区行为用真实消息 + 显式泵断言**：双击标题栏、SC_MAXIMIZE
   这类 WndProc 路径，PostMessage 到真实 hwnd 再显式 PumpGuarded，消息在
   泵内同步派发，无 sleep、无时序依赖。两条坑：NC 双击的 wParam 必须是
