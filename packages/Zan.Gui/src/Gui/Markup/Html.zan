@@ -79,6 +79,8 @@ class Html {
                     // 自己的协议——button 吃捕获文本）
                     if (c is Element) { ((Element)c).AddText(it.text); }
                 } else {
+                    WNode kidNode = wd.nodes[it.kid];
+                    if (IsMetaChild(n.tag, kidNode.tag)) { continue; }
                     Html.AddChild(c, built[it.kid]);
                 }
             }
@@ -157,17 +159,32 @@ class Html {
             // Select（-1 清除、程序化赋值不触发 Change）。
             if (selIdx >= 0) { sb.Select(selIdx); }
             c = sb;
+        } else if (tag == "progress" || tag == "zan-progress") {
+            Progress p = new Progress();
+            string maxVal = HtmlText.NodeAttr(n.attrs, "max");
+            if (maxVal != "") { p.SetProp("max", maxVal); }
+            string curVal = HtmlText.NodeAttr(n.attrs, "value");
+            if (curVal != "") { p.SetProp("value", curVal); }
+            c = p;
         } else {
-            Element el = new Element();
-            el.InitElement(tag, id);
-            // 真实属性表：全部原始属性进表（class/style/data-* 与
-            // 构造消费的 id/src 等都存原文），CSS 属性选择器与
-            // content:attr() 的取值源。布尔属性值为空串也照存——
-            // 存在性走 CssHasAttr，不看值。
-            for (int i = 0; i < n.attrs.Count; i = i + 1) {
-                el.SetAttr(n.attrs[i].name, n.attrs[i].val);
+            // 通用动态解析：优先通过 ControlFactory 与已注册组件族（ControlBootstrap,
+            // DataTableBootstrap, ChartBootstrap 等）实例化，杜绝死硬编码
+            string kind = TagToKind(tag);
+            Control created = ControlFactory.Create(kind);
+            if (created != null) {
+                c = created;
+            } else {
+                Element el = new Element();
+                el.InitElement(tag, id);
+                // 真实属性表：全部原始属性进表（class/style/data-* 与
+                // 构造消费的 id/src 等都存原文），CSS 属性选择器与
+                // content:attr() 的取值源。布尔属性值为空串也照存——
+                // 存在性走 CssHasAttr，不看值。
+                for (int i = 0; i < n.attrs.Count; i = i + 1) {
+                    el.SetAttr(n.attrs[i].name, n.attrs[i].val);
+                }
+                c = el;
             }
-            c = el;
         }
         // 真控件的 id 不进 nodeName（那是 Element 的），走选择器名
         if (id != "" && !(c is Element)) { c.SetProp("name", id); }
@@ -199,45 +216,102 @@ class Html {
                 doc.css = doc.css + "." + gen + " { " + v + " }\n";
                 continue;
             }
-            if (k == "data-bind") {
+            if (k == "data-bind" || k == "z-model" || k == "v-model") {
                 c.bindPath = v;
                 continue;
             }
-            if (k == "data-if") {
+            if (k == "data-if" || k == "z-show" || k == "v-show") {
                 c.bindIf = v;
                 continue;
             }
+            if (k == "z-hide" || k == "v-hide") {
+                c.bindIf = "!" + v;
+                continue;
+            }
+            if (k == "z-text" || k == "v-text") {
+                c.bindPath = v;
+                c.bindProp = "text";
+                continue;
+            }
+            // 事件语法糖解析（data-on-*, @*, v-on:*, z-on:*, on*）
+            string evt = "";
+            string suffix = "";
             if (k.Length > 8 && HtmlText.StartsWith(k, "data-on-")) {
-                string suffix = k.Substring(8, k.Length - 8);
-                string evt = HtmlText.EventKind(suffix);
-                if (evt != "") {
-                    // Wire/WireArg 负责落名（SetHandler）+ 接线，见上。
-                    if (darg != "") {
-                        Html.WireArg(handlers, c, evt, v, darg);
-                    } else {
-                        Html.Wire(handlers, c, evt, v);
-                    }
+                suffix = k.Substring(8, k.Length - 8);
+                evt = HtmlText.EventKind(suffix);
+            } else if (k.Length > 1 && k[0] == 64) { // '@'
+                suffix = k.Substring(1);
+                evt = HtmlText.EventKind(suffix);
+            } else if (k.Length > 5 && (HtmlText.StartsWith(k, "v-on:") || HtmlText.StartsWith(k, "z-on:"))) {
+                suffix = k.Substring(5);
+                evt = HtmlText.EventKind(suffix);
+            } else if (k.Length > 2 && HtmlText.StartsWith(k, "on")) {
+                suffix = k.Substring(2);
+                evt = HtmlText.EventKind(suffix);
+            }
+            if (evt != "") {
+                if (darg != "") {
+                    Html.WireArg(handlers, c, evt, v, darg);
                 } else {
-                    // 未知后缀 = 拼错的事件名（如 data-on-clic），此前
-                    // 静默不接线、表现为“点了没反应”。控制台一行警告
-                    // 把它变成可发现的事实（对照 EventKind 支持表）。
-                    Console.WriteLine("HTML_WIRE_WARN unknown event '"
-                        + suffix + "' on <" + n.tag + (id != ""
-                            ? " id=" + id : "") + ">");
+                    Html.Wire(handlers, c, evt, v);
                 }
                 continue;
-            }
-            if (k == "title") {
-                // 原生悬停提示（tooltip）语义：指针在元素上停稳
-                // Tooltip.DefaultDelayMs 后浮出气泡。Element 记
-                // elTitle、绘制期由 Html.PaintTip 轮询（悬停计时在
-                // focus.hoverStartMs，目标一变即重置）；真控件不吃
-                // 这条（title 不进控件属性面，见 HTML_UI 台账）。
-                if (c is Element) { ((Element)c).elTitle = v; }
+            } else if (suffix != "") {
+                Console.WriteLine("HTML_WIRE_WARN unknown event '"
+                    + suffix + "' on <" + n.tag + (id != ""
+                        ? " id=" + id : "") + ">");
                 continue;
             }
-            // 其余属性（href 已由 AutoLink 消费；disabled/...）忽略
-            // （台账）
+            string klow = k.ToLower();
+            if (klow == "icon") {
+                if (c is Button) {
+                    ((Button)c).Icon = v;
+                }
+                c.SetProp("icon", v);
+                continue;
+            }
+            if (klow == "tip" || klow == "title") {
+                if (c is Button) {
+                    ((Button)c).Tip = v;
+                }
+                if (c is Element) {
+                    ((Element)c).elTitle = v;
+                }
+                c.SetProp("tip", v);
+                continue;
+            }
+            if (klow == "tip-side" || klow == "tipside" || klow == "tip-pos") {
+                if (c is Button) {
+                    ((Button)c).TipSide = v;
+                }
+                c.SetProp("tip-side", v);
+                continue;
+            }
+            if (klow == "free-layout" || klow == "data-free-layout") {
+                c.FreeLayout();
+                continue;
+            }
+            if (klow == "disabled") {
+                c.SetProp("disabled", "true");
+                continue;
+            }
+            if (klow == "dock" || klow == "data-dock") {
+                string dlow = v.ToLower();
+                if (dlow == "fill") { c.DockFill(); }
+                else if (dlow == "left") { c.DockLeft(); }
+                else if (dlow == "right") { c.DockRight(); }
+                else if (dlow == "top") { c.DockTop(); }
+                else if (dlow == "bottom") { c.DockBottom(); }
+                continue;
+            }
+            if (klow == "visible") {
+                if (v == "false" || v == "0") { c.visible = false; }
+                else if (v == "true" || v == "1") { c.visible = true; }
+                continue;
+            }
+            if (!(c is Element)) {
+                c.SetProp(k, v);
+            }
         }
         return c;
     }
@@ -259,6 +333,16 @@ class Html {
         }
         Tooltip.RequestBox(app, c.bx, c.by, c.bw, c.bh, tip,
             Tooltip.Bottom(), app.Scale(260));
+    }
+
+    static bool IsMetaChild(string ptag, string ctag) {
+        if (ptag == "select" || ptag == "selectbox" || ptag == "zan-select-box") {
+            if (ctag == "option") { return true; }
+        }
+        if (ptag == "datatable" || ptag == "grid" || ptag == "data-grid" || ptag == "zan-data-grid" || ptag == "zan-datatable") {
+            if (ctag == "col" || ctag == "column") { return true; }
+        }
+        return false;
     }
 
     // 挂子节点：Element 父走 AddKid（与 AddText 的文档序交错，
@@ -454,6 +538,31 @@ class Html {
         string low = href.ToLower();
         return HtmlText.StartsWith(low, "http://")
             || HtmlText.StartsWith(low, "https://");
+    }
+
+    // HTML 标签到控件 Kind 类型的归一化映射
+    static string TagToKind(string tag) {
+        if (tag == "") { return ""; }
+        string t = tag.ToLower();
+        if (HtmlText.StartsWith(t, "zan-")) {
+            t = t.Substring(4, t.Length - 4);
+        }
+        if (t == "datatable" || t == "grid" || t == "data-grid") { return "DataGrid"; }
+        if (t == "tabs" || t == "tab-control") { return "Tabs"; }
+        if (t == "treeview" || t == "tree") { return "TreeView"; }
+        if (t == "pagination" || t == "pager") { return "Pagination"; }
+        if (t == "switch") { return "Switch"; }
+        if (t == "radio") { return "Radio"; }
+        if (t == "slider") { return "Slider"; }
+        if (t == "colorpicker" || t == "color-picker") { return "ColorPicker"; }
+        if (t == "datepicker" || t == "date-picker") { return "DatePicker"; }
+        if (t == "upload") { return "Upload"; }
+        if (t == "listview" || t == "list") { return "ListView"; }
+        if (t == "virtuallist" || t == "virtual-list") { return "VirtualList"; }
+        if (t == "rate") { return "Rate"; }
+        if (t == "chart") { return "ChartHost"; }
+        // PascalCase 简单尝试
+        return tag;
     }
 }
 
