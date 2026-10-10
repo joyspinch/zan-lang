@@ -270,3 +270,27 @@ STANDARDS.md §6.7）。
 实测 clean/dirty 均值 3ms、峰值 23ms、预算 16.6ms，空闲 120 拍仅
 3 帧重绘）；**每帧热路径 HUD（血条/伤害数字/小地图）仍走代码直绘
 + 门控渲染，不进 DOM**——那是性能边界，不是能力缺口。
+
+## 声明式事件体系与丰富组件事件契约
+
+彻底消除“HTML 仅作空壳、后台繁琐查找控件手动挂接”的反模式，由 HTML 模板承载完整结构、交互声明与事件语义，Zan 代码只作为 ViewModel / 业务逻辑层。
+
+1. **统一声明式事件指令**：
+   - 支持 `@event`、`v-on:event`、`z-on:event`、`on<event>` 及 `data-on-<event>` 等标准声明语法。
+   - 解析层自动完成 kebab-case 到组件标准 PascalCase 事件名的规范化映射（如 `@row-click` -> `RowClick`、`@cell-dblclick` -> `CellDoubleClick`、`@column-resize` -> `ColumnResize`、`@tab-change` -> `Change`、`@page-change` -> `Change` 等）。
+2. **双通道事件路由（BindEvent 与 BindEventS）**：
+   - 无参通道：`BindEvent(string evt, Action a)` 接收轻量无参回调。
+   - Sender 通道：`BindEventS(string evt, ControlEvent a)` 接收带 `Control sender` 实例强类型回调。
+   - **包装 state/model 的复合控件（如 DataGrid/TreeView/Pagination 等）必须重写 BindEventS**：不可仅重写 `BindEvent` 并任由 `BindEventS` 回退到基类的 `On.AddByNameS`，否则会导致带参回调无法触发底层状态机专属事件；必须显式通过 `this.st.<Event>.Add(() => a(this))` 将自身封装为 sender 准确派发。
+3. **表格等大型组件的多维丰富事件（Row / Cell / Column / Grid）**：
+   - 行级：`RowClick`、`RowDoubleClick`、`RowRightClick`（别名 `RowContext`）、`RowInserted`、`RowDeleted`。
+   - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
+   - 列与表头级：`HeaderClick`（别名 `ColumnClick`）、`ColumnDoubleClick`、`ColumnResize`、`ColumnResizeEnd`、`Sort`、`ColumnReorder`。
+   - 网格视图与状态：`FilterChanged`、`SelectionChanged`、`GroupChanged`、`BandToggled`、`ScrollChanged`。
+   - **双击命中坐标锁定**：在双击触发判定时必须锁定列索引（如 `st.hitCol = ptrCol;`），并同时触发 `RowDoubleClick` 与 `CellDoubleClick`，保证 `DataGrid.HitField()` 能解析出目标列字段，供 `GenForm` 中列声明的事件脱糖分派精准路由。
+4. **常用组件专属语义事件标配**：
+   - `TreeView`：`Select`、`Activate`、`Expand`、`Collapse`、`Context`、`Check`。
+   - `Pagination`：`Change`（切页）、`SizeChange`（切每页条数）。
+   - `ListView`：`Select`、`Activate`、`Context`。
+   - `Tabs`：`Change`（切标签页）。
+   - 全部专属事件必须注册在 `Events()` 清单中，并通过 `BindEvent` / `BindEventS` 双通道无缝转发。
