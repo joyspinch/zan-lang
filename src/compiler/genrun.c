@@ -274,8 +274,14 @@ static int zan_gen_parse_pid(const char *s, uint32_t *out) {
     return 1;
 }
 
+typedef struct zan_gen_sweep_ctx {
+    const char *dir;
+    uint64_t keep_key;
+} zan_gen_sweep_ctx;
+
 static void zan_gen_sweep_one(const char *name, void *ud) {
-    const char *dir = (const char *)ud;
+    zan_gen_sweep_ctx *ctx = (zan_gen_sweep_ctx *)ud;
+    const char *dir = ctx->dir;
     const char *rest = NULL;
     char path[ZAN_GEN_MAX_PATH];
     uint32_t pid = 0;
@@ -285,7 +291,7 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
     const char sep = '/';
 #endif
 
-    /* ZanGen_<16hex>[ */
+    /* ZanGen_<16hex>[_pid].exe */
     if (zan_gen_strip(name, "ZanGen_", &rest)) {
         int kind = zan_gen_parse_zangen(rest, &pid);
         if (kind == 2 && !zan_pid_alive(pid)) {
@@ -295,6 +301,19 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
 #else
             remove(path);
 #endif
+        } else if (kind == 1 && ctx->keep_key != 0) {
+            /* 淘汰非当前活跃版本的过期生成器二进制，避免长期累积垃圾 */
+            char active_name[64];
+            snprintf(active_name, sizeof(active_name), "%016llx%s",
+                     (unsigned long long)ctx->keep_key, GEN_EXE_SUFFIX);
+            if (strcmp(rest, active_name) != 0) {
+                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
+#ifdef _WIN32
+                DeleteFileA(path);
+#else
+                remove(path);
+#endif
+            }
         }
         return;
     }
@@ -321,14 +340,16 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
         }
         return;
     }
-    /* 核心系统底层抽象与内存语义契约 */
 }
 
-static void zan_gen_sweep(const char *dir) {
+static void zan_gen_sweep(const char *dir, uint64_t keep_key) {
     static int swept = 0;
     if (swept) return;
     swept = 1;
-    zan_gen_scan_dir(dir, zan_gen_sweep_one, (void *)dir);
+    zan_gen_sweep_ctx ctx;
+    ctx.dir = dir;
+    ctx.keep_key = keep_key;
+    zan_gen_scan_dir(dir, zan_gen_sweep_one, &ctx);
 }
 
 /* 内部辅助逻辑 */
@@ -454,10 +475,6 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         fprintf(stderr, "error: no user cache dir for the code generators\n");
         return -1;
     }
-    /* 内部辅助逻辑 */
-    zan_gen_sweep(dir);
-
-    /* 内部辅助逻辑 */
     char zexe[ZAN_GEN_MAX_PATH];
     zan_self_exe(zexe, sizeof(zexe));
     if (!zexe[0]) {
@@ -477,6 +494,9 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
                         " cache\n");
         return -1;
     }
+    /* 自动清理历史旧版本和死进程残留，仅保留当前活跃的生成器 */
+    zan_gen_sweep(dir, key);
+
     snprintf(exe, exe_size, "%s%sZanGen_%016llx%s", dir, GEN_DIR_SEP_STR,
              (unsigned long long)key, GEN_EXE_SUFFIX);
 
