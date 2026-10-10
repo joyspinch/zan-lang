@@ -70,7 +70,32 @@
   通配写法）：StripComments 按第一个 `*/` 截断注释，注释后半段
   变成裸 CSS 文本、随后的规则被吞进选择器——整段样式静默失效。
 
-## 声明面五件套与硬边界
+## 声明面原语与语法糖（全事件与响应式指令）
+
+在 `.html` 模板中支持 Vue 风格声明式全事件绑定与响应式指令，编译期（GenForm/GenHtml）静态直连，彻底避免后台繁琐重复的命令式查找与手动绑定：
+
+### 1. 事件绑定语法糖（支持 `@<event>`、`v-on:<event>`、`z-on:<event>`、`on<event>`）
+
+| 声明语法 | 规范化事件 | 对应 Control / On 槽位 | 说明 |
+|---|---|---|---|
+| `@click="OnSave"` / `onclick="OnSave"` | `Click` | `ctrl.Click` 或 `ctrl.On.Click` | 单击事件 |
+| `@dblclick="OnEdit"` / `ondblclick="OnEdit"` | `DoubleClick` | `ctrl.On.DoubleClick` | 双击事件 |
+| `@change="OnChange"` / `onchange="OnChange"` | `Change` | `ctrl.Change` (Input等特化) 或 `On.Change` | 内容改变事件 |
+| `@show="OnOpen"` / `onshow="OnOpen"` | `Show` | `ctrl.Show` 固有事件槽 | 控件显示事件 |
+| `@hide="OnClose"` / `onhide="OnClose"` | `Hide` | `ctrl.Hide` 固有事件槽 | 控件隐藏事件 |
+| `@resize="OnResize"` / `onsizechange="OnResize"` | `Resize` | `ctrl.Resize` 固有事件槽 | 尺寸变化事件 |
+| `@keydown`, `@keyup`, `@focus`, `@blur` | `KeyDown` 等 | `ctrl.On.*` | 键盘输入与焦点通用事件 |
+
+### 2. 数据双向与显隐指令
+
+| 指令 | 编译期映射 | 说明 |
+|---|---|---|
+| `z-model="form.username"` / `v-model="..."` | `ctrl.bindPath = "form.username";` | 表单输入控件（Input、Checkbox 等）双向数据同步 |
+| `z-show="form.isVip"` / `v-show="..."` | `ctrl.bindIf = "form.isVip";` | 依布尔表达式路径控制控件显隐（真时显） |
+| `z-hide="form.loading"` / `v-hide="..."` | `ctrl.bindIf = "!form.loading";` | 取反显隐控制（真时隐） |
+| `z-text="form.title"` / `v-text="..."` | `ctrl.bindPath = "form.title"; ctrl.bindProp = "text";` | 文本单向渲染同步 |
+
+### 3. 底层声明面五件套与硬边界（模型宿主与列表克隆）
 
 | 原语 | 作用 | 硬边界（超了就静默不生效，别猜） |
 |---|---|---|
