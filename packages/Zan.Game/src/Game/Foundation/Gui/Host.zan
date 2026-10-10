@@ -116,6 +116,7 @@ class GuiHost {
         this.lastTick = Window.GetTickMs();
         loop.Start(this);
         while (this.running) {
+            int frameStartMs = Window.GetTickMs();
             // 单帧排空当前所有积压的 OS 事件（处理高频鼠标移动与连续按键），
             // 彻底消除游戏输入延迟；上限保护防止极端事件风暴阻塞帧推进。
             int drained = 0;
@@ -137,6 +138,24 @@ class GuiHost {
             // 收不到任何点击。把本帧最后的事件 kind 挂给 App 供渲染期
             // 回退读取；下一帧循环用新值覆盖（无事件帧挂 0）。
             this.app.HoldEventKind(lastEvKind);
+
+            // 窗口最小化/不可见（全平台）：完全跳过光栅化与上屏，仅保持逻辑步进并深睡。
+            if (!this.app.window.IsVisible()) {
+                int nowMin = Window.GetTickMs();
+                int deltaMin = nowMin - this.lastTick;
+                if (deltaMin < 0) { deltaMin = 0; }
+                this.lastTick = nowMin;
+                this.clock.Advance(deltaMin);
+                while (this.clock.HasStep()) {
+                    loop.FixedUpdate(this, this.clock.ConsumeStep());
+                }
+                for (int i = 0; i < this.viewports.Count; i = i + 1) {
+                    this.viewports[i].StepLogic();
+                }
+                loop.Update(this, deltaMin);
+                Window.SleepMs(60);
+                continue;
+            }
 
             int now = Window.GetTickMs();
             int delta = now - this.lastTick;
@@ -167,9 +186,19 @@ class GuiHost {
             // ContentTop() 之下开始）；全屏收起标题栏后自然消失。
             this.app.RenderChrome(this.title);
             this.app.PresentFrame();
-            // 连续渲染：游戏每帧都要画，下一圈继续出帧（App 的
-            // 帧预算睡眠承担限速，这里不再额外 Delay）。
+            // 连续渲染：游戏每帧都要画，下一圈继续出帧。
             this.app.RequestRedraw();
+
+            // 跨平台帧尾 Pacing 闭环：覆盖全帧耗时（排空+逻辑+渲染+Present），
+            // 前台锁定 60 FPS (16ms)，失焦后台自适应降档至 30 FPS (33ms)，彻底消除空转与高 CPU。
+            int targetBudget = 16;
+            if (!this.app.window.IsFocused()) {
+                targetBudget = 33;
+            }
+            int frameElapsed = Window.GetTickMs() - frameStartMs;
+            if (frameElapsed < targetBudget) {
+                Window.SleepMs(targetBudget - frameElapsed);
+            }
         }
         loop.Stop(this);
         this.app.StopLoop();
