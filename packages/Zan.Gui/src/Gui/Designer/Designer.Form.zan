@@ -64,6 +64,8 @@ partial class Designer {
             new RibbonAlignCommand("align-top", Designer.T("Top", "顶对齐"), Designer.T("Align to the top edge", "贴所属框顶边"), "al3", true),
             new RibbonAlignCommand("align-middle", Designer.T("Middle", "垂直居中"), Designer.T("Centre vertically", "在所属框内垂直居中"), "al4", true),
             new RibbonAlignCommand("align-bottom", Designer.T("Bottom", "底对齐"), Designer.T("Align to the bottom edge", "贴所属框底边"), "al5", true),
+            new RibbonAlignCommand("columns-3", Designer.T("Dist H", "水平均分"), Designer.T("Distribute horizontally with equal spacing", "水平等间距分布"), "dist_h", true),
+            new RibbonAlignCommand("layout-rows", Designer.T("Dist V", "垂直均分"), Designer.T("Distribute vertically with equal spacing", "垂直等间距分布"), "dist_v", true),
             new RibbonAlignCommand("layout", Designer.T("Same W", "等宽"), Designer.T("Match the width of the primary selection", "把其余选中项的宽度设成主选中项的"), "samew", true),
             new RibbonAlignCommand("sort", Designer.T("Same H", "等高"), Designer.T("Match the height of the primary selection", "把其余选中项的高度设成主选中项的"), "sameh", true),
             new RibbonAlignCommand("chevron-up", Designer.T("Forward", "上一层"), Designer.T("Move one step forward", "在同级里前移一位"), "fwd", false),
@@ -258,6 +260,8 @@ partial class Designer {
         else if (act == "al3") { this.AlignSelGroup(3); }
         else if (act == "al4") { this.AlignSelGroup(4); }
         else if (act == "al5") { this.AlignSelGroup(5); }
+        else if (act == "dist_h") { this.DistributeSelGroup(0); }
+        else if (act == "dist_v") { this.DistributeSelGroup(1); }
         else if (act == "grid") {
             showGrid = !showGrid;
         } else if (act == "snap") {
@@ -333,21 +337,121 @@ partial class Designer {
 
     // 把选中组件对齐到它所在的框（顶层为设计窗口，容器子元素
     // 为容器的内容框）：0-2 左/水平居中/右，3-5 上/垂直居中/下。
-    // 对整个多选做对齐：只有一个选中项时就是它自己
-    // 对齐到所属框；多选时所有成员对齐到同一条边
-    // （主选中项所在框的边）。
+    // 对整个多选做对齐：只有一个选中项时对齐到所属容器；
+    // 多选时以主选中项 sel 为对齐基准。
     void AlignSelGroup(int mode) {
         if (sel == null) { return; }
         this.PushUndo();
         FormField keep = sel;
         List<FormField> extra = freeExtra;
-        this.AlignSel(mode);
-        for (int i = 0; i < extra.Count; i = i + 1) {
-            sel = extra[i];
+        if (extra.Count == 0) {
             this.AlignSel(mode);
+            sel = keep;
+            msg = Designer.T("aligned", "已对齐");
+            return;
+        }
+        int baseLeft = sel.LayoutX();
+        int baseTop = sel.LayoutY();
+        int baseW = sel.LayoutW();
+        int baseH = sel.LayoutH();
+        for (int i = 0; i < extra.Count; i = i + 1) {
+            FormField f = extra[i];
+            if (f != null && !f.locked) {
+                this.DesignMakeFloat(f);
+                int fw = f.LayoutW();
+                int fh = f.LayoutH();
+                if (mode == 0) { f.fx = baseLeft; }
+                else if (mode == 1) { f.fx = baseLeft + (baseW - fw) / 2; }
+                else if (mode == 2) { f.fx = baseLeft + baseW - fw; }
+                else if (mode == 3) { f.fy = baseTop; }
+                else if (mode == 4) { f.fy = baseTop + (baseH - fh) / 2; }
+                else if (mode == 5) { f.fy = baseTop + baseH - fh; }
+                this.DesignDeclareRect(f);
+            }
         }
         sel = keep;
         msg = Designer.T("aligned", "已对齐");
+    }
+
+    // 选中的多个组件等间距分布（0=水平等间距分布，1=垂直等间距分布）。
+    // 至少选中 3 个组件（主选中项 + 至少 2 个附加选中项），首尾组件位置保持锚定，
+    // 中间组件按尺寸与跨度均匀分布空隙。
+    void DistributeSelGroup(int axis) {
+        if (sel == null || freeExtra.Count < 2) {
+            msg = Designer.T("Select 3+ items to distribute", "至少选择 3 个控件才能均分");
+            return;
+        }
+        List<FormField> items = new List<FormField>();
+        if (!sel.locked) {
+            items.Add(sel);
+        }
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (f != null && !f.locked) {
+                items.Add(f);
+            }
+        }
+        if (items.Count < 3) {
+            msg = Designer.T("Select 3+ items to distribute", "至少选择 3 个控件才能均分");
+            return;
+        }
+        this.PushUndo();
+        if (axis == 0) {
+            // 水平方向等间距分布
+            for (int i = 0; i < items.Count - 1; i = i + 1) {
+                for (int j = i + 1; j < items.Count; j = j + 1) {
+                    if (items[i].LayoutX() > items[j].LayoutX()) {
+                        FormField t = items[i];
+                        items[i] = items[j];
+                        items[j] = t;
+                    }
+                }
+            }
+            int minX = items[0].LayoutX();
+            int maxX = items[items.Count - 1].LayoutX() + items[items.Count - 1].LayoutW();
+            int totalW = 0;
+            for (int i = 0; i < items.Count; i = i + 1) {
+                totalW = totalW + items[i].LayoutW();
+            }
+            int totalGap = (maxX - minX) - totalW;
+            int gap = totalGap / (items.Count - 1);
+            int curX = items[0].LayoutX() + items[0].LayoutW() + gap;
+            for (int i = 1; i < items.Count - 1; i = i + 1) {
+                FormField f = items[i];
+                this.DesignMakeFloat(f);
+                f.fx = curX;
+                this.DesignDeclareRect(f);
+                curX = curX + f.LayoutW() + gap;
+            }
+        } else {
+            // 垂直方向等间距分布
+            for (int i = 0; i < items.Count - 1; i = i + 1) {
+                for (int j = i + 1; j < items.Count; j = j + 1) {
+                    if (items[i].LayoutY() > items[j].LayoutY()) {
+                        FormField t = items[i];
+                        items[i] = items[j];
+                        items[j] = t;
+                    }
+                }
+            }
+            int minY = items[0].LayoutY();
+            int maxY = items[items.Count - 1].LayoutY() + items[items.Count - 1].LayoutH();
+            int totalH = 0;
+            for (int i = 0; i < items.Count; i = i + 1) {
+                totalH = totalH + items[i].LayoutH();
+            }
+            int totalGap = (maxY - minY) - totalH;
+            int gap = totalGap / (items.Count - 1);
+            int curY = items[0].LayoutY() + items[0].LayoutH() + gap;
+            for (int i = 1; i < items.Count - 1; i = i + 1) {
+                FormField f = items[i];
+                this.DesignMakeFloat(f);
+                f.fy = curY;
+                this.DesignDeclareRect(f);
+                curY = curY + f.LayoutH() + gap;
+            }
+        }
+        msg = Designer.T("distributed", "已等间距分布");
     }
 
     // 对齐到真实父内容框；解除旧约束后仍保留未编辑轴的实际位置。

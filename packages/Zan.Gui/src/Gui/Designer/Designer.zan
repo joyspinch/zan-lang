@@ -240,16 +240,22 @@ class CompPropEditRow {
     public string key;
     public string label;
     public bool isBool;
+    public bool isEnum;
+    public bool isIcon;
     public Input input;
     public Switch sw;
+    public SelectBox pick;
     public string shadow;
 
     CompPropEditRow(string key, string label, bool isBool, Input input, Switch sw, string shadow) {
         this.key = key != null ? key : "";
         this.label = label != null ? label : "";
         this.isBool = isBool;
+        this.isEnum = false;
+        this.isIcon = false;
         this.input = input;
         this.sw = sw;
+        this.pick = null;
         this.shadow = shadow != null ? shadow : "";
     }
 }
@@ -1265,7 +1271,55 @@ partial class Designer {
                 clean = clean.Substring(0, ftIdx);
             }
         }
+        int p1 = clean.IndexOf("(");
+        int p2 = clean.IndexOf(")");
+        if (p1 >= 0 && p2 > p1) {
+            string inner = clean.Substring(p1 + 1, p2 - p1 - 1);
+            if (inner.Contains("/")) {
+                clean = clean.Substring(0, p1);
+            }
+        }
         return StyleSheet.Trim(clean);
+    }
+
+    // 从属性提示标签提取枚举选项（如 "Type (primary/info/success)" -> ["", "primary", "info", "success"]）。
+    // 第一个为 ""（默认/清空），方便重置为缺省样式。
+    static List<string> ExtractPropOptions(string rawLabel) {
+        List<string> res = new List<string>();
+        if (rawLabel == null) { return res; }
+        if (rawLabel.Contains("(true/false)") || rawLabel.Contains("(false/true)")) {
+            return res;
+        }
+        int p1 = rawLabel.IndexOf("(");
+        int p2 = rawLabel.IndexOf(")");
+        if (p1 < 0 || p2 <= p1) { return res; }
+        string inner = rawLabel.Substring(p1 + 1, p2 - p1 - 1);
+        if (!inner.Contains("/")) { return res; }
+        List<string> parts = inner.Split("/");
+        if (parts.Count < 2) { return res; }
+        res.Add(""); // 缺省项
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string itm = StyleSheet.Trim(parts[i]);
+            // 剔除包含中文或等号说明（例如 "0=cold"）的非纯净枚举
+            if (itm != "" && !itm.Contains("=") && !itm.Contains(" ") && !res.Contains(itm)) {
+                res.Add(itm);
+            }
+        }
+        if (res.Count <= 2) { res.Clear(); } // 至少有2个及以上有效备选项
+        return res;
+    }
+
+    // 清洗字符生成合法的标识符片段
+    static string CleanIdentifier(string s) {
+        if (s == null) { return ""; }
+        string res = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch != " " && ch != "-" && ch != ":" && ch != ">" && ch != "." && ch != "/" && ch != "\\") {
+                res = res + ch;
+            }
+        }
+        return res;
     }
 
     // 内置组件的直通属性行：kind → "键|双语标签" 列表。值存
@@ -4322,11 +4376,47 @@ partial class Designer {
             if (tool || ribbon) {
                 // PropertyGrid 行里放不下按钮：图标选择走隐藏 Input 转交。
                 int pickId = SmallBtn(app, Designer.T("Pick icon…", "选择图标…"), 0,
-                    gx, gridY + gridH + app.Scale(6), app.Scale(120));
+                    gx, gridY + gridH + app.Scale(6), app.Scale(110));
                 if (Ui.Clicked(app, pickId)) {
                     iconHolder.SetText(rowEdField);
                     this.OpenIconPicker(app, iconHolder);
                     app.RequestRedraw();
+                }
+                if (tool) {
+                    int navBtnW = app.Scale(110);
+                    int navId = SmallBtn(app, Designer.T("Code behind", "定位事件代码"), 0,
+                        gx + app.Scale(116), gridY + gridH + app.Scale(6), navBtnW);
+                    if (Ui.Clicked(app, navId)) {
+                        string target = StyleSheet.Trim(toolEdClick);
+                        if (target == "") {
+                            string baseName = f.fname != "" ? f.fname : "Tool";
+                            string itmName = StyleSheet.Trim(rowEdTitle);
+                            if (itmName == "") { itmName = "Item" + Convert.ToString(rowsEdSel + 1); }
+                            target = "On" + Designer.CleanIdentifier(baseName)
+                                + Designer.CleanIdentifier(itmName) + "Click";
+                            toolEdClick = target;
+                            this.WriteBackToolItem(app, f);
+                        }
+                        this.RequestOpenCodeBehindHandler(target);
+                    }
+                }
+            } else if (table) {
+                int colNavBtnW = app.Scale(110);
+                int colNavId = SmallBtn(app, Designer.T("Code behind", "定位点击代码"), 0,
+                    gx, gridY + gridH + app.Scale(6), colNavBtnW);
+                if (Ui.Clicked(app, colNavId)) {
+                    string target = StyleSheet.Trim(colEdClick);
+                    if (target == "") {
+                        string baseName = f.fname != "" ? f.fname : "Table";
+                        string colName = StyleSheet.Trim(rowEdField);
+                        if (colName == "") { colName = StyleSheet.Trim(rowEdTitle); }
+                        if (colName == "") { colName = "Col" + Convert.ToString(rowsEdSel + 1); }
+                        target = "On" + Designer.CleanIdentifier(baseName)
+                            + Designer.CleanIdentifier(colName) + "CellClick";
+                        colEdClick = target;
+                        this.WriteBackCol(app, f);
+                    }
+                    this.RequestOpenCodeBehindHandler(target);
                 }
             }
         } else if (rows > 0) {

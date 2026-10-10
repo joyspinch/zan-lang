@@ -46,10 +46,18 @@ class ChildTemplateMeta {
 class ChildExpandedRow {
     public Control rowRoot;
     public Control template;
+    public string key;
 
     ChildExpandedRow(Control rowRoot, Control template) {
         this.rowRoot = rowRoot;
         this.template = template;
+        this.key = "";
+    }
+
+    ChildExpandedRow(Control rowRoot, Control template, string key) {
+        this.rowRoot = rowRoot;
+        this.template = template;
+        this.key = key;
     }
 }
 
@@ -224,7 +232,7 @@ class ChildWindow {
     void SyncFromNode(Control c) {
         if (c.Kind() == "template") { return; }
         if (c.bindIf != "") {
-            c.SetShown(ChildWindow.Truthy(this.ValueFor(c, c.bindIf)));
+            c.SetShown(this.EvalExpr(c, c.bindIf));
         }
         if (c.bindPath != "") {
             JsonValue v = this.ValueFor(c, c.bindPath);
@@ -364,8 +372,8 @@ class ChildWindow {
         }
     }
 
-    // 每帧核对各模板的源数组长度；与上帧一致就什么都不做（行是活
-    // 控件，绑定照常同步），变了才整组重建。
+    // 每帧核对各模板的源数组；若声明了 data-key 则走增量 Diffing 复用，
+    // 未声明则按长度变动重建。
     void EnsureExpanded() {
         if (tmplMetas == null) { return; }
         for (int i = 0; i < tmplMetas.Count; i = i + 1) {
@@ -374,29 +382,130 @@ class ChildWindow {
             if (path == "" || t.children.Count == 0) { continue; }
             JsonValue arr = model.PathGet(path);
             int n = (arr != null && arr.IsArray()) ? arr.Count() : 0;
-            if (tmplMetas[i].lastCount == n) { continue; }
-            this.RemoveRows(t);
-            tmplMetas[i].lastCount = n;
-            if (n == 0) { continue; }
-            Control p = t.parent;
-            if (p == null) { continue; }
-            int cur = p.IndexOf(t) + 1;
-            for (int k = 0; k < n; k = k + 1) {
-                JsonValue item = arr.At(k);
+            string keyAttr = t.CssAttr("data-key");
+
+            if (keyAttr != "") {
+                this.EnsureExpandedKeyed(t, arr, n, keyAttr, tmplMetas[i]);
+            } else {
+                if (tmplMetas[i].lastCount == n) { continue; }
+                this.RemoveRows(t);
+                tmplMetas[i].lastCount = n;
+                if (n == 0) { continue; }
+                Control p = t.parent;
+                if (p == null) { continue; }
+                int cur = p.IndexOf(t) + 1;
+                for (int k = 0; k < n; k = k + 1) {
+                    JsonValue item = arr.At(k);
+                    for (int j = 0; j < t.children.Count; j = j + 1) {
+                        Control row = App.CloneTree(t.children[j]);
+                        if (row == null) { continue; }
+                        p.InsertAt(cur, row);
+                        cur = cur + 1;
+                        WireNode(row);
+                        this.ScopeRow(row, item);
+                        if (expandedRows == null) {
+                            expandedRows = new List<ChildExpandedRow>();
+                        }
+                        expandedRows.Add(new ChildExpandedRow(row, t));
+                    }
+                }
+            }
+        }
+    }
+
+    // 基于 data-key 的增量 Diffing：复用已有节点，按需增删与刷新作用域
+    void EnsureExpandedKeyed(Control t, JsonValue arr, int n, string keyAttr, ChildTemplateMeta meta) {
+        Control p = t.parent;
+        if (p == null) { return; }
+        meta.lastCount = n;
+
+        // 收集当前模板下已有的展开行
+        List<ChildExpandedRow> oldRows = new List<ChildExpandedRow>();
+        if (expandedRows != null) {
+            for (int i = 0; i < expandedRows.Count; i = i + 1) {
+                if (expandedRows[i].template == t) {
+                    oldRows.Add(expandedRows[i]);
+                }
+            }
+        }
+
+        // 收集新列表中所有的 key
+        List<string> newKeys = new List<string>();
+        for (int k = 0; k < n; k = k + 1) {
+            JsonValue item = arr.At(k);
+            string keyVal = "";
+            if (item != null) {
+                JsonValue kv = item.PathGet(keyAttr);
+                if (kv != null) { keyVal = kv.AsString(""); }
+            }
+            if (keyVal == "") { keyVal = k.ToString(); }
+            newKeys.Add(keyVal);
+        }
+
+        // 1. 删除在 newKeys 中不存在的旧行
+        for (int i = oldRows.Count - 1; i >= 0; i = i - 1) {
+            string oldKey = oldRows[i].key;
+            bool existsInNew = false;
+            for (int k = 0; k < newKeys.Count; k = k + 1) {
+                if (newKeys[k] == oldKey) {
+                    existsInNew = true;
+                    break;
+                }
+            }
+            if (!existsInNew) {
+                Control row = oldRows[i].rowRoot;
+                this.DetachRow(row);
+                this.ScopeDropRow(row);
+                this.RemoveExpandedRowEntry(oldRows[i]);
+                oldRows.RemoveAt(i);
+            }
+        }
+
+        // 2. 按顺序对齐或插入新行，并刷新数据作用域
+        int insertPos = p.IndexOf(t) + 1;
+        for (int k = 0; k < n; k = k + 1) {
+            JsonValue item = arr.At(k);
+            string keyVal = newKeys[k];
+
+            // 查找是否已有该 key 的行
+            ChildExpandedRow matched = null;
+            for (int r = 0; r < oldRows.Count; r = r + 1) {
+                if (oldRows[r].key == keyVal) {
+                    matched = oldRows[r];
+                    break;
+                }
+            }
+
+            if (matched != null) {
+                // 复用节点：更新作用域
+                this.ScopeRow(matched.rowRoot, item);
+                insertPos = insertPos + 1;
+            } else {
+                // 新建节点克隆插入
                 for (int j = 0; j < t.children.Count; j = j + 1) {
-                    // 原型深拷贝经 App 克隆槽（Html.Install 注册）；
-                    // 未装 HTML 声明层就不会有 template 原型到这里。
                     Control row = App.CloneTree(t.children[j]);
                     if (row == null) { continue; }
-                    p.InsertAt(cur, row);
-                    cur = cur + 1;
+                    p.InsertAt(insertPos, row);
+                    insertPos = insertPos + 1;
                     WireNode(row);
                     this.ScopeRow(row, item);
+                    ChildExpandedRow entry = new ChildExpandedRow(row, t, keyVal);
                     if (expandedRows == null) {
                         expandedRows = new List<ChildExpandedRow>();
                     }
-                    expandedRows.Add(new ChildExpandedRow(row, t));
+                    expandedRows.Add(entry);
+                    oldRows.Add(entry);
                 }
+            }
+        }
+    }
+
+    void RemoveExpandedRowEntry(ChildExpandedRow entry) {
+        if (expandedRows == null) { return; }
+        for (int i = 0; i < expandedRows.Count; i = i + 1) {
+            if (expandedRows[i] == entry) {
+                expandedRows.RemoveAt(i);
+                return;
             }
         }
     }
@@ -493,6 +602,166 @@ class ChildWindow {
         if (v.IsNumber()) { return v.AsInt(0) != 0; }
         string s = v.AsString("");
         return s != "" && s != "false";
+    }
+
+    // 行内条件表达式求值（支持 ==, !=, >, <, >=, <=, &&, ||, ! 及路径属性/字面量）
+    bool EvalExpr(Control c, string expr) {
+        if (expr == "") { return false; }
+        string s = expr.Trim();
+        if (s == "") { return false; }
+
+        // 顶层 || 拆分
+        int orIdx = s.IndexOf("||");
+        if (orIdx >= 0) {
+            string left = s.Substring(0, orIdx);
+            string right = s.Substring(orIdx + 2);
+            return this.EvalExpr(c, left) || this.EvalExpr(c, right);
+        }
+
+        // 顶层 && 拆分
+        int andIdx = s.IndexOf("&&");
+        if (andIdx >= 0) {
+            string left = s.Substring(0, andIdx);
+            string right = s.Substring(andIdx + 2);
+            return this.EvalExpr(c, left) && this.EvalExpr(c, right);
+        }
+
+        // 逻辑非 ! 前缀
+        if (s.StartsWith("!")) {
+            return !this.EvalExpr(c, s.Substring(1));
+        }
+
+        // 比较运算符查找
+        string op = "";
+        int opIdx = -1;
+        int opLen = 0;
+
+        int idx = s.IndexOf("==");
+        if (idx >= 0) { op = "=="; opIdx = idx; opLen = 2; }
+        else {
+            idx = s.IndexOf("!=");
+            if (idx >= 0) { op = "!="; opIdx = idx; opLen = 2; }
+            else {
+                idx = s.IndexOf(">=");
+                if (idx >= 0) { op = ">="; opIdx = idx; opLen = 2; }
+                else {
+                    idx = s.IndexOf("<=");
+                    if (idx >= 0) { op = "<="; opIdx = idx; opLen = 2; }
+                    else {
+                        idx = s.IndexOf(">");
+                        if (idx >= 0) { op = ">"; opIdx = idx; opLen = 1; }
+                        else {
+                            idx = s.IndexOf("<");
+                            if (idx >= 0) { op = "<"; opIdx = idx; opLen = 1; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (op != "") {
+            string leftStr = s.Substring(0, opIdx).Trim();
+            string rightStr = s.Substring(opIdx + opLen).Trim();
+            return this.EvalCompare(c, leftStr, op, rightStr);
+        }
+
+        // 单操作数真值判定（原生路径）
+        return ChildWindow.Truthy(this.ValueFor(c, s));
+    }
+
+    bool EvalCompare(Control c, string leftStr, string op, string rightStr) {
+        // 先按数值解析比较
+        bool isLeftNum = false;
+        bool isRightNum = false;
+        double leftNum = this.ParseOperandNum(c, leftStr, out isLeftNum);
+        double rightNum = this.ParseOperandNum(c, rightStr, out isRightNum);
+
+        if (isLeftNum && isRightNum) {
+            switch (op) {
+                case "==": return leftNum == rightNum;
+                case "!=": return leftNum != rightNum;
+                case ">":  return leftNum > rightNum;
+                case "<":  return leftNum < rightNum;
+                case ">=": return leftNum >= rightNum;
+                case "<=": return leftNum <= rightNum;
+                default:   return false;
+            }
+        }
+
+        // 字符串比较
+        string leftVal = this.ResolveOperandStr(c, leftStr);
+        string rightVal = this.ResolveOperandStr(c, rightStr);
+        switch (op) {
+            case "==": return leftVal == rightVal;
+            case "!=": return leftVal != rightVal;
+            case ">":  return leftVal > rightVal;
+            case "<":  return leftVal < rightVal;
+            case ">=": return leftVal >= rightVal;
+            case "<=": return leftVal <= rightVal;
+            default:   return false;
+        }
+    }
+
+    double ParseOperandNum(Control c, string operand, out bool isNum) {
+        isNum = false;
+        if (operand == "") { return 0.0; }
+        if (operand.StartsWith("'") || operand.StartsWith("\"")) {
+            return 0.0;
+        }
+        if (operand == "true" || operand == "false") {
+            return 0.0;
+        }
+        // 尝试解析纯数字字面量
+        if (IsNumericLiteral(operand)) {
+            isNum = true;
+            return operand.ToDouble();
+        }
+        // 尝试解析为模型/作用域路径取值
+        JsonValue v = this.ValueFor(c, operand);
+        if (v != null && v.IsNumber()) {
+            isNum = true;
+            return v.AsDouble(0.0);
+        }
+        return 0.0;
+    }
+
+    static bool IsNumericLiteral(string s) {
+        if (s == "") { return false; }
+        int start = 0;
+        if (s.StartsWith("-") || s.StartsWith("+")) {
+            start = 1;
+            if (s.Length <= 1) { return false; }
+        }
+        bool hasDot = false;
+        for (int i = start; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch == 46) { // '.'
+                if (hasDot) { return false; }
+                hasDot = true;
+            } else if (ch < 48 || ch > 57) { // '0' ~ '9'
+                return false;
+            }
+        }
+        return true;
+    }
+
+    string ResolveOperandStr(Control c, string operand) {
+        if (operand == "") { return ""; }
+        // 引号包裹字面量
+        if ((operand.StartsWith("'") && operand.EndsWith("'")) ||
+            (operand.StartsWith("\"") && operand.EndsWith("\""))) {
+            if (operand.Length >= 2) {
+                return operand.Substring(1, operand.Length - 2);
+            }
+            return "";
+        }
+        if (operand == "true") { return "true"; }
+        if (operand == "false") { return "false"; }
+        if (operand == "null") { return ""; }
+        // 模型/作用域中取值
+        JsonValue v = this.ValueFor(c, operand);
+        if (v == null) { return ""; }
+        return v.AsString("");
     }
 
     // 接口数据协议与执行契约。
