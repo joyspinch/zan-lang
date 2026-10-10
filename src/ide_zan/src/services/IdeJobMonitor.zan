@@ -290,17 +290,34 @@ class IdeJobMonitor {
         return false;
     }
 
+    bool HasActiveJob(IdeJobSnapshot input) {
+        if (input == null || !Current(input, lane)) { return false; }
+        if (lane == 1) { return input.term; }
+        if (lane == 2) { return input.run && runDone != input.runSeq; }
+        if (lane == 3) { return input.git != 0 && gitDone != input.gitSeq; }
+        if (lane == 4) { return input.build && buildDone != input.buildSeq; }
+        if (lane == 5) { return input.ui && uiDone != input.uiSeq; }
+        if (lane == 6) { return input.pub && pubDone != input.pubSeq; }
+        if (lane == 7) { return input.ai && input.request != null; }
+        if (lane == 8) { return input.ai && input.tool != null && toolDone != input.tool; }
+        return false;
+    }
+
     void Run() {
         try {
             while (!cancellation.Token.IsCancellationRequested) {
+                bool busy = false;
                 IdeJobStart start = TakeStart();
-                if (start != null) { bound = start.input; StartOne(start); }
+                if (start != null) { bound = start.input; StartOne(start); busy = true; }
                 IdeJobSnapshot input = ReadSnapshot();
                 if (input != null && lane <= 8) {
                     if (bound == null || !SameJob(bound, input)) { bound = input; }
-                    PollOne(bound);
+                    if (this.HasActiveJob(bound)) {
+                        busy = true;
+                        PollOne(bound);
+                    }
                 }
-                Thread.Sleep(80);
+                Thread.Sleep(busy ? 80 : 200);
             }
         } catch (Exception error) {
             // 接口数据协议与执行契约。
@@ -1034,8 +1051,24 @@ partial class ZanIDE {
         input.request = input.ai ? jobAiRequest : null;
         input.tool = input.ai ? AiWork.Snapshot() : null;
         input.aiLaunchSeq = jobAiLaunchSeq;
+        bool snapshotChanged = prev == null || !ZanIDE.SameJobSnapshot(prev, input);
         jobSnapshot = input;
-        if (submit) { jobMonitor.Submit(input); }
+        if (submit && snapshotChanged) { jobMonitor.Submit(input); }
+    }
+
+    static bool SameJobSnapshot(IdeJobSnapshot a, IdeJobSnapshot b) {
+        if (a == null || b == null) { return false; }
+        return a.workspace == b.workspace && a.session == b.session
+            && a.monitor == b.monitor && a.root == b.root
+            && a.term == b.term && a.termConsumed == b.termConsumed && a.termSeq == b.termSeq
+            && a.run == b.run && a.runConsumed == b.runConsumed && a.runSeq == b.runSeq
+            && a.git == b.git && a.gitSeq == b.gitSeq
+            && a.build == b.build && a.buildConsumed == b.buildConsumed && a.buildSeq == b.buildSeq
+            && a.ui == b.ui && a.uiSeq == b.uiSeq
+            && a.pub == b.pub && a.pubConsumed == b.pubConsumed && a.pubSeq == b.pubSeq
+            && a.ai == b.ai && a.request == b.request && a.tool == b.tool
+            && a.debugger == b.debugger && a.debugSeq == b.debugSeq
+            && a.aiLaunchSeq == b.aiLaunchSeq;
     }
 
     void BeginBuildJob(string target, bool thenRun, bool debug = false, bool hot = false) {
