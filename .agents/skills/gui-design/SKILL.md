@@ -1086,6 +1086,12 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   规范做法：
   1. 新增 ToolStrip 时默认赋予 `dockSide = 1`（Dock.Top 顶部停靠，`position = 0`），新增 StatusBar 时默认赋予 `dockSide = 2`（Dock.Bottom 底部停靠，`position = 0`），使其自动参与外壳停靠排版；
   2. 属性检查器单选排版卡片常驻提供 `Dock: [None 0] [Top 1] [Bot 2] [Left 3] [Right 4] [Fill 5]` 胶囊切换按钮矩阵，一秒在常用停靠与铺满余量间切换，并自动同步坐标与重算布局。
+- **大纲树同级调序方向与视图闭环联动（Outline Sibling Reordering & Immediate Refresh）**：
+  在组件大纲树（Outline TreeView）等纵向层级树视图中，列表物理索引为从上至下（第 0 项在最顶部，第 Count-1 项在最底部）。
+  规范做法：
+  1. 大纲树工具条中 `▲`（向上移动）应对应兄弟列表索引减 1（`MoveSel(-1)`），`▼`（向下移动）对应索引加 1（`MoveSel(1)`），与树节点在视觉列表中的物理位移直觉严格保持一致；
+  2. 触发调序、锁定/解锁或删除后，必须立即触发 `EnsureOutline()` 与 `RequestRedraw()`，使大纲树节点物理顺序与高亮焦点无缝跟随，杜绝视图滞后或焦点跑偏；
+  3. 大纲树激活双击（`OnActivate`）时智能区分容器与展示组件：具备文本属性的控件直接呼出原地编辑框，非文本控件与容器避免误弹重命名浮层。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
