@@ -363,6 +363,15 @@ STANDARDS.md §6.7）。
    - **Tabs 容器选项自动推导与元子节点插槽转挂**：`<tabs>` 容器若未显式指定 `options` 属性，`GenHtml` 与 `Html.Build` 均自动深层扫描子级 `<tab title="...">` / `<tab-pane>` 元素并推导拼接 `options` 字符串；元子节点在 `IsMetaChild` 中标记放行，其内部实际承载的子孙控件自动注入 `slotName = tTitle` 并重定向挂载至父级 `Tabs`，在 AOT 与 JIT 两大模式下达成 100% 同构闭环。
    - **密码输入与扩展属性双向对称性（GetExtra/SetExtra）**：`<input type="password">` 统一通过 `v.SetProp("password", "true")` 声明，且控件层在 `GetExtra` 与 `SetExtra` 中形成完整读写闭环，确保属性获取与状态同步双向对称。
 
+16. **动态模型数组驱动选项绑定与双向值同步规范（`:options` 与 `<option value="...">` JIT/AOT 同构）**：
+   - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ChildWindow.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray()`）时，自动序列化为标准 JSON 字符串（`v.ToJson()`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
+   - **选项反序列化多格式兼容与元数据映射**：组件的 `SetOptionsText` / `SetItemsText` 原生兼容经典竖线分隔字符串（`"A|B|C"`）与结构化 JSON 数组（`"[{\"label\":\"北京\",\"value\":\"bj\"}, ...]"`）。解析 JSON 数组时，标签键优先读取 `label` / `title` / `name` / `text`，值键读取 `value` / `id`，并支持 `disabled` 与 `closable` 元数据映射。
+   - **帧渲染缓存幂等防抖（`optionsRaw` / `itemsSpec`）**：在组件内部维护 `optionsRaw` 原始字符串缓存；当每帧数据同步写入的选项文本与当前缓存一致时立即跳过重新解析与重建子项，彻底避免动画帧循环中重复反序列化造成的性能损耗以及弹窗滚动条、焦点和选中态被意外重置的问题。
+   - **双向绑定语义值与下标自适应（Two-Way Binding Type Adaptability）**：
+     - 当从 `SelectBox` 读取值回写模型时（`ChildWindow.BoundValue`），先检查目标模型字段当前是否为数值类型；若为数值，则回写整型下标字符串（`Convert.ToString(sb.Selected())`）；若为字符串或未初始化，则回写语义值（`sb.SelectedValue()`，回退至 `sb.Text()`）。
+     - 当从模型向 `SelectBox` 写入属性时（`SetProp("value", val)`），优先在选项列表中匹配 `opts[i].val == val || opts[i].label == val`；若未命中则回退为数值下标解析，实现语义值与下标的双向平滑转换。
+   - **JIT 与 AOT `<option value="...">` 编译同构**：当在声明式 HTML 中声明带有显式 `value` 属性的 `<option value="bj">北京</option>` 时，运行时 JIT（`Html.Parse`）与编译期 AOT（`GenHtml.Translate`）统一探测子级是否包含非空自定义 `value`。一旦包含，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并发射为 `SetProp("options", ...)`，确保原生 HTML `<select>` 语义在动静双通道下 100% 行为一致。
+
 
 
 

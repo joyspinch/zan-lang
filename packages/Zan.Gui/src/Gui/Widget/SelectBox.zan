@@ -8,6 +8,8 @@ namespace Gui.Widget;
 class SelectOption {
     // 选项标签（显示文本）。
     string label;
+    // 选项底层取值（未指定时默认为 label）。
+    string val;
     // 多选勾选态（单选模式不用）。
     bool chosen;
     // 表格式下拉（SelectBox.Table）里这一行除首列以外的单元格。
@@ -29,6 +31,19 @@ class SelectOption {
     // 构造普通选项（无附加列、非分组、无子级）。
     SelectOption(string label, bool chosen) {
         this.label = label;
+        this.val = label;
+        this.chosen = chosen;
+        this.cells = null;
+        this.children = null;
+        this.flatIdx = 0 - 1;
+        this.parentIdx = 0 - 1;
+        this.grp = false;
+        this.disabled = false;
+    }
+
+    SelectOption(string label, string val, bool chosen) {
+        this.label = label;
+        this.val = (val != null && val != "") ? val : label;
         this.chosen = chosen;
         this.cells = null;
         this.children = null;
@@ -222,6 +237,8 @@ class SelectBox : Control {
     int popupW;
     // 弹层宽度缓存是否失效（选项集 / 过滤词 / 列数变化时置位）。
     bool popupWDirty;
+    // 选项原始文本或 JSON 串（防帧级频繁重复解析）。
+    string optionsRaw;
 
     // 校验状态常量（Status 的取值）。
     static int Normal() { return 0; }
@@ -280,10 +297,20 @@ class SelectBox : Control {
         this.pathText = "";
         this.popupW = 0;
         this.popupWDirty = true;
+        this.optionsRaw = "";
         this.Change = new UiEvent();
         this.Open = new UiEvent();
         this.Close = new UiEvent();
         this.Hover = new UiEvent();
+    }
+
+    // 当前选中项的数据值（无显式值时返回 label；未选中时返回 ""）。
+    string SelectedValue() {
+        if (selected >= 0 && selected < opts.Count) {
+            string v = opts[selected].val;
+            return (v != null && v != "") ? v : opts[selected].label;
+        }
+        return "";
     }
 
     // 从普通标签列表构建选择框（JSON / 设计器 / 单行场景使用）。
@@ -305,18 +332,59 @@ class SelectBox : Control {
         return outp;
     }
 
-    // "a|b|c" 文本 → 选项列表（SetExtra 反序列化；滚动复位）。
+    // "a|b|c" 文本或 JSON 数组 → 选项列表（SetExtra 反序列化；滚动复位）。
     void SetOptionsText(string text) {
+        if (text == optionsRaw && opts != null && opts.Count > 0) { return; }
+        optionsRaw = text != null ? text : "";
         popupWDirty = true;
         opts = new List<SelectOption>();
         if (text == null) {
+            selected = 0 - 1;
             scrollY = 0;
             return;
         }
+        string s = text.Trim();
+        if (s == "") {
+            selected = 0 - 1;
+            scrollY = 0;
+            return;
+        }
+        if (s.StartsWith("[") && s.EndsWith("]")) {
+            JsonValue arr = JsonValue.ParseLenient(s);
+            if (arr != null && arr.IsArray()) {
+                for (int i = 0; i < arr.Count(); i = i + 1) {
+                    JsonValue item = arr.At(i);
+                    if (item == null) { continue; }
+                    if (item.IsObject()) {
+                        string lbl = item.Str("label", "");
+                        if (lbl == "") { lbl = item.Str("text", ""); }
+                        if (lbl == "") { lbl = item.Str("name", ""); }
+                        if (lbl == "") { lbl = item.Str("title", ""); }
+                        string v = item.Str("value", "");
+                        if (v == "") { v = item.Str("id", ""); }
+                        if (v == "") { v = lbl; }
+                        if (lbl == "") { lbl = v; }
+                        SelectOption opt = new SelectOption(lbl, v, false);
+                        opt.disabled = item.Bool("disabled", false);
+                        opts.Add(opt);
+                    } else {
+                        string sv = item.AsString("");
+                        opts.Add(new SelectOption(sv, sv, false));
+                    }
+                }
+                if (selected >= opts.Count) { selected = opts.Count - 1; }
+                scrollY = 0;
+                return;
+            }
+        }
         List<string> parts = text.Split("|");
         for (int i = 0; i < parts.Count; i = i + 1) {
-            opts.Add(new SelectOption(parts[i], false));
+            string p = parts[i].Trim();
+            if (p != "") {
+                opts.Add(new SelectOption(p, p, false));
+            }
         }
+        if (selected >= opts.Count) { selected = opts.Count - 1; }
         scrollY = 0;
     }
 
@@ -957,17 +1025,71 @@ class SelectBox : Control {
         return ps;
     }
 
-    // 选项列表为文本，每项一个 `label|value` 对。
+    // 选项列表为文本或原始 JSON，每项一个 `label|value` 对。
     override string GetExtra(string key) {
-        if (key == "options") { return this.OptionsText(); }
+        if (key == "options") { return optionsRaw != "" ? optionsRaw : this.OptionsText(); }
+        if (key == "text" || key == "label" || key == "selectedText") { return this.Text(); }
+        if (key == "val" || key == "selectedValue") { return this.SelectedValue(); }
         return "";
     }
 
-    // 覆写：写回扩展属性，"options" 按每行 `label|value` 解析。
+    // 覆写：写回扩展属性，"options" 支持每行 label|value 或 JSON 数组，值属性支持文本与键名反查。
     override bool SetExtra(string key, string val) {
-        if (key != "options") { return false; }
-        this.SetOptionsText(val);
+        if (key == "options") {
+            this.SetOptionsText(val);
+            return true;
+        }
+        if (key == "value" || key == "selected" || key == "text" || key == "label" || key == "val" || key == "selectedValue") {
+            if (val == null) { this.Select(0 - 1); return true; }
+            for (int i = 0; i < opts.Count; i = i + 1) {
+                if (opts[i].val == val || opts[i].label == val) {
+                    this.Select(i);
+                    return true;
+                }
+            }
+            if (val != "" && SelectBox.IsIntString(val)) {
+                int idx = Convert.ToInt32(val);
+                if (idx >= 0 && idx < opts.Count) {
+                    this.Select(idx);
+                    return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    static bool IsIntString(string s) {
+        if (s == null || s == "") { return false; }
+        int start = 0;
+        if (s[0] == 45) { // '-'
+            start = 1;
+            if (s.Length <= 1) { return false; }
+        }
+        for (int i = start; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch < 48 || ch > 57) { return false; }
+        }
         return true;
+    }
+
+    override string GetProp(string key) {
+        if (key == "options") { return optionsRaw != "" ? optionsRaw : this.OptionsText(); }
+        if (key == "text" || key == "label" || key == "selectedText") { return this.Text(); }
+        if (key == "val" || key == "selectedValue") { return this.SelectedValue(); }
+        if (key == "value" || key == "selected") { return Convert.ToString(selected); }
+        return base.GetProp(key);
+    }
+
+    override void SetProp(string key, string val) {
+        if (key == "options") {
+            this.SetOptionsText(val);
+            return;
+        }
+        if (key == "value" || key == "selected" || key == "text" || key == "label" || key == "val" || key == "selectedValue") {
+            if (this.SetExtra(key, val)) { return; }
+        }
+        base.SetProp(key, val);
     }
 
     // 覆写：公共事件之外提供 "Change"/"SelectionChanged"/"Open"/"Close"/"Hover"。

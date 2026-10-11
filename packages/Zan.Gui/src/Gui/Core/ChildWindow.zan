@@ -350,6 +350,20 @@ class ChildWindow {
     // 再取 text。
     string BoundValue(Control c) {
         if (c.bindProp != "") { return c.GetProp(c.bindProp); }
+        string k = c.Kind();
+        if (k == "SelectBox") {
+            JsonValue scope = this.ScopeOf(c);
+            if (scope != null) {
+                JsonValue cur = scope.PathGet(c.bindPath);
+                if (cur != null && cur.IsNumber()) {
+                    return c.GetProp("value");
+                }
+            }
+            string sv = c.GetProp("selectedValue");
+            if (sv != "") { return sv; }
+            string txt = c.GetProp("text");
+            if (txt != "") { return txt; }
+        }
         string s = c.GetProp("value");
         if (s == "") { s = c.GetProp("text"); }
         return s;
@@ -362,8 +376,9 @@ class ChildWindow {
         if (c.bindTrim) {
             s = s.Trim();
         }
-        bool isBoolCtrl = (c is Checkbox || c is Switch);
-        bool isNumCtrl = (c is Slider || c is InputNumber || c is Progress || c is Rate || c.bindNumber);
+        string k = c.Kind();
+        bool isBoolCtrl = (k == "Checkbox" || k == "Switch");
+        bool isNumCtrl = (k == "Slider" || k == "InputNumber" || k == "Progress" || k == "Rate" || c.bindNumber);
 
         JsonValue scope = this.ScopeOf(c);
         if (scope != null) {
@@ -811,6 +826,7 @@ class ChildWindow {
         // 模型/作用域中取值
         JsonValue v = this.ValueFor(c, operand);
         if (v == null) { return ""; }
+        if (v.IsArray()) { return v.ToJson(); }
         return v.AsString("");
     }
 
@@ -1133,13 +1149,21 @@ class ChildWindow {
     }
 }
 
+interface IModalWindow {
+    bool IsOpen();
+    bool NeedsRedraw();
+    bool OwnsWindow(nint hwnd);
+    bool ApplyEvent(nint hwnd);
+    void RenderWindow();
+}
+
 // GUI 控件排版布局与事件分发契约。
 // 接口数据协议与执行契约。
 // GUI 控件排版布局与事件分发契约。
 // 接口数据协议与执行契约。
 class ChildWindows {
     static List<ChildWindow> wins;
-    static FilePicker picker;
+    static IModalWindow picker;
     // 最近一次已路由的事件序号与结果（`RouteEvent` 幂等）。标准循环
     // `Form.Run` 与自带帧钩子的宿主（ZanIDE 外壳）都会按 hwnd 路由，
     // 同一事件经两处必然把一次按压/释放重放一遍——双击计数、长按
@@ -1151,7 +1175,7 @@ class ChildWindows {
     // 组件自建的附加选择器（Upload 内建选文件弹窗等）。单一 `picker`
     // 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
     // 由组件按需登记，数量不限。PumpAll/RouteEvent/Wants 统一照顾两处。
-    static List<FilePicker> pickers;
+    static List<IModalWindow> pickers;
 
     // 注册表（惰性创建）。
     static List<ChildWindow> All() {
@@ -1180,16 +1204,16 @@ class ChildWindows {
 
     // GUI 控件排版布局与事件分发契约。
     // 接口数据协议与执行契约。
-    static void RegisterPicker(FilePicker p) {
+    static void RegisterPicker(IModalWindow p) {
         ChildWindows.picker = p;
     }
 
     // 登记一个组件自建的选择器（Upload 内建弹窗）。同一实例重复登记
     // 是无操作；`PrunePickers` 在它关闭后移出，因此宿主应在每次打开
     // 时重新登记（组件复用同一 picker 实例）。返回 true = 首次登记。
-    static bool RegisterComponentPicker(FilePicker p) {
+    static bool RegisterComponentPicker(IModalWindow p) {
         if (ChildWindows.pickers == null) {
-            ChildWindows.pickers = new List<FilePicker>();
+            ChildWindows.pickers = new List<IModalWindow>();
         }
         if (ChildWindows.pickers.Contains(p)) { return false; }
         ChildWindows.pickers.Add(p);
@@ -1230,7 +1254,7 @@ class ChildWindows {
     static bool AnyPickerWants() {
         if (ChildWindows.pickers == null) { return false; }
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            FilePicker p = ChildWindows.pickers[i];
+            IModalWindow p = ChildWindows.pickers[i];
             if (p.IsOpen() && p.NeedsRedraw()) { return true; }
         }
         return false;
@@ -1247,14 +1271,13 @@ class ChildWindows {
 
     // 接口数据协议与执行契约。
     static int Deadline(int deadline) {
-        int d = deadline;
         foreach (ChildWindow w in ChildWindows.All()) {
             int a = w.AnimNextMs();
-            if (a >= 0 && (d < 0 || a < d)) { d = a; }
+            if (a >= 0 && (deadline < 0 || a < deadline)) { deadline = a; }
             int f = w.FxNextMs();
-            if (f >= 0 && (d < 0 || f < d)) { d = f; }
+            if (f >= 0 && (deadline < 0 || f < deadline)) { deadline = f; }
         }
-        return d;
+        return deadline;
     }
 
     // 组件选择器开着时把它的重绘需求折叠进主应用：轮询判据（开着时
@@ -1263,7 +1286,7 @@ class ChildWindows {
         if (ChildWindows.pickers == null) { return false; }
         bool woken = false;
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            FilePicker p = ChildWindows.pickers[i];
+            IModalWindow p = ChildWindows.pickers[i];
             if (!p.IsOpen()) { continue; }
             if (p.NeedsRedraw() && !woken) {
                 main.RequestRedraw();
@@ -1276,9 +1299,9 @@ class ChildWindows {
     // GUI 控件排版布局与事件分发契约。
     static void PrunePickers() {
         if (ChildWindows.pickers == null) { return; }
-        List<FilePicker> keep = new List<FilePicker>();
+        List<IModalWindow> keep = new List<IModalWindow>();
         for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-            FilePicker p = ChildWindows.pickers[i];
+            IModalWindow p = ChildWindows.pickers[i];
             if (p.IsOpen()) { keep.Add(p); }
         }
         ChildWindows.pickers = keep;
@@ -1329,7 +1352,7 @@ class ChildWindows {
         }
         if (ChildWindows.pickers != null) {
             for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-                FilePicker p = ChildWindows.pickers[i];
+                IModalWindow p = ChildWindows.pickers[i];
                 if (p.OwnsWindow(hwnd)) {
                     p.ApplyEvent(hwnd);
                     ChildWindows.routedHandled = true;
@@ -1369,7 +1392,7 @@ class ChildWindows {
         // 内部自会跳过不需要重绘的帧。
         if (ChildWindows.pickers != null) {
             for (int i = 0; i < ChildWindows.pickers.Count; i = i + 1) {
-                FilePicker p = ChildWindows.pickers[i];
+                IModalWindow p = ChildWindows.pickers[i];
                 if (p.IsOpen()) { p.RenderWindow(); }
             }
         }

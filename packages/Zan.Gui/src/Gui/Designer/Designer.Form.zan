@@ -616,6 +616,8 @@ partial class Designer {
         if (f == null || !this.DesignVisible(f)) { return; }
         f.fx = this.DesignWorldX(f) - this.DesignEditOriginX(f);
         f.fy = this.DesignWorldY(f) - this.DesignEditOriginY(f);
+        if (f.fx < 0) { f.fx = 0; }
+        if (f.fy < 0) { f.fy = 0; }
         f.fw = f.LayoutW();
         f.fh = f.LayoutH();
         f.position = 1;
@@ -928,12 +930,10 @@ partial class Designer {
         while (hit != null) {
             for (int i = pvDocNodes.Count - 1; i >= 0; i = i - 1) {
                 DesignPreviewNode node = pvDocNodes[i];
-                if (node.visible && !node.field.IsNonVisual()) {
-                    if (node.control == hit || (node.control != null && node.control.parent == hit)) {
-                        freeSelPX = node.originX;
-                        freeSelPY = node.originY;
-                        return node.field;
-                    }
+                if (node.visible && !node.field.IsNonVisual() && node.control == hit) {
+                    freeSelPX = node.originX;
+                    freeSelPY = node.originY;
+                    return node.field;
                 }
             }
             hit = hit.parent;
@@ -1018,6 +1018,8 @@ partial class Designer {
             else { cont.kids.Add(f); }
             f.fx = absX - newBaseX;
             f.fy = absY - newBaseY;
+            if (f.fx < 0) { f.fx = 0; }
+            if (f.fy < 0) { f.fy = 0; }
             this.DesignDeclareRect(f);
             moved = true;
         }
@@ -1025,6 +1027,7 @@ partial class Designer {
         if (cont != null && cont.kind == "SplitPanel") { cont.uiState.Set(designDropSlot); }
         this.SyncFreeSelBase();
         if (moved) {
+            this.MarkDocDirty();
             msg = cont == null ? Designer.T("moved to canvas", "已移回画布")
                 : Designer.T("moved into ", "已移入 ") + cont.KindName();
         }
@@ -1335,23 +1338,25 @@ partial class Designer {
             while (step * psMilli / 1000 < app.Scale(6)) { step = step * 2; }
             int gridCol = Style.Part(app, "designer", "grid", "", "", "", Style.SNormal()).BgOr(0);
             if (gridCol == 0) {
-                gridCol = Style.Fade(t.textSecondary, 35);
+                gridCol = Style.Fade(t.textSecondary, 85);
             } else {
-                gridCol = Style.Fade(gridCol, 40);
+                gridCol = Style.Fade(gridCol, 90);
             }
+            int dotSz = app.Scale(2);
+            if (dotSz < 1) { dotSz = 1; }
             for (int gy = 0; gy <= dh; gy = gy + step) {
                 int py = oy + gy * psMilli / 1000;
                 for (int gx = 0; gx <= dw; gx = gx + step) {
-                    bool hitField = false;
+                    bool hitLeaf = false;
                     for (int fi = 0; fi < fields.Count; fi = fi + 1) {
                         FormField f = fields[fi];
-                        if (gx >= f.fx && gx < f.fx + f.fw && gy >= f.fy && gy < f.fy + f.fh) {
-                            hitField = true;
+                        if (!f.IsContainer() && gx >= f.fx && gx < f.fx + f.fw && gy >= f.fy && gy < f.fy + f.fh) {
+                            hitLeaf = true;
                             break;
                         }
                     }
-                    if (!hitField) {
-                        c.FillRect(ox + gx * psMilli / 1000, py, 1, 1, gridCol);
+                    if (!hitLeaf) {
+                        c.FillRect(ox + gx * psMilli / 1000, py, dotSz, dotSz, gridCol);
                     }
                 }
             }
@@ -1386,7 +1391,10 @@ partial class Designer {
                 int mDesY = (app.mouseY - oy) * 1000 / psMilli;
                 FormField cont = this.FreeDropContainerDevice(this.DesignPointerPx(app.mouseX, ox, psMilli),
                         this.DesignPointerPx(app.mouseY, oy, psMilli));
-                if (cont == sel || this.DesignInSubtree(sel, cont)) { cont = null; }
+                FormField currentParent = this.DesignOwnerOf(sel);
+                if (cont == sel || this.DesignInSubtree(sel, cont)) {
+                    cont = currentParent;
+                }
                 this.DrawFreeDropHi(app, c, ox, oy, psMilli, cont);
                 if (ek == 3) {
                     // 只在画布内松手才换父：拖到画布外（工具条/检查器
@@ -1411,6 +1419,7 @@ partial class Designer {
         if (!locked && freeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             Window.SetCursor(1);
             if (ek == 2 && app.window.EventButton() == 0) {
+                app.focus.ClearFocus();
                 freePanning = true;
                 freePanSX = app.mouseX;
                 freePanSY = app.mouseY;
@@ -1422,6 +1431,7 @@ partial class Designer {
         // 画板右键菜单触发：在画板内右键点击，命中控件则选中该控件并弹出上下文菜单，点在空白处则弹出全局画布菜单
         if (!locked && !preview && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 1
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            app.focus.ClearFocus();
             int mDesX = (app.mouseX - ox) * 1000 / psMilli;
             int mDesY = (app.mouseY - oy) * 1000 / psMilli;
             FormField hit = InRect(app.mouseX, app.mouseY, ox, oy, cw2, ch2)
@@ -1451,6 +1461,7 @@ partial class Designer {
         // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
         if (!locked && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+            app.focus.ClearFocus();
             bool started = false;
             // 拖拽基先对齐当前选中项：框选/撤销/换父之后存的旧基
             // 会让手柄命中测试与随后的拖拽全部错位。
@@ -1627,6 +1638,8 @@ partial class Designer {
                     DesignMoveStart move = designMoves[i];
                     move.field.fx = move.x + dx - this.DesignEditOriginX(move.field);
                     move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    if (move.field.fx < 0) { move.field.fx = 0; }
+                    if (move.field.fy < 0) { move.field.fy = 0; }
                     this.DesignDeclareRect(move.field);
                 }
                 this.MarkDocDirty();

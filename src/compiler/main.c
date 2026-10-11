@@ -1098,6 +1098,7 @@ typedef struct pi_file {
     pi_name_t **idents; int ident_count, ident_cap; /* 核心系统底层抽象与内存语义契约 */
     char **usings; int using_count, using_cap;    /* 核心系统底层抽象与内存语义契约 */
     int has_ext;                /* 核心系统底层抽象与内存语义契约 */
+    int has_controller;         /* 控制器/路由/表等生成器实体 */
     int pkg_src;                /* 内部辅助实现 */
     int gate_live;              /* 内部辅助实现 */
     int included;               /* 核心系统底层抽象与内存语义契约 */
@@ -1523,7 +1524,7 @@ static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
 
 /* 内部辅助实现 */
 #define PI_META_MAGIC UINT32_C(0x5a504d32)
-#define PI_META_VERSION UINT32_C(2)
+#define PI_META_VERSION UINT32_C(3)
 #define PI_META_MAX_NAMES 100000u
 
 static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
@@ -1538,12 +1539,14 @@ static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
     pi_dir_t *saved_head = pi_dirs_head, *saved_tail = pi_dirs_tail;
     uint32_t magic = 0, version = 0, top = 0, idents = 0, usings = 0;
     unsigned char ext = 0;
+    unsigned char ctrl = 0;
     int ok = fread(&magic, sizeof(magic), 1, in) == 1 &&
              fread(&version, sizeof(version), 1, in) == 1 &&
              fread(&top, sizeof(top), 1, in) == 1 &&
              fread(&idents, sizeof(idents), 1, in) == 1 &&
              fread(&usings, sizeof(usings), 1, in) == 1 &&
              fread(&ext, sizeof(ext), 1, in) == 1 &&
+             fread(&ctrl, sizeof(ctrl), 1, in) == 1 &&
              magic == PI_META_MAGIC && version == PI_META_VERSION &&
              top <= PI_META_MAX_NAMES && idents <= PI_META_MAX_NAMES &&
              usings <= PI_META_MAX_NAMES;
@@ -1595,6 +1598,7 @@ static int pi_meta_cache_load(pi_file_t *f, const char *src, size_t len) {
         return 0;
     }
     f->has_ext = ext != 0;
+    f->has_controller = ctrl != 0;
     g_scale_stats.metadata_cache_hits++;
     return 1;
 }
@@ -1632,12 +1636,14 @@ static void pi_meta_cache_write(const pi_file_t *f, const char *src, size_t len)
     uint32_t idents = (uint32_t)f->ident_count;
     uint32_t usings = (uint32_t)f->using_count;
     unsigned char ext = (unsigned char)(f->has_ext != 0);
+    unsigned char ctrl = (unsigned char)(f->has_controller != 0);
     int ok = fwrite(&magic, sizeof(magic), 1, out) == 1 &&
              fwrite(&version, sizeof(version), 1, out) == 1 &&
              fwrite(&top, sizeof(top), 1, out) == 1 &&
              fwrite(&idents, sizeof(idents), 1, out) == 1 &&
              fwrite(&usings, sizeof(usings), 1, out) == 1 &&
-             fwrite(&ext, sizeof(ext), 1, out) == 1;
+             fwrite(&ext, sizeof(ext), 1, out) == 1 &&
+             fwrite(&ctrl, sizeof(ctrl), 1, out) == 1;
     for (uint32_t i = 0; ok && i < top; i++) {
         const pi_name_t *n = f->top[i];
         uint16_t len16 = n->len > UINT16_MAX ? 0 : (uint16_t)n->len;
@@ -1705,6 +1711,22 @@ static void pi_scan_file(pi_file_t *f) {
         case TK_RBRACE:
             if (depth > 0) depth--;
             break;
+        case TK_LBRACKET: {
+            zan_token_t next = zan_lexer_peek(&lex);
+            if (next.kind == TK_IDENT) {
+                if ((next.str_val.len == 5 && memcmp(next.str_val.str, "Route", 5) == 0) ||
+                    (next.str_val.len == 13 && memcmp(next.str_val.str, "ApiController", 13) == 0) ||
+                    (next.str_val.len == 5 && memcmp(next.str_val.str, "Table", 5) == 0) ||
+                    (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpGet", 7) == 0) ||
+                    (next.str_val.len == 8 && memcmp(next.str_val.str, "HttpPost", 8) == 0) ||
+                    (next.str_val.len == 7 && memcmp(next.str_val.str, "HttpPut", 7) == 0) ||
+                    (next.str_val.len == 10 && memcmp(next.str_val.str, "HttpDelete", 10) == 0) ||
+                    (next.str_val.len == 9 && memcmp(next.str_val.str, "HttpPatch", 9) == 0)) {
+                    f->has_controller = 1;
+                }
+            }
+            break;
+        }
         case TK_USING: {
             char subdir[512];
             size_t used = 0;
@@ -1804,6 +1826,14 @@ static void pi_scan_file(pi_file_t *f) {
             }
             pi_name_t *cur_id = pi_intern(tok.str_val.str,
                                           tok.str_val.len);
+            if (prev == TK_COLON) {
+                if ((tok.str_val.len == 10 && memcmp(tok.str_val.str, "Controller", 10) == 0) ||
+                    (tok.str_val.len == 13 && memcmp(tok.str_val.str, "ApiController", 13) == 0) ||
+                    (tok.str_val.len == 13 && memcmp(tok.str_val.str, "AppController", 13) == 0) ||
+                    (tok.str_val.len == 15 && memcmp(tok.str_val.str, "AdminController", 15) == 0)) {
+                    f->has_controller = 1;
+                }
+            }
             if (prev != TK_DOT) last_id = cur_id;
             pi_flag_ident(f, tok.str_val.str, tok.str_val.len);
             /* 核心系统底层抽象与内存语义契约 */
@@ -2437,10 +2467,9 @@ static int pi_close_once(const char *stdlib_root) {
         for (int i = 0; i < d->file_count; i++) {
             pi_file_t *f = &d->files[i];
             if (f->included) continue;
-            int hit = f->has_ext || (f->pkg_src && !f->gate_live);
+            int hit = f->has_ext || f->has_controller;
             const char *why = f->has_ext ? "ext"
-                              : (f->pkg_src ? (f->gate_live ? NULL : "pkg")
-                                             : NULL);
+                              : (f->has_controller ? "controller" : NULL);
             for (int k = 0; k < f->top_count && !hit; k++)
                 if (f->top[k]->flagged) { hit = 1; why = f->top[k]->str; }
             if (!hit) continue;

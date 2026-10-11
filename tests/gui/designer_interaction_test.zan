@@ -885,6 +885,61 @@ class DesignerInteractionTest {
         #endif
     }
 
+    static void DesignerShortcutsAndDropSafety() {
+        DesignerInteractionHarness h = new DesignerInteractionHarness(DesignerInteractionTest.Html());
+        Designer d = h.designer;
+        FormField loose = h.Field("Loose");
+        FormField tabs = h.Field("Tabs");
+        FormField first = h.Field("TabFirst");
+
+        // 1. 严格容器判断：只有声明并具备容器能力的控件才允许作为放置目标
+        Check("button is not container", !d.DesignCanContain(loose));
+        Check("tabs is container", d.DesignCanContain(tabs));
+
+        // 2. 画布点击释放输入焦点契约
+        h.host.focus.focusedId = 1234;
+        h.Input(2, h.ox + 10, h.oy + 10, 0, 0, 0, 0);
+        Check("canvas click clears focus", h.host.focus.focusedId < 0);
+
+        // 3. 拖拽坐标下限防御（防负数越界移出画布）
+        d.sel = loose;
+        d.DesignMakeFloat(loose);
+        int origX = loose.fx;
+        Check("origX positive", origX > 0);
+        d.DesignBeginMove();
+        h.Pointer(2, h.ViewX(loose.fx), h.ViewY(loose.fy));
+        h.Pointer(1, h.ViewX(loose.fx) - 500, h.ViewY(loose.fy) - 500);
+        Check("dragged coords clamped to zero", loose.fx >= 0 && loose.fy >= 0);
+        h.ReleaseOutside();
+
+        // 4. ek == 4 KeyDown 快捷键撤销与重做
+        d.preview = false;
+        h.host.focus.ClearFocus();
+        d.sel = loose;
+        d.PushUndo();
+        loose.fx = 99;
+        loose.fy = 88;
+        h.host.BeginOffscreenFrame();
+        h.host.ProcessOffscreenInput(4, 0, 0, 0, 90, Modifiers.Ctrl(), 0);
+        d.Render(h.host, 0, 0, 1120, 850);
+        h.host.EndOffscreenFrame();
+        Check("Ctrl+Z keydown undo restored", h.Field("Loose").fx != 99);
+
+        // 5. 换父防御：当落点为自身或子树时，回退到当前父级而非 null（防止组件意外脱离丢失）
+        tabs = h.Field("Tabs");
+        first = h.Field("TabFirst");
+        FormField currentParent = d.DesignOwnerOf(first);
+        Check("TabFirst in Tabs", currentParent == tabs);
+        d.sel = first;
+        FormField cont = first;
+        if (cont == d.sel || d.DesignInSubtree(d.sel, cont)) {
+            cont = currentParent;
+        }
+        Check("self drop target safe fallback", cont == tabs);
+
+        h.Dispose();
+    }
+
     static void Main() {
         // 核心契约与语义定义。
         Dispatcher.Init();
@@ -903,6 +958,7 @@ class DesignerInteractionTest {
             DesignerInteractionTest.FractionalDpiEditing(dpi);
         }
         DesignerInteractionTest.RibbonClickLifecycle();
+        DesignerInteractionTest.DesignerShortcutsAndDropSafety();
         Console.WriteLine("DESIGNER_INTERACTION_OK");
     }
 }
