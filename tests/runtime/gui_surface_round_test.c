@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +16,6 @@ extern void zan_gui_surface_rounded_rect(int32_t, int32_t, int32_t, int32_t, int
 extern void zan_gui_surface_rounded_rect_mask(int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t);
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "surface round line %d: %s\n", __LINE__, #c); exit(1); } } while (0)
 
-/* 底层系统交互与数据协议契约 */
 static double coverage(int x, int y, int w, int h, int r) {
     if (x < 0 || y < 0 || x >= w || y >= h || w <= 0 || h <= 0) return 0;
     if (r < 0) r = 0;
@@ -66,7 +64,6 @@ static void bitmap_boundaries(void) {
     src[3] = 0xff334455u; src[4] = 0xff445566u;
     zan_bitmap img = {0};
     img.pixels = src; img.width = 2; img.height = 2; img.stride = 3;
-    /* 底层系统交互与数据协议契约 */
     zan_gui_clear(id, 0);
     zan_gui_blit_pixels(id, &img, 2, 1, 1, 1, 1, 1, 1, 1);
     CHECK(dst[5] == src[4]);
@@ -116,7 +113,6 @@ int main(void) {
             near_pixel(p[y*32+x], reference(backgrounds[bg], fills[f], borders[b], o, in));
         }
     }
-    /* 底层系统交互与数据协议契约 */
     uint32_t one[1024];
     zan_gui_clear(id, 0);
     zan_gui_fill_rounded_rect(id, 4, 4, 24, 20, 7, (int32_t)0xff2288eeu);
@@ -128,7 +124,6 @@ int main(void) {
         CHECK(p[i] == one[i]); fractional++;
     }
     CHECK(fractional > 0);
-    /* 底层系统交互与数据协议契约 */
     zan_gui_clear(id, 0);
     zan_gui_push_clip(id,4,4,12,12);
     zan_gui_push_clip(id,4,4,6,6);

@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,11 +44,9 @@ static uint32_t frame_hash(void) {
     return h;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static float *cube_mvp(float rad, float dist, float r) {
     static float m[16];
     float c = (float)cos(rad), s = (float)sin(rad);
-    /* 底层系统交互与数据协议契约 */
     float cy=(float)cos(0.4), sy=(float)sin(0.4);
     float R[16] = {
         c,        0,   -s,       0,
@@ -57,9 +54,7 @@ static float *cube_mvp(float rad, float dist, float r) {
         cy*s,    -sy,  cy*c,     0,
         0,        0,    0,       1,
     };
-    /* 模块核心语义抽象与接口调用契约 */
     float V[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,-dist,1 };
-    /* 核心系统底层抽象与内存语义契约 */
     float f = 1.0f / (float)tan(0.5235988);
     float P[16] = {
         f / ((float)W / (float)H), 0, 0, 0,
@@ -67,7 +62,6 @@ static float *cube_mvp(float rad, float dist, float r) {
         0, 0, 10.0f/(1.0f-100.0f), (1.0f*100.0f)/(1.0f-100.0f),
         0, 0, -1, 0,
     };
-    /* 核心系统底层抽象与内存语义契约 */
     float PV[16];
     for (int col = 0; col < 4; col++)
         for (int row = 0; row < 4; row++) {
@@ -139,19 +133,17 @@ int main(int argc, char **argv) {
     LOAD(draw3d, game, "zan_game_draw3d");
 
     build_cube();
-    /* 模块核心语义抽象与接口调用契约 */
     backend(0);
     int s = create(W, H);
     CHECK(s >= 0);
     clear_rect(s, 0, 0, W, H, 0xFF203040);
     int mesh_cpu = mesh_create(s, cube_verts, 24, cube_idx, 36);
-    (void)mesh_cpu;   /* 核心系统底层抽象与内存语义契约 */
+    (void)mesh_cpu;   
     int cpu_ret = draw3d(s, 1, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL);
     capture(s);
     uint32_t cpu_hash = frame_hash();
     if (cpu_ret != 0) { fprintf(stderr, "GL 3D: CPU backend must report 0\n"); return 1; }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (!backend(1) || strcmp(backend_name(), "gl")) {
         fprintf(stderr, "SKIP: real GL 3.3 unavailable\n");
         return 77;
@@ -164,19 +156,16 @@ int main(int argc, char **argv) {
     capture(s);
     uint32_t h0 = frame_hash();
     CHECK(h0 != cpu_hash);
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(center_r() > 0x50 && center_g() > 0x50);
 
-    /* 底层系统交互与数据协议契约 */
     clear_rect(s, 0, 0, W, H, 0xFF203040);
     CHECK(draw3d(s, mesh, cube_mvp(0.7f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
     capture(s);
     uint32_t h1 = frame_hash();
     CHECK(h0 != h1);
 
-    /* 模块核心语义抽象与接口调用契约 */
     unsigned char checker[18 + 2*2*4] = {0};
-    checker[2] = 2;             /* 核心系统底层抽象与内存语义契约 */
+    checker[2] = 2;             
     checker[12] = 2; checker[14] = 2;   /* 2x2, little-endian */
     checker[16] = 32; checker[17] = 0x28; /* 32bpp, top-down */
     {
@@ -196,7 +185,6 @@ int main(int argc, char **argv) {
     uint32_t h2 = frame_hash();
     CHECK(h1 != h2);
 
-    /* 模块核心语义抽象与接口调用契约 */
     float quad_v[2*4*8] = {0};
     uint16_t quad_i[12];
     const float corners[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
@@ -231,7 +219,6 @@ int main(int argc, char **argv) {
     CHECK(((center >> 16) & 255) > 150 && (center & 255) < 50);
     CHECK((center >> 24) == 255);
 
-    /* 模块核心语义抽象与接口调用契约 */
     clear_rect(s, 0, 0, W, H, 0xFF203040);
     push_clip(s, 0, 0, W/2, H);
     CHECK(draw3d(s, qmesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
@@ -257,7 +244,6 @@ int main(int argc, char **argv) {
     capture(s);
     CHECK(frame_hash() != cpu_hash);
 
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(destroy(s) == 0);
     s = create(W, H);
     CHECK(s >= 0);

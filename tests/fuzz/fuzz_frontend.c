@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -14,10 +13,8 @@
 #include "checker.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    /* 底层系统交互与数据协议契约 */
     if (size > 64 * 1024) return 0;
 
-    /* 底层系统交互与数据协议契约 */
     char *src = (char *)malloc(size + 1);
     if (!src) return 0;
     memcpy(src, data, size);
@@ -28,7 +25,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     zan_diag_set_capture(diag, true);           /* store, don't print */
     zan_diag_add_file(diag, "<fuzz>", src);
 
-    /* 底层系统交互与数据协议契约 */
     {
         zan_lexer_t lex;
         zan_lexer_init(&lex, src, size, 0, arena, diag);
@@ -38,7 +34,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_ast_node_t *ast = NULL;
     {
         zan_lexer_t lex;
@@ -48,7 +43,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         ast = zan_parser_parse(&parser);
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (ast && !zan_diag_has_errors(diag)) {
         zan_parser_flatten_nested_types(ast, arena, diag);
         zan_parser_merge_partials(ast, arena, diag);
@@ -60,7 +54,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             zan_binder_init(&binder, arena, diag);
             zan_binder_bind(&binder, ast);
 
-            /* 底层系统交互与数据协议契约 */
             zan_checker_t checker;
             zan_checker_init(&checker, &binder, arena, diag);
             zan_checker_check(&checker, ast);

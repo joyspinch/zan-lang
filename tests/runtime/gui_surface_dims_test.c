@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -36,12 +35,10 @@ static void test_negative_dims_rejected(void) {
 }
 
 static void test_oversize_dims_rejected(void) {
-    /* 底层系统交互与数据协议契约 */
     i64 s = zan_gui_create_surface(100000, 100000);
     EXPECT(s < 0, "create_surface(100000,100000) should fail (got %lld)", (long long)s);
     if (s >= 0) zan_gui_destroy_surface(s);
 
-    /* 底层系统交互与数据协议契约 */
     s = zan_gui_create_surface(16385, 16);
     EXPECT(s < 0, "create_surface(16385,16) should fail (got %lld)", (long long)s);
     if (s >= 0) zan_gui_destroy_surface(s);

@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include "src/common/json.h"
 
 #include <stdio.h>

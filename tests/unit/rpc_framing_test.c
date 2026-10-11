@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include "src/common/rpc.h"
 
 #include <stdio.h>
@@ -16,7 +15,6 @@ static int failures = 0;
     }                                                                       \
 } while (0)
 
-/* 底层系统交互与数据协议契约 */
 typedef struct {
     const char *data;
     size_t len;
@@ -38,35 +36,26 @@ static char *read_frame(const char *frame, long max_len) {
     return rpc_read_message_cb(mem_read_byte, &m, max_len);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void test_bad_content_length(void) {
-    /* 底层系统交互与数据协议契约 */
     char *r = read_frame("Content-Length: abc\r\n\r\n", 1024);
     EXPECT(r == NULL, "Content-Length: abc should be rejected");
 
-    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length: -5\r\n\r\n", 1024);
     EXPECT(r == NULL, "negative Content-Length should be rejected");
 
-    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length: 5x\r\n\r\n12345", 1024);
     EXPECT(r == NULL, "Content-Length with trailing junk should be rejected");
 
-    /* 核心系统底层抽象与内存语义契约 */
     r = read_frame("Content-Length:\r\n\r\n", 1024);
     EXPECT(r == NULL, "empty Content-Length should be rejected");
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void test_oversize_capped(void) {
-    /* 底层系统交互与数据协议契约 */
     char *r = read_frame("Content-Length: 9999999999\r\n\r\n", 16 * 1024 * 1024);
     EXPECT(r == NULL, "oversize Content-Length should be rejected under the cap");
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void test_partial_body_rejected(void) {
-    /* 底层系统交互与数据协议契约 */
     const char *hdr = "Content-Length: 100\r\n\r\n";
     size_t hl = strlen(hdr);
     char *frame = (char *)malloc(hl + 50);
@@ -79,7 +68,6 @@ static void test_partial_body_rejected(void) {
     free(frame);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void test_normal_frame(void) {
     const char *body = "{\"method\":\"initialize\"}";
     char header[64];
@@ -95,7 +83,6 @@ static void test_normal_frame(void) {
     free(frame);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void test_content_length_not_first(void) {
     const char *body = "12345";
     char frame[256];
@@ -110,7 +97,6 @@ static void test_content_length_not_first(void) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static void test_zero_length_body(void) {
     char *r = read_frame("Content-Length: 0\r\n\r\n", 1024);
     EXPECT(r != NULL, "zero-length body should parse");
@@ -120,7 +106,6 @@ static void test_zero_length_body(void) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static void test_immediate_eof(void) {
     mem_reader m = { "", 0, 0 };
     char *r = rpc_read_message_cb(mem_read_byte, &m, 1024);

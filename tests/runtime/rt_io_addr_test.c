@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include "src/runtime/rt_io.h"
 #include <stdio.h>
 #include <string.h>
@@ -66,7 +65,6 @@ int main(void) {
     CHECK(zan_io_sockaddr_family(&v6, 16) == 0);
     CHECK(zan_io_sockaddr_family(NULL, 28) == 0);
 
-    /* 底层系统交互与数据协议契约 */
     check_v4("127.0.0.1", 0, 0);
     check_v4("127.0.0.1", 1, 1);
     check_v4("0.1.2.3", 1, 0);
@@ -87,7 +85,6 @@ int main(void) {
     check_v4("255.255.255.255", 1, 0);
     check_v4("8.8.8.8", 1, 1);
 
-    /* 底层系统交互与数据协议契约 */
     check_v6("::", 1, 0);
     check_v6("::1", 0, 0);
     check_v6("::1", 1, 1);
@@ -98,24 +95,20 @@ int main(void) {
     check_v6("2001:db8::1", 1, 0);
     check_v6("2001:4860:4860::8888", 1, 1);
 
-    /* 底层系统交互与数据协议契约 */
     check_v6("::ffff:127.0.0.1", 0, 0);
     check_v6("::ffff:127.0.0.1", 1, 1);
     check_v6("::ffff:10.0.0.1", 1, 0);
     check_v6("::ffff:8.8.8.8", 1, 1);
 
-    /* 底层系统交互与数据协议契约 */
     check_v6("2002:0a00:0001::1", 1, 0);                 /* 6to4 -> 10.0.0.1 */
     check_v6("2002:0808:0808::1", 1, 1);                 /* 6to4 -> 8.8.8.8 */
     check_v6("64:ff9b::a00:1", 1, 0);                    /* NAT64 -> 10.0.0.1 */
     check_v6("64:ff9b::808:808", 1, 1);                  /* NAT64 -> 8.8.8.8 */
     check_v6("::10.0.0.1", 1, 0);                        /* v4-compatible */
     check_v6("::8.8.8.8", 1, 1);
-    /* 底层系统交互与数据协议契约 */
     check_v6("2001:0000:4136:e378:8000:63bf:3fff:fdd2", 1, 0);
     check_v6("2001:0000:4136:e378:8000:63bf:8787:8787", 1, 1);
 
-    /* 底层系统交互与数据协议契约 */
     memset(records, 0xa5, sizeof(records));
     int n = (int)zan_io_resolve_all("127.0.0.1", 80, records, sizeof(records));
     if (n < 1) {

@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 
 #ifndef _WIN32
 #ifndef _POSIX_C_SOURCE
@@ -116,7 +115,6 @@ struct source_spec {
     unsigned visible_b;
 };
 
-/* 模块核心语义抽象与接口调用契约 */
 static const struct source_spec source_specs[F_SOURCE_COUNT] = {
     [F_A_OTHER_FIRST] = { STORE_A_PACKAGES,
         NS ".AOrder/src/A-before.zan", DECLARE("Other"), 1, 0 },
@@ -465,7 +463,6 @@ static void cleanup_fixture(void) {
     free(fixture.old_profile_env);
     fixture.old_profile_env = NULL;
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = MAX_FILES - 1; i >= 0; --i) {
         if (!fixture.files[i].path) continue;
         int result = fixture_unlink(fixture.files[i].path);
@@ -493,7 +490,6 @@ static int namespace_probe(const char *path, char *out_ns, size_t cap) {
     if (out_ns && cap) out_ns[0] = '\0';
     int id = find_fixture_file(path);
     if (id < 0) {
-        /* 模块核心语义抽象与接口调用契约 */
         EXPECT(!path_within(path, fixture.root), "probed untracked fixture path: %s", path);
         return 0;
     }
@@ -516,7 +512,6 @@ static int namespace_probe(const char *path, char *out_ns, size_t cap) {
         if (length >= cap) return 0;
         memcpy(out_ns, declared, length + 1);
     }
-    /* 模块核心语义抽象与接口调用契约 */
     return 1;
 }
 
@@ -825,7 +820,6 @@ static void test_legacy_compatibility(void) {
     save_probe_counts(saved);
     expect_legacy(fixture.project_a, NS ".Tree", 0,
                   refreshed_tree_exact, ARRAY_COUNT(refreshed_tree_exact));
-    /* 模块核心语义抽象与接口调用契约 */
     expect_create_probes(saved, 1);
     expect_legacy(fixture.project_a, NS "/Tree", 1,
                   refreshed_tree_hierarchical, ARRAY_COUNT(refreshed_tree_hierarchical));

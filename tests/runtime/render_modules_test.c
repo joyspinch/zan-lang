@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 #include "../../src/runtime/zan_gui_graphics.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,7 +132,7 @@ static void load_apis(module core, module game_module, module image_module) {
     LOAD(game_module, game.bake, "zan_game_bake_sprite");
     LOAD(game_module, game.batch, "zan_game_sprite_batch");
     required(game_module, "zan_game_mesh_create");
-    required(game_module, "zan_game_draw3d"); /* 核心系统底层抽象与内存语义契约 */
+    required(game_module, "zan_game_draw3d"); 
 }
 
 #define BLACK UINT32_C(0xFF000000)
@@ -163,12 +162,11 @@ static void expect(const char *label, const zan_bitmap *b, int x, int y,
 static void quad(float *q, int x, int y, int w, int h, uint32_t tint) {
     const float data[10] = { (float)x, (float)y, (float)w, (float)h, 0, 0, 2, 2, 0, 0 };
     memcpy(q, data, sizeof(data));
-    memcpy(q + 8, &tint, sizeof(tint)); /* 核心系统底层抽象与内存语义契约 */
+    memcpy(q + 8, &tint, sizeof(tint)); 
 }
 
 static void test_images(void) {
     phase = "image";
-    /* 模块核心语义抽象与接口调用契约 */
     const unsigned char tga[] = {
         0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 32, 0x28,
         0, 0, 255, 255, 0, 255, 0, 255,
@@ -213,7 +211,6 @@ static void test_order(int dst, int handle, int tolerance) {
     gui.fill(dst, 0, 0, 12, 8, (int32_t)RED);
     quad(q, 2, 1, 8, 6, BLUE); game.batch(dst, handle, q, 1);
     gui.fill(dst, 4, 2, 4, 4, (int32_t)GREEN);
-    /* 模块核心语义抽象与接口调用契约 */
     gui.snapshot(dst, 0, 0, 12, 8, 2);
     quad(q, 0, 0, 12, 8, WHITE); game.batch(dst, handle, q, 1);
     CHECK(gui.restore(dst, 0, 0, 12, 8, 2) == 1);
@@ -235,7 +232,6 @@ static void test_transient(int dst) {
     gui.blit(dst, &bitmap, 1, 1, 2, 2, 0, 0, 2, 2);
     pixels[0] = pixels[1] = pixels[4] = pixels[5] = BLUE;
     quad(q, 6, 1, 2, 2, WHITE); gui.batch(dst, &bitmap, q, 1);
-    /* 模块核心语义抽象与接口调用契约 */
     memset(pixels, 0, sizeof(pixels));
     memset(&bitmap, 0, sizeof(bitmap));
     gui.fill(dst, 10, 1, 2, 2, (int32_t)GREEN);
@@ -247,7 +243,7 @@ static void test_transient(int dst) {
 
 static void test_sprites(int gpu) {
     phase = gpu ? "GPU sprites" : "CPU sprites";
-    const int tolerance = gpu ? 1 : 0; /* 底层系统交互与数据协议契约 */
+    const int tolerance = gpu ? 1 : 0; 
     int src = gui.create(7, 5), dst = gui.create(16, 12);
     CHECK(src >= 0 && dst >= 0);
     gui.clear(src, (int32_t)MAGENTA);
@@ -267,7 +263,7 @@ static void test_sprites(int gpu) {
     const zan_bitmap *b = image.get("mem:render-bake");
     CHECK(b && b->width == 2 && b->height == 2 && (b->serial & IMAGE_SERIAL_BIT));
     uint64_t serial = b->serial;
-    gui.clear(src, (int32_t)BLACK); /* 底层系统交互与数据协议契约 */
+    gui.clear(src, (int32_t)BLACK); 
     b = image.get("mem:render-bake");
     expect("bake owns copy", b, 0, 0, RED, tolerance);
     expect("slice crosses surface stride", b, 0, 1, BLUE, tolerance);
@@ -307,7 +303,6 @@ static void test_sprites(int gpu) {
     gui.fill(dst, 2, 0, 2, 2, (int32_t)BLUE);
     gui.scaled(dst, dst, 2, 0, 8, 4, 0, 0, 4, 2);
     b = gui.bitmap(dst);
-    /* 模块核心语义抽象与接口调用契约 */
     expect("scaled self-blit first half", b, 3, 1, RED, tolerance);
     expect("scaled self-blit saved source", b, 8, 1, BLUE, tolerance);
     expect("self-blit bounds", b, 10, 1, BLACK, 0);
@@ -318,8 +313,8 @@ static void test_sprites(int gpu) {
 int main(int argc, char **argv) {
     if (argc != 4) { fprintf(stderr, "usage: %s CORE GAME IMAGE\n", argv[0]); return 2; }
     module core = open_module(argv[1]);
-    check_core_exports(core); /* 底层系统交互与数据协议契约 */
-    module image_module = open_module(argv[3]); /* 核心系统底层抽象与内存语义契约 */
+    check_core_exports(core); 
+    module image_module = open_module(argv[3]); 
     module game_module = open_module(argv[2]);
     load_apis(core, game_module, image_module);
     test_images();
@@ -333,7 +328,6 @@ int main(int argc, char **argv) {
     } else {
         puts("render modules: GPU unavailable; image + CPU checks passed");
     }
-    /* 模块核心语义抽象与接口调用契约 */
     gui.backend(0);
     close_module(game_module); close_module(image_module); close_module(core);
     return 0;

@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,10 +5,8 @@
 #include <unistd.h>
 #include "../../src/runtime/rt_co.h"
 
-/* 底层系统交互与数据协议契约 */
 void zan_co_delay(long long ms, void *frame, void (*step)(void *));
 
-/* 底层系统交互与数据协议契约 */
 typedef struct {
     volatile long long sched;
     void (*pending)(void *);
@@ -47,7 +44,6 @@ static void w2_step(void *fp) { pframe_t *f = fp; sample_thr(); f->done = 1; }
 static void w1_step(void *fp) {
     pframe_t *f = fp;
     sample_thr();
-    /* 底层系统交互与数据协议契约 */
     zan_co_ready(&w2, w2_step);
     f->done = 1;
 }
@@ -57,10 +53,8 @@ static void t_step(void *fp) { pframe_t *f = fp; sample_thr(); f->done = 1; }
 static void *helper(void *arg) {
     (void)arg;
     usleep(50 * 1000);
-    /* 底层系统交互与数据协议契约 */
     zan_co_ready(&w1, w1_step);
     sample_thr();
-    /* 底层系统交互与数据协议契约 */
     zan_co_sched_run_until(&w2.done);
     if (!w2.done) { printf("FAIL: run_until returned before w2 done\n"); fails++; }
     return NULL;
@@ -76,7 +70,7 @@ int main(void) {
     zan_co_delay(300, &tf, t_step);
     pthread_t h;
     pthread_create(&h, NULL, helper, NULL);
-    zan_co_sched_run();            /* 核心系统底层抽象与内存语义契约 */
+    zan_co_sched_run();            
     pthread_join(h, NULL);
 
     check(w1.done, "foreign-readied frame ran on the foreground pool");

@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,11 +16,10 @@
 
 #include "src/common/json.h"
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
 #ifdef _WIN32
     HANDLE in_w;   /* write to child's stdin */
-    HANDLE out_r;  /* 核心系统底层抽象与内存语义契约 */
+    HANDLE out_r;  
     HANDLE proc;
 #else
     int in_w;
@@ -123,8 +121,6 @@ static void child_close(child_t *c) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 模块核心语义抽象与接口调用契约 */
 static int g_read_budget = 4 * 1024 * 1024;
 
 static int child_read_byte_budgeted(child_t *c) {
@@ -142,7 +138,6 @@ static void lsp_send(child_t *c, const char *body) {
     child_write(c, body, (int)strlen(body));
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool lsp_recv(child_t *c, char *buf, int cap) {
     char header[256];
     int hp = 0;
@@ -156,7 +151,7 @@ static bool lsp_recv(child_t *c, char *buf, int cap) {
             if (ch == '\n') break;
         }
         header[hp] = '\0';
-        if (hp - line_start <= 2) break; /* 核心系统底层抽象与内存语义契约 */
+        if (hp - line_start <= 2) break; 
         if (content_len < 0) {
             const char *cl = header + line_start;
             if (strncmp(cl, "Content-Length:", 15) == 0)
@@ -174,7 +169,6 @@ static bool lsp_recv(child_t *c, char *buf, int cap) {
     return true;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void send_message(child_t *c, json_value *root) {
     char *body = json_serialize(root);
     lsp_send(c, body);
@@ -182,7 +176,6 @@ static void send_message(child_t *c, json_value *root) {
     json_free(root);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static char *recv_until_id(child_t *c, double want_id) {
     char buf[65536];
     for (int tries = 0; tries < 64; tries++) {
@@ -196,8 +189,6 @@ static char *recv_until_id(child_t *c, double want_id) {
     return NULL;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 模块核心语义抽象与接口调用契约 */
 #define TEST_URI "file:///lsp_utf16_test.zan"
 static const char *DOC =
     "using System;\n"
@@ -218,9 +209,7 @@ static json_value *mk_text_document(void) {
     return td;
 }
 
-/* 底层系统交互与数据协议契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 #define BAD_URI "file:///lsp_diag_range_test.zan"
 static const char *BAD_DOC =
     "class P {\n"
@@ -234,7 +223,6 @@ static void ext_check(bool cond, const char *msg) {
     if (!cond) ext_fails++;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static json_value *mk_request(int id, const char *method, json_value *params) {
     json_value *msg = json_new_obj();
     json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
@@ -244,7 +232,6 @@ static json_value *mk_request(int id, const char *method, json_value *params) {
     return msg;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool fold_contains(const char *body, int s0, int e0) {
     char pat[96];
     snprintf(pat, sizeof(pat), "\"startLine\":%d,\"endLine\":%d", s0, e0);
@@ -276,7 +263,6 @@ static bool helper_highlights_exact(const char *body) {
 }
 
 static int run_extended_checks(child_t *child) {
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(BAD_URI));
@@ -320,7 +306,6 @@ static int run_extended_checks(child_t *child) {
         json_obj_set(params, "position", pos);
         send_message(child, mk_request(12, "textDocument/prepareRename", params));
     }
-    /* 底层系统交互与数据协议契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(TEST_URI));
@@ -349,9 +334,8 @@ static int run_extended_checks(child_t *child) {
         send_message(child, mk_request(14, "textDocument/rangeFormatting", params));
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     char *r[6] = {0};       /* by id: 10..14 */
-    char *diag_bad = NULL;  /* 核心系统底层抽象与内存语义契约 */
+    char *diag_bad = NULL;  
     for (int i = 0; i < 300 && ext_fails == 0; i++) {
         char buf[131072];
         if (!lsp_recv(child, buf, sizeof(buf))) break;
@@ -371,7 +355,6 @@ static int run_extended_checks(child_t *child) {
         if (done && diag_bad) break;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (r[0]) {
         ext_check(fold_contains(r[0], 1, 6), "foldingRange: class block 1..6");
         ext_check(fold_contains(r[0], 3, 5), "foldingRange: Main block 3..5");
@@ -400,7 +383,6 @@ static int run_extended_checks(child_t *child) {
         free(response);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (r[2]) {
         ext_check(strstr(r[2], "\"placeholder\":\"Helper\"") != NULL,
                   "prepareRename: placeholder is Helper");
@@ -410,7 +392,6 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "prepareRename: no response");
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (r[3]) {
         ext_check(strstr(r[3], "\"newText\":\"using System;\\nclass Program {\\n") != NULL,
                   "formatting: stable on formatted input");
@@ -418,7 +399,6 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "formatting: no response");
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (r[4]) {
         ext_check(strstr(r[4], "\"result\":[]") != NULL,
                   "rangeFormatting: no spurious edits on clean lines");
@@ -426,7 +406,6 @@ static int run_extended_checks(child_t *child) {
         ext_check(false, "rangeFormatting: no response");
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (diag_bad) {
         ext_check(strstr(diag_bad, "\"start\":{\"line\":1,\"character\":12}") != NULL,
                   "diagnostics: error reported at line 1 char 12");
@@ -524,7 +503,6 @@ static bool completion_has(child_t *child, const char *uri, const char *text,
     return found;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool interpolation_ranges_exact(json_value *items, const char *text,
                                         const char *uri, bool rename) {
     const char *markers[] = {
@@ -792,7 +770,6 @@ static int run_completion_checks(child_t *child) {
     ext_check(member_rename_safe, "rename: member cannot edit unrelated type or local");
     json_free(root); free(response);
 
-    /* 模块核心语义抽象与接口调用契约 */
     const char *fb_a_uri = "file:///lsp_rename_fallback_a.zan";
     const char *fb_a_text = "class FallbackA { void F() { mystery = 1; } }\n";
     const char *fb_b_uri = "file:///lsp_rename_fallback_b.zan";
@@ -923,21 +900,19 @@ static int run_completion_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 
 #define SC_URI "file:///lsp_scope_test.zan"
-/* 模块核心语义抽象与接口调用契约 */
 static const char *SC_DOC =
     "class S {\n"
     "    int total = 0;\n"
     "    static void Add() {\n"
     "        int count = 1;\n"       /* line 3 */
-    "        count = count + 1;\n"   /* 核心系统底层抽象与内存语义契约 */
+    "        count = count + 1;\n"   
     "        Console.WriteLine(count);\n" /* line 5 */
     "    }\n"
     "    static void Other() {\n"
-    "        int count = 9;\n"       /* 核心系统底层抽象与内存语义契约 */
-    "        Console.WriteLine(count);\n" /* 核心系统底层抽象与内存语义契约 */
+    "        int count = 9;\n"       
+    "        Console.WriteLine(count);\n" 
     "    }\n"
     "}\n";
 
@@ -962,7 +937,6 @@ static json_value *scope_position(int line, int character) {
 static int run_scope_checks(child_t *child) {
     scope_open(child);
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -985,7 +959,6 @@ static int run_scope_checks(child_t *child) {
         free(r);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -1008,7 +981,6 @@ static int run_scope_checks(child_t *child) {
         free(r);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(SC_URI));
@@ -1050,7 +1022,6 @@ static int run_scope_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #define HINT_URI "file:///lsp_hint_test.zan"
 static const char *HINT_DOC =
     "class Greeter {\n"
@@ -1063,7 +1034,6 @@ static const char *HINT_DOC =
     "}\n";
 
 static int run_semantic_and_hint_checks(child_t *child) {
-    /* 核心系统底层抽象与内存语义契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(HINT_URI));
@@ -1100,7 +1070,6 @@ static int run_semantic_and_hint_checks(child_t *child) {
         char *r = recv_until_id(child, 31);
         ext_check(r && strstr(r, "\"data\":[") != NULL,
                   "semanticTokens: returned data array");
-        /* 核心系统底层抽象与内存语义契约 */
         ext_check(r && strstr(r, "\"data\":[]") == NULL,
                   "semanticTokens: non-empty token data returned");
         free(r);
@@ -1110,11 +1079,9 @@ static int run_semantic_and_hint_checks(child_t *child) {
     return ext_fails ? 1 : 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 #define CANCEL_FILES 300
 #define CANCEL_FILLER_LINES 1200
 
-/* 模块核心语义抽象与接口调用契约 */
 static json_value *mk_refs_params(const char *doc_uri) {
     json_value *td = json_new_obj();
     json_obj_set(td, "uri", json_new_str(doc_uri));
@@ -1148,7 +1115,6 @@ static int run_cancel_checks(const char *exe) {
     mkdir(root, 0755);
 #endif
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < CANCEL_FILES; i++) {
         char path[700];
         snprintf(path, sizeof(path), "%s%cGen%d.zan", root,
@@ -1176,12 +1142,10 @@ static int run_cancel_checks(const char *exe) {
     char uri[700];
     snprintf(uri, sizeof(uri), "file:///Gen0.zan");
 
-    /* 底层系统交互与数据协议契约 */
     {
         json_value *params = json_new_obj();
         char ruri[700];
 #ifdef _WIN32
-        /* 模块核心语义抽象与接口调用契约 */
         snprintf(ruri, sizeof(ruri), "file:///");
         char *wp = ruri + strlen(ruri);
         for (const char *q = root; *q && wp < ruri + sizeof(ruri) - 1; q++)
@@ -1201,7 +1165,6 @@ static int run_cancel_checks(const char *exe) {
         free(r);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(uri));
@@ -1214,7 +1177,6 @@ static int run_cancel_checks(const char *exe) {
         send_message(&child, mk_request(-1, "textDocument/didOpen", params));
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(100, "textDocument/references",
                                     mk_refs_params(uri)));
     {
@@ -1232,7 +1194,6 @@ static int run_cancel_checks(const char *exe) {
               "cancel: queued references request answers -32800");
     free(r100);
 
-    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(101, "textDocument/references",
                                     mk_refs_params(uri)));
     {
@@ -1249,7 +1210,6 @@ static int run_cancel_checks(const char *exe) {
               "cancel: in-flight references walk aborts with -32800");
     free(r101);
 
-    /* 模块核心语义抽象与接口调用契约 */
     send_message(&child, mk_request(102, "textDocument/references",
                                     mk_refs_params(uri)));
     char *r102 = recv_until_id(&child, 102);
@@ -1312,7 +1272,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* 底层系统交互与数据协议契约 */
     {
         json_value *msg = json_new_obj();
         json_obj_set(msg, "jsonrpc", json_new_str("2.0"));
@@ -1329,7 +1288,6 @@ int main(int argc, char **argv) {
     }
     free(resp);
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         json_value *params = json_new_obj();
         json_obj_set(params, "textDocument", mk_text_document());
@@ -1340,7 +1298,6 @@ int main(int argc, char **argv) {
         send_message(&child, msg);
     }
 
-    /* 底层系统交互与数据协议契约 */
     {
         json_value *td = json_new_obj();
         json_obj_set(td, "uri", json_new_str(TEST_URI));
@@ -1413,7 +1370,6 @@ int main(int argc, char **argv) {
     if (rc == 0)
         rc = run_semantic_and_hint_checks(&child);
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (rc == 0)
         rc = run_cancel_checks(argv[1]);
 

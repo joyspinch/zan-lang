@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
 
@@ -25,7 +24,6 @@ static void pump(int n) {
     for (int j = 0; j < n; j++) { zan_gui_poll_event(); usleep(3000); }
 }
 
-/* 底层系统交互与数据协议契约 */
 static i64 click_hwnd(int rx, int ry) {
     XWarpPointer(d, None, DefaultRootWindow(d), 0, 0, 0, 0, rx, ry);
     XSync(d, False);
@@ -53,12 +51,10 @@ int main(void) {
     zan_gui_show_window(w1);
     zan_gui_show_window(w2);
 
-    /* 核心系统底层抽象与内存语义契约 */
     int sizes_ok = zan_gui_client_width(w1) == 300 && zan_gui_client_height(w1) == 200 &&
                    zan_gui_client_width(w2) == 360 && zan_gui_client_height(w2) == 260;
     printf("per-window sizes: %s\n", sizes_ok ? "OK" : "FAIL");
 
-    /* 底层系统交互与数据协议契约 */
     i64 s1 = zan_gui_create_surface(300, 200);
     i64 s2 = zan_gui_create_surface(360, 260);
     int present_ok = zan_gui_present(w1, s1) == 0 && zan_gui_present(w2, s2) == 0;
@@ -66,7 +62,6 @@ int main(void) {
 
     d = XOpenDisplay(NULL);
     if (!d) { printf("no display\n"); return 3; }
-    /* 底层系统交互与数据协议契约 */
     XMoveWindow(d, (Window)w1, 0, 0);
     XMoveWindow(d, (Window)w2, 400, 0);
     XRaiseWindow(d, (Window)w1);
@@ -74,7 +69,6 @@ int main(void) {
     XSync(d, False);
     pump(30);
 
-    /* 底层系统交互与数据协议契约 */
     i64 h1 = click_hwnd(150, 120);
     i64 h2 = click_hwnd(400 + 180, 120);
     int route_ok = (h1 == w1) && (h2 == w2);
@@ -82,7 +76,6 @@ int main(void) {
            h1 == w1 ? "w1" : "?", h2 == w2 ? "w2" : "?",
            route_ok ? "OK" : "FAIL");
 
-    /* 底层系统交互与数据协议契约 */
     zan_gui_close_window(w1);
     pump(10);
     int survive_ok = zan_gui_client_width(w2) == 360 &&

@@ -110,7 +110,6 @@ static void zan_hw_init_cpu_features(void) {
     g_has_aesni   = (ecx & (1u << 25)) != 0;
     g_has_pclmul  = (ecx & (1u << 1)) != 0;
 
-    // 核心契约与语义定义。
     __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(7), "c"(0));
     g_has_avx2  = (ebx & (1u << 5)) != 0;
     g_has_shani = (ebx & (1u << 29)) != 0;
@@ -723,7 +722,6 @@ int64_t zan_hw_sha256(const uint8_t *data, int64_t len, uint8_t out[32]) {
 #endif
     }
 
-    // 核心契约与语义定义。
     uint8_t tail[128];
     size_t rem = (size_t)len % 64;
     if (rem > 0 && data) {
@@ -3075,7 +3073,6 @@ int64_t zan_hw_sm3(const uint8_t *data, int64_t len, uint8_t out[32]) {
 #endif
     }
 
-    // 核心契约与语义定义。
     uint8_t tail[128];
     size_t rem = (size_t)len % 64;
     if (rem > 0 && data) {

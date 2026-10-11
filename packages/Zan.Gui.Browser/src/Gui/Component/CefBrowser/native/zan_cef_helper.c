@@ -22,7 +22,6 @@ static int zch_exists(const char *path) {
     return path && path[0] && stat(path, &st) == 0 && !S_ISDIR(st.st_mode);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void zch_up(char *p, int n) {
     for (int i = 0; i < n; i++) {
         char *slash = strrchr(p, '/');
@@ -43,7 +42,6 @@ static int zch_exe_path(char *buf, size_t cap) {
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zch_driver_path(char *out, size_t cap) {
     const char *env = getenv("ZAN_CEF_HELPER_DRIVER");
     if (zch_exists(env)) {
@@ -53,7 +51,6 @@ static int zch_driver_path(char *out, size_t cap) {
     char exe[1024];
     if (!zch_exe_path(exe, sizeof(exe))) return 0;
 
-    /* 底层系统交互与数据协议契约 */
     char base[1024];
     snprintf(base, sizeof(base), "%s", exe);
     zch_up(base, 5);
@@ -66,13 +63,11 @@ static int zch_driver_path(char *out, size_t cap) {
     return zch_exists(out);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zch_log_on(void) {
     const char *v = getenv("ZAN_CEF_LOG");
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static const char *zch_type(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (argv[i] && strncmp(argv[i], "--type=", 7) == 0) return argv[i] + 7;
@@ -126,7 +121,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[helper] leave type=%s rc=%d\n", type, rc);
         fflush(stderr);
     }
-    /* 底层系统交互与数据协议契约 */
     if (rc < 0) return 1;
     return rc;
 }

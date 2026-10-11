@@ -202,23 +202,11 @@ extern "C" int zan_dw_text_width(const wchar_t *w, int len,
 
 /* Renders straight-alpha BGRA into a malloc'd buffer (caller frees with
  * free()). Returns 1 on success. */
-static FILE *dbg() {
-    static FILE *f = nullptr;
-    if (!f) { f = fopen("emo_dw.log", "a"); }
-    return f;
-}
-
 extern "C" int zan_dw_render(const wchar_t *w, int len,
         const wchar_t *family, float size, int bold,
         unsigned char **out_px, int *out_w, int *out_h, int *out_advance) {
     *out_px = nullptr;
-    FILE *f = dbg();
-    if (f) fprintf(f, "render enter len=%d init_ok=%d gdi=%d params=%d\n",
-        len, (int)(g_factory != nullptr), (int)(g_gdi != nullptr),
-        (int)(g_params != nullptr));
-    if (f) fflush(f);
     if (!zan_dw_init() || len <= 0 || !g_gdi || !g_params) {
-        if (f) fprintf(f, "render bail init\n");
         return 0;
     }
     IDWriteTextFormat *fmt = pick_format(family, size, bold);
@@ -227,7 +215,6 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
     HRESULT hrl = g_factory->CreateTextLayout(w, len, fmt, 8192.0f,
         1024.0f, &lay);
     if (FAILED(hrl) || !lay) {
-        if (f) fprintf(f, "layout FAILED hr=%08x\n", (unsigned)hrl);
         return 0;
     }
     DWRITE_TEXT_METRICS tm;
@@ -243,8 +230,6 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
     }
     int tw = (int)tm.widthIncludingTrailingWhitespace + 3;
     int th = (int)line_h + 3;
-    if (f) fprintf(f, "metrics tw=%d th=%d baseline=%.1f' + chr(92) + 'n", tw, th, baseline);
-    if (f) fflush(f);
     if (tw <= 4 || th <= 4 || tw > 8192 || th > 1024) {
         lay->Release();
         return 0;
@@ -255,7 +240,6 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
     HRESULT hr = hr2;
     ReleaseDC(nullptr, screen);
     if (FAILED(hr) || !brt) {
-        if (f) fprintf(f, "brt FAILED hr=%08x\n", (unsigned)hr);
         lay->Release();
         return 0;
     }

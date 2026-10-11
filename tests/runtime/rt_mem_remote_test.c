@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -15,7 +14,6 @@ static int failures;
     if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); failures++; } \
 } while (0)
 
-/* 模块核心语义抽象与接口调用契约 */
 #define RING 256
 #define ROUNDS 4000
 #define PER_ROUND 64
@@ -34,7 +32,6 @@ static void ring_put(void *p) {
     pthread_mutex_unlock(&g_mu);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void *ring_take(void) {
     pthread_mutex_lock(&g_mu);
     while (g_put == g_take && !g_done) pthread_cond_wait(&g_cv, &g_mu);
@@ -45,14 +42,12 @@ static void *ring_take(void) {
     return p;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void *consumer(void *arg) {
     (void)arg;
     size_t freed = 0;
     for (;;) {
         void *p = ring_take();
         if (!p) break;
-        /* 模块核心语义抽象与接口调用契约 */
         memset(p, 0xAB, 16);
         __wrap_free(p);
         freed++;
@@ -60,7 +55,6 @@ static void *consumer(void *arg) {
     return (void *)freed;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void *alloc_then_exit(void *arg) {
     (void)arg;
     void *keep[PER_ROUND];
@@ -70,7 +64,6 @@ static void *alloc_then_exit(void *arg) {
 }
 
 int main(void) {
-    /* 模块核心语义抽象与接口调用契约 */
     void *warm[PER_ROUND];
     for (int i = 0; i < PER_ROUND; i++) warm[i] = __wrap_malloc(64);
     for (int i = 0; i < PER_ROUND; i++) __wrap_free(warm[i]);
@@ -84,7 +77,6 @@ int main(void) {
     size_t sent = 0;
     for (int r = 0; r < ROUNDS; r++) {
         for (int i = 0; i < PER_ROUND; i++) {
-            /* 模块核心语义抽象与接口调用契约 */
             size_t n = (size_t)(16 + ((r * PER_ROUND + i) % 12) * 64);
             void *p = __wrap_malloc(n);
             CHECK(p != NULL, "malloc returned a block");
@@ -103,7 +95,6 @@ int main(void) {
     pthread_join(th, &ret);
     CHECK((size_t)ret == sent, "consumer freed every block it was handed");
 
-    /* 模块核心语义抽象与接口调用契约 */
     size_t grew = zan_mem_slabs() - slabs_before;
     if (grew > 8) {
         fprintf(stderr, "FAIL: slab count grew by %zu after %zu cross-thread "
@@ -112,7 +103,6 @@ int main(void) {
         failures++;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     size_t settled = zan_mem_slabs();
     for (int r = 0; r < 64; r++) {
         void *keep[PER_ROUND];
@@ -121,7 +111,6 @@ int main(void) {
     }
     CHECK(zan_mem_slabs() == settled, "reused returned blocks without new slabs");
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int t = 0; t < 64; t++) {
         pthread_t th2;
         CHECK(pthread_create(&th2, NULL, alloc_then_exit, NULL) == 0,

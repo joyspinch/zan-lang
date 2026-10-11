@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <sys/socket.h>
 #include <unistd.h>
 #include <signal.h>
@@ -29,10 +28,9 @@ int main(void) {
     check(sigaction(SIGPIPE, NULL, &cur) == 0 && cur.sa_handler != SIG_DFL,
           "zan_io_init() takes SIGPIPE off its default (fatal) action");
 
-    close(sv[1]);                      /* 核心系统底层抽象与内存语义契约 */
+    close(sv[1]);                      
     memset(buf, 'x', sizeof(buf));
 
-    /* 底层系统交互与数据协议契约 */
     r = zan_io_socket_send((intptr_t)sv[0], buf, (int64_t)sizeof(buf), 0);
     if (r >= 0) {
         r = zan_io_socket_send((intptr_t)sv[0], buf, (int64_t)sizeof(buf), 0);

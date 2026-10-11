@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <X11/Xlib.h>
 #include <X11/extensions/XTest.h>
 
@@ -19,7 +18,6 @@ extern i64 zan_gui_event_kind(void);
 static Display *d;
 static Window target;
 
-/* 底层系统交互与数据协议契约 */
 static int click_produces_mousedown(int px, int py) {
     XWarpPointer(d, None, target, 0, 0, 0, 0, px, py);
     XSync(d, False);
@@ -59,9 +57,9 @@ int main(void) {
     XSetInputFocus(d, target, RevertToParent, CurrentTime);
     XSync(d, False);
 
-    int caption = click_produces_mousedown(40, 16);    /* 核心系统底层抽象与内存语义契约 */
+    int caption = click_produces_mousedown(40, 16);    
     int content = click_produces_mousedown(150, 150);  /* content   -> kind2   */
-    int button  = click_produces_mousedown(300, 16);   /* 核心系统底层抽象与内存语义契约 */
+    int button  = click_produces_mousedown(300, 16);   
 
     printf("caption drag consumed: %s\n", caption == 0 ? "OK" : "FAIL");
     printf("content click -> mousedown: %s\n", content == 1 ? "OK" : "FAIL");

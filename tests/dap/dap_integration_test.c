@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,11 +13,10 @@
 #  include <errno.h>
 #endif
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
 #ifdef _WIN32
     HANDLE in_w;   /* write to child's stdin */
-    HANDLE out_r;  /* 核心系统底层抽象与内存语义契约 */
+    HANDLE out_r;  
     HANDLE proc;
 #else
     int in_w;
@@ -120,7 +118,6 @@ static void child_close(child_t *c) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int g_seq = 0;
 
 static void dap_send(child_t *c, const char *body) {
@@ -131,12 +128,10 @@ static void dap_send(child_t *c, const char *body) {
     child_write(c, body, (int)strlen(body));
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool dap_recv(child_t *c, char *buf, int cap) {
     char header[256];
     int hp = 0;
     int content_len = -1;
-    /* 底层系统交互与数据协议契约 */
     while (1) {
         int line_start = hp;
         while (1) {
@@ -146,8 +141,7 @@ static bool dap_recv(child_t *c, char *buf, int cap) {
             if (ch == '\n') break;
         }
         header[hp] = '\0';
-        /* 底层系统交互与数据协议契约 */
-        if (hp - line_start <= 2) break; /* 核心系统底层抽象与内存语义契约 */
+        if (hp - line_start <= 2) break; 
         if (content_len < 0) {
             const char *cl = header + line_start;
             if (strncmp(cl, "Content-Length:", 15) == 0)
@@ -165,7 +159,6 @@ static bool dap_recv(child_t *c, char *buf, int cap) {
     return true;
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool wait_event(child_t *c, const char *name, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -177,7 +170,6 @@ static bool wait_event(child_t *c, const char *name, char *out, int cap) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool wait_stopped_or_ended(child_t *c, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -192,7 +184,6 @@ static bool wait_stopped_or_ended(child_t *c, char *out, int cap) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool wait_response(child_t *c, const char *command, char *out, int cap) {
     for (int i = 0; i < 200; i++) {
         if (!dap_recv(c, out, cap)) return false;
@@ -210,7 +201,6 @@ static void check(bool cond, const char *msg) {
     if (!cond) g_fails++;
 }
 
-/* 底层系统交互与数据协议契约 */
 static long json_num(const char *json, const char *key, long def) {
     char pat[128];
     snprintf(pat, sizeof(pat), "\"%s\":", key);
@@ -221,7 +211,6 @@ static long json_num(const char *json, const char *key, long def) {
     return strtol(p, NULL, 10);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void json_escape(const char *in, char *out, size_t cap) {
     size_t j = 0;
     for (size_t i = 0; in[i] && j + 2 < cap; i++) {
@@ -232,7 +221,6 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[j] = '\0';
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void handshake(child_t *c, const char *program, char *body, char *msg,
                       size_t cap) {
@@ -266,7 +254,6 @@ static void send_disconnect(child_t *c, char *body, char *msg, size_t cap) {
     dap_send(c, body);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int run_basic(const char *dap_exe, const char *target, const char *source) {
     g_seq = 0;
     child_t c;
@@ -284,7 +271,6 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
 
     handshake(&c, target, body, msg, sizeof(body));
 
-    /* 核心系统底层抽象与内存语义契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
              "\"arguments\":{\"source\":{\"path\":\"%s\"},"
@@ -296,7 +282,6 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
 
     send_configuration_done(&c, body, msg, sizeof(body));
 
-    /* 底层系统交互与数据协议契约 */
     if (!wait_stopped_or_ended(&c, msg, sizeof(msg))) {
         child_close(&c);
         const char *optout = getenv("ZAN_ALLOW_SKIP_DAP");
@@ -346,7 +331,6 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     dap_send(&c, body);
     check(wait_response(&c, "evaluate", msg, sizeof(msg)), "evaluate response");
 
-    /* 核心系统底层抽象与内存语义契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"next\","
              "\"arguments\":{\"threadId\":1}}", ++g_seq);
@@ -354,7 +338,6 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     (void)wait_response(&c, "next", msg, sizeof(msg));
     check(wait_event(&c, "stopped", msg, sizeof(msg)), "stopped after step over");
 
-    /* 底层系统交互与数据协议契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"continue\","
              "\"arguments\":{\"threadId\":1}}", ++g_seq);
@@ -380,7 +363,6 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_src) {
     g_seq = 0;
     child_t c;
@@ -420,7 +402,6 @@ static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_
     (void)wait_response(&c, "stackTrace", msg, sizeof(msg));
     long frame_id = json_num(msg, "id", -1);
 
-    /* 底层系统交互与数据协议契约 */
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"evaluate\","
              "\"arguments\":{\"expression\":\"i\",\"frameId\":%ld,\"context\":\"watch\"}}",
@@ -434,7 +415,6 @@ static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_src) {
     g_seq = 0;
     child_t c;
@@ -482,7 +462,6 @@ static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int run_pause(const char *dap_exe, const char *burn, const char *burn_src) {
     (void)burn_src;
     g_seq = 0;
@@ -498,7 +477,6 @@ static int run_pause(const char *dap_exe, const char *burn, const char *burn_src
 
     send_configuration_done(&c, body, msg, sizeof(body));
 
-    /* 底层系统交互与数据协议契约 */
 #ifdef _WIN32
     Sleep(1000);
 #else
@@ -546,7 +524,7 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
     int r = run_basic(dap_exe, target, source);
-    if (r != 0) return r; /* 底层系统交互与数据协议契约 */
+    if (r != 0) return r; 
 
     if (argc >= 6) {
         char burn[1024], burn_src[1024];

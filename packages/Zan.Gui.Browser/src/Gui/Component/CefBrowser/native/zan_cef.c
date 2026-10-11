@@ -69,7 +69,6 @@ static char *zc_dup(const char *s, size_t n) {
     return p;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef int (*zc_fn_initialize)(const cef_main_args_t *, const cef_settings_t *,
                                 cef_app_t *, void *);
@@ -110,7 +109,6 @@ static zc_cef_t zc;
 static void *zc_open(const char *path) {
 #ifdef _WIN32
     /* Windows 平台动态加载 libcef.dll 及其依赖动态链接库 */
-    /* 模块核心语义抽象与接口调用契约 */
     char win[1024];
     size_t n = strlen(path);
     if (n >= sizeof(win)) { return NULL; }
@@ -144,7 +142,6 @@ static const char *zc_open_error(void) {
 
 #ifdef __APPLE__
 
-/* 核心系统底层抽象与内存语义契约 */
 
 /* macOS 环境下浏览器作为 NSView 嵌入宿主窗口 */
 typedef struct { double x, y, w, h; } zc_rect_t;
@@ -166,7 +163,6 @@ static int zc_ns_init(void) {
     if (!sel || !msg) return 0;
     memcpy(&zc_ns.sel, &sel, sizeof(void *));
     zc_ns.msg = msg;
-    /* 模块核心语义抽象与接口调用契约 */
     zc_ns.msg_stret = zc_sym(lib, "objc_msgSend_stret");
     zc_ns.objc = lib;
     return 1;
@@ -256,7 +252,6 @@ static void zc_app_set_handling(void *self, void *sel, signed char v) {
 static void (*zc_app_orig_send_event)(void *, void *, void *);
 
 static void zc_app_send_event(void *self, void *sel, void *event) {
-    /* 模块核心语义抽象与接口调用契约 */
     int prev = zc_app_sending_event;
     zc_app_sending_event = 1;
     if (zc_app_orig_send_event) zc_app_orig_send_event(self, sel, event);
@@ -267,7 +262,6 @@ static void zc_mac_patch_nsapp(void) {
     static int done;
     if (done || !zc_ns_init()) return;
     done = 1;
-    /* 模块核心语义抽象与接口调用契约 */
     zc_open("/System/Library/Frameworks/AppKit.framework/AppKit");
     void *cls = zc_ns_class("NSApplication");
     if (!cls) return;
@@ -312,7 +306,6 @@ static void zc_mac_patch_nsapp(void) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static struct {
     void *lib;
     void *(*path_create)(void);
@@ -429,7 +422,6 @@ static int zc_load(const char *runtime_dir) {
 
 /* ------------------------------------------------------------- cef_string_t */
 
-/* 模块核心语义抽象与接口调用契约 */
 static void zc_str_set(cef_string_t *out, const char *s) {
     memset(out, 0, sizeof(*out));
     if (s && s[0]) zc.utf8_to_utf16(s, strlen(s), out);
@@ -437,7 +429,6 @@ static void zc_str_set(cef_string_t *out, const char *s) {
 
 static void zc_str_free(cef_string_t *s) { zc.utf16_clear(s); }
 
-/* 底层系统交互与数据协议契约 */
 static void zc_str_get(const cef_string_t *s, char *buf, size_t cap) {
     buf[0] = '\0';
     if (!s || !s->str || s->length == 0) return;
@@ -472,15 +463,13 @@ static void zc_enter(void) { pthread_mutex_lock(&zc_lock); }
 static void zc_leave(void) { pthread_mutex_unlock(&zc_lock); }
 #endif
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct zc_browser_s {
     int used;
-    int id;                     /* 核心系统底层抽象与内存语义契约 */
-    cef_browser_t *browser;     /* 核心系统底层抽象与内存语义契约 */
+    int id;                     
+    cef_browser_t *browser;     
     cef_registration_t *cdp_reg;
 
-    /* 模块核心语义抽象与接口调用契约 */
     cef_client_t client;
     cef_life_span_handler_t life;
     cef_load_handler_t load;
@@ -488,32 +477,32 @@ typedef struct zc_browser_s {
     cef_focus_handler_t focus;
     cef_dev_tools_message_observer_t observer;
 
-    int bx, by, bw, bh;         /* 核心系统底层抽象与内存语义契约 */
-    char *clip_spec;            /* 模块核心语义抽象与接口调用契约 */
-    int shown;                  /* 核心系统底层抽象与内存语义契约 */
+    int bx, by, bw, bh;         
+    char *clip_spec;            
+    int shown;                  
     char url[2048];
     char title[512];
     int loading, can_back, can_forward;
     int nav_seq, last_status, last_error;
     int closing, gone;
-    int cdp_id;                 /* 核心系统底层抽象与内存语义契约 */
+    int cdp_id;                 
     int cdp_attached;
     /* 宿主 UI 控件持有键盘焦点时的按键事件拦截标志 */
     int host_focus;
     /* 新建窗口与弹窗策略（0:原生弹窗, 1:拦截并派发事件, 2:外部默认浏览器打开） */
     int popup_policy;
-    char popup_url[2048];       /* 核心系统底层抽象与内存语义契约 */
-    int popup_dropped;          /* 底层系统交互与数据协议契约 */
-    char *taken_popup;          /* 底层系统交互与数据协议契约 */
+    char popup_url[2048];       
+    int popup_dropped;          
+    char *taken_popup;          
 
     char *queue[ZC_MAX_CDP_QUEUE];
     int q_head, q_count, q_dropped;
-    char *taken;                /* 底层系统交互与数据协议契约 */
+    char *taken;                
 } zc_browser_t;
 
 static zc_browser_t zc_browsers[ZC_MAX_BROWSERS];
 static int zc_ready;            /* cef_initialize() succeeded */
-static int zc_shut;             /* 核心系统底层抽象与内存语义契约 */
+static int zc_shut;             
 static char zc_runtime[1024];
 
 static zc_browser_t *zc_get(int h) {
@@ -545,14 +534,12 @@ static void zc_base_init(cef_base_ref_counted_t *base, size_t size) {
     base->has_at_least_one_ref = zc_has_at_least_one_ref;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void zc_queue_push(zc_browser_t *b, const char *msg, size_t len) {
     char *copy = zc_dup(msg, len);
     if (!copy) return;
     zc_enter();
     if (b->q_count == ZC_MAX_CDP_QUEUE) {
-        /* 模块核心语义抽象与接口调用契约 */
         free(b->queue[b->q_head]);
         b->queue[b->q_head] = NULL;
         b->q_head = (b->q_head + 1) % ZC_MAX_CDP_QUEUE;
@@ -570,7 +557,6 @@ static int CEF_CALLBACK zc_on_dev_tools_message(
     (void)browser;
     zc_browser_t *b = ZC_OWNER(self, observer);
     zc_queue_push(b, (const char *)message, message_size);
-    /* 模块核心语义抽象与接口调用契约 */
     return 1;
 }
 
@@ -599,7 +585,6 @@ static void CEF_CALLBACK zc_on_agent_detached(
     ZC_OWNER(self, observer)->cdp_attached = 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void CEF_CALLBACK zc_on_after_created(cef_life_span_handler_t *self,
                                              cef_browser_t *browser) {
@@ -610,7 +595,6 @@ static void CEF_CALLBACK zc_on_after_created(cef_life_span_handler_t *self,
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int CEF_CALLBACK zc_on_before_popup(cef_life_span_handler_t *self,
                                            cef_browser_t *browser,
                                            cef_frame_t *frame,
@@ -651,7 +635,7 @@ static int CEF_CALLBACK zc_do_close(cef_life_span_handler_t *self,
                                     cef_browser_t *browser) {
     (void)browser;
     ZC_OWNER(self, life)->closing = 1;
-    return 0; /* 底层系统交互与数据协议契约 */
+    return 0; 
 }
 
 static void CEF_CALLBACK zc_on_before_close(cef_life_span_handler_t *self,
@@ -669,7 +653,6 @@ static void CEF_CALLBACK zc_on_before_close(cef_life_span_handler_t *self,
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void CEF_CALLBACK zc_on_loading_state_change(cef_load_handler_t *self,
                                                     cef_browser_t *browser,
@@ -716,7 +699,6 @@ static void CEF_CALLBACK zc_on_load_error(cef_load_handler_t *self,
     b->nav_seq++;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void CEF_CALLBACK zc_on_address_change(cef_display_handler_t *self,
                                               cef_browser_t *browser,
@@ -749,7 +731,6 @@ static int CEF_CALLBACK zc_on_set_focus(cef_focus_handler_t *self,
     return ZC_OWNER(self, focus)->host_focus ? 1 : 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void CEF_CALLBACK zc_on_take_focus(cef_focus_handler_t *self,
                                           cef_browser_t *browser, int next) {
     (void)browser;
@@ -909,7 +890,6 @@ static void zc_app_init(void) {
     zc_app.on_before_command_line_processing = zc_on_before_command_line_processing;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 /* 获取并构造传给 CEF 初始化流程的进程命令行参数 */
 #ifndef _WIN32
@@ -929,7 +909,6 @@ static void zc_argv_fallback(void) {
 static void zc_read_cmdline(void) {
     if (zc_argc) return;
 #ifdef __APPLE__
-    /* 模块核心语义抽象与接口调用契约 */
     int *ac = _NSGetArgc();
     char ***av = _NSGetArgv();
     if (ac && av && *ac > 0 && *av) {
@@ -1044,7 +1023,6 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     settings.windowless_rendering_enabled = windowless ? 1 : 0;
     settings.log_severity = LOGSEVERITY_WARNING;
 
-    /* 模块核心语义抽象与接口调用契约 */
     char profile[1100];
     snprintf(profile, sizeof(profile), "%s", cache_path ? cache_path : "");
 
@@ -1087,7 +1065,6 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     cef_main_args_t args;
     zc_main_args(&args);
 #ifdef __APPLE__
-    /* 模块核心语义抽象与接口调用契约 */
     zc_mac_patch_nsapp();
 #endif
     int ok = zc.initialize(&args, &settings, &zc_app, NULL);
@@ -1110,7 +1087,6 @@ ZC_EXPORT int zan_cef_init(const char *runtime_dir, const char *cache_path,
     return 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void zan_cef_work(void) {
     if (zc_ready && !zc_shut) {
 #ifdef _WIN32
@@ -1155,7 +1131,6 @@ ZC_EXPORT void zan_cef_shutdown(void) {
             }
         }
     }
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < 200; i++) zc.do_message_loop_work();
     zc.shutdown();
     zc_shut = 1;
@@ -1175,7 +1150,7 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     zc_browser_t *b = NULL;
     for (int i = 0; i < ZC_MAX_BROWSERS; i++) {
         if (!zc_browsers[i].used) { b = &zc_browsers[i]; b->id = i + 1; break; }
-        if (zc_browsers[i].gone) {   /* 核心系统底层抽象与内存语义契约 */
+        if (zc_browsers[i].gone) {   
             b = &zc_browsers[i];
             for (int q = 0; q < ZC_MAX_CDP_QUEUE; q++) {
                 free(b->queue[q]);
@@ -1210,7 +1185,6 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
     cef_window_info_t wi;
     memset(&wi, 0, sizeof(wi));
 #ifndef ZAN_CEF_LEGACY
-    /* 模块核心语义抽象与接口调用契约 */
     wi.size = sizeof(wi);
 #endif
     wi.bounds.x = x;
@@ -1238,7 +1212,6 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
                     x, y, w, h);
         }
         if (pview) {
-            /* 模块核心语义抽象与接口调用契约 */
             double sc = zc_view_scale(pview);
             wi.bounds.x = (int)((double)wi.bounds.x / sc);
             wi.bounds.y = (int)((double)wi.bounds.y / sc);
@@ -1267,7 +1240,6 @@ ZC_EXPORT int zan_cef_create(void *parent, int x, int y, int w, int h,
         return 0;
     }
     if (b->browser != browser) {
-        /* 模块核心语义抽象与接口调用契约 */
         if (b->browser) browser->base.release(&browser->base);
         else b->browser = browser;
     } else {
@@ -1307,7 +1279,6 @@ ZC_EXPORT void zan_cef_close(int h) {
 
 ZC_EXPORT int zan_cef_alive(int h) { return zc_get(h) != NULL; }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void *zan_cef_window(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return NULL;
@@ -1327,7 +1298,6 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
         zc_browser_t *bb = zc_get(h);
         if (bb) {
             bb->bx = x; bb->by = y; bb->bw = w; bb->bh = hh;
-            /* 模块核心语义抽象与接口调用契约 */
             free(bb->clip_spec);
             bb->clip_spec = NULL;
         }
@@ -1365,7 +1335,6 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
         }
     }
 #else
-    /* 模块核心语义抽象与接口调用契约 */
     typedef void *(*fn_xdisplay)(void);
     typedef int (*fn_move_resize)(void *, unsigned long, int, int, unsigned, unsigned);
     typedef int (*fn_flush)(void *);
@@ -1402,7 +1371,6 @@ ZC_EXPORT void zan_cef_set_bounds(int h, int x, int y, int w, int hh) {
 ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
-    /* 模块核心语义抽象与接口调用契约 */
     int state = visible ? 1 : 0;
     if (b->shown == state) return;
     b->shown = state;
@@ -1445,7 +1413,6 @@ ZC_EXPORT void zan_cef_set_visible(int h, int visible) {
 static void zc_mac_clip(zc_browser_t *b, const char *spec) {
     void *wnd = zan_cef_window(b->id);
     if (!wnd || !zc_cg_init()) return;
-    /* 模块核心语义抽象与接口调用契约 */
     if (b->clip_spec && strcmp(b->clip_spec, spec) == 0) return;
     zc_rect_t fr = zc_ns_rect(wnd, "frame");
     if (fr.w <= 0.0 || fr.h <= 0.0) return;
@@ -1553,7 +1520,6 @@ ZC_EXPORT void zan_cef_set_clip(int h, const char *spec) {
             }
             while (*p && *p != ';' && (*p < '0' || *p > '9') && *p != '-') p++;
         }
-        /* 核心系统底层抽象与内存语义契约 */
         SetWindowRgn((HWND)wnd, total, TRUE);
         free(b->clip_spec);
         b->clip_spec = zc_dup(spec, strlen(spec));
@@ -1599,7 +1565,6 @@ ZC_EXPORT double zan_cef_get_zoom(int h) {
     return level;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void zan_cef_find(int h, const char *text, int forward,
                             int match_case, int find_next) {
     zc_browser_t *b = zc_get(h);
@@ -1608,7 +1573,6 @@ ZC_EXPORT void zan_cef_find(int h, const char *text, int forward,
     if (!host) return;
     cef_string_t s;
     zc_str_set(&s, text);
-    /* 模块核心语义抽象与接口调用契约 */
     host->find(host, &s, forward, match_case, find_next);
     zc_str_free(&s);
     host->base.release(&host->base);
@@ -1623,7 +1587,6 @@ ZC_EXPORT void zan_cef_stop_find(int h, int clear_selection) {
     host->base.release(&host->base);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void zan_cef_print(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
@@ -1633,7 +1596,6 @@ ZC_EXPORT void zan_cef_print(int h) {
     host->base.release(&host->base);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void zan_cef_show_devtools(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b || !b->browser) return;
@@ -1736,7 +1698,6 @@ ZC_EXPORT const char *zan_cef_title(int h) {
     return b ? b->title : "";
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT void zan_cef_execute_js(int h, const char *code, const char *script_url,
                                   int start_line) {
     zc_browser_t *b = zc_get(h);
@@ -1785,7 +1746,6 @@ ZC_EXPORT void zan_cef_set_popup_policy(int h, int policy) {
     if (b) b->popup_policy = policy;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT const char *zan_cef_take_popup_url(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b) return "";
@@ -1820,7 +1780,6 @@ ZC_EXPORT int zan_cef_cdp_attached(int h) {
     return b ? b->cdp_attached : 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 ZC_EXPORT const char *zan_cef_cdp_take(int h) {
     zc_browser_t *b = zc_get(h);
     if (!b) return "";

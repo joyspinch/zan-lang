@@ -1,24 +1,22 @@
-/* 底层系统交互与数据协议契约 */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 #if defined(__has_include)
 #if __has_include(<stdio.h>)
-#include <stdio.h>             /* 底层系统交互与数据协议契约 */
+#include <stdio.h>             
 #endif
 #endif
 
-/* 核心系统底层抽象与内存语义契约 */
-#define UART0_BASE   0x10000000u /* 核心系统底层抽象与内存语义契约 */
+#define UART0_BASE   0x10000000u 
 #define UART_THR     0u
 #define UART_LSR     5u
 #define UART_LSR_THRE 0x20u
 #define CLINT_BASE   0x2000000ull
 #define CLINT_MTIMECMP (CLINT_BASE + 0x4000)
 #define CLINT_MTIME    (CLINT_BASE + 0xbff8)
-#define TIMEBASE_HZ  10000000ull  /* 核心系统底层抽象与内存语义契约 */
-#define TEST_FINISHER 0x100000u   /* 核心系统底层抽象与内存语义契约 */
+#define TIMEBASE_HZ  10000000ull  
+#define TEST_FINISHER 0x100000u   
 #define FINISHER_PASS 0x5555u
 #define FINISHER_FAIL 0x3333u
 
@@ -33,16 +31,14 @@ static void uart_putc(char c) {
 
 static void uart_write(const char *s, unsigned len) {
     for (unsigned i = 0; i < len; i++) {
-        if (s[i] == '\n') uart_putc('\r');   /* 核心系统底层抽象与内存语义契约 */
+        if (s[i] == '\n') uart_putc('\r');   
         uart_putc(s[i]);
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #if defined(__has_include)
 #if __has_include(<stdio.h>)
-/* 底层系统交互与数据协议契约 */
 static int zan_stdout_putc(char c, FILE *f) {
     (void)f;
     if (c == '\n') uart_putc('\r');
@@ -54,7 +50,7 @@ static FILE zan_stdout_file = FDEV_SETUP_STREAM(zan_stdout_putc, 0, 0,
 FILE *const stdout = &zan_stdout_file;
 static FILE zan_stderr_file = FDEV_SETUP_STREAM(zan_stdout_putc, 0, 0,
                                                 _FDEV_SETUP_WRITE);
-FILE *const stderr = &zan_stderr_file;   /* 底层系统交互与数据协议契约 */
+FILE *const stderr = &zan_stderr_file;   
 #endif
 #endif
 
@@ -67,12 +63,10 @@ static uint64_t mtime_read(void) {
     return ((uint64_t)hi << 32) | lo;
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_timer_now_ms(void) {
     return (long long)(mtime_read() / (TIMEBASE_HZ / 1000));
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline unsigned long zan_irq_lock(void) {
     unsigned long f;
     asm volatile ("csrrc %0, mstatus, %1" : "=r"(f) : "rK"(0x8) : "memory");
@@ -132,10 +126,8 @@ bool __atomic_compare_exchange_8(void *p, void *expected, uint64_t desired,
     return old == exp;
 }
 
-/* 底层系统交互与数据协议契约 */
 
-/* 底层系统交互与数据协议契约 */
-#define ZAN_STACK_BUDGET (28u * 1024u)   /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_STACK_BUDGET (28u * 1024u)   
 static int stack_over_budget(void) {
     return *(volatile uint32_t *)(__stack_top - ZAN_STACK_BUDGET)
         != 0xABABABABu;
@@ -150,10 +142,10 @@ int poll(void *fds, unsigned long nfds, int timeout) {
     (void)fds; (void)nfds;
     if (stack_over_budget()) {
         uart_write("\n[zan] STACK OVERFLOW: past 28K of 32K budget\n", 45);
-        zan_stop_fail(139);                /* 核心系统底层抽象与内存语义契约 */
+        zan_stop_fail(139);                
     }
-    if (timeout == 0) return 0;            /* 核心系统底层抽象与内存语义契约 */
-    uint64_t slice = (timeout < 0) ? 10u   /* 核心系统底层抽象与内存语义契约 */
+    if (timeout == 0) return 0;            
+    uint64_t slice = (timeout < 0) ? 10u   
                                    : (uint64_t)timeout;
     uint64_t deadline = mtime_read() + slice * (TIMEBASE_HZ / 1000);
     *(volatile uint32_t *)(CLINT_MTIMECMP + 4) = (uint32_t)(deadline >> 32);
@@ -163,10 +155,9 @@ int poll(void *fds, unsigned long nfds, int timeout) {
     asm volatile ("wfi");                         /* wakes on MTIP */
     asm volatile ("csrci mstatus, 0x8");
     asm volatile ("csrc mie, %0" :: "r"(0x80));
-    return 0;   /* 底层系统交互与数据协议契约 */
+    return 0;   
 }
 
-/* 底层系统交互与数据协议契约 */
 
 #if defined(__has_include)
 #if __has_include(<unistd.h>)
@@ -175,7 +166,7 @@ int poll(void *fds, unsigned long nfds, int timeout) {
 #include <sys/time.h>
 int open(const char *path, int flags, ...) {
     (void)path; (void)flags;
-    return -1;   /* 底层系统交互与数据协议契约 */
+    return -1;   
 }
 int close(int fd) { (void)fd; return -1; }
 int unlink(const char *p) { (void)p; return -1; }
@@ -183,7 +174,7 @@ int rmdir(const char *p) { (void)p; return -1; }
 int mkdir(const char *p, mode_t mode) { (void)p; (void)mode; return -1; }
 ssize_t read(int fd, void *buf, size_t len) {
     (void)fd; (void)buf; (void)len;
-    return -1;                             /* 核心系统底层抽象与内存语义契约 */
+    return -1;                             
 }
 ssize_t write(int fd, const void *buf, size_t len) {
     if (fd == 1 || fd == 2) {
@@ -214,16 +205,15 @@ int gettimeofday(struct timeval *tv, void *tz) {
 
 int _fstat(int fd, struct stat *st) {
     (void)fd;
-    st->st_mode = S_IFCHR;                 /* 核心系统底层抽象与内存语义契约 */
+    st->st_mode = S_IFCHR;                 
     return 0;
 }
 int _isatty(int fd) { return (fd == 1 || fd == 2); }
 
-void *_sbrk(int inc) { (void)inc; return (void *)-1; }  /* 底层系统交互与数据协议契约 */
+void *_sbrk(int inc) { (void)inc; return (void *)-1; }  
 int _getpid(void) { return 1; }
 int _kill(int pid, int sig) { (void)pid; (void)sig; return -1; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void uart_print_dec(long long v) {
     char buf[24];
@@ -241,7 +231,6 @@ static void uart_print_hex(unsigned long v) {
     for (int i = 28; i >= 0; i -= 4) uart_putc(digits[(v >> i) & 0xF]);
 }
 
-/* 底层系统交互与数据协议契约 */
 void __attribute__((noreturn))
 zan_fault_report(long mcause, long mepc, long mtval, long ra) {
     uart_write("\n[zan] TRAP mcause=", 19);
@@ -257,8 +246,6 @@ zan_fault_report(long mcause, long mepc, long mtval, long ra) {
 }
 
 void __attribute__((noreturn)) exit(int code) {
-    /* 底层系统交互与数据协议契约 */
-    /* 底层系统交互与数据协议契约 */
     const volatile uint32_t *p = (const volatile uint32_t *)__stack_bottom;
     while (p < (const volatile uint32_t *)__stack_top && *p == 0xABABABABu)
         p++;
@@ -272,7 +259,6 @@ void __attribute__((noreturn)) exit(int code) {
     uart_print_dec((long long)(__stack_top - __stack_bottom));
     uart_write(" bytes\n", 7);
 
-    /* 底层系统交互与数据协议契约 */
     {
         extern void zan_shim_pool_stats(size_t *live, size_t *peak,
                                         unsigned *oom);
@@ -328,7 +314,6 @@ void __attribute__((noreturn)) exit(int code) {
             }
         }
         if (oom) {
-            /* 底层系统交互与数据协议契约 */
             extern void zan_shim_trace(const size_t **allocs,
                                        const size_t **frees,
                                        unsigned *an, unsigned *fn);
@@ -356,4 +341,4 @@ void __attribute__((noreturn)) exit(int code) {
     for (;;) { asm volatile ("wfi"); }
 }
 
-void abort(void) { exit(134); }            /* 核心系统底层抽象与内存语义契约 */
+void abort(void) { exit(134); }            

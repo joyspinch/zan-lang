@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #include "package.h"
 #include <stdio.h>
@@ -31,7 +30,6 @@ static void test_lock_roundtrip(void) {
     zan_pkg_registry_t reg;
     zan_pkg_init(&reg, "test_pkg_scratch");
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_package_t *p1 = (zan_package_t *)calloc(1, sizeof(zan_package_t));
     strncpy(p1->name, "Test.PkgA", sizeof(p1->name) - 1);
     zan_version_parse("1.2.3", &p1->version);
@@ -46,7 +44,6 @@ static void test_lock_roundtrip(void) {
 
     EXPECT(zan_pkg_write_lock(&reg), "write lock should succeed");
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_pkg_registry_t reg2;
     zan_pkg_init(&reg2, "test_pkg_scratch");
     EXPECT(zan_pkg_read_lock(&reg2), "read lock should succeed");
@@ -65,7 +62,6 @@ static void test_lock_roundtrip(void) {
 
 static void test_corrupt_lock_rejected(void) {
     mkdir("test_pkg_scratch");
-    /* 底层系统交互与数据协议契约 */
     FILE *f = fopen("test_pkg_scratch/zan.lock", "w");
     assert(f);
     fprintf(f, "[[package]]\nname = \"Bad.Pkg\"\nversion = \"not_a_version\"\n");
@@ -79,7 +75,6 @@ static void test_corrupt_lock_rejected(void) {
 
 static void test_unsafe_name_rejected(void) {
     mkdir("test_pkg_scratch");
-    /* 底层系统交互与数据协议契约 */
     FILE *f = fopen("test_pkg_scratch/zan.lock", "w");
     assert(f);
     fprintf(f, "[[package]]\nname = \"../../escape\"\nversion = \"1.0.0\"\n");

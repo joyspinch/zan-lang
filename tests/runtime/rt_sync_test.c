@@ -141,7 +141,6 @@ static void *nested_monitor_worker(void *arg) {
 }
 
 static void test_monitor(void) {
-    /* 核心系统底层抽象与内存语义契约 */
     int dummy_obj = 42;
     zan_monitor_enter(&dummy_obj);
     zan_monitor_enter(&dummy_obj);
@@ -149,7 +148,6 @@ static void test_monitor(void) {
     zan_monitor_exit(&dummy_obj);
     CHECK(1, "recursive monitor enter/exit succeeded");
 
-    /* 核心系统底层抽象与内存语义契约 */
     enum { M_THREADS = 4, M_ITERS = 10000 };
     volatile int counter = 0;
     monitor_worker_args margs = {&dummy_obj, &counter, M_ITERS};
@@ -176,7 +174,6 @@ static void test_monitor(void) {
           "striped monitor failed mutual exclusion: counter=%d expected=%d",
           counter, M_THREADS * M_ITERS);
 
-    /* 核心系统底层抽象与内存语义契约 */
     int obj1 = 1, obj2 = 2;
     zan_monitor_enter(&obj1);
     zan_monitor_enter(&obj2);
@@ -184,7 +181,6 @@ static void test_monitor(void) {
     zan_monitor_exit(&obj1);
     CHECK(1, "nested monitor enter/exit succeeded");
 
-    /* 底层系统交互与数据协议契约 */
     enum { N_THREADS = 4, N_ITERS = 5000 };
     volatile int ncounter = 0;
     nested_monitor_worker_args nargs = {&obj1, &obj2, &ncounter, N_ITERS};
@@ -211,7 +207,6 @@ static void test_monitor(void) {
           "concurrent nested monitor failed: counter=%d expected=%d",
           ncounter, N_THREADS * N_ITERS);
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_ui_thread_set();
     CHECK(zan_ui_thread_check() == 1, "UI thread check should succeed on registered UI thread");
     zan_ui_thread_assert("test on UI thread");
@@ -385,7 +380,6 @@ static void test_shared_table(void) {
           "destroyed shared table can still be opened");
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void test_file_handle(void) {
     char path[160];
 #ifdef _WIN32
@@ -414,7 +408,6 @@ static void test_file_handle(void) {
     CHECK(zan_file_tell(h) == n, "tell after read is wrong");
     CHECK(zan_file_flush(h) == 1, "flush failed on open handle");
 
-    /* 底层系统交互与数据协议契约 */
     CHECK(zan_file_read(12345, (long long)(intptr_t)buf, 4) == 0,
           "forged handle accepted by read");
     CHECK(zan_file_write(12345, (long long)(intptr_t)msg, 4) == 0,
@@ -426,19 +419,16 @@ static void test_file_handle(void) {
     CHECK(zan_file_read(0, (long long)(intptr_t)buf, 4) == 0,
           "zero handle accepted by read");
 
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_read(h ^ (1LL << 32), (long long)(intptr_t)buf, 4) == 0,
           "wrong-generation handle accepted by read");
     CHECK(zan_file_close(h ^ (1LL << 32)) == 0,
           "wrong-generation handle accepted by close");
 
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_close(h) == 1, "first close failed");
     CHECK(zan_file_close(h) == 0, "double close not detected");
     CHECK(zan_file_read(h, (long long)(intptr_t)buf, 4) == 0,
           "use-after-close handle accepted by read");
 
-    /* 模块核心语义抽象与接口调用契约 */
     long long h2 = zan_file_open(path, "rb");
     CHECK(h2 != 0, "could not reopen scratch file");
     if (h2) {
@@ -452,7 +442,6 @@ static void test_file_handle(void) {
     remove(path);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 #ifndef _WIN32
 static void test_file_no_follow_symlink(void) {
     char dir[192], target[192], link[192];
@@ -484,7 +473,6 @@ static void test_file_no_follow_symlink(void) {
     mode_t mode_before = st_before.st_mode & 07777;
     time_t mtime_before = st_before.st_mtime;
 
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_set_readonly(link, 1) == 0,
           "set_readonly followed a symlink");
     CHECK(zan_file_set_time(link, 0, (long long)(mtime_before + 3600)) == 0,
@@ -495,7 +483,6 @@ static void test_file_no_follow_symlink(void) {
     CHECK(st_after.st_mtime == mtime_before,
           "symlink set_time changed the target's mtime");
 
-    /* 模块核心语义抽象与接口调用契约 */
     CHECK(zan_file_set_readonly(target, 1) == 1,
           "set_readonly failed on the real file");
     CHECK(stat(target, &st_after) == 0, "could not restat target");

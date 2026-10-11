@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include "../../src/runtime/gui_touch_game.h"
@@ -55,7 +54,6 @@ static void test_tap_and_slop(void) {
     p.x += 8;
     feed(&f, ZAN_TG_MOVE, -1, &p, 1);
     expect_event(&f, 2, 1, 48, 60, 0, 0, 1);
-    /* 模块核心语义抽象与接口调用契约 */
     p.x = 40;
     feed(&f, ZAN_TG_UP, 19, &p, 1);
     CHECK(f.count == 5 && f.game.phase == ZAN_TG_IDLE);
@@ -77,7 +75,6 @@ static void test_single_drag_no_scroll(void) {
     CHECK(f.count == 5);
     for (int i = 0; i < f.count; ++i) CHECK(f.events[i][0] != 13);
 
-    /* 模块核心语义抽象与接口调用契约 */
     f.count = 0;
     feed(&f, ZAN_TG_DOWN, 3, &p, 1);
     p.y += 20;
@@ -92,7 +89,6 @@ static void test_pair_ids_pan_and_zoom(void) {
     CHECK(f.count == 4);
     expect_event(&f, 2, 3, 0, 0, 0, 0, 1);
     expect_event(&f, 3, 1, 50, 0, 0, 0, 2);
-    /* 模块核心语义抽象与接口调用契约 */
     zan_tg_pointer p[] = { { 23, 120, 30 }, { 7, 20, 30 } };
     feed(&f, ZAN_TG_MOVE, -1, p, 2);
     CHECK(f.count == 5);
@@ -120,20 +116,18 @@ static void test_drag_to_pair_and_partial_stream(void) {
     feed(&f, ZAN_TG_POINTER_DOWN, 9, p, 2);
     expect_event(&f, 3, 3, 120, 100, 0, 0, 1);
     expect_event(&f, 4, 1, 160, 110, 0, 0, 2);
-    /* 模块核心语义抽象与接口调用契约 */
     feed(&f, ZAN_TG_POINTER_UP, 9, p, 2);
     expect_event(&f, 5, 3, 160, 110, 0, 0, 1);
     feed(&f, ZAN_TG_MOVE, -1, p, 1);
     feed(&f, ZAN_TG_UP, 17, p, 1);
     CHECK(f.count == 6 && f.game.phase == ZAN_TG_IDLE);
 
-    /* 模块核心语义抽象与接口调用契约 */
     f.count = 0;
     feed(&f, ZAN_TG_MOVE, -1, p, 1);
     feed(&f, ZAN_TG_POINTER_DOWN, 9, p, 2);
     CHECK(f.count == 0);
     feed(&f, ZAN_TG_DOWN, 17, p, 1);
-    feed(&f, ZAN_TG_MOVE, -1, p, 2); /* 核心系统底层抽象与内存语义契约 */
+    feed(&f, ZAN_TG_MOVE, -1, p, 2); 
     expect_event(&f, 2, 3, 120, 100, 0, 0, 1);
     CHECK(f.count == 3 && f.game.phase == ZAN_TG_SUPPRESS);
     feed(&f, ZAN_TG_CANCEL, -1, NULL, 0);
@@ -141,7 +135,6 @@ static void test_drag_to_pair_and_partial_stream(void) {
 }
 
 static void test_extra_finger_and_residual_suppression(void) {
-    /* 模块核心语义抽象与接口调用契约 */
     for (int lifted = 0; lifted < 2; ++lifted) {
         fixture f = {0};
         start_pair(&f);
@@ -189,13 +182,12 @@ static void test_cancel_missing_id_and_restart(void) {
     CHECK(f.game.phase == ZAN_TG_IDLE);
     f.count = 0;
     start_pair(&f);
-    feed(&f, ZAN_TG_MOVE, -1, &p, 1); /* 核心系统底层抽象与内存语义契约 */
+    feed(&f, ZAN_TG_MOVE, -1, &p, 1); 
     expect_event(&f, 4, 3, 50, 0, 0, 0, 1);
     CHECK(f.game.phase == ZAN_TG_SUPPRESS);
     feed(&f, ZAN_TG_UP, 5, &p, 1);
     CHECK(f.count == 5 && f.game.phase == ZAN_TG_IDLE);
 
-    /* 模块核心语义抽象与接口调用契约 */
     f.count = 0;
     feed(&f, ZAN_TG_DOWN, 5, &p, 1);
     p.id = 29; p.x = 80;
@@ -210,7 +202,6 @@ static void test_fractional_and_zero_distance(void) {
     start_pair(&f);
     f.count = 0;
     zan_tg_pointer p[] = { { 7, 0, 0 }, { 23, 100, 0 } };
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 1; i <= 100; ++i) {
         p[1].x = 100.0f + (float)i / 10.0f;
         feed(&f, ZAN_TG_MOVE, -1, p, 2);
@@ -263,7 +254,7 @@ static void test_event_coalescing(void) {
     move[3] = 0; move[6] = 2;
     CHECK(!zan_tg_coalesce(last, move));
     last[6] = 2;
-    CHECK(!zan_tg_coalesce(last, move)); /* 核心系统底层抽象与内存语义契约 */
+    CHECK(!zan_tg_coalesce(last, move)); 
     last[0] = move[0] = 3;
     CHECK(!zan_tg_coalesce(last, move));
 }
