@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_RT_HW_ACCEL_SM4_TABLES_H
 #define ZAN_RT_HW_ACCEL_SM4_TABLES_H
 

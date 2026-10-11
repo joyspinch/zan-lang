@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -65,11 +64,9 @@ int __vfprintf_chk(FILE *o, int f, const char *fmt, va_list ap) {
 ssize_t __read_chk(int fd, void *buf, size_t n, size_t bs) {
     (void)bs; return read(fd, buf, n);
 }
-/* 底层系统交互与数据协议契约 */
 unsigned long __fdelt_chk(unsigned long d) {
     return d >> 6;
 }
-/* 底层系统交互与数据协议契约 */
 int __isoc99_sscanf(const char *s, const char *fmt, ...) {
     va_list ap; int r;
     va_start(ap, fmt); r = vsscanf(s, fmt, ap); va_end(ap);

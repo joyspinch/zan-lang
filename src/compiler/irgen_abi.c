@@ -9,18 +9,18 @@ typedef enum {
 
 typedef enum {
     ABI_SLOT_DIRECT,    /* passed as declared */
-    ABI_SLOT_COERCE,    /* 核心系统底层抽象与内存语义契约 */
+    ABI_SLOT_COERCE,
     ABI_SLOT_INDIRECT,  /* passed as a pointer to a copy */
-    ABI_SLOT_SRET       /* 核心系统底层抽象与内存语义契约 */
+    ABI_SLOT_SRET
 } abi_slot_kind_t;
 
 typedef struct {
     abi_slot_kind_t kind;
-    LLVMTypeRef ty;        /* 核心系统底层抽象与内存语义契约 */
-    LLVMTypeRef parts[2];  /* 底层系统交互与数据协议契约 */
+    LLVMTypeRef ty;
+    LLVMTypeRef parts[2];
     int nparts;
-    bool byval;            /* 核心系统底层抽象与内存语义契约 */
-    unsigned stack_align;  /* 核心系统底层抽象与内存语义契约 */
+    bool byval;
+    unsigned stack_align;
 } abi_slot_t;
 
 static abi_target_t abi_target_of(zan_irgen_t *g) {
@@ -79,7 +79,6 @@ static unsigned long abi_align_of(LLVMTypeRef t) {
     }
 }
 
-/* 内部辅助逻辑 */
 #define ABI_SIZE_MAX (1ULL << 40)
 
 static uint64_t abi_size_of64(LLVMTypeRef t) {
@@ -128,8 +127,8 @@ typedef enum { SYSV_NONE = 0, SYSV_SSE, SYSV_INTEGER, SYSV_MEMORY } sysv_class_t
 
 typedef struct {
     sysv_class_t cls[2];
-    bool has_double[2];      /* 底层系统交互与数据协议契约 */
-    unsigned long used[2];   /* 底层系统交互与数据协议契约 */
+    bool has_double[2];
+    unsigned long used[2];
     unsigned long size;
     bool memory;
 } sysv_info_t;
@@ -194,11 +193,9 @@ static void sysv_classify(LLVMTypeRef t, sysv_info_t *in) {
     sysv_walk(t, 0, in);
 }
 
-/* 内部辅助逻辑 */
 static LLVMTypeRef sysv_part_type(zan_irgen_t *g, sysv_info_t *in, int eb) {
     unsigned long rest = in->size - (unsigned long)eb * 8;
     unsigned long bytes = rest > 8 ? 8 : rest;
-    /* 内部辅助逻辑 */
     if (in->used[eb] && in->used[eb] < bytes) bytes = in->used[eb];
     if (in->cls[eb] == SYSV_INTEGER)
         return LLVMIntTypeInContext(g->ctx, (unsigned)(bytes * 8));
@@ -249,7 +246,6 @@ static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
             slot->parts[0] = LLVMIntTypeInContext(g->ctx, (unsigned)(size * 8));
             slot->nparts = 1;
         } else {
-            /* 模块核心语义抽象与接口调用契约 */
             slot->kind = is_return ? ABI_SLOT_SRET : ABI_SLOT_INDIRECT;
         }
         return;
@@ -277,7 +273,7 @@ static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
         LLVMTypeRef base = NULL;
         int count = 0;
         if (aarch64_hfa(ty, &base, &count) && base && count > 0 && count <= 4) {
-            if (is_return) return;   /* 核心系统底层抽象与内存语义契约 */
+            if (is_return) return;
             slot->kind = ABI_SLOT_COERCE;
             slot->parts[0] = LLVMArrayType(base, (unsigned)count);
             slot->nparts = 1;
@@ -300,7 +296,6 @@ static void abi_classify(zan_irgen_t *g, abi_target_t tgt, LLVMTypeRef ty,
         return;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
 }
 
 static void abi_add_type_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
@@ -325,7 +320,6 @@ static void abi_add_int_attr(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef call,
                                  LLVMCreateEnumAttribute(g->ctx, kind, val));
 }
 
-/* 内部辅助逻辑 */
 static const char *abi_int_ext_attr(zan_type_t *t) {
     if (!t) return NULL;
     switch (t->kind) {
@@ -338,7 +332,6 @@ static const char *abi_int_ext_attr(zan_type_t *t) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void abi_add_int_ext_attrs(zan_irgen_t *g, LLVMValueRef fn,
                                   zan_type_t *ret, zan_type_t **ptypes,
                                   int pc) {
@@ -358,8 +351,6 @@ static LLVMValueRef abi_byte_ptr(zan_irgen_t *g, LLVMValueRef base,
     return LLVMBuildInBoundsGEP2(g->builder, i8, base, &idx, 1, "abi.off");
 }
 
-/* 内部辅助逻辑 */
-/* 内部辅助逻辑 */
 static void abi_pending_add(zan_irgen_t *g, const char *name) {
     for (int i = 0; i < g->abi_pending_count; i++)
         if (strcmp(g->abi_pending[i], name) == 0) return;
@@ -415,7 +406,6 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
 
     abi_target_t tgt = abi_target_of(g);
     if (tgt == ABI_TARGET_UNSUPPORTED) {
-        /* 内部辅助逻辑 */
         abi_pending_add(g, name);
         free(zan_params);
         return NULL;
@@ -436,7 +426,6 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
     for (unsigned i = 0; i < pc; i++)
         abi_classify(g, tgt, zan_params[i], false, &arg_slots[i]);
 
-    /* 核心系统底层抽象与内存语义契约 */
     unsigned cn = 0;
     bool sret = (ret_slot.kind == ABI_SLOT_SRET);
     LLVMTypeRef ptr_ty = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -492,7 +481,6 @@ static LLVMValueRef abi_extern_thunk(zan_irgen_t *g, const char *name,
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     char tname[320];
     snprintf(tname, sizeof(tname), "zan.abi.%s", name);
     LLVMValueRef thunk = LLVMGetNamedFunction(g->mod, tname);

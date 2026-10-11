@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_TOKEN_H
 #define ZAN_TOKEN_H
@@ -11,10 +10,10 @@ typedef enum {
     TK_FLOAT_LIT,       /* 3.14, 1.0e10 */
     TK_STRING_LIT,      /* "hello" */
     TK_CHAR_LIT,        /* 'A' */
-    TK_INTERP_START,    /* 核心系统底层抽象与内存语义契约 */
-    TK_INTERP_MID,      /* 核心系统底层抽象与内存语义契约 */
-    TK_INTERP_END,      /* 核心系统底层抽象与内存语义契约 */
-    TK_INTERP_FMT,      /* 底层系统交互与数据协议契约 */
+    TK_INTERP_START,
+    TK_INTERP_MID,
+    TK_INTERP_END,
+    TK_INTERP_FMT,
 
     TK_IDENT,
 
@@ -143,7 +142,7 @@ typedef enum {
     TK_CARET,           /* ^ */
     TK_LESS_LESS,       /* << */
     TK_GREATER_GREATER, /* >> */
-    TK_GREATER_GREATER_GREATER, /* 核心系统底层抽象与内存语义契约 */
+    TK_GREATER_GREATER_GREATER,
 
     TK_EQ,              /* = */
     TK_PLUS_EQ,         /* += */
@@ -161,7 +160,6 @@ typedef enum {
     TK__COUNT
 } zan_token_kind_t;
 
-/* 底层系统交互与数据协议契约 */
 const char *zan_token_kind_name(zan_token_kind_t kind);
 bool zan_is_keyword(const char *name);
 

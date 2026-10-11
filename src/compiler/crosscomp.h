@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_CROSSCOMP_H
 #define ZAN_CROSSCOMP_H
@@ -36,32 +35,27 @@ typedef struct {
     zan_arch_t arch;
     zan_os_t os;
     zan_abi_t abi;
-    char triple[128];       /* 核心系统底层抽象与内存语义契约 */
-    char cpu[64];           /* 核心系统底层抽象与内存语义契约 */
-    char features[256];     /* 核心系统底层抽象与内存语义契约 */
+    char triple[128];
+    char cpu[64];
+    char features[256];
     int pointer_size;       /* in bytes: 4 or 8 */
-    bool pic;               /* 核心系统底层抽象与内存语义契约 */
+    bool pic;
 } zan_target_t;
 
-/* 底层系统交互与数据协议契约 */
 bool zan_target_parse(const char *triple_str, zan_target_t *out);
 
-/* 核心系统底层抽象与内存语义契约 */
 void zan_target_host(zan_target_t *out);
 
-/* 底层系统交互与数据协议契约 */
 const char *zan_target_llvm_triple(const zan_target_t *target);
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
-    const char *name;       /* 核心系统底层抽象与内存语义契约 */
-    const char *triple;     /* 核心系统底层抽象与内存语义契约 */
-    const char *desc;       /* 核心系统底层抽象与内存语义契约 */
+    const char *name;
+    const char *triple;
+    const char *desc;
 } zan_target_info_t;
 
 int zan_target_list(const zan_target_info_t **out);
 
-/* 底层系统交互与数据协议契约 */
 void *zan_target_create_machine(const zan_target_t *target, int opt_level);
 
 #endif /* ZAN_CROSSCOMP_H */

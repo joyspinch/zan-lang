@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 
 #include <llvm-c/IRReader.h>
 #include <limits.h>
@@ -23,22 +22,21 @@ static void sh_probe_mem(const char *tag) {
 }
 
 enum {
-    SH_F_DECL = 0,  /* 核心系统底层抽象与内存语义契约 */
-    SH_F_DEMOTE,    /* 底层系统交互与数据协议契约 */
-    SH_F_EXT,       /* 底层系统交互与数据协议契约 */
-    SH_F_BLOCK      /* 核心系统底层抽象与内存语义契约 */
+    SH_F_DECL = 0,
+    SH_F_DEMOTE,
+    SH_F_EXT,
+    SH_F_BLOCK
 };
 
 enum {
-    SH_G_DECL = 0,  /* 核心系统底层抽象与内存语义契约 */
+    SH_G_DECL = 0,
     SH_G_TRAVEL,    /* 内部常量：定义直接复制到每个引用它的分片模块中 */
     SH_G_BLOCK      /* 无法迁移的全局状态（初始化器逃逸至内部函数/别名/TLS）：保留在协调器模块 */
 };
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     void     **keys;
-    int       *vals;      /* 核心系统底层抽象与内存语义契约 */
+    int       *vals;
     int        mask;
     int        n;
 } sh_map_t;
@@ -94,7 +92,6 @@ static bool sh_map_put(sh_map_t *m, void *k, int v) {
     return true;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct { char *p; size_t n, cap; bool oom; } sh_sbuf_t;
 
 static void sh_sb_putn(sh_sbuf_t *b, const char *s, size_t n) {
@@ -113,7 +110,6 @@ static void sh_sb_putn(sh_sbuf_t *b, const char *s, size_t n) {
 
 static void sh_sb_puts(sh_sbuf_t *b, const char *s) { sh_sb_putn(b, s, strlen(s)); }
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct { LLVMValueRef fn; LLVMValueRef glob; unsigned old_linkage; } sh_link_rec_t;
 typedef struct { LLVMValueRef orig, decl; char *origname; } sh_move_rec_t;
 
@@ -121,12 +117,12 @@ typedef struct {
     zan_irgen_t      *g;
     sh_map_t          fn_v;        /* fn      -> SH_F_* */
     sh_map_t          glob_v;      /* global  -> SH_G_* */
-    sh_map_t          members_all; /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t          needs_decl;  /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t          type_done;   /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t          members_all;
+    sh_map_t          needs_decl;
+    sh_map_t          type_done;
     sh_link_rec_t    *link_recs;   int link_n, link_cap;
-    sh_map_t          ext_globs;   /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t          ext_fns;     /* 核心系统底层抽象与内存语义契约 */
+    sh_map_t          ext_globs;
+    sh_map_t          ext_fns;
     bool              failed;
     char              reason[256];
 } sh_state_t;
@@ -145,9 +141,8 @@ static bool sh_name_is(const LLVMValueRef v, const char *pfx) {
     return n && strncmp(n, pfx, strlen(pfx)) == 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
-    long long   offset;       /* 核心系统底层抽象与内存语义契约 */
+    long long   offset;
     size_t      len;
 } sh_body_slice_t;
 
@@ -203,7 +198,6 @@ static char *sh_body_header_name(const char *header) {
                 c = (unsigned char)((hi << 4) | lo);
                 i += 2;
             }
-            /* 模块核心语义抽象与接口调用契约 */
             if (!c) { free(name); return NULL; }
             name[n++] = (char)c;
         }
@@ -293,7 +287,7 @@ static bool sh_build_body_index(sh_body_index_t *idx, FILE *file) {
                 !sh_body_index_add(idx, name, body_start, (size_t)span)) {
                 ok = false; break;
             }
-            name = NULL; /* 核心系统底层抽象与内存语义契约 */
+            name = NULL;
             in_body = false;
         }
         pos += (long long)n;
@@ -348,7 +342,6 @@ static void sh_free_body_index(sh_body_index_t *idx) {
     memset(idx, 0, sizeof(*idx));
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 /* 分片引用的协调器函数必须通过外部导出符号可达 */
 static int sh_fn_verdict(sh_state_t *st, LLVMValueRef f) {
     int hit = sh_map_get(&st->fn_v, f);
@@ -363,7 +356,6 @@ static int sh_fn_verdict(sh_state_t *st, LLVMValueRef f) {
     return v;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool sh_has_attached_metadata(LLVMValueRef f) {
     if (LLVMHasMetadata(f)) return true;
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(f); bb;
@@ -375,12 +367,10 @@ static bool sh_has_attached_metadata(LLVMValueRef f) {
 }
 
 /* 全局判定（含初始化器闭包依赖扫描） */
-/* 内部辅助实现 */
 typedef struct { LLVMValueRef v; int depth; } sh_cw_item_t;
 
 static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv);
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool sh_glob_closure_ok(sh_state_t *st, LLVMValueRef init,
                                sh_map_t *done, int depth) {
     if (!init || depth > 32) return true;
@@ -410,11 +400,11 @@ static bool sh_glob_closure_ok(sh_state_t *st, LLVMValueRef init,
 static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv) {
     int hit = sh_map_get(&st->glob_v, gv);
     if (hit >= 0) return hit;
-    if (hit == -2) return SH_G_BLOCK;   /* 核心系统底层抽象与内存语义契约 */
+    if (hit == -2) return SH_G_BLOCK;
 
     int verdict;
     if (!LLVMIsAGlobalVariable(gv)) {
-        verdict = SH_G_BLOCK;           /* 核心系统底层抽象与内存语义契约 */
+        verdict = SH_G_BLOCK;
     } else if (LLVMHasMetadata(gv)) {
         /* 剥离无定义的 !N 元数据节点引用 */
         verdict = SH_G_BLOCK;
@@ -445,11 +435,11 @@ static int sh_global_verdict(sh_state_t *st, LLVMValueRef gv) {
 
 typedef struct {
     sh_state_t *st;
-    sh_map_t    decl_fns;    /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t    decl_globs;  /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t    travel;      /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t    body_done;   /* 核心系统底层抽象与内存语义契约 */
-    sh_map_t   *closure_seen;/* 底层系统交互与数据协议契约 */
+    sh_map_t    decl_fns;
+    sh_map_t    decl_globs;
+    sh_map_t    travel;
+    sh_map_t    body_done;
+    sh_map_t   *closure_seen;
 } sh_refs_t;
 
 static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f);
@@ -473,7 +463,6 @@ static bool sh_link_glob(sh_state_t *st, LLVMValueRef gv) {
 }
 static bool sh_refs_note_global(sh_refs_t *r, LLVMValueRef gv);
 
-/* 内部辅助实现 */
 static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
     /* 跨分片函数引用记录：分片间独立记录声明集 */
     sh_map_t walk_done; sh_map_init(&walk_done);
@@ -490,7 +479,6 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
         if (LLVMIsAFunction(v)) {
             if (sh_map_get(&st->members_all, v) >= 0) {
                 sh_map_put(&st->needs_decl, v, 1);
-                /* 模块核心语义抽象与接口调用契约 */
                 if (sh_map_get(&r->decl_fns, v) < 0)
                     sh_map_put(&r->decl_fns, v, 1);
             } else
@@ -513,7 +501,6 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
                 if (sh_map_get(&r->travel, v) < 0)
                     sh_map_put(&r->travel, v, 1);
             } else {
-                /* 底层系统交互与数据协议契约 */
                 if (!sh_refs_note_global(r, v)) { break; }
                 continue;
             }
@@ -542,7 +529,6 @@ static void sh_mark_closure_fns(sh_state_t *st, sh_refs_t *r, LLVMValueRef gv) {
     sh_map_free(&walk_done);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static time_t sh_trace_t0(void) {
     static time_t t0 = 0;
     if (!t0) t0 = time(NULL);
@@ -559,8 +545,6 @@ static int sh_trace_on(void) {
         fprintf(stderr, __VA_ARGS__); \
         fflush(stderr); } } while (0)
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
 static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f) {
     sh_state_t *st = r->st;
     if (sh_map_get(&st->members_all, f) >= 0) {
@@ -583,7 +567,6 @@ static bool sh_refs_note_fn(sh_refs_t *r, LLVMValueRef f) {
                 LLVMGetValueName(f));
         return false;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     if (sh_map_get(&r->decl_fns, f) < 0)
         if (!sh_map_put(&r->decl_fns, f, 1)) { sh_fail(st, "out of memory"); return false; }
     return true;
@@ -655,14 +638,14 @@ static bool sh_refs_scan_fn(sh_refs_t *r, LLVMValueRef fn) {
 
 /* ---- planning -------------------------------------------------------------- */
 typedef struct {
-    int         *idx;        /* 核心系统底层抽象与内存语义契约 */
+    int         *idx;
     int          n, cap;
     long long    insns;
     const char  *minname;
 } sh_comp_t;
 
 typedef struct {
-    int mf_i;                /* 核心系统底层抽象与内存语义契约 */
+    int mf_i;
     LLVMValueRef fn;
     int  comp;
     bool needs_decl;
@@ -679,10 +662,6 @@ static int sh_cmp_name_ref(const void *a, const void *b) {
     return strcmp(LLVMGetValueName(x), LLVMGetValueName(y));
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
 static bool sh_ident_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') || c == '_' || c == '$' || c == '.' ||
@@ -786,7 +765,6 @@ static char *sh_type_name_clean(LLVMTypeRef ty) {
     return res;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void sh_emit_fn_decl(sh_sbuf_t *b, LLVMValueRef f) {
     LLVMTypeRef ft = LLVMGlobalGetValueType(f);
     LLVMTypeRef rt = LLVMGetReturnType(ft);
@@ -816,7 +794,6 @@ static void sh_emit_fn_decl(sh_sbuf_t *b, LLVMValueRef f) {
 
 static void sh_emit_global_decl(sh_state_t *st, sh_sbuf_t *b, LLVMValueRef gv) {
     if (!LLVMIsDeclaration(gv)) {
-        /* 模块核心语义抽象与接口调用契约 */
         sh_sb_puts(b, "@");
         sh_sb_puts(b, LLVMGetValueName(gv));
         sh_sb_puts(b, " = external ");
@@ -833,7 +810,6 @@ static void sh_emit_global_decl(sh_state_t *st, sh_sbuf_t *b, LLVMValueRef gv) {
     (void)st;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static LLVMTargetMachineRef sh_make_tm(sh_state_t *st) {
     LLVMTargetMachineRef tm = NULL;
     if (zan_bind_target_layout(st->g, &tm) != ZAN_OK) return NULL;
@@ -896,14 +872,12 @@ static bool sh_emit_one_file(sh_state_t *st, const char *frag_path,
     }
     SH_TRACE("shard emit: frag %zu bytes -> parse\n", LLVMGetBufferSize(mb));
     LLVMModuleRef mod = NULL;
-    /* 模块核心语义抽象与接口调用契约 */
     if (LLVMParseIRInContext(ctx, mb, &mod, &perr)) {
         snprintf(errbuf, errsz, "parse: %.160s", perr ? perr : "?");
         if (perr) LLVMDisposeMessage(perr);
         LLVMContextDispose(ctx);
         return false;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMSetModuleIdentifier(mod, "zan-shard", strlen("zan-shard"));
     LLVMSetSourceFileName(mod, "zan-shard", strlen("zan-shard"));
     const char *triple = LLVMGetTarget(g->mod);
@@ -948,9 +922,7 @@ static bool sh_unique_fn_name(zan_irgen_t *g, const char *base, const char *sfx,
     return false;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 /* ---- entry ---------------------------------------------------------------- */
-/* 内部辅助实现 */
 static void sh_planner_mark(sh_state_t *st, LLVMValueRef v, int depth) {
     if (!v || depth > 8) return;
     if (LLVMIsAFunction(v)) {
@@ -1002,7 +974,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     sh_map_init(&st.ext_globs);
     sh_map_init(&st.ext_fns);
 
-    /* 模块核心语义抽象与接口调用契约 */
     sh_member_t *mem = (sh_member_t *)calloc((size_t)(m->fn_count ? m->fn_count : 1),
                                              sizeof(*mem));
     int *uf = (int *)calloc((size_t)(m->fn_count ? m->fn_count : 1), sizeof(*uf));
@@ -1034,7 +1005,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         return 0;
     }
 
-    /* 底层系统交互与数据协议契约 */
     sh_map_t mf2mem; sh_map_init(&mf2mem);
     for (int k = 0; k < nm; k++) sh_map_put(&mf2mem, mem[k].fn, k);
 
@@ -1045,7 +1015,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         changed = false;
         for (int k = 0; k < nm; k++) {
             sh_member_t *M = &mem[k];
-            if (M->comp < 0) continue;   /* 核心系统底层抽象与内存语义契约 */
+            if (M->comp < 0) continue;
             const zan_mf_fn *F = &m->fns[M->mf_i];
             bool dirty = false;
             for (int c = 0; c < F->call_cnt && !dirty; c++) {
@@ -1133,7 +1103,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     }
     qsort(comps, (size_t)ncomp, sizeof(*comps), sh_cmp_comp);
 
-    /* 核心系统底层抽象与内存语义契约 */
     int nshard = 0;
     long long cur_fn = 0, cur_insn = 0;
     int *shard_of_comp = (int *)malloc((size_t)(ncomp ? ncomp : 1) * sizeof(int));
@@ -1156,7 +1125,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             nm + dropped + meta_skip, nm - dropped, mov_insns, dropped,
             meta_skip, nshard);
     if (nshard <= 1) {
-        /* 模块核心语义抽象与接口调用契约 */
         for (int c = 0; c < ncomp; c++) free(comps[c].idx);
         free(comps); free(shard_of_comp); free(mem);
         sh_map_free(&mf2mem);
@@ -1166,13 +1134,10 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         return 0;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int c = 0; c < ncomp; c++)
         for (int j = 0; j < comps[c].n; j++)
             mem[comps[c].idx[j]].comp = shard_of_comp[c];
-    /* 核心系统底层抽象与内存语义契约 */
 
-    /* 内部辅助实现 */
     for (int i = 0; i < m->fn_count; i++) {
         const zan_mf_fn *F = &m->fns[i];
         if (!F->defined) continue;
@@ -1185,7 +1150,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
                  in = LLVMGetNextInstruction(in)) {
                 if (LLVMGetInstructionOpcode(in) == LLVMLandingPad)
-                    continue; /* 核心系统底层抽象与内存语义契约 */
+                    continue;
                 unsigned nop = LLVMGetNumOperands(in);
                 for (unsigned k = 0; k < nop; k++)
                     sh_planner_mark(&st, LLVMGetOperand(in, (int)k), 0);
@@ -1193,9 +1158,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
     }
 
-    /* 内部辅助实现 */
 
-    /* 内部辅助实现 */
     {
         sh_refs_t scratch;
         memset(&scratch, 0, sizeof(scratch));
@@ -1256,7 +1219,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             LLVMSetLinkage(mem[k].fn, LLVMExternalLinkage);
         }
     }
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i <= st.fn_v.mask; i++) {
         if (st.fn_v.vals[i] != SH_F_DEMOTE) continue;
         LLVMValueRef f = st.fn_v.keys[i];
@@ -1310,7 +1272,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         sh_map_init(&st.type_done);
 
         bool ok = true;
-        /* 核心系统底层抽象与内存语义契约 */
         sh_map_t local; sh_map_init(&local);
         sh_map_t closure_memo; sh_map_init(&closure_memo);
         for (int c = 0; c < ncomp && ok; c++) {
@@ -1319,7 +1280,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                 if (!sh_map_put(&local, mem[comps[c].idx[j]].fn, 1)) ok = false;
         }
 
-        /* 核心系统底层抽象与内存语义契约 */
         for (int c = 0; c < ncomp && ok; c++) {
             if (shard_of_comp[c] != s) continue;
             LLVMValueRef *mbrs = (LLVMValueRef *)malloc(
@@ -1330,7 +1290,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             qsort(mbrs, (size_t)comps[c].n, sizeof(*mbrs), sh_cmp_name_ref);
             for (int j = 0; j < comps[c].n && ok; j++) {
                 LLVMValueRef fn = mbrs[j];
-                /* 模块核心语义抽象与接口调用契约 */
                 {
                     sh_refs_t refs;
                     memset(&refs, 0, sizeof(refs));
@@ -1386,7 +1345,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         SH_TRACE("shard %d: bodies done (%d bytes)\n", s, (int)bodies.n);
-        /* 核心系统底层抽象与内存语义契约 */
         int ntrav = 0;
         for (int i = 0; i <= travel.mask; i++)
             if (travel.vals[i] > 0) ntrav++;
@@ -1433,7 +1391,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         SH_TRACE("shard %d: globals done (%d bytes)\n", s, (int)gdecls.n);
-        /* 底层系统交互与数据协议契约 */
         if (ok) {
             /* 合并跨分片引用的外部声明标记集合 */
             int nfd = 0;
@@ -1459,7 +1416,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
         }
 
         SH_TRACE("shard %d: declares done\n", s);
-        /* 核心系统底层抽象与内存语义契约 */
         if (ok) {
             sh_harvest_types(&st, &types, bodies.p ? bodies.p : "");
             sh_harvest_types(&st, &types, gdecls.p ? gdecls.p : "");
@@ -1536,7 +1492,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             snprintf(frag_path, sizeof(frag_path), "%s.shard%d.frag.ll", obj_base, s);
             remove(frag_path);
         }
-        /* 模块核心语义抽象与接口调用契约 */
         for (int i = 0; i < st.link_n; i++)
             LLVMSetLinkage(st.link_recs[i].glob ? st.link_recs[i].glob
                                                : st.link_recs[i].fn,
@@ -1555,7 +1510,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
     {
         bool moved_ok = true;
         int rename_counter = 0;
-        /* 核心系统底层抽象与内存语义契约 */
         sh_move_rec_t *moves = (sh_move_rec_t *)calloc((size_t)nm,
                                                         sizeof(*moves));
         int nmoves = 0;
@@ -1581,7 +1535,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
                                    origtmp, sizeof(origtmp))) {
                 moved_ok = false; break;
             }
-            /* 内部辅助实现 */
             LLVMValueRef decl = LLVMAddFunction(
                 g->mod, decltmp, LLVMGlobalGetValueType(orig));
             LLVMSetFunctionCallConv(decl, LLVMGetFunctionCallConv(orig));
@@ -1616,7 +1569,7 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             /* 回滚：恢复函数使用点、原始符号名称与链接属性并删除声明 */
             for (int i = 0; i < nmoves; i++) {
                 LLVMReplaceAllUsesWith(moves[i].decl, moves[i].orig);
-                LLVMDeleteFunction(moves[i].decl); /* 核心系统底层抽象与内存语义契约 */
+                LLVMDeleteFunction(moves[i].decl);
                 LLVMSetValueName2(moves[i].orig, moves[i].origname,
                                   strlen(moves[i].origname));
                 free(moves[i].origname);
@@ -1635,7 +1588,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
             free(objs);
             goto cleanup_planning;
         }
-        /* 核心系统底层抽象与内存语义契约 */
         for (int k = 0; k < nm; k++) {
             if (mem[k].comp < 0) continue;
             LLVMValueRef orig = mem[k].fn;
@@ -1672,7 +1624,6 @@ int zan_irgen_shard_run(zan_irgen_t *g, const zan_cg_manifest_t *m,
 
         char *vmsg = NULL;
             if (LLVMVerifyModule(g->mod, LLVMReturnStatusAction, &vmsg)) {
-                /* 模块核心语义抽象与接口调用契约 */
                 fprintf(stderr,
                         "error: shard: coordinator verify failed after delete: "
                         "%.160s\n", vmsg ? vmsg : "?");

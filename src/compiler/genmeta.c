@@ -18,19 +18,16 @@
 typedef struct {
     json_value *calls;
     int call_id;
-    char cur_cls[128];   /* 核心系统底层抽象与内存语义契约 */
-    char cur_fn[128];    /* 底层系统交互与数据协议契约 */
-    /* 内部辅助逻辑 */
+    char cur_cls[128];
+    char cur_fn[128];
     zan_ast_node_t **rec_nodes;
     int *rec_ids;
     int rec_count;
     int rec_cap;
-    /* 底层系统交互与数据协议契约 */
     zan_ast_node_t **pend_nodes;
     int *pend_ids;
     int pend_count;
     int pend_cap;
-    /* 底层系统交互与数据协议契约 */
     const char *const *expr_names;
     int expr_count;
     const char *const *table_names;
@@ -57,7 +54,6 @@ static bool gm_istr_is(zan_istr_t s, const char *lit) {
     return s.str && s.len == (uint32_t)n && memcmp(s.str, lit, n) == 0;
 }
 
-/* 内部辅助逻辑 */
 static size_t gm_snpcat(char *out, size_t cap, size_t pos,
                         const char *fmt, ...) {
     if (cap == 0) return 0;
@@ -95,7 +91,6 @@ static void gm_type_str(zan_ast_node_t *t, char *out, size_t outsz) {
     }
     case AST_ARRAY_TYPE:
     case AST_NULLABLE_TYPE:
-        /* 底层系统交互与数据协议契约 */
         out[0] = '\0';
         break;
     case AST_QUALIFIED_NAME: {
@@ -262,7 +257,6 @@ static json_value *gm_expr_tree(zan_ast_node_t *n) {
           json_obj_set(o, "a", args); }
         break;
     case AST_BLOCK:
-        /* 底层系统交互与数据协议契约 */
         json_obj_set(o, "k", json_new_str("block"));
         break;
     case AST_LAMBDA: {
@@ -320,7 +314,6 @@ static void gm_recv_str(zan_ast_node_t *obj, char *out, size_t outsz) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static int gm_recv_reserve(zan_ast_node_t *recv, gm_ctx_t *c) {
     for (int i = 0; i < c->pend_count; i++)
         if (c->pend_nodes[i] == recv) return c->pend_ids[i];
@@ -357,7 +350,6 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         if (callee->ident.name.str) name = callee->ident.name.str;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < c->pend_count; i++) {
         if (c->pend_nodes[i] == call) return true;
     }
@@ -378,7 +370,6 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
         strcmp(robj->ident.name.str, "Json") == 0)
         return true;
 
-    /* 核心系统底层抽象与内存语义契约 */
     static const char *const seeds[] = {
         "Serialize", "Deserialize",
         "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
@@ -390,11 +381,9 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
     if (name && gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
         return true;
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (name && gm_name_in(name, c->expr_names, c->expr_count))
         return true;
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (robj && robj->kind == AST_MEMBER_ACCESS && robj->member.name.str &&
         gm_name_in(robj->member.name.str, c->table_names, c->table_count))
         return true;
@@ -404,7 +393,6 @@ static bool gm_is_candidate_ast_call(zan_ast_node_t *call, gm_ctx_t *c) {
 
 static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     zan_ast_node_t *callee = call->call.callee;
-    /* 内部辅助逻辑 */
     int id = 0;
     for (int i = 0; i < c->pend_count; i++) {
         if (c->pend_nodes[i] == call) {
@@ -417,7 +405,6 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     }
     if (!id) id = ++c->call_id;
 
-    /* 内部辅助逻辑 */
     if (c->rec_count >= c->rec_cap) {
         int ncap = c->rec_cap ? c->rec_cap * 2 : 256;
         zan_ast_node_t **nn =
@@ -435,7 +422,6 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
         c->rec_count++;
     }
 
-    /* 内部辅助逻辑 */
     if (!gm_is_candidate_ast_call(call, c)) {
         return;
     }
@@ -484,7 +470,6 @@ static void gm_record_call(zan_ast_node_t *call, gm_ctx_t *c) {
     json_arr_add(c->calls, o);
 }
 
-/* 内部辅助逻辑 */
 static const char **gm_table_entity_names(json_value *classes, int *out_count) {
     const char **names = NULL;
     int count = 0, cap = 0;
@@ -525,10 +510,8 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
                                int expr_count, const char *const *table_names,
                                int table_count) {
     static const char *const seeds[] = {
-        /* 核心系统底层抽象与内存语义契约 */
         "In", "InText", "InRaw", "InInt", "InLong", "InDouble", "InBool",
         "HasIn", "Need", "NeedText", "NeedInt", "NeedLong", "Param", "Paged",
-        /* 底层系统交互与数据协议契约 */
         "Query", "Select", "Insert", "Update", "Delete", "SyncStructure",
         "SyncStructureAsync", "SyncStructureAll", "SyncStructureAllAsync",
         "Read", "ReadAsync"
@@ -542,7 +525,6 @@ static bool gm_is_codegen_seed(json_value *call, const char *const *expr_names,
     if (gm_name_in(name, seeds, (int)(sizeof(seeds) / sizeof(seeds[0]))))
         return true;
     if (gm_name_in(name, expr_names, expr_count)) return true;
-    /* 底层系统交互与数据协议契约 */
     {
         json_value *recvx = json_obj_get(call, "recvx");
         if (recvx && recvx->type == JSON_OBJ) {
@@ -622,7 +604,6 @@ static void gm_prune_calls(json_value *calls, const char *const *expr_names,
             keep[id] = true;
     }
 
-    /* 内部辅助逻辑 */
     bool changed;
     do {
         changed = false;
@@ -663,7 +644,6 @@ static void gm_walk_expr(zan_ast_node_t *n, gm_ctx_t *c) {
     if (!n) return;
     switch (n->kind) {
     case AST_CALL:
-        /* 内部辅助逻辑 */
         gm_walk_expr(n->call.callee, c);
         for (int i = 0; i < n->call.args.count; i++)
             gm_walk_expr(n->call.args.items[i], c);
@@ -799,7 +779,6 @@ static void gm_walk_stmt(zan_ast_node_t *n, gm_ctx_t *c) {
         break;
     case AST_LABEL_STMT:
     case AST_GOTO_STMT:
-        /* 核心系统底层抽象与内存语义契约 */
         break;
     case AST_QUERY_EXPR:
         gm_walk_expr(n->query.source, c);
@@ -918,10 +897,8 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 gm_attrs_json(zan_ast_attributes(m), ma);
                 json_obj_set(mm, "attrs", ma);
                 json_arr_add(methods, mm);
-                /* 内部辅助逻辑 */
                 if (m->kind == AST_CONSTRUCTOR_DECL) {
                     json_value *co = json_new_obj();
-                    /* 内部辅助逻辑 */
                     json_value *cps = json_new_arr();
                     for (int j = 0; j < m->method_decl.params.count; j++) {
                         zan_ast_node_t *p = m->method_decl.params.items[j];
@@ -980,7 +957,6 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                 }
             } else if ((m->kind == AST_PROPERTY_DECL) &&
                        m->field_decl.initializer) {
-                /* 核心系统底层抽象与内存语义契约 */
                 json_value *p = json_new_obj();
                 json_obj_set(p, "name", json_new_str(
                     m->field_decl.name.str ? (const char *)m->field_decl.name.str
@@ -1027,12 +1003,10 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
     json_arr_add(classes, o);
 }
 
-/* 内部辅助逻辑 */
 typedef struct {
     int want;
     int seen;
     zan_ast_node_t *found;
-    /* 内部辅助逻辑 */
     zan_ast_node_t **nodes;
     int cap;
 } gm_find_ctx_t;
@@ -1225,7 +1199,6 @@ zan_ast_node_t *zan_genmeta_find_call(zan_ast_node_t *unit, int id) {
     return f.found;
 }
 
-/* 内部辅助逻辑 */
 int zan_genmeta_index_calls(zan_ast_node_t *unit, zan_ast_node_t **nodes,
                             int cap) {
     gm_find_ctx_t f;
@@ -1337,7 +1310,6 @@ char *zan_genmeta_export_files(zan_ast_node_t *unit, zan_diag_t *diag) {
     return gm_export(unit, diag);
 }
 
-/* 内部辅助逻辑 */
 
 static zan_token_kind_t gm_token_kind(const char *name) {
     if (!name) return TK_INVALID;
@@ -1516,7 +1488,6 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
         return n;
     }
     if (strcmp(k, "block") == 0) {
-        /* 底层系统交互与数据协议契约 */
         n = zan_ast_new(arena, AST_BLOCK, loc);
         zan_ast_list_init(&n->block.stmts);
         return n;
@@ -1558,5 +1529,5 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
         n->ref_arg.is_out = 0;
         return n;
     }
-    return NULL; /* 底层系统交互与数据协议契约 */
+    return NULL;
 }

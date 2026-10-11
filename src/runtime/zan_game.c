@@ -14,7 +14,6 @@
 #define ZAN_GAME_VERTEX_CAP 65536
 #define ZAN_GAME_GL_ERROR_LIMIT 16
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 typedef struct {
     char key[ZAN_GAME_KEY_CAP];
 } zan_game_sprite;
@@ -60,7 +59,6 @@ ZAN_GAME_API int32_t zan_game_bake_sprite(const char *key, int32_t surface_id,
     char full_key[ZAN_GAME_KEY_CAP];
     size_t len = strlen(key);
     size_t prefix = strncmp(key, "mem:", 4) == 0 ? 0 : 4;
-    /* 底层系统交互与数据协议契约 */
     if (len >= sizeof(full_key) - prefix) return 0;
     if (prefix) memcpy(full_key, "mem:", prefix);
     memcpy(full_key + prefix, key, len + 1);
@@ -81,7 +79,6 @@ ZAN_GAME_API int32_t zan_game_bake_sprite(const char *key, int32_t surface_id,
 
     const uint32_t *slice = source->pixels + (size_t)by *
         (size_t)source->stride + (size_t)bx;
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (zan_image_register_argb(full_key, slice, (int)bw, (int)bh,
                                source->stride) <= 0) return 0;
     return zan_game_store_sprite(full_key);
@@ -118,11 +115,9 @@ static zgl_uint g_game_program;
 static zgl_int g_game_u_mvp = -1, g_game_u_tex = -1, g_game_u_color = -1;
 static zgl_int g_game_a_pos = -1, g_game_a_normal = -1, g_game_a_uv = -1;
 static int g_game_cleanup_registered;
-/* 编译器代码生成与运行时系统底层调用契约 */
 static uint32_t g_game_next_mesh_id = 1;
 
 static const uint32_t g_game_white_pixel = UINT32_C(0xFFFFFFFF);
-/* 编译器代码生成与运行时系统底层调用契约 */
 static const zan_bitmap g_game_white = {
     &g_game_white_pixel, 1, 1, 1, UINT64_C(1)
 };
@@ -140,7 +135,6 @@ static const char *const ZAN_GAME_3D_VS =
 "    v_uv = a_uv;\n"
 "    v_normal = a_normal;\n"
 "    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
-/* 编译器代码生成与运行时系统底层调用契约 */
 "    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
 "}\n";
 
@@ -152,7 +146,6 @@ static const char *const ZAN_GAME_3D_FS =
 "in vec3 v_normal;\n"
 "out vec4 frag;\n"
 "void main() {\n"
-/* 编译器代码生成与运行时系统底层调用契约 */
 "    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
 "    float shade = 0.55 + 0.45 * lam;\n"
 "    vec4 tex = texture(uTex, v_uv);\n"
@@ -183,7 +176,6 @@ static void zan_game_forget_gpu(void) {
 }
 
 static void zan_game_gpu_cleanup(int32_t surface_id) {
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (surface_id >= 0) {
         if (surface_id < ZAN_GAME_SURFACE_CAP && g_game_gl)
             zan_game_drop_depth(&g_game_depth[surface_id]);
@@ -204,7 +196,6 @@ static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
     if (!frame->api || !frame->framebuffer || frame->width <= 0 ||
         frame->height <= 0) return 0;
     if (g_game_gl && g_game_epoch != frame->epoch) {
-        /* 编译器代码生成与运行时系统底层调用契约 */
         zan_game_forget_gpu();
     }
     g_game_gl = frame->api;
@@ -213,7 +204,6 @@ static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
         if (!zan_gui_gpu_register_cleanup(zan_game_gpu_cleanup)) return 0;
         g_game_cleanup_registered = 1;
     }
-    /* 编译器代码生成与运行时系统底层调用契约 */
     for (int i = 0; i < ZAN_GAME_GL_ERROR_LIMIT; ++i)
         if (g_game_gl->GetError() == ZGL_NO_ERROR) return 1;
     return 0;
@@ -322,7 +312,6 @@ static int zan_game_depth_ready(int32_t surface_id, const zan_gpu_frame *frame) 
         depth->width = frame->width;
         depth->height = frame->height;
     }
-    /* 编译器代码生成与运行时系统底层调用契约 */
     gl->FramebufferRenderbuffer(ZGL_FRAMEBUFFER, ZGL_DEPTH_ATTACHMENT,
                                ZGL_RENDERBUFFER, depth->renderbuffer);
     if (gl->CheckFramebufferStatus(ZGL_FRAMEBUFFER) != ZGL_FRAMEBUFFER_COMPLETE ||
@@ -377,7 +366,6 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
     gl->Viewport(0, 0, frame.width, frame.height);
     gl->Enable(ZGL_SCISSOR_TEST);
     gl->Scissor(clip_x, clip_y, clip_w, clip_h);
-    /* 底层系统交互与数据协议契约 */
     gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl->Clear(ZGL_DEPTH_BUFFER_BIT);
     gl->Enable(ZGL_DEPTH_TEST);
@@ -397,7 +385,6 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
-    /* 编译器代码生成与运行时系统底层调用契约 */
     gl->Finish();
     result = gl->GetError() == ZGL_NO_ERROR;
 

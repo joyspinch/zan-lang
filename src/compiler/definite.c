@@ -16,11 +16,10 @@ typedef struct {
 
 struct da_var {
     zan_istr_t name;
-    unsigned char is_out;   /* 底层系统交互与数据协议契约 */
-    unsigned char reported; /* 核心系统底层抽象与内存语义契约 */
+    unsigned char is_out;
+    unsigned char reported;
 };
 
-/* 模块核心语义抽象与接口调用契约 */
 struct da_exit {
     struct da_exit *outer;
     unsigned char seen;
@@ -33,8 +32,8 @@ struct da_ctx {
     da_state_t assigned;
     int count;
     bool reachable;
-    bool bail;      /* 模块核心语义抽象与接口调用契约 */
-    bool emit;      /* 核心系统底层抽象与内存语义契约 */
+    bool bail;
+    bool emit;
     struct da_exit *exits;
 };
 
@@ -78,7 +77,6 @@ static void da_restore(struct da_ctx *c, const da_state_t *buf) {
     c->assigned = *buf;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void da_merge(struct da_ctx *c, const da_state_t *buf) {
     for (int i = 0; i < DA_WORDS; i++) {
         c->assigned.words[i] &= buf->words[i];
@@ -150,7 +148,6 @@ static void da_call_args(struct da_ctx *c, zan_ast_list_t *args) {
         zan_ast_node_t *a = args->items[i];
         if (!a) continue;
         if (a->kind == AST_REF_ARG) {
-            /* 模块核心语义抽象与接口调用契约 */
             if (a->ref_arg.is_out) {
                 if (a->ref_arg.decl_type && a->ref_arg.expr &&
                     a->ref_arg.expr->kind == AST_IDENTIFIER) {
@@ -288,7 +285,6 @@ static void da_expr(struct da_ctx *c, zan_ast_node_t *n) {
     case AST_IS_EXPR:
     case AST_AS_EXPR:
         da_expr(c, n->type_test.expr);
-        /* 模块核心语义抽象与接口调用契约 */
         if (n->type_test.var_name.str && n->type_test.var_name.len) {
             da_declare(c, n->type_test.var_name, true, false);
         }
@@ -482,7 +478,6 @@ static void da_switch(struct da_ctx *c, zan_ast_node_t *n) {
         da_expr(c, sc->switch_case.when_cond);
         da_stmt(c, sc->switch_case.body);
         c->count = mark;
-        /* 模块核心语义抽象与接口调用契约 */
         if (c->reachable) da_record_exit(c);
     }
 
@@ -557,7 +552,6 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
         return;
 
     case AST_DO_WHILE_STMT: {
-        /* 模块核心语义抽象与接口调用契约 */
         struct da_exit exit;
         exit.outer = c->exits;
         exit.seen = 0;
@@ -616,12 +610,10 @@ static void da_stmt(struct da_ctx *c, zan_ast_node_t *n) {
 
     case AST_GOTO_STMT:
     case AST_LABEL_STMT:
-        /* 模块核心语义抽象与接口调用契约 */
         c->bail = true;
         return;
 
     default:
-        /* 底层系统交互与数据协议契约 */
         da_expr(c, n);
         return;
     }
@@ -656,7 +648,6 @@ void zan_definite_check(zan_diag_t *diag, zan_ast_node_t *method) {
     static struct da_ctx ctx;
     ctx.diag = diag;
 
-    /* 模块核心语义抽象与接口调用契约 */
     da_run(&ctx, method, false);
     if (ctx.bail) return;
     da_run(&ctx, method, true);

@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +13,7 @@
 #undef RT_GROUP_ICON
 #endif
 
-#define RES_LANG 1033           /* 核心系统底层抽象与内存语义契约 */
+#define RES_LANG 1033
 #define RT_ICON 3
 #define RT_GROUP_ICON 14
 
@@ -87,7 +86,6 @@ static unsigned char *read_file(const char *path, size_t *out_len) {
     return p;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int dir_header(buf_t *b, unsigned short count) {
     return put32(b, 0) && put32(b, 0) && put16(b, 0) && put16(b, 0) &&
            put16(b, 0) && put16(b, count);
@@ -115,7 +113,6 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
         }
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     buf_t grp = {0};
     if (!(put16(&grp, 0) && put16(&grp, 1) && put16(&grp, (unsigned short)n))) {
         free(ents); return 3;
@@ -134,15 +131,14 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
         }
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
-    int leaves = n + 1;                        /* 核心系统底层抽象与内存语义契约 */
+    int leaves = n + 1;
     unsigned int off_root = 0;
     unsigned int sz_root = 16 + 2 * 8;
     unsigned int off_ticon = off_root + sz_root;
     unsigned int sz_ticon = 16 + (unsigned int)n * 8;
     unsigned int off_tgrp = off_ticon + sz_ticon;
     unsigned int sz_tgrp = 16 + 8;
-    unsigned int off_names = off_tgrp + sz_tgrp;    /* 核心系统底层抽象与内存语义契约 */
+    unsigned int off_names = off_tgrp + sz_tgrp;
     unsigned int sz_name = 16 + 8;
     unsigned int off_data_entries = off_names + (unsigned int)leaves * sz_name;
     unsigned int off_data = off_data_entries + (unsigned int)leaves * 16;
@@ -152,25 +148,21 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
     if (!dir_header(&sec, 2)) goto oom;
     if (!put32(&sec, RT_ICON) || !put32(&sec, off_ticon | 0x80000000u)) goto oom;
     if (!put32(&sec, RT_GROUP_ICON) || !put32(&sec, off_tgrp | 0x80000000u)) goto oom;
-    /* 底层系统交互与数据协议契约 */
     if (!dir_header(&sec, (unsigned short)n)) goto oom;
     for (int i = 0; i < n; i++) {
         unsigned int nd = off_names + (unsigned int)i * sz_name;
         if (!put32(&sec, (unsigned int)(i + 1)) || !put32(&sec, nd | 0x80000000u)) goto oom;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (!dir_header(&sec, 1)) goto oom;
     {
         unsigned int nd = off_names + (unsigned int)n * sz_name;
         if (!put32(&sec, 1) || !put32(&sec, nd | 0x80000000u)) goto oom;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < leaves; i++) {
         if (!dir_header(&sec, 1)) goto oom;
         if (!put32(&sec, RES_LANG) ||
             !put32(&sec, off_data_entries + (unsigned int)i * 16)) goto oom;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     unsigned int cursor = off_data;
     unsigned int *data_off = (unsigned int *)calloc((size_t)leaves, sizeof(unsigned int));
     unsigned int *reloc_at = (unsigned int *)calloc((size_t)leaves, sizeof(unsigned int));
@@ -185,7 +177,6 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
         }
         cursor += (size + 7u) & ~7u;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < leaves; i++) {
         const unsigned char *src = (i < n) ? ico + ents[i].offset : grp.buf;
         unsigned int size = (i < n) ? ents[i].bytes : (unsigned int)grp.len;
@@ -206,12 +197,11 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
     unsigned int ptr_syms = ptr_reloc + nreloc * 10;
 
     buf_t o = {0};
-    /* 模块核心语义抽象与接口调用契约 */
     put16(&o, arm64 ? 0xAA64 : 0x8664);
-    put16(&o, 1);                      /* 核心系统底层抽象与内存语义契约 */
-    put32(&o, 0);                      /* 核心系统底层抽象与内存语义契约 */
+    put16(&o, 1);
+    put32(&o, 0);
     put32(&o, ptr_syms);
-    put32(&o, 2);                      /* 核心系统底层抽象与内存语义契约 */
+    put32(&o, 2);
     put16(&o, 0);
     put16(&o, 0);
     put(&o, ".rsrc\0\0\0", 8);
@@ -223,28 +213,27 @@ static int icon_object(const unsigned char *ico, size_t ico_len,
     put32(&o, 0);
     put16(&o, (unsigned short)nreloc);
     put16(&o, 0);
-    put32(&o, 0x40300040u);            /* 核心系统底层抽象与内存语义契约 */
+    put32(&o, 0x40300040u);
     put(&o, sec.buf, sec.len);
     for (unsigned int i = 0; i < nreloc; i++) {
         put32(&o, reloc_at[i]);
-        put32(&o, 0);                  /* 核心系统底层抽象与内存语义契约 */
+        put32(&o, 0);
         /* ADDR32NB: 0x0003 on AMD64, 0x0002 on ARM64 */
         put16(&o, arm64 ? 0x0002 : 0x0003);
     }
-    put(&o, ".rsrc\0\0\0", 8);         /* 核心系统底层抽象与内存语义契约 */
+    put(&o, ".rsrc\0\0\0", 8);
     put32(&o, 0);
-    put16(&o, 1);                      /* 核心系统底层抽象与内存语义契约 */
+    put16(&o, 1);
     put16(&o, 0);
-    { unsigned char t[2] = { 3 /* IMAGE_SYM_CLASS_STATIC */, 1 /* 核心系统底层抽象与内存语义契约 */ };
+    { unsigned char t[2] = { 3 /* IMAGE_SYM_CLASS_STATIC */, 1  };
       put(&o, t, 2); }
-    /* 模块核心语义抽象与接口调用契约 */
-    put32(&o, sec_size);               /* 核心系统底层抽象与内存语义契约 */
+    put32(&o, sec_size);
     put16(&o, (unsigned short)nreloc);
-    put16(&o, 0);                      /* 核心系统底层抽象与内存语义契约 */
+    put16(&o, 0);
     put32(&o, 0);                      /* checksum */
-    put16(&o, 0);                      /* 核心系统底层抽象与内存语义契约 */
+    put16(&o, 0);
     { unsigned char t[4] = {0, 0, 0, 0}; put(&o, t, 4); }
-    put32(&o, 4);                      /* 核心系统底层抽象与内存语义契约 */
+    put32(&o, 4);
 
     size_t wrote = fwrite(o.buf, 1, o.len, out);
     fclose(out);

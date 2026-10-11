@@ -1,24 +1,21 @@
 /* gui_runtime_glyph */
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_TILE_RUN   0
 #define ZAN_TILE_GLYPH 1
 
 typedef struct {
-    char    *key;      /* 核心系统底层抽象与内存语义契约 */
+    char    *key;
     int      key_len;
     int      kind;
     int      size;
-    uint64_t used;     /* 核心系统底层抽象与内存语义契约 */
-    uint64_t stamped;  /* 底层系统交互与数据协议契约 */
-    size_t   bytes;    /* 核心系统底层抽象与内存语义契约 */
+    uint64_t used;
+    uint64_t stamped;
+    size_t   bytes;
     zan_glyph_tile tile;
 } zan_atlas_slot;
 
-/* 内部辅助逻辑 */
 #define ZAN_ATLAS_CAP   4096
 #define ZAN_ATLAS_PROBE 8
-/* 底层系统交互与数据协议契约 */
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_BYTES (4u * 1024u * 1024u)
 #else
@@ -34,7 +31,6 @@ static uint64_t g_atlas_hits = 0;
 static uint64_t g_atlas_misses = 0;
 static uint64_t g_atlas_swept = 0;
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_ATLAS_POOL_CAP 256
 #if defined(__ANDROID__)
 #define ZAN_ATLAS_POOL_BYTES (1u * 1024u * 1024u)
@@ -110,12 +106,9 @@ static void zan_atlas_trim(void) {
     }
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_ATLAS_COLD_STORES 64
-/* 底层系统交互与数据协议契约 */
 #define ZAN_ATLAS_SWEEP 64
 
-/* 核心系统底层抽象与内存语义契约 */
 static void zan_atlas_sweep(void) {
     for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
         zan_atlas_slot *e = &g_atlas[i];
@@ -127,7 +120,6 @@ static void zan_atlas_sweep(void) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
     uint64_t h = zan_atlas_hash(kind, size, key, key_len);
@@ -147,7 +139,6 @@ static const zan_glyph_tile *zan_atlas_find(int kind, int size,
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static const zan_glyph_tile *zan_atlas_store(
     int kind, int size, const char *key, int key_len,
     int w, int h, int left, int top, int advance,
@@ -199,7 +190,6 @@ static const zan_glyph_tile *zan_atlas_store(
     return &victim->tile;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_GLYPH_BATCH 128
 
 typedef struct {

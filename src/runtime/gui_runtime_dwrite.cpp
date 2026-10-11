@@ -317,14 +317,3 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
     *out_advance = (int)(tm.widthIncludingTrailingWhitespace + 0.5f);
     return 1;
 }
-
-/* 临时诊断：win_run_tile 的路由判定落文件，定位后删除。 */
-extern "C" int zan_dw_probe_log(int len, int emoji, int missing) {
-    FILE *f = fopen("emo_dw.log", "a");
-    if (f) {
-        fprintf(f, "run_tile len=%d emoji=%d missing=%d\n", len, emoji,
-            missing);
-        fclose(f);
-    }
-    return 0;
-}

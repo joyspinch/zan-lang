@@ -18,7 +18,6 @@
 #endif
 #endif
 
-/* 内部辅助逻辑 */
 
 static bool mi_active(debugger_t *dbg) {
 #ifdef _WIN32
@@ -28,7 +27,6 @@ static bool mi_active(debugger_t *dbg) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 static const char *mi_basename(const char *path) {
     const char *b = path;
     for (const char *p = path; *p; p++)
@@ -36,7 +34,6 @@ static const char *mi_basename(const char *path) {
     return b;
 }
 
-/* 内部辅助逻辑 */
 static bool mi_field(const char *rec, const char *key, char *out, int size) {
     char pat[80];
     snprintf(pat, sizeof(pat), "%s=\"", key);
@@ -64,10 +61,8 @@ static void mi_raw_write(debugger_t *dbg, const char *s) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) {
     for (;;) {
-        /* 核心系统底层抽象与内存语义契约 */
         for (int i = 0; i < dbg->mi_buf_len; i++) {
             if (dbg->mi_buf[i] != '\n') continue;
             int len = i;
@@ -81,7 +76,6 @@ static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) 
             return 1;
         }
         if (dbg->mi_buf_len >= (int)sizeof(dbg->mi_buf)) {
-            /* 内部辅助逻辑 */
             dbg->mi_buf_len = 0;
         }
         char chunk[4096];
@@ -90,7 +84,7 @@ static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) 
         if (poll) {
             DWORD avail = 0;
             if (!PeekNamedPipe((HANDLE)dbg->gdb_out_r, NULL, 0, NULL, &avail, NULL))
-                got = -1;                  /* 核心系统底层抽象与内存语义契约 */
+                got = -1;
             else if (avail == 0) {
                 if (dbg->wait_hook) dbg->wait_hook(dbg->wait_hook_user);
                 Sleep(10);
@@ -119,7 +113,6 @@ static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) 
         got = r > 0 ? (int)r : -1;
 #endif
         if (got <= 0) {
-            /* 模块核心语义抽象与接口调用契约 */
             if (dbg->mi_buf_len > 0) {
                 int len = dbg->mi_buf_len;
                 if (len > out_size - 1) len = out_size - 1;
@@ -139,12 +132,10 @@ static int mi_read_line_ex(debugger_t *dbg, char *out, int out_size, bool poll) 
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool mi_read_line(debugger_t *dbg, char *out, int out_size) {
     return mi_read_line_ex(dbg, out, out_size, false) == 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void mi_forward_stream(debugger_t *dbg, const char *body) {
     char buf[2048];
     int n = 0;
@@ -180,10 +171,8 @@ static void mi_handle_stopped(debugger_t *dbg, const char *rec) {
     if (reason[0])
         snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "%s", reason);
     else
-        /* 底层系统交互与数据协议契约 */
         snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "signal-received");
     if (dbg->interrupt_requested) {
-        /* 模块核心语义抽象与接口调用契约 */
         snprintf(dbg->stop_reason, sizeof(dbg->stop_reason), "pause");
         dbg->interrupt_requested = false;
     }
@@ -201,17 +190,14 @@ static void mi_dispatch_line(debugger_t *dbg, const char *line) {
     } else if (line[0] == '@') {
         mi_forward_stream(dbg, line + 1);
     } else if (line[0] == '=') {
-        /* 内部辅助逻辑 */
         if (strncmp(line + 1, "thread-group-started", 20) == 0) {
             char pid[32] = "";
             if (mi_field(line, "pid", pid, sizeof(pid)))
                 dbg->inferior_pid = atoi(pid);
         }
     }
-    /* 底层系统交互与数据协议契约 */
 }
 
-/* 内部辅助逻辑 */
 static bool mi_pump(debugger_t *dbg, int token, char *result, int result_size) {
     char line[8192];
     while (mi_read_line(dbg, line, sizeof(line))) {
@@ -230,13 +216,11 @@ static bool mi_pump(debugger_t *dbg, int token, char *result, int result_size) {
         }
         if (line[0] == '~' || line[0] == '&' || line[0] == '+' || line[0] == '^') continue;
         if (strncmp(line, "(gdb)", 5) == 0) continue;
-        /* 模块核心语义抽象与接口调用契约 */
         { char buf[8200]; snprintf(buf, sizeof(buf), "%s\n", line); dbg_append_output(dbg, buf); }
     }
     return false;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool mi_command(debugger_t *dbg, const char *cmd, char *result, int result_size) {
     if (!mi_active(dbg)) return false;
     int tok = ++dbg->mi_token;
@@ -246,7 +230,6 @@ static bool mi_command(debugger_t *dbg, const char *cmd, char *result, int resul
     return mi_pump(dbg, tok, result, result_size);
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool mi_wait_stopped(debugger_t *dbg) {
     char line[8192];
     for (;;) {
@@ -255,13 +238,12 @@ static bool mi_wait_stopped(debugger_t *dbg) {
             dbg->state = DBG_TERMINATED;
             return false;
         }
-        if (r == 0) continue;   /* 核心系统底层抽象与内存语义契约 */
+        if (r == 0) continue;
         if (line[0] == '*' || line[0] == '@') {
             mi_dispatch_line(dbg, line);
             if (line[0] == '*' && strncmp(line + 1, "stopped", 7) == 0) return true;
         } else if (line[0] == '~' || line[0] == '&' || line[0] == '=' ||
                    line[0] == '+' || line[0] == '^' || strncmp(line, "(gdb)", 5) == 0) {
-            /* 核心系统底层抽象与内存语义契约 */
         } else {
             char buf[8200]; snprintf(buf, sizeof(buf), "%s\n", line);
             dbg_append_output(dbg, buf);
@@ -270,7 +252,6 @@ static bool mi_wait_stopped(debugger_t *dbg) {
     }
 }
 
-/* 内部辅助逻辑 */
 static bool mi_zan_frame(debugger_t *dbg) {
     for (int i = 0; i < dbg->callstack_depth; i++) {
         const char *f = dbg->callstack[i].file;
@@ -284,9 +265,8 @@ static bool mi_zan_frame(debugger_t *dbg) {
     return false;
 }
 
-/* 内部辅助逻辑 */
 static void mi_pick_zan_thread(debugger_t *dbg) {
-    if (mi_zan_frame(dbg)) return; /* 核心系统底层抽象与内存语义契约 */
+    if (mi_zan_frame(dbg)) return;
     int saved = dbg->current_thread;
     for (int i = 0; i < dbg->thread_count; i++) {
         int tid = dbg->threads[i].id;
@@ -302,7 +282,6 @@ static void mi_pick_zan_thread(debugger_t *dbg) {
     dbg->current_thread = saved;
 }
 
-/* 内部辅助逻辑 */
 static void mi_after_stop(debugger_t *dbg) {
     dbg_refresh_threads(dbg);
     dbg_refresh_callstack(dbg);
@@ -330,7 +309,6 @@ static void mi_after_stop(debugger_t *dbg) {
     dbg_evaluate_watches(dbg);
 }
 
-/* 内部辅助逻辑 */
 static void mi_exec(debugger_t *dbg, const char *cmd) {
     if (!mi_active(dbg) || dbg->state == DBG_TERMINATED) return;
     char res[512] = "";
@@ -350,7 +328,6 @@ static void mi_exec(debugger_t *dbg, const char *cmd) {
         mi_after_stop(dbg);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void mi_exe_dir(char *out, size_t outsz) {
     out[0] = '\0';
 #ifdef _WIN32
@@ -372,7 +349,6 @@ static bool mi_file_exists(const char *path) {
     return false;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void mi_resolve_gdb(debugger_t *dbg, char *out, int size) {
     if (dbg->gdb_path[0]) { snprintf(out, (size_t)size, "%s", dbg->gdb_path); return; }
     const char *env = getenv("ZAN_GDB");
@@ -401,7 +377,6 @@ static void mi_resolve_gdb(debugger_t *dbg, char *out, int size) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool mi_spawn(debugger_t *dbg, const char *program) {
     char gdb[512];
     mi_resolve_gdb(dbg, gdb, sizeof(gdb));
@@ -503,16 +478,14 @@ void dbg_init(debugger_t *dbg) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 int dbg_add_breakpoint(debugger_t *dbg, const char *file, int line) {
     if (dbg->bp_count >= DBG_MAX_BREAKPOINTS) return -1;
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < dbg->bp_count; i++) {
         if (dbg->breakpoints[i].line == line &&
             strcmp(dbg->breakpoints[i].file, file) == 0) {
-            return dbg->breakpoints[i].id; /* 核心系统底层抽象与内存语义契约 */
+            return dbg->breakpoints[i].id;
         }
     }
 
@@ -538,7 +511,6 @@ int dbg_add_conditional_bp(debugger_t *dbg, const char *file, int line,
     int id = dbg_add_breakpoint(dbg, file, line);
     if (id < 0) return -1;
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < dbg->bp_count; i++) {
         if (dbg->breakpoints[i].id == id) {
             dbg->breakpoints[i].type = BP_CONDITIONAL;
@@ -601,7 +573,6 @@ bool dbg_remove_breakpoint(debugger_t *dbg, int bp_id) {
                     bp_id, dbg->breakpoints[i].line + 1);
             dbg_append_output(dbg, msg);
 
-            /* 核心系统底层抽象与内存语义契约 */
             for (int j = i; j < dbg->bp_count - 1; j++)
                 dbg->breakpoints[j] = dbg->breakpoints[j + 1];
             dbg->bp_count--;
@@ -674,7 +645,6 @@ dbg_breakpoint_t *dbg_get_breakpoint_at(debugger_t *dbg, const char *file, int l
     return NULL;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 int dbg_add_watch(debugger_t *dbg, const char *expression) {
     if (dbg->watch_count >= DBG_MAX_WATCHES) return -1;
@@ -709,7 +679,6 @@ void dbg_edit_watch(debugger_t *dbg, int index, const char *new_expression) {
              "<not evaluated>");
 }
 
-/* 底层系统交互与数据协议契约 */
 bool dbg_evaluate(debugger_t *dbg, const char *expression, char *result, int result_size) {
     if (dbg->state != DBG_PAUSED) {
         snprintf(result, (size_t)result_size, "<not paused>");
@@ -734,7 +703,6 @@ bool dbg_evaluate(debugger_t *dbg, const char *expression, char *result, int res
         return false;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < dbg->local_count; i++) {
         if (strcmp(dbg->locals[i].name, expression) == 0) {
             snprintf(result, (size_t)result_size, "%s", dbg->locals[i].value);
@@ -753,7 +721,6 @@ void dbg_evaluate_watches(debugger_t *dbg) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     if (mi_active(dbg)) dbg_stop(dbg);
@@ -771,11 +738,9 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     dbg->interrupt_requested = false;
 
     char res[1024];
-    /* 底层系统交互与数据协议契约 */
     mi_command(dbg, "-gdb-set mi-async off", res, sizeof(res));
     mi_command(dbg, "-gdb-set confirm off", res, sizeof(res));
     mi_command(dbg, "-gdb-set print pretty off", res, sizeof(res));
-    /* 内部辅助逻辑 */
     mi_command(dbg, "-gdb-set startup-with-shell off", res, sizeof(res));
 
     if (args && args[0]) {
@@ -784,7 +749,6 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
         mi_command(dbg, cmd, res, sizeof(res));
     }
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < dbg->bp_count; i++) {
         dbg_breakpoint_t *bp = &dbg->breakpoints[i];
         if (!bp->enabled) continue;
@@ -796,7 +760,6 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
         else
             snprintf(cmd, sizeof(cmd), "-break-insert \"%s:%d\"", base, bp->line);
         bp->verified = mi_command(dbg, cmd, r, sizeof(r)) && strstr(r, "^done") != NULL;
-        /* 内部辅助逻辑 */
         if (bp->verified && bp->type == BP_HITCOUNT && bp->hit_count_target > 1) {
             char num[16] = "";
             if (mi_field(r, "number", num, sizeof(num))) {
@@ -814,14 +777,12 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
     snprintf(msg, sizeof(msg), "[DBG] Launched under gdb: %s\n", program);
     dbg_append_output(dbg, msg);
 
-    /* 底层系统交互与数据协议契约 */
     dbg->exc_bp_throw = -1;
     dbg->exc_bp_unhandled = -1;
     if (dbg->break_on_throw || dbg->break_on_exception)
         dbg_set_exception_breakpoints(dbg, dbg->break_on_throw,
                                       dbg->break_on_exception);
 
-    /* 模块核心语义抽象与接口调用契约 */
     mi_exec(dbg, dbg->break_on_entry ? "-exec-run --start" : "-exec-run");
     return true;
 }
@@ -829,7 +790,6 @@ bool dbg_start(debugger_t *dbg, const char *program, const char *args) {
 bool dbg_attach(debugger_t *dbg, const char *program, int pid) {
     if (pid <= 0) return false;
     if (mi_active(dbg)) dbg_stop(dbg);
-    /* 内部辅助逻辑 */
     if (program && program[0])
         snprintf(dbg->program_path, sizeof(dbg->program_path), "%s", program);
     else
@@ -860,10 +820,9 @@ bool dbg_attach(debugger_t *dbg, const char *program, int pid) {
         return false;
     }
     dbg->attached = true;
-    dbg->state = DBG_PAUSED;   /* 核心系统底层抽象与内存语义契约 */
+    dbg->state = DBG_PAUSED;
     dbg->last_exit_code = 0;
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < dbg->bp_count; i++) {
         dbg_breakpoint_t *bp = &dbg->breakpoints[i];
         if (!bp->enabled) continue;
@@ -917,7 +876,6 @@ void dbg_continue(debugger_t *dbg) {
     mi_exec(dbg, "-exec-continue");
 }
 
-/* 底层系统交互与数据协议契约 */
 
 void dbg_set_wait_hook(debugger_t *dbg, void (*fn)(void *user), void *user) {
     dbg->wait_hook = fn;
@@ -986,7 +944,6 @@ void dbg_run_to_cursor(debugger_t *dbg, const char *file, int line) {
     mi_exec(dbg, "-exec-continue");
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 /* --- Threads (gdb/MI) --- */
 
@@ -1041,9 +998,7 @@ bool dbg_select_thread(debugger_t *dbg, int thread_id) {
     return true;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static int mi_break_function(debugger_t *dbg, const char *func) {
     char cmd[256], res[2048] = "";
     snprintf(cmd, sizeof(cmd), "-break-insert -f %s", func);
@@ -1065,7 +1020,7 @@ static void mi_delete_bp(debugger_t *dbg, int *num) {
 int dbg_set_exception_breakpoints(debugger_t *dbg, bool on_throw, bool on_unhandled) {
     dbg->break_on_throw = on_throw;
     dbg->break_on_exception = on_unhandled;
-    if (!mi_active(dbg)) return 0;   /* 核心系统底层抽象与内存语义契约 */
+    if (!mi_active(dbg)) return 0;
     int placed = 0;
     if (on_throw) {
         if (dbg->exc_bp_throw < 0)
@@ -1122,7 +1077,6 @@ void dbg_refresh_callstack(debugger_t *dbg) {
 
 void dbg_refresh_locals(debugger_t *dbg) {
     dbg->local_count = 0;
-    /* 模块核心语义抽象与接口调用契约 */
     dbg->var_gen++;
     memset(dbg->var_created, 0, sizeof(dbg->var_created));
     dbg->var_ref_count = 0;
@@ -1138,7 +1092,6 @@ void dbg_refresh_locals(debugger_t *dbg) {
     const char *p = strstr(res, "variables=[");
     if (!p) return;
     p += 11;
-    /* 内部辅助逻辑 */
     while ((p = strchr(p, '{')) != NULL) {
         const char *end = strchr(p, '}');
         if (!end) break;
@@ -1166,9 +1119,7 @@ void dbg_refresh_locals(debugger_t *dbg) {
     }
 }
 
-/* 内部辅助逻辑 */
 
-/* 内部辅助逻辑 */
 bool dbg_type_expandable(const char *ty) {
     if (!ty || !ty[0]) return false;
     bool strct = strncmp(ty, "struct ", 7) == 0;
@@ -1182,7 +1133,6 @@ bool dbg_type_expandable(const char *ty) {
     return true;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static const char *mi_next_child(const char *p, char *out, int cap) {
     const char *c = p;
     while ((c = strstr(c, "child={")) != NULL) {
@@ -1204,7 +1154,7 @@ static const char *mi_next_child(const char *p, char *out, int cap) {
             }
             q++;
         }
-        if (depth != 0) return NULL; /* 核心系统底层抽象与内存语义契约 */
+        if (depth != 0) return NULL;
         int bl = (int)(q - body - 1);
         if (bl > cap - 1) bl = cap - 1;
         memcpy(out, body + 1, (size_t)bl);
@@ -1234,7 +1184,6 @@ static int dbg_fill_children(char *res, dbg_var_t *out, int cap) {
     return count;
 }
 
-/* 内部辅助逻辑 */
 static int dbg_var_list_children(debugger_t *dbg, const char *varobj_name,
                                  dbg_var_t *out, int cap, int depth,
                                  char *first_name_out, int name_cap);
@@ -1245,7 +1194,6 @@ static int dbg_var_list_children(debugger_t *dbg, const char *varobj_name,
     if (depth > 3 || !varobj_name[0]) return 0;
     char cmd[256];
     static char res[262144];
-    /* 底层系统交互与数据协议契约 */
     snprintf(cmd, sizeof(cmd), "-var-list-children --all-values \"%s\"",
              varobj_name);
     if (!mi_command(dbg, cmd, res, (int)sizeof(res))) return 0;
@@ -1256,7 +1204,6 @@ static int dbg_var_list_children(debugger_t *dbg, const char *varobj_name,
         mi_field(block, "name", cni, sizeof(cni));
     int n = dbg_fill_children(res, out, cap);
 
-    /* 内部辅助逻辑 */
     if (n == 1 && out[0].name[0] == '*' && cni[0] && depth < 3) {
         dbg_var_t inner[64];
         int inner_n = dbg_var_list_children(dbg, cni, inner, 64, depth + 1,
@@ -1314,7 +1261,6 @@ int dbg_expand_variables(debugger_t *dbg, int ref, dbg_var_t *out, int cap) {
     int n = dbg_var_list_children(dbg, node, out, cap, 0,
                                   first_name, (int)sizeof(first_name));
 
-    /* 内部辅助逻辑 */
     for (int i = 0; i < n; i++) {
         out[i].expand_ref = 0;
         if (!dbg_type_expandable(out[i].type)) continue;
@@ -1333,13 +1279,11 @@ void dbg_select_frame(debugger_t *dbg, int frame_index) {
     if (frame_index < 0 || frame_index >= dbg->callstack_depth) return;
     dbg->active_frame = frame_index;
 
-    /* 底层系统交互与数据协议契约 */
     strncpy(dbg->current_file, dbg->callstack[frame_index].file,
             sizeof(dbg->current_file) - 1);
     dbg->current_line = dbg->callstack[frame_index].line;
     dbg->current_col = dbg->callstack[frame_index].col;
 
-    /* 底层系统交互与数据协议契约 */
     dbg_refresh_locals(dbg);
     dbg_evaluate_watches(dbg);
 }
@@ -1350,7 +1294,6 @@ void dbg_append_output(debugger_t *dbg, const char *text) {
     int tlen = (int)strlen(text);
     int space = DBG_MAX_OUTPUT - dbg->output_len - 1;
     if (tlen > space) {
-        /* 核心系统底层抽象与内存语义契约 */
         int keep = dbg->output_len / 2;
         memmove(dbg->output, dbg->output + (dbg->output_len - keep), (size_t)keep);
         dbg->output_len = keep;
@@ -1367,7 +1310,6 @@ void dbg_clear_output(debugger_t *dbg) {
     dbg->output_len = 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 bool dbg_set_variable(debugger_t *dbg, const char *name, const char *value) {
     if (dbg->state != DBG_PAUSED) return false;
@@ -1404,7 +1346,6 @@ bool dbg_is_current_line(debugger_t *dbg, const char *file, int line) {
     if (dbg->state != DBG_PAUSED) return false;
     if (dbg->current_line != line) return false;
     if (!file || !dbg->current_file[0]) return false;
-    /* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
     return _stricmp(dbg->current_file, file) == 0;
 #else

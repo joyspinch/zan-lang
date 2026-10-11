@@ -1,7 +1,6 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* 底层系统交互与数据协议契约 */
 typedef void *id_t;
 typedef void *sel_t;
 typedef void *class_t;
@@ -43,7 +42,6 @@ static void ensure_app_delegate(id_t win_delegate) {
 
 static intptr_t hook_applicationShouldTerminate(id_t self, sel_t _cmd, id_t sender) {
     (void)self; (void)_cmd; (void)sender;
-    /* 底层系统交互与数据协议契约 */
     if (g_bridge.zan_gui_inject_event) {
         g_bridge.zan_gui_inject_event(0, 8, 0, 0, 0, 0, 0);
     }
@@ -68,7 +66,6 @@ static intptr_t hook_windowShouldClose(id_t self, sel_t _cmd, id_t sender) {
 static imp_t g_orig_canBecomeKeyWindow = NULL;
 
 static intptr_t hook_canBecomeKeyWindow(id_t self, sel_t _cmd) {
-    /* 底层系统交互与数据协议契约 */
     if (g_bridge.initialized) {
         sel_t sel_del = g_bridge.sel_registerName("delegate");
         if (sel_del) {
@@ -99,13 +96,11 @@ static void zan_mac_gui_fixup(void) {
     }
     g_bridge.initialized = 1;
 
-    /* 核心系统底层抽象与内存语义契约 */
     class_t cls_del = g_bridge.objc_getClass("ZanDelegate");
     if (cls_del && g_bridge.class_addMethod) {
         sel_t sel_term = g_bridge.sel_registerName("applicationShouldTerminate:");
         g_bridge.class_addMethod(cls_del, sel_term, (imp_t)hook_applicationShouldTerminate, "q@:@");
 
-        /* 底层系统交互与数据协议契约 */
         if (g_bridge.class_getInstanceMethod && g_bridge.method_setImplementation) {
             sel_t sel_close = g_bridge.sel_registerName("windowShouldClose:");
             method_t m_close = g_bridge.class_getInstanceMethod(cls_del, sel_close);
@@ -115,7 +110,6 @@ static void zan_mac_gui_fixup(void) {
         }
     }
 
-    /* 底层系统交互与数据协议契约 */
     class_t cls_win = g_bridge.objc_getClass("ZanWindow");
     if (cls_win && g_bridge.class_getInstanceMethod && g_bridge.method_setImplementation) {
         sel_t sel_canKey = g_bridge.sel_registerName("canBecomeKeyWindow");
@@ -147,7 +141,6 @@ int32_t zan_gui_event_flag(void) {
 __attribute__((visibility("default")))
 void zan_gui_present_full(void) {
     zan_mac_gui_fixup();
-    /* 底层系统交互与数据协议契约 */
 }
 
 extern int32_t zan_gui_font_height(int32_t font_size);

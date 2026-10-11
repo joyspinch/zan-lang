@@ -1,8 +1,6 @@
-/* 内部辅助实现 */
 #ifndef ZAN_RT_CRASH_H
 #define ZAN_RT_CRASH_H
 
-/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_MAYBE_UNUSED
 #  if defined(__GNUC__) || defined(__clang__)
 #    define ZAN_MAYBE_UNUSED __attribute__((unused))
@@ -13,7 +11,6 @@
 
 #if defined(_WIN32)
 #include <windows.h>
-/* 内部辅助实现 */
 WINBASEAPI ULONGLONG WINAPI GetTickCount64(VOID);
 #include <stdio.h>
 #include <stdint.h>
@@ -35,7 +32,6 @@ static void zan__crash_modline(FILE *f, void *addr, const char *tag) {
     }
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static uintptr_t zan__crash_image_base(const char *exe) {
     HANDLE h = CreateFileA(exe, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -52,7 +48,7 @@ static uintptr_t zan__crash_image_base(const char *exe) {
     if ((size_t)e_lfanew + 0x40 > (size_t)got) return 0;
     unsigned char *nt = buf + e_lfanew;
     if (!(nt[0] == 'P' && nt[1] == 'E' && nt[2] == 0 && nt[3] == 0)) return 0;
-    unsigned char *opt = nt + 24; /* 核心系统底层抽象与内存语义契约 */
+    unsigned char *opt = nt + 24;
     uint16_t magic;
     memcpy(&magic, opt, 2);
     if (magic == 0x20B) { /* PE32+ : ImageBase is a ULONGLONG at opt+24 */
@@ -68,7 +64,6 @@ static uintptr_t zan__crash_image_base(const char *exe) {
     return 0;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
     HMODULE m = NULL;
     if (addr &&
@@ -80,7 +75,6 @@ static int zan__crash_in_main(void *addr, uintptr_t exe_base) {
     return 0;
 }
 
-/* 内部辅助实现 */
 static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t outsz) {
     char cand[MAX_PATH];
     snprintf(cand, sizeof cand, "%saddr2line.exe", exe_dir);
@@ -94,7 +88,6 @@ static int zan__crash_find_symbolizer(const char *exe_dir, char *out, size_t out
     return 0;
 }
 
-/* 内部辅助实现 */
 static int zan__crash_line_is_noise(const char *line) {
     static const char *const noise[] = {
         "cygming-crtbegin.c", "__tmainCRTStartup", "WinMainCRTStartup",
@@ -103,7 +96,6 @@ static int zan__crash_line_is_noise(const char *line) {
     };
     for (size_t i = 0; i < sizeof(noise) / sizeof(noise[0]); i++)
         if (strstr(line, noise[i])) return 1;
-    /* 核心系统底层抽象与内存语义契约 */
     if (line[0] == '?' && line[1] == '?') return 1;
     return 0;
 }
@@ -127,7 +119,6 @@ static int zan__crash_append_filtered(const char *logpath, const char *tmppath,
     return kept;
 }
 
-/* 内部辅助实现 */
 static void zan__crash_symbolize(const char *logpath, const char *exe,
                                  const char *exe_dir, uintptr_t exe_base,
                                  void *fault, void **frames, USHORT nframes,
@@ -138,7 +129,6 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
     int mode = zan__crash_find_symbolizer(exe_dir, sym, sizeof sym);
     if (!mode) return;
 
-    /* 编译器代码生成与运行时系统底层调用契约 */
     char addrs[3200];
     size_t ap = 0;
     int count = 0;
@@ -166,7 +156,6 @@ static void zan__crash_symbolize(const char *logpath, const char *exe,
                  sym, exe, addrs);
 
     char tmppath[MAX_PATH];
-    /* 内部辅助实现 */
     HANDLE h = INVALID_HANDLE_VALUE;
     for (int attempt = 0; attempt < 8 && h == INVALID_HANDLE_VALUE; attempt++) {
         unsigned long long salt =
@@ -259,7 +248,6 @@ static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void zan__crash_note(const char *what, const char *detail) {
     char logpath[MAX_PATH];
     char exe_dir[MAX_PATH];
@@ -286,7 +274,6 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
 #define ZAN_CRASH_TLS __thread
 #endif
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #if defined(_WIN32) && (defined(__GNUC__) || defined(__clang__))
 #define ZAN_CRASH_SHARED __attribute__((selectany))
 #elif defined(_MSC_VER)
@@ -307,7 +294,6 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep, const char *reason,
 #define ZAN_CTX_PC(c) (0)
 #endif
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void zan__crash_image_range(uintptr_t base, uintptr_t *lo,
                                   uintptr_t *hi) {
     *lo = base;
@@ -327,7 +313,6 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     zan__crash_image_range(exe_base, &lo, &hi);
     if (hi <= lo) return;
 
-    /* 内部辅助实现 */
     ULONG_PTR start = rsp + 128 * 1024;
 
     MEMORY_BASIC_INFORMATION mbi;
@@ -336,7 +321,6 @@ static void zan__crash_stack_scan(FILE *f, ULONG_PTR rsp, uintptr_t exe_base) {
     if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return;
     ULONG_PTR region_end = (ULONG_PTR)mbi.BaseAddress + mbi.RegionSize;
 
-    /* 模块核心语义抽象与接口调用契约 */
     ULONG_PTR end = start + 512 * 1024;
     if (end > region_end) end = region_end;
 
@@ -382,28 +366,26 @@ typedef struct zan__guard zan__guard_t;
 typedef struct zan__fault zan__fault_t;
 
 typedef struct zan__thread_slot {
-    volatile LONG tid;      /* 核心系统底层抽象与内存语义契约 */
-    zan__guard_t *top;      /* 核心系统底层抽象与内存语义契约 */
-    int ready;              /* 底层系统交互与数据协议契约 */
-    int busy;               /* 核心系统底层抽象与内存语义契约 */
+    volatile LONG tid;
+    zan__guard_t *top;
+    int ready;
+    int busy;
 } zan__thread_slot;
 
 #define ZAN_GUARD_SLOTS 64
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct zan__shared {
     LONG magic;
-    volatile LONG busy;         /* 底层系统交互与数据协议契约 */
-    volatile LONG recovered;    /* 核心系统底层抽象与内存语义契约 */
-    volatile LONG logged;       /* 核心系统底层抽象与内存语义契约 */
-    volatile LONG firstchance;  /* 底层系统交互与数据协议契约 */
-    volatile LONG installed;    /* 核心系统底层抽象与内存语义契约 */
+    volatile LONG busy;
+    volatile LONG recovered;
+    volatile LONG logged;
+    volatile LONG firstchance;
+    volatile LONG installed;
     zan__thread_slot slots[ZAN_GUARD_SLOTS];
 } zan__shared_t;
 
 ZAN_CRASH_SHARED zan__shared_t zan__shared = { 0x5A414353, 0, 0, 0, 0, 0, { { 0, 0, 0, 0 } } };
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #define zan__slots             zan__shared.slots
 #define zan__crash_busy_shared zan__shared.busy
 #define zan__guard_recovered   zan__shared.recovered
@@ -427,7 +409,6 @@ static zan__thread_slot *zan__slot(int create) {
     return NULL;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int zan__crash_busy_get(zan__thread_slot *s) {
     return s ? s->busy : (int)zan__crash_busy_shared;
 }
@@ -446,10 +427,9 @@ static LONG WINAPI zan__crash_filter(EXCEPTION_POINTERS *ep) {
         /* 编译器内部生成的非致命崩溃记录触发信号 */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
-    return EXCEPTION_EXECUTE_HANDLER; /* 底层系统交互与数据协议契约 */
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
                                    const char *reason,
                                    void **bt, unsigned btn) {
@@ -539,7 +519,6 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
             fprintf(f, "rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p\n",
                     (void *)c->Rax, (void *)c->Rbx, (void *)c->Rcx,
                     (void *)c->Rdx, (void *)c->Rsi, (void *)c->Rdi);
-            /* 内部辅助实现 */
             {
                 ULONG_PTR raw_rsp = ZAN_CTX_SP(c);
                 MEMORY_BASIC_INFORMATION raw_mbi;
@@ -587,10 +566,9 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
         fprintf(f, "\n");
         fclose(f);
 
-        /* 模块核心语义抽象与接口调用契约 */
         DWORD crash_code = er->ExceptionCode;
         if (crash_code != EXCEPTION_STACK_OVERFLOW &&
-            crash_code != 0xC0000374 /* 核心系统底层抽象与内存语义契约 */ &&
+            crash_code != 0xC0000374  &&
             crash_code != 0xC0000409 /* fail-fast */) {
             zan__crash_symbolize(logpath, exe, exe_dir[0] ? exe_dir : ".\\",
                                  exe_base, ep->ExceptionRecord->ExceptionAddress,
@@ -602,7 +580,6 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
     }
 }
 
-/* 内部辅助实现 */
 
 /* 拷贝故障帧异常信息以供恢复帧写入日志 */
 struct zan__fault {
@@ -614,20 +591,17 @@ struct zan__fault {
 };
 
 struct zan__guard {
-    void *jb[5];             /* 核心系统底层抽象与内存语义契约 */
-    struct zan__guard *prev; /* 核心系统底层抽象与内存语义契约 */
-    ULONG_PTR sp;            /* 底层系统交互与数据协议契约 */
+    void *jb[5];
+    struct zan__guard *prev;
+    ULONG_PTR sp;
     volatile LONG armed;
     zan__fault_t f;
 };
 
-/* 内部辅助实现 */
 #define ZAN_GUARD_LOG_FULL 20
 #define ZAN_GUARD_LOG_EVERY 100
 
-/* 内部辅助实现 */
 #if defined(_M_X64) || defined(__x86_64__)
-/* 模块核心语义抽象与接口调用契约 */
 static int zan__guard_recoverable(DWORD code) {
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
@@ -640,7 +614,6 @@ static int zan__guard_recoverable(DWORD code) {
     case EXCEPTION_INT_OVERFLOW:
     case EXCEPTION_FLT_DIVIDE_BY_ZERO:
     case EXCEPTION_FLT_INVALID_OPERATION:
-    /* 内部辅助实现 */
     case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
     case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
     case 0xE0A2C009: case 0xE0A2C010:
@@ -661,7 +634,7 @@ static int zan__guard_rip_recoverable(EXCEPTION_POINTERS *ep) {
         return 0;
     return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
 }
-#endif /* 核心系统底层抽象与内存语义契约 */
+#endif
 
 /* 过滤并记录致命硬件异常 (AV/非法指令等) */
 static int zan__guard_hard_fault(DWORD code) {
@@ -672,7 +645,6 @@ static int zan__guard_hard_fault(DWORD code) {
     case EXCEPTION_PRIV_INSTRUCTION:
     case EXCEPTION_STACK_OVERFLOW:
     case 0xC0000374:
-    /* 底层系统交互与数据协议契约 */
     case 0xE0A2C001: case 0xE0A2C002: case 0xE0A2C003: case 0xE0A2C004:
     case 0xE0A2C005: case 0xE0A2C006: case 0xE0A2C007: case 0xE0A2C008:
     case 0xE0A2C009:
@@ -683,7 +655,6 @@ static int zan__guard_hard_fault(DWORD code) {
 }
 
 #if defined(_M_X64) || defined(__x86_64__)
-/* 内部辅助实现 */
 static void zan__guard_resume(void) {
     zan__thread_slot *s = zan__slot(0);
     zan__guard_t *g = s ? s->top : NULL;
@@ -720,7 +691,6 @@ static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
     if (!fn) return 1;
     zan__thread_slot *s = zan__slot(1);
     if (!s) { fn(arg); return 1; } /* out of slots: unguarded, as before */
-    /* 模块核心语义抽象与接口调用契约 */
     if (!s->ready) {
         s->ready = 1;
         /* 重新确立全局未处理异常过滤器所有权 */
@@ -751,7 +721,6 @@ static ZAN_MAYBE_UNUSED int zan__guard_call(void (*fn)(void *), void *arg) {
     (void)frame_probe;
     return ok;
 #else
-    /* 内部辅助实现 */
     fn(arg);
     return 1;
 #endif
@@ -770,13 +739,11 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
 #if defined(_M_X64) || defined(__x86_64__)
     if (g && g->armed && zan__guard_recoverable(code) &&
         zan__guard_rip_recoverable(ep)) {
-        g->armed = 0; /* 模块核心语义抽象与接口调用契约 */
-        /* 内部辅助实现 */
+        g->armed = 0;
         g->f.er = *ep->ExceptionRecord;
         g->f.ctx = *ep->ContextRecord;
         g->f.btn = (unsigned)RtlCaptureStackBackTrace(0, 62, g->f.bt, NULL);
         g->f.have = 1;
-        /* 内部辅助实现 */
         ULONG_PTR sp = ((g->sp - 256) & ~(ULONG_PTR)15) - 8;
         ep->ContextRecord->Rsp = (DWORD64)sp;
         ep->ContextRecord->Rip = (DWORD64)(ULONG_PTR)&zan__guard_resume;
@@ -784,7 +751,6 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     }
 #endif
 
-    /* 内部辅助实现 */
     if (zan__guard_hard_fault(code)) {
         LONG seen = InterlockedIncrement((LONG volatile *)&zan__guard_firstchance);
         if (seen <= ZAN_GUARD_LOG_FULL || seen % ZAN_GUARD_LOG_EVERY == 0) {
@@ -796,13 +762,11 @@ static LONG CALLBACK zan__crash_veh(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static ZAN_MAYBE_UNUSED LONG zan__guard_recovered_count(void) {
     return zan__guard_recovered;
 }
 
 static void zan__crash_atexit(void) {
-    /* 内部辅助实现 */
     char detail[96];
     snprintf(detail, sizeof detail, "recovered=%ld logged=%ld first-chance=%ld",
              (long)zan__guard_recovered, (long)zan__guard_logged,
@@ -816,7 +780,7 @@ static int zan__crash_in_main_image(void) {
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCSTR)(ULONG_PTR)&zan__crash_in_main_image, &m))
-        return 1; /* 核心系统底层抽象与内存语义契约 */
+        return 1;
     return (uintptr_t)m == (uintptr_t)GetModuleHandleA(NULL);
 }
 
@@ -835,7 +799,6 @@ static void zan__crash_install(void) {
     /* 向量化异常处理优先于帧异常拦截 */
     AddVectoredExceptionHandler(1, zan__crash_veh);
     zan__crash_note("run", "");
-    /* 底层系统交互与数据协议契约 */
     if (zan__crash_in_main_image()) atexit(zan__crash_atexit);
 }
 
@@ -846,7 +809,6 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #endif
 
 #else /* !_WIN32 */
-/* 内部辅助实现 */
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
@@ -859,7 +821,6 @@ __attribute__((constructor)) static void zan__crash_ctor(void) {
 #include <sys/types.h>
 
 #if (defined(__GLIBC__) || defined(__APPLE__)) && !defined(ZAN_NO_EXECINFO)
-/* 内部辅助实现 */
 #include <execinfo.h>
 #define ZAN_CRASH_HAVE_BACKTRACE 1
 #endif
@@ -880,7 +841,6 @@ static void zan__crash_wr(int fd, const char *s) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static const char *zan__crash_dec(unsigned long long v, char *buf) {
     char *p = buf + 23;
     *p = '\0';
@@ -898,7 +858,6 @@ static const char *zan__crash_hex(unsigned long long v, char *buf) {
     return p;
 }
 
-/* 内部辅助实现 */
 #if defined(_GNU_SOURCE)
 #define ZAN_CRASH_HAVE_DLADDR 1
 #endif
@@ -927,7 +886,6 @@ static void zan__crash_frame(int fd, void *pc) {
     zan__crash_wr(fd, "\n");
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int zan__crash_fp_walk(int fd, void **fp) {
     int n = 0;
     while (fp && n < 48) {
@@ -955,13 +913,10 @@ static const char *zan__crash_signame(int sig) {
     }
 }
 
-/* 内部辅助实现 */
 static char zan__crash_exe[4096];
 static char zan__crash_logdir[4096];
-/* 模块核心语义抽象与接口调用契约 */
 static char zan__crash_wid[32];
 
-/* 内部辅助实现 */
 static long zan__crash_tz_off;
 static int zan__crash_err_fd = -1;
 
@@ -1068,7 +1023,7 @@ static int zan__crash_logpath_for(const struct tm *tmv, char *out, size_t cap) {
     char dir[4096];
     if ((size_t)snprintf(dir, sizeof dir, "%s/%s", zan__crash_logdir, month)
             >= sizeof dir) return 0;
-    mkdir(zan__crash_logdir, 0755); /* 核心系统底层抽象与内存语义契约 */
+    mkdir(zan__crash_logdir, 0755);
     mkdir(dir, 0755);
     return (size_t)snprintf(out, cap, "%s/%s.log", dir, day) < cap;
 }
@@ -1130,7 +1085,6 @@ static void zan__crash_record(int fd, int sig, void *addr, const char *stamp,
 
 static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
     void *addr = info ? info->si_addr : NULL;
-    /* 编译器代码生成与运行时系统底层调用契约 */
     time_t now = time(NULL) + (time_t)zan__crash_tz_off;
     char stamp[32];
     /* 信号安全格式化时间字符串 */
@@ -1187,7 +1141,6 @@ static void zan__crash_handler(int sig, siginfo_t *info, void *ctx) {
             close(fd);
         }
     }
-    /* 模块核心语义抽象与接口调用契约 */
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -1199,15 +1152,12 @@ static void zan__crash_install(void) {
     zan__crash_resolve_paths();
     zan__crash_cache_handler_state();
 #if defined(__linux__) && !defined(SA_ONSTACK)
-    /* 内部辅助实现 */
 #define SA_ONSTACK 0x08000000
 #endif
 #if defined(__OHOS__) && !defined(SS_DISABLE)
-    /* 模块核心语义抽象与接口调用契约 */
 #define SS_DISABLE 2
 int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
 #endif
-    /* 内部辅助实现 */
     {
         stack_t cur;
         if (sigaltstack(NULL, &cur) == 0 &&
@@ -1229,7 +1179,6 @@ int sigaltstack(const stack_t *__restrict, stack_t *__restrict);
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
     for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
         struct sigaction cur;
-        /* 模块核心语义抽象与接口调用契约 */
         if (sigaction(sigs[i], NULL, &cur) == 0 && cur.sa_handler != SIG_DFL) {
             continue;
         }

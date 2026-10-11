@@ -171,7 +171,6 @@ static int zan_img_dimensions_ok(int w, int h) {
         && (size_t)w <= SIZE_MAX / sizeof(uint32_t) / (size_t)h;
 }
 
-/* 底层系统交互与数据协议契约 */
 static uint32_t *zan_rgba_to_argb(const unsigned char *data, int w, int h) {
     uint32_t *pix;
     size_t i, n;

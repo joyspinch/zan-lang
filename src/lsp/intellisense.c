@@ -1,7 +1,6 @@
 /* intellisense */
 #include "intellisense.h"
 #include "../common/json.h"
-/* 内部辅助逻辑 */
 #include "../compiler/builtin_api.h"
 #include "../compiler/parser.h"
 #include "../compiler/arena.h"
@@ -25,14 +24,12 @@
 #endif
 #include "../common/host_oom.h"
 
-/* 核心系统底层抽象与内存语义契约 */
 static const char *builtin_types[] = {
     "int", "float", "double", "bool", "string", "char", "byte", "long",
     "short", "void", "var", "object", "decimal", "uint", "ulong",
     "ushort", "sbyte", NULL
 };
 
-/* 核心系统底层抽象与内存语义契约 */
 static const char *builtin_keywords[] = {
     "abstract", "as", "async", "await", "base", "break",
     "case", "catch", "class", "const", "continue",
@@ -47,9 +44,7 @@ static const char *builtin_keywords[] = {
     NULL
 };
 
-/* 内部辅助逻辑 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static const zan_builtin_type_t *builtin_receiver(const char *type_name) {
     if (!type_name || !type_name[0]) return NULL;
     char bare[64];
@@ -70,7 +65,6 @@ static const zan_builtin_type_t *builtin_receiver(const char *type_name) {
     return NULL;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool already_offered(const intellisense_t *is, const char *label) {
     for (int i = 0; i < is->completion_count; i++) {
         if (strcmp(is->completions[i].label, label) == 0) return true;
@@ -78,9 +72,7 @@ static bool already_offered(const intellisense_t *is, const char *label) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_symbols(intellisense_t *is, int need) {
     if (need <= is->symbol_cap) return true;
     int cap = is->symbol_cap ? is->symbol_cap * 2 : INTEL_INIT_SYMBOLS;
@@ -92,7 +84,6 @@ static bool reserve_symbols(intellisense_t *is, int need) {
     return true;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_methods(intellisense_t *is, int need) {
     if (need <= is->method_cap) return true;
     int cap = is->method_cap ? is->method_cap * 2 : 64;
@@ -104,7 +95,6 @@ static bool reserve_methods(intellisense_t *is, int need) {
     return true;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool reserve_files(intellisense_t *is, int need) {
     if (need <= is->indexed_file_cap) return true;
     int cap = is->indexed_file_cap ? is->indexed_file_cap * 2 : INTEL_INIT_FILES;
@@ -162,7 +152,6 @@ static void add_symbol(intellisense_t *is, const char *name,
     sym->col = col;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void add_symbol_ex(intellisense_t *is, const char *name,
                           const char *type_name, const char *parent,
                           const char *signature, const char *file,
@@ -186,7 +175,6 @@ static void add_symbol_ex(intellisense_t *is, const char *name,
     sym->param_count = param_count;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 void intel_register_snippets(intellisense_t *is) {
     is->snippet_count = 0;
 
@@ -222,9 +210,7 @@ void intel_register_snippets(intellisense_t *is) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 
-/* 内部辅助逻辑 */
 static const char *intel_design_widget(int ft) {
     if (ft == 0 || ft == 2 || ft == 3) return "Input";
     if (ft == 1 || ft == 14) return "TextArea";
@@ -240,9 +226,7 @@ static const char *intel_design_widget(int ft) {
     return "Label";
 }
 
-/* 内部辅助实现 */
 
-/* 底层系统交互与数据协议契约 */
 static size_t intel_html_decode(const char *v, size_t n, char *out,
                                 size_t cap);
 static bool intel_html_attr(const char *line, size_t len, const char *attr,
@@ -263,7 +247,6 @@ static bool intel_html_attr(const char *line, size_t len, const char *attr,
     return false;
 }
 
-/* 内部辅助实现 */
 static size_t intel_html_decode(const char *v, size_t n, char *out,
                                 size_t cap) {
     size_t r = 0, w = 0;
@@ -311,7 +294,6 @@ static bool intel_html_has(const char *line, size_t len, const char *needle) {
     return false;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int intel_html_handlers(const char *line, size_t len,
                                char outs[][128], int max) {
     static const char kOn[] = "data-on-";
@@ -410,7 +392,6 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
                    filepath, ISYM_METHOD, 0, 0);
     }
 
-    /* 底层系统交互与数据协议契约 */
     p = content;
     int line = 0;
     while (p < end) {
@@ -422,7 +403,6 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
             char fname[128];
             if (intel_html_attr(p, ll, "id", fname, sizeof(fname)) &&
                 fname[0] && isalpha((unsigned char)fname[0])) {
-                /* 内部辅助逻辑 */
                 const char *wtype = "Panel";
                 if (isalpha((unsigned char)kind[0])) {
                     wtype = kind;
@@ -445,7 +425,6 @@ static void intel_parse_design_html(intellisense_t *is, const char *filepath,
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     zan_token_t token;
     int mate;
@@ -494,7 +473,7 @@ static void intel_ast_position(const intel_ast_ctx_t *c, int offset,
     }
     *line = lo;
     *col = intel_utf16_col(c->source + c->lines[lo], off - c->lines[lo]);
-    if (offset > 0 && (size_t)offset > c->len) (*col)++; /* 核心系统底层抽象与内存语义契约 */
+    if (offset > 0 && (size_t)offset > c->len) (*col)++;
 }
 
 static int intel_ast_token_at(const intel_ast_ctx_t *c, int offset) {
@@ -525,7 +504,6 @@ static void intel_ast_type(const zan_ast_node_t *n, char *out, size_t cap) {
             while (element->kind == AST_TYPE_REF && element->type_ref.array_element)
                 element = element->type_ref.array_element;
             intel_ast_type(element, out, cap);
-            /* 内部辅助逻辑 */
             for (element = n; element->kind == AST_TYPE_REF && element->type_ref.array_element;
                  element = element->type_ref.array_element) {
                 intel_ast_append(out, cap, "[");
@@ -572,7 +550,6 @@ static void intel_ast_type(const zan_ast_node_t *n, char *out, size_t cap) {
     }
 }
 
-/* 内部辅助逻辑 */
 static int intel_ast_type_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n) {
     if (!n) return 0;
     int i = intel_ast_token_at(c, (int)n->loc.offset);
@@ -611,7 +588,6 @@ static int intel_ast_name_token(const intel_ast_ctx_t *c, const zan_ast_node_t *
         const zan_token_t *t = &c->tokens[i].token;
         if (t->kind == TK_IDENT && t->str_val.len == name.len &&
             memcmp(t->str_val.str, name.str, name.len) == 0) return i;
-        /* 模块核心语义抽象与接口调用契约 */
         if (t->kind == TK_EQ && (n->kind == AST_VAR_DECL || n->kind == AST_FIELD_DECL)) {
             for (i++; i < c->token_count; i++) {
                 zan_token_kind_t k = c->tokens[i].token.kind;
@@ -624,7 +600,7 @@ static int intel_ast_name_token(const intel_ast_ctx_t *c, const zan_ast_node_t *
         if (t->kind == TK_SEMICOLON || t->kind == TK_LBRACE ||
             t->kind == TK_RBRACE || t->kind == TK_EQ) break;
     }
-    return -1; /* 底层系统交互与数据协议契约 */
+    return -1;
 }
 
 static int intel_ast_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n, int limit) {
@@ -649,7 +625,6 @@ static int intel_ast_end(const intel_ast_ctx_t *c, const zan_ast_node_t *n, int 
     int i = intel_ast_token_at(c, (int)n->loc.offset);
     if (i < c->token_count && c->tokens[i].token.kind == TK_LBRACE)
         return c->tokens[i].mate >= i ? (int)c->tokens[c->tokens[i].mate].token.loc.offset + 1 : limit;
-    /* 模块核心语义抽象与接口调用契约 */
     for (; i < c->token_count && (int)c->tokens[i].token.loc.offset < limit; i++) {
         zan_token_kind_t kind = c->tokens[i].token.kind;
         if (kind == TK_SEMICOLON) return (int)c->tokens[i].token.loc.offset + 1;
@@ -667,7 +642,6 @@ static void intel_ast_scope(const intel_ast_ctx_t *c, isym_t *s, intel_scope_t s
     intel_ast_position(c, scope.end, &s->scope_end_line, &s->scope_end_col);
 }
 
-/* 内部辅助逻辑 */
 static void utf8_trim_end(char *s) {
     size_t n = strlen(s);
     size_t i = n;
@@ -675,8 +649,8 @@ static void utf8_trim_end(char *s) {
     if (i > 0 && (unsigned char)s[i - 1] >= 0x80) {
         unsigned char b = (unsigned char)s[i - 1];
         size_t need = b >= 0xF0 ? 4 : (b >= 0xE0 ? 3 : 2);
-        if (n - (i - 1) < need) i--; /* 底层系统交互与数据协议契约 */
-        else i = n;                  /* 核心系统底层抽象与内存语义契约 */
+        if (n - (i - 1) < need) i--;
+        else i = n;
     }
     if (i < n) s[i] = '\0';
 }
@@ -908,7 +882,6 @@ static void intel_ast_callable(intel_ast_ctx_t *c, const zan_ast_node_t *n,
     snprintf(sig, sizeof(sig), "%s%s%s%s%s%s(", mods & MOD_STATIC ? "static " : "",
              mods & MOD_ASYNC ? "async " : "", ctor ? "" : type, ctor ? "" : " ",
              parent && parent[0] ? parent : "", parent && parent[0] ? "." : "");
-    /* 模块核心语义抽象与接口调用契约 */
     size_t sl = strlen(sig);
     if (sl) sig[sl - 1] = '\0';
     intel_ast_append(sig, sizeof(sig), name);
@@ -931,7 +904,6 @@ static void intel_ast_callable(intel_ast_ctx_t *c, const zan_ast_node_t *n,
                          mods, n->method_decl.params.count, scope);
         return;
     }
-    /* 内部辅助逻辑 */
     if (intel_ast_name_token(c, n, n->method_decl.name, floor) < 0) return;
     intel_scope_t body = intel_ast_body(c, n->method_decl.body ? n->method_decl.body : n,
                                         parent, name, (int)n->loc.offset, scope);
@@ -1224,7 +1196,6 @@ static void intel_ast_walk(intel_ast_ctx_t *c, const zan_ast_node_t *n,
     }
 }
 
-/* 内部辅助逻辑 */
 int intel_find_text_references(const char *text, const char *word, size_t *offsets, int max) {
     int count = 0;
     size_t wlen = strlen(word);
@@ -1284,7 +1255,6 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
         else if (depth && (k == TK_RBRACE || k == TK_RPAREN || k == TK_RBRACKET)) {
             zan_token_kind_t expected = k == TK_RBRACE ? TK_LBRACE : k == TK_RPAREN ? TK_LPAREN : TK_LBRACKET;
             int match = depth - 1;
-            /* 内部辅助逻辑 */
             while (match >= 0 && c.tokens[stack[match]].token.kind != expected) {
                 if (c.tokens[stack[match]].token.kind == TK_LBRACE) break;
                 match--;
@@ -1296,7 +1266,6 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
         }
     }
     free(stack);
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i + 1 < c.token_count; i++) {
         zan_token_kind_t k = c.tokens[i].token.kind, next = c.tokens[i + 1].token.kind;
         if ((k == TK_DOT || k == TK_QUESTION_DOT || k == TK_EQ) &&
@@ -1319,7 +1288,6 @@ static void intel_parse_zan_ast(intellisense_t *is, intellisense_t *project, con
     snprintf(saved_file, sizeof(saved_file), "%s", is->current_file);
     snprintf(is->current_file, sizeof(is->current_file), "%s", file);
     intel_scope_t scope = {0, (int)len + 1, -1};
-    /* 内部辅助逻辑 */
     c.declarations_only = true;
     intel_ast_walk(&c, unit, "", scope);
     c.declarations_only = false;
@@ -1331,7 +1299,6 @@ done:
     zan_arena_free(arena);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 bool intel_same_file(const char *a, const char *b) {
 #ifdef _WIN32
     while (*a && *b) {
@@ -1346,10 +1313,8 @@ bool intel_same_file(const char *a, const char *b) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char *filepath,
                          const char *content, size_t len) {
-    /* 底层系统交互与数据协议契约 */
     int dst = 0;
     for (int i = 0; i < is->symbol_count; i++) {
         if (!intel_same_file(is->symbols[i].file, filepath)) {
@@ -1359,7 +1324,6 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
     }
     is->symbol_count = dst;
 
-    /* 底层系统交互与数据协议契约 */
     int mdst = 0;
     for (int i = 0; i < is->method_count; i++) {
         if (!intel_same_file(is->methods[i].file, filepath)) {
@@ -1369,7 +1333,6 @@ void intel_parse_file_ex(intellisense_t *is, intellisense_t *project, const char
     }
     is->method_count = mdst;
 
-    /* 核心系统底层抽象与内存语义契约 */
     int fdst = 0;
     for (int i = 0; i < is->indexed_file_count; i++) {
         if (intel_same_file(is->indexed_files[i], filepath)) continue;
@@ -1407,7 +1370,7 @@ void intel_parse_file(intellisense_t *is, const char *filepath,
 bool intel_position_in(int line, int col, int start_line, int start_col,
                        int end_line, int end_col) {
     if (line < start_line || line > end_line) return false;
-    if (col < 0) return true; /* 核心系统底层抽象与内存语义契约 */
+    if (col < 0) return true;
     return (line != start_line || col >= start_col) &&
            (line != end_line || col < end_col);
 }
@@ -1429,7 +1392,6 @@ bool intel_symbol_visible_at(const intellisense_t *is, const isym_t *sym, int li
     if (sym->kind != ISYM_VARIABLE && sym->kind != ISYM_PARAMETER) return true;
     if (line < 0 || sym->method_offset < 0) return false;
     if (is->current_file[0] && !intel_same_file(sym->file, is->current_file)) return false;
-    /* 模块核心语义抽象与接口调用契约 */
     if (sym->offset >= 0 && col >= 0 && line == sym->line && col >= sym->col &&
         col < sym->col + intel_utf16_col(sym->name, strlen(sym->name))) return true;
     const imethod_t *m = intel_method_at(is, line, col);
@@ -1482,7 +1444,6 @@ const isym_t *intel_lookup_symbol_at(intellisense_t *is, const char *word, int l
     return best;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 const isym_t *intel_lookup_symbol_any(intellisense_t *is, const char *word) {
     if (!is || !word || !word[0]) return NULL;
     const isym_t *best = NULL;
@@ -1540,7 +1501,6 @@ static bool intel_type_owner_is(const char *type, const char *owner) {
     return strcmp(simple ? simple + 1 : bare, owner) == 0;
 }
 
-/* 内部辅助逻辑 */
 static int intel_owner_distance(intellisense_t *is, const char *type, const char *owner) {
     for (int depth = 0; type && type[0] && depth < 16; depth++) {
         if (intel_type_owner_is(type, owner)) return depth;
@@ -1549,7 +1509,6 @@ static int intel_owner_distance(intellisense_t *is, const char *type, const char
     return -1;
 }
 
-/* 内部辅助逻辑 */
 static bool member_visible(const intellisense_t *is, ivis_t vis,
                            const char *parent, const char *from_class) {
     if (vis == IVIS_PUBLIC) return true;
@@ -1559,7 +1518,6 @@ static bool member_visible(const intellisense_t *is, ivis_t vis,
            intel_owner_distance((intellisense_t *)is, from_class, parent) >= 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                                const char *prefix, int line, int col) {
     is->completion_count = 0;
@@ -1567,7 +1525,6 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
     size_t plen = prefix ? strlen(prefix) : 0;
 
-    /* 底层系统交互与数据协议契约 */
     if (strcmp(type_name, "this") == 0 || strcmp(type_name, "self") == 0) {
         const char *encl = intel_enclosing_type_at(is, line, col);
         if (encl && encl[0]) type_name = encl;
@@ -1590,7 +1547,6 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
     const char *rank = intel_array_suffix(type_name);
     if (rank) {
-        /* 内部辅助逻辑 */
         const char *members[] = {"Length", "Count", "GetLength"};
         int count = rank[1] == ',' ? 3 : 2;
         for (int i = 0; i < count; i++) {
@@ -1606,16 +1562,13 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
         return is->completion_count;
     }
 
-    /* 内部辅助逻辑 */
     char bare_type[64];
     snprintf(bare_type, sizeof(bare_type), "%s", type_name);
     { char *lt = strchr(bare_type, '<'); if (lt) *lt = '\0';
       char *br = strstr(bare_type, "[]"); if (br) *br = '\0'; }
 
-    /* 内部辅助逻辑 */
     const char *from_class = intel_enclosing_type_at(is, line, col);
 
-    /* 内部辅助逻辑 */
     const char *cls = bare_type;
     int guard = 0;
     while (cls && cls[0] && guard < 16 &&
@@ -1637,7 +1590,6 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
 
             if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
-            /* 核心系统底层抽象与内存语义契约 */
             bool dup = false;
             for (int k = 0; k < is->completion_count; k++) {
                 if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
@@ -1662,7 +1614,6 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
         guard++;
     }
 
-    /* 内部辅助逻辑 */
     const zan_builtin_type_t *bt = builtin_receiver(bare_type);
     if (bt) {
         for (int i = 0; i < bt->member_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
@@ -1675,17 +1626,14 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                 snprintf(c->insert_text, sizeof(c->insert_text), "%s(", m->name);
             else
                 snprintf(c->insert_text, sizeof(c->insert_text), "%s", m->name);
-            /* 模块核心语义抽象与接口调用契约 */
             snprintf(c->detail, sizeof(c->detail), "%s", m->sig);
             c->kind = (m->kind == 'M') ? ISYM_METHOD : ISYM_FIELD;
             c->sort_priority = 1;
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, bare_type) == 0) {
-            /* 底层系统交互与数据协议契约 */
             for (int j = 0; j < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
                 if (is->symbols[j].kind == ISYM_ENUM_MEMBER &&
                     strcmp(is->symbols[j].parent, bare_type) == 0) {
@@ -1724,7 +1672,6 @@ static int intel_bare_symbol_rank(intellisense_t *is, const isym_t *sym,
             intel_lookup_symbol_at(is, sym->name, line, col) != sym) return -1;
         return 0;
     case ISYM_METHOD: case ISYM_FIELD: case ISYM_PROPERTY: case ISYM_EVENT: {
-        /* 内部辅助逻辑 */
         if (!from_class[0]) return -1;
         int distance = intel_owner_distance(is, from_class, sym->parent);
         if (distance < 0 || !member_visible(is, sym->visibility, sym->parent, from_class)) return -1;
@@ -1745,7 +1692,6 @@ bool intel_is_keyword(const char *word) {
     return false;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
                                  const char *context_class,
                                  const char *from_class_override,
@@ -1759,12 +1705,10 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         return 0;
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (context_class && context_class[0]) {
         return intel_complete_members_pos(is, context_class, prefix, line, col);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < is->snippet_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(is->snippets[i].trigger, prefix, plen) != 0) continue;
         completion_t *c = &is->completions[is->completion_count++];
@@ -1783,7 +1727,6 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         if (_strnicmp(sym->name, prefix, plen) != 0) continue;
         int rank = intel_bare_symbol_rank(is, sym, from_class, line, col);
         if (rank < 0 || already_offered(is, sym->name)) continue;
-        /* 内部辅助逻辑 */
         bool hidden = false;
         for (int j = 0; j < is->symbol_count; j++) {
             if (j == i || strcmp(is->symbols[j].name, sym->name) != 0) continue;
@@ -1811,10 +1754,8 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 0;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_keywords[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(builtin_keywords[i], prefix, plen) != 0) continue;
-        /* 核心系统底层抽象与内存语义契约 */
         bool dup = false;
         for (int j = 0; j < is->completion_count; j++) {
             if (strcmp(is->completions[j].insert_text, builtin_keywords[i]) == 0 ||
@@ -1831,7 +1772,6 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 2;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_types[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         if (_strnicmp(builtin_types[i], prefix, plen) != 0) continue;
         bool dup = false;
@@ -1847,7 +1787,6 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         c->sort_priority = 1;
     }
 
-    /* 内部辅助逻辑 */
     {
         int btcount = 0;
         const zan_builtin_type_t *all = zan_builtin_types(&btcount);
@@ -1873,7 +1812,6 @@ int intel_complete_pos(intellisense_t *is, const char *prefix,
     return intel_complete_pos_ex(is, prefix, context_class, NULL, line, col);
 }
 
-/* 内部辅助实现 */
 int intel_complete_bare(intellisense_t *is, const char *prefix,
                         const char *from_class) {
     return intel_complete_pos_ex(is, prefix, NULL, from_class, -1, -1);
@@ -1894,9 +1832,7 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
     if (!is || !word || !word[0]) return info;
 
     const isym_t *selected = intel_lookup_symbol_at(is, word, line, col);
-    /* 内部辅助逻辑 */
     if (!selected) selected = intel_lookup_symbol_any(is, word);
-    /* 内部辅助逻辑 */
     for (int i = 0; i < is->symbol_count; i++) {
         if (&is->symbols[i] == selected) {
             isym_kind_t hk = is->symbols[i].kind;
@@ -1924,7 +1860,6 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_types[i]; i++) {
         if (strcmp(builtin_types[i], word) == 0) {
             snprintf(info.text, sizeof(info.text), "type %s (built-in)", word);
@@ -1954,7 +1889,6 @@ hover_info_t intel_hover_pos(intellisense_t *is, const char *word, int line, int
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; builtin_keywords[i]; i++) {
         if (strcmp(builtin_keywords[i], word) == 0) {
             snprintf(info.text, sizeof(info.text), "keyword %s", word);
@@ -1970,7 +1904,6 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
     return intel_hover_pos(is, word, line, -1);
 }
 
-/* 内部辅助逻辑 */
 static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
                                       const char *member) {
     if (!is || !type_name || !type_name[0] || !member || !member[0]) return NULL;
@@ -2001,7 +1934,6 @@ static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
     return NULL;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
                                 const char *member) {
     hover_info_t info = {0};
@@ -2019,7 +1951,6 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
         return info;
     }
 
-    /* 内部辅助逻辑 */
     char bare[64];
     snprintf(bare, sizeof(bare), "%s", type_name);
     { char *lt = strchr(bare, '<'); if (lt) *lt = '\0';
@@ -2037,7 +1968,6 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
     return info;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 bool intel_goto_member(intellisense_t *is, const char *type_name,
                        const char *member, goto_def_t *out) {
     if (!out) return false;
@@ -2059,7 +1989,6 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
 
     for (int i = 0; i < is->symbol_count; i++) {
         if (strcmp(is->symbols[i].name, word) == 0) {
-            /* 底层系统交互与数据协议契约 */
             if (is->symbols[i].kind == ISYM_CLASS || is->symbols[i].kind == ISYM_STRUCT ||
                 is->symbols[i].kind == ISYM_ENUM || is->symbols[i].kind == ISYM_INTERFACE ||
                 !result.found) {
@@ -2076,7 +2005,6 @@ goto_def_t intel_goto_def(intellisense_t *is, const char *word) {
     return result;
 }
 
-/* 内部辅助逻辑 */
 static void sig_param_list(param_info_t *params, int *count, int max,
                            const char *signature) {
     const char *pstart = strchr(signature, '(');
@@ -2089,7 +2017,6 @@ static void sig_param_list(param_info_t *params, int *count, int max,
     memcpy(params_copy, pstart, (size_t)plen2);
     params_copy[plen2] = '\0';
 
-    /* 内部辅助逻辑 */
     char *tok = params_copy;
     while (*tok && *count < max) {
         while (*tok == ' ') tok++;
@@ -2110,14 +2037,12 @@ static void sig_param_list(param_info_t *params, int *count, int max,
             memcpy(param_str, tok, (size_t)tlen);
             param_str[tlen] = '\0';
 
-            /* 底层系统交互与数据协议契约 */
             char *eq = strchr(param_str, '=');
             if (eq) {
                 while (eq > param_str && eq[-1] == ' ') eq--;
                 *eq = '\0';
             }
 
-            /* 核心系统底层抽象与内存语义契约 */
             char *space = strrchr(param_str, ' ');
             if (space) {
                 *space = '\0';
@@ -2136,7 +2061,6 @@ static void sig_param_list(param_info_t *params, int *count, int max,
 static void substitute_generics(const char *parent_type, const char *declaration,
                                  const char *raw_ret, char *out, size_t cap);
 
-/* 模块核心语义抽象与接口调用契约 */
 signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
                                              const char *method_name, const char *class_context,
                                              int line, int col) {
@@ -2172,7 +2096,6 @@ signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t 
     if (!receiver[0] || intel_array_suffix(receiver)) return sig;
 
     for (int depth = 0; receiver[0] && depth < 16; depth++) {
-        /* 内部辅助逻辑 */
         const zan_builtin_type_t *bt = builtin_receiver(receiver);
         if (bt) {
             for (int i = 0; i < bt->member_count; i++) {
@@ -2228,7 +2151,6 @@ signature_info_t intel_signature_help(intellisense_t *is, const char *method_nam
     return intel_signature_help_pos(is, method_name, class_context, -1, -1);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int intel_find_references(intellisense_t *is, const char *word,
                           goto_def_t *results, int max_results) {
     int count = 0;
@@ -2282,9 +2204,7 @@ void intel_dismiss(intellisense_t *is) {
     is->signature_visible = false;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool extract_return_type_from_sig(const char *sig, char *out, size_t cap) {
     if (!sig || !sig[0] || !out || cap == 0) return false;
     out[0] = '\0';
@@ -2352,7 +2272,6 @@ static intel_type_arg_t intel_generic_arg(const char *type, int index) {
     return empty;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void substitute_generics(const char *parent_type, const char *declaration,
                                  const char *raw_ret, char *out, size_t cap) {
     if (!out || !cap) return;
@@ -2390,7 +2309,6 @@ const char *intel_resolve_method_return_ex(intellisense_t *is, intellisense_t *p
     snprintf(current, sizeof(current), "%s", type_name);
     buf[0] = '\0';
 
-    /* 模块核心语义抽象与接口调用契约 */
     const char *rank = intel_array_suffix(current);
     if (rank) {
         if (strcmp(method_name, "Length") == 0 || strcmp(method_name, "Count") == 0 ||
@@ -2472,7 +2390,6 @@ static int intel_chain_indexes(const char *part) {
     return count;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool intel_chain_name(const char *part, char *out, size_t cap) {
     const char *start = part;
     while (isspace((unsigned char)*start)) start++;
@@ -2498,7 +2415,6 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
 
     if (!chain || !chain[0]) return NULL;
 
-    /* 底层系统交互与数据协议契约 */
     char parts[16][128];
     int part_count = 0;
     int paren_depth = 0;
@@ -2534,9 +2450,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         ci++;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     int rem_len = ci - part_start;
-    /* 内部辅助实现 */
     if (part_count == 0 && rem_len > 0 && rem_len < 127) {
         memcpy(parts[0], chain + part_start, (size_t)rem_len);
         parts[0][rem_len] = '\0';
@@ -2550,7 +2464,6 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
 
     if (part_count == 0) return NULL;
 
-    /* 核心系统底层抽象与内存语义契约 */
     char first_name[128];
     bool is_root_call = intel_chain_name(parts[0], first_name, sizeof(first_name));
     char *fn = first_name;
@@ -2563,7 +2476,6 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
     const char *current_type = NULL;
     const char *encl_cls = intel_enclosing_type_at(is, line, col);
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (parts[0][0] == '"' || parts[0][0] == '\'') {
         current_type = "string";
     } else if (parts[0][0] >= '0' && parts[0][0] <= '9') {
@@ -2575,12 +2487,10 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (!base && project && encl_cls[0]) base = class_base(project, encl_cls);
         current_type = base;
     } else if (is_root_call) {
-        /* 底层系统交互与数据协议契约 */
         if (encl_cls[0]) {
             current_type = intel_resolve_method_return_ex(is, project, encl_cls, fn);
         }
     } else {
-        /* 底层系统交互与数据协议契约 */
         if (is && line >= 0) {
             current_type = intel_resolve_type_pos(is, fn, line, col);
         }
@@ -2591,13 +2501,11 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
             if (project) current_type = intel_resolve_type(project, fn);
         }
         if (!current_type || !current_type[0]) {
-            /* 核心系统底层抽象与内存语义契约 */
             if (encl_cls[0]) {
                 current_type = intel_resolve_method_return_ex(is, project, encl_cls, fn);
             }
         }
         if (!current_type || !current_type[0]) {
-            /* 底层系统交互与数据协议契约 */
             if (builtin_receiver(root_owner)) {
                 current_type = fn;
             } else if (is) {
@@ -2636,7 +2544,6 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (strcmp(resolved_type, "var") == 0) return NULL;
     }
 
-    /* 底层系统交互与数据协议契约 */
     for (int pi = 1; pi < part_count; pi++) {
         char member_name[128];
         intel_chain_name(parts[pi], member_name, sizeof(member_name));
@@ -2650,7 +2557,7 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (next_type && next_type[0]) {
             strncpy(resolved_type, next_type, sizeof(resolved_type) - 1);
             resolved_type[sizeof(resolved_type) - 1] = '\0';
-        } else return NULL; /* 底层系统交互与数据协议契约 */
+        } else return NULL;
         for (int i = 0; i < indexes; i++) {
             char collection[128];
             snprintf(collection, sizeof(collection), "%s", resolved_type);
@@ -2673,9 +2580,7 @@ const char *intel_resolve_chain(intellisense_t *is, const char *chain,
     return intel_resolve_chain_pos(is, NULL, chain, final_member, final_cap, -1, -1);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助实现 */
 static bool index_skip_dir(const char *name) {
     return strcmp(name, "bin") == 0 ||
            strcmp(name, "obj") == 0 ||
@@ -2687,7 +2592,6 @@ static bool index_skip_dir(const char *name) {
            strcmp(name, ".git") == 0;
 }
 
-/* 内部辅助逻辑 */
 volatile int intel_cancel_flag = 0;
 
 #ifdef _WIN32
@@ -2716,12 +2620,10 @@ static void index_directory_recursive(intellisense_t *is, const char *dir_path) 
         snprintf(full_path, sizeof(full_path), "%s\\%s", dir_path, filename_utf8);
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            /* 模块核心语义抽象与接口调用契约 */
             if (!index_skip_dir(filename_utf8)) {
                 index_directory_recursive(is, full_path);
             }
         } else {
-            /* 核心系统底层抽象与内存语义契约 */
             size_t name_len = strlen(filename_utf8);
             bool is_zan = name_len > 4 &&
                           strcmp(filename_utf8 + name_len - 4, ".zan") == 0;
@@ -2760,7 +2662,7 @@ void intel_index_project(intellisense_t *is, const char *project_root) {
     index_directory_recursive(is, project_root);
 }
 
-#else /* 核心系统底层抽象与内存语义契约 */
+#else
 static void index_directory_recursive(intellisense_t *is, const char *dir_path) {
     if (intel_cancel_flag) return;
     DIR *dir = opendir(dir_path);
@@ -2823,7 +2725,6 @@ void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
         if (intel_cancel_flag) break;
         if (!filepaths[i]) continue;
 
-        /* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
         wchar_t wfp[1024];
         FILE *f = NULL;
@@ -2852,9 +2753,7 @@ void intel_index_files(intellisense_t *is, const char **filepaths, int count) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 核心系统底层抽象与内存语义契约 */
 typedef struct {
     const char *ns;
     const char *types[32];
@@ -2878,7 +2777,6 @@ static const ns_types_t stdlib_namespace_map[] = {
     {NULL, {NULL}}
 };
 
-/* 核心系统底层抽象与内存语义契约 */
 static const char *find_namespace_for_type(const char *type_name) {
     for (int i = 0; stdlib_namespace_map[i].ns; i++) {
         for (int j = 0; stdlib_namespace_map[i].types[j]; j++) {
@@ -2913,7 +2811,6 @@ int intel_complete_usings(intellisense_t *is, intellisense_t *project,
     is->completion_active = true;
     if (!ns_prefix) ns_prefix = "";
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int pass = 0; pass < 2; pass++) {
         intellisense_t *src = pass == 0 ? is : project;
         if (!src) continue;
@@ -2939,25 +2836,21 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
     int line_num = 0;
     bool in_using_block = true;
 
-    /* 模块核心语义抽象与接口调用契约 */
     while (p < end && in_using_block) {
         while (p < end && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
         if (p >= end) break;
         if (*p == '\n') { line_num++; p++; continue; }
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (p + 1 < end && p[0] == '/' && p[1] == '/') {
             while (p < end && *p != '\n') p++;
             continue;
         }
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (p + 5 < end && memcmp(p, "using", 5) == 0 &&
             !isalnum((unsigned char)p[5]) && p[5] != '_') {
             p += 5;
             while (p < end && (*p == ' ' || *p == '\t')) p++;
 
-            /* 核心系统底层抽象与内存语义契约 */
             const char *ns_start = p;
             while (p < end && *p != ';' && *p != '\n') p++;
             int ns_len = (int)(p - ns_start);
@@ -2980,14 +2873,12 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         }
     }
 
-    /* 内部辅助逻辑 */
     p = content;
     line_num = 0;
     while (p < end) {
         if (*p == '\n') { line_num++; p++; continue; }
         if (!isalpha((unsigned char)*p) && *p != '_') { p++; continue; }
 
-        /* 核心系统底层抽象与内存语义契约 */
         const char *word_start = p;
         while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
         int wlen = (int)(p - word_start);
@@ -2997,7 +2888,6 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         memcpy(word, word_start, (size_t)wlen);
         word[wlen] = '\0';
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (strcmp(word, "using") == 0 || strcmp(word, "namespace") == 0 ||
             strcmp(word, "class") == 0 || strcmp(word, "struct") == 0 ||
             strcmp(word, "if") == 0 || strcmp(word, "else") == 0 ||
@@ -3007,11 +2897,9 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
             strcmp(word, "string") == 0 || strcmp(word, "var") == 0)
             continue;
 
-        /* 核心系统底层抽象与内存语义契约 */
         const char *ns = find_namespace_for_type(word);
         if (!ns) continue;
 
-        /* 底层系统交互与数据协议契约 */
         bool found_using = false;
         for (int i = 0; i < result.using_count; i++) {
             if (strcmp(result.usings[i].namespace_name, ns) == 0) {
@@ -3021,7 +2909,6 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
             }
         }
 
-        /* 底层系统交互与数据协议契约 */
         if (!found_using) {
             bool already_missing = false;
             for (int i = 0; i < result.missing_count; i++) {
@@ -3036,10 +2923,8 @@ using_analysis_t intel_analyze_usings(intellisense_t *is, const char *content, s
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < result.using_count; i++) {
         if (!result.usings[i].is_used) {
-            /* 模块核心语义抽象与接口调用契约 */
             bool used_by_symbol = false;
             for (int s = 0; s < is->symbol_count; s++) {
                 if (is->symbols[s].kind == ISYM_NAMESPACE &&
@@ -3061,11 +2946,9 @@ void intel_format_using(const char *namespace_name, char *out, size_t out_cap) {
     snprintf(out, out_cap, "using %s;", namespace_name);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int using_sort_cmp(const void *a, const void *b) {
     const using_entry_t *ua = (const using_entry_t *)a;
     const using_entry_t *ub = (const using_entry_t *)b;
-    /* 核心系统底层抽象与内存语义契约 */
     bool a_sys = (strncmp(ua->namespace_name, "System", 6) == 0);
     bool b_sys = (strncmp(ub->namespace_name, "System", 6) == 0);
     if (a_sys && !b_sys) return -1;
@@ -3079,13 +2962,10 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
 
     using_analysis_t analysis = intel_analyze_usings(is, content, len);
 
-    /* 核心系统底层抽象与内存语义契约 */
     using_entry_t new_usings[INTEL_MAX_USINGS * 2];
     int new_count = 0;
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < analysis.using_count; i++) {
-        /* 核心系统底层抽象与内存语义契约 */
         bool is_unused = false;
         for (int j = 0; j < analysis.unused_count; j++) {
             if (analysis.unused_indices[j] == i) { is_unused = true; break; }
@@ -3096,7 +2976,6 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < analysis.missing_count; i++) {
         using_entry_t *u = &new_usings[new_count++];
         memset(u, 0, sizeof(*u));
@@ -3104,12 +2983,9 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         u->is_used = true;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     qsort(new_usings, (size_t)new_count, sizeof(using_entry_t), using_sort_cmp);
 
-    /* 内部辅助逻辑 */
 
-    /* 模块核心语义抽象与接口调用契约 */
     int first_using_line = -1, last_using_line = -1;
     for (int i = 0; i < analysis.using_count; i++) {
         if (first_using_line < 0 || analysis.usings[i].line < first_using_line)
@@ -3119,12 +2995,10 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
     }
 
     if (first_using_line < 0) {
-        /* 模块核心语义抽象与接口调用契约 */
         first_using_line = 0;
         last_using_line = -1;
     }
 
-    /* 底层系统交互与数据协议契约 */
     size_t using_start_off = 0;
     size_t using_end_off = 0;
     int cur_line = 0;
@@ -3146,30 +3020,25 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
         using_end_off = using_start_off;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     size_t buf_cap = len + (size_t)new_count * 140 + 64;
     char *buf = (char *)malloc(buf_cap);
     if (!buf) { *out_len = 0; return NULL; }
     size_t buf_len = 0;
 
-    /* 核心系统底层抽象与内存语义契约 */
     memcpy(buf, content, using_start_off);
     buf_len = using_start_off;
 
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < new_count; i++) {
         int n = snprintf(buf + buf_len, buf_cap - buf_len, "using %s;\n",
                         new_usings[i].namespace_name);
         if (n > 0) buf_len += (size_t)n;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (buf_len > 0 && buf[buf_len - 1] == '\n' && using_end_off < len &&
         content[using_end_off] != '\n') {
         buf[buf_len++] = '\n';
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     size_t remaining = len - using_end_off;
     if (remaining > 0) {
         memcpy(buf + buf_len, content + using_end_off, remaining);
@@ -3181,19 +3050,16 @@ char *intel_organize_usings(intellisense_t *is, const char *content, size_t len,
     return buf;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t len,
                              intel_inlay_hint_t *hints, int max_hints) {
     if (!content || len == 0 || !hints || max_hints <= 0) return 0;
     int count = 0;
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (is) {
         for (int i = 0; i < is->symbol_count && count < max_hints; i++) {
             isym_t *sym = &is->symbols[i];
             if (sym->kind == ISYM_VARIABLE && sym->type_name[0] &&
                 strcmp(sym->type_name, "var") != 0 && strcmp(sym->type_name, "void") != 0) {
-                /* 核心系统底层抽象与内存语义契约 */
                 int cur_line = 0;
                 const char *p = content;
                 const char *end = content + len;
@@ -3204,18 +3070,15 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 if (p < end && cur_line == sym->line) {
                     const char *le = p;
                     while (le < end && *le != '\n') le++;
-                    /* 核心系统底层抽象与内存语义契约 */
                     const char *var_pos = strstr(p, "var ");
                     if (var_pos && var_pos < le) {
-                        /* 底层系统交互与数据协议契约 */
                         const char *name_pos = strstr(var_pos + 4, sym->name);
                         if (name_pos && name_pos < le) {
-                            /* 核心系统底层抽象与内存语义契约 */
                             int col = (int)(name_pos - p) + (int)strlen(sym->name);
                             intel_inlay_hint_t *h = &hints[count++];
                             h->line = sym->line;
                             h->col = col;
-                            h->kind = 1; /* 核心系统底层抽象与内存语义契约 */
+                            h->kind = 1;
                             snprintf(h->label, sizeof(h->label), ": %s", sym->type_name);
                         }
                     }
@@ -3224,7 +3087,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
         }
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (is && count < max_hints) {
         const char *p = content;
         const char *end = content + len;
@@ -3253,7 +3115,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 continue;
             }
 
-            /* 底层系统交互与数据协议契约 */
             if (isalpha((unsigned char)*p) || *p == '_') {
                 const char *w_start = p;
                 while (p < end && (isalnum((unsigned char)*p) || *p == '_')) p++;
@@ -3269,7 +3130,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                 const char *peek = p;
                 while (peek < end && (*peek == ' ' || *peek == '\t')) peek++;
                 if (peek < end && *peek == '(') {
-                    /* 核心系统底层抽象与内存语义契约 */
                     if (strcmp(fn_name, "if") == 0 || strcmp(fn_name, "while") == 0 ||
                         strcmp(fn_name, "for") == 0 || strcmp(fn_name, "foreach") == 0 ||
                         strcmp(fn_name, "switch") == 0 || strcmp(fn_name, "catch") == 0) {
@@ -3277,7 +3137,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                         continue;
                     }
 
-                    /* 核心系统底层抽象与内存语义契约 */
                     isym_t *method_sym = NULL;
                     for (int s = 0; s < is->symbol_count; s++) {
                         if (is->symbols[s].kind == ISYM_METHOD &&
@@ -3289,7 +3148,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                     }
 
                     if (method_sym && method_sym->signature[0]) {
-                        /* 核心系统底层抽象与内存语义契约 */
                         const char *sig_paren = strchr(method_sym->signature, '(');
                         if (sig_paren) {
                             sig_paren++;
@@ -3299,7 +3157,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                             while (*sp && *sp != ')' && pcount < 8) {
                                 while (*sp == ' ' || *sp == '\t') sp++;
                                 if (!*sp || *sp == ')') break;
-                                /* 核心系统底层抽象与内存语义契约 */
                                 while (*sp && *sp != ' ' && *sp != ')' && *sp != ',') sp++;
                                 while (*sp == ' ' || *sp == '\t') sp++;
                                 const char *pn_s = sp;
@@ -3314,7 +3171,6 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                                 if (*sp == ',') sp++;
                             }
 
-                            /* 核心系统底层抽象与内存语义契约 */
                             const char *arg_p = peek + 1;
                             int arg_idx = 0;
                             int paren_lvl = 1;
@@ -3322,16 +3178,14 @@ int intel_collect_inlay_hints(intellisense_t *is, const char *content, size_t le
                                 while (arg_p < end && (*arg_p == ' ' || *arg_p == '\t')) arg_p++;
                                 if (arg_p >= end || *arg_p == ')') break;
 
-                                /* 底层系统交互与数据协议契约 */
                                 int arg_col = (int)(arg_p - line_start);
                                 intel_inlay_hint_t *h = &hints[count++];
                                 h->line = line_num;
                                 h->col = arg_col;
-                                h->kind = 2; /* 核心系统底层抽象与内存语义契约 */
+                                h->kind = 2;
                                 snprintf(h->label, sizeof(h->label), "%s:", pnames[arg_idx]);
                                 arg_idx++;
 
-                                /* 底层系统交互与数据协议契约 */
                                 while (arg_p < end && paren_lvl > 0) {
                                     if (*arg_p == '(') paren_lvl++;
                                     else if (*arg_p == ')') {

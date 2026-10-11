@@ -1,10 +1,8 @@
-/* 内部辅助实现 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
-#define _WIN32_WINNT 0x0601   /* 底层系统交互与数据协议契约 */
+#define _WIN32_WINNT 0x0601
 #endif
 
-/* 内部辅助逻辑 */
 #if (defined(__linux__) || defined(__unix__)) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
@@ -15,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../common/zan_abi.h"
-#include "rt_timer.h"          /* 核心系统底层抽象与内存语义契约 */
+#include "rt_timer.h"
 
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <sys/mman.h>
@@ -29,7 +27,6 @@
 #include <windows.h>
 #endif
 
-/* 底层系统交互与数据协议契约 */
 void *__real_malloc(size_t n);
 void  __real_free(void *p);
 void *__real_calloc(size_t n, size_t m);
@@ -38,7 +35,6 @@ void *__real_realloc(void *p, size_t n);
 #define ZAN_MEM_MAX_SMALL   2048u
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
 
-/* 内部辅助实现 */
 typedef struct {
     uint32_t magic;
     uint32_t cls;
@@ -50,10 +46,9 @@ _Static_assert(sizeof(zan_mem_hdr_t) == ZAN_OBJ_HDR_SIZE,
                "for the compiler's object header (zan_abi.h)");
 
 #define ZAN_MEM_MAGIC 0x5A414E4DU     /* "ZANM" */
-#define ZAN_MEM_FREED 0x5A414E46U     /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_MEM_FREED 0x5A414E46U
 #define ZAN_MEM_HDR   ((size_t)sizeof(zan_mem_hdr_t))
 
-/* 核心系统底层抽象与内存语义契约 */
 static const uint16_t k_class_size[] = {
       16,   32,   48,   64,   80,   96,  112,  128,
      160,  192,  224,  256,  320,  384,  448,  512,
@@ -61,50 +56,40 @@ static const uint16_t k_class_size[] = {
 };
 #define ZAN_MEM_NCLASS ((int)(sizeof(k_class_size) / sizeof(k_class_size[0])))
 
-/* 底层系统交互与数据协议契约 */
 static unsigned char g_size_class[ZAN_MEM_MAX_SMALL + 1];
 static int g_class_ready;
 
-/* 内部辅助实现 */
 #define ZAN_MEM_SET_SIZE  (1u << 14)
 #define ZAN_MEM_SET_MASK  (ZAN_MEM_SET_SIZE - 1u)
 static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 static size_t g_slab_count;
 
-/* 核心系统底层抽象与内存语义契约 */
 size_t zan_mem_slabs(void) {
     return __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
 }
 
-/* 内部辅助实现 */
-/* 内部辅助逻辑 */
 #define ZAN_MEM_REMOTE_STRIPES 8
 
 typedef struct zan_mem_cache {
     void  *free_list[ZAN_MEM_NCLASS];   /* owner-only */
     char  *bump;                        /* owner-only */
     char  *bump_end;                    /* owner-only */
-    /* 内部辅助实现 */
     struct {
         void *head;
-        char pad[64 - sizeof(void *)];  /* 核心系统底层抽象与内存语义契约 */
+        char pad[64 - sizeof(void *)];
     } remote[ZAN_MEM_REMOTE_STRIPES];
-    struct zan_mem_cache *next_free;    /* 底层系统交互与数据协议契约 */
+    struct zan_mem_cache *next_free;
 } zan_mem_cache;
 
-/* 核心系统底层抽象与内存语义契约 */
 static zan_mem_cache *g_cache_pool;
 
-/* 内部辅助逻辑 */
 static unsigned g_remote_rr;
 
-/* 内部辅助实现 */
 static void zan_mem_retire(zan_mem_cache *c);
 static void zan_mem_drain_remote(zan_mem_cache *c);
 
 #if defined(_WIN32)
 static DWORD g_fls = FLS_OUT_OF_INDEXES;
-/* 内部辅助逻辑 */
 static int g_fls_state;
 static void WINAPI zan_mem_fls_cb(void *p) {
     if (p) zan_mem_retire((zan_mem_cache *)p);
@@ -114,7 +99,6 @@ static void WINAPI zan_mem_fls_cb(void *p) {
 #include <sched.h>
 static __thread zan_mem_cache *t_cache;
 static pthread_key_t g_exit_key;
-/* 底层系统交互与数据协议契约 */
 static int g_exit_key_state;
 static void zan_mem_thread_exit(void *p) {
     t_cache = NULL;
@@ -124,7 +108,6 @@ static void zan_mem_thread_exit(void *p) {
 
 static volatile int g_slab_lock;
 
-/* 底层系统交互与数据协议契约 */
 static void zan_mem_backoff(int spins) {
     if (spins < 64) {
 #if defined(__i386__) || defined(__x86_64__)
@@ -157,7 +140,6 @@ static void zan_mem_build_classes(void) {
     __atomic_store_n(&g_class_ready, 1, __ATOMIC_RELEASE);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void zan_mem_ensure_classes(void) {
     if (__atomic_load_n(&g_class_ready, __ATOMIC_ACQUIRE)) return;
     zan_mem_lock();
@@ -170,7 +152,6 @@ static unsigned zan_mem_hash(uintptr_t base) {
     return (unsigned)(h >> 40) & ZAN_MEM_SET_MASK;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_mem_owns(const void *p) {
     uintptr_t base = (uintptr_t)p & ~(uintptr_t)(ZAN_MEM_SLAB - 1);
     unsigned i = zan_mem_hash(base);
@@ -180,7 +161,6 @@ static int zan_mem_owns(const void *p) {
         if (v == base) return 1;
         if (v == 0) return 0;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     for (unsigned n = 0; n < ZAN_MEM_SET_SIZE; n++) {
         uintptr_t v = __atomic_load_n(&g_slab_set[n], __ATOMIC_ACQUIRE);
         if (v == base) return 1;
@@ -188,7 +168,6 @@ static int zan_mem_owns(const void *p) {
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static zan_mem_cache *zan_mem_cache_get(void) {
 #if defined(_WIN32)
     int fst = __atomic_load_n(&g_fls_state, __ATOMIC_ACQUIRE);
@@ -196,13 +175,12 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                 __ATOMIC_ACQ_REL,
                                                 __ATOMIC_ACQUIRE)) {
         DWORD idx = FlsAlloc(zan_mem_fls_cb);
-        /* 内部辅助逻辑 */
         __atomic_store_n(&g_fls, idx, __ATOMIC_RELEASE);
         __atomic_store_n(&g_fls_state, idx == FLS_OUT_OF_INDEXES ? 3 : 2,
                          __ATOMIC_RELEASE);
         fst = idx == FLS_OUT_OF_INDEXES ? 3 : 2;
     }
-    if (fst != 2) return NULL;      /* 核心系统底层抽象与内存语义契约 */
+    if (fst != 2) return NULL;
     DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
     zan_mem_cache *c = (fls == FLS_OUT_OF_INDEXES)
                        ? NULL : (zan_mem_cache *)FlsGetValue(fls);
@@ -215,7 +193,6 @@ static zan_mem_cache *zan_mem_cache_get(void) {
                                                __ATOMIC_ACQ_REL,
                                                __ATOMIC_ACQUIRE)) {
         int ok = pthread_key_create(&g_exit_key, zan_mem_thread_exit) == 0;
-        /* 核心系统底层抽象与内存语义契约 */
         __atomic_store_n(&g_exit_key_state, ok ? 2 : 3, __ATOMIC_RELEASE);
         st = ok ? 2 : 3;
     } else {
@@ -225,7 +202,7 @@ static zan_mem_cache *zan_mem_cache_get(void) {
 #endif
         }
     }
-    if (st != 2) return NULL;       /* 核心系统底层抽象与内存语义契约 */
+    if (st != 2) return NULL;
 #endif
     zan_mem_lock();
     c = g_cache_pool;
@@ -249,7 +226,6 @@ static zan_mem_cache *zan_mem_cache_get(void) {
     return c;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void zan_mem_drain_remote(zan_mem_cache *c) {
     for (int s = 0; s < ZAN_MEM_REMOTE_STRIPES; s++) {
         void *p = __atomic_exchange_n(&c->remote[s].head, NULL, __ATOMIC_ACQUIRE);
@@ -266,7 +242,6 @@ static void zan_mem_drain_remote(zan_mem_cache *c) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_drain_remote(c);
     zan_mem_lock();
@@ -275,7 +250,6 @@ static void zan_mem_retire(zan_mem_cache *c) {
     zan_mem_unlock();
 }
 
-/* 内部辅助逻辑 */
 static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
     if (!g_cache_pool) return NULL;
     zan_mem_lock();
@@ -293,7 +267,6 @@ static void *zan_mem_harvest_free_block(zan_mem_cache *c, int cls) {
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     if (!g_cache_pool) return 0;
     zan_mem_lock();
@@ -311,13 +284,12 @@ static int zan_mem_adopt_retired_bump(zan_mem_cache *c, size_t need) {
     return 0;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     zan_mem_lock();
     unsigned i = zan_mem_hash(base);
     unsigned n = 0;
     while (n < 64 && g_slab_set[(i + n) & ZAN_MEM_SET_MASK] != 0) n++;
-    if (n == 64) {                       /* 底层系统交互与数据协议契约 */
+    if (n == 64) {
         zan_mem_unlock();
         return 0;
     }
@@ -331,10 +303,8 @@ static int zan_mem_publish_slab(zan_mem_cache *c, uintptr_t base) {
     return 1;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_mem_new_slab(zan_mem_cache *c) {
 #if defined(_WIN32)
-    /* 内部辅助实现 */
     size_t span = (size_t)ZAN_MEM_SLAB * 2;
     char *raw = (char *)VirtualAlloc(NULL, span, MEM_RESERVE, PAGE_NOACCESS);
     if (!raw) return 0;
@@ -379,20 +349,16 @@ static void *zan_mem_small(size_t n) {
     int cls = g_size_class[n];
     void *p = c->free_list[cls];
     if (!p) {
-        /* 内部辅助逻辑 */
         zan_mem_drain_remote(c);
         p = c->free_list[cls];
     }
     if (!p) {
-        /* 模块核心语义抽象与接口调用契约 */
         p = zan_mem_harvest_free_block(c, cls);
     }
     if (p) {
-        /* 底层系统交互与数据协议契约 */
         if (p == c->free_list[cls]) {
             c->free_list[cls] = *(void **)p;
         }
-        /* 内部辅助逻辑 */
         zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
         __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELAXED);
         __atomic_store_n(&h->owner, c, __ATOMIC_RELAXED);
@@ -422,19 +388,17 @@ void *__wrap_malloc(size_t n) {
     return __real_malloc(n);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_mem_hdr_check(const void *p, uint32_t *cls) {
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((const char *)p - ZAN_MEM_HDR);
-    /* 内部辅助实现 */
     uint32_t magic = __atomic_load_n(&h->magic, __ATOMIC_ACQUIRE);
     if (magic == ZAN_MEM_FREED) {
         char msg[64];
         snprintf(msg, sizeof msg, "double free of block %p", p);
         zan_rt_fatal("mem", msg);
     }
-    if (magic != ZAN_MEM_MAGIC) return -1;   /* 核心系统底层抽象与内存语义契约 */
+    if (magic != ZAN_MEM_MAGIC) return -1;
     uint32_t c = __atomic_load_n(&h->cls, __ATOMIC_ACQUIRE);
-    if (c >= (uint32_t)ZAN_MEM_NCLASS) {   /* 核心系统底层抽象与内存语义契约 */
+    if (c >= (uint32_t)ZAN_MEM_NCLASS) {
         char msg[80];
         snprintf(msg, sizeof msg, "corrupt block header at %p (class %u)",
                  p, (unsigned)c);
@@ -450,7 +414,6 @@ void __wrap_free(void *p) {
     uint32_t cls;
     if (zan_mem_hdr_check(p, &cls) != 0) return;
     zan_mem_hdr_t *h = (zan_mem_hdr_t *)((char *)p - ZAN_MEM_HDR);
-    /* 编译器代码生成与运行时系统底层调用契约 */
     uint32_t expect = ZAN_MEM_MAGIC;
     if (!__atomic_compare_exchange_n(&h->magic, &expect, ZAN_MEM_FREED, 0,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -459,11 +422,10 @@ void __wrap_free(void *p) {
             snprintf(msg, sizeof msg, "double free of block %p", p);
             zan_rt_fatal("mem", msg);
         }
-        return;   /* 底层系统交互与数据协议契约 */
+        return;
     }
     zan_mem_cache *owner = __atomic_load_n(&h->owner, __ATOMIC_RELAXED);
 #if defined(_WIN32)
-    /* 内部辅助逻辑 */
     DWORD fls = __atomic_load_n(&g_fls, __ATOMIC_ACQUIRE);
     zan_mem_cache *self = (fls == FLS_OUT_OF_INDEXES)
                           ? NULL : (zan_mem_cache *)FlsGetValue(fls);
@@ -475,8 +437,7 @@ void __wrap_free(void *p) {
         self->free_list[cls] = p;
         return;
     }
-    /* 模块核心语义抽象与接口调用契约 */
-    if (!owner) return;                  /* 核心系统底层抽象与内存语义契约 */
+    if (!owner) return;
     unsigned s;
     if (self)
         s = (unsigned)(((uintptr_t)self >> 4) & (ZAN_MEM_REMOTE_STRIPES - 1));
@@ -490,7 +451,6 @@ void __wrap_free(void *p) {
     } while (!__atomic_compare_exchange_n(slot, &head, p, 1,
                                           __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 
-    /* 内部辅助逻辑 */
     if (self && self != owner) {
         zan_mem_drain_remote(self);
     }
@@ -508,12 +468,10 @@ void *__wrap_calloc(size_t n, size_t m) {
 
 void *__wrap_realloc(void *p, size_t n) {
     if (!p) return __wrap_malloc(n);
-    /* 内部辅助实现 */
     if (n == 0) { __wrap_free(p); return NULL; }
     if (!zan_mem_owns(p)) return __real_realloc(p, n);
-    /* 内部辅助逻辑 */
     uint32_t cls;
-    if (zan_mem_hdr_check(p, &cls) != 0) return NULL;  /* 核心系统底层抽象与内存语义契约 */
+    if (zan_mem_hdr_check(p, &cls) != 0) return NULL;
     size_t old = k_class_size[cls];
     if (n <= old) return p;
     void *np = __wrap_malloc(n);

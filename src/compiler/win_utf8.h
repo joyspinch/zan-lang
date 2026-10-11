@@ -1,7 +1,6 @@
 #ifndef ZAN_COMPILER_WIN_UTF8_H
 #define ZAN_COMPILER_WIN_UTF8_H
 
-/* 底层系统交互与数据协议契约 */
 
 #ifdef _WIN32
 
@@ -150,7 +149,6 @@ static inline int zan_utf8_system(const char *command) {
     return rc;
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline char **zan_utf8_command_line_argv(int *out_argc) {
     typedef LPWSTR *(WINAPI *command_line_to_argv_w_fn)(LPCWSTR, int *);
     HMODULE shell32 = LoadLibraryW(L"shell32.dll");

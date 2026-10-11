@@ -4,14 +4,12 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
-/* 内部辅助逻辑 */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
 #if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE
 #endif
-/* 内部辅助逻辑 */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1
 #endif
@@ -24,7 +22,7 @@
 #include <string.h>
 #include <time.h>
 
-#include "rt_timer.h"           /* 核心系统底层抽象与内存语义契约 */
+#include "rt_timer.h"
 #include "../common/zan_abi.h"
 
 #ifdef _WIN32
@@ -48,12 +46,10 @@
 #endif
 
 #if defined(__ANDROID__) || (defined(__OHOS__) && !defined(ZAN_SYNC_NO_SHM_SHIM))
-/* 内部辅助实现 */
 static const char *zan_android_shm_dir(void) {
     const char *d = getenv("ZAN_SHM_DIR");
     return (d && d[0]) ? d : "/data/local/tmp";
 }
-/* 内部辅助实现 */
 static int zan_android_shm_path(const char *name, char *path, size_t cap) {
     if (name[0] == '/') name++;
     int n = snprintf(path, cap, "%s/%s", zan_android_shm_dir(), name);
@@ -85,11 +81,9 @@ static int zan_android_shm_unlink(const char *name) {
 #endif
 
 #define ZAN_TABLE_MAGIC UINT64_C(0x5a414e54424c3031)
-/* 内部辅助逻辑 */
 #define ZAN_TABLE_VERSION 5
 #define ZAN_TABLE_MAX_COLUMNS 64
 #define ZAN_TABLE_COLUMN_NAME 32
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_TABLE_MAX_KEY 1024
 #define ZAN_TABLE_MAX_STRING 1048576
 #define ZAN_TABLE_MAX_CAPACITY (UINT64_C(1) << 30)
@@ -128,7 +122,6 @@ typedef struct {
     uint32_t key_size;
     uint32_t row_stride;
     uint32_t column_count;
-    /* 内部辅助逻辑 */
     uint32_t struct_lock;
     zan_shared_column columns[ZAN_TABLE_MAX_COLUMNS];
 } zan_shared_header;
@@ -137,9 +130,8 @@ typedef struct {
     zan_shared_header *header;
     size_t mapped_size;
     char map_name[256];
-    /* 内部辅助逻辑 */
     int anonymous;
-    int attached;   /* 模块核心语义抽象与接口调用契约 */
+    int attached;
 #ifdef _WIN32
     HANDLE mapping;
 #else
@@ -149,7 +141,6 @@ typedef struct {
 #endif
 } zan_shared_table;
 
-/* 内部辅助逻辑 */
 #ifdef _WIN32
 static INIT_ONCE zan_shared_string_once = INIT_ONCE_STATIC_INIT;
 static DWORD zan_shared_string_slot = FLS_OUT_OF_INDEXES;
@@ -333,14 +324,12 @@ static void zan_make_names(const char *name, char map_name[256]) {
 }
 
 /* CAS 自旋锁保护共享内存结构 */
-/* 内部辅助实现 */
 #define ZAN_LOCK_HELD_BIT 0x80000000u
 #define ZAN_LOCK_PID_MASK 0x7FFFFFFFu
 
 static int zan_pid_alive(uint32_t pid) {
     if (!pid) return 0;
 #ifdef _WIN32
-    /* 内部辅助实现 */
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                            FALSE, (DWORD)pid);
     if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
@@ -371,7 +360,6 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             LONG hpid = held & (LONG)ZAN_LOCK_PID_MASK;
             if ((held & (LONG)ZAN_LOCK_HELD_BIT) && hpid &&
                 !zan_pid_alive((uint32_t)hpid)) {
-                /* 内部辅助实现 */
                 LONG now = InterlockedCompareExchange((volatile LONG *)word,
                                                       0, 0);
                 if (now == held && !zan_pid_alive((uint32_t)hpid)) {
@@ -401,7 +389,6 @@ static void zan_lock_word_acquire(volatile uint32_t *word) {
             uint32_t hpid = held & ZAN_LOCK_PID_MASK;
             if ((held & ZAN_LOCK_HELD_BIT) && hpid &&
                 !zan_pid_alive(hpid)) {
-                /* 模块核心语义抽象与接口调用契约 */
                 uint32_t now = __atomic_load_n(word, __ATOMIC_ACQUIRE);
                 if (now == held && !zan_pid_alive(hpid)) {
                     uint32_t expected = held;
@@ -635,7 +622,6 @@ static void zan_purge_expired_locked(
         if (*zan_row_expires_at(row) > now_ms) break;
         zan_row_lock(row);
         zan_expiry_remove(header, row);
-        /* 内部辅助实现 */
         memset(row + 8, 0, header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         header->count--;
@@ -645,10 +631,8 @@ static void zan_purge_expired_locked(
 }
 
 static void zan_purge_expired(zan_shared_header *header) {
-    /* 模块核心语义抽象与接口调用契约 */
     if (__atomic_load_n(&header->expiry_count, __ATOMIC_RELAXED) == 0)
         return;
-    /* 内部辅助逻辑 */
     static int64_t last_attempt_ms;
     int64_t now_ms = zan_wall_now_ms();
     int64_t last = __atomic_load_n(&last_attempt_ms, __ATOMIC_RELAXED);
@@ -656,7 +640,7 @@ static void zan_purge_expired(zan_shared_header *header) {
     __atomic_store_n(&last_attempt_ms, now_ms, __ATOMIC_RELAXED);
     uint64_t *heap = zan_expiry_heap(header);
     uint64_t top = __atomic_load_n(&heap[0], __ATOMIC_RELAXED);
-    if (top >= header->capacity) return; /* 底层系统交互与数据协议契约 */
+    if (top >= header->capacity) return;
     unsigned char *row = zan_row_at(header, top);
     if (*zan_row_expires_at(row) > now_ms) return;
     zan_struct_lock(header);
@@ -692,12 +676,10 @@ static unsigned char *zan_find_row(
         }
         if (!create) return NULL;
         if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
-        /* 内部辅助实现 */
         *zan_row_hash(row) = hash;
         memcpy(zan_row_key(row), key, key_len);
         if ((size_t)key_len < header->key_size)
             zan_row_key(row)[key_len] = '\0';
-        /* 内部辅助逻辑 */
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
         return row;
@@ -705,7 +687,6 @@ static unsigned char *zan_find_row(
 
     if (create && first_tombstone != UINT64_MAX) {
         unsigned char *row = zan_row_at(header, first_tombstone);
-        /* 底层系统交互与数据协议契约 */
         *zan_row_hash(row) = hash;
         memcpy(zan_row_key(row), key, key_len);
         if ((size_t)key_len < header->key_size)
@@ -722,18 +703,15 @@ static unsigned char *zan_row_for(
     zan_purge_expired(header);
     unsigned char *row = zan_find_row(header, key, 0);
     if (row || !create) return row;
-    /* 内部辅助逻辑 */
     zan_struct_lock(header);
     row = zan_find_row(header, key, 1);
     zan_struct_unlock(header);
     return row;
 }
 
-/* 内部辅助实现 */
 
 static unsigned char *zan_find_row_hash(
     zan_shared_header *header, uint64_t hash, int create) {
-    /* 底层系统交互与数据协议契约 */
     if (create && header->count >= header->capacity - header->capacity / 8)
         return NULL;
     if (!hash) hash = 1;
@@ -752,7 +730,6 @@ static unsigned char *zan_find_row_hash(
         }
         if (!create) return NULL;
         if (first_tombstone != UINT64_MAX) row = zan_row_at(header, first_tombstone);
-        /* 内部辅助逻辑 */
         *zan_row_hash(row) = hash;
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
@@ -760,7 +737,6 @@ static unsigned char *zan_find_row_hash(
     }
     if (create && first_tombstone != UINT64_MAX) {
         unsigned char *row = zan_row_at(header, first_tombstone);
-        /* 底层系统交互与数据协议契约 */
         *zan_row_hash(row) = hash;
         zan_publish_state(row, ZAN_SLOT_USED);
         header->count++;
@@ -799,7 +775,6 @@ static void zan_shared_table_free(zan_shared_table *table) {
 
 typedef void (*zan_thread_body_fn)(void);
 
-/* 模块核心语义抽象与接口调用契约 */
 static void *zan_delegate_record(void *d);
 static void zan_delegate_retain(void *d);
 static void zan_delegate_release(void *d);
@@ -815,14 +790,12 @@ static void zan_thread_invoke(void *body) {
     if (fn) fn(rec);
 }
 
-/* 内部辅助逻辑 */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) void __zan_eh_release(void) { }
 #else
 void __zan_eh_release(void) { }
 #endif
 
-/* 模块核心语义抽象与接口调用契约 */
 void zan_thread_detach(void) {
     __zan_eh_release();
 }
@@ -830,38 +803,36 @@ void zan_thread_detach(void) {
 #ifdef _WIN32
 static DWORD WINAPI zan_thread_trampoline(LPVOID arg) {
     zan_thread_invoke(arg);
-    zan_delegate_release(arg); /* 底层系统交互与数据协议契约 */
+    zan_delegate_release(arg);
     zan_thread_detach();
     return 0;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    /* 内部辅助逻辑 */
     zan_delegate_retain(body);
     HANDLE h = CreateThread(NULL, 0, zan_thread_trampoline, body, 0, NULL);
     if (!h) {
-        zan_delegate_release(body); /* 底层系统交互与数据协议契约 */
+        zan_delegate_release(body);
         return 0;
     }
-    CloseHandle(h); /* 底层系统交互与数据协议契约 */
+    CloseHandle(h);
     return 1;
 }
 #else
 static void *zan_thread_trampoline(void *arg) {
     zan_thread_invoke(arg);
-    zan_delegate_release(arg); /* 底层系统交互与数据协议契约 */
+    zan_delegate_release(arg);
     zan_thread_detach();
     return NULL;
 }
 
 int32_t zan_thread_start(void *body) {
     if (!body) return 0;
-    /* 内部辅助逻辑 */
     zan_delegate_retain(body);
     pthread_t t;
     if (pthread_create(&t, NULL, zan_thread_trampoline, body) != 0) {
-        zan_delegate_release(body); /* 底层系统交互与数据协议契约 */
+        zan_delegate_release(body);
         return 0;
     }
     pthread_detach(t);
@@ -870,7 +841,6 @@ int32_t zan_thread_start(void *body) {
 #endif
 
 #if defined(__linux__)
-/* 内部辅助实现 */
 #if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
 #if __GLIBC_PREREQ(2, 30)
 #define zan_tid() gettid()
@@ -892,24 +862,20 @@ int64_t zan_thread_current_id(void) {
 #elif defined(__linux__)
     return (int64_t)zan_tid();
 #elif defined(__APPLE__)
-    /* 内部辅助逻辑 */
     uint64_t tid = 0;
     if (pthread_threadid_np(NULL, &tid) != 0) return 0;
     return (int64_t)tid;
 #else
-    /* 模块核心语义抽象与接口调用契约 */
     uintptr_t self = (uintptr_t)pthread_self();
     return (int64_t)((self >> 16) ^ (self & 0xffffffffu));
 #endif
 }
 
-/* 内部辅助逻辑 */
 
 #define ZAN_MONITOR_STRIPES 64
 
 static unsigned zan_monitor_stripe(void *obj) {
     uintptr_t bits = (uintptr_t)obj;
-    /* 内部辅助逻辑 */
     bits ^= bits >> 20;
     bits ^= bits >> 8;
     return (unsigned)((bits >> 4) & (ZAN_MONITOR_STRIPES - 1));
@@ -953,8 +919,6 @@ void zan_monitor_exit(void *obj) {
 
 /* UI 主线程安全分发任务队列 */
 
-/* 内部辅助逻辑 */
-/* 内部辅助逻辑 */
 #define ZAN_DISPATCH_CAP0 64
 #define ZAN_DISPATCH_CAP_MAX (1u << 20)
 static void *g_dispatch_static[ZAN_DISPATCH_CAP0];
@@ -964,7 +928,6 @@ static int g_dispatch_head = 0;
 static int g_dispatch_tail = 0;
 
 #ifdef _WIN32
-/* 内部辅助实现 */
 static CRITICAL_SECTION g_dispatch_cs;
 static INIT_ONCE g_dispatch_once = INIT_ONCE_STATIC_INIT;
 
@@ -997,7 +960,7 @@ void zan_ui_thread_set(void) {
 }
 
 int32_t zan_ui_thread_check(void) {
-    if (!g_ui_thread_id) return 1; /* 核心系统底层抽象与内存语义契约 */
+    if (!g_ui_thread_id) return 1;
 #ifdef _WIN32
     return (uintptr_t)GetCurrentThreadId() == g_ui_thread_id ? 1 : 0;
 #else
@@ -1013,7 +976,6 @@ void zan_ui_thread_assert(const char *msg) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 void zan_dispatch_init(void) {
     zan_ui_thread_set();
     zan_dispatch_lock();
@@ -1022,14 +984,12 @@ void zan_dispatch_init(void) {
     zan_dispatch_unlock();
 }
 
-/* 内部辅助逻辑 */
 static void *zan_delegate_record(void *d) {
     uintptr_t v = (uintptr_t)d;
     if (!(v & (uintptr_t)ZAN_CLOSURE_TAG)) return NULL;
     return (void *)(v & ~(uintptr_t)ZAN_CLOSURE_TAG);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void zan_delegate_retain(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
@@ -1041,7 +1001,6 @@ static void zan_delegate_retain(void *d) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void zan_delegate_release(void *d) {
     void *rec = zan_delegate_record(d);
     if (!rec) return;
@@ -1049,7 +1008,6 @@ static void zan_delegate_release(void *d) {
     if (dtor) ((void (*)(void *))dtor)(rec);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_dispatch_grow(void) {
     if ((unsigned)g_dispatch_cap >= ZAN_DISPATCH_CAP_MAX) return 0;
     int ncap = g_dispatch_cap * 2;
@@ -1083,7 +1041,6 @@ int32_t zan_dispatch_post(void *fn) {
     }
     zan_dispatch_unlock();
     if (!ok) {
-        /* 内部辅助逻辑 */
         static int reported;
         if (!reported) {
             reported = 1;
@@ -1094,7 +1051,6 @@ int32_t zan_dispatch_post(void *fn) {
     return ok;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 void *zan_dispatch_take(void) {
     void *fn = NULL;
     zan_dispatch_lock();
@@ -1106,9 +1062,7 @@ void *zan_dispatch_take(void) {
     return fn;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 void zan_dispatch_clear(void) {
-    /* 内部辅助实现 */
     for (;;) {
         void *drop[64];
         int n = 0;
@@ -1198,7 +1152,6 @@ int64_t zan_atomic_int_add(int64_t handle, int64_t delta) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 typedef struct {
     uint64_t capacity;
     uint32_t key_size;
@@ -1239,12 +1192,11 @@ static int zan_table_layout_of(
     return 1;
 }
 
-/* 内部辅助逻辑 */
 static int zan_header_geometry_ok(const zan_shared_header *header) {
     if (header->capacity == 0 ||
         header->capacity > ZAN_TABLE_MAX_CAPACITY ||
         (header->capacity & (header->capacity - 1)) != 0)
-        return 0;   /* 底层系统交互与数据协议契约 */
+        return 0;
     if (header->key_size == 0 || header->key_size > ZAN_TABLE_MAX_KEY)
         return 0;
     if (header->column_count > ZAN_TABLE_MAX_COLUMNS)
@@ -1261,7 +1213,6 @@ static int zan_header_geometry_ok(const zan_shared_header *header) {
         if (c->size == 0 ||
             (uint64_t)c->offset + c->size > header->row_stride)
             return 0;
-        /* 底层系统交互与数据协议契约 */
         if (!memchr(c->name, '\0', sizeof(c->name)))
             return 0;
     }
@@ -1276,7 +1227,6 @@ static int zan_header_geometry_ok(const zan_shared_header *header) {
 static void zan_table_init_header(
     zan_shared_table *table, const zan_table_layout *layout) {
     table->mapped_size = layout->total_size;
-    /* 核心系统底层抽象与内存语义契约 */
     memset(table->header, 0, sizeof(zan_shared_header));
     table->header->magic = ZAN_TABLE_MAGIC;
     table->header->version = ZAN_TABLE_VERSION;
@@ -1309,7 +1259,6 @@ static zan_shared_table *zan_table_alloc(void) {
     return table;
 }
 
-/* 内部辅助实现 */
 int64_t zan_shared_table_create_anon(
     int32_t capacity_value, int32_t key_size_value, const char *schema) {
     zan_table_layout layout;
@@ -1322,7 +1271,6 @@ int64_t zan_shared_table_create_anon(
     table->anonymous = 1;
 
 #ifdef _WIN32
-    /* 内部辅助逻辑 */
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof(sa));
     sa.nLength = sizeof(sa);
@@ -1343,10 +1291,8 @@ int64_t zan_shared_table_create_anon(
         return 0;
     }
 #else
-    /* 内部辅助实现 */
     static uint32_t anon_seq = 0;
     char shm_name[64];
-    /* 内部辅助逻辑 */
     uint32_t seq = __atomic_fetch_add(&anon_seq, 1, __ATOMIC_RELAXED);
     snprintf(shm_name, sizeof(shm_name), "/zan_table_%ld_%u_%u",
              (long)getpid(), (unsigned)time(NULL), seq);
@@ -1356,7 +1302,6 @@ int64_t zan_shared_table_create_anon(
         return 0;
     }
     shm_unlink(shm_name);
-    /* 内部辅助逻辑 */
     if (fcntl(fd, F_SETFD, 0) != 0) {
         close(fd);
         zan_shared_table_free(table);
@@ -1380,7 +1325,6 @@ int64_t zan_shared_table_create_anon(
     return (int64_t)(intptr_t)table;
 }
 
-/* 内部辅助逻辑 */
 int64_t zan_shared_table_handle(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !table->anonymous) return 0;
@@ -1391,7 +1335,6 @@ int64_t zan_shared_table_handle(int64_t handle) {
 #endif
 }
 
-/* 内部实现与并发/内存约束规范 */
 int64_t zan_shared_table_attach(int64_t os_handle) {
     if (os_handle <= 0) return 0;
     zan_shared_table *table = zan_table_alloc();
@@ -1407,7 +1350,6 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         zan_shared_table_free(table);
         return 0;
     }
-    /* 内部辅助实现 */
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(table->header, &mbi, sizeof(mbi)) ||
@@ -1425,7 +1367,6 @@ int64_t zan_shared_table_attach(int64_t os_handle) {
         return 0;
     }
     table->mapped_size = (size_t)stat_buf.st_size;
-    /* 内部辅助实现 */
     table->header = (zan_shared_header *)mmap(
         NULL, table->mapped_size, PROT_READ | PROT_WRITE, MAP_SHARED,
         table->fd, 0);
@@ -1536,7 +1477,6 @@ int64_t zan_shared_table_open(const char *name) {
         zan_shared_table_free(table);
         return 0;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery(table->header, &mbi, sizeof(mbi)) ||
@@ -1583,7 +1523,6 @@ int64_t zan_shared_table_open(const char *name) {
         return 0;
     }
 #ifndef _WIN32
-    /* 内部辅助实现 */
     if (table->header->total_size != table->mapped_size) {
         zan_shared_table_free(table);
         return 0;
@@ -1601,7 +1540,6 @@ int32_t zan_shared_table_destroy(int64_t handle) {
     if (!table) return 0;
     int32_t result = 1;
 #ifndef _WIN32
-    /* 内部辅助逻辑 */
     if (!table->anonymous) {
         if (unlink(table->map_name) != 0 && errno != ENOENT) result = 0;
     }
@@ -1619,7 +1557,6 @@ typedef struct {
 typedef BOOL(WINAPI *zan_query_ws_ex_fn)(HANDLE, zan_ws_ex_info *, DWORD);
 #endif
 
-/* 模块核心语义抽象与接口调用契约 */
 static int64_t zan_table_resident_bytes(const zan_shared_table *table) {
     if (!table->header || !table->mapped_size) return 0;
 #ifdef _WIN32
@@ -1669,7 +1606,7 @@ static int64_t zan_table_resident_bytes(const zan_shared_table *table) {
 #else
     long page_conf = sysconf(_SC_PAGESIZE);
     size_t page_size = page_conf > 0 ? (size_t)page_conf : 4096u;
-    enum { ZAN_MINCORE_BATCH = 16384 };  /* 核心系统底层抽象与内存语义契约 */
+    enum { ZAN_MINCORE_BATCH = 16384 };
     unsigned char *vec = (unsigned char *)malloc(ZAN_MINCORE_BATCH);
     if (!vec) return -1;
     unsigned char *base = (unsigned char *)table->header;
@@ -1823,7 +1760,6 @@ int32_t zan_shared_table_set_string(
         return 0;
     }
     char *destination = (char *)(row + column->offset);
-    /* 内部辅助实现 */
     memcpy(destination, value, value_len);
     destination[value_len] = '\0';
     zan_row_unlock(row);
@@ -1875,14 +1811,12 @@ int64_t zan_shared_table_increment(
     return value;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_monotonic_us(void) {
 #ifdef _WIN32
     static LARGE_INTEGER frequency;
     if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    /* 模块核心语义抽象与接口调用契约 */
     return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000
         + ((now.QuadPart % frequency.QuadPart) * 1000000) / frequency.QuadPart);
 #else
@@ -1892,14 +1826,12 @@ int64_t zan_monotonic_us(void) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int64_t zan_monotonic_ns(void) {
 #ifdef _WIN32
     static LARGE_INTEGER frequency;
     if (!frequency.QuadPart) QueryPerformanceFrequency(&frequency);
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    /* 模块核心语义抽象与接口调用契约 */
     return (int64_t)((now.QuadPart / frequency.QuadPart) * 1000000000
         + ((now.QuadPart % frequency.QuadPart) * 1000000000) / frequency.QuadPart);
 #else
@@ -1937,7 +1869,6 @@ int64_t zan_monotonic_frequency(void) {
     return zan_stopwatch_frequency();
 }
 
-/* 底层系统交互与数据协议契约 */
 
 int64_t zan_shared_table_hash(const char *value) {
     return (int64_t)zan_hash_bytes(value);
@@ -2004,7 +1935,6 @@ int64_t zan_shared_table_increment_at(
     return value;
 }
 
-/* 内部辅助逻辑 */
 int64_t zan_shared_table_extreme_at(
     int64_t handle, int64_t key_hash, const char *column_name, int64_t value,
     int64_t keep_larger) {
@@ -2050,7 +1980,6 @@ int32_t zan_shared_table_set_string_at(
         return 0;
     }
     char *destination = (char *)(row + column->offset);
-    /* 内部辅助实现 */
     memcpy(destination, value, value_len);
     destination[value_len] = '\0';
     zan_row_unlock(row);
@@ -2080,7 +2009,6 @@ const char *zan_shared_table_get_string_at(
     return result;
 }
 
-/* 内部辅助逻辑 */
 int32_t zan_shared_table_match_at(
     int64_t handle, int64_t key_hash, const char *column_name,
     const char *text) {
@@ -2111,14 +2039,12 @@ int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row_hash(
         table->header, (uint64_t)key_hash, 0);
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        /* 模块核心语义抽象与接口调用契约 */
         memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -2141,7 +2067,6 @@ int32_t zan_shared_table_expire_at(
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table || !key || expires_at_ms < 0) return 0;
     zan_struct_lock(table->header);
-    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(),
                              ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
@@ -2198,9 +2123,7 @@ int32_t zan_shared_table_rate_allow(
 
     int allowed = 0;
     zan_struct_lock(table->header);
-    /* 内部辅助实现 */
     zan_purge_expired_locked(table->header, now_ms, ZAN_PURGE_MAX_BATCH);
-    /* 内部辅助实现 */
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (!row) row = zan_find_row(table->header, key, 1);
     if (row) {
@@ -2269,7 +2192,6 @@ int32_t zan_shared_table_lock_release(
 
     int released = 0;
     zan_struct_lock(table->header);
-    /* 内部辅助逻辑 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
@@ -2278,7 +2200,6 @@ int32_t zan_shared_table_lock_release(
         memcpy(&current_owner, row + owner_column->offset, sizeof(current_owner));
         if (current_owner == owner) {
             zan_expiry_remove(table->header, row);
-            /* 模块核心语义抽象与接口调用契约 */
             memset(row + 8, 0, table->header->row_stride - 8);
             zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
             table->header->count--;
@@ -2294,13 +2215,11 @@ int32_t zan_shared_table_delete(int64_t handle, const char *key) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return 0;
     zan_struct_lock(table->header);
-    /* 内部辅助逻辑 */
     zan_purge_expired_locked(table->header, zan_wall_now_ms(), ZAN_PURGE_MAX_BATCH);
     unsigned char *row = zan_find_row(table->header, key, 0);
     if (row) {
         zan_row_lock(row);
         zan_expiry_remove(table->header, row);
-        /* 模块核心语义抽象与接口调用契约 */
         memset(row + 8, 0, table->header->row_stride - 8);
         zan_publish_state(row, ZAN_SLOT_TOMBSTONE);
         table->header->count--;
@@ -2327,22 +2246,19 @@ int64_t zan_shared_table_count(int64_t handle) {
 void zan_shared_table_clear(int64_t handle) {
     zan_shared_table *table = (zan_shared_table *)(intptr_t)handle;
     if (!table) return;
-    /* 模块核心语义抽象与接口调用契约 */
     zan_struct_lock(table->header);
     for (uint64_t i = 0; i < table->header->capacity; i++) {
         unsigned char *row = zan_row_at(table->header, i);
         uint32_t state = zan_load_state(row);
-        if (state == ZAN_SLOT_EMPTY) continue;   /* 核心系统底层抽象与内存语义契约 */
+        if (state == ZAN_SLOT_EMPTY) continue;
         zan_row_lock(row);
         if (zan_load_state(row) != ZAN_SLOT_EMPTY) {
-            /* 内部辅助逻辑 */
             if (zan_load_state(row) == ZAN_SLOT_USED)
                 memset(row + 8, 0, table->header->row_stride - 8);
             zan_publish_state(row, ZAN_SLOT_EMPTY);
         }
         zan_row_unlock(row);
     }
-    /* 内部辅助逻辑 */
     memset(zan_expiry_heap(table->header), 0,
            (size_t)table->header->capacity * sizeof(uint64_t));
     table->header->count = 0;
@@ -2350,9 +2266,7 @@ void zan_shared_table_clear(int64_t handle) {
     zan_struct_unlock(table->header);
 }
 
-/* 底层系统交互与数据协议契约 */
 
-/* 内部辅助逻辑 */
 long long zan_exe_dir_into(char *out, long long cap) {
     if (!out || cap <= 0) return 0;
     out[0] = '\0';
@@ -2360,7 +2274,7 @@ long long zan_exe_dir_into(char *out, long long cap) {
     char buf[1024];
     DWORD n = GetModuleFileNameA(NULL, buf, sizeof(buf));
     while (n > 0 && buf[n - 1] != '\\') n--;
-    if (n > 0) n--; /* 核心系统底层抽象与内存语义契约 */
+    if (n > 0) n--;
     if ((long long)n >= cap) n = (DWORD)(cap - 1);
     memcpy(out, buf, n);
     out[n] = '\0';
@@ -2378,7 +2292,6 @@ long long zan_exe_dir_into(char *out, long long cap) {
 #endif
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
     if (!out || cap <= 0) return 0;
     out[0] = '\0';
@@ -2415,7 +2328,6 @@ long long zan_dir_list_into(const char *pattern, char *out, long long cap) {
     return len;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
 typedef struct {
     HANDLE h;
@@ -2423,8 +2335,8 @@ typedef struct {
 #else
 typedef struct {
     int fd;
-    int owner;         /* 内部辅助逻辑 */
-    char name[256];    /* 模块核心语义抽象与接口调用契约 */
+    int owner;
+    char name[256];
 } zan_mmap_handle;
 #endif
 
@@ -2435,7 +2347,7 @@ long long zan_mmap_create(const char *name, long long size) {
     DWORD hi = (DWORD)(((unsigned long long)size) >> 32);
     DWORD lo = (DWORD)((unsigned long long)size & 0xFFFFFFFFULL);
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* 内部辅助逻辑 */
+    if (wlen <= 0) return 0;
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2474,7 +2386,7 @@ long long zan_mmap_open(const char *name, long long size) {
 #ifdef _WIN32
     (void)size;
     int wlen = MultiByteToWideChar(CP_UTF8, 0, name, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* 底层系统交互与数据协议契约 */
+    if (wlen <= 0) return 0;
     wchar_t *wname = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wname) return 0;
     MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, wlen);
@@ -2507,7 +2419,7 @@ long long zan_mmap_from_file(const char *path, long long size) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-    if (wlen <= 0) return 0;   /* 底层系统交互与数据协议契约 */
+    if (wlen <= 0) return 0;
     wchar_t *wpath = (wchar_t *)calloc((size_t)wlen, sizeof(wchar_t));
     if (!wpath) return 0;
     MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen);
@@ -2536,7 +2448,6 @@ long long zan_mmap_from_file(const char *path, long long size) {
 #endif
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 long long zan_mmap_map(long long handle, long long size) {
     if (!handle || size <= 0) return 0;
 #ifdef _WIN32
@@ -2552,7 +2463,6 @@ long long zan_mmap_map(long long handle, long long size) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_mmap_unmap(long long ptr, long long size) {
     if (!ptr) return 0;
 #ifdef _WIN32
@@ -2563,7 +2473,6 @@ long long zan_mmap_unmap(long long ptr, long long size) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_mmap_flush(long long ptr, long long size) {
     if (!ptr) return 1;
 #ifdef _WIN32
@@ -2573,7 +2482,6 @@ long long zan_mmap_flush(long long ptr, long long size) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 long long zan_mmap_close(long long handle) {
     if (!handle) return 0;
 #ifdef _WIN32
@@ -2588,7 +2496,6 @@ long long zan_mmap_close(long long handle) {
 #endif
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 long long zan_mmap_unlink(const char *name) {
     if (!name || !name[0]) return 0;
 #ifdef _WIN32
@@ -2601,7 +2508,6 @@ long long zan_mmap_unlink(const char *name) {
 #endif
 }
 
-/* 内部辅助实现 */
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -2618,7 +2524,6 @@ long long zan_mmap_unlink(const char *name) {
 #endif
 #endif
 
-/* 内部辅助逻辑 */
 #ifndef _WIN32
 #define ZAN_PLAT_TEXT_MAX 65536
 static pthread_key_t zan_plat_text_key;
@@ -2673,7 +2578,6 @@ static void zan_plat_mac_from_sockaddr(struct sockaddr *sa, char *out,
 }
 #endif
 
-/* 内部辅助逻辑 */
 const char *zan_plat_net_interfaces(void) {
 #ifdef _WIN32
     return "";
@@ -2686,7 +2590,6 @@ const char *zan_plat_net_interfaces(void) {
     size_t used = 0;
     for (struct ifaddrs *it = list; it; it = it->ifa_next) {
         if (!it->ifa_name) continue;
-        /* 模块核心语义抽象与接口调用契约 */
         int seen = 0;
         for (struct ifaddrs *p = list; p != it; p = p->ifa_next) {
             if (p->ifa_name && strcmp(p->ifa_name, it->ifa_name) == 0) {
@@ -2755,7 +2658,6 @@ static long long zan_plat_now_us(void) {
 }
 #endif
 
-/* 内部辅助逻辑 */
 int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
 #ifdef _WIN32
     (void)address;
@@ -2774,7 +2676,6 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
     if (fd < 0) fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if (fd < 0) return -3;
 
-    /* 模块核心语义抽象与接口调用契约 */
     unsigned char packet[16];
     memset(packet, 0, sizeof packet);
     packet[0] = 8;                                  /* ICMP_ECHO */
@@ -2829,7 +2730,6 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
             close(fd);
             return -3;
         }
-        /* 模块核心语义抽象与接口调用契约 */
         size_t offset = 0;
         if (!datagram) {
             if (got < 20) continue;
@@ -2845,15 +2745,14 @@ int32_t zan_plat_icmp_ping(const char *address, int32_t timeout_ms) {
             long long rtt_ms = rtt_us / 1000;
             return (int32_t)(rtt_ms > 0x7FFFFFFF ? 0x7FFFFFFF : rtt_ms);
         }
-        if (type == 3) {                            /* 核心系统底层抽象与内存语义契约 */
+        if (type == 3) {
             close(fd);
             return -2;
         }
-        if (type == 11) {                           /* 核心系统底层抽象与内存语义契约 */
+        if (type == 11) {
             close(fd);
             return -2;
         }
-        /* 核心系统底层抽象与内存语义契约 */
     }
 #endif
 }
@@ -2957,7 +2856,6 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
     CloseHandle(pi.hThread);
     return (int32_t)code;
 #else
-    /* 内部辅助逻辑 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) return -1;
     argv[0] = (char *)exe;
@@ -2972,7 +2870,6 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
         return -1;
     }
     if (pid == 0) {
-        /* 内部实现与并发/内存约束规范 */
         execvp(exe, argv);
         _exit(127);
     }
@@ -2989,7 +2886,6 @@ int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc) {
 
 #ifndef _WIN32
 #if !defined(__linux__)
-/* 模块核心语义抽象与接口调用契约 */
 static pthread_mutex_t g_proc_pipe_guard = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t g_proc_pipe_once = PTHREAD_ONCE_INIT;
 static int g_proc_pipe_guard_error;
@@ -3016,7 +2912,6 @@ static int zan_proc_launch_pipe(int fds[2]) {
     if (fcntl(fds[0], F_SETFD, FD_CLOEXEC) < 0 ||
         fcntl(fds[1], F_SETFD, FD_CLOEXEC) < 0) goto failed;
 #endif
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < 2; i++) {
         if (fds[i] >= 3) continue;
         int moved = fcntl(fds[i], F_DUPFD_CLOEXEC, 3);
@@ -3066,7 +2961,6 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     CloseHandle(pi.hThread);
     return 0;
 #else
-    /* 模块核心语义抽象与接口调用契约 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) return -1;
     argv[0] = (char *)exe;
@@ -3075,7 +2969,6 @@ int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t
     }
     argv[argc + 1] = NULL;
 
-    /* 内部辅助逻辑 */
     int launch_pipe[2];
     if (zan_proc_launch_pipe(launch_pipe) < 0) { free(argv); return -1; }
     pid_t pid = fork();
@@ -3176,7 +3069,6 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     }
     wcmd[0] = L'"';
     MultiByteToWideChar(CP_UTF8, 0, exe, -1, wcmd + 1, wexe_len);
-    /* 模块核心语义抽象与接口调用契约 */
     wcmd[wexe_len] = L'"';
     wcmd[wexe_len + 1] = L'\0';
 
@@ -3192,12 +3084,10 @@ int32_t zan_proc_start_program_safe(const char *exe, const char *log_path) {
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
-        /* 内部辅助逻辑 */
         if (setsid() < 0) _exit(127);
         pid_t gc = fork();
         if (gc < 0) _exit(127);
         if (gc == 0) {
-            /* 核心系统底层抽象与内存语义契约 */
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
@@ -3283,7 +3173,7 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     free(wcmd);
-    CloseHandle(hWrite); /* 底层系统交互与数据协议契约 */
+    CloseHandle(hWrite);
 
     if (!ok) {
         CloseHandle(hRead);
@@ -3329,7 +3219,6 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
-    /* 模块核心语义抽象与接口调用契约 */
     char **argv = (char **)malloc(((size_t)argc + 2) * sizeof(char *));
     if (!argv) {
         close(pipefd[0]);

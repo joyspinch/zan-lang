@@ -1,4 +1,3 @@
-/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_WEAK_BUCKET_COUNT 8192
 
@@ -79,7 +78,6 @@ static void emit_weak_unlock(zan_irgen_t *g) {
         LLVMAtomicOrderingRelease, 0);
 }
 
-/* 底层系统交互与数据协议契约 */
 static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
                                         LLVMValueRef calloc_fn) {
     LLVMBuilderRef b = g->builder;
@@ -105,7 +103,6 @@ static LLVMValueRef weak_buckets_ensure(zan_irgen_t *g, LLVMValueRef fn,
         calloc_fn, args, 2, "weak.buckets.calloc");
     zan_irgen_emit_oom_check(g, fn, mem);
     LLVMBuildStore(b, mem, g->weak_buckets);
-    /* 内部辅助逻辑 */
     LLVMBasicBlockRef tail_bb = LLVMGetInsertBlock(b);
     LLVMBuildBr(b, join_bb);
 
@@ -237,7 +234,6 @@ static void emit_weak_store_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildRetVoid(b);
 }
 
-/* 内部辅助逻辑 */
 static void emit_weak_nil_scan(zan_irgen_t *g, LLVMValueRef fn,
                                LLVMValueRef weak_calloc, LLVMValueRef obj,
                                LLVMBasicBlockRef done_bb) {
@@ -351,7 +347,6 @@ static void emit_weak_nil_all_body(zan_irgen_t *g, LLVMValueRef weak_calloc) {
     LLVMBuildRetVoid(b);
 }
 
-/* 内部辅助逻辑 */
 static void emit_weak_destroy_begin_body(zan_irgen_t *g,
                                          LLVMValueRef weak_calloc) {
     LLVMBuilderRef b = g->builder;
@@ -379,7 +374,6 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
         &neg16, 1, "weak.begin.rcp");
     LLVMValueRef rcip = LLVMBuildBitCast(b, rcp, LLVMPointerType(i64, 0),
         "weak.begin.rcip");
-    /* 内部辅助逻辑 */
     LLVMValueRef rc = LLVMBuildAtomicRMW(b, LLVMAtomicRMWBinOpAdd, rcip,
         LLVMConstInt(i64, 0, 0), LLVMAtomicOrderingMonotonic, 0);
     LLVMValueRef ok = LLVMBuildICmp(b, LLVMIntEQ, rc,
@@ -388,7 +382,6 @@ static void emit_weak_destroy_begin_body(zan_irgen_t *g,
     LLVMBuildRet(b, ok);
 }
 
-/* 内部辅助逻辑 */
 static void emit_weak_load_retain_body(zan_irgen_t *g) {
     LLVMBuilderRef b = g->builder;
     LLVMTypeRef i8ptr = weak_i8ptr(g);
@@ -417,7 +410,6 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
 
-    /* 内部辅助逻辑 */
     g->weak_buckets = LLVMAddGlobal(g->mod, i8ptr, "zan_weak_buckets");
     LLVMSetInitializer(g->weak_buckets, LLVMConstNull(i8ptr));
     LLVMSetLinkage(g->weak_buckets, LLVMInternalLinkage);
@@ -430,7 +422,6 @@ static void emit_weak_runtime(zan_irgen_t *g) {
     LLVMSetAlignment(g->weak_count, 8);
     (void)weak_node_type(g);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef calloc_args[] = { i64, i64 };
     LLVMTypeRef calloc_type = LLVMFunctionType(i8ptr, calloc_args, 2, 0);
     LLVMValueRef weak_calloc = LLVMAddFunction(g->mod, "calloc", calloc_type);
@@ -488,7 +479,6 @@ static void emit_weak_store(zan_irgen_t *g, LLVMValueRef field_ptr,
               g->rt_weak_store, args, 2, "");
 }
 
-/* 内部辅助逻辑 */
 static LLVMValueRef emit_weak_field_load(zan_irgen_t *g, LLVMValueRef field_ptr,
                                          LLVMTypeRef val_ty) {
     LLVMTypeRef i8ptr = weak_i8ptr(g);

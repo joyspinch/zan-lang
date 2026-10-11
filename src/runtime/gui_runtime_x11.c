@@ -1,13 +1,10 @@
 /* gui_runtime_x11 */
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 核心系统底层抽象与内存语义契约 */
 #if defined(__linux__)
 
 static Display *g_display = NULL;
 static Window g_x11_window = 0;
-/* 内部辅助逻辑 */
 static int g_wake_pipe[2] = { -1, -1 };
 static int g_pending_event_linux[8];
 static int g_win_w = 0, g_win_h = 0;
@@ -17,14 +14,12 @@ static Cursor g_cursors_linux[8];
 static XIM g_xim = NULL;
 static XIC g_xic = NULL;
 
-/* 内部辅助逻辑 */
 static int g_scale_linux = 100;
 static int g_titlebar_h_l = 32;
 static int g_btn_w_l = 46;
 static int g_caption_btn_count_l = 5;
 static int g_metrics_ready_linux = 0;
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #define ZAN_MAX_WINDOWS 256
 typedef struct {
     Window xid;
@@ -37,7 +32,6 @@ typedef struct {
 static zan_lwin_t g_lwins[ZAN_MAX_WINDOWS];
 static int g_lwin_count = 0;
 static Window g_primary_win = 0;
-/* 编译器代码生成与运行时系统底层调用契约 */
 static Window g_evwin_linux = 0;
 
 static zan_lwin_t *lwin_find(Window xid) {
@@ -58,17 +52,15 @@ static void x11_set_scale_metrics(int scale) {
     g_metrics_ready_linux = 1;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_EVQ_CAP 64
 static int g_evq_linux[ZAN_EVQ_CAP][8];
 static int g_evq_head_linux = 0, g_evq_tail_linux = 0;
 
-/* 内部辅助逻辑 */
 static long long g_ev_seq_linux = 0;
 
 static void evq_push_linux(int kind, int x, int y, int button, int keycode, int mods) {
     int next = (g_evq_tail_linux + 1) % ZAN_EVQ_CAP;
-    if (next == g_evq_head_linux) return; /* 核心系统底层抽象与内存语义契约 */
+    if (next == g_evq_head_linux) return;
     int *e = g_evq_linux[g_evq_tail_linux];
     e[0] = kind; e[1] = x; e[2] = y; e[3] = button;
     e[4] = keycode; e[5] = mods; e[6] = (int)g_evwin_linux; e[7] = 0;
@@ -84,7 +76,6 @@ static int evq_pop_linux(void) {
     return 1;
 }
 
-/* 底层系统交互与数据协议契约 */
 static unsigned x11_utf8_next(const char **p) {
     const unsigned char *s = (const unsigned char *)*p;
     unsigned cp = *s;
@@ -96,7 +87,6 @@ static unsigned x11_utf8_next(const char **p) {
     return cp;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int x11_mods(unsigned int state) {
     int m = 0;
     if (state & ControlMask) m |= 1;
@@ -105,7 +95,6 @@ static int x11_mods(unsigned int state) {
     return m;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int x11_vk_from_keysym(KeySym ks) {
     switch (ks) {
     case XK_Escape:    return 27;
@@ -142,7 +131,6 @@ static int x11_vk_from_keysym(KeySym ks) {
 
 static Atom x11_atom(const char *name) { return XInternAtom(g_display, name, False); }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     if (!g_display || !win) return;
     XEvent xev;
@@ -160,7 +148,6 @@ static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
     XFlush(g_display);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_NWMR_TOPLEFT     0
 #define ZAN_NWMR_TOP         1
 #define ZAN_NWMR_TOPRIGHT    2
@@ -171,7 +158,6 @@ static void x11_wm_state(Window win, Atom state1, Atom state2, long action) {
 #define ZAN_NWMR_LEFT        7
 #define ZAN_NWMR_MOVE        8
 
-/* 内部辅助逻辑 */
 static void x11_set_borderless(Window win) {
     if (!g_display || !win) return;
     struct {
@@ -187,7 +173,6 @@ static void x11_set_borderless(Window win) {
                     (unsigned char *)&hints, 5);
 }
 
-/* 内部辅助逻辑 */
 static void x11_start_moveresize(Window win, int x_root, int y_root, int direction) {
     if (!g_display || !win) return;
     XUngrabPointer(g_display, CurrentTime);
@@ -201,13 +186,12 @@ static void x11_start_moveresize(Window win, int x_root, int y_root, int directi
     xev.xclient.data.l[1] = y_root;
     xev.xclient.data.l[2] = direction;
     xev.xclient.data.l[3] = 1; /* button 1 */
-    xev.xclient.data.l[4] = 1; /* 核心系统底层抽象与内存语义契约 */
+    xev.xclient.data.l[4] = 1;
     XSendEvent(g_display, DefaultRootWindow(g_display), False,
                SubstructureNotifyMask | SubstructureRedirectMask, &xev);
     XFlush(g_display);
 }
 
-/* 内部辅助逻辑 */
 static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     int w = lw->w, h = lw->h;
     int capW = g_caption_btn_count_l * g_btn_w_l;
@@ -222,7 +206,6 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     if (top && right) return ZAN_NWMR_TOPRIGHT;
     if (bottom && left) return ZAN_NWMR_BOTTOMLEFT;
     if (bottom && right) return ZAN_NWMR_BOTTOMRIGHT;
-    /* 内部辅助逻辑 */
     if (!zan_gui_in_hit_guard((iptr)lw->xid, x, y)) {
         if (left) return ZAN_NWMR_LEFT;
         if (right) return ZAN_NWMR_RIGHT;
@@ -233,7 +216,6 @@ static int x11_caption_hit(zan_lwin_t *lw, int x, int y) {
     return -1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void x11_serve_selection(XSelectionRequestEvent *req) {
     XSelectionEvent resp;
     memset(&resp, 0, sizeof(resp));
@@ -270,7 +252,6 @@ static int x11_abi_button(unsigned int b) {
     return (int)b - 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void x11_translate_event(XEvent *ev) {
     g_evwin_linux = ev->xany.window;
     switch (ev->type) {
@@ -279,15 +260,12 @@ static void x11_translate_event(XEvent *ev) {
                        x11_mods(ev->xmotion.state));
         break;
     case ButtonPress:
-        /* 内部辅助逻辑 */
         if (ev->xbutton.button == 4 || ev->xbutton.button == 5) {
             int delta = ev->xbutton.button == 4 ? 120 : -120;
             evq_push_linux(13, ev->xbutton.x, ev->xbutton.y, 0, delta,
                            x11_mods(ev->xbutton.state));
         } else if (ev->xbutton.button == 6 || ev->xbutton.button == 7) {
-            /* 核心系统底层抽象与内存语义契约 */
         } else if (ev->xbutton.button == 1) {
-            /* 内部辅助逻辑 */
             zan_lwin_t *bw = lwin_find(ev->xbutton.window);
             int dir = bw ? x11_caption_hit(bw, ev->xbutton.x, ev->xbutton.y) : -1;
             if (dir >= 0) {
@@ -356,7 +334,6 @@ static void x11_translate_event(XEvent *ev) {
         break;
     }
     case Expose: {
-        /* 内部辅助逻辑 */
         zan_lwin_t *ew = lwin_find(ev->xexpose.window);
         if (ew && ew->backbuf)
             XCopyArea(g_display, ew->backbuf, ew->xid, ew->gc, 0, 0,
@@ -367,7 +344,6 @@ static void x11_translate_event(XEvent *ev) {
         evq_push_linux(8, 0, 0, 0, 0, 0);
         break;
     case FocusOut:
-        /* 内部辅助逻辑 */
         evq_push_linux(9, 0, 0, 0, 0, 0);
         break;
     }
@@ -378,9 +354,7 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
         g_display = XOpenDisplay(NULL);
         if (!g_display) return 0;
     }
-    /* 内部辅助逻辑 */
     zan_gui_get_dpi_scale();
-    /* 内部辅助逻辑 */
     if (!g_xim) {
         setlocale(LC_ALL, "");
         XSetLocaleModifiers("");
@@ -430,7 +404,6 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     w->h = height;
 
     if (!g_primary_win) {
-        /* 内部辅助逻辑 */
         g_primary_win = xid;
         g_x11_window = xid;
         g_xic = xic;
@@ -458,7 +431,6 @@ EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
             XMoveWindow(g_display, xid, x, y);
         }
     }
-    /* 编译器代码生成与运行时系统底层调用契约 */
     x11_set_borderless(xid);
 
     return (i64)xid;
@@ -481,7 +453,6 @@ EXPORT i32 zan_gui_wait_event(void) {
     int xfd = ConnectionNumber(g_display);
     XEvent ev;
     for (;;) {
-        /* 模块核心语义抽象与接口调用契约 */
         while (XPending(g_display) > 0) {
             XNextEvent(g_display, &ev);
             if (ev.type == SelectionRequest) {
@@ -492,7 +463,6 @@ EXPORT i32 zan_gui_wait_event(void) {
             x11_translate_event(&ev);
             if (evq_pop_linux()) return 0;
         }
-        /* 模块核心语义抽象与接口调用契约 */
         struct pollfd fds[2];
         fds[0].fd = xfd; fds[0].events = POLLIN; fds[0].revents = 0;
         int nfds = 1;
@@ -511,11 +481,9 @@ EXPORT i32 zan_gui_wait_event(void) {
             /* 返回a benign empty frame (kind 0) so the caller drains its dispatch queue */
             return 0;
         }
-        /* 底层系统交互与数据协议契约 */
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     if (!g_display) return -1;
     memset(g_pending_event_linux, 0, sizeof(g_pending_event_linux));
@@ -563,7 +531,6 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     }
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 EXPORT i32 zan_gui_wake(void) {
     if (g_wake_pipe[1] >= 0) {
         char b = 1;
@@ -591,7 +558,6 @@ EXPORT i32 zan_gui_poll_event(void) {
     }
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
@@ -625,7 +591,6 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
     return w ? w->h : g_win_h;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_DIRTY_MAX 512
 static int g_dirty[ZAN_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -642,7 +607,6 @@ EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_count = 0;
     g_dirty_overflow = 0;
@@ -656,13 +620,11 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
     zan_surface_t *s = g_surfaces[surface_id];
 
-    /* 内部辅助逻辑 */
     if (zan_gui_present_window(surface_id, (void *)(intptr_t)w->xid)) {
         g_dirty_count = 0;
         g_dirty_overflow = 0;
         return 0;
     }
-    /* 内部辅助逻辑 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -671,9 +633,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     int screen = DefaultScreen(g_display);
     unsigned depth = (unsigned)DefaultDepth(g_display, screen);
 
-    /* 内部辅助逻辑 */
     if (!w->backbuf || w->backbuf_w != s->width || w->backbuf_h != s->height) {
-        /* 底层系统交互与数据协议契约 */
         g_dirty_count = 0;
         g_dirty_overflow = 1;
         if (w->backbuf) XFreePixmap(g_display, w->backbuf);
@@ -787,10 +747,9 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
     nanosleep(&req, NULL);
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #if defined(__GNUC__)
 __attribute__((weak)) int issetugid(void) {
     return (getuid() != geteuid() || getgid() != getegid()) ? 1 : 0;
 }
 #endif
-#endif /* 核心系统底层抽象与内存语义契约 */
+#endif

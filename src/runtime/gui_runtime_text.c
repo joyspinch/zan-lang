@@ -1,11 +1,10 @@
 /* gui_runtime_text */
 
-/* 底层系统交互与数据协议契约 */
 
 #ifdef _WIN32
 
 static HDC g_text_dc = NULL;
-static HFONT g_fonts[16]; /* 核心系统底层抽象与内存语义契约 */
+static HFONT g_fonts[16];
 static int g_font_count = 0;
 static int g_text_stats_enabled = 0;
 static uint64_t g_text_draw_calls = 0;
@@ -66,7 +65,6 @@ EXPORT i64 zan_gui_text_stat_read(i32 idx) {
         case 9: return (i64)g_text_draw_us;
         case 10: return (i64)g_text_measure_us;
         case 11: return (i64)g_text_height_us;
-        /* 底层系统交互与数据协议契约 */
         case 76: return (i64)g_atlas_bytes;
         case 77: return (i64)g_atlas_stores;
         case 78: return (i64)g_atlas_swept;
@@ -86,15 +84,13 @@ static void ensure_text_dc(void) {
 }
 
 static int g_font_sizes[16];
-static int g_font_bold[16];   /* 底层系统交互与数据协议契约 */
-/* 内部辅助逻辑 */
+static int g_font_bold[16];
 static wchar_t g_font_family[64] = L"Segoe UI";
 static int g_font_family_env_done = 0;
 static int g_font_family_explicit = 0;
-/* 内部辅助逻辑 */
-static int g_os2_asc = 0;    /* 核心系统底层抽象与内存语义契约 */
-static int g_os2_desc = 0;   /* 核心系统底层抽象与内存语义契约 */
-static int g_os2_upem = 0;   /* 核心系统底层抽象与内存语义契约 */
+static int g_os2_asc = 0;
+static int g_os2_desc = 0;
+static int g_os2_upem = 0;
 static int g_os2_tried = 0;
 
 static HFONT get_or_create_font(int size, int bold) {
@@ -105,14 +101,12 @@ static HFONT get_or_create_font(int size, int bold) {
             return g_fonts[i];
         }
     }
-    /* 核心系统底层抽象与内存语义契约 */
     int slot = -1;
     for (int i = 0; i < 16; i++) {
         if (!g_fonts[i]) { slot = i; break; }
     }
-    if (slot < 0) slot = 15; /* 核心系统底层抽象与内存语义契约 */
+    if (slot < 0) slot = 15;
 
-    /* 内部辅助实现 */
     if (!g_font_family_explicit && !g_font_family_env_done) {
         g_font_family_env_done = 1;
         wchar_t env[64];
@@ -138,7 +132,6 @@ static HFONT get_or_create_font(int size, int bold) {
     return g_fonts[slot];
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -146,19 +139,16 @@ EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     if (n <= 0 || n > 64) return 0;
     memcpy(g_font_family, want, (size_t)n * sizeof(wchar_t));
     g_font_family_explicit = 1;
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < 16; i++) {
         if (g_fonts[i]) { DeleteObject(g_fonts[i]); g_fonts[i] = NULL; }
         g_font_sizes[i] = 0;
         g_font_bold[i] = 0;
     }
-    /* 底层系统交互与数据协议契约 */
     g_os2_tried = 0;
     g_os2_upem = 0;
     return 1;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_font_face_matches(const char *utf8_family) {
     if (!utf8_family || !*utf8_family) return 0;
     wchar_t want[64];
@@ -197,13 +187,11 @@ static uint64_t zan_text_hash(const char *s, int size) {
     return h;
 }
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_RUN_BOLD_FLAG 0x10000
 static int run_key_size(int size, int bold) {
     return bold ? (size | ZAN_RUN_BOLD_FLAG) : size;
 }
 
-/* 内部辅助实现 */
 extern int zan_dw_init(void);
 extern int zan_dw_text_width(const wchar_t *w, int len,
     const wchar_t *family, float size, int bold);
@@ -211,15 +199,14 @@ extern int zan_dw_render(const wchar_t *w, int len,
     const wchar_t *family, float size, int bold,
     unsigned char **out_px, int *out_w, int *out_h, int *out_advance);
 
-/* 内部辅助实现 */
 static int win_cp_is_emoji(unsigned int cp) {
-    if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;   /* 核心系统底层抽象与内存语义契约 */
-    if (cp >= 0xD83C && cp <= 0xD83E) return 1;     /* 核心系统底层抽象与内存语义契约 */
-    if (cp >= 0x2600 && cp <= 0x27BF) return 1;     /* 核心系统底层抽象与内存语义契约 */
+    if (cp >= 0x1F000 && cp <= 0x1FFFF) return 1;
+    if (cp >= 0xD83C && cp <= 0xD83E) return 1;
+    if (cp >= 0x2600 && cp <= 0x27BF) return 1;
     if (cp >= 0x2B00 && cp <= 0x2BFF) return 1;     /* stars/arrows */
-    if (cp >= 0xFE00 && cp <= 0xFE0F) return 1;     /* 核心系统底层抽象与内存语义契约 */
-    if (cp == 0x200D) return 1;                     /* 核心系统底层抽象与内存语义契约 */
-    if (cp == 0x20E3) return 1;                     /* 核心系统底层抽象与内存语义契约 */
+    if (cp >= 0xFE00 && cp <= 0xFE0F) return 1;
+    if (cp == 0x200D) return 1;
+    if (cp == 0x20E3) return 1;
     if (cp >= 0x2190 && cp <= 0x21AA) return 1;     /* arrows/hands */
     if (cp >= 0x231A && cp <= 0x231B) return 1;
     if (cp >= 0x23E9 && cp <= 0x23FA) return 1;
@@ -231,7 +218,6 @@ static int win_cp_is_emoji(unsigned int cp) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
 static int win_run_has_emoji(const wchar_t *w, int len) {
     for (int i = 0; i < len; i++) {
         if (win_cp_is_emoji((unsigned int)w[i])) return 1;
@@ -239,7 +225,6 @@ static int win_run_has_emoji(const wchar_t *w, int len) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
 static int win_run_has_missing(int size, int bold,
                                const wchar_t *w, int len) {
     HFONT font = get_or_create_font(size, bold);
@@ -259,7 +244,6 @@ static int win_run_has_missing(int size, int bold,
     return missing;
 }
 
-/* 内部辅助逻辑 */
 static const zan_glyph_tile *win_dwrite_tile(const char *text, int size,
                                              int bold) {
     int key_len = (int)strlen(text);
@@ -305,7 +289,6 @@ static int win_dw_text_width(const wchar_t *w, int len, int size, int bold) {
     return zan_dw_text_width(w, len, family, (float)size, bold ? 1 : 0);
 }
 
-/* 内部辅助实现 */
 static const zan_glyph_tile *win_run_tile(const char *text, int size, int bold) {
     int key_len = (int)strlen(text);
     int ksize = run_key_size(size, bold);
@@ -376,7 +359,6 @@ EXPORT void zan_gui_draw_text(
 
     const zan_glyph_tile *tile = win_run_tile(text, size, 0);
     if (!tile) {
-        /* 内部辅助逻辑 */
         tile = win_dwrite_tile(text, size, 0);
     }
     if (tile) {
@@ -395,7 +377,6 @@ EXPORT void zan_gui_draw_text(
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -421,7 +402,6 @@ EXPORT void zan_gui_draw_text_bold(
     }
 }
 
-/* 内部辅助实现 */
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
     i32 angle_deg) {
@@ -472,7 +452,6 @@ EXPORT void zan_gui_draw_text_rot(
 
         double rad = (double)angle * 3.14159265358979323846 / 180.0;
         double cs = cos(rad), sn = sin(rad);
-        /* 核心系统底层抽象与内存语义契约 */
         double cx0 = 0.0, cx1 = cs * w, cx2 = -sn * h, cx3 = cs * w - sn * h;
         double cy0 = 0.0, cy1 = sn * w, cy2 = cs * h, cy3 = sn * w + cs * h;
         double mnx = cx0;
@@ -522,7 +501,6 @@ EXPORT void zan_gui_draw_text_rot(
         HBITMAP old_bmp = (HBITMAP)SelectObject(g_text_dc, hbmp);
         memset(dbits, 0, (size_t)bw * (size_t)bh * 4);
 
-        /* 内部辅助逻辑 */
         XFORM xf;
         xf.eM11 = (FLOAT)cs;   xf.eM12 = (FLOAT)sn;
         xf.eM21 = (FLOAT)-sn;  xf.eM22 = (FLOAT)cs;
@@ -561,12 +539,11 @@ EXPORT void zan_gui_draw_text_rot(
     }
 }
 
-/* 内部辅助实现 */
 typedef struct {
-    char    *text;   /* 底层系统交互与数据协议契约 */
+    char    *text;
     int      size;
     int      width;
-    uint64_t used;   /* 核心系统底层抽象与内存语义契约 */
+    uint64_t used;
 } zan_measure_cache_t;
 
 #define ZAN_MEAS_CACHE_CAP 2048
@@ -585,7 +562,6 @@ static int measure_text_gdi(const char *text, int size) {
     GetTextExtentPoint32W(g_text_dc, wtext, wlen - 1, &text_size);
     int missing = win_run_has_emoji(wtext, wlen - 1);
     SelectObject(g_text_dc, old_font);
-    /* 核心系统底层抽象与内存语义契约 */
     int w = 0;
     if (missing) {
         w = win_dw_text_width(wtext, wlen - 1, size, 0);
@@ -648,7 +624,6 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     return (i64)w;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int g_fh_size[16];
 static int g_fh_val[16];
 static int g_fh_count = 0;
@@ -664,7 +639,6 @@ static void load_os2_vertical_metrics(void) {
     HFONT font = get_or_create_font(16, 0);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
     uint8_t buf[2];
-    /* 内部辅助实现 */
     if (GetFontData(g_text_dc, 0x64616568, 18, buf, 2) == 2) {
         g_os2_upem = (int)((buf[0] << 8) | buf[1]);
     }
@@ -680,7 +654,6 @@ static void load_os2_vertical_metrics(void) {
     }
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_font_ascent(i32 font_size) {
     int size = (int)font_size;
     if (size < 8) size = 8;
@@ -729,7 +702,6 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     load_os2_vertical_metrics();
     int val;
     if (g_os2_upem > 0) {
-        /* 底层系统交互与数据协议契约 */
         val = (size * g_os2_asc) / g_os2_upem
             + (size * g_os2_desc) / g_os2_upem;
     } else {
@@ -754,12 +726,10 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
 
 #else /* !_WIN32 */
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_text_stat_enable(i32 enabled) { (void)enabled; }
 
 EXPORT i64 zan_gui_text_stat_read(i32 idx) { (void)idx; return 0; }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_set_text_family(const char *utf8_family) {
     (void)utf8_family;
     return 0;

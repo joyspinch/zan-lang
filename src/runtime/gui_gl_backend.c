@@ -6,60 +6,54 @@
 /* plumbing */
 
 static zan_gl_api gl;
-/* 底层系统交互与数据协议契约 */
 #define ZGL_MAX 0x8008
 #define ZGL_FUNC_ADD 0x8006
 static void (*zgl_blend_equation)(zgl_enum);
 static int g_gl_state = 0;   /* 0 untried, 1 ready, -1 unusable */
 
-#define ZGL_VF 34            /* 底层系统交互与数据协议契约 */
+#define ZGL_VF 34
 
 typedef enum {
     ZGL_MODE_NONE = 0,
     ZGL_MODE_BLEND,     /* shapes, source-over */
-    ZGL_MODE_REPLACE,   /* 底层系统交互与数据协议契约 */
-    ZGL_MODE_TEXT,      /* 核心系统底层抽象与内存语义契约 */
-    ZGL_MODE_UNION      /* 模块核心语义抽象与接口调用契约 */
-    /* 内部辅助逻辑 */
+    ZGL_MODE_REPLACE,
+    ZGL_MODE_TEXT,
+    ZGL_MODE_UNION
 } zgl_mode;
 
-/* 底层系统交互与数据协议契约 */
 #define ZGL_K_RECT    0
 #define ZGL_K_CIRCLE  1
 #define ZGL_K_RADIAL  2
 #define ZGL_K_SECTOR  3
 #define ZGL_K_CAPSULE 4
-#define ZGL_K_TEXT1   5   /* 底层系统交互与数据协议契约 */
-#define ZGL_K_TEXT4   6   /* 底层系统交互与数据协议契约 */
-#define ZGL_K_UNION   7   /* 核心系统底层抽象与内存语义契约 */
-#define ZGL_K_TEXTRGBA 9 /* 底层系统交互与数据协议契约 */
-#define ZGL_K_SURFACE 8   /* 核心系统底层抽象与内存语义契约 */
-#define ZGL_K_BITMAP  10  /* 核心系统底层抽象与内存语义契约 */
+#define ZGL_K_TEXT1   5
+#define ZGL_K_TEXT4   6
+#define ZGL_K_UNION   7
+#define ZGL_K_TEXTRGBA 9
+#define ZGL_K_SURFACE 8
+#define ZGL_K_BITMAP  10
 
-/* 内部辅助逻辑 */
 #define ZGL_TILE 64
 
 typedef struct {
     zgl_uint tex, fbo;
-    zgl_uint cov_tex, cov_fbo; /* 核心系统底层抽象与内存语义契约 */
+    zgl_uint cov_tex, cov_fbo;
     int w, h;
-    int gpu_ahead;   /* 底层系统交互与数据协议契约 */
-    int cpu_ahead;   /* 模块核心语义抽象与接口调用契约 */
-    /* 内部辅助逻辑 */
+    int gpu_ahead;
+    int cpu_ahead;
     unsigned char *shadow;
     int shadow_valid;
 } zgl_target;
 
 static zgl_target g_zgl_targets[64];
 
-/* 内部辅助逻辑 */
 static struct {
     zgl_uint prog_shape, prog_text, vao, vbo;
     zgl_int  u_viewport_shape, u_viewport_text, u_atlas1, u_atlas4, u_coverage,
              u_destination;
-    zgl_uint atlas1, atlas4;         /* 核心系统底层抽象与内存语义契约 */
-    zgl_int  u_atlas2;               /* 核心系统底层抽象与内存语义契约 */
-    zgl_uint bitmap_tex;             /* 核心系统底层抽象与内存语义契约 */
+    zgl_uint atlas1, atlas4;
+    zgl_int  u_atlas2;
+    zgl_uint bitmap_tex;
     float   *verts;
     size_t   count, cap;             /* in floats */
     zgl_mode mode;
@@ -79,7 +73,7 @@ static const char *ZGL_VS =
 "in vec4 a_col1;\n"
 "in vec4 a_col2;\n"
 "in vec4 a_clip;\n"    /* x0, y0, x1, y1 (exclusive) */
-"in vec4 a_seg;\n"     /* 核心系统底层抽象与内存语义契约 */
+"in vec4 a_seg;\n"
 "in vec2 a_uv;\n"
 "flat out vec2 v_center;\n"
 "flat out vec4 v_shape;\n"
@@ -94,13 +88,11 @@ static const char *ZGL_VS =
 "    v_center = a_center; v_shape = a_shape; v_kind = a_kind;\n"
 "    v_col0 = a_col0; v_col1 = a_col1; v_col2 = a_col2;\n"
 "    v_clip = a_clip; v_seg = a_seg; v_uv = a_uv;\n"
-/* 内部辅助逻辑 */
 "    vec2 ndc = vec2(a_pos.x / uViewport.x * 2.0 - 1.0,\n"
 "                    1.0 - a_pos.y / uViewport.y * 2.0);\n"
 "    gl_Position = vec4(ndc, 0.0, 1.0);\n"
 "}\n";
 
-/* 内部辅助逻辑 */
 #define ZGL_FS_COMMON \
 "uniform vec2 uViewport;\n" \
 "flat in vec2 v_center;\n" \
@@ -131,11 +123,10 @@ ZGL_FS_COMMON
 "    if (s.a <= 0.0) return dst;\n"
 "    float da = floor(d.a * (255.0-s.a) / 255.0);\n"
 "    float a = s.a + da;\n"
-"    /* 内部辅助逻辑 */\n"
+"    \n"
 "    return vec4(floor((s.rgb*s.a+d.rgb*da)/a), a)/255.0;\n"
 "}\n"
 "out vec4 o_color;\n"
-/* 内部辅助逻辑 */
 "float sd_round(vec2 p, vec2 half_, float r, int mask) {\n"
 "    float rr = r;\n"
 "    int bit = (p.x < 0.0) ? ((p.y < 0.0) ? 1 : 8) : ((p.y < 0.0) ? 2 : 4);\n"
@@ -148,7 +139,6 @@ ZGL_FS_COMMON
 "    float t = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);\n"
 "    return length(pa - ba * t);\n"
 "}\n"
-/* 内部辅助逻辑 */
 "vec4 grad(float t) {\n"
 "    if (v_kind.z > 0.5) {\n"
 "        return (t < 0.5) ? mix(v_col0, v_col2, t * 2.0)\n"
@@ -160,7 +150,6 @@ ZGL_FS_COMMON
 "    vec2 p = zpix();\n"
 "    zclip(p);\n"
 "    int kind = int(v_kind.x + 0.5);\n"
-/* 底层系统交互与数据协议契约 */
 "    vec2 lp = p - v_center;\n"
 "    if (kind == 2) lp -= vec2(0.5);\n"
 "    float cov = 0.0;\n"
@@ -169,7 +158,6 @@ ZGL_FS_COMMON
 "        float sd = sd_round(lp, v_shape.xy, v_shape.z, int(v_kind.y + 0.5));\n"
 "        if (v_shape.w > 0.0) sd = abs(sd + v_shape.w * 0.5) - v_shape.w * 0.5;\n"
 "        cov = clamp(0.5 - sd, 0.0, 1.0);\n"
-/* 内部辅助逻辑 */
 "        int gdir = int(v_kind.w + 0.5);\n"
 "        if (gdir >= 0) {\n"
 "            vec2 h = v_shape.xy;\n"
@@ -183,12 +171,10 @@ ZGL_FS_COMMON
 "            col = grad(clamp(t, 0.0, 1.0));\n"
 "        }\n"
 "    } else if (kind == 1) {\n"
-/* 编译器代码生成与运行时系统底层调用契约 */
 "        float sd = (v_shape.w > 0.0)\n"
 "                 ? abs(length(lp) - v_shape.z) - v_shape.w * 0.5\n"
 "                 : length(lp) - v_shape.z;\n"
 "        cov = clamp(0.5 - sd, 0.0, 1.0);\n"
-/* 模块核心语义抽象与接口调用契约 */
 "    } else if (kind == 2) {\n"
 "        float r = v_shape.z;\n"
 "        float d2 = dot(lp, lp);\n"
@@ -205,7 +191,6 @@ ZGL_FS_COMMON
 "        if (dist > ro - 0.5) radc = ro + 0.5 - dist;\n"
 "        else if (ri > 0.0 && dist < ri + 0.5) radc = dist - (ri - 0.5);\n"
 "        float a0 = v_kind.y, a1 = v_kind.w;\n"
-/* 模块核心语义抽象与接口调用契约 */
 "        float ang = degrees(atan(lp.x, -lp.y));\n"
 "        if (ang < 0.0) ang += 360.0;\n"
 "        float angc = 1.0;\n"
@@ -239,7 +224,6 @@ ZGL_FS_COMMON
 "        o_color = over(vec4((v_col0.rgb * fill + v_col1.rgb * border) / alpha, alpha));\n"
 "        return;\n"
 "    }\n"
-/* 内部辅助逻辑 */
 "    if (kind == 10) {\n"
 "        col = texture(uAtlas2, v_uv) * v_col0;\n"
 "        cov = 1.0;\n"
@@ -247,17 +231,15 @@ ZGL_FS_COMMON
 "    if (cov <= 0.0) discard;\n"
 "    o_color = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
 "                                          : vec4(col.rgb, col.a * cov);\n"
-"    /* 内部辅助逻辑 */\n"
+"    \n"
 "    if (kind == 7 || kind == 8) o_color = over(o_color);\n"
 "}\n";
 
-/* 内部辅助逻辑 */
 static const char *ZGL_FS_TEXT =
 "#version 330 core\n"
 ZGL_FS_COMMON
 "uniform sampler2D uAtlas1;\n"
 "uniform sampler2D uAtlas4;\n"
-/* 内部辅助逻辑 */
 "layout(location = 0, index = 0) out vec4 o_color;\n"
 "layout(location = 0, index = 1) out vec4 o_cov;\n"
 "void main() {\n"
@@ -265,7 +247,6 @@ ZGL_FS_COMMON
 "    zclip(p);\n"
 "    int kind = int(v_kind.x + 0.5);\n"
 "    if (kind == 9) {\n"
-/* 内部辅助逻辑 */
 "        vec4 t = texture(uAtlas4, v_uv);\n"
 "        if (t.a <= 0.0) discard;\n"
 "        o_color = vec4(t.rgb, 1.0);\n"
@@ -323,7 +304,6 @@ static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
     return prog;
 }
 
-/* 内部辅助逻辑 */
 static void zgl_bind_attribs(zgl_uint prog) {
     struct { const char *name; int size; } a[] = {
         { "a_pos", 2 }, { "a_center", 2 }, { "a_shape", 4 }, { "a_kind", 4 },
@@ -362,7 +342,6 @@ static int zgl_init(void) {
     if (g_gl_state) return g_gl_state > 0;
     g_gl_state = -1;
     if (!zan_gl_ctx_create()) return 0;
-    /* 内部辅助逻辑 */
     if (!zan_gl_ctx_make_current()) { zan_gl_ctx_destroy(); return 0; }
     if (!zan_gl_api_load(&gl, zan_gl_ctx_getproc)) { zan_gl_ctx_destroy(); return 0; }
     zgl_blend_equation = (void (*)(zgl_enum))zan_gl_ctx_getproc("glBlendEquation");
@@ -400,9 +379,7 @@ static int zgl_init(void) {
     return 1;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static zgl_target *zgl_target_of(zan_surface_t *s) {
     if (s->id < 0 || s->id >= (int)(sizeof(g_zgl_targets) / sizeof(g_zgl_targets[0])))
         return NULL;
@@ -437,7 +414,6 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
         t->w = s->width;
         t->h = s->height;
         t->shadow = (unsigned char *)malloc((size_t)s->width * (size_t)s->height * 4);
-        /* 内部辅助逻辑 */
         t->cpu_ahead = 1;
     }
     return t;
@@ -445,7 +421,6 @@ static zgl_target *zgl_target_of(zan_surface_t *s) {
 
 static void zgl_flush(void);
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void zgl_shadow_store(zan_surface_t *s, zgl_target *t,
                              int x, int y, int tw, int th) {
     size_t row = (size_t)tw * 4;
@@ -455,7 +430,6 @@ static void zgl_shadow_store(zan_surface_t *s, zgl_target *t,
                row);
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int zgl_tile_dirty(zan_surface_t *s, zgl_target *t,
                           int x, int y, int tw, int th) {
     size_t row = (size_t)tw * 4;
@@ -468,12 +442,10 @@ static int zgl_tile_dirty(zan_surface_t *s, zgl_target *t,
     return 0;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     if (!t->cpu_ahead) return;
     gl.BindTexture(ZGL_TEXTURE_2D, t->tex);
     gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (!t->shadow) {
         for (int y = 0; y < s->height; y++) {
             gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, 0, s->height - 1 - y,
@@ -502,21 +474,18 @@ static void zgl_upload(zan_surface_t *s, zgl_target *t) {
     t->cpu_ahead = 0;
 }
 
-/* 内部辅助逻辑 */
 static unsigned char *g_zgl_rb = NULL;
 static size_t g_zgl_rb_cap = 0;
 
-/* 内部辅助逻辑 */
 static void zgl_readback(zan_surface_t *s, zgl_target *t) {
     if (!t->gpu_ahead) return;
     if (s->width <= 0 || s->height <= 0) return;
     gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
-    /* 模块核心语义抽象与接口调用契约 */
     size_t row = (size_t)s->width * 4;
     size_t need = row * (size_t)s->height;
     if (need > g_zgl_rb_cap) {
         unsigned char *ng = (unsigned char *)realloc(g_zgl_rb, need);
-        if (!ng) return;   /* 底层系统交互与数据协议契约 */
+        if (!ng) return;
         g_zgl_rb = ng;
         g_zgl_rb_cap = need;
     }
@@ -526,7 +495,6 @@ static void zgl_readback(zan_surface_t *s, zgl_target *t) {
         memcpy(s->pixels + (size_t)y * (size_t)s->stride,
                g_zgl_rb + row * (size_t)(s->height - 1 - y), row);
     }
-    /* 内部辅助逻辑 */
     if (t->shadow) {
         zgl_shadow_store(s, t, 0, 0, s->width, s->height);
         t->shadow_valid = 1;
@@ -540,7 +508,7 @@ static void gl_sync_to_cpu(zan_surface_t *s) {
     zgl_target *t = zgl_target_of(s);
     if (!t) return;
     zgl_readback(s, t);
-    t->cpu_ahead = 1;   /* 底层系统交互与数据协议契约 */
+    t->cpu_ahead = 1;
 }
 
 static void (*g_gpu_cleanup[8])(int32_t);
@@ -587,7 +555,6 @@ static void zgl_flush(void) {
     gl.BufferData(ZGL_ARRAY_BUFFER,
                   (zgl_sizeiptr)(g_zgl.count * sizeof(float)),
                   g_zgl.verts, ZGL_STREAM_DRAW);
-    /* 内部辅助逻辑 */
     int shader_over = 0;
     for (size_t v = 0; v + 8 <= g_zgl.count; v += ZGL_VF) {
         int k = (int)(g_zgl.verts[v + 8] + 0.5f);
@@ -606,7 +573,6 @@ static void zgl_flush(void) {
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
         gl.Uniform1i(g_zgl.u_atlas4, 1);
         gl.Enable(ZGL_BLEND);
-        /* 内部辅助逻辑 */
         gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
                              ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
     } else {
@@ -614,11 +580,9 @@ static void zgl_flush(void) {
         zgl_bind_attribs(g_zgl.prog_shape);
         gl.Uniform2f(g_zgl.u_viewport_shape, (float)t->w, (float)t->h);
         gl.ActiveTexture(ZGL_TEXTURE0);
-        /* 编译器代码生成与运行时系统底层调用契约 */
         if (g_zgl.mode == ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, 0);
         } else if (shader_over) {
-            /* 内部辅助逻辑 */
             if (snap_w != t->w || snap_h != t->h) {
                 if (snap_tex) { gl.DeleteTextures(1, &snap_tex); gl.DeleteFramebuffers(1, &snap_fbo); snap_tex = snap_fbo = 0; }
                 snap_w = snap_h = 0;
@@ -652,16 +616,13 @@ static void zgl_flush(void) {
                 gl.Uniform1i(g_zgl.u_destination, 1);
                 gl.ActiveTexture(ZGL_TEXTURE0);
             } else {
-                /* 内部辅助逻辑 */
                 shader_over = 0;
             }
         }
-        /* 模块核心语义抽象与接口调用契约 */
         if (g_zgl.mode != ZGL_MODE_UNION) {
             gl.BindTexture(ZGL_TEXTURE_2D, t->cov_tex);
             gl.Uniform1i(g_zgl.u_coverage, 0);
         }
-        /* 内部辅助逻辑 */
         if (g_zgl.bitmap_tex) {
             gl.ActiveTexture(ZGL_TEXTURE2);
             gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.bitmap_tex);
@@ -672,7 +633,6 @@ static void zgl_flush(void) {
             gl.Disable(ZGL_BLEND);
         } else {
             gl.Enable(ZGL_BLEND);
-            /* 内部辅助逻辑 */
             gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
                                  ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
         }
@@ -682,11 +642,9 @@ static void zgl_flush(void) {
     g_zgl.count = 0;
     if (g_zgl.mode != ZGL_MODE_UNION) t->gpu_ahead = 1;
     zgl_blend_equation(ZGL_FUNC_ADD);
-    /* 内部辅助逻辑 */
     gl.Enable(ZGL_BLEND);
 }
 
-/* 内部辅助逻辑 */
 static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
     if (g_gl_state <= 0) return 0;
     zgl_target *t = zgl_target_of(s);
@@ -701,14 +659,14 @@ static int zgl_begin(zan_surface_t *s, zgl_mode mode) {
 }
 
 typedef struct {
-    float cx, cy;              /* 核心系统底层抽象与内存语义契约 */
-    float hw, hh;              /* 核心系统底层抽象与内存语义契约 */
+    float cx, cy;
+    float hw, hh;
     float radius, stroke;
     int   kind;
     float p0, p1, p2;          /* kind-specific */
     float col0[4], col1[4], col2[4];
     float seg[4];
-    float u0, v0, u1, v1;      /* 核心系统底层抽象与内存语义契约 */
+    float u0, v0, u1, v1;
 } zgl_quad;
 
 static void zgl_color(float *out, u32 c, int force_opaque) {
@@ -719,10 +677,8 @@ static void zgl_color(float *out, u32 c, int force_opaque) {
     out[3] = force_opaque ? 1.0f : (float)a / 255.0f;
 }
 
-/* 内部辅助逻辑 */
 static void zgl_push(zan_surface_t *s, const zgl_quad *q,
                      float x0, float y0, float x1, float y1) {
-    /* 内部辅助逻辑 */
     float cx0 = (float)s->clip_x0, cy0 = (float)s->clip_y0;
     float cx1 = (float)s->clip_x1, cy1 = (float)s->clip_y1;
     if (x0 < cx0) x0 = cx0;
@@ -742,7 +698,6 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         { x0, y0 }, { x1, y0 }, { x1, y1 },
         { x0, y0 }, { x1, y1 }, { x0, y1 },
     };
-    /* 内部辅助逻辑 */
     float du = (q->u1 - q->u0), dv = (q->v1 - q->v0);
     float qw = (x1 - x0), qh = (y1 - y0);
     (void)qw; (void)qh;
@@ -760,7 +715,6 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
         v[24] = (float)s->clip_x0; v[25] = (float)s->clip_y0;
         v[26] = (float)s->clip_x1; v[27] = (float)s->clip_y1;
         memcpy(v + 28, q->seg, 4 * sizeof(float));
-        /* 编译器代码生成与运行时系统底层调用契约 */
         float fu = (q->hw > 0.0f) ? (px - (q->cx - q->hw)) / (2.0f * q->hw) : 0.0f;
         float fv = (q->hh > 0.0f) ? (py - (q->cy - q->hh)) / (2.0f * q->hh) : 0.0f;
         v[32] = q->u0 + du * fu;
@@ -846,12 +800,11 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
     q.p0 = (float)(corners & 15);
     zgl_color(q.col0, fill, 0); zgl_color(q.col1, border, 0);
     zgl_push(s, &q, (float)x, (float)y, (float)x + (float)w, (float)y + (float)h);
-    zgl_flush(); /* 内部辅助逻辑 */
+    zgl_flush();
 }
 
 static void gl_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 top, u32 bottom) {
-    /* 内部辅助逻辑 */
     int rounded = (radius > 0 && (corners & 15) != 0);
     if (!zgl_begin(s, rounded ? ZGL_MODE_BLEND : ZGL_MODE_REPLACE)) {
         cpu_fill_vgrad(s, x, y, w, h, radius, corners, top, bottom); return;
@@ -879,7 +832,6 @@ static void gl_circle(zan_surface_t *s, int cx, int cy, int radius, u32 c,
     q.cy = (float)cy;
     q.radius = (float)radius;
     q.stroke = (float)stroke;
-    /* 模块核心语义抽象与接口调用契约 */
     q.hw = (float)radius + (float)stroke * 0.5f + 2.0f;
     q.hh = q.hw;
     zgl_color(q.col0, c, 0);
@@ -971,13 +923,11 @@ static void gl_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         cpu_draw_line(s, x0, y0, x1, y1, c, thickness); return;
     }
     float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
-    /* 模块核心语义抽象与接口调用契约 */
     float offset = thickness > 1 ? 0.0f : 0.5f;
     gl_capsule(s, (float)x0 + offset, (float)y0 + offset,
                (float)x1 + offset, (float)y1 + offset, half, c);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int zgl_union_target(zgl_target *t) {
     if (t->cov_fbo) return 1;
     gl.ActiveTexture(ZGL_TEXTURE0);
@@ -1012,7 +962,6 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
         cpu_polyline(s, pts, n, c, thickness, fx);
         return;
     }
-    /* 编译器代码生成与运行时系统底层调用契约 */
     float scale = fx == 0 ? 1.0f : 1.0f / 256.0f;
     float half = (thickness > 1) ? (float)thickness / 2.0f : 0.5f;
     float lo_x = (float)s->width, lo_y = (float)s->height, hi_x = 0, hi_y = 0;
@@ -1036,10 +985,9 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
     if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
     int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
     int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
     zgl_target *t = zgl_target_of(s);
     if (!zgl_union_target(t)) {
-        /* 底层系统交互与数据协议契约 */
         fprintf(stderr, "[zan_gui] GL polyline coverage framebuffer unavailable; CPU fallback\n");
         gl_sync_to_cpu(s);
         cpu_polyline(s, pts, n, c, thickness, fx);
@@ -1050,7 +998,7 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.Clear(ZGL_COLOR_BUFFER_BIT);
-    gl.Disable(ZGL_SCISSOR_TEST); /* 核心系统底层抽象与内存语义契约 */
+    gl.Disable(ZGL_SCISSOR_TEST);
     g_zgl.mode = ZGL_MODE_UNION;
     for (int i = 0; i + 1 < n; i++) {
         float ax = (float)pts[i * 2] * scale;
@@ -1058,20 +1006,19 @@ static void gl_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
         float bx = (float)pts[i * 2 + 2] * scale;
         float by = (float)pts[i * 2 + 3] * scale;
         float dx = bx - ax, dy = by - ay;
-        if (dx * dx + dy * dy < 0.0001f) continue; /* 核心系统底层抽象与内存语义契约 */
+        if (dx * dx + dy * dy < 0.0001f) continue;
         gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
     }
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
     g_zgl.mode = ZGL_MODE_BLEND;
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_UNION;
     zgl_color(q.col0, c, 0);
     zgl_push(s, &q, lo_x, lo_y, hi_x, hi_y);
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static void cpu_polybatch_loop(zan_surface_t *s, const int32_t *pts,
                                const int32_t *counts, int n_paths, u32 c,
                                int thickness, int fx) {
@@ -1083,7 +1030,6 @@ static void cpu_polybatch_loop(zan_surface_t *s, const int32_t *pts,
     }
 }
 
-/* 内部辅助逻辑 */
 static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
                          const int32_t *counts, int n_paths, u32 c,
                          int thickness, int fx) {
@@ -1123,10 +1069,9 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     if (!segments || lo_x >= hi_x || lo_y >= hi_y) return;
     int clear_x = (int)floorf(lo_x), clear_y = (int)floorf(lo_y);
     int clear_x1 = (int)ceilf(hi_x), clear_y1 = (int)ceilf(hi_y);
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
     zgl_target *t = zgl_target_of(s);
     if (!zgl_union_target(t)) {
-        /* 底层系统交互与数据协议契约 */
         fprintf(stderr, "[zan_gui] GL polybatch coverage framebuffer unavailable; CPU fallback\n");
         gl_sync_to_cpu(s);
         cpu_polybatch_loop(s, pts, counts, n_paths, c, thickness, fx);
@@ -1137,7 +1082,7 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
     gl.Scissor(clear_x, t->h - clear_y1, clear_x1 - clear_x, clear_y1 - clear_y);
     gl.ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
     gl.Clear(ZGL_COLOR_BUFFER_BIT);
-    gl.Disable(ZGL_SCISSOR_TEST); /* 核心系统底层抽象与内存语义契约 */
+    gl.Disable(ZGL_SCISSOR_TEST);
     g_zgl.mode = ZGL_MODE_UNION;
     off = 0;
     for (int p = 0; p < n_paths; p++) {
@@ -1148,24 +1093,23 @@ static void gl_polybatch(zan_surface_t *s, const int32_t *pts,
             float bx = (float)pts[off + i * 2 + 2] * scale;
             float by = (float)pts[off + i * 2 + 3] * scale;
             float dx = bx - ax, dy = by - ay;
-            if (dx * dx + dy * dy < 0.0001f) continue; /* 核心系统底层抽象与内存语义契约 */
+            if (dx * dx + dy * dy < 0.0001f) continue;
             gl_capsule(s, ax, ay, bx, by, half, 0xFFFFFFFFu);
         }
         off += n * 2;
     }
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
     g_zgl.mode = ZGL_MODE_BLEND;
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_UNION;
     zgl_color(q.col0, c, 0);
     zgl_push(s, &q, lo_x, lo_y, hi_x, hi_y);
-    zgl_flush(); /* 底层系统交互与数据协议契约 */
+    zgl_flush();
 }
 
 /* text */
 
-/* 底层系统交互与数据协议契约 */
 typedef struct {
     uint32_t id, rev;
     int x, y, w, h;
@@ -1187,7 +1131,7 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     zgl_tile_slot *slot = &g_zgl_tiles[tile->id % ZGL_TILES];
     if (slot->id == tile->id && slot->rev == tile->rev &&
         slot->w == tile->w && slot->h == tile->h) {
-        return slot;   /* 核心系统底层抽象与内存语义契约 */
+        return slot;
     }
 
     int shelf = (tile->bpp == 4) ? 1 : 0;
@@ -1197,7 +1141,6 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
         g_zgl_shelf[shelf].row_h = 0;
     }
     if (g_zgl_shelf[shelf].y + tile->h > ZGL_ATLAS_DIM) {
-        /* 内部辅助逻辑 */
         zgl_flush();
         zgl_atlas_reset();
     }
@@ -1211,7 +1154,6 @@ static zgl_tile_slot *zgl_tile_upload(const zan_glyph_tile *tile) {
     g_zgl_shelf[shelf].x += tile->w;
     if (tile->h > g_zgl_shelf[shelf].row_h) g_zgl_shelf[shelf].row_h = tile->h;
 
-    /* 模块核心语义抽象与接口调用契约 */
     zgl_flush();
     gl.BindTexture(ZGL_TEXTURE_2D, shelf ? g_zgl.atlas4 : g_zgl.atlas1);
     gl.TexSubImage2D(ZGL_TEXTURE_2D, 0, slot->x, slot->y, slot->w, slot->h,
@@ -1223,12 +1165,11 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     if (!run || run->count <= 0) return;
     if (!zgl_begin(s, ZGL_MODE_TEXT)) { cpu_glyph_run(s, run); return; }
     u32 color = run->color;
-    if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;  /* 核心系统底层抽象与内存语义契约 */
+    if (((color >> 24) & 0xFF) == 0) color |= 0xFF000000u;
     for (int i = 0; i < run->count; i++) {
         const zan_glyph_tile *tile = run->items[i].tile;
         zgl_tile_slot *slot = zgl_tile_upload(tile);
         if (!slot) continue;
-        /* 内部辅助逻辑 */
         if (!zgl_begin(s, ZGL_MODE_TEXT)) return;
         zgl_quad q;
         memset(&q, 0, sizeof(q));
@@ -1249,10 +1190,8 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void gl_set_clip(zan_surface_t *s, int x0, int y0, int x1, int y1) {
-    /* 内部辅助逻辑 */
     (void)x0; (void)y0; (void)x1; (void)y1;
     if (g_zgl.target == s) zgl_flush();
 }
@@ -1270,19 +1209,16 @@ static void gl_read_pixels(zan_surface_t *s) {
     if (t) zgl_readback(s, t);
 }
 
-/* 内部辅助逻辑 */
 static int gl_present(zan_surface_t *s, void *native_window) {
     if (g_gl_state <= 0 || !native_window) return 0;
     zgl_flush();
     zgl_target *t = zgl_target_of(s);
     if (!t) return 0;
-    /* 内部辅助逻辑 */
     zgl_upload(s, t);
     if (!zan_gl_ctx_present_begin(native_window, t->w, t->h)) return 0;
 
     gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
     gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, 0);
-    /* 内部辅助逻辑 */
     gl.BlitFramebuffer(0, 0, t->w, t->h,
                        0, 0, t->w, t->h,
                        ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
@@ -1296,7 +1232,6 @@ static void gl_drop_window(void *native_window) {
     zan_gl_ctx_present_drop(native_window);
 }
 
-/* 内部辅助逻辑 */
 static void gl_drop_surface(zan_surface_t *s) {
     if (s->id < 0 || s->id >= (int)(sizeof(g_zgl_targets) / sizeof(g_zgl_targets[0])))
         return;
@@ -1326,7 +1261,6 @@ static void gl_drop_tex(unsigned int tex) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 #define ZGL_BITMAP_CAP 256
 #define ZGL_BITMAP_BYTES (64u * 1024u * 1024u)
 typedef struct {
@@ -1449,7 +1383,6 @@ static const zan_gui_backend zan_gl_backend = {
     .surface_round = gl_surface_round,
     .fill_vgrad   = gl_fill_vgrad,
     .fill_grad    = gl_fill_grad,
-    /* 内部辅助逻辑 */
     .shadow_round = NULL,
     .fill_circle  = gl_fill_circle,
     .draw_circle  = gl_draw_circle,
@@ -1475,14 +1408,12 @@ static const zan_gui_backend zan_gl_backend = {
     .sync_from_cpu = gl_sync_from_cpu,
 };
 
-/* 内部辅助逻辑 */
 int zan_gui_internal_gl_install(void) {
     if (!zgl_init()) return 0;
     zan_gui_internal_set_backend(&zan_gl_backend);
     return 1;
 }
 
-/* 内部辅助逻辑 */
 void zan_gui_internal_gl_drop_present(void) {
     if (g_gl_state <= 0) return;
     if (!zan_gl_ctx_make_current()) return;

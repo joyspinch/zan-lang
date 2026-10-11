@@ -9,20 +9,17 @@
 #endif
 #endif
 #ifndef ZAN_SHIM_HAVE_STDIO
-/* 底层系统交互与数据协议契约 */
 typedef __builtin_va_list zan_va_list;
 int vsnprintf(char *s, unsigned long n, const char *fmt, zan_va_list ap);
 #define va_list zan_va_list
 #endif
 
-/* 底层系统交互与数据协议契约 */
 #if defined(__ELF__)
 #define ZAN_SHIM_WEAK __attribute__((weak))
 #else
 #define ZAN_SHIM_WEAK
 #endif
 
-/* 内部辅助逻辑 */
 
 #ifndef ZAN_BARE_HEAP_BYTES
 #define ZAN_BARE_HEAP_BYTES (64 * 1024)
@@ -30,31 +27,27 @@ int vsnprintf(char *s, unsigned long n, const char *fmt, zan_va_list ap);
 
 union zan_shim_block {
     struct {
-        size_t size;             /* 核心系统底层抽象与内存语义契约 */
+        size_t size;
         size_t magic;            /* set at malloc, checked at free */
         union zan_shim_block *next;
     } hdr;
-    /* 底层系统交互与数据协议契约 */
     long long align_min;
     unsigned char align_bytes[16];
 };
-/* 内部辅助逻辑 */
 #define ZAN_SHIM_MAGIC ((size_t)0x5A4E4245u)   /* "ZNBE" */
 
 static unsigned char zan_shim_pool[ZAN_BARE_HEAP_BYTES]
     __attribute__((aligned(8)));
 static union zan_shim_block *zan_shim_free = NULL;
 static int zan_shim_pool_ready;
-/* 内部辅助逻辑 */
 static size_t zan_shim_live_bytes;
 static size_t zan_shim_live_peak;
 static unsigned zan_shim_oom;
-static size_t zan_shim_oom_size;   /* 核心系统底层抽象与内存语义契约 */
+static size_t zan_shim_oom_size;
 static unsigned zan_shim_frees;
 static unsigned zan_shim_allocs;
-static unsigned zan_shim_bad_frees;  /* 核心系统底层抽象与内存语义契约 */
+static unsigned zan_shim_bad_frees;
 
-/* 内部辅助逻辑 */
 static union zan_shim_block *zan_shim_checked_header(void *p) {
     if ((uintptr_t)p < (uintptr_t)zan_shim_pool + sizeof(union zan_shim_block) ||
         (uintptr_t)p >= (uintptr_t)zan_shim_pool + sizeof(zan_shim_pool))
@@ -64,7 +57,6 @@ static union zan_shim_block *zan_shim_checked_header(void *p) {
     if (b->hdr.magic != ZAN_SHIM_MAGIC) return NULL;
     return b;
 }
-/* 内部辅助逻辑 */
 #define ZAN_SHIM_TRACE 16
 static size_t zan_shim_alloc_trace[ZAN_SHIM_TRACE];
 static size_t zan_shim_free_trace[ZAN_SHIM_TRACE];
@@ -90,10 +82,9 @@ void zan_shim_trace(const size_t **allocs, const size_t **frees,
     *fn = zan_shim_free_trace_n;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_SHIM_LIVE_N 64
 static struct { void *p; size_t n; } zan_shim_live[ZAN_SHIM_LIVE_N];
-static unsigned zan_shim_live_over;   /* 核心系统底层抽象与内存语义契约 */
+static unsigned zan_shim_live_over;
 
 static void zan_shim_live_add(void *p, size_t n) {
     if (zan_shim_live_over) return;
@@ -107,7 +98,6 @@ static void zan_shim_live_del(void *p) {
         if (zan_shim_live[i].p == p) { zan_shim_live[i].p = 0; return; }
     }
 }
-/* 核心系统底层抽象与内存语义契约 */
 unsigned zan_shim_live_top(size_t *out, unsigned max) {
     unsigned found = 0;
     for (unsigned i = 0; i < ZAN_SHIM_LIVE_N && found < max; i++) {
@@ -134,7 +124,6 @@ static void zan_shim_pool_init(void) {
 void *malloc(size_t n) {
     if (!zan_shim_pool_ready) zan_shim_pool_init();
     if (n == 0) n = 1;
-    /* 内部辅助逻辑 */
     if (n > sizeof(zan_shim_pool)) {
         zan_shim_oom++;
         zan_shim_oom_size = n;
@@ -146,7 +135,6 @@ void *malloc(size_t n) {
         if (b->hdr.size < n) { prev = &b->hdr.next; continue; }
         size_t rest = b->hdr.size - n;
         if (rest >= sizeof(*b)) {
-            /* 底层系统交互与数据协议契约 */
             union zan_shim_block *tail =
                 (union zan_shim_block *)((unsigned char *)b + sizeof(*b) + n);
             tail->hdr.size = rest - sizeof(*b);
@@ -154,10 +142,9 @@ void *malloc(size_t n) {
             *prev = tail;
         } else {
             *prev = b->hdr.next;
-            /* 内部辅助逻辑 */
             n = b->hdr.size;
         }
-        b->hdr.size = n;         /* 核心系统底层抽象与内存语义契约 */
+        b->hdr.size = n;
         b->hdr.magic = ZAN_SHIM_MAGIC;
         zan_shim_allocs++;
         zan_shim_alloc_trace[zan_shim_alloc_trace_n++ % ZAN_SHIM_TRACE] = n;
@@ -172,7 +159,6 @@ void *malloc(size_t n) {
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 void zan_shim_free_walk(size_t *total, size_t *maxhole, unsigned *holes) {
     size_t sum = 0, best = 0;
     unsigned count = 0;
@@ -190,18 +176,16 @@ void free(void *p) {
     if (!p) return;
     union zan_shim_block *b = zan_shim_checked_header(p);
     if (!b) {
-        /* 底层系统交互与数据协议契约 */
         zan_shim_bad_frees++;
         return;
     }
-    b->hdr.magic = 0;        /* 底层系统交互与数据协议契约 */
+    b->hdr.magic = 0;
     zan_shim_frees++;
     zan_shim_free_trace[zan_shim_free_trace_n++ % ZAN_SHIM_TRACE] =
         b->hdr.size;
     zan_shim_live_del(p);
     if (b->hdr.size <= zan_shim_live_bytes)
         zan_shim_live_bytes -= b->hdr.size;
-    /* 核心系统底层抽象与内存语义契约 */
     union zan_shim_block **link = &zan_shim_free;
     union zan_shim_block *pv = NULL;
     while (*link && (uintptr_t)*link < (uintptr_t)b) {
@@ -224,7 +208,7 @@ void free(void *p) {
 }
 
 void *calloc(size_t count, size_t size) {
-    if (count && size > (size_t)-1 / count) return NULL;   /* 核心系统底层抽象与内存语义契约 */
+    if (count && size > (size_t)-1 / count) return NULL;
     size_t total = count * size;
     void *p = malloc(total);
     if (p) {
@@ -239,7 +223,6 @@ void *realloc(void *p, size_t n) {
     if (!n) { free(p); return NULL; }
     union zan_shim_block *b = zan_shim_checked_header(p);
     if (!b) {
-        /* 底层系统交互与数据协议契约 */
         zan_shim_bad_frees++;
         return malloc(n);
     }
@@ -253,11 +236,10 @@ void *realloc(void *p, size_t n) {
     return np;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 ZAN_SHIM_WEAK int poll(void *fds, unsigned long nfds, int timeout) {
     (void)fds; (void)nfds; (void)timeout;
-    return 0;                    /* 核心系统底层抽象与内存语义契约 */
+    return 0;
 }
 
 ZAN_SHIM_WEAK int pthread_mutex_lock(void *m) { (void)m; return 0; }
@@ -266,7 +248,6 @@ ZAN_SHIM_WEAK unsigned long pthread_self(void) { return 1; }
 
 ZAN_SHIM_WEAK char *getenv(const char *name) { (void)name; return NULL; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #ifdef ZAN_SHIM_HAVE_STDIO
 int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
@@ -277,7 +258,6 @@ int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
     return r;
 }
 #else
-/* 底层系统交互与数据协议契约 */
 int zan_w32_snprintf(char *s, long long n, const char *fmt, ...) {
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);

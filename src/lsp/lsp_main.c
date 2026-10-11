@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 #include "json.h"
 #include "rpc.h"
 
@@ -45,14 +44,11 @@ typedef int lsp_sock_t;
 #endif
 
 #include "../common/host_oom.h"
-/* 核心系统底层抽象与内存语义契约 */
 
 #define LSP_MAX_DOCS 256
 
-/* 内部辅助逻辑 */
 #define LSP_DIAG_QUIET_MS 200
 
-/* 内部辅助逻辑 */
 typedef struct lsp_msg {
     struct lsp_msg *next;
     json_value *msg;
@@ -61,9 +57,9 @@ typedef struct lsp_msg {
 typedef struct {
     char *uri;
     char *text;
-    long    version;         /* 核心系统底层抽象与内存语义契约 */
-    bool    diag_pending;    /* 底层系统交互与数据协议契约 */
-    uint64_t last_change_ms; /* 核心系统底层抽象与内存语义契约 */
+    long    version;
+    bool    diag_pending;
+    uint64_t last_change_ms;
 } lsp_doc_t;
 
 typedef struct {
@@ -73,9 +69,8 @@ typedef struct {
     bool      project_indexed;
     char      workspace_root[1024];
     FILE     *out;
-    bool       use_sock;  /* 底层系统交互与数据协议契约 */
-    lsp_sock_t sock;      /* 核心系统底层抽象与内存语义契约 */
-    /* 内部辅助实现 */
+    bool       use_sock;
+    lsp_sock_t sock;
 #ifdef _WIN32
     CRITICAL_SECTION doc_lock;
     CRITICAL_SECTION write_lock;
@@ -87,7 +82,6 @@ typedef struct {
     bool diag_thread_valid;
 #endif
     volatile bool diag_stop;
-    /* 内部辅助逻辑 */
 #ifdef _WIN32
     CRITICAL_SECTION q_lock;
     HANDLE worker_thread;
@@ -96,22 +90,19 @@ typedef struct {
     pthread_t worker_thread;
     bool worker_thread_valid;
 #endif
-    lsp_msg_t *q_head;          /* 核心系统底层抽象与内存语义契约 */
+    lsp_msg_t *q_head;
     lsp_msg_t *q_tail;
     int q_len;
-    /* 模块核心语义抽象与接口调用契约 */
     bool cancel_valid;
     bool cancel_is_str;
     double cancel_num;
     char cancel_str[80];
-    /* 模块核心语义抽象与接口调用契约 */
     bool exec_valid;
     bool exec_is_str;
     double exec_num;
     char exec_str[80];
 } lsp_server_t;
 
-/* 模块核心语义抽象与接口调用契约 */
 
 static bool sock_send_all(lsp_sock_t s, const char *buf, int n) {
     int off = 0;
@@ -123,23 +114,21 @@ static bool sock_send_all(lsp_sock_t s, const char *buf, int n) {
     return true;
 }
 
-/* 内部辅助实现 */
 #ifndef LSP_FRAME_DEADLINE_MS
 #define LSP_FRAME_DEADLINE_MS 60000
 #endif
 
 typedef struct {
     lsp_sock_t s;
-    bool started;        /* 核心系统底层抽象与内存语义契约 */
-    uint64_t deadline;   /* 底层系统交互与数据协议契约 */
+    bool started;
+    uint64_t deadline;
 } lsp_frame_reader_t;
 
-static uint64_t lsp_now_ms(void);   /* 核心系统底层抽象与内存语义契约 */
+static uint64_t lsp_now_ms(void);
 
 static int sock_reader(void *ctx, char *buf, int n) {
     lsp_frame_reader_t *r = (lsp_frame_reader_t *)ctx;
     if (r->started) {
-        /* 内部辅助逻辑 */
         long long wait = (long long)(r->deadline - lsp_now_ms());
         if (wait <= 0) return 0;
         fd_set fds;
@@ -163,9 +152,9 @@ static bool sock_writer(void *ctx, const char *buf, int n) {
 }
 
 static char *rpc_read_message_sock(lsp_sock_t s) {
-    static lsp_frame_reader_t r;   /* 核心系统底层抽象与内存语义契约 */
+    static lsp_frame_reader_t r;
     r.s = s;
-    r.started = false;             /* 底层系统交互与数据协议契约 */
+    r.started = false;
     return rpc_read_message_cb(sock_reader, &r, 64 * 1024 * 1024);
 }
 
@@ -173,7 +162,6 @@ static void rpc_write_message_sock(lsp_sock_t s, const char *payload) {
     rpc_write_message_cb(sock_writer, &s, payload);
 }
 
-/* 内部辅助逻辑 */
 static void lsp_write(lsp_server_t *s, const char *payload) {
 #ifdef _WIN32
     EnterCriticalSection(&s->write_lock);
@@ -323,9 +311,7 @@ static void lsp_remove_doc(lsp_server_t *s, const char *uri) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助逻辑 */
 static void utf8_seq_info(unsigned char c, int *bytes, int *utf16_units) {
     if (c < 0x80)                 { *bytes = 1; *utf16_units = 1; }
     else if ((c & 0xE0) == 0xC0)  { *bytes = 2; *utf16_units = 1; }
@@ -334,20 +320,18 @@ static void utf8_seq_info(unsigned char c, int *bytes, int *utf16_units) {
     else                          { *bytes = 1; *utf16_units = 1; }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int utf16_units_range(const char *start, const char *end) {
     int units = 0;
     while (start < end) {
         int bytes, cu;
         utf8_seq_info((unsigned char)*start, &bytes, &cu);
-        if (start + bytes > end) break; /* 核心系统底层抽象与内存语义契约 */
+        if (start + bytes > end) break;
         units += cu;
         start += bytes;
     }
     return units;
 }
 
-/* 内部辅助逻辑 */
 static int byte_col_to_utf16_char(const char *text, int line0, int byte_col1) {
     const char *ls = text;
     int ln = 0;
@@ -356,7 +340,6 @@ static int byte_col_to_utf16_char(const char *text, int line0, int byte_col1) {
         ls++;
     }
     if (byte_col1 <= 1) return 0;
-    /* 内部辅助逻辑 */
     const char *line_start = ls;
     int want = byte_col1 - 1;
     int have = 0;
@@ -370,7 +353,6 @@ static int byte_col_to_utf16_char(const char *text, int line0, int byte_col1) {
     return utf16_units_range(line_start, ls);
 }
 
-/* 内部辅助逻辑 */
 static size_t pos_to_offset(const char *text, int line, int character) {
     size_t off = 0;
     int cur_line = 0;
@@ -378,7 +360,6 @@ static size_t pos_to_offset(const char *text, int line, int character) {
         if (text[off] == '\n') cur_line++;
         off++;
     }
-    /* 内部辅助逻辑 */
     int units = 0;
     while (text[off] && text[off] != '\n' && units < character) {
         int bytes, cu;
@@ -390,7 +371,6 @@ static size_t pos_to_offset(const char *text, int line, int character) {
     return off;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static const char *line_start_at(const char *text, int line0) {
     const char *ls = text;
     int ln = 0;
@@ -406,14 +386,12 @@ static bool is_ident_char(char c) {
            (c >= '0' && c <= '9') || c == '_';
 }
 
-/* 底层系统交互与数据协议契约 */
 static int ident_len_at(const char *s) {
     int n = 0;
     while (is_ident_char(s[n])) n++;
     return n;
 }
 
-/* 内部辅助逻辑 */
 static void word_at(const char *text, size_t offset, char *out, size_t cap) {
     size_t len = strlen(text);
     if (offset > len) offset = len;
@@ -427,7 +405,6 @@ static void word_at(const char *text, size_t offset, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void prefix_before(const char *text, size_t offset, char *out, size_t cap) {
     size_t start = offset;
     while (start > 0 && is_ident_char(text[start - 1])) start--;
@@ -437,7 +414,6 @@ static void prefix_before(const char *text, size_t offset, char *out, size_t cap
     out[n] = '\0';
 }
 
-/* 内部辅助逻辑 */
 static void offset_to_linecol(const char *text, int offset, int *line, int *character) {
     int ln = 0, col = 0, i = 0;
     while (i < offset && text[i]) {
@@ -446,7 +422,6 @@ static void offset_to_linecol(const char *text, int offset, int *line, int *char
         int bytes, cu;
         utf8_seq_info(c, &bytes, &cu);
         if (i + bytes > offset) {
-            /* 内部辅助逻辑 */
             col += cu;
             break;
         }
@@ -457,11 +432,9 @@ static void offset_to_linecol(const char *text, int offset, int *line, int *char
     *character = col;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void extract_chain_expr(const char *text, size_t offset,
                                char *chain_out, size_t chain_cap) {
     chain_out[0] = '\0';
-    /* 内部辅助逻辑 */
     size_t end = offset;
     size_t start = end;
     int paren_depth = 0;
@@ -477,7 +450,6 @@ static void extract_chain_expr(const char *text, size_t offset,
             if (paren_depth > 0) { paren_depth--; start--; }
             else break;
         } else if (ch == ']') {
-            /* 内部辅助逻辑 */
             bracket_depth++;
             start--;
         } else if (ch == '[') {
@@ -493,7 +465,6 @@ static void extract_chain_expr(const char *text, size_t offset,
                    bracket_depth == 0) {
             start--;
         } else if (ch == '"' || ch == '\'') {
-            /* 模块核心语义抽象与接口调用契约 */
             char q = ch;
             start--;
             while (start > 0 && text[start - 1] != q) start--;
@@ -501,7 +472,6 @@ static void extract_chain_expr(const char *text, size_t offset,
         } else if ((is_ident_char(ch) || ch == '_') && paren_depth == 0 && angle_depth == 0) {
             start--;
         } else if (paren_depth > 0 || angle_depth > 0 || bracket_depth > 0) {
-            /* 底层系统交互与数据协议契约 */
             start--;
         } else {
             break;
@@ -516,8 +486,6 @@ static void extract_chain_expr(const char *text, size_t offset,
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
 static bool using_ns_context(const char *text, size_t off,
                              char *out, size_t cap) {
     size_t ls = off;
@@ -532,7 +500,6 @@ static bool using_ns_context(const char *text, size_t off,
     while (i < hlen && (head[i] == ' ' || head[i] == '\t' || head[i] == '\r')) i++;
 
     if (i == hlen) {
-        /* 模块核心语义抽象与接口调用契约 */
         size_t j = 0;
         while (j < tlen && (tail[j] == ' ' || tail[j] == '\t')) j++;
         if (tlen - j >= 5 && memcmp(tail + j, "using", 5) == 0 &&
@@ -548,7 +515,7 @@ static bool using_ns_context(const char *text, size_t off,
     size_t m = 0;
     while (m < rlen && m < 5 &&
            tolower((unsigned char)rest[m]) == "using"[m]) m++;
-    if (rlen < 5 || m < 5) return false;   /* 核心系统底层抽象与内存语义契约 */
+    if (rlen < 5 || m < 5) return false;
 
     size_t p = 5;
     while (p < rlen && (rest[p] == ' ' || rest[p] == '\t')) p++;
@@ -557,20 +524,19 @@ static bool using_ns_context(const char *text, size_t off,
     size_t w0 = p, w1 = p;
     while (w1 < rlen && (isalnum((unsigned char)rest[w1]) ||
                          rest[w1] == '.' || rest[w1] == '_')) w1++;
-    if (w1 != rlen) return false;          /* 核心系统底层抽象与内存语义契约 */
+    if (w1 != rlen) return false;
     size_t n = w1 - w0 < cap - 1 ? w1 - w0 : cap - 1;
     memcpy(out, rest + w0, n);
     out[n] = '\0';
     return true;
 }
 
-/* 内部辅助逻辑 */
 static bool receiver_chain_before(const char *text, size_t offset,
                                   char *out, size_t cap) {
     size_t start = offset;
     while (start > 0 && is_ident_char(text[start - 1])) start--;
     if (start == 0 || text[start - 1] != '.') return false;
-    size_t end = start - 1; /* 核心系统底层抽象与内存语义契约 */
+    size_t end = start - 1;
     size_t from = end;
     for (;;) {
         while (from > 0) {
@@ -580,7 +546,6 @@ static bool receiver_chain_before(const char *text, size_t offset,
             else break;
         }
         if (from > 0 && (text[from - 1] == '"' || text[from - 1] == '\'')) {
-            /* 内部辅助逻辑 */
             char q = text[from - 1];
             from--;
             while (from > 0 && text[from - 1] != q) from--;
@@ -602,11 +567,9 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
     while (start > 0 && is_ident_char(text[start - 1])) start--;
     if (start == 0 || text[start - 1] != '.') return;
 
-    /* 核心系统底层抽象与内存语义契约 */
     char chain_expr[1024];
     extract_chain_expr(text, offset, chain_expr, sizeof(chain_expr));
 
-    /* 内部辅助逻辑 */
     if (chain_expr[0] == '"' || chain_expr[0] == '\'' ||
         (chain_expr[0] >= '0' && chain_expr[0] <= '9')) {
         if (strlen(chain_expr) + 7 < cap) {
@@ -615,7 +578,6 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     int dot_count = 0;
     int pd = 0;
     for (int i = 0; chain_expr[i]; i++) {
@@ -625,19 +587,15 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
     }
 
     if (dot_count > 1) {
-        /* 模块核心语义抽象与接口调用契约 */
-        /* 模块核心语义抽象与接口调用契约 */
         if (strlen(chain_expr) + 7 < cap) {
             snprintf(out, cap, "CHAIN:%s", chain_expr);
             return;
         }
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     size_t dot = start - 1;
     size_t obj_end = dot;
     size_t obj_start = obj_end;
-    /* 模块核心语义抽象与接口调用契约 */
     if (obj_start > 0 && text[obj_start - 1] == ')') {
         int pdepth = 1;
         obj_start--;
@@ -646,14 +604,12 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
             if (text[obj_start] == ')') pdepth++;
             else if (text[obj_start] == '(') pdepth--;
         }
-        /* 底层系统交互与数据协议契约 */
         obj_end = obj_start;
         obj_start = obj_end;
     }
     while (obj_start > 0 && is_ident_char(text[obj_start - 1])) obj_start--;
     size_t n = obj_end - obj_start;
     if (n == 0 && chain_expr[0]) {
-        /* 内部辅助逻辑 */
         if (strlen(chain_expr) + 7 < cap) {
             snprintf(out, cap, "CHAIN:%s", chain_expr);
             return;
@@ -664,7 +620,6 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
     out[n] = '\0';
 }
 
-/* 内部辅助逻辑 */
 static void method_call_context(const char *text, size_t offset,
                                 char *method_out, size_t method_cap,
                                 char *class_out, size_t class_cap,
@@ -679,7 +634,6 @@ static void method_call_context(const char *text, size_t offset,
     size_t i = offset;
     bool found = false;
 
-    /* 模块核心语义抽象与接口调用契约 */
     while (i > 0) {
         i--;
         if (text[i] == ')') paren_depth++;
@@ -690,7 +644,6 @@ static void method_call_context(const char *text, size_t offset,
     }
     if (!found) return;
 
-    /* 内部辅助逻辑 */
     {
         int depth = 0;
         int commas = 0;
@@ -714,7 +667,6 @@ static void method_call_context(const char *text, size_t offset,
         *active_param = commas;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     size_t end = i;
     while (end > 0 && (text[end - 1] == ' ' || text[end - 1] == '\t')) end--;
     size_t name_end = end;
@@ -724,9 +676,7 @@ static void method_call_context(const char *text, size_t offset,
     memcpy(method_out, text + end, n);
     method_out[n] = '\0';
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (end > 0 && text[end - 1] == '.') {
-        /* 内部辅助逻辑 */
         if (recv_chain_out && recv_chain_cap > 0) {
             recv_chain_out[0] = '\0';
             receiver_chain_before(text, end, recv_chain_out, recv_chain_cap);
@@ -746,7 +696,6 @@ static void method_call_context(const char *text, size_t offset,
 
 /* diagnostics */
 
-/* 核心系统底层抽象与内存语义契约 */
 static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
@@ -761,7 +710,6 @@ static void publish_empty_diagnostics(lsp_server_t *s, const char *uri) {
     json_free(note);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *text) {
     size_t ul = strlen(uri);
     if ((ul > 5 && strcmp(uri + ul - 5, ".html") == 0) ||
@@ -782,7 +730,6 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
     zan_parser_init(&parser, &lex, arena, diag);
     zan_ast_node_t *ast = zan_parser_parse(&parser);
 
-    /* 内部辅助逻辑 */
     if (ast && !zan_diag_has_errors(diag)) {
         zan_binder_t binder;
         zan_binder_init(&binder, arena, diag);
@@ -802,7 +749,6 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
         int line = (int)e->loc.line > 0 ? (int)e->loc.line - 1 : 0;
         /* e->loc */
         int col  = byte_col_to_utf16_char(text, line, (int)e->loc.col);
-        /* 内部辅助逻辑 */
         int end_char = col + 1;
         {
             const char *ls = line_start_at(text, line);
@@ -829,7 +775,6 @@ static void publish_diagnostics(lsp_server_t *s, const char *uri, const char *te
         json_obj_set(range, "start", start);
         json_obj_set(range, "end", endp);
         json_obj_set(d, "range", range);
-        /* 底层系统交互与数据协议契约 */
         int sev = e->level == DIAG_ERROR ? 1 : (e->level == DIAG_WARNING ? 2 : 3);
         json_obj_set(d, "severity", json_new_num(sev));
         json_obj_set(d, "source", json_new_str("zanc"));
@@ -875,7 +820,6 @@ static void send_response(lsp_server_t *s, json_value *id, json_value *result) {
     json_free(resp);
 }
 
-/* 内部辅助逻辑 */
 static void send_response_error(lsp_server_t *s, json_value *id, int code,
                                 const char *message) {
     json_value *resp = json_new_obj();
@@ -897,7 +841,6 @@ static void send_response_error(lsp_server_t *s, json_value *id, int code,
     json_free(resp);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int lsp_completion_kind(isym_kind_t k) {
     switch (k) {
     case ISYM_CLASS:       return 7;   /* Class */
@@ -920,7 +863,6 @@ static int lsp_completion_kind(isym_kind_t k) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static int lsp_symbol_kind(isym_kind_t k) {
     switch (k) {
     case ISYM_CLASS:       return 5;   /* Class */
@@ -941,7 +883,6 @@ static int lsp_symbol_kind(isym_kind_t k) {
 
 static void ensure_project_indexed(lsp_server_t *s);
 
-/* 模块核心语义抽象与接口调用契约 */
 static void uri_percent_decode(const char *in, char *out, size_t cap) {
     size_t o = 0;
     for (size_t i = 0; in[i] && o + 1 < cap; i++) {
@@ -957,7 +898,6 @@ static void uri_percent_decode(const char *in, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* 内部辅助实现 */
 static void uri_percent_encode_path(const char *in, char *out, size_t cap) {
     static const char hex[] = "0123456789ABCDEF";
     size_t o = 0;
@@ -976,7 +916,6 @@ static void uri_percent_encode_path(const char *in, char *out, size_t cap) {
     out[o] = '\0';
 }
 
-/* 内部辅助逻辑 */
 static void uri_to_native_path(const char *uri, char *out, size_t cap) {
     const char *rest = NULL;
     if (strncmp(uri, "file:///", 8) == 0) rest = uri + 8;   /* file:///C:/... */
@@ -998,7 +937,6 @@ static void uri_to_native_path(const char *uri, char *out, size_t cap) {
 }
 
 static void handle_initialize(lsp_server_t *s, json_value *id, json_value *params) {
-    /* 底层系统交互与数据协议契约 */
     if (params) {
         const char *root_uri = json_get_str(json_obj_get(params, "rootUri"));
         const char *root_path = json_get_str(json_obj_get(params, "rootPath"));
@@ -1012,13 +950,11 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     ensure_project_indexed(s);
 
     json_value *caps = json_new_obj();
-    /* 模块核心语义抽象与接口调用契约 */
     json_value *sync = json_new_obj();
     json_obj_set(sync, "openClose", json_new_bool(true));
     json_obj_set(sync, "change", json_new_num(2)); /* incremental */
     json_obj_set(caps, "textDocumentSync", sync);
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *completion = json_new_obj();
     json_value *triggers = json_new_arr();
     json_arr_add(triggers, json_new_str("."));
@@ -1027,7 +963,6 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(completion, "resolveProvider", json_new_bool(false));
     json_obj_set(caps, "completionProvider", completion);
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *sig_help = json_new_obj();
     json_value *sig_triggers = json_new_arr();
     json_arr_add(sig_triggers, json_new_str("("));
@@ -1040,7 +975,6 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(caps, "referencesProvider", json_new_bool(true));
     json_obj_set(caps, "documentSymbolProvider", json_new_bool(true));
     json_obj_set(caps, "workspaceSymbolProvider", json_new_bool(true));
-    /* 内部辅助逻辑 */
     json_value *rename = json_new_obj();
     json_obj_set(rename, "prepareProvider", json_new_bool(true));
     json_obj_set(caps, "renameProvider", rename);
@@ -1049,24 +983,20 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     json_obj_set(caps, "documentFormattingProvider", json_new_bool(true));
     json_obj_set(caps, "documentRangeFormattingProvider", json_new_bool(true));
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *code_action = json_new_obj();
     json_value *ca_kinds = json_new_arr();
     json_arr_add(ca_kinds, json_new_str("source.organizeImports"));
     json_obj_set(code_action, "codeActionKinds", ca_kinds);
     json_obj_set(caps, "codeActionProvider", code_action);
 
-    /* 模块核心语义抽象与接口调用契约 */
     json_value *inlay_hint = json_new_obj();
     json_obj_set(inlay_hint, "resolveProvider", json_new_bool(false));
     json_obj_set(caps, "inlayHintProvider", inlay_hint);
 
-    /* 核心系统底层抽象与内存语义契约 */
     {
         json_value *sem_tokens = json_new_obj();
         json_value *legend = json_new_obj();
         json_value *token_types = json_new_arr();
-        /* 内部辅助实现 */
         json_arr_add(token_types, json_new_str("namespace"));
         json_arr_add(token_types, json_new_str("type"));
         json_arr_add(token_types, json_new_str("class"));
@@ -1089,7 +1019,6 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
         json_obj_set(caps, "semanticTokensProvider", sem_tokens);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *exec_cmd = json_new_obj();
     json_value *cmd_list = json_new_arr();
     json_arr_add(cmd_list, json_new_str("zan.checkLeaks"));
@@ -1107,10 +1036,8 @@ static void handle_initialize(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, result);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static intellisense_t *g_project_intel = NULL;
 
-/* 内部辅助实现 */
 static bool lsp_stdlib_root(char *out, size_t cap) {
     const char *env = getenv("ZAN_STDLIB");
     if (env && env[0]) {
@@ -1163,7 +1090,6 @@ static bool lsp_stdlib_root(char *out, size_t cap) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 static void ensure_stdlib_indexed(lsp_server_t *s) {
     static bool stdlib_indexed = false;
     if (stdlib_indexed) { return; }
@@ -1174,7 +1100,6 @@ static void ensure_stdlib_indexed(lsp_server_t *s) {
         intel_index_project(g_project_intel, root);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     const char *project_dir = s->workspace_root[0] ? s->workspace_root : ".";
     char pkg_roots[32][1024];
     int pkg_n = zan_pkg_all_source_roots(project_dir, pkg_roots, 32);
@@ -1193,11 +1118,9 @@ static void ensure_project_indexed(lsp_server_t *s) {
         if (!g_project_intel) return;
         intel_init(g_project_intel);
     }
-    /* 内部辅助实现 */
     if (s->workspace_root[0]) {
         intel_index_project(g_project_intel, s->workspace_root);
         if (intel_cancel_flag) {
-            /* 内部辅助逻辑 */
             s->project_indexed = false;
             return;
         }
@@ -1205,7 +1128,6 @@ static void ensure_project_indexed(lsp_server_t *s) {
     ensure_stdlib_indexed(s);
 }
 
-/* 内部辅助逻辑 */
 static void update_project_index(lsp_server_t *s, const char *uri,
                                  const char *text) {
     if (!g_project_intel || !uri || !text) return;
@@ -1222,20 +1144,17 @@ static void handle_did_open(lsp_server_t *s, json_value *params) {
     if (!uri || !text) return;
     lsp_set_doc(s, uri, text);
 
-    /* 底层系统交互与数据协议契约 */
     json_value *ver_j = json_obj_get(td, "version");
     int over = ver_j ? (int)json_get_num(ver_j, 0) : 0;
     lsp_doc_t *d = lsp_find_doc(s, uri);
     if (d && over > 0) d->version = over;
 
-    /* 底层系统交互与数据协议契约 */
     ensure_project_indexed(s);
     update_project_index(s, uri, text);
 
     publish_diagnostics(s, uri, text);
 }
 
-/* 内部辅助逻辑 */
 static void lsp_doc_apply_change(lsp_doc_t *d, json_value *change) {
     const char *text = json_get_str(json_obj_get(change, "text"));
     if (!text) return;
@@ -1279,13 +1198,11 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     int n = json_arr_count(changes);
     if (n <= 0) return;
 
-    /* 内部辅助实现 */
     json_value *ver_j = json_obj_get(td, "version");
     int incoming = ver_j ? (int)json_get_num(ver_j, 0) : 0;
 
     lsp_doc_t *d = lsp_find_doc(s, uri);
     if (!d) {
-        /* 内部辅助逻辑 */
         for (int i = 0; i < n && !d; i++) {
             json_value *ch = json_arr_at(changes, i);
             if (!json_obj_get(ch, "range")) {
@@ -1299,7 +1216,6 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
         if (!d) return;
     } else {
         if (incoming > 0 && incoming <= d->version) return;
-        /* 模块核心语义抽象与接口调用契约 */
         for (int i = 0; i < n; i++)
             lsp_doc_apply_change(d, json_arr_at(changes, i));
     }
@@ -1308,16 +1224,13 @@ static void handle_did_change(lsp_server_t *s, json_value *params) {
     d->last_change_ms = lsp_now_ms();
     d->diag_pending = true;
 
-    /* 内部辅助逻辑 */
     update_project_index(s, uri, d->text);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static intellisense_t *g_doc_intel = NULL;
 static char g_doc_intel_uri[512] = "";
 static long g_doc_intel_version = -1;
 
-/* 内部辅助逻辑 */
 static intellisense_t *doc_intel_for(lsp_server_t *s, const char *uri) {
     lsp_doc_t *doc = lsp_find_doc(s, uri);
     if (!doc) return NULL;
@@ -1349,13 +1262,10 @@ static void handle_did_close(lsp_server_t *s, json_value *params) {
     if (!uri) return;
     lsp_remove_doc(s, uri);
     doc_intel_invalidate(uri);
-    /* 核心系统底层抽象与内存语义契约 */
     publish_diagnostics(s, uri, "");
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助实现 */
 static int diag_worker_loop(lsp_server_t *s) {
     while (!s->diag_stop) {
         lsp_sleep_ms(20);
@@ -1390,7 +1300,6 @@ static void *diag_worker_main(void *arg) {
 }
 #endif
 
-/* 底层系统交互与数据协议契约 */
 static bool get_position(json_value *params, const char **uri,
                          int *line, int *character) {
     json_value *td = json_obj_get(params, "textDocument");
@@ -1401,7 +1310,6 @@ static bool get_position(json_value *params, const char **uri,
     return *uri != NULL;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int complete_var_init_members(const lsp_doc_t *doc, intellisense_t *is,
                                      const char *name, int line, int character,
                                      const char *prefix) {
@@ -1442,7 +1350,6 @@ static int complete_var_init_members(const lsp_doc_t *doc, intellisense_t *is,
     init[e - i] = '\0';
 
     char fm[64];
-    /* 内部辅助逻辑 */
     char dotted[300];
     snprintf(dotted, sizeof(dotted), "%s.", init);
     const char *ct = intel_resolve_chain_pos(is, g_project_intel, dotted, fm,
@@ -1467,29 +1374,24 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     prefix_before(doc->text, off, prefix, sizeof(prefix));
     member_context(doc->text, off, context, sizeof(context));
 
-    /* 底层系统交互与数据协议契约 */
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_arr()); return; }
 
     const char *effective = prefix[0] ? prefix : "";
     int count = 0;
 
-    /* 模块核心语义抽象与接口调用契约 */
     char ns_prefix[128];
     bool ns_mode = using_ns_context(doc->text, off, ns_prefix, sizeof(ns_prefix));
     if (ns_mode) {
         count = intel_complete_usings(is, g_project_intel, ns_prefix);
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (!ns_mode && context[0]) {
         const char *resolve_type = context;
         char chain_prefix[128] = "";
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (strncmp(context, "CHAIN:", 6) == 0) {
             const char *chain_expr = context + 6;
-            /* 语言服务与调试协议交互规范 */
             const char *chain_type = intel_resolve_chain_pos(is, g_project_intel, chain_expr,
                                                              chain_prefix, sizeof(chain_prefix),
                                                              line, character);
@@ -1505,23 +1407,18 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
                     effective = prefix[0] ? prefix : "";
                 }
             } else {
-                /* 底层系统交互与数据协议契约 */
                 resolve_type = "";
             }
         }
 
         if (resolve_type[0]) {
-            /* 内部辅助逻辑 */
             count = intel_complete_members_pos(is, resolve_type, effective,
                                                line, character);
             if (count == 0 && strncmp(context, "CHAIN:", 6) != 0) {
-                /* 模块核心语义抽象与接口调用契约 */
                 count = complete_var_init_members(doc, is, context, line,
                                                   character, effective);
             }
-            /* 模块核心语义抽象与接口调用契约 */
             if (g_project_intel) {
-                /* 内部辅助逻辑 */
                 const char *local_t = intel_resolve_type_pos(is, resolve_type,
                                                              line, character);
                 const char *query_t = (local_t && local_t[0]) ? local_t
@@ -1550,13 +1447,10 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
             }
         }
     } else if (!ns_mode && effective[0]) {
-        /* 内部辅助逻辑 */
         count = intel_complete_pos(is, effective, NULL, line, character);
-        /* 模块核心语义抽象与接口调用契约 */
         if (g_project_intel && count < 20) {
             const char *encl = intel_enclosing_type_at(is, line, character);
             int proj_count = intel_complete_bare(g_project_intel, effective, encl);
-            /* 模块核心语义抽象与接口调用契约 */
             for (int pi = 0; pi < proj_count && count < INTEL_MAX_COMPLETIONS; pi++) {
                 bool dup = false;
                 for (int li = 0; li < count; li++) {
@@ -1568,7 +1462,6 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
                 }
                 if (!dup) {
                     is->completions[count] = g_project_intel->completions[pi];
-                    /* 内部辅助逻辑 */
                     count++;
                 }
             }
@@ -1585,7 +1478,6 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         json_obj_set(item, "detail", json_new_str(c->detail));
         json_obj_set(item, "kind", json_new_num(lsp_completion_kind(c->kind)));
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (c->doc[0]) {
             json_value *doc_obj = json_new_obj();
             json_obj_set(doc_obj, "kind", json_new_str("markdown"));
@@ -1593,12 +1485,10 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
             json_obj_set(item, "documentation", doc_obj);
         }
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (c->kind == ISYM_SNIPPET) {
             json_obj_set(item, "insertTextFormat", json_new_num(2));
         }
 
-        /* 核心系统底层抽象与内存语义契约 */
         char sort_key[140];
         snprintf(sort_key, sizeof(sort_key), "%d_%s", c->sort_priority + 5, c->label);
         json_obj_set(item, "sortText", json_new_str(sort_key));
@@ -1640,7 +1530,6 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
                     m->decl_offset, m->start_line, m->start_col, m->end_line, m->end_col);
         }
     }
-    /* 内部辅助实现 */
     hover_info_t h = {0};
     char chain[256];
     if (receiver_chain_before(doc->text, off, chain, sizeof(chain))) {
@@ -1648,7 +1537,6 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
         const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
                                                  fm, sizeof(fm), line, character);
         if (!rt || !rt[0]) {
-            /* 内部辅助逻辑 */
             rt = intel_resolve_chain_pos(g_project_intel, is, chain,
                                          fm, sizeof(fm), line, character);
         }
@@ -1656,11 +1544,9 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
             h = intel_hover_member(g_project_intel, rt, word);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (!h.valid)
         h = intel_hover_pos(is, word, line, character);
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (!h.valid && g_project_intel)
         h = intel_hover_at(g_project_intel, word, -1);
     if (!h.valid) { send_response(s, id, json_new_null()); return; }
@@ -1679,7 +1565,6 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
     send_response(s, id, result);
 }
 
-/* 内部辅助逻辑 */
 static void fspath_to_uri(const char *path, char *out, size_t cap);
 static bool same_uri_ci(const char *a, const char *b);
 
@@ -1703,13 +1588,11 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     char chain[256];
     bool member_ctx = receiver_chain_before(doc->text, off, chain, sizeof(chain));
 
-    /* 内部辅助实现 */
     if (member_ctx) {
         char fm[64];
         const char *rt = intel_resolve_chain_pos(is, g_project_intel, chain,
                                                  fm, sizeof(fm), line, character);
         if (!rt || !rt[0]) {
-            /* 内部辅助逻辑 */
             rt = intel_resolve_chain_pos(g_project_intel, is, chain,
                                          fm, sizeof(fm), line, character);
         }
@@ -1718,13 +1601,12 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
         }
     }
     if (!g.found) {
-        /* 内部辅助实现 */
         const isym_t *loc = intel_lookup_symbol_at(is, word, line, character);
         if (loc && (loc->kind == ISYM_VARIABLE || loc->kind == ISYM_PARAMETER)) {
             g.found = true;
             g.line = loc->line;
             g.col = loc->col;
-            g.file[0] = '\0'; /* 核心系统底层抽象与内存语义契约 */
+            g.file[0] = '\0';
         }
     }
     if (!g.found)
@@ -1733,7 +1615,6 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
         g = intel_goto_def(g_project_intel, word);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
-    /* 内部辅助实现 */
     char target_uri[1800];
     if (g.file[0] && strncmp(g.file, "file://", 7) == 0) {
         snprintf(target_uri, sizeof(target_uri), "%s", g.file);
@@ -1748,7 +1629,6 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
         dl = g.line;
         dc = g.col;
     } else {
-        /* 核心系统底层抽象与内存语义契约 */
         dl = g.line;
         dc = 0;
     }
@@ -1768,7 +1648,6 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, loc);
 }
 
-/* 内部辅助实现 */
 static void scan_string_refs(const char *text, size_t *ip, const char *word,
                              size_t wlen, size_t *offsets, int *count,
                              int max, int depth) {
@@ -1792,13 +1671,12 @@ static void scan_string_refs(const char *text, size_t *ip, const char *word,
         *ip = i;
         return;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     int hole = 0;
     bool fmt = false;
     while (text[i]) {
         char d = text[i];
         if (hole == 0) {
-            if (d == '"') break; /* 核心系统底层抽象与内存语义契约 */
+            if (d == '"') break;
             if (d == '{') {
                 if (text[i + 1] == '{') { i += 2; continue; } /* escaped */
                 hole = 1;
@@ -1866,7 +1744,6 @@ static int find_text_references(const char *text, const char *word,
     return count;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static char *read_file_all(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -1882,7 +1759,6 @@ static char *read_file_all(const char *path) {
     return buf;
 }
 
-/* 内部辅助逻辑 */
 static void fspath_to_uri(const char *path, char *out, size_t cap) {
     if (strncmp(path, "file://", 7) == 0) {
         snprintf(out, cap, "%s", path);
@@ -1898,7 +1774,6 @@ static void fspath_to_uri(const char *path, char *out, size_t cap) {
     uri_percent_encode_path(raw, out, cap);
 }
 
-/* 内部辅助实现 */
 static bool same_uri_ci(const char *a, const char *b) {
     char da[1800], db[1800];
     uri_percent_decode(a, da, sizeof(da));
@@ -1914,14 +1789,12 @@ static bool same_uri_ci(const char *a, const char *b) {
     return *a == '\0' && *b == '\0';
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool uri_is_open(lsp_server_t *s, const char *uri) {
     for (int i = 0; i < s->doc_count; i++)
         if (same_uri_ci(s->docs[i].uri, uri)) return true;
     return false;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int add_locations(json_value *arr, const char *uri,
                          const char *text, const char *word,
                          int lo, int hi) {
@@ -1948,7 +1821,6 @@ static int add_locations(json_value *arr, const char *uri,
     return n;
 }
 
-/* 内部辅助逻辑 */
 static bool type_simple_same(const char *a, const char *b) {
     char sa[128], sb[128];
     snprintf(sa, sizeof(sa), "%s", a ? a : "");
@@ -1960,15 +1832,14 @@ static bool type_simple_same(const char *a, const char *b) {
     return strcmp(pa, pb) == 0;
 }
 
-/* 内部辅助实现 */
 typedef struct {
     bool ok;
     bool is_local;
-    char rt_simple[128]; /* 核心系统底层抽象与内存语义契约 */
+    char rt_simple[128];
     bool have_decl;
-    char decl_ref[512];  /* 核心系统底层抽象与内存语义契约 */
-    int decl_line, decl_col; /* 核心系统底层抽象与内存语义契约 */
-    int ldecl_line, ldecl_col; /* 核心系统底层抽象与内存语义契约 */
+    char decl_ref[512];
+    int decl_line, decl_col;
+    int ldecl_line, ldecl_col;
     const char *origin_uri;
     char word[128];
 } sym_target_t;
@@ -1986,7 +1857,6 @@ static bool occurrence_matches(const sym_target_t *t, const char *text,
                                intellisense_t *de, intellisense_t *project,
                                const char *doc_uri, size_t off, int rl, int rc) {
     if (t->is_local) {
-        /* 内部辅助实现 */
         if (!de || strcmp(doc_uri, t->origin_uri) != 0) return false;
         /* `recv */
         if (off > 0 && text[off - 1] == '.') return false;
@@ -2006,7 +1876,6 @@ static bool occurrence_matches(const sym_target_t *t, const char *text,
                                           rl, rc);
         if (rt2 && rt2[0] && type_simple_same(rt2, t->rt_simple)) return true;
     }
-    /* 内部辅助逻辑 */
     if (de) {
         const isym_t *s2 = intel_lookup_symbol_at(de, t->word, rl, rc);
         if (s2 && s2->parent[0] && type_simple_same(s2->parent, t->rt_simple))
@@ -2023,7 +1892,6 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
     snprintf(t->word, sizeof(t->word), "%s", word);
     t->origin_uri = uri;
 
-    /* 底层系统交互与数据协议契约 */
     char chain[256];
     if (receiver_chain_before(text, off, chain, sizeof(chain))) {
         char fm[64];
@@ -2055,8 +1923,7 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
     const isym_t *sym = intel_lookup_symbol_at(is, word, line, character);
     if (!sym) return false;
     if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) {
-        if (sym->line < 0) return false; /* 核心系统底层抽象与内存语义契约 */
-        /* 内部辅助逻辑 */
+        if (sym->line < 0) return false;
         char dcheck[128];
         word_at(text, pos_to_offset(text, sym->line, sym->col), dcheck,
                 sizeof(dcheck));
@@ -2070,7 +1937,6 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
     if ((sym->kind == ISYM_FIELD || sym->kind == ISYM_PROPERTY ||
          sym->kind == ISYM_EVENT || sym->kind == ISYM_METHOD) &&
         sym->parent[0]) {
-        /* 内部辅助逻辑 */
         t->ok = true;
         t->is_local = false;
         snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", sym->parent);
@@ -2087,7 +1953,6 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
     return false;
 }
 
-/* 内部辅助逻辑 */
 static int add_scoped_locations(json_value *arr, const char *doc_uri,
                                 const char *text, intellisense_t *de,
                                 intellisense_t *project, const sym_target_t *t,
@@ -2120,13 +1985,12 @@ static int add_scoped_locations(json_value *arr, const char *doc_uri,
     return added;
 }
 
-/* 底层系统交互与数据协议契约 */
 static intellisense_t *g_unopened_intel = NULL;
 
 typedef struct {
-    json_value *out;      /* 底层系统交互与数据协议契约 */
+    json_value *out;
     const sym_target_t *t;
-    const char *new_name; /* 核心系统底层抽象与内存语义契约 */
+    const char *new_name;
     bool include_decl;
     bool covered_decl;
     intellisense_t *scratch;
@@ -2164,7 +2028,6 @@ static intellisense_t *unopened_scratch(void) {
     return g_unopened_intel;
 }
 
-/* 内部辅助逻辑 */
 typedef void (*project_file_fn)(void *ctx, const char *uri, const char *text);
 
 static bool lsp_cancel_hit(lsp_server_t *s);
@@ -2197,7 +2060,6 @@ static void refs_visit(void *ctx, const char *uri, const char *text) {
     add_locations(rc->arr, uri, text, rc->word, -1, -1);
 }
 
-/* 内部辅助逻辑 */
 static void handle_references(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -2212,7 +2074,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     word_at(doc->text, off, word, sizeof(word));
     if (!word[0]) { send_response(s, id, json_new_arr()); return; }
 
-    /* 内部辅助实现 */
     intellisense_t *is = doc_intel_for(s, uri);
     sym_target_t t;
     bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri, word,
@@ -2223,10 +2084,8 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
         json_value *ctxj = json_obj_get(params, "context");
         if (ctxj) {
             json_value *idj = json_obj_get(ctxj, "includeDeclaration");
-            /* 内部辅助逻辑 */
             if (idj) include_decl = json_get_bool(idj, json_get_num(idj, 1) != 0.0);
         }
-        /* 内部辅助逻辑 */
         int od = -1;
         for (int d = 0; d < s->doc_count; d++)
             if (strcmp(s->docs[d].uri, uri) == 0) { od = d; break; }
@@ -2240,7 +2099,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
             add_scoped_locations(arr, dd->uri, dd->text, de, g_project_intel,
                                  &t, include_decl);
         }
-        /* 内部辅助逻辑 */
         bool covered_decl = false;
         if (!lsp_cancel_hit(s) && g_project_intel) {
             intellisense_t *scratch = unopened_scratch();
@@ -2256,7 +2114,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
                 covered_decl = uc.covered_decl;
             }
         }
-        /* 模块核心语义抽象与接口调用契约 */
         if (!t.is_local && t.have_decl && include_decl && !covered_decl) {
             bool covered = false;
             for (int d = 0; d < s->doc_count; d++)
@@ -2293,7 +2150,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
         return;
     }
 
-    /* 内部辅助逻辑 */
     json_value *arr = json_new_arr();
     for (int d = 0; d < s->doc_count; d++) {
         if (lsp_cancel_hit(s)) break;
@@ -2303,7 +2159,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
         refs_ctx_t rc; rc.arr = arr; rc.word = word;
         for_each_unopened_project_file(s, &rc, refs_visit);
     }
-    /* 底层系统交互与数据协议契约 */
     if (lsp_cancel_hit(s)) {
         json_free(arr);
         send_response_error(s, id, -32800, "Request cancelled");
@@ -2312,7 +2167,6 @@ static void handle_references(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, arr);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
@@ -2338,7 +2192,6 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
     signature_info_t sig = intel_signature_help(is, method_name,
                                                  class_context[0] ? class_context : NULL);
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (!sig.valid && recv_chain[0]) {
         char fm[64];
         const char *rt = intel_resolve_chain_pos(is, g_project_intel, recv_chain,
@@ -2354,7 +2207,6 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
 
     if (!sig.valid) { send_response(s, id, json_new_null()); return; }
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *result = json_new_obj();
 
     json_value *sigs = json_new_arr();
@@ -2405,7 +2257,6 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
     json_value *arr = json_new_arr();
     for (int i = 0; i < is->symbol_count; i++) {
         isym_t *sym = &is->symbols[i];
-        /* 模块核心语义抽象与接口调用契约 */
         if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) continue;
 
         json_value *sinfo = json_new_obj();
@@ -2435,7 +2286,6 @@ static void handle_document_symbol(lsp_server_t *s, json_value *id, json_value *
     send_response(s, id, arr);
 }
 
-/* 内部辅助逻辑 */
 static json_value *rename_edits_for(const char *text, const char *word,
                                     const char *new_name, int lo, int hi) {
     size_t offsets[512];
@@ -2463,8 +2313,6 @@ static json_value *rename_edits_for(const char *text, const char *word,
     return edits;
 }
 
-/* 内部辅助逻辑 */
-/* 内部辅助逻辑 */
 static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
                                        intellisense_t *de, intellisense_t *project,
                                        const sym_target_t *t,
@@ -2497,7 +2345,6 @@ static json_value *scoped_rename_edits(const char *doc_uri, const char *text,
     return edits;
 }
 
-/* 内部辅助逻辑 */
 static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri; int line, character;
     const char *new_name = json_get_str(json_obj_get(params, "newName"));
@@ -2505,7 +2352,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
         send_response(s, id, json_new_null());
         return;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (!(isalpha((unsigned char)new_name[0]) || new_name[0] == '_')) {
         send_response(s, id, json_new_null());
         return;
@@ -2513,7 +2359,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     for (const char *p = new_name + 1; *p; p++) {
         if (!is_ident_char(*p)) { send_response(s, id, json_new_null()); return; }
     }
-    /* 内部辅助逻辑 */
     if (intel_is_keyword(new_name)) {
         send_response_error(s, id, -32602, "newName is a keyword");
         return;
@@ -2531,7 +2376,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
     bool resolved = resolve_sym_target(is, g_project_intel, doc->text, off, uri,
                                        word, line, character, &t);
     if (resolved) {
-        /* 内部辅助逻辑 */
         if (t.is_local && strcmp(word, new_name) != 0 && is) {
             for (int i = 0; i < is->symbol_count; i++) {
                 const isym_t *sym = &is->symbols[i];
@@ -2544,9 +2388,7 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
             }
         }
         json_value *changes = json_new_obj();
-        /* 内部辅助逻辑 */
         bool decl_open = false;
-        /* 内部辅助逻辑 */
         int od = -1;
         for (int d = 0; d < s->doc_count; d++)
             if (strcmp(s->docs[d].uri, uri) == 0) { od = d; break; }
@@ -2564,7 +2406,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
             if (edits) json_obj_set(changes, dd->uri, edits);
             if (t.have_decl && same_uri_ci(dd->uri, t.decl_ref)) decl_open = true;
         }
-        /* 模块核心语义抽象与接口调用契约 */
         bool covered_decl = decl_open;
         if (!lsp_cancel_hit(s) && g_project_intel) {
             intellisense_t *scratch = unopened_scratch();
@@ -2580,7 +2421,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
                 covered_decl = covered_decl || uc.covered_decl;
             }
         }
-        /* 模块核心语义抽象与接口调用契约 */
         if (!t.is_local && t.have_decl && !covered_decl) {
             json_value *edits = json_new_arr();
             json_value *edit = json_new_obj();
@@ -2611,7 +2451,6 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
         return;
     }
 
-    /* 内部辅助逻辑 */
     json_value *changes = json_new_obj();
     json_value *edits = rename_edits_for(doc->text, word, new_name, -1, -1);
     if (edits) json_obj_set(changes, doc->uri, edits);
@@ -2623,17 +2462,16 @@ static void handle_rename(lsp_server_t *s, json_value *id, json_value *params) {
 
 /* formatting */
 
-/* 内部辅助实现 */
 
 typedef struct {
-    bool in_str;    /* 核心系统底层抽象与内存语义契约 */
-    bool in_block;  /* 底层系统交互与数据协议契约 */
+    bool in_str;
+    bool in_block;
 } fmt_scan_t;
 
 typedef struct {
-    int  level;            /* 核心系统底层抽象与内存语义契约 */
-    int  lead;             /* 核心系统底层抽象与内存语义契约 */
-    const char *content;   /* 核心系统底层抽象与内存语义契约 */
+    int  level;
+    int  lead;
+    const char *content;
     int  content_len;
     bool blank;
 } fmt_line_t;
@@ -2665,7 +2503,6 @@ static bool txtbuf_spaces(txtbuf_t *b, int n) {
     return true;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static fmt_line_t *fmt_scan(const char *text, int *out_count, fmt_scan_t *st) {
     int nlines = 1;
     for (const char *p = text; *p; p++)
@@ -2689,7 +2526,6 @@ static fmt_line_t *fmt_scan(const char *text, int *out_count, fmt_scan_t *st) {
         L->content_len = (int)(ce - cs);
         L->blank = L->content_len == 0;
 
-        /* 内部辅助逻辑 */
         bool ends_open = false;
         for (const char *q = cs; q < ce; ) {
             char c = *q;
@@ -2705,7 +2541,7 @@ static fmt_line_t *fmt_scan(const char *text, int *out_count, fmt_scan_t *st) {
                 continue;
             }
             if (c == '"') { st->in_str = true; q++; continue; }
-            if (c == '/' && q + 1 < ce && q[1] == '/') break; /* 核心系统底层抽象与内存语义契约 */
+            if (c == '/' && q + 1 < ce && q[1] == '/') break;
             if (c == '/' && q + 1 < ce && q[1] == '*') { st->in_block = true; q += 2; continue; }
             ends_open = (c == '{');
             q++;
@@ -2724,7 +2560,6 @@ static fmt_line_t *fmt_scan(const char *text, int *out_count, fmt_scan_t *st) {
     return lines;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void handle_formatting(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -2774,7 +2609,6 @@ static void handle_formatting(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, result);
 }
 
-/* 内部辅助逻辑 */
 static void handle_range_formatting(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -2795,7 +2629,7 @@ static void handle_range_formatting(lsp_server_t *s, json_value *id, json_value 
                 fmt_line_t *L = &lines[i];
                 if (L->blank) continue;
                 int want = L->level * 4;
-                if (want == L->lead) continue; /* 核心系统底层抽象与内存语义契约 */
+                if (want == L->lead) continue;
                 json_value *edit = json_new_obj();
                 json_value *range = json_new_obj();
                 json_value *start = json_new_obj();
@@ -2803,7 +2637,6 @@ static void handle_range_formatting(lsp_server_t *s, json_value *id, json_value 
                 json_obj_set(start, "line", json_new_num(i));
                 json_obj_set(start, "character", json_new_num(0));
                 json_obj_set(endp, "line", json_new_num(i));
-                /* 底层系统交互与数据协议契约 */
                 json_obj_set(endp, "character", json_new_num(L->lead));
                 json_obj_set(range, "start", start);
                 json_obj_set(range, "end", endp);
@@ -2834,7 +2667,6 @@ static void handle_document_highlight(lsp_server_t *s, json_value *id, json_valu
             char word[128];
             word_at(doc->text, off, word, sizeof(word));
             if (word[0]) {
-                /* 语言服务与调试协议交互规范 */
                 int lo = -1, hi = -1;
                 intellisense_t *is = doc_intel_for(s, uri);
                 int ms = -1, me = -1, dl = -1;
@@ -2866,7 +2698,6 @@ static void handle_document_highlight(lsp_server_t *s, json_value *id, json_valu
     send_response(s, id, result);
 }
 
-/* 内部辅助逻辑 */
 static void handle_folding_range(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -2923,7 +2754,6 @@ static void handle_folding_range(lsp_server_t *s, json_value *id, json_value *pa
 
 /* prepareRename */
 
-/* 内部辅助逻辑 */
 static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *params) {
     const char *uri;
     int line, character;
@@ -2949,7 +2779,6 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     memcpy(word, doc->text + start, n);
     word[n] = '\0';
 
-    /* 内部辅助实现 */
     intellisense_t *is = doc_intel_for(s, uri);
     sym_target_t t;
     bool renamable = resolve_sym_target(is, g_project_intel, doc->text, off,
@@ -2971,7 +2800,6 @@ static void handle_prepare_rename(lsp_server_t *s, json_value *id, json_value *p
     send_response(s, id, result);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool name_matches_query(const char *name, const char *query) {
     if (!query || !query[0]) return true;
     size_t qlen = strlen(query);
@@ -2985,7 +2813,6 @@ static bool name_matches_query(const char *name, const char *query) {
     return false;
 }
 
-/* 内部辅助逻辑 */
 static void handle_workspace_symbol(lsp_server_t *s, json_value *id, json_value *params) {
     const char *query = json_get_str(json_obj_get(params, "query"));
     ensure_project_indexed(s);
@@ -3033,7 +2860,6 @@ static void handle_workspace_symbol(lsp_server_t *s, json_value *id, json_value 
     send_response(s, id, arr);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void handle_code_action(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -3042,7 +2868,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
     lsp_doc_t *doc = lsp_find_doc(s, uri);
     if (!doc || !doc->text) { send_response(s, id, json_new_arr()); return; }
 
-    /* 模块核心语义抽象与接口调用契约 */
     intellisense_t *is = g_project_intel;
     if (!is) {
         is = (intellisense_t *)malloc(sizeof(intellisense_t));
@@ -3055,17 +2880,14 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
 
     json_value *actions = json_new_arr();
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (analysis.missing_count > 0 || analysis.unused_count > 0) {
         json_value *action = json_new_obj();
         json_obj_set(action, "title", json_new_str("Organize Usings"));
         json_obj_set(action, "kind", json_new_str("source.organizeImports"));
 
-        /* 模块核心语义抽象与接口调用契约 */
         size_t new_len;
         char *new_text = intel_organize_usings(is, doc->text, doc_len, &new_len);
         if (new_text) {
-            /* 核心系统底层抽象与内存语义契约 */
             json_value *edit_obj = json_new_obj();
             json_value *changes = json_new_obj();
             json_value *edits = json_new_arr();
@@ -3078,7 +2900,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
             json_obj_set(start_pos, "line", json_new_num(0));
             json_obj_set(start_pos, "character", json_new_num(0));
 
-            /* 底层系统交互与数据协议契约 */
             int line_count = 0;
             for (size_t i = 0; i < doc_len; i++)
                 if (doc->text[i] == '\n') line_count++;
@@ -3099,7 +2920,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
         json_arr_add(actions, action);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = 0; i < analysis.missing_count; i++) {
         json_value *action = json_new_obj();
         char title[256];
@@ -3107,7 +2927,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
         json_obj_set(action, "title", json_new_str(title));
         json_obj_set(action, "kind", json_new_str("quickfix"));
 
-        /* 底层系统交互与数据协议契约 */
         json_value *edit_obj = json_new_obj();
         json_value *changes = json_new_obj();
         json_value *edits = json_new_arr();
@@ -3136,7 +2955,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
         json_arr_add(actions, action);
     }
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < analysis.unused_count; i++) {
         int idx = analysis.unused_indices[i];
         json_value *action = json_new_obj();
@@ -3173,7 +2991,6 @@ static void handle_code_action(lsp_server_t *s, json_value *id, json_value *para
     send_response(s, id, actions);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void handle_inlay_hint(lsp_server_t *s, json_value *id, json_value *params) {
     json_value *td = json_obj_get(params, "textDocument");
     const char *uri = json_get_str(json_obj_get(td, "uri"));
@@ -3205,8 +3022,6 @@ static void handle_inlay_hint(lsp_server_t *s, json_value *id, json_value *param
     send_response(s, id, arr);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
 static int map_token_type(zan_token_kind_t tk) {
     switch (tk) {
     case TK_CLASS:
@@ -3323,7 +3138,6 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
 
     intellisense_t *is = doc_intel_for(s, uri);
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_arena_t *arena = zan_arena_new();
     zan_diag_t *diag = zan_diag_new(arena);
     zan_diag_set_capture(diag, true);
@@ -3331,7 +3145,6 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
     zan_lexer_t lex;
     zan_lexer_init(&lex, doc->text, strlen(doc->text), 0, arena, diag);
 
-    /* 模块核心语义抽象与接口调用契约 */
     json_value *data = json_new_arr();
     int prev_line = 0;
     int prev_char = 0;
@@ -3345,7 +3158,6 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
             const char *ident_str = tok.str_val.str;
             tlen = (int)tok.str_val.len;
 
-            /* 核心系统底层抽象与内存语义契约 */
             if (is) {
                 for (int si = 0; si < is->symbol_count; si++) {
                     if ((int)strlen(is->symbols[si].name) == tlen &&
@@ -3365,7 +3177,6 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
                 }
             }
             if (token_type == -1) {
-                /* 模块核心语义抽象与接口调用契约 */
                 if (tlen > 0 && isupper((unsigned char)ident_str[0])) {
                     token_type = 1; /* type */
                 } else {
@@ -3377,7 +3188,6 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
             if (tok.kind == TK_STRING_LIT || tok.kind == TK_CHAR_LIT) {
                 tlen = (int)tok.str_val.len;
             } else {
-                /* 模块核心语义抽象与接口调用契约 */
                 const char *ls = line_start_at(doc->text, (int)tok.loc.line - 1);
                 if (ls) {
                     const char *p = ls + (tok.loc.col - 1);
@@ -3420,16 +3230,13 @@ static void handle_semantic_tokens_full(lsp_server_t *s, json_value *id, json_va
     send_response(s, id, result);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 底层系统交互与数据协议契约 */
 static void uri_to_fspath(const char *uri, char *out, size_t cap) {
     out[0] = '\0';
     if (!uri) return;
     uri_to_native_path(uri, out, cap);
 }
 
-/* 内部辅助逻辑 */
 static void run_leak_check(lsp_server_t *s, const char *uri) {
     char src[1024];
     uri_to_fspath(uri, src, sizeof(src));
@@ -3453,8 +3260,6 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
     snprintf(out_exe, sizeof(out_exe), "%s.leakcheck", src);
 #endif
 
-    /* 内部辅助逻辑 */
-    /* 内部辅助逻辑 */
     char build_cmd[4096];
     snprintf(build_cmd, sizeof(build_cmd),
 #ifdef _WIN32
@@ -3493,13 +3298,11 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
                 const char *at = strstr(line, "allocated at ");
                 if (!at) continue;
                 at += strlen("allocated at ");
-                /* 核心系统底层抽象与内存语义契约 */
                 char loc[1024];
                 strncpy(loc, at, sizeof(loc) - 1);
                 loc[sizeof(loc) - 1] = '\0';
                 char *nl = strpbrk(loc, "\r\n");
                 if (nl) *nl = '\0';
-                /* 模块核心语义抽象与接口调用契约 */
                 char *c2 = strrchr(loc, ':');
                 if (!c2) continue;
                 *c2 = '\0';
@@ -3538,7 +3341,6 @@ static void run_leak_check(lsp_server_t *s, const char *uri) {
         remove(out_exe);
     }
 
-    /* 底层系统交互与数据协议契约 */
     json_value *params = json_new_obj();
     json_obj_set(params, "uri", json_new_str(uri));
     json_obj_set(params, "diagnostics", arr);
@@ -3586,7 +3388,6 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
     json_value *params = json_obj_get(msg, "params");
     if (!method) return;
 
-    /* 内部辅助逻辑 */
     lsp_doc_lock(s);
     if (strcmp(method, "initialize") == 0) {
         handle_initialize(s, id, params);
@@ -3599,7 +3400,6 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
     } else if (strcmp(method, "textDocument/didClose") == 0) {
         handle_did_close(s, params);
     } else if (strcmp(method, "textDocument/didSave") == 0) {
-        /* 核心系统底层抽象与内存语义契约 */
     } else if (strcmp(method, "textDocument/completion") == 0) {
         handle_completion(s, id, params);
     } else if (strcmp(method, "textDocument/hover") == 0) {
@@ -3638,19 +3438,15 @@ static void dispatch(lsp_server_t *s, json_value *msg) {
         s->shutdown_requested = true;
         send_response(s, id, json_new_null());
     } else if (strcmp(method, "exit") == 0) {
-        /* 核心系统底层抽象与内存语义契约 */
     } else if (id) {
-        /* 模块核心语义抽象与接口调用契约 */
         send_response(s, id, json_new_null());
     }
     lsp_doc_unlock(s);
 }
 
-/* 底层系统交互与数据协议契约 */
 
 #define LSP_Q_MAX 1024
 
-/* 内部辅助逻辑 */
 static void lsp_q_lock(lsp_server_t *s) {
 #ifdef _WIN32
     EnterCriticalSection(&s->q_lock);
@@ -3667,7 +3463,6 @@ static void lsp_q_unlock(lsp_server_t *s) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool q_push(lsp_server_t *s, json_value *msg) {
     lsp_msg_t *n = (lsp_msg_t *)malloc(sizeof(*n));
     if (!n) return false;
@@ -3688,7 +3483,6 @@ static bool q_push(lsp_server_t *s, json_value *msg) {
     return ok;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static lsp_msg_t *q_pop(lsp_server_t *s) {
     for (;;) {
         lsp_msg_t *n = NULL;
@@ -3707,7 +3501,6 @@ static lsp_msg_t *q_pop(lsp_server_t *s) {
 
 static bool cancel_matches_locked(lsp_server_t *s);
 
-/* 内部辅助实现 */
 static void q_set_cancel(lsp_server_t *s, json_value *id) {
     if (!id) return;
     lsp_q_lock(s);
@@ -3733,7 +3526,6 @@ static bool cancel_matches_locked(lsp_server_t *s) {
     return s->cancel_num == s->exec_num;
 }
 
-/* 内部辅助逻辑 */
 static bool lsp_cancel_hit(lsp_server_t *s) {
     lsp_q_lock(s);
     bool hit = cancel_matches_locked(s);
@@ -3742,7 +3534,6 @@ static bool lsp_cancel_hit(lsp_server_t *s) {
     return hit;
 }
 
-/* 内部辅助逻辑 */
 static bool lsp_take_cancel(lsp_server_t *s, json_value *id) {
     bool hit = false;
     lsp_q_lock(s);
@@ -3761,13 +3552,11 @@ static bool lsp_take_cancel(lsp_server_t *s, json_value *id) {
         hit = true;
         s->cancel_valid = false;
     }
-    /* 内部辅助实现 */
     lsp_q_unlock(s);
-    intel_cancel_flag = 0; /* 内部辅助逻辑 */
+    intel_cancel_flag = 0;
     return hit;
 }
 
-/* 内部辅助逻辑 */
 static void lsp_clear_exec(lsp_server_t *s) {
     lsp_q_lock(s);
     s->exec_valid = false;
@@ -3789,11 +3578,10 @@ static void *lsp_worker_main(void *arg) {
 }
 #endif
 
-/* 内部辅助逻辑 */
 static void lsp_worker_loop(lsp_server_t *s) {
     for (;;) {
         lsp_msg_t *m = q_pop(s);
-        if (!m) break; /* 内部辅助逻辑 */
+        if (!m) break;
         json_value *msg = m->msg;
         free(m);
         if (!msg) break; /* sentinel */
@@ -3849,13 +3637,11 @@ int main(int argc, char **argv) {
         server.use_sock = true;
     } else {
 #ifdef _WIN32
-        /* 底层系统交互与数据协议契约 */
         _setmode(_fileno(stdin), _O_BINARY);
         _setmode(_fileno(stdout), _O_BINARY);
 #endif
     }
 
-    /* 内部辅助逻辑 */
     for (;;) {
         char *body = server.use_sock ? rpc_read_message_sock(server.sock)
                                      : rpc_read_message(stdin);
@@ -3882,7 +3668,6 @@ int main(int argc, char **argv) {
         if (is_exit) break;
     }
 
-    /* 内部辅助逻辑 */
     while (!q_push(&server, NULL)) lsp_sleep_ms(10);
 
 #ifdef _WIN32
@@ -3895,7 +3680,6 @@ int main(int argc, char **argv) {
         pthread_join(server.worker_thread, NULL);
 #endif
 
-    /* 内部辅助逻辑 */
     server.diag_stop = true;
 #ifdef _WIN32
     if (server.diag_thread) {

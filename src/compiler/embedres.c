@@ -17,7 +17,7 @@
 #endif
 
 typedef struct {
-    char          *name; /* 核心系统底层抽象与内存语义契约 */
+    char          *name;
     unsigned char *data;
     long long      len;
 } zan_embed_file_t;
@@ -90,7 +90,6 @@ static int embed_add_file(zan_embed_list_t *l, const char *path,
     return 1;
 }
 
-/* 底层系统交互与数据协议契约 */
 #define EMBED_WALK_MAX_DEPTH 128
 
 static void embed_walk_impl(zan_embed_list_t *l, const char *dir, const char *name, int depth) {
@@ -156,7 +155,6 @@ static void embed_walk(zan_embed_list_t *l, const char *dir, const char *name) {
     embed_walk_impl(l, dir, name, 1);
 }
 
-/* 内部辅助逻辑 */
 static void embed_walk_filtered_impl(zan_embed_list_t *l, const char *dir,
                                      const char *name, int depth,
                                      const char *const *filter,
@@ -257,12 +255,9 @@ static const char *embed_basename(const char *path) {
     return sep ? sep + 1 : path;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_EMBED_COMPRESS_MIN 512
-/* 内部辅助逻辑 */
 #define ZAN_EMBED_COMPRESSED 0x8000000000000000ULL
 
-/* 内部辅助逻辑 */
 static unsigned char *embed_maybe_compress(const unsigned char *data,
                                            long long len, long long *out_len) {
     if (len < ZAN_EMBED_COMPRESS_MIN) return NULL;
@@ -285,12 +280,10 @@ static unsigned char *embed_maybe_compress(const unsigned char *data,
     return out;
 }
 
-/* 内部辅助逻辑 */
 static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
                                        const unsigned char *data,
                                        long long len) {
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
-    /* 内部辅助逻辑 */
     if (len < 0 || len > 0xFFFFFFFEULL) {
         fprintf(stderr,
                 "error: embedded resource '%s' is too large (%lld bytes, "
@@ -309,7 +302,6 @@ static LLVMValueRef embed_bytes_global(zan_irgen_t *g, const char *label,
     return LLVMConstInBoundsGEP2(arr_ty, gv, idx, 2);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static LLVMValueRef embed_define(zan_irgen_t *g, const char *name,
                                  LLVMTypeRef fty) {
     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, name);
@@ -328,15 +320,13 @@ static LLVMValueRef embed_libc(zan_irgen_t *g, const char *name,
     return fn;
 }
 
-/* 底层系统交互与数据协议契约 */
 struct embed_api_ctx {
     LLVMTypeRef  i8, i8p, i32, i64, ent_ty;
     LLVMValueRef gtbl, gcnt, gbuf, empty;
-    LLVMValueRef own_tbl, own_cnt;  /* 核心系统底层抽象与内存语义契约 */
+    LLVMValueRef own_tbl, own_cnt;
     long long    buf_cap;
 };
 
-/* 底层系统交互与数据协议契约 */
 static LLVMValueRef embed_entry_at(LLVMBuilderRef b, struct embed_api_ctx *c,
                                    LLVMValueRef base, LLVMValueRef i) {
     return LLVMBuildGEP2(b, c->ent_ty, base, &i, 1, "ent");
@@ -369,7 +359,6 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMValueRef nv = LLVMBuildAlloca(b, c->i64, "n");
     LLVMValueRef sv = LLVMBuildAlloca(b, c->i64, "slot");
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), iv);
-    /* 内部辅助逻辑 */
     LLVMBuildStore(b, LLVMBuildLoad2(b, c->i8p, c->gtbl, "tbl0"), bv);
     LLVMBuildStore(b, LLVMBuildLoad2(b, c->i64, c->gcnt, "cnt0"), nv);
     LLVMBuildStore(b, LLVMConstInt(c->i64, 0, 0), sv);
@@ -407,7 +396,6 @@ static LLVMValueRef embed_emit_find(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBuildStore(b, LLVMBuildAdd(b, i, LLVMConstInt(c->i64, 1, 0), "i1"), iv);
     LLVMBuildBr(b, head);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMPositionBuilderAtEnd(b, nextslot);
     LLVMValueRef s = LLVMBuildLoad2(b, c->i64, sv, "scur");
     LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
@@ -454,7 +442,6 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMPositionBuilderAtEnd(b, comp);
     LLVMValueRef dp = LLVMBuildStructGEP2(b, c->ent_ty, e, 1, "dp");
     LLVMValueRef d = LLVMBuildLoad2(b, c->i8p, dp, "d");
-    /* 内部辅助逻辑 */
     LLVMValueRef plain = LLVMBuildOr(b,
         LLVMBuildAnd(b, len,
             LLVMConstInt(c->i64, 0x7FFFFFFFFFFFFFFFULL, 0), "pl0"),
@@ -465,7 +452,6 @@ static LLVMValueRef embed_emit_unzip(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMPositionBuilderAtEnd(b, bad);
     LLVMBuildRet(b, LLVMConstNull(c->i8p));
     LLVMPositionBuilderAtEnd(b, ok);
-    /* 内部辅助逻辑 */
     LLVMValueRef rl = LLVMBuildLoad2(b, c->i32, d, "rawlen");
     LLVMValueRef rl64 = LLVMBuildZExt(b, rl, c->i64, "raw64");
     LLVMBuildStore(b, out, dp);
@@ -498,7 +484,6 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMTypeRef find_ty = LLVMFunctionType(c->i8p, find_args, 1, 0);
     LLVMBuilderRef b = LLVMCreateBuilderInContext(g->ctx);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef rty = LLVMFunctionType(c->i8p, find_args, 1, 0);
     LLVMValueRef rfn = embed_define(g, "zan_embed_read", rty);
     if (!rfn) { LLVMDisposeBuilder(b); return; }
@@ -518,7 +503,6 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMPositionBuilderAtEnd(b, rnil);
     LLVMBuildRet(b, c->empty);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef hty = LLVMFunctionType(c->i32, find_args, 1, 0);
     LLVMValueRef hfn = embed_define(g, "zan_embed_has", hty);
     if (!hfn) { LLVMDisposeBuilder(b); return; }
@@ -529,12 +513,10 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMValueRef hv = LLVMBuildIsNotNull(b, he, "hit");
     LLVMBuildRet(b, LLVMBuildZExt(b, hv, c->i32, "hi"));
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef bargs[] = { c->i8p, c->i8p };
     LLVMTypeRef bty = LLVMFunctionType(c->i8p, bargs, 2, 0);
     LLVMValueRef bfn = embed_define(g, "zan_embed_bytes", bty);
     if (!bfn) { LLVMDisposeBuilder(b); return; }
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef brt = LLVMGetReturnType(LLVMGlobalGetValueType(bfn));
     LLVMBasicBlockRef bb0 = LLVMAppendBasicBlockInContext(g->ctx, bfn, "entry");
     LLVMBasicBlockRef bgot = LLVMAppendBasicBlockInContext(g->ctx, bfn, "got");
@@ -576,7 +558,6 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMDisposeBuilder(b);
 }
 
-/* 内部辅助逻辑 */
 static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p };
     LLVMTypeRef fty = LLVMFunctionType(c->i8p, args, 1, 0);
@@ -690,7 +671,6 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
         LLVMConstInt(c->i32, 0, 0), "pmatch"), take, next);
 
     LLVMPositionBuilderAtEnd(b, take);
-    /* 内部辅助逻辑 */
     LLVMValueRef s0 = LLVMBuildLoad2(b, c->i64, sva, "scur");
     LLVMBuildCondBr(b, LLVMBuildICmp(b, LLVMIntEQ, s0,
         LLVMConstInt(c->i64, 0, 0), "is0"), take2, dup);
@@ -753,7 +733,6 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBuildStore(b, LLVMBuildAdd(b, i, LLVMConstInt(c->i64, 1, 0), "i1"), ia);
     LLVMBuildBr(b, head);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMPositionBuilderAtEnd(b, nextslot);
     LLVMValueRef s = LLVMBuildLoad2(b, c->i64, sva, "sscur");
     LLVMBasicBlockRef adv = LLVMAppendBasicBlockInContext(g->ctx, fn, "adv");
@@ -774,7 +753,6 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMDisposeBuilder(b);
 }
 
-/* 内部辅助逻辑 */
 static void embed_emit_register(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMTypeRef args[] = { c->i8p, c->i64 };
     LLVMTypeRef fty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), args, 2, 0);
@@ -802,7 +780,6 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
     long long len = 0;
     unsigned char *data = embed_read_file(path, &len);
     if (!data) return -1;
-    /* 内部辅助逻辑 */
     unsigned long long h = 1469598103934665603ULL;
     for (long long i = 0; i < len; i++) {
         h ^= (unsigned long long)data[i];
@@ -814,7 +791,6 @@ int zan_embed_driver_spec(const char *path, const char *file, char *out,
     return (n < 0 || (size_t)n >= out_sz) ? -1 : 0;
 }
 
-/* 内部辅助逻辑 */
 int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
                                   int count, const char *const *filter,
                                   int filter_count);
@@ -842,7 +818,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         }
 #endif
         int before = files.n;
-        /* 底层系统交互与数据协议契约 */
         int filtering = filter != NULL && filter_count > 0
                         && embed_is_dir(path)
                         && prefix != NULL && strcmp(prefix, "skins") == 0;
@@ -861,7 +836,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
             return -1;
         }
     }
-    /* 内部辅助逻辑 */
     unsigned char *compressed = (unsigned char *)calloc(
         (size_t)(files.n > 0 ? files.n : 1), 1);
     if (!compressed) {
@@ -884,7 +858,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         compressed[i] = 1;
         any_compressed = 1;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (any_compressed) g->uses_inflate = true;
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -906,7 +879,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         LLVMValueRef data = embed_bytes_global(g, label, files.v[i].data,
                                                files.v[i].len);
         if (!name || !data) {
-            /* 内部辅助逻辑 */
             free(ents);
             free(compressed);
             for (int f = 0; f < files.n; f++) {
@@ -925,7 +897,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
                              LLVMConstInt(i64, 0, 0) };
     ents[files.n] = LLVMConstNamedStruct(ent_ty, nulls, 3);
 
-    /* 内部辅助逻辑 */
     LLVMValueRef tbl0 = LLVMConstNull(i8p);
     if (files.n > 0) {
         LLVMTypeRef tbl_ty = LLVMArrayType(ent_ty, (unsigned)files.n + 1);
@@ -933,7 +904,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
         LLVMSetInitializer(tbl,
             LLVMConstArray(ent_ty, ents, (unsigned)files.n + 1));
         LLVMSetLinkage(tbl, LLVMPrivateLinkage);
-        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef zero = LLVMConstInt(i64, 0, 0);
         LLVMValueRef idx[] = { zero, zero };
         tbl0 = LLVMConstInBoundsGEP2(tbl_ty, tbl, idx, 2);
@@ -946,7 +916,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     c.i32 = LLVMInt32TypeInContext(g->ctx);
     c.i64 = i64;
     c.ent_ty = ent_ty;
-    /* 内部辅助逻辑 */
     c.buf_cap = total_names + 4096;
     c.gtbl = LLVMAddGlobal(g->mod, i8p, "zan.embed.gtbl");
     LLVMSetInitializer(c.gtbl, LLVMConstNull(i8p));
@@ -969,7 +938,6 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     embed_emit_read_has_bytes(g, &c, find, unzip);
     embed_emit_list(g, &c);
 
-    /* 内部辅助逻辑 */
     g->uses_embed_api = false;
 
     int n = files.n;

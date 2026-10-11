@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 
 #include "checker.h"
 #include "reflect_api.h"
@@ -11,7 +10,6 @@
 
 static const char *type_name(zan_type_t *t);
 
-/* 内部辅助逻辑 */
 static zan_type_t *builtin_call_result_type(zan_checker_t *c,
                                             zan_type_t *recv,
                                             zan_istr_t name) {
@@ -26,7 +24,6 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
              memcmp(recv->name.str, "StringBuilder", 13) == 0)
         bt = "StringBuilder";
     if (!bt) return NULL;
-    /* 底层系统交互与数据协议契约 */
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
     if (!res) return NULL;
@@ -38,7 +35,6 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     if (strcmp(res, "bool") == 0) return c->binder->type_bool;
     if (strcmp(res, "List<string>") == 0)
         return zan_binder_make_list_type(c->binder, c->binder->type_string);
-    /* 内部辅助逻辑 */
     if (strcmp(res, "T[]") == 0) {
         zan_type_t *elem = recv->type_arg_count > 0 ? recv->type_args[0] : NULL;
         if (!elem) return NULL;
@@ -47,7 +43,6 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     return NULL;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #define CHECKER_DERIVES_MAX_DEPTH 8192
 
 void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
@@ -59,7 +54,6 @@ void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
     c->current_return_type = NULL;
 }
 
-/* 内部辅助实现 */
 static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what) {
     if (!c->in_no_runtime) return;
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
@@ -83,7 +77,6 @@ static void no_runtime_warn_arc_return(zan_checker_t *c,
                   "out of the [NoRuntime] method or use a non-owning return");
 }
 
-/* 内部辅助逻辑 */
 static zan_type_t *checker_nullable_base(zan_type_t *t) {
     return (t && t->kind == TYPE_NULLABLE && t->element_type)
         ? t->element_type : t;
@@ -105,9 +98,7 @@ static zan_symbol_t *checker_find_method(zan_symbol_t *type_sym, zan_istr_t name
     return NULL;
 }
 
-/* 内部辅助实现 */
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name) {
     while (type_sym) {
         zan_symbol_t *found = NULL;
@@ -125,11 +116,9 @@ static zan_symbol_t *checker_find_field(zan_symbol_t *type_sym, zan_istr_t name)
     return NULL;
 }
 
-/* 内部辅助实现 */
 
 static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup);
 
-/* 底层系统交互与数据协议契约 */
 static uint32_t access_module_len(zan_istr_t ns) {
     int dots = 0;
     for (uint32_t i = 0; i < ns.len; i++) {
@@ -146,7 +135,6 @@ static bool access_same_module(zan_istr_t a, zan_istr_t b) {
     return la == lb && memcmp(a.str, b.str, (size_t)la) == 0;
 }
 
-/* 内部辅助实现 */
 static zan_istr_t access_symbol_ns(zan_symbol_t *s) {
     while (s) {
         if (s->decl && zan_ast_ns_name(s->decl).len)
@@ -195,21 +183,17 @@ static void report_inaccessible(zan_checker_t *c, zan_symbol_t *m,
     }
 }
 
-/* 内部辅助实现 */
 static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m) {
     if (!(m->modifiers & (MOD_PRIVATE | MOD_PROTECTED | MOD_INTERNAL)))
         return true;
     if (!c->current_type_sym || !m->parent ||
         !m->parent->type || !c->current_type_sym->type)
         return false;
-    /* 底层系统交互与数据协议契约 */
     if (c->current_type_sym == m->parent) return true;
-    /* 核心系统底层抽象与内存语义契约 */
     if ((m->modifiers & MOD_PROTECTED) &&
         checker_type_derives_from(c->current_type_sym->type,
                                   m->parent->type))
         return true;
-    /* 模块核心语义抽象与接口调用契约 */
     if ((m->modifiers & MOD_INTERNAL) &&
         access_same_module(access_symbol_ns(c->current_type_sym),
                            access_symbol_ns(m)))
@@ -217,7 +201,6 @@ static bool access_member_allowed(zan_checker_t *c, zan_symbol_t *m) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static zan_symbol_t *checker_field_visible(zan_checker_t *c,
                                            zan_symbol_t *ts, zan_loc_t loc,
                                            zan_istr_t name) {
@@ -229,11 +212,9 @@ static zan_symbol_t *checker_field_visible(zan_checker_t *c,
     return f;
 }
 
-/* 内部辅助实现 */
 struct checker_local {
     zan_istr_t name;
     zan_type_t *type;
-    /* 内部辅助实现 */
     zan_symbol_t *null_src;
     struct checker_local *next;
 };
@@ -269,7 +250,6 @@ static void checker_add_local(zan_checker_t *c, zan_istr_t name,
     c->locals = l;
 }
 
-/* 内部辅助逻辑 */
 static void checker_mark_local_null_src(zan_checker_t *c, zan_ast_node_t *decl) {
     zan_ast_node_t *init = decl->var_decl.initializer;
     if (!init || init->kind != AST_CALL || init != c->last_call_node) return;
@@ -283,21 +263,18 @@ static bool field_is_readonly(zan_symbol_t *field) {
            (field->decl->field_decl.modifiers & MOD_READONLY) != 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static bool property_is_readonly(zan_symbol_t *prop) {
     if (!prop || prop->kind != SYM_PROPERTY || !prop->decl) return false;
     return !prop->decl->field_decl.has_setter &&
            !prop->decl->field_decl.has_init;
 }
 
-/* 内部辅助实现 */
 static bool property_is_init_only(zan_symbol_t *prop) {
     if (!prop || prop->kind != SYM_PROPERTY || !prop->decl) return false;
     return prop->decl->field_decl.has_init &&
            !prop->decl->field_decl.has_setter;
 }
 
-/* 内部辅助逻辑 */
 static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
                                          zan_symbol_t **owner) {
     if (!lhs) return NULL;
@@ -328,14 +305,12 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
         return;
     zan_symbol_t *owner = NULL;
     zan_symbol_t *field = assign_target_field(c, expr->binary.left, &owner);
-    /* 模块核心语义抽象与接口调用契约 */
     if (property_is_readonly(field)) {
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                       "property '%.*s' has no setter and cannot be assigned",
                       (int)field->name.len, field->name.str);
         return;
     }
-    /* 内部辅助实现 */
     if (property_is_init_only(field)) {
         if (c->in_ctor && field->parent == c->current_type_sym) return;
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -359,7 +334,6 @@ static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
                   decl_owner ? decl_owner->name.str : "");
 }
 
-/* 内部辅助实现 */
 static void check_readonly_incdec(zan_checker_t *c, zan_ast_node_t *expr) {
     if (!expr || !expr->unary.operand) return;
     zan_ast_node_t *operand = expr->unary.operand;
@@ -417,7 +391,6 @@ static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static zan_type_t *checker_index_set_target(zan_checker_t *c,
                                             zan_ast_node_t *lhs,
                                             zan_type_t *right) {
@@ -434,7 +407,6 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
             memcmp(m->name.str, op_name.str, op_name.len) != 0) continue;
         if (!m->decl || m->decl->kind != AST_METHOD_DECL)
             continue;
-        /* 模块核心语义抽象与接口调用契约 */
         zan_ast_list_t *ps = &m->decl->method_decl.params;
         int n = ps->count;
         if (n < 2) continue;
@@ -460,7 +432,6 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
     if (!node) return false;
     switch (node->kind) {
@@ -470,7 +441,6 @@ static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
         zan_istr_t name = node->ident.name;
         /* If resolved to a local or parameter, it is not 'this' */
         if (checker_find_local(c, name)) return false;
-        /* 内部辅助逻辑 */
         if (c->current_type_sym) {
             zan_symbol_t *f = checker_find_field(c->current_type_sym, name);
             if (f && !(f->modifiers & MOD_STATIC)) return true;
@@ -518,7 +488,6 @@ static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
         }
         return false;
     case AST_LAMBDA:
-        /* 核心系统底层抽象与内存语义契约 */
         return expr_captures_this(c, node->lambda.body);
     case AST_BLOCK:
         for (int i = 0; i < node->block.stmts.count; i++) {
@@ -578,11 +547,9 @@ static bool has_closure_capturing_this(zan_checker_t *c, zan_ast_node_t *node) {
     return false;
 }
 
-/* 内部辅助实现 */
 static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
                                        zan_ast_node_t *rhs, zan_loc_t loc) {
     if (!c->current_type_sym || !lhs || !rhs) return;
-    /* 核心系统底层抽象与内存语义契约 */
     if (c->current_type_sym->kind != SYM_CLASS) return;
 
     /* 检查if lhs is a member of 'this', e */
@@ -620,9 +587,7 @@ static void check_closure_cycle_warning(zan_checker_t *c, zan_ast_node_t *lhs,
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 底层系统交互与数据协议契约 */
 static bool type_satisfies_constraint_depth(zan_type_t *arg, zan_type_t *cons,
                                             int depth) {
     if (!arg || !cons) return true;
@@ -644,7 +609,6 @@ static bool type_satisfies_constraint(zan_type_t *arg, zan_type_t *cons) {
 
 static const char *type_name(zan_type_t *t);
 
-/* 内部辅助逻辑 */
 static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
                                       zan_loc_t loc) {
     if (!t || !t->sym || !t->sym->decl) return;
@@ -668,7 +632,6 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
         }
         if (idx < 0 || idx >= t->type_arg_count) continue;
         zan_type_t *arg = t->type_args[idx];
-        /* 内部辅助实现 */
         if (arg && arg->kind == TYPE_TYPE_PARAM) continue;
         for (int k = 0; k < wc->where_clause.constraints.count; k++) {
             zan_ast_node_t *cons_ref = wc->where_clause.constraints.items[k];
@@ -694,14 +657,12 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static const char *type_name(zan_type_t *t) {
     if (!t) return "<unknown>";
     return t->name.str;
 }
 
-/* 内部辅助逻辑 */
 static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
     if (!t) return false;
     if (t->kind == TYPE_TYPE_PARAM) return true;
@@ -709,7 +670,6 @@ static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
     return t->kind == TYPE_CLASS && t->sym != NULL;
 }
 
-/* 内部辅助实现 */
 static void check_extern_static(zan_checker_t *c, zan_ast_node_t *member) {
     if (!c || !member || member->kind != AST_METHOD_DECL) return;
     bool is_extern = zan_ast_method_extern_lib(member).str != NULL ||
@@ -755,9 +715,7 @@ static void check_weak_member(zan_checker_t *c, zan_ast_node_t *owner,
                   type_name(type));
 }
 
-/* 内部辅助实现 */
 
-/* 内部辅助实现 */
 static void ctor_arity(zan_ast_node_t *decl, int *min, int *max) {
     int total = decl->method_decl.params.count;
     int required = 0;
@@ -772,7 +730,6 @@ static void ctor_arity(zan_ast_node_t *decl, int *min, int *max) {
     *max = variadic ? -1 : total;
 }
 
-/* 内部辅助实现 */
 static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
                           zan_symbol_t *type_sym) {
     int n = expr->new_expr.args.count;
@@ -793,7 +750,6 @@ static int ctor_arg_count(zan_checker_t *c, zan_ast_node_t *expr,
     return n;
 }
 
-/* 内部辅助实现 */
 static bool arg_is_initializer_entry(zan_ast_node_t *a) {
     if (!a) return false;
     if (a->kind == AST_COLL_INIT) return true;
@@ -801,7 +757,6 @@ static bool arg_is_initializer_entry(zan_ast_node_t *a) {
            a->binary.left->kind == AST_IDENTIFIER;
 }
 
-/* 内部辅助实现 */
 static bool initializer_covers_all_members(zan_ast_node_t *expr,
                                            zan_symbol_t *type_sym,
                                            int init_start) {
@@ -837,7 +792,6 @@ static bool type_is_scalar_primitive(zan_type_t *t);
 static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
                                  zan_ast_node_t *expr) {
     if (!type || expr->new_expr.is_array) return;
-    /* 内部辅助逻辑 */
     if (type_is_scalar_primitive(type)) {
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
             "the builtin type '%s' has no constructor -- use literals, casts or the conversion functions",
@@ -848,7 +802,6 @@ static void check_ctor_available(zan_checker_t *c, zan_type_t *type,
     zan_symbol_t *sym = type->sym;
     int declared = 0;
     int argc = ctor_arg_count(c, expr, sym);
-    /* 内部辅助实现 */
     if (argc == 0 && argc < expr->new_expr.args.count &&
         initializer_covers_all_members(expr, sym, argc)) {
         return;
@@ -893,7 +846,6 @@ static bool type_is_numeric(zan_type_t *t) {
     }
 }
 
-/* 内部辅助逻辑 */
 static bool type_is_scalar_primitive(zan_type_t *t) {
     if (!t) return false;
     switch (t->kind) {
@@ -928,16 +880,14 @@ static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b
     return b->type_int;
 }
 
-/* 内部辅助实现 */
 
-/* 内部辅助逻辑 */
 static bool checker_type_equal(zan_type_t *a, zan_type_t *b) {
     if (a == b) return true;
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
     if (a->kind == TYPE_ARRAY || a->kind == TYPE_NULLABLE) {
         if (a->kind == TYPE_ARRAY && a->array_rank != b->array_rank)
-            return false; /* 核心系统底层抽象与内存语义契约 */
+            return false;
         return checker_type_equal(a->element_type, b->element_type);
     }
     if (a->name.len != b->name.len ||
@@ -967,8 +917,7 @@ static bool iface_edge_derives_params_ast(zan_ast_node_t *edge_ref,
         zan_ast_node_t *ea = eargs->items[j];
         if (!ea) return false;
         if (ea->kind == AST_TYPE_REF && ea->type_ref.type_args.count > 0)
-            return false; /* 核心系统底层抽象与内存语义契约 */
-        /* 模块核心语义抽象与接口调用契约 */
+            return false;
         zan_istr_t ename;
         if (ea->kind == AST_IDENTIFIER) ename = ea->ident.name;
         else if (ea->kind == AST_TYPE_REF) ename = ea->type_ref.name;
@@ -994,7 +943,6 @@ static bool iface_edge_derives_params_ast(zan_ast_node_t *edge_ref,
     return true;
 }
 
-/* 内部辅助实现 */
 static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
                                             int depth) {
     if (!sub || !sup) return false;
@@ -1012,12 +960,10 @@ static bool checker_type_derives_from_depth(zan_type_t *sub, zan_type_t *sup,
         if (checker_type_derives_from_depth(sub->interfaces[i], sup, depth + 1))
             return true;
     zan_type_t *base = sub->base_type;
-    /* 内部辅助逻辑 */
     if (!base && sub->sym && sub->sym->type && sub->sym->type != sub)
         base = sub->sym->type->base_type;
     if (base && base != sub)
         return checker_type_derives_from_depth(base, sup, depth + 1);
-    /* 内部辅助实现 */
     if (sub->type_arg_count > 0 && sub->sym && sub->sym->type &&
         sub->sym->type != sub && sub->sym->decl &&
         (sub->sym->decl->kind == AST_CLASS_DECL ||
@@ -1038,16 +984,14 @@ static bool checker_type_derives_from(zan_type_t *sub, zan_type_t *sup) {
     return checker_type_derives_from_depth(sub, sup, 0);
 }
 
-/* 内部辅助实现 */
 static bool checker_type_is_ref(zan_type_t *t) {
     if (!t) return false;
     return t->kind == TYPE_OBJECT || t->kind == TYPE_INTERFACE ||
            t->kind == TYPE_STRING || t->kind == TYPE_CLASS ||
            t->kind == TYPE_ARRAY || t->kind == TYPE_DELEGATE ||
-           t->kind == TYPE_TASK; /* 核心系统底层抽象与内存语义契约 */
+           t->kind == TYPE_TASK;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *merge_conditional_types(zan_checker_t *c,
                                            zan_type_t *a, zan_type_t *b);
 static bool expr_is_null_literal(zan_ast_node_t *e);
@@ -1058,13 +1002,10 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
     if (a == c->binder->type_error) return b;
     if (b == c->binder->type_error) return a;
     if (a == b) return a;
-    /* 内部辅助逻辑 */
     if (a->kind == TYPE_TYPE_PARAM || b->kind == TYPE_TYPE_PARAM) return a;
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (a->kind == b->kind && checker_type_equal(a, b)) return a;
 
-    /* 底层系统交互与数据协议契约 */
     if ((type_is_numeric(a) || a->kind == TYPE_CHAR) &&
         (type_is_numeric(b) || b->kind == TYPE_CHAR))
         return promote_numeric(c->binder, a, b);
@@ -1072,21 +1013,18 @@ static zan_type_t *merge_conditional_types(zan_checker_t *c,
     if (checker_type_is_ref(a) && checker_type_is_ref(b)) {
         if (checker_type_derives_from(b, a)) return a;  /* b is-a a */
         if (checker_type_derives_from(a, b)) return b;  /* a is-a b */
-        /* 内部辅助逻辑 */
         for (zan_type_t *t = a->base_type; t && t != a; t = t->base_type) {
             if (checker_type_derives_from(b, t)) return t;
             if (!t->base_type) break;
         }
-        return NULL; /* 底层系统交互与数据协议契约 */
+        return NULL;
     }
 
-    /* 内部辅助实现 */
     if (a->kind == TYPE_ENUM || b->kind == TYPE_ENUM) return a;
 
-    return NULL; /* 底层系统交互与数据协议契约 */
+    return NULL;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static bool same_generic_container(zan_type_t *a, zan_type_t *b) {
     if (!a || !b || a->kind != b->kind) return false;
     if (a->type_arg_count != b->type_arg_count || a->type_arg_count == 0)
@@ -1103,9 +1041,7 @@ static bool checker_is_byte_buffer(zan_type_t *t) {
            t->element_type->kind == TYPE_CHAR;
 }
 
-/* 内部辅助实现 */
 
-/* 内部辅助逻辑 */
 static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (!target || !value) return true;
     if (target == value) return true;
@@ -1115,7 +1051,6 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (target->kind == value->kind && checker_type_equal(target, value))
         return true;
 
-    /* 内部辅助实现 */
     if (target->kind == TYPE_CLASS && target->name.len == 7 &&
         memcmp(target->name.str, "Binding", 7) == 0 &&
         target->type_arg_count == 1 && target->type_args[0]) {
@@ -1123,23 +1058,19 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
         return checker_type_assignable(target->type_args[0], value);
     }
 
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (target->kind == TYPE_NULLABLE && value->kind == TYPE_OBJECT)
         return true; /* null -> T? */
     if (target->kind == TYPE_NULLABLE && value->kind != TYPE_NULLABLE &&
         value->kind != TYPE_OBJECT && target->element_type)
         return checker_type_assignable(target->element_type, value); /* T -> T? */
 
-    /* 内部辅助实现 */
     if (target->kind == TYPE_DELEGATE)
         return value->kind == TYPE_OBJECT ||
                (value->kind == TYPE_DELEGATE && checker_type_equal(target, value));
 
-    /* 内部辅助实现 */
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK)
         return value->type_arg_count >= target->type_arg_count;
     bool tnum = type_is_numeric(target), vnum = type_is_numeric(value);
-    /* 内部辅助逻辑 */
     if (target->kind == TYPE_ENUM)
         return value->kind == TYPE_ENUM || vnum || value->kind == TYPE_CHAR;
     if (value->kind == TYPE_ENUM)
@@ -1148,20 +1079,17 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (target->kind == TYPE_CHAR && (vnum || value->kind == TYPE_CHAR))
         return true;
 
-    /* 内部辅助实现 */
     if (value->kind == TYPE_OBJECT) {
-        return checker_type_is_ref(target); /* 核心系统底层抽象与内存语义契约 */
+        return checker_type_is_ref(target);
     }
     switch (target->kind) {
     case TYPE_STRING:
         return value->kind == TYPE_STRING || checker_is_byte_buffer(value);
     case TYPE_CLASS:
         if (value->kind == TYPE_CLASS) {
-            /* 内部辅助实现 */
             if (target->sym && value->sym && target->sym == value->sym &&
                 (target->type_arg_count == 0 || value->type_arg_count == 0))
                 return true;
-            /* 内部辅助实现 */
             if (same_generic_container(target, value) &&
                 !checker_type_equal(target, value))
                 return true;
@@ -1221,14 +1149,12 @@ static bool const_integral_value(zan_ast_node_t *expr, int64_t *value) {
     }
     if (expr->kind == AST_UNARY && expr->unary.op == TK_MINUS &&
         expr->unary.operand && expr->unary.operand->kind == AST_INT_LITERAL) {
-        /* 内部辅助实现 */
         *value = (int64_t)(0ULL - (uint64_t)expr->unary.operand->int_val);
         return true;
     }
     return false;
 }
 
-/* 内部辅助实现 */
 static bool mixed_sign_compare_error(zan_binder_t *b, zan_diag_t *diag,
                                      zan_ast_node_t *expr,
                                      zan_type_t *left, zan_type_t *right) {
@@ -1261,9 +1187,7 @@ static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
         return true;
     if ((!vu || tu) && vmin >= tmin && vmax <= tmax) return true;
     if (!const_integral_value(expr, &constant)) return false;
-    /* 内部辅助实现 */
     if (vu && !tu) {
-        /* 内部辅助实现 */
         if (expr && expr->kind == AST_UNARY && expr->unary.op == TK_MINUS &&
             expr->unary.operand && expr->unary.operand->kind == AST_INT_LITERAL &&
             (uint64_t)expr->unary.operand->int_val == 0x8000000000000000ULL)
@@ -1282,7 +1206,6 @@ static bool integral_conversion_is_safe(zan_type_t *target, zan_type_t *value,
 }
 
 /* 发射the diagnostic when `value` is not assignable to `target` */
-/* 内部辅助逻辑 */
 static bool checker_conversion_method(zan_checker_t *c, zan_symbol_t *sym,
                                       zan_type_t *from, zan_type_t *to,
                                       const char *op_name) {
@@ -1326,7 +1249,6 @@ static bool checker_has_user_conversion(zan_checker_t *c, zan_type_t *target,
     return checker_user_conversion(c, target, value, "op_implicit");
 }
 
-/* 内部辅助逻辑 */
 static bool cast_is_scalar(zan_type_t *t) {
     return t && (type_is_numeric(t) || t->kind == TYPE_CHAR ||
                  t->kind == TYPE_ENUM || t->kind == TYPE_NINT);
@@ -1340,9 +1262,7 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
         src == c->binder->type_void)
         return true;
     if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return true;
-    /* 模块核心语义抽象与接口调用契约 */
     if (dst->kind == TYPE_OBJECT || src->kind == TYPE_OBJECT) return true;
-    /* 内部辅助实现 */
     if (dst->kind == TYPE_NINT || src->kind == TYPE_NINT) return true;
     if (dst->kind == TYPE_DELEGATE || src->kind == TYPE_DELEGATE) return true;
     if (checker_type_equal(dst, src)) return true;
@@ -1350,7 +1270,6 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
         return checker_cast_is_valid(c, checker_nullable_base(dst),
                                      checker_nullable_base(src));
     if (cast_is_scalar(dst) && cast_is_scalar(src)) return true;
-    /* 内部辅助实现 */
     if (checker_type_is_ref(dst) && checker_type_is_ref(src)) return true;
     if (checker_user_conversion(c, dst, src, "op_explicit")) return true;
     if (checker_user_conversion(c, dst, src, "op_implicit")) return true;
@@ -1373,7 +1292,6 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     }
     if (target == c->binder->type_error || value == c->binder->type_error)
         return;
-    /* 模块核心语义抽象与接口调用契约 */
     if (value == c->binder->type_void && target != c->binder->type_void) {
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "cannot convert 'void' to '%s' in %s: no implicit "
@@ -1398,13 +1316,11 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
         bool has_constant = const_integral_value(expr, &constant);
         bool native_handle_narrowing = value->kind == TYPE_NINT &&
             target->kind != TYPE_LONG && target->kind != TYPE_NINT;
-        /* 内部辅助实现 */
         bool decimal_radix = expr && expr->kind == AST_INT_LITERAL &&
             expr->lit_radix == 10;
         bool uint32_bit_pattern = value->kind == TYPE_LONG &&
             target->kind == TYPE_INT && has_constant && constant >= 0 &&
             (uint64_t)constant <= UINT32_MAX && !decimal_radix;
-        /* 内部辅助实现 */
         bool ulong_literal = target->kind == TYPE_ULONG && expr &&
             expr->kind == AST_INT_LITERAL;
         if (native_handle_narrowing ||
@@ -1424,12 +1340,10 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                   type_name(value), type_name(target), what);
 }
 
-/* 内部辅助逻辑 */
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee);
 static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr);
 
-/* 核心系统底层抽象与内存语义契约 */
 static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
     /* a [DllImport( */
@@ -1447,13 +1361,11 @@ static bool method_arity(zan_symbol_t *m, int *min, int *max) {
     return true;
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool method_accepts_argc(zan_symbol_t *m, int argc) {
     int lo, hi;
     if (method_arity(m, &lo, &hi)) return argc >= lo && argc <= hi;
     if (!m->decl || m->decl->kind != AST_METHOD_DECL) return false;
     zan_ast_list_t *ps = &m->decl->method_decl.params;
-    /* 模块核心语义抽象与接口调用契约 */
     if (m->decl->method_decl.is_variadic) return argc >= ps->count;
     if (ps->count == 0) return false;
     zan_ast_node_t *last = ps->items[ps->count - 1];
@@ -1469,7 +1381,6 @@ static bool method_is_params_tail(zan_symbol_t *m) {
     return last && last->kind == AST_PARAM && last->param.is_params;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
                                                zan_istr_t name, int argc,
                                                int type_arg_count) {
@@ -1498,7 +1409,6 @@ static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
     return fallback;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
@@ -1552,7 +1462,6 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
     return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                              zan_type_t *recv) {
     zan_ast_node_t *callee = call->call.callee;
@@ -1573,7 +1482,6 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                 memcmp(m->name.str, name.str, (size_t)name.len) != 0)
                 continue;
             if (!method_arity(m, &lo, &hi)) {
-                /* 内部辅助逻辑 */
                 if (candidates == 0 && m->decl->method_decl.is_variadic &&
                     argc < m->decl->method_decl.params.count) {
                     int floor = m->decl->method_decl.params.count;
@@ -1613,7 +1521,6 @@ static void check_call_arity(zan_checker_t *c, zan_ast_node_t *call,
                   (int)name.len, name.str, want_min, want_max, argc);
 }
 
-/* 内部辅助逻辑 */
 static bool type_is_scalar_register(zan_type_t *t) {
     return t && (type_is_numeric(t) || t->kind == TYPE_BOOL ||
                  t->kind == TYPE_CHAR || t->kind == TYPE_ENUM ||
@@ -1621,7 +1528,6 @@ static bool type_is_scalar_register(zan_type_t *t) {
 }
 
 /* 检查是否an argument of type `value` cannot reach a parameter of type `target` */
-/* 内部辅助实现 */
 static bool type_refs_type_param_d(zan_type_t *t, int depth) {
     if (!t || depth > 4) return false;
     if (t->kind == TYPE_TYPE_PARAM) return true;
@@ -1639,7 +1545,6 @@ static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
                                       zan_type_t *value) {
     if (!target || !value) return false;
     if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return false;
-    /* 内部辅助实现 */
     if (type_refs_type_param(target) || type_refs_type_param(value) ||
         (target->type_arg_count && value->type_arg_count &&
          same_generic_container(target, value) &&
@@ -1662,7 +1567,6 @@ static bool checker_arg_type_mismatch(zan_checker_t *c, zan_type_t *target,
     return false;
 }
 
-/* 内部辅助实现 */
 static zan_symbol_t *unique_named_method(zan_symbol_t *type_sym,
                                          zan_istr_t name) {
     zan_symbol_t *only = NULL;
@@ -1680,7 +1584,6 @@ static zan_symbol_t *unique_named_method(zan_symbol_t *type_sym,
     return only;
 }
 
-/* 内部辅助实现 */
 static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
                                         zan_type_t *recv) {
     zan_ast_node_t *callee = call->call.callee;
@@ -1693,7 +1596,6 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
         if (!c->current_type_sym) return NULL;
         if (c->current_type_sym->type &&
             c->current_type_sym->type->type_arg_count) return NULL;
-        /* 内部辅助逻辑 */
         zan_symbol_t *shadow = zan_binder_lookup(c->binder, callee->ident.name);
         if (shadow && shadow->kind != SYM_METHOD) return NULL;
         only = unique_named_method(c->current_type_sym, callee->ident.name);
@@ -1716,7 +1618,6 @@ static zan_symbol_t *call_arg_signature(zan_checker_t *c, zan_ast_node_t *call,
     return only;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static bool arg_is_spawn_callee(zan_ast_node_t *call) {
     if (!call || call->call.callee == NULL ||
         call->call.callee->kind != AST_MEMBER_ACCESS ||
@@ -1875,10 +1776,7 @@ static void check_ctor_call_arguments(zan_checker_t *c, zan_type_t *type,
                   type_name(type));
 }
 
-/* 底层系统交互与数据协议契约 */
-/* 内部辅助实现 */
 static bool type_is_concatable(zan_type_t *t) {
-    /* 内部辅助实现 */
     if (t->kind == TYPE_NULLABLE)
         return t->element_type && type_is_concatable(t->element_type);
     return t->kind == TYPE_STRING || t->kind == TYPE_CHAR ||
@@ -1897,7 +1795,6 @@ static bool binary_op_compares(zan_token_kind_t op) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     if (!e || e->kind != AST_MEMBER_ACCESS) return NULL;
     zan_ast_node_t *obj = e->member.object;
@@ -1918,7 +1815,6 @@ static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e) {
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static bool body_returns_this(zan_ast_node_t *n, int depth, int *count) {
     if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return true;
     switch (n->kind) {
@@ -1968,7 +1864,6 @@ static bool body_returns_this(zan_ast_node_t *n, int depth, int *count) {
     }
 }
 
-/* 内部辅助实现 */
 static bool expr_is_this_call(zan_checker_t *c, zan_symbol_t *method,
                               zan_type_t *recv) {
     if (!method || !method->decl) return false;
@@ -2038,7 +1933,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     switch (expr->kind) {
     case AST_INT_LITERAL:
-        /* 内部辅助实现 */
         switch (expr->lit_suffix) {
         case 1:
             return c->binder->type_long;
@@ -2070,7 +1964,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         return c->binder->type_object;
 
     case AST_IDENTIFIER: {
-        /* 内部辅助实现 */
         zan_type_t *lt = checker_find_local(c, expr->ident.name);
         if (lt) return lt;
         if (c->current_type_sym) {
@@ -2082,7 +1975,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
         zan_symbol_t *sym = zan_binder_lookup(c->binder, expr->ident.name);
         if (!sym) {
-            /* 底层系统交互与数据协议契约 */
             return c->binder->type_error;
         }
         return sym->type;
@@ -2091,7 +1983,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_BINARY: {
         zan_type_t *left = zan_checker_check_expr(c, expr->binary.left);
         zan_type_t *right = zan_checker_check_expr(c, expr->binary.right);
-        /* 核心系统底层抽象与内存语义契约 */
         if (binary_op_compares(expr->binary.op)) {
             if (right->kind != TYPE_DELEGATE)
                 reject_method_group(c, expr->binary.left);
@@ -2101,7 +1992,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
         switch (expr->binary.op) {
         case TK_PLUS:
-            /* 核心系统底层抽象与内存语义契约 */
             if (left->kind == TYPE_STRING || right->kind == TYPE_STRING) {
                 zan_type_t *other = left->kind == TYPE_STRING ? right : left;
                 if (!type_is_concatable(other)) {
@@ -2113,9 +2003,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 no_runtime_reject(c, expr->loc, "string concatenation");
                 return c->binder->type_string;
             }
-            /* 核心系统底层抽象与内存语义契约 */
         case TK_MINUS: case TK_STAR: case TK_SLASH: case TK_PERCENT:
-            /* 底层系统交互与数据协议契约 */
             if (left->kind == TYPE_DELEGATE || right->kind == TYPE_DELEGATE) {
                 if (expr->binary.op == TK_PLUS || expr->binary.op == TK_MINUS)
                     zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -2132,22 +2020,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (type_is_numeric(left) && type_is_numeric(right)) {
                 return promote_numeric(c->binder, left, right);
             }
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_NULLABLE || right->kind == TYPE_NULLABLE) {
                 zan_type_t *lb = checker_nullable_base(left);
                 zan_type_t *rb = checker_nullable_base(right);
                 if (type_is_numeric(lb) && type_is_numeric(rb))
                     return left->kind == TYPE_NULLABLE ? left : right;
             }
-            /* 内部辅助实现 */
-            /* 内部辅助实现 */
             if ((type_is_numeric(left) || left->kind == TYPE_ENUM ||
                  left->kind == TYPE_CHAR) &&
                 (type_is_numeric(right) || right->kind == TYPE_ENUM ||
                  right->kind == TYPE_CHAR)) {
                 return promote_numeric(c->binder, left, right);
             }
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_CLASS || left->kind == TYPE_STRUCT) {
                 return left;
             }
@@ -2179,7 +2063,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     return c->binder->type_error;
                 return c->binder->type_bool;
             }
-            /* 内部辅助实现 */
             if (left->kind == TYPE_NULLABLE || right->kind == TYPE_NULLABLE) {
                 zan_type_t *lb = checker_nullable_base(left);
                 zan_type_t *rb = checker_nullable_base(right);
@@ -2196,19 +2079,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     checker_type_assignable(rb, lb))
                     return c->binder->type_bool;
             }
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_STRUCT && right->kind == TYPE_STRUCT &&
                 left->sym && left->sym == right->sym)
                 return c->binder->type_bool;
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_TYPE_PARAM && right->kind == TYPE_TYPE_PARAM &&
                 checker_type_equal(left, right))
                 return c->binder->type_bool;
-            /* 模块核心语义抽象与接口调用契约 */
             if ((left->kind == TYPE_TYPE_PARAM && (right->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.right))) ||
                 (right->kind == TYPE_TYPE_PARAM && (left->kind == TYPE_OBJECT || expr_is_null_literal(expr->binary.left))))
                 return c->binder->type_bool;
-            /* 内部辅助逻辑 */
             if (checker_type_is_ref(left) && checker_type_is_ref(right) &&
                 (left->kind == TYPE_OBJECT || right->kind == TYPE_OBJECT ||
                  checker_type_assignable(left, right) ||
@@ -2233,7 +2112,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     return c->binder->type_error;
                 return c->binder->type_bool;
             }
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_NULLABLE || right->kind == TYPE_NULLABLE) {
                 zan_type_t *lb = checker_nullable_base(left);
                 zan_type_t *rb = checker_nullable_base(right);
@@ -2243,14 +2121,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                           rb->kind == TYPE_ENUM;
                 if (l2 && r2) return c->binder->type_bool;
             }
-            /* 内部辅助逻辑 */
             if (left->kind == TYPE_TYPE_PARAM && right->kind == TYPE_TYPE_PARAM &&
                 checker_type_equal(left, right))
                 return c->binder->type_bool;
-            /* 内部辅助实现 */
             if (left->kind == TYPE_STRING && right->kind == TYPE_STRING)
                 return c->binder->type_bool;
-            /* 内部辅助实现 */
             if ((left->kind == TYPE_CLASS || left->kind == TYPE_STRUCT) &&
                 left->sym) {
                 const char *rel_name = NULL;
@@ -2286,7 +2161,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return c->binder->type_error;
 
         case TK_QUESTION_QUESTION: {
-            /* 内部辅助实现 */
             if (left->kind == TYPE_NULLABLE && left->element_type) {
                 zan_type_t *merged = merge_conditional_types(c,
                                                               left->element_type,
@@ -2332,7 +2206,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_POSTFIX_UNARY: {
         zan_type_t *operand = zan_checker_check_expr(c, expr->unary.operand);
-        /* 内部辅助逻辑 */
         if (expr->unary.op == TK_BANG)
             return operand ? operand : c->binder->type_error;
         check_readonly_incdec(c, expr);
@@ -2356,17 +2229,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 "nameof requires a single identifier or member access");
             return c->binder->type_error;
         }
-        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *callee_type;
         zan_type_t *recv = NULL;
-        /* 内部辅助实现 */
         int callee_is_method = 0;
         bool typed_overload_changed = false;
         zan_symbol_t *called_sym = NULL;
         int argc = expr->call.args.count;
         zan_type_t **arg_types = argc > 0 ? (zan_type_t **)zan_arena_alloc(
             c->arena, (size_t)argc * sizeof(zan_type_t *)) : NULL;
-        /* 内部辅助实现 */
         if (expr->call.callee && expr->call.callee->kind == AST_MEMBER_ACCESS &&
             expr->call.callee->member.object->kind == AST_IDENTIFIER &&
             expr->call.args.count == 2 &&
@@ -2387,7 +2257,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     recv->sym, expr->call.callee->member.name,
                     expr->call.args.count, expr->call.type_args.count);
                 if (m && m->kind == SYM_METHOD) {
-                    /* 内部辅助逻辑 */
                     if (!access_member_allowed(c, m)) {
                         report_inaccessible(c, m, expr->call.callee->loc);
                         return c->binder->type_error;
@@ -2412,7 +2281,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
             zan_type_t *arg_type = zan_checker_check_expr(c, arg);
             arg_types[i] = arg_type;
-            /* 模块核心语义抽象与接口调用契约 */
             if (!arg_sig && arg && arg_type == c->binder->type_void &&
                 arg->kind != AST_REF_ARG && !arg_is_spawn_callee(expr)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
@@ -2423,7 +2291,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
         }
-        /* 内部辅助实现 */
         if (callee_is_method && recv && recv->sym) {
             zan_symbol_t *typed = checker_find_method_typed(c, recv->sym,
                 expr->call.callee->member.name, expr, arg_types);
@@ -2437,11 +2304,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 callee_type = typed->type ? typed->type : c->binder->type_error;
             }
         }
-        /* 内部辅助实现 */
         if (!called_sym && expr->call.callee &&
             expr->call.callee->kind == AST_IDENTIFIER)
             called_sym = zan_binder_lookup(c->binder, expr->call.callee->ident.name);
-        /* 内部辅助逻辑 */
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
             c->current_type_sym &&
             (!called_sym || called_sym->kind == SYM_METHOD)) {
@@ -2453,7 +2318,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         c->last_call_node = expr;
         c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
-        /* 内部辅助实现 */
         if (!callee_is_method && recv) {
             zan_type_t *br = builtin_call_result_type(c, recv,
                                                       expr->call.callee->member.name);
@@ -2467,7 +2331,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             no_runtime_warn_arc_return(c, expr, ret);
             return ret;
         }
-        /* 内部辅助逻辑 */
         if (callee_type && (callee_type->kind == TYPE_CLASS ||
                             callee_type->kind == TYPE_STRUCT) && callee_type->sym) {
             zan_istr_t op_name = {(char *)"op_call", 7};
@@ -2497,10 +2360,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     no_runtime_warn_arc_return(c, expr, ret);
                     return ret;
                 }
-                return c->binder->type_void; /* 核心系统底层抽象与内存语义契约 */
+                return c->binder->type_void;
             }
         }
-        /* 内部辅助逻辑 */
         if (called_sym && called_sym->decl &&
             called_sym->decl->kind == AST_METHOD_DECL &&
             expr->call.type_args.count > 0) {
@@ -2519,7 +2381,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
 
-        /* 内部辅助实现 */
         if (typed_overload_changed && called_sym && called_sym->decl &&
             called_sym->decl->kind == AST_METHOD_DECL) {
             zan_ast_node_t *m = called_sym->decl;
@@ -2529,11 +2390,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             no_runtime_warn_arc_return(c, expr, ret);
             return ret;
         }
-        /* 底层系统交互与数据协议契约 */
         if (arg_sig && arg_sig->decl &&
             arg_sig->decl->kind == AST_METHOD_DECL) {
             if (arg_sig->decl->method_decl.return_type) {
-                /* 底层系统交互与数据协议契约 */
                 if (expr_is_this_call(c, arg_sig, recv)) {
                     no_runtime_warn_arc_return(c, expr, recv);
                     return recv;
@@ -2544,7 +2403,7 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 return ret;
             }
             no_runtime_warn_arc_return(c, expr, c->binder->type_void);
-            return c->binder->type_void; /* 核心系统底层抽象与内存语义契约 */
+            return c->binder->type_void;
         }
         no_runtime_warn_arc_return(c, expr, callee_is_method ? callee_type : NULL);
         return c->binder->type_error;
@@ -2554,7 +2413,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         no_runtime_reject(c, expr->loc, "string interpolation");
         for (int i = 0; i < expr->string_interp.parts.count; i++) {
             zan_type_t *pt = zan_checker_check_expr(c, expr->string_interp.parts.items[i]);
-            /* 内部辅助实现 */
             if (!type_is_concatable(pt)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
                               "cannot interpolate '%s' -- convert the operand explicitly instead of formatting the reference",
@@ -2572,10 +2430,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_INDEX: {
         zan_type_t *obj = zan_checker_check_expr(c, expr->index.object);
         zan_type_t *idx = zan_checker_check_expr(c, expr->index.index);
-        /* 内部辅助逻辑 */
         if ((obj->kind == TYPE_CLASS || obj->kind == TYPE_STRUCT) && obj->sym) {
             zan_istr_t op_name = {(char *)"op_index", 8};
-            /* 内部辅助实现 */
             zan_symbol_t *op = NULL;
             int op_count = 0;
             for (zan_symbol_t *ts = obj->sym; ts;
@@ -2597,7 +2453,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 op->decl->method_decl.return_type) {
                 /* 索引器形参与实参类型匹配校验 */
                 zan_ast_list_t *ps = &op->decl->method_decl.params;
-                /* 内部辅助实现 */
                 bool is_static = (op->decl->method_decl.modifiers &
                                   MOD_STATIC) != 0;
                 int self_off = is_static ? 1 : 0;
@@ -2625,7 +2480,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     if (p0 && p0->kind == AST_PARAM && p0->param.type) {
                         zan_type_t *pt0 =
                             zan_binder_resolve_type(c->binder, p0->param.type);
-                        /* 内部辅助实现 */
                         if (pt0 && !type_refs_type_param(pt0) &&
                             !checker_type_assignable(pt0, idx)) {
                             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -2649,7 +2503,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             if (op && op->type) return op->type;
         }
         if (obj->kind == TYPE_ARRAY && obj->element_type) {
-            /* 内部辅助逻辑 */
             int rank = obj->array_rank > 1 ? obj->array_rank : 1;
             int given = 1 + expr->index.extra.count;
             if (given != rank) {
@@ -2675,7 +2528,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *target = checker_assignment_target_type(c, expr->binary.left);
         if (!target && expr->binary.left->kind == AST_INDEX) {
             target = checker_index_set_target(c, expr->binary.left, right);
-            /* 模块核心语义抽象与接口调用契约 */
             if (!target) {
                 zan_type_t *iobj = zan_checker_check_expr(
                     c, expr->binary.left->index.object);
@@ -2716,22 +2568,18 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             /* `FactoryCall( */
             type = zan_checker_check_expr(c, expr->new_expr.call_init);
         } else if (!expr->new_expr.type) {
-            /* 核心系统底层抽象与内存语义契约 */
             for (int i = 0; i < expr->new_expr.args.count; i++) {
                 zan_checker_check_expr(c, expr->new_expr.args.items[i]);
             }
             return c->binder->type_error;
         }
-        /* 内部辅助实现 */
         bool factory_init = expr->new_expr.call_init != NULL;
         if (!factory_init) {
             type = zan_binder_resolve_type(c->binder, expr->new_expr.type);
-            /* 内部辅助实现 */
             if (expr->new_expr.is_array && type && type->kind != TYPE_ERROR &&
                 type->kind != TYPE_ARRAY)
                 type = zan_binder_make_array_type(c->binder, type);
             check_generic_constraints(c, type, expr->loc);
-            /* 内部辅助逻辑 */
             check_ctor_available(c, type, expr);
         }
         /* new List<T>(src) 单参数拷贝构造函数类型推导 */
@@ -2742,7 +2590,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             expr->new_expr.args.items[0] &&
             expr->new_expr.args.items[0]->kind != AST_ASSIGNMENT;
         expr->new_expr.list_copy = false;
-        /* 内部辅助实现 */
         if (expr->new_expr.is_array && !expr->new_expr.array_init &&
             expr->new_expr.args.count > 0) {
             int rank = expr->new_expr.array_rank > 0
@@ -2771,7 +2618,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                                   (long long)prod);
             }
         }
-        /* 底层系统交互与数据协议契约 */
         int ctor_argc = (!factory_init && !expr->new_expr.is_array && type && type->sym)
             ? ctor_arg_count(c, expr, type->sym) : 0;
         zan_type_t *ctor_arg_types[256];
@@ -2784,13 +2630,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_ast_list_t *init_args = init_lists[li];
         for (int i = 0; i < init_args->count; i++) {
             zan_ast_node_t *arg = init_args->items[i];
-            /* 内部辅助实现 */
             if (arg && arg_is_initializer_entry(arg) && type && type->sym) {
                 zan_istr_t mname = arg->kind == AST_COLL_INIT
                     ? arg->coll_init.name
                     : arg->binary.left->ident.name;
                 zan_symbol_t *field = checker_find_field(type->sym, mname);
-                /* 内部辅助实现 */
                 if (!field && factory_init) {
                     zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                                   "'%s' has no member '%.*s'",
@@ -2798,7 +2642,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     continue;
                 }
                 if (field) {
-                    /* 内部辅助实现 */
                     if (property_is_readonly(field) &&
                         arg->kind != AST_COLL_INIT) {
                         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
@@ -2808,14 +2651,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                     }
                 }
                 if (arg->kind == AST_COLL_INIT) {
-                    /* 内部辅助逻辑 */
                     if (!field || !field->type) {
                         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                                       "'%.*s' has no member '%.*s'",
                                       (int)type->name.len, type->name.str,
                                       (int)mname.len, mname.str);
                     } else {
-                        /* 内部辅助实现 */
                         zan_istr_t add_istr = {(char *)"Add", 3};
                         bool builtin_list = false;
                         zan_type_t *coll = field->type;
@@ -2832,7 +2673,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                             ? (zan_symbol_t *)1
                             : (coll_sym ? checker_find_method(coll_sym, add_istr)
                                         : NULL);
-                        /* 内部辅助实现 */
                         bool dict_kv = coll && coll->name.len == 4 &&
                                        memcmp(coll->name.str, "Dict", 4) == 0;
                         zan_type_t *elem =
@@ -2937,20 +2777,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     case AST_LAMBDA:
         no_runtime_reject(c, expr->loc, "a lambda");
         for (int i = 0; i < expr->lambda.params.count; i++) {
-            /* 核心系统底层抽象与内存语义契约 */
         }
         zan_checker_check_expr(c, expr->lambda.body);
-        return c->binder->type_error; /* 核心系统底层抽象与内存语义契约 */
+        return c->binder->type_error;
 
     case AST_THIS_EXPR:
-        /* 底层系统交互与数据协议契约 */
         if (c->current_type_sym && c->current_type_sym->type) {
             return c->current_type_sym->type;
         }
         return c->binder->type_error;
 
     case AST_QUERY_EXPR: {
-        /* 内部辅助实现 */
         zan_type_t *src_ty = zan_checker_check_expr(c, expr->query.source);
         zan_type_t *elem = (src_ty && src_ty->element_type)
             ? src_ty->element_type : NULL;
@@ -3001,7 +2838,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_TUPLE_EXPR: {
-        /* 内部辅助实现 */
         int n = expr->tuple_expr.items.count;
         zan_type_t **elems = (zan_type_t **)zan_arena_alloc(
             c->binder->arena, sizeof(zan_type_t *) * (size_t)(n > 0 ? n : 1));
@@ -3012,7 +2848,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_SWITCH_EXPR: {
-        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *disc_type = zan_checker_check_expr(c, expr->switch_expr.expr);
         zan_type_t *merged = NULL;
         bool has_result = false;
@@ -3078,7 +2913,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
         }
 
-        /* 编译器代码生成与运行时系统底层调用契约 */
         if (disc_type && disc_type->kind == TYPE_ENUM && disc_type->sym && !seen_wildcard) {
             zan_symbol_t *esym = disc_type->sym;
             for (int mi = 0; mi < esym->member_count; mi++) {
@@ -3116,7 +2950,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_WITH_EXPR: {
-        /* 核心系统底层抽象与内存语义契约 */
         zan_type_t *rt = zan_checker_check_expr(c, expr->with_expr.expr);
         if (!rt || (rt->kind != TYPE_CLASS && rt->kind != TYPE_STRUCT)) {
             if (rt && rt->kind != TYPE_ERROR)
@@ -3158,14 +2991,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 
     case AST_AWAIT_EXPR:
-        /* 内部辅助逻辑 */
         {
             zan_type_t *inner = zan_checker_check_expr(c, expr->await_expr.expr);
             if (inner && inner->kind == TYPE_TASK) {
                 return inner->type_arg_count == 1 ? inner->type_args[0]
                                                   : c->binder->type_void;
             }
-            /* 内部辅助逻辑 */
             return inner ? inner : c->binder->type_error;
         }
 
@@ -3177,7 +3008,6 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     if (!stmt) return;
@@ -3209,7 +3039,6 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             checker_add_local(c, stmt->var_decl.name, dt);
             checker_mark_local_null_src(c, stmt);
         } else {
-            /* 内部辅助实现 */
             if (stmt->var_decl.initializer) {
                 zan_symbol_t *mg = expr_method_group(c, stmt->var_decl.initializer);
                 if (mg) {
@@ -3235,7 +3064,6 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     case AST_RETURN_STMT:
         if (stmt->ret.value) {
             zan_type_t *rv = zan_checker_check_expr(c, stmt->ret.value);
-            /* 内部辅助实现 */
             if (c->current_return_type &&
                 c->current_return_type->kind != TYPE_VOID)
                 checker_check_assignable(c, c->current_return_type, rv,
@@ -3271,7 +3099,6 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_FOREACH_STMT:
-        /* 底层系统交互与数据协议契约 */
         no_runtime_reject(c, stmt->loc, "`foreach`");
         {
             zan_type_t *col = zan_checker_check_expr(c, stmt->foreach_stmt.collection);
@@ -3302,7 +3129,6 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
         break;
 
     case AST_CHECKED_STMT:
-        /* 模块核心语义抽象与接口调用契约 */
         zan_checker_check_stmt(c, stmt->checked_stmt.body);
         break;
 
@@ -3314,7 +3140,6 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
 
     case AST_SWITCH_STMT: {
         zan_type_t *sw_type = zan_checker_check_expr(c, stmt->switch_stmt.expr);
-        /* 内部辅助实现 */
         bool has_patterns = false;
         for (int i = 0; i < stmt->switch_stmt.cases.count && !has_patterns; i++) {
             zan_ast_node_t *sc = stmt->switch_stmt.cases.items[i];
@@ -3407,10 +3232,7 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助实现 */
-/* 内部辅助实现 */
 static bool expr_is_null_literal(zan_ast_node_t *e) {
     if (!e) return false;
     if (e->kind == AST_NULL_LITERAL) return true;
@@ -3467,14 +3289,12 @@ static bool method_can_return_null(zan_symbol_t *m) {
     return stmt_returns_null(m->decl->method_decl.body, 0);
 }
 
-/* 内部辅助逻辑 */
 static bool loc_at_or_after(zan_loc_t a, zan_loc_t b) {
     if (a.file_id != b.file_id)
         return a.line > b.line || (a.line == b.line && a.col >= b.col);
     return a.offset >= b.offset;
 }
 
-/* 内部辅助实现 */
 static bool node_loc_prunable(zan_ast_kind_t k) {
     switch (k) {
     case AST_BLOCK: case AST_EXPR_STMT: case AST_RETURN_STMT:
@@ -3507,13 +3327,11 @@ static bool is_named_ident(zan_ast_node_t *n, zan_istr_t name) {
 static bool node_guards_null(zan_ast_node_t *n, zan_istr_t name, int depth,
                              zan_loc_t use) {
     if (!n || depth > CHECKER_DERIVES_MAX_DEPTH) return false;
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (node_loc_prunable(n->kind) && loc_at_or_after(n->loc, use)) {
         return false;
     }
     switch (n->kind) {
     case AST_BINARY:
-        /* 底层系统交互与数据协议契约 */
         if ((is_named_ident(n->binary.left, name) &&
              (n->binary.right && n->binary.right->kind == AST_NULL_LITERAL)) ||
             (is_named_ident(n->binary.right, name) &&
@@ -3621,7 +3439,6 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
         if (obj != c->last_call_node) return;
         m = c->last_call_method;
     } else if (obj->kind == AST_IDENTIFIER) {
-        /* 模块核心语义抽象与接口调用契约 */
         struct checker_local *l = checker_find_local_slot(c, obj->ident.name);
         if (!l || !l->null_src) return;
         if (!c->current_body) return;
@@ -3640,7 +3457,6 @@ static void checker_reject_null_receiver(zan_checker_t *c, zan_ast_node_t *expr)
                   (int)expr->member.name.len, expr->member.name.str);
 }
 
-/* 内部辅助逻辑 */
 static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
     switch (obj->kind) {
     case AST_IDENTIFIER: {
@@ -3668,7 +3484,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             return c->binder->type_error;
         }
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && obj_type->kind == TYPE_ENUM && obj_type->sym &&
         expr->member.object->kind == AST_IDENTIFIER) {
         zan_symbol_t *os = zan_binder_lookup(c->binder,
@@ -3684,7 +3499,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                     break;
             }
             if (ei == obj_type->sym->member_count) {
-                /* 内部辅助实现 */
                 zan_istr_t mn = expr->member.name;
                 bool pseudo = mn.len == 8 &&
                     memcmp(mn.str, "TryParse", 8) == 0;
@@ -3700,7 +3514,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             }
         }
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && obj_type->kind == TYPE_NULLABLE) {
         zan_istr_t mn = expr->member.name;
         if (mn.len == 8 && memcmp(mn.str, "HasValue", 8) == 0) {
@@ -3718,7 +3531,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                       (int)mn.len, mn.str, elem_name);
         return c->binder->type_error;
     }
-    /* 底层系统交互与数据协议契约 */
     if (obj_type && obj_type->sym) {
         for (zan_symbol_t *s = obj_type->sym; s;
              s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
@@ -3731,7 +3543,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                         report_inaccessible(c, m, expr->loc);
                         return c->binder->type_error;
                     }
-                    /* 内部辅助实现 */
                     if (m->kind == SYM_METHOD)
                         return c->binder->type_error;
                     if (m->kind == SYM_FIELD && (m->modifiers & MOD_STATIC) &&
@@ -3756,13 +3567,11 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             }
         }
     }
-    /* 核心系统底层抽象与内存语义契约 */
     {
         zan_type_t *rt = zan_refl_member_type(c->binder, obj_type,
                                               expr->member.name);
         if (rt) return rt;
     }
-    /* 内部辅助实现 */
     if (obj_type && obj_type->kind == TYPE_ARRAY) {
         bool is_len = expr->member.name.len == 6 &&
             memcmp(expr->member.name.str, "Length", 6) == 0;
@@ -3770,7 +3579,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             memcmp(expr->member.name.str, "Count", 5) == 0;
         if (is_len || is_cnt) return c->binder->type_int;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (obj_type && type_is_scalar_primitive(obj_type)) {
         if (obj_type->kind == TYPE_STRING && expr->member.name.len == 6 &&
             memcmp(expr->member.name.str, "Length", 6) == 0) {
@@ -3786,7 +3594,6 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
          obj_type->kind == TYPE_INTERFACE) &&
         obj_type != c->binder->type_error && obj_type->sym) {
-        /* 内部辅助实现 */
         zan_istr_t ns = access_symbol_ns(obj_type->sym);
         if (ns.len)
             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
@@ -3815,7 +3622,6 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->current_return_type = zan_binder_resolve_type(c->binder,
                                                       method->method_decl.return_type);
     check_generic_constraints(c, c->current_return_type, method->loc);
-    /* 内部辅助实现 */
     struct checker_local *saved_locals = c->locals;
     c->locals = NULL;
     for (int j = 0; j < method->method_decl.params.count; j++) {
@@ -3836,9 +3642,8 @@ static void check_method_body(zan_checker_t *c, zan_ast_node_t *method) {
     c->in_ctor = saved_ctor;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
-    zan_ast_node_t **slots;      /* 核心系统底层抽象与内存语义契约 */
+    zan_ast_node_t **slots;
     int cap;                     /* power of two, 0 = unset */
     int count;
 } zan_struct_visited_t;
@@ -3904,7 +3709,6 @@ static bool check_struct_cycle_dfs(zan_checker_t *c, zan_ast_node_t *struct_decl
                       struct_decl->type_decl.name.str);
         return false;
     }
-    /* 底层系统交互与数据协议契约 */
     if (struct_visit_seen(visited, struct_decl)) return false;
     stack[depth] = struct_decl;
 
@@ -3954,9 +3758,7 @@ static void check_all_struct_cycles(zan_checker_t *c, zan_ast_node_t *unit) {
     }
 }
 
-/* 内部辅助实现 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static int checker_method_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
     return m->decl->method_decl.params.count;
@@ -3990,7 +3792,6 @@ static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
         zan_ast_node_t *member = decl->type_decl.members.items[j];
         if (member->kind != AST_METHOD_DECL) continue;
         int want = member->method_decl.params.count;
-        /* 内部辅助实现 */
         zan_symbol_t *sym = NULL;
         for (int i = 0; i < ts->member_count; i++) {
             zan_symbol_t *m = ts->members[i];

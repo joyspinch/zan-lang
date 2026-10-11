@@ -1,8 +1,6 @@
 /* gui_runtime_font */
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 #if !defined(_WIN32) && !defined(ZAN_GUI_COCOA)
-/* 底层系统交互与数据协议契约 */
 static const unsigned char zan_font_6x10[96][10] = {
     /* space (32) */ {0},
     /* ! */ {0x04,0x04,0x04,0x04,0x04,0x00,0x04,0x00,0x00,0x00},
@@ -185,14 +183,12 @@ static FT_Face g_ft_face;
 static int g_ft_state;
 
 #if defined(__ANDROID__) || defined(__OHOS__)
-/* 模块核心语义抽象与接口调用契约 */
 static char g_android_def_path[256];
 static int g_android_def_idx;
 static char g_android_cjk_path[256];
 static int g_android_cjk_idx;
 static int g_android_cjk_ok;
 
-/* 内部辅助逻辑 */
 static int ft_xml_attr(const char *attrs, int attrlen, const char *name,
                        char *out, int outsz) {
     char pat[64];
@@ -220,7 +216,7 @@ static int ft_xml_attr(const char *attrs, int attrlen, const char *name,
 static int ft_fonts_xml_scan(void) {
     FILE *f = fopen("/system/etc/fonts.xml", "rb");
     if (!f) return 0;
-    static char buf[1 << 21]; /* 核心系统底层抽象与内存语义契约 */
+    static char buf[1 << 21];
     size_t len = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[len] = 0;
@@ -228,7 +224,6 @@ static int ft_fonts_xml_scan(void) {
     const char *p = buf;
     while ((p = strstr(p, "<family")) != NULL) {
         p += 7;
-        /* 底层系统交互与数据协议契约 */
         if (*p != ' ' && *p != '>') continue;
         const char *gt = strchr(p, '>');
         if (!gt) break;
@@ -245,7 +240,6 @@ static int ft_fonts_xml_scan(void) {
         char lang[32] = "";
         ft_xml_attr(attrs, attrlen, "lang", lang, sizeof(lang));
 
-        /* 内部辅助实现 */
         char best[256] = "";
         int best_idx = 0, best_score = 1 << 30;
         const char *q = body;
@@ -263,7 +257,6 @@ static int ft_fonts_xml_scan(void) {
             const char *txt = fgt + 1;
             const char *ftxt_end = strstr(txt, "</font>");
             if (!ftxt_end || ftxt_end > fend) break;
-            /* 底层系统交互与数据协议契约 */
             const char *lt = memchr(txt, '<', (size_t)(ftxt_end - txt));
             if (!lt || lt > ftxt_end) lt = ftxt_end;
             char path[256];
@@ -317,7 +310,6 @@ static int ft_fonts_xml_scan(void) {
 
 static void ft_android_pick_fonts(void) {
     if (ft_fonts_xml_scan()) return;
-    /* 底层系统交互与数据协议契约 */
     snprintf(g_android_def_path, sizeof(g_android_def_path),
              "/system/fonts/Roboto-Regular.ttf");
     g_android_def_idx = 0;
@@ -333,12 +325,10 @@ static int ft_prepare(int font_size) {
         g_ft_state = -1;
         if (FT_Init_FreeType(&g_ft_library) != 0) return 0;
 #if defined(__wasm__)
-        /* 核心系统底层抽象与内存语义契约 */
         if (FT_New_Face(g_ft_library, "/fonts/ui.ttf", 0, &g_ft_face) == 0) {
             g_ft_state = 1;
         }
 #elif defined(__ANDROID__) || defined(__OHOS__)
-        /* 模块核心语义抽象与接口调用契约 */
         ft_android_pick_fonts();
         if (access(g_android_def_path, R_OK) == 0 &&
             FT_New_Face(g_ft_library, g_android_def_path,
@@ -346,7 +336,7 @@ static int ft_prepare(int font_size) {
             g_ft_state = 1;
         } else {
             static const char *const prim_paths[] = {
-                "/system/fonts/HarmonyOS_Sans.ttf", /* 核心系统底层抽象与内存语义契约 */
+                "/system/fonts/HarmonyOS_Sans.ttf",
                 "/system/fonts/DroidSans.ttf",
                 "/system/fonts/NotoSansCJK-Regular.ttc",
             };
@@ -397,7 +387,6 @@ static int ft_prepare(int font_size) {
 static FT_Face g_ft_fb[ZAN_FT_FB_MAX];
 static int g_ft_fb_count = 0;
 
-/* 内部辅助逻辑 */
 static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     if (FT_Get_Char_Index(g_ft_face, cp)) return g_ft_face;
     for (int i = 0; i < g_ft_fb_count; i++) {
@@ -408,7 +397,6 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     }
     if (g_ft_fb_count < ZAN_FT_FB_MAX) {
 #if defined(__ANDROID__) || defined(__OHOS__)
-        /* 核心系统底层抽象与内存语义契约 */
         const char *fb_paths[4];
         int fb_idx[4];
         int nfb = 0;
@@ -445,7 +433,6 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
             if (face) FT_Done_Face(face);
         }
-        /* 内部辅助逻辑 */
         {
             DIR *d = opendir("/system/fonts");
             if (d) {
@@ -478,7 +465,6 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
         }
 #elif defined(__wasm__)
-        /* 模块核心语义抽象与接口调用契约 */
         static int cjk_tried = 0;
         if (!cjk_tried) {
             cjk_tried = 1;
@@ -493,7 +479,6 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
             }
         }
 #elif !defined(__wasm__)
-        /* 底层系统交互与数据协议契约 */
         FcCharSet *charset = FcCharSetCreate();
         FcCharSetAddChar(charset, cp);
         FcPattern *pat = FcPatternCreate();
@@ -522,9 +507,6 @@ static FT_Face ft_face_for_cp(u32 cp, int font_size) {
     return g_ft_face;
 }
 
-/* 内部辅助实现 */
-/* 内部辅助实现 */
-/* 内部辅助实现 */
 static void colr1_color(FT_Color *palette, const FT_ColorIndex *ci,
                         FT_Color *out) {
     if (ci->palette_index == 0xFFFF || !palette) {
@@ -608,7 +590,6 @@ static void colr1_paint(FT_Face face, FT_Color *palette, FT_OpaquePaint op,
             colr1_paint(face, palette, p.u.composite.backdrop_paint,
                         target, toff, depth + 1);
         } else {
-            /* 模块核心语义抽象与接口调用契约 */
             colr1_paint(face, palette, p.u.composite.backdrop_paint,
                         target, toff, depth + 1);
             colr1_paint(face, palette, p.u.composite.source_paint,
@@ -616,7 +597,6 @@ static void colr1_paint(FT_Face face, FT_Color *palette, FT_OpaquePaint op,
         }
         break;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     case FT_COLR_PAINTFORMAT_TRANSFORM:
         colr1_paint(face, palette, p.u.transform.paint,
                     target, toff, depth + 1);
@@ -658,7 +638,6 @@ static const zan_glyph_tile *ft_colr_tile(FT_Face face, FT_UInt glyph,
     FT_OpaquePaint root;
     int used_v1 = 0;
 
-    /* 内部辅助逻辑 */
     memset(&root, 0, sizeof(root));
 
     if (FT_Palette_Select(face, 0, &palette) != 0) palette = NULL;
@@ -669,17 +648,15 @@ static const zan_glyph_tile *ft_colr_tile(FT_Face face, FT_UInt glyph,
     FT_Bitmap_Init(&target);
     toff.x = toff.y = 0;
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (FT_Get_Color_Glyph_Paint(face, glyph,
                                  FT_COLOR_NO_ROOT_TRANSFORM, &root)) {
         colr1_paint(face, palette, root, &target, &toff, 0);
         used_v1 = 1;
-        layers = 1;   /* 核心系统底层抽象与内存语义契约 */
+        layers = 1;
     } else {
         FT_LOG("colr v1 miss: glyph=%u pal=%d", glyph, palette ? 1 : 0);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (!used_v1) {
         it.p = NULL;
         while (FT_Get_Color_Glyph_Layer(face, glyph, &lg, &lc, &it)) {
@@ -687,7 +664,6 @@ static const zan_glyph_tile *ft_colr_tile(FT_Face face, FT_UInt glyph,
             if (lc != 0xFFFF && palette) {
                 c = palette[lc];
             } else {
-                /* 底层系统交互与数据协议契约 */
                 c.blue = c.green = c.red = 0xFF; c.alpha = 0xFF;
             }
             if (FT_Load_Glyph(face, lg, FT_LOAD_RENDER) == 0) {
@@ -697,7 +673,7 @@ static const zan_glyph_tile *ft_colr_tile(FT_Face face, FT_UInt glyph,
                                     &target, &toff, c) == 0)
                     layers++;
             }
-            if (!lg) break;   /* 底层系统交互与数据协议契约 */
+            if (!lg) break;
         }
     }
     if (!layers) { FT_Bitmap_Done(g_ft_library, &target); return NULL; }
@@ -759,12 +735,10 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
     FT_Face face = ft_face_for_cp(cp, font_size);
     FT_UInt glyph = FT_Get_Char_Index(face, cp);
     if (!glyph) glyph = FT_Get_Char_Index(face, '?');
-    /* 内部辅助逻辑 */
     if (FT_HAS_COLOR(face) && angle == 0) {
         const zan_glyph_tile *ct = ft_colr_tile(face, glyph, font_size, key);
         if (ct) return ct;
     }
-    /* 内部辅助实现 */
     int rotated = angle != 0;
     if (rotated) {
         double rad = (double)angle * 3.14159265358979323846 / 180.0;
@@ -775,7 +749,6 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
         mat.yy = (FT_Fixed)(cos(rad) * 65536.0);
         FT_Set_Transform(face, &mat, NULL);
     }
-    /* 内部辅助逻辑 */
     int loaded = glyph && FT_Load_Glyph(face, glyph,
                                         FT_LOAD_RENDER | FT_LOAD_COLOR) == 0;
     int advance = 0;
@@ -794,7 +767,6 @@ static const zan_glyph_tile *ft_glyph_tile(u32 cp, int font_size, int angle) {
                                0, 0, 0, 0, advance, NULL, 1);
     }
 
-    /* 内部辅助逻辑 */
     if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA) {
         int pitch = bitmap->pitch;
         unsigned char *px = (unsigned char *)malloc((size_t)w * h * 4);
@@ -858,7 +830,7 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
         while (*text) {
             u32 cp = utf8_next(&text);
             const zan_glyph_tile *tile = ft_glyph_tile(cp, font_size, 0);
-            if (!tile) continue;   /* 底层系统交互与数据协议契约 */
+            if (!tile) continue;
             zan_glyph_batch_add(&batch, tile, pen_x + tile->left,
                                 baseline - tile->top);
             pen_x += tile->advance;
@@ -866,7 +838,6 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
         zan_glyph_batch_flush(&batch);
         return;
     }
-    /* 内部辅助实现 */
     double rad = (double)angle * 3.14159265358979323846 / 180.0;
     double cs = cos(rad), sn = sin(rad);
     double asc = (double)(g_ft_face->size->metrics.ascender >> 6);
@@ -880,17 +851,16 @@ static void ft_draw_text(i64 surface_id, i64 x, i64 y,
         zan_glyph_batch_add(&batch, tile,
                             (int)((double)x + px + tile->left),
                             (int)((double)y + py - tile->top));
-        s_acc += tile->advance;   /* 核心系统底层抽象与内存语义契约 */
+        s_acc += tile->advance;
     }
     zan_glyph_batch_flush(&batch);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
-    char    *text;   /* 底层系统交互与数据协议契约 */
+    char    *text;
     int      size;
     int      width;
-    uint64_t used;   /* 核心系统底层抽象与内存语义契约 */
+    uint64_t used;
 } ft_measure_cache_t;
 
 #define FT_MEAS_CACHE_CAP 2048
@@ -964,13 +934,11 @@ EXPORT void zan_gui_draw_text(
     bitmap_draw_text(surface_id, x, y, text, color, font_size);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 EXPORT void zan_gui_draw_text_bold(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size) {
     zan_gui_draw_text(surface_id, x, y, text, color, font_size);
 }
 
-/* 内部辅助实现 */
 EXPORT void zan_gui_draw_text_rot(
     i32 surface_id, i32 x, i32 y, const char *text, i32 color, i32 font_size,
     i32 angle_deg) {
@@ -1003,7 +971,6 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
 EXPORT i32 zan_gui_font_height(i32 font_size) {
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
-        /* 内部辅助逻辑 */
         FT_Size_Metrics m = g_ft_face->size->metrics;
         i32 asc = (i32)(m.ascender >> 6);
         i32 desc = (i32)((0 - m.descender) >> 6);
@@ -1013,7 +980,6 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
     return bitmap_font_height(font_size);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 EXPORT i32 zan_gui_font_ascent(i32 font_size) {
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size))
@@ -1022,12 +988,10 @@ EXPORT i32 zan_gui_font_ascent(i32 font_size) {
     return bitmap_font_height(font_size);
 }
 
-#endif /* 核心系统底层抽象与内存语义契约 */
+#endif
 
-/* 内部辅助逻辑 */
 
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_minimize(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
@@ -1068,7 +1032,6 @@ EXPORT i32 zan_gui_is_maximized(iptr hwnd_val) {
     return (found_v && found_h) ? 1 : 0;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
@@ -1080,7 +1043,6 @@ EXPORT i32 zan_gui_window_visible(iptr hwnd_val) {
     return 1;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_window_focused(iptr hwnd_val) {
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_x11_window;
     if (!g_display || !xid) return 0;
@@ -1096,7 +1058,6 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i32 zan_gui_caption_button_width(void) { return g_btn_w_l; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
@@ -1105,7 +1066,6 @@ EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     return 0;
 }
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     if (!g_display) return 0;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
@@ -1132,7 +1092,6 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
         g_lwins[idx] = g_lwins[--g_lwin_count];
     }
     if (xid == g_primary_win) {
-        /* 模块核心语义抽象与接口调用契约 */
         g_primary_win = g_lwin_count ? g_lwins[0].xid : 0;
         g_x11_window = g_primary_win;
         if (g_lwin_count) {
@@ -1144,7 +1103,6 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
         }
     }
     if (g_lwin_count == 0) {
-        /* 底层系统交互与数据协议契约 */
         for (int i = 0; i < 8; i++) {
             if (g_cursors_linux[i]) {
                 XFreeCursor(g_display, g_cursors_linux[i]);
@@ -1161,7 +1119,6 @@ EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     return 0;
 }
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
     (void)tint_argb;
     if (!g_display) return 1;
@@ -1185,7 +1142,6 @@ EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) {
     if (!g_display) return 1;
     Window xid = hwnd_val ? (Window)(intptr_t)hwnd_val : g_primary_win;
@@ -1219,7 +1175,7 @@ EXPORT i32 zan_gui_get_dpi_scale(void) {
     }
     double dpi = (double)wpx * 25.4 / (double)wmm;
     long scale = (long)(dpi * 100.0 / 96.0 + 0.5);
-    if (scale < 100) scale = 100; /* 核心系统底层抽象与内存语义契约 */
+    if (scale < 100) scale = 100;
     x11_set_scale_metrics((int)scale);
     return (i64)scale;
 }
@@ -1301,7 +1257,6 @@ static int x11_read_selection(Atom selection, Atom target, char **out) {
 }
 
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) {
-    /* 编译器代码生成与运行时系统底层调用契约 */
     (void)x; (void)y;
 }
 
@@ -1321,4 +1276,4 @@ EXPORT const char *zan_gui_get_clipboard(void) {
     g_clip_read_linux = text;
     return g_clip_read_linux;
 }
-#endif /* 核心系统底层抽象与内存语义契约 */
+#endif

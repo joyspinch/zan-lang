@@ -1,4 +1,3 @@
-/* 核心系统底层抽象与内存语义契约 */
 
 #include "package.h"
 #include <stdio.h>
@@ -36,7 +35,6 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
         if (n < 2) return false;
         out->patch = 0;
     }
-    /* 内部辅助逻辑 */
     if (out->major < 0 || out->minor < 0 || out->patch < 0) return false;
     if (str[consumed] == '-') {
         const char *pre = str + consumed + 1;
@@ -48,7 +46,6 @@ bool zan_version_parse(const char *str, zan_version_t *out) {
     return true;
 }
 
-/* 内部辅助逻辑 */
 static int version_cmp_int(int x, int y) {
     return (x > y) - (x < y);
 }
@@ -284,7 +281,6 @@ bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t 
     return false;
 }
 
-/* 内部辅助逻辑 */
 static bool pkg_token_is_shell_safe(const char *s) {
     if (!s) return true;
     for (const char *p = s; *p; p++) {
@@ -303,14 +299,12 @@ static bool pkg_token_is_shell_safe(const char *s) {
     return true;
 }
 
-/* 内部辅助逻辑 */
 static bool pkg_safe_component(const char *s);
 
 bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     char pkg_dir[1024];
     snprintf(pkg_dir, sizeof(pkg_dir), "%s" PATH_SEP "%s", reg->cache_dir, dep->name);
     if (pkg_is_dir(pkg_dir)) return true;
-    /* 核心系统底层抽象与内存语义契约 */
     if (!pkg_safe_component(dep->name)) {
         fprintf(stderr,
                 "error: refusing to fetch '%s': package name must be a single "
@@ -340,7 +334,6 @@ bool zan_pkg_fetch(zan_pkg_registry_t *reg, const zan_dependency_t *dep) {
     return false;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                                  char (*seen)[128], int *seen_count) {
     bool all_ok = true;
@@ -376,7 +369,6 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                     reg->resolved[reg->resolved_count++] = rp;
                 }
             }
-            /* 内部辅助逻辑 */
             if (fetched_pkg.dep_count > 0) {
                 bool seen_before = false;
                 for (int s = 0; s < *seen_count; s++) {
@@ -408,7 +400,6 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
 bool zan_pkg_resolve(zan_pkg_registry_t *reg, zan_package_t *root) {
     char seen[256][128];
     int seen_count = 0;
-    /* 内部辅助逻辑 */
     if (root->name[0]) {
         snprintf(seen[seen_count++], 128, "%s", root->name);
     }
@@ -452,7 +443,6 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
     }
     for (int i = 0; i < reg->resolved_count; i++) {
         if (reg->resolved[i] && strcmp(reg->resolved[i]->name, name) == 0) {
-            /* 底层系统交互与数据协议契约 */
             return zan_version_compare(&reg->resolved[i]->version, &v) == 0;
         }
     }
@@ -552,7 +542,6 @@ static bool pkg_safe_namespace_path(const char *s) {
 
 static bool pkg_is_dir(const char *path) {
 #ifdef _WIN32
-    /* 内部辅助逻辑 */
     char norm[1024];
     snprintf(norm, sizeof(norm), "%s", path);
     for (char *p = norm; *p; p++)
@@ -591,7 +580,6 @@ static bool pkg_dir_in_list(const char (*out_dirs)[1024], int count, const char 
     return false;
 }
 
-/* 内部辅助逻辑 */
 
 static int pkg_names_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
@@ -687,12 +675,10 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
         snprintf(cand, sizeof(cand), "%s" PATH_SEP "src" PATH_SEP "%s",
                  root, namespace_path);
         if (!pkg_is_dir(cand)) {
-            /* 底层系统交互与数据协议契约 */
             snprintf(cand, sizeof(cand), "%s" PATH_SEP "stdlib" PATH_SEP "%s",
                      root, namespace_path);
         }
         if (!pkg_is_dir(cand)) {
-            /* 底层系统交互与数据协议契约 */
             snprintf(cand, sizeof(cand), "%s" PATH_SEP "%s",
                      root, namespace_path);
         }
@@ -706,7 +692,6 @@ static int pkg_scan_store(const char *store, const char *namespace_path,
     return count;
 }
 
-/* 内部辅助逻辑 */
 
 #define PKG_NAMESPACE_BUCKETS 1024
 
@@ -763,7 +748,6 @@ static pkg_index_namespace_t *pkg_index_find_namespace(
     return NULL;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void pkg_index_add_namespace(zan_pkg_source_index_t *index,
                                     const char *name, size_t len,
                                     pkg_index_source_t *source, int descendant) {
@@ -786,7 +770,6 @@ static void pkg_index_add_namespace(zan_pkg_source_index_t *index,
     ns->sources[ns->count++] = (pkg_namespace_source_t){source, descendant};
 }
 
-/* 内部辅助逻辑 */
 static void pkg_rel_dir_ns(const char *dir, const char *src_root,
                            char *out, size_t cap) {
     size_t rl = strlen(src_root);
@@ -862,7 +845,6 @@ typedef struct {
     int capacity;
 } pkg_seen_names_t;
 
-/* 内部辅助逻辑 */
 static bool pkg_mark_seen(pkg_seen_names_t *seen, const char *name) {
     for (int i = 0; i < seen->count; i++)
         if (strcmp(seen->names[i], name) == 0) return false;
@@ -921,7 +903,6 @@ static void pkg_index_store(zan_pkg_source_index_t *index, const char *store,
 
 zan_pkg_source_index_t *zan_pkg_source_index_create(
     const char *project_dir, zan_pkg_namespace_probe_t probe) {
-    /* 底层系统交互与数据协议契约 */
     if (!project_dir || !project_dir[0] || !probe) return NULL;
     zan_pkg_source_index_t *index = (zan_pkg_source_index_t *)calloc(1, sizeof(*index));
     char store[1024];
@@ -930,7 +911,6 @@ zan_pkg_source_index_t *zan_pkg_source_index_create(
     pkg_index_store(index, store, probe, &seen, 1);
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
     pkg_index_store(index, store, probe, &seen, 1);
-    /* 底层系统交互与数据协议契约 */
     char exe_dir[1024] = {0};
 #ifdef _WIN32
     if (GetModuleFileNameA(NULL, exe_dir, sizeof(exe_dir))) {
@@ -1031,20 +1011,16 @@ int zan_pkg_visit_namespace(const char *project_dir, const char *namespace_path,
     return found;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int pkg_add_package_root(const char *store, const char *name,
                                 char (*out_roots)[1024], int count,
                                 int max_roots) {
     char root[1024], cand[1024];
     snprintf(root, sizeof(root), "%s/%s", store, name);
-    /* 底层系统交互与数据协议契约 */
     snprintf(cand, sizeof(cand), "%s/src", root);
     if (!pkg_is_dir(cand)) {
-        /* 核心系统底层抽象与内存语义契约 */
         snprintf(cand, sizeof(cand), "%s/stdlib", root);
     }
     if (!pkg_is_dir(cand)) {
-        /* 底层系统交互与数据协议契约 */
         snprintf(cand, sizeof(cand), "%s", root);
     }
     if (!pkg_is_dir(cand) || count >= max_roots ||
@@ -1132,13 +1108,10 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
         !pkg_safe_namespace_path(namespace_path) ||
         !out_dirs || max_dirs <= 0) return 0;
     char store[1024]; int count = 0;
-    /* 底层系统交互与数据协议契约 */
     snprintf(store, sizeof(store), "%s" PATH_SEP "packages", project_dir);
     count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
-    /* 核心系统底层抽象与内存语义契约 */
     snprintf(store, sizeof(store), "%s" PATH_SEP ".zan-packages", project_dir);
     count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
-    /* 核心系统底层抽象与内存语义契约 */
     {
         char exe_dir[1024] = {0};
 #ifdef _WIN32
@@ -1173,7 +1146,6 @@ int zan_pkg_find_namespace(const char *project_dir, const char *namespace_path,
         }
 #endif
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (zan_pkg_global_store(store, sizeof(store)))
         count = pkg_scan_store(store, namespace_path, out_dirs, count, max_dirs);
     return count;
@@ -1286,13 +1258,11 @@ bool zan_pkg_install_local(const char *source_dir, const char *package_name,
         snprintf(status, status_size, "ZANPKG_STATUS action=install status=invalid_manifest package=%s", package_name);
         return false;
     }
-    /* 内部辅助逻辑 */
     if (!pkg.has_version) {
         snprintf(status, status_size, "ZANPKG_STATUS action=install status=missing_version package=%s", package_name);
         zan_pkg_destroy(&pkg);
         return false;
     }
-    /* 内部辅助逻辑 */
     char pkg_src[1024], pkg_stdlib[1024];
     snprintf(pkg_src, sizeof(pkg_src), "%s" PATH_SEP "src", source_dir);
     snprintf(pkg_stdlib, sizeof(pkg_stdlib), "%s" PATH_SEP "stdlib", source_dir);
@@ -1369,7 +1339,6 @@ void zan_pkg_registry_destroy(zan_pkg_registry_t *reg) {
     memset(reg, 0, sizeof(*reg));
 }
 
-/* 内部辅助逻辑 */
 
 typedef struct {
     char pkg[128];

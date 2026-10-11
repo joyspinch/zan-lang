@@ -1,4 +1,3 @@
-/* 核心系统底层抽象与内存语义契约 */
 
 #include "ast.h"
 #include "arena.h"
@@ -37,7 +36,6 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     node->lit_suffix = 0;
     node->meta = NULL;
     if (kind == AST_ASSIGNMENT || kind == AST_BINARY) {
-        /* 底层系统交互与数据协议契约 */
         node->binary.compound_base = TK_EOF;
     }
     if (kind == AST_METHOD_DECL || kind == AST_CONSTRUCTOR_DECL) {
@@ -50,7 +48,6 @@ zan_ast_node_t *zan_ast_new(zan_arena_t *arena, zan_ast_kind_t kind, zan_loc_t l
     return node;
 }
 
-/* 底层系统交互与数据协议契约 */
 bool zan_ast_has_attr(const zan_ast_node_t *decl, const char *name) {
     if (!decl || !decl->meta) return false;
     size_t n = strlen(name);

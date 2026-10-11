@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 
 #include "lexer.h"
 #include "arena.h"
@@ -89,7 +88,6 @@ static const keyword_entry_t s_keywords[] = {
     {"unsafe",    TK_UNSAFE},
     {"ushort",    TK_USHORT},
     {"using",     TK_USING},
-    /* 内部辅助实现 */
     {"var",       TK_VAR},
     {"virtual",   TK_VIRTUAL},
     {"void",      TK_VOID},
@@ -182,7 +180,6 @@ bool zan_is_keyword(const char *name) {
 void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
                     uint32_t file_id, zan_arena_t *arena, zan_diag_t *diag) {
     memset(lex, 0, sizeof(*lex));
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (source && len >= 3 &&
         (unsigned char)source[0] == 0xEF &&
         (unsigned char)source[1] == 0xBB &&
@@ -199,7 +196,6 @@ void zan_lexer_init(zan_lexer_t *lex, const char *source, size_t len,
     lex->arena = arena;
     lex->diag = diag;
     lex->at_line_start = 1;
-    /* 内部辅助逻辑 */
     lex->defines = NULL;
     lex->define_count = 0;
     lex->define_cap = 0;
@@ -220,7 +216,6 @@ static inline char lexer_peek_ch2(zan_lexer_t *lex) {
 }
 
 static inline char lexer_advance(zan_lexer_t *lex) {
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (lexer_at_end(lex)) return '\0';
     char ch = lex->source[lex->pos++];
     if (ch == '\n') {
@@ -301,7 +296,6 @@ static void pp_undef(zan_lexer_t *lex, const char *name) {
 }
 
 static int pp_active(zan_lexer_t *lex) {
-    /* 模块核心语义抽象与接口调用契约 */
     if (lex->cond_overflow > 0) return 0;
     for (int i = 0; i < lex->cond_depth; i++) {
         if (!lex->cond_stack[i]) return 0;
@@ -321,7 +315,6 @@ static void pp_skip_hspaces(zan_lexer_t *lex) {
     }
 }
 
-/* 内部辅助逻辑 */
 static int pp_word_is_conditional(const char *src, size_t len, size_t p) {
     static const char *const words[] = { "endif", "else", "elif" };
     for (int w = 0; w < 3; w++) {
@@ -334,7 +327,6 @@ static int pp_word_is_conditional(const char *src, size_t len, size_t p) {
     return 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
     if (!honor_conditional) { pp_skip_to_eol(lex); return; }
     size_t stop = lex->pos;
@@ -343,12 +335,10 @@ static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
         char c = lex->source[stop];
         if (c == '/' && stop + 1 < lex->source_len
             && lex->source[stop + 1] == '/') {
-            /* 模块核心语义抽象与接口调用契约 */
             break;
         }
         if (c == '/' && stop + 1 < lex->source_len
             && lex->source[stop + 1] == '*') {
-            /* 内部辅助逻辑 */
             size_t end = stop + 2;
             while (end < lex->source_len && lex->source[end] != '\n'
                    && !(lex->source[end] == '*' && end + 1 < lex->source_len
@@ -359,7 +349,6 @@ static void pp_end_directive_line(zan_lexer_t *lex, int honor_conditional) {
                 stop = end + 2;
                 continue;
             }
-            /* 模块核心语义抽象与接口调用契约 */
             break;
         }
         if (c == '#') {
@@ -385,7 +374,6 @@ static void pp_read_ident(zan_lexer_t *lex, char *buf, int maxlen) {
     buf[i] = '\0';
 }
 
-/* 内部辅助逻辑 */
 static int pp_eval_expr(zan_lexer_t *lex, int depth);
 #define ZAN_PP_EVAL_MAX_DEPTH 2048
 
@@ -407,7 +395,6 @@ static int pp_eval_atom(zan_lexer_t *lex, int depth) {
         return v;
     }
     if (isdigit((unsigned char)ch)) {
-        /* 内部辅助逻辑 */
         long long v = 0;
         while (!lexer_at_end(lex) && isdigit((unsigned char)lexer_peek_ch(lex))) {
             v = v * 10 + (lexer_advance(lex) - '0');
@@ -488,7 +475,6 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_seen_true[lex->cond_depth] = active;
             lex->cond_depth++;
         } else {
-            /* 内部辅助实现 */
             zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
                           "conditional-compilation nesting too deep (max %d)",
                           ZAN_PP_MAX_COND_DEPTH);
@@ -522,7 +508,6 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             lex->cond_overflow++;
         }
     } else if (strcmp(dir, "elif") == 0) {
-        /* 编译器代码生成与运行时系统底层调用契约 */
         if (lex->cond_overflow > 0) {
             /* nothing to select on */
         } else if (lex->cond_depth > 0) {
@@ -539,7 +524,6 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             }
         }
     } else if (strcmp(dir, "else") == 0) {
-        /* 底层系统交互与数据协议契约 */
         if (lex->cond_overflow > 0) {
             /* nothing to flip */
         } else if (lex->cond_depth > 0) {
@@ -575,7 +559,6 @@ static void pp_handle_directive(zan_lexer_t *lex) {
             zan_diag_emit(lex->diag, DIAG_WARNING, lexer_loc(lex), "#warning %s", msg);
         }
     }
-    /* 内部辅助实现 */
     int honor_conditional =
         strcmp(dir, "if") == 0 || strcmp(dir, "ifdef") == 0 ||
         strcmp(dir, "ifndef") == 0 || strcmp(dir, "elif") == 0 ||
@@ -583,7 +566,6 @@ static void pp_handle_directive(zan_lexer_t *lex) {
     pp_end_directive_line(lex, honor_conditional);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void lexer_skip_whitespace(zan_lexer_t *lex) {
     for (;;) {
@@ -660,9 +642,7 @@ static zan_token_t lexer_ident_or_keyword(zan_lexer_t *lex) {
     return tok;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助逻辑 */
 static int lexer_int_suffix(zan_lexer_t *lex) {
     int enc = 0;
     char c = lexer_peek_ch(lex);
@@ -680,7 +660,6 @@ static int lexer_int_suffix(zan_lexer_t *lex) {
     return enc;
 }
 
-/* 内部辅助实现 */
 static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
                                      const char *buf, int radix,
                                      int *lit_suffix) {
@@ -698,7 +677,7 @@ static int64_t lexer_radix_int_value(zan_lexer_t *lex, zan_loc_t loc,
                       "integer literal is too large for 'long'");
         return (int64_t)uv;
     }
-    if (*lit_suffix == 0) *lit_suffix = 3; /* 核心系统底层抽象与内存语义契约 */
+    if (*lit_suffix == 0) *lit_suffix = 3;
     return (int64_t)uv;
 }
 
@@ -722,7 +701,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                     break;
                 }
             }
-            /* 底层系统交互与数据协议契约 */
             if (!digit_seen) {
                 zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                               "hexadecimal literal requires at least one digit after '0x'");
@@ -803,7 +781,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                     break;
                 }
             }
-            /* 底层系统交互与数据协议契约 */
             if (!digit_seen) {
                 char bad = lexer_peek_ch(lex);
                 if (bad >= '8' && bad <= '9')
@@ -871,7 +848,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
             lexer_advance(lex);
             exp_digit_seen = true;
         }
-        /* 核心系统底层抽象与内存语义契约 */
         if (!exp_digit_seen) {
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "exponent requires at least one digit after 'e'");
@@ -886,7 +862,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         lexer_advance(lex);
     }
 
-    /* 底层系统交互与数据协议契约 */
     int lit_suffix = 0;
     if (!is_float) {
         lit_suffix = lexer_int_suffix(lex);
@@ -905,7 +880,6 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
     buf[bi] = '\0';
     if (lit_truncated) {
-        /* 内部辅助逻辑 */
         zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float
                       ? "floating-point literal is too long"
                       : "integer literal is too long");
@@ -919,11 +893,9 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);
         tok.lit_suffix = lit_suffix;
         tok.lit_radix = 10;
-        /* 核心系统底层抽象与内存语义契约 */
         errno = 0;
         long long sv = strtoll(buf, NULL, 10);
         if (errno == ERANGE) {
-            /* 内部辅助实现 */
             errno = 0;
             unsigned long long uv = strtoull(buf, NULL, 10);
             if (errno == ERANGE) {
@@ -935,7 +907,7 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
                               "integer literal is too large for 'long'");
                 tok.int_val = (int64_t)uv;
             } else {
-                tok.lit_suffix = 3;   /* 底层系统交互与数据协议契约 */
+                tok.lit_suffix = 3;
                 tok.int_val = (int64_t)uv;
             }
         } else {
@@ -945,13 +917,11 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
 }
 
-/* 内部辅助实现 */
 typedef struct {
     char bytes[4];
     int len;
 } zan_esc_out_t;
 
-/* 内部辅助实现 */
 static int zan_utf8_encode(uint32_t cp, zan_esc_out_t *out) {
     if (cp < 0x80) {
         out->bytes[0] = (char)cp;
@@ -975,13 +945,11 @@ static int zan_utf8_encode(uint32_t cp, zan_esc_out_t *out) {
     return 4;
 }
 
-/* 内部辅助逻辑 */
 static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
                                 int ndigits) {
     uint32_t val = 0;
     int got = 0;
     if (kind == 'x') {
-        /* 核心系统底层抽象与内存语义契约 */
         while (got < 4) {
             char ch = lexer_peek_ch(lex);
             if (!isxdigit((unsigned char)ch)) break;
@@ -997,7 +965,6 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
             return -1;
         }
     } else {
-        /* 核心系统底层抽象与内存语义契约 */
         for (int i = 0; i < ndigits; i++) {
             char ch = lexer_peek_ch(lex);
             if (!isxdigit((unsigned char)ch)) {
@@ -1011,7 +978,6 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
             val = val * 16 + (uint32_t)d;
         }
     }
-    /* 模块核心语义抽象与接口调用契约 */
     if (val >= 0xD800 && val <= 0xDFFF) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                       "'\\%c' escape value 0x%X is a surrogate code point",
@@ -1021,7 +987,6 @@ static int32_t lexer_hex_escape(zan_lexer_t *lex, zan_loc_t loc, char kind,
     return (int32_t)val;
 }
 
-/* 内部辅助实现 */
 static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out) {
     char ch = lexer_advance(lex);
     switch (ch) {
@@ -1050,15 +1015,13 @@ static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out)
     }
 }
 
-/* 内部辅助实现 */
 static char lexer_escape_char(zan_lexer_t *lex) {
     zan_esc_out_t out;
     int n = lexer_escape_seq(lex, lexer_loc(lex), &out);
-    return out.bytes[0]; /* 底层系统交互与数据协议契约 */
+    return out.bytes[0];
     (void)n;
 }
 
-/* 内部辅助逻辑 */
 typedef struct {
     char *buf;
     size_t len;
@@ -1076,7 +1039,6 @@ static void zan_lex_strbuf_init(zan_lex_strbuf_t *sb) {
 static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
     if (sb->oom) return;
     if (sb->len + 1 > sb->cap) {
-        /* 内部辅助逻辑 */
         if (sb->cap > SIZE_MAX / 2) { sb->oom = true; return; }
         size_t ncap = sb->cap * 2;
         char *nbuf = (char *)realloc(sb->buf, ncap);
@@ -1087,13 +1049,11 @@ static void zan_lex_strbuf_push(zan_lex_strbuf_t *sb, char ch) {
     sb->buf[sb->len++] = ch;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static char *zan_lex_strbuf_take(zan_lexer_t *lex, zan_lex_strbuf_t *sb,
                                  size_t *out_len) {
     if (sb->oom) {
         zan_diag_emit(lex->diag, DIAG_ERROR, lexer_loc(lex),
                       "out of memory while lexing string literal");
-        /* 内部辅助逻辑 */
         free(sb->buf);
         sb->buf = NULL;
         *out_len = 0;
@@ -1116,7 +1076,6 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         if (lexer_peek_ch(lex) == '\\') {
             lexer_advance(lex); /* \ */
-            /* 内部辅助实现 */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
@@ -1144,7 +1103,6 @@ static zan_token_t lexer_string(zan_lexer_t *lex) {
     return tok;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static zan_token_t lexer_char(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
@@ -1169,7 +1127,6 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     return tok;
 }
 
-/* 内部辅助逻辑 */
 static zan_interp_level_t *lexer_interp_top(zan_lexer_t *lex) {
     if (lex->interp_depth <= 0) return NULL;
     int i = lex->interp_depth - 1;
@@ -1185,15 +1142,13 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '"') {
         char ch = lexer_peek_ch(lex);
         if ((ch == '{' || ch == '}') && lexer_peek_ch2(lex) == ch) {
-            /* 内部辅助逻辑 */
             lexer_advance(lex);
             lexer_advance(lex);
             zan_lex_strbuf_push(&sb, ch);
         } else if (ch == '{') {
-            break; /* 底层系统交互与数据协议契约 */
+            break;
         } else if (ch == '\\') {
             lexer_advance(lex); /* \ */
-            /* 内部辅助逻辑 */
             zan_esc_out_t esc;
             int en = lexer_escape_seq(lex, loc, &esc);
             for (int i = 0; i < en; i++) {
@@ -1214,7 +1169,6 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "interpolated strings nested more than %d deep",
                           ZAN_MAX_INTERP_DEPTH);
-            /* 内部辅助实现 */
         } else {
             lex->interp_stack[lex->interp_depth].brace = 0;
             lex->interp_stack[lex->interp_depth].paren = 0;
@@ -1223,11 +1177,9 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
         }
         kind = start_kind;
     } else {
-        /* 编译器代码生成与运行时系统底层调用契约 */
         if (!lexer_at_end(lex)) {
             lexer_advance(lex); /* " */
         } else {
-            /* 内部辅助逻辑 */
             zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                           "unterminated interpolated string");
         }
@@ -1242,13 +1194,12 @@ static zan_token_t lexer_interp_string_segment(zan_lexer_t *lex, zan_token_kind_
     return tok;
 }
 
-/* 内部辅助实现 */
 static zan_token_t lexer_interp_format(zan_lexer_t *lex, zan_loc_t loc) {
     char buf[256];
     size_t bi = 0;
     while (!lexer_at_end(lex) && lexer_peek_ch(lex) != '}') {
         if (bi < sizeof(buf) - 1) buf[bi++] = lexer_advance(lex);
-        else lexer_advance(lex); /* 底层系统交互与数据协议契约 */
+        else lexer_advance(lex);
     }
     if (bi >= sizeof(buf) - 1) {
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
@@ -1288,7 +1239,6 @@ static zan_token_t lexer_verbatim_string(zan_lexer_t *lex) {
         }
     }
     if (lexer_at_end(lex)) {
-        /* 内部辅助逻辑 */
         zan_diag_emit(lex->diag, DIAG_ERROR, loc,
                       "unterminated verbatim string literal");
     }
@@ -1370,7 +1320,6 @@ pp_retry:
         return lexer_make(lex, TK_LBRACE, loc);
     case '}':
         if (lexer_interp_top(lex) && lexer_interp_top(lex)->brace == 0) {
-            /* 内部辅助逻辑 */
             lex->interp_depth--;
             return lexer_interp_string_segment(lex, TK_INTERP_MID);
         }
@@ -1485,9 +1434,7 @@ static zan_token_t lexer_peek_n(zan_lexer_t *lex, int n) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
-    /* 内部辅助实现 */
     int dcount = lex->define_count;
-    /* 内部辅助逻辑 */
     int cdep = lex->cond_depth;
     int cover = lex->cond_overflow;
     int cstack[ZAN_PP_MAX_COND_DEPTH];

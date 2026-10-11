@@ -12,16 +12,14 @@
 #define ZAN_TRAY_QCAP      64
 #define ZAN_TRAY_ITEM_MAX  256
 
-/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_TRAY_OPCODE_DOCK 0
 
 typedef struct {
     int  id;
-    int  flags;         /* 底层系统交互与数据协议契约 */
+    int  flags;
     char text[128];
 } zan_tray_item_t;
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     char path[ZAN_TRAY_PATH_MAX];
     u32 *pixels;
@@ -31,8 +29,7 @@ typedef struct {
 static pthread_t       g_tray_thread;
 static pthread_mutex_t g_tray_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_tray_cv = PTHREAD_COND_INITIALIZER;
-/* 核心系统底层抽象与内存语义契约 */
-static int  g_tray_live      = 0;   /* 底层系统交互与数据协议契约 */
+static int  g_tray_live      = 0;
 static int  g_tray_start_rc  = 0;   /* 0 pending, 1 docked, -1 failed */
 static int  g_tray_quit      = 0;
 static int  g_tray_ctl[2]    = { -1, -1 };
@@ -43,12 +40,10 @@ static int  g_tray_menu_dirty = 0;
 static int  g_tray_q[ZAN_TRAY_QCAP];
 static int  g_tray_qhead = 0, g_tray_qtail = 0;
 
-/* 模块核心语义抽象与接口调用契约 */
 static Display *g_tray_dpy      = NULL;
 static Window   g_tray_win      = 0;
 static Window   g_tray_manager  = 0;
 static GC       g_tray_gc       = NULL;
-/* 内部辅助逻辑 */
 static Font g_tray_font    = 0;
 static int  g_tray_font16  = 0;   /* font is 2-byte (iso10646-1) */
 static int  g_tray_ascent  = 11;
@@ -59,7 +54,6 @@ static zan_tray_item_t g_tray_items[ZAN_TRAY_ITEM_MAX];
 static int      g_tray_item_n   = 0;
 static Time     g_tray_last_click = 0;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void tray_push(int ev) {
     pthread_mutex_lock(&g_tray_mu);
@@ -72,9 +66,7 @@ static void tray_push(int ev) {
     pthread_mutex_unlock(&g_tray_mu);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static unsigned char *tray_read_file(const char *path, long *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -91,7 +83,6 @@ static unsigned char *tray_read_file(const char *path, long *out_len) {
     return buf;
 }
 
-/* 内部辅助逻辑 */
 static u32 *tray_copy_bitmap(const zan_bitmap *bitmap, int *w, int *h) {
     u32 *copy;
     int row;
@@ -121,12 +112,11 @@ static u32 tray_le32(const unsigned char *p) {
     return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
-/* 内部辅助逻辑 */
 static u32 *tray_from_ico_dib(const unsigned char *p, long len, int *w, int *h) {
     if (len < 40) return NULL;
     u32 hdr    = tray_le32(p);
     int width  = (int)tray_le32(p + 4);
-    int height = (int)tray_le32(p + 8) / 2;   /* 核心系统底层抽象与内存语义契约 */
+    int height = (int)tray_le32(p + 8) / 2;
     int bpp    = (int)(p[14] | (p[15] << 8));
     u32 comp   = tray_le32(p + 16);
     if (hdr < 40 || hdr > (u32)len || comp != 0) return NULL;
@@ -152,7 +142,6 @@ static u32 *tray_from_ico_dib(const unsigned char *p, long len, int *w, int *h) 
     return out;
 }
 
-/* 内部辅助逻辑 */
 static u32 *tray_from_ico(const unsigned char *p, long len, int *w, int *h) {
     if (len < 6 || tray_le32(p) != 0x00010000u) return NULL;
     int count = (int)(p[4] | (p[5] << 8));
@@ -176,7 +165,6 @@ static u32 *tray_from_ico(const unsigned char *p, long len, int *w, int *h) {
     return tray_from_ico_dib(p + best_off, best_len, w, h);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static u32 *tray_load_icon(const char *path, int *w, int *h) {
     if (!path || !*path) return NULL;
     long len = 0;
@@ -189,12 +177,10 @@ static u32 *tray_load_icon(const char *path, int *w, int *h) {
 
 /* drawing */
 
-/* 模块核心语义抽象与接口调用契约 */
 static void tray_paint(void) {
     if (!g_tray_dpy || !g_tray_win) return;
     XClearWindow(g_tray_dpy, g_tray_win);
     if (!g_tray_pix || g_tray_pix_w <= 0 || g_tray_pix_h <= 0) {
-        /* 内部辅助逻辑 */
         XSetForeground(g_tray_dpy, g_tray_gc, 0x3B78FF);
         XFillRectangle(g_tray_dpy, g_tray_win, g_tray_gc, 3, 3,
                        (unsigned)(g_tray_w - 6), (unsigned)(g_tray_h - 6));
@@ -238,7 +224,6 @@ static void tray_apply_tooltip(void) {
     g_tray_tip_dirty = 0;
     pthread_mutex_unlock(&g_tray_mu);
     if (!g_tray_win) return;
-    /* 模块核心语义抽象与接口调用契约 */
     XStoreName(g_tray_dpy, g_tray_win, tip);
     Atom net_name = XInternAtom(g_tray_dpy, "_NET_WM_NAME", False);
     Atom utf8 = XInternAtom(g_tray_dpy, "UTF8_STRING", False);
@@ -247,7 +232,6 @@ static void tray_apply_tooltip(void) {
     XFlush(g_tray_dpy);
 }
 
-/* 内部辅助逻辑 */
 static void tray_apply_menu(void) {
     char spec[ZAN_TRAY_MENU_MAX];
     pthread_mutex_lock(&g_tray_mu);
@@ -281,7 +265,6 @@ static void tray_apply_menu(void) {
     }
 }
 
-/* 内部辅助逻辑 */
 static int tray_to_ucs2(const char *s, XChar2b *out, int cap) {
     int n = 0;
     const unsigned char *p = (const unsigned char *)s;
@@ -313,7 +296,6 @@ static int tray_text_width(const char *s) {
     if (g_tray_font16) {
         n = tray_to_ucs2(s, buf, ZAN_TRAY_GLYPH_MAX);
     } else {
-        /* 模块核心语义抽象与接口调用契约 */
         n = (int)strlen(s);
         if (n > ZAN_TRAY_GLYPH_MAX) n = ZAN_TRAY_GLYPH_MAX;
         for (int i = 0; i < n; i++) {
@@ -339,12 +321,10 @@ static void tray_draw_text(Window w, int x, int y, const char *s) {
         int n = tray_to_ucs2(s, buf, ZAN_TRAY_GLYPH_MAX);
         XDrawString16(g_tray_dpy, w, g_tray_gc, x, y, buf, n);
     } else {
-        /* 底层系统交互与数据协议契约 */
         XDrawString(g_tray_dpy, w, g_tray_gc, x, y, s, (int)strlen(s));
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_TRAY_ITEM_H  22
 #define ZAN_TRAY_SEP_H   7
@@ -401,7 +381,6 @@ static int tray_hit_item(int y) {
     return -1;
 }
 
-/* 内部辅助逻辑 */
 static int tray_show_menu(void) {
     if (g_tray_item_n == 0) return 0;
     int width = 120, height = 2;
@@ -422,7 +401,7 @@ static int tray_show_menu(void) {
                   &child_ret, &rx, &ry, &wx, &wy, &mask);
     int mx = rx, my = ry;
     if (mx + width > sw) mx = sw - width;
-    if (my + height > sh) my = sh - height;   /* 核心系统底层抽象与内存语义契约 */
+    if (my + height > sh) my = sh - height;
     if (mx < 0) mx = 0;
     if (my < 0) my = 0;
 
@@ -435,7 +414,6 @@ static int tray_show_menu(void) {
         (unsigned)height, 0, CopyFromParent, InputOutput, CopyFromParent,
         CWOverrideRedirect | CWBackPixel | CWSaveUnder, &attrs);
     if (!menu) return 0;
-    /* 内部辅助逻辑 */
     Atom wtype = XInternAtom(g_tray_dpy, "_NET_WM_WINDOW_TYPE", False);
     Atom popup = XInternAtom(g_tray_dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
     XChangeProperty(g_tray_dpy, menu, wtype, XA_ATOM, 32, PropModeReplace,
@@ -481,7 +459,7 @@ static int tray_show_menu(void) {
             }
             break;
         case KeyPress:
-            done = 1;   /* 核心系统底层抽象与内存语义契约 */
+            done = 1;
             break;
         case ButtonPress:
             if (ev.xbutton.window != menu) { done = 1; }
@@ -534,7 +512,6 @@ static int tray_dock(void) {
     if (!XSendEvent(g_tray_dpy, g_tray_manager, False, NoEventMask, &ev)) {
         return 0;
     }
-    /* 内部辅助逻辑 */
     XSelectInput(g_tray_dpy, g_tray_manager, StructureNotifyMask);
     XFlush(g_tray_dpy);
     return 1;
@@ -559,17 +536,14 @@ static int tray_setup(const char *icon_path) {
         return 0;
     }
     g_tray_win = win;
-    /* 内部辅助逻辑 */
     XSetWindowBackgroundPixmap(g_tray_dpy, win, ParentRelative);
     g_tray_gc = XCreateGC(g_tray_dpy, win, 0, NULL);
 
-    /* 模块核心语义抽象与接口调用契约 */
     Atom xembed_info = XInternAtom(g_tray_dpy, "_XEMBED_INFO", False);
     unsigned long info[2] = { 0, 1 };
     XChangeProperty(g_tray_dpy, win, xembed_info, xembed_info, 32,
                     PropModeReplace, (const unsigned char *)info, 2);
 
-    /* 内部辅助逻辑 */
     static const char *fonts[] = {
         "-*-*-medium-r-normal--14-*-*-*-*-*-iso10646-1",
         "-*-*-medium-r-normal--*-*-*-*-*-*-iso10646-1",
@@ -645,7 +619,6 @@ static void *tray_thread_main(void *arg) {
         fds[0].events = POLLIN;
         fds[1].fd = g_tray_ctl[0];
         fds[1].events = POLLIN;
-        /* 模块核心语义抽象与接口调用契约 */
         if (XPending(g_tray_dpy) == 0) poll(fds, 2, 1000);
 
         if (fds[1].revents & POLLIN) {
@@ -680,7 +653,7 @@ static void *tray_thread_main(void *arg) {
                 break;
             case DestroyNotify:
                 if (ev.xdestroywindow.window == g_tray_manager) {
-                    g_tray_manager = 0;   /* 核心系统底层抽象与内存语义契约 */
+                    g_tray_manager = 0;
                 } else if (ev.xdestroywindow.window == g_tray_win) {
                     g_tray_win = 0;
                     stop = 1;
@@ -694,7 +667,6 @@ static void *tray_thread_main(void *arg) {
                 } else if (ev.xbutton.button == 2) {
                     tray_push(4);
                 } else if (ev.xbutton.button == 1) {
-                    /* 内部辅助逻辑 */
                     tray_push(1);
                     if (g_tray_last_click != 0 &&
                         ev.xbutton.time - g_tray_last_click <= 400) {
@@ -733,7 +705,6 @@ static void tray_wake(void) {
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_tray_start_pixels(const zan_bitmap *bitmap,
                                   const char *icon_path, const char *tooltip) {
@@ -781,7 +752,6 @@ EXPORT i32 zan_tray_start_pixels(const zan_bitmap *bitmap,
     return 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT i32 zan_tray_start(const char *icon_path, const char *tooltip) {
     return zan_tray_start_pixels(NULL, icon_path, tooltip);
 }
@@ -839,7 +809,6 @@ EXPORT i32 zan_tray_next_event(i32 timeout_ms) {
     return ev;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_LINUX_HOTKEY_QCAP 64
 static int g_linux_hotkey_q[ZAN_LINUX_HOTKEY_QCAP];
@@ -1019,7 +988,6 @@ EXPORT i32 zan_hotkey_next_event(i32 timeout_ms) {
     return ev;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_mouse_is_down(i32 button) {
     Display *dpy = XOpenDisplay(NULL);
     if (!dpy) return 0;
@@ -1127,7 +1095,6 @@ EXPORT i32 zan_keyboard_post(i32 vk, i32 is_down) {
     return st != 0 ? 1 : 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_LINUX_HOOK_QCAP 256
 static pthread_mutex_t g_linux_hook_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_linux_hook_cv = PTHREAD_COND_INITIALIZER;
@@ -1177,7 +1144,6 @@ EXPORT i32 zan_hook_next_event(i32 timeout_ms, i32 *out_p1, i32 *out_p2, i32 *ou
 
 #elif !defined(_WIN32) && !defined(__APPLE__)
 
-/* 核心系统底层抽象与内存语义契约 */
 EXPORT i32 zan_tray_start(const char *icon_path, const char *tooltip) {
     (void)icon_path; (void)tooltip; return 0;
 }

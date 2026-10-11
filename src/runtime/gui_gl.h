@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_GUI_GL_H
 #define ZAN_GUI_GL_H
 
@@ -23,7 +22,6 @@ typedef float         zgl_float;
 #define ZGL_SRC_ALPHA                    0x0302
 #define ZGL_ONE_MINUS_SRC_ALPHA          0x0303
 #define ZGL_ONE                          1
-/* 底层系统交互与数据协议契约 */
 #define ZGL_SRC1_COLOR                   0x88F9
 #define ZGL_ONE_MINUS_SRC1_COLOR         0x88FA
 #define ZGL_SRC1_ALPHA                   0x8589
@@ -154,13 +152,11 @@ typedef struct zan_gl_api_s {
     void      (*FramebufferRenderbuffer)(zgl_enum, zgl_enum, zgl_enum,
                                          zgl_uint);
     zgl_enum  (*CheckFramebufferStatus)(zgl_enum);
-    /* 底层系统交互与数据协议契约 */
     void      (*BlitFramebuffer)(zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_int, zgl_int, zgl_int, zgl_int,
                                  zgl_bitfield, zgl_enum);
 } zan_gl_api;
 
-/* 底层系统交互与数据协议契约 */
 int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name));
 
 #endif /* ZAN_GUI_GL_H */

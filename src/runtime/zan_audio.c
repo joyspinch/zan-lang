@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -20,9 +19,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600 /* 底层系统交互与数据协议契约 */
+#define _WIN32_WINNT 0x0600
 #endif
-/* 底层系统交互与数据协议契约 */
 #ifndef COBJMACROS
 #define COBJMACROS
 #endif
@@ -42,11 +40,9 @@
 #endif
 
 #ifdef __ANDROID__
-/* 内部辅助逻辑 */
 #include <aaudio/AAudio.h>
 #endif
 
-/* 内部辅助逻辑 */
 #define STB_VORBIS_NO_PUSHDATA_API
 #define STB_VORBIS_NO_STDIO
 #include "stb_vorbis.c"
@@ -54,25 +50,24 @@
 #ifndef ZAN_VOICE_SLOTS
 #define ZAN_VOICE_SLOTS 256
 #endif
-/* 内部辅助逻辑 */
 #define ZAN_AUDIO_MAX_FILL 4096
 #define ZAN_AUDIO_MAX_CHANNELS 8
 #define ZAN_AUDIO_MAX_FILE (256 * 1024 * 1024)
 
 typedef struct ZanAudioClip {
     short *pcm;   /* s16 interleaved */
-    int frames;   /* 核心系统底层抽象与内存语义契约 */
+    int frames;
     int freq;
     int channels;
 } ZanAudioClip;
 
 typedef struct ZanVoice {
     ZanAudioClip *clip;
-    double cursor; /* 核心系统底层抽象与内存语义契约 */
-    double step;   /* 底层系统交互与数据协议契约 */
+    double cursor;
+    double step;
     float gain;
     int loop;
-    int gen;       /* 底层系统交互与数据协议契约 */
+    int gen;
     int active;
 } ZanVoice;
 
@@ -86,21 +81,19 @@ static char zan_audio_err[192];
 static CRITICAL_SECTION zan_audio_cs;
 static int zan_audio_cs_ok;
 static HANDLE zan_audio_thread;
-static HANDLE zan_audio_stop_evt;   /* 核心系统底层抽象与内存语义契约 */
-static HANDLE zan_audio_fill_evt;   /* 核心系统底层抽象与内存语义契约 */
-static HANDLE zan_audio_init_evt;   /* 核心系统底层抽象与内存语义契约 */
+static HANDLE zan_audio_stop_evt;
+static HANDLE zan_audio_fill_evt;
+static HANDLE zan_audio_init_evt;
 static IAudioClient *zan_audio_client;
 static IAudioRenderClient *zan_audio_render;
 static UINT32 zan_audio_buf_frames;
 static int zan_audio_dev_freq;
 static int zan_audio_dev_channels;
-/* 内部辅助逻辑 */
 static int zan_audio_dev_fmt;
 #endif
 
 #ifndef _WIN32
 #if defined(__wasi__)
-/* 底层系统交互与数据协议契约 */
 static void zan_audio_lock(void) { }
 static void zan_audio_unlock(void) { }
 #else
@@ -108,8 +101,8 @@ static pthread_mutex_t zan_audio_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void zan_audio_lock(void) { pthread_mutex_lock(&zan_audio_mutex); }
 static void zan_audio_unlock(void) { pthread_mutex_unlock(&zan_audio_mutex); }
 #endif
-static int zan_audio_dev_freq;      /* 核心系统底层抽象与内存语义契约 */
-static int zan_audio_dev_channels;  /* 核心系统底层抽象与内存语义契约 */
+static int zan_audio_dev_freq;
+static int zan_audio_dev_channels;
 #endif
 
 #ifdef __ANDROID__
@@ -139,7 +132,6 @@ static int64_t zan_voice_pack(int slot, int gen) {
     return ((int64_t)gen << 8) | (int64_t)(slot + 1);
 }
 
-/* 内部辅助逻辑 */
 static ZanVoice *zan_voice_of(int64_t handle) {
     int slot = (int)((handle & 255) - 1);
     int gen = (int)(handle >> 8);
@@ -155,7 +147,6 @@ static void zan_voice_reset(ZanVoice *v) {
     memset(v, 0, sizeof(*v));
 }
 
-/* 内部辅助逻辑 */
 static void zan_voice_reap_locked(void) {
     int i;
     for (i = 0; i < ZAN_VOICE_SLOTS; i++) {
@@ -165,7 +156,6 @@ static void zan_voice_reap_locked(void) {
     }
 }
 
-/* 内部辅助逻辑 */
 
 static unsigned char *zan_audio_read_file(const char *path, int *out_len) {
     unsigned char *bytes = NULL;
@@ -231,7 +221,6 @@ static unsigned char *zan_audio_read_file(const char *path, int *out_len) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static unsigned int zan_wav_u16(const unsigned char *p) {
     return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
@@ -245,7 +234,7 @@ static unsigned int zan_wav_u32(const unsigned char *p) {
 static short zan_wav_int_to_s16(int bits, const unsigned char *p) {
     if (bits == 8) return (short)(((int)p[0] - 128) * 257);
     if (bits == 16) return (short)(unsigned short)zan_wav_u16(p);
-    if (bits == 24) { /* 底层系统交互与数据协议契约 */
+    if (bits == 24) {
         int v = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16);
         if (v & 0x800000) v -= 0x1000000;
         return (short)(v >> 8);
@@ -264,7 +253,6 @@ static short zan_wav_f32_to_s16(const unsigned char *p) {
     return (short)(int)(d * 32767.0);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     const unsigned char *fmt = NULL;
     const unsigned char *data = NULL;
@@ -278,7 +266,6 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     }
     pos = 12;
     while (pos + 8 <= n) {
-        /* 核心系统底层抽象与内存语义契约 */
         uint32_t len = zan_wav_u32(b + pos + 4);
         if (len >= 0x80000000u) {
             zan_audio_set_err("wav chunk length out of range");
@@ -290,11 +277,11 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
             fmt_len = (int)len;
         } else if (memcmp(b + pos, "data", 4) == 0 && !data) {
             data_len = (int)len;
-            if (pos + 8 + (int64_t)data_len > n) data_len = (int)(n - pos - 8); /* 核心系统底层抽象与内存语义契约 */
+            if (pos + 8 + (int64_t)data_len > n) data_len = (int)(n - pos - 8);
             data = b + pos + 8;
         }
         if (fmt && data) break;
-        pos += 8 + (int64_t)((len + 1u) & ~1u); /* 核心系统底层抽象与内存语义契约 */
+        pos += 8 + (int64_t)((len + 1u) & ~1u);
     }
     if (!fmt || !data || data_len <= 0) {
         zan_audio_set_err("wav fmt/data chunk missing or empty");
@@ -305,7 +292,6 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     fmt_freq = (int)zan_wav_u32(fmt + 4);
     fmt_bits = (int)zan_wav_u16(fmt + 14);
     if (fmt_tag == 0xFFFE) {
-        /* 内部辅助逻辑 */
         unsigned int sub;
         if (fmt_len < 40) {
             zan_audio_set_err("wav extensible fmt chunk too small");
@@ -363,7 +349,6 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_ogg_decode(const unsigned char *b, int n, ZanAudioClip *c) {
     int channels = 0, freq = 0;
     short *decoded = NULL;
@@ -385,14 +370,12 @@ static int zan_ogg_decode(const unsigned char *b, int n, ZanAudioClip *c) {
 #ifdef _WIN32
 
 static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
-    /* 内部辅助逻辑 */
     static float acc[ZAN_AUDIO_MAX_FILL * ZAN_AUDIO_MAX_CHANNELS];
     int f, ch, i;
     int devch = zan_audio_dev_channels;
     int total;
 
     if (frames > ZAN_AUDIO_MAX_FILL) frames = ZAN_AUDIO_MAX_FILL;
-    /* 内部辅助逻辑 */
     if (devch < 1 || devch > ZAN_AUDIO_MAX_CHANNELS) devch = 2;
     total = (int)frames * devch;
     memset(acc, 0, sizeof(float) * (size_t)total);
@@ -422,7 +405,7 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
                 if (v->loop) {
                     while (cur >= (double)nf) cur -= (double)nf;
                 } else if (cur >= (double)nf) {
-                    break; /* 底层系统交互与数据协议契约 */
+                    break;
                 }
                 i0 = (int)cur;
                 frac = cur - (double)i0;
@@ -442,7 +425,6 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
     }
     LeaveCriticalSection(&zan_audio_cs);
 
-    /* 底层系统交互与数据协议契约 */
     switch (zan_audio_dev_fmt) {
     case 0: { /* float32 */
         float *d = (float *)dst;
@@ -494,7 +476,6 @@ static void zan_audio_mix(unsigned char *dst, UINT32 frames) {
 }
 
 static DWORD WINAPI zan_audio_thread_proc(LPVOID param) {
-    /* 核心系统底层抽象与内存语义契约 */
     static const CLSID clsid_mmdevice = {0xBCDE0395,0xE52F,0x467C,
         {0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
     static const IID iid_immdevice_enum = {0xA95664D2,0x9614,0x4F35,
@@ -543,7 +524,6 @@ static DWORD WINAPI zan_audio_thread_proc(LPVOID param) {
         zan_audio_set_err("GetMixFormat failed");
         goto thread_fail;
     }
-    /* 内部辅助逻辑 */
     {
         int tag = wf->wFormatTag;
         int bits = wf->wBitsPerSample;
@@ -564,7 +544,6 @@ static DWORD WINAPI zan_audio_thread_proc(LPVOID param) {
         zan_audio_dev_freq = (int)wf->nSamplesPerSec;
         zan_audio_dev_channels = (int)wf->nChannels;
     }
-    /* 内部辅助逻辑 */
     if (FAILED(IAudioClient_Initialize(zan_audio_client,
                 AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 1000000 /* 100ms in 100ns units */, 0, wf, NULL))) {
@@ -593,14 +572,14 @@ static DWORD WINAPI zan_audio_thread_proc(LPVOID param) {
     CoTaskMemFree(wf);
     wf = NULL;
 
-    SetEvent(zan_audio_init_evt); /* 核心系统底层抽象与内存语义契约 */
+    SetEvent(zan_audio_init_evt);
     for (;;) {
         DWORD w = WaitForMultipleObjects(2, evs, FALSE, 2000);
         UINT32 padding = 0, avail;
         BYTE *dst = NULL;
-        if (w == WAIT_OBJECT_0) break;                 /* 核心系统底层抽象与内存语义契约 */
+        if (w == WAIT_OBJECT_0) break;
         if (w != WAIT_OBJECT_0 + 1 && w != WAIT_TIMEOUT) break;
-        if (!zan_audio_ready) break;                   /* 核心系统底层抽象与内存语义契约 */
+        if (!zan_audio_ready) break;
         if (FAILED(IAudioClient_GetCurrentPadding(zan_audio_client, &padding)))
             continue;
         if (padding >= zan_audio_buf_frames) continue;
@@ -630,7 +609,7 @@ thread_fail:
     IMMDevice_Release(dev);
     IMMDeviceEnumerator_Release(enumr);
     CoUninitialize();
-    SetEvent(zan_audio_init_evt); /* 核心系统底层抽象与内存语义契约 */
+    SetEvent(zan_audio_init_evt);
     return 0;
 }
 
@@ -641,7 +620,6 @@ thread_fail:
 #ifndef _WIN32
 
 static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
-    /* 内部辅助逻辑 */
     static float acc[ZAN_AUDIO_MAX_FILL * ZAN_AUDIO_MAX_CHANNELS];
     int f, ch, i;
     int total;
@@ -675,7 +653,7 @@ static void zan_audio_mix_s16(unsigned char *dst, int frames, int devch) {
                 if (v->loop) {
                     while (cur >= (double)nf) cur -= (double)nf;
                 } else if (cur >= (double)nf) {
-                    break; /* 底层系统交互与数据协议契约 */
+                    break;
                 }
                 i0 = (int)cur;
                 frac = cur - (double)i0;
@@ -774,7 +752,6 @@ static void zan_audio_mix_f32(float *dst, int frames, int devch) {
 
 #ifdef __ANDROID__
 
-/* 内部辅助逻辑 */
 static aaudio_data_callback_result_t zan_audio_aa_callback(
         AAudioStream *stream, void *userData, void *audioData,
         int32_t numFrames) {
@@ -809,7 +786,6 @@ static AAudioStream *zan_audio_aa_open_stream(void) {
     }
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
     AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
-    /* 内部辅助逻辑 */
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setSampleRate(b, 48000);
     AAudioStreamBuilder_setChannelCount(b, 2);
@@ -1084,7 +1060,6 @@ static int zan_coreaudio_start(void) {
     zan_audio_dev_freq = 44100;
     zan_audio_dev_channels = 2;
 
-    /* 底层系统交互与数据协议契约 */
     zan_ca_AudioStreamBasicDescription fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.mSampleRate = (double)zan_audio_dev_freq;
@@ -1099,7 +1074,6 @@ static int zan_coreaudio_start(void) {
     /* kAudioUnitProperty_StreamFormat = 8, kAudioUnitScope_Input = 1 */
     zan_ca.SetProperty(zan_ca_unit, 8, 1, 0, &fmt, sizeof(fmt));
 
-    /* 内部辅助逻辑 */
     zan_ca_AURenderCallbackStruct cb;
     cb.inputProc = zan_coreaudio_render_cb;
     cb.inputProcRefCon = NULL;
@@ -1251,7 +1225,6 @@ static void zan_ohaudio_stop(void) {
 
 #endif /* __OHOS__ */
 
-/* 核心系统底层抽象与内存语义契约 */
 
 ZAN_AUDIO_EXPORT int32_t zan_audio_open(void) {
 #if defined(_WIN32)
@@ -1269,7 +1242,6 @@ ZAN_AUDIO_EXPORT int32_t zan_audio_open(void) {
         zan_audio_set_err("CreateEvent failed");
         goto open_fail;
     }
-    /* 底层系统交互与数据协议契约 */
     {
         int i;
         for (i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
@@ -1280,7 +1252,6 @@ ZAN_AUDIO_EXPORT int32_t zan_audio_open(void) {
         goto open_fail;
     }
     zan_audio_thread = th;
-    /* 内部辅助逻辑 */
     if (WaitForSingleObject(zan_audio_init_evt, 10000) != WAIT_OBJECT_0
         || !zan_audio_client) {
         SetEvent(zan_audio_stop_evt);
@@ -1307,7 +1278,6 @@ open_fail:
         if (zan_audio_err[0] == 0) zan_audio_set_err("audio device open failed");
         return 0;
     }
-    /* 内部辅助逻辑 */
     zan_audio_lock();
     for (int i = 0; i < ZAN_VOICE_SLOTS; i++) zan_voice_reset(&zan_voices[i]);
     zan_audio_dev_freq = AAudioStream_getSampleRate(s);
@@ -1315,7 +1285,7 @@ open_fail:
     if (zan_audio_dev_freq <= 0) zan_audio_dev_freq = 48000;
     if (zan_audio_dev_channels <= 0) zan_audio_dev_channels = 2;
     zan_audio_stream = s;
-    zan_audio_ready = 1; /* 核心系统底层抽象与内存语义契约 */
+    zan_audio_ready = 1;
     zan_audio_unlock();
     if (AAudioStream_requestStart(s) != AAUDIO_OK) {
         zan_audio_lock();
@@ -1392,7 +1362,6 @@ ZAN_AUDIO_EXPORT void zan_audio_close(void) {
     zan_audio_ready = 0;
     zan_audio_unlock();
     if (zan_audio_stream) {
-        /* 内部辅助逻辑 */
         AAudioStream_close(zan_audio_stream);
         zan_audio_stream = NULL;
     }
@@ -1562,7 +1531,6 @@ ZAN_AUDIO_EXPORT void zan_audio_free_clip(int64_t clip_handle) {
 #else
     zan_audio_lock();
 #endif
-    /* 底层系统交互与数据协议契约 */
     for (i = 0; i < ZAN_VOICE_SLOTS; i++)
         if (zan_voices[i].clip == c) zan_voice_reset(&zan_voices[i]);
 #if defined(_WIN32)
@@ -1590,7 +1558,6 @@ ZAN_AUDIO_EXPORT int32_t zan_audio_clip_duration_ms(int64_t clip_handle) {
     return (int32_t)(((int64_t)c->frames * 1000) / (int64_t)c->freq);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 ZAN_AUDIO_EXPORT int64_t zan_audio_play(int64_t clip_handle, double gain, int32_t loop) {
     ZanAudioClip *c = (ZanAudioClip *)zan_ptr_of(clip_handle);
     ZanVoice *v;
@@ -1621,10 +1588,9 @@ ZAN_AUDIO_EXPORT int64_t zan_audio_play(int64_t clip_handle, double gain, int32_
     v->clip = c;
     v->loop = loop != 0 ? 1 : 0;
     v->gen = zan_voice_gen++;
-    if (v->gen > 0x1FFFFF) v->gen = 1; /* 核心系统底层抽象与内存语义契约 */
+    if (v->gen > 0x1FFFFF) v->gen = 1;
     v->gain = gain < 0.0 ? 0.0f : (float)gain;
     v->cursor = 0.0;
-    /* 内部辅助逻辑 */
     v->step = (zan_audio_dev_freq > 0) ? ((double)c->freq / (double)zan_audio_dev_freq) : 1.0;
     if (!(v->step > 0.0)) v->step = 1.0;
     v->active = 1;
@@ -1706,7 +1672,7 @@ ZAN_AUDIO_EXPORT void zan_audio_voice_set_gain(int64_t voice, double gain) {
         v = zan_voice_of(voice);
         if (v) {
             if (gain < 0.0) gain = 0.0;
-            v->gain = (float)gain; /* 核心系统底层抽象与内存语义契约 */
+            v->gain = (float)gain;
         }
         LeaveCriticalSection(&zan_audio_cs);
         return;
@@ -1717,7 +1683,7 @@ ZAN_AUDIO_EXPORT void zan_audio_voice_set_gain(int64_t voice, double gain) {
         ZanVoice *v = zan_voice_of(voice);
         if (v) {
             if (gain < 0.0) gain = 0.0;
-            v->gain = (float)gain; /* 核心系统底层抽象与内存语义契约 */
+            v->gain = (float)gain;
         }
     }
     zan_audio_unlock();
@@ -1727,7 +1693,7 @@ ZAN_AUDIO_EXPORT void zan_audio_voice_set_gain(int64_t voice, double gain) {
         ZanVoice *v = zan_voice_of(voice);
         if (!v) return;
         if (gain < 0.0) gain = 0.0;
-        v->gain = (float)gain; /* 核心系统底层抽象与内存语义契约 */
+        v->gain = (float)gain;
     }
 }
 

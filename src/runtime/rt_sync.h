@@ -7,7 +7,6 @@
 extern "C" {
 #endif
 
-/* 模块核心语义抽象与接口调用契约 */
 int32_t zan_thread_start(void *body);
 
 /* 获取当前线程的进程内唯一数值 ID（跨平台底层线程标识） */
@@ -19,7 +18,6 @@ void zan_thread_detach(void);
 /* 释放当前线程的异常处理状态 */
 void __zan_eh_release(void);
 
-/* 模块核心语义抽象与接口调用契约 */
 void zan_monitor_enter(void *obj);
 void zan_monitor_exit(void *obj);
 
@@ -28,7 +26,6 @@ void zan_dispatch_init(void);
 int32_t zan_dispatch_post(void *fn);
 void *zan_dispatch_take(void);
 
-/* 底层系统交互与数据协议契约 */
 void zan_ui_thread_set(void);
 int32_t zan_ui_thread_check(void);
 void zan_ui_thread_assert(const char *msg);
@@ -43,13 +40,10 @@ int64_t zan_atomic_int_compare_exchange(
     int64_t handle, int64_t expected, int64_t desired);
 int64_t zan_atomic_int_add(int64_t handle, int64_t delta);
 
-/* 模块核心语义抽象与接口调用契约 */
 int64_t zan_monotonic_us(void);
 
-/* 底层系统交互与数据协议契约 */
 int64_t zan_monotonic_ns(void);
 
-/* 模块核心语义抽象与接口调用契约 */
 int64_t zan_stopwatch_ticks(void);
 int64_t zan_stopwatch_frequency(void);
 int64_t zan_monotonic_ticks(void);
@@ -130,11 +124,9 @@ int32_t zan_shared_table_match_at(
 int32_t zan_shared_table_exists_at(int64_t handle, int64_t key_hash);
 int32_t zan_shared_table_delete_at(int64_t handle, int64_t key_hash);
 
-/* 底层系统交互与数据协议契约 */
 long long zan_exe_dir_into(char *out, long long cap);
 long long zan_dir_list_into(const char *pattern, char *out, long long cap);
 
-/* 模块核心语义抽象与接口调用契约 */
 int32_t zan_proc_run_safe(const char *exe, const char **args, int32_t argc);
 int32_t zan_proc_start_detached_safe(const char *exe, const char **args, int32_t argc);
 int32_t zan_proc_start_program_safe(const char *exe, const char *log_path);
@@ -142,11 +134,9 @@ int32_t zan_proc_capture_safe(const char *exe, const char **args, int32_t argc,
                               char **out_buf, int32_t *out_len, int32_t *exit_code);
 void zan_proc_free_buf(char *buf);
 
-/* 核心系统底层抽象与内存语义契约 */
 long long zan_file_time(const char *path, int which);
 long long zan_file_length(const char *path);
 long long zan_file_attributes(const char *path);
-/* 模块核心语义抽象与接口调用契约 */
 const char *zan_file_app_dir(void);
 const char *zan_file_read_path(const char *path);
 long long zan_file_set_readonly(const char *path, int on);
@@ -164,7 +154,6 @@ long long zan_file_eof(long long handle);
 long long zan_file_try_lock(const char *path);
 long long zan_file_unlock(long long handle);
 
-/* 核心系统底层抽象与内存语义契约 */
 long long zan_mmap_create(const char *name, long long size);
 long long zan_mmap_open(const char *name, long long size);
 long long zan_mmap_from_file(const char *path, long long size);

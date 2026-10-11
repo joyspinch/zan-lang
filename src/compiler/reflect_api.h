@@ -1,11 +1,9 @@
-/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_REFLECT_API_H
 #define ZAN_REFLECT_API_H
 
 #include <string.h>
 #include "binder.h"
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_M_NAME        1   /* TypeInfo.Name              -> string */
 #define ZAN_REFL_M_KIND        2   /* TypeInfo.Kind              -> string */
 #define ZAN_REFL_M_FCOUNT      3   /* TypeInfo.FieldCount        -> int */
@@ -21,7 +19,6 @@
 #define ZAN_REFL_M_OSTRING    15   /* obj.GetFieldString(name)   -> string */
 #define ZAN_REFL_M_OBOOL      16   /* obj.GetFieldBool(name)     -> bool */
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_M_MCOUNT     20   /* TypeInfo.MethodCount            -> int */
 #define ZAN_REFL_M_MNAME      21   /* TypeInfo.GetMethodName(i)       -> string */
 #define ZAN_REFL_M_MRET       22   /* TypeInfo.GetMethodReturnType(i) -> string */
@@ -34,7 +31,6 @@
 #define ZAN_REFL_M_CPTYPE     29   /* TypeInfo.GetCtorParamType(i,k)  -> string */
 #define ZAN_REFL_M_CNEW       30   /* TypeInfo.CreateInstance(...)    -> object */
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_M_ISARRAY    31   /* TypeInfo.IsArray        -> bool */
 #define ZAN_REFL_M_ISNULLABLE 32   /* TypeInfo.IsNullable     -> bool */
 #define ZAN_REFL_M_ISIFACE    33   /* TypeInfo.IsInterface    -> bool */
@@ -43,7 +39,6 @@
 #define ZAN_REFL_M_TACOUNT    36   /* TypeInfo.TypeArgCount   -> int */
 #define ZAN_REFL_M_TARG       37   /* TypeInfo.GetTypeArg(i)  -> TypeInfo */
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_M_SETINT     40   /* obj.SetFieldInt(name, v)    -> bool */
 #define ZAN_REFL_M_SETLONG    41   /* obj.SetFieldLong(name, v)   -> bool */
 #define ZAN_REFL_M_SETDOUBLE  42   /* obj.SetFieldDouble(name, v) -> bool */
@@ -61,7 +56,6 @@ static inline bool zan_refl_is_typeinfo(const zan_type_t *t) {
            memcmp(t->name.str, "TypeInfo", 8) == 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
     static const struct { const char *name; int len; int code; } tbl[] = {
         { "Name",              4,  ZAN_REFL_M_NAME },
@@ -99,7 +93,6 @@ static inline bool zan_refl_typeinfo_member(zan_istr_t n, int *out) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
     static const struct { const char *name; int len; int code; } tbl[] = {
         { "GetType",         7, ZAN_REFL_M_GETTYPE },
@@ -130,7 +123,6 @@ static inline bool zan_refl_instance_method(zan_istr_t n, int *out) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline bool zan_refl_member_takes_arg(int code) {
     switch (code) {
     case ZAN_REFL_M_FNAME:
@@ -169,7 +161,6 @@ static inline bool zan_refl_member_takes_arg(int code) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_REFL_MAX_ARGS 65
 
 static inline int zan_refl_member_max_args(int code) {
@@ -241,12 +232,10 @@ static inline zan_type_t *zan_refl_result_type(zan_binder_t *b, int code) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline bool zan_refl_is_reflectable(const zan_type_t *t) {
     static const char *builtins[] = { "List", "Dict", "StringBuilder", "Span",
                                       "Task", "Grouping" };
     if (!t) return false;
-    /* 底层系统交互与数据协议契约 */
     if (t->kind == TYPE_OBJECT) return true;
     if (t->kind != TYPE_CLASS && t->kind != TYPE_STRUCT) return false;
     if (zan_refl_is_typeinfo(t)) return false;
@@ -259,7 +248,6 @@ static inline bool zan_refl_is_reflectable(const zan_type_t *t) {
     return true;
 }
 
-/* 底层系统交互与数据协议契约 */
 static inline zan_type_t *zan_refl_member_type(zan_binder_t *b,
                                               const zan_type_t *recv,
                                               zan_istr_t n) {

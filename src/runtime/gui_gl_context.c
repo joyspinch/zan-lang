@@ -90,13 +90,12 @@ int zan_gl_api_load(zan_gl_api *api, void *(*getproc)(const char *name)) {
 #define WGL_CONTEXT_PROFILE_MASK_ARB        0x9126
 #define WGL_CONTEXT_CORE_PROFILE_BIT_ARB    0x00000001
 
-/* 内部辅助逻辑 */
 typedef struct {
     HMODULE opengl32;
     HWND    wnd;
     HDC     dc;
     HGLRC   rc;
-    int     pf;              /* 底层系统交互与数据协议契约 */
+    int     pf;
     HGLRC (WINAPI *CreateContext)(HDC);
     BOOL  (WINAPI *DeleteContext)(HGLRC);
     BOOL  (WINAPI *MakeCurrent)(HDC, HGLRC);
@@ -104,7 +103,6 @@ typedef struct {
     PROC  (WINAPI *GetProcAddress_)(LPCSTR);
 } zan_gl_ctx;
 
-/* 模块核心语义抽象与接口调用契约 */
 typedef struct {
     HWND host, child;
     HDC  dc;
@@ -116,7 +114,6 @@ static void *zan_gl_ctx_getproc(const char *name);
 static zan_gl_ctx g_glctx;
 
 static void *zan_gl_ctx_getproc(const char *name) {
-    /* 内部辅助逻辑 */
     PROC p = g_glctx.GetProcAddress_ ? g_glctx.GetProcAddress_(name) : NULL;
     if (p) return (void *)p;
     return (void *)GetProcAddress(g_glctx.opengl32, name);
@@ -136,7 +133,6 @@ static void zan_gl_ctx_destroy(void) {
     memset(&g_glctx, 0, sizeof(g_glctx));
 }
 
-/* 内部辅助逻辑 */
 static int zan_gl_ctx_create(void) {
     g_glctx.opengl32 = LoadLibraryA("opengl32.dll");
     if (!g_glctx.opengl32) return 0;
@@ -179,14 +175,12 @@ static int zan_gl_ctx_create(void) {
     if (!pf || !SetPixelFormat(g_glctx.dc, pf, &pfd)) {
         zan_gl_ctx_destroy(); return 0;
     }
-    /* 内部辅助逻辑 */
     g_glctx.pf = pf;
 
     HGLRC boot = g_glctx.CreateContext(g_glctx.dc);
     if (!boot) { zan_gl_ctx_destroy(); return 0; }
     g_glctx.MakeCurrent(g_glctx.dc, boot);
 
-    /* 核心系统底层抽象与内存语义契约 */
     HGLRC (WINAPI *create_attribs)(HDC, HGLRC, const int *) =
         (HGLRC (WINAPI *)(HDC, HGLRC, const int *))
             g_glctx.GetProcAddress_("wglCreateContextAttribsARB");
@@ -219,7 +213,6 @@ static int zan_gl_ctx_make_current(void) {
     return g_glctx.MakeCurrent(g_glctx.dc, g_glctx.rc) ? 1 : 0;
 }
 
-/* 内部辅助逻辑 */
 static LRESULT CALLBACK zan_gl_present_proc(HWND h, UINT msg, WPARAM wp,
                                            LPARAM lp) {
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
@@ -253,7 +246,6 @@ static void zan_gl_ctx_present_drop_all(void) {
         if (g_glpres[i].host) zan_gl_ctx_present_drop((void *)g_glpres[i].host);
 }
 
-/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     HWND hw = (HWND)host;
     if (!hw || !g_glctx.rc || !g_glctx.pf || !g_glctx.SwapBuffers_) return 0;
@@ -267,7 +259,6 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
         wc.lpfnWndProc = zan_gl_present_proc;
         wc.hInstance = GetModuleHandleA(NULL);
         wc.lpszClassName = "ZanGLPresent";
-        /* 内部辅助逻辑 */
         wc.style = CS_OWNDC;
         RegisterClassA(&wc);
         HWND child = CreateWindowExA(0, "ZanGLPresent", "",
@@ -296,7 +287,6 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     return 1;
 }
 
-/* 内部辅助逻辑 */
 static void zan_gl_ctx_present_end(void *host) {
     zan_gl_present_win *p = NULL;
     int n = (int)(sizeof(g_glpres) / sizeof(g_glpres[0]));
@@ -338,8 +328,8 @@ typedef struct {
     int owns_dpy;
     GLXPbuffer_t pbuf;
     GLXContext_t rc;
-    GLXFBConfig_t cfg;       /* 内部辅助逻辑 */
-    int can_present;         /* 模块核心语义抽象与接口调用契约 */
+    GLXFBConfig_t cfg;
+    int can_present;
     void *(*get_proc)(const char *);
     GLXFBConfig_t *(*choose_fbconfig)(Display *, int, const int *, int *);
     GLXPbuffer_t (*create_pbuffer)(Display *, GLXFBConfig_t, const int *);
@@ -358,16 +348,14 @@ typedef struct {
 
 static zan_gl_ctx g_glctx;
 
-/* 内部辅助逻辑 */
 typedef struct {
     Window       host, child;
     Colormap     cmap;
-    GLXPbuffer_t glxwin;   /* 底层系统交互与数据协议契约 */
+    GLXPbuffer_t glxwin;
     int          w, h;
 } zan_gl_present_win;
 static zan_gl_present_win g_glpres[8];
 
-/* 内部辅助逻辑 */
 typedef void (*zan_anyfn)(void);
 static zan_anyfn zan_gl_dlfn(void *lib, const char *name) {
     union { void *obj; zan_anyfn fn; } u;
@@ -382,7 +370,6 @@ static void *zan_gl_ctx_getproc(const char *name) {
     return p;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_anyfn zan_gl_glxfn(const char *name) {
     union { void *obj; zan_anyfn fn; } u;
     u.obj = zan_gl_ctx_getproc(name);
@@ -432,7 +419,6 @@ static int zan_gl_ctx_create(void) {
             "glXMakeContextCurrent");
     ZGL_GLX(destroy_context, void (*)(Display *, GLXContext_t),
             "glXDestroyContext");
-    /* 内部辅助逻辑 */
     ZGL_GLX(get_visual, XVisualInfo *(*)(Display *, GLXFBConfig_t),
             "glXGetVisualFromFBConfig");
     ZGL_GLX(create_glxwindow,
@@ -449,7 +435,6 @@ static int zan_gl_ctx_create(void) {
         return 0;
     }
 
-    /* 内部辅助逻辑 */
     g_glctx.dpy = g_display;
     if (!g_glctx.dpy) {
         g_glctx.dpy = XOpenDisplay(NULL);
@@ -457,7 +442,6 @@ static int zan_gl_ctx_create(void) {
     }
     if (!g_glctx.dpy) { zan_gl_ctx_destroy(); return 0; }
 
-    /* 内部辅助逻辑 */
     const int present_attribs[] = {
         GLX_RENDER_TYPE,   GLX_RGBA_BIT,
         GLX_DRAWABLE_TYPE, GLX_PBUFFER_BIT | GLX_WINDOW_BIT,
@@ -533,7 +517,6 @@ static void zan_gl_ctx_present_drop(void *host) {
     zan_gl_ctx_make_current();
 }
 
-/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     Window hw = (Window)(size_t)host;
     if (!hw || !g_glctx.rc || !g_glctx.can_present) return 0;
@@ -552,7 +535,6 @@ static int zan_gl_ctx_present_begin(void *host, int w, int h) {
         memset(&swa, 0, sizeof(swa));
         swa.colormap = cmap;
         swa.border_pixel = 0;
-        /* 内部辅助逻辑 */
         swa.event_mask = 0;
         Window child = XCreateWindow(g_glctx.dpy, hw, 0, 0,
                                      (unsigned)w, (unsigned)h, 0, vi->depth,
@@ -602,7 +584,6 @@ static void zan_gl_ctx_present_end(void *host) {
 /* macOS/CGL */
 #include <dlfcn.h>
 
-/* 内部辅助逻辑 */
 typedef void *CGLPixelFormatObj_t;
 typedef void *CGLContextObj_t;
 
@@ -625,7 +606,6 @@ typedef struct {
 } zan_gl_ctx;
 static zan_gl_ctx g_glctx;
 
-/* 内部辅助逻辑 */
 typedef void (*zan_anyfn)(void);
 static zan_anyfn zan_gl_cglfn(const char *name) {
     union { void *obj; zan_anyfn fn; } u;
@@ -671,7 +651,6 @@ static int zan_gl_ctx_create(void) {
     if (!g_glctx.ChoosePixelFormat || !g_glctx.CreateContext ||
         !g_glctx.SetCurrentContext) { zan_gl_ctx_destroy(); return 0; }
 
-    /* 底层系统交互与数据协议契约 */
     const int profiles[] = { kCGLOGLPVersion_GL4_Core, kCGLOGLPVersion_3_2_Core };
     for (int i = 0; i < 2 && !g_glctx.pf; i++) {
         const int attribs[] = {
@@ -699,7 +678,6 @@ static int zan_gl_ctx_create(void) {
     return 1;
 }
 
-/* 内部辅助逻辑 */
 static int zan_gl_ctx_present_begin(void *host, int w, int h) {
     (void)host; (void)w; (void)h; return 0;
 }
@@ -708,7 +686,6 @@ static void zan_gl_ctx_present_drop(void *host) { (void)host; }
 static void zan_gl_ctx_present_drop_all(void) { }
 
 #else
-/* 内部辅助逻辑 */
 static int zan_gl_ctx_create(void) { return 0; }
 static int zan_gl_ctx_make_current(void) { return 0; }
 static void zan_gl_ctx_destroy(void) { }

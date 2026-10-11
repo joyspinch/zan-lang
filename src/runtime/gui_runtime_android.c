@@ -4,7 +4,6 @@
 
 #include <errno.h>
 #include <jni.h>
-/* 内部辅助逻辑 */
 static JNIEnv *zan_anw_bridge_env(void);
 static jobject  zan_anw_bridge_activity(void);
 #include <pthread.h>
@@ -12,7 +11,6 @@ static jobject  zan_anw_bridge_activity(void);
 #include <string.h>
 #include <time.h>
 
-/* 底层系统交互与数据协议契约 */
 #include <android/log.h>
 #define AWV_LOG(...) \
     __android_log_print(ANDROID_LOG_INFO, "zan_awv", __VA_ARGS__)
@@ -21,9 +19,8 @@ static jobject  zan_anw_bridge_activity(void);
 #define ZAN_ANDROID_WV_MAX 128
 #endif
 #define ZAN_AWV_MSG_MAX 128     /* queued "<handler>\t<body>" entries */
-#define ZAN_AWV_EVAL_TIMEOUT 3  /* 核心系统底层抽象与内存语义契约 */
+#define ZAN_AWV_EVAL_TIMEOUT 3
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_AWV_EV_PAGE_STARTED 1
 #define ZAN_AWV_EV_PAGE_FINISHED 2
 #define ZAN_AWV_EV_TITLE 3
@@ -35,14 +32,11 @@ static jobject  zan_anw_bridge_activity(void);
 
 typedef struct {
     int used;
-    /* 底层系统交互与数据协议契约 */
     char *urlBuf, *titleBuf, *reqBuf, *evalBuf, *takeBuf, *cookieBuf, *clipBuf;
     int canBack, canFwd, loading, navSeq, status;
     int frameX, frameY, frameW, frameH;
-    /* 核心系统底层抽象与内存语义契约 */
     char *msgs[ZAN_AWV_MSG_MAX];
     int msgHead, msgCount, msgDropped;
-    /* 底层系统交互与数据协议契约 */
     unsigned evalSeq;
 } zaw_t;
 
@@ -73,7 +67,6 @@ static zaw_t *awv_slot(int h) {
     return w->used ? w : NULL;
 }
 
-/* 内部辅助逻辑 */
 static jstring awv_jstr(JNIEnv *env, const char *utf8) {
     if (!utf8) { utf8 = ""; }
     int needsBytes = 0;
@@ -118,7 +111,6 @@ static char *awv_cstr(JNIEnv *env, jstring s) {
     return out;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int awv_init(void) {
     static int done = -1;
     if (done == 0) { return 0; }
@@ -154,7 +146,6 @@ static int awv_init(void) {
     }
     jstring name = (*env)->NewStringUTF(env, "org.zan.app.ZanWeb");
     jclass bridge = (jclass)(*env)->CallObjectMethod(env, loader, load, name);
-    /* 内部辅助逻辑 */
     (*env)->DeleteLocalRef(env, loader);
     (*env)->DeleteLocalRef(env, name);
     if ((*env)->ExceptionCheck(env) || !bridge) {
@@ -233,7 +224,6 @@ fail:
     return -1;
 }
 
-/* 内部辅助逻辑 */
 static JNIEnv *awv_env(void) {
     JNIEnv *env = zan_anw_bridge_env();
     if (env) { return env; }
@@ -244,7 +234,6 @@ static JNIEnv *awv_env(void) {
     return env;
 }
 
-/* 内部辅助逻辑 */
 static int awv_begin(JNIEnv **env, jobject *act) {
     if (!g_awv_bridge) { return -1; }
     *env = awv_env();
@@ -326,7 +315,6 @@ static void awv_call_ss(jmethodID mid, i32 a, const char *s1, const char *s2) {
     (*env)->DeleteLocalRef(env, act);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 EXPORT void JNICALL
 Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
                                        jint kind, jstring s1, jstring s2,
@@ -401,11 +389,10 @@ Java_org_zan_app_ZanWeb_zanGuiWebEvent(JNIEnv *env, jclass clazz, jint id,
     free(b);
 }
 
-/* 底层系统交互与数据协议契约 */
 
 EXPORT i32 zan_gui_webview_create(i64 hwnd, const char *profileId) {
-    (void)hwnd;      /* 底层系统交互与数据协议契约 */
-    (void)profileId; /* 底层系统交互与数据协议契约 */
+    (void)hwnd;
+    (void)profileId;
     if (awv_init() != 0) { AWV_LOG("create: init failed"); return 0; }
     pthread_mutex_lock(&g_awv_lock);
     int h = 0;
@@ -559,7 +546,6 @@ EXPORT const char *zan_gui_webview_eval(i32 h, const char *js) {
     pthread_mutex_unlock(&g_awv_lock);
     if (!w) { return ""; }
     awv_call_s(g_awv_mid.eval, h, js ? js : "");
-    /* 内部辅助逻辑 */
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += ZAN_AWV_EVAL_TIMEOUT;
@@ -624,7 +610,6 @@ EXPORT void zan_gui_webview_clear_cookies(i32 h) {
     if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); }
 }
 
-/* 底层系统交互与数据协议契约 */
 
 EXPORT i32 zan_gui_webview_add_handler(i32 h, const char *name) {
     if (!awv_slot(h) || !name || !*name) { return 0; }
@@ -697,7 +682,6 @@ EXPORT void zan_gui_webview_clear_data(i32 h) {
     awv_call_i(g_awv_mid.clearData, h);
 }
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_webview_set_clip(i32 h, const char *spec) {
     zaw_t *slot = awv_slot(h);
     if (!slot) { return; }

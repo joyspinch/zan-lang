@@ -4,7 +4,6 @@
 #include <math.h>
 #include <string.h>
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 enum {
     ZAN_TG_DOWN, ZAN_TG_MOVE, ZAN_TG_UP, ZAN_TG_CANCEL,
     ZAN_TG_POINTER_DOWN, ZAN_TG_POINTER_UP
@@ -26,12 +25,10 @@ static inline void zan_tg_event(zan_tg_emit emit, void *ctx, int kind,
     emit(ctx, event);
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static inline int zan_tg_coalesce(int last[8], const int event[8]) {
     if (last[0] != event[0] || last[3] != event[3] ||
         last[5] != event[5] || last[6] != event[6] || last[7] != event[7]) return 0;
     if (event[0] != 1 && event[0] != 13) return 0;
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (event[0] == 1 && event[6] == 2) return 0;
     last[1] = event[1]; last[2] = event[2];
     if (event[0] == 13) last[4] += event[4];
@@ -76,7 +73,6 @@ static inline void zan_touch_game_feed(zan_touch_game *g, int action,
         return;
     }
     if (action == ZAN_TG_DOWN) {
-        /* 模块核心语义抽象与接口调用契约 */
         zan_tg_cancel(g, ZAN_TG_IDLE, emit, ctx);
         const zan_tg_pointer *a = zan_tg_find(p, count, changed_id);
         if (!a || count != 1) { g->phase = ZAN_TG_SUPPRESS; return; }
@@ -111,7 +107,6 @@ static inline void zan_touch_game_feed(zan_touch_game *g, int action,
             zan_tg_pair_position(g, a, b);
             zan_tg_event(emit, ctx, 1, g->x, g->y, 0, 0, 2);
         } else if (action == ZAN_TG_UP && changed_id == g->first_id) {
-            /* 模块核心语义抽象与接口调用契约 */
             zan_tg_single_move(g, a, emit, ctx);
             zan_tg_event(emit, ctx, 3,
                          g->dragging ? g->x : g->anchor_x,
@@ -120,7 +115,6 @@ static inline void zan_touch_game_feed(zan_touch_game *g, int action,
         } else if (action == ZAN_TG_MOVE && count == 1) {
             zan_tg_single_move(g, a, emit, ctx);
         } else {
-            /* 底层系统交互与数据协议契约 */
             zan_tg_cancel(g, ZAN_TG_SUPPRESS, emit, ctx);
         }
         return;
@@ -141,7 +135,6 @@ static inline void zan_touch_game_feed(zan_touch_game *g, int action,
         float previous = g->distance;
         zan_tg_pair_position(g, a, b);
         zan_tg_event(emit, ctx, 1, g->x, g->y, 0, 0, 2);
-        /* 编译器代码生成与运行时系统底层调用契约 */
         if (previous > 0 && g->distance > 0) {
             g->wheel_remainder += 120.0f * log2f(g->distance / previous);
             int delta = (int)g->wheel_remainder;
@@ -153,7 +146,6 @@ static inline void zan_touch_game_feed(zan_touch_game *g, int action,
             g->wheel_remainder = 0;
         }
     }
-    /* 编译器代码生成与运行时系统底层调用契约 */
 }
 
 #endif

@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601
@@ -6,12 +5,10 @@
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
-/* 编译器代码生成与运行时系统底层调用契约 */
 #if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
 #define _DEFAULT_SOURCE 1
 #endif
 
-/* 内部辅助逻辑 */
 #if !defined(_WIN32) && !defined(_DARWIN_C_SOURCE)
 #define _DARWIN_C_SOURCE 1
 #endif
@@ -49,7 +46,6 @@
 #define O_CLOEXEC 0
 #endif
 
-/* 核心系统底层抽象与内存语义契约 */
 #ifdef _WIN32
 static wchar_t *zan_win_utf8_to_wide(const char *text) {
     if (!text) return NULL;
@@ -105,9 +101,7 @@ int zan_file_rename(const char *source, const char *dest) {
 #endif
 }
 
-/* 内部辅助实现 */
 
-/* 核心系统底层抽象与内存语义契约 */
 long long zan_file_time(const char *path, int which) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
@@ -123,7 +117,6 @@ long long zan_file_time(const char *path, int which) {
     unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32)
                          | (unsigned long long)ft.dwLowDateTime;
     if (t == 0) return 0;
-    /* 核心系统底层抽象与内存语义契约 */
     return (long long)(t / 10000000ULL) - 11644473600LL;
 #else
     struct stat st;
@@ -134,7 +127,6 @@ long long zan_file_time(const char *path, int which) {
 #endif
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 long long zan_file_length(const char *path) {
     if (!path || !path[0]) return -1;
 #ifdef _WIN32
@@ -153,13 +145,11 @@ long long zan_file_length(const char *path) {
 #endif
 }
 
-/* 内部辅助实现 */
 
-/* 内部辅助逻辑 */
 #if defined(_WIN32)
 static volatile LONG g_appdir_resolved;
 #elif defined(__wasm__)
-static int g_appdir_resolved;   /* 核心系统底层抽象与内存语义契约 */
+static int g_appdir_resolved;
 #else
 static volatile int g_appdir_resolved;
 #endif
@@ -171,8 +161,8 @@ const char *zan_file_app_dir(void) {
         if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 0, 0) == 1)
             return dir;
         if (InterlockedCompareExchangeAcquire(&g_appdir_resolved, 2, 0) == 0)
-            break;                      /* 核心系统底层抽象与内存语义契约 */
-        SwitchToThread();               /* 核心系统底层抽象与内存语义契约 */
+            break;
+        SwitchToThread();
     }
 #elif defined(__wasm__)
     if (g_appdir_resolved) return dir;
@@ -183,8 +173,8 @@ const char *zan_file_app_dir(void) {
         int expected = 0;
         if (__atomic_compare_exchange_n(&g_appdir_resolved, &expected, 2, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            break;                      /* 核心系统底层抽象与内存语义契约 */
-        sched_yield();                  /* 核心系统底层抽象与内存语义契约 */
+            break;
+        sched_yield();
     }
 #endif
     const char *env = getenv("ZAN_APP_DIR");
@@ -195,7 +185,6 @@ const char *zan_file_app_dir(void) {
         if (n < sizeof(local)) {
             memcpy(local, env, n + 1);
         } else {
-            /* 内部辅助逻辑 */
             fprintf(stderr,
                     "zan: ZAN_APP_DIR too long (%zu bytes, limit %zu) -- "
                     "falling back to the executable directory\n",
@@ -227,7 +216,6 @@ const char *zan_file_app_dir(void) {
             }
         }
     }
-    /* 内部辅助逻辑 */
     memcpy(dir, local, strlen(local) + 1);
 #if defined(_WIN32)
     InterlockedCompareExchangeRelease(&g_appdir_resolved, 1, 2);
@@ -239,7 +227,6 @@ const char *zan_file_app_dir(void) {
     return dir;
 }
 
-/* 内部辅助逻辑 */
 static const char *zan_alt_path(const char *path, int which, char *out,
                                 size_t cap) {
     if (!path || !path[0]) return NULL;
@@ -257,13 +244,10 @@ static const char *zan_alt_path(const char *path, int which, char *out,
 
 #define ZAN_ALT_BASES 2
 
-/* 模块核心语义抽象与接口调用契约 */
 static long long zan_file_attributes_at(const char *path);
 
-/* 内部辅助实现 */
 const char *zan_file_read_path(const char *path) {
     if (zan_file_attributes_at(path) >= 0) return "";
-    /* 内部辅助逻辑 */
     static _Thread_local char alt[4096];
     for (int which = 0; which < ZAN_ALT_BASES; which++) {
         const char *p = zan_alt_path(path, which, alt, sizeof(alt));
@@ -272,7 +256,6 @@ const char *zan_file_read_path(const char *path) {
     return "";
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 void *zan_pkg_fopen(const char *path, const char *mode) {
     FILE *f = (FILE *)zan_file_fopen(path, mode);
     if (f) return f;
@@ -328,7 +311,6 @@ static long long zan_file_attributes_at(const char *path) {
 }
 
 #ifndef _WIN32
-/* 模块核心语义抽象与接口调用契约 */
 static int zan_posix_open_nofollow(const char *path) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 #if defined(O_PATH)
@@ -340,7 +322,6 @@ static int zan_posix_open_nofollow(const char *path) {
 }
 #endif
 
-/* 底层系统交互与数据协议契约 */
 long long zan_file_set_readonly(const char *path, int on) {
     if (!path || !path[0]) return 0;
 #ifdef _WIN32
@@ -355,14 +336,13 @@ long long zan_file_set_readonly(const char *path, int on) {
     return ok;
 #else
     int fd = zan_posix_open_nofollow(path);
-    if (fd < 0) return 0;   /* 核心系统底层抽象与内存语义契约 */
+    if (fd < 0) return 0;
     struct stat st;
     if (fstat(fd, &st) != 0) { close(fd); return 0; }
     mode_t m = st.st_mode;
     if (on) m &= ~(mode_t)(S_IWUSR | S_IWGRP | S_IWOTH);
     else    m |= S_IWUSR;
 #if defined(__wasi__)
-    /* 底层系统交互与数据协议契约 */
     int ok = 0;
 #else
     int ok = fchmod(fd, m) == 0 ? 1 : 0;
@@ -372,7 +352,6 @@ long long zan_file_set_readonly(const char *path, int on) {
 #endif
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     if (!path || !path[0]) return 0;
     if (which != 0 && which != 1 && which != 2) return 0;
@@ -384,7 +363,6 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     free(wide_path);
     if (h == INVALID_HANDLE_VALUE) return 0;
-    /* 核心系统底层抽象与内存语义契约 */
     unsigned long long ticks = (unsigned long long)(unix_sec + 11644473600LL)
                              * 10000000ULL;
     FILETIME ft;
@@ -397,7 +375,7 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
     CloseHandle(h);
     return ok ? 1 : 0;
 #else
-    if (which == 1) return 0;   /* 核心系统底层抽象与内存语义契约 */
+    if (which == 1) return 0;
     int fd = zan_posix_open_nofollow(path);
     if (fd < 0) return 0;
     struct stat st;
@@ -414,17 +392,15 @@ long long zan_file_set_time(const char *path, int which, long long unix_sec) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助逻辑 */
 #define ZAN_FH_CAP0 64
 #define ZAN_FH_CAP_MAX (1024 * 1024)
 typedef struct {
     FILE *fp;
-    uint32_t gen;   /* 底层系统交互与数据协议契约 */
+    uint32_t gen;
     int open;
-    int inuse;      /* 模块核心语义抽象与接口调用契约 */
-    FILE *dying;    /* 模块核心语义抽象与接口调用契约 */
+    int inuse;
+    FILE *dying;
 } zan_fh_slot;
 static zan_fh_slot *g_fh_table = NULL;
 static uint32_t g_fh_cap = 0;
@@ -432,11 +408,10 @@ static uint32_t g_fh_cap = 0;
 static void zan_fh_ensure(void) {
     if (g_fh_table) return;
     g_fh_table = (zan_fh_slot *)calloc(ZAN_FH_CAP0, sizeof(*g_fh_table));
-    if (!g_fh_table) return;  /* 底层系统交互与数据协议契约 */
+    if (!g_fh_table) return;
     g_fh_cap = ZAN_FH_CAP0;
 }
 
-/* 编译器代码生成与运行时系统底层调用契约 */
 static int zan_fh_grow(void) {
     uint32_t ncap;
     zan_fh_slot *ntab;
@@ -453,7 +428,6 @@ static int zan_fh_grow(void) {
 }
 
 #ifdef _WIN32
-/* 内部辅助逻辑 */
 static CRITICAL_SECTION g_fh_cs;
 static INIT_ONCE g_fh_once = INIT_ONCE_STATIC_INIT;
 
@@ -469,7 +443,6 @@ static void zan_fh_lock(void) {
 }
 static void zan_fh_unlock(void) { LeaveCriticalSection(&g_fh_cs); }
 #elif defined(__wasm__)
-/* 内部辅助逻辑 */
 static void zan_fh_lock(void) {}
 static void zan_fh_unlock(void) {}
 #else
@@ -478,7 +451,6 @@ static void zan_fh_lock(void) { pthread_mutex_lock(&g_fh_mx); }
 static void zan_fh_unlock(void) { pthread_mutex_unlock(&g_fh_mx); }
 #endif
 
-/* 内部辅助逻辑 */
 static long zan_fh_index(long long handle) {
     unsigned long long h = (unsigned long long)handle;
     uint32_t idx = (uint32_t)(h & 0xFFFFFFFFULL);
@@ -489,7 +461,6 @@ static long zan_fh_index(long long handle) {
     return (long)idx;
 }
 
-/* 内部辅助逻辑 */
 static FILE *zan_fh_pin(long long handle, long *idx_out) {
     zan_fh_lock();
     zan_fh_ensure();
@@ -520,7 +491,6 @@ static void zan_fh_unpin(long idx) {
     if (dying) fclose(dying);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 long long zan_file_open(const char *path, const char *mode) {
     if (!path || !path[0] || !mode || !mode[0]) return 0;
     FILE *f = (FILE *)zan_file_fopen(path, mode);
@@ -533,12 +503,10 @@ long long zan_file_open(const char *path, const char *mode) {
             uint32_t i = 0;
             while (i < g_fh_cap) {
                 zan_fh_slot *s = &g_fh_table[i];
-                /* 内部辅助实现 */
                 if (!s->open && !s->dying && s->gen != UINT32_MAX) {
-                    if (s->gen == 0) { s->gen = 1; }   /* 核心系统底层抽象与内存语义契约 */
+                    if (s->gen == 0) { s->gen = 1; }
                     s->fp = f;
                     s->open = 1;
-                    /* 内部辅助逻辑 */
                     handle = (long long)(((unsigned long long)s->gen << 32)
                                          | (unsigned long long)i);
                     break;
@@ -546,11 +514,11 @@ long long zan_file_open(const char *path, const char *mode) {
                 i = i + 1;
             }
             if (i < g_fh_cap) break;    /* claimed a slot */
-            if (!zan_fh_grow()) break;  /* 核心系统底层抽象与内存语义契约 */
+            if (!zan_fh_grow()) break;
         }
     }
     zan_fh_unlock();
-    if (handle == 0) { fclose(f); return 0; }  /* 核心系统底层抽象与内存语义契约 */
+    if (handle == 0) { fclose(f); return 0; }
     return handle;
 }
 
@@ -622,7 +590,6 @@ long long zan_file_close(long long handle) {
         zan_fh_slot *s = &g_fh_table[idx];
         s->open = 0;
         if (s->inuse > 0) {
-            /* 内部辅助逻辑 */
             s->dying = s->fp;
             s->fp = NULL;
             deferred = 1;
@@ -630,17 +597,15 @@ long long zan_file_close(long long handle) {
             f = s->fp;
             s->fp = NULL;
         }
-        /* 内部辅助实现 */
         uint32_t next_gen = (uint32_t)(s->gen + 1);
         if (next_gen != 0) s->gen = next_gen;
     }
     zan_fh_unlock();
-    if (deferred) return 1;   /* 模块核心语义抽象与接口调用契约 */
-    if (!f) return 0;         /* 核心系统底层抽象与内存语义契约 */
+    if (deferred) return 1;
+    if (!f) return 0;
     return fclose(f) == 0 ? 1 : 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_file_eof(long long handle) {
     long idx;
     FILE *f = zan_fh_pin(handle, &idx);
@@ -650,7 +615,6 @@ long long zan_file_eof(long long handle) {
     return e;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #define ZAN_LK_CAP 32
 typedef struct {
@@ -660,11 +624,10 @@ typedef struct {
     int fd;
 #endif
     int used;
-    uint32_t gen;   /* 模块核心语义抽象与接口调用契约 */
+    uint32_t gen;
 } zan_lk_slot;
 static zan_lk_slot g_lk_table[ZAN_LK_CAP];
 
-/* 核心系统底层抽象与内存语义契约 */
 static long zan_lk_index(long long handle) {
     if (handle <= 0) return -1;
     unsigned long long h = (unsigned long long)handle;
@@ -675,19 +638,17 @@ static long zan_lk_index(long long handle) {
     return (long)slot;
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_file_try_lock(const char *path) {
     if (!path || !path[0]) return 0;
 #if defined(__wasm__)
     (void)path;
-    return 0;               /* 核心系统底层抽象与内存语义契约 */
+    return 0;
 #else
-    zan_fh_lock();          /* 模块核心语义抽象与接口调用契约 */
+    zan_fh_lock();
     long slot = -1;
     for (long i = 0; i < ZAN_LK_CAP; i++) {
         if (!g_lk_table[i].used) {
             slot = i;
-            /* 底层系统交互与数据协议契约 */
             g_lk_table[slot].used = 1;
             break;
         }
@@ -712,7 +673,6 @@ long long zan_file_try_lock(const char *path) {
 #else
     g_lk_table[slot].fd = fd;
 #endif
-    /* 内部辅助实现 */
     uint32_t next_gen = (uint32_t)(g_lk_table[slot].gen + 1);
     if (next_gen == 0) {
 #ifdef _WIN32
@@ -720,12 +680,12 @@ long long zan_file_try_lock(const char *path) {
 #else
         g_lk_table[slot].fd = -1;
 #endif
-        g_lk_table[slot].used = 2;          /* 核心系统底层抽象与内存语义契约 */
+        g_lk_table[slot].used = 2;
         zan_fh_unlock();
 #ifdef _WIN32
         CloseHandle(h);
 #else
-        close(fd);              /* 底层系统交互与数据协议契约 */
+        close(fd);
 #endif
         return 0;
     }
@@ -738,13 +698,12 @@ long long zan_file_try_lock(const char *path) {
 
 fail_reserve:
     zan_fh_lock();
-    g_lk_table[slot].used = 0;   /* 核心系统底层抽象与内存语义契约 */
+    g_lk_table[slot].used = 0;
     zan_fh_unlock();
     return 0;
 #endif /* !__wasm__ */
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_file_unlock(long long handle) {
     zan_fh_lock();
     long slot = zan_lk_index(handle);
@@ -761,16 +720,15 @@ long long zan_file_unlock(long long handle) {
     s->fd = -1;
 #endif
     s->used = 0;
-    s->gen = s->gen + 1;   /* 底层系统交互与数据协议契约 */
+    s->gen = s->gen + 1;
     if (s->gen == 0) {
-        /* 内部辅助逻辑 */
         s->used = 2;
     }
     zan_fh_unlock();
 #ifdef _WIN32
     CloseHandle(h);
 #else
-    close(fd);              /* 核心系统底层抽象与内存语义契约 */
+    close(fd);
 #endif
     return 1;
 }

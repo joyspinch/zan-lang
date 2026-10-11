@@ -39,7 +39,7 @@ static int g_top_size_count = 0;
 #endif
 
 void *zan_arena_alloc(zan_arena_t *arena, size_t size) {
-    if (size > SIZE_MAX - 7) return NULL;   /* 核心系统底层抽象与内存语义契约 */
+    if (size > SIZE_MAX - 7) return NULL;
     size = (size + 7) & ~(size_t)7;
 
 #ifdef ZAN_ARENA_STATS

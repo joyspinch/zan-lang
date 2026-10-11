@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #include "crosscomp.h"
 #include <llvm-c/Core.h>
@@ -83,7 +82,6 @@ bool zan_target_parse(const char *triple_str, zan_target_t *out) {
     if (out->arch == ZAN_ARCH_X86_64) {
         snprintf(out->features, sizeof(out->features), "%s", "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi");
     } else if (out->arch == ZAN_ARCH_AARCH64) {
-        /* 底层系统交互与数据协议契约 */
         snprintf(out->features, sizeof(out->features), "%s", "+aes");
     } else {
         out->features[0] = 0;

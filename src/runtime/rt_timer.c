@@ -1,9 +1,7 @@
-/* 内部辅助实现 */
 #if !defined(_WIN32) && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-/* 内部辅助实现 */
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0601
 #endif
@@ -18,7 +16,6 @@
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
 
-/* 核心系统底层抽象与内存语义契约 */
 #if !defined(__wasm__) && !defined(ZAN_BARE_METAL)
 #include "rt_crash.h"
 #endif
@@ -40,7 +37,6 @@ static void timer_lock(void) {
 }
 static void timer_unlock(void) { LeaveCriticalSection(&g_lock); }
 #elif defined(__wasm__)
-/* 内部辅助逻辑 */
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -49,7 +45,6 @@ int clock_gettime(clockid_t, struct timespec *);
 static void timer_lock(void) {}
 static void timer_unlock(void) {}
 #elif defined(ZAN_BARE_METAL)
-/* 内部辅助实现 */
 #include <time.h>
 static void timer_lock(void) {}
 static void timer_unlock(void) {}
@@ -64,7 +59,6 @@ static void timer_lock(void) { pthread_mutex_lock(&g_lock); }
 static void timer_unlock(void) { pthread_mutex_unlock(&g_lock); }
 #endif
 
-/* 内部辅助实现 */
 #if defined(_WIN32)
 static unsigned long timer_self_tid(void) { return GetCurrentThreadId(); }
 static void timer_yield(void) { Sleep(1); }
@@ -78,7 +72,6 @@ static unsigned long timer_self_tid(void) {
 }
 static void timer_yield(void) { sched_yield(); }
 #endif
-/* 内部辅助实现 */
 int zan_utf8_argv(int *argc, char ***argv) {
 #if defined(_WIN32)
     if (!argc || !argv) return 0;
@@ -130,17 +123,14 @@ int zan_utf8_argv(int *argc, char ***argv) {
 #endif
 }
 
-/* 内部辅助实现 */
 
 #define ZAN_SOFT_MAX_SITES 1024
 
 static char *g_soft_seen[ZAN_SOFT_MAX_SITES];
 static int g_soft_seen_count;
-/* 内部辅助实现 */
 static int g_soft_strict;
 
 static int zan_soft_is_hard(void) {
-    /* 内部辅助实现 */
     timer_lock();
     static int hard = -1;
     if (hard < 0) {
@@ -155,15 +145,12 @@ static int zan_soft_is_hard(void) {
 
 int zan_rt_soft_is_hard(void) { return zan_soft_is_hard(); }
 
-/* 内部辅助实现 */
 void zan_rt_set_strict(void) { g_soft_strict = 1; }
 
-/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_SOFT_SCRATCH_RC  (UINT64_C(1) << 62)
 #define ZAN_SOFT_SCRATCH_PAYLOAD 4096
 static union {
     unsigned char bytes[40 + ZAN_SOFT_SCRATCH_PAYLOAD];
-    /* 模块核心语义抽象与接口调用契约 */
     long double align_it;
 } g_soft_scratch_store;
 static unsigned char *g_soft_scratch;
@@ -173,13 +160,12 @@ static void store_u64_le(unsigned char *p, uint64_t v) {
 }
 
 unsigned char *zan_rt_soft_scratch(void) {
-    /* 内部辅助实现 */
     timer_lock();
     if (!g_soft_scratch) {
         unsigned char *hdr = g_soft_scratch_store.bytes;
         memset(hdr, 0, sizeof(g_soft_scratch_store.bytes));
         store_u64_le(hdr + 0,  ZAN_SOFT_SCRATCH_RC);    /* P-32: array rc */
-        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);     /* 核心系统底层抽象与内存语义契约 */
+        store_u64_le(hdr + 8,  ZAN_ARRAY_RC_MAGIC);
         store_u64_le(hdr + 16, ZAN_SOFT_SCRATCH_RC);    /* P-16: object rc */
         store_u64_le(hdr + 24, ZAN_ARRAY_MAGIC);        /* P-8:  discriminator */
         g_soft_scratch = hdr + 32;
@@ -189,7 +175,6 @@ unsigned char *zan_rt_soft_scratch(void) {
     return scratch;
 }
 
-/* 内部辅助逻辑 */
 static int zan_soft_seen(const char *text) {
     for (int i = 0; i < g_soft_seen_count; i++)
         if (g_soft_seen[i] == text) return 1;
@@ -198,7 +183,6 @@ static int zan_soft_seen(const char *text) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
 static struct {
     const char *file;
     unsigned line;
@@ -273,7 +257,6 @@ static void zan_soft_append(const char *text) {
     if (!f) return;
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
-    /* 内部辅助实现 */
     if (size == 0) {
 #if defined(_WIN32)
         char exe[MAX_PATH];
@@ -315,7 +298,6 @@ void zan_rt_soft_note(const char *text) {
     zan_soft_append(text);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 void zan_rt_soft_note2(const char *prefix, const char *msg) {
     if (!prefix) return;
     char buf[1400];
@@ -340,7 +322,6 @@ void zan_rt_soft_note2(const char *prefix, const char *msg) {
     zan_soft_append(buf);
 }
 
-/* 内部辅助逻辑 */
 void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
                        const char *msg) {
     char buf[1400];
@@ -348,7 +329,6 @@ void zan_rt_soft_note3(const char *file, unsigned line, unsigned col,
                      file ? file : "<unknown>", line, col,
                      msg ? msg : "");
     if (n <= 0) return;
-    /* 底层系统交互与数据协议契约 */
     if ((size_t)n >= sizeof buf - 1) n = (int)sizeof buf - 2;
     buf[n] = '\n';
     buf[n + 1] = '\0';
@@ -377,11 +357,9 @@ void zan_rt_guard_fail2(const char *prefix, const char *msg) {
         fprintf(stderr, "%s", buf);
         fflush(stderr);
 #if defined(_WIN32)
-        /* 模块核心语义抽象与接口调用契约 */
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
         unsigned long code = 0xE0A2C010u; 
-/* 底层系统交互与数据协议契约 */
         ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
         raise(code, 0, 2, args);
 #endif
@@ -394,7 +372,6 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
                         const char *msg) {
     if (zan_soft_is_hard()) {
 #if defined(_WIN32)
-        /* 内部辅助实现 */
         char buf[1400];
         snprintf(buf, sizeof buf, "%s:%u:%u: runtime error: %s",
                  file ? file : "<unknown>", line, col, msg ? msg : "");
@@ -408,7 +385,6 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
         void (WINAPI *raise)(DWORD, DWORD, DWORD, const ULONG_PTR *) =
             RaiseException;
         unsigned long code = 0xE0A2C010u; 
-/* 底层系统交互与数据协议契约 */
         ULONG_PTR args[2] = { (ULONG_PTR)buf, 70 };
         raise(code, 0, 2, args);
 #endif
@@ -417,20 +393,17 @@ void zan_rt_guard_fail3(const char *file, unsigned line, unsigned col,
     zan_rt_soft_note3(file, line, col, msg);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static zan_fatal_fn g_fatal_handler;
 
 void zan_rt_set_fatal_handler(zan_fatal_fn fn) { g_fatal_handler = fn; }
 
 void zan_rt_fatal(const char *category, const char *message) {
-    /* 内部辅助逻辑 */
     fprintf(stderr, "zan runtime: fatal (%s): %s\n",
             category ? category : "runtime", message ? message : "");
     fflush(stderr);
     zan_fatal_fn fn = g_fatal_handler;
     if (fn) fn(category, message);
-    /* 内部辅助实现 */
     abort();
 }
 typedef enum zan_timer_kind {
@@ -438,7 +411,6 @@ typedef enum zan_timer_kind {
     ZAN_TIMER_PUBLIC = 1
 } zan_timer_kind;
 typedef struct zan_timer_entry {
-    /* 内部辅助逻辑 */
     long long due_us;
     long long id;
     long long interval;
@@ -448,7 +420,6 @@ typedef struct zan_timer_entry {
     unsigned long long sequence;
     zan_timer_kind kind;
     int removed;
-    /* 内部辅助逻辑 */
     int waking;
     zan_timer_callback_t callback;
     void *frame;
@@ -463,14 +434,10 @@ static long long g_round;
 static unsigned long long g_sequence;
 static int g_initialized;
 static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
-/* 内部辅助逻辑 */
 static zan_timer_entry *g_dispatching;
-/* 内部辅助逻辑 */
 static unsigned long g_dispatch_tid;
-/* 底层系统交互与数据协议契约 */
 static volatile long long g_live;
 
-/* 内部辅助实现 */
 #if defined(ZAN_BARE_METAL)
 __attribute__((weak))
 #endif
@@ -482,11 +449,10 @@ long long zan_timer_now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 #else
-    return 0;                  /* 核心系统底层抽象与内存语义契约 */
+    return 0;
 #endif
 }
 
-/* 内部辅助实现 */
 long long zan_co_quantum_ms(void) {
     static long long q = -1;
     if (q >= 0) return q;
@@ -498,7 +464,6 @@ long long zan_co_quantum_ms(void) {
     return q;
 }
 
-/* 内部辅助逻辑 */
 long long zan_co_precise_us(void) {
 #if defined(_WIN32)
     static long long freq;
@@ -516,7 +481,7 @@ long long zan_co_precise_us(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 #else
-    return zan_timer_now_ms() * 1000;   /* 核心系统底层抽象与内存语义契约 */
+    return zan_timer_now_ms() * 1000;
 #endif
 }
 
@@ -531,7 +496,6 @@ static void heap_swap(size_t a, size_t b) {
     g_heap[b] = entry;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int heap_push(zan_timer_entry *entry) {
     if (g_heap_len == g_heap_cap) {
         size_t cap = g_heap_cap ? g_heap_cap * 2 : 64;
@@ -594,14 +558,12 @@ void zan_timer_runtime_reset(void) {
     timer_unlock();
 }
 
-/* 底层系统交互与数据协议契约 */
 long long zan_timer_saturating_due(long long now_ms, long long delay_ms) {
     if (delay_ms < 0) return now_ms;
     if (delay_ms > LLONG_MAX - now_ms) return LLONG_MAX;
     return now_ms + delay_ms;
 }
 
-/* 内部辅助实现 */
 long long zan_timer_saturating_due_us(long long now_us, long long delay_us) {
     if (delay_us < 0) return now_us;
     if (delay_us > LLONG_MAX - now_us) return LLONG_MAX;
@@ -618,7 +580,6 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     if (!step) return;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
     if (!entry) return;   
-/* 内部辅助逻辑 */
     entry->due_us = zan_timer_saturating_due_us(zan_co_precise_us(),
                                                                delay_ms_to_us(ms));
     entry->kind = ZAN_TIMER_DELAY;
@@ -626,18 +587,16 @@ void zan_timer_delay(long long ms, void *frame, zan_timer_step_t step) {
     entry->step = step;
     timer_lock();
     g_initialized = 1;
-    entry->sequence = ++g_sequence;   /* 底层系统交互与数据协议契约 */
+    entry->sequence = ++g_sequence;
     if (heap_push(entry) != 0) {
-        /* 模块核心语义抽象与接口调用契约 */
         timer_unlock();
-        free(entry);   /* 底层系统交互与数据协议契约 */
+        free(entry);
         step(frame);
         return;
     }
     timer_unlock();
 }
 
-/* 底层系统交互与数据协议契约 */
 int zan_timer_cancel_delay(void *frame) {
     int found = 0;
     if (!frame) return 0;
@@ -656,7 +615,6 @@ int zan_timer_cancel_delay(void *frame) {
         g_dispatching->removed = 1;
         found++;
     }
-    /* 内部辅助实现 */
     while (g_dispatching && g_dispatching->kind == ZAN_TIMER_DELAY &&
            g_dispatching->waking && g_dispatching->frame == frame &&
            g_dispatch_tid != timer_self_tid()) {
@@ -664,7 +622,6 @@ int zan_timer_cancel_delay(void *frame) {
         timer_yield();
         timer_lock();
     }
-    /* 内部辅助逻辑 */
     size_t old_len = g_heap_len;
     size_t w = 0;
     for (size_t i = 0; i < g_heap_len; i++) {
@@ -675,7 +632,6 @@ int zan_timer_cancel_delay(void *frame) {
         }
     }
     g_heap_len = w;
-    /* 内部辅助实现 */
     if (w != old_len && g_heap_len > 1) {
         for (size_t i = g_heap_len / 2; i-- > 0;) {
             size_t index = i;
@@ -699,8 +655,7 @@ int zan_timer_cancel_delay(void *frame) {
 static long long timer_add(long long ms, zan_timer_callback_t callback, int repeat) {
     if (ms < 1 || !callback) return 0;
     zan_timer_entry *entry = (zan_timer_entry *)calloc(1, sizeof(*entry));
-    if (!entry) return 0;   /* 核心系统底层抽象与内存语义契约 */
-    /* 内部辅助实现 */
+    if (!entry) return 0;
     entry->callback = callback;
     timer_lock();
     g_initialized = 1;
@@ -733,7 +688,6 @@ long long zan_timer_next_timeout(void) {
     timer_lock();
     while (g_heap_len > 0 && g_heap[0]->removed) free(heap_pop());
     if (g_heap_len > 0) {
-        /* 内部辅助逻辑 */
         long long rem_us = g_heap[0]->due_us - zan_co_precise_us();
         timeout = (rem_us <= 0) ? 0 : (rem_us + 999) / 1000;
     }
@@ -756,20 +710,17 @@ long long zan_timer_dispatch_due(void) {
             entry->exec_count++;
             entry->round = ++g_round;
         }
-        /* 内部辅助实现 */
         zan_timer_entry *prev = g_dispatching;
         g_dispatching = entry;
         timer_unlock();
 
         long long started_us = zan_co_precise_us();
         if (entry->kind == ZAN_TIMER_DELAY) {
-            /* 内部辅助实现 */
             void (*ready)(void *, zan_timer_step_t);
             timer_lock();
             ready = g_ready_hook;
             int cancelled = entry->removed;
             if (!cancelled) {
-                /* 内部辅助实现 */
                 entry->waking = 1;
                 g_dispatch_tid = timer_self_tid();
             }
@@ -783,7 +734,6 @@ long long zan_timer_dispatch_due(void) {
         dispatched++;
 
         timer_lock();
-        /* 内部辅助实现 */
         entry->waking = 0;
         g_dispatching = prev;
         if (entry->kind == ZAN_TIMER_PUBLIC) entry->exec_msec = elapsed / 1000;
@@ -792,7 +742,6 @@ long long zan_timer_dispatch_due(void) {
             long long interval_us = delay_ms_to_us(entry->interval);
             entry->due_us = zan_timer_saturating_due_us(entry->due_us, interval_us);
             if (entry->due_us < cur_now) {
-                /* 内部辅助实现 */
                 if (cur_now - entry->due_us > interval_us) {
                     long long lag = cur_now - entry->due_us;
                     long long skips = lag / interval_us;
@@ -804,7 +753,6 @@ long long zan_timer_dispatch_due(void) {
             }
             entry->sequence = ++g_sequence;
             if (heap_push(entry) != 0) {
-                /* 内部辅助逻辑 */
                 timer_unlock();
                 free(entry);
                 continue;
@@ -818,7 +766,6 @@ long long zan_timer_dispatch_due(void) {
 }
 
 long long zan_timer_pending(void) {
-    /* 内部辅助实现 */
     return __atomic_load_n(&g_live, __ATOMIC_RELAXED);
 }
 
@@ -834,7 +781,6 @@ int zan_timer_clear(long long id) {
             break;
         }
     }
-    /* 内部辅助实现 */
     if (!found && g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
         g_dispatching->id == id && !g_dispatching->removed) {
         g_dispatching->removed = 1;
@@ -855,7 +801,6 @@ long long zan_timer_clear_all(void) {
             count++;
         }
     }
-    /* 内部辅助实现 */
     if (g_dispatching && g_dispatching->kind == ZAN_TIMER_PUBLIC &&
         !g_dispatching->removed) {
         g_dispatching->removed = 1;
@@ -908,7 +853,6 @@ long long zan_timer_list_at(long long index) {
 }
 
 void zan_timer_stats(long long *initialized, long long *num, long long *round) {
-    /* 内部辅助实现 */
     timer_lock();
     if (initialized) *initialized = g_initialized;
     if (num) {
@@ -921,14 +865,12 @@ void zan_timer_stats(long long *initialized, long long *num, long long *round) {
     timer_unlock();
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_LIVE_DEAD ((void *)(uintptr_t)1)
 
 static void  **g_colive_slots;
-static size_t   g_colive_cap;    /* 核心系统底层抽象与内存语义契约 */
-static size_t   g_colive_live;   /* 核心系统底层抽象与内存语义契约 */
+static size_t   g_colive_cap;
+static size_t   g_colive_live;
 static size_t   g_colive_dead;   /* tombstones */
 
 static volatile int g_colive_lock;
@@ -944,7 +886,6 @@ static void zan_lock_backoff(int spins) {
 #if defined(_WIN32)
     SwitchToThread();
 #elif defined(__wasm__) || defined(ZAN_BARE_METAL)
-    /* 模块核心语义抽象与接口调用契约 */
 #else
     sched_yield();
 #endif
@@ -959,7 +900,6 @@ static void live_lock(void) {
 
 static void live_unlock(void) { __sync_lock_release(&g_colive_lock); }
 
-/* 内部辅助实现 */
 static size_t live_hash(void *p) {
     uint64_t x = (uint64_t)(uintptr_t)p;
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
@@ -968,7 +908,6 @@ static size_t live_hash(void *p) {
     return (size_t)x;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void live_rehash(size_t ncap) {
     void **old = g_colive_slots;
     size_t ocap = g_colive_cap;
@@ -992,7 +931,6 @@ static void live_rehash(size_t ncap) {
 void zan_co_live_add(void *frame) {
     if (!frame) return;
     live_lock();
-    /* 内部辅助实现 */
     if ((g_colive_live + g_colive_dead + 1) * 4 > g_colive_cap * 3)
         live_rehash(g_colive_cap ? (g_colive_live * 4 > g_colive_cap ? g_colive_cap * 2 : g_colive_cap) : 64);
     size_t mask = g_colive_cap - 1;
@@ -1016,7 +954,6 @@ static void join_on_untrack(void *frame, void **out_joiner,
 
 void zan_co_live_del(void *frame) {
     if (!frame || !g_colive_cap) return;
-    /* 内部辅助实现 */
     void *fire_joiner = NULL;
     zan_timer_step_t fire_step = NULL;
     live_lock();
@@ -1047,7 +984,6 @@ int zan_co_live_count(void) {
     return n;
 }
 
-/* 内部辅助逻辑 */
 static int live_has_nolock(void *frame) {
     size_t mask = g_colive_cap - 1;
     size_t i = live_hash(frame) & mask;
@@ -1077,8 +1013,7 @@ void zan_co_live_reset(void) {
 
 /* 任务协同汇聚与事件驱动 Join 原语 */
 
-#define JOIN_OFF_DONE (12 + (int)sizeof(void *)) /* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
+#define JOIN_OFF_DONE (12 + (int)sizeof(void *))
 typedef struct zan_co_header_probe {
     long long sched;                /* ASYNC_FRAME_SCHED (i64) */
     void (*sched_step)(void *);     /* ASYNC_FRAME_SCHED_STEP (ptr) */
@@ -1095,24 +1030,23 @@ typedef struct zan_join_pair {
     void            *frame;
     struct zan_join *owner;
     int              idx;
-    int              done;    /* 核心系统底层抽象与内存语义契约 */
+    int              done;
 } zan_join_pair_t;
 
 typedef struct zan_join {
-    int              any;     /* 核心系统底层抽象与内存语义契约 */
-    int              fired;   /* 核心系统底层抽象与内存语义契约 */
-    void            *joiner;  /* 核心系统底层抽象与内存语义契约 */
+    int              any;
+    int              fired;
+    void            *joiner;
     zan_timer_step_t joiner_step;
-    int              npairs;  /* 底层系统交互与数据协议契约 */
-    int              winner;  /* 底层系统交互与数据协议契约 */
-    /* 底层系统交互与数据协议契约 */
+    int              npairs;
+    int              winner;
     int              remaining;
-    int              capacity; /* 核心系统底层抽象与内存语义契约 */
-    zan_join_pair_t  pairs[]; /* 核心系统底层抽象与内存语义契约 */
+    int              capacity;
+    zan_join_pair_t  pairs[];
 } zan_join_t;
 
 static zan_join_pair_t **g_joinmap_slots;
-static size_t   g_joinmap_cap;   /* 核心系统底层抽象与内存语义契约 */
+static size_t   g_joinmap_cap;
 static size_t   g_joinmap_live;
 static size_t   g_joinmap_dead;
 #define JOINMAP_TOMB ((zan_join_pair_t *)(uintptr_t)1)
@@ -1135,7 +1069,6 @@ static void joinmap_rehash(size_t ncap) {
 }
 
 static void joinmap_put(zan_join_pair_t *pr) {
-    /* 内部辅助实现 */
     if ((g_joinmap_live + g_joinmap_dead + 1) * 4 >= g_joinmap_cap * 3)
         joinmap_rehash(g_joinmap_cap
                            ? (g_joinmap_live * 4 > g_joinmap_cap ? g_joinmap_cap * 2
@@ -1151,7 +1084,7 @@ static void joinmap_put(zan_join_pair_t *pr) {
             g_joinmap_live++;
             return;
         }
-        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) return; /* 核心系统底层抽象与内存语义契约 */
+        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) return;
         i = (i + 1) & mask;
     }
 }
@@ -1168,7 +1101,6 @@ static zan_join_pair_t *joinmap_get(void *frame) {
     }
 }
 
-/* 内部辅助实现 */
 static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
     if (!g_joinmap_cap) return;
     size_t mask = g_joinmap_cap - 1;
@@ -1177,7 +1109,7 @@ static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
         zan_join_pair_t *cur = g_joinmap_slots[i];
         if (!cur) return;
         if (cur == pr) {
-            if (cur->frame != frame) return; /* 核心系统底层抽象与内存语义契约 */
+            if (cur->frame != frame) return;
             g_joinmap_slots[i] = JOINMAP_TOMB;
             g_joinmap_live--;
             g_joinmap_dead++;
@@ -1190,7 +1122,6 @@ static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
 static int join_pair_done(const zan_join_pair_t *pr) {
     if (pr->done) return 1;
     if (!live_has_nolock(pr->frame)) return 1;   /* untracked: completed */
-    /* 模块核心语义抽象与接口调用契约 */
     int32_t done = __atomic_load_n(
         (const volatile int32_t *)((const unsigned char *)pr->frame + JOIN_OFF_DONE),
         __ATOMIC_ACQUIRE);
@@ -1198,7 +1129,6 @@ static int join_pair_done(const zan_join_pair_t *pr) {
 }
 
 static int join_any_done(zan_join_t *j) {
-    /* 内部辅助实现 */
     if (j->npairs == 0) return 1;
     for (int i = 0; i < j->npairs; i++)
         if (join_pair_done(&j->pairs[i])) { j->winner = j->pairs[i].idx; return 1; }
@@ -1208,7 +1138,6 @@ static int join_any_done(zan_join_t *j) {
 static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t *out_step) {
     *out_joiner = NULL;
     if (j->fired) return;
-    /* 内部辅助实现 */
     int trig = j->any ? join_any_done(j) : (j->remaining == 0);
     if (!trig) return;
     j->fired = 1;
@@ -1216,7 +1145,6 @@ static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t 
     *out_step = j->joiner_step;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *out_step) {
     *out_joiner = NULL;
     zan_join_pair_t *pr = joinmap_get(frame);
@@ -1227,7 +1155,6 @@ static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *ou
     join_fire_locked(pr->owner, out_joiner, out_step);
 }
 
-/* 内部辅助逻辑 */
 static int zan_sched_trace(void) {
     static volatile int t = -1;
     int cur = __atomic_load_n(&t, __ATOMIC_RELAXED);
@@ -1274,14 +1201,12 @@ long long zan_join_new(int npairs, int any) {
     return (long long)(intptr_t)j;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 int zan_join_bind(long long entry, void *frame, int idx) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
     if (!j || !frame) return 0;
     int bound = 0;
     live_lock();
     if (live_has_nolock(frame) && !joinmap_get(frame)) {
-        /* 内部辅助实现 */
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
@@ -1302,7 +1227,6 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     return bound;
 }
 
-/* 底层系统交互与数据协议契约 */
 int zan_join_wait2(long long entry, void *frame, zan_timer_step_t step) {
     zan_join_t *j = (zan_join_t *)(intptr_t)entry;
     if (!j || !g_ready_hook || !frame || !step) return 2;
@@ -1324,9 +1248,8 @@ void zan_join_cancel(long long entry) {
     free(j);
 }
 
-/* 内部辅助逻辑 */
-static volatile int g_cfg_workers   = 0;    /* 核心系统底层抽象与内存语义契约 */
-static volatile int g_cfg_io_shards = 0;    /* 核心系统底层抽象与内存语义契约 */
+static volatile int g_cfg_workers   = 0;
+static volatile int g_cfg_io_shards = 0;
 static volatile int g_cfg_sync_fast = -1;   /* -1 = unset */
 
 void zan_async_set_workers(int32_t n)    { __atomic_store_n(&g_cfg_workers, (n > 0) ? (int)n : 0, __ATOMIC_RELEASE); }
@@ -1337,7 +1260,6 @@ int32_t zan_async_cfg_workers(void)   { return (int32_t)__atomic_load_n(&g_cfg_w
 int32_t zan_async_cfg_io_shards(void) { return (int32_t)__atomic_load_n(&g_cfg_io_shards, __ATOMIC_ACQUIRE); }
 int32_t zan_async_cfg_sync_fast(void) { return (int32_t)__atomic_load_n(&g_cfg_sync_fast, __ATOMIC_ACQUIRE); }
 
-/* 内部辅助实现 */
 void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     if (v != v) { snprintf(buf, (size_t)cap, "NaN"); return; }
     if (v == 0.0) { snprintf(buf, (size_t)cap, "0"); return; }
@@ -1347,7 +1269,6 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
         snprintf(buf, (size_t)cap, "%sInfinity", sign);
         return;
     }
-    /* 底层系统交互与数据协议契约 */
     char m[40];
     int p;
     for (p = 1; p < 17; p++) {
@@ -1370,14 +1291,12 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     char out[48];
     if (e10 >= -4 && e10 <= 14) {
         if (e10 >= n) {
-            /* 底层系统交互与数据协议契约 */
             char zeros[24];
             int z = e10 - (n - 1);
             memset(zeros, '0', (size_t)z);
             zeros[z] = 0;
             snprintf(out, sizeof out, "%s%s%s", sign, sig, zeros);
     } else if (e10 >= 0) {
-        /* 底层系统交互与数据协议契约 */
         int h = e10 + 1;
         if (sig[h])
             snprintf(out, sizeof out, "%s%.*s.%s", sign, h, sig, sig + h);
@@ -1402,7 +1321,6 @@ void zan_rt_dbl_str(char *buf, unsigned long long cap, double v) {
     snprintf(buf, (size_t)cap, "%s", out);
 }
 
-/* 内部辅助实现 */
 double zan_rt_dbl_parse(const char *s, char **endp) {
     if (endp) *endp = (char *)s;
     if (strcmp(s, "NaN") == 0) {
@@ -1420,6 +1338,5 @@ double zan_rt_dbl_parse(const char *s, char **endp) {
     return strtod(s, endp);
 }
 
-/* 底层系统交互与数据协议契约 */
 #include "rt_hw_accel.c"
 

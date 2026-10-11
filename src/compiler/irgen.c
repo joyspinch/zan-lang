@@ -1,4 +1,3 @@
-/* 内部辅助实现 */
 
 #include "irgen.h"
 #include "irgen_compact.h"
@@ -11,8 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* 内部辅助实现 */
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef zan_iwiden(LLVMBuilderRef b, LLVMValueRef v, LLVMTypeRef to) {
     LLVMTypeRef vt = LLVMTypeOf(v);
     if (LLVMGetTypeKind(vt) != LLVMIntegerTypeKind) return v;
@@ -26,7 +23,6 @@ static void zan_ipair(LLVMBuilderRef b, LLVMValueRef *l, LLVMValueRef *r) {
         LLVMGetTypeKind(tr) != LLVMIntegerTypeKind) return;
     unsigned wl = LLVMGetIntTypeWidth(tl), wr = LLVMGetIntTypeWidth(tr);
     if (wl == wr) {
-        /* 内部辅助逻辑 */
         if (wl == 8) {
             LLVMTypeRef i64 = LLVMInt64TypeInContext(LLVMGetTypeContext(tl));
             *l = LLVMBuildZExt(b, *l, i64, "zx");
@@ -96,14 +92,12 @@ static LLVMValueRef zan_tobool(LLVMBuilderRef b, LLVMValueRef v, const char *n) 
 #define zan_getcwd getcwd
 #endif
 
-/* 底层系统交互与数据协议契约 */
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id);
 
 static void di_ensure(zan_irgen_t *g) {
     if (!g->emit_debug || g->di_builder) return;
     g->di_builder = LLVMCreateDIBuilder(g->mod);
 
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMContextRef c = g->ctx;
     LLVMTypeRef i32 = LLVMInt32TypeInContext(c);
     LLVMAddModuleFlag(g->mod, LLVMModuleFlagBehaviorWarning,
@@ -126,7 +120,6 @@ static void di_ensure(zan_irgen_t *g) {
 
 static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     if (!g->emit_debug) return NULL;
-    /* 底层系统交互与数据协议契约 */
     if (!zan_tab_reserve((void **)&g->di_files, &g->di_file_cap,
                          sizeof(*g->di_files), (int)file_id, 64))
         return NULL;
@@ -138,10 +131,8 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
         path = g->diag->file_names[file_id];
     if (!path || !path[0]) path = g->src_file ? g->src_file : "<unknown>.zan";
 
-    /* 内部辅助逻辑 */
     char dir[1024];
     if (path[0] == '/' || (path[0] && path[1] == ':')) {
-        /* 底层系统交互与数据协议契约 */
         const char *slash = strrchr(path, '/');
         const char *bslash = strrchr(path, '\\');
         const char *cut = slash > bslash ? slash : bslash;
@@ -164,7 +155,6 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
     return f;
 }
 
-/* 内部辅助逻辑 */
 static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
     const char *p = NULL;
     if (g->diag && g->diag->file_names &&
@@ -173,7 +163,6 @@ static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
         if (q && q[0]) p = q;
     }
     if (!p) p = g->src_file ? g->src_file : "<unknown>";
-    /* 模块核心语义抽象与接口调用契约 */
     const char *slash = NULL, *prev = NULL;
     for (const char *c = p; *c; c++) {
         if (*c == '/' || *c == '\\') {
@@ -185,7 +174,6 @@ static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
     return p;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_STR_INTERN_BUCKETS 1024
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     if (!g->str_intern) {
@@ -208,7 +196,6 @@ LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     return e->gv;
 }
 
-/* 内部辅助实现 */
 static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned line) {
     if (!g->emit_debug || !g->builder) return NULL;
     LLVMBasicBlockRef bb = LLVMGetInsertBlock(g->builder);
@@ -233,7 +220,6 @@ static LLVMMetadataRef di_ensure_sp(zan_irgen_t *g, uint32_t file_id, unsigned l
     return sp;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void di_clear(zan_irgen_t *g) {
     if (!g->emit_debug || !g->builder) return;
     LLVMSetCurrentDebugLocation2(g->builder, NULL);
@@ -241,7 +227,6 @@ static void di_clear(zan_irgen_t *g) {
     g->di_cur_file = 0;
 }
 
-/* 内部辅助逻辑 */
 static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     if (!g->emit_debug || !g->builder) return;
     LLVMMetadataRef sp = di_ensure_sp(g, loc.file_id, loc.line);
@@ -254,7 +239,6 @@ static void di_set_loc(zan_irgen_t *g, zan_loc_t loc) {
     LLVMSetCurrentDebugLocation2(g->builder, dl);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
     LLVMTypeKind k = LLVMGetTypeKind(ty);
     switch (k) {
@@ -292,9 +276,7 @@ static LLVMMetadataRef di_type_from_llvm(zan_irgen_t *g, LLVMTypeRef ty) {
 static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage,
                            zan_type_t *zt);
 
-/* 内部辅助实现 */
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_DI_TAG_STRUCTURE 0x13u /* DW_TAG_structure_type */
 #define ZAN_DI_ATE_BOOLEAN   0x02u
 #define ZAN_DI_ATE_FLOAT     0x04u
@@ -303,23 +285,20 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 #define ZAN_DI_ATE_UCHAR     0x08u
 #define ZAN_DI_ATE_UTF       0x10u
 
-/* 底层系统交互与数据协议契约 */
 static bool class_has_virtual_methods(zan_symbol_t *sym);
 static bool field_member_is_static(zan_symbol_t *m);
 static unsigned long abi_size_of(LLVMTypeRef t);
 static unsigned long abi_align_of(LLVMTypeRef t);
 
 typedef struct {
-    zan_type_t *type;        /* 核心系统底层抽象与内存语义契约 */
-    LLVMMetadataRef placeholder; /* 核心系统底层抽象与内存语义契约 */
-    LLVMMetadataRef composite;   /* 核心系统底层抽象与内存语义契约 */
+    zan_type_t *type;
+    LLVMMetadataRef placeholder;
+    LLVMMetadataRef composite;
     int building;
 } zan_di_type_rec_t;
-/* 内部辅助实现 */
 static zan_di_type_rec_t **g_di_types = NULL;
 static int g_di_type_count = 0, g_di_type_cap = 0;
 
-/* 内部辅助实现 */
 static void di_debug_types_reset(void) {
     for (int i = 0; i < g_di_type_count; i++) free(g_di_types[i]);
     free(g_di_types);
@@ -357,14 +336,12 @@ static LLVMMetadataRef di_basic(zan_irgen_t *g, const char *nm, uint64_t bits,
                                         encoding, LLVMDIFlagZero);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_byte_ptr(zan_irgen_t *g) {
     LLVMMetadataRef byte = di_basic(g, "byte", 8, ZAN_DI_ATE_UCHAR);
     return LLVMDIBuilderCreatePointerType(g->di_builder, byte, 64, 0, 0,
                                           "", 0);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void di_type_name(zan_type_t *t, char *buf, size_t cap) {
     if (cap == 0) return;
     buf[0] = '\0';
@@ -396,7 +373,6 @@ static void di_type_name(zan_type_t *t, char *buf, size_t cap) {
     }
 }
 
-/* 内部辅助实现 */
 static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
     if (t->kind != TYPE_TYPE_PARAM || !inst || !inst->sym ||
         inst->type_arg_count <= 0 || !t->name.str)
@@ -411,7 +387,6 @@ static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
             return inst->type_args[idx];
         idx++;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     if (cls->decl &&
         cls->decl->type_decl.type_params.count == inst->type_arg_count) {
         zan_ast_list_t *tps = &cls->decl->type_decl.type_params;
@@ -426,7 +401,6 @@ static zan_type_t *di_subst_param(zan_type_t *t, zan_type_t *inst) {
     return NULL;
 }
 
-/* 内部辅助逻辑 */
 static struct zan_struct_type_entry *di_struct_entry(zan_irgen_t *g,
                                                      zan_symbol_t *sym) {
     for (int i = 0; i < g->struct_type_count; i++)
@@ -440,7 +414,6 @@ static unsigned long di_align_up(unsigned long v, unsigned long a) {
     return r ? v + (a - r) : v;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_member(zan_irgen_t *g, LLVMMetadataRef scope,
                                  LLVMMetadataRef file, const char *nm,
                                  LLVMMetadataRef ty, unsigned long off,
@@ -450,7 +423,6 @@ static LLVMMetadataRef di_member(zan_irgen_t *g, LLVMMetadataRef scope,
         size_bytes * 8, /* AlignInBits */ 0, off * 8, LLVMDIFlagZero, ty);
 }
 
-/* 内部辅助实现 */
 static int di_type_named(zan_type_t *t, const char *n) {
     return t && t->kind != TYPE_ARRAY && t->name.str &&
            (int)t->name.len == (int)strlen(n) &&
@@ -465,7 +437,6 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
     LLVMMetadataRef i64 = di_basic(g, "long", 64, ZAN_DI_ATE_SIGNED);
     LLVMMetadataRef bytep = di_byte_ptr(g);
 
-    /* 底层系统交互与数据协议契约 */
     if (di_type_named(t, "List") || di_type_named(t, "StringBuilder")) {
         LLVMMetadataRef data = i64;
         if (di_type_named(t, "StringBuilder")) data = bytep;
@@ -516,7 +487,6 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
                                               0, "", 0);
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (di_type_named(t, "Span")) {
         LLVMMetadataRef members[2] = {
             di_member(g, file, file, "base", bytep, 0, 8, 1),
@@ -529,7 +499,6 @@ static LLVMMetadataRef di_builtin_composite(zan_irgen_t *g, zan_type_t *t,
     return NULL;
 }
 
-/* 内部辅助实现 */
 static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
                                           int depth) {
     zan_symbol_t *sym = t->sym;
@@ -539,7 +508,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
 
     zan_di_type_rec_t *rec = di_type_rec(t);
     if (!rec) return NULL;
-    if (rec->building) return rec->placeholder; /* 核心系统底层抽象与内存语义契约 */
+    if (rec->building) return rec->placeholder;
     if (rec->composite) {
         return LLVMDIBuilderCreatePointerType(g->di_builder, rec->composite,
                                               64, 0, 0, "", 0);
@@ -558,7 +527,6 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
         /* SizeInBits */ 0, /*AlignInBits*/ 0, LLVMDIFlagZero, NULL, 0);
     rec->building = 1;
 
-    /* 内部辅助实现 */
     int nslots = e->field_count;
     int vptr = class_has_virtual_methods(sym) ? 1 : 0;
     LLVMMetadataRef *members =
@@ -581,7 +549,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
             if (fa > max_align) max_align = fa;
             if (cursor > size) size = cursor;
         }
-        LLVMMetadataRef mty = di_byte_ptr(g); /* 核心系统底层抽象与内存语义契约 */
+        LLVMMetadataRef mty = di_byte_ptr(g);
         members[slot] = di_member(g, rec->placeholder, file, "$vptr", mty, off,
                                   fsize, line);
         slot++;
@@ -634,7 +602,6 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
                                           "", 0);
 }
 
-/* 内部辅助实现 */
 static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
                                           zan_type_t *inst, int depth) {
     zan_di_type_rec_t *rec = di_type_rec(t);
@@ -683,7 +650,6 @@ static LLVMMetadataRef di_array_composite(zan_irgen_t *g, zan_type_t *t,
                                           "", 0);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMMetadataRef di_struct_composite(zan_irgen_t *g, zan_type_t *t,
                                            zan_type_t *inst, int depth) {
     zan_symbol_t *sym = t->sym;
@@ -743,7 +709,6 @@ static LLVMMetadataRef di_struct_composite(zan_irgen_t *g, zan_type_t *t,
     return composite;
 }
 
-/* 底层系统交互与数据协议契约 */
 static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
                                        zan_type_t *inst, int depth) {
     if (!g->emit_debug || !g->di_builder || !t || depth > 8) return NULL;
@@ -774,7 +739,6 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
     case TYPE_CHAR:
         return di_basic(g, "char", 16, ZAN_DI_ATE_UTF);
     case TYPE_STRING: {
-        /* 内部辅助逻辑 */
         LLVMMetadataRef byte = di_basic(g, "byte", 8, ZAN_DI_ATE_UCHAR);
         LLVMMetadataRef ptr = LLVMDIBuilderCreatePointerType(
             g->di_builder, byte, 64, 0, 0, "", 0);
@@ -787,7 +751,6 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
         return di_array_composite(g, t, inst, depth);
     case TYPE_CLASS:
     case TYPE_INTERFACE:
-        /* 内部辅助逻辑 */
         if (!t->sym) {
             LLVMMetadataRef bi = di_builtin_composite(g, t, depth);
             if (bi) return bi;
@@ -827,7 +790,7 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
     LLVMMetadataRef ty = NULL;
     if (zt) ty = di_type_for_zan(g, zt, zt, 0);
     if (!ty && LLVMIsAAllocaInst(storage)) ty = di_type_from_llvm(g, LLVMGetAllocatedType(storage));
-    if (!ty) return; /* 核心系统底层抽象与内存语义契约 */
+    if (!ty) return;
     LLVMMetadataRef file = di_file_for(g, g->di_cur_file);
     unsigned line = g->di_cur_line ? g->di_cur_line : 1;
     LLVMMetadataRef var = LLVMDIBuilderCreateAutoVariable(
@@ -835,7 +798,6 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
         /* AlwaysPreserve */ 1, LLVMDIFlagZero, /*AlignInBits*/ 0);
     LLVMMetadataRef expr = LLVMDIBuilderCreateExpression(g->di_builder, NULL, 0);
     LLVMMetadataRef dl = LLVMDIBuilderCreateDebugLocation(g->ctx, line, 0, sp, NULL);
-    /* 内部辅助实现 */
 #if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR < 19
     LLVMDIBuilderInsertDeclareAtEnd(g->di_builder, storage, var, expr, dl, bb);
 #else
@@ -843,22 +805,18 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 #endif
 }
 
-/* 内部辅助实现 */
 static zan_irgen_t *g_di_emit_ctx = NULL;
 
 #include "../common/host_oom.h"
 #include "../common/zan_abi.h"
-/* 模块核心语义抽象与接口调用契约 */
 
 static bool types_equal(zan_type_t *a, zan_type_t *b);
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm);
 static void emit_weak_runtime(zan_irgen_t *g);
 
-/* 核心系统底层抽象与内存语义契约 */
 static zan_irgen_t *s_current_irgen = NULL;
 
-/* 内部辅助逻辑 */
 static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                                      const char *nm) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
@@ -868,7 +826,6 @@ static LLVMValueRef zan_hdr_is_string(zan_irgen_t *g, LLVMValueRef word,
                     LLVMConstInt(i64, ZAN_STRING_TAG, 0), nm);
 }
 
-/* 内部辅助逻辑 */
 static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     if (!g->target_is_windows) return NULL;
     LLVMTypeRef i1t = LLVMInt1TypeInContext(g->ctx);
@@ -908,7 +865,6 @@ static LLVMValueRef zan_hdr_read_ok(zan_irgen_t *g, LLVMValueRef obj) {
     return phi;
 }
 
-/* 内部辅助实现 */
 static LLVMTypeRef arc_desc_type(zan_irgen_t *g) {
     LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -924,7 +880,6 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     LLVMValueRef dg = LLVMAddGlobal(g->mod, dt, dname);
     LLVMSetLinkage(dg, LLVMInternalLinkage);
     LLVMSetGlobalConstant(dg, 1);
-    /* 内部辅助实现 */
     LLVMValueRef z = LLVMConstNull(i8p);
     LLVMSetInitializer(dg, LLVMConstNamedStruct(dt,
         (LLVMValueRef[]){ z, z, z, LLVMConstInt(i64t, 0, 0) }, 4));
@@ -932,7 +887,6 @@ static LLVMValueRef create_arc_desc(zan_irgen_t *g, int site_idx) {
     return dg;
 }
 
-/* 内部辅助逻辑 */
 static bool site_arrays_reserve(zan_irgen_t *g, int want) {
     if (want <= g->leak_site_cap) return true;
     int newcap = g->leak_site_cap ? g->leak_site_cap * 2 : 256;
@@ -988,7 +942,6 @@ static bool desc_gv_reserve(zan_irgen_t *g, int want) {
 static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
                             zan_type_t *inst, int coll_kind,
                             zan_type_t *coll_elem) {
-    /* 内部辅助实现 */
     uint32_t key_file = g->check_leaks ? g->di_cur_file : 0;
     uint32_t key_line = g->check_leaks ? g->di_cur_line : 0;
     for (int i = 0; i < g->leak_site_count; i++) {
@@ -1006,7 +959,6 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
             if (existing_sym == sym && types_equal(existing_inst, inst)) return i;
         }
     }
-    /* 内部辅助实现 */
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
         fprintf(stderr, "zanc: out of memory growing ARC site tables\n");
@@ -1023,7 +975,6 @@ static int reserve_arc_site(zan_irgen_t *g, zan_symbol_t *sym,
     return site_idx;
 }
 
-/* 内部辅助实现 */
 static int reserve_closure_site(zan_irgen_t *g) {
     if (!site_arrays_reserve(g, g->leak_site_count + 1) ||
         (g->desc_hdr && !desc_gv_reserve(g, g->leak_site_count + 1))) {
@@ -1036,13 +987,11 @@ static int reserve_closure_site(zan_irgen_t *g) {
     if (g->site_coll) g->site_coll[site_idx] = 0;
     if (g->site_coll_elem) g->site_coll_elem[site_idx] = NULL;
     if (g->desc_hdr) {
-        /* 内部辅助实现 */
         create_arc_desc(g, site_idx);
     }
     return site_idx;
 }
 
-/* 内部辅助实现 */
 static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
     if (!g->desc_hdr)
         return LLVMConstInt(LLVMInt64TypeInContext(g->ctx),
@@ -1051,13 +1000,10 @@ static LLVMValueRef arc_site_arg(zan_irgen_t *g, int site_idx) {
                              LLVMInt64TypeInContext(g->ctx), "desc.arg");
 }
 
-/* 内部辅助逻辑 */
 
 /* ---- initialization ---- */
 
-/* 模块核心语义抽象与接口调用契约 */
 
-/* 内部辅助实现 */
 static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
                               LLVMValueRef *args, unsigned n, const char *nm) {
     LLVMValueRef callee = fn;
@@ -1066,10 +1012,8 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     } else if (fn && !LLVMIsAFunction(fn) &&
                LLVMGetTypeKind(LLVMTypeOf(fn)) == LLVMPointerTypeKind &&
                LLVMTypeOf(fn) != LLVMPointerType(ty, 0)) {
-        /* 内部辅助实现 */
         fn = LLVMBuildBitCast(b, fn, LLVMPointerType(ty, 0), "callee.fp");
     }
-    /* 内部辅助实现 */
     if (false && s_current_irgen && s_current_irgen->target_is_wasm &&
         s_current_irgen->wasm_try_depth > 0 &&
         !s_current_irgen->in_wasm_throw_op &&
@@ -1078,11 +1022,9 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
         LLVMBasicBlockRef cur = LLVMGetInsertBlock(b);
         LLVMValueRef parent = LLVMGetBasicBlockParent(cur);
         LLVMBasicBlockRef lpad = g->wasm_lpad_stack[g->wasm_try_depth - 1];
-        /* 内部辅助实现 */
         if (!lpad ||
             LLVMGetBasicBlockParent(cur) != LLVMGetBasicBlockParent(lpad)) {
             LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
-            /* 模块核心语义抽象与接口调用契约 */
             if (callee && LLVMIsAFunction(callee)) {
                 static const char *ext[2] = { "signext", "zeroext" };
                 for (int e = 0; e < 2; e++) {
@@ -1118,7 +1060,6 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
         return inv;
     }
     LLVMValueRef call = LLVMBuildCall2(b, ty, fn, args, n, nm);
-    /* 内部辅助实现 */
     if (callee && LLVMIsAFunction(callee)) {
         static const char *ext[2] = { "signext", "zeroext" };
         for (int e = 0; e < 2; e++) {
@@ -1135,7 +1076,6 @@ static LLVMValueRef zan_call2(LLVMBuilderRef b, LLVMTypeRef ty, LLVMValueRef fn,
     return call;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
     if (g->external_async_executor && g->rt_co_frame_free) {
         zan_call2(g->builder, g->rt_co_frame_free_type, g->rt_co_frame_free,
@@ -1146,7 +1086,6 @@ static void zan_emit_frame_free(zan_irgen_t *g, LLVMValueRef frame_i8) {
               &frame_i8, 1, "");
 }
 
-/* 底层系统交互与数据协议契约 */
 static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     if (need <= *cap) return base;
     int ncap = *cap ? *cap * 2 : 256;
@@ -1160,19 +1099,16 @@ static void *irgen_grow(void *base, int *cap, int need, size_t elem) {
     return p;
 }
 
-/* 底层系统交互与数据协议契约 */
 static size_t irgen_ptr_bucket(const void *p, int cap) {
     uint64_t h = (uint64_t)(uintptr_t)p * 0x9E3779B97F4A7C15ull;
     return (size_t)((h >> 32) & (uint64_t)(cap - 1));
 }
 
-/* 底层系统交互与数据协议契约 */
 
 static size_t fn_index_hash(zan_symbol_t *sym, int cap) {
     return irgen_ptr_bucket(sym, cap);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void fn_index_put(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
     size_t i = fn_index_hash(sym, g->fn_index_cap);
     while (g->fn_index[i].sym) {
@@ -1183,7 +1119,6 @@ static void fn_index_put(zan_irgen_t *g, zan_symbol_t *sym, int idx) {
     g->fn_index[i].idx = idx;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void fn_index_rehash(zan_irgen_t *g, int ncap) {
     struct zan_fn_index_slot *slots =
         calloc((size_t)ncap, sizeof(*g->fn_index));
@@ -1198,7 +1133,6 @@ static void fn_index_rehash(zan_irgen_t *g, int ncap) {
         if (g->functions[i].sym) fn_index_put(g, g->functions[i].sym, i);
 }
 
-/* 底层系统交互与数据协议契约 */
 static int irgen_find_function(zan_irgen_t *g, zan_symbol_t *sym) {
     if (!sym || !g->fn_index) return -1;
     size_t i = fn_index_hash(sym, g->fn_index_cap);
@@ -1221,23 +1155,21 @@ static void irgen_register_function(zan_irgen_t *g, zan_symbol_t *sym,
     g->functions[g->function_count].fn = fn;
     g->functions[g->function_count].fn_type = fn_type;
     g->functions[g->function_count].modifiers = sym ? sym->modifiers : 0;
-    /* 模块核心语义抽象与接口调用契约 */
     if ((g->function_count + 1) * 2 >= g->fn_index_cap)
         fn_index_rehash(g, g->fn_index_cap ? g->fn_index_cap * 2 : 2048);
     if (sym) fn_index_put(g, sym, g->function_count);
     g->function_count++;
 }
 
-/* 内部辅助实现 */
 
 typedef struct {
     zan_symbol_t *owner;
-    int built_count;    /* 模块核心语义抽象与接口调用契约 */
-    int cap;            /* 核心系统底层抽象与内存语义契约 */
-    int *name_buckets;  /* 核心系统底层抽象与内存语义契约 */
-    int *name_next;     /* 底层系统交互与数据协议契约 */
-    int *decl_buckets;  /* 核心系统底层抽象与内存语义契约 */
-    int *decl_next;     /* 底层系统交互与数据协议契约 */
+    int built_count;
+    int cap;
+    int *name_buckets;
+    int *name_next;
+    int *decl_buckets;
+    int *decl_next;
 } zan_class_index_t;
 
 static zan_class_index_t *g_class_indexes;
@@ -1286,7 +1218,6 @@ static void class_index_build(zan_class_index_t *ci, zan_symbol_t *owner) {
         ci->name_buckets[i] = -1;
         ci->decl_buckets[i] = -1;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     for (int i = n - 1; i >= 0; i--) {
         zan_symbol_t *m = owner->members[i];
         size_t nb = (size_t)(istr_hash(m->name) & (uint64_t)(cap - 1));
@@ -1340,7 +1271,6 @@ static zan_class_index_t *class_index_for(zan_symbol_t *owner) {
     return ci;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int member_first_named(zan_class_index_t *ci, zan_istr_t name) {
     return ci->name_buckets[istr_hash(name) & (uint64_t)(ci->cap - 1)];
 }
@@ -1357,7 +1287,6 @@ static bool member_name_is(zan_symbol_t *m, zan_istr_t name) {
 /* Defined in irgen_generics */
 static void emit_fatal_report(zan_irgen_t *g, LLVMValueRef text, int exit_code);
 
-/* 内部辅助实现 */
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef isnull = zan_icmp(g->builder, LLVMIntEQ, raw,
@@ -1366,13 +1295,11 @@ void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw)
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom.ok");
     LLVMBuildCondBr(g->builder, isnull, oom_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, oom_bb);
-    /* 内部辅助逻辑 */
     LLVMValueRef text = zan_irgen_intern_string(g, "out of memory\n");
     emit_fatal_report(g, text, 1);
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* 内部辅助逻辑 */
 static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long delta) {
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMBuildAtomicRMW(g->builder,
@@ -1381,7 +1308,6 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
         LLVMAtomicOrderingMonotonic, 0);
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_ARC_FAULT_RETAIN      0xE0A2C001u
 #define ZAN_ARC_FAULT_RELEASE     0xE0A2C002u
 #define ZAN_ARC_FAULT_STR_RETAIN  0xE0A2C003u
@@ -1392,10 +1318,8 @@ static void emit_leak_counter_add(zan_irgen_t *g, LLVMValueRef ptr, long long de
 #define ZAN_ARC_FAULT_ARR_RELEASE 0xE0A2C008u
 #define ZAN_ARC_FAULT_USE_ARR     0xE0A2C009u
 
-/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_ARC_FREED_MARK 0xDEAD0000DEAD0000ull
 
-/* 内部辅助实现 */
 static void emit_arc_fault_report(zan_irgen_t *g, LLVMValueRef obj,
                                   LLVMValueRef rc_old, LLVMValueRef site,
                                   unsigned code, const char *what) {
@@ -1444,7 +1368,6 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc_old, LLVMValueRef obj,
                                     LLVMValueRef site, unsigned code,
                                     const char *what) {
-    /* 内部辅助逻辑 */
     if (g->arc_guard) {
         if (!g->runtime_checks) return;
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
@@ -1458,7 +1381,6 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
         LLVMPositionBuilderAtEnd(g->builder, ok_bb);
         return;
     }
-    /* 内部辅助实现 */
     if (!g->arc_net) return;
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMValueRef dead = zan_icmp(g->builder, LLVMIntSLE, rc_old,
@@ -1496,7 +1418,6 @@ static void emit_arc_underflow_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* 内部辅助实现 */
 static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
                                     LLVMValueRef rc, LLVMValueRef obj,
                                     unsigned code, const char *what) {
@@ -1509,7 +1430,6 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMBasicBlockRef ok_bb = LLVMAppendBasicBlockInContext(g->ctx, fn, "uaf.ok");
     LLVMBuildCondBr(g->builder, freed, bad_bb, ok_bb);
     LLVMPositionBuilderAtEnd(g->builder, bad_bb);
-    /* 内部辅助实现 */
     LLVMValueRef sp = LLVMBuildGEP2(g->builder, i8t, obj,
         (LLVMValueRef[]){ LLVMConstInt(i64t, (uint64_t)ZAN_OBJ_SITE_OFF, 1) }, 1, "uafsp");
     LLVMValueRef sip = LLVMBuildBitCast(g->builder, sp, LLVMPointerType(i64t, 0), "uafsip");
@@ -1518,7 +1438,6 @@ static void emit_arc_freed_use_check(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, ok_bb);
 }
 
-/* 内部辅助逻辑 */
 static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
                                LLVMValueRef rc_iptr) {
     LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
@@ -1527,7 +1446,6 @@ static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
     LLVMTypeRef i8p = LLVMPointerType(i8t, 0);
     LLVMBuildStore(g->builder, LLVMConstInt(i64t, ZAN_ARC_FREED_MARK, 0), rc_iptr);
     LLVMBuildStore(g->builder, LLVMConstInt(i8t, 0xDD, 0), obj);
-    /* 内部辅助实现 */
     LLVMTypeRef ra_ty = LLVMFunctionType(i8p, &i32t, 1, 0);
     LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
     if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
@@ -1539,7 +1457,6 @@ static void emit_arc_quarantine(zan_irgen_t *g, LLVMValueRef obj,
     LLVMBuildStore(g->builder, LLVMBuildPtrToInt(g->builder, ra, i64t, "ran"), sip);
 }
 
-/* 内部辅助实现 */
 static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
                                    LLVMValueRef ptr8, LLVMBasicBlockRef ret_bb) {
     if (!g->target_is_windows) return;
@@ -1560,7 +1477,6 @@ static void emit_header_read_guard(zan_irgen_t *g, LLVMValueRef fn,
     LLVMPositionBuilderAtEnd(g->builder, readable_bb);
 }
 
-/* 内部辅助实现 */
 static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
                                 const char *tag, LLVMValueRef obj,
                                 LLVMValueRef rc, LLVMValueRef site) {
@@ -1591,12 +1507,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->arena = arena;
     g->diag = diag;
     g->binder = binder;
-    /* 内部辅助实现 */
     g->runtime_checks = runtime_checks;
     g->arc_guard = arc_guard;
     g->arc_net = arc_net;
     g->check_leaks = check_leaks;
-    /* 模块核心语义抽象与接口调用契约 */
     if (target_triple && target_triple[0])
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;
@@ -1609,17 +1523,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->target_is_macos = true;
 #endif
     }
-    /* 内部辅助逻辑 */
     g->external_async_executor = external_async_executor;
     g->has_async_work = false;
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         static const unsigned char zan_obf_pad[16] = {
             0x5a, 0x67, 0xa3, 0x1c, 0xd9, 0x84, 0x2f, 0x70,
             0xbe, 0x11, 0x4d, 0xe6, 0x93, 0x28, 0xc5, 0x7a
         };
-        uint64_t h = 0xcbf29ce484222325ULL; /* 核心系统底层抽象与内存语义契约 */
+        uint64_t h = 0xcbf29ce484222325ULL;
         const char *seeds[2] = { module_name ? module_name : "",
                                  g->target_triple };
         for (int s = 0; s < 2; s++) {
@@ -1653,7 +1565,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
     g->builder = LLVMCreateBuilderInContext(g->ctx);
 
-    /* 内部辅助逻辑 */
     g->emit_debug = false;
     g->di_builder = NULL;
     g->di_cu = NULL;
@@ -1662,16 +1573,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->di_cur_line = 0;
     g->di_cur_file = 0;
 
-    /* 核心系统底层抽象与内存语义契约 */
     g->src_file = module_name;
 
-    /* 内部辅助实现 */
     g->g_live = LLVMAddGlobal(g->mod, LLVMInt64TypeInContext(g->ctx), "__zan_live");
     LLVMSetInitializer(g->g_live, LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0));
     LLVMSetLinkage(g->g_live, LLVMInternalLinkage);
 
     g->leak_site_count = 0;
-    /* 内部辅助实现 */
     g->desc_hdr = !check_leaks;
     g->desc_gv_cap = 0;
     g->leak_site_cap = 256;
@@ -1679,7 +1587,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p  = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         if (!g->desc_hdr) {
-            /* 内部辅助实现 */
             g->g_site_count = LLVMAddGlobal(g->mod, i64t, "__zan_site_count");
             LLVMSetInitializer(g->g_site_count, LLVMConstInt(i64t, 0, 0));
             LLVMSetLinkage(g->g_site_count, LLVMInternalLinkage);
@@ -1689,7 +1596,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             g->g_site_names = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_names");
             LLVMSetInitializer(g->g_site_names, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_names, LLVMInternalLinkage);
-            /* 内部辅助实现 */
             g->g_site_dtors = LLVMAddGlobal(g->mod, LLVMPointerType(i8p, 0), "__zan_site_dtors");
             LLVMSetInitializer(g->g_site_dtors, LLVMConstNull(LLVMPointerType(i8p, 0)));
             LLVMSetLinkage(g->g_site_dtors, LLVMInternalLinkage);
@@ -1708,7 +1614,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->site_loc_line = (uint32_t *)calloc(g->leak_site_cap, sizeof(uint32_t));
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef printf_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef printf_type = LLVMFunctionType(
         LLVMInt32TypeInContext(g->ctx), printf_args, 1, 1 /* varargs */);
@@ -1716,13 +1621,11 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->fn_printf = printf_fn;
     g->printf_type = printf_type;
 
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMTypeRef println_args[] = { LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0) };
     LLVMTypeRef println_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), println_args, 1, 0);
     g->rt_println = LLVMAddFunction(g->mod, "zan_rt_println", println_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_println, "entry");
     LLVMPositionBuilderAtEnd(g->builder, entry);
 
@@ -1731,7 +1634,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, args, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef pint_args[] = { LLVMInt64TypeInContext(g->ctx) };
     LLVMTypeRef pint_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), pint_args, 1, 0);
@@ -1744,7 +1646,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, iargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* 模块核心语义抽象与接口调用契约 */
     g->rt_print_uint = LLVMAddFunction(g->mod, "zan_rt_print_uint", pint_type);
 
     LLVMBasicBlockRef puint_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_uint, "entry");
@@ -1754,7 +1655,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     zan_call2(g->builder, printf_type, printf_fn, uargs, 2, "");
     LLVMBuildRetVoid(g->builder);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef pdbl_args[] = { LLVMDoubleTypeInContext(g->ctx) };
     LLVMTypeRef pdbl_type = LLVMFunctionType(
         LLVMVoidTypeInContext(g->ctx), pdbl_args, 1, 0);
@@ -1762,7 +1662,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
 
     LLVMBasicBlockRef pdbl_entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_print_double, "entry");
     LLVMPositionBuilderAtEnd(g->builder, pdbl_entry);
-    /* 内部辅助逻辑 */
     {
         LLVMTypeRef i8p_t = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
         LLVMTypeRef i64_t = LLVMInt64TypeInContext(g->ctx);
@@ -1783,12 +1682,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     LLVMBuildRetVoid(g->builder);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef snprintf_args[] = { i8ptr, i64, i8ptr };
     LLVMTypeRef snprintf_type = LLVMFunctionType(i32, snprintf_args, 3, 1);
     g->fn_snprintf = LLVMAddFunction(g->mod, "snprintf", snprintf_type);
@@ -1798,18 +1695,15 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef malloc_type = LLVMFunctionType(i8ptr, malloc_args, 1, 0);
     g->fn_malloc = LLVMAddFunction(g->mod, "malloc", malloc_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef free_args[] = { i8ptr };
     LLVMTypeRef free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), free_args, 1, 0);
     g->fn_free = LLVMAddFunction(g->mod, "free", free_type);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef exit_args[] = { i32 };
     g->exit_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), exit_args, 1, 0);
     g->fn_exit = LLVMAddFunction(g->mod, "exit", g->exit_type);
 
     if (g->check_leaks) {
-        /* 模块核心语义抽象与接口调用契约 */
         LLVMTypeRef void_fn_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
         LLVMTypeRef void_fn_ptr = LLVMPointerType(void_fn_type, 0);
         LLVMTypeRef atexit_args[] = { void_fn_ptr };
@@ -1822,53 +1716,43 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef realloc_type = LLVMFunctionType(i8ptr, realloc_args, 2, 0);
     g->fn_realloc = LLVMAddFunction(g->mod, "realloc", realloc_type);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef list_fields[] = { i64, i64, LLVMPointerType(i64, 0) };
     g->list_struct_type = LLVMStructCreateNamed(g->ctx, "List");
     LLVMStructSetBody(g->list_struct_type, list_fields, 3, 0);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef span_fields[] = { i8ptr, i64 };
     g->span_struct_type = LLVMStructCreateNamed(g->ctx, "Span");
     LLVMStructSetBody(g->span_struct_type, span_fields, 2, 0);
 
-    /* 内部辅助实现 */
     LLVMTypeRef dict_fields[] = { i64, i64, LLVMPointerType(i8ptr, 0), LLVMPointerType(i64, 0),
                                   LLVMPointerType(i64, 0), i64, i64, i64 };
     g->dict_struct_type = LLVMStructCreateNamed(g->ctx, "Dict");
     LLVMStructSetBody(g->dict_struct_type, dict_fields, 8, 0);
 
-    /* 底层系统交互与数据协议契约 */
     g->task_struct_type = LLVMStructCreateNamed(g->ctx, "Task");
     LLVMTypeRef task_fields[] = { i64, i64, i64 };
     LLVMStructSetBody(g->task_struct_type, task_fields, 3, 0);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef sb_fields[] = { i64, i64, i8ptr };
     g->sb_struct_type = LLVMStructCreateNamed(g->ctx, "StringBuilder");
     LLVMStructSetBody(g->sb_struct_type, sb_fields, 3, 0);
 
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMTypeRef co_step_args[] = { i8ptr };
     g->co_step_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_step_args, 1, 0);
     g->co_step_ptr = LLVMPointerType(g->co_step_type, 0);
     LLVMTypeRef co_ready_args[] = { i8ptr, g->co_step_ptr };
     g->rt_co_ready_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_ready_args, 2, 0);
     g->rt_co_ready = LLVMAddFunction(g->mod, "zan_co_ready", g->rt_co_ready_type);
-    /* 底层系统交互与数据协议契约 */
     g->rt_co_poll_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_poll = LLVMAddFunction(g->mod, "zan_co_poll", g->rt_co_poll_type);
-    /* 内部辅助实现 */
     g->rt_co_frame_free_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
                                                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
     g->rt_co_frame_free = LLVMAddFunction(g->mod, "__zan_co_frame_free",
                                           g->rt_co_frame_free_type);
-    /* 编译期中间表示与代码生成内部规范 */
     g->rt_co_sched_init_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_init = LLVMAddFunction(g->mod, "zan_co_sched_init", g->rt_co_sched_init_type);
     g->rt_co_sched_run_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), NULL, 0, 0);
     g->rt_co_sched_run = LLVMAddFunction(g->mod, "zan_co_sched_run", g->rt_co_sched_run_type);
-    /* 内部辅助逻辑 */
     g->rt_co_sched_run_until_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
         (LLVMTypeRef[]){ LLVMPointerType(LLVMInt32TypeInContext(g->ctx), 0) }, 1, 0);
     g->rt_co_sched_run_until = LLVMAddFunction(g->mod, "zan_co_sched_run_until",
@@ -1880,7 +1764,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         g->rt_co_delay = LLVMAddFunction(g->mod, "zan_co_delay", g->rt_co_delay_type);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     {
         LLVMTypeRef i64d = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32d = LLVMInt32TypeInContext(g->ctx);
@@ -1922,7 +1805,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMSetLinkage(g->rt_io_pump_timeout,
             g->external_async_executor ? LLVMExternalLinkage : LLVMExternalWeakLinkage);
 
-        /* 内部辅助实现 */
         g->rt_io_has_pending_type = LLVMFunctionType(i32d, NULL, 0, 0);
         g->rt_io_has_pending = LLVMAddFunction(g->mod, "zan_io_has_pending",
             g->rt_io_has_pending_type);
@@ -1943,7 +1825,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     }
     g->uses_socket_async = false;
 
-    /* 内部辅助实现 */
     if (!g->external_async_executor) {
         LLVMTypeRef voidt = LLVMVoidTypeInContext(g->ctx);
         LLVMTypeRef node_fields[] = { i8ptr /* next */, i8ptr /*frame*/, g->co_step_ptr /*step*/ };
@@ -1955,28 +1836,23 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef g_tail = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_tail");
         LLVMSetInitializer(g_tail, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_tail, LLVMInternalLinkage);
-        /* 内部辅助实现 */
         LLVMValueRef g_nodes = LLVMAddGlobal(g->mod, i8ptr, "__zan_co_nodes");
         LLVMSetInitializer(g_nodes, LLVMConstNull(i8ptr));
         LLVMSetLinkage(g_nodes, LLVMInternalLinkage);
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
 
-        /* 内部辅助实现 */
         LLVMValueRef g_slice_start = LLVMAddGlobal(g->mod, i64t, "__zan_co_slice_start");
         LLVMSetInitializer(g_slice_start, LLVMConstInt(i64t, 0, 0));
-        /* 内部辅助实现 */
         LLVMValueRef g_poll_tick = LLVMAddGlobal(g->mod, i64t, "__zan_co_poll_tick");
         LLVMSetInitializer(g_poll_tick, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_slice_start, LLVMInternalLinkage);
         LLVMValueRef g_quantum = LLVMAddGlobal(g->mod, i64t, "__zan_co_quantum_us");
         LLVMSetInitializer(g_quantum, LLVMConstInt(i64t, 0, 0));
         LLVMSetLinkage(g_quantum, LLVMInternalLinkage);
-        /* 内部辅助实现 */
         LLVMTypeRef now_type = LLVMFunctionType(i64t, NULL, 0, 0);
         LLVMValueRef co_quantum = LLVMAddFunction(g->mod, "zan_co_quantum_ms", now_type);
         LLVMValueRef precise_now = LLVMAddFunction(g->mod, "zan_co_precise_us", now_type);
 
-        /* 模块核心语义抽象与接口调用契约 */
         LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
         LLVMTypeRef timer_reset_type = LLVMFunctionType(voidt, NULL, 0, 0);
         LLVMValueRef timer_reset = LLVMAddFunction(g->mod, "zan_timer_runtime_reset", timer_reset_type);
@@ -1990,7 +1866,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef timer_next = LLVMAddFunction(g->mod, "zan_timer_next_timeout", timer_next_type);
         LLVMValueRef timer_dispatch = LLVMAddFunction(g->mod, "zan_timer_dispatch_due", timer_next_type);
 
-        /* 内部辅助实现 */
         LLVMTypeRef sleep_args[] = { i32t };
         LLVMTypeRef sleep_type = LLVMFunctionType(voidt, sleep_args, 1, 0);
         LLVMValueRef fn_sleep = NULL;
@@ -2002,7 +1877,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         else
             fn_poll = LLVMAddFunction(g->mod, "poll", poll_type);
 
-        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_io_pump_timeout, "entry");
@@ -2030,7 +1904,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
-        /* 内部辅助实现 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_io_has_pending, "entry");
@@ -2038,7 +1911,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(i32t, 0, 0));
         }
 
-        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_sched_init, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2055,7 +1927,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* 内部辅助逻辑 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "entry");
             LLVMBasicBlockRef check = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_poll, "check");
@@ -2091,7 +1962,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRet(g->builder, LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0));
         }
 
-        /* 内部辅助逻辑 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_delay, "entry");
             LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2102,7 +1972,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "entry");
             LLVMBasicBlockRef cont  = LLVMAppendBasicBlockInContext(g->ctx, g->rt_co_ready, "cont");
@@ -2118,7 +1987,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildCondBr(g->builder, step_null, ret, cont);
 
             LLVMPositionBuilderAtEnd(g->builder, cont);
-            /* 底层系统交互与数据协议契约 */
             LLVMBasicBlockRef reuse_bb = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_co_ready, "node.reuse");
             LLVMBasicBlockRef alloc_bb = LLVMAppendBasicBlockInContext(g->ctx,
@@ -2141,7 +2009,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef fresh = zan_call2(g->builder, malloc_type, g->fn_malloc,
                 (LLVMValueRef[]){ LLVMSizeOf(node_ty) }, 1, "node");
             zan_irgen_emit_oom_check(g, g->rt_co_ready, fresh);
-            /* 内部辅助逻辑 */
             LLVMBasicBlockRef fresh_bb = LLVMGetInsertBlock(g->builder);
             LLVMBuildBr(g->builder, have_bb);
 
@@ -2177,7 +2044,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* 内部辅助逻辑 */
         {
             LLVMValueRef runfn = g->rt_co_sched_run_until;
             LLVMTypeRef i32p = LLVMPointerType(i32t, 0);
@@ -2196,7 +2062,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef doneptr = LLVMGetParam(runfn, 0);
             LLVMBuildBr(g->builder, head_bb);
 
-            /* 模块核心语义抽象与接口调用契约 */
             LLVMPositionBuilderAtEnd(g->builder, head_bb);
             LLVMValueRef no_flag = zan_icmp(g->builder, LLVMIntEQ, doneptr,
                 LLVMConstNull(i32p), "done.noflag");
@@ -2231,15 +2096,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildBr(g->builder, after_bb);
 
             LLVMPositionBuilderAtEnd(g->builder, after_bb);
-            /* 内部辅助逻辑 */
             LLVMBuildStore(g->builder,
                 LLVMBuildLoad2(g->builder, i8ptr, g_nodes, "nodes.head"),
                 LLVMBuildStructGEP2(g->builder, node_ty, head, 0, "n.recycle"));
             LLVMBuildStore(g->builder, head, g_nodes);
-            /* 内部辅助实现 */
             (void)zan_call2(g->builder, timer_next_type, timer_dispatch,
                 NULL, 0, "due.busy");
-            /* 内部辅助实现 */
             LLVMValueRef slice_now = zan_call2(g->builder, now_type, precise_now,
                 NULL, 0, "slice.now");
             LLVMBuildStore(g->builder, slice_now, g_slice_start);
@@ -2267,7 +2129,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 (LLVMValueRef[]){ timeout }, 1, "woke");
             LLVMValueRef more = zan_icmp(g->builder, LLVMIntSGT, woke,
                 LLVMConstInt(i64t, 0, 0), "io.more");
-            /* 内部辅助实现 */
             LLVMValueRef pend = zan_call2(g->builder,
                 g->rt_io_has_pending_type, g->rt_io_has_pending, NULL, 0,
                 "io.pending");
@@ -2283,7 +2144,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMBuildRetVoid(g->builder);
         }
 
-        /* 模块核心语义抽象与接口调用契约 */
         {
             LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx,
                 g->rt_co_sched_run, "entry");
@@ -2295,19 +2155,17 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         }
         (void)voidt;
     }
-    /* 内部辅助实现 */
     LLVMTypeRef co_hdr_fields[] = {
         i64, g->co_step_ptr,   /* SCHED, SCHED_STEP: scheduler-owned */
         LLVMInt32TypeInContext(g->ctx), LLVMInt32TypeInContext(g->ctx),
         i8ptr, g->co_step_ptr, i64,
         g->co_step_ptr, LLVMInt32TypeInContext(g->ctx),
-        g->co_step_ptr, /* 核心系统底层抽象与内存语义契约 */
-        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx), /* 核心系统底层抽象与内存语义契约 */
-        LLVMInt32TypeInContext(g->ctx), /* 核心系统底层抽象与内存语义契约 */
-        i8ptr, /* 核心系统底层抽象与内存语义契约 */
-        i8ptr  /* 底层系统交互与数据协议契约 */
+        g->co_step_ptr,
+        i8ptr, i8ptr, LLVMInt32TypeInContext(g->ctx),
+        LLVMInt32TypeInContext(g->ctx),
+        i8ptr,
+        i8ptr
     };
-    /* 内部辅助实现 */
     g->co_header_type = LLVMStructCreateNamed(g->ctx, "zan.co.header");
     LLVMStructSetBody(g->co_header_type, co_hdr_fields, 16, 0);
     g->current_async_frame = NULL;
@@ -2326,32 +2184,26 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->current_async_sub_rethrow_phi_ev = NULL;
     g->current_async_sub_slot_ptr = NULL;
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef strcmp_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcmp_type = LLVMFunctionType(LLVMInt32TypeInContext(g->ctx), strcmp_args, 2, 0);
     g->fn_strcmp = LLVMAddFunction(g->mod, "strcmp", strcmp_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strrchr_args[] = { i8ptr, LLVMInt32TypeInContext(g->ctx) };
     LLVMTypeRef strrchr_type = LLVMFunctionType(i8ptr, strrchr_args, 2, 0);
     LLVMAddFunction(g->mod, "strrchr", strrchr_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strlen_args[] = { i8ptr };
     LLVMTypeRef strlen_type = LLVMFunctionType(i64, strlen_args, 1, 0);
     g->fn_strlen = LLVMAddFunction(g->mod, "strlen", strlen_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strcpy_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcpy_type = LLVMFunctionType(i8ptr, strcpy_args, 2, 0);
     g->fn_strcpy = LLVMAddFunction(g->mod, "strcpy", strcpy_type);
 
-    /* 核心系统底层抽象与内存语义契约 */
     LLVMTypeRef strcat_args[] = { i8ptr, i8ptr };
     LLVMTypeRef strcat_type = LLVMFunctionType(i8ptr, strcat_args, 2, 0);
     g->fn_strcat = LLVMAddFunction(g->mod, "strcat", strcat_type);
 
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef arc_trace_ev = NULL;
     LLVMTypeRef arc_ra_ty = NULL;
     LLVMTypeRef arc_ev_ty = NULL;
@@ -2420,24 +2272,20 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         (void)ev_tag;
     }
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef retain_args[] = { i8ptr };
     LLVMTypeRef retain_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), retain_args, 1, 0);
     g->rt_retain = LLVMAddFunction(g->mod, "zan_rt_retain", retain_type);
 
-    /* 底层系统交互与数据协议契约 */
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
         LLVMValueRef obj = LLVMGetParam(g->rt_retain, 0);
-        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef is_null = zan_icmp(g->builder, LLVMIntEQ, obj,
             LLVMConstNull(i8ptr), "isnull");
         LLVMBasicBlockRef do_retain = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "retain");
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, do_retain);
         LLVMPositionBuilderAtEnd(g->builder, do_retain);
-        /* 底层系统交互与数据协议契约 */
         LLVMValueRef neg16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
@@ -2470,15 +2318,12 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* 内部辅助实现 */
     emit_weak_runtime(g);
 
-    /* 底层系统交互与数据协议契约 */
     LLVMTypeRef release_args[] = { i8ptr };
     LLVMTypeRef release_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
     g->rt_release = LLVMAddFunction(g->mod, "zan_rt_release", release_type);
 
-    /* 底层系统交互与数据协议契约 */
     {
         LLVMBasicBlockRef bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "entry");
         LLVMPositionBuilderAtEnd(g->builder, bb);
@@ -2501,7 +2346,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                                      "release through a stale reference "
                                      "(object was already freed)");
         }
-        /* 底层系统交互与数据协议契约 */
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
         {
@@ -2524,7 +2368,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
                 "rrsite");
             emit_arc_trace_call(g, arc_trace_ev, "r", obj, rc1, rsite);
         }
-        /* 底层系统交互与数据协议契约 */
         LLVMValueRef is_zero = zan_icmp(g->builder, LLVMIntEQ, rc1,
             LLVMConstInt(i64, 0, 0), "iszero");
         LLVMBasicBlockRef free_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "dofree");
@@ -2539,7 +2382,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* 内部辅助实现 */
     {
         if (!g->rt_arr_release) {
             LLVMTypeRef arr_fnty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), release_args, 1, 0);
@@ -2558,7 +2400,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBasicBlockRef ret_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release_dyn, "ret");
         LLVMBuildCondBr(g->builder, is_null, ret_bb, cont);
         LLVMPositionBuilderAtEnd(g->builder, cont);
-        /* 内部辅助实现 */
         LLVMValueRef sent16 = LLVMConstInt(i64, (uint64_t)ZAN_OBJ_RC_OFF, 1);
         LLVMValueRef sent_rc = LLVMBuildLoad2(g->builder, i64,
             LLVMBuildBitCast(g->builder,
@@ -2590,7 +2431,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef siptr = LLVMBuildBitCast(g->builder, sptr, LLVMPointerType(i64, 0), "siptr");
         LLVMValueRef dpp;
         if (!g->desc_hdr) {
-            /* 模块核心语义抽象与接口调用契约 */
             LLVMValueRef site = LLVMBuildLoad2(g->builder, i64, siptr, "site");
             LLVMValueRef bound = LLVMBuildLoad2(g->builder, i64,
                 g->g_site_count, "bound");
@@ -2606,7 +2446,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
             LLVMValueRef hasd = zan_icmp(g->builder, LLVMIntNE, dtor, LLVMConstNull(i8ptr), "hasd");
             LLVMBuildCondBr(g->builder, hasd, calld, fb);
         } else {
-            /* 内部辅助逻辑 */
             LLVMValueRef desc = LLVMBuildLoad2(g->builder, i64, siptr, "desc");
             LLVMValueRef is_arr_magic = zan_icmp(g->builder, LLVMIntEQ, desc,
                 LLVMConstInt(i64, ZAN_ARRAY_MAGIC, 0), "is.arrmagic");
@@ -2649,7 +2488,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* 内部辅助实现 */
     LLVMTypeRef alloc_args[] = { i64, i64, i8ptr };
     LLVMTypeRef alloc_type = LLVMFunctionType(i8ptr, alloc_args, 3, 0);
     g->rt_alloc = LLVMAddFunction(g->mod, "zan_rt_alloc", alloc_type);
@@ -2660,7 +2498,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef size = LLVMGetParam(g->rt_alloc, 0);
         LLVMValueRef site = LLVMGetParam(g->rt_alloc, 1);
         LLVMValueRef name = LLVMGetParam(g->rt_alloc, 2);
-        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef total = zan_add(g->builder, size, LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0), "total");
         LLVMTypeRef malloc_fn_type = LLVMFunctionType(i8ptr, (LLVMTypeRef[]){ i64 }, 1, 0);
         LLVMValueRef raw = zan_call2(g->builder, malloc_fn_type, g->fn_malloc, &total, 1, "raw");
@@ -2668,16 +2505,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         /* refcount = 1 at raw[0..7] */
         LLVMValueRef rc_ptr = LLVMBuildBitCast(g->builder, raw, LLVMPointerType(i64, 0), "rcptr");
         LLVMBuildStore(g->builder, LLVMConstInt(i64, 1, 0), rc_ptr);
-        /* 底层系统交互与数据协议契约 */
         LLVMValueRef eight = LLVMConstInt(i64, (uint64_t)(-ZAN_OBJ_SITE_OFF), 0);
         LLVMValueRef site_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &eight, 1, "sptr");
         LLVMValueRef site_iptr = LLVMBuildBitCast(g->builder, site_ptr, LLVMPointerType(i64, 0), "siptr");
         LLVMBuildStore(g->builder, site, site_iptr);
-        /* 核心系统底层抽象与内存语义契约 */
         LLVMValueRef hdr_off = LLVMConstInt(i64, ZAN_OBJ_HDR_SIZE, 0);
         LLVMValueRef user_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), raw, &hdr_off, 1, "usr");
         if (g->check_leaks) {
-            /* 模块核心语义抽象与接口调用契约 */
             emit_leak_counter_add(g, g->g_live, 1);
             LLVMValueRef ltbl = LLVMBuildLoad2(g->builder,
                 LLVMPointerType(i64, 0), g->g_site_live, "ltbl");
@@ -2693,7 +2527,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRet(g->builder, user_ptr);
     }
 
-    /* 内部辅助实现 */
     {
         LLVMTypeRef str_alloc_args[] = { i64 };
         LLVMTypeRef str_alloc_type = LLVMFunctionType(i8ptr, str_alloc_args, 1, 0);
@@ -2721,7 +2554,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRet(g->builder, user_ptr);
     }
 
-    /* 内部辅助逻辑 */
     for (int rel = 0; rel < 2; rel++) {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8t = LLVMInt8TypeInContext(g->ctx);
@@ -2794,7 +2626,6 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMBuildRetVoid(g->builder);
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     {
         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i8p = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -3000,8 +2831,6 @@ void zan_irgen_destroy(zan_irgen_t *g) {
     g->function_compactor = NULL;
     if (g->builder) LLVMDisposeBuilder(g->builder);
     if (g->mod) LLVMDisposeModule(g->mod);
-    /* 内部辅助实现 */
-    /* if (g->ctx) LLVMContextDispose(g->ctx); */
     if (g->ctx) g->ctx = NULL;
     free(g->functions);
     g->functions = NULL;
@@ -3106,9 +2935,7 @@ void zan_irgen_shard_buf_free(zan_irgen_t *g) {
     g->streaming_shard_count = g->streaming_shard_cap = g->streaming_shard_cur_fns = 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_type_t *subst_method_tp(zan_irgen_t *g, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **bind);
 static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
@@ -3116,25 +2943,21 @@ static int get_or_create_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
                                      zan_type_t *owner_inst);
 static void emit_pending_method_specs(zan_irgen_t *g);
 
-/* 内部辅助实现 */
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 
 static zan_type_t *resolve_type_ctx(zan_irgen_t *g, zan_ast_node_t *tref) {
     zan_type_t *t = zan_binder_resolve_type(g->binder, tref);
     if (g->cur_mtps && t) t = subst_method_tp(g, t, g->cur_mtps, g->cur_mbind);
-    /* 内部辅助实现 */
     if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
     return t;
 }
 
-/* 内部辅助实现 */
 static zan_type_t *field_type_here(zan_irgen_t *g, zan_type_t *t) {
     if (t && g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
     return t;
 }
 
-/* 内部辅助实现 */
 #define ZAN_NULLABLE_PREFIX "zan.nullable."
 
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);
@@ -3150,7 +2973,6 @@ static LLVMTypeRef nullable_payload_type(LLVMTypeRef t) {
     return LLVMStructGetTypeAtIndex(t, 0);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMTypeRef nullable_type_of(zan_irgen_t *g, LLVMTypeRef payload) {
     char name[256];
     size_t off = 0;
@@ -3172,12 +2994,10 @@ static LLVMTypeRef nullable_type_of(zan_irgen_t *g, LLVMTypeRef payload) {
     return st;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef nullable_none(LLVMTypeRef nty) {
     return LLVMConstNull(nty);
 }
 
-/* 内部辅助实现 */
 static LLVMValueRef nullable_some(zan_irgen_t *g, LLVMTypeRef nty, LLVMValueRef v) {
     LLVMTypeRef pl = nullable_payload_type(nty);
     LLVMValueRef fit = coerce_int_to(g, v, pl);
@@ -3199,7 +3019,6 @@ static LLVMValueRef nullable_get_payload(zan_irgen_t *g, LLVMValueRef v) {
 
 static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym);
 
-/* 核心系统底层抽象与内存语义契约 */
 static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
     if (!type || !type->sym) return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = 0; i < g->struct_type_count; i++) {
@@ -3230,7 +3049,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_UINT:   return LLVMInt32TypeInContext(g->ctx);
     case TYPE_ULONG:  return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NINT:   return LLVMInt64TypeInContext(g->ctx);
-    case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx); /* 核心系统底层抽象与内存语义契约 */
+    case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
     case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
@@ -3239,19 +3058,16 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_ENUM:
         return LLVMInt64TypeInContext(g->ctx);
     case TYPE_NULLABLE:
-        /* 内部辅助逻辑 */
         if (type->element_type)
             return nullable_type_of(g, map_type(g, type->element_type));
         return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_DELEGATE: {
-        /* 底层系统交互与数据协议契约 */
         int pc = type->delegate_param_count;
         LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
             (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
         for (int i = 0; i < pc; i++) {
             param_types[i] = map_type(g, type->delegate_param_types[i]);
         }
-        /* 内部辅助实现 */
         LLVMTypeRef ret = type->delegate_is_async
             ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
             : (type->delegate_ret_type
@@ -3265,7 +3081,6 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_CLASS: {
         if (type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0)
             return g->span_struct_type;
-        /* 核心系统底层抽象与内存语义契约 */
         for (int i = 0; i < g->struct_type_count; i++) {
             if (g->struct_types[i].sym == type->sym) {
                 if (type->kind == TYPE_CLASS) {
@@ -3274,14 +3089,12 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
                 return g->struct_types[i].llvm_type;
             }
         }
-        /* 模块核心语义抽象与接口调用契约 */
         return map_tuple_struct(g, type);
     }
     default:          return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     }
 }
 
-/* 内部辅助逻辑 */
 static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
                                    zan_type_t *type) {
     if (!v || !type) return v;
@@ -3300,9 +3113,7 @@ static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
     }
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助实现 */
 static bool class_has_virtual_methods(zan_symbol_t *sym);
 static int class_vptr_offset(zan_symbol_t *sym) {
     return class_has_virtual_methods(sym) ? 1 : 0;
@@ -3333,14 +3144,12 @@ static LLVMValueRef emit_field_ptr(zan_irgen_t *g, zan_symbol_t *type_sym,
                                         e->field_offsets[fi], 0);
         LLVMValueRef raw = LLVMBuildInBoundsGEP2(g->builder,
             LLVMInt8TypeInContext(g->ctx), base, &off, 1, "fld.off");
-        /* 内部辅助实现 */
         LLVMTypeRef wrap = LLVMStructTypeInContext(g->ctx, &e->field_llvm[fi], 1, 0);
         return LLVMBuildStructGEP2(g->builder, wrap, raw, 0, name);
     }
     return LLVMBuildStructGEP2(g->builder, st, base, (unsigned)fi, name);
 }
 
-/* 内部辅助实现 */
 static bool field_member_is_static(zan_symbol_t *m) {
     if (m->modifiers & MOD_STATIC) return true;
     if (m->kind == SYM_FIELD && m->decl &&
@@ -3348,7 +3157,6 @@ static bool field_member_is_static(zan_symbol_t *m) {
     return false;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     int idx = class_vptr_offset(type_sym);
     int found = -1;
@@ -3366,7 +3174,6 @@ static int get_field_index(zan_symbol_t *type_sym, zan_istr_t field_name) {
     return found;
 }
 
-/* 内部辅助逻辑 */
 static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name) {
     zan_class_index_t *ci = class_index_for(type_sym);
     zan_symbol_t *found = NULL;
@@ -3382,7 +3189,6 @@ static zan_symbol_t *get_field_sym(zan_symbol_t *type_sym, zan_istr_t field_name
 }
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_name) {
-    /* 核心系统底层抽象与内存语义契约 */
     zan_class_index_t *ci = class_index_for(type_sym);
     for (int i = member_first_named(ci, method_name); i >= 0;
          i = member_next_named(ci, i)) {
@@ -3390,11 +3196,9 @@ static zan_symbol_t *get_method_sym(zan_symbol_t *type_sym, zan_istr_t method_na
         if (m->kind == SYM_METHOD && member_name_is(m, method_name))
             return m;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         return get_method_sym(type_sym->type->base_type->sym, method_name);
     }
-    /* 内部辅助实现 */
     if (type_sym->kind == SYM_INTERFACE && type_sym->type) {
         for (int i = 0; i < type_sym->type->interface_count; i++) {
             zan_type_t *it = type_sym->type->interfaces[i];
@@ -3417,7 +3221,6 @@ static zan_symbol_t *method_sym_for_decl(zan_symbol_t *type_sym, zan_ast_node_t 
     return NULL;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int method_is_params_variadic(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->method_decl.params.count == 0) return 0;
     zan_ast_node_t *last =
@@ -3425,12 +3228,10 @@ static int method_is_params_variadic(zan_symbol_t *m) {
     return last->kind == AST_PARAM && last->param.is_params;
 }
 
-/* 内部辅助实现 */
 static int method_accepts_arity(zan_symbol_t *m, int argc) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
     int pc = m->decl->method_decl.params.count;
     if (pc == argc) return 1;
-    /* 底层系统交互与数据协议契约 */
     if (m->decl->method_decl.is_variadic && argc > pc) return 1;
     if (method_is_params_variadic(m) && argc >= pc - 1) return 1;
     if (argc < pc) {
@@ -3443,7 +3244,6 @@ static int method_accepts_arity(zan_symbol_t *m, int argc) {
     return 0;
 }
 
-/* 内部辅助实现 */
 static int method_type_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return 0;
     return m->decl->method_decl.type_params.count;
@@ -3463,7 +3263,6 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
                 method_type_param_count(m) != type_arg_count)
                 continue;
             if (m->decl && method_accepts_arity(m, argc)) {
-                /* 内部辅助逻辑 */
                 if (method_is_params_variadic(m)) {
                     if (!variadic) variadic = m;
                 } else {
@@ -3480,7 +3279,6 @@ static zan_symbol_t *resolve_overload(zan_symbol_t *type_sym, zan_istr_t name,
     return NULL;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static zan_symbol_t *resolve_iface_overload_depth(zan_symbol_t *iface,
                                                    zan_istr_t name, int argc,
                                                    int type_arg_count,
@@ -3514,7 +3312,6 @@ static bool decl_is_explicit_layout(zan_symbol_t *sym) {
            sym->decl->type_decl.is_explicit_layout;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     if (!field->decl) return false;
     zan_ast_list_t *attrs = zan_ast_attributes(field->decl);
@@ -3532,7 +3329,6 @@ static bool field_offset_attr(zan_symbol_t *field, unsigned long *out) {
     return false;
 }
 
-/* 内部辅助实现 */
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
 static unsigned long abi_size_of(LLVMTypeRef t);
@@ -3560,7 +3356,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
                                  g->struct_type_count + 1,
                                  sizeof(*g->struct_types));
 
-    /* 内部辅助实现 */
     char name_buf[256];
     snprintf(name_buf, sizeof(name_buf), "struct.%.*s", (int)sym->name.len, sym->name.str);
     LLVMTypeRef st = LLVMStructCreateNamed(g->ctx, name_buf);
@@ -3568,7 +3363,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     g->struct_types[g->struct_type_count].llvm_type = st;
     g->struct_type_count++;
 
-    /* 模块核心语义抽象与接口调用契约 */
     int field_count = 0;
     for (int i = 0; i < sym->member_count; i++) {
         if ((sym->members[i]->kind == SYM_FIELD ||
@@ -3576,7 +3370,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
             !field_member_is_static(sym->members[i])) field_count++;
     }
 
-    /* 内部辅助逻辑 */
     int vptr = class_has_virtual_methods(sym) ? 1 : 0;
     LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)(field_count + vptr), sizeof(LLVMTypeRef));
     int fi = 0;
@@ -3598,7 +3391,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     entry->explicit_layout = decl_is_explicit_layout(sym);
 
     if (!entry->explicit_layout) {
-        /* 内部辅助实现 */
         LLVMStructSetBody(st, field_types, (unsigned)(field_count + vptr), 0);
         return;
     }
@@ -3608,7 +3400,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     unsigned long size = 0, align = 1;
     int slot = vptr;
     if (vptr) {
-        /* 内部辅助实现 */
         zan_diag_emit(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0),
                       "explicit-layout type '%.*s' cannot have virtual methods",
                       (int)sym->name.len, sym->name.str);
@@ -3638,7 +3429,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     }
     if (size % align) size += align - size % align;
 
-    /* 内部辅助实现 */
     LLVMTypeRef body[2];
     unsigned nbody = 0;
     body[nbody++] = LLVMIntTypeInContext(g->ctx, (unsigned)(align * 8));
@@ -3648,7 +3438,6 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     LLVMStructSetBody(st, body, nbody, 0);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static bool class_has_virtual_methods(zan_symbol_t *sym) {
     for (int i = 0; i < sym->member_count; i++) {
@@ -3657,9 +3446,7 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
             return true;
         }
     }
-    /* 内部辅助实现 */
     if (sym->type && sym->type->interface_count > 0) return true;
-    /* 核心系统底层抽象与内存语义契约 */
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         return class_has_virtual_methods(sym->type->base_type->sym);
     }
@@ -3668,11 +3455,9 @@ static bool class_has_virtual_methods(zan_symbol_t *sym) {
 
 static int count_virtual_methods(zan_symbol_t *sym) {
     int count = 0;
-    /* 核心系统底层抽象与内存语义契约 */
     if (sym->type && sym->type->base_type && sym->type->base_type->sym) {
         count = count_virtual_methods(sym->type->base_type->sym);
     }
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < sym->member_count; i++) {
         if (sym->members[i]->kind == SYM_METHOD &&
             (sym->members[i]->modifiers & MOD_VIRTUAL) &&
@@ -3683,7 +3468,6 @@ static int count_virtual_methods(zan_symbol_t *sym) {
     return count;
 }
 
-/* 内部辅助逻辑 */
 static int method_declared_param_count(zan_symbol_t *m) {
     if (!m || !m->decl || m->decl->kind != AST_METHOD_DECL) return -1;
     return m->decl->method_decl.params.count;
@@ -3692,12 +3476,10 @@ static int method_declared_param_count(zan_symbol_t *m) {
 static int get_virtual_method_index(zan_symbol_t *type_sym,
                                     zan_symbol_t *method_sym) {
     if (!method_sym) return -1;
-    /* 模块核心语义抽象与接口调用契约 */
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         int idx = get_virtual_method_index(type_sym->type->base_type->sym, method_sym);
         if (idx >= 0) return idx;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     int base_count = 0;
     if (type_sym->type && type_sym->type->base_type && type_sym->type->base_type->sym) {
         base_count = count_virtual_methods(type_sym->type->base_type->sym);
@@ -3709,7 +3491,6 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
         if (m->kind == SYM_METHOD &&
             (m->modifiers & MOD_VIRTUAL) &&
             !(m->modifiers & MOD_OVERRIDE)) {
-            /* 内部辅助实现 */
             if (member_name_is(m, method_sym->name) &&
                 method_declared_param_count(m) == want) {
                 return idx;
@@ -3720,7 +3501,6 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
     return -1;
 }
 
-/* 底层系统交互与数据协议契约 */
 
 #define INITIAL_LOCALS 16
 
@@ -3728,38 +3508,23 @@ typedef struct {
     zan_istr_t name;
     LLVMValueRef alloca;
     zan_type_t *type;
-    /* 内部辅助实现 */
     int arc_owned;
-    /* 内部辅助逻辑 */
     LLVMValueRef arr_len_slot;
-    /* 内部辅助逻辑 */
     int eh_slot;
-    /* 内部辅助实现 */
     LLVMValueRef box_cell;
-    /* 模块核心语义抽象与接口调用契约 */
     LLVMValueRef box_owner_slot;
-    /* 内部辅助实现 */
     int          box_owned;
-    /* 内部辅助实现 */
     int          opaque_string;
-    /* 内部辅助实现 */
     LLVMValueRef obj_rc_flag;
-    /* 内部辅助逻辑 */
     int          byref_slot;
-    /* 内部辅助实现 */
     zan_ast_node_t *binding_decl;
-    /* 内部辅助逻辑 */
     zan_ast_node_t *async_decl;
-    int async_role; /* 模块核心语义抽象与接口调用契约 */
-    /* 内部辅助逻辑 */
+    int async_role;
     int frame_owner;
-    /* 内部辅助逻辑 */
     int struct_rc;
-    /* 内部辅助实现 */
     int per_iteration;
 } local_var_t;
 
-/* 底层系统交互与数据协议契约 */
 typedef struct {
     zan_ast_node_t *decl;
     LLVMValueRef cell;
@@ -3795,14 +3560,12 @@ static local_scope_t *local_scope_new(zan_arena_t *arena) {
     return s;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type);
 static LLVMTypeRef local_slot_type(zan_irgen_t *g, local_var_t *v) {
     if (LLVMIsAAllocaInst(v->alloca)) return LLVMGetAllocatedType(v->alloca);
     return map_type(g, v->type);
 }
 
-/* 内部辅助实现 */
 static unsigned g_local_gen;
 
 static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca, zan_type_t *type) {
@@ -3836,7 +3599,6 @@ static void local_add(local_scope_t *scope, zan_istr_t name, LLVMValueRef alloca
     scope->vars[scope->count].struct_rc = 0;
     scope->vars[scope->count].per_iteration = 0;
     scope->count++;
-    /* 模块核心语义抽象与接口调用契约 */
     di_declare_var(g_di_emit_ctx, name, alloca, type);
 }
 
@@ -3848,7 +3610,6 @@ static LLVMValueRef emit_entry_alloca(zan_irgen_t *g, LLVMTypeRef ty, const char
     if (term) LLVMPositionBuilderBefore(g->builder, term);
     else LLVMPositionBuilderAtEnd(g->builder, entry);
     LLVMValueRef alloca = LLVMBuildAlloca(g->builder, ty, name);
-    /* 内部辅助逻辑 */
     if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
         LLVMBuildStore(g->builder, LLVMConstNull(ty), alloca);
     LLVMPositionBuilderAtEnd(g->builder, cur);
@@ -3865,7 +3626,6 @@ static local_var_t *local_find(local_scope_t *scope, zan_istr_t name) {
     return NULL;
 }
 
-/* 编译期中间表示与代码生成内部规范 */
 enum {
     ASYNC_LOCAL_VALUE = 0,
     ASYNC_FOREACH_INDEX,
@@ -3887,7 +3647,6 @@ static local_var_t *local_find_async_decl(local_scope_t *scope, zan_ast_node_t *
     return local_find_async_role(scope, decl, ASYNC_LOCAL_VALUE);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static local_var_t *local_find_binding_decl(local_scope_t *scope,
                                             zan_ast_node_t *decl) {
     if (!scope || !decl) return NULL;
@@ -3924,13 +3683,11 @@ static pattern_binding_t *local_add_pattern_binding(local_scope_t *scope,
     return p;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int type_named(zan_type_t *t, const char *n, int len) {
     return t && t->kind != TYPE_ARRAY && t->name.str &&
            (int)t->name.len == len && memcmp(t->name.str, n, (size_t)len) == 0;
 }
 
-/* 内部辅助实现 */
 static int is_builtin_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -3939,7 +3696,6 @@ static int is_builtin_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* 内部辅助实现 */
 static int is_rc_collection_type(zan_type_t *t) {
     if (!t || t->kind != TYPE_CLASS) return 0;
     zan_istr_t n = t->name;
@@ -3948,10 +3704,8 @@ static int is_rc_collection_type(zan_type_t *t) {
            (n.len == 13 && memcmp(n.str, "StringBuilder", 13) == 0);
 }
 
-/* 内部辅助实现 */
 static int is_arc_managed_type(zan_type_t *t) {
     if (!t) return 0;
-    /* 内部辅助实现 */
     if (t->kind == TYPE_INTERFACE) return 1;
     if (t->kind != TYPE_CLASS) return 0;
     if (is_builtin_collection_type(t)) return is_rc_collection_type(t);
@@ -3959,7 +3713,6 @@ static int is_arc_managed_type(zan_type_t *t) {
 }
 
 static int is_rc_managed_type(zan_type_t *t) {
-    /* 内部辅助实现 */
     return t && (t->kind == TYPE_STRING || t->kind == TYPE_DELEGATE ||
                  t->kind == TYPE_ARRAY || is_arc_managed_type(t));
 }
@@ -3981,10 +3734,8 @@ static void emit_struct_local_release(zan_irgen_t *g, zan_type_t *type,
                                       LLVMValueRef slot);
 static LLVMValueRef zan_store_fit(zan_irgen_t *g, LLVMValueRef val, LLVMValueRef ptr);
 
-/* 模块核心语义抽象与接口调用契约 */
 static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     for (int i = 0; i < locals->count; i++) {
-        /* 模块核心语义抽象与接口调用契约 */
         if (locals->vars[i].box_cell) continue;
         if (locals->vars[i].obj_rc_flag) {
             emit_release_obj_local(g, &locals->vars[i]);
@@ -4000,7 +3751,6 @@ static void release_all_arc_locals(zan_irgen_t *g, local_scope_t *locals) {
     }
 }
 
-/* 内部辅助实现 */
 static unsigned llvm_scalar_size(LLVMTypeRef t) {
     switch (LLVMGetTypeKind(t)) {
     case LLVMIntegerTypeKind: return (LLVMGetIntTypeWidth(t) + 7) / 8;
@@ -4013,7 +3763,7 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
         for (unsigned i = 0; i < n; i++) {
             unsigned fs = llvm_scalar_size(LLVMStructGetTypeAtIndex(t, i));
             if (!fs) return 0;
-            if (fs > 1 && total % fs) total += fs - (total % fs);  /* 核心系统底层抽象与内存语义契约 */
+            if (fs > 1 && total % fs) total += fs - (total % fs);
             total += fs;
         }
         return total;
@@ -4022,7 +3772,6 @@ static unsigned llvm_scalar_size(LLVMTypeRef t) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
     if (!elem || elem->kind != TYPE_STRUCT) return 1;
     LLVMTypeRef st = map_type(g, elem);
@@ -4032,7 +3781,6 @@ static unsigned elem_slot_words(zan_irgen_t *g, zan_type_t *elem) {
     return (sz + 7) / 8;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
                                     unsigned words) {
     if (words <= 1) return idx;
@@ -4040,7 +3788,6 @@ static LLVMValueRef slot_word_index(zan_irgen_t *g, LLVMValueRef idx,
                    LLVMConstInt(LLVMTypeOf(idx), words, 0), "slot.wi");
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_t *at) {
     if (llvm_scalar_size(st)) return;
     zan_loc_t loc; memset(&loc, 0, sizeof(loc));
@@ -4050,7 +3797,6 @@ static void check_struct_fits_slot(zan_irgen_t *g, LLVMTypeRef st, zan_ast_node_
         "cannot compute its layout; use a class instead");
 }
 
-/* 内部辅助实现 */
 static void store_struct_in_slot(zan_irgen_t *g, LLVMValueRef v,
                                  LLVMValueRef slot_ptr, zan_ast_node_t *at) {
     LLVMTypeRef st = LLVMTypeOf(v);
@@ -4067,7 +3813,6 @@ static LLVMValueRef load_struct_from_slot(zan_irgen_t *g, LLVMValueRef slot_ptr,
     return LLVMBuildLoad2(g->builder, st, sp, "slot.struct");
 }
 
-/* 内部辅助实现 */
 static LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
                                         zan_type_t *elem_type,
                                         LLVMTypeRef slot_ty) {
@@ -4084,7 +3829,6 @@ static LLVMValueRef extend_int_for_slot(zan_irgen_t *g, LLVMValueRef v,
                : LLVMBuildSExt(g->builder, v, slot_ty, "slot.sx");
 }
 
-/* 内部辅助实现 */
 static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                                        LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
                                        LLVMValueRef value,
@@ -4104,12 +3848,10 @@ static LLVMValueRef get_calloc_fn(zan_irgen_t *g) {
     return f;
 }
 
-/* 内部辅助逻辑 */
 static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *expr,
                                              long size, int coll_kind,
                                              zan_type_t *elem_type) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    /* 内部辅助实现 */
     if (g->cur_inst) elem_type = subst_type_param_deep(g, elem_type, g->cur_inst);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
     int site_idx = reserve_arc_site(g, NULL, NULL, coll_kind, elem_type);
@@ -4133,7 +3875,6 @@ static LLVMValueRef emit_alloc_rc_collection(zan_irgen_t *g, zan_ast_node_t *exp
     return zan_call2(g->builder, alloc_fn_type, g->rt_alloc, args, 3, "coll");
 }
 
-/* 内部辅助实现 */
 
 static int eh_slot_kind_of(zan_type_t *t) {
     if (!t) return ZAN_EH_SLOT_OBJ;
@@ -4143,7 +3884,6 @@ static int eh_slot_kind_of(zan_type_t *t) {
     return ZAN_EH_SLOT_OBJ;
 }
 
-/* 内部辅助实现 */
 static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     if (g->fn_itoa64) return g->fn_itoa64;
     LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
@@ -4169,7 +3909,6 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     LLVMValueRef zero64 = LLVMConstInt(i64, 0, 0);
     LLVMValueRef ten = LLVMConstInt(i64, 10, 0);
     LLVMValueRef one = LLVMConstInt(i64, 1, 0);
-    /* 内部辅助实现 */
     LLVMValueRef cap = LLVMConstInt(i64, 24, 0);
 
     LLVMPositionBuilderAtEnd(g->builder, entry);
@@ -4178,7 +3917,6 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
         LLVMBuildICmp(g->builder, LLVMIntSLT, v, zero64, "itoa.slt"),
         LLVMBuildICmp(g->builder, LLVMIntEQ, uns,
                       LLVMConstInt(i32, 0, 0), "itoa.signed"), "itoa.neg");
-    /* 内部辅助逻辑 */
     LLVMValueRef mag = LLVMBuildSelect(g->builder, is_neg,
         LLVMBuildNeg(g->builder, v, "itoa.negv"), v, "itoa.mag");
     LLVMBuildBr(g->builder, digit);
@@ -4232,7 +3970,6 @@ static LLVMValueRef get_itoa64_fn(zan_irgen_t *g) {
     return fn;
 }
 
-/* 内部辅助实现 */
 static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
                                    LLVMValueRef v, int is_unsigned) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -4245,7 +3982,6 @@ static LLVMValueRef emit_itoa_into(zan_irgen_t *g, LLVMValueRef buf,
     return zan_call2(g->builder, fn_ty, fn, args, 3, "itoa");
 }
 
-/* 内部辅助实现 */
 static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
                          LLVMValueRef v) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
@@ -4262,7 +3998,6 @@ static void emit_dbl_str(zan_irgen_t *g, LLVMValueRef buf, LLVMValueRef cap,
     zan_call2(g->builder, fn_ty, fn, args, 3, "");
 }
 
-/* 内部辅助实现 */
 static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     if (!g->function_compactor || zan_diag_has_errors(g->diag)) return;
     char error[4096];
@@ -4273,7 +4008,6 @@ static void zan_irgen_compact_completed(zan_irgen_t *g, LLVMValueRef fn) {
     }
 }
 
-/* 内部辅助实现 */
 #include "irgen_expr_core.c"
 #include "irgen_weak.c"
 #include "irgen_arc.c"

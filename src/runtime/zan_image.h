@@ -3,7 +3,6 @@
 
 #include "zan_bitmap.h"
 
-/* 底层系统交互与数据协议契约 */
 #ifndef ZAN_IMAGE_EXPORT
 #define ZAN_IMAGE_EXPORT
 #endif
@@ -16,7 +15,6 @@ extern "C" {
 extern ZAN_IMAGE_EXPORT int32_t zan_image_width(const char *key);
 extern ZAN_IMAGE_EXPORT int32_t zan_image_height(const char *key);
 extern ZAN_IMAGE_EXPORT void zan_image_evict(const char *key);
-/* 底层系统交互与数据协议契约 */
 extern ZAN_IMAGE_EXPORT const char *zan_image_mem_report(void);
 
 /* 注册或查询内存图像键 (以 "mem:" 为前缀)，成功返回宽度，失败返回 0 */

@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 #include "json.h"
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +66,6 @@ void json_arr_add(json_value *arr, json_value *val) {
     arr->as.arr.items[arr->as.arr.count++] = val;
 }
 
-/* 内部辅助逻辑 */
 static uint64_t json_key_hash(const char *s) {
     uint64_t h = 1469598103934665603ULL;
     while (*s) {
@@ -77,7 +75,6 @@ static uint64_t json_key_hash(const char *s) {
     return h;
 }
 
-/* 内部辅助逻辑 */
 static int json_obj_index_find(const json_value *obj, const char *key,
                                uint64_t h) {
     int cap = obj->as.obj.index_cap;
@@ -103,12 +100,9 @@ static void json_obj_index_insert(json_value *obj, const char *key,
     obj->as.obj.index[i] = ordinal + 1;
 }
 
-/* 内部辅助逻辑 */
 static void json_obj_index_rebuild(json_value *obj) {
-    /* 内部辅助逻辑 */
     long long want = obj->as.obj.cap > 8 ? obj->as.obj.cap : 8;
     if (want > (INT_MAX >> 2)) {
-        /* 内部辅助逻辑 */
         free(obj->as.obj.index);
         obj->as.obj.index = NULL;
         obj->as.obj.index_cap = 0;
@@ -127,7 +121,6 @@ static void json_obj_index_rebuild(json_value *obj) {
 void json_obj_set(json_value *obj, const char *key, json_value *val) {
     if (!obj || obj->type != JSON_OBJ || !key || !val) return;
 
-    /* 内部辅助逻辑 */
     int found = -1;
     if (obj->as.obj.index) {
         found = json_obj_index_find(obj, key, json_key_hash(key));
@@ -143,7 +136,6 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
     }
 
     if (obj->as.obj.count >= obj->as.obj.cap) {
-        /* 核心系统底层抽象与内存语义契约 */
         if (obj->as.obj.cap > INT_MAX / 2) { json_free(val); return; }
         int nc = obj->as.obj.cap ? obj->as.obj.cap * 2 : 8;
         char **nk = (char **)realloc(obj->as.obj.keys, sizeof(char *) * (size_t)nc);
@@ -166,7 +158,6 @@ void json_obj_set(json_value *obj, const char *key, json_value *val) {
     obj->as.obj.vals[obj->as.obj.count] = val;
     obj->as.obj.count++;
 
-    /* 内部辅助逻辑 */
     if (!obj->as.obj.index) {
         if (obj->as.obj.count >= 16) json_obj_index_rebuild(obj);
     } else if ((long long)(obj->as.obj.count + 1) * 2 >
@@ -270,7 +261,6 @@ typedef struct {
     int depth;
 } jparser;
 
-/* 内部辅助逻辑 */
 #define JSON_MAX_DEPTH 1024
 
 static void jp_skip_ws(jparser *j) {
@@ -283,7 +273,7 @@ static json_value *jp_value(jparser *j);
 
 static json_value *jp_string(jparser *j) {
     if (j->p >= j->end || *j->p != '"') { j->ok = false; return NULL; }
-    j->p++; /* 核心系统底层抽象与内存语义契约 */
+    j->p++;
     size_t cap = 16, len = 0;
     char *buf = (char *)malloc(cap);
     if (!buf) { j->ok = false; return NULL; }
@@ -301,7 +291,6 @@ static json_value *jp_string(jparser *j) {
             case '\\': c = '\\'; break;
             case '"': c = '"';  break;
             case 'u': {
-                /* 底层系统交互与数据协议契约 */
                 if (j->end - j->p < 4) { j->ok = false; free(buf); return NULL; }
                 unsigned code = 0;
                 for (int i = 0; i < 4; i++) {
@@ -312,7 +301,6 @@ static json_value *jp_string(jparser *j) {
                     else if (h >= 'A' && h <= 'F') code |= (unsigned)(h - 'A' + 10);
                     else { j->ok = false; free(buf); return NULL; }
                 }
-                /* 内部辅助逻辑 */
                 if (code == 0) { j->ok = false; free(buf); return NULL; }
                 if (code >= 0xD800 && code <= 0xDBFF &&
                     j->end - j->p >= 6 && j->p[0] == '\\' && j->p[1] == 'u') {
@@ -328,12 +316,11 @@ static json_value *jp_string(jparser *j) {
                     }
                     /* UTF-16 高低代理对严格配对校验 */
                     if (lo < 0xDC00 || lo > 0xDFFF) {
-                        code = 0xFFFD;      /* 核心系统底层抽象与内存语义契约 */
+                        code = 0xFFFD;
                     } else {
                         code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
                     }
                 } else if (code >= 0xD800 && code <= 0xDFFF) {
-                    /* 内部辅助逻辑 */
                     code = 0xFFFD;
                 }
                 char utf8[4];
@@ -365,7 +352,6 @@ static json_value *jp_string(jparser *j) {
                 continue;
             }
             default:
-                /* 底层系统交互与数据协议契约 */
                 free(buf); j->ok = false; return NULL;
             }
         }
@@ -379,7 +365,7 @@ static json_value *jp_string(jparser *j) {
         buf[len++] = c;
     }
     if (j->p >= j->end) { free(buf); j->ok = false; return NULL; }
-    j->p++; /* 核心系统底层抽象与内存语义契约 */
+    j->p++;
     buf[len] = '\0';
     json_value *v = json_alloc(JSON_STR);
     if (!v) { free(buf); j->ok = false; return NULL; }
@@ -486,7 +472,6 @@ json_value *json_parse(const char *text) {
     j.depth = 0;
     json_value *v = jp_value(&j);
     if (!j.ok) { json_free(v); return NULL; }
-    /* 内部辅助逻辑 */
     jp_skip_ws(&j);
     if (j.p != j.end) { json_free(v); return NULL; }
     return v;
@@ -498,14 +483,13 @@ typedef struct {
     char  *buf;
     size_t len;
     size_t cap;
-    int    oom;     /* 内部辅助逻辑 */
+    int    oom;
 } sbuf;
 
 static void sb_ensure(sbuf *s, size_t extra) {
     if (s->len + extra + 1 > s->cap) {
         size_t nc = s->cap ? s->cap * 2 : 256;
         while (nc < s->len + extra + 1) nc *= 2;
-        /* 内部辅助逻辑 */
         char *g = (char *)realloc(s->buf, nc);
         if (!g) { s->oom = 1; return; }
         s->buf = g;
@@ -561,7 +545,6 @@ static void sb_put_value(sbuf *s, const json_value *v) {
     case JSON_BOOL: sb_puts(s, v->as.b ? "true" : "false"); break;
     case JSON_NUM: {
         double n = v->as.num;
-        /* 内部辅助逻辑 */
         if (!isfinite(n)) { sb_puts(s, "null"); break; }
         char tmp[64];
         if (n == floor(n) && fabs(n) < 1e15) {
@@ -599,6 +582,6 @@ char *json_serialize(const json_value *v) {
     sb_put_value(&s, v);
     if (!s.buf) { s.buf = (char *)malloc(1); s.cap = 1; s.len = 0; }
     if (!s.oom) s.buf[s.len] = '\0';
-    else if (s.cap > 0) s.buf[0] = '\0';   /* 核心系统底层抽象与内存语义契约 */
+    else if (s.cap > 0) s.buf[0] = '\0';
     return s.buf;
 }

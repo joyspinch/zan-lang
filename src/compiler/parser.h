@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #ifndef ZAN_PARSER_H
 #define ZAN_PARSER_H
@@ -13,19 +12,17 @@ struct zan_parser {
     zan_diag_t *diag;
     zan_token_t current;
     zan_token_t previous;
-    int expr_depth; /* 底层系统交互与数据协议契约 */
-    int expr_tail_depth; /* 底层系统交互与数据协议契约 */
-    bool expr_depth_reported; /* 内部辅助逻辑 */
-    int stmt_depth; /* 底层系统交互与数据协议契约 */
-    int type_depth; /* 底层系统交互与数据协议契约 */
-    int type_no_nullable; /* 内部辅助逻辑 */
-    int checked_depth; /* 核心系统底层抽象与内存语义契约 */
-    int unchecked_depth; /* 核心系统底层抽象与内存语义契约 */
-    int synth_counter; /* 底层系统交互与数据协议契约 */
-    bool chain_cap_reported; /* 内部辅助逻辑 */
-    /* 内部辅助逻辑 */
+    int expr_depth;
+    int expr_tail_depth;
+    bool expr_depth_reported;
+    int stmt_depth;
+    int type_depth;
+    int type_no_nullable;
+    int checked_depth;
+    int unchecked_depth;
+    int synth_counter;
+    bool chain_cap_reported;
     zan_ast_list_t pending_members;
-    /* 内部辅助逻辑 */
     zan_ast_list_t pending_stmts;
 };
 
@@ -38,10 +35,8 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
 void zan_parser_desugar_events(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag);
-/* 核心系统底层抽象与内存语义契约 */
 void zan_parser_flatten_nested_types(zan_ast_node_t *unit, zan_arena_t *arena,
                                      zan_diag_t *diag);
-/* 内部辅助逻辑 */
 void zan_parser_specialize_generic_bases(zan_ast_node_t *unit, zan_arena_t *arena,
                                          zan_diag_t *diag);
 

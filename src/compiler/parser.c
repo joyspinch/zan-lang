@@ -1,4 +1,3 @@
-/* 模块核心语义抽象与接口调用契约 */
 
 #include "parser.h"
 #include "arena.h"
@@ -8,7 +7,6 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
-/* 模块核心语义抽象与接口调用契约 */
 #define ZAN_PARSER_MAX_TYPE_DEPTH 4096
 
 static void parser_advance(zan_parser_t *p) {
@@ -43,7 +41,6 @@ static zan_ast_node_t *parser_error_node(zan_parser_t *p) {
     return zan_ast_new(p->arena, AST_INT_LITERAL, p->current.loc);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void parser_expect_gt(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_GREATER:
@@ -81,7 +78,6 @@ static bool looks_like_var_decl(zan_parser_t *p);
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p);
 static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers);
 
-/* 内部辅助逻辑 */
 static void splice_pending_stmts(zan_parser_t *p, zan_ast_list_t *list) {
     for (int i = 0; i < p->pending_stmts.count; i++) {
         zan_ast_list_push(list, p->pending_stmts.items[i], p->arena);
@@ -100,7 +96,6 @@ static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               bool *out_variadic);
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit);
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     parser_advance(p);
     zan_loc_t dloc = p->current.loc;
@@ -133,7 +128,6 @@ static zan_ast_node_t *parse_delegate_decl(zan_parser_t *p, uint32_t mods) {
     return ddecl;
 }
 
-/* 内部辅助实现 */
 static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
     /* 解析类型特性：保留特性元数据，[StructLayout] 触发 C 内存布局对齐 */
     bool has_c_layout = false;
@@ -160,7 +154,6 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
 
     uint32_t mods = parse_modifiers(p);
 
-    /* 底层系统交互与数据协议契约 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
         memcmp(p->current.str_val.str, "partial", 7) == 0) {
         zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
@@ -170,7 +163,6 @@ static bool parse_top_level_decl(zan_parser_t *p, zan_ast_node_t *unit) {
         }
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 6 &&
         memcmp(p->current.str_val.str, "record", 6) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -224,7 +216,6 @@ static zan_ast_node_t *parse_qualified_name(zan_parser_t *p) {
     return node;
 }
 
-/* 内部辅助逻辑 */
 static int array_suffix_rank(zan_parser_t *p) {
     zan_lexer_t *lx = p->lex;
     const char *s = lx->source;
@@ -251,11 +242,9 @@ static int array_suffix_rank(zan_parser_t *p) {
 static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* 内部辅助逻辑 */
     int nn_top = p->type_no_nullable;
     p->type_no_nullable = 0;
 
-    /* 内部辅助逻辑 */
     if (++p->type_depth > ZAN_PARSER_MAX_TYPE_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, loc,
                       "type nesting too deep (max %d)",
@@ -264,7 +253,6 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         return parser_error_node(p);
     }
 
-    /* 内部辅助逻辑 */
     if (parser_check(p, TK_LPAREN)) {
         parser_advance(p);
         zan_ast_node_t *tn = zan_ast_new(p->arena, AST_TUPLE_TYPE, loc);
@@ -272,10 +260,8 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
             zan_ast_node_t *et = parse_type_ref(p);
             zan_ast_list_push(&tn->tuple_type.elems, et, p->arena);
-            /* 模块核心语义抽象与接口调用契约 */
             if (p->current.kind == TK_IDENT &&
                 !(et->kind == AST_TYPE_REF && et->type_ref.is_array)) {
-                /* 内部辅助逻辑 */
                 parser_advance(p);
             }
             if (!parser_match(p, TK_COMMA)) break;
@@ -314,7 +300,6 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     } else if (parser_check(p, TK_IDENT)) {
         parser_advance(p);
         name = p->previous.str_val;
-        /* 核心系统底层抽象与内存语义契约 */
         if (parser_check(p, TK_DOT) &&
             zan_lexer_peek(p->lex).kind == TK_IDENT) {
             char qbuf[512];
@@ -355,18 +340,15 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
         parser_expect_gt(p);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     int ranks[16];
     int nranks = 0;
     bool seen_array = false;
     for (;;) {
         if (nn_top && parser_check(p, TK_QUESTION)) {
-            /* 内部辅助逻辑 */
             break;
         }
         if (parser_match(p, TK_QUESTION)) {
             if (seen_array) {
-                /* 核心系统底层抽象与内存语义契约 */
             } else {
                 type_node->type_ref.is_nullable = true;
             }
@@ -379,7 +361,6 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
             if (rank <= 16 && nranks < 16) {
                 ranks[nranks++] = rank;
             } else {
-                /* 内部辅助逻辑 */
                 zan_diag_emit(p->diag, DIAG_ERROR, loc,
                               "array rank specifier is too deep (max 16)");
             }
@@ -407,13 +388,11 @@ static zan_ast_node_t *parse_type_ref(zan_parser_t *p) {
     return type_node;
 }
 
-/* 内部辅助逻辑 */
 static bool is_init_accessor_kw(zan_parser_t *p) {
     return p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
            memcmp(p->current.str_val.str, "init", 4) == 0;
 }
 
-/* 内部辅助逻辑 */
 static bool is_checked_use(zan_parser_t *p) {
     if (p->current.kind != TK_IDENT) return false;
     const char *s = p->current.str_val.str;
@@ -439,21 +418,18 @@ static uint32_t parse_modifiers(zan_parser_t *p) {
         case TK_ABSTRACT:  parser_advance(p); mods |= MOD_ABSTRACT;  break;
         case TK_SEALED:    parser_advance(p); mods |= MOD_SEALED;    break;
         case TK_READONLY:  parser_advance(p); mods |= MOD_READONLY;  break;
-        /* 内部辅助逻辑 */
         case TK_CONST:     parser_advance(p);
                            mods |= MOD_STATIC | MOD_READONLY; break;
         case TK_EXTERN:    parser_advance(p); mods |= MOD_EXTERN;    break;
         case TK_ASYNC:     parser_advance(p); mods |= MOD_ASYNC;     break;
         case TK_UNSAFE:    parser_advance(p); mods |= MOD_UNSAFE;    break;
         case TK_WEAK:      parser_advance(p); mods |= MOD_WEAK;      break;
-        /* 核心系统底层抽象与内存语义契约 */
         case TK_REF:       parser_advance(p); mods |= MOD_REF;       break;
         default: return mods;
         }
     }
 }
 
-/* 内部辅助逻辑 */
 static bool paren_is_lambda(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
@@ -504,7 +480,6 @@ static bool paren_is_named_cast(zan_parser_t *p) {
     return result;
 }
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
     if (parser_check(p, TK_IDENT)) {
@@ -531,7 +506,6 @@ static zan_ast_node_t *parse_lambda_param(zan_parser_t *p) {
     return pn;
 }
 
-/* 底层系统交互与数据协议契约 */
 static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, loc);
     zan_ast_list_init(&n->lambda.params);
@@ -553,7 +527,6 @@ static zan_ast_node_t *parse_lambda_paren(zan_parser_t *p, zan_loc_t loc) {
 
 static bool is_type_kw(zan_token_kind_t k);
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_call_arg(zan_parser_t *p);
 
 static zan_ast_node_t *parse_primary(zan_parser_t *p) {
@@ -584,7 +557,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (is_type_kw(p->current.kind) && zan_lexer_peek(p->lex).kind == TK_DOT) {
         const char *nm = zan_token_kind_name(p->current.kind);
         parser_advance(p);
@@ -593,7 +565,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (p->current.kind == TK_IDENT && p->current.str_val.len == 4 &&
         memcmp(p->current.str_val.str, "from", 4) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -613,7 +584,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             n->query.group_key = NULL;
             n->query.group_into = (zan_istr_t){ NULL, 0 };
             n->query.select = NULL;
-            /* 内部辅助逻辑 */
             for (;;) {
                 if (parser_match(p, TK_WHERE)) {
                     zan_ast_node_t *wc = zan_ast_new(p->arena, AST_QUERY_WHERE,
@@ -700,7 +670,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 }
                 break;
             }
-            /* 内部辅助逻辑 */
             if (p->current.kind == TK_IDENT &&
                 p->current.str_val.len == 5 &&
                 memcmp(p->current.str_val.str, "group", 5) == 0) {
@@ -768,7 +737,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_INTERP_START: {
-        /* 内部辅助逻辑 */
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_STRING_INTERP, loc);
         zan_ast_list_init(&n->string_interp.parts);
         zan_ast_list_init(&n->string_interp.formats);
@@ -834,7 +802,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return zan_ast_new(p->arena, AST_BASE_EXPR, loc);
     }
     case TK_IDENT: {
-        /* 底层系统交互与数据协议契约 */
         if (p->current.str_val.len == 6 &&
             memcmp(p->current.str_val.str, "nameof", 6) == 0 &&
             zan_lexer_peek(p->lex).kind == TK_LPAREN) {
@@ -858,7 +825,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             n->str_val = name;
             return n;
         }
-        /* 核心系统底层抽象与内存语义契约 */
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_ARROW) {
             parser_advance(p);
@@ -882,11 +848,9 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return n;
     }
     case TK_LPAREN: {
-        /* 底层系统交互与数据协议契约 */
         if (paren_is_lambda(p)) {
             return parse_lambda_paren(p, loc);
         }
-        /* 内部辅助逻辑 */
         switch (zan_lexer_peek(p->lex).kind) {
         case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
         case TK_UINT: case TK_ULONG: case TK_USHORT: case TK_SBYTE:
@@ -916,14 +880,12 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         }
         parser_advance(p);
         zan_ast_node_t *expr = parse_expression(p);
-        /* 内部辅助逻辑 */
         if (parser_check(p, TK_COMMA)) {
             zan_ast_node_t *tup = zan_ast_new(p->arena, AST_TUPLE_EXPR, loc);
             zan_ast_list_init(&tup->tuple_expr.items);
             zan_ast_list_push(&tup->tuple_expr.items, expr, p->arena);
             while (parser_match(p, TK_COMMA)) {
                 if (parser_check(p, TK_RPAREN) || parser_check(p, TK_EOF)) break;
-                /* 模块核心语义抽象与接口调用契约 */
                 if (p->current.kind == TK_IDENT &&
                     zan_lexer_peek(p->lex).kind == TK_COLON) {
                     parser_advance(p);
@@ -954,7 +916,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         return expr;
     }
     case TK_DELEGATE: {
-        /* 核心系统底层抽象与内存语义契约 */
         zan_loc_t dloc = p->current.loc;
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_LAMBDA, dloc);
@@ -975,7 +936,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         zan_loc_t newloc = p->previous.loc;
         zan_ast_node_t *n = NULL;
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (parser_check(p, TK_LBRACE)) {
             parser_advance(p);
             n = zan_ast_new(p->arena, AST_NEW_EXPR, newloc);
@@ -1002,7 +962,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         n->new_expr.is_array = false;
         n->new_expr.array_init = false;
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (parser_check(p, TK_LBRACKET) && !type->type_ref.is_array) {
             parser_advance(p);
             n->new_expr.is_array = true;
@@ -1018,7 +977,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 if (!parser_match(p, TK_COMMA)) break;
             }
             parser_expect(p, TK_RBRACKET);
-            /* 编译器代码生成与运行时系统底层调用契约 */
             while (parser_check(p, TK_LBRACKET)) {
                 int rank = array_suffix_rank(p);
                 if (rank <= 0) break;
@@ -1026,7 +984,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 for (int c = 1; c < rank; c++) parser_advance(p);
                 parser_advance(p);
                 if (rank > 16) {
-                    /* 编译器代码生成与运行时系统底层调用契约 */
                     zan_diag_emit(p->diag, DIAG_ERROR, loc,
                                   "array rank specifier is too deep (max 16)");
                     continue;
@@ -1039,7 +996,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
                 zan_ast_list_init(&w->type_ref.type_args);
                 type = w;
             }
-            /* 模块核心语义抽象与接口调用契约 */
             if (n->new_expr.array_rank > 0) {
                 zan_ast_node_t *w = zan_ast_new(p->arena, AST_TYPE_REF, loc);
                 w->type_ref.name = type->type_ref.name;
@@ -1058,7 +1014,6 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
             }
             parser_expect(p, TK_RPAREN);
         }
-        /* 内部辅助实现 */
         if (parser_check(p, TK_LBRACE) && type->kind == AST_TYPE_REF &&
             type->type_ref.is_array && !n->new_expr.is_array) {
             /* new T[] { */
@@ -1113,9 +1068,7 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
 
 static bool is_type_kw(zan_token_kind_t k);
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
-    /* 核心系统底层抽象与内存语义契约 */
     if (parser_check(p, TK_IDENT)) {
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_COLON) {
@@ -1149,7 +1102,6 @@ static zan_ast_node_t *parse_call_arg(zan_parser_t *p) {
     }
     zan_ast_node_t *e = parse_expression(p);
     if (is_out && e->kind == AST_IDENTIFIER && parser_check(p, TK_IDENT)) {
-        /* 编译器代码生成与运行时系统底层调用契约 */
         zan_ast_node_t *ty = zan_ast_new(p->arena, AST_TYPE_REF, e->loc);
         ty->type_ref.name = e->ident.name;
         zan_ast_list_init(&ty->type_ref.type_args);
@@ -1197,7 +1149,6 @@ static bool looks_like_call_type_args(zan_parser_t *p) {
         } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
                    k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
                    is_type_kw(k)) {
-            /* 核心系统底层抽象与内存语义契约 */
         } else {
             break;
         }
@@ -1231,7 +1182,6 @@ static bool looks_like_type_args_before_dot(zan_parser_t *p) {
         } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
                    k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
                    is_type_kw(k)) {
-            /* 核心系统底层抽象与内存语义契约 */
         } else {
             break;
         }
@@ -1265,7 +1215,6 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
         } else if (k == TK_IDENT || k == TK_COMMA || k == TK_DOT ||
                    k == TK_LBRACKET || k == TK_RBRACKET || k == TK_QUESTION ||
                    is_type_kw(k)) {
-            /* 核心系统底层抽象与内存语义契约 */
         } else {
             break;
         }
@@ -1277,7 +1226,6 @@ static bool looks_like_type_args_before_brace(zan_parser_t *p) {
     return ok;
 }
 
-/* 内部辅助实现 */
 static void desugar_task_join(zan_ast_node_t *member) {
     zan_istr_t obj_name;
     zan_istr_t m = member->member.name;
@@ -1298,11 +1246,9 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     for (;;) {
         zan_loc_t loc = p->current.loc;
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (parser_check(p, TK_LBRACE) &&
             (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS ||
              expr->kind == AST_CALL)) {
-            /* 内部辅助逻辑 */
             if (expr->kind == AST_IDENTIFIER && expr->ident.inst_type_ref) {
                 zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
                 n->new_expr.type = expr->ident.inst_type_ref;
@@ -1350,7 +1296,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 continue;
             }
 
-            /* 核心系统底层抽象与内存语义契约 */
             if (expr->kind == AST_CALL) {
                 zan_ast_node_t *n = zan_ast_new(p->arena, AST_NEW_EXPR, loc);
                 n->new_expr.call_init = expr;
@@ -1397,7 +1342,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 expr = n;
                 continue;
             }
-            /* 内部辅助逻辑 */
             zan_ast_node_t *type = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
             if (expr->kind == AST_IDENTIFIER) {
                 type->type_ref.name = expr->ident.name;
@@ -1410,7 +1354,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             n->new_expr.type = type;
             zan_ast_list_init(&n->new_expr.args);
 
-            /* 内部辅助逻辑 */
             while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF)) {
                 zan_ast_node_t *field_init;
                 if (parser_check(p, TK_IDENT) &&
@@ -1502,7 +1445,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                    !expr->ident.inst_type_ref &&
                    (looks_like_type_args_before_dot(p) ||
                     looks_like_type_args_before_brace(p))) {
-            /* 内部辅助逻辑 */
             zan_ast_node_t *tref = zan_ast_new(p->arena, AST_TYPE_REF, expr->loc);
             tref->type_ref.name = expr->ident.name;
             tref->type_ref.is_nullable = false;
@@ -1517,7 +1459,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect_gt(p);
             expr->ident.inst_type_ref = tref;
         } else if (parser_match(p, TK_LBRACKET)) {
-            /* 底层系统交互与数据协议契约 */
             zan_ast_node_t *idx = parse_expression(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_INDEX, loc);
             n->index.object = expr;
@@ -1529,7 +1470,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect(p, TK_RBRACKET);
             expr = n;
         } else if (parser_check(p, TK_SWITCH)) {
-            /* 内部辅助逻辑 */
             parser_advance(p);
             parser_expect(p, TK_LBRACE);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_SWITCH_EXPR, loc);
@@ -1544,7 +1484,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                 zan_istr_t var_name = {0};
                 bool is_default = false;
 
-                /* 内部辅助逻辑 */
                 if (parser_check(p, TK_DEFAULT) ||
                     (parser_check(p, TK_IDENT) && p->current.str_val.len == 1 &&
                      p->current.str_val.str[0] == '_')) {
@@ -1557,7 +1496,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                         var_name = p->previous.str_val;
                     }
                 } else {
-                    /* 核心系统底层抽象与内存语义契约 */
                     pattern = parse_expression(p);
                 }
                 if (parser_match(p, TK_WHEN)) {
@@ -1581,7 +1519,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
                    p->current.str_val.len == 4 &&
                    memcmp(p->current.str_val.str, "with", 4) == 0 &&
                    zan_lexer_peek(p->lex).kind == TK_LBRACE) {
-            /* 底层系统交互与数据协议契约 */
             parser_advance(p);
             parser_expect(p, TK_LBRACE);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_WITH_EXPR, loc);
@@ -1605,7 +1542,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             parser_expect(p, TK_RBRACE);
             expr = n;
         } else if (parser_check(p, TK_BANG)) {
-            /* 底层系统交互与数据协议契约 */
             parser_advance(p);
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
             n->unary.op = TK_BANG;
@@ -1613,7 +1549,6 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
             expr = n;
             continue;
         } else if (parser_check(p, TK_PLUS_PLUS) || parser_check(p, TK_MINUS_MINUS)) {
-            /* 内部辅助逻辑 */
             zan_ast_node_t *n = zan_ast_new(p->arena, AST_POSTFIX_UNARY, loc);
             n->unary.op = p->current.kind;
             parser_advance(p);
@@ -1628,12 +1563,10 @@ static zan_ast_node_t *parse_postfix(zan_parser_t *p) {
     return expr;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_PARSER_MAX_EXPR_DEPTH 512
 
 static zan_ast_node_t *parse_unary_inner(zan_parser_t *p);
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parser_expr_too_deep(zan_parser_t *p) {
     if (!p->expr_depth_reported) {
         p->expr_depth_reported = true;
@@ -1644,7 +1577,6 @@ static zan_ast_node_t *parser_expr_too_deep(zan_parser_t *p) {
     return parser_error_node(p);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static zan_ast_node_t *parse_unary(zan_parser_t *p) {
     if (p->expr_depth >= ZAN_PARSER_MAX_EXPR_DEPTH)
         return parser_expr_too_deep(p);
@@ -1702,7 +1634,6 @@ static bool is_binary_op(zan_token_kind_t kind) {
     return get_precedence(kind) > 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static bool token_starts_expr(zan_token_kind_t k) {
     switch (k) {
     case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_STRING_LIT:
@@ -1715,13 +1646,12 @@ static bool token_starts_expr(zan_token_kind_t k) {
     }
 }
 
-/* 内部辅助逻辑 */
 static bool is_question_is_conditional(zan_parser_t *p) {
     zan_lexer_t saved_lex = *p->lex;
     zan_token_t saved_cur = p->current;
     zan_token_t saved_prev = p->previous;
-    int depth = 0; /* 核心系统底层抽象与内存语义契约 */
-    bool in_arm = false; /* 底层系统交互与数据协议契约 */
+    int depth = 0;
+    bool in_arm = false;
     bool result = false;
     while (p->current.kind != TK_EOF) {
         zan_token_kind_t k = p->current.kind;
@@ -1743,7 +1673,7 @@ static bool is_question_is_conditional(zan_parser_t *p) {
             depth -= depth >= 3 ? 3 : depth;
         } else if (!in_arm && k == TK_QUESTION && depth == 0) {
             if (!token_starts_expr(zan_lexer_peek(p->lex).kind)) {
-                break; /* 底层系统交互与数据协议契约 */
+                break;
             }
             in_arm = true;
         } else if (in_arm && k == TK_COLON && depth == 0) {
@@ -1758,7 +1688,6 @@ static bool is_question_is_conditional(zan_parser_t *p) {
     return result;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_PARSER_MAX_BINOP_CHAIN 16384
 
 static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
@@ -1792,7 +1721,6 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
             n->type_test.var_name = (zan_istr_t){NULL, 0};
             n->type_test.is_not = false;
             if (op == TK_AS) {
-                /* 内部辅助逻辑 */
                 p->type_no_nullable =
                     is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
@@ -1800,19 +1728,16 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
                 left = n;
                 continue;
             }
-            /* 核心系统底层抽象与内存语义契约 */
             if (parser_match(p, TK_NOT)) {
                 n->type_test.is_not = true;
             }
             if (parser_check(p, TK_NULL)) {
-                /* 核心系统底层抽象与内存语义契约 */
                 parser_advance(p);
             } else {
                 p->type_no_nullable =
                     is_question_is_conditional(p) ? 1 : 0;
                 n->type_test.type = parse_type_ref(p);
                 p->type_no_nullable = 0;
-                /* 底层系统交互与数据协议契约 */
                 if (parser_check(p, TK_IDENT)) {
                     zan_token_t after = zan_lexer_peek(p->lex);
                     if (after.kind != TK_IS && after.kind != TK_AS) {
@@ -1828,7 +1753,6 @@ static zan_ast_node_t *parse_binary(zan_parser_t *p, int min_prec) {
         zan_ast_node_t *right = parse_binary(p, prec + 1);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_BINARY, loc);
         n->binary.op = op;
-        /* 内部辅助逻辑 */
         if (op == TK_PLUS || op == TK_MINUS || op == TK_STAR) {
             if (p->checked_depth > 0) n->binary.checked = 1;
             else if (p->unchecked_depth > 0) n->binary.checked = -1;
@@ -1874,7 +1798,6 @@ static bool is_assign_op(zan_token_kind_t kind) {
 static zan_ast_node_t *parse_expression_inner(zan_parser_t *p);
 
 static zan_ast_node_t *parse_expression(zan_parser_t *p) {
-    /* 底层系统交互与数据协议契约 */
     if (p->expr_tail_depth >= ZAN_PARSER_MAX_EXPR_DEPTH)
         return parser_expr_too_deep(p);
     p->expr_tail_depth++;
@@ -1891,7 +1814,6 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (op == TK_EQ && parser_check(p, TK_LBRACE) &&
             (expr->kind == AST_IDENTIFIER || expr->kind == AST_MEMBER_ACCESS)) {
             zan_istr_t name = (expr->kind == AST_IDENTIFIER)
@@ -1912,7 +1834,6 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 
         zan_ast_node_t *right = parse_expression(p);
 
-        /* 内部辅助逻辑 */
         zan_token_kind_t base = TK_EOF;
         switch (op) {
         case TK_PLUS_EQ:            base = TK_PLUS; break;
@@ -1939,7 +1860,6 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_ASSIGNMENT, loc);
         n->binary.op = op;
-        /* 内部辅助逻辑 */
         n->binary.compound_base = base;
         n->binary.left = expr;
         n->binary.right = right;
@@ -1949,7 +1869,6 @@ static zan_ast_node_t *parse_expression_inner(zan_parser_t *p) {
     return expr;
 }
 
-/* 内部辅助逻辑 */
 #define ZAN_PARSER_MAX_STMT_DEPTH 4096
 
 static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
@@ -1957,7 +1876,6 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
         if (parser_check(p, TK_DEFER)) {
             zan_loc_t defer_loc = p->current.loc;
             parser_advance(p);
-            /* 内部辅助逻辑 */
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
                 zan_diag_emit(p->diag, DIAG_ERROR, defer_loc,
                               "statement nesting too deep (max %d)",
@@ -1980,7 +1898,6 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
                 fin_body = fb;
             }
 
-            /* 模块核心语义抽象与接口调用契约 */
             zan_ast_node_t *tail_block = zan_ast_new(p->arena, AST_BLOCK, defer_loc);
             zan_ast_list_init(&tail_block->block.stmts);
             parse_block_stmts(p, &tail_block->block.stmts);
@@ -2000,7 +1917,6 @@ static void parse_block_stmts(zan_parser_t *p, zan_ast_list_t *stmts_list) {
             zan_ast_list_push(stmts_list, stmt, p->arena);
             splice_pending_stmts(p, stmts_list);
         }
-        /* 内部辅助逻辑 */
         if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
             parser_advance(p);
         }
@@ -2012,7 +1928,6 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                       "statement nesting too deep (max %d)",
                       ZAN_PARSER_MAX_STMT_DEPTH);
-        /* 模块核心语义抽象与接口调用契约 */
         while (!parser_check(p, TK_RBRACE) && !parser_check(p, TK_EOF))
             parser_advance(p);
         zan_ast_node_t *empty = zan_ast_new(p->arena, AST_BLOCK,
@@ -2034,9 +1949,7 @@ static zan_ast_node_t *parse_block(zan_parser_t *p) {
     return block;
 }
 
-/* 内部辅助实现 */
 
-/* 内部辅助逻辑 */
 static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     size_t pos = p->lex->pos;
     uint32_t line = p->lex->line;
@@ -2047,7 +1960,6 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
     zan_interp_level_t istack[ZAN_MAX_INTERP_DEPTH];
     if (nsave > 0)
         memcpy(istack, p->lex->interp_stack, sizeof(istack[0]) * (size_t)nsave);
-    /* 内部辅助逻辑 */
     int cdep = p->lex->cond_depth;
     int cover = p->lex->cond_overflow;
     int cstack[ZAN_PP_MAX_COND_DEPTH];
@@ -2078,7 +1990,6 @@ static zan_token_t lexer_peek_n(zan_parser_t *p, int k) {
 static bool looks_like_decon_decl(zan_parser_t *p) {
     if (!parser_check(p, TK_LPAREN)) return false;
     zan_token_t a = lexer_peek_n(p, 1);
-    /* 内部辅助逻辑 */
     bool type_kw = a.kind == TK_INT || a.kind == TK_LONG || a.kind == TK_SHORT ||
                    a.kind == TK_BYTE || a.kind == TK_UINT || a.kind == TK_ULONG ||
                    a.kind == TK_USHORT || a.kind == TK_SBYTE || a.kind == TK_FLOAT ||
@@ -2086,13 +1997,11 @@ static bool looks_like_decon_decl(zan_parser_t *p) {
                    a.kind == TK_CHAR || a.kind == TK_STRING || a.kind == TK_OBJECT ||
                    a.kind == TK_NINT || a.kind == TK_VAR;
     if (a.kind != TK_IDENT && !type_kw) return false;
-    /* 编译器代码生成与运行时系统底层调用契约 */
     zan_token_t b = lexer_peek_n(p, 2);
     if (b.kind != TK_IDENT) return false;
     zan_token_t c = lexer_peek_n(p, 3);
     if (c.kind != TK_COMMA && c.kind != TK_RPAREN) return false;
 
-    /* 内部辅助逻辑 */
     int depth = 0;
     for (int k = 1; k < 64; k++) {
         zan_token_t tk = lexer_peek_n(p, k);
@@ -2111,20 +2020,17 @@ static bool looks_like_decon_decl(zan_parser_t *p) {
     return false;
 }
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
                                               zan_ast_node_t *type_prefix) {
     zan_ast_node_t *n = zan_ast_new(p->arena, AST_TUPLE_DECON, loc);
     zan_ast_list_init(&n->tuple_decon.names);
     zan_ast_list_init(&n->tuple_decon.types);
 
-    /* 编译器代码生成与运行时系统底层调用契约 */
     if (type_prefix) {
         bool is_var = type_prefix->kind == AST_TYPE_REF &&
                       type_prefix->type_ref.name.len == 3 &&
                       memcmp(type_prefix->type_ref.name.str, "var", 3) == 0;
         if (!is_var) {
-            /* 内部辅助逻辑 */
             zan_diag_emit(p->diag, DIAG_ERROR, loc,
                           "unsupported tuple deconstruction form");
             return n;
@@ -2134,7 +2040,6 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
     if (parser_check(p, TK_LPAREN)) parser_advance(p);
 
     while (!parser_check(p, TK_RPAREN) && !parser_check(p, TK_EOF)) {
-        /* 核心系统底层抽象与内存语义契约 */
         zan_ast_node_t *elem_type = NULL;
         bool is_kw_type =
             parser_check(p, TK_INT) || parser_check(p, TK_LONG) ||
@@ -2174,18 +2079,16 @@ static zan_ast_node_t *parse_tuple_decon_body(zan_parser_t *p, zan_loc_t loc,
     return n;
 }
 
-/* 底层系统交互与数据协议契约 */
 static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     if (parser_check(p, TK_LBRACE)) {
         return parse_block(p);
     }
 
-    /* 内部辅助逻辑 */
     if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
         zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                       "statement nesting too deep (max %d)",
                       ZAN_PARSER_MAX_STMT_DEPTH);
-        parser_advance(p); /* 底层系统交互与数据协议契约 */
+        parser_advance(p);
         zan_ast_node_t *empty = zan_ast_new(p->arena, AST_BLOCK,
                                             p->current.loc);
         zan_ast_list_init(&empty->block.stmts);
@@ -2215,7 +2118,6 @@ static zan_ast_node_t *parse_embedded_stmt(zan_parser_t *p) {
     return block;
 }
 
-/* 内部辅助逻辑 */
 static bool looks_like_var_decl(zan_parser_t *p) {
     if (parser_check(p, TK_VAR) || parser_check(p, TK_LET) || parser_check(p, TK_CONST)) {
         return true;
@@ -2248,7 +2150,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         if (peek.kind == TK_IDENT) {
             return true;
         }
-        /* 底层系统交互与数据协议契约 */
         if (peek.kind == TK_LESS) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2278,7 +2179,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_GA_WS
             #undef ZAN_GA_IDSTART
         }
-        /* 核心系统底层抽象与内存语义契约 */
         if (peek.kind == TK_DOT) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2330,7 +2230,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_IDCONT
             return false;
         }
-        /* 内部辅助逻辑 */
         if (peek.kind == TK_QUESTION) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2341,7 +2240,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             while (q < n && ZAN_NQ_WS(s[q])) q++;
             if (q < n && s[q] == '?') {
                 q++;
-                /* 核心系统底层抽象与内存语义契约 */
                 if (q < n && s[q] != '?' && s[q] != '.' && s[q] != '[') {
                     while (q < n && ZAN_NQ_WS(s[q])) q++;
                     if (q < n && ZAN_NQ_IDSTART(s[q])) {
@@ -2357,7 +2255,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             #undef ZAN_NQ_IDCONT
             return is_decl;
         }
-        /* 内部辅助逻辑 */
         if (peek.kind == TK_LBRACKET) {
             const char *s = p->lex->source;
             size_t q = p->lex->pos, n = p->lex->source_len;
@@ -2373,7 +2270,6 @@ static bool looks_like_var_decl(zan_parser_t *p) {
         return false;
     }
     case TK_LPAREN: {
-        /* 内部辅助逻辑 */
         int depth = 0;
         for (int k = 1; k < 64; k++) {
             zan_token_t tk = lexer_peek_n(p, k);
@@ -2407,14 +2303,12 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
         type = parse_type_ref(p);
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (type && type->kind == AST_TYPE_REF &&
         type->type_ref.name.len == 3 &&
         memcmp(type->type_ref.name.str, "var", 3) == 0) {
         type = NULL;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (type == NULL && parser_check(p, TK_LPAREN) && !is_const) {
         return parse_tuple_decon_body(p, loc, type);
     }
@@ -2439,7 +2333,6 @@ static zan_ast_node_t *parse_var_decl(zan_parser_t *p) {
     decl->var_decl.is_const = is_const;
     decl->var_decl.is_let = is_let;
 
-    /* 内部辅助实现 */
     zan_ast_list_init(&p->pending_stmts);
     while (parser_match(p, TK_COMMA)) {
         zan_istr_t more = {0};
@@ -2479,12 +2372,11 @@ static zan_ast_node_t *parse_if_stmt(zan_parser_t *p) {
     zan_ast_node_t *else_body = NULL;
     if (parser_match(p, TK_ELSE)) {
         if (parser_check(p, TK_IF)) {
-            /* 内部辅助逻辑 */
             if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
                 zan_diag_emit(p->diag, DIAG_ERROR, p->current.loc,
                               "statement nesting too deep (max %d)",
                               ZAN_PARSER_MAX_STMT_DEPTH);
-                parser_advance(p); /* 核心系统底层抽象与内存语义契约 */
+                parser_advance(p);
             } else {
                 p->stmt_depth++;
                 else_body = parse_if_stmt(p);
@@ -2522,7 +2414,6 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
     parser_expect(p, TK_LPAREN);
 
     zan_ast_node_t *init = NULL;
-    /* 底层系统交互与数据协议契约 */
     zan_ast_list_t head_decls;
     zan_ast_list_init(&head_decls);
     int head_count = 0;
@@ -2542,7 +2433,6 @@ static zan_ast_node_t *parse_for_stmt(zan_parser_t *p) {
             }
 
             if (dtype == NULL && parser_check(p, TK_LPAREN) && !is_const) {
-                /* 核心系统底层抽象与内存语义契约 */
                 init = parse_tuple_decon_body(p, loc, dtype);
             } else {
                 for (;;) {
@@ -2665,7 +2555,6 @@ static zan_ast_node_t *parse_return_stmt(zan_parser_t *p) {
     return n;
 }
 
-/* 内部辅助实现 */
 static bool is_case_type_pattern(zan_parser_t *p) {
     switch (p->current.kind) {
     case TK_INT: case TK_LONG: case TK_SHORT: case TK_BYTE:
@@ -2711,7 +2600,6 @@ static zan_ast_node_t *parse_switch_stmt(zan_parser_t *p) {
                     var_name = p->previous.str_val;
                 }
             } else {
-                /* 底层系统交互与数据协议契约 */
                 pattern = parse_expression(p);
             }
             /* `case */
@@ -2813,11 +2701,9 @@ static bool skip_angle_group(zan_parser_t *p) {
     }
 }
 
-/* 内部辅助逻辑 */
 static bool looks_like_local_func(zan_parser_t *p) {
     zan_lexer_t saved = *p->lex;
 
-    /* 内部辅助逻辑 */
     zan_token_t t = p->current;
 
     switch (t.kind) {
@@ -2848,7 +2734,6 @@ static bool looks_like_local_func(zan_parser_t *p) {
         return false;
     }
 
-    /* 底层系统交互与数据协议契约 */
     for (;;) {
         zan_token_t after = zan_lexer_peek(p->lex);
         if (after.kind != TK_LBRACKET) break;
@@ -2866,14 +2751,12 @@ static bool looks_like_local_func(zan_parser_t *p) {
 
     if (zan_lexer_next(p->lex).kind != TK_IDENT) { *p->lex = saved; return false; }
 
-    /* 底层系统交互与数据协议契约 */
     if (zan_lexer_peek(p->lex).kind == TK_LESS) {
         if (!skip_angle_group(p)) { *p->lex = saved; return false; }
     }
 
     if (zan_lexer_next(p->lex).kind != TK_LPAREN) { *p->lex = saved; return false; }
 
-    /* 内部辅助逻辑 */
     {
         int depth = 1;
         while (depth > 0) {
@@ -2891,7 +2774,6 @@ static bool looks_like_local_func(zan_parser_t *p) {
     return tail.kind == TK_LBRACE || tail.kind == TK_ARROW;
 }
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
@@ -2907,7 +2789,6 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
         return parser_error_node(p);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     zan_ast_list_t type_params;
     zan_ast_list_init(&type_params);
     if (parser_match(p, TK_LESS)) {
@@ -2963,14 +2844,12 @@ static zan_ast_node_t *parse_local_func(zan_parser_t *p) {
     n->method_decl.has_this_init = false;
     zan_ast_list_push(&p->pending_members, n, p->arena);
 
-    /* 底层系统交互与数据协议契约 */
     zan_ast_node_t *noop = zan_ast_new(p->arena, AST_BLOCK, loc);
     zan_ast_list_init(&noop->block.stmts);
     return noop;
 }
 
 static zan_ast_node_t *parse_statement(zan_parser_t *p) {
-    /* 内部辅助逻辑 */
     if (p->current.kind == TK_IDENT && p->current.str_val.len == 5 &&
         memcmp(p->current.str_val.str, "yield", 5) == 0) {
         zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
@@ -2986,7 +2865,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         }
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (p->current.kind == TK_IDENT && zan_lexer_peek(p->lex).kind == TK_COLON) {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
@@ -3005,7 +2883,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         if (is_checked) p->checked_depth++; else p->unchecked_depth++;
         zan_ast_node_t *blk = parse_block(p);
         if (is_checked) p->checked_depth--; else p->unchecked_depth--;
-        /* 内部辅助逻辑 */
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_CHECKED_STMT, loc);
         n->checked_stmt.checked = is_checked;
         n->checked_stmt.body = blk;
@@ -3040,7 +2917,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
     case TK_THROW: {
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
-        /* 内部辅助逻辑 */
         zan_ast_node_t *value = NULL;
         if (p->current.kind != TK_SEMICOLON)
             value = parse_expression(p);
@@ -3055,12 +2931,11 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return parse_try_stmt(p);
     case TK_DEFER: {
         zan_loc_t loc = p->current.loc;
-        /* 核心系统底层抽象与内存语义契约 */
         if (p->stmt_depth >= ZAN_PARSER_MAX_STMT_DEPTH) {
             zan_diag_emit(p->diag, DIAG_ERROR, loc,
                           "statement nesting too deep (max %d)",
                           ZAN_PARSER_MAX_STMT_DEPTH);
-            parser_advance(p); /* 核心系统底层抽象与内存语义契约 */
+            parser_advance(p);
             zan_ast_node_t *fb = zan_ast_new(p->arena, AST_BLOCK, loc);
             zan_ast_list_init(&fb->block.stmts);
             return fb;
@@ -3088,7 +2963,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         return n;
     }
     case TK_USING: {
-        /* 内部辅助逻辑 */
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         parser_expect(p, TK_LPAREN);
@@ -3098,7 +2972,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         zan_ast_node_t *init = NULL;
 
         if (looks_like_var_decl(p)) {
-            /* 内部辅助逻辑 */
             zan_ast_node_t *tref = parse_type_ref(p);
             type = tref;
             if (parser_check(p, TK_IDENT)) {
@@ -3112,7 +2985,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
                 init = parse_expression(p);
             }
         } else {
-            /* 底层系统交互与数据协议契约 */
             init = parse_expression(p);
             char buf[32];
             snprintf(buf, sizeof buf, "__using%d", p->synth_counter++);
@@ -3122,21 +2994,18 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_RPAREN);
         zan_ast_node_t *body = parse_embedded_stmt(p);
 
-        /* 底层系统交互与数据协议契约 */
         zan_ast_node_t *outer = zan_ast_new(p->arena, AST_BLOCK, loc);
         zan_ast_list_init(&outer->block.stmts);
 
         if (type || !init) {
-            /* 内部辅助逻辑 */
             zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
             decl->var_decl.name = name;
-            decl->var_decl.type = type; /* 核心系统底层抽象与内存语义契约 */
+            decl->var_decl.type = type;
             decl->var_decl.initializer = init;
             decl->var_decl.is_const = false;
             decl->var_decl.is_let = false;
             zan_ast_list_push(&outer->block.stmts, decl, p->arena);
         } else if (init) {
-            /* 底层系统交互与数据协议契约 */
             zan_ast_node_t *decl = zan_ast_new(p->arena, AST_VAR_DECL, loc);
             decl->var_decl.name = name;
             decl->var_decl.type = NULL; /* var (inferred) */
@@ -3180,7 +3049,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_expect(p, TK_RPAREN);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_LOCK_STMT, loc);
         n->lock_stmt.expr = expr;
-        /* 模块核心语义抽象与接口调用契约 */
         n->lock_stmt.body = parse_embedded_stmt(p);
         return n;
     }
@@ -3198,12 +3066,11 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         parser_advance(p);
         return parse_block(p);
     case TK_FIXED: {
-        /* 内部辅助逻辑 */
         zan_loc_t loc = p->current.loc;
         parser_advance(p);
         parser_expect(p, TK_LPAREN);
         zan_ast_node_t *type = parse_type_ref(p);
-        parser_match(p, TK_STAR); /* 核心系统底层抽象与内存语义契约 */
+        parser_match(p, TK_STAR);
         parser_expect(p, TK_IDENT);
         zan_istr_t vname = p->previous.str_val;
         parser_expect(p, TK_EQ);
@@ -3215,7 +3082,6 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         decl->var_decl.initializer = init;
         decl->var_decl.is_const = false;
         decl->var_decl.is_let = false;
-        /* 底层系统交互与数据协议契约 */
         zan_ast_node_t *body = parse_embedded_stmt(p);
         zan_ast_node_t *blk = zan_ast_new(p->arena, AST_BLOCK, loc);
         zan_ast_list_init(&blk->block.stmts);
@@ -3241,12 +3107,10 @@ static zan_ast_node_t *parse_statement(zan_parser_t *p) {
         break;
     }
 
-    /* 内部辅助实现 */
     if (looks_like_local_func(p)) {
         return parse_local_func(p);
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (looks_like_decon_decl(p)) {
         zan_loc_t dloc = p->current.loc;
         return parse_tuple_decon_body(p, dloc, NULL);
@@ -3302,7 +3166,6 @@ static void parse_where_clauses(zan_parser_t *p, zan_ast_list_t *out) {
 static zan_ast_node_t *parse_parameter(zan_parser_t *p) {
     zan_loc_t loc = p->current.loc;
 
-    /* 内部辅助逻辑 */
     int is_this = 0;
     if (parser_check(p, TK_THIS)) {
         parser_advance(p);
@@ -3359,7 +3222,6 @@ static zan_ast_list_t parse_param_list(zan_parser_t *p) {
     return params;
 }
 
-/* 内部辅助实现 */
 
 static bool stmt_contains_yield(zan_ast_node_t *s);
 
@@ -3421,7 +3283,6 @@ static void rewrite_yield_stmt(zan_parser_t *p, zan_ast_node_t **slot) {
             es->expr_stmt.expr = call;
             *slot = es;
         } else {
-            /* return __yield; */
             zan_ast_node_t *ret = zan_ast_new(p->arena, AST_RETURN_STMT, s->loc);
             ret->ret.value = make_yield_ident(p, s->loc);
             *slot = ret;
@@ -3512,7 +3373,6 @@ static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
     bool is_valuetask = (rt->type_ref.name.len == 9 && memcmp(rt->type_ref.name.str, "ValueTask", 9) == 0);
     if (!is_task && !is_valuetask) return;
 
-    /* 底层系统交互与数据协议契约 */
     if ((m->method_decl.modifiers & MOD_ASYNC) != 0 || m->method_decl.body == NULL) {
         if ((m->method_decl.modifiers & MOD_ASYNC) == 0) {
             m->method_decl.modifiers |= MOD_ASYNC;
@@ -3533,7 +3393,6 @@ static void desugar_async_task_method(zan_parser_t *p, zan_ast_node_t *m) {
 static void parse_attr_usages(zan_parser_t *p, zan_ast_list_t *out,
                               zan_istr_t *out_lib, zan_istr_t *out_entry,
                               bool *out_variadic) {
-    /* 核心系统底层抽象与内存语义契约 */
     while (parser_check(p, TK_LBRACKET)) {
         parser_advance(p);
         for (;;) {
@@ -3605,7 +3464,6 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                zan_istr_t dll_entry_point,
                                                bool dll_variadic);
 
-/* 内部辅助逻辑 */
 static zan_ast_node_t *synth_property_accessor(zan_parser_t *p, zan_istr_t name,
                                                zan_ast_node_t *ret_type,
                                                zan_ast_node_t *value_type,
@@ -3618,7 +3476,6 @@ static zan_ast_node_t *synth_property_accessor(zan_parser_t *p, zan_istr_t name,
     zan_ast_list_init(&n->method_decl.type_params);
     if (value_type) {
         zan_ast_node_t *param = zan_ast_new(p->arena, AST_PARAM, loc);
-        /* 底层系统交互与数据协议契约 */
         zan_istr_t vn = {(char *)"value", 5};
         param->param.name = vn;
         param->param.type = value_type;
@@ -3650,7 +3507,6 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
                                                bool dll_variadic) {
     uint32_t mods = parse_modifiers(p);
     if (dll_import_lib.str) mods |= MOD_EXTERN;
-    /* 内部辅助逻辑 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 5 &&
         memcmp(p->current.str_val.str, "event", 5) == 0 &&
         zan_lexer_peek(p->lex).kind == TK_IDENT) {
@@ -3658,7 +3514,6 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         mods |= MOD_EVENT;
     }
 
-    /* 内部辅助逻辑 */
     if (parser_check(p, TK_IDENT) && p->current.str_val.len == 7 &&
         memcmp(p->current.str_val.str, "partial", 7) == 0) {
         zan_token_kind_t nk = zan_lexer_peek(p->lex).kind;
@@ -3668,13 +3523,11 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         }
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (parser_check(p, TK_CLASS) || parser_check(p, TK_STRUCT) ||
         parser_check(p, TK_INTERFACE) || parser_check(p, TK_ENUM)) {
         return parse_type_decl(p, mods);
     }
 
-    /* 内部辅助逻辑 */
     if (parser_check(p, TK_DELEGATE)) {
         return parse_delegate_decl(p, mods);
     }
@@ -3700,7 +3553,6 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         return n;
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (parser_check(p, TK_IDENT) &&
         zan_lexer_peek(p->lex).kind == TK_OPERATOR) {
         zan_istr_t kw = p->current.str_val;
@@ -3724,7 +3576,7 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         const char *conv_name = is_explicit ? "op_explicit" : "op_implicit";
         zan_ast_node_t *cn = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
         cn->method_decl.name =
-            (zan_istr_t){ (char *)conv_name, 11 }; /* 核心系统底层抽象与内存语义契约 */
+            (zan_istr_t){ (char *)conv_name, 11 };
         cn->method_decl.return_type = conv_ret;
         cn->method_decl.params = conv_params;
         zan_ast_list_init(&cn->method_decl.type_params);
@@ -3733,7 +3585,6 @@ static zan_ast_node_t *parse_member_decl_inner(zan_parser_t *p,
         return cn;
     }
 ordinary_member:
-    /* 底层系统交互与数据协议契约 */
     ;
     zan_ast_node_t *type = parse_type_ref(p);
 
@@ -3742,7 +3593,6 @@ ordinary_member:
         zan_istr_t name = type->type_ref.name;
         zan_ast_list_t params = parse_param_list(p);
 
-        /* 底层系统交互与数据协议契约 */
         zan_ast_list_t base_args;
         zan_ast_list_init(&base_args);
         bool has_base_init = false;
@@ -3787,7 +3637,6 @@ ordinary_member:
         return n;
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (parser_check(p, TK_OPERATOR)) {
         parser_advance(p);
         char op_name[32];
@@ -3826,7 +3675,6 @@ ordinary_member:
         return n;
     }
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (parser_check(p, TK_THIS)) {
         parser_advance(p);
         parser_expect(p, TK_LBRACKET);
@@ -3887,7 +3735,7 @@ ordinary_member:
                         parser_expect(p, TK_SEMICOLON);
                     }
                 } else {
-                    parser_advance(p); /* 核心系统底层抽象与内存语义契约 */
+                    parser_advance(p);
                 }
             }
             parser_expect(p, TK_RBRACE);
@@ -3896,7 +3744,7 @@ ordinary_member:
         }
 
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_PROPERTY_DECL, loc);
-        zan_istr_t iname = {(char *)"Item", 4}; /* 核心系统底层抽象与内存语义契约 */
+        zan_istr_t iname = {(char *)"Item", 4};
         n->field_decl.name = iname;
         n->field_decl.type = type;
         n->field_decl.initializer = NULL;
@@ -3906,13 +3754,11 @@ ordinary_member:
         n->field_decl.has_getter = has_getter;
         n->field_decl.has_setter = has_setter;
         n->field_decl.has_init = has_init;
-        /* 内部辅助实现 */
         zan_ast_list_t *iparams =
             (zan_ast_list_t *)zan_arena_alloc(p->arena, sizeof(zan_ast_list_t));
         *iparams = idx_params;
         n->field_decl.indexer_params = iparams;
 
-        /* 核心系统底层抽象与内存语义契约 */
         if (getter_body) {
             zan_ast_node_t *g = zan_ast_new(p->arena, AST_METHOD_DECL, loc);
             zan_istr_t gistr = {(char *)"op_index", 8};
@@ -3951,7 +3797,6 @@ ordinary_member:
     parser_advance(p);
     zan_istr_t name = p->previous.str_val;
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (parser_check(p, TK_ARROW)) {
         parser_advance(p);
         zan_ast_node_t *expr = parse_expression(p);
@@ -3983,7 +3828,6 @@ ordinary_member:
         return n;
     }
 
-    /* 底层系统交互与数据协议契约 */
     if (parser_check(p, TK_LPAREN) || parser_check(p, TK_LESS)) {
         zan_ast_list_t type_params;
         zan_ast_list_init(&type_params);
@@ -4044,7 +3888,6 @@ ordinary_member:
         return n;
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     if (parser_check(p, TK_LBRACE)) {
         zan_token_t peek = zan_lexer_peek(p->lex);
         if (peek.kind == TK_GET || peek.kind == TK_SET) {
@@ -4084,12 +3927,11 @@ ordinary_member:
                         parser_expect(p, TK_SEMICOLON);
                     }
                 } else {
-                    parser_advance(p); /* 核心系统底层抽象与内存语义契约 */
+                    parser_advance(p);
                 }
             }
             parser_expect(p, TK_RBRACE);
 
-            /* 核心系统底层抽象与内存语义契约 */
             zan_ast_node_t *init = NULL;
             if (parser_match(p, TK_EQ)) {
                 init = parse_expression(p);
@@ -4107,7 +3949,6 @@ ordinary_member:
             n->field_decl.has_setter = has_setter;
             n->field_decl.has_init = has_init;
 
-            /* 模块核心语义抽象与接口调用契约 */
             if (getter_body) {
                 size_t gn = 4;
                 char *gname = (char *)zan_arena_alloc(p->arena,
@@ -4138,7 +3979,6 @@ ordinary_member:
         }
     }
 
-    /* 内部辅助逻辑 */
     zan_ast_node_t *init = NULL;
     if (parser_match(p, TK_EQ)) {
         init = parse_expression(p);
@@ -4201,7 +4041,6 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
     zan_ast_list_init(&type_params);
     if (parser_match(p, TK_LESS)) {
         while (!parser_check(p, TK_GREATER) && !parser_check(p, TK_EOF)) {
-            /* 内部辅助逻辑 */
             if (parser_check(p, TK_OUT) || parser_check(p, TK_IN)) {
                 parser_advance(p);
             }
@@ -4259,13 +4098,11 @@ static zan_ast_node_t *parse_type_decl(zan_parser_t *p, uint32_t modifiers) {
             if (member) {
                 zan_ast_list_push(&members, member, p->arena);
             }
-            /* 内部辅助逻辑 */
             for (int pi = 0; pi < p->pending_members.count; pi++) {
                 zan_ast_list_push(&members, p->pending_members.items[pi],
                                   p->arena);
             }
             p->pending_members.count = 0;
-            /* 内部辅助逻辑 */
             if (p->current.loc.offset == before && !parser_check(p, TK_EOF)) {
                 parser_advance(p);
             }
@@ -4309,7 +4146,7 @@ void zan_parser_init(zan_parser_t *p, zan_lexer_t *lex, zan_arena_t *arena,
     p->lex = lex;
     p->arena = arena;
     p->diag = diag;
-    parser_advance(p); /* 核心系统底层抽象与内存语义契约 */
+    parser_advance(p);
 }
 
 zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
@@ -4371,7 +4208,6 @@ zan_ast_node_t *zan_parser_parse(zan_parser_t *p) {
     return unit;
 }
 
-/* 内部辅助实现 */
 
 static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name) {
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
@@ -4384,8 +4220,6 @@ static zan_ast_node_t *find_delegate_decl(zan_ast_node_t *unit, zan_istr_t name)
     return NULL;
 }
 
-/* 底层系统交互与数据协议契约 */
-/* 内部辅助逻辑 */
 #define ZAN_GEN_SRC_CAP (256 * 1024)
 
 static void zsrc_append(char *buf, int cap, int *off, const char *fmt, ...) {
@@ -4446,7 +4280,6 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         "    void Invoke(",
         hname, dname, hname, hname, dname, hname, hname, dname,
         hname, hname, dname);
-    /* 模块核心语义抽象与接口调用契约 */
     int invoke_params_at = n;
     for (int i = 0; i < ddecl->method_decl.params.count; i++) {
         zan_ast_node_t *pp = ddecl->method_decl.params.items[i];
@@ -4471,7 +4304,6 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
         "        }\n"
         "    }\n");
 
-    /* 内部辅助逻辑 */
     int params_len = invoke_params_end - invoke_params_at;
     char *params = (char *)malloc((size_t)params_len + 1);
     if (!params) { free(src); return; }
@@ -4510,7 +4342,6 @@ static void gen_event_holder(zan_ast_node_t *unit, zan_ast_node_t *ddecl,
                           arena);
 }
 
-/* 内部辅助逻辑 */
 static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                              zan_ast_list_t *params, zan_arena_t *arena,
                              zan_diag_t *diag) {
@@ -4545,7 +4376,6 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                          (int)pp->param.name.len, pp->param.name.str);
     }
     zsrc_append(src, cap, &n, "    }\n");
-    /* 模块核心语义抽象与接口调用契约 */
     zsrc_append(src, cap, &n, "    public %s __CloneWith(", nm);
     for (int i = 0; i < params->count; i++) {
         zan_ast_node_t *pp = params->items[i];
@@ -4619,7 +4449,6 @@ static void gen_record_class(zan_ast_node_t *unit, zan_istr_t rname,
                           arena);
 }
 
-/* 内部辅助实现 */
 void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
                                zan_diag_t *diag) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
@@ -4668,7 +4497,6 @@ void zan_parser_merge_partials(zan_ast_node_t *unit, zan_arena_t *arena,
     (void)diag;
 }
 
-/* 内部辅助逻辑 */
 static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
                               zan_ast_list_t *decls, zan_arena_t *arena) {
     int hoisted = 0;
@@ -4680,18 +4508,15 @@ static int hoist_nested_types(zan_ast_node_t *unit, zan_ast_node_t *type_node,
         if (mem->kind == AST_DELEGATE_DECL) {
             zan_ast_list_push(decls, mem, arena);
             hoisted++;
-            /* 核心系统底层抽象与内存语义契约 */
             for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
             members->count--;
             m--;
         } else if (mem->kind == AST_CLASS_DECL || mem->kind == AST_STRUCT_DECL ||
                    mem->kind == AST_INTERFACE_DECL || mem->kind == AST_ENUM_DECL) {
             hoisted += hoist_nested_types(unit, mem, decls, arena);
-            /* 编译器代码生成与运行时系统底层调用契约 */
             mem->type_decl.nested_host = type_node;
             zan_ast_list_push(decls, mem, arena);
             hoisted++;
-            /* 核心系统底层抽象与内存语义契约 */
             for (int k = mi; k < m - 1; k++) members->items[k] = members->items[k + 1];
             members->count--;
             m--;

@@ -7,15 +7,12 @@
 
 typedef struct zan_task zan_task_t;
 
-/* 底层系统交互与数据协议契约 */
 typedef void (*zan_co_body_t)(zan_task_t *task);
 
-/* 核心系统底层抽象与内存语义契约 */
 void zan_sched_init(void);
 void zan_sched_run(void);
 void zan_sched_shutdown(void);
 
-/* 核心系统底层抽象与内存语义契约 */
 zan_task_t *zan_spawn(zan_co_body_t body, void *arg);
 void       *zan_task_arg(zan_task_t *task);
 void        zan_task_return(zan_task_t *task, int64_t result);

@@ -1,16 +1,14 @@
-/* 底层系统交互与数据协议契约 */
 
 enum {
-    ZAN_MF_USER = 0,       /* 核心系统底层抽象与内存语义契约 */
-    ZAN_MF_ASYNC_RESUME,   /* 核心系统底层抽象与内存语义契约 */
-    ZAN_MF_RELEASE,        /* 底层系统交互与数据协议契约 */
-    ZAN_MF_VTABLE,         /* 核心系统底层抽象与内存语义契约 */
+    ZAN_MF_USER = 0,
+    ZAN_MF_ASYNC_RESUME,
+    ZAN_MF_RELEASE,
+    ZAN_MF_VTABLE,
     ZAN_MF_REFLECT,        /* __zan.refl.* / __zan_refl* thunks */
-    ZAN_MF_ADAPTER,        /* 核心系统底层抽象与内存语义契约 */
-    ZAN_MF_OTHER           /* 核心系统底层抽象与内存语义契约 */
+    ZAN_MF_ADAPTER,
+    ZAN_MF_OTHER
 };
 
-/* 底层系统交互与数据协议契约 */
 enum {
     ZAN_MF_R_ASYNC, ZAN_MF_R_SPEC, ZAN_MF_R_VIRTUAL, ZAN_MF_R_ADDR,
     ZAN_MF_R_INDIRECT, ZAN_MF_R_ABI, ZAN_MF_R_SYNTH, ZAN_MF_R_POLICY,
@@ -50,12 +48,10 @@ static unsigned char mf_classify(const char *name, int reg_idx) {
     return ZAN_MF_OTHER;
 }
 
-/* 内部辅助逻辑 */
 static bool mf_is_virtual_dispatch(uint32_t modifiers) {
     return (modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) != 0;
 }
 
-/* 内部辅助逻辑 */
 static bool mf_simple_abi(LLVMTypeRef ft) {
     LLVMTypeKind rk = LLVMGetTypeKind(LLVMGetReturnType(ft));
     if (rk != LLVMVoidTypeKind && rk != LLVMPointerTypeKind &&
@@ -80,14 +76,12 @@ static bool mf_simple_abi(LLVMTypeRef ft) {
     return true;
 }
 
-/* 内部辅助逻辑 */
 static bool mf_is_spec(zan_irgen_t *g, LLVMValueRef fn) {
     for (int i = 0; i < g->generic_fn_count; i++)
         if (g->generic_fns[i].fn == fn) return true;
     return false;
 }
 
-/* 内部辅助逻辑 */
 static bool mf_is_async_ramp(zan_irgen_t *g, const char *name) {
     char buf[512];
     if (strlen(name) + 8 >= sizeof(buf)) return false;
@@ -99,13 +93,13 @@ static void mf_push(int **arr, int *cnt, int *cap, int v) {
     if (*cnt < *cap) { (*arr)[(*cnt)++] = v; return; }
     int ncap = *cap ? *cap * 2 : 8;
     int *n = (int *)realloc(*arr, (size_t)ncap * sizeof(int));
-    if (!n) { *cnt = 0; return; } /* 底层系统交互与数据协议契约 */
+    if (!n) { *cnt = 0; return; }
     *arr = n; *cap = ncap; (*arr)[(*cnt)++] = v;
 }
 
 static void mf_push_name(const char ***arr, int *cnt, int *cap, const char *v) {
     for (int i = 0; i < *cnt; i++)
-        if (!strcmp((*arr)[i], v)) return; /* 核心系统底层抽象与内存语义契约 */
+        if (!strcmp((*arr)[i], v)) return;
     if (*cnt < *cap) { (*arr)[(*cnt)++] = v; return; }
     int ncap = *cap ? *cap * 2 : 8;
     const char **n = (const char **)realloc(*arr,
@@ -114,7 +108,6 @@ static void mf_push_name(const char ***arr, int *cnt, int *cap, const char *v) {
     *arr = n; *cap = ncap; (*arr)[(*cnt)++] = v;
 }
 
-/* 底层系统交互与数据协议契约 */
 typedef struct { const char *name; int idx; } mf_name_map_t;
 
 static int mf_name_map_cmp(const void *a, const void *b) {
@@ -130,7 +123,6 @@ static int mf_defined_lookup(const mf_name_map_t *map, int n, const char *name) 
     return hit ? hit->idx : -1;
 }
 
-/* 内部辅助逻辑 */
 static void mf_scan_insn_operand(zan_mf_fn *F, zan_mf_fn *fns,
                                  const mf_name_map_t *map, int map_n,
                                  LLVMValueRef op) {
@@ -147,7 +139,6 @@ static void mf_scan_insn_operand(zan_mf_fn *F, zan_mf_fn *fns,
                      LLVMGetValueName(op));
 }
 
-/* 内部辅助逻辑 */
 static void mf_scan_const(zan_mf_fn *F, const mf_name_map_t *map, int map_n,
                           LLVMValueRef v, int depth) {
     if (!v || depth > 8) return;
@@ -172,7 +163,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                                                  sizeof(LLVMValueRef));
     if (!fns || !llfns) { free(fns); free(llfns); return; }
 
-    /* 底层系统交互与数据协议契约 */
     for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
          fn = LLVMGetNextFunction(fn)) {
         if (m->fn_count >= cap) {
@@ -217,7 +207,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
          gv = LLVMGetNextGlobal(gv))
         m->global_count++;
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < m->fn_count; i++) {
         zan_mf_fn *F = &fns[i];
         F->reg_idx = -1;
@@ -231,7 +220,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         F->simple_abi = mf_simple_abi(g->functions[F->reg_idx].fn_type);
     }
 
-    /* 底层系统交互与数据协议契约 */
     mf_name_map_t *map = (mf_name_map_t *)malloc(
         (size_t)(m->defined_count ? m->defined_count : 1) * sizeof(*map));
     int mi = 0;
@@ -243,7 +231,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         }
     qsort(map, (size_t)mi, sizeof(*map), mf_name_map_cmp);
 
-    /* 底层系统交互与数据协议契约 */
     for (int i = 0; i < m->fn_count; i++) {
         zan_mf_fn *F = &fns[i];
         if (!F->defined) continue;
@@ -252,7 +239,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
             for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in;
                  in = LLVMGetNextInstruction(in)) {
                 if (LLVMGetInstructionOpcode(in) == LLVMCall) {
-                    /* 内部辅助逻辑 */
                     unsigned nop = LLVMGetNumOperands(in);
                     LLVMValueRef callee =
                         nop ? LLVMGetOperand(in, (int)(nop - 1)) : NULL;
@@ -276,7 +262,7 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                     continue;
                 }
                 if (LLVMGetInstructionOpcode(in) == LLVMLandingPad)
-                    continue; /* 核心系统底层抽象与内存语义契约 */
+                    continue;
                 unsigned nop = LLVMGetNumOperands(in);
                 for (unsigned k = 0; k < nop; k++)
                     mf_scan_insn_operand(F, fns, map, mi,
@@ -285,7 +271,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
         }
     }
 
-    /* 内部辅助逻辑 */
     for (LLVMValueRef gv = LLVMGetFirstGlobal(g->mod); gv;
          gv = LLVMGetNextGlobal(gv)) {
         LLVMValueRef init = LLVMGetInitializer(gv);
@@ -301,7 +286,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
     }
     free(llfns);
 
-    /* 内部辅助逻辑 */
     bool policy_ok = native && !g->emit_debug && !g->check_leaks &&
                      !g->arc_guard && !g->emit_lib;
     for (int i = 0; i < m->fn_count; i++) {
@@ -311,7 +295,6 @@ static void mf_build(zan_irgen_t *g, zan_cg_manifest_t *m, bool native) {
                       (F->kind == ZAN_MF_USER || F->kind == ZAN_MF_RELEASE) &&
                       !F->is_async;
     }
-    /* 内部辅助逻辑 */
     unsigned char *seen = (unsigned char *)calloc((size_t)m->fn_count, 1);
     int *stack = (int *)malloc((size_t)(m->fn_count ? m->fn_count : 1) *
                                sizeof(int));
@@ -361,7 +344,7 @@ static void mf_report(zan_irgen_t *g, const zan_cg_manifest_t *m) {
     int reasons[ZAN_MF_R_REASON_COUNT] = {0};
     for (int i = 0; i < m->fn_count; i++) {
         const zan_mf_fn *F = &m->fns[i];
-        if (!F->defined) continue; /* 核心系统底层抽象与内存语义契约 */
+        if (!F->defined) continue;
         kind_count[F->kind]++;
         if (F->kind == ZAN_MF_USER) {
             if (F->is_async) async++;
@@ -441,7 +424,6 @@ static void mf_json_str(FILE *out, const char *s) {
     fputc('"', out);
 }
 
-/* 内部辅助逻辑 */
 static void mf_json_names(FILE *out, const char **arr, int cnt) {
     if (cnt > 1) qsort(arr, (size_t)cnt, sizeof(char *), mf_json_cmp_str);
     fputc('[', out);
@@ -524,7 +506,6 @@ static int mf_write_json(zan_irgen_t *g, zan_cg_manifest_t *m,
     return fclose(out) == 0 ? ZAN_OK : ZAN_ERROR;
 }
 
-/* 底层系统交互与数据协议契约 */
 void zan_irgen_manifest_build(zan_irgen_t *g, zan_cg_manifest_t *m,
                               bool native) {
     g->mf_native = native;

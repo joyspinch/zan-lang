@@ -7,7 +7,6 @@
 
 #include "../common/zan_abi.h"
 
-/* 内部辅助逻辑 */
 __attribute__((import_module("zan_env"), import_name("pump")))
 static void zan__env_pump(void);
 __attribute__((import_module("zan_env"), import_name("wait")))
@@ -19,12 +18,11 @@ static void zan__env_present(i32 ptr, i32 w, i32 h);
 __attribute__((import_module("zan_env"), import_name("title")))
 static void zan__env_title(const char *text, i32 len);
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct {
-    int w, h;      /* 底层系统交互与数据协议契约 */
+    int w, h;
     int shown;
-    int closed;    /* 核心系统底层抽象与内存语义契约 */
+    int closed;
 } zan_wasm_win_t;
 static zan_wasm_win_t g_wwin;
 #define ZAN_WASM_HWND ((i64)(intptr_t)&g_wwin)
@@ -32,7 +30,6 @@ static zan_wasm_win_t g_wwin;
 static int  g_window_width  = 0;
 static int  g_window_height = 0;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct { int e[8]; i64 win; } zan_wev_t;
 #define ZAN_WQ_CAP 512
@@ -43,10 +40,9 @@ static int g_pending_event[8];
 static i64 g_event_win = 0;
 static long long g_ev_seq = 0;
 
-/* 内部辅助逻辑 */
 static void wq_push(int kind, int x, int y, int button, int code, int mods,
                     int flag) {
-    if (kind == 7) { /* 底层系统交互与数据协议契约 */
+    if (kind == 7) {
         g_window_width = x;
         g_window_height = y;
     }
@@ -70,7 +66,6 @@ static void wq_push(int kind, int x, int y, int button, int code, int mods,
     g_wq_tail = next;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_wasm_feed(i32 kind, i32 x, i32 y, i32 button, i32 code,
                              i32 mods, i32 flag) {
     wq_push((int)kind, (int)x, (int)y, (int)button, (int)code, (int)mods,
@@ -88,9 +83,7 @@ static int wq_pop(void) {
     return 1;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助逻辑 */
 EXPORT i64 zan_gui_create_window(const char *title, i32 width, i32 height) {
     (void)title;
     g_wwin.w = (int)width;
@@ -127,7 +120,6 @@ EXPORT i32 zan_gui_set_title(i64 h, const char *t) {
 }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     zan__env_pump();
@@ -151,7 +143,6 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     zan__env_pump();
     if (wq_pop()) return 0;
     if (ms > 0 && zan__env_wait(ms)) {
-        /* 底层系统交互与数据协议契约 */
         if (wq_pop()) return 0;
     }
     return 1;
@@ -184,7 +175,6 @@ EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i32 zan_gui_client_width(i64 hwnd_val)  { (void)hwnd_val; return g_window_width; }
 EXPORT i32 zan_gui_client_height(i64 hwnd_val) { (void)hwnd_val; return g_window_height; }
 
-/* 内部辅助逻辑 */
 #define ZAN_DIRTY_MAX_WASM 512
 static int g_dirty_wasm[ZAN_DIRTY_MAX_WASM * 4];
 static int g_dirty_count_wasm;
@@ -212,7 +202,6 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
         return 1;
     zan_surface_t *s = g_surfaces[surface_id];
-    /* 底层系统交互与数据协议契约 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -223,9 +212,7 @@ EXPORT i32 zan_gui_present(i64 hwnd_val, i32 surface_id) {
     return 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_get_dpi_scale(void) { return 100; }
 
 EXPORT i64 zan_gui_get_tick_ms(void) {
@@ -234,7 +221,6 @@ EXPORT i64 zan_gui_get_tick_ms(void) {
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_sleep_ms(i32 ms) {
     if (ms > 0) zan__env_sleep(ms);
 }
@@ -252,10 +238,8 @@ EXPORT i32 zan_gui_enable_glass(i64 hwnd_val, i32 tint_argb) {
 EXPORT i32 zan_gui_disable_glass(i64 hwnd_val)    { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(i64 h, i32 percent) { (void)h; (void)percent; return 0; }
 
-/* 内部辅助逻辑 */
 EXPORT const char *zan_gui_android_files_dir(void) { return "."; }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_adopt_sdl_window(i64 hwnd_val)              { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_scene_set_renderer(i64 hwnd_val, i64 rend) { (void)hwnd_val; (void)rend; return 1; }
 EXPORT i32 zan_gui_scene_upload(i64 hwnd_val, const void *bgra, i32 w, i32 h) {
@@ -339,7 +323,7 @@ void zan_dispatch_init(void) {
 int32_t zan_dispatch_post(void *fn) {
     if (!fn) return 0;
     int next = (g_wdisp_tail + 1) % ZAN_WDISP_CAP;
-    if (next == g_wdisp_head) return 0; /* 核心系统底层抽象与内存语义契约 */
+    if (next == g_wdisp_head) return 0;
     wdisp_retain(fn);
     g_wdisp[g_wdisp_tail] = fn;
     g_wdisp_tail = next;
@@ -363,4 +347,4 @@ void zan_dispatch_clear(void) {
     g_wdisp_tail = 0;
 }
 
-#endif /* 核心系统底层抽象与内存语义契约 */
+#endif

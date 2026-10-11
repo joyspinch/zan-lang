@@ -1,10 +1,9 @@
-/* 内部辅助实现 */
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(__ANDROID__) || defined(ZAN_GUI_OHOS)
-#include <malloc.h> /* 底层系统交互与数据协议契约 */
+#include <malloc.h>
 #endif
 #include <math.h>
 #include <stdio.h>
@@ -16,19 +15,16 @@
 #include <shellscalingapi.h>
 #include <dwmapi.h>
 #include <imm.h>
-/* 内部辅助实现 */
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "imm32.lib")
-/* 内部辅助实现 */
 #if defined(ZAN_GUI_STATIC)
 #define EXPORT
 #else
 #define EXPORT __declspec(dllexport)
 #endif
 #elif defined(__linux__) || defined(__wasm__)
-/* 底层系统交互与数据协议契约 */
 #if !defined(ZAN_GUI_OHOS) && !defined(__ANDROID__) && !defined(__wasm__)
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -57,9 +53,7 @@
 #define EXPORT __attribute__((visibility("default")))
 #endif
 
-/* 内部辅助逻辑 */
 #include "../common/host_oom.h"
-/* 模块核心语义抽象与接口调用契约 */
 #if !defined(__wasm__)
 #include "rt_crash.h"
 #endif
@@ -68,23 +62,18 @@
 #include "zan_gui_graphics.h"
 typedef int32_t i32;
 typedef int64_t i64;
-/* 内部辅助实现 */
 typedef intptr_t iptr;
 typedef uint32_t u32;
 typedef uint8_t  u8;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct zan_surface_s {
     u32 *pixels;
     int width;
     int height;
     int stride;
-    /* 内部辅助逻辑 */
     const zan_gui_backend *be;
-    /* 内部辅助实现 */
     int id;
-    /* 内部辅助实现 */
     int clip_x0;
     int clip_y0;
     int clip_x1;
@@ -92,24 +81,19 @@ typedef struct zan_surface_s {
     int clip_stack[256];
     int clip_depth;
     int clip_overflow;
-    /* 内部辅助实现 */
     int painted;
 } zan_surface_t;
 
 static zan_surface_t *g_surfaces[64];
 static int g_surface_count = 0;
 
-/* 底层系统交互与数据协议契约 */
 static const zan_gui_backend *g_backend = NULL;
 
-/* 内部辅助逻辑 */
 static const zan_gui_backend *zan_impl_pick(zan_surface_t *s, int has_entry) {
     if (has_entry) {
-        /* 内部辅助实现 */
         if (s->be->sync_from_cpu) s->be->sync_from_cpu(s);
         return s->be;
     }
-    /* 内部辅助实现 */
     if (s->be && s->be->sync_to_cpu) s->be->sync_to_cpu(s);
     return &zan_cpu_backend;
 }
@@ -117,7 +101,6 @@ static const zan_gui_backend *zan_impl_pick(zan_surface_t *s, int has_entry) {
 #define ZAN_IMPL(s, entry)                                                \
     zan_impl_pick((s), (s)->be != NULL && (s)->be->entry != NULL)
 
-/* 内部辅助实现 */
 #define ZAN_BE(s, entry, ...)                                             \
     do {                                                                  \
         if ((s)->be && (s)->be->entry) {                                  \
@@ -126,7 +109,6 @@ static const zan_gui_backend *zan_impl_pick(zan_surface_t *s, int has_entry) {
         }                                                                 \
     } while (0)
 
-/* 内部辅助实现 */
 void zan_gui_internal_set_backend(const zan_gui_backend *be) {
     g_backend = be;
 }
@@ -135,11 +117,9 @@ const char *zan_gui_internal_backend_name(void) {
     return (g_backend && g_backend->name) ? g_backend->name
                                           : zan_cpu_backend.name;
 }
-/* 内部辅助实现 */
 static i64 g_last_surface = -1;
 static u32 g_bg_color = 0xFFFFFFFF;
 
-/* 内部辅助逻辑 */
 static void zan_cache_drop_surface(int sid);
 
 static int clamp_i(int v, int lo, int hi) {
@@ -167,7 +147,6 @@ static u32 blend_over(u32 dst, u32 src) {
         u32 ob = (sb * sa + db * inv_sa) / 255;
         return (255u << 24) | (or_ << 16) | (og << 8) | ob;
     }
-    /* 底层系统交互与数据协议契约 */
     u32 da2 = da * inv_sa / 255;
     u32 oa = sa + da2;
     if (oa == 0) return 0;
@@ -177,7 +156,6 @@ static u32 blend_over(u32 dst, u32 src) {
     return (oa << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
-/* 内部辅助实现 */
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #define ZAN_HAS_SSE2 1
@@ -185,7 +163,6 @@ static u32 blend_over(u32 dst, u32 src) {
 #define ZAN_HAS_SSE2 0
 #endif
 
-/* 内部辅助实现 */
 #if defined(__aarch64__) || (defined(_M_ARM64) && !defined(_M_ARM64EC))
 #include <arm_neon.h>
 #define ZAN_HAS_NEON 1
@@ -193,11 +170,8 @@ static u32 blend_over(u32 dst, u32 src) {
 #define ZAN_HAS_NEON 0
 #endif
 
-/* 模块核心语义抽象与接口调用契约 */
-/* 底层系统交互与数据协议契约 */
 static long long g_blend_px_simd, g_blend_px_scalar;
 
-/* 核心系统底层抽象与内存语义契约 */
 static void fill_run_const(u32 *row, int n, u32 c) {
     for (int i = 0; i < n; i++) row[i] = c;
 }
@@ -214,7 +188,6 @@ static void blend_run_const(u32 *row, int n, u32 src) {
     u32 sg = ((src >> 8) & 0xFFu) * sa;
     int i = 0;
 #if ZAN_HAS_SSE2
-    /* 模块核心语义抽象与接口调用契约 */
     if (n >= 4) {
         __m128i zero = _mm_setzero_si128();
         __m128i amask = _mm_set1_epi32((int)0xFF000000u);
@@ -239,7 +212,6 @@ static void blend_run_const(u32 *row, int n, u32 src) {
     }
 #endif
 #if ZAN_HAS_NEON
-    /* 内部辅助实现 */
     if (n >= 4) {
         uint8x16_t ff8 = vdupq_n_u8(0xFF);
         uint32x4_t amask = vdupq_n_u32(0xFF000000u);
@@ -278,8 +250,6 @@ static void blend_run_const(u32 *row, int n, u32 src) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
-/* 内部辅助实现 */
 static void clip_notify(zan_surface_t *s) {
     if (s->be && s->be->set_clip) {
         s->be->set_clip(s, s->clip_x0, s->clip_y0, s->clip_x1, s->clip_y1);
@@ -296,20 +266,17 @@ static void clip_reset_full(zan_surface_t *s) {
     clip_notify(s);
 }
 
-/* 内部辅助逻辑 */
 static int clip_hits(zan_surface_t *s, int x0, int y0, int x1, int y1) {
     if (x1 <= s->clip_x0 || x0 >= s->clip_x1) return 0;
     if (y1 <= s->clip_y0 || y0 >= s->clip_y1) return 0;
     return 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int clip_covers(zan_surface_t *s, int x0, int y0, int x1, int y1) {
     return x0 >= s->clip_x0 && y0 >= s->clip_y0
         && x1 <= s->clip_x1 && y1 <= s->clip_y1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static int clipped_out(zan_surface_t *s, int x, int y) {
     if (x < 0 || x >= s->width || y < 0 || y >= s->height) return 1;
     if (x < s->clip_x0 || x >= s->clip_x1) return 1;
@@ -323,7 +290,6 @@ static void set_pixel(zan_surface_t *s, int x, int y, u32 color) {
     s->pixels[idx] = blend_over(s->pixels[idx], color);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void set_pixel_aa(zan_surface_t *s, int x, int y, u32 color, int coverage) {
     if (clipped_out(s, x, y)) return;
     if (coverage <= 0) return;
@@ -341,23 +307,19 @@ static inline int aa_coverage(double cov) {
     return (int)(cov * 255.0);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_guard_call(iptr fn, iptr arg) {
     void (*body)(void *) = (void (*)(void *))fn;
     if (!body) return 1;
 #if defined(_WIN32)
     return (i32)zan__guard_call(body, (void *)arg);
 #else
-    /* 内部辅助实现 */
     body((void *)arg);
     return 1;
 #endif
 }
 
 #if defined(_WIN32)
-/* 核心系统底层抽象与内存语义契约 */
 typedef iptr (*zan_gui_wndproc_fn)(iptr hwnd, i32 msg, iptr wp, iptr lp);
 static zan_gui_wndproc_fn zan_gui_zan_wndproc;
 
@@ -382,7 +344,6 @@ static LRESULT CALLBACK zan_gui_wndproc(HWND hwnd, UINT msg,
 }
 #endif
 
-/* 内部辅助实现 */
 EXPORT iptr zan_gui_guard_wndproc(iptr proc) {
 #if defined(_WIN32)
     zan_gui_zan_wndproc = (zan_gui_wndproc_fn)proc;
@@ -392,7 +353,6 @@ EXPORT iptr zan_gui_guard_wndproc(iptr proc) {
 #endif
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT i32 zan_gui_guard_recovered(void) {
 #if defined(_WIN32)
     return (i32)zan__guard_recovered_count();
@@ -401,17 +361,14 @@ EXPORT i32 zan_gui_guard_recovered(void) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
 #if !defined(__wasm__)
-    zan__crash_install(); /* 底层系统交互与数据协议契约 */
+    zan__crash_install();
 #endif
-    /* 内部辅助实现 */
     if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return -1;
     int64_t px = (int64_t)width * (int64_t)height;
     if (px <= 0 || px > 16384LL * 16384LL) return -1;
-    /* 内部辅助实现 */
     int id = -1;
     for (int i = 0; i < g_surface_count; i++) {
         if (!g_surfaces[i]) { id = i; break; }
@@ -430,13 +387,11 @@ EXPORT i32 zan_gui_create_surface(i32 width, i32 height) {
     clip_reset_full(s);
     s->pixels = (u32 *)malloc((size_t)px * sizeof(u32));
     if (!s->pixels) { free(s); return -1; }
-    /* 内部辅助实现 */
     fill_run_const(s->pixels, (int)px, g_bg_color);
     g_surfaces[id] = s;
     return (i64)id;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT i32 zan_gui_surface_painted(i32 id) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return 0;
     return g_surfaces[id]->painted;
@@ -449,9 +404,7 @@ EXPORT i32 zan_gui_destroy_surface(i32 id) {
     free(g_surfaces[id]->pixels);
     free(g_surfaces[id]);
     g_surfaces[id] = NULL;
-    /* 内部辅助实现 */
     zan_cache_drop_surface(id);
-    /* 内部辅助逻辑 */
     if (id == g_last_surface) g_last_surface = -1;
     return 0;
 }
@@ -466,7 +419,6 @@ EXPORT i32 zan_gui_surface_height(i32 id) {
     return g_surfaces[id]->height;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_write_pixels(i32 surface_id, const char *path,
                                 i32 x, i32 y, i32 width, i32 height) {
     if (surface_id < 0 || surface_id >= g_surface_count
@@ -500,11 +452,9 @@ EXPORT i32 zan_gui_write_pixels(i32 surface_id, const char *path,
     return (i32)written;
 }
 
-/* 内部辅助实现 */
 u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) return NULL;
     zan_surface_t *s = g_surfaces[id];
-    /* 内部辅助实现 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -515,7 +465,6 @@ u32 *zan_gui_internal_surface_data(i64 id, int *w, int *h, int *stride) {
     return s->pixels;
 }
 
-/* 内部辅助实现 */
 void zan_gui_internal_surface_clip(i64 id, int *x0, int *y0, int *x1, int *y1) {
     if (id < 0 || id >= g_surface_count || !g_surfaces[id]) {
         if (x0) *x0 = 0;
@@ -535,7 +484,6 @@ EXPORT void zan_gui_clear(i32 surface_id, i32 color) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s) return;
-    /* 内部实现与并发/内存约束规范 */
     clip_reset_full(s);
     u32 c = (u32)color;
     g_bg_color = c;
@@ -548,7 +496,6 @@ EXPORT void zan_gui_clear(i32 surface_id, i32 color) {
     s->painted = 1;
 }
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_push_clip(i32 surface_id, i32 x, i32 y, i32 w, i32 h) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -580,7 +527,6 @@ EXPORT void zan_gui_push_clip(i32 surface_id, i32 x, i32 y, i32 w, i32 h) {
     }
 }
 
-/* 内部实现与并发/内存约束规范 */
 EXPORT void zan_gui_pop_clip(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -601,7 +547,6 @@ EXPORT void zan_gui_pop_clip(i32 surface_id) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT void zan_gui_reset_clip(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -609,7 +554,6 @@ EXPORT void zan_gui_reset_clip(i32 surface_id) {
     clip_reset_full(s);
 }
 
-/* 内部辅助实现 */
 typedef struct { long long calls, px; } zan_stat_t;
 static zan_stat_t g_st_fill_op, g_st_fill_blend, g_st_grad, g_st_round,
                   g_st_radial, g_st_blur, g_st_blur_hit, g_st_img,
@@ -618,9 +562,7 @@ static zan_stat_t g_st_fill_op, g_st_fill_blend, g_st_grad, g_st_round,
 
 EXPORT void zan_gui_stat_glyphs(i32 n) { ZAN_STAT(g_st_glyph, n); }
 
-/* 内部辅助实现 */
 #define ZAN_TOP_N 6
-/* 内部辅助实现 */
 #define ZAN_TOP_T 2
 static int g_top_a[ZAN_TOP_T][ZAN_TOP_N], g_top_x[ZAN_TOP_T][ZAN_TOP_N],
            g_top_y[ZAN_TOP_T][ZAN_TOP_N], g_top_w[ZAN_TOP_T][ZAN_TOP_N],
@@ -628,7 +570,6 @@ static int g_top_a[ZAN_TOP_T][ZAN_TOP_N], g_top_x[ZAN_TOP_T][ZAN_TOP_N],
 
 static void stat_top_rect(int t, int area, int x, int y, int w, int h,
                           u32 color) {
-    /* 内部辅助实现 */
     for (int i = 0; i < ZAN_TOP_N; i++) {
         if (g_top_a[t][i] == area && g_top_x[t][i] == x &&
             g_top_y[t][i] == y && g_top_w[t][i] == w &&
@@ -665,17 +606,14 @@ static i32 stat_top_field(int t, i32 rank, i32 field) {
     return h;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_stat_top(i32 rank, i32 field) {
     return stat_top_field(0, rank, field);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT i32 zan_gui_stat_top_fill(i32 rank, i32 field) {
     return stat_top_field(1, rank, field);
 }
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
     zan_stat_t *t = 0;
     switch (idx) {
@@ -701,7 +639,6 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
         default: return 0;
     }
     if (kind == 0) { return (i32)t->calls; }
-    /* 内部辅助实现 */
     if (kind == 2) { return (i32)(t->px / 1000); }
     i32 kpx = (i32)(t->px / 1000);
     t->calls = 0;
@@ -709,7 +646,6 @@ EXPORT i32 zan_gui_stat_read(i32 idx, i32 kind) {
     return kpx;
 }
 
-/* 内部辅助逻辑 */
 static void cpu_clear_rect(zan_surface_t *s, int x, int y, int w, int h,
                            u32 c) {
     int x0 = clamp_i(x, s->clip_x0, s->clip_x1);
@@ -750,7 +686,6 @@ static void cpu_fill_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
     } else if (sa != 0) {
         ZAN_STAT(g_st_fill_blend, area);
         stat_top_rect(0, (int)area, x0, y0, x1 - x0, y1 - y0, c);
-        /* 内部辅助实现 */
         for (int py = y0; py < y1; py++) {
             blend_run_const(s->pixels + py * s->stride + x0, x1 - x0, c);
         }
@@ -765,10 +700,8 @@ EXPORT void zan_gui_fill_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
                                       (u32)color);
 }
 
-/* 内部辅助逻辑 */
 static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask);
 
-/* 内部辅助实现 */
 static void cpu_fill_vgrad(zan_surface_t *s, int x, int y, int w, int h,
                            int radius, int corners, u32 ct, u32 cb) {
     int x0 = clamp_i(x, s->clip_x0, s->clip_x1);
@@ -832,7 +765,6 @@ EXPORT void zan_gui_fill_vgrad_mask(
                                        (u32)color_top, (u32)color_bottom);
 }
 
-/* 底层系统交互与数据协议契约 */
 static u32 grad_sample(u32 from, u32 via, u32 to, int t) {
     u32 a = from, b = to;
     if (via != 0) {
@@ -848,7 +780,6 @@ static u32 grad_sample(u32 from, u32 via, u32 to, int t) {
     return (u32)out;
 }
 
-/* 内部辅助实现 */
 static void cpu_fill_grad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, int dir,
                           u32 cf, u32 cv, u32 ct) {
@@ -875,7 +806,6 @@ static void cpu_fill_grad(zan_surface_t *s, int x, int y, int w, int h,
         if (d == 0) {
             c = grad_sample(cf, cv, ct,
                 clamp_i(py - y, 0, denom) * 1000 / denom);
-            /* 内部辅助逻辑 */
             int j = py - y;
             if (r <= 0 || (j >= r && j < h - r)) {
                 blend_run_const(row + x0, x1 - x0, c);
@@ -928,21 +858,18 @@ static int zan_round_cov(int i, int j, int rw, int rh, int cr, int cmask) {
     double dx = (double)i + 0.5 - (double)cx;
     double dy = (double)j + 0.5 - (double)cy;
     double dist = sqrt(dx * dx + dy * dy);
-    double cov = (double)cr - dist + 0.5;           /* 核心系统底层抽象与内存语义契约 */
+    double cov = (double)cr - dist + 0.5;
     if (cov >= 1.0) return 255;
     if (cov <= 0.0) return 0;
     return (int)(cov * 255.0);
 }
 
-/* 内部辅助逻辑 */
-/* 内部辅助实现 */
 static void blur_put(zan_surface_t *s, int px, int py, u32 c, int cov) {
     if (cov <= 0 || clipped_out(s, px, py)) return;
     if (cov >= 255) { s->pixels[py * s->stride + px] = c; return; }
     set_pixel_aa(s, px, py, c, cov);
 }
 
-/* 内部辅助实现 */
 static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
                                int radius, int cr, int cmask, u32 *capture) {
     int x0 = clamp_i(x, 0, s->width);
@@ -956,7 +883,6 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
     if (r < 1) return;
     if (r > 40) r = 40;
 
-    /* 核心系统底层抽象与内存语义契约 */
     ZAN_STAT(g_st_blur, (long long)rw * (long long)rh);
     int ds = 1;
     if (r >= 12) { ds = 4; } else if (r >= 6) { ds = 2; }
@@ -965,12 +891,11 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
     size_t dn = (size_t)dw * (size_t)dh;
-    /* 内部辅助实现 */
     static u32 *scratch_a = NULL, *scratch_b = NULL;
     static size_t scratch_n = 0;
     if (dn > scratch_n) {
         u32 *na = (u32 *)realloc(scratch_a, dn * sizeof(u32));
-        if (!na) return;                    /* 底层系统交互与数据协议契约 */
+        if (!na) return;
         scratch_a = na;
         u32 *nb = (u32 *)realloc(scratch_b, dn * sizeof(u32));
         if (!nb) return;
@@ -1002,7 +927,6 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
         }
     }
 
-    /* 内部辅助逻辑 */
     int rr = r / ds; if (rr < 1) rr = 1;
     int win = 2 * rr + 1;
     for (int p = 0; p < 2; p++) {
@@ -1060,7 +984,6 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
              | ((u32)clamp_i(gc, 0, 255) << 8) | (u32)clamp_i(bc, 0, 255);
     }
 
-    /* 内部辅助实现 */
     if (ds == 1) {
         for (int j = 0; j < rh; j++) {
             u32 *src = a + j * dw;
@@ -1079,7 +1002,6 @@ static void zan_blur_rect_core(zan_surface_t *s, int x, int y, int w, int h,
             }
         }
     } else {
-        /* 内部辅助逻辑 */
         for (int j = 0; j < rh; j++) {
             int fy = ((j * 2 + 1) * 256) / (ds * 2) - 128;
             if (fy < 0) fy = 0;
@@ -1129,20 +1051,17 @@ EXPORT void zan_gui_blur_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 ra
                             -1, 1, 0, ZAN_CORNERS_ALL);
 }
 
-/* 内部辅助实现 */
 #define ZAN_BLUR_CACHE_SLOTS 256
 typedef struct {
     int valid;
     int sid; 
-/* 内部辅助实现 */
     int x0, y0, rw, rh, r;
-    int cr, cmask; /* 模块核心语义抽象与接口调用契约 */
-    u32 src_sum; /* 模块核心语义抽象与接口调用契约 */
+    int cr, cmask;
+    u32 src_sum;
     u32 *pixels;
     size_t cap;
 } zan_blur_cache_t;
 
-/* 内部辅助实现 */
 static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
     u32 sum = 2166136261u;
     for (int j = 0; j < rh; j += 8) {
@@ -1155,10 +1074,8 @@ static u32 zan_src_sum(zan_surface_t *s, int x0, int y0, int rw, int rh) {
 }
 static zan_blur_cache_t g_blur_cache[ZAN_BLUR_CACHE_SLOTS];
 
-/* 内部辅助实现 */
 static long long g_blur_partial_miss;
 
-/* 内部辅助实现 */
 static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
                      int slot, int dirty, int cr, int cmask) {
     if (slot < 0 || slot >= ZAN_BLUR_CACHE_SLOTS) {
@@ -1171,7 +1088,6 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     int y1 = clamp_i(y + h, 0, s->height);
     int rw = x1 - x0, rh = y1 - y0;
     if (rw <= 0 || rh <= 0) return;
-    /* 内部辅助实现 */
     if (!clip_hits(s, x0, y0, x1, y1)) return;
     int r = radius;
     if (r < 1) return;
@@ -1180,22 +1096,18 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     zan_blur_cache_t *c = &g_blur_cache[slot];
     size_t n = (size_t)rw * (size_t)rh;
 
-    /* 内部辅助实现 */
     int geom_ok = c->valid && c->pixels && c->sid == s->id
         && c->x0 == x0 && c->y0 == y0 && c->rw == rw && c->rh == rh
         && c->r == r && c->cr == cr && c->cmask == cmask;
     int covers = clip_covers(s, x0, y0, x1, y1);
     u32 sum = geom_ok ? zan_src_sum(s, x0, y0, rw, rh) : 0;
-    /* 内部辅助实现 */
     if (geom_ok && (!dirty || (covers && sum == c->src_sum))) {
         ZAN_STAT(g_st_blur_hit, (long long)rw * (long long)rh);
         if (covers) {
-            /* 模块核心语义抽象与接口调用契约 */
             for (int j = 0; j < rh; j++)
                 memcpy(s->pixels + (size_t)(y0 + j) * s->stride + x0,
                        c->pixels + (size_t)j * rw, (size_t)rw * sizeof(u32));
         } else {
-            /* 模块核心语义抽象与接口调用契约 */
             for (int j = 0; j < rh; j++) {
                 u32 *src = c->pixels + (size_t)j * rw;
                 for (int i = 0; i < rw; i++)
@@ -1205,7 +1117,6 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
         return;
     }
 
-    /* 内部辅助逻辑 */
     u32 fresh = geom_ok ? sum : zan_src_sum(s, x0, y0, rw, rh);
     if (c->cap < n) {
         u32 *np = (u32 *)realloc(c->pixels, n * sizeof(u32));
@@ -1213,7 +1124,6 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     }
     zan_blur_rect_core(s, x, y, w, h, radius, cr, cmask,
                        c->cap >= n ? c->pixels : NULL);
-    /* 内部辅助实现 */
     if (!covers) { g_blur_partial_miss++; }
     if (!covers || c->cap < n) { c->valid = 0; return; }
     c->x0 = x0; c->y0 = y0; c->rw = rw; c->rh = rh; c->r = r;
@@ -1223,7 +1133,6 @@ static void cpu_blur(zan_surface_t *s, int x, int y, int w, int h, int radius,
     c->valid = 1;
 }
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_blur_partial_miss_take(void) {
     i32 v = (i32)g_blur_partial_miss;
     g_blur_partial_miss = 0;
@@ -1240,7 +1149,6 @@ EXPORT void zan_gui_blur_rect_cached(
                             (int)slot, (int)dirty, 0, ZAN_CORNERS_ALL);
 }
 
-/* 内部辅助实现 */
 EXPORT void zan_gui_blur_round_cached(
     i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 radius, i32 slot,
     i32 dirty, i32 corner_radius, i32 corner_mask) {
@@ -1252,12 +1160,10 @@ EXPORT void zan_gui_blur_round_cached(
                             (int)corner_mask);
 }
 
-/* 内部辅助实现 */
 #define ZAN_SNAP_CACHE_SLOTS 8
 #define ZAN_SNAP_CACHE_MAX_SLOTS 512
 static zan_blur_cache_t *g_snap_cache;
 static int g_snap_cache_count;
-/* 模块核心语义抽象与接口调用契约 */
 #if defined(__ANDROID__)
 #define ZAN_SNAP_CACHE_BYTES (16u * 1024u * 1024u)
 #else
@@ -1319,7 +1225,6 @@ static void cpu_snapshot(zan_surface_t *s, int x, int y, int w, int h,
     size_t n = (size_t)rw * (size_t)rh;
     if (c->cap < n) {
 #if defined(__ANDROID__)
-        /* 内部辅助实现 */
         size_t keep = c->pixels ? c->cap * sizeof(u32) : 0;
         if (ZAN_SNAP_CACHE_BYTES
             && zan_snap_total_bytes() - keep + n * sizeof(u32)
@@ -1360,7 +1265,6 @@ EXPORT void zan_gui_snapshot_patch_rect(i32 surface_id, i32 x, i32 y, i32 w,
                                                 (int)h, (int)slot);
 }
 
-/* 内部辅助实现 */
 static void cpu_snapshot_patch(zan_surface_t *s, int x, int y, int w, int h,
                                int slot) {
     zan_blur_cache_t *c = zan_snap_slot(slot);
@@ -1396,7 +1300,6 @@ static int cpu_restore_rect(zan_surface_t *s, int x, int y, int w, int h,
         || c->x0 != x0 || c->y0 != y0 || c->rw != rw || c->rh != rh) {
         return 0;
     }
-    /* 内部辅助实现 */
     int cx0 = x0 > s->clip_x0 ? x0 : s->clip_x0;
     int cy0 = y0 > s->clip_y0 ? y0 : s->clip_y0;
     int cx1 = x1 < s->clip_x1 ? x1 : s->clip_x1;
@@ -1423,7 +1326,6 @@ static int cpu_restore_sub_rect(zan_surface_t *s, int x, int y, int w, int h,
         || x1 > c->x0 + c->rw || y1 > c->y0 + c->rh) {
         return 0;
     }
-    /* 内部辅助实现 */
     if (x0 < s->clip_x0) x0 = s->clip_x0;
     if (y0 < s->clip_y0) y0 = s->clip_y0;
     if (x1 > s->clip_x1) x1 = s->clip_x1;
@@ -1464,7 +1366,6 @@ EXPORT i32 zan_gui_restore_sub_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, 
                                          (int)slot, 1);
 }
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
     if (surface_id < 0 || surface_id >= g_surface_count) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -1494,7 +1395,6 @@ EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
         u32 *src = s->pixels + (size_t)j * (size_t)s->stride;
         for (int i = 0; i < w; i++) {
             u32 p = src[i];
-            /* 内部辅助逻辑 */
             row[i * 3 + 0] = (unsigned char)(p & 0xFF);
             row[i * 3 + 1] = (unsigned char)((p >> 8) & 0xFF);
             row[i * 3 + 2] = (unsigned char)((p >> 16) & 0xFF);
@@ -1506,8 +1406,6 @@ EXPORT i32 zan_gui_surface_dump(i32 surface_id, const char *path) {
     return 1;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
-/* 内部辅助实现 */
 #ifdef _WIN32
 
 typedef struct zan_present_shadow_s {
@@ -1522,7 +1420,6 @@ static zan_present_shadow_t *g_present_shadows = NULL;
 
 #define ZAN_DIFF_TILE 64
 
-/* 底层系统交互与数据协议契约 */
 static zan_present_shadow_t *present_shadow(void *hwnd, int w, int h, int alloc) {
     zan_present_shadow_t *prev = NULL;
     zan_present_shadow_t *it = g_present_shadows;
@@ -1560,7 +1457,7 @@ static zan_present_shadow_t *present_shadow(void *hwnd, int w, int h, int alloc)
     ns->h = h;
     ns->next = g_present_shadows;
     g_present_shadows = ns;
-    if (n >= 8) {  /* 核心系统底层抽象与内存语义契约 */
+    if (n >= 8) {
         zan_present_shadow_t *tail = g_present_shadows;
         while (tail->next && tail->next->next) tail = tail->next;
         free(tail->next->pixels);
@@ -1579,7 +1476,6 @@ static void present_shadow_fill_rect(zan_present_shadow_t *sh, const u32 *pix,
     }
 }
 
-/* 内部辅助实现 */
 #define ZAN_CHUNK_H 128
 
 static int gdi_upload_chunks(HDC dc, u32 *pix, BITMAPINFO *bmi,
@@ -1588,7 +1484,6 @@ static int gdi_upload_chunks(HDC dc, u32 *pix, BITMAPINFO *bmi,
     int y = ry;
     int end = ry + rh;
     int w = bmi->bmiHeader.biWidth;
-    /* 内部辅助逻辑 */
     HDC sdc = GetDC(0);
     HDC mdc = CreateCompatibleDC(sdc);
     ReleaseDC(0, sdc);
@@ -1624,12 +1519,9 @@ static int gdi_upload_chunks(HDC dc, u32 *pix, BITMAPINFO *bmi,
 
 #endif /* _WIN32 */
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id);
 
-/* 内部辅助实现 */
 #define ZAN_ATOMIC_AT 35
-/* 内部辅助实现 */
 #define ZAN_ATOMIC_RET 1000000
 EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                                i32 rect_count) {
@@ -1649,7 +1541,7 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     memset(&bmi, 0, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = w;
-    bmi.bmiHeader.biHeight = -h;  /* 底层系统交互与数据协议契约 */
+    bmi.bmiHeader.biHeight = -h;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
@@ -1661,7 +1553,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     zan_present_shadow_t *sh = present_shadow(hwnd, w, h, 1);
     int force_full = (rect_count < 0) || !sh;
     {
-        /* 内部辅助逻辑 */
         static int tilediff = -1;
         if (tilediff < 0) {
             const char *ev = getenv("ZAN_TILE_DIFF");
@@ -1671,7 +1562,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
     }
 
     if (!force_full && rect_count == 0) {
-        /* 底层系统交互与数据协议契约 */
         int tw = (w + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
         int th = (h + ZAN_DIFF_TILE - 1) / ZAN_DIFF_TILE;
         unsigned char *changed = (unsigned char *)calloc((size_t)tw * th, 1);
@@ -1704,7 +1594,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
             }
         }
         if (changed_tiles > 0) {
-            /* 内部辅助实现 */
             long long area = (long long)changed_tiles * ZAN_DIFF_TILE
                              * ZAN_DIFF_TILE;
             if (area * 100 > (long long)w * h * ZAN_ATOMIC_AT
@@ -1721,7 +1610,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                     if (changed[(size_t)ty * tw + tx]) { rowany[ty] = 1; break; }
                 }
             }
-            /* 内部辅助实现 */
             int n = 0;
             for (int ty = 0; ty < th; ty++) {
                 int tx = 0;
@@ -1750,7 +1638,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
                     }
                 }
             }
-            /* 内部辅助实现 */
             if (n > 48) {
                 int ty = 0;
                 n = 0;
@@ -1785,7 +1672,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
         free(out);
         free(rowany);
     } else if (force_full) {
-        /* 内部辅助实现 */
         if (zan_gui_atomic_present(hwnd, surface_id)) {
             memcpy(sh->pixels, pix, (size_t)w * (size_t)h * 4);
             ReleaseDC((HWND)hwnd, dc);
@@ -1835,8 +1721,6 @@ EXPORT i32 zan_gui_gdi_present(void *hwnd, i32 surface_id, i32 *rects,
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-/* 内部辅助实现 */
 #ifdef _WIN32
 typedef struct zan_atomic_layer_s {
     void *hwnd;
@@ -1856,7 +1740,6 @@ static zan_atomic_layer_t *atomic_layer(void *hwnd, int w, int h) {
     while (it) {
         if (it->hwnd == hwnd) {
             if (it->w != w || it->h != h) {
-                /* 模块核心语义抽象与接口调用契约 */
                 DeleteDC(it->dc);
                 DeleteObject(it->bm);
                 BITMAPINFO bmi;
@@ -1938,13 +1821,12 @@ static void zan_atomic_layer_drop(void *hwnd) {
         p = &(*p)->next;
     }
 }
-#endif /* 模块核心语义抽象与接口调用契约 */
+#endif
 
 /* 帧缓冲区向物理屏幕原子呈现提交 */
 EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
 #ifdef _WIN32
     if (!hwnd || surface_id < 0 || surface_id >= g_surface_count) return 0;
-    /* 内部辅助实现 */
     if (!(GetWindowLongPtrW((HWND)hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)) return 0;
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !s->pixels) return 0;
@@ -2028,7 +1910,6 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_gdi_present_drop(void *hwnd) {
 #ifdef _WIN32
     zan_present_shadow_t **p = &g_present_shadows;
@@ -2048,7 +1929,6 @@ EXPORT void zan_gui_gdi_present_drop(void *hwnd) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_surface_release(i32 surface_id, i32 slot) {
     (void)surface_id;
     zan_blur_cache_t *c = zan_snap_slot(slot);
@@ -2059,7 +1939,6 @@ EXPORT void zan_gui_surface_release(i32 surface_id, i32 slot) {
     c->valid = 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void cpu_draw_square_rect(zan_surface_t *s, int x, int y, int w, int h,
                                  u32 c, int t) {
     /* top */ cpu_fill_rect(s, x, y, w, t, c);
@@ -2077,7 +1956,6 @@ EXPORT void zan_gui_draw_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h, i32 co
                                         (int)thickness);
 }
 
-/* 内部辅助实现 */
 #define ZAN_CORNER_TL 1
 #define ZAN_CORNER_TR 2
 #define ZAN_CORNER_BR 4
@@ -2093,14 +1971,12 @@ static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
     if (r > ih/2) r = ih/2;
     ZAN_STAT(g_st_round, (long long)iw * (long long)ih);
 
-    /* 内部辅助实现 */
-    int xl = ix + r, xr = ix + iw - r;      /* 核心系统底层抽象与内存语义契约 */
+    int xl = ix + r, xr = ix + iw - r;
     int yt = iy + r, yb = iy + ih - r;
-    cpu_fill_rect(s, xl, iy, iw - 2*r, r, c);        /* 核心系统底层抽象与内存语义契约 */
+    cpu_fill_rect(s, xl, iy, iw - 2*r, r, c);
     cpu_fill_rect(s, ix, yt, iw, ih - 2*r, c);      /* middle */
-    cpu_fill_rect(s, xl, yb, iw - 2*r, r, c);        /* 核心系统底层抽象与内存语义契约 */
+    cpu_fill_rect(s, xl, yb, iw - 2*r, r, c);
 
-    /* 内部辅助实现 */
     double cc[4][2] = {
         {xl, yt},     /* TL, square px<xl, py<yt */
         {xr, yt},     /* TR, square px>=xr, py<yt */
@@ -2112,7 +1988,6 @@ static void cpu_fill_round(zan_surface_t *s, int x, int y, int w, int h,
     int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
     for (int ci = 0; ci < 4; ci++) {
         if (!(m & bit[ci])) {
-            /* 底层系统交互与数据协议契约 */
             cpu_fill_rect(s, zx[ci], zy[ci], r, r, c);
             continue;
         }
@@ -2142,7 +2017,6 @@ EXPORT void zan_gui_fill_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     zan_gui_fill_rounded_rect_mask(surface_id, x, y, w, h, radius, 15, color);
 }
 
-/* 内部辅助逻辑 */
 static u32 surface_round_color(u32 fill, u32 border, int outer, int inner) {
     uint64_t af = fill >> 24, ab = border >> 24;
     uint64_t bw = ab * (uint64_t)(outer - inner);
@@ -2169,7 +2043,6 @@ static void cpu_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         return;
     }
     int r = clamp_i(radius, 0, (w < h ? w : h) / 2);
-    /* 底层系统交互与数据协议契约 */
     int t = thickness < (w < h ? w : h) ? thickness : (w < h ? w : h);
     int iw = w - t - t, ih = h - t - t, ir = r > t ? r - t : 0;
     int x0 = clamp_i(x, s->clip_x0, s->clip_x1);
@@ -2228,7 +2101,6 @@ static void cpu_draw_round(zan_surface_t *s, int x, int y, int w, int h,
 
     int xl = ix + r, xr = ix + iw - r;
     int yt = iy + r, yb = iy + ih - r;
-    /* 底层系统交互与数据协议契约 */
     cpu_fill_rect(s, xl, iy, iw - 2*r, th, c);              /* top */
     cpu_fill_rect(s, xl, iy + ih - th, iw - 2*r, th, c);    /* bottom */
     cpu_fill_rect(s, ix, yt, th, ih - 2*r, c);             /* left */
@@ -2240,11 +2112,10 @@ static void cpu_draw_round(zan_surface_t *s, int x, int y, int w, int h,
     int zx[4] = {ix, xr, ix, xr};
     int zy[4] = {iy, iy, yb, yb};
     int bit[4] = {ZAN_CORNER_TL, ZAN_CORNER_TR, ZAN_CORNER_BL, ZAN_CORNER_BR};
-    int hx[4] = {ix, xr, ix, xr};          /* 核心系统底层抽象与内存语义契约 */
-    double rin = (double)r - (double)th;   /* 核心系统底层抽象与内存语义契约 */
+    int hx[4] = {ix, xr, ix, xr};
+    double rin = (double)r - (double)th;
     for (int ci = 0; ci < 4; ci++) {
         if (!(m & bit[ci])) {
-            /* 底层系统交互与数据协议契约 */
             int cy = (ci < 2) ? zy[ci] : zy[ci] + r - th;
             int cx = (ci % 2 == 0) ? hx[ci] : hx[ci] + r - th;
             cpu_fill_rect(s, zx[ci], cy, r, th, c);
@@ -2257,8 +2128,8 @@ static void cpu_draw_round(zan_surface_t *s, int x, int y, int w, int h,
                 double ddx = (double)px + 0.5 - ccx;
                 double ddy = (double)py + 0.5 - ccy;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                double outerCov = (double)r + 0.5 - dist;        /* 核心系统底层抽象与内存语义契约 */
-                double innerCov = dist - (rin - 0.5);            /* 核心系统底层抽象与内存语义契约 */
+                double outerCov = (double)r + 0.5 - dist;
+                double innerCov = dist - (rin - 0.5);
                 double cov = outerCov < innerCov ? outerCov : innerCov;
                 if (cov <= 0.0) continue;
                 if (cov >= 1.0) set_pixel(s, px, py, c);
@@ -2281,7 +2152,6 @@ EXPORT void zan_gui_draw_rounded_rect(i32 surface_id, i32 x, i32 y, i32 w, i32 h
     zan_gui_draw_rounded_rect_mask(surface_id, x, y, w, h, radius, 15, color, thickness);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
                              int radius, int blur, u32 c) {
     int iw = w, ih = h;
@@ -2296,7 +2166,6 @@ static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
     if (r > ih/2) r = ih/2;
     if (r < 0) r = 0;
 
-    /* 内部辅助实现 */
     double cx = (double)x + (double)iw / 2.0;
     double cy = (double)y + (double)ih / 2.0;
     double ex = (double)iw / 2.0 - (double)r;
@@ -2313,7 +2182,6 @@ static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
     if (x1 > s->width) x1 = s->width;
     if (y1 > s->height) y1 = s->height;
 
-    /* 内部辅助实现 */
     int in = r + (bl + 1) / 2 + 1;
     int xi0 = x + in, xi1 = x + iw - in;
     int yi0 = y + in, yi1 = y + ih - in;
@@ -2336,11 +2204,11 @@ static void cpu_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
             double outside = sqrt(mx*mx + my*my);
             double inside = (qx > qy ? qx : qy);
             if (inside > 0.0) inside = 0.0;
-            double d = outside + inside - (double)r;   /* 核心系统底层抽象与内存语义契约 */
+            double d = outside + inside - (double)r;
             double t = (d + half) * inv;
             if (t <= 0.0) { set_pixel(s, px, py, c); continue; }
             if (t >= 1.0) continue;
-            double cov = 1.0 - t * t * (3.0 - 2.0 * t);   /* 核心系统底层抽象与内存语义契约 */
+            double cov = 1.0 - t * t * (3.0 - 2.0 * t);
             set_pixel_aa(s, px, py, c, (int)(cov * 255.0));
         }
     }
@@ -2363,7 +2231,6 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
     double rin = rr - 0.5, rout = rr + 0.5;
     double rin2 = rin * rin, rout2 = rout * rout;
 
-    /* 底层系统交互与数据协议契约 */
     ZAN_STAT(g_st_round, (long long)(2 * r + 3) * (long long)(2 * r + 3));
     int ext = r + 2;
     int ylo = cy - ext, yhi = cy + ext;
@@ -2374,7 +2241,6 @@ static void cpu_fill_circle(zan_surface_t *s, int cx, int cy, int radius,
         double wy2 = wy * wy;
         if (wy2 > rout2) continue;
         u32 *row = s->pixels + (size_t)py * (size_t)s->stride;
-        /* 底层系统交互与数据协议契约 */
         double hs = (rin2 > wy2) ? sqrt(rin2 - wy2) : -1.0;
         int L = cx + (int)ceil(-hs - 0.5);
         int Rr = cx + (int)floor(hs - 0.5);
@@ -2405,7 +2271,6 @@ EXPORT void zan_gui_fill_circle(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
                                          (u32)color);
 }
 
-/* 内部辅助实现 */
 static void cpu_draw_circle(zan_surface_t *s, int cx, int cy, int radius,
                             u32 c, int thickness) {
     int r = radius;
@@ -2413,7 +2278,6 @@ static void cpu_draw_circle(zan_surface_t *s, int cx, int cy, int radius,
     double half = (double)(thickness > 0 ? thickness : 1) / 2.0;
     int ext = r + (int)half + 2;
 
-    /* 底层系统交互与数据协议契约 */
     for (int py = cy - ext; py <= cy + ext; py++) {
         if (py < s->clip_y0 || py >= s->clip_y1) continue;
         double wy = (double)py + 0.5 - (double)cy;
@@ -2440,7 +2304,6 @@ EXPORT void zan_gui_draw_circle(
                                          (u32)color, (int)thickness);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
                             u32 color, int inner_a) {
     int r = radius;
@@ -2452,8 +2315,6 @@ static void cpu_fill_radial(zan_surface_t *s, int cx, int cy, int radius,
     if (peak <= 0) return;
     int r2 = r * r;
     ZAN_STAT(g_st_radial, (long long)(2 * r + 1) * (long long)(2 * r + 1));
-    /* 内部辅助实现 */
-    /* 内部辅助实现 */
     int y_lo = icy - r, y_hi = icy + r;
     if (y_lo < s->clip_y0) y_lo = s->clip_y0;
     if (y_hi > s->clip_y1 - 1) y_hi = s->clip_y1 - 1;
@@ -2488,7 +2349,6 @@ EXPORT void zan_gui_fill_radial(i32 surface_id, i32 cx, i32 cy, i32 radius, i32 
                                          (u32)color, (int)inner_a);
 }
 
-/* 内部辅助逻辑 */
 EXPORT void zan_gui_fill_rects(i32 surface_id, const i32 *data, i32 count) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
     zan_surface_t *s = g_surfaces[surface_id];
@@ -2522,7 +2382,6 @@ EXPORT void zan_gui_fill_radials(i32 surface_id, const i32 *data, i32 count) {
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 EXPORT void zan_gui_blit_surface(i32 dst_id, i32 src_id, i32 dst_x, i32 dst_y,
                                  i32 src_x, i32 src_y, i32 w, i32 h) {
     if (dst_id < 0 || dst_id >= g_surface_count) return;
@@ -2552,7 +2411,6 @@ EXPORT void zan_gui_blit_surface(i32 dst_id, i32 src_id, i32 dst_x, i32 dst_y,
     if (d->be && d->be->sync_from_cpu) d->be->sync_from_cpu(d);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
                             int r_outer, int a0_deg, int a1_deg, u32 c) {
     if (r_outer <= 0) return;
@@ -2561,7 +2419,6 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
     double sweep = a1 - a0;
     if (sweep <= 0.0) return;
     if (sweep > 360.0) sweep = 360.0;
-    /* 内部辅助逻辑 */
     a0 = a0 - floor(a0 / 360.0) * 360.0;
     a1 = a0 + sweep;
 
@@ -2578,16 +2435,14 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
     if (roIn2 < 0.0) roIn2 = 0.0;
     int full = sweep >= 360.0;
 
-    /* 模块核心语义抽象与接口调用契约 */
     double e0x = sin(a0 * PI / 180.0), e0y = -cos(a0 * PI / 180.0);
     double e1x = sin(a1 * PI / 180.0), e1y = -cos(a1 * PI / 180.0);
     /* cross(v,w) = v */
-    int wide = sweep > 180.0;   /* 核心系统底层抽象与内存语义契约 */
+    int wide = sweep > 180.0;
 
     int bx0 = cx - r_outer - 1, bx1 = cx + r_outer + 1;
     int by0 = cy - r_outer - 1, by1 = cy + r_outer + 1;
     if (!full) {
-        /* 内部辅助实现 */
         double xmn = e0x * ri, xmx = xmn, ymn = e0y * ri, ymx = ymn;
         double cand[10][2];
         int n = 0;
@@ -2629,7 +2484,6 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
         int rx1 = (int)floor((double)cx + half - 0.5);
         if (rx0 < bx0) rx0 = bx0;
         if (rx1 > bx1) rx1 = bx1;
-        /* 模块核心语义抽象与接口调用契约 */
         int spans[2][2];
         int nspan = 0;
         if (hasHole && wy2 < riOut2) {
@@ -2660,9 +2514,7 @@ static void cpu_fill_sector(zan_surface_t *s, int cx, int cy, int r_inner,
                 if (radCov > 1.0) radCov = 1.0;
                 double angCov = 1.0;
                 if (!full) {
-                    /* 底层系统交互与数据协议契约 */
                     if (wide) {
-                        /* 内部辅助逻辑 */
                         double gLo = e1x * wy - e1y * wx;
                         double gHi = wx * e0y - wy * e0x;
                         double covLo = gLo + 0.5, covHi = gHi + 0.5;
@@ -2706,7 +2558,6 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
     int t = thickness;
 
     if (t <= 1) {
-        /* 核心系统底层抽象与内存语义契约 */
         int steep = abs(y1 - y0) > abs(x1 - x0);
         double fx0 = (double)x0, fy0 = (double)y0, fx1 = (double)x1, fy1 = (double)y1;
         if (steep) { double tmp; tmp = fx0; fx0 = fy0; fy0 = tmp; tmp = fx1; fx1 = fy1; fy1 = tmp; }
@@ -2743,14 +2594,12 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         double dx = (double)(x1 - x0), dy = (double)(y1 - y0);
         double len2 = dx*dx + dy*dy;
         double half = t * 0.5;
-        /* 模块核心语义抽象与接口调用契约 */
         int lox = (x0 < x1 ? x0 : x1);
         int hix = (x0 > x1 ? x0 : x1);
         int loy = (y0 < y1 ? y0 : y1);
         int hiy = (y0 > y1 ? y0 : y1);
         int minx = lox - t - 1, maxx = hix + t + 1;
         int miny = loy - t - 1, maxy = hiy + t + 1;
-        /* 模块核心语义抽象与接口调用契约 */
         double ux = 0.0, uy = 0.0, seglen = sqrt(len2);
         if (seglen > 0.0001) { ux = dx / seglen; uy = dy / seglen; }
         double rr = half + 0.5;
@@ -2759,7 +2608,6 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
         if (minx < s->clip_x0) minx = s->clip_x0;
         if (maxx > s->clip_x1 - 1) maxx = s->clip_x1 - 1;
         for (int py = miny; py <= maxy; py++) {
-            /* 内部实现与并发/内存约束规范 */
             double yc = (double)py + 0.5;
             double lo = 1e30, hi = -1e30;
             for (int e = 0; e < 2; e++) {
@@ -2772,7 +2620,7 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
                 if (ecx + half_w > hi) hi = ecx + half_w;
             }
             if (seglen > 0.0001) {
-                double nx = -uy * rr, ny = ux * rr;   /* 核心系统底层抽象与内存语义契约 */
+                double nx = -uy * rr, ny = ux * rr;
                 for (int e = 0; e < 2; e++) {
                     double sgn = e ? -1.0 : 1.0;
                     double ax = (double)x0 + sgn * nx, ay = (double)y0 + sgn * ny;
@@ -2802,7 +2650,7 @@ static void cpu_draw_line(zan_surface_t *s, int x0, int y0, int x1, int y1,
                 double cyp = (double)y0 + proj * dy;
                 double ddx = pxc - cxp, ddy = pyc - cyp;
                 double dist = sqrt(ddx*ddx + ddy*ddy);
-                double cov = half + 0.5 - dist;   /* 核心系统底层抽象与内存语义契约 */
+                double cov = half + 0.5 - dist;
                 if (cov <= 0.0) continue;
                 int icov = aa_coverage(cov);
                 if (icov >= 255) set_pixel(s, px, py, c);
@@ -2820,11 +2668,10 @@ EXPORT void zan_gui_draw_line(i32 surface_id, i32 x0, i32 y0, i32 x1, i32 y1, i3
                                      (u32)color, (int)thickness);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
-static u8  *g_poly_cov = NULL;    /* 核心系统底层抽象与内存语义契约 */
+static u8  *g_poly_cov = NULL;
 static i32  g_poly_cov_w = 0;
 static i32  g_poly_cov_h = 0;
-static i32 *g_poly_dirty = NULL;  /* 核心系统底层抽象与内存语义契约 */
+static i32 *g_poly_dirty = NULL;
 static i32  g_poly_dirty_n = 0;
 static i32  g_poly_dirty_cap = 0;
 
@@ -2840,12 +2687,10 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
         g_poly_cov = (u8*)malloc((size_t)W * (size_t)H);
         g_poly_cov_w = W;
         g_poly_cov_h = H;
-        /* 内部辅助逻辑 */
         if (g_poly_cov) memset(g_poly_cov, 0, (size_t)W * (size_t)H);
     }
     if (!g_poly_cov) { g_poly_cov_w = 0; g_poly_cov_h = 0; return; }
     g_poly_dirty_n = 0;
-    /* 内部辅助实现 */
 
     double half = t * 0.5;
     for (i32 i = 0; i + 1 < n; i++) {
@@ -2864,7 +2709,6 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
         if (maxx >= W) maxx = W - 1;
         if (maxy >= H) maxy = H - 1;
         for (int py = miny; py <= maxy; py++) {
-            /* 核心系统底层抽象与内存语义契约 */
             double pyc = (double)py + 0.5;
             for (int px = minx; px <= maxx; px++) {
                 double pxc = (double)px + 0.5;
@@ -2875,16 +2719,15 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
                 double cyp = y0 + proj * dy;
                 double ddx = pxc - cxp, ddy = pyc - cyp;
                 double dist = sqrt(ddx * ddx + ddy * ddy);
-                double cov = half + 0.5 - dist;   /* 核心系统底层抽象与内存语义契约 */
+                double cov = half + 0.5 - dist;
                 if (cov <= 0.0) continue;
                 int icov = aa_coverage(cov);
                 int idx = py * W + px;
-                if (g_poly_cov[idx] == 0) {       /* 核心系统底层抽象与内存语义契约 */
+                if (g_poly_cov[idx] == 0) {
                     if (g_poly_dirty_n >= g_poly_dirty_cap) {
                         i32 cap2 = g_poly_dirty_cap ? g_poly_dirty_cap * 2 : 1024;
                         i32 *nd = (i32*)realloc(g_poly_dirty,
                             (size_t)cap2 * sizeof(i32));
-                        /* 内部辅助实现 */
                         if (!nd) {
                             memset(g_poly_cov, 0, (size_t)W * (size_t)H);
                             g_poly_dirty_n = 0;
@@ -2895,13 +2738,11 @@ static void zan_polyline_core(zan_surface_t *s, const i32 *pts, i32 n,
                     }
                     g_poly_dirty[g_poly_dirty_n++] = (py << 16) | (px & 0xFFFF);
                 }
-                /* 内部辅助实现 */
                 if (icov > g_poly_cov[idx]) g_poly_cov[idx] = (u8)icov;
             }
         }
     }
 
-    /* 模块核心语义抽象与接口调用契约 */
     for (i32 d = 0; d < g_poly_dirty_n; d++) {
         int px = g_poly_dirty[d] & 0xFFFF;
         int py = (g_poly_dirty[d] >> 16) & 0xFFFF;
@@ -2923,7 +2764,6 @@ EXPORT void zan_gui_draw_polyline(i32 surface_id, const i32 *pts, i32 n,
     ZAN_IMPL(s, polyline)->polyline(s, pts, (int)n, (u32)color, t, 0);
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_draw_polyline_fx(i32 surface_id, const i32 *pts, i32 n,
                                      i32 color, i32 thickness) {
     if (surface_id < 0 || surface_id >= g_surface_count) return;
@@ -2934,7 +2774,6 @@ EXPORT void zan_gui_draw_polyline_fx(i32 surface_id, const i32 *pts, i32 n,
     ZAN_IMPL(s, polyline)->polyline(s, pts, (int)n, (u32)color, t, 8);
 }
 
-/* 内部辅助实现 */
 static void cpu_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
                          int t, int shift);
 
@@ -2969,7 +2808,6 @@ EXPORT void zan_gui_draw_polybatch(i32 surface_id, const i32 *pts,
 EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return NULL;
     zan_surface_t *s = g_surfaces[surface_id];
-    /* 内部辅助实现 */
     if (s->be) {
         if (s->be->flush) s->be->flush(s);
         if (s->be->read_pixels) s->be->read_pixels(s);
@@ -2977,7 +2815,6 @@ EXPORT void *zan_gui_get_pixels(i32 surface_id) {
     return (void *)s->pixels;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_read_pixel(i32 surface_id, i32 x, i32 y) {
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id])
         return -1;
@@ -2990,7 +2827,6 @@ EXPORT i32 zan_gui_read_pixel(i32 surface_id, i32 x, i32 y) {
     return (i32)(s->pixels[(size_t)y * (size_t)s->stride + (size_t)x]);
 }
 
-/* 内部实现与并发/内存约束规范 */
 EXPORT i32 zan_gui_present_window(i32 surface_id, void *native_window) {
     if (surface_id < 0 || surface_id >= g_surface_count ||
         !g_surfaces[surface_id]) return 0;
@@ -2999,13 +2835,11 @@ EXPORT i32 zan_gui_present_window(i32 surface_id, void *native_window) {
     return s->be->present(s, native_window) ? 1 : 0;
 }
 
-/* 内部辅助实现 */
 EXPORT void zan_gui_release_window(void *native_window) {
     if (g_backend && g_backend->drop_window)
         g_backend->drop_window(native_window);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
                          int dx, int dy, int dw, int dh,
                          int sx, int sy, int sw, int sh)
@@ -3029,7 +2863,6 @@ static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
 
     int boxX = idw < isw;
     int boxY = idh < ish;
-    /* 内部辅助实现 */
     long long nDen = boxX ? idw : 2 * (long long)idw;
     long long t0 = boxX ? (long long)(x0 - idx2) * isw
                         : ((long long)(x0 - idx2) * 2 + 1) * isw;
@@ -3039,7 +2872,6 @@ static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
     int qxStep = (int)(tStep / nDen);
     int rxStep = (int)(tStep % nDen);
     int rDen = (int)nDen;
-    /* 内部辅助逻辑 */
     int qx2 = (int)((((long long)(x0 - idx2) + 1) * isw + idw - 1) / idw);
     int rx2 = (int)((((long long)(x0 - idx2) + 1) * isw + idw - 1) % idw);
     for (py = y0; py < y1; py++) {
@@ -3049,7 +2881,6 @@ static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
             sy1 = isy + (int)(((long long)(py - idy + 1) * ish + idh - 1) / idh);
             if (sy1 <= sy0) { sy1 = sy0 + 1; }
         } else {
-            /* 模块核心语义抽象与接口调用契约 */
             sy0 = isy + (int)(((long long)(py - idy) * 2 + 1) * ish / (2 * (long long)idh));
             sy1 = sy0 + 1;
         }
@@ -3071,7 +2902,6 @@ static void cpu_blit_img(zan_surface_t *s, const zan_bitmap *img, int tint,
             if (sy1 - sy0 == 1 && sx1 - sx0 == 1) {
                 sp = img->pixels[(size_t)sy0 * (size_t)img->stride + (size_t)sx0];
             } else {
-                /* 内部辅助逻辑 */
                 int sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
                 for (int yy = sy0; yy < sy1; yy++) {
                     const u32 *srow = img->pixels + (size_t)yy * (size_t)img->stride;
@@ -3162,7 +2992,6 @@ EXPORT void zan_gui_blit_surface_scaled(i32 dst_id, i32 src_id,
     i32 dx, i32 dy, i32 dw, i32 dh, i32 sx, i32 sy, i32 sw, i32 sh) {
     const zan_bitmap *src = zan_gui_surface_bitmap(src_id);
     if (!src) return;
-    /* 模块核心语义抽象与接口调用契约 */
     if (dst_id == src_id) {
         size_t bytes = (size_t)src->stride * (size_t)src->height * sizeof(u32);
         u32 *copy = (u32 *)malloc(bytes);
@@ -3177,7 +3006,6 @@ EXPORT void zan_gui_blit_surface_scaled(i32 dst_id, i32 src_id,
     }
 }
 
-/* 内部辅助实现 */
 #define ZAN_GUI_MAX_HIT_GUARDS 1024
 static int g_hit_guards[ZAN_GUI_MAX_HIT_GUARDS][4];
 static iptr g_hit_guard_win[ZAN_GUI_MAX_HIT_GUARDS];
@@ -3206,7 +3034,6 @@ EXPORT i32 zan_gui_add_hit_guard(iptr hwnd, i32 x, i32 y, i32 w, i32 h) {
     return 0;
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
     for (int i = 0; i < g_hit_guard_count; i++) {
         const int *g = g_hit_guards[i];
@@ -3217,7 +3044,6 @@ static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
     return 0;
 }
 
-/* 内部辅助实现 */
 #include "gui_runtime_glyph.c"
 #include "gui_runtime_text.c"
 #if defined(ZAN_GUI_OHOS)
@@ -3234,19 +3060,17 @@ static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
 #include "gui_runtime_shims.c"
 #include "gui_runtime_android.c"
 
-/* 内部辅助实现 */
 static void cpu_polyline(zan_surface_t *s, const int32_t *pts, int n, u32 c,
                          int t, int shift) {
     zan_polyline_core(s, pts, (i32)n, c, t, shift);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 static void cpu_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
     u32 cr = (run->color >> 16) & 0xFF;
     u32 cg = (run->color >> 8) & 0xFF;
     u32 cb = run->color & 0xFF;
     u32 ca = (run->color >> 24) & 0xFF;
-    if (ca == 0) ca = 255;   /* 核心系统底层抽象与内存语义契约 */
+    if (ca == 0) ca = 255;
     for (int i = 0; i < run->count; i++) {
         const zan_glyph_tile *tile = run->items[i].tile;
         int ox = run->items[i].x, oy = run->items[i].y;
@@ -3256,7 +3080,6 @@ static void cpu_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
         int px0 = s->clip_x0 - ox; if (px0 < 0) px0 = 0;
         int px1 = s->clip_x1 - ox; if (px1 > tw) px1 = tw;
         if (tile->flags & ZAN_TILE_RGBA) {
-            /* 内部辅助逻辑 */
             const u32 *cov = (const u32 *)tile->cov;
             for (int py = py0; py < py1; py++) {
                 const u32 *srow = cov + (size_t)py * (size_t)tw;
@@ -3337,19 +3160,17 @@ const zan_gui_backend zan_cpu_backend = {
     .snapshot     = cpu_snapshot,
     .snapshot_patch = cpu_snapshot_patch,
     .restore      = cpu_restore,
-    .draw_text    = NULL,   /* 底层系统交互与数据协议契约 */
+    .draw_text    = NULL,
     .glyph_run    = cpu_glyph_run,
     .blit_pixels  = cpu_blit_pixels,
     .blit_pixels_batch = cpu_blit_pixels_batch,
-    .set_clip     = NULL,   /* 模块核心语义抽象与接口调用契约 */
-    .flush        = NULL,   /* 核心系统底层抽象与内存语义契约 */
-    .read_pixels  = NULL,   /* 核心系统底层抽象与内存语义契约 */
+    .set_clip     = NULL,
+    .flush        = NULL,
+    .read_pixels  = NULL,
 };
 
-/* 内部辅助实现 */
 #include "gui_gl_backend.c"
 
-/* 内部辅助逻辑 */
 EXPORT i32 zan_gui_set_render_backend(i32 mode) {
     const zan_gui_backend *be = NULL;
     if (mode == 1 || mode == 2) {
@@ -3360,23 +3181,18 @@ EXPORT i32 zan_gui_set_render_backend(i32 mode) {
     for (int i = 0; i < g_surface_count; i++) {
         zan_surface_t *s = g_surfaces[i];
         if (!s || s->be == be) continue;
-        /* 模块核心语义抽象与接口调用契约 */
         if (s->be && s->be->flush) s->be->flush(s);
         if (s->be && s->be->read_pixels) s->be->read_pixels(s);
         s->be = be;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     if (!be) zan_gui_internal_gl_drop_present();
     return be ? 1 : 0;
 }
 
-/* 内部辅助逻辑 */
 EXPORT const char *zan_gui_render_backend(void) {
     return zan_gui_internal_backend_name();
 }
 
-/* 内部辅助实现 */
-/* 内部辅助实现 */
 static inline size_t zan_gui_upload_last_bytes(void) { return 0; }
 static inline int zan_gui_upload_last_full(void) { return 0; }
 
@@ -3406,7 +3222,6 @@ EXPORT const char *zan_gui_mem_report(void) {
     }
     char buf[384];
 #if defined(__ANDROID__) || defined(ZAN_GUI_OHOS)
-    /* 模块核心语义抽象与接口调用契约 */
     struct mallinfo mi = mallinfo();
 #endif
 #ifdef __ANDROID__

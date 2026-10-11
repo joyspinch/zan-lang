@@ -30,26 +30,25 @@ static void zan_alog(const char *fmt, ...) {
 #define ZAN_TRACE(...) ((void)0)
 #endif
 
-/* 内部辅助实现 */
 typedef struct {
-    ANativeWindow *nw;    /* 核心系统底层抽象与内存语义契约 */
-    int w, h;             /* 核心系统底层抽象与内存语义契约 */
+    ANativeWindow *nw;
+    int w, h;
     int attached;
-    int closed;           /* 核心系统底层抽象与内存语义契约 */
+    int closed;
 
     /* EGL 呈现状态：在 surface 附着或首次 present 时创建（运行于 glue 应用线程） */
     EGLDisplay egl_dpy;
     EGLSurface egl_surf;
     EGLContext egl_ctx;
-    ANativeWindow *surf_nw;  /* 核心系统底层抽象与内存语义契约 */
-    int        surf_w, surf_h; /* 底层系统交互与数据协议契约 */
+    ANativeWindow *surf_nw;
+    int        surf_w, surf_h;
     GLuint     gl_prog;
     GLuint     gl_tex;
     GLuint     gl_vbo;
     int        tex_w, tex_h;
 
-    struct android_app *app;   /* 底层系统交互与数据协议契约 */
-    int destroy_wait;          /* 核心系统底层抽象与内存语义契约 */
+    struct android_app *app;
+    int destroy_wait;
 } zan_anw_t;
 
 static zan_anw_t g_anw;
@@ -59,7 +58,6 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
-/* 内部辅助实现 */
 typedef struct { int e[8]; iptr win; } zan_aev_t;
 #define ZAN_AQ_CAP 512
 static zan_aev_t g_aq[ZAN_AQ_CAP];
@@ -104,7 +102,6 @@ static int aq_pop(void) {
     return 1;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void ant_gl_reset(void);
 
@@ -117,7 +114,6 @@ static void anw_attach(ANativeWindow *nw) {
     g_anw.attached = 1;
     g_window_width = w;
     g_window_height = h;
-    /* 底层系统交互与数据协议契约 */
     aq_push_locked(7, w, h, 0, 0, 0);
     /* Surface 重新附着：强制触发全屏重绘并唤醒 WaitEvent 挂起线程 */
     aq_push_locked(14, 0, 0, 0, 0, 0);
@@ -133,15 +129,14 @@ static void anw_detach(void) {
     pthread_mutex_unlock(&g_aq_lock);
 }
 
-/* 内部辅助实现 */
 static i64 ant_tick_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-#define ANT_TOUCH_SLOP2   64.0f   /* 核心系统底层抽象与内存语义契约 */
-#define ANT_TOUCH_HIST    8       /* 核心系统底层抽象与内存语义契约 */
+#define ANT_TOUCH_SLOP2   64.0f
+#define ANT_TOUCH_HIST    8
 #define ANT_FLING_START_PX_S 250.0f
 #define ANT_FLING_STOP_PX_S  120.0f
 #define ANT_FLING_TAU_MS     400.0f
@@ -430,7 +425,6 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
         pthread_mutex_lock(&g_aq_lock);
         g_anw.destroy_wait = 0;
         pthread_mutex_unlock(&g_aq_lock);
-        /* 内部辅助实现 */
         ant_set_immersive();
         anw_attach(app->window);
         break;
@@ -455,7 +449,6 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
         }
         break;
     case APP_CMD_WINDOW_REDRAW_NEEDED:
-        /* 内部辅助实现 */
         if (g_anw.attached) {
             pthread_mutex_lock(&g_aq_lock);
             aq_push_locked(14, 0, 0, 0, 0, 0);
@@ -484,7 +477,6 @@ static void fling_cancel_public(void) {
     pthread_mutex_unlock(&g_aq_lock);
 }
 
-/* 内部辅助实现 */
 
 static char g_files_dir[512] = "/data/local/tmp";
 
@@ -497,7 +489,6 @@ static void ant_set_dpi(struct android_app *app) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 int main(int argc, char **argv);
 
 void android_main(struct android_app *app) {
@@ -510,7 +501,6 @@ void android_main(struct android_app *app) {
     if (files && files[0]) {
         snprintf(g_files_dir, sizeof(g_files_dir), "%s", files);
         if (chdir(g_files_dir) != 0) {
-            /* 底层系统交互与数据协议契约 */
         }
     }
 
@@ -540,7 +530,6 @@ void android_main(struct android_app *app) {
     char *arg0 = "zan";
     char *argv[1] = { arg0 };
     main(1, argv);
-    /* 底层系统交互与数据协议契约 */
 }
 
 /* ---- present (EGL) ------------------------------------------------------ */
@@ -604,7 +593,6 @@ static int ant_gl_surface(zan_anw_t *w) {
                                              (EGLNativeWindowType)w->nw, NULL);
         if (w->egl_surf == EGL_NO_SURFACE) return 1;
         w->surf_nw = w->nw;
-        /* 内部辅助实现 */
         EGLint qw = 0, qh = 0;
         if (eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_WIDTH, &qw)
             && eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_HEIGHT, &qh)
@@ -615,7 +603,6 @@ static int ant_gl_surface(zan_anw_t *w) {
             w->surf_w = w->w;
             w->surf_h = w->h;
         }
-        /* 内部辅助实现 */
         ant_gl_reset();
     }
     if (!w->egl_ctx) {
@@ -628,7 +615,6 @@ static int ant_gl_surface(zan_anw_t *w) {
     return 0;
 }
 
-/* 内部辅助实现 */
 static void ant_gl_reset(void) {
     zan_anw_t *w = &g_anw;
     w->gl_prog = 0;
@@ -666,7 +652,6 @@ static int ant_gl_program(zan_anw_t *w) {
     return 0;
 }
 
-/* 内部辅助实现 */
 #define ZAN_ANT_DIRTY_MAX 512
 static i32 g_dirty[ZAN_ANT_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -755,7 +740,6 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     return 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 /* JNI: Activity */
 static void ant_set_orientation(int landscape) {
@@ -883,7 +867,6 @@ EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0
 EXPORT i32 zan_gui_set_title(iptr h, const char *t) { (void)h; (void)t; return 0; }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
@@ -895,7 +878,6 @@ EXPORT i32 zan_gui_poll_event(void) {
 
 static long long g_wait_spins;
 
-/* 内部辅助实现 */
 static void ant_pump_looper(void) {
     struct android_app *app = g_anw.app;
     if (!app) return;
@@ -920,7 +902,6 @@ EXPORT i32 zan_gui_wait_event(void) {
     for (;;) {
         ant_pump_looper();
         if (aq_pop()) { return 0; }
-        /* 底层系统交互与数据协议契约 */
         if (g_anw.destroy_wait && g_anw.app) {
             int events;
             struct android_poll_source *source;
@@ -993,7 +974,6 @@ EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i32 zan_gui_client_width(iptr hwnd_val)  { (void)hwnd_val; return g_window_width; }
 EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_window_height; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
@@ -1095,13 +1075,11 @@ static jchar *ant_utf8_to_utf16(const char *in, jsize *out_len) {
     return out;
 }
 
-/* 底层系统交互与数据协议契约 */
 static jclass g_ime_cls;
 static jmethodID g_ime_show, g_ime_hide;
 static void ant_ime_commit(JNIEnv *env, jclass clazz, jstring text);
 static void ant_ime_set_composing(JNIEnv *env, jclass clazz, jstring text);
 
-/* 内部辅助实现 */
 static char g_composing[256];
 static size_t g_composing_len;
 
@@ -1117,7 +1095,6 @@ static void ant_composing_store(const char *utf8) {
         g_composing[0] = 0;
         g_composing_len = 0;
     }
-    /* 内部辅助实现 */
     aq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_aq_lock);
 }
@@ -1178,7 +1155,6 @@ fail:
     return -1;
 }
 
-/* 内部辅助实现 */
 static void ant_ime_commit(JNIEnv *env, jclass clazz, jstring text) {
     (void)clazz;
     if (!env || !text) return;
@@ -1342,7 +1318,6 @@ EXPORT int  zan_gui_drop_pending(void)             { return 0; }
 EXPORT const char *zan_gui_drop_take(void)         { return ""; }
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y)      { (void)x; (void)y; }
 
-/* 核心系统底层抽象与内存语义契约 */
 EXPORT i32 zan_gui_set_ime_open(i32 on) {
     struct android_app *app = g_anw.app;
     if (!app || !app->activity) return 1;
@@ -1364,7 +1339,6 @@ EXPORT i32 zan_gui_set_ime_open(i32 on) {
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT const char *zan_gui_ime_composing(void) {
     static char buf[sizeof(g_composing)];
     pthread_mutex_lock(&g_aq_lock);
@@ -1374,7 +1348,7 @@ EXPORT const char *zan_gui_ime_composing(void) {
 }
 
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
-    (void)hwnd_val; (void)tint_argb; return 1; /* 核心系统底层抽象与内存语义契约 */
+    (void)hwnd_val; (void)tint_argb; return 1;
 }
 EXPORT i32 zan_gui_disable_glass(iptr hwnd_val)    { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(iptr h, i32 percent) { (void)h; (void)percent; return 0; }
@@ -1389,7 +1363,6 @@ EXPORT i32 zan_gui_write_file(const char *path, const char *utf8) {
     return w == n ? 0 : 1;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val)                  { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr rend)     { (void)hwnd_val; (void)rend; return 1; }
 EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {

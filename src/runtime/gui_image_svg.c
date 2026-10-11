@@ -1,4 +1,3 @@
-/* 底层系统交互与数据协议契约 */
 
 #include <math.h>
 #include <stdint.h>
@@ -7,11 +6,9 @@
 
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg/nanosvg.h"
-/* 底层系统交互与数据协议契约 */
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvg/nanosvgrast.h"
 
-/* 底层系统交互与数据协议契约 */
 int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
                    int *outH, int boxW, int boxH) {
     char *doc;
@@ -32,14 +29,12 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
     if (!img) { free(doc); return 0; }
     iw = img->width;
     ih = img->height;
-    /* 底层系统交互与数据协议契约 */
     if (iw <= 0.0f || ih <= 0.0f) {
         nsvgDelete(img); free(doc); return 0;
     }
     if (boxW <= 0) boxW = (int)(iw + 0.5f);
     if (boxH <= 0) boxH = (int)(ih + 0.5f);
     if (boxW <= 0 || boxH <= 0) { nsvgDelete(img); free(doc); return 0; }
-    /* 底层系统交互与数据协议契约 */
     scale = boxW / iw < boxH / ih ? boxW / iw : boxH / ih;
     if (scale <= 0.0f || !(scale < 1e6f)) scale = 1.0f;
     w = (int)(iw * scale + 0.5f);
@@ -58,7 +53,6 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
         nsvgRasterize(rast, img, 0.0f, 0.0f, scale, rgba, w, h, w * 4);
         pix = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
         if (pix) {
-            /* 底层系统交互与数据协议契约 */
             n = w * h;
             for (x = 0; x < n; x++) {
                 unsigned char r = rgba[x*4], g = rgba[x*4+1],

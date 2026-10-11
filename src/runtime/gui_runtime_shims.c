@@ -1,8 +1,6 @@
 /* gui_runtime_shims */
 
-/* 核心系统底层抽象与内存语义契约 */
 #if defined(__APPLE__) && !defined(ZAN_GUI_COCOA)
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }
@@ -52,10 +50,8 @@ EXPORT void zan_gui_webview_set_context_menu_enabled(i32 h, i32 enabled) {
 }
 #endif
 
-/* 底层系统交互与数据协议契约 */
 #if !defined(_WIN32)
 
-/* 底层系统交互与数据协议契约 */
 static int zan_shim_utf8_next(const unsigned char *s, int limit, int *pos,
                               unsigned *cp) {
     unsigned char b = s[*pos];
@@ -90,7 +86,7 @@ int MultiByteToWideChar(unsigned int page, unsigned int flags,
     if (limit < 0) {
         limit = 0;
         while (s[limit] != 0) { limit++; }
-        limit++;                                    /* 核心系统底层抽象与内存语义契约 */
+        limit++;
     }
     int i = 0, need = 0, first = (dst == 0);
     int out = 0;
@@ -127,7 +123,7 @@ int WideCharToMultiByte(unsigned int page, unsigned int flags,
     if (limit < 0) {
         limit = 0;
         while (w[limit] != 0) { limit++; }
-        limit++;                                    /* 核心系统底层抽象与内存语义契约 */
+        limit++;
     }
     int i = 0, need = 0, first = (dst == 0);
     int out = 0;
@@ -139,7 +135,7 @@ int WideCharToMultiByte(unsigned int page, unsigned int flags,
             cp = 0x10000u + ((u - 0xD800u) << 10) + (w[i] - 0xDC00u);
             i++;
         } else if (u >= 0xDC00u && u < 0xE000u) {
-            cp = 0xFFFDu;                           /* 核心系统底层抽象与内存语义契约 */
+            cp = 0xFFFDu;
         } else {
             cp = u;
         }

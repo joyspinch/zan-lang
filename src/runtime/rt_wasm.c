@@ -13,7 +13,6 @@ int zan_w32_snprintf(char *s, i64 n, const char *fmt, ...) {
     return r;
 }
 
-/* 内部辅助逻辑 */
 int pthread_mutex_init(void *m, const void *a) { (void)m; (void)a; return 0; }
 int pthread_mutex_lock(void *m) { (void)m; return 0; }
 int pthread_mutex_unlock(void *m) { (void)m; return 0; }
@@ -21,6 +20,5 @@ int pthread_mutex_destroy(void *m) { (void)m; return 0; }
 
 void longjmp(void *env, int val) { (void)env; (void)val; abort(); }
 
-/* 底层系统交互与数据协议契约 */
 __attribute__((returns_twice))
 int setjmp(void *env) { (void)env; return 0; }

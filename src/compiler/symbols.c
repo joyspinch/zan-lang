@@ -1,4 +1,3 @@
-/* 核心系统底层抽象与内存语义契约 */
 
 #include "symbols.h"
 #include "builtin_api.h"
@@ -11,7 +10,6 @@
 #define fopen zan_utf8_fopen
 #endif
 
-/* 底层系统交互与数据协议契约 */
 static int type_name(const zan_ast_node_t *t, char *buf, int cap) {
     int n = 0;
     if (!t || cap < 2) { if (cap > 0) buf[0] = 0; return 0; }
@@ -50,7 +48,6 @@ static int type_name(const zan_ast_node_t *t, char *buf, int cap) {
     return n;
 }
 
-/* 底层系统交互与数据协议契约 */
 static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     char ret[256];
     type_name(m->method_decl.return_type, ret, (int)sizeof(ret));
@@ -73,7 +70,6 @@ static void method_sig(const zan_ast_node_t *m, char *buf, int cap) {
     if (n < cap - 1) { buf[n++] = ')'; buf[n] = 0; }
 }
 
-/* 底层系统交互与数据协议契约 */
 static int is_extern_decl(const zan_ast_node_t *m) {
     return m->kind == AST_METHOD_DECL && !m->method_decl.body &&
            (zan_ast_method_extern_lib(m).str != NULL ||

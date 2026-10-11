@@ -35,7 +35,6 @@
 
 int zan_gen_enabled = 1;
 
-/* 内部辅助逻辑 */
 static char **g_gen_texts = NULL;
 static int g_gen_text_count = 0;
 static int g_gen_text_cap = 0;
@@ -56,9 +55,7 @@ void zan_gen_take_source_texts(char ***texts, int *count) {
 #define GEN_EXE_SUFFIX ""
 #endif
 
-/* 底层系统交互与数据协议契约 */
 
-/* 内部辅助逻辑 */
 static void zan_self_exe(char *out, size_t outsz) {
 #ifdef _WIN32
     GetModuleFileNameA(NULL, out, (DWORD)outsz);
@@ -82,7 +79,7 @@ int zan_gen_cache_dir(char *dir, size_t dir_size) {
         if (*p != '\\' && *p != '/') continue;
         char sep = *p;
         *p = '\0';
-        CreateDirectoryA(dir, NULL); /* 核心系统底层抽象与内存语义契约 */
+        CreateDirectoryA(dir, NULL);
         *p = sep;
     }
     if (!CreateDirectoryA(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
@@ -135,7 +132,6 @@ static int zan_gen_hash_file(uint64_t *hash, const char *path) {
     return ok;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_spawn_wait(char *const argv[]) {
 #ifdef _WIN32
     intptr_t r = _spawnv(_P_WAIT, argv[0], (const char *const *)argv);
@@ -157,7 +153,6 @@ static int zan_spawn_wait(char *const argv[]) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 
 static int zan_pid_alive(uint32_t pid) {
     if (pid == 0) return 0;
@@ -174,7 +169,6 @@ static int zan_pid_alive(uint32_t pid) {
 #endif
 }
 
-/* 内部辅助逻辑 */
 static void zan_gen_scan_dir(const char *dir,
                              void (*cb)(const char *name, void *ud),
                              void *ud) {
@@ -209,7 +203,6 @@ static void zan_gen_scan_dir(const char *dir,
 #endif
 }
 
-/* 内部辅助逻辑 */
 static int zan_gen_strip(const char *s, const char *prefix, const char **rest) {
     size_t n = strlen(prefix);
     if (strncmp(s, prefix, n) != 0) return 0;
@@ -217,7 +210,6 @@ static int zan_gen_strip(const char *s, const char *prefix, const char **rest) {
     return 1;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
     if (!s) return 0;
     static const char hex[] = "0123456789abcdef";
@@ -253,14 +245,11 @@ static int zan_gen_parse_zangen(const char *s, uint32_t *out) {
     return 0;
 }
 
-/* 内部辅助逻辑 */
 static int zan_gen_parse_pid(const char *s, uint32_t *out) {
     if (!s) return 0;
     const char *p = s;
     const char *end = p + strlen(p);
-    /* 底层系统交互与数据协议契约 */
     if (end - p >= 4 && memcmp(end - 4, ".exe", 4) == 0) end -= 4;
-    /* 底层系统交互与数据协议契约 */
     else if (end - p > 8 && memcmp(end - 8, "_in.json", 8) == 0) end -= 8;
     else if (end - p > 9 && memcmp(end - 9, "_out.json", 9) == 0) end -= 9;
     if (end == p) return 0;
@@ -352,7 +341,6 @@ static void zan_gen_sweep(const char *dir, uint64_t keep_key) {
     zan_gen_scan_dir(dir, zan_gen_sweep_one, &ctx);
 }
 
-/* 内部辅助逻辑 */
 
 typedef struct zan_gen_strlist {
     char **v;
@@ -364,7 +352,7 @@ static void zan_gen_strlist_push(zan_gen_strlist *l, const char *s) {
     if (l->n == l->cap) {
         size_t ncap = l->cap ? l->cap * 2 : 64;
         char **nv = (char **)realloc(l->v, ncap * sizeof(char *));
-        if (!nv) return; /* 底层系统交互与数据协议契约 */
+        if (!nv) return;
         l->v = nv;
         l->cap = ncap;
     }
@@ -379,7 +367,6 @@ static int zan_gen_relcmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int zan_gen_collect_zan(char *abs, size_t abscap, const char *rel,
                                size_t rellen, zan_gen_strlist *out) {
 #ifdef _WIN32
@@ -442,7 +429,6 @@ static int zan_gen_collect_zan(char *abs, size_t abscap, const char *rel,
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static int zan_gen_hash_stdlib(uint64_t *key, const char *root) {
     char abs[ZAN_GEN_MAX_PATH];
     snprintf(abs, sizeof(abs), "%s", root);
@@ -512,7 +498,6 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
                  stdlib_root, GEN_DIR_SEP_STR[0], GEN_DIR_SEP_STR[0],
                  GEN_DIR_SEP_STR[0]);
         fprintf(stderr, "zan: compiling code generators (first use; cached at %s)\n", exe);
-        /* 内部辅助逻辑 */
         char tmp[ZAN_GEN_MAX_PATH];
 #ifdef _WIN32
         int pid = (int)_getpid();
@@ -522,8 +507,6 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
         snprintf(tmp, sizeof(tmp), "%s%cZanGen_%016llx_%d%s", dir,
                  GEN_DIR_SEP_STR[0], (unsigned long long)key, pid,
                  GEN_EXE_SUFFIX);
-        /* 内部辅助逻辑 */
-        /* 底层系统交互与数据协议契约 */
         char *argv[] = {
             zexe, src, "--stdlib-path", (char *)stdlib_root, "--auto-stdlib",
             "--no-gen", "--no-packages", "--quiet", "-DZAN_GEN_MAIN=1",
@@ -540,7 +523,6 @@ int zan_gen_ensure(const char *stdlib_root, char *exe, size_t exe_size) {
 #else
         if (rename(tmp, exe) != 0) {
 #endif
-            /* 内部辅助逻辑 */
             remove(tmp);
             FILE *published = fopen(exe, "rb");
             if (published) {
@@ -571,7 +553,6 @@ bool zan_is_design_path(const char *p) {
            (n > 4 && strcmp(p + n - 4, ".htm") == 0);
 }
 
-/* 内部辅助逻辑 */
 bool zan_is_zcomp_path(const char *p) {
     size_t n = strlen(p);
     return n > 6 && strcmp(p + n - 6, ".zcomp") == 0;
@@ -602,7 +583,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         return NULL;
     }
 
-    /* 底层系统交互与数据协议契约 */
     int ndesign = 0;
     for (size_t i = 0; i < count; i++)
         if (zan_is_design_path(paths[i])) ndesign++;
@@ -646,7 +626,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
             free(outs);
             return NULL;
         }
-        /* 内部辅助逻辑 */
         const char *body = text;
         if (tlen >= 3 && (unsigned char)body[0] == 0xEF &&
             (unsigned char)body[1] == 0xBB && (unsigned char)body[2] == 0xBF)
@@ -658,7 +637,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         json_arr_add(files, f);
         free(text);
     }
-    /* 内部辅助逻辑 */
     json_value *comps = json_new_arr();
     for (size_t i = 0; i < count; i++) {
         if (!zan_is_zcomp_path(paths[i])) continue;
@@ -707,7 +685,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         if (mf) fclose(mf);
         ok = -1;
     } else if (fclose(mf) != 0) {
-        /* 底层系统交互与数据协议契约 */
         fprintf(stderr, "error: cannot write generator request\n");
         ok = -1;
     }
@@ -752,7 +729,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
         free(reply);
     }
 
-    /* 内部辅助逻辑 */
     if (getenv("ZAN_KEEP_GEN_REQ") == NULL) {
         remove(meta_path);
         remove(out_path);
@@ -765,7 +741,6 @@ char **zan_gen_design(const char *stdlib_root, const char *const *paths,
     return outs;
 }
 
-/* 内部辅助逻辑 */
 
 static bool ast_call_triggers(zan_ast_node_t *call) {
     if (!call || call->kind != AST_CALL || !call->call.callee)
@@ -786,7 +761,6 @@ static bool ast_call_triggers(zan_ast_node_t *call) {
 
     if (!name) return false;
 
-    /* 底层系统交互与数据协议契约 */
     if (strcmp(name, "Deserialize") == 0 || strcmp(name, "Serialize") == 0) {
         if (recv_name && strcmp(recv_name, "Json") == 0) return true;
         if (call->call.type_args.count > 0) return true;
@@ -961,13 +935,11 @@ static bool ast_stmt_triggers(zan_ast_node_t *n) {
 static bool ast_type_triggers(zan_ast_node_t *decl) {
     if (!decl || (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL))
         return false;
-    /* 核心系统底层抽象与内存语义契约 */
     const char *name = decl->type_decl.name.str;
     size_t nlen = decl->type_decl.name.len;
     if (name && nlen >= 10 && memcmp(name + nlen - 10, "Controller", 10) == 0) {
         return true;
     }
-    /* 核心系统底层抽象与内存语义契约 */
     for (int i = 0; i < decl->type_decl.bases.count; i++) {
         zan_ast_node_t *b = decl->type_decl.bases.items[i];
         if (!b) continue;
@@ -1021,7 +993,6 @@ static bool zan_gen_ast_triggered(zan_ast_node_t *unit) {
     return false;
 }
 
-/* 内部辅助逻辑 */
 
 static zan_ast_node_t *rw_ident(zan_arena_t *arena, zan_loc_t loc,
                                 const char *name) {
@@ -1073,7 +1044,6 @@ static void rw_set_ident(zan_arena_t *arena, zan_ast_node_t *id,
     id->ident.name.len = (uint32_t)l;
 }
 
-/* 内部辅助逻辑 */
 static void rw_sort_desc(json_value *rw, int *order, int count) {
     for (int i = 1; i < count; i++) {
         int v = order[i];
@@ -1098,7 +1068,6 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
     for (int i = 0; i < count; i++) order[i] = i;
     rw_sort_desc(rw, order, count);
 
-    /* 内部辅助逻辑 */
     int total = zan_genmeta_index_calls(unit, NULL, 0);
     zan_ast_node_t **idx = NULL;
     if (total > 0) {
@@ -1137,7 +1106,6 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
                               call->call.args.count > 0;
             zan_ast_node_t *ex =
                 keep_extra ? call->call.args.items[0] : NULL;
-            /* 内部辅助逻辑 */
             ce->member.object = rw_ident(arena, loc, "__DbBind");
             rw_set_member_name(arena, ce, name);
             call->call.type_args.count = 0;
@@ -1204,7 +1172,6 @@ static void zan_apply_rewrites(zan_ast_node_t *unit, json_value *rw,
     free(order);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
                               zan_arena_t *arena, zan_diag_t *diag) {
     if (!sources || sources->type != JSON_ARR) return;
@@ -1212,7 +1179,6 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
         json_value *src = sources->as.arr.items[i];
         const char *text = json_get_str(json_obj_get(src, "text"));
         if (!text) continue;
-        /* 内部辅助逻辑 */
         if (g_gen_text_count == g_gen_text_cap) {
             int ncap = g_gen_text_cap ? g_gen_text_cap * 2 : 4;
             char **grown = (char **)realloc(g_gen_texts,
@@ -1230,7 +1196,6 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
         zan_parser_init(&gp, &lex, arena, diag);
         zan_ast_node_t *gu = zan_parser_parse(&gp);
         if (!gu) continue;
-        /* 内部辅助逻辑 */
         zan_nsresolve_stamp(gu, arena);
         for (int k = 0; k < gu->comp_unit.decls.count; k++)
             zan_ast_list_push(&unit->comp_unit.decls, gu->comp_unit.decls.items[k],
@@ -1238,7 +1203,6 @@ static void zan_merge_sources(zan_ast_node_t *unit, json_value *sources,
     }
 }
 
-/* 内部辅助逻辑 */
 static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
     if (!arr || arr->type != JSON_ARR) return;
     for (int i = 0; i < arr->as.arr.count; i++) {
@@ -1254,12 +1218,10 @@ static void zan_report_diags(zan_diag_t *diag, json_value *arr, bool is_error) {
     }
 }
 
-/* 内部辅助逻辑 */
 int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
                     zan_diag_t *diag, const char *stdlib_root) {
     if (!zan_gen_enabled || !unit) return 0;
 
-    /* 底层系统交互与数据协议契约 */
     if (!zan_gen_ast_triggered(unit)) return 0;
 
     if (!stdlib_root || !stdlib_root[0]) {
@@ -1277,7 +1239,6 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         return -1;
     }
 
-    /* 内部辅助逻辑 */
     char *meta = zan_genmeta_export_files(unit, diag);
     if (!meta) return 0;
 
@@ -1293,7 +1254,6 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
              dir, GEN_DIR_SEP_STR[0], pid);
 
     int rc = -1;
-    /* 内部辅助逻辑 */
     FILE *mf = fopen(meta_path, "wb");
     if (!mf) {
         fprintf(stderr, "error: cannot write generator request\n");
@@ -1337,16 +1297,14 @@ int zan_gen_codegen(zan_ast_node_t *unit, zan_arena_t *arena,
         json_value *warnings = json_obj_get(root, "warnings");
         zan_report_diags(diag, warnings, false);
         zan_report_diags(diag, errors, true);
-        /* 底层系统交互与数据协议契约 */
         zan_apply_rewrites(unit, json_obj_get(root, "rewrites"), arena);
         if (errors && errors->type == JSON_ARR && errors->as.arr.count > 0) {
             json_free(root);
             free(reply);
-            rc = 0; /* 底层系统交互与数据协议契约 */
+            rc = 0;
             goto done;
         }
         zan_merge_sources(unit, json_obj_get(root, "sources"), arena, diag);
-        /* 内部辅助逻辑 */
         {
             const char *gr = getenv("ZAN_GEN_REPLY");
             if (gr && gr[0]) {

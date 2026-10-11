@@ -10,7 +10,6 @@
 #include <GLES3/gl3.h>
 #include <native_window/external_window.h>
 
-/* 内部辅助实现 */
 typedef int (*FnNWRequestBuffer)(OHNativeWindow *, OHNativeWindowBuffer **, int *);
 typedef int (*FnNWFlushBuffer)(OHNativeWindow *, OHNativeWindowBuffer *, int, Region *);
 typedef BufferHandle *(*FnNWGetBufferHandle)(OHNativeWindowBuffer *);
@@ -20,18 +19,17 @@ static FnNWFlushBuffer     g_nw_flush;
 static FnNWGetBufferHandle g_nw_getbh;
 static FnNWHandleOpt       g_nw_handleopt;
 
-/* 内部辅助实现 */
 typedef struct {
-    void *nw;             /* 底层系统交互与数据协议契约 */
-    int w, h;             /* 核心系统底层抽象与内存语义契约 */
+    void *nw;
+    int w, h;
     int attached;
-    int closed;           /* 核心系统底层抽象与内存语义契约 */
+    int closed;
 
     /* OpenHarmony EGL 呈现状态：在 surface 附着或首次 present 时创建 */
     EGLDisplay egl_dpy;
     EGLSurface egl_surf;
-    void      *surf_nw;   /* 底层系统交互与数据协议契约 */
-    int        surf_w, surf_h; /* 内部辅助实现 */
+    void      *surf_nw;
+    int        surf_w, surf_h;
     EGLContext egl_ctx;
     GLuint     gl_prog;
     GLuint     gl_tex;
@@ -45,7 +43,6 @@ static int  g_window_width  = 0;
 static int  g_window_height = 0;
 static int  g_dpi           = 96;
 
-/* 内部辅助实现 */
 typedef struct { int e[8]; iptr win; } zan_oev_t;
 #define ZAN_OQ_CAP 512
 static zan_oev_t g_oq[ZAN_OQ_CAP];
@@ -98,7 +95,6 @@ EXPORT void zan_gui_ohos_attach(void *nw, int w, int h) {
     g_window_width = w;
     g_window_height = h;
     oq_push_locked(7, w, h, 0, 0, 0);
-    /* 内部辅助实现 */
     oq_push_locked(14, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_oq_lock);
 
@@ -128,29 +124,28 @@ EXPORT void zan_gui_ohos_detach(void) {
     pthread_mutex_unlock(&g_oq_lock);
 }
 
-/* 内部辅助实现 */
 static i64 ohs_tick_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-#define OH_TOUCH_SLOP2   64.0f   /* 核心系统底层抽象与内存语义契约 */
-#define OH_TOUCH_HIST    8       /* 核心系统底层抽象与内存语义契约 */
+#define OH_TOUCH_SLOP2   64.0f
+#define OH_TOUCH_HIST    8
 #define OH_FLING_START_PX_S 250.0f
 #define OH_FLING_STOP_PX_S  120.0f
 #define OH_FLING_TAU_MS     400.0f
 
 static int   g_tg_down, g_tg_drag;
-static float g_tg_ax, g_tg_ay;    /* 核心系统底层抽象与内存语义契约 */
-static float g_tg_x, g_tg_y;      /* 核心系统底层抽象与内存语义契约 */
-static float g_tg_acc;            /* 核心系统底层抽象与内存语义契约 */
+static float g_tg_ax, g_tg_ay;
+static float g_tg_x, g_tg_y;
+static float g_tg_acc;
 static long long g_tg_ht[OH_TOUCH_HIST];
 static float g_tg_hy[OH_TOUCH_HIST];
 static int   g_tg_hn, g_tg_hi;
 
 static int g_fling_active;
-static float g_fling_v;           /* 核心系统底层抽象与内存语义契约 */
+static float g_fling_v;
 static float g_fling_acc;
 static int   g_fling_x, g_fling_y;
 static long long g_fling_last;
@@ -212,13 +207,12 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
 
     if (action == 0) {
         pthread_mutex_lock(&g_oq_lock);
-        fling_cancel_locked(); /* 底层系统交互与数据协议契约 */
+        fling_cancel_locked();
         g_tg_down = 1; g_tg_drag = 0; g_tg_acc = 0;
         g_tg_x = g_tg_ax = (float)x;
         g_tg_y = g_tg_ay = (float)y;
         g_tg_hn = 1; g_tg_hi = 1 % OH_TOUCH_HIST;
         g_tg_ht[0] = ohs_tick_ms(); g_tg_hy[0] = g_tg_y;
-        /* 内部辅助实现 */
         oq_push_locked(1, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         oq_push_locked(2, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         pthread_mutex_unlock(&g_oq_lock);
@@ -234,9 +228,7 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
                 return; /* slop: still a tap */
             }
             g_tg_drag = 1;
-            /* 内部辅助实现 */
         }
-        /* 内部辅助实现 */
         g_tg_acc += (fy - g_tg_y) * 288.0f / (float)g_dpi;
         int delta = (int)g_tg_acc;
         if (delta != 0) {
@@ -256,7 +248,6 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
         g_tg_down = 0;
         pthread_mutex_lock(&g_oq_lock);
         if (g_tg_drag) {
-            /* 内部辅助实现 */
             oq_push_flag_locked(3, (int)g_tg_x, (int)g_tg_y, 0, 0, 0);
             pthread_mutex_unlock(&g_oq_lock);
             /* 计算滑动释放速度 (~120ms 时间窗口滑动惯性) */
@@ -283,7 +274,6 @@ EXPORT void zan_gui_ohos_touch(int action, int x, int y) {
     }
 }
 
-/* 内部辅助实现 */
 
 /* 包含 uchar.h 以支持 IMF 头文件中的 char16_t 类型定义 */
 #include <uchar.h>
@@ -450,7 +440,7 @@ static int32_t ime_on_set_preview_text(InputMethod_TextEditorProxy *proxy,
                                        const char16_t text[], size_t length,
                                        int32_t start, int32_t end) {
     (void)proxy; (void)text; (void)length; (void)start; (void)end;
-    return IME_ERR_OK; /* 底层系统交互与数据协议契约 */
+    return IME_ERR_OK;
 }
 
 static void ime_on_keyboard_status(InputMethod_TextEditorProxy *proxy,
@@ -511,7 +501,7 @@ static void ime_feature_detect(void) {
     if (done) { return; }
     done = 1;
     void *h = dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Create");
-    if (!h) { return; } /* 核心系统底层抽象与内存语义契约 */
+    if (!h) { return; }
     g_ime_proxy_create = (FnImeProxyCreate)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Create");
     g_ime_proxy_destroy = (FnImeProxyDestroy)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_Destroy");
     g_ime_set_cfg = (FnImeSetGetTextConfig)dlsym(RTLD_DEFAULT, "OH_TextEditorProxy_SetGetTextConfigFunc");
@@ -583,7 +573,6 @@ void zan_gui_ohos_ime_shutdown(void) {
     }
 }
 
-/* 内部辅助实现 */
 static const char *k_ohos_vs =
     "attribute vec2 a_pos;\n"
     "varying vec2 v_uv;\n"
@@ -632,7 +621,6 @@ static int ohos_gl_surface(zan_ohos_win_t *w) {
                                              (EGLNativeWindowType)w->nw, NULL);
         if (w->egl_surf == EGL_NO_SURFACE) return 1;
         w->surf_nw = w->nw;
-        /* 内部辅助实现 */
         EGLint qw = 0, qh = 0;
         if (eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_WIDTH, &qw)
             && eglQuerySurface(w->egl_dpy, w->egl_surf, EGL_HEIGHT, &qh)
@@ -688,7 +676,6 @@ static int ohos_gl_init(zan_ohos_win_t *w) {
     return ohos_gl_program(w);
 }
 
-/* 底层系统交互与数据协议契约 */
 #define ZAN_OHOS_DIRTY_MAX 512
 static i32 g_dirty[ZAN_OHOS_DIRTY_MAX * 4];
 static int g_dirty_count;
@@ -713,7 +700,6 @@ static void ohos_dirty_reset(void) {
     g_dirty_full = 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_present_full(void) {
     g_dirty_full = 1;
 }
@@ -775,7 +761,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
             goto egl_path;
         BufferHandle *bh = g_nw_getbh(buf);
         if (bh && bh->virAddr) {
-            int bw = (int)bh->width;    /* 核心系统底层抽象与内存语义契约 */
+            int bw = (int)bh->width;
             int bstride = (int)bh->stride;
             int copy_w = s->width < bw ? s->width : bw;
             int copy_h = s->height < (int)bh->height ? s->height : (int)bh->height;
@@ -786,7 +772,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
                 memcpy(dst + (size_t)y * (size_t)bstride * 4,
                        src + (size_t)y * (size_t)s->stride * 4, row);
             Region region;
-            region.rects = NULL;   /* 核心系统底层抽象与内存语义契约 */
+            region.rects = NULL;
             region.rectNumber = 0;
             g_nw_flush((OHNativeWindow *)g_owin.nw, buf, -1, &region);
             ohos_dirty_reset();
@@ -794,11 +780,9 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         }
     }
 egl_path:
-    /* 底层系统交互与数据协议契约 */
     if (g_owin.egl_surf && (g_owin.surf_nw != g_owin.nw
                             || g_owin.surf_w != g_owin.w
                             || g_owin.surf_h != g_owin.h)) {
-        /* 内部辅助实现 */
         eglMakeCurrent(g_owin.egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
         eglDestroySurface(g_owin.egl_dpy, g_owin.egl_surf);
@@ -817,7 +801,6 @@ egl_path:
     return 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT void zan_gui_ohos_shutdown(void) {
     zan_gui_ohos_ime_shutdown();
     zan_ohos_win_t *w = &g_owin;
@@ -839,11 +822,10 @@ EXPORT void zan_gui_ohos_shutdown(void) {
     w->tex_w = w->tex_h = 0;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
     (void)title;
-    (void)width; (void)height; /* 底层系统交互与数据协议契约 */
+    (void)width; (void)height;
     return ZAN_OHOS_HWND;
 }
 EXPORT i32 zan_gui_show_window(iptr hwnd_val)            { (void)hwnd_val; return 1; }
@@ -877,7 +859,6 @@ EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0
 EXPORT i32 zan_gui_set_title(iptr h, const char *t) { (void)h; (void)t; return 0; }
 EXPORT i32 zan_gui_set_cursor(i32 cursor_type)     { (void)cursor_type; return 0; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static int oq_pop(void) {
     pthread_mutex_lock(&g_oq_lock);
@@ -891,7 +872,6 @@ static int oq_pop(void) {
     return 1;
 }
 
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     if (oq_pop()) { return 0; }
@@ -922,7 +902,6 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
 }
 
 EXPORT i32 zan_gui_wake(void) { return 0; }
-/* 内部辅助实现 */
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
@@ -951,11 +930,9 @@ EXPORT i32 zan_gui_window_height(void) { return g_window_height; }
 EXPORT i32 zan_gui_client_width(iptr hwnd_val)  { (void)hwnd_val; return g_window_width; }
 EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_window_height; }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_dpi * 100 / 96); }
 
-/* 内部辅助实现 */
 EXPORT void zan_gui_ohos_set_dpi(i32 dpi) {
     if (dpi >= 48 && dpi <= 960) g_dpi = (int)((long)dpi * 96 / 160);
 }
@@ -980,9 +957,8 @@ EXPORT const char *zan_gui_get_clipboard(void)     { return ""; }
 EXPORT int  zan_gui_drop_pending(void)             { return 0; }
 EXPORT const char *zan_gui_drop_take(void)         { return ""; }
 EXPORT void zan_gui_set_ime_pos(i32 x, i32 y)      { (void)x; (void)y; }
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) {
-    (void)hwnd_val; (void)tint_argb; return 1; /* 核心系统底层抽象与内存语义契约 */
+    (void)hwnd_val; (void)tint_argb; return 1;
 }
 EXPORT i32 zan_gui_disable_glass(iptr hwnd_val)    { (void)hwnd_val; return 0; }
 EXPORT i32 zan_gui_set_opacity(iptr h, i32 percent) { (void)h; (void)percent; return 0; }
@@ -997,7 +973,6 @@ EXPORT i32 zan_gui_write_file(const char *path, const char *utf8) {
     return w == n ? 0 : 1;
 }
 
-/* 底层系统交互与数据协议契约 */
 EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val)                  { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr rend)     { (void)hwnd_val; (void)rend; return 1; }
 EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {

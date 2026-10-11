@@ -30,18 +30,17 @@ typedef int dap_sock_t;
 typedef struct {
     debugger_t dbg;
     FILE      *out;
-    int        seq;              /* 核心系统底层抽象与内存语义契约 */
-    char       program[1024];    /* 核心系统底层抽象与内存语义契约 */
-    char       prog_args[1024];  /* 核心系统底层抽象与内存语义契约 */
-    char       source_file[1024];/* 底层系统交互与数据协议契约 */
+    int        seq;
+    char       program[1024];
+    char       prog_args[1024];
+    char       source_file[1024];
     bool       terminated;
     bool       launched;
-    int        attach_pid;       /* 核心系统底层抽象与内存语义契约 */
-    bool       use_sock;         /* 底层系统交互与数据协议契约 */
-    dap_sock_t sock;             /* 核心系统底层抽象与内存语义契约 */
+    int        attach_pid;
+    bool       use_sock;
+    dap_sock_t sock;
 } dap_t;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
     int sent = 0;
@@ -53,15 +52,14 @@ static bool sock_send_all(dap_sock_t s, const char *buf, int n) {
     return true;
 }
 
-/* 内部辅助逻辑 */
 #ifndef DAP_FRAME_DEADLINE_MS
 #define DAP_FRAME_DEADLINE_MS 60000
 #endif
 
 typedef struct {
     dap_sock_t s;
-    bool started;        /* 核心系统底层抽象与内存语义契约 */
-    long long deadline;  /* 底层系统交互与数据协议契约 */
+    bool started;
+    long long deadline;
 } dap_frame_reader_t;
 
 static long long dap_now_ms(void) {
@@ -77,7 +75,6 @@ static long long dap_now_ms(void) {
 static int sock_reader(void *ctx, char *buf, int n) {
     dap_frame_reader_t *r = (dap_frame_reader_t *)ctx;
     if (r->started) {
-        /* 内部辅助逻辑 */
         long long wait = r->deadline - dap_now_ms();
         if (wait <= 0) return 0;
         fd_set fds;
@@ -100,11 +97,10 @@ static bool sock_writer(void *ctx, const char *buf, int n) {
     return sock_send_all(*(dap_sock_t *)ctx, buf, n);
 }
 
-/* 底层系统交互与数据协议契约 */
 static char *rpc_read_message_sock(dap_sock_t s) {
-    static dap_frame_reader_t r;   /* 核心系统底层抽象与内存语义契约 */
+    static dap_frame_reader_t r;
     r.s = s;
-    r.started = false;             /* 底层系统交互与数据协议契约 */
+    r.started = false;
     return rpc_read_message_cb(sock_reader, &r, 64 * 1024 * 1024);
 }
 
@@ -112,7 +108,6 @@ static void rpc_write_message_sock(dap_sock_t s, const char *payload) {
     rpc_write_message_cb(sock_writer, &s, payload);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 #define VARREF_LOCALS  1000
 #define VARREF_WATCHES 2000
 
@@ -157,7 +152,6 @@ static void dap_output(dap_t *d, const char *category, const char *text) {
     dap_send_event(d, "output", body);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void dap_send_stopped(dap_t *d, const char *reason) {
     json_value *body = json_new_obj();
     json_obj_set(body, "reason", json_new_str(reason));
@@ -166,7 +160,6 @@ static void dap_send_stopped(dap_t *d, const char *reason) {
     dap_send_event(d, "stopped", body);
 }
 
-/* 内部辅助逻辑 */
 static void dap_flush_output(dap_t *d) {
     if (d->dbg.output_len > 0) {
         dap_output(d, "stdout", d->dbg.output);
@@ -183,11 +176,10 @@ static void dap_terminate_with_code(dap_t *d, int exit_code) {
     dap_send_event(d, "exited", body);
 }
 
-/* 底层系统交互与数据协议契约 */
 static const char *dap_stop_reason(const char *mi) {
     if (!mi || !mi[0]) return "breakpoint";
     if (strcmp(mi, "pause") == 0) return "pause";
-    if (strcmp(mi, "signal-received") == 0) return "pause"; /* 核心系统底层抽象与内存语义契约 */
+    if (strcmp(mi, "signal-received") == 0) return "pause";
     if (strncmp(mi, "breakpoint", 10) == 0) return "breakpoint";
     if (strstr(mi, "stepping-range") || strstr(mi, "finished")) return "step";
     if (strstr(mi, "watchpoint")) return "data breakpoint";
@@ -196,7 +188,6 @@ static const char *dap_stop_reason(const char *mi) {
     return "breakpoint";
 }
 
-/* 内部辅助逻辑 */
 static const char *dap_basename(const char *path) {
     const char *b = path;
     for (const char *p = path; *p; p++)
@@ -204,7 +195,6 @@ static const char *dap_basename(const char *path) {
     return b;
 }
 
-/* 底层系统交互与数据协议契约 */
 static dbg_breakpoint_t *dap_logpoint_here(dap_t *d) {
     if (d->dbg.state != DBG_PAUSED) return NULL;
     dbg_breakpoint_t *lp = NULL;
@@ -215,12 +205,11 @@ static dbg_breakpoint_t *dap_logpoint_here(dap_t *d) {
         if (strcmp(dap_basename(bp->file), dap_basename(d->dbg.current_file)) != 0)
             continue;
         if (bp->type == BP_LOGPOINT) lp = bp;
-        else return NULL; /* 底层系统交互与数据协议契约 */
+        else return NULL;
     }
     return lp;
 }
 
-/* 内部辅助逻辑 */
 static void dap_format_log(dap_t *d, const char *msg, char *out, int cap) {
     int o = 0;
     for (int i = 0; msg[i]; i++) {
@@ -255,7 +244,6 @@ static void dap_format_log(dap_t *d, const char *msg, char *out, int cap) {
     }
 }
 
-/* 底层系统交互与数据协议契约 */
 static void dap_report_stop(dap_t *d) {
     dap_flush_output(d);
     int guard = 0;
@@ -291,7 +279,6 @@ static void handle_initialize(dap_t *d, json_value *request) {
     json_obj_set(caps, "supportsExceptionInfoRequest", json_new_bool(true));
     json_obj_set(caps, "supportsExceptionFilterOptions", json_new_bool(true));
     {
-        /* 底层系统交互与数据协议契约 */
         json_value *filters = json_new_arr();
         const char *ids[2]   = { "throw", "unhandled" };
         const char *labels[2] = { "Thrown exceptions", "Unhandled exceptions" };
@@ -305,7 +292,6 @@ static void handle_initialize(dap_t *d, json_value *request) {
         json_obj_set(caps, "exceptionBreakpointFilters", filters);
     }
     dap_send_response(d, request, true, caps);
-    /* 底层系统交互与数据协议契约 */
     dap_send_event(d, "initialized", NULL);
 }
 
@@ -316,7 +302,6 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
     json_value *bps = json_obj_get(args, "breakpoints");
 
     if (path) {
-        /* 底层系统交互与数据协议契约 */
         for (int i = d->dbg.bp_count - 1; i >= 0; i--) {
             if (strcmp(d->dbg.breakpoints[i].file, path) == 0)
                 dbg_remove_breakpoint(&d->dbg, d->dbg.breakpoints[i].id);
@@ -332,7 +317,7 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
         const char *cond = json_get_str(json_obj_get(bp, "condition"));
         const char *hit_cond = json_get_str(json_obj_get(bp, "hitCondition"));
         const char *log_msg = json_get_str(json_obj_get(bp, "logMessage"));
-        const char *reject = NULL; /* 底层系统交互与数据协议契约 */
+        const char *reject = NULL;
 
         int id = -1;
         if (path) {
@@ -340,7 +325,6 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
                 /* Logpoint */
                 id = dbg_add_logpoint(&d->dbg, path, line, log_msg);
             } else if (hit_cond && hit_cond[0]) {
-                /* 核心系统底层抽象与内存语义契约 */
                 const char *h = hit_cond;
                 while (*h == ' ') h++;
                 bool modulo = (h[0] == '%');
@@ -356,10 +340,8 @@ static void handle_set_breakpoints(dap_t *d, json_value *request) {
                     reject = why;
                 }
             } else if (cond && cond[0]) {
-                /* 核心系统底层抽象与内存语义契约 */
                 id = dbg_add_conditional_bp(&d->dbg, path, line, cond);
             } else {
-                /* 核心系统底层抽象与内存语义契约 */
                 id = dbg_add_breakpoint(&d->dbg, path, line);
             }
         }
@@ -396,13 +378,11 @@ static void handle_launch(dap_t *d, json_value *request) {
     d->launched = true;
     dap_output(d, "console", "Launching Zan program under gdb...\n");
 
-    /* 内部辅助逻辑 */
     dap_send_response(d, request, true, NULL);
 }
 
 static void handle_configuration_done(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
-    /* 底层系统交互与数据协议契约 */
     if (d->attach_pid > 0)
         dbg_attach(&d->dbg, d->program, d->attach_pid);
     else
@@ -420,7 +400,6 @@ static void handle_threads(dap_t *d, json_value *request) {
         json_arr_add(threads, thread);
     }
     if (d->dbg.thread_count == 0) {
-        /* 内部辅助逻辑 */
         json_value *thread = json_new_obj();
         json_obj_set(thread, "id", json_new_num(1));
         json_obj_set(thread, "name", json_new_str("main"));
@@ -458,7 +437,6 @@ static void handle_stack_trace(dap_t *d, json_value *request) {
 static void handle_scopes(dap_t *d, json_value *request) {
     json_value *scopes = json_new_arr();
 
-    /* 核心系统底层抽象与内存语义契约 */
     json_value *locals_scope = json_new_obj();
     json_obj_set(locals_scope, "name", json_new_str("Locals"));
     json_obj_set(locals_scope, "variablesReference", json_new_num(VARREF_LOCALS));
@@ -466,7 +444,6 @@ static void handle_scopes(dap_t *d, json_value *request) {
     json_obj_set(locals_scope, "presentationHint", json_new_str("locals"));
     json_arr_add(scopes, locals_scope);
 
-    /* 核心系统底层抽象与内存语义契约 */
     if (d->dbg.watch_count > 0) {
         json_value *watch_scope = json_new_obj();
         json_obj_set(watch_scope, "name", json_new_str("Watch"));
@@ -497,7 +474,6 @@ static void handle_variables(dap_t *d, json_value *request) {
             json_arr_add(vars, var);
         }
     } else if (ref >= 3000 && ref < 3000 + DBG_MAX_LOCALS) {
-        /* 内部辅助逻辑 */
         dbg_var_t kids[64];
         int n = dbg_expand_variables(&d->dbg, ref, kids, 64);
         for (int i = 0; i < n; i++) {
@@ -522,7 +498,6 @@ static void handle_variables(dap_t *d, json_value *request) {
             json_arr_add(vars, var);
         }
     } else if (ref == VARREF_WATCHES) {
-        /* 核心系统底层抽象与内存语义契约 */
         dbg_evaluate_watches(&d->dbg);
         for (int i = 0; i < d->dbg.watch_count; i++) {
             dbg_watch_t *w = &d->dbg.watches[i];
@@ -541,7 +516,6 @@ static void handle_variables(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, body);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void handle_evaluate(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     const char *expression = json_get_str(json_obj_get(args, "expression"));
@@ -559,9 +533,7 @@ static void handle_evaluate(dap_t *d, json_value *request) {
     json_obj_set(body, "result", json_new_str(result));
     json_obj_set(body, "variablesReference", json_new_num(0));
 
-    /* 底层系统交互与数据协议契约 */
     if (context_str && strcmp(context_str, "watch") == 0) {
-        /* 核心系统底层抽象与内存语义契约 */
         bool found = false;
         for (int i = 0; i < d->dbg.watch_count; i++) {
             if (strcmp(d->dbg.watches[i].expression, expression) == 0) {
@@ -575,7 +547,6 @@ static void handle_evaluate(dap_t *d, json_value *request) {
     dap_send_response(d, request, success, body);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void handle_set_variable(dap_t *d, json_value *request) {
     json_value *args = json_obj_get(request, "arguments");
     const char *name = json_get_str(json_obj_get(args, "name"));
@@ -593,7 +564,6 @@ static void handle_set_variable(dap_t *d, json_value *request) {
     dap_send_response(d, request, success, body);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void handle_exception_info(dap_t *d, json_value *request) {
     char info[256] = {0};
     bool has_info = dbg_get_exception_info(&d->dbg, info, sizeof(info));
@@ -604,7 +574,6 @@ static void handle_exception_info(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, body);
 }
 
-/* 底层系统交互与数据协议契约 */
 static void handle_continue(dap_t *d, json_value *request) {
     json_value *body = json_new_obj();
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
@@ -631,7 +600,6 @@ static void handle_step_out(dap_t *d, json_value *request) {
     dap_report_stop(d);
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 static void handle_pause(dap_t *d, json_value *request) {
     if (d->dbg.state != DBG_RUNNING) {
         json_value *body = json_new_obj();
@@ -663,7 +631,6 @@ static void handle_set_exception_breakpoints(dap_t *d, json_value *request) {
         else if (strcmp(f, "unhandled") == 0 || strcmp(f, "uncaught") == 0)
             on_unhandled = true;
     }
-    /* 内部辅助逻辑 */
     dbg_set_exception_breakpoints(&d->dbg, on_throw, on_unhandled);
     dap_send_response(d, request, true, NULL);
 }
@@ -692,7 +659,6 @@ static void handle_select_thread(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, NULL);
 }
 
-/* 内部辅助逻辑 */
 
 static dap_t *g_dap;
 
@@ -717,12 +683,10 @@ static bool rd_input_pending(dap_t *d) {
     }
     HANDLE h = (HANDLE)_get_osfhandle(0);
     DWORD avail = 0;
-    /* 内部辅助逻辑 */
     return h != INVALID_HANDLE_VALUE && h != NULL &&
            PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL) && avail > 0;
 }
 
-/* 底层系统交互与数据协议契约 */
 static int rd_reader(void *ctx, char *buf, int n) {
     (void)ctx;
     DWORD r = 0;
@@ -748,14 +712,13 @@ static int rd_reader(void *ctx, char *buf, int n) {
 }
 #endif
 
-/* 语言服务与调试协议交互规范 */
 static void dap_wait_hook(void *user) {
     dap_t *d = user;
     if (!rd_input_pending(d)) return;
     char *body = d->use_sock
         ? rpc_read_message_sock(d->sock)
         : rpc_read_message_cb(rd_reader, NULL, RPC_MAX_MESSAGE);
-    if (!body) return; /* 核心系统底层抽象与内存语义契约 */
+    if (!body) return;
     json_value *msg = json_parse(body);
     if (!msg) {
         free(body);
@@ -763,17 +726,16 @@ static void dap_wait_hook(void *user) {
     }
     const char *cmd = json_get_str(json_obj_get(msg, "command"));
     if (cmd && strcmp(cmd, "pause") == 0) {
-        /* 内部辅助逻辑 */
         dap_send_response(d, msg, true, NULL);
         json_free(msg);
         free(body);
         dbg_interrupt(&d->dbg);
     } else if (g_parked_tail < DAP_PARK_MAX) {
-        g_parked[g_parked_tail++] = body; /* 核心系统底层抽象与内存语义契约 */
+        g_parked[g_parked_tail++] = body;
         json_free(msg);
     } else {
         json_free(msg);
-        free(body); /* 核心系统底层抽象与内存语义契约 */
+        free(body);
     }
 }
 

@@ -1,17 +1,15 @@
-/* 内部辅助实现 */
 
-/* 内部辅助实现 */
 #if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
 #define _XOPEN_SOURCE 700
 #endif
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
-#define _WIN32_WINNT 0x0601   /* 核心系统底层抽象与内存语义契约 */
+#define _WIN32_WINNT 0x0601
 #endif
 
 #include "rt_sched.h"
 #include "rt_io.h"
-#include "rt_timer.h"       /* 核心系统底层抽象与内存语义契约 */
+#include "rt_timer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,14 +18,13 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <sys/mman.h>      /* 底层系统交互与数据协议契约 */
+#include <sys/mman.h>
 #include <ucontext.h>
 #include <time.h>
 #include <unistd.h>
 #endif
 #include "../common/host_oom.h"
 
-/* 核心系统底层抽象与内存语义契约 */
 #define ZAN_CO_STACK_DEFAULT (128 * 1024)
 
 static size_t co_stack_size(void) {
@@ -49,14 +46,13 @@ static size_t co_stack_size(void) {
     return cached;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 typedef struct zan_co {
-    void          *fiber;   /* 核心系统底层抽象与内存语义契约 */
+    void          *fiber;
     zan_co_body_t  body;
     zan_task_t    *task;
     int            finished;
-    struct zan_co *next;    /* 核心系统底层抽象与内存语义契约 */
+    struct zan_co *next;
 } zan_co_t;
 
 struct zan_task {
@@ -64,32 +60,29 @@ struct zan_task {
     int64_t     result;
     void       *arg;
     zan_co_t   *co;
-    zan_co_t   *waiters;   /* 底层系统交互与数据协议契约 */
+    zan_co_t   *waiters;
     zan_task_t *all_next;
 };
 
 /* ---- timers ---- */
 
-/* 内部辅助逻辑 */
 
 typedef struct zan_timer {
     int64_t     due_ms;
     zan_task_t *task;
 } zan_timer_t;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void        *g_sched_fiber;
 static zan_co_t    *g_current;
 static zan_co_t    *g_ready_head;
 static zan_co_t    *g_ready_tail;
-static zan_timer_t *g_timers;      /* 底层系统交互与数据协议契约 */
+static zan_timer_t *g_timers;
 static size_t       g_timer_n;
 static size_t       g_timer_cap;
 static zan_task_t  *g_all_tasks;
 static int          g_live;
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #ifdef _WIN32
 static void WINAPI co_trampoline(void *p);
@@ -101,7 +94,6 @@ static void *plat_fiber_new(zan_co_t *co) {
 }
 static void plat_fiber_delete(void *f) { DeleteFiber(f); }
 static void plat_switch(void *to)      { SwitchToFiber(to); }
-/* 内部辅助实现 */
 #define ZAN_SLEEP_MS_MAX ((int64_t)0x7FFFFFFF)
 static void plat_sleep(int64_t ms) {
     if (ms < 0) ms = 0;
@@ -111,7 +103,6 @@ static void plat_sleep(int64_t ms) {
 static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 
 #else
-/* 核心系统底层抽象与内存语义契约 */
 static ucontext_t g_sched_ctx;
 #if UINTPTR_MAX > 0xFFFFFFFFu
 static void co_trampoline_posix(unsigned hi, unsigned lo);
@@ -121,14 +112,13 @@ static void co_trampoline_posix(unsigned ptr);
 
 typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
-/* 内部辅助实现 */
 #define ZAN_CO_STACK_POOL_MAX 256
 
 static void *g_stack_pool;
 static int g_stack_pool_n;
 
 static char *plat_stack_alloc(void) {
-    if (g_stack_pool) {               /* 核心系统底层抽象与内存语义契约 */
+    if (g_stack_pool) {
         char *s = (char *)g_stack_pool;
         g_stack_pool = *(void **)s;
         g_stack_pool_n--;
@@ -143,7 +133,7 @@ static char *plat_stack_alloc(void) {
         munmap(base, total);
         return NULL;
     }
-    return base + page;               /* 底层系统交互与数据协议契约 */
+    return base + page;
 }
 
 static void plat_stack_free(char *stack) {
@@ -168,7 +158,6 @@ static void *plat_fiber_new(zan_co_t *co) {
     pf->ctx.uc_stack.ss_sp = pf->stack;
     pf->ctx.uc_stack.ss_size = co_stack_size();
     pf->ctx.uc_link = &g_sched_ctx;
-    /* 模块核心语义抽象与接口调用契约 */
 #if UINTPTR_MAX > 0xFFFFFFFFu
     uintptr_t p = (uintptr_t)co;
     makecontext(&pf->ctx, (void (*)(void))co_trampoline_posix, 2,
@@ -185,7 +174,6 @@ static void plat_fiber_delete(void *f) {
     free(pf);
 }
 static void plat_switch(void *to) {
-    /* 内部辅助实现 */
     swapcontext(&g_sched_ctx, &((posix_fiber_t *)to)->ctx);
 }
 static void plat_sleep(int64_t ms) {
@@ -200,7 +188,6 @@ static int64_t plat_now_ms(void) {
 }
 #endif
 
-/* 底层系统交互与数据协议契约 */
 static void switch_to_sched(void) {
 #ifdef _WIN32
     plat_switch(g_sched_fiber);
@@ -209,7 +196,6 @@ static void switch_to_sched(void) {
 #endif
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 static void ready_push(zan_co_t *co) {
     co->next = NULL;
@@ -243,7 +229,6 @@ static void complete_task(zan_task_t *t, int64_t result) {
     if (t->completed) return;
     t->result = result;
     t->completed = 1;
-    /* 内部辅助实现 */
     zan_co_t *w = t->waiters;
     t->waiters = NULL;
     zan_co_t *rev = NULL;
@@ -255,27 +240,24 @@ static void complete_task(zan_task_t *t, int64_t result) {
     }
     while (rev) {
         zan_co_t *n = rev->next;
-        rev->next = NULL;   /* 核心系统底层抽象与内存语义契约 */
+        rev->next = NULL;
         ready_push(rev);
         rev = n;
     }
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 void zan_task_release(zan_task_t *task) {
     if (!task) return;
     zan_task_t **pp = &g_all_tasks;
     while (*pp && *pp != task) pp = &(*pp)->all_next;
-    if (!*pp) return;   /* 核心系统底层抽象与内存语义契约 */
+    if (!*pp) return;
     if (!task->completed) {
-        /* 内部辅助实现 */
         zan_rt_fatal("sched", "task released before completion");
     }
     *pp = task->all_next;
     free(task);
 }
 
-/* 模块核心语义抽象与接口调用契约 */
 size_t zan_task_live(void) {
     size_t n = 0;
     for (zan_task_t *t = g_all_tasks; t; t = t->all_next) n++;
@@ -292,9 +274,7 @@ static void timer_add(zan_task_t *t, int64_t delay_ms) {
         g_timers = nt;
         g_timer_cap = nc;
     }
-    /* 模块核心语义抽象与接口调用契约 */
     size_t i = g_timer_n++;
-    /* 内部辅助实现 */
     int64_t due;
     if (delay_ms < 0) {
         due = plat_now_ms();
@@ -316,7 +296,6 @@ static void timer_add(zan_task_t *t, int64_t delay_ms) {
 }
 
 static void timer_pop_root(void) {
-    /* 模块核心语义抽象与接口调用契约 */
     g_timers[0] = g_timers[--g_timer_n];
     size_t i = 0;
     for (;;) {
@@ -333,17 +312,14 @@ static void timer_pop_root(void) {
 
 static int64_t timers_process(void) {
     int64_t now = plat_now_ms();
-    /* 核心系统底层抽象与内存语义契约 */
     while (g_timer_n > 0 && g_timers[0].due_ms <= now) {
         zan_task_t *task = g_timers[0].task;
         timer_pop_root();
         complete_task(task, 0);
     }
-    /* 内部辅助实现 */
     return g_timer_n > 0 ? g_timers[0].due_ms - now : -1;
 }
 
-/* 核心系统底层抽象与内存语义契约 */
 
 #ifdef _WIN32
 static void WINAPI co_trampoline(void *p) {
@@ -367,7 +343,6 @@ static void co_trampoline_posix(unsigned ptr) {
 }
 #endif
 
-/* 核心系统底层抽象与内存语义契约 */
 
 zan_task_t *zan_spawn(zan_co_body_t body, void *arg) {
     zan_co_t *co = (zan_co_t *)calloc(1, sizeof(*co));
@@ -393,7 +368,6 @@ void zan_task_return(zan_task_t *task, int64_t result) {
 int64_t zan_task_await(zan_task_t *task) {
     if (!task) return 0;
     if (!task->completed) {
-        /* 核心系统底层抽象与内存语义契约 */
         g_current->next = task->waiters;
         task->waiters = g_current;
         switch_to_sched();
@@ -419,7 +393,6 @@ int64_t zan_task_result(zan_task_t *task) { return task ? task->result : 0; }
 /* ================= IO integration ================= */
 
 void zan_io_suspend_current(void) {
-    /* 模块核心语义抽象与接口调用契约 */
     if (g_current) {
         switch_to_sched();
     }
@@ -452,13 +425,10 @@ void zan_sched_init(void) {
 
 void zan_sched_run(void) {
     while (g_live > 0) {
-        /* 核心系统底层抽象与内存语义契约 */
         int64_t next_timer = timers_process();
 
-        /* 底层系统交互与数据协议契约 */
         zan_co_t *co = ready_pop();
         if (!co) {
-            /* 内部辅助逻辑 */
             int64_t poll_timeout = -1;
             if (next_timer >= 0) poll_timeout = next_timer;
             if (zan_io_has_pending()) {
@@ -468,7 +438,6 @@ void zan_sched_run(void) {
                 plat_sleep(next_timer);
                 continue;
             } else {
-                /* 内部辅助实现 */
                 if (g_live > 0) {
                     fprintf(stderr,
                             "zan runtime: %d coroutine(s) parked with no "
@@ -479,7 +448,6 @@ void zan_sched_run(void) {
                 break;
             }
         } else {
-            /* 底层系统交互与数据协议契约 */
             if (zan_io_has_pending()) {
                 zan_io_poll(0);
             }
@@ -503,7 +471,6 @@ void zan_sched_shutdown(void) {
     zan_task_t *t = g_all_tasks;
     while (t) { zan_task_t *n = t->all_next; free(t); t = n; }
     g_all_tasks = NULL;
-    /* 模块核心语义抽象与接口调用契约 */
     free(g_timers);
     g_timers = NULL;
     g_timer_n = g_timer_cap = 0;
