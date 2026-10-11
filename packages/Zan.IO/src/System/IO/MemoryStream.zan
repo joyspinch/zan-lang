@@ -11,34 +11,54 @@ namespace System.IO;
 // 读写共用同一个游标（与 System.IO.MemoryStream 相同）：写入
 // 越过末尾会扩展缓冲区，Length 记录最高水位。
 // <see cref="Close"/> 释放缓冲区。
-class MemoryStream : Stream {
+public class MemoryStream : Stream {
     nint data;
     int capacity;
     int length;
     int pos;
 
-    // 构造空流；实例经 Alloc/FromStr/FromRaw 创建。
-    MemoryStream() {
-        this.data = 0;
-        this.capacity = 0;
+    // 构造空流（默认分配 256 字节初始缓冲区）。
+    public MemoryStream() {
+        this.capacity = 256;
+        this.data = NativeMemory.Alloc(this.capacity);
         this.length = 0;
         this.pos = 0;
     }
 
-    // 给定初始容量的空可写流。
-    static MemoryStream Alloc(int initialCapacity) {
+    // 指定初始容量构造空流。
+    public MemoryStream(int initialCapacity) {
         int cap = initialCapacity;
         if (cap < 16) { cap = 16; }
-        MemoryStream ms = new MemoryStream();
-        ms.data = NativeMemory.Alloc(cap);
-        // 分配失败要在这里报出来：否则 capacity 记着 cap 而 data 是 0，
-        // 首次写入就 memcpy 到低地址，故障地址只是写偏移，看不出原因。
-        if (ms.data == 0) {
+        this.capacity = cap;
+        this.data = NativeMemory.Alloc(cap);
+        if (this.data == 0) {
             throw new IOException("MemoryStream: out of memory allocating "
                 + cap + " bytes");
         }
-        ms.capacity = cap;
-        return ms;
+        this.length = 0;
+        this.pos = 0;
+    }
+
+    // 基于托管字节数组初始化流。
+    public MemoryStream(byte[] bytes) {
+        int cap = bytes != null ? bytes.Length : 0;
+        if (cap < 16) { cap = 16; }
+        this.capacity = cap;
+        this.data = NativeMemory.Alloc(cap);
+        this.length = 0;
+        this.pos = 0;
+        if (bytes != null && bytes.Length > 0) {
+            Span<byte> sp = new Span<byte>(this.data, bytes.Length);
+            for (int i = 0; i < bytes.Length; i = i + 1) {
+                sp[i] = bytes[i];
+            }
+            this.length = bytes.Length;
+        }
+    }
+
+    // 给定初始容量的空可写流。
+    public static MemoryStream Alloc(int initialCapacity) {
+        return new MemoryStream(initialCapacity);
     }
 
     // 基于 `s` 字节副本的流，位置为 0
@@ -60,9 +80,52 @@ class MemoryStream : Stream {
     }
 
     // 目前已写入的字节，以二进制安全字符串返回。
-    string ToStr() {
+    public string ToStr() {
         if (this.length <= 0) { return ""; }
         return NativeMemory.GetString(this.data, 0, this.length);
+    }
+
+    // 将整个流内容提取为独立的托管字节数组
+    public byte[] ToArray() {
+        if (this.length <= 0 || this.data == 0) {
+            return new byte[0];
+        }
+        byte[] arr = new byte[this.length];
+        Span<byte> sp = new Span<byte>(this.data, this.length);
+        for (int i = 0; i < this.length; i = i + 1) {
+            arr[i] = sp[i];
+        }
+        return arr;
+    }
+
+    // 写入托管字节数组切片
+    public void WriteBytes(byte[] buffer, int offset, int count) {
+        if (this.capacity == 0 || buffer == null || count <= 0) { return; }
+        if (offset < 0 || offset + count > buffer.Length) { return; }
+        this.Grow(this.pos + count);
+        Span<byte> dst = new Span<byte>(this.data, this.pos + count);
+        for (int i = 0; i < count; i = i + 1) {
+            dst[this.pos + i] = buffer[offset + i];
+        }
+        this.pos = this.pos + count;
+        if (this.pos > this.length) {
+            this.length = this.pos;
+        }
+    }
+
+    // 读取数据到托管字节数组切片
+    public int ReadBytes(byte[] buffer, int offset, int count) {
+        if (this.capacity == 0 || buffer == null || count <= 0) { return 0; }
+        if (offset < 0 || offset + count > buffer.Length) { return 0; }
+        if (this.pos >= this.length) { return 0; }
+        int avail = this.length - this.pos;
+        int toRead = count < avail ? count : avail;
+        Span<byte> src = new Span<byte>(this.data, this.length);
+        for (int i = 0; i < toRead; i = i + 1) {
+            buffer[offset + i] = src[this.pos + i];
+        }
+        this.pos = this.pos + toRead;
+        return toRead;
     }
 
     // 底层缓冲区地址，用于零拷贝 FFI。写入导致缓冲区增长后

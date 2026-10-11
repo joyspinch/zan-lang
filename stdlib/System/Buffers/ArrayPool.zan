@@ -1,0 +1,117 @@
+using System;
+using System.Threading;
+
+namespace System.Buffers;
+
+// 字节数组桶，管理特定容量梯度的数组缓存。
+class ByteArrayBucket {
+    public int bufferLength;
+    public int maxCount;
+    public List<byte[]> buffers;
+    public nint syncLock;
+
+    public ByteArrayBucket(int bufferLength, int maxCount) {
+        this.bufferLength = bufferLength;
+        this.maxCount = maxCount;
+        this.buffers = new List<byte[]>();
+        this.syncLock = Mutex.Create();
+    }
+
+    public byte[] Rent() {
+        Mutex.Lock(this.syncLock);
+        if (this.buffers.Count > 0) {
+            int lastIdx = this.buffers.Count - 1;
+            byte[] arr = this.buffers[lastIdx];
+            this.buffers.RemoveAt(lastIdx);
+            Mutex.Unlock(this.syncLock);
+            return arr;
+        }
+        Mutex.Unlock(this.syncLock);
+        return new byte[this.bufferLength];
+    }
+
+    public void Return(byte[] array, bool clearArray) {
+        if (array == null || array.Length != this.bufferLength) {
+            return;
+        }
+        if (clearArray) {
+            for (int i = 0; i < array.Length; i = i + 1) {
+                array[i] = (byte)0;
+            }
+        }
+        Mutex.Lock(this.syncLock);
+        if (this.buffers.Count < this.maxCount) {
+            this.buffers.Add(array);
+        }
+        Mutex.Unlock(this.syncLock);
+    }
+}
+
+// 工业级高性能分桶字节缓冲池，消除高频网络 IO、组帧与序列化过程中的频繁堆分配与内存碎片。
+public class ArrayPool {
+    static ArrayPool shared;
+    static nint globalLock;
+
+    List<ByteArrayBucket> buckets;
+
+    public ArrayPool() {
+        this.buckets = new List<ByteArrayBucket>();
+        // 阶梯容量梯度：16B 到 1MB 共 17 个 bucket
+        int sz = 16;
+        for (int i = 0; i < 17; i = i + 1) {
+            // 每桶最多缓存 32 个复用块
+            this.buckets.Add(new ByteArrayBucket(sz, 32));
+            sz = sz * 2;
+        }
+    }
+
+    // 全局共享缓冲池单例。
+    public static ArrayPool Shared {
+        get {
+            if (ArrayPool.shared == null) {
+                if (ArrayPool.globalLock == 0) {
+                    ArrayPool.globalLock = Mutex.Create();
+                }
+                Mutex.Lock(ArrayPool.globalLock);
+                if (ArrayPool.shared == null) {
+                    ArrayPool.shared = new ArrayPool();
+                }
+                Mutex.Unlock(ArrayPool.globalLock);
+            }
+            return ArrayPool.shared;
+        }
+    }
+
+    // 租借长度不小于 minimumLength 字节的缓冲区。
+    public byte[] Rent(int minimumLength) {
+        if (minimumLength <= 0) {
+            minimumLength = 16;
+        }
+        for (int i = 0; i < this.buckets.Count; i = i + 1) {
+            ByteArrayBucket b = this.buckets[i];
+            if (b.bufferLength >= minimumLength) {
+                return b.Rent();
+            }
+        }
+        // 超过 1MB 梯度上限直接分配
+        return new byte[minimumLength];
+    }
+
+    // 归还缓冲区至池中。
+    public void Return(byte[] array, bool clearArray) {
+        if (array == null) { return; }
+        int len = array.Length;
+        for (int i = 0; i < this.buckets.Count; i = i + 1) {
+            ByteArrayBucket b = this.buckets[i];
+            if (b.bufferLength == len) {
+                b.Return(array, clearArray);
+                return;
+            }
+        }
+    }
+
+    // 归还缓冲区（默认不清空内容）。
+    public void Return(byte[] array) {
+        this.Return(array, false);
+    }
+}
