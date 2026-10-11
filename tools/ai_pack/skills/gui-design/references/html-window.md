@@ -344,6 +344,10 @@ STANDARDS.md §6.7）。
    - **组件类型感知模型强转回写（Coercion On Writeback）**：双向绑定 `data-bind` 回写时，若目标 JSON 模型节点尚未初始化（`cur == null`），`WriteBoundValue` 自动根据当前绑定的控件类型进行精准的类型归一化：`Checkbox` / `Switch` 强制以 `JsonValue.NewBool` 写入；`Slider` / `InputNumber` / `Progress` / `Rate` 及声明了 `.number` 的控件强制以 `JsonValue.NewNum` 写入；避免空模型初次绑定输入时被统一回写为字符串而破坏数据契约。
    - **快照即时同步防抖**：控件完成 `WriteBoundValue` 模型就地回写后，立即调用 `RecordSnapshot(c, s)` 同步控件快照，防止同一帧在后续流程中再次触发无效重复写入。
 
+13. **编译期 GenHtml 与运行时 Html.Build 双通道语义同构对齐规范**：
+   - **指令与修饰符发射对齐**：AOT 编译期代码生成器 `GenHtml` 必须完整发射 `:class` (`v.bindClass`)、`:disabled` (`v.bindDisabled`)、`:prop` / `v-bind:prop` (`v.AddBindProp("prop", expr)`)、以及 `v-model.lazy.number.trim` 对应的修饰符布尔标记（`v.bindLazy`、`v.bindNumber`、`v.bindTrim`），确保 AOT 编译生成的控件树在运行期享有与 JIT 动态解析完全一致的双向绑定与响应式行为。
+   - **模板插值与作用域对齐**：静态节点与容器内部的 `{{ expr }}` 文本在 `GenHtml` 中自动扫描并合成 `v.bindTpl = "..."` 发射，由 `ChildWindow.SyncFromNode` 统一求值与更新。
+
 14. **设计器复合与容器组件项事件与细粒度配置闭环规范（ToolStrip 项事件/Tab 与选项关闭尺寸/大编辑器定位）**：
    - **工具条（ToolStrip）项点击事件在属性与事件面板双通道暴露**：
      - 在「属性」面板的选项行（OPTIONS）上，为非分隔符项直观展示已绑定的事件处理器（`-> On...Click`），并在每行配备 `[事件]` 操作按钮，点击自动推导方法名并直通代码后置。
@@ -352,6 +356,12 @@ STANDARDS.md §6.7）。
      - 在工具条项与表格列的弹窗主从属性编辑面板中，为选中项提供「定位事件代码」/「定位点击代码」按钮，免除开发者在选项文本与事件方法名之间反复来回切换。
    - **选项与 Tab 关闭按钮精致化度量（14px~16px）**：
      - 属性检查器选项列表中删除按钮（`MiniCloseBtn`）重构为轻量 16px 矩形热区配 10px `close` 字符图标与悬停高亮；`Tabs` 标签页的关闭按钮统一收缩至 14px 方形热区并配合 10px 字符，彻底根绝关闭按钮过大挤占选项标签或误触的问题。
+
+15. **AOT 编译期高级组件标签映射与插槽挂载同构规范（Tabs/Card/Badge/Tag 等）**：
+   - **高阶组件声明式类型映射**：在 AOT 编译阶段（`GenHtml.EmitDecl`），标准组件标签（`<card>`、`<badge>`、`<avatar>`、`<tag>`、`<divider>`、`<alert-box>`、`<rate>`、`<split-panel>`、`<collapse>`、`<breadcrumb>`、`<steps>`、`<timeline>`、`<qrcode>`、`<watermark>`、`<marquee>`、`<spin>`、`<empty>`、`<result>`、`<skeleton>`、`<input-number>` 等）必须直接发射强类型实例化代码（如 `Gui.Widget.Card vN = new Gui.Widget.Card("...");`），并在 `IsWidgetTag` 中注册为受管组件，严禁退化为通用 `Gui.Element` 导致方法丢失。
+   - **真组件文本与空白过滤（Anti-Bogus-AddText）**：真实组件继承自 `Control` 而非 `Element`，不具备 `AddText` 接口。在 `GenHtml.EmitContent` 中，对于 `IsWidgetTag` 判为真的组件，游离空白符与换行符必须严加过滤，禁止发射 `v.AddText(" ")`；非空白文本内容通过 `v.SetProp("text", ...)` 规范写入。
+   - **Tabs 容器选项自动推导与元子节点插槽转挂**：`<tabs>` 容器若未显式指定 `options` 属性，`GenHtml` 与 `Html.Build` 均自动深层扫描子级 `<tab title="...">` / `<tab-pane>` 元素并推导拼接 `options` 字符串；元子节点在 `IsMetaChild` 中标记放行，其内部实际承载的子孙控件自动注入 `slotName = tTitle` 并重定向挂载至父级 `Tabs`，在 AOT 与 JIT 两大模式下达成 100% 同构闭环。
+   - **密码输入与扩展属性双向对称性（GetExtra/SetExtra）**：`<input type="password">` 统一通过 `v.SetProp("password", "true")` 声明，且控件层在 `GetExtra` 与 `SetExtra` 中形成完整读写闭环，确保属性获取与状态同步双向对称。
 
 
 
