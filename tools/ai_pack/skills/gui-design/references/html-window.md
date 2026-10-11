@@ -8,7 +8,7 @@
 
 - **编译期设计稿（GenForm）**：body 带 `data-zan-design` 的设计文档
   作为编译输入，GenForm 合成 Main、控件字段、`__BuildForm`（含
-  `root.Dock(Dock.Fill())`）。**设计稿必须是命令行第一个文件**——
+  `root.Dock(Dock.Fill)`）。**设计稿必须是命令行第一个文件**——
   zanc 从第一份设计文档合成入口，放后面 = 字段全缺（模板门配方：
   html 首参 + 全部 src/*.zan）。
 - **编译期运行期文档（GenHtml）**：body **不带** `data-zan-design`
@@ -25,7 +25,7 @@
 
 **GenHtml 通道的树根坑（实机踩过）**：`Build` 返回的 body 元素 dock=0
 （Manual）——窗口只对 dock=Fill 的根做客户区填充，**code-behind 必须
-补一句 `root.DockFill()`**，否则整棵树缩在窗口左上角按内容尺寸排版
+补一句 `root.DockFill`**，否则整棵树缩在窗口左上角按内容尺寸排版
 （GenForm 时代这句由 `__BuildForm` 发射，runtime 文档没人替你发射）。
 同理：左栏宽度这类"GenForm 靠 logW/logH 声明"的定尺寸，在 GenHtml
 通道走 CSS `width/height` 声明（dock 排布的 `DockSize` 取
@@ -87,9 +87,9 @@
 | `@hide="OnClose"` / `onhide="OnClose"` | `Hide` | `ctrl.Hide` 固有事件槽 | 控件隐藏事件 |
 | `@resize="OnResize"` / `onsizechange="OnResize"` | `Resize` | `ctrl.Resize` 固有事件槽 | 尺寸变化事件 |
 | `@tab-changed="OnTabChange"` / `@tab-change="..."` | `TabChanged` | `tabs.TabChanged` | 标签页切换事件 |
-| `@row-click="OnRowClick"` / `@row-dblclick="..."` | `RowClick` / `RowDoubleClick` | `grid.State().RowClick` 等 | 表格行级单击/双击事件 |
-| `@cell-click="OnCellClick"` / `@cell-dblclick="..."` | `CellClick` / `CellDoubleClick` | `grid.State().CellClick` 等 | 表格单元格级单击/双击事件 |
-| `@col-click="OnColClick"` / `columns[i].click` | `ColumnClick` / `HeaderClick` | `grid.State().HeaderClick` | 表格列头/字段级声明式点击事件 |
+| `@row-click="OnRowClick"` / `@row-dblclick="..."` | `RowClick` / `RowDoubleClick` | `grid.State.RowClick` 等 | 表格行级单击/双击事件 |
+| `@cell-click="OnCellClick"` / `@cell-dblclick="..."` | `CellClick` / `CellDoubleClick` | `grid.State.CellClick` 等 | 表格单元格级单击/双击事件 |
+| `@col-click="OnColClick"` / `columns[i].click` | `ColumnClick` / `HeaderClick` | `grid.State.HeaderClick` | 表格列头/字段级声明式点击事件 |
 | `@item-click="OnItemClick"` / `@item-dblclick="..."` | `ItemClick` / `ItemDoubleClick` | `list.ItemClick` 等 | 列表控件条目点击事件 |
 | `@keydown`, `@keyup`, `@focus`, `@blur` | `KeyDown` 等 | `ctrl.On.*` | 键盘输入与焦点通用事件 |
 
@@ -125,7 +125,7 @@ JsonValue 状态实体）：帧前模型→UI（`SyncFromModel`，值变才写�
 
 - **值/显隐/列表内容 → 改模型**：`model.Set("title", ...)` /
   `Set("showBag", ...)` / `Set("items", ...)`，末尾
-  `RequestRedraw()` 出一帧即生效（模型改了但窗口静止，屏幕不会
+  `RequestRedraw` 出一帧即生效（模型改了但窗口静止，屏幕不会
   自己动）。别既改模型又 `SetProp` 同一控件——两个写入源打架，
   帧后回写可能把模型改动顶回去。
 - **结构（增删控件/换组件类型）→ 命令式**：retained 树 API
@@ -170,7 +170,7 @@ STANDARDS.md §6.7）。
   见到同名目录就整体跳过 stdlib 基线内嵌，只放自家 skin.css 会让
   基线层整层丢失、flex 全退化成叠矩形（无为修仙传百艺页签全叠的根因，
   模板补带 base.css 后消除）。
-- 运行时换肤是实例方法：`form.GetApp().UseSkin("neon")`——按静态
+- 运行时换肤是实例方法：`form.GetApp.UseSkin("neon")`——按静态
   `App.UseSkin(...)` 调会报 cannot call instance method（踩过）。
 
 ## 模板实例化（gui-* 模板带 `{{NAME}}` 占位符）
@@ -281,22 +281,22 @@ STANDARDS.md §6.7）。
 2. **双通道事件路由（BindEvent 与 BindEventS）**：
    - 无参通道：`BindEvent(string evt, Action a)` 接收轻量无参回调。
    - Sender 通道：`BindEventS(string evt, ControlEvent a)` 接收带 `Control sender` 实例强类型回调。
-   - **包装 state/model 的复合控件（如 DataGrid/TreeView/Pagination 等）必须重写 BindEventS**：不可仅重写 `BindEvent` 并任由 `BindEventS` 回退到基类的 `On.AddByNameS`，否则会导致带参回调无法触发底层状态机专属事件；必须显式通过 `this.st.<Event>.Add(() => a(this))` 将自身封装为 sender 准确派发。
+   - **包装 state/model 的复合控件（如 DataGrid/TreeView/Pagination 等）必须重写 BindEventS**：不可仅重写 `BindEvent` 并任由 `BindEventS` 回退到基类的 `On.AddByNameS`，否则会导致带参回调无法触发底层状态机专属事件；必须显式通过 `this.st.<Event>.Add( => a(this))` 将自身封装为 sender 准确派发。
 3. **表格等大型组件的多维丰富事件（Row / Cell / Column / Grid）**：
    - 行级：`RowClick`、`RowDoubleClick`、`RowRightClick`（别名 `RowContext`）、`RowInserted`、`RowDeleted`。
    - 单元格级：`CellClick`、`CellDoubleClick`（别名 `CellDblClick`）、`CellEdit`、`CellValidating`。
    - 列与表头级：`HeaderClick`（别名 `ColumnClick`）、`ColumnDoubleClick`、`ColumnResize`、`ColumnResizeEnd`、`Sort`、`ColumnReorder`。
    - 网格视图与状态：`FilterChanged`、`SelectionChanged`、`GroupChanged`、`BandToggled`、`ScrollChanged`。
-   - **双击命中坐标锁定**：在双击触发判定时必须锁定列索引（如 `st.hitCol = ptrCol;`），并同时触发 `RowDoubleClick` 与 `CellDoubleClick`，保证 `DataGrid.HitField()` 能解析出目标列字段，供 `GenForm` 中列声明的事件脱糖分派精准路由。
+   - **双击命中坐标锁定**：在双击触发判定时必须锁定列索引（如 `st.hitCol = ptrCol;`），并同时触发 `RowDoubleClick` 与 `CellDoubleClick`，保证 `DataGrid.HitField` 能解析出目标列字段，供 `GenForm` 中列声明的事件脱糖分派精准路由。
 4. **常用组件专属语义事件标配**：
    - `TreeView`：`Select`、`Activate`、`Expand`、`Collapse`、`Context`、`Check`。
    - `Pagination`：`Change`（切页）、`SizeChange`（切每页条数）。
    - `ListView`：`Select`、`Activate`、`Context`。
    - `Tabs`：`Change`（切标签页）。
-   - 全部专属事件必须注册在 `Events()` 清单中，并通过 `BindEvent` / `BindEventS` 双通道无缝转发。
+   - 全部专属事件必须注册在 `Events` 清单中，并通过 `BindEvent` / `BindEventS` 双通道无缝转发。
 
 5. **设计器与代码生成脱糖契约（ToolStrip 项事件与组件配置规范）**：
-   - **ToolStrip 项点击事件脱糖**：`ToolStrip` 的按钮项（`items`）在设计器或 JSON 声明中配置了 `click` 属性时，`GenForm` 自动脱糖聚合生成该工具条的 `ItemClick` 事件监听；内部通过 `if (vn.LastIndex() == i) { __form.Call("OnHandler"); }` 区分触发项，无须手写胶水代码分派。
+   - **ToolStrip 项点击事件脱糖**：`ToolStrip` 的按钮项（`items`）在设计器或 JSON 声明中配置了 `click` 属性时，`GenForm` 自动脱糖聚合生成该工具条的 `ItemClick` 事件监听；内部通过 `if (vn.LastIndex == i) { __form.Call("OnHandler"); }` 区分触发项，无须手写胶水代码分派。
    - **紧凑型关闭按钮（MiniCloseBtn）排版纪律**：属性检查器（选项列表、CSS 样式表等）中的单项删除按钮禁止使用常规 28px/34px 操作按钮，统一采用 20px 紧凑圆底微十字按钮，避免挤占输入框与标签的空间。
    - **设计器画布网格避让渲染**：画布网格必须使用淡色微点阵（35%~40% 次级透明度）替代粗实线；绘制点阵时需检查控件包围盒（`fx, fy, fw, fh`），组件覆盖区域跳过绘制，彻底消除网格穿透遮挡组件界面的视觉干扰。
    - **常用组件属性契约闭环**：基础组件在设计器 `BuiltinPropRows` 中必须完整声明属性元数据，`Button` 等支持 `type` / `size` 变体类的组件在 `SetProp` 中使用 `SetClassIn` 维护互斥语义类，确保设计器即时配置所见即所得。
@@ -304,11 +304,11 @@ STANDARDS.md §6.7）。
 6. **窗体设计器事件交互与代码后置快速定位规范（新建/编辑/双击/快捷跳转）**：
    - **三合一快捷操作区**：属性面板「事件」选项卡的每个事件条目均配齐「定位」、「新建」、「编辑」按钮，并在底部事件输入框右侧提供一键「定位代码」，同时支持直接双击事件条目快速定位。
    - **语义化事件建议与自动绑定**：点击「新建」或在未绑定状态下点击「定位」/双击时，设计器自动按组件名与事件名推导标准方法名（如 `OnSubmitBtnClick`、`OnWindowLoad`）并写入事件绑定。
-   - **智能代码后置（Code-Behind）定位与桩补齐**：通过 `handler:<方法名>` 请求宿主 IDE 切换至配对的 `.zan` 业务文件。若源码中已存在该方法，精准定位至声明行号；若尚未声明，自动在 `partial class` 类体末尾（最后一个闭合花括号前）插入干净的标准方法桩（`static void <方法名>() { }`）并定位光标，实现所见即所得的极速事件开发闭环。
+   - **智能代码后置（Code-Behind）定位与桩补齐**：通过 `handler:<方法名>` 请求宿主 IDE 切换至配对的 `.zan` 业务文件。若源码中已存在该方法，精准定位至声明行号；若尚未声明，自动在 `partial class` 类体末尾（最后一个闭合花括号前）插入干净的标准方法桩（`static void <方法名> { }`）并定位光标，实现所见即所得的极速事件开发闭环。
 
 7. **窗体设计器属性强类型交互与多选排版对齐规范（下拉枚举/图标拾取/主选基准对齐/等间距分布）**：
    - **属性强类型化与下拉枚举（SelectBox）渲染**：属性提示中带有枚举候选项（如 `"Type (primary/info/success/warning/error)"`）时，自动解析出合法枚举列表并在属性检查器中渲染为 `small` 尺寸的 `SelectBox` 下拉选择框，替代繁琐易错的手动输入；标签展示时自动清洗掉 `(primary/...)` 后缀，保持排版精简整洁，同时保留 `(px)` 等合法度量单位。
-   - **图标与资源可视化拾取（OpenIconPicker）**：属性键为 `icon` 时，在输入框旁渲染 `[图标]` 弹窗选择按钮，点击后拉起基于 `Icon.Names()` 的可视化图标网格，点选后直接填充并触发画布即时重绘。
+   - **图标与资源可视化拾取（OpenIconPicker）**：属性键为 `icon` 时，在输入框旁渲染 `[图标]` 弹窗选择按钮，点击后拉起基于 `Icon.Names` 的可视化图标网格，点选后直接填充并触发画布即时重绘。
    - **多组件排版以主选为基准（Anchor Alignment）**：自由画布多选对齐（左/居中/右/顶/中/底）在单选时对齐至所属容器内容框，多选时必须严格以主选中项（`sel`）的位置与尺寸为几何基准（而非各元素独立归位到容器边框），符合直觉的矢量/GUI 排版体验。
    - **水平与垂直等间距分布（Distribute）**：支持多选控件（≥3 个）的水平等间距分布（`dist_h`）与垂直等间距分布（`dist_v`），保持首尾两端控件绝对位置不变，中间所有控件在剩余跨度内均匀分配几何间隙，消除人工肉眼对齐的繁琐工作。
    - **多媒体与图像资源浏览拾取器（Asset Picker）**：针对 `src`、`image`、`avatar` 及各类以 `Path` 结尾的媒体资源属性，在输入框旁渲染 `[浏览]` 按钮，拉起过滤了主流图片格式（`*.png;*.jpg;*.jpeg;*.svg;*.bmp;*.gif;*.webp`）的 `FilePicker` 弹窗；选中后自动调用 `RelativizePath` 将绝对路径转为相对于当前项目工作目录的标准短路径（如 `assets/player.png`），配合控件的 `SetProp` 实现画布即时渲染更新。
@@ -332,12 +332,12 @@ STANDARDS.md §6.7）。
    - **声明式具名插槽（`slot="xxx"` / `data-slot="xxx"`）**：复合容器（如 `Tabs`、`SplitPanel`、`Card` 等）覆写 `NamedSlotHost(string slot)`，在 `Html.AddChild` 阶段自动将带 `slot` 属性的子控件分发挂载到对应的内部宿主容器（如 `SplitPanel` 的 `left`/`right`/`pane1`/`pane2` 窗格，`Tabs` 的 `slot="Account"` 匹配标签页页面 `Page(i)`），完全免去在后台代码中手动拆分查找与挂载。
    - **双向绑定失焦防抖修饰符（`v-model.lazy`）**：在 `SyncChangedNode` 中通过 `c.HasFocus(host)` 检测用户输入焦点。处于获焦编辑状态时不触发每帧回写，直到用户失焦（Blur）或切换组件时一次性回写模型并更新快照，彻底消除键盘逐字输入过程中的状态抖动与频繁渲染开销。
    - **双向绑定类型保真修饰符（`v-model.number`）**：用户在输入框键入文本后，在 `WriteBoundValue` 回写阶段自动将其转换为 `JsonValue.NewNum` 数值节点存储，避免原本数字类型的 JSON 模型字段被降级污染为字符串类型。
-   - **双向绑定首尾去空修饰符（`v-model.trim`）**：在回写前自动剥离字符串首尾的空白字符（`s.Trim()`），可与 `.number` 复合链式声明（如 `v-model.number.trim="score"`）。
+   - **双向绑定首尾去空修饰符（`v-model.trim`）**：在回写前自动剥离字符串首尾的空白字符（`s.Trim`），可与 `.number` 复合链式声明（如 `v-model.number.trim="score"`）。
 
 11. **文本胡子语法动态插值（`{{ expr }}`）与事件修饰符规范（`@click.stop` / `@keydown.enter`）**：
    - **胡子模板文本插值（`{{ expr }}`）**：在静态元素或模板行（`<template data-for>`）的文本内容中声明 `{{ user.name }}` 或 `{{ active ? '在线' : '离线' }}`。HTML 构建期将包含 `{{` 的文本捕获到 `c.bindTpl`；`ChildWindow` 在每帧 `SyncFromNode` 中调用 `EvalInterpolation` 解析各花括号内部的表达式，求值后回写到 `c.SetProp("text", val)`；支持行级数据作用域与根级模型混用及动态响应式刷新。
    - **复合标签与元子节点插槽无缝集成（`<tabs>` / `<tab title="...">`）**：`<tabs>` 容器既支持显式声明 `slot="Title"` 的直系子控件分发挂载，也支持以 `<tab title="...">` / `<tab-pane>` 包裹子内容的标准组件写法。在 `Html.Parse` 装配阶段，元子节点 `<tab>` 的内部子控件自动提取并继承标签页插槽路由至 `Tabs.Page(i)`，实现自然、声明式的选项卡界面排版。
-   - **事件修饰符与防冒泡（`@click.stop` / `@keydown.enter`）**：在 `@click.stop`、`@submit.prevent`、`@keydown.enter` 等事件声明中，`HtmlText.EventKind` 自动剥离修饰符后缀以匹配核心事件种类，并在 `Html.Wire` / `Html.WireArg` 中通过 `WrapModifier` 装饰底层回调：`.stop` 自动调用 `app.ClaimClick()` 截断事件向下冒泡；`.enter` 严格校验 `app.window.EventKeyCode() == 13`，免去业务回调中重复编写键码和冒泡判定样板代码。
+   - **事件修饰符与防冒泡（`@click.stop` / `@keydown.enter`）**：在 `@click.stop`、`@submit.prevent`、`@keydown.enter` 等事件声明中，`HtmlText.EventKind` 自动剥离修饰符后缀以匹配核心事件种类，并在 `Html.Wire` / `Html.WireArg` 中通过 `WrapModifier` 装饰底层回调：`.stop` 自动调用 `app.ClaimClick` 截断事件向下冒泡；`.enter` 严格校验 `app.window.EventKeyCode == 13`，免去业务回调中重复编写键码和冒泡判定样板代码。
 
 12. **HTML5 声明式输入控件多态映射与模型类型感知自动强转规范**：
    - **`<input type="...">` 多态组件实例化**：在 HTML 声明中写 `<input type="checkbox|radio|number|range|color|date|password" />` 时，`Html.Build` 自动映射实例化为对应的专属高阶组件（`checkbox` -> `Checkbox`、`radio` -> `Radio`、`number` -> `InputNumber`、`range` -> `Slider`、`color` -> `ColorPicker`、`date` -> `DatePicker`、`password` -> `Input` 带密码掩码属性），与自定义组件标签（`<slider>`、`<colorpicker>` 等）完全等价且支持标准 HTML 语义。
@@ -364,11 +364,11 @@ STANDARDS.md §6.7）。
    - **密码输入与扩展属性双向对称性（GetExtra/SetExtra）**：`<input type="password">` 统一通过 `v.SetProp("password", "true")` 声明，且控件层在 `GetExtra` 与 `SetExtra` 中形成完整读写闭环，确保属性获取与状态同步双向对称。
 
 16. **动态模型数组驱动选项绑定与双向值同步规范（`:options` 与 `<option value="...">` JIT/AOT 同构）**：
-   - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ChildWindow.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray()`）时，自动序列化为标准 JSON 字符串（`v.ToJson()`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
+   - **JSON 模型数组动态绑定（`:options` / `v-bind:options`）**：在 `ChildWindow.ResolveOperandStr` 中，当绑定表达式求值结果为 JSON 数组（`v.IsArray`）时，自动序列化为标准 JSON 字符串（`v.ToJson`），使高阶选择组件（`SelectBox`、`ChoiceGroup`、`RadioGroup`、`Tabs` 等）能够无缝响应由模型数组驱动的动态选项变更。
    - **选项反序列化多格式兼容与元数据映射**：组件的 `SetOptionsText` / `SetItemsText` 原生兼容经典竖线分隔字符串（`"A|B|C"`）与结构化 JSON 数组（`"[{\"label\":\"北京\",\"value\":\"bj\"}, ...]"`）。解析 JSON 数组时，标签键优先读取 `label` / `title` / `name` / `text`，值键读取 `value` / `id`，并支持 `disabled` 与 `closable` 元数据映射。
    - **帧渲染缓存幂等防抖（`optionsRaw` / `itemsSpec`）**：在组件内部维护 `optionsRaw` 原始字符串缓存；当每帧数据同步写入的选项文本与当前缓存一致时立即跳过重新解析与重建子项，彻底避免动画帧循环中重复反序列化造成的性能损耗以及弹窗滚动条、焦点和选中态被意外重置的问题。
    - **双向绑定语义值与下标自适应（Two-Way Binding Type Adaptability）**：
-     - 当从 `SelectBox` 读取值回写模型时（`ChildWindow.BoundValue`），先检查目标模型字段当前是否为数值类型；若为数值，则回写整型下标字符串（`Convert.ToString(sb.Selected())`）；若为字符串或未初始化，则回写语义值（`sb.SelectedValue()`，回退至 `sb.Text()`）。
+     - 当从 `SelectBox` 读取值回写模型时（`ChildWindow.BoundValue`），先检查目标模型字段当前是否为数值类型；若为数值，则回写整型下标字符串（`Convert.ToString(sb.Selected)`）；若为字符串或未初始化，则回写语义值（`sb.SelectedValue`，回退至 `sb.Text`）。
      - 当从模型向 `SelectBox` 写入属性时（`SetProp("value", val)`），优先在选项列表中匹配 `opts[i].val == val || opts[i].label == val`；若未命中则回退为数值下标解析，实现语义值与下标的双向平滑转换。
    - **JIT 与 AOT `<option value="...">` 编译同构**：当在声明式 HTML 中声明带有显式 `value` 属性的 `<option value="bj">北京</option>` 时，运行时 JIT（`Html.Parse`）与编译期 AOT（`GenHtml.Translate`）统一探测子级是否包含非空自定义 `value`。一旦包含，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并发射为 `SetProp("options", ...)`，确保原生 HTML `<select>` 语义在动静双通道下 100% 行为一致。
 

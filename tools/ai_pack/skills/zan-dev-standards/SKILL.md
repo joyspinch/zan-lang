@@ -23,14 +23,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 5. **修根因，不绕行**：Zan 代码失败若源于编译器/runtime 缺陷，去修编译器，
    禁止把业务代码改写成绕开缺陷的形状。
 6. **动包的公共 API 前全仓查消费方，grep 必须含项目模板与示例目录**：包内
-   类型被模板与服务端样例跨包消费是常态（2026-10-02 CSV 合并成包，两份旧
+   类型被模板与服务端样例跨包消费是常态（CSV 合并成包，两份旧
    `Csv` 共 8 处消费方，其中 4 处在模板里，漏一处 = 模板验收门红）。改 GUI/
-   基础库公共 API 同理——一次异步化重构给模板写了不存在的 `Form.Close()`，
-   模板自此编译不过，直到模板门复跑才暴露（2026-10-02）。删除/搬家包文件、
+   基础库公共 API 同理——一次异步化重构给模板写了不存在的 `Form.Close`，
+   模板自此编译不过，直到模板门复跑才暴露。删除/搬家包文件、
    改公共 API 之后跑一遍"编译全部项目模板"的验收测试收口。
 7. **禁止手搓简化版复刻仓库验收脚手架**（脚手架脚本这类）：模板占位符内容
    替换、入口文件重命名、manifest 键解析、target 分支参数，少搬一步就是整批
-   假阳性（2026-10-02 复刻缺占位符替换与入口逻辑，19 个模板假红空转一轮，
+   假阳性（复刻缺占位符替换与入口逻辑，19 个模板假红空转一轮，
    真失败只有 1 个漏网消费方）。能直接跑现成验收测试就直接跑；复刻仅用于
    定位单模板问题，且必须对照原脚本逐行搬齐。
 
@@ -98,19 +98,19 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **杜绝手拼 JSON 字符串与手拼 SQL 拼接（严禁裸字符串拼接与简陋的 Replace 引号）**：
   ① JSON 序列化一律使用标准库 `System.Json.JsonValue` 构建器（`PutStr/PutInt/PutDouble/PutBool/PutNull/PutJson` 与 `Append`），字符串成员经原生转义安全处理特殊字符（引号、反斜杠、控制字符 `\n`/`\r`/`\t`），杜绝因换行或引号破坏 JSON 报文语法；嵌套片段利用 `PutJson`/`AppendJson` 原生嵌入，禁止通过文本剪裁与字符串拼接嵌入；
   ② 数据库非查询/查询/聚合操作一律使用参数化 API（`DbParams` 与 `?` 占位符），禁止手写拼接 `Quote` 单引号或裸拼接变量（如 `"WHERE slot=" + key`），杜绝 SQL 注入漏洞并复用数据库预编译执行计划；
-  ③ 实体持久化与业务数据访问优先使用原生 ORM 表达式与模型映射（`Select<T>()` / `Insert<T>()` / `Update<T>()` / `Delete<T>()` / `DbTable.Of()`），通过 lambda 强类型表达式（如 `a => a.slot == slot`）或类型化查询链，由编译器与 ORM 生成层自动完成列名白名单核验、类型绑定与参数化，从架构根源上根除手写裸 SQL 字符串的脆弱性。
+  ③ 实体持久化与业务数据访问优先使用原生 ORM 表达式与模型映射（`Select<T>` / `Insert<T>` / `Update<T>` / `Delete<T>` / `DbTable.Of`），通过 lambda 强类型表达式（如 `a => a.slot == slot`）或类型化查询链，由编译器与 ORM 生成层自动完成列名白名单核验、类型绑定与参数化，从架构根源上根除手写裸 SQL 字符串的脆弱性。
 - **ORM 条件只有值自带原语，裸 SQL 片段是生成代码专属**。用户面条件一律
   `WhereEq/WhereGe/WhereLe/WhereIn/WhereLikeAny`（列名经实体元数据校验，
   值全部参数化绑定）与类型化 lambda（`ids.Contains(a.id)` 降级为参数化
-  IN；空列表恒假，不会生成非法 `IN ()`）；列表筛选收集成 `List<OrmCond>`
+  IN；空列表恒假，不会生成非法 `IN `）；列表筛选收集成 `List<OrmCond>`
   后 `WhereConds(conds)` 一口吞（多列 LIKE 用 `|` 分组 OR）。批量更新/
-  删除走 `DbTable.Of(conn, "表").Query().WhereIn(...).ExecuteUpdateAsync(...)`
+  删除走 `DbTable.Of(conn, "表").Query.WhereIn(...).ExecuteUpdateAsync(...)`
   （列名过 RequireIdent 白名单）。`W("片段")+InI(...)` 这类片段/参数分离
   写法已整体删除，只以 `__` 前缀（`__Frag/__Pi/...`）存在于编译器生成代码
   里，手写代码不可见；要给查询链接名字仍用门面根
   `__DbQ_Post sel = __DbBind.Q_Post(conn);`（裸赋值 `this.Post` 编译不过）。
   坑出处：片段+参数靠位置配对，编译器查不出错位，历史上实烂三处
-  （2026-09-25 根治，值自带后错位不可能发生）。
+  （根治，值自带后错位不可能发生）。
 - **Zan.Web 菜单是显式选择（GenRoute 约定），别靠描述"顺便"进侧栏**。进
   管理菜单只认显式标注：`[Custom(IsMenu = true)]`（类级或动作级，图标/权限
   同写在那一处）、`[Menu]`、`[AdminAction(IsMenu = true)]`；类级
@@ -118,9 +118,9 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   没有方法级显式标注一律不进——类级菜单配置只作用于根动作。方法层显式
   标注永远赢过类级默认（两层合并类先方法后）。坑出处：登录/健康检查这类
   有描述的公开端点曾被类描述隐式默认刷进侧栏，而监控类控制器的非根动作
-  上已标注的 `[Custom(IsMenu=true)]` 又被反向吞掉（2026-09-25 GenRoute
+  上已标注的 `[Custom(IsMenu=true)]` 又被反向吞掉（GenRoute
   改约定后两端同时修复，一致性用例锁定）。
-- **语言事实三则（2026-09-25 CRUD 声明化实机踩出）**：① `protected`
+- **语言事实三则（CRUD 声明化实机踩出）**：① `protected`
   是**仅子类可见**——同包同命名空间的协作类也访问不到（`Crud` 访问
   `AdminController` 的 `Can/Note/Saved` 直接编译错）。包内协作面要么
   放开为默认公开（如 Note/Saved 这类通用应答/审计），要么像
@@ -128,11 +128,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ② 关键字不能当标识符——`where`（lambda 语法）与 `set`/`get`（属性
   访问器语法）都是保留字：`where` 做变量名报 `unexpected token` 一串，
   `DbValues set` 参数把整段方法解析炸成上百条级联错（各改名实修）；
-  另 `StringBuilder.Append` 返回 void，`sb.Append(x).ToString()` 链式
+  另 `StringBuilder.Append` 返回 void，`sb.Append(x).ToString` 链式
   取值编译不过，必须拆两条语句；
   ③ async 方法同一表达式里 await 前不得再求值带副作用的调用
-  （`this.Ctx().path` 要先赋局部变量），编译期强制。
-- **语言事实第四则（2026-09-27 全站假死排查踩出）**：`virtual` 在派生类
+  （`this.Ctx.path` 要先赋局部变量），编译期强制。
+- **语言事实第四则（全站假死排查踩出）**：`virtual` 在派生类
   里是**新开槽位**（隐藏基类实现），不是覆盖——挂接框架生命周期钩子
   （请求前后清理这类）必须写 `override`。曾把控制器基类的请求钩子声明
   成 `virtual`：框架经基类静态类型的槽位派发，新槽位永远打不中，跑的
@@ -142,7 +142,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   失配 + 钩子首行日志打不出来 = 槽位没接上。SDK 新版编译器对该形状
   直接告警（`--deny-warnings` 可升级为编译失败），合法重载与真
   override 不误报。
-- **语言事实第五则（2026-10-01 XML DOM 包首日踩出）**：① 包命名空间按
+- **语言事实第五则（XML DOM 包首日踩出）**：① 包命名空间按
   using 拉取：`packages/*` 里的类型必须先 `using System.Xml;`（对应的
   包命名空间）才入编，漏 using 直接报 `undefined type 'XmlNode'` 且不
   指向缺 using——新包首次使用先补 using 再排查别的（与 stdlib 按需拉入
@@ -151,15 +151,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   runtime`），既有代码惯例是存局部变量判空，无 `?.` 使用先例、别臆测其
   形态；深层取值逐层存局部判空，同根多条断言用 `if (x != null) {}` 包住
   整段，测试探针尤其常用。
-- **语言事实第六则（2026-10-01 Zan.Toml 包首日踩出）**：① `JsonValue.At(i)`
+- **语言事实第六则（Zan.Toml 包首日踩出）**：① `JsonValue.At(i)`
   是**数组专属**——对象上调 `At(i)` 直取数组底层的 `items[i]`，对象该列表
   恒空，无边界检查直接段崩（编译期查不出）；对象遍历配对用
-  `KeyAt(i)`/`ValAt(i)`，`Count()` 两种形态通用；② 无序格式的往返相等
+  `KeyAt(i)`/`ValAt(i)`，`Count` 两种形态通用；② 无序格式的往返相等
   **必须按键集合深度比，不能比 ToJson 原文**——写出器把行内对象键合法地
   挪进 `[表头]` 区块，同层键序变化是语义不变的（TOML 表无序），拿 JSON
   文本判等会误报失败：递归 `Eqv(a,b)`（对象逐 KeyAt 查 Has+ValAt 递归、
   数组按序递归、标量按类型比）才是正确闸门。
-- **语言事实第七则（2026-10-01 Zan.Protobuf/Zan.MsgPack 首日踩出）**：
+- **语言事实第七则（Zan.Protobuf/Zan.MsgPack 首日踩出）**：
   ① 数值类型只有 `int`/`long`/`double`/`bool`——没有 `float`，也没有
   `sbyte`/`short` 有符号小整型：32 位浮点字段做不了（当文档化取舍写进
   README），小整型符号扩展手工算（`v >= 128 → v - 256`），别臆测类型
@@ -170,7 +170,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   仍是特殊值，无限递归）；③ 判 NaN 用 `x != x`，判 ±∞ 用
   `x > 1e308` / `x < -1e308`——`x == x` 对 ∞ 恒真，照 NaN 惯用法写
   会误报失败。
-- **语言事实第八则（2026-10-01 Zan.Yaml 首日踩出）**：① 同类里
+- **语言事实第八则（Zan.Yaml 首日踩出）**：① 同类里
   **static 方法调用实例方法不报检查器错**，直到 LLVM verification 才炸
   （`Operand is null`，指向被调函数的 this 实参）——报错不提示
   "static 调实例"，纯帮助类小函数一开始就 `static` 化（`JsonValue`
@@ -179,15 +179,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `Encoding.Utf8FromCodePoint(8)`（退格）/`(12)`（换页）落；③
   `while (true)` **合法**（stdlib TaskJoin/ByteBuffer/JsonTape 都在
   用）——别凭"语言不支持"把循环改写成标志位绕路（此前会话曾这样
-  误绕，证伪撤案）；④ 可空返回链式取成员（`Get().Get()`）检查器
+  误绕，证伪撤案）；④ 可空返回链式取成员（`Get.Get`）检查器
   强制"先落地局部 + 判空"，测试代码给一个永非 null 的哨兵 helper
   （缺失返 `NewNull`）一次消音全部链式断言。
-- **语言事实第九则（2026-10-03 深审修复批连踩两次）**：转出型 `byte[]` 的
+- **语言事实第九则（深审修复批连踩两次）**：转出型 `byte[]` 的
   `Length` 含尾随 NUL 槽——`ByteBuffer.ToBytes`、hex/字符串转字节这类 API 产出的
   数组比"逻辑数据"多 1 个收尾 0 字节（既有契约，bytebuffer_bounds 金样钉死）。
   拿 `.Length` 当数据长度喂底层（实例：RSA hex 密钥按字节数传参）会多传一个 0
   而被拒或错算；真实长度用写入/转换时记下的 n 传递，不反查数组。
-- **语言事实第十则（2026-10-04 异步调度与高并发进程/同步原语重构踩出）**：
+- **语言事实第十则（异步调度与高并发进程/同步原语重构踩出）**：
   ① `Task.Run(Action/delegate)` 下发给 Worker Pool 时必须生成独立堆帧
   （TaskActionFrame）并绑定 `zan_co_ready`，不能在当前调用线程同步 invoke；
   ② 跨线程运行的委托闭包记录必须通过 `emit_closure_retain/release` 保活，
@@ -199,7 +199,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ⑤ 异步解耦必须彻底独立于 UI/渲染帧：UI 线程专职负责事件分发与绘制，后台任务与 I/O
   完成后通过 `App.Post` + 线程级 `Wake` 唤醒 UI 消息泵排空回调，严禁后台计算依赖渲染循环推进；
   跨线程/协程结果传递与协作取消统一使用 `TaskCompletionSource<T>` 与 `CancellationToken` 原语。
-- **语言事实第十一则（2026-10-07 游戏存档迁移连踩两次）**：
+- **语言事实第十一则（游戏存档迁移连踩两次）**：
   `JsonValue` 对象上 `Put(key, value)` 对**已存在的键是追加重复键**（序列化
   产出两份同名键，读档端 `Get` 只见其一、`Count` 虚高），`Set(key, value)`
   才是**原位替换**——改写从旧档剥出来的字段（如给 buildings 列表元素剥
@@ -208,15 +208,15 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `"list"` 键（Count 4→Set 后 3），存档迁移测试两次因 `Put` 写回被
   Require 拒收。
 
-- **文本格式包的 BOM 防线（2026-10-01 Yaml/Toml/Xml 跨平台审计踩出）**：
+- **文本格式包的 BOM 防线（Yaml/Toml/Xml 跨平台审计踩出）**：
   文件读取 API 已在文件层剥 UTF-8 BOM，但 `Parse(src)` 收网络报文/
   内嵌资源时没有这层兜底——Windows 工具产出的文本常带 EF BB BF，不剥
   首键/首标签带隐形字节或报"expected <"。任何文本格式解析器的 Parse
   入口自己剥一次 BOM（三字节判定 + Substring(3)），一致性测试加
   BOM+CRLF 向量锁行为；换行侧在切行层吃掉 CRLF/孤立 CR，写出恒 `\n`。
-- **声明驱动的 CRUD 定式（ListPage/Crud，2026-09-25 落地）**：一屏一个
-  `ScreenDef()` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
-  `Table/EditFields` 写白名单），渲染 `Screen()` 整段产出 screenHtml
+- **声明驱动的 CRUD 定式（ListPage/Crud 落地）**：一屏一个
+  `ScreenDef` 静态声明（列 Col/Tag/Flag、行内操作 Ops、筛选、工具栏、
+  `Table/EditFields` 写白名单），渲染 `Screen` 整段产出 screenHtml
   （视图只剩壳），通用写动作走 `Crud.Field/Batch/Delete`（白名单+
   Gen.Safe 双保险+`?` 占位符，行级授权由调用方预检 allowed 集合，
   越权与不存在同答 404），`Crud.Conf` 同一声明投影 adminUI conf 契约。
@@ -228,7 +228,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   span 越界；② 每轮算完 U 必须把 U 回写外层缓冲的消息位，只留下
   内层摘要 ih 会让下一轮错拿 ih（链静默变错）；③ 最小对拍集必须含
   c=1 与 c≥2、短盐与 >64B 长键、dkLen≤32 与 >32 分块——c=1 与
-  单块向量对上述两类 bug 全都测不出来（2026-09-25 RFC 7914 形状
+  单块向量对上述两类 bug 全都测不出来（RFC 7914 形状
   向量 + Hmac.Compute 对拍双保险锁进 tests/conformance/pbkdf2）。
 - **动态加载系统 C API 时逐参数对照目标 SDK 头文件**：函数指针不得凭
   印象省略“编码类型”等中间参数；Crypt32 的 `CertAddEncodedCertificateToStore`
@@ -256,8 +256,8 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   POSIX 监听 socket 的 shutdown 不等于取消，仍分配的 fd 上 fatal errno
   不能按 IsOpen 重试，errno 应在 syscall 后立即保存到局部。Windows
   取消/复用及真实多进程关闭已验证；POSIX 此次仅静态复核，不冒称实测。
-- **注销后台回调不等于生命周期排空**：进程退出前 await `Timer.StopAsync()`，
-  等已选回调和最后一个共享泵结束；同步 `Stop()` 仍供回调自停。临时批次
+- **注销后台回调不等于生命周期排空**：进程退出前 await `Timer.StopAsync`，
+  等已选回调和最后一个共享泵结束；同步 `Stop` 仍供回调自停。临时批次
   放同步 helper，返回时释放，不跨后台 Sleep；完成标志须在这些引用释放后发布。
   为什么：Start/Stop 最小探针五次泄漏临时列表，后台泵还撞上全局析构；
   排空修正后五次及周期/自停/重启回归均无泄漏。取消回调只捕获独立状态，
@@ -314,17 +314,17 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 
 ## 三、验证纪律（实机/无头通用）
 
-### 探针测量与脚本改文件的三条硬纪律（2026-10-02 排查沉淀）
+### 探针测量与脚本改文件的三条硬纪律（排查沉淀）
 
 - **测"超期/耗时"先核对单位与减数**：耗时量是微秒、延时参数是毫秒，`raw - delayMs` 少乘 1000 会把 0.5ms 真超期算成 50ms 假超期（一轮"2× 回归"查了两轮调度器，结果是自己探针的单位错）。测超期一律 `raw - delayMs * 1000`。
-- **Stopwatch.GetMilliseconds()/GetMicroseconds() 是静态单调钟读数（墙钟），不是流逝时间**：拿来当 elapsed 用会打出 1 亿毫秒级的数（实案：探针打出 `build=102483857ms`，误判为计时器坏了）。测流逝要么 `Stopwatch.GetMicroseconds()` 前后两次相减，要么 `StartNew()` + `ElapsedMilliseconds()`。
+- **Stopwatch.GetMilliseconds/GetMicroseconds 是静态单调钟读数（墙钟），不是流逝时间**：拿来当 elapsed 用会打出 1 亿毫秒级的数（实案：探针打出 `build=102483857ms`，误判为计时器坏了）。测流逝要么 `Stopwatch.GetMicroseconds` 前后两次相减，要么 `StartNew` + `ElapsedMilliseconds`。
 - **trace 打点必须带绝对时刻，成对相对量串不成时间线**：`late_us` 只能回答"迟了几多"，回答不了"第几段路迟的"；push/fire/park/slept 各打点带运行时单调钟绝对值，一轮就能定位迟滞在停车原语还是派发路径。
 - **脚本批量改文件必须读原文→逐处断言命中→写回→复验大小**：`open(p,"w").write(变量.replace(...))` 里变量不是文件内容时写出 0 字节（两个运行时源文件被截断的实案）；写完大小不对就停，别继续跑。
 
-### IDE 内部逻辑的无头探针验证配方（2026-10-06 模板打磨沉淀）
+### IDE 内部逻辑的无头探针验证配方（模板打磨沉淀）
 
 - **探针作 paths[0]，全量工程源一起编**：zanc 只给首个输入发 Main，探针文件带
-  `static void Main()` 放首位，后接入口的窗体文档与工程源清单响应文件
+  `static void Main` 放首位，后接入口的窗体文档与工程源清单响应文件
   （ZanIDE 工程即 `<build>/ide_files.rsp`，其中已含 Gui 包源码，改组件库
   同样被这把编译覆盖），即可在命令行无头驱动 IDE 内部任何静态方法
   （项目创建、向导数据投影这类），不必起窗口。
@@ -334,7 +334,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **夹具走真文件，断言读回盘上字节**：给有文件副作用的函数（项目脚手架、
   导出器这类）喂临时目录下的真实输入树，事后把产物按字节读回断言
   （工程文件关键字段、忽略表、README 命令行），别在内存里 mock 文件系统。
-- **App 级全窗控件用独立宿主探针驱动**（2026-10-06 向导芯片实机验证）：
+- **App 级全窗控件用独立宿主探针驱动**（向导芯片实机验证）：
   WizardHost 这类宿主是独立顶层窗口、自带事件泵，主窗的 ZAN_UI_SCRIPT
   dump/clickid 够不到内部——别硬掰驱动，直接给控件搭一个
   `App.CreateDarkStage(标题, 宽, 高)` 探针宿主，帧循环里 `控件.Show(app)`，
@@ -346,7 +346,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   DC 跟着小——截图被裁角还以为窗口没建对。截图脚本开头调一次
   `SetProcessDpiAwarenessContext(-4)` 再量再抓。
 
-### GUI 保留树事件路径的真实点击验证（2026-10-07 事件门控验证沉淀）
+### GUI 保留树事件路径的真实点击验证（事件门控验证沉淀）
 
 - **先分清事件通道，再声明"路径已被点击验证"**：控件事件是双通道。Button
   这类控件有专属 `UiEvent Click` 字段，处理器经重载的 AddByName 路由进专属
@@ -360,10 +360,10 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **hub 路径的探针夹具用"无专属字段、只订 hub"的控件**：Panel 订
   `root.On.Click`（Panel 没有专属 Click 字段，点击只能经通用分发到达），
   宿主用 ChildWindow 独立窗口。
-- **ChildWindow 独立窗口探针配方**：子类 override `Title()/Width()/
-  Height()/ShowMaximize()/IdBase()`（同进程多窗 IdBase 分段防撞号），主流程
-  `w.SetRoot(root, null); w.Wire(); w.OpenStandalone();
-  w.PumpStandaloneUntil(stop)`，stop 是 `delegate bool Xxx()`、返回 true 停泵。
+- **ChildWindow 独立窗口探针配方**：子类 override `Title/Width/
+  Height/ShowMaximize/IdBase`（同进程多窗 IdBase 分段防撞号），主流程
+  `w.SetRoot(root, null); w.Wire; w.OpenStandalone;
+  w.PumpStandaloneUntil(stop)`，stop 是 `delegate bool Xxx`、返回 true 停泵。
   驱动 `ZAN_UI_SCRIPT`：`wait 2500`（等首帧）/ `click x y`（保留树命中区
   客户区 1:1）/ `wait 800` / `quit`（兜底防点空挂死），断言读 stdout 的
   处理器输出。事件成员名以事件表源码为准（是 `Enter` 不是 `EnterS`——
@@ -380,14 +380,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   解析（后注册者=顶层优先），标签在就永远点得中。新控件注册命中区时用
   `RegisterRectL` 带上数据键标签（向导行/平台芯片已接，芯片标签=
   "linux-x64" 这类平台 id），没标签才退宿主 probe "id.<name>" 旧通道。
-- **ZanWeb 模板实机核对坑清单**（2026-09-25 ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
+- **ZanWeb 模板实机核对坑清单**（ListPage/FormPage/视觉重绘验证起，每条都白折腾过一轮）：
   ① 静态资产挂在 `/static/*`（`StaticFiles.Mount(app, "/static", "wwwroot")`），
   curl `/js/x.js` 拿到的是 API 层 `{"code":"404"}` JSON——不是"服务了旧文件"，
   先核对 URL 再怀疑缓存；② 改 wwwroot 的 JS/CSS 必须同步升布局模板
   里的 `?v=N`：资产响应带 `Cache-Control: max-age=3600`，浏览器缓存键含查询串，
   只 reload 页面拿不到新 JS（新代码 "确认加载" 要看执行中的函数源码或版本参数），
   且版本号升级放在该轮资产编辑**全部完成之后**——先升 v 后再改 js，会以新版本号
-  缓存旧内容，之后怎么刷新都是旧的（2026-09-29 菜单图标不渲染即此故，再升一位才好）；
+  缓存旧内容，之后怎么刷新都是旧的（菜单图标不渲染即此故，再升一位才好）；
   ③ `app.exe start` 会 daemon 出脱离启动任务的 worker，杀后台任务杀不掉它——
   重建 exe 报 `Permission denied`、旧进程继续占端口继续服务旧视图，须
   `app.exe stop` **并按 netstat 确认监听端口 PID 已清**（stop 不干净时链接
@@ -412,21 +412,21 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   `/xxx/form?id=N` 返回裸 `<form>`（含 lay-footer 的取消/保存按钮，但无
   head/link/script），css/js 全靠 data-dialog 弹窗注入宿主页后继承——
   脱离弹窗直接 goto 片段 URL 验收，会拿到"样式不生效、页签点击无反应"的
-  假故障（2026-09-29 表设计器验收白走一轮），交互必须在宿主页弹窗语境测；
+  假故障（表设计器验收白走一轮），交互必须在宿主页弹窗语境测；
   ⑫ `app.exe reload` 会把 worker 搞挂且 master 仍握着监听 socket——端口
   LISTEN 但请求 000 超时（连接进 backlog 无人应答，两实例先后中招），
   刷视图/配置一律 stop+start；master+worker 常驻时 exe 被运行进程占用，
   zanc 链接 `app.exe` 报 Permission denied，先 stop 并 netstat 复核再编
-  （2026-09-29 SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（2026-09-29 仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（2026-09-29 coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（2026-09-29 窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）；⑰ grid 子项的 margin-bottom 参与轨道行高——为去双倍间距把它清零，会把"最后一行卡片借给容器的 12px"一起清掉，网格之间归零贴死；块级兄弟的纵向节奏要给唯一来源 `.parent > * + * { margin-top }`（与卡片残留 margin-bottom 自动折叠取一份），修一处别再靠多层 margin 叠加（2026-09-29 监控页网格间 0 间距回归）；⑱ try 内 return 的返回值遇 finally 含 await 会写坏——返回值溢出到 $resume 入口 alloca，finally 挂起恢复时入口块重执行出未初始化栈格，裸 await/接住结果/循环三形态全坏、返回假 false 不进 catch（2026-09-30 Schema.Ensure 静默失败定位；当晨 46a7e83a 修愈：溢出改走堆 frame RETSPILL 槽，常设用例 async_return_in_awaiting_finally，2026-10-02 疤痕编译器考古独立复证四形全假→HEAD 全绿）。挂账时"裸语句是触发面/接住结果即安全"的归因是形状巧合，勿再引用；写跨 finally 挂起的 async 形态先跑该用例，包侧接住 async 调用结果再分支保留为可读性纪律。
+  （SSE 30s 断流修复部署即踩）；⑬ 浏览器整页截图连续超时（30s 连发）先 DOM 快照确认页面没坏再改 clip 小区域出图——是取帧层不稳，不是页面坏了（仪表盘验收 3 连超时，裁剪即出图）；⑭ 路由按注册串精确匹配，Route("/admin") 不收 /admin/ 尾斜杠——goto 得 {"code":"404"} JSON 先核尾斜杠再怀疑服务挂了；⑮ 浏览器窗口级截屏会把旁边开着的窗口拍进同一张图，图上出现"第二个应用副本/双份侧栏"≠DOM 有两个壳——先 elementFromPoint 或壳计数定真相再动手（coder 页验收把邻窗 8123 误读成页面复制体）；⑯ CSS 表格自动布局里 td/th 的 width 只是建议，列位紧张时被压到内容宽（zt-cell 定宽 36 被压到 13，勾选列贴死相邻列）——定宽列必须配 min-width 才是硬下限；overflow 容器裁剪绘制但 getBoundingClientRect 仍报全宽，量"是否溢出"要看 scrollWidth>clientWidth 或视觉，别信 rect（窄视口审计 zt-cell 压缩 + 部门/知识库两页 rect 误报）；⑰ grid 子项的 margin-bottom 参与轨道行高——为去双倍间距把它清零，会把"最后一行卡片借给容器的 12px"一起清掉，网格之间归零贴死；块级兄弟的纵向节奏要给唯一来源 `.parent > * + * { margin-top }`（与卡片残留 margin-bottom 自动折叠取一份），修一处别再靠多层 margin 叠加（监控页网格间 0 间距回归）；⑱ try 内 return 的返回值遇 finally 含 await 会写坏——返回值溢出到 $resume 入口 alloca，finally 挂起恢复时入口块重执行出未初始化栈格，裸 await/接住结果/循环三形态全坏、返回假 false 不进 catch（Schema.Ensure 静默失败定位；当晨 46a7e83a 修愈：溢出改走堆 frame RETSPILL 槽，常设用例 async_return_in_awaiting_finally 疤痕编译器考古独立复证四形全假→HEAD 全绿）。挂账时"裸语句是触发面/接住结果即安全"的归因是形状巧合，勿再引用；写跨 finally 挂起的 async 形态先跑该用例，包侧接住 async 调用结果再分支保留为可读性纪律。
 - **共享工作树上的测试归责：先隔离再定责**。测试结果异常先查
   并发提交时间线（`git log --format="%h %ad %s" -3`）：共享树另一会话
   在途编辑 stdlib/编译器期间跑测试，产物混进 WIP 源，无关测试假挂假绿
-  （2026-09-25 GUI 拖拽 ctest 挂死 vs 手动快速 FAIL 二相性， targeted
+  （GUI 拖拽 ctest 挂死 vs 手动快速 FAIL 二相性， targeted
   `git stash push -- <自己的文件>` 复跑一次即证明与己无关）。
   同产物"ctest 挂死、手动跑通"先手动复跑再怀疑代码。编译器本身被并发
   改动搞崩时（zanc 段错误/未改源也报错崩），不碰 build/ 与对方文件：
   `git worktree add _scratch/<名> HEAD` 后用主构建同款编译参数自建干净
-  编译器验证自己的改动，用完 `git worktree remove`（2026-09-29 表格
+  编译器验证自己的改动，用完 `git worktree remove`（表格
   修复验证即此法）。
   进程静默死亡（无日志、无 WER 事件）同样先怀疑并行会话清场：按映像名的
   `taskkill /IM` 扫荡会波及同名的演示实例——重启同一二进制若稳定存活即坐实
@@ -436,7 +436,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   确认检测通道真的会报错，再采信"探针没报错=无罪"——探针不炸只说明被测
   代码根本没进检测路径（如包文件未进解析集），这类阴性结果才有信息量；
   没做过阴性对照的"通过"不算证据。
-- **编译健康普查必须按各程序的官方输入形态（2026-10-01 templates/examples
+- **编译健康普查必须按各程序的官方输入形态（templates/examples
   普查教训，38 项里 4 项假红全是普查方法学造的）**：伴生文件要合编
   （gui_gallery 的 MapChinaData.zan 与 components/，gui_charts 甚至跨目录
   借 gui_gallery 的伴生文件——见 build_charts.ps1）；html 设计稿必须
@@ -461,32 +461,32 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   + LF，PowerShell 5.1 按 GBK 读，行尾汉字的尾字节会把换行吞进注释、把
   下一行代码并进注释——报"意外的 }"，注释行尾保持 ASCII 或存成带 BOM/CRLF。
 - **GUI 多窗口回归的记录器按相位分槽，断言吃进 DPI 与既定边距**
-  （childwindow_shape，2026-09-23）：两个子窗口宿主并发存活时，
-  `parent.PumpGuarded()` 会顺带泵到已显示的子宿主——用**静态字段**记录
+  （childwindow_shape）：两个子窗口宿主并发存活时，
+  `parent.PumpGuarded` 会顺带泵到已显示的子宿主——用**静态字段**记录
   "本次排版结果"会被另一宿主的重绘回写（plain 阶段读到 shape 的值），
-  记录器必须按窗口/相位分槽。断言坐标时注意三套坐标系：`ShapeOffX()`
+  记录器必须按窗口/相位分槽。断言坐标时注意三套坐标系：`ShapeOffX`
   返回**已乘 DPI 的画布像素**、`Control.bx` 是设备像素、
   ChildWindow.Render 在内容原点外还有一圈随 DPI 缩放的 5 逻辑像素
   呼吸边距——期望值写成 `offX + Scale(5)`，别拿逻辑像素比设备像素
   （100% DPI 的机器上碰巧相等，150% 上必红）。
-- **无头/脚本驱动 Zan GUI 程序，帧循环要自唤醒**：`app.ProcessEvent()`
+- **无头/脚本驱动 Zan GUI 程序，帧循环要自唤醒**：`app.ProcessEvent`
   在消息队列空时会阻塞等消息——WebView2 创建完、页面稳定后没人发消息，
   帧循环就停在那里（窗口"未挂起"、消息循环活着，但帧计数器不走，
-  超时断言永远不触发）。探针每帧末尾调一次 `app.RequestRedraw()` 保持
+  超时断言永远不触发）。探针每帧末尾调一次 `app.RequestRedraw` 保持
   状态机推进，否则看起来像"卡死在某一帧"，实际是没消息可等。
-- **进程内 Render() 探针每帧要 RequestRedraw，断言像素别画在画布原点**
-  （2026-10-08 B-ID118 E2E）：`ChildWindow.Render()` 有 NeedsRedraw 门
-  （`open && (host.needsRedraw || Pending())`）——循环里裸调 Render()
+- **进程内 Render 探针每帧要 RequestRedraw，断言像素别画在画布原点**
+  （E2E）：`ChildWindow.Render` 有 NeedsRedraw 门
+  （`open && (host.needsRedraw || Pending)`）——循环里裸调 Render
   只有首帧真画，后续全部静默短路，"静态帧复用/门控重渲染"类断言整体
-  空转；签名 = 树内画帧计数器停在 1。每帧先 `host.RequestRedraw()` 再泵
-  再 Render()。断言像素画在画布 (0,0) 会被根面板的裁剪裁掉（读数像
+  空转；签名 = 树内画帧计数器停在 1。每帧先 `host.RequestRedraw` 再泵
+  再 Render。断言像素画在画布 (0,0) 会被根面板的裁剪裁掉（读数像
   "没画"），要画进控件带内。
 - **哈希损伤与绘制同段共生，"漏喂哈希"类缺陷往往探针不可观测**
-  （2026-10-08 B-ID118/121/119 补喂实测）：控件的命令流哈希求值发生在
+  （/121/119 补喂实测）：控件的命令流哈希求值发生在
   OnPaint 里——控件被条带裁掉时两者都不发生；而内容变化帧在动画/游戏
   循环里总是 `RequestRedraw` 整帧（idle/GuiHost 每帧都 RequestRedraw）。
   因此"批量原语漏喂哈希"即使真实违反契约，红/绿对照也双双全绿
-  （B-ID119 的 hover-label 流程才可观测）。新增 Canvas 原语补喂哈希
+  （的 hover-label 流程才可观测）。新增 Canvas 原语补喂哈希
   入口靠台账规则与评审守住，探针只能验证修好的行为、守不住不变量；
   红对照全绿 ≠ 改动无意义，先分清"契约对齐"还是"缺陷修复"再写提交。
   Canvas 所有图元入口须 100% 接入命令流哈希：BlitImage（op 23 携目标与
@@ -495,7 +495,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   Canvas.TakeBlurPartialMiss 驱动 forceFullNext 整窗升级，自段命令流哈希
   则保证面板自身几何/半径参数变更能被局部帧检出并自动 NoteDamage 补画。
 - **dock=5（fill）子控件放 Panel.Root，不放 Panel.Column/Row**
-  （2026-10-08 B-ID118 E2E）：Column/Row 是流式容器、按子控件 pref 尺寸
+  （E2E）：Column/Row 是流式容器、按子控件 pref 尺寸
   排布——只设 grow 没有首选尺寸的控件（如 GameViewport）在 Column 里
   排成零高，OnPaint 照常被调但 bw/bh=0，绘制静默空转，看起来像"没渲染"
   实际是"没尺寸"。停靠子控件的宿主用 `Panel.Root`。
@@ -512,7 +512,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 - **无头仿真 + 像素复核**：逻辑用无头仿真跑，断言写成探针
   （读内部状态或像素），禁止"截图看一眼"式的判断；相邻两次截图字节级相同
   要怀疑"根本没重绘"，先排查再下结论。
-- **冻结测试钟只冻时钟，不冻样式补间**（2026-10-05 像素确定性排查）：`freeze clock`
+- **冻结测试钟只冻时钟，不冻样式补间**（像素确定性排查）：`freeze clock`
   冻的是 `GetTickMs`，`AnimToIn` 的补间靠 `elapsed = nowMs - startMs` 推进——
   时钟冻结后 elapsed 恒定，补间永不落定，控件每帧重武装自己的条带帧
   （`RequestAnimationFrameIn`）永动。无头像素比对若撞上"条带帧 ↔ 加宽帧"
@@ -528,11 +528,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   （控件条带帧几乎总是嵌在面板玻璃内部）；测试冻结钟的"强制重算"豁免
   同样要受这条约束，否则冻结钟反而制造不等价。
 - **注入事件的 GUI 测试，BeginFrame 归 App 循环管，帧体只画内容**：
-  `PumpGuarded + FrameGuarded(Body)` 的 Body 里不要再调 `app.BeginFrame()`——
+  `PumpGuarded + FrameGuarded(Body)` 的 Body 里不要再调 `app.BeginFrame`——
   SafeFrame 已经调过，双重置会把 `inputBlockPrevious` 链打断，
   `BlockHitsBelow` 每帧误判"模态首帧"而自动认领点击（clickClaimed），
   浮层收不到任何释放、result 恒 -1，测试静默测了个空还不报错。逐帧手工
-  推进时同理：一次 `BeginFrame() + 内容 + PresentFrame()` 才是一帧。
+  推进时同理：一次 `BeginFrame + 内容 + PresentFrame` 才是一帧。
 - **像素转场扫描必须带末段归属**：沿列/行打印"颜色转场"做像素断言时，
   最后一次转场之后的区间保持的是前一个色值——把"后面没有转场"误读成
   "后面没画东西"，会把已生效的绘制当成缺陷，白走一圈排查。转场列表
@@ -591,7 +591,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   位置再拍（默认布局偶尔比屏高，出屏窗口捕获几何不稳）。
 - **`Directory.ReadPath` 不是 cwd 解析器**：它对 cwd 里已存在的路径回
   空串（「程序随附资源回落」语义——磁盘上有就用原路径），永远产不出
-  绝对路径；要取绝对 cwd 用 `Directory.GetCurrentDirectory()`（跨平
+  绝对路径；要取绝对 cwd 用 `Directory.GetCurrentDirectory`（跨平
   台）。想用 ReadPath(".") 拿 cwd 的写法静默失效，极难察觉。
 - **截图 diff 断言必须选「内容必然变化」的动作**：PNG 确定性编码下，
   「重拉同一份数据再渲染」的重绘字节与之前完全相同（重绘发生了但断言
@@ -608,14 +608,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   Windows 下只携带不触发 TLS 的程序可直接链接——不可解析的非系统库会被
   自动桩化（调用时才报错），不再链接期失败。
 
-- **GUI 测试合成驱动的“静止泵”永挂坑**（2026-09-30 chatview_bubble/transfer/
+- **GUI 测试合成驱动的“静止泵”永挂坑**（chatview_bubble/transfer/
   chart_stackedarea_aa 三测试在安静机器上集体挂死，同一二进制早晨有人用机器时全绿，
   cdb attach 抓栈定位）：`App.ProcessEvent` 在无挂起重绘、无动画截止、无待处理事件
-  时走阻塞 `window.WaitEvent()`（GetMessageW 无限等；空闲零 CPU 是产品正确语义，
+  时走阻塞 `window.WaitEvent`（GetMessageW 无限等；空闲零 CPU 是产品正确语义，
   不要改成轮询）。测试帧与帧之间常处于静止，静止泵只能靠环境消息流（鼠标活动等）
   偶然喂活——机器一安静就必挂，且挂点随时序漂移，极难归因。定式：守卫帧体
   （FrameGuarded 的 body）末尾续订 `RequestAnimationFrame(16)`（spinner 的文档化
-  模式，animNextMs 截止让泵走 ≤16ms 非阻塞等待），或泵前 `RequestRedraw()`
+  模式，animNextMs 截止让泵走 ≤16ms 非阻塞等待），或泵前 `RequestRedraw`
   （datatable 系同款）；纯数据突变后必须请求重绘再泵。诊断抓
   `USER32!GetMessageW` 栈一锤定音。
 
@@ -675,7 +675,7 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
 6. 本次引入或发现的旧写法，挂账了吗？（见第六节）
 7. 删了该删的吗？（临时探针、废弃产物、被推翻的规则）
 
-- **并行会话共享工作树时，编译验证用"冻结床"隔离在途噪声**（2026-09-30 定式）：
+- **并行会话共享工作树时，编译验证用"冻结床"隔离在途噪声**（定式）：
   别的会话正把某个包/stdlib 文件改到语法破损的中间态时，直接用工作树工具链编译
   会看到与己无关的解析错误假象。隔离法：`git archive HEAD packages stdlib |
   tar -x` 解到独立临时目录，再拷入当前 zanc 与其运行时 obj 兄弟文件——包/stdlib

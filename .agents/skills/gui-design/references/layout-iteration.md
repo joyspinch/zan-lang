@@ -14,7 +14,7 @@
      加高、`SetCaptionActions` 追加功能胶囊、`SetChromeBrandIcon` 换品牌图标，
      字号/颜色走 `titlebar::brand` / `::cap` / `::action` 样式部件）；
   3. 在应用里自绘动画库已有的效果（氛围动效先查 `Gui.BackdropFx` 的 Kind
-     目录，如飘带 `KindRibbon()`）。
+     目录，如飘带 `KindRibbon`）。
 - **应用层只配置，组件层才实现**。`DllImport`/user32/命中测试/拖动协议
   属于组件与后端；应用层出现任何一样就是架构错了，返工方向是把逻辑下沉。
 - 迭代中长出来的通用能力（新控件、新动效 Kind、新绘制原语）**当场提升进
@@ -59,19 +59,19 @@
   控件最小尺寸算的框。
 - kind 0 页面层不自动居中：打开时按**当前窗口尺寸**算一次中心（尺寸变化
   时重算或跟随），不要指望它像模态层那样自己居中。
-- **居中减掉自绘标题栏**：窗口客户区高含自绘标题栏（`ContentTop()`，如 48），
-  拿 `ClientHeight()` 直接居中会比内容区中线低半个标题栏（实证低 24 设备px，
-  弹窗压住底部内容）。铺满用的遮罩同理：`ClientHeight() − ContentTop()`。
+- **居中减掉自绘标题栏**：窗口客户区高含自绘标题栏（`ContentTop`，如 48），
+  拿 `ClientHeight` 直接居中会比内容区中线低半个标题栏（实证低 24 设备px，
+  弹窗压住底部内容）。铺满用的遮罩同理：`ClientHeight − ContentTop`。
 - **模态遮罩必须有人监听，否则不注册命中区**：`Control.FireCommon` 里
-  `if (!On.Any()) { return; }`（契约是"未使用的容器不能抢走画在它下面的内容
+  `if (!On.Any) { return; }`（契约是"未使用的容器不能抢走画在它下面的内容
   的指针"）。空壳 Panel 当遮罩 → 点击**穿透到下层**（实证：弹窗开着点导航
   瓦片，导航被触发、弹窗被关掉）。正解是给遮罩挂一个空回调
-  `block.OnClick(() => { })`——只为注册命中区。**"点不动下层" = 遮罩在命中
+  `block.OnClick( => { })`——只为注册命中区。**"点不动下层" = 遮罩在命中
   序列里**，不是靠不透明。
 - **键事件只发给持有焦点的控件**（`Ui.KeyDownOn` 就是 `focus.IsFocused(id)`）。
   给弹窗加热键（按钮上写着 `取消(C)` 这类）要两步：`app.focus.SetFocused(控件
-  .CommonId())` + `控件.OnKeyDown(() => ...)`。
-  **别在定时器刻度里轮询 `app.EventKind()`/`EventKeyCode()`**：键事件在
+  .CommonId)` + `控件.OnKeyDown( => ...)`。
+  **别在定时器刻度里轮询 `app.EventKind`/`EventKeyCode`**：键事件在
   `ProcessEvent` 里处理完，下一次 `PollEvent` 的 `ClearEvent` 就清了，刻度
   多半读不到（实证：`keydown 67` 之后弹窗照旧开着，改成 `OnKeyDown` 才关掉）。
 - **层序冲突修层序管理，不许删组件了事**——两个层打架时干掉一个是被用户
@@ -79,8 +79,8 @@
 - **浮层/右键菜单展开期间禁止弹出底层悬停提示（Tooltip）**：Tooltip 在帧末尾
   `Flush` 统一绘制在所有层之上。若底层组件（如表格单元格截断提示、表头提示）只靠局部标志
   判断悬停，不仅外部菜单展开时会因坐标穿透漏出提示，且右键按下当帧前置入队的提示也会直接
-  盖在菜单上。底层悬停提示必须受 `!app.PointerCaptured() && !app.HasOverlays()` 门控，
-  右键/模态展开当帧必须立即重置 tip 跟踪并调用 `Tooltip.Cancel()` 撤销挂起提示。
+  盖在菜单上。底层悬停提示必须受 `!app.PointerCaptured && !app.HasOverlays` 门控，
+  右键/模态展开当帧必须立即重置 tip 跟踪并调用 `Tooltip.Cancel` 撤销挂起提示。
 - 阴影用 SDF 一次出图的 `Canvas.ShadowRoundRect`（四周均匀）。手叠两层
   偏移实心矩形的症状：底边一圈硬黑带、顶部没有阴影。
 

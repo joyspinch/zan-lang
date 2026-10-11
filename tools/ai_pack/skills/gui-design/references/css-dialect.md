@@ -25,7 +25,7 @@
   `:nth-child(odd)`/`:nth-of-type(2n)` 含 an±b/`:empty`)、`*`、属性选择器
   (任意属性,`=`/`~=`/`|=`/`^=`/`$=`/`*=`,`i` 标志,`[disabled]`/`[checked]`/
   `[selected]` 映射状态位;Element 的属性来自 HTML 属性表,普通控件只有 id)、
-  `:not()`/`:is()`/`:where()`、`:has()`。**组合器、结构性伪类、`:has()` 与非
+  `:not`/`:is`/`:where`、`:has`。**组合器、结构性伪类、`:has` 与非
   class 属性条件只在 retained 控件树内命中**(`Control.RenderTree` 渲染时注入
   树上下文);手工调 `Style.Full` 的即时路径它们不命中(规则不丢,Lint 汇总
   报告)。`:has(img)`/`:has(> img)`/`:has(+ p)` 真实判定(前导组合器定候选
@@ -33,16 +33,16 @@
   伪元素部件或嵌套 `:has` 判 never。`::before`/`::after` 是部件:声明
   `content: "…"/attr(name)/none` 后 Element 的伪文本会真的拼进行盒(引号串
   支持 `\` 转义与 hex 码点);first-line/first-letter 判 never 并由 Lint 点名。
-  `:where()` 权重计 0,`:is()`/`:has()` 取内层最大。
+  `:where` 权重计 0,`:is`/`:has` 取内层最大。
 - **长度单位全套有求值器**:`em`/`rem`(当前字号/根字号,声明字号时的 em
   按未缩放前的当前值)、`ex`/`ch`(近似半字宽/半字高)、`vw`/`vh`/`vmin`/
   `vmax`(设计视口)、`pt`/`pc`/`in`/`cm`/`mm`/`q`(96dpi 换算)、`ms`/`s`/
-  `deg`/`turn`;`calc()/min()/max()/clamp()` 可嵌套(calc 里 `%` 按视口宽
+  `deg`/`turn`;`calc/min/max/clamp` 可嵌套(calc 里 `%` 按视口宽
   近似)。长度不再需要写裸数字,`padding: 12px 1.5em` 这类网页写法直接抄。
 - **现代颜色函数**:`rgb(0 128 255)`/`rgb(0 128 255 / 50%)`(空格语法 + 斜杠
   alpha,逗号旧语法也认)、hue 单位 `0.5turn`/`200grad`/`3.14rad`、
-  `hwb(h w% b%)`、`oklab()/oklch()`(Tailwind 调色板的缺省写法)、
-  `lab()/lch()`、`color-mix(in srgb, a, b)`(混合空间按 sRGB 近似,百分比
+  `hwb(h w% b%)`、`oklab/oklch`(Tailwind 调色板的缺省写法)、
+  `lab/lch`、`color-mix(in srgb, a, b)`(混合空间按 sRGB 近似,百分比
   缺省 50%)。**`currentColor` 生效**:`border-color: currentColor` 记账后
   在级联完成时替换成最终前景色(嵌在 `border: 1px solid currentcolor`
   shorthand 里也认;写 `color: currentColor` 等于保持主题前景)。
@@ -64,7 +64,7 @@
   顺序的逆序**——画在上面的控件也先被点中。flex 容器里 `order` 改主轴
   顺序。`overflow: visible` 放行子节点溢出(缺省引擎裁剪,显式声明才变
   行为)。type 选择器大小写不敏感(`Button` 与 `button` 都命中,引擎按
-  `Kind()` 的小写匹配);class/id 仍区分大小写。
+  `Kind` 的小写匹配);class/id 仍区分大小写。
 - **Web 等价布局已落地前三批（WEB_GUI_ROADMAP P0-P2)**:
   `display: block` 是**真块流**——写成 CSS 的树走 web 语义,没写 display 的
   老代码走 legacy 零回归。**margin 是塌陷的(CSS 2.1)**:相邻兄弟取大合并,
@@ -118,7 +118,7 @@
   `"1 / 3"` = 从线 1 跨到线 3(占 2 格);② 类名/组件名撞车——Zan 里
   `Grid` 已是 Widget 布局组件,CSS grid 引擎类叫 `CssGrid`,自己写
   Zan 代码别 import 锋利的 `Grid` 名;③ 命名线/命名区/负线号/
-  `fit-content()`/`dense` 不认(按 auto 兜底),条目级
+  `fit-content`/`dense` 不认(按 auto 兜底),条目级
   justify-self/align-self 未接入,跨 span>1 的条目不参与 auto 轨的
   内容定宽。
 
@@ -127,8 +127,8 @@
   没写 body 会包隐式 body),或把 `.html` 喂 zanc 编译期展开成
   `UiHtml.Build(handlers)`(发布不携带 HTML 文本与解析器;生成器与
   运行时吃同一解析器,几何逐盒全等)。属性协议:`data-on-click="名"`
-  接事件(`handlers.Add("名", () => ...)` 注册;**Button 的 Click 落
-  专属字段**,断言 `((Button)b).Click.Count()` 而非 `b.On.Click`)、
+  接事件(`handlers.Add("名",  => ...)` 注册;**Button 的 Click 落
+  专属字段**,断言 `((Button)b).Click.Count` 而非 `b.On.Click`)、
   `data-bind` 绑定路径、`style` 属性合成 `.zgen-N` 类规则(类级特异性,
   不是浏览器 inline style 特异性,`!important` 可覆盖)。容器 tag→
   Element(UA 样式表给 web 缺省 display/字号/margin,AI 不用写
@@ -181,10 +181,10 @@
   皮肤实测 vars 46→0、`.frame` 背景与字号全变 0,页面看起来"皮肤没生效"。
   自己拼 CSS 字符串(不经 `File.ReadAllText`)时仍要自己剥:解析器只认
   正好等于 `:root` 的选择器。
-- **改完皮肤用 `sheet.Lint()`/`Audit()` 自查**:返回"写了但没生效"的清单——
+- **改完皮肤用 `sheet.Lint`/`Audit` 自查**:返回"写了但没生效"的清单——
   被跳过的 at-rule 数与名字、判假的 `@supports` 守卫(按条件原文)、语法拒绝的
   选择器、永不匹配的选择器(first-line/first-letter、内层含伪元素部件或嵌套
-  `:has` 的 `:has()`,各带原因)、值里白名单外单位的裸数字强转、一条声明都没
+  `:has` 的 `:has`,各带原因)、值里白名单外单位的裸数字强转、一条声明都没
   被消费的规则、收下但无效果的属性、只在树内匹配的组合器/结构性/`:has`/
   属性选择器条数。返回空表 = 每条都真的会生效。
   正常渲染不调用它,没开销。诊断皮肤"改了没反应"从这里开始,不要靠猜。
@@ -194,7 +194,7 @@
   档。`@supports`/`@layer`/`@media` 内容递归计入,厂商前缀按 StripVendor 剥后
   计数。`--corpus-a` 跑仓内皮肤,给目录跑外部语料。bootstrap 语料按轮次迭代:
   声明不认识 30.6%→0.7%、值静默强转→0%;后续轮次(属性
-  选择器/`::before::after`/`:has()` 落地)后选择器 live 70.9%→**99.9%**、声明
+  选择器/`::before::after`/`:has` 落地)后选择器 live 70.9%→**99.9%**、声明
   accepted 75.3%→**95.2%**(`content` 由空转转正)、effective **99.4%**——
   **分母不同结论差一倍以上,所以报数字必须写清是哪份 CSS 量的**。
 
@@ -204,23 +204,23 @@
    胶囊画满即被自己的矩形裁掉底边(微信模板「徽标底部被切割」,。分隔线写成
    `.row { border-bottom: 1 var(--divider); }`,零布局成本;行 gap 只承担
    水平间距,或把水平间距挪到子类 `padding-left`。
-2. **行内容要垂直居中:中列/右列用 `Flex.Column()` + `Justify("center")`。**
+2. **行内容要垂直居中:中列/右列用 `Flex.Column` + `Justify("center")`。**
    `Panel.Column` 是 dock 顶对齐,文本块贴顶、行底留白偏大,肉眼即见。
-3. **`Flex.Column()` 之后不能再用 `Class = ` 赋值**——`Class` setter 整体
+3. **`Flex.Column` 之后不能再用 `Class = ` 赋值**——`Class` setter 整体
    替换类列表,`column` 方向类被冲掉,纵列当场变横排(整行塌成一行)。
    追加类用 `AddClass("...")`。
-4. **自定义控件 OnMeasure 里改表面色,直写字段,不调 `Bg()/Gradient()`。**
+4. **自定义控件 OnMeasure 里改表面色,直写字段,不调 `Bg/Gradient`。**
    这两个 setter 会把 computedStyle 置空,而 MeasureTree 里样式解析先于
    OnMeasure;随后父容器的 flex 排布从 computedStyle 读 `flex-grow` 拿到 0,
    控件挂 `.grow` 也不生长(ToolStrip 在 Flex 行里永远只有内容宽)。
    修法:`styleBg = c; styleBgTo = d;` 再
    `if (computedStyle != null) { Style.Inline(computedStyle, this); }`
    把 inline 覆盖补映到已解析的 box。ToolStrip/StatusBar 都因此修过。
-5. **弹出面板/抽屉这类高度随内容的容器,根节点用 `Flex.Column()`,别用
+5. **弹出面板/抽屉这类高度随内容的容器,根节点用 `Flex.Column`,别用
    `Panel.Column`。** Panel(dock 容器)把 prefH 报小,宿主按小值分高度,
    Arrange 时内容按真实子项摆,尾部子项互相叠、被裁(微信模板表情/
    头像/文件面板「最后一行与提示语重叠」,;flex 的自然
-   高度求和是准的。宿主还要 `AlignStart()`,否则列的交叉轴 stretch
+   高度求和是准的。宿主还要 `AlignStart`,否则列的交叉轴 stretch
    把子项拉满整行,`width: 424` 形同虚设。
 6. **ToolStrip 的项自带皮肤类,加自有类用 `AddClass`,互斥状态类用
    `SetClassIn("wxon", ...)`。** `item.Class = "wxvoice"` 整体顶掉
@@ -263,7 +263,7 @@
     `display:flex; justify-content:center` 的盒子(皮肤里已有先例
     `.tbl-cell`),或容器用 Flex 的 `Justify("center")`;别指望标签自己
     居中,也别用一个"和字一样宽"的盒子去蒙(字宽随字体度量变)。
-13. **要手摆子项的宿主容器不能是 flex**。给子项 `DockManual()` +
+13. **要手摆子项的宿主容器不能是 flex**。给子项 `DockManual` +
     `Place(x,y)` 的宿主,皮肤类里不能有 `display:flex`——flex 把子项按
     add 序流式排,`Place` 与 dock 一起被忽略(同第 9 条,。**分工写死**:手摆宿主只给背景/边框,子项一个
     个 `Place`;自己需要 `display:flex` 的行盒(如要横排分段文字),只能

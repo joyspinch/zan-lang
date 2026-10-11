@@ -25,11 +25,11 @@ SKILL.md 是规则主干;这里是可以直接照抄的组合模式(全部用 st
 ### 表单(标签列固定宽)
 
 ```zan
-Panel form = Panel.Column().Gap(2);                 // 行距 8px(档位)
-Panel row1 = Panel.Row().Gap(2);
+Panel form = Panel.Column.Gap(2);                 // 行距 8px(档位)
+Panel row1 = Panel.Row.Gap(2);
 row1.Class = "items-center";                        // CSS 类经 Control.Class 生效
 Label lbl1 = new Label("名称:"); lbl1.Prefer(90, 0);  // 全表同一列宽
-row1.With(lbl1).With(new Input());                  // 输入列吃剩余空间
+row1.With(lbl1).With(new Input);                  // 输入列吃剩余空间
 ```
 
 多行表单:所有标签列同宽、所有输入框同高(默认 medium),主操作按钮
@@ -86,12 +86,12 @@ g.With(new Card(...)).With(new Card(...)) ...;
   隐形开态吞点击。全局状态每帧在页面之上渲染一次。
 - **CellStyler/回调里硬编码浅色主题色** → 深色皮肤下不可读。回调
   `Bind(app)` 每帧从主题派生色。
-- **动画帧里调 RequestRedraw()** → 整窗重绘打满 CPU。用
+- **动画帧里调 RequestRedraw** → 整窗重绘打满 CPU。用
   `TakeDueFrame` 保住控件自己声明的损伤矩形;损伤矩形要覆盖整行区
   (行头/表头/合计随滚动的教训)。
-- **自定义事件循环把 `PollEvent()` 当"有事件"** → 队列空时它立即返回,
+- **自定义事件循环把 `PollEvent` 当"有事件"** → 队列空时它立即返回,
   100% CPU 空转。空事件回退 `WaitEventTimeout(16)`;要用 UiDriver
-  自动化就记得每帧 `UiDriver.Tick()`。
+  自动化就记得每帧 `UiDriver.Tick`。
 
 ## 验证捷径
 

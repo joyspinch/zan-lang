@@ -74,7 +74,7 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 
 ## 1.6 取整与半像素节距：账本算得对，落码差几像素
 
-账本里的设计值经过 `Px()`（`v * dpi / 100`，整数除法）落成设备像素，
+账本里的设计值经过 `Px`（`v * dpi / 100`，整数除法）落成设备像素，
 **凡是非整数结果都会被截断**，一页几十行的列表会把这个误差累积成看得见的
 偏移。三条实证（表格页还原踩出来的）：
 
@@ -136,7 +136,7 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 ## 1.9 从裁切图推坐标：两条框架契约先算进去
 
 参考图是**某个容器/弹窗本体的裁切**（裁切原点落在它的边框上）时，账本里量到的
-坐标不能直接进 `Place()`——先减掉框架自己的两条度量，否则整窗每一项整齐偏 1~2px，
+坐标不能直接进 `Place`——先减掉框架自己的两条度量，否则整窗每一项整齐偏 1~2px，
 看起来像"字体/边框差"，其实是坐标原点差（实证：一个 377×335 的模态弹窗，第一条
 按"裁切 − 2"存，每一项都偏 1 设备px）。
 
@@ -153,7 +153,7 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
   即 `盒顶 = 墨心 − 11.5`；改字号/盒高要重算这条。
 - **盒宽按本版字体给，不照抄原版墨宽**：原版墨宽 58 的字串，本版字体可能要
   84 设备px，照抄会被 `Label` 省略号截断（实证显示成「祝福语..」）。宁可把盒
-  加宽到压住相邻控件左缘（墨没压到就行），并给该子控件 `NoOverlapCheck()`——
+  加宽到压住相邻控件左缘（墨没压到就行），并给该子控件 `NoOverlapCheck`——
   **豁免必须挂在子控件上**：布局 lint 的 `CheckOverlapKids` 读的是
   `a.overlapExempt`（a = 子），挂父容器不生效。
 
@@ -163,11 +163,11 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 - 通栏横条（顶部工具区/底部状态条）→ `Dock(1)`/`Dock(2)` + `Prefer(0,h)`
 - 通栏竖条（侧栏/导航）→ `Dock(3)`/`Dock(4)` + `Prefer(w,0)`
 - 其余内容区 → `Dock(5)`，内部按截图结构选：
-  - 纵向堆叠的区块 → `Panel.Column().Gap(档)`
-  - 一行多物（不等宽、工具行）→ `Panel.Row()` / `Flex`；左右两端对齐
-    （左标题右按钮）→ `Flex.Row().Between().AlignCenter()`
+  - 纵向堆叠的区块 → `Panel.Column.Gap(档)`
+  - 一行多物（不等宽、工具行）→ `Panel.Row` / `Flex`；左右两端对齐
+    （左标题右按钮）→ `Flex.Row.Between.AlignCenter`
   - 等宽卡片行/指标行 → `Grid.Of(n)`（**n 从截图里数出来**）
-  - 左列表右详情（1:1 或 1:2）→ `Panel.Row()` 两子 `Grow()`，不要用
+  - 左列表右详情（1:1 或 1:2）→ `Panel.Row` 两子 `Grow`，不要用
     两个 `Dock(5)`（会互相叠）
   - 表单 → `FormBuilder` 或标签列固定宽的 `Panel.Row`
   - 可滚动内容 → `ScrollView`/`ScrollColumn`
@@ -235,9 +235,9 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 | 区块 | 物理px | 倍数 | 设计px | 原语映射 + token |
 |---|---|---|---|---|
 | 侧栏（品牌+菜单+底部网关态） | 372 | 1.5 | 248 | Dock(3) → Prefer(230,0)；内部 brand Dock(1)/menu Dock(5)/状态 Dock(2) |
-| 头行：眉题+标题 左，刷新/更多 右 | 高 66 | 1.5 | 44 | Flex.Row().Between().AlignCenter()；高度按内容 |
+| 头行：眉题+标题 左，刷新/更多 右 | 高 66 | 1.5 | 44 | Flex.Row.Between.AlignCenter；高度按内容 |
 | 指标行：4 张等宽卡 | 列距 16 | 1.5 | 11 | Grid.Of(4).Gap(12) 归档 |
-| 双栏：实时路由 \| 快速控制 | 1:1 | — | — | Panel.Row 两 Card Grow() |
+| 双栏：实时路由 \| 快速控制 | 1:1 | — | — | Panel.Row 两 Card Grow |
 | 用量统计通栏卡 | 高 ~220 | 1.5 | ~146 | Card 进内容列末行；高度按内容 |
 
 （截图原稿的巨型刷新钮、被裁的"…"、宽窄不齐的指标卡是原生成 AI 手摆
@@ -246,25 +246,25 @@ SKILL.md"缩放纪律"的样式路径/自绘路径两分法），抄物理值 = 
 还原代码骨架（已验证：编译通过，1200×800 下 Arrange 重叠命中 0）：
 
 ```zan
-Panel root = new Panel();
-Panel side = Panel.Column();                       // 侧栏
+Panel root = new Panel;
+Panel side = Panel.Column;                       // 侧栏
 side.Dock(3).Prefer(230, 0);
-Panel brand = Panel.Column(); brand.Dock(1);       // 品牌:名+副题
-Panel menu  = Panel.Column(); menu.Dock(5);        // 菜单项逐行 With
-Panel gw    = Panel.Column(); gw.Dock(2);          // 底部网关状态
+Panel brand = Panel.Column; brand.Dock(1);       // 品牌:名+副题
+Panel menu  = Panel.Column; menu.Dock(5);        // 菜单项逐行 With
+Panel gw    = Panel.Column; gw.Dock(2);          // 底部网关状态
 side.With(brand); side.With(menu); side.With(gw);
 root.With(side);
 
-Panel content = Panel.Column().Gap(12);            // 内容列
+Panel content = Panel.Column.Gap(12);            // 内容列
 content.Dock(5).Pad(4);
-Flex head = Flex.Row().Between().AlignCenter();    // 头行
+Flex head = Flex.Row.Between.AlignCenter;    // 头行
 head.With(左标题列).With(右侧按钮行);
 content.With(head);
 Grid metrics = Grid.Of(4).Gap(12);                 // 指标行:四张等宽卡
 metrics.With(MetricCard("本地代理", "运行中"));     // …×4
 content.With(metrics);
-Panel mid = Panel.Row().Gap(12);                   // 双栏 1:1
-mid.With(路由卡.Grow()).With(快速控制卡.Grow());
+Panel mid = Panel.Row.Gap(12);                   // 双栏 1:1
+mid.With(路由卡.Grow).With(快速控制卡.Grow);
 content.With(mid);
 content.With(用量卡);                               // 通栏收尾
 root.With(content);

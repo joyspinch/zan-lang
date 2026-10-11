@@ -28,7 +28,7 @@ instead of asking again.
 ```
 zan_api_search("File.ReadAllText")   → static string ReadAllText(string path)
 zan_api_search("Http")               → the surface of the HTTP client/server
-zan_example()                        → catalog of shipped, build-verified programs
+zan_example                        → catalog of shipped, build-verified programs
 zan_example("server-mvc")            → files of one of them, verbatim
 ```
 
@@ -41,7 +41,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 ## 3. Language facts that decide whether it compiles
 
 * Static types, C#-like syntax, **ARC** — no GC and no manual free.
-* Static members are reached through the class: `Foo.Bar()`, including inside
+* Static members are reached through the class: `Foo.Bar`, including inside
   `Foo` itself.
 * Nullability is enforced: `x.Get("k").Put(...)` is an error when `Get` may
   return null. Store it, check for null, then use it (or use `?.`).
@@ -56,7 +56,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   follows: `x is int? i` tests against `int?`. **Unwrap patterns are not
   supported**: `maybe is int n` (int? -> int) does not compile — test
   `maybe is int?` instead. `as` on failure yields an empty string for
-  value-shaped targets, not null: check `!= ""`. (2026-09-13: the parse
+  value-shaped targets, not null: check `!= ""`. （the parse
   ambiguity was fixed in zanc; the old advice to write `(x is T) ? a : b`
   is obsolete.)
 * Never list attribute names with `*/` inside a `/* ... */` comment —
@@ -64,15 +64,15 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   code (209 cascading errors). Separate with `、` or spaces.
 * No C#-style collection initializers: `string[] xs = { "a", "b" };` fails
   to parse (`unexpected token '{'`). Build a `List<string>` with `Add`
-  calls instead. (2026-10-07, test-probe compile)
+  calls instead. （test-probe compile)
 * `new T[N]` is zero-initialized — a non-zero sentinel needs an explicit
   constructor pass. Every slot reads `0` right after allocation; if an
-  incremental `Clear()` only resets slots it has recorded (dirty buckets,
+  incremental `Clear` only resets slots it has recorded (dirty buckets,
   a used-slots list), the constructor — where nothing is recorded yet —
   must loop-initialize all N slots itself, or the first insert chains onto
   slot 0: self-loops, duplicated query hits, nearest-search hangs.
-  (2026-10-07, spatial-hash probe hang)
-* TLS client trust roots differ per platform (2026-10-08, MySQL/PG self-signed
+  （spatial-hash probe hang)
+* TLS client trust roots differ per platform （MySQL/PG self-signed
   interop): Windows verifies via Crypt32 SSL chain policy against the system
   store; Linux auto-loads the distro CA bundle (`/etc/ssl/certs/
   ca-certificates.crt` and siblings); macOS loads the system bundle
@@ -98,7 +98,7 @@ extending an existing class over adding a parallel one.
 ## 5. Compile — every time, before any claim
 
 ```
-zan_build_project()            # whole project, structured diagnostics
+zan_build_project            # whole project, structured diagnostics
 zan_compile(content)           # one snippet in an isolated dir
 ```
 
@@ -110,7 +110,7 @@ Direct:
 <ZAN_SDK>/toolchain/zanc <entry.zan> --auto-stdlib --check-leaks -o build/app
 ```
 
-**多文件项目必须枚举全部 .zan 源**（2026-09-25 实证）：`--auto-stdlib` 只自动
+**多文件项目必须枚举全部 .zan 源**（实证）：`--auto-stdlib` 只自动
 发现 stdlib/包命名空间，**不拉取同项目的兄弟 .zan**——单入口
 `zanc src/main.zan ...` 报 `unresolved call 'X': X is not a known variable,
 type, or namespace`（X 是项目内另一文件的类）时，先数源文件齐不齐：
@@ -127,15 +127,15 @@ down: later errors are usually fallout.
 `scripts/test.ps1 smoke | standard | full` — take the smallest tier that covers
 the change.
 
-**ctest green ≠ 当前工作区已验证**（2026-09-13 实证）：conformance 用例的
+**ctest green ≠ 当前工作区已验证**（实证）：conformance 用例的
 `run_case.cmake` 有 up-to-date check——STDLIB_STAMP 不变就复用旧 exe 直接
 回放，工作区**未提交**的 stdlib 改动不碰 stamp，于是出现"ctest passed 但
 同一源文件手编失败"的假绿。多会话并行的仓库里，凡结论依赖"刚改过的东西
 过没过"，必须手编直跑（`build/zanc.exe <case>.zan --auto-stdlib -o
 _scratch/x.exe && _scratch/x.exe`）当真值，ctest 只当台账。
 
-**`System.Threading.Timer` 构造后不自启**（2026-09-22 实证）：`new Timer(50, cb)`
-只是注册，必须再调 `t.Start()`，否则共享泵根本不投 tick——全程无任何报错，
+**`System.Threading.Timer` 构造后不自启**（实证）：`new Timer(50, cb)`
+只是注册，必须再调 `t.Start`，否则共享泵根本不投 tick——全程无任何报错，
 依赖它的轮询/消息泵整个静默失效（gui-webapp 模板的桥消息泵就因此死过，
 前端 RPC 与窗口控制全无响应）。构造后紧跟 Start，并实跑验证回调确实在触发。
 
@@ -163,7 +163,7 @@ Handler args: `data-arg="apple"` on the same node passes the literal
 not the arg; template rows share the prototype's arg).
 `style` attributes become `.zgen-N` class rules (class-level specificity,
 not browser inline specificity). Idempotent pitfalls: Button routes "Click"
-to its dedicated `Click` field — assert `((Button)b).Click.Count()`, not
+to its dedicated `Click` field — assert `((Button)b).Click.Count`, not
 `b.On.Click`; engine ledgers (inline x stepping ±3px, line-height rounding,
 block strut font-size) apply — write explicit `line-height`/`font-size`
 in fixtures. Lists and conditional visibility are declarative too
@@ -172,7 +172,7 @@ item (rows inserted right after the template; row binds scope to the item
 first, so `<span data-bind="name">` shows `item.name` — Element's default
 bind property is `text`), and `data-if="flag"` toggles `SetShown` by the
 path's truthiness (null/false/0/"" are false). Both are **consumed only by
-a model-hosting ChildWindow** (`SetRoot(tree, model)` + `Wire()`); without
+a model-hosting ChildWindow** (`SetRoot(tree, model)` + `Wire`); without
 a model they are inert (prototype stays hidden, conditions stay visible).
 Nested templates are not supported v1.
 Full spec: `docs/HTML_UI.md` in the SDK.
@@ -196,10 +196,10 @@ feed) — don't hand-write it, and write new designs as .html.
   `data-<kebab>` attrs, `on<Event>` becomes `data-on-<kebab>` (Pascal
   restored on read), pass-through objects (`props`, `columns`) ride
   `data-x-<kebab>` as compact JSON. Bare attributes mean `true` on read.
-- **Designer API**: `Designer.SaveHtml()` / `LoadHtmlText(text)`. Loading
+- **Designer API**: `Designer.SaveHtml` / `LoadHtmlText(text)`. Loading
   a non-design HTML imports it (tags fall back to kinds) — HTML has no
   "corrupt" form, so `loadError` is nearly unreachable for .html input.
-- **Zan trap hit here**: `((char)c).ToString()` returns the code point
+- **Zan trap hit here**: `((char)c).ToString` returns the code point
   ("M" -> "77") — capitalize via `char + string` concatenation instead
   (`(char)(c - 32) + rest`).
 
@@ -276,7 +276,7 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
   `HttpResponse.Parse` 一次：GetAsync 返回的已经是剥掉头部的正文，
   二次解析 statusCode 恒 200、body 变空。
 * `JsonValue.Get`/`PathGet` 可空性是编译期强制的：`x.Get(k) != null &&
-  x.Get(k).AsInt()` 这种"调两次"写法直接编译错误，必须先存局部变量再判
+  x.Get(k).AsInt` 这种"调两次"写法直接编译错误，必须先存局部变量再判
   （每处一次 `Get` + null check）。
 * `JsonValue.Put` 是**追加不去重**，`Get` 命中返回**第一个**同名键——
   更新已存在的键必须用 `Set`（替换或追加）。"整表重写后 Put 回对象"
@@ -287,8 +287,8 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
   且个别字段文档写数字、线上回字符串（如 AuthenticateUserTicket 的
   `result:"OK"`）——解析层两种形态都要接住。
 * 需要本地 HTTP 假网关自测的 SDK（微信/京东/Steam 同款套路）：
-  `HttpServer` 回放官方 JSON 形态 + `ExternalCallPolicy.Default()
-  .AllowLocalHttp()` 放行 loopback。曾有的坑（stdlib 已修，旧工具链仍会
+  `HttpServer` 回放官方 JSON 形态 + `ExternalCallPolicy.Default
+  .AllowLocalHttp` 放行 loopback。曾有的坑（stdlib 已修，旧工具链仍会
   踩）：TLS 客户端对明文服务器握手会永久挂死——`TlsStream.PumpInAsync`
   对 `Recv<0` 不退出循环重挂 `ReadReady`，而 shutdown 后 readiness 只有一
   次；给 SDK 留 `PlainHttpMode` 之类的明文开关是防御性设计。

@@ -33,7 +33,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   前科（A258）：ada73452 的增量 backward-shift 修复在**共享前缀键序**（同簇
   探测链）下把索引写坏，后续 Remove 的探测循环无空槽出口直接死循环（CPU
   100%）——形状钉在 `tests/conformance/dict_remove_shared_prefix.zan`。
-- **Keys/Values 是编译期合成的视图，不是声明的字段**（A314，2026-09-13 已修）：
+- **Keys/Values 是编译期合成的视图，不是声明的字段**（A314 已修）：
   `dict.Keys[i]` 曾整表达式折叠成常量 0——`emit_expr_index` 的成员分支只认
   `member_access_field_type`（声明字段），合成视图解析失败后落进「静默折叠
   常量 0」兜底，且 `d.Keys.Count` 走另一特判一直正常、极具迷惑性。凡新增
@@ -53,9 +53,9 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   branch+phi：两块各算各的，merge 处 phi 合流。
 - 返回 NULL 字符串是合法的空串形状：emit_str_concat 有 NULL→""、
   zan_rt_str_release 有 NULL 守卫，全链路安全。
-- **`LLVMIsConstant()` 不是「只读全局」**（2026-09-15）：它问 ValueKind
+- **`LLVMIsConstant` 不是「只读全局」**：它问 ValueKind
   是否 Constant 子类，而 GlobalVariable 继承自 Constant——对任何全局恒
-  真。只读标志要用 `LLVMIsGlobalConstant()`。弄错会把可变的字符串字面
+  真。只读标志要用 `LLVMIsGlobalConstant`。弄错会把可变的字符串字面
   量缓冲（`__zan.deobf` 构造器启动时要写）放进只读 .rdata，发布程序启
   动即 SIGSEGV。
 - **别给 `llvm.*` 全局设 section**：`llvm.global_ctors` 靠后端特殊降级
@@ -75,33 +75,33 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 - **批量 3D 顶点 FMA 列向量流水线（`Mat4.TransformPoints`）**：在对批量 $(x, y, z)$ 坐标施加 4x4 变换时，将矩阵行主序展开为 4 个预加载列向量 $C_0..C_3$。每个顶点仅需 3 次 `Vector128.MultiplyAdd`（$P' = C_3 + x C_0 + y C_1 + z C_2$），单核达到 4180 万顶点/秒变换吞吐。
 - **SwissTable 16 字节控制组并发探测（`MatchGroup16`）**：`Vector128.Equals` 配合 `ExtractMostSignificantBits` 与 `BitOperations.TrailingZeroCount`，一条指令完成 16 个哈希槽位并发探测，单核达到 1.2 亿次/秒探针吞吐。
 - **LLVM x86 硬件指令集特性开关（`tm_features` 独立命名）**：使用 `llvm.x86.sse42.crc32.*` 机器指令时，仅仅开启 `+sse4.2` 不足以在 SelectionDAG 中完成指令选择，会导致 `LLVM ERROR: Cannot select: intrinsic %llvm.x86.sse42.crc32.*` 致命报错。这是因为 LLVM 将 CRC32 拆分在单独的 `+crc32` 子特性下。同理，FMA 融和乘加需要 `+fma`，单周期硬件位操作需要 `+bmi`。在 TargetMachine 的特性串中，必须显式传递 `+sse4.2,+crc32,+fma,+bmi`。
-- **驱动 runtime 打包与 LLVM 模块生命周期顺序（`zan_irgen_defines_prefix`）**：在主编译流程中，`zan_irgen_release_llvm(&irgen)` 会释放并销毁 LLVM 模块指针（`irgen.mod = NULL`）。如果链接成功后的驱动 runtime bundling 阶段（`*.bundle` manifest 含有类似 `WebView2Loader.dll if WebView` 的条件依赖项）直接调用 `zan_irgen_defines_prefix()` 遍历 `LLVMGetFirstFunction(g->mod)`，会因空指针异常退出（Windows 进程错误码 `-1073741819`）。正确定式：① `zan_irgen_defines_prefix` 必须包含空指针与空模块防崩保护；② 驱动 manifest 中的条件依赖符号前缀（如 `WebView`、`Cef` 等）必须在 `zan_irgen_release_llvm` 释放模块前**提前扫描 manifest 并预缓存**至 `prefix_cache`，后续 bundling 阶段直接从缓存检索；③ 严禁在模块销毁后再次调用 LLVM 模块级遍历 API。
-- **Async 状态机挂起退场与 Await 空蹦床收敛（2026-10-08 落地）**：
+- **驱动 runtime 打包与 LLVM 模块生命周期顺序（`zan_irgen_defines_prefix`）**：在主编译流程中，`zan_irgen_release_llvm(&irgen)` 会释放并销毁 LLVM 模块指针（`irgen.mod = NULL`）。如果链接成功后的驱动 runtime bundling 阶段（`*.bundle` manifest 含有类似 `WebView2Loader.dll if WebView` 的条件依赖项）直接调用 `zan_irgen_defines_prefix` 遍历 `LLVMGetFirstFunction(g->mod)`，会因空指针异常退出（Windows 进程错误码 `-1073741819`）。正确定式：① `zan_irgen_defines_prefix` 必须包含空指针与空模块防崩保护；② 驱动 manifest 中的条件依赖符号前缀（如 `WebView`、`Cef` 等）必须在 `zan_irgen_release_llvm` 释放模块前**提前扫描 manifest 并预缓存**至 `prefix_cache`，后续 bundling 阶段直接从缓存检索；③ 严禁在模块销毁后再次调用 LLVM 模块级遍历 API。
+- **Async 状态机挂起退场与 Await 空蹦床收敛（落地）**：
   - **消灭 `await.fast` 空跳板块**：在 `emit_expr_await_expr` 中，原先快路径（`is_done != 0`）与 CAS 竞争失败（`cas.won == 0`）均跳转至仅包含一条 `br label %await.cont` 的空基本块 `await.fast`。直接将两处条件分支目标直连 `cont_bb`，并将 `cont_bb` 中的 `completed_sub` PHI 节点由 2 臂（`await.fast` 槽、`rk` 槽）改由 3 臂（`probe_bb` 的 `sub_i8`、`prep_bb` 的 `sub_i8`、`rk` 的 `sub_rl`）显式合流，每个 await 点直接消除 1 个冗余 BasicBlock 与 1 条无条件跳转。
   - **共享挂起退场块 `co.suspend.ret`**：在协程 resume 方法内，全部 11 处挂起终结点（Task.Delay, Gate.Park, Task.JoinWait, Socket.Read/WriteReady, Socket.RecvOv, Socket.RecvToOv, Socket.AcceptOv, Socket.ResolveAsync, Socket.ResolveSockAddr, 子任务挂起 suspend_bb, 以及协同抢占 requeue_bb）原先均就地展开 `emit_async_eh_unarm(g); LLVMBuildRetVoid(g->builder);`（重复发射 load/store 恢复 `__zan_eh_top` 及 ret）。改用惰性初始化的共享 `co.suspend.ret` 基本块统一退场（各挂起点发射一条 `br label %co.suspend.ret`），大幅消除重复的 EH unarm 指令与分支扇出。
-  - **协程协作式取消检查前置提升与基本块扁平化（2026-10-09 落地）**：
+  - **协程协作式取消检查前置提升与基本块扁平化（落地）**：
     原先协程在顶层块与嵌套块中遍历语句时，凡遇到 `anf_stmt_contains_await(bs)` 即发射 `emit_async_cancel_check`，导致每个 await 恢复后均额外分裂出 `co.cancelled` 与 `co.notcancelled` 块，生成重复的 `fr.cancel.p` 载入与条件分支。正确定式：
     ① **前置集中拦截**：取消检查统一提升至 `$resume` 方法的分发器入口（`co.dispatch` 之前）；若协程在挂起期间已被请求取消（`Task.Cancel`），直接跳转至共享的 `co.cancelled` 块完成清理并退出，根本无需进入 `switch(state)` 分发；
     ② **消除语句级逐条探测**：由于恢复执行的协程在分发前已经确认未取消，且同步语句序列执行期间取消标志不会自发改变，因此彻底消除 `AST_BLOCK` 内每条包含 await 语句后的重复 `emit_async_cancel_check`。不仅消除了成倍膨胀的基本块，更严格维护了取消协议的语义一致性。
-  - **协程帧单例子任务槽位复用（2026-10-09 落地）**：
+  - **协程帧单例子任务槽位复用（落地）**：
     原先编译器在 `declare_async_method` 中计算协程帧结构体时，按 `w->sub_base + w->await_count` 为每一个 await 挂起点分配一个独立的 `i8*` 子任务句柄槽位，导致包含数十甚至上百个 await 的方法堆帧字段数 $O(N)$ 线性暴涨，结构体膨胀上千字节。
     正确定式：一个协程在任意时刻至多挂起在 1 个子任务上，且在 `rk` 恢复块消费子任务结果并 `zan_emit_frame_free` 后才可能进入下一个 await。因此整个协程帧只需分配至多 1 个共享单例子任务槽位（`w->await_count > 0 ? 1 : 0`），所有 await 点统一读写 `g->current_async_sub_base`。帧类型字段数与内存开销从 $O(N)$ 彻底收敛为 $O(1)$。
-  - **子协程异常传播块单例共享（`co.sub_rethrow`，2026-10-09 落地）**：
+  - **子协程异常传播块单例共享（`co.sub_rethrow` 落地）**：
     原先每个 await 挂起点在 `cont_bb` 中调用 `emit_async_check_sub_exc` 时，均就地内联生成 `sub.rethrow` 基本块，重复发射读取 `sub.exc.tid`、`sub.exc.own`，写 3 个全局 EH 变量，并调用 `zan_emit_frame_free` 与 `get_async_rethrow_bb`。这导致 N 个 await 点生成 N 个同构异常转移基本块与数十条重复指令。
     正确定式：在同一个 `$resume` 方法中，惰性分配一个共享的 `co.sub_rethrow` 基本块，头部放置 `phi_sub` 与 `phi_ev` 两个 PHI 节点收集异常来源；各个 await 点检测到 `sub.exc != NULL` 时直接分支到该共享块。全方法只需 1 组 GEP/Store/FrameFree 展开，消除 $O(N)$ 个冗余异常处理块。
-  - **协程挂起点与完成尾部单例指令收敛（2026-10-09 落地）**：
+  - **协程挂起点与完成尾部单例指令收敛（落地）**：
     原先编译器在 `Gate.Park`、`Socket.ReadReady`/`WriteReady`、`Socket.RecvOv` 等内建异步 I/O 原语挂起点，以及子协程 `await <call>` 与 `emit_async_complete_epilogue` 完成尾部中，频繁就地重复发射 `(i8*)self`、`&self.state`、`&self.result`、`&self.sub_slot` 与 `&self.child` 的 GEP/BitCast。
     正确定式：
     ① **Entry 前导块单例缓存**：在 `$resume` 入口前导块惰性分配并缓存 `self_i8`、`self.state`、`self.result`、`self.sub_slot` 和 `self.child`，全局各挂起点与 epilogue 统一读取单例，将重复发射降为 $O(1)$；
     ② **挂起点 BitCast 与类型匹配收敛**：在 `await <call>` 中，当 `sub` 或指针类型已与目标类型匹配时，豁免发射无操作的 `BitCast`，消除未经优化的中间 IR 指令堆积。
 
-- **`static object` 静态字段的 RC 根注册与动态析构契约（2026-10-09 落地）**：
-  在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object()`）或堆字符串。
-  ① **静态根注册**：`get_static_field_global` 在向 `g->static_fields` 追加退出清理根时，必须显式覆盖 `fsym->type->kind == TYPE_OBJECT`，否则静态 `object` 字段（如单例锁 `static object lock = new object();`）不会登记为全局根；
+- **`static object` 静态字段的 RC 根注册与动态析构契约（落地）**：
+  在 Zan 编译器中，`TYPE_OBJECT` 不属于静态编译期的强类型类（`is_arc_managed_type` 为 false），但其运行时持有的可能是通过 `zan_rt_alloc` 分配的堆类实例（如 `new object`）或堆字符串。
+  ① **静态根注册**：`get_static_field_global` 在向 `g->static_fields` 追加退出清理根时，必须显式覆盖 `fsym->type->kind == TYPE_OBJECT`，否则静态 `object` 字段（如单例锁 `static object lock = new object;`）不会登记为全局根；
   ② **写入托管**：静态字段初始化器（`emit_main_method`）与静态字段赋值（`emit_expr`）对 `TYPE_OBJECT` 必须走 `emit_rc_store_field` 维持 RC 占有权转移，不能直通无托管 store；
   ③ **释放分派**：`emit_rc_release_for_type` 遇到 `TYPE_OBJECT` 须调用 `emit_release_obj_value`，通过负 8 字节 header word 动态探测堆字符串还是类实例并分派正确析构，保证 Main 退出时静态 `object` 被正确清零释放，彻底消除 `--check-leaks` 假阳性/假泄漏。
 
-## 大型 Windows 发布的链接与编译内存（2026-09-28）
+## 大型 Windows 发布的链接与编译内存
 
 - 数万节的单一 COFF 对象（OnePlus 实测 47,411 节）交给捆绑 GNU ld 会报
   `IMAGE_REL_AMD64_REL32` 溢出，并把对象内已定义的 `__zan_argc/__zan_argv`
@@ -137,7 +137,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   应区分 AST 真节点数、节点字节数、累计 arena 请求、各阶段当前 Commit
   与进程峰值：释放前端能降优化期峰值，但 IRGen 时单模块与 AST 并存，
   仍需单独衡量生成的函数及指令数，不把晚期释放冒充 IRGen 峰值治理。
-- **pi_scan_file 词法 metadata 落盘缓存（2026-09-28 落地，提交 13584165）**：
+- **pi_scan_file 词法 metadata 落盘缓存（落地，提交 13584165）**：
   按内容寻址缓存 top 声明名/标识符全集/using/ext（暖跑 35/35 命中）。
   五条定式：① key 必须用**显式字段**（arch/os/abi/triple/cpu/features/
   pointer_size/pic/publish/-D/源内容/路径）——hash `zan_target_t` 原始
@@ -157,7 +157,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   自己写的缓存（正确），别误读成"define 没进 key"——看缓存目录文件
   总数是否按批次增长。
 
-- **lld 的 PE `--wrap` 与导入符号不兼容（2026-10-02）**：`--fast-alloc` 靠
+- **lld 的 PE `--wrap` 与导入符号不兼容**：`--fast-alloc` 靠
   `ld --wrap=malloc/free/calloc/realloc` 全图接管分配，lld 20.1.8（GNU 仿真
   `-m i386pep`）把导入槽改写成 `__imp___wrap_malloc` 别名——wrap 实际不生效，
   程序在 main 之前加载即死（msys 报 exit 127、零输出）；GNU ld 2.36 链同样
@@ -167,14 +167,14 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   `ZAN_LINK_ECHO=1` 回显完整链接命令，供手工重放二分。
 
 - **shard 发布下按"extern 声明还在协调 module 里"判库死活必然误杀——
-  `shard_n == 0` prune 门是承重墙（2026-10-07，同一场发布实录）**：
+  `shard_n == 0` prune 门是承重墙（同一场发布实录）**：
   `--publish` 分片后函数体已搬进 .shard<k>.o，只剩 shard 体调用的驱动声明
   （sqlite3_reset/SQLAllocHandle）在协调 module 里看着是死的；LLVM 扫掉这些
   声明后，zan_irgen_prune_extern_libs 按"声明没了"顺手删 -l，链接死于 shard
   对象的 `undefined reference to sqlite3_reset`。为修幻影 ssl/crypto 而摘掉
   main.c 两处调用点的 `if (shard_n == 0)` 门，sqlite/odbc 立刻以同样方式炸
   ——门必须保留（两处已补注释说明）。幻影库的正解在上游：让幻影 DllImport
-  压根不进编译（SDK 包店精确匹配，见"auto-stdlib 拉入"节 2026-10-07 条），
+  压根不进编译（SDK 包店精确匹配，见"auto-stdlib 拉入"节 条），
   不是在链接期删库。
 
 ## 驱动按活性发布与跨包依赖
@@ -226,7 +226,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
   绘图、图片、音频解码、sprite 和图标；窗口 host 调用应显式失败，
   离屏成功不能当作浏览器窗口或音频设备验收。
 
-## 发布体积：数据逐符号分节与链接器 GC 的边界（2026-09-15）
+## 发布体积：数据逐符号分节与链接器 GC 的边界
 
 irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名>` /
 `.data$<名>`），与既有的逐函数 `.text.<名>` 对称。背景实测（空窗 GUI 探
@@ -237,17 +237,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   每个输入段保持独立可回收。点号命名（`.rdata.foo`）会让每个数据分节成
   为独立输出段，PE 按 4KB 对齐——同一探针 +3.8MB。ELF/Mach-O 用点号。
 - **GNU ld 在 PE 上把 .pdata/.xdata 当 GC 根**：带展开表的函数永远收不
-  回（最小 gctest：零调用的 `dead()` 在 `--gc-sections` 下存活）。x64
+  回（最小 gctest：零调用的 `dead` 在 `--gc-sections` 下存活）。x64
   win-gnu 上 LLVM 给所有非叶函数发展开表 ⇒ PE 发布的 .text 不缩，本改动
   在 PE 净效果≈0；ELF 上 ld.lld 正常回收（实测 193 分节 / .text −280KB）。
   PE 要真裁剪：换 lld-link `/OPT:REF`（关联 COMDAT 语义正确）或发布档发
   no-unwind 表——都未做，见 TASKS.md 挂账。
 - **数据分节只是使能层，语义可达才决定死活**：空窗探针在 ELF 上
-  `Html_Clone → ControlFactory_Create → new ChartHost()` 一条链把整个组
+  `Html_Clone → ControlFactory_Create → new ChartHost` 一条链把整个组
   件世界拖活（App_ctor 自身就引用 45 个类描述符 + ImageHttp 拖活 TLS）。
   裁剪大头在 stdlib 解耦（ControlFactory 的重臂照 CEF/WebView 的
   Bootstrap 注册模式移出主 switch），不在链接器。
-- **生成前函数体裁剪（A-MEM1）的两大击穿暗桩与解法（2026-09-29）**：
+- **生成前函数体裁剪（A-MEM1）的两大击穿暗桩与解法**：
   1. `g->refl_used` 暴力全局保活：只要项目碰了 `typeof`，全局标志就会把所有符号无条件作为 root 保活。必须收敛为仅当类型的 `sym` 出现在反射元数据表（`g->refl_mtabs` / `g->refl_metas`）时才保活，未被反射的 stdlib 辅助类不应被拉活。
   2. 虚表常量数组（`__zan_vtable_*`）无脑判定为存活：`emit_vtables` 预先为所有拥有虚方法的类生成了虚表数组，而 `body_has_live_use` 对常量数组无脑 `return true`，导致所有派生类的虚方法及级联依赖全部被钉死。解法：常量聚合向上回溯归属全局变量，仅当该类的实例构造函数已存活或虚表被活指令真正读取/写入时才算活，未实例化的死类虚方法安全裁剪为 `unreachable` 桩。实测 probe_refl 指令数暴降 96.7%（27,455→908），GUI 探针指令数降 30%（236,282→165,294），BasicBlocks 减少 11,360 个，Peak Commit 显著下降。
 - **测量配方**：`zanc --publish -o x.a`（静态库输出路径保留完整对象，链
@@ -260,21 +260,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   只拆成 GUI 静态库成员时，GUI DLL 仍带解码与设备实现。当前图片、
   游戏和音频各有自己的 shared/static driver，纯绘图工具仅携带 GUI；
   验收应检查两种链接模式的运行结果和依赖，不能只测静态体积。
-- **发布档必须 `-DNDEBUG`（2026-09-27）**：vendored C 库（libwebp/stb）
-  的 `assert()` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏 31 处构建机
+- **发布档必须 `-DNDEBUG`**：vendored C 库（libwebp/stb）
+  的 `assert` 把 `__FILE__` 编进 .rdata，每个发布 exe 泄漏 31 处构建机
   路径（`D:\<repo>\src\runtime\libwebp/...`）；NDEBUG 后字符串清零且无
   行为风险（gui_runtime.c/zan_audio.c 自身零 assert）。linux/android/
   ohos 静态驱动脚本已同批加旗子；linux 归档随 CI 换血，android/ohos
-  已于 2026-10-03 本地重跑换血（android build_gui_android_static.sh、
+  已于 本地重跑换血（android build_gui_android_static.sh、
   ohos build_gui_ohos.sh）。
 - **提交态归档会过期，重建时连环炸**：静态驱动归档落后源码时（如
   dwrite TU 未入归档、脚本里的 `.libs` 清单落后人工补过的提交版），
   下一次重编归档才爆 undefined reference；先 `git show
   HEAD:<归档路径>` 对比成员与 `nm` 旧符号，再对齐脚本与提交态清单。
 
-## auto-stdlib 拉入的真实语义与重臂注册制（2026-09-16 落地）
+## auto-stdlib 拉入的真实语义与重臂注册制（落地）
 
-- **拉入两段制（2026-09-16 起为 AST 真引用闭包，旧"using 整目录 glob"
+- **拉入两段制（起为 AST 真引用闭包，旧"using 整目录 glob"
   已废）**：`using X.Y.Z;` 只把 `stdlib/X/Y/Z` 变成**候选集**（真词法器扫
   top 声明名/using/ext 标记，不 parse）；候选文件仅当 top 声明名是"活名"
   才入图。活名 = 已入图文件 AST 里**类型位置**（TYPE_REF 各段）+
@@ -284,7 +284,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   stdlib 输入，其**自身目录**也进候选集（pi_reach_input_dir，旧
   auto_include 输入命名空间 glob 的按需版）。实测 NewProject 2.6s/75 文件
   （旧 glob 3.2s），空窗 GUI 68 文件。改"谁被编译进"先看旗标链，再谈 using。
-- **包发现收紧后，包源必须豁免活名门（2026-09-29 回归）**：包内文件的
+- **包发现收紧后，包源必须豁免活名门（回归）**：包内文件的
   发现条件是"声明命名空间与 using 名精确相等"（`pkg_visit_source_tree`，
   2e75673e 从整目录 glob 收紧而来），而按需拉入对包源与 stdlib 一视同仁地
   过活名门。组合后果：包控制器这类只被生成代码/框架反射点名、从不被用户
@@ -295,7 +295,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   豁免活名门，否则任何 codegen 驱动的包（MVC 控制器、生成器宿主）都会
   静默脱图。归因四步：无包探针 ROUTES=1 → 带包探针 __AttrRoutes 未合成 →
   垃圾探针（编译必错）证明包文件未进解析 → 活引用探针 ROUTES=1。
-- **pkg_ns_match 的层级展开只是项目包店特权（2026-10-07，真实工程双目标发布实录）**：
+- **pkg_ns_match 的层级展开只是项目包店特权（真实工程双目标发布实录）**：
   stdlib 瘦身把 System.Data/Gui 移出 stdlib 后，"stdlib 目录还在才精确匹配"的
   调用侧门（stdlib_has_dir）对 SDK/exe 旁/全局包店翻转成层级匹配——一条只为
   IDbConnection/ORM 元数据写的 `using System.Data;` 把 Postgres/Firebird/
@@ -310,8 +310,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   rsp 重放 `--publish --link-mode static`，双目标各跑一遍，驱动告警里不该再
   出现 -lpq/-lssl/-lcrypto。
 - **包源豁免活名门之后，命名空间就是拉入单位——FFI 实现类必须与公共契约
-  分命名空间住（2026-10-08，oneplus 补刀）**：包源文件按"声明命名空间与
-  using 名精确相等即无条件入解析集"（上一条 2026-09-29 的豁免），所以一条
+  分命名空间住（oneplus 补刀）**：包源文件按"声明命名空间与
+  using 名精确相等即无条件入解析集"（上一条 的豁免），所以一条
   `using System.Data;` 把核心命名空间**全部文件**整批带进编译——Zan.Data
   曾把 ODBC 万能连接类（13 个 odbc DllImport + 全部实现）与几乎所有 ORM
   文件都要引用的 DbProvider 常量放在同一命名空间，任何只用 SQLite 的程序
@@ -324,23 +324,23 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   表无 ODBC32、odbc_buffers 用例照常过。定式：包里"人人要用的常量/接口"
   与"某后端的 FFI/重实现"永远分命名空间住；动手前 `ZAN_PULLIN_DEBUG=1`
   看 INCL 清单里有没有与业务无关的后端子树。
-- **按需拉取=死代码屏蔽罩（2026-10-01 模板普查实证）**：从未被任何编译
+- **按需拉取=死代码屏蔽罩（模板普查实证）**：从未被任何编译
   单元引用的基建文件（Zan.Game 的 GameViewport/SceneManager/BulletPool
   等"引擎管线"批）**从不进编译集，坏了也不响**——出生即坏的多参
   `Action<Canvas,int,int>`（仓里只有零元 Gui.Action 与一元
   System.Linq.Action<T>，多元泛型根本不存在）潜伏三周，直到首个模板
   （game/idle）真引用才爆。教训：① 基建批次的验证不能只编"入口程序"，
   要有把包/库**整树拉进编译集**的健康普查（`scripts\pkg_sweep.ps1` 一键
-  全包整树合编；2026-10-01 基线 26 包全绿，后续拆包/大改后重跑）；
+  全包整树合编；基线 26 包全绿，后续拆包/大改后重跑）；
   ② 多参回调一律声明具名委托（`delegate void BulletHitFn(int, double, ...)`
   放消费方同命名空间），lambda 实参照常转换，别指望仓里有多元 Action。
-- **同名类型歧义按泛型元数过滤（B-ID38，已根治）**：`using System; using Gui;`
+- **同名类型歧义按泛型元数过滤（，已根治）**：`using System; using Gui;`
   下 `Action<int>` 曾误报 ambiguous——歧义判定按名全列候选（零元 Gui.Action
   加一元 System.Linq.Action<T>，不看能不能吃下实参）。修后 nsresolve 对带
   类型实参的引用只数同元数声明：恰一元可匹配即解析到 System.Linq.Action<T>；
   裸名仍按名计数——两个同名零元 `Action` 双导入照报歧义（对齐 C# CS0104，
   有意保留）。语义钉在 conformance 用例 ns_ambiguity_arity_filter。
-  同族辟谣（B-ID39 撤案）：**「字段被同名导入类遮蔽」机制不存在**——checker
+  同族辟谣（撤案）：**「字段被同名导入类遮蔽」机制不存在**——checker
   裸名本就字段优先，生成字段 `Menu` 与 Gui.Widget.Menu 同名相安无事，插桩
   实证传入 App.html 后原样全绿。那类一枝独秀的成员错，真因是 **zanc 不自动
   发现入口旁的 .html 设计稿**：漏传时生成字段全部缺席，裸名 `Menu` 经"全库
@@ -348,7 +348,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （`type 'Gui.Widget.Menu' has no member 'visible'`），错误里出现导入类型
   全名即命中兜底（其余 undeclared 群在 checker 静默、要等 irgen 才冒，所以
   它独占输出）。撞到别修名字解析——先核对设计稿/生成输入在不在编译输入里。
-- **stdlib 输入自我遮蔽坑（2026-09-16，datatable 5 例红）**：显式传入的
+- **stdlib 输入自我遮蔽坑（datatable 5 例红）**：显式传入的
   stdlib 文件在 entry 循环被打 `user_decl`（本意：用户文件遮蔽 stdlib
   同名类，防冲突改名），结果它自己写全的 `DataTable.CellTextRouted` 调用头
   被 `pi_flag_istr` 的 user_decl 检查一并压制 → 同目录 30 个 partial 部件
@@ -357,7 +357,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   复用 pi_reach_input_dir 的 stdlib 根叶名比对）。教训：`user_decl` 的语义
   是"**用户**声明遮蔽 stdlib"，不是"所有输入都遮蔽"——stdlib 输入提到
   自己的名字（partial 联动）是真引用，必须照常旗标。
-- **AST 播种要连 ns_root 一起搬（2026-09-16，pullin_qualified_escape
+- **AST 播种要连 ns_root 一起搬（pullin_qualified_escape
   四变体全红）**：`ns_root`（using/namespace 的每一段 = 已知命名空间根）
   原本是词法播种 pass 1 顺手填的；播种改走 AST 后没人填了，
   `Gui.App.ISqrt(9)` 的链中段 `App` 逃逸不出 user_decl 遮蔽 → stdlib 的
@@ -379,18 +379,18 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   链后当场 unresolved。**规则：谁用谁声明**；拔任何 using 前先 grep 该
   目录独有声明的外部用户。
 - **重臂注册制（重家族一律照此办理）**：ControlFactory 主 switch 的
-  `new ChartHost()`/`new DataGrid<T>()` 分支 = 语义钉子，把 0.5-0.8MB+
+  `new ChartHost`/`new DataGrid<T>` 分支 = 语义钉子，把 0.5-0.8MB+
   的组件目录钉进每个 GUI 程序；App 自持 `WebViewBox linkBox` 字段 +
   ctor 装 ChartTheme.Css 同理。范式：类型从核心文件里搬走/改为
-  `*Bootstrap.Install()` 经 HeavyControls 注册（先注册后可用），行为
+  `*Bootstrap.Install` 经 HeavyControls 注册（先注册后可用），行为
   钩子用 delegate 槽反转（App.SetLinkNavigator ← WebViewBootstrap），
   资源装载懒触发（ChartTheme.EnsureDefault 挂在 ChartHost 布局/绘制）。
   设计器生成代码（GenForm）的无条件重家族 using 改为按设计树实际 kind
   发射。实测：空窗 GUI 272→213 文件；NewProject singleFile 发布
   13.4MB→4.38MB（OpenSSL/Chart/DataTable/WebView 全部退出编译图）。
-  **槽反转必须全量清点旧调用点（2026-09-16，conformance_gui_html_runtime
+  **槽反转必须全量清点旧调用点（conformance_gui_html_runtime
   连环红）**：`Html.Clone` 直调改 `App.CloneTree` 槽反转（null 槽返
-  null）后，凡是走克隆通道的宿主都得先 `Html.Install()` 注册实现——
+  null）后，凡是走克隆通道的宿主都得先 `Html.Install` 注册实现——
   测试只补了 form_dynamic/compref_designer，html_runtime_test 漏补，
   模板行展开拿到 null 行，ChildCount 断言红且行内越界段错误。归因
   A/B 三步定式：先 stash 自己的编译器改动重跑（排除编译器）、再 stash
@@ -401,7 +401,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   必须提供同名静态方法；只传 .html 不带同名 code-behind .zan 时报
   "type X has no method OnLoad"——是输入列表不全，不是生成器坏了。
 - **__DesignMain 回退是 irgen 的消费义务，发射端改了消费端必须同窗口
-  落地（2026-09-16，NewProject 发布连爆 undefined main/WinMain）**：
+  落地（NewProject 发布连爆 undefined main/WinMain）**：
   GenForm/GenScene 只对主设计稿发射 `__DesignMain`（不是 `Main`，免得
   偷走用户入口），irgen Pass 3 必须先找显式用户 `Main`、没有才落回
   `__DesignMain`。两提交只落了发射端，Pass 3 还只认 4 字节 "Main"——
@@ -412,10 +412,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   /subsystem 方向猜。另注意成员名比较的 `len` 要与字面量同步
   （"__DesignMain" 是 12 字节，写 13 永不命中——静默失配无任何诊断）。
 
-- **async 循环回边协作抢占与 QPC 时钟读节流门控（B-ID44(4)，2026-10-02）**：
+- **async 循环回边协作抢占与 QPC 时钟读节流门控（(4)）**：
   为防止计算密集型 async 协程独占 worker，编译器在 async 函数的所有 `while`/`for`/`do`
-  回边注入 `zan_co_poll()`（当运行时间超量子时自动 `Task.Yield()` 让渡）。但实测发现：
-  若在每次回边无条件调用 `zan_co_precise_us()`（QPC/单调时钟读取），时钟调用的 CPU
+  回边注入 `zan_co_poll`（当运行时间超量子时自动 `Task.Yield` 让渡）。但实测发现：
+  若在每次回边无条件调用 `zan_co_precise_us`（QPC/单调时钟读取），时钟调用的 CPU
   开销占纳秒级紧凑计算循环的 ~85%（探针 23ns/iter 降到跳过时钟时的 3.7ns/iter）。
   治理定式：
   1. 引入 256 次节流门控（`ZAN_POLL_GATE = 256`）：
@@ -425,10 +425,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        同样仅在 `(++w->poll_tick & (ZAN_POLL_GATE - 1)) == 0` 时才读时钟；
   2. 误差可控性：在 2ms 量子下，跳过 255 次纳秒级循环至多产生数微秒的量化过冲，
      但换取了紧凑计算循环 6.2 倍的吞吐提升，彻底消除了回边抢占对 CPU 密集循环的性能惩罚。
-  3. **门控必须在一切函数调用之前——包括配置全局读（B-ID54，2026-10-02）**：时钟门控落地后
+  3. **门控必须在一切函数调用之前——包括配置全局读**：时钟门控落地后
      量子阶梯实验（quantum=0/2/10000 × k=1/32）反转了归因：让渡路径本身零开销
      （q=10000 与 q=2 几乎重合），残余 +86%（k=32）来自 poll 快路径**每次回边的
-     `zan_co_quantum_ms()` 跨编译单元调用**（量子全局读住在 rt_timer.c）。修法=门控前移：
+     `zan_co_quantum_ms` 跨编译单元调用**（量子全局读住在 rt_timer.c）。修法=门控前移：
      先动 worker 本地计数器，255/256 次仅 TLS 读+RMW 即返回，量子/片/时钟全部挪进
      1/256 命中分支；修后开销入噪声。热路径上的"只是读个全局"若隔着编译单元就是一次真实调用。
   4. **C11 `_Thread_local` 在本工具链（原生对象 TDM-GCC、交叉对象 zig clang，均 GNU/mingw 目标）= emutls，热路径禁用**：
@@ -436,23 +436,23 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
      `__emutls_get_address`（~10ns/次的真调用，obj 内实锤），q=0 探针全套 5× 变慢
      （793ms→3.9s）。Windows 上 TlsGetValue（读 TEB→TLS 数组，无系统调用）反而是快路径；
      POSIX 的 pthread_getspecific 同理不可热路径化。换 TLS 机制前后必须重跑热探针对拍绝对值。
-  5. **生产者-消费者环的 head/tail 必须分缓存线（B-ID54 ②，2026-10-02）**：mt 驱动 worker 环
+  5. **生产者-消费者环的 head/tail 必须分缓存线（②）**：mt 驱动 worker 环
      的 head（thieves CAS）与 tail（仅 owner store）原本相邻同线——k=32 下 16 个并发搜索者
      对 head 的 CAS 把 owner 正在写的 tail 线反复打掉，生产者入环 123ns→800ns（6.5×），
      spawn 批次提交侧即崩。修法=head/tail 各垫 56B + 结构 64B 对齐（数组元素逐个成立）。
      副作用良性：producer 提速后环自然触顶溢出，注入队列批量路径（64/锁）接管分发，
      steal 次数 -85%、park -79%。诊断：ZAN_CO_STATS（挂 atexit 后任何驱动路径退出都打）
      看 steal/park；spawn/join 拆分计量区分提交侧 vs 汇合侧退化。
-  6. **async 等待循环：让渡轮询优先于睡眠轮询（B-ID44 第六段，2026-10-02）**：
-     轮询等待"某批协程完成"时，`await Task.Yield()`（重排就绪环尾）的轮询节奏
+  6. **async 等待循环：让渡轮询优先于睡眠轮询（第六段）**：
+     轮询等待"某批协程完成"时，`await Task.Yield`（重排就绪环尾）的轮询节奏
      与批次排水节奏天然同步——再排到自己时任务恰好又跑过一轮，快批次 1-2 圈
      即汇合；`await Task.Delay(1)` 保底吃 1-2ms 睡眠。定式=先让渡 N 圈再退避
      Delay（N=8 足够；预算耗尽说明批次是 IO/定时器长任务，让渡会空转烧核）。
      小扇出实测每批 62-212µs→6-26µs。同二进制 A/B 技巧：预算做成静态字段，
-     探针置 0 即回退旧行为。**2026-10-02 起此定式只剩手写轮询场景**：
-     `Task.WhenAll/WhenAny` 已事件化（见下条 B-ID56），标准库扇出汇合不再轮询。
+     探针置 0 即回退旧行为。**起此定式只剩手写轮询场景**：
+     `Task.WhenAll/WhenAny` 已事件化（见下条 ），标准库扇出汇合不再轮询。
 
-  7. **async 完成通知与挂起的三条铁律（B-ID56 事件驱动 join，2026-10-02）**：
+  7. **async 完成通知与挂起的三条铁律（事件驱动 join）**：
      - **借帧槽前必查 emit_detach_async_call**：spawn 帧的
        `awaiter/awaiter_step` 槽在创建时就被预填 `self+reap_fn`（spawn/reap
        生命周期自用，完成 epilogue xchg 后 ready(self,reap)→reap 释放）——
@@ -469,18 +469,18 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        事件等待必须 Delay 形——误抄 Yield 形加一个 self-ready，挂起立即
        空转假醒，等价于没挂起。
      - 附：irgen 发出的 **void 调用不得命名**（LLVM verifier 拒
-       "named void value"，如 `call void @f()` 带名即拒）；定位用
+       "named void value"，如 `call void @f` 带名即拒）；定位用
        `ZANC_DUMP_BAD_IR=1`，自动 dump 被拒函数 IR。
      - 附：交叉目标的运行时 .o，zanc 从 **exe 旁捆绑副本**（`build/<target>/`）
-       链接而非仓库 `toolchain/<target>/`——2026-10-02 已根治（CMakeLists 的
+       链接而非仓库 `toolchain/<target>/`——已根治（CMakeLists 的
        cross_sysroots staging 改为 zanc 的前置依赖 + 目的地去 TARGET_FILE_DIR
        生成器表达式防环），`--target zanc` 快速迭代也会自动同步；旧构建树或
        SDK dist 里仍可能陈旧，undefined symbol 时先比对两边 .o 的 mtime。
 
-  8. **async 状态机 IR 膨胀治理：挂起退出块共享与帧指针缓存（2026-10-08）**：
-     - **挂起让渡尾块共享（`get_async_requeue_bb`）**：每个 `await Task.Yield()` 与
+  8. **async 状态机 IR 膨胀治理：挂起退出块共享与帧指针缓存**：
+     - **挂起让渡尾块共享（`get_async_requeue_bb`）**：每个 `await Task.Yield` 与
        循环回边抢占（`emit_async_preempt_site`）原本就地生成完整的 `zan_co_ready(self, resume_fn)`
-       + `emit_async_eh_unarm()` + `ret void` 尾部（~7 条 LLVM 指令与基本块）。将其收敛至
+       + `emit_async_eh_unarm` + `ret void` 尾部（~7 条 LLVM 指令与基本块）。将其收敛至
        函数级惰性单例 `co.requeue`，挂起点仅需 `store state` + `br label %co.requeue`，
        消除 60%+ 的挂起胶水指令，同时消灭无意义的中间跳转蹦床块。
      - **取消退出块共享守卫（`scope_has_owned_cleanups` 与 `get_async_cancel_bb`）**：
@@ -523,7 +523,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
        （注意单编译单元 include 拓扑：`irgen.c` 先包含 `irgen_expr.c` 再包含 `irgen_async.c`，在 `irgen_async.c` 中实现的
        静态辅助函数若被 `irgen_expr.c` 调用，必须在 `irgen_expr_core.c` 顶层统一前置声明，防止 C99 隐式函数声明错误）。
 
-## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④，2026-09-17）
+## stdlib 肥边治理：独立类分片 + 槽反转 + 实例方法组注入（A332 肥边③④）
 
 - **重文件被"字段类型"钉进图，与被调用钉进同罪**：`HttpFramer` 有个
   `TlsStream tls` 字段（+`CreateTls` 工厂），Worker.zan 拼了
@@ -536,8 +536,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   实现搬到独立文件独立类（WorkerWs/WorkerSse/WorkerMqtt/HttpFramerTls，
   **绝不能写 partial Worker**——分家名会拉全家，A332 肥边②已验），
   核心留 `static ProtoEntryFn ws/sse/mqttEntry` 静态槽，Dispatch 经槽
-  分发；RunAll 前置 `CheckProtoEntries()`：专用协议槽空即打印
-  "needs WorkerXxx.Install()" 并 exit(1)（比首连接静默断开可诊断得多；
+  分发；RunAll 前置 `CheckProtoEntries`：专用协议槽空即打印
+  "needs WorkerXxx.Install" 并 exit(1)（比首连接静默断开可诊断得多；
   http 端口设了 ws 回调但没装分片只告警，明文语义不受影响）。
   **CheckProtoEntries 只能读槽、不能拼分片类型名**——拼了（哪怕只为
   报错文案的代码路径）就把分片拉回图，槽白拆；报错文案写进字符串没事。
@@ -555,7 +555,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   CRLF——从日志抽文件列表再 `grep`/`[ -f ]` 探测时必须先
   `tr -d '\r'`，否则路径带 \r 全部 MISS，得出"图内没人引用它"的假阴性。
 
-## 发布产物命名与字符串混淆内存陷阱（2026-09-29）
+## 发布产物命名与字符串混淆内存陷阱
 
 - **Windows Image File Execution Options 劫持通用名 `app.exe`**：
   在 Windows 注册表 `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\app.exe` 下若被开启了 `GlobalFlag = 0x02000000` (Page Heap / 页面堆) 并注入 `verifier.dll`，任何名为 `app.exe` 的二进制在启动时都会被 Windows 内核强制挂钩，每个微小堆分配独占 4KB 物理内存保护页，导致进程启动内存暴增至 270MB+ 并可能引发莫名崩溃（`0x80000003` 断点）。ZanIDE 发布与构建绝不可无脑使用目录名 `Path.GetFileName(root)` 作为 `app.exe`，必须优先取 `zan.proj` 中的 `name` 属性（如 `OnePlus.exe`），彻底避开系统对通用名字的调试注入。
@@ -597,10 +597,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   位模式是否真的不可能出现"——函数表索引/句柄/压缩指针都可能撞 tag。
   新 target 落地时对"native 偶数才合法"的隐含假设逐个显式化。
 
-- **跨调用保活 delegate 必须 retain，线程入口必须 tag-test（A70/A261，
-  2026-09-11）**：`Thread.Start(job.Run)`（实例方法组 = tagged closure 记录）
-  此前在 native `zan_thread_start` 里被原样当裸 `void(*)()` 调用 → 启动瞬间
-  SIGSEGV；同形的 `Thread.Start(() => {...})`（捕获 lambda）一样崩，裸静态
+- **跨调用保活 delegate 必须 retain，线程入口必须 tag-test（A70/A261）**：`Thread.Start(job.Run)`（实例方法组 = tagged closure 记录）
+  此前在 native `zan_thread_start` 里被原样当裸 `void(*)` 调用 → 启动瞬间
+  SIGSEGV；同形的 `Thread.Start( => {...})`（捕获 lambda）一样崩，裸静态
   方法组却正常（checker 不拦，编译期无诊断）。native 两路（Win32
   CreateThread / POSIX pthread_create）与 wasm 版、UI 派发队列同构化：
   trampoline 先 `v & ZAN_CLOSURE_TAG` 判形态（带 tag 就卸 tag 取记录 fn 槽按
@@ -625,7 +624,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   引用的 `_scratch` 探针结论一并复核。坑出处：这三处是"文档更新已完成"当天漏掉
   的，"更新 stdlib 注释"被当成做完，实际只改了一半。
 
-## stdlib 生成器（GenForm/GenHtml）：分块发射空集与直通排除清单（2026-09-14）
+## stdlib 生成器（GenForm/GenHtml）：分块发射空集与直通排除清单
 
 - **分块字面量发射必须单测空集**：为绕单字面量 4095 词法上限把
   `Css = "<全串>"` 改写成 while 分块相加（GenHtml），css 为空的文档
@@ -642,16 +641,16 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   静默降级只有 GetProp 断言型 conformance 抓得住，输出型金样抓不住
   （gui_form_control 的 `container class` 断言就是为此写的）。
 
-## nsresolve 冲突改名丢泛型实参：只在"全量输入"构建炸（lambda_87，2026-09-13）
+## nsresolve 冲突改名丢泛型实参：只在"全量输入"构建炸（lambda_87）
 
 - **症状**：IDE 构建（glob 全 Gui 树）报 `LLVM verification failed in
   lambda_87: Incorrect number of arguments passed to called function!`，
   `call void %dlg.fn(ptr %clo.rec, ptr %load4)`；同一份 Gui 源码在
   conformance/单文件编译全绿。挂掉的是 ChildWindow.WireNode /
-  Html.WireArg 的 `Action<string> aa = ...; () => { aa(arg); }`。
+  Html.WireArg 的 `Action<string> aa = ...;  => { aa(arg); }`。
 - **根因链**：`Gui/Event.zan`（namespace Gui）与
   `Gui/Reactive/Events.zan`（namespace Gui.Reactive）各有一个零参
-  `delegate void Action()`。nsresolve 对跨命名空间同名声明双方 mangle
+  `delegate void Action`。nsresolve 对跨命名空间同名声明双方 mangle
   （Gui_Action…）并改写所有解析到的引用，但 `type_ref.name` 只是基名、
   泛型实参在独立列表里——**改写基名天然丢实参**。Gui 命名空间文件里的
   `Action<string>` 于是被绑到零参 Gui_Action（binder 侧 scope 命中声明、
@@ -677,12 +676,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   ——本轮设计文档二分的全部结论因此作废。二分前先确认每个子集都能
   走到被观测的阶段（closed set），或把 pass 判据定为"编译成功"。
 
-## 限定名解析的简单名回退：错命名空间的发射碰巧编过，用户同名类一出现就炸（design_palette，2026-09-17）
+## 限定名解析的简单名回退：错命名空间的发射碰巧编过，用户同名类一出现就炸（design_palette）
 
 - **症状**：GenForm 给告警件（类在 `Gui.Hmi`）发射 `Gui.Widget.AlarmBanner`
   字段与构造，设计稿编译全绿；用户项目一旦声明同名全局类，同一行变成
   `undefined type 'AlarmBanner'`——"没动 stdlib 却编不过"。实测还可能
-  静默绑到用户类（继承基类的 Kind() 自报名暴露）。
+  静默绑到用户类（继承基类的 Kind 自报名暴露）。
 - **根因**：限定名解析在限定路径走不通时**退回简单名解析**
   （using import / 可见域）。所以限定错命名空间的名字平时碰巧编过，
   "限定名"并不锁真身；用户同名类让简单名出现双绑定后回退失效。
@@ -692,11 +691,11 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   门槛先放行裸名，探针立刻打回（Led 绑到用户类）。新增工具箱 kind
   三处同步：FormField.KindForType、GenForm（IsStdWidgetKind/IsHmiKind）、
   ControlBootstrap（Names/Make，policy_control_factory 强约束
-  键=分支=Kind() 自报且标签唯一、漏 `override` 修饰符会骗过扫描）。
+  键=分支=Kind 自报且标签唯一、漏 `override` 修饰符会骗过扫描）。
   回归锁：conformance_gui_design_palette（设计文档放全 25 个
   展示/工控 kind + 探针侧 Tag/Led/Dropdown 三个同名用户类）。
 
-## 简单名同名劫持：using 导入的 stdlib 类压过另一 using 里的业务同名类（MarkdownLite，2026-10-08）
+## 简单名同名劫持：using 导入的 stdlib 类压过另一 using 里的业务同名类（MarkdownLite）
 
 - **症状**：业务包新增 `class Markdown`（`ZanWeb.Web`），调用方文件同时
   `using System.Text;`（stdlib 有同名类）与 `using ZanWeb.Web;`，裸名
@@ -712,9 +711,9 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   都是把雷埋给下一个文件。坑出处：Mvc 包 golden 4/4 编译失败，
   改名 MarkdownLite 后即愈。
 
-## 嵌套类型提升：hoist 拿走 AST 嵌套关系，binder 必须挂回宿主 members[]（namespace_qualified_call，2026-09-23）
+## 嵌套类型提升：hoist 拿走 AST 嵌套关系，binder 必须挂回宿主 members[]（namespace_qualified_call）
 
-- **症状**：`class Outer { public class Inner { ... } }` + `Outer.Inner.Value()`
+- **症状**：`class Outer { public class Inner { ... } }` + `Outer.Inner.Value`
   被 checker 拒绝 `'Outer' has no member 'Inner'`，而这个限定调用在旧版
   编译运行全绿——"测试突然红"，且 binder/checker 当时的 diff 都是无关改动。
 - **根因**：parser 的 `zan_parser_flatten_nested_types` 把嵌套类型**整体搬到
@@ -749,7 +748,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 
 ## Redis RESP 协议与大数据量安全：512MB 单块上限与 100 万数组递归防线
 
-- **病灶**：在 `RedisClient` 解码 RESP 协议报文时，原先对 `$` bulk 字符串仅读取长度 `blen` 并直接无条件传入 `ensureAvailable(n + 2)`；对 `*` 数组同样根据 `count` 循环调用 `readReply()`。
+- **病灶**：在 `RedisClient` 解码 RESP 协议报文时，原先对 `$` bulk 字符串仅读取长度 `blen` 并直接无条件传入 `ensureAvailable(n + 2)`；对 `*` 数组同样根据 `count` 循环调用 `readReply`。
 - **危害**：
   1. Redis 官方规范（RESP spec）明确定义单个 bulk string 的绝对硬上限为 512MB；
   2. 恶意或畸形对端若发送 `$2000000000\r\n`，`blen` 将达到约 2GB，客户端在 `ensureRoom` 时会触发连续扩容直至撑爆内存抛出 OOM 崩溃；
@@ -832,8 +831,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 ## MessagePack / BSON 序列化防线：容器尺寸整型溢出回绕与 512MB 载荷上限
 
 - **病灶**：
-  1. `MsgPackReader` 中 `ArrayOf((int)U32BE(), depth)` 与 `MapOf((int)U32BE(), depth)` 原先将无符号 32 位整数直接强转为 `(int)`。当恶意报文声明 `0xFFFFFFFF` 时，数值回绕为 `-1`。在 `while (i < n)` 中，由于 `-1 <= 0`，循环直接跳出，**静默将超大非法容器解析为空数组或空对象**；
-  2. 若 `U32BE()` 为较大的正数（如 20 亿），解析器会尝试在内存中无节制分配 20 亿个 `JsonValue` 实例，引发长时间 CPU 停顿与 OOM；
+  1. `MsgPackReader` 中 `ArrayOf((int)U32BE, depth)` 与 `MapOf((int)U32BE, depth)` 原先将无符号 32 位整数直接强转为 `(int)`。当恶意报文声明 `0xFFFFFFFF` 时，数值回绕为 `-1`。在 `while (i < n)` 中，由于 `-1 <= 0`，循环直接跳出，**静默将超大非法容器解析为空数组或空对象**；
+  2. 若 `U32BE` 为较大的正数（如 20 亿），解析器会尝试在内存中无节制分配 20 亿个 `JsonValue` 实例，引发长时间 CPU 停顿与 OOM；
   3. `BsonReader` 中文档总长度 `total` 与字符串/二进制载荷长度未设硬上限，且在 `total > len - lenAt` 校验前计算 `bodyEnd = lenAt + total` 存在 `int` 加法溢出风险。
 - **危害**：
   1. 恶意输入可通过伪造 32 位整型溢出绕过格式校验，误导业务层得到假空数据；
@@ -897,17 +896,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   stdlib_min`（带 WASI 分支的裁剪快照），**repo stdlib 的修复必须镜像进
   快照**（Effects.zan TakeDamage 首帧 null 守卫），否则构建用的还是旧代码。
 
-## 泛型实例化定长表：第 64 个起静默丢弃（A78-3，2026-09-11）
+## 泛型实例化定长表：第 64 个起静默丢弃（A78-3）
 
 - `irgen_emit.c` 里两张"按实例逐份"的表曾用定长栈数组：`variants[64]`
   （每实例一份方法体）与 `insts[64]`（泛型类静态字段的按实例初始化器）。
   `variants` 有一槽留给擦除版，循环守卫 `nvar < 64` 只装得下 **63** 个具体
   实例化：第 64 个实例化的专用体 `Wrap_Show$T63` 从未发射，调用点
   `route_generic_method` 查 `find_generic_fn` 落空后**静默退回擦除版**，而擦除
-  版的体就是 `call abort(); unreachable` → 程序无输出、退出码 3。同族的
+  版的体就是 `call abort; unreachable` → 程序无输出、退出码 3。同族的
   `insts` 从第 65 个起静默丢弃，那些实例化的静态字段停在 0。
 - **触发条件是"体的发射需要按实例特化"**（体里用到类型参数，如 `Wrap<T>` 的
-  `Show()` 调 `item.Name()`）。只靠擦除形态就够的实例化（类实参、体不碰 T）
+  `Show` 调 `item.Name`）。只靠擦除形态就够的实例化（类实参、体不碰 T）
   到 100 个也正常——所以早期记录把它误判成"≥64 个实例化堆损坏、非确定性、
   ASLR 相关"，实际是**确定性的运行期 abort**，只跟"需要几份专用体"有关。
 - **修法**：两张表改按需倍增的堆数组。**任何容量上限都不许静默截断**——截断
@@ -918,7 +917,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **回归**：`tests/conformance/generic_inst_count_70.zan`（70 个实例化，同时
   覆盖 64 边界的专用体与 65 边界的静态初始化器）输出 `2485/70`。
 
-## 调用形状：接收者槽必须按静态性判定（A270，2026-09-11）
+## 调用形状：接收者槽必须按静态性判定（A270）
 
 - `obj.Method(args)` 在 irgen_call.c 里按接收者形态走**两条互不相交的分支**：
   局部变量接收者（`local.Method(...)`）与表达式接收者（`expr.Method(...)`，`if (recv_cls)`）。
@@ -928,14 +927,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 局部变量那条曾**无条件** `argc = args.count + 1`、把接收者塞进 slot 0、参数整体后移
   一位 → 静态方法调用生成 3 参 call 打 2 参函数，LLVM 校验报
   `Incorrect number of arguments passed to called function!`；报错点离调用点很远，调用者
-  只看得到一个参数个数不符的 call。触发面就是 `d.StaticMethod()` 这一种写法
+  只看得到一个参数个数不符的 call。触发面就是 `d.StaticMethod` 这一种写法
   （`tests/gui/compref_designer_test.zan` 曾长期挂在 standard 档）。
 - **定式**：新增或改动任何 call 发射分支，先问三件事——接收者槽要不要（静态性）、
   参数索引用不用偏移（`recv_off`）、`emit_dispatch_call` 的类参数要不要传（静态方法
   没有 vtable，传 NULL 走直接调用）。三者是一组，漏一个就是形状错配。
 - **归属定式**：这类"参数个数不符"报错不明说谁多传了，定位靠最小探针 + 逐一遍历接收者
   形态（局部 / 字段 / 临时 / 类型名）；并用**旧编译器快照**证明是既有缺陷而非本轮引入
-  （本次用 `_scratch/zanc_head.exe`，2026-09-03 构建，同探针同样复现）。
+  （本次用 `_scratch/zanc_head.exe` 构建，同探针同样复现）。
 
 ## 属性访问：裸名 static 读静默得 0，裸名实例写让 zanc 段错误
 
@@ -961,7 +960,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （第 16 参起仍是 i64 未被 coerce）。限定名 `A.big17(...)` 路径正常（探针
   `p17.zan` / `p60.zan` / `p17b.zan`）。
 
-## 编译器内建三件套契约：is_call_to 拦截、builtin_api 表、stdlib 声明可独立缺失（B-ID46，2026-10-01）
+## 编译器内建三件套契约：is_call_to 拦截、builtin_api 表、stdlib 声明可独立缺失
 
 - **事实**：NativeMemory 这类"stdlib 声明 + 编译器内建"的 API 由三处拼成——
   ① irgen_expr.c 的 `is_call_to(expr, "NativeMemory", "X") && argc==N` 拦截降级
@@ -977,21 +976,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   一元负号 `-z`——`0.0 - z` 对 z=+0.0 得 +0.0（IEEE 减法 x−x=+0，不是常量
   折叠问题），位型语义探针必须走 fneg。
 
-## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect（2026-09-25）
+## irgen_builtins 算术内联保宽：禁止对 8 位整型混用 zan_add 与 LLVMBuildSelect
 
 - **症状**：在编译器内置字符串方法生成（如 `__zan_str_to_upper` / `__zan_str_to_lower`）中，使用 SSA 计算 `%c8 = select i1 %in_rng, %conv, %c` 时，LLVM 校验直接报错 `Invalid operands for select instruction!`。
 - **根因**：编译器宏 `ZAN_IBIN(zan_add, LLVMBuildAdd)` 内部默认调用 `zan_ipair(b, &l, &r)`，遵循 C# 算术向 int/long 提升规则，若左右操作数为 i8 则会自动调用 `zan_iwiden` 零扩展为 `i64`。但后续 `LLVMBuildSelect` 接收的 `%c` 仍是原始加载的 `i8` 字符，导致 `select` 的 true 分支为 `i64`、false 分支为 `i8`，类型不匹配。
 - **纪律**：在生成 8 位或保宽标量 SSA 寄存器操作时，禁止随意混用通用整型二元运算包装宏（如 `zan_add`、`zan_sub`）；涉及 `select` 或定宽存储的逻辑，直接使用显式保宽的 `LLVMBuildAdd(g->builder, c, diff, "conv")` 或显式截断/强转，确保 LLVM 寄存器类型严格闭环。
 
 - **本类一个构造函数都没有时 `new C(args)` 静默丢实参**（`irgen_expr.c:7281-7287` 的
-  诊断以 `type_has_ctor()` 为门，无 ctor 反而不报）→ 对象只用字段初始化器，args 不
+  诊断以 `type_has_ctor` 为门，无 ctor 反而不报）→ 对象只用字段初始化器，args 不
   求值。探针 `_scratch/audit2/newargs.zan`。
-- **工厂延续初始化器 `Factory() { M = v }` 的成员检查曾被整段跳过（A89，2026-09-13
+- **工厂延续初始化器 `Factory { M = v }` 的成员检查曾被整段跳过（A89
   已修）**：call_init 形态没有 type 节点（`new_expr.type == NULL`），checker 先
   `type = check_expr(call_init)` 拿到工厂返回类型，后面又无条件
   `resolve_type(new_expr.type)`——NULL 进去 type_error 出来，把已算好的类型冲掉，
   共享初始化器循环的 `type && type->sym` 门恒假：no-setter / 赋值兼容 / 成员存在
-  **三检查全部静默**（`Maker.New() { tag = "字符串" }` 塞 int 字段、`{ nosuch = 5 }`
+  **三检查全部静默**（`Maker.New { tag = "字符串" }` 塞 int 字段、`{ nosuch = 5 }`
   都编译通过，运行期 `if (!msym) continue` 整体丢写）。**为什么**：给表达式分支补
   "后置统一 resolve" 时会吃掉前面分支已算好的类型——新增 AST 形态要么 early-return，
   要么用形态旗标门住 resolve/ctor 检查。诊断点在 `checker.c` AST_NEW_EXPR +
@@ -1015,7 +1014,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 单行多声明符 `int a = 0, b = 2;` 走 pending_stmts 队列 + 三个语句收集点
   splice；comma 循环只吃 `IDENT [= expr]`。
 
-## 类型位置的裸名是 AST_TYPE_REF，不是 AST_IDENTIFIER（2026-09-15）
+## 类型位置的裸名是 AST_TYPE_REF，不是 AST_IDENTIFIER
 
 - 泛型实参、基底列表、extends 边里的裸名形参（`Box<T>` 的 `T`）经
   `parse_type_ref` 解析，得到 `AST_TYPE_REF` 且 `type_args.count == 0`；
@@ -1035,8 +1034,8 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   has ? cstr(payload) : NULL（branch+phi，见上）。无符号元素
   （uint?/ulong?）要传 emit_to_cstr_u 的 unsigned 旗标。
 - `Convert.ToString(T?)` 与插值 `"{x}"` 同样走 emit_to_cstr_u 的
-  nullable 分支（2026-09-23 修复：此前这两条自建分支链把 nullable
-  结构按值递进 itoa64 炸 verifier）。`.ToString()` 直调被 checker 以
+  nullable 分支（修复：此前这两条自建分支链把 nullable
+  结构按值递进 itoa64 炸 verifier）。`.ToString` 直调被 checker 以
   "cannot access member on nullable type" 拦下——要文本就走
   `Convert.ToString(x)`。
 
@@ -1056,7 +1055,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   日期报告把「内容其实现行」（rt_timer.h 只加声明→embed 对象重建字节全同）
   和「真缺符号」（macos timer 0 个 zan_join_*=重刷批次只刷部分目标漏网）混
   在一起；常驻告警没人分流就退化成壁纸——macos io/sync/timer 的陈旧报告
-  挂了很久无人处理，2026-10-02 全量入册+字节裁定才定性（同日修掉 macos 八
+  挂了很久无人处理 全量入册+字节裁定才定性（同日修掉 macos 八
   对象、ios 六对象、win 双架构十对象）。手搓重建或补 rebuild_cmd 都必须
   逐字镜像旗标，三个已踩坑：linux/macos 的 zanrt_io/io_mt 编 rt_io.c 用
   默认 gnu 方言（-std=c11 会藏掉 sigemptyset/clock_gettime，字节全变）、
@@ -1072,8 +1071,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   git log 看提交时区（github-actions[bot]/-0700=CI 产物，+0800=本机产物），
   别把 CI 产物当成本机能力边界。
 - toolchain/** 的 *.o 命中 gitignore，提交要 `git add -f`。
-- **静态驱动的 .libs 需求必须在同目录兑现，先符号预检再提交**（2026-10-08，
-  B-ID122 win-x64 实录）：`pq.libs` 索要 `-lssl -lcrypto` 时解析器在驱动
+- **静态驱动的 .libs 需求必须在同目录兑现，先符号预检再提交**（win-x64 实录）：`pq.libs` 索要 `-lssl -lcrypto` 时解析器在驱动
   static/ 下按 `lib<name>.a` 找，缺档就是发布期 `cannot find -lssl`。补档
   定式：① ABI 匹配看现有 libpq.a 的出处——win 用 MSYS2 `mingw64`
   （msvcrt）包，别拿 clang64（ucrt）或 musl 源；linux-x64 的 libpq.a 是
@@ -1084,21 +1082,21 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   ④ 验收看端到端：`--publish --link-mode static` 真用该驱动的探针，链接
   过 + 运行优雅（连不上服务器的错误文本 = 代码路径活着）。
 
-## 继承静态字段存储归属（B-ID126，2026-10-08）
+## 继承静态字段存储归属
 
 - **症状**：派生类中通过裸名访问继承自基类的静态字段（如 `class Derived : Base` 中访问 `Tag`）或者通过派生类限定名访问（`Derived.Tag`），在实例方法中读出 `(null)`，在静态方法中读出空值或 0。
 - **根因**：静态字段与 auto 属性在 LLVM IR 层面被发射为全局变量 `__zan_sf_<ClassName>_<FieldName>`。在 `irgen_builtins.c:get_static_field_global` 中，构造符号名时原先直接采用传入的 `class_sym`。当通过派生类上下文（裸名解析或派生类限定）访问时，`class_sym` 记录的是访问点所在的类（`Derived`）而非实际声明该字段的类（`Base`）。导致基类静态初始化器写入 `__zan_sf_Base_Tag`，而派生类访问读取了未初始化的空全局 `__zan_sf_Derived_Tag`。
 - **定式**：所有静态字段及静态属性的 backing global 名字必须锚定在其声明类上：若字段符号的 `fsym->parent` 是类或结构体，必须将 `class_sym` 重定向为 `fsym->parent`。保证继承链上所有层级（包括多级继承、派生类限定和裸名访问）统一读写同一个全局实体。
 
-## 内建 `new object()` 堆分配契约与三元条件类型合流（B-ID124，2026-10-08）
+## 内建 `new object` 堆分配契约与三元条件类型合流
 
-- **症状**：在三元条件表达式中包含 `new object()`（例如 `hit ? sync : new object()`），编译时通过语法与语义检查，但在 LLVM IR 校验时报 `LLVM verification failed: PHI node operands are not the same type as the result`（指纹为 `ptr` 与 `i32` 混合喂入同一 PHI 节点）。
+- **症状**：在三元条件表达式中包含 `new object`（例如 `hit ? sync : new object`），编译时通过语法与语义检查，但在 LLVM IR 校验时报 `LLVM verification failed: PHI node operands are not the same type as the result`（指纹为 `ptr` 与 `i32` 混合喂入同一 PHI 节点）。
 - **根因**：
   1. `object` 为内建类型（`TYPE_OBJECT`），没有对应的 `SYM_CLASS` 结构描述符。`src/compiler/irgen_expr.c` 的 `emit_expr_new_expr` 原先只针对 `sym && (sym->type->kind == TYPE_STRUCT || sym->type->kind == TYPE_CLASS)` 进行实例化，未匹配内建 `object`，落入兜底的 `LLVMConstInt(i32, 0)`。
   2. 条件表达式 `emit_expr_conditional` 将三元表达式的合流类型推断为引用指针 `ptr`，由于 `coerce_ternary_value` 仅在浮点与整型之间执行强制转换，不会将整型 0 盲目强制转化为指针，导致常数 `0: i32` 被直接喂入 `ptr` PHI 节点引发 verifier 拒绝。
 - **定式**：
-  1. `new object()` 是合法的对象实例化表达式（常用作 `lock` 同步锁头或通用哨兵）。`emit_expr_new_expr` 必须对其显式分配 ARC 堆对象（调用 `zan_rt_alloc` 分配 8 字节最小载荷并关联 ARC 站点），将载荷清零并返回引用指针；
-  2. 严禁通过简单将常数 0 转为 null 指针来避开 verifier：`new object()` 必须产生具有独立生命周期与堆身份的有效对象引用。
+  1. `new object` 是合法的对象实例化表达式（常用作 `lock` 同步锁头或通用哨兵）。`emit_expr_new_expr` 必须对其显式分配 ARC 堆对象（调用 `zan_rt_alloc` 分配 8 字节最小载荷并关联 ARC 站点），将载荷清零并返回引用指针；
+  2. 严禁通过简单将常数 0 转为 null 指针来避开 verifier：`new object` 必须产生具有独立生命周期与堆身份的有效对象引用。
 
 ## win-arm64 交叉 rt：setjmp 降层与 rt_crash 架构门
 
@@ -1125,7 +1123,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 重出对象名是 `zanrt_*.o` 前缀（build_win_rt.sh 协议），别把裸 `rt_*.o`
   拷进 toolchain/。OHOS NDK clang 15.0.4 在 DevEco Studio 安装目录的
   native/ 下。
-- **「需要 OHOS SDK」挂账前先翻 DevEco 自带的那份（2026-10-03 B-ID86 残项
+- **「需要 OHOS SDK」挂账前先翻 DevEco 自带的那份（残项
   闭账）**：DevEco Studio 自带完整 OpenHarmony native SDK——
   `<DevEco>/sdk/default/openharmony/native/`（llvm/clang+llvm-ar、sysroot
   153 库含 libEGL/libGLESv3/native_window），GUI 驱动双架构配方即仓库
@@ -1138,7 +1136,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   dlopen 崩即同族）。本地新产出的驱动二进制受全局 `*.so`/`*.a`/`*.dll`
   忽略，提交必须 `git add -f`。
 
-## Linux 构建三断点：feature 宏分层、fortify 契约、死包含（B-ID29）
+## Linux 构建三断点：feature 宏分层、fortify 契约、死包含
 
 - **glibc 头文件的 feature 宏分层必须显式给**：`SA_ONSTACK` 在
   `__USE_GNU` 层——要显式 `-D_GNU_SOURCE`，`-std=gnu11` 也不保证暴露
@@ -1161,7 +1159,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   hello 探针；只单编对象抓不到 fortify abort（只在运行时炸）。这类
   缺陷会被「构建本来就断」掩盖成潜伏雷，修通构建后才首曝。
 
-## IOCP 唤醒包丢失家族与 raw socket 探针陷阱（A298 收尾，2026-09-14）
+## IOCP 唤醒包丢失家族与 raw socket 探针陷阱（A298 收尾）
 
 - **丢包路径的契约**：Windows 上 `PostQueuedCompletionStatus` 失败（DNS/-2
   唤醒包）会置 `g_blocking_wake_lost`，完成结果滞留 `g_blocking_done` 且
@@ -1177,14 +1175,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `zan_io_close_notify`（Windows）为显式 `CancelIoEx(fd, NULL)`，唤醒
   不再依赖 closesocket 的隐式取消时序；stdlib 侧 `Socket.ShutdownBoth`
   同型（SysShutdown+CancelIoEx）。
-- **raw `Socket.Create*` 曾不做 WSAStartup**（2026-09-14 已修：四个
-  Create* 自调 `Socket.Initialize()`）：TcpListener/TcpClient/UdpClient
-  构造器各自初始化，raw 路径原本无人兜底，Windows 上 `CreateTcp()`
+- **raw `Socket.Create*` 曾不做 WSAStartup**（已修：四个
+  Create* 自调 `Socket.Initialize`）：TcpListener/TcpClient/UdpClient
+  构造器各自初始化，raw 路径原本无人兜底，Windows 上 `CreateTcp`
   静默返 -1。**socket 探针必须断言 fd>0 且 Bind==0**——否则挂在不存在的
   fd 上，`AcceptAsync(-1)` 立即返回会伪装成「苏醒」，探针假阳性（首轮
   listener 探针就因此"通过"过一次）。
 
-## 懒启动池的所有权谓词：前台泵自起池也要置所有权标志（B-ID30）
+## 懒启动池的所有权谓词：前台泵自起池也要置所有权标志
 
 - **「无池则起池」的懒启动入口（ensure）必须与所有持有执行所有权的路径
   共用同一个所有权谓词**：前台 `sched_run` 自起 worker 并内联跑 worker0
@@ -1201,20 +1199,20 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   前台池要靠「arm 住 pending 工作但不触发 ready」的定时器撑住（arm 不
   走 ready，dispatch 才走），否则 ensure 在起前台池前就被先触发。
 
-## nullable 接收者扫描必须穿透 lock（2026-10-08）
+## nullable 接收者扫描必须穿透 lock
 
 - **同步维护守卫、可空返回和位置裁剪三个遍历表**：`node_guards_null` 对
   `AST_LOCK_STMT` 要扫描锁表达式和 body，`stmt_returns_null` 要扫描 body，
   `node_loc_prunable` 要把 lock 当作带可靠起点的语句。漏守卫子树会误拒
-  `lock (sync) { T x = Find(); if (x != null) x.Member(); }`；只补这一处，
+  `lock (sync) { T x = Find; if (x != null) x.Member; }`；只补这一处，
   则锁内 `return null` 仍会逃过诊断，或后置锁头的空值比较会错误放行前置
   解引用。原因不是同步语义，而是辅助 AST 扫描与正常语句检查漏了同一种节点。
   回归用 guarded/nested lock 正例和未守卫、后置 body/header 守卫、锁内可空
   返回负例成对锁住；`null_guard_lock` 与 `diag_null_guard_lock_*` 已验证。
 
-## 空值保护只认显式护栏分支，不认"先存局部"（2026-10-09）
+## 空值保护只认显式护栏分支，不认"先存局部"
 
-- **症状**：`T x = Find(); x.Member = v;` 与 `Find().Member = v` 报同样的
+- **症状**：`T x = Find; x.Member = v;` 与 `Find.Member = v` 报同样的
   "'Find' can return null; accessing 'x' on its result faults"——把可空结果
   存进局部变量**不会**解除诊断；测试作者常以为"我已经存了局部"就该放行。
 - **放行条件**：存在显式护栏分支（`if (x == null) { … }` 早退或 if/else
@@ -1229,12 +1227,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 挂的测试先归因再动手：「stale golden」（重生成，逐行核对 C# 拼写）、
 「实现违约」（修实现——布局注释/文档注释就是契约，「注释与实现打架时
 先查 git 考古谁先谁后」）、「测试源不合法」（C# 也拒绝的写法改测试源，
-如无约束 T 的 string 拼接改 .ToString()）、「真回归」（git 考古最后
+如无约束 T 的 string 拼接改 .ToString）、「真回归」（git 考古最后
 通过点定位元凶提交修编译器）。混着处置就会把行为改错。
 
 ## ARC 契约：DllImport 的 string 返回值是借用指针，永不释放（内建除外！）
 
-- **内建优先于 extern 借用规则（A262，2026-09-10）**：`NativeMemory.GetString`
+- **内建优先于 extern 借用规则（A262）**：`NativeMemory.GetString`
   是编译器内建（emit_native_memory_call，irgen_expr.c 用 emit_string_alloc_rc
   建真 ARC 串、memcpy、NUL 收尾，交调用方 +1），`[DllImport]` 声明只为
   checker 提供类型。extern 借用判定必须先给内建开白名单
@@ -1275,7 +1273,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （__malloc_allzerop）且 RSS 平台化后不重现，优先怀疑高压竞争而非
   Zan 侧 UAF——先用低速率复跑分型。
 
-- **消费方要留引用时，拥有所有权的临时接收者必须释放（A269，2026-09-11）**：
+- **消费方要留引用时，拥有所有权的临时接收者必须释放（A269）**：
   委托绑定（`Action a = new Job(i).Run;`）与 retained 字段读一样，会让闭包
   记录 retain 接收者（`emit_closure_record(..., retain_target=true)`），但方法组
   这条路径原先没有像 `finish_member_of_temp` 那样把"临时量自带的那一份 +1"
@@ -1288,14 +1286,14 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   那条路径"**——按"谁 retain 了它"反查消费点（这里是 emit_closure_record 的
   retain_target），别只盯着 new。
 
-- **extern string 不只不能释放，也不能下标（A347，2026-09-23）**：
+- **extern string 不只不能释放，也不能下标（A347）**：
   `DllImport` 返回的串（如 crt `calloc`）无长度元数据，字符串下标守卫
   对它按 0 界处理——任何读写都报 "string index out of bounds"。收发
   缓冲必须用 `byte[]`（真驱动 recvExact 的形态）；`byte[]` 实参可隐式
   传给 `string` 形参且带真实长度。测试手搓 `Fake.calloc` 字符串缓冲层
   让 firebird_wire/sqlserver_tds 全红，后者还因假服务协程崩在守卫上
   表现为客户端挂死超时——**"超时"先看协程是否早崩**。
-## 数组字面量初始化循环必须走 ARC retain 协议（2026-09-13 已修）
+## 数组字面量初始化循环必须走 ARC retain 协议（已修）
 
 - `new T[]{a, b}` 与定长 `new T[n] {...}` 的元素初始化循环原先只
   `LLVMBuildStore` 不 retain——元素是引用类型（string/类/委托）时数组槽里
@@ -1312,17 +1310,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   都必须复制这套判据**，判据散装手写会漏。conformance：
   tests/conformance/arr_lit_rc（存 two 元素字面量后再逐个比对）。
 
-## macOS 交叉编译与运行契约（ld64.lld / codesign / Cocoa 生命周期，2026-09-20）
+## macOS 交叉编译与运行契约（ld64.lld / codesign / Cocoa 生命周期）
 
 - **Apple Silicon 必须带 `-adhoc_codesign`**：macOS 11+ arm64 Mach-O 可执行文件若无 `LC_CODE_SIGNATURE`（即使未加开发者证书也必须有 ad-hoc 签名），XNU 内核在 `execve` 时会直接 `SIGKILL`（namespace `CODESIGNING`），现象为启动即闪退。`ld64.lld` 针对 macOS target 必须常开 `-adhoc_codesign`。
 - **GUI 兼容对象 `zanrt_gui.o` 仅在存在 GUI 驱动时链接**：CLI 程序不能无条件引入 `zanrt_gui.o`，否则会报 `_zan_gui_draw_text` / `_zan_gui_font_height` 等未定义符号错误。通过检查 `cross_dylibs` 是否包含 `zan_gui` 门控链接。
-- **macOS 退出事件与 Cocoa Delegate 契约**：Dock 右键 Quit / Cmd+Q 发送 `kAEQuitApplication` 走 AppKit `[NSApp terminate:]`。若 `NSApp.delegate` 为 nil 或未实现 `applicationShouldTerminate:`，AppKit 回退调用各窗口 `windowShouldClose:`；如果 `windowShouldClose:` 返回 `NO` 且未调用 `zan_gui_wake()`，终止过程被静默取消且事件泵继续挂起阻塞，造成“右键退出无法退出”。正确做法：
-  1. 为 `NSApp` 设置代理 `ZanDelegate`（实现 `applicationShouldTerminate:`），返回 `NSTerminateCancel` 并派发事件 8（Window Close）以及调用 `zan_gui_wake()`，让 Zan 运行时正常触发安全清理退出；
-  2. `windowShouldClose:` 中也必须调用 `zan_gui_wake()` 唤醒阻塞在 `nextEventMatchingMask:` 的事件泵；
+- **macOS 退出事件与 Cocoa Delegate 契约**：Dock 右键 Quit / Cmd+Q 发送 `kAEQuitApplication` 走 AppKit `[NSApp terminate:]`。若 `NSApp.delegate` 为 nil 或未实现 `applicationShouldTerminate:`，AppKit 回退调用各窗口 `windowShouldClose:`；如果 `windowShouldClose:` 返回 `NO` 且未调用 `zan_gui_wake`，终止过程被静默取消且事件泵继续挂起阻塞，造成“右键退出无法退出”。正确做法：
+  1. 为 `NSApp` 设置代理 `ZanDelegate`（实现 `applicationShouldTerminate:`），返回 `NSTerminateCancel` 并派发事件 8（Window Close）以及调用 `zan_gui_wake`，让 Zan 运行时正常触发安全清理退出；
+  2. `windowShouldClose:` 中也必须调用 `zan_gui_wake` 唤醒阻塞在 `nextEventMatchingMask:` 的事件泵；
   3. `zanrt_gui.o` 在运行时通过 ObjC 运行时动态注入/挂载上述 delegate，确保即使动态链接旧版 `libzan_gui.dylib` 也能生效。
 - **多开外层跳板必须声明 `LSUIElement`**：多开跳板外层 App 仅用于执行脚本 `open -n AppCore.app`，其 `Info.plist` 必须包含 `<key>LSUIElement</key><true/>`（即 `isLauncher=true`），否则外层进程执行脚本完毕退出时 Dock 图标闪烁后消失，容易被误认为崩溃闪退。
 
-## 字节串 ABI 契约（stdlib crypto EVP 换装踩坑，2026-09-10）
+## 字节串 ABI 契约（stdlib crypto EVP 换装踩坑）
 
 - **byte[] 按 string 形参传入时 `.Length` = strlen**：共享的是 payload
   指针，没有数组头，长度按 0x00 截断——Hex.Decode 产物首字节为 0 时
@@ -1364,7 +1362,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   ——`File.ReadAllText` 内部就是这样把 chunk 变字符串的。自检：`.Length` 等于
   字节数（BOM 是 3 不是 6），首字节是你想要的码值。
 
-## stdlib 按需拉入的词法级坑（2026-09-10 首版过滤；语义守门仍有效）
+## stdlib 按需拉入的词法级坑（首版过滤；语义守门仍有效）
 
 > 以前 `using Gui;` = 目录全量 glob + 传递 using 扫描到不动点，一个空窗口
 > 程序 parse 380 个文件、2.8s，且 stdlib 树里任何文件有语法错全体拖垮。
@@ -1379,10 +1377,10 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     锚点无条件拉入。识别形状是 `( this Type`——**Type 常是内建关键字
     token**（`this string s` 的 string 是 TK_STRING 不是 IDENT），只认
     IDENT 会漏掉所有内建类型扩展；`M(this.x)` / `M(this)` 是表达式不算。
-  - 方法名撞 stdlib 类名（用户方法 `Label()` vs `Gui.Widget.Label`）：
+  - 方法名撞 stdlib 类名（用户方法 `Label` vs `Gui.Widget.Label`）：
     种子阶段"点号链根是命名空间段"才把链上名字当拉入信号；类型体内
     `类型 + IDENT + (`/`{` 是方法/属性**声明**名，不标活。否则一个
-    `b.Label()` 级联拉进整个 Gui。
+    `b.Label` 级联拉进整个 Gui。
   - 泛型委托 `delegate T Mapper<T>(T x)` 的名字 = `<>` **外**最后一个
     IDENT；不跳泛型参数会把 "T" 铸成声明名，此后任何文件提到 T 全量
     级联。
@@ -1392,15 +1390,15 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **用户同名类遮蔽**：用户自己 `class App` 时未限定 `App` 永远解析到用户
   自己的，不拉 stdlib 同名文件。这是 stdlib 模板（App/Window/Button 全是
   常见词）不级联的关键。**这条与 C# 同规则**（`class Panel` + 裸
-  `Panel.Column()` → C# CS0117 / Zan `'Panel' has no member 'Column'`）。
-- **限定名逃逸（A312，2026-09-12 已修）——注释/SPEC 说的才是对的，但曾长期是死代码**：
+  `Panel.Column` → C# CS0117 / Zan `'Panel' has no member 'Column'`）。
+- **限定名逃逸（A312 已修）——注释/SPEC 说的才是对的，但曾长期是死代码**：
   `main.c` 与 `docs/SPEC.md:658` 都写「限定 `Gui.App` 仍拉」，A312 之前**不拉**，
   有两种坏法：① 无同名用户类时 `Gui.App a = null;` 报 `undefined type 'App'`
   （`Gui/App.zan` 被 `skip`；`ZAN_PULLIN_DEBUG=1` 可证，同程序
   `ZAN_NO_PULLIN_FILTER=1` 才编过）；② 有同名用户类时 `Gui.App` **静默改绑
-  到用户类**（`class App{ static string Marker()=>"USER-CLASS"; }` +
-  `Gui.App.Marker()` 编译并打印 `USER-CLASS`）。C# 恰恰**能**用
-  `Lib.Panel.Column()` 逃出遮蔽，所以当时是 Zan 独有的洞。
+  到用户类**（`class App{ static string Marker=>"USER-CLASS"; }` +
+  `Gui.App.Marker` 编译并打印 `USER-CLASS`）。C# 恰恰**能**用
+  `Lib.Panel.Column` 逃出遮蔽，所以当时是 Zan 独有的洞。
   - **根因（两处清空，缺一不可）**：seed 的 `chain` 在设置它的**同一轮**被
     清两次——`default:` 分支在**点号本身**清（`TK_DOT` 落到 default），
     switch 后置守卫又在**起始 IDENT 本身**清（`tok.kind != TK_DOT`）。
@@ -1415,13 +1413,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     `Collections`/`Generic`/`System`/`Gui` 这类段名（grep 确认 0 个），
     传递拉入无处落脚。改 `ns_root` 相关逻辑前先重跑这个检查。
   - 判别性探针：**必须让用户类带一个 stdlib 类没有的成员**，再去调
-    `Gui.App.Marker()`。原 `pullin_qualified_escape` 只写
+    `Gui.App.Marker`。原 `pullin_qualified_escape` 只写
     `Gui.App a = null; a == null`，改绑与正确解析**输出同为 `true`**，用例
     恒真（vacuous）——这类"输出与错误行为同值"的断言是假绿，写 conformance
     时先问一句"改绑/漏解析会不会也通过"。已改成
-    `App.Tag()` + `Gui.App.ISqrt(9)`（输出 `user-app`/`3`），并补
+    `App.Tag` + `Gui.App.ISqrt(9)`（输出 `user-app`/`3`），并补
     `pullin_qualified_pull`（无同名类、只有限定提及）覆盖另一半。
-- **子进程 stdout 是 `--emit-ir` 的私有通道（A313，2026-09-12 已修）**：编译器
+- **子进程 stdout 是 `--emit-ir` 的私有通道（A313 已修）**：编译器
   会**自己调自己**去编译代码生成器（`genrun.c:zan_gen_ensure`），而
   `zan_spawn_wait` 刻意让子进程继承 stdout（注释说"diagnostics pass through"）。
   于是子编译的人类进度行 `Compiled 31 files ? '…ZanGen_<hash>_<pid>.exe'`
@@ -1450,7 +1448,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     --emit-ir` 连跑两次比 md5。HEAD stdlib 上两次 rc=0 且 md5 相同即证明与
     本修无关。同理，`ctest` 大面积红先看有没有**别的会话在跑 ctest/构建**
     （共用 `build\zanc.exe` 与 `conf_*.exe`），隔离重跑一遍再下结论。
-- **A/B 两个 zanc 二进制时 stdlib 根跟着 exe 走（2026-09-13 实测大坑）**：
+- **A/B 两个 zanc 二进制时 stdlib 根跟着 exe 走（实测大坑）**：
   `--auto-stdlib` 按**编译器 exe 所在目录**找 stdlib（main.c:2951）——
   worktree/副本里构建的 zanc 会静默用它自己那份冻结 stdlib；此时脚本若又
   显式喂主树 stdlib 文件，同一文件两个根各注册一次，全局类型集体报
@@ -1471,7 +1469,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   GuiHost→App/Style/Fx 的活代码闭包 + Zan 运行时，与 unused 无关。
 - stdlib 文件引用跨命名空间类型必须写 using（ChartHost 曾裸写 `App`，
   靠用户程序恰好也有 `class App` 才碰巧编译——prune 把它藏成了哑弹）。
-- **（已闭，2026-09-13）极小 seed 曾报 `cannot convert 'CellOf' to
+- **（已闭）极小 seed 曾报 `cannot convert 'CellOf' to
   'CellOf'`**（同名类型两份解析，Transfer/DataGrid delegate 声明面）。
   当时的诊断 heuristic 仍有效：**同名类型互斥转换先怀疑闭包裁剪，不是
   代码错**。现在的 HEAD 复现不出（6 形态 × 2 拉入模式全绿；台账行号
@@ -1483,7 +1481,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - C# 形态的 lambda 捕获的是**变量**：只要某个声明被 lambda 真正引用，声明方和
   所有 closure 都必须读写同一个 heap cell；即使 lambda 只读，创建 closure 后的
   外层赋值也必须可见。旧的“只读捕获按创建时快照、只有 lambda 写入才装箱”规则
-  已被共享捕获 oracle 推翻；它会让 `int n=1; Read r=()=>n; n=42; r()` 错误返回 1。
+  已被共享捕获 oracle 推翻；它会让 `int n=1; Read r==>n; n=42; r` 错误返回 1。
 - 判断捕获必须按**声明身份 + 词法作用域**，不能只按名字：lambda 参数、lambda
   局部、for/foreach/query/catch/switch pattern 变量的同名遮蔽只在自己的作用域内
   生效，退出后 sibling lambda 仍应能捕获外层声明。廉价 name-only 扫描只能当候选
@@ -1507,7 +1505,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   可能是你引入的——那些阶段在你的改动之前跑。
 - **陈旧产物导致的挂起/超时**：`tests/run_case.cmake` 只在 exe 不存在、或比 `.zan` 源旧、或比
   `-DSTDLIB_STAMP` 旧时才重编；而 `STDLIB_STAMP` 由**调用方**传入——glob 出来的
-  conformance 用例传了它，**gui 段的 `add_test()` 没传**，所以 gui 用例从不因
+  conformance 用例传了它，**gui 段的 `add_test` 没传**，所以 gui 用例从不因
   stdlib 变化而重编（下面那条 10 分钟挂死就是它的代价）。别的会话在你上次跑之后改了
   stdlib，ctest 仍会复用旧的 `build/conf_*.exe`，于是出现"单跑必挂、手编必过"
   的怪象（本次 `conformance_gui_listview_scrollbar_drag` 挂死在 5:09 的中间态
@@ -1520,7 +1518,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   全部过期，逐条归因毫无意义；判据是 `ls -l build/zanc.exe` 的 mtime 落在你的运行
   区间内 → 整档作废重跑。
 
-## 编译期大型工程内存暴增治理（A-MEM1/2/3 经验定式，2026-09-29）
+## 编译期大型工程内存暴增治理（A-MEM1/2/3 经验定式）
 
 - **代码生成与元数据导出三阶治理（A-MEM3）**：
   - **触发检测前置（AST Fast-Check）**：元数据导出极其昂贵，在导出前必须先做 AST 浅层特征扫描（`zan_gen_ast_triggered`），无 `Json.Serialize`/ORM 实体/Controller 路由的项目直接返回 0，彻底避免分配兆字节元数据 JSON。
@@ -1543,17 +1541,17 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
     - **协程工作线程默认上限**：在 16/32/64 核高配机器上，`co_worker_count` 默认回退如果盲目使用 CPU 核数，会为每个工作线程创建 1MB 物理栈并产生数十个闲置线程，单是线程栈与锁竞争就膨胀数十兆内存。在无 `ZAN_CO_WORKERS` 显式配置时，协程工作线程应默认上限设为 `min(CPU, 4)`，兼顾吞吐与极低内存底噪。
   - **标准库命名空间规范**：Zan 语言的标准库 GUI 库命名空间为 `using Gui;`，不存在 `using Zan.Gui` 或 `using Zan.Core;`。若用户代码误写，auto-stdlib 会将其当作第三方扩展包拉取并在找不到时报告 `ZANPKG_MISSING namespace=Zan/Gui`，最终因命名空间未定义在语义检查阶段报错。
   - **跨分片调用与数据布局**：分片间调用通过标准 external declare 降阶，全局变量按只读可复制（TRAVEL）与外部声明（DECL）清晰判定，带引号的 LLVM 结构体名（`%"..."`）必须在分片中完整导出对应类型声明，避免 Parse 失败；最终由 `lld-link` 将各分片 `.o` 统一链接。
-  - **AST arena 早释放的收益边界与事实快照化（A-MEM5，2026-09-29）**：
+  - **AST arena 早释放的收益边界与事实快照化（A-MEM5）**：
     - **峰值窗口铁律：峰值 = irgen 完成那一刻，不是 manifest**。732 文件 OnePlus 实测（`ZAN_PROBE_MEM` 逐阶段 Commit/Peak/Arena 采样）：irgen 结束时 Commit 1,101 MB / Peak 1,112 MB——此刻 LLVM module（~885 MB）与 AST arena（215 MB）**必然共存**（函数体边发射边消费 AST，arena 无法部分释放）；早释放只能削掉释放点之后的驻留，动不了共存窗口本身。
     - **早释放的真实收益是后期驻留**：AST 释放上移到 manifest 之前后，manifest 阶段 Commit 1,111→895 MB（-216 MB），25 分钟 shard emit 窗口驻留 1,007~1,023→886~897 MB（约 -120 MB），全进程 Peak 1,117→1,112 MB（-5 MB，只是 manifest 自身超冲）。把释放点提前**不等于**峰值下降——峰值在释放点之前就已定型，验收别只盯 Peak 数字。
     - **后期读者必须事实快照化**：arena 释放后所有悬空读者逐一排查过（shard/optimizer/write_obj/write_ir 零 AST 访问；`mf_is_spec` 只比 LLVMValueRef）。唯一回读点 `mf_is_virtual_dispatch` 读 `sym->decl->method_decl.modifiers`——symbol 本身也分配在 AST arena（`make_symbol(b->arena,...)`），整个指针都悬空。修法：`zan_fn_entry` 加 `uint32_t modifiers`，`irgen_register_function`（唯一注册点）在 emit 时快照 `sym->modifiers`（bind 时已从 AST 拷贝的位副本），manifest 改读快照。**泛型 spec 不走 functions[]**（走 `generic_fns[]`，manifest 用 `mf_is_spec` 按 LLVMValueRef 判定），快照面恰好闭合。
     - **手工 A/B 编译器二进制时 exe 同目录发现面陷阱**：worktree zanc 的包发现/exe 兄弟目录规则与主树一致，跑 OnePlus 这类外部项目无碍；但 A/B 对比产物字节级 diff 时 COFF 时间戳每次不同，比尺寸+运行行为，别比字节。
-  - **后端 LLVM 早释放与分片单趟索引提取（A-MEM6，2026-09-30）**：
+  - **后端 LLVM 早释放与分片单趟索引提取（A-MEM6）**：
     - **write_obj 后即刻释放 LLVM backend 状态（`zan_irgen_release_llvm`）**：在目标文件写出（`zan_irgen_write_obj`）完成后，链接开始之前，LLVM module、builder 及相关大型映射表（functions、fn_index、struct_types、literals 等）已完成历史使命。此时调用 `zan_irgen_release_llvm` 销毁 module 与相关内存，在进入链接阶段前归还约 400 MB 物理提交（OnePlus 732 文件实测：free llvm 阶段 Commit 瞬间从 846 MB 降至 447 MB）。
     - **分片阶段单趟全模块流式导出与哈希索引切片**：
       - **病灶机理**：逐函数调用 `LLVMPrintValueToString` 会让 LLVM 为每个函数重复扫描全模块以构建 `SlotTracker`，在 8,900+ 函数的大项目中形成 $O(N \times \text{ModuleSize})$ 平方级耗时（分片发射耗时高达 25~30 分钟），且 `LLVMPrintModuleToString` 内存字符串又会因倍增分配产生虚假内存峰值。
       - **定式解法**：在 shard 循环开始前，通过 `LLVMPrintModuleToFile` 将当前 module 一次性写入临时文件，通过 `fopen`/`fread` 读入后构建 `sh_body_index_t` 开地址哈希索引（单趟扫描 `define ` 与 `}` 定界），每个待分片函数在常数时间 $O(1)$ 获取其在只读缓冲区中的起始指针与字节长度（`sh_body_slice_t`），零字符串二次分配直接组装进 fragment。所有分片处理完毕后立即释放索引、缓冲区并物理删除临时 `.ll` 文件。分片发射效率从数十分钟降至数十秒，且峰值与内存完全可控。
-    - **分片组装与发射两阶段解耦（A-MEM7，2026-09-30）**：
+    - **分片组装与发射两阶段解耦（A-MEM7）**：
       - **病灶机理**：若分片组装（基于 body_index 拼接 fragment）与分片发射（`LLVMParseIRInContext` + `LLVMTargetMachineEmitToFile`）交织在同一个循环内，全模块文本缓冲区（~150MB）与索引必须在所有分片发射期间全程驻留。当单个 Shard 解析与后端代码生成时，coordinator 模块（~885MB）、文本缓冲区（~150MB）、shard module 与 codegen 工作集（~150MB）三者叠加，导致发射期间内存 Commit 达 1,166 MB、峰值冲高至 1,251 MB。
       - **定式解法**：将分片拆为「Pass 2a 全量组装写出分片 fragment」与「Pass 2b 独立发射目标文件」两阶段。Pass 2a 仅负责遍历索引组装各分片 IR 文本并流式落盘为 `.frag.ll` 临时文件；Pass 2a 结束后立即彻底释放全模块文本缓冲区（`free(ll_buf)`）与哈希索引（`sh_free_body_index`），并删除临时全模块 `.ll`。进入 Pass 2b 后，单分片按需读入仅 3~4MB 的 fragment 进行独立解析与代码生成，发射完毕即刻删除 `.frag.ll`。
       - **实测证明**：OnePlus 733 文件全量 publish 实测：Shard 0 发射前 Commit 从 1,166 MB 直降至 938 MB（净降 228 MB），全阶段 Shard 驻留稳定在 1,010 MB 左右，彻底消除了 1,251 MB 的次级峰值尖峰。
@@ -1561,19 +1559,19 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
       - 实测证明：链接阶段（`link`）在 732 文件项目下仅耗时 294 ms，且内存 Commit 维持在 447 MB，链接本身绝非内存与耗时瓶颈；
       - 真正耗时与驻留的大头在于 LLVM 优化与目标文件写出（`write obj` 耗时约 10 秒，驻留 846 MB），早释放策略精准切断了 LLVM 模块对链接窗口的内存压迫。
 
-## 企业级数据库与大数据量流式传输定式（2026-10-01）
+## 企业级数据库与大数据量流式传输定式
 
-- **连接池 OpenOne 异常封装与槽位释放**：各数据库连接池（`DbPool`、`MySqlPool`、`PgPool`、`SqlServerPool`、`FirebirdPool`、`TDenginePool`）在 `TryReserve()` 预留连接槽位后执行 `OpenOne()`。若 `OpenOne()` 抛出异常（网络中断、认证失败、DNS 解析错误等），异常直接向上冒泡会导致预留的 `liveCount` 槽位无法归还（未调用 `UndoReserve()`），导致连接池假满并永久拒绝/挂起后续请求。最佳实践：在 `OpenOne()` 内部通过 `try ... catch (Exception ex) { return null; }` 捕获异常，外部 `AcquireAsync()` 即可安全走到 `if (opened == null || !opened.IsConnected()) { core.NoteOpenFailed(); core.UndoReserve(); return null; }`，槽位精准归还且协程主路径免于 landing pad 性能抖动与时序踩踏。
-- **DbResult / DbRow 按需空值（On-demand NULL tracking）**：无 SQL NULL 记录行不应为每行无条件分配 `new List<bool>()`，高并发与十万行大表下这会产生大量小对象堆分配。改为默认 `null`，仅在第一次扫描到真实 NULL 列时分配并向前补足 `false`，非 NULL 记录走轻量 `AddRow(row)`，在 `IsNull` 处判空快速返回 `false`。
+- **连接池 OpenOne 异常封装与槽位释放**：各数据库连接池（`DbPool`、`MySqlPool`、`PgPool`、`SqlServerPool`、`FirebirdPool`、`TDenginePool`）在 `TryReserve` 预留连接槽位后执行 `OpenOne`。若 `OpenOne` 抛出异常（网络中断、认证失败、DNS 解析错误等），异常直接向上冒泡会导致预留的 `liveCount` 槽位无法归还（未调用 `UndoReserve`），导致连接池假满并永久拒绝/挂起后续请求。最佳实践：在 `OpenOne` 内部通过 `try ... catch (Exception ex) { return null; }` 捕获异常，外部 `AcquireAsync` 即可安全走到 `if (opened == null || !opened.IsConnected) { core.NoteOpenFailed; core.UndoReserve; return null; }`，槽位精准归还且协程主路径免于 landing pad 性能抖动与时序踩踏。
+- **DbResult / DbRow 按需空值（On-demand NULL tracking）**：无 SQL NULL 记录行不应为每行无条件分配 `new List<bool>`，高并发与十万行大表下这会产生大量小对象堆分配。改为默认 `null`，仅在第一次扫描到真实 NULL 列时分配并向前补足 `false`，非 NULL 记录走轻量 `AddRow(row)`，在 `IsNull` 处判空快速返回 `false`。
 - **ORM 方言分页与无分页保护（`OrmSelect` / `QueryBuilder`）**：SQL Server 和 Oracle 使用 `OFFSET m ROWS FETCH NEXT n ROWS ONLY` 语法，且严格要求 `ORDER BY`。若未做方言分支或对无分页查询盲目追加 `OFFSET 0 ROWS`，不仅破坏非分页查询的语义，还会因缺少排序列报错；`BuildDto` 等投影查询也必须统一接入方言分页，避免标准 `LIMIT/OFFSET` 语法在 SQL Server 等引擎上抛语法错误。
 - **XLSX 大数据量流式生成与块缓冲**：大表导出禁止一次性把所有行对象保存在内存（`rows` 列表），通过 `ZipWriter.BeginEntry/WriteData/EndEntry` 配合适度大小的 `StringBuilder` 块缓冲区（如 64KB）逐行渲染与批量输出，内存占用与总导出数据量解耦，实现近恒定常数级内存开销。
 - **ORM 超大批量写入参数上限与自动分批（`OrmInsert`）**：各 SQL 数据库对 Prepared Statement 参数个数具有硬性上限（SQL Server 上限 2,100，SQLite 上限 999，MySQL/PostgreSQL 上限 65,535）。当批量插入上千甚至上万行数据时，单条巨大的 SQL 不仅引发数据库参数超限崩溃，还会在堆上瞬间分配数十兆的 StringBuilder 与 DbParams 引起 GC 卡顿。解法：在 `OrmInsert` 引入 `safeBatchRows(colCount)` 动态计算单批次安全行数（如 SQLite 500/N，SQL Server 1000/N，默认 1000/N，上限 500 行），并在 `ExecuteAffrows` / `ExecuteAffrowsAsync`（实体行与字典行双通道）自动按批次范围（`BuildRowsRange`/`BuildDictsRange`）执行与累加行数，内存与参数严格恒定在安全阈值内。
 - **ORM 写入字段名元数据严格校验**：`OrmUpdate.SetI/SetL/SetD/SetS/SetB/SetIncr*` 以及 `OrmInsert.Only/Skip/OC/ACC/GMX/GMN` 必须经 `this.meta.Require(c)` 或 `RequireCol(c)` 校验，剥除可选的 `t.` 前缀并检查实体字段元数据，未知列或非法注入片段抛异常，杜绝直接拼接裸列名进 SQL 文本。
-- **MqttBroker 规避代码生成器 Json.Serialize<T> 循环依赖**：`MqttBroker` 位于网络核心服务路径，管理快照（`ClientsJson`/`ClientDetailJson`/`SubscriptionsJson`/`TopicsJson`/`MetricsJson`）统一改用标准库原生 `JsonValue` 组树（`NewObject`/`NewArray`/`NewStr`/`NewInt`/`arr.items.Add`/`ToJson()`），彻底打破在编译器子进程 `--no-gen` 模式下的序列化降层依赖；测试与退出时显式调用 `WorkerMqtt.Uninstall()`（解除 `Worker.mqttEntry` 并执行 `MqttBroker.TeardownGlobal()`），确保 leakcheck 零保持根干净退出。
-- **Redis 64位整型与RESP批量键值操作（`RedisReply` / `RedisClient`）**：RESP协议的整数回复（`:12345678901234\r\n`）与自增计数（INCRBY、分布式计数器、雪花ID、时间戳）常远超32位有符号整型上限（21亿），若直接按32位int解析将发生静默溢出。解法：在`RedisReply`升级引入64位长整型`integer64`与`AsLong()`，并增补`Incr64Async`、`IncrByAsync`、`Decr64Async`、`DecrByAsync`；在大数据量键值读写场景下，单key循环请求导致严重的网络RTT往返空耗，补齐`MGetAsync`、`MSetAsync`与`DelMultipleAsync`原生RESP批量管道操作。
+- **MqttBroker 规避代码生成器 Json.Serialize<T> 循环依赖**：`MqttBroker` 位于网络核心服务路径，管理快照（`ClientsJson`/`ClientDetailJson`/`SubscriptionsJson`/`TopicsJson`/`MetricsJson`）统一改用标准库原生 `JsonValue` 组树（`NewObject`/`NewArray`/`NewStr`/`NewInt`/`arr.items.Add`/`ToJson`），彻底打破在编译器子进程 `--no-gen` 模式下的序列化降层依赖；测试与退出时显式调用 `WorkerMqtt.Uninstall`（解除 `Worker.mqttEntry` 并执行 `MqttBroker.TeardownGlobal`），确保 leakcheck 零保持根干净退出。
+- **Redis 64位整型与RESP批量键值操作（`RedisReply` / `RedisClient`）**：RESP协议的整数回复（`:12345678901234\r\n`）与自增计数（INCRBY、分布式计数器、雪花ID、时间戳）常远超32位有符号整型上限（21亿），若直接按32位int解析将发生静默溢出。解法：在`RedisReply`升级引入64位长整型`integer64`与`AsLong`，并增补`Incr64Async`、`IncrByAsync`、`Decr64Async`、`DecrByAsync`；在大数据量键值读写场景下，单key循环请求导致严重的网络RTT往返空耗，补齐`MGetAsync`、`MSetAsync`与`DelMultipleAsync`原生RESP批量管道操作。
 - **DbResult 零拷贝行实体读取（`DbRow` / `DbResult.RowAt`）**：传统`DbResult.GetRow(i)`在遍历每一行时均创建新的`List<string>`副本并拷贝字段，在十万行级大结果集下产生十万次多余的列表堆分配与GC压力。在`DbRow`上直接提供`GetString`、`GetInt`、`GetLong`、`GetDouble`、`GetBool`与`IsNull`访问器，并在`DbResult`提供`RowAt(index)`返回只读行引用，消除行克隆分配。
-- **SQLite驱动行解码按需空值实例化与ZanDb块缓存锁生命周期安全（`SqliteConnection` / `BlockCache`）**：全套关系型数据库驱动中，`SqliteConnection` 的 `Query` 与 `QueryAsync` 亦应严格遵循按需空值定式，在扫描到首个 SQLITE_NULL 时才懒分配布尔列表，常规无 NULL 行直接通过 `AddRow` 入结果集，消除桌面端与单测中十万行级无 NULL 数据的堆分配浪费；嵌入式数据库 `BlockCache` 增补 `Close()` 幂等防御与销毁后操作短路拦截，`Release` 增补对 `pin == null` 的空安全防护，杜绝异常中断分支中的悬空解引用。
-- **StringBuilder.Clear 内建指令与 CSV 解析就地复用（`StringBuilder.Clear` / `Csv.ParseSep` / `Segment.Lookup`）**：在编译器底层补齐 `StringBuilder.Clear()` 原生指令（count 置零并终结 NUL），消除循环流式拼接时反复 `new StringBuilder` 的堆分配；`Csv.ParseSep` 接入 `field.Clear()` 与 `field.Length > 0` 长度直读，消除大 CSV 解析十万级单元格时小对象风暴；`Segment.Lookup` 增补缓存关闭或满员时的安全降级直读，`ScanRow.ValPtr` 补齐空指针防御，确保嵌入式内核健壮性。
+- **SQLite驱动行解码按需空值实例化与ZanDb块缓存锁生命周期安全（`SqliteConnection` / `BlockCache`）**：全套关系型数据库驱动中，`SqliteConnection` 的 `Query` 与 `QueryAsync` 亦应严格遵循按需空值定式，在扫描到首个 SQLITE_NULL 时才懒分配布尔列表，常规无 NULL 行直接通过 `AddRow` 入结果集，消除桌面端与单测中十万行级无 NULL 数据的堆分配浪费；嵌入式数据库 `BlockCache` 增补 `Close` 幂等防御与销毁后操作短路拦截，`Release` 增补对 `pin == null` 的空安全防护，杜绝异常中断分支中的悬空解引用。
+- **StringBuilder.Clear 内建指令与 CSV 解析就地复用（`StringBuilder.Clear` / `Csv.ParseSep` / `Segment.Lookup`）**：在编译器底层补齐 `StringBuilder.Clear` 原生指令（count 置零并终结 NUL），消除循环流式拼接时反复 `new StringBuilder` 的堆分配；`Csv.ParseSep` 接入 `field.Clear` 与 `field.Length > 0` 长度直读，消除大 CSV 解析十万级单元格时小对象风暴；`Segment.Lookup` 增补缓存关闭或满员时的安全降级直读，`ScanRow.ValPtr` 补齐空指针防御，确保嵌入式内核健壮性。
 
 
 
@@ -1583,7 +1581,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   Gui 车道在途改动；`conformance_http_client_keepalive` 则是全量并行 120s 超时、
   单跑 0.5s 过，属端口竞争）。并行档的超时值一律先单跑复核。
 
-## 协程挂起点与完成尾部单例指令收敛（2026-10-09，B-ID119 优化收敛）
+## 协程挂起点与完成尾部单例指令收敛（优化收敛）
 
 - **挂起点内联 bitcast/GEP 冗余消除**：在 `Gate.Park` 与 `Socket.ReadReady`/`Socket.WriteReady` 等内建挂起点中，原先每次就地发射 `LLVMBuildBitCast(g->builder, selfframe, di8ptr, "self")` 与 `LLVMBuildStructGEP2(..., ASYNC_FRAME_STATE, "self.state")`。通过统一收敛至 `get_async_self_i8(g)` 与 `get_async_state_ptr(g)`，消除了重复的指针类型转换与结构体偏移计算。
 - **协程完成尾部指令复用（`emit_async_complete_epilogue`）**：在协程正常完成与取消完成汇聚的 `co.complete` 尾部基本块中，原先再次对 frame 发射独立的 `fr.i8` bitcast、`fr.result` GEP、`fr.state` GEP 以及 `fr.jc` bitcast。重构为复用 entry 前导块单例缓存 `get_async_self_i8(g)`、`get_async_result_ptr(g)` 与 `get_async_state_ptr(g)`，使整个协程方法生命周期内的帧基础指针与状态/结果指针实现 $O(1)$ 指令发射共享，进一步压缩 IR 指令数量与基本块拓扑。
@@ -1666,7 +1664,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   JS **零改动**（memory 仍是模块导出，不用 --import-memory）。增长越界会
   trap，所以上界别贴着单次测得值给，留一个量级余量。
 - **wasm 冒烟在 node 跑**：`WebAssembly.instantiate(bytes,
-  {wasi_snapshot_preview1: Proxy})` + `ZanWASI(fsBackend, out).attach()`，
+  {wasi_snapshot_preview1: Proxy})` + `ZanWASI(fsBackend, out).attach`，
   fsBackend 要有 statSync/readFileSync/writeFileSync（缺 writeFileSync 时
   path_open 创建文件会静默失败，别误判成编译问题——tests/wasm32 的断言本
   是"编译+链接"，端到端跑通要自备内存 fs）。
@@ -1691,7 +1689,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **async 未捕获 die 块具名**（irgen_async.c `emit_eh_rethrow_current`）：
   原来只打裸行 "Unhandled exception"，设备控制台上没法归因。现在字符串
   载荷直打消息、类异常经 tid-name 注册表打类名、无异常在飞维持裸行，与
-  同步 die 块对齐。探针：`await Boom()` 无 try 时打
+  同步 die 块对齐。探针：`await Boom` 无 try 时打
   `Unhandled exception: string-payload` / `Unhandled exception: Spark`
   并 exit 1；conformance 无金样期待裸行（exc_uncaught_name 走 catch 路径）。
 - **并行会话下的选择性提交**：工作树文件 = HEAD + 我的 hunk + 别人在途
@@ -1742,8 +1740,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （物理或 2x，清晰且比例正确）；裸 Gui 程序无缩放层，喂高分辨率会把逻辑
   尺寸控件缩成 1/dpr，必须喂逻辑分辨率。
 - **devtools sim 会整体僵尸**：工程窗/控制台看似正常但 gamePage 不再
-  编译启动，跨进程冷启、WeappCache、webview 缓存清理均不愈（2026-09-13
-  实测 3 次冷启无效）；判断真假启动的唯一可靠信号是**程序写出的日志文件
+  编译启动，跨进程冷启、WeappCache、webview 缓存清理均不愈（实测 3 次冷启无效）；判断真假启动的唯一可靠信号是**程序写出的日志文件
   mtime**——控制台回显/旧内容会被误读成新 boot。真机预览编译是独立管线，
   不受 sim 僵尸影响。
 - **游戏模板实测 + 字体注入**：ddz 卡牌模板 wasm 8.8MB 在 wx worker 壳里
@@ -1765,7 +1762,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   正确顺序：先 `replace(CRLF, LF)` 归一化 → 改内容 → 要保 CRLF 再整体重放；
   验证靠 `git diff --numstat`：增删行数应等于你实际改的行数（本轮 2/2 才对）。
 - **工具传输会把双反斜杠折叠成单反斜杠**：替换片段里想要两个反斜杠，到执行时可能
-  只剩一个，于是 old == new、`str.replace()` 静默 no-op——脚本照样打印 "patched 5"，
+  只剩一个，于是 old == new、`str.replace` 静默 no-op——脚本照样打印 "patched 5"，
   文件一个字节没变。含反斜杠/引号的替换一律用 `chr(92)` / `chr(34)` 在脚本里
   拼，写后做两件事：**md5 前后对比**、**断言 old 计数归零**。
 - **不止双反斜杠：\r / \n 这类同样会被折成真的 CR / LF**（本轮两处：
@@ -1778,7 +1775,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `tests/gui/datatable_sparse_page_test.zan` 的 `new SparseSource(pageSize)`
   （基类 `SparseServerDataSource(int)` 有 1 参 ctor、派生类没声明 ctor）由「悄悄
   丢参」变成编译错。**Zan 不做 ctor 向基类转发**（探针 `ctor_inh1/2.zan`：
-  `new Derived()` 编过但基类 ctor 不执行、字段保持 0；`new Derived(5)` 在修复后报
+  `new Derived` 编过但基类 ctor 不执行、字段保持 0；`new Derived(5)` 在修复后报
   "no constructor of 'Derived2' accepts 1 argument"），这类调用点本就该写无参构造 +
   `Setup(...)`。改这类语义前先全档编译，连带修调用点，别把诊断再放回去。
 
@@ -1798,7 +1795,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   文件按锚切片、原样拼进基线**（find 定位 + 下标切），零转义零风险；
   写完断言 count==1/块内标记存在，再 md5 前后对比。
 
-## Windows 路径通配符与 C++ COM 运行时解耦（2026-09-18）
+## Windows 路径通配符与 C++ COM 运行时解耦
 
 - **Win32 FindFirstFileW 遇到混合斜杠在通配符下报 ERROR_FILE_NOT_FOUND (2)**：
   在 Windows 下拼接通配符路径（如 `D:\project\stdlib/Gui/icons\\*`）时，若路径前段含有正斜杠 `/`，
@@ -1812,7 +1809,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   ② 编译参数必须强制带 `-fno-exceptions -fno-rtti`；
   实现 100% 零 C++ 运行时依赖的 pure COM 胶水，无缝打包进 C/GNU 目标库。
 
-## 解析器别丢 token 原文本：格式化输出 ≠ 无损（A295，2026-09-11 已修）
+## 解析器别丢 token 原文本：格式化输出 ≠ 无损（A295 已修）
 
 - 场景：`JsonValue.ParseNumberToken` 为性能把「含 . / e 的数字」直接转 double 且不存原文本，
   `AsString`/`ToJson` 回落到 `Convert.ToString(numD)`。后果不是「格式不同」而是**语义错误**：
@@ -1835,7 +1832,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （停在 stream-progressive 的 4 行 / 11 行但内容错 / 全空），**全部 rc=0**；线索是用例的
   upstream 只 accept 2 个连接，转发器一旦复用连接就停在 accept 上，Main 的下一个 await 永不 resume。
 
-## async × 异常：unwind mark 是每个 handler 的义务，漏一个就殃及全部帧（A293，2026-09-11 已修）
+## async × 异常：unwind mark 是每个 handler 的义务，漏一个就殃及全部帧（A293 已修）
 
 - 症状：async 方法内**嵌套的非 async 函数** throw、由 awaiter catch 后，awaiter 的
   所有局部 NULL/0。最小红案：嵌套 sync throw + root catch + 一个 string 局部。
@@ -1853,7 +1850,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   加进 EH 机制时，把「arm 三件套」写成一个小 helper（top++、写 mark、setjmp），
   别让三步散在三处。
 
-## 拉入闭包的链扫描：一个变量被两处清空 = 镜像全死（A300，2026-09-11 已修）
+## 拉入闭包的链扫描：一个变量被两处清空 = 镜像全死（A300 已修）
 
 - 症状：`await Task.WhenAll(...)` 编不过（TaskJoin 拉不进来），但**没有 namespace 的
   同款用例能过**、显式拼 `TaskJoin.X` 也能过——「形状相关」的假象差点把人引向
@@ -1869,7 +1866,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - 插桩小坑：往 C 源里加 `\n` 的 fprintf 时，工具传输会把 `\\n` 折成真换行直接
   咬断字符串字面量（本轮踩中，编译错误 expected expression 才发现）；写完先看 repr。
 
-## longjmp 落地沿的 SSA 不可信：-O2 会把 catch/展开路径的槽读折叠成 undef（A300②③，2026-09-15 已修）
+## longjmp 落地沿的 SSA 不可信：-O2 会把 catch/展开路径的槽读折叠成 undef（A300②③ 已修）
 
 - **机制**：setjmp/longjmp EH 的落地块（async `$resume` 的 `co.exc`/`eh.land`、
   try 的 `try.rearm`/`try.rearm.init`）不是 CFG 边——控制从**函数外**重新进入。
@@ -1887,7 +1884,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   **别用 `emit_async_reload_slots`（从堆帧 reload）**：A293 契约是同调用 throw
   落地时栈槽比帧新（after-await），reload 会把帧里的旧值盖回来
   （async_throw_across_frames 当场变红）。
-- **残留洞（A320，2026-09-17 已修）**：A300 的入口 null-init 只盖了预登记
+- **残留洞（A320 已修）**：A300 的入口 null-init 只盖了预登记
   alocal/参数槽；**语句级声明走 `emit_entry_alloca` 的指针槽没有 init**。
   「声明点在 await 之后」的 owned 局部（典型：ORM 动作里第二个查询的结果
   局部）在 resume 的 co.exc 清理里 `load alloca; release_dyn` → -Os 折成
@@ -1916,7 +1913,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （"未定义槽值"）不同：是**强制内联打破 ARC/EH 所有权**，释放的是已释放
   对象，见下节。
 
-## -Os 强制内联打破 ARC/EH 槽位所有权：打内联标记=改写所有权（A318 已修，2026-09-16）
+## -Os 强制内联打破 ARC/EH 槽位所有权：打内联标记=改写所有权（A318 已修）
 
 - **症状**：publish(-Os) 秒崩 0xC0000005 @ `release_dyn+0x19`，dev(-O0) 稳定；
   "没改源码也崩"——毒路径由内联器选择，与业务改动无关（IDE 启动即做 HTTP
@@ -1951,13 +1948,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 ## leakcheck「仍可达」与停服排水（A302，未修）
 
 - Zan 的 leakcheck 对**仍可达**对象也报红（不区分丢失/仍被持有）。服务端对象
-  （listener、连接、池）在 Stop() 后需要泵协程自然走完（accept 返回 -1、EOF 关链路）
+  （listener、连接、池）在 Stop 后需要泵协程自然走完（accept 返回 -1、EOF 关链路）
   才不可达；测试里的固定排水（20x10ms）在负载下可能不够，`rc=0` 但 leakcheck 记红。
 - 判据：leak 行全指向服务端对象分配点、主输出全对 → 停服排水不足或 Stop 语义不
   可等待，不是真泄漏。修法方向：Stop 返回可等待句柄（服务端 join 自己的泵），
   而不是让每个用例猜排水时长。
 
-## reactor 关 fd 必须"先摘注册后 close"，且 Windows 上探针证不出差异（A291⑤，2026-09-12 已修）
+## reactor 关 fd 必须"先摘注册后 close"，且 Windows 上探针证不出差异（A291⑤ 已修）
 
 - rt_io 的等待者表按 fd 号索引（epoll/kqueue 槽位、select 链表都一样），close 后
   OS 会把同一个 fd 号立刻复用给新连接：老 waiter 还挂在表里，新连接一有活动就被
@@ -1976,7 +1973,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   声明成 Socket 的私有静态 extern，在 Close 这类单一入口里先钩后关；运行时四个
   后端 + wasm 桩都要有符号，否则任一目标平台链接就炸。
 
-## Worker 控制口令牌/记录文件：验证要靠 A/B 记录内容，别盯进程行为（A291②，2026-09-12 已修）
+## Worker 控制口令牌/记录文件：验证要靠 A/B 记录内容，别盯进程行为（A291② 已修）
 
 - stdlib 要 CSPRNG 用根命名空间的 `RandomNumberGenerator.GetBytes(n)`（Windows
   RtlGenRandom / POSIX /dev/urandom，无弱回退）；**别 `using System.Security.Cryptography`**
@@ -2013,7 +2010,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   drain 为空 → woke==0 一轮 → 带着 N 个在途 IO op 和 parked 帧**静默退出**（rc=0、
   输出在截断处戛然而止）。IOTRACE 指纹：末行 `poll removed=1 cnt=N` 且**无**
   `poll_op` 行（NULL-overlapped 包不打印 poll_op）。修法：终局条件追加
-  `zan_io_has_pending()`（weak 声明 + 无 IO 程序 weak 回退 0），对齐 rt_sched
+  `zan_io_has_pending`（weak 声明 + 无 IO 程序 weak 回退 0），对齐 rt_sched
   纤程调度器的既有判据。凡「偶发空输出/中途截断 rc=0」先查这条，别先怀疑 IO 丢数据。
 - 排查定式：`ZAN_IO_TRACE=1` 跑 N 次抓失败样本 + 用 File.AppendAllText 打点
   （stdout 不可信——正被排查的就是它）；标记序列直接指认退出点在哪个 await 之间。
@@ -2036,7 +2033,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   「main 返回后该不该挂住」型判别用例（discrim/mini）是无效的，会把有效修复
   误判成死码。
 
-## 泄漏探测红 ≠ IO 挂死；共享 fd 的协程收尾定式（A302，2026-09-12 已修）
+## 泄漏探测红 ≠ IO 挂死；共享 fd 的协程收尾定式（A302 已修）
 
 - `zan_io_poll` 在 `cnt==0` 时早退且**不落 IOTRACE**：settle 窗口的 trace 静默
   不代表调度器没在轮，别把「trace 停了」当「进程卡死/没跑」（A298 教训的镜像）。
@@ -2057,7 +2054,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   把改过的文件 `cp` 进 worktree 对应路径重编即可，泄漏 A/B 用
   `git show HEAD:path > worktree 拷贝` 还原单文件基线。
 
-## poll 内循环会吞掉入口扫描：deadline 交付要挂在超时路径上（A308，2026-09-12 已修）
+## poll 内循环会吞掉入口扫描：deadline 交付要挂在超时路径上（A308 已修）
 
 - recv-with-deadline（`zan_io_recv_to_co`）的截止表扫描 `rto_timeout_scan` 若
   只挂在 `zan_io_poll` **入口**，而 poll 内部还有自己的 `for(;;)` 超时循环
@@ -2073,7 +2070,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   每 15.6ms 才醒一次），是**预存基线**：断言要用「相对基线」（≥40/0.8s），
   别按名义 1000 ticks/s 定阈值——同探针旧编译器快照同值证明与本改无关。
 - C 级 socketpair harness 验证 recv-to ABI：`zan_io_pump_timeout` 只泵 IO，
-  step 是经 `zan_co_ready` **入队**的，harness 必须自己 `zan_co_sched_run()`
+  step 是经 `zan_co_ready` **入队**的，harness 必须自己 `zan_co_sched_run`
   排干就绪队列，否则 `steps=0` 看似 hang 其实是队列没人抽；recv 缓冲要给真
   指针，`(void*)0x1000` 伪地址会在交付 recv 时 EFAULT 返回 0（伪 EOF），
   误判成对端关闭。
@@ -2082,7 +2079,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `-DZAN_CO_DRIVER`）；改 rt_io.c 后用 `wsl zig cc -target x86_64-linux-musl
   -DZAN_IO_STACKLESS_ONLY -fPIC -O2 -c` 重出两份并同步 `toolchain/linux-musl/`。
   排查期可临时用 O0 打点副本顶替，收尾必须换回 O2 官方对象。
-- 晚到完成包的仲裁不能按帧指针，要按 op 自持身份（A327-12a，2026-09-17 已修）：
+- 晚到完成包的仲裁不能按帧指针，要按 op 自持身份（A327-12a 已修）：
   recv-with-deadline 赢家路径（`rto_timeout_scan` 交付 -1 后 `CancelIoEx`）的
   OPERATION_ABORTED 晚到包出队时，原实现按 `CONTAINING_RECORD(帧指针)` claim——
   async 帧是池化复用的，deadline 输了竞赛后帧立即回到就绪队列，同指针上新登记
@@ -2092,7 +2089,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   OVERLAPPED，是完成包点名的唯一稳定身份）再 op_free。判定手法：
   ZAN_IO_TRACE 看 aborted 包是否带 `rto-dead`，以及紧随超时的 recv 是否 0 字节。
 
-## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b，2026-09-12；已修同日）
+## 泄漏报告的站点标签按类形状混叠；排查先做单站点最小复形（A64b；已修同日）
 
 - leakcheck 报告的「allocated at file:line:col」**（修复前）不是泄漏物的出生地**：站点
   索引按 (类符号, 泛型实例) 去重（`reserve_arc_site`，dispatch 需要同形状共享），而
@@ -2130,12 +2127,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   5 对象即既有真泄漏，与本改无关。怀疑某 twin 是「本来就坏」时，看 CMake 里各
   foreach 的 `_extra_args` 链是否一致（见下条）。
 
-## 测试里无界 accept 循环的监听器必须可被外部 Stop（A64b，2026-09-12）
+## 测试里无界 accept 循环的监听器必须可被外部 Stop（A64b）
 
 - 服务端测试用例的 `while(true)` accept 循环，收尾只 Stop 一个服务时，另一个
   listener 的停摆 accept 帧会把它钉成 leakcheck 红。有界循环（`while (served < N)`）
   能自己退出，但 accept 数不定的用例（池化行为决定链路数）没法预设 N——把
-  listener 提成 `static` 字段，Run 收尾补一次 `Stop()`：挂起 accept 以 -1 复位、
+  listener 提成 `static` 字段，Run 收尾补一次 `Stop`：挂起 accept 以 -1 复位、
   循环 break、帧完成释放，leakcheck 转绿。Stop 幂等（`running=false; sock>=0`
   守卫），循环保守起见的二次 Stop 是无害 no-op。
 - 定式（static 停靠不会假红）：static 字段持有的对象**不在泄漏报告里出现**
@@ -2152,12 +2149,12 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   **不看 ZANC_ARGS**，args 修好后旧 exe 依旧复用、红不变——已加 `.args` sidecar
   记录编译参数，args 变了强制重编；`zan_drop_artifact` 同步删 sidecar。
 
-## Worker.Stop() 只翻标志；停摆 accept 靠「关监听 fd」复位
+## Worker.Stop 只翻标志；停摆 accept 靠「关监听 fd」复位
 
-- `Worker.Stop()` 语义是协作式（`running=false`，注释明言「不中断运行中的协程」）：
+- `Worker.Stop` 语义是协作式（`running=false`，注释明言「不中断运行中的协程」）：
   循环 `while (running) { await AcceptAsync(sock); }` **停在 accept 里时永远看不到
   标志翻转**。与 TcpListener.Stop 的差别就在这里——后者会关 fd，挂起 accept 以
-  -1 复位。Worker 用例的收尾定式：`Stop()` 之后必须补 `Socket.Close(listenSock)`
+  -1 复位。Worker 用例的收尾定式：`Stop` 之后必须补 `Socket.Close(listenSock)`
   （accept 返回 -1 → 回到 while 条件见 running=false → 循环退出 → `RunAllLoopsOnSockets`
   帧完成，socks List 与 Worker 对象链整体释放）。ws_loopback / ws_protocol_gate /
   mqtt_loopback / sse_stream 四用例的「用例 2 对象 + Worker.zan:280/297 2 对象」
@@ -2173,7 +2170,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   之类的包装对象，就整批进 leakcheck 报告。sqlserver_tds 的「4 对象、站点
   `TdsCodec.zan:146:16`（`new TdsBytes`）」正是它：泄漏物是 **fake server 自己**
   的两个包装对象 × 2 个未退 Serve 帧，与编解码器无关——**站点名又一次张冠李戴**。
-- **定位阶梯（最小探针全干净时必须回真实用例二分）**：去掉 Live() → 0；worker 数
+- **定位阶梯（最小探针全干净时必须回真实用例二分）**：去掉 Live → 0；worker 数
   1/2/4 → 2/4/4（锁定在池段）；在 Serve 里 Release 后补 `body=null; pkt=null` →
   **clean**（坐实是「帧持有包装对象」而非内部缓冲）；插桩 serveLive/serveDone →
   退出时 `live=2 done=1`（两帧未退）。**判据**：泄漏数 = 未退帧数 × 帧内包装对象数，
@@ -2181,7 +2178,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **修法定式**：fake server 记下每个 accept 的 client fd，用例收尾关掉**服务端自己
   那端**（关对端没用），再自旋等 `serveLive==0`。`List<nint>` 这类静态字段的
   `xs.At(i)`/`xs.Count` **不能从别的静态方法直接调**（报「'xs' is not a known
-  variable」），必须包一层 `ShutdownClients()/ClientsAlive()` 辅助方法。
+  variable」），必须包一层 `ShutdownClients/ClientsAlive` 辅助方法。
 - 与上一条 accept 同族：**测试里的停摆帧是 leakcheck 红的常见来源**（accept 停摆、
   recv 停摆），收尾必须让每个自建协程帧能退——「关自己那端的 fd」是通用把手。
 
@@ -2191,7 +2188,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   `d[key]` 读的代码生成把实参 `emit_expr` 出来后从不释放。实参是局部变量/字面量时
   无恙（帧收尾释放/借用/驻留）；写成**内联调用**——临时串唯一持有者是本次表达式——
   每次执行漏 1 条。真实形状藏在 HttpClient 重定向防环
-  `visited.Contains(target.Canonical())`：每跟一跳漏一条 URL 串，
+  `visited.Contains(target.Canonical)`：每跟一跳漏一条 URL 串，
   http_bytes_redirect 漏 4 = 4 跳、http_client_redirect 漏 10 = 10 跳，
   泄漏数与业务跳数严丝合缝即是此坑的指纹。
 - **缩小阶梯**（从真实形状到七行复形，一层层换血）：HTTP 重定向链 →
@@ -2199,7 +2196,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （排除共享字段）→ 去掉 DropAlive 仍漏 → 常量实参仍漏（排除 URL 拼接）→
   同客户端二跳仍漏（排除派生客户端）→ 极小 while 循环干净 → 逐个加回
   Parse/GetHeader/ExternalTarget 都干净 → **只剩 `visited.Contains(...)` 漏** →
-  语言级 `v.Contains(P.Build(2))` 七行复形。反向排除同样要逐件做：Add(调用())、
+  语言级 `v.Contains(P.Build(2))` 七行复形。反向排除同样要逐件做：Add(调用)、
   普通方法实参、`List<int>`（值类型）全不漏——只有「RC 管理实参 + 查找类内建」
   组合踩坑。
 - **修法定式**：查找类内建的 done/return 前统一补
@@ -2222,7 +2219,7 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
 - **最小复形**：`Boom(Make(1))`，Boom 首行 throw，Make 的结果泄漏。IR 指纹：
   `%bcall = call ptr @Bag_Make` → `call i32 @Bag_Boom(ptr %bcall)` →
   **只有成功路径**才有 `zan_rt_release_dyn`，`call` 前没有任何 eh push。
-  stdlib 层真实形状 = `db.Execute(sql, new DbParams())` 的 prepare 失败路径
+  stdlib 层真实形状 = `db.Execute(sql, new DbParams)` 的 prepare 失败路径
   （Execute→Fail 抛出、BindAll 还没跑）——`db_error_throw` 的 5 对象漂移即此。
 - **修法定式**：帮手 `emit_call_arg_eh_push`（与 spec 路径同守卫：RC 管理类型 +
   非局部标识 + owned 产出 + 指针类型；非 OBJ 类槽走 `emit_eh_tmp_push_slot` 打标，
@@ -2252,33 +2249,33 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   它们各有自己的释放函数（闭包记录析构、数组长度前缀），走站点索引的
   `zan_rt_release_dyn` 会**绕过**它们、只把记录 free 掉。
 - **坑二（默认构建段错误）**：描述符头（默认）构建里对象第二头字是描述符记录指针，
-  `__zan_refl_obj_type`（`obj.GetType()`）与 `emit_runtime_is_check`（`x is T`）
+  `__zan_refl_obj_type`（`obj.GetType`）与 `emit_runtime_is_check`（`x is T`）
   都直接 `inttoptr` 后 `+16`/`+8` 取字段。但 object 槽装**堆串**时该字是串标签
   `ZAN_STRING_TAG`（高位）+缓存字节长（低位），装**一维数组**时是
   `ZAN_ARRAY_MAGIC`，装**矩形数组**时是 rank（小整数）——三种都不是指针，
-  解引用即崩：`object o = "lit"; o.GetType()` 一行必崩。
+  解引用即崩：`object o = "lit"; o.GetType` 一行必崩。
   **check-leaks 构建为什么看不出**：那条路用无符号范围比较
-  `0 < site < 站点数` 挡住串标签/垃圾字（B-ID17 后站点数从 finalize 发射的
+  `0 < site < 站点数` 挡住串标签/垃圾字（后站点数从 finalize 发射的
   `__zan_site_count` 全局加载，原 `ZAN_MAX_LEAK_SITES`=4096 常量已除；
   `is` 侧还额外把串标签先分流），
   于是 `--check-leaks` 全程正常——**「两种模式语义分叉」的隐蔽 bug 只在默认
   （发布）构建踩**。排查这类「-g/--check-leaks 好、发布崩」的问题，直接怀疑
   描述符头解引用路径。
-- **修法定式二**：解引用前判形状——`GetType()` 侧拒
+- **修法定式二**：解引用前判形状——`GetType` 侧拒
   `zan_hdr_is_string` / `ZAN_ARRAY_MAGIC` / 小整数（描述符是全局，
   绝不可能是小整数，矩形数组的 rank 由此挡住）；`is` 侧把判空扩成
   「0 / 数组魔数 / 小整数」并集。两条路都**退回静态类型的记录**，与 check-leaks
   构建对同一值的回答**逐字一致**——修完必须两模式输出比对，别再引入新分叉。
   （descriptor 路径的「小整数」判别取字面 4096 哨兵即可，与站点数无关，勿混。）
-- 遗留（未修，独立设计变更）：`GetType()` 对槽里的串/数组仍答静态类型
+- 遗留（未修，独立设计变更）：`GetType` 对槽里的串/数组仍答静态类型
   （`object`），C# 语义应答 `string`/`int[]`；要改需给两类载荷造记录并按形状分派，
   会同时改 check-leaks 侧既有答案。
 - conformance 用例 `reflect_object_payload`：类/串/一维数组/矩形数组四种载荷的
-  `GetType()`+`is` 一起钉，四孪生（conformance/leakcheck/arcguard/determinism）。
+  `GetType`+`is` 一起钉，四孪生（conformance/leakcheck/arcguard/determinism）。
 
 ## Binding 活绑定弱引用契约与 out 字段写穿
 
-- **借用槽的写入与析构必须成对（2026-10-09，设计器崩溃实证）**：扩展通用
+- **借用槽的写入与析构必须成对（设计器崩溃实证）**：扩展通用
   `object` 字段 ARC 时，先核对编译器内建对象里的非占有字段。
   `emit_binding_value` 对 `Binding<T>.target` 只写入、不 retain；因此
   `build_class_release_body` 必须跳过这个 target，常量绑定的 `constVal` 仍照常
@@ -2287,22 +2284,22 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   stale release。回归 `binding_target_lifetime` 反复销毁临时绑定后继续读写模型，
   并用自绑定的 leakcheck/arcguard 检查保持借用语义，不能靠 retain 源对象掩盖错误。
 
-- **A310（已修）**：`comp.prop = f().field;`（Binding<T> 属性 ← 字段左值、但接收者
+- **A310（已修）**：`comp.prop = f.field;`（Binding<T> 属性 ← 字段左值、但接收者
   产出 owned 临时）曾合成活绑定——活绑定的 `object target` 是**刻意设计的弱引用**
   （`emit_binding_value` 注释：强引用会让 model<->component 图成环泄漏），而临时
-  接收者在语句结束即被释放 → target 悬空，下一帧 `Get()` 读释放内存（轻则读出
-  空串，重则 MeasureTree 段错误；堆复用探针 + `IsLive()` 观察可稳定实锤）。
+  接收者在语句结束即被释放 → target 悬空，下一帧 `Get` 读释放内存（轻则读出
+  空串，重则 MeasureTree 段错误；堆复用探针 + `IsLive` 观察可稳定实锤）。
   **修**：接收者 `expr_yields_owned_rc_value` 为真时不合成活绑定，降级为 const
-  快照（`IsLive()==false`，语义自洽：临时源本来就不存在"活"可言）；live 路径里
+  快照（`IsLive==false`，语义自洽：临时源本来就不存在"活"可言）；live 路径里
   原来的临时接收者手动释放块随之变成死代码删除。持久接收者（局部/字段/容器元素）
   的活绑定语义不变，`binding_sugar` 等金样逐字不动。**铁律升级**：模板侧"先快照
   局部再赋 Binding 属性"的防御写法只对"绑定活得过源对象作用域"场景仍有意义；
-  编译器现在兜底 `f().field` 形态，回归用例 `tests/conformance/binding_temp_source.zan`。
+  编译器现在兜底 `f.field` 形态，回归用例 `tests/conformance/binding_temp_source.zan`。
 - **A307（已修，与 out_param_lvalue 同根因）**：`out` 实参目标是非标识符位置
   （`Fill(out this.v)`/`out b.field`/`out arr[i]`）曾走 emit_expr 返回**存值**被
   当地址写（int 字段存 7 就把 0x7 当指针）；修=emit_ref_arg 按位置解析真实地址
   （实例字段/静态字段/数组与 List 元素/裸字段名=this.field）。回归
-  `tests/conformance/out_param_lvalue.zan`，2026-09-13 六形态补试零复现后闭账。
+  `tests/conformance/out_param_lvalue.zan` 六形态补试零复现后闭账。
 
 ## A311 已修：设计类名撞 `Gui.App`
 
@@ -2368,7 +2365,7 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 
 **坑二（WebSocket 帧交错 Send Interleaving）**：
 - `SendBytesAsync` 是异步挂起 IO（等待 `WriteReady`）。
-- 若无并发发送门控，当后台协程发送心跳 `Ping()` 或其他消息时，若与业务协程并发写入，两个 WebSocket 帧的字节流会交错混杂在同一个 TCP 连接上，导致对端报 RFC 6455 1002 Protocol Error 瞬间断链。
+- 若无并发发送门控，当后台协程发送心跳 `Ping` 或其他消息时，若与业务协程并发写入，两个 WebSocket 帧的字节流会交错混杂在同一个 TCP 连接上，导致对端报 RFC 6455 1002 Protocol Error 瞬间断链。
 - 客户端（`WebSocketClient` / `WssClient`）必须引入异步排队互斥锁（`AsyncGate` 队列表），文本、二进制、Ping、Pong、Close 全路径统一进门控。
 
 **坑三（Modbus 工控死循环与事务错配）**：
@@ -2396,27 +2393,27 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
 - **隐患背景**：MySQL Wire、SQL Server TDS、PostgreSQL libpq、Firebird Wire 等基于单 TCP 连接/单会话句柄的客户端，其线协议本质是请求-响应锁步（Lockstep）交互模型：发送命令 -> 逐个接收包头/列定义/行数据包/EOF 或 OK/ERR 包。
 - **并发交织灾难**：当多个业务协程并发调用同一连接上的 `QueryAsync` / `ExecuteAsync` / `QueryParamsAsync` 时，由于每个异步操作中途都在网络 IO（`Socket.RecvOv` / `Socket.ReadReady`）上挂起（await），后发起的查询向套接字注入报文，或者提前截获上一查询尚未收完的列定义/行包。最终导致报文错序、协议断链、或致命的“串号交付”（协程 A 查到了协程 B 的用户数据）。
 - **定式**：
-  - 数据库驱动客户端（`MySqlConnection`、`SqlServerConnection`、`PgConnection`、`FirebirdConnection`）内部必须集成连接级异步互斥锁 `AsyncGate`（`AcquireLock()` 与 `ReleaseLock()`）；
-  - 所有公共出入站查询入口必须以 `await this.AcquireLock(); try { ... } finally { this.ReleaseLock(); }` 完整保护单连接完整的事务/查询生命周期（含预编译、参数绑定、执行、全结果集回读）；
-  - `Close()` 必须强制重置互斥标志，并唤醒所有在 `waiters` 中排队的 `AsyncGate` 等待者，杜绝挂起协程永久悬死泄漏；
+  - 数据库驱动客户端（`MySqlConnection`、`SqlServerConnection`、`PgConnection`、`FirebirdConnection`）内部必须集成连接级异步互斥锁 `AsyncGate`（`AcquireLock` 与 `ReleaseLock`）；
+  - 所有公共出入站查询入口必须以 `await this.AcquireLock; try { ... } finally { this.ReleaseLock; }` 完整保护单连接完整的事务/查询生命周期（含预编译、参数绑定、执行、全结果集回读）；
+  - `Close` 必须强制重置互斥标志，并唤醒所有在 `waiters` 中排队的 `AsyncGate` 等待者，杜绝挂起协程永久悬死泄漏；
 **坑八（物联网 MQTT QoS 1/2 订阅端应答遗漏与 WebSocket 并发推送踩踏）**：
 - **MQTT 订阅端断连与重复风暴**：
   - 规范（RFC 3.1.1 §4.3.2）要求接收到 QoS 1 PUBLISH 必须回送 PUBACK，接收到 QoS 2 必须回送 PUBREC 并在收到 PUBREL 时回复 PUBCOMP；
   - 若客户端只读出负载而不向 broker 发送确认报文，主流 Broker（Mosquitto、EMQX、HiveMQ、AWS IoT）会认为消息未成功交付，不断重传，导致网络风暴或超时踢掉客户端；PINGRESP 也不能当作正文负载误返回；
   - 定式：`MqttClient.ReceiveAsync` 与 `ReceiveBytesAsync` 解析到 QoS > 0 时必须立即按其报文标识符回送对应 ACK（PUBACK/PUBREC/PUBCOMP），并正确过滤心跳包。
 - **WebSocket 连接多协程并发 Push 帧缓冲区踩踏**：
-  - 多业务协程向同一长连接推流（如通知、广播、报警）时，若无互斥门控，多个协程会同时操作同一连接的 `WsWriter` 输出缓冲并在 `Flush()` 的 `SendBytesAsync` 挂起期间相互覆盖 `buf` 与 `len`，引发帧数据穿插错位或乱序断链；
+  - 多业务协程向同一长连接推流（如通知、广播、报警）时，若无互斥门控，多个协程会同时操作同一连接的 `WsWriter` 输出缓冲并在 `Flush` 的 `SendBytesAsync` 挂起期间相互覆盖 `buf` 与 `len`，引发帧数据穿插错位或乱序断链；
 **坑九（MySQL 大数据量超 16MB 分包拼接与 SQLite 语句缓存覆写）**：
 - **MySQL 线协议 16MB (0xFFFFFF) 边界截断与协议错位**：
   - MySQL 线协议每个数据包头部仅 3 字节长度（最大 $2^{24}-1 = 16,777,215$ 字节）。当单列、大字段（BLOB/JSON/TEXT）或批处理超过 16MB 时，服务端与客户端均须按 16MB 分包，递增包序列号并在小于 16MB 的包处结束；
   - 若客户端只读单包，后续数据包会留在套接字输入缓冲区中，被下一次查询误当成响应包头，造成协议永久错位与断链；
-  - 定式：`MySqlConnection.readPacket()` 遇 `len == 16777215` 时必须循环拼装分片直至终包；`writePacket` 超 16MB 自动分片发送；套接字接收逐字节循环全部接入 `NativeMemory.Copy` 加速。
+  - 定式：`MySqlConnection.readPacket` 遇 `len == 16777215` 时必须循环拼装分片直至终包；`writePacket` 超 16MB 自动分片发送；套接字接收逐字节循环全部接入 `NativeMemory.Copy` 加速。
 - **SQLite 语句缓存覆写**：
   - `SqliteConnection` 使用索引器 `stmtBusy[sql] = true/false` 代替 `Add`，杜绝重复键异常。
 **坑十（TDengine 协程并发互斥门控与 Firebird 原生内存拷贝加速）**：
 - **TDengine 客户端单连接协程互斥**：
   - `TDengineConnection` 多个协程并发调用 `QueryAsync` / `ExecuteAsync` 时，若未加排队互斥，会并发读写 `lastError`、`lastCode` 与 `affected` 实例状态，导致错误状态交织错乱；
-  - 定式：引入 `AsyncGate` 异步门控与 `waiters` 队列保护完整的请求生命周期，并在 `Close()` 中唤醒所有排队者。
+  - 定式：引入 `AsyncGate` 异步门控与 `waiters` 队列保护完整的请求生命周期，并在 `Close` 中唤醒所有排队者。
 - **Firebird 驱动收发包 NativeMemory 加速**：
   - `recvExact` 与 `sendPacket` 剥离逐字节解释循环，全面接入 `NativeMemory.Copy`，消除大字段（BLOB）和长结果集下的大量解释器空耗。
 **坑十一（HTTP 大文件下载 64 位整型长度与 Modbus 协程唤醒）**：
@@ -2424,7 +2421,7 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - `HttpClient` 原先使用 `int HeaderInt(head, "content-length")` 和 `int RangeTotal(head)`，当下载超过 2GB 的大文件（如安装包、模型权重、镜像归档）时，32 位有符号整数发生负溢出，导致 `Content-Length` 解析为负数、已完成判定（416 校验中原先硬编码 `total > 2147483647 -> false`）失效、且断点续传 `Range: bytes=have-` 截断；
   - 定式：实现 `HeaderLong` 与 64 位 `RangeTotal`，`BuildDownloadRequest`、`DownloadBinaryOnceAsync` 全面支持 `long have`；`File` 增补 `GetSize64(path)` 经底层 `zan_file_length` 获得精确 64 位文件大小。
 - **Modbus TCP 客户端连接关闭唤醒**：
-  - `ModbusClient.Close()` 必须同步调用 `ReleaseLock()` 并释放唤醒所有 `waiters` 挂起的协程，防止外部在并发交互期间关闭连接造成协程永久悬死。
+  - `ModbusClient.Close` 必须同步调用 `ReleaseLock` 并释放唤醒所有 `waiters` 挂起的协程，防止外部在并发交互期间关闭连接造成协程永久悬死。
 **坑十二（大文件流式上传句柄暴风根治与 File.ReadBytes 向量化加速）**：
 - **大文件上传反复开闭句柄风暴**：
   - `HttpClient.UploadFileBytesAsync`（明文与 TLS）原先在 64KB 发送循环内反复调用 `File.ReadBytes(localPath, offset, want)`，导致 1GB 文件上传触发上万次 `fopen` / `fseek` / `fclose` 系统调用与句柄震荡，易引发文件占用冲突或句柄耗尽；
@@ -2457,10 +2454,10 @@ recurse 收集相对路径 → qsort 定序 → 逐文件哈希路径+内容）�
   - 定式：补齐 `Http2Error` 错误码（RFC 7540 §7）、`DecodeHeader(buf, offset)` 帧头反序列化，以及 `BuildRstStream`、`BuildGoAway`、`BuildWindowUpdate`、`BuildPing` 等控制分帧构建方法；
 - **SSE 服务端推送二次字符串切片与多行数据二次幂拼接消除**：
   - `SseConnection.SendAsync` 在底层 TCP 发生背压部分写入时，原先在循环内反复执行 `frame.Substring(sent, total - sent)` 造成大量堆内存分配；`ParseBlock` 在接收多行 `data:` 时原先使用字符串拼接导致二次幂内存膨胀；`TcpClient` 缺失基于偏移量与长度的字节数组切片发送；
-  - 定式：`TcpClient` 增补 `SendBytesAsync(byte[] data, int offset, int len)` 与 `TcpListener.AcceptTcpClientAsync()`；`SseConnection` 移除无谓的 Substring 循环并增补 `SendBytesAsync(eventName, byte[] data, offset, len)` 原生字节推送通道；`SseClient.ParseBlock` 改用 `StringBuilder` 线性累加多行数据载荷。
+  - 定式：`TcpClient` 增补 `SendBytesAsync(byte[] data, int offset, int len)` 与 `TcpListener.AcceptTcpClientAsync`；`SseConnection` 移除无谓的 Substring 循环并增补 `SendBytesAsync(eventName, byte[] data, offset, len)` 原生字节推送通道；`SseClient.ParseBlock` 改用 `StringBuilder` 线性累加多行数据载荷。
 **坑十六（数据库大数据量结果集空值标记按需实例化与游标复用、TDengine 分块与套接字异常防护）**：
 - **大数据量行级对象冗余分配**：
-  - `DbResult` 原先在每行记录无任何 SQL NULL 时，仍无条件为每行创建 `new List<bool>()`，导致 10 万行 20 列的大宽表产生 10 万个无意义的布尔列表对象；`MySqlConnection` 与 `MySqlSyncConnection` 在逐行解码时，每行均 `new List<int>()` 仅用于充当变长解析偏移游标；
+  - `DbResult` 原先在每行记录无任何 SQL NULL 时，仍无条件为每行创建 `new List<bool>`，导致 10 万行 20 列的大宽表产生 10 万个无意义的布尔列表对象；`MySqlConnection` 与 `MySqlSyncConnection` 在逐行解码时，每行均 `new List<int>` 仅用于充当变长解析偏移游标；
   - 定式：`DbResult.AddRow` 接收 `null` 标记，`IsNull` 判断时判空直返 `false`，仅当该行真正包含 NULL 字段时才懒加载创建 `List<bool>`；MySQL 线协议解码将 `cur` 游标提升至循环外部复用，消除数万次临时列表分配；Postgres、SqlServer、Firebird 结果集转换全面接入按需空标记判定；
 - **TDengine REST HTTP 传输健壮性与句柄异常泄漏**：
   - `HexOf` 分块十六进制长度原先使用 32 位整型计算，当遇到异常恶意大 chunk 时存在有符号整型溢出风险；`Post` 与 `PostAsync` 在套接字接收循环发生异常时，原先跳过 `Socket.Close` 造成底层 socket 泄漏；
@@ -2479,7 +2476,7 @@ base1=**exe 目录**）——测试 exe 在 build/，于是读到 build/hts_cach
 读、写、清理三边各锚一棵树，用例永远无法自清理。
 
 **定式**：程序运行期自己创建的缓存/临时目录，路径一律用
-`ProcessHost.AppDir() + "/name"` 绝对路径（绝对路径 `path[1]==':'` 或
+`ProcessHost.AppDir + "/name"` 绝对路径（绝对路径 `path[1]==':'` 或
 前导 `/` 直接跳过 alt-base，三边天然同树）；只有"随程序分发的只读资源"
 才该用相对路径享受 alt-base 的发布查找。排查口诀：见"删了还在/读不到刚
 写的"先问一句 File 和 Directory 是否锚在同一目录——
@@ -2525,7 +2522,7 @@ System.Threading` 的代价都是整个 rt_sync。
 **坑**：`--target linux-x64`（zig 交叉）产物里 `Interop.Load`/任何 dlopen
 直接报 "Dynamic loading not supported"——musl 静态二进制不支持 dlopen
 （musl 的已知限制）。Lua/Python/SDL 这类运行期 dlopen 的可选原生依赖在
-交叉 Linux 产物上永远 IsAvailable()==false，且裸名/限定路径/CDPATH 都
+交叉 Linux 产物上永远 IsAvailable==false，且裸名/限定路径/CDPATH 都
 救不了。排查时先在目标机跑一个 `Interop.Load("libc.so")` 探针分清
 「库没找到」还是「dlopen 本身不可用」。
 
@@ -2536,10 +2533,10 @@ System.Threading` 的代价都是整个 rt_sync。
 ctest 绿≠断言跑过，必须另写显式探针）。
 ## 运行时 abort 死点普查要按符号抓头文件帮凶 + zan_rt_fatal 接管钩子（A52-8 实录）
 
-**坑**：普查"库内哪些地方会硬死"时只 `grep abort()` 会漏一半——`zan_host_oom()`
+**坑**：普查"库内哪些地方会硬死"时只 `grep abort` 会漏一半——`zan_host_oom`
 （fprintf + abort）定义在 `src/common/host_oom.h` 里，rt_sync.c 六处 OOM 死点、
 rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路径但注释里留着
-"abort()" 字样，纯文本 grep 三向误报/漏报。正确姿势：先抓 `abort()`，再抓
+"abort" 字样，纯文本 grep 三向误报/漏报。正确姿势：先抓 `abort`，再抓
 "包着 abort 的辅助函数"的调用点（`grep zan_host_oom`），最后逐处读上下文
 分辨活死点 vs 注留史。
 
@@ -2555,9 +2552,9 @@ rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路�
 **顺手坑**：CMakeLists 的参数列表里 `/* ... */` 不是注释，会被拆成参数
 传给命令——CMake 注释只有 `#` 行注释。
 
-## async 启动语义与 sched_run 泵等待：三类静默挂死/丢消息（2026-09-23）
+## async 启动语义与 sched_run 泵等待：三类静默挂死/丢消息
 
-- **丢弃 async 调用（`Foo();` 裸语句、async void）的体在首次调度泵时才运行**，
+- **丢弃 async 调用（`Foo;` 裸语句、async void）的体在首次调度泵时才运行**，
   不是 C# 的急切执行：emit_expr 只发射 ramp（分配堆帧、返回句柄），
   AST_EXPR_STMT 对该句柄调 emit_detach_async_call 排队——首拍前什么都不跑。
   依赖"调用点立刻执行前导"的逻辑必错：WsSharedBus.StartPolling 把
@@ -2577,7 +2574,7 @@ rt_timer.c 一处全部借它藏身；另有三处历史 abort 已改优雅路�
   原语与组合层（SharedTable 直连两实例→原语 OK；复刻 WsSharedBus 建表→
   列声明即现形），再用逐拍打印暴露调度时序（轮询体的真实启动时刻）。
 
-## android 静态驱动档案 libzan_gui.a 过期 = 实机 dlopen "cannot locate symbol" 崩溃（2026-09-16 实录）
+## android 静态驱动档案 libzan_gui.a 过期 = 实机 dlopen "cannot locate symbol" 崩溃（实录）
 
 **坑**：`--emit-apk` 的 libmain.so 链接是 `-shared`，lld 默认允许未解析符号
 （等运行期解析），stdlib/Gui/Render.zan 新增的 `static extern`（如
@@ -2599,7 +2596,7 @@ driver_class 直接链接失败）。② 验证符号齐：
 extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 `--no-undefined`，档案过期从"实机闪退"左移成"发布当场报错"。
 
-## embedres：skin_filter 只属 skins 规格；多 spec 别拆多次 emit（2026-09-17）
+## embedres：skin_filter 只属 skins 规格；多 spec 别拆多次 emit
 
 - **`zan_embed_emit_specs_filtered` 的 skin_filter 是 skins 规格专属**，
   过滤条件必须按 `prefix=="skins"` 收窄（embedres.c 的 `filtering` 判定）。
@@ -2619,7 +2616,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   取的是最后一个分隔符——build.ps1 里 `Join-Path $project 'src/App.html'`
   这类混合分隔符路径会让截桶错位。诊断时先打印候选再怀疑逻辑。
 
-## 跨平台硬件加速 Crypto/TLS 微内核替换与 ABI 契约（2026-09-24）
+## 跨平台硬件加速 Crypto/TLS 微内核替换与 ABI 契约
 
 - **胖驱动瘦身与生命周期引用计数（X509 存储）**：
   OpenSSL 历史多平台驱动体积达 5MB+，采用单 TU 原生微内核（AES-NI/PCLMULQDQ 硬件加速，几十 KB）替代时，必须精准遵循 OpenSSL 的所有权语义。例如 X509 证书同时被上层调用方句柄和 `SSL_CTX` 的 `cert_store` 引用；`X509_STORE_add_cert` 接管时必须递增 `ref_count`，`X509_free` 递减至 0 时才真正 free。若做浅拷贝或单侧硬析构，`SSL_CTX_free` 析构证书库时会触发严重的堆破坏与崩溃（`0xc0000374` @ `RtlFreeHeap`）。
@@ -2629,7 +2626,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   macOS 动态库在没有宿主完整 SDK 的情况下使用 lld 交叉链接时，动态运行时符号（`calloc`, `free`, `snprintf` 等）需要添加 `-fno-stack-protector "-Wl,-undefined,dynamic_lookup"`，否则 ld64.lld 会将 libc 符号报错为 undefined symbol；在 PowerShell 中执行时必须将包含逗号的链接器参数整体双引号引起来（`"-Wl,-undefined,dynamic_lookup"`），避免逗号被 PowerShell 语法解析为数组分割符。
 
 
-## GenForm：带字 label 的字段名会被 text 的 syncName 吃掉（2026-09-17）
+## GenForm：带字 label 的字段名会被 text 的 syncName 吃掉
 
 - **PropSpec.Text 工厂自带 `syncName=true`**：`SetProp("text", …)` 会把
   控件 `name` 改写成文本。设计稿通道里 html 元素内容走兜底直通发射
@@ -2645,7 +2642,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   `dump hitregions` 看当帧可见区域集。塌缩的第一嫌疑是"父容器尺寸没
   到位/子树从未 Arrange"，而不是控件重叠。
 
-## async 帧槽：按名字去重必炸，同名遮蔽声明各占一槽（A31x，2026-09-17）
+## async 帧槽：按名字去重必炸，同名遮蔽声明各占一槽（A31x）
 
 - **`async_scan_add_local` 的去重键是 AST 声明节点，不是名字**。按名去重
   时，`foreach (string k in ...)`（no_arc 借用槽）之后同名的
@@ -2672,9 +2669,9 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   的文件）重编基线 zanc 跑同用例。契约用例
   conformance/async_shadow_same_name_across_await 四形态绿为准。
 
-## async 局部委托初始化：目标签名也是所有权契约（2026-10-08）
+## async 局部委托初始化：目标签名也是所有权契约
 
-- **帧局部声明沿用目标委托类型发射 lambda**：`ReadText read = () => text`
+- **帧局部声明沿用目标委托类型发射 lambda**：`ReadText read =  => text`
   要走 `emit_lambda_typed(..., declared_type, ...)`，不能直接 `emit_expr`。
   普通表达式路径缺少目标签名，会把字符串返回值按默认 `i64` 发射，并漏掉
   借用返回值的 retain；委托调用方仍按 string 结果拥有 +1 释放，第一次调用
@@ -2685,7 +2682,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   参数、引用返回、多次调用及跨协程完成后逃逸的闭包锁住契约；只测返回 int
   的 lambda 会让默认 i64 路径伪装成正确。
 
-## await 消费尾段合并：先合子帧句柄，再转移结果（2026-10-08）
+## await 消费尾段合并：先合子帧句柄，再转移结果
 
 - **fast 与 resume 在子帧指针上合流**：DONE acquire 与 awaiter CAS 握手保持
   原有顺序；恢复块只加载保存的子帧句柄，随后与立即完成句柄组成 phi。异常
@@ -2696,7 +2693,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   指针 phi 后先完成 aggregate load，才释放子帧；异常分支先转移异常及 owned
   标志，再释放并重抛。合并已解码的值或提前 free 都不能替代这项顺序检查。
 
-## async 聚合值：帧存储与逐字段所有权一起规划（2026-10-08）
+## async 聚合值：帧存储与逐字段所有权一起规划
 
 - **结构体也能跨挂起**：局部帧扫描必须包含 LLVM struct，不能假定值聚合
   不会跨 await。三 long 探针的 awaited 结果首次读取正确，再 Yield 后变成零
@@ -2711,7 +2708,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   `async_aggregate_frame` 覆盖嵌套字符串/对象/数组、赋值、参数、返回、循环、
   丢弃结果与协程结束后的闭包访问，并用 leakcheck 检验所有权。
 
-## 嵌套结构体写入：递归解析 place 地址（2026-10-08）
+## 嵌套结构体写入：递归解析 place 地址
 
 - **写接收者不能先读取成聚合值**：`outer.inner.value = v` 若先 load inner，
   再只接受 pointer 接收者，会静默不发射 store；最小探针在 Yield 前就读回零。
@@ -2719,7 +2716,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   与 ref/out 地址解析。不能写入临时副本。`nested_struct_place` 检验这些根形态
   和有副作用的数组下标仅执行一次；含引用的嵌套替换仍走逐字段 capture。
 
-## async finally 异常槽：扫描深度、工作项和实际数组类型一致（2026-10-08）
+## async finally 异常槽：扫描深度、工作项和实际数组类型一致
 
 - **容量沿完整管线传递**：扫描器的 `fin_depth_max` 必须落到 async 工作项，
   再用它定义 FINEXC / FINEXC_OWNED / FINEXC_TID。只改帧构造、不传扫描值，
@@ -2733,7 +2730,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   内嵌两层 finally、checked 内跨 await 局部验证普通/发布运行及 leakcheck；
   单层 finally 用例无法锁住这类容量错配。
 
-## async finally 共享发射：按入口契约分组，存储按节点定位（2026-10-08）
+## async finally 共享发射：按入口契约分组，存储按节点定位
 
 - **先区分入口的 EH 状态**：提前 return 的 handler 仍可能处于 armed 状态，
   正常离开 try 与异常入口则已弹出所属 handler。只按 finally AST 合并会改变
@@ -2760,7 +2757,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   完整 stdout/stderr 与 manifest 指令增长；旧实现增长 340%，共享后 178%，
   校准 250% 上限。leakcheck 可能报告泄漏但 exit=0，不能只断言退出码。
 
-## async finally：持久 owner 与执行中清理边界（2026-10-08）
+## async finally：持久 owner 与执行中清理边界
 
 - **退出协议分级 disarm 与 owner 递减**：离开 awaiting try 区域时，必须将
   armed exception handlers 逐级弹出至该区域外层 armed 深度，再发射其 finally
@@ -2777,17 +2774,17 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   保存、清零与恢复，lambda 内部的普通 `return` 语句会误判为属于外层 async 方法，
   从而提前执行外层方法的 finally 块导致二次执行与逻辑破坏。
 
-## 拥有引用字段的结构体局部必须先初始化（2026-10-08）
+## 拥有引用字段的结构体局部必须先初始化
 
 - **局部聚合槽位声明即零初始化**：包含 RC 字段的结构体局部变量在栈上分配时必须
   通过 `zan_store_fit(LLVMConstNull)` 立即清零。由于结构体字段替换与赋值逻辑默认
   先释放原有字段内容，未初始化的栈垃圾会被 `zan_rt_str_release` 或对象 release 误
   作为旧引用释放，引发 ARC double free / over-release。
 
-## async 循环 continue 目标与 ANF Await 规整契约（2026-10-08）
+## async 循环 continue 目标与 ANF Await 规整契约
 
 - **症状**：在含 `await` 的 `for` 步进（如 `for (...; ...; i = await Next(i))`）或
-  `do-while` 条件（如 `do { ...; continue; } while (await More())`）中执行 `continue`
+  `do-while` 条件（如 `do { ...; continue; } while (await More)`）中执行 `continue`
   时，循环陷入死循环（步进未执行、条件未重新求值挂死）。
 - **根因**：
   1. ANF 规范化阶段原先将 `for` 步进中提升出来的声明和残余表达式强行塞入循环体末尾，
@@ -2805,9 +2802,9 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **回归锁定**：`tests/conformance/async_loop_continue.zan`（`ctest -R conformance_async_loop_continue`
   4 孪生全部通过）。
 
-## async foreach 临时集合所有权与 SSA 跨挂起支配规则（2026-10-08）
+## async foreach 临时集合所有权与 SSA 跨挂起支配规则
 
-- **症状**：在 `foreach (int x in MakeArray())` 或 `foreach (char c in MakeString())`
+- **症状**：在 `foreach (int x in MakeArray)` 或 `foreach (char c in MakeString)`
   循环体包含 `await` 挂起点时，LLVM verifier 报错 `Instruction does not dominate all uses!`，
   指向 preheader 中的函数调用返回值在循环尾释放点使用非法；或在循环结束时报 double free。
 - **根因**：临时数组与临时字符串作为调用表达式，其生命周期所有权在 preheader 中已被登记为局部
@@ -2823,7 +2820,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **回归锁定**：`tests/conformance/async_foreach_owner.zan`（`ctest -R conformance_async_foreach_owner`
   4 孪生全部通过）。
 
-## 二进制格式补丁器（APK AXML axml_patch）：改解析先写 walk 探针（2026-09-23）
+## 二进制格式补丁器（APK AXML axml_patch）：改解析先写 walk 探针
 
 - **ResStringPool 两种池两种长度形式，别按单一形态写解析**：UTF-16 池
   条目=u16 长度前缀，≥0x8000 时扩成 32 位形式（低 15 位<<16 | 下一个
@@ -2839,11 +2836,11 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   （如 UTF-16 分支 hl 忘设 2）读侧整体错位 1 字节、占位符全找不到——
   先建好的探针当场抓住，没让它流进提交。
 
-## 泛型 TP 按简单名全局注册：用户同名类击穿一切泛型方法调用（A350，2026-09-23）
+## 泛型 TP 按简单名全局注册：用户同名类击穿一切泛型方法调用（A350）
 
 - **症状**：用户声明 `class T` 后，`Binding<T>`/自家泛型类的成员方法调用
   全线 `no overload of 'Binding.Set' matches argument type(s)`（checker
-  沉默，irgen 打分拒绝）；`Get()` 正常（0 参不经过参数打分）。桌面/
+  沉默，irgen 打分拒绝）；`Get` 正常（0 参不经过参数打分）。桌面/
   android 无差别，与拉入面无关——**同名类在哪，毒就在哪**。
 - **根因双层**：① 泛型 TP 以简单名注册进单元作用域，`scope_find` 命中
   **任何**同名符号（含用户类）即跳过注册，TP 名被抢；② 绑定期签名解析
@@ -2862,7 +2859,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   字段/参数全红，假象），真差异是**类名**（Program vs T）。改类名二分
   一击定位，比读打分代码快一个数量级。
 
-## 合成值进 store 必带 owned 信号：算了没用的 fval_owned = 半截线（A351，2026-09-23）
+## 合成值进 store 必带 owned 信号：算了没用的 fval_owned = 半截线（A351）
 
 - **症状**：full 门禁档 leakcheck 孪生红，退出恒剩 1 个 Binding 盒；
   探针二分只有"对象初始化器写 Binding 字段"这一种形状漏（纯赋值、
@@ -2881,12 +2878,12 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **定位手法**：leakcheck 红先做**形状二分**（删构造器/删初始化器/
   换局部），一个维度一轮 30 秒；判 ownership 争议直接 `--emit-ir`
   数 retain/release，比读三层调用链快。
-## 服务端 stdlib 退出泄漏：静态根 + 永生协程帧，拆卸必须对称且先于泵等待（A352，2026-09-24）
+## 服务端 stdlib 退出泄漏：静态根 + 永生协程帧，拆卸必须对称且先于泵等待（A352）
 
 - **症状**：网络类 leakcheck 孪生（mqtt/ws/sse/webdav）测试逻辑全过、
   退出恒报"仍可达"：broker 的三个列表、静态共享总线、Worker 静态
   委托槽，计数跨二进制稳定。
-- **根因两类**：① **静态保持根**——`static` 单例（惰性 `Global()`）、
+- **根因两类**：① **静态保持根**——`static` 单例（惰性 `Global`）、
   static 委托槽、static 总线引用，退出时必然把对象图钉在可达集里；
   ② **永生协程帧**——组件内部的轮询/巡检循环（`while(running)` +
   `Task.Delay`）的帧持有 `this`，没人置停标志就永远停在某次 Delay
@@ -2901,7 +2898,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **定位手法**：泄漏计数对不上预期时，按"谁还可达"往根上追——
   报表给的是分配点，持有人要在类型图里找（static 槽 → 帧 → this
   → 字段列表）；改完先跑单测试再跑窄层，别拿泵等待时长硬凑。
-## 链式 owned 接收者在内建分支泄漏；泄漏报表的站点名会撒谎（A355，2026-09-24）
+## 链式 owned 接收者在内建分支泄漏；泄漏报表的站点名会撒谎（A355）
 
 - **症状**：webdav/HTTP 服务端 leakcheck 恒报漏 N 个
   `HttpClient.zan:1271` 的 StringBuilder，但**有体响应不漏、空体
@@ -2909,11 +2906,11 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   ToString/删 AbsorbCookies）全部照漏，语言级 async 形状探针又全绿。
 - **根因**：真凶根本不在报表指的那个文件——**同形状分配点共享站点
   槽，报表名是最后注册者的**（`-g` 才按 file:line 键控）。真泄漏对象
-  是 `HttpResponse.BuildHeaders()`（空体路径）里的链式临时
-  `this.BuildHeadersSb().ToString()`：`StringBuilder` 的
+  是 `HttpResponse.BuildHeaders`（空体路径）里的链式临时
+  `this.BuildHeadersSb.ToString`：`StringBuilder` 的
   Append/AppendLine/ToString 内建分支（irgen_call.c）**直接求值接收者
   表达式**，owned (+1) 接收者从不释放；`Append` 又声明为 void，语句级
-  丢弃兜底（EXPR_STMT 的 owned 释放）也永不触发。有体路径 `Build()`
+  丢弃兜底（EXPR_STMT 的 owned 释放）也永不触发。有体路径 `Build`
   先存局部变量，借用接收者不走 owned 通道，所以只有空体漏。普通类/
   List/Dict/string 的链式接收者都各自有释放路径，**洞只在 SB**。
 - **修法**：SB 内建分支复用集合内建已有的
@@ -2921,7 +2918,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   接收者→求值实参→内建完成后 drop），**只在真正走到返回点的分支挂
   载**（该分支会 fall-through 到 Console 等其他内建，提前挂会导致
   push 无 pop）。新增内建/改内建分发时，用
-  `Probe.Make().Method()` 四形态（return 位/丢弃语句/实参位/局部
+  `Probe.Make.Method` 四形态（return 位/丢弃语句/实参位/局部
   位）各写一个 `--check-leaks` 探针过一遍。
 - **定位手法（本次决定性的一手）**：怀疑 ARC 事件序时给运行时发射
   加**site 感知 trace**（alloc/retain/release/release-dyn 时读 obj-8
@@ -2932,9 +2929,9 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   前提。**教训：leakcheck 报表的 file:line 只是同形状槽位的名字，
   不是持有人；先验证站点名，再顺着名字修**。
 
-## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑（2026-09-25）
+## 编译期生成器（GenRoute/GenDb）：合成源码的三类坑
 
-- **Controller 纯基类必须显式声明为 abstract**（2026-09-25 实证）：GenRoute
+- **Controller 纯基类必须显式声明为 abstract**（实证）：GenRoute
   识别控制器的规则是 `cls.Bool("abstract", false)` 返回 false 时，只要以 `Controller`
   结尾或继承 `Controller` 就会被视为具体控制器。若框架抽象基类（如 `AppController`、
   `AdminController`）未加 `abstract` 修饰符，其内部暴露给派生类继承的公开方法与
@@ -2957,7 +2954,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   要编译"没有包的历史版本"做对照，必须把源码树和 zanc 一起搬到仓库外
   （exe 旁 `../packages` 也是发现面之一），runtime obj（build/*.obj）要
   随 zanc 同拷。
-- **worktree 快照 zanc 拿的是 worktree 的包副本**（2026-09-25 实证）：exe
+- **worktree 快照 zanc 拿的是 worktree 的包副本**（实证）：exe
   兄弟目录发现面对 worktree 编译器同样生效——`_scratch/wt_xxx/build/zanc.exe`
   会解析 `_scratch/wt_xxx/packages/`（快照提交态），仓库里**未提交**的包
   改动编不进去，症状是"改了包源码、产物行为照旧"。用快照二进制编当前
@@ -2969,9 +2966,9 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   二进制（如 `_scratch/wt-fd20/build/zanc.exe`）对照即可定位，多文件项目
   编译时 e2e 预留 `ZANC=` 环境变量切换二进制。
 
-## expr_yields_owned_rc_value 成员访问与返回值 ARC 所有权判定（2026-09-25）
+## expr_yields_owned_rc_value 成员访问与返回值 ARC 所有权判定
 
-- **症状**：调用返回静态字段/借用对象的方法（如 `public IDbConnection __Conn() { return AdminApp.Db; }`）后，调用方使用返回值（如 `ctrl.__Conn().Query(...)`）触发 `release through a stale reference (object was already freed)` 或野指针崩溃。
+- **症状**：调用返回静态字段/借用对象的方法（如 `public IDbConnection __Conn { return AdminApp.Db; }`）后，调用方使用返回值（如 `ctrl.__Conn.Query(...)`）触发 `release through a stale reference (object was already freed)` 或野指针崩溃。
 - **根因**：
   1. `src/compiler/irgen_generics.c` 的 `expr_yields_owned_rc_value` 在判定成员访问时，若当前类定义了与访问目标同名的实例属性（如 `BaseAdminController.Db` 属性），旧逻辑优先从 `g->current_type_sym` 查该名字，若为属性且有 getter 则返回 1（误判为 owned +1）。这导致 `return AdminApp.Db;` 被误认为会产生 +1 拥有值，跳过了 `emit_rc_retain_for_type`，使借用对象未加引用即交付调用方，调用方用毕无条件释放产生野释放；
   2. 指针类型混淆：`zan_binder_lookup` 查到类/结构体符号 `cs` 时，直接将 `cs->type`（`zan_type_t*`）赋值给 `tsym`（`zan_symbol_t*`），导致后续将类型结构体误当符号指针解引用；
@@ -2981,26 +2978,26 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   2. 修复指针赋值：`tsym = cs;`；
   3. 在 `irgen_stmt.c` 的返回语句处理中，当 `ret_type == NULL && g->current_fn_zan_ret_type` 时回退赋值，确保 RC 托管类型必定正确处理 retain。
 
-## Span<T> 元素赋值类型强制转换缺口（A356，2026-09-25）
+## Span<T> 元素赋值类型强制转换缺口（A356）
 
-- **症状**：向 `Span<float>` 等非 64 位宽或浮点 Span 元素赋值浮点字面量时，程序运行偶发退出码 127 或在后续 `free()` 时发生堆块元数据损坏崩溃（0xc0000374 / SIGSEGV）。
+- **症状**：向 `Span<float>` 等非 64 位宽或浮点 Span 元素赋值浮点字面量时，程序运行偶发退出码 127 或在后续 `free` 时发生堆块元数据损坏崩溃（0xc0000374 / SIGSEGV）。
 - **根因**：`src/compiler/irgen_expr.c` 在发射 `span[idx] = right;` 存储时，守卫条件原写为 `if (LLVMGetTypeKind(LLVMTypeOf(sv)) == LLVMIntegerTypeKind && LLVMGetTypeKind(elem_llvm) == LLVMIntegerTypeKind && LLVMTypeOf(sv) != elem_llvm)`。在 Zan 语言中，浮点字面量推导为 double (f64)，当目标元素为 `float` (f32) 时，由于两侧类型 kind 均为 `LLVMDoubleTypeKind`/`LLVMFloatTypeKind` 而非整型，该判断跳过了 `coerce_int_to`，导致 LLVM 直接将 8 字节双精度浮点数存储进 4 字节的单精度浮点元素槽位中。在 10 元素的批处理缓冲数组尾部，多出的 4 字节直接越界覆盖了紧随其后的堆头元数据。
 - **修法**：简化类型对齐条件为无条件 `if (LLVMTypeOf(sv) != elem_llvm) sv = coerce_int_to(g, sv, elem_llvm);`。`coerce_int_to` 内部已有完善的 `fit.fptrunc` / `fit.sitofp` 等所有基本类型转换路径，保证任何元素宽度的存储严格对齐目标类型槽位尺寸。
 
-## await 同步完成 Fast Path 与无锁原子握手（A32-4，2026-09-25）
+## await 同步完成 Fast Path 与无锁原子握手（A32-4）
 
 - **机制**：当子任务是一个纯同步完成或已缓存命中的 Task/协程时，原本的 await 发射逻辑仍会无条件分配待续帧槽、保存状态码、将当前协程挂起并排队进调度泵，产生大量不必要的上下文切换与调度抖动。
 - **契约与实现**：
   1. **Done 快速探测**：调用方在挂起前优先读取子协程帧头的 `ASYNC_FRAME_DONE` 标志，若已为非 0（已完成），直接跳过挂起，直接从结果槽读取返回值并调用 `zan_emit_frame_free` 回收子帧，在当前基本块内联继续执行；
   2. **双向无锁原子握手**：若子任务尚未置位 Done，调用方将自身恢复函数存入 `ASYNC_FRAME_AWAITER_STEP`，并对 `ASYNC_FRAME_AWAITER` 执行 `atomicrmw cmpxchg`（将 NULL 换为调用方帧指针）。若 CAS 失败（说明子协程已完成并写入完成标记），调用方不进入挂起基本块，而是直通 fast path 执行后续逻辑；若 CAS 成功，调用方才安全退出交由子协程完成时唤醒。
 
-## 标量类型到接口形参类型隐式转换漏洞（A357，2026-09-25）
+## 标量类型到接口形参类型隐式转换漏洞（A357）
 
 - **症状**：在方法调用与构造函数调用中，若将基础标量类型（如 `int`、`bool` 等）误传给接口类型形参（如 `IMenu`、`IComparable`），类型检查器未报类型不匹配错误，导致编译通过但在运行期按对象指针访问时引发非法内存访问崩溃。
 - **根因**：`src/compiler/checker.c` 中针对方法形参与构造函数形参做兼容性检查时，当目标形参为接口或对象引用类型时，未严格限制实参必须属于对象/引用/结构体或显式装箱类型，部分标量类型分支漏掉了 `type_implements_interface` 或引用类型的守卫断言。
 - **修法**：在形参实参匹配检查中全面收紧接口与对象的类型分配检查，对接口类型形参强制要求实参必须是实现了该接口的合法类或结构体类型，标量类型必须显式转换或装箱，否则当场发出诊断拦截（如 `diag_call_interface_arg_mismatch` 与 `diag_ctor_interface_arg_mismatch`）。
 
-## 通用硬件向量（Vector128/Vector256）与 LLVM 指令零开销直通（2026-09-25）
+## 通用硬件向量（Vector128/Vector256）与 LLVM 指令零开销直通
 
 - **背景与意图**：高级加速算法（图像调光/Alpha混合/通道解包/大吞吐文本与协议扫描）不能靠在 C 运行时里针对每个算法堆写 native 驱动，必须在编译器层面将硬件 SIMD 体系开放给纯 Zan 源码，使编写 Zan 源码即可直接发射单周期 CPU 机器码。
 - **Vector128 饱和运算与图像原语**：
@@ -3017,7 +3014,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
 - **内建方法名匹配陷阱**：在 `irgen_expr.c` 进行方法名长度比对时，`ExtractMostSignificantBits` 字符数严格为 26（非 27），长度计算偏差会导致内建短路失败回退至未解析外部符号。
 
 
-## 硬件加速纵切：运行时只通能力、纯 Zan 承载实现（2026-09-26）
+## 硬件加速纵切：运行时只通能力、纯 Zan 承载实现
 
 - **架构定式（用户明确否决便携 C 参考实现）**：算法实现全部住在 stdlib
   纯 Zan（带回退分支），runtime 只放三样——CPU 特性检测、薄 hw 内核、
@@ -3062,7 +3059,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   掩住它。换装/仿写 SIMD 内核时，KAT 必须覆盖"累加器非零"的后续步，
   单块自测不算通过。
 
-## ARM64 加密 intrinsic 内核：qemu 交叉验证闭环与指令语义探针（2026-09-26）
+## ARM64 加密 intrinsic 内核：qemu 交叉验证闭环与指令语义探针
 
 - **无真机也能功能验证 ARM 内核**：`zig cc -target aarch64-linux-musl
   -Xclang -target-feature -Xclang +<feat>` 交叉编译 + `qemu-aarch64` 运行，
@@ -3096,7 +3093,7 @@ extern。③ 编译器侧已加保险：main.c android `-shared` 链接行加
   `wsl.exe bash -c "<heredoc>"` 内联喂脚本有被引号损坏的风险，一律写成
   文件再执行。
 
-## 嵌入资源压缩侧接线：LLVM GEP 槽误读、ARC tag 契约与空表直通替身（2026-09-27）
+## 嵌入资源压缩侧接线：LLVM GEP 槽误读、ARC tag 契约与空表直通替身
 
 `--embed` 资源 ≥512B 且省 ≥8B 时烘焙 raw-deflate（`[u32 raw_len][u32 comp_len][deflate]`），
 len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不可 LLVMSetGlobalConstant）。
@@ -3127,7 +3124,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   是查找键，明文属设计）。字符数≠字节数：UTF-8 资产用 Python 写入时
   `len(str)` 是字符数，golden 长度断言要按字节重算。
 
-## 编译器性能 A/B 的定式（pull-in 缓存 + parse-once 实测，2026-09-28）
+## 编译器性能 A/B 的定式（pull-in 缓存 + parse-once 实测）
 
 - **跨编译器版本比 scan 阶段耗时，双方各跑两遍取暖跑**：metadata cache 的
   key 含编译器 exe 全字节 hash（防旧编译器误读新缓存），所以每个编译器对
@@ -3151,7 +3148,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   906 闭包、3.2M IR 指令、峰值 ~1.2GB、`--publish` 后可做
   IDE_RUNNING_OK 启动冒烟，是阶段 3-5 分片/manifest 工作的现成验收器。
 
-## 包命名空间发现的编译内索引（2026-10-08）
+## 包命名空间发现的编译内索引
 
 - **metadata cache 命中不代表包发现已经缓存**：namespace probe 会单独打开包内
   每个源文件；逐个 `using` 重扫所有包，让 423 文件 GUI 的暖 parse 花十余秒，
@@ -3173,7 +3170,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   拉入顺序及 AST/IR 统计；失败用例先在基线对照诊断，避免误归因或以失败
   提前退出的时长宣称提速。只复制实验输入，不把旧快照覆盖回共享工作树。
 
-## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（阶段 4，2026-09-28）
+## LLVM 文本往返分片的坑：GetValueName 悬垂、平方级打印与元数据门（阶段 4）
 
 - **LLVMGetValueName 返回的指针在改名瞬间失效**：`LLVMSetValueName2(v, new)`
   会释放旧名字符串存储，改名后继续用旧 `const char*` 读到的是新名。坑的
@@ -3206,7 +3203,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   出的新 module+fragment 文本三者共存，文本往返让峰值 1278MB→2207MB。
   把内存从一相挪到另一相不算省，验收只看全进程 PeakPagefileUsage。
 
-## 包存储发现含 CWD/项目根相对项：对照编译必炸双拉（2026-09-30，Gui.CodeEditor 拆包实测）
+## 包存储发现含 CWD/项目根相对项：对照编译必炸双拉（Gui.CodeEditor 拆包实测）
 
 - zanc 解析包存储时会扫 `项目根/packages`（monorepo 包仓）与 exe 旁
   `packages/`。做"旧布局 vs 新布局"对照编译时，只要 CWD 或项目根下有
@@ -3214,13 +3211,13 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   duplicate type declaration 成片（一次 667 错），极易误判成改动引入。
 - 实测规则：对照实验把 **CWD 切到空目录**（两条发现路径同时落空），
   或用无 packages/ 的独立工具链副本；`--stdlib-path` 只覆盖 stdlib，
-  包存储发现本身挡不住（注意：`--package-project` 自 2026-09-30 起对
+  包存储发现本身挡不住（注意：`--package-project` 自 起对
   编译期包发现生效，见下节，旧论断"只改安装作用域"已废止）。
 - 为什么：按需拉入按"命名空间 → 文件声明"精确匹配，stdlib 与包同供
   一个命名空间时不去重；错误形态是成片 duplicate 而非缺符号，归因
   极易反了（先怀疑布局改动，其实是发现路径重叠）。
 
-## 包根资源发现成编译器能力 + --package-project 编译期语义修正（2026-09-30，Zan.Gui.Browser 拆包实测）
+## 包根资源发现成编译器能力 + --package-project 编译期语义修正（Zan.Gui.Browser 拆包实测）
 
 - 机制定式：zanc 驱动发现/静态库查找/皮肤图标内嵌已从"只走 stdlib 根"扩为
   "stdlib 根 + 各包源根"（`zan_pkg_all_source_roots`：项目 packages/、
@@ -3249,7 +3246,7 @@ len 置符号位为旗标，读 API 惰性解码并原位修补表槽（表不�
   所有 `<模块>/<文件>.zan` 显式输入路径必须同步改（golden 案例已注册但没
   人跑 = 坏了也没人发现）。
 
-## 闭包捕获的引用模型与"按迭代捕获"的实现边界（B-ID33，2026-09-30）
+## 闭包捕获的引用模型与"按迭代捕获"的实现边界
 
 坑出处：for 循环变量被闭包捕获时三连得 `3,3,3`（C#1/JS var 行为），提案改 Go 1.22
 按迭代语义。第一直觉"回边处造新 cell 并重绑槽位"是死路：irgen 单遍发射，cond/body
@@ -3279,20 +3276,20 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 `lld-link: failed to write output ... permission denied`——串行构建；链接失败先
 `tasklist` 查 zanc.exe/lld-link 残留（也可能是并行会话的瞬时编译，会自行退出）。
 
-## 包发现不认无命名空间文件：拆库出包前先扫"无 ns 源"（2026-09-30，Zan.Data 拆包实测）
+## 包发现不认无命名空间文件：拆库出包前先扫"无 ns 源"（Zan.Data 拆包实测）
 
 - 坑：包发现按"声明命名空间==目标"精确匹配（pkg_visit_source_tree），无命名空间的
   全局命名空间纯函数库（如 MySqlWire.zan，批 D-1 从 async/sync 双胞胎合并而来）
   永远不成为候选——同目录同命名空间的调用方文件能进编译，它进不了，
   `unresolved call 'MySqlWire.readLenenc'` 且错误挂在包内文件行号上，极易误判为
   搬迁搬丢了文件或编译器解析回归。stdlib 时代它靠整目录 glob 天然入集，拆包后
-  此路径消失；层级包（ZanWeb.Controllers）盲区同根同源（B-ID18，2e75673e 引入）。
+  此路径消失；层级包（ZanWeb.Controllers）盲区同根同源（，2e75673e 引入）。
 - 修复语义（package.c/main.c，三件套）：① 声明 ns 精确或"目标+点"前缀匹配
   （pkg_ns_match）；② 无 ns 文件按"源根相对目录（分隔符转点）==目标命名空间"匹配
   （pkg_rel_dir_ns）——文件只归入其兄弟声明的那一个目录，逐目录访问天然不重复；
   ③ 安全门：stdlib 同名目录存在的命名空间保持精确匹配（stdlib_has_dir）——否则
   ubiquitous 的 `using System;` 配 pkg_src 无条件入集，会把所有包的 System.* 源
-  拉进每一次编译（pkg_src 是"只被生成路由表点名"的包文件的活名门豁免，见 B-ID18）。
+  拉进每一次编译（pkg_src 是"只被生成路由表点名"的包文件的活名门豁免，见 ）。
 - 动手前先扫：逐包源 `grep -c "^namespace"` 找零命中文件——无 ns 源是拆包的
   隐藏地雷，发现即知要靠 rel-dir 匹配（或给文件补 ns，但那是绕行不是修复）。
 - A/B 隔离技法（归因"编译器回归还是拆包破损"）：把 build/zanc.exe 与 build/zanrt*.obj
@@ -3303,9 +3300,9 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   `1c1 < PASS > PASS`；先 od -c 看字节，再用 diff --strip-trailing-cr 复核，
   并与 HEAD 干净树 A/B 确认既有，勿当回归修。
 
-## 裸简单名调用的"全局兜底唯一性"：跨包同名类同框即失效（2026-09-30，Zan.Desktop 拆包实测）
+## 裸简单名调用的"全局兜底唯一性"：跨包同名类同框即失效（Zan.Desktop 拆包实测）
 
-- 坑：不带 using 的静态调用（如 Gui 代码裸写 `Window.GetTickMs()`，Window 实为
+- 坑：不带 using 的静态调用（如 Gui 代码裸写 `Window.GetTickMs`，Window 实为
   Gui.Backend.Window）走简单名全局兜底解析，该兜底要求**全编译面唯一**。当另一个包
   声明了同名类（System.Automation.Window / System.Windows.Clipboard）同框编译，
   所有缺精确 using 的裸调用集体失效——报 `not a known variable, type, or namespace`
@@ -3324,7 +3321,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   publish 的编译器快照，把它拷到 build/zanc.exe 跑同一构建（IDE_NO_PUBLISH=1），
   同错 ⇒ 非新编译器回归。用完恢复原 zanc。
 
-## 构建代际联动：gui_runtime 的 ABI 由 zanc 发射侧决定，ninja 追不到（B-ID23，2026-09-30）
+## 构建代际联动：gui_runtime 的 ABI 由 zanc 发射侧决定，ninja 追不到
 
 - 坑：gui_runtime.c（zan_gui.dll 的源）镜像的 ABI 决策活在 zanc 的发射逻辑里
   （对象/串布局、调用约定、反射协议），**不在任何 C 头里**——ninja 的依赖追踪
@@ -3339,7 +3336,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
 - 同型问题举一反三：凡"C 侧手抄镜像发射侧契约"的文件（自研运行时、驱动、
   生成器宿主）都照此钉住生成器可执行文件，别指望源码 diff 触发重编。
 
-## 拉入门 user_decl 遮蔽与外围命名空间解析：同名类错绑的两个底层缺口（Zan.Security 拆包实测，2026-09-30）
+## 拉入门 user_decl 遮蔽与外围命名空间解析：同名类错绑的两个底层缺口（Zan.Security 拆包实测）
 
 - 坑一（拉入门 user_decl 遮蔽命名空间盲+顺序依赖）：pi 活名门控的 `user_decl`
   遮蔽按**裸名**生效——任何输入文件声明的顶层类型 X 都会压制 stdlib 同名 X.zan
@@ -3348,7 +3345,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   就拉不进 stdlib 真身：nsresolve 表里只剩 Management.Cpu，using 命中落空，
   裸名兜底错绑（报 `'Cpu' has no member 'HasSse42'`）。更毒的是**顺序依赖**：
   遮蔽只在 `pi_flag_istr` 打标时生效——声明文件排在引用文件之前才压制，
-  排后则 flag 先到获胜，同一代码随参数顺序时过不过。B-ID35 教训"带 using 的
+  排后则 flag 先到获胜，同一代码随参数顺序时过不过。教训"带 using 的
   调用方不受影响"在拉入层不成立：using 命中的前提（stdlib 文件入表）被拉入门
   掐掉了。`ZAN_PULLIN_DEBUG=1` 直接看 `incl/skip ... because X` 定位此类。
 - 修法一：user_decl 遮蔽窄化到**全局命名空间**声明（AST 路径看 stamp 后
@@ -3372,11 +3369,11 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   幸存），必须**二分真实全量输入**：先 `@rsp` 全量复现，再逐组裁剪到最小
   复现集，`ZAN_PULLIN_DEBUG=1` 对比拉入清单定锁 who-suppressed-what。
 
-## 项目与包共用命名空间名的"平行副本"：双向撞名无增量解（2026-09-30，server-collab 模板实测）
+## 项目与包共用命名空间名的"平行副本"：双向撞名无增量解（server-collab 模板实测）
 
 - 坑：拆包前的老项目（模板/示例）常整树保留框架平行副本，且与包**共用命名空间
   名**（模板 `namespace ZanWeb.Dao.Sys`、`ZanWeb.Framework.Services` 与包同名同
-  形）。编译集一旦两侧同框（B-ID18 后包发现按层级拉族，更易同框），同名命名空间
+  形）。编译集一旦两侧同框（后包发现按层级拉族，更易同框），同名命名空间
   被**合并**成一张表，两份同名类都在：裸名解析命中哪份由 using/同 ns/兜底的竞争
   决定，且**双向都会中招**——包侧裸名（`MetricsStore`、`SettingKeys`、
   `SysUserDao`）命中模板副本，报 `has no member FlushAtExit`（模板副本落后于包的
@@ -3396,7 +3393,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   噪声（别的会话改到一半的包文件）完全隔离。tar 对 linux 驱动符号链接的报错在
   Windows 无害。
 
-## 生成器子编译不认生成器魔法，也不许吸包：--no-packages（2026-09-30，Zan.Net 拆包实测）
+## 生成器子编译不认生成器魔法，也不许吸包：--no-packages（Zan.Net 拆包实测）
 
 - 坑：`Json.Serialize<T>`/`db.Insert<T>` 是**生成器魔法**——只在父编译的生成管线里
   降级重写（`__JsonBind.D_/S_`），全仓根本没有 `class Json`。genrun 的生成器子编译
@@ -3418,7 +3415,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   语义是"无条件"，stdlib 的语义是"被提及才入"。生成器子编译、LSP 单文件、
   任何 `--no-gen` 路径都在此列。
 
-## 分裂命名空间与数据资产：拆半留半的三连坑（2026-10-01，Zan.Text 拆包实测）
+## 分裂命名空间与数据资产：拆半留半的三连坑（Zan.Text 拆包实测）
 
 - 坑一（真空门击穿）：System/Text 拆半留半（Encoding 留 stdlib，七个处理文件
   入包）后 hello-world 从 14 文件涨到 21——永远入编的 ext 核心文件
@@ -3435,7 +3432,7 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   "翻译失效"，实为嵌入断链。修法：改走 `zan_resolve_gui_resource_dir`
   （stdlib 候选 + 全部包源根候选，Gui skins/icons 同款）。
 - 坑三（walk-up 尾分隔符停摆）：数据回退链的源码树逐级上溯写法
-  `dir=ExeDir(); 循环{ 扫到最后分隔符; dir=Substring(0,i); 试候选 }`——
+  `dir=ExeDir; 循环{ 扫到最后分隔符; dir=Substring(0,i); 试候选 }`——
   ExeDir 返回**带尾分隔符**的目录，第一轮扫描立刻在末字符 break，
   Substring(0,len) 原地不动，六轮全试同一条候选。此模式在 Gui 图标包等
   同构代码里同样存在；循环前先剥一个尾分隔符。
@@ -3443,9 +3440,8 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   （Pinyin("zhongwen")=="zhongwen"）不触发数据链，测了等于没测。
 - 探针里的内建类型**不走全限定名**：BT 注册的内建类型（Console 等，
   builtin_api.c 成员表）不进命名空间解析的限定名回退，`System.Console.WriteLine(..)`
-  直接报 "'Console' is not a known variable, type, or namespace"（2026-10-01
-  真空门探针踩过，白白烧一轮编译）；探针一律 `using System;` + 裸名形态。
-- 拆包轮的**验证假绿双坑**（2026-10-01，IO/Web 拆包实测）：① run_case.cmake
+  直接报 "'Console' is not a known variable, type, or namespace"（真空门探针踩过，白白烧一轮编译）；探针一律 `using System;` + 裸名形态。
+- 拆包轮的**验证假绿双坑**（IO/Web 拆包实测）：① run_case.cmake
   有工件复用优化——conf_*.exe 新于全部源+STDLIB_STAMP 即跳过编译直接重跑，
   而 stdlib **布局搬移不碰 stamp 不重建 zanc**，家族 ctest 可能整批 0.06s
   "通过"实际全是拆包前编的旧 exe。拆包轮跑 ctest 前先 `rm build/conf_*`（或
@@ -3461,55 +3457,55 @@ foreach 变量不用处理：它是 entry alloca（非装箱），捕获本就�
   TDM-GCC 出 rpcnsip.h 类型错——AGENTS 警告的私目录变体），再 `--build --target zanc`；
   私 zanc 编探针须带 `--stdlib-path stdlib`（exe 旁发现失效）+ `--no-packages`（隔离并行
   会话在途包改动）。共账 build/ 不必抢：对方下次 ninja 调用自动用新源重链。
-- **机制开关类注释会滞后架构演进，还会污染台账**（2026-10-01，async-workers 正名轮实测）：多 worker M:N 异步驱动早就是 native 64-bit 目标的**默认**（编译器按 target 判定选链哪个驱动对象），而运行时 11 处注释仍写"编译时加 --async-workers 才启用"——该旗标从未出现在 argv 解析里，纯注释民间传说；新会话（包括写台账的会话）读注释即被带偏，把"已默认"错记成"待评估缺口"，白做一轮"默认化改造"调研。定式：机制/开关类陈述以**代码判定点**为准绳——`grep -rn '<旗标名>' src/compiler/` 若只命中注释、argv 解析零命中，即为传说；真值源是编译器里选路径的那处初始化（capability 判定/条件编译），注释只有对上判定点才可信。写台账引用机制前先做这一步。
-- **协作式调度器"定时器只在 idle 泵"会在持续负载下饿死 timer 交付**（2026-10-01 抢占轮实测）：回边抢占让 CPU 密集帧每片重排自身后，就绪队列**永不为空**，而 M:1 的 run_until 和 mt 的 co_worker 都只在队列排空的 idle 路径派发到期定时器——`Task.Delay` 兄弟照样饿死，抢占等于白做。通则：忙碌路径必须也派发到期定时器（M:1 每次 dispatch 顺手 zan_timer_dispatch_due，一锁一堆顶；mt 走现成 1ms 节流 co_pump_timers）。任何"事件循环只在没活干时看钟"的调度器都有同款坑。
-- **LLVM 会把纯计算热循环折成闭式（SCEV），热循环探针必须含不透明副作用**：`s=s+j` 累加循环在 Release 下被折成一条公式，"热循环"微秒跑完，抢占/调度探针全程测不到东西。内层循环塞原子 RMW（AtomicInt.Add）或外部调用才保得住真实耗时——但外部调用别选 Stopwatch.GetMicroseconds：NowTicks() 每读做一对 NativeMemory.Alloc(8)/Free，多线程热循环在 CRT 堆锁上串行（实测 128 线程墙钟随核数涨 3×），探针要用 DllImport zan_co_precise_us（B-ID55）；探针断言也别用会被 LICM 提外的普通 Load（外层判 flag 用 intervening 有副作用调用保证不被提升）。
+- **机制开关类注释会滞后架构演进，还会污染台账**（async-workers 正名轮实测）：多 worker M:N 异步驱动早就是 native 64-bit 目标的**默认**（编译器按 target 判定选链哪个驱动对象），而运行时 11 处注释仍写"编译时加 --async-workers 才启用"——该旗标从未出现在 argv 解析里，纯注释民间传说；新会话（包括写台账的会话）读注释即被带偏，把"已默认"错记成"待评估缺口"，白做一轮"默认化改造"调研。定式：机制/开关类陈述以**代码判定点**为准绳——`grep -rn '<旗标名>' src/compiler/` 若只命中注释、argv 解析零命中，即为传说；真值源是编译器里选路径的那处初始化（capability 判定/条件编译），注释只有对上判定点才可信。写台账引用机制前先做这一步。
+- **协作式调度器"定时器只在 idle 泵"会在持续负载下饿死 timer 交付**（抢占轮实测）：回边抢占让 CPU 密集帧每片重排自身后，就绪队列**永不为空**，而 M:1 的 run_until 和 mt 的 co_worker 都只在队列排空的 idle 路径派发到期定时器——`Task.Delay` 兄弟照样饿死，抢占等于白做。通则：忙碌路径必须也派发到期定时器（M:1 每次 dispatch 顺手 zan_timer_dispatch_due，一锁一堆顶；mt 走现成 1ms 节流 co_pump_timers）。任何"事件循环只在没活干时看钟"的调度器都有同款坑。
+- **LLVM 会把纯计算热循环折成闭式（SCEV），热循环探针必须含不透明副作用**：`s=s+j` 累加循环在 Release 下被折成一条公式，"热循环"微秒跑完，抢占/调度探针全程测不到东西。内层循环塞原子 RMW（AtomicInt.Add）或外部调用才保得住真实耗时——但外部调用别选 Stopwatch.GetMicroseconds：NowTicks 每读做一对 NativeMemory.Alloc(8)/Free，多线程热循环在 CRT 堆锁上串行（实测 128 线程墙钟随核数涨 3×），探针要用 DllImport zan_co_precise_us；探针断言也别用会被 LICM 提外的普通 Load（外层判 flag 用 intervening 有副作用调用保证不被提升）。
 - **特性带 env 关闭旋钮时，探针必须跑"关"态做 A/B**：ZAN_CO_QUANTUM_MS=0 重跑同一探针得到相反断言（brokeEarly 1 vs 0），证明测试真的测到了特性而不是恒真；conformance 用例配 ctest `ENVIRONMENT` property pin 住关键变量（本例 ZAN_CO_WORKERS=1，否则多 worker 下兄弟本就在别的 worker 上跑，用例恒绿测不到抢占）。
 - 私目录 zanc 追加两条：编译 wasm32 目标需 `build/wasm32` sysroot 在**exe 旁**（`cp -r build/wasm32 _scratch/bld-y/`），且 wasm32 async 目前链不过（`_setjmp` undefined，既有缺口非新回归）——IR verify 阶段已足够验证发射体；包类型用例在私 zanc 下走 MVC 模式显式传包源文件（exe 侧发现不出 _scratch，`--auto-stdlib` 半解析会报 ZANPKG_MISSING 假象）。
-- **wasm32 的 setjmp/longjmp 是"引擎传输"不是 libc 符号**（2026-10-01 B-ID47）：wasi-libc 三档案（libc.a/libzigc/builtins）符号表零 setjmp，LLVM 20 wasm 后端连 `__builtin_setjmp` 都报 not supported——在 wasm 上造真 setjmp 是死路，也没必要：Zan 异常在 wasm 走 wasm.throw/catchswitch（引擎展开），async 守卫的 setjmp 只需永远返回 0 的 returns_twice 桩（rt_wasm.c），longjmp 是链接解析用的死符号。emit_eh_setjmp 按目标分派时新目标默认会掉进"`_setjmp`"托管分支——加目标先查这条链。
+- **wasm32 的 setjmp/longjmp 是"引擎传输"不是 libc 符号**：wasi-libc 三档案（libc.a/libzigc/builtins）符号表零 setjmp，LLVM 20 wasm 后端连 `__builtin_setjmp` 都报 not supported——在 wasm 上造真 setjmp 是死路，也没必要：Zan 异常在 wasm 走 wasm.throw/catchswitch（引擎展开），async 守卫的 setjmp 只需永远返回 0 的 returns_twice 桩（rt_wasm.c），longjmp 是链接解析用的死符号。emit_eh_setjmp 按目标分派时新目标默认会掉进"`_setjmp`"托管分支——加目标先查这条链。
 - **交叉目标 zanrt 对象是提交进仓库的预编译二进制，运行时源码每次变更都要重跑 `scripts\build_cross_rt.cmd <zig>`**：新增符号（如 zan_co_quantum_ms）只在原生目标练过，交叉链接才爆 undefined；linux/macos/android/ios/wasm32 全部 zig 可达（OHOS 需 NDK）。重编后 toolchain/ 与 build/<tsub>/（zanc exe 旁）双份都要刷新——zanc 从 exe 旁读对象。
-- **wasm32 产物可以 node 实跑，但 node:wasi 有两个静默坑**（2026-10-01 验证）：① 默认 args 会害 `args_get` 返回 28(NAMETOOLONG)，libc 初始化即 `proc_exit(71)` 且**无任何输出**——构造时必须显式 `args:['prog'], preopens:{}`；② 默认 returnOnExit=false 把 proc_exit 吞成异常、stdout 接死管道，表现为"静默 exit 0"。可用 returnOnExit:true 拿退出码 + 包一层 import 调用日志定位；或自写 Proxy 桩 runner（fd_write 直连 process.stdout；fd_prestat_get 必须返回 8(BADF) 结束 preopen 循环，返回 0 会死循环）。修好后 M:1 内联驱动、poll 发射等"只有 wasm 走的路径"有运行时验证，不再止步 LLVM module verify。
-- **mt 驱动自建重排路径必须带 co_submit 的全套记账（g_co_outstanding+g_co_activity）**（2026-10-02）：步返回重排若绕过 co_submit 直呼 lq_push，帧在环里排队但 outstanding=0——zan_co_sched_run 后台池等待循环只凭 running/outstanding/io/timer 判静默，会提前返回，@main 退出清扫把 RC 静态字段清零，后台 worker 随后读静态即 "null reference: receiver ... is null"（~1/3 复现、exit 0 静默截断，极易误归因到用户代码）。凡是新增"把帧放回队列"的路径，先对 co_submit 抄账。
-- **Windows 停车原语的等待粒度按系统 tick 取整，微秒期限钟必须配 timeBeginPeriod 才可见**（2026-10-02 B-ID48）：期限堆切 µs 后 Delay(50) 仍超期 13ms——GQCS 超时参数不走微秒堆的精度，实睡 63.2ms for 50ms（trace 铁证）；修法是调度器 worker 入口动态加载 winmm timeBeginPeriod(1)（LoadLibrary 零硬导入，控制台链接表没有 winmm；Win10 2004+ 请求进程内生效，不调 EndPeriod 因 worker 池重启使 Begin/End 跨线程配对成竞态）。POSIX 无此问题（poll/sleep 走 CLOCK_MONOTONIC 内核粒度），平台分支用空静态函数让 -O2 消除——linux zanrt_io 重编后与旧对象字节一致即是"POSIX 零代码生成"的免费强校验。
-- **循环回边埋点的逐迭代成本会吞掉整个热循环——时钟读必须门控**（2026-10-02）：协作抢占的 zan_co_poll 埋在每个 async 循环回边，原实现每次调用读一次钟（QPC），实测占计算循环逐迭代成本的 ~85%（23ns/iter→3.7ns/iter，k=1 总墙钟 6.2×）；修法=worker 本地计数器每 256 次放行一次读钟（2ms 量子最多超冲 256 次 ns 级迭代，微秒诚实保留），M:1 内联发射体同款（模块级计数全局，单线程无需原子）。教训：凡是"每迭代都执行"的埋点（统计、断言、采样），成本按乘在最大迭代数上估，先门控再上线。
-- **A/B 对拍运行时行为时，换对象必须重编探针**（2026-10-02）：`git stash` 运行时源→重 build→跑**旧探针 exe**（链接的还是改动后对象）当"基线"，得出 5/10 复现的假结论——基线与实验二进制必须都从当前对象重链，否则 A/B 测的是同一个东西。
-- **发布装运（--publish）逐文件拷贝失败绝不能静默，聚合警告要区分原因**（B-ID52，2026-10-02）：驱动装运循环 `zan_copy_file` 失败若静默吞掉，最外层聚合警告统一把原因归结为 "no runtime library found in ... add a manifest"，极具误导性——实测案例：输出目录有残留运行中进程锁持其导入的 DLL（winerr 32 ERROR_SHARING_VIOLATION），库实体存在但目标不可写，用户却被引导去查清单和搜索路径。定式：文件拷贝封装 `zan_copy_file_ex` 带出详细错误码（Windows 下 GetLastError/errno，Unix 下 strerror/errno），逐文件失败立即输出告警定位 src/dst 与真因；聚合警告细分为"无运行时库"与"拷贝操作失败（目标文件可能被占用或权限拒绝）"，让排查秒级定位。
-- **发布装运对 C 原生库间接依赖必须以 DLL 静态导入表为唯一事实依据**（B-ID51，2026-10-02）：跨平台 C 原生客户端（如 PostgreSQL `libpq.dll`）不可想当然假设"某平台不需要某底层库"——必须用 pefile/dumpbin 严格反查 PE 静态导入表（`DIRECTORY_ENTRY_IMPORT`）；实测 Windows 版 `libpq.dll` 硬性依赖 `libcrypto-3-x64.dll` 与 `libssl-3-x64.dll`。若标准库拆分或重构移除了上层原生模块，底层 C 驱动模块必须在其平台 driver 目录内置该套 DLL 并更新 `pq.bundle`，禁止在驱动清单中留下 `@driver/` 空悬引用产生伪告警或目标机缺 DLL 启动崩溃。
-- **zig wasi-libc 的 WASI 导入桩真名带 `__wasi_` 前缀**（2026-10-03 B-ID81h 实测）：wasm32 侧 `[DllImport("wasi", EntryPoint="random_get")]` 链接失败——zig 构建的 wasi-libc 不导出裸 `random_get`，手拼 `__imported_wasi_random_get` 前缀也不对，真名是 `__wasi_random_get`（`__wasi_<名>`）。新接 WASI 原语先 `llvm-nm toolchain/wasm32/liblibc.a`（或 wasi-sysroot 档案）查真名再写 EntryPoint，别按文档裸名臆写。
-- **按需拉入闭包的"二次扫描"必须静音 reach 副作用，兜底 round 的触发器必须限定来源**（2026-10-02 B-ID87 踩出）：`pi_scan_file` 扫描文件时 `pi_note_using` 会顺手 `pi_reach` 它的 using 目录——任何"只为读 top-level 名"的二次扫描（如新增的 repair walk）都必须置 `pi_repair_scanning` 静音，否则全树 using 全部 reach，`pkg_src` 文件在其目录 reached 后无条件入编，13 文件的 hello-world 编成 122 文件。同族两条：① 兜底 round 的触发器必须按来源门控（stdlib 作者文件的 mention 才置 `flagged_stdlib`）——内建类型名（Console 等）和 AST 种子文档化的合法过近似让"存在未满足名"在每个程序上都成立；② reach 集只加"命中名的声明目录"，绝不 reach-all（包目录一旦 reached 即全家入编）。
-- **静态 fd 字段零初始化 = 0，而 0 是合法 fd（stdin）——"-1 哨兵"结构必须显式 prime**（2026-10-03 B-ID88）：`static zan_io_shard_t g_ioshard[256]` 的 poll_fd 零初始化成 0，开片守卫 `poll_fd < 0`（跳过）与 `poll_fd >= 0`（视为已开）双双短路——分片携 epfd=0 运行，epoll_ctl/epoll_wait 全 EINVAL(22)，注册假失败 → 0 字节假 EOF（bad=64）→ 一条 fail-woken 帧滞留死账，`zan_io_has_pending()` 永真 → sched_run 排水循环永不退出，表象是"WhenAll 迟到几十秒"实为退出挂死。修法 = `io_shards_prime()` 一次性三 fd 全 -1，在一切守卫读数组之前调用（epoll/kqueue/POSIX 三个入口）。通则：凡以 -1 为"未打开"哨兵的静态结构不信零初始化；诊断钩子：挂死进程先 `/proc/$PID/task/*/wchan` 采样（nanosleep=排水循环、futex=工人群、epoll=反应堆），再上 ZAN_SCHED_TRACE=1 环境门控 STRACE（rt_io.c/rt_timer.c 常驻，IOTRACE 同型）抓 io_arm 失败的 fd/epfd/errno——`epfd=0 + errno 22` 组合直接定罪这条路。
-- **WSL 的 tmpfs /tmp 会在 wsl.exe 调用间随 VM 回收蒸发**（2026-10-03 B-ID88 取证实测）：上一次调用落盘的探针日志下次 `wsl.exe` 进去就没了（VM 整个回收），丢失即无法补采——进程活着时立刻 `cp /tmp/xxx /mnt/d/...` 持久化到 Windows 盘再继续；/mnt/d 下的文件则跨调用存活。
-- **zig 交叉建 Windows DLL：输出路径必须平/绝对，导入库走 zig dlltool**（2026-10-03 B-ID81b 实测）：`zig cc/c++ -target aarch64-windows-gnu -shared` 相对 `-o` 路径会把自动导入库写进 `zig tmp\<hash>\<相对路径>` 拼接目录（父目录不存在 → lld-link "No such file or directory" 无文件名报错）；`-static` 与 `-shared` 同给产出 `!<arch>` 静态档案而非 DLL；`-Wl,--out-implib`/`-femit-implib` 不接受（implib 由驱动自动发但 tmp 即清）。落地配方：在输出目录内平路径链 DLL，导入库用 `zig dlltool -m arm64 -d <def> -D x.dll -l libx.dll.a`（def 从 DLL 导出表生成纯名单，含 `a=b` 行会丢符号 member）。产物验证三板斧：pefile 查 Machine(0xaa64)/IMPORT（系统库+UCRT apiset，不得出现 libstdc++）/EXPORT 与 .def 逐一比对。
-- **PE 链接疑云第一步：核对被引符号真的在导出表里**（2026-10-03 B-ID89 虚惊全记录）：链不上先 `python -c "pefile 导出表"` 查符号存在性——探针里自编的符号名（如想当然的 `zan_gui_init`）不在 DLL 导出表，会让 dlltool 导入库、lib.exe short import、直连 DLL 三种通路"全部失败"，看起来像链接器对某 arch 的空白，实为幻影符号；x64 对照"通过"也不可信（它报的 __main 只是解析顺序靠前掩盖了同一幻影）。修正后同环境实测：ld.lld -m arm64pe 对 dlltool GNU 导入库与直连 DLL、lld-link -lldmingw 双格式全通，zanc --target win-arm64 消费 zan_gui 探针 E2E 出正确 PE——arm64 PE 消费链接本就健康。仲裁首选 zanc 真链路（最小 [DllImport] 探针），别拿自拼 linker 命令当终审。
-- **CI 是否真落地，看 bot 提交不看猜 runs**（2026-10-03 实测）：无 gh/API（api.github.com 被断）时，workflow 产物的事实源是 `git log --author=github-actions` 的回写提交——闭账文案声称"workflow 自动重跑回写"后若无对应 bot 提交（连应出 diff 的对象都没写），就是 win 腿 continue-on-error 静默失败或未触发，按未落地处理，本机配方补齐并明注 provenance 等 CI 重刷。
-- **CI 回写步的 git add 必须核对 .gitignore**（2026-10-03 drivers.yml 实测）：`*.dll` 全局忽略时，提交步普通 `git add <dir>` 对未跟踪 DLL **静默跳过**（exit 0 无警告）——构建全绿、提交照打、DLL 永远不落地；对已跟踪文件的删除却照单全收（10-01 bot 提交就是这么把 payload 删掉的）。凡"构建产物回写"步骤逐个 `git check-ignore` 过一遍，入库产物用 `git add -f`。
-- **交叉 rt 对象必须从 HEAD 已提交源编，不能从工作树**（2026-10-03 实测拦截）：共享树的并行会话常载着在途 diff（哪怕 2 行）——从工作树源编出的对象与已提交源不一致，下次 check_toolchain_stale --verify 必报 rebuild differs，且对象里的符号在源里找不到。正确姿势：`git show HEAD:<src> > _scratch/x.c` 后用 -I 原目录编临时副本；提交自己名下的对象前 `git status` 扫一眼源文件是否带别人的 M。
-- **x86 intrinsic 在非 x86 目标是 SelectionDAG fatal，不是告警**（2026-10-04 B-ID92 实测）：`Sse42.Crc32` 被 irgen 无条件发射成 `llvm.x86.sse42.crc32.*`，GUI 宿主程序把 `Crc32C_Compute` 拉进模块后 android/ohos-arm64 交叉编即 "Do not know how to promote this operator's operand!"（legalizer abort，无诊断无函数名）。定位定式：`--emit-ir > x.ll`（注意 emit-ir 对超大模块尾部截断且 exit=0，是独立缺陷别误当崩点）→ llc 前先洗 `define extern_weak`→`define`、补 attributes 桩与非内建 @ 符号的 declare（c"..." 字符串体里的 @ 不是符号引用）→ llc 复现后 stack dump 的 "Running pass ... on function '@X'" 直接给崩点函数。修法：发射侧按 target_triple 分流——x86 走硬件 intrinsic，其余架构落查表软件链并与硬件路径做 qemu 实跑位精确对拍；运行时守卫（Cpu.HasSse42 在 ARM 恒 0）不救编译期——死代码也必须能过 ISel。同类目标失配 emit_aes_call 已由 B-ID94 同法闭账（见下条）。
-- **目标特定发射必须三分支化，两分不够**（2026-10-04 B-ID93）：`__zan_cpu_feature` 只有「本机 x86 / ARM」两分支，wasm32/riscv 掉进 x86 的 cpuid 内联 asm，后端报 `couldn't allocate output register for constraint '{ax}'` 编译期 fatal。修法：非 x86 非 ARM 直接 `ret i32 0`（无 cpuid 概念的目标全部特性位恒 0）。凡是「本机指令 vs 其它」的发散点，先把目标全集列出来再写分支。
-- **istr 长度常量错一位 = 静默漏接，症状在链接期不在编译期**（2026-10-04 B-ID94）：`InverseMixColumns` 实长 17，emit_aes_call 写成 `method.len == 18` 从未匹配，调用静默漏到 DllImport 外部路径——DllImport 的 struct 返回经 `zan.abi.<Name>` sret thunk 注册，拦截链没接住就发裸 extern 调用，最终 `undefined reference` 而非编译错误，没人调用过的分支可以烂几个月不被发现。约定：`method.len == strlen` 且 memcmp 不含 NUL，每个长度常量写前数字符。
-- **ARM AES 轮指令先 XOR 轮密钥再 SubBytes/ShiftRows，与教科书相反**（2026-10-04 B-ID94）：AESE(a,k)=SR(SB(a^k))，S 盒非线性 ⇒ 单条 AESE 永远出不了 `SR(SB(a))^k`；把 x86 AESENC 直接翻译成 aesmc(aese(a,aesmc(k))) 是错的（qemu 实跑逐字节对拍抓出）。正确代数（MC/IMC 的 GF(2) 线性折键）：AESENC=aesmc(aese(a,0)⊕aesimc(k))、AESENCLAST=aese(a,0)⊕k、AESDEC=aesimc(aesd(a,0)⊕aesmc(k))、AESDECLAST=aesd(a,0)⊕k、IMC=aesimc(a)。纪律：这类代数先 Python 对 x86 硬件金样 + 随机数验证，再落 irgen，再 qemu 对拍；aarch64 用 llvm.aarch64.crypto.* 需要 crosscomp.c 与 irgen_emit.c 两处特性表都给 +aes。
-- **Windows 收尾 ExitProcess(0) 会把 stdio 缓冲尾巴静默蒸发**（2026-10-05 B-ID95）：ExitProcess 跳过 CRT 退出，stdout 缓冲里最后不足 4KB 的残余直接丢（--emit-ir 204MB IR 停在函数中段、exit=0、fputs/ferror 全程健康；实测一轮恰丢 1415 字节）。正常编译 stdout 不载货所以烂很久没人发现，小模块同样丢尾只是没人验尾。修法：ExitProcess 前手工 fflush(stdout)+fflush(stderr)，保留跳过 CRT 慢销毁的初衷。诊断定式：先插探针对拍 strlen/fflush/ferror 分清生产端 vs 写端，再以「带 fflush 恒全量、不带恒截」锁定退出路径——别先怀疑 fputs 或 LLVM。
-- **parser 投机前瞻与递归防护：逐字段快照必须含条件指令栈，防护必须落在真实递归点**（2026-10-05 B-ID107）：① parser 侧 lexer_peek_n 逐字段保存 pos/line/col/interp/defines 时漏掉 cond_depth/cond_overflow/cond_stack/cond_seen_true——窥探跨过 `#if/#else` 后位置回滚而条件栈残留，主解析再处理同一指令就双压栈，后续所有条件指令错位（全结构快照 `*p->lex` 天然覆盖，逐字段镜像 lexer.c 的 peek 助手必须一字段不漏）；② `defer defer ...` 链是 parse_statement 的 TK_DEFER 分支直接递归、`else if` 链是 parse_if_stmt 直接递归，都不经过 parse_block——深度防护只放 parse_block_stmts 入口看不见嵌套层（6000 层链照样爆 C 栈），要在递归点用 stmt_depth 计数：到上限发诊断、吞一个 token 保推进、返回形状安全的空节点；③ skip_angle_group 数 `<...>` 深度必须认词法贪心合并的闭角 `>>`=2、`>>>=3，漏了就在嵌套泛型（`List<List<int>>` 局部函数）上跑到 `;`/EOF 误判；④ 探针坑：Zan 方法必须包在 class 里，顶层裸方法的报错是 "expected type declaration" 级联，与被测逻辑无关。
-- **pthread_mutex_init 不能碰已持有或被阻塞的互斥；静态数组成员互斥靠零初始化是 glibc/musl 巧合**（2026-10-05 B-ID108）：rt_io 的 zan_io_init 一边 shard_lock(g_ioshard[0]) 一边在 io_shard_open(0) 里对同一互斥 pthread_mutex_init——re-init 持有中的锁是 UB，第二个阻塞在该互斥上的线程等状态被 re-init 直接抹掉（表现为偶发首 await 挂死/状态错乱）；而那把"第一把锁"此前落在静态数组全零字节上，只在 glibc/musl 凑巧可用，换 libc 即爆。定式：初始化路径用 PTHREAD_MUTEX_INITIALIZER 静态互斥专锁（无引导问题），共享结构里的互斥在首个 init 内一次性 prime 全部成员并打 one-shot 标志（shutdown/reinit 周期绝不 re-init 活锁）；Windows 对应物是 SRWLOCK_INIT（同样免引导）+ 双检 started 标志——懒初始化入口（首个 await 可落在任意 worker 线程）必须按并发首用设计，不能按"主线程先跑"假设。
-- **同文件里同构哈希表的策略必须镜像，漏一边就是容量棘轮**（2026-10-05 B-ID110）：rt_timer 的 live map（zan_co_live_add）阈值触发时按「live*4>cap 才翻倍，否则原容量 rehash 收缩墓碑」，joinmap_put 同型表却一律翻倍——高吞吐定时器的 WhenAll churn 突发（批量完成留一堆墓碑，下一个插入又踩到 3/4 阈值）把容量棘轮式推上去永不回落。改任何开放寻址表的 grow 阈值时，先 grep 全文件找同构表，策略一字不差地镜像。
-- **SA_ONSTACK 没有 sigaltstack 等于没设**（2026-10-05 B-ID111）：崩溃处理器带 SA_ONSTACK 注册却从没装备用栈——栈溢出触发的 SIGSEGV 无法在已溢出的栈上投递，处理器自身当场再炸，崩溃报告永远出不来（WSL 深递归探针三跑无报告，装 64KB 定长备用栈后三跑全出报告）。定长而非 SIGSTKSZ：glibc>=2.34 的 SIGSTKSZ 是 sysconf() 非常量，头文件要过严格 -std=c11；装前 sigaltstack(NULL,&cur) 查 SS_DISABLE，别覆写宿主自己装的栈。同型坑：OHOS musl 子集连 sigaltstack/SS_DISABLE 声明都藏，但 libc.a 实际导出——照 SA_ONSTACK 字面量先例本地补声明前先 nm 验证符号存在。
-- **goto 出 try 的落地链：弹出条目在标号定义时已不可恢复，必须在 goto 站点快照**（2026-10-05 B-ID112）：前向 goto 只记录深度，等标号定义时 finallys/catch_cleanups 栈早已弹出（槽位可能被后续同深度 try 复用），想补跑清理只能重放 goto 站点的 arena 快照。三类栈三种待遇：finallys/catch 重放「已弹出区间 [lab,go)」的快照条目（只覆写弹出区间，标号自身活跃条目原样不动，免保存/恢复）；EH 解装不需要快照——emit_eh_disarm_from 读 armed[base].old_top_slot，该槽位陈旧占位恰是跳前 top。链尾的终止符守卫必须查「当前插入块」而非 from_bb：catch 释放链会串出新块（cex.cont），builder 已不在 from_bb（首个探针 LLVM verify "does not have terminator" 就是查错块漏掉 Br）。三深度同向比较：f<标号=跳入诊断（C# 禁止）、f>标号=重放、相等=原 Br 不动；跨 owning 局部仍保守诊断。
-- **EH 临时栈注册条目必须带对 flavour，字符串走 plain push 会段错误**（2026-10-06 B-ID113）：`emit_eh_tmp_push` 的 plain 对象 flavour 走 `rel_dyn`/`zan_rt_release_dyn`，它假定对象带分配头；Zan string/delegate/数组若是裸指针没有头，抛异常清栈时直接崩（concat 抛出探针 rc=139 就是这么来的）。非 OBJ 类型必须镜像 `emit_call_arg_eh_push`：entry alloca + 存值 + `emit_eh_tmp_push_slot(slot, eh_slot_kind_of(t))`；配对的普通路径弹出用 `emit_eh_tmp_pop` 计数弹（drop-by-identity 只置空不弹栈，LIFO 深度会错位）。新注册点先想清楚操作数的静态类型，`eh_slot_kind_of` 是唯一权威。
-- **fork 到 exec 之间只准 async-signal-safe，malloc 会死锁**（2026-10-06 B-ID114）：多线程父进程 fork 后，子进程内 malloc 可能拿到一把「持锁线程已不存在」的 arena 锁直接死锁——POSIX 只保证 fork/exec 间隙的 async-signal-safe 函数。argv 一类 exec 参数必须在 fork 前在父进程建好，子进程只 exec；父进程 fork 后即可 free（子用的是 COW 拷贝）。同类：read/waitpid 把 EINTR 当终局会把健康流剪断（capture 循环曾把信号中断当 EOF 截断输出），读循环必须显式重试 EINTR；reactor 内部 fd（epoll/kqueue/eventfd/唤醒管道）建好立刻 FD_CLOEXEC，否则子进程继承唤醒管道写端，shutdown 等不到 EOF。
-- **协程池门的握手必须 lock-free，锁拦不住无锁 CAS**（2026-10-06 B-ID114）：io_wake→zan_co_ready→co_pool_ensure 在 poll 循环的 shard 锁内运行，所以（a）任何「先 g_inj_lock 再 shard 锁」的路径（如 sched_run 尾部持 injector 锁调 zan_io_shutdown）都与它反序，可能死锁；（b）ensure 的门变迁本身是无锁 CAS，持锁者拦不住并发 start——shutdown 与 pool start 的互斥只能靠对同一个门（g_co_pool_live）做 CAS 占用：先 claim（0→1）再放 fg 标志，输家直接退出；后台池创建计数要按实际创建数（made）发布，发布 w 而有创建失败时 retire 永远减不到 0，g_co_pool_live 永不清零，后续任务全部搁浅。
+- **wasm32 产物可以 node 实跑，但 node:wasi 有两个静默坑**（验证）：① 默认 args 会害 `args_get` 返回 28(NAMETOOLONG)，libc 初始化即 `proc_exit(71)` 且**无任何输出**——构造时必须显式 `args:['prog'], preopens:{}`；② 默认 returnOnExit=false 把 proc_exit 吞成异常、stdout 接死管道，表现为"静默 exit 0"。可用 returnOnExit:true 拿退出码 + 包一层 import 调用日志定位；或自写 Proxy 桩 runner（fd_write 直连 process.stdout；fd_prestat_get 必须返回 8(BADF) 结束 preopen 循环，返回 0 会死循环）。修好后 M:1 内联驱动、poll 发射等"只有 wasm 走的路径"有运行时验证，不再止步 LLVM module verify。
+- **mt 驱动自建重排路径必须带 co_submit 的全套记账（g_co_outstanding+g_co_activity）**：步返回重排若绕过 co_submit 直呼 lq_push，帧在环里排队但 outstanding=0——zan_co_sched_run 后台池等待循环只凭 running/outstanding/io/timer 判静默，会提前返回，@main 退出清扫把 RC 静态字段清零，后台 worker 随后读静态即 "null reference: receiver ... is null"（~1/3 复现、exit 0 静默截断，极易误归因到用户代码）。凡是新增"把帧放回队列"的路径，先对 co_submit 抄账。
+- **Windows 停车原语的等待粒度按系统 tick 取整，微秒期限钟必须配 timeBeginPeriod 才可见**：期限堆切 µs 后 Delay(50) 仍超期 13ms——GQCS 超时参数不走微秒堆的精度，实睡 63.2ms for 50ms（trace 铁证）；修法是调度器 worker 入口动态加载 winmm timeBeginPeriod(1)（LoadLibrary 零硬导入，控制台链接表没有 winmm；Win10 2004+ 请求进程内生效，不调 EndPeriod 因 worker 池重启使 Begin/End 跨线程配对成竞态）。POSIX 无此问题（poll/sleep 走 CLOCK_MONOTONIC 内核粒度），平台分支用空静态函数让 -O2 消除——linux zanrt_io 重编后与旧对象字节一致即是"POSIX 零代码生成"的免费强校验。
+- **循环回边埋点的逐迭代成本会吞掉整个热循环——时钟读必须门控**：协作抢占的 zan_co_poll 埋在每个 async 循环回边，原实现每次调用读一次钟（QPC），实测占计算循环逐迭代成本的 ~85%（23ns/iter→3.7ns/iter，k=1 总墙钟 6.2×）；修法=worker 本地计数器每 256 次放行一次读钟（2ms 量子最多超冲 256 次 ns 级迭代，微秒诚实保留），M:1 内联发射体同款（模块级计数全局，单线程无需原子）。教训：凡是"每迭代都执行"的埋点（统计、断言、采样），成本按乘在最大迭代数上估，先门控再上线。
+- **A/B 对拍运行时行为时，换对象必须重编探针**：`git stash` 运行时源→重 build→跑**旧探针 exe**（链接的还是改动后对象）当"基线"，得出 5/10 复现的假结论——基线与实验二进制必须都从当前对象重链，否则 A/B 测的是同一个东西。
+- **发布装运（--publish）逐文件拷贝失败绝不能静默，聚合警告要区分原因**：驱动装运循环 `zan_copy_file` 失败若静默吞掉，最外层聚合警告统一把原因归结为 "no runtime library found in ... add a manifest"，极具误导性——实测案例：输出目录有残留运行中进程锁持其导入的 DLL（winerr 32 ERROR_SHARING_VIOLATION），库实体存在但目标不可写，用户却被引导去查清单和搜索路径。定式：文件拷贝封装 `zan_copy_file_ex` 带出详细错误码（Windows 下 GetLastError/errno，Unix 下 strerror/errno），逐文件失败立即输出告警定位 src/dst 与真因；聚合警告细分为"无运行时库"与"拷贝操作失败（目标文件可能被占用或权限拒绝）"，让排查秒级定位。
+- **发布装运对 C 原生库间接依赖必须以 DLL 静态导入表为唯一事实依据**：跨平台 C 原生客户端（如 PostgreSQL `libpq.dll`）不可想当然假设"某平台不需要某底层库"——必须用 pefile/dumpbin 严格反查 PE 静态导入表（`DIRECTORY_ENTRY_IMPORT`）；实测 Windows 版 `libpq.dll` 硬性依赖 `libcrypto-3-x64.dll` 与 `libssl-3-x64.dll`。若标准库拆分或重构移除了上层原生模块，底层 C 驱动模块必须在其平台 driver 目录内置该套 DLL 并更新 `pq.bundle`，禁止在驱动清单中留下 `@driver/` 空悬引用产生伪告警或目标机缺 DLL 启动崩溃。
+- **zig wasi-libc 的 WASI 导入桩真名带 `__wasi_` 前缀**（h 实测）：wasm32 侧 `[DllImport("wasi", EntryPoint="random_get")]` 链接失败——zig 构建的 wasi-libc 不导出裸 `random_get`，手拼 `__imported_wasi_random_get` 前缀也不对，真名是 `__wasi_random_get`（`__wasi_<名>`）。新接 WASI 原语先 `llvm-nm toolchain/wasm32/liblibc.a`（或 wasi-sysroot 档案）查真名再写 EntryPoint，别按文档裸名臆写。
+- **按需拉入闭包的"二次扫描"必须静音 reach 副作用，兜底 round 的触发器必须限定来源**（踩出）：`pi_scan_file` 扫描文件时 `pi_note_using` 会顺手 `pi_reach` 它的 using 目录——任何"只为读 top-level 名"的二次扫描（如新增的 repair walk）都必须置 `pi_repair_scanning` 静音，否则全树 using 全部 reach，`pkg_src` 文件在其目录 reached 后无条件入编，13 文件的 hello-world 编成 122 文件。同族两条：① 兜底 round 的触发器必须按来源门控（stdlib 作者文件的 mention 才置 `flagged_stdlib`）——内建类型名（Console 等）和 AST 种子文档化的合法过近似让"存在未满足名"在每个程序上都成立；② reach 集只加"命中名的声明目录"，绝不 reach-all（包目录一旦 reached 即全家入编）。
+- **静态 fd 字段零初始化 = 0，而 0 是合法 fd（stdin）——"-1 哨兵"结构必须显式 prime**：`static zan_io_shard_t g_ioshard[256]` 的 poll_fd 零初始化成 0，开片守卫 `poll_fd < 0`（跳过）与 `poll_fd >= 0`（视为已开）双双短路——分片携 epfd=0 运行，epoll_ctl/epoll_wait 全 EINVAL(22)，注册假失败 → 0 字节假 EOF（bad=64）→ 一条 fail-woken 帧滞留死账，`zan_io_has_pending` 永真 → sched_run 排水循环永不退出，表象是"WhenAll 迟到几十秒"实为退出挂死。修法 = `io_shards_prime` 一次性三 fd 全 -1，在一切守卫读数组之前调用（epoll/kqueue/POSIX 三个入口）。通则：凡以 -1 为"未打开"哨兵的静态结构不信零初始化；诊断钩子：挂死进程先 `/proc/$PID/task/*/wchan` 采样（nanosleep=排水循环、futex=工人群、epoll=反应堆），再上 ZAN_SCHED_TRACE=1 环境门控 STRACE（rt_io.c/rt_timer.c 常驻，IOTRACE 同型）抓 io_arm 失败的 fd/epfd/errno——`epfd=0 + errno 22` 组合直接定罪这条路。
+- **WSL 的 tmpfs /tmp 会在 wsl.exe 调用间随 VM 回收蒸发**（取证实测）：上一次调用落盘的探针日志下次 `wsl.exe` 进去就没了（VM 整个回收），丢失即无法补采——进程活着时立刻 `cp /tmp/xxx /mnt/d/...` 持久化到 Windows 盘再继续；/mnt/d 下的文件则跨调用存活。
+- **zig 交叉建 Windows DLL：输出路径必须平/绝对，导入库走 zig dlltool**（b 实测）：`zig cc/c++ -target aarch64-windows-gnu -shared` 相对 `-o` 路径会把自动导入库写进 `zig tmp\<hash>\<相对路径>` 拼接目录（父目录不存在 → lld-link "No such file or directory" 无文件名报错）；`-static` 与 `-shared` 同给产出 `!<arch>` 静态档案而非 DLL；`-Wl,--out-implib`/`-femit-implib` 不接受（implib 由驱动自动发但 tmp 即清）。落地配方：在输出目录内平路径链 DLL，导入库用 `zig dlltool -m arm64 -d <def> -D x.dll -l libx.dll.a`（def 从 DLL 导出表生成纯名单，含 `a=b` 行会丢符号 member）。产物验证三板斧：pefile 查 Machine(0xaa64)/IMPORT（系统库+UCRT apiset，不得出现 libstdc++）/EXPORT 与 .def 逐一比对。
+- **PE 链接疑云第一步：核对被引符号真的在导出表里**（虚惊全记录）：链不上先 `python -c "pefile 导出表"` 查符号存在性——探针里自编的符号名（如想当然的 `zan_gui_init`）不在 DLL 导出表，会让 dlltool 导入库、lib.exe short import、直连 DLL 三种通路"全部失败"，看起来像链接器对某 arch 的空白，实为幻影符号；x64 对照"通过"也不可信（它报的 __main 只是解析顺序靠前掩盖了同一幻影）。修正后同环境实测：ld.lld -m arm64pe 对 dlltool GNU 导入库与直连 DLL、lld-link -lldmingw 双格式全通，zanc --target win-arm64 消费 zan_gui 探针 E2E 出正确 PE——arm64 PE 消费链接本就健康。仲裁首选 zanc 真链路（最小 [DllImport] 探针），别拿自拼 linker 命令当终审。
+- **CI 是否真落地，看 bot 提交不看猜 runs**（实测）：无 gh/API（api.github.com 被断）时，workflow 产物的事实源是 `git log --author=github-actions` 的回写提交——闭账文案声称"workflow 自动重跑回写"后若无对应 bot 提交（连应出 diff 的对象都没写），就是 win 腿 continue-on-error 静默失败或未触发，按未落地处理，本机配方补齐并明注 provenance 等 CI 重刷。
+- **CI 回写步的 git add 必须核对 .gitignore**（drivers.yml 实测）：`*.dll` 全局忽略时，提交步普通 `git add <dir>` 对未跟踪 DLL **静默跳过**（exit 0 无警告）——构建全绿、提交照打、DLL 永远不落地；对已跟踪文件的删除却照单全收（10-01 bot 提交就是这么把 payload 删掉的）。凡"构建产物回写"步骤逐个 `git check-ignore` 过一遍，入库产物用 `git add -f`。
+- **交叉 rt 对象必须从 HEAD 已提交源编，不能从工作树**（实测拦截）：共享树的并行会话常载着在途 diff（哪怕 2 行）——从工作树源编出的对象与已提交源不一致，下次 check_toolchain_stale --verify 必报 rebuild differs，且对象里的符号在源里找不到。正确姿势：`git show HEAD:<src> > _scratch/x.c` 后用 -I 原目录编临时副本；提交自己名下的对象前 `git status` 扫一眼源文件是否带别人的 M。
+- **x86 intrinsic 在非 x86 目标是 SelectionDAG fatal，不是告警**（实测）：`Sse42.Crc32` 被 irgen 无条件发射成 `llvm.x86.sse42.crc32.*`，GUI 宿主程序把 `Crc32C_Compute` 拉进模块后 android/ohos-arm64 交叉编即 "Do not know how to promote this operator's operand!"（legalizer abort，无诊断无函数名）。定位定式：`--emit-ir > x.ll`（注意 emit-ir 对超大模块尾部截断且 exit=0，是独立缺陷别误当崩点）→ llc 前先洗 `define extern_weak`→`define`、补 attributes 桩与非内建 @ 符号的 declare（c"..." 字符串体里的 @ 不是符号引用）→ llc 复现后 stack dump 的 "Running pass ... on function '@X'" 直接给崩点函数。修法：发射侧按 target_triple 分流——x86 走硬件 intrinsic，其余架构落查表软件链并与硬件路径做 qemu 实跑位精确对拍；运行时守卫（Cpu.HasSse42 在 ARM 恒 0）不救编译期——死代码也必须能过 ISel。同类目标失配 emit_aes_call 已由 同法闭账（见下条）。
+- **目标特定发射必须三分支化，两分不够**：`__zan_cpu_feature` 只有「本机 x86 / ARM」两分支，wasm32/riscv 掉进 x86 的 cpuid 内联 asm，后端报 `couldn't allocate output register for constraint '{ax}'` 编译期 fatal。修法：非 x86 非 ARM 直接 `ret i32 0`（无 cpuid 概念的目标全部特性位恒 0）。凡是「本机指令 vs 其它」的发散点，先把目标全集列出来再写分支。
+- **istr 长度常量错一位 = 静默漏接，症状在链接期不在编译期**：`InverseMixColumns` 实长 17，emit_aes_call 写成 `method.len == 18` 从未匹配，调用静默漏到 DllImport 外部路径——DllImport 的 struct 返回经 `zan.abi.<Name>` sret thunk 注册，拦截链没接住就发裸 extern 调用，最终 `undefined reference` 而非编译错误，没人调用过的分支可以烂几个月不被发现。约定：`method.len == strlen` 且 memcmp 不含 NUL，每个长度常量写前数字符。
+- **ARM AES 轮指令先 XOR 轮密钥再 SubBytes/ShiftRows，与教科书相反**：AESE(a,k)=SR(SB(a^k))，S 盒非线性 ⇒ 单条 AESE 永远出不了 `SR(SB(a))^k`；把 x86 AESENC 直接翻译成 aesmc(aese(a,aesmc(k))) 是错的（qemu 实跑逐字节对拍抓出）。正确代数（MC/IMC 的 GF(2) 线性折键）：AESENC=aesmc(aese(a,0)⊕aesimc(k))、AESENCLAST=aese(a,0)⊕k、AESDEC=aesimc(aesd(a,0)⊕aesmc(k))、AESDECLAST=aesd(a,0)⊕k、IMC=aesimc(a)。纪律：这类代数先 Python 对 x86 硬件金样 + 随机数验证，再落 irgen，再 qemu 对拍；aarch64 用 llvm.aarch64.crypto.* 需要 crosscomp.c 与 irgen_emit.c 两处特性表都给 +aes。
+- **Windows 收尾 ExitProcess(0) 会把 stdio 缓冲尾巴静默蒸发**：ExitProcess 跳过 CRT 退出，stdout 缓冲里最后不足 4KB 的残余直接丢（--emit-ir 204MB IR 停在函数中段、exit=0、fputs/ferror 全程健康；实测一轮恰丢 1415 字节）。正常编译 stdout 不载货所以烂很久没人发现，小模块同样丢尾只是没人验尾。修法：ExitProcess 前手工 fflush(stdout)+fflush(stderr)，保留跳过 CRT 慢销毁的初衷。诊断定式：先插探针对拍 strlen/fflush/ferror 分清生产端 vs 写端，再以「带 fflush 恒全量、不带恒截」锁定退出路径——别先怀疑 fputs 或 LLVM。
+- **parser 投机前瞻与递归防护：逐字段快照必须含条件指令栈，防护必须落在真实递归点**：① parser 侧 lexer_peek_n 逐字段保存 pos/line/col/interp/defines 时漏掉 cond_depth/cond_overflow/cond_stack/cond_seen_true——窥探跨过 `#if/#else` 后位置回滚而条件栈残留，主解析再处理同一指令就双压栈，后续所有条件指令错位（全结构快照 `*p->lex` 天然覆盖，逐字段镜像 lexer.c 的 peek 助手必须一字段不漏）；② `defer defer ...` 链是 parse_statement 的 TK_DEFER 分支直接递归、`else if` 链是 parse_if_stmt 直接递归，都不经过 parse_block——深度防护只放 parse_block_stmts 入口看不见嵌套层（6000 层链照样爆 C 栈），要在递归点用 stmt_depth 计数：到上限发诊断、吞一个 token 保推进、返回形状安全的空节点；③ skip_angle_group 数 `<...>` 深度必须认词法贪心合并的闭角 `>>`=2、`>>>=3，漏了就在嵌套泛型（`List<List<int>>` 局部函数）上跑到 `;`/EOF 误判；④ 探针坑：Zan 方法必须包在 class 里，顶层裸方法的报错是 "expected type declaration" 级联，与被测逻辑无关。
+- **pthread_mutex_init 不能碰已持有或被阻塞的互斥；静态数组成员互斥靠零初始化是 glibc/musl 巧合**：rt_io 的 zan_io_init 一边 shard_lock(g_ioshard[0]) 一边在 io_shard_open(0) 里对同一互斥 pthread_mutex_init——re-init 持有中的锁是 UB，第二个阻塞在该互斥上的线程等状态被 re-init 直接抹掉（表现为偶发首 await 挂死/状态错乱）；而那把"第一把锁"此前落在静态数组全零字节上，只在 glibc/musl 凑巧可用，换 libc 即爆。定式：初始化路径用 PTHREAD_MUTEX_INITIALIZER 静态互斥专锁（无引导问题），共享结构里的互斥在首个 init 内一次性 prime 全部成员并打 one-shot 标志（shutdown/reinit 周期绝不 re-init 活锁）；Windows 对应物是 SRWLOCK_INIT（同样免引导）+ 双检 started 标志——懒初始化入口（首个 await 可落在任意 worker 线程）必须按并发首用设计，不能按"主线程先跑"假设。
+- **同文件里同构哈希表的策略必须镜像，漏一边就是容量棘轮**：rt_timer 的 live map（zan_co_live_add）阈值触发时按「live*4>cap 才翻倍，否则原容量 rehash 收缩墓碑」，joinmap_put 同型表却一律翻倍——高吞吐定时器的 WhenAll churn 突发（批量完成留一堆墓碑，下一个插入又踩到 3/4 阈值）把容量棘轮式推上去永不回落。改任何开放寻址表的 grow 阈值时，先 grep 全文件找同构表，策略一字不差地镜像。
+- **SA_ONSTACK 没有 sigaltstack 等于没设**：崩溃处理器带 SA_ONSTACK 注册却从没装备用栈——栈溢出触发的 SIGSEGV 无法在已溢出的栈上投递，处理器自身当场再炸，崩溃报告永远出不来（WSL 深递归探针三跑无报告，装 64KB 定长备用栈后三跑全出报告）。定长而非 SIGSTKSZ：glibc>=2.34 的 SIGSTKSZ 是 sysconf 非常量，头文件要过严格 -std=c11；装前 sigaltstack(NULL,&cur) 查 SS_DISABLE，别覆写宿主自己装的栈。同型坑：OHOS musl 子集连 sigaltstack/SS_DISABLE 声明都藏，但 libc.a 实际导出——照 SA_ONSTACK 字面量先例本地补声明前先 nm 验证符号存在。
+- **goto 出 try 的落地链：弹出条目在标号定义时已不可恢复，必须在 goto 站点快照**：前向 goto 只记录深度，等标号定义时 finallys/catch_cleanups 栈早已弹出（槽位可能被后续同深度 try 复用），想补跑清理只能重放 goto 站点的 arena 快照。三类栈三种待遇：finallys/catch 重放「已弹出区间 [lab,go)」的快照条目（只覆写弹出区间，标号自身活跃条目原样不动，免保存/恢复）；EH 解装不需要快照——emit_eh_disarm_from 读 armed[base].old_top_slot，该槽位陈旧占位恰是跳前 top。链尾的终止符守卫必须查「当前插入块」而非 from_bb：catch 释放链会串出新块（cex.cont），builder 已不在 from_bb（首个探针 LLVM verify "does not have terminator" 就是查错块漏掉 Br）。三深度同向比较：f<标号=跳入诊断（C# 禁止）、f>标号=重放、相等=原 Br 不动；跨 owning 局部仍保守诊断。
+- **EH 临时栈注册条目必须带对 flavour，字符串走 plain push 会段错误**：`emit_eh_tmp_push` 的 plain 对象 flavour 走 `rel_dyn`/`zan_rt_release_dyn`，它假定对象带分配头；Zan string/delegate/数组若是裸指针没有头，抛异常清栈时直接崩（concat 抛出探针 rc=139 就是这么来的）。非 OBJ 类型必须镜像 `emit_call_arg_eh_push`：entry alloca + 存值 + `emit_eh_tmp_push_slot(slot, eh_slot_kind_of(t))`；配对的普通路径弹出用 `emit_eh_tmp_pop` 计数弹（drop-by-identity 只置空不弹栈，LIFO 深度会错位）。新注册点先想清楚操作数的静态类型，`eh_slot_kind_of` 是唯一权威。
+- **fork 到 exec 之间只准 async-signal-safe，malloc 会死锁**：多线程父进程 fork 后，子进程内 malloc 可能拿到一把「持锁线程已不存在」的 arena 锁直接死锁——POSIX 只保证 fork/exec 间隙的 async-signal-safe 函数。argv 一类 exec 参数必须在 fork 前在父进程建好，子进程只 exec；父进程 fork 后即可 free（子用的是 COW 拷贝）。同类：read/waitpid 把 EINTR 当终局会把健康流剪断（capture 循环曾把信号中断当 EOF 截断输出），读循环必须显式重试 EINTR；reactor 内部 fd（epoll/kqueue/eventfd/唤醒管道）建好立刻 FD_CLOEXEC，否则子进程继承唤醒管道写端，shutdown 等不到 EOF。
+- **协程池门的握手必须 lock-free，锁拦不住无锁 CAS**：io_wake→zan_co_ready→co_pool_ensure 在 poll 循环的 shard 锁内运行，所以（a）任何「先 g_inj_lock 再 shard 锁」的路径（如 sched_run 尾部持 injector 锁调 zan_io_shutdown）都与它反序，可能死锁；（b）ensure 的门变迁本身是无锁 CAS，持锁者拦不住并发 start——shutdown 与 pool start 的互斥只能靠对同一个门（g_co_pool_live）做 CAS 占用：先 claim（0→1）再放 fg 标志，输家直接退出；后台池创建计数要按实际创建数（made）发布，发布 w 而有创建失败时 retire 永远减不到 0，g_co_pool_live 永不清零，后续任务全部搁浅。
 
-## zan-lsp 智能感知：列缺失的位置查找与 file:// URI 往返（2026-10-07，LspSession 集成实测）
+## zan-lsp 智能感知：列缺失的位置查找与 file:// URI 往返（LspSession 集成实测）
 
 - **位置型符号查找必须带真实光标列，col<0 会掉进"名字下水道"**：`intel_position_in` 对 col<0 一律返回 true（为无列调用留的兼容分支），于是 `intel_method_at`/`intel_resolve_type_at` 在无列时匹配该行**所有**方法、最小跨距者胜——同一行上更早的小方法体（如 `void Pick(string s) {}`）把后面方法的参数全部判为不可见，查找落进项目索引的按名首中（任意索引文件里第一个同名符号），hover/补全/goto-def 整条线给出无关结果。实测：探针里 `a.` 补全返回另一类的 VennCircle 成员，根因是补全走了无列的 resolve_type_at。修法：hover/补全/定义/重命名的位置参数全部透传真实 (line, character)；接收者链解析（`a.Visible`）先按接收者类型找成员，按名兜底放最后。
 - **file:// URI 不做 percent decode/encode，跨文件智能感知静默全废**：客户端发来的 rootUri/textDocument.uri 是 percent-encoded（空格 %20、中文 %E4..、字面 % 是 %25）；不 decode 就当磁盘路径用 → 工作区与依赖文件从未被索引，补全/悬浮全部退化成按名匹配，且无任何报错。回写 Location/Rename 的 uri 时要 encode（unreserved 与 `/`、`:` 直通，十六进制大写）。decode/encode 只实现一份、全仓复用：曾有 uri_to_fspath 的第二份拷贝漏掉解码规则，同文件两种行为；same_uri_ci 比较前双方先 decode。
 - **冷启动的 initialize 是同步索引，超时要按 tens-of-seconds 放**：zan-lsp 应答 initialize 前同步索引工具链 stdlib 与包，实测 ~22s（构建竞争下更慢）；测试/探针把读超时设 20s 会把慢应答误判成挂死。另：didOpen/didChange 是通知没有应答，探针按请求 id 等回复时别把它们当请求发。
-- **per-doc 引擎单槽缓存：跨文档循环里取别的文档引擎会逐出本请求自己的引擎**（B-ID117 实测）：doc_intel_for 只有一个槽，references/rename 逐文档处理时对第二个文档调 doc_intel_for 就把 origin 引擎重建，先前捕获的 `intellisense_t*`/`isym_t*` 全部悬垂——症状是"dump 里 n=6 但逐出现查找全部 NULL、de==origin 指针还相等"。定式：符号身份只用数据（声明 line/col + owner 简名 + origin uri），绝不跨 doc_intel_for 调用持引擎指针；跨文档循环 origin 文档先行，逐出现判定全在数据域比对。
-- **intel_resolve_chain_pos 把最后一个点之后的段当"补全前缀"而非链段**（B-ID117 实测）：解析 `"ProjectFactory.Fetch()"` 返回的是接收者类名 ProjectFactory，末段 Fetch 的返回类型根本没走——该函数为补全场景设计（上下文总带尾点，末段是用户没打完的前缀）。要按返回类型解析完整调用链（var 初值重推导等），给链尾补一个 `.` 再解析。同族：链**提取**（extract_chain_expr）与链**解析**（bracket_depth/intel_chain_indexes）能力不对称——提取端不收 `[...]` 下标时 `items[i].`/`map["a"][0].` 断链只剩 `CHAIN:.`，解析端修好了也到不了，两端口径要一起对。
-- **json_get_num 读布尔字段永远拿到默认值**（B-ID117 实测）：`includeDeclaration:false` 经 `json_get_num(v,1)` 得 1（非 NUM 类型直接回退），声明永远被包含；读 LSP 布尔参数用 `json_get_bool(v, json_get_num(v,1)!=0.0)` 兜两种编码。
-- **无工作区根也必须建聚合索引**（B-ID117 实测）：ensure_project_indexed 原来无 rootUri 直接 return，无根会话（测试、无 root 客户端）里跨文件成员链/静态访问/var 初值推断全瞎（definition 落到同名词局部、补全空）。修法：无根也 init 聚合引擎、只跳过磁盘扫描——didOpen/didChange 本来就喂它，打开的文档互相可见。
-- **合成符号（隐式 setter value）的 decl 位置不是声明**（B-ID117 实测）：引擎给 setter 的 value 记 `(body行-1, col0)`，单行文档里 line=-1 直接穿透 `line>=0` 之外的守卫，prepareRename/references 会把它当真参数。判定定式：decl 位置上的文本必须逐字拼出该名字（word_at 比对），合成符号当场排除。
+- **per-doc 引擎单槽缓存：跨文档循环里取别的文档引擎会逐出本请求自己的引擎**（实测）：doc_intel_for 只有一个槽，references/rename 逐文档处理时对第二个文档调 doc_intel_for 就把 origin 引擎重建，先前捕获的 `intellisense_t*`/`isym_t*` 全部悬垂——症状是"dump 里 n=6 但逐出现查找全部 NULL、de==origin 指针还相等"。定式：符号身份只用数据（声明 line/col + owner 简名 + origin uri），绝不跨 doc_intel_for 调用持引擎指针；跨文档循环 origin 文档先行，逐出现判定全在数据域比对。
+- **intel_resolve_chain_pos 把最后一个点之后的段当"补全前缀"而非链段**（实测）：解析 `"ProjectFactory.Fetch"` 返回的是接收者类名 ProjectFactory，末段 Fetch 的返回类型根本没走——该函数为补全场景设计（上下文总带尾点，末段是用户没打完的前缀）。要按返回类型解析完整调用链（var 初值重推导等），给链尾补一个 `.` 再解析。同族：链**提取**（extract_chain_expr）与链**解析**（bracket_depth/intel_chain_indexes）能力不对称——提取端不收 `[...]` 下标时 `items[i].`/`map["a"][0].` 断链只剩 `CHAIN:.`，解析端修好了也到不了，两端口径要一起对。
+- **json_get_num 读布尔字段永远拿到默认值**（实测）：`includeDeclaration:false` 经 `json_get_num(v,1)` 得 1（非 NUM 类型直接回退），声明永远被包含；读 LSP 布尔参数用 `json_get_bool(v, json_get_num(v,1)!=0.0)` 兜两种编码。
+- **无工作区根也必须建聚合索引**（实测）：ensure_project_indexed 原来无 rootUri 直接 return，无根会话（测试、无 root 客户端）里跨文件成员链/静态访问/var 初值推断全瞎（definition 落到同名词局部、补全空）。修法：无根也 init 聚合引擎、只跳过磁盘扫描——didOpen/didChange 本来就喂它，打开的文档互相可见。
+- **合成符号（隐式 setter value）的 decl 位置不是声明**（实测）：引擎给 setter 的 value 记 `(body行-1, col0)`，单行文档里 line=-1 直接穿透 `line>=0` 之外的守卫，prepareRename/references 会把它当真参数。判定定式：decl 位置上的文本必须逐字拼出该名字（word_at 比对），合成符号当场排除。
 
-## 包内新类忘写 namespace 声明：同一工程不同入口编译结果不同（PgWire，2026-10-08）
+## 包内新类忘写 namespace 声明：同一工程不同入口编译结果不同（PgWire）
 
 `.zan` 文件里没有 `namespace X;` 行的类落进全局命名空间；它能否被同包
 其他带命名空间的类以简单名解析，取决于是否已注册进 stdlib map——而
@@ -3520,11 +3516,11 @@ ORM 示例却报 `'PgWire' is not a known variable, type, or namespace
 源码、同一台机器，差别只是入口文件的 using 集合。给包内新文件第一行
 写上 namespace 声明，让类走常规命名空间拉入解析，不靠注册顺序的侥幸。
 
-## 表访问器打到非 IDbConnection 接收者：codegen 报错错挂到无关文件 0:0（FreeSql 迁移实测，2026-10-09）
+## 表访问器打到非 IDbConnection 接收者：codegen 报错错挂到无关文件 0:0（FreeSql 迁移实测）
 
-把 `db.<Entity>` 表访问器批量改写成 `fsql.Select<Entity>()` 时，漏改一
+把 `db.<Entity>` 表访问器批量改写成 `fsql.Select<Entity>` 时，漏改一
 处（如 `db.Realm` 漏出 `fsql.Realm`）不会在那一行报错——MVC 代码生成器
-在降低访问器语法时发现接收者不是 `IDbConnection`（拿不到 `__Conn()`），
+在降低访问器语法时发现接收者不是 `IDbConnection`（拿不到 `__Conn`），
 抛 `this call could not be resolved to any callable`，且**位置错挂到
 项目里另一个文件（如 AdminController.zan:0:0）**。全项目逐文件二分
 （worktree 快照 + 逐文件换 HEAD 版本）才定位到真正站点。定式：访问器
@@ -3532,7 +3528,7 @@ ORM 示例却报 `'PgWire' is not a known variable, type, or namespace
 （大写开头的访问器形态）必须零命中；见到"任意文件 0:0 的 callable 
 解析失败"先怀疑某处访问器/降级语法打在错误接收者类型上，别信报错位置。
 
-## 显式类型实参是重载身份的一部分：checker 与 irgen 必须同口径过滤（FreeRedis GetAsync<T> 实录，2026-10-08）
+## 显式类型实参是重载身份的一部分：checker 与 irgen 必须同口径过滤（FreeRedis GetAsync<T> 实录）
 
 - **症状**：`cli.GetAsync<User>("k")` checker 通过、运行时返回 null/垃圾
   （`null reference where a string/byte buffer is required`），且**只在

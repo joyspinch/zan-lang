@@ -46,7 +46,7 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
 - 外部地址与内部代码严格同名映射：URL 路径段 = 目录 = 类名；
   数据模型名 = 表名；HTTP 动词进方法名后缀，同一地址不同动词天然分流。
 - 字段名一律走生成的常量/实体成员，SQL 与业务代码里不出现裸字符串列名。
-- Zan.Web 落地定式（2026-09-25 全链统一实机验证）：系统层表名 `sys_*` =
+- Zan.Web 落地定式（全链统一实机验证）：系统层表名 `sys_*` =
   Model `Sys*` = Dao `Sys*Dao` = 控制器类 `Sys*`（Admin/System 管理域）；
   但**动作方法名不加前缀**——路由 `[action]` 段就是方法名，加了 URL 跟着变；
   视图文件 `<控制器类>.<动作>.html` 跟类名走，控制器类改名必须同步改视图
@@ -94,9 +94,9 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
    加载失败，症状（空数据）离根因（写日志失败）极远。
 10. **数据层规范对齐 FreeSql 体系**：数据访问以强类型 CodeFirst 实体为核心，
     统一通过 `IFreeSql` / `FreeSqlBuilder` 作为入口；表结构同步走
-    `fsql.CodeFirst().SyncStructure<T>()`；实体仓储继承泛型 `BaseRepository<T>`
+    `fsql.CodeFirst.SyncStructure<T>`；实体仓储继承泛型 `BaseRepository<T>`
     直接获得通用 CRUD 能力（禁止机械编写一两行的空壳 DAO 样板代码）；
-    多表/事务操作统一步骤进 `IUnitOfWork`（`fsql.CreateUnitOfWork()`）；
+    多表/事务操作统一步骤进 `IUnitOfWork`（`fsql.CreateUnitOfWork`）；
     严禁使用历史遗留的弱类型字符串拼表（ModelRow/Model.Define）。
 
 ## 五、AI 协作纪律（写码前后的固定动作）
@@ -123,7 +123,7 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
 踩过坑验证过的：
 
 1. **停服必须杀整树并保底强杀进程名**（Windows：`taskkill /F /T /PID <master>` 配合 `taskkill /F /IM <exe_name>`）。
-   只 `terminate()` 主进程或单杀 PID，N 个 worker 变成攥着监听套接字的孤儿——
+   只 `terminate` 主进程或单杀 PID，N 个 worker 变成攥着监听套接字的孤儿——
    下一次起服新旧实例混着应答，症状是响应里掺二进制乱码、随机
    connection reset，极易误判成协议 bug。重启前先 `wait_gone` 并确认端口释放。
 2. **admin 控制器 GET 默认整页 HTML**；要数据片段加请求头
@@ -146,7 +146,7 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
    在线帧永不到达」。
 6. **事件扇出 Relay 的启动初始水位必须显式对齐**：
    在后台循环启动前，由 `main.zan` 在对外暴露端口前主动借库执行一次
-   `InitWatermark(db)`（以 `Latest()` / `MAX(id)` 对齐内存水位）。
+   `InitWatermark(db)`（以 `Latest` / `MAX(id)` 对齐内存水位）。
    若交由循环首拍异步对齐，会存在时序竞态窗口：在首拍执行延迟期间（如被
    调度到后几百毫秒），在线请求产生的新事件已写入 DB，随后首拍触发时
    却把该新事件的 id 误作为初始历史水位，导致启动瞬间的新事件被当作历史
