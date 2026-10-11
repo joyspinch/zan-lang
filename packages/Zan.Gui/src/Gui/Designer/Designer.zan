@@ -310,6 +310,17 @@ partial class Designer {
     List<FormField> outlineFields;
     bool outlineSyncing;
 
+    // 快速组件插入面板 (Quick Insert Spotlight HUD)
+    bool quickInsertOpen;
+    Input quickInsertInput;
+    int quickInsertX;
+    int quickInsertY;
+    int quickInsertDesX;
+    int quickInsertDesY;
+    int quickInsertSelIdx;
+    List<int> quickInsertMatches;
+    string quickInsertLastQ;
+
     // 被设计窗口的布局模式：0 = 流式（24 列，form-builder
     // 风格），1 = 自由（绝对定位的设计画布，场景设计器风格）。
     int layoutMode;
@@ -775,6 +786,11 @@ partial class Designer {
         this.outlineNodes = new List<TreeNode>();
         this.outlineFields = new List<FormField>();
         this.outlineSyncing = false;
+        this.quickInsertOpen = false;
+        this.quickInsertInput = new Input();
+        this.quickInsertMatches = new List<int>();
+        this.quickInsertLastQ = "";
+        this.quickInsertSelIdx = 0;
         this.undoStack = new List<string>();
         this.redoStack = new List<string>();
         this.clipFields = new List<string>();
@@ -2744,6 +2760,185 @@ partial class Designer {
         this.MarkDocDirty();
     }
 
+    // 大纲树一键全部展开/折叠所有目录节点
+    void OutlineExpandAll(bool expand) {
+        if (outlineTv == null) { return; }
+        if (expand) { outlineTv.ExpandAll(); }
+        else { outlineTv.CollapseAll(); }
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 打开快速组件插入浮动面板 (Spotlight Quick Insert)
+    void OpenQuickInsert(App app) {
+        quickInsertOpen = true;
+        quickInsertInput.SetText("");
+        quickInsertLastQ = "";
+        quickInsertSelIdx = 0;
+        quickInsertX = app.mouseX;
+        quickInsertY = app.mouseY;
+        quickInsertDesX = 40;
+        quickInsertDesY = 40;
+        if (sel != null) {
+            quickInsertDesX = sel.fx + 24;
+            quickInsertDesY = sel.fy + 24;
+        }
+        this.FilterQuickInsert("");
+        quickInsertInput.Focus();
+    }
+
+    // 过滤候选组件列表
+    void FilterQuickInsert(string q) {
+        quickInsertMatches = new List<int>();
+        quickInsertLastQ = q;
+        if (q == "") {
+            quickInsertMatches.Add(15); // Button
+            quickInsertMatches.Add(0);  // Input
+            quickInsertMatches.Add(18); // Card
+            quickInsertMatches.Add(23); // Table
+            quickInsertMatches.Add(36); // Tabs
+            quickInsertMatches.Add(45); // Panel
+            quickInsertMatches.Add(58); // ToolStrip
+            quickInsertMatches.Add(73); // Flex
+            quickInsertMatches.Add(6);  // Select
+            quickInsertMatches.Add(4);  // Radio
+            quickInsertMatches.Add(5);  // Checkbox
+            quickInsertMatches.Add(14); // RichText
+            quickInsertMatches.Add(59); // StatusBar
+            quickInsertMatches.Add(60); // Splitter
+            return;
+        }
+        for (int ft = 0; ft <= 85; ft = ft + 1) {
+            string name = FormField.TypeName(ft);
+            string desc = this.FieldDesc(ft);
+            if (Designer.Contains(name, q) || Designer.Contains(desc, q)) {
+                quickInsertMatches.Add(ft);
+                if (quickInsertMatches.Count >= 20) { break; }
+            }
+        }
+        if (quickInsertSelIdx >= quickInsertMatches.Count) {
+            quickInsertSelIdx = 0;
+        }
+    }
+
+    // 提交并生成选中的组件
+    void CommitQuickInsert(int ft) {
+        quickInsertOpen = false;
+        this.AddField(ft);
+        if (sel != null && layoutMode == 1) {
+            sel.fx = quickInsertDesX;
+            sel.fy = quickInsertDesY;
+            this.DesignDeclareRect(sel);
+        }
+        msg = Designer.T("inserted: ", "已插入: ") + FormField.TypeName(ft);
+        this.MarkDocDirty();
+    }
+
+    // 绘制快速组件插入浮动面板 (Quick Insert Spotlight HUD)
+    void RenderQuickInsert(App app, Canvas c, Theme t, int screenW, int screenH) {
+        if (!quickInsertOpen) { return; }
+        int w = app.Scale(320);
+        int itemH = app.Scale(28);
+        int headerH = app.Scale(42);
+        int maxItems = 7;
+        int listCount = quickInsertMatches.Count;
+        if (listCount > maxItems) { listCount = maxItems; }
+        int h = headerH + listCount * itemH + app.Scale(12);
+
+        int qx = quickInsertX;
+        int qy = quickInsertY;
+        if (qx + w > screenW - app.Scale(16)) { qx = screenW - w - app.Scale(16); }
+        if (qy + h > screenH - app.Scale(16)) { qy = screenH - h - app.Scale(16); }
+        if (qx < app.Scale(16)) { qx = app.Scale(16); }
+        if (qy < app.Scale(16)) { qy = app.Scale(16); }
+
+        int fs = Style.FontFallback(app, "small");
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = fs; }
+
+        int bg = Style.Full(app, "designer", "", "", Style.SNormal()).BgOr(0);
+        int border = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BorderOr(0);
+        int shadow = Style.Part(app, "designer", "shadow", "", "", "", Style.SNormal()).BgOr(0);
+
+        c.FillRoundRect(qx + 2, qy + 2, w, h, app.Scale(8), shadow);
+        c.FillRoundRect(qx, qy, w, h, app.Scale(8), bg);
+        c.DrawRoundRect(qx, qy, w, h, app.Scale(8), border, 1);
+
+        int inX = qx + app.Scale(10);
+        int inY = qy + app.Scale(8);
+        int inW = w - app.Scale(20);
+        int inH = app.Scale(26);
+        quickInsertInput.Render(app, inX, inY, inW, inH);
+
+        string curQ = quickInsertInput.GetText();
+        if (curQ != quickInsertLastQ) {
+            this.FilterQuickInsert(curQ);
+        }
+
+        int lineY = inY + inH + app.Scale(6);
+        c.FillRect(qx + app.Scale(8), lineY, w - app.Scale(16), 1, Style.Fade(border, 40));
+
+        int ly = lineY + app.Scale(4);
+        int hoveredItem = 0 - 1;
+        for (int i = 0; i < listCount; i = i + 1) {
+            int ft = quickInsertMatches[i];
+            int iy = ly + i * itemH;
+            bool isSel = (i == quickInsertSelIdx);
+            bool isHov = InRect(app.mouseX, app.mouseY, qx + app.Scale(6), iy, w - app.Scale(12), itemH);
+            if (isHov) { hoveredItem = i; }
+
+            if (isSel || isHov) {
+                int fillCol = isSel ? Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0)
+                                    : Style.Fade(border, 30);
+                c.FillRoundRect(qx + app.Scale(6), iy, w - app.Scale(12), itemH - app.Scale(2), app.Scale(4), fillCol);
+            }
+
+            int textCol = isSel ? Style.Part(app, "designer", "badge", "", "", "", Style.SNormal()).FgOr(0)
+                                : Style.Part(app, "designer", "text", "", "", "", Style.SNormal()).FgOr(0);
+            int descCol = isSel ? textCol : Style.Part(app, "designer", "hint", "", "", "", Style.SNormal()).FgOr(0);
+
+            string iconName = this.FieldIcon(ft);
+            c.DrawGlyphIn(iconName, qx + app.Scale(14), iy + app.Scale(5), app.Scale(16), app.Scale(16), app.Scale(14), textCol);
+            string name = FormField.TypeName(ft);
+            c.DrawText(qx + app.Scale(36), iy + app.Scale(5), name, textCol, fs);
+
+            string desc = this.FieldDesc(ft);
+            int nw = Canvas.MeasureText(name, fs);
+            c.DrawText(qx + app.Scale(44) + nw, iy + app.Scale(6), " · " + desc, descCol, fsTiny);
+
+            if (isHov && app.EventKind() == 3) {
+                this.CommitQuickInsert(ft);
+                app.RequestRedraw();
+                return;
+            }
+        }
+        if (hoveredItem >= 0) {
+            quickInsertSelIdx = hoveredItem;
+        }
+
+        if (app.EventKind() == 4) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 38) {
+                if (quickInsertMatches.Count > 0) {
+                    quickInsertSelIdx = (quickInsertSelIdx - 1 + quickInsertMatches.Count) % quickInsertMatches.Count;
+                    app.RequestRedraw();
+                }
+            } else if (kc == 40) {
+                if (quickInsertMatches.Count > 0) {
+                    quickInsertSelIdx = (quickInsertSelIdx + 1) % quickInsertMatches.Count;
+                    app.RequestRedraw();
+                }
+            } else if (kc == 13) {
+                if (quickInsertSelIdx >= 0 && quickInsertSelIdx < quickInsertMatches.Count) {
+                    this.CommitQuickInsert(quickInsertMatches[quickInsertSelIdx]);
+                    app.RequestRedraw();
+                }
+            } else if (kc == 27) {
+                quickInsertOpen = false;
+                app.RequestRedraw();
+            }
+        }
+    }
+
     // 快捷设置选中组件的排版与锚定方式（Flex 流式 vs 浮动与锚点）。
     void SetSelLayoutMode(int posMode, int anchorMode) {
         if (sel == null) { return; }
@@ -2838,8 +3033,10 @@ partial class Designer {
             else { r.Add(Designer.T("Lock", "锁定") + "  Ctrl+L"); }
             r.Add("");
             r.Add(Designer.T("Duplicate", "创建副本") + "  Ctrl+D");
+            r.Add(Designer.T("Quick Insert...", "快速插入组件...") + "  Ctrl+I");
         } else {
             r.Add(Designer.T("Paste", "粘贴") + "  Ctrl+V");
+            r.Add(Designer.T("Quick Insert...", "快速插入组件...") + "  Ctrl+I");
             r.Add("");
             r.Add(Designer.T("Add Button", "添加 按钮"));
             r.Add(Designer.T("Add Label", "添加 标签"));
@@ -2914,12 +3111,14 @@ partial class Designer {
             }
             else if (it.StartsWith(Designer.T("Unlock", "解锁")) || it.StartsWith(Designer.T("Lock", "锁定"))) { this.ToggleLockSel(); }
             else if (it.StartsWith(Designer.T("Duplicate", "创建副本"))) { this.DuplicateSel(); }
+            else if (it.StartsWith(Designer.T("Quick Insert...", "快速插入组件..."))) { this.OpenQuickInsert(app); }
         } else {
             List<string> items = this.CanvasMenuLabels();
             if (cc < 0 || cc >= items.Count) { return; }
             string it = items[cc];
             if (it == "") { return; }
             if (it.StartsWith(Designer.T("Paste", "粘贴"))) { this.PasteClip(); }
+            else if (it.StartsWith(Designer.T("Quick Insert...", "快速插入组件..."))) { this.OpenQuickInsert(app); }
             else if (it.StartsWith(Designer.T("Add Button", "添加 按钮"))) { this.AddField(15); }
             else if (it.StartsWith(Designer.T("Add Label", "添加 标签"))) { this.AddField(18); }
             else if (it.StartsWith(Designer.T("Add Input", "添加 输入框"))) { this.AddField(0); }
@@ -3064,6 +3263,9 @@ partial class Designer {
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 76 || kc == 108) && sel != null) {
                     this.ToggleLockSel();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 73 || kc == 105)) {
+                    this.OpenQuickInsert(app);
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 71 || kc == 103)) {
                     if (hasShift) { this.UngroupSel(); }
@@ -3267,6 +3469,10 @@ partial class Designer {
         }
         c.PopClip();
 
+        if (quickInsertOpen) {
+            this.RenderQuickInsert(app, c, t, app.canvas.Width(), app.canvas.Height());
+        }
+
         // 弹窗式大编辑器画在裁剪区之外的最上层：Layer.Modal 的遮罩
         // 与居中坐标都是全画布的，裁在设计器矩形里会把遮罩裁成
         // 一块，宿主面板一窄弹窗边缘也被截掉。
@@ -3314,13 +3520,23 @@ partial class Designer {
     void RenderPalette(App app, Canvas c, Theme t, int px, int py, int pw, int ph) {
         if (pw < 20 || ph < 20) { return; }
         int tabH = app.Scale(28);
-        int tabW = (pw - app.Scale(6)) / 2;
+        int expW = 0;
+        if (palTab == 1) { expW = app.Scale(46); }
+        int tabW = (pw - app.Scale(6) - expW) / 2;
         int bType = 0; if (palTab == 0) { bType = 1; }
         int oType = 0; if (palTab == 1) { oType = 1; }
         int bId = SmallBtn(app, Designer.T("Palette", "组件库"), bType, px, py, tabW);
         int oId = SmallBtn(app, Designer.T("Outline", "大纲树"), oType, px + tabW + app.Scale(6), py, tabW);
         if (Ui.Clicked(app, bId) && palTab != 0) { palTab = 0; app.RequestRedraw(); }
         if (Ui.Clicked(app, oId) && palTab != 1) { palTab = 1; app.RequestRedraw(); }
+        if (palTab == 1) {
+            int btnW = app.Scale(20);
+            int expX = px + tabW * 2 + app.Scale(10);
+            int expId = SmallBtn(app, "+", 0, expX, py, btnW);
+            int colId = SmallBtn(app, "-", 0, expX + btnW + app.Scale(4), py, btnW);
+            if (Ui.Clicked(app, expId)) { this.OutlineExpandAll(true); }
+            if (Ui.Clicked(app, colId)) { this.OutlineExpandAll(false); }
+        }
 
         int bodyY = py + tabH + app.Scale(6);
         int bodyH = ph - tabH - app.Scale(6);
