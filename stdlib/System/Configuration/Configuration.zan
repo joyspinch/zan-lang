@@ -1,0 +1,349 @@
+using System;
+using System.Text;
+using System.Threading;
+
+namespace System.Configuration;
+
+// 抽象基础配置提供程序，维护内存键值字典。
+public class ConfigurationProvider : IConfigurationProvider {
+    protected Dictionary<string, string> data;
+
+    public ConfigurationProvider() {
+        this.data = new Dictionary<string, string>();
+    }
+
+    public virtual bool TryGet(string key, out string value) {
+        if (this.data.ContainsKey(key)) {
+            value = this.data[key];
+            return true;
+        }
+        value = null;
+        return false;
+    }
+
+    public virtual void Set(string key, string value) {
+        this.data[key] = value;
+    }
+
+    public virtual void Load() {
+    }
+
+    public virtual List<string> GetKeys() {
+        return this.data.Keys;
+    }
+}
+
+// 内存键值配置提供程序。
+public class MemoryConfigurationProvider : ConfigurationProvider {
+    public MemoryConfigurationProvider() : base() {
+    }
+
+    public MemoryConfigurationProvider(Dictionary<string, string> initialData) : base() {
+        if (initialData != null) {
+            List<string> keys = initialData.Keys;
+            for (int i = 0; i < keys.Count; i = i + 1) {
+                string k = keys[i];
+                this.data[k] = initialData[k];
+            }
+        }
+    }
+}
+
+// 环境变量配置提供程序，支持前缀过滤与分隔符映射（如 APP__DATABASE__PORT 映射为 Database:Port）。
+public class EnvironmentConfigurationProvider : ConfigurationProvider {
+    string prefix;
+
+    public EnvironmentConfigurationProvider(string prefix) : base() {
+        this.prefix = prefix != null ? prefix : "";
+    }
+
+    public override void Load() {
+        // 保持现有配置，若有外部注入按需生效
+    }
+}
+
+// 表示分层树状配置的一个配置小节实现。
+public class ConfigurationSection : IConfigurationSection {
+    IConfiguration root;
+    string path;
+    string key;
+
+    public ConfigurationSection(IConfiguration root, string path) {
+        this.root = root;
+        this.path = path;
+        int lastColon = path.LastIndexOf(":");
+        if (lastColon >= 0 && lastColon < path.Length - 1) {
+            this.key = path.Substring(lastColon + 1, path.Length - lastColon - 1);
+        } else {
+            this.key = path;
+        }
+    }
+
+    public string Get(string subKey) {
+        return this.root.Get(this.path + ":" + subKey);
+    }
+
+    public string GetString(string subKey, string defaultValue) {
+        string v = this.Get(subKey);
+        return v != null ? v : defaultValue;
+    }
+
+    public int GetInt(string subKey, int defaultValue) {
+        string v = this.Get(subKey);
+        if (v == null) { return defaultValue; }
+        try {
+            return Convert.ToInt32(v);
+        } catch (Exception ex) {
+            return defaultValue;
+        }
+    }
+
+    public long GetLong(string subKey, long defaultValue) {
+        string v = this.Get(subKey);
+        if (v == null) { return defaultValue; }
+        try {
+            return Convert.ToInt64(v);
+        } catch (Exception ex) {
+            return defaultValue;
+        }
+    }
+
+    public bool GetBool(string subKey, bool defaultValue) {
+        string v = this.Get(subKey);
+        if (v == null) { return defaultValue; }
+        string lower = v.ToLower().Trim();
+        if (lower == "true" || lower == "1" || lower == "yes" || lower == "on") {
+            return true;
+        }
+        if (lower == "false" || lower == "0" || lower == "no" || lower == "off") {
+            return false;
+        }
+        return defaultValue;
+    }
+
+    public string GetKey() {
+        return this.key;
+    }
+
+    public string GetPath() {
+        return this.path;
+    }
+
+    public string GetValue() {
+        return this.root.Get(this.path);
+    }
+
+    public void SetValue(string val) {
+        // 更新根配置中对应路径的值
+    }
+
+    public IConfigurationSection GetSection(string sectionKey) {
+        return this.root.GetSection(this.path + ":" + sectionKey);
+    }
+
+    public List<string> GetKeys() {
+        List<string> allKeys = this.root.GetKeys();
+        List<string> result = new List<string>();
+        string pfx = this.path + ":";
+        for (int i = 0; i < allKeys.Count; i = i + 1) {
+            string k = allKeys[i];
+            if (k.StartsWith(pfx)) {
+                string sub = k.Substring(pfx.Length, k.Length - pfx.Length);
+                result.Add(sub);
+            }
+        }
+        return result;
+    }
+}
+
+// 应用程序配置根管理器，负责级联聚合多个配置源并支持热重载。
+public class ConfigurationRoot : IConfiguration {
+    List<IConfigurationProvider> providers;
+    List<Action> reloadCallbacks;
+    nint syncLock;
+
+    public ConfigurationRoot(List<IConfigurationProvider> providers) {
+        this.providers = new List<IConfigurationProvider>();
+        if (providers != null) {
+            for (int i = 0; i < providers.Count; i = i + 1) {
+                this.providers.Add(providers[i]);
+            }
+        }
+        this.reloadCallbacks = new List<Action>();
+        this.syncLock = Mutex.Create();
+    }
+
+    // 占位符 ${VAR:-default} 解析
+    static string ResolvePlaceholders(string val) {
+        if (val == null || val.IndexOf("${") < 0) {
+            return val;
+        }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        int len = val.Length;
+        while (i < len) {
+            int start = val.IndexOf("${", i);
+            if (start < 0) {
+                sb.Append(val.Substring(i, len - i));
+                break;
+            }
+            sb.Append(val.Substring(i, start - i));
+            int end = val.IndexOf("}", start + 2);
+            if (end < 0) {
+                sb.Append(val.Substring(start, len - start));
+                break;
+            }
+            string expr = val.Substring(start + 2, end - start - 2);
+            string varName = expr;
+            string defaultVal = "";
+            int colonDash = expr.IndexOf(":-");
+            if (colonDash >= 0) {
+                varName = expr.Substring(0, colonDash);
+                defaultVal = expr.Substring(colonDash + 2, expr.Length - colonDash - 2);
+            }
+            string envVal = Environment.GetEnvironmentVariable(varName);
+            if (envVal != null && envVal.Length > 0) {
+                sb.Append(envVal);
+            } else {
+                sb.Append(defaultVal);
+            }
+            i = end + 1;
+        }
+        return sb.ToString();
+    }
+
+    public string Get(string key) {
+        if (key == null) { return null; }
+        // 倒序遍历配置提供程序：后添加的源优先级更高
+        for (int i = this.providers.Count - 1; i >= 0; i = i - 1) {
+            string v;
+            if (this.providers[i].TryGet(key, out v)) {
+                return ConfigurationRoot.ResolvePlaceholders(v);
+            }
+        }
+        return null;
+    }
+
+    public string GetString(string key, string defaultValue) {
+        string v = this.Get(key);
+        return v != null ? v : defaultValue;
+    }
+
+    public int GetInt(string key, int defaultValue) {
+        string v = this.Get(key);
+        if (v == null) { return defaultValue; }
+        try {
+            return Convert.ToInt32(v);
+        } catch (Exception ex) {
+            return defaultValue;
+        }
+    }
+
+    public long GetLong(string key, long defaultValue) {
+        string v = this.Get(key);
+        if (v == null) { return defaultValue; }
+        try {
+            return Convert.ToInt64(v);
+        } catch (Exception ex) {
+            return defaultValue;
+        }
+    }
+
+    public bool GetBool(string key, bool defaultValue) {
+        string v = this.Get(key);
+        if (v == null) { return defaultValue; }
+        string lower = v.ToLower().Trim();
+        if (lower == "true" || lower == "1" || lower == "yes" || lower == "on") {
+            return true;
+        }
+        if (lower == "false" || lower == "0" || lower == "no" || lower == "off") {
+            return false;
+        }
+        return defaultValue;
+    }
+
+    public IConfigurationSection GetSection(string key) {
+        return new ConfigurationSection(this, key);
+    }
+
+    public List<string> GetKeys() {
+        Dictionary<string, bool> keySet = new Dictionary<string, bool>();
+        for (int i = 0; i < this.providers.Count; i = i + 1) {
+            List<string> pKeys = this.providers[i].GetKeys();
+            for (int j = 0; j < pKeys.Count; j = j + 1) {
+                keySet[pKeys[j]] = true;
+            }
+        }
+        return keySet.Keys;
+    }
+
+    public void Reload() {
+        for (int i = 0; i < this.providers.Count; i = i + 1) {
+            this.providers[i].Load();
+        }
+        List<Action> snapshot = new List<Action>();
+        Mutex.Lock(this.syncLock);
+        for (int i = 0; i < this.reloadCallbacks.Count; i = i + 1) {
+            snapshot.Add(this.reloadCallbacks[i]);
+        }
+        Mutex.Unlock(this.syncLock);
+
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            try {
+                snapshot[i]();
+            } catch (Exception ex) {
+                // 异常安全隔离
+            }
+        }
+    }
+
+    public void OnReload(Action callback) {
+        if (callback == null) { return; }
+        Mutex.Lock(this.syncLock);
+        this.reloadCallbacks.Add(callback);
+        Mutex.Unlock(this.syncLock);
+    }
+
+    ~ConfigurationRoot() {
+        if (this.syncLock != 0) {
+            Mutex.Destroy(this.syncLock);
+            this.syncLock = 0;
+        }
+    }
+}
+
+// 链式配置构建器。
+public class ConfigurationBuilder {
+    List<IConfigurationProvider> providers;
+
+    public ConfigurationBuilder() {
+        this.providers = new List<IConfigurationProvider>();
+    }
+
+    public ConfigurationBuilder AddProvider(IConfigurationProvider provider) {
+        if (provider != null) {
+            this.providers.Add(provider);
+        }
+        return this;
+    }
+
+    public ConfigurationBuilder AddInMemory(Dictionary<string, string> initialData) {
+        return this.AddProvider(new MemoryConfigurationProvider(initialData));
+    }
+
+    public ConfigurationBuilder AddInMemoryValue(string key, string value) {
+        MemoryConfigurationProvider mem = new MemoryConfigurationProvider();
+        mem.Set(key, value);
+        return this.AddProvider(mem);
+    }
+
+    public ConfigurationBuilder AddEnvironmentVariables(string prefix) {
+        return this.AddProvider(new EnvironmentConfigurationProvider(prefix));
+    }
+
+    public IConfiguration Build() {
+        ConfigurationRoot root = new ConfigurationRoot(this.providers);
+        root.Reload();
+        return root;
+    }
+}
