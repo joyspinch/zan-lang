@@ -1140,7 +1140,10 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     zan_ast_node_t *param = member->method_decl.params.items[k];
                     zan_type_t *ptype = zan_binder_resolve_type(g->binder, param->param.type);
                     pzt[k] = ptype;
-                    pt[k] = map_type(g, ptype);
+                    LLVMTypeRef llvm_pt = map_type(g, ptype);
+                    pt[k] = param->param.by_ref
+                        ? LLVMPointerType(llvm_pt, 0)
+                        : llvm_pt;
                 }
                 zan_type_t *rt = member->method_decl.return_type
                     ? zan_binder_resolve_type(g->binder, member->method_decl.return_type)

@@ -465,7 +465,7 @@ static bool paren_is_named_cast(zan_parser_t *p) {
     parser_advance(p);
     if (p->current.kind == TK_RPAREN) {
         switch (zan_lexer_peek(p->lex).kind) {
-        case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT:
+        case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_DECIMAL_LIT:
         case TK_STRING_LIT: case TK_CHAR_LIT:
         case TK_THIS: case TK_NEW: case TK_LPAREN:
             result = true;
@@ -728,6 +728,12 @@ static zan_ast_node_t *parse_primary(zan_parser_t *p) {
         parser_advance(p);
         zan_ast_node_t *n = zan_ast_new(p->arena, AST_FLOAT_LITERAL, loc);
         n->float_val = p->previous.float_val;
+        return n;
+    }
+    case TK_DECIMAL_LIT: {
+        parser_advance(p);
+        zan_ast_node_t *n = zan_ast_new(p->arena, AST_DECIMAL_LITERAL, loc);
+        n->str_val = p->previous.str_val;
         return n;
     }
     case TK_STRING_LIT: {
@@ -1636,7 +1642,7 @@ static bool is_binary_op(zan_token_kind_t kind) {
 
 static bool token_starts_expr(zan_token_kind_t k) {
     switch (k) {
-    case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_STRING_LIT:
+    case TK_IDENT: case TK_INT_LIT: case TK_FLOAT_LIT: case TK_DECIMAL_LIT: case TK_STRING_LIT:
     case TK_CHAR_LIT: case TK_INTERP_START: case TK_LPAREN: case TK_MINUS:
     case TK_PLUS: case TK_BANG: case TK_TILDE: case TK_THIS: case TK_BASE:
     case TK_NEW: case TK_NULL: case TK_TRUE: case TK_FALSE:

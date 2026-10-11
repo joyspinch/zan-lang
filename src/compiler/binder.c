@@ -144,6 +144,7 @@ void zan_binder_init(zan_binder_t *b, zan_arena_t *arena, zan_diag_t *diag) {
     b->type_ulong  = make_type(arena, TYPE_ULONG,  "ulong",  5);
     b->type_float  = make_type(arena, TYPE_FLOAT,  "float",  5);
     b->type_double = make_type(arena, TYPE_DOUBLE, "double", 6);
+    b->type_decimal = make_type(arena, TYPE_DECIMAL, "decimal", 7);
     b->type_char   = make_type(arena, TYPE_CHAR,   "char",   4);
     b->type_string = make_type(arena, TYPE_STRING, "string", 6);
     b->type_object = make_type(arena, TYPE_OBJECT, "object", 6);
@@ -755,12 +756,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     else if (istr_eq(name, "ulong",  5)) base = b->type_ulong;
     else if (istr_eq(name, "float",  5)) base = b->type_float;
     else if (istr_eq(name, "double", 6)) base = b->type_double;
-    else if (istr_eq(name, "decimal", 7)) {
-        zan_diag_emit(b->diag, DIAG_ERROR, type_ref->loc,
-                      "'decimal' is not supported: use 'long' (minor units), "
-                      "'double', or a string column instead");
-        base = b->type_error;
-    }
+    else if (istr_eq(name, "decimal", 7)) base = b->type_decimal;
     else if (istr_eq(name, "char",   4)) base = b->type_char;
     else if (istr_eq(name, "string", 6)) base = b->type_string;
     else if (istr_eq(name, "object", 6)) base = b->type_object;

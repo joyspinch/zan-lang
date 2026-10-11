@@ -736,6 +736,8 @@ static LLVMMetadataRef di_type_for_zan(zan_irgen_t *g, zan_type_t *t,
         return di_basic(g, "float", 32, ZAN_DI_ATE_FLOAT);
     case TYPE_DOUBLE:
         return di_basic(g, "double", 64, ZAN_DI_ATE_FLOAT);
+    case TYPE_DECIMAL:
+        return di_basic(g, "decimal", 128, ZAN_DI_ATE_FLOAT);
     case TYPE_CHAR:
         return di_basic(g, "char", 16, ZAN_DI_ATE_UTF);
     case TYPE_STRING: {
@@ -1736,6 +1738,14 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     LLVMTypeRef sb_fields[] = { i64, i64, i8ptr };
     g->sb_struct_type = LLVMStructCreateNamed(g->ctx, "StringBuilder");
     LLVMStructSetBody(g->sb_struct_type, sb_fields, 3, 0);
+
+    LLVMTypeRef dec_fields[] = {
+        LLVMInt32TypeInContext(g->ctx),
+        LLVMInt32TypeInContext(g->ctx),
+        i64
+    };
+    g->decimal_struct_type = LLVMStructCreateNamed(g->ctx, "Decimal");
+    LLVMStructSetBody(g->decimal_struct_type, dec_fields, 3, 0);
 
     LLVMTypeRef co_step_args[] = { i8ptr };
     g->co_step_type = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), co_step_args, 1, 0);
@@ -3035,6 +3045,20 @@ static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
     return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
 }
 
+LLVMTypeRef get_decimal_type(zan_irgen_t *g) {
+    g->uses_decimal_runtime = true;
+    if (!g->decimal_struct_type) {
+        LLVMTypeRef dec_fields[] = {
+            LLVMInt32TypeInContext(g->ctx),
+            LLVMInt32TypeInContext(g->ctx),
+            LLVMInt64TypeInContext(g->ctx)
+        };
+        g->decimal_struct_type = LLVMStructCreateNamed(g->ctx, "Decimal");
+        LLVMStructSetBody(g->decimal_struct_type, dec_fields, 3, 0);
+    }
+    return g->decimal_struct_type;
+}
+
 static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     if (!type) return LLVMVoidTypeInContext(g->ctx);
     switch (type->kind) {
@@ -3052,6 +3076,7 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     case TYPE_TASK:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_FLOAT:  return LLVMFloatTypeInContext(g->ctx);
     case TYPE_DOUBLE: return LLVMDoubleTypeInContext(g->ctx);
+    case TYPE_DECIMAL: return get_decimal_type(g);
     case TYPE_CHAR:   return LLVMInt64TypeInContext(g->ctx);
     case TYPE_STRING: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     case TYPE_OBJECT: return LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);

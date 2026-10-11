@@ -8,6 +8,7 @@ typedef enum {
 
     TK_INT_LIT,         /* 42, 0xFF, 0b1010, 0o77 */
     TK_FLOAT_LIT,       /* 3.14, 1.0e10 */
+    TK_DECIMAL_LIT,     /* 3.14m, 100M */
     TK_STRING_LIT,      /* "hello" */
     TK_CHAR_LIT,        /* 'A' */
     TK_INTERP_START,

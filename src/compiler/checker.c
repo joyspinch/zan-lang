@@ -839,7 +839,7 @@ static bool type_is_numeric(zan_type_t *t) {
     switch (t->kind) {
     case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
     case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
-    case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_NINT:
+    case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_DECIMAL: case TYPE_NINT:
         return true;
     default:
         return false;
@@ -851,7 +851,7 @@ static bool type_is_scalar_primitive(zan_type_t *t) {
     switch (t->kind) {
     case TYPE_BOOL: case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT:
     case TYPE_LONG: case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT:
-    case TYPE_ULONG: case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_CHAR:
+    case TYPE_ULONG: case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_DECIMAL: case TYPE_CHAR:
     case TYPE_STRING: case TYPE_NINT:
         return true;
     default:
@@ -873,6 +873,17 @@ static bool type_is_integral(zan_type_t *t) {
 
 static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b_type) {
     if (!a || !b_type) return b->type_error;
+    bool a_dec = (a->kind == TYPE_DECIMAL);
+    bool b_dec = (b_type->kind == TYPE_DECIMAL);
+    if (a_dec && b_dec) return b->type_decimal;
+    if (a_dec) {
+        if (b_type->kind == TYPE_FLOAT || b_type->kind == TYPE_DOUBLE) return b->type_error;
+        return b->type_decimal;
+    }
+    if (b_dec) {
+        if (a->kind == TYPE_FLOAT || a->kind == TYPE_DOUBLE) return b->type_error;
+        return b->type_decimal;
+    }
     if (a->kind == TYPE_DOUBLE || b_type->kind == TYPE_DOUBLE) return b->type_double;
     if (a->kind == TYPE_FLOAT  || b_type->kind == TYPE_FLOAT)  return b->type_float;
     if (a->kind == TYPE_ULONG  || b_type->kind == TYPE_ULONG)  return b->type_ulong;
@@ -1071,6 +1082,12 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK)
         return value->type_arg_count >= target->type_arg_count;
     bool tnum = type_is_numeric(target), vnum = type_is_numeric(value);
+    if (target->kind == TYPE_DECIMAL && (value->kind == TYPE_FLOAT || value->kind == TYPE_DOUBLE))
+        return false;
+    if ((target->kind == TYPE_FLOAT || target->kind == TYPE_DOUBLE) && value->kind == TYPE_DECIMAL)
+        return false;
+    if ((type_is_integral(target) || target->kind == TYPE_CHAR) && value->kind == TYPE_DECIMAL)
+        return false;
     if (target->kind == TYPE_ENUM)
         return value->kind == TYPE_ENUM || vnum || value->kind == TYPE_CHAR;
     if (value->kind == TYPE_ENUM)
@@ -1954,6 +1971,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         }
     case AST_FLOAT_LITERAL:
         return c->binder->type_double;
+    case AST_DECIMAL_LITERAL:
+        return c->binder->type_decimal;
     case AST_STRING_LITERAL:
         return c->binder->type_string;
     case AST_CHAR_LITERAL:

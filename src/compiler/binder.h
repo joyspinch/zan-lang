@@ -36,6 +36,7 @@ typedef enum {
     TYPE_ULONG,
     TYPE_FLOAT,
     TYPE_DOUBLE,
+    TYPE_DECIMAL,
     TYPE_CHAR,
     TYPE_STRING,
     TYPE_OBJECT,
@@ -116,6 +117,7 @@ struct zan_binder {
     zan_type_t *type_ulong;
     zan_type_t *type_float;
     zan_type_t *type_double;
+    zan_type_t *type_decimal;
     zan_type_t *type_char;
     zan_type_t *type_string;
     zan_type_t *type_object;

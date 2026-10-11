@@ -156,6 +156,11 @@ static json_value *gm_expr_tree(zan_ast_node_t *n) {
         json_obj_set(o, "t", json_new_str("double"));
         json_obj_set(o, "v", json_new_num(n->float_val));
         break;
+    case AST_DECIMAL_LITERAL:
+        json_obj_set(o, "k", json_new_str("lit"));
+        json_obj_set(o, "t", json_new_str("decimal"));
+        json_obj_set(o, "v", json_new_str(n->str_val.str ? n->str_val.str : "0"));
+        break;
     case AST_BOOL_LITERAL:
         json_obj_set(o, "k", json_new_str("lit"));
         json_obj_set(o, "t", json_new_str("bool"));

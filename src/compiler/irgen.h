@@ -5,6 +5,7 @@
 #include "zan.h"
 #include "ast.h"
 #include "binder.h"
+#include "../runtime/rt_decimal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <llvm-c/Core.h>
@@ -393,6 +394,7 @@ struct zan_irgen {
     LLVMTypeRef dict_struct_type; /* { i64 count, i64 capacity, i8** keys, i64* values } */
     LLVMTypeRef sb_struct_type;   /* StringBuilder { i64 count, i64 capacity, i8* data } */
     LLVMTypeRef task_struct_type; /* Task { i64 completed, i64 result, i64 thread_handle } */
+    LLVMTypeRef decimal_struct_type; /* Decimal { i32 flags, i32 hi32, i64 lo64 } */
     LLVMValueRef fn_strcmp;       /* strcmp(s1, s2) -> int */
 
     struct {
@@ -492,6 +494,7 @@ struct zan_irgen {
     bool         uses_timer_runtime;
     bool         uses_sync_runtime;
     bool         uses_file_runtime; /* set by zan_file_* (file IO) externs */
+    bool         uses_decimal_runtime; /* set by decimal arithmetic/literals */
     bool         uses_embed_api;
     bool         uses_inflate;
     zan_goto_label_rec_t *goto_labels;
@@ -650,6 +653,8 @@ void zan_irgen_release_llvm(zan_irgen_t *g);
 
 /* 编译器生成的保护文本驻留符号 */
 LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text);
+
+LLVMTypeRef  get_decimal_type(zan_irgen_t *g);
 
 void zan_irgen_emit_oom_check(zan_irgen_t *g, LLVMValueRef fn, LLVMValueRef raw);
 

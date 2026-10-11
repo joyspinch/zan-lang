@@ -3550,3 +3550,13 @@ ORM 示例却报 `'PgWire' is not a known variable, type, or namespace
   （arity、类型实参、params 尾、默认参数）必须两处同提交落地，并补一条
   "显式类型实参选中泛型重载"的 conformance（**非泛型声明在前**的顺序
   必须在内，这是唯一能暴露本缺陷的形状）。
+
+## 128 位 Decimal 与值类型定式：Union 重叠、By-Ref 外部声明与插值陷阱
+
+- **Token/AST union 中 float_val 与 str_val 内存重叠覆盖**：
+  `zan_token` / `zan_ast_node_t` 匿名 union 中 `float_val` (8 字节 double) 与 `str_val` (`{ const char *str; uint32_t len; }`) 的首地址完全重合。解析 decimal 字面量或字符串时，严禁写入 `float_val = strtod(...)`，否则 double 浮点二进制位（如 10.5 的 0x4025000000000000）将覆盖破坏有效字符串指针，导致后端 dereference 时报 SIGSEGV。
+- **is_extern_decl 形参映射必须检查 param.by_ref**：
+  `irgen_emit.c` 在为 `is_extern_decl` 构造 LLVM 函数类型时，若直接 `map_type(g, ptype)` 未检查 `param->param.by_ref`，会导致 `ref`/`out` 形参声明为值类型，而调用点发射指针 `ptr`，触发 LLVM verification `Call parameter type does not match function signature` 报错；必须按 `param.by_ref ? LLVMPointerType(llvm_pt, 0) : llvm_pt` 进行指针提升。
+- **结构体值类型插值与拼接禁止落入 itoa64**：
+  字符串插值 (`emit_expr_string_interp`) 与二元 `+` 拼接遇非指针、非浮点结构体（如 128 位 `%struct.Decimal`）时，严禁落入默认的 `itoa64` 路径，必须单独分流调用专门的运行时格式化函数（`__zan_decimal_to_string`）。
+

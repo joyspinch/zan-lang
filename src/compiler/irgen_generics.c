@@ -2285,6 +2285,21 @@ static LLVMValueRef emit_to_cstr_u(zan_irgen_t *g, LLVMValueRef val,
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    if (vt == get_decimal_type(g)) {
+        LLVMValueRef dslot = emit_entry_alloca(g, vt, "dec.str.slot");
+        LLVMBuildStore(g->builder, val, dslot);
+        LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 48, 0));
+        LLVMTypeRef to_str_fn_ty = LLVMFunctionType(
+            LLVMInt32TypeInContext(g->ctx),
+            (LLVMTypeRef[]){ LLVMPointerType(vt, 0), i8ptr, i64 },
+            3, 0);
+        LLVMValueRef to_str_fn = get_libc_fn(g, "__zan_decimal_to_string", to_str_fn_ty);
+        LLVMValueRef len = zan_call2(g->builder, to_str_fn_ty, to_str_fn,
+            (LLVMValueRef[]){ dslot, buf, LLVMConstInt(i64, 48, 0) }, 3, "dec.slen");
+        LLVMValueRef len64 = LLVMBuildZExt(g->builder, len, i64, "dec.slen64");
+        emit_string_len_set(g, buf, len64);
+        return buf;
+    }
     if (vtk == LLVMDoubleTypeKind || vtk == LLVMFloatTypeKind) {
         LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 40, 0));
         emit_dbl_str(g, buf, LLVMConstInt(i64, 40, 0), val);

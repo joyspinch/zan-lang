@@ -3430,7 +3430,7 @@ static LLVMValueRef emit_typed_equality(zan_irgen_t *g, zan_type_t *type,
         }
         LLVMValueRef lc = emit_str_nonnull(g, left);
         LLVMValueRef rc = emit_str_nonnull(g, right);
-        /* 带长度感知的字符串字典序比对（防止嵌入   截断） */
+        /* 带长度感知的字符串字典序比对（防止嵌入 0 截断） */
         LLVMValueRef ocmp = get_str_ordinal_cmp_fn(g, (zan_loc_t){0});
         LLVMValueRef cmp = zan_call2(
             g->builder, LLVMGlobalGetValueType(ocmp), ocmp,
@@ -3524,6 +3524,88 @@ static LLVMValueRef emit_checked_int_arith(zan_irgen_t *g, zan_ast_node_t *expr,
 static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                          LLVMValueRef left, LLVMValueRef right,
                                          local_scope_t *locals);
+
+static LLVMValueRef coerce_to_decimal(zan_irgen_t *g, LLVMValueRef val) {
+    LLVMTypeRef dec_ty = get_decimal_type(g);
+    if (!val || LLVMTypeOf(val) == dec_ty) return val;
+    LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+    LLVMTypeRef ptr_ty = LLVMPointerType(dec_ty, 0);
+    LLVMValueRef val_i64 = val;
+    if (LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMIntegerTypeKind) {
+        if (LLVMGetIntTypeWidth(LLVMTypeOf(val)) < 64) {
+            val_i64 = LLVMBuildSExt(g->builder, val, i64, "dec.sext");
+        }
+    } else {
+        return val;
+    }
+    LLVMValueRef slot = emit_entry_alloca(g, dec_ty, "dec.conv");
+    LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+        (LLVMTypeRef[]){ i64, ptr_ty }, 2, 0);
+    LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_from_int64", fn_ty);
+    zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ val_i64, slot }, 2, "");
+    return LLVMBuildLoad2(g->builder, dec_ty, slot, "dec.val");
+}
+
+static LLVMValueRef emit_decimal_binary(zan_irgen_t *g, zan_ast_node_t *expr,
+                                        LLVMValueRef left, LLVMValueRef right,
+                                        local_scope_t *locals) {
+    (void)locals;
+    LLVMTypeRef dec_ty = get_decimal_type(g);
+    left = coerce_to_decimal(g, left);
+    right = coerce_to_decimal(g, right);
+
+    LLVMValueRef lslot = emit_entry_alloca(g, dec_ty, "dec.l");
+    LLVMValueRef rslot = emit_entry_alloca(g, dec_ty, "dec.r");
+    LLVMBuildStore(g->builder, left, lslot);
+    LLVMBuildStore(g->builder, right, rslot);
+    LLVMTypeRef ptr_ty = LLVMPointerType(dec_ty, 0);
+
+    const char *op_fn = NULL;
+    switch (expr->binary.op) {
+    case TK_PLUS:    op_fn = "__zan_decimal_add"; break;
+    case TK_MINUS:   op_fn = "__zan_decimal_sub"; break;
+    case TK_STAR:    op_fn = "__zan_decimal_mul"; break;
+    case TK_SLASH:   op_fn = "__zan_decimal_div"; break;
+    case TK_PERCENT: op_fn = "__zan_decimal_rem"; break;
+    default: break;
+    }
+
+    if (op_fn) {
+        LLVMValueRef res_slot = emit_entry_alloca(g, dec_ty, "dec.res");
+        LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+            (LLVMTypeRef[]){ ptr_ty, ptr_ty, ptr_ty }, 3, 0);
+        LLVMValueRef fn = get_libc_fn(g, op_fn, fn_ty);
+        zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ lslot, rslot, res_slot }, 3, "");
+        return LLVMBuildLoad2(g->builder, dec_ty, res_slot, "dec.out");
+    }
+
+    /* 比较运算 */
+    LLVMTypeRef i32_ty = LLVMInt32TypeInContext(g->ctx);
+    LLVMTypeRef cmp_fn_ty = LLVMFunctionType(i32_ty,
+        (LLVMTypeRef[]){ ptr_ty, ptr_ty }, 2, 0);
+    LLVMValueRef cmp_fn = get_libc_fn(g, "__zan_decimal_cmp", cmp_fn_ty);
+    LLVMValueRef cmp_res = zan_call2(g->builder, cmp_fn_ty, cmp_fn,
+        (LLVMValueRef[]){ lslot, rslot }, 2, "dec.cmp");
+    LLVMValueRef zero = LLVMConstInt(i32_ty, 0, 0);
+
+    switch (expr->binary.op) {
+    case TK_EQ_EQ:
+        return zan_icmp(g->builder, LLVMIntEQ, cmp_res, zero, "dec.eq");
+    case TK_BANG_EQ:
+        return zan_icmp(g->builder, LLVMIntNE, cmp_res, zero, "dec.ne");
+    case TK_LESS:
+        return zan_icmp(g->builder, LLVMIntSLT, cmp_res, zero, "dec.lt");
+    case TK_LESS_EQ:
+        return zan_icmp(g->builder, LLVMIntSLE, cmp_res, zero, "dec.le");
+    case TK_GREATER:
+        return zan_icmp(g->builder, LLVMIntSGT, cmp_res, zero, "dec.gt");
+    case TK_GREATER_EQ:
+        return zan_icmp(g->builder, LLVMIntSGE, cmp_res, zero, "dec.ge");
+    default:
+        break;
+    }
+    return left;
+}
 
 static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
@@ -3663,6 +3745,14 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             !is_string_expr(g, expr->binary.left, locals) &&
             !is_string_expr(g, expr->binary.right, locals))
             return emit_nullable_binary(g, expr, left, right, locals);
+
+        /* 128 位定点数 decimal 二元运算与比较 */
+        bool has_str_op = is_string_expr(g, expr->binary.left, locals) ||
+                          is_string_expr(g, expr->binary.right, locals);
+        if ((LLVMTypeOf(left) == get_decimal_type(g) ||
+             LLVMTypeOf(right) == get_decimal_type(g)) && !has_str_op) {
+            return emit_decimal_binary(g, expr, left, right, locals);
+        }
 
         /* 结构体逐字段相等性比较 */
         if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) &&
@@ -4214,12 +4304,25 @@ static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
         switch (expr->unary.op) {
         case TK_MINUS: {
             LLVMTypeRef t = LLVMTypeOf(operand);
+            if (t == get_decimal_type(g)) {
+                LLVMValueRef slot = emit_entry_alloca(g, t, "dec.uneg_in");
+                LLVMValueRef res_slot = emit_entry_alloca(g, t, "dec.uneg_res");
+                LLVMBuildStore(g->builder, operand, slot);
+                LLVMTypeRef ptr_ty = LLVMPointerType(t, 0);
+                LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                    (LLVMTypeRef[]){ ptr_ty, ptr_ty }, 2, 0);
+                LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_neg", fn_ty);
+                zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ slot, res_slot }, 2, "");
+                return LLVMBuildLoad2(g->builder, t, res_slot, "dec.uneg_val");
+            }
             if (LLVMGetTypeKind(t) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(t) == LLVMFloatTypeKind) {
                 return LLVMBuildFNeg(g->builder, operand, "neg");
             }
             return LLVMBuildNeg(g->builder, operand, "neg");
         }
+        case TK_PLUS:
+            return operand;
         case TK_BANG: {
             /* 逻辑非与按位取反指令发射 */
             LLVMTypeRef ot = LLVMTypeOf(operand);
@@ -6206,6 +6309,22 @@ static LLVMValueRef emit_expr_string_interp(zan_irgen_t *g, zan_ast_node_t *expr
                     strs[i] = emit_to_cstr_u(g, val, uns ? 1 : 0);
                     lens[i] = zan_call2(g->builder, strlen_type, g->fn_strlen,
                                         &strs[i], 1, "nvlen");
+                    owns[i] = 1;
+                } else if (vt == get_decimal_type(g)) {
+                    LLVMValueRef dslot = emit_entry_alloca(g, vt, "dec.interp.slot");
+                    LLVMBuildStore(g->builder, val, dslot);
+                    LLVMValueRef buf = emit_string_alloc_rc(g, LLVMConstInt(i64, 48, 0));
+                    LLVMTypeRef to_str_fn_ty = LLVMFunctionType(
+                        LLVMInt32TypeInContext(g->ctx),
+                        (LLVMTypeRef[]){ LLVMPointerType(vt, 0), i8ptr, i64 },
+                        3, 0);
+                    LLVMValueRef to_str_fn = get_libc_fn(g, "__zan_decimal_to_string", to_str_fn_ty);
+                    LLVMValueRef slen = zan_call2(g->builder, to_str_fn_ty, to_str_fn,
+                        (LLVMValueRef[]){ dslot, buf, LLVMConstInt(i64, 48, 0) }, 3, "dec.slen");
+                    LLVMValueRef slen64 = LLVMBuildZExt(g->builder, slen, i64, "dec.slen64");
+                    emit_string_len_set(g, buf, slen64);
+                    strs[i] = buf;
+                    lens[i] = slen64;
                     owns[i] = 1;
                 } else {
                     /* 整数插值格式化：基于 snprintf 转换为十进制字符串 */
@@ -10320,6 +10439,56 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
         if (src == target) return val;
+
+        /* decimal 显式强转支持（整型与浮点型互转） */
+        if (target == get_decimal_type(g)) {
+            if (LLVMGetTypeKind(src) == LLVMIntegerTypeKind) {
+                return coerce_to_decimal(g, val);
+            }
+            if (LLVMGetTypeKind(src) == LLVMDoubleTypeKind ||
+                LLVMGetTypeKind(src) == LLVMFloatTypeKind) {
+                if (LLVMGetTypeKind(src) == LLVMFloatTypeKind) {
+                    val = LLVMBuildFPExt(g->builder, val, LLVMDoubleTypeInContext(g->ctx), "dec.fpext");
+                }
+                LLVMValueRef slot = emit_entry_alloca(g, target, "dec.fslot");
+                LLVMTypeRef ptr_ty = LLVMPointerType(target, 0);
+                LLVMTypeRef fn_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                    (LLVMTypeRef[]){ LLVMDoubleTypeInContext(g->ctx), ptr_ty }, 2, 0);
+                LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_from_double", fn_ty);
+                zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ val, slot }, 2, "");
+                return LLVMBuildLoad2(g->builder, target, slot, "dec.fval");
+            }
+        }
+        if (src == get_decimal_type(g)) {
+            if (LLVMGetTypeKind(target) == LLVMIntegerTypeKind) {
+                LLVMValueRef slot = emit_entry_alloca(g, src, "dec.tslot");
+                LLVMBuildStore(g->builder, val, slot);
+                LLVMTypeRef ptr_ty = LLVMPointerType(src, 0);
+                LLVMTypeRef fn_ty = LLVMFunctionType(LLVMInt64TypeInContext(g->ctx),
+                    (LLVMTypeRef[]){ ptr_ty }, 1, 0);
+                LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_to_int64", fn_ty);
+                LLVMValueRef i64_val = zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ slot }, 1, "dec.i64");
+                if (LLVMGetIntTypeWidth(target) < 64) {
+                    return LLVMBuildTrunc(g->builder, i64_val, target, "dec.trunc");
+                }
+                return i64_val;
+            }
+            if (LLVMGetTypeKind(target) == LLVMDoubleTypeKind ||
+                LLVMGetTypeKind(target) == LLVMFloatTypeKind) {
+                LLVMValueRef slot = emit_entry_alloca(g, src, "dec.tslot");
+                LLVMBuildStore(g->builder, val, slot);
+                LLVMTypeRef ptr_ty = LLVMPointerType(src, 0);
+                LLVMTypeRef fn_ty = LLVMFunctionType(LLVMDoubleTypeInContext(g->ctx),
+                    (LLVMTypeRef[]){ ptr_ty }, 1, 0);
+                LLVMValueRef fn = get_libc_fn(g, "__zan_decimal_to_double", fn_ty);
+                LLVMValueRef dbl = zan_call2(g->builder, fn_ty, fn, (LLVMValueRef[]){ slot }, 1, "dec.dbl");
+                if (LLVMGetTypeKind(target) == LLVMFloatTypeKind) {
+                    return LLVMBuildFPTrunc(g->builder, dbl, target, "dec.flt");
+                }
+                return dbl;
+            }
+        }
+
         LLVMTypeKind sk = LLVMGetTypeKind(src);
         LLVMTypeKind tk = LLVMGetTypeKind(target);
         /* 地址与委托互转：(WndProc)addr 动态转换运行时回调 */
@@ -10515,7 +10684,7 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     if (!expr) return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 
     if (expr->kind == AST_REF_ARG) {
-        return emit_ref_arg(g, expr, locals);    }
+        return emit_ref_arg(g, expr, locals); }
     if (expr->kind == AST_MEMBER_ACCESS && expr->member.null_cond) {
         return emit_null_cond(g, expr, expr, locals);
     }
@@ -10538,6 +10707,20 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
 
     case AST_FLOAT_LITERAL:
         return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx), expr->float_val);
+
+    case AST_DECIMAL_LITERAL: {
+        zan_decimal_t dec;
+        const char *s = expr->str_val.str ? expr->str_val.str : "0";
+        if (!zan_decimal_parse(s, (size_t)expr->str_val.len, &dec)) {
+            dec = zan_decimal_zero();
+        }
+        LLVMValueRef fld_vals[3] = {
+            LLVMConstInt(LLVMInt32TypeInContext(g->ctx), dec.flags, 0),
+            LLVMConstInt(LLVMInt32TypeInContext(g->ctx), dec.hi32, 0),
+            LLVMConstInt(LLVMInt64TypeInContext(g->ctx), dec.lo64, 0)
+        };
+        return LLVMConstNamedStruct(get_decimal_type(g), fld_vals, 3);
+    }
 
     case AST_STRING_LITERAL:
         return emit_string_literal_rc(g, expr->str_val);

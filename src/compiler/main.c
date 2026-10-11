@@ -3045,6 +3045,9 @@ static void dump_ast_node(zan_ast_node_t *node, int depth) {
     case AST_FLOAT_LITERAL:
         printf("FloatLiteral %g\n", node->float_val);
         break;
+    case AST_DECIMAL_LITERAL:
+        printf("DecimalLiteral %.*sm\n", node->str_val.len, node->str_val.str ? node->str_val.str : "0");
+        break;
     case AST_STRING_LITERAL:
         printf("StringLiteral \"%.*s\"\n", node->str_val.len, node->str_val.str);
         break;
@@ -6043,6 +6046,7 @@ int main(int argc, char **argv) {
         char rt_io_buf[1200];
         char rt_sync_buf[1200];
         char rt_file_buf[1200];
+        char rt_decimal_buf[1200];
         char rt_embed_buf[1200];
         char rt_inflate_buf[1200];
         char rt_timer_buf[1200];
@@ -6077,6 +6081,14 @@ int main(int argc, char **argv) {
             snprintf(rt_file_buf, sizeof(rt_file_buf), "%s/%s",
                      link_exe_dir, zan_path_basename(ZAN_RT_FILE_OBJ));
             rt_file_obj = rt_file_buf;
+        }
+#endif
+        const char *rt_decimal_obj = NULL;
+#ifdef ZAN_RT_DECIMAL_OBJ
+        if (irgen.uses_decimal_runtime) {
+            snprintf(rt_decimal_buf, sizeof(rt_decimal_buf), "%s/%s",
+                     link_exe_dir, zan_path_basename(ZAN_RT_DECIMAL_OBJ));
+            rt_decimal_obj = rt_decimal_buf;
         }
 #endif
         const char *rt_embed_obj = NULL;
@@ -6390,7 +6402,7 @@ int main(int argc, char **argv) {
             } else {
                 if (cross_compiling
                     && (rt_io_obj || rt_sync_obj || rt_file_obj
-                        || rt_embed_obj)) {
+                        || rt_decimal_obj || rt_embed_obj)) {
                     if (!target_rt_sub) {
                         fprintf(stderr,
                                 "error: no bundled runtime objects for this "
@@ -6425,6 +6437,13 @@ int main(int argc, char **argv) {
                                  target_rt_sub);
                         rt_file_obj = rt_file_buf;
                         if (!zan_file_exists(rt_file_obj)) missing = rt_file_obj;
+                    }
+                    if (rt_decimal_obj) {
+                        snprintf(rt_decimal_buf, sizeof(rt_decimal_buf),
+                                 "%s/%s/zanrt_decimal.o", link_exe_dir,
+                                 target_rt_sub);
+                        rt_decimal_obj = rt_decimal_buf;
+                        if (!zan_file_exists(rt_decimal_obj)) missing = rt_decimal_obj;
                     }
                     if (rt_embed_obj) {
                         snprintf(rt_embed_buf, sizeof(rt_embed_buf),
@@ -6508,6 +6527,7 @@ int main(int argc, char **argv) {
                     if (rt_io_obj) argv[a++] = rt_io_obj;
                     if (rt_sync_obj) argv[a++] = rt_sync_obj;
                     if (rt_file_obj) argv[a++] = rt_file_obj;
+                    if (rt_decimal_obj) argv[a++] = rt_decimal_obj;
                     if (rt_embed_obj) argv[a++] = rt_embed_obj;
                     if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
                     if (rt_timer_obj) argv[a++] = rt_timer_obj;
@@ -6655,6 +6675,10 @@ int main(int argc, char **argv) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
                     }
+                    if (rt_decimal_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_decimal_obj);
+                    }
                     if (rt_embed_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_embed_obj);
@@ -6701,6 +6725,10 @@ int main(int argc, char **argv) {
                     if (rt_file_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
+                    }
+                    if (rt_decimal_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_decimal_obj);
                     }
                     if (rt_embed_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -6762,6 +6790,10 @@ int main(int argc, char **argv) {
                     if (rt_file_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
                                  rt_file_obj);
+                    }
+                    if (rt_decimal_obj) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
+                                 rt_decimal_obj);
                     }
                     if (rt_embed_obj) {
                         cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -6850,6 +6882,10 @@ int main(int argc, char **argv) {
                     if (irgen.uses_file_runtime) {
                         cmd_appendf(cmd, sizeof(cmd),
                                  " \"%s/zanrt_file.o\"", sys4);
+                    }
+                    if (irgen.uses_decimal_runtime) {
+                        cmd_appendf(cmd, sizeof(cmd),
+                                 " \"%s/zanrt_decimal.o\"", sys4);
                     }
                     if (irgen.uses_embed_api) {
                         cmd_appendf(cmd, sizeof(cmd),
@@ -6956,6 +6992,9 @@ int main(int argc, char **argv) {
             if (irgen.uses_file_runtime) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
+            if (irgen.uses_decimal_runtime) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_decimal.o\"", sys);
+            }
             if (irgen.uses_embed_api) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zan_embed_api.o\"", sys);
             }
@@ -7045,6 +7084,9 @@ int main(int argc, char **argv) {
             if (irgen.uses_file_runtime) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
+            if (irgen.uses_decimal_runtime) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_decimal.o\"", sys);
+            }
             if (irgen.uses_embed_api) {
                 cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_embed_api.o\"", sys);
@@ -7126,6 +7168,9 @@ int main(int argc, char **argv) {
             if (irgen.uses_file_runtime) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_file.o\"", sys);
             }
+            if (irgen.uses_decimal_runtime) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s/zanrt_decimal.o\"", sys);
+            }
             if (irgen.uses_embed_api) {
                 cmd_appendf(cmd, sizeof(cmd),
                          " \"%s/zan_embed_api.o\"", sys);
@@ -7194,6 +7239,7 @@ int main(int argc, char **argv) {
             char winrt_io[1400] = {0};
             char winrt_sync[1400] = {0};
             char winrt_file[1400] = {0};
+            char winrt_decimal[1400] = {0};
             char winrt_embed[1400] = {0};
             if (rt_io_obj)
                 snprintf(winrt_io, sizeof(winrt_io), "%s/%s/%s", exe_dir2, wsub,
@@ -7203,6 +7249,9 @@ int main(int argc, char **argv) {
                          exe_dir2, wsub);
             if (rt_file_obj)
                 snprintf(winrt_file, sizeof(winrt_file), "%s/%s/zanrt_file.o",
+                         exe_dir2, wsub);
+            if (rt_decimal_obj)
+                snprintf(winrt_decimal, sizeof(winrt_decimal), "%s/%s/zanrt_decimal.o",
                          exe_dir2, wsub);
             if (rt_embed_obj)
                 snprintf(winrt_embed, sizeof(winrt_embed),
@@ -7214,6 +7263,7 @@ int main(int argc, char **argv) {
             if ((winrt_io[0] && !zan_file_exists(winrt_io))
                 || (winrt_sync[0] && !zan_file_exists(winrt_sync))
                 || (winrt_file[0] && !zan_file_exists(winrt_file))
+                || (winrt_decimal[0] && !zan_file_exists(winrt_decimal))
                 || (winrt_embed[0] && !zan_file_exists(winrt_embed))
                 || (winrt_inflate[0] && !zan_file_exists(winrt_inflate))) {
                 fprintf(stderr,
@@ -7263,6 +7313,9 @@ int main(int argc, char **argv) {
             }
             if (winrt_file[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_file);
+            }
+            if (winrt_decimal[0]) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_decimal);
             }
             if (winrt_embed[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", winrt_embed);
@@ -7496,6 +7549,7 @@ int main(int argc, char **argv) {
             char macrt_io[1400] = {0};
             char macrt_sync[1400] = {0};
             char macrt_file[1400] = {0};
+            char macrt_decimal[1400] = {0};
             char macrt_embed[1400] = {0};
             if (rt_io_obj) {
                 snprintf(macrt_io, sizeof(macrt_io), "%s/%s", macrt,
@@ -7507,6 +7561,10 @@ int main(int argc, char **argv) {
             }
             if (rt_file_obj) {
                 snprintf(macrt_file, sizeof(macrt_file), "%s/zanrt_file.o",
+                         macrt);
+            }
+            if (rt_decimal_obj) {
+                snprintf(macrt_decimal, sizeof(macrt_decimal), "%s/zanrt_decimal.o",
                          macrt);
             }
             if (rt_embed_obj) {
@@ -7521,6 +7579,7 @@ int main(int argc, char **argv) {
             if ((macrt_io[0] && !zan_file_exists(macrt_io))
                 || (macrt_sync[0] && !zan_file_exists(macrt_sync))
                 || (macrt_file[0] && !zan_file_exists(macrt_file))
+                || (macrt_decimal[0] && !zan_file_exists(macrt_decimal))
                 || (macrt_embed[0] && !zan_file_exists(macrt_embed))
                 || (macrt_inflate[0] && !zan_file_exists(macrt_inflate))) {
                 fprintf(stderr,
@@ -7564,6 +7623,9 @@ int main(int argc, char **argv) {
             }
             if (macrt_file[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_file);
+            }
+            if (macrt_decimal[0]) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_decimal);
             }
             if (macrt_embed[0]) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_embed);
@@ -7696,6 +7758,7 @@ int main(int argc, char **argv) {
             if (rt_io_obj) argv[a++] = rt_io_obj;
             if (rt_sync_obj) argv[a++] = rt_sync_obj;
             if (rt_file_obj) argv[a++] = rt_file_obj;
+            if (rt_decimal_obj) argv[a++] = rt_decimal_obj;
             if (rt_embed_obj) argv[a++] = rt_embed_obj;
             if (rt_inflate_obj) argv[a++] = rt_inflate_obj;
             if (rt_timer_obj) argv[a++] = rt_timer_obj;
@@ -7776,6 +7839,9 @@ int main(int argc, char **argv) {
             if (rt_file_obj) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_file_obj);
             }
+            if (rt_decimal_obj) {
+                cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_decimal_obj);
+            }
             if (rt_embed_obj) {
                 cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_embed_obj);
             }
@@ -7853,6 +7919,9 @@ int main(int argc, char **argv) {
             cmd_appendf(link_cmd, sizeof(link_cmd),
                      " \"%s\" -pthread", rt_file_obj);
 #endif
+        }
+        if (rt_decimal_obj) {
+            cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_decimal_obj);
         }
         if (rt_embed_obj) {
             cmd_appendf(link_cmd, sizeof(link_cmd), " \"%s\"", rt_embed_obj);

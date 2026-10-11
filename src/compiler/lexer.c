@@ -104,6 +104,7 @@ static const char *s_token_names[TK__COUNT] = {
     [TK_EOF]         = "EOF",
     [TK_INT_LIT]     = "INT_LIT",
     [TK_FLOAT_LIT]   = "FLOAT_LIT",
+    [TK_DECIMAL_LIT] = "DECIMAL_LIT",
     [TK_STRING_LIT]  = "STRING_LIT",
     [TK_CHAR_LIT]    = "CHAR_LIT",
     [TK_IDENT]       = "IDENT",
@@ -855,15 +856,18 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
         }
     }
 
-    /* suffix: f/F (float), m/M (decimal, mapped to double) */
-    if (lexer_peek_ch(lex) == 'f' || lexer_peek_ch(lex) == 'F' ||
-        lexer_peek_ch(lex) == 'm' || lexer_peek_ch(lex) == 'M') {
+    bool is_decimal = false;
+    /* suffix: f/F (float), m/M (decimal) */
+    if (lexer_peek_ch(lex) == 'f' || lexer_peek_ch(lex) == 'F') {
         is_float = true;
+        lexer_advance(lex);
+    } else if (lexer_peek_ch(lex) == 'm' || lexer_peek_ch(lex) == 'M') {
+        is_decimal = true;
         lexer_advance(lex);
     }
 
     int lit_suffix = 0;
-    if (!is_float) {
+    if (!is_float && !is_decimal) {
         lit_suffix = lexer_int_suffix(lex);
     }
 
@@ -880,12 +884,17 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
     buf[bi] = '\0';
     if (lit_truncated) {
-        zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float
-                      ? "floating-point literal is too long"
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc, is_float || is_decimal
+                      ? "floating-point/decimal literal is too long"
                       : "integer literal is too long");
     }
 
-    if (is_float) {
+    if (is_decimal) {
+        zan_token_t tok = lexer_make(lex, TK_DECIMAL_LIT, loc);
+        tok.str_val.str = zan_arena_strdup(lex->arena, buf, bi);
+        tok.str_val.len = (uint32_t)bi;
+        return tok;
+    } else if (is_float) {
         zan_token_t tok = lexer_make(lex, TK_FLOAT_LIT, loc);
         tok.float_val = strtod(buf, NULL);
         return tok;

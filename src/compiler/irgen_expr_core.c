@@ -571,7 +571,7 @@ static bool types_match_modulo_tp(zan_type_t *a, zan_type_t *b) {
     return true;
 }
 
-enum { FAM_UNKNOWN = 0, FAM_BOOL, FAM_INT, FAM_FLOAT, FAM_STRING, FAM_REF };
+enum { FAM_UNKNOWN = 0, FAM_BOOL, FAM_INT, FAM_FLOAT, FAM_STRING, FAM_REF, FAM_DECIMAL };
 
 static int type_family(zan_type_t *t) {
     if (!t) return FAM_UNKNOWN;
@@ -582,6 +582,7 @@ static int type_family(zan_type_t *t) {
     case TYPE_CHAR: case TYPE_ENUM:
         return FAM_INT;
     case TYPE_FLOAT: case TYPE_DOUBLE: return FAM_FLOAT;
+    case TYPE_DECIMAL: return FAM_DECIMAL;
     case TYPE_STRING: return FAM_STRING;
     case TYPE_CLASS: case TYPE_INTERFACE: case TYPE_ARRAY: case TYPE_OBJECT: return FAM_REF;
     default: return FAM_UNKNOWN;
@@ -906,6 +907,7 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
     switch (e->kind) {
     case AST_INT_LITERAL: case AST_CHAR_LITERAL: return FAM_INT;
     case AST_FLOAT_LITERAL: return FAM_FLOAT;
+    case AST_DECIMAL_LITERAL: return FAM_DECIMAL;
     case AST_STRING_LITERAL: case AST_STRING_INTERP: return FAM_STRING;
     case AST_BOOL_LITERAL: return FAM_BOOL;
     case AST_UNARY:
@@ -928,6 +930,7 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
             int lf = expr_family(g, e->binary.left, locals);
             int rf = expr_family(g, e->binary.right, locals);
             if (lf == FAM_STRING || rf == FAM_STRING) return FAM_STRING;
+            if (lf == FAM_DECIMAL || rf == FAM_DECIMAL) return FAM_DECIMAL;
             if (lf == FAM_FLOAT || rf == FAM_FLOAT) return FAM_FLOAT;
             if (lf != FAM_UNKNOWN) return lf;
             return rf;
@@ -951,6 +954,7 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
         if (pf == af) return 2;
         if (implicit_ctor_for_arg(g, pt, at, a, locals)) return 1;
         if (pf == FAM_FLOAT && af == FAM_INT) return 0;
+        if (pf == FAM_DECIMAL && af == FAM_INT) return 1;
         if (str_and_byte_buffer(pt, at) || str_and_byte_buffer(at, pt)) return 0;
         return -1;
     }
@@ -959,6 +963,7 @@ static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
     if (af == FAM_UNKNOWN || pf == FAM_UNKNOWN) return 0;
     if (af == pf) return 2;
     if (pf == FAM_FLOAT && af == FAM_INT) return 0;
+    if (pf == FAM_DECIMAL && af == FAM_INT) return 1;
     return -1;
 }
 
@@ -1374,6 +1379,8 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
         }
     case AST_FLOAT_LITERAL:
         return g->binder ? g->binder->type_double : NULL;
+    case AST_DECIMAL_LITERAL:
+        return g->binder ? g->binder->type_decimal : NULL;
     case AST_CHAR_LITERAL:
         return g->binder ? g->binder->type_char : NULL;
     case AST_BOOL_LITERAL:
