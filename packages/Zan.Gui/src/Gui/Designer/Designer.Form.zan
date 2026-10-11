@@ -1451,9 +1451,10 @@ partial class Designer {
         }
 
         // 抓手模式：左键在面板任意处按下即拖动画布，
-        // 选择/框选/调整大小全部让位。
-        if (freeHand) { freeDragging = false; freeResizing = false; freeMarquee = false; }
-        if (!locked && freeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
+        // 选择/框选/调整大小全部让位。按住空格键等价于激活抓手。
+        bool activeHand = freeHand || spacePressed;
+        if (activeHand) { freeDragging = false; freeResizing = false; freeMarquee = false; }
+        if (!locked && activeHand && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             Window.SetCursor(1);
             if (ek == 2 && app.window.EventButton() == 0) {
                 app.focus.ClearFocus();
@@ -1466,7 +1467,7 @@ partial class Designer {
         }
 
         // 画板右键菜单触发：在画板内右键点击，命中控件则选中该控件并弹出上下文菜单，点在空白处则弹出全局画布菜单
-        if (!locked && !preview && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 1
+        if (!locked && !preview && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 1
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             app.focus.ClearFocus();
             int mDesX = (app.mouseX - ox) * 1000 / psMilli;
@@ -1496,7 +1497,7 @@ partial class Designer {
 
         // 指针按下：选中的调整大小手柄优先，否则选择并
         // 开始拖拽；按在空白处清除选择。编辑器窗口开着时让位。
-        if (!locked && !freeHand && !dragging && ek == 2 && app.window.EventButton() == 0
+        if (!locked && !activeHand && !dragging && ek == 2 && app.window.EventButton() == 0
                 && InRect(app.mouseX, app.mouseY, inX, inY, inW, inH)) {
             app.focus.ClearFocus();
             bool started = false;
@@ -1764,7 +1765,9 @@ partial class Designer {
             if (mqw < 0) { mqx = app.mouseX; mqw = 0 - mqw; }
             if (mqh < 0) { mqy = app.mouseY; mqh = 0 - mqh; }
             if (ek == 1) { app.RequestRedraw(); }
-            c.DrawRect(mqx, mqy, mqw, mqh, Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0), 1);
+            int mqAcc = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+            c.FillRect(mqx, mqy, mqw, mqh, Style.Fade(mqAcc, 80));
+            c.DrawRect(mqx, mqy, mqw, mqh, mqAcc, 1);
             if (ek == 3) {
                 int selL = this.DesignPointerPx(mqx, ox, psMilli);
                 int selT = this.DesignPointerPx(mqy, oy, psMilli);
@@ -1881,6 +1884,74 @@ partial class Designer {
             c.FillRoundRect(hudX, hudY, hudW, hudH, app.Scale(4),
                 Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0));
             c.DrawText(hudX + app.Scale(6), hudY + app.Scale(2), hudTxt, badgeFg, fsTiny);
+        }
+
+        // Alt 键悬停间距测量标尺 (Alt Spacing Inspection)：
+        // 当按住 Alt 且有选中项 sel，光标悬停在另一个控件 hoverField 上时，
+        // 动态绘制两者在世界坐标系下的间距连线与数字标尺。
+        if (!preview && sel != null && hoverField != null && hoverField != sel
+                && Modifiers.HasAlt(app.window.EventMods())
+                && !freeDragging && !freeResizing && !freePanning) {
+            Rect r1 = this.DesignViewRect(sel, ox, oy, psMilli);
+            Rect r2 = this.DesignViewRect(hoverField, ox, oy, psMilli);
+            int mCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+            int lineCol = Style.Fade(mCol, 20);
+
+            // 绘制 hoverField 高亮外框
+            c.DrawRect(r2.x, r2.y, r2.width, r2.height, mCol, 1);
+
+            int x1 = r1.x; int y1 = r1.y; int w1 = r1.width; int h1 = r1.height;
+            int x2 = r2.x; int y2 = r2.y; int w2 = r2.width; int h2 = r2.height;
+
+            // 水平间距：r2 在 r1 右侧
+            if (x2 > x1 + w1) {
+                int gapX = (x2 - (x1 + w1)) * 1000 / psMilli;
+                int ly = (y1 + h1 / 2 + y2 + h2 / 2) / 2;
+                c.FillRect(x1 + w1, ly, x2 - (x1 + w1), 1, lineCol);
+                string gt = Convert.ToString(gapX);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (x1 + w1 + x2) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            } else if (x1 > x2 + w2) { // 水平间距：r2 在 r1 左侧
+                int gapX = (x1 - (x2 + w2)) * 1000 / psMilli;
+                int ly = (y1 + h1 / 2 + y2 + h2 / 2) / 2;
+                c.FillRect(x2 + w2, ly, x1 - (x2 + w2), 1, lineCol);
+                string gt = Convert.ToString(gapX);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = (x2 + w2 + x1) / 2 - gtw / 2;
+                int gty = ly - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
+
+            // 垂直间距：r2 在 r1 下方
+            if (y2 > y1 + h1) {
+                int gapY = (y2 - (y1 + h1)) * 1000 / psMilli;
+                int lx = (x1 + w1 / 2 + x2 + w2 / 2) / 2;
+                c.FillRect(lx, y1 + h1, 1, y2 - (y1 + h1), lineCol);
+                string gt = Convert.ToString(gapY);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (y1 + h1 + y2) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            } else if (y1 > y2 + h2) { // 垂直间距：r2 在 r1 上方
+                int gapY = (y1 - (y2 + h2)) * 1000 / psMilli;
+                int lx = (x1 + w1 / 2 + x2 + w2 / 2) / 2;
+                c.FillRect(lx, y2 + h2, 1, y1 - (y2 + h2), lineCol);
+                string gt = Convert.ToString(gapY);
+                int gtw = Canvas.MeasureText(gt, fsTiny) + app.Scale(6);
+                int gth = app.Scale(14);
+                int gtx = lx - gtw / 2;
+                int gty = (y2 + h2 + y1) / 2 - gth / 2;
+                c.FillRoundRect(gtx, gty, gtw, gth, app.Scale(2), mCol);
+                c.DrawText(gtx + app.Scale(3), gty + app.Scale(1), gt, badgeFg, fsTiny);
+            }
         }
 
         c.PopClip();

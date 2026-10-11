@@ -379,6 +379,7 @@ partial class Designer {
     // （容器连子级一起）。
     List<string> clipFields;
     bool freeHand;       // 抓手模式：左键拖动即平移画布
+    bool spacePressed;   // 空格键按下：临时激活抓手平移
     bool freeMarquee;    // 正在空白处拉框选
     int freeMqSX;        // 框选起点（屏幕坐标）
     int freeMqSY;
@@ -2545,6 +2546,94 @@ partial class Designer {
         }
     }
 
+    // 一键成组：把多选的所有组件收纳进一个新的 Panel 容器 (Ctrl+G)
+    void GroupSel() {
+        if (sel == null || freeExtra == null || freeExtra.Count == 0) { return; }
+        this.PushUndo();
+        List<FormField> all = new List<FormField>();
+        all.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            all.Add(freeExtra[i]);
+        }
+        int minX = all[0].fx;
+        int minY = all[0].fy;
+        int maxX = all[0].fx + all[0].LayoutW();
+        int maxY = all[0].fy + all[0].LayoutH();
+        for (int i = 1; i < all.Count; i = i + 1) {
+            FormField f = all[i];
+            if (f.fx < minX) { minX = f.fx; }
+            if (f.fy < minY) { minY = f.fy; }
+            int r = f.fx + f.LayoutW();
+            int b = f.fy + f.LayoutH();
+            if (r > maxX) { maxX = r; }
+            if (b > maxY) { maxY = b; }
+        }
+        int pad = 12;
+        int groupW = maxX - minX + pad * 2;
+        int groupH = maxY - minY + pad * 2;
+        if (groupW < 60) { groupW = 60; }
+        if (groupH < 40) { groupH = 40; }
+
+        FormField grp = FormField.New(15, seq);
+        seq = seq + 1;
+        grp.fname = "panel" + Convert.ToString(seq);
+        grp.name = grp.fname;
+        grp.fx = minX;
+        grp.fy = minY;
+        grp.fw = groupW;
+        grp.fh = groupH;
+        grp.position = 1;
+        grp.kids = new List<FormField>();
+
+        for (int i = 0; i < all.Count; i = i + 1) {
+            FormField f = all[i];
+            FormField pc = ParentContainerOf(f);
+            if (pc == null) { fields = ListRemove(fields, f); }
+            else { pc.kids = ListRemove(pc.kids, f); }
+            f.fx = f.fx - minX + pad;
+            f.fy = f.fy - minY + pad;
+            grp.kids.Add(f);
+        }
+
+        fields.Add(grp);
+        this.ClearExtraSel();
+        sel = grp;
+        activeContainer = grp;
+        this.MarkDocDirty();
+        msg = Designer.T("Grouped ", "已成组 ") + Convert.ToString(all.Count) + Designer.T(" components into ", " 个组件至 ") + grp.fname;
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 一键解散成组：把当前选中容器解散，将其子组件提取回上一层 (Ctrl+Shift+G)
+    void UngroupSel() {
+        if (sel == null || !FormField.IsContainerOf(sel.ftype) || sel.kids == null || sel.kids.Count == 0) {
+            return;
+        }
+        this.PushUndo();
+        FormField grp = sel;
+        int baseX = grp.fx;
+        int baseY = grp.fy;
+        List<FormField> children = grp.kids;
+        FormField pc = ParentContainerOf(grp);
+        if (pc == null) { fields = ListRemove(fields, grp); }
+        else { pc.kids = ListRemove(pc.kids, grp); }
+
+        this.ClearExtraSel();
+        sel = null;
+        for (int i = 0; i < children.Count; i = i + 1) {
+            FormField child = children[i];
+            child.fx = baseX + child.fx;
+            child.fy = baseY + child.fy;
+            if (pc == null) { fields.Add(child); }
+            else { pc.kids.Add(child); }
+            if (sel == null) { sel = child; }
+            else { freeExtra.Add(child); }
+        }
+        this.MarkDocDirty();
+        msg = Designer.T("Ungrouped ", "已解散成组: ") + grp.fname + " (" + Convert.ToString(children.Count) + ")";
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
     // 删除主选中项，并清掉多选与可能引用它的交互状态
     // （避免悬空引用崩溃）。
     void DeleteSel() {
@@ -2645,6 +2734,8 @@ partial class Designer {
             r.Add(Designer.T("Delete", "删除") + "  Del");
             if (freeExtra != null && freeExtra.Count > 0) {
                 r.Add("");
+                r.Add(Designer.T("Group", "成组") + "  Ctrl+G");
+                r.Add("");
                 r.Add(Designer.T("Align Left", "← 左对齐"));
                 r.Add(Designer.T("Align Center H", "| 水平居中"));
                 r.Add(Designer.T("Align Right", "→ 右对齐"));
@@ -2659,6 +2750,9 @@ partial class Designer {
                 r.Add("");
             } else {
                 r.Add(Designer.T("Rename", "重命名") + "  F2");
+                if (FormField.IsContainerOf(sel.ftype) && sel.kids != null && sel.kids.Count > 0) {
+                    r.Add(Designer.T("Ungroup", "解散成组") + "  Ctrl+Shift+G");
+                }
                 r.Add("");
                 r.Add(Designer.T("Layout: Flow", "排版: Flex 流式"));
                 r.Add(Designer.T("Layout: Float Free", "排版: 浮动自由"));
@@ -2697,57 +2791,54 @@ partial class Designer {
 
     void HandleCanvasMenu(App app, int cc) {
         if (sel != null) {
-            if (freeExtra != null && freeExtra.Count > 0) {
-                if (cc == 0) { this.CutSel(); }
-                else if (cc == 1) { this.CopySel(); }
-                else if (cc == 2) { this.PasteClip(); }
-                else if (cc == 3) { this.DeleteSelGroup(); }
-                else if (cc == 5) { this.AlignSelGroup(0); }
-                else if (cc == 6) { this.AlignSelGroup(1); }
-                else if (cc == 7) { this.AlignSelGroup(2); }
-                else if (cc == 8) { this.AlignSelGroup(3); }
-                else if (cc == 9) { this.AlignSelGroup(4); }
-                else if (cc == 10) { this.AlignSelGroup(5); }
-                else if (cc == 12) { this.DistributeSelGroup(0); }
-                else if (cc == 13) { this.DistributeSelGroup(1); }
-                else if (cc == 14) { this.SizeSelGroup(0); }
-                else if (cc == 15) { this.SizeSelGroup(1); }
-                else if (cc == 17) { this.SelToEdge(1); }
-                else if (cc == 18) { this.MoveSel(1); }
-                else if (cc == 19) { this.MoveSel(0 - 1); }
-                else if (cc == 20) { this.SelToEdge(0); }
-                else if (cc == 21) { this.ToggleLockSel(); }
-                else if (cc == 23) { this.DuplicateSel(); }
-            } else {
-                if (cc == 0) { this.CutSel(); }
-                else if (cc == 1) { this.CopySel(); }
-                else if (cc == 2) { this.PasteClip(); }
-                else if (cc == 3) { this.DeleteSelGroup(); }
-                else if (cc == 4) { this.StartInlineRename(); }
-                else if (cc == 6) { this.SetSelLayoutMode(0, 0); }
-                else if (cc == 7) { this.SetSelLayoutMode(1, 0); }
-                else if (cc == 8) { this.SetSelLayoutMode(1, 1); }
-                else if (cc == 9) { this.SetSelLayoutMode(1, 3); }
-                else if (cc == 10) { this.SetSelLayoutMode(1, 7); }
-                else if (cc == 11) { this.SetSelLayoutMode(1, 9); }
-                else if (cc == 12) { this.SetSelLayoutMode(1, 10); }
-                else if (cc == 14) { this.SelToEdge(1); }
-                else if (cc == 15) { this.MoveSel(1); }
-                else if (cc == 16) { this.MoveSel(0 - 1); }
-                else if (cc == 17) { this.SelToEdge(0); }
-                else if (cc == 18) { this.ToggleLockSel(); }
-                else if (cc == 20) { this.DuplicateSel(); }
-            }
+            List<string> items = this.CanvasMenuLabels();
+            if (cc < 0 || cc >= items.Count) { return; }
+            string it = items[cc];
+            if (it == "") { return; }
+            if (it.StartsWith(Designer.T("Cut", "剪切"))) { this.CutSel(); }
+            else if (it.StartsWith(Designer.T("Copy", "复制"))) { this.CopySel(); }
+            else if (it.StartsWith(Designer.T("Paste", "粘贴"))) { this.PasteClip(); }
+            else if (it.StartsWith(Designer.T("Delete", "删除"))) { this.DeleteSelGroup(); }
+            else if (it.StartsWith(Designer.T("Rename", "重命名"))) { this.StartInlineRename(); }
+            else if (it.StartsWith(Designer.T("Group", "成组"))) { this.GroupSel(); }
+            else if (it.StartsWith(Designer.T("Ungroup", "解散成组"))) { this.UngroupSel(); }
+            else if (it.StartsWith(Designer.T("Align Left", "← 左对齐"))) { this.AlignSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Align Center H", "| 水平居中"))) { this.AlignSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Align Right", "→ 右对齐"))) { this.AlignSelGroup(2); }
+            else if (it.StartsWith(Designer.T("Align Top", "↑ 顶对齐"))) { this.AlignSelGroup(3); }
+            else if (it.StartsWith(Designer.T("Align Middle V", "- 垂直居中"))) { this.AlignSelGroup(4); }
+            else if (it.StartsWith(Designer.T("Align Bottom", "↓ 底对齐"))) { this.AlignSelGroup(5); }
+            else if (it.StartsWith(Designer.T("Distribute Horizontally", "⇹ 水平均分"))) { this.DistributeSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Distribute Vertically", "⇳ 垂直均分"))) { this.DistributeSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Match Width", "↔ 等宽"))) { this.SizeSelGroup(0); }
+            else if (it.StartsWith(Designer.T("Match Height", "↕ 等高"))) { this.SizeSelGroup(1); }
+            else if (it.StartsWith(Designer.T("Layout: Flow", "排版: Flex 流式"))) { this.SetSelLayoutMode(0, 0); }
+            else if (it.StartsWith(Designer.T("Layout: Float Free", "排版: 浮动自由"))) { this.SetSelLayoutMode(1, 0); }
+            else if (it.StartsWith(Designer.T("Layout: Float Top-Left", "排版: 浮动左上"))) { this.SetSelLayoutMode(1, 1); }
+            else if (it.StartsWith(Designer.T("Layout: Float Top-Right", "排版: 浮动右上"))) { this.SetSelLayoutMode(1, 3); }
+            else if (it.StartsWith(Designer.T("Layout: Float Bottom-Left", "排版: 浮动左下"))) { this.SetSelLayoutMode(1, 7); }
+            else if (it.StartsWith(Designer.T("Layout: Float Bottom-Right", "排版: 浮动右下"))) { this.SetSelLayoutMode(1, 9); }
+            else if (it.StartsWith(Designer.T("Layout: Float Stretch", "排版: 浮动铺满"))) { this.SetSelLayoutMode(1, 10); }
+            else if (it.StartsWith(Designer.T("Bring to Front", "置于顶层"))) { this.SelToEdge(1); }
+            else if (it.StartsWith(Designer.T("Bring Forward", "上移一层"))) { this.MoveSel(1); }
+            else if (it.StartsWith(Designer.T("Send Backward", "下移一层"))) { this.MoveSel(0 - 1); }
+            else if (it.StartsWith(Designer.T("Send to Back", "置于底层"))) { this.SelToEdge(0); }
+            else if (it.StartsWith(Designer.T("Unlock", "解锁")) || it.StartsWith(Designer.T("Lock", "锁定"))) { this.ToggleLockSel(); }
+            else if (it.StartsWith(Designer.T("Duplicate", "创建副本"))) { this.DuplicateSel(); }
         } else {
-            if (cc == 0) { this.PasteClip(); }
-            else if (cc == 2) { this.AddField(15); }
-            else if (cc == 3) { this.AddField(18); }
-            else if (cc == 4) { this.AddField(0); }
-            else if (cc == 5) { this.AddField(22); }
-            else if (cc == 6) { this.AddField(28); }
-            else if (cc == 8) { snapGrid = !snapGrid; }
-            else if (cc == 10) { winZoom = 0; }
-            else if (cc == 11) { winZoom = 1000; }
+            List<string> items = this.CanvasMenuLabels();
+            if (cc < 0 || cc >= items.Count) { return; }
+            string it = items[cc];
+            if (it == "") { return; }
+            if (it.StartsWith(Designer.T("Paste", "粘贴"))) { this.PasteClip(); }
+            else if (it.StartsWith(Designer.T("Add Button", "添加 按钮"))) { this.AddField(15); }
+            else if (it.StartsWith(Designer.T("Add Label", "添加 标签"))) { this.AddField(18); }
+            else if (it.StartsWith(Designer.T("Add Input", "添加 输入框"))) { this.AddField(0); }
+            else if (it.StartsWith(Designer.T("Add Panel", "添加 面板"))) { this.AddField(22); }
+            else if (it.StartsWith(Designer.T("Add Table", "添加 表格"))) { this.AddField(28); }
+            else if (it.StartsWith(Designer.T("Disable Snap", "关闭网格吸附")) || it.StartsWith(Designer.T("Enable Snap", "开启网格吸附"))) { snapGrid = !snapGrid; }
+            else if (it.StartsWith(Designer.T("Fit to Window", "适应窗口大小"))) { winZoom = 0; }
+            else if (it.StartsWith(Designer.T("Zoom 100%", "缩放 100%"))) { winZoom = 1000; }
         }
     }
 
@@ -2885,6 +2976,13 @@ partial class Designer {
                 } else if (hasCtrl && (kc == 76 || kc == 108) && sel != null) {
                     this.ToggleLockSel();
                     app.RequestRedraw();
+                } else if (hasCtrl && (kc == 71 || kc == 103)) {
+                    if (hasShift) { this.UngroupSel(); }
+                    else { this.GroupSel(); }
+                    app.RequestRedraw();
+                } else if (kc == 32) {
+                    spacePressed = true;
+                    app.RequestRedraw();
                 } else if (inlineRenaming && kc == 13) {
                     this.CommitInlineRename();
                 } else if (inlineRenaming && kc == 27) {
@@ -2941,6 +3039,12 @@ partial class Designer {
                         if (kc == 40) { ndy = step; }
                         this.NudgeSel(ndx, ndy);
                     }
+                    app.RequestRedraw();
+                }
+            } else if (ek == 5) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 32) {
+                    spacePressed = false;
                     app.RequestRedraw();
                 }
             }
