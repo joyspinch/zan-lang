@@ -1083,8 +1083,14 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
 	  1. 上下文菜单项数必须精简克制（单选 10~15 项，多选 15~18 项，空白根 8~10 项），严禁将模板插入、底层排版流等杂项平铺进右键菜单导致菜单高达上千像素溢出屏幕被截断；
 	  2. 通用 ContextMenu 必须标准化识别 `"-"`、`""`、`"---"` 分隔线，制表符 `\t` 或双空格后的快捷键（accel）必须自动剥离并两端右对齐渲染，单项行高不低于 26px 并配备悬停圆角底衬，确保留白舒适；
 	  3. 裸指针事件防穿透门控：设计器画布、绘图区等直接读取底层裸事件（`app.EventKind()`、`mouseX`、`mouseY`）的组件，当存在浮层弹窗、ContextMenu 或帮助浮层时，必须建立联合锁定门控（`locked = BigEditorOpen || canvasMenuOpen || quickInsertOpen || keymapHelpOpen`），并在鼠标抬起（`EventKind == 3`）、双击跳转、标尺拖拽等关键路径全量施加 `!locked` 门控，彻底封死在菜单项上点击时穿透到底层画布篡改组件或误跳代码的历史顽疾。
-	- **属性检查器窄面板下密集按钮网格排布（Inspector Grid Adaptability in Narrow Panels）**：
-	  在属性检查器（宽 200~300px）中，当操作选项多于 4 项时（如 Dock 的 6 种停靠方式：None/Top/Bottom/Left/Right/Fill），严禁在单行硬塞 6 个按钮导致文字严重截断挤压与视觉畸变；规范做法是拆分为标准 3+3 两行等宽网格排布，垂直与水平间距遵循 4px 阶梯，行高宽裕舒适，彻底根治窄面板下按钮变形的顽疾。
+		- **属性检查器窄面板下密集按钮网格排布（Inspector Grid Adaptability in Narrow Panels）**：
+		  在属性检查器（宽 200~300px）中，当操作选项多于 4 项时（如 Dock 的 6 种停靠方式：None/Top/Bottom/Left/Right/Fill），严禁在单行硬塞 6 个按钮导致文字严重截断挤压与视觉畸变；规范做法是拆分为标准 3+3 两行等宽网格排布，垂直与水平间距遵循 4px 阶梯，行高宽裕舒适，彻底根治窄面板下按钮变形的顽疾。
+	- **内外边距与间隙（Margin, Padding & Gap）在设计器与运行时全链路生效闭环**：
+	  在设计器中配置 `margin`（外边距）、`padding`（内边距）和 `gap`（子间距）后，若出现“设置了但在设计器预览或运行期没有变化”的症状，根因在于 FormBuilder 动态重建控件树期未将文档声明绑定到底层控件的度量通道。
+	  规范做法：
+	  1. `Control` 基类必须内建显式的 `marL/marT/marR/marB` 与 `marSet` 标志，提供 `Margin(int m)` / `Margin(t, r, b, l)` 链式方法，并在 `StyleMarL/T/R/B()` 决策中优先返回显式外边距（与 `Pad()/Padding()` 优先机制完全对齐）；
+	  2. 声明度量体系建立 `logMar`、`logPad`、`logGap` 通道，在 `ApplyDeclaredUnits` 中统一由 `app.Scale(...)` 换算为设备像素；
+	  3. `FormBuilder.SetupLayout` 构建期必须将文档节点的 `padding`、`gap`、`margin` 显式映射到控件的 `logPad`、`logGap`、`logMar`，彻底打通“检查器设置 -> 文档持久化 -> FormBuilder 映射 -> 布局度量计算”的全链路。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
