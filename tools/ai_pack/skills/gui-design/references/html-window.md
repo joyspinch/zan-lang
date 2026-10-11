@@ -344,10 +344,15 @@ STANDARDS.md §6.7）。
    - **组件类型感知模型强转回写（Coercion On Writeback）**：双向绑定 `data-bind` 回写时，若目标 JSON 模型节点尚未初始化（`cur == null`），`WriteBoundValue` 自动根据当前绑定的控件类型进行精准的类型归一化：`Checkbox` / `Switch` 强制以 `JsonValue.NewBool` 写入；`Slider` / `InputNumber` / `Progress` / `Rate` 及声明了 `.number` 的控件强制以 `JsonValue.NewNum` 写入；避免空模型初次绑定输入时被统一回写为字符串而破坏数据契约。
    - **快照即时同步防抖**：控件完成 `WriteBoundValue` 模型就地回写后，立即调用 `RecordSnapshot(c, s)` 同步控件快照，防止同一帧在后续流程中再次触发无效重复写入。
 
-13. **编译期 GenHtml 与运行时 Html.Build 双通道语义同构对齐规范**：
-   - **全量语法特性的编译期保真**：编译期 `.html` 转 `.zan` 代码生成器（`GenHtml`）必须与运行期动态解析器（`Html.Build`）保持 100% 契约同构。
-   - **动态属性与修饰符同构生成**：动态属性绑定（`:prop`、`v-bind:prop`、`z-bind:prop`）统一发射 `v.AddBindProp("prop", expr)`；修饰符链路（`v-model.lazy.number.trim`）除发射 `v.bindPath` 外，同步发射 `v.bindLazy = true`、`v.bindNumber = true`、`v.bindTrim = true` 属性；具名插槽同步发射 `v.slotName = "..."`；动态类名与禁用态同步发射 `v.bindClass` 与 `v.bindDisabled`。
-   - **文本胡子插值编译期提取**：在元素内部内容包含 `{{ expr }}` 时，`GenHtml` 同步在生成的源码中登记 `v.bindTpl = "..."`，确保 AOT 编译生成的建树代码在被 `ChildWindow` 接线挂载后，与 JIT 动态解析文档具备完全一致的运行时响应式求值表现。
+14. **设计器复合与容器组件项事件与细粒度配置闭环规范（ToolStrip 项事件/Tab 与选项关闭尺寸/大编辑器定位）**：
+   - **工具条（ToolStrip）项点击事件在属性与事件面板双通道暴露**：
+     - 在「属性」面板的选项行（OPTIONS）上，为非分隔符项直观展示已绑定的事件处理器（`-> On...Click`），并在每行配备 `[事件]` 操作按钮，点击自动推导方法名并直通代码后置。
+     - 在「事件」面板中增设专属「工具条项点击 (Tool Items Click)」事件组，列出全部项的 `.Click` 事件，标配「定位」、「新建」、「编辑」三合一操作，支持一键在代码后置中定位或自动生成事件桩。
+   - **大弹窗选项与列编辑器（RowsEditor）代码定位直通**：
+     - 在工具条项与表格列的弹窗主从属性编辑面板中，为选中项提供「定位事件代码」/「定位点击代码」按钮，免除开发者在选项文本与事件方法名之间反复来回切换。
+   - **选项与 Tab 关闭按钮精致化度量（14px~16px）**：
+     - 属性检查器选项列表中删除按钮（`MiniCloseBtn`）重构为轻量 16px 矩形热区配 10px `close` 字符图标与悬停高亮；`Tabs` 标签页的关闭按钮统一收缩至 14px 方形热区并配合 10px 字符，彻底根绝关闭按钮过大挤占选项标签或误触的问题。
+
 
 
 
