@@ -989,6 +989,8 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   对多选组件执行成组（`GroupSel` / `Ctrl+G`）时，若所有子项来自同一公共父容器（`commonParent`），新生成的包装 Panel 必须归入该父容器（`commonParent.kids.Add(grp)`），局部坐标直接基于其局部几何运算；若跨容器才折算世界坐标提升至根窗口。解散成组（`UngroupSel` / `Ctrl+Shift+G`）提取子组件时，必须正确折算偏移并对所有子项与新容器调用 `DesignDeclareRect`，确保修改完整持久化到源码，杜绝重载后层级倒流或坐标归零。
 - **左侧面板即时搜索过滤框（Palette / Outline Quick Filter）的常驻呈现**：
   拥有庞大组件库与大纲树的设计器左侧面板，必须在顶层 Tab 下方常驻即时搜索输入框（`filterInput`），联动树视图的 `WithFilter` 机制，支持输入拼音/英文/汉字关键字（如 "button", "table", "tab", "按钮"）毫秒级过滤匹配项，避免用户在几十个折叠分组中反复翻找。
+- **大纲树节点激活重命名与状态栏实时几何指示（Outline Activation & Status Live Geometry）**：
+  设计器中组件大纲树（`TreeView`）应挂载 `OnActivate` 回调：当用户在已选节点上再次点击或回车激活时，即时就地触发 F2 原地重命名（`StartInlineRename`），免除用户在树节点与右键菜单之间往返切换。同时，底部状态栏应动态显示当前选中组件（或根窗口）的实时逻辑位置与宽高（如 `'btnSave' [120, 80  100×32]`），并在多选时标注附加项数，为像素微调和对齐校验提供毫秒级直接反馈。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
