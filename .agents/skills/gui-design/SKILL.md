@@ -1081,6 +1081,11 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
 - **全局快捷键均分分布与撤销/重做语义动作跟踪（Global Distribution Shortcuts & Semantic Undo Action Tracking）**：
   1. 全局支持 `Ctrl+Shift+H`（水平均分）与 `Ctrl+Shift+V`（垂直均分）快捷键，无缝衔接多选排版流水线；
   2. 撤销/重做系统（Undo/Redo）维护动作语义栈（`undoActionStack` / `redoActionStack`），在压栈时同步记录具体操作类型（如“对齐组件”、“水平均分”、“批量外边距”、“锁定/解锁”等），撤销或重做时在状态栏精准呈现具体操作描述与剩余步数，并在工具栏按钮上展示实时步数徽标，消除心智盲区。
+- **外壳控件智能默认Dock停靠与检查器停靠矩阵（Smart Docking on Creation & Quick Dock Matrix）**：
+  在自由或混合排版中，外壳控件（ToolStrip, StatusBar）如果被默认赋予绝对浮动坐标（Float），后续添加的流式容器（Panel, Form, GroupBox）会从 (0, 0) 开始排版并将工具条覆盖遮挡。
+  规范做法：
+  1. 新增 ToolStrip 时默认赋予 `dockSide = 1`（Dock.Top 顶部停靠，`position = 0`），新增 StatusBar 时默认赋予 `dockSide = 2`（Dock.Bottom 底部停靠，`position = 0`），使其自动参与外壳停靠排版；
+  2. 属性检查器单选排版卡片常驻提供 `Dock: [None 0] [Top 1] [Bot 2] [Left 3] [Right 4] [Fill 5]` 胶囊切换按钮矩阵，一秒在常用停靠与铺满余量间切换，并自动同步坐标与重算布局。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
