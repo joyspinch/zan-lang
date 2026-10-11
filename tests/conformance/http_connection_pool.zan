@@ -1,0 +1,194 @@
+using System;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    static int PORT = 9642;
+    static int accepted;
+    static int requests;
+    static TcpListener listener;
+    static bool probing = true;
+
+    static async void Serve() {
+        Prog.listener = new TcpListener("127.0.0.1", Prog.PORT);
+        Prog.listener.Start();
+        while (true) {
+            nint c = await Prog.listener.AcceptAsync();
+            if (c < 0) { break; }
+            if (Prog.probing) {
+                Prog.probing = false;
+            } else {
+                Prog.accepted = Prog.accepted + 1;
+            }
+            Task.Spawn(Prog.ServeOne(c));
+        }
+        Prog.listener.Stop();
+        Prog.listener = null;
+    }
+
+    static async void ServeOne(nint c) {
+        string buf = "";
+        while (true) {
+            int hb = Prog.Find(buf, "\r\n\r\n");
+            while (hb < 0) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { Socket.Close(c); return; }
+                buf = buf + piece;
+                hb = Prog.Find(buf, "\r\n\r\n");
+            }
+            string head = buf.Substring(0, hb + 4);
+            string rest = buf.Substring(hb + 4, buf.Length - hb - 4);
+            int cl = Prog.ContentLength(head);
+            while (rest.Length < cl) {
+                string piece2 = await Socket.RecvAsync(c, 8192);
+                if (piece2.Length == 0) { Socket.Close(c); return; }
+                rest = rest + piece2;
+            }
+            buf = rest.Substring(cl, rest.Length - cl);
+            Prog.requests = Prog.requests + 1;
+            bool reqClose = Prog.FindNoCase(head, "connection: close") >= 0;
+
+            string resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+            int _s = await Socket.SendStringAsync(c, resp);
+            if (reqClose) {
+                Socket.Close(c);
+                return;
+            }
+        }
+    }
+
+    static int ContentLength(string head) {
+        int i = Prog.FindNoCase(head, "content-length:");
+        if (i < 0) { return 0; }
+        int s = i + 15;
+        while (s < head.Length && head[s] == ' ') { s = s + 1; }
+        int v = 0;
+        while (s < head.Length && head[s] >= '0' && head[s] <= '9') {
+            v = v * 10 + (head[s] - 48);
+            s = s + 1;
+        }
+        return v;
+    }
+
+    static int Find(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = 0; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m && (hay[i + k] & 255) == (needle[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static int FindNoCase(string hay, string needle) {
+        int n = hay.Length;
+        int m = needle.Length;
+        for (int i = 0; i + m <= n; i = i + 1) {
+            int k = 0;
+            while (k < m) {
+                int a = hay[i + k] & 255;
+                int b = needle[k] & 255;
+                if (a >= 65 && a <= 90) { a = a + 32; }
+                if (b >= 65 && b <= 90) { b = b + 32; }
+                if (a != b) { break; }
+                k = k + 1;
+            }
+            if (k == m) { return i; }
+        }
+        return -1;
+    }
+
+    static async void ConcurrentWorker(HttpClient c, List<string> sink) {
+        string res = await c.GetAsync("/test");
+        sink.Add(res);
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+        Prog.accepted = 0;
+        Prog.requests = 0;
+        Task.Spawn(Prog.Serve());
+
+        bool up = false;
+        for (int i = 0; i < 250 && !up; i = i + 1) {
+            TcpClient probe = await TcpClient.ConnectAsync("127.0.0.1", Prog.PORT, 200);
+            if (probe != null) {
+                probe.Close();
+                up = true;
+            } else {
+                await Task.Delay(20);
+            }
+        }
+
+        // 1. 测试独立 HttpConnectionPool 组件控制与过期逻辑
+        HttpConnectionPool p = new HttpConnectionPool(8, 4, 50, 100);
+        Console.WriteLine("pool-cap: " + Convert.ToString(p.MaxConnections()));
+        Console.WriteLine("pool-idle-cap: " + Convert.ToString(p.MaxIdleConnections()));
+        Console.WriteLine("permit-1: " + Convert.ToString(p.TryAcquirePermit() ? 1 : 0));
+        Console.WriteLine("active-1: " + Convert.ToString(p.ActiveCount()));
+        p.ReleasePermit();
+        Console.WriteLine("active-after-release: " + Convert.ToString(p.ActiveCount()));
+
+        // 2. 测试并发多连接池化扩展与跨并发轮次全量复用
+        HttpClient client = new HttpClient("127.0.0.1", Prog.PORT);
+        client.SetTimeout(8000);
+        client.SetConnectionPool(16, 8, 60000, 300000);
+
+        // 第一轮：发起 3 个并发请求
+        int beforeRound1 = Prog.accepted;
+        List<string> sink1 = new List<string>();
+        Task.Spawn(Prog.ConcurrentWorker(client, sink1));
+        Task.Spawn(Prog.ConcurrentWorker(client, sink1));
+        string r1 = await client.GetAsync("/test");
+        sink1.Add(r1);
+
+        for (int i = 0; i < 400 && sink1.Count < 3; i = i + 1) {
+            await Task.Delay(20);
+        }
+        Console.WriteLine("round1-all-success: " + Convert.ToString(sink1.Count == 3 ? 1 : 0));
+        int connsCreated = Prog.accepted - beforeRound1;
+        Console.WriteLine("round1-conns-pooled: " + Convert.ToString(connsCreated >= 2 ? 1 : 0));
+
+        // 等待所有连接归还入池
+        for (int i = 0; i < 50 && client.ConnectionPool().IdleCount() < connsCreated; i = i + 1) {
+            await Task.Delay(20);
+        }
+        int idleInPool = client.ConnectionPool().IdleCount();
+        Console.WriteLine("pool-has-idle: " + Convert.ToString(idleInPool >= 2 ? 1 : 0));
+
+        // 第二轮：再次发起 3 个并发请求，应当完全复用池中已建立的连接，不产生任何新连接
+        int beforeRound2 = Prog.accepted;
+        List<string> sink2 = new List<string>();
+        Task.Spawn(Prog.ConcurrentWorker(client, sink2));
+        Task.Spawn(Prog.ConcurrentWorker(client, sink2));
+        string r2 = await client.GetAsync("/test");
+        sink2.Add(r2);
+
+        for (int i = 0; i < 400 && sink2.Count < 3; i = i + 1) {
+            await Task.Delay(20);
+        }
+        Console.WriteLine("round2-all-success: " + Convert.ToString(sink2.Count == 3 ? 1 : 0));
+        int newConnsRound2 = Prog.accepted - beforeRound2;
+        Console.WriteLine("round2-zero-new-conns: " + Convert.ToString(newConnsRound2 == 0 ? 1 : 0));
+
+        // 3. 关闭客户端连接池并验证
+        client.Close();
+        Console.WriteLine("pool-closed-idle: " + Convert.ToString(client.ConnectionPool().IdleCount()));
+
+        Prog.listener.Stop();
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("connection-pool-test-done: 1");
+        return 0;
+    }
+
+    static void Main() {
+        int _rc = await Run();
+    }
+}

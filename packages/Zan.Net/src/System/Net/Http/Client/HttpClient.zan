@@ -91,6 +91,7 @@ class HttpClient {
     TlsContext kaCtx;
     bool kaBusy;  // 在途请求标志：并发请求退回一次性通道
     bool kaEnabled;
+    HttpConnectionPool pool;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -139,6 +140,7 @@ class HttpClient {
         this.kaCtx = null;
         this.kaBusy = false;
         this.kaEnabled = true;
+        this.pool = HttpConnectionPool.CreateDefault();
     }
 
     // 为指定的主机和端口创建 HTTPS 客户端。
@@ -449,6 +451,7 @@ class HttpClient {
     // 空闲时调用，避免悬挂的半开连接。
     void Close() {
         this.DropAlive();
+        if (this.pool != null) { this.pool.CloseAll(); }
     }
 
     // 禁用连接复用：每个请求各建一条连接并在响应后关闭
@@ -456,6 +459,7 @@ class HttpClient {
     HttpClient DisableKeepAlive() {
         this.kaEnabled = false;
         this.DropAlive();
+        if (this.pool != null) { this.pool.CloseAll(); }
         return this;
     }
 
@@ -470,6 +474,22 @@ class HttpClient {
         this.kaConn = null;
         if (this.kaCtx != null) { this.kaCtx.Free(); }
         this.kaCtx = null;
+        if (this.pool != null) { this.pool.CloseAll(); }
+    }
+
+    // 配置底层弹性连接池规格与生命周期参数。
+    HttpClient SetConnectionPool(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
+        if (this.pool == null) {
+            this.pool = new HttpConnectionPool(maxConnections, maxIdleConnections, idleTimeoutMs, maxLifetimeMs);
+        } else {
+            this.pool.SetLimits(maxConnections, maxIdleConnections, idleTimeoutMs, maxLifetimeMs);
+        }
+        return this;
+    }
+
+    // 获取底层连接池实例。
+    HttpConnectionPool ConnectionPool() {
+        return this.pool;
     }
 
     // 当 <see cref="SetHeader"/> 已提供过一个名字
@@ -930,10 +950,14 @@ class HttpClient {
     async string RequestOnceAsync(string method, string path, string body) {
         this.CheckRequestLimit(body.Length);
         this.CheckTargetPolicy();
-        if (this.kaEnabled && !this.kaBusy) {
-            string alive = await this.RequestAliveAsync(method, path, body);
+        if (this.kaEnabled && this.pool != null) {
+            string alive = await this.RequestPooledAsync(method, path, body);
             return alive;
         }
+        return await this.RequestUnpooledAsync(method, path, body);
+    }
+
+    async string RequestUnpooledAsync(string method, string path, string body) {
         if (this.useTls) {
             string raw = await RequestTlsAsync(method, path, body);
             return raw;
@@ -1322,6 +1346,243 @@ class HttpClient {
             bool late2 = HttpDeadline.Expired(watch);
             HttpDeadline.Disarm(watch);
             if (!keep || late2) { this.DropAlive(); }
+            if (late2) {
+                bodyOut = "";
+                head = "";
+                req = "";
+                method = "";
+                path = "";
+                body = "";
+                FailTimeout();
+            }
+            StringBuilder rsb = new StringBuilder();
+            rsb.Append(head);
+            rsb.Append(bodyOut);
+            string result = rsb.ToString();
+            this.ValidateTextResponse(result, method);
+            this.AbsorbCookies(path, result);
+            return result;
+        }
+    }
+
+    // 为池化通道创建底层物理连接（明文 TCP 或 TLS 握手），连接失败返回 null。
+    async PooledHttpConnection CreatePooledConnection() {
+        TcpClient conn = await this.ConnectTarget();
+        if (conn == null) { return null; }
+        if (!this.useTls) {
+            HttpFramer framer = HttpFramer.Create(conn.Sock());
+            return new PooledHttpConnection(conn, null, null, framer);
+        }
+        Socket.Initialize();
+        TlsContext ctx;
+        if (this.clientCertificateFile.Length > 0
+            && this.clientPrivateKeyFile.Length > 0) {
+            ctx = TlsContext.CreateClientWithCertificate(
+                this.clientCertificateFile, this.clientPrivateKeyFile);
+        } else {
+            ctx = TlsContext.CreateClient();
+        }
+        if (ctx != null && this.certPolicy != null) {
+            ctx.SetCertPolicy(this.certPolicy);
+        }
+        if (ctx == null) {
+            conn.Close();
+            string tlsError = TlsStream.LastError();
+            if (tlsError == "") { tlsError = "TLS 上下文初始化失败"; }
+            throw new HttpRequestException(tlsError);
+        }
+        if (!this.verifyTls) {
+            ctx.DisableVerify();
+        }
+        this.ApplyPinning(ctx);
+        TlsStream stream = await this.ConnectTls(ctx, conn.Sock());
+        if (stream == null) {
+            conn.Close();
+            ctx.Free();
+            string tlsHandshakeError = TlsStream.LastError();
+            if (tlsHandshakeError == "") {
+                tlsHandshakeError = "TLS 握手失败";
+            }
+            throw new HttpRequestException(tlsHandshakeError);
+        }
+        HttpFramer framer = HttpFramerTls.Create(stream);
+        return new PooledHttpConnection(conn, stream, ctx, framer);
+    }
+
+    // 弹性连接池收发核心：租借复用连接，并发多连接自动扩容，远端静默断开透明重试。
+    async string RequestPooledAsync(string method, string path, string body) {
+        int attempt = 0;
+        while (true) {
+            attempt = attempt + 1;
+            bool reused = false;
+            PooledHttpConnection conn = this.pool.TryRentIdle();
+            if (conn != null) {
+                reused = true;
+            } else {
+                bool permit = this.pool.TryAcquirePermit();
+                if (!permit) {
+                    return await this.RequestUnpooledAsync(method, path, body);
+                }
+                conn = await this.CreatePooledConnection();
+                if (conn == null) {
+                    this.pool.ReleasePermit();
+                    FailConnect();
+                }
+            }
+
+            HttpDeadlineToken watch = HttpDeadline.Arm(conn.conn.Sock(),
+                this.WriteBudget(), this.TotalBudget());
+            string req = this.BuildRequest(method, path, body, false);
+            int _sent = 0;
+            if (conn.tls != null) {
+                _sent = await conn.tls.SendAsync(req, req.Length);
+            } else {
+                _sent = await conn.conn.SendAsync(req);
+            }
+            if (_sent != req.Length) {
+                bool writeLate = HttpDeadline.Expired(watch);
+                HttpDeadline.Disarm(watch);
+                this.pool.Return(conn, false);
+                req = "";
+                if (writeLate) { FailTimeout(); }
+                throw new HttpRequestException("request write failed");
+            }
+
+            HttpDeadline.Touch(watch, this.ReadBudget());
+            int he = 0;
+            string head = "";
+            while (true) {
+                he = await conn.framer.ReadHead(65536);
+                if (he == 0 && reused && attempt == 1
+                    && (method == "GET" || method == "HEAD")) {
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    break;
+                }
+                if (he == 0) {
+                    bool late = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    if (late) {
+                        method = "";
+                        path = "";
+                        body = "";
+                        FailTimeout();
+                    }
+                    throw new HttpRequestException(
+                        "connection closed before a response arrived");
+                }
+                if (he < 0) {
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    throw new HttpRequestException(
+                        "response header block exceeds 65536 bytes");
+                }
+                head = conn.framer.Head(he);
+                int interim = HttpClient.HeadStatus(head);
+                if (interim >= 100 && interim < 200 && interim != 101) {
+                    conn.framer.Consume(he);
+                    continue;
+                }
+                break;
+            }
+
+            if (he == 0 && reused && attempt == 1
+                && (method == "GET" || method == "HEAD")) {
+                continue;
+            }
+
+            HttpResponse probe = HttpResponse.Parse(head);
+            if (probe.statusCode < 100 || !probe.ParseFraming()) {
+                HttpDeadline.Disarm(watch);
+                this.pool.Return(conn, false);
+                req = "";
+                throw new HttpRequestException("response framing malformed");
+            }
+            bool serverClose = HttpClient.HeadSaysClose(head);
+            bool noBody = probe.statusCode == 204 || probe.statusCode == 304
+                || method == "HEAD";
+            string bodyOut = "";
+            bool keep = false;
+            if (noBody) {
+                conn.framer.Consume(he);
+                keep = !serverClose;
+            } else if (probe.framingChunked || probe.framingHasLength) {
+                int st = await conn.framer.ReadResponseBody(probe, he,
+                    this.ResponseLimit());
+                if (st == 0) {
+                    bodyOut = probe.body;
+                    conn.framer.Consume(conn.framer.RequestBytes());
+                    keep = !serverClose;
+                } else if (st == -1) {
+                    bool late = HttpDeadline.Expired(watch);
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    if (late) {
+                        method = "";
+                        path = "";
+                        body = "";
+                        FailTimeout();
+                    }
+                    throw new HttpRequestException(
+                        "connection closed in the middle of the response body");
+                } else if (st == 413) {
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    throw new HttpRequestException(
+                        "response body exceeds " + Convert.ToString(
+                            this.ResponseLimit()) + " bytes");
+                } else {
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    throw new HttpRequestException(
+                        "malformed chunked response body");
+                }
+            } else {
+                StringBuilder rest = new StringBuilder();
+                int limit = this.ResponseLimit();
+                int bodyCount = conn.framer.Pending() - he;
+                if (bodyCount > limit) {
+                    HttpDeadline.Disarm(watch);
+                    this.pool.Return(conn, false);
+                    req = "";
+                    throw new HttpRequestException(
+                        "response body exceeds " + Convert.ToString(limit)
+                        + " bytes");
+                }
+                if (bodyCount > 0) {
+                    rest.Append(conn.framer.Slice(he, bodyCount));
+                }
+                int pend = conn.framer.Pending();
+                conn.framer.Consume(pend);
+                while (!conn.framer.Closed()) {
+                    int n = await conn.framer.Fill();
+                    if (n > 0) {
+                        if (bodyCount > limit - n) {
+                            this.pool.Return(conn, false);
+                            req = "";
+                            HttpDeadline.Disarm(watch);
+                            throw new HttpRequestException(
+                                "response body exceeds " + Convert.ToString(limit)
+                                + " bytes");
+                        }
+                        rest.Append(conn.framer.Slice(0, n));
+                        bodyCount = bodyCount + n;
+                        conn.framer.Consume(n);
+                    }
+                }
+                bodyOut = rest.ToString();
+                keep = false;
+            }
+
+            bool late2 = HttpDeadline.Expired(watch);
+            HttpDeadline.Disarm(watch);
+            this.pool.Return(conn, keep && !late2);
             if (late2) {
                 bodyOut = "";
                 head = "";

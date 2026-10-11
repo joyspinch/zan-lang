@@ -1856,8 +1856,10 @@ static void coerce_int_pair(zan_irgen_t *g, LLVMValueRef *a, LLVMValueRef *b) {
 }
 
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target) {
+    if (!v || !target) return v;
     LLVMTypeRef vt = LLVMTypeOf(v);
-    if (llvm_is_nullable(target) && vt != target) {
+    if (vt == target) return v;
+    if (llvm_is_nullable(target)) {
         if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind)
             return LLVMIsNull(v) ? nullable_none(target) : v;
         if (llvm_is_nullable(vt)) {
@@ -1872,6 +1874,13 @@ static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef ta
         LLVMValueRef wrapped = nullable_some(g, target, v);
         return wrapped ? wrapped : v;
     }
+    if (LLVMIsNull(v)) return LLVMConstNull(target);
+    if (LLVMGetTypeKind(vt) == LLVMPointerTypeKind &&
+        LLVMGetTypeKind(target) == LLVMIntegerTypeKind)
+        return LLVMBuildPtrToInt(g->builder, v, target, "p2i");
+    if (LLVMGetTypeKind(vt) == LLVMIntegerTypeKind &&
+        LLVMGetTypeKind(target) == LLVMPointerTypeKind)
+        return LLVMBuildIntToPtr(g->builder, v, target, "i2p");
     if (LLVMGetTypeKind(target) == LLVMFloatTypeKind &&
         LLVMGetTypeKind(vt) == LLVMDoubleTypeKind)
         return LLVMBuildFPTrunc(g->builder, v, target, "fit.fptrunc");

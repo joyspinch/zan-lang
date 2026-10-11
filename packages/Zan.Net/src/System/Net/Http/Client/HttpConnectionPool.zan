@@ -1,0 +1,212 @@
+using System;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.Http;
+using System.Net.Tls;
+using System.Threading;
+
+namespace System.Net.Http.Client;
+
+// 单条池化管理的 HTTP/HTTPS 持久连接封装。
+public class PooledHttpConnection {
+    public TcpClient conn;
+    public TlsStream tls;
+    public TlsContext ctx;
+    public HttpFramer framer;
+    public long createdAtUs;
+    public long lastUsedAtUs;
+    public int totalRequests;
+
+    public PooledHttpConnection(TcpClient conn, TlsStream tls, TlsContext ctx, HttpFramer framer) {
+        this.conn = conn;
+        this.tls = tls;
+        this.ctx = ctx;
+        this.framer = framer;
+        this.createdAtUs = Socket.NativeMonotonicUs();
+        this.lastUsedAtUs = this.createdAtUs;
+        this.totalRequests = 0;
+    }
+
+    public bool IsExpired(long idleTimeoutUs, long maxLifetimeUs) {
+        long now = Socket.NativeMonotonicUs();
+        if (idleTimeoutUs > 0 && (now - this.lastUsedAtUs) > idleTimeoutUs) {
+            return true;
+        }
+        if (maxLifetimeUs > 0 && (now - this.createdAtUs) > maxLifetimeUs) {
+            return true;
+        }
+        return false;
+    }
+
+    public void Touch() {
+        this.lastUsedAtUs = Socket.NativeMonotonicUs();
+        this.totalRequests = this.totalRequests + 1;
+    }
+
+    public void Dispose() {
+        if (this.framer != null) {
+            this.framer.Dispose();
+            this.framer = null;
+        }
+        if (this.tls != null) {
+            this.tls.Close();
+            this.tls = null;
+        }
+        if (this.conn != null) {
+            this.conn.Close();
+            this.conn = null;
+        }
+        if (this.ctx != null) {
+            this.ctx.Free();
+            this.ctx = null;
+        }
+    }
+}
+
+// 弹性 HTTP 连接池：维护空闲持久连接队列、支持并发连接租借/归还、最大容量控制、空闲超时剔除。
+public class HttpConnectionPool {
+    int maxConnections;
+    int maxIdleConnections;
+    long idleTimeoutMs;
+    long maxLifetimeMs;
+    nint mtx;
+    List<PooledHttpConnection> idleList;
+    int activeCount;
+
+    public HttpConnectionPool(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
+        this.maxConnections = maxConnections > 0 ? maxConnections : 32;
+        this.maxIdleConnections = maxIdleConnections > 0 ? maxIdleConnections : 16;
+        this.idleTimeoutMs = idleTimeoutMs > 0 ? idleTimeoutMs : 60000;
+        this.maxLifetimeMs = maxLifetimeMs > 0 ? maxLifetimeMs : 300000;
+        this.mtx = Mutex.Create();
+        this.idleList = new List<PooledHttpConnection>();
+        this.activeCount = 0;
+    }
+
+    public static HttpConnectionPool CreateDefault() {
+        return new HttpConnectionPool(32, 16, 60000, 300000);
+    }
+
+    public int MaxConnections() { return this.maxConnections; }
+    public int MaxIdleConnections() { return this.maxIdleConnections; }
+    public long IdleTimeoutMs() { return this.idleTimeoutMs; }
+    public long MaxLifetimeMs() { return this.maxLifetimeMs; }
+
+    public void SetLimits(int maxConnections, int maxIdleConnections, long idleTimeoutMs, long maxLifetimeMs) {
+        Mutex.Lock(this.mtx);
+        try {
+            if (maxConnections > 0) { this.maxConnections = maxConnections; }
+            if (maxIdleConnections > 0) { this.maxIdleConnections = maxIdleConnections; }
+            if (idleTimeoutMs > 0) { this.idleTimeoutMs = idleTimeoutMs; }
+            if (maxLifetimeMs > 0) { this.maxLifetimeMs = maxLifetimeMs; }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 租借一条可用的空闲连接（若存在且未过期）
+    public PooledHttpConnection TryRentIdle() {
+        Mutex.Lock(this.mtx);
+        try {
+            long idleUs = this.idleTimeoutMs * 1000L;
+            long lifeUs = this.maxLifetimeMs * 1000L;
+            while (this.idleList.Count > 0) {
+                int lastIdx = this.idleList.Count - 1;
+                PooledHttpConnection conn = this.idleList[lastIdx];
+                this.idleList.RemoveAt(lastIdx);
+                if (conn.IsExpired(idleUs, lifeUs)) {
+                    conn.Dispose();
+                    continue;
+                }
+                this.activeCount = this.activeCount + 1;
+                return conn;
+            }
+            return null;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 是否允许创建新连接（并发连接数未达上限）
+    public bool TryAcquirePermit() {
+        Mutex.Lock(this.mtx);
+        try {
+            if (this.activeCount + this.idleList.Count < this.maxConnections) {
+                this.activeCount = this.activeCount + 1;
+                return true;
+            }
+            return false;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 归还或销毁连接
+    public void Return(PooledHttpConnection conn, bool reusable) {
+        if (conn == null) { return; }
+        Mutex.Lock(this.mtx);
+        try {
+            if (this.activeCount > 0) {
+                this.activeCount = this.activeCount - 1;
+            }
+            long idleUs = this.idleTimeoutMs * 1000L;
+            long lifeUs = this.maxLifetimeMs * 1000L;
+            if (reusable && !conn.IsExpired(idleUs, lifeUs) && this.idleList.Count < this.maxIdleConnections) {
+                conn.Touch();
+                this.idleList.Add(conn);
+            } else {
+                conn.Dispose();
+            }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 撤销创建许可（建连失败时回退计数）
+    public void ReleasePermit() {
+        Mutex.Lock(this.mtx);
+        try {
+            if (this.activeCount > 0) {
+                this.activeCount = this.activeCount - 1;
+            }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 清理所有池化连接
+    public void CloseAll() {
+        List<PooledHttpConnection> toClose = new List<PooledHttpConnection>();
+        Mutex.Lock(this.mtx);
+        try {
+            for (int i = 0; i < this.idleList.Count; i = i + 1) {
+                toClose.Add(this.idleList[i]);
+            }
+            this.idleList.Clear();
+            this.activeCount = 0;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+        for (int i = 0; i < toClose.Count; i = i + 1) {
+            toClose[i].Dispose();
+        }
+    }
+
+    public int ActiveCount() {
+        Mutex.Lock(this.mtx);
+        try {
+            return this.activeCount;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    public int IdleCount() {
+        Mutex.Lock(this.mtx);
+        try {
+            return this.idleList.Count;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+}

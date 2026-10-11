@@ -1,0 +1,244 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace System.Collections.Concurrent;
+
+// 分段锁条带节点，封装单个字典分片与其互斥锁。
+class ConcurrentStripe<TKey, TValue> {
+    nint mtx;
+    Dict<TKey, TValue> map;
+
+    ConcurrentStripe() {
+        this.mtx = Mutex.Create();
+        this.map = new Dict<TKey, TValue>();
+    }
+
+    ~ConcurrentStripe() {
+        if (this.mtx != 0) {
+            Mutex.Destroy(this.mtx);
+            this.mtx = 0;
+        }
+    }
+
+    void Lock() { Mutex.Lock(this.mtx); }
+    void Unlock() { Mutex.Unlock(this.mtx); }
+    Dict<TKey, TValue> Map { get { return this.map; } }
+}
+
+// 工业级分段锁并发字典（Striped-Lock ConcurrentDictionary）。
+// 通过多分片锁（Lock Striping）隔离并发热点，读写操作按键哈希仅锁对应条带，
+// 极大降低多线程高并发下的锁竞争与上下文切换开销。
+class ConcurrentDictionary<TKey, TValue> {
+    ConcurrentStripe<TKey, TValue>[] stripes;
+    int stripeCount;
+
+    ConcurrentDictionary() {
+        this.stripeCount = 16;
+        this.stripes = new ConcurrentStripe<TKey, TValue>[16];
+        for (int i = 0; i < 16; i = i + 1) {
+            this.stripes[i] = new ConcurrentStripe<TKey, TValue>();
+        }
+    }
+
+    ConcurrentDictionary(int concurrencyLevel) {
+        int n = concurrencyLevel;
+        if (n < 1) { n = 1; }
+        if (n > 256) { n = 256; }
+        this.stripeCount = n;
+        this.stripes = new ConcurrentStripe<TKey, TValue>[n];
+        for (int i = 0; i < n; i = i + 1) {
+            this.stripes[i] = new ConcurrentStripe<TKey, TValue>();
+        }
+    }
+
+    // 根据键计算所属条带序号（基于稳定多项式哈希）
+    int GetStripeIndex(TKey key) {
+        string s = key.ToString();
+        int h = 0;
+        int len = s.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            h = (h * 31 + (int)s[i]) & 0x7fffffff;
+        }
+        return h % this.stripeCount;
+    }
+
+    // 尝试添加键值对。若键已存在则返回 false，不覆盖旧值。
+    bool TryAdd(TKey key, TValue value) {
+        int idx = this.GetStripeIndex(key);
+        ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+        stripe.Lock();
+        try {
+            if (stripe.Map.ContainsKey(key)) {
+                return false;
+            }
+            stripe.Map.Add(key, value);
+            return true;
+        } finally {
+            stripe.Unlock();
+        }
+    }
+
+    // 尝试获取指定键对应的值。
+    bool TryGetValue(TKey key, out TValue value) {
+        int idx = this.GetStripeIndex(key);
+        ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+        stripe.Lock();
+        try {
+            return stripe.Map.TryGetValue(key, out value);
+        } finally {
+            stripe.Unlock();
+        }
+    }
+
+    // 尝试移除指定键并输出旧值。
+    bool TryRemove(TKey key, out TValue value) {
+        int idx = this.GetStripeIndex(key);
+        ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+        stripe.Lock();
+        try {
+            if (stripe.Map.TryGetValue(key, out value)) {
+                stripe.Map.Remove(key);
+                return true;
+            }
+            return false;
+        } finally {
+            stripe.Unlock();
+        }
+    }
+
+    // 判断是否包含指定键。
+    bool ContainsKey(TKey key) {
+        int idx = this.GetStripeIndex(key);
+        ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+        stripe.Lock();
+        try {
+            return stripe.Map.ContainsKey(key);
+        } finally {
+            stripe.Unlock();
+        }
+    }
+
+    // 若键不存在则插入，最终返回现有或新插入的值。
+    TValue GetOrAdd(TKey key, TValue value) {
+        int idx = this.GetStripeIndex(key);
+        ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+        stripe.Lock();
+        try {
+            TValue existing;
+            if (stripe.Map.TryGetValue(key, out existing)) {
+                return existing;
+            }
+            stripe.Map.Add(key, value);
+            return value;
+        } finally {
+            stripe.Unlock();
+        }
+    }
+
+    // 索引用法支持：读取或更新键值
+    TValue this[TKey key] {
+        get {
+            TValue v;
+            if (this.TryGetValue(key, out v)) {
+                return v;
+            }
+            throw new Exception("The given key was not present in the dictionary.");
+        }
+        set {
+            int idx = this.GetStripeIndex(key);
+            ConcurrentStripe<TKey, TValue> stripe = this.stripes[idx];
+            stripe.Lock();
+            try {
+                if (stripe.Map.ContainsKey(key)) {
+                    stripe.Map[key] = value;
+                } else {
+                    stripe.Map.Add(key, value);
+                }
+            } finally {
+                stripe.Unlock();
+            }
+        }
+    }
+
+    // 按顺序获取所有条带锁（防止死锁）
+    void LockAll() {
+        for (int i = 0; i < this.stripeCount; i = i + 1) {
+            this.stripes[i].Lock();
+        }
+    }
+
+    // 逆序释放所有条带锁
+    void UnlockAll() {
+        for (int i = this.stripeCount - 1; i >= 0; i = i - 1) {
+            this.stripes[i].Unlock();
+        }
+    }
+
+    // 清空字典中的所有项。
+    void Clear() {
+        this.LockAll();
+        try {
+            for (int i = 0; i < this.stripeCount; i = i + 1) {
+                this.stripes[i].Map.Clear();
+            }
+        } finally {
+            this.UnlockAll();
+        }
+    }
+
+    // 当前存储的总项数。
+    int Count() {
+        this.LockAll();
+        try {
+            int total = 0;
+            for (int i = 0; i < this.stripeCount; i = i + 1) {
+                total = total + this.stripes[i].Map.Count;
+            }
+            return total;
+        } finally {
+            this.UnlockAll();
+        }
+    }
+
+    // 字典是否为空。
+    bool IsEmpty() {
+        return this.Count() == 0;
+    }
+
+    // 获取所有键的列表快照。
+    List<TKey> Keys() {
+        this.LockAll();
+        try {
+            List<TKey> list = new List<TKey>();
+            for (int i = 0; i < this.stripeCount; i = i + 1) {
+                List<TKey> klist = this.stripes[i].Map.Keys;
+                int count = klist.Count;
+                for (int j = 0; j < count; j = j + 1) {
+                    list.Add(klist[j]);
+                }
+            }
+            return list;
+        } finally {
+            this.UnlockAll();
+        }
+    }
+
+    // 获取所有值的列表快照。
+    List<TValue> Values() {
+        this.LockAll();
+        try {
+            List<TValue> list = new List<TValue>();
+            for (int i = 0; i < this.stripeCount; i = i + 1) {
+                List<TValue> vlist = this.stripes[i].Map.Values;
+                int count = vlist.Count;
+                for (int j = 0; j < count; j = j + 1) {
+                    list.Add(vlist[j]);
+                }
+            }
+            return list;
+        } finally {
+            this.UnlockAll();
+        }
+    }
+}
