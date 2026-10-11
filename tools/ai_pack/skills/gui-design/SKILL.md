@@ -376,6 +376,15 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   3. 固定尺寸/固定正方形型（`Switch`、`Avatar`、`Icon`）：锁定宽高比与固定尺寸，禁止自由缩放；
   4. 自由容器与复合组件（`Panel`、`DataGrid`、`TreeView`、`TextArea`、`Chart`、`Tabs`）：开放 8 向自由伸缩，
      但必须受最小安全尺寸（`MinSafeWOf / MinSafeHOf`）门控，防止反向或过度拖拽导致组件崩溃塌陷为不可选中的 0/负数。
+- **属性检查器分层过滤与渐进披露机制（Inspector Progressive Disclosure）**：
+  为彻底解决组件属性检查器（PropertyGrid）列表过长、翻找困难的操作痛点：
+  1. 顶部分类标签分流：在检查器顶部提供【全部 (All) / 基础 (Basic) / 布局 (Layout) / 样式 (Style) / 数据 (Data)】五类一级分类标签；
+  2. 属性智能归类：`label/name/placeholder/required/wrap` 归入基础，`position/dock/flexGrow/anchor/x/y/w/h/margin/padding/gap/flexDir/justify/alignItems/flexWrap/span` 归入布局，`color/bg/border/radius/font/opacity` 归入样式，`bind/options/columns` 归入数据；
+  3. 卡片与分区联动过滤：布局快捷卡片、样式编辑器、数据绑定选择器、选项列表分区与分类标签严格联动过滤呈现，大幅收敛首屏高度。
+- **Flex 主轴/交叉轴对称性与行高最小容纳约束（Line Height Minimum Bounding Constraint）**：
+  1. Flex 测量主轴与交叉轴判定：横向流（`row == true`）主轴为宽（width），交叉轴为高（height）；纵向流（`!row`）主轴为高（height），交叉轴为宽（width）。断行主轴累计判定（`m > lineRem`）必须与排布阶段取值同源一致，严禁颠倒导致子项意外提前断行；
+  2. 行高基线保证与防截断：容器声明的 `line-height`（`declaredLineH`）为单行最小基线，不能强行压制比其更高的子元素（如 Button、Input）；行高计算应满足 `maxCross = Math.Max(maxCross, declaredLineH)`，杜绝子控件被压扁截断；
+  3. 盒模型双轨注入：FormBuilder 解析 `padding/pad` 属性时，必须同时注入 CSS `style` 与内核逻辑单位 `ctl.logPad`，并在 `padding == 0` 时显式注入 `padding: 0px`，确保画布预览与运行时完全一致。
 
 ## 毛刺防治(斜线/曲线/圆角的抗锯齿)
 
