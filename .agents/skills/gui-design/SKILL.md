@@ -316,6 +316,11 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
      按键路由同时支持 `EventChar` 控制字符与 `EventKeyDown`（Ctrl+Z/Ctrl+Y 等组合键）；
   3. 容器 Qualification 需严格校验 `f.IsContainer() || f.KidCount() > 0 || (f.kind == "Element" && node.control is Element)`，
      落点命中自身或子树时安全回退至原父容器，拖拽坐标换算处强制 `fx >= 0, fy >= 0` 杜绝负坐标移出画布。
+- **设计器画布双击时序与盒模型一等公民属性规范**
+  (点击设计窗口误跳代码/拖拽浮动层级混乱/盒模型只能手写 CSS 教训):
+  1. 双击进代码时序解耦：严禁在 MouseDown (`ek == 2`) 中消费底层 `DoubleClickNow()`，否则在单击选中或拖拽起步时极易误判为双击，打断画布操作并意外跳转代码生成桩事件；必须在 MouseUp (`ek == 3`) 且判定无任何物理拖拽/缩放位移（`!dragging && !freeDragHasMoved && !designResizeMoved`）时，通过组件指针与 400ms 阈值状态机精准触发跳转；
+  2. 盒模型一等公民快捷设置：Margin（外边距）、Padding（内边距）与容器 Gap（子间距）必须作为 FormField 核心建模字段，并在 Inspector 检查器提供数字步进器（0~200px 范围），同时闭环 FieldToJson / FieldFromJson 序列化、IsModeledKey 白名单以及快照 Copy/Equal 比对，避免开发者在自由/流式排版中被迫手写额外内联 CSS；
+  3. 自由与流式拖拽位移隔离：仅当鼠标移动超出物理阈值（`dx >= 4 || dy >= 4`）时才触发 `DesignMakeFloat`，避免原地单击或抖动将流式/停靠组件意外变为绝对定位；外壳/顶栏组件（如 ToolStrip）优先使用 `dock: top` 或主 Flex 列首项，避免绝对定位脱离文档流被后续流式容器覆盖。
 - **富文本/自绘文本的默认前景兜底是纯白**(Arpg 深色底习惯):亮色皮肤
   里标记文本没写色码的段落、以及 #W 白/#Y 纯黄这类深底快捷色,画在
   亮底上全部隐形——不是"渲染丢了"。皮肤补
