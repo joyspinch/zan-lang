@@ -985,6 +985,13 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   1. 拖拽过程中动态探测指针下方的承载容器（排除自身及其所有子树，防止循环嵌套）；
   2. 目标容器实时给予半透明高亮填充、外边框及浮动徽标（如 `"↳ 移入容器: Panel1"`），拖出容器至根层时高亮画布边框并展示 `"⇪ 移回窗口根层"`；
   3. 鼠标松开（Drop）时自动更新父子归属（`pc.kids.Remove` 与 `cont.kids.Add` 或 `fields.Add`），并以新宿主原点精准折算相对逻辑坐标 `DesignDeclareRect`，保证绝对视觉位置无缝承接。
+- **容器专属排版快捷工具栏与常用间距档位（Container Quick Layout & Gap/Padding Presets）**：
+  当用户选中容器类组件（Panel, Card, GroupBox 等）时，排版流向与间距是核心高频属性。
+  若将流向（`flexDir`）、间距（`gap`）和内边距（`padding`）淹没在冗长抽象的属性网格中，用户需要反复翻找并手动输入数字。
+  规范做法：在属性检查器顶部常驻容器排版快捷卡片，集成「⬇ 纵向 (Column) / ➔ 横向 (Row)」单选切换，以及 Gap（0, 4, 8, 12, 16）与 Pad（0, 8, 12, 16, 24）常用规格一键快捷按钮，配合撤销记录与实时重绘，实现秒级排版定型。
+- **智能 Alt 测距之父容器内缩四周边距（Alt Parent Inset / Padding Guides）**：
+  按住 Alt 测量组件间距时，除两个独立组件之间的间距连线外，当光标悬停在空白处或父容器上时，应自动测量当前选中组件到其父容器（或根窗口）四边（Top, Bottom, Left, Right）的内缩距离，
+  并绘制高亮参考边框与带像素数值的半透明数字徽标。这与 Figma/Sketch 行业标杆体验无缝对齐，消除目测与心算容器边距的成本。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
