@@ -339,4 +339,10 @@ STANDARDS.md §6.7）。
    - **复合标签与元子节点插槽无缝集成（`<tabs>` / `<tab title="...">`）**：`<tabs>` 容器既支持显式声明 `slot="Title"` 的直系子控件分发挂载，也支持以 `<tab title="...">` / `<tab-pane>` 包裹子内容的标准组件写法。在 `Html.Parse` 装配阶段，元子节点 `<tab>` 的内部子控件自动提取并继承标签页插槽路由至 `Tabs.Page(i)`，实现自然、声明式的选项卡界面排版。
    - **事件修饰符与防冒泡（`@click.stop` / `@keydown.enter`）**：在 `@click.stop`、`@submit.prevent`、`@keydown.enter` 等事件声明中，`HtmlText.EventKind` 自动剥离修饰符后缀以匹配核心事件种类，并在 `Html.Wire` / `Html.WireArg` 中通过 `WrapModifier` 装饰底层回调：`.stop` 自动调用 `app.ClaimClick()` 截断事件向下冒泡；`.enter` 严格校验 `app.window.EventKeyCode() == 13`，免去业务回调中重复编写键码和冒泡判定样板代码。
 
+12. **HTML5 声明式输入控件多态映射与模型类型感知自动强转规范**：
+   - **`<input type="...">` 多态组件实例化**：在 HTML 声明中写 `<input type="checkbox|radio|number|range|color|date|password" />` 时，`Html.Build` 自动映射实例化为对应的专属高阶组件（`checkbox` -> `Checkbox`、`radio` -> `Radio`、`number` -> `InputNumber`、`range` -> `Slider`、`color` -> `ColorPicker`、`date` -> `DatePicker`、`password` -> `Input` 带密码掩码属性），与自定义组件标签（`<slider>`、`<colorpicker>` 等）完全等价且支持标准 HTML 语义。
+   - **组件类型感知模型强转回写（Coercion On Writeback）**：双向绑定 `data-bind` 回写时，若目标 JSON 模型节点尚未初始化（`cur == null`），`WriteBoundValue` 自动根据当前绑定的控件类型进行精准的类型归一化：`Checkbox` / `Switch` 强制以 `JsonValue.NewBool` 写入；`Slider` / `InputNumber` / `Progress` / `Rate` 及声明了 `.number` 的控件强制以 `JsonValue.NewNum` 写入；避免空模型初次绑定输入时被统一回写为字符串而破坏数据契约。
+   - **快照即时同步防抖**：控件完成 `WriteBoundValue` 模型就地回写后，立即调用 `RecordSnapshot(c, s)` 同步控件快照，防止同一帧在后续流程中再次触发无效重复写入。
+
+
 
