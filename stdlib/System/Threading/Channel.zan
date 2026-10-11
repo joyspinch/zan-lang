@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Threading;
+
+// 工业生产级 CSP 异步协程通信通道。
+// 支持有界背压（Bounded）与无界流转（Unbounded）；
+// 读写两端基于运行时原生 AsyncGate/Gate 实现零忙轮询挂起与精准事件唤醒；
+// 支持生产者完成信号（Complete）传播与安全优雅退出。
+class Channel<T> {
+    List<T> buffer;
+    int head;
+    int capacity;
+    bool isClosed;
+    AsyncGate readGate;
+    AsyncGate writeGate;
+    nint mtx;
+
+    // 创建无界通道（capacity <= 0 表示无上限）
+    Channel() {
+        this.buffer = new List<T>();
+        this.head = 0;
+        this.capacity = 0;
+        this.isClosed = false;
+        this.readGate = new AsyncGate();
+        this.writeGate = new AsyncGate();
+        this.mtx = Mutex.Create();
+    }
+
+    // 创建指定容量的有界通道（带生产者背压）
+    Channel(int capacity) {
+        this.buffer = new List<T>();
+        this.head = 0;
+        this.capacity = capacity > 0 ? capacity : 0;
+        this.isClosed = false;
+        this.readGate = new AsyncGate();
+        this.writeGate = new AsyncGate();
+        this.mtx = Mutex.Create();
+    }
+
+    ~Channel() {
+        if (this.mtx != 0) {
+            Mutex.Destroy(this.mtx);
+            this.mtx = 0;
+        }
+    }
+
+    // 工厂方法：创建无界通道
+    static Channel<T> CreateUnbounded() {
+        return new Channel<T>(0);
+    }
+
+    // 工厂方法：创建有界通道
+    static Channel<T> CreateBounded(int capacity) {
+        return new Channel<T>(capacity);
+    }
+
+    // 当前缓冲区积压的消息数
+    int Count() {
+        Mutex.Lock(this.mtx);
+        int c = this.buffer.Count - this.head;
+        Mutex.Unlock(this.mtx);
+        return c;
+    }
+
+    // 通道是否已关闭且缓冲区已排空
+    bool IsCompleted() {
+        Mutex.Lock(this.mtx);
+        bool comp = this.isClosed && (this.head >= this.buffer.Count);
+        Mutex.Unlock(this.mtx);
+        return comp;
+    }
+
+    // 尝试非阻塞写入一项。
+    // 若通道已关闭或有界通道已满，则返回 false。
+    bool TryWrite(T item) {
+        Mutex.Lock(this.mtx);
+        if (this.isClosed) {
+            Mutex.Unlock(this.mtx);
+            return false;
+        }
+        if (this.capacity > 0 && (this.buffer.Count - this.head) >= this.capacity) {
+            Mutex.Unlock(this.mtx);
+            return false;
+        }
+        this.buffer.Add(item);
+        Mutex.Unlock(this.mtx);
+        this.readGate.Signal();
+        return true;
+    }
+
+    // 异步写入一项。
+    // 若有界通道已满，协程将真正挂起在调度器上，直到消费者取走数据让出空位。
+    // 若通道已关闭，则返回 false。
+    async bool Write(T item) {
+        while (true) {
+            Mutex.Lock(this.mtx);
+            if (this.isClosed) {
+                Mutex.Unlock(this.mtx);
+                return false;
+            }
+            if (this.capacity == 0 || (this.buffer.Count - this.head) < this.capacity) {
+                this.buffer.Add(item);
+                Mutex.Unlock(this.mtx);
+                this.readGate.Signal();
+                return true;
+            }
+            Mutex.Unlock(this.mtx);
+            await this.writeGate.Wait();
+        }
+    }
+
+    // 尝试非阻塞读取一项。
+    // 若缓冲区有数据则取出并返回 true；若通道为空则返回 false。
+    bool TryRead(out T item) {
+        Mutex.Lock(this.mtx);
+        if (this.head < this.buffer.Count) {
+            item = this.buffer[this.head];
+            this.head = this.head + 1;
+            // 惰性紧凑压缩，防止长生命周期列表过度占用内存
+            if (this.head >= 64 && this.head * 2 >= this.buffer.Count) {
+                List<T> compacted = new List<T>();
+                for (int i = this.head; i < this.buffer.Count; i = i + 1) {
+                    compacted.Add(this.buffer[i]);
+                }
+                this.buffer = compacted;
+                this.head = 0;
+            }
+            bool hadBackpressure = this.capacity > 0;
+            Mutex.Unlock(this.mtx);
+            if (hadBackpressure) {
+                this.writeGate.Signal();
+            }
+            return true;
+        }
+        item = null;
+        Mutex.Unlock(this.mtx);
+        return false;
+    }
+
+    // 异步读取一项。
+    // 若缓冲区为空且通道未关闭，协程挂起等待生产者投递。
+    // 若通道关闭且缓冲区排空，返回 false；正常读到项返回 true。
+    async bool Read(out T item) {
+        while (true) {
+            Mutex.Lock(this.mtx);
+            if (this.head < this.buffer.Count) {
+                item = this.buffer[this.head];
+                this.head = this.head + 1;
+                if (this.head >= 64 && this.head * 2 >= this.buffer.Count) {
+                    List<T> compacted = new List<T>();
+                    for (int i = this.head; i < this.buffer.Count; i = i + 1) {
+                        compacted.Add(this.buffer[i]);
+                    }
+                    this.buffer = compacted;
+                    this.head = 0;
+                }
+                bool hadBackpressure = this.capacity > 0;
+                Mutex.Unlock(this.mtx);
+                if (hadBackpressure) {
+                    this.writeGate.Signal();
+                }
+                return true;
+            }
+            if (this.isClosed) {
+                item = null;
+                Mutex.Unlock(this.mtx);
+                return false;
+            }
+            Mutex.Unlock(this.mtx);
+            await this.readGate.Wait();
+        }
+    }
+
+    // 关闭通道，通知不再有新数据到达。
+    // 唤醒所有挂起的等待读取与写入协程。
+    void Complete() {
+        Mutex.Lock(this.mtx);
+        if (this.isClosed) {
+            Mutex.Unlock(this.mtx);
+            return;
+        }
+        this.isClosed = true;
+        Mutex.Unlock(this.mtx);
+        // 唤醒挂起的读取协程以便感知关闭退出
+        this.readGate.Signal();
+        // 唤醒挂起的写入协程以便感知拒绝退出
+        this.writeGate.Signal();
+    }
+}
