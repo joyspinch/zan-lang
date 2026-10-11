@@ -74,8 +74,199 @@ char *zan_version_format(const zan_version_t *v, char *buf, int buf_size) {
     return buf;
 }
 
+/* --- SHA-256 算法实现 --- */
+static const uint32_t K256[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define ZAN_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define ZAN_CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define ZAN_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define ZAN_SIGMA0(x) (ZAN_ROTR(x, 2) ^ ZAN_ROTR(x, 13) ^ ZAN_ROTR(x, 22))
+#define ZAN_SIGMA1(x) (ZAN_ROTR(x, 6) ^ ZAN_ROTR(x, 11) ^ ZAN_ROTR(x, 25))
+#define ZAN_SIG0(x) (ZAN_ROTR(x, 7) ^ ZAN_ROTR(x, 18) ^ ((x) >> 3))
+#define ZAN_SIG1(x) (ZAN_ROTR(x, 17) ^ ZAN_ROTR(x, 19) ^ ((x) >> 10))
+
+typedef struct {
+    uint32_t state[8];
+    uint64_t count;
+    uint8_t buffer[64];
+} zan_sha256_ctx_t;
+
+static void zan_sha256_transform(uint32_t state[8], const uint8_t data[64]) {
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+    uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)data[i * 4] << 24) |
+               ((uint32_t)data[i * 4 + 1] << 16) |
+               ((uint32_t)data[i * 4 + 2] << 8) |
+               ((uint32_t)data[i * 4 + 3]);
+    }
+    for (int i = 16; i < 64; i++) {
+        w[i] = ZAN_SIG1(w[i - 2]) + w[i - 7] + ZAN_SIG0(w[i - 15]) + w[i - 16];
+    }
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + ZAN_SIGMA1(e) + ZAN_CH(e, f, g) + K256[i] + w[i];
+        uint32_t t2 = ZAN_SIGMA0(a) + ZAN_MAJ(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
+}
+
+static void zan_sha256_init(zan_sha256_ctx_t *ctx) {
+    ctx->state[0] = 0x6a09e667;
+    ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372;
+    ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f;
+    ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab;
+    ctx->state[7] = 0x5be0cd19;
+    ctx->count = 0;
+}
+
+static void zan_sha256_update(zan_sha256_ctx_t *ctx, const uint8_t *data, size_t len) {
+    size_t idx = (size_t)(ctx->count & 63);
+    ctx->count += len;
+    while (len > 0) {
+        size_t take = 64 - idx;
+        if (take > len) take = len;
+        memcpy(ctx->buffer + idx, data, take);
+        idx += take;
+        data += take;
+        len -= take;
+        if (idx == 64) {
+            zan_sha256_transform(ctx->state, ctx->buffer);
+            idx = 0;
+        }
+    }
+}
+
+static void zan_sha256_final(zan_sha256_ctx_t *ctx, uint8_t digest[32]) {
+    size_t idx = (size_t)(ctx->count & 63);
+    ctx->buffer[idx++] = 0x80;
+    if (idx > 56) {
+        memset(ctx->buffer + idx, 0, 64 - idx);
+        zan_sha256_transform(ctx->state, ctx->buffer);
+        idx = 0;
+    }
+    memset(ctx->buffer + idx, 0, 56 - idx);
+    uint64_t bits = ctx->count * 8;
+    for (int i = 7; i >= 0; i--) {
+        ctx->buffer[56 + (7 - i)] = (uint8_t)((bits >> (i * 8)) & 0xff);
+    }
+    zan_sha256_transform(ctx->state, ctx->buffer);
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4] = (uint8_t)((ctx->state[i] >> 24) & 0xff);
+        digest[i * 4 + 1] = (uint8_t)((ctx->state[i] >> 16) & 0xff);
+        digest[i * 4 + 2] = (uint8_t)((ctx->state[i] >> 8) & 0xff);
+        digest[i * 4 + 3] = (uint8_t)(ctx->state[i] & 0xff);
+    }
+}
+
+bool zan_pkg_compute_checksum(const char *file_path, char out_hex[65]) {
+    if (!file_path || !out_hex) return false;
+    FILE *f = fopen(file_path, "rb");
+    if (!f) return false;
+    zan_sha256_ctx_t ctx;
+    zan_sha256_init(&ctx);
+    uint8_t buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        zan_sha256_update(&ctx, buf, n);
+    }
+    fclose(f);
+    uint8_t digest[32];
+    zan_sha256_final(&ctx, digest);
+    for (int i = 0; i < 32; i++) {
+        sprintf(out_hex + (i * 2), "%02x", digest[i]);
+    }
+    out_hex[64] = 0;
+    return true;
+}
+
 static void skip_ws(const char **p) {
     while (**p && isspace((unsigned char)**p)) (*p)++;
+}
+
+static void zan_dep_parse_constraint(const char *str, zan_dependency_t *dep) {
+    if (!dep) return;
+    if (!str || !*str) {
+        dep->kind = ZAN_DEP_ANY;
+        return;
+    }
+    const char *p = str;
+    skip_ws(&p);
+    if (!*p || *p == '*' || *p == 'x' || *p == 'X') {
+        dep->kind = ZAN_DEP_ANY;
+        return;
+    }
+    if (*p == '^') {
+        dep->kind = ZAN_DEP_COMPAT;
+        p++;
+        skip_ws(&p);
+        zan_version_parse(p, &dep->min_ver);
+    } else if (*p == '~') {
+        dep->kind = ZAN_DEP_TILDE;
+        p++;
+        skip_ws(&p);
+        zan_version_parse(p, &dep->min_ver);
+    } else if (*p == '>' && *(p + 1) == '=') {
+        dep->kind = ZAN_DEP_MINIMUM;
+        p += 2;
+        skip_ws(&p);
+        char ver1[64] = {0};
+        int vi = 0;
+        while (*p && !isspace((unsigned char)*p) && *p != ',' && vi < 63) {
+            ver1[vi++] = *p++;
+        }
+        ver1[vi] = 0;
+        zan_version_parse(ver1, &dep->min_ver);
+        skip_ws(&p);
+        if (*p == ',') { p++; skip_ws(&p); }
+        if (*p == '<') {
+            dep->kind = ZAN_DEP_RANGE;
+            if (*(p + 1) == '=') p += 2;
+            else p++;
+            skip_ws(&p);
+            zan_version_parse(p, &dep->max_ver);
+        }
+    } else if (*p == '<' && *(p + 1) == '=') {
+        dep->kind = ZAN_DEP_MAXIMUM;
+        p += 2;
+        skip_ws(&p);
+        zan_version_parse(p, &dep->min_ver);
+    } else if (*p == '=') {
+        dep->kind = ZAN_DEP_EXACT;
+        p++;
+        skip_ws(&p);
+        zan_version_parse(p, &dep->min_ver);
+    } else {
+        dep->kind = ZAN_DEP_COMPAT;
+        zan_version_parse(p, &dep->min_ver);
+    }
 }
 
 static bool read_qstr(const char **p, char *out, int max_len) {
@@ -153,11 +344,7 @@ bool zan_pkg_load(zan_package_t *pkg, const char *manifest_path) {
                     skip_ws(&p); if (*p == ',') p++;
                     if (strcmp(dkey, "source") == 0 || strcmp(dkey, "git") == 0) strncpy(dep->source, dval, sizeof(dep->source) - 1);
                     else if (strcmp(dkey, "version") == 0) {
-                        const char *v = dval;
-                        if (v[0] == '^') { dep->kind = ZAN_DEP_COMPAT; zan_version_parse(v + 1, &dep->min_ver); }
-                        else if (v[0] == '>' && v[1] == '=') { dep->kind = ZAN_DEP_MINIMUM; zan_version_parse(v + 2, &dep->min_ver); }
-                        else if (v[0] == '=') { dep->kind = ZAN_DEP_EXACT; zan_version_parse(v + 1, &dep->min_ver); }
-                        else { dep->kind = ZAN_DEP_COMPAT; zan_version_parse(v, &dep->min_ver); }
+                        zan_dep_parse_constraint(dval, dep);
                     }
                 }
                 if (*p == '}') p++;
@@ -190,9 +377,12 @@ bool zan_pkg_save(const zan_package_t *pkg, const char *manifest_path) {
             const char *prefix = "";
             switch (d->kind) {
             case ZAN_DEP_COMPAT: prefix = "^"; break;
+            case ZAN_DEP_TILDE: prefix = "~"; break;
             case ZAN_DEP_MINIMUM: prefix = ">="; break;
+            case ZAN_DEP_MAXIMUM: prefix = "<="; break;
             case ZAN_DEP_EXACT: prefix = "="; break;
             case ZAN_DEP_RANGE: prefix = ">="; break;
+            case ZAN_DEP_ANY: prefix = "*"; break;
             }
             fprintf(f, "%s = { source = \"%s\", version = \"%s%s\" }\n", d->name, d->source, prefix, dep_ver);
         }
@@ -224,12 +414,7 @@ void zan_pkg_add_dep(zan_package_t *pkg, const char *name, const char *source, c
     memset(dep, 0, sizeof(*dep));
     strncpy(dep->name, name, sizeof(dep->name) - 1);
     strncpy(dep->source, source, sizeof(dep->source) - 1);
-    const char *v = version_constraint;
-    if (v[0] == '^') { dep->kind = ZAN_DEP_COMPAT; v++; }
-    else if (v[0] == '>' && v[1] == '=') { dep->kind = ZAN_DEP_MINIMUM; v += 2; }
-    else if (v[0] == '=') { dep->kind = ZAN_DEP_EXACT; v++; }
-    else { dep->kind = ZAN_DEP_COMPAT; }
-    zan_version_parse(v, &dep->min_ver);
+    zan_dep_parse_constraint(version_constraint, dep);
 }
 
 bool zan_pkg_remove_dep(zan_package_t *pkg, const char *name) {
@@ -266,14 +451,25 @@ void zan_pkg_init(zan_pkg_registry_t *reg, const char *project_dir) {
 }
 
 bool zan_pkg_version_satisfies(const zan_dependency_t *dep, const zan_version_t *ver) {
+    if (!dep || !ver) return false;
     switch (dep->kind) {
-    case ZAN_DEP_EXACT: return zan_version_compare(ver, &dep->min_ver) == 0;
-    case ZAN_DEP_MINIMUM: return zan_version_compare(ver, &dep->min_ver) >= 0;
+    case ZAN_DEP_ANY:
+        return true;
+    case ZAN_DEP_EXACT:
+        return zan_version_compare(ver, &dep->min_ver) == 0;
+    case ZAN_DEP_MINIMUM:
+        return zan_version_compare(ver, &dep->min_ver) >= 0;
+    case ZAN_DEP_MAXIMUM:
+        return zan_version_compare(ver, &dep->min_ver) <= 0;
     case ZAN_DEP_COMPAT: {
         if (zan_version_compare(ver, &dep->min_ver) < 0) return false;
         if (dep->min_ver.major > 0) return ver->major == dep->min_ver.major;
         else if (dep->min_ver.minor > 0) return ver->major == 0 && ver->minor == dep->min_ver.minor;
         return zan_version_compare(ver, &dep->min_ver) == 0;
+    }
+    case ZAN_DEP_TILDE: {
+        if (zan_version_compare(ver, &dep->min_ver) < 0) return false;
+        return ver->major == dep->min_ver.major && ver->minor == dep->min_ver.minor;
     }
     case ZAN_DEP_RANGE:
         return zan_version_compare(ver, &dep->min_ver) >= 0 && zan_version_compare(ver, &dep->max_ver) < 0;
@@ -349,6 +545,8 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
         snprintf(manifest_path, sizeof(manifest_path), "%s" PATH_SEP "%s" PATH_SEP "zan.pkg", reg->cache_dir, dep->name);
         zan_package_t fetched_pkg;
         if (zan_pkg_load(&fetched_pkg, manifest_path)) {
+            char computed_hash[65] = {0};
+            bool has_hash = zan_pkg_compute_checksum(manifest_path, computed_hash);
             if (!zan_pkg_version_satisfies(dep, &fetched_pkg.version)) {
                 char ver_buf[64]; zan_version_format(&fetched_pkg.version, ver_buf, sizeof(ver_buf));
                 fprintf(stderr, "warning: package '%s' version %s may not satisfy constraint\n", dep->name, ver_buf);
@@ -358,14 +556,28 @@ static bool zan_pkg_resolve_seen(zan_pkg_registry_t *reg, zan_package_t *root,
                 for (int r = 0; r < reg->resolved_count; r++) {
                     if (reg->resolved[r] && strcmp(reg->resolved[r]->name, fetched_pkg.name) == 0) {
                         already_resolved = true;
+                        if (reg->resolved[r]->checksum[0] && has_hash) {
+                            if (strcmp(reg->resolved[r]->checksum, computed_hash) != 0) {
+                                fprintf(stderr, "error: checksum mismatch for package '%s': expected %s, got %s\n",
+                                        fetched_pkg.name, reg->resolved[r]->checksum, computed_hash);
+                                zan_pkg_destroy(&fetched_pkg);
+                                return false;
+                            }
+                        } else if (has_hash) {
+                            strncpy(reg->resolved[r]->checksum, computed_hash, sizeof(reg->resolved[r]->checksum) - 1);
+                        }
                         break;
                     }
                 }
                 if (!already_resolved) {
                     zan_package_t *rp = (zan_package_t *)calloc(1, sizeof(zan_package_t));
                     strncpy(rp->name, fetched_pkg.name, sizeof(rp->name) - 1);
+                    if (dep->source[0]) strncpy(rp->source, dep->source, sizeof(rp->source) - 1);
                     rp->version = fetched_pkg.version;
                     rp->has_version = true;
+                    if (has_hash) {
+                        strncpy(rp->checksum, computed_hash, sizeof(rp->checksum) - 1);
+                    }
                     reg->resolved[reg->resolved_count++] = rp;
                 }
             }
@@ -413,20 +625,30 @@ char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count) {
 }
 
 bool zan_pkg_write_lock(zan_pkg_registry_t *reg) {
+    if (!reg || !reg->lock_file) return false;
     FILE *f = fopen(reg->lock_file, "w");
     if (!f) return false;
     fprintf(f, "# Zan lock file - auto-generated\n\n");
     for (int i = 0; i < reg->resolved_count; i++) {
         zan_package_t *pkg = reg->resolved[i];
+        if (!pkg) continue;
         char ver_buf[64]; zan_version_format(&pkg->version, ver_buf, sizeof(ver_buf));
-        fprintf(f, "[[package]]\nname = \"%s\"\nversion = \"%s\"\n\n", pkg->name, ver_buf);
+        fprintf(f, "[[package]]\nname = \"%s\"\nversion = \"%s\"\n", pkg->name, ver_buf);
+        if (pkg->source[0]) {
+            fprintf(f, "source = \"%s\"\n", pkg->source);
+        }
+        if (pkg->checksum[0]) {
+            fprintf(f, "checksum = \"%s\"\n", pkg->checksum);
+        }
+        fprintf(f, "\n");
     }
     bool ok = (ferror(f) == 0);
     if (fclose(f) != 0) ok = false;
     return ok;
 }
 
-static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char *ver_str) {
+static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char *ver_str,
+                           const char *source, const char *checksum) {
     if (!name || !name[0] || !ver_str || !ver_str[0]) return false;
     if (!pkg_safe_component(name)) {
         fprintf(stderr, "error: unsafe package name '%s' in lock file\n", name);
@@ -443,6 +665,8 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
     }
     for (int i = 0; i < reg->resolved_count; i++) {
         if (reg->resolved[i] && strcmp(reg->resolved[i]->name, name) == 0) {
+            if (source && source[0]) strncpy(reg->resolved[i]->source, source, sizeof(reg->resolved[i]->source) - 1);
+            if (checksum && checksum[0]) strncpy(reg->resolved[i]->checksum, checksum, sizeof(reg->resolved[i]->checksum) - 1);
             return zan_version_compare(&reg->resolved[i]->version, &v) == 0;
         }
     }
@@ -454,6 +678,8 @@ static bool add_locked_pkg(zan_pkg_registry_t *reg, const char *name, const char
     strncpy(pkg->name, name, sizeof(pkg->name) - 1);
     pkg->version = v;
     pkg->has_version = true;
+    if (source && source[0]) strncpy(pkg->source, source, sizeof(pkg->source) - 1);
+    if (checksum && checksum[0]) strncpy(pkg->checksum, checksum, sizeof(pkg->checksum) - 1);
     reg->resolved[reg->resolved_count++] = pkg;
     return true;
 }
@@ -466,6 +692,8 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
     char line[1024];
     char cur_name[128] = {0};
     char cur_ver[64] = {0};
+    char cur_source[512] = {0};
+    char cur_checksum[65] = {0};
     bool in_pkg = false;
     bool ok = true;
 
@@ -476,7 +704,7 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
         if (*p == '[') {
             if (strncmp(p, "[[package]]", 11) == 0) {
                 if (in_pkg) {
-                    if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver)) {
+                    if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver, cur_source, cur_checksum)) {
                         ok = false;
                         break;
                     }
@@ -484,6 +712,8 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
                 in_pkg = true;
                 cur_name[0] = 0;
                 cur_ver[0] = 0;
+                cur_source[0] = 0;
+                cur_checksum[0] = 0;
             }
             continue;
         }
@@ -495,18 +725,22 @@ bool zan_pkg_read_lock(zan_pkg_registry_t *reg) {
         skip_ws(&p);
         if (*p == '=') p++;
         skip_ws(&p);
-        char val[256] = {0};
+        char val[512] = {0};
         if (*p == '"') { read_qstr(&p, val, sizeof(val)); }
-        else { int vi = 0; while (*p && *p != '\n' && *p != '\r' && vi < 255) { val[vi++] = *p; p++; } val[vi] = 0; }
+        else { int vi = 0; while (*p && *p != '\n' && *p != '\r' && vi < 511) { val[vi++] = *p; p++; } val[vi] = 0; }
 
         if (strcmp(key, "name") == 0) {
             strncpy(cur_name, val, sizeof(cur_name) - 1);
         } else if (strcmp(key, "version") == 0) {
             strncpy(cur_ver, val, sizeof(cur_ver) - 1);
+        } else if (strcmp(key, "source") == 0) {
+            strncpy(cur_source, val, sizeof(cur_source) - 1);
+        } else if (strcmp(key, "checksum") == 0) {
+            strncpy(cur_checksum, val, sizeof(cur_checksum) - 1);
         }
     }
     if (ok && in_pkg) {
-        if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver)) {
+        if (!cur_name[0] || !cur_ver[0] || !add_locked_pkg(reg, cur_name, cur_ver, cur_source, cur_checksum)) {
             ok = false;
         }
     }

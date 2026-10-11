@@ -425,6 +425,14 @@ static zan_type_t *checker_index_set_target(zan_checker_t *c,
         if (pidx->kind != AST_PARAM || pval->kind != AST_PARAM) continue;
         zan_type_t *pt1 = zan_binder_resolve_type(c->binder, pidx->param.type);
         zan_type_t *pt2 = zan_binder_resolve_type(c->binder, pval->param.type);
+        if (obj->type_args && obj->type_arg_count > 0 && obj->sym && obj->sym->decl &&
+            (obj->sym->decl->kind == AST_CLASS_DECL || obj->sym->decl->kind == AST_STRUCT_DECL)) {
+            zan_ast_list_t *tps = &obj->sym->decl->type_decl.type_params;
+            if (tps->count == obj->type_arg_count) {
+                pt1 = zan_binder_subst_named(c->binder, pt1, tps, obj->type_args);
+                pt2 = zan_binder_subst_named(c->binder, pt2, tps, obj->type_args);
+            }
+        }
         if (idx && !checker_type_assignable(pt1, idx)) continue;
         if (right && !checker_type_assignable(pt2, right)) continue;
         return pt2;
@@ -2510,14 +2518,30 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                         }
                     }
                 }
-                return zan_binder_resolve_type(c->binder,
+                zan_type_t *ret_ty = zan_binder_resolve_type(c->binder,
                     op->decl->method_decl.return_type);
+                if (obj->type_args && obj->type_arg_count > 0 && obj->sym && obj->sym->decl &&
+                    (obj->sym->decl->kind == AST_CLASS_DECL || obj->sym->decl->kind == AST_STRUCT_DECL)) {
+                    zan_ast_list_t *tps = &obj->sym->decl->type_decl.type_params;
+                    if (tps->count == obj->type_arg_count) {
+                        ret_ty = zan_binder_subst_named(c->binder, ret_ty, tps, obj->type_args);
+                    }
+                }
+                return ret_ty;
             }
             if (op && op_count > 0 && op->decl &&
                 op->decl->kind == AST_METHOD_DECL &&
                 op->decl->method_decl.return_type) {
-                return zan_binder_resolve_type(c->binder,
+                zan_type_t *ret_ty = zan_binder_resolve_type(c->binder,
                     op->decl->method_decl.return_type);
+                if (obj->type_args && obj->type_arg_count > 0 && obj->sym && obj->sym->decl &&
+                    (obj->sym->decl->kind == AST_CLASS_DECL || obj->sym->decl->kind == AST_STRUCT_DECL)) {
+                    zan_ast_list_t *tps = &obj->sym->decl->type_decl.type_params;
+                    if (tps->count == obj->type_arg_count) {
+                        ret_ty = zan_binder_subst_named(c->binder, ret_ty, tps, obj->type_args);
+                    }
+                }
+                return ret_ty;
             }
             if (op && op->type) return op->type;
         }

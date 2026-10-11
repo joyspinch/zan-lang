@@ -23,8 +23,11 @@ char *zan_version_format(const zan_version_t *v, char *buf, int buf_size);
 typedef enum {
     ZAN_DEP_EXACT,    /* =1.2.3 */
     ZAN_DEP_COMPAT,   /* ^1.2.3 (>=1.2.3, <2.0.0) */
+    ZAN_DEP_TILDE,    /* ~1.2.3 (>=1.2.3, <1.3.0) */
     ZAN_DEP_MINIMUM,  /* >=1.2.3 */
+    ZAN_DEP_MAXIMUM,  /* <=1.2.3 */
     ZAN_DEP_RANGE,    /* >=1.0.0 <2.0.0 */
+    ZAN_DEP_ANY,      /* * */
 } zan_dep_kind_t;
 
 typedef struct {
@@ -37,6 +40,8 @@ typedef struct {
 
 typedef struct {
     char name[128];
+    char source[512];
+    char checksum[65];
     zan_version_t version;
     bool has_version;
     char description[256];
@@ -85,6 +90,9 @@ char **zan_pkg_get_sources(zan_pkg_registry_t *reg, int *out_count);
 bool zan_pkg_write_lock(zan_pkg_registry_t *reg);
 
 bool zan_pkg_read_lock(zan_pkg_registry_t *reg);
+
+/* 计算文件 SHA-256 校验和（小写十六进制，共 64 字符 + '\\0'） */
+bool zan_pkg_compute_checksum(const char *file_path, char out_hex[65]);
 
 typedef enum {
     ZAN_PKG_SCOPE_PROJECT,

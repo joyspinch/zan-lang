@@ -825,6 +825,16 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
             (decl->type_decl.modifiers & MOD_ABSTRACT) != 0));
         json_obj_set(o, "generic", json_new_bool(
             decl->type_decl.type_params.count > 0));
+        if (decl->type_decl.type_params.count > 0) {
+            json_value *tparams = json_new_arr();
+            for (int i = 0; i < decl->type_decl.type_params.count; i++) {
+                zan_ast_node_t *tp = decl->type_decl.type_params.items[i];
+                if (tp && tp->ident.name.str) {
+                    json_arr_add(tparams, json_new_str((const char *)tp->ident.name.str));
+                }
+            }
+            json_obj_set(o, "type_params", tparams);
+        }
         if (decl_orig.len)
             json_obj_set(o, "orig", json_new_str(
                 decl_orig.str ? (const char *)decl_orig.str : ""));
@@ -879,6 +889,27 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                     (m->method_decl.modifiers & MOD_PRIVATE) != 0));
                 json_obj_set(mm, "protected", json_new_bool(
                     (m->method_decl.modifiers & MOD_PROTECTED) != 0));
+                json_obj_set(mm, "virtual", json_new_bool(
+                    (m->method_decl.modifiers & MOD_VIRTUAL) != 0));
+                json_obj_set(mm, "override", json_new_bool(
+                    (m->method_decl.modifiers & MOD_OVERRIDE) != 0));
+                json_obj_set(mm, "abstract", json_new_bool(
+                    (m->method_decl.modifiers & MOD_ABSTRACT) != 0));
+                if (m->kind == AST_METHOD_DECL && m->method_decl.return_type) {
+                    char rt[256];
+                    gm_type_str(m->method_decl.return_type, rt, sizeof(rt));
+                    json_obj_set(mm, "ret", json_new_str(rt));
+                }
+                if (m->method_decl.type_params.count > 0) {
+                    json_value *mtparams = json_new_arr();
+                    for (int tp_i = 0; tp_i < m->method_decl.type_params.count; tp_i++) {
+                        zan_ast_node_t *tp = m->method_decl.type_params.items[tp_i];
+                        if (tp && tp->ident.name.str) {
+                            json_arr_add(mtparams, json_new_str((const char *)tp->ident.name.str));
+                        }
+                    }
+                    json_obj_set(mm, "type_params", mtparams);
+                }
                 json_obj_set(mm, "file", json_new_num((double)m->loc.file_id));
                 json_obj_set(mm, "line", json_new_num((double)m->loc.line));
                 json_value *ps = json_new_arr();
@@ -892,6 +923,9 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                     char pt[256];
                     gm_type_str(p->param.type, pt, sizeof(pt));
                     json_obj_set(pv, "type", json_new_str(pt));
+                    if (p->param.by_ref) {
+                        json_obj_set(pv, "by_ref", json_new_num((double)p->param.by_ref));
+                    }
                     if (p->param.default_val)
                         json_obj_set(pv, "def",
                                      gm_expr_tree(p->param.default_val));
@@ -960,14 +994,25 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                     json_obj_set(co, "assigns", as);
                     json_arr_add(ctors, co);
                 }
-            } else if ((m->kind == AST_PROPERTY_DECL) &&
-                       m->field_decl.initializer) {
+            } else if (m->kind == AST_PROPERTY_DECL) {
                 json_value *p = json_new_obj();
                 json_obj_set(p, "name", json_new_str(
                     m->field_decl.name.str ? (const char *)m->field_decl.name.str
                                            : ""));
-                json_obj_set(p, "init",
-                             gm_expr_tree(m->field_decl.initializer));
+                char pt[256];
+                gm_type_str(m->field_decl.type, pt, sizeof(pt));
+                json_obj_set(p, "type", json_new_str(pt));
+                json_obj_set(p, "static", json_new_bool(
+                    (m->field_decl.modifiers & MOD_STATIC) != 0));
+                json_obj_set(p, "get", json_new_bool(m->field_decl.has_getter));
+                json_obj_set(p, "set", json_new_bool(m->field_decl.has_setter));
+                if (m->field_decl.initializer) {
+                    json_obj_set(p, "init",
+                                 gm_expr_tree(m->field_decl.initializer));
+                }
+                json_value *pa = json_new_arr();
+                gm_attrs_json(zan_ast_attributes(m), pa);
+                json_obj_set(p, "attrs", pa);
                 json_arr_add(props, p);
             }
         }
