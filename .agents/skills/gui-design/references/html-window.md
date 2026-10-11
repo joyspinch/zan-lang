@@ -372,7 +372,33 @@ STANDARDS.md §6.7）。
      - 当从模型向 `SelectBox` 写入属性时（`SetProp("value", val)`），优先在选项列表中匹配 `opts[i].val == val || opts[i].label == val`；若未命中则回退为数值下标解析，实现语义值与下标的双向平滑转换。
    - **JIT 与 AOT `<option value="...">` 编译同构**：当在声明式 HTML 中声明带有显式 `value` 属性的 `<option value="bj">北京</option>` 时，运行时 JIT（`Html.Parse`）与编译期 AOT（`GenHtml.Translate`）统一探测子级是否包含非空自定义 `value`。一旦包含，自动合成 `[{"label": "北京", "value": "bj"}, ...]` JSON 数组并发射为 `SetProp("options", ...)`，确保原生 HTML `<select>` 语义在动静双通道下 100% 行为一致。
 
+17. **流式排版、停靠体系与边距内外消费全链路契约（Fill Height / Flex / Margin / Padding）**：
+   - **FormBuilder 布局流与容器 Display 属性声明**：
+     - 当控件在 JSON 中声明 `flexDir` 时，解析器在生成样式时必须注入 `;display:flex`（若仅声明 `flex-direction` 会导致容器退化为 `display:block` 并进入传统停靠/流式分支）。
+   - **自动撑满高度（Fill Height）与停靠语义映射**：
+     - 在非 Flex 停靠容器中，撑满剩余高度的语义对应 `c.dock = Dock.Fill()`（`5`）；在 Flex 弹性容器中，撑满对应 `flex-grow: 1` 且 `fh = 0`。
+     - `FormBuilder.SetupLayout` 在流式模式（`position == 0`）下，必须优先识别显式 `dock` 属性；当 `flexGrow > 0 && fh == 0` 时自动赋给 `ctl.dock = Dock.Fill()`，避免将流式控件重置为 `Dock.Top()` 导致高度取 0 塌陷。
+     - `FormBuilder.AttachNode` 当 `ctl.dock > 0` 时直接挂载到宿主容器，不被 `FbFlow` 匿名网格拦截。
+   - **Control.Arrange 停靠与浮动分支的边距消费**：
+     - 控件排布引擎 `Control.Arrange` 在处理各停靠分支（Top/Bottom/Left/Right/Fill）及未停靠流式分支时，必须完整消费 `StyleMarL/T/R/B` 边距扣减、自身位置平移与下一项步进累加（`stepH = hh + mt + mb`），确保边距直观生效。
+     - 在 `ArrangePositioned` 的 `c.designFloat` 浮动分支中，改用 `StylePadL/T/R/B` 避免边框重复累加，并加上子控件自身的 `c.StyleMarL()` 与 `c.StyleMarT()`。
+   - **设计器属性检查器实时脏标记与数据模型同步**：
+     - `PropertyGrid.OnChange` 必须显式触发 `Designer.MarkDocDirty()`，使得属性检查器中编辑任何数值均即时触发文档树重建并更新画布预览。
+     - `DesignDeclareRect` 同步持久化 `flexGrow`、`margin`、`padding`、`gap` 至 `f.designSource`，确保设计器与序列化快照双向保真。
 
-
+18. **设计器属性检查器 Visual Studio 规范重构与垂直间距律（VS 分类、高频前置与呼吸节奏）**：
+   - **Visual Studio 属性网格分区分级契约**：
+     - 属性列表平铺无章会导致翻找成本极高。属性规格（`AllFieldSpecs`）必须通过 `PropSpec.Section` 划分为 4 大标准大类：
+       1. `IDENTITY / COMMON`（标识与常用）：`name`（变量名）置顶，`label`（显示文本）紧随其后，配合 `placeholder`（占位文本）与组件类型。
+       2. `LAYOUT`（布局与几何）：`dock`（停靠方式：None/Top/Bot/Left/Right/Fill）置顶，随后为 `position`（定位模式）、`flexGrow`（弹性撑满）、`anchor`（九宫格锚点）、浮动坐标 `x/y`、物理尺寸 `w/h`、边距 `margin/padding` 以及容器专属流向/间距。
+       3. `DATA`（数据与绑定）：`bind`（绑定路径/数据源）、`bindProp`（绑定属性）及 `of`（表格行实体）。
+       4. `BEHAVIOR`（行为与状态）：`required`（必填校验）、`wrap`（自动折行）、`orient`（Tab方向）及 `defOn`（默认开启）。
+     - 分类过滤（`inspCategory`）只在选择“全部 (All)”时渲染 Section 分组栏；在单项分类下隐去分组头直接展示过滤后的紧凑属性。
+   - **PropertyGrid Section Bar 视觉质感**：
+     - `PropertyGrid` 渲染 `PropSpec.kind == 5`（Section 头）时，必须画出专属条带（`t.bgSecondary` 背景、左侧垂直强调色条 `t.primary`、高亮分类文字），与普通属性行形成鲜明视觉阶梯。
+   - **快捷工具栏卡片行高计算与垂直呼吸律（Anti-Card-Overflow）**：
+     - 快捷按钮（`SmallBtn`）的高度约为 24px。卡片内部放 N 行按钮时，行间步进距必须保持至少 28px~30px（例如 `row1: 8px`、`row2: 36px`、`row3: 66px`），卡片总高度必须为 `app.Scale(96~130)` 并留足底边距，严禁卡片高度不足 78px 强塞 3 行导致按钮垂直重叠、文字压盖与溢出边界。
+     - 快捷卡片与卡片之间统一保持 10px 间距；快捷操作区与下方的 `PropertyGrid` 之间必须保持 12px 留白；多选批量卡片（3行按钮+双行文字）必须保留 126px 充足纵深。
+     - 避免在顶部堆砌过多卡片导致属性网格被挤出屏幕。常用尺寸预设等次要辅助卡片仅在布局专属分类（`inspCategory == 2`）下展开，全部模式下让位给核心属性网格。
 
 
