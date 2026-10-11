@@ -1,0 +1,122 @@
+using System;
+
+namespace System.Threading;
+
+// 未观察到的异步任务异常事件参数，提供异常对象检索与标为已观察（Suppress/Mark Observed）能力。
+public class UnobservedTaskExceptionEventArgs {
+    Exception exception;
+    bool observed;
+
+    public UnobservedTaskExceptionEventArgs(Exception exception) {
+        this.exception = exception;
+        this.observed = false;
+    }
+
+    // 导致任务失败的未捕获异常。
+    public Exception Exception {
+        get { return this.exception; }
+    }
+
+    // 该异常是否已被上层异常治理系统标记为已观察（标记后可抑制崩溃并进行监控记账）。
+    public bool Observed {
+        get { return this.observed; }
+        set { this.observed = value; }
+    }
+
+    // 将未观察任务异常标记为已处理。
+    public void SetObserved() {
+        this.observed = true;
+    }
+}
+
+// 未观察任务异常事件处理委托。
+public delegate void UnobservedTaskExceptionHandler(object sender, UnobservedTaskExceptionEventArgs args);
+
+// 全局任务调度与未观察异常治理中心。
+// 统一监控后台火后即焚（Fire-and-forget）任务与未捕获协程异常，防止静默吞噬或未定义崩溃。
+public class TaskScheduler {
+    static List<UnobservedTaskExceptionHandler> handlers;
+    static nint syncLock;
+
+    static void EnsureInitialized() {
+        if (TaskScheduler.syncLock == 0) {
+            TaskScheduler.syncLock = Mutex.Create();
+            TaskScheduler.handlers = new List<UnobservedTaskExceptionHandler>();
+        }
+    }
+
+    // 订阅全局未观察任务异常事件。
+    public static void AddUnobservedTaskException(UnobservedTaskExceptionHandler handler) {
+        if (handler == null) { return; }
+        TaskScheduler.EnsureInitialized();
+        Mutex.Lock(TaskScheduler.syncLock);
+        TaskScheduler.handlers.Add(handler);
+        Mutex.Unlock(TaskScheduler.syncLock);
+    }
+
+    // 退订全局未观察任务异常事件。
+    public static void RemoveUnobservedTaskException(UnobservedTaskExceptionHandler handler) {
+        if (handler == null || TaskScheduler.syncLock == 0) { return; }
+        Mutex.Lock(TaskScheduler.syncLock);
+        if (TaskScheduler.handlers != null) {
+            for (int i = 0; i < TaskScheduler.handlers.Count; i = i + 1) {
+                if (TaskScheduler.handlers[i] == handler) {
+                    TaskScheduler.handlers.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(TaskScheduler.syncLock);
+    }
+
+    // 清空所有未观察异常处理器（通常用于单元测试环境隔离）。
+    public static void ClearHandlers() {
+        if (TaskScheduler.syncLock == 0) { return; }
+        Mutex.Lock(TaskScheduler.syncLock);
+        if (TaskScheduler.handlers != null) {
+            TaskScheduler.handlers.Clear();
+        }
+        Mutex.Unlock(TaskScheduler.syncLock);
+    }
+
+    // 分发未观察到的任务异常。
+    // 返回该异常是否已被任一处理器标记为 Observed。
+    public static bool PublishUnobservedException(object sender, Exception exc) {
+        if (exc == null) { return true; }
+        TaskScheduler.EnsureInitialized();
+
+        UnobservedTaskExceptionEventArgs args = new UnobservedTaskExceptionEventArgs(exc);
+        List<UnobservedTaskExceptionHandler> snapshot = new List<UnobservedTaskExceptionHandler>();
+
+        Mutex.Lock(TaskScheduler.syncLock);
+        if (TaskScheduler.handlers != null) {
+            for (int i = 0; i < TaskScheduler.handlers.Count; i = i + 1) {
+                snapshot.Add(TaskScheduler.handlers[i]);
+            }
+        }
+        Mutex.Unlock(TaskScheduler.syncLock);
+
+        for (int i = 0; i < snapshot.Count; i = i + 1) {
+            try {
+                snapshot[i](sender, args);
+            } catch (Exception ex) {
+                // 处理器本身的异常安全隔离，不打断其余处理
+            }
+        }
+
+        if (!args.Observed) {
+            Console.WriteLine("[TaskScheduler] Unobserved Task Exception: " + exc.Message);
+        }
+        return args.Observed;
+    }
+
+    // 安全启动后台任务并捕获其未处理异常，自动向全局 TaskScheduler 派发治理。
+    public static void RunSafe(Action action) {
+        if (action == null) { return; }
+        try {
+            action();
+        } catch (Exception ex) {
+            TaskScheduler.PublishUnobservedException(action, ex);
+        }
+    }
+}

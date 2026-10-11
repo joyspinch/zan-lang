@@ -2,33 +2,82 @@ using System;
 
 namespace System.Threading;
 
-// 跨平台轻量级取消令牌，提供非阻塞、线程安全且事件驱动的取消通知。
+// 取消回调登记节点。
+class CancellationTokenEntry {
+    public long id;
+    public Action callback;
+
+    public CancellationTokenEntry(long id, Action callback) {
+        this.id = id;
+        this.callback = callback;
+    }
+}
+
+// 取消回调注册句柄，提供显式注销取消回调与生命周期管理。
+public class CancellationTokenRegistration {
+    CancellationToken token;
+    long registrationId;
+    bool isDisposed;
+
+    public CancellationTokenRegistration(CancellationToken token, long registrationId) {
+        this.token = token;
+        this.registrationId = registrationId;
+        this.isDisposed = false;
+    }
+
+    // 注销回调，取消触发时不再被调用。
+    public void Dispose() {
+        if (this.isDisposed) { return; }
+        this.isDisposed = true;
+        if (this.token != null) {
+            this.token.Unregister(this.registrationId);
+        }
+    }
+}
+
+// 跨平台轻量级取消令牌，提供非阻塞、线程安全且事件驱动的取消通知与回调注册。
 // 适用于高并发异步流水线、长时任务协作式中断与网络请求超时。
-class CancellationToken {
+public class CancellationToken {
     bool isCancellationRequested;
     Gate waitGate;
     nint syncLock;
+    List<CancellationTokenEntry> callbacks;
+    long nextCallbackId;
 
-    CancellationToken() {
+    static CancellationToken noneToken;
+
+    public CancellationToken() {
         this.isCancellationRequested = false;
         this.waitGate = new Gate();
         this.syncLock = Mutex.Create();
+        this.callbacks = new List<CancellationTokenEntry>();
+        this.nextCallbackId = 0;
+    }
+
+    // 获取未取消且永不取消的空令牌单例。
+    public static CancellationToken None {
+        get {
+            if (CancellationToken.noneToken == null) {
+                CancellationToken.noneToken = new CancellationToken();
+            }
+            return CancellationToken.noneToken;
+        }
     }
 
     // 是否已收到取消请求。
-    bool IsCancellationRequested {
+    public bool IsCancellationRequested {
         get { return this.isCancellationRequested; }
     }
 
     // 如果已请求取消，抛出异常或中断执行。
-    void ThrowIfCancellationRequested() {
+    public void ThrowIfCancellationRequested() {
         if (this.isCancellationRequested) {
             throw new Exception("The operation was canceled.");
         }
     }
 
     // 挂起当前协程直到收到取消请求（完全非阻塞，不占用线程与渲染帧）。
-    async bool WaitHandle() {
+    public async bool WaitHandle() {
         if (this.isCancellationRequested) { return true; }
         while (!this.isCancellationRequested) {
             await this.waitGate.Wait();
@@ -36,20 +85,81 @@ class CancellationToken {
         return true;
     }
 
+    // 注册当令牌被取消时执行的回调委托。若令牌已处于取消态，立即同步执行。
+    public CancellationTokenRegistration Register(Action callback) {
+        if (callback == null) {
+            return new CancellationTokenRegistration(this, 0);
+        }
+        bool alreadyCanceled = false;
+        long regId = 0;
+        Mutex.Lock(this.syncLock);
+        if (this.isCancellationRequested) {
+            alreadyCanceled = true;
+        } else {
+            this.nextCallbackId = this.nextCallbackId + 1;
+            regId = this.nextCallbackId;
+            if (this.callbacks == null) {
+                this.callbacks = new List<CancellationTokenEntry>();
+            }
+            this.callbacks.Add(new CancellationTokenEntry(regId, callback));
+        }
+        Mutex.Unlock(this.syncLock);
+
+        if (alreadyCanceled) {
+            callback();
+            return new CancellationTokenRegistration(this, 0);
+        }
+        return new CancellationTokenRegistration(this, regId);
+    }
+
+    // 内部注销回调。
+    public void Unregister(long id) {
+        if (id == 0 || this.syncLock == 0) { return; }
+        Mutex.Lock(this.syncLock);
+        if (this.callbacks != null) {
+            for (int i = 0; i < this.callbacks.Count; i = i + 1) {
+                if (this.callbacks[i].id == id) {
+                    this.callbacks.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        Mutex.Unlock(this.syncLock);
+    }
+
     // 触发取消（内部由 CancellationTokenSource 调用）。
-    void CancelInternal() {
+    public void CancelInternal() {
+        List<Action> toInvoke = null;
         Mutex.Lock(this.syncLock);
         if (this.isCancellationRequested) {
             Mutex.Unlock(this.syncLock);
             return;
         }
         this.isCancellationRequested = true;
+        if (this.callbacks != null && this.callbacks.Count > 0) {
+            toInvoke = new List<Action>();
+            for (int i = 0; i < this.callbacks.Count; i = i + 1) {
+                toInvoke.Add(this.callbacks[i].callback);
+            }
+            this.callbacks.Clear();
+        }
         Mutex.Unlock(this.syncLock);
+
         this.waitGate.Signal();
+
+        if (toInvoke != null) {
+            for (int i = 0; i < toInvoke.Count; i = i + 1) {
+                try {
+                    toInvoke[i]();
+                } catch (Exception ex) {
+                    // 回调异常安全隔离，避免单点失败打断后续取消通知
+                }
+            }
+        }
     }
 
     // 关闭释放底层资源。
-    void Close() {
+    public void Close() {
         if (this.waitGate != null) {
             this.waitGate.Close();
         }
@@ -65,21 +175,49 @@ class CancellationToken {
     }
 }
 
-// 取消令牌源，用于发送取消请求或关联超时取消。
-class CancellationTokenSource {
+// 取消令牌源，用于发送取消请求、超时取消与级联联动取消。
+public class CancellationTokenSource {
     CancellationToken token;
     bool isDisposed;
+    List<CancellationTokenRegistration> linkedRegistrations;
 
-    CancellationTokenSource() {
+    public CancellationTokenSource() {
         this.token = new CancellationToken();
         this.isDisposed = false;
+        this.linkedRegistrations = new List<CancellationTokenRegistration>();
     }
 
     // 创建在指定毫秒后自动触发取消的 CancellationTokenSource。
-    static CancellationTokenSource CreateAfter(int delayMs) {
+    public static CancellationTokenSource CreateAfter(int delayMs) {
         CancellationTokenSource cts = new CancellationTokenSource();
         if (delayMs > 0) {
             Task.Run(CancellationTokenSource.CancelDelayed(cts, delayMs));
+        }
+        return cts;
+    }
+
+    // 创建联动取消源：当两个指定令牌中任一被取消时，联动源立即取消。
+    public static CancellationTokenSource CreateLinkedTokenSource(CancellationToken token1, CancellationToken token2) {
+        CancellationTokenSource cts = new CancellationTokenSource();
+        if (token1 != null) {
+            cts.linkedRegistrations.Add(token1.Register(() => { cts.Cancel(); }));
+        }
+        if (token2 != null) {
+            cts.linkedRegistrations.Add(token2.Register(() => { cts.Cancel(); }));
+        }
+        return cts;
+    }
+
+    // 创建联动取消源：当指定令牌列表中的任一令牌被取消时，联动源立即取消。
+    public static CancellationTokenSource CreateLinkedTokenSource(List<CancellationToken> tokens) {
+        CancellationTokenSource cts = new CancellationTokenSource();
+        if (tokens != null) {
+            for (int i = 0; i < tokens.Count; i = i + 1) {
+                CancellationToken t = tokens[i];
+                if (t != null) {
+                    cts.linkedRegistrations.Add(t.Register(() => { cts.Cancel(); }));
+                }
+            }
         }
         return cts;
     }
@@ -90,18 +228,18 @@ class CancellationTokenSource {
     }
 
     // 获取关联的 CancellationToken。
-    CancellationToken Token {
+    public CancellationToken Token {
         get { return this.token; }
     }
 
     // 请求取消操作。
-    void Cancel() {
+    public void Cancel() {
         if (this.isDisposed) { return; }
         this.token.CancelInternal();
     }
 
     // 在指定毫秒后触发取消。
-    void CancelAfter(int delayMs) {
+    public void CancelAfter(int delayMs) {
         if (this.isDisposed) { return; }
         if (delayMs <= 0) {
             this.Cancel();
@@ -111,9 +249,15 @@ class CancellationTokenSource {
     }
 
     // 释放关联资源。
-    void Dispose() {
+    public void Dispose() {
         if (this.isDisposed) { return; }
         this.isDisposed = true;
+        if (this.linkedRegistrations != null) {
+            for (int i = 0; i < this.linkedRegistrations.Count; i = i + 1) {
+                this.linkedRegistrations[i].Dispose();
+            }
+            this.linkedRegistrations.Clear();
+        }
         this.token.Close();
     }
 }

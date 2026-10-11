@@ -1,0 +1,83 @@
+using System;
+using System.Threading;
+
+namespace Conf;
+
+class Prog {
+    static async Task<int> Run() {
+        // 1. CancellationToken 回调注册与触发
+        CancellationTokenSource cts1 = new CancellationTokenSource();
+        bool cbFired = false;
+        CancellationTokenRegistration reg = cts1.Token.Register(() => {
+            cbFired = true;
+        });
+        Console.WriteLine("before-cancel-cb: " + (cbFired ? "1" : "0"));
+        cts1.Cancel();
+        Console.WriteLine("after-cancel-cb: " + (cbFired ? "1" : "0"));
+
+        // 2. 已取消状态下注册回调，立即同步触发
+        bool immediateCb = false;
+        cts1.Token.Register(() => {
+            immediateCb = true;
+        });
+        Console.WriteLine("immediate-cb-on-canceled: " + (immediateCb ? "1" : "0"));
+
+        // 3. 回调注册句柄 Dispose 注销，取消不再触发
+        CancellationTokenSource cts2 = new CancellationTokenSource();
+        bool disposedCb = false;
+        CancellationTokenRegistration reg2 = cts2.Token.Register(() => {
+            disposedCb = true;
+        });
+        reg2.Dispose();
+        cts2.Cancel();
+        Console.WriteLine("disposed-cb-fired: " + (disposedCb ? "1" : "0"));
+
+        // 4. 级联联动取消源（Linked Token Source）
+        CancellationTokenSource p1 = new CancellationTokenSource();
+        CancellationTokenSource p2 = new CancellationTokenSource();
+        CancellationTokenSource linked = CancellationTokenSource.CreateLinkedTokenSource(p1.Token, p2.Token);
+        Console.WriteLine("linked-before-cancel: " + (linked.Token.IsCancellationRequested ? "1" : "0"));
+        p2.Cancel();
+        Console.WriteLine("linked-after-p2-cancel: " + (linked.Token.IsCancellationRequested ? "1" : "0"));
+
+        // 5. TaskCompletionSource 与取消令牌联动
+        TaskCompletionSource<int> tcs = new TaskCompletionSource<int>();
+        CancellationTokenSource cancelTcsSource = new CancellationTokenSource();
+        tcs.AttachCancellationToken(cancelTcsSource.Token);
+        cancelTcsSource.Cancel();
+        try {
+            int val = await tcs.Task;
+            Console.WriteLine("tcs-val: " + val.ToString());
+        } catch (Exception ex) {
+            Console.WriteLine("tcs-canceled-caught: 1");
+        }
+
+        // 6. 全局未观察任务异常治理（TaskScheduler.UnobservedTaskException）
+        bool observedCaught = false;
+        string observedMsg = "";
+        UnobservedTaskExceptionHandler handler = (sender, args) => {
+            observedCaught = true;
+            observedMsg = args.Exception.Message;
+            args.SetObserved();
+        };
+
+        TaskScheduler.AddUnobservedTaskException(handler);
+        TaskScheduler.RunSafe(() => {
+            throw new Exception("unhandled-bg-error");
+        });
+
+        Console.WriteLine("observed-caught: " + (observedCaught ? "1" : "0"));
+        Console.WriteLine("observed-msg: " + observedMsg);
+
+        // 退订与环境重置
+        TaskScheduler.RemoveUnobservedTaskException(handler);
+        TaskScheduler.ClearHandlers();
+
+        Console.WriteLine("p7-all-passed: 1");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
