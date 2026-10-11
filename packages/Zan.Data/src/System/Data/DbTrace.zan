@@ -6,14 +6,38 @@ namespace System.Data;
 // 完成执行的 SQL 语句度量记录（含执行耗时微秒数）。
 delegate void SqlTraceSink(string sql, long us);
 
-// SQL 执行耗时上报槽点，由需要追踪性能的应用在启动时配置。
+// SQL 执行耗时与链路追踪上报槽点，打通 OpenTelemetry 数据库遥测规范与慢查询治理。
 class DbTrace {
     static SqlTraceSink sink = null;
+    static SqlTraceSink slowSink = null;
+    static long slowThresholdUs = 500000; // 默认 500ms
+    static bool activityTracing = true;
+    static string dbSystemName = "sql";
 
     // 配置耗时 SQL 语句接收回调；传入 null 停止追踪。
     static void Sink(SqlTraceSink fn) { DbTrace.sink = fn; }
 
-    static bool Enabled() { return DbTrace.sink != null; }
+    // 配置慢查询告警接收回调。
+    static void OnSlowQuery(SqlTraceSink fn) { DbTrace.slowSink = fn; }
+
+    // 设置慢查询阈值（毫秒）。
+    static void SetSlowQueryThresholdMs(int ms) {
+        DbTrace.slowThresholdUs = ms > 0 ? (long)ms * 1000L : 500000L;
+    }
+
+    // 设置数据库类型名称（例如 "mysql", "postgres", "sqlite", "sqlserver"）。
+    static void SetDbSystem(string system) {
+        DbTrace.dbSystemName = system != null ? system : "sql";
+    }
+
+    // 是否开启自动 Activity 分布式链路追踪。
+    static void EnableActivityTracing(bool on) {
+        DbTrace.activityTracing = on;
+    }
+
+    static bool Enabled() {
+        return DbTrace.sink != null || DbTrace.slowSink != null || DbTrace.activityTracing;
+    }
 
     static long NowUs() {
         long freq = Stopwatch.Frequency();
@@ -22,11 +46,42 @@ class DbTrace {
         return Stopwatch.NowTicks() / perUs;
     }
 
-    static void Report(string sql, long startUs) {
-        SqlTraceSink fn = DbTrace.sink;
-        if (fn == null) { return; }
+    // 开启一次 SQL 操作，若当前存在链路且开启追踪则返回对应 Activity。
+    static Activity BeginSpan(string sql) {
+        if (!DbTrace.activityTracing) { return null; }
+        if (Activity.Current == null) { return null; }
+        Activity span = Activity.Start("db.query");
+        span.SetTag("db.system", DbTrace.dbSystemName);
+        if (sql != null) {
+            span.SetTag("db.statement", sql);
+        }
+        return span;
+    }
+
+    // 完成 SQL 上报与链路 Span 归档。
+    static void Report(string sql, long startUs, Activity span) {
         long us = DbTrace.NowUs() - startUs;
         if (us < 0) { us = 0; }
-        fn(sql, us);
+
+        if (span != null) {
+            span.SetTag("db.duration_us", Convert.ToString(us));
+            if (us >= DbTrace.slowThresholdUs) {
+                span.SetTag("db.slow", "true");
+            }
+            span.Stop();
+        }
+
+        if (DbTrace.sink != null) {
+            DbTrace.sink(sql, us);
+        }
+
+        if (us >= DbTrace.slowThresholdUs && DbTrace.slowSink != null) {
+            DbTrace.slowSink(sql, us);
+        }
+    }
+
+    // 兼容历史二参数重载
+    static void Report(string sql, long startUs) {
+        DbTrace.Report(sql, startUs, null);
     }
 }

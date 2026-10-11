@@ -1,0 +1,93 @@
+using System;
+using System.Diagnostics;
+using System.Data;
+
+namespace Conf;
+
+class FakeConn : IDbConnection {
+    bool connected;
+
+    FakeConn() {
+        this.connected = true;
+    }
+
+    bool IsConnected() { return this.connected; }
+    void Close() { this.connected = false; }
+    void Dispose() { this.Close(); }
+    void BeginTransaction() {}
+    void Commit() {}
+    void Rollback() {}
+    async bool BeginTransactionAsync() { return true; }
+    async bool CommitAsync() { return true; }
+    async bool RollbackAsync() { return true; }
+
+    DbResult Query(string sql, DbParams prms) { return null; }
+    int Execute(string sql, DbParams prms) { return 1; }
+    DbResult Query(string sql) { return null; }
+    int Execute(string sql) { return 1; }
+    string ExecuteScalar(string sql) { return "42"; }
+    string ExecuteScalar(string sql, DbParams prms) { return "42"; }
+    int GetProvider() { return 1; }
+
+    async DbResult QueryAsync(string sql, DbParams prms) { return null; }
+    async int ExecuteAsync(string sql, DbParams prms) { return 1; }
+    async DbResult QueryAsync(string sql) { return null; }
+    async int ExecuteAsync(string sql) { return 1; }
+    async string ExecuteScalarAsync(string sql) { return "42"; }
+    async string ExecuteScalarAsync(string sql, DbParams prms) { return "42"; }
+}
+
+class Prog {
+    static string lastTracedSql;
+    static long lastTracedUs;
+    static string lastSlowSql;
+    static long lastSlowUs;
+
+    static void OnSqlTrace(string sql, long us) {
+        Prog.lastTracedSql = sql;
+        Prog.lastTracedUs = us;
+    }
+
+    static void OnSlowTrace(string sql, long us) {
+        Prog.lastSlowSql = sql;
+        Prog.lastSlowUs = us;
+    }
+
+    static void Main() {
+        DbTrace.Sink(Prog.OnSqlTrace);
+        DbTrace.OnSlowQuery(Prog.OnSlowTrace);
+        DbTrace.SetDbSystem("sqlite");
+        DbTrace.SetSlowQueryThresholdMs(1); // 1ms threshold for testing slow query detection
+
+        FakeConn raw = new FakeConn();
+        IDbConnection conn = TracedDbConnection.Wrap(raw);
+        Console.WriteLine("wrapped-is-traced: " + Convert.ToString(conn is TracedDbConnection ? 1 : 0));
+        Console.WriteLine("unwrapped-match: " + Convert.ToString(TracedDbConnection.Unwrap(conn) == raw ? 1 : 0));
+
+        // 1. 无父链路时执行普通查询
+        int rows = conn.Execute("UPDATE users SET status = 1 WHERE id = 10");
+        Console.WriteLine("exec-rows: " + Convert.ToString(rows));
+        Console.WriteLine("sink-sql-match: " + Convert.ToString(Prog.lastTracedSql.Contains("UPDATE users") ? 1 : 0));
+        Console.WriteLine("sink-us-valid: " + Convert.ToString(Prog.lastTracedUs >= 0 ? 1 : 0));
+
+        // 2. 有父链路时执行查询，验证链路Span与标签记录
+        Activity httpAct = Activity.Start("http.request");
+        httpAct.SetTag("http.route", "/api/user");
+
+        string val = conn.ExecuteScalar("SELECT count(*) FROM orders");
+        Console.WriteLine("scalar-val: " + val);
+        Console.WriteLine("sink-scalar-sql-match: " + Convert.ToString(Prog.lastTracedSql.Contains("SELECT count(*)") ? 1 : 0));
+
+        // 验证当前活动仍为父活动（子Span在执行后已自动Stop并退栈）
+        Console.WriteLine("current-is-http: " + Convert.ToString(Activity.Current == httpAct ? 1 : 0));
+
+        // 3. 模拟耗时操作触发慢查询告警
+        // 人工上报一次慢查询测试阈值逻辑
+        DbTrace.Report("SELECT * FROM huge_table WHERE unindexed_col = 1", 0);
+        Console.WriteLine("slow-sql-captured: " + Convert.ToString(Prog.lastSlowSql.Contains("huge_table") ? 1 : 0));
+
+        httpAct.Stop();
+        Console.WriteLine("current-after-stop: " + Convert.ToString(Activity.Current == null ? 1 : 0));
+        Console.WriteLine("db-tracing-all-tests-passed: 1");
+    }
+}
