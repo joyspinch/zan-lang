@@ -24,6 +24,7 @@ build/zanc.exe examples/net/tcp_echo.zan --auto-stdlib -o tcp_echo.exe
 | `modbus_master.zan` | Modbus TCP | 工业 PLC/仪表寄存器读写：ReadHolding/WriteRegister、MBAP 事务帧、异常应答、内置 16 寄存器从站 |
 | `ntp_time.zan` | NTP/SNTP | 无 RTC 设备对时：一次请求取 Unix 秒、内置最小 SNTP 服务端（真实使用换 pool.ntp.org） |
 | `sip_options.zan` | SIP | VoIP 信令：OPTIONS 保活/REGISTER 注册、消息解析与序列化、非 INVITE 事务重传、内置最小注册服务端 |
+| `sip_call.zan` | SIP / SDP / RTP | VoIP 语音通话（打电话）：INVITE 拨号、180 Ringing 振铃、200 OK 接听、ACK 三路握手、SDP 媒体协商、RTP 语音采样帧收发、BYE 挂断 |
 
 选型速查：
 
@@ -37,4 +38,4 @@ build/zanc.exe examples/net/tcp_echo.zan --auto-stdlib -o tcp_echo.exe
 - 受限设备/低功耗网络的请求应答 → CoAP（`System.Net.Coap.CoapClient`，见 `coap_client.zan`）
 - 工业设备寄存器读写 → Modbus TCP（`System.Net.Modbus.ModbusClient`，见 `modbus_master.zan`）
 - 设备对时 → NTP（`System.Net.Ntp.NtpClient`，见 `ntp_time.zan`）
-- VoIP/软电话信令 → SIP（`System.Net.Sip.SipClient`，信令层；媒体/认证未包含，见 `sip_options.zan`）
+- VoIP/软电话信令与通话 → SIP（`System.Net.Sip.SipClient` / `SipCall` / `SdpMessage` / `RtpChannel`，信令+SDP+RTP 打电话全流程，见 `sip_call.zan` 和 `sip_options.zan`）

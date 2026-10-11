@@ -1,0 +1,145 @@
+// SIP 语音通话（打电话）完整流程（RFC 3261 / RFC 4566 / RFC 3550）
+// 演示内容：
+// 1. SipClient.InviteAsync：发起呼叫（拨打电话），发送 INVITE 与本地 SDP（协商语音端口）
+// 2. 状态机流转：Calling（拨号中） -> 180 Ringing（对方振铃） -> 200 OK（接听通话）
+// 3. 三路握手：自动回复 ACK 确认消息，通话进入 Connected 状态
+// 4. SDP 媒体协商：自动解析对方返回的 IP 与 RTP 语音端口
+// 5. RTP 媒体通道：通过 RtpChannel 实时发送 G.711u（PCMU）音频帧
+// 6. SipClient.HangupAsync：主动发送 BYE 请求挂断电话，释放会话资源
+// 7. 本例在同一进程内启动最小 SIP 被叫服务端（Bob）进行真实网络交互，无需外部 PBX
+using System;
+using System.Net.Sip;
+using System.Net.Sockets;
+
+class Program {
+    static int SERVER_PORT = 55080;
+    static int CLIENT_PORT = 55082;
+    static bool serverReady = false;
+
+    // ---- 模拟被叫端（Bob）服务协程：响应呼叫并接听通话 ----
+    static async void BobPhoneServer() {
+        UdpClient udp = UdpClient.Bind("127.0.0.1", SERVER_PORT);
+        if (udp == null) { return; }
+        serverReady = true;
+
+        bool callEnded = false;
+        while (!callEnded) {
+            if (Socket.IsReadable(udp.GetSocket())) {
+                string data = udp.RecvFrom(65536);
+                SipMessage req = SipMessage.Parse(data);
+                if (req != null && req.GetIsRequest()) {
+                    string method = req.GetMethod();
+                    string via = req.Header("Via");
+                    string from = req.Header("From");
+                    string to = req.Header("To");
+                    string callId = req.Header("Call-ID");
+                    string cseq = req.Header("CSeq");
+
+                    if (method == "INVITE") {
+                        Console.WriteLine("[Bob 电话] 收到来自 " + from + " 的来电请求 (INVITE)");
+
+                        // 1. 回复 180 Ringing 振铃通知
+                        SipMessage ring = SipMessage.Response(180, "Ringing");
+                        ring.Add("Via", via);
+                        ring.Add("From", from);
+                        ring.Add("To", to + ";tag=bob-tag-888");
+                        ring.Add("Call-ID", callId);
+                        ring.Add("CSeq", cseq);
+                        await udp.SendToAsync(ring.Serialize(), "127.0.0.1", CLIENT_PORT);
+                        Console.WriteLine("[Bob 电话] 正在振铃... (发送 180 Ringing)");
+
+                        // 模拟响铃 100ms 后接听
+                        await Task.Delay(100);
+
+                        // 2. 回复 200 OK 接听电话，附带 Bob 的 SDP 音频接收端口 (56002)
+                        SipMessage ok = SipMessage.Response(200, "OK");
+                        ok.Add("Via", via);
+                        ok.Add("From", from);
+                        ok.Add("To", to + ";tag=bob-tag-888");
+                        ok.Add("Call-ID", callId);
+                        ok.Add("CSeq", cseq);
+                        ok.Add("Contact", "<sip:bob@127.0.0.1:" + Convert.ToString(SERVER_PORT) + ">");
+                        ok.Add("Content-Type", "application/sdp");
+
+                        SdpMessage bobSdp = SdpMessage.CreateAudio("127.0.0.1", 56002);
+                        ok.SetBody(bobSdp.Serialize());
+                        await udp.SendToAsync(ok.Serialize(), "127.0.0.1", CLIENT_PORT);
+                        Console.WriteLine("[Bob 电话] 接听电话！(发送 200 OK + SDP 语音端口 56002)");
+                    } else if (method == "ACK") {
+                        Console.WriteLine("[Bob 电话] 收到 ACK 确认，双方通话已正式连通！");
+                    } else if (method == "BYE") {
+                        Console.WriteLine("[Bob 电话] 收到对方挂断请求 (BYE)，通话结束");
+                        SipMessage byeOk = SipMessage.Response(200, "OK");
+                        byeOk.Add("Via", via);
+                        byeOk.Add("From", from);
+                        byeOk.Add("To", to);
+                        byeOk.Add("Call-ID", callId);
+                        byeOk.Add("CSeq", cseq);
+                        await udp.SendToAsync(byeOk.Serialize(), "127.0.0.1", CLIENT_PORT);
+                        callEnded = true;
+                    }
+                }
+            } else {
+                await Task.Delay(10);
+            }
+        }
+        udp.Close();
+    }
+
+    static async int Main() {
+        Console.WriteLine("=== Zan SIP 语音通话（打电话）示例 ===");
+
+        // 启动被叫端服务
+        BobPhoneServer();
+        while (!serverReady) { await Task.Delay(10); }
+
+        // 创建主叫客户端（Alice），配置本地 SIP 信令端口为 55082
+        SipClient alice = new SipClient("127.0.0.1", SERVER_PORT, "alice-client");
+        alice.SetLocalIp("127.0.0.1");
+        alice.SetLocalSipPort(CLIENT_PORT);
+
+        Console.WriteLine("[Alice] 准备向 bob 发起呼叫...");
+        // 拨打电话：指定主叫 alice、被叫 bob，以及 Alice 本地接收音频的 RTP 端口 56000
+        SipCall call = await alice.InviteAsync("alice", "bob", 56000);
+
+        if (call == null || !call.IsConnected()) {
+            Console.WriteLine("[Alice] 呼叫失败，未接通");
+            return 1;
+        }
+
+        Console.WriteLine("[Alice] 电话已接通！");
+        Console.WriteLine(" - Call-ID: " + call.GetCallId());
+        Console.WriteLine(" - 远端标识: " + call.GetRemoteTag());
+        Console.WriteLine(" - 协商音频地址: " + call.GetRemoteRtpHost() + ":" + Convert.ToString(call.GetRemoteRtpPort()));
+
+        // 获取并就绪 RTP 音频传输通道
+        RtpChannel audioChannel = call.GetOrCreateRtpChannel();
+        if (audioChannel != null) {
+            Console.WriteLine("[Alice] 正在通过 RTP 发送语音采样数据...");
+            // 模拟发送 3 个 20ms G.711u 语音采样帧（每帧 160 字节）
+            byte[] frameData = new byte[160];
+            for (int i = 0; i < 3; i = i + 1) {
+                // 填充模拟音频波形
+                frameData[0] = (byte)(i * 10);
+                await audioChannel.SendAudioFrameAsync(frameData, 0, 160);
+                Console.WriteLine("   -> 发送第 " + Convert.ToString(i + 1) + " 帧 RTP 语音包");
+                await Task.Delay(20);
+            }
+        }
+
+        // 模拟通话持续片刻
+        await Task.Delay(100);
+        Console.WriteLine("[Alice] 通话进行中，当前通话时长: " + Convert.ToString(call.GetDurationSeconds()) + " 秒");
+
+        // 挂断电话
+        Console.WriteLine("[Alice] 挂断电话 (发送 BYE)...");
+        bool hungUp = await alice.HangupAsync(call);
+        if (hungUp) {
+            Console.WriteLine("[Alice] 对方已确认挂断，通话正常结束。");
+        } else {
+            Console.WriteLine("[Alice] 挂断超时或异常");
+        }
+
+        return 0;
+    }
+}
