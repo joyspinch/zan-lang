@@ -308,6 +308,14 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   使用实际框。禁止另写逐控件布局或外层裁剪遮盖差异；那会丢掉继承、
   容器 chrome 和合法 overflow。视图 zoom 只缩放最终图像，细则与
   几何/像素/交互验证见 `references/html-window.md` 所见所得专节。
+- **设计器画布网格、焦点与容器拖拽鲁棒性**
+  (点阵不可见/撤销失效/拖拽组件消失教训):
+  1. 点阵网格尺寸按 DPI 缩放（至少 2px），颜色对比度采用 `Style.Fade(t.textSecondary, 85)`，
+     且仅跳过非容器叶子控件，容器内部仍正常展示网格辅助线；
+  2. 画布交互（平移/点击空白/拖拽/右键）主动调用 `app.focus.ClearFocus()` 释放输入框独占焦点，
+     按键路由同时支持 `EventChar` 控制字符与 `EventKeyDown`（Ctrl+Z/Ctrl+Y 等组合键）；
+  3. 容器 Qualification 需严格校验 `f.IsContainer() || f.KidCount() > 0 || (f.kind == "Element" && node.control is Element)`，
+     落点命中自身或子树时安全回退至原父容器，拖拽坐标换算处强制 `fx >= 0, fy >= 0` 杜绝负坐标移出画布。
 - **富文本/自绘文本的默认前景兜底是纯白**(Arpg 深色底习惯):亮色皮肤
   里标记文本没写色码的段落、以及 #W 白/#Y 纯黄这类深底快捷色,画在
   亮底上全部隐形——不是"渲染丢了"。皮肤补
