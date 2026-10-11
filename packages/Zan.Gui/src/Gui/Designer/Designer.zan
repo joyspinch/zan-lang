@@ -2726,7 +2726,7 @@ partial class Designer {
         }
     }
 
-    // 一键成组：把多选的所有组件收纳进一个新的 Panel 容器 (Ctrl+G)
+    // 一键成组：把多选的所有组件收纳进一个新的 Panel 容器 (Ctrl+G)，智能识别公共宿主容器与层级持久化
     void GroupSel() {
         if (sel == null || freeExtra == null || freeExtra.Count == 0) { return; }
         this.PushUndo();
@@ -2735,19 +2735,54 @@ partial class Designer {
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
             all.Add(freeExtra[i]);
         }
-        int minX = all[0].fx;
-        int minY = all[0].fy;
-        int maxX = all[0].fx + all[0].LayoutW();
-        int maxY = all[0].fy + all[0].LayoutH();
+        FormField commonParent = ParentContainerOf(all[0]);
+        bool sameParent = true;
         for (int i = 1; i < all.Count; i = i + 1) {
-            FormField f = all[i];
-            if (f.fx < minX) { minX = f.fx; }
-            if (f.fy < minY) { minY = f.fy; }
-            int r = f.fx + f.LayoutW();
-            int b = f.fy + f.LayoutH();
-            if (r > maxX) { maxX = r; }
-            if (b > maxY) { maxY = b; }
+            if (ParentContainerOf(all[i]) != commonParent) {
+                sameParent = false;
+                break;
+            }
         }
+        if (!sameParent) {
+            commonParent = null;
+        }
+
+        int minX = 0;
+        int minY = 0;
+        int maxX = 0;
+        int maxY = 0;
+        if (commonParent != null) {
+            minX = all[0].fx;
+            minY = all[0].fy;
+            maxX = all[0].fx + all[0].fw;
+            maxY = all[0].fy + all[0].fh;
+            for (int i = 1; i < all.Count; i = i + 1) {
+                FormField f = all[i];
+                if (f.fx < minX) { minX = f.fx; }
+                if (f.fy < minY) { minY = f.fy; }
+                int r = f.fx + f.fw;
+                int b = f.fy + f.fh;
+                if (r > maxX) { maxX = r; }
+                if (b > maxY) { maxY = b; }
+            }
+        } else {
+            minX = this.DesignWorldX(all[0]);
+            minY = this.DesignWorldY(all[0]);
+            maxX = minX + all[0].fw;
+            maxY = minY + all[0].fh;
+            for (int i = 1; i < all.Count; i = i + 1) {
+                FormField f = all[i];
+                int wx = this.DesignWorldX(f);
+                int wy = this.DesignWorldY(f);
+                if (wx < minX) { minX = wx; }
+                if (wy < minY) { minY = wy; }
+                int r = wx + f.fw;
+                int b = wy + f.fh;
+                if (r > maxX) { maxX = r; }
+                if (b > maxY) { maxY = b; }
+            }
+        }
+
         int pad = 12;
         int groupW = maxX - minX + pad * 2;
         int groupH = maxY - minY + pad * 2;
@@ -2770,12 +2805,23 @@ partial class Designer {
             FormField pc = ParentContainerOf(f);
             if (pc == null) { fields = ListRemove(fields, f); }
             else { pc.kids = ListRemove(pc.kids, f); }
-            f.fx = f.fx - minX + pad;
-            f.fy = f.fy - minY + pad;
+            if (commonParent != null) {
+                f.fx = f.fx - minX + pad;
+                f.fy = f.fy - minY + pad;
+            } else {
+                f.fx = this.DesignWorldX(f) - minX + pad;
+                f.fy = this.DesignWorldY(f) - minY + pad;
+            }
             grp.kids.Add(f);
+            this.DesignDeclareRect(f);
         }
 
-        fields.Add(grp);
+        if (commonParent == null) {
+            fields.Add(grp);
+        } else {
+            commonParent.kids.Add(grp);
+        }
+        this.DesignDeclareRect(grp);
         this.ClearExtraSel();
         sel = grp;
         activeContainer = grp;
@@ -2784,7 +2830,7 @@ partial class Designer {
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
-    // 一键解散成组：把当前选中容器解散，将其子组件提取回上一层 (Ctrl+Shift+G)
+    // 一键解散成组：把当前选中容器解散，将其子组件提取回上一层 (Ctrl+Shift+G) 并重新声明持久化
     void UngroupSel() {
         if (sel == null || !FormField.IsContainerOf(sel.ftype) || sel.kids == null || sel.kids.Count == 0) {
             return;
@@ -2806,6 +2852,7 @@ partial class Designer {
             child.fy = baseY + child.fy;
             if (pc == null) { fields.Add(child); }
             else { pc.kids.Add(child); }
+            this.DesignDeclareRect(child);
             if (sel == null) { sel = child; }
             else { freeExtra.Add(child); }
         }
@@ -3905,10 +3952,15 @@ partial class Designer {
         if (Ui.Clicked(app, bId) && palTab != 0) { palTab = 0; app.RequestRedraw(); }
         if (Ui.Clicked(app, oId) && palTab != 1) { palTab = 1; app.RequestRedraw(); }
 
+        // 即时搜索过滤输入框：支持快速检索组件库与大纲树节点
+        int searchH = app.Scale(24);
+        int searchY = py + tabH + app.Scale(4);
+        filterInput.Render(app, px, searchY, pw, searchH);
+
         int barH = 0;
         if (palTab == 1) {
             barH = app.Scale(26);
-            int barY = py + tabH + app.Scale(4);
+            int barY = searchY + searchH + app.Scale(4);
             int nBtns = 6;
             int gap = app.Scale(3);
             int btnW = (pw - gap * (nBtns - 1)) / nBtns;
@@ -3946,8 +3998,8 @@ partial class Designer {
             if (Ui.Clicked(app, colId)) { this.OutlineExpandAll(false); }
         }
 
-        int bodyY = py + tabH + app.Scale(6) + barH;
-        int bodyH = ph - tabH - app.Scale(6) - barH;
+        int bodyY = searchY + searchH + app.Scale(4) + barH;
+        int bodyH = ph - (bodyY - py);
         if (bodyH < 20) { return; }
         if (palTab == 0) {
             this.EnsurePalette();

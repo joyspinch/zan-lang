@@ -956,6 +956,10 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   否则父容器内部组件会跳出容器飞出视口；必须严格基于原组件局部坐标 `orig.fx + 16`、`orig.fy + 16` 进行偏移。
   同时，当处于多选状态时，Ctrl+D 必须支持多选整组批量克隆（保留各组件父级归属与相对坐标），并将克隆出的一组新组件设为新的选中组，
   支持无缝连续克隆排版。
+- **多选成组与解组的公共宿主归属与矩形声明纪律（Group & Ungroup Container Scoping）**：
+  对多选组件执行成组（`GroupSel` / `Ctrl+G`）时，若所有子项来自同一公共父容器（`commonParent`），新生成的包装 Panel 必须归入该父容器（`commonParent.kids.Add(grp)`），局部坐标直接基于其局部几何运算；若跨容器才折算世界坐标提升至根窗口。解散成组（`UngroupSel` / `Ctrl+Shift+G`）提取子组件时，必须正确折算偏移并对所有子项与新容器调用 `DesignDeclareRect`，确保修改完整持久化到源码，杜绝重载后层级倒流或坐标归零。
+- **左侧面板即时搜索过滤框（Palette / Outline Quick Filter）的常驻呈现**：
+  拥有庞大组件库与大纲树的设计器左侧面板，必须在顶层 Tab 下方常驻即时搜索输入框（`filterInput`），联动树视图的 `WithFilter` 机制，支持输入拼音/英文/汉字关键字（如 "button", "table", "tab", "按钮"）毫秒级过滤匹配项，避免用户在几十个折叠分组中反复翻找。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
