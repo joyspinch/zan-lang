@@ -620,6 +620,16 @@ partial class Designer {
         if (f.fy < 0) { f.fy = 0; }
         f.fw = f.LayoutW();
         f.fh = f.LayoutH();
+        if (f.IsFullWidthBanner()) {
+            Rect content = this.DesignContentRect(this.DesignParentHost(f));
+            int hostW = this.DesignLogical(content.width);
+            if (hostW <= 0) { hostW = f.LayoutW(); }
+            f.fx = 0;
+            f.fw = hostW;
+        }
+        if (f.IsFixedHeight()) {
+            f.fh = FormField.DefaultHFor(f.ftype);
+        }
         f.position = 1;
         f.anchor = 0;
         f.dockSide = 0;
@@ -813,6 +823,7 @@ partial class Designer {
             } else if (layoutMode == 1) {
                 int hs = app.Scale(7);
                 for (int hn = 0; hn < 8; hn = hn + 1) {
+                    if (!Designer.FreeHandleAllowed(f, hn)) { continue; }
                     int hx = Designer.FreeHandleX(hn, r.x, r.width) - hs / 2;
                     int hy = Designer.FreeHandleY(hn, r.y, r.height) - hs / 2;
                     c.FillRect(hx, hy, hs, hs,
@@ -1096,6 +1107,32 @@ partial class Designer {
             pc = DesignOwnerOf(pc);
         }
         return false;
+    }
+
+    // 判断选中组件 f 是否允许显示/响应第 hn 号调整大小手柄：
+    // hn 对应：0 左上 1 上 2 右上 3 右 4 右下 5 下 6 左下 7 左。
+    static bool FreeHandleAllowed(FormField f, int hn) {
+        if (f == null) { return false; }
+        // 1. 通栏横幅型控件（工具条、状态栏、菜单栏、横向分割线等）：
+        // 横向始终填满父容器宽度，禁止左右调整宽度。
+        if (f.IsFullWidthBanner()) {
+            // 若高度也是固定的（如状态栏、分割线），则完全不开放调整大小手柄。
+            if (f.IsFixedHeight()) { return false; }
+            // 工具条等允许微调高度的横幅控件仅开放下手柄（5）。
+            return hn == 5;
+        }
+        // 2. 固定尺寸控件（如开关、头像、单图标）：不开放随意拉伸。
+        if (f.IsFixedWidth()) {
+            return false;
+        }
+        // 3. 固定单行高度型控件（输入框、单选/多选、下拉框、滑块、分页等）：
+        // 高度由规格与标准行高严格约束，禁止拉伸高度；仅开放左右手柄（3 右、7 左）。
+        if (f.IsFixedHeight()) {
+            return hn == 3 || hn == 7;
+        }
+        // 4. 自由容器与复杂组件（Panel、DataGrid、TreeView、TextArea、Chart、Tabs 等）：
+        // 8 个方位手柄全部开放自由调整。
+        return true;
     }
 
     // 第 hn 号调整大小手柄（0 左上 1 上 2 右上 3 右 4 右下 5 下
@@ -1488,6 +1525,7 @@ partial class Designer {
                 int sh2 = selected.height;
                 int hs = app.Scale(10);
                 for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                    if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
                     int hx = FreeHandleX(hn, sx, sw2);
                     int hy = FreeHandleY(hn, sy, sh2);
                     if (InRect(app.mouseX, app.mouseY,
@@ -1636,8 +1674,13 @@ partial class Designer {
                 int dy = top - designDragTop;
                 for (int i = 0; i < designMoves.Count; i = i + 1) {
                     DesignMoveStart move = designMoves[i];
-                    move.field.fx = move.x + dx - this.DesignEditOriginX(move.field);
-                    move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    if (move.field.IsFullWidthBanner()) {
+                        move.field.fx = 0;
+                        move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    } else {
+                        move.field.fx = move.x + dx - this.DesignEditOriginX(move.field);
+                        move.field.fy = move.y + dy - this.DesignEditOriginY(move.field);
+                    }
                     if (move.field.fx < 0) { move.field.fx = 0; }
                     if (move.field.fy < 0) { move.field.fy = 0; }
                     this.DesignDeclareRect(move.field);
@@ -1666,6 +1709,14 @@ partial class Designer {
                 bool moveT = hn == 0 || hn == 1 || hn == 2;
                 bool moveR = hn == 2 || hn == 3 || hn == 4;
                 bool moveB = hn == 4 || hn == 5 || hn == 6;
+                if (sel.IsFullWidthBanner()) {
+                    moveL = false;
+                    moveR = false;
+                }
+                if (sel.IsFixedHeight()) {
+                    moveT = false;
+                    moveB = false;
+                }
                 if (moveL) { left = left + dx; }
                 if (moveT) { top = top + dy; }
                 if (moveR) { right = right + dx; }
@@ -1695,11 +1746,23 @@ partial class Designer {
                         if (r[1] >= 0) { freeGuideY = r[1] + baseY; }
                     }
                 }
-                if (right - left < 8) {
-                    if (moveL) { left = right - 8; } else { right = left + 8; }
+                int minW = FormField.MinSafeWOf(sel.ftype);
+                int minH = FormField.MinSafeHOf(sel.ftype);
+                if (right - left < minW) {
+                    if (moveL) { left = right - minW; } else { right = left + minW; }
                 }
-                if (bottom - top < 8) {
-                    if (moveT) { top = bottom - 8; } else { bottom = top + 8; }
+                if (bottom - top < minH) {
+                    if (moveT) { top = bottom - minH; } else { bottom = top + minH; }
+                }
+                if (sel.IsFullWidthBanner()) {
+                    Rect content = this.DesignContentRect(this.DesignParentHost(sel));
+                    int hostW = this.DesignLogical(content.width);
+                    if (hostW <= 0) { hostW = sel.LayoutW(); }
+                    left = baseX;
+                    right = baseX + hostW;
+                }
+                if (sel.IsFixedHeight()) {
+                    bottom = top + FormField.DefaultHFor(sel.ftype);
                 }
                 sel.fx = left - baseX;
                 sel.fy = top - baseY;
