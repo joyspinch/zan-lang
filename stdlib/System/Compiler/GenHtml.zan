@@ -445,6 +445,16 @@ class GenHtml {
                 GenCommon.Line(b, 2, v + ".visible = true;");
             }
         }
+        // slot 具名插槽路由
+        string slot = HtmlText.NodeAttr(n.attrs, "slot");
+        if (slot == "") { slot = HtmlText.NodeAttr(n.attrs, "data-slot"); }
+        if (slot != "") {
+            GenCommon.Line(b, 2, v + ".slotName = \"" + GenCommon.Esc(slot) + "\";");
+        }
+        // {{ expr }} 胡子模板文本插值
+        if (n.text != "" && n.text.IndexOf("{{") >= 0) {
+            GenCommon.Line(b, 2, v + ".bindTpl = \"" + GenCommon.Esc(n.text) + "\";");
+        }
         /* Element 的原始 data-* 属性 parity 落属性表（运行时
          * Html.Build 全量进 elAttrs；编译通道至少让 data-for 一类
          * 动态原语与 CSS 属性选择器同语义生效）。协议消费掉的
@@ -480,10 +490,16 @@ class GenHtml {
                     || alow == "icon" || alow == "tip" || alow == "title" || alow == "tip-side"
                     || alow == "tipside" || alow == "tip-pos" || alow == "free-layout"
                     || alow == "data-free-layout" || alow == "dock" || alow == "data-dock"
-                    || alow == "disabled" || alow == "visible"
+                    || alow == "disabled" || alow == "visible" || alow == "slot" || alow == "data-slot"
                     || alow == "z-model" || alow == "v-model" || alow == "data-bind"
+                    || alow.StartsWith("z-model.") || alow.StartsWith("v-model.") || alow.StartsWith("data-bind.")
+                    || alow == ":class" || alow == "data-bind-class" || alow == "z-class" || alow == "v-bind:class"
+                    || alow == ":disabled" || alow == "data-bind-disabled" || alow == "z-disabled" || alow == "v-bind:disabled"
                     || alow == "z-show" || alow == "v-show" || alow == "z-hide" || alow == "v-hide"
                     || alow == "z-text" || alow == "v-text" || alow == "data-if" || alow == "data-arg"
+                    || (ak.Length > 1 && ak[0] == 58)
+                    || (ak.Length > 7 && HtmlText.StartsWith(ak, "v-bind:"))
+                    || (ak.Length > 7 && HtmlText.StartsWith(ak, "z-bind:"))
                     || alow.StartsWith("data-on-") || alow.StartsWith("on") || alow.StartsWith("v-on:")
                     || alow.StartsWith("z-on:") || (ak.Length > 0 && ak[0] == 64)) {
                     continue;
@@ -493,12 +509,38 @@ class GenHtml {
                                + GenCommon.Esc(val) + "\");");
             }
         }
-        string bind = HtmlText.NodeAttr(n.attrs, "data-bind");
-        if (bind == "") { bind = HtmlText.NodeAttr(n.attrs, "z-model"); }
-        if (bind == "") { bind = HtmlText.NodeAttr(n.attrs, "v-model"); }
+        string bind = "";
+        bool bLazy = false;
+        bool bNum = false;
+        bool bTrim = false;
+        for (int a = 0; a < n.attrs.Count; a = a + 1) {
+            string ak = n.attrs[a].name;
+            string aval = n.attrs[a].val;
+            if (ak == "data-bind" || ak == "z-model" || ak == "v-model"
+                || HtmlText.StartsWith(ak, "v-model.") || HtmlText.StartsWith(ak, "z-model.")
+                || HtmlText.StartsWith(ak, "data-bind.")) {
+                bind = aval;
+                if (ak.IndexOf(".lazy") >= 0) { bLazy = true; }
+                if (ak.IndexOf(".number") >= 0) { bNum = true; }
+                if (ak.IndexOf(".trim") >= 0) { bTrim = true; }
+            } else if (ak == ":class" || ak == "data-bind-class" || ak == "z-class" || ak == "v-bind:class") {
+                GenCommon.Line(b, 2, v + ".bindClass = \"" + GenCommon.Esc(aval) + "\";");
+            } else if (ak == ":disabled" || ak == "data-bind-disabled" || ak == "z-disabled" || ak == "v-bind:disabled") {
+                GenCommon.Line(b, 2, v + ".bindDisabled = \"" + GenCommon.Esc(aval) + "\";");
+            } else if (ak.Length > 1 && ak[0] == 58) {
+                GenCommon.Line(b, 2, v + ".AddBindProp(\"" + GenCommon.Esc(ak.Substring(1)) + "\", \"" + GenCommon.Esc(aval) + "\");");
+            } else if (ak.Length > 7 && HtmlText.StartsWith(ak, "v-bind:")) {
+                GenCommon.Line(b, 2, v + ".AddBindProp(\"" + GenCommon.Esc(ak.Substring(7)) + "\", \"" + GenCommon.Esc(aval) + "\");");
+            } else if (ak.Length > 7 && HtmlText.StartsWith(ak, "z-bind:")) {
+                GenCommon.Line(b, 2, v + ".AddBindProp(\"" + GenCommon.Esc(ak.Substring(7)) + "\", \"" + GenCommon.Esc(aval) + "\");");
+            }
+        }
         if (bind != "") {
             GenCommon.Line(b, 2, v + ".bindPath = \""
                            + GenCommon.Esc(bind) + "\";");
+            if (bLazy) { GenCommon.Line(b, 2, v + ".bindLazy = true;"); }
+            if (bNum) { GenCommon.Line(b, 2, v + ".bindNumber = true;"); }
+            if (bTrim) { GenCommon.Line(b, 2, v + ".bindTrim = true;"); }
         }
         string dif = HtmlText.NodeAttr(n.attrs, "data-if");
         if (dif == "") { dif = HtmlText.NodeAttr(n.attrs, "z-show"); }
@@ -646,9 +688,13 @@ class GenHtml {
     // 走自己的构造协议，void 元素无内容）。
     static void EmitContent(StringBuilder b, WDoc wd, WNode n, int idx) {
         string v = "v" + idx;
+        string tpl = "";
         for (int k = 0; k < n.items.Count; k = k + 1) {
             WItem it = n.items[k];
             if (it.kid < 0) {
+                if (it.text.IndexOf("{{") >= 0) {
+                    tpl = tpl + it.text;
+                }
                 GenCommon.Line(b, 2, v + ".AddText(\""
                                + GenCommon.Esc(it.text) + "\");");
             } else {
@@ -657,6 +703,9 @@ class GenHtml {
                 GenCommon.Line(b, 2, "Html.AddChild(" + v + ", v"
                                + it.kid + ");");
             }
+        }
+        if (tpl != "") {
+            GenCommon.Line(b, 2, v + ".bindTpl = \"" + GenCommon.Esc(tpl) + "\";");
         }
     }
 
