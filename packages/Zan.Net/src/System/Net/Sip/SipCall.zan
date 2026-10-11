@@ -1,0 +1,134 @@
+using System;
+
+namespace System.Net.Sip;
+
+// SIP 呼叫状态枚举常量。
+class SipCallState {
+    static const int Idle = 0;        // 空闲
+    static const int Calling = 1;     // 呼叫中（INVITE 已发出）
+    static const int Ringing = 2;     // 对方振铃中（180 Ringing）
+    static const int Connected = 3;   // 通话已接通（200 OK + ACK 握手完成）
+    static const int Terminating = 4; // 正在挂断（BYE / CANCEL 发出）
+    static const int Terminated = 5;  // 通话已结束 / 挂断
+}
+
+// SIP 呼叫会话（Call Dialog）实体，表示一个完整的双向语音通话。
+class SipCall {
+    string callId;
+    string callerUri;
+    string calleeUri;
+    string localTag;
+    string remoteTag;
+    int cseq;
+    int state;
+    int localRtpPort;
+    string remoteRtpHost;
+    int remoteRtpPort;
+    SdpMessage localSdp;
+    SdpMessage remoteSdp;
+    RtpChannel rtpChannel;
+    long connectedAt;
+    int lastStatusCode;
+    string lastReason;
+
+    SipCall(string callId, string caller, string callee, string tag, int seq, int localRtpPort) {
+        this.callId = callId;
+        this.callerUri = caller;
+        this.calleeUri = callee;
+        this.localTag = tag;
+        this.remoteTag = "";
+        this.cseq = seq;
+        this.state = SipCallState.Idle;
+        this.localRtpPort = localRtpPort;
+        this.remoteRtpHost = "";
+        this.remoteRtpPort = 0;
+        this.localSdp = null;
+        this.remoteSdp = null;
+        this.rtpChannel = null;
+        this.connectedAt = 0;
+        this.lastStatusCode = 0;
+        this.lastReason = "";
+    }
+
+    public string GetCallId() { return this.callId; }
+    public string GetCallerUri() { return this.callerUri; }
+    public string GetCalleeUri() { return this.calleeUri; }
+    public string GetLocalTag() { return this.localTag; }
+    public string GetRemoteTag() { return this.remoteTag; }
+    public void SetRemoteTag(string tag) { this.remoteTag = tag; }
+    public int GetCSeq() { return this.cseq; }
+    public void SetCSeq(int seq) { this.cseq = seq; }
+    public int NextCSeq() {
+        this.cseq = this.cseq + 1;
+        return this.cseq;
+    }
+
+    public int GetState() { return this.state; }
+    public void SetState(int s) {
+        this.state = s;
+        if (s == SipCallState.Connected && this.connectedAt == 0) {
+            this.connectedAt = Stopwatch.GetMilliseconds();
+        }
+    }
+
+    public bool IsActive() {
+        return this.state == SipCallState.Calling || this.state == SipCallState.Ringing || this.state == SipCallState.Connected;
+    }
+
+    public bool IsConnected() {
+        return this.state == SipCallState.Connected;
+    }
+
+    public SdpMessage GetLocalSdp() { return this.localSdp; }
+    public void SetLocalSdp(SdpMessage sdp) { this.localSdp = sdp; }
+
+    public SdpMessage GetRemoteSdp() { return this.remoteSdp; }
+    public void SetRemoteSdp(SdpMessage sdp) {
+        this.remoteSdp = sdp;
+        if (sdp != null) {
+            if (sdp.GetConnectionIp().Length > 0) {
+                this.remoteRtpHost = sdp.GetConnectionIp();
+            }
+            if (sdp.GetMediaPort() > 0) {
+                this.remoteRtpPort = sdp.GetMediaPort();
+            }
+        }
+    }
+
+    public int GetLocalRtpPort() { return this.localRtpPort; }
+    public string GetRemoteRtpHost() { return this.remoteRtpHost; }
+    public int GetRemoteRtpPort() { return this.remoteRtpPort; }
+
+    public int GetLastStatusCode() { return this.lastStatusCode; }
+    public void SetLastStatus(int code, string reason) {
+        this.lastStatusCode = code;
+        this.lastReason = reason;
+    }
+    public string GetLastReason() { return this.lastReason; }
+
+    // 计算当前已接通通话时长（秒）。
+    public int GetDurationSeconds() {
+        if (this.connectedAt == 0) { return 0; }
+        long diff = Stopwatch.GetMilliseconds() - this.connectedAt;
+        if (diff < 0) { return 0; }
+        return (int)(diff / 1000);
+    }
+
+    // 获取或创建语音流 RTP 媒体通道。
+    public RtpChannel GetOrCreateRtpChannel() {
+        if (this.rtpChannel != null) { return this.rtpChannel; }
+        if (this.remoteRtpPort > 0 && this.remoteRtpHost.Length > 0) {
+            this.rtpChannel = new RtpChannel(this.localRtpPort, this.remoteRtpHost, this.remoteRtpPort);
+        }
+        return this.rtpChannel;
+    }
+
+    // 释放通话资源与媒体通道。
+    void Close() {
+        this.state = SipCallState.Terminated;
+        if (this.rtpChannel != null) {
+            this.rtpChannel.Close();
+            this.rtpChannel = null;
+        }
+    }
+}

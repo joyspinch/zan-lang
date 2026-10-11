@@ -1,0 +1,192 @@
+using System;
+using System.Net.Sockets;
+
+namespace System.Net.Sip;
+
+// RTP 数据包（RFC 3550）——VoIP 语音流实时传输容器。
+class RtpPacket {
+    int version;
+    bool marker;
+    int payloadType;
+    int sequenceNumber;
+    long timestamp;
+    long ssrc;
+    byte[] payload;
+
+    RtpPacket() {
+        this.version = 2;
+        this.marker = false;
+        this.payloadType = 0; // PCMU
+        this.sequenceNumber = 0;
+        this.timestamp = 0;
+        this.ssrc = 12345678;
+        this.payload = null;
+    }
+
+    // 快速创建 RTP 音频包。
+    static RtpPacket Create(int pt, int seq, long ts, long ssrcVal, byte[] data) {
+        RtpPacket p = new RtpPacket();
+        p.payloadType = pt;
+        p.sequenceNumber = seq & 65535;
+        p.timestamp = ts & 4294967295;
+        p.ssrc = ssrcVal & 4294967295;
+        p.payload = data;
+        return p;
+    }
+
+    public int GetVersion() { return this.version; }
+    public bool GetMarker() { return this.marker; }
+    public void SetMarker(bool m) { this.marker = m; }
+    public int GetPayloadType() { return this.payloadType; }
+    public void SetPayloadType(int pt) { this.payloadType = pt; }
+    public int GetSequenceNumber() { return this.sequenceNumber; }
+    public void SetSequenceNumber(int seq) { this.sequenceNumber = seq & 65535; }
+    public long GetTimestamp() { return this.timestamp; }
+    public void SetTimestamp(long ts) { this.timestamp = ts & 4294967295; }
+    public long GetSsrc() { return this.ssrc; }
+    public void SetSsrc(long s) { this.ssrc = s & 4294967295; }
+    public byte[] GetPayload() { return this.payload; }
+    public void SetPayload(byte[] data) { this.payload = data; }
+
+    // 编码为大端序字节数组（RFC 3550 固定头部 12 字节 + payload）。
+    byte[] Encode() {
+        int payloadLen = this.payload != null ? this.payload.Length : 0;
+        byte[] buf = new byte[12 + payloadLen];
+
+        // Byte 0: V=2, P=0, X=0, CC=0 -> 0x80
+        buf[0] = 128;
+
+        // Byte 1: M (1 bit) | PT (7 bits)
+        int b1 = (this.payloadType & 127);
+        if (this.marker) {
+            b1 = b1 | 128;
+        }
+        buf[1] = (byte)b1;
+
+        // Byte 2..3: Sequence number (16-bit)
+        buf[2] = (byte)((this.sequenceNumber >> 8) & 255);
+        buf[3] = (byte)(this.sequenceNumber & 255);
+
+        // Byte 4..7: Timestamp (32-bit)
+        buf[4] = (byte)((this.timestamp >> 24) & 255);
+        buf[5] = (byte)((this.timestamp >> 16) & 255);
+        buf[6] = (byte)((this.timestamp >> 8) & 255);
+        buf[7] = (byte)(this.timestamp & 255);
+
+        // Byte 8..11: SSRC (32-bit)
+        buf[8] = (byte)((this.ssrc >> 24) & 255);
+        buf[9] = (byte)((this.ssrc >> 16) & 255);
+        buf[10] = (byte)((this.ssrc >> 8) & 255);
+        buf[11] = (byte)(this.ssrc & 255);
+
+        // Payload
+        if (payloadLen > 0) {
+            for (int i = 0; i < payloadLen; i = i + 1) {
+                buf[12 + i] = this.payload[i];
+            }
+        }
+
+        return buf;
+    }
+
+    // 从缓冲区解码 RTP 包。
+    static RtpPacket Decode(byte[] buf, int offset, int length) {
+        if (buf == null || length < 12) { return null; }
+        int b0 = buf[offset] & 255;
+        int version = (b0 >> 6) & 3;
+        if (version != 2) { return null; } // 仅支持 RTP v2
+
+        int b1 = buf[offset + 1] & 255;
+        bool marker = (b1 & 128) != 0;
+        int pt = b1 & 127;
+
+        int seq = ((buf[offset + 2] & 255) << 8) | (buf[offset + 3] & 255);
+
+        long ts = (((long)(buf[offset + 4] & 255)) << 24)
+                | (((long)(buf[offset + 5] & 255)) << 16)
+                | (((long)(buf[offset + 6] & 255)) << 8)
+                | ((long)(buf[offset + 7] & 255));
+
+        long ssrc = (((long)(buf[offset + 8] & 255)) << 24)
+                  | (((long)(buf[offset + 9] & 255)) << 16)
+                  | (((long)(buf[offset + 10] & 255)) << 8)
+                  | ((long)(buf[offset + 11] & 255));
+
+        int payloadLen = length - 12;
+        byte[] payloadData = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i = i + 1) {
+            payloadData[i] = buf[offset + 12 + i];
+        }
+
+        RtpPacket p = new RtpPacket();
+        p.version = version;
+        p.marker = marker;
+        p.payloadType = pt;
+        p.sequenceNumber = seq;
+        p.timestamp = ts;
+        p.ssrc = ssrc;
+        p.payload = payloadData;
+        return p;
+    }
+}
+
+// 轻量级 RTP 媒体通道——封装 UDP 传输语音采样帧。
+class RtpChannel {
+    UdpClient udp;
+    string remoteHost;
+    int remotePort;
+    int localPort;
+    int nextSeq;
+    long nextTimestamp;
+    long ssrc;
+
+    RtpChannel(int localPort, string remoteHost, int remotePort) {
+        this.localPort = localPort;
+        this.remoteHost = remoteHost;
+        this.remotePort = remotePort;
+        this.nextSeq = 1;
+        this.nextTimestamp = 0;
+        this.ssrc = Stopwatch.GetMilliseconds() & 16777215;
+        if (localPort > 0) {
+            this.udp = UdpClient.Bind("0.0.0.0", localPort);
+        }
+        if (this.udp == null) {
+            this.udp = new UdpClient();
+        }
+    }
+
+    public int GetLocalPort() { return this.localPort; }
+    public string GetRemoteHost() { return this.remoteHost; }
+    public int GetRemotePort() { return this.remotePort; }
+
+    // 发送封装好的 RTP 包。
+    async int SendRtpAsync(RtpPacket packet) {
+        byte[] data = packet.Encode();
+        return await this.udp.SendBytesToAsync(data, data.Length, this.remoteHost, this.remotePort);
+    }
+
+    // 自动按递增序号与时间戳发送一段音频载荷（如 20ms G.711，增量 160 采样点）。
+    async int SendAudioFrameAsync(byte[] pcmData, int payloadType, int sampleIncrement) {
+        RtpPacket pkt = RtpPacket.Create(payloadType, this.nextSeq, this.nextTimestamp, this.ssrc, pcmData);
+        this.nextSeq = (this.nextSeq + 1) & 65535;
+        this.nextTimestamp = (this.nextTimestamp + sampleIncrement) & 4294967295;
+        return await SendRtpAsync(pkt);
+    }
+
+    // 接收远端发来的 RTP 音频包。
+    RtpPacket RecvRtp(int maxBytes) {
+        byte[] buf = new byte[maxBytes];
+        int n = this.udp.RecvBytesFrom(buf, maxBytes);
+        if (n >= 12) {
+            return RtpPacket.Decode(buf, 0, n);
+        }
+        return null;
+    }
+
+    // 关闭通道与底层套接字。
+    void Close() {
+        if (this.udp != null) {
+            this.udp.Close();
+        }
+    }
+}

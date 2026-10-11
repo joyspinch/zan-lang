@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Sip;
+
+// SDP（RFC 4566）会话描述协议实现，用于 VoIP 通话协商音视频媒体格式、IP 与 RTP 端口。
+class SdpMessage {
+    int version;
+    string originUser;
+    long sessionId;
+    long sessionVersion;
+    string connectionIp;
+    string sessionName;
+    string mediaType;
+    int mediaPort;
+    int payloadType;
+    string codec;
+    int sampleRate;
+    List<string> attributes;
+
+    SdpMessage() {
+        this.version = 0;
+        this.originUser = "-";
+        this.sessionId = Stopwatch.GetMilliseconds();
+        this.sessionVersion = 1;
+        this.connectionIp = "127.0.0.1";
+        this.sessionName = "ZanCall";
+        this.mediaType = "audio";
+        this.mediaPort = 0;
+        this.payloadType = 0; // 默认 0: PCMU (G.711u)
+        this.codec = "PCMU";
+        this.sampleRate = 8000;
+        this.attributes = new List<string>();
+    }
+
+    // 快速创建默认的语音通话 SDP 描述（G.711u, 8000Hz）。
+    static SdpMessage CreateAudio(string ip, int rtpPort) {
+        return SdpMessage.CreateAudioWithCodec(ip, rtpPort, 0, "PCMU", 8000);
+    }
+
+    // 创建指定编码的语音通话 SDP 描述。
+    static SdpMessage CreateAudioWithCodec(string ip, int rtpPort, int pt, string codecName, int rate) {
+        SdpMessage sdp = new SdpMessage();
+        sdp.connectionIp = ip;
+        sdp.mediaPort = rtpPort;
+        sdp.payloadType = pt;
+        sdp.codec = codecName;
+        sdp.sampleRate = rate;
+        sdp.attributes.Add("rtpmap:" + Convert.ToString(pt) + " " + codecName + "/" + Convert.ToString(rate));
+        sdp.attributes.Add("sendrecv");
+        return sdp;
+    }
+
+    public string GetConnectionIp() { return this.connectionIp; }
+    public int GetMediaPort() { return this.mediaPort; }
+    public int GetPayloadType() { return this.payloadType; }
+    public string GetCodec() { return this.codec; }
+    public int GetSampleRate() { return this.sampleRate; }
+    public List<string> GetAttributes() { return this.attributes; }
+
+    // 添加自定义属性。
+    void AddAttribute(string attr) {
+        this.attributes.Add(attr);
+    }
+
+    // 序列化为规范的 SDP 字符串。
+    string Serialize() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("v=");
+        sb.Append(Convert.ToString(this.version));
+        sb.Append("\r\n");
+
+        sb.Append("o=");
+        sb.Append(this.originUser);
+        sb.Append(" ");
+        sb.Append(Convert.ToString(this.sessionId));
+        sb.Append(" ");
+        sb.Append(Convert.ToString(this.sessionVersion));
+        sb.Append(" IN IP4 ");
+        sb.Append(this.connectionIp);
+        sb.Append("\r\n");
+
+        sb.Append("s=");
+        sb.Append(this.sessionName);
+        sb.Append("\r\n");
+
+        sb.Append("c=IN IP4 ");
+        sb.Append(this.connectionIp);
+        sb.Append("\r\n");
+
+        sb.Append("t=0 0\r\n");
+
+        sb.Append("m=");
+        sb.Append(this.mediaType);
+        sb.Append(" ");
+        sb.Append(Convert.ToString(this.mediaPort));
+        sb.Append(" RTP/AVP ");
+        sb.Append(Convert.ToString(this.payloadType));
+        sb.Append("\r\n");
+
+        for (int i = 0; i < this.attributes.Count; i = i + 1) {
+            sb.Append("a=");
+            sb.Append(this.attributes[i]);
+            sb.Append("\r\n");
+        }
+
+        return sb.ToString();
+    }
+
+    // 解析 SDP 文本并提取连接信息与媒体端口。
+    static SdpMessage Parse(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        SdpMessage sdp = new SdpMessage();
+        int pos = 0;
+        int len = text.Length;
+        while (pos < len) {
+            int nextLine = SdpMessage.FindLineEnd(text, pos);
+            int lineLen = (nextLine >= 0 ? nextLine : len) - pos;
+            string line = text.Substring(pos, lineLen).Trim();
+            if (line.Length >= 2 && (line[1] & 255) == 61) { // '='
+                int typeChar = line[0] & 255;
+                string val = line.Substring(2, line.Length - 2).Trim();
+                if (typeChar == 99) { // 'c'
+                    // "IN IP4 192.168.1.1"
+                    int lastSp = val.LastIndexOf(" ");
+                    if (lastSp >= 0) {
+                        sdp.connectionIp = val.Substring(lastSp + 1, val.Length - lastSp - 1).Trim();
+                    } else {
+                        sdp.connectionIp = val;
+                    }
+                } else if (typeChar == 109) { // 'm'
+                    // "audio 40000 RTP/AVP 0 8"
+                    int sp1 = val.IndexOf(" ");
+                    if (sp1 > 0) {
+                        sdp.mediaType = val.Substring(0, sp1).Trim();
+                        int sp2 = val.IndexOf(" ", sp1 + 1);
+                        if (sp2 > sp1) {
+                            string portStr = val.Substring(sp1 + 1, sp2 - sp1 - 1).Trim();
+                            sdp.mediaPort = Convert.ToInt32(portStr);
+                            int sp3 = val.IndexOf(" ", sp2 + 1);
+                            if (sp3 > sp2) {
+                                // 提取后续第一个格式
+                                string fmtStr = val.Substring(sp3 + 1, val.Length - sp3 - 1).Trim();
+                                int spaceAfterFmt = fmtStr.IndexOf(" ");
+                                if (spaceAfterFmt > 0) {
+                                    fmtStr = fmtStr.Substring(0, spaceAfterFmt).Trim();
+                                }
+                                if (fmtStr.Length > 0) {
+                                    sdp.payloadType = Convert.ToInt32(fmtStr);
+                                }
+                            }
+                        }
+                    }
+                } else if (typeChar == 115) { // 's'
+                    sdp.sessionName = val;
+                } else if (typeChar == 97) { // 'a'
+                    sdp.attributes.Add(val);
+                    if (val.StartsWith("rtpmap:")) {
+                        // "rtpmap:0 PCMU/8000"
+                        int colon = val.IndexOf(":");
+                        int sp = val.IndexOf(" ", colon + 1);
+                        if (sp > colon) {
+                            int slash = val.IndexOf("/", sp + 1);
+                            if (slash > sp) {
+                                sdp.codec = val.Substring(sp + 1, slash - sp - 1).Trim();
+                                string rateStr = val.Substring(slash + 1, val.Length - slash - 1).Trim();
+                                sdp.sampleRate = Convert.ToInt32(rateStr);
+                            }
+                        }
+                    }
+                }
+            }
+            if (nextLine < 0) { break; }
+            pos = nextLine;
+            if (pos < len && (text[pos] & 255) == 13) { pos = pos + 1; }
+            if (pos < len && (text[pos] & 255) == 10) { pos = pos + 1; }
+        }
+        return sdp;
+    }
+
+    static int FindLineEnd(string s, int from) {
+        int i = from;
+        while (i < s.Length) {
+            int c = s[i] & 255;
+            if (c == 13 || c == 10) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

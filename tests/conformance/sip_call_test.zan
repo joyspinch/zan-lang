@@ -1,0 +1,224 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.Sip;
+using System.Threading;
+
+class Program {
+    static void TestSdpSerializationAndParse() {
+        SdpMessage sdp = SdpMessage.CreateAudio("192.168.1.50", 40000);
+        string text = sdp.Serialize();
+        if (text.IndexOf("c=IN IP4 192.168.1.50") < 0) {
+            Console.WriteLine("FAIL: sdp c line");
+            Environment.Exit(1);
+        }
+        if (text.IndexOf("m=audio 40000 RTP/AVP 0") < 0) {
+            Console.WriteLine("FAIL: sdp m line");
+            Environment.Exit(2);
+        }
+
+        SdpMessage parsed = SdpMessage.Parse(text);
+        if (parsed == null || parsed.GetConnectionIp() != "192.168.1.50" || parsed.GetMediaPort() != 40000 || parsed.GetPayloadType() != 0) {
+            Console.WriteLine("FAIL: sdp parse");
+            Environment.Exit(3);
+        }
+        if (parsed.GetCodec() != "PCMU" || parsed.GetSampleRate() != 8000) {
+            Console.WriteLine("FAIL: sdp rtpmap parse");
+            Environment.Exit(4);
+        }
+        Console.WriteLine("sdp serialize and parse ok");
+    }
+
+    static void TestRtpPacketEncodeDecode() {
+        byte[] pcm = new byte[160]; // 20ms G.711u 采样
+        for (int i = 0; i < 160; i = i + 1) {
+            pcm[i] = (byte)(i & 255);
+        }
+        RtpPacket pkt = RtpPacket.Create(0, 101, 16000, 99998888, pcm);
+        pkt.SetMarker(true);
+        byte[] wire = pkt.Encode();
+        if (wire == null || wire.Length != 172) { // 12 header + 160 payload
+            Console.WriteLine("FAIL: rtp encode length");
+            Environment.Exit(5);
+        }
+        if ((wire[0] & 255) != 128) { // V=2
+            Console.WriteLine("FAIL: rtp version");
+            Environment.Exit(6);
+        }
+        if ((wire[1] & 255) != 128) { // M=1, PT=0
+            Console.WriteLine("FAIL: rtp marker and pt");
+            Environment.Exit(7);
+        }
+
+        RtpPacket decoded = RtpPacket.Decode(wire, 0, wire.Length);
+        if (decoded == null || !decoded.GetMarker() || decoded.GetPayloadType() != 0 || decoded.GetSequenceNumber() != 101) {
+            Console.WriteLine("FAIL: rtp decode header");
+            Environment.Exit(8);
+        }
+        if (decoded.GetTimestamp() != 16000 || decoded.GetSsrc() != 99998888) {
+            Console.WriteLine("FAIL: rtp decode ts or ssrc");
+            Environment.Exit(9);
+        }
+        byte[] decPayload = decoded.GetPayload();
+        if (decPayload == null || decPayload.Length != 160 || (decPayload[159] & 255) != 159) {
+            Console.WriteLine("FAIL: rtp decode payload");
+            Environment.Exit(10);
+        }
+        Console.WriteLine("rtp packet encode and decode ok");
+    }
+
+    static void TestSipCallModel() {
+        SipCall call = new SipCall("call-001", "sip:alice@127.0.0.1", "sip:bob@127.0.0.1", "tag-alice", 1, 30000);
+        if (call.GetState() != SipCallState.Idle || call.IsActive()) {
+            Console.WriteLine("FAIL: call initial state");
+            Environment.Exit(11);
+        }
+        call.SetState(SipCallState.Calling);
+        if (!call.IsActive() || call.IsConnected()) {
+            Console.WriteLine("FAIL: call calling state");
+            Environment.Exit(12);
+        }
+        call.SetState(SipCallState.Connected);
+        if (!call.IsConnected()) {
+            Console.WriteLine("FAIL: call connected state");
+            Environment.Exit(13);
+        }
+        call.Close();
+        if (call.GetState() != SipCallState.Terminated || call.IsActive()) {
+            Console.WriteLine("FAIL: call terminated state");
+            Environment.Exit(14);
+        }
+        Console.WriteLine("sip call model ok");
+    }
+
+    // 模拟服务端响应来电：接收 INVITE -> 回复 180 Ringing -> 回复 200 OK (带 SDP) -> 接收 ACK -> 接收 BYE -> 回复 200 OK
+    static async void RunMockSipServer(int port, int clientPort) {
+        UdpClient server = UdpClient.Bind("127.0.0.1", port);
+        if (server == null) { return; }
+
+        bool callDone = false;
+        while (!callDone) {
+            if (Socket.IsReadable(server.GetSocket())) {
+                string d = server.RecvFrom(65536);
+                SipMessage msg = SipMessage.Parse(d);
+                if (msg != null && msg.GetIsRequest()) {
+                    string method = msg.GetMethod();
+                    if (method == "INVITE") {
+                        string via = msg.Header("Via");
+                        string from = msg.Header("From");
+                        string to = msg.Header("To");
+                        string callId = msg.Header("Call-ID");
+                        string cseq = msg.Header("CSeq");
+
+                        // 1. 发送 180 Ringing
+                        SipMessage ring = SipMessage.Response(180, "Ringing");
+                        ring.Add("Via", via);
+                        ring.Add("From", from);
+                        ring.Add("To", to + ";tag=bob-tag-999");
+                        ring.Add("Call-ID", callId);
+                        ring.Add("CSeq", cseq);
+                        await server.SendToAsync(ring.Serialize(), "127.0.0.1", clientPort);
+
+                        await Task.Delay(50);
+
+                        // 2. 发送 200 OK，携带对端 SDP（协商音频端口 50002）
+                        SipMessage ok = SipMessage.Response(200, "OK");
+                        ok.Add("Via", via);
+                        ok.Add("From", from);
+                        ok.Add("To", to + ";tag=bob-tag-999");
+                        ok.Add("Call-ID", callId);
+                        ok.Add("CSeq", cseq);
+                        ok.Add("Contact", "<sip:bob@127.0.0.1:" + Convert.ToString(port) + ">");
+                        ok.Add("Content-Type", "application/sdp");
+                        SdpMessage bobSdp = SdpMessage.CreateAudio("127.0.0.1", 50002);
+                        ok.SetBody(bobSdp.Serialize());
+                        await server.SendToAsync(ok.Serialize(), "127.0.0.1", clientPort);
+                    } else if (method == "ACK") {
+                        // 握手完成
+                    } else if (method == "BYE") {
+                        // 3. 挂断确认 200 OK
+                        string via = msg.Header("Via");
+                        string from = msg.Header("From");
+                        string to = msg.Header("To");
+                        string callId = msg.Header("Call-ID");
+                        string cseq = msg.Header("CSeq");
+
+                        SipMessage byeOk = SipMessage.Response(200, "OK");
+                        byeOk.Add("Via", via);
+                        byeOk.Add("From", from);
+                        byeOk.Add("To", to);
+                        byeOk.Add("Call-ID", callId);
+                        byeOk.Add("CSeq", cseq);
+                        await server.SendToAsync(byeOk.Serialize(), "127.0.0.1", clientPort);
+                        callDone = true;
+                    }
+                }
+            } else {
+                await Task.Delay(10);
+            }
+        }
+        server.Close();
+    }
+
+    static async Task TestSipCallWorkflow() {
+        int serverPort = 5062;
+        int clientPort = 5064;
+        RunMockSipServer(serverPort, clientPort);
+        await Task.Delay(50);
+
+        SipClient client = new SipClient("127.0.0.1", serverPort, "alice");
+        client.SetLocalIp("127.0.0.1");
+        client.SetLocalSipPort(clientPort);
+
+        // 发起语音呼叫（拨打电话），本地准备接收音频的 RTP 端口为 50000
+        SipCall call = await client.InviteAsync("alice", "bob", 50000);
+        if (call == null) {
+            Console.WriteLine("FAIL: invite call is null");
+            Environment.Exit(15);
+        }
+        if (!call.IsConnected()) {
+            Console.WriteLine("FAIL: invite call not connected");
+            Environment.Exit(16);
+        }
+        if (call.GetRemoteTag() != "bob-tag-999") {
+            Console.WriteLine("FAIL: remote tag mismatch: " + call.GetRemoteTag());
+            Environment.Exit(17);
+        }
+        if (call.GetRemoteRtpPort() != 50002 || call.GetRemoteRtpHost() != "127.0.0.1") {
+            Console.WriteLine("FAIL: remote rtp negotiation: port=" + Convert.ToString(call.GetRemoteRtpPort()) + " host=" + call.GetRemoteRtpHost());
+            Environment.Exit(18);
+        }
+
+        // 验证语音媒体通道
+        RtpChannel channel = call.GetOrCreateRtpChannel();
+        if (channel == null || channel.GetRemotePort() != 50002) {
+            Console.WriteLine("FAIL: rtp channel init");
+            Environment.Exit(19);
+        }
+
+        // 发送一帧语音数据包
+        byte[] voiceFrame = new byte[160];
+        int sent = await channel.SendAudioFrameAsync(voiceFrame, 0, 160);
+        if (sent <= 0) {
+            Console.WriteLine("FAIL: send audio frame");
+            Environment.Exit(20);
+        }
+
+        // 挂断通话
+        bool hungUp = await client.HangupAsync(call);
+        if (!hungUp || call.GetState() != SipCallState.Terminated) {
+            Console.WriteLine("FAIL: hangup failed");
+            Environment.Exit(21);
+        }
+
+        Console.WriteLine("sip call workflow (invite, ringing, 200 ok, ack, rtp, bye) ok");
+    }
+
+    static async void Main() {
+        TestSdpSerializationAndParse();
+        TestRtpPacketEncodeDecode();
+        TestSipCallModel();
+        await TestSipCallWorkflow();
+        Console.WriteLine("ALL_SIP_TESTS_OK");
+    }
+}

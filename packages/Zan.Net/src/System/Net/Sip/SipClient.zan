@@ -5,19 +5,19 @@ using System.Threading;
 
 namespace System.Net.Sip;
 
-// 基于 UDP 的 SIP user-agent 客户端（RFC 3261）——仅信令侧。
-// 范围：非 INVITE 客户端事务（OPTIONS 保活/能力探测、
-// REGISTER），带 Timer E/F 重传（500ms 翻倍至 4s，总计 32s）。
-// 未实现 Digest 认证、INVITE 会话和 RTP 媒体；
-// 401/407 响应原样返回给调用方，由应用
-// 决定如何处理。
-// 用法：
-// if (r != null && r.status == 200) { ... }
+// 基于 UDP 的 SIP user-agent 客户端（RFC 3261）——支持信令与语音通话（VoIP 打电话）。
+// 包含：
+// 1. 注册与探测（REGISTER、OPTIONS）。
+// 2. 语音呼叫会话控制（INVITE 发起呼叫、180 Ringing 振铃通知、200 OK 接听、ACK 三路握手）。
+// 3. 挂断通话（BYE）与取消呼叫（CANCEL）。
+// 4. SDP 媒体参数协商与 RTP 语音通道关联。
 class SipClient {
     string host;
     int port;
     string localTag;
     int cseq;
+    string localIp;
+    int localSipPort;
 
     // 为单个 SIP 服务器/代理创建客户端。
     SipClient(string host, int port, string tag) {
@@ -25,7 +25,25 @@ class SipClient {
         this.port = port;
         this.localTag = "zan";
         this.cseq = 1;
+        this.localIp = "127.0.0.1";
+        this.localSipPort = 5060;
         if (tag.Length > 0) { this.localTag = tag; }
+    }
+
+    public void SetLocalIp(string ip) {
+        this.localIp = ip;
+    }
+
+    public string GetLocalIp() {
+        return this.localIp;
+    }
+
+    public void SetLocalSipPort(int p) {
+        this.localSipPort = p;
+    }
+
+    public int GetLocalSipPort() {
+        return this.localSipPort;
     }
 
     // 发送 OPTIONS 并等待最终响应——标准的
@@ -51,6 +69,177 @@ class SipClient {
         return r;
     }
 
+    // 发起语音呼叫（打电话）——执行标准 INVITE 信令流程与 SDP 协商，
+    // 完成与对方的通话握手（INVITE -> 180 Ringing -> 200 OK -> ACK）。
+    // 若对方接听，返回状态为 Connected 的 SipCall 对象；
+    // 包含双方协商就绪的 RTP 语音端口与 IP。
+    async SipCall InviteAsync(string callerUser, string calleeUser, int localRtpPort) {
+        SdpMessage sdp = SdpMessage.CreateAudio(this.localIp, localRtpPort);
+        return await InviteWithSdpAsync(callerUser, calleeUser, sdp, localRtpPort);
+    }
+
+    // 发起带自定义 SDP 参数的语音呼叫。
+    async SipCall InviteWithSdpAsync(string callerUser, string calleeUser, SdpMessage localSdp, int localRtpPort) {
+        int seq = this.cseq;
+        this.cseq = this.cseq + 1;
+
+        string callerUri = "sip:" + callerUser + "@" + this.host;
+        string calleeUri = "sip:" + calleeUser + "@" + this.host;
+        string callId = this.localTag + "-" + Convert.ToString(seq) + "-" + Convert.ToString(Stopwatch.GetMilliseconds());
+
+        SipCall call = new SipCall(callId, callerUri, calleeUri, this.localTag, seq, localRtpPort);
+        call.SetLocalSdp(localSdp);
+        call.SetState(SipCallState.Calling);
+
+        SipMessage req = SipMessage.Request("INVITE", calleeUri);
+        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : 5060);
+        req.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
+        req.Add("Max-Forwards", "70");
+        req.Add("From", "<" + callerUri + ">;tag=" + this.localTag);
+        req.Add("To", "<" + calleeUri + ">");
+        req.Add("Call-ID", callId);
+        req.Add("CSeq", Convert.ToString(seq) + " INVITE");
+        req.Add("Contact", "<" + callerUri + ">");
+        req.Add("Content-Type", "application/sdp");
+        string sdpBody = localSdp.Serialize();
+        req.SetBody(sdpBody);
+
+        UdpClient udp = null;
+        if (this.localSipPort > 0) {
+            udp = UdpClient.Bind(this.localIp, this.localSipPort);
+        }
+        if (udp == null) {
+            udp = new UdpClient();
+        }
+        string wire = req.Serialize();
+        long start = Stopwatch.GetMilliseconds();
+        long nextSend = start;
+        int interval = 500;
+        bool done = false;
+
+        while (!done && Stopwatch.GetMilliseconds() - start < 32000) {
+            if (Stopwatch.GetMilliseconds() >= nextSend) {
+                int _s = await udp.SendToAsync(wire, this.host, this.port);
+                nextSend = Stopwatch.GetMilliseconds() + interval;
+                interval = interval * 2;
+                if (interval > 4000) { interval = 4000; }
+            }
+
+            if (Socket.IsReadable(udp.GetSocket())) {
+                string d = udp.RecvFrom(65536);
+                SipMessage resp = SipMessage.Parse(d);
+                if (resp != null && !resp.GetIsRequest()) {
+                    int status = resp.GetStatus();
+                    call.SetLastStatus(status, resp.GetReason());
+
+                    // 180 Ringing 或 183 Session Progress：记录远端状态为振铃
+                    if (status == 180 || status == 183) {
+                        call.SetState(SipCallState.Ringing);
+                        string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                        if (remoteTag.Length > 0) {
+                            call.SetRemoteTag(remoteTag);
+                        }
+                    } else if (status >= 200 && status < 300) {
+                        // 200 OK：对方接听电话！提取 Remote Tag 与对端 SDP，发送 ACK 确认握手
+                        string remoteTag = SipMessage.ExtractTag(resp.Header("To"));
+                        if (remoteTag.Length > 0) {
+                            call.SetRemoteTag(remoteTag);
+                        }
+                        string remoteSdpText = resp.GetBody();
+                        if (remoteSdpText.Length > 0) {
+                            SdpMessage remoteSdp = SdpMessage.Parse(remoteSdpText);
+                            call.SetRemoteSdp(remoteSdp);
+                        }
+                        call.SetState(SipCallState.Connected);
+
+                        // 发送 ACK 请求（完成三路握手）
+                        await SendAckAsync(udp, call, calleeUri, branch);
+
+                        // 创建就绪的 RTP 音频流媒体通道
+                        call.GetOrCreateRtpChannel();
+                        done = true;
+                    } else if (status >= 300) {
+                        // 呼叫被拒绝、无人接听或失败（486 Busy, 603 Decline 等）
+                        call.SetState(SipCallState.Terminated);
+                        // RFC 3261 要求对非 2xx 响应也发送 ACK
+                        await SendAckAsync(udp, call, calleeUri, branch);
+                        done = true;
+                    }
+                }
+            } else {
+                await Task.Delay(20);
+            }
+        }
+
+        udp.Close();
+        if (!done) {
+            call.SetState(SipCallState.Terminated);
+            call.SetLastStatus(408, "Request Timeout");
+        }
+        return call;
+    }
+
+    // 发送 ACK 确认请求。
+    async int SendAckAsync(UdpClient udp, SipCall call, string targetUri, string branch) {
+        SipMessage ack = SipMessage.Request("ACK", targetUri);
+        ack.Add("Via", "SIP/2.0/UDP " + this.localIp + ":5060;branch=" + branch);
+        ack.Add("Max-Forwards", "70");
+        ack.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
+        string toHeader = "<" + call.GetCalleeUri() + ">";
+        if (call.GetRemoteTag().Length > 0) {
+            toHeader = toHeader + ";tag=" + call.GetRemoteTag();
+        }
+        ack.Add("To", toHeader);
+        ack.Add("Call-ID", call.GetCallId());
+        ack.Add("CSeq", Convert.ToString(call.GetCSeq()) + " ACK");
+        string wire = ack.Serialize();
+        return await udp.SendToAsync(wire, this.host, this.port);
+    }
+
+    // 挂断通话（BYE）。在通话接通后发送 BYE 请求终止会话。
+    async bool HangupAsync(SipCall call) {
+        if (call == null) { return false; }
+        call.SetState(SipCallState.Terminating);
+
+        int seq = call.NextCSeq();
+        SipMessage bye = SipMessage.Request("BYE", call.GetCalleeUri());
+        string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+        bye.Add("Via", "SIP/2.0/UDP " + this.localIp + ":5060;branch=" + branch);
+        bye.Add("Max-Forwards", "70");
+        bye.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
+        string toHeader = "<" + call.GetCalleeUri() + ">";
+        if (call.GetRemoteTag().Length > 0) {
+            toHeader = toHeader + ";tag=" + call.GetRemoteTag();
+        }
+        bye.Add("To", toHeader);
+        bye.Add("Call-ID", call.GetCallId());
+        bye.Add("CSeq", Convert.ToString(seq) + " BYE");
+
+        SipMessage r = await TransactAsync(bye);
+        call.Close();
+        return r != null && r.GetStatus() == 200;
+    }
+
+    // 取消呼叫（CANCEL）。在对方尚未接听（Calling 或 Ringing 阶段）终止呼叫。
+    async bool CancelAsync(SipCall call) {
+        if (call == null) { return false; }
+        call.SetState(SipCallState.Terminating);
+
+        SipMessage cancel = SipMessage.Request("CANCEL", call.GetCalleeUri());
+        string branch = "z9hG4bK" + this.localTag + Convert.ToString(call.GetCSeq()) + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
+        cancel.Add("Via", "SIP/2.0/UDP " + this.localIp + ":5060;branch=" + branch);
+        cancel.Add("Max-Forwards", "70");
+        cancel.Add("From", "<" + call.GetCallerUri() + ">;tag=" + call.GetLocalTag());
+        cancel.Add("To", "<" + call.GetCalleeUri() + ">");
+        cancel.Add("Call-ID", call.GetCallId());
+        cancel.Add("CSeq", Convert.ToString(call.GetCSeq()) + " CANCEL");
+
+        SipMessage r = await TransactAsync(cancel);
+        call.Close();
+        return r != null && r.GetStatus() == 200;
+    }
+
     // 填入每个请求都必须包含的头部（RFC 3261 8.1.1）：
     // Via（随机 branch）、Max-Forwards、From/To、Call-ID、CSeq。
     void AddCommon(SipMessage req, string aor, string method) {
@@ -58,7 +247,8 @@ class SipClient {
         this.cseq = this.cseq + 1;
         string branch = "z9hG4bK" + this.localTag + Convert.ToString(seq)
             + Convert.ToString(Stopwatch.GetMilliseconds() & 65535);
-        req.Add("Via", "SIP/2.0/UDP 0.0.0.0:5060;branch=" + branch);
+        string portStr = Convert.ToString(this.localSipPort > 0 ? this.localSipPort : 5060);
+        req.Add("Via", "SIP/2.0/UDP " + this.localIp + ":" + portStr + ";branch=" + branch);
         req.Add("Max-Forwards", "70");
         req.Add("From", "<" + aor + ">;tag=" + this.localTag);
         req.Add("To", "<" + aor + ">");
@@ -69,9 +259,15 @@ class SipClient {
 
     // 非 INVITE 客户端事务：500ms 起重传并翻倍至 4s，
     // 32s 后放弃（Timer E/F）。临时 1xx 响应不重启计时器、直接跳过；
-    // 首个最终（&gt;=200）响应生效。超时返回 null。
+    // 首个最终（>=200）响应生效。超时返回 null。
     async SipMessage TransactAsync(SipMessage req) {
-        UdpClient udp = new UdpClient();
+        UdpClient udp = null;
+        if (this.localSipPort > 0) {
+            udp = UdpClient.Bind(this.localIp, this.localSipPort);
+        }
+        if (udp == null) {
+            udp = new UdpClient();
+        }
         string wire = req.Serialize();
         long start = Stopwatch.GetMilliseconds();
         long nextSend = start;
