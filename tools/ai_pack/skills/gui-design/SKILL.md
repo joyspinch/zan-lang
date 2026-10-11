@@ -911,6 +911,11 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   后续元素在写入新坐标前必须先解除旧约束（`DesignMakeFloat(f)`），并在累加前一项实际渲染宽高（`LayoutW()` /
   `LayoutH()`）与指定间距 `gapPx` 之后写入 `f.fx`/`f.fy` 并重声明矩形（`DesignDeclareRect(f)`），确保在不同盒模型
   或内联尺寸下均保持严格像素级间距一致。
+- **自由画布辅助参考线（Canvas Guide Lines）的标尺拖出交互与智能磁吸优先**：
+  设计器支持标尺后，辅助参考线是从标尺直接延展的一等公民排版辅助工具。从顶部标尺（Y轴）或左侧标尺（X轴）
+  按下拖出时，需实时以逆投影逻辑像素计算位置并在光标旁展示坐标浮层（Tooltip，如 `X: 120px`）；
+  拖回标尺或拖离视口松开时自动删除对应参考线。在移动或拉伸组件的磁吸计算（`FreeSnapLines`）中，
+  参考线坐标必须作为一等公民候选线并入，使得组件边缘与中轴线能够精准吸附到参考线上，实现工业级排版手感。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
