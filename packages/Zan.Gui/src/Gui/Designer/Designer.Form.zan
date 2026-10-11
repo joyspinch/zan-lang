@@ -19,6 +19,21 @@ class DesignMoveStart {
     }
 }
 
+class MultiResizeItem {
+    public FormField field;
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public MultiResizeItem(FormField field, int x, int y, int w, int h) {
+        this.field = field;
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+    }
+}
+
 // 排版/操作功能区命令定义强类型实体（消除 aIcons / aLabels / aTips / aActs 平行列表反模式）。
 class RibbonAlignCommand {
     public string icon;
@@ -721,6 +736,37 @@ partial class Designer {
         f.designSource.Set("dock", JsonValue.NewNum("0"));
     }
 
+    List<FormField> GetMultiSelItems() {
+        List<FormField> r = new List<FormField>();
+        if (sel != null && !sel.locked) { r.Add(sel); }
+        if (freeExtra != null) {
+            for (int i = 0; i < freeExtra.Count; i = i + 1) {
+                FormField f = freeExtra[i];
+                if (f != null && !f.locked && r.IndexOf(f) < 0) { r.Add(f); }
+            }
+        }
+        return r;
+    }
+
+    Rect GetMultiSelWorldRect(List<FormField> items) {
+        if (items == null || items.Count == 0) { return new Rect(0, 0, 0, 0); }
+        int minX = this.DesignWorldX(items[0]);
+        int minY = this.DesignWorldY(items[0]);
+        int maxX = minX + items[0].LayoutW();
+        int maxY = minY + items[0].LayoutH();
+        for (int i = 1; i < items.Count; i = i + 1) {
+            int x = this.DesignWorldX(items[i]);
+            int y = this.DesignWorldY(items[i]);
+            int r = x + items[i].LayoutW();
+            int b = y + items[i].LayoutH();
+            if (x < minX) { minX = x; }
+            if (y < minY) { minY = y; }
+            if (r > maxX) { maxX = r; }
+            if (b > maxY) { maxY = b; }
+        }
+        return new Rect(minX, minY, maxX - minX, maxY - minY);
+    }
+
     int designResizeLeft;
     int designResizeTop;
     int designResizeRight;
@@ -728,6 +774,7 @@ partial class Designer {
     int designResizeMouseX;
     int designResizeMouseY;
     bool designResizeMoved;
+    List<MultiResizeItem> multiResizeStarts;
     int designDropSlot;
     int designDragLeft;
     int designDragTop;
@@ -892,7 +939,7 @@ partial class Designer {
                 c.DrawGlyphIn("lock", r.Right() - lsz - app.Scale(2),
                     r.y + app.Scale(2), lsz, lsz, lsz,
                     Style.Part(app, "designer", "accent", "", "warning", "", Style.SNormal()).BgOr(0));
-            } else if (layoutMode == 1) {
+            } else if (layoutMode == 1 && (freeExtra == null || freeExtra.Count == 0)) {
                 int hs = app.Scale(7);
                 for (int hn = 0; hn < 8; hn = hn + 1) {
                     if (!Designer.FreeHandleAllowed(f, hn)) { continue; }
@@ -908,6 +955,48 @@ partial class Designer {
         }
         for (int i = 0; i < f.KidCount(); i = i + 1) {
             this.RenderDesignOverlay(app, c, f.KidAt(i), ox, oy, psMilli);
+        }
+    }
+
+    // 绘制多选外包围盒与统一变换控制手柄 (Multi-Selection Bounding Box & Handles)
+    void RenderMultiSelBounds(App app, Canvas c, int ox, int oy, int psMilli) {
+        if (preview || layoutMode != 1 || sel == null || freeExtra == null || freeExtra.Count < 1) { return; }
+        List<FormField> items = this.GetMultiSelItems();
+        if (items.Count < 2) { return; }
+        Rect wRect = this.GetMultiSelWorldRect(items);
+        if (wRect.width <= 0 || wRect.height <= 0) { return; }
+
+        int vx = ox + wRect.x * psMilli / 1000;
+        int vy = oy + wRect.y * psMilli / 1000;
+        int vw = wRect.width * psMilli / 1000;
+        int vh = wRect.height * psMilli / 1000;
+
+        int accentCol = Style.Part(app, "designer", "accent", "", "", "", Style.SNormal()).BgOr(0);
+        int borderCol = Style.Fade(accentCol, 180);
+
+        // 绘制多选整体外包围盒虚线边框
+        c.DrawRect(vx - 2, vy - 2, vw + 4, vh + 4, borderCol, 1);
+
+        // 绘制多选包围盒顶部信息徽标
+        int fsTiny = Style.FontFallback(app, "tiny");
+        if (fsTiny <= 0) { fsTiny = Style.FontFallback(app, "small"); }
+        string badgeText = Convert.ToString(items.Count) + Designer.T(" items  ", " 项  ")
+            + Convert.ToString(wRect.width) + " × " + Convert.ToString(wRect.height) + " px";
+        int bw = Canvas.MeasureText(badgeText, fsTiny) + app.Scale(10);
+        int bh = app.Scale(16);
+        int bx = vx + (vw - bw) / 2;
+        int by = vy - bh - app.Scale(4);
+        c.FillRoundRect(bx, by, bw, bh, app.Scale(3), 0xDD1E1E1E);
+        c.DrawRoundRect(bx, by, bw, bh, app.Scale(3), borderCol, 1);
+        c.DrawText(bx + app.Scale(5), by + app.Scale(1), badgeText, 0xFFFFFFFF, fsTiny);
+
+        // 绘制多选外包围盒的 8 个外角/边缘控制手柄
+        int hs = app.Scale(8);
+        for (int hn = 0; hn < 8; hn = hn + 1) {
+            int hx = Designer.FreeHandleX(hn, vx, vw) - hs / 2;
+            int hy = Designer.FreeHandleY(hn, vy, vh) - hs / 2;
+            c.FillRoundRect(hx, hy, hs, hs, app.Scale(2), accentCol);
+            c.DrawRoundRect(hx, hy, hs, hs, app.Scale(2), 0xFFFFFFFF, 1);
         }
     }
 
@@ -1522,6 +1611,7 @@ partial class Designer {
             for (int i = 0; i < fields.Count; i = i + 1) {
                 this.RenderDesignOverlay(app, c, fields[i], ox, oy, psMilli);
             }
+            this.RenderMultiSelBounds(app, c, ox, oy, psMilli);
         }
         c.PopClip();
 
@@ -1639,28 +1729,62 @@ partial class Designer {
                 started = true;
             }
             if (!started && !preview && free && sel != null && !sel.locked && this.DesignVisible(sel)) {
-                Rect selected = this.DesignViewRect(sel, ox, oy, psMilli);
-                int sx = selected.x;
-                int sy = selected.y;
-                int sw2 = selected.width;
-                int sh2 = selected.height;
-                int hs = app.Scale(10);
-                for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
-                    if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
-                    int hx = FreeHandleX(hn, sx, sw2);
-                    int hy = FreeHandleY(hn, sy, sh2);
-                    if (InRect(app.mouseX, app.mouseY,
-                            hx - hs, hy - hs, hs * 2, hs * 2)) {
-                        freeResizing = true;
-                        freeResizeH = hn;
-                        designResizeMoved = false;
-                        designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
-                        designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
-                        designResizeLeft = this.DesignWorldX(sel);
-                        designResizeTop = this.DesignWorldY(sel);
-                        designResizeRight = designResizeLeft + sel.LayoutW();
-                        designResizeBottom = designResizeTop + sel.LayoutH();
-                        started = true;
+                List<FormField> mItems = this.GetMultiSelItems();
+                if (mItems.Count > 1) {
+                    Rect mw = this.GetMultiSelWorldRect(mItems);
+                    int sx = ox + mw.x * psMilli / 1000;
+                    int sy = oy + mw.y * psMilli / 1000;
+                    int sw2 = mw.width * psMilli / 1000;
+                    int sh2 = mw.height * psMilli / 1000;
+                    int hs = app.Scale(10);
+                    for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                        int hx = FreeHandleX(hn, sx, sw2);
+                        int hy = FreeHandleY(hn, sy, sh2);
+                        if (InRect(app.mouseX, app.mouseY, hx - hs, hy - hs, hs * 2, hs * 2)) {
+                            freeResizing = true;
+                            freeResizeH = hn;
+                            designResizeMoved = false;
+                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                            designResizeLeft = mw.x;
+                            designResizeTop = mw.y;
+                            designResizeRight = mw.x + mw.width;
+                            designResizeBottom = mw.y + mw.height;
+                            multiResizeStarts = new List<MultiResizeItem>();
+                            for (int mi = 0; mi < mItems.Count; mi = mi + 1) {
+                                FormField mf = mItems[mi];
+                                multiResizeStarts.Add(new MultiResizeItem(mf,
+                                    this.DesignWorldX(mf), this.DesignWorldY(mf),
+                                    mf.LayoutW(), mf.LayoutH()));
+                            }
+                            started = true;
+                        }
+                    }
+                } else {
+                    Rect selected = this.DesignViewRect(sel, ox, oy, psMilli);
+                    int sx = selected.x;
+                    int sy = selected.y;
+                    int sw2 = selected.width;
+                    int sh2 = selected.height;
+                    int hs = app.Scale(10);
+                    for (int hn = 0; hn < 8 && !started; hn = hn + 1) {
+                        if (!Designer.FreeHandleAllowed(sel, hn)) { continue; }
+                        int hx = FreeHandleX(hn, sx, sw2);
+                        int hy = FreeHandleY(hn, sy, sh2);
+                        if (InRect(app.mouseX, app.mouseY,
+                                hx - hs, hy - hs, hs * 2, hs * 2)) {
+                            freeResizing = true;
+                            freeResizeH = hn;
+                            designResizeMoved = false;
+                            designResizeMouseX = (app.mouseX - ox) * 1000 / psMilli;
+                            designResizeMouseY = (app.mouseY - oy) * 1000 / psMilli;
+                            designResizeLeft = this.DesignWorldX(sel);
+                            designResizeTop = this.DesignWorldY(sel);
+                            designResizeRight = designResizeLeft + sel.LayoutW();
+                            designResizeBottom = designResizeTop + sel.LayoutH();
+                            multiResizeStarts = null;
+                            started = true;
+                        }
                     }
                 }
             }
@@ -1799,7 +1923,13 @@ partial class Designer {
             int dy = (app.mouseY - oy) * 1000 / psMilli - designResizeMouseY;
             if (!designResizeMoved && (dx != 0 || dy != 0)) {
                 this.PushUndo();
-                this.DesignMakeFloat(sel);
+                if (multiResizeStarts != null && multiResizeStarts.Count > 1) {
+                    for (int mi = 0; mi < multiResizeStarts.Count; mi = mi + 1) {
+                        this.DesignMakeFloat(multiResizeStarts[mi].field);
+                    }
+                } else {
+                    this.DesignMakeFloat(sel);
+                }
                 designResizeMoved = true;
             }
             if (designResizeMoved) {
@@ -1812,11 +1942,13 @@ partial class Designer {
                 bool moveT = hn == 0 || hn == 1 || hn == 2;
                 bool moveR = hn == 2 || hn == 3 || hn == 4;
                 bool moveB = hn == 4 || hn == 5 || hn == 6;
-                if (sel.IsFullWidthBanner()) {
+                bool isMulti = (multiResizeStarts != null && multiResizeStarts.Count > 1);
+
+                if (!isMulti && sel.IsFullWidthBanner()) {
                     moveL = false;
                     moveR = false;
                 }
-                if (sel.IsFixedHeight()) {
+                if (!isMulti && sel.IsFixedHeight()) {
                     moveT = false;
                     moveB = false;
                 }
@@ -1849,29 +1981,66 @@ partial class Designer {
                         if (r[1] >= 0) { freeGuideY = r[1] + baseY; }
                     }
                 }
-                int minW = FormField.MinSafeWOf(sel.ftype);
-                int minH = FormField.MinSafeHOf(sel.ftype);
-                if (right - left < minW) {
-                    if (moveL) { left = right - minW; } else { right = left + minW; }
+                if (isMulti) {
+                    // 多选联合等比 / 自由比例缩放
+                    int origW = designResizeRight - designResizeLeft;
+                    int origH = designResizeBottom - designResizeTop;
+                    int newW = right - left;
+                    int newH = bottom - top;
+                    if (newW < 20) { newW = 20; }
+                    if (newH < 20) { newH = 20; }
+                    // Shift 等比约束
+                    if (Modifiers.HasShift(app.window.EventMods()) && (hn == 0 || hn == 2 || hn == 4 || hn == 6)) {
+                        if (origW > 0 && origH > 0) {
+                            newH = origH * newW / origW;
+                            if (hn == 0 || hn == 2) { top = bottom - newH; }
+                            else { bottom = top + newH; }
+                        }
+                    }
+                    for (int mi = 0; mi < multiResizeStarts.Count; mi = mi + 1) {
+                        MultiResizeItem it = multiResizeStarts[mi];
+                        int relX = it.x - designResizeLeft;
+                        int relY = it.y - designResizeTop;
+                        int newX = origW > 0 ? left + relX * newW / origW : left;
+                        int newY = origH > 0 ? top + relY * newH / origH : top;
+                        int newFieldW = origW > 0 ? it.w * newW / origW : it.w;
+                        int newFieldH = origH > 0 ? it.h * newH / origH : it.h;
+                        if (newFieldW < 10) { newFieldW = 10; }
+                        if (newFieldH < 10) { newFieldH = 10; }
+                        int itBaseX = this.DesignEditOriginX(it.field);
+                        int itBaseY = this.DesignEditOriginY(it.field);
+                        it.field.fx = newX - itBaseX;
+                        it.field.fy = newY - itBaseY;
+                        it.field.fw = newFieldW;
+                        it.field.fh = newFieldH;
+                        this.DesignDeclareRect(it.field);
+                    }
+                    this.MarkDocDirty();
+                } else {
+                    int minW = FormField.MinSafeWOf(sel.ftype);
+                    int minH = FormField.MinSafeHOf(sel.ftype);
+                    if (right - left < minW) {
+                        if (moveL) { left = right - minW; } else { right = left + minW; }
+                    }
+                    if (bottom - top < minH) {
+                        if (moveT) { top = bottom - minH; } else { bottom = top + minH; }
+                    }
+                    if (sel.IsFullWidthBanner()) {
+                        Rect content = this.DesignContentRect(this.DesignParentHost(sel));
+                        int hostW = this.DesignLogical(content.width);
+                        if (hostW <= 0) { hostW = sel.LayoutW(); }
+                        left = baseX;
+                        right = baseX + hostW;
+                    }
+                    if (sel.IsFixedHeight()) {
+                        bottom = top + FormField.DefaultHFor(sel.ftype);
+                    }
+                    sel.fx = left - baseX;
+                    sel.fy = top - baseY;
+                    sel.fw = right - left;
+                    sel.fh = bottom - top;
+                    this.MarkDocDirty();
                 }
-                if (bottom - top < minH) {
-                    if (moveT) { top = bottom - minH; } else { bottom = top + minH; }
-                }
-                if (sel.IsFullWidthBanner()) {
-                    Rect content = this.DesignContentRect(this.DesignParentHost(sel));
-                    int hostW = this.DesignLogical(content.width);
-                    if (hostW <= 0) { hostW = sel.LayoutW(); }
-                    left = baseX;
-                    right = baseX + hostW;
-                }
-                if (sel.IsFixedHeight()) {
-                    bottom = top + FormField.DefaultHFor(sel.ftype);
-                }
-                sel.fx = left - baseX;
-                sel.fy = top - baseY;
-                sel.fw = right - left;
-                sel.fh = bottom - top;
-                this.MarkDocDirty();
             }
             app.RequestRedraw();
         }
@@ -1949,6 +2118,7 @@ partial class Designer {
             freeDragHasMoved = false;
             freeResizing = false;
             designResizeMoved = false;
+            multiResizeStarts = null;
             designMoves = null;
             freePanning = false;
             this.freeGuideX = 0 - 1;
