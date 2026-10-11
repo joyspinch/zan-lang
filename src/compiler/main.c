@@ -4414,6 +4414,7 @@ int main(int argc, char **argv) {
     /* 内部辅助逻辑 */
     int check_leaks_opt = -1;
     int arc_guard_opt = -1;
+    int runtime_checks_opt = -1;
     bool runtime_checks = true;
     /* 内部辅助逻辑 */
     bool strict_runtime = false;
@@ -4490,7 +4491,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--no-arc-guard") == 0) {
             arc_guard_opt = 0;
         } else if (strcmp(argv[i], "--no-runtime-checks") == 0) {
+            runtime_checks_opt = 0;
             runtime_checks = false;
+        } else if (strcmp(argv[i], "--runtime-checks") == 0) {
+            runtime_checks_opt = 1;
+            runtime_checks = true;
         } else if (strcmp(argv[i], "--strict-runtime") == 0) {
             strict_runtime = true;
         } else if (strcmp(argv[i], "--deny-warnings") == 0) {
@@ -5273,6 +5278,9 @@ int main(int argc, char **argv) {
                                            : (debug_info && !publish_mode);
     bool arc_guard = arc_guard_opt >= 0 ? arc_guard_opt != 0
                                         : (debug_info && !publish_mode);
+    if (runtime_checks_opt < 0 && publish_mode) {
+        runtime_checks = false;
+    }
     /* 内部辅助实现 */
     bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
     zan_arena_t *ir_arena = zan_arena_new();
