@@ -49,6 +49,10 @@ class PropertyGrid : Control {
     Action<string> BeforeChange;
     // 最近被用户改动的行号（-1 = 尚无改动；Rebuild 后复位）。
     int hitRow;
+    // 已折叠的分组标题集合（支持一键折叠收起不常用大类）。
+    List<string> collapsedSections;
+    // 分组点击命中的部件ID池。
+    List<int> sectionClickIds;
 
     // 构造空属性表：未绑定任何行，空态文本为 ""（不画）。
     PropertyGrid() {
@@ -59,8 +63,30 @@ class PropertyGrid : Control {
         scroll = new SignalInt(0);
         Empty = "";
         hitRow = 0 - 1;
+        collapsedSections = new List<string>();
+        sectionClickIds = new List<int>();
         wiresOwnEvents = true;
         Change = new UiEvent();
+    }
+
+    public bool IsSectionCollapsed(string sec) {
+        if (sec == null || collapsedSections == null) { return false; }
+        for (int i = 0; i < collapsedSections.Count; i = i + 1) {
+            if (collapsedSections[i] == sec) { return true; }
+        }
+        return false;
+    }
+
+    public void ToggleSection(string sec) {
+        if (sec == null) { return; }
+        if (collapsedSections == null) { collapsedSections = new List<string>(); }
+        for (int i = 0; i < collapsedSections.Count; i = i + 1) {
+            if (collapsedSections[i] == sec) {
+                collapsedSections.RemoveAt(i);
+                return;
+            }
+        }
+        collapsedSections.Add(sec);
     }
 
     // 控件类型标识（"PropertyGrid"）。
@@ -262,9 +288,25 @@ class PropertyGrid : Control {
     // 单行高度（逻辑像素，绘制时按 DPI 缩放）。
     int RowHeight(App app) { return app.Scale(38); }
 
-    // 全部行的高度（宿主据此在自己的滚动区里给出槽位）。
+    // 全部行的高度（宿主据此在自己的滚动区里给出槽位，折叠分组下的项不占高）。
     int ContentHeight(App app) {
-        return data.Count * this.RowHeight(app);
+        int rowH = this.RowHeight(app);
+        int totalH = 0;
+        string curSec = "";
+        bool curCollapsed = false;
+        for (int i = 0; i < data.Count; i = i + 1) {
+            PropSpec p = data[i];
+            if (p.kind == 5) {
+                curSec = p.label;
+                curCollapsed = this.IsSectionCollapsed(curSec);
+                totalH = totalH + rowH;
+            } else {
+                if (!curCollapsed) {
+                    totalH = totalH + rowH;
+                }
+            }
+        }
+        return totalH;
     }
 
     // 布局测量：首选高度 = 全部行高之和。
@@ -332,10 +374,21 @@ class PropertyGrid : Control {
         int y = by - scroll.Get();
 
         c.PushClip(bx, by, bw, bh);
+        string curSec = "";
+        bool curCollapsed = false;
         for (int i = 0; i < data.Count; i = i + 1) {
+            PropSpec p = data[i];
+            if (p.kind == 5) {
+                curSec = p.label;
+                curCollapsed = this.IsSectionCollapsed(curSec);
+            } else {
+                if (curCollapsed) {
+                    continue;
+                }
+            }
+
             bool onscreen = y + rowH > by && y < by + bh;
             if (onscreen) {
-                PropSpec p = data[i];
                 bool rowHover = Ui.Over(app, bx, y, rowW, rowH)
                     && app.mouseY >= by && app.mouseY < by + bh;
                 if (rowHover && p.kind != 5) {
@@ -344,14 +397,25 @@ class PropertyGrid : Control {
                 if (p.kind == 5) {
                     int secBarH = app.Scale(24);
                     int secY = y + (rowH - secBarH) / 2;
-                    c.FillRoundRect(bx, secY, rowW, secBarH, app.Scale(3), t.bgSecondary);
+                    bool secHover = Ui.Over(app, bx, secY, rowW, secBarH)
+                        && app.mouseY >= by && app.mouseY < by + bh;
+                    if (secHover) {
+                        c.FillRoundRect(bx, secY, rowW, secBarH, app.Scale(3), t.bgHover);
+                    } else {
+                        c.FillRoundRect(bx, secY, rowW, secBarH, app.Scale(3), t.bgSecondary);
+                    }
                     c.DrawRoundRect(bx, secY, rowW, secBarH, app.Scale(3), t.borderSecondary, 1);
+                    if (Ui.ClickedIn(app, bx, secY, rowW, secBarH)) {
+                        this.ToggleSection(curSec);
+                        app.RequestRedraw();
+                    }
                     int indW = app.Scale(3);
                     int indH = app.Scale(12);
                     int indY = secY + (secBarH - indH) / 2;
                     c.FillRoundRect(bx + app.Scale(6), indY, indW, indH, app.Scale(1), t.primary);
+                    string arrow = curCollapsed ? "▶ " : "▼ ";
                     c.DrawText(bx + app.Scale(15), Canvas.CenterTextY(secY, secBarH, fs),
-                        Ellipsis.Fit(p.label, rowW - app.Scale(20), fs), sectionStyle.FgOr(t.textPrimary), fs);
+                        arrow + Ellipsis.Fit(p.label, rowW - app.Scale(30), fs), sectionStyle.FgOr(t.textPrimary), fs);
                 } else {
                     c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
                         Ellipsis.Fit(p.label, labelW - t.gapSmall, fs),
@@ -373,7 +437,7 @@ class PropertyGrid : Control {
                             int segW = ew / optCount;
                             for (int si = 0; si < optCount; si = si + 1) {
                                 int tw = Canvas.MeasureText(p.options[si], fs);
-                                if (tw + app.Scale(6) > segW) {
+                                if (tw + app.Scale(16) > segW) {
                                     useSegmented = false;
                                     break;
                                 }
@@ -431,7 +495,7 @@ class PropertyGrid : Control {
                                 }
                             }
                         } else {
-                            r.pick.Render(app, ex, ey, ew);
+                            r.pick.RenderIn(app, ex, ey, ew, eh);
                         }
                     } else if (p.kind == 1) {
 	                        // 整数行：[-] [可点击键入的输入框] [+]。
