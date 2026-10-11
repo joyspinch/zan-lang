@@ -939,6 +939,10 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   切忌直接把绝对渲染坐标 `LayoutX` 赋给 `fx`，否则嵌套容器内的组件将发生跳变脱离父容器；
   在执行“等宽”、“等高”或“等尺寸（宽高同时匹配）”时，必须自动调用 `DesignMakeFloat(f)` 解除流式/停靠约束，
   并调用 `DesignDeclareRect(f)` 持久化进设计文档（`designSource`），避免重载后尺寸丢失。
+- **F2 原地快捷重命名（Inline Rename HUD）的视口组件自适应锚定**：
+  原地重命名浮层绝不能简单固定在设计器视口/画布的静态绝对位置（如固定在左上角），而应在每帧渲染覆盖层（`RenderDesignOverlay`）
+  中实时缓存主选中项在视口中的屏幕几何（`lastSelViewRect`）；原地重命名浮层动态计算并水平居中锚定于组件上方，
+  遇到视口顶部边界时智能翻转至组件下方，并对视口边缘做严格钳制，提供就地编辑的自然交互，并配合确认/取消双操作与回车/Esc 响应。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
