@@ -265,7 +265,6 @@ class CompPropEditRow {
 }
 
 partial class Designer {
-    // 核心契约与语义定义。
     // designer 界面文案跟随宿主 UI 语言，通过 T(en, zh) 读取。
     static string lang = "en";
 
@@ -303,6 +302,13 @@ partial class Designer {
     // 工具箱中被折叠起来的分组标题（Visual Studio 风格的
     // 可折叠分组），按标题记住，跨帧保留。
     List<string> palFolded;
+
+    // 左侧面板选项卡：0 = 组件工具箱(Palette), 1 = 组件大纲树(Outline)
+    int palTab;
+    TreeView outlineTv;
+    List<TreeNode> outlineNodes;
+    List<FormField> outlineFields;
+    bool outlineSyncing;
 
     // 被设计窗口的布局模式：0 = 流式（24 列，form-builder
     // 风格），1 = 自由（绝对定位的设计画布，场景设计器风格）。
@@ -534,7 +540,6 @@ partial class Designer {
     }
 
     // 当前选中引用节点的组件属性声明缓存（组件文档根上的
-    // 图表配置契约与样式属性适配规范
     // 实例值存引用节点 extra 的 "props" 直通表，序列化/展开全链路
     // 复用既有通道。
     string compPropFor;
@@ -596,7 +601,6 @@ partial class Designer {
     bool colEdResizable;
     bool colEdEditable;
     // 扩展列声明（GenForm EmitColumn 消费的同一批键）：decimals
-    // 系统底层交互与数据流转契约
     // 五个布尔键的设计器侧归一枚举；pin 归一 left/right。
     int colEdDecimals;
     string colEdMoney;
@@ -761,6 +765,12 @@ partial class Designer {
         this.freePanY = 0;
         this.freePanning = false;
         this.freeExtra = new List<FormField>();
+        this.palFolded = new List<string>();
+        this.palTab = 0;
+        this.outlineTv = null;
+        this.outlineNodes = new List<TreeNode>();
+        this.outlineFields = new List<FormField>();
+        this.outlineSyncing = false;
         this.undoStack = new List<string>();
         this.redoStack = new List<string>();
         this.clipFields = new List<string>();
@@ -916,7 +926,6 @@ partial class Designer {
     // 标签切换行为开箱即可见。
     void Seed(App app) {
         activeContainer = null;
-        // 系统底层交互与数据流转契约
         AddField(0); fields[fields.Count - 1].span = 12;
         AddField(2); fields[fields.Count - 1].span = 12;
         AddField(3); fields[fields.Count - 1].span = 8;
@@ -2222,6 +2231,7 @@ partial class Designer {
     }
 
     // 把选中项移到同级的最前/最后（1=置顶，0=置底）。
+    // 在 Retained GUI 中，列表末尾项最后绘制（处于最上层），列表头部项最先绘制（处于最底层）。
     void SelToEdge(int top) {
         if (sel == null) { return; }
         FormField pc = ParentContainerOf(sel);
@@ -2229,8 +2239,8 @@ partial class Designer {
         if (pc != null) { list = pc.kids; }
         int idx = IndexIn(list, sel);
         if (idx < 0) { return; }
-        int to = 0;
-        if (top == 0) { to = list.Count - 1; }
+        int to = list.Count - 1;
+        if (top == 0) { to = 0; }
         if (to == idx) { return; }
         this.PushUndo();
         List<FormField> moved = ListMove(list, idx, to);
@@ -2584,8 +2594,8 @@ partial class Designer {
             else if (cc == 10) { this.SetSelLayoutMode(1, 9); }
             else if (cc == 11) { this.SetSelLayoutMode(1, 10); }
             else if (cc == 13) { this.SelToEdge(1); }
-            else if (cc == 14) { this.MoveSel(0 - 1); }
-            else if (cc == 15) { this.MoveSel(1); }
+            else if (cc == 14) { this.MoveSel(1); }
+            else if (cc == 15) { this.MoveSel(0 - 1); }
             else if (cc == 16) { this.SelToEdge(0); }
             else if (cc == 17) { this.ToggleLockSel(); }
             else if (cc == 19) { this.DuplicateSel(); }
@@ -2745,11 +2755,11 @@ partial class Designer {
                     DeleteSelGroup();
                     app.RequestRedraw();
                 } else if (kc == 33 && sel != null) {
-                    MoveSel(0 - 1);
+                    MoveSel(1);
                     msg = Designer.T("moved forward", "上移一层");
                     app.RequestRedraw();
                 } else if (kc == 34 && sel != null) {
-                    MoveSel(1);
+                    MoveSel(0 - 1);
                     msg = Designer.T("moved back", "下移一层");
                     app.RequestRedraw();
                 } else if (kc == 36 && Modifiers.HasCtrl(app.window.EventMods()) && sel != null) {
@@ -2928,15 +2938,129 @@ partial class Designer {
         if (Ui.Clicked(app, closeId)) { jsonOpen = false; }
     }
 
-    // --- 字段面板 -------------------------------------------------------
+    // --- 字段面板 / 大纲树 -------------------------------------------------
 
-    // 组件工具箱：一棵 TreeView（分组是目录，组件是叶子），
-    // 行的绘制、滚动、过滤、折叠全部由控件自己完成，这里
-    // 只负责喂数据和处理「选中 = 添加 / 按下 = 开始拖拽」。
+    // 组件工具箱与大纲树选项卡：
+    // palTab == 0: 组件工具箱 TreeView（分组与组件叶子）
+    // palTab == 1: 组件大纲树 TreeView（文档完整树状嵌套结构与即时选中）
     void RenderPalette(App app, Canvas c, Theme t, int px, int py, int pw, int ph) {
         if (pw < 20 || ph < 20) { return; }
-        this.EnsurePalette();
-        palTv.RenderInside(app, new Rect(px, py, pw, ph));
+        int tabH = app.Scale(28);
+        int tabW = (pw - app.Scale(6)) / 2;
+        int bType = 0; if (palTab == 0) { bType = 1; }
+        int oType = 0; if (palTab == 1) { oType = 1; }
+        int bId = SmallBtn(app, Designer.T("Palette", "组件库"), bType, px, py, tabW);
+        int oId = SmallBtn(app, Designer.T("Outline", "大纲树"), oType, px + tabW + app.Scale(6), py, tabW);
+        if (Ui.Clicked(app, bId) && palTab != 0) { palTab = 0; app.RequestRedraw(); }
+        if (Ui.Clicked(app, oId) && palTab != 1) { palTab = 1; app.RequestRedraw(); }
+
+        int bodyY = py + tabH + app.Scale(6);
+        int bodyH = ph - tabH - app.Scale(6);
+        if (bodyH < 20) { return; }
+        if (palTab == 0) {
+            this.EnsurePalette();
+            palTv.RenderInside(app, new Rect(px, bodyY, pw, bodyH));
+        } else {
+            this.EnsureOutline();
+            outlineTv.RenderInside(app, new Rect(px, bodyY, pw, bodyH));
+        }
+    }
+
+    void EnsureOutline() {
+        if (outlineTv == null) {
+            outlineNodes = new List<TreeNode>();
+            outlineFields = new List<FormField>();
+            outlineTv = new TreeView();
+            outlineTv.Empty = Designer.T("No components in window.", "窗口中暂无组件。");
+            outlineTv.OnSelect(() => { this.OnOutlineSelect(); });
+        }
+        this.BuildOutline();
+        outlineTv.Bind(outlineNodes);
+        this.SyncOutlineSelection();
+    }
+
+    void BuildOutline() {
+        outlineNodes = new List<TreeNode>();
+        outlineFields = new List<FormField>();
+
+        // 根节点：Form 窗口本体
+        string rootLbl = Designer.T("Form (Window)", "窗口 (Form)");
+        if (winTitle != "") { rootLbl = rootLbl + " · " + winTitle; }
+        TreeNode rootNode = TreeNode.Dir(rootLbl, 0, true);
+        rootNode.icon = "window";
+        rootNode.payload = "root";
+        outlineNodes.Add(rootNode);
+        outlineFields.Add(null);
+
+        this.AddOutlineChildren(null, 1);
+    }
+
+    void AddOutlineChildren(FormField parent, int depth) {
+        List<FormField> list = parent == null ? fields : parent.kids;
+        if (list == null) { return; }
+        for (int i = 0; i < list.Count; i = i + 1) {
+            FormField f = list[i];
+            if (f == null) { continue; }
+            string name = f.fname;
+            if (name == "") { name = FormField.TypeName(f.ftype); }
+            string lbl = name + " (" + FormField.TypeName(f.ftype) + ")";
+            if (f.dockSide == 1) { lbl = lbl + " [Top]"; }
+            else if (f.dockSide == 2) { lbl = lbl + " [Bottom]"; }
+            else if (f.dockSide == 3) { lbl = lbl + " [Left]"; }
+            else if (f.dockSide == 4) { lbl = lbl + " [Right]"; }
+            else if (f.dockSide == 5) { lbl = lbl + " [Fill]"; }
+            else if (f.position == 1) { lbl = lbl + " [Float]"; }
+
+            bool isContainer = FormField.IsContainerOf(f.ftype) || (f.kids != null && f.kids.Count > 0);
+            TreeNode node;
+            if (isContainer) {
+                node = TreeNode.Dir(lbl, depth, true);
+            } else {
+                node = TreeNode.FileIcon(lbl, depth, this.FieldIcon(f.ftype));
+            }
+            node.payload = f.fname;
+            outlineNodes.Add(node);
+            outlineFields.Add(f);
+
+            if (isContainer) {
+                this.AddOutlineChildren(f, depth + 1);
+            }
+        }
+    }
+
+    void OnOutlineSelect() {
+        if (outlineSyncing || outlineTv == null) { return; }
+        int idx = outlineTv.SelectedIndex();
+        if (idx < 0 || idx >= outlineFields.Count) { return; }
+        FormField target = outlineFields[idx];
+        outlineSyncing = true;
+        this.ClearExtraSel();
+        this.sel = target;
+        this.inspTab = 0;
+        if (target != null) {
+            if (this.DesignCanContain(target)) { this.activeContainer = target; }
+            else { this.activeContainer = DesignOwnerOf(target); }
+            this.msg = Designer.T("selected: ", "已选中：") + target.fname;
+        } else {
+            this.activeContainer = null;
+            this.msg = Designer.T("selected window root", "已选中窗口根节点");
+        }
+        outlineSyncing = false;
+    }
+
+    void SyncOutlineSelection() {
+        if (outlineSyncing || outlineTv == null || outlineFields == null) { return; }
+        int targetIdx = 0;
+        if (sel != null) {
+            for (int i = 1; i < outlineFields.Count; i = i + 1) {
+                if (outlineFields[i] == sel) { targetIdx = i; break; }
+            }
+        }
+        if (outlineTv.SelectedIndex() != targetIdx) {
+            outlineSyncing = true;
+            outlineTv.SelectIndex(targetIdx);
+            outlineSyncing = false;
+        }
     }
 
     // 惰性创建工具箱 TreeView，并在过滤串或用户组件数量变化时重建节点。
