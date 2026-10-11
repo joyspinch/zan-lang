@@ -2325,11 +2325,92 @@ partial class Designer {
                 f.required = primary.required;
             } else if (key == "wrap") {
                 f.wrap = primary.wrap;
+            } else if (key == "orient") {
+                f.tabOrient = primary.tabOrient;
+            } else if (key == "locked") {
+                f.locked = primary.locked;
             }
             this.DesignDeclareRect(f);
         }
         this.MarkDocDirty();
         this.msg = Designer.T("Batch updated: ", "已批量同步属性: ") + key + " (" + Convert.ToString(freeExtra.Count + 1) + ")";
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 多选批量操作：一键切换所有选中项锁定状态
+    void BatchToggleLock() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        bool anyUnlocked = !sel.locked;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] != null && !freeExtra[i].locked) { anyUnlocked = true; break; }
+        }
+        bool targetLocked = anyUnlocked;
+        sel.locked = targetLocked;
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            if (freeExtra[i] != null) { freeExtra[i].locked = targetLocked; }
+        }
+        this.MarkDocDirty();
+        int total = 1 + freeExtra.Count;
+        msg = targetLocked ?
+            Designer.T("Locked " + Convert.ToString(total) + " items", "已批量锁定 " + Convert.ToString(total) + " 个组件") :
+            Designer.T("Unlocked " + Convert.ToString(total) + " items", "已批量解锁 " + Convert.ToString(total) + " 个组件");
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 多选批量操作：一键清空所有选中项外边距
+    void BatchResetMargins() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        sel.margin = 0;
+        this.DesignDeclareRect(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (f != null && !f.locked) {
+                f.margin = 0;
+                this.DesignDeclareRect(f);
+            }
+        }
+        this.MarkDocDirty();
+        msg = Designer.T("Reset margins to 0", "已清空选中项外边距");
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 多选批量操作：一键清空所有选中项内边距
+    void BatchResetPadding() {
+        if (sel == null) { return; }
+        this.PushUndo();
+        sel.padding = 0;
+        this.DesignDeclareRect(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (f != null && !f.locked) {
+                f.padding = 0;
+                this.DesignDeclareRect(f);
+            }
+        }
+        this.MarkDocDirty();
+        msg = Designer.T("Reset padding to 0", "已清空选中项内边距");
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 多选批量操作：一键统一设置定位模式（0: 流式 Flow, 1: 浮动 Float）
+    void BatchSetPosition(int pos) {
+        if (sel == null) { return; }
+        this.PushUndo();
+        if (pos == 1) { this.DesignMakeFloat(sel); }
+        else { sel.position = 0; sel.fx = 0; sel.fy = 0; }
+        this.DesignDeclareRect(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (f != null && !f.locked) {
+                if (pos == 1) { this.DesignMakeFloat(f); }
+                else { f.position = 0; f.fx = 0; f.fy = 0; }
+                this.DesignDeclareRect(f);
+            }
+        }
+        this.MarkDocDirty();
+        msg = (pos == 1) ? Designer.T("Set all to Float (Absolute)", "已批量设为浮动定位") : Designer.T("Set all to Flow (Flex)", "已批量设为流式排版");
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
@@ -2392,23 +2473,46 @@ partial class Designer {
         if (pc == null) { fields = moved; } else { pc.kids = moved; }
     }
 
-    // 复制选中项，副本偏移一点并成为新的选中项。
+    // 复制选中项（支持多选批量创建副本），副本在容器局部坐标偏移 16px 并成为新的选中组。
     void DuplicateSel() {
         if (sel == null) { return; }
         this.PushUndo();
-        FormField nf = this.FieldFromJson(JsonValue.ParseLenient(this.FieldJson(sel).ToJson()));
-        nf.fx = sel.LayoutX() + 16;
-        nf.fy = sel.LayoutY() + 16;
-        nf.fw = sel.LayoutW();
-        nf.fh = sel.LayoutH();
-        nf.fname = FormField.TypeKey(nf.ftype) + Convert.ToString(seq);
-        nf.name = nf.fname;
-        seq = seq + 1;
-        FormField pc = ParentContainerOf(sel);
-        if (pc == null) { fields.Add(nf); } else { pc.kids.Add(nf); }
-        ClearExtraSel();
-        sel = nf;
-        msg = Designer.T("duplicated", "已复制");
+        List<FormField> targets = new List<FormField>();
+        targets.Add(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField ef = freeExtra[i];
+            if (ef != null && ef != sel && !targets.Contains(ef)) {
+                targets.Add(ef);
+            }
+        }
+        List<FormField> newCopies = new List<FormField>();
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            FormField orig = targets[i];
+            FormField nf = this.FieldFromJson(JsonValue.ParseLenient(this.FieldJson(orig).ToJson()));
+            nf.fx = orig.fx + 16;
+            nf.fy = orig.fy + 16;
+            nf.fw = orig.fw;
+            nf.fh = orig.fh;
+            this.RenameFresh(nf);
+            FormField pc = ParentContainerOf(orig);
+            if (pc == null) { fields.Add(nf); } else { pc.kids.Add(nf); }
+            this.DesignDeclareRect(nf);
+            newCopies.Add(nf);
+        }
+        if (newCopies.Count > 0) {
+            ClearExtraSel();
+            sel = newCopies[0];
+            for (int i = 1; i < newCopies.Count; i = i + 1) {
+                freeExtra.Add(newCopies[i]);
+            }
+            this.SyncFreeSelBase();
+            this.MarkDocDirty();
+            if (newCopies.Count == 1) {
+                msg = Designer.T("duplicated", "已创建副本");
+            } else {
+                msg = Designer.T("duplicated ", "已创建副本 ") + Convert.ToString(newCopies.Count) + Designer.T(" component(s)", " 个组件");
+            }
+        }
     }
 
     // --- 撤销 / 重做（整份设计 JSON 快照，同场景设计器） ----------
@@ -3064,6 +3168,8 @@ partial class Designer {
 
         this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+I", Designer.T("Spotlight Quick Insert", "快捷插入组件面板"), fs, fsTiny, titleCol, hintCol, border);
         curY = curY + app.Scale(24);
+        this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+X / C / V", Designer.T("Cut / Copy / Paste", "剪切 / 复制 / 粘贴"), fs, fsTiny, titleCol, hintCol, border);
+        curY = curY + app.Scale(24);
         this.DrawShortcutRow(app, c, col1X, curY, colW, "Ctrl+D", Designer.T("Duplicate Component", "创建副本"), fs, fsTiny, titleCol, hintCol, border);
         curY = curY + app.Scale(24);
         this.DrawShortcutRow(app, c, col1X, curY, colW, "F2", Designer.T("Rename Inline", "原地重命名"), fs, fsTiny, titleCol, hintCol, border);
@@ -3460,6 +3566,7 @@ partial class Designer {
                 if (cc == 1) { this.SelectAll(); app.RequestRedraw(); }
                 else if (cc == 26) { this.Undo(); app.RequestRedraw(); }
                 else if (cc == 25) { this.Redo(); app.RequestRedraw(); }
+                else if (cc == 24 && sel != null) { this.CutSel(); app.RequestRedraw(); }
                 else if (cc == 3) { this.CopySel(); app.RequestRedraw(); }
                 else if (cc == 22) { this.PasteClip(); app.RequestRedraw(); }
                 else if (cc == 4 && sel != null) { this.DuplicateSel(); app.RequestRedraw(); }
@@ -3476,6 +3583,9 @@ partial class Designer {
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 65 || kc == 97)) {
                     this.SelectAll();
+                    app.RequestRedraw();
+                } else if (hasCtrl && (kc == 88 || kc == 120) && sel != null) {
+                    this.CutSel();
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 67 || kc == 99)) {
                     this.CopySel();
