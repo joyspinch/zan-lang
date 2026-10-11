@@ -996,6 +996,15 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   工业级防误触必须同时满足两层严密防护：
   1. **屏幕位移容差校验**：两次点击在屏幕空间中的位移必须限制在极小容差内（如 `abs(dx) <= Scale(5) && abs(dy) <= Scale(5)`），只要产生拖拽位移或跨区域点击即刻重置，严禁触发代码跳转；
   2. **业务控件白名单与容器/静态项绝对排除**：容器类组件（Panel, Card, Tabs, Collapse 等）与静态纯展示组件（Label, Title, Divider, Tag, Badge 等）在排版时属于高频承载与对齐参照物，绝对禁止双击跳代码；只有明确具备交互业务事件的组件（Button, Input, Checkbox, Switch, Tree, DataGrid 等）或自定义组件引用（`compRef`，双击打开子设计稿）才允许双击导航。
+- **显式停靠组件（Docking Components）的防误转浮动防护**：
+  在自由画布上拖拽移动组件时，必须严格保护 `f.dockSide > 0` 的显式停靠组件（如 ToolStrip Dock.Top 或 StatusBar Dock.Bottom）。
+  严禁在移动起始（`DesignBeginMove`）或解除约束（`DesignMakeFloat`）中粗暴将组件的 `dockSide` 抹为 0 并改为 `position = 1`（绝对浮动定位）；
+  否则停靠组件一旦被降级为绝对浮动，将脱离正常文档流占位，导致后续从顶部 (0,0) 开始排列的流式容器直接遮挡浮动工具条，引发严重的视觉与交互倒退。
+- **全流式排版高度自动撑满（Fill Remaining Height）一键快捷动作**：
+  在全流式（Flex/Flow）布局下，组件撑满剩余高度的规范语义是 `position = 0`、`flexGrow = 1` 且 `fh = 0`（由弹性主轴自动分配撑满余量空间）。
+  若仅提供抽象的 `flexGrow` 整数输入，用户极难联想到高度填满需要将固定像素高度置 0。
+  工业级设计器必须在属性检查器（单选流式组件与多选批量编辑卡片）中直接提供显式的 `[ ↕ 自动撑满高度 (Fill) ]` 与 `[ 0 内容自适应 (Auto) ]` 快捷动作，
+  并在 Height 属性提示中清晰注明，一键消除认知障碍。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
