@@ -943,6 +943,10 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   原地重命名浮层绝不能简单固定在设计器视口/画布的静态绝对位置（如固定在左上角），而应在每帧渲染覆盖层（`RenderDesignOverlay`）
   中实时缓存主选中项在视口中的屏幕几何（`lastSelViewRect`）；原地重命名浮层动态计算并水平居中锚定于组件上方，
   遇到视口顶部边界时智能翻转至组件下方，并对视口边缘做严格钳制，提供就地编辑的自然交互，并配合确认/取消双操作与回车/Esc 响应。
+- **画布缩放重置与视口自适应归位（Zoom Reset & Fit to Window Viewport Reset）**：
+  在设计器中提供 100% 原始缩放（`Ctrl+0`）和适应窗口（`Ctrl+1` / `Fit to Window`）时，不能仅仅更新缩放比例 `winZoom`，
+  必须同步重置抓手平移偏移量（`freePanX = 0; freePanY = 0;`）。如果只改缩放比例而保留旧平移量，会导致画布内容缩放后飞出当前视口，
+  用户需要再次盲目拖拽抓手寻找设计内容。重置平移量后能确保设计窗口瞬间精确居中于当前工作区。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
