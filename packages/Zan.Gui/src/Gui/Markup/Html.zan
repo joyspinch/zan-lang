@@ -231,6 +231,9 @@ class Html {
         // 字段，ChildWindow.WireNode 的二次接线同源。
         string darg = HtmlText.NodeAttr(n.attrs, "data-arg");
         if (darg != "") { c.handlerArg = darg; }
+        if (n.text != "" && n.text.IndexOf("{{") >= 0 && c.bindTpl == "") {
+            c.bindTpl = n.text;
+        }
         // 属性协议（与 GenHtml 生成的建树代码同一套语义）
         for (int i = 0; i < n.attrs.Count; i = i + 1) {
             string k = n.attrs[i].name;
@@ -319,10 +322,15 @@ class Html {
                 evt = HtmlText.EventKind(suffix);
             }
             if (evt != "") {
+                string mod = "";
+                int dotIdx = suffix.IndexOf(".");
+                if (dotIdx >= 0) {
+                    mod = suffix.Substring(dotIdx + 1);
+                }
                 if (darg != "") {
-                    Html.WireArg(handlers, c, evt, v, darg);
+                    Html.WireArg(handlers, c, evt, v, darg, mod);
                 } else {
-                    Html.Wire(handlers, c, evt, v);
+                    Html.Wire(handlers, c, evt, v, mod);
                 }
                 continue;
             } else if (suffix != "") {
@@ -496,6 +504,7 @@ class Html {
             el.bindLazy = src.bindLazy;
             el.bindNumber = src.bindNumber;
             el.bindTrim = src.bindTrim;
+            el.bindTpl = src.bindTpl;
             if (src.bindProps != null) {
                 for (int bpi = 0; bpi < src.bindProps.Count; bpi = bpi + 1) {
                     el.AddBindProp(src.bindProps[bpi].prop, src.bindProps[bpi].expr);
@@ -559,6 +568,7 @@ class Html {
         n.bindLazy = c.bindLazy;
         n.bindNumber = c.bindNumber;
         n.bindTrim = c.bindTrim;
+        n.bindTpl = c.bindTpl;
         if (c.bindProps != null) {
             for (int bpi = 0; bpi < c.bindProps.Count; bpi = bpi + 1) {
                 n.AddBindProp(c.bindProps[bpi].prop, c.bindProps[bpi].expr);
@@ -578,6 +588,42 @@ class Html {
         return n;
     }
 
+    static Action WrapModifier(Action a, string mod) {
+        if (mod == "") { return a; }
+        bool hasStop = mod.IndexOf("stop") >= 0;
+        bool hasEnter = mod.IndexOf("enter") >= 0;
+        return () => {
+            App app = App.FrameApp();
+            if (hasEnter && app != null && app.window != null) {
+                if (app.window.EventKeyCode() != 13) {
+                    return;
+                }
+            }
+            if (hasStop && app != null) {
+                app.ClaimClick();
+            }
+            a();
+        };
+    }
+
+    static Action<string> WrapModifierArg(Action<string> a, string mod) {
+        if (mod == "") { return a; }
+        bool hasStop = mod.IndexOf("stop") >= 0;
+        bool hasEnter = mod.IndexOf("enter") >= 0;
+        return (arg) => {
+            App app = App.FrameApp();
+            if (hasEnter && app != null && app.window != null) {
+                if (app.window.EventKeyCode() != 13) {
+                    return;
+                }
+            }
+            if (hasStop && app != null) {
+                app.ClaimClick();
+            }
+            a(arg);
+        };
+    }
+
     // data-on-* 接线的公开钩子：生成的/手写的建树代码统一走这里，
     // 由它消化"名字 → 注册表 Action → BindEvent"与 Button 等控件
     // 把事件路由到专属槽位的差异（BindEvent 多态分派）。名字无论
@@ -585,12 +631,19 @@ class Html {
     // 代码同一契约，ChildWindow.Wire 等宿主才能二次解析。
     static void Wire(HtmlHandlers handlers, Control c, string evt,
                      string name) {
+        Wire(handlers, c, evt, name, "");
+    }
+
+    static void Wire(HtmlHandlers handlers, Control c, string evt,
+                     string name, string mod) {
         if (evt == "") { return; }
         c.SetHandler(evt, name);
         if (handlers == null) { return; }
         Action a = handlers.Find(name);
-        if (a != null) { c.BindEvent(evt, a); }
-        else {
+        if (a != null) {
+            Action wrapped = WrapModifier(a, mod);
+            c.BindEvent(evt, wrapped);
+        } else {
             // 名字没注册 = 处理器漏写/拼错（宿主侧）——同一“点了没
             // 反应”家族，同样一行警告点名。注册表晚于装载补充的
             // 二次接线（ChildWindow.WireNode）不受影响：名字已落
@@ -606,13 +659,19 @@ class Html {
     // 未命中时静默不接（与 Wire 同一契约）。
     static void WireArg(HtmlHandlers handlers, Control c, string evt,
                         string name, string arg) {
+        WireArg(handlers, c, evt, name, arg, "");
+    }
+
+    static void WireArg(HtmlHandlers handlers, Control c, string evt,
+                        string name, string arg, string mod) {
         if (evt == "") { return; }
         c.SetHandler(evt, name);
         if (handlers == null) { return; }
         Action<string> a = handlers.FindArg(name);
         if (a == null) { return; }
         string captured = arg;
-        c.BindEvent(evt, () => { a(captured); });
+        Action<string> wrapped = WrapModifierArg(a, mod);
+        c.BindEvent(evt, () => { wrapped(captured); });
     }
 
     // ---- <a> 链接导航（P5 链接语义） --------------------------------
