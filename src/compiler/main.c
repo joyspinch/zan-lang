@@ -3625,10 +3625,13 @@ typedef struct {
 static bool zan_driver_prefix_live(zan_irgen_t *g,
                                    const zan_driver_prefix_snapshot_t *snapshot,
                                    const char *prefix) {
-    for (const zan_driver_prefix_snapshot_entry_t *p = snapshot->head; p;
-         p = p->next)
-        if (strcmp(p->prefix, prefix) == 0) return p->defined;
-    return !snapshot->captured && zan_irgen_defines_prefix(g, prefix);
+    if (snapshot) {
+        for (const zan_driver_prefix_snapshot_entry_t *p = snapshot->head; p;
+             p = p->next) {
+            if (p->prefix && strcmp(p->prefix, prefix) == 0) return p->defined;
+        }
+    }
+    return (!snapshot || !snapshot->captured) && zan_irgen_defines_prefix(g, prefix);
 }
 
 static void zan_driver_prefix_record(zan_irgen_t *g, zan_arena_t *arena,

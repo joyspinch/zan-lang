@@ -3,6 +3,7 @@
 #include "embedres.h"
 #include "win_utf8.h"
 #include "miniz.h"
+#include "../common/zan_abi.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -501,7 +502,8 @@ static void embed_emit_read_has_bytes(zan_irgen_t *g, struct embed_api_ctx *c,
     LLVMPositionBuilderAtEnd(b, rgot2);
     LLVMBuildRet(b, rd);
     LLVMPositionBuilderAtEnd(b, rnil);
-    LLVMBuildRet(b, c->empty);
+    LLVMValueRef real_empty = LLVMBuildGlobalStringPtr(b, "", "embed_empty");
+    LLVMBuildRet(b, real_empty);
 
     LLVMTypeRef hty = LLVMFunctionType(c->i32, find_args, 1, 0);
     LLVMValueRef hfn = embed_define(g, "zan_embed_has", hty);
@@ -588,6 +590,7 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
 
     LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(g->ctx, fn, "entry");
     LLVMBasicBlockRef alloc = LLVMAppendBasicBlockInContext(g->ctx, fn, "alloc");
+    LLVMBasicBlockRef init = LLVMAppendBasicBlockInContext(g->ctx, fn, "init");
     LLVMBasicBlockRef oom = LLVMAppendBasicBlockInContext(g->ctx, fn, "oom");
     LLVMBasicBlockRef ready = LLVMAppendBasicBlockInContext(g->ctx, fn, "ready");
     LLVMBasicBlockRef head = LLVMAppendBasicBlockInContext(g->ctx, fn, "head");
@@ -603,6 +606,7 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBasicBlockRef done = LLVMAppendBasicBlockInContext(g->ctx, fn, "done");
 
     LLVMPositionBuilderAtEnd(b, entry);
+    LLVMValueRef real_empty = LLVMBuildGlobalStringPtr(b, "", "embed_empty");
     LLVMValueRef prefix = LLVMGetParam(fn, 0);
     LLVMValueRef ia = LLVMBuildAlloca(b, c->i64, "i");
     LLVMValueRef oa = LLVMBuildAlloca(b, c->i64, "o");
@@ -619,13 +623,24 @@ static void embed_emit_list(zan_irgen_t *g, struct embed_api_ctx *c) {
     LLVMBuildCondBr(b, LLVMBuildIsNull(b, buf0, "nobuf"), alloc, ready);
 
     LLVMPositionBuilderAtEnd(b, alloc);
-    LLVMValueRef cap = LLVMConstInt(c->i64, (unsigned long long)c->buf_cap, 0);
+    LLVMValueRef cap = LLVMConstInt(c->i64,
+        (unsigned long long)c->buf_cap + ZAN_OBJ_HDR_SIZE, 0);
     LLVMValueRef nb = LLVMBuildCall2(b, mal_ty, malloc_fn, &cap, 1, "nb");
-    LLVMBuildStore(b, nb, c->gbuf);
-    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nb, "failed"), oom, ready);
+    LLVMBuildCondBr(b, LLVMBuildIsNull(b, nb, "failed"), oom, init);
+
+    LLVMPositionBuilderAtEnd(b, init);
+    /* The reusable borrowed buffer still needs a readable Zan string header. */
+    LLVMValueRef hdr = LLVMBuildBitCast(b, nb, LLVMPointerType(c->i64, 0), "hdr");
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_SENTINEL_RC, 0), hdr);
+    LLVMValueRef one = LLVMConstInt(c->i64, 1, 0);
+    LLVMValueRef magic = LLVMBuildGEP2(b, c->i64, hdr, &one, 1, "magic");
+    LLVMBuildStore(b, LLVMConstInt(c->i64, ZAN_STRING_MAGIC, 0), magic);
+    LLVMValueRef skip = LLVMConstInt(c->i64, ZAN_OBJ_HDR_SIZE, 0);
+    LLVMBuildStore(b, LLVMBuildGEP2(b, c->i8, nb, &skip, 1, "data"), c->gbuf);
+    LLVMBuildBr(b, ready);
 
     LLVMPositionBuilderAtEnd(b, oom);
-    LLVMBuildRet(b, c->empty);
+    LLVMBuildRet(b, real_empty);
 
     LLVMPositionBuilderAtEnd(b, ready);
     LLVMValueRef buf = LLVMBuildLoad2(b, c->i8p, c->gbuf, "buf");
@@ -928,8 +943,7 @@ int zan_embed_emit_specs_filtered(zan_irgen_t *g, const char *const *specs,
     c.gbuf = LLVMAddGlobal(g->mod, i8p, "zan.embed.gbuf");
     LLVMSetInitializer(c.gbuf, LLVMConstNull(i8p));
     LLVMSetLinkage(c.gbuf, LLVMInternalLinkage);
-    c.empty = embed_bytes_global(g, "zan.embed.empty",
-                                 (const unsigned char *)"", 0);
+    c.empty = zan_irgen_intern_string(g, "");
 
     embed_emit_register(g, &c);
     LLVMValueRef find = embed_emit_find(g, &c);

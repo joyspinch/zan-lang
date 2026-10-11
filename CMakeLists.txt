@@ -147,6 +147,7 @@ add_executable(zanc
     src/compiler/ipa.c
     src/compiler/builtin_api.c
     src/compiler/symbols.c
+    src/runtime/rt_decimal.c
     # compressor side of embedded resources (embedres.c embed_maybe_compress)
     src/common/miniz.c
     src/common/miniz_tinfl.c
@@ -409,6 +410,25 @@ target_compile_definitions(zanc PRIVATE ZAN_RT_FILE_OBJ="${ZAN_RT_FILE_OBJ}")
 add_custom_command(TARGET zanc POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${ZAN_RT_FILE_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_file${CMAKE_C_OUTPUT_EXTENSION}
+    VERBATIM)
+
+# ---- 128-bit Decimal runtime (System.Decimal) ----
+set(ZAN_RT_DECIMAL_OBJ "${CMAKE_BINARY_DIR}/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}")
+add_custom_command(
+    OUTPUT ${ZAN_RT_DECIMAL_OBJ}
+    COMMAND ${ZAN_RT_IO_CC} -std=c11
+            -I ${CMAKE_SOURCE_DIR}/src/runtime -O2
+            -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c -o ${ZAN_RT_DECIMAL_OBJ}
+    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.c
+            ${CMAKE_SOURCE_DIR}/src/runtime/rt_decimal.h
+    COMMENT "Building 128-bit decimal runtime object (zanrt_decimal)"
+    VERBATIM)
+add_custom_target(zanrt_decimal ALL DEPENDS ${ZAN_RT_DECIMAL_OBJ})
+add_dependencies(zanc zanrt_decimal)
+target_compile_definitions(zanc PRIVATE ZAN_RT_DECIMAL_OBJ="${ZAN_RT_DECIMAL_OBJ}")
+add_custom_command(TARGET zanc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${ZAN_RT_DECIMAL_OBJ} $<TARGET_FILE_DIR:zanc>/zanrt_decimal${CMAKE_C_OUTPUT_EXTENSION}
     VERBATIM)
 
 # ---- Self-contained linking toolchain (Windows) ----
@@ -1922,6 +1942,9 @@ foreach(_src ${_conf_srcs})
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+  elseif(_name STREQUAL "security_cryptography_suite")
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.
@@ -2080,6 +2103,9 @@ foreach(_src ${_conf_srcs})
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+  elseif(_name STREQUAL "security_cryptography_suite")
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/tests/conformance/helpers/ns_conflict_other_action.zan")
@@ -2184,6 +2210,9 @@ foreach(_src ${_conf_srcs})
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+  elseif(_name STREQUAL "security_cryptography_suite")
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.
@@ -2252,6 +2281,9 @@ foreach(_src ${_conf_srcs})
   if(_name STREQUAL "server_mvc_timezone")
     set(_extra_args
       "${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Fmt.zan")
+  elseif(_name STREQUAL "security_cryptography_suite")
+    file(GLOB _sec_crypto_srcs "${CMAKE_SOURCE_DIR}/packages/Zan.Security/src/System/Security/Cryptography/*.zan")
+    set(_extra_args "${_sec_crypto_srcs};--auto-stdlib")
   elseif(_name STREQUAL "ns_conflict_generic_arity")
     # The case needs a same-simple-name delegate in a second namespace so
     # nsresolve sees the cross-namespace collision it locks in.

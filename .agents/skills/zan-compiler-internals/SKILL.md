@@ -48,6 +48,7 @@ description: zanc 编译器内部（parser/checker/irgen/nsresolve）的定式�
 
 ## LLVM 陷阱
 
+- **`LLVMBuildGlobalStringPtr` 必须在有效 BasicBlock 内调用**：在 LLVM C API 中，调用 `LLVMBuildGlobalStringPtr(builder, str, name)` 等构建指令时，`builder` 必须已经通过 `LLVMPositionBuilderAtEnd(builder, bb)` 关联了有效的 BasicBlock。如果对刚创建未定位的 builder 或已脱钩的 builder（如 IRGen 主流程结束后已退出的 `g->builder`）调用，会导致指令插入至空块内部，触发 LLVM 断言或底层 SIGSEGV 崩溃。同样，在合成辅助函数（如 `zan_embed_read`、`zan_embed_list` 等）中返回空串时，不可直接复用 AST 阶段结束后 builder 已脱钩的全局 `c->empty`（`zan_irgen_intern_string(g, "")`），必须在自身已定位的 entry block 内通过 `LLVMBuildGlobalStringPtr` 生成或直接发射常量指针。
 - **`LLVMBuildSelect` 两臂都求值**。字符串化之类会分配的辅助（itoa64 的
   数字缓冲）放进 select 死臂就是泄漏——leakcheck 孪生测试当场抓。要用
   branch+phi：两块各算各的，merge 处 phi 合流。
@@ -1262,6 +1263,13 @@ irgen_emit.c write_obj 在 publish 档给全局也按符号分节（`.rdata$<名
   （extern_check_callee_sym + sym_declares_extern + method_ret_type_at），
   void/string 返回一律借用。conformance 用例
   tests/conformance/extern_borrowed_string_result（getcwd 三次全读）。
+- **运行时自建的借用字符串仍须有可读的头部**：ARC retain 和字符串长度
+  会探测数据指针前的字；`zan_embed_list` 直接返回 malloc 缓冲起点，
+  Android 分配恰落页边界时，首次枚举内嵌目录就在读取 `ptr-8` 崩溃。
+  复用缓冲预留 16 字节，写 sentinel RC 与 unknown-length 字符串头；
+  sentinel 阻止释放和缓存改写，避免下一次复用读取旧长度。编译器合成实现
+  与运行时 C 实现同步维护，空串返回也要符合头部契约。用保护页分配探针
+  做修前/修后对照，并回归空目录与多次切换前缀（file_embed_subdir）。
 - **platform-defining DllImport 会被 irgen 内建短路**：`Directory.\
   GetCurrentDirectory`/`SetCurrentDirectory` 在 irgen_call.c 有内建降层
   （!zan_type_defines 才生效）——探针里自己写 Directory 类会静默走 stdlib
