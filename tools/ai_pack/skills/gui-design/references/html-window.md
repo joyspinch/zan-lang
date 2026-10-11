@@ -15,7 +15,7 @@
   的普通 .html 作为编译输入，GenHtml 展开成
   `class <文件基名帕斯卡化>Html { public static string Css;
   public static Control Build(HtmlHandlers); }`——类名来自**文件基名**
-  （App.html → `AppHtml`），不是 body id 也不是项目占位名；成员只有
+  （App.html → `AppHtml`），不是 body id 也不是 `{{NAME}}`；成员只有
   静态字段 `Css`（无括号）与静态方法 `Build`。**不发射 Main、不发射
   字段、不管 dock**：`data-win-*` 是 GenForm 专属，dock/图标/Tip 等
   行为配置在 code-behind 里 `Find(id)` 后补。适合"文档=结构快照、
@@ -183,8 +183,8 @@ STANDARDS.md §6.7）。
   `<NAME>.OnLoad` 找不到方法、模板内组件字段全裸（只复制
   App.zan/App.html 各一份编译 gui-wechat 这类多文件模板也会
   undefined type——整个 src 都要带）。
-- 参考实例化脚本（仓库 `scripts/e2e_pipeline.ps1` 的做法）：整树
-  拷贝 + 替换 + 用 zan.proj 编译，别手搓单文件。
+- 参考脚本 `scripts/e2e_pipeline.ps1`：整树拷贝 + 替换 + 用
+  zan.proj 编译，别手搓单文件。
 
 ## HTML 窗口设计器的所见所得
 
@@ -313,4 +313,13 @@ STANDARDS.md §6.7）。
    - **水平与垂直等间距分布（Distribute）**：支持多选控件（≥3 个）的水平等间距分布（`dist_h`）与垂直等间距分布（`dist_v`），保持首尾两端控件绝对位置不变，中间所有控件在剩余跨度内均匀分配几何间隙，消除人工肉眼对齐的繁琐工作。
    - **多媒体与图像资源浏览拾取器（Asset Picker）**：针对 `src`、`image`、`avatar` 及各类以 `Path` 结尾的媒体资源属性，在输入框旁渲染 `[浏览]` 按钮，拉起过滤了主流图片格式（`*.png;*.jpg;*.jpeg;*.svg;*.bmp;*.gif;*.webp`）的 `FilePicker` 弹窗；选中后自动调用 `RelativizePath` 将绝对路径转为相对于当前项目工作目录的标准短路径（如 `assets/player.png`），配合控件的 `SetProp` 实现画布即时渲染更新。
 
+8. **窗体与场景设计器键盘交互与细节完善规范（退格删除/代码后置直通/颜色色块与预设轮换）**：
+   - **键盘删除双键适配（Delete & Backspace）**：在无输入焦点（`focus.focusedId < 0` 且无弹窗/大编辑器打开）时，删除操作除响应 `kc == 46`（Delete 键）外，必须同时响应 `kc == 8`（Backspace 键），以完全对齐苹果键盘与无独立 Delete 键的笔记本电脑用户习惯。游戏场景设计器同理，在 `HandleKeys` 中必须同步适配，并在 `AnyInputFocused` 中防卫好包含类名（`inpIdClass`）在内的全部检查器输入控件。
+   - **游戏场景元素事件直通 Code-Behind**：游戏场景设计器属性检查器的点击事件（`clickIn`）旁标配 `[代码]` 按钮。未绑定时自动推导生成 `On<ElementName>Click` 并存入元素动作；点击后置位 `openCodeBehindElement = "handler:" + h`，直通宿主 IDE 在场景 `.zan` 代码后置文件中精确定位或在末尾自动生成事件响应方法桩。
+   - **颜色属性实时色块与预设主题色轮换**：对 `color`、`bgColor`、`textColor`、`borderColor`、`fill`、`stroke` 及 `*Color` 属性，在属性行右侧渲染 28px 交互色块；支持十六进制（`#RRGGBB` / `#RRGGBBAA`）与 CSS 函数（`rgb/rgba/hsl`）实时解析渲染；点击色块可在主流高频品牌/功能色预设之间快速循环轮换（蓝/绿/橙/红/紫/青/黑/白/灰），大幅提升配色效率。
+
+9. **声明式动态属性与动态样式类绑定规范（`:class` / `:disabled` 与通用 `:attr` 机制）**：
+   - **动态样式类（`:class` / `data-bind-class` / `z-class`）**：支持三元表达式（`cond ? 'active' : ''`）与模型/作用域路径。求值时与初始静态 `class`（保存在 `baseClass`）做非破坏性合并；类名变更时自动清空 `computedStyle` 缓存，下一帧重新解析样式表规则，彻底避免覆盖静态类或样式滞后。
+   - **动态禁用态（`:disabled` / `data-bind-disabled` / `z-disabled`）**：按条件表达式动态同步 `c.Disabled` 绑定，沿控件树向下继承置灰并切断交互。
+   - **通用动态单向属性绑定（`:prop` / `v-bind:prop` / `z-bind:prop`）**：支持在模板上声明任意属性绑定（`:placeholder`、`:status`、`:title`、`:min`、`:max` 等），通过 `c.AddBindProp` 注册并在 `SyncFromNode` 每一帧中通过 `GetProp` / `SetProp` 对比写入；支持行作用域穿透（`template` 循环行内自动继承 item 作用域），并随节点克隆（`Html.Clone`）完整保真。
 
