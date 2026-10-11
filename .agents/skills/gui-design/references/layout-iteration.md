@@ -91,6 +91,11 @@
 - 图标在正方形格内居中：字形尺寸按**格高的固定倍数**推（如 1.7 倍基准
   字号），不要和文本字号共用一套阶梯，也不要逐个试数。
 
+## 子窗口（ChildWindow）与多窗口时钟
+
+- **子窗口标题栏禁止皮肤选择与固顶操作**：`ChildWindow` 是依附主窗口的对话框/从属窗口，默认调用 `host.SetChildMode(true)`。标题栏严禁出现调色板换肤抽屉与 pin 置顶按钮，且后续调用 `EnableSkins`、`SetThemeMenu` 或 `FormBuilder.ConfigureWindow` 均必须严格锁死禁止开启。
+- **多窗口动画时钟与帧泵送**：在保留模式主循环中，子窗口由 `ChildWindows.PumpAll()` 驱动。动画时钟（`animNextMs` / `fxNextMs`）到期判断必须在 `PumpAll()` 开头就地先行兑现 `ChildWindows.TickDue(now)`，且 `ChildWindow.NeedsRedraw()` 必须在动画时钟到期时立即返回 true；同时 `FoldDeadlines` 必须向主循环注册 `RequestWakeFrameAt(dl)`，确保内核定时休眠唤醒后主循环当圈即可将动画帧送达子窗口呈现，杜绝跨圈滞后或空转。
+
 ## 过程纪律（这决定快慢）
 
 - **改一轮 → 构建 → 真实启动 → 截图 → 对照**，小步快跑；绝不连改多处
