@@ -992,6 +992,14 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
 - **智能 Alt 测距之父容器内缩四周边距（Alt Parent Inset / Padding Guides）**：
   按住 Alt 测量组件间距时，除两个独立组件之间的间距连线外，当光标悬停在空白处或父容器上时，应自动测量当前选中组件到其父容器（或根窗口）四边（Top, Bottom, Left, Right）的内缩距离，
   并绘制高亮参考边框与带像素数值的半透明数字徽标。这与 Figma/Sketch 行业标杆体验无缝对齐，消除目测与心算容器边距的成本。
+- **常用界面骨架复合模板（Starter Layout Presets）**：
+  从零拼凑容器层级、手动配置工具条 Dock.Top、状态栏 Dock.Bottom 以及主工作区 Flex.Fill 是界面设计初期的主要心智负担，且极易因手动设置疏漏导致浮动遮挡或无法自动撑满高度。
+  工业级设计器应在画布右键菜单（空白处与容器节点）及快速插入（Quick Insert Ctrl+I）中提供常用骨架复合模板一键生成能力：
+  1. **经典主窗口骨架 (Classic App Skeleton)**：置顶 ToolStrip (Dock.Top) + 主工作区 (Dock.Fill / Flex.Fill) + 状态栏 (Dock.Bottom)；
+  2. **左右双栏工作台 (Split Workspace)**：外层 Fill 容器 + 左侧导航栏 (Dock.Left, 宽220) + 右侧主工作区 (Dock.Fill)；
+  3. **标准水平表单行 (Standard Form Row)**：横向流式行，内置 80px 标题标签 + 自动撑满余量输入框 (Fill) + 确认按钮；
+  4. **对话框底部操作栏 (Dialog Action Buttons)**：底部容器 (Dock.Bottom)，横向靠右居中排布标准规格的「取消」与「确定」按钮。
+  一键生成完整规范的父子结构、停靠边、弹性填充、内外边距与间隙，从根本上杜绝布局畸变并提升排版效率。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
