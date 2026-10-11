@@ -1057,12 +1057,18 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   规范做法：
   1. 新增 ToolStrip 时默认赋予 `dockSide = 1`（Dock.Top 顶部停靠，`position = 0`），新增 StatusBar 时默认赋予 `dockSide = 2`（Dock.Bottom 底部停靠，`position = 0`），使其自动参与外壳停靠排版；
   2. 属性检查器单选排版卡片常驻提供 `Dock: [None 0] [Top 1] [Bot 2] [Left 3] [Right 4] [Fill 5]` 胶囊切换按钮矩阵，一秒在常用停靠与铺满余量间切换，并自动同步坐标与重算布局。
-- **大纲树同级调序方向与视图闭环联动（Outline Sibling Reordering & Immediate Refresh）**：
-  在组件大纲树（Outline TreeView）等纵向层级树视图中，列表物理索引为从上至下（第 0 项在最顶部，第 Count-1 项在最底部）。
-  规范做法：
-  1. 大纲树工具条中 `▲`（向上移动）应对应兄弟列表索引减 1（`MoveSel(-1)`），`▼`（向下移动）对应索引加 1（`MoveSel(1)`），与树节点在视觉列表中的物理位移直觉严格保持一致；
-  2. 触发调序、锁定/解锁或删除后，必须立即触发 `EnsureOutline()` 与 `RequestRedraw()`，使大纲树节点物理顺序与高亮焦点无缝跟随，杜绝视图滞后或焦点跑偏；
-  3. 大纲树激活双击（`OnActivate`）时智能区分容器与展示组件：具备文本属性的控件直接呼出原地编辑框，非文本控件与容器避免误弹重命名浮层。
+	- **大纲树同级调序方向与视图闭环联动（Outline Sibling Reordering & Immediate Refresh）**：
+	  在组件大纲树（Outline TreeView）等纵向层级树视图中，列表物理索引为从上至下（第 0 项在最顶部，第 Count-1 项在最底部）。
+	  规范做法：
+	  1. 大纲树工具条中 `▲`（向上移动）应对应兄弟列表索引减 1（`MoveSel(-1)`），`▼`（向下移动）对应索引加 1（`MoveSel(1)`），与树节点在视觉列表中的物理位移直觉严格保持一致；
+	  2. 触发调序、锁定/解锁或删除后，必须立即触发 `EnsureOutline()` 与 `RequestRedraw()`，使大纲树节点物理顺序与高亮焦点无缝跟随，杜绝视图滞后或焦点跑偏；
+	  3. 大纲树激活双击（`OnActivate`）时智能区分容器与展示组件：具备文本属性的控件直接呼出原地编辑框，非文本控件与容器避免误弹重命名浮层。
+	- **设计器持久化与尺寸微调之布局模式保护（Layout Mode Preservation in DesignDeclareRect & Resize）**：
+	  过去 `DesignDeclareRect` 曾错误硬编码 `position = "1"` 与 `dock = "0"`，导致任何通过检查器修改属性或微调尺寸的流式/停靠组件，一被持久化或刷新就强制降级为绝对浮动（`position = 1`）；同时 `DesignMakeFloat` 在调整尺寸手柄时也无差别将流式组件降级为浮动。
+	  规范做法：
+	  1. `DesignDeclareRect` 必须动态持久化当前真实的 `Convert.ToString(f.position)` 与 `Convert.ToString(f.dockSide)`，严禁硬编码常量；
+	  2. `DesignMakeFloat` 在检测到组件为流式（`f.position == 0`）时，拖动手柄调整尺寸仅更新 `fw/fh` 推荐像素，保留 `position == 0` 流式属性，绝不强行降级为绝对浮动；
+	  3. 画布右键上下文菜单（`CanvasMenuLabels` & `HandleCanvasMenu`）同步完备集成 `Dock`（Top/Bottom/Left/Right/Fill/None）与 `Flow: Fill Height`（撑满剩余高度 `flexGrow=1, fh=0`）/ `Flow: Auto Height` 一键命令，消除全流布局填满高度的心智门槛。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
