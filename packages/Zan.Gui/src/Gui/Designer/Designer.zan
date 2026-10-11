@@ -398,6 +398,9 @@ partial class Designer {
     // 同一套模型——SaveJson/LoadJson 就是文档的完整往返。
     List<string> undoStack;
     List<string> redoStack;
+    List<string> undoActionStack;
+    List<string> redoActionStack;
+    string pendingUndoAction;
     // 剪贴板：复制选中项的 FieldJson 片段，粘贴时重建
     // （容器连子级一起）。
     List<string> clipFields;
@@ -839,6 +842,9 @@ partial class Designer {
         this.keymapHelpOpen = false;
         this.undoStack = new List<string>();
         this.redoStack = new List<string>();
+        this.undoActionStack = new List<string>();
+        this.redoActionStack = new List<string>();
+        this.pendingUndoAction = "";
         this.clipFields = new List<string>();
         this.freeHand = false;
         this.freeMarquee = false;
@@ -2603,7 +2609,7 @@ partial class Designer {
     // 多选批量操作：一键切换所有选中项锁定状态
     void BatchToggleLock() {
         if (sel == null) { return; }
-        this.PushUndo();
+        this.PushUndoAction(Designer.T("toggle lock", "切换锁定"));
         bool anyUnlocked = !sel.locked;
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
             if (freeExtra[i] != null && !freeExtra[i].locked) { anyUnlocked = true; break; }
@@ -2621,46 +2627,56 @@ partial class Designer {
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
-    // 多选批量操作：一键清空所有选中项外边距
-    void BatchResetMargins() {
+    // 多选批量操作：一键设置所有选中项外边距
+    void BatchSetMargins(int val) {
         if (sel == null) { return; }
-        this.PushUndo();
-        sel.margin = 0;
+        this.PushUndoAction(Designer.T("batch margins", "批量外边距"));
+        sel.margin = val;
         this.DesignDeclareRect(sel);
         for (int i = 0; i < freeExtra.Count; i = i + 1) {
             FormField f = freeExtra[i];
             if (f != null && !f.locked) {
-                f.margin = 0;
+                f.margin = val;
                 this.DesignDeclareRect(f);
             }
         }
         this.MarkDocDirty();
-        msg = Designer.T("Reset margins to 0", "已清空选中项外边距");
+        msg = Designer.T("Batch set margin: ", "已批量设置外边距: ") + Convert.ToString(val) + "px";
+        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+    }
+
+    // 多选批量操作：一键清空所有选中项外边距
+    void BatchResetMargins() {
+        this.BatchSetMargins(0);
+    }
+
+    // 多选批量操作：一键设置所有选中项内边距
+    void BatchSetPadding(int val) {
+        if (sel == null) { return; }
+        this.PushUndoAction(Designer.T("batch padding", "批量内边距"));
+        sel.padding = val;
+        this.DesignDeclareRect(sel);
+        for (int i = 0; i < freeExtra.Count; i = i + 1) {
+            FormField f = freeExtra[i];
+            if (f != null && !f.locked) {
+                f.padding = val;
+                this.DesignDeclareRect(f);
+            }
+        }
+        this.MarkDocDirty();
+        msg = Designer.T("Batch set padding: ", "已批量设置内边距: ") + Convert.ToString(val) + "px";
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
     // 多选批量操作：一键清空所有选中项内边距
     void BatchResetPadding() {
-        if (sel == null) { return; }
-        this.PushUndo();
-        sel.padding = 0;
-        this.DesignDeclareRect(sel);
-        for (int i = 0; i < freeExtra.Count; i = i + 1) {
-            FormField f = freeExtra[i];
-            if (f != null && !f.locked) {
-                f.padding = 0;
-                this.DesignDeclareRect(f);
-            }
-        }
-        this.MarkDocDirty();
-        msg = Designer.T("Reset padding to 0", "已清空选中项内边距");
-        if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
+        this.BatchSetPadding(0);
     }
 
     // 多选批量操作：一键统一设置定位模式（0: 流式 Flow, 1: 浮动 Float）
     void BatchSetPosition(int pos) {
         if (sel == null) { return; }
-        this.PushUndo();
+        this.PushUndoAction(Designer.T("batch position", "批量排版模式"));
         if (pos == 1) { this.DesignMakeFloat(sel); }
         else { sel.position = 0; sel.fx = 0; sel.fy = 0; }
         this.DesignDeclareRect(sel);
@@ -2680,7 +2696,7 @@ partial class Designer {
     // 多选批量操作：一键将所有选中项设为流式并自动撑满高度 (Fill Remaining Height)
     void BatchFillHeight() {
         if (sel == null) { return; }
-        this.PushUndo();
+        this.PushUndoAction(Designer.T("batch fill height", "批量撑满高度"));
         sel.position = 0;
         sel.flexGrow = 1;
         sel.fh = 0;
@@ -2827,13 +2843,27 @@ partial class Designer {
     // 记录当前设计；在任何修改前调用。当前状态和栈顶相同
     // （上一次压栈后设计没真正变过）时不重复压栈。
     void PushUndo() {
+        this.PushUndoAction("");
+    }
+
+    void PushUndoAction(string action) {
         string j = this.SaveJson();
         if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == j) {
+            if (action != "" && undoActionStack.Count > 0) {
+                undoActionStack[undoActionStack.Count - 1] = action;
+            }
             return;
         }
+        string act = action != "" ? action : (pendingUndoAction != "" ? pendingUndoAction : Designer.T("change", "修改"));
+        pendingUndoAction = "";
         undoStack.Add(j);
-        if (undoStack.Count > 60) { undoStack.RemoveAt(0); }
+        undoActionStack.Add(act);
+        if (undoStack.Count > 60) {
+            undoStack.RemoveAt(0);
+            if (undoActionStack.Count > 0) { undoActionStack.RemoveAt(0); }
+        }
         redoStack = new List<string>();
+        redoActionStack = new List<string>();
         this.MarkDocDirty();
     }
 
@@ -2843,6 +2873,9 @@ partial class Designer {
     void PopUndoIfUnchanged() {
         if (undoStack.Count > 0 && undoStack[undoStack.Count - 1] == this.SaveJson()) {
             undoStack.RemoveAt(undoStack.Count - 1);
+            if (undoActionStack.Count > 0) {
+                undoActionStack.RemoveAt(undoActionStack.Count - 1);
+            }
         }
     }
 
@@ -2855,11 +2888,17 @@ partial class Designer {
             return;
         }
         redoStack.Add(this.SaveJson());
+        string act = Designer.T("change", "修改");
+        if (undoActionStack.Count > 0) {
+            act = undoActionStack[undoActionStack.Count - 1];
+            undoActionStack.RemoveAt(undoActionStack.Count - 1);
+        }
+        redoActionStack.Add(act);
         string j = undoStack[undoStack.Count - 1];
         undoStack.RemoveAt(undoStack.Count - 1);
         this.ApplyJson(j);
         this.SyncFreeSelBase();
-        msg = Designer.T("undone", "已撤销");
+        msg = Designer.T("undone: ", "已撤销: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(undoStack.Count) + Designer.T(" steps", " 步") + ")";
     }
 
     // 重做：当前设计压入撤销栈，载入重做栈顶；栈空时仅提示。
@@ -2869,11 +2908,17 @@ partial class Designer {
             return;
         }
         undoStack.Add(this.SaveJson());
+        string act = Designer.T("change", "修改");
+        if (redoActionStack.Count > 0) {
+            act = redoActionStack[redoActionStack.Count - 1];
+            redoActionStack.RemoveAt(redoActionStack.Count - 1);
+        }
+        undoActionStack.Add(act);
         string j = redoStack[redoStack.Count - 1];
         redoStack.RemoveAt(redoStack.Count - 1);
         this.ApplyJson(j);
         this.SyncFreeSelBase();
-        msg = Designer.T("redone", "已重做");
+        msg = Designer.T("redone: ", "已重做: ") + act + " (" + Designer.T("remaining ", "剩余 ") + Convert.ToString(redoStack.Count) + Designer.T(" steps", " 步") + ")";
     }
 
     // --- 剪贴板：复制 / 粘贴选中项（容器连子级一起） --------------
@@ -4046,7 +4091,14 @@ partial class Designer {
                     this.CopySel();
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 86 || kc == 118)) {
-                    this.PasteClip();
+                    if (hasShift) {
+                        this.DistributeSelGroup(1);
+                    } else {
+                        this.PasteClip();
+                    }
+                    app.RequestRedraw();
+                } else if (hasCtrl && hasShift && (kc == 72 || kc == 104)) {
+                    this.DistributeSelGroup(0);
                     app.RequestRedraw();
                 } else if (hasCtrl && (kc == 68 || kc == 100) && sel != null) {
                     this.DuplicateSel();

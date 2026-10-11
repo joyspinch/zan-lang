@@ -1076,8 +1076,11 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   1. 拖拽开始时严格判定 `if (f.dockSide == 0 && f.position == 1)`，仅绝对浮动组件才重算并解除坐标约束，流式组件（`position == 0`）严禁被篡改为浮动；
   2. 拖拽悬停于容器上方时，始终激活 `FlowDropTarget` 探测流向与子节点包围盒，实时渲染插入线；
   3. 松手 `FreeReparentSel` 中识别同容器内部拖拽（`pc == cont`），结合 `dropIndex` 实现 `kids` 精确插槽调序，无论在容器内还是跨容器均完美保持流式属性。
-- **属性检查器常用外边距快捷预设档位（Quick Margin Presets in Inspector）**：
-  在属性面板顶部常驻的几何尺寸卡片中，除了高度 `H` 与宽度 `W` 外，集成第三行外边距 `Mg (px)` 快捷档位（`[0]`, `[4]`, `[8]`, `[12]`, `[16]`），使得任何单选可视组件无需深入属性网格即可一键定型外边距；搭配容器专属的 Pad/Gap 档位与多选批量清边距按钮，形成覆盖全局的内外边距即时调控闭环。
+- **属性检查器多选批量外边距与内边距档位矩阵（Batch Margin & Padding Matrix in Inspector）**：
+  在多选批量编辑卡片（Batch Editing Card）中，集成 Row 2 外边距 `Mg (px)` 与 Row 3 内边距 `Pad (px)` 快捷档位矩阵（0/4/8/12/16/24px），使选中的多个组件能够一键批量统一并规范外边距与内边距，配合高亮按钮与实时重绘，消除逐个反复修改的机械重复。
+- **全局快捷键均分分布与撤销/重做语义动作跟踪（Global Distribution Shortcuts & Semantic Undo Action Tracking）**：
+  1. 全局支持 `Ctrl+Shift+H`（水平均分）与 `Ctrl+Shift+V`（垂直均分）快捷键，无缝衔接多选排版流水线；
+  2. 撤销/重做系统（Undo/Redo）维护动作语义栈（`undoActionStack` / `redoActionStack`），在压栈时同步记录具体操作类型（如“对齐组件”、“水平均分”、“批量外边距”、“锁定/解锁”等），撤销或重做时在状态栏精准呈现具体操作描述与剩余步数，并在工具栏按钮上展示实时步数徽标，消除心智盲区。
 
 ## 在 zan-lang 仓库内工作(仅仓库内,发布给用户的版面无此节内容)
 
