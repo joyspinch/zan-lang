@@ -234,6 +234,22 @@ class ChildWindow {
         if (c.bindIf != "") {
             c.SetShown(this.EvalExpr(c, c.bindIf));
         }
+        if (c.bindDisabled != "") {
+            bool dis = this.EvalExpr(c, c.bindDisabled);
+            if (c.Disabled.Get() != dis) { c.Disabled = dis; }
+        }
+        if (c.bindClass != "") {
+            string dyn = this.EvalClassExpr(c, c.bindClass).Trim();
+            string full = dyn;
+            if (c.baseClass != "") {
+                if (dyn != "") { full = c.baseClass + " " + dyn; }
+                else { full = c.baseClass; }
+            }
+            if (c.Class != full) {
+                c.Class = full;
+                c.computedStyle = null;
+            }
+        }
         if (c.bindPath != "") {
             JsonValue v = this.ValueFor(c, c.bindPath);
             if (v != null) {
@@ -539,7 +555,7 @@ class ChildWindow {
     // JsonValue）。只登记声明了绑定的控件——表按引用线性查，登记
     // 面越小每帧越便宜。
     void ScopeRow(Control c, JsonValue item) {
-        if (c.bindPath != "" || c.bindIf != "") { this.ScopePut(c, item); }
+        if (c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "") { this.ScopePut(c, item); }
         for (int j = 0; j < c.children.Count; j = j + 1) {
             this.ScopeRow(c.children[j], item);
         }
@@ -573,7 +589,7 @@ class ChildWindow {
     // 压缩，尾部截断）。残留条目永不命中（键是引用），但数组频繁
     // 重建的窗口靠这一步封住增长。
     void ScopeDropRow(Control c) {
-        if (c.bindPath != "" || c.bindIf != "") { this.ScopeDropOne(c); }
+        if (c.bindPath != "" || c.bindIf != "" || c.bindClass != "" || c.bindDisabled != "") { this.ScopeDropOne(c); }
         for (int j = 0; j < c.children.Count; j = j + 1) {
             this.ScopeDropRow(c.children[j]);
         }
@@ -762,6 +778,44 @@ class ChildWindow {
         JsonValue v = this.ValueFor(c, operand);
         if (v == null) { return ""; }
         return v.AsString("");
+    }
+
+    // 动态样式类表达式求值（支持三元表达式 cond ? 'a' : 'b' 与模型/作用域路径）
+    string EvalClassExpr(Control c, string expr) {
+        if (expr == "") { return ""; }
+        string s = expr.Trim();
+        if (s == "") { return ""; }
+        int qIdx = 0 - 1;
+        int colonIdx = 0 - 1;
+        bool inQuote = false;
+        int quoteChar = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = (int)s[i];
+            if (ch == 39 || ch == 34) { // '\'' or '"'
+                if (!inQuote) {
+                    inQuote = true;
+                    quoteChar = ch;
+                } else if (quoteChar == ch) {
+                    inQuote = false;
+                }
+            } else if (!inQuote) {
+                if (ch == 63 && qIdx < 0) { // '?'
+                    qIdx = i;
+                } else if (ch == 58 && qIdx >= 0 && colonIdx < 0) { // ':'
+                    colonIdx = i;
+                    break;
+                }
+            }
+        }
+        if (qIdx >= 0 && colonIdx > qIdx) {
+            string cond = s.Substring(0, qIdx).Trim();
+            string trueBranch = s.Substring(qIdx + 1, colonIdx - (qIdx + 1)).Trim();
+            string falseBranch = s.Substring(colonIdx + 1).Trim();
+            bool condVal = this.EvalExpr(c, cond);
+            string chosen = condVal ? trueBranch : falseBranch;
+            return this.ResolveOperandStr(c, chosen);
+        }
+        return this.ResolveOperandStr(c, s);
     }
 
     // 接口数据协议与执行契约。
