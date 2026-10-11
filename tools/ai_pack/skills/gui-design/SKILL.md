@@ -1036,6 +1036,19 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
 - **Alt+拖拽就地克隆副本并连续平移（Alt+Drag Clone on Move）**：
   在需要快速排列多个相同或相似组件（如一系列并列按钮、数据列标签）时，传统的先 Ctrl+C / Ctrl+V 再拖开操作割裂视线。
   规范做法：在拖拽产生真实位移时检测 `Alt` 键，原地克隆当前选中项（或多选组），将新副本直接无缝切换为当前拖拽对象继续移动，松开鼠标时原组件保持不动、新组件已在目标位置就绪。
+- **画布双击智能区分原地编辑显示文本与后台代码跳转（Double-Click Inline Text vs Code Navigation）**：
+  在可视化画布中，用户快速双击或连击组件时，过去曾无差别触发跳转后台代码（`RequestOpenCodeBehindHandler`），导致焦点丢失，且无法直观修改按钮/标签文案。
+  规范做法：
+  1. 双击时优先通过 `HasDisplayText(sel)` 判定是否为带有界面展示文本特性的组件（如 Button, Label, Checkbox, Radio, Title 等），若有则就地激活 F2 原地编辑浮层（`StartInlineRename`），自动聚焦输入框并全选文案；
+  2. 仅在明确按住 `Ctrl` 键或双击无展示文本的业务控件时才允许导航至代码后置事件，彻底消除排版心流被强制打断的痛点。
+- **流式组件拖拽保护与容器内精准插槽调序（Flow Drag Preservation & In-Container Slot Reordering）**：
+  在自由画布或混合排版模式下，过去 `DesignBeginMove` 曾无差别对所有拖拽组件调用 `DesignMakeFloat`，导致在流式容器或流式表单里的组件一拖动就被破坏性降级为浮动绝对定位（`position = 1`），不仅破坏 Flex 流式自适应特性还会引发图层遮挡；同时，在同容器内拖拽松手时因 `pc == cont` 判定直接 `continue` 跳过，无法通过拖拽进行子项排序。
+  规范做法：
+  1. 拖拽开始时严格判定 `if (f.dockSide == 0 && f.position == 1)`，仅绝对浮动组件才重算并解除坐标约束，流式组件（`position == 0`）严禁被篡改为浮动；
+  2. 拖拽悬停于容器上方时，始终激活 `FlowDropTarget` 探测流向与子节点包围盒，实时渲染插入线；
+  3. 松手 `FreeReparentSel` 中识别同容器内部拖拽（`pc == cont`），结合 `dropIndex` 实现 `kids` 精确插槽调序，无论在容器内还是跨容器均完美保持流式属性。
+- **属性检查器常用外边距快捷预设档位（Quick Margin Presets in Inspector）**：
+  在属性面板顶部常驻的几何尺寸卡片中，除了高度 `H` 与宽度 `W` 外，集成第三行外边距 `Mg (px)` 快捷档位（`[0]`, `[4]`, `[8]`, `[12]`, `[16]`），使得任何单选可视组件无需深入属性网格即可一键定型外边距；搭配容器专属的 Pad/Gap 档位与多选批量清边距按钮，形成覆盖全局的内外边距即时调控闭环。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像

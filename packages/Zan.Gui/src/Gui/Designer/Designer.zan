@@ -453,6 +453,7 @@ partial class Designer {
     int dragKind;     // 正从面板拖出的字段类型
     string dragCustomKind; // 当 dragKind == 100 时的自定义组件 tag
     int dragIndex;    // 排序时的源行索引
+    FormField dragField; // 拖拽重排中的源字段对象（支持容器内与跨层流式重排）
     int dropIndex;    // 计算出的插入索引
     int dropY;        // 插入指示线的 y 坐标
     int dragMouseX;
@@ -484,6 +485,7 @@ partial class Designer {
     Input formNameInput;
     Input submitInput;
     bool inlineRenaming;
+    bool inlineRenameFocusNeeded;
     Input inlineRenameInput;
     Rect lastSelViewRect;
 
@@ -2698,16 +2700,35 @@ partial class Designer {
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
-    // F2 原地快捷重命名：在画布或大纲树直接编辑标签/名称
+    // 组件是否具有界面展示文本/标签属性（优先原地编辑显示文字，而非后端变量名）
+    static bool HasDisplayText(FormField f) {
+        if (f == null) { return false; }
+        if (f.label != "") { return true; }
+        int ft = f.ftype;
+        return ft == 20 || ft == 15 || ft == 16 || ft == 2 || ft == 3 || ft == 28
+            || ft == 39 || ft == 18 || ft == 25 || ft == 7 || ft == 48 || ft == 58 || ft == 59;
+    }
+
+    // F2 / 双击 原地快捷编辑：智能区分界面显示文本 (label) 与代码变量名 (fname)
     void StartInlineRename() {
         if (sel == null) { return; }
         inlineRenaming = true;
+        inlineRenameFocusNeeded = true;
+        bool isText = Designer.HasDisplayText(sel);
         if (inlineRenameInput == null) {
-            inlineRenameInput = new Input(Designer.T("Rename", "重命名"));
+            inlineRenameInput = new Input("");
         }
-        string initText = sel.label != "" ? sel.label : sel.fname;
+        string initText = "";
+        if (isText) {
+            initText = sel.label != "" ? sel.label : FormField.TypeName(sel.ftype);
+            inlineRenameInput.hint = Designer.T("Edit Display Text", "编辑显示文本");
+            msg = Designer.T("Editing Text (Enter to commit, Esc to cancel)...", "正在编辑显示文本（回车确认，Esc取消）...");
+        } else {
+            initText = sel.fname;
+            inlineRenameInput.hint = Designer.T("Rename Variable", "修改变量名");
+            msg = Designer.T("Renaming (Enter to commit, Esc to cancel)...", "正在重命名变量（回车确认，Esc取消）...");
+        }
         inlineRenameInput.SetText(initText);
-        msg = Designer.T("Renaming (Enter to commit, Esc to cancel)...", "正在重命名（回车确认，Esc取消）...");
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
     }
 
@@ -2716,18 +2737,20 @@ partial class Designer {
         string val = StyleSheet.Trim(inlineRenameInput.GetText());
         if (val != "") {
             this.PushUndo();
-            if (sel.label != "") {
+            if (Designer.HasDisplayText(sel)) {
                 sel.label = val;
+                this.DesignDeclareRect(sel);
+                msg = Designer.T("Text updated: ", "已更新文本: ") + val;
             } else {
                 if (val != sel.fname && !this.UsedFieldName(sel, val)) {
                     renamedOldField = sel.fname;
                     renamedNewField = val;
                     sel.fname = val;
                     sel.name = val;
+                    msg = Designer.T("Renamed variable: ", "已重命名变量: ") + val;
                 }
             }
             this.MarkDocDirty();
-            msg = Designer.T("Renamed: ", "已重命名: ") + val;
         }
         inlineRenaming = false;
         if (this.hostApp != null) { this.hostApp.RequestRedraw(); }
@@ -4201,6 +4224,11 @@ partial class Designer {
                 int btnW = app.Scale(44);
                 int inW = rw - btnW * 2 - app.Scale(20);
                 inlineRenameInput.Render(app, rx + app.Scale(6), ry + app.Scale(4), inW, rh - app.Scale(8));
+                if (inlineRenameFocusNeeded) {
+                    inlineRenameInput.Focus();
+                    inlineRenameInput.SelectAll();
+                    inlineRenameFocusNeeded = false;
+                }
                 int okId = SmallBtn(app, Designer.T("OK", "确定"), 1, rx + inW + app.Scale(8), ry + app.Scale(4), btnW);
                 int cancelId = SmallBtn(app, Designer.T("Cancel", "取消"), 0, rx + inW + btnW + app.Scale(12), ry + app.Scale(4), btnW);
                 if (Ui.Clicked(app, okId)) {

@@ -806,7 +806,8 @@ partial class Designer {
             FormField f = group[i];
             if (f == null || f.locked || !this.DesignVisible(f)
                     || this.HasAncestorIn(f, group)) { continue; }
-            if (f.dockSide == 0) {
+            // 流式组件 (position == 0) 保持流式布局，仅浮动组件在移动前解除约束并同步坐标
+            if (f.dockSide == 0 && f.position == 1) {
                 this.DesignMakeFloat(f);
             }
             designMoves.Add(new DesignMoveStart(f,
@@ -1334,14 +1335,51 @@ partial class Designer {
         for (int i = 0; i < designMoves.Count; i = i + 1) {
             FormField f = designMoves[i].field;
             FormField pc = this.DesignOwnerOf(f);
-            if (pc == cont && (cont == null || f.childTab == designDropSlot)) { continue; }
+            if (pc == cont && (cont == null || f.childTab == designDropSlot)) {
+                // 同容器内部拖拽调序：按 FlowDropTarget 探测到的精确插槽 dropIndex 重新插入
+                if (cont != null && dropIndex >= 0 && dropIndex <= cont.kids.Count) {
+                    int oldIdx = IndexIn(cont.kids, f);
+                    if (oldIdx >= 0 && oldIdx != dropIndex) {
+                        cont.kids = ListRemove(cont.kids, f);
+                        int targetIdx = dropIndex;
+                        if (targetIdx > oldIdx) { targetIdx = targetIdx - 1; }
+                        if (targetIdx < 0) { targetIdx = 0; }
+                        if (targetIdx > cont.kids.Count) { targetIdx = cont.kids.Count; }
+                        cont.kids.Insert(targetIdx, f);
+                        moved = true;
+                    }
+                } else if (cont == null && dropIndex >= 0 && dropIndex <= fields.Count) {
+                    int oldIdx = IndexIn(fields, f);
+                    if (oldIdx >= 0 && oldIdx != dropIndex) {
+                        fields = ListRemove(fields, f);
+                        int targetIdx = dropIndex;
+                        if (targetIdx > oldIdx) { targetIdx = targetIdx - 1; }
+                        if (targetIdx < 0) { targetIdx = 0; }
+                        if (targetIdx > fields.Count) { targetIdx = fields.Count; }
+                        fields.Insert(targetIdx, f);
+                        moved = true;
+                    }
+                }
+                continue;
+            }
             int absX = this.DesignEditOriginX(f) + f.fx;
             int absY = this.DesignEditOriginY(f) + f.fy;
             if (pc == null) { fields = ListRemove(fields, f); }
             else { pc.kids = ListRemove(pc.kids, f); }
             f.childTab = cont == null ? 0 : designDropSlot;
-            if (cont == null) { fields.Add(f); }
-            else { cont.kids.Add(f); }
+            if (cont == null) {
+                if (dropIndex >= 0 && dropIndex <= fields.Count) {
+                    fields.Insert(dropIndex, f);
+                } else {
+                    fields.Add(f);
+                }
+            } else {
+                if (dropIndex >= 0 && dropIndex <= cont.kids.Count) {
+                    cont.kids.Insert(dropIndex, f);
+                } else {
+                    cont.kids.Add(f);
+                }
+            }
             f.fx = absX - newBaseX;
             f.fy = absY - newBaseY;
             if (f.fx < 0) { f.fx = 0; }
@@ -1845,8 +1883,8 @@ partial class Designer {
                 if (invalidDrop) {
                     cont = currentParent;
                 }
-                if (cont != null && cont != currentParent) {
-                    this.DrawFreeDropHi(app, c, ox, oy, psMilli, cont);
+                if (cont != null) {
+                    this.FlowDropTarget(app, c, t, ox, oy, psMilli, dw);
                 } else if (cont == null && currentParent != null) {
                     this.DrawFreeDropRootHi(app, c, ox, oy, psMilli, cw2, ch2);
                 }
@@ -2326,25 +2364,36 @@ partial class Designer {
 	                if (cdy < 0) { cdy = 0 - cdy; }
 	                int tol = app.Scale(5);
 	                bool inDist = (cdx <= tol && cdy <= tol);
-	                if (sel != null && sel == canvasLastClickField && (nowMs - canvasLastClickMs) <= 400 && inDist && Designer.CanNavigateCodeBehind(sel)) {
-	                    if (sel.compRef) {
-	                        openCompName = sel.customKind;
-	                        openCompRequested = true;
-	                        msg = Designer.T("opening component ", "打开组件 ") + sel.customKind;
-	                    } else {
-	                        string defEv = Designer.DefaultEventName(sel);
-	                        string h = sel.GetHandler(defEv);
-	                        if (h == "") {
-	                            h = Designer.SuggestHandler(sel, defEv);
-	                            sel.SetHandler(defEv, h);
-	                        }
-	                        this.RequestOpenCodeBehindHandler(h);
-	                    }
-	                    canvasLastClickField = null;
-	                    canvasLastClickMs = 0;
-	                    canvasLastClickX = 0;
-	                    canvasLastClickY = 0;
-	                } else {
+		                if (sel != null && sel == canvasLastClickField && (nowMs - canvasLastClickMs) <= 400 && inDist) {
+		                    bool hasCtrlNav = Modifiers.HasCtrl(app.window.EventMods());
+		                    if (sel.compRef) {
+		                        openCompName = sel.customKind;
+		                        openCompRequested = true;
+		                        msg = Designer.T("opening component ", "打开组件 ") + sel.customKind;
+		                    } else if (hasCtrlNav && Designer.CanNavigateCodeBehind(sel)) {
+		                        string defEv = Designer.DefaultEventName(sel);
+		                        string h = sel.GetHandler(defEv);
+		                        if (h == "") {
+		                            h = Designer.SuggestHandler(sel, defEv);
+		                            sel.SetHandler(defEv, h);
+		                        }
+		                        this.RequestOpenCodeBehindHandler(h);
+		                    } else if (Designer.HasDisplayText(sel)) {
+		                        this.StartInlineRename();
+		                    } else if (Designer.CanNavigateCodeBehind(sel)) {
+		                        string defEv = Designer.DefaultEventName(sel);
+		                        string h = sel.GetHandler(defEv);
+		                        if (h == "") {
+		                            h = Designer.SuggestHandler(sel, defEv);
+		                            sel.SetHandler(defEv, h);
+		                        }
+		                        this.RequestOpenCodeBehindHandler(h);
+		                    }
+		                    canvasLastClickField = null;
+		                    canvasLastClickMs = 0;
+		                    canvasLastClickX = 0;
+		                    canvasLastClickY = 0;
+		                } else {
 	                    canvasLastClickField = sel;
 	                    canvasLastClickMs = nowMs;
 	                    canvasLastClickX = app.mouseX;
