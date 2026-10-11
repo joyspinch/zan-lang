@@ -4503,7 +4503,6 @@ int64_t zan_hw_rsa_crt(const uint8_t *msg, int64_t mLen,
     uint64_t s2[66] = {0};
     zan_mont_exp_ctx(&ctx_q, m_q, dq_limbs, dq_k, s2);
 
-    // 核心契约与执行状态转移规范。
     // s2_p = s2 mod p
     uint64_t s2_p[66];
     for (int i = 0; i < k; i++) s2_p[i] = s2[i];
