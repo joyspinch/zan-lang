@@ -933,6 +933,12 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   正确做法是以局部坐标 `f.fx + dx` / `f.fy + dy` 进行增量偏移，并在微调时自动调用 `DesignMakeFloat(f)` 解除流式/停靠约束、
   `DesignDeclareRect(f)` 持久化至设计文档。步长设定遵循标准规范：常规方向键 1px 像素级微调，Shift + 方向键大步长（8px 或网格尺寸），
   Alt + 方向键按相同步长微调组件尺寸（`fw`/`fh`），并同步作用于全部多选未锁定组件。
+- **多选对齐与统一尺寸（Alignments & Make Same Size）的局部坐标与约束解除**：
+  设计器中对多选组件做对齐（左/右/顶/底/居中）时，基准虽然是主选中项的全局逻辑坐标（`DesignWorldX(sel)` / `DesignWorldY(sel)`），
+  但写回各从属组件时，必须减去目标所在容器的编辑原点偏移（`f.fx = targetWorldX - this.DesignEditOriginX(f)`），
+  切忌直接把绝对渲染坐标 `LayoutX` 赋给 `fx`，否则嵌套容器内的组件将发生跳变脱离父容器；
+  在执行“等宽”、“等高”或“等尺寸（宽高同时匹配）”时，必须自动调用 `DesignMakeFloat(f)` 解除流式/停靠约束，
+  并调用 `DesignDeclareRect(f)` 持久化进设计文档（`designSource`），避免重载后尺寸丢失。
 
 - 跑 GUI 程序别用 `Start-Process -WindowStyle Hidden` 启动:STARTUPINFO 的
   SW_HIDE 会传给子进程,Zan 窗口创建即隐藏、事件循环立刻返回,症状像
