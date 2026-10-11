@@ -2530,6 +2530,19 @@ void zan_irgen_emit_arc_desc_init(zan_irgen_t *g) {
                 memcpy(buf, cur->name.str, (size_t)len);
                 buf[len] = 0;
                 names[k++] = zan_arena_strdup(g->arena, buf, (size_t)len);
+                if (cur->type) {
+                    for (int ifi = 0; ifi < cur->type->interface_count && k < 63; ifi++) {
+                        zan_type_t *iface = cur->type->interfaces[ifi];
+                        if (iface && iface->sym) {
+                            int ilen = (int)iface->sym->name.len;
+                            if (ilen > 319) ilen = 319;
+                            char ibuf[320];
+                            memcpy(ibuf, iface->sym->name.str, (size_t)ilen);
+                            ibuf[ilen] = 0;
+                            names[k++] = zan_arena_strdup(g->arena, ibuf, (size_t)ilen);
+                        }
+                    }
+                }
                 cur = (cur->type && cur->type->base_type)
                           ? cur->type->base_type->sym : NULL;
             }

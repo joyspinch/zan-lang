@@ -5305,6 +5305,7 @@ binding_lowered:
                     emit_dict_value_set(g, local->type, raw, key, right,
                         expr->binary.left->index.index, expr->binary.right,
                         locals);
+                    return right;
                 } else if (local && local->type && type_named(local->type, "List", 4)) {
                     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                     LLVMValueRef raw = LLVMBuildLoad2(g->builder, i8ptr, local->alloca, "lraw");
@@ -5470,6 +5471,7 @@ binding_lowered:
                             }
                             emit_dict_value_set(g, fsym->type, arr_ptr, key, right,
                                 expr->binary.left->index.index, expr->binary.right, locals);
+                            return right;
                         } else if (fsym->type && fsym->type->kind == TYPE_STRING) {
                             LLVMTypeRef i8 = LLVMInt8TypeInContext(g->ctx);
                             LLVMValueRef elem_ptr = LLVMBuildGEP2(g->builder, i8, arr_ptr, &idx, 1, "eidx");
@@ -5647,7 +5649,28 @@ binding_lowered:
                 }
             } else {
                 zan_type_t *at = infer_expr_type(g, arr_expr, locals);
-                if (at && type_named(at, "List", 4)) {
+                if (at && type_named(at, "Dict", 4)) {
+                    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+                    LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
+                    LLVMValueRef idx = emit_expr(g, expr->binary.left->index.index, locals);
+                    zan_type_t *kt = dict_key_type(g, at);
+                    LLVMValueRef key = idx;
+                    if (LLVMGetTypeKind(LLVMTypeOf(key)) == LLVMIntegerTypeKind) {
+                        LLVMTypeRef kem = kt ? map_type(g, kt) : NULL;
+                        if (kem && LLVMGetTypeKind(kem) == LLVMIntegerTypeKind &&
+                            LLVMGetIntTypeWidth(kem) < LLVMGetIntTypeWidth(LLVMTypeOf(key)))
+                            key = LLVMBuildTrunc(g->builder, key, kem, "k.nw");
+                        if (LLVMGetIntTypeWidth(LLVMTypeOf(key)) < 64)
+                            key = LLVMBuildSExt(g->builder, key, LLVMInt64TypeInContext(g->ctx), "k.sx");
+                        key = LLVMBuildIntToPtr(g->builder, key, i8ptr, "k.ip");
+                    } else if (LLVMTypeOf(key) != i8ptr) {
+                        key = LLVMBuildBitCast(g->builder, key, i8ptr, "k.bc");
+                    }
+                    emit_dict_value_set(g, at, arr_ptr, key, right,
+                        expr->binary.left->index.index, expr->binary.right, locals);
+                    emit_release_owned_call_temp(g, arr_expr, arr_ptr, locals);
+                    return right;
+                } else if (at && type_named(at, "List", 4)) {
                     /* 多层级联索引写入：基表达式读取与深层寻址 */
                     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
                     LLVMValueRef arr_ptr = emit_expr(g, arr_expr, locals);
@@ -10816,8 +10839,10 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
                         } else {
                             test = LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
                         }
-                    } else if (tt->kind == TYPE_OBJECT || tt->kind == TYPE_INTERFACE) {
+                    } else if (tt->kind == TYPE_OBJECT) {
                         test = nn;
+                    } else if (tt->kind == TYPE_INTERFACE) {
+                        test = emit_runtime_is_check_name(g, v, tt);
                     } else if (st->kind == TYPE_CLASS && type_is_or_derives(st, tt)) {
                         test = nn;
                     } else if (st->kind == TYPE_CLASS && type_is_or_derives(tt, st)) {

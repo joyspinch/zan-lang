@@ -1131,6 +1131,19 @@ static void emit_site_tyname_table(zan_irgen_t *g) {
                 memcpy(buf, cur->name.str, (size_t)len);
                 buf[len] = 0;
                 names[k++] = zan_arena_strdup(g->arena, buf, (size_t)len);
+                if (cur->type) {
+                    for (int ifi = 0; ifi < cur->type->interface_count && k < 63; ifi++) {
+                        zan_type_t *iface = cur->type->interfaces[ifi];
+                        if (iface && iface->sym) {
+                            int ilen = (int)iface->sym->name.len;
+                            if (ilen > 319) ilen = 319;
+                            char ibuf[320];
+                            memcpy(ibuf, iface->sym->name.str, (size_t)ilen);
+                            ibuf[ilen] = 0;
+                            names[k++] = zan_arena_strdup(g->arena, ibuf, (size_t)ilen);
+                        }
+                    }
+                }
                 cur = (cur->type && cur->type->base_type)
                           ? cur->type->base_type->sym : NULL;
             }
@@ -1194,7 +1207,7 @@ static LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
     LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
     gv = LLVMAddGlobal(g->mod, at, name);
     LLVMSetInitializer(gv, LLVMConstNull(at));
-    LLVMSetLinkage(gv, LLVMInternalLinkage);
+    zan_set_odr_comdat(g, gv, name);
     return gv;
 }
 
@@ -1223,6 +1236,11 @@ static void emit_vtables(zan_irgen_t *g) {
         }
         LLVMValueRef gv = get_vtable_global(g, sym);
         LLVMSetInitializer(gv, LLVMConstArray(i8ptr, elems, (unsigned)n));
+        LLVMSetGlobalConstant(gv, 1);
+        char name[320];
+        snprintf(name, sizeof(name), "__zan_vtable_%.*s",
+                 (int)sym->name.len, sym->name.str);
+        zan_set_odr_comdat(g, gv, name);
         free(elems);
         free(decls);
     }

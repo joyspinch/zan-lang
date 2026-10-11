@@ -3739,7 +3739,8 @@ static int is_arc_managed_type(zan_type_t *t) {
 
 static int is_rc_managed_type(zan_type_t *t) {
     return t && (t->kind == TYPE_STRING || t->kind == TYPE_DELEGATE ||
-                 t->kind == TYPE_ARRAY || is_arc_managed_type(t));
+                 t->kind == TYPE_ARRAY || t->kind == TYPE_OBJECT ||
+                 is_arc_managed_type(t));
 }
 
 static void emit_rc_release_for_type(zan_irgen_t *g, zan_type_t *type, LLVMValueRef v);

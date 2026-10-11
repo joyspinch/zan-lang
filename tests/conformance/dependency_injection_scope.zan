@@ -1,0 +1,79 @@
+using System;
+using System.DependencyInjection;
+
+class Counter {
+    public int id;
+    public Counter(int id) { this.id = id; }
+}
+
+class CounterGen {
+    public int seq;
+    public CounterGen() { this.seq = 1; }
+    public Counter Next() {
+        Counter c = new Counter(this.seq);
+        this.seq = this.seq + 1;
+        return c;
+    }
+}
+
+class DisposableScopeService : IDisposable {
+    public bool disposed;
+    public DisposableScopeService() { this.disposed = false; }
+    public void Dispose() { this.disposed = true; }
+}
+
+class Program {
+    static void Main() {
+        ServiceCollection services = new ServiceCollection();
+
+        CounterGen gen = new CounterGen();
+
+        ServiceFactory fTrans = (sp) => { return gen.Next(); };
+        services.AddTransient("Counter.Transient", fTrans);
+
+        ServiceFactory fScope = (sp) => { return gen.Next(); };
+        services.AddScoped("Counter.Scoped", fScope);
+
+        ServiceFactory fDisp = (sp) => { return new DisposableScopeService(); };
+        services.AddScoped("Service.Disposable", fDisp);
+
+        Counter singleInstance = new Counter(888);
+        services.AddSingletonInstance("Counter.SingletonInstance", singleInstance);
+
+        ServiceProvider root = services.BuildServiceProvider();
+
+        // 1. Transient 验证：每次解析均为新实例
+        Counter t1 = (Counter)root.GetService("Counter.Transient");
+        Counter t2 = (Counter)root.GetService("Counter.Transient");
+        Console.WriteLine("t1.id=" + t1.id.ToString());
+        Console.WriteLine("t2.id=" + t2.id.ToString());
+
+        // 2. SingletonInstance 验证
+        Counter sInst = (Counter)root.GetService("Counter.SingletonInstance");
+        Console.WriteLine("sInst.id=" + sInst.id.ToString());
+
+        // 3. Scoped 验证：同一 scope 内部相同，不同 scope 间独立
+        IServiceScope scope1 = root.CreateScope();
+        IServiceProvider sp1 = scope1.GetServiceProvider();
+        Counter sc1_a = (Counter)sp1.GetService("Counter.Scoped");
+        Counter sc1_b = (Counter)sp1.GetService("Counter.Scoped");
+        Console.WriteLine("sc1_a.id=" + sc1_a.id.ToString());
+        Console.WriteLine("sc1_b.id=" + sc1_b.id.ToString());
+
+        DisposableScopeService d1 = (DisposableScopeService)sp1.GetService("Service.Disposable");
+        Console.WriteLine("d1.disposed before=" + d1.disposed.ToString());
+
+        IServiceScope scope2 = root.CreateScope();
+        IServiceProvider sp2 = scope2.GetServiceProvider();
+        Counter sc2_a = (Counter)sp2.GetService("Counter.Scoped");
+        Console.WriteLine("sc2_a.id=" + sc2_a.id.ToString());
+
+        // 4. Scope Dispose 验证级联清理
+        scope1.Dispose();
+        Console.WriteLine("d1.disposed after=" + d1.disposed.ToString());
+        scope2.Dispose();
+
+        root.Dispose();
+        Console.WriteLine("All DI scopes verified successfully!");
+    }
+}
