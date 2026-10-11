@@ -1,0 +1,60 @@
+using System;
+using System.Diagnostics;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace Conf;
+
+class Prog {
+    static void Main() {
+        // 1. 测试根活动与 W3C TraceContext 生成
+        Activity root = Activity.Start("test-root");
+        Console.WriteLine("root-traceid-len: " + Convert.ToString(root.traceId.Length));
+        Console.WriteLine("root-spanid-len: " + Convert.ToString(root.spanId.Length));
+        Console.WriteLine("root-parent-empty: " + Convert.ToString(root.parentSpanId.Length == 0 ? 1 : 0));
+        Console.WriteLine("root-current-match: " + Convert.ToString(Activity.Current == root ? 1 : 0));
+
+        string rootTp = root.ToTraceParent();
+        Console.WriteLine("root-tp-len: " + Convert.ToString(rootTp.Length));
+        Console.WriteLine("root-tp-version: " + Convert.ToString(rootTp.StartsWith("00-") ? 1 : 0));
+
+        // 2. 测试子活动继承与上下文压栈/出栈
+        Activity child = Activity.Start("test-child");
+        Console.WriteLine("child-inherits-traceid: " + Convert.ToString(child.traceId == root.traceId ? 1 : 0));
+        Console.WriteLine("child-parent-span-match: " + Convert.ToString(child.parentSpanId == root.spanId ? 1 : 0));
+        Console.WriteLine("child-different-span: " + Convert.ToString(child.spanId != root.spanId ? 1 : 0));
+        Console.WriteLine("child-current-match: " + Convert.ToString(Activity.Current == child ? 1 : 0));
+
+        child.SetTag("service.name", "billing");
+        Console.WriteLine("child-tag: " + child.GetTag("service.name"));
+
+        child.Stop();
+        Console.WriteLine("after-child-stop-current-root: " + Convert.ToString(Activity.Current == root ? 1 : 0));
+
+        root.Stop();
+        Console.WriteLine("after-root-stop-current-null: " + Convert.ToString(Activity.Current == null ? 1 : 0));
+
+        // 3. 测试从入站 W3C traceparent 恢复活动
+        string inboundTp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        Activity inbound = Activity.StartFromTraceParent("inbound-worker", inboundTp);
+        Console.WriteLine("inbound-traceid-match: " + Convert.ToString(inbound.traceId == "4bf92f3577b34da6a3ce929d0e0e4736" ? 1 : 0));
+        Console.WriteLine("inbound-parent-match: " + Convert.ToString(inbound.parentSpanId == "00f067aa0ba902b7" ? 1 : 0));
+        Console.WriteLine("inbound-new-span-len: " + Convert.ToString(inbound.spanId.Length));
+
+        // 4. 测试 HttpClient 请求自动注入当前链路 traceparent 头部
+        HttpClient client = new HttpClient("127.0.0.1", 8080);
+        string req = client.BuildRequest("GET", "/api/order", "", false);
+        string expectedHeader = "traceparent: " + inbound.ToTraceParent();
+        Console.WriteLine("http-has-traceparent: " + Convert.ToString(req.Contains(expectedHeader) ? 1 : 0));
+
+        inbound.Stop();
+
+        // 5. 显式设置 TraceParent
+        HttpClient clientExplicit = new HttpClient("127.0.0.1", 8080);
+        clientExplicit.SetTraceParent("00-11112222333344445555666677778888-aaaabbbbccccdddd-01");
+        string reqExplicit = clientExplicit.BuildRequest("POST", "/test", "data", false);
+        Console.WriteLine("explicit-tp-match: " + Convert.ToString(reqExplicit.Contains("traceparent: 00-11112222333344445555666677778888-aaaabbbbccccdddd-01") ? 1 : 0));
+
+        Console.WriteLine("tracing-all-tests-passed: 1");
+    }
+}

@@ -15,6 +15,11 @@ enum LogLevel {
     FATAL = 5,
 }
 
+enum LogFormat {
+    TEXT = 0,
+    JSON = 1,
+}
+
 // 进程级滚动文件日志。写文件是日志的默认去处：服务跑在后台（worker、
 // 守护进程、Windows 上没有控制台）时，只写 stdout 等于什么都没记，
 // 出事后无从查起。
@@ -45,10 +50,20 @@ class Log {
     static string dir = "";
     static string pattern = "{yyyy}{MM}/{dd}.log";
     static int minLevel = 2;
+    static int format = 0;
     static long maxBytes = 0;
     static bool toConsole = true;
     static bool enabled = false;
     static string lastPath = "";
+
+    // 设置日志输出格式（LogFormat.TEXT 或 LogFormat.JSON）。
+    static void SetFormat(int fmt) { Log.format = fmt; }
+
+    // 获取当前日志格式。
+    static int Format() { return Log.format; }
+
+    // 设置最低日志输出级别。
+    static void SetMinLevel(int level) { Log.minLevel = level; }
 
     // 启用文件日志：`dir` 目录（不存在则创建），`pattern`
     // 见类说明，`minLevel` 以下的记录被丢弃。
@@ -101,9 +116,28 @@ class Log {
     // 全灭，服务带空目录上线）。失败后清 lastPath，下一条重验目录。
     static void Write(int level, string msg) {
         if (level < Log.minLevel) { return; }
-        DateTime t = DateTime.Now();
-        string line = t.ToString() + " [" + Log.LevelName(level) + "] "
-            + Convert.ToString(ProcessHost.WorkerId()) + " " + msg + "\n";
+        string line = "";
+        if (Log.format == (int)LogFormat.JSON) {
+            DateTime t = DateTime.Now();
+            string trId = "";
+            string spId = "";
+            if (Activity.Current != null) {
+                trId = Activity.Current.traceId;
+                spId = Activity.Current.spanId;
+            }
+            string trPart = "";
+            if (trId.Length > 0) {
+                trPart = ",\"traceId\":\"" + trId + "\",\"spanId\":\"" + spId + "\"";
+            }
+            line = "{\"time\":\"" + t.ToString() + "\",\"level\":\"" + Log.LevelName(level).Trim() + "\",\"pid\":"
+                + Convert.ToString(ProcessHost.Pid()) + ",\"wid\":"
+                + Convert.ToString(ProcessHost.WorkerId()) + trPart
+                + ",\"msg\":\"" + Log.EscapeJson(msg) + "\"}\n";
+        } else {
+            DateTime t = DateTime.Now();
+            line = t.ToString() + " [" + Log.LevelName(level) + "] "
+                + Convert.ToString(ProcessHost.WorkerId()) + " " + msg + "\n";
+        }
         if (Log.toConsole || !Log.enabled) { Console.Write(line); }
         if (!Log.enabled) { return; }
         string path = Log.CurrentPath();
@@ -118,6 +152,21 @@ class Log {
         } catch (Exception ex) {
             Log.lastPath = "";
         }
+    }
+
+    static string EscapeJson(string str) {
+        if (str == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < str.Length; i = i + 1) {
+            char c = str[i];
+            if (c == '"') { sb.Append("\\\""); }
+            else if (c == '\\') { sb.Append("\\\\"); }
+            else if (c == '\n') { sb.Append("\\n"); }
+            else if (c == '\r') { sb.Append("\\r"); }
+            else if (c == '\t') { sb.Append("\\t"); }
+            else { sb.Append(c); }
+        }
+        return sb.ToString();
     }
 
     // 把已写满的 `path` 改名为第一个空闲的 `path.N`，返回仍然

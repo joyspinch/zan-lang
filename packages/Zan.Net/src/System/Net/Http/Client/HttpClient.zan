@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Net.Tls;
 using System.Net.External;
 using System.Threading;
+using System.Diagnostics;
 
 namespace System.Net.Http.Client;
 
@@ -92,6 +93,7 @@ class HttpClient {
     bool kaBusy;  // 在途请求标志：并发请求退回一次性通道
     bool kaEnabled;
     HttpConnectionPool pool;
+    string traceParent;
 
     [DllImport("crt")]
     static extern nint fopen(string path, string mode);
@@ -141,6 +143,7 @@ class HttpClient {
         this.kaBusy = false;
         this.kaEnabled = true;
         this.pool = HttpConnectionPool.CreateDefault();
+        this.traceParent = "";
     }
 
     // 为指定的主机和端口创建 HTTPS 客户端。
@@ -492,6 +495,17 @@ class HttpClient {
         return this.pool;
     }
 
+    // 设置出站分布式链路追踪 traceparent 头部。
+    HttpClient SetTraceParent(string tp) {
+        this.traceParent = tp != null ? tp : "";
+        return this;
+    }
+
+    // 获取当前配置的出站 traceparent 头部。
+    string TraceParent() {
+        return this.traceParent;
+    }
+
     // 当 <see cref="SetHeader"/> 已提供过一个名字
     // （ASCII 大小写不敏感）匹配的头部时返回 true。这样 BuildRequest 可以只保留
     // 调用者自选的 Content-Type，而非总是强制表单编码。
@@ -608,6 +622,20 @@ class HttpClient {
             sb.Append("Connection: close\r\n");
         } else {
             sb.Append("Connection: keep-alive\r\n");
+        }
+
+        if (!this.HasHeaderName("traceparent")) {
+            string tp = this.traceParent;
+            if (tp == null || tp.Length == 0) {
+                if (Activity.Current != null) {
+                    tp = Activity.Current.ToTraceParent();
+                }
+            }
+            if (tp != null && tp.Length > 0) {
+                sb.Append("traceparent: ");
+                sb.Append(tp);
+                sb.Append("\r\n");
+            }
         }
         sb.Append("\r\n");
         return sb.ToString();
