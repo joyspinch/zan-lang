@@ -322,7 +322,10 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   3. 自由与流式拖拽位移隔离：仅当鼠标移动超出物理阈值（`dx >= 4 || dy >= 4`）时才触发 `DesignMakeFloat`，避免原地单击或抖动将流式/停靠组件意外变为绝对定位；外壳/顶栏组件（如 ToolStrip）优先使用 `dock: top` 或主 Flex 列首项，避免绝对定位脱离文档流被后续流式容器覆盖；
   4. Z-Order 渲染层级与列表下标契约（置顶置底倒置教训）：GUI Retained 模式与 HTML 遵循自然文档序绘制（`0 -> Count - 1`，下标 0 最先绘制处于最底层，下标末尾最后绘制处于最顶层，`HitTest` 命中测试从末尾向前逆序检测）。因此置顶（Bring to Front）必须移至末尾下标 `Count - 1`，置底（Send to Back）移至头部下标 `0`；上移一层（Bring Forward）为正向位移 `+1`，下移一层（Send Backward）为负向位移 `-1`，切勿倒置导致“越置顶越在底层被遮挡”；
   5. Dock 停靠模式一等公民与流式 Fill 撑满：顶栏（ToolStrip/MenuBar）和底栏（StatusBar）首选 `dockSide`（Top=1, Bottom=2, Fill=5），并在 Inspector 中暴露可视化停靠选项；停靠组件协同设置 `position = 0` 保持在文档流中，避免脱离文档流导致后续流式容器覆盖顶栏；全流式容器下主组件自动撑满高度使用 `flexGrow = 1`（Fill / Grow）；
-  6. 组件大纲树（Component Tree / Outline）大纲导航与双向联动选择：左侧面板提供 `[ 组件库 | 大纲树 ]` 双 Tab 切换，递归遍历显示完整窗口的嵌套结构、图标、类型与定位模式（Dock/Float）；树节点单击直接同步选中目标组件，彻底解决画布深层嵌套、零尺寸或被遮挡组件无法点中的痛点。
+  6. 组件大纲树（Component Tree / Outline）大纲导航与双向联动选择：左侧面板提供 `[ 组件库 | 大纲树 ]` 双 Tab 切换，递归遍历显示完整窗口的嵌套结构、图标、类型与定位模式（Dock/Float）；树节点单击直接同步选中目标组件，彻底解决画布深层嵌套、零尺寸或被遮挡组件无法点中的痛点；
+  7. 容器 Flex 弹性排版一等公民建模（方向/主轴/交叉轴/换行）：Panel/Card/FlowPanel 等容器的子项流向与对齐方式必须作为 FormField 核心建模字段（flexDir: Column/Row、justify: Start/Center/End/SpaceBetween、alignItems: Start/Center/End/Stretch、flexWrap），并在 Inspector 检查器提供直观的可视化配置与 FormBuilder 同构映射，彻底免除在设计器中被迫手写额外内联 flex CSS 类的繁琐；
+  8. 多选画布上下文菜单与就地排版对齐：多选（freeExtra.Count > 0）时，右键上下文菜单直接呼出「左/顶/右/底对齐、水平/垂直居中、水平/垂直均分、等宽/等高」，无需移至顶部 Ribbon 翻找；
+  9. 大纲树就地右键菜单与 Alt+方向键尺寸缩放：左侧大纲树支持右键就地呼出操作菜单；自由排版模式下支持 Alt+方向键（结合网格吸附与 Shift 步长）快捷调整控件宽高。
 - **富文本/自绘文本的默认前景兜底是纯白**(Arpg 深色底习惯):亮色皮肤
   里标记文本没写色码的段落、以及 #W 白/#Y 纯黄这类深底快捷色,画在
   亮底上全部隐形——不是"渲染丢了"。皮肤补

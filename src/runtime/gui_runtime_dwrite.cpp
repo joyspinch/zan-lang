@@ -22,7 +22,6 @@
 #include <string.h>
 #include <wchar.h>
 
-static FILE *dbg();
 static IDWriteFactory *g_factory = nullptr;
 static IDWriteFactory2 *g_factory2 = nullptr;   /* Win 8.1+: color glyphs */
 static IDWriteGdiInterop *g_gdi = nullptr;      /* bitmap render targets */
@@ -94,9 +93,6 @@ public:
     HRESULT STDMETHODCALLTYPE DrawGlyphRun(void *, FLOAT x, FLOAT y,
         DWRITE_MEASURING_MODE, const DWRITE_GLYPH_RUN *run,
         const DWRITE_GLYPH_RUN_DESCRIPTION *, IUnknown *) noexcept override {
-        FILE *f = dbg();
-        if (f) { fprintf(f, "glyphrun glyphCount=%u factory2=%d' + chr(92) + 'n",
-            (unsigned)run->glyphCount, (int)(g_factory2 != nullptr)); fflush(f); }
         if (g_factory2) {
             IDWriteColorGlyphRunEnumerator *en = nullptr;
             if (SUCCEEDED(g_factory2->TranslateColorGlyphRun(x, y, run,
@@ -276,16 +272,6 @@ extern "C" int zan_dw_render(const wchar_t *w, int len,
     brt->Release();
     lay->Release();
     /* Premultiplied BGRA -> straight BGRA. */
-    {
-        FILE *f = dbg();
-        int ink = 0, maxa = 0;
-        for (int i = 0; i < tw * th; i++) {
-            unsigned char a = buf[i * 4 + 3];
-            if (a > 0) ink++;
-            if (a > maxa) maxa = a;
-        }
-        if (f) { fprintf(f, "readback ink=%d maxa=%d' + chr(92) + 'n", ink, maxa); fflush(f); }
-    }
     for (int i = 0; i < tw * th; i++) {
         unsigned char a = buf[i * 4 + 3];
         if (a > 0 && a < 255) {

@@ -1857,10 +1857,10 @@ EXPORT i32 zan_gui_atomic_present(void *hwnd, i32 surface_id) {
             ww = tw;
             wh = th;
             ox = tx;
-	            oy = ty;
-	        }
-	    }
-	    zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh);
+            oy = ty;
+        }
+    }
+    zan_atomic_layer_t *l = atomic_layer(hwnd, ww, wh);
     if (!l || !l->bits) return 0;
     int w = s->width, h = s->height;
     int stride = s->stride;
