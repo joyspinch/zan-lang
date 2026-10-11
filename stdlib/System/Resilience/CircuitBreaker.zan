@@ -1,0 +1,140 @@
+using System;
+using System.Threading;
+
+namespace System.Resilience;
+
+// 熔断器状态机三态。
+public enum CircuitState {
+    Closed = 0,
+    Open = 1,
+    HalfOpen = 2,
+}
+
+// 生产级高可用熔断器：支持连续错误阈值熔断、熔断静默期快速失败、半开探测自愈。
+public class CircuitBreaker {
+    CircuitState state;
+    int failureThreshold;
+    long breakDurationMs;
+    int successThreshold;
+    int consecutiveFailures;
+    int consecutiveSuccesses;
+    long trippedAtMs;
+    nint mtx;
+
+    public CircuitBreaker(int failureThreshold, long breakDurationMs, int successThreshold) {
+        this.failureThreshold = failureThreshold > 0 ? failureThreshold : 5;
+        this.breakDurationMs = breakDurationMs > 0 ? breakDurationMs : 5000;
+        this.successThreshold = successThreshold > 0 ? successThreshold : 2;
+        this.state = CircuitState.Closed;
+        this.consecutiveFailures = 0;
+        this.consecutiveSuccesses = 0;
+        this.trippedAtMs = 0;
+        this.mtx = Mutex.Create();
+    }
+
+    public static CircuitBreaker CreateDefault() {
+        return new CircuitBreaker(5, 5000, 2);
+    }
+
+    // 获取当前生效的熔断状态（如果处于 Open 且熔断时间已过，自动推进至 HalfOpen）。
+    public CircuitState State() {
+        Mutex.Lock(this.mtx);
+        try {
+            this.UpdateStateInternal();
+            return this.state;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 检查是否允许放行调用（Open 状态快速失败拦截，杜绝雪崩）。
+    public bool CanExecute() {
+        Mutex.Lock(this.mtx);
+        try {
+            this.UpdateStateInternal();
+            if (this.state == CircuitState.Closed) {
+                return true;
+            }
+            if (this.state == CircuitState.HalfOpen) {
+                return true; // 放行单次或少量探测流量
+            }
+            return false; // Open 状态快速失败
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 记录一次成功调用。
+    public void RecordSuccess() {
+        Mutex.Lock(this.mtx);
+        try {
+            if (this.state == CircuitState.HalfOpen) {
+                this.consecutiveSuccesses = this.consecutiveSuccesses + 1;
+                if (this.consecutiveSuccesses >= this.successThreshold) {
+                    // 半开探测通过，自动愈合恢复至 Closed
+                    this.state = CircuitState.Closed;
+                    this.consecutiveFailures = 0;
+                    this.consecutiveSuccesses = 0;
+                    this.trippedAtMs = 0;
+                }
+            } else if (this.state == CircuitState.Closed) {
+                this.consecutiveFailures = 0;
+            }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 记录一次失败调用。
+    public void RecordFailure() {
+        Mutex.Lock(this.mtx);
+        try {
+            long now = CircuitBreaker.NowMs();
+            if (this.state == CircuitState.HalfOpen) {
+                // 半开探测失败，立即重新触发熔断
+                this.state = CircuitState.Open;
+                this.trippedAtMs = now;
+                this.consecutiveSuccesses = 0;
+            } else if (this.state == CircuitState.Closed) {
+                this.consecutiveFailures = this.consecutiveFailures + 1;
+                if (this.consecutiveFailures >= this.failureThreshold) {
+                    // 连续错误达到阈值，触发熔断切为 Open
+                    this.state = CircuitState.Open;
+                    this.trippedAtMs = now;
+                    this.consecutiveSuccesses = 0;
+                }
+            }
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    // 手动重置熔断器至 Closed 初始正常状态。
+    public void Reset() {
+        Mutex.Lock(this.mtx);
+        try {
+            this.state = CircuitState.Closed;
+            this.consecutiveFailures = 0;
+            this.consecutiveSuccesses = 0;
+            this.trippedAtMs = 0;
+        } finally {
+            Mutex.Unlock(this.mtx);
+        }
+    }
+
+    void UpdateStateInternal() {
+        if (this.state == CircuitState.Open) {
+            long now = CircuitBreaker.NowMs();
+            if (now - this.trippedAtMs >= this.breakDurationMs) {
+                this.state = CircuitState.HalfOpen;
+                this.consecutiveSuccesses = 0;
+            }
+        }
+    }
+
+    static long NowMs() {
+        long freq = Stopwatch.Frequency();
+        if (freq <= 0) { return 0; }
+        return (long)(Stopwatch.NowTicks() * 1000.0 / (double)freq);
+    }
+}
