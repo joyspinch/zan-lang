@@ -265,8 +265,14 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
      支持语义标签映射（`button`, `input`, `textarea`, `select`, `progress`）与 78+ 款扩展控件（`<zan-card>`, `<zan-badge>`, `<zan-tabs>`）；不支持复杂的父子 `position: relative/absolute` 深度嵌套计算或深层伪元素。
   3. **复杂/泛型组件采用“容器占位 + Code-behind 挂载”定式**:
      对于 `VirtualList`, `TreeView`, `Dropdown<T>`, `CodeEditor` 等需泛型或模型的重型组件，HTML 中仅放置占位容器 `<div id="PlaceHolder" style="flex:1"></div>`，在 code-behind 中通过 `Find("PlaceHolder")` 实例化后 `Add()` 填入，禁止在 HTML 标签硬试探复杂参数。
-  4. **GenHtml 通道树根必须 `DockFill`**:
-     普通 `.html`（不带 `data-zan-design`）由 GenHtml 生成，body 根节点默认无 Dock，在 code-behind 中必须补齐 `root.DockFill`，否则界面缩在左上角。
+    4. **GenHtml 通道树根必须 `DockFill`**:
+       普通 `.html`（不带 `data-zan-design`）由 GenHtml 生成，body 根节点默认无 Dock，在 code-behind 中必须补齐 `root.DockFill`，否则界面缩在左上角。
+    5. **从设计截图还原精美客户端的“四步拆解定式”(网易云/QQ音乐实战验证)**:
+       - **第一步·视觉材质提取**: 从设计图取色提取主题主色与渐变层（暗紫/深灰阶梯，如 `linear-gradient(135deg, #26212b, #121015)`）；提炼特征几何（黑胶唱片大圆角 `border-radius: 180px`、同心圆同轴径向渐变 `radial-gradient`）；提炼吸底/吸顶磨砂半透明度（`rgba(18, 15, 21, 0.95)`）。
+       - **第二步·骨架分段与停靠**: 采用经典三段式停靠收敛视口：顶栏 `<zan-flex dock="top">`、吸底操作条 `<zan-flex dock="bottom">`、主舞台 `<zan-flex dock="fill">`。主舞台内部一分为二（唱盘区 + 歌词/列表区）自适应伸缩。
+       - **第三步·CSS 原生动效交付**: 旋转/呼吸高光直接在 CSS 声明内置关键帧动画（如 `animation: spin 24s linear infinite`），由底层 GPU 帧循环 60/120Hz 驱动无损旋转，严禁在 Zan 业务代码里手写角度插值时钟。
+       - **第四步·原生 Code-behind 极简绑定**: HTML 内完全不写 `<script>`；在 `App.zan` 中仅写 30~50 行强类型业务逻辑，通过 `HtmlHandlers.Add("OnTogglePlay", OnTogglePlay)` 编译期安全绑定原生事件。
+       - **验收铁律**: 一律经 `zan_gui_snapshot` 或无头 `ZAN_UI_SCRIPT` 回收 `tree.json` 验真，确保各主要容器高度不塌陷、子项不叠放、无无效坐标警告。
 - 项目自带 `skins/` 目录要连 base.css 一起带——同名目录整体跳过
   stdlib 基线内嵌,基线层丢了 flex 全退化成叠矩形(wuwei 百艺页签全叠)。
 - 游戏帧循环:菜单/面板可嵌(脏区门控,实测均值 3ms);每帧热路径 HUD
