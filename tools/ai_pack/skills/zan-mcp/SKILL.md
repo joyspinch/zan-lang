@@ -78,6 +78,10 @@ Ask-the-toolchain tools (use these before file tools):
 | `zan_example` | `{topic?}` → the files of a shipped, build-verified program; no topic → the catalog (GUI, games, console, HTTP/MVC servers, IoT, DLL libraries). |
 | `zan_compile` | `{content, filename?}` → compiles that snippet in an isolated directory and returns `{ok, exitCode, diagnostics[], raw}` with file/line/column. The cheapest way to settle a language question. |
 | `zan_build_project` | `{entry?}` (defaults to `src/App.zan` / `src/main.zan`) → builds the workspace project, same structured diagnostics. |
+| `pkg_list_installed` | `{}` → list installed packages in project's `.zan-packages/`. |
+| `pkg_search` | `{query}` → search packages in the ecosystem pool by name/namespace/description. |
+| `pkg_install` | `{name, scope?}` → install a package from ecosystem pool into project `.zan-packages/`. |
+| `pkg_info` | `{name}` → inspection of package metadata, license, exported namespaces, native drivers. |
 
 Workspace tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `mkdir`,
 `delete_path`, `move_path`, `copy_path`, `stat_path`, `find_files`,
