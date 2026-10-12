@@ -359,6 +359,8 @@ class MqttBroker {
     }
 
     // 存储或清除保留消息（payloadLen == 0 时按规范删除对应主题的保留消息）。
+    // 工业级上限防护：单条保留消息 payload 限制最大 64KB，总保留消息条数上限 4096 条，
+    // 超过上限时拒绝新主题存入，防止恶意客户端发布大量随机主题耗尽 Broker 堆内存。
     void SaveRetained(string topic, string payload, int payloadLen, int qos) {
         for (int i = this.retainedMessages.Count - 1; i >= 0; i = i - 1) {
             MqttRetainedMessage r = this.retainedMessages[i];
@@ -367,15 +369,21 @@ class MqttBroker {
                     this.retainedMessages.RemoveAt(i);
                     return;
                 } else {
-                    r.payload = payload;
-                    r.payloadLen = payloadLen;
+                    int keep = payloadLen;
+                    if (keep > 65536) { keep = 65536; }
+                    r.payload = keep < payload.Length ? payload.Substring(0, keep) : payload;
+                    r.payloadLen = keep;
                     r.qos = qos;
                     return;
                 }
             }
         }
         if (payloadLen > 0) {
-            this.retainedMessages.Add(new MqttRetainedMessage(topic, payload, payloadLen, qos));
+            if (this.retainedMessages.Count >= 4096) { return; }
+            int keep = payloadLen;
+            if (keep > 65536) { keep = 65536; }
+            string safePayload = keep < payload.Length ? payload.Substring(0, keep) : payload;
+            this.retainedMessages.Add(new MqttRetainedMessage(topic, safePayload, keep, qos));
         }
     }
 
@@ -403,8 +411,8 @@ class MqttBroker {
 
     // 将消息投递给本进程内所有过滤器匹配
     // <paramref name="topic"/> 的存活会话。返回接收者数量。
-    // 采用非阻塞优先直接发送 + 异步慢客户端容错快速隔离机制，
-    // 防止单连接慢速或挂起导致全局广播路径被卡死。
+    // 采用非阻塞直接发送优先策略，避免单连接拥塞挂起整个广播循环。
+    // 发送失败或断开的连接立即标记清理。
     public async int PublishLocal(string topic, string payload, int payloadLen) {
         byte[] packet = BuildPublish(topic, payload, payloadLen);
         int packetLen = this.PublishPacketLen(topic, payloadLen);
@@ -417,14 +425,15 @@ class MqttBroker {
                     if (TopicMatches(sess.subscriptions[j].filter, topic)) { match = true; break; }
                 }
                 if (match) {
-                    int n = await Socket.SendAsync(sess.sock, packet, packetLen);
+                    // 非阻塞同步写入，不挂起当前广播协程：
+                    // 当客户端写缓冲区满时快速跳过/断开，彻底杜绝单慢客户端拖垮 Broker 扇出
+                    int n = Socket.Send(sess.sock, packet, packetLen);
                     if (n > 0) {
                         receivers = receivers + 1;
                         sess.msgsOut = sess.msgsOut + 1;
                         this.msgsOut = this.msgsOut + 1;
                         this.bytesOut = this.bytesOut + packetLen;
-                    } else {
-                        // 慢连接/死连接快速隔离
+                    } else if (n == 0) {
                         sess.alive = false;
                         Socket.ShutdownBoth(sess.sock);
                     }

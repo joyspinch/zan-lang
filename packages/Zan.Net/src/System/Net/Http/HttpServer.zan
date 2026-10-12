@@ -167,13 +167,22 @@ class HttpServer {
     }
 
     // 超过 maxConnections 时对下游回 503（Connection: close）并关闭。
+    // 使用 HttpDeadline 设定 3 秒硬超时并用 finally 闭环关闭连接，
+    // 防止慢客户端故意不收包导致 RejectOverloaded 协程挂起与句柄泄露。
     static async void RejectOverloaded(nint clientSock) {
+        HttpDeadlineToken watch = HttpDeadline.Arm(clientSock, 3000);
         TcpClient client = TcpClient.FromSocket(clientSock);
-        HttpResponse busy = HttpResponse.WithStatus(503, "Service Unavailable",
-            "server busy");
-        busy = busy.SetKeepAlive(false);
-        int _s = await client.SendAsync(busy.Build());
-        client.Close();
+        try {
+            HttpResponse busy = HttpResponse.WithStatus(503, "Service Unavailable",
+                "server busy");
+            busy = busy.SetKeepAlive(false);
+            int _s = await client.SendAsync(busy.Build());
+        } catch (Exception _ex) {
+            // 发送失败直接丢弃，进入 finally 关闭套接字
+        } finally {
+            HttpDeadline.Disarm(watch);
+            client.Close();
+        }
     }
 
     // 处理单个客户端连接。连接计数必须在 finally 中归还：
