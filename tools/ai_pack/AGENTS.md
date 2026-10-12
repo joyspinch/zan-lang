@@ -49,18 +49,24 @@ re-read that one window rather than switching to a whole-file rewrite.
 returns a body. Read the body of the skill you are about to use, not all of
 them — and not again later in the same session.
 
-## 1. Never guess an API
+## 1. Never guess an API or package
 
 Zan is not C#, and looking similar is exactly the trap. Before you write a call
 you have not personally verified in this project:
 
 * `zan_api_search("Http.Post")` → exact signature, file, line.
+* `pkg_search("Data")` / `pkg_install("Zan.Data")` → when a namespace is missing
+  (e.g. `unknown namespace 'System.Data'`), search the official ecosystem and
+  install the package into `.zan-packages/` instead of rewriting or working around it.
 * `zan_example("<topic>")` → a shipped, build-verified program to copy from
   (call it with no topic for the catalog).
 * Still unsure? `zan_compile` a five-line snippet and read the diagnostic.
 
-Inventing a method that "should" exist is the single most expensive mistake in
-this language: it compiles in your head and nowhere else.
+Without MCP, use `<ZAN_SDK>/toolchain/zanc --api <symbol>` to query signatures
+directly from the terminal.
+
+Inventing a method or package that "should" exist is the single most expensive
+mistake in this language: it compiles in your head and nowhere else.
 
 ## 2. Compile before you claim
 
