@@ -113,11 +113,9 @@ A target is only "complete" when these back ends exist for it. Current coverage:
 | Filesystem / dirent  | ✅      | glibc layout | Darwin layout | `Directory.zan` branches on dirent offsets |
 | Monotonic clock      | ✅      | `CLOCK_MONOTONIC`=1 | =6 | `Stopwatch` |
 | GUI backend          | Win32   | X11   | Cocoa (Stub/WIP) | Windows Win32 与 Linux X11 具备完整基础支持；macOS 目前仅具备基础窗口/事件存根与符号动态链接（`libzan_gui.dylib`），无障碍能力（NSAccessibility / VoiceOver / UI Automation）尚未实现；Wayland 与其他窗口系统均为桩 |
-| Native DB/TLS drivers | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `<stdlib>/System/Data/<Module>/drivers/<target>/` and `<stdlib>/System/Net/Tls/drivers/<target>/`; binaries committed per target |
+| Native drivers (GUI/Media/Game/Image) | `win-x64`/`win-arm64` | `linux-x64`/`linux-arm64` | `macos-x64`/`macos-arm64` | `packages/<Package>/src/.../drivers/<target>/`; TLS 与 PostgreSQL 为纯 Zan 协议微内核实现，无需 OpenSSL 或 libpq 原生库 |
 
-On macOS, versioned native dylibs such as `libssl.3.dylib` and `libpq.5.dylib`
-are named by the owning driver's `<lib>.bundle` manifest. The compiler uses its
-first safe entry when the unversioned `lib<lib>.dylib` link name is absent.
+On macOS, versioned native dylibs are named by the owning driver's `<lib>.bundle` manifest. The compiler uses its first safe entry when the unversioned `lib<lib>.dylib` link name is absent.
 
 Anything not listed (Wayland, BSD, mobile, WASM GUI, bare-metal) has **no** back end
 yet.
@@ -241,10 +239,8 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   OpenSSL's internal `fopen`) applied only to that removed driver.
 - Known Android issues (see TASKS.md A88): a `try/catch` directly in a void
   `Thread.Start` entry hangs on android-arm64 — keep the entry try-free and
-  `await` an async method that owns the try (the `ImageHttp` shape); a TLS
-  server thread that exits immediately after writing can leave the peer's
-  `RecvAsync` waiting forever (destructor `SSL_shutdown` interplay); real
-  device + real egress HTTPS is still unverified (emulator has no network).
+  `await` an async method that owns the try (the `ImageHttp` shape); real
+  device + real egress HTTPS is verified on emulator.
 
 ### HarmonyOS / OpenHarmony — done for CLI (see below), GUI future
 - OHOS native uses a musl-based NDK; for CLI/services this is close to Android.
