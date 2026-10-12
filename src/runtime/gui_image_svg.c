@@ -20,7 +20,7 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
     int w, h, x, n;
 
     *outPix = NULL; *outW = 0; *outH = 0;
-    if (!text || len <= 0) return 0;
+    if (!text || len <= 0 || len > 64 * 1024 * 1024) return 0;
     doc = (char *)malloc((size_t)len + 1);
     if (!doc) return 0;
     memcpy(doc, text, (size_t)len);

@@ -80,6 +80,26 @@
 #define ZAN_IMG_CACHE_BYTES 0
 #endif
 
+#ifdef _WIN32
+static CRITICAL_SECTION g_img_cs;
+static INIT_ONCE g_img_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK zan_img_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_img_cs);
+    return TRUE;
+}
+static void img_lock(void) {
+    InitOnceExecuteOnce(&g_img_once, zan_img_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_img_cs);
+}
+static void img_unlock(void) { LeaveCriticalSection(&g_img_cs); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_img_mx = PTHREAD_MUTEX_INITIALIZER;
+static void img_lock(void) { pthread_mutex_lock(&g_img_mx); }
+static void img_unlock(void) { pthread_mutex_unlock(&g_img_mx); }
+#endif
+
 static size_t g_img_bytes = 0;
 typedef struct {
     char path[512];
@@ -331,8 +351,11 @@ static zan_img_t *zan_img_load(const char *path) {
 }
 
 ZAN_IMAGE_EXPORT const zan_bitmap *zan_image_get(const char *key) {
+    img_lock();
     zan_img_t *e = zan_img_load(key);
-    return e ? &e->bitmap : NULL;
+    const zan_bitmap *res = e ? &e->bitmap : NULL;
+    img_unlock();
+    return res;
 }
 
 ZAN_IMAGE_EXPORT int32_t zan_image_width(const char *key) {
@@ -349,6 +372,7 @@ ZAN_IMAGE_EXPORT const char *zan_image_mem_report(void) {
     static char report[96];
     size_t mem_bytes = 0;
     int i;
+    img_lock();
     for (i = 0; i < g_mem_img_n; i++) {
         mem_bytes += (size_t)g_mem_imgs[i].bitmap.stride
                    * (size_t)g_mem_imgs[i].bitmap.height * sizeof(uint32_t);
@@ -356,12 +380,14 @@ ZAN_IMAGE_EXPORT const char *zan_image_mem_report(void) {
     snprintf(report, sizeof(report), "img %d/%.1fM mimg %d/%.1fM",
              g_img_n, (double)g_img_bytes / 1048576.0,
              g_mem_img_n, (double)mem_bytes / 1048576.0);
+    img_unlock();
     return report;
 }
 
 ZAN_IMAGE_EXPORT void zan_image_evict(const char *path) {
     int i;
     if (!path) return;
+    img_lock();
     for (i = 0; i < g_img_bad_n; i++) {
         if (strncmp(g_img_bad[i], path, 511) == 0) {
             memmove(&g_img_bad[i], &g_img_bad[i+1],
@@ -376,6 +402,7 @@ ZAN_IMAGE_EXPORT void zan_image_evict(const char *path) {
             memmove(&g_mem_imgs[i], &g_mem_imgs[i+1],
                     sizeof(zan_img_t) * (g_mem_img_n - i - 1));
             g_mem_img_n--;
+            img_unlock();
             return;
         }
     }
@@ -387,9 +414,11 @@ ZAN_IMAGE_EXPORT void zan_image_evict(const char *path) {
             memmove(&g_imgs[i], &g_imgs[i+1],
                     sizeof(zan_img_t) * (g_img_n - i - 1));
             g_img_n--;
+            img_unlock();
             return;
         }
     }
+    img_unlock();
 }
 
 /* 图像魔数识别：通过 RIFF 头探测 WebP，其他格式派发至 stb_image */
@@ -399,11 +428,21 @@ ZAN_IMAGE_EXPORT int32_t zan_image_load_mem(const char *key, const char *data,
     uint32_t *pix = NULL;
     zan_img_t *e;
     if (!key || !key[0] || !data || len <= 0) return 0;
+    img_lock();
     e = zan_img_mem_find(key);
-    if (e) return e->bitmap.width;
+    if (e) {
+        int32_t ew = e->bitmap.width;
+        img_unlock();
+        return ew;
+    }
+    img_unlock();
+
     pix = zan_img_decode((const unsigned char *)data, (int)len, &w, &h);
     if (!pix) return 0;
+
+    img_lock();
     zan_img_mem_put(key, pix, w, h);
+    img_unlock();
     return w;
 }
 
@@ -420,14 +459,24 @@ ZAN_IMAGE_EXPORT int32_t zan_image_load_svg(const char *key, const char *text,
     int w = 0, h = 0;
     zan_img_t *e;
     if (!key || !key[0] || !text) return 0;
+    img_lock();
     e = zan_img_mem_find(key);
-    if (e) return e->bitmap.width;
+    if (e) {
+        int32_t ew = e->bitmap.width;
+        img_unlock();
+        return ew;
+    }
+    img_unlock();
+
     if (len < 0) len = (int32_t)strlen(text);
     if (len <= 0) return 0;
     if (!zan_svg_raster(text, (int)len, &pix, &w, &h, (int)rasterW,
                         (int)rasterH))
         return 0;
+
+    img_lock();
     zan_img_mem_put(key, pix, w, h);
+    img_unlock();
     return w;
 }
 
@@ -452,6 +501,7 @@ ZAN_IMAGE_EXPORT int32_t zan_image_register_argb(const char *key,
                (size_t)w * sizeof(uint32_t));
     }
     /* 先拷贝后替换：防止借用的源图像在替换写入时发生并发破坏 */
+    img_lock();
     e = zan_img_mem_find(key);
     if (e) {
         free((void *)e->bitmap.pixels);
@@ -459,5 +509,6 @@ ZAN_IMAGE_EXPORT int32_t zan_image_register_argb(const char *key,
     } else {
         zan_img_mem_put(key, copy, w, h);
     }
+    img_unlock();
     return w;
 }

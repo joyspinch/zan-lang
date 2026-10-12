@@ -1031,6 +1031,7 @@ typedef struct zan_join_pair {
     struct zan_join *owner;
     int              idx;
     int              done;
+    struct zan_join_pair *next_in_frame;
 } zan_join_pair_t;
 
 typedef struct zan_join {
@@ -1069,6 +1070,8 @@ static void joinmap_rehash(size_t ncap) {
 }
 
 static void joinmap_put(zan_join_pair_t *pr) {
+    if (!pr || !pr->frame) return;
+    pr->next_in_frame = NULL;
     if ((g_joinmap_live + g_joinmap_dead + 1) * 4 >= g_joinmap_cap * 3)
         joinmap_rehash(g_joinmap_cap
                            ? (g_joinmap_live * 4 > g_joinmap_cap ? g_joinmap_cap * 2
@@ -1084,7 +1087,12 @@ static void joinmap_put(zan_join_pair_t *pr) {
             g_joinmap_live++;
             return;
         }
-        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) return;
+        if (cur != JOINMAP_TOMB && cur->frame == pr->frame) {
+            /* 同一任务被多个 join 监听：头插法链入一对多链表 */
+            pr->next_in_frame = cur;
+            g_joinmap_slots[i] = pr;
+            return;
+        }
         i = (i + 1) & mask;
     }
 }
@@ -1102,17 +1110,27 @@ static zan_join_pair_t *joinmap_get(void *frame) {
 }
 
 static void joinmap_remove(void *frame, zan_join_pair_t *pr) {
-    if (!g_joinmap_cap) return;
+    if (!g_joinmap_cap || !pr) return;
     size_t mask = g_joinmap_cap - 1;
     size_t i = live_hash(frame) & mask;
     for (;;) {
         zan_join_pair_t *cur = g_joinmap_slots[i];
         if (!cur) return;
-        if (cur == pr) {
-            if (cur->frame != frame) return;
-            g_joinmap_slots[i] = JOINMAP_TOMB;
-            g_joinmap_live--;
-            g_joinmap_dead++;
+        if (cur != JOINMAP_TOMB && cur->frame == frame) {
+            zan_join_pair_t **pp = &g_joinmap_slots[i];
+            while (*pp) {
+                if (*pp == pr) {
+                    *pp = pr->next_in_frame;
+                    pr->next_in_frame = NULL;
+                    if (!g_joinmap_slots[i]) {
+                        g_joinmap_slots[i] = JOINMAP_TOMB;
+                        g_joinmap_live--;
+                        g_joinmap_dead++;
+                    }
+                    return;
+                }
+                pp = &(*pp)->next_in_frame;
+            }
             return;
         }
         i = (i + 1) & mask;
@@ -1148,11 +1166,16 @@ static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t 
 static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *out_step) {
     *out_joiner = NULL;
     zan_join_pair_t *pr = joinmap_get(frame);
-    if (!pr) return;
-    pr->done = 1;
-    pr->owner->remaining--;
-    joinmap_remove(frame, pr);
-    join_fire_locked(pr->owner, out_joiner, out_step);
+    while (pr) {
+        zan_join_pair_t *next = pr->next_in_frame;
+        if (!pr->done) {
+            pr->done = 1;
+            pr->owner->remaining--;
+            join_fire_locked(pr->owner, out_joiner, out_step);
+        }
+        joinmap_remove(frame, pr);
+        pr = next;
+    }
 }
 
 static int zan_sched_trace(void) {
@@ -1166,29 +1189,39 @@ static int zan_sched_trace(void) {
     return cur;
 }
 
+#define ZAN_MAX_JOIN_FIRES 16
 void zan_join_complete(void *frame) {
     if (!frame || !g_joinmap_cap) return;
-    void *fire_joiner = NULL;
-    zan_timer_step_t fire_step = NULL;
-    int rem_dbg = -1, np_dbg = -1, any_dbg = -1, fired_dbg = 0;
+    void *fire_joiners[ZAN_MAX_JOIN_FIRES];
+    zan_timer_step_t fire_steps[ZAN_MAX_JOIN_FIRES];
+    int nfires = 0;
     live_lock();
     zan_join_pair_t *pr = joinmap_get(frame);
-    if (pr && !pr->done) {
-        pr->done = 1;
-        pr->owner->remaining--;
-        rem_dbg = pr->owner->remaining;
-        np_dbg = pr->owner->npairs;
-        any_dbg = pr->owner->any;
+    while (pr) {
+        zan_join_pair_t *next = pr->next_in_frame;
+        if (!pr->done) {
+            pr->done = 1;
+            pr->owner->remaining--;
+            void *joiner = NULL;
+            zan_timer_step_t step = NULL;
+            join_fire_locked(pr->owner, &joiner, &step);
+            if (joiner && step && nfires < ZAN_MAX_JOIN_FIRES) {
+                fire_joiners[nfires] = joiner;
+                fire_steps[nfires] = step;
+                nfires++;
+            }
+        }
         joinmap_remove(frame, pr);
-        join_fire_locked(pr->owner, &fire_joiner, &fire_step);
-        fired_dbg = (fire_joiner && fire_step) ? 1 : 0;
+        pr = next;
     }
     live_unlock();
-    if (zan_sched_trace())
-        fprintf(stderr, "[st] joincmp frame=%p rem=%d np=%d any=%d fired=%d\n",
-                frame, rem_dbg, np_dbg, any_dbg, fired_dbg);
+
     void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
-    if (fire_joiner && fire_step && _hook) _hook(fire_joiner, fire_step);
+    if (_hook) {
+        for (int i = 0; i < nfires; i++) {
+            _hook(fire_joiners[i], fire_steps[i]);
+        }
+    }
 }
 
 long long zan_join_new(int npairs, int any) {
@@ -1206,7 +1239,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
     if (!j || !frame) return 0;
     int bound = 0;
     live_lock();
-    if (live_has_nolock(frame) && !joinmap_get(frame)) {
+    if (live_has_nolock(frame)) {
         int32_t done = __atomic_load_n(
             (const volatile int32_t *)((const unsigned char *)frame + JOIN_OFF_DONE),
             __ATOMIC_ACQUIRE);
@@ -1217,6 +1250,7 @@ int zan_join_bind(long long entry, void *frame, int idx) {
             pr->owner = j;
             pr->idx = idx;
             pr->done = 0;
+            pr->next_in_frame = NULL;
             j->npairs++;
             j->remaining++;
             joinmap_put(pr);

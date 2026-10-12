@@ -872,50 +872,167 @@ int64_t zan_thread_current_id(void) {
 }
 
 
-#define ZAN_MONITOR_STRIPES 64
+/* 生产级自适应 SyncTable：细粒度分桶锁 + 独立 SyncBlock 链表
+ * 彻底消除静态条带哈希碰撞引发的不相干对象伪死锁 */
+#define ZAN_SYNC_BUCKETS 256
 
-static unsigned zan_monitor_stripe(void *obj) {
+typedef struct zan_sync_block {
+    void *obj;
+    int32_t ref_count;
+#ifdef _WIN32
+    CRITICAL_SECTION cs;
+#else
+    pthread_mutex_t mx;
+#endif
+    struct zan_sync_block *next;
+} zan_sync_block_t;
+
+typedef struct {
+#ifdef _WIN32
+    CRITICAL_SECTION bucket_cs;
+#else
+    pthread_mutex_t bucket_mx;
+#endif
+    zan_sync_block_t *head;
+} zan_sync_bucket_t;
+
+static zan_sync_bucket_t g_sync_buckets[ZAN_SYNC_BUCKETS];
+#ifdef _WIN32
+static INIT_ONCE g_sync_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK zan_sync_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once; (void)param; (void)ctx;
+    for (unsigned i = 0; i < ZAN_SYNC_BUCKETS; i++) {
+        InitializeCriticalSection(&g_sync_buckets[i].bucket_cs);
+        g_sync_buckets[i].head = NULL;
+    }
+    return TRUE;
+}
+#else
+static pthread_once_t g_sync_once = PTHREAD_ONCE_INIT;
+static void zan_sync_init(void) {
+    for (unsigned i = 0; i < ZAN_SYNC_BUCKETS; i++) {
+        pthread_mutex_init(&g_sync_buckets[i].bucket_mx, NULL);
+        g_sync_buckets[i].head = NULL;
+    }
+}
+#endif
+
+static inline unsigned zan_sync_bucket_idx(void *obj) {
     uintptr_t bits = (uintptr_t)obj;
     bits ^= bits >> 20;
     bits ^= bits >> 8;
-    return (unsigned)((bits >> 4) & (ZAN_MONITOR_STRIPES - 1));
+    return (unsigned)((bits >> 4) & (ZAN_SYNC_BUCKETS - 1));
 }
 
+void zan_monitor_enter(void *obj) {
+    if (!obj) return;
 #ifdef _WIN32
-static CRITICAL_SECTION g_monitor_cs[ZAN_MONITOR_STRIPES];
-static INIT_ONCE g_monitor_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK zan_monitor_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-    (void)once; (void)param; (void)ctx;
-    for (unsigned i = 0; i < ZAN_MONITOR_STRIPES; i++)
-        InitializeCriticalSection(&g_monitor_cs[i]);
-    return TRUE;
-}
-void zan_monitor_enter(void *obj) {
-    InitOnceExecuteOnce(&g_monitor_once, zan_monitor_init, NULL, NULL);
-    EnterCriticalSection(&g_monitor_cs[zan_monitor_stripe(obj)]);
-}
-void zan_monitor_exit(void *obj) {
-    LeaveCriticalSection(&g_monitor_cs[zan_monitor_stripe(obj)]);
-}
+    InitOnceExecuteOnce(&g_sync_once, zan_sync_init, NULL, NULL);
 #else
-static pthread_mutex_t g_monitor_mx[ZAN_MONITOR_STRIPES];
-static pthread_once_t g_monitor_once = PTHREAD_ONCE_INIT;
-static void zan_monitor_init(void) {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    for (unsigned i = 0; i < ZAN_MONITOR_STRIPES; i++)
-        pthread_mutex_init(&g_monitor_mx[i], &attr);
-    pthread_mutexattr_destroy(&attr);
-}
-void zan_monitor_enter(void *obj) {
-    pthread_once(&g_monitor_once, zan_monitor_init);
-    pthread_mutex_lock(&g_monitor_mx[zan_monitor_stripe(obj)]);
-}
-void zan_monitor_exit(void *obj) {
-    pthread_mutex_unlock(&g_monitor_mx[zan_monitor_stripe(obj)]);
-}
+    pthread_once(&g_sync_once, zan_sync_init);
 #endif
+    unsigned bidx = zan_sync_bucket_idx(obj);
+    zan_sync_bucket_t *bucket = &g_sync_buckets[bidx];
+
+#ifdef _WIN32
+    EnterCriticalSection(&bucket->bucket_cs);
+#else
+    pthread_mutex_lock(&bucket->bucket_mx);
+#endif
+
+    zan_sync_block_t *sb = bucket->head;
+    while (sb && sb->obj != obj) {
+        sb = sb->next;
+    }
+
+    if (!sb) {
+        sb = (zan_sync_block_t *)malloc(sizeof(zan_sync_block_t));
+        if (!sb) {
+#ifdef _WIN32
+            LeaveCriticalSection(&bucket->bucket_cs);
+#else
+            pthread_mutex_unlock(&bucket->bucket_mx);
+#endif
+            return;
+        }
+        sb->obj = obj;
+        sb->ref_count = 0;
+#ifdef _WIN32
+        InitializeCriticalSection(&sb->cs);
+#else
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&sb->mx, &attr);
+        pthread_mutexattr_destroy(&attr);
+#endif
+        sb->next = bucket->head;
+        bucket->head = sb;
+    }
+
+    sb->ref_count++;
+
+#ifdef _WIN32
+    LeaveCriticalSection(&bucket->bucket_cs);
+    EnterCriticalSection(&sb->cs);
+#else
+    pthread_mutex_unlock(&bucket->bucket_mx);
+    pthread_mutex_lock(&sb->mx);
+#endif
+}
+
+void zan_monitor_exit(void *obj) {
+    if (!obj) return;
+    unsigned bidx = zan_sync_bucket_idx(obj);
+    zan_sync_bucket_t *bucket = &g_sync_buckets[bidx];
+
+#ifdef _WIN32
+    EnterCriticalSection(&bucket->bucket_cs);
+#else
+    pthread_mutex_lock(&bucket->bucket_mx);
+#endif
+
+    zan_sync_block_t **curr_p = &bucket->head;
+    zan_sync_block_t *sb = NULL;
+    while (*curr_p) {
+        if ((*curr_p)->obj == obj) {
+            sb = *curr_p;
+            break;
+        }
+        curr_p = &(*curr_p)->next;
+    }
+
+    if (!sb) {
+#ifdef _WIN32
+        LeaveCriticalSection(&bucket->bucket_cs);
+#else
+        pthread_mutex_unlock(&bucket->bucket_mx);
+#endif
+        return;
+    }
+
+    sb->ref_count--;
+    int should_free = (sb->ref_count <= 0);
+    if (should_free) {
+        *curr_p = sb->next;
+    }
+
+#ifdef _WIN32
+    LeaveCriticalSection(&sb->cs);
+    if (should_free) {
+        DeleteCriticalSection(&sb->cs);
+        free(sb);
+    }
+    LeaveCriticalSection(&bucket->bucket_cs);
+#else
+    pthread_mutex_unlock(&sb->mx);
+    if (should_free) {
+        pthread_mutex_destroy(&sb->mx);
+        free(sb);
+    }
+    pthread_mutex_unlock(&bucket->bucket_mx);
+#endif
+}
 
 /* UI 主线程安全分发任务队列 */
 
