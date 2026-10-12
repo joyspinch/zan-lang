@@ -1,0 +1,354 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+// Observe the production painter only when the ordinary Form loop invokes it.
+class TrapCatSingleTapSprite : TrapCatSprite {
+    TrapCatSingleTapSprite(Button[] boardCells) : base(boardCells) {}
+
+    override void OnPaint(App app) {
+        base.OnPaint(app);
+        TrapCatSingleTapTest.RecordPaint(this, app);
+    }
+}
+
+class TrapCatSingleTapTest {
+    const int Seed = 20261012;
+    const int ObservationMs = 1500;
+    const int StartupGuardMs = 8000;
+    const int QuietMs = 80;
+    const int RequiredPaints = 6;
+    static Form form;
+    static Control root;
+    static TrapCatBoard board;
+    static Button[] cells;
+    static TrapCatSingleTapSprite sprite;
+    static nint observationLock;
+    #if WINDOWS
+    static nint initialPaintReady;
+    static nint workerDone;
+    #else
+    static string initialPaintReady;
+    static string workerDone;
+    #endif
+    static int clickedCell;
+    static int expectedCat;
+    static int clockStart;
+    static bool shown;
+    static bool boundsReady;
+    static int tapX;
+    static int tapY;
+    static int tapId;
+    static int initialPaints;
+    static int layoutWidth;
+    static int layoutHeight;
+    static int windowWidth;
+    static int windowHeight;
+    static int downHit = -1;
+    static int upHit = -1;
+    static int eventX;
+    static int eventY;
+    static bool injected;
+    static bool observationClosed;
+    static long injectedUs;
+    static long deadlineUs;
+    static long releasedUs;
+    static long lastPaintUs;
+    static int downs;
+    static int ups;
+    static int clicks;
+    static int initialX;
+    static int initialY;
+    static int paints;
+    static int movingPaints;
+    static int settledPaints;
+    static int creamPaints;
+    static int paintedX;
+    static int paintedY;
+    static int paintedW;
+    static int paintedH;
+    static int targetX;
+    static int targetY;
+    static int paintedCat;
+    static int paintedMoves;
+    static int paintedPixel;
+    static bool paintedMoving;
+    static bool changedPosition;
+    static bool paintedBlock;
+
+    static Control RequireControl(string id) {
+        Control control = root.Find(id);
+        if (control == null) { throw new Exception("Missing game control: " + id); }
+        return control;
+    }
+
+    static void Refresh() {
+        for (int i = 0; i < TrapCatBoard.Count; i++) {
+            Button cell = cells[i];
+            string state = board.blocked[i] ? "blocked" : "open";
+            if (i == board.cat) { state = "cat"; }
+            cell.SetClassIn("open blocked cat", state);
+            cell.Text = "";
+            cell.Disabled = board.result != TrapCatResult.Playing || board.blocked[i] || i == board.cat;
+        }
+        TrapCatSingleTapTest.RequireControl("Moves").SetProp("text", Convert.ToString(board.moves) + " 步");
+        form.GetApp().RequestRedraw();
+    }
+
+    // HTML wires this to the real Button.Click.PostS deferred dispatch path.
+    static void PickCell(string arg) {
+        Mutex.Lock(observationLock);
+        if (!observationClosed && Stopwatch.GetMicroseconds() < deadlineUs) { clicks++; }
+        Mutex.Unlock(observationLock);
+        if (board.Block(Convert.ToInt32(arg))) {
+            sprite.WalkTo(board.cat, board.result);
+            TrapCatSingleTapTest.Refresh();
+        }
+    }
+
+    static void ObserveEvent() {
+        App app = form.GetApp();
+        // CMake's hidden launch must not turn this visible-rendering test into an iconic-window test.
+        if (!shown) {
+            shown = true;
+            app.window.Show();
+            #if WINDOWS
+            if (Win32Shell.IsIconic(app.window.handle) != 0) {
+                Win32Shell.ShowWindow(app.window.handle, 9);
+            }
+            #endif
+        }
+        long now = Stopwatch.GetMicroseconds();
+        Mutex.Lock(observationLock);
+        if (injected && !observationClosed && now < deadlineUs) {
+            int kind = app.EventKind();
+            if (kind == 2) {
+                downs++;
+                downHit = app.PressTarget();
+                eventX = app.window.EventX();
+                eventY = app.window.EventY();
+            }
+            if (kind == 3) {
+                ups++;
+                upHit = app.ClickTarget();
+                releasedUs = now;
+                eventX = app.window.EventX();
+                eventY = app.window.EventY();
+            }
+        }
+        Mutex.Unlock(observationLock);
+    }
+
+    static void RecordPaint(TrapCatSingleTapSprite cat, App app) {
+        long now = Stopwatch.GetMicroseconds();
+        bool signalReady = false;
+        Mutex.Lock(observationLock);
+        if (!injected) {
+            layoutWidth = app.canvas.Width();
+            layoutHeight = app.canvas.Height();
+            windowWidth = app.window.ClientWidth();
+            windowHeight = app.window.ClientHeight();
+        }
+        bool liveSurface = layoutWidth > 0 && layoutHeight > 0 && windowWidth > 0 && windowHeight > 0;
+        if (!observationClosed && !injected && liveSurface && cat.bw > 0 && cat.bh > 0) {
+            Button cell = cells[clickedCell];
+            initialX = cat.bx;
+            initialY = cat.by;
+            tapX = cell.bx + cell.bw / 2;
+            tapY = cell.by + cell.bh / 2;
+            tapId = cell.wid;
+            initialPaints++;
+            layoutWidth = app.canvas.Width();
+            layoutHeight = app.canvas.Height();
+            // Android's Surface/DPI layout can replace the very first fallback geometry.
+            // Keep the newest real paint until injection, without requiring a second frame.
+            if (!boundsReady && cell.bw > 0 && cell.bh > 0) {
+                boundsReady = true;
+                signalReady = true;
+            }
+        } else if (!observationClosed && now < deadlineUs && clicks == 1 && releasedUs > 0) {
+            // Exclude the input burst: only later, autonomous paints count toward the cadence assertion.
+            if (now - releasedUs >= (long)TrapCatSingleTapTest.QuietMs * 1000) { paints++; }
+            paintedX = cat.bx;
+            paintedY = cat.by;
+            paintedW = cat.bw;
+            paintedH = cat.bh;
+            paintedMoving = cat.Moving();
+            paintedCat = board.cat;
+            paintedMoves = board.moves;
+            paintedBlock = board.blocked[clickedCell];
+            lastPaintUs = now;
+            Button target = cells[board.cat];
+            int size = target.bw * 8 / 5;
+            int height = size * 144 / 128;
+            targetX = target.bx + target.bw / 2 - size / 2;
+            targetY = target.by + target.bh / 2 + target.bh / 4 - height * 132 / 144;
+            // Read the cream chest from the actual canvas before Present discards its contents.
+            paintedPixel = app.canvas.GetPixel(cat.bx + cat.bw / 2, cat.by + cat.bh * 104 / 144);
+            if (cat.bx != initialX || cat.by != initialY) { changedPosition = true; }
+            if (paintedMoving) {
+                if (cat.bx != initialX || cat.by != initialY) { movingPaints++; }
+            } else if (cat.bx == targetX && cat.by == targetY && board.cat == expectedCat) {
+                settledPaints++;
+                if (paintedPixel == 0xfffff3d7) { creamPaints++; }
+            }
+        }
+        Mutex.Unlock(observationLock);
+        if (signalReady) { Semaphore.Release(initialPaintReady); }
+    }
+
+    static void Guard() {
+        // A stalled idle animation still has its initial full paint; do not wait for later frames.
+        if (Semaphore.WaitFor(initialPaintReady, TrapCatSingleTapTest.StartupGuardMs)) {
+            Thread.Sleep(300);
+            Mutex.Lock(observationLock);
+            injected = true;
+            injectedUs = Stopwatch.GetMicroseconds();
+            deadlineUs = injectedUs + (long)TrapCatSingleTapTest.ObservationMs * 1000;
+            int x = tapX;
+            int y = tapY;
+            Mutex.Unlock(observationLock);
+            form.GetApp().window.InjectEvent(2, x, y, 0, 0, 0);
+            Thread.Sleep(40);
+            form.GetApp().window.InjectEvent(3, x, y, 0, 0, 0);
+            // No polling, rendering, animation requests or UI wakes after this sole input pair.
+            Thread.Sleep(TrapCatSingleTapTest.ObservationMs + 20);
+        }
+        Mutex.Lock(observationLock);
+        // Freeze all evidence BEFORE the sole guard wake; late paints cannot repair a stall.
+        observationClosed = true;
+        Mutex.Unlock(observationLock);
+        form.GetApp().Post(() => form.GetApp().StopLoop());
+        Semaphore.Release(workerDone);
+    }
+
+    static string Evidence() {
+        return "injected=" + injected + " clock_start=" + clockStart
+            + " down=" + downs + " up=" + ups + " clicks=" + clicks
+            + " tap=" + tapX + "," + tapY + " tap_id=" + tapId
+            + " event=" + eventX + "," + eventY + " down_hit=" + downHit + " up_hit=" + upHit
+            + " bounds_ready=" + boundsReady + " initial_paints=" + initialPaints
+            + " layout=" + layoutWidth + "," + layoutHeight + " window=" + windowWidth + "," + windowHeight
+            + " autonomous_paints=" + paints + " moving_paints=" + movingPaints
+            + " settled_paints=" + settledPaints + " cream_paints=" + creamPaints
+            + " initial=" + initialX + "," + initialY
+            + " painted=" + paintedX + "," + paintedY + "," + paintedW + "," + paintedH
+            + " target=" + targetX + "," + targetY + " moving=" + paintedMoving
+            + " moves=" + paintedMoves + " cat=" + paintedCat + " expected_cat=" + expectedCat
+            + " clicked_cell=" + clickedCell + " blocked=" + paintedBlock
+            + " pixel=" + paintedPixel + " observation_ms=" + TrapCatSingleTapTest.ObservationMs
+            + " last_paint_after_tap_ms=" + ((lastPaintUs - injectedUs) / 1000);
+    }
+
+    static void Require(bool ok, string label) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + label + "\n" + TrapCatSingleTapTest.Evidence());
+            throw new Exception(label);
+        }
+        Console.WriteLine("PASS " + label);
+    }
+
+    static void Main() {
+        // Driver wait commands/test-mode pacing would conceal the very stall this test must catch.
+        Environment.SetEnvironmentVariable("ZAN_UI_TEST", "");
+        Environment.SetEnvironmentVariable("ZAN_UI_SCRIPT", "");
+        Window.UnfreezeTick();
+        clockStart = Window.GetTickMs();
+        observationLock = Mutex.Create();
+        initialPaintReady = Semaphore.Create(0, 1);
+        workerDone = Semaphore.Create(0, 1);
+        board = new TrapCatBoard();
+        board.NewRound(1, TrapCatSingleTapTest.Seed);
+        clickedCell = 0;
+        while (board.blocked[clickedCell]) { clickedCell++; }
+        TrapCatBoard expected = new TrapCatBoard();
+        expected.NewRound(1, TrapCatSingleTapTest.Seed);
+        if (!expected.Block(clickedCell) || expected.cat == TrapCatBoard.Center) {
+            throw new Exception("Fixture must move the cat on one open-cell tap");
+        }
+        expectedCat = expected.cat;
+        cells = new Button[TrapCatBoard.Count];
+        form = Form.Create("TrapCat single tap autonomy", 600, 760);
+        App app = form.GetApp();
+        app.SetPartialFrames(true);
+        #if ANDROID
+        app.SetChromeVisible(false);
+        #endif
+        app.CenterWindow();
+        app.EnableSkins(0);
+        app.UseAppCss(TrapCatHtml.Css);
+        HtmlHandlers handlers = new HtmlHandlers();
+        handlers.AddArg("cell", (string arg) => TrapCatSingleTapTest.PickCell(arg));
+        handlers.AddArg("difficulty", (string arg) => {
+            board.NewRound(Convert.ToInt32(arg), TrapCatSingleTapTest.Seed);
+            sprite.Reset(board.cat, board.result);
+            TrapCatSingleTapTest.Refresh();
+        });
+        handlers.Add("new-round", () => {
+            board.NewRound(1, TrapCatSingleTapTest.Seed);
+            sprite.Reset(board.cat, board.result);
+            TrapCatSingleTapTest.Refresh();
+        });
+        handlers.Add("undo", () => {
+            if (board.Undo()) {
+                sprite.Reset(board.cat, board.result);
+                TrapCatSingleTapTest.Refresh();
+            }
+        });
+        root = TrapCatHtml.Build(handlers);
+        root.DockFill();
+        form.Add(root);
+        for (int i = 0; i < TrapCatBoard.Count; i++) {
+            cells[i] = (Button)TrapCatSingleTapTest.RequireControl("Cell" + Convert.ToString(i));
+            cells[i].FreeLayout();
+        }
+        sprite = new TrapCatSingleTapSprite(cells);
+        sprite.Reset(board.cat, board.result);
+        TrapCatSingleTapTest.RequireControl("Board").Add(sprite);
+        TrapCatSingleTapTest.Refresh();
+        form.FrameHook(() => TrapCatSingleTapTest.ObserveEvent());
+        if (Semaphore.WaitFor(initialPaintReady, 0)) { throw new Exception("Empty paint semaphore did not time out"); }
+        if (!Thread.Start(TrapCatSingleTapTest.Guard)) { throw new Exception("Guard thread did not start"); }
+        form.Run();
+        if (!Semaphore.WaitFor(workerDone, 6000)) { throw new Exception("Guard thread did not finish"); }
+        bool inputOk = injected && downs == 1 && ups == 1 && clicks == 1;
+        bool boardOk = paintedMoves == 1 && paintedCat == expectedCat && paintedBlock;
+        bool cadenceOk = paints >= TrapCatSingleTapTest.RequiredPaints;
+        bool travelOk = changedPosition && movingPaints >= 2;
+        bool settledOk = !paintedMoving && settledPaints >= 2
+            && paintedX == targetX && paintedY == targetY && paintedW > 0 && paintedH > 0;
+        bool pixelsOk = creamPaints >= 2 && paintedPixel == 0xfffff3d7;
+        bool passed = inputOk && boardOk && cadenceOk && travelOk && settledOk && pixelsOk;
+        string report = (passed ? "PASS" : "FAIL") + " TRAP_CAT_SINGLE_TAP\n"
+            + TrapCatSingleTapTest.Evidence() + "\n";
+        string reportPath = Environment.GetEnvironmentVariable("ZAN_TRAP_CAT_SINGLE_TAP_REPORT");
+        #if ANDROID
+        if (reportPath == "") { reportPath = "/data/user/0/com.zan.trapcat.singletap/files/single_tap.txt"; }
+        string externalDir = "/sdcard/Android/data/com.zan.trapcat.singletap/files";
+        Directory.CreateDirectoryRecursive(externalDir);
+        File.WriteAllText(externalDir + "/single_tap.txt", report);
+        #endif
+        if (reportPath != "") { File.WriteAllText(reportPath, report); }
+        TrapCatSingleTapTest.Require(inputOk,
+            "one DOWN and UP dispatch exactly one deferred Button click");
+        TrapCatSingleTapTest.Require(boardOk,
+            "one tap blocks a cell and advances the production board once");
+        TrapCatSingleTapTest.Require(cadenceOk,
+            "several autonomous paints follow the single input burst");
+        TrapCatSingleTapTest.Require(travelOk,
+            "production sprite visibly travels during autonomous paints");
+        TrapCatSingleTapTest.Require(settledOk,
+            "painted sprite settles at the board target without another tap");
+        TrapCatSingleTapTest.Require(pixelsOk,
+            "settled production sprite pixels are present before presentation");
+        app.canvas.Destroy();
+        app.window.Destroy();
+        Semaphore.Destroy(workerDone);
+        Semaphore.Destroy(initialPaintReady);
+        Mutex.Destroy(observationLock);
+        Console.WriteLine("TRAP_CAT_SINGLE_TAP_OK");
+    }
+}

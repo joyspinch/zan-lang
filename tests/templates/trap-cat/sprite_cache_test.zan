@@ -1,0 +1,93 @@
+using System;
+using System.Drawing.Imaging;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+class TrapCatSpriteCacheTest {
+    static void Require(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+        Console.WriteLine("PASS " + label);
+    }
+
+    static string Key(int mood, int phase, int size) {
+        return "mem:trapcat-dance-v2-" + mood + "-" + phase + "-" + size;
+    }
+
+    static void Fill(TrapCatSprite sprite, App app, int start) {
+        for (int phase = 0; phase < TrapCatSprite.PoseCount; phase++) {
+            Window.FreezeTick(start + phase * TrapCatSprite.PoseMs);
+            sprite.OnPaint(app);
+        }
+    }
+
+    static void OldKeysGone(int mood, int size) {
+        for (int phase = 0; phase < TrapCatSprite.PoseCount; phase++) {
+            if (Canvas.ImageWidth(TrapCatSpriteCacheTest.Key(mood, phase, size)) > 0) {
+                throw new Exception("Previous mood or size remains cached");
+            }
+        }
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Trap cat cache", 720, 960);
+        Button[] cells = new Button[TrapCatBoard.Count];
+        for (int i = 0; i < TrapCatBoard.Count; i++) {
+            cells[i] = new Button("");
+            cells[i].Arrange(20 + i % 9 * 70, 150 + i / 9 * 70, 84, 84);
+        }
+        Window.FreezeTick(1000000);
+        TrapCatSprite sprite = new TrapCatSprite(cells);
+        sprite.Reset(TrapCatBoard.Center, TrapCatResult.Playing);
+        TrapCatSpriteCacheTest.Fill(sprite, app, 1000000);
+        string report = ImageCodec.MemReport();
+        TrapCatSpriteCacheTest.Require(report.Contains("mimg 256/19.5M"), "256 current-state poses occupy 19.5MiB");
+        TrapCatSpriteCacheTest.Require(sprite.bx == 275 && sprite.by == 356
+            && sprite.bw == 134 && sprite.bh == 150, "retained bounds match the actual sprite pixels");
+
+        Window.FreezeTick(1002000);
+        sprite.Reset(TrapCatBoard.Center, TrapCatResult.Trapped);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(0, 134);
+        report = ImageCodec.MemReport();
+        TrapCatSpriteCacheTest.Require(report.Contains("mimg 1/0.1M"), "state change evicts all previous poses");
+        TrapCatSpriteCacheTest.Fill(sprite, app, 1002000);
+        TrapCatSpriteCacheTest.Require(ImageCodec.MemReport().Contains("mimg 256/19.5M"), "new state remains within one 256-pose set");
+
+        cells[TrapCatBoard.Center].Arrange(300, 400, 40, 40);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(2, 134);
+        report = ImageCodec.MemReport();
+        TrapCatSpriteCacheTest.Require(report.Contains("mimg 1/0.0M"), "resize evicts previous-size rasters");
+        TrapCatSpriteCacheTest.Fill(sprite, app, 1002000);
+        report = ImageCodec.MemReport();
+        TrapCatSpriteCacheTest.Require(report.Contains("mimg 256/4.5M"), "smaller size releases previous pixel memory");
+        TrapCatSpriteCacheTest.Require(sprite.bx == 288 && sprite.by == 364
+            && sprite.bw == 64 && sprite.bh == 72, "resized retained bounds stay aligned with sprite pixels");
+
+        Window.FreezeTick(1004000);
+        sprite.Reset(TrapCatBoard.Center, TrapCatResult.Escaped);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(2, 64);
+        TrapCatSpriteCacheTest.Require(ImageCodec.MemReport().Contains("mimg 1/0.0M"), "Reset preserves eviction metadata");
+        sprite.Reset(TrapCatBoard.Center, TrapCatResult.Playing);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(3, 64);
+        sprite.WalkTo(31, TrapCatResult.Playing);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(0, 64);
+        TrapCatSpriteCacheTest.Require(ImageCodec.MemReport().Contains("mimg 1/0.1M"), "hop state replaces the idle cache");
+        Window.FreezeTick(1004000 + TrapCatSprite.HopMs + 1);
+        sprite.OnPaint(app);
+        TrapCatSpriteCacheTest.OldKeysGone(1, 134);
+        TrapCatSpriteCacheTest.Require(ImageCodec.MemReport().Contains("mimg 1/0.1M"), "hop completion replaces the hop cache");
+        for (int phase = 0; phase < TrapCatSprite.PoseCount; phase++) {
+            Canvas.EvictImage(TrapCatSpriteCacheTest.Key(0, phase, 134));
+        }
+        TrapCatSpriteCacheTest.Require(ImageCodec.MemReport().Contains("mimg 0/0.0M"), "explicit cleanup releases all sprite pixels");
+        Window.UnfreezeTick();
+        app.canvas.Destroy();
+        if (app.window != null) { app.window.Destroy(); }
+        Console.WriteLine("TRAP_CAT_SPRITE_CACHE_OK");
+    }
+}

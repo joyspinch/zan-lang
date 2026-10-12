@@ -1,0 +1,181 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Game.Foundation;
+
+class TrapCatSprite : Control {
+    const int PoseCount = 256;
+    const int PoseMs = 5;
+    const int HopMs = 240;
+    const double Tau = 6.283185307179586;
+    Button[] cells;
+    int fromCell = TrapCatBoard.Center;
+    int toCell = TrapCatBoard.Center;
+    long hopStart;
+    long danceStart;
+    int hopFromX;
+    int hopFromY;
+    int cachedSize;
+    int cachedMood = -1;
+    TrapCatResult result;
+
+    TrapCatSprite(Button[] boardCells) {
+        InitControl("CatSprite", 0);
+        cells = boardCells;
+        SetProp("class", "cat-layer");
+        NoOverlapCheck();
+        danceStart = Window.GetTickMs();
+    }
+
+    override string Kind() { return "CatSprite"; }
+
+    override void OnMeasure(App app) { prefW = 0; prefH = 0; }
+
+    void Reset(int cell, TrapCatResult state) {
+        fromCell = cell;
+        toCell = cell;
+        hopStart = 0;
+        danceStart = Window.GetTickMs();
+        result = state;
+    }
+
+    bool Moving() {
+        return fromCell != toCell && Window.GetTickMs() - hopStart < TrapCatSprite.HopMs;
+    }
+
+    void WalkTo(int cell, TrapCatResult state) {
+        Button source = cells[toCell];
+        int x = source.bx + source.bw / 2;
+        int y = source.by + source.bh / 2;
+        long now = Window.GetTickMs();
+        if (this.Moving()) {
+            double t = (double)(now - hopStart) / TrapCatSprite.HopMs;
+            double f = Easing.Evaluate(EaseType.SineInOut, t);
+            x = (int)(hopFromX * (1.0 - f) + x * f);
+            y = (int)(hopFromY * (1.0 - f) + y * f)
+                - (int)(Math.Sin(t * TrapCatSprite.Tau / 2.0) * source.bh * 0.28);
+        }
+        hopFromX = x;
+        hopFromY = y;
+        fromCell = toCell;
+        toCell = cell;
+        hopStart = now;
+        result = state;
+    }
+
+    override void OnPaint(App app) {
+        Button target = cells[toCell];
+        if (target.bw <= 0 || target.bh <= 0) { return; }
+        long now = Window.GetTickMs();
+        int phase = (int)((now - danceStart) / TrapCatSprite.PoseMs % TrapCatSprite.PoseCount);
+        int mood = result == TrapCatResult.Trapped ? 2 : (result == TrapCatResult.Escaped ? 3 : 0);
+        int x = target.bx + target.bw / 2;
+        int y = target.by + target.bh / 2;
+        int rise = 0;
+        if (this.Moving()) {
+            double t = (double)(now - hopStart) / TrapCatSprite.HopMs;
+            double f = Easing.Evaluate(EaseType.SineInOut, t);
+            x = (int)(hopFromX * (1.0 - f) + x * f);
+            y = (int)(hopFromY * (1.0 - f) + y * f);
+            rise = (int)(Math.Sin(t * TrapCatSprite.Tau / 2.0) * target.bh * 0.28);
+            mood = 1;
+        }
+        int size = target.bw * 8 / 5;
+        int height = size * 144 / 128;
+        if (cachedSize != size || cachedMood != mood) {
+            // 256 帧按当前状态保留；跨状态累积会把单套约 20MiB 放大四倍。
+            if (cachedSize > 0 && cachedMood >= 0) {
+                for (int p = 0; p < TrapCatSprite.PoseCount; p++) {
+                    Canvas.EvictImage("mem:trapcat-dance-v2-" + cachedMood + "-" + p + "-" + cachedSize);
+                }
+            }
+            cachedSize = size;
+            cachedMood = mood;
+        }
+        int left = x - size / 2;
+        int top = y + target.bh / 4 - height * 132 / 144;
+        // 此覆盖层不占布局流；保留框必须对应实际图像，供内容哈希正确归因损伤。
+        bx = left;
+        by = top - rise;
+        bw = size;
+        bh = height;
+        string key = "mem:trapcat-dance-v2-" + mood + "-" + phase + "-" + size;
+        if (Canvas.ImageWidth(key) <= 0) {
+            Canvas.ImageLoadSvg(key, TrapCatSprite.PoseSvg(phase, mood), size, height);
+        }
+        app.canvas.BlitImage(key, left, top - rise, size, height, 0, 0, 0, 0);
+        UiDriver.SetProbe("trap.cat.pose", Convert.ToString(phase));
+        UiDriver.SetProbe("trap.cat.moving", this.Moving() ? "true" : "false");
+        UiDriver.SetProbe("trap.cat.sprite", Convert.ToString(Canvas.ImageWidth(key)));
+        int rx = left;
+        int ry = top - rise;
+        int rw = size;
+        int rh = height;
+        if (this.Moving()) {
+            int tx = target.bx + target.bw / 2;
+            int ty = target.by + target.bh / 2;
+            int minX = hopFromX < tx ? hopFromX : tx;
+            int minY = hopFromY < ty ? hopFromY : ty;
+            int maxX = hopFromX > tx ? hopFromX : tx;
+            int maxY = hopFromY > ty ? hopFromY : ty;
+            int lift = (int)(target.bh * 0.28);
+            rx = minX - size / 2;
+            ry = minY + target.bh / 4 - height * 132 / 144 - lift;
+            rw = maxX - minX + size;
+            rh = maxY - minY + height + lift;
+        }
+        app.RequestAnimationFrameIn(rx, ry, rw, rh);
+    }
+
+    static string PoseSvg(int frame, int mood) {
+        double phase = frame * TrapCatSprite.Tau / TrapCatSprite.PoseCount;
+        double sway = Math.Sin(phase);
+        double beat = Math.Cos(phase * 2.0);
+        int lean = (int)(sway * 9.0);
+        int bob = (int)((1.0 - beat) * -2.0);
+        int leftArm = (int)(-22.0 + sway * 38.0);
+        int rightArm = (int)(22.0 + sway * 38.0);
+        int leftFoot = sway > 0.0 ? (int)(sway * -5.0) : 0;
+        int rightFoot = sway < 0.0 ? (int)(sway * 5.0) : 0;
+        int tail = (int)(sway * 12.0);
+        bool blink = frame >= TrapCatSprite.PoseCount * 6 / 32
+            && frame < TrapCatSprite.PoseCount * 8 / 32;
+        if (mood == 1) { lean = (int)(sway * 5.0); leftArm = -32; rightArm = 32; }
+        if (mood == 2) { lean = -5; bob = 2; leftArm = -65; rightArm = 65; leftFoot = 0; rightFoot = 0; tail = (int)(sway * 4.0); }
+        if (mood == 3) { lean = (int)(sway * 12.0); }
+        string outline = "#59453f";
+        string fur = "#ffbd73";
+        string cream = "#fff3d7";
+        string svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 144' width='128' height='144'>"
+            + "<ellipse cx='64' cy='133' rx='25' ry='5' fill='#3d6348' opacity='.16'/>"
+            + "<g transform='translate(0 " + bob + ") rotate(" + lean + " 64 118)' stroke='" + outline + "' stroke-width='3' stroke-linejoin='round' stroke-linecap='round'>"
+            + "<path d='M83 111 Q111 117 111 96 Q108 82 " + (110 + tail) + " 72' fill='none' stroke='" + outline + "' stroke-width='12'/>"
+            + "<path d='M83 111 Q111 117 111 96 Q108 82 " + (110 + tail) + " 72' fill='none' stroke='" + fur + "' stroke-width='7'/>"
+            + "<ellipse cx='51' cy='" + (126 + leftFoot) + "' rx='12' ry='6' fill='" + cream + "'/>"
+            + "<ellipse cx='77' cy='" + (126 + rightFoot) + "' rx='12' ry='6' fill='" + cream + "'/>"
+            + "<path d='M45 78 Q35 96 42 115 Q47 128 64 126 Q81 128 86 115 Q93 96 83 78 Z' fill='" + fur + "'/>"
+            + "<ellipse cx='64' cy='104' rx='15' ry='17' fill='" + cream + "' stroke='none'/>"
+            + "<g transform='rotate(" + leftArm + " 44 88)'><path d='M44 88 Q30 93 24 82' fill='none' stroke='" + outline + "' stroke-width='12'/><path d='M44 88 Q30 93 24 82' fill='none' stroke='" + fur + "' stroke-width='7'/><ellipse cx='23' cy='79' rx='8' ry='9' fill='" + cream + "'/><ellipse cx='23' cy='79' rx='3' ry='4' fill='#ed9d94' stroke='none'/></g>"
+            + "<g transform='rotate(" + rightArm + " 84 88)'><path d='M84 88 Q98 93 104 82' fill='none' stroke='" + outline + "' stroke-width='12'/><path d='M84 88 Q98 93 104 82' fill='none' stroke='" + fur + "' stroke-width='7'/><ellipse cx='105' cy='79' rx='8' ry='9' fill='" + cream + "'/><ellipse cx='105' cy='79' rx='3' ry='4' fill='#ed9d94' stroke='none'/></g>"
+            + "<g transform='rotate(" + (-lean / 2) + " 64 65)'>"
+            + "<path d='M34 41 Q26 10 34 13 L51 29 Q64 25 77 29 L94 13 Q102 10 94 41 Q104 52 98 66 Q90 83 64 83 Q38 83 30 66 Q24 52 34 41 Z' fill='" + fur + "'/>"
+            + "<path d='M36 22 L40 38 L47 32 Z M92 22 L88 38 L81 32 Z' fill='#ec9b8a' stroke='none'/>"
+            + "<path d='M57 29 L60 38 M67 29 L66 38' fill='none' stroke='#db9458' stroke-width='4'/>"
+            + "<ellipse cx='64' cy='66' rx='21' ry='13' fill='" + cream + "' stroke='none'/>";
+        if (blink || mood == 2) {
+            svg = svg + "<path d='M43 53 Q48 58 53 53 M75 53 Q80 58 85 53' fill='none'/>";
+        } else {
+            int gaze = (int)(sway * 2.0);
+            svg = svg + "<ellipse cx='48' cy='52' rx='6' ry='8' fill='" + cream + "' stroke='none'/><ellipse cx='80' cy='52' rx='6' ry='8' fill='" + cream + "' stroke='none'/>"
+                + "<ellipse cx='" + (49 + gaze) + "' cy='53' rx='3.5' ry='5.5' fill='" + outline + "' stroke='none'/><ellipse cx='" + (79 + gaze) + "' cy='53' rx='3.5' ry='5.5' fill='" + outline + "' stroke='none'/>"
+                + "<circle cx='" + (50 + gaze) + "' cy='50' r='1.5' fill='white' stroke='none'/><circle cx='" + (80 + gaze) + "' cy='50' r='1.5' fill='white' stroke='none'/>";
+        }
+        svg = svg + "<ellipse cx='38' cy='63' rx='6' ry='3' fill='#ed9d94' stroke='none'/><ellipse cx='90' cy='63' rx='6' ry='3' fill='#ed9d94' stroke='none'/>"
+            + "<path d='M60 62 Q64 60 68 62 L64 66 Z' fill='#bd766d' stroke-width='1.5'/>"
+            + "<path d='M64 66 Q60 74 55 68 M64 66 Q68 74 73 68' fill='none' stroke-width='2'/>"
+            + "<path d='M28 59 L38 61 M27 67 L37 66 M90 61 L100 59 M91 66 L101 67' fill='none' stroke-width='2'/>"
+            + "</g></g></svg>";
+        return svg;
+    }
+}

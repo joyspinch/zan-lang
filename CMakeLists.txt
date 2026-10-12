@@ -4071,7 +4071,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/single_tap_test.zan
-      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib${_gui_driver_tail}"
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib;--subsystem;console${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_single_tap.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_trap_cat_single_tap${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
