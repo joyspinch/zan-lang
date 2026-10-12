@@ -1180,10 +1180,10 @@ class McpServer {
         if (name == "zan_arch_check" || name == "arch_check" || name == "check_architecture") {
             return McpServer.ArchCheck();
         }
-        if (name == "zan_gui_preview" || name == "gui_preview") {
-            return McpServer.GuiPreview(args.Str("file", ""),
-                                       args.Int("delay_ms", 800),
-                                       args.Str("output", "_scratch/gui_preview.png"));
+        if (name == "zan_gui_snapshot" || name == "gui_snapshot"
+            || name == "zan_gui_preview" || name == "gui_preview") {
+            return await McpServer.GuiSnapshotAsync(args.Str("file", ""),
+                                                    args.Str("action_script", ""));
         }
         if (name == "zan_project_overview" || name == "project_overview") {
             return McpServer.ProjectOverview(args.Int("limit", 40));
@@ -3136,7 +3136,7 @@ class McpServer {
         return sb.ToString();
     }
 
-    static string GuiPreview(string srcPath, int delayMs, string outPath) {
+    static async string GuiSnapshotAsync(string srcPath, string actionScript) {
         if (srcPath == "") { return "error: 'file' is required (e.g. 'examples/gui_gallery/App.zan')"; }
         string fullSrc = srcPath;
         if (!File.Exists(fullSrc) && File.Exists(McpServer.root + "/" + srcPath)) {
@@ -3145,25 +3145,90 @@ class McpServer {
         if (!File.Exists(fullSrc)) {
             return "error: source file not found: " + srcPath;
         }
-        if (outPath == "") { outPath = "_scratch/gui_preview.png"; }
-        if (delayMs <= 0) { delayMs = 800; }
 
-        string exePath = "_scratch/gui_probe.exe";
+        string outDir = McpServer.root + "/_scratch/gui_snapshot";
+        Directory.CreateDirectoryRecursive(outDir);
+        string exePath = outDir + "/app.exe";
+        string scriptPath = outDir + "/script.txt";
+        string lintLogPath = outDir + "/lint.log";
+        string treeJsonPath = outDir + "/tree.json";
+        string regionsJsonPath = outDir + "/regions.json";
+
+        if (File.Exists(exePath)) { File.Delete(exePath); }
+        if (File.Exists(lintLogPath)) { File.Delete(lintLogPath); }
+        if (File.Exists(treeJsonPath)) { File.Delete(treeJsonPath); }
+        if (File.Exists(regionsJsonPath)) { File.Delete(regionsJsonPath); }
+
         string zanc = McpServer.zancPath;
         if (!File.Exists(zanc)) { zanc = "build/zanc.exe"; }
+        if (!File.Exists(zanc)) {
+            return "error: zanc compiler not found at " + zanc;
+        }
 
+        // 1. 快速构建目标 GUI 程序
+        string buildCmd = "\"" + zanc + "\" \"" + fullSrc + "\" --auto-stdlib -o \"" + exePath + "\"";
+        ProcessResult bres = await McpServer.RunProcessAsync(buildCmd);
+        if (bres.exitCode != 0 || !File.Exists(exePath)) {
+            StringBuilder errSb = new StringBuilder();
+            for (int i = 0; i < bres.lines.Count; i = i + 1) {
+                errSb.Append(bres.lines[i]);
+                errSb.Append("\n");
+            }
+            return "error: build failed:\n" + errSb.ToString();
+        }
+
+        // 2. 准备 UiDriver 执行脚本
+        if (actionScript == "") {
+            actionScript = "wait 300\ndump tree tree.json\ndump hitregions regions.json\ndump theme theme.json\nquit\n";
+        } else {
+            if (!actionScript.EndsWith("\n")) { actionScript = actionScript + "\n"; }
+            if (actionScript.IndexOf("quit") < 0) { actionScript = actionScript + "quit\n"; }
+        }
+        File.WriteAllText(scriptPath, actionScript);
+
+        // 3. 在 UiDriver 和 LayoutLint 环境下无头执行
+        string runCmd = "cmd /c \"set ZAN_UI_SCRIPT=" + scriptPath
+            + "&set ZAN_UI_OUT=" + outDir
+            + "&set ZAN_GUI_LAYOUTLINT=1"
+            + "&set ZAN_GUI_OVERLAP_LOG=" + lintLogPath
+            + "&\"" + exePath + "\"\"";
+        ProcessResult rres = await McpServer.RunProcessAsync(runCmd);
+
+        // 4. 回收产物与组装诊断
         StringBuilder sb = new StringBuilder();
-        sb.Append("=== [Zan GUI Visual Preview & Inspection Probe] ===\n");
-        sb.Append("Target Source: " + srcPath + "\n");
-        sb.Append("Output Image: " + outPath + "\n");
-        sb.Append("Capture Command:\n");
-        sb.Append("  powershell -ExecutionPolicy Bypass -File scripts/gui_capture.ps1 -exePath \"" + exePath + "\" -delayMs " + Convert.ToString(delayMs) + " -outPng \"" + outPath + "\"\n\n");
-        sb.Append("--- [Design System / Visual Judge Checklist] ---\n");
-        sb.Append("1. 8pt Grid Alignment: Are margins and paddings using Space.M (16px) or Space.L (24px)?\n");
-        sb.Append("2. Typography Ladder: Clear hierarchy (Title 16pt -> Subhead 14pt -> Body 12pt)?\n");
-        sb.Append("3. Control Height: Buttons/Inputs conforming to WidgetSize.Normal (32px) or Large (40px)?\n");
-        sb.Append("4. Standard Components: Are UI elements using stdlib/Gui/Widget/* instead of custom OnPaint?\n");
-        sb.Append("5. Color Semantics: Using Theme.Primary and Theme.Surface instead of hardcoded RGB?\n");
+        sb.Append("=== [Zan GUI Snapshot & Layout Inspection] ===\n");
+        sb.Append("Target: " + srcPath + "\n");
+        sb.Append("Output Dir: _scratch/gui_snapshot\n\n");
+
+        if (File.Exists(lintLogPath)) {
+            string lintText = File.ReadAllText(lintLogPath);
+            if (lintText.Trim().Length > 0) {
+                sb.Append("--- [Layout Warnings / Lint Diagnostics] ---\n");
+                sb.Append(lintText.Trim() + "\n\n");
+            }
+        }
+
+        if (File.Exists(treeJsonPath)) {
+            string treeJson = File.ReadAllText(treeJsonPath);
+            sb.Append("--- [Control Tree Summary] ---\n");
+            if (treeJson.Length > 2048) {
+                sb.Append(treeJson.Substring(0, 2048) + "\n... (truncated for brevity)\n\n");
+            } else {
+                sb.Append(treeJson + "\n\n");
+            }
+        }
+
+        if (File.Exists(regionsJsonPath)) {
+            string regionsJson = File.ReadAllText(regionsJsonPath);
+            sb.Append("--- [Hit Regions] ---\n");
+            if (regionsJson.Length > 1024) {
+                sb.Append(regionsJson.Substring(0, 1024) + "\n... (truncated)\n\n");
+            } else {
+                sb.Append(regionsJson + "\n\n");
+            }
+        }
+
+        sb.Append("Snapshot execution settled with exit code " + Convert.ToString(rres.exitCode) + ".\n");
         return sb.ToString();
     }
 
@@ -3956,16 +4021,22 @@ class McpServer {
             arr.Append(t);
         }
 
+        t = McpServer.NewTool("zan_gui_snapshot",
+            "GUI visual snapshot and layout probe: compiles target GUI source, executes under UiDriver,"
+            + " captures layout tree, interactive hit regions, and layout-lint diagnostics."
+            + " Enables closed-loop visual & constraint verification for AI.");
+        McpServer.AddParam(t, "file", "string",
+            "Path to the Zan GUI source file (e.g. 'src/App.zan' or 'examples/gui_gallery/App.zan').", true);
+        McpServer.AddParam(t, "action_script", "string",
+            "Optional UiDriver script (e.g. 'wait 300; dump tree tree.json; quit').", false);
+        arr.Append(t);
+
         t = McpServer.NewTool("zan_gui_preview",
-            "GUI visual inspection probe: triggers headless build, captures high-res PNG screenshot"
-            + " of a Zan GUI program, and returns image path with design-system inspection checklist."
-            + " Enables visual closed-loop review for multimodal AI.");
+            "Alias for zan_gui_snapshot: compiles and runs GUI probe to capture layout tree and diagnostics.");
         McpServer.AddParam(t, "file", "string",
             "Path to the Zan GUI source file (e.g. 'src/App.zan').", true);
-        McpServer.AddParam(t, "delay_ms", "integer",
-            "Delay in milliseconds before taking screenshot (default 800).", false);
-        McpServer.AddParam(t, "output", "string",
-            "Output PNG path (default '_scratch/gui_preview.png').", false);
+        McpServer.AddParam(t, "action_script", "string",
+            "Optional UiDriver script.", false);
         arr.Append(t);
 
         t = McpServer.NewTool("zan_game_simulate_trajectory",

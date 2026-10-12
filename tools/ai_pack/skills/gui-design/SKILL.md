@@ -800,6 +800,11 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
 
 硬规则:
 
+0. **禁止在自动布局中手写绝对坐标**:凡处于 `Panel.Column/Row`、`Flex`、`Grid`
+   或子项设置了 `dock != 0` 的自动容器中，**严禁调用 `Place(x, y)`、`Float(x, y)`
+   或手设 `mx/my`**。最终坐标完全由父容器算法根据方向、对齐与间隙统一计算，
+   手写数值会被底层完全忽略并触发 `gui-lint` 警告。排版对不齐时，绝对不要调
+   数值试探，改用父容器的 `Gap`、`Padding`、对齐类或更换容器。
 1. **窗口骨架用停靠**:侧栏 `Dock(3).Prefer(w,0)`、顶栏 `Dock(1).Prefer(0,h)`、
    内容 `Dock(5)`;状态条 `Dock(2)`。停靠的子节点按声明顺序吃边,
    永远不会互相压住。

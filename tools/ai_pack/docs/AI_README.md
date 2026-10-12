@@ -52,7 +52,7 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 | 查 API——写码前先查，别猜 | `zan_api_search`（符号检索）、`zan_lookup_symbol`（精确定位定义+签名+摘要）、`zan_list_members`（一个类型的全部成员）、`zan_read_context`（按符号名直接读那段源码窗口） |
 | 改之前评估影响 | `zan_find_refs`（谁引用它/谁继承它/多少是测试）、`zan_change_impact`（引用 + 受影响的路由和表）、`zan_project_overview`（工程全貌：模块/路由/实体） |
 | 服务器工程 | `zan_route_lookup`（URL→action→权限门）、`zan_orm_lookup`（实体→表→列→门面） |
-| 验证——说完要能证 | `zan_compile`（编译一个片段，返回结构化诊断）、`zan_build_project`（编译整个工程） |
+| 验证——说完要能证 | `zan_compile`（编译一个片段，返回结构化诊断）、`zan_build_project`（编译整个工程）、`zan_gui_snapshot`（GUI 全景快照与排版约束诊断） |
 | 控件规格与示例 | `zan_example`（可编译的官方示例，带目录）、`zan_control_schema`（控件 PropSpec 目录：schema + Props/Events 规格） |
 | 文件与检索 | `list_dir` `read_file` `write_file` `edit_file` `search_text` `find_files` `run_command`、`mkdir`/`move_path`/`copy_path`/`delete_path`/`stat_path` |
 | 扩展包生态管理 | `pkg_list_installed`（查看项目已装包）、`pkg_search`（搜官方扩展包池）、`pkg_install`（自愈安装扩展包）、`pkg_info`（扩展包元数据详情） |

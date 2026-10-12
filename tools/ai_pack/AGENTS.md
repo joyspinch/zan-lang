@@ -68,11 +68,15 @@ directly from the terminal.
 Inventing a method or package that "should" exist is the single most expensive
 mistake in this language: it compiles in your head and nowhere else.
 
-## 2. Compile before you claim
+## 2. Compile and verify before you claim
 
 `zan_build_project` (whole project) or `zan_compile` (one snippet) returns
 `{ok, exitCode, diagnostics[], raw}` with file/line/column per diagnostic. Fix
 diagnostics from the top; a later error is often a consequence of the first.
+
+For GUI layouts, never tweak manual coordinates (Place/Float) inside auto-layout
+containers (Panel.Column, Panel.Row, Flex, Grid). Use `zan_gui_snapshot("src/App.zan")`
+to verify real layout tree, hit regions and layout-lint warnings.
 
 Without MCP:
 
