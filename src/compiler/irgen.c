@@ -190,7 +190,15 @@ LLVMValueRef zan_irgen_intern_string(zan_irgen_t *g, const char *text) {
     size_t n = strlen(text) + 1;
     e->text = zan_arena_alloc(g->arena, n);
     memcpy(e->text, text, n);
-    e->gv = LLVMBuildGlobalStringPtr(g->builder, text, "rterr");
+    LLVMTypeRef str_arr_ty = LLVMArrayType(LLVMInt8TypeInContext(g->ctx), (unsigned)n);
+    LLVMValueRef gv = LLVMAddGlobal(g->mod, str_arr_ty, ".str");
+    LLVMSetInitializer(gv, LLVMConstStringInContext(g->ctx, text, (unsigned)(n - 1), 0));
+    LLVMSetGlobalConstant(gv, 1);
+    LLVMSetLinkage(gv, LLVMPrivateLinkage);
+    LLVMSetUnnamedAddress(gv, LLVMGlobalUnnamedAddr);
+    LLVMValueRef zero = LLVMConstInt(LLVMInt64TypeInContext(g->ctx), 0, 0);
+    LLVMValueRef idx[] = { zero, zero };
+    e->gv = LLVMConstInBoundsGEP2(str_arr_ty, gv, idx, 2);
     e->next = g->str_intern[b];
     g->str_intern[b] = e;
     return e->gv;

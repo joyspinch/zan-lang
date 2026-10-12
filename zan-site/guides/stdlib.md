@@ -150,8 +150,7 @@ ch.Send("task"); string s = await ch.Receive();
 
 - 跨平台代码用条件编译：`#if WINDOWS` / `#elif LINUX` / `#elif MACOS`（预定义
   符号见「语言参考 → 预处理」）。
-- 原生依赖（`libcrypto`、`zan_gui`、`zan_sdl3`、`lua`/`python` 驱动、CEF、
-  Tls 等）位于模块的 `drivers/<target>/`，`--publish` 时按
+- 原生依赖（`zan_gui`、`sqlite3`、`lua` 驱动、CEF 等）位于模块的 `drivers/<target>/`，`--publish` 时按
   `--link-mode shared|static` 链接。
 - `System.Scripting` / `Gui.Component.CefBrowser` / `System.Net.Tls` /
   `System.Net.WebSocket.Secure` 等依赖特定平台驱动，无驱动平台会退化或报

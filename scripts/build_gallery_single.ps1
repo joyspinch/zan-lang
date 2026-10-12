@@ -8,8 +8,7 @@
 #
 # The gallery is a pure Gui stdlib program: on Windows its window shell is the
 # Zan-side Win32Shell (Native.zan #if WINDOWS), so the native Win32 GUI runtime
-# is enough -- no SDL3 is linked (the IDE's static link is a game/IDE
-# thing, the gallery does not need it).
+# is enough.
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\build_gallery_single.ps1
 # Output: build\gui_gallery_dist\gui_gallery.exe   (single file, no deps)
@@ -34,15 +33,7 @@ if ($LASTEXITCODE -ne 0) { throw "EMBED_GEN_FAILED" }
 
 # ---- static driver dir so zanc's --link-mode static resolves zan_gui ----
 # --driver-dir REPLACES the per-module stdlib driver dirs for every driver
-# the program links, not just zan_gui. The gallery deliberately does NOT
-# stage the ssl/crypto static archives here: the only https entry point is
-# ImageHttp -> HttpClient.CreateHttps, and the catalog demo fetches images
-# from a local http://127.0.0.1 server, so no TlsStream call site is live.
-# Without the archives, zanc's static-publish stub kicks in: every
-# [DllImport("ssl"/"crypto")] import is stubbed (calls fail at run time) and
-# -lssl/-lcrypto is dropped from the link line, keeping ~5.5 MB of OpenSSL
-# out of the exe. A program that DOES use https stages the archives (or
-# publishes shared) and links the real thing.
+# the program links, not just zan_gui.
 # The unified recipe already staged GUI/image/audio archives and their .libs
 # into build/static_driver/static. Runtime/timer/embed objects are zanc-owned.
 

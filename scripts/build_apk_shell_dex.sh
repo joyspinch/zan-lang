@@ -1,6 +1,6 @@
 #!/bin/bash
 # Rebuild toolchain/apk-shell/classes.dex from the vendored Java sources
-# (toolchain/apk-shell/java: the SDL3 activity shell + org.zan.app.ZanWeb,
+# (toolchain/apk-shell/java: the Android native activity shell + org.zan.app.ZanWeb,
 # the system-WebView bridge backing Gui.Component.WebView on Android).
 #
 # Needs a JDK (javac) and an Android SDK (android.jar + build-tools d8).

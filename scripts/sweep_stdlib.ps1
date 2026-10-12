@@ -1,9 +1,8 @@
 $ErrorActionPreference="Continue"
 Set-Location $PSScriptRoot\..
 $sys = Get-ChildItem -Recurse stdlib\System -Filter *.zan | Where-Object { $_.FullName -notmatch 'Windows\\Forms' } | ForEach-Object { $_.FullName }
-$sdl = Get-ChildItem -Recurse stdlib\SDL3,stdlib\Platform -Filter *.zan | ForEach-Object { $_.FullName }
 $gui = Get-ChildItem -Recurse packages\Zan.Gui\src\Gui -Filter *.zan | ForEach-Object { $_.FullName }
-$fg=@($sys+$sdl+$gui)
+$fg=@($sys+$gui)
 $sw=[Diagnostics.Stopwatch]::StartNew()
 & .\build\zanc1.exe build\sw_gui.ll @fg 2>build\sw_gui_e.txt | Out-Null
 $rc=$LASTEXITCODE; $sw.Stop()

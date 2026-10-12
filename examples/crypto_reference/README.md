@@ -1,9 +1,8 @@
 # crypto_reference — 纯 Zan 参考实现（教学用）
 
 本目录保存 AES、AES-GCM、SM4 的**纯 Zan 逐位实现**。它们不参与编译期
-驱动解析，也不被 stdlib 引用——stdlib 里的同名类自 Zan 2.7 起走 OpenSSL
-libcrypto 的 EVP 接口（AES-NI/PCLMULQDQ 硬件加速），本目录的实现仅作
-为算法教学与核对基准存在。
+驱动解析，也不被 stdlib 引用——stdlib 里的同名类走硬件加速的原生密码学微内核，
+本目录的实现仅作为算法教学与核对基准存在。
 
 ## 文件
 
@@ -21,13 +20,12 @@ libcrypto 的 EVP 接口（AES-NI/PCLMULQDQ 硬件加速），本目录的实现
 > 删掉对包内 Hex/Bits 的依赖（或一并带走），再把包版本的 EVP 实现
 > 换掉（不推荐——性能差两个数量级）。
 
-## 为什么 stdlib 换成了 EVP
+## 为什么 stdlib 换成了硬件加速原生微内核
 
 纯 Zan 版性能（Windows x64 实测）：AES-CBC 加密约 **2 MiB/s**，
 AES-GCM 单 token 约 **103 µs**——无 T 表、GF 乘法逐位循环、每轮分配
-临时数组，全部是解释成本之外的真实 CPU 开销。同一台机器上 EVP 路径：
-CBC **~196 MiB/s**（含 API 层拷贝；裸 EVP 1250+ MiB/s）、GCM token
-**~3.6 µs**。安全性上 EVP 还带来 OpenSSL 的常数时间查表与侧信道加固。
+临时数组，全部是解释成本之外的真实 CPU 开销。同一台机器上原生微内核路径
+具备硬件加速与常数时间查表、侧信道加固。
 
 ## 使用差异（对照 stdlib 契约时注意）
 

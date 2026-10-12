@@ -209,7 +209,7 @@ Difficulty is for **CLI/compute** first; GUI is a separate, larger effort on eac
   first use) with an auto-generated debug keystore. `--apk-package <name>`
   and `--apk-label <text>` override the identity derived from the input
   file name (multi-file programs should set them). `[DllImport]` libraries
-  that Android cannot provide (openssl, odbc, libpq — anything with no
+  that Android cannot provide (odbc — anything with no
   bundled `android-<arch>` driver .so and no sysroot stub) are stubbed and
   dropped from the link, same policy as the Linux/macOS cross paths: the
   build succeeds, calls fail at runtime with a compile-time warning.

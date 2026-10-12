@@ -641,7 +641,7 @@ Native binaries are owned by the module that uses them, in a `drivers/`
 subdirectory:
 
 1. `<module>/drivers/driver.manifest` lists one `-l` basename per line
-   (e.g. `zan_gui`, `zan_sdl3`); blank lines and `#` comments are ignored.
+   (e.g. `zan_gui`, `sqlite3`); blank lines and `#` comments are ignored.
    On macOS, a versioned driver may provide `<lib>.bundle`; when
    `lib<lib>.dylib` is absent, the compiler links the first safe filename in
    that manifest.

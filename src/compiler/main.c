@@ -3179,7 +3179,7 @@ static bool zan_win_system_lib(const char *lib, int lib_len) {
 
 #define ZAN_MAX_DRIVERS 1024
 typedef struct {
-    char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_sdl3" */
+    char lib[64];      /* normalized -l basename, e.g. "sqlite3", "zan_gui" */
     char module[512];
     char sym[64];
     char root[1024];
@@ -5345,7 +5345,6 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-
         char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
         int cross_archive_count = 0;
         if (cross_compiling && (target.os == ZAN_OS_LINUX

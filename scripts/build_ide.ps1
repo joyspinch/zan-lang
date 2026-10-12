@@ -234,7 +234,7 @@ Remove-Item -LiteralPath (Join-Path (Get-Location) "build\ide.css") `
 
 # ---- record the non-system DLLs the IDE needs beside it -------------------
 # ZanIDE.exe imports more than the Windows API: the runtime objects pull in
-# OpenSSL and SQLite, and zanc stages driver DLLs (zan_gui, WebView2Loader)
+# SQLite, and zanc stages driver DLLs (zan_gui, WebView2Loader)
 # next to the exe. A release that ships the exe without them dies on launch
 # with "cannot find <dll>" on any machine that has no copy on PATH -- which is
 # every machine but this one. Read the truth from the exe's own import table

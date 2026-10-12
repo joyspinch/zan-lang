@@ -1969,10 +1969,8 @@ foreach(_src ${_conf_srcs})
     set(_extra_args
       "--publish;--link-mode;static;--driver-dir;${CMAKE_SOURCE_DIR}/tests/conformance/empty_driver_dir")
   elseif(_name STREQUAL "publish_tls_bundle")
-    # A47-1 step 1: a --publish build of a Tls program with the default
-    # driver discovery must copy the real OpenSSL DLLs next to the exe; the
-    # behavioral proof is that the published exe starts and hands back a
-    # usable TlsContext (a broken bundle copy fails to start instead).
+    # A --publish build of a Tls program verifies that the published exe starts
+    # and hands back a usable TlsContext under native TLS without external dependencies.
     set(_extra_args "--publish")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
@@ -2088,6 +2086,20 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/toolchain/android-x64/libc.a")
             -o ${CMAKE_BINARY_DIR}/conf_try_catch_android
             ${CMAKE_SOURCE_DIR}/tests/conformance/try_catch.zan)
   set_tests_properties(conformance_try_catch_android PROPERTIES TIMEOUT 120)
+endif()
+
+find_program(ZAN_LLVM_OBJDUMP NAMES llvm-objdump
+  HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+if(ZAN_LLVM_OBJDUMP)
+  add_test(NAME codegen_android_x64_baseline
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/codegen/android_x64_baseline.zan
+      -DOUT=${CMAKE_BINARY_DIR}/android_x64_baseline.a
+      -DOBJDUMP=${ZAN_LLVM_OBJDUMP}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_android_x64_baseline.cmake)
+  set_tests_properties(codegen_android_x64_baseline PROPERTIES TIMEOUT 120)
 endif()
 
 # ---- Determinism: codegen must be a pure function of the source ----
@@ -2567,6 +2579,17 @@ add_test(NAME compiler_driver_liveness
     -DWORK=${CMAKE_SOURCE_DIR}/_scratch/driver_liveness
     -P ${CMAKE_SOURCE_DIR}/tests/run_driver_liveness.cmake)
 set_tests_properties(compiler_driver_liveness PROPERTIES TIMEOUT 180)
+
+# Inject high device uptime into the production Android clock; no GUI/SDK needed.
+add_executable(zan_gui_android_clock_test tests/runtime/gui_android_clock_test.c)
+set_target_properties(zan_gui_android_clock_test PROPERTIES
+  C_STANDARD 11 C_STANDARD_REQUIRED YES)
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(zan_gui_android_clock_test PRIVATE Threads::Threads)
+endif()
+add_test(NAME runtime_gui_android_clock COMMAND zan_gui_android_clock_test)
+set_tests_properties(runtime_gui_android_clock PROPERTIES TIMEOUT 15)
 
 option(ZAN_BUILD_GUI_TESTS "Run the Gui conformance tests (requires zan_gui)" ON)
 if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
@@ -3985,6 +4008,78 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_css_dpi PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  foreach(_gui_frame_case IN ITEMS frame_cadence style_context_cache native_wait_wake window_wait animation_phase)
+    add_test(NAME conformance_gui_${_gui_frame_case}
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/${_gui_frame_case}_test.zan
+        "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_${_gui_frame_case}.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_${_gui_frame_case}${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${CMAKE_SOURCE_DIR}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_${_gui_frame_case} PROPERTIES
+      TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+  endforeach()
+
+  add_test(NAME conformance_guihost_loop
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/guihost_loop_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/guihost_loop.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_guihost_loop${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_guihost_loop PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  if(WIN32)
+    set(_gui_effects_coalesce_workdir "${CMAKE_BINARY_DIR}/perf/gui-effects-coalesce")
+    file(MAKE_DIRECTORY "${_gui_effects_coalesce_workdir}")
+    add_test(NAME conformance_gui_effects_coalesce
+      COMMAND ${CMAKE_COMMAND}
+        -DZANC=$<TARGET_FILE:zanc>
+        -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/effects_coalesce_test.zan
+        "-DZANC_ARGS=--auto-stdlib;--subsystem;console${_gui_driver_tail}"
+        -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_effects_coalesce.out
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_effects_coalesce${_exe_ext}
+        -DSTDLIB_STAMP=${_stdlib_stamp}
+        -DWORKDIR=${_gui_effects_coalesce_workdir}
+        -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+    set_tests_properties(conformance_gui_effects_coalesce PROPERTIES
+      TIMEOUT 120 WORKING_DIRECTORY "${_gui_effects_coalesce_workdir}")
+  endif()
+
+  add_test(NAME conformance_trap_cat_sprite_cache
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/sprite_cache_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_sprite_cache.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_trap_cat_sprite_cache${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_trap_cat_sprite_cache PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+  add_test(NAME conformance_trap_cat_single_tap
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/single_tap_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_single_tap.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_trap_cat_single_tap${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_trap_cat_single_tap PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    ENVIRONMENT "ZAN_UI_TEST=;ZAN_UI_SCRIPT=")
 
   # The Zan-side COM interop the WebView2 backend is built from (GUID
   # marshalling, vtable objects, slot dispatch, URL/profile helpers) is pure
