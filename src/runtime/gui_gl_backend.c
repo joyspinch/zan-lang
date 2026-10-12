@@ -786,6 +786,7 @@ static void gl_surface_round(zan_surface_t *s, int x, int y, int w, int h,
         cpu_surface_round(s, x, y, w, h, radius, corners, fill, border, thickness);
         return;
     }
+    if (g_zgl.count) zgl_flush();
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_SURFACE;

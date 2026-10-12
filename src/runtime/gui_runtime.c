@@ -424,6 +424,10 @@ EXPORT i32 zan_gui_write_pixels(i32 surface_id, const char *path,
     if (surface_id < 0 || surface_id >= g_surface_count
         || !g_surfaces[surface_id] || !path || path[0] == '\0') return -1;
     zan_surface_t *s = g_surfaces[surface_id];
+    if (s->be) {
+        if (s->be->flush) s->be->flush(s);
+        if (s->be->read_pixels) s->be->read_pixels(s);
+    }
     if (x < 0 || y < 0 || width <= 0 || height <= 0
         || x > s->width - width || y > s->height - height) return -1;
     size_t pixel_bytes = (size_t)width * (size_t)height * sizeof(u32);

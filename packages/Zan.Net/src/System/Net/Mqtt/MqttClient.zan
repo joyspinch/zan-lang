@@ -68,6 +68,7 @@ class MqttClient {
     int willQos;
     bool willRetain;
     bool hasWill;
+    List<MqttPacket> pendingPackets;
 
     [DllImport("crt")]
     static extern long strlen(string str);
@@ -85,6 +86,7 @@ class MqttClient {
         this.willQos = 0;
         this.willRetain = false;
         this.hasWill = false;
+        this.pendingPackets = new List<MqttPacket>();
     }
 
     // 设置客户端遗嘱（LWT）属性，在连接建立前配置。
@@ -202,15 +204,56 @@ class MqttClient {
         return written + 1;
     }
 
+    // 从待处理缓冲队列或底层网络流中获取下一个数据报文。
+    async MqttPacket NextPacketAsync() {
+        if (this.pendingPackets != null && this.pendingPackets.Count > 0) {
+            MqttPacket pkt = this.pendingPackets[0];
+            this.pendingPackets.RemoveAt(0);
+            return pkt;
+        }
+        if (this.reader == null) { return null; }
+        return await this.reader.ReadPacketAsync();
+    }
+
+    // 等待指定类型的控制报文（如 PUBACK / SUBACK / UNSUBACK / PUBREC / PUBCOMP）。
+    // 在等待过程中，如果收到 PUBLISH，将其暂存到 pendingPackets 队列中，
+    // 防止在确认到达之前丢失并发下发的业务消息；收到 PINGREQ 自动回 PINGRESP。
+    async MqttPacket DrainExpectedPacketAsync(int expectedType) {
+        if (this.reader == null) { return null; }
+        if (this.pendingPackets == null) { this.pendingPackets = new List<MqttPacket>(); }
+        while (true) {
+            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            if (pkt == null) {
+                this.connected = false;
+                return null;
+            }
+            if (expectedType >= 0 && pkt.packetType == expectedType) {
+                return pkt;
+            }
+            if (pkt.packetType == MqttPacketType.PUBLISH) {
+                this.pendingPackets.Add(pkt);
+                continue;
+            } else if (pkt.packetType == MqttPacketType.PINGREQ) {
+                byte[] pong = new byte[2];
+                pong[0] = (byte)(MqttPacketType.PINGRESP << 4);
+                pong[1] = 0;
+                await this.conn.SendBytesAsync(pong, 2);
+                continue;
+            } else if (pkt.packetType == MqttPacketType.PINGRESP) {
+                continue;
+            }
+            if (expectedType < 0) {
+                return pkt;
+            }
+            return pkt;
+        }
+    }
+
     // 读取并丢弃一个完整控制报文（如 SUBACK / PUBACK），
     // 返回其报文类型以保持流帧同步。
     async int DrainPacketAsync() {
-        if (this.reader == null) { return -1; }
-        MqttPacket pkt = await this.reader.ReadPacketAsync();
-        if (pkt == null) {
-            this.connected = false;
-            return -1;
-        }
+        MqttPacket pkt = await this.DrainExpectedPacketAsync(-1);
+        if (pkt == null) { return -1; }
         return pkt.packetType;
     }
 
@@ -324,11 +367,11 @@ class MqttClient {
         int sent = await this.conn.SendBytesAsync(packet, offset);
 
         if (qos == MqttQos.AtLeastOnce) {
-            int acked = await DrainPacketAsync();
+            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK);
         } else if (qos == MqttQos.ExactlyOnce) {
             // QoS 2 严格四步往返握手：
             // 1. 等待 broker 返回 PUBREC (5)
-            MqttPacket rec = await this.reader.ReadPacketAsync();
+            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC);
             if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
                 // 2. 发送 PUBREL (6)，固定头必须带 flags=0010 (0x62)
                 int pid = this.nextPacketId - 1;
@@ -339,7 +382,7 @@ class MqttClient {
                 pubrel[3] = (byte)(pid & 255);
                 await this.conn.SendBytesAsync(pubrel, 4);
                 // 3. 等待 broker 返回 PUBCOMP (7)
-                MqttPacket comp = await this.reader.ReadPacketAsync();
+                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP);
             }
         }
 
@@ -402,9 +445,9 @@ class MqttClient {
         int sent = await this.conn.SendBytesAsync(packet, poffset);
 
         if (qos == MqttQos.AtLeastOnce) {
-            int acked = await DrainPacketAsync();
+            MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.PUBACK);
         } else if (qos == MqttQos.ExactlyOnce) {
-            MqttPacket rec = await this.reader.ReadPacketAsync();
+            MqttPacket rec = await this.DrainExpectedPacketAsync(MqttPacketType.PUBREC);
             if (rec != null && rec.packetType == MqttPacketType.PUBREC) {
                 int pid = this.nextPacketId - 1;
                 byte[] pubrel = new byte[4];
@@ -413,7 +456,7 @@ class MqttClient {
                 pubrel[2] = (byte)((pid >> 8) & 255);
                 pubrel[3] = (byte)(pid & 255);
                 await this.conn.SendBytesAsync(pubrel, 4);
-                MqttPacket comp = await this.reader.ReadPacketAsync();
+                MqttPacket comp = await this.DrainExpectedPacketAsync(MqttPacketType.PUBCOMP);
             }
         }
 
@@ -460,7 +503,7 @@ class MqttClient {
         offset = offset + 1;
 
         int sent = await this.conn.SendBytesAsync(packet, offset);
-        int acked = await DrainPacketAsync();
+        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.SUBACK);
         return sent;
     }
 
@@ -495,7 +538,7 @@ class MqttClient {
         }
 
         int sent = await this.conn.SendBytesAsync(packet, offset);
-        int acked = await DrainPacketAsync();
+        MqttPacket acked = await this.DrainExpectedPacketAsync(MqttPacketType.UNSUBACK);
         return sent;
     }
 
@@ -507,7 +550,7 @@ class MqttClient {
         // 循环而非递归：恶意 broker 连发 PINGREQ 会把
         // 递归版本的协程栈打穿。
         while (true) {
-            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            MqttPacket pkt = await this.NextPacketAsync();
             if (pkt == null) {
                 this.connected = false;
                 return "";
@@ -589,7 +632,7 @@ class MqttClient {
     async byte[] ReceiveBytesAsync() {
         if (this.reader == null) { return null; }
         while (true) {
-            MqttPacket pkt = await this.reader.ReadPacketAsync();
+            MqttPacket pkt = await this.NextPacketAsync();
             if (pkt == null) {
                 this.connected = false;
                 return null;
