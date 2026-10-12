@@ -311,6 +311,14 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   （VEH）在检测到 `__SANITIZE_ADDRESS__` 或 `__has_feature(address_sanitizer)` 时必须跳过安装，
   避免进程在 CRT 析构（`__asan_unregister_globals`）退出时被 VEH 二次拦截并在未初始化的
   stdio 上 `fopen` 发生二次 access violation。
+- **AI 辅助工具链与包生态韧性（永远暴露、自动回退、缺包自愈）**：
+  ① MCP 工具注册必须去条件化：核心工具（`zan_api_search`, `zan_lookup_symbol`,
+  `zan_list_members`, `zan_example`）严禁因为项目目录缺少 `.zanmap` 离线文件
+  就拒绝注册向 AI 隐藏，必须始终暴露，调用时自动向 `knowledge/` 或 SDK
+  源码兜底；② 面向终端发布必须包含 `packages-catalog.json` 与 `pkg_*` 工具族
+  （`pkg_list_installed`, `pkg_search`, `pkg_install`），遇到 `namespace not found`
+  时由 AI 反向映射并自动安装，而非盲猜重写；③ 编译器内建 `zanc --api <symbol>`
+  命令行直达查询，确保即使无 MCP 环境，AI 也能通过单行命令拿到真实类型与方法签名。
 
 ## 三、验证纪律（实机/无头通用）
 

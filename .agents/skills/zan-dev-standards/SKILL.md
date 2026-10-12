@@ -307,8 +307,17 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   （`--publish` 或 `-g --no-arc-guard --no-check-leaks`）严禁启用 `--arc-guard`
   与 `--check-leaks`，因为死块隔离区只吞不吐会导致长期运行的服务或桌面端 RSS
   无界膨胀；工程级 `strictMemory` 开关仅作用于本地非发布运行，绝不穿透覆盖发布配置。
-  坑出处：历史构建中本地 F5 与发布共用一套标志，导致部署产物因 quarantine
-  积累常驻内存，或调试时缺 guard 让 UAF 沦为偶发难以复现的 0xC0000005。
+
+	- **AI 辅助工具链与包生态韧性（永远暴露、自动回退、缺包自愈）**：
+	  ① MCP 工具注册必须去条件化：核心工具（`zan_api_search`, `zan_lookup_symbol`,
+	  `zan_list_members`, `zan_example`）严禁因为项目目录缺少 `.zanmap` 离线文件
+	  就拒绝注册向 AI 隐藏，必须始终暴露，调用时自动向 `knowledge/` 或 SDK
+	  源码兜底；② 面向终端发布必须包含 `packages-catalog.json` 与 `pkg_*` 工具族
+	  （`pkg_list_installed`, `pkg_search`, `pkg_install`），遇到 `namespace not found`
+	  时由 AI 反向映射并自动安装，而非盲猜重写；③ 编译器内建 `zanc --api <symbol>`
+	  命令行直达查询，确保即使无 MCP 环境，AI 也能通过单行命令拿到真实类型与方法签名。
+	  坑出处：历史版本因未建 `.zanmap` 导致 MCP 工具静默全部隐藏，AI 退化为瞎猜接口；
+	  且未装扩展包时 AI 无法感知或安装已有官方包，反复重造已有基础设施。
 - **原生栅格化与 Blit 裁剪必须做 64 位整数防溢出**：
   在计算目标裁剪右界和下界时，`dx + dw` 和 `dy + dh` 若直接用 32 位 `int` 相加，
   当坐标处于极端区间（如 `INT_MAX` 附近的平移或越界拖拽）会发生 signed integer
