@@ -61,12 +61,12 @@ static struct {
     size_t   count, cap;             /* in floats */
     zgl_mode mode;
     zan_surface_t *target;
+    int      is_gles;
 } g_zgl;
 
 /* shaders */
 
-static const char *ZGL_VS =
-"#version 330 core\n"
+static const char *ZGL_VS_BODY =
 "uniform vec2 uViewport;\n"
 "in vec2 a_pos;\n"
 "in vec2 a_center;\n"
@@ -113,8 +113,7 @@ static const char *ZGL_VS =
 "        discard;\n" \
 "}\n"
 
-static const char *ZGL_FS_SHAPE =
-"#version 330 core\n"
+static const char *ZGL_FS_SHAPE_BODY =
 ZGL_FS_COMMON
 "uniform sampler2D uCoverage;\n"
 "uniform sampler2D uDestination;\n"
@@ -250,8 +249,8 @@ ZGL_FS_COMMON
 "    if (kind == 7 || kind == 8) o_color = over(o_color);\n"
 "}\n";
 
-static const char *ZGL_FS_TEXT =
-"#version 330 core\n"
+/* Desktop Core 3.3 Text Fragment: 亚像素 Dual-Source LCD 混合 */
+static const char *ZGL_FS_TEXT_CORE_BODY =
 ZGL_FS_COMMON
 "uniform sampler2D uAtlas1;\n"
 "uniform sampler2D uAtlas4;\n"
@@ -276,12 +275,36 @@ ZGL_FS_COMMON
 "    o_cov = vec4(c, max(max(c.r, c.g), c.b));\n"
 "}\n";
 
+/* GLES 3.0 Text Fragment: 标准高移植性 Alpha 混合输出 */
+static const char *ZGL_FS_TEXT_ES_BODY =
+ZGL_FS_COMMON
+"uniform sampler2D uAtlas1;\n"
+"uniform sampler2D uAtlas4;\n"
+"out vec4 o_color;\n"
+"void main() {\n"
+"    vec2 p = zpix();\n"
+"    zclip(p);\n"
+"    int kind = int(v_kind.x + 0.5);\n"
+"    if (kind == 9) {\n"
+"        vec4 t = texture(uAtlas4, v_uv);\n"
+"        if (t.a <= 0.0) discard;\n"
+"        o_color = vec4(t.rgb, t.a * v_col0.a);\n"
+"        return;\n"
+"    }\n"
+"    vec3 cov = (kind == 5) ? vec3(texture(uAtlas1, v_uv).r)\n"
+"                           : texture(uAtlas4, v_uv).rgb;\n"
+"    if (cov.r + cov.g + cov.b <= 0.0) discard;\n"
+"    float a = (kind == 5) ? cov.r : max(max(cov.r, cov.g), cov.b);\n"
+"    o_color = vec4(v_col0.rgb, v_col0.a * a);\n"
+"}\n";
+
 /* GL bootstrap */
 
-static zgl_uint zgl_compile(zgl_enum type, const char *src) {
+static zgl_uint zgl_compile_parts(zgl_enum type, const char *header, const char *body) {
     zgl_uint sh = gl.CreateShader(type);
-    zgl_int len = (zgl_int)strlen(src);
-    gl.ShaderSource(sh, 1, &src, &len);
+    const char *parts[2] = { header, body };
+    zgl_int lens[2] = { (zgl_int)strlen(header), (zgl_int)strlen(body) };
+    gl.ShaderSource(sh, 2, parts, lens);
     gl.CompileShader(sh);
     zgl_int ok = 0;
     gl.GetShaderiv(sh, ZGL_COMPILE_STATUS, &ok);
@@ -296,9 +319,10 @@ static zgl_uint zgl_compile(zgl_enum type, const char *src) {
     return sh;
 }
 
-static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
-    zgl_uint vs = zgl_compile(ZGL_VERTEX_SHADER, vs_src);
-    zgl_uint fs = zgl_compile(ZGL_FRAGMENT_SHADER, fs_src);
+static zgl_uint zgl_link_parts(const char *vs_head, const char *vs_body,
+                               const char *fs_head, const char *fs_body) {
+    zgl_uint vs = zgl_compile_parts(ZGL_VERTEX_SHADER, vs_head, vs_body);
+    zgl_uint fs = zgl_compile_parts(ZGL_FRAGMENT_SHADER, fs_head, fs_body);
     if (!vs || !fs) return 0;
     zgl_uint prog = gl.CreateProgram();
     gl.AttachShader(prog, vs);
@@ -317,6 +341,10 @@ static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
         return 0;
     }
     return prog;
+}
+
+static zgl_uint zgl_link(const char *vs_src, const char *fs_src) {
+    return zgl_link_parts("", vs_src, "", fs_src);
 }
 
 static void zgl_bind_attribs(zgl_uint prog) {
@@ -362,8 +390,29 @@ static int zgl_init(void) {
     zgl_blend_equation = (void (*)(zgl_enum))zan_gl_ctx_getproc("glBlendEquation");
     if (!zgl_blend_equation) { zan_gl_ctx_destroy(); return 0; }
 
-    g_zgl.prog_shape = zgl_link(ZGL_VS, ZGL_FS_SHAPE);
-    g_zgl.prog_text = zgl_link(ZGL_VS, ZGL_FS_TEXT);
+    const char *ver = (const char *)gl.GetString(ZGL_VERSION);
+    if ((ver && strstr(ver, "OpenGL ES"))
+#if defined(__ANDROID__) || defined(__OHOS__)
+        || 1
+#endif
+    ) {
+        g_zgl.is_gles = 1;
+    } else {
+        g_zgl.is_gles = 0;
+    }
+
+    const char *vs_head = g_zgl.is_gles
+        ? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+        : "#version 330 core\n";
+    const char *fs_head = g_zgl.is_gles
+        ? "#version 300 es\nprecision highp float;\nprecision highp int;\n"
+        : "#version 330 core\n";
+    const char *fs_text_body = g_zgl.is_gles
+        ? ZGL_FS_TEXT_ES_BODY
+        : ZGL_FS_TEXT_CORE_BODY;
+
+    g_zgl.prog_shape = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, ZGL_FS_SHAPE_BODY);
+    g_zgl.prog_text  = zgl_link_parts(vs_head, ZGL_VS_BODY, fs_head, fs_text_body);
     if (!g_zgl.prog_shape || !g_zgl.prog_text) { zan_gl_ctx_destroy(); return 0; }
 
     gl.GenVertexArrays(1, &g_zgl.vao);
@@ -382,8 +431,9 @@ static int zgl_init(void) {
 
     gl.PixelStorei(ZGL_UNPACK_ALIGNMENT, 1);
     gl.PixelStorei(ZGL_PACK_ALIGNMENT, 1);
+    zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
     g_zgl.atlas1 = zgl_new_atlas(ZGL_R8, ZGL_RED, ZGL_ATLAS_DIM);
-    g_zgl.atlas4 = zgl_new_atlas(ZGL_RGBA8, ZGL_BGRA, ZGL_ATLAS_DIM);
+    g_zgl.atlas4 = zgl_new_atlas(ZGL_RGBA8, color_fmt, ZGL_ATLAS_DIM);
 
     g_zgl.cap = (size_t)ZGL_VF * 6 * 2048;
     g_zgl.verts = (float *)malloc(g_zgl.cap * sizeof(float));
@@ -588,8 +638,13 @@ static void zgl_flush(void) {
         gl.BindTexture(ZGL_TEXTURE_2D, g_zgl.atlas4);
         gl.Uniform1i(g_zgl.u_atlas4, 1);
         gl.Enable(ZGL_BLEND);
-        gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
-                             ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
+        if (g_zgl.is_gles) {
+            gl.BlendFuncSeparate(ZGL_SRC_ALPHA, ZGL_ONE_MINUS_SRC_ALPHA,
+                                 ZGL_ONE, ZGL_ONE_MINUS_SRC_ALPHA);
+        } else {
+            gl.BlendFuncSeparate(ZGL_SRC1_COLOR, ZGL_ONE_MINUS_SRC1_COLOR,
+                                 ZGL_SRC1_ALPHA, ZGL_ONE_MINUS_SRC1_ALPHA);
+        }
     } else {
         gl.UseProgram(g_zgl.prog_shape);
         zgl_bind_attribs(g_zgl.prog_shape);
@@ -607,8 +662,9 @@ static void zgl_flush(void) {
                 gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
                 gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
                 gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+                zgl_enum color_fmt = g_zgl.is_gles ? ZGL_RGBA : ZGL_BGRA;
                 gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, t->w, t->h, 0,
-                              ZGL_BGRA, ZGL_UNSIGNED_BYTE, NULL);
+                              color_fmt, ZGL_UNSIGNED_BYTE, NULL);
                 gl.GenFramebuffers(1, &snap_fbo);
                 gl.BindFramebuffer(ZGL_FRAMEBUFFER, snap_fbo);
                 gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,

@@ -1,5 +1,30 @@
 /* gui_runtime_android_native */
 
+/* The native clock regression includes this production block without Android SDK headers. */
+#if defined(ZAN_GUI_ANDROID_NATIVE) || defined(ZAN_GUI_ANDROID_CLOCK_TEST)
+#ifdef ZAN_GUI_ANDROID_NATIVE
+#include <pthread.h>
+#endif
+static pthread_once_t g_tick_once = PTHREAD_ONCE_INIT;
+static i64 g_tick_origin_ms;
+
+static void ant_tick_init(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_tick_origin_ms = (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static i64 ant_tick_ms(void) {
+    /* Window.GetTickMs narrows to int: use driver lifetime, not device uptime.
+       Initialize before sampling now so concurrent first callers cannot go negative.
+       This origin survives Activity/Surface recreation and resume. */
+    pthread_once(&g_tick_once, ant_tick_init);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 - g_tick_origin_ms;
+}
+#endif
+
 #ifdef ZAN_GUI_ANDROID_NATIVE
 
 #include <EGL/egl.h>
@@ -9,6 +34,7 @@
 #include <android/input.h>
 #include <android/keycodes.h>
 #include <android/looper.h>
+#include <android/choreographer.h>
 #include <android/configuration.h>
 #include <android/window.h>
 #include <android/log.h>
@@ -63,6 +89,37 @@ typedef struct { int e[8]; iptr win; } zan_aev_t;
 static zan_aev_t g_aq[ZAN_AQ_CAP];
 static int g_aq_head = 0, g_aq_tail = 0;
 static pthread_mutex_t g_aq_lock = PTHREAD_MUTEX_INITIALIZER;
+static ALooper *g_ui_looper;
+static uint64_t g_wake_seq, g_seen_wake_seq;
+static AChoreographer *g_display_choreographer;
+static uintptr_t g_display_frame_serial, g_display_frame_pending;
+static int g_display_frame_ready;
+
+/* API24 回调不可取消；失效请求的 token 不能清除下一窗口的新请求。 */
+static void ant_invalidate_display_frame_locked(void) {
+    g_display_frame_pending = 0;
+    g_display_frame_ready = 0;
+}
+static double g_refresh_hz = 60.0;
+static i64 g_refresh_checked_ms;
+static int g_refresh_valid;
+
+/* 队列锁同时保护 Looper 的持有期；poll 的任何返回都可能合并唤醒。 */
+static void ant_wake_locked(void) {
+    if (g_ui_looper) {
+        ++g_wake_seq;
+        ALooper_wake(g_ui_looper);
+    }
+}
+
+static int ant_take_wake(void) {
+    pthread_mutex_lock(&g_aq_lock);
+    /* Poll/Wait must keep reporting an unconsumed frame after its wake is taken. */
+    int woke = g_seen_wake_seq != g_wake_seq || g_display_frame_ready;
+    g_seen_wake_seq = g_wake_seq;
+    pthread_mutex_unlock(&g_aq_lock);
+    return woke;
+}
 
 static int g_pending_event[8];
 static iptr g_event_win = 0;
@@ -78,6 +135,7 @@ static void aq_push_event_locked(const int event[8]) {
     memcpy(z->e, event, sizeof(z->e));
     z->win = ZAN_ANW_HWND;
     g_aq_tail = next;
+    ant_wake_locked();
 }
 
 static void aq_push_locked(int kind, int x, int y, int button, int code, int mods) {
@@ -112,6 +170,8 @@ static void anw_attach(ANativeWindow *nw) {
     g_anw.nw = nw;
     g_anw.w = w; g_anw.h = h;
     g_anw.attached = 1;
+    g_refresh_valid = 0;
+    ant_invalidate_display_frame_locked();
     g_window_width = w;
     g_window_height = h;
     aq_push_locked(7, w, h, 0, 0, 0);
@@ -126,13 +186,8 @@ static void anw_detach(void) {
     pthread_mutex_lock(&g_aq_lock);
     g_anw.attached = 0;
     g_anw.nw = NULL;
+    ant_invalidate_display_frame_locked();
     pthread_mutex_unlock(&g_aq_lock);
-}
-
-static i64 ant_tick_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (i64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 #define ANT_TOUCH_SLOP2   64.0f
@@ -218,8 +273,7 @@ static void ant_touch(int action, int x, int y) {
         g_tg_y = g_tg_ay = (float)y;
         g_tg_hn = 1; g_tg_hi = 1 % ANT_TOUCH_HIST;
         g_tg_ht[0] = ant_tick_ms(); g_tg_hy[0] = g_tg_y;
-        /* 手指按下事件派发：先发送移动事件以更新光标悬停，再发送按下事件 */
-        aq_push_locked(1, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
+        /* 按下自带坐标，App 直接命中目标；不额外生成触屏悬停帧。 */
         aq_push_locked(2, (int)g_tg_ax, (int)g_tg_ay, 0, 0, 0);
         pthread_mutex_unlock(&g_aq_lock);
         return;
@@ -368,15 +422,23 @@ static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
     if (AInputEvent_getType(ev) == AINPUT_EVENT_TYPE_KEY) {
         int32_t kc = AKeyEvent_getKeyCode(ev);
         int32_t act = AKeyEvent_getAction(ev);
-        if (act != AKEY_EVENT_ACTION_DOWN) return 1;
         if (kc == AKEYCODE_BACK) {
-            /* 返回键处理：派发窗口关闭事件终止主循环 */
+            const char *back_as_escape = getenv("ZAN_GUI_BACK_AS_ESCAPE");
             pthread_mutex_lock(&g_aq_lock);
-            g_anw.closed = 1;
-            aq_push_locked(8, 0, 0, 0, 0, 0);
+            if (back_as_escape && strcmp(back_as_escape, "1") == 0) {
+                if (act == AKEY_EVENT_ACTION_UP ||
+                    (act == AKEY_EVENT_ACTION_DOWN && AKeyEvent_getRepeatCount(ev) == 0)) {
+                    aq_push_locked(act == AKEY_EVENT_ACTION_DOWN ? 4 : 5,
+                                   0, 0, 0, 27, 0);
+                }
+            } else if (act == AKEY_EVENT_ACTION_DOWN) {
+                g_anw.closed = 1;
+                aq_push_locked(8, 0, 0, 0, 0, 0);
+            }
             pthread_mutex_unlock(&g_aq_lock);
             return 1;
         }
+        if (act != AKEY_EVENT_ACTION_DOWN) return 1;
         if (kc == AKEYCODE_DEL || kc == AKEYCODE_FORWARD_DEL) {
             pthread_mutex_lock(&g_aq_lock);
             aq_push_locked(6, 0, 0, 0, 8, 0);
@@ -415,6 +477,7 @@ static int32_t ant_input(struct android_app *app, AInputEvent *ev) {
 
 static void fling_cancel_public(void);
 
+static int ant_poll_looper(int timeout_ms);
 static void ant_pump_looper(void);
 
 static void ant_set_immersive(void);
@@ -455,10 +518,14 @@ static void ant_cmd(struct android_app *app, int32_t cmd) {
             pthread_mutex_unlock(&g_aq_lock);
         }
         break;
+    case APP_CMD_RESUME:
+        g_refresh_valid = 0;
+        break;
     case APP_CMD_GAINED_FOCUS:
         /* Activity 恢复时重新隐藏系统状态栏与导航栏 */
         ant_set_immersive();
         pthread_mutex_lock(&g_aq_lock);
+        g_refresh_valid = 0;
         aq_push_locked(14, 0, 0, 0, 0, 0);
         pthread_mutex_unlock(&g_aq_lock);
         break;
@@ -493,7 +560,15 @@ int main(int argc, char **argv);
 
 void android_main(struct android_app *app) {
     app->onAppCmd = ant_cmd;
+    pthread_mutex_lock(&g_aq_lock);
     g_anw.app = app;
+    g_anw.closed = 0;
+    g_anw.destroy_wait = 0;
+    g_aq_head = g_aq_tail = 0;
+    memset(g_pending_event, 0, sizeof(g_pending_event));
+    g_ui_looper = app->looper;
+    if (g_ui_looper) ALooper_acquire(g_ui_looper);
+    pthread_mutex_unlock(&g_aq_lock);
 
     ant_set_dpi(app);
 
@@ -530,6 +605,20 @@ void android_main(struct android_app *app) {
     char *arg0 = "zan";
     char *argv[1] = { arg0 };
     main(1, argv);
+    /* Native glue must process DESTROY before its worker returns. */
+    app->onInputEvent = NULL;
+    if (!app->destroyRequested) ANativeActivity_finish(app->activity);
+    while (!app->destroyRequested) {
+        if (ant_poll_looper(-1) == ALOOPER_POLL_ERROR) break;
+    }
+    pthread_mutex_lock(&g_aq_lock);
+    ALooper *looper = g_ui_looper;
+    ant_invalidate_display_frame_locked();
+    g_display_choreographer = NULL;
+    g_ui_looper = NULL;
+    g_anw.app = NULL;
+    pthread_mutex_unlock(&g_aq_lock);
+    if (looper) ALooper_release(looper);
 }
 
 /* ---- present (EGL) ------------------------------------------------------ */
@@ -571,16 +660,24 @@ static int ant_gl_surface(zan_anw_t *w) {
         if (w->egl_dpy == EGL_NO_DISPLAY || !eglInitialize(w->egl_dpy, NULL, NULL))
             return 1;
     }
-    const EGLint cfg_attrs[] = {
+    const EGLint cfg_attrs_v3[] = {
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RENDERABLE_TYPE, 0x00000040 /* EGL_OPENGL_ES3_BIT_KHR */,
         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
         EGL_NONE
     };
     EGLConfig cfg = NULL;
     EGLint n = 0;
-    if (!eglChooseConfig(w->egl_dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
-        return 1;
+    if (!eglChooseConfig(w->egl_dpy, cfg_attrs_v3, &cfg, 1, &n) || n < 1) {
+        const EGLint cfg_attrs_v2[] = {
+            EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(w->egl_dpy, cfg_attrs_v2, &cfg, 1, &n) || n < 1)
+            return 1;
+    }
     if (!w->egl_surf || w->nw != w->surf_nw
         || w->w != w->surf_w || w->h != w->surf_h) {
         if (w->egl_surf) {
@@ -606,8 +703,12 @@ static int ant_gl_surface(zan_anw_t *w) {
         ant_gl_reset();
     }
     if (!w->egl_ctx) {
-        const EGLint ctx_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-        w->egl_ctx = eglCreateContext(w->egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs);
+        const EGLint ctx_attrs_v3[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+        w->egl_ctx = eglCreateContext(w->egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs_v3);
+        if (w->egl_ctx == EGL_NO_CONTEXT) {
+            const EGLint ctx_attrs_v2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+            w->egl_ctx = eglCreateContext(w->egl_dpy, cfg, EGL_NO_CONTEXT, ctx_attrs_v2);
+        }
         if (w->egl_ctx == EGL_NO_CONTEXT) return 1;
     }
     if (!eglMakeCurrent(w->egl_dpy, w->egl_surf, w->egl_surf, w->egl_ctx))
@@ -839,6 +940,7 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     (void)hwnd_val;
     pthread_mutex_lock(&g_aq_lock);
     g_anw.closed = 1;
+    ant_invalidate_display_frame_locked();
     aq_push_locked(8, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_aq_lock);
     /* 请求 Activity 退出并销毁 Surface */
@@ -849,10 +951,7 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
 }
 EXPORT i32 zan_gui_destroy_window(iptr hwnd_val) {
     (void)hwnd_val;
-    pthread_mutex_lock(&g_aq_lock);
-    g_anw.attached = 0;
-    g_anw.nw = NULL;
-    pthread_mutex_unlock(&g_aq_lock);
+    anw_detach();
     return 0;
 }
 EXPORT i32 zan_gui_is_maximized(iptr hwnd_val)     { (void)hwnd_val; return 0; }
@@ -872,79 +971,126 @@ EXPORT i32 zan_gui_poll_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     /* 待重绘空闲轮询路径：带超时的 epoll/ALooper 等待 */
     ant_pump_looper();
-    if (aq_pop()) { return 0; }
+    int woke = ant_take_wake();
+    if (aq_pop() || woke) { return 0; }
+    return g_anw.closed ? -1 : 1;
+}
+
+/* 由请求线程的 Looper 执行；只发布帧信号，不创建或覆盖输入事件。 */
+static void ant_display_frame_callback(long frame_time_ns, void *data) {
+    (void)frame_time_ns;
+    uintptr_t token = (uintptr_t)data;
+    pthread_mutex_lock(&g_aq_lock);
+    if (token != 0 && token == g_display_frame_pending) {
+        g_display_frame_pending = 0;
+        if (g_ui_looper && g_anw.app && g_anw.attached && !g_anw.closed &&
+            !g_anw.app->destroyRequested) {
+            g_display_frame_ready = 1;
+            ant_wake_locked();
+        }
+    }
+    pthread_mutex_unlock(&g_aq_lock);
+}
+
+static int ant_display_frame_available_locked(ALooper *looper) {
+    return looper && looper == g_ui_looper && g_anw.app &&
+           g_anw.attached && !g_anw.closed && !g_anw.app->destroyRequested;
+}
+
+EXPORT i32 zan_gui_request_display_frame(iptr hwnd_val) {
+    if (hwnd_val != ZAN_ANW_HWND) return 0;
+    ALooper *looper = ALooper_forThread();
+    pthread_mutex_lock(&g_aq_lock);
+    if (!ant_display_frame_available_locked(looper)) {
+        pthread_mutex_unlock(&g_aq_lock);
+        return 0;
+    }
+    if (g_display_frame_pending || g_display_frame_ready) {
+        pthread_mutex_unlock(&g_aq_lock);
+        return 1;
+    }
+    AChoreographer *choreographer = g_display_choreographer;
+    /* API24 在当前 Looper 线程取得实例；稳态请求只取一次队列锁。 */
+    if (!choreographer) {
+        pthread_mutex_unlock(&g_aq_lock);
+        choreographer = AChoreographer_getInstance();
+        if (!choreographer) return 0;
+        pthread_mutex_lock(&g_aq_lock);
+        if (!ant_display_frame_available_locked(looper)) {
+            pthread_mutex_unlock(&g_aq_lock);
+            return 0;
+        }
+        g_display_choreographer = choreographer;
+    }
+    if (++g_display_frame_serial == 0) ++g_display_frame_serial;
+    uintptr_t token = g_display_frame_serial;
+    g_display_frame_pending = token;
+    pthread_mutex_unlock(&g_aq_lock);
+    AChoreographer_postFrameCallback(choreographer, ant_display_frame_callback,
+                                     (void *)token);
     return 1;
 }
 
-static long long g_wait_spins;
+EXPORT i32 zan_gui_take_display_frame(iptr hwnd_val) {
+    if (hwnd_val != ZAN_ANW_HWND) return 0;
+    ALooper *looper = ALooper_forThread();
+    pthread_mutex_lock(&g_aq_lock);
+    int ready = ant_display_frame_available_locked(looper) && g_display_frame_ready;
+    if (ready) g_display_frame_ready = 0;
+    pthread_mutex_unlock(&g_aq_lock);
+    return ready;
+}
+
+static int ant_poll_looper(int timeout_ms) {
+    struct android_app *app = g_anw.app;
+    if (!app || !app->looper) return ALOOPER_POLL_ERROR;
+    int events = 0;
+    struct android_poll_source *source = NULL;
+    int ident = ALooper_pollOnce(timeout_ms, NULL, &events, (void **)&source);
+    if (ident >= 0 && source && source->process) source->process(app, source);
+    if (app->destroyRequested != 0 && !g_anw.closed) {
+        pthread_mutex_lock(&g_aq_lock);
+        g_anw.closed = 1;
+        ant_invalidate_display_frame_locked();
+        aq_push_locked(8, 0, 0, 0, 0, 0);
+        pthread_mutex_unlock(&g_aq_lock);
+    }
+    return ident;
+}
 
 static void ant_pump_looper(void) {
-    struct android_app *app = g_anw.app;
-    if (!app) return;
-    int ident;
-    int events;
-    struct android_poll_source *source;
-    while ((ident = ALooper_pollOnce(0, NULL, &events,
-                                     (void **)&source)) >= 0) {
-        if (source && source->process) source->process(app, source);
-        if (ident == LOOPER_ID_MAIN && app->destroyRequested != 0) {
-            pthread_mutex_lock(&g_aq_lock);
-            g_anw.closed = 1;
-            aq_push_locked(8, 0, 0, 0, 0, 0);
-            pthread_mutex_unlock(&g_aq_lock);
-            return;
-        }
+    while (ant_poll_looper(0) >= 0) {
+        if (g_anw.closed) return;
     }
 }
 
-EXPORT i32 zan_gui_wait_event(void) {
-    memset(g_pending_event, 0, sizeof(g_pending_event));
-    for (;;) {
-        ant_pump_looper();
-        if (aq_pop()) { return 0; }
-        if (g_anw.destroy_wait && g_anw.app) {
-            int events;
-            struct android_poll_source *source;
-            int ident = ALooper_pollOnce(-1, NULL, &events,
-                                         (void **)&source);
-            if (ident == LOOPER_ID_MAIN && source && source->process)
-                source->process(g_anw.app, source);
-            if (g_anw.app->destroyRequested != 0) {
-                pthread_mutex_lock(&g_aq_lock);
-                g_anw.closed = 1;
-                aq_push_locked(8, 0, 0, 0, 0, 0);
-                pthread_mutex_unlock(&g_aq_lock);
-                return 0;
-            }
-            if (aq_pop()) { return 0; }
-            continue;
-        }
-#ifdef ZAN_SHELL_TRACE
-        if ((++g_wait_spins % 500) == 0)
-            ZAN_TRACE("wait spin %lld", g_wait_spins);
-#endif
-        struct timespec ts = { 0, 4 * 1000 * 1000 }; /* 4 ms */
-        nanosleep(&ts, NULL);
-    }
-}
-
-EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
+static i32 ant_wait_event(int timeout_ms) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
     ant_pump_looper();
-    if (aq_pop()) { return 0; }
-    int remain = (ms < 0) ? 0 : ms;
-    while (remain > 0) {
-        long step = (remain > 8) ? 8 : (long)remain;
-        struct timespec ts = { 0, step * 1000 * 1000 };
-        nanosleep(&ts, NULL);
-        remain -= (int)step;
-        ant_pump_looper();
-        if (aq_pop()) { return 0; }
-    }
-    return 1;
+    int woke = ant_take_wake();
+    if (aq_pop() || woke) return 0;
+    if (g_anw.closed) return -1;
+    if (timeout_ms == 0) return 1;
+    int ident = ant_poll_looper(timeout_ms);
+    /* WAKE 可与输入、callback 或 timeout 合并，序号比返回码更可靠。 */
+    woke = ant_take_wake();
+    if (aq_pop() || woke) return 0;
+    if (g_anw.closed || ident == ALOOPER_POLL_ERROR) return -1;
+    return ident == ALOOPER_POLL_TIMEOUT ? 1 : 0;
 }
 
-EXPORT i32 zan_gui_wake(void) { return 0; }
+EXPORT i32 zan_gui_wait_event(void) { return ant_wait_event(-1); }
+
+EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
+    return ant_wait_event(ms < 0 ? 0 : ms);
+}
+
+EXPORT i32 zan_gui_wake(void) {
+    pthread_mutex_lock(&g_aq_lock);
+    ant_wake_locked();
+    pthread_mutex_unlock(&g_aq_lock);
+    return 0;
+}
 
 EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
@@ -1003,6 +1149,53 @@ static JNIEnv *zan_anw_bridge_env(void) {
 static jobject zan_anw_bridge_activity(void) {
     struct android_app *app = g_anw.app;
     return app && app->activity ? (jobject)app->activity->clazz : NULL;
+}
+
+/* 当前 Display 模式的 Hz；Surface/恢复后重查，其余最多每秒一次 JNI。 */
+EXPORT double zan_gui_refresh_rate(iptr hwnd_val) {
+    (void)hwnd_val;
+    i64 now = ant_tick_ms();
+    if (g_refresh_valid && now - g_refresh_checked_ms < 1000) return g_refresh_hz;
+    g_refresh_checked_ms = now;
+    g_refresh_valid = 1;
+    g_refresh_hz = 60.0;
+    struct android_app *app = g_anw.app;
+    if (!app || !app->activity || !app->activity->vm) return g_refresh_hz;
+    JavaVM *vm = app->activity->vm;
+    JNIEnv *prior = NULL;
+    int detach = (*vm)->GetEnv(vm, (void **)&prior, JNI_VERSION_1_6) == JNI_EDETACHED;
+    JNIEnv *env = zan_anw_bridge_env();
+    if (!env) return g_refresh_hz;
+    int framed = (*env)->PushLocalFrame(env, 16) == JNI_OK;
+    if (!framed) goto done;
+    jobject activity = (jobject)app->activity->clazz;
+    jclass activity_class = (*env)->GetObjectClass(env, activity);
+    if (!activity_class) goto done;
+    jmethodID get_manager = (*env)->GetMethodID(env, activity_class, "getWindowManager",
+                                               "()Landroid/view/WindowManager;");
+    if (!get_manager) goto done;
+    jobject manager = (*env)->CallObjectMethod(env, activity, get_manager);
+    if ((*env)->ExceptionCheck(env) || !manager) goto done;
+    jclass manager_class = (*env)->GetObjectClass(env, manager);
+    if (!manager_class) goto done;
+    jmethodID get_display = (*env)->GetMethodID(env, manager_class, "getDefaultDisplay",
+                                               "()Landroid/view/Display;");
+    if (!get_display) goto done;
+    jobject display = (*env)->CallObjectMethod(env, manager, get_display);
+    if ((*env)->ExceptionCheck(env) || !display) goto done;
+    jclass display_class = (*env)->GetObjectClass(env, display);
+    if (!display_class) goto done;
+    jmethodID get_rate = (*env)->GetMethodID(env, display_class, "getRefreshRate", "()F");
+    if (!get_rate) goto done;
+    jfloat hz = (*env)->CallFloatMethod(env, display, get_rate);
+    if (!(*env)->ExceptionCheck(env) && hz > 1.0f && hz <= 1000.0f)
+        g_refresh_hz = (double)hz;
+ done:
+    /* 可选显示查询失败按契约回退，不能留下异常污染后续 JNI。 */
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (framed) (*env)->PopLocalFrame(env, NULL);
+    if (detach) (*vm)->DetachCurrentThread(vm);
+    return g_refresh_hz;
 }
 
 /* JNI 剪贴板与输入法 (IME) 访问通道 */
@@ -1361,15 +1554,6 @@ EXPORT i32 zan_gui_write_file(const char *path, const char *utf8) {
     size_t w = fwrite(utf8, 1, n, f);
     fclose(f);
     return w == n ? 0 : 1;
-}
-
-EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val)                  { (void)hwnd_val; return 1; }
-EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr rend)     { (void)hwnd_val; (void)rend; return 1; }
-EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {
-    (void)hwnd_val; (void)bgra; (void)w; (void)h; return 1;
-}
-EXPORT i32 zan_gui_scene_present(iptr hwnd_val, i32 surface_id) {
-    (void)hwnd_val; (void)surface_id; return 1;
 }
 
 #endif /* ZAN_GUI_ANDROID_NATIVE */

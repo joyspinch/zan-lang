@@ -685,6 +685,146 @@ static void zan_gl_ctx_present_end(void *host) { (void)host; }
 static void zan_gl_ctx_present_drop(void *host) { (void)host; }
 static void zan_gl_ctx_present_drop_all(void) { }
 
+#elif defined(__ANDROID__) || defined(__OHOS__) || defined(ZAN_USE_EGL)
+/* EGL (Android / OpenHarmony / Linux EGL) */
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <dlfcn.h>
+#include <stdlib.h>
+
+#ifndef EGL_OPENGL_ES3_BIT_KHR
+#define EGL_OPENGL_ES3_BIT_KHR 0x00000040
+#endif
+
+typedef struct {
+    EGLDisplay dpy;
+    EGLSurface surf;
+    EGLContext ctx;
+    EGLConfig  cfg;
+    int        external;
+    void      *libgles;
+} zan_egl_ctx_t;
+
+static zan_egl_ctx_t g_eglctx;
+
+static void *zan_gl_ctx_getproc(const char *name) {
+    if (!name) return NULL;
+    void *fn = (void *)eglGetProcAddress(name);
+    if (fn) return fn;
+    if (!g_eglctx.libgles) {
+        g_eglctx.libgles = dlopen("libGLESv3.so", RTLD_NOW | RTLD_GLOBAL);
+        if (!g_eglctx.libgles)
+            g_eglctx.libgles = dlopen("libGLESv2.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (g_eglctx.libgles) {
+        fn = dlsym(g_eglctx.libgles, name);
+        if (fn) return fn;
+    }
+    return dlsym(RTLD_DEFAULT, name);
+}
+
+static int zan_gl_ctx_make_current(void) {
+    if (!g_eglctx.dpy || !g_eglctx.ctx) return 0;
+    return eglMakeCurrent(g_eglctx.dpy, g_eglctx.surf, g_eglctx.surf, g_eglctx.ctx) == EGL_TRUE;
+}
+
+static void zan_gl_ctx_destroy(void) {
+    if (g_eglctx.dpy && !g_eglctx.external) {
+        eglMakeCurrent(g_eglctx.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (g_eglctx.surf != EGL_NO_SURFACE) eglDestroySurface(g_eglctx.dpy, g_eglctx.surf);
+        if (g_eglctx.ctx != EGL_NO_CONTEXT) eglDestroyContext(g_eglctx.dpy, g_eglctx.ctx);
+        eglTerminate(g_eglctx.dpy);
+    }
+    if (g_eglctx.libgles) {
+        dlclose(g_eglctx.libgles);
+        g_eglctx.libgles = NULL;
+    }
+    memset(&g_eglctx, 0, sizeof(g_eglctx));
+}
+
+static int zan_gl_ctx_create(void) {
+    /* 1. 若当前环境已有活跃外部 EGL 状态，直接复用以零成本衔接主循环 */
+    EGLDisplay cur_dpy = eglGetCurrentDisplay();
+    EGLContext cur_ctx = eglGetCurrentContext();
+    EGLSurface cur_surf = eglGetCurrentSurface(EGL_DRAW);
+    if (cur_dpy != EGL_NO_DISPLAY && cur_ctx != EGL_NO_CONTEXT) {
+        g_eglctx.dpy = cur_dpy;
+        g_eglctx.ctx = cur_ctx;
+        g_eglctx.surf = cur_surf;
+        g_eglctx.external = 1;
+        return 1;
+    }
+
+    /* 2. 独立初始化 EGL 离屏上下文 */
+    g_eglctx.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (g_eglctx.dpy == EGL_NO_DISPLAY || !eglInitialize(g_eglctx.dpy, NULL, NULL)) {
+        zan_gl_ctx_destroy();
+        return 0;
+    }
+
+    const EGLint cfg_attrs[] = {
+        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLint n = 0;
+    if (!eglChooseConfig(g_eglctx.dpy, cfg_attrs, &g_eglctx.cfg, 1, &n) || n < 1) {
+        const EGLint cfg_fallback[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_NONE
+        };
+        if (!eglChooseConfig(g_eglctx.dpy, cfg_fallback, &g_eglctx.cfg, 1, &n) || n < 1) {
+            zan_gl_ctx_destroy();
+            return 0;
+        }
+    }
+
+    const EGLint pbuf_attrs[] = {
+        EGL_WIDTH, 1,
+        EGL_HEIGHT, 1,
+        EGL_NONE
+    };
+    g_eglctx.surf = eglCreatePbufferSurface(g_eglctx.dpy, g_eglctx.cfg, pbuf_attrs);
+    if (g_eglctx.surf == EGL_NO_SURFACE) {
+        zan_gl_ctx_destroy();
+        return 0;
+    }
+
+    const EGLint ctx_attrs_v3[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    g_eglctx.ctx = eglCreateContext(g_eglctx.dpy, g_eglctx.cfg, EGL_NO_CONTEXT, ctx_attrs_v3);
+    if (g_eglctx.ctx == EGL_NO_CONTEXT) {
+        const EGLint ctx_attrs_v2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+        g_eglctx.ctx = eglCreateContext(g_eglctx.dpy, g_eglctx.cfg, EGL_NO_CONTEXT, ctx_attrs_v2);
+    }
+    if (g_eglctx.ctx == EGL_NO_CONTEXT) {
+        zan_gl_ctx_destroy();
+        return 0;
+    }
+
+    if (!zan_gl_ctx_make_current()) {
+        zan_gl_ctx_destroy();
+        return 0;
+    }
+    return 1;
+}
+
+static int zan_gl_ctx_present_begin(void *host, int w, int h) {
+    (void)host; (void)w; (void)h;
+    return zan_gl_ctx_make_current();
+}
+
+static void zan_gl_ctx_present_end(void *host) {
+    (void)host;
+    if (g_eglctx.dpy && g_eglctx.surf != EGL_NO_SURFACE) {
+        eglSwapBuffers(g_eglctx.dpy, g_eglctx.surf);
+    }
+}
+
+static void zan_gl_ctx_present_drop(void *host) { (void)host; }
+static void zan_gl_ctx_present_drop_all(void) { }
+
 #else
 static int zan_gl_ctx_create(void) { return 0; }
 static int zan_gl_ctx_make_current(void) { return 0; }
