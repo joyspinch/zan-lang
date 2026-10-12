@@ -1,7 +1,7 @@
 # Zan Charts
 
 Standalone gallery for `Gui.Component.Chart`, modelled on the
-[ECharts 2.2.7 example site](http://static.dtws110.com/echarts-2.2.7/doc/example.html).
+[ECharts official example gallery](https://echarts.apache.org/examples/).
 
 Each nav entry is one example with its own `ChartOption` and dataset. Deep-link
 by id, English name, or Chinese title:
