@@ -8,5 +8,5 @@ card, tactics, puzzle, idle and lightweight arcade games:
 - one-shot and repeating timers;
 - a stack-based scene lifecycle.
 
-SDL ownership lives in `Game.Foundation.Sdl`, keeping headless simulations and
-servers independent from the native windowing driver.
+GUI runtime host integration lives in `Game.Foundation.Gui`, keeping headless
+simulations and servers independent from the windowing driver.

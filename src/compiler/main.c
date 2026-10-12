@@ -6238,20 +6238,14 @@ int main(int argc, char **argv) {
 #ifdef __APPLE__
         {
             char home_lib[512]; home_lib[0] = '\0';
-            char home_pq[512];  home_pq[0] = '\0';
             const char *home = getenv("HOME");
             if (home && *home) {
                 snprintf(home_lib, sizeof(home_lib), "%s/.homebrew/lib", home);
-                snprintf(home_pq, sizeof(home_pq),
-                         "%s/.homebrew/opt/libpq/lib", home);
             }
             const char *mac_lib_dirs[] = {
                 home_lib[0] ? home_lib : NULL,
                 "/opt/homebrew/lib",
                 "/usr/local/lib",
-                home_pq[0] ? home_pq : NULL,
-                "/opt/homebrew/opt/libpq/lib",
-                "/usr/local/opt/libpq/lib",
                 NULL,
             };
             for (int ci = 0; mac_lib_dirs[ci]; ci++) {

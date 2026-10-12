@@ -14,10 +14,10 @@ namespace Game.Foundation.Gui;
 // 3=鼠标释放 4=键按下 5=键抬起——Win32Shell/App 控件分发同一
 // 编码，keycode/按钮见 Event 参数）；FixedUpdate 一帧内可能触发
 // 多次（追帧）也可能零次；Render 的 alpha 是 0..1 的帧间插值系数。
-// 渲染回调给 Gui.Canvas（软件光栅 + 各平台原生 present）而非
-// SdlRenderer——窗口、事件泵与呈现全部由 stdlib/Gui 的原生
+// 渲染回调给 Gui.Canvas（软件光栅 + 各平台原生 present）——
+// 窗口、事件泵与呈现全部由 stdlib/Gui 的原生
 // 外壳承担（Windows GDI / Linux X11 / macOS / OHOS / Android
-// NativeActivity+GL），不依赖 SDL。
+// NativeActivity+GL）。
 interface IGuiHostLoop {
     // 主循环开始前调用一次（窗口已就绪）。
     void Start(GuiHost host);
@@ -41,11 +41,11 @@ interface IGuiHostLoop {
 }
 
 // GUI 运行时宿主：确定性固定更新、语义化输入状态、连续帧驱动
-// （SetPollEventMode + 每帧 RequestRedraw，由 App 的 16ms 帧预算
-// 自限速在约 60fps）。窗口经 App.CreateDarkStage 创建——统一 DPI
+// （输入可打断 App 的显示帧等待，渲染按显示器刷新节奏推进）。
+// 窗口经 App.CreateDarkStage 创建——统一 DPI
 // 契约：不做显示器 DPI 放大，游戏舞台（内容区）尺寸恒等于请求的
 // 逻辑分辨率，拖到任何缩放率的显示器都不变，输入坐标 1:1（高
-// DPI 屏上窗口视觉尺寸变小，同 SDL 时代的行为）。窗口模式带标准
+// DPI 屏上窗口视觉尺寸变小，保持物理 1:1 像素映射）。窗口模式带标准
 // Gui 标题栏（皮肤按钮默认关，宿主每帧在内容之上画 chrome，模板
 // 绘制与鼠标 y 以 ContentTop() 为界）；全屏收起标题栏后舞台即整
 // 个客户区。模板按固定逻辑分辨率绘制，用 canvas.Width()/Height()
@@ -99,28 +99,37 @@ class GuiHost {
 
     // 运行主循环直到退出：轮询事件 → 推进固定步长时钟 →
     // 依次回调 loop 的 Update/Render（在 App 的 BeginFrame/
-    // PresentFrame 之间）。App 帧预算把节奏压在约 60fps；
+    // PresentFrame 之间）。App 使用当前显示器的刷新节奏；
     // 关窗（Process 返回 false）结束循环。正常返回 true。
     bool Run(IGuiHostLoop loop) {
         if (loop == null) { return false; }
+        #if ANDROID
+        Environment.SetEnvironmentVariable("ZAN_GUI_BACK_AS_ESCAPE", "1");
+        #endif
         this.app = App.CreateDarkStage(this.title, this.logicalWidth,
                                        this.logicalHeight);
         if (this.app == null) { return false; }
         // 窗口建好后必须 Show：App.RunLoop 的第一步同样是它。
         this.app.Show();
-        // 游戏主循环负责帧节奏：ProcessEvent 绝不阻塞等待 OS 事件，
-        // 否则空闲帧会睡死在没有独立消息泵的循环里。
-        this.app.SetPollEventMode();
+        this.app.RequestRedraw();
         this.running = true;
         this.lastTick = Window.GetTickMs();
         loop.Start(this);
         while (this.running) {
-            int frameStartMs = Window.GetTickMs();
-            // 单帧排空当前所有积压的 OS 事件（处理高频鼠标移动与连续按键），
-            // 彻底消除游戏输入延迟；上限保护防止极端事件风暴阻塞帧推进。
+            // 帧回调/空唤醒没有输入，不能回退成上一帧挂载的释放事件。
+            this.app.HoldEventKind(0);
+            // 无输入时等显示帧，有输入时立即派发；排空阶段始终非阻塞。
+            if (!this.app.ProcessEvent()) { this.running = false; break; }
             int drained = 0;
             int lastEvKind = 0;
-            while (drained < 32) {
+            if (this.app.lastPollResult == 0) {
+                lastEvKind = this.app.EventKind();
+                this.DispatchKeyEvent(loop);
+                drained = 1;
+            }
+            // 保留树在 Render 才消费按下/释放/键盘/字符事件。
+            // 每个离散输入必须先呈现，再取下一个，否则同批输入会互相覆盖。
+            while (drained < 32 && (lastEvKind < 2 || lastEvKind > 6)) {
                 int ev = this.app.PollOneEvent();
                 if (ev < 0) { this.running = false; break; }
                 if (ev == 0) { break; }
@@ -188,16 +197,6 @@ class GuiHost {
             // 连续渲染：游戏每帧都要画，下一圈继续出帧。
             this.app.RequestRedraw();
 
-            // 跨平台帧尾 Pacing 闭环：覆盖全帧耗时（排空+逻辑+渲染+Present），
-            // 前台锁定 60 FPS (16ms)，失焦后台自适应降档至 30 FPS (33ms)，彻底消除空转与高 CPU。
-            int targetBudget = 16;
-            if (!this.app.window.IsFocused()) {
-                targetBudget = 33;
-            }
-            int frameElapsed = Window.GetTickMs() - frameStartMs;
-            if (frameElapsed < targetBudget) {
-                Window.SleepMs(targetBudget - frameElapsed);
-            }
         }
         loop.Stop(this);
         this.app.StopLoop();

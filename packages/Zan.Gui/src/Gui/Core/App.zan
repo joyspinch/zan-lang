@@ -147,8 +147,8 @@ class App {
     int contentHeight;
     int scrollSpeed;
     int dpiScale;
-    // 构造期请求的逻辑设计尺寸。全屏宿主（Android 上 SDL 窗口
-    // 就是整个 activity 表面）不会按请求给窗口尺寸，Show() 依靠
+    // 构造期请求的逻辑设计尺寸。全屏宿主（Android 上全屏表面）
+    // 不会按请求给窗口尺寸，Show() 依靠
     // 这两个值把 dpiScale 重新拟合到「设计整页放进客户区」。
     int designW;
     int designH;
@@ -546,6 +546,9 @@ class App {
     int perfFxMs;
     int perfOverlayMs;
     int lastPresentMs;
+    FrameCadence frameCadence = new FrameCadence();
+    bool displayAnimationPending;
+    bool displayFxPending;
     // 上一*整窗*帧的提交时刻：条带帧不计。特效快照的突发跳过判据
     // 以它为准——条带帧期间快照靠条带回写保鲜（见 PresentFrame），
     // 只有整帧连发（滚动/拖拽风暴）才让快照注定白做。
@@ -711,6 +714,8 @@ class App {
     // 上一次整窗合成特效所用的时间点：损伤裁剪帧以同一
     // 相位重新合成，使重绘的条带与周围的背景动画对齐。
     int fxFrameMs;
+    // 同拍页面帧前已推进 Fx，损伤等待该页面的唯一一次呈现。
+    bool fxPagePending;
 
     // ---- 脏区裁剪（部分）帧 ------------------------------------
     // 纯悬停移动只会改变指针离开的控件和它进入的
@@ -1184,10 +1189,14 @@ class App {
         if (densitySnapshot == null) {
             densitySnapshot = theme.Snapshot();
             densityBase = theme.SnapshotMetrics();
-            if (density == 1) { theme.ScaleByDpi(dpiScale); return; }
         }
         theme.ApplyDensitySnapshot(densitySnapshot, density);
         theme.ScaleByDpi(dpiScale);
+        // 应用 CSS 已展开的主题 token 是物理值，DPI/密度变化后必须重新展开。
+        if (sheet != null) {
+            this.ApplyAppCss();
+            bgThemeGen = bgThemeGen + 1;
+        }
     }
 
     // 全局密度档：0 小（紧凑）/ 1 中（默认）/ 2 大（宽松）。整体
@@ -1543,6 +1552,7 @@ class App {
                 theme.ApplyDensityScaled(densityBase, density);
             }
             theme.ScaleByDpi(dpiScale);
+            this.ApplyAppCss();
             bgThemeGen = bgThemeGen + 1;
             backdropDirty = true;
             this.NoteRedrawWhy("SyncSkinDensity");
@@ -2417,7 +2427,9 @@ class App {
     // 在其上重新合成皮肤效果并呈现。当
     // 无有效快照时返回 false（调用方回退为完整渲染），
     // 例如在尺寸变化之后。
-    bool FxPresent() {
+    bool FxPresent() { return this.FxPresent(true); }
+
+    bool FxPresent(bool present) {
         // 纯特效拍与局部帧无关：它不渲染控件树，只是整窗恢复快照 +
         // 重合成特效 + 整窗提交，partialFrames 关闭（默认）时同样正确。
         // 此前按 ForceFullFrames 一票否决，等于在默认配置下把快速路径
@@ -2512,41 +2524,52 @@ class App {
                 fxTouchedFull = true;
             }
         }
-        // 呈现：全帧修复后画布处处等于"快照+本拍特效"，整窗上传；
-        // 部分修复时上传旧损伤区（已回到快照）+ 本拍损伤区即可。
-        if (App.PerfOn()) { perfFxPresentT0 = Window.GetTickUs(); }
+        // 损伤声明直到原生 Present 才消费。页面同拍时仍推进整窗 Fx，
+        // 但只登记新旧损伤；页面保持自己的裁剪，帧尾一次上传并集。
         if (fullRepair) {
-            window.Present(canvas);
+            window.PresentDirty(0, 0, cw, chh);
         } else {
             this.MarkPresentDirty(fxTouched);
+        }
+        if (App.PerfOn()) { perfFxPresentT0 = Window.GetTickUs(); }
+        if (present) {
             window.Present(canvas);
+        } else {
+            fxPagePending = true;
         }
         if (App.PerfOn()) {
             int perfFxEndUs = Window.GetTickUs();
             perfFxRenderUs = perfFxRenderUs
                 + (perfFxPresentT0 - perfFxRenderT0);
-            perfFxPresentUs = perfFxPresentUs
-                + (perfFxEndUs - perfFxPresentT0);
+            if (present) {
+                perfFxPresentUs = perfFxPresentUs
+                    + (perfFxEndUs - perfFxPresentT0);
+                perfFxOnlyTicks = perfFxOnlyTicks + 1;
+            }
             perfFxTickUs = perfFxTickUs + (perfFxEndUs - perfFxT0);
             perfFxTicks = perfFxTicks + 1;
-            perfFxOnlyTicks = perfFxOnlyTicks + 1;
             perfFxTickMs = perfFxTickMs
                 + (perfFxEndUs - perfFxT0) / 1000;
             this.PerfMaybeFlushLoop(Window.GetTickMs());
         }
-        lastPresentMs = Window.GetTickMs();
-        fxNextMs = lastPresentMs + this.FxIntervalMs();
+        if (present) {
+            lastPresentMs = Window.GetTickMs();
+            this.ScheduleFxFrame();
+        }
         return true;
     }
 
-    // 距下次效果帧的时间：皮肤自身的帧间隔。
-    // 只有不可见的窗口才停止计时（见 FxPresent）。
-    // 不做"输入空闲就放慢"的降速：输入空闲 ≠ 没人看，失焦或
-    // 挂机后仍可见的窗口按半速/四分之一速起步，粒子漂移肉眼
-    // 可见地一卡一卡（实机反馈）。没人看的窗口
-    // （最小化/隐藏）本就走 FxPresent 的暂停，那才是该省的 CPU。
     int FxIntervalMs() {
-        return BackdropFx.IntervalMs(this.EffectiveFx());
+        return (int)Math.Ceiling(1000.0 / frameCadence.Rate());
+    }
+
+    void ScheduleFxFrame() {
+        frameCadence.SetRate(window.RefreshRate());
+        frameCadence.Begin(Stopwatch.GetMicroseconds());
+        displayFxPending = window.RequestDisplayFrame();
+        int wait = displayFxPending
+            ? 100 : frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+        fxNextMs = Window.GetTickMs() + wait;
     }
 
     // 将下次重绘标记为损伤裁剪帧，覆盖指针
@@ -3045,11 +3068,11 @@ class App {
         // hbar 已含阴影带顶偏移（RenderCaptionButtons 传 stripH +
         // ShapeOffY），失效矩形从画布顶算起即可覆盖旧/新位置。
         if (capTipId != 0) {
-            this.RequestAnimationFrameIn(16, capTipX, 0, tipW, tipH);
+            this.RequestAnimationFrameIn(capTipX, 0, tipW, tipH);
         }
         if (id != 0) {
             int nx = this.CaptionTipX(bx, bw);
-            this.RequestAnimationFrameIn(16, nx, 0, tipW, tipH);
+            this.RequestAnimationFrameIn(nx, 0, tipW, tipH);
             capTipX = nx;
         }
         capTipId = id;
@@ -3149,6 +3172,8 @@ class App {
         Canvas old = canvas;
         canvas = new Canvas(w, h);
         old.Destroy();
+        // vw/vh 与媒体查询随实际视口变化，控件上的解析缓存也要作废。
+        bgThemeGen = bgThemeGen + 1;
         partialPending = false;
         partialFrame = false;
         dmgW = 0;
@@ -3442,6 +3467,19 @@ class App {
     }
     int ClientHeight() {
         return canvas.Height() - this.ShapeOffY() * 2;
+    }
+
+    // 离屏预览保留声明的逻辑视口；原生窗口按实际客户区换算 CSS 逻辑长度。
+    int CssViewportWidth() {
+        if (window.GetHandle() == 0) { return designW; }
+        int scale = dpiScale > 0 ? dpiScale : 100;
+        return (this.ClientWidth() * 100 + scale / 2) / scale;
+    }
+
+    int CssViewportHeight() {
+        if (window.GetHandle() == 0) { return designH; }
+        int scale = dpiScale > 0 ? dpiScale : 100;
+        return (this.ClientHeight() * 100 + scale / 2) / scale;
     }
 
     // 绘制无边框窗口的标题栏（品牌 + 拖动区域 + 最小化/最大化/关闭
@@ -3915,13 +3953,28 @@ class App {
         partialPending = false;
     }
 
-    // 为循环动画请求*限速*重绘：下一帧
-    // 安排在不迟于 `minIntervalMs` 之后，事件循环
-    // 在此之前休眠（空闲，零 CPU），而非以 60fps 忙渲染。与
-    // RequestRedraw 不同，它不强制立即出帧，因此持续
-    // 动画的控件（旋转指示器、骨架屏闪烁）以较低的
-    // 节奏重绘页面。同一帧内有多个动画时，更早的截止时间胜出。
-    // 输入仍会及时唤醒事件循环。
+    // 连续视觉动画使用显示器节奏；定时内容仍可显式指定毫秒间隔。
+    int DisplayFrameDelay() {
+        if (window.RequestDisplayFrame()) {
+            displayAnimationPending = true;
+            // 显示回调负责唤醒；超时兜底覆盖 Surface 切换期间丢失的回调。
+            return 100;
+        }
+        return frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+    }
+
+    void RequestAnimationFrame() {
+        this.RequestAnimationFrame(this.DisplayFrameDelay());
+    }
+
+    void RequestAnimationFrameIn(int x, int y, int w, int h) {
+        this.RequestAnimationFrameIn(this.DisplayFrameDelay(), x, y, w, h);
+    }
+
+    double RefreshRate() { return window.RefreshRate(); }
+
+    // 输入先于帧截止时间返回。poll 模式由外部宿主负责帧节奏。
+    // 定时刷新请求的多个截止时间取最早值。
     void RequestAnimationFrame(int minIntervalMs) {
         int due = Window.GetTickMs() + minIntervalMs;
         if (animNextMs < 0 || due < animNextMs) { animNextMs = due; }
@@ -4366,9 +4419,7 @@ class App {
     int AnimIntroIn(int key, int durMs, int x, int y, int w, int h) {
         int value = this.AnimIntroValue(key, durMs);
         if (this.AnimActive(key)) {
-            // 30ms 步进：入场动画不需要 60fps（大图表整窗软渲染
-            // 跟不满会掉帧发卡）；输入事件照常即时唤醒整帧。
-            this.RequestAnimationFrameIn(30, x, y, w, h);
+            this.RequestAnimationFrameIn(x, y, w, h);
         }
         return value;
     }
@@ -4601,19 +4652,14 @@ class App {
     // 表示这一拍已由特效层就地呈现、还该继续等下一拍。
     bool TakeDueFrame(int now) {
         bool fxOnly = animNextMs < 0 || now < animNextMs;
-        if (fxNextMs >= 0 && now >= fxNextMs && !this.inputNeedsFrame
-            && this.FxPresent()) {
-            if (fxOnly) {
-                // 纯特效拍已就地呈现；继续等待下一个 tick。输入事件
-                // 不等：点击目标所在的控件可能根本不在已呈现的范围里。
-                return false;
-            }
-            // 特效拍就地推进了（条带外的背景动画不因持续动画的条带帧
-            // 冻结），而页面帧也已到期：接着出页面帧。落到底下通用
-            // 路径，纯动画帧照旧裁剪到动画声明的范围。
-            needsRedraw = true;
+        bool fxDue = fxNextMs >= 0 && now >= fxNextMs;
+        bool pageDue = !fxOnly || needsRedraw || this.inputNeedsFrame
+            || (wakeNextMs >= 0 && now >= wakeNextMs)
+            || (wakeFrameNextMs >= 0 && now >= wakeFrameNextMs);
+        if (fxDue && !pageDue && this.FxPresent()) {
+            return false;
         }
-        if (fxOnly && animNextMs >= 0
+        if (!pageDue && fxOnly && animNextMs >= 0
             && animNextMs - now <= this.FxIntervalMs()
             && !(wakeNextMs >= 0 && now >= wakeNextMs)
             && !(wakeFrameNextMs >= 0 && now >= wakeFrameNextMs)
@@ -4637,14 +4683,12 @@ class App {
             }
             this.NoteRedrawWhy("wake");
             needsRedraw = true;
-            return true;
-        }
-        if (fxOnly && wakeNextMs >= 0 && now >= wakeNextMs) {
+        } else if (fxOnly && wakeNextMs >= 0 && now >= wakeNextMs) {
             wakeNextMs = -1;
-            return true;
+        } else {
+            this.NoteRedrawWhy("ProcessEvent");
+            needsRedraw = true;
         }
-        this.NoteRedrawWhy("ProcessEvent");
-        needsRedraw = true;
         // 纯动画唤醒：若上一帧所有动画都声明了范围，
         // 把这一帧裁剪到它们的并集。输入事件触发的帧不裁剪：
         // 点击/按键改变哪些像素只有控件渲染时读到 Ui.Clicked
@@ -4652,12 +4696,10 @@ class App {
         // 点击目标在条带外时点击既不被处理也不被重绘。
         // 滚轮是例外（见 wheelScrollInput）：它的消费与损伤都在
         // 渲染期声明，且声明者几何=上一帧认领视口，可以收窄。
-        if (!fxOnly && this.wheelScrollInput && !this.inputNeedsFrame
-            && this.TakeDueWheelRect()) {
-            this.NoteRedrawWhy("wheel-strip");
-            return true;
-        }
-        if (!fxOnly && animRectValid && !animRectAll
+        bool wheelFrame = !fxOnly && this.wheelScrollInput
+            && !this.inputNeedsFrame && this.TakeDueWheelRect();
+        if (wheelFrame) { this.NoteRedrawWhy("wheel-strip"); }
+        if (!wheelFrame && !fxOnly && animRectValid && !animRectAll
             && !this.inputNeedsFrame
             && !this.ForceFullFrames()
             && !this.HasOverlays()) {
@@ -4692,6 +4734,12 @@ class App {
             animPH = animRH;
             partialPending = true;
         }
+        // 整窗页在 PresentFrame 直接合成当前 Fx；局部页先推进条带外，
+        // 只声明损伤，页面帧尾合成条带并呈现一次。快照失效时重建整页。
+        if (fxDue && partialPending && !forceFullNext
+            && !this.inputNeedsFrame && !fxPagePending) {
+            if (!this.FxPresent(false)) { partialPending = false; }
+        }
         return true;
     }
 
@@ -4719,8 +4767,8 @@ class App {
     // 要求下一次 ProcessEvent 以轮询方式进行，绝不阻塞等待 OS 事件。
     // 供外部驱动帧循环的宿主（如 Game.Ui.GameHud：游戏主循环负责帧
     // 节奏，每帧都会来取事件）设置。否则空闲时走到阻塞 WaitEvent 的
-    // 那一路，会在没有独立消息泵的窗口上永久睡死（游戏窗口的消息
-    // 只有 SDL_PollEvent 泵送，HUD 合成循环不调它）。
+    // 那一路，会在没有独立消息泵的窗口上永久睡死（外部驱动帧循环
+    // 自主轮询事件，HUD 合成循环不调阻塞等待）。
     void SetPollEventMode() {
         pollPending = true;
     }
@@ -4749,20 +4797,16 @@ class App {
         int loopPath = 2;
         if (App.PerfOn()) { loopT0 = Window.GetTickMs(); }
         if (needsRedraw || pollPending) {
-            // 一次性：要求轮询的一方每圈重新提出，驱动结束后
-            // 循环立刻回到阻塞等待，不留下空转。
+            bool explicitPoll = pollPending;
             pollPending = false;
             loopPath = 0;
-            if (!needsRedraw) { this.PumpDueFrame(); }
-            // 重绘挂起中（状态变化或动画进行中）。
-            // 将忙轮询限制在约 60fps，避免运行中的动画让
-            // CPU 以数百帧每秒空转；睡眠帧预算的剩余部分
-            // 还能让运动更平滑、更贴合真实时钟节奏。
-            int since = Window.GetTickMs() - lastPresentMs;
-            if (lastPresentMs > 0 && since < 16) { Window.SleepMs(16 - since); }
-            if (needsRedraw) {
-                result = window.PollEvent();
-            } else {
+            result = window.PollEvent();
+            // 先取输入，队列为空才等下一显示帧。等待可由输入和 App.Post 唤醒。
+            if (result == 1 && needsRedraw && !explicitPoll) {
+                int wait = window.RequestDisplayFrame()
+                    ? 100 : frameCadence.WaitMilliseconds(Stopwatch.GetMicroseconds());
+                if (wait > 0) { result = window.WaitEventTimeout(wait); }
+            } else if (result == 1 && !needsRedraw && !explicitPoll) {
                 // 只有"要求轮询"没有"挂起重绘"（自动化驱动在等时间
                 // 或等注入批次排空）：在内核里小睡到下一个事件或最多
                 // 8ms——注入的事件会立刻唤醒等待，而循环不再以
@@ -4783,43 +4827,30 @@ class App {
         } else if (animNextMs >= 0 || wakeNextMs >= 0
                    || wakeFrameNextMs >= 0 || fxNextMs >= 0) {
             loopPath = 1;
-            // 节流的动画（spinner 在 animNextMs）和/或皮肤
-            // 特效层（fxNextMs）需要未来的帧。休眠（空闲）直到
-            // 最早截止时间，而不是以 60fps 忙碌渲染；但
-            // 要分小段轮询，以便 OS 输入仍能及时唤醒循环。
-            // 仅特效的截止时间由 FxPresent 处理（单次恢复 +
-            // 重新合成，不渲染页面）；其余情况标记重绘。
-            result = 1;
-            bool waitedForEvent = false;
-            bool waiting = true;
-            while (waiting) {
-                int now = Window.GetTickMs();
-                int deadline = animNextMs;
-                if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
-                    deadline = wakeNextMs;
-                }
-                if (deadline < 0
-                    || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
-                    deadline = wakeFrameNextMs;
-                }
-                if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
-                    deadline = fxNextMs;
-                }
-                if (deadline < 0) { waiting = false; }
-                else if (now >= deadline) {
-                    if (this.TakeDueFrame(now)) { waiting = false; }
-                } else {
-                    // 在内核中休眠直到输入或截止时间：一次
-                    // 阻塞等待，而非轮询 + 睡眠切片，因此等待
-                    // 下一个动画帧不消耗 CPU。
-                    waitedForEvent = true;
-                    result = window.WaitEventTimeout(deadline - now);
-                    if (result != 1) { waiting = false; }
-                }
+            // 先取出输入/生命周期事件，到期帧在 Surface 和输入处理后兑现。
+            int now = Window.GetTickMs();
+            int deadline = animNextMs;
+            if (deadline < 0 || (wakeNextMs >= 0 && wakeNextMs < deadline)) {
+                deadline = wakeNextMs;
             }
-            if (!waitedForEvent) { result = window.PollEvent(); }
+            if (deadline < 0
+                || (wakeFrameNextMs >= 0 && wakeFrameNextMs < deadline)) {
+                deadline = wakeFrameNextMs;
+            }
+            if (deadline < 0 || (fxNextMs >= 0 && fxNextMs < deadline)) {
+                deadline = fxNextMs;
+            }
+            if (deadline < 0 || now >= deadline) { result = window.PollEvent(); }
+            else { result = window.WaitEventTimeout(deadline - now); }
         } else {
             result = window.WaitEvent();
+        }
+        bool displayReady = window.TakeDisplayFrame();
+        bool displayAnimationDue = displayReady && displayAnimationPending;
+        bool displayFxDue = displayReady && displayFxPending;
+        if (displayReady) {
+            displayAnimationPending = false;
+            displayFxPending = false;
         }
         if (App.PerfOn()) { this.PerfLoopTick(loopT0, loopPath); }
         this.lastPollResult = result;
@@ -4833,6 +4864,10 @@ class App {
         this.PerfMark("sh.posts");
 
         int kind = this.NormalizedKind();
+        if (displayAnimationDue) { animNextMs = Window.GetTickMs(); }
+        if (displayFxDue && fxNextMs >= 0 && this.FxActive()) {
+            fxNextMs = Window.GetTickMs();
+        }
         // 按下/释放/按键触发的那一帧必须整帧重绘（见 inputNeedsFrame）。
         // 滚轮（13）记入 wheelScrollInput：滚轮的消费发生在渲染期
         // （CaptureWheel 仲裁），本帧收窄为上一帧认领视口的条带而非
@@ -5141,6 +5176,7 @@ class App {
             fxNextMs = Window.GetTickMs();
         }
 
+        if (!needsRedraw) { this.PumpDueFrame(); }
         this.PerfMark("sh.eventend");
         return true;
     }
@@ -5460,34 +5496,26 @@ class App {
                 // 只有损伤条带被重绘（因此那里是合成前的像素），
                 // 裁剪仍然生效：以上一整帧的相位重新合成
                 // 特效，只覆盖该条带，其余像素保持已合成的状态。
-                if (fxSnapValid && presentW * presentH * 2
-                    <= fc.Width() * fc.Height()) {
-                    // 条带外的画布像素自上一拍以来没被改动过（裁剪
-                    // 保证），把条带的干净基面（特效重合成之前）补进
-                    // 快照——补丁保持槽的整窗几何，FxPresent 的整窗
-                    // 恢复继续匹配，快照对整窗继续有效——持续动画
-                    // （倒计时条带帧）期间特效拍仍走"恢复快照+重合成
-                    // +整窗提交"的廉价路径，条带外的背景动画照常推进。
-                    // 快照本来就无效（上次整帧是突发帧）时补丁救不回
-                    // 条带外，保持无效，等下一次非突发整帧重建。条带
-                    // 大过半窗时补丁接近整窗复制，放弃——条带外本来
-                    // 也剩不下多少特效。
+                if (fxSnapValid) {
+                    // 只把页面条带的干净像素补进整窗快照。条带即使超过
+                    // 半窗也必须补齐，否则下一拍恢复会抹掉新页面内容。
                     fc.SnapshotPatchRect(presentX, presentY, presentW,
                                          presentH, App.FxSnapSlot());
                 }
                 BackdropFx.Render(this, fc, this.EffectiveFx(), 0, 0, fc.Width(),
                                   fc.Height(), fxFrameMs, theme, dpiScale);
                 BackdropFx.TakeDamage();
-                fxDamage = null;
-                fxTouched = null;
-                fxTouchedFull = false;
-                if (fxNextMs < 0 || fxNow >= fxNextMs) {
-                    // 这一条带帧占用了本该到期的特效拍：把拍子挪到
-                    // 此刻，循环下一圈就以廉价特效拍推进条带外的背景。
-                    // 到期之前的节奏原样保留——否则条带帧（间隔可短于
-                    // 特效周期）会把拍子无限后推，背景动画整段冻结。
-                    fxNextMs = fxNow;
+                if (!fxPagePending) {
+                    fxDamage = null;
+                    fxTouched = null;
+                    fxTouchedFull = false;
+                    if (fxNextMs < 0 || fxNow >= fxNextMs) {
+                        // 本拍没有提前推进整窗 Fx，下一圈补上条带外相位。
+                        fxNextMs = fxNow;
+                    }
                 }
+                // 同拍 Fx 已记录整窗新旧损伤和相位；条带只按同相位
+                // 补画，不丢修复清单，也不在页面呈现前重排下一拍。
             } else {
             // 突发判定只看上一*整窗*帧（条带帧不计，快照的条带区域
             // 随后回写保鲜）：整帧连发（滚动/拖拽风暴）时下一帧反正
@@ -5500,7 +5528,7 @@ class App {
                 fxDamage = null;
                 fxTouched = null;
                 fxTouchedFull = false;
-                fxNextMs = fxNow + this.FxIntervalMs();
+                this.ScheduleFxFrame();
             } else {
                 fc.SnapshotRect(0, 0, fc.Width(), fc.Height(),
                                 App.FxSnapSlot());
@@ -5518,7 +5546,7 @@ class App {
                 // 并入新损伤之前 fxDamage 已换到新列表，不会互扰）。
                 fxTouched = fxDamage;
                 fxTouchedFull = fxDamage.Count / 4 > 1024;
-                fxNextMs = Window.GetTickMs() + this.FxIntervalMs();
+                this.ScheduleFxFrame();
             } else {
                 BackdropFx.TakeDamage();
             }
@@ -5582,6 +5610,11 @@ class App {
             // 上传之后，影子与屏幕永久失步，差异比对会把旧帧内容
             // 当作已呈现，滚动停下的残带就是这样留下的。
             window.PresentFull();
+            if (fxPagePending) {
+                // BeginFrame 因输入/DPI/修复升级成整帧时，提前登记的 Fx
+                // 矩形也不能把原生上传收窄为旧表面的范围。
+                window.PresentDirty(0, 0, canvas.Width(), canvas.Height());
+            }
             lastFullFrameMs = Window.GetTickMs();
         }
         this.SettleGlassRefresh();
@@ -5589,6 +5622,12 @@ class App {
         // 最近一次整帧的命中区（见 HitTester.KeepFullSnapshot）。
         if (!partialFrame) { hitTester.KeepFullSnapshot(); }
         window.Present(canvas);
+        if (fxPagePending) {
+            fxPagePending = false;
+            if (partialFrame && this.FxActive() && window.IsVisible()) {
+                this.ScheduleFxFrame();
+            }
+        }
         // 滚轮两段式认领的第二段：渲染期有声明者（指针在其内）却
         // 无人消费——典型是指针刚跨入滚动区、上一帧无人认领
         // （ownerOrder=0），第一格被全体声明者拒绝——就把同一格
@@ -6378,6 +6417,9 @@ class App {
     }
 
     void BeginFrame() {
+        displayAnimationPending = false;
+        frameCadence.SetRate(window.RefreshRate());
+        frameCadence.Begin(Stopwatch.GetMicroseconds());
         if (window.GetHandle() == 0) { this.BeginOffscreenFrame(); return; }
         this.SyncNativeDpi();
         if (App.PerfOn()) { perfBeginMs = Window.GetTickMs(); }

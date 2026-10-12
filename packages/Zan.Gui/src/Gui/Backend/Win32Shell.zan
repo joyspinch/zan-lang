@@ -247,6 +247,8 @@ class Win32Shell {
     static extern nint MonitorFromWindow(nint hwnd, int flags);
     [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
     static extern int GetMonitorInfoW(nint monitor, nint info);
+    [DllImport("user32", EntryPoint = "EnumDisplaySettingsW")]
+    static extern int EnumDisplaySettingsW(nint device, int mode, nint devMode);
     [DllImport("user32", EntryPoint = "GetWindowLongPtrW")]
     static extern nint GetWindowLongPtrW(nint hwnd, int index);
     [DllImport("user32", EntryPoint = "SetWindowLongPtrW")]
@@ -504,6 +506,7 @@ class Win32Shell {
     static nint scratchMsg;
     static nint bitmapInfo;
     static int bgColor;
+    static int displayChangeSerial;
     // 读取 32 位字段。Win32 RECT / POINT 坐标在
     // 多显示器布局下会为负，因此该值保持有符号。
     static int S32(nint p, int off) {
@@ -518,9 +521,9 @@ class Win32Shell {
         // MsgWaitForMultipleObjects / Sleep 的超时都会拖到下一拍才醒，
         // 16ms 的动画截止实际落在 15.6~31.2ms，帧间隔 16↔31ms 交替
         // 正是"动画一卡一卡"的来源。提到 1ms（对齐 QPC 时钟的精度）。
-        // SDL 后端由 SDL 自理；macOS/Linux 的事件等待本就纳秒级精度，
-        // 均无需同等处理。GUI 进程空闲时本就阻塞等事件，不空转，
-        // 1ms 时钟中断的功耗代价可接受（Chrome/SDL 同款取舍）。
+        // macOS/Linux 的事件等待本就纳秒级精度，无需同等处理。
+        // GUI 进程空闲时本就阻塞等事件，不空转，
+        // 1ms 时钟中断的功耗代价可接受（Chrome 同款取舍）。
         Win32Shell.TimeBeginPeriod(1);
         Win32Shell.captionConfigs = new List<Win32CaptionConfig>();
         Win32Shell.fixedHwnd = new List<nint>();
@@ -760,6 +763,9 @@ class Win32Shell {
                     Win32Shell.PresentLayered(hwnd, Win32Shell.lastSurface);
                 }
             }
+        } else if (msg == 0x007E) {                // WM_DISPLAYCHANGE
+            Win32Shell.displayChangeSerial++;
+            Win32Shell.Post(hwnd, 14, 0, 0, 0, 0, 0);
         } else if (msg == 0x02E0) {                // WM_DPICHANGED
             Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
             int oldW = Win32Shell.ClientWidth(hwnd);
@@ -1505,7 +1511,7 @@ class Win32Shell {
     // 1280x720 压成 868x517，模板画满全屏的右/下边整块出界）；
     // ② 与逻辑尺寸路径共用无边框客户区契约——WM_NCCALCSIZE 把客户
     // 区扩成整个窗口矩形，不再追加系统框架补偿。
-    // 高 DPI 屏上窗口视觉尺寸变小（物理 1:1），同 SDL 时代的行为。
+    // 高 DPI 屏上窗口视觉尺寸变小（物理 1:1）。
     static nint CreateWindowPhysical(string title, int width, int height) {
         Win32Shell.Init();
         int deviceDpi = Win32Shell.WindowDpi(Win32Shell.mainHwnd);
@@ -1600,6 +1606,31 @@ class Win32Shell {
         NativeMemory.Free(margins);
         Win32Shell.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0020 | 2 | 1 | 4 | 16);
         return hwnd;
+    }
+
+    // Win32 SDK: MONITORINFOEXW=104 字节，DEVMODEW=220 字节；
+    // dmSize 为偏移 68 的 WORD，dmDisplayFrequency 为偏移 184 的 DWORD。
+    static double MonitorRefreshRate(nint monitor) {
+        if (monitor == 0) { return 60.0; }
+        nint info = NativeMemory.Alloc(104);
+        nint mode = NativeMemory.Alloc(220);
+        double hz = 60.0;
+        try {
+            NativeMemory.Fill(info, 0, 104);
+            NativeMemory.Fill(mode, 0, 220);
+            new Span<int>(info, 1)[0] = 104;
+            new Span<short>(mode + 68, 1)[0] = 220;
+            if (Win32Shell.GetMonitorInfoW(monitor, info) != 0 &&
+                Win32Shell.EnumDisplaySettingsW(info + 40, 0 - 1, mode) != 0) {
+                int rate = Win32Shell.S32(mode, 184);
+                // 0/1 表示驱动默认频率，不能当作实际显示节奏。
+                if (rate > 1 && rate <= 1000) { hz = (double)rate; }
+            }
+        } finally {
+            NativeMemory.Free(mode);
+            NativeMemory.Free(info);
+        }
+        return hz;
     }
 
     // 窗口所在显示器的（可用）工作区矩形，写入 scratchRect。
@@ -2531,7 +2562,7 @@ class Win32Shell {
         if (Win32Shell.DrainInjected()) { return 0; }
         if (Win32Shell.DrainPosted()) { return 0; }
         if (ms < 0) { ms = 0; }
-        int start = Win32Shell.GetTickCount();
+        int start = Win32Shell.TickMs();
         nint msg = Win32Shell.scratchMsg;
         while (true) {
             while (Win32Shell.PeekMessageW(msg, 0, 0, 0, 1) != 0) {
@@ -2545,7 +2576,7 @@ class Win32Shell {
                 Win32Shell.DispatchMessageW(msg);
             }
             if (Win32Shell.DrainPosted()) { return 0; }
-            int elapsed = Win32Shell.GetTickCount() - start;
+            int elapsed = Win32Shell.TickMs() - start;
             if (elapsed >= ms) { return 1; }
             // QS_ALLINPUT = 0x04FF; WAIT_TIMEOUT = 258
             int wr = Win32Shell.MsgWaitForMultipleObjects(0, 0, 0,
