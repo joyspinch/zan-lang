@@ -21,7 +21,7 @@ build/zanc tools/skinbuilder/SkinBuilder.zan --auto-stdlib -o build/skinbuilder.
 ```
 
 `--auto-stdlib` 自动拉齐 Gui/Widget/Chart 组件，`[DllImport("zan_gui")]`
-的原生驱动由 zanc 从 `stdlib/Gui/drivers/<平台>/` 自动发现并捆绑到
+的原生驱动由 zanc 从 `packages/Zan.Gui/src/Gui/drivers/<平台>/` 自动发现并捆绑到
 输出旁，无需任何手工链接步骤。
 
 ## 界面

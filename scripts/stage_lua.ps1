@@ -6,7 +6,7 @@ param(
 
 # Build the Lua runtime that System.Scripting.Lua loads at run time and stage it
 # into the module's driver directory,
-# stdlib\System\Scripting\drivers\win-x64 (and into build\, so dev builds
+# packages\Zan.Scripting\src\System\Scripting\drivers\win-x64 (and into build\, so dev builds
 # resolve it beside the executables zanc produces there).
 #
 # Lua ships source only, so the DLL is compiled here with MinGW instead of
@@ -30,7 +30,7 @@ if (!(Test-Path -LiteralPath $Compiler)) {
 
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $Dest) {
-    $Dest = Join-Path $root "stdlib\System\Scripting\drivers\win-x64"
+    $Dest = Join-Path $root "packages\Zan.Scripting\src\System\Scripting\drivers\win-x64"
 }
 $work = Join-Path $env:TEMP "zan-lua-$Version"
 $archive = Join-Path $work "lua-$Version.tar.gz"

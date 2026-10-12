@@ -111,7 +111,7 @@ one.
 - 症状：窗口创建成功且"已响应"，stdout 零输出、UiErrorLog 无异常
   （异常被 PumpSafe 吞进内存环），进程停在 `App.PumpGuarded` 内部。
 - 先做一步：用**当前** `build/zan_gui.dll` 覆盖 exe 旁的
-  `zan_gui.dll` 重跑。zanc 会把 `stdlib/Gui/drivers/<plat>/zan_gui.dll`
+  `zan_gui.dll` 重跑。zanc 会把 `packages/Zan.Gui/src/Gui/drivers/<plat>/zan_gui.dll`
   （提交版二进制）暂存到 exe 旁；src/runtime 重编后若这批提交版驱动
   没跟着刷新，新编译的 exe 配旧驱动就挂在泵里——与用户代码、与
   stdlib/包布局全都无关（实测 HEAD 布局与拆包布局同样复现，
