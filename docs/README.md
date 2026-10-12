@@ -30,6 +30,7 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 | [ZANC_CLI.md](ZANC_CLI.md) | `zanc` 全部命令行参数与已知坑——改参数解析时同提交更新 |
 | [BUILD_TOOLCHAIN.md](BUILD_TOOLCHAIN.md) | 各平台固定的构建工具链（勿自行更换） |
 | [platform-targets.md](platform-targets.md) | 交叉编译目标平台矩阵 |
+| [native-rendering-modules.md](native-rendering-modules.md) | 原生绘图、图片、游戏与音频驱动职责与接入说明 |
 | [TOOLING.md](TOOLING.md) | `zan-lsp` / `zan-dap` 协议与能力 |
 | 仓库代码地图 | `AGENTS.md` 目录表 + [agent-kb/project-map.md](agent-kb/project-map.md)（需求 → 改哪儿，带 grep 关键字） |
 
