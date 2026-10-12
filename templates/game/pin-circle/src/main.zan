@@ -1,0 +1,166 @@
+using System;
+using Gui;
+using Game.Foundation.Gui;
+
+namespace PinCircle;
+
+class PinMenuScene : HtmlScene {
+    PinWorld game;
+    PinView view;
+    int timeMs;
+
+    PinMenuScene(PinWorld game, PinView view) { this.game = game; this.view = view; }
+
+    override void OnEnter(Control root) {
+        this.timeMs = 0;
+        this.router.Host().App().SetBackdropFx(false);
+    }
+
+    void Start() {
+        this.game.StartRound(1, 0);
+        this.router.Go("play");
+    }
+
+    override void Event(int kind, int key) {
+        this.view.Sync(this.router.Host());
+        if (kind == 2 && key == 0 && this.view.MenuStartHit()) { this.Start(); }
+        if (kind == 5 && key == 32) { this.view.spaceHeld = false; }
+        if (kind == 4) {
+            if (key == 32) { this.view.spaceHeld = true; }
+            if (key == 13 || key == 32) { this.Start(); }
+            if (key == 27) { this.router.Exit(); }
+        }
+    }
+
+    override void FixedStep(int dtMs) { this.timeMs = this.timeMs + dtMs; }
+
+    override void Render(Canvas c, double alpha) {
+        this.view.Sync(this.router.Host());
+        this.view.Menu(c, this.timeMs, this.game);
+        this.view.Publish(this.game, "menu");
+    }
+}
+
+class PinPlayScene : HtmlScene {
+    PinWorld game;
+    PinView view;
+    int resultWait;
+    int pauseTime;
+
+    PinPlayScene(PinWorld game, PinView view) { this.game = game; this.view = view; }
+
+    override void OnEnter(Control root) {
+        this.resultWait = 0;
+        this.pauseTime = 0;
+        Console.WriteLine("ROUND level=" + this.game.level + " target=" + this.game.target);
+    }
+
+    override void Event(int kind, int key) {
+        this.view.Sync(this.router.Host());
+        if (kind == 5 && key == 32) { this.view.spaceHeld = false; }
+        if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            if (key == 80) { this.game.TogglePause(); }
+            if (key == 82) { this.Restart(); }
+            if (key == 32 && !this.view.spaceHeld) {
+                this.view.spaceHeld = true;
+                if (this.game.paused) { this.game.TogglePause(); } else { this.Fire(); }
+            }
+        }
+        if (kind != 2 || key != 0) { return; }
+        if (this.game.paused) {
+            if (this.view.ResultHit()) { this.game.TogglePause(); }
+            if (this.view.ResultMenuHit()) { this.router.Go("menu"); }
+            return;
+        }
+        if (this.view.HomeHit()) { this.router.Go("menu"); return; }
+        if (this.view.PauseHit()) { this.game.TogglePause(); return; }
+        if (this.view.my > this.view.Dp(96)) { this.Fire(); }
+    }
+
+    void Fire() {
+        if (this.game.Shoot()) { Console.WriteLine("SHOT level=" + this.game.level); }
+    }
+
+    void Restart() {
+        this.game.StartRound(this.game.level, 0);
+        this.resultWait = 0;
+    }
+
+    override void FixedStep(int dtMs) {
+        this.pauseTime = this.game.paused ? this.pauseTime + dtMs : 0;
+        this.game.Step(dtMs);
+        if (this.game.state != RoundState.Playing) {
+            this.resultWait = this.resultWait + dtMs;
+            if (this.resultWait >= 400) { this.router.Go("over"); }
+        }
+    }
+
+    override void Render(Canvas c, double alpha) {
+        this.view.Sync(this.router.Host());
+        if (this.game.paused) {
+            this.view.Result(c, this.game, true, this.pauseTime);
+        } else {
+            this.view.Play(c, this.game, true);
+        }
+        this.view.Publish(this.game, "play");
+    }
+}
+
+class PinOverScene : HtmlScene {
+    PinWorld game;
+    PinView view;
+    int waitMs;
+
+    PinOverScene(PinWorld game, PinView view) { this.game = game; this.view = view; }
+
+    override void OnEnter(Control root) {
+        this.waitMs = 0;
+        Console.WriteLine("RESULT level=" + this.game.level + " inserted=" + this.game.inserted
+            + " won=" + (this.game.state == RoundState.Cleared ? "1" : "0"));
+    }
+
+    void Continue() {
+        if (this.waitMs < 240) { return; }
+        int next = this.game.level + (this.game.state == RoundState.Cleared ? 1 : 0);
+        this.game.StartRound(next, 0);
+        this.router.Go("play");
+    }
+
+    override void Event(int kind, int key) {
+        this.view.Sync(this.router.Host());
+        if (kind == 2 && key == 0) {
+            if (this.view.ResultHit()) { this.Continue(); }
+            if (this.view.ResultMenuHit()) { this.router.Go("menu"); }
+        }
+        if (kind == 5 && key == 32) { this.view.spaceHeld = false; }
+        if (kind == 4) {
+            if (key == 27) { this.router.Go("menu"); }
+            if (key == 13) { this.Continue(); }
+            if (key == 32 && !this.view.spaceHeld) {
+                this.view.spaceHeld = true;
+                this.Continue();
+            }
+        }
+    }
+
+    override void FixedStep(int dtMs) { this.waitMs = this.waitMs + dtMs; }
+
+    override void Render(Canvas c, double alpha) {
+        this.view.Sync(this.router.Host());
+        this.view.Result(c, this.game, false, this.waitMs);
+        this.view.Publish(this.game, "over");
+    }
+}
+
+class PinApp {
+    static void Main() {
+        PinWorld game = new PinWorld();
+        PinView view = new PinView();
+        SceneRouter router = SceneRouter.CreateFixed("见缝插针 · 星环机关", 600, 900, 16);
+        router.Register("menu", new PinMenuScene(game, view));
+        router.Register("play", new PinPlayScene(game, view));
+        router.Register("over", new PinOverScene(game, view));
+        router.Run("menu");
+    }
+}

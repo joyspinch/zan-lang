@@ -1,0 +1,168 @@
+using System;
+
+namespace PinCircle;
+
+enum RoundState { Playing, Cleared, Failed }
+
+class Pin {
+    double angle;
+    bool preset;
+
+    Pin(double angle, bool preset) {
+        this.angle = angle;
+        this.preset = preset;
+    }
+}
+
+class PinWorld {
+    const double Tau = 6.283185307179586;
+    const double Down = 1.5707963267948966;
+    const double DiskRadius = 56;
+    const double PinRadius = 144;
+    const double HeadRadius = 9;
+    const double ShaftLength = 88;
+    const double LaunchRadius = 312;
+    const double ShotSpeed = 1600;
+    const double ShaftWidth = 3;
+
+    List<Pin> pins;
+    RoundState state;
+    int level;
+    int target;
+    int inserted;
+    int elapsedMs;
+    int pulseMs;
+    int bestLevel;
+    int clearedRounds;
+    double rotation;
+    double shotRadius;
+    bool flying;
+    bool paused;
+
+    PinWorld() {
+        this.pins = new List<Pin>();
+        this.bestLevel = 1;
+        this.StartRound(1, 0);
+    }
+
+    static double Wrap(double angle) {
+        double result = angle % PinWorld.Tau;
+        return result < 0 ? result + PinWorld.Tau : result;
+    }
+
+    void StartRound(int level, int seed) {
+        this.level = level < 1 ? 1 : level;
+        this.target = 5 + (int)Math.Min((this.level - 1) / 2, 13);
+        int preset = 2 + (int)Math.Min((this.level - 1) / 2, 4);
+        this.pins.Clear();
+        this.rotation = PinWorld.Wrap((seed % 360) * PinWorld.Tau / 360.0);
+        for (int i = 0; i < preset; i = i + 1) {
+            this.pins.Add(new Pin((i + 0.5) * PinWorld.Tau / preset - PinWorld.Down, true));
+        }
+        this.state = RoundState.Playing;
+        this.inserted = 0;
+        this.elapsedMs = 0;
+        this.pulseMs = 0;
+        this.flying = false;
+        this.paused = false;
+        this.shotRadius = PinWorld.LaunchRadius;
+        if (this.level > this.bestLevel) { this.bestLevel = this.level; }
+    }
+
+    int Remaining() { return this.target - this.inserted; }
+
+    string PatternName() {
+        if (this.level >= 7) { return "往返反转"; }
+        if (this.level >= 4) { return "节奏变速"; }
+        return "匀速旋转";
+    }
+
+    double AngularSpeed() {
+        double speed = 0.8 + Math.Min((this.level - 1) * 0.09, 1.0);
+        double direction = this.level % 2 == 0 ? -1.0 : 1.0;
+        if (this.level >= 7) {
+            return direction * speed * 1.35 * Math.Cos(this.elapsedMs / 1100.0);
+        }
+        if (this.level >= 4) {
+            speed = speed * (1.0 + 0.42 * Math.Sin(this.elapsedMs / 650.0));
+        }
+        return direction * speed;
+    }
+
+    bool Shoot() {
+        if (this.state != RoundState.Playing || this.paused || this.flying) { return false; }
+        this.shotRadius = PinWorld.LaunchRadius;
+        this.flying = true;
+        return true;
+    }
+
+    void TogglePause() {
+        if (this.state == RoundState.Playing) { this.paused = !this.paused; }
+    }
+
+    static double DistanceToSegmentSq(double px, double py,
+                                      double ax, double ay, double bx, double by) {
+        double dx = bx - ax;
+        double dy = by - ay;
+        double lengthSq = dx * dx + dy * dy;
+        double t = lengthSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lengthSq : 0;
+        t = Math.Max(0, Math.Min(1, t));
+        double rx = px - ax - t * dx;
+        double ry = py - ay - t * dy;
+        return rx * rx + ry * ry;
+    }
+
+    bool ShotCollides(double radius) {
+        double shaftContact = PinWorld.HeadRadius + PinWorld.ShaftWidth / 2;
+        double ballContact = PinWorld.HeadRadius * 2;
+        for (int i = 0; i < this.pins.Count; i = i + 1) {
+            double a = this.pins[i].angle + this.rotation;
+            double dx = Math.Cos(a);
+            double dy = Math.Sin(a);
+            double hx = dx * PinWorld.PinRadius;
+            double hy = dy * PinWorld.PinRadius;
+            double headDist = hx * hx + (hy - radius) * (hy - radius);
+            if (headDist <= ballContact * ballContact) { return true; }
+            double incomingShaft = PinWorld.DistanceToSegmentSq(hx, hy,
+                0, radius - PinWorld.ShaftLength, 0, radius);
+            double fixedShaft = PinWorld.DistanceToSegmentSq(0, radius,
+                dx * PinWorld.DiskRadius, dy * PinWorld.DiskRadius, hx, hy);
+            if (incomingShaft <= shaftContact * shaftContact
+                || fixedShaft <= shaftContact * shaftContact) { return true; }
+        }
+        return false;
+    }
+
+    void Step(int dtMs) {
+        if (this.paused || dtMs <= 0) { return; }
+        if (this.pulseMs > 0) { this.pulseMs = (int)Math.Max(0, this.pulseMs - dtMs); }
+        if (this.state != RoundState.Playing) { return; }
+        // A needle travels at most four local pixels per substep, including long caller steps.
+        int remaining = dtMs;
+        while (remaining > 0 && this.state == RoundState.Playing) {
+            int step = remaining > 2 ? 2 : remaining;
+            this.rotation = PinWorld.Wrap(this.rotation + this.AngularSpeed() * step / 1000.0);
+            this.elapsedMs = this.elapsedMs + step;
+            remaining = remaining - step;
+            if (!this.flying) { continue; }
+            double next = Math.Max(PinWorld.PinRadius,
+                this.shotRadius - PinWorld.ShotSpeed * step / 1000.0);
+            this.shotRadius = next;
+            if (this.ShotCollides(next)) {
+                this.state = RoundState.Failed;
+                this.pulseMs = 400;
+                continue;
+            }
+            if (next <= PinWorld.PinRadius) {
+                this.pins.Add(new Pin(PinWorld.Wrap(PinWorld.Down - this.rotation), false));
+                this.inserted = this.inserted + 1;
+                this.flying = false;
+                this.pulseMs = 240;
+                if (this.Remaining() == 0) {
+                    this.state = RoundState.Cleared;
+                    this.clearedRounds = this.clearedRounds + 1;
+                }
+            }
+        }
+    }
+}

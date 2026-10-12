@@ -1,0 +1,140 @@
+using System;
+using PinCircle;
+
+class PinWorldTest {
+    static void Require(bool condition, string message) {
+        if (!condition) {
+            Console.WriteLine("FAIL: " + message);
+            throw new Exception(message);
+        }
+    }
+
+    static PinWorld Copy(PinWorld source) {
+        PinWorld copy = new PinWorld();
+        copy.StartRound(source.level, 0);
+        copy.pins.Clear();
+        for (int i = 0; i < source.pins.Count; i = i + 1) {
+            copy.pins.Add(new Pin(source.pins[i].angle, source.pins[i].preset));
+        }
+        copy.rotation = source.rotation;
+        copy.elapsedMs = source.elapsedMs;
+        copy.inserted = source.inserted;
+        return copy;
+    }
+
+    static bool SafeShot(PinWorld source) {
+        PinWorld next = PinWorldTest.Copy(source);
+        next.Shoot();
+        for (int i = 0; i < 12; i = i + 1) { next.Step(16); }
+        return next.state != RoundState.Failed && next.inserted == source.inserted + 1;
+    }
+
+    static void Main() {
+        PinWorld g = new PinWorld();
+        PinWorldTest.Require(g.level == 1 && g.target == 5 && g.pins.Count == 2, "first round setup");
+        PinWorldTest.Require(g.Shoot() && !g.Shoot(), "one needle in flight");
+        g.TogglePause();
+        double radius = g.shotRadius;
+        double rotation = g.rotation;
+        int elapsed = g.elapsedMs;
+        g.Step(1000);
+        PinWorldTest.Require(g.shotRadius == radius && g.rotation == rotation && g.elapsedMs == elapsed,
+            "pause freezes both wheel and shot");
+        PinWorldTest.Require(!g.Shoot(), "paused round rejects shots");
+        g.TogglePause();
+        g.Step(192);
+        PinWorldTest.Require(g.inserted == 1 && !g.flying && g.Remaining() == 4, "first pin attaches once");
+        g.Step(16);
+        PinWorldTest.Require(g.inserted == 1, "idle frames do not attach another pin");
+
+        g.StartRound(1, 0);
+        g.pins.Clear();
+        g.pins.Add(new Pin(PinWorld.Down, true));
+        PinWorldTest.Require(g.ShotCollides(PinWorld.PinRadius), "head to head collision");
+        PinWorldTest.Require(g.ShotCollides(PinWorld.PinRadius + 70), "incoming shaft touches an existing head");
+        PinWorldTest.Require(!g.ShotCollides(PinWorld.LaunchRadius), "launch position has clearance");
+        g.pins.Clear();
+        g.pins.Add(new Pin(PinWorld.Down + PinWorld.Tau - 0.03, true));
+        PinWorldTest.Require(g.ShotCollides(PinWorld.PinRadius), "collision wraps at a full turn");
+        g.pins.Clear();
+        g.pins.Add(new Pin(PinWorld.Down + 0.2, true));
+        PinWorldTest.Require(!g.ShotCollides(PinWorld.PinRadius), "nearby visible gap is safe");
+        g.pins.Clear();
+        g.pins.Add(new Pin(PinWorld.Down, true));
+        g.Shoot();
+        g.Step(1000);
+        PinWorldTest.Require(g.state == RoundState.Failed && g.inserted == 0, "long step cannot tunnel through pins");
+        int frozenTime = g.elapsedMs;
+        PinWorldTest.Require(!g.Shoot(), "failed round rejects shots");
+        g.Step(1000);
+        PinWorldTest.Require(g.elapsedMs == frozenTime && g.pulseMs == 0, "failed wheel freezes but feedback ends");
+
+        g.StartRound(4, 0);
+        double speed = g.AngularSpeed();
+        g.Step(1000);
+        PinWorldTest.Require(Math.Abs(speed - g.AngularSpeed()) > 0.1, "speed-changing rounds");
+        g.StartRound(7, 0);
+        speed = g.AngularSpeed();
+        g.Step(4000);
+        PinWorldTest.Require(speed * g.AngularSpeed() < 0, "reverse rounds change direction");
+        g.StartRound(2, 0);
+        PinWorldTest.Require(g.AngularSpeed() < 0, "even rounds start counterclockwise");
+
+        PinWorld batch = new PinWorld();
+        PinWorld small = new PinWorld();
+        batch.StartRound(8, 87);
+        small.StartRound(8, 87);
+        batch.Shoot();
+        small.Shoot();
+        batch.Step(160);
+        for (int i = 0; i < 10; i = i + 1) { small.Step(16); }
+        PinWorldTest.Require(Math.Abs(batch.rotation - small.rotation) < 0.000001
+            && batch.shotRadius == small.shotRadius && batch.state == small.state,
+            "fixed substeps are independent of caller chunking");
+
+        int solved = 0;
+        for (int level = 1; level <= 20; level = level + 1) {
+            for (int seed = 0; seed < 4; seed = seed + 1) {
+                g.StartRound(level, seed * 83);
+                for (int tick = 0; tick < 7500 && g.state == RoundState.Playing; tick = tick + 1) {
+                    if (!g.flying && PinWorldTest.SafeShot(g)) { g.Shoot(); }
+                    g.Step(16);
+                    PinWorldTest.Require(g.inserted >= 0 && g.inserted <= g.target, "insertion bounds");
+                    for (int i = 0; i < g.pins.Count; i = i + 1) {
+                        double a = PinWorld.Wrap(g.pins[i].angle + g.rotation);
+                        PinWorldTest.Require(a >= 0 && a < PinWorld.Tau, "wrapped angular coordinates");
+                    }
+                }
+                PinWorldTest.Require(g.state == RoundState.Cleared,
+                    "round solvability: level=" + level + " seed=" + seed + " inserted=" + g.inserted
+                    + " elapsed=" + g.elapsedMs + " state=" + (int)g.state);
+                PinWorldTest.Require(g.Remaining() == 0 && !g.flying && !g.Shoot(), "cleared round is terminal");
+                int cleared = g.clearedRounds;
+                g.Step(1000);
+                PinWorldTest.Require(g.clearedRounds == cleared, "completion is counted once");
+                solved = solved + 1;
+            }
+        }
+
+        int wins = 0;
+        int losses = 0;
+        for (int level = 1; level <= 10; level = level + 1) {
+            for (int seed = 0; seed < 12; seed = seed + 1) {
+                g.StartRound(level, seed * 29);
+                int rhythm = 16 + seed * 8;
+                for (int tick = 0; tick < 5000 && g.state == RoundState.Playing; tick = tick + 1) {
+                    if (tick % rhythm == 0) { g.Shoot(); }
+                    g.Step(16);
+                }
+                PinWorldTest.Require(g.state != RoundState.Playing, "repeated-click games terminate");
+                if (g.state == RoundState.Cleared) { wins = wins + 1; } else { losses = losses + 1; }
+            }
+        }
+        PinWorldTest.Require(wins > 0 && losses > 0, "medium players exercise both outcomes");
+        g.StartRound(99, 0);
+        PinWorldTest.Require(g.target == 18 && g.pins.Count == 6 && g.flying == false,
+            "late levels stay bounded and restart resets flight");
+        Console.WriteLine("PASS pin-circle: boundaries, pause, substeps, " + solved
+            + " solved rounds, 120 rhythmic players (wins=" + wins + ", losses=" + losses + ")");
+    }
+}
