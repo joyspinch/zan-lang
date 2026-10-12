@@ -258,6 +258,15 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   (导航页 892>854 翻车后改排序键才收平)。
 - 布局按浏览器**等价子集**写(flow/inline/flex/grid/float/overflow);
   "写上去不生效"先查支持度审计与差异清单,再查优先级。
+- **HTML+CSS 开发边界与响应式铁律(AI必读)**:
+  1. **禁止在 HTML 中手写 `data-fx/data-fy/data-fw/data-fh` 绝对坐标尺寸**:
+     除设计器生成的离线静态卡片外，新建 HTML 界面必须全采用 Flex/Grid/Block 流式布局与 CSS 变量（`gap`, `padding`, `flex: 1`），严禁使用绝对坐标防呆混淆。
+  2. **Zan HTML 解析器为轻量 Control AST 转换器，非完整浏览器引擎**:
+     支持语义标签映射（`button`, `input`, `textarea`, `select`, `progress`）与 78+ 款扩展控件（`<zan-card>`, `<zan-badge>`, `<zan-tabs>`）；不支持复杂的父子 `position: relative/absolute` 深度嵌套计算或深层伪元素。
+  3. **复杂/泛型组件采用“容器占位 + Code-behind 挂载”定式**:
+     对于 `VirtualList`, `TreeView`, `Dropdown<T>`, `CodeEditor` 等需泛型或模型的重型组件，HTML 中仅放置占位容器 `<div id="PlaceHolder" style="flex:1"></div>`，在 code-behind 中通过 `Find("PlaceHolder")` 实例化后 `Add()` 填入，禁止在 HTML 标签硬试探复杂参数。
+  4. **GenHtml 通道树根必须 `DockFill`**:
+     普通 `.html`（不带 `data-zan-design`）由 GenHtml 生成，body 根节点默认无 Dock，在 code-behind 中必须补齐 `root.DockFill`，否则界面缩在左上角。
 - 项目自带 `skins/` 目录要连 base.css 一起带——同名目录整体跳过
   stdlib 基线内嵌,基线层丢了 flex 全退化成叠矩形(wuwei 百艺页签全叠)。
 - 游戏帧循环:菜单/面板可嵌(脏区门控,实测均值 3ms);每帧热路径 HUD
