@@ -1900,6 +1900,13 @@ static bool emit_target_is_x86(const zan_irgen_t *g)
            (g->target_triple[0] == 'i' && strstr(g->target_triple, "86") != NULL);
 }
 
+/* Match the Android baseline selected by zan_bind_target_layout. Architecture
+   alone does not permit AVX2; generic vector IR can split into SSE operations. */
+static bool emit_target_has_avx2(const zan_irgen_t *g)
+{
+    return emit_target_is_x86(g) && strstr(g->target_triple, "android") == NULL;
+}
+
 /* 跨平台 pmovmskb 实现：提取每个字节符号位组装为整型掩码 */
 static LLVMValueRef emit_pmovmskb_portable(zan_irgen_t *g, LLVMValueRef v,
                                            unsigned lanes)
@@ -2667,7 +2674,7 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
         if (method.len == 7 && memcmp(method.str, "Average", 7) == 0) {
             LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
             LLVMValueRef b32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[1], locals));
-            if (emit_target_is_x86(g)) {
+            if (emit_target_has_avx2(g)) {
                 LLVMTypeRef fty = LLVMFunctionType(v32i8, (LLVMTypeRef[]){ v32i8, v32i8 }, 2, 0);
                 LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pavg.b");
                 if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pavg.b", fty);
@@ -2735,7 +2742,7 @@ static bool emit_vector256_call(zan_irgen_t *g, zan_ast_node_t *expr,
 
     if (method.len == 26 && memcmp(method.str, "ExtractMostSignificantBits", 26) == 0 && argc == 1) {
         LLVMValueRef a32 = vec256_to_v32i8(g, emit_expr(g, expr->call.args.items[0], locals));
-        if (emit_target_is_x86(g)) {
+        if (emit_target_has_avx2(g)) {
             LLVMTypeRef fty = LLVMFunctionType(i32t, (LLVMTypeRef[]){ v32i8 }, 1, 0);
             LLVMValueRef fn = LLVMGetNamedFunction(g->mod, "llvm.x86.avx2.pmovmskb");
             if (!fn) fn = LLVMAddFunction(g->mod, "llvm.x86.avx2.pmovmskb", fty);

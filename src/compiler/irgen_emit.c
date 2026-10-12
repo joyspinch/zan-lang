@@ -3031,7 +3031,12 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
                                   g->ctx, "ilp32", 5)));
     } else if (strncmp(triple, "x86_64", 6) == 0) {
         tm_cpu = "x86-64";
-        tm_features = "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
+        /* Android's x86_64 ABI matches the NDK baseline: SSE4.2, POPCNT,
+           CX16, but no AVX/BMI/FMA/AES guarantee. Enabling AVX globally
+           vectorizes ordinary initialization before any CPU feature check. */
+        tm_features = strstr(triple, "android")
+            ? "+sse4.2,+crc32,+popcnt,+cx16"
+            : "+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi";
     } else if (strncmp(triple, "aarch64", 7) == 0) {
         tm_features = "+aes";
     }

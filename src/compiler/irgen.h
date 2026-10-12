@@ -9,10 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/Analysis.h>
 #include <llvm-c/DebugInfo.h>
 #include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
+#include <llvm-c/Comdat.h>
 
 typedef struct {
     LLVMValueRef slot_alloca;
@@ -639,6 +641,16 @@ void zan_irgen_shard_harvest_stats(void);
 
 static inline void zan_set_module_local(LLVMValueRef fn) {
     if (fn) LLVMSetLinkage(fn, LLVMInternalLinkage);
+}
+
+static inline void zan_set_odr_comdat(zan_irgen_t *g, LLVMValueRef val, const char *name) {
+    if (!val || !g) return;
+    LLVMSetLinkage(val, LLVMLinkOnceODRLinkage);
+    if (!g->target_is_macos && !g->target_is_wasm) {
+        LLVMComdatRef group = LLVMGetOrInsertComdat(g->mod, name);
+        LLVMSetComdatSelectionKind(group, LLVMAnyComdatSelectionKind);
+        LLVMSetComdat(val, group);
+    }
 }
 
 zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,

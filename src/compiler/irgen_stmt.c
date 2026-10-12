@@ -582,6 +582,8 @@ static void emit_eh_propagate_tail(zan_irgen_t *g) {
     } else {
         LLVMBuildCondBr(g->builder, rhas, rjmp_bb, rdie_bb);
         LLVMPositionBuilderAtEnd(g->builder, rjmp_bb);
+        /* Unwind while synchronous owner slots still point into live stack frames. */
+        if (!g->current_async_frame) emit_eh_unwind_to_handler(g, rtop);
         emit_eh_longjmp(g, emit_eh_buf_ptr(g, rtop));
         LLVMBuildUnreachable(g->builder);
         LLVMPositionBuilderAtEnd(g->builder, rdie_bb);
