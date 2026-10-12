@@ -16,7 +16,7 @@
 |---|------|------|
 | 1 | GL 后端 vtable `blit_image = NULL`：贴图精灵在 GPU 路径未实现，每贴图走 CPU 光栅 + 帧缓冲上传；一帧混图片/模糊/影子即整体 CPU-GPU 同步 | `src/runtime/gui_gl_backend.c:1663`、`:527` |
 | 2 | 批处理只覆盖几何与文本：rect/circle/radial 顶点批按 mode 聚合、文本有字形图集。传奇/RTS/卡牌的画面主体（成百上千图集精灵、图块）是全栈最弱原语 | `gui_gl_backend.c:857+` |
-| 3 | CanvasPrims 每帧程序化重画光晕（FillRadial 逐像素径向衰减）；SDL 时代 bake 纹理一次每帧贴图，canvas 化丢了烘焙层 | `packages/Zan.Game/src/Game/Kit/CanvasPrims.zan` |
+| 3 | CanvasPrims 每帧程序化重画光晕（FillRadial 逐像素径向衰减）；缺少纹理烘焙层，canvas 化丢失了烘焙优化 | `packages/Zan.Game/src/Game/Kit/CanvasPrims.zan` |
 | 4 | Kit.SpriteBatch 是假批：计数器封装，逐图元 FFI 调 CDraw | `SpriteBatch.zan:10-60` |
 | 5 | Gui 动画能力 = `Control.Transition(ms)` 样式过渡旋钮；无时间线/缓动驱动/帧动画；游戏包的 Tween（20+ 缓动曲线）过不去工具侧 | `packages/Zan.Gui/src/Gui/Core/Control.zan:324`、`Foundation/Tween.zan` |
 | 6 | Gui 失效模型：脏区存在但一帧混请求即回退整窗重绘 | `packages/Zan.Gui/src/Gui/Core/App.zan:686`、`:2763` |
@@ -45,7 +45,7 @@ Gui.Widget 上如鱼得水，因为工具界面用的矩形/文本恰是这套�
 ### 1.2 烘焙与资产（R1）
 
 - **bake-to-atlas**：程序化效果（径向光晕、软影、图块纹理、渐变）一次绘制进
-  图集条目，此后每帧只是贴一次批——恢复 SDL 时代的 bake 思想，落到 canvas 轨。
+  图集条目，此后每帧只是贴一次批——确立纹理烘焙思想，落到 canvas 轨。
 - **图集打包**：`Kit/Packed.zan` 已有雏形，补齐源图集 → 运行时图集条目的映射。
 - **帧表动画**：`Arcade2D/Animation` 已有帧表模型，接到 1.1 的批上
   （uv 随帧号切换，零额外绘制成本）。
