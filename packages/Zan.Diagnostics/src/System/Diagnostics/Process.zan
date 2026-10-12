@@ -107,6 +107,8 @@ class Process {
     static extern int WinGetExitCodeProcess(nint handle, string codeBuf);
     [DllImport("kernel32", EntryPoint = "CloseHandle")]
     static extern int WinCloseHandle(nint handle);
+    [DllImport("kernel32", EntryPoint = "TerminateProcess")]
+    static extern int WinTerminateProcess(nint handle, int exitCode);
     [DllImport("kernel32", EntryPoint = "GetTickCount")]
     static extern int WinGetTickCount();
     [DllImport("kernel32", EntryPoint = "GetCurrentProcessId")]
@@ -568,6 +570,11 @@ class Process {
 
     // 直接执行指定的程序及参数数组，不经过 shell，安全无命令注入风险。
     static int RunSafe(string exe, List<string> args) {
+        return Process.RunSafe(exe, args, 0 - 1);
+    }
+
+    // 支持超时限制的 RunSafe（timeoutMs <= 0 表示无限等待；超时主动终止子进程防止宿主挂死）。
+    static int RunSafe(string exe, List<string> args, int timeoutMs) {
         #if WINDOWS
         string cmdline = BuildCommandLine(exe, args);
         byte[] si = new byte[128];
@@ -581,7 +588,12 @@ class Process {
         nint hProc = WinHandleAt(pi, 0);
         nint hThread = WinHandleAt(pi, 8);
         try {
-            WinWaitForSingleObject(hProc, 0 - 1);
+            int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
+            int waitRes = WinWaitForSingleObject(hProc, waitMs);
+            if (waitRes == 258) { // WAIT_TIMEOUT = 258 (0x102)
+                WinTerminateProcess(hProc, 1);
+                return 0 - 1;
+            }
             byte[] cb = new byte[8];
             WinGetExitCodeProcess(hProc, cb);
             int code = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
@@ -666,6 +678,11 @@ class Process {
 
     // 通过直接进程管道启动程序并捕获 stdout/stderr 输出（不经过 shell，绝对安全）。
     static ProcessResult CaptureSafe(string exe, List<string> args) {
+        return Process.CaptureSafe(exe, args, 0 - 1);
+    }
+
+    // 支持超时限制的 CaptureSafe（timeoutMs <= 0 表示无限等待；超时主动终止子进程防止宿主挂死）。
+    static ProcessResult CaptureSafe(string exe, List<string> args, int timeoutMs) {
         ProcessResult r = new ProcessResult();
         r.lines = new List<string>();
         #if WINDOWS
@@ -721,7 +738,14 @@ class Process {
                 WinCloseHandle(hReadPipe);
             }
 
-            WinWaitForSingleObject(hProc, 0 - 1);
+            int waitMs = timeoutMs > 0 ? timeoutMs : (0 - 1);
+            int waitRes = WinWaitForSingleObject(hProc, waitMs);
+            if (waitRes == 258) { // WAIT_TIMEOUT
+                WinTerminateProcess(hProc, 1);
+                r.exitCode = 0 - 1;
+                r.lines = SplitLines(sb.ToString());
+                return r;
+            }
             byte[] cb = new byte[8];
             WinGetExitCodeProcess(hProc, cb);
             r.exitCode = cb[0] + cb[1] * 256 + cb[2] * 65536 + cb[3] * 16777216;
