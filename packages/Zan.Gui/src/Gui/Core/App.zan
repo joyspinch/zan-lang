@@ -1655,20 +1655,16 @@ class App {
         } else {
             shapeMode = 1;
             shapeRadius = 0;
-            // 暴露第一个区域的圆角半径，供 WindowShapeRadius() 使用。
-            int c1 = spec.IndexOf(",");
-            if (c1 > 0) {
-                int c2 = spec.IndexOf(",", c1 + 1);
-                if (c2 > 0) {
-                    int c3 = spec.IndexOf(",", c2 + 1);
-                    if (c3 > 0) {
-                        int c4 = spec.IndexOf(",", c3 + 1);
-                        if (c4 > 0) {
-                            int c5 = spec.IndexOf(",", c4 + 1);
-                            if (c5 > 0) {
-                                shapeRadius = Convert.ToInt32(spec.Substring(c4 + 1, c5 - c4 - 1));
-                            }
-                        }
+            // 暴露首个非阴影带（kind!=3）有效内容区域的圆角半径，供 WindowShapeRadius() 使用。
+            // 若包含类型 3 阴影带（例如最大化恢复带阴影规格），同步恢复原点偏移。
+            if (shapeRegions != null) {
+                for (int i = 0; i < shapeRegions.Count; i = i + 1) {
+                    WindowShapeRegion r = shapeRegions[i];
+                    if (r.kind == 3) {
+                        shapeOffX = r.radius;
+                        shapeOffY = r.radius;
+                    } else if (shapeRadius == 0) {
+                        shapeRadius = r.radius;
                     }
                 }
             }
@@ -1750,6 +1746,9 @@ class App {
                 shapeOffY = px;
                 window.SetShape(shapeSpec);
             }
+        } else if (px > 0 && this.HasShadowBand()) {
+            shapeOffX = px;
+            shapeOffY = px;
         }
         this.NoteRedrawWhy("SetWindowShadow");
         needsRedraw = true;
@@ -1803,6 +1802,9 @@ class App {
     // Win11 DWM 统一圆角窗口（SetWindowRoundCorners(true)）返回 8px 缩放值；
     // 方角窗口返回 0。
     int EffectiveCornerRadius() {
+        if (window != null && window.IsMaximized()) {
+            return 0;
+        }
         if (shapeMode != 0 && shapeRadius > 0) {
             return this.Scale(shapeRadius);
         }
@@ -3278,8 +3280,38 @@ class App {
         int curW = window.ClientWidth();
         int curH = window.ClientHeight();
         if (curW <= 0 || curH <= 0) { return; }
+
+        // 窗口最大化与还原状态下的异形/圆角生命周期自动同步：
+        // 无论通过标题栏按钮、双击标题栏、Win+Up/Down 或 Snap 布局触发最大化/还原，
+        // 均以真实窗口状态 window.IsMaximized() 为准：
+        // 1. 进入最大化状态：临时暂存并清除异形规格，确保铺满屏幕直角显示；
+        // 2. 退出最大化状态：若之前存有异形/阴影规格，自动完整复原异形遮罩与阴影；
+        // 3. 亦同步触发 DWM 圆角策略的重新应用。
+        if (window.IsMaximized()) {
+            if (shapeMode != 0) {
+                maxSavedShapeSpec = shapeSpec;
+                maxSavedShapeShadow = shapeShadow;
+                shapeShadow = 0;
+                this.SetWindowShape("");
+            }
+        } else {
+            if (maxSavedShapeSpec != "") {
+                string restoreSpec = maxSavedShapeSpec;
+                int restoreShadow = maxSavedShapeShadow;
+                maxSavedShapeSpec = "";
+                maxSavedShapeShadow = 0;
+                this.SetWindowShape(restoreSpec);
+                if (restoreShadow > 0) {
+                    this.SetWindowShadow(restoreShadow);
+                }
+            } else if (shapeMode == 0) {
+                this.ApplyRoundCorners();
+            }
+        }
+
         if (curW == canvas.Width() && curH == canvas.Height()) { return; }
         this.SwapCanvas(curW, curH);
+
         // 将滚动限制到新视口，而非跳到顶部——调整大小
         // 不应跳变用户的滚动位置。
         int viewH = curH - titlebarH;
@@ -3857,28 +3889,6 @@ class App {
             } else if (showMinimizeButton && hit == minId) {
                 window.Minimize();
             } else if (showMaximizeButton && hit == maxId) {
-                // 异形/圆角窗口最大化与还原逻辑：
-                // 最大化时尺寸铺满整个屏幕，异形遮罩与阴影必须暂时收起并以纯矩形平铺；
-                // 还原（Restore）时必须完整恢复原本的异形、圆角与阴影规格。
-                if (!window.IsMaximized()) {
-                    if (shapeMode != 0) {
-                        maxSavedShapeSpec = shapeSpec;
-                        maxSavedShapeShadow = shapeShadow;
-                        shapeShadow = 0;
-                        this.SetWindowShape("");
-                    }
-                } else {
-                    if (maxSavedShapeSpec != "") {
-                        string restoreSpec = maxSavedShapeSpec;
-                        int restoreShadow = maxSavedShapeShadow;
-                        maxSavedShapeSpec = "";
-                        maxSavedShapeShadow = 0;
-                        this.SetWindowShape(restoreSpec);
-                        if (restoreShadow > 0) {
-                            this.SetWindowShadow(restoreShadow);
-                        }
-                    }
-                }
                 window.ToggleMaximize();
             } else if (showCloseButton && hit == closeId) {
                 window.Close();
