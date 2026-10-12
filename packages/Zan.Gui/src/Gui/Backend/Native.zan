@@ -8,11 +8,25 @@ namespace Gui.Backend;
 // Window.SetSizePaint）。
 delegate void SizePaintBody();
 
+#if ANDROID
+delegate double WindowRefreshRateFn(nint hwnd);
+delegate int WindowDisplayFrameFn(nint hwnd);
+#endif
+
 // 跨平台抽象的窗口与事件管理。
 // 委托给处理 Win32/X11/Cocoa 的 zan_gui 运行时。
 class Window {
     static bool frozenTick;
     static int frozenTickMs;
+    #if ANDROID
+    static bool refreshQueryResolved;
+    static nint refreshQuery;
+    static bool optionalGuiDriverResolved;
+    static nint optionalGuiDriver;
+    static bool displayFrameResolved;
+    static nint displayFrameRequest;
+    static nint displayFrameTake;
+    #endif
 
     // 这些导入确保链接器包含 gui_runtime 所需的系统库
     [DllImport("user32")]
@@ -192,60 +206,14 @@ class Window {
     static extern int zan_gui_add_hit_guard(nint hwnd, int x, int y, int w, int h);
     #endif
 
-    #if !WINDOWS
-    [DllImport("zan_gui")]
-    static extern int zan_gui_adopt_sdl_window(nint hwnd);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_scene_set_renderer(nint hwnd, nint renderer);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_scene_upload(nint hwnd, string bgra, int w, int h);
-    [DllImport("zan_gui")]
-    static extern int zan_gui_scene_present(nint hwnd, int surfaceId);
-    #endif
-
-    // 把游戏宿主自建的 SDL 窗口交给 GUI 运行时，此后 `App` 可在它
-    // 之上驱动控件（HUD 层）。返回 0 表示成功（或该窗口已被接管）。
-    // 仅 SDL 后端有效；Win32 外壳构建返回非 0。
-    #if !WINDOWS
-    public static int AdoptSdlWindow(nint sdlWindowHandle) {
-        return zan_gui_adopt_sdl_window(sdlWindowHandle);
-    }
-    #else
-    public static int AdoptSdlWindow(nint sdlWindowHandle) { return 1; }
-    #endif
-
-    // 把宿主的 SDL 渲染器交给 GUI 运行时（同一窗口第二个渲染器在
-    // D3D11 等后端会创建失败，故复用宿主的）。在 AdoptSdlWindow 之后、
-    // 首次 ScenePresent 之前调用一次。
-    #if !WINDOWS
-    public static int SceneSetRenderer(nint sdlWindowHandle, nint sdlRendererHandle) {
-        return zan_gui_scene_set_renderer(sdlWindowHandle, sdlRendererHandle);
-    }
-    #else
-    public static int SceneSetRenderer(nint sdlWindowHandle, nint sdlRendererHandle) { return 1; }
-    #endif
-
-    // 上传一帧 RGBA 场景图像（w×h，每像素 4 字节，行优先，保留
-    // alpha）——SdlRenderer.ReadPixels 的输出可直接传入；
-    // ScenePresent 时合成在 HUD 表面之下。
-    #if !WINDOWS
-    public static int SceneUpload(nint sdlWindowHandle, string rgba, int w, int h) {
-        return zan_gui_scene_upload(sdlWindowHandle, rgba, w, h);
-    }
-    #else
-    public static int SceneUpload(nint sdlWindowHandle, string rgba, int w, int h) { return 1; }
-    #endif
-
-    // 把场景纹理（下）与 HUD 表面（上）合成呈现到已接管的窗口。
-    #if !WINDOWS
-    public static int ScenePresent(nint sdlWindowHandle, int surfaceId) {
-        return zan_gui_scene_present(sdlWindowHandle, surfaceId);
-    }
-    #else
-    public static int ScenePresent(nint sdlWindowHandle, int surfaceId) { return 1; }
-    #endif
 
     nint handle;
+    #if WINDOWS
+    nint refreshMonitor;
+    int refreshDisplaySerial;
+    long refreshCheckedUs;
+    double refreshHz;
+    #endif
     int width;
     int height;
     int localKind;
@@ -419,6 +387,88 @@ class Window {
         #else
         zan_gui_center_window(handle);
         #endif
+    }
+
+    #if ANDROID
+    // 静态 APK 的驱动导出在 libmain.so 中；共享驱动只加载一次并保活。
+    static nint OptionalGuiEntry(string symbol) {
+        nint entry = Interop.PosixSymbol(0, symbol);
+        if (entry != 0) { return entry; }
+        if (!Window.optionalGuiDriverResolved) {
+            Window.optionalGuiDriverResolved = true;
+            Window.optionalGuiDriver = Interop.Load("libzan_gui.so");
+        }
+        return Interop.Symbol(Window.optionalGuiDriver, symbol);
+    }
+
+    static void ResolveDisplayFrame() {
+        if (Window.displayFrameResolved) { return; }
+        Window.displayFrameResolved = true;
+        Window.displayFrameRequest = Window.OptionalGuiEntry("zan_gui_request_display_frame");
+        Window.displayFrameTake = Window.OptionalGuiEntry("zan_gui_take_display_frame");
+    }
+    #endif
+
+    // 所在显示器当前模式的刷新率（Hz），查询不可用时返回 60。
+    // 这是动画节奏提示，不保证与垂直同步相位对齐；周期应保留小数。
+    double RefreshRate() {
+        if (handle == 0) { return 60.0; }
+        #if WINDOWS
+        nint monitor = Win32Shell.MonitorFromWindow(handle, 2);
+        long nowUs = Stopwatch.GetMicroseconds();
+        int serial = Win32Shell.displayChangeSerial;
+        if (refreshHz > 0 && monitor == refreshMonitor &&
+            serial == refreshDisplaySerial && nowUs - refreshCheckedUs < 1000000) {
+            return refreshHz;
+        }
+        refreshHz = Win32Shell.MonitorRefreshRate(monitor);
+        refreshMonitor = monitor;
+        refreshDisplaySerial = serial;
+        refreshCheckedUs = nowUs;
+        return refreshHz;
+        #else
+        #if ANDROID
+        if (!Window.refreshQueryResolved) {
+            Window.refreshQueryResolved = true;
+            Window.refreshQuery = Window.OptionalGuiEntry("zan_gui_refresh_rate");
+        }
+        if (Window.refreshQuery != 0) {
+            WindowRefreshRateFn query = (WindowRefreshRateFn)Window.refreshQuery;
+            double hz = query(handle);
+            if (hz > 1.0 && hz <= 1000.0) { return hz; }
+        }
+        #endif
+        // X11 驱动没有 XRandR 依赖，其余后端尚无显示模式查询。
+        return 60.0;
+        #endif
+    }
+
+    // 仅 UI/Looper 线程：按需请求下一显示帧，重复请求合并。
+    // true 表示已排期或已有未消费信号；false 时使用计时器回退。
+    // 不会持续订阅显示帧，必须在消费并决定继续动画后再次请求。
+    bool RequestDisplayFrame() {
+        if (handle == 0) { return false; }
+        #if ANDROID
+        Window.ResolveDisplayFrame();
+        if (Window.displayFrameRequest != 0 && Window.displayFrameTake != 0) {
+            WindowDisplayFrameFn request = (WindowDisplayFrameFn)Window.displayFrameRequest;
+            return request(handle) != 0;
+        }
+        #endif
+        return false;
+    }
+
+    // 仅 UI/Looper 线程：一次性消费显示帧信号，不修改输入事件记录。
+    bool TakeDisplayFrame() {
+        if (handle == 0) { return false; }
+        #if ANDROID
+        Window.ResolveDisplayFrame();
+        if (Window.displayFrameRequest != 0 && Window.displayFrameTake != 0) {
+            WindowDisplayFrameFn take = (WindowDisplayFrameFn)Window.displayFrameTake;
+            return take(handle) != 0;
+        }
+        #endif
+        return false;
     }
 
     // 阻塞直到下一个 OS 事件到达。成功返回 0，退出返回 -1。

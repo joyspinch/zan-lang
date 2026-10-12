@@ -240,13 +240,6 @@ EXPORT i32 zan_gui_set_opacity(i64 h, i32 percent) { (void)h; (void)percent; ret
 
 EXPORT const char *zan_gui_android_files_dir(void) { return "."; }
 
-EXPORT i32 zan_gui_adopt_sdl_window(i64 hwnd_val)              { (void)hwnd_val; return 1; }
-EXPORT i32 zan_gui_scene_set_renderer(i64 hwnd_val, i64 rend) { (void)hwnd_val; (void)rend; return 1; }
-EXPORT i32 zan_gui_scene_upload(i64 hwnd_val, const void *bgra, i32 w, i32 h) {
-    (void)hwnd_val; (void)bgra; (void)w; (void)h; return 1;
-}
-EXPORT i32 zan_gui_scene_present(i64 hwnd_val, i32 surface_id) { (void)hwnd_val; (void)surface_id; return 1; }
-
 EXPORT i32 zan_gui_webview_create(i64 hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }

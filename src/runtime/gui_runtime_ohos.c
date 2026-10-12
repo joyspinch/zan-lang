@@ -973,13 +973,4 @@ EXPORT i32 zan_gui_write_file(const char *path, const char *utf8) {
     return w == n ? 0 : 1;
 }
 
-EXPORT i32 zan_gui_adopt_sdl_window(iptr hwnd_val)                  { (void)hwnd_val; return 1; }
-EXPORT i32 zan_gui_scene_set_renderer(iptr hwnd_val, iptr rend)     { (void)hwnd_val; (void)rend; return 1; }
-EXPORT i32 zan_gui_scene_upload(iptr hwnd_val, const void *bgra, i32 w, i32 h) {
-    (void)hwnd_val; (void)bgra; (void)w; (void)h; return 1;
-}
-EXPORT i32 zan_gui_scene_present(iptr hwnd_val, i32 surface_id) {
-    (void)hwnd_val; (void)surface_id; return 1;
-}
-
 #endif /* ZAN_GUI_OHOS */
