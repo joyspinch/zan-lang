@@ -32,12 +32,15 @@ typedef enum {
 #define ZGL_K_TEXTRGBA 9
 #define ZGL_K_SURFACE 8
 #define ZGL_K_BITMAP  10
+#define ZGL_K_SHADOW  11
 
 #define ZGL_TILE 64
 
 typedef struct {
     zgl_uint tex, fbo;
     zgl_uint cov_tex, cov_fbo;
+    zgl_uint snap_tex, snap_fbo;
+    int snap_w, snap_h;
     int w, h;
     int gpu_ahead;
     int cpu_ahead;
@@ -227,6 +230,18 @@ ZGL_FS_COMMON
 "    if (kind == 10) {\n"
 "        col = texture(uAtlas2, v_uv) * v_col0;\n"
 "        cov = 1.0;\n"
+"    }\n"
+"    if (kind == 11) {\n"
+"        float blur = v_shape.w;\n"
+"        float d = sd_round(lp, v_shape.xy, v_shape.z, 15);\n"
+"        if (blur <= 0.0) {\n"
+"            cov = clamp(0.5 - d, 0.0, 1.0);\n"
+"        } else {\n"
+"            float t = (d + blur * 0.5) / blur;\n"
+"            if (t <= 0.0) cov = 1.0;\n"
+"            else if (t >= 1.0) discard;\n"
+"            else cov = 1.0 - t * t * (3.0 - 2.0 * t);\n"
+"        }\n"
 "    }\n"
 "    if (cov <= 0.0) discard;\n"
 "    o_color = (kind == 4 && v_kind.y > 0.5) ? vec4(cov)\n"
@@ -824,6 +839,37 @@ static void gl_fill_grad(zan_surface_t *s, int x, int y, int w, int h,
     zgl_rect_quad(s, x, y, w, h, radius, corners, 0, dir, from, to, via, 0);
 }
 
+static void gl_shadow_round(zan_surface_t *s, int x, int y, int w, int h,
+                            int radius, int blur, u32 c) {
+    if (w <= 0 || h <= 0 || (c >> 24) == 0) return;
+    if (blur <= 0) {
+        gl_fill_round(s, x, y, w, h, radius, ZAN_CORNERS_ALL, c);
+        return;
+    }
+    if (!zgl_begin(s, ZGL_MODE_BLEND)) {
+        cpu_shadow_round(s, x, y, w, h, radius, blur, c);
+        return;
+    }
+    int r = radius < 0 ? 0 : radius;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+
+    zgl_quad q;
+    memset(&q, 0, sizeof(q));
+    q.kind = ZGL_K_SHADOW;
+    q.cx = (float)x + (float)w * 0.5f;
+    q.cy = (float)y + (float)h * 0.5f;
+    q.hw = (float)w * 0.5f;
+    q.hh = (float)h * 0.5f;
+    q.radius = (float)r;
+    q.stroke = (float)blur;
+    q.p0 = 15.0f;
+    zgl_color(q.col0, c, 0);
+
+    float pad = (float)blur;
+    zgl_push(s, &q, (float)x - pad, (float)y - pad, (float)(x + w) + pad, (float)(y + h) + pad);
+}
+
 static void gl_circle(zan_surface_t *s, int cx, int cy, int radius, u32 c,
                       int stroke) {
     zgl_quad q;
@@ -1192,6 +1238,70 @@ static void gl_glyph_run(zan_surface_t *s, const zan_glyph_run *run) {
 }
 
 
+static void gl_snapshot(zan_surface_t *s, int x, int y, int w, int h, int slot) {
+    (void)x; (void)y; (void)w; (void)h; (void)slot;
+    if (!s || g_gl_state <= 0) return;
+    zgl_target *t = zgl_target_of(s);
+    if (!t) return;
+    if (g_zgl.target == s || g_zgl.count) zgl_flush();
+    if (!zan_gl_ctx_make_current()) return;
+
+    if (t->snap_w != t->w || t->snap_h != t->h || !t->snap_tex || !t->snap_fbo) {
+        if (t->snap_fbo) gl.DeleteFramebuffers(1, &t->snap_fbo);
+        if (t->snap_tex) gl.DeleteTextures(1, &t->snap_tex);
+        t->snap_tex = t->snap_fbo = 0;
+        t->snap_w = t->snap_h = 0;
+
+        gl.GenTextures(1, &t->snap_tex);
+        gl.BindTexture(ZGL_TEXTURE_2D, t->snap_tex);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MIN_FILTER, ZGL_NEAREST);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_MAG_FILTER, ZGL_NEAREST);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, t->w, t->h, 0,
+                      ZGL_BGRA, ZGL_UNSIGNED_BYTE, NULL);
+        gl.GenFramebuffers(1, &t->snap_fbo);
+        gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->snap_fbo);
+        gl.FramebufferTexture2D(ZGL_FRAMEBUFFER, ZGL_COLOR_ATTACHMENT0,
+                                ZGL_TEXTURE_2D, t->snap_tex, 0);
+        if (gl.CheckFramebufferStatus(ZGL_FRAMEBUFFER) == ZGL_FRAMEBUFFER_COMPLETE) {
+            t->snap_w = t->w;
+            t->snap_h = t->h;
+        } else {
+            gl.DeleteFramebuffers(1, &t->snap_fbo);
+            gl.DeleteTextures(1, &t->snap_tex);
+            t->snap_tex = t->snap_fbo = 0;
+            t->snap_w = t->snap_h = 0;
+            gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+            return;
+        }
+    }
+
+    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->fbo);
+    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, t->snap_fbo);
+    gl.BlitFramebuffer(0, 0, t->w, t->h, 0, 0, t->w, t->h,
+                       ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+}
+
+static int gl_restore(zan_surface_t *s, int x, int y, int w, int h, int slot, int sub_rect) {
+    (void)x; (void)y; (void)w; (void)h; (void)slot; (void)sub_rect;
+    if (!s || g_gl_state <= 0) return 0;
+    zgl_target *t = zgl_target_of(s);
+    if (!t || !t->snap_fbo || !t->snap_tex) return 0;
+    if (g_zgl.target == s || g_zgl.count) zgl_flush();
+    if (!zan_gl_ctx_make_current()) return 0;
+
+    gl.BindFramebuffer(ZGL_READ_FRAMEBUFFER, t->snap_fbo);
+    gl.BindFramebuffer(ZGL_DRAW_FRAMEBUFFER, t->fbo);
+    gl.BlitFramebuffer(0, 0, t->w, t->h, 0, 0, t->w, t->h,
+                       ZGL_COLOR_BUFFER_BIT, ZGL_NEAREST);
+    gl.BindFramebuffer(ZGL_FRAMEBUFFER, t->fbo);
+    t->gpu_ahead = 1;
+    t->cpu_ahead = 0;
+    return 1;
+}
+
 static void gl_set_clip(zan_surface_t *s, int x0, int y0, int x1, int y1) {
     (void)x0; (void)y0; (void)x1; (void)y1;
     if (g_zgl.target == s) zgl_flush();
@@ -1245,6 +1355,8 @@ static void gl_drop_surface(zan_surface_t *s) {
         gl.DeleteTextures(1, &t->tex);
         if (t->cov_fbo) gl.DeleteFramebuffers(1, &t->cov_fbo);
         if (t->cov_tex) gl.DeleteTextures(1, &t->cov_tex);
+        if (t->snap_fbo) gl.DeleteFramebuffers(1, &t->snap_fbo);
+        if (t->snap_tex) gl.DeleteTextures(1, &t->snap_tex);
     }
     if (g_zgl.target == s) g_zgl.target = NULL;
     free(t->shadow);
@@ -1384,7 +1496,7 @@ static const zan_gui_backend zan_gl_backend = {
     .surface_round = gl_surface_round,
     .fill_vgrad   = gl_fill_vgrad,
     .fill_grad    = gl_fill_grad,
-    .shadow_round = NULL,
+    .shadow_round = gl_shadow_round,
     .fill_circle  = gl_fill_circle,
     .draw_circle  = gl_draw_circle,
     .fill_radial  = gl_fill_radial,
@@ -1393,8 +1505,8 @@ static const zan_gui_backend zan_gl_backend = {
     .polyline     = gl_polyline,
     .polybatch    = gl_polybatch,
     .blur         = NULL,
-    .snapshot     = NULL,
-    .restore      = NULL,
+    .snapshot     = gl_snapshot,
+    .restore      = gl_restore,
     .draw_text    = NULL,
     .glyph_run    = gl_glyph_run,
     .blit_pixels  = zgl_blit_pixels,
