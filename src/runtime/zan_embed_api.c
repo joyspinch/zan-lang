@@ -4,6 +4,7 @@
 #include "rt_timer.h"
 
 #include "../common/host_oom.h"
+#include "../common/zan_abi.h"
 
 typedef struct {
     const char*          name;
@@ -57,9 +58,18 @@ const char* zan_embed_list(const char* prefix) {
         need += strlen(nm) + 1;
     }
     if (need > cap) {
-        char* nb = (char*)realloc(buf, need);
-        if (!nb) return "";
-        buf = nb; cap = need;
+        static const struct {
+            uint64_t rc, magic;
+            char data[1];
+        } empty = { ZAN_STRING_SENTINEL_RC, ZAN_STR_HDR_WORD(0), { 0 } };
+        char* nb = (char*)realloc(buf ? buf - ZAN_OBJ_HDR_SIZE : 0,
+                                 need + ZAN_OBJ_HDR_SIZE);
+        if (!nb) return empty.data;
+        /* ARC and string length may inspect the words before the data. */
+        uint64_t* hdr = (uint64_t*)nb;
+        hdr[0] = ZAN_STRING_SENTINEL_RC;
+        hdr[1] = ZAN_STRING_MAGIC;
+        buf = nb + ZAN_OBJ_HDR_SIZE; cap = need;
     }
     {
         size_t o = 0;
