@@ -84,3 +84,14 @@ if ((Test-Path $genKnowledgeSrc) -and (Test-Path $GallerySrc) -and (Test-Path $S
 } else {
   Write-Output "KNOWLEDGE_WARN: GenKnowledge inputs missing; gallery tool will be empty"
 }
+
+# ---- package & example catalogs for AI-assisted development ---------------
+$genCatalogsScript = Join-Path $root 'scripts\gen_catalogs.ps1'
+if (Test-Path $genCatalogsScript) {
+  try {
+    & $genCatalogsScript -OutDir $OutDir
+  } catch {
+    Write-Output "KNOWLEDGE_WARN: gen_catalogs failed: $_"
+  }
+}
+

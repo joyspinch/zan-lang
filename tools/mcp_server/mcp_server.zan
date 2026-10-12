@@ -1227,6 +1227,13 @@ class McpServer {
             if (!McpServer.ZanToolsAvailable()) { return McpServer.NoZancMsg(); }
             return await McpServer.BuildProject(args.Str("entry", ""));
         }
+        if (name == "pkg_list_installed") { return McpServer.PkgListInstalled(); }
+        if (name == "pkg_search") { return McpServer.PkgSearch(args.Str("query", "")); }
+        if (name == "pkg_install") {
+            if (!McpServer.Mutable()) { return McpServer.ReadOnlyMsg(); }
+            return McpServer.PkgInstall(args.Str("name", ""), args.Str("scope", "project"));
+        }
+        if (name == "pkg_info") { return McpServer.PkgInfo(args.Str("name", "")); }
         string text = McpServer.FileTool(name, args);
         if (text != "") { return text; }
         return "error: unknown tool '" + name + "'; call tools/list for the catalog";
@@ -3444,6 +3451,172 @@ class McpServer {
         return true;
     }
 
+    static void CopyPackageDir(string src, string dest) {
+        Directory.CreateDirectoryRecursive(dest);
+        List<string> files = Directory.GetFiles(src);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string dstFile = dest + "/" + files[i];
+            if (File.Exists(dstFile)) { File.Delete(dstFile); }
+            File.Copy(src + "/" + files[i], dstFile);
+        }
+        List<string> dirs = Directory.GetDirectories(src);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            McpServer.CopyPackageDir(src + "/" + dirs[i], dest + "/" + dirs[i]);
+        }
+    }
+
+    static string PkgListInstalled() {
+        string pkgDir = McpServer.root + "/.zan-packages";
+        JsonValue o = JsonValue.NewObject();
+        JsonValue list = JsonValue.NewArray();
+        if (!Directory.Exists(pkgDir)) {
+            o.Put("installed", list);
+            o.Put("count", JsonValue.NewNum("0"));
+            o.Put("tip", JsonValue.NewStr("No packages installed in current project (.zan-packages/ does not exist)."));
+            return o.ToJson();
+        }
+        List<string> subdirs = Directory.GetDirectories(pkgDir);
+        for (int i = 0; i < subdirs.Count; i = i + 1) {
+            string name = subdirs[i];
+            string d = pkgDir + "/" + name;
+            string manifestPath = d + "/zan.pkg";
+            string ver = "1.0.0";
+            string desc = "";
+            if (File.Exists(manifestPath)) {
+                string content = File.ReadAllText(manifestPath);
+                JsonValue parsed = McpServer.ParseBody(content);
+                if (parsed != null) {
+                    ver = parsed.Str("version", "1.0.0");
+                    desc = parsed.Str("description", "");
+                }
+            }
+            JsonValue item = JsonValue.NewObject();
+            item.Put("name", JsonValue.NewStr(name));
+            item.Put("version", JsonValue.NewStr(ver));
+            item.Put("description", JsonValue.NewStr(desc));
+            item.Put("path", JsonValue.NewStr(".zan-packages/" + name));
+            list.Append(item);
+        }
+        o.Put("installed", list);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(list.Count())));
+        return o.ToJson();
+    }
+
+    static string PkgSearch(string query) {
+        string catalogPath = McpServer.knowledge + "/packages-catalog.json";
+        if (!File.Exists(catalogPath)) {
+            catalogPath = McpServer.sdkRoot + "/knowledge/packages-catalog.json";
+        }
+        if (!File.Exists(catalogPath)) {
+            catalogPath = McpServer.root + "/knowledge/packages-catalog.json";
+        }
+
+        JsonValue o = JsonValue.NewObject();
+        JsonValue results = JsonValue.NewArray();
+
+        if (File.Exists(catalogPath)) {
+            string text = File.ReadAllText(catalogPath);
+            JsonValue root = McpServer.ParseBody(text);
+            if (root != null && root.IsArray()) {
+                string qLower = query.ToLower();
+                for (int i = 0; i < root.Count(); i = i + 1) {
+                    JsonValue p = root.At(i);
+                    string name = p.Str("name", "");
+                    string desc = p.Str("description", "");
+                    bool match = query == ""
+                        || McpServer.Find(name.ToLower(), qLower) >= 0
+                        || McpServer.Find(desc.ToLower(), qLower) >= 0;
+                    if (!match) {
+                        JsonValue nsArr = p.Get("namespaces");
+                        if (nsArr != null && nsArr.IsArray()) {
+                            for (int j = 0; j < nsArr.Count(); j = j + 1) {
+                                if (McpServer.Find(nsArr.At(j).AsString("").ToLower(), qLower) >= 0) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (match) {
+                        results.Append(p);
+                    }
+                }
+            }
+        } else {
+            string pkgsDir = McpServer.sdkRoot + "/packages";
+            if (!Directory.Exists(pkgsDir)) { pkgsDir = McpServer.root + "/packages"; }
+            if (Directory.Exists(pkgsDir)) {
+                List<string> subs = Directory.GetDirectories(pkgsDir);
+                string qLower = query.ToLower();
+                for (int i = 0; i < subs.Count; i = i + 1) {
+                    string name = subs[i];
+                    if (query == "" || McpServer.Find(name.ToLower(), qLower) >= 0) {
+                        JsonValue p = JsonValue.NewObject();
+                        p.Put("name", JsonValue.NewStr(name));
+                        p.Put("version", JsonValue.NewStr("1.0.0"));
+                        p.Put("description", JsonValue.NewStr("Discovered in local packages/ repository"));
+                        results.Append(p);
+                    }
+                }
+            }
+        }
+        o.Put("packages", results);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(results.Count())));
+        return o.ToJson();
+    }
+
+    static string PkgInstall(string pkgName, string scope) {
+        if (pkgName == "") { return "error: 'name' is required (e.g. 'Zan.Gui.Charts')"; }
+        string srcPkgDir = McpServer.sdkRoot + "/packages/" + pkgName;
+        if (!Directory.Exists(srcPkgDir)) {
+            srcPkgDir = McpServer.sdkRoot + "/packages_cache/" + pkgName;
+        }
+        if (!Directory.Exists(srcPkgDir)) {
+            srcPkgDir = McpServer.root + "/packages/" + pkgName;
+        }
+
+        string destPkgDir = McpServer.root + "/.zan-packages/" + pkgName;
+        JsonValue o = JsonValue.NewObject();
+        if (Directory.Exists(srcPkgDir)) {
+            try {
+                McpServer.CopyPackageDir(srcPkgDir, destPkgDir);
+                o.Put("ok", JsonValue.NewBool(true));
+                o.Put("package", JsonValue.NewStr(pkgName));
+                o.Put("path", JsonValue.NewStr(".zan-packages/" + pkgName));
+                o.Put("message", JsonValue.NewStr("Package installed into project successfully."));
+                return o.ToJson();
+            } catch (Exception e) {
+                return "error: failed to install package " + pkgName + ": " + e.Message;
+            }
+        }
+        return "error: package '" + pkgName + "' not found in local package repository/cache (" + McpServer.sdkRoot + "/packages).";
+    }
+
+    static string PkgInfo(string pkgName) {
+        if (pkgName == "") { return "error: 'name' is required"; }
+        string pkgDir = McpServer.sdkRoot + "/packages/" + pkgName;
+        if (!Directory.Exists(pkgDir)) { pkgDir = McpServer.root + "/packages/" + pkgName; }
+        if (!Directory.Exists(pkgDir)) { pkgDir = McpServer.root + "/.zan-packages/" + pkgName; }
+        if (!Directory.Exists(pkgDir)) {
+            return "error: package '" + pkgName + "' not found.";
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(pkgName));
+        string readmePath = pkgDir + "/README.md";
+        if (File.Exists(readmePath)) {
+            o.Put("readme", JsonValue.NewStr(File.ReadAllText(readmePath)));
+        }
+        string manifestPath = pkgDir + "/zan.pkg";
+        if (File.Exists(manifestPath)) {
+            string raw = File.ReadAllText(manifestPath);
+            JsonValue parsed = McpServer.ParseBody(raw);
+            if (parsed != null) {
+                o.Put("manifest", parsed);
+            }
+        }
+        return o.ToJson();
+    }
+
 
     static JsonValue ToolsDoc() {
         JsonValue arr = JsonValue.NewArray();
@@ -3589,34 +3762,55 @@ class McpServer {
             arr.Append(t);
         }
 
-        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
-            t = McpServer.NewTool("zan_api_search",
-                "Search the Zan stdlib symbol index (name/kind/file/line/signature)."
-                + " Use it before writing Zan code instead of guessing signatures.");
-            McpServer.AddParam(t, "query", "string", "Symbol fragment(s).", true);
-            McpServer.AddParam(t, "limit", "integer", "Result cap (default 40).", false);
-            arr.Append(t);
+        // ---- package management tools for AI-assisted development ------------
+        t = McpServer.NewTool("pkg_list_installed",
+            "List all installed packages and versions in the current project (.zan-packages/).");
+        arr.Append(t);
 
-            t = McpServer.NewTool("zan_lookup_symbol",
-                "Locate a definition exactly: pass \"File\" or \"File.ReadAllText\""
-                + " (or a bare member name) and get kind, signature, summary and"
-                + " file:line back. Use this instead of reading a file to find"
-                + " out what something is.");
-            McpServer.AddParam(t, "name", "string",
-                "Type, Type.Member, or member name.", true);
-            McpServer.AddParam(t, "limit", "integer", "Result cap (default 10).", false);
-            arr.Append(t);
+        t = McpServer.NewTool("pkg_search",
+            "Search for available packages in the official Zan ecosystem catalog by keyword or namespace.");
+        McpServer.AddParam(t, "query", "string", "Keyword, topic, or namespace fragment to search.", false);
+        arr.Append(t);
 
-            t = McpServer.NewTool("zan_list_members",
-                "List every member of one type with signatures and file:line --"
-                + " the per-type API page. Cheaper than fetching a whole"
-                + " namespace reference page.");
-            McpServer.AddParam(t, "type", "string", "Type name.", true);
-            McpServer.AddParam(t, "filter", "string",
-                "Only members whose name contains this fragment.", false);
-            McpServer.AddParam(t, "limit", "integer", "Result cap (default 80).", false);
-            arr.Append(t);
-        }
+        t = McpServer.NewTool("pkg_install",
+            "Install an official or local package into the project (.zan-packages/).");
+        McpServer.AddParam(t, "name", "string", "Package name, e.g. 'Zan.Gui.Charts' or 'Zan.Data'.", true);
+        McpServer.AddParam(t, "scope", "string", "'project' (default) or 'global'.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("pkg_info",
+            "Get details, exported namespaces, and usage of a specific package.");
+        McpServer.AddParam(t, "name", "string", "Package name.", true);
+        arr.Append(t);
+
+        // ---- API inspection tools (always available for AI clients) -----------
+        t = McpServer.NewTool("zan_api_search",
+            "Search the Zan stdlib symbol index (name/kind/file/line/signature)."
+            + " Use it before writing Zan code instead of guessing signatures.");
+        McpServer.AddParam(t, "query", "string", "Symbol fragment(s).", true);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 40).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_lookup_symbol",
+            "Locate a definition exactly: pass \"File\" or \"File.ReadAllText\""
+            + " (or a bare member name) and get kind, signature, summary and"
+            + " file:line back. Use this instead of reading a file to find"
+            + " out what something is.");
+        McpServer.AddParam(t, "name", "string",
+            "Type, Type.Member, or member name.", true);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 10).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_list_members",
+            "List every member of one type with signatures and file:line --"
+            + " the per-type API page. Cheaper than fetching a whole"
+            + " namespace reference page.");
+        McpServer.AddParam(t, "type", "string", "Type name.", true);
+        McpServer.AddParam(t, "filter", "string",
+            "Only members whose name contains this fragment.", false);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 80).", false);
+        arr.Append(t);
+
         if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_find_refs",
                 "Impact of a change: declarations, the lines that mention the"
@@ -3714,13 +3908,13 @@ class McpServer {
                 + " (RepoMap) alone.");
             arr.Append(t);
         }
-        if (File.Exists(McpServer.galleryPath) || McpServer.frozenTools) {
-            t = McpServer.NewTool("zan_example",
-                "Return a shipped, build-verified Zan template for a topic."
-                + " Call with no topic to list the catalog.");
-            McpServer.AddParam(t, "topic", "string", "Catalog topic.", false);
-            arr.Append(t);
-        }
+        // ---- example template inspection tool --------------------------------
+        t = McpServer.NewTool("zan_example",
+            "Return a shipped, build-verified Zan template for a topic."
+            + " Call with no topic to list the catalog.");
+        McpServer.AddParam(t, "topic", "string", "Catalog topic.", false);
+        arr.Append(t);
+
         if (File.Exists(McpServer.formSchemaPath) || McpServer.frozenTools) {
             t = McpServer.NewTool("zan_control_schema",
                 "Return the control catalog and generated control specifications."

@@ -206,6 +206,137 @@ class AiAgent {
         return "";
     }
 
+    static string PackagesDir() {
+        string a = ZanIDE.BaseDir() + "/packages";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/packages_cache";
+        if (Directory.Exists(b)) { return b; }
+        string c = ZanIDE.BaseDir() + "/../packages";
+        if (Directory.Exists(c)) { return c; }
+        return "";
+    }
+
+    static string PkgList(string root) {
+        string pkgDir = root + "/.zan-packages";
+        if (!Directory.Exists(pkgDir)) {
+            return "{\"installed\": [], \"count\": 0, \"tip\": \"No packages installed in this project (.zan-packages/ does not exist).\"}";
+        }
+        JsonValue o = JsonValue.NewObject();
+        JsonValue list = JsonValue.NewArray();
+        List<string> subdirs = Directory.GetDirectories(pkgDir);
+        for (int i = 0; i < subdirs.Count; i = i + 1) {
+            string name = subdirs[i];
+            string d = pkgDir + "/" + name;
+            string manifestPath = d + "/zan.pkg";
+            string ver = "1.0.0";
+            string desc = "";
+            if (File.Exists(manifestPath)) {
+                JsonValue parsed = JsonValue.ParseLenient(File.ReadAllText(manifestPath));
+                if (parsed != null) {
+                    ver = parsed.Str("version", "1.0.0");
+                    desc = parsed.Str("description", "");
+                }
+            }
+            JsonValue item = JsonValue.NewObject();
+            item.Put("name", JsonValue.NewStr(name));
+            item.Put("version", JsonValue.NewStr(ver));
+            item.Put("description", JsonValue.NewStr(desc));
+            item.Put("path", JsonValue.NewStr(".zan-packages/" + name));
+            list.Append(item);
+        }
+        o.Put("installed", list);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(list.Count())));
+        return o.ToJson();
+    }
+
+    static string PkgSearch(string query) {
+        string kdir = AiAgent.KnowledgeDir();
+        string catalogPath = kdir + "/packages-catalog.json";
+        JsonValue o = JsonValue.NewObject();
+        JsonValue results = JsonValue.NewArray();
+        if (File.Exists(catalogPath)) {
+            JsonValue root = JsonValue.ParseLenient(File.ReadAllText(catalogPath));
+            if (root != null && root.IsArray()) {
+                string qLower = query.ToLower();
+                for (int i = 0; i < root.Count(); i = i + 1) {
+                    JsonValue p = root.At(i);
+                    string name = p.Str("name", "");
+                    string desc = p.Str("description", "");
+                    bool match = query == ""
+                        || ZanIDE.IndexOfStr(name.ToLower(), qLower) >= 0
+                        || ZanIDE.IndexOfStr(desc.ToLower(), qLower) >= 0;
+                    if (!match) {
+                        JsonValue nsArr = p.Get("namespaces");
+                        if (nsArr != null && nsArr.IsArray()) {
+                            for (int j = 0; j < nsArr.Count(); j = j + 1) {
+                                if (ZanIDE.IndexOfStr(nsArr.At(j).AsString("").ToLower(), qLower) >= 0) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (match) { results.Append(p); }
+                }
+            }
+        } else {
+            string pkgsDir = AiAgent.PackagesDir();
+            if (pkgsDir != "" && Directory.Exists(pkgsDir)) {
+                List<string> subs = Directory.GetDirectories(pkgsDir);
+                string qLower = query.ToLower();
+                for (int i = 0; i < subs.Count; i = i + 1) {
+                    string name = subs[i];
+                    if (query == "" || ZanIDE.IndexOfStr(name.ToLower(), qLower) >= 0) {
+                        JsonValue p = JsonValue.NewObject();
+                        p.Put("name", JsonValue.NewStr(name));
+                        p.Put("version", JsonValue.NewStr("1.0.0"));
+                        p.Put("description", JsonValue.NewStr("Discovered in local packages/ cache"));
+                        results.Append(p);
+                    }
+                }
+            }
+        }
+        o.Put("packages", results);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(results.Count())));
+        return o.ToJson();
+    }
+
+    static void CopyDir(string src, string dest) {
+        Directory.CreateDirectoryRecursive(dest);
+        List<string> files = Directory.GetFiles(src);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string dstFile = dest + "/" + files[i];
+            if (File.Exists(dstFile)) { File.Delete(dstFile); }
+            File.Copy(src + "/" + files[i], dstFile);
+        }
+        List<string> dirs = Directory.GetDirectories(src);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            AiAgent.CopyDir(src + "/" + dirs[i], dest + "/" + dirs[i]);
+        }
+    }
+
+    static string PkgInstall(string root, string name) {
+        if (name == "") { return "error: 'name' is required (e.g. 'Zan.Gui.Charts')"; }
+        string pkgsDir = AiAgent.PackagesDir();
+        if (pkgsDir == "") { return "error: local packages repository/cache not found."; }
+        string srcPkg = pkgsDir + "/" + name;
+        if (!Directory.Exists(srcPkg)) {
+            return "error: package '" + name + "' not found in " + pkgsDir;
+        }
+        string dstPkg = root + "/.zan-packages/" + name;
+        try {
+            AiAgent.CopyDir(srcPkg, dstPkg);
+            JsonValue o = JsonValue.NewObject();
+            o.Put("ok", JsonValue.NewBool(true));
+            o.Put("package", JsonValue.NewStr(name));
+            o.Put("path", JsonValue.NewStr(".zan-packages/" + name));
+            o.Put("message", JsonValue.NewStr("Package installed into project successfully."));
+            return o.ToJson();
+        } catch (Exception e) {
+            return "error: failed to install package " + name + ": " + e.Message;
+        }
+    }
+
     static string ShippedFile(string rel) {
         string a = ZanIDE.BaseDir() + "/" + rel;
         if (File.Exists(a)) { return a; }
@@ -414,6 +545,15 @@ class AiAgent {
         if (tool == "api_search") {
             return AiAgent.ApiSearch(v.Str("query", ""), v.Int("limit", 40));
         }
+        if (tool == "pkg_list" || tool == "pkg_list_installed") {
+            return AiAgent.PkgList(root);
+        }
+        if (tool == "pkg_search") {
+            return AiAgent.PkgSearch(v.Str("query", ""));
+        }
+        if (tool == "pkg_install") {
+            return AiAgent.PkgInstall(root, v.Str("name", ""));
+        }
         if (tool == "example") {
             return AiAgent.Example(v.Str("topic", ""));
         }
@@ -432,8 +572,8 @@ class AiAgent {
         }
         return "error: unknown tool '" + tool + "'. Available: read_file,"
             + " list_dir, grep, repo_map, stdlib_read, stdlib_grep, api_search,"
-            + " example, plan, write_file, edit_file, build, run, ui_check,"
-            + " ui_tree, diff, run_errors.";
+            + " pkg_list, pkg_search, pkg_install, example, plan, write_file,"
+            + " edit_file, build, run, ui_check, ui_tree, diff, run_errors.";
     }
 
     static int ParsePlan(string json, List<AiPlanStep> outSteps) {
@@ -701,7 +841,8 @@ class AiAgent {
         return tool == "read_file" || tool == "list_dir" || tool == "grep"
             || tool == "repo_map" || tool == "stdlib_read"
             || tool == "stdlib_grep" || tool == "api_search"
-            || tool == "example";
+            || tool == "pkg_list" || tool == "pkg_list_installed"
+            || tool == "pkg_search" || tool == "example";
     }
 
     // 一个查询调用的身份：工具名加上真正决定结果的那几个参数。签名相同就是
@@ -740,6 +881,9 @@ class AiAgent {
         if (tool == "stdlib_read") { return ZanIDE.T("stdlib_read", "读标准库"); }
         if (tool == "stdlib_grep") { return ZanIDE.T("stdlib_grep", "搜标准库"); }
         if (tool == "api_search") { return ZanIDE.T("api_search", "查接口"); }
+        if (tool == "pkg_list" || tool == "pkg_list_installed") { return ZanIDE.T("pkg_list", "已装包"); }
+        if (tool == "pkg_search") { return ZanIDE.T("pkg_search", "搜扩展包"); }
+        if (tool == "pkg_install") { return ZanIDE.T("pkg_install", "装扩展包"); }
         if (tool == "example") { return ZanIDE.T("example", "看示例"); }
         if (tool == "plan") { return ZanIDE.T("plan", "列计划"); }
         if (tool == "build") { return ZanIDE.T("build", "编译"); }
@@ -1218,6 +1362,8 @@ class AiAgent {
             + " get matching {name,kind,file,line,sig} records. Use this FIRST"
             + " to find a control/method's exact signature instead of grepping"
             + " large stdlib files.\n"
+            + "- pkg_list {}: list packages and versions currently installed in the project (.zan-packages/).\n"
+            + "- pkg_search {query}: search available packages/extensions in the ecosystem catalog by keyword or namespace.\n"
             + "- example {topic}: return a shipped, build-verified"
             + " template/example VERBATIM (no topic = list the catalog). Copy"
             + " this as your starting point for Gui/Game code instead of"
@@ -1231,6 +1377,7 @@ class AiAgent {
             + " on its own, in the order you will do them. Runs silently.\n"
             + "Action tools (the IDE asks the user to approve each one first,"
             + " unless they turned on Auto-execute):\n"
+            + "- pkg_install {name}: install an official package (e.g. \"Zan.Gui.Charts\", \"Zan.Data\") into the project (.zan-packages/).\n"
             + "- edit_file {path, old, new}: replace the UNIQUE occurrence of"
             + " `old` with `new` in an existing file. Copy `old` verbatim from a"
             + " read_file, including indentation; if it is not unique the edit is"

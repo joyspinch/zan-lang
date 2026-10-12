@@ -3806,6 +3806,116 @@ static bool zan_file_exists(const char *path) {
 #endif
 }
 
+static void zan_extract_json_str(const char *line, const char *key, char *out, size_t outsz) {
+    out[0] = '\0';
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    const char *p = strstr(line, needle);
+    if (!p) return;
+    p += strlen(needle);
+    size_t i = 0;
+    while (*p && *p != '"' && i + 1 < outsz) {
+        if (*p == '\\' && *(p + 1)) p++;
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+}
+
+static int zan_extract_json_int(const char *line, const char *key) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    const char *p = strstr(line, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t') p++;
+    return atoi(p);
+}
+
+static const char *zan_strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return NULL;
+    if (!*needle) return haystack;
+    for (; *haystack; haystack++) {
+        if (tolower((unsigned char)*haystack) == tolower((unsigned char)*needle)) {
+            const char *h = haystack;
+            const char *n = needle;
+            while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+                h++;
+                n++;
+            }
+            if (!*n) return haystack;
+        }
+    }
+    return NULL;
+}
+
+static int zan_query_api(const char *symbol_query) {
+    if (!symbol_query || !*symbol_query) {
+        fprintf(stderr, "error: --api requires a symbol name or fragment (e.g. 'Button' or 'File.ReadAllText')\n");
+        return 1;
+    }
+    char exe_dir[1024];
+    zan_exe_dir(exe_dir, sizeof(exe_dir));
+
+    char cand1[1200], cand2[1200], cand3[256], cand4[256];
+    snprintf(cand1, sizeof(cand1), "%s/knowledge/symbols.json", exe_dir);
+    snprintf(cand2, sizeof(cand2), "%s/../knowledge/symbols.json", exe_dir);
+    snprintf(cand3, sizeof(cand3), ".zanmap/symbols.json");
+    snprintf(cand4, sizeof(cand4), "knowledge/symbols.json");
+
+    const char *paths[] = { cand1, cand2, cand3, cand4 };
+    const char *found_path = NULL;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        if (zan_file_exists(paths[i])) {
+            found_path = paths[i];
+            break;
+        }
+    }
+
+    if (!found_path) {
+        fprintf(stderr, "error: API symbol index not found (checked knowledge/symbols.json, .zanmap/symbols.json).\n");
+        fprintf(stderr, "Hint: Run scripts/gen_knowledge.ps1 to generate the offline API index.\n");
+        return 1;
+    }
+
+    FILE *f = fopen(found_path, "r");
+    if (!f) {
+        fprintf(stderr, "error: could not open %s\n", found_path);
+        return 1;
+    }
+
+    char line[4096];
+    int count = 0;
+    const int max_results = 50;
+    printf("=== API search for '%s' (from %s) ===\n", symbol_query, found_path);
+
+    while (fgets(line, sizeof(line), f)) {
+        if (!zan_strcasestr(line, symbol_query)) continue;
+
+        char name[256], kind[64], sig[512], file[512];
+        zan_extract_json_str(line, "name", name, sizeof(name));
+        zan_extract_json_str(line, "kind", kind, sizeof(kind));
+        zan_extract_json_str(line, "sig", sig, sizeof(sig));
+        zan_extract_json_str(line, "file", file, sizeof(file));
+        int line_no = zan_extract_json_int(line, "line");
+
+        if (!name[0]) continue;
+
+        if (sig[0]) {
+            printf("  [%s] %s :: %s  (%s:%d)\n", kind[0] ? kind : "symbol", name, sig, file, line_no);
+        } else {
+            printf("  [%s] %s  (%s:%d)\n", kind[0] ? kind : "type", name, file, line_no);
+        }
+        count++;
+        if (count >= max_results) {
+            printf("  ... (capped at %d results)\n", max_results);
+            break;
+        }
+    }
+    fclose(f);
+    printf("Total found: %d\n", count);
+    return 0;
+}
+
 static bool zan_read_first_bundle_name(const char *path,
                                        char *out, size_t outsz) {
     FILE *f = fopen(path, "rb");
@@ -4105,6 +4215,7 @@ static void print_usage(void) {
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
     fprintf(stderr, "                   libs next to the exe, default) or static (link into the exe)\n");
     fprintf(stderr, "  --driver-dir <d> Override the bundled native driver directory\n");
+    fprintf(stderr, "  --api <symbol>   Query member signatures and types from API index\n");
     fprintf(stderr, "  --stdlib-path <dir>  Path to stdlib directory\n");
     fprintf(stderr, "  --auto-stdlib    Automatically find stdlib and installed package namespaces (default)\n");
     fprintf(stderr, "  --no-stdlib      Disable automatic stdlib and package discovery\n");
@@ -4385,6 +4496,8 @@ int main(int argc, char **argv) {
             for (int t = 0; t < nt; t++)
                 printf("  %-12s %-30s %s\n", ts[t].name, ts[t].triple, ts[t].desc);
             return 0;
+        } else if (strcmp(argv[i], "--api") == 0 && i + 1 < argc) {
+            return zan_query_api(argv[++i]);
         } else if (strcmp(argv[i], "--stdlib-path") == 0 && i + 1 < argc) {
             stdlib_path = argv[++i];
         } else if (strcmp(argv[i], "--auto-stdlib") == 0) {
@@ -5084,8 +5197,11 @@ int main(int argc, char **argv) {
                                            : (debug_info && !publish_mode);
     bool arc_guard = arc_guard_opt >= 0 ? arc_guard_opt != 0
                                         : (debug_info && !publish_mode);
-    if (runtime_checks_opt < 0 && publish_mode) {
-        runtime_checks = false;
+    /* 生产级安全基线：无论 debug 还是 publish 模式，
+       默认均保留 runtime_checks（数组/切片越界防线、除零保护等）。
+       仅当用户显式传递 --no-runtime-checks 时才予以禁用。 */
+    if (runtime_checks_opt < 0) {
+        runtime_checks = true;
     }
     bool arc_net = publish_mode && arc_guard_opt != 1 && arc_guard_opt != 0;
     zan_arena_t *ir_arena = zan_arena_new();
