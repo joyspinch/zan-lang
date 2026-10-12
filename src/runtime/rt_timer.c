@@ -949,15 +949,16 @@ void zan_co_live_add(void *frame) {
     live_unlock();
 }
 
-static void join_on_untrack(void *frame, void **out_joiner,
-                            zan_timer_step_t *out_step);
+#define ZAN_MAX_JOIN_FIRES 16
+static int join_on_untrack(void *frame, void **out_joiners,
+                           zan_timer_step_t *out_steps, int max_fires);
 
 void zan_co_live_del(void *frame) {
     if (!frame || !g_colive_cap) return;
-    void *fire_joiner = NULL;
-    zan_timer_step_t fire_step = NULL;
+    void *fire_joiners[ZAN_MAX_JOIN_FIRES];
+    zan_timer_step_t fire_steps[ZAN_MAX_JOIN_FIRES];
     live_lock();
-    join_on_untrack(frame, &fire_joiner, &fire_step);
+    int nfires = join_on_untrack(frame, fire_joiners, fire_steps, ZAN_MAX_JOIN_FIRES);
     size_t mask = g_colive_cap - 1;
     size_t i = live_hash(frame) & mask;
     for (;;) {
@@ -973,7 +974,11 @@ void zan_co_live_del(void *frame) {
     }
     live_unlock();
     void (*_hook)(void *, zan_timer_step_t) = g_ready_hook;
-    if (fire_joiner && fire_step && _hook) _hook(fire_joiner, fire_step);
+    if (_hook) {
+        for (int k = 0; k < nfires; k++) {
+            _hook(fire_joiners[k], fire_steps[k]);
+        }
+    }
 }
 
 int zan_co_live_count(void) {
@@ -1163,19 +1168,28 @@ static void join_fire_locked(zan_join_t *j, void **out_joiner, zan_timer_step_t 
     *out_step = j->joiner_step;
 }
 
-static void join_on_untrack(void *frame, void **out_joiner, zan_timer_step_t *out_step) {
-    *out_joiner = NULL;
+static int join_on_untrack(void *frame, void **out_joiners,
+                           zan_timer_step_t *out_steps, int max_fires) {
+    int nfires = 0;
     zan_join_pair_t *pr = joinmap_get(frame);
     while (pr) {
         zan_join_pair_t *next = pr->next_in_frame;
         if (!pr->done) {
             pr->done = 1;
             pr->owner->remaining--;
-            join_fire_locked(pr->owner, out_joiner, out_step);
+            void *joiner = NULL;
+            zan_timer_step_t step = NULL;
+            join_fire_locked(pr->owner, &joiner, &step);
+            if (joiner && step && nfires < max_fires) {
+                out_joiners[nfires] = joiner;
+                out_steps[nfires] = step;
+                nfires++;
+            }
         }
         joinmap_remove(frame, pr);
         pr = next;
     }
+    return nfires;
 }
 
 static int zan_sched_trace(void) {
@@ -1189,7 +1203,6 @@ static int zan_sched_trace(void) {
     return cur;
 }
 
-#define ZAN_MAX_JOIN_FIRES 16
 void zan_join_complete(void *frame) {
     if (!frame || !g_joinmap_cap) return;
     void *fire_joiners[ZAN_MAX_JOIN_FIRES];
