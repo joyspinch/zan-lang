@@ -825,6 +825,70 @@ static void zan_gl_ctx_present_end(void *host) {
 static void zan_gl_ctx_present_drop(void *host) { (void)host; }
 static void zan_gl_ctx_present_drop_all(void) { }
 
+#elif defined(__EMSCRIPTEN__) || defined(__wasm__)
+/* WebAssembly / WebGL 2.0 (GLES 3.0 Compatible) */
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/html5.h>
+#include <emscripten/emscripten.h>
+#include <GLES3/gl3.h>
+
+static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_wasm_glctx = 0;
+
+static int zan_gl_ctx_create(void) {
+    if (g_wasm_glctx > 0) return 1;
+    EmscriptenWebGLContextAttributes attr;
+    emscripten_webgl_init_context_attributes(&attr);
+    attr.majorVersion = 2;
+    attr.minorVersion = 0;
+    attr.alpha = 1;
+    attr.depth = 1;
+    attr.stencil = 0;
+    attr.antialias = 1;
+    attr.preserveDrawingBuffer = 1;
+    g_wasm_glctx = emscripten_webgl_create_context("#canvas", &attr);
+    if (g_wasm_glctx <= 0) {
+        g_wasm_glctx = emscripten_webgl_create_context(NULL, &attr);
+    }
+    if (g_wasm_glctx <= 0) return 0;
+    return emscripten_webgl_make_context_current(g_wasm_glctx) == EMSCRIPTEN_RESULT_SUCCESS;
+}
+
+static int zan_gl_ctx_make_current(void) {
+    if (g_wasm_glctx <= 0) return 0;
+    return emscripten_webgl_make_context_current(g_wasm_glctx) == EMSCRIPTEN_RESULT_SUCCESS;
+}
+
+static void zan_gl_ctx_destroy(void) {
+    if (g_wasm_glctx > 0) {
+        emscripten_webgl_destroy_context(g_wasm_glctx);
+        g_wasm_glctx = 0;
+    }
+}
+
+static void *zan_gl_ctx_getproc(const char *name) {
+    return emscripten_webgl_get_proc_address(name);
+}
+
+static int zan_gl_ctx_present_begin(void *host, int w, int h) {
+    (void)host; (void)w; (void)h;
+    return zan_gl_ctx_make_current();
+}
+static void zan_gl_ctx_present_end(void *host) { (void)host; }
+static void zan_gl_ctx_present_drop(void *host) { (void)host; }
+static void zan_gl_ctx_present_drop_all(void) { }
+
+#else
+/* Raw WASI / non-emscripten wasm stub */
+static int zan_gl_ctx_create(void) { return 0; }
+static int zan_gl_ctx_make_current(void) { return 0; }
+static void zan_gl_ctx_destroy(void) { }
+static void *zan_gl_ctx_getproc(const char *name) { (void)name; return NULL; }
+static int zan_gl_ctx_present_begin(void *host, int w, int h) { (void)host; (void)w; (void)h; return 0; }
+static void zan_gl_ctx_present_end(void *host) { (void)host; }
+static void zan_gl_ctx_present_drop(void *host) { (void)host; }
+static void zan_gl_ctx_present_drop_all(void) { }
+#endif
+
 #else
 static int zan_gl_ctx_create(void) { return 0; }
 static int zan_gl_ctx_make_current(void) { return 0; }

@@ -3161,11 +3161,20 @@ const zan_gui_backend zan_cpu_backend = {
 };
 
 #include "gui_gl_backend.c"
+#include "gui_metal_backend.h"
 
 EXPORT i32 zan_gui_set_render_backend(i32 mode) {
     const zan_gui_backend *be = NULL;
     if (mode == 1 || mode == 2) {
+#if defined(__APPLE__)
+        if (zan_gui_internal_metal_supported() && zan_gui_internal_metal_install()) {
+            be = &zan_metal_backend;
+        } else if (zan_gui_internal_gl_install()) {
+            be = &zan_gl_backend;
+        }
+#else
         if (zan_gui_internal_gl_install()) be = &zan_gl_backend;
+#endif
     } else {
         zan_gui_internal_set_backend(NULL);
     }
@@ -3176,7 +3185,12 @@ EXPORT i32 zan_gui_set_render_backend(i32 mode) {
         if (s->be && s->be->read_pixels) s->be->read_pixels(s);
         s->be = be;
     }
-    if (!be) zan_gui_internal_gl_drop_present();
+    if (!be) {
+        zan_gui_internal_gl_drop_present();
+#if defined(__APPLE__)
+        zan_gui_internal_metal_drop_present();
+#endif
+    }
     return be ? 1 : 0;
 }
 
