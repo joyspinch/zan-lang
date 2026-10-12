@@ -56,6 +56,15 @@ while (app.isRunning) {
 皮肤与样式：`Skin.zan`（皮肤索引/切换）、`Style*.zan` / `StyleSheet.zan` / `Css.zan`
 （CSS 式样式层，IDE 自己的布局在 `src/ide_zan/assets/ide.css`）、`skins/`（资源）。
 
+**图形游戏使用 Gui 的现行开发规范**：玩家可见的按钮、面板、HUD、菜单、提示与
+弹层必须图形化并匹配游戏场景美术。布局和交互复用标准组件，外观通过游戏专属
+皮肤、语义类与 UI 素材统一配色、字体、图标、材质和动效；适用的悬停/按下/选中/
+禁用/焦点状态也要同风格。用户指出默认桌面外观与图形游戏混搭会降低品质，因此
+验收须把 Gui 和场景放在同一张截图中逐页复核，默认外观只能作开发占位。
+详细规则见 [游戏开发规范](../../.agents/skills/game-dev/SKILL.md)
+“图形游戏的 Gui 组件必须匹配游戏美术风格”及
+[游戏引擎指南](../GAME_ENGINE_GUIDE.md)。
+
 ## 绘制原语（`packages/Zan.Gui/src/Gui/Rendering/Render.zan`）
 
 `Canvas` 上常用：`FillRect` `DrawRect` `FillRoundRect` `DrawCircle` `DrawLine`
