@@ -1394,6 +1394,10 @@ static uint64_t pi_meta_hash_text(uint64_t h, const char *text) {
 }
 
 static uint64_t pi_meta_compiler_hash(void) {
+    /* 默认不落盘元数据缓存（零磁盘垃圾模式）；仅当显式指定 ZAN_META_CACHE_DIR 时启用 */
+    const char *override = getenv("ZAN_META_CACHE_DIR");
+    if (!override || !*override) return 0;
+
     static uint64_t identity;
     static int checked;
     if (checked) return identity;
@@ -1450,6 +1454,7 @@ static uint64_t pi_meta_file_hash(const char *path, const char *src, size_t len)
 static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
     out[0] = 0;
     if (!key) return;
+    /* 默认不污染用户磁盘；仅当显式指定 ZAN_META_CACHE_DIR 时向隔离目录落盘 */
     const char *override = getenv("ZAN_META_CACHE_DIR");
     if (override && *override) {
 #ifdef _WIN32
@@ -1461,23 +1466,6 @@ static void pi_meta_cache_path(uint64_t key, char *out, size_t out_sz) {
 #endif
         return;
     }
-#ifdef _WIN32
-    const char *base = getenv("LOCALAPPDATA");
-    if (base && *base)
-        snprintf(out, out_sz, "%s\\Zan\\pullin-meta-%016llx.bin", base,
-                 (unsigned long long)key);
-#else
-    const char *base = getenv("XDG_CACHE_HOME");
-    if (!base || !*base) base = getenv("HOME");
-    if (base && *base) {
-        if (getenv("XDG_CACHE_HOME"))
-            snprintf(out, out_sz, "%s/zan/pullin-meta-%016llx.bin", base,
-                     (unsigned long long)key);
-        else
-            snprintf(out, out_sz, "%s/.cache/zan/pullin-meta-%016llx.bin", base,
-                     (unsigned long long)key);
-    }
-#endif
 }
 
 #define PI_META_MAGIC UINT32_C(0x5a504d32)
