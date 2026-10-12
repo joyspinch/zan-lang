@@ -6,10 +6,10 @@
 > scaling/gravity/min-maxRadius、chord sort/sortSub/gap/ribbonType、funnel
 > funnelAlign/gap/转化率、wordCloud sizeRange/textRotation）。
 >
-> - 2.2.7 口径的**全示例可表达性账本**见 `docs/CHART_VS_ECHARTS_227.md`（该基准已迁走）；
-> - 2.2.7 口径的**兼容性合同**见 `docs/CHART_COMPATIBILITY_227.md`；
-> - 当前**迁移账本**见 `docs/CHART_COMPATIBILITY_5.md`（基准 ECharts 6.1.0+），**代码级对照**见
->   `docs/CHART_CODE_GAP_LEDGER.md`；
+> - 2.2.7 口径的**全示例可表达性账本**见 `docs/archive/CHART_VS_ECHARTS_227.md`（该基准已迁走）；
+> - 2.2.7 口径的**兼容性合同**见 `docs/archive/CHART_COMPATIBILITY_227.md`；
+> - 当前**迁移账本**见 `docs/archive/CHART_COMPATIBILITY_5.md`（基准 ECharts 6.1.0+），**代码级对照**见
+>   `docs/archive/CHART_CODE_GAP_LEDGER.md`；
 > - 下方正文保留为历史审计依据。
 
 # Zan Chart 与 ECharts 2.2.4 能力对照 · 变体矩阵
