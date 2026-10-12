@@ -986,12 +986,10 @@ void zan_monitor_exit(void *obj) {
     unsigned bidx = zan_sync_bucket_idx(obj);
     zan_sync_bucket_t *bucket = &g_sync_buckets[bidx];
 
+    /* 必须先释放该对象内部持有的递归互斥锁，再进入桶锁更新引用计数并判定销毁，
+       彻底避免跨线程争用时提前在桶内销毁锁引发的释放 UAF 崩溃 */
 #ifdef _WIN32
     EnterCriticalSection(&bucket->bucket_cs);
-#else
-    pthread_mutex_lock(&bucket->bucket_mx);
-#endif
-
     zan_sync_block_t **curr_p = &bucket->head;
     zan_sync_block_t *sb = NULL;
     while (*curr_p) {
@@ -1003,30 +1001,41 @@ void zan_monitor_exit(void *obj) {
     }
 
     if (!sb) {
-#ifdef _WIN32
         LeaveCriticalSection(&bucket->bucket_cs);
-#else
-        pthread_mutex_unlock(&bucket->bucket_mx);
-#endif
         return;
     }
 
-    sb->ref_count--;
-    int should_free = (sb->ref_count <= 0);
-    if (should_free) {
-        *curr_p = sb->next;
-    }
-
-#ifdef _WIN32
     LeaveCriticalSection(&sb->cs);
-    if (should_free) {
+
+    sb->ref_count--;
+    if (sb->ref_count <= 0) {
+        *curr_p = sb->next;
         DeleteCriticalSection(&sb->cs);
         free(sb);
     }
     LeaveCriticalSection(&bucket->bucket_cs);
 #else
+    pthread_mutex_lock(&bucket->bucket_mx);
+    zan_sync_block_t **curr_p = &bucket->head;
+    zan_sync_block_t *sb = NULL;
+    while (*curr_p) {
+        if ((*curr_p)->obj == obj) {
+            sb = *curr_p;
+            break;
+        }
+        curr_p = &(*curr_p)->next;
+    }
+
+    if (!sb) {
+        pthread_mutex_unlock(&bucket->bucket_mx);
+        return;
+    }
+
     pthread_mutex_unlock(&sb->mx);
-    if (should_free) {
+
+    sb->ref_count--;
+    if (sb->ref_count <= 0) {
+        *curr_p = sb->next;
         pthread_mutex_destroy(&sb->mx);
         free(sb);
     }
