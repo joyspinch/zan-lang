@@ -968,6 +968,10 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   搬 CSS 进 `<style>` 时逐条补单位:`line-height: 72` 是 72 倍行高
   (无单位=倍数),30px 字号配它=3240px 行盒整树顶飞,要 72px 必须
   写 `72px`(详见 references/html-window.md)。
+- **窗口与内容面板贴边纪律与圆角状态契约（Window Margin & Corner Invariant）**：
+  ① 桌面窗口根节点（`body` 与 `.designroot`）默认必须 0 外边距与 0 内边距、100% 贴边撑满客户区；留白应由具体业务卡片/内联布局显式决定，根节点绝不强行内缩，禁止机械带出浏览器的 `body { margin: 8px }` 导致主界面悬空漏边；
+  ② 通用容器/面板（`panel`）默认必须直角透明无内边距（`border-radius: 0; padding: 0; box-shadow: none`），填满窗口（`Dock.Fill`）时天然贴合无缝咬合；只有明确声明为展示卡片的独立部件（`card` / `panel.card`）才带圆角与投影，禁止普通面板默认带圆角导致贴边时四角切开漏底；
+  ③ 窗口圆角与最大化状态严格联动：最大化（`SIZE_MAXIMIZED`）时铺满全屏，DWM 与异形遮罩必须自动取消圆角（直角平铺），防止屏幕四角漏出桌面背景；从最大化还原（`SIZE_RESTORED`）时必须完整恢复原本的圆角与阴影规格，严禁单向破坏不可逆。
 - **自由画布动态像素标尺系统（Dynamic Pixel Rulers）与视口投影**：
   设计器画布支持视口平移（ox/oy）与光标中心缩放（psMilli）时，屏幕物理像素与文档设计逻辑像素（fx/fy/fw/fh）
   动态映射。顶部与左侧动态标尺必须依据逻辑逆映射 `minLx = (inX + rThick - ox) * 1000 / psMilli` 循环发射，

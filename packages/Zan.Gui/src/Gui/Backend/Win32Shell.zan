@@ -50,6 +50,7 @@ class Win32CaptionConfig {
     public int minTrackPhysicalW;
     public int minTrackPhysicalH;
     public bool physicalStage;
+    public bool roundCorner;
 
     public Win32CaptionConfig(nint hwnd, int capCount, int zoneWidth) {
         this.hwnd = hwnd;
@@ -791,6 +792,17 @@ class Win32Shell {
             }
             return 0;
         } else if (msg == 5) {                     // WM_SIZE
+            int sizeType = (int)wp;
+            if (sizeType == 2) {
+                // 最大化：强制取消 DWM 圆角，直角贴满屏幕
+                Win32Shell.ApplyDwmRound(hwnd, false);
+            } else if (sizeType == 0) {
+                // 还原：恢复用户设置的圆角偏好
+                Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+                if (cfg != null && cfg.roundCorner) {
+                    Win32Shell.ApplyDwmRound(hwnd, true);
+                }
+            }
             Win32Shell.windowWidth = Win32Shell.LoWord(lp) & 65535;
             Win32Shell.windowHeight = (((int)lp) >> 16) & 65535;
             int own = Win32Shell.SurfaceOf(hwnd);
@@ -1929,11 +1941,9 @@ class Win32Shell {
     // DWMWA_WINDOW_CORNER_PREFERENCE(33)，旧系统返回错误码——懒解析
     // 加调用失败忽略，等价于安全空操作。
 
-    // 窗口外轮廓圆角。Win11 由 DWM 合成：抗锯齿、与系统投影一致，
-    // 不吃性能；无边框窗口需保持 1px DWM 框架扩展（创建时已加）。
-    // `on` 为 false 时写 DWMWCP_DONOTROUND 恢复方角。Win10 及更早
-    // 系统上属性不存在，调用失败即无操作。
-    static void SetRoundCorners(nint hwnd, bool on) {
+    // DWM 物理写入窗口外轮廓圆角属性。Win11 由 DWM 合成，
+    // 旧系统安全忽略。
+    static void ApplyDwmRound(nint hwnd, bool on) {
         Win32Shell.Init();
         if (hwnd == 0) { return; }
         nint fn = Interop.Entry("dwmapi.dll", "DwmSetWindowAttribute");
@@ -1943,6 +1953,21 @@ class Win32Shell {
         DwmSetWindowAttrFn call = (DwmSetWindowAttrFn)fn;
         call(hwnd, 33, slot, 4);
         NativeMemory.Free(slot);
+    }
+
+    // 窗口外轮廓圆角。Win11 由 DWM 合成：抗锯齿、与系统投影一致，
+    // 不吃性能；无边框窗口需保持 1px DWM 框架扩展（创建时已加）。
+    // `on` 为 false 时写 DWMWCP_DONOTROUND 恢复方角。Win10 及更早
+    // 系统上属性不存在，调用失败即无操作。最大化时自动切回方角，还原时复原。
+    static void SetRoundCorners(nint hwnd, bool on) {
+        if (hwnd == 0) { return; }
+        Win32CaptionConfig cfg = Win32Shell.DpiConfigOf(hwnd);
+        cfg.roundCorner = on;
+        if (Win32Shell.IsMaximized(hwnd)) {
+            Win32Shell.ApplyDwmRound(hwnd, false);
+        } else {
+            Win32Shell.ApplyDwmRound(hwnd, on);
+        }
     }
 
     // 为窗口登记客户区自绘标题按钮数（0..8，越界忽略），
