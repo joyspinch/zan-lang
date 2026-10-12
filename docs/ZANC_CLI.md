@@ -56,15 +56,15 @@ build/zanc src/MyApp.html $(find src -name '*.zan' | sort | tr '\n' ' ') -o app.
 ```bash
 build/zanc --list-targets                 # 查看全部目标（见 §3）
 build/zanc src/main.zan --auto-stdlib --target linux-musl -o app      # musl 静态
-build/zanc src/main.zan --auto-stdlib --target android-arm64 --emit-apk \
-    --apk-package com.example.app --apk-label 我的应用 -o app.apk
+build/zanc src/main.zan --auto-stdlib --target android-arm64 --emit-apk app.apk \
+    --apk-package com.example.app --apk-label 我的应用 -o app.so
 build/zanc src/main.zan --auto-stdlib --target ios-arm64 -o app.ipa
 # 或显式指定参数生成免证书可安装的 iOS IPA：
 build/zanc src/main.zan --auto-stdlib --target ios-arm64 --emit-ipa app.ipa \
     --ipa-bundle-id com.example.app --ipa-name 我的应用
 ```
 
-`--emit-apk` 一条命令完成 编译→打包 SDLActivity 壳→二进制 AXML→签名
+`--emit-apk` 一条命令完成 编译→打包 NativeActivity 壳→二进制 AXML→签名
 （需要 JAVA_HOME 指向 JDK；`--apk-package`/`--apk-label` 定应用 ID 与名称）。
 
 **工程键（zan.proj）在所有构建路径一致生效**：`androidPackage`/
