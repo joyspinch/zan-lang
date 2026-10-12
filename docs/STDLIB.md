@@ -561,7 +561,7 @@ class Enumerable {
 ```
 
 Differences from C# (by design or pending compiler work — see
-`docs/bugs/generics-uniform-repr.md`):
+`docs/archive/bugs/generics-uniform-repr.md`):
 
 - **Eager, not lazy**: every operator runs immediately and returns a `List`;
   there is no `IEnumerable<T>` pipeline.

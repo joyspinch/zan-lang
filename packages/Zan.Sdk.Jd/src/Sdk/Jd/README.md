@@ -186,17 +186,6 @@ tests/conformance/sdk_jd_modules.zan 44 个模块、211 组生成契约的完整
 
 mock 网关会用 `JdSign` 独立重算签名并比对，因此签名一旦写错测试立刻失败。
 
-## 已知限制
-
-两处实现受当前编译器缺陷约束，写法比自然形态绕，改前请先看对应的 bug 记录：
-
-- `ExecuteAsync` 的重试退避不能写在 `catch` 块里——`await` 在 `catch` 内且外层是
-  循环时，第二轮迭代会崩溃（`docs/bugs/await-in-catch-loop.md`），当前把重试
-  决策提到了 `try` 之外。
-- `JdResponse.Parse` 先判定再抛，失败原因经 static 字段传出——`throw` 不释放
-  当前帧里活着的对象（`docs/bugs/throw-leaks-live-locals.md`），直接在持有
-  JsonValue 树时抛会泄漏整棵树。
-
 vendored C# 快照保留了 `IJdUploadRequest` 接口，但 211 个 Request 中没有任何类实现它，
 因此本快照没有可迁移的 multipart 方法；后续升级快照若出现上传 Request，生成器会因未知
 传输形态失败而不是伪装成普通 JSON 接口。

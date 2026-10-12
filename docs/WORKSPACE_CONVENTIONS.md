@@ -209,7 +209,7 @@ cherry-pick / 重写提交 / 并行同修进了 main，只有血缘断了
 
 ### 4. bug 文档状态字段（C6）
 
-`docs/bugs/*.md` 每份在标题下第一行给出统一状态字段：
+`docs/archive/bugs/*.md` 每份在标题下第一行给出统一状态字段：
 
 ```
 **Status:** Fixed (YYYY-MM-DD) — <task ref>；see Resolution / TASKS.md <编号>.

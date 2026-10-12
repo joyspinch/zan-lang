@@ -155,6 +155,7 @@ for %%P in (android-x64:x86_64 android-arm64:aarch64) do (
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_sync.c  -o toolchain\%%A\zanrt_sync.o  || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_file.c  -o toolchain\%%A\zanrt_file.o  || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_timer.c -o toolchain\%%A\zanrt_timer.o || exit /b 1
+    "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -O2 -c %RT%\rt_decimal.c -o toolchain\%%A\zanrt_decimal.o || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -I %RT% -I src\common -O2 -c %RT%\zan_embed_api.c -o toolchain\%%A\zan_embed_api.o || exit /b 1
     "%NDKBIN%\clang.exe" --sysroot="%ANDROID_NDK%\toolchains\llvm\prebuilt\windows-x86_64\sysroot" -target %%B-linux-android28 -g0 -std=c11 -fPIC -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_ZIP_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -I %RT% -I src\common -O2 -c %RT%\zan_inflate.c -o toolchain\%%A\zan_inflate.o || exit /b 1
     echo built toolchain\%%A

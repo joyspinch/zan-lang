@@ -60,15 +60,13 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 | --- | --- |
 | [ENGINE_REDESIGN.md](ENGINE_REDESIGN.md) | 渲染引擎增强 + 游戏引擎重设计（A356 挂账，未实施） |
 | [EVOLUTION_PLAN_CSHARP_ALIGNMENT.md](EVOLUTION_PLAN_CSHARP_ALIGNMENT.md) | 与 C# 对齐并超越的标准库/工具演进路线 |
-| [CHART_COMPATIBILITY_5.md](CHART_COMPATIBILITY_5.md) | Chart 与 ECharts 6.x 官方示例的迁移账本 |
-| [CHART_CODE_GAP_LEDGER.md](CHART_CODE_GAP_LEDGER.md) | Chart 引擎代码级缺口账本（`chart_gap_audit.py` 驱动） |
 
 ## 专项目录
 
 | 目录 | 内容 |
 | --- | --- |
 | [agent-kb/](agent-kb/README.md) | 智能体开发知识库：怎么找到该改的地方、怎么证明改对了、怎么定位根因；含编译器 C 标准（coding-standards.md）与自举（bootstrap.md） |
-| [bugs/](bugs/) | 编译器 bug 复盘（每份带 Status 字段）——stdlib 与各 SDK 包的代码注释按路径引用 |
+| [archive/bugs/](archive/bugs/) | 历史编译器 bug 复盘（已归档） |
 | [projects/zanide/](projects/zanide/STRUCTURE.md) | ZanIDE 项目专属文档（STRUCTURE.md 由 `check_structure.ps1` 强制） |
 | [archive/](archive/) | 历史/过时文档，冻结不随实现更新 |
 
