@@ -55,6 +55,7 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 | 验证——说完要能证 | `zan_compile`（编译一个片段，返回结构化诊断）、`zan_build_project`（编译整个工程） |
 | 控件规格与示例 | `zan_example`（可编译的官方示例，带目录）、`zan_control_schema`（控件 PropSpec 目录：schema + Props/Events 规格） |
 | 文件与检索 | `list_dir` `read_file` `write_file` `edit_file` `search_text` `find_files` `run_command`、`mkdir`/`move_path`/`copy_path`/`delete_path`/`stat_path` |
+| 扩展包生态管理 | `pkg_list_installed`（查看项目已装包）、`pkg_search`（搜官方扩展包池）、`pkg_install`（自愈安装扩展包）、`pkg_info`（扩展包元数据详情） |
 | 索引维护 | `zan_refresh_index`（加过控制器/实体后重建语义索引）、`zan_refresh_knowledge`（重建 gallery） |
 | 技能 | `skills_list`（名字+一行摘要）、`skill_read`（读选中那一个的正文） |
 
@@ -80,8 +81,10 @@ AGENTS.md            AI 在 Zan 项目里必须守的规矩（短，先读它）
 
 | 文件 | 内容 | 谁在用 |
 | --- | --- | --- |
-| `symbols.json` | 标准库全量符号索引（名字/签名/文件：行/摘要） | `zan_api_search`、IDE 助手面板 |
+| `symbols.json` | 标准库全量符号索引（名字/签名/文件：行/摘要） | `zan_api_search`、IDE 助手面板、`zanc --api` |
 | `gallery.json` | 金标示例目录 | `zan_example` |
+| `packages-catalog.json` | 官方扩展包元数据索引（命名空间反查与生态清单） | `pkg_search`、`pkg_install`、IDE 助手 |
+| `examples-catalog.json` | 示例与模板特征索引（代码模式参考） | 示例发现工具、IDE 助手 |
 | `controls.json` | 控件 PropSpec 目录与设计器规格 | `zan_control_schema`、IDE 设计器 |
 
 ## 6. 常见问题

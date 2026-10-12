@@ -27,14 +27,16 @@
 #
 # Usage:  powershell -ExecutionPolicy Bypass -File scripts\publish_ide.ps1
 #         Add  -SkipBuild  to package the existing build\ artifacts as-is.
+#         Add  -NoBump     to suppress auto-bumping patch version.
+#         Add  -OutDir <d> to publish directly to custom path (e.g. D:\Zan).
 
-param([switch]$SkipBuild, [switch]$NoBump)
+param([switch]$SkipBuild, [switch]$NoBump, [string]$OutDir)
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$dist = Join-Path $root 'dist\win-x64'
+$dist = if ($OutDir -and $OutDir.Trim() -ne "") { $OutDir.Trim() } else { Join-Path $root 'dist\win-x64' }
 
 # Every publish is a release, so it gets its own version: the patch component is
 # raised before the build that stamps it into the binaries. -NoBump republishes
@@ -219,7 +221,12 @@ function Find-HostLlvmAr([string]$buildDir) {
             switch ($key) {
                 "LLVM_TOOLS_BINARY_DIR" { $candidates += Join-Path $value "llvm-ar.exe" }
                 "LLVM_DIR" { $candidates += Join-Path $value "../../../bin/llvm-ar.exe" }
-                "CMAKE_C_COMPILER" { $candidates += Join-Path (Split-Path -Parent $value) "llvm-ar.exe" }
+                "CMAKE_C_COMPILER" {
+                    $parent = Split-Path -Parent $value
+                    if ($parent -and $parent.Trim() -ne "") {
+                        $candidates += Join-Path $parent "llvm-ar.exe"
+                    }
+                }
             }
         }
     }
@@ -491,9 +498,13 @@ Contents
                  no external toolchain. Keep this folder intact.
   stdlib\        Standard library sources. zanc auto-includes the .zan files
                  it needs from here; keep this folder next to ZanIDE.exe.
+  packages\      Official extension packages ecosystem (Zan.Data, Zan.Gui.Charts, etc.)
+                 installed into user projects by pkg_install or the AI assistant.
   knowledge\     Offline knowledge base for the built-in assistant:
-                   symbols.json  API index generated from stdlib (api_search)
-                   gallery.json  golden-example catalog (example tool)
+                   symbols.json          API index generated from stdlib (api_search)
+                   gallery.json          golden-example catalog (example tool)
+                   packages-catalog.json Package catalog index (pkg_search/pkg_install)
+                   examples-catalog.json Examples catalog index
                  The assistant queries these instead of grepping the stdlib.
   examples\      Sample programs shown in the IDE's Examples pane (optional).
   templates\     Built-in New Project templates (one folder each, with a
@@ -599,9 +610,13 @@ Zan IDE 自包含发布包
                  IDE 在这里找 zanc，zanc 在自己旁边找链接器 / sysroot / 标准库，
                  生成 .exe 不依赖任何外部工具链。请保持本目录完整。
   stdlib\        标准库源码。zanc 自动按需引入；请与 ZanIDE.exe 放在一起。
+  packages\      官方扩展包生态池（Zan.Data、Zan.Gui.Charts 等）。
+                 由内置 AI 助手或 pkg_install 按需安装至具体项目。
   knowledge\     内置 AI 助手的离线知识库：
-                   symbols.json  由随包 stdlib 生成的 API 索引（api_search 用）
-                   gallery.json  金标示例目录（example 工具用）
+                   symbols.json          由随包 stdlib 生成的 API 索引（api_search 用）
+                   gallery.json          金标示例目录（example 工具用）
+                   packages-catalog.json 扩展包元数据索引（包查找与自动修复用）
+                   examples-catalog.json 官方范例索引（功能参考用）
                  助手查这些索引，而不是去 grep 标准库源码。
   examples\      IDE 示例面板展示的示例程序（可选）。
   templates\     内置"新建项目"模板（每个模板一个目录，含 template.manifest）。
