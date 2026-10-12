@@ -4,7 +4,7 @@
 > 权威源 `_scratch/echarts-master/src/`（v6.1.0，596 个 `.ts`）。
 > 目标 `packages/Zan.Gui.Charts/src/Gui/Component/Chart/*.zan`（35 文件 / 31,759 行）。
 >
-> 本文是 `docs/archive/CHART_COMPATIBILITY_5.md`「迁移账本」的**代码侧补充**：
+> 本文是 `docs/CHART_COMPATIBILITY.md`「迁移账本」的**代码侧补充**：
 > 那份账本按官方示例记进度，本文按引擎代码记缺口。两者冲突时以本文为准，
 > 因为"示例能不能画"是结果，"引擎有没有这段逻辑"才是原因。
 >

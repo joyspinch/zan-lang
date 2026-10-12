@@ -1,6 +1,6 @@
 > **已归档（一次性审计快照，2026-09-10，不再维护）。**
 > 本报告是对 `ready: true` 的 335 个示例做的首次官方渲染全量对照，其结论已并入
-> `docs/archive/CHART_COMPATIBILITY_5.md`（迁移账本）与 `docs/archive/CHART_CODE_GAP_LEDGER.md`
+> `docs/CHART_COMPATIBILITY.md`（迁移账本）与 `docs/archive/CHART_CODE_GAP_LEDGER.md`
 > （代码级对照），两者冲突时以后者为准；下方正文保留为历史审计依据。
 
 # Zan 图表引擎移植完整度审计报告

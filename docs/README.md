@@ -38,6 +38,7 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 | 文档 | 内容 |
 | --- | --- |
 | [STDLIB.md](STDLIB.md) | 标准库总览（含 §3.7 任务/通道/异步 I/O 现状）——写 Zan 代码前先查这里 |
+| [CHART_COMPATIBILITY.md](CHART_COMPATIBILITY.md) | Zan 图表引擎与 ECharts 最新官方标准（6.x）兼容性迁移账本 |
 | [STDLIB_COMPONENT_STANDARDS.md](STDLIB_COMPONENT_STANDARDS.md) | 组件编写标准 + 取色取字样式解析门禁（附录） |
 | [HTML_UI.md](HTML_UI.md) | HTML+CSS 声明式窗口协议 + web 等价布局驱动与 oracle（附录） |
 | [GAME_ENGINE_GUIDE.md](GAME_ENGINE_GUIDE.md) | 游戏引擎使用指南 + 资产管线（附录） |
