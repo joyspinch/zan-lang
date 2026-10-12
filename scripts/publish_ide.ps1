@@ -687,6 +687,25 @@ Set-Content -Path (Join-Path $dist 'README.CN.txt') -Value $readmeCn -Encoding U
 & (Join-Path $root 'scripts\gen_ai_index.ps1') -Dist $dist -Version $version
 if ($LASTEXITCODE -ne 0) { Write-Output "PUBLISH_WARN: llms.txt generation failed (non-fatal)" }
 
+# ---- strip transient build artifacts and dev files from published tree ------
+Write-Output "Sweeping transient and intermediate artifacts from dist ..."
+# 1. Sweep transient build directories (.build, build, _scratch, bin, obj, logs)
+Get-ChildItem -Path $dist -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('.build', 'build', '_scratch', 'bin', 'obj', 'logs', '.git', '.github') } |
+    ForEach-Object {
+        try { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
+# 2. Sweep developer/intermediate files (*.log, *.tmp, *.bak, *.pdb, *.ilk, *.exp, .gitignore, .gitattributes)
+Get-ChildItem -Path $dist -Recurse -File -Force -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -in @('.gitignore', '.gitattributes', '.DS_Store', 'Thumbs.db') -or
+        $_.Extension -in @('.log', '.tmp', '.bak', '.pdb', '.ilk', '.exp')
+    } |
+    ForEach-Object {
+        try { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
 $n = (Get-ChildItem $dist -Recurse -File | Measure-Object).Count
 Write-Output "STAGE_OK -> $dist ($n files)"
 
