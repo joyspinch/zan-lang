@@ -33,6 +33,23 @@ class WebViewHandlerEntry {
     }
 }
 
+// 异步网络响应读取上下文实体
+class WvResponseContext {
+    public int id;
+    public int handle;
+    public string url;
+    public int status;
+    public nint sink;
+
+    public WvResponseContext(int id, int handle, string url, int status, nint sink) {
+        this.id = id;
+        this.handle = handle;
+        this.url = url;
+        this.status = status;
+        this.sink = sink;
+    }
+}
+
 // Edge WebView2，由 Zan 直接驱动。
 // WebView2 是 COM API：除加载器唯一的扁平导出外，其余都是
 // vtable 分发，其异步调用把结果交给调用方实现的
@@ -87,6 +104,8 @@ class WebView2 {
     static nint loader;
     static nint createEnv;
     static bool comReady;
+    static List<WvResponseContext> respContexts;
+    static int nextRespId = 1;
 
     int handle;
     // 本视图独占的宿主子窗口（WebView2 controller 的父窗口）。
@@ -104,6 +123,9 @@ class WebView2 {
     long srcToken;
     long msgToken;
     long winToken;
+    nint respSink;
+    long respToken;
+    public Action<string, int, string> onResourceResponse;
     int navSeq;
     int lastStatus;
     bool loading;
@@ -195,8 +217,12 @@ class WebView2 {
     static int SlotStop() { return 43; }
     // 槽 48：get_DocumentTitle，读取页面标题。
     static int SlotGetDocumentTitle() { return 48; }
-    // ICoreWebView2_2 接口虚函数 get_CookieManager（继承 ICoreWebView2，槽位 66）。
-    static int SlotGetCookieManager() { return 66; }
+    // ICoreWebView2_2 接口虚函数 add_WebResourceResponseReceived（槽位 66）。
+    static int SlotAddWebResourceResponseReceived() { return 66; }
+    // ICoreWebView2_2 接口虚函数 remove_WebResourceResponseReceived（槽位 67）。
+    static int SlotRemoveWebResourceResponseReceived() { return 67; }
+    // ICoreWebView2_2 接口虚函数 get_CookieManager（继承 ICoreWebView2，槽位 71）。
+    static int SlotGetCookieManager() { return 71; }
     // ICoreWebView2_2 的接口 IID，QueryInterface 取 Cookie 管理器时使用。
     static string IidWebView2_2() {
         return "9E8F0CF8-E670-4B5E-B2BC-73E061E3184C";
@@ -470,6 +496,13 @@ class WebView2 {
         winSink = this.Sink((nint)WebView2.OnNewWindowRequested);
         winToken = this.Subscribe(WebView2.SlotAddNewWindow(), winSink);
 
+        nint c2 = Com.Query(core, WebView2.IidWebView2_2());
+        if (c2 != 0) {
+            respSink = this.Sink((nint)WebView2.OnWebResourceResponseReceived);
+            respToken = this.SubscribeCore2(c2, WebView2.SlotAddWebResourceResponseReceived(), respSink);
+            Com.Release(c2);
+        }
+
         this.ApplySettings();
 
         // 应用就绪前由控件排队的几何尺寸和可见性
@@ -523,6 +556,22 @@ class WebView2 {
         // token 是按值传递的结构体；8 字节时它在寄存器中传递，
         // 因此其值就是参数。
         Com.Call1(core, slot, (nint)token);
+        NativeMemory.Free(cell);
+    }
+
+    long SubscribeCore2(nint iface, int slot, nint sink) {
+        nint token = NativeMemory.Alloc(8);
+        new Span<long>(token, 1)[0] = 0;
+        Com.Call2(iface, slot, sink, token);
+        long t = new Span<long>(token, 1)[0];
+        NativeMemory.Free(token);
+        return t;
+    }
+
+    void UnsubscribeCore2(nint iface, int slot, long token) {
+        nint cell = NativeMemory.Alloc(8);
+        new Span<long>(cell, 1)[0] = token;
+        Com.Call1(iface, slot, (nint)token);
         NativeMemory.Free(cell);
     }
 
@@ -679,6 +728,101 @@ class WebView2 {
             if (uri != "") { w.pendingWindowNav = uri; }
         }
         return 0;
+    }
+
+    // 网络响应到达回调（COM）：当 HTTP 请求完成时由内核直接触发
+    static int OnWebResourceResponseReceived(nint self, nint sender, nint args) {
+        WebView2 w = WebView2.Get(ComVtbl.State(self));
+        if (w == null || args == 0) { return 0; }
+        nint req = Com.Get(args, 3);
+        if (req == 0) { return 0; }
+        string url = Com.GetString(req, 3);
+        Com.Release(req);
+
+        nint resp = Com.Get(args, 4);
+        if (resp == 0) { return 0; }
+        int statusCode = Com.GetInt(resp, 4);
+
+        if (statusCode == 200 && WebView2.IsTargetResponseUrl(url)) {
+            if (WebView2.respContexts == null) {
+                WebView2.respContexts = new List<WvResponseContext>();
+            }
+            int ctxId = WebView2.nextRespId;
+            WebView2.nextRespId = WebView2.nextRespId + 1;
+
+            ComVtbl v = ComVtbl.Create(4);
+            v.Add((nint)WebView2.OnQueryInterface);
+            v.Add((nint)WebView2.OnAddRef);
+            v.Add((nint)WebView2.OnRelease);
+            v.Add((nint)WebView2.OnGetContentCompleted);
+            nint contentSink = v.Build();
+            v.SetState(ctxId);
+
+            WvResponseContext ctx = new WvResponseContext(ctxId, w.handle, url, statusCode, contentSink);
+            WebView2.respContexts.Add(ctx);
+
+            // 槽位 6: GetContent(handler)
+            Com.Call1(resp, 6, contentSink);
+        }
+        Com.Release(resp);
+        return 0;
+    }
+
+    // 读取响应流完成回调（COM）：从 IStream 提取正文并派发给宿主
+    static int OnGetContentCompleted(nint self, int hr, nint stream) {
+        int ctxId = ComVtbl.State(self);
+        WvResponseContext ctx = null;
+        if (WebView2.respContexts != null) {
+            for (int i = 0; i < WebView2.respContexts.Count; i = i + 1) {
+                if (WebView2.respContexts[i].id == ctxId) {
+                    ctx = WebView2.respContexts[i];
+                    WebView2.respContexts.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        if (ctx == null) { return 0; }
+
+        string body = "";
+        if (Com.Ok(hr) && stream != 0) {
+            nint buf = NativeMemory.Alloc(4096);
+            nint pRead = NativeMemory.Alloc(4);
+            StringBuilder sb = new StringBuilder();
+            while (true) {
+                new Span<int>(pRead, 1)[0] = 0;
+                int rhr = Com.Call3(stream, 3, buf, (nint)4096, pRead);
+                int read = new Span<int>(pRead, 1)[0];
+                if (read <= 0 || !Com.Ok(rhr)) { break; }
+                sb.Append(NativeMemory.GetString(buf, 0, read));
+            }
+            NativeMemory.Free(buf);
+            NativeMemory.Free(pRead);
+            body = sb.ToString();
+        }
+
+        WebView2 w = WebView2.Get(ctx.handle);
+        if (w != null) {
+            w.DispatchResourceResponse(ctx.url, ctx.status, body);
+        }
+        return 0;
+    }
+
+    void DispatchResourceResponse(string url, int status, string body) {
+        if (this.onResourceResponse != null) {
+            this.onResourceResponse(url, status, body);
+        }
+    }
+
+    static bool IsTargetResponseUrl(string url) {
+        if (url == null || url == "") { return false; }
+        return url.IndexOf("jdy.resource.shop.info.get") >= 0 ||
+            url.IndexOf("member/checkAccess.json") >= 0 ||
+            url.IndexOf("supplierHome/accountInfo") >= 0 ||
+            url.IndexOf("supplier/queryCurrent") >= 0 ||
+            url.IndexOf("supplier/listAllSub") >= 0 ||
+            url.IndexOf("secondSuppliers") >= 0 ||
+            url.IndexOf("gw/brand/api/v1/account/me") >= 0 ||
+            url.IndexOf("loginmyseller.taobao.com") >= 0;
     }
 
     // AddScriptToExecuteOnDocumentCreated 完成回调（COM）：记下脚本 id
@@ -1452,6 +1596,14 @@ class WebView2 {
             this.Unsubscribe(WebView2.SlotRemoveSourceChanged(), srcToken);
             this.Unsubscribe(WebView2.SlotRemoveWebMessage(), msgToken);
             this.Unsubscribe(WebView2.SlotRemoveNewWindow(), winToken);
+            if (respToken != 0) {
+                nint c2 = Com.Query(core, WebView2.IidWebView2_2());
+                if (c2 != 0) {
+                    this.UnsubscribeCore2(c2, WebView2.SlotRemoveWebResourceResponseReceived(), respToken);
+                    Com.Release(c2);
+                }
+                respToken = 0;
+            }
             Com.Release(core);
             core = 0;
         }
