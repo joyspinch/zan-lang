@@ -1,0 +1,54 @@
+# 火绒安全软件 - 现代桌面原生 GUI 演示程序 (HTML + CSS + Zan Code-behind)
+
+本示例参照现代安全桌面软件（火绒安全 6.0 风格）高保真开发，展示了 Zan 语言在开发**平台级现代桌面软件（Dashboard 体系）**时的核心范式与最佳实践：
+- **HTML 声明式无边框窗口**（`data-win-chrome="false"`、自定义标题栏与视口排版）；
+- **Tabler 矢量 SVG 图标集成**（无需切图，直采 `icon="..."` 具名矢量字形）；
+- **多页面声明与响应式路由**（左侧垂直窄导航 + 5 大功能视图无缝切页）；
+- **零胶水 Code-behind 业务绑定**（基于 `form.On` 与强类型 partial 类，彻底告别手写窗口与绝对坐标）。
+
+---
+
+## 五大页面模块
+
+1. **首页 (Home)**：
+   - 运行天数与状态大标题（“已保护 399 天”、“火绒正在保护您的电脑”）；
+   - 品牌橙色分体式查杀主按钮（“快速查杀 ∨”）；
+   - 2.5D 科技感防护核心卡片；
+   - 底部 4 大快捷操作圆形入口（检查更新、安全日志、信任区、隔离区）与版本库信息。
+
+2. **防护中心 (Protection Center)**：
+   - 二级分类卡片（病毒防护、系统防护、网络防护）；
+   - 7 项核心防护项列表，配备矢量图标、品牌橙色 Switch 交互开关及配置入口。
+
+3. **访问控制 (Access Control)**：
+   - 2 列等宽卡片网格；
+   - 涵盖上网时段控制、网站内容控制、程序执行控制、USB 设备控制、IP 协议控制、IP 黑名单及未开启胶囊徽章。
+
+4. **安全工具 (Security Tools)**：
+   - 常用工具（虚线拖拽放置区域）；
+   - 系统工具网格（漏洞修复、系统修复、弹窗拦截、垃圾清理、启动项管理、文件粉碎等）；
+   - 网络工具区块。
+
+5. **安全设置 (Settings)**：
+   - 常规设置 / 病毒防护 / 系统防护 / 网络防护多级树状导航；
+   - 快捷操作复选框组（带文字标签）；
+   - 密码保护、游戏模式开关；
+   - 色彩模式单选组（明亮模式、暗黑模式、跟随系统）。
+
+---
+
+## 运行与验证
+
+### 1. 编译并启动
+```bash
+build\zanc.exe examples/security_guard/src/App.html examples/security_guard/src/App.zan --auto-stdlib -o _scratch/security_guard.exe
+_scratch\security_guard.exe
+```
+
+### 2. 自动化无头驱动验证 (UiDriver)
+利用 Zan 原生 UI 自动化驱动器输出各页面的控件树、命中区域与像素快照：
+```bash
+$env:ZAN_UI_SCRIPT = "examples/security_guard/scripts/test_driver.txt"
+$env:ZAN_UI_OUT = "_scratch/sec_out"
+_scratch\security_guard.exe
+```
