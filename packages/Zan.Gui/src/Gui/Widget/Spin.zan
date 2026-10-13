@@ -99,34 +99,61 @@ class Spin : Control {
         // 矩形，环若顶满 box，最上/最下的圆点会被切掉半边。
         int radius = box / 2 - dotR - app.Scale(1);
         if (radius < 1) { radius = 1; }
-        // 墙钟相位（每 90ms 一步），使旋转速度固定，
-        // 与页面实际重绘频率无关。
-        int active = (Window.GetTickMs() / 90) % 8;
+        // 保持 720ms 一圈；相邻圆点连续交接高光与头部半径，
+        // 避免高刷新率页面每 90ms 才看到一次颜色跳变。
+        int phase = Spin.DotPhase(Window.GetTickMs());
         for (int i = 0; i < 8; i = i + 1) {
             int px = cx + PivotSafeMul(Spin.OffX(i), radius);
             int py = cy + PivotSafeMul(Spin.OffY(i), radius);
-            int d = (active - i + 8) % 8;
-            int dc = rest;
-            int dr = dotR;
-            switch (d) {
-                case 0: dc = accent; dr = dotR + app.Scale(1); break;
-                case 1: dc = accent; break;
-                case 2: dc = tailStyle.FgOr(0); break;
-                case 3: dc = ringStyle.FgOr(0); break;
-                default: break;
-            }
-            c.FillCircle(px, py, dr, dc);
+            int d = (phase / 1000 - i + 8) % 8;
+            int dc = App.LerpColor(Spin.DotTone(d, accent, tailStyle.FgOr(0),
+                                               ringStyle.FgOr(0), rest),
+                                   Spin.DotTone((d + 1) % 8, accent, tailStyle.FgOr(0),
+                                               ringStyle.FgOr(0), rest), phase % 1000);
+            Spin.PaintDot(c, px, py, dotR, app.Scale(1), dc,
+                          Spin.DotLevel(phase, i, 0));
         }
         // 仅当指示器真正在屏幕上时才保持页面重绘。
         // 屏幕外的指示器（如随长页面滚出视野）
         // 不得驱动重绘，否则会空转动画占满 CPU。
-        // 可见时将帧率限制到约 11fps，而不是 60fps 忙循环。
+        // 可见时按宿主显示刷新率调度，隐藏后停止续订。
         if (Spin.OnScreen(app, cx, cy, radius)) {
             int span = radius + dotR + app.Scale(2);
-            app.RequestAnimationFrameIn(90, cx - span, cy - span, span * 2, span * 2);
+            app.RequestAnimationFrameIn(cx - span, cy - span, span * 2, span * 2);
         }
     }
 
+    // 相位以圆点间隔的千分比表示；取模也容纳单调毫秒钟的整数回绕。
+    static int DotPhase(int nowMs) {
+        int elapsed = nowMs % 720;
+        if (elapsed < 0) { elapsed = elapsed + 720; }
+        return elapsed * 1000 / 90;
+    }
+
+    // 头部与其后 trail 个圆点的高光权重（0..1000），供加载指示复用。
+    static int DotLevel(int phase, int dot, int trail) {
+        int d = (phase / 1000 - dot + 8) % 8;
+        int from = d <= trail ? 1000 : 0;
+        int to = (d + 1) % 8 <= trail ? 1000 : 0;
+        return App.Lerp(from, to, phase % 1000);
+    }
+
+    // 整数半径会让 1px 的头部增量在插值期间全部舍掉；通过外圈
+    // 覆盖率交接保留连续视觉变化，再补内圈使圆点中心亮度不受影响。
+    static void PaintDot(Canvas canvas, int x, int y, int radius, int growth,
+                         int color, int head) {
+        if (head > 0 && growth > 0) {
+            canvas.FillCircle(x, y, radius + growth, App.ScaleAlpha(color, head));
+        }
+        canvas.FillCircle(x, y, radius, color);
+    }
+
+    static int DotTone(int distance, int accent, int tail, int ring, int rest) {
+        if (distance <= 1) { return accent; }
+        if (distance == 2) { return tail; }
+        if (distance == 3) { return ring; }
+        return rest;
+    }
 
     // 8 个单位圆偏移（x1000），每 45 度一步，从顶部开始。
     static int OffX(int i) {
