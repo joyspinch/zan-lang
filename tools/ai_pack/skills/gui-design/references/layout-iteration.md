@@ -110,3 +110,12 @@
   组件为什么要创造"= 该下沉进组件库的东西漏在了应用层；听到这类反馈，
   返工方向是下沉，不是继续在原地打补丁。
 - 不给应用加用户没要的配置面（单皮肤应用不挂皮肤选择器）。
+
+## 滚动容器与动态模板列表（实战血泪经验）
+
+- **滚动条独立走廊（Overlay Scrollbar Gutter 规则）**：GUI 的滚动条为内嵌悬浮绘制（位于容器右侧内边缘 `x + w - bw - inset`）。所有声明了 `overflow-y: auto` 或 `scroll` 的列表/网格容器，**必须显式在 CSS 中预留至少 14~16px 的 `padding-right`**（如 `.items-list { overflow-y: auto; padding-right: 16px; }`）作为滑块专属走廊，严禁内容贴到容器右边缘。
+  - **踩过的坑**：未预留 padding-right 或仅给 6px（小于滑块宽 8px + 边距 2px），卡片右边框、尾部开关、配置齿轮以及顶部的“编辑”按钮会被滚动条半透明滑块直接盖在上面，引发用户严重差评（"滚动条怎么可以在列表里面"）。
+- **动态创建控件的 HTML 作用域样式继承（Scoped CSS 穿透）**：HTML 设计稿编译期会对 `<style>` 样式补充文档作用域类（如 `.card.zs-app`）。当后台 Zan 代码使用 `new Element()` 动态创建模板行（如 `CreateProtectRow`）并挂入 DOM 时，容器必须在 `Adopt`（`AddKid`）阶段将父级的 `zs-*` 作用域类自动下传注入给动态子节点整棵子树。
+  - **踩过的坑**：动态创建的节点缺少作用域类，导致 `.protect-row-card.zs-app` 等 CSS 规则完全无法命中，直接回退到无样式的 `display: block`。这导致原本 Flex 水平横排的图标、文字、开关垂直向下堆叠，文字在 54px 的固定行高内被挤出容器外不可见，表现为"文字丢失、组件乱跳"的灵异现象。
+- **`overflow: hidden` 严禁伪装为滚动容器**：`overflow: hidden`（mode 1）不是滚动容器。主轴溢出计算时，只有 `overflow: auto/scroll`（mode >= 2）才保持自然尺寸供滚动；`overflow: hidden` 容器的子元素必须按 `flex-shrink` 正常收缩适配视口。否则父级高度无法正确约束子列表，导致外层全屏泄露全高滚动条。
+
