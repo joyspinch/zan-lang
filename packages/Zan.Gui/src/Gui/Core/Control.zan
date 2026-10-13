@@ -1270,6 +1270,54 @@ class Control {
         if (c.parent != null) { c.parent.Remove(c); }
         c.parent = this;
         c.SpreadHostForm(this.HostForm());
+        this.SpreadScopeTo(c);
+    }
+
+    // 提取作用域类（HTML scoping 约定的 `zs-*` 类标记）：
+    // 若本节点（或祖先链）携带有 `zs-*` 作用域，子树被收养时自动继承。
+    string ScopeClass() {
+        Control cur = this;
+        while (cur != null) {
+            if (cur.Class != "") {
+                List<string> parts = Style.Classes(cur.Class);
+                for (int i = 0; i < parts.Count; i = i + 1) {
+                    string p = parts[i];
+                    if (p.Length >= 3 && p[0] == 122 && p[1] == 115 && p[2] == 45) {
+                        return p;
+                    }
+                }
+            }
+            cur = cur.parent;
+        }
+        return "";
+    }
+
+    void SpreadScopeTo(Control c) {
+        if (c == null) { return; }
+        string zs = this.ScopeClass();
+        if (zs == "") { return; }
+        c.InheritScope(zs);
+    }
+
+    void InheritScope(string zs) {
+        if (this.Class != "" && Style.Has(this.Class, zs)) { return; }
+        bool hasOtherScope = false;
+        if (this.Class != "") {
+            List<string> parts = Style.Classes(this.Class);
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                string p = parts[i];
+                if (p.Length >= 3 && p[0] == 122 && p[1] == 115 && p[2] == 45) {
+                    hasOtherScope = true;
+                    break;
+                }
+            }
+        }
+        if (!hasOtherScope) {
+            this.AddClass(zs);
+        }
+        for (int i = 0; i < children.Count; i = i + 1) {
+            children[i].InheritScope(zs);
+        }
     }
 
     // 本节点所在的窗口，尚未挂到任何窗口下时为 null。
@@ -2631,6 +2679,7 @@ class Control {
         int right = 0;
         for (int i = 0; i < children.Count; i = i + 1) {
             Control c = children[i];
+            if (!c.StyleVisible() || c.designFloat) { continue; }
             int b = c.by + c.bh;
             if (b > bottom) { bottom = b; }
             int r = c.bx + c.bw;
@@ -3357,11 +3406,11 @@ class Control {
             }
             if (free < 0) { free = 0; }
         } else if (free < 0 && used > 0) {
-            // 溢出的一行：当容器为主轴滚动容器（overflow-x/y != 0）时，
+            // 溢出的一行：当容器为主轴滚动容器（overflow-x/y >= 2 即 auto/scroll）时，
             // 子项不应被强制收缩压扁，而应保持自然尺寸溢出供滚动；
-            // 只有非滚动容器才按比例收缩（flex-shrink 默认 1）。
+            // 只有非滚动或 overflow:hidden 容器才按比例收缩（flex-shrink 默认 1）。
             // 声明了 `flex-shrink: 0` 的子项保持自身尺寸不参与。
-            bool canScrollMain = row ? (this.StyleOverflowX() != 0) : (this.StyleOverflowY() != 0);
+            bool canScrollMain = row ? (this.StyleOverflowX() >= 2) : (this.StyleOverflowY() >= 2);
             if (!canScrollMain) {
                 int marTotal = 0;
                 int fixedMain = 0;
@@ -3961,12 +4010,14 @@ class Control {
             int pby2 = by + computedStyle.BorderTopPx();
             int pbh2 = bh - computedStyle.BorderTopPx()
                 - computedStyle.BorderBottomPx();
-            int off = this.scroll.Bar(app, bx, pby2, bw, pbh2,
-                                      this.scrollY, this.scrollExtent,
-                                      oyMode);
-            if (off != this.scrollY) {
-                this.scrollY = off;
-                app.NoteScrollDamage(bx, by, bw, bh);
+            if (oyMode >= 2) {
+                int off = this.scroll.Bar(app, bx, pby2, bw, pbh2,
+                                          this.scrollY, this.scrollExtent,
+                                          oyMode);
+                if (off != this.scrollY) {
+                    this.scrollY = off;
+                    app.NoteScrollDamage(bx, by, bw, bh);
+                }
             }
             if (oxMode >= 2) {
                 int pbx2 = bx + computedStyle.BorderLeftPx();
