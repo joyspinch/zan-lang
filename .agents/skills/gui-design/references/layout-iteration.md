@@ -118,4 +118,6 @@
 - **动态创建控件的 HTML 作用域样式继承（Scoped CSS 穿透）**：HTML 设计稿编译期会对 `<style>` 样式补充文档作用域类（如 `.card.zs-app`）。当后台 Zan 代码使用 `new Element()` 动态创建模板行（如 `CreateProtectRow`）并挂入 DOM 时，容器必须在 `Adopt`（`AddKid`）阶段将父级的 `zs-*` 作用域类自动下传注入给动态子节点整棵子树。
   - **踩过的坑**：动态创建的节点缺少作用域类，导致 `.protect-row-card.zs-app` 等 CSS 规则完全无法命中，直接回退到无样式的 `display: block`。这导致原本 Flex 水平横排的图标、文字、开关垂直向下堆叠，文字在 54px 的固定行高内被挤出容器外不可见，表现为"文字丢失、组件乱跳"的灵异现象。
 - **`overflow: hidden` 严禁伪装为滚动容器**：`overflow: hidden`（mode 1）不是滚动容器。主轴溢出计算时，只有 `overflow: auto/scroll`（mode >= 2）才保持自然尺寸供滚动；`overflow: hidden` 容器的子元素必须按 `flex-shrink` 正常收缩适配视口。否则父级高度无法正确约束子列表，导致外层全屏泄露全高滚动条。
+- **保留模式滚动平移（ShiftTree）必须连带平移行内文本坐标（elRuns）**：GUI 滚动容器（`UpdateScroll`）在 `Arrange` 尾段对整棵子树下发 `ShiftTree(dx, dy)`，平移所有后代控件的 `bx/by` 绝对坐标。`Element` 派生类接管了行内文本流（`elRuns`），记录了行盒绝对定位坐标 `(r.x, r.topY)`。`ShiftTree` 必须为虚方法且 `Element` 必须重写 `ShiftTree` 联动平移 `elRuns` 中所有文本 run 的 `x` 与 `topY`。
+  - **踩过的坑**：若 `ShiftTree` 未重写平移 `elRuns`，容器滚动时卡片与普通控件外框下移/上移，而卡片内的文本 run 仍留在原始未滚动绝对坐标。随后外框的 `PushClip` 裁剪矩形移走，文本直接被裁掉或脱离卡片位置，表现为“向下滚动了，组件没变，组件里面的内容跑了……”。
 
