@@ -446,5 +446,23 @@ STANDARDS.md §6.7）。
      - 左侧面板必须提供组件工具库（Palette）与大纲树（Outline）双 Tab 视图。大纲树以整棵设计文档树为蓝本递归渲染层级结构，节点显式标注控件类型、变量名、停靠方式（`[Top]` / `[Fill]` 等）以及容器/锁定标识。
      - 大纲树节点与画布/检查器保持绝对实时双向同步：单击树节点立即激活对应组件的选中包围框、句柄与属性检查器焦点，右键呼出同构上下文菜单，并提供同级上下微调、一键锁定与折叠展开工具条，彻底消除界面元素“看得见选不中、选得中挪不了”的死角。
 
+20. **高保真桌面软件现代动效与交互架构规范（自主帧循环、数据驱动 SVG 动效、三态拖拽落区与克制美学）**：
+   - **自主动画帧循环驱动契约（Autonomous Frame Loop Driving）**：
+     - *踩坑*：在 Zan HTML 窗口开发中，使用 `form.Every(ms, cb)` 绑定的定时动画在没有鼠标移动时会停止刷新（窗口卡死在当前帧，必须持续晃动鼠标才刷一帧）。
+     - *根因*：Win32 事件循环 `TakeDueFrame` 依赖 `RequestWakeIn` 结合系统定时器，Win32 定时器存在微小提前触发抖动，未到达 due 且 `animNextMs < 0` 时未置 `needsRedraw = true`，导致窗口进入深休眠。
+     - *规范*：在动画回调（`OnTimerAnimation` / `OnFrameAnimation`）中必须主动调用 `app.RequestAnimationFrame(intervalMs)`（例如 40ms 对应 25 FPS），持续为 `animNextMs` 赋正值，由帧循环自主驱动下一次重绘，彻底解耦鼠标运动。
+   - **纯数据驱动动态矢量 SVG（Data-driven Dynamic SVG Data URI）**：
+     - *踩坑*：雷达旋转扫描、同心光晕呼吸、跑马灯流动虚线等复杂动效，若通过频繁操作 DOM 树会引发重排抖动；若手写自绘控件则违反 ZanIDE/HTML 窗口的“禁止自绘”纪律。
+     - *规范*：在 HTML 中放置 `<img id="..." class="..." />`，后端通过纯函数 `BuildDynamicSvg(tick, ...)` 生成 `data:image/svg+xml;utf8,<svg ...>...</svg>`，通过 `img.Src.Set(...)` 极速更新。计算纯在数学层面（`stroke-dashoffset`、坐标矩阵、透明度），零布局重排、零自绘违反，画质矢量保真且帧率极高。
+   - **桌面端拖拽三态反馈模型（Three-State Dropzone & Avatar Drag Feedback）**：
+     - *踩坑*：卡片拖拽若仅靠静态提示或等待 drop 事件，用户无法感知卡片是否已被抓取、当前悬停在何处、落区是否就绪。
+     - *规范*：建立三态落区模型（静止态、拖拽进行中流动虚线跑马灯态、落区悬停吸附高亮态） + 悬浮跟随 Avatar（绝对定位，在 `FrameHook` 中每帧读取 `app.mouseX, app.mouseY` 更新坐标） + 释放吸附交互。
+   - **界面美学克制与品牌主视觉对齐（Anti-Cyberpunk Overfitting）**：
+     - *踩坑*：AI 开发安全卫士/系统工具时，容易臆想出密密麻麻的 PCB 微电路、芯片针脚、暗黑赛博朋克风，破坏桌面产品的现代清爽扁平/微立体质感。
+     - *规范*：严格遵循 `gui-design` 规范：纯白卡片底色（`#ffffff`）、极细边缘（`#eaedf2`）、品牌主色（如火绒橙 `#F58220`）、微透明柔和光晕与 2.5D 切面金盾，克制配色与呼吸节奏。
+   - **HTML + Code-behind 编译输入顺序硬契约**：
+     - *规范*：执行 `zanc` 编译时，HTML 文件必须作为命令行首个输入参数（例如 `zanc.exe App.html App.zan --auto-stdlib -o app.exe`），由编译器从首个设计文档合成 Form 宿主与入口。
+
+
 
 
