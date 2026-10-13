@@ -345,6 +345,10 @@ STANDARDS.md §6.7）。
       - 窗口声明 `data-win-chrome="false"`，顶栏自定义按钮（`icon="minus"`, `icon="square"`, `icon="x"`），后台 `OnLoad` 订阅后直接调用 `__form.Minimize()`、`__form.ToggleMaximize()`、`__form.Close()`。
     - **Switch 自定义品牌色**：
       - `Switch.CheckedColor` 可直接赋予 ARGB 颜色（如 `unchecked((int)0xFFF58220)` 品牌橙），或在 CSS `:root` 中声明 `--primary`。
+    - **现代安全软件/Dashboard 视觉精细化排版定式**：
+      - *配色规范与纯净底色*：主视口采用纯白（`#ffffff`）或轻灰（`#fafbfc`），卡片边框采用柔和冷灰（`#eaedf2`），悬停时切换为微透品牌色边框（`#ffd8b3`）与淡阴影（`rgba(245, 130, 32, 0.08)`）；操作图标使用统一中性灰（`#5c6472`），避免杂色。
+      - *字阶与对齐约束*：模块大标题采用 20px / 600 字重，副标题采用 13px / 400（字色 `#7e8794`，行高 1.5）；卡片项标题统一 14px / 600，描述文本采用 12px（行高 1.4~1.5）。
+      - *间距与内边距档位*：视口外边距统一 40px，列表行卡片内边距统一 12px 18px，圆角统一 10px（大卡片 16~18px）；按钮/图标统一居中热区（36px~44px），消除几何错位与排版杂乱。
 
 
 10. **声明式具名插槽路由与双向绑定修饰符规范（`slot` 与 `v-model.lazy/.number/.trim`）**：
