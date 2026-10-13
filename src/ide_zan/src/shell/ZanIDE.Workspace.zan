@@ -318,6 +318,44 @@ partial class ZanIDE {
         return dir;
     }
 
+    static string ReplaceAttrValue(string text, string attr, string newVal) {
+        string key = attr + "=\"";
+        int idx = text.IndexOf(key);
+        if (idx < 0) { return text; }
+        int valStart = idx + key.Length;
+        int valEnd = text.IndexOf("\"", valStart);
+        if (valEnd < 0) { return text; }
+        return text.Substring(0, valStart) + newVal + text.Substring(valEnd, text.Length - valEnd);
+    }
+
+    static string RetargetHtmlDoc(string html, int devW, int devH, string devId) {
+        if (!ZanIDE.IsHtmlDesignBody(html)) { return html; }
+        string res = html;
+        if (res.IndexOf("data-win-w=\"") >= 0) {
+            res = ZanIDE.ReplaceAttrValue(res, "data-win-w", Convert.ToString(devW));
+        } else if (res.IndexOf("data-zan-design") >= 0) {
+            int p = res.IndexOf("data-zan-design") + 15;
+            res = res.Substring(0, p) + " data-win-w=\"" + Convert.ToString(devW) + "\"" + res.Substring(p, res.Length - p);
+        }
+
+        if (res.IndexOf("data-win-h=\"") >= 0) {
+            res = ZanIDE.ReplaceAttrValue(res, "data-win-h", Convert.ToString(devH));
+        } else if (res.IndexOf("data-zan-design") >= 0) {
+            int p = res.IndexOf("data-zan-design") + 15;
+            res = res.Substring(0, p) + " data-win-h=\"" + Convert.ToString(devH) + "\"" + res.Substring(p, res.Length - p);
+        }
+
+        if (devId != "") {
+            if (res.IndexOf("data-dev-id=\"") >= 0) {
+                res = ZanIDE.ReplaceAttrValue(res, "data-dev-id", devId);
+            } else if (res.IndexOf("data-zan-design") >= 0) {
+                int p = res.IndexOf("data-zan-design") + 15;
+                res = res.Substring(0, p) + " data-dev-id=\"" + devId + "\"" + res.Substring(p, res.Length - p);
+            }
+        }
+        return res;
+    }
+
     static void RetargetForms(string srcDir, int devW, int devH, List<string> log) {
         ZanIDE.RetargetForms(srcDir, devW, devH, "", log);
     }
@@ -328,16 +366,15 @@ partial class ZanIDE {
             PathFilter.Only(".html"));
         for (int i = 0; i < files.Count; i = i + 1) {
             string fp = files[i];
-            // 逐文件守卫：模板 src/ 里的一份坏设计文档（截断/手改的 JSON，
-            // 或目标文件被占用/只读）不能把整个"新建项目"炸成进程闪退——
-            // 记日志跳过，其余文件继续。这条链在 WizardHost 的子窗口泵里
-            // 运行，不走主框架的每帧 catch。
             try {
-                JsonValue d = JsonValue.Parse(File.ReadAllText(fp));
-                if (!Designer.RetargetDoc(d, devW, devH, devId)) { continue; }
-                File.WriteAllText(fp, d.PrettyToJson() + "\n");
-                log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
-                    + Convert.ToString(devH) + " (" + devId + "): " + fp);
+                string orig = File.ReadAllText(fp);
+                if (!ZanIDE.IsHtmlDesignBody(orig)) { continue; }
+                string updated = ZanIDE.RetargetHtmlDoc(orig, devW, devH, devId);
+                if (updated != orig) {
+                    File.WriteAllText(fp, updated);
+                    log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
+                        + Convert.ToString(devH) + " (" + devId + "): " + fp);
+                }
             } catch (Exception e) {
                 log.Add(ZanIDE.T("> Skipped unreadable design file: " + fp
                         + " (" + e.Message + ")",
@@ -525,17 +562,31 @@ partial class ZanIDE {
     }
 
 
-    static int FileKindLua() { return 5; }
+    static int FileKindProgram() { return 0; }
 
-    static int FileKindForm() { return 6; }
+    static int FileKindClass() { return 1; }
 
-    static int FileKindFreeForm() { return 7; }
+    static int FileKindInterface() { return 2; }
 
-    static int FileKindScene() { return 8; }
+    static int FileKindForm() { return 3; }
 
-    static int FileKindFolder() { return 9; }
+    static int FileKindFreeForm() { return 4; }
+
+    static int FileKindScene() { return 5; }
+
+    static int FileKindLua() { return 6; }
+
+    static int FileKindEmpty() { return 7; }
+
+    static int FileKindFolder() { return 8; }
 
     static bool FileKindDeclaresType(int kind) {
+        return kind == ZanIDE.FileKindForm()
+            || kind == ZanIDE.FileKindFreeForm()
+            || kind == ZanIDE.FileKindScene();
+    }
+
+    static bool FileKindNeedsSize(int kind) {
         return kind == ZanIDE.FileKindForm()
             || kind == ZanIDE.FileKindFreeForm()
             || kind == ZanIDE.FileKindScene();
@@ -692,36 +743,13 @@ partial class ZanIDE {
 
 
     static string FileTemplateBody(int kind, string name) {
-        if (kind == 0) {
+        if (kind == ZanIDE.FileKindProgram()) {
             return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
         }
-        if (kind == 1) {
+        if (kind == ZanIDE.FileKindClass()) {
             return "using System;\n\nclass " + name + " {\n    // fields and methods\n}\n";
         }
-        if (kind == 2) {
-            return "using System;\n"
-                 + "using Gui;\n"
-                 + "using Gui.Widget;\n\n"
-                 + "class Program {\n"
-                 + "    static void Main() {\n"
-                 + "        Form form = Form.Create(\"" + name + "\", 800, 600);\n\n"
-                 + "        // Controls go into a container, the container into the\n"
-                 + "        // window; Panel.Column() stacks its children top to bottom.\n"
-                 + "        Panel root = Panel.Column();\n"
-                 + "        root.With(new Label(\"" + name + "\"));\n"
-                 + "        Input who = new Input(\"你的名字\");\n"
-                 + "        root.With(who);\n"
-                 + "        Button hi = new Button(\"打个招呼\");\n"
-                 + "        hi.Click += () => {\n"
-                 + "            Layer.Notify(\"你好，\" + who.GetText() + \"！\", 3);\n"
-                 + "        };\n"
-                 + "        root.With(hi);\n\n"
-                 + "        form.Add(root);\n"
-                 + "        form.Run();\n"
-                 + "    }\n"
-                 + "}\n";
-        }
-        if (kind == 3) {
+        if (kind == ZanIDE.FileKindInterface()) {
             return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
         }
         return "";
