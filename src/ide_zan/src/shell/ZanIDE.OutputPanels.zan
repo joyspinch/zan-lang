@@ -1,0 +1,193 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Text;
+using System.Collections.Generic;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+using Gui.Backend;
+
+partial class ZanIDE {
+    List<DiagnosticRecord> BuildErrors() {
+        if (errCache == null) { errCache = new List<DiagnosticRecord>(); }
+        return errCache;
+    }
+
+
+    void RenderOutputPanels(App app, Rect orr) {
+        Theme t = app.theme;
+            // 「帮助与反馈」：本地聚合的错误 + 复制/导出。它和错误面板并列
+            // 在底部，但收的是全部来源（含界面层异常与程序崩溃），不只是
+            // 这一次编译的诊断。
+            Rect errRect = dock.ContentParked("errors");
+            List<DiagnosticRecord> errors = this.BuildErrors();
+            string errTitle = ZanIDE.T("Errors", "错误");
+            if (errors.Count > 0) {
+                errTitle = errTitle + " (" + Convert.ToString(errors.Count) + ")";
+            }
+            if (errTitle != dockErrorsTitle) {
+                dock.SetTitle("errors", errTitle);
+                dockErrorsTitle = errTitle;
+            }
+            app.BeginIdScope(700000);
+            errorsPanel.Render(app, errRect, errors);
+            app.EndIdScope();
+            if (!coCtxOpen) {
+                DiagnosticRecord efr = errorsPanel.TakeFix();
+                if (efr != null) {
+                    ZanIDE.AddUsing(editor, tabs, activeTab,
+                        errorsPanel.FixNs(efr), log);
+                    app.RequestRedraw();
+                }
+                DiagnosticRecord ejr = errorsPanel.TakeJump();
+                if (ejr != null) {
+                    int ejl = ZanIDE.ParseInt(ejr.line);
+                    // 双击一条诊断要能落到出错那一行，哪怕它所在的文件
+                    // 还没打开：先按诊断里的路径开出标签页，只有路径压
+                    // 根定位不到（无位置的诊断、被截断的路径）才退回到
+                    // 按文件名找已打开的标签页。
+                    string ejp = ZanIDE.ResolveDiagPath(root, ejr.path);
+                    int ejt = 0 - 1;
+                    if (ejp != "") {
+                        ZanIDE.OpenPath(tabs, activeTab, ejp,
+                            Path.GetFileName(ejp));
+                        ejt = activeTab.Get();
+                    } else {
+                        ejt = ZanIDE.FindTabByBase(
+                            tabs, ZanIDE.BaseName(ejr.path));
+                        if (ejt >= 0) { activeTab.Set(ejt); }
+                    }
+                    if (ejt >= 0 && ejl > 0) {
+                        lastActive = 0 - 1;
+                        pendingGotoLine = ejl - 1;
+                        pendingGotoCol = 0;
+                    }
+                    app.RequestRedraw();
+                }
+            }
+            app.PerfMark("sh.errors");
+
+            if (dbgState == 2) {
+                app.BeginIdScope(650000);
+                dbgPanel.Render(app, orr, dbgPanelTab,
+                    dbgConsole, dbgVarInfo, dbgWatches, dbgStack);
+                app.EndIdScope();
+                string wAdd = DebugPanel.TakeWatchAdd();
+                int wDrop = DebugPanel.TakeWatchDrop();
+                if (wAdd.Length > 0) {
+                    string v = "";
+                    if (dbg != null) { v = dbg.Evaluate(wAdd); }
+                    dbgWatches.Add(new DbgVar(wAdd, "", v));
+                    app.RequestRedraw();
+                }
+                if (wDrop >= 0 && wDrop < dbgWatches.Count) {
+                    dbgWatches.RemoveAt(wDrop);
+                    app.RequestRedraw();
+                }
+            } else {
+                int botTab = 0;
+                if (errRect.Contains(app.mouseX, app.mouseY)) { botTab = 1; }
+                int obTabH = t.heightMedium;
+                int coContentY = orr.y + obTabH;
+                int coContentH = orr.height - obTabH;
+                app.BeginIdScope(600000);
+                outputPanel.Render(app, orr, log);
+                app.EndIdScope();
+                List<string> coView = outputPanel.Shown();
+                Rect botRect = orr;
+                if (botTab == 1) { botRect = errRect; }
+                if (app.EventKind() == 2 && app.window.EventButton() == 1
+                    && botRect.Contains(app.mouseX, app.mouseY)) {
+                    coCtxOpen = true;
+                    coCtxX = app.mouseX;
+                    coCtxY = app.mouseY;
+                    if (botTab == 0) {
+                        coCtxRow = LogView.RowAt(app, coContentY, coContentH,
+                            coView.Count, coLog.scroll, app.mouseY);
+                    } else {
+                        coCtxRow = (app.mouseY - (errRect.y + app.Scale(6))) / app.Scale(20);
+                    }
+                    app.RequestRedraw();
+                }
+                if (coCtxOpen) {
+                    app.BeginIdScope(620000);
+                    app.BlockHitsMenu();
+                    bool haveSel = botTab == 0 && coLog.HasSelection();
+                    List<string> cmi = new List<string>();
+                    if (haveSel) {
+                        cmi.Add(ZanIDE.T("Copy selection", "复制选中"));
+                    }
+                    cmi.Add(ZanIDE.T("Copy line", "复制该行"));
+                    cmi.Add(ZanIDE.T("Copy all", "复制全部"));
+                    cmi.Add(ZanIDE.T("Clear", "清空"));
+                    int cmHit = ContextMenu.Render(app, coCtxX, coCtxY, cmi);
+                    if (cmHit == 0 - 2) {
+                        coCtxOpen = false;
+                        app.RequestRedraw();
+                    } else if (cmHit >= 0) {
+                        int base2 = 0;
+                        if (haveSel) { base2 = 1; }
+                        string clip = "";
+                        if (haveSel && cmHit == 0) {
+                            clip = LogView.SelectionText(coView, coLog);
+                        } else if (cmHit == base2) {
+                            if (botTab == 0) {
+                                if (coCtxRow >= 0 && coCtxRow < coView.Count) {
+                                    clip = coView[coCtxRow];
+                                }
+                            } else if (coCtxRow >= 0 && coCtxRow < errors.Count) {
+                                DiagnosticRecord error = errors[coCtxRow];
+                                clip = ZanIDE.BaseName(error.path) + ":"
+                                    + error.line + "  " + error.msg;
+                            }
+                        } else if (cmHit == base2 + 1) {
+                            if (botTab == 0) {
+                                for (int ci = 0; ci < coView.Count; ci = ci + 1) { clip = clip + coView[ci] + "\n"; }
+                            } else {
+                                for (int ci = 0; ci < errors.Count; ci = ci + 1) {
+                                    DiagnosticRecord error = errors[ci];
+                                    clip = clip + ZanIDE.BaseName(error.path) + ":" + error.line
+                                        + "  " + error.msg + "\n";
+                                }
+                            }
+                        } else {
+                            log = new List<string>();
+                            coFilter.SetText("");
+                            coLog.Reset();
+                        }
+                        if (clip.Length > 0) {
+                            Clipboard.SetText(clip);
+                            Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
+                        }
+                        coCtxOpen = false;
+                        app.RequestRedraw();
+                    }
+                    app.EndIdScope();
+                }
+                if (app.EventKind() == 4 && app.window.EventKeyCode() == 67
+                    && Modifiers.HasCtrl(app.window.EventMods())
+                    && coLog.HasSelection()
+                    && orr.Contains(app.mouseX, app.mouseY)) {
+                    Clipboard.SetText(LogView.SelectionText(coView, coLog));
+                    Layer.Msg(ZanIDE.T("Copied to clipboard", "已复制到剪贴板"), 3);
+                    app.RequestRedraw();
+                }
+            }
+            app.PerfMark("sh.output");
+
+            app.BeginIdScope(800000);
+            gitPanel.Render(app, dock.ContentParked("git"));
+            app.EndIdScope();
+            app.BeginIdScope(850000);
+            toolsPanel.Render(app, dock.ContentParked("tools"), rtToolTree);
+            app.EndIdScope();
+            app.BeginIdScope(900000);
+            examplesPanel.Render(app, dock.ContentParked("examples"), rtExTree);
+            app.EndIdScope();
+    }
+}

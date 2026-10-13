@@ -1,0 +1,454 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+
+partial class AiAgent {
+    // --- streaming (SSE) parsing ---------------------------------------------
+
+    static SseAnswer ParseSse(string raw) {
+        SseAnswer a = new SseAnswer();
+        a.content = "";
+        a.reasoning = "";
+        a.error = "";
+        a.done = false;
+        a.promptTokens = 0;
+        a.completionTokens = 0;
+        a.totalTokens = 0;
+        a.cachedTokens = 0;
+        StringBuilder c = new StringBuilder();
+        StringBuilder r = new StringBuilder();
+        int n = raw.Length;
+        int i = 0;
+        while (i < n) {
+            int nl = i;
+            while (nl < n && (raw[nl] & 255) != 10) { nl = nl + 1; }
+            int lineEnd = nl;
+            if (lineEnd > i && (raw[lineEnd - 1] & 255) == 13) {
+                lineEnd = lineEnd - 1;
+            }
+            string line = raw.Substring(i, lineEnd - i);
+            string payload = "";
+            bool isData = false;
+            if (line.Length >= 6 && line.Substring(0, 6) == "data: ") {
+                payload = line.Substring(6, line.Length - 6);
+                isData = true;
+            } else if (line.Length >= 5 && line.Substring(0, 5) == "data:") {
+                payload = AiAgent.Trim(line.Substring(5, line.Length - 5));
+                isData = true;
+            }
+            if (isData) {
+                if (payload == "[DONE]") {
+                    a.done = true;
+                } else {
+                    AiAgent.FoldChunk(a, c, r, JsonValue.ParseLenient(payload),
+                                      payload);
+                }
+            }
+            if (nl >= n) { break; }
+            i = nl + 1;
+        }
+        string flat = AiAgent.Trim(raw);
+        if (!a.done && a.error == "" && c.Length == 0 && flat.Length > 0
+            && flat.Substring(0, 1) == "{") {
+            AiAgent.FoldChunk(a, c, r, JsonValue.ParseLenient(flat), flat);
+        }
+        a.content = c.ToString();
+        a.reasoning = r.ToString();
+        return a;
+    }
+
+    // one.
+    static void FoldChunk(SseAnswer a, StringBuilder c, StringBuilder r,
+            JsonValue v, string raw) {
+        if (v == null) { return; }
+        JsonValue err = v.Get("error");
+        if (err != null && a.error == "") {
+            if (err.IsObject()) { a.error = err.Str("message", raw); }
+            else { a.error = err.AsString(raw); }
+        }
+        JsonValue ch = v.Get("choices");
+        if (ch != null && ch.IsArray() && ch.Count() > 0) {
+            JsonValue delta = ch.At(0).Get("delta");
+            if (delta != null) {
+                c.Append(delta.Str("content", ""));
+                r.Append(delta.Str("reasoning_content", ""));
+            } else {
+                JsonValue full = ch.At(0).Get("message");
+                if (full != null) {
+                    c.Append(full.Str("content", ""));
+                    r.Append(full.Str("reasoning_content", ""));
+                }
+            }
+        }
+        JsonValue us = v.Get("usage");
+        if (us != null && us.IsObject()) {
+            a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
+            a.completionTokens = us.Int("completion_tokens", a.completionTokens);
+            a.totalTokens = us.Int("total_tokens", a.totalTokens);
+            a.cachedTokens = us.Int("prompt_cache_hit_tokens", a.cachedTokens);
+            JsonValue pd = us.Get("prompt_tokens_details");
+            if (pd != null && pd.IsObject()) {
+                a.cachedTokens = pd.Int("cached_tokens", a.cachedTokens);
+            }
+        }
+    }
+
+
+    // 生效服务商的限额表（模型 -> {ctx, out}，就是设置里那张表）和聊天框选中
+    // 的默认模型，由面板每帧刷新。团队模式下每个成员各跑自己的模型，上下文
+    // 窗口和输出上限也就各不相同，所以这里存的是「按模型查」的那张表，而不是
+    // 一份被所有人共用的数字——共用那份就是「统计不对、压缩按别人的窗口算」的
+    // 来源。
+    static string gLimits;
+    static string gChatModel;
+
+// 成员上下文压缩与定型摘要记录实体（消除 gCompRoles/gCompCount/gCompDrop/gCompFrom/gCompText 平行列表反模式）。
+
+
+    // 每个成员各自的压缩记录：谁的上下文被折叠过几次、最近那次折掉了几轮。
+    // 一个成员因为自己的窗口小而压缩，不该显示成全队都压缩了。
+    // 空成员名（"" ）就是单人模式那一份。
+    static List<AiAgentCompactionRecord> gCompRecords;
+
+    static void EnsureCompRoles() {
+        if (AiAgent.gCompRecords == null) {
+            AiAgent.gCompRecords = new List<AiAgentCompactionRecord>();
+        }
+    }
+
+    // 这个成员在压缩记录里的下标；`make` 为真时没有就建一条。
+    static int CompSlot(string agent, bool make) {
+        AiAgent.EnsureCompRoles();
+        string who = agent;
+        if (who == null) { who = ""; }
+        for (int i = 0; i < AiAgent.gCompRecords.Count; i = i + 1) {
+            if (AiAgent.gCompRecords[i].role == who) { return i; }
+        }
+        if (!make) { return 0 - 1; }
+        AiAgent.gCompRecords.Add(new AiAgentCompactionRecord(who));
+        return AiAgent.gCompRecords.Count - 1;
+    }
+
+    static void NoteCompaction(string agent, int dropped) {
+        int s = AiAgent.CompSlot(agent, true);
+        AiAgent.gCompRecords[s].count = AiAgent.gCompRecords[s].count + 1;
+        AiAgent.gCompRecords[s].lastDrop = dropped;
+    }
+
+    // 这个成员的上下文被折叠过几次请求，以及最近那次折掉了几轮。
+    static int CompactionsOf(string agent) {
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0) { return 0; }
+        return AiAgent.gCompRecords[s].count;
+    }
+
+    static int LastDroppedOf(string agent) {
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0) { return 0; }
+        return AiAgent.gCompRecords[s].lastDrop;
+    }
+
+    // 全队一共压缩过几次（本次会话的总数）。
+    static int Compactions() {
+        AiAgent.EnsureCompRoles();
+        int acc = 0;
+        for (int i = 0; i < AiAgent.gCompRecords.Count; i = i + 1) {
+            acc = acc + AiAgent.gCompRecords[i].count;
+        }
+        return acc;
+    }
+
+    static void ResetCompaction() {
+        AiAgent.gCompRecords = new List<AiAgentCompactionRecord>();
+    }
+
+    // 已经定型的那份摘要：折掉了前 `stickyFrom` 轮，正文是 `stickyText`。留着它
+    // 是为了让摘要**逐字节不变**：摘要在消息序列里排在最前面，改一个字就等于
+    // 换掉整份前缀，它后面的每一条历史在供应商那边都要重新计费（prompt 缓存按
+    // 前缀匹配），命中率于是永远归零。
+
+    static void EnsureSticky() {
+        AiAgent.EnsureCompRoles();
+    }
+
+    // 这个成员已经定型的摘要折掉了前几轮（0 = 还没折过）。
+    static int StickyFrom(string agent) {
+        AiAgent.EnsureSticky();
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0 || s >= AiAgent.gCompRecords.Count) { return 0; }
+        return AiAgent.gCompRecords[s].stickyFrom;
+    }
+
+    // 这个成员已经定型的摘要正文（"" = 还没折过）。
+    static string StickyText(string agent) {
+        AiAgent.EnsureSticky();
+        int s = AiAgent.CompSlot(agent, false);
+        if (s < 0 || s >= AiAgent.gCompRecords.Count) { return ""; }
+        return AiAgent.gCompRecords[s].stickyText;
+    }
+
+    static void SetSticky(string agent, int from, string text) {
+        int s = AiAgent.CompSlot(agent, true);
+        AiAgent.EnsureSticky();
+        AiAgent.gCompRecords[s].stickyFrom = from;
+        AiAgent.gCompRecords[s].stickyText = text;
+    }
+
+    static void SetProvider(string limitsJson, string chatModel) {
+        AiAgent.gLimits = limitsJson;
+        AiAgent.gChatModel = chatModel;
+    }
+
+    // 这个模型配置的上下文长度（token）；没配过就用默认。空模型名 = 聊天框
+    // 选中的那个模型（单人模式，以及没给成员单独绑模型的时候）。
+    static int CtxTokensOf(string model) {
+        int tok = AiAgent.LimitOf(model, "ctx");
+        if (tok <= 0) { tok = AiAgent.DefaultCtxTokens(); }
+        return tok;
+    }
+
+    // 这个模型配置的最大输出长度（token）；0 表示没配（请求里不带 max_tokens）。
+    static int MaxOutTokensOf(string model) {
+        return AiAgent.LimitOf(model, "out");
+    }
+
+    static int LimitOf(string model, string field) {
+        string m = model;
+        if (m == null || m == "") { m = AiAgent.gChatModel; }
+        if (m == null || m == "") { return 0; }
+        if (AiAgent.gLimits == null) { return 0; }
+        return ZanIDE.AiLimitInt(AiAgent.gLimits, m, field);
+    }
+
+    static int MaxContextCharsOf(string model) {
+        return AiAgent.CtxTokensOf(model) * 4;
+    }
+
+    static int DefaultCtxTokens() { return 200000; }
+
+    static int ContextChars(List<ChatMessage> msgs) {
+        int acc = 0;
+        for (int i = 0; i < msgs.Count; i = i + 1) { acc = acc + msgs[i].text.Length; }
+        return acc;
+    }
+
+    static int MinRecentTurns() { return 6; }
+
+    static string FirstLine(string s) {
+        int i = ZanIDE.IndexOfStr(s, "\n");
+        if (i < 0) { return s; }
+        return s.Substring(0, i);
+    }
+
+    static string Cap(string s, int n) {
+        if (s.Length <= n) { return s; }
+        return AiAgent.Clip(s, n) + " ...";
+    }
+
+    // 前 `cap` 个字节，但截断点退到字符边界上。
+    // 字符串按字节索引，一个汉字占三个字节，所以 `Substring(0, 6000)` 有
+    // 三分之二的概率把某个汉字切成半个。半个字符不是合法 UTF-8，装进请求体
+    // 之后服务端整包拒收（HTTP 400 invalid unicode code point），提示词里
+    // 越靠后的内容越无辜地背锅。所以凡是按长度截提示词的地方都走这里。
+    static string Clip(string s, int cap) {
+        if (cap <= 0) { return ""; }
+        if (s.Length <= cap) { return s; }
+        int n = cap;
+        // 续字节是 10xxxxxx（128..191）：落在续字节上说明切进了字符中间，
+        // 往前退到这个字符的首字节为止。
+        while (n > 0) {
+            int b = s[n] & 255;
+            if (b < 128 || b > 191) { break; }
+            n = n - 1;
+        }
+        return s.Substring(0, n);
+    }
+
+    // 末 `cap` 个字节，同样只在字符边界上开切（掐头留尾的场合用它）。
+    static string ClipTail(string s, int cap) {
+        if (cap <= 0) { return ""; }
+        if (s.Length <= cap) { return s; }
+        int st = s.Length - cap;
+        while (st < s.Length) {
+            int b = s[st] & 255;
+            if (b < 128 || b > 191) { break; }
+            st = st + 1;
+        }
+        return s.Substring(st, s.Length - st);
+    }
+
+    // 把一段字节流洗成合法 UTF-8：非法字节换成 `?`。
+    // 请求体里只要有一个非法码点，服务端就整包 400，一整轮对话原地卡死；而
+    // 非法字节的来源不止截断——read_file 读到 GBK 存的源文件、命令输出里的
+    // 半截多字节字符，都会带进来。所以发送前统一过一遍，宁可显示成 `?` 也
+    // 不能让整个请求发不出去。
+    static string SafeUtf8(string s) {
+        int bad = 0;
+        int i = 0;
+        while (i < s.Length) {
+            int need = AiAgent.SeqLen(s, i);
+            if (need <= 0) { bad = bad + 1; i = i + 1; } else { i = i + need; }
+        }
+        if (bad == 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        i = 0;
+        while (i < s.Length) {
+            int need = AiAgent.SeqLen(s, i);
+            if (need <= 0) {
+                sb.Append("?");
+                i = i + 1;
+                continue;
+            }
+            sb.Append(s.Substring(i, need));
+            i = i + need;
+        }
+        return sb.ToString();
+    }
+
+    // 从 `i` 开始的这个 UTF-8 序列有几个字节；不是合法序列就返回 0。
+    static int SeqLen(string s, int i) {
+        int b = s[i] & 255;
+        if (b < 128) { return 1; }
+        int need = 0;
+        if (b >= 194 && b <= 223) { need = 2; }
+        if (b >= 224 && b <= 239) { need = 3; }
+        if (b >= 240 && b <= 244) { need = 4; }
+        if (need == 0) { return 0; }
+        if (i + need > s.Length) { return 0; }
+        for (int k = 1; k < need; k = k + 1) {
+            int c = s[i + k] & 255;
+            if (c < 128 || c > 191) { return 0; }
+        }
+        return need;
+    }
+
+    static string DigestTurn(ChatMessage m) {
+        if (m.role == "user") {
+            return "USER: " + AiAgent.Cap(AiAgent.FirstLine(m.text), 300);
+        }
+        if (m.role == "assistant") {
+            string t = AiAgent.StripToolBlock(m.text);
+            if (AiAgent.Trim(t) == "") {
+                string call = AiAgent.ToolBlock(m.text);
+                if (call == "") { call = AiAgent.ToolBlock(m.call); }
+                return "ASSISTANT: (called " + AiAgent.Describe(call) + ")";
+            }
+            return "ASSISTANT: " + AiAgent.Cap(t, 400);
+        }
+        if (m.role == "tool") {
+            string head = AiAgent.FirstLine(m.text);
+            string body = "";
+            if (m.text.Length > head.Length + 1) {
+                body = AiAgent.FirstLine(
+                    m.text.Substring(head.Length + 1, m.text.Length - head.Length - 1));
+            }
+            string line = "TOOL " + head;
+            if (body != "") { line = line + " -> " + AiAgent.Cap(body, 200); }
+            return line;
+        }
+        return AiAgent.Cap(AiAgent.FirstLine(m.text), 200);
+    }
+
+    // `msgs` 是这个成员自己那份上下文（`AiTeam.ContextFor`），`budget` 是
+    // 它自己那个模型的窗口，`agent` 只用来把压缩记到它名下：一个成员
+    // 因为自己的窗口小而压缩，不会动到别人的上下文、也不会显示成全队都
+    // 压缩了。
+    static AiMessages BuildContext(List<ChatMessage> msgs, int budget,
+            string agent) {
+        AiMessages m = new AiMessages();
+        m.msgs = new List<ChatMessage>();
+        m.compacted = false;
+        m.dropped = 0;
+        int n = msgs.Count;
+        // 上一拍定型的那份摘要：只要它后面的尾部还放得下，就一个字都不动地
+        // 复用。重算一次摘要 = 换掉整份前缀，后面每一条历史都要重新计费。
+        int sticky = AiAgent.StickyFrom(agent);
+        string stickyText = AiAgent.StickyText(agent);
+        if (sticky > 0 && sticky <= n && stickyText != ""
+                && stickyText.Length + AiAgent.TailChars(msgs, sticky)
+                    <= budget) {
+            m.msgs.Add(ChatMessage.Create("user", stickyText));
+            for (int k = sticky; k < n; k = k + 1) { m.msgs.Add(msgs[k]); }
+            m.compacted = true;
+            m.dropped = sticky;
+            return m;
+        }
+        if (sticky > n) {
+            // 换了一份记录（切换/删除会话）：旧摘要说的不是这段对话了。
+            AiAgent.SetSticky(agent, 0, "");
+            sticky = 0;
+        }
+        int keepFrom = AiAgent.FoldPoint(msgs, budget);
+        if (keepFrom <= 0 && sticky <= 0) {
+            for (int k = 0; k < n; k = k + 1) {
+                m.msgs.Add(msgs[k]);
+            }
+            return m;
+        }
+        // 重折的时候一次折到预算的一半，而不是刚好放得下：刚好放得下意味着
+        // 下一拍又要重折，摘要于是每一拍都在变，缓存一次也命不中。
+        int target = budget * AiAgent.CompactKeepPercent() / 100;
+        int folded = AiAgent.FoldPoint(msgs, target);
+        if (folded > keepFrom) { keepFrom = folded; }
+        if (keepFrom <= sticky) { keepFrom = sticky; }
+        if (keepFrom <= 0) { keepFrom = 1; }
+        if (keepFrom > n) { keepFrom = n; }
+        StringBuilder d = new StringBuilder();
+        d.Append("[Earlier turns were compacted to save context; digest of the"
+            + " conversation so far -- decisions, files touched and findings:]\n");
+        for (int j = 0; j < keepFrom; j = j + 1) {
+            d.Append(AiAgent.DigestTurn(msgs[j]) + "\n");
+            if (d.Length > 6000) {
+                d.Append("... (older turns elided)\n");
+                break;
+            }
+        }
+        string digest = d.ToString();
+        AiAgent.SetSticky(agent, keepFrom, digest);
+        // 这一折把前面那些轮换成了摘要，钉进去的正文（打开文件、项目参考）
+        // 很可能就在被折掉的那一段里：忘掉「已经钉过」，下一拍重新钉一份。
+        // 不然模型手上没有正文，而重复读又会被拒——那就真的什么都看不到了。
+        AiAgent.ResetPins();
+        m.msgs.Add(ChatMessage.Create("user", digest));
+        int r = keepFrom;
+        while (r < n) {
+            m.msgs.Add(msgs[r]); r = r + 1;
+        }
+        m.compacted = true;
+        m.dropped = keepFrom;
+        AiAgent.NoteCompaction(agent, keepFrom);
+        return m;
+    }
+
+    // 从末尾往前累计，`limit` 个字符放得下的最早那一轮的下标（0 = 整份都
+    // 放得下）。最近 `MinRecentTurns()` 轮无论多长都保留。
+    static int FoldPoint(List<ChatMessage> msgs, int limit) {
+        int n = msgs.Count;
+        int acc = 0;
+        int from = n;
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            acc = acc + msgs[i].text.Length;
+            int kept = n - i;
+            if (acc > limit && kept > AiAgent.MinRecentTurns()) { break; }
+            from = i;
+        }
+        if (from > n) { from = n; }
+        if (from < 0) { from = 0; }
+        return from;
+    }
+
+    // `from` 之后逐字发出的那部分有多少字符。
+    static int TailChars(List<ChatMessage> msgs, int from) {
+        int acc = 0;
+        for (int i = from; i < msgs.Count; i = i + 1) {
+            acc = acc + msgs[i].text.Length;
+        }
+        return acc;
+    }
+
+    // 重折一次之后尾部占预算的比例：折到一半，之后好几十拍都能复用同一
+    // 份摘要（摘要不变 = 前缀不变 = 缓存还能命中）。
+    static int CompactKeepPercent() { return 50; }
+}

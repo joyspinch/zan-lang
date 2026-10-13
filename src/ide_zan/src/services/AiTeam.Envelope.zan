@@ -1,0 +1,314 @@
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+
+partial class AiTeam {
+    // --- envelope ------------------------------------------------------------
+
+    static string KindAssign() { return "assign"; }
+    static string KindAck() { return "ack"; }
+    static string KindProgress() { return "progress"; }
+    static string KindHandoff() { return "handoff"; }
+    static string KindQuestion() { return "question"; }
+    static string KindReport() { return "report"; }
+    static string KindBlock() { return "block"; }
+    // 不是模型说的拍子，而是 IDE 自己放进节点上下文的一条：前置节点的产出
+    // 摘要。单独一个 kind 是为了「这个节点已经收到过前置摘要了」可以被查到，
+    // 于是切回来十次也只注入一次。
+    static string KindDeps() { return "deps"; }
+
+    static bool IsKind(string k) {
+        return k == AiTeam.KindAssign() || k == AiTeam.KindAck()
+            || k == AiTeam.KindProgress() || k == AiTeam.KindHandoff()
+            || k == AiTeam.KindQuestion() || k == AiTeam.KindReport()
+            || k == AiTeam.KindBlock();
+    }
+
+    // @测试工程师 [handoff T-3] 表单校验已实现，build 通过。
+    // [progress T-3 60%] 正在补边界用例
+    // [question] 这两种做法哪个是你要的？
+    static AiEnvelope ParseEnvelope(string text) {
+        AiEnvelope e = AiEnvelope.Create();
+        e.body = text;
+        e.to = AiTeam.ParseMentions(text);
+        int at = 0;
+        if (e.to.Count > 0) { at = AiTeam.MentionEnd(text); }
+        int i = at;
+        while (i < text.Length && (text[i] & 255) != 91) {
+            int bl = AiTeam.BreakLen(text, i);
+            if (bl == 0) { break; }
+            i = i + bl;
+        }
+        if (i < text.Length && (text[i] & 255) == 91) {
+            int close = i + 1;
+            while (close < text.Length && (text[close] & 255) != 93) {
+                if ((text[close] & 255) == 10) { break; }
+                close = close + 1;
+            }
+            if (close < text.Length && (text[close] & 255) == 93) {
+                string inner = text.Substring(i + 1, close - i - 1);
+                if (AiTeam.ReadMarker(inner, e)) { at = close + 1; }
+            }
+        }
+        string rest = text.Substring(at, text.Length - at);
+        e.body = AiAgent.Trim(rest);
+        return e;
+    }
+
+    static int MentionEnd(string text) {
+        int i = 0;
+        int last = 0;
+        while (i < text.Length) {
+            while (i < text.Length && (text[i] & 255) != 64) {
+                int bl = AiTeam.BreakLen(text, i);
+                if (bl == 0) { return last; }
+                i = i + bl;
+            }
+            if (i >= text.Length) { return last; }
+            if ((text[i] & 255) != 64) { return last; }
+            int s = i + 1;
+            int e = s;
+            while (e < text.Length && (text[e] & 255) != 64
+                   && AiTeam.BreakLen(text, e) == 0) {
+                e = e + 1;
+            }
+            string name = text.Substring(s, e - s);
+            if (!AiTeam.IsEveryone(name) && AiTeam.RoleIdOfName(name) == "") {
+                return last;
+            }
+            last = e;
+            i = e;
+        }
+        return last;
+    }
+
+    static bool ReadMarker(string inner, AiEnvelope e) {
+        List<string> parts = new List<string>();
+        int s = 0;
+        for (int i = 0; i <= inner.Length; i = i + 1) {
+            bool end = i == inner.Length;
+            bool sp = false;
+            if (!end) {
+                int ch = inner[i] & 255;
+                sp = ch == 32 || ch == 9;
+            }
+            if (end || sp) {
+                if (i > s) { parts.Add(inner.Substring(s, i - s)); }
+                s = i + 1;
+            }
+        }
+        if (parts.Count == 0) { return false; }
+        string kind = ZanIDE.ToLowerS(parts[0]);
+        if (!AiTeam.IsKind(kind)) { return false; }
+        e.kind = kind;
+        for (int i = 1; i < parts.Count; i = i + 1) {
+            string p = parts[i];
+            if (p.Length > 0 && (p[p.Length - 1] & 255) == 37) {
+                e.progress = AiTeam.NumOf(p.Substring(0, p.Length - 1));
+            } else {
+                e.taskId = AiTeam.TaskIdOf(p);
+            }
+        }
+        return true;
+    }
+
+    // 标记里那一段任务号，去掉模型顺手带上的 `task=` 之类的前缀。
+    // 提示词里写的是 `[report] task=T-1`，模型多半合成一个标记写成
+    // `[report task=T-1]`，于是这一段字面量是 `task=T-1`。不剥掉前缀，它就是
+    // 一个图上不存在的节点号：`Fold` 照它新建一个空节点，真正的 T-1 因此永远
+    // 不会被收尾、永远留在「能开工」里，产品经理于是一拍一拍地把同一个节点
+    // 重新派出去——用户看到的那个「验收通过了还在原地打转」的死循环。
+    static string TaskIdOf(string s) {
+        string p = s;
+        int eq = -1;
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int ch = p[i] & 255;
+            if (ch == 61 || ch == 58) { eq = i; break; }
+        }
+        if (eq >= 0) {
+            string head = ZanIDE.ToLowerS(p.Substring(0, eq));
+            if (head == "task" || head == "id" || head == "taskid"
+                || head == "node") {
+                p = p.Substring(eq + 1, p.Length - eq - 1);
+            }
+        }
+        while (p.Length > 0 && (p[0] & 255) == 35) {
+            p = p.Substring(1, p.Length - 1);
+        }
+        return p;
+    }
+
+    static int NumOf(string s) {
+        int v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch < 48 || ch > 57) { break; }
+            v = v * 10 + (ch - 48);
+        }
+        if (v > 100) { v = 100; }
+        return v;
+    }
+
+    static string Header(string toId, string kind, string taskId) {
+        StringBuilder sb = new StringBuilder();
+        if (toId != "") { sb.Append("@" + AiTeam.DisplayName(toId) + " "); }
+        if (kind != "") {
+            sb.Append("[" + kind);
+            if (taskId != "") { sb.Append(" " + taskId); }
+            sb.Append("] ");
+        }
+        return sb.ToString();
+    }
+
+
+    static string DefaultRecipient(List<ChatMessage> msgs) {
+        for (int i = msgs.Count - 1; i >= 0; i = i - 1) {
+            if (msgs[i].role == "user") { continue; }
+            if (msgs[i].agent != "" && AiTeam.RoleOf(msgs[i].agent) != null) {
+                return msgs[i].agent;
+            }
+        }
+        return AiTeam.Pm();
+    }
+
+    static string RouteUser(string text, List<ChatMessage> msgs) {
+        List<string> ms = AiTeam.ParseMentions(text);
+        if (ms.Count > 0) { return ms[0]; }
+        return AiTeam.DefaultRecipient(msgs);
+    }
+
+    static string RouteUserSt(string text, List<ChatMessage> msgs,
+            AiTeamState st) {
+        List<string> ms = AiTeam.ParseMentions(text);
+        if (ms.Count > 0) { return ms[0]; }
+        if (st != null && st.awaitingUser) {
+            string r = AiTeam.ResumeTarget(st);
+            if (r != "") { return r; }
+        }
+        return AiTeam.DefaultRecipient(msgs);
+    }
+
+    static string UnknownMention(string text) {
+        int i = 0;
+        while (i < text.Length && AiTeam.BreakLen(text, i) > 0) {
+            i = i + AiTeam.BreakLen(text, i);
+        }
+        if (i >= text.Length || (text[i] & 255) != 64) { return ""; }
+        int s = i + 1;
+        int e = s;
+        while (e < text.Length && (text[e] & 255) != 64
+               && AiTeam.BreakLen(text, e) == 0) {
+            e = e + 1;
+        }
+        string name = text.Substring(s, e - s);
+        if (name == "") { return ""; }
+        if (AiTeam.IsEveryone(name)) { return ""; }
+        if (AiTeam.RoleIdOfName(name) != "") { return ""; }
+        return name;
+    }
+
+    static string NameList() {
+        List<AiRole> rs = AiTeam.Roles();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (i > 0) { sb.Append("、"); }
+            sb.Append(ZanIDE.T(rs[i].en, rs[i].zh));
+        }
+        return sb.ToString();
+    }
+
+
+    static bool AllowsTool(string roleId, string tool) {
+        if (roleId == "" || AiTeam.RoleOf(roleId) == null) { return true; }
+        if (tool == "read_file" || tool == "list_dir" || tool == "grep"
+            || tool == "repo_map" || tool == "stdlib_read"
+            || tool == "stdlib_grep" || tool == "plan") { return true; }
+        if (roleId == AiTeam.Dev()) {
+            return tool == "write_file" || tool == "edit_file"
+                || tool == "build";
+        }
+        if (roleId == AiTeam.Qa()) {
+            return tool == "run" || tool == "build" || tool == "ui_check"
+                || tool == "ui_tree" || tool == "run_errors";
+        }
+        if (roleId == AiTeam.Rev() || roleId == AiTeam.Sec()) {
+            return tool == "diff";
+        }
+        if (roleId == AiTeam.Art()) {
+            return tool == "write_file" || tool == "edit_file";
+        }
+        return false;
+    }
+
+    static string DenyTool(string roleId, string tool) {
+        string owner = AiTeam.Dev();
+        if (tool == "ui_check" || tool == "run" || tool == "ui_tree"
+            || tool == "run_errors") { owner = AiTeam.Qa(); }
+        if (tool == "diff") { owner = AiTeam.Rev(); }
+        return "error: '" + tool + "' is not yours to call as "
+            + AiTeam.DisplayName(roleId) + ". Do not call it again -- hand the"
+            + " work to @" + AiTeam.MentionToken(owner)
+            + " with a [handoff] message that states what you need done.";
+    }
+
+
+    static List<ChatMessage> ContextFor(string roleId, List<ChatMessage> msgs) {
+        List<ChatMessage> outMsgs = new List<ChatMessage>();
+        for (int i = 0; i < msgs.Count; i = i + 1) {
+            ChatMessage m = msgs[i];
+            if (AiTeam.IsAuto(m)) {
+                // 内部派单只给收件人看：它不是需求，把它广播给所有人只会让每个
+                // 成员都以为自己被叫到了。没写收件人的（旧存档）算公共上下文。
+                if (m.to == ""
+                    || AiTeam.HasStr(AiTeam.ToListOf(m), roleId)) {
+                    outMsgs.Add(m);
+                }
+                continue;
+            }
+            if (m.role == "user") {
+                outMsgs.Add(m);
+                continue;
+            }
+            if (m.role == "tool" || m.role == "error") {
+                // 没署名的工具结果（旧存档，或单人模式留下的）算公共上下文：
+                // 宁可多看一条，也不能把成员自己刚读到的东西滤掉——滤掉的
+                // 后果是它每一拍都以为自己还没查过，于是一直重发同一个调用。
+                if (m.agent == "" || m.agent == roleId) { outMsgs.Add(m); }
+                continue;
+            }
+            if (m.agent == roleId) { outMsgs.Add(m); continue; }
+            if (AiTeam.HasStr(AiTeam.ToListOf(m), roleId)) {
+                outMsgs.Add(m);
+                continue;
+            }
+        }
+        return outMsgs;
+    }
+
+    static List<string> ToListOf(ChatMessage m) {
+        List<string> ids = new List<string>();
+        if (m.to == "") { return ids; }
+        int s = 0;
+        for (int i = 0; i <= m.to.Length; i = i + 1) {
+            bool end = i == m.to.Length;
+            bool comma = false;
+            if (!end) { comma = (m.to[i] & 255) == 44; }
+            if (end || comma) {
+                if (i > s) { AiTeam.AddOnce(ids, m.to.Substring(s, i - s)); }
+                s = i + 1;
+            }
+        }
+        return ids;
+    }
+
+    static string ToStrOf(List<string> ids) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(ids[i]);
+        }
+        return sb.ToString();
+    }
+
+}

@@ -1,0 +1,590 @@
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+
+partial class AiTeam {
+    // --- 自动验收 / 自动接下一个任务 ------------------------------------------
+
+    // 验收的人：测试工程师。验收必须换一个人做，报完成的人自己说「通过」不
+    // 算验收——这一条就是「执行验收结束」里的验收。
+    static string Verifier() { return AiTeam.Qa(); }
+
+    // 报完成的这一拍要不要先送去验收：写了验收标准、而且报的人不是验收人。
+    // 没写验收标准就没有可对的东西，硬塞一拍只是空转。
+    static bool NeedsAccept(AiTask t, string from) {
+        if (t == null) { return false; }
+        if (AiAgent.Trim(t.accept) == "") { return false; }
+        return from != AiTeam.Verifier();
+    }
+
+    // 交给验收人的指令：只对着验收标准判，通过就 [report]，不通过就 [block]
+    // 回开发——两个出口都已经在协议里，所以这里不引入新状态。
+    static string AcceptPrompt(AiTask t) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 请验收任务 " + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        if (AiAgent.Trim(t.outcome) != "") {
+            sb.Append("交付说明：\n" + AiAgent.Trim(t.outcome) + "\n");
+        }
+        sb.Append("按标准逐条核对，需要就自己编译 / 运行 / 读代码取证，不要只"
+            + "看它怎么说。通过就回 [report] task=" + t.id
+            + " 并写清核对结果；不通过回 [block] task=" + t.id
+            + " 说清哪条不达标、证据是什么。");
+        return sb.ToString();
+    }
+
+    // 验收通过后自动接的下一个节点：前置全齐、还没完成，排在最前的那个。
+    // 没有就返回 null（整条链跑完，或剩下的都被前置卡着）。
+    static AiTask NextReady(List<AiTask> tasks, string doneId) {
+        List<string> ready = AiTeam.ReadyTasks(tasks);
+        for (int i = 0; i < ready.Count; i = i + 1) {
+            if (ready[i] == doneId) { continue; }
+            AiTask t = AiTeam.TaskOf(tasks, ready[i]);
+            if (t == null) { continue; }
+            return t;
+        }
+        return null;
+    }
+
+    // 正在跑的那个节点（进行中或验收中）：同一时刻只允许一个，所以派单前先
+    // 看有没有人手上还有活，有就不要再开第二个。
+    static AiTask InFlight(List<AiTask> tasks) {
+        if (tasks == null) { return null; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskDoing()
+                || tasks[i].state == AiTeam.TaskReview()) {
+                return tasks[i];
+            }
+        }
+        return null;
+    }
+
+    // 挂在「已交接（验收中）」却一直没有验收结论的那个节点。
+    // 送去验收的那一拍只要没回 [report]/[block]（说了两句就停、或者话头被别的
+    // 节点带走），节点就一直停在验收中——而它又是下游的 `deps`，整张图都被它
+    // 挡住（用户看到的「上游还挂着已交接，进度 96% 一直不动」）。所以派下一个
+    // 节点之前先看有没有这种欠着结论的节点。
+    static AiTask AwaitingAccept(List<AiTask> tasks) {
+        if (tasks == null) { return null; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskReview()) { return tasks[i]; }
+        }
+        return null;
+    }
+
+    // 同一个节点最多催几次验收：催不动就是验收这一拍本身有问题（标准没法判、
+    // 交付说明缺证据），再催只会把同一段话刷屏，那时挂起节点交给用户。
+    static int MaxReviewChases() { return 2; }
+
+    // 催验收的指令：把原来的验收要求原样再给一遍，并说清「不回结论下游全都
+    // 开不了工」——只有 [report]/[block] 两个出口，不引入新状态。
+    static string ChaseAcceptPrompt(AiTask t, int times) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + t.id + " 还挂在「验收中」，上一拍没有给出验收"
+            + "结论（第 " + Convert.ToString(times) + " 次催办）。这个节点是下游的"
+            + "前置，不验收下游一个都开不了工。\n");
+        sb.Append(AiTeam.AcceptPrompt(t));
+        sb.Append("\n这一拍必须以 [report] 或 [block] 收尾，别只描述你打算"
+            + "怎么核对；缺证据就自己读代码 / 编译 / 运行去取。");
+        return sb.ToString();
+    }
+
+    // 一个节点验收过了之后交回产品经理的指令：它这一拍只做调度——把下一个
+    // 能开工的节点派给负责人。派单以外的话（重述需求、再发一份计划）就是
+    // 用户看到的那种「反复列需求不开工」。
+    static string DispatchPrompt(string doneId, AiTask nx) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + doneId + " 已验收通过，结论已写进项目知识。");
+        if (nx == null) {
+            sb.Append("图上暂时没有能开工的节点了：要么向用户交代这一轮的结果，"
+                + "要么说清还卡在哪个前置。");
+            return sb.ToString();
+        }
+        sb.Append("你这一拍只做一件事——派下一个节点：\n");
+        sb.Append("  " + nx.id);
+        if (nx.title != "") { sb.Append("（" + nx.title + "）"); }
+        string who = AiTeam.OwnerOf(nx);
+        sb.Append(" → @" + AiTeam.DisplayName(who) + "\n");
+        sb.Append("回一条 [assign] task=" + nx.id + " @"
+            + AiTeam.DisplayName(who)
+            + "，一句话说清这个节点要交付什么就够了。不要重述需求、不要重发"
+            + "计划、不要同时派两个节点；有真需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    // 自动派下一个任务的指令。前置产出摘要由调用方附在后面（同一条消息里），
+    // 所以接手的人不必回头读前置的整段对话。
+    static string NextPrompt(AiTask t, string doneId) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] " + doneId + " 已验收通过，按计划接下一个任务 " + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。直接开工，不用回「收到」；");
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("这个任务的验收标准是：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        sb.Append("做完回 [report] task=" + t.id
+            + "，说清交付了什么、怎么验证的。计划要改就重发 plan。");
+        return sb.ToString();
+    }
+
+    // 派单给节点负责人的指令。跟 `NextPrompt` 的区别只在由头：那条是「前一个
+    // 节点验收过了」，这条是「图已经拆好了、这个节点该你干」——图一落地就得有
+    // 人接手，否则拆活儿的人只会被反复叫回来再拆一遍。
+    static string AssignPrompt(AiTask t, string who) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 按任务图派单。本拍执行人："
+            + AiTeam.DisplayName(who) + "，这个节点归你——" + t.id);
+        if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("。直接动手做这个节点自己的活（不用回「收到」，也别重述计划、"
+            + "别把别人节点的活揽过来）。\n");
+        List<AiPlanStep> its = AiTaskPlan.ItemsOf(t);
+        if (its.Count > 0) {
+            sb.Append("这个节点要干的活：\n");
+            for (int i = 0; i < its.Count; i = i + 1) {
+                string mark = "[ ] ";
+                if (its[i].done != 0) { mark = "[x] "; }
+                sb.Append("  " + mark + its[i].text + "\n");
+            }
+        }
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        sb.Append(AiTeam.TickHint(t));
+        sb.Append("做完回 [report] task=" + t.id
+            + " 说清交付了什么、怎么验证的；真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    // 「干完一条怎么把它勾上」。节点百分比只从这份清单和真跑过的拍数算，而勾选
+    // 只有重发 plan（把做完的那条写成 "[x] ..."）才会打上：不说这件事，模型
+    // 就在正文里写个 100%，于是图上出现「进行到 95% 而清单 0/5」。
+    static string TickHint(AiTask t) {
+        int n = AiTaskPlan.CountOf(t);
+        if (n == 0) { return ""; }
+        return "每干完一条就用 plan 工具把这个节点连同整份 tasks 重发一次，做完的那条"
+            + "写成 \"[x] ...\"：节点进度就是这份清单的完成比，正文里写百分比不会让它"
+            + "动一格（也不要写）。\n";
+    }
+
+    // 该派给谁：节点写了负责人就按它，没写（或写成产品经理——它不写代码）就
+    // 按固定链条交给产品经理的下一环。
+    static string OwnerOf(AiTask t) {
+        if (t == null) { return ""; }
+        string who = AiAgent.Trim(t.owner);
+        if (who == "" || who == AiTeam.Pm()) {
+            return AiTeam.NextOf(AiTeam.Pm());
+        }
+        return who;
+    }
+
+    // 验收通过后落进项目知识的那一段（`.zan/knowledge.md` 的一节）。写的是
+    // 结论而不是过程：下一次开工的人要的是「这里已经定成什么样」，不是当时
+    // 聊了多少拍。
+    static string NoteSection(AiTask t, string verdict) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\n## " + t.id);
+        if (t.title != "") { sb.Append(" " + t.title); }
+        sb.Append("\n");
+        if (t.owner != "") {
+            sb.Append("- 负责人：@" + AiTeam.DisplayName(t.owner) + "\n");
+        }
+        if (AiAgent.Trim(t.accept) != "") {
+            sb.Append("- 验收标准：" + AiTeam.OneLine(t.accept) + "\n");
+        }
+        if (AiAgent.Trim(t.outcome) != "") {
+            sb.Append("- 产出：" + AiTeam.OneLine(t.outcome) + "\n");
+        }
+        string v = AiAgent.Trim(verdict);
+        if (v != "") { sb.Append("- 验收结论：" + AiTeam.OneLine(v) + "\n"); }
+        return sb.ToString();
+    }
+
+    // 折成一行：知识条目是给人扫的，多行正文塞进列表项里会把结构撑烂。
+    static string OneLine(string s) {
+        StringBuilder sb = new StringBuilder();
+        bool sp = false;
+        string t = AiAgent.Trim(s);
+        for (int i = 0; i < t.Length; i = i + 1) {
+            string ch = t.Substring(i, 1);
+            if (ch == "\n" || ch == "\r" || ch == "\t") {
+                sp = true;
+                continue;
+            }
+            if (sp && sb.Length > 0) { sb.Append(" "); }
+            sp = false;
+            sb.Append(ch);
+        }
+        string one = sb.ToString();
+        if (one.Length > 600) { one = AiAgent.Clip(one, 600) + "..."; }
+        return one;
+    }
+
+    // 现在可以开工的节点：自己未完成、前置全齐。面板用它提示「接下来能做
+    // 哪几个」，模型也用它决定下一步派单给谁。
+    static List<string> ReadyTasks(List<AiTask> tasks) {
+        List<string> ids = new List<string>();
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state == AiTeam.TaskDone()) { continue; }
+            if (AiTeam.LockedTask(tasks, tasks[i].id)) { continue; }
+            ids.Add(tasks[i].id);
+        }
+        return ids;
+    }
+
+    // 团队模式下 `plan` 工具的一次调用即一张任务图：`items` 里每项除了标题，
+    // 还可以带 `id` / `owner` / `deps` / `accept` / `parts`。已存在的节点只更新
+    // 图信息，状态和进度留给协议信封推进——重发一次计划不该把进行中的节点
+    // 打回待办。返回图里的节点总数。
+    static int ParseGraph(string json, List<AiTask> tasks) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return tasks.Count; }
+        JsonValue items = v.Get("items");
+        if (items == null || !items.IsArray()) { return tasks.Count; }
+        // 本次计划里出现的节点次序，以及模型到底有没有说过前置：没说过和
+        // 说了「没有前置」是两件事，前者才需要 IDE 替它连线。
+        List<string> order = new List<string>();
+        bool told = false;
+        for (int i = 0; i < items.Count(); i = i + 1) {
+            JsonValue it = items.At(i);
+            if (!it.IsObject()) { continue; }
+            string id = AiAgent.Trim(it.Str("id", ""));
+            string title = AiAgent.Trim(it.Str("t", it.Str("text",
+                it.Str("title", ""))));
+            if (id == "" && title == "") { continue; }
+            if (id == "") { id = "T-" + Convert.ToString(i + 1); }
+            AiTask t = AiTeam.TaskOf(tasks, id);
+            if (t == null) {
+                t = AiTask.Create(id, title, "");
+                tasks.Add(t);
+            } else if (title != "") {
+                t.title = title;
+            }
+            string owner = AiTeam.RoleIdArg(it.Str("owner", it.Str("o", "")));
+            if (owner != "") { t.owner = owner; }
+            string accept = AiAgent.Trim(it.Str("accept", it.Str("ac", "")));
+            if (accept != "") { t.accept = accept; }
+            if (it.Get("deps") != null) { told = true; }
+            // 节点内的开发任务清单：功能节点下面那几件具体的活。
+            JsonValue sub = it.Get("tasks");
+            if (sub == null) { sub = it.Get("items"); }
+            if (sub == null) { sub = it.Get("steps"); }
+            AiTaskPlan.ReadItems(sub, t);
+            AiTeam.ReadIds(it.Get("deps"), t, true);
+            AiTeam.ReadIds(it.Get("parts"), t, false);
+            AiTeam.AddOnce(order, id);
+        }
+        if (!told) { AiTeam.ChainOrder(tasks, order); }
+        return tasks.Count;
+    }
+
+    // 一个 `deps` 都没写的计划：把这次列出的节点按给出的次序串成一条链。
+    // 没有连线的任务图退化成一排卡片——看不出先后，也就没有「谁在等谁」
+    // 和「现在能开工的是哪个」，而列出来的次序正是模型心里的顺序。只补
+    // 空缺：已经有前置的节点不动，所以下一次带 deps 的重发能把链改成真
+    // 正的分叉。
+    static void ChainOrder(List<AiTask> tasks, List<string> ids) {
+        if (ids == null || ids.Count < 2) { return; }
+        for (int i = 1; i < ids.Count; i = i + 1) {
+            AiTask t = AiTeam.TaskOf(tasks, ids[i]);
+            if (t == null) { continue; }
+            if (t.deps != null && t.deps.Count > 0) { continue; }
+            AiTeam.AddDep(t, ids[i - 1]);
+        }
+    }
+
+    static void ReadIds(JsonValue v, AiTask t, bool asDeps) {
+        if (v == null) { return; }
+        List<string> ids = new List<string>();
+        if (v.IsArray()) {
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                ids.Add(AiAgent.Trim(v.At(i).AsString("")));
+            }
+        } else {
+            string s = v.AsString("");
+            int start = 0;
+            for (int i = 0; i <= s.Length; i = i + 1) {
+                bool end = i == s.Length;
+                bool comma = false;
+                if (!end) { comma = (s[i] & 255) == 44; }
+                if (end || comma) {
+                    ids.Add(AiAgent.Trim(s.Substring(start, i - start)));
+                    start = i + 1;
+                }
+            }
+        }
+        for (int k = 0; k < ids.Count; k = k + 1) {
+            if (ids[k] == "") { continue; }
+            if (asDeps) { AiTeam.AddDep(t, ids[k]); }
+            else { AiTeam.AddPart(t, AiTeam.RoleIdArg(ids[k])); }
+        }
+    }
+
+    static string RoleIdArg(string s) {
+        string v = AiAgent.Trim(s);
+        if (v == "") { return ""; }
+        if ((v[0] & 255) == 64) { v = v.Substring(1, v.Length - 1); }
+        if (AiTeam.RoleOf(v) != null) { return v; }
+        return AiTeam.RoleIdOfName(v);
+    }
+
+    static string TaskTitleOf(string body) {
+        string t = AiAgent.Trim(body);
+        int nl = t.IndexOf("\n");
+        if (nl >= 0) { t = t.Substring(0, nl); }
+        if (t.Length > 60) { t = AiAgent.Clip(t, 60); }
+        return AiAgent.Trim(t);
+    }
+
+    static int StageOf(string id) {
+        List<AiRole> rs = AiTeam.Roles();
+        for (int i = 0; i < rs.Count; i = i + 1) {
+            if (rs[i].id == id) { return i; }
+        }
+        return 0;
+    }
+
+
+    static int MaxHandoffs() { return 12; }
+
+    // 同一个人在同一个节点上能被原地催几次。第一脚常常真能把它推动，
+    // 第二脚往往已经是一模一样的一拍；再催就只是把同一段话刷给用户看，
+    // 所以到这里换人而不是接着催。
+    static int MaxIdleNudges() { return 2; }
+
+    // 原地卡住的人把活儿交给谁：具体干活的人卡住先找架构师理清（拆活儿
+    // 、定方案本来就是它的职责），架构师自己卡住就回到产品经理去统筴。
+    // 产品经理本身卡住不在这条路上（给它的一脚已经是“转派”），返回 ""
+    // 让调用方停下来交回用户。
+    static string EscalateTo(string who) {
+        if (who == AiTeam.Pm()) { return ""; }
+        if (who == AiTeam.Arch()) { return AiTeam.Pm(); }
+        return AiTeam.Arch();
+    }
+
+    // 换人时给接手人的指令：说清是谁在哪个节点上停住了，接手人要么自己
+    // 把这一步做完、要么把它拆成能执行的下一步再交回去，不要原封不动地
+    // 把同一句话再弹回给卡住的人，也不要把这事丢给用户。
+    static string EscalatePrompt(string stuck, string esc, AiTask t,
+        string taskId) {
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 团队内部转交：" + AiTeam.DisplayName(stuck)
+            + " 在");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append(" 上连着几拍没有推进（只说下一步、或重复同一个查询），"
+            + "现在转给你。\n");
+        if (t != null && AiAgent.Trim(t.accept) != "") {
+            sb.Append("验收标准：\n" + AiAgent.Trim(t.accept) + "\n");
+        }
+        // 转给一个没有写权限的角色（架构师、审查、安全）时，「你自己把那一步
+        // 做完」是它做不到的事：它只会一遍遍读代码，然后同一个节点又挂起。
+        // 这种角色这一拍只能产出一条可执行指令，或者说清真的缺什么。
+        if (!AiTeam.AllowsTool(esc, "write_file")) {
+            sb.Append("你没有改代码的权限，所以不要试着自己做完：这一拍只做一件"
+                + "事——把卡住的那一步变成一条别人拿着就能敲的指令（改哪个文件、"
+                + "加什么、怎么算做完），然后 [handoff] @"
+                + AiTeam.DisplayName(stuck) + " task=" + id
+                + "。已经读过的东西别再读一遍；要是缺的是前置条件或用户拍板，"
+                + "直接 [block] 说清缺什么。");
+            return sb.ToString();
+        }
+        sb.Append("这一拍要么你自己把卡住的那一步做完，要么把它拆成一条明确、可"
+            + "执行的指令后 [handoff] 给合适的人（带上 task=" + id
+            + "）；不要把同一句话原样退回去，也不要因为这个去问用户。");
+        return sb.ToString();
+    }
+
+    // 交接上限：跟「自动继续上限」用同一个设置项，因为一次自动交接对用户
+    // 就是「小助手又自己跑了一拍」，两个刹车分开配只会出现「继续设成不限、
+    // 团队照样停」。`configured` 是设置里的值（<0 = 没配过，用内置默认；
+    // 0 = 不限，仍受 AiAgent.ContinuesCeiling() 兜底）。
+    static int HandoffsBudget(int configured) {
+        if (configured < 0) { return AiTeam.MaxHandoffs(); }
+        if (configured == 0) { return AiAgent.ContinuesCeiling(); }
+        return configured;
+    }
+
+    static string JoinIds(List<string> ids) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(ids[i]);
+        }
+        return sb.ToString();
+    }
+
+    // wrong.
+    static string HandoffPrompt(string from, string to, AiEnvelope env) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[assign] @" + AiTeam.DisplayName(to) + "，来自 @"
+            + AiTeam.DisplayName(from));
+        if (env.taskId != "") { sb.Append("，任务 " + env.taskId); }
+        sb.Append("。\n");
+        if (env.kind == AiTeam.KindBlock()) {
+            sb.Append("上一环节发现问题，需要你修复：\n");
+        }
+        string body = AiAgent.Trim(env.body);
+        if (body != "") { sb.Append(body + "\n"); }
+        sb.Append("直接开始你自己那一段（不用回「收到」）；做完再按协议 @ 下一"
+            + "环节，中途不要 @ 人。");
+        return sb.ToString();
+    }
+
+    // 认领之后那一脚：认领本身不是工作，所以自动执行时立刻把同一个成员
+    // 叫回来干活，而不是停在「已认领 0%」等用户催。
+    static string StartPrompt(string who, AiTask t, string taskId) {
+        // 产品经理认领了也不是它自己干：它统筹，所以那一脚仍是转派。
+        if (who == AiTeam.Pm()) { return AiTeam.RoutePrompt(t); }
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人："
+            + AiTeam.DisplayName(who) + "，现在直接做");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("该由你负责的那一段：该查就查、该改就改，"
+            + "别复述计划也别重复刚才已经查过的东西。\n");
+        sb.Append(AiTeam.TickHint(t));
+        sb.Append("做完回 [report] 说清交付了什么、怎么验证的；"
+            + "真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    // 团队还欠着活儿：任务图里还有节点没到「已完成」。图是空的不算欠活儿
+    // （还没拆任务时不该替用户往下催）。
+    static bool HasUnfinished(List<AiTask> tasks) {
+        if (tasks == null) { return false; }
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            if (tasks[i].state != AiTeam.TaskDone()) { return true; }
+        }
+        return false;
+    }
+
+    // 流程自己还能推动的节点：手上正在跑（进行中 / 验收中）的那个，或者前置
+    // 齐了、又没被挂起的节点。两样都没有＝这一轮到头了（要么全部验收完成，
+    // 要么剩下的全卡在前置或挂起等人介入），这时候再催谁、再派一单都只是拿
+    // 同一个状态转圈刷屏。
+    static bool Actionable(List<AiTask> tasks) {
+        if (tasks == null) { return false; }
+        if (AiTeam.InFlight(tasks) != null) { return true; }
+        List<string> ready = AiTeam.ReadyTasks(tasks);
+        for (int i = 0; i < ready.Count; i = i + 1) {
+            AiTask t = AiTeam.TaskOf(tasks, ready[i]);
+            if (t == null) { continue; }
+            if (t.state == AiTeam.TaskBlocked()) { continue; }
+            return true;
+        }
+        return false;
+    }
+
+    // 一拍说完了却什么也没做（只回了一句「接下来看 X」、或者读文件读到次数
+    // 上限被截断）时给同一个成员的那一脚。它欠的活儿还在图上，停下来只会让
+    // 用户手打「继续」，所以直接把它叫回原地接着干。
+    // 产品经理是例外：它的活儿是盯全程和转派，不是自己下手做。催它「接着做」
+    // 只会换回一份重写的计划或又一份报告，所以给它的那一脚是「按图把这一段
+    // 交给对应负责人」。
+    static string NudgePrompt(string who, AiTask t, string taskId) {
+        if (who == AiTeam.Pm()) { return AiTeam.RoutePrompt(t); }
+        string id = taskId;
+        if (t != null) { id = t.id; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人：" + AiTeam.DisplayName(who)
+            + "。从你上次停下的地方继续");
+        if (id != "") { sb.Append("任务 " + id); }
+        if (t != null && t.title != "") { sb.Append("（" + t.title + "）"); }
+        sb.Append("：上一拍只说了下一步却没真做，现在直接发出那一步的工具调用，"
+            + "别重述计划、别重复已经查过的东西、别从头开始。\n");
+        sb.Append(AiTeam.TickHint(t));
+        if (!AiTeam.AllowsTool(who, "write_file")) {
+            // 只读角色再催「发工具调用」只会换个文件继续读：它的交付不是代码，
+            // 是一条能落地的指令。
+            sb.Append("你没有改代码的权限：代码已经读够了就别再读，直接把结论写"
+                + "成一条可执行的指令 [handoff] 给 @"
+                + AiTeam.DisplayName(AiTeam.Dev()) + " task=" + id
+                + "；确实缺前置就 [block] 说清缺什么。");
+            return sb.ToString();
+        }
+        sb.Append("做完回 [report] 说清交付了什么、怎么验证的；"
+            + "真有需要用户定的事才 [question]。");
+        return sb.ToString();
+    }
+
+    // 给产品经理的那一脚：转派，不是自己做。图上已经有这个节点就点名它的
+    // 负责人；图还没拆（或这个节点没写负责人）就交给架构师去拆——拆活儿本来
+    // 就是架构师的职责，产品经理只负责需求和统筹。
+    static string RoutePrompt(AiTask t) {
+        string who = AiTeam.OwnerOf(t);
+        if (t == null) { who = AiTeam.Arch(); }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[auto] 本拍执行人：" + AiTeam.DisplayName(AiTeam.Pm())
+            + "。你不写代码、不做设计、不自己跑测试：你的活儿是把需求讲清楚、"
+            + "盯着整条流程、需要用户拍板时才问用户。上一拍你既没交接也没提问，"
+            + "流程停住了。\n");
+        sb.Append("现在这一拍只做一件事：[handoff] @"
+            + AiTeam.DisplayName(who));
+        if (t != null) {
+            sb.Append(" task=" + t.id);
+            if (t.title != "") { sb.Append("（" + t.title + "）"); }
+        }
+        sb.Append("，一句话说清要它交付什么、验收看什么。");
+        if (t == null) {
+            sb.Append("任务图还没拆，让架构师按功能拆成节点（每个节点自己带"
+                + " 3-8 条活儿、负责人和验收标准）。");
+        }
+        sb.Append("别重发计划、别再写一遍报告、别复述已经说过的话。");
+        return sb.ToString();
+    }
+
+
+    // transcript, so "继续" survives an IDE restart.
+    static string PackState(AiTeamState st) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(st.activeAgent + "|" + st.activeTask + "|");
+        if (st.awaitingUser) { sb.Append("1"); } else { sb.Append("0"); }
+        sb.Append("|" + st.askedBy);
+        return sb.ToString();
+    }
+
+    static AiTeamState UnpackState(string s) {
+        AiTeamState st = AiTeamState.Create();
+        if (AiAgent.Trim(s) == "") { return st; }
+        List<string> parts = new List<string>();
+        int start = 0;
+        for (int i = 0; i <= s.Length; i = i + 1) {
+            bool end = i == s.Length;
+            bool bar = false;
+            if (!end) { bar = (s[i] & 255) == 124; }
+            if (end || bar) {
+                parts.Add(s.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        if (parts.Count >= 1 && parts[0] != "") { st.activeAgent = parts[0]; }
+        if (parts.Count >= 2) { st.activeTask = parts[1]; }
+        if (parts.Count >= 3) { st.awaitingUser = parts[2] == "1"; }
+        if (parts.Count >= 4) { st.askedBy = parts[3]; }
+        return st;
+    }
+
+    // 示例任务节点（提示词用）：树构建一次再序列化，字段值转义交给
+    // ToJson，文本改动不会写出非法 JSON。
+    static string SampleNode() {
+        JsonValue deps = JsonValue.NewArray(); deps.AppendStr("T-1");
+        JsonValue parts = JsonValue.NewArray(); parts.AppendStr("测试工程师");
+        JsonValue tasks = JsonValue.NewArray();
+        tasks.AppendStr("商品列表页"); tasks.AppendStr("商品详情页"); tasks.AppendStr("关键字搜索");
+        JsonValue n = JsonValue.NewObject();
+        n.PutStr("id", "T-2");
+        n.PutStr("t", "前台商品展示");
+        n.PutStr("owner", "开发者");
+        n.Put("deps", deps);
+        n.Put("parts", parts);
+        n.PutStr("accept", "列表、详情、搜索都能用真实数据打开");
+        n.Put("tasks", tasks);
+        return n.ToJson();
+    }
+}

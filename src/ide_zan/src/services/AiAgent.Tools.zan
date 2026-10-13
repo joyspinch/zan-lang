@@ -1,0 +1,485 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+using Gui;
+
+partial class AiAgent {
+    static string Run(string root, string json) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) {
+            return "error: the tool call is not valid JSON.";
+        }
+        string tool = v.Str("tool", "");
+        if (tool == "read_file") {
+            return AiAgent.ReadFile(root, v.Str("path", ""),
+                                    v.Int("offset", 1), v.Int("limit", 300));
+        }
+        if (tool == "list_dir") {
+            return AiAgent.ListDir(root, v.Str("path", ""));
+        }
+        if (tool == "grep") {
+            return AiAgent.Grep(root, v.Str("pattern", ""), v.Str("path", ""),
+                                v.Str("ext", ""));
+        }
+        if (tool == "repo_map") {
+            return AiAgent.RepoMap(root);
+        }
+        if (tool == "stdlib_read") {
+            string sroot = AiAgent.StdlibRoot();
+            if (sroot == "") { return "error: the stdlib folder was not found next to the IDE."; }
+            return AiAgent.ReadFile(sroot, v.Str("path", ""),
+                                    v.Int("offset", 1), v.Int("limit", 300));
+        }
+        if (tool == "stdlib_grep") {
+            string sroot = AiAgent.StdlibRoot();
+            if (sroot == "") { return "error: the stdlib folder was not found next to the IDE."; }
+            return AiAgent.Grep(sroot, v.Str("pattern", ""), v.Str("path", ""),
+                                v.Str("ext", ""));
+        }
+        if (tool == "api_search") {
+            return AiAgent.ApiSearch(v.Str("query", ""), v.Int("limit", 40));
+        }
+        if (tool == "pkg_list" || tool == "pkg_list_installed") {
+            return AiAgent.PkgList(root);
+        }
+        if (tool == "pkg_search") {
+            return AiAgent.PkgSearch(v.Str("query", ""));
+        }
+        if (tool == "pkg_install") {
+            return AiAgent.PkgInstall(root, v.Str("name", ""));
+        }
+        if (tool == "example") {
+            return AiAgent.Example(v.Str("topic", ""));
+        }
+        if (tool == "write_file") {
+            return AiAgent.WriteFile(root, v.Str("path", ""),
+                                     v.Str("content", ""));
+        }
+        if (tool == "edit_file") {
+            return AiAgent.EditFile(root, v.Str("path", ""),
+                                    v.Str("old", ""), v.Str("new", ""));
+        }
+        if (tool == "build" || tool == "run" || tool == "ui_check"
+            || tool == "plan" || tool == "ui_tree" || tool == "ui_snapshot"
+            || tool == "diff" || tool == "run_errors") {
+            return "error: '" + tool + "' is run by the IDE, not this dispatch.";
+        }
+        return "error: unknown tool '" + tool + "'. Available: read_file,"
+            + " list_dir, grep, repo_map, stdlib_read, stdlib_grep, api_search,"
+            + " pkg_list, pkg_search, pkg_install, example, plan, write_file,"
+            + " edit_file, build, run, ui_check, ui_tree, ui_snapshot, diff, run_errors.";
+    }
+
+
+    static string NormalizeUiScript(string script, bool withTheme) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append(script);
+        if (script.Length == 0 || script.Substring(script.Length - 1, 1) != "\n") {
+            sb.Append("\n");
+        }
+        if (ZanIDE.IndexOfStr(script, "dump hitregions") < 0) {
+            sb.Append("wait 200\ndump hitregions regions.json\n");
+        }
+        if (withTheme && ZanIDE.IndexOfStr(script, "dump theme") < 0) {
+            sb.Append("dump theme theme.json\n");
+        }
+        if (ZanIDE.IndexOfStr(script, "quit") < 0) {
+            sb.Append("wait 200\nquit\n");
+        }
+        return sb.ToString();
+    }
+
+    static string UiResult(string resultsLog, string regionsJson,
+            bool timedOut) {
+        return AiAgent.UiResultOf("ui_check", resultsLog, regionsJson, "",
+            timedOut);
+    }
+
+    static string UiResultOf(string toolName, string resultsLog,
+            string regionsJson, string themeJson, bool timedOut) {
+        StringBuilder sb = new StringBuilder();
+        if (timedOut) {
+            sb.Append(toolName + " TIMED OUT (the window did not close in"
+                + " time); partial output below.\n");
+        } else {
+            sb.Append(toolName + " finished.\n");
+        }
+        if (resultsLog != "") {
+            string rl = resultsLog;
+            if (rl.Length > 4000) {
+                rl = AiAgent.ClipTail(rl, 4000);
+            }
+            sb.Append("--- driver log ---\n" + rl);
+            if (rl.Length > 0 && rl.Substring(rl.Length - 1, 1) != "\n") {
+                sb.Append("\n");
+            }
+        } else {
+            sb.Append("--- driver log --- (empty: script produced no output)\n");
+        }
+        if (regionsJson != "") {
+            string rj = regionsJson;
+            if (rj.Length > 6000) {
+                rj = AiAgent.Clip(rj, 6000) + " ...(truncated)";
+            }
+            sb.Append("--- hit regions (x,y,w,h per widget) ---\n" + rj + "\n");
+        }
+        if (themeJson != "") {
+            string tj = themeJson;
+            if (tj.Length > 4000) {
+                tj = AiAgent.Clip(tj, 4000) + " ...(truncated)";
+            }
+            sb.Append("--- skin style tokens (scale is x1000) ---\n"
+                + tj + "\n");
+        }
+        return sb.ToString();
+    }
+
+    // --- tools ---------------------------------------------------------------
+
+    static string ReadFile(string root, string path, int offset, int limit) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!File.Exists(full)) { return "error: no such file: " + path; }
+        int fsz = File.GetSize(full);
+        if (fsz > AiAgent.MaxFileBytes()) {
+            return "error: file too large to read (" + Convert.ToString(fsz)
+                + " bytes) -- likely a build artifact or asset, not source."
+                + " Use grep to find what you need, or read a source file.";
+        }
+        int from = offset;
+        if (from < 1) { from = 1; }
+        int max = limit;
+        if (max < 1) { max = 1; }
+        if (max > 600) { max = 600; }
+        string raw = File.ReadAllText(full);
+        if (AiAgent.LooksBinary(raw)) {
+            return "error: this is a binary file (not text); skipping " + path + ".";
+        }
+        List<string> lines = ZanIDE.Lines(raw);
+        StringBuilder sb = new StringBuilder();
+        sb.Append(path + " (" + Convert.ToString(lines.Count) + " lines)\n");
+        int i = from - 1;
+        for (int shown = 0; i < lines.Count && shown < max; shown = shown + 1) {
+            sb.Append(Convert.ToString(i + 1) + ": " + lines[i] + "\n");
+            if (sb.Length > AiAgent.MaxReadChars()) {
+                sb.Append("... truncated, read again with a larger offset\n");
+                return sb.ToString();
+            }
+            i = i + 1;
+        }
+        if (i < lines.Count) {
+            sb.Append("... " + Convert.ToString(lines.Count - i)
+                + " more lines; read again with offset "
+                + Convert.ToString(i + 1) + "\n");
+        }
+        return sb.ToString();
+    }
+
+    static string ListDir(string root, string path) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!Directory.Exists(full)) { return "error: no such directory: " + path; }
+        StringBuilder sb = new StringBuilder();
+        List<string> dirs = Directory.GetDirectories(full);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            sb.Append(Path.GetFileName(dirs[i]) + "/\n");
+        }
+        List<string> files = Directory.GetFiles(full);
+        for (int f = 0; f < files.Count; f = f + 1) {
+            sb.Append(Path.GetFileName(files[f]) + "\n");
+        }
+        if (dirs.Count == 0 && files.Count == 0) { return "(empty)"; }
+        return sb.ToString();
+    }
+
+    static string Grep(string root, string pattern, string path, string ext) {
+        if (pattern == "") { return "error: grep needs a 'pattern'."; }
+        string start = AiAgent.SafePath(root, path);
+        if (start == "") { return "error: path outside the project: " + path; }
+        string scope = path;
+        if (!Directory.Exists(start)) { start = root; scope = ""; }
+        List<string> hits = new List<string>();
+        // 扫过的文件数是「没找到」这句话唯一有用的部分：模型据此知道自己是搜
+        // 空了范围（0 个文件 = path/ext 写错），还是真的整个项目里没这段字。
+        List<int> scanned = new List<int>();
+        scanned.Add(0);
+        AiAgent.GrepDir(start, root, pattern, ext, hits, 0, false, scanned);
+        bool fuzzy = false;
+        if (hits.Count == 0) {
+            // 只有大小写不同就报「没有」，模型接着会原样再搜一遍（或者去猜
+            // 一个不存在的名字）。所以第一遍空了自动降一档：忽略大小写再走
+            // 一遍，命中的话在结果里说清这是忽略大小写找到的。
+            AiAgent.GrepDir(start, root, pattern, ext, hits, 0, true, scanned);
+            fuzzy = hits.Count > 0;
+        }
+        if (hits.Count == 0) {
+            return AiAgent.GrepMiss(pattern, scope, ext, scanned[0]);
+        }
+        StringBuilder sb = new StringBuilder();
+        if (fuzzy) {
+            sb.Append("no case-sensitive match; matched ignoring case:\n");
+        }
+        for (int i = 0; i < hits.Count; i = i + 1) { sb.Append(hits[i] + "\n"); }
+        if (hits.Count >= 80) {
+            sb.Append("... more matches; narrow the pattern\n");
+        }
+        return sb.ToString();
+    }
+
+    // 「没找到」要说清搜了什么范围、扫了多少文件、这个搜索是什么语义，并给出
+    // 下一步能做的动作。原来只回一句 `no match for "[Table]"`：模型看不出自己
+    // 是范围写错了、还是把正则/标记当普通文本搜了，于是原地重复同一次调用。
+    static string GrepMiss(string pattern, string scope, string ext,
+            int scanned) {
+        string area = "the whole project";
+        if (scope != "") { area = scope; }
+        string extTxt = "any text file";
+        if (ext != "") { extTxt = "*." + ext + " only"; }
+        string s = "no match for \"" + pattern + "\" (searched " + area
+            + ", " + extTxt + ", scanned " + Convert.ToString(scanned)
+            + " file(s); plain substring search, tried case-insensitively too --"
+            + " no regex, no globs)\n";
+        if (scanned == 0) {
+            return s + "hint: nothing was scanned -- 'path' or 'ext' selects no"
+                + " file. Check the directory with list_dir first.\n";
+        }
+        if (AiAgent.HasPunctPattern(pattern)) {
+            s = s + "hint: the pattern only matches if those characters are in"
+                + " the file literally. Search the bare identifier inside it"
+                + " (e.g. \"" + AiAgent.CoreWord(pattern) + "\") or a"
+                + " declaration fragment, not a regex/markup form.\n";
+        } else {
+            s = s + "hint: this string is not in the project. Do not repeat the"
+                + " same call -- try a shorter fragment of the name, a related"
+                + " identifier, or list_dir/repo_map to find the right area.\n";
+        }
+        return s;
+    }
+
+    // 这个模式里带着正则 / 标记语法常用的符号（`[]`、`()`、`.*`、引号等）。
+    static bool HasPunctPattern(string p) {
+        for (int i = 0; i < p.Length; i = i + 1) {
+            int c = p[i] & 255;
+            if (c == 91 || c == 93 || c == 40 || c == 41 || c == 123
+                || c == 125 || c == 42 || c == 63 || c == 94 || c == 36
+                || c == 124 || c == 92 || c == 34 || c == 39) { return true; }
+        }
+        return false;
+    }
+
+    // 模式里最长的那串标识符字符（`[Table]` -> `Table`），用来给出一个真的
+    // 能搜到东西的替代模式。整串都是符号时返回原文。
+    static string CoreWord(string p) {
+        string best = "";
+        string cur = "";
+        for (int i = 0; i <= p.Length; i = i + 1) {
+            int c = 0;
+            if (i < p.Length) { c = p[i] & 255; }
+            bool word = (c >= 48 && c <= 57) || (c >= 65 && c <= 90)
+                || (c >= 97 && c <= 122) || c == 95 || c > 127;
+            if (word) {
+                cur = cur + p.Substring(i, 1);
+            } else {
+                if (cur.Length > best.Length) { best = cur; }
+                cur = "";
+            }
+        }
+        if (best == "") { return p; }
+        return best;
+    }
+
+    static void GrepDir(string dir, string root, string pattern, string ext,
+                        List<string> hits, int depth, bool fold,
+                        List<int> scanned) {
+        if (hits.Count >= 80 || depth > 8) { return; }
+        List<string> files = Directory.GetFiles(dir);
+        for (int f = 0; f < files.Count && hits.Count < 80; f = f + 1) {
+            string name = Path.GetFileName(files[f]);
+            bool want = AiAgent.TextFile(name);
+            if (ext != "" && AiAgent.ExtOf(name) != ext) { want = false; }
+            if (want) {
+                // 忽略大小写那一遍走的是同一批文件，别把它们数两遍。
+                if (!fold) { scanned[0] = scanned[0] + 1; }
+                AiAgent.GrepFile(dir + "/" + name, root, pattern, hits, fold);
+            }
+        }
+        List<string> dirs = Directory.GetDirectories(dir);
+        for (int d = 0; d < dirs.Count && hits.Count < 80; d = d + 1) {
+            string dn = dirs[d];
+            if (!AiAgent.SkipDir(dn)) {
+                AiAgent.GrepDir(dir + "/" + dn, root, pattern, ext, hits,
+                    depth + 1, fold, scanned);
+            }
+        }
+    }
+
+    static void GrepFile(string full, string root, string pattern,
+                         List<string> hits, bool fold) {
+        if (File.GetSize(full) > AiAgent.MaxFileBytes()) { return; }
+        string body = File.ReadAllText(full);
+        if (fold) {
+            pattern = ZanIDE.ToLowerS(pattern);
+            body = ZanIDE.ToLowerS(body);
+        }
+        if (ZanIDE.IndexOfStr(body, pattern) < 0) { return; }
+        string rel = full;
+        if (rel.Length > root.Length + 1 && rel.Substring(0, root.Length) == root) {
+            rel = rel.Substring(root.Length + 1, rel.Length - root.Length - 1);
+        }
+        rel = AiAgent.Slashes(rel);
+        List<string> lines = ZanIDE.Lines(body);
+        for (int i = 0; i < lines.Count && hits.Count < 80; i = i + 1) {
+            if (ZanIDE.IndexOfStr(lines[i], pattern) >= 0) {
+                string txt = lines[i];
+                if (txt.Length > 200) { txt = AiAgent.Clip(txt, 200) + "..."; }
+                hits.Add(rel + ":" + Convert.ToString(i + 1) + ": " + txt);
+            }
+        }
+    }
+
+    static string RepoMap(string root) {
+        string mapPath = root + "/.zanmap/repo.map.txt";
+        if (File.Exists(mapPath)) {
+            string rm = File.ReadAllText(mapPath);
+            if (rm.Length > 12000) { rm = AiAgent.Clip(rm, 12000) + "\n... truncated"; }
+            return rm;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("(no RepoMap outline yet; auto-generated project tree)\n");
+        AiAgent.AutoMap(root, sb, 0);
+        string tree = sb.ToString();
+        if (tree.Length > 12000) { tree = AiAgent.Clip(tree, 12000) + "\n... truncated"; }
+        return tree;
+    }
+
+    static void AutoMap(string dir, StringBuilder sb, int depth) {
+        if (depth > 6 || sb.Length > 11000) { return; }
+        List<string> dirs = Directory.GetDirectories(dir);
+        for (int d = 0; d < dirs.Count && sb.Length <= 11000; d = d + 1) {
+            string name = dirs[d];
+            if (!AiAgent.SkipDir(name)) {
+                string ind = "";
+                for (int k = 0; k < depth; k = k + 1) { ind = ind + "  "; }
+                sb.Append(ind + name + "/\n");
+                AiAgent.AutoMap(dir + "/" + name, sb, depth + 1);
+            }
+        }
+        List<string> files = Directory.GetFiles(dir);
+        for (int f = 0; f < files.Count && sb.Length <= 11000; f = f + 1) {
+            string name = Path.GetFileName(files[f]);
+            if (AiAgent.TextFile(name)) {
+                string ind = "";
+                for (int k = 0; k < depth; k = k + 1) { ind = ind + "  "; }
+                int size = File.GetSize(dir + "/" + name);
+                if (size > 0 && size <= 262144) {
+                    List<string> lines = ZanIDE.Lines(
+                        File.ReadAllText(dir + "/" + name));
+                    sb.Append(ind + name + " ("
+                        + Convert.ToString(lines.Count) + " lines)\n");
+                } else {
+                    sb.Append(ind + name + " ("
+                        + Convert.ToString(size) + " bytes)\n");
+                }
+            }
+        }
+    }
+
+
+    // 一次改动的行数变化：掐掉首尾完全相同的行之后，新文本剩下的行算「增」、
+    // 旧文本剩下的行算「删」。
+    // 这不是最小编辑距离（那要 O(n*m)，而这条路径上每写一个文件都要算一次），
+    // 对一次连续的改动它就是准的；改了好几处时它报的是「从第一处到最后一处这
+    // 一段」的行数，偏大而不会偏小，也绝不会把没动过的头尾算成改动。
+    static AiLineDelta LineDelta(string oldText, string newText) {
+        List<string> a = ZanIDE.Lines(oldText);
+        List<string> b = ZanIDE.Lines(newText);
+        if (oldText == newText) { return AiLineDelta.Of(0, 0); }
+        int head = 0;
+        while (head < a.Count && head < b.Count && a[head] == b[head]) {
+            head = head + 1;
+        }
+        int tail = 0;
+        while (tail < a.Count - head && tail < b.Count - head
+            && a[a.Count - 1 - tail] == b[b.Count - 1 - tail]) {
+            tail = tail + 1;
+        }
+        return AiLineDelta.Of(b.Count - head - tail, a.Count - head - tail);
+    }
+
+    static string WriteFile(string root, string path, string content) {
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        string dir = ZanIDE.DirOf(full);
+        if (dir != "" && dir != "." && !Directory.Exists(dir)) {
+            Directory.CreateDirectoryRecursive(dir);
+        }
+        File.WriteAllText(full, content);
+        List<string> lines = ZanIDE.Lines(content);
+        return "wrote " + path + " (" + Convert.ToString(lines.Count)
+            + " lines, " + Convert.ToString(content.Length) + " chars)";
+    }
+
+    static string EditFile(string root, string path, string oldS, string newS) {
+        if (oldS == "") {
+            return "error: edit_file needs the 'old' text to find and replace.";
+        }
+        string full = AiAgent.SafePath(root, path);
+        if (full == "") { return "error: path outside the project: " + path; }
+        if (!File.Exists(full)) { return "error: no such file: " + path; }
+        if (File.GetSize(full) > AiAgent.MaxFileBytes()) {
+            return "error: file too large to edit (" + Convert.ToString(File.GetSize(full))
+                + " bytes); this tool only edits source-sized text files.";
+        }
+        string body = File.ReadAllText(full);
+        int first = ZanIDE.IndexOfStr(body, oldS);
+        if (first < 0) {
+            return "error: 'old' text not found in " + path
+                + "; read the file and copy the exact text (including indentation).";
+        }
+        int after = first + oldS.Length;
+        string rest = body.Substring(after, body.Length - after);
+        if (ZanIDE.IndexOfStr(rest, oldS) >= 0) {
+            return "error: 'old' text appears more than once in " + path
+                + "; include more surrounding lines so the match is unique.";
+        }
+        string updated = body.Substring(0, first) + newS + rest;
+        File.WriteAllText(full, updated);
+        return "edited " + path + " (replaced 1 occurrence, now "
+            + Convert.ToString(updated.Length) + " chars)";
+    }
+
+    static string BuildResult(List<string> lines, bool ok, bool ran) {
+        StringBuilder sb = new StringBuilder();
+        if (ok) { sb.Append("build succeeded"); }
+        else { sb.Append("build FAILED"); }
+        if (ok && ran) { sb.Append("; program launched"); }
+        sb.Append(".\n");
+        List<string> keep = new List<string>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string ln = lines[i];
+            if (ZanIDE.IndexOfStr(ln, "error") >= 0
+                || ZanIDE.IndexOfStr(ln, "Error") >= 0
+                || ZanIDE.IndexOfStr(ln, "warning") >= 0) {
+                keep.Add(ln);
+            }
+        }
+        if (keep.Count == 0) {
+            int from = lines.Count - 20;
+            if (from < 0) { from = 0; }
+            int k = from;
+            while (k < lines.Count) { sb.Append(lines[k] + "\n"); k = k + 1; }
+        } else {
+            int shown = keep.Count;
+            if (shown > 40) { shown = 40; }
+            for (int k = 0; k < shown; k = k + 1) { sb.Append(keep[k] + "\n"); }
+            if (keep.Count > shown) {
+                sb.Append("... " + Convert.ToString(keep.Count - shown)
+                    + " more diagnostic lines\n");
+            }
+        }
+        return sb.ToString();
+    }
+
+}

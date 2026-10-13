@@ -1,0 +1,166 @@
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Json;
+
+partial class AiAgent {
+    static int ParsePlan(string json, List<AiPlanStep> outSteps) {
+        JsonValue v = JsonValue.ParseLenient(json);
+        if (v == null) { return 0; }
+        JsonValue items = v.Get("items");
+        if (items == null || !items.IsArray()) { return 0; }
+        for (int i = 0; i < items.Count(); i = i + 1) {
+            JsonValue it = items.At(i);
+            string txt = "";
+            bool done = false;
+            if (it.IsObject()) {
+                txt = it.Str("t", it.Str("text", ""));
+                done = it.Bool("d", it.Bool("done", false));
+            } else {
+                txt = it.AsString("");
+                if (txt.Length >= 4) {
+                    string pre = txt.Substring(0, 4);
+                    if (pre == "[x] " || pre == "[X] ") {
+                        done = true;
+                        txt = txt.Substring(4, txt.Length - 4);
+                    } else if (pre == "[ ] ") {
+                        txt = txt.Substring(4, txt.Length - 4);
+                    }
+                }
+            }
+            txt = AiAgent.Trim(txt);
+            if (txt != "") {
+                int d = 0;
+                if (done) { d = 1; }
+                outSteps.Add(AiPlanStep.Create(txt, d));
+            }
+        }
+        return outSteps.Count;
+    }
+
+    static List<AiPlanStep> MergePlan(string json, List<AiPlanStep> prev) {
+        List<AiPlanStep> fresh = new List<AiPlanStep>();
+        AiAgent.ParsePlan(json, fresh);
+        for (int i = 0; i < fresh.Count; i = i + 1) {
+            if (fresh[i].done != 0) { continue; }
+            if (AiAgent.WasDone(prev, fresh[i].text)) { fresh[i].done = 1; }
+        }
+        return fresh;
+    }
+
+    static bool WasDone(List<AiPlanStep> plan, string text) {
+        if (plan == null) { return false; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].text == text) { return plan[i].done != 0; }
+        }
+        return false;
+    }
+
+    static int PlanDone(List<AiPlanStep> plan) {
+        int n = 0;
+        if (plan == null) { return 0; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done != 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string CurStepText(List<AiPlanStep> plan) {
+        if (plan == null) { return ""; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done == 0) {
+                return Convert.ToString(i + 1) + "/"
+                    + Convert.ToString(plan.Count) + " " + plan[i].text;
+            }
+        }
+        return "";
+    }
+
+    static string PlanNote(List<AiPlanStep> prev, List<AiPlanStep> next) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("\nplan updated: " + Convert.ToString(next.Count)
+            + " step(s), " + Convert.ToString(AiAgent.PlanDone(next))
+            + " done.");
+        string cur = AiAgent.CurStepText(next);
+        if (cur != "") {
+            sb.Append(" current step: " + cur + ".");
+        } else {
+            sb.Append(" every step is ticked: say in one line what you"
+                + " delivered and stop.");
+        }
+        int gone = 0;
+        if (prev != null) {
+            for (int i = 0; i < prev.Count; i = i + 1) {
+                bool kept = false;
+                for (int j = 0; j < next.Count && !kept; j = j + 1) {
+                    if (next[j].text == prev[i].text) { kept = true; }
+                }
+                if (!kept) { gone = gone + 1; }
+            }
+        }
+        if (gone > 0) {
+            sb.Append(" NOTE: " + Convert.ToString(gone) + " step(s) of the"
+                + " previous plan are gone. Rewording a step loses its [x] and"
+                + " reads as starting over -- keep the wording of a step"
+                + " identical for the whole task, and only add or remove a step"
+                + " when the plan really changed (then say why in one line).");
+        }
+        return sb.ToString();
+    }
+
+    // 单人模式那份计划在提示词里的样子（团队模式的对应物是任务图那块板）：
+    // 整张清单、当前那一步、以及「一步一步来」的规矩。由宿主在计划变化时写
+    // 进来（`SetPlanBoard`），每一拍作为现场的一部分发出去。
+    // 不发这一段，模型就只能从对话历史里回忆自己的清单——而历史会被压缩，
+    // 摘要里那份清单是几拍之前的：于是它一会儿跳到第 5 步、一会儿回头重做第
+    // 2 步，看着毫无逻辑。
+    static string gPlanBoard;
+
+    static void SetPlanBoard(string s) { AiAgent.gPlanBoard = s; }
+
+    static string PlanBoard() {
+        if (AiAgent.gPlanBoard == null) { return ""; }
+        return AiAgent.gPlanBoard;
+    }
+
+    // 把一份计划拼成上面那一段。空计划返回 ""。
+    static string PlanBlock(List<AiPlanStep> plan) {
+        if (plan == null || plan.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("YOUR PLAN (the checklist above the chat, "
+            + Convert.ToString(AiAgent.PlanDone(plan)) + "/"
+            + Convert.ToString(plan.Count) + " done; this is the live copy --"
+            + " trust it over any plan text earlier in the conversation):\n");
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            string mark = "[ ]";
+            if (plan[i].done != 0) { mark = "[x]"; }
+            string lead = "  ";
+            if (plan[i].done == 0 && AiAgent.PlanFirstOpen(plan) == i) {
+                lead = "->";
+            }
+            sb.Append(lead + " " + Convert.ToString(i + 1) + ". " + mark + " "
+                + plan[i].text + "\n");
+        }
+        string cur = AiAgent.CurStepText(plan);
+        if (cur != "") {
+            sb.Append("Work the step marked -> (" + cur + ") to the end before"
+                + " you touch any later step; when it is really done, resend"
+                + " the plan with it marked [x]. Do not jump ahead and do not"
+                + " reword the steps.\n\n");
+        } else {
+            sb.Append("Every step is ticked: report what you delivered in one"
+                + " line and stop instead of finding new work.\n\n");
+        }
+        return sb.ToString();
+    }
+
+    // 第一条没打勾的下标（全打勾了返回 -1）。
+    static int PlanFirstOpen(List<AiPlanStep> plan) {
+        if (plan == null) { return -1; }
+        for (int i = 0; i < plan.Count; i = i + 1) {
+            if (plan[i].done == 0) { return i; }
+        }
+        return -1;
+    }
+
+}

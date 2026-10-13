@@ -1,0 +1,76 @@
+using System;
+using System.IO;
+using System.Collections.Generic;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+
+partial class ZanIDE {
+    string syncedEditorPath;
+    int syncedEditorStamp;
+    LspSession syncedEditorSession;
+
+    void EnsureLsp() {
+        if (lspSess != null || lspTried || shuttingDown) { return; }
+        lspTried = true;
+        int workspace = documentWorkspace;
+        lspSess = LspSession.StartAsync(app, root, delegate (LspSession session, bool ready) {
+            if (shuttingDown || documentWorkspace != workspace || lspSess != session) {
+                session.Shutdown();
+                return;
+            }
+            if (ready) {
+                log.Add("> zan-lsp connected: semantic navigation & completion enabled.");
+                this.SyncEditorDocument();
+                this.RefreshFoldRanges();
+            } else {
+                log.Add(ZanIDE.T("> Language service unavailable.", "> 语言服务不可用。"));
+            }
+            app.RequestRedraw();
+        });
+        lspSess.BindToEditor(editor);
+    }
+
+    // 关闭/保存/切换可能先改活动下标，旧缓冲须按实际文档路径同步。
+    void SyncEditorDocument() {
+        if (editor == null || !DocBaseline.IsFileTab(editor.documentPath)) { return; }
+        int i = lastActive;
+        if (i < 0 || i >= tabs.Count || tabs[i].path != editor.documentPath
+            || tabs[i].designDoc || ZanIDE.IsFormPath(tabs[i].path)
+            || ZanIDE.IsScenePath(tabs[i].path)) { return; }
+        int stamp = editor.TextStamp();
+        if (syncedEditorPath == editor.documentPath && syncedEditorStamp == stamp
+            && syncedEditorSession == lspSess) { return; }
+        tabs[i].body = editor.GetText();
+        if (lspSess != null && lspSess.Alive()) {
+            lspSess.SyncDoc(tabs[i].path, tabs[i].body);
+        }
+        syncedEditorPath = editor.documentPath;
+        syncedEditorStamp = stamp;
+        syncedEditorSession = lspSess;
+    }
+
+    // 把当前代码标签页的折叠区间从 zan-lsp 拉给编辑器
+    // （didOpen 全量同步 + textDocument/foldingRange）。
+    // 服务不可用或当前是设计/场景标签时静默跳过。
+    void RefreshFoldRanges() {
+        if (lspSess == null) { return; }
+        int act = activeTab.Get();
+        if (act < 0 || act >= tabs.Count) { return; }
+        if (tabs[act].designDoc || ZanIDE.IsFormPath(tabs[act].path)
+            || ZanIDE.IsScenePath(tabs[act].path)) { return; }
+        LspSession session = lspSess;
+        string path = tabs[act].path;
+        int stamp = editor.TextStamp();
+        session.SyncDoc(path, tabs[act].body);
+        session.RequestFoldingRanges(path, stamp, delegate (LspFoldingResult result) {
+            if (shuttingDown || lspSess != session || editor.documentPath != result.path
+                || editor.TextStamp() != result.stamp
+                || !session.IsCurrent(result.path, result.version, result.generation,
+                    result.documentGeneration)) { return; }
+            editor.SetFoldRegions(result.regions);
+            app.RequestRedraw();
+        });
+    }
+}
