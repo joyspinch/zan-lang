@@ -427,4 +427,257 @@ partial class ZanIDE {
         host.Open(parent);
         return host;
     }
+
+    static void ExplorerPicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.explorerTv.HasSelection()) { return; }
+        TreeNode node = ide.explorerTv.Selected();
+        if (node.isDir || node.path == "") { return; }
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, node.path, node.label);
+        ide.log.Add("> Opened " + node.path + ".");
+    }
+
+    static void ExplorerContext() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.ctxKind = 1;
+        ide.ctxX = ide.explorerTv.ContextX();
+        ide.ctxY = ide.explorerTv.ContextY();
+        ide.ctxTarget = ide.explorerTv.ContextRow();
+    }
+
+    static void StructurePicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.structTv.HasSelection()) { return; }
+        int ci = ZanIDE.OutlineLineOf(ide.structTv.Selected().path);
+        if (ci < 0) { return; }
+        if (ide.designerMode) {
+            List<FormField> flat = new List<FormField>();
+            ZanIDE.FlattenFields(ide.formDesigner.fields, flat);
+            if (ci < flat.Count) { ide.formDesigner.sel = flat[ci]; }
+        } else if (ide.sceneMode) {
+            List<SceneElement> ord = ide.sceneDesigner.OrderedByZ();
+            if (ci < ord.Count) {
+                ide.sceneDesigner.sel = ord[ci];
+                ide.sceneDesigner.selExtra = new List<SceneElement>();
+            }
+        } else {
+            ide.pendingGotoLine = ci;
+            ide.pendingGotoCol = 0;
+        }
+    }
+
+    static void ExamplePicked() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.stdlibTv.HasSelection()) { return; }
+        TreeNode en = ide.stdlibTv.Selected();
+        if (en.isDir || en.path == "") { return; }
+        if (ZanIDE.StartsWith(en.path, "@ex:")) {
+            int di = ZanIDE.FindTabByPath(ide.tabs, "@docs");
+            if (di >= 0) {
+                ide.activeTab.Set(di);
+            } else {
+                ide.tabs.Add(TabRecord.Create(ZanIDE.T("Components", "组件中心"), "", "@docs"));
+                ide.activeTab.Set(ide.tabs.Count - 1);
+            }
+            ide.lastActive = 0 - 1;
+            ide.log.Add("> Opened the GUI component center.");
+            return;
+        }
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, en.path, en.label);
+        ide.log.Add("> Opened " + en.path + ".");
+    }
+
+    static void StdlibContext() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.ctxKind = 2;
+        ide.ctxX = ide.stdlibTv.ContextX();
+        ide.ctxY = ide.stdlibTv.ContextY();
+        ide.ctxTarget = ide.stdlibTv.ContextRow();
+    }
+
+    static void ToolActivated() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.toolsTv.HasSelection()) { return; }
+        TreeNode n = ide.toolsTv.Selected();
+        if (n.isDir || n.path == "" || ZanIDE.StartsWith(n.path, "@")) { return; }
+        if (ide.buildBusy || ide.pubBusy) {
+            Layer.Msg(ZanIDE.T("Build or publish already running…", "构建或发布进行中…"), 2);
+            return;
+        }
+        ide.log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + n.path + " ...");
+        ide.BeginBuildJob(n.path, true);
+        ide.dock.Focus("output");
+    }
+
+    static void ToolContext() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.rtCtxShow = ide.toolsTv.Nodes();
+        ide.ctxKind = 4;
+        ide.ctxX = ide.toolsTv.ContextX();
+        ide.ctxY = ide.toolsTv.ContextY();
+        ide.ctxTarget = ide.toolsTv.ContextRow();
+    }
+
+    static void ExampleActivated() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.examplesTv.HasSelection()) { return; }
+        TreeNode n = ide.examplesTv.Selected();
+        if (n.isDir || n.path == "" || ZanIDE.StartsWith(n.path, "@")) { return; }
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, n.path, n.label);
+        ide.log.Add("> Opened " + n.path + ".");
+    }
+
+    static void ExampleContext() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null) { return; }
+        ide.rtCtxShow = ide.examplesTv.Nodes();
+        ide.ctxKind = 5;
+        ide.ctxX = ide.examplesTv.ContextX();
+        ide.ctxY = ide.examplesTv.ContextY();
+        ide.ctxTarget = ide.examplesTv.ContextRow();
+    }
+
+    static string GitEscape(string msg) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < msg.Length; i = i + 1) {
+            string ch = msg.Substring(i, 1);
+            if (ch != "\"" && ch != "\\" && ch != "`" && ch != "$"
+                && ch != "\r" && ch != "\n") {
+                sb.Append(ch);
+            } else if (ch == "\r" || ch == "\n") {
+                sb.Append(" ");
+            } else {
+                sb.Append("'");
+            }
+        }
+        return sb.ToString();
+    }
+
+    static string DebugBuildBegin(
+        List<TabRecord> tabs,
+        SignalInt activeTab,
+        string root,
+        List<string> log
+    ) {
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabs.Count) { return ""; }
+        string p = tabs[a].path;
+        p = ZanIDE.RibbonRunTarget(p, root);
+        if (p == "") {
+            log.Add(ZanIDE.T("> [Debug] Open a source file first.", "> [调试] 请先打开源文件。"));
+            return "";
+        }
+        string troot = ZanIDE.TargetRoot(root, p);
+        string bd = ZanIDE.EnsureBuildDir(troot);
+        string ll = bd + "/.zandbg.ll";
+        string exe = bd + "/.zandbg" + ZanIDE.ExeSuffix();
+        if (File.Exists(exe)) { File.Delete(exe); }
+        string inputs = ZanIDE.InputsArg(bd, ".zandbg_inputs",
+            ZanIDE.SmartInputs(troot, ZanIDE.DirOf(p), p));
+        string buildCmd = ZanIDE.CompileToExe(troot, p, inputs, ll, exe, false, true);
+        log.Add("> [Debug] Building " + p + " ...");
+        ZanIDE.BuildDetach(buildCmd, bd);
+        return exe;
+    }
+
+    static int FirstDebugLine(CodeEditor editor) {
+        List<string> lines = CodeEditor.SplitLines(editor.GetText());
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = ZanIDE.TrimLeadSpaces(lines[i]);
+            bool skip = line == "" || line == "{" || line == "}"
+                || ZanIDE.Has(line, "using ")
+                || ZanIDE.Has(line, "class ")
+                || ZanIDE.Has(line, "static void Main")
+                || ZanIDE.Has(line, "//");
+            if (!skip) { return i; }
+        }
+        return 0;
+    }
+
+    static void LogVarsToConsole(List<string> log, List<DbgVar> vars, int execLine) {
+        log.Add("> --- Line " + Convert.ToString(execLine + 1) + " ---");
+        for (int vi = 0; vi < vars.Count; vi = vi + 1) {
+            DbgVar entry = vars[vi];
+            string vn = entry.name;
+            string vt = entry.type;
+            string vv = entry.val;
+            log.Add(">   " + vn + " : " + vt + " = " + vv);
+        }
+    }
+
+    static List<TreeNode> BuildStdlibTree() {
+        List<TreeNode> n = ZanIDE.BuildDirTree(ZanIDE.StdlibDir());
+        for (int i = 0; i < n.Count; i = i + 1) {
+            if (n[i].isDir) { n[i].expanded = false; }
+        }
+        return n;
+    }
+
+    static List<TreeNode> BuildDirTree(string dir) {
+        List<TreeNode> n = new List<TreeNode>();
+        if (dir != "" && Directory.Exists(dir)) {
+            ZanIDE.ScanExamplesInto(n, dir, 0);
+        }
+        return n;
+    }
+
+    static List<TreeNode> BuildExampleTree() {
+        List<TreeNode> n = new List<TreeNode>();
+        string dir = ZanIDE.ExamplesDir();
+        if (dir != "") {
+            ZanIDE.ScanExamplesInto(n, dir, 0);
+        }
+        if (n.Count == 0) {
+            n.Add(TreeNode.Dir(ZanIDE.T("GUI Reference", "GUI 参考"), 0, true));
+            n.Add(ZanIDE.ExLeaf(
+                ZanIDE.T("Component Center", "组件示例中心"), 0));
+        }
+        return n;
+    }
+
+    static void ScanExamplesInto(List<TreeNode> nodes, string dirPath, int depth) {
+        FileTree.Into(nodes, dirPath, "", depth, true,
+            PathFilter.Only(".zan"), false, true);
+    }
+
+    static TreeNode ExLeaf(string label, int idx) {
+        TreeNode f = TreeNode.FileIcon(label, 1, "file");
+        f.path = "@ex:" + Convert.ToString(idx);
+        return f;
+    }
+
+    static int FindTabByPath(List<string> paths, string p) {
+        for (int i = 0; i < paths.Count; i = i + 1) {
+            if (paths[i] == p) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static string ToLowerS(string s) {
+        string up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lo = "abcdefghijklmnopqrstuvwxyz";
+        string o = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            bool done = false;
+            for (int k = 0; k < 26 && !done; k = k + 1) {
+                if (up.Substring(k, 1) == ch) { o = o + lo.Substring(k, 1); done = true; }
+            }
+            if (!done) { o = o + ch; }
+        }
+        return o;
+    }
+
+    static bool ContainsS(string hay, string needle) {
+        if (needle.Length == 0) { return true; }
+        if (hay.Length < needle.Length) { return false; }
+        int last = hay.Length - needle.Length;
+        for (int i = 0; i <= last; i = i + 1) {
+            if (hay.Substring(i, needle.Length) == needle) { return true; }
+        }
+        return false;
+    }
 }
