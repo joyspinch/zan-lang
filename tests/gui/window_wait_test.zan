@@ -1,0 +1,55 @@
+using System;
+using System.Threading;
+using Gui.Backend;
+
+class Program {
+    static void Assert(bool condition, string message) {
+        if (!condition) { throw new Exception(message); }
+    }
+
+    static void Drain(Window window) {
+        for (int i = 0; i < 256; i++) {
+            int result = window.PollEvent();
+            Assert(result >= 0, "unexpected window quit");
+            if (result == 1) { return; }
+        }
+        throw new Exception("window event queue did not settle");
+    }
+
+    static void Main() {
+        #if WINDOWS
+        // A hidden native window avoids paint/input traffic masking the Wake test.
+        Window window = new Window("Window wait regression", 160, 100);
+        Drain(window);
+        Assert(window.WaitEventTimeout(0) == 1, "empty zero wait must time out");
+        Assert(window.WaitEventTimeout(0 - 1) == 1, "negative wait must be nonblocking");
+        double hz = window.RefreshRate();
+        Assert(hz > 1.0 && hz <= 1000.0, "display refresh query must be bounded");
+
+        long start = Stopwatch.GetMicroseconds();
+        Assert(window.WaitEventTimeout(8) == 1, "empty timed wait must time out");
+        Assert(Stopwatch.GetMicroseconds() - start >= 6000,
+            "short frame deadline must not expire immediately");
+
+        for (int i = 0; i < 3; i++) {
+            Drain(window);
+            AtomicInt sent = new AtomicInt(0);
+            Task worker = Task.Run(delegate () {
+                Thread.Sleep(40);
+                sent.Store(1);
+                window.Wake();
+            });
+            start = Stopwatch.GetMicroseconds();
+            while (sent.Load() == 0 && Stopwatch.GetMicroseconds() - start < 700000) {
+                Assert(window.WaitEventTimeout(1000) >= 0, "wake wait must not quit");
+            }
+            long elapsed = Stopwatch.GetMicroseconds() - start;
+            worker.Wait();
+            Assert(sent.Load() == 1 && elapsed < 700000,
+                "background Wake must interrupt a one-second native wait");
+        }
+        window.Destroy();
+        #endif
+        Console.WriteLine("PASS window wait");
+    }
+}

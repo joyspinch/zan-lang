@@ -1,0 +1,74 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+class FrameCadenceTest {
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Rate(double hz) {
+        FrameCadence clock = new FrameCadence();
+        clock.SetRate(hz);
+        long now = 1000000;
+        clock.Begin(now);
+        for (int i = 1; i <= 10000; i++) {
+            long expected = (long)Math.Ceiling(1000000.0 + i * 1000000.0 / hz);
+            long due = clock.DeadlineUs();
+            FrameCadenceTest.Check(Math.Abs((double)(due - expected)) <= 1.0,
+                "fractional cadence drift at " + hz);
+            int wait = clock.WaitMilliseconds(due - 3200);
+            FrameCadenceTest.Check(wait == 4, "deadline rounds up remaining time");
+            FrameCadenceTest.Check(clock.WaitMilliseconds(due) == 0, "due frame is immediate");
+            clock.Begin(due);
+        }
+        long beforeInput = clock.DeadlineUs();
+        clock.Begin(beforeInput - 1000);
+        FrameCadenceTest.Check(clock.DeadlineUs() == beforeInput,
+            "early input frame must preserve animation deadline");
+        long late = beforeInput + 1000000;
+        clock.Begin(late);
+        long recovered = clock.DeadlineUs();
+        FrameCadenceTest.Check(recovered > late && recovered - late <= (long)Math.Ceiling(1000000.0 / hz),
+            "late frame skips backlog without catch-up storm");
+    }
+
+    static void PollInput() {
+        #if WINDOWS
+        App app = App.CreateDark("Frame cadence input", 320, 240);
+        int drained = 0;
+        while (drained < 64 && app.PollOneEvent() > 0) { drained++; }
+        app.needsRedraw = true;
+        app.lastPresentMs = Window.GetTickMs();
+        app.window.InjectEvent(2, 80, 90, 0, 0, 0);
+        long start = Stopwatch.GetMicroseconds();
+        int result = app.PollOneEvent();
+        long elapsed = Stopwatch.GetMicroseconds() - start;
+        FrameCadenceTest.Check(result == 1 && app.EventKind() == 2, "queued press consumed");
+        FrameCadenceTest.Check(elapsed < 12000, "input poll slept a frame budget");
+        FrameCadenceTest.Check(app.mouseX == 80 && app.mouseY == 90, "press coordinates updated without hover");
+        app.window.InjectEvent(3, 80, 90, 0, 0, 0);
+        FrameCadenceTest.Check(app.PollOneEvent() == 1 && app.EventKind() == 3, "queued release preserved");
+        app.window.Destroy();
+        app.canvas.Destroy();
+        #endif
+    }
+
+    static void Main() {
+        FrameCadenceTest.Rate(60.0);
+        FrameCadenceTest.Rate(90.0);
+        FrameCadenceTest.Rate(120.0);
+        FrameCadenceTest.Rate(144.0);
+        FrameCadenceTest.Rate(240.0);
+        FrameCadence clock = new FrameCadence();
+        clock.SetRate(0.0);
+        FrameCadenceTest.Check(clock.Rate() == 60.0, "invalid display fallback");
+        clock.SetRate(144.0);
+        clock.Begin(1000000);
+        clock.SetRate(120.0);
+        clock.Begin(2000000);
+        FrameCadenceTest.Check(clock.DeadlineUs() == 2008334, "monitor rate change resets cadence");
+        FrameCadenceTest.PollInput();
+        Console.WriteLine("FRAME_CADENCE_OK");
+    }
+}

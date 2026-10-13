@@ -1,0 +1,148 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+using Game.Foundation.Gui;
+
+class GuiHostLoopTest : IGuiHostLoop {
+    Button button;
+    int frames;
+    int fixedSteps;
+    int fixedMilliseconds;
+    int elapsedMilliseconds;
+    int presses;
+    int releases;
+    int clicks;
+    int keyPresses;
+    int keyReleases;
+    int updates;
+    bool started;
+    bool stopped;
+    long startUs;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + label);
+            throw new Exception(label);
+        }
+        Console.WriteLine("PASS " + label);
+    }
+
+    void OnClick() { clicks++; }
+
+    void Diagnose(GuiHost host, string label) {
+        App app = host.App();
+        Console.WriteLine("GUIHOST_DIAG " + label + " visible=" + app.window.IsVisible()
+            + " focused=" + app.window.IsFocused() + " handle=" + app.window.handle
+            + " frames=" + frames + " updates=" + updates + " steps=" + fixedSteps
+            + " elapsed_ms=" + elapsedMilliseconds
+            + " wall_ms=" + ((Stopwatch.GetMicroseconds() - startUs) / 1000)
+            + " presses=" + presses + " releases=" + releases + " clicks=" + clicks
+            + " key_down=" + keyPresses + " key_up=" + keyReleases
+            + " poll=" + app.lastPollResult + " event=" + app.EventKind());
+    }
+
+    void Start(GuiHost host) {
+        started = true;
+        startUs = Stopwatch.GetMicroseconds();
+        App app = host.App();
+        // CMake 隐藏启动会影响进程首次 ShowWindow；本用例验证可见渲染，显式再显示测试窗口。
+        app.window.Show();
+        #if WINDOWS
+        // SW_SHOW 保留最小化状态；恢复仅此测试自己的窗口，不改宿主的隐藏行为。
+        if (Win32Shell.IsIconic(app.window.handle) != 0) {
+            Win32Shell.ShowWindow(app.window.handle, 9);
+        }
+        #endif
+        app.EnableSkins(0);
+        button = new Button("HUD action");
+        button.Click.Add(() => this.OnClick());
+        button.MeasureTree(app);
+        button.Arrange(40, app.ContentTop() + 30, 160, 48);
+        host.Hud().Add(button);
+    }
+
+    void Event(GuiHost host, int kind, int keycode) {
+        if (kind == 2) { presses++; }
+        if (kind == 3) { releases++; }
+        if (kind == 4 && keycode == 65) { keyPresses++; }
+        if (kind == 5 && keycode == 65) { keyReleases++; }
+    }
+
+    void FixedUpdate(GuiHost host, int deltaMilliseconds) {
+        fixedSteps++;
+        fixedMilliseconds += deltaMilliseconds;
+        if (deltaMilliseconds != 100) { throw new Exception("fixed simulation interval changed"); }
+    }
+
+    void Update(GuiHost host, int deltaMilliseconds) {
+        updates++;
+        elapsedMilliseconds += deltaMilliseconds;
+        // 隐藏窗口只推进 Update，不能把有界退出条件放在 Render 内。
+        if (Stopwatch.GetMicroseconds() - startUs > 5000000) {
+            this.Diagnose(host, "five-second guard");
+            throw new Exception("GuiHost regression did not finish within five seconds");
+        }
+    }
+
+    void Inject(GuiHost host, int kind, int x, int y) {
+        host.App().window.InjectEvent(kind, x, y, 0, 0, 0);
+    }
+
+    void Render(GuiHost host, Canvas canvas, double alpha) {
+        frames++;
+        canvas.Clear(0xff14291f);
+        int x = button.bx + button.bw / 2;
+        int y = button.by + button.bh / 2;
+        // Split press/release across frames, then drain both in one frame.
+        if (frames == 3) { this.Inject(host, 2, x, y); }
+        if (frames == 4) { this.Inject(host, 3, x, y); }
+        if (frames == 9) {
+            this.Inject(host, 2, x, y);
+            this.Inject(host, 3, x, y);
+            // Display callbacks and wake packets carry no input kind.
+            this.Inject(host, 0, 0, 0);
+        }
+        // Two complete clicks and later pointer/key events share one queue.
+        if (frames == 15) {
+            this.Inject(host, 2, x, y);
+            this.Inject(host, 3, x, y);
+            this.Inject(host, 2, x, y);
+            this.Inject(host, 3, x, y);
+            this.Inject(host, 1, x + 200, y);
+            host.App().window.InjectEvent(4, 0, 0, 0, 65, 0);
+            host.App().window.InjectEvent(5, 0, 0, 0, 65, 0);
+        }
+        if (elapsedMilliseconds >= 1000 && frames >= 30) { host.RequestStop(); }
+        if (frames > 500) { throw new Exception("GuiHost loop did not stop"); }
+    }
+
+    void Stop(GuiHost host) {
+        stopped = true;
+        if (!started || updates != frames || fixedSteps < 5
+            || fixedMilliseconds != fixedSteps * 100 || frames <= fixedSteps * 2
+            || presses != 4 || releases != 4 || clicks != 4
+            || keyPresses != 1 || keyReleases != 1) {
+            this.Diagnose(host, "exit assertions");
+        }
+        GuiHostLoopTest.Check(started, "Start precedes callbacks");
+        GuiHostLoopTest.Check(updates == frames, "one Update per rendered frame");
+        GuiHostLoopTest.Check(fixedSteps >= 5 && fixedMilliseconds == fixedSteps * 100,
+            "fixed simulation advances while rendering independently");
+        GuiHostLoopTest.Check(frames > fixedSteps * 2,
+            "render cadence is independent of fixed simulation interval");
+        GuiHostLoopTest.Check(presses == 4 && releases == 4,
+            "all injected HUD press/release events reach game loop");
+        GuiHostLoopTest.Check(keyPresses == 1 && keyReleases == 1,
+            "queued key press/release reach game loop");
+        GuiHostLoopTest.Check(clicks == 4, "HUD clicks survive drain and repaint without replay");
+    }
+
+    static void Main() {
+        GuiHostLoopTest loop = new GuiHostLoopTest();
+        GuiHost host = new GuiHost("GuiHost HUD input regression", 360, 240, 100);
+        GuiHostLoopTest.Check(host.Run(loop), "host returns normally");
+        GuiHostLoopTest.Check(loop.stopped, "Stop called exactly at loop exit");
+        Console.WriteLine("GUIHOST_LOOP_OK");
+    }
+}

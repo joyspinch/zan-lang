@@ -1,0 +1,196 @@
+using System;
+using Gui;
+
+// No drawing: isolate the retained style/layout contract from raster cost.
+class StyleContextProbe : Control {
+    int seenWidth;
+    int resolves;
+    bool failMeasure;
+    bool sawSelf;
+
+    StyleContextProbe(string n) {
+        this.InitControl(n, 0);
+        styleSurfaceOwned = true;
+    }
+
+    override string StyleType() { return "cacheprobe"; }
+
+    override StyleBox ResolveStyle(App app, int state) {
+        resolves = resolves + 1;
+        return base.ResolveStyle(app, state);
+    }
+
+    override void OnMeasure(App app) {
+        sawSelf = app.styleCtx == this;
+        seenWidth = this.StyleWidth();
+        if (failMeasure) { throw new Exception("measure context probe"); }
+    }
+}
+
+class StyleContextCacheTest {
+    static void Check(string label, bool ok) {
+        if (ok) { return; }
+        Console.WriteLine("FAIL " + label);
+        throw new Exception("Style context: " + label);
+    }
+
+    static void Eq(string label, int actual, int expected) {
+        StyleContextCacheTest.Check(label + " actual=" + Convert.ToString(actual)
+            + " expected=" + Convert.ToString(expected), actual == expected);
+    }
+
+    static void StableCache(App app, bool relational) {
+        app.UseAppCss(relational
+            ? ".host .leaf { width:37px; height:19px; }"
+            : ".leaf { width:37px; height:19px; }");
+        StyleContextProbe root = new StyleContextProbe("root");
+        root.Class = "host";
+        StyleContextProbe middle = new StyleContextProbe("middle");
+        StyleContextProbe leaf = new StyleContextProbe("leaf");
+        leaf.Class = "leaf";
+        root.Add(middle);
+        middle.Add(leaf);
+        StyleContextProbe outer = new StyleContextProbe("outer");
+        app.styleCtx = outer;
+        root.MeasureTree(app);
+        StyleContextCacheTest.Check("measure restores caller", app.styleCtx == outer);
+        StyleContextCacheTest.Check("measure uses self", root.sawSelf && middle.sawSelf && leaf.sawSelf);
+        StyleContextCacheTest.Eq("descendant measured width", leaf.seenWidth, 37);
+        StyleBox rootStyle = root.computedStyle;
+        StyleBox middleStyle = middle.computedStyle;
+        StyleBox leafStyle = leaf.computedStyle;
+        root.Arrange(0, 0, 320, 240);
+        int before = Style.StatPeek(0);
+        for (int i = 0; i < 3; i = i + 1) {
+            root.RenderTree(app);
+            StyleContextCacheTest.Check("render restores caller", app.styleCtx == outer);
+            root.MeasureTree(app);
+            root.Arrange(0, 0, 320, 240);
+        }
+        StyleContextCacheTest.Check("root retains owned box", root.computedStyle == rootStyle);
+        StyleContextCacheTest.Check("middle retains owned box", middle.computedStyle == middleStyle);
+        StyleContextCacheTest.Check("leaf retains owned box", leaf.computedStyle == leafStyle);
+        StyleContextCacheTest.Eq("steady style resolutions", Style.StatPeek(0) - before, 0);
+        StyleContextCacheTest.Eq("root resolves once", root.resolves, 1);
+        StyleContextCacheTest.Eq("leaf resolves once", leaf.resolves, 1);
+        StyleContextCacheTest.Check("context dependency matches sheet",
+            relational ? leaf.computedStyleCtx != "" : leaf.computedStyleCtx == "");
+        if (relational) {
+            root.Class = "other";
+            root.MeasureTree(app);
+            StyleContextCacheTest.Check("ancestor class invalidates", leaf.computedStyle != leafStyle);
+            StyleContextCacheTest.Check("ancestor selector stops matching", leaf.seenWidth != 37);
+            root.Class = "host";
+            root.MeasureTree(app);
+            StyleContextCacheTest.Eq("ancestor selector restored", leaf.seenWidth, 37);
+            root.Remove(middle);
+            middle.MeasureTree(app);
+            StyleContextCacheTest.Check("reparent invalidates descendant", leaf.seenWidth != 37);
+        }
+        app.styleCtx = null;
+    }
+
+    static void Structural(App app) {
+        app.UseAppCss(".host > .leaf:first-child { width:23px; }"
+            + " .host > .leaf:last-child { height:17px; }");
+        StyleContextProbe root = new StyleContextProbe("structural-root");
+        root.Class = "host";
+        StyleContextProbe first = new StyleContextProbe("first");
+        StyleContextProbe last = new StyleContextProbe("last");
+        first.Class = "leaf";
+        last.Class = "leaf";
+        root.Add(first);
+        root.Add(last);
+        root.MeasureTree(app);
+        StyleContextCacheTest.Eq("first-child measured width", first.seenWidth, 23);
+        StyleContextCacheTest.Check("second child excluded", last.seenWidth != 23);
+        StyleContextCacheTest.Eq("last-child measured height", last.StyleHeight(), 17);
+        root.Remove(first);
+        root.MeasureTree(app);
+        StyleContextCacheTest.Eq("sibling index invalidates", last.seenWidth, 23);
+    }
+
+    static void RestoreContext(App app) {
+        StyleContextProbe outer = new StyleContextProbe("caller");
+        app.styleCtx = outer;
+        StyleContextProbe hidden = new StyleContextProbe("hidden");
+        hidden.SetShown(false);
+        hidden.MeasureTree(app);
+        StyleContextCacheTest.Check("hidden restores caller", app.styleCtx == outer);
+        StyleContextProbe failure = new StyleContextProbe("failure");
+        failure.failMeasure = true;
+        bool caught = false;
+        try { failure.MeasureTree(app); }
+        catch (Exception ex) { caught = true; }
+        StyleContextCacheTest.Check("measure threw", caught);
+        StyleContextCacheTest.Check("exception restores caller", app.styleCtx == outer);
+        app.styleCtx = null;
+    }
+
+    static void OwnedStyle(App app) {
+        app.UseAppCss(".leaf { width:37px; height:19px; }");
+        StyleContextProbe a = new StyleContextProbe("shared");
+        StyleContextProbe b = new StyleContextProbe("shared");
+        a.Class = "leaf";
+        b.Class = "leaf";
+        a.Bg(0xff123456);
+        a.MeasureTree(app);
+        b.MeasureTree(app);
+        StyleContextCacheTest.Check("cache clones remain owned", a.computedStyle != b.computedStyle);
+        StyleContextCacheTest.Check("inline does not mutate cache", b.computedStyle.bg != 0xff123456);
+        StyleContextCacheTest.Eq("cached geometry remains intact", b.seenWidth, 37);
+    }
+
+    // Optional A/B mode prints timings without correctness assertions so the same
+    // fixture can be compiled against the pre-fix source snapshot.
+    static void Bench(App app, bool relational) {
+        app.UseAppCss(relational ? ".host > .leaf { width:1px; height:1px; }"
+                                : ".leaf { width:1px; height:1px; }");
+        StyleContextProbe root = new StyleContextProbe("bench-root");
+        root.Class = "host";
+        for (int i = 0; i < 200; i = i + 1) {
+            StyleContextProbe leaf = new StyleContextProbe("bench-" + Convert.ToString(i));
+            leaf.Class = "leaf";
+            root.Add(leaf);
+        }
+        for (int warm = 0; warm < 3; warm = warm + 1) {
+            root.MeasureTree(app);
+            root.Arrange(0, 0, 320, 240);
+            root.RenderTree(app);
+        }
+        int before = Style.StatPeek(0);
+        int frames = 120;
+        long measureUs = 0;
+        long pipelineStart = Stopwatch.GetMicroseconds();
+        for (int frame = 0; frame < frames; frame = frame + 1) {
+            long start = Stopwatch.GetMicroseconds();
+            root.MeasureTree(app);
+            measureUs = measureUs + Stopwatch.GetMicroseconds() - start;
+            root.Arrange(0, 0, 320, 240);
+            root.RenderTree(app);
+        }
+        long pipelineUs = Stopwatch.GetMicroseconds() - pipelineStart;
+        Console.WriteLine("STYLE_CONTEXT_BENCH relational=" + Convert.ToString(relational)
+            + " nodes=201 frames=" + Convert.ToString(frames)
+            + " style_resolve=" + Convert.ToString(Style.StatPeek(0) - before)
+            + " measure_us=" + Convert.ToString(measureUs)
+            + " pipeline_us=" + Convert.ToString(pipelineUs));
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("Style context", 320, 240);
+        app.SetOffscreenViewport(320, 240, 100);
+        if (Interop.EnvVar("ZAN_STYLE_CONTEXT_BENCH") == "1") {
+            StyleContextCacheTest.Bench(app, false);
+            StyleContextCacheTest.Bench(app, true);
+        } else {
+            StyleContextCacheTest.StableCache(app, false);
+            StyleContextCacheTest.StableCache(app, true);
+            StyleContextCacheTest.Structural(app);
+            StyleContextCacheTest.RestoreContext(app);
+            StyleContextCacheTest.OwnedStyle(app);
+            Console.WriteLine("STYLE_CONTEXT_CACHE_OK");
+        }
+        app.canvas.Destroy();
+    }
+}

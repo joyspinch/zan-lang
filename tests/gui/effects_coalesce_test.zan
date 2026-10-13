@@ -1,0 +1,178 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Backend;
+
+class EffectsCoalesceTest {
+    static void Check(bool ok, string message) {
+        if (ok) { return; }
+        Console.WriteLine("FAIL Fx coalescing: " + message);
+        throw new Exception("Fx coalescing: " + message);
+    }
+
+    static void Paint(Canvas c, int x, int y, int w, int h, int color) {
+        // The page paints normally; Canvas clipping alone limits partial work.
+        c.FillRect(0, 0, c.Width(), c.Height(), 0xff17232d);
+        c.FillRect(x, y, w, h, color);
+    }
+
+    static void SamePixels(App app, int x, int y, int w, int h, int color, int ms) {
+        Canvas reference = new Canvas(app.canvas.Width(), app.canvas.Height());
+        Paint(reference, x, y, w, h, color);
+        BackdropFx.Render(app, reference, app.EffectiveFx(), 0, 0,
+            reference.Width(), reference.Height(), ms, app.theme, app.dpiScale);
+        BackdropFx.TakeDamage();
+        for (int py = 0; py < reference.Height(); py++) {
+            for (int px = 0; px < reference.Width(); px++) {
+                if (app.canvas.GetPixel(px, py) != reference.GetPixel(px, py)) {
+                    Check(false, "pixels at " + Convert.ToString(px) + ","
+                        + Convert.ToString(py));
+                }
+            }
+        }
+        reference.Destroy();
+    }
+
+    #if WINDOWS
+    static int Presents() {
+        string log = File.ReadAllText("present_log.txt");
+        List<string> lines = log.Split("\n");
+        int count = 0;
+        for (int i = 0; i < lines.Count; i++) {
+            if (lines[i].StartsWith("blit ")) { count++; }
+        }
+        return count;
+    }
+
+    static bool Declared(int x, int y) {
+        if (Win32Shell.dirtyOverflow) { return true; }
+        for (int i = 0; i < Win32Shell.dirtyRects.Count; i++) {
+            Win32DirtyRect r = Win32Shell.dirtyRects[i];
+            if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static void Partial(App app, int ms, int x, int y, int w, int h, int color,
+                        bool fullRepair) {
+        int cw = app.canvas.Width();
+        int ch = app.canvas.Height();
+        int[] previous = new int[cw * ch];
+        for (int py = 0; py < ch; py++) {
+            for (int px = 0; px < cw; px++) {
+                previous[py * cw + px] = app.canvas.GetPixel(px, py);
+            }
+        }
+        app.FreezeAnimClock(ms);
+        app.fxNextMs = ms;
+        app.animNextMs = ms;
+        app.animRectValid = true;
+        app.animRectAll = false;
+        app.animRX = x;
+        app.animRY = y;
+        app.animRW = w;
+        app.animRH = h;
+        app.needsRedraw = false;
+        if (fullRepair) { app.fxTouchedFull = true; }
+        File.WriteAllText("present_log.txt", "");
+        Check(app.TakeDueFrame(ms), "page tick must be due");
+        Check(Presents() == 0, "Fx must not present ahead of a due page");
+        Check(app.partialPending, "due page must retain its partial clip");
+        Check(app.fxFrameMs == ms, "outside Fx must advance this tick");
+        Check(app.fxPagePending, "Fx composition must wait for page present");
+        int changed = 0;
+        int erased = 0;
+        for (int py = 0; py < ch; py++) {
+            for (int px = 0; px < cw; px++) {
+                bool outside = px < app.dmgX || px >= app.dmgX + app.dmgW
+                    || py < app.dmgY || py >= app.dmgY + app.dmgH;
+                int pixel = app.canvas.GetPixel(px, py);
+                if (outside && pixel != previous[py * cw + px]) {
+                    changed++;
+                    Check(Declared(px, py), "old/new Fx upload damage missing");
+                    if (pixel == 0xff17232d) { erased++; }
+                }
+            }
+        }
+        Check(changed > 0, "outside Fx must have visibly moved");
+        Check(erased > 0, "old outside Fx positions must be cleared");
+        app.BeginFrame();
+        Check(app.partialFrame, "page rendering must remain partial");
+        Paint(app.canvas, x, y, w, h, color);
+        app.PresentFrame();
+        Check(Presents() == 1, "Fx plus page must present exactly once");
+        Check(!app.fxPagePending && app.fxNextMs > ms,
+            "next Fx tick must follow the final presentation");
+        SamePixels(app, x, y, w, h, color, ms);
+    }
+    #endif
+
+    static void Main() {
+        #if WINDOWS
+        bool logExisted = File.Exists("present_log.txt");
+        string oldLog = logExisted ? File.ReadAllText("present_log.txt") : "";
+        App app = new App("Fx/page coalescing regression", 320, 240, true);
+        app.Show();
+        // CMake can supply SW_HIDE for the first ShowWindow of the process.
+        app.window.Show();
+        if (Win32Shell.IsIconic(app.window.handle) != 0) {
+            Win32Shell.ShowWindow(app.window.handle, 9);
+        }
+        bool oldLogging = Win32Shell.presentLog;
+        Win32Shell.presentLog = true;
+        try {
+            app.SetPartialFrames(true);
+            app.SetFxKind(BackdropFx.KindStars());
+            app.FreezeAnimClock(1000);
+            app.BeginFrame();
+            Paint(app.canvas, 20, 60, 120, 24, 0xff35516e);
+            app.PresentFrame();
+            Check(app.fxSnapValid, "initial clean snapshot must exist");
+            SamePixels(app, 20, 60, 120, 24, 0xff35516e, 1000);
+
+            Partial(app, 1400, 20, 60, 120, 24, 0xff8a5135, false);
+            Partial(app, 1800, 20, 60, 120, 24, 0xff35516e, false);
+            // A repaired full Fx surface still joins one partial page present.
+            Partial(app, 2200, 20, 60, 120, 24, 0xff8a5135, true);
+            // Wide strips must patch the clean snapshot too, or the next tick
+            // erases the new page content by restoring an obsolete baseline.
+            int wideW = app.canvas.Width() - 40;
+            int wideH = app.canvas.Height() - 60;
+            Partial(app, 2600, 20, 30, wideW, wideH, 0xff35516e, false);
+
+            app.FreezeAnimClock(3000);
+            app.needsRedraw = false;
+            app.fxNextMs = 3000;
+            File.WriteAllText("present_log.txt", "");
+            Check(!app.TakeDueFrame(3000), "standalone Fx must not render a page");
+            Check(Presents() == 1, "standalone Fx must still present once");
+            SamePixels(app, 20, 30, wideW, wideH, 0xff35516e, 3000);
+
+            app.FreezeAnimClock(3400);
+            app.fxNextMs = 3400;
+            app.animNextMs = 3400;
+            app.animRectAll = true;
+            app.needsRedraw = false;
+            File.WriteAllText("present_log.txt", "");
+            Check(app.TakeDueFrame(3400), "full page tick must be due");
+            Check(Presents() == 0, "full page must absorb Fx without presenting first");
+            app.BeginFrame();
+            Check(!app.partialFrame, "full page must remain full");
+            Paint(app.canvas, 20, 30, wideW, wideH, 0xff8a5135);
+            app.PresentFrame();
+            Check(Presents() == 1, "full page plus Fx must present once");
+            SamePixels(app, 20, 30, wideW, wideH, 0xff8a5135, 3400);
+        } finally {
+            Win32Shell.presentLog = oldLogging;
+            app.UnfreezeAnimClock();
+            app.window.Destroy();
+            app.canvas.Destroy();
+            if (logExisted) { File.WriteAllText("present_log.txt", oldLog); }
+            else { File.Delete("present_log.txt"); }
+        }
+        #endif
+        Console.WriteLine("EFFECTS_COALESCE_OK");
+    }
+}

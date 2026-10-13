@@ -1,0 +1,138 @@
+using System;
+using System.IO;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+class NativeWaitWakeTest {
+    static Window window;
+    static AtomicInt sent = new AtomicInt(0);
+
+    static void WakeWorker() {
+        Thread.Sleep(40);
+        sent.Store(1);
+        window.Wake();
+    }
+
+    static void InjectWorker() {
+        Thread.Sleep(40);
+        window.InjectEvent(2, 80, 90, 0, 0, 0);
+    }
+
+    static void Check(bool ok, string label) {
+        if (!ok) { throw new Exception(label); }
+    }
+
+    static void Drain() {
+        for (int i = 0; i < 256 && window.PollEvent() == 0; i++) { }
+    }
+
+    static void Main() {
+        try { NativeWaitWakeTest.Run(); }
+        catch (Exception error) {
+            #if ANDROID
+            File.WriteAllText("/sdcard/Android/data/com.zan.nativewait/files/native_wait_wake.txt",
+                "NATIVE_WAIT_WAKE_FAIL " + error.Message);
+            #else
+            throw error;
+            #endif
+        }
+    }
+
+    static void Run() {
+        App app = App.CreateDark("Native wait wake", 320, 480);
+        app.SetChromeVisible(false);
+        app.Show();
+        window = app.window;
+        NativeWaitWakeTest.Check(window.RefreshRate() >= 24.0, "valid display refresh rate");
+        NativeWaitWakeTest.Drain();
+        NativeWaitWakeTest.Check(window.WaitEventTimeout(0) == 1, "empty zero-timeout poll");
+        ThreadStart wakeBody = NativeWaitWakeTest.WakeWorker;
+        NativeWaitWakeTest.Check(Thread.Start(wakeBody), "background wake thread starts");
+        long start = Stopwatch.GetMicroseconds();
+        int result = 1;
+        while (sent.Load() == 0 && Stopwatch.GetMicroseconds() - start < 500000) {
+            result = window.WaitEventTimeout(1000);
+        }
+        long elapsed = Stopwatch.GetMicroseconds() - start;
+        NativeWaitWakeTest.Check(sent.Load() == 1 && result == 0 && elapsed < 500000,
+            "background wake interrupts native wait");
+        NativeWaitWakeTest.Drain();
+        ThreadStart injectBody = NativeWaitWakeTest.InjectWorker;
+        NativeWaitWakeTest.Check(Thread.Start(injectBody), "background input thread starts");
+        start = Stopwatch.GetMicroseconds();
+        int kind = 0;
+        while (kind != 2 && Stopwatch.GetMicroseconds() - start < 500000) {
+            result = window.WaitEventTimeout(100);
+            kind = window.EventKind();
+        }
+        NativeWaitWakeTest.Check(result == 0 && kind == 2 && window.EventX() == 80 && window.EventY() == 90,
+            "injected input interrupts native wait");
+        window.InjectEvent(3, 80, 90, 0, 0, 0);
+        NativeWaitWakeTest.Check(window.PollEvent() == 0 && window.EventKind() == 3,
+            "release is preserved after press");
+        AtomicInt posted = new AtomicInt(0);
+        NativeWaitWakeTest.Check(Thread.Start(delegate () {
+            Thread.Sleep(40);
+            app.Post(delegate () { posted.Store(1); });
+        }), "background post thread starts");
+        start = Stopwatch.GetMicroseconds();
+        while (posted.Load() == 0 && Stopwatch.GetMicroseconds() - start < 500000) {
+            NativeWaitWakeTest.Check(app.ProcessEvent(), "post wait remains open");
+        }
+        NativeWaitWakeTest.Check(posted.Load() == 1, "App.Post wakes and drains on UI thread");
+        string report = "NATIVE_WAIT_WAKE_OK rate=" + window.RefreshRate()
+            + " wake_us=" + elapsed;
+        #if ANDROID
+        bool displaySupported = window.RequestDisplayFrame();
+        for (int i = 0; i < 20 && !displaySupported; i++) {
+            window.WaitEventTimeout(100);
+            displaySupported = window.RequestDisplayFrame();
+        }
+        NativeWaitWakeTest.Check(displaySupported, "live Surface supports display callbacks");
+        long readyWorst = 0;
+        for (int i = 0; i < 4; i++) {
+            window.TakeDisplayFrame();
+            NativeWaitWakeTest.Drain();
+            NativeWaitWakeTest.Check(window.RequestDisplayFrame(), "ready-frame request is supported");
+            Thread.Sleep(40);
+            // Looper 消费回调和唤醒，不 Take 帧；就绪状态必须持续到真正取帧。
+            for (int j = 0; j < 16; j++) { window.PollEvent(); }
+            start = Stopwatch.GetMicroseconds();
+            result = window.WaitEventTimeout(200);
+            long readyWait = Stopwatch.GetMicroseconds() - start;
+            bool ready = window.TakeDisplayFrame();
+            if (readyWait > readyWorst) { readyWorst = readyWait; }
+            NativeWaitWakeTest.Check(result == 0 && readyWait < 80000 && ready,
+                "unconsumed display readiness interrupts another wait");
+            NativeWaitWakeTest.Check(!window.TakeDisplayFrame(), "ready-frame wait does not duplicate the frame");
+        }
+        long total = 0;
+        long worst = 0;
+        for (int i = 0; i < 120; i++) {
+            NativeWaitWakeTest.Check(window.RequestDisplayFrame(), "display callback is supported");
+            start = Stopwatch.GetMicroseconds();
+            bool ready = false;
+            while (!ready && Stopwatch.GetMicroseconds() - start < 500000) {
+                window.WaitEventTimeout(100);
+                ready = window.TakeDisplayFrame();
+            }
+            NativeWaitWakeTest.Check(ready, "one-shot display callback arrives");
+            NativeWaitWakeTest.Check(!window.TakeDisplayFrame(), "display readiness consumed once");
+            long duration = Stopwatch.GetMicroseconds() - start;
+            total = total + duration;
+            if (duration > worst) { worst = duration; }
+        }
+        report = report + " ready_wait_max_us=" + readyWorst
+            + " callbacks=120 avg_wait_us=" + total / 120 + " max_wait_us=" + worst;
+        File.WriteAllText("native_wait_wake.txt", report);
+        File.WriteAllText("/sdcard/Android/data/com.zan.nativewait/files/native_wait_wake.txt", report);
+        #else
+        NativeWaitWakeTest.Check(!window.RequestDisplayFrame() && !window.TakeDisplayFrame(),
+            "unsupported display callback uses cadence fallback");
+        window.Destroy();
+        app.canvas.Destroy();
+        Console.WriteLine("NATIVE_WAIT_WAKE_OK");
+        #endif
+    }
+}
