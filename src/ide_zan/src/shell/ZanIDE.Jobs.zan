@@ -1,0 +1,595 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Text;
+using System.Threading;
+using System.Collections.Generic;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+partial class ZanIDE {
+    IdeJobMonitor jobMonitor;
+    IdeJobSnapshot jobSnapshot;
+    int jobSerial;
+    int jobMonitorEpoch;
+    int jobAiSession;
+    int jobDebugSeq;
+    int jobAiLaunchSeq;
+    AiReq jobAiRequest;
+    nint jobTermHandle;
+    string jobPublishedTarget;
+
+    void StartJobMonitor() {
+        if (jobMonitor != null || shuttingDown) { return; }
+        IdeJobMonitor monitor = new IdeJobMonitor();
+        monitor.host = app;
+        monitor.apply = this.ApplyJobResult;
+        jobMonitor = monitor;
+        jobMonitorEpoch = ++jobSerial;
+        this.CaptureJobMonitor();
+        if (!monitor.Start()) {
+            jobMonitor = null;
+            log.Add("> Could not start job monitor.");
+            app.RequestRedraw();
+        }
+    }
+
+    async void StopJobMonitorAsync() {
+        IdeJobMonitor monitor = jobMonitor;
+        jobMonitor = null;
+        jobSnapshot = null;
+        if (monitor != null) { await monitor.StopAsync(); }
+    }
+
+    void ResetJobMonitorWorkspace() {
+        jobSnapshot = null;
+        jobSerial = jobSerial + 1;
+        this.CaptureJobMonitor();
+    }
+
+    static List<string> CopyJobStrings(List<string> source) {
+        List<string> copy = new List<string>();
+        if (source != null) {
+            for (int i = 0; i < source.Count; i = i + 1) { copy.Add(source[i]); }
+        }
+        return copy;
+    }
+
+    void CaptureJobMonitor(bool submit = true) {
+        if (jobMonitor == null || shuttingDown) { return; }
+        jobAiSession = this.AiSessionVersion();
+        IdeJobSnapshot prev = jobSnapshot;
+        IdeJobSnapshot input = new IdeJobSnapshot();
+        input.workspace = documentWorkspace;
+        input.session = jobAiSession;
+        input.monitor = jobMonitorEpoch;
+        input.root = root;
+        if (prev != null && prev.workspace != input.workspace) { prev = null; }
+        input.term = termFp != 0;
+        input.termConsumed = termLogLen;
+        input.termSeq = prev != null ? prev.termSeq : 0;
+        if (input.term && (prev == null || !prev.term)) { input.termSeq = ++jobSerial; }
+        if (termFp != jobTermHandle) { input.termSeq = ++jobSerial; jobTermHandle = termFp; }
+        input.run = runStreaming;
+        input.runConsumed = runLogLen;
+        input.runSeq = prev != null ? prev.runSeq : 0;
+        if (input.run && (prev == null || !prev.run)) { input.runSeq = ++jobSerial; }
+        input.git = gitJob;
+        input.gitSeq = prev != null ? prev.gitSeq : 0;
+        if (input.git != 0 && (prev == null || prev.git != input.git)) { input.gitSeq = ++jobSerial; }
+        input.build = buildBusy;
+        input.buildStart = buildStartMs;
+        input.buildSeq = prev != null ? prev.buildSeq : 0;
+        if (input.build && (prev == null || !prev.build || prev.buildStart != input.buildStart)) { input.buildSeq = ++jobSerial; }
+        input.buildConsumed = buildLogLen;
+        input.buildExe = buildExe;
+        input.buildTarget = buildTargetPath;
+        input.thenRun = buildThenRun;
+        input.gui = buildIsGui;
+        input.debug = dbgBuildPending;
+        input.aiBuild = aiBuildForAi;
+        input.aiUiPending = aiUiPending;
+        input.aiUiScript = aiUiScript;
+        input.debugger = dbg;
+        input.debugSeq = jobDebugSeq;
+        if (input.debug) {
+            if (prev != null && prev.buildSeq == input.buildSeq && prev.debug) {
+                input.breakpoints = prev.breakpoints;
+                input.debugText = prev.debugText;
+            } else {
+                input.breakpoints = ZanIDE.MergeBreakpoints(editor.Breakpoints(), bpConds);
+                input.debugText = editor.GetText();
+            }
+        }
+        if (input.debug || dbg != null) { input.watches = IdeJobMonitor.CopyVars(dbgWatches); }
+        input.ui = aiUiRunning;
+        input.uiDeadline = aiUiDeadline;
+        input.uiTool = aiUiTool;
+        input.uiSeq = prev != null ? prev.uiSeq : 0;
+        if (input.ui && (prev == null || !prev.ui || prev.uiDeadline != input.uiDeadline)) { input.uiSeq = ++jobSerial; }
+        input.pub = pubBusy;
+        input.packing = pubPacking;
+        input.pubStart = pubStartMs;
+        input.pubSeq = prev != null ? prev.pubSeq : 0;
+        if (input.pub && (prev == null || !prev.pub || prev.pubStart != input.pubStart)) { input.pubSeq = ++jobSerial; }
+        input.pubConsumed = pubLogLen;
+        input.pubRoot = pubRoot;
+        input.packed = pubPacked;
+        input.exes = ZanIDE.CopyJobStrings(pubExes);
+        input.ai = aiBusy.Get() == 1;
+        input.request = input.ai ? jobAiRequest : null;
+        input.tool = input.ai ? AiWork.Snapshot() : null;
+        input.aiLaunchSeq = jobAiLaunchSeq;
+        bool snapshotChanged = prev == null || !ZanIDE.SameJobSnapshot(prev, input);
+        jobSnapshot = input;
+        if (submit && snapshotChanged) { jobMonitor.Submit(input); }
+    }
+
+    static bool SameJobSnapshot(IdeJobSnapshot a, IdeJobSnapshot b) {
+        if (a == null || b == null) { return false; }
+        return a.workspace == b.workspace && a.session == b.session
+            && a.monitor == b.monitor && a.root == b.root
+            && a.term == b.term && a.termConsumed == b.termConsumed && a.termSeq == b.termSeq
+            && a.run == b.run && a.runConsumed == b.runConsumed && a.runSeq == b.runSeq
+            && a.git == b.git && a.gitSeq == b.gitSeq
+            && a.build == b.build && a.buildConsumed == b.buildConsumed && a.buildSeq == b.buildSeq
+            && a.ui == b.ui && a.uiSeq == b.uiSeq
+            && a.pub == b.pub && a.pubConsumed == b.pubConsumed && a.pubSeq == b.pubSeq
+            && a.ai == b.ai && a.request == b.request && a.tool == b.tool
+            && a.debugger == b.debugger && a.debugSeq == b.debugSeq
+            && a.aiLaunchSeq == b.aiLaunchSeq;
+    }
+
+    void BeginBuildJob(string target, bool thenRun, bool debug = false, bool hot = false) {
+        if (buildBusy || pubBusy || shuttingDown) { return; }
+        this.StartJobMonitor();
+        if (jobMonitor == null) { return; }
+        buildBusy = true;
+        buildStartMs = Window.GetTickMs();
+        buildTargetPath = target;
+        buildExe = "";
+        buildThenRun = thenRun;
+        dbgBuildPending = debug;
+        buildLogLen = 0;
+        this.CaptureJobMonitor(false);
+        IdeJobStart start = new IdeJobStart();
+        start.input = jobSnapshot;
+        start.kind = 4;
+        start.target = target;
+        start.hot = hot;
+        jobMonitor.Begin(start);
+    }
+
+    void ConsumeHotReloadJob() {
+        if (!hotReloadReq || shuttingDown) { return; }
+        hotReloadReq = false;
+        if (buildBusy || pubBusy) { return; }
+        int active = activeTab.Get();
+        string path = "";
+        if (active >= 0 && active < tabs.Count) { path = tabs[active].path; }
+        this.BeginBuildJob(path, true, false, true);
+        dock.Focus("output");
+    }
+
+    void BeginGitJob(string args, bool refresh = false) {
+        if (gitJob != 0 || shuttingDown) { return; }
+        this.StartJobMonitor();
+        if (jobMonitor == null) { return; }
+        gitJob = refresh ? 1 : 2;
+        this.CaptureJobMonitor(false);
+        IdeJobStart start = new IdeJobStart();
+        start.input = jobSnapshot;
+        start.kind = 3;
+        start.gitArgs = args;
+        start.gitRefresh = refresh;
+        jobMonitor.Begin(start);
+    }
+
+    void BeginPublishJob() {
+        if (buildBusy || pubBusy || shuttingDown) { return; }
+        this.StartJobMonitor();
+        if (jobMonitor == null) { return; }
+        pubPending = false;
+        pubBusy = true;
+        pubPacking = false;
+        pubStartMs = Window.GetTickMs();
+        pubLogLen = 0;
+        this.CaptureJobMonitor(false);
+        IdeJobStart start = new IdeJobStart();
+        start.input = jobSnapshot;
+        start.kind = 6;
+        start.options = new List<PublishTargetOption>();
+        for (int i = 0; i < pubPlatformOptions.Count; i = i + 1) {
+            PublishTargetOption option = new PublishTargetOption(pubPlatformOptions[i].id,
+                pubPlatformOptions[i].label, pubPlatformOptions[i].selected);
+            start.options.Add(option);
+        }
+        jobMonitor.Begin(start);
+    }
+
+    bool IsJobResultCurrent(IdeJobResult result) {
+        if (shuttingDown || jobMonitor == null || jobSnapshot == null
+            || result.input.workspace != documentWorkspace
+            || result.input.monitor != jobMonitorEpoch
+            || result.input.root != root) { return false; }
+        IdeJobSnapshot current = jobSnapshot;
+        if (result.kind == 0) { return current.workspace == result.input.workspace; }
+        if (result.kind == 1) { return termFp != 0 && current.termSeq == result.input.termSeq; }
+        if (result.kind == 2) { return runStreaming && current.runSeq == result.input.runSeq; }
+        if (result.kind == 3) { return gitJob != 0 && current.gitSeq == result.input.gitSeq; }
+        if (result.kind == 4) { return buildBusy && current.buildSeq == result.input.buildSeq; }
+        if (result.kind == 5) { return aiUiRunning && current.uiSeq == result.input.uiSeq
+            && this.IsJobAiSessionCurrent(result.input); }
+        if (result.kind == 6) { return pubBusy && current.pubSeq == result.input.pubSeq; }
+        if (result.kind == 7) { return this.IsJobAiSessionCurrent(result.input)
+            && aiBusy.Get() == 1 && jobAiRequest == result.input.request; }
+        if (result.kind == 8) { return this.IsJobAiSessionCurrent(result.input)
+            && aiBusy.Get() == 1 && AiWork.Snapshot() == result.input.tool; }
+        if (result.kind == 9) { return jobDebugSeq == result.input.debugSeq && dbg == result.input.debugger; }
+        if (result.kind == 10) { return this.IsJobAiSessionCurrent(result.input)
+            && jobAiLaunchSeq == result.input.aiLaunchSeq; }
+        return false;
+    }
+
+    bool IsJobAiSessionCurrent(IdeJobSnapshot input) {
+        return this.IsAiSessionVersion(input.session);
+    }
+
+    void ApplyJobResult(IdeJobResult result) {
+        if (!this.IsJobResultCurrent(result)) { return; }
+        ZanIDE.AppendAll(log, result.log);
+        while (log.Count > 2000) { log.RemoveAt(0); }
+        if (result.phase == -1 || result.kind == 0) { coLog.Reset(); app.RequestRedraw(); return; }
+        if (result.kind == 1) { termLogLen = result.consumed; }
+        else if (result.kind == 2) {
+            runLogLen = result.consumed;
+            if (result.complete) { runStreaming = false; }
+        } else if (result.kind == 3 && result.complete) {
+            if (gitJob == 1 && result.files != null) {
+                gitFiles = result.files;
+                gitBranch = result.branch;
+                gitHead = result.head;
+                gitLoaded = true;
+                gitSel.Set(-1);
+            } else { gitLoaded = false; }
+            gitJob = 0;
+        } else if (result.kind == 4) { this.ApplyBuildJobResult(result); }
+        else if (result.kind == 5) {
+            aiUiRunning = false;
+            aiMsgs.Add(this.AiToolMsg("tool", aiUiTool + "\n" + result.uiResult));
+            this.ResumeAiJob();
+        } else if (result.kind == 6) {
+            if (result.phase == 1 && result.exes != null) { pubExes = result.exes; }
+            if (result.phase == 0) { pubLogLen = result.consumed; }
+            if (result.step != null && result.step != "") { pubStep = result.step; }
+            if (result.phase == 2) { pubPacking = true; pubPackStartMs = Window.GetTickMs(); }
+            if (result.complete) { jobPublishedTarget = result.publishFolder; this.FinishPublish(result.ok); }
+        } else if (result.kind == 7) { this.ApplyAiJobResult(result); }
+        else if (result.kind == 8) {
+            AiWork.Consume(result.tool);
+            this.AiWorkFinish(result.tool);
+        } else if (result.kind == 9) { this.ApplyDebugJobResult(result); }
+        else if (result.kind == 10) {
+            if (!result.ok || (result.error != null && result.error != "")) {
+                string error = result.error;
+                if (error == null || error == "") { error = "could not prepare the AI request."; }
+                aiMsgs.Add(this.AiToolMsg("error", error));
+                aiBusy.Set(0);
+            } else {
+                if (result.pins != null) {
+                    for (int i = 0; i < result.pins.Count; i = i + 1) { aiMsgs.Add(result.pins[i]); }
+                }
+                jobAiRequest = result.startedRequest;
+                ZanIDE.aiStatReqs = ZanIDE.aiStatReqs + 1;
+            }
+            this.AiChatToEnd();
+        }
+        if ((result.kind == 5 || result.kind == 7 || result.kind == 8 || result.kind == 10
+                || (result.kind == 4 && result.input.aiBuild))
+            && this.IsAiSessionVersion(result.input.session)) {
+            this.SaveAiSessions(result.input.session);
+        }
+        coLog.Reset();
+        this.CaptureJobMonitor();
+        app.RequestRedraw();
+    }
+
+    string BeginAiJob() {
+        if (shuttingDown) { return "IDE is shutting down."; }
+        this.StartJobMonitor();
+        if (jobMonitor == null) { return "could not start the AI job monitor."; }
+        jobAiLaunchSeq = ++jobSerial;
+        jobAiRequest = null;
+        AiNet.Abandon();
+        this.CaptureJobMonitor(false);
+        IdeJobStart start = new IdeJobStart();
+        start.kind = 10;
+        start.input = jobSnapshot;
+        start.agent = aiRunAgent;
+        start.contextName = aiRunCtxName;
+        start.contextCode = aiRunCtxCode;
+        start.baseUrl = aiProfiles[aiProfActive].baseUrl;
+        start.key = aiProfiles[aiProfActive].key;
+        start.model = aiRunModel;
+        start.messages = new List<ChatMessage>();
+        for (int i = 0; i < aiMsgs.Count; i = i + 1) {
+            ChatMessage source = aiMsgs[i];
+            ChatMessage copy = ChatMessage.CreateWithReason(source.role, source.text, source.reason);
+            copy.agent = source.agent;
+            copy.to = source.to;
+            copy.kind = source.kind;
+            copy.taskId = source.taskId;
+            copy.progress = source.progress;
+            copy.call = source.call;
+            copy.at = source.at;
+            copy.img = source.img;
+            copy.msgId = source.msgId;
+            copy.mark = source.mark;
+            copy.quoteWho = source.quoteWho;
+            copy.quoteText = source.quoteText;
+            copy.quoteId = source.quoteId;
+            copy.card = source.card;
+            start.messages.Add(copy);
+        }
+        jobMonitor.Begin(start);
+        return "";
+    }
+
+    void ResumeAiJob() {
+        string error = this.BeginAiJob();
+        if (error != "") { aiMsgs.Add(this.AiToolMsg("error", error)); aiBusy.Set(0); }
+        this.AiChatToEnd();
+    }
+
+    void BeginDebugCommand(string command, string argument = "", int line = -1) {
+        if (shuttingDown || dbg == null) { return; }
+        this.StartJobMonitor();
+        if (jobMonitor == null) { return; }
+        jobDebugSeq = ++jobSerial;
+        if (command == "stop") { dbg.CancelWait(); }
+        this.CaptureJobMonitor(false);
+        IdeJobStart start = new IdeJobStart();
+        start.kind = 9;
+        start.input = jobSnapshot;
+        start.command = command;
+        start.argument = argument;
+        start.watch = line;
+        jobMonitor.Begin(start);
+    }
+
+    void ApplyDebugJobResult(IdeJobResult result) {
+        dbg = result.debugSession;
+        dbgState = result.debugState;
+        dbgExecLine = result.debugLine;
+        dbgConsole = result.debugConsole;
+        dbgVarInfo = result.debugVars;
+        dbgStack = result.debugStack;
+        if (result.watches != null) { dbgWatches = result.watches; }
+        editor.SetExecLine(dbgExecLine);
+        if (result.debugCommand == "evaluate") {
+            if (result.debugWatch >= 0 && result.debugWatch < dbgWatches.Count
+                && dbgWatches[result.debugWatch].name == result.debugExpression) {
+                dbgWatches[result.debugWatch].val = result.debugValue;
+            } else if (result.debugExpression != "") {
+                log.Add("> " + result.debugExpression + " = " + result.debugValue);
+            }
+        }
+    }
+
+    void ApplyBuildJobResult(IdeJobResult result) {
+        if (result.phase == 1) {
+            buildExe = result.exe;
+            if (result.target != null && result.target != "") { buildTargetPath = result.target; }
+            buildIsGui = result.gui;
+            buildThenRun = result.thenRun;
+            if (!result.complete) { return; }
+        }
+        buildLogLen = result.consumed;
+        if (!result.complete) { return; }
+        buildBusy = false;
+        if (result.timeout) {
+            dbgBuildPending = false;
+            aiBuildForAi = false;
+            log.Add(ZanIDE.T("> Build timed out; no compiler result.", "> 构建超时，未拿到编译结果。"));
+            dock.Focus("errors");
+            return;
+        }
+        List<string> output = result.output;
+        if (output == null) { output = new List<string>(); }
+        int active = activeTab.Get();
+        if (result.diagnostics != null && active >= 0 && active < tabs.Count
+            && ZanIDE.SamePath(tabs[active].path, result.input.buildTarget)) {
+            editor.SetCompilerDiagnostics(result.diagnostics);
+            if (result.diagnostics.Count > 0) {
+                log.Add("> " + Convert.ToString(result.diagnostics.Count) + " error(s) in this file; jumped to the first.");
+            }
+        }
+        if (dbgBuildPending) {
+            dbgBuildPending = false;
+            if (!result.ok) { log.Add("> [Debug] Build failed."); }
+            else {
+                dbg = result.debugSession;
+                dbgState = result.debugState;
+                dbgExecLine = result.debugLine;
+                dbgConsole = result.debugConsole;
+                dbgVarInfo = result.debugVars;
+                dbgStack = result.debugStack;
+                if (result.watches != null) { dbgWatches = result.watches; }
+                editor.SetExecLine(dbgExecLine);
+                dbgPanelTab.Set(1);
+                if (dbgState == 2) {
+                    log.Add(">   F5=Continue  F10=StepOver  F11=StepInto  Ctrl+B=Condition  Esc=Stop");
+                    ZanIDE.LogVarsToConsole(log, dbgVarInfo, dbgExecLine);
+                }
+            }
+        } else if (!result.ok) {
+            if (result.missingPackage != null && result.missingPackage != "") {
+                log.Add(ZanIDE.T("> Missing package: ", "> 缺少库：") + result.missingPackage
+                    + ZanIDE.T(" (install it from Extensions)", "（可到「扩展」里安装）"));
+            }
+            log.Add(ZanIDE.T("> Build failed; not run.", "> 构建失败，未运行。"));
+            dock.Focus("errors");
+        } else if (result.consoleStarted) { runLogLen = 0; runStreaming = true; }
+        else if (!result.thenRun) { log.Add(ZanIDE.T("> Build succeeded.", "> 构建成功。")); }
+        this.RefreshSymbolIndex(true);
+        if (aiBuildForAi && this.IsJobAiSessionCurrent(result.input)) {
+            aiBuildForAi = false;
+            string tool = aiUiPending ? aiUiTool : (buildThenRun ? "run" : "build");
+            this.AiRunBuildDone(result.ok, tool, output);
+            if (aiUiPending) {
+                aiUiPending = false;
+                if (result.uiStarted) {
+                    aiUiRunning = true;
+                    aiUiDeadline = result.uiDeadline;
+                    log.Add(ZanIDE.T("> [AI] Driving UI...", "> [AI] 正在驱动 UI 自检..."));
+                } else {
+                    aiMsgs.Add(this.AiToolMsg("tool", aiUiTool + "\n" + AiAgent.BuildResult(output, false, false)));
+                    this.ResumeAiJob();
+                }
+            } else {
+                aiMsgs.Add(this.AiToolMsg("tool", (buildThenRun ? "run\n" : "build\n")
+                    + AiAgent.BuildResult(output, result.ok, buildThenRun)));
+                this.ResumeAiJob();
+            }
+        }
+    }
+
+    void ApplyAiFinalResult(IdeJobResult result) {
+        this.AiStreamDrop(true);
+        jobAiRequest = null;
+        AiNet.Abandon();
+        SseAnswer answer = result.answer;
+        if (answer.totalTokens > 0 || answer.promptTokens > 0) {
+            aiTokPrompt = answer.promptTokens;
+            aiTokCompletion = answer.completionTokens;
+            aiTokTotal = answer.totalTokens;
+            aiTokCached = answer.cachedTokens;
+        }
+        ZanIDE.AiStatAdd(answer);
+        string done = result.done;
+        bool ok = done.Length >= 2 && done.Substring(0, 2) == "ok";
+        if (!ok || answer.error != "") {
+            string error = done;
+            if (error.Length >= 5 && error.Substring(0, 5) == "err: ") {
+                error = error.Substring(5, error.Length - 5);
+            }
+            if (answer.error != "") {
+                if (error != "" && !ok) { error = error + ": " + answer.error; }
+                else { error = answer.error; }
+            }
+            if (error == "") { error = "the AI request failed."; }
+            ZanIDE.aiStatFails = ZanIDE.aiStatFails + 1;
+            bool retry = answer.error == "" && AiAgent.IsTransient(error)
+                && aiRetry < AiAgent.MaxRetries();
+            if (retry) {
+                aiRetry = aiRetry + 1;
+                string startError = this.BeginAiJob();
+                if (startError == "") {
+                    log.Add("> 小赞: " + error + " - " + ZanIDE.T("retrying (", "重试中（")
+                        + Convert.ToString(aiRetry) + "/" + Convert.ToString(AiAgent.MaxRetries())
+                        + ZanIDE.T(")", "）"));
+                    Layer.Msg(ZanIDE.T("Xiao Zan request failed - retrying", "小赞请求失败——正在重试"), 3);
+                } else {
+                    aiMsgs.Add(ChatMessage.Create("error", "[error] " + startError));
+                    aiBusy.Set(0);
+                }
+            } else {
+                aiRetry = 0;
+                aiMsgs.Add(ChatMessage.Create("error", "[error] " + error));
+                aiBusy.Set(0);
+            }
+            this.AiChatToEnd();
+            return;
+        }
+        aiRetry = 0;
+        string call = result.call;
+        string said = result.said;
+        bool more = call != "" && AiAgent.StepsSinceUser(aiMsgs) < AiAgent.MaxSteps();
+        if (said != "" || result.reasoning != "" || result.archiveCall != null && result.archiveCall != "") {
+            ChatMessage message = ChatMessage.CreateWithReason("assistant", said, result.reasoning);
+            message.call = result.archiveCall == null ? "" : result.archiveCall;
+            if (aiTeamMode) {
+                AiEnvelope envelope = result.envelope;
+                AiTeam.ApplyToTasks(aiTasks, aiRunAgent, envelope);
+                message.agent = aiRunAgent;
+                message.kind = envelope.kind;
+                message.taskId = envelope.taskId;
+                message.progress = envelope.progress;
+                message.to = AiTeam.JoinIds(envelope.to);
+            }
+            aiMsgs.Add(message);
+        }
+        if (more) {
+            if (AiAgent.IsMutating(result.toolName) && !aiAutoExec) {
+                aiPendingCall = call;
+                aiBusy.Set(2);
+            } else { this.AiDispatchTool(call); }
+        } else {
+            bool limitHit = call != "" && AiAgent.IsMutating(result.toolName);
+            string badTool = result.badTool == null ? "" : result.badTool;
+            if (badTool != "") {
+                aiIdleWhy = ZanIDE.T("the tool block could not be parsed, so nothing ran",
+                    "它发的工具块解析不出来（格式不对或被截断），所以那个调用根本没执行");
+            }
+            if (limitHit) {
+                aiIdleWhy = ZanIDE.T("the per-turn tool budget ran out", "这一问的工具预算用完了");
+            }
+            bool cont = aiAutoCont < aiContMax && (limitHit || badTool != ""
+                || (!aiTeamMode && aiAutoExec && this.AiPlanUnfinished() && !AiAgent.AsksUser(said)));
+            if (cont) {
+                aiAutoCont = aiAutoCont + 1;
+                string body = AiAgent.ContinuePrompt(limitHit, this.AiCurStep());
+                if (badTool != "") { body = badTool; }
+                ChatMessage message = ChatMessage.Create("user", body);
+                message.agent = AiTeam.Auto();
+                message.to = aiRunAgent;
+                aiMsgs.Add(message);
+                string error = this.BeginAiJob();
+                if (error != "") { aiMsgs.Add(ChatMessage.Create("error", error)); aiBusy.Set(0); }
+            } else {
+                if (limitHit) {
+                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T("Tool limit reached for this question.",
+                        "本次提问的工具调用次数已达上限。")));
+                }
+                this.AiRunTurnEnd(said);
+                this.AiTeamTurnEnd(said);
+                if (aiBusy.Get() == 0 && aiAutoCont >= aiContMax
+                    && (this.AiPlanUnfinished() || (aiTeamMode && AiTeam.HasUnfinished(aiTasks)))) {
+                    aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                        "Auto-continue budget spent with work left; say \"continue\" to push on.",
+                        "自动继续次数已用完，任务还没做完；回一句「继续」就接着跑。")));
+                }
+            }
+        }
+        this.AiChatToEnd();
+    }
+
+    void ApplyAiJobResult(IdeJobResult result) {
+        if (result.dropPreview) { this.AiStreamDrop(true); }
+        if (result.live != null && result.live != "") {
+            bool valid = aiStreamMsgIdx >= 0 && aiStreamMsgIdx == aiMsgs.Count - 1
+                && aiMsgs[aiStreamMsgIdx].role == "assistant";
+            if (valid) { aiMsgs[aiStreamMsgIdx].text = result.live; }
+            else {
+                ChatMessage message = ChatMessage.Create("assistant", result.live);
+                message.agent = aiRunAgent;
+                aiMsgs.Add(message);
+                aiStreamMsgIdx = aiMsgs.Count - 1;
+            }
+            this.AiChatToEnd();
+        }
+        if (result.timeout) {
+            this.AiStreamDrop(true);
+            aiMsgs.Add(ChatMessage.Create("error", ZanIDE.T(
+                "[error] AI request timed out - no response received.", "[错误] AI 请求超时——未收到响应。")));
+            aiBusy.Set(0);
+            this.AiChatToEnd();
+            return;
+        }
+        if (result.final) { this.ApplyAiFinalResult(result); }
+    }
+}
