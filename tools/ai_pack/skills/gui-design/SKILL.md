@@ -654,8 +654,14 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   阻断点击穿透，保证滚动条量程与视野紧凑清晰。
 - **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
   - **GenForm 设计稿零胶水通道**:在 HTML `body` 上声明 `data-zan-design`、`data-win-title`、`data-win-w`、`data-win-h`、`data-win-chrome="false"`(沉浸式无边框)和 `data-win-center="true"`。编译器自动生成窗口、自动注入 `<style>` 中的 CSS 样式表、去除标题栏、自动居中、DockFill 挂载并连线所有 `@click` 事件与默认 Main 入口。后台 `App.zan` 严禁手写任何 `Form.Create`、`UseAppCss`、`SetChromeVisible` 或 `handlers.Add` 等样板胶水代码,只需声明 `partial class` 编写纯粹的业务状态与事件响应。
+  - **无边框窗口右上角系统控制按钮保护区（SetCaptionZone）**:声明 `data-win-chrome="false"` 沉浸式无边框窗口时，若标题栏高度生效，Win32 的 `WM_NCHITTEST` 会将整个窗口顶栏判定为 `HTCAPTION (2)` 导致拖拽吞掉右上角按钮点击；必须在 `OnLoad` 中调用 `form.GetApp().SetCaptionZone(width)`（如 `form.GetApp().Scale(160)`）为右上角功能区（菜单/最小化/最大化/关闭）保留非拖拽客户区。
   - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
-  - **HTML 文本与布局容器语义映射**:原生 `div` 标签映射为纯无格式布局容器(`Panel`,不绘制自身文本)。段落与标题必须使用语义标签 `<p>` 或 `<h1>`~`<h6>`(映射为 `Typography` 排版控件),行内文案使用 `<label>` 或 `<span>`(映射为 `Label` 控件)。容器排版纵向排列时必须显式声明 `display: flex; flex-direction: column;` 避免子元素横向挤占。
+  - **Nanosvg 矢量图元约束与动态透明 SVG 规范**:
+    1. 颜色 Hex 解析：nanosvg 只接受 3 位或 6 位 Hex（`#RGB` / `#RRGGBB`），不支持 8 位 Hex（`#AARRGGBB` 会解析失败并静默回落为灰色 `#808080`）；透明度必须使用标准 XML 属性：`opacity="0.5"`、`fill-opacity="0.3"` 或 `stroke-opacity="0.8"`。
+    2. 几何图元限制：nanosvg 不解析 `<text>` 标签，动态矢量芯片、HUD 刻度等指示图形必须由 `<path>`、`<polygon>`、`<line>`、`<circle>`、`<rect>` 等几何图元绘制。
+    3. 动态透明 SVG 承载：通过 `Image.Src.Set("data:image/svg+xml;utf8," + svg)` 动态帧刷新时，图片控件必须在 CSS 中显式声明 `background: transparent; border: none;`，消除基础皮肤默认占位灰底。
+  - **高性能帧循环动画（FrameHook）**:复杂 2.5D/动态视觉（如雷达扫描、呼吸光晕、状态气泡）通过 `Form.FrameHook(OnFrameAnimation)` 注册帧回调，利用 `Stopwatch.GetMicroseconds() / 1000` 实施帧率节流（如 90ms / ~11 FPS）；每帧计算离散步进增量构造动态 SVG 并更新，调用 `form.GetApp().RequestRedraw()` 实现丝滑低占用原生动画。
+  - **HTML 文本与布局容器语义映射**:原生 `div` 标签映射为纯无格式布局容器(`Panel`,不绘制自身文本)。段落与标题必须使用语义标签 `<p>` 或 `<h1>`~`<h6>`(映射为 `Typography` 排版控件),行内文案使用 `<label>` 或 `<span>`(映射为 `Label` 控件)。当 `div` 元素承载动态单行文本胶囊时，声明 `display: block; white-space: nowrap;` 触发 `ArrangeFlow` 块流完成排版绘制。容器排版纵向排列时必须显式声明 `display: flex; flex-direction: column;` 避免子元素横向挤占。
 - **分段单选按钮（Segmented Buttons）文字安全内边距阈值**:
   判定是否由下拉框升格为单行分段按钮时，文字宽度测量 `tw` 必须预留至少 `app.Scale(16)`
   的安全 padding（左右各 8px），否则在高 DPI 或多字宽下极易贴边或溢出截断；放不下时应
