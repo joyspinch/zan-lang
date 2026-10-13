@@ -463,6 +463,18 @@ STANDARDS.md §6.7）。
    - **HTML + Code-behind 编译输入顺序硬契约**：
      - *规范*：执行 `zanc` 编译时，HTML 文件必须作为命令行首个输入参数（例如 `zanc.exe App.html App.zan --auto-stdlib -o app.exe`），由编译器从首个设计文档合成 Form 宿主与入口。
 
+21. **同构集合列表的数据驱动与模板复用架构（Anti-Hardcoded-DOM-List-Duplication）**：
+   - **踩坑出处**：在开发火绒安全卫士的“防护中心”（22项开关）、“访问控制”（6项规则）、“安全工具”（11项工具）等大量结构相同但数据不同的卡片视图时，若直接在 HTML 中手写复制数十份静态 `<div class="protect-row-card">` 节点，会导致：
+     1) HTML 臃肿失控（单文件 2000 多行，充斥重复代码）；
+     2) 排版高度出现细微差异（某些卡片因微小的 CSS 语法、换行或 `flex-shrink` 产生高度不一致，出现参差不齐）；
+     3) 状态切换需要分别操纵 22 个子面板或大量 ID 变量，脆弱难维。
+   - **规范要求**：
+     1) **数据与模板彻底分离**：所有同构列表，严禁在 HTML 中硬编码重复卡片！HTML 只声明纯净的容器节点（如 `<div id="protectItemsList" class="protect-items-list"></div>`）。
+     2) **强类型数据模型**：在 Code-behind 中定义扁平微型数据实体（如 `ProtectItem`、`AccessItem`、`ToolEntry`）。
+     3) **单一行模板工厂函数**：提供单一的行/卡片构造工厂（如 `CreateProtectRow(item)`、`CreateAccessCard(item)`），统一赋予 CSS 样式类（如 `.protect-row-card`），绑定图标、标签与事件，保证 100% 像素级一致的行高（如 `height: 54px; min-height: 54px; max-height: 54px; flex-shrink: 0; flex: 0 0 54px;`）、内边距与对齐基准。
+     4) **统一容器刷新**：数据更新或分类切换时，调用容器 `ClearKids()` 移除旧行后遍历模型列表逐项追加 `AddKid(CreateRow(item))`，内存轻量、渲染瞬时完成。
+
+
 
 
 
