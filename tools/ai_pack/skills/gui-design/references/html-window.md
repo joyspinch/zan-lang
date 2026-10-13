@@ -124,9 +124,9 @@
 - **顶栏窗口控制按钮图标必须使用标准语义名**：
   - 踩坑：使用 `icon="square"`（试图画方形最大化框）或 `icon="chevron-down"`（试图画菜单）会导致回退字体渲染失败——`Icon.Codepoint` 只收录 `minimize` (0xE921)、`maximize` (0xE922)、`restore` (0xE923)、`close` (0xE8BB)、`menu` (0xE700) 等语义名。非标准名称在未命中 Tabler 矢量 SVG 缓存时会退化为空白或问号。
   - 正确姿势：窗口系统按钮严格使用 `icon="menu"`、`icon="minimize"`、`icon="maximize"`、`icon="close"`。
-- **无边框自绘标题栏拖动区高度对齐**：
-  - 踩坑：`data-win-chrome="false"` 声明下，系统默认标题栏拖动条带高度为 32px。若 HTML 自定义顶栏高度高于此值（如 38px），在顶部 y 处于 32~38px 的边缘区域点击不会触发窗口拖动。
-  - 正确姿势：在 `OnLoad` 初始调用 `form.GetApp().SetTitlebarHeight(38)`，使 Win32 WM_NCHITTEST 拖动命中区与 HTML 顶栏高度像素级吻合。
+- **无边框自绘标题栏拖动区高度与右上角按钮客户区保护带（避让防误触）**：
+  - 踩坑：`data-win-chrome="false"` 声明下，系统外壳会将原生标题按钮计数清零（`capCount = 0`）。在 Win32 `WM_NCHITTEST` 中，若未显式登记保护带（默认 `zoneWidth = 0`），整个顶部标题栏（`cy >= 0 && cy < titlebarH`）横跨全部窗口宽度的物理点击都会直接判定为 `HTCAPTION (2)` 拖动窗口！此时右上角的自定义功能按钮（菜单、最小化、最大化、关闭等）将永远无法接收到物理鼠标点击与悬停事件（`WM_LBUTTONDOWN` / `WM_MOUSEMOVE`），表现为“右上角功能按钮全部失效/无响应”。
+  - 正确姿势：在 `OnLoad` 初始同时调用 `form.GetApp().SetTitlebarHeight(height)`（如 38px）与 `form.GetApp().SetCaptionZone(form.GetApp().Scale(btnStripWidth))`（如 160~180px）。将右上角按钮条带区域显式登记为客户区保护带，使 Win32 `WM_NCHITTEST` 在该区域返回 `HTCLIENT (1)`，确保自定义按钮正常接收物理点击与鼠标交互，而其余顶部条带正常维持窗口拖拽。
 
 ## 动态绑定：改模型，还是改树（选路）
 
