@@ -198,7 +198,7 @@ def md_render(text):
 # --------------------------------------------------------------------- #
 # 页面模板
 # --------------------------------------------------------------------- #
-def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, content_html, full_width=False):
+def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, content_html, full_width=False, md_href=""):
     tabs = []
     for href, zh, en in NAV:
         cls = "active" if href == active else ""
@@ -214,11 +214,12 @@ def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, 
     else:
         sidebar_block = (
             '    <aside class="wiki-side doc-side">\n'
-            '      <div class="searchbox"><svg class="ic" style="width:16px;height:16px" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>\n'
+            '      <div class="searchbox"><svg style="width:16px;height:16px;flex-shrink:0" viewBox="0 0 24 24" fill="none" stroke="var(--text-4)" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>\n'
             '        <input id="docSearch" placeholder="筛选目录…" aria-label="filter"></div>\n'
             f'      {sidebar_html}\n'
             '    </aside>'
         )
+    alt_link = f'\n<link rel="alternate" type="text/markdown" href="{md_href}">' if md_href else ""
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -227,7 +228,7 @@ def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, 
 <title>{html.escape(title)} · Zan</title>
 <meta name="description" content="{html.escape(desc)}">
 <link rel="icon" href="/favicon.svg">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/styles.css">{alt_link}
 </head>
 <body class="lang-zh">
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
@@ -254,7 +255,7 @@ def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, 
       <p class="kicker" style="text-align:left">{hero_kicker}</p>
       <h1 class="grad">{hero_title}</h1>
       <p class="lede">{hero_lede}</p>
-      <p style="font-size:13.5px;color:var(--muted);margin:6px 0 0">
+      <p style="font-size:13.5px;color:var(--text-4);margin:6px 0 0">
         <span class="zh">指南正文以中文编写；导航与界面文案提供英文切换。英文原文请抓取对应 .md 或见仓库 docs/。</span>
         <span class="en">This guide is written in Chinese; the navigation Chrome switches to English. Fetch the .md copy for the raw text.</span>
       </p>
@@ -272,30 +273,68 @@ def page(title, desc, hero_kicker, hero_title, hero_lede, active, sidebar_html, 
   </div>
 </main>
 
-<footer class="footer">
-  <div class="wrap footer-inner">
-    <div class="brand"><img class="brand-mascot" src="/mascot.png" alt=""/><span>Zan</span></div>
-    <p><span class="zh">用 C# 语法做轻量、高性能、漂亮的跨平台原生应用。</span>
-      <span class="en">Lightweight, high-performance, beautiful cross-platform native apps in C#-style syntax.</span></p>
-    <div class="footer-links">
-      {"".join(f'<a href="{h}"><span class="zh">{z}</span><span class="en">{e}</span></a>' for h, z, e in NAV)}
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a class="brand" href="/"><svg width="28" height="28" viewBox="0 0 512 512" style="border-radius:6px"><defs><linearGradient id="fv" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5E86FF"/><stop offset="1" stop-color="#2141E6"/></linearGradient></defs><rect width="512" height="512" fill="url(#fv)"/><path d="M172 200h168L172 312h168" fill="none" stroke="#fff" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Zan</span></a>
+        <p><span class="zh">C# 语法 · AOT 编译 · ARC 内存 · 自研 GUI</span><span class="en">C# syntax · AOT · ARC memory · self-hosted GUI</span></p>
+      </div>
+      <div class="footer-col">
+        <h5><span class="zh">文档</span><span class="en">Docs</span></h5>
+        <ul>
+          <li><a href="/wiki"><span class="zh">IDE 指南</span><span class="en">IDE guide</span></a></li>
+          <li><a href="/lang"><span class="zh">语言参考</span><span class="en">Language</span></a></li>
+          <li><a href="/gui"><span class="zh">GUI 指南</span><span class="en">GUI guide</span></a></li>
+          <li><a href="/stdlib"><span class="zh">标准库</span><span class="en">Stdlib</span></a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h5><span class="zh">资源</span><span class="en">Resources</span></h5>
+        <ul>
+          <li><a href="/examples"><span class="zh">示例</span><span class="en">Examples</span></a></li>
+          <li><a href="/ai-connect"><span class="zh">AI 接入</span><span class="en">AI connect</span></a></li>
+          <li><a href="/ref/System">API Reference</a></li>
+        </ul>
+      </div>
+      <div class="footer-col">
+        <h5><span class="zh">下载</span><span class="en">Download</span></h5>
+        <ul>
+          <li><a data-download href="{DOWNLOAD_URL}"><span class="zh">Windows x64</span><span class="en">Windows x64</span></a></li>
+        </ul>
+      </div>
     </div>
-    <p class="copyright">© 2026 Zan Language · MIT</p>
+    <div class="footer-bottom">
+      <span class="footer-tagline"><span class="zh">© 2026 Zan Language · MIT 许可</span><span class="en">© 2026 Zan Language · MIT License</span></span>
+    </div>
   </div>
 </footer>
 
-<div class="modal" id="dlModal" role="dialog" aria-modal="true">
+<div class="modal-backdrop" id="dlModal" role="dialog" aria-modal="true" aria-label="下载 Zan IDE">
   <div class="modal-card">
-    <button class="modal-x" aria-label="close">&times;</button>
-    <img class="m-mascot" src="/mascot.png" alt=""/>
-    <h3><span class="zh">下载 Zan IDE</span><span class="en">Download Zan IDE</span></h3>
-    <p><span class="zh">网盘下载需要提取码，请先复制：</span><span class="en">The download needs an access code — copy it first:</span></p>
-    <div class="code-box">
-      <span class="code-val">zanlang</span>
-      <button class="copy-btn" data-copy="zanlang"><span class="zh">复制</span><span class="en">Copy</span></button>
+    <div class="modal-head">
+      <svg class="modal-avatar" width="48" height="48" viewBox="0 0 512 512"><defs><linearGradient id="mv" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5E86FF"/><stop offset="1" stop-color="#2141E6"/></linearGradient></defs><rect width="512" height="512" rx="116" fill="url(#mv)"/><path d="M172 200h168L172 312h168" fill="none" stroke="#fff" stroke-width="52" stroke-linecap="round" stroke-linejoin="round"/><path d="M400 92l11 29 29 11-29 11-11 29-11-29-29-11 29-11z" fill="#FFC838"/></svg>
+      <div class="modal-head-text">
+        <h3><span class="zh">下载 Zan IDE</span><span class="en">Download Zan IDE</span></h3>
+        <p><span class="zh">免费 · 解压即用 · &lt; 20 MB</span><span class="en">Free · unzip and run · &lt; 20 MB</span></p>
+      </div>
+      <button class="modal-close" id="modalCloseBtn" aria-label="关闭">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
     </div>
-    <p class="modal-hint"><span class="zh">蓝奏云<b>不能自动填充密码</b>，打开后请在页面手动粘贴提取码。</span><span class="en">The netdisk <b>can't auto-fill</b> — paste the code manually on its page.</span></p>
-    <a class="btn btn-primary" href="{DOWNLOAD_URL}" target="_blank" rel="noopener"><span class="zh">前往下载页</span><span class="en">Go to download page</span></a>
+    <div class="modal-body">
+      <div class="modal-code-row">
+        <div><div class="modal-code-lbl"><span class="zh">提取码</span><span class="en">Access code</span></div><div class="modal-code-val">zanlang</div></div>
+        <button class="btn-copy" data-copy="zanlang"><span class="zh">一键复制</span><span class="en">Copy</span></button>
+      </div>
+      <p class="modal-notice"><span class="zh">蓝奏云<b>不能自动填充密码</b>，请先点「一键复制」，打开下载页后手动粘贴提取码。</span><span class="en">The netdisk <b>can't auto-fill</b> the code — copy it first, then paste it on the download page.</span></p>
+      <div class="modal-platforms">
+        <span><span class="ok">✓</span> Windows x64</span>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <a class="btn-primary" href="{DOWNLOAD_URL}" target="_blank" rel="noopener"><span class="zh">前往下载页</span><span class="en">Go to download page</span></a>
+    </div>
   </div>
 </div>
 
@@ -363,7 +402,8 @@ def build_guides():
                    '<span class="zh">知识库 · 指南</span><span class="en">Knowledge base</span>',
                    hero_title,
                    f'<span class="zh">完整开发文档，可检索、可复制。</span><span class="en">Full development docs.</span>',
-                   "/" + page_name, sb, content)
+                   "/" + page_name, sb, content,
+                   md_href="/" + page_name + ".md")
         with open(os.path.join(REF, "..", page_name + ".html"), "w", encoding="utf-8") as f:
             f.write(out)
         with open(os.path.join(PUB, page_name + ".md"), "w", encoding="utf-8") as f:
@@ -533,7 +573,8 @@ def build_ref():
                    ns,
                    f'<span class="zh">{len(d.get("types", []))} 个类型 · 完整签名由 stdlib/packages 源码提取</span>'
                    f'<span class="en">{len(d.get("types", []))} types · extracted from stdlib and package sources</span>',
-                   "/stdlib.html", ref_sidebar(data, ns), "\n".join(content))
+                   "/stdlib.html", ref_sidebar(data, ns), "\n".join(content),
+                   md_href="/ref/" + ns + ".md")
         with open(os.path.join(REF, ns + ".html"), "w", encoding="utf-8") as f:
             f.write(out)
         # Markdown
@@ -575,7 +616,8 @@ def build_ai_mirror():
                "AI 接入（Zan 助手）",
                '<span class="zh">把这个提示词发给你的 AI 编码工具，它会自己配置并开始工作。</span>'
                '<span class="en">Give this prompt to your AI tool; it configures itself.</span>',
-               "/ai-connect", "", content, full_width=True)
+               "/ai-connect", "", content, full_width=True,
+               md_href="/ai-connect.md")
     with open(os.path.join(PUB, "ai-connect.html"), "w", encoding="utf-8") as f:
         f.write(out)
     with open(os.path.join(PUB, "ai-connect.md"), "w", encoding="utf-8") as f:
