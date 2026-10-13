@@ -1238,8 +1238,13 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
         LLVMPositionBuilderAtEnd(g->builder, bad_bb);
         char buf[640];
         const char *file0 = loc_site_file(g, loc);
-        snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
-                 file0, loc.line, loc.col, msg);
+        if (g->hide_diagnostics) {
+            snprintf(buf, sizeof(buf), "%s: runtime error: %s\n",
+                     file0, msg);
+        } else {
+            snprintf(buf, sizeof(buf), "%s:%u:%u: runtime error: %s\n",
+                     file0, loc.line, loc.col, msg);
+        }
         LLVMValueRef text0 = zan_irgen_intern_string(g, buf);
         emit_guard_report_merged(g, text0);
         LLVMBuildBr(g->builder, cont_bb);
@@ -1256,7 +1261,9 @@ static void emit_runtime_check(zan_irgen_t *g, LLVMValueRef is_error,
     char mbuf[320];
     snprintf(mbuf, sizeof(mbuf), "%s\n", msg);
     LLVMValueRef msg_gv = zan_irgen_intern_string(g, mbuf);
-    emit_guard_report3(g, file_gv, loc.line, loc.col, msg_gv);
+    uint32_t line_arg = g->hide_diagnostics ? 0 : loc.line;
+    uint32_t col_arg = g->hide_diagnostics ? 0 : loc.col;
+    emit_guard_report3(g, file_gv, line_arg, col_arg, msg_gv);
     LLVMBuildBr(g->builder, cont_bb);
 
     LLVMPositionBuilderAtEnd(g->builder, cont_bb);
@@ -1267,10 +1274,17 @@ static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
     if (!g->rt_guard_split) {
         char buf[160];
         const char *file0 = loc_site_file(g, loc);
-        snprintf(buf, sizeof(buf),
-                 "%s:%u:%u: runtime error: null reference where a string/byte "
-                 "buffer is required (length probe)\n",
-                 file0, loc.line, loc.col);
+        if (g->hide_diagnostics) {
+            snprintf(buf, sizeof(buf),
+                     "%s: runtime error: null reference where a string/byte "
+                     "buffer is required (length probe)\n",
+                     file0);
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "%s:%u:%u: runtime error: null reference where a string/byte "
+                     "buffer is required (length probe)\n",
+                     file0, loc.line, loc.col);
+        }
         emit_guard_report_merged(g, zan_irgen_intern_string(g, buf));
         return;
     }
@@ -1278,7 +1292,9 @@ static void emit_string_null_report(zan_irgen_t *g, LLVMValueRef payload,
     LLVMValueRef file_gv = zan_irgen_intern_string(g, file);
     LLVMValueRef msg_gv = zan_irgen_intern_string(g,
         "null reference where a string/byte buffer is required (length probe)\n");
-    emit_guard_report3(g, file_gv, loc.line, loc.col, msg_gv);
+    uint32_t line_arg = g->hide_diagnostics ? 0 : loc.line;
+    uint32_t col_arg = g->hide_diagnostics ? 0 : loc.col;
+    emit_guard_report3(g, file_gv, line_arg, col_arg, msg_gv);
 }
 
 static LLVMValueRef emit_index_i64(zan_irgen_t *g, LLVMValueRef value,

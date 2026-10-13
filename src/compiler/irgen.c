@@ -156,6 +156,45 @@ static LLVMMetadataRef di_file_for(zan_irgen_t *g, uint32_t file_id) {
 }
 
 static const char *loc_site_file(zan_irgen_t *g, zan_loc_t loc) {
+    if (g->hide_diagnostics) {
+        for (int i = 0; i < g->site_record_count; i++) {
+            if (g->site_records[i].file_id == loc.file_id &&
+                g->site_records[i].line == loc.line &&
+                g->site_records[i].col == loc.col) {
+                char sbuf[32];
+                snprintf(sbuf, sizeof(sbuf), "#%u", g->site_records[i].site_id);
+                return zan_arena_strdup(g->arena, sbuf, strlen(sbuf));
+            }
+        }
+        if (g->site_record_count >= g->site_record_cap) {
+            int new_cap = g->site_record_cap ? g->site_record_cap * 2 : 64;
+            g->site_records = realloc(g->site_records, new_cap * sizeof(*g->site_records));
+            g->site_record_cap = new_cap;
+        }
+        uint32_t id = ++g->next_site_id;
+        g->site_records[g->site_record_count].file_id = loc.file_id;
+        g->site_records[g->site_record_count].line = loc.line;
+        g->site_records[g->site_record_count].col = loc.col;
+        g->site_records[g->site_record_count].site_id = id;
+        g->site_record_count++;
+
+        if (g->site_map_fp) {
+            const char *raw_file = NULL;
+            if (g->diag && g->diag->file_names &&
+                (int)loc.file_id < g->diag->file_count) {
+                const char *q = g->diag->file_names[loc.file_id];
+                if (q && q[0]) raw_file = q;
+            }
+            if (!raw_file) raw_file = g->src_file ? g->src_file : "<unknown>";
+            fprintf(g->site_map_fp, "#%u\t%s:%u:%u\n", id, raw_file, loc.line, loc.col);
+            fflush(g->site_map_fp);
+        }
+
+        char sbuf[32];
+        snprintf(sbuf, sizeof(sbuf), "#%u", id);
+        return zan_arena_strdup(g->arena, sbuf, strlen(sbuf));
+    }
+
     const char *p = NULL;
     if (g->diag && g->diag->file_names &&
         (int)loc.file_id < g->diag->file_count) {
@@ -1570,6 +1609,13 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
     g->string_literals = NULL;
     g->string_literal_count = 0;
     g->string_literal_cap = 0;
+    g->hide_diagnostics = false;
+    g->site_map_path = NULL;
+    g->site_map_fp = NULL;
+    g->next_site_id = 0;
+    g->site_records = NULL;
+    g->site_record_count = 0;
+    g->site_record_cap = 0;
 
     g->ctx = LLVMContextCreate();
     g->mod = LLVMModuleCreateWithNameInContext(module_name, g->ctx);
@@ -2787,6 +2833,13 @@ void zan_irgen_release_llvm(zan_irgen_t *g) {
     free(g->string_literals);
     g->string_literals = NULL;
     g->string_literal_count = g->string_literal_cap = 0;
+    if (g->site_map_fp) {
+        fclose(g->site_map_fp);
+        g->site_map_fp = NULL;
+    }
+    free(g->site_records);
+    g->site_records = NULL;
+    g->site_record_count = g->site_record_cap = 0;
     free(g->goto_labels);
     g->goto_labels = NULL;
     g->goto_label_count = g->goto_label_cap = 0;

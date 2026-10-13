@@ -6,6 +6,7 @@
 #include "ast.h"
 #include "binder.h"
 #include "../runtime/rt_decimal.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <llvm-c/Core.h>
@@ -454,6 +455,19 @@ struct zan_irgen {
     struct { LLVMValueRef global; uint32_t len; } *obf_literals;
     int obf_literal_count;
     int obf_literal_cap;
+
+    bool hide_diagnostics;
+    const char *site_map_path;
+    FILE *site_map_fp;
+    uint32_t next_site_id;
+    struct {
+        uint32_t file_id;
+        uint32_t line;
+        uint32_t col;
+        uint32_t site_id;
+    } *site_records;
+    int site_record_count;
+    int site_record_cap;
 
     LLVMTypeRef  co_step_type;    /* void(i8*) — a frame's resume/step fn */
     LLVMTypeRef  co_step_ptr;     /* void(i8*)* — pointer to a step fn */

@@ -4198,6 +4198,10 @@ static void print_usage(void) {
     fprintf(stderr, "  --strict-runtime  Guard failures exit(70) without ZAN_RT_HARD=1\n");
     fprintf(stderr, "  --deny-warnings   Treat compiler warnings as fatal errors\n");
     fprintf(stderr, "  --publish        Build optimized release binary (strip debug, optimize)\n");
+    fprintf(stderr, "  --strip-symbols  Strip debug and non-exported symbols at link time\n");
+    fprintf(stderr, "  --hide-diagnostics Suppress source file paths/lines in runtime guard reports\n");
+    fprintf(stderr, "  --emit-site-map <f> Write diagnostic site ID mapping to <f> (with --hide-diagnostics)\n");
+    fprintf(stderr, "  --obfuscate-strings Obfuscate user string literals in readonly data\n");
     fprintf(stderr, "  --fast-alloc     Front-end malloc with the per-thread small-object\n");
     fprintf(stderr, "                   allocator (server workloads; native targets only)\n");
     fprintf(stderr, "  --link-mode <m>  Native driver linking on publish: shared (copy driver\n");
@@ -4380,6 +4384,9 @@ int main(int argc, char **argv) {
     bool strict_runtime = false;
     bool publish_mode = false;
     int obfuscate_strings_opt = -1;
+    bool hide_diagnostics = false;
+    const char *site_map_path = NULL;
+    bool strip_symbols = false;
     int error_limit = -1;
     bool debug_info = false;
     /* 小对象内存分配器管理池 */
@@ -4462,6 +4469,14 @@ int main(int argc, char **argv) {
             obfuscate_strings_opt = 1;
         } else if (strcmp(argv[i], "--no-obfuscate-strings") == 0) {
             obfuscate_strings_opt = 0;
+        } else if (strcmp(argv[i], "--hide-diagnostics") == 0) {
+            hide_diagnostics = true;
+        } else if (strcmp(argv[i], "--strip-symbols") == 0) {
+            strip_symbols = true;
+        } else if (strcmp(argv[i], "--emit-site-map") == 0 && i + 1 < argc) {
+            site_map_path = argv[++i];
+        } else if (strncmp(argv[i], "--emit-site-map=", 16) == 0) {
+            site_map_path = argv[i] + 16;
         } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--debug") == 0) {
             debug_info = true;
         } else if (strcmp(argv[i], "--fast-alloc") == 0) {
@@ -5226,6 +5241,16 @@ int main(int argc, char **argv) {
         irgen.obfuscate_strings = false;
     } else {
         irgen.obfuscate_strings = false;
+    }
+    irgen.hide_diagnostics = hide_diagnostics;
+    irgen.site_map_path = site_map_path;
+    if (site_map_path && site_map_path[0]) {
+        irgen.site_map_fp = fopen(site_map_path, "w");
+        if (!irgen.site_map_fp) {
+            fprintf(stderr, "warning: cannot open site map file for writing: %s\n", site_map_path);
+        } else {
+            fprintf(irgen.site_map_fp, "# Zan Diagnostic Site Map\n# Input: %s\n", input_file ? input_file : "zan");
+        }
     }
     irgen.fast_codegen = false;
     irgen.emit_lib = emit_lib;
@@ -7063,7 +7088,7 @@ int main(int argc, char **argv) {
             char cmd[4096];
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\" \"%s\"",
-                     publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
+                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7163,7 +7188,7 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof(cmd),
                      "ld.lld -static%s -o \"%s\" \"%s/crt1.o\" \"%s/crti.o\""
                      " \"%s/clang_rt.crtbegin.o\" \"%s\"",
-                     publish_mode ? " -s --gc-sections" : "", obj_path, sys, sys, sys, obj_tmp);
+                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, sys, sys, obj_tmp);
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
                          zan_lib_dirs[di]);
@@ -7241,12 +7266,12 @@ int main(int argc, char **argv) {
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -pie%s -o \"%s\" \"%s/crtbegin_dynamic.o\""
                          " \"%s\"",
-                         publish_mode ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
                          "ld.lld -static%s -o \"%s\" \"%s/crtbegin_static.o\""
                          " \"%s\"",
-                         publish_mode ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
+                         (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys, obj_tmp);
             }
             for (int di = 0; di < zan_lib_ndirs; di++) {
                 cmd_appendf(cmd, sizeof(cmd), " -L\"%s\"",
@@ -7388,7 +7413,7 @@ int main(int argc, char **argv) {
                      "ld.lld -m %s --stack 268435456%s%s -o \"%s\" "
                      "\"%s/crt2.o\" \"%s/crtbegin.o\"",
                      (target.arch == ZAN_ARCH_AARCH64) ? "arm64pe" : "i386pep",
-                     publish_mode ? " -s --gc-sections" : "",
+                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "",
                      (link_subsystem && strcmp(link_subsystem, "windows") == 0)
                          ? " --subsystem windows" : "",
                      obj_path, syslib, syslib);
@@ -7503,7 +7528,7 @@ int main(int argc, char **argv) {
                      "wasm-ld%s -z stack-size=4194304 --max-memory=536870912 "
                      "--table-base=2 "
                      "-o \"%s\" \"%s/crt1.o\" \"%s\"",
-                     publish_mode ? " -s --gc-sections" : "", obj_path, sys,
+                     (publish_mode || strip_symbols) ? " -s --gc-sections" : "", obj_path, sys,
                      obj_tmp);
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
@@ -7703,13 +7728,13 @@ int main(int argc, char **argv) {
                 snprintf(cmd, sizeof(cmd),
                          "ld64.lld -arch arm64 -platform_version ios 14.0 14.0 -adhoc_codesign"
                          "%s -o \"%s\" \"%s\"",
-                         publish_mode ? " -dead_strip" : "",
+                         (publish_mode || strip_symbols) ? " -dead_strip" : "",
                          obj_path, obj_tmp);
             } else {
                 snprintf(cmd, sizeof(cmd),
                          "ld64.lld -arch %s -platform_version macos 11.0 11.0 -adhoc_codesign"
                          "%s -o \"%s\" \"%s\"",
-                         march, publish_mode ? " -dead_strip" : "",
+                         march, (publish_mode || strip_symbols) ? " -dead_strip" : "",
                          obj_path, obj_tmp);
             }
             if (rt_timer_obj) {
@@ -7825,7 +7850,7 @@ int main(int argc, char **argv) {
             argv[a++] = "-m";      argv[a++] = "i386pep";
             argv[a++] = "-Bdynamic";
             argv[a++] = "--stack"; argv[a++] = "268435456";
-            if (publish_mode) {
+            if (publish_mode || strip_symbols) {
                 argv[a++] = "-s";
                 argv[a++] = "--gc-sections";
             }
@@ -7992,7 +8017,7 @@ int main(int argc, char **argv) {
         }
 #else
         char link_cmd[4096];
-        if (publish_mode) {
+        if (publish_mode || strip_symbols) {
             snprintf(link_cmd, sizeof(link_cmd), "cc \"%s\" -o \"%s\" -lm -O2 -s",
                      obj_tmp, obj_path);
         } else {

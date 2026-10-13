@@ -7,7 +7,7 @@ endif()
 # Extracting this block avoids linking the IDE's window, debugger and network.
 file(READ "${ROOT}/src/ide_zan/src/services/ZanIDE.Project.zan" _project)
 string(FIND "${_project}" "    static string CompileToExe(" _begin)
-string(FIND "${_project}" "    /// Reads a `key = value`" _end)
+string(FIND "${_project}" "    static string ProjField(" _end)
 if(_begin LESS 0 OR _end LESS _begin)
   message(FATAL_ERROR "IDE compile builder boundaries not found")
 endif()
@@ -19,7 +19,7 @@ set(_generated "${_out_dir}/ide_compile_builders.zan")
 file(WRITE "${_generated}" "partial class ZanIDE {\n${_builders}}\n")
 
 # The callers must distinguish debug runs from debug deployment too.
-file(READ "${ROOT}/src/ide_zan/src/shell/ZanIDE.Workspace.zan" _workspace)
+file(READ "${ROOT}/src/ide_zan/src/services/ZanIDE.Publish.zan" _workspace)
 string(REGEX MATCHALL "CompileToExe(SingleFile)?\\([^;]*exe, true, dbg\\)" _publish_calls "${_workspace}")
 list(LENGTH _publish_calls _publish_count)
 if(NOT _publish_count EQUAL 3 OR _workspace MATCHES "exe, !dbg, dbg\\)")
