@@ -63,9 +63,12 @@ partial class SecurityApp {
     static List<AccessItem> accessItems = new List<AccessItem>();
     static bool isFavEditing = false;
 
-    // 常用工具拖拽悬浮图标状态
+    // 常用工具拖拽手势与悬浮图标状态机
     static bool isDraggingTool = false;
-    static bool dragStartByMouseDown = false;
+    static bool dragMouseDown = false;
+    static int dragStartX = 0;
+    static int dragStartY = 0;
+    static ToolEntry pendingDragTool = null;
     static string dragToolId = "";
     static string dragToolName = "";
     static string dragToolIcon = "";
@@ -83,7 +86,8 @@ partial class SecurityApp {
 
     // 首页芯片与落区动态效果计时
     static int animTick = 0;
-    static int dragTick = 0;
+    static int dragAnimTick = 0;
+    static int dragDurationFrames = 0;
     static long lastAnimMs = 0;
 
     static void OnLoad(Form form) {
@@ -450,7 +454,7 @@ partial class SecurityApp {
         card.InitElement("div", "toolCard_" + item.id);
         card.Class = "tool-item-card";
         card.Prefer(0, 72);
-        card.SetProp("style", "height: 72px; min-height: 72px; max-height: 72px; flex: 0 0 31%; flex-shrink: 0;");
+        card.SetProp("style", "height: 72px; min-height: 72px; max-height: 72px; flex: 0 0 31%; flex-shrink: 0; cursor: pointer;");
 
         Element iconBox = new Element();
         iconBox.InitElement("div", "");
@@ -459,24 +463,6 @@ partial class SecurityApp {
         btnIcon.Class = "tool-icon-btn";
         btnIcon.Icon = item.icon;
         btnIcon.Prefer(24, 24);
-        btnIcon.OnMouseDown(() => {
-            if (!item.isFav) {
-                dragStartByMouseDown = true;
-                StartDragTool(item.id, item.name, item.icon);
-            }
-        });
-        btnIcon.OnClick(() => {
-            long now = Window.GetTickMs();
-            if (now - lastDragEndMs < 400) { return; }
-            if (item.isFav) {
-                OnLaunchTool(item.id, item.name);
-            } else if (!isDraggingTool) {
-                dragStartByMouseDown = false;
-                StartDragTool(item.id, item.name, item.icon);
-            }
-        });
-        iconBox.AddKid(btnIcon);
-        card.AddKid(iconBox);
 
         Element info = new Element();
         info.InitElement("div", "");
@@ -494,25 +480,43 @@ partial class SecurityApp {
         descEl.SetText(item.desc);
         info.AddKid(descEl);
 
+        iconBox.AddKid(btnIcon);
+        card.AddKid(iconBox);
         card.AddKid(info);
 
-        card.OnMouseDown(() => {
-            if (!item.isFav) {
-                dragStartByMouseDown = true;
-                StartDragTool(item.id, item.name, item.icon);
+        // 统一手势处理：鼠标按下时记录拖拽意图，移动超阈值进入浮动拖拽；原位点击启动对应工具
+        Gui.Action onMouseDownCard = () => {
+            if (!item.isFav && !isDraggingTool) {
+                if (__form != null) {
+                    App app = __form.GetApp();
+                    dragStartX = app.mouseX;
+                    dragStartY = app.mouseY;
+                }
+                dragMouseDown = true;
+                pendingDragTool = item;
             }
-        });
+        };
 
-        card.OnClick(() => {
+        Gui.Action onClickCard = () => {
             long now = Window.GetTickMs();
             if (now - lastDragEndMs < 400) { return; }
-            if (item.isFav) {
-                OnLaunchTool(item.id, item.name);
-            } else if (!isDraggingTool) {
-                dragStartByMouseDown = false;
-                StartDragTool(item.id, item.name, item.icon);
-            }
-        });
+            if (isDraggingTool) { return; }
+            OnLaunchTool(item.id, item.name);
+        };
+
+        // 绑定到整个卡片及所有子节点，确保点击或按压卡片任何区域（图标、标题、说明或留白）均完美触发
+        card.OnMouseDown(onMouseDownCard);
+        card.OnClick(onClickCard);
+        btnIcon.OnMouseDown(onMouseDownCard);
+        btnIcon.OnClick(onClickCard);
+        iconBox.OnMouseDown(onMouseDownCard);
+        iconBox.OnClick(onClickCard);
+        info.OnMouseDown(onMouseDownCard);
+        info.OnClick(onClickCard);
+        nameEl.OnMouseDown(onMouseDownCard);
+        nameEl.OnClick(onClickCard);
+        descEl.OnMouseDown(onMouseDownCard);
+        descEl.OnClick(onClickCard);
 
         return card;
     }
@@ -685,11 +689,12 @@ partial class SecurityApp {
 
     // 拖拽工具跟随与置入常用工具
     static void StartDragTool(string id, string name, string icon) {
+        if (isDraggingTool) { return; }
         isDraggingTool = true;
         dragToolId = id;
         dragToolName = name;
         dragToolIcon = icon;
-        dragTick = 0;
+        dragDurationFrames = 0;
         if (dragAvatar != null) {
             dragAvatar.visible = true;
             dragAvatar.designFloat = true;
@@ -733,21 +738,23 @@ partial class SecurityApp {
     static void EndDragTool(bool dock) {
         if (!isDraggingTool) { return; }
         lastDragEndMs = Window.GetTickMs();
-        if (dock) {
-            DockFavoriteTool(dragToolName);
-        }
+        string toolNameToDock = dragToolName;
         isDraggingTool = false;
-        dragStartByMouseDown = false;
+        dragMouseDown = false;
+        pendingDragTool = null;
         dragToolId = "";
         dragToolName = "";
         dragToolIcon = "";
-        dragTick = 0;
+        dragDurationFrames = 0;
         if (dragAvatar != null) {
             dragAvatar.visible = false;
             dragAvatar.SetProp("class", "drag-avatar");
         }
         if (imgDropzone != null) {
             imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(0, false, false));
+        }
+        if (dock && toolNameToDock != "") {
+            DockFavoriteTool(toolNameToDock);
         }
         if (__form != null) { __form.GetApp().RequestRedraw(); }
     }
@@ -1157,7 +1164,7 @@ partial class SecurityApp {
 
         // 安全工具页：拖拽状态下落区流动跑马灯/呼吸光晕自主推进
         if (currentPageIndex == 3 && imgDropzone != null) {
-            dragTick = (dragTick + 1) % 40;
+            dragAnimTick = (dragAnimTick + 1) % 40;
             bool isOver = false;
             if (isDraggingTool && dropzoneBox != null) {
                 int mx = app.mouseX;
@@ -1167,7 +1174,7 @@ partial class SecurityApp {
                     isOver = true;
                 }
             }
-            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragTick, isDraggingTool, isOver));
+            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragAnimTick, isDraggingTool, isOver));
             app.RequestRedraw();
         }
     }
@@ -1192,9 +1199,27 @@ partial class SecurityApp {
             }
         }
 
-        // 2. 常用工具拖拽图标无卡顿光标跟随与鼠标松手落入判定
+        // 2. 常用工具拖拽手势判定与光标极速跟随
+        if (dragMouseDown && !isDraggingTool && pendingDragTool != null) {
+            if (!app.pointerDown || (app.window != null && app.window.EventKind() == 3)) {
+                // 未达到拖拽位移阈值就已松手，视为普通点击/取消
+                dragMouseDown = false;
+                pendingDragTool = null;
+            } else {
+                int dx = app.mouseX - dragStartX;
+                if (dx < 0) { dx = 0 - dx; }
+                int dy = app.mouseY - dragStartY;
+                if (dy < 0) { dy = 0 - dy; }
+                // 移动超过 4 个逻辑像素阈值，正式启动拖拽悬浮态
+                if (dx >= 4 || dy >= 4) {
+                    StartDragTool(pendingDragTool.id, pendingDragTool.name, pendingDragTool.icon);
+                    dragMouseDown = false;
+                }
+            }
+        }
+
         if (isDraggingTool && dragAvatar != null) {
-            dragTick = dragTick + 1;
+            dragDurationFrames = dragDurationFrames + 1;
             int mx = app.mouseX;
             int my = app.mouseY;
             int scale = app.dpiScale > 0 ? app.dpiScale : 100;
@@ -1209,10 +1234,22 @@ partial class SecurityApp {
             dragAvatar.Arrange(curX, curY, curW, curH);
 
             bool isOverDropzone = false;
-            if (dropzoneBox != null) {
-                if (mx >= dropzoneBox.bx && mx <= dropzoneBox.bx + dropzoneBox.bw &&
-                    my >= dropzoneBox.by && my <= dropzoneBox.by + dropzoneBox.bh) {
-                    isOverDropzone = true;
+            int favCount = 0;
+            for (int i = 0; i < toolsList.Count; i = i + 1) {
+                if (toolsList[i].isFav) { favCount = favCount + 1; }
+            }
+            if (favCount < 6) {
+                if (dropzoneBox != null && dropzoneBox.visible) {
+                    if (mx >= dropzoneBox.bx && mx <= dropzoneBox.bx + dropzoneBox.bw &&
+                        my >= dropzoneBox.by && my <= dropzoneBox.by + dropzoneBox.bh) {
+                        isOverDropzone = true;
+                    }
+                }
+                if (!isOverDropzone && favToolsList != null) {
+                    if (mx >= favToolsList.bx && mx <= favToolsList.bx + favToolsList.bw &&
+                        my >= favToolsList.by && my <= favToolsList.by + favToolsList.bh) {
+                        isOverDropzone = true;
+                    }
                 }
             }
 
@@ -1223,25 +1260,18 @@ partial class SecurityApp {
             }
 
             if (imgDropzone != null) {
-                imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragTick, true, isOverDropzone));
+                imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragDurationFrames, true, isOverDropzone));
             }
 
-            // 监听释放判定（长按拖动：松开鼠标释放；点击抓取：再次点击释放）
+            // 监听释放判定（松开鼠标释放）
             bool shouldEndDrag = false;
-            if (dragStartByMouseDown && dragTick >= 3) {
-                if (app.window != null && (app.window.EventKind() == 3 || !app.pointerDown)) {
-                    shouldEndDrag = true;
-                }
-            } else if (!dragStartByMouseDown && dragTick >= 6) {
-                if (app.window != null && (app.window.EventKind() == 3 || app.window.EventKind() == 2)) {
-                    shouldEndDrag = true;
-                }
+            if (!app.pointerDown || (app.window != null && app.window.EventKind() == 3)) {
+                shouldEndDrag = true;
             }
             if (shouldEndDrag) {
-                Console.WriteLine("[SecurityGuard] 拖拽释放: 落区检测 = " + (isOverDropzone ? "命中[拖拽到此]" : "未命中"));
+                Console.WriteLine("[SecurityGuard] 拖拽释放: 落区检测 = " + (isOverDropzone ? "命中[常用工具]" : "未命中"));
                 EndDragTool(isOverDropzone);
             }
-
             app.RequestRedraw();
         }
     }
