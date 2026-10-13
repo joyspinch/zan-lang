@@ -652,6 +652,10 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
   属性项动辄几十项时必须分组并支持折叠展开，大类标题（`kind == 5`）展示 `▶` / `▼`
   指示状态，`ContentHeight` 与逐行绘制均需联动跳过折叠项，并在标题栏使用 `Ui.ClickedIn`
   阻断点击穿透，保证滚动条量程与视野紧凑清晰。
+- **HTML+CSS+Zan 设计稿零胶水规范与纯矢量图标体系（从截图还原精美客户端铁律）**:
+  - **GenForm 设计稿零胶水通道**:在 HTML `body` 上声明 `data-zan-design`、`data-win-title`、`data-win-w`、`data-win-h`、`data-win-chrome="false"`(沉浸式无边框)和 `data-win-center="true"`。编译器自动生成窗口、自动注入 `<style>` 中的 CSS 样式表、去除标题栏、自动居中、DockFill 挂载并连线所有 `@click` 事件与默认 Main 入口。后台 `App.zan` 严禁手写任何 `Form.Create`、`UseAppCss`、`SetChromeVisible` 或 `handlers.Add` 等样板胶水代码,只需声明 `partial class` 编写纯粹的业务状态与事件响应。
+  - **Tabler SVG 纯矢量图标铁律(杜绝伪 Unicode 字符)**:按钮与图标控件一律声明标准 SVG 矢量名(如 `icon="player-play"`、`icon="player-skip-back"`、`icon="player-skip-forward"`、`icon="heart"`、`icon="volume"`、`icon="reload"`、`icon="playlist"`、`icon="chevron-down"` 等),走内置 997+ Tabler SVG 矢量图标集经 nanosvg 矢量光栅化与 GPU 贴图缓存。严禁使用 `▶`、`⏮`、`❤` 等 Unicode 假字符冒充图标。
+  - **HTML 文本与布局容器语义映射**:原生 `div` 标签映射为纯无格式布局容器(`Panel`,不绘制自身文本)。段落与标题必须使用语义标签 `<p>` 或 `<h1>`~`<h6>`(映射为 `Typography` 排版控件),行内文案使用 `<label>` 或 `<span>`(映射为 `Label` 控件)。容器排版纵向排列时必须显式声明 `display: flex; flex-direction: column;` 避免子元素横向挤占。
 - **分段单选按钮（Segmented Buttons）文字安全内边距阈值**:
   判定是否由下拉框升格为单行分段按钮时，文字宽度测量 `tw` 必须预留至少 `app.Scale(16)`
   的安全 padding（左右各 8px），否则在高 DPI 或多字宽下极易贴边或溢出截断；放不下时应
