@@ -269,9 +269,15 @@ small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 
        普通 `.html`（不带 `data-zan-design`）由 GenHtml 生成，body 根节点默认无 Dock，在 code-behind 中必须补齐 `root.DockFill`，否则界面缩在左上角。
     5. **从设计截图还原精美客户端的“四步拆解定式”(网易云/QQ音乐实战验证)**:
        - **第一步·视觉材质提取**: 从设计图取色提取主题主色与渐变层（暗紫/深灰阶梯，如 `linear-gradient(135deg, #26212b, #121015)`）；提炼特征几何（黑胶唱片大圆角 `border-radius: 180px`、同心圆同轴径向渐变 `radial-gradient`）；提炼吸底/吸顶磨砂半透明度（`rgba(18, 15, 21, 0.95)`）。
-       - **第二步·骨架分段与停靠**: 采用经典三段式停靠收敛视口：顶栏 `<zan-flex dock="top">`、吸底操作条 `<zan-flex dock="bottom">`、主舞台 `<zan-flex dock="fill">`。主舞台内部一分为二（唱盘区 + 歌词/列表区）自适应伸缩。
+       - **第二步·骨架分段与弹性伸缩(防白板与颠倒)**:
+         视口排布必须首选标准 Flex Column 垂直流：`body { display: flex; flex-direction: column; width: 100%; height: 100%; overflow: hidden; }`。
+         按自然视口自上而下顺次书写：顶栏 `<div class="topbar">`（固定高 `flex-shrink: 0`） -> 主舞台 `<div class="stage-row">`（`flex-grow: 1; min-height: 0` 弹性撑满中间） -> 底栏 `<div class="bottom-bar">`（固定高 `flex-shrink: 0` 吸附在最底）。禁止在 block 流中混用 `dock="bottom"` 与 `dock="fill"` 导致顺序颠倒或高度塌陷。
        - **第三步·CSS 原生动效交付**: 旋转/呼吸高光直接在 CSS 声明内置关键帧动画（如 `animation: spin 24s linear infinite`），由底层 GPU 帧循环 60/120Hz 驱动无损旋转，严禁在 Zan 业务代码里手写角度插值时钟。
-       - **第四步·原生 Code-behind 极简绑定**: HTML 内完全不写 `<script>`；在 `App.zan` 中仅写 30~50 行强类型业务逻辑，通过 `HtmlHandlers.Add("OnTogglePlay", OnTogglePlay)` 编译期安全绑定原生事件。
+       - **第四步·原生 Code-behind 极简绑定(核心防白板铁律)**:
+         HTML 内完全不写 `<script>`；在 `App.zan` 中仅写 30~50 行强类型业务逻辑。
+         **防白板第一铁律**：必须在建树前显式调用 `form.GetApp().UseAppCss(AppHtml.Css)` 注入样式表，否则 CSS 全部未生效、窗口必成纯白板！
+         **防露白第二铁律**：沉浸式暗色应用必须使用 `Form.CreateDark` 创建深色宿主，并配合 `form.GetApp().SetChromeVisible(false)` 隐藏默认标题栏，让 HTML 顶栏完全接管视口，底栏贴底，杜绝浅色窗体外框露白边。
+         通过 `HtmlHandlers.Add("OnTogglePlay", OnTogglePlay)` 编译期安全绑定原生事件。
        - **验收铁律**: 一律经 `zan_gui_snapshot` 或无头 `ZAN_UI_SCRIPT` 回收 `tree.json` 验真，确保各主要容器高度不塌陷、子项不叠放、无无效坐标警告。
 - 项目自带 `skins/` 目录要连 base.css 一起带——同名目录整体跳过
   stdlib 基线内嵌,基线层丢了 flex 全退化成叠矩形(wuwei 百艺页签全叠)。
