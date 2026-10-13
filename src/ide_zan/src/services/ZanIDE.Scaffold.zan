@@ -1,0 +1,756 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Collections.Generic;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+partial class ZanIDE {
+    // ---- workspace / scaffolding ----
+
+
+    static string TemplatesDir() {
+        string a = ZanIDE.BaseDir() + "/templates";
+        if (Directory.Exists(a)) { return a; }
+        string b = ZanIDE.BaseDir() + "/../templates";
+        if (Directory.Exists(b)) { return b; }
+        return "";
+    }
+
+    static List<Tpl> BuildCatalog(string root) {
+        List<Tpl> ts = new List<Tpl>();
+        ZanIDE.LoadDiskTemplates(ts);
+        ZanIDE.LoadCustomTemplates(ts, root);
+        return ts;
+    }
+
+    static void LoadDiskTemplates(List<Tpl> ts) {
+        string base_ = ZanIDE.TemplatesDir();
+        if (base_.Length == 0) { return; }
+        List<Tpl> found = new List<Tpl>();
+        List<string> cats = Directory.GetDirectories(base_);
+        for (int i = 0; i < cats.Count; i = i + 1) {
+            string catDir = base_ + "/" + cats[i];
+            if (File.Exists(catDir + "/template.manifest")) {
+                ZanIDE.AddDiskTemplate(found, catDir);
+            } else {
+                List<string> subs = Directory.GetDirectories(catDir);
+                for (int j = 0; j < subs.Count; j = j + 1) {
+                    ZanIDE.AddDiskTemplate(found, catDir + "/" + subs[j]);
+                }
+            }
+        }
+        for (int k = 0; k < found.Count; k = k + 1) {
+            int best = k;
+            for (int m = k + 1; m < found.Count; m = m + 1) {
+                if (found[m].order < found[best].order) { best = m; }
+            }
+            Tpl tmp = found[k]; found[k] = found[best]; found[best] = tmp;
+            ts.Add(found[k]);
+        }
+    }
+
+    static void AddDiskTemplate(List<Tpl> ts, string dir) {
+        string mpath = dir + "/template.manifest";
+        if (!File.Exists(mpath)) { return; }
+        string m = File.ReadAllText(mpath);
+        string nameEn = ZanIDE.ManifestField(m, "name", Path.GetFileName(dir));
+        string nameZh = ZanIDE.ManifestField(m, "name.zh", nameEn);
+        string descEn = ZanIDE.ManifestField(m, "desc", "");
+        string descZh = ZanIDE.ManifestField(m, "desc.zh", descEn);
+        string catEn = ZanIDE.ManifestField(m, "category", "Other");
+        string catZh = ZanIDE.ManifestField(m, "category.zh", catEn);
+        Tpl t = Tpl.Make(
+            ZanIDE.T(catEn, catZh),
+            ZanIDE.T(nameEn, nameZh),
+            ZanIDE.ManifestField(m, "icon", "file"),
+            ZanIDE.ManifestField(m, "kind", "copy"),
+            ZanIDE.T(descEn, descZh));
+        t.src = dir;
+        t.ptype = ZanIDE.ManifestField(m, "type", "console");
+        t.ptarget = ZanIDE.ManifestField(m, "target", "exe");
+        t.pentry = ZanIDE.ManifestField(m, "entry", "src/main.zan");
+        t.order = ZanIDE.ParseInt(ZanIDE.ManifestField(m, "order", "1000"));
+        t.platforms = ZanIDE.ManifestField(m, "platforms", "");
+        string size = ZanIDE.ManifestField(m, "size", "");
+        if (size != "") {
+            List<string> wh = size.Split("x");
+            if (wh.Count == 2) {
+                t.defW = ZanIDE.ParseIntSafe(wh[0]);
+                t.defH = ZanIDE.ParseIntSafe(wh[1]);
+            }
+        }
+        t.sizeable = ZanIDE.ManifestField(m, "sizeable", "0") == "1";
+        t.round = ZanIDE.ManifestField(m, "shape", "") == "round";
+        t.sketch = ZanIDE.ManifestField(m, "sketch", "");
+        t.device = ZanIDE.ManifestField(m, "device", "");
+        t.caps = ZanIDE.ManifestField(m, "caps", "");
+        string prev = ZanIDE.ManifestField(m, "preview", "");
+        if (prev != "" && File.Exists(dir + "/" + prev)) {
+            t.preview = dir + "/" + prev;
+        }
+        ts.Add(t);
+    }
+
+    static List<string> CatsOf(List<Tpl> ts) {
+        List<string> outp = new List<string>();
+        for (int i = 0; i < ts.Count; i = i + 1) {
+            string c = ts[i].cat;
+            bool seen = false;
+            for (int j = 0; j < outp.Count; j = j + 1) {
+                if (outp[j] == c) { seen = true; }
+            }
+            if (!seen) { outp.Add(c); }
+        }
+        return outp;
+    }
+
+    static List<WizardTemplate> WizTemplates(List<Tpl> ts) {
+        List<WizardTemplate> outp = new List<WizardTemplate>();
+        foreach (Tpl t in ts) {
+            outp.Add(new WizardTemplate(t.cat, t.name, t.icon, t.desc)
+                .Shape(t.sizeable, t.defW, t.defH, t.round)
+                .Look(t.preview, t.sketch)
+                .Device(t.device)
+                .Caps(t.caps)
+                .Plats(t.platforms));
+        }
+        return outp;
+    }
+
+    static void LoadCustomTemplates(List<Tpl> ts, string root) {
+        string dir = ZanIDE.UserConfigDir() + "/templates";
+        List<string> subs = Directory.GetDirectories(dir);
+        for (int i = 0; i < subs.Count; i = i + 1) {
+            string tname = subs[i];
+            string tdir = dir + "/" + tname;
+            string desc = "Custom template.";
+            string icon = "file";
+            string mpath = tdir + "/template.manifest";
+            if (!File.Exists(mpath)) { mpath = tdir + "/manifest.txt"; }
+            if (File.Exists(mpath)) {
+                string m = File.ReadAllText(mpath);
+                desc = ZanIDE.ManifestField(m, "desc", desc);
+                icon = ZanIDE.ManifestField(m, "icon", icon);
+            }
+            Tpl t = Tpl.Make("Custom", tname, icon, "custom", desc);
+            t.src = tdir;
+            ts.Add(t);
+        }
+    }
+
+    static string ManifestField(string content, string key, string def) {
+        int n = content.Length;
+        int kl = key.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            bool atLineStart = (i == 0) || (content.Substring(i - 1, 1) == "\n");
+            if (!atLineStart || i + kl > n
+                || content.Substring(i, kl) != key) { continue; }
+            int j = i + kl;
+            while (j < n) {
+                string sp = content.Substring(j, 1);
+                if (sp == " " || sp == "\t") { j = j + 1; } else { break; }
+            }
+            if (j >= n || content.Substring(j, 1) != "=") { continue; }
+            j = j + 1;
+            string val = "";
+            while (j < n) {
+                string ch = content.Substring(j, 1);
+                if (ch == "\n" || ch == "\r") { break; }
+                val = val + ch;
+                j = j + 1;
+            }
+            return val.Trim();
+        }
+        return def;
+    }
+
+    static void CopyTree(string srcDir, string dstDir) {
+        ZanIDE.CopyTreeT(srcDir, dstDir, "");
+    }
+
+    static void CopyTreeT(string srcDir, string dstDir, string name) {
+        Directory.CreateDirectory(dstDir);
+        List<string> files = Directory.GetFiles(srcDir);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string fn = files[i];
+            if (fn != "manifest.txt" && fn != "template.manifest") {
+                string body = File.ReadAllText(srcDir + "/" + fn);
+                if (name.Length > 0) {
+                    body = ZanIDE.ReplaceAll(body, "{{NAME}}", name);
+                }
+                File.WriteAllText(dstDir + "/" + fn, body);
+            }
+        }
+        List<string> subs = Directory.GetDirectories(srcDir);
+        for (int j = 0; j < subs.Count; j = j + 1) {
+            ZanIDE.CopyTreeT(srcDir + "/" + subs[j], dstDir + "/" + subs[j], name);
+        }
+    }
+
+    static string ReplaceAll(string s, string pat, string rep) {
+        if (pat.Length == 0) { return s; }
+        StringBuilder sb = new StringBuilder();
+        int n = s.Length;
+        int pl = pat.Length;
+        int i = 0;
+        while (i < n) {
+            bool hit = false;
+            if (i + pl <= n) {
+                if (s.Substring(i, pl) == pat) { hit = true; }
+            }
+            if (hit) { sb.Append(rep); i = i + pl; }
+            else { sb.Append(s.Substring(i, 1)); i = i + 1; }
+        }
+        return sb.ToString();
+    }
+
+    static void SaveAsTemplate(string root, string cat, string tname, List<string> log) {
+        string tdir = ZanIDE.UserConfigDir() + "/templates/" + tname;
+        Directory.CreateDirectoryRecursive(tdir);
+        if (Directory.Exists(root + "/src")) {
+            ZanIDE.CopyTree(root + "/src", tdir + "/src");
+        }
+        if (File.Exists(root + "/zan.proj")) {
+            File.WriteAllText(tdir + "/zan.proj", File.ReadAllText(root + "/zan.proj"));
+        }
+        File.WriteAllText(tdir + "/template.manifest",
+            "name=" + tname + "\ncategory=" + cat + "\nicon=file\nkind=custom\ndesc=Custom template from " + Path.GetFileName(root) + ".\n");
+        log.Add("> Saved current project as template '" + tname + "' (" + tdir + ").");
+    }
+
+    static List<string> PlatformCsvIds() {
+        List<string> ids = new List<string>{
+            "windows-x64", "windows-arm64",
+            "linux-x64", "linux-arm64",
+            "macos-x64", "macos-arm64",
+            "android-x64", "android-arm64",
+            "ohos-x64", "ohos-arm64" };
+        return ids;
+    }
+
+    static string PlatformCsv(List<WizardTarget> targets) {
+        List<string> ids = ZanIDE.PlatformCsvIds();
+        string outp = "";
+        for (int i = 0; i < targets.Count; i = i + 1) {
+            if (i < ids.Count && targets[i].selected == 1) {
+                if (outp.Length > 0) { outp = outp + ","; }
+                outp = outp + ids[i];
+            }
+        }
+        if (outp.Length == 0) { outp = ZanIDE.HostTargetId(); }
+        return outp;
+    }
+
+    static List<string> SplitIds(string s) {
+        List<string> outp = new List<string>();
+        if (s == null) { return outp; }
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == ",") {
+                if (cur != "") { outp.Add(cur); }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur != "") { outp.Add(cur); }
+        return outp;
+    }
+
+    static bool IsValidProjectName(string name) {
+        if (name == "") { return false; }
+        if (name == "." || name == "..") { return false; }
+        string bad = "<>:\"/\\|?*";
+        int i = 0;
+        for (i = 0; i < name.Length; i = i + 1) {
+            string ch = name.Substring(i, 1);
+            for (int j = 0; j < bad.Length; j = j + 1) {
+                if (bad.Substring(j, 1) == ch) { return false; }
+            }
+        }
+        StringBuilder ub = new StringBuilder();
+        i = 0;
+        i = 0;
+        for (i = 0; i < name.Length; i = i + 1) {
+            string ch = name.Substring(i, 1);
+            int code = ch[0] & 255;
+            if (code < 32 || code == 127) { return false; }   // control chars
+            if (code >= 97 && code <= 122) { code = code - 32; }
+            ub.Append(Text.CharStr(code));
+        }
+        string upper = ub.ToString();
+        string reserved = " CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9 ";
+        if (ZanIDE.Has(reserved, " " + upper + " ")) { return false; }
+        return true;
+    }
+
+    static string CreateProjectT(Tpl tpl, string parent, string name, string platforms,
+                                 int devW, int devH, string devId, List<string> log) {
+        string dir = ZanIDE.CreateProjectT(tpl, parent, name, platforms, log);
+        if (dir == "") { return dir; }
+        if (tpl.sizeable && devW >= 40 && devH >= 40) {
+            ZanIDE.RetargetForms(dir + "/src", devW, devH, devId, log);
+        }
+        return dir;
+    }
+
+    static string ReplaceAttrValue(string text, string attr, string newVal) {
+        string key = attr + "=\"";
+        int idx = text.IndexOf(key);
+        if (idx < 0) { return text; }
+        int valStart = idx + key.Length;
+        int valEnd = text.IndexOf("\"", valStart);
+        if (valEnd < 0) { return text; }
+        return text.Substring(0, valStart) + newVal + text.Substring(valEnd, text.Length - valEnd);
+    }
+
+    static string RetargetHtmlDoc(string html, int devW, int devH, string devId) {
+        if (!ZanIDE.IsHtmlDesignBody(html)) { return html; }
+        string res = html;
+        if (res.IndexOf("data-win-w=\"") >= 0) {
+            res = ZanIDE.ReplaceAttrValue(res, "data-win-w", Convert.ToString(devW));
+        } else if (res.IndexOf("data-zan-design") >= 0) {
+            int p = res.IndexOf("data-zan-design") + 15;
+            res = res.Substring(0, p) + " data-win-w=\"" + Convert.ToString(devW) + "\"" + res.Substring(p, res.Length - p);
+        }
+
+        if (res.IndexOf("data-win-h=\"") >= 0) {
+            res = ZanIDE.ReplaceAttrValue(res, "data-win-h", Convert.ToString(devH));
+        } else if (res.IndexOf("data-zan-design") >= 0) {
+            int p = res.IndexOf("data-zan-design") + 15;
+            res = res.Substring(0, p) + " data-win-h=\"" + Convert.ToString(devH) + "\"" + res.Substring(p, res.Length - p);
+        }
+
+        if (devId != "") {
+            if (res.IndexOf("data-dev-id=\"") >= 0) {
+                res = ZanIDE.ReplaceAttrValue(res, "data-dev-id", devId);
+            } else if (res.IndexOf("data-zan-design") >= 0) {
+                int p = res.IndexOf("data-zan-design") + 15;
+                res = res.Substring(0, p) + " data-dev-id=\"" + devId + "\"" + res.Substring(p, res.Length - p);
+            }
+        }
+        return res;
+    }
+
+    static void RetargetForms(string srcDir, int devW, int devH, List<string> log) {
+        ZanIDE.RetargetForms(srcDir, devW, devH, "", log);
+    }
+
+    static void RetargetForms(string srcDir, int devW, int devH, string devId,
+                              List<string> log) {
+        List<string> files = DirectoryTree.Flat(srcDir,
+            PathFilter.Only(".html"));
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string fp = files[i];
+            try {
+                string orig = File.ReadAllText(fp);
+                if (!ZanIDE.IsHtmlDesignBody(orig)) { continue; }
+                string updated = ZanIDE.RetargetHtmlDoc(orig, devW, devH, devId);
+                if (updated != orig) {
+                    File.WriteAllText(fp, updated);
+                    log.Add("> Design canvas set to " + Convert.ToString(devW) + "x"
+                        + Convert.ToString(devH) + " (" + devId + "): " + fp);
+                }
+            } catch (Exception e) {
+                log.Add(ZanIDE.T("> Skipped unreadable design file: " + fp
+                        + " (" + e.Message + ")",
+                        "> 跳过无法读取的设计文件：" + fp + "（" + e.Message + "）"));
+            }
+        }
+    }
+
+    static string CreateProjectT(Tpl tpl, string parent, string name, string platforms, List<string> log) {
+        if (!ZanIDE.IsValidProjectName(name)) {
+            log.Add(ZanIDE.T("> Cannot create project: invalid name '",
+                "> 无法创建项目：名称非法 '") + name + "'.");
+            return "";
+        }
+        if (tpl.platforms.Length > 0) {
+            string kept = "";
+            string dropped = "";
+            List<string> wants = ZanIDE.SplitIds(platforms);
+            for (int i = 0; i < wants.Count; i = i + 1) {
+                string id = wants[i];
+                string os = id;
+                int dash = ZanIDE.IndexOfStr(id, "-");
+                if (dash > 0) { os = id.Substring(0, dash); }
+                if (ZanIDE.Has("," + tpl.platforms + ",", "," + os + ",")) {
+                    if (kept.Length > 0) { kept = kept + ","; }
+                    kept = kept + id;
+                } else {
+                    if (dropped.Length > 0) { dropped = dropped + ","; }
+                    dropped = dropped + id;
+                }
+            }
+            if (kept.Length == 0) {
+                log.Add(ZanIDE.T("> Cannot create project: template '" + tpl.name
+                        + "' supports [" + tpl.platforms + "] -- none of the selected targets is supported.",
+                    "> 无法创建项目：模板 '" + tpl.name
+                        + "' 支持 [" + tpl.platforms + "] -- 与所选目标平台无交集。"));
+                return "";
+            }
+            if (dropped.Length > 0) {
+                log.Add(ZanIDE.T("> Template '" + tpl.name + "' supports [" + tpl.platforms
+                        + "]; dropped unsupported targets: " + dropped + ".",
+                    "> 模板 '" + tpl.name + "' 支持 [" + tpl.platforms
+                        + "]；已剔除不支持的目标：" + dropped + "。"));
+            }
+            platforms = kept;
+        }
+        string dir = parent + "/" + name;
+        try {
+        if (Directory.Exists(dir)) {
+            List<string> exFiles = Directory.GetFiles(dir);
+            List<string> exDirs = Directory.GetDirectories(dir);
+            if (exFiles.Count > 0 || exDirs.Count > 0) {
+                log.Add(ZanIDE.T("> Cannot create project: target folder is not empty: ",
+                    "> 无法创建项目：目标文件夹非空：") + dir);
+                return "";
+            }
+        }
+        Directory.CreateDirectoryRecursive(dir);
+
+        string typeName = "console";
+        string target = "exe";
+        string entry = "src/main.zan";
+        string kind = tpl.kind;
+
+        if (kind == "custom") {
+            ZanIDE.CopyTree(tpl.src, dir);
+        } else if (tpl.src.Length > 0) {
+            typeName = tpl.ptype; target = tpl.ptarget; entry = tpl.pentry;
+            if (name.Length > 0) {
+                entry = ZanIDE.ReplaceAll(entry, "{{NAME}}", name);
+            }
+            ZanIDE.CopyTreeT(tpl.src, dir, name);
+            if (typeName == "gui" && name.Length > 0) {
+                if (File.Exists(dir + "/src/App.zan")) {
+                    string body = File.ReadAllText(dir + "/src/App.zan");
+                    File.WriteAllText(dir + "/src/" + name + ".zan", body);
+                    File.Delete(dir + "/src/App.zan");
+                }
+                if (File.Exists(dir + "/src/App.html")) {
+                    string body = File.ReadAllText(dir + "/src/App.html");
+                    File.WriteAllText(dir + "/src/" + name + ".html", body);
+                    File.Delete(dir + "/src/App.html");
+                }
+                ZanIDE.SyncFormCodeBehinds(dir + "/src");
+                if (File.Exists(dir + "/src/" + name + ".html")) {
+                    entry = "src/" + name + ".html";
+                }
+            }
+        } else {
+            typeName = "empty";
+        }
+
+        if (!File.Exists(dir + "/README.md")) {
+            string platNote = "";
+            if (tpl.platforms != "") {
+                platNote = "\n" + ZanIDE.T("Runs on: ", "支持平台：") + tpl.platforms
+                    + ZanIDE.T(" (declared by the template).", "（模板声明）。");
+            }
+            string runLine = "";
+            if (typeName == "gui") {
+                runLine = ZanIDE.T(
+                    "Open this folder in the IDE and press Run (F5) - the IDE passes the window subsystem and driver paths. Publish produces a standalone exe.",
+                    "在 IDE 中打开本目录并按运行（F5）——窗口子系统与驱动路径由 IDE 自动传入；发布命令产出独立 exe。");
+            } else if (target == "dll") {
+                runLine = "`zanc " + entry + " --auto-stdlib --emit-lib -o build/" + name + ".dll`";
+            } else {
+                runLine = "`zanc " + entry + " --auto-stdlib -o build/" + name + ".exe`, "
+                    + ZanIDE.T("then run `build/", "然后运行 `build/") + name + ".exe`";
+            }
+            File.WriteAllText(dir + "/README.md",
+                "# " + name + "\n\n"
+                + ZanIDE.T("Created by the Zan IDE from template '", "由 Zan IDE 从模板 '")
+                    + tpl.name + ZanIDE.T("'.\nEntry: ", "' 创建。\n入口：") + entry + "\n"
+                + platNote
+                + "\n\n## " + ZanIDE.T("Run", "运行") + "\n\n"
+                + "- " + runLine + "\n"
+                + "- " + ZanIDE.T(
+                    "Language docs live in the Zan SDK's docs/; examples/ has complete programs.",
+                    "语言文档见 Zan SDK 的 docs/；examples/ 里有完整示例程序。") + "\n");
+        }
+        if (!File.Exists(dir + "/.gitignore")) {
+            File.WriteAllText(dir + "/.gitignore",
+                "# Build and publish output is disposable - keep it out of version control.\n"
+                + "# In the IDE use Run / Publish; on the CLI prefer -o build/<app>.exe.\n"
+                + "build/\n"
+                + "publish/\n"
+                + "*.exe\n"
+                + "*.dll\n"
+                + "*.lib\n"
+                + "*.pdb\n"
+                + "*.obj\n"
+                + "*.o\n"
+                + "*.wasm\n"
+                + "*.log\n"
+                + "zan_crash.log\n");
+        }
+        string iconRel = "";
+        string iconSrc = ZanIDE.ZanIconSource();
+        if (iconSrc != "") {
+            Directory.CreateDirectory(dir + "/assets");
+            File.Copy(iconSrc, dir + "/assets/zan.ico");
+            iconRel = "assets/zan.ico";
+        }
+        if (kind != "custom" && !File.Exists(dir + "/zan.proj")) {
+            string projc = "name = " + name + "\ntype = " + typeName + "\nentry = " + entry
+                + "\ntarget = " + target + "\nplatform = " + platforms + "\n";
+            if (iconRel != "") { projc = projc + "icon = " + iconRel + "\n"; }
+            File.WriteAllText(dir + "/zan.proj", projc);
+        } else if (kind != "custom") {
+            ZanIDE.SetProjField(dir, "platform", platforms);
+            if (iconRel != "" && ZanIDE.ProjField(dir, "icon") == "") {
+                ZanIDE.SetProjField(dir, "icon", iconRel);
+            }
+        }
+        log.Add("> Created " + typeName + " project for [" + platforms + "] at " + dir + " (template: " + tpl.name + ").");
+        return dir;
+        } catch (Exception e) {
+            log.Add(ZanIDE.T("> Failed to create project: ",
+                "> 创建项目失败：") + e.Message);
+            return "";
+        }
+    }
+
+    static void SyncFormCodeBehinds(string srcDir) {
+        List<string> files = DirectoryTree.Flat(srcDir,
+            PathFilter.Only(".html .htm"));
+        int i = 0;
+        while (i < files.Count) {
+            string fp = files[i];
+            i = i + 1;
+            if (ZanIDE.IsFormPath(fp)) {
+                string fbase = ZanIDE.FormBaseName(fp);
+                string cbp = ZanIDE.CodeBehindPath(fp);
+                if (!File.Exists(cbp)) {
+                    File.WriteAllText(cbp, ZanIDE.GenBusinessShell(fbase));
+                }
+            } else if (ZanIDE.IsScenePath(fp)) {
+                string sbase = ZanIDE.SceneBaseName(fp);
+                string scbp = ZanIDE.SceneCodeBehindPath(fp);
+                if (!File.Exists(scbp)) {
+                    File.WriteAllText(scbp, ZanIDE.GenSceneBusinessShell(sbase));
+                }
+            }
+        }
+    }
+
+
+    static int FileKindProgram() { return 0; }
+
+    static int FileKindClass() { return 1; }
+
+    static int FileKindInterface() { return 2; }
+
+    static int FileKindForm() { return 3; }
+
+    static int FileKindFreeForm() { return 4; }
+
+    static int FileKindScene() { return 5; }
+
+    static int FileKindLua() { return 6; }
+
+    static int FileKindEmpty() { return 7; }
+
+    static int FileKindFolder() { return 8; }
+
+    static bool FileKindDeclaresType(int kind) {
+        return kind == ZanIDE.FileKindForm()
+            || kind == ZanIDE.FileKindFreeForm()
+            || kind == ZanIDE.FileKindScene();
+    }
+
+    static bool FileKindNeedsSize(int kind) {
+        return kind == ZanIDE.FileKindForm()
+            || kind == ZanIDE.FileKindFreeForm()
+            || kind == ZanIDE.FileKindScene();
+    }
+
+    static bool DirHasEntries(string dir) {
+        if (!Directory.Exists(dir)) { return false; }
+        return Directory.GetFiles(dir).Count > 0
+            || Directory.GetDirectories(dir).Count > 0;
+    }
+
+    static string NewFileTaken(int kind, string root, string name) {
+        string src = root + "/src/";
+        if (kind == ZanIDE.FileKindLua()) {
+            if (File.Exists(src + name + ".lua")) { return src + name + ".lua"; }
+            return "";
+        }
+        if (kind == ZanIDE.FileKindScene()) {
+            if (File.Exists(src + name + ".html")) { return src + name + ".html"; }
+            return "";
+        }
+        if (kind == ZanIDE.FileKindForm() || kind == ZanIDE.FileKindFreeForm()) {
+            if (File.Exists(src + name + ".html")) { return src + name + ".html"; }
+            return "";
+        }
+        if (kind == ZanIDE.FileKindFolder()) {
+            if (Directory.Exists(src + name)) { return src + name; }
+            return "";
+        }
+        if (File.Exists(src + name + ".zan")) { return src + name + ".zan"; }
+        return "";
+    }
+
+    // Scene, 9 Folder.
+    static string CreateFile(int kind, string root, string name, int sizeSel,
+                             int customW, int customH, List<string> log) {
+        int winW = 480;
+        int winH = 520;
+        List<int> pw = Wizard.SizePresetW();
+        List<int> ph = Wizard.SizePresetH();
+        bool sized = false;
+        if (customW >= 40 && customH >= 40) {
+            winW = customW;
+            winH = customH;
+            sized = sizeSel >= 0 || customW != 480 || customH != 520;
+        } else if (sizeSel >= 0 && sizeSel < pw.Count) {
+            winW = pw[sizeSel];
+            winH = ph[sizeSel];
+            sized = true;
+        }
+        string taken = ZanIDE.NewFileTaken(kind, root, name);
+        if (taken != "") {
+            log.Add(ZanIDE.T("> Cannot create file: already exists: ",
+                "> 无法新建：文件已存在：") + taken);
+            return "";
+        }
+        Directory.CreateDirectory(root + "/src");
+        if (kind == ZanIDE.FileKindLua()) {
+            string ext = ".lua";
+            string spath = root + "/src/" + name + ext;
+            File.WriteAllText(spath, ZanIDE.ScriptTemplateBody(name));
+            log.Add("> Created script " + spath
+                    + " (load it from Zan, see the header comment).");
+            return spath;
+        }
+        if (kind == ZanIDE.FileKindScene()) {
+            int scW = 1280;
+            int scH = 720;
+            if (sized) { scW = winW; scH = winH; }
+            string scenePath = root + "/src/" + name + ".html";
+            string scbPath = ZanIDE.SceneCodeBehindPath(scenePath);
+            SceneDoc sdoc = new SceneDoc(name, scW, scH);
+            File.WriteAllText(scenePath, sdoc.ToHtml());
+            if (!File.Exists(scbPath)) {
+                File.WriteAllText(scbPath, ZanIDE.GenSceneBusinessShell(name));
+            }
+            log.Add("> Created scene " + scenePath + " (+ " + scbPath + ").");
+            return scenePath;
+        }
+        if (kind == ZanIDE.FileKindForm()) {
+            string formPath = root + "/src/" + name + ".html";
+            string cbPath = ZanIDE.CodeBehindPath(formPath);
+            File.WriteAllText(formPath, ZanIDE.FlowFormBody(name, winW, winH));
+            if (!File.Exists(cbPath)) {
+                File.WriteAllText(cbPath, ZanIDE.GenBusinessShell(name));
+            }
+            log.Add("> Created form " + formPath + " (+ " + cbPath + ").");
+            return formPath;
+        }
+        if (kind == ZanIDE.FileKindFreeForm()) {
+            string formPath = root + "/src/" + name + ".html";
+            string cbPath = ZanIDE.CodeBehindPath(formPath);
+            File.WriteAllText(formPath, ZanIDE.FreeFormBody(name, winW, winH));
+            if (!File.Exists(cbPath)) {
+                File.WriteAllText(cbPath, ZanIDE.GenFreeShell(name));
+            }
+            log.Add("> Created free-layout form " + formPath + " (+ " + cbPath + ").");
+            return formPath;
+        }
+        if (kind == ZanIDE.FileKindFolder()) {
+            string dirPath = root + "/src/" + name;
+            Directory.CreateDirectoryRecursive(dirPath);
+            log.Add("> Created folder " + dirPath + ".");
+            return dirPath;
+        }
+        string path = root + "/src/" + name + ".zan";
+        File.WriteAllText(path, ZanIDE.FileTemplateBody(kind, name));
+        log.Add("> Created file " + path + ".");
+        return path;
+    }
+
+    static void DeletePathRecursive(string p) {
+        if (Directory.Exists(p)) {
+            List<string> subs = Directory.GetDirectories(p);
+            for (int i = 0; i < subs.Count; i = i + 1) {
+                ZanIDE.DeletePathRecursive(p + "/" + subs[i]);
+            }
+            List<string> files = Directory.GetFiles(p);
+            for (int j = 0; j < files.Count; j = j + 1) {
+                File.Delete(p + "/" + files[j]);
+            }
+            Directory.Delete(p);
+        } else if (File.Exists(p)) {
+            File.Delete(p);
+        }
+    }
+
+    static void OpenFirst(List<TabRecord> tabs, SignalInt active, string root) {
+        string formP = root + "/src/" + Path.GetFileName(root) + ".html";
+        string main = root + "/src/main.zan";
+        string lib = root + "/src/lib.zan";
+        if (File.Exists(formP)) {
+            ZanIDE.OpenPath(tabs, active, formP, Path.GetFileName(formP));
+        } else if (File.Exists(main)) {
+            ZanIDE.OpenPath(tabs, active, main, "main.zan");
+        } else if (File.Exists(lib)) {
+            ZanIDE.OpenPath(tabs, active, lib, "lib.zan");
+        } else if (File.Exists(root + "/README.md")) {
+            ZanIDE.OpenPath(tabs, active, root + "/README.md", "README.md");
+        } else {
+            string first = ZanIDE.FirstSourceFile(root + "/src");
+            if (first == "") { first = ZanIDE.FirstSourceFile(root); }
+            if (first != "") {
+                ZanIDE.OpenPath(tabs, active, first, Path.GetFileName(first));
+            }
+        }
+    }
+
+    static string FirstSourceFile(string dir) {
+        List<string> fs = DirectoryTree.Flat(dir, PathFilter.Only(".zan"));
+        if (fs.Count == 0) { return ""; }
+        return fs[0];
+    }
+
+
+    static string FileTemplateBody(int kind, string name) {
+        if (kind == ZanIDE.FileKindProgram()) {
+            return "using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine(\"Hello from " + name + "\");\n    }\n}\n";
+        }
+        if (kind == ZanIDE.FileKindClass()) {
+            return "using System;\n\nclass " + name + " {\n    // fields and methods\n}\n";
+        }
+        if (kind == ZanIDE.FileKindInterface()) {
+            return "using System;\n\n/// Contract implemented by concrete types.\nclass " + name + " {\n    void Execute() { }\n}\n";
+        }
+        return "";
+    }
+
+    static string ScriptTemplateBody(string name) {
+        return "-- " + name + ".lua -- loaded by a Zan host, not run on its own.\n"
+             + "--\n"
+             + "--   using System.Scripting;\n"
+             + "--   Lua.Initialize();\n"
+             + "--   Lua.RunFile(\"src/" + name + ".lua\");\n"
+             + "--   Console.WriteLine(Lua.CallS(\"" + name + "_main\"));\n"
+             + "--\n"
+             + "-- The interpreter comes from ZAN_LUA_LIB, the runtime bundled next\n"
+             + "-- to the executable by zanc, or the system Lua.\n\n"
+             + "function " + name + "_main()\n"
+             + "    return \"hello from " + name + ".lua\"\n"
+             + "end\n";
+    }
+
+
+}
