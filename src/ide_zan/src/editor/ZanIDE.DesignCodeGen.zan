@@ -1,0 +1,564 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+partial class ZanIDE {
+
+    static bool IsFormPath(string p) {
+        if (!ZanIDE.IsHtmlPath(p)) { return false; }
+        try {
+            if (File.Exists(p)) {
+                string s = File.ReadAllText(p);
+                return ZanIDE.IsHtmlDesignBody(s) && !ZanIDE.IsScenePath(p);
+            }
+        } catch (Exception ex) {}
+        return false;
+    }
+
+    static bool IsDesignFilePath(string p) {
+        return ZanIDE.IsFormPath(p) || ZanIDE.IsScenePath(p);
+    }
+
+    static bool IsHtmlPath(string p) {
+        int n = p.Length;
+        if (n >= 5 && p.Substring(n - 5, 5) == ".html") { return true; }
+        return n >= 4 && p.Substring(n - 4, 4) == ".htm";
+    }
+
+    static bool IsHtmlDesignBody(string s) {
+        return System.Web.DesignerHtml.IsDesignDoc(s);
+    }
+
+    static bool IsScenePath(string p) {
+        int n = p.Length;
+        if (n >= 5 && p.Substring(n - 5, 5) == ".html") {
+            try {
+                if (File.Exists(p)) {
+                    string s = File.ReadAllText(p);
+                    return s.IndexOf("data-zan-scene") >= 0 || s.IndexOf("<body data-scene") >= 0;
+                }
+            } catch (Exception ex) {}
+        }
+        return false;
+    }
+
+    static string SceneBaseName(string p) {
+        string fn = Path.GetFileName(p);
+        int n = fn.Length;
+        if (n >= 5 && fn.Substring(n - 5, 5) == ".html") { return fn.Substring(0, n - 5); }
+        if (n >= 4 && fn.Substring(n - 4, 4) == ".htm") { return fn.Substring(0, n - 4); }
+        return fn;
+    }
+
+    static string FormBaseName(string p) {
+        string fn = Path.GetFileName(p);
+        int n = fn.Length;
+        if (n >= 5 && fn.Substring(n - 5, 5) == ".html") { return fn.Substring(0, n - 5); }
+        if (n >= 4 && fn.Substring(n - 4, 4) == ".htm") { return fn.Substring(0, n - 4); }
+        return fn;
+    }
+
+    static List<string> ScanBindVars(string code) {
+        List<string> vars = new List<string>();
+        List<string> lines = CodeEditor.SplitLines(code);
+        bool inRegion = false;
+        int i = 0;
+        while (i < lines.Count && vars.Count < 60) {
+            string ln = ZanIDE.TrimStr(lines[i]);
+            i = i + 1;
+            if (ZanIDE.Has(ln, "ZAN-DESIGNER BEGIN")) { inRegion = true; }
+            if (ZanIDE.Has(ln, "ZAN-DESIGNER END")) { inRegion = false; continue; }
+            if (inRegion) { continue; }
+            if (ln.Length < 5) { continue; }
+            if (ln.Substring(0, 2) == "//") { continue; }
+            if (ZanIDE.Has(ln, "(")) { continue; }
+            if (ln.Substring(ln.Length - 1, 1) != ";") { continue; }
+            string body = ln.Substring(0, ln.Length - 1);
+            int eq = ZanIDE.IndexOfStr(body, "=");
+            if (eq >= 0) { body = ZanIDE.TrimStr(body.Substring(0, eq)); }
+            List<string> toks = ZanIDE.SplitWords(body);
+            if (toks.Count < 2) { continue; }
+            string ty = toks[toks.Count - 2];
+            string nm = toks[toks.Count - 1];
+            if (!ZanIDE.IsIdent(nm)) { continue; }
+            if (ty == "using" || ty == "namespace" || ty == "return" || ty == "new") { continue; }
+            bool dup = false;
+            for (int di = 0; di < vars.Count; di = di + 1) { if (vars[di] == nm) { dup = true; } }
+            if (!dup) { vars.Add(nm); }
+        }
+        return vars;
+    }
+
+    static string TrimStr(string s) {
+        int a = 0;
+        int b = s.Length;
+        for (; a < b && (s.Substring(a, 1) == " " || s.Substring(a, 1) == "\t"); a = a + 1) { }
+        while (b > a && (s.Substring(b - 1, 1) == " " || s.Substring(b - 1, 1) == "\t" || s.Substring(b - 1, 1) == "\r")) { b = b - 1; }
+        return s.Substring(a, b - a);
+    }
+
+    static List<string> SplitWords(string s) {
+        List<string> toks = new List<string>();
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == " " || ch == "\t") {
+                if (cur != "") { toks.Add(cur); cur = ""; }
+            } else {
+                cur = cur + ch;
+            }
+        }
+        if (cur != "") { toks.Add(cur); }
+        return toks;
+    }
+
+    static bool IsIdent(string s) {
+        if (s.Length == 0) { return false; }
+        string ok = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+        string digits = "0123456789";
+        if (ZanIDE.Has(digits, s.Substring(0, 1))) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (!ZanIDE.Has(ok, s.Substring(i, 1))) { return false; }
+        }
+        return true;
+    }
+
+    static string CodeBehindPath(string formPath) {
+        int n = formPath.Length;
+        if (n >= 5 && formPath.Substring(n - 5, 5) == ".html") {
+            return formPath.Substring(0, n - 5) + ".zan";
+        }
+        if (n >= 4 && formPath.Substring(n - 4, 4) == ".htm") {
+            return formPath.Substring(0, n - 4) + ".zan";
+        }
+        return formPath + ".zan";
+    }
+
+    static bool LooksLikeJson(string s) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch != " " && ch != "\t" && ch != "\n" && ch != "\r") {
+                return ch == "{";
+            }
+        }
+        return false;
+    }
+
+    static bool IsGenPath(string p) {
+        int n = p.Length;
+        if (n < 6) { return false; }
+        return p.Substring(n - 6, 6) == ".g.zan";
+    }
+
+    static bool IsZanFilePath(string p) {
+        int n = p.Length;
+        if (n < 4) { return false; }
+        return p.Substring(n - 4, 4) == ".zan";
+    }
+
+    static string EscZ(string s) {
+        string o = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string ch = s.Substring(i, 1);
+            if (ch == "\\") { o = o + "\\\\"; }
+            else if (ch == "\"") { o = o + "\\\""; }
+            else if (ch == "\n") { o = o + "\\n"; }
+            else if (ch == "\r") { }
+            else if (ch == "\t") { o = o + "\\t"; }
+            else { o = o + ch; }
+        }
+        return o;
+    }
+
+    static bool ListHasStr(List<string> l, string v) {
+        for (int i = 0; i < l.Count; i = i + 1) { if (l[i] == v) { return true; } }
+        return false;
+    }
+
+    static string GenBusinessShell(string name) {
+        string s = "using System;\n";
+        s = s + "using Gui;\n";
+        s = s + "using Gui.Widget;\n\n";
+        s = s + "// Business logic for " + name + ". The window is designed visually in\n";
+        s = s + "// " + name + ".html. At compile time zanc projects its typed controls\n";
+        s = s + "// and Main from the design, so there is no generated file to keep in sync.\n";
+        s = s + "// This file is yours - the designer never overwrites it.\n";
+        s = s + "partial class " + name + " {\n";
+        s = s + "    // Runs once after the window is built, before the event loop.\n";
+        s = s + "    static void OnLoad(Form form) {\n";
+        s = s + "    }\n\n";
+        s = s + "    static void OnOk() {\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+
+    // 生成标准流式窗体 HTML5 设计稿。
+    static string FlowFormBody(string name, int winW, int winH) {
+        string b = "<!DOCTYPE html>\n<html>\n<head>\n";
+        b = b + "<meta charset=\"utf-8\">\n";
+        b = b + "<title>" + name + "</title>\n";
+        b = b + "</head>\n";
+        b = b + "<body data-zan-design id=\"" + name + "\" data-win-w=\"" + Convert.ToString(winW)
+            + "\" data-win-h=\"" + Convert.ToString(winH)
+            + "\" data-win-title=\"" + name
+            + "\" data-win-center=\"true\" data-layout-mode=\"0\" data-win-zoom=\"0\">\n";
+        b = b + "  <label id=\"TitleLabel\" data-kind=\"Label\" data-label=\"欢迎使用 " + name + "\"></label>\n";
+        b = b + "  <button id=\"OkButton\" class=\"primary\" data-kind=\"Button\" data-label=\"确定\" @click=\"OnOk\"></button>\n";
+        b = b + "</body>\n</html>\n";
+        return b;
+    }
+
+    // 生成自由绝对定位布局窗体 HTML5 设计稿。
+    static string FreeFormBody(string name, int winW, int winH) {
+        string b = "<!DOCTYPE html>\n<html>\n<head>\n";
+        b = b + "<meta charset=\"utf-8\">\n";
+        b = b + "<title>" + name + "</title>\n";
+        b = b + "</head>\n";
+        b = b + "<body data-zan-design id=\"" + name + "\" data-win-w=\"" + Convert.ToString(winW)
+            + "\" data-win-h=\"" + Convert.ToString(winH)
+            + "\" data-win-title=\"" + name
+            + "\" data-win-center=\"true\" data-layout-mode=\"1\" data-win-zoom=\"0\">\n";
+        b = b + "  <span id=\"TitleLabel\" style=\"position:absolute;left:16px;top:16px;width:448px;height:30px;font-size:24px;\">欢迎</span>\n";
+        b = b + "  <input id=\"NameInput\" type=\"text\" placeholder=\"姓名\" required style=\"position:absolute;left:60px;top:76px;width:360px;height:32px;\" />\n";
+        b = b + "  <input id=\"PasswordInput\" type=\"password\" placeholder=\"密码\" required style=\"position:absolute;left:60px;top:122px;width:360px;height:32px;\" />\n";
+        b = b + "  <input id=\"RememberCheck\" type=\"checkbox\" style=\"position:absolute;left:60px;top:168px;width:200px;height:26px;\">记住我</input>\n";
+        b = b + "  <button id=\"SignInButton\" class=\"primary\" style=\"position:absolute;left:160px;top:220px;width:160px;height:36px;\">登录</button>\n";
+        b = b + "  <span id=\"HintText\" class=\"muted\" style=\"position:absolute;left:16px;top:300px;width:448px;height:40px;\">提示：在设计器中可切换流式/自由布局、缩放窗口，并把组件拖到画布任意位置。</span>\n";
+        b = b + "</body>\n</html>\n";
+        return b;
+    }
+
+    static string GenFreeShell(string name) {
+        string s = "using System;\n";
+        s = s + "using Gui;\n";
+        s = s + "using Gui.Widget;\n\n";
+        s = s + "// Business logic for " + name + ". The window is designed visually in\n";
+        s = s + "// " + name + ".html (open it in the form designer). This form uses FREE\n";
+        s = s + "// layout: every control is absolutely positioned on the design canvas.\n";
+        s = s + "// At compile time zanc projects its typed controls and Main from the\n";
+        s = s + "// design, so there is no generated file to keep in sync.\n";
+        s = s + "// This file is yours - the designer never overwrites it.\n";
+        s = s + "partial class " + name + " {\n";
+        s = s + "    // Runs once after the window is built, before the event loop starts.\n";
+        s = s + "    static void OnLoad(Form form) {\n";
+        s = s + "        SignInButton.OnClick(() => {\n";
+        s = s + "            // Required fields (marked in the designer) are validated by the\n";
+        s = s + "            // generated __ValidateForm: empty inputs get a red border + message.\n";
+        s = s + "            if (!__ValidateForm()) { return; }\n";
+        s = s + "            TitleLabel.Text = \"你好，\" + NameInput.GetText() + \"!\";\n";
+        s = s + "        });\n";
+        s = s + "        PasswordInput.OnEnter(() => { TitleLabel.Text = \"已按回车\"; });\n";
+        s = s + "        RememberCheck.OnChange(() => {\n";
+        s = s + "            TitleLabel.Text = \"记住我：\" + RememberCheck.IsChecked();\n";
+        s = s + "        });\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+
+    // 智能事件桩补齐与定位：当用户在设计器双击控件或在事件检查器中点击“定位/新建”时，
+    // 若 code-behind 源码中已有该事件方法或控件变量，则返回已有行号；
+    // 若无，则自动在类体末尾插入标准事件响应方法（例如 static void OnSubmit() { }）并返回插入行号。
+    static int EnsureControlEventHandler(CodeEditor editor, string ctrlName) {
+        if (editor == null || ctrlName == "") { return -1; }
+        string target = ctrlName;
+        string handlerName = "";
+        bool isHandler = false;
+        if (target.StartsWith("handler:")) {
+            handlerName = target.Substring(8, target.Length - 8);
+            isHandler = true;
+        } else if (target.StartsWith("On")) {
+            handlerName = target;
+            isHandler = true;
+        }
+
+        List<string> lines = CodeEditor.SplitLines(editor.GetText());
+
+        if (isHandler && handlerName != "") {
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                string ln = lines[li];
+                if ((ZanIDE.IndexOfStr(ln, "void " + handlerName) >= 0
+                    || ZanIDE.IndexOfStr(ln, handlerName + "(") >= 0
+                    || ZanIDE.IndexOfStr(ln, handlerName + " (") >= 0)
+                    && ZanIDE.IndexOfStr(ln, "//") < 0) {
+                    return li;
+                }
+            }
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                if (ZanIDE.IndexOfStr(lines[li], handlerName) >= 0) {
+                    return li;
+                }
+            }
+
+            int insertLine = -1;
+            for (int i = lines.Count - 1; i >= 0; i = i - 1) {
+                string tr = ZanIDE.TrimTrailSpaces(ZanIDE.TrimLeadSpaces(lines[i]));
+                if (tr == "}" || tr == "};") {
+                    insertLine = i;
+                    break;
+                }
+            }
+            if (insertLine < 0) { insertLine = lines.Count; }
+
+            lines.Insert(insertLine, "");
+            lines.Insert(insertLine + 1, "    static void " + handlerName + "() {");
+            lines.Insert(insertLine + 2, "    }");
+
+            StringBuilder sb = new StringBuilder();
+            for (int k = 0; k < lines.Count; k = k + 1) {
+                sb.Append(lines[k]);
+                sb.Append("\n");
+            }
+            editor.LoadText(sb.ToString());
+            return insertLine + 1;
+        }
+
+        int existing = -1;
+        for (int li = 0; li < lines.Count; li = li + 1) {
+            if (ZanIDE.IndexOfStr(lines[li], ctrlName) >= 0) {
+                existing = li;
+                break;
+            }
+        }
+        if (existing >= 0) { return existing; }
+
+        int onLoadLine = -1;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string l = lines[i];
+            if (ZanIDE.IndexOfStr(l, "OnLoad") >= 0 && ZanIDE.IndexOfStr(l, "(") >= 0) {
+                onLoadLine = i;
+                break;
+            }
+        }
+        if (onLoadLine < 0) { return -1; }
+
+        int ins = onLoadLine + 1;
+        for (int j = onLoadLine + 1; j < lines.Count; j = j + 1) {
+            string tr = ZanIDE.TrimTrailSpaces(ZanIDE.TrimLeadSpaces(lines[j]));
+            if (tr == "}" || tr == "};") {
+                ins = j;
+                break;
+            }
+        }
+
+        string evtMethod = "OnClick";
+        string cnLower = ctrlName.ToLower();
+        if (cnLower.EndsWith("check") || cnLower.EndsWith("checkbox")
+            || cnLower.EndsWith("switch") || cnLower.EndsWith("select")
+            || cnLower.EndsWith("radio")) {
+            evtMethod = "OnChange";
+        } else if (cnLower.EndsWith("input") || cnLower.EndsWith("text")
+                   || cnLower.EndsWith("edit") || cnLower.EndsWith("box")) {
+            evtMethod = "OnChange";
+        }
+
+        string stub = "        " + ctrlName + "." + evtMethod + "(() => {\n        });";
+        lines.Insert(ins, stub);
+        string newBody = "";
+        for (int k = 0; k < lines.Count; k = k + 1) {
+            newBody = newBody + lines[k] + "\n";
+        }
+        editor.LoadText(newBody);
+        return ins;
+    }
+
+    // 配对设计稿探测：给定 .zan 源码路径，寻找同名对应 .html/.htm 设计稿。
+    static string FindPairedDesignPath(string zanPath) {
+        if (zanPath.Length <= 4 || !zanPath.EndsWith(".zan")) { return ""; }
+        string baseWithoutExt = zanPath.Substring(0, zanPath.Length - 4);
+        string directHtml = baseWithoutExt + ".html";
+        if (File.Exists(directHtml)) { return directHtml; }
+        string directHtm = baseWithoutExt + ".htm";
+        if (File.Exists(directHtm)) { return directHtm; }
+        return "";
+    }
+
+    static string SceneCodeBehindPath(string scenePath) {
+        int n = scenePath.Length;
+        if (n >= 5 && scenePath.Substring(n - 5, 5) == ".html") {
+            return scenePath.Substring(0, n - 5) + ".zan";
+        }
+        if (n >= 4 && scenePath.Substring(n - 4, 4) == ".htm") {
+            return scenePath.Substring(0, n - 4) + ".zan";
+        }
+        return scenePath + ".zan";
+    }
+
+    static string GenSceneFile(string name, SceneDoc doc) {
+        List<string> decls = new List<string>();
+        List<string> used = new List<string>();
+        List<string> body = new List<string>();
+        for (int i = 0; i < doc.Count(); i = i + 1) {
+            SceneElement e = doc.ElementAt(i);
+            string vn = "e" + Convert.ToString(i);
+            bool typed = ZanIDE.IsIdent(e.Name()) && !ZanIDE.ListHasStr(used, e.Name());
+            if (typed) {
+                vn = e.Name();
+                used.Add(vn);
+                decls.Add("    static SceneElement " + vn + ";");
+            } else {
+                body.Add("        SceneElement " + vn + ";");
+            }
+            body.Add("        " + vn + " = new SceneElement(\"" + ZanIDE.EscZ(e.Kind()) + "\", \"" + ZanIDE.EscZ(e.Name()) + "\");");
+            body.Add("        " + vn + ".At(" + Convert.ToString(e.X()) + ", " + Convert.ToString(e.Y()) + ");");
+            body.Add("        " + vn + ".Size(" + Convert.ToString(e.W()) + ", " + Convert.ToString(e.H()) + ");");
+            body.Add("        " + vn + ".AnchorTo(" + Convert.ToString(e.AnchorX()) + ", " + Convert.ToString(e.AnchorY()) + ");");
+            body.Add("        " + vn + ".Order(" + Convert.ToString(e.Z()) + ");");
+            body.Add("        " + vn + ".Tint(" + Convert.ToString(e.R()) + ", " + Convert.ToString(e.G()) + ", " + Convert.ToString(e.B()) + ", " + Convert.ToString(e.A()) + ");");
+            if (e.ImageId().Length > 0) {
+                body.Add("        " + vn + ".Image(\"" + ZanIDE.EscZ(e.ImageId()) + "\");");
+            }
+            if (e.Text().Length > 0) {
+                body.Add("        " + vn + ".Caption(\"" + ZanIDE.EscZ(e.Text()) + "\");");
+            }
+            if (e.IsGrid() || e.GapX() != 0 || e.GapY() != 0) {
+                body.Add("        " + vn + ".Grid(" + Convert.ToString(e.Rows()) + ", " + Convert.ToString(e.Cols()) + ", " + Convert.ToString(e.GapX()) + ", " + Convert.ToString(e.GapY()) + ");");
+            }
+            if (e.Value() != 0) {
+                body.Add("        " + vn + ".SetValue(" + Convert.ToString(e.Value()) + ");");
+            }
+            if (e.Items().Length > 0) {
+                body.Add("        " + vn + ".SetItems(\"" + ZanIDE.EscZ(e.Items()) + "\");");
+            }
+            if (e.Locked()) {
+                body.Add("        " + vn + ".SetLocked(true);");
+            }
+            if (e.Layer().Length > 0) {
+                body.Add("        " + vn + ".SetLayer(\"" + ZanIDE.EscZ(e.Layer()) + "\");");
+            }
+            if (e.OnAction("Click").Length > 0) {
+                body.Add("        " + vn + ".On(\"Click\", \"" + ZanIDE.EscZ(e.OnAction("Click")) + "\");");
+            }
+            if (!e.Visible()) {
+                body.Add("        " + vn + ".SetVisible(false);");
+            }
+            body.Add("        d.Add(" + vn + ");");
+        }
+        int dw = doc.DesignWidth();
+        if (dw <= 0) { dw = 1280; }
+        int dh = doc.DesignHeight();
+        if (dh <= 0) { dh = 720; }
+        string dws = Convert.ToString(dw);
+        string dhs = Convert.ToString(dh);
+        string wtitle = doc.WinTitle();
+        if (wtitle.Length == 0) { wtitle = name; }
+        string s = "// <auto-generated> compile-time projection of " + name + ".html (scene design).\n";
+        s = s + "// The design document is the source of truth; this code is not a file.\n";
+        s = s + "// Put your initialization and game logic in " + name + ".zan.\n";
+        s = s + "using System;\n";
+        s = s + "using Gui;\n";
+        s = s + "using Game.Scene;\n\n";
+        s = s + "partial class " + name + " {\n";
+        for (int d = 0; d < decls.Count; d = d + 1) { s = s + decls[d] + "\n"; }
+        s = s + "    static SceneDoc scene;\n\n";
+        s = s + "    /// Builds the designed scene document (design-resolution HUD tree).\n";
+        s = s + "    static SceneDoc BuildScene() {\n";
+        s = s + "        SceneDoc d = new SceneDoc(\"" + ZanIDE.EscZ(name) + "\", " + dws + ", " + dhs + ");\n";
+        s = s + "        d.SetMode(" + Convert.ToString(doc.Mode()) + ");\n";
+        s = s + "        d.SetClearColor(" + Convert.ToString(doc.ClearR()) + ", " + Convert.ToString(doc.ClearG()) + ", " + Convert.ToString(doc.ClearB()) + ");\n";
+        if (doc.Background().Length > 0) {
+            s = s + "        d.SetBackground(\"" + ZanIDE.EscZ(doc.Background()) + "\");\n";
+        }
+        for (int b = 0; b < body.Count; b = b + 1) { s = s + body[b] + "\n"; }
+        s = s + "        return d;\n";
+        s = s + "    }\n\n";
+        s = s + "    /// Opens this designed scene and renders it until the window\n";
+        s = s + "    /// closes, so one design opens another with `" + name + ".Run();`.\n";
+        s = s + "    static void Run() {\n";
+        s = s + "        scene = BuildScene();\n";
+        s = s + "        App app = App.CreateDark(\"" + ZanIDE.EscZ(wtitle) + "\", " + dws + ", " + dhs + ");\n";
+        if (doc.WinCenter() != 0) {
+            s = s + "        app.CenterWindow();\n";
+        } else {
+            s = s + "        app.SetWindowPos(" + Convert.ToString(doc.WinPosX()) + ", " + Convert.ToString(doc.WinPosY()) + ");\n";
+        }
+        if (!doc.WinResizable()) {
+            s = s + "        app.SetResizable(false);\n";
+        }
+        if (!doc.WinChrome()) {
+            s = s + "        app.SetChromeVisible(false);\n";
+        }
+        s = s + "        app.Show();\n";
+        s = s + "        " + name + ".OnLoad(app);\n";
+        s = s + "        scene.SetLayersActive(true);\n";
+        s = s + "        while (app.isRunning) {\n";
+        s = s + "            if (!app.ProcessEvent()) { break; }\n";
+        s = s + "            if (!app.needsRedraw) { continue; }\n";
+        s = s + "            app.BeginFrame();\n";
+        s = s + "            SceneView.Render(app, scene);\n";
+        s = s + "            SceneView.HandleClicks(app, scene);\n";
+        s = s + "            app.RenderChrome(\"" + ZanIDE.EscZ(wtitle) + "\");\n";
+        s = s + "            app.PresentFrame();\n";
+        s = s + "            if (scene.PendingScene().Length > 0) {\n";
+        s = s + "                app.RequestClose();\n";
+        s = s + "            }\n";
+        s = s + "        }\n";
+        s = s + "    }\n\n";
+        s = s + "    static void Main() {\n";
+        s = s + "        " + name + ".Run();\n";
+        s = s + "    }\n\n";
+        s = s + "    partial class " + name + "Scene : Game.Foundation.IGameScene {\n";
+        s = s + "        SceneDoc d;\n";
+        s = s + "        App host;\n\n";
+        s = s + "        public string Name() { return \"" + ZanIDE.EscZ(name) + "\"; }\n\n";
+        s = s + "        public void Host(App app) { host = app; }\n\n";
+        s = s + "        public void Enter() {\n";
+        s = s + "            d = " + name + ".BuildScene();\n";
+        s = s + "            d.SetLayersActive(true);\n";
+        s = s + "            " + name + ".OnSceneEnter();\n";
+        s = s + "        }\n\n";
+        s = s + "        public void Exit() {\n";
+        s = s + "            " + name + ".OnSceneExit();\n";
+        s = s + "            d = null;\n";
+        s = s + "        }\n\n";
+        s = s + "        public void Pause() { " + name + ".OnScenePause(); }\n\n";
+        s = s + "        public void Resume() { " + name + ".OnSceneResume(); }\n\n";
+        s = s + "        public void FixedUpdate(int deltaMilliseconds) {\n";
+        s = s + "            " + name + ".OnSceneFixedUpdate(deltaMilliseconds);\n";
+        s = s + "        }\n\n";
+        s = s + "        public void Update(int deltaMilliseconds) {\n";
+        s = s + "            if (d == null || host == null) { return; }\n";
+        s = s + "            if (!host.needsRedraw) { return; }\n";
+        s = s + "            host.BeginFrame();\n";
+        s = s + "            SceneView.Render(host, d);\n";
+        s = s + "            SceneView.HandleClicks(host, d);\n";
+        s = s + "            host.PresentFrame();\n";
+        s = s + "        }\n\n";
+        s = s + "        public SceneDoc Doc() { return d; }\n\n";
+        s = s + "        public string PendingScene() {\n";
+        s = s + "            return d == null ? \"\" : d.PendingScene();\n";
+        s = s + "        }\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+
+    static string GenSceneBusinessShell(string name) {
+        string s = "using System;\n";
+        s = s + "using Gui;\n";
+        s = s + "using Game.Scene;\n\n";
+        s = s + "// Business logic for scene " + name + ". The scene is designed visually in\n";
+        s = s + "// " + name + ".html; the compiler projects its typed elements at build time.\n";
+        s = s + "// This file is yours - the designer never overwrites it.\n";
+        s = s + "partial class " + name + " {\n";
+        s = s + "    static void OnLoad(App app) {\n";
+        s = s + "    }\n\n";
+        s = s + "    static void OnSceneEnter() {\n";
+        s = s + "    }\n";
+        s = s + "    static void OnSceneExit() {\n";
+        s = s + "    }\n";
+        s = s + "    static void OnScenePause() {\n";
+        s = s + "    }\n";
+        s = s + "    static void OnSceneResume() {\n";
+        s = s + "    }\n";
+        s = s + "    static void OnSceneFixedUpdate(int deltaMilliseconds) {\n";
+        s = s + "    }\n";
+        s = s + "}\n";
+        return s;
+    }
+}
