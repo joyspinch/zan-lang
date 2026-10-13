@@ -473,6 +473,7 @@ STANDARDS.md §6.7）。
      2) **强类型数据模型**：在 Code-behind 中定义扁平微型数据实体（如 `ProtectItem`、`AccessItem`、`ToolEntry`）。
      3) **单一行模板工厂函数**：提供单一的行/卡片构造工厂（如 `CreateProtectRow(item)`、`CreateAccessCard(item)`），统一赋予 CSS 样式类（如 `.protect-row-card`），绑定图标、标签与事件，保证 100% 像素级一致的行高（如 `height: 54px; min-height: 54px; max-height: 54px; flex-shrink: 0; flex: 0 0 54px;`）、内边距与对齐基准。
      4) **统一容器刷新**：数据更新或分类切换时，调用容器 `ClearKids()` 移除旧行后遍历模型列表逐项追加 `AddKid(CreateRow(item))`，内存轻量、渲染瞬时完成。
+     5) **主轴滚动容器 flex-shrink 锁定**：当 Flex 容器声明了 `overflow-y: auto` / `overflow-x: auto` 时，它是滚动容器，排布引擎必须跳过主轴收缩压缩（否则 7 项会按 `room/7`、8 项会按 `room/8` 强制压扁，导致切换分类时列表行高剧烈跳变）。行模板根节点必须显式锁定偏好与弹性收缩尺寸（如 `row.Prefer(0, 54)` 并配 `flex: 0 0 54px; flex-shrink: 0;`），确保无论多少条目行高均严格恒定在像素基准线。
 
 
 
