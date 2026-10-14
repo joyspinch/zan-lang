@@ -8,11 +8,15 @@
 #define ZAN_GAME_SPRITE_CAP 4096
 #define ZAN_GAME_KEY_CAP 512
 #define ZAN_GAME_QUAD_FLOATS 10
-#define ZAN_GAME_MESH_CAP 24
+#define ZAN_GAME_MESH_CAP 256
 #define ZAN_GAME_SURFACE_CAP 64
 #define ZAN_GAME_VERTEX_FLOATS 8
+#define ZAN_GAME_COLORED_VERTEX_FLOATS 12
 #define ZAN_GAME_VERTEX_CAP 65536
 #define ZAN_GAME_GL_ERROR_LIMIT 16
+/* 实例记录：mvp 16 个 float（列主序）+ tint rgba 4 个 float（线性 0..1）。 */
+#define ZAN_GAME_INSTANCE_FLOATS 20
+#define ZAN_GAME_INSTANCE_CAP 1024
 
 typedef struct {
     char key[ZAN_GAME_KEY_CAP];
@@ -99,6 +103,8 @@ typedef struct {
     zgl_uint vao, vbo, ebo;
     int32_t id;
     int index_count;
+    int colored;      /* 顶点带 a_color（12 float/顶点） */
+    int inst_ready;   /* 本 VAO 已配置实例属性（divisor=1） */
     uint64_t epoch;
 } zan_game_mesh;
 
@@ -107,13 +113,29 @@ typedef struct {
     int width, height;
 } zan_game_depth;
 
+/* 着色器程序按 [colored][instanced] 惰性建，属性位置全部显式 layout，
+ * 同一网格 VAO 可跨程序复用。u_mvp/u_color 仅非实例化程序使用。 */
+typedef struct {
+    zgl_uint program;
+    zgl_int u_mvp, u_tex, u_color;
+} zan_game_program;
+
+#define ZAN_GAME_LOC_POS 0
+#define ZAN_GAME_LOC_NORMAL 1
+#define ZAN_GAME_LOC_UV 2
+#define ZAN_GAME_LOC_COLOR 3
+#define ZAN_GAME_LOC_IMVP 4   /* mat4 占用 4..7 */
+#define ZAN_GAME_LOC_ITINT 8
+
 static zan_game_mesh g_game_meshes[ZAN_GAME_MESH_CAP];
 static zan_game_depth g_game_depth[ZAN_GAME_SURFACE_CAP];
 static const zan_gl_api *g_game_gl;
 static uint64_t g_game_epoch;
-static zgl_uint g_game_program;
-static zgl_int g_game_u_mvp = -1, g_game_u_tex = -1, g_game_u_color = -1;
-static zgl_int g_game_a_pos = -1, g_game_a_normal = -1, g_game_a_uv = -1;
+static zan_game_program g_game_progs[2][2];
+static zgl_uint g_game_instance_vbo;
+static int32_t g_game_batch_surface = -1;
+static zan_gpu_frame g_game_batch_frame;
+static int g_game_batch_clip_empty;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
@@ -122,13 +144,15 @@ static const zan_bitmap g_game_white = {
     &g_game_white_pixel, 1, 1, 1, UINT64_C(1)
 };
 
-static const char *const ZAN_GAME_3D_VS =
+/* 属性位置常量与 VAO 配置一一对应（ZAN_GAME_LOC_*），四种变体共享同一
+ * 网格 VAO。Y 翻转：3D 画进画布 FBO（顶朝下表面），clip 空间先翻 Y。 */
+
+static const char *const ZAN_GAME_3D_VS_PLAIN =
 "#version 330 core\n"
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
 "uniform mat4 uMVP;\n"
-"uniform vec2 uViewport;\n"
-"in vec3 a_pos;\n"
-"in vec3 a_normal;\n"
-"in vec2 a_uv;\n"
 "out vec2 v_uv;\n"
 "out vec3 v_normal;\n"
 "void main() {\n"
@@ -138,7 +162,64 @@ static const char *const ZAN_GAME_3D_VS =
 "    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
 "}\n";
 
-static const char *const ZAN_GAME_3D_FS =
+static const char *const ZAN_GAME_3D_VS_COLOR =
+"#version 330 core\n"
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
+"layout(location = 3) in vec4 a_color;\n"
+"uniform mat4 uMVP;\n"
+"out vec2 v_uv;\n"
+"out vec3 v_normal;\n"
+"out vec4 v_color;\n"
+"void main() {\n"
+"    v_uv = a_uv;\n"
+"    v_normal = a_normal;\n"
+"    v_color = a_color;\n"
+"    vec4 clip = uMVP * vec4(a_pos, 1.0);\n"
+"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_VS_INST =
+"#version 330 core\n"
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
+"layout(location = 4) in mat4 i_mvp;\n"
+"layout(location = 8) in vec4 i_tint;\n"
+"out vec2 v_uv;\n"
+"out vec3 v_normal;\n"
+"out vec4 v_tint;\n"
+"void main() {\n"
+"    v_uv = a_uv;\n"
+"    v_normal = a_normal;\n"
+"    v_tint = i_tint;\n"
+"    vec4 clip = i_mvp * vec4(a_pos, 1.0);\n"
+"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_VS_INST_COLOR =
+"#version 330 core\n"
+"layout(location = 0) in vec3 a_pos;\n"
+"layout(location = 1) in vec3 a_normal;\n"
+"layout(location = 2) in vec2 a_uv;\n"
+"layout(location = 3) in vec4 a_color;\n"
+"layout(location = 4) in mat4 i_mvp;\n"
+"layout(location = 8) in vec4 i_tint;\n"
+"out vec2 v_uv;\n"
+"out vec3 v_normal;\n"
+"out vec4 v_color;\n"
+"out vec4 v_tint;\n"
+"void main() {\n"
+"    v_uv = a_uv;\n"
+"    v_normal = a_normal;\n"
+"    v_color = a_color;\n"
+"    v_tint = i_tint;\n"
+"    vec4 clip = i_mvp * vec4(a_pos, 1.0);\n"
+"    gl_Position = vec4(clip.x, -clip.y, clip.z, clip.w);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_FS_PLAIN =
 "#version 330 core\n"
 "uniform sampler2D uTex;\n"
 "uniform vec4 uColor;\n"
@@ -150,6 +231,52 @@ static const char *const ZAN_GAME_3D_FS =
 "    float shade = 0.55 + 0.45 * lam;\n"
 "    vec4 tex = texture(uTex, v_uv);\n"
 "    frag = vec4(tex.rgb * uColor.rgb * shade, tex.a * uColor.a);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_FS_COLOR =
+"#version 330 core\n"
+"uniform sampler2D uTex;\n"
+"uniform vec4 uColor;\n"
+"in vec2 v_uv;\n"
+"in vec3 v_normal;\n"
+"in vec4 v_color;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
+"    float shade = 0.55 + 0.45 * lam;\n"
+"    vec4 tex = texture(uTex, v_uv);\n"
+"    vec3 rgb = tex.rgb * uColor.rgb * v_color.rgb * shade;\n"
+"    frag = vec4(rgb, tex.a * uColor.a * v_color.a);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_FS_INST =
+"#version 330 core\n"
+"uniform sampler2D uTex;\n"
+"in vec2 v_uv;\n"
+"in vec3 v_normal;\n"
+"in vec4 v_tint;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
+"    float shade = 0.55 + 0.45 * lam;\n"
+"    vec4 tex = texture(uTex, v_uv);\n"
+"    frag = vec4(tex.rgb * v_tint.rgb * shade, tex.a * v_tint.a);\n"
+"}\n";
+
+static const char *const ZAN_GAME_3D_FS_INST_COLOR =
+"#version 330 core\n"
+"uniform sampler2D uTex;\n"
+"in vec2 v_uv;\n"
+"in vec3 v_normal;\n"
+"in vec4 v_color;\n"
+"in vec4 v_tint;\n"
+"out vec4 frag;\n"
+"void main() {\n"
+"    float lam = clamp(dot(normalize(v_normal), normalize(vec3(0.4, 0.8, 0.6))) * 0.5 + 0.5, 0.0, 1.0);\n"
+"    float shade = 0.55 + 0.45 * lam;\n"
+"    vec4 tex = texture(uTex, v_uv);\n"
+"    vec3 rgb = tex.rgb * v_tint.rgb * v_color.rgb * shade;\n"
+"    frag = vec4(rgb, tex.a * v_tint.a * v_color.a);\n"
 "}\n";
 
 static void zan_game_drop_mesh(zan_game_mesh *mesh) {
@@ -166,11 +293,19 @@ static void zan_game_drop_depth(zan_game_depth *depth) {
 }
 
 static void zan_game_forget_gpu(void) {
+    if (g_game_gl) {
+        for (int r = 0; r < 2; ++r)
+            for (int c = 0; c < 2; ++c)
+                if (g_game_progs[r][c].program)
+                    g_game_gl->DeleteProgram(g_game_progs[r][c].program);
+        if (g_game_instance_vbo)
+            g_game_gl->DeleteBuffers(1, &g_game_instance_vbo);
+    }
     memset(g_game_meshes, 0, sizeof(g_game_meshes));
     memset(g_game_depth, 0, sizeof(g_game_depth));
-    g_game_program = 0;
-    g_game_u_mvp = g_game_u_tex = g_game_u_color = -1;
-    g_game_a_pos = g_game_a_normal = g_game_a_uv = -1;
+    memset(g_game_progs, 0, sizeof(g_game_progs));
+    g_game_instance_vbo = 0;
+    g_game_batch_surface = -1;
     g_game_epoch = 0;
     g_game_gl = NULL;
 }
@@ -187,7 +322,6 @@ static void zan_game_gpu_cleanup(int32_t surface_id) {
             zan_game_drop_mesh(&g_game_meshes[i]);
         for (int i = 0; i < ZAN_GAME_SURFACE_CAP; ++i)
             zan_game_drop_depth(&g_game_depth[i]);
-        if (g_game_program) g_game_gl->DeleteProgram(g_game_program);
     }
     zan_game_forget_gpu();
 }
@@ -209,25 +343,51 @@ static int zan_game_gpu_prepare(const zan_gpu_frame *frame) {
     return 0;
 }
 
-static int zan_game_program_ready(void) {
-    if (g_game_program) return 1;
-    zgl_uint program = zan_gui_gpu_program(ZAN_GAME_3D_VS, ZAN_GAME_3D_FS);
-    if (!program) return 0;
-    zgl_int mvp = g_game_gl->GetUniformLocation(program, "uMVP");
+/* 惰性取用着色器程序变体。属性位置为显式 layout 常量，创建时校验链接器
+ * 确实落在这些位置（VAO 配置按常量位置写死，错位即整体失败，不带病运行）。 */
+static zan_game_program *zan_game_program_get(int colored, int instanced) {
+    zan_game_program *prog =
+        &g_game_progs[colored ? 1 : 0][instanced ? 1 : 0];
+    if (prog->program) return prog;
+    const char *vs = instanced
+        ? (colored ? ZAN_GAME_3D_VS_INST_COLOR : ZAN_GAME_3D_VS_INST)
+        : (colored ? ZAN_GAME_3D_VS_COLOR : ZAN_GAME_3D_VS_PLAIN);
+    const char *fs = instanced
+        ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
+        : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
+    zgl_uint program = zan_gui_gpu_program(vs, fs);
+    if (!program) return NULL;
     zgl_int tex = g_game_gl->GetUniformLocation(program, "uTex");
-    zgl_int color = g_game_gl->GetUniformLocation(program, "uColor");
     zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
     zgl_int normal = g_game_gl->GetAttribLocation(program, "a_normal");
     zgl_int uv = g_game_gl->GetAttribLocation(program, "a_uv");
-    if (mvp < 0 || tex < 0 || color < 0 || pos < 0 || normal < 0 || uv < 0 ||
-        g_game_gl->GetError() != ZGL_NO_ERROR) {
-        g_game_gl->DeleteProgram(program);
-        return 0;
+    zgl_int mvp = instanced ? 0
+        : g_game_gl->GetUniformLocation(program, "uMVP");
+    zgl_int color = instanced ? 0
+        : g_game_gl->GetUniformLocation(program, "uColor");
+    int ok = tex >= 0 && pos == ZAN_GAME_LOC_POS &&
+        normal == ZAN_GAME_LOC_NORMAL && uv == ZAN_GAME_LOC_UV &&
+        mvp >= 0 && color >= 0 &&
+        g_game_gl->GetError() == ZGL_NO_ERROR;
+    if (ok && colored) {
+        ok = g_game_gl->GetAttribLocation(program, "a_color") ==
+            ZAN_GAME_LOC_COLOR;
     }
-    g_game_program = program;
-    g_game_u_mvp = mvp; g_game_u_tex = tex; g_game_u_color = color;
-    g_game_a_pos = pos; g_game_a_normal = normal; g_game_a_uv = uv;
-    return 1;
+    if (ok && instanced) {
+        ok = g_game_gl->GetAttribLocation(program, "i_mvp") ==
+                ZAN_GAME_LOC_IMVP &&
+            g_game_gl->GetAttribLocation(program, "i_tint") ==
+                ZAN_GAME_LOC_ITINT;
+    }
+    if (!ok) {
+        g_game_gl->DeleteProgram(program);
+        return NULL;
+    }
+    prog->program = program;
+    prog->u_mvp = mvp;
+    prog->u_tex = tex;
+    prog->u_color = color;
+    return prog;
 }
 
 static zan_game_mesh *zan_game_find_mesh(int32_t id, uint64_t epoch) {
@@ -239,6 +399,18 @@ static zan_game_mesh *zan_game_find_mesh(int32_t id, uint64_t epoch) {
 
 ZAN_GAME_API int32_t zan_game_mesh_create(int32_t surface_id, const float *verts,
     int32_t count, const unsigned short *indices, int32_t index_count) {
+    return zan_game_mesh_create_ex(surface_id, verts, count, indices,
+                                   index_count, 0);
+}
+
+/* flags bit0 = colored：顶点 12 float（pos3+normal3+uv2+color4），
+ * 否则 8 float。返回网格 id，0 = 失败/后端不支持。 */
+ZAN_GAME_API int32_t zan_game_mesh_create_ex(int32_t surface_id,
+    const float *verts, int32_t count, const unsigned short *indices,
+    int32_t index_count, int32_t flags) {
+    int colored = (flags & 1) != 0;
+    int vertex_floats = colored ? ZAN_GAME_COLORED_VERTEX_FLOATS
+                                : ZAN_GAME_VERTEX_FLOATS;
     if (!verts || !indices || count <= 0 || count > ZAN_GAME_VERTEX_CAP ||
         index_count <= 0 || g_game_next_mesh_id > INT32_MAX ||
         (size_t)index_count > (size_t)PTRDIFF_MAX / sizeof(*indices)) return 0;
@@ -252,7 +424,7 @@ ZAN_GAME_API int32_t zan_game_mesh_create(int32_t surface_id, const float *verts
     zan_game_mesh *mesh = NULL;
     for (int i = 0; i < ZAN_GAME_MESH_CAP; ++i)
         if (!g_game_meshes[i].id) { mesh = &g_game_meshes[i]; break; }
-    if (!mesh || !zan_game_program_ready()) goto done;
+    if (!mesh || !zan_game_program_get(colored, 0)) goto done;
 
     const zan_gl_api *gl = frame.api;
     gl->GenVertexArrays(1, &mesh->vao);
@@ -262,7 +434,7 @@ ZAN_GAME_API int32_t zan_game_mesh_create(int32_t surface_id, const float *verts
     if (!mesh->vbo) goto failed;
     gl->BindBuffer(ZGL_ARRAY_BUFFER, mesh->vbo);
     gl->BufferData(ZGL_ARRAY_BUFFER,
-        (zgl_sizeiptr)((size_t)count * ZAN_GAME_VERTEX_FLOATS * sizeof(*verts)),
+        (zgl_sizeiptr)((size_t)count * vertex_floats * sizeof(*verts)),
         verts, ZGL_STATIC_DRAW);
     gl->GenBuffers(1, &mesh->ebo);
     if (!mesh->ebo) goto failed;
@@ -270,19 +442,26 @@ ZAN_GAME_API int32_t zan_game_mesh_create(int32_t surface_id, const float *verts
     gl->BufferData(ZGL_ELEMENT_ARRAY_BUFFER,
         (zgl_sizeiptr)((size_t)index_count * sizeof(*indices)), indices,
         ZGL_STATIC_DRAW);
-    const zgl_int locations[] = {
-        g_game_a_pos, g_game_a_normal, g_game_a_uv
-    };
     const int sizes[] = { 3, 3, 2 };
     const size_t offsets[] = { 0, 3 * sizeof(float), 6 * sizeof(float) };
+    const int locs[] = {
+        ZAN_GAME_LOC_POS, ZAN_GAME_LOC_NORMAL, ZAN_GAME_LOC_UV
+    };
     for (int i = 0; i < 3; ++i) {
-        gl->EnableVertexAttribArray((zgl_uint)locations[i]);
-        gl->VertexAttribPointer((zgl_uint)locations[i], sizes[i], ZGL_FLOAT,
-            ZGL_FALSE, ZAN_GAME_VERTEX_FLOATS * (zgl_sizei)sizeof(float),
+        gl->EnableVertexAttribArray((zgl_uint)locs[i]);
+        gl->VertexAttribPointer((zgl_uint)locs[i], sizes[i], ZGL_FLOAT,
+            ZGL_FALSE, vertex_floats * (zgl_sizei)sizeof(float),
             (const void *)offsets[i]);
+    }
+    if (colored) {
+        gl->EnableVertexAttribArray(ZAN_GAME_LOC_COLOR);
+        gl->VertexAttribPointer(ZAN_GAME_LOC_COLOR, 4, ZGL_FLOAT, ZGL_FALSE,
+            vertex_floats * (zgl_sizei)sizeof(float),
+            (const void *)(8 * sizeof(float)));
     }
     if (gl->GetError() != ZGL_NO_ERROR) goto failed;
     mesh->index_count = index_count;
+    mesh->colored = colored;
     mesh->epoch = frame.epoch;
     mesh->id = (int32_t)g_game_next_mesh_id++;
     result = mesh->id;
@@ -349,7 +528,9 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
     int32_t result = 0;
     if (!zan_game_gpu_prepare(&frame)) goto done;
     zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame.epoch);
-    if (!mesh || !g_game_program) goto done;
+    if (!mesh) goto done;
+    zan_game_program *prog = zan_game_program_get(mesh->colored, 0);
+    if (!prog) goto done;
     int clip_x, clip_y, clip_w, clip_h;
     zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
     if (!clip_w || !clip_h) { result = 1; goto done; }
@@ -371,17 +552,17 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
     gl->Enable(ZGL_DEPTH_TEST);
     gl->DepthFunc(ZGL_LEQUAL);
     gl->Disable(ZGL_BLEND);
-    gl->UseProgram(g_game_program);
-    gl->UniformMatrix4fv(g_game_u_mvp, 1, ZGL_FALSE, mvp);
+    gl->UseProgram(prog->program);
+    gl->UniformMatrix4fv(prog->u_mvp, 1, ZGL_FALSE, mvp);
     uint32_t argb = (uint32_t)color;
-    gl->Uniform4f(g_game_u_color,
+    gl->Uniform4f(prog->u_color,
         (float)((argb >> 16) & 255) / 255.0f,
         (float)((argb >> 8) & 255) / 255.0f,
         (float)(argb & 255) / 255.0f,
         (float)((argb >> 24) & 255) / 255.0f);
     gl->ActiveTexture(ZGL_TEXTURE0);
     gl->BindTexture(ZGL_TEXTURE_2D, tex);
-    gl->Uniform1i(g_game_u_tex, 0);
+    gl->Uniform1i(prog->u_tex, 0);
     gl->BindVertexArray(mesh->vao);
     gl->DrawElements(ZGL_TRIANGLES, mesh->index_count, ZGL_UNSIGNED_SHORT, NULL);
     gl->BindVertexArray(0);
@@ -391,4 +572,135 @@ ZAN_GAME_API int32_t zan_game_draw3d(int32_t surface_id, int32_t mesh_id,
 done:
     zan_gui_gpu_end(surface_id);
     return result;
+}
+
+/* ---- 批量实例绘制 ----------------------------------------------------
+ * begin 一次（清一次深度、绑定 FBO/深度/scissor、关 blend）→
+ * 每网格一组 batch 提交（一次 DrawElementsInstanced，实例记录
+ * mvp 16 float 列主序 + tint rgba 4 float）→ end 一次（恢复状态，
+ * 整批恰好一次 Finish）。批内实例与跨网格组之间都做深度解析，
+ * 这是与 draw3d（每次清深度、调用序遮挡）的本质差别。
+ * 批活跃期间不要混用 draw3d/mesh_create。 */
+
+ZAN_GAME_API int32_t zan_game_draw3d_batch_begin(int32_t surface_id) {
+    if (surface_id < 0 || surface_id >= ZAN_GAME_SURFACE_CAP ||
+        g_game_batch_surface != -1) return 0;
+    zan_gpu_frame frame;
+    if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
+    if (!zan_game_gpu_prepare(&frame)) {
+        zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    int clip_x, clip_y, clip_w, clip_h;
+    zan_game_clip(&frame, &clip_x, &clip_y, &clip_w, &clip_h);
+    const zan_gl_api *gl = frame.api;
+    if (!g_game_instance_vbo) {
+        gl->GenBuffers(1, &g_game_instance_vbo);
+        if (!g_game_instance_vbo) {
+            zan_gui_gpu_end(surface_id);
+            return 0;
+        }
+        gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
+        gl->BufferData(ZGL_ARRAY_BUFFER,
+            (zgl_sizeiptr)((size_t)ZAN_GAME_INSTANCE_CAP *
+                ZAN_GAME_INSTANCE_FLOATS * sizeof(float)),
+            NULL, ZGL_STREAM_DRAW);
+        gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
+    }
+    if (gl->GetError() != ZGL_NO_ERROR) {
+        zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    gl->BindFramebuffer(ZGL_FRAMEBUFFER, frame.framebuffer);
+    if (!zan_game_depth_ready(surface_id, &frame)) {
+        zan_gui_gpu_end(surface_id);
+        return 0;
+    }
+    gl->Viewport(0, 0, frame.width, frame.height);
+    gl->Enable(ZGL_SCISSOR_TEST);
+    gl->Scissor(clip_x, clip_y, clip_w, clip_h);
+    gl->ClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->Clear(ZGL_DEPTH_BUFFER_BIT);
+    gl->Enable(ZGL_DEPTH_TEST);
+    gl->DepthFunc(ZGL_LEQUAL);
+    gl->Disable(ZGL_BLEND);
+    g_game_batch_frame = frame;
+    g_game_batch_clip_empty = !clip_w || !clip_h;
+    g_game_batch_surface = surface_id;
+    return 1;
+}
+
+/* 给网格 VAO 配实例属性（每网格一次，指向共享实例 VBO，divisor=1）。
+ * mat4 属性占 location 4..7 连续四槽 + tint 在 8。 */
+static int zan_game_mesh_inst_ready(zan_game_mesh *mesh, const zan_gl_api *gl) {
+    if (mesh->inst_ready) return 1;
+    gl->BindVertexArray(mesh->vao);
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
+    const zgl_uint locs[] = {
+        ZAN_GAME_LOC_IMVP, ZAN_GAME_LOC_IMVP + 1,
+        ZAN_GAME_LOC_IMVP + 2, ZAN_GAME_LOC_IMVP + 3,
+        ZAN_GAME_LOC_ITINT
+    };
+    for (int i = 0; i < 5; ++i)
+        gl->EnableVertexAttribArray(locs[i]);
+    for (int i = 0; i < 4; ++i) {
+        gl->VertexAttribPointer(locs[i], 4, ZGL_FLOAT, ZGL_FALSE,
+            ZAN_GAME_INSTANCE_FLOATS * (zgl_sizei)sizeof(float),
+            (const void *)(size_t)(i * 4 * sizeof(float)));
+        gl->VertexAttribDivisor(locs[i], 1);
+    }
+    gl->VertexAttribPointer(ZAN_GAME_LOC_ITINT, 4, ZGL_FLOAT, ZGL_FALSE,
+        ZAN_GAME_INSTANCE_FLOATS * (zgl_sizei)sizeof(float),
+        (const void *)(16 * sizeof(float)));
+    gl->VertexAttribDivisor(ZAN_GAME_LOC_ITINT, 1);
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
+    gl->BindVertexArray(0);
+    if (gl->GetError() != ZGL_NO_ERROR) return 0;
+    mesh->inst_ready = 1;
+    return 1;
+}
+
+ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
+    const char *texture, const float *instances, int32_t count) {
+    if (surface_id < 0 || surface_id != g_game_batch_surface || !instances ||
+        count <= 0 || count > ZAN_GAME_INSTANCE_CAP || mesh_id <= 0) return 0;
+    zan_gpu_frame *frame = &g_game_batch_frame;
+    if (!zan_game_gpu_prepare(frame)) return 0;
+    zan_game_mesh *mesh = zan_game_find_mesh(mesh_id, frame->epoch);
+    if (!mesh) return 0;
+    zan_game_program *prog = zan_game_program_get(mesh->colored, 1);
+    if (!prog || !g_game_instance_vbo) return 0;
+    if (g_game_batch_clip_empty) return 1;
+
+    const zan_bitmap *bitmap = texture && texture[0] ? zan_image_get(texture) : NULL;
+    if (!zan_game_bitmap_valid(bitmap)) bitmap = &g_game_white;
+    zgl_uint tex = zan_gui_gpu_texture(bitmap);
+    if (!tex && bitmap != &g_game_white) tex = zan_gui_gpu_texture(&g_game_white);
+    if (!tex) return 0;
+
+    const zan_gl_api *gl = frame->api;
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, g_game_instance_vbo);
+    gl->BufferSubData(ZGL_ARRAY_BUFFER, 0,
+        (zgl_sizeiptr)((size_t)count * ZAN_GAME_INSTANCE_FLOATS *
+            sizeof(float)), instances);
+    gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
+    if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
+    gl->UseProgram(prog->program);
+    gl->ActiveTexture(ZGL_TEXTURE0);
+    gl->BindTexture(ZGL_TEXTURE_2D, tex);
+    gl->Uniform1i(prog->u_tex, 0);
+    gl->BindVertexArray(mesh->vao);
+    gl->DrawElementsInstanced(ZGL_TRIANGLES, mesh->index_count,
+        ZGL_UNSIGNED_SHORT, NULL, count);
+    gl->BindVertexArray(0);
+    return gl->GetError() == ZGL_NO_ERROR;
+}
+
+ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
+    if (surface_id < 0 || surface_id != g_game_batch_surface) return 0;
+    if (g_game_gl) g_game_gl->Finish();
+    g_game_batch_surface = -1;
+    g_game_batch_clip_empty = 0;
+    zan_gui_gpu_end(surface_id);
+    return 1;
 }

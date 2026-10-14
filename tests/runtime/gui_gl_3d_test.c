@@ -25,9 +25,13 @@ static const char *(*backend_name)(void);
 static const void *(*pixels)(int32_t);
 static void (*clear_rect)(int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t);
 static int32_t (*mesh_create)(int32_t,const float*,int32_t,const uint16_t*,int32_t);
+static int32_t (*mesh_create_ex)(int32_t,const float*,int32_t,const uint16_t*,int32_t,int32_t);
 static void (*push_clip)(int32_t,int32_t,int32_t,int32_t,int32_t);
 static void (*pop_clip)(int32_t);
 static int32_t (*draw3d)(int32_t,int32_t,const float*,uint32_t,const char*);
+static int32_t (*batch_begin)(int32_t);
+static int32_t (*batch)(int32_t,int32_t,const char*,const float*,int32_t);
+static int32_t (*batch_end)(int32_t);
 #define LOAD(v,l,n) do { *(void **)(&(v)) = (void *)SYMBOL(l,n); CHECK(v); } while (0)
 
 static uint32_t frame[W*H];
@@ -77,6 +81,75 @@ static float *cube_mvp(float rad, float dist, float r) {
         }
     (void)r;
     return m;
+}
+
+/* 批量实例的 MVP：同一透视矩阵 P（与 cube_mvp 一致，视空间恒等）乘
+ * 平移 T(dx,dy,dz)，列主序输出。 */
+static float *inst_mvp(float dx, float dy, float dz) {
+    static float m[16];
+    float f = 1.0f / (float)tan(0.5235988);
+    float fa = f / ((float)W / (float)H);
+    /* P 列主序四列 */
+    float pc[4][4] = {
+        { fa, 0, 0, 0 },
+        { 0, f, 0, 0 },
+        { 0, 0, 10.0f/(1.0f-100.0f), -1 },
+        { 0, 0, (1.0f*100.0f)/(1.0f-100.0f), 0 },
+    };
+    float t[4] = { dx, dy, dz, 1 };
+    for (int col = 0; col < 4; col++)
+        for (int row = 0; row < 4; row++) {
+            float v;
+            if (col < 3) {
+                v = pc[col][row]; /* T 前三列 = 恒等 */
+            } else {
+                v = 0;
+                for (int k = 0; k < 4; k++) v += pc[k][row] * t[k];
+            }
+            m[col*4+row] = v;
+        }
+    (void)dy;
+    return m;
+}
+
+static void fill_instance(float *inst, const float *mvp,
+                          float r, float g, float b, float a) {
+    for (int i = 0; i < 16; i++) inst[i] = mvp[i];
+    inst[16] = r; inst[17] = g; inst[18] = b; inst[19] = a;
+}
+
+/* 单四边形网格（z=0 平面，法线 +z，8 float/顶点，无顶点色）。 */
+static int make_quad_mesh(int32_t s, float half) {
+    float v[4*8] = {0};
+    uint16_t idx[6] = {0,1,2,0,2,3};
+    const float corners[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
+    for (int i = 0; i < 4; i++) {
+        v[i*8+0] = corners[i][0] * half;
+        v[i*8+1] = corners[i][1] * half;
+        v[i*8+5] = 1.0f;
+    }
+    return mesh_create(s, v, 4, idx, 6);
+}
+
+/* 顶点色四边形：左半红右半绿（x 从 -0.9 到 0.9 线性插值），
+ * 12 float/顶点。返回 mesh_create_ex(flags=1) 的结果。 */
+static int make_colored_quad(int32_t s) {
+    float v[4*12] = {0};
+    uint16_t idx[6] = {0,1,2,0,2,3};
+    const float corners[4][2] = {{-1,-1},{1,-1},{1,1},{-1,1}};
+    for (int i = 0; i < 4; i++) {
+        float *p = v + i * 12;
+        p[0] = corners[i][0] * 0.9f;
+        p[1] = corners[i][1] * 0.5f;
+        p[3] = 0; p[4] = 0; p[5] = 1.0f;
+        p[6] = (corners[i][0] < 0) ? 0.0f : 1.0f;
+        p[7] = 0.5f;
+        p[8] = (corners[i][0] < 0) ? 1.0f : 0.0f;
+        p[9] = (corners[i][0] < 0) ? 0.0f : 1.0f;
+        p[10] = 0.0f;
+        p[11] = 1.0f;
+    }
+    return mesh_create_ex(s, v, 4, idx, 6, 1);
 }
 
 static float cube_verts[6*4*8];
@@ -130,7 +203,11 @@ int main(int argc, char **argv) {
     LOAD(push_clip, core, "zan_gui_push_clip");
     LOAD(pop_clip, core, "zan_gui_pop_clip");
     LOAD(mesh_create, game, "zan_game_mesh_create");
+    LOAD(mesh_create_ex, game, "zan_game_mesh_create_ex");
     LOAD(draw3d, game, "zan_game_draw3d");
+    LOAD(batch_begin, game, "zan_game_draw3d_batch_begin");
+    LOAD(batch, game, "zan_game_draw3d_batch");
+    LOAD(batch_end, game, "zan_game_draw3d_batch_end");
 
     build_cube();
     backend(0);
@@ -251,6 +328,103 @@ int main(int argc, char **argv) {
     CHECK(draw3d(s, new_mesh, identity, 0xFFFFFFFF, "mem:depth") == 1);
     capture(s);
     CHECK(((frame[(H/2)*W + W/2] >> 16) & 255) > 150);
+
+    /* ---- 顶点色 / 批量实例（新管线） ------------------------------ */
+
+    /* CPU 兜底档：batch 三导出全部拒绝 */
+    CHECK(backend(0) == 0);
+    CHECK(batch_begin(s) == 0);
+    CHECK(batch(s, 1, NULL, NULL, 1) == 0);
+    CHECK(batch_end(s) == 0);
+    CHECK(backend(1) == 1);
+
+    /* 网格容量 > 24（原上限） */
+    int cap_prev = 0;
+    for (int i = 0; i < 30; i++) {
+        int m = make_quad_mesh(s, 0.5f);
+        CHECK(m > cap_prev);
+        cap_prev = m;
+    }
+
+    /* 顶点色网格（无纹理）：左红右绿，中心黄色混合 */
+    int cmesh = make_colored_quad(s);
+    CHECK(cmesh > 0);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(draw3d(s, cmesh, identity, 0xFFFFFFFF, NULL) == 1);
+    capture(s);
+    {
+        uint32_t left = frame[(H/2)*W + W/4];
+        uint32_t mid = frame[(H/2)*W + W/2];
+        uint32_t right = frame[(H/2)*W + 3*W/4];
+        CHECK(((left >> 16) & 255) > 150 && ((left >> 8) & 255) < 110);
+        CHECK(((right >> 8) & 255) > 150 && ((right >> 16) & 255) < 110);
+        CHECK(((mid >> 16) & 255) > 100 && ((mid >> 8) & 255) > 100 &&
+              (mid & 255) < 100);
+        CHECK((mid >> 24) == 255);
+    }
+
+    /* 批内深度解析：A(z=-3,红) 先提交，B(z=-4,绿) 后提交。两实例屏幕
+     * 范围分别约 x∈[38,67] 与 x∈[55,76]，重叠 x∈[55,67] 必须是更近的
+     * A——若深度不生效，后画的 B 会盖掉红。 */
+    int sqmesh = make_quad_mesh(s, 0.5f);
+    CHECK(sqmesh > 0);
+    float inst[2 * 20];
+    fill_instance(inst, inst_mvp(-0.25f, 0.0f, -3.0f), 1, 0, 0, 1);
+    fill_instance(inst + 20, inst_mvp(0.25f, 0.0f, -4.0f), 0, 1, 0, 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(batch_begin(s) == 1);
+    CHECK(batch(s, sqmesh, NULL, inst, 2) == 1);
+    CHECK(batch_end(s) == 1);
+    capture(s);
+    {
+        uint32_t overlap = frame[(H/2)*W + 60];
+        uint32_t only_a = frame[(H/2)*W + 42];
+        uint32_t only_b = frame[(H/2)*W + 72];
+        CHECK(((overlap >> 16) & 255) > 140 && ((overlap >> 8) & 255) < 100);
+        CHECK(((only_a >> 16) & 255) > 140 && ((only_a >> 8) & 255) < 100);
+        CHECK(((only_b >> 8) & 255) > 140 && ((only_b >> 16) & 255) < 100);
+    }
+
+    /* 跨网格批：左侧红四边形（z=-2.5，屏幕约 x∈[22,57]）+ 居中立方体
+     * （前脸 z=-3，约 x∈[38,82]），同一 begin/end。重叠区 x=45 必须是
+     * 更近的四边形——立方体后提交，深度不生效就会变成白。 */
+    int cube2 = mesh_create(s, cube_verts, 24, cube_idx, 36);
+    CHECK(cube2 > 0);
+    float inst2[20];
+    fill_instance(inst2, inst_mvp(-0.6f, 0.0f, -2.5f), 1, 0, 0, 1);
+    float cube_inst[20];
+    fill_instance(cube_inst, cube_mvp(0.0f, 4.0f, 1.0f), 1, 1, 1, 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(batch_begin(s) == 1);
+    CHECK(batch(s, sqmesh, NULL, inst2, 1) == 1);
+    CHECK(batch(s, cube2, NULL, NULL, 0) == 0); /* count=0 拒绝 */
+    CHECK(batch(s, cube2, NULL, cube_inst, 1) == 1);
+    CHECK(batch_end(s) == 1);
+    capture(s);
+    {
+        uint32_t mid = frame[(H/2)*W + 60];
+        uint32_t overlap = frame[(H/2)*W + 45];
+        uint32_t only_quad = frame[(H/2)*W + 25];
+        CHECK(((mid >> 16) & 255) > 0x50 && ((mid >> 8) & 255) > 0x50);
+        CHECK(((overlap >> 16) & 255) > 140 && ((overlap >> 8) & 255) < 100);
+        CHECK(((only_quad >> 16) & 255) > 140 && ((only_quad >> 8) & 255) < 100);
+    }
+
+    /* 顶点色 × 实例化（第 4 个着色器变体）+ 每实例 tint：
+     * 红 tint × 左红右绿顶点色 = 左红右黑（z=-3，屏幕约 x∈[34,86]）。 */
+    float inst3[20];
+    fill_instance(inst3, inst_mvp(0.0f, 0.0f, -3.0f), 1, 0, 0, 1);
+    clear_rect(s, 0, 0, W, H, 0xFF203040);
+    CHECK(batch_begin(s) == 1);
+    CHECK(batch(s, cmesh, NULL, inst3, 1) == 1);
+    CHECK(batch_end(s) == 1);
+    capture(s);
+    {
+        uint32_t left = frame[(H/2)*W + 40];
+        uint32_t right = frame[(H/2)*W + 80];
+        CHECK(((left >> 16) & 255) > 140 && ((left >> 8) & 255) < 60);
+        CHECK(((right >> 16) & 255) < 60 && ((right >> 8) & 255) < 60);
+    }
 
     destroy(s);
     fprintf(stderr, "GL 3D: OK\n");

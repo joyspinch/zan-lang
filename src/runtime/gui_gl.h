@@ -93,6 +93,8 @@ typedef struct zan_gl_api_s {
     const zgl_char *(*GetString)(zgl_enum);
     void      (*DrawArrays)(zgl_enum, zgl_int, zgl_sizei);
     void      (*DrawElements)(zgl_enum, zgl_sizei, zgl_enum, const void *);
+    void      (*DrawElementsInstanced)(zgl_enum, zgl_sizei, zgl_enum,
+                                       const void *, zgl_sizei);
     void      (*DepthFunc)(zgl_enum);
     void      (*ReadPixels)(zgl_int, zgl_int, zgl_sizei, zgl_sizei,
                             zgl_enum, zgl_enum, void *);
@@ -129,6 +131,8 @@ typedef struct zan_gl_api_s {
     void      (*EnableVertexAttribArray)(zgl_uint);
     void      (*VertexAttribPointer)(zgl_uint, zgl_int, zgl_enum, zgl_boolean,
                                      zgl_sizei, const void *);
+    void      (*VertexAttribDivisor)(zgl_uint, zgl_uint);
+    void      (*BufferSubData)(zgl_enum, zgl_intptr, zgl_sizeiptr, const void *);
     /* --- textures ------------------------------------------------------- */
     void      (*GenTextures)(zgl_sizei, zgl_uint *);
     void      (*DeleteTextures)(zgl_sizei, const zgl_uint *);
