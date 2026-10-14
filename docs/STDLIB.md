@@ -64,7 +64,7 @@ class PlatformProbe {
 ```
 
 (`#if WINDOWS` / `#if LINUX` / `#if MACOS` are the forms actually used across
-`stdlib/`, e.g. `System/Interop.zan` and `Gui/Backend/Native.zan`.)
+`stdlib/`, e.g. `System/Interop.zan` and `Gui/Backend/Window.zan`.)
 
 ---
 
@@ -170,9 +170,9 @@ stdlib/
 │       Web/, Windows/)
 │
 ├── Gui/                             # self-hosted GUI framework (Zan source)
-│   ├── App.zan / Types.zan / Theme.zan / Reactive.zan / Layout.zan
-│   ├── Render.zan / Event.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
-│   ├── Backend/                     # Native.zan, UiDriver.zan, Win32Shell.zan
+│   ├── App.zan / Point.zan / Color.zan / Theme.zan / Signal.zan / FlexLayout.zan
+│   ├── Canvas.zan / EventHub.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
+│   ├── Backend/                     # Window.zan, UiDriver.zan, Win32Shell.zan
 │   ├── Component/                   # Chart, CodeEditor, DataTable, WebView, ...
 │   ├── Widget/                      # 60 controls (Button, Input, Label, ...)
 │   ├── Designer/ / Hmi/

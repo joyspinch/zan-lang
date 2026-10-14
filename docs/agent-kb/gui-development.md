@@ -65,7 +65,7 @@ while (app.isRunning) {
 “图形游戏的 Gui 组件必须匹配游戏美术风格”及
 [游戏引擎指南](../GAME_ENGINE_GUIDE.md)。
 
-## 绘制原语（`packages/Zan.Gui/src/Gui/Rendering/Render.zan`）
+## 绘制原语（`packages/Zan.Gui/src/Gui/Rendering/Canvas.zan`）
 
 `Canvas` 上常用：`FillRect` `DrawRect` `FillRoundRect` `DrawCircle` `DrawLine`
 `DrawPolyline` `DrawText` `PushClip`/`PopClip` `BlurRect`。
