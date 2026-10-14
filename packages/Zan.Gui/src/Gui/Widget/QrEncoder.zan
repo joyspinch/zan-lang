@@ -210,21 +210,11 @@ class QrEncoder {
     }
 
     // ---- 分段模型 -----------------------------------------------------------
-
-    // 一个编码分段：mode 为指示符值，chars 是字符数（numeric/alnum 为
-    // 字符数，byte 为字节数），bits 是该段的数据位（不含模式/计数头）。
-    class Segment {
-        public int mode;
-        public int chars;
-        public int srcPos;
-        public List<int> bits;
-    }
-
     // ---- 公开入口 -----------------------------------------------------------
 
     // 按级别编码文本，返回不含静区的模块矩阵。
     public static QrMatrix Encode(string text, QrEcl ecl) {
-        List<QrEncoder.Segment> segs = QrEncoder.MakeSegments(text);
+        List<QrSegment> segs = QrEncoder.MakeQrSegments(text);
         int ver = QrEncoder.PickVersion(segs, ecl);
         if (ver < 0) {
             throw new Exception(
@@ -233,7 +223,7 @@ class QrEncoder {
         int totalCw = QrEncoder.TotalCodewords(ver);
         int[] cw = new int[totalCw];
         for (int i = 0; i < totalCw; i = i + 1) { cw[i] = 0; }
-        int nDataCw = QrEncoder.WriteSegments(segs, ver, ecl, cw);
+        int nDataCw = QrEncoder.WriteQrSegments(segs, ver, ecl, cw);
         return QrEncoder.BuildMatrix(ver, ecl, cw, nDataCw);
     }
 
@@ -276,12 +266,12 @@ class QrEncoder {
 
     // 按码点游程切段：数字 / 字母数字 / 字节（UTF-8 原样），再把短的非
     // Byte 游程折回 Byte（模式切换头 4+cc 位往往比直接写进 UTF-8 更贵）。
-    static List<QrEncoder.Segment> MakeSegments(string text) {
-        List<QrEncoder.Segment> outp = new List<QrEncoder.Segment>();
+    static List<QrSegment> MakeQrSegments(string text) {
+        List<QrSegment> outp = new List<QrSegment>();
         if (text == null || text.Length == 0) {
             return outp;
         }
-        List<QrEncoder.Segment> raw = new List<QrEncoder.Segment>();
+        List<QrSegment> raw = new List<QrSegment>();
         int len = text.Length;
         int i = 0;
         while (i < len) {
@@ -294,7 +284,7 @@ class QrEncoder {
                 i = i + QrEncoder.SeqByteLen(text[i] & 255);
             }
             string run = text.Substring(runStart, i - runStart);
-            QrEncoder.Segment s = new QrEncoder.Segment();
+            QrSegment s = new QrSegment();
             s.bits = new List<int>();
             s.srcPos = runStart;
             if (mode == MODE_NUMERIC) {
@@ -350,7 +340,7 @@ class QrEncoder {
         }
         // 短游程折回 Byte + 相邻 Byte 段合并。
         for (int k = 0; k < raw.Count; k = k + 1) {
-            QrEncoder.Segment s = raw[k];
+            QrSegment s = raw[k];
             if (s.mode != MODE_BYTE && s.chars <= 8) {
                 // 该游程全部在 ASCII（数字/字母数字表）内：直接按字节走。
                 // 起点用构建时记录的 srcPos——合并会就地改 raw 段的
@@ -359,7 +349,7 @@ class QrEncoder {
             }
             bool merged = false;
             if (s.mode == MODE_BYTE && outp.Count > 0) {
-                QrEncoder.Segment p = outp[outp.Count - 1];
+                QrSegment p = outp[outp.Count - 1];
                 if (p.mode == MODE_BYTE) {
                     for (int j = 0; j < s.bits.Count; j = j + 1) {
                         p.bits.Add(s.bits[j]);
@@ -374,8 +364,8 @@ class QrEncoder {
     }
 
     // 把一段文本编码为 Byte 段（每字节 8 位，高位在前）。
-    static QrEncoder.Segment MakeByteRun(string run) {
-        QrEncoder.Segment s = new QrEncoder.Segment();
+    static QrSegment MakeByteRun(string run) {
+        QrSegment s = new QrSegment();
         s.mode = MODE_BYTE;
         s.chars = run.Length;
         s.bits = new List<int>();
@@ -415,11 +405,11 @@ class QrEncoder {
     }
 
     // 能容纳这些分段的最小版本，1..40；放不下返回 -1。
-    static int PickVersion(List<QrEncoder.Segment> segs, QrEcl ecl) {
+    static int PickVersion(List<QrSegment> segs, QrEcl ecl) {
         for (int ver = 1; ver <= 40; ver = ver + 1) {
             int need = 0;
             for (int i = 0; i < segs.Count; i = i + 1) {
-                QrEncoder.Segment s = segs[i];
+                QrSegment s = segs[i];
                 need = need + 4 + CharCountBits(s.mode, ver) + s.bits.Count;
             }
             if (need <= DataCapacity(ver, ecl) * 8) { return ver; }
@@ -428,11 +418,11 @@ class QrEncoder {
     }
 
     // 分段位流 + 终止符 + 填充写入 cw（容量码字），返回实际数据码字数。
-    static int WriteSegments(List<QrEncoder.Segment> segs, int ver, QrEcl ecl,
+    static int WriteQrSegments(List<QrSegment> segs, int ver, QrEcl ecl,
                              int[] cw) {
         List<int> bits = new List<int>();
         for (int i = 0; i < segs.Count; i = i + 1) {
-            QrEncoder.Segment s = segs[i];
+            QrSegment s = segs[i];
             QrEncoder.AppendVal(bits, s.mode, 4);
             QrEncoder.AppendVal(bits, s.chars, CharCountBits(s.mode, ver));
             for (int k = 0; k < s.bits.Count; k = k + 1) {
