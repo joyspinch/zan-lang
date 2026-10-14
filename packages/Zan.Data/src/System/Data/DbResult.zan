@@ -1,0 +1,229 @@
+using System;
+using System.Text;
+namespace System.Data;
+
+class DbResult {
+    List<DbRow> rows;
+    List<string> columnNames;
+    int columnCount;
+    Dict<string, int> colMap;
+
+    DbResult() {
+        this.rows = new List<DbRow>();
+        this.columnNames = new List<string>();
+        this.columnCount = 0;
+        this.colMap = null;
+    }
+
+    // 创建空结果（无行）。
+    static DbResult Empty() {
+        return new DbResult();
+    }
+
+    // 设置列数。
+    void SetColumnCount(int count) {
+        this.columnCount = count;
+    }
+
+    // 添加一个列名。
+    void AddColumnName(string name) {
+        this.columnNames.Add(name);
+        this.colMap = null;
+    }
+
+    // 添加一行已物化的单元格（驱动快路径：整数格免字符串
+    // 物化）。cells 与 texts 长度必须一致；文本格的载荷在 texts。
+    void AddRowCells(List<DbCell> cells, List<string> texts) {
+        this.rows.Add(new DbRow(cells, texts));
+    }
+
+    // 添加一行值（不含 SQL NULL）。
+    void AddRow(List<string> row) {
+        List<DbCell> cells = new List<DbCell>();
+        for (int i = 0; i < row.Count; i = i + 1) {
+            DbCell cell = new DbCell();
+            cell.kind = 2;
+            cells.Add(cell);
+        }
+        this.rows.Add(new DbRow(cells, row));
+    }
+
+    // 添加一行，并附逐列的 SQL NULL 标记，调用方
+    // 可通过 IsNull() 区分 NULL 与空字符串。
+    void AddRowNulls(List<string> row, List<bool> nullFlags) {
+        List<DbCell> cells = new List<DbCell>();
+        for (int i = 0; i < row.Count; i = i + 1) {
+            DbCell cell = new DbCell();
+            if (nullFlags != null && i < nullFlags.Count && nullFlags[i]) {
+                cell.kind = 0;
+            } else {
+                cell.kind = 2;
+            }
+            cells.Add(cell);
+        }
+        this.rows.Add(new DbRow(cells, row));
+    }
+
+    // 单元格为 SQL NULL 时为 true（空字符串则相反，
+    // GetString 对空字符串同样返回 ""）。
+    bool IsNull(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].IsNull(col);
+        }
+        return false;
+    }
+
+    // 按列名检查是否为 NULL。
+    bool IsNullByName(int row, string columnName) {
+        return IsNull(row, GetColumnIndex(columnName));
+    }
+
+    // 返回行数。
+    int RowCount() {
+        return this.rows.Count;
+    }
+
+    // 返回列数。
+    int ColumnCount() {
+        return this.columnCount;
+    }
+
+    // 获取指定行列索引处的字符串值。
+    string GetString(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetString(col);
+        }
+        return "";
+    }
+
+    // 获取指定行列索引处的整数值。
+    int GetInt(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetInt(col);
+        }
+        return 0;
+    }
+
+    // 获取指定行列索引处的 64 位整数值。
+    long GetLong(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetLong(col);
+        }
+        return 0;
+    }
+
+    // 获取指定行列索引处的双精度值。
+    double GetDouble(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetDouble(col);
+        }
+        return 0.0;
+    }
+
+    // 获取指定行列索引处的布尔值。
+    bool GetBool(int row, int col) {
+        if (row >= 0 && row < this.rows.Count) {
+            return this.rows[row].GetBool(col);
+        }
+        return false;
+    }
+
+    // 按行索引和列名取值。
+    string GetByName(int row, string columnName) {
+        int col = GetColumnIndex(columnName);
+        if (col >= 0) {
+            return GetString(row, col);
+        }
+        return "";
+    }
+
+    // 按列名获取列索引。内部带有懒加载字典索引缓存，将大数据量高频调用从 O(N) 线性扫描降为 O(1)。
+    int GetColumnIndex(string name) {
+        if (this.colMap == null) {
+            this.colMap = new Dict<string, int>();
+            for (int i = 0; i < this.columnNames.Count; i = i + 1) {
+                if (!this.colMap.ContainsKey(this.columnNames[i])) {
+                    this.colMap.Add(this.columnNames[i], i);
+                }
+            }
+        }
+        if (this.colMap.ContainsKey(name)) {
+            return this.colMap[name];
+        }
+        return -1;
+    }
+
+    // 获取指定索引处的列名。
+    string GetColumnName(int index) {
+        if (index >= 0 && index < this.columnNames.Count) {
+            return this.columnNames[index];
+        }
+        return "";
+    }
+
+    // 返回所有列名（内部列表的副本，调用方改动
+    // 不会影响本结果集）。
+    List<string> GetColumnNames() {
+        List<string> copy = new List<string>();
+        for (int i = 0; i < this.columnNames.Count; i = i + 1) {
+            copy.Add(this.columnNames[i]);
+        }
+        return copy;
+    }
+
+    // 检查结果集是否包含行。
+    bool HasRows() {
+        return this.rows.Count > 0;
+    }
+
+    // 返回指定索引处的只读行实体（零列表克隆，大数据量循环极速读取推荐）。
+    DbRow RowAt(int index) {
+        if (index >= 0 && index < this.rows.Count) {
+            return this.rows[index];
+        }
+        return null;
+    }
+
+    // 将整行作为字符串列表返回（内部行的副本）。
+    List<string> GetRow(int index) {
+        if (index >= 0 && index < this.rows.Count) {
+            List<string> copy = new List<string>();
+            DbRow src = this.rows[index];
+            for (int i = 0; i < src.Count(); i = i + 1) {
+                copy.Add(src.GetString(i));
+            }
+            return copy;
+        }
+        return new List<string>();
+    }
+
+    // 获取第一行（便捷方法）。
+    List<string> First() {
+        return GetRow(0);
+    }
+
+    // 将结果集打印到控制台（用于调试）。
+    void Print() {
+        // 打印列标题
+        StringBuilder headerSb = new StringBuilder();
+        for (int c = 0; c < this.columnNames.Count; c = c + 1) {
+            if (c > 0) { headerSb.Append("\t"); }
+            headerSb.Append(this.columnNames[c]);
+        }
+        Console.WriteLine(headerSb.ToString());
+
+        // 打印分隔线
+        Console.WriteLine("---");
+
+        // 打印各行（整数格按 GetString 的十进制格式物化）
+        for (int r = 0; r < this.rows.Count; r = r + 1) {
+            StringBuilder rowSb = new StringBuilder();
+            DbRow row = this.rows[r];
+            for (int cc = 0; cc < row.Count(); cc = cc + 1) {
+                if (cc > 0) { rowSb.Append("\t"); }
+                rowSb.Append(row.GetString(cc));
+            }
+            Console.WriteLine(rowSb.ToString());
+        }
+    }
+}

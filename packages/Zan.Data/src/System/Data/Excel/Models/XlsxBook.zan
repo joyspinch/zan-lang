@@ -1,0 +1,480 @@
+using System;
+using System.IO;
+using System.Text;
+using System.IO.Compression;
+namespace System.Data.Excel;
+
+class XlsxBook {
+    List<XlsxSheet> sheets;
+
+    // 私有构造；统一经 <see cref="New"/>/<see cref="FromText"/> 创建。
+    XlsxBook() {
+        this.sheets = new List<XlsxSheet>();
+    }
+
+    // 新建空工作簿。
+    static XlsxBook New() { return new XlsxBook(); }
+
+    // 添加工作表并返回它。名字会清洗 Excel 的非法字符
+    // （: \ / ? * [ ] 与首尾撇号）、截到 31 字符，并与已有表名去重。
+    XlsxSheet AddSheet(string name) {
+        if (name == null) { name = ""; }
+        StringBuilder cleanSb = new StringBuilder();
+        int n = name.Length;
+        int start = 0;
+        for (int i = 0; i < n && cleanSb.Length < 31; i = i + 1) {
+            int c = name[i] & 255;
+            bool edge = (i == 0 || i == n - 1);
+            if (c == 58 || c == 92 || c == 47 || c == 63 || c == 42
+                || c == 91 || c == 93) {
+                if (i > start) { cleanSb.Append(name.Substring(start, i - start)); }
+                if (cleanSb.Length < 31) { cleanSb.Append("_"); }
+                start = i + 1;
+            } else if (c == 39 && edge) {
+                // Excel 禁止表名以撇号开头或结尾。
+                if (i > start) { cleanSb.Append(name.Substring(start, i - start)); }
+                start = i + 1;
+            }
+        }
+        if (start < n && cleanSb.Length < 31) {
+            int take = n - start;
+            if (cleanSb.Length + take > 31) { take = 31 - cleanSb.Length; }
+            cleanSb.Append(name.Substring(start, take));
+        }
+        string clean = cleanSb.ToString();
+        if (clean == "") { clean = "Sheet"; }
+        string unique = clean;
+        int dupSuffix = 2;
+        while (XlsxBook.IndexOfSheet(sheets, unique) >= 0) {
+            unique = clean + Convert.ToString(dupSuffix);
+            dupSuffix = dupSuffix + 1;
+        }
+        XlsxSheet s = new XlsxSheet(unique);
+        sheets.Add(s);
+        return s;
+    }
+
+    // 便捷构建：全文本表格。`firstRowIsHeader` 为 false 时关闭
+    // 表头加粗与冻结；需要数字/日期/布尔请用 AddSheet + XlsxCell。
+    static XlsxBook FromText(List<List<string>> rows, bool firstRowIsHeader) {
+        XlsxBook b = new XlsxBook();
+        XlsxSheet sh = b.AddSheet("Sheet1");
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            List<XlsxCell> row = new List<XlsxCell>();
+            List<string> src = rows[r];
+            for (int c = 0; c < src.Count; c = c + 1) {
+                row.Add(XlsxCell.Str(src[c]));
+            }
+            sh.AddRow(row);
+        }
+        if (!firstRowIsHeader) {
+            sh.headerBold = false;
+            sh.freezeHeader = false;
+        }
+        return b;
+    }
+
+    // 生成完整 xlsx 字节（zip 包）。输出只由数据决定，可复现。
+    byte[] SaveToBytes() {
+        List<ZipEntry> entries = new List<ZipEntry>();
+        entries.Add(XlsxBook.Part("[Content_Types].xml",
+            XlsxBook.ContentTypes(sheets.Count)));
+        entries.Add(XlsxBook.Part("_rels/.rels", XlsxBook.RootRels()));
+        entries.Add(XlsxBook.Part("docProps/core.xml", XlsxBook.CoreProps()));
+        entries.Add(XlsxBook.Part("docProps/app.xml",
+            XlsxBook.AppProps()));
+        entries.Add(XlsxBook.Part("xl/workbook.xml",
+            XlsxBook.WorkbookXml(sheets)));
+        entries.Add(XlsxBook.Part("xl/_rels/workbook.xml.rels",
+            XlsxBook.WorkbookRels(sheets.Count)));
+        entries.Add(XlsxBook.Part("xl/styles.xml", XlsxBook.StylesXml()));
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            string part = "xl/worksheets/sheet" + Convert.ToString(i + 1) + ".xml";
+            entries.Add(XlsxBook.Part(part, XlsxBook.SheetXml(sheets[i])));
+        }
+        return Zip.Create(entries, 6);
+    }
+
+    // 写入 .xlsx 文件。路径打不开时抛 <see cref="IOException"/>。
+    void Save(string path) {
+        File.WriteAllBytes(path, SaveToBytes());
+    }
+
+    // 单张工作表的最大行数（xlsx 格式上限 1048576）。流式写
+    // 出超出时自动续接分表；测试/演示可调小以驱动分表路径。
+    static int maxRowsPerSheet = 1048576;
+
+    // 流式写出：工作表内容经 <paramref name="sources"/>（与 sheets
+    // 一一对应，缺位的用空源）逐行供给，边生成边压缩落盘，内存
+    // 占用与总行数无关。单表超过 <see cref="maxRowsPerSheet"/> 时
+    // 自动续接分表（原表名后缀 2、3……去重；表头/冻结窗格留在
+    // 第一分表）。数据源的 Cancelled() 返回 true 时中止写盘、
+    // 删除半成品并返回 false；路径打不开时抛 IOException。
+    // 输出同样不含时间戳，可复现。
+    bool SaveStreaming(string path, List<XlsxRowSource> sources) {
+        ZipWriter zw = ZipWriter.Open(path);
+        // 先写工作表部件（zip 内条目顺序无所谓），收集实际写出
+        // 的分表清单，最后按它生成 workbook/rels/content-types。
+        List<XlsxSheet> parts = new List<XlsxSheet>();
+        int partNo = 0;
+        bool cancelled = false;
+        for (int i = 0; i < sheets.Count && !cancelled; i = i + 1) {
+            XlsxRowSource src = i < sources.Count ? sources[i] : new XlsxRowSource();
+            int total = src.RowCount();
+            int done = 0;
+            int round = 0;
+            while ((done < total || round == 0) && !cancelled) {
+                int n = total - done;
+                if (n > XlsxBook.maxRowsPerSheet) { n = XlsxBook.maxRowsPerSheet; }
+                XlsxSheet part = sheets[i];
+                if (round > 0) {
+                    part = new XlsxSheet(XlsxBook.PartName(sheets, parts, sheets[i].name));
+                    part.headerBold = false;
+                    part.freezeHeader = false;
+                }
+                parts.Add(part);
+                partNo = partNo + 1;
+                if (!XlsxBook.StreamSheetPart(part, src, done, n, zw, partNo, total)) {
+                    cancelled = true;
+                }
+                done = done + n;
+                round = round + 1;
+            }
+        }
+        if (cancelled) {
+            zw.Abort();
+            return false;
+        }
+        zw.AddEntry("[Content_Types].xml",
+            XlsxBook.ContentTypes(parts.Count).ToBytes(), 6);
+        zw.AddEntry("_rels/.rels", XlsxBook.RootRels().ToBytes(), 6);
+        zw.AddEntry("docProps/core.xml", XlsxBook.CoreProps().ToBytes(), 6);
+        zw.AddEntry("docProps/app.xml", XlsxBook.AppProps().ToBytes(), 6);
+        zw.AddEntry("xl/workbook.xml", XlsxBook.WorkbookXml(parts).ToBytes(), 6);
+        zw.AddEntry("xl/_rels/workbook.xml.rels",
+            XlsxBook.WorkbookRels(parts.Count).ToBytes(), 6);
+        zw.AddEntry("xl/styles.xml", XlsxBook.StylesXml().ToBytes(), 6);
+        zw.Close();
+        return true;
+    }
+
+    // 分表命名：`baseName` 撞上现有表或已写分表时后缀 2、3……。
+    static string PartName(List<XlsxSheet> sheets, List<XlsxSheet> parts,
+                           string baseName) {
+        string unique = baseName;
+        int n = 2;
+        while (XlsxBook.IndexOfSheet(sheets, unique) >= 0
+               || XlsxBook.IndexOfSheet(parts, unique) >= 0) {
+            unique = baseName + Convert.ToString(n);
+            n = n + 1;
+        }
+        return unique;
+    }
+
+    // 写出一个分表的 worksheet 部件：表头加粗/冻结窗格只在分表
+    // 覆盖绝对第 0 行时生效；列宽对区间前 200 行做预扫（FillRow
+    // 必须可重入）；行体攒到 32KB 冲一次压缩流。返回 false =
+    // 数据源取消/失败。
+    static bool StreamSheetPart(XlsxSheet s, XlsxRowSource src, int rowStart,
+                                int rows, ZipWriter zw, int partNo, int total) {
+        // 工作表占整个工作簿 95% 以上的字节：用 level 1 而不是 6 ——
+        // worksheet XML 高度冗余，两档压缩率差 <1%，速度快约 4 倍。
+        zw.BeginEntry("xl/worksheets/sheet" + Convert.ToString(partNo) + ".xml", 1);
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<worksheet xmlns=\"http:  // schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<sheetViews><sheetView workbookViewId=\"0\">");
+        if (s.freezeHeader && rowStart == 0 && rows > 0) {
+            sb.Append("<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>");
+            sb.Append("<selection pane=\"bottomLeft\" activeCell=\"A2\" sqref=\"A2\"/>");
+        }
+        sb.Append("</sheetView></sheetViews>");
+        int ncols = 0;
+        List<int> widths = new List<int>();
+        if (s.autoWidth && rows > 0) {
+            int preview = rows < 200 ? rows : 200;
+            List<XlsxCell> probe = new List<XlsxCell>();
+            for (int i = 0; i < preview; i = i + 1) {
+                if (src.Cancelled()) { return false; }
+                probe.Clear();
+                if (!src.FillRow(rowStart + i, probe)) { return false; }
+                if (probe.Count > ncols) { ncols = probe.Count; }
+                for (int c = 0; c < probe.Count; c = c + 1) {
+                    int len = XlsxBook.CellWidth(probe[c]);
+                    if (c >= widths.Count) { widths.Add(len); }
+                    else if (len > widths[c]) { widths[c] = len; }
+                }
+            }
+            if (ncols > 0) {
+                sb.Append("<cols>");
+                for (int c = 0; c < ncols; c = c + 1) {
+                    int w = c < widths.Count ? widths[c] : 8;
+                    w = w + 2;
+                    if (w < 10) { w = 10; }
+                    if (w > 60) { w = 60; }
+                    sb.Append("<col min=\"" + Convert.ToString(c + 1));
+                    sb.Append("\" max=\"" + Convert.ToString(c + 1));
+                    sb.Append("\" width=\"" + Convert.ToString(w));
+                    sb.Append("\" customWidth=\"1\"/>");
+                }
+                sb.Append("</cols>");
+            }
+        }
+        sb.Append("<sheetData>");
+        byte[] pre = sb.ToString().ToBytes();
+        zw.WriteData(pre, pre.Length);
+        StringBuilder body = new StringBuilder();
+        List<XlsxCell> row = new List<XlsxCell>();
+        for (int i = 0; i < rows; i = i + 1) {
+            if (src.Cancelled()) { return false; }
+            row.Clear();
+            if (!src.FillRow(rowStart + i, row)) { return false; }
+            int abs = rowStart + i;
+            body.Append("<row r=\"" + Convert.ToString(abs + 1) + "\">");
+            bool bold = s.headerBold && abs == 0;
+            for (int c = 0; c < row.Count; c = c + 1) {
+                XlsxBook.AppendCellXml(body, row[c], abs + 1, c, bold);
+            }
+            body.Append("</row>");
+            if (body.Length >= 32768) {
+                byte[] flush = body.ToString().ToBytes();
+                zw.WriteData(flush, flush.Length);
+                body = new StringBuilder();
+            }
+            if ((abs & 511) == 511) {
+                src.OnProgress(abs + 1, total);
+            }
+        }
+        if (body.Length > 0) {
+            byte[] flush = body.ToString().ToBytes();
+            zw.WriteData(flush, flush.Length);
+        }
+        if (rows > 0) {
+            src.OnProgress(rowStart + rows, total);
+        }
+        body = new StringBuilder();
+        body.Append("</sheetData></worksheet>");
+        byte[] tail = body.ToString().ToBytes();
+        zw.WriteData(tail, tail.Length);
+        zw.EndEntry();
+        return true;
+    }
+
+    // 以 (部件名, XML 文本) 组装一个 zip 条目。
+    static ZipEntry Part(string name, string xml) {
+        ZipEntry e = new ZipEntry(name);
+        e.data = xml.ToBytes();
+        return e;
+    }
+
+    // 表名在清单中的下标，不存在时为 -1。
+    static int IndexOfSheet(List<XlsxSheet> sheets, string name) {
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            if (sheets[i].name == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // ---------- OPC 部件 ----------
+
+    // [Content_Types].xml：声明各部件的内容类型。
+    static string ContentTypes(int sheetCount) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Types xmlns=\"http:  // schemas.openxmlformats.org/package/2006/content-types\">");
+        sb.Append("<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>");
+        sb.Append("<Default Extension=\"xml\" ContentType=\"application/xml\"/>");
+        sb.Append("<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>");
+        for (int i = 1; i <= sheetCount; i = i + 1) {
+            sb.Append("<Override PartName=\"/xl/worksheets/sheet");
+            sb.Append(Convert.ToString(i));
+            sb.Append(".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>");
+        }
+        sb.Append("<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>");
+        sb.Append("<Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>");
+        sb.Append("<Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/>");
+        sb.Append("</Types>");
+        return sb.ToString();
+    }
+
+    // 包级关系：workbook 与两个 docProps 部件。
+    static string RootRels() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Relationships xmlns=\"http:  // schemas.openxmlformats.org/package/2006/relationships\">");
+        sb.Append("<Relationship Id=\"rId1\" Type=\"http:  // schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>");
+        sb.Append("<Relationship Id=\"rId2\" Type=\"http:  // schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>");
+        sb.Append("<Relationship Id=\"rId3\" Type=\"http:  // schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties\" Target=\"docProps/app.xml\"/>");
+        sb.Append("</Relationships>");
+        return sb.ToString();
+    }
+
+    // 核心属性（创建者）；不写时间戳以保持输出可复现。
+    static string CoreProps() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<cp:coreProperties xmlns:cp=\"http:  // schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">");
+        sb.Append("<dc:creator>Zan</dc:creator>");
+        sb.Append("</cp:coreProperties>");
+        return sb.ToString();
+    }
+
+    // 应用属性（生成程序名）。
+    static string AppProps() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Properties xmlns=\"http:  // schemas.openxmlformats.org/officeDocument/2006/extended-properties\">");
+        sb.Append("<Application>Zan</Application>");
+        sb.Append("</Properties>");
+        return sb.ToString();
+    }
+
+    // workbook.xml：表名与 sheetId/rId 清单。
+    static string WorkbookXml(List<XlsxSheet> sheets) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<workbook xmlns=\"http:  // schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>");
+        for (int i = 0; i < sheets.Count; i = i + 1) {
+            sb.Append("<sheet name=\"" + Xlsx.EscAttr(sheets[i].name));
+            sb.Append("\" sheetId=\"" + Convert.ToString(i + 1));
+            sb.Append("\" r:id=\"rId" + Convert.ToString(i + 1) + "\"/>");
+        }
+        sb.Append("</sheets></workbook>");
+        return sb.ToString();
+    }
+
+    // workbook 的关系：每张表一个 rId，最后一个是 styles。
+    static string WorkbookRels(int sheetCount) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<Relationships xmlns=\"http:  // schemas.openxmlformats.org/package/2006/relationships\">");
+        for (int i = 1; i <= sheetCount; i = i + 1) {
+            sb.Append("<Relationship Id=\"rId" + Convert.ToString(i));
+            sb.Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet");
+            sb.Append(Convert.ToString(i));
+            sb.Append(".xml\"/>");
+        }
+        sb.Append("<Relationship Id=\"rId" + Convert.ToString(sheetCount + 1));
+        sb.Append("\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+        sb.Append("</Relationships>");
+        return sb.ToString();
+    }
+
+    // 样式表：s=0 默认，s=1 日期（numFmt 164 = yyyy-mm-dd），
+    // s=2 表头加粗，s=3 日期 + 加粗。numFmts 必须在 fonts 之前
+    // （schema 顺序），Excel 才认。
+    static string StylesXml() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<styleSheet xmlns=\"http:  // schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"yyyy\\-mm\\-dd\"/></numFmts>");
+        sb.Append("<fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts>");
+        sb.Append("<fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills>");
+        sb.Append("<borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>");
+        sb.Append("<cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>");
+        sb.Append("<cellXfs count=\"4\">");
+        sb.Append("<xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>");
+        sb.Append("<xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>");
+        sb.Append("<xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>");
+        sb.Append("<xf numFmtId=\"164\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\" applyFont=\"1\"/>");
+        sb.Append("</cellXfs>");
+        sb.Append("<cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>");
+        sb.Append("</styleSheet>");
+        return sb.ToString();
+    }
+
+    // 单张工作表的完整 worksheet XML（内存版，见 <see cref="SaveToBytes"/>）。
+    static string SheetXml(XlsxSheet s) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+        sb.Append("<worksheet xmlns=\"http:  // schemas.openxmlformats.org/spreadsheetml/2006/main\">");
+        sb.Append("<sheetViews><sheetView workbookViewId=\"0\">");
+        if (s.freezeHeader && s.RowCount() > 0) {
+            sb.Append("<pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\"/>");
+            sb.Append("<selection pane=\"bottomLeft\" activeCell=\"A2\" sqref=\"A2\"/>");
+        }
+        sb.Append("</sheetView></sheetViews>");
+        if (s.autoWidth && s.maxCols > 0) {
+            sb.Append("<cols>");
+            for (int c = 0; c < s.maxCols; c = c + 1) {
+                sb.Append("<col min=\"" + Convert.ToString(c + 1));
+                sb.Append("\" max=\"" + Convert.ToString(c + 1));
+                sb.Append("\" width=\"" + Convert.ToString(XlsxBook.ColWidth(s, c)));
+                sb.Append("\" customWidth=\"1\"/>");
+            }
+            sb.Append("</cols>");
+        }
+        sb.Append("<sheetData>");
+        for (int r = 0; r < s.rows.Count; r = r + 1) {
+            List<XlsxCell> row = s.rows[r];
+            sb.Append("<row r=\"" + Convert.ToString(r + 1) + "\">");
+            bool bold = s.headerBold && r == 0;
+            for (int c = 0; c < row.Count; c = c + 1) {
+                XlsxBook.AppendCellXml(sb, row[c], r + 1, c, bold);
+            }
+            sb.Append("</row>");
+        }
+        sb.Append("</sheetData></worksheet>");
+        return sb.ToString();
+    }
+
+    // 单个 &lt;c&gt; 单元格（含 r/s/t 属性与内容）追加到 sb。kind 0
+    // 或空文本的单元格不产生输出。
+    static void AppendCellXml(StringBuilder sb, XlsxCell cell, int row1,
+                              int col, bool bold) {
+        if (cell == null || cell.kind == 0) { return; }
+        if (cell.kind == 1 && cell.text == "") { return; }
+        string rf = "<c r=\"" + Xlsx.ColRef(col) + Convert.ToString(row1) + "\"";
+        int style = 0;
+        if (cell.kind == 4) { style = 1; }
+        if (bold) { style = style + 2; }
+        if (style > 0) { rf = rf + " s=\"" + Convert.ToString(style) + "\""; }
+        if (cell.kind == 1) {
+            sb.Append(rf + " t=\"inlineStr\"><is><t");
+            if ((int)cell.text[0] == 32
+                || (int)cell.text[cell.text.Length - 1] == 32) {
+                sb.Append(" xml:space=\"preserve\"");
+            }
+            sb.Append(">" + Xlsx.Esc(cell.text) + "</t></is></c>");
+        } else if (cell.kind == 2) {
+            sb.Append(rf + "><v>" + cell.text + "</v></c>");
+        } else if (cell.kind == 3) {
+            sb.Append(rf + " t=\"b\"><v>");
+            if (cell.flag) { sb.Append("1"); } else { sb.Append("0"); }
+            sb.Append("</v></c>");
+        } else if (cell.kind == 4) {
+            // Excel 1900 日期制：1970-01-01 = 序列 25569。
+            sb.Append(rf + "><v>" + Convert.ToString((long)cell.days + 25569) + "</v></c>");
+        }
+    }
+
+    // 单格的列宽贡献值（8 兜底；文本按显示宽、数字 +1、日期 10）。
+    static int CellWidth(XlsxCell cell) {
+        if (cell == null || cell.kind == 0) { return 8; }
+        if (cell.kind == 1) { return Xlsx.WideLen(cell.text); }
+        if (cell.kind == 2) { return cell.text.Length + 1; }
+        if (cell.kind == 4) { return 10; }
+        return 8;
+    }
+
+    // 列宽估算：内容显示宽度 + 2 的余量，夹在 [10, 60]。
+    // 只扫前 200 行——宽度是观感问题，不值得为十万行扫描。
+    static int ColWidth(XlsxSheet s, int col) {
+        int w = 8;
+        int limit = s.rows.Count;
+        if (limit > 200) { limit = 200; }
+        for (int r = 0; r < limit; r = r + 1) {
+            List<XlsxCell> row = s.rows[r];
+            if (col >= row.Count) { continue; }
+            int len = XlsxBook.CellWidth(row[col]);
+            if (len > w) { w = len; }
+        }
+        w = w + 2;
+        if (w < 10) { w = 10; }
+        if (w > 60) { w = 60; }
+        return w;
+    }
+}
+
+// Xlsx 模块的共享工具：XML 转义、列号转字母、
+// double 的精确文本化与显示宽度估算。

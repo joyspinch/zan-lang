@@ -1,0 +1,281 @@
+using System;
+using System.Threading;
+namespace System.Data;
+
+class PoolCore<T> {
+    int maxSize;
+    List<T> idle;
+    List<T> borrowed;  // 当前已借出、尚未归还的连接
+    int liveCount;  // 已打开的连接总数（空闲 + 借出）
+    int waiting;  // 当前停泊等待连接的协程数
+    Gate gate;  // 面向等待者的事件驱动唤醒（取代轮询）
+    bool closed;
+    bool openFailed;  // 自上次成功建连以来，最近一次建连是否失败
+    int skipped;  // 退避期间已快速失败的获取次数
+    int retryEvery;  // 退避期间每多少次获取放行一次真正的重试
+
+    // 创建核心，存活连接数上限为 <paramref name="maxSize"/>
+    // （至少一个）。
+    PoolCore(int maxSize) {
+        if (maxSize < 1) {
+            maxSize = 1;
+        }
+        this.maxSize = maxSize;
+        this.idle = new List<T>();
+        this.borrowed = new List<T>();
+        this.liveCount = 0;
+        this.waiting = 0;
+        this.gate = new Gate();
+        this.closed = false;
+        this.openFailed = false;
+        this.skipped = 0;
+        this.retryEvery = 64;
+    }
+
+    // 从空闲列表取出最近归还的连接，
+    // 列表为空时返回 null。调用方检查其是否仍可用，
+    // 对停泊期间已失效的连接调用 <see cref="Drop"/>
+    // （服务器重启、空闲超时）。
+    T TakeIdle() {
+        lock (this) {
+            if (this.idle.Count == 0) {
+                return null;
+            }
+            int last = this.idle.Count - 1;
+            T c = this.idle[last];
+            this.idle.RemoveAt(last);
+            this.borrowed.Add(c);
+            return c;
+        }
+    }
+
+    // 将可用连接放入空闲列表并唤醒一个等待者。
+    // 仅接受当前处于借出状态的连接，重复归还会被忽略。
+    void Pool(T c) {
+        lock (this) {
+            if (!this.RemoveBorrowed(c)) {
+                return;
+            }
+            this.idle.Add(c);
+            if (this.waiting > 0) {
+                this.gate.Signal();
+            }
+        }
+    }
+
+    // 登记一条永久离开连接池的连接（关闭、
+    // 损坏或被驱逐）：释放其槽位，等待者可新建
+    // 连接顶替它。
+    // 只有确实从借出列表里摘下来时才归还槽位：否则重复
+    // 归还（同一条连接被 Release/Drop 两次）会把 liveCount
+    // 减到实际连接数以下，池子就会开出超过 maxSize 的连接。
+    void Drop(T c) {
+        lock (this) {
+            if (!this.RemoveBorrowed(c)) {
+                return;
+            }
+            if (this.liveCount > 0) {
+                this.liveCount = this.liveCount - 1;
+            }
+            if (this.waiting > 0) {
+                this.gate.Signal();
+            }
+        }
+    }
+
+    // 记录新打开的连接已借出。在 <see cref="TryReserve"/>
+    // 预留槽位并成功打开后调用。
+    void Borrow(T c) {
+        lock (this) {
+            this.borrowed.Add(c);
+        }
+    }
+
+    // 为即将打开的连接预留槽位。预先
+    // 预留可防止并发获取者同时判定
+    // 有空位而超出上限。
+    bool TryReserve() {
+        lock (this) {
+            if (this.liveCount < this.maxSize) {
+                this.liveCount = this.liveCount + 1;
+                return true;
+            }
+            return false;
+        }
+    }
+
+    // 归还因打开失败而空出的槽位，并让等待者重试。
+    void UndoReserve() {
+        lock (this) {
+            if (this.liveCount > 0) {
+                this.liveCount = this.liveCount - 1;
+            }
+            if (this.waiting > 0) {
+                this.gate.Signal();
+            }
+        }
+    }
+
+    // 从借出列表摘除 c；c 确在列表中时返回 true
+    // （Pool/Drop 以此拒绝重复归还）。
+    bool RemoveBorrowed(T c) {
+        lock (this) {
+            int i = 0;
+            int n = this.borrowed.Count;
+            while (i < n) {
+                if (this.borrowed[i] == c) {
+                    this.borrowed.RemoveAt(i);
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+    }
+
+    // 建连失败后，本次获取是否应跳过建连尝试。
+    // 后端不可达时，池里永远没有空闲连接，于是每个获取者都会
+    // 重新尝试建连；建连失败本身是有代价的（一次失败的
+    // sqlite3_open 约 125us，网络驱动还要等一个 RTT 或超时），
+    // 代价会摊到每个请求上。失败后只放行每 <c>retryEvery</c>
+    // 次获取中的一次去真正重试，其余立即失败，让后端宕机变成
+    // 快速失败而不是吞吐塌方；重试一旦成功便恢复常态。
+    // 不依赖时钟，因此各平台行为一致。
+    bool OpenBlocked() {
+        lock (this) {
+            if (!this.openFailed) {
+                return false;
+            }
+            this.skipped = this.skipped + 1;
+            if (this.skipped >= this.retryEvery) {
+                this.skipped = 0;
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // 登记一次失败的建连，开启（或延续）退避。
+    void NoteOpenFailed() {
+        lock (this) {
+            this.openFailed = true;
+            this.skipped = 0;
+        }
+    }
+
+    // 登记一次成功的建连，结束退避。
+    void NoteOpenOk() {
+        lock (this) {
+            this.openFailed = false;
+            this.skipped = 0;
+        }
+    }
+
+    // 最近一次建连是否失败（即连接池是否处于退避中）。
+    bool OpenFailing() {
+        lock (this) {
+            return this.openFailed;
+        }
+    }
+
+    // 连接池饱和时停泊获取者的闸门。其计数
+    // 语义加上调用方的复查循环，可保证不丢失唤醒。
+    Gate Waiter() {
+        return this.gate;
+    }
+
+    // 在协程 await 闸门之前，将其登记为停泊状态，
+    // 这样释放者就知道必须发信号唤醒。
+    void EnterWait() {
+        lock (this) {
+            this.waiting = this.waiting + 1;
+        }
+    }
+
+    // 注销从闸门唤醒的协程。
+    void LeaveWait() {
+        lock (this) {
+            if (this.waiting > 0) {
+                this.waiting = this.waiting - 1;
+            }
+        }
+    }
+
+    // 空闲（已入池、立即可用）连接数。
+    int IdleCount() {
+        lock (this) {
+            return this.idle.Count;
+        }
+    }
+
+    // 存活连接总数（空闲 + 借出）。
+    int LiveCount() {
+        lock (this) {
+            return this.liveCount;
+        }
+    }
+
+    // 当前停泊等待连接的协程数。
+    int WaitingCount() {
+        lock (this) {
+            return this.waiting;
+        }
+    }
+
+    // 最大并发存活连接数。
+    int MaxSize() {
+        return this.maxSize;
+    }
+
+    // 连接池关闭后为 true。
+    bool IsClosed() {
+        lock (this) {
+            return this.closed;
+        }
+    }
+
+    // 标记连接池已关闭：获取者返回 null，归还的
+    // 连接将被销毁而不入池。
+    void MarkClosed() {
+        lock (this) {
+            this.closed = true;
+        }
+    }
+
+    // 唤醒所有停泊的等待者；每个都会重新检查已关闭的池并
+    // 返回 null。
+    void WakeAll() {
+        int n = 0;
+        lock (this) {
+            n = this.waiting;
+        }
+        for (int k = 0; k < n; k = k + 1) {
+            this.gate.Signal();
+        }
+    }
+
+    // 池饱和时的一轮有界等待，所有驱动连接池共用。
+    // 先停泊在事件门上（零轮询，归还即醒；每轮门等自带
+    // <see cref="PoolWait.GateWaitMs"/> 看门狗，Signal 丢失也必然复查）；
+    // 门等次数用尽仍拿不到——说明持有者迟迟不还：健康系统里一次
+    // 归还在毫秒级——转为短轮询直至预算耗尽，返回 false 让调用方
+    // 快速失败（应答「数据库暂不可用」），绝不定死。等待次数与预算
+    // 记在调用方自备的 <see cref="PoolWait"/> 里，跨整个获取循环累计。
+    async bool WaitForRelease(PoolWait w) {
+        if (w.gated < PoolWait.MaxGateWaits) {
+            this.EnterWait();
+            await this.Waiter().Wait(PoolWait.GateWaitMs);
+            this.LeaveWait();
+            w.gated = w.gated + 1;
+            return true;
+        }
+        await Task.Delay(PoolWait.PollStepMs);
+        w.budget = w.budget - PoolWait.PollStepMs;
+        return w.budget > 0;
+    }
+}
+
+// 一个获取者在饱和等待期的进度：已发生的门等次数与剩余的
+// 轮询预算。获取循环外创建一次，传给每一轮
+// <see cref="PoolCore{T}.WaitForRelease"/>；策略常数也集中在这里，
+// 是全仓库连接池唯一的饱和政策出处。
