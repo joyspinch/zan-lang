@@ -404,8 +404,10 @@ if (Test-Path $mcpSrc) {
     # judge the result by the exit code.
     $mcpLog = Join-Path $root '_scratch\publish_zan_mcp.log'
     New-Item -ItemType Directory -Force -Path (Split-Path $mcpLog) | Out-Null
+    $mcpSources = @(Get-ChildItem -Path (Split-Path -Parent $mcpSrc) -Filter *.zan | Select-Object -ExpandProperty FullName)
+    $mcpArgs = @($mcpSources) + @('--auto-stdlib', '--publish', '-o', $mcpExe)
     $mcpProc = Start-Process -FilePath $zancExe -Wait -PassThru -NoNewWindow `
-        -ArgumentList @($mcpSrc, '--auto-stdlib', '--publish', '-o', $mcpExe) `
+        -ArgumentList $mcpArgs `
         -RedirectStandardOutput $mcpLog -RedirectStandardError "$mcpLog.err"
     if ($mcpProc.ExitCode -ne 0) {
         Write-Output "PUBLISH_WARN: zanc exited $($mcpProc.ExitCode) building zan-mcp.exe; see $mcpLog.err"
