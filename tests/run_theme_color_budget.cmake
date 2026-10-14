@@ -22,8 +22,6 @@ cmake_policy(SET CMP0007 NEW)
 # keep ThemeDoc, ThemeJson, and this note in sync.
 set(_budget
   "packages/Zan.Gui/src/Gui/Backend/UiDriver.zan=12"
-  "packages/Zan.Gui/src/Gui/Component/PropertyGrid.zan=7"
-  "packages/Zan.Gui/src/Gui/Designer/Designer.Inspector.zan=2"
 )
 
 set(_members "primary|primaryHover|primaryPressed|info|infoHover|infoPressed|success|successHover|successPressed|warning|warningHover|warningPressed|error|errorHover|errorPressed|textPrimary|textSecondary|textTertiary|textDisabled|textInverse|bgPrimary|bgSecondary|bgTertiary|bgHover|bgActive|bgDisabled|borderPrimary|borderSecondary|borderHover|borderFocus|divider|shadowColor|scrollbar|scrollbarHover|tooltipBg|tooltipBorder|tooltipText|glassTint|glassChromeTint")
