@@ -8,7 +8,7 @@
 |---|---|
 | `BigNum.zan` | 千进制后缀格式化（1.2K / 3.4M / 5.6B … Qa..Dc）+ 千分位分组文本 |
 | `Curves.zan` | 指数成本（下一件/批量总价）、产出速率、逐级复合成长曲线，long 饱和钳制 |
-| `Wallet.zan` | 多资源账本：Define/Add/TrySpend/TrySpendAll，cap 饱和、变更快照轮询、存档文本往返 |
+| `Wallet.zan` | 多资源账本：Define/Add/TrySpend/TrySpendItems，cap 饱和、变更快照轮询、存档文本往返 |
 | `Offline.zan` | 离线收益结算：24h 缺省封顶、时钟回拨安全、静默阈值与逐步/闭式判定 |
 
 约定：成本/产出曲线参数一旦随版本发布就不可再改（会破坏存量存档的
