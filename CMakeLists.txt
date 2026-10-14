@@ -4941,9 +4941,9 @@ endif()
 # ---- zanfmt (code formatter, written in Zan) ----
 set(_zanfmt_exe ${CMAKE_BINARY_DIR}/zanfmt${_exe_ext})
 add_custom_command(OUTPUT ${_zanfmt_exe}
-    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/fmt/zanfmt.zan
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/fmt/ZanFmt.zan
             --auto-stdlib -o ${_zanfmt_exe}
-    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/fmt/zanfmt.zan
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/fmt/ZanFmt.zan
     COMMENT "Building zanfmt from Zan source")
 # The target cannot be called `zanfmt`: on platforms with no executable suffix
 # that is also the name of the file the custom command writes, and Ninja then
@@ -4962,9 +4962,9 @@ add_test(NAME tool_zanfmt
 # ---- zandoc (documentation generator, written in Zan) ----
 set(_zandoc_exe ${CMAKE_BINARY_DIR}/zandoc${_exe_ext})
 add_custom_command(OUTPUT ${_zandoc_exe}
-    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/doc/zandoc.zan
+    COMMAND $<TARGET_FILE:zanc> ${CMAKE_SOURCE_DIR}/src/doc/ZanDoc.zan ${CMAKE_SOURCE_DIR}/src/doc/DocMember.zan
             --auto-stdlib -o ${_zandoc_exe}
-    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/doc/zandoc.zan
+    DEPENDS zanc ${CMAKE_SOURCE_DIR}/src/doc/ZanDoc.zan ${CMAKE_SOURCE_DIR}/src/doc/DocMember.zan
     COMMENT "Building zandoc from Zan source")
 add_custom_target(zandoc_tool ALL DEPENDS ${_zandoc_exe})
 

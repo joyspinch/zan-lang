@@ -46,7 +46,7 @@ if [ -z "$exe" ]; then
 fi
 if [ -z "$exe" ] || [ ! -x "$exe" ]; then
     echo "zan-mcp not found. Build it first:" >&2
-    echo "  build/zanc --stdlib-path stdlib tools/mcp_server/mcp_server.zan -o tools/zan-mcp" >&2
+    echo "  build/zanc --stdlib-path stdlib tools/mcp_server/McpServer.zan -o tools/zan-mcp" >&2
     echo "(or pass --exe <path>)" >&2
     exit 1
 fi

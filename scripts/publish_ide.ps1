@@ -389,7 +389,7 @@ if (Test-Path $gallerySeed) {
 # assistance, it does not break the IDE.
 Write-Output "[4/6] Building the AI onboarding pack ..."
 $aiPack = Join-Path $root 'tools\ai_pack'
-$mcpSrc = Join-Path $root 'tools\mcp_server\mcp_server.zan'
+$mcpSrc = Join-Path $root 'tools\mcp_server\McpServer.zan'
 $distTools = Join-Path $dist 'tools'
 New-Item -ItemType Directory -Force -Path $distTools | Out-Null
 $mcpExe = Join-Path $distTools 'zan-mcp.exe'
@@ -413,10 +413,10 @@ if (Test-Path $mcpSrc) {
     if (Test-Path $mcpExe) {
         Write-Output "PUBLISH_MCP_OK -> $mcpExe"
     } else {
-        Write-Output "PUBLISH_WARN: could not build tools\zan-mcp.exe; AI clients must run tools\mcp_server\mcp_server.zan themselves"
+        Write-Output "PUBLISH_WARN: could not build tools\zan-mcp.exe; AI clients must run tools\mcp_server\McpServer.zan themselves"
     }
 } else {
-    Write-Output "PUBLISH_WARN: tools\mcp_server\mcp_server.zan missing; no MCP server published"
+    Write-Output "PUBLISH_WARN: tools\mcp_server\McpServer.zan missing; no MCP server published"
 }
 
 if (Test-Path (Join-Path $aiPack 'AGENTS.md')) {
