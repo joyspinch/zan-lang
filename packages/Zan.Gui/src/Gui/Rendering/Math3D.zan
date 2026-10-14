@@ -208,17 +208,27 @@ class Mat4 {
     }
 }
 
-// 网格构建器：交错顶点（px,py,pz, nx,ny,nz, u,v，每顶点 8 个 float）
-// + ushort 索引，与运行时 3D 管线的顶点布局逐字节对应。Build 之后可复用
-// Upload 到不同表面。
+// 网格构建器：交错顶点 + ushort 索引，与运行时 3D 管线的顶点布局逐字节
+// 对应。默认每顶点 8 个 float（px,py,pz, nx,ny,nz, u,v）；一旦调用过
+// <see cref="VertexC"/> 即切换为顶点色布局（12 float，尾随 r,g,b,a），
+// <see cref="Canvas.MeshUpload"/> 会按布局封送。两种布局不得混用——
+// 同一网格只走一种 Vertex*。Build 之后可复用 Upload 到不同表面。
 class Mesh3D {
     List<float> v;
     List<ushort> idx;
+    bool colored;
 
     public Mesh3D() {
         this.v = new List<float>();
         this.idx = new List<ushort>();
+        this.colored = false;
     }
+
+    // 本网格是否为顶点色布局（12 float/顶点）。
+    public bool Colored() { return this.colored; }
+
+    // 每顶点 float 数（8 = 无顶点色，12 = 顶点色）。
+    public int StrideFloats() { return this.colored ? 12 : 8; }
 
     // 追加一个顶点，返回其索引。
     public int Vertex(float px, float py, float pz,
@@ -228,6 +238,20 @@ class Mesh3D {
         this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
         this.v.Add(u); this.v.Add(vv);
         return this.v.Count / 8 - 1;
+    }
+
+    // 追加一个带颜色的顶点（r,g,b,a 线性 0..1），网格切换为顶点色布局，
+    // 返回其索引。颜色与绘制时的 uColor/tint、纹理相乘。
+    public int VertexC(float px, float py, float pz,
+                       float nx, float ny, float nz,
+                       float u, float vv,
+                       float r, float g, float b, float a) {
+        this.colored = true;
+        this.v.Add(px); this.v.Add(py); this.v.Add(pz);
+        this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
+        this.v.Add(u); this.v.Add(vv);
+        this.v.Add(r); this.v.Add(g); this.v.Add(b); this.v.Add(a);
+        return this.v.Count / 12 - 1;
     }
 
     // 按逆时针（从观察方向看）追加一个三角形，保证正面朝外。
@@ -243,7 +267,7 @@ class Mesh3D {
         this.Triangle(a, c, d);
     }
 
-    public int VertexCount() { return this.v.Count / 8; }
+    public int VertexCount() { return this.v.Count / this.StrideFloats(); }
     public int IndexCount() { return this.idx.Count; }
 
     // 交错顶点缓冲（Canvas.MeshUpload 封送用）。
@@ -260,6 +284,47 @@ class Mesh3D {
         ushort[] outi = new ushort[n];
         for (int i = 0; i < n; i = i + 1) { outi[i] = this.idx[i]; }
         return outi;
+    }
+
+    // 以单位立方体（边长 2，中心原点）填充此网格并给全部顶点同一颜色
+    // （r,g,b,a 线性 0..1），六面 UV 全贴。网格进入顶点色布局。
+    public void AddCubeColored(float r, float g, float b, float a) {
+        // +z front
+        int a0 = this.VertexC(-1, -1, 1, 0, 0, 1, 0, 1, r, g, b, a);
+        int b0 = this.VertexC(1, -1, 1, 0, 0, 1, 1, 1, r, g, b, a);
+        int c0 = this.VertexC(1, 1, 1, 0, 0, 1, 1, 0, r, g, b, a);
+        int d0 = this.VertexC(-1, 1, 1, 0, 0, 1, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
+        // -z back
+        a0 = this.VertexC(1, -1, -1, 0, 0, -1, 0, 1, r, g, b, a);
+        b0 = this.VertexC(-1, -1, -1, 0, 0, -1, 1, 1, r, g, b, a);
+        c0 = this.VertexC(-1, 1, -1, 0, 0, -1, 1, 0, r, g, b, a);
+        d0 = this.VertexC(1, 1, -1, 0, 0, -1, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
+        // +x right
+        a0 = this.VertexC(1, -1, 1, 1, 0, 0, 0, 1, r, g, b, a);
+        b0 = this.VertexC(1, -1, -1, 1, 0, 0, 1, 1, r, g, b, a);
+        c0 = this.VertexC(1, 1, -1, 1, 0, 0, 1, 0, r, g, b, a);
+        d0 = this.VertexC(1, 1, 1, 1, 0, 0, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
+        // -x left
+        a0 = this.VertexC(-1, -1, -1, -1, 0, 0, 0, 1, r, g, b, a);
+        b0 = this.VertexC(-1, -1, 1, -1, 0, 0, 1, 1, r, g, b, a);
+        c0 = this.VertexC(-1, 1, 1, -1, 0, 0, 1, 0, r, g, b, a);
+        d0 = this.VertexC(-1, 1, -1, -1, 0, 0, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
+        // +y top
+        a0 = this.VertexC(-1, 1, 1, 0, 1, 0, 0, 1, r, g, b, a);
+        b0 = this.VertexC(1, 1, 1, 0, 1, 0, 1, 0, r, g, b, a);
+        c0 = this.VertexC(1, 1, -1, 0, 1, 0, 1, 0, r, g, b, a);
+        d0 = this.VertexC(-1, 1, -1, 0, 1, 0, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
+        // -y bottom
+        a0 = this.VertexC(-1, -1, -1, 0, -1, 0, 0, 1, r, g, b, a);
+        b0 = this.VertexC(1, -1, -1, 0, -1, 0, 1, 1, r, g, b, a);
+        c0 = this.VertexC(1, -1, 1, 0, -1, 0, 1, 0, r, g, b, a);
+        d0 = this.VertexC(-1, -1, 1, 0, -1, 0, 0, 0, r, g, b, a);
+        this.Quad(a0, b0, c0, d0);
     }
 
     // 以单位立方体（边长 2，中心原点）填充此网格，六面 UV 全贴。
@@ -290,7 +355,7 @@ class Mesh3D {
         this.Quad(a, b, c, d);
         // +y top
         a = this.Vertex(-1, 1, 1, 0, 1, 0, 0, 1);
-        b = this.Vertex(1, 1, 1, 0, 1, 0, 1, 1);
+        b = this.Vertex(1, 1, 1, 0, 1, 0, 1, 0);
         c = this.Vertex(1, 1, -1, 0, 1, 0, 1, 0);
         d = this.Vertex(-1, 1, -1, 0, 1, 0, 0, 0);
         this.Quad(a, b, c, d);

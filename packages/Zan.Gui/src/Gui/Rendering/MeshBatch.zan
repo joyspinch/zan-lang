@@ -1,0 +1,126 @@
+using System;
+
+namespace Gui;
+
+// 打包 3D 实例批：把一帧的全部网格实例（同网格 = 一组，一次
+// DrawElementsInstanced）装进一块预分配的 NativeMemory 缓冲，跨帧复用
+// ——热路径零分配。Draw 时按 (mesh, texture) 连段分组提交：Begin 一次
+// （批内只清一次深度）→ 每组一次 <see cref="Canvas.DrawMesh3DBatch"/>
+// → End 一次（整批恰好一次 Finish）。批内实例与跨组之间都做深度解析。
+// 建议按组连续 Add（RTS 场景天然如此：按单位类型装填）；乱序 Add 也
+// 正确，只是多出几次提交。
+// 每实例 20 个 float：mvp 16（列主序，Mat4.ToColumnMajor() 组出）+
+// tint rgba 4（线性 0..1，由 0xAARRGGBB 打包色展开）。单次提交上限
+// 1024 实例（运行时实例缓冲容量），超出自动分段。
+class MeshBatch {
+    nint buf;
+    int capInstances;
+    int count;
+    List<int> meshIds;
+    List<int> texIds;
+    List<string> texKeys;
+    int lastTexKey;
+
+    MeshBatch() {
+        this.buf = 0;
+        this.capInstances = 0;
+        this.count = 0;
+        this.meshIds = new List<int>();
+        this.texIds = new List<int>();
+        this.texKeys = new List<string>();
+        this.lastTexKey = -1;
+    }
+
+    // 分配可容纳 capInstances 个实例的批缓冲。
+    public static MeshBatch Create(int capInstances) {
+        if (capInstances <= 0) { return null; }
+        MeshBatch mb = new MeshBatch();
+        mb.buf = NativeMemory.Alloc(capInstances * 80);
+        mb.capInstances = capInstances;
+        mb.count = 0;
+        return mb;
+    }
+
+    // 清空批（不释放缓冲），开始装新一帧。
+    public void Begin() {
+        this.count = 0;
+        this.meshIds.Clear();
+        this.texIds.Clear();
+        this.texKeys.Clear();
+        this.lastTexKey = -1;
+    }
+
+    // 本批已装填的实例数。
+    public int Count() {
+        return this.count;
+    }
+
+    // 装一个实例。缓冲满时静默丢弃（容量在 Create 时定）。
+    // mvpColumnMajor 为 16 个 float（列主序）；tintArgb 为 0xAARRGGBB。
+    public void Add(int mesh, string texture, float[] mvpColumnMajor,
+                    int tintArgb) {
+        if (this.count >= this.capInstances) { return; }
+        if (mvpColumnMajor == null || mvpColumnMajor.Length < 16) { return; }
+        nint p = this.buf + this.count * 80;
+        Span<float> sf = new Span<float>(p, 20);
+        for (int i = 0; i < 16; i = i + 1) { sf[i] = mvpColumnMajor[i]; }
+        sf[16] = (float)((tintArgb >> 16) & 255) / 255.0f;
+        sf[17] = (float)((tintArgb >> 8) & 255) / 255.0f;
+        sf[18] = (float)(tintArgb & 255) / 255.0f;
+        sf[19] = (float)((tintArgb >> 24) & 255) / 255.0f;
+        int texId = this.lastTexKey;
+        if (texId < 0 || texId >= this.texKeys.Count ||
+            this.texKeys[texId] != texture) {
+            texId = -1;
+            for (int i = 0; i < this.texKeys.Count; i = i + 1) {
+                if (this.texKeys[i] == texture) { texId = i; break; }
+            }
+            if (texId < 0) {
+                this.texKeys.Add(texture);
+                texId = this.texKeys.Count - 1;
+            }
+            this.lastTexKey = texId;
+        }
+        this.meshIds.Add(mesh);
+        this.texIds.Add(texId);
+        this.count = this.count + 1;
+    }
+
+    // 整批提交到画布：Begin → 按 (mesh, texture) 连段分组提交 → End。
+    // CPU 兜底档（后端不支持 3D）整批跳过，调用方换 2D 回退。
+    public void Draw(Canvas c) {
+        if (this.count <= 0) { return; }
+        if (c.DrawMesh3DBatchBegin() != 1) { return; }
+        int i = 0;
+        while (i < this.count) {
+            int mesh = this.meshIds[i];
+            int texId = this.texIds[i];
+            int j = i;
+            while (j < this.count && this.meshIds[j] == mesh &&
+                   this.texIds[j] == texId) {
+                j = j + 1;
+            }
+            int run = j - i;
+            int offset = 0;
+            while (run > 0) {
+                int chunk = run > 1024 ? 1024 : run;
+                c.DrawMesh3DBatch(mesh, this.texKeys[texId],
+                                  this.buf + (i + offset) * 80, chunk);
+                offset = offset + chunk;
+                run = run - chunk;
+            }
+            i = j;
+        }
+        c.DrawMesh3DBatchEnd();
+    }
+
+    // 释放底层缓冲。此后本对象不可再用。
+    public void Dispose() {
+        if (this.buf != 0) {
+            NativeMemory.Free(this.buf);
+            this.buf = 0;
+        }
+        this.capInstances = 0;
+        this.count = 0;
+    }
+}

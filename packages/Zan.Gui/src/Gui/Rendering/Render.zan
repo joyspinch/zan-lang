@@ -1133,31 +1133,48 @@ class Canvas {
     // DrawMesh3D、再画 2D 前景，一切都走同一个后端 seam。只有 GPU 后端
     // 实现 3D；CPU 兜底档上 DrawMesh3D 返回 0 且不落像素，应用据此换
     // 2D 表示（例如投影多边形）或直接留空。
+    // 批量通路（DrawMesh3DBatch*）与此不同：一次 Begin 清一次深度，
+    // 批内实例之间、跨网格组之间都做深度解析，整批一次 Finish——
+    // 几十至几百同网格实例（RTS 单位/体素单元）走批量，单个大件走
+    // DrawMesh3D。批活跃期间不要混用 DrawMesh3D/MeshUpload。
 
     [DllImport("zan_game")]
-    static extern int zan_game_mesh_create(int surfaceId, nint verts,
-        int count, nint indices, int indexCount);
+    static extern int zan_game_mesh_create_ex(int surfaceId, nint verts,
+        int count, nint indices, int indexCount, int flags);
 
     [DllImport("zan_game")]
     static extern int zan_game_draw3d(int surfaceId, int mesh, nint mvp,
         int color, string texture);
 
-    // 上传网格，返回 mesh id（0 = 失败/当前后端不支持）。
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch_begin(int surfaceId);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch(int surfaceId, int mesh,
+        string texture, nint instances, int count);
+
+    [DllImport("zan_game")]
+    static extern int zan_game_draw3d_batch_end(int surfaceId);
+
+    // 上传网格，返回 mesh id（0 = 失败/当前后端不支持）。按网格自身
+    // 布局封送（8 或 12 float/顶点，见 Math3D.zan 的 Vertex/VertexC）。
     // 数据被运行时复制，Upload 返回后即可释放 Mesh3D 的缓冲。mesh id
     // 在切换 RenderBackend 后失效（需要重新 Upload）。
     public int MeshUpload(Mesh3D mesh) {
         int nv = mesh.VertexCount();
         int ni = mesh.IndexCount();
         if (nv <= 0 || ni <= 0) { return 0; }
+        int stride = mesh.StrideFloats();
         float[] verts = mesh.VertexArray();
         ushort[] indices = mesh.IndexArray();
-        nint vp = NativeMemory.Alloc(nv * 32);
-        Span<float> vs = new Span<float>(vp, nv * 8);
-        for (int i = 0; i < nv * 8; i = i + 1) { vs[i] = verts[i]; }
+        nint vp = NativeMemory.Alloc(nv * stride * 4);
+        Span<float> vs = new Span<float>(vp, nv * stride);
+        for (int i = 0; i < nv * stride; i = i + 1) { vs[i] = verts[i]; }
         nint ip = NativeMemory.Alloc(ni * 2);
         Span<ushort> ispan = new Span<ushort>(ip, ni);
         for (int i = 0; i < ni; i = i + 1) { ispan[i] = indices[i]; }
-        int id = zan_game_mesh_create(surfaceId, vp, nv, ip, ni);
+        int id = zan_game_mesh_create_ex(surfaceId, vp, nv, ip, ni,
+            mesh.Colored() ? 1 : 0);
         NativeMemory.Free(vp);
         NativeMemory.Free(ip);
         return id;
@@ -1177,5 +1194,31 @@ class Canvas {
         int ok = zan_game_draw3d(surfaceId, mesh, mp, color, texture);
         NativeMemory.Free(mp);
         return ok;
+    }
+
+    // 开始一批实例绘制：清一次深度缓冲、绑定深度/裁剪状态。之后可对
+    // 多个 (mesh, texture) 组各调一次 <see cref="DrawMesh3DBatch"/>，
+    // 最后必须 <see cref="DrawMesh3DBatchEnd"/>。返回 1 = 批已开始，
+    // 0 = 当前后端不支持 3D（调用方整批跳过，换 2D 回退）。
+    public int DrawMesh3DBatchBegin() {
+        return zan_game_draw3d_batch_begin(surfaceId);
+    }
+
+    // 提交一组同网格实例：instances 每实例 20 个 float——mvp 16 个
+    // （列主序，Mat4.ToColumnMajor() 组出）+ tint rgba 4 个（线性
+    // 0..1）；count 为实例数，单次上限 1024（超出由调用方分段）。
+    // 批内与跨组都按深度解析。返回 1 = 已提交。参与损伤哈希（op 42）。
+    public int DrawMesh3DBatch(int mesh, string texture, nint instances,
+                               int count) {
+        if (instances == 0 || count <= 0) { return 0; }
+        App.PaintHashOp(42, mesh, count, 0, 0);
+        return zan_game_draw3d_batch(surfaceId, mesh, texture, instances,
+                                     count);
+    }
+
+    // 结束本批实例绘制：恢复 2D 状态，整批恰好一次 Finish。返回 1 =
+    // 正常收束（无批活跃时返回 0）。
+    public int DrawMesh3DBatchEnd() {
+        return zan_game_draw3d_batch_end(surfaceId);
     }
 }
