@@ -1,0 +1,55 @@
+using System;
+using System.Json;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+namespace System.Data.ZanDb;
+
+class ZanDbIoState {
+    object sync;
+    nint socket;
+    long deadline;
+    CancellationToken cancellation;
+    bool active;
+    bool expired;
+    bool canceled;
+
+    ZanDbIoState(TcpClient client, int timeoutMs, CancellationToken cancellation) {
+        this.sync = new object();
+        this.socket = client.GetSocket();
+        this.deadline = Stopwatch.GetMilliseconds() + timeoutMs;
+        this.cancellation = cancellation;
+        this.active = true;
+        this.expired = false;
+        this.canceled = false;
+    }
+
+    void Check() {
+        lock (this.sync) {
+            if (!this.active) { return; }
+            if (this.cancellation != null && this.cancellation.IsCancellationRequested) {
+                this.canceled = true;
+            }
+            if (Stopwatch.GetMilliseconds() >= this.deadline) { this.expired = true; }
+            if (this.expired || this.canceled) {
+                // 停机唤醒所有挂起的重叠/就绪 I/O 操作；由持有者在等待结束后关闭句柄。
+                Socket.ShutdownBoth(this.socket);
+            }
+        }
+    }
+
+    void Finish() {
+        this.Check();
+        lock (this.sync) { this.active = false; }
+    }
+
+    void ThrowIfAborted() {
+        lock (this.sync) {
+            if (this.canceled) { throw new IOException("ZanDB request canceled; write outcome may be unknown."); }
+            if (this.expired) { throw new TimeoutException("ZanDB frame deadline exceeded; write outcome may be unknown."); }
+        }
+    }
+}
+
+// 协程帧管理其超时时限；完成时注销定时器回调。

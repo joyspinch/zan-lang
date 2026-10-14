@@ -1,0 +1,171 @@
+using System;
+using System.IO;
+namespace System.Data.ZanDb;
+
+class SegCursor {
+    [DllImport("crt", EntryPoint = "memcmp")]
+    static extern int MemCmp(nint a, string b, long n);
+
+    SegmentFile seg;
+    ByteBuffer buf;
+    int blockIdx;
+    bool valid;
+    string curKey;
+    bool keyMat;
+    string curVal;
+    bool valMat;
+    int curOp;
+    int curKeyOff;
+    int curKeyLen;
+    int curValOff;
+    int curValLen;
+
+    SegCursor(SegmentFile seg) {
+        this.seg = seg;
+        this.buf = null;
+        this.blockIdx = 0;
+        this.valid = false;
+        this.curKey = "";
+        this.keyMat = false;
+        this.curVal = "";
+        this.valMat = false;
+        this.curOp = 0;
+        this.curKeyOff = 0;
+        this.curKeyLen = 0;
+        this.curValOff = 0;
+        this.curValLen = 0;
+    }
+
+    // 当前记录的键（Valid() 为假时无意义）。首次调用物化并缓存。
+    string Key() {
+        if (!this.keyMat) {
+            this.curKey = this.buf.Str(this.curKeyOff, this.curKeyLen);
+            this.keyMat = true;
+        }
+        return this.curKey;
+    }
+
+    // 当前记录的值（墓碑时为空串）。首次调用物化并缓存。
+    string Val() {
+        if (!this.valMat) {
+            this.curVal = this.curValLen > 0
+                ? this.buf.Str(this.curValOff, this.curValLen) : "";
+            this.valMat = true;
+        }
+        return this.curVal;
+    }
+
+    // 当前记录类型：1=put、2=墓碑。
+    int Op() { return this.curOp; }
+
+    // 是否还有未消费的记录。
+    bool Valid() { return this.valid; }
+
+    // 当前键在块内的起始偏移（Valid() 为假时无意义）。
+    int KeyOff() { return this.curKeyOff; }
+
+    // 当前键的字节长度。
+    int KeyLen() { return this.curKeyLen; }
+
+    // 当前值在块内的起始偏移（墓碑时无意义）。
+    int ValOff() { return this.curValOff; }
+
+    // 当前值的字节长度（墓碑为 0）。
+    int ValLen() { return this.curValLen; }
+
+    // 当前块缓冲（键/值偏移基于它；回调期间可随机读）。
+    ByteBuffer Block() { return this.buf; }
+
+    // 当前键与 other 的序数比较：块内指针 memcmp 前缀、
+    // 长度定序——与 String.CompareOrdinal 同序（本层键为字节串，
+    // 每字符一字节），零分配。
+    int CmpKeyRaw(string other) {
+        int n = this.curKeyLen < other.Length ? this.curKeyLen : other.Length;
+        if (n > 0) {
+            nint kp = this.buf.Raw() + this.curKeyOff;
+            int r = MemCmp(kp, other, n);
+            if (r != 0) { return r; }
+        }
+        return this.curKeyLen - other.Length;
+    }
+
+    // 打开游标并定位到第一个 key ≥ fromKey 的记录；
+    // 段为空或全部记录都小于 fromKey 时 Valid() 为假。
+    static SegCursor Open(SegmentFile seg, string fromKey) {
+        SegCursor c = new SegCursor(seg);
+        c.blockIdx = seg.BlockFor(fromKey);
+        c.LoadCur();
+        while (c.valid && c.CmpKeyRaw(fromKey) < 0) {
+            c.Next();
+        }
+        return c;
+    }
+
+    // 加载 blockIdx 块并裸解析其首条记录；越界/腐坏/空块置 invalid。
+    // 块缓冲跨块复用（段不可变，重读只走 IO 不再分配）。
+    bool LoadCur() {
+        this.valid = false;
+        this.curKey = "";
+        this.keyMat = false;
+        this.curVal = "";
+        this.valMat = false;
+        this.curOp = 0;
+        if (this.blockIdx >= this.seg.BlockCount()) { return false; }
+        ByteBuffer b;
+        if (this.buf != null) {
+            // 复用现有缓冲：LoadBlockReuse 失败时不动调用方缓冲，
+            // 所有权仍在游标手里，Free() 时统一释放。
+            b = this.seg.LoadBlockReuse(this.blockIdx, this.buf);
+        } else {
+            b = this.seg.LoadBlock(this.blockIdx);
+        }
+        if (b == null) { return false; }
+        this.buf = b;
+        int ko;
+        int kl;
+        int vo;
+        int vl;
+        int rop;
+        if (!SegmentFile.NextRecordRaw(b, out ko, out kl, out vo, out vl, out rop)) {
+            // 空块（良构段不应出现）：按段耗尽处理。
+            this.buf.Free();
+            this.buf = null;
+            return false;
+        }
+        this.curKeyOff = ko;
+        this.curKeyLen = kl;
+        this.curValOff = vo;
+        this.curValLen = vl;
+        this.curOp = rop;
+        this.valid = true;
+        return true;
+    }
+
+    // 推进到下一条记录（惰性缓存一并失效）；段耗尽后 Valid() 变假。
+    void Next() {
+        if (!this.valid) { return; }
+        int ko;
+        int kl;
+        int vo;
+        int vl;
+        int rop;
+        if (SegmentFile.NextRecordRaw(this.buf, out ko, out kl, out vo, out vl, out rop)) {
+            this.curKeyOff = ko;
+            this.curKeyLen = kl;
+            this.curValOff = vo;
+            this.curValLen = vl;
+            this.curOp = rop;
+            this.keyMat = false;
+            this.valMat = false;
+            return;
+        }
+        this.blockIdx = this.blockIdx + 1;
+        this.LoadCur();
+    }
+
+    // 释放当前块缓冲；之后 Valid() 恒为假。
+    void Free() {
+        if (this.buf != null) { this.buf.Free(); this.buf = null; }
+        this.valid = false;
+    }
+}
