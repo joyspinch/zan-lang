@@ -1,0 +1,41 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Http;
+
+class HttpDeadlineSlot {
+    nint sock;
+    long deadline;
+    int generation;
+    bool active;
+    bool fired;
+    long totalDeadline;
+
+    // 新槽位：generation 从 1 起，槽位复用时递增。
+    HttpDeadlineSlot(nint sock, long deadline) {
+        this.sock = sock;
+        this.deadline = deadline;
+        this.generation = 1;
+        this.active = true;
+        this.fired = false;
+        this.totalDeadline = 0;
+    }
+}
+
+// 按连接管理的请求截止时间，由整个进程中的一个协程统一
+// 扫描。
+// 无法直接在 receive 上设置超时：连接协程
+// 停靠在 IO reactor 中，没有其他机制驱动它。因此每个连接
+// 注册一个截止时间槽位，单个扫描器每秒唤醒一次，对超时者
+// 执行挂断。这使每个请求只需 O(1) 开销（一次整数写入），
+// 整个进程一个协程，而非每个连接一个定时器协程。
+// 扫描器对套接字执行 shutdown 而非 close，因此等待中的
+// 协程会因读取到 0 字节被唤醒，沿正常断连路径
+// 展开（释放槽位）；若在此处直接关闭描述符，会卡住
+// 该协程并泄漏槽位。
+// 槽位表是进程级的，而连接协程可能跑在不同 worker 线程上
+// （<c>--async-workers</c>），因此每一处表访问都在
+// <c>lock (slots)</c> 里：否则 <see cref="Arm"/> 的 <c>slots.Add</c>
+// 会与另一个线程的 <c>slots[slot]</c> 同时发生，或两个连接
+// 从自由列表拿到同一个槽位。临界区里只有列表操作和
+// shutdown 系统调用，不包含 await。

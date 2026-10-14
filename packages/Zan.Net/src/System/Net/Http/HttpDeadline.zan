@@ -1,0 +1,160 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Net.Http;
+
+class HttpDeadline {
+    static List<HttpDeadlineSlot> slots = new List<HttpDeadlineSlot>();
+    static List<int> freeSlots = new List<int>();
+    static bool sweeping = false;
+    static int activeCount = 0;
+    // 仅作扫描器的缓存；Touch 会先刷新它，不能使用上一次 sweep 的旧值。
+    static long nowMs = 0;
+
+    // 注册一个连接并返回带 generation 的 token；
+    // 截止时间被禁用（timeoutMs &lt;= 0）时返回 null。
+    static HttpDeadlineToken Arm(nint sock, int timeoutMs) {
+        return HttpDeadline.Arm(sock, timeoutMs, 0);
+    }
+
+    // 注册阶段 deadline，并可附带从 Arm 时刻起的 total budget。
+    // totalMs &lt;= 0 表示不设总预算。
+    static HttpDeadlineToken Arm(nint sock, int timeoutMs, int totalMs) {
+        if (timeoutMs <= 0 && totalMs <= 0) { return null; }
+        lock (slots) {
+            nowMs = Stopwatch.GetMilliseconds();
+            int phase = timeoutMs;
+            if (phase <= 0) { phase = totalMs; }
+            if (totalMs > 0 && phase > totalMs) { phase = totalMs; }
+            int slot;
+            int n = freeSlots.Count;
+            if (n > 0) {
+                slot = freeSlots[n - 1];
+                freeSlots.RemoveAt(n - 1);
+                HttpDeadlineSlot old = slots[slot];
+                old.generation = old.generation + 1;
+                if (old.generation <= 0) { old.generation = 1; }
+                old.sock = sock;
+                old.deadline = nowMs + phase;
+                old.fired = false;
+                old.active = true;
+                old.totalDeadline = totalMs > 0 ? nowMs + totalMs : 0;
+            } else {
+                slots.Add(new HttpDeadlineSlot(sock, nowMs + phase));
+                if (totalMs > 0) { slots[slots.Count - 1].totalDeadline = nowMs + totalMs; }
+                slot = slots.Count - 1;
+            }
+            activeCount = activeCount + 1;
+            HttpDeadlineToken token = new HttpDeadlineToken(slot,
+                slots[slot].generation);
+            if (!sweeping) {
+                // sweeping 只在锁内读写；StopSweeping 在发现新连接时会
+                // 重新启动扫描器，避免最后一次 sweep 与 Arm 之间丢唤醒。
+                sweeping = true;
+                Task.Spawn(HttpDeadline.Sweep());
+            }
+            return token;
+        }
+    }
+
+    // 为 token 重启阶段窗口。阶段预算为非正值时仍保留
+    // total deadline；不能因为关闭某一阶段而把总截止时间一并关闭。
+    static void Touch(HttpDeadlineToken token, int timeoutMs) {
+        if (token == null || token.disarmed) { return; }
+        lock (slots) {
+            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            if (!slot.active || slot.generation != token.generation) { return; }
+            // Sweep 已经触发时不能被阶段切换重新武装；否则发送阶段
+            // 的超时可能在 await 返回后被 Touch 清掉。
+            if (slot.fired) { return; }
+            nowMs = Stopwatch.GetMilliseconds();
+            // 在扫描器尚未轮到本槽位时也要观察到过期，避免一次迟到的
+            // 收包把已经耗尽的窗口重新推到未来。
+            if (nowMs >= slot.deadline) {
+                slot.deadline = nowMs + 3600000;
+                slot.fired = true;
+                Socket.ShutdownBoth(slot.sock);
+                return;
+            }
+            long next = 0;
+            if (timeoutMs > 0) { next = nowMs + timeoutMs; }
+            if (slot.totalDeadline > 0
+                && (next <= 0 || next > slot.totalDeadline)) {
+                next = slot.totalDeadline;
+            }
+            if (next <= 0) { return; }
+            slot.deadline = next;
+            slot.fired = false;
+        }
+    }
+
+    // 当扫描器已对 token 执行挂断时返回 true。
+    // 必须在 Disarm 前查询。
+    static bool Expired(HttpDeadlineToken token) {
+        if (token == null || token.disarmed) { return false; }
+        lock (slots) {
+            if (token.disarmed || token.slot < 0 || token.slot >= slots.Count) { return false; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            return slot.active && slot.generation == token.generation && slot.fired;
+        }
+    }
+
+    // 连接结束时释放 token；重复释放安全，旧 token 不能释放新连接。
+    static void Disarm(HttpDeadlineToken token) {
+        if (token == null) { return; }
+        lock (slots) {
+            if (token.disarmed) { return; }
+            token.disarmed = true;
+            if (token.slot < 0 || token.slot >= slots.Count) { return; }
+            HttpDeadlineSlot slot = slots[token.slot];
+            if (!slot.active || slot.generation != token.generation) { return; }
+            slot.active = false;
+            slot.sock = -1;
+            slot.fired = false;
+            activeCount = activeCount - 1;
+            freeSlots.Add(token.slot);
+        }
+    }
+
+    // 单次扫描：刷新粗粒度时钟并对过期连接执行挂断
+    // （shutdown 而非 close，见类文档）。返回是否仍有活动 token。
+    static bool SweepOnce() {
+        lock (slots) {
+            nowMs = Stopwatch.GetMilliseconds();
+            int n = slots.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                HttpDeadlineSlot slot = slots[i];
+                nint s = slot.sock;
+                if (slot.active && s >= 0 && nowMs >= slot.deadline && !slot.fired) {
+                    // fired 保持到归属者查询/Disarm；generation 防止旧 token
+                    // 在槽位复用后误触碰新连接。
+                    slot.deadline = nowMs + 3600000;
+                    slot.fired = true;
+                    Socket.ShutdownBoth(s);
+                }
+            }
+            return activeCount > 0;
+        }
+    }
+
+    // 每秒扫描一次的常驻协程；只在有活动 token 时存活。
+    // SweepOnce 返回 false 后仍需在锁内再确认一次 activeCount，
+    // 避免 Arm 与扫描器退出之间丢失唤醒。
+    static async void Sweep() {
+        while (true) {
+            await Task.Delay(1000);
+            bool live = HttpDeadline.SweepOnce();
+            if (live) { continue; }
+            lock (slots) {
+                if (activeCount > 0) { continue; }
+                sweeping = false;
+                return;
+            }
+        }
+    }
+}
+
+
+// 一条已注册的路由：method + path + 静态响应体，作为一个
+// 整体保存，而非三个索引对齐的并行列表。

@@ -1,0 +1,153 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace System.Net.Http.Proxy;
+
+class FwdReader {
+    FwdChannel ch;
+    ByteBuffer buf;
+    byte[] recv;
+    bool eof;
+    int chunkBytes;
+
+    // <paramref name="chunkBytes"/> 为单批读取与转发的块大小（字节）。
+    FwdReader(FwdChannel ch, int chunkBytes) {
+        this.ch = ch;
+        this.buf = ByteBuffer.Alloc(chunkBytes);
+        this.recv = new byte[chunkBytes];
+        this.eof = false;
+        this.chunkBytes = chunkBytes;
+    }
+
+    ~FwdReader() {
+        this.buf.Free();
+    }
+
+    // 再读一批到缓冲；对端关闭时返回 false。
+    async bool FillAsync() {
+        if (this.eof) { return false; }
+        int n = await this.ch.RecvBytesAsync(this.recv, this.chunkBytes);
+        if (n <= 0) {
+            this.eof = true;
+            return false;
+        }
+        this.buf.WriteBytes((nint)this.recv, n);
+        return true;
+    }
+
+    // 读到头块结束（含空行），正文仍留在原始字节缓冲中。
+    async string ReadHeadAsync(int cap) {
+        int scan = 0;
+        while (true) {
+            int len = this.buf.Length();
+            int idx = this.buf.IndexOfByte(scan, 13);
+            while (idx >= 0 && idx + 3 < len) {
+                if (this.buf.ByteAt(idx + 1) == 10
+                    && this.buf.ByteAt(idx + 2) == 13
+                    && this.buf.ByteAt(idx + 3) == 10) {
+                    int nul = this.buf.IndexOfByte(0, 0);
+                    if (idx + 4 > cap || (nul >= 0 && nul < idx + 4)) {
+                        return "";
+                    }
+                    string head = this.buf.Str(0, idx + 4);
+                    this.buf.Discard(idx + 4);
+                    return head;
+                }
+                idx = this.buf.IndexOfByte(idx + 1, 13);
+            }
+            if (len >= cap) { return ""; }
+            scan = len - 3;
+            if (scan < 0) { scan = 0; }
+            if (!await this.FillAsync()) { return ""; }
+        }
+        return "";
+    }
+
+    // 读到行尾（含 CRLF），正文原样保留在缓冲中。
+    async string ReadLineAsync(int cap) {
+        int scan = 0;
+        while (true) {
+            int len = this.buf.Length();
+            int idx = this.buf.IndexOfByte(scan, 13);
+            while (idx >= 0 && idx + 1 < len) {
+                if (this.buf.ByteAt(idx + 1) == 10) {
+                    int nul = this.buf.IndexOfByte(0, 0);
+                    if (idx + 2 > cap || (nul >= 0 && nul < idx + 2)) {
+                        return "";
+                    }
+                    string line = this.buf.Str(0, idx + 2);
+                    this.buf.Discard(idx + 2);
+                    return line;
+                }
+                idx = this.buf.IndexOfByte(idx + 1, 13);
+            }
+            if (len >= cap) { return ""; }
+            scan = len - 1;
+            if (scan < 0) { scan = 0; }
+            if (!await this.FillAsync()) { return ""; }
+        }
+        return "";
+    }
+
+    // 取至多 max 个原始字节，返回真实字节数；0 表示 EOF。
+    async int ReadSomeBytesAsync(byte[] data, int max) {
+        if (data == null || max <= 0) { return 0; }
+        if (this.buf.Length() == 0) {
+            if (!await this.FillAsync()) { return 0; }
+        }
+        return this.TakeBufferedBytes(data, max);
+    }
+
+    // 仅取缓冲中已有字节，不读套接字。可循环取至返回 0。
+    int TakeBufferedBytes(byte[] data, int max) {
+        if (data == null || max <= 0) { return 0; }
+        int n = this.buf.Length();
+        if (n > max) { n = max; }
+        if (n > data.Length) { n = data.Length; }
+        if (n <= 0) { return 0; }
+        NativeMemory.Copy((nint)data, this.buf.Raw(), n);
+        this.buf.Discard(n);
+        return n;
+    }
+
+    // 对端已关闭且缓冲取尽——链路已读到 EOF，不可再复用。
+    bool AtEof() {
+        return this.eof && this.buf.Length() == 0;
+    }
+
+    // 从缓冲取一个字节，必要时从套接字补充。
+    async int ReadByteAsync() {
+        if (this.buf.Length() == 0 && !await this.FillAsync()) { return -1; }
+        int b = this.buf.ByteAt(0);
+        this.buf.Discard(1);
+        return b;
+    }
+
+    // 缓冲已空且对端未关闭——正好停在帧边界。
+    bool Drained() {
+        return this.buf.Length() == 0 && !this.eof;
+    }
+}
+
+// 流式 HTTP 反向代理/转发器。
+// 与"用 HttpClient 请求上游、拿到完整 HttpResponse 再回给
+// 下游"的写法不同，这里全程只用套接字原语按块搬运：上游
+// 响应头一到就立刻写给下游，之后每收到一块正文就立刻转出，
+// 任何时刻都不缓冲整个响应。因此流式聊天（SSE /
+// <c>text/event-stream</c>、逐 token 的分块响应）在下游是
+// 实时可见的，CONNECT 与 101 Upgrade（WebSocket）则退化为
+// 双向裸字节隧道。
+// 用法：
+// f.SetTimeout(600000);          // 长连接的流式响应要给足时间
+// await f.Start();
+// 逐跳（hop-by-hop）头部按 RFC 7230 6.1 剥离，Host 改写为上游
+// 主机，并追加 X-Forwarded-For。
+// 上游连接默认复用（<c>Connection: keep-alive</c> + <see cref="FwdPool"/>）：
+// 转发 AI 接口时，每个请求重新做一次 TCP+TLS 握手是毫秒级的
+// 开销，比搬字节本身贵得多。只有帧格式能确定结尾的响应
+// （Content-Length、chunked、或按定义无正文的 204/304/HEAD）才会把
+// 链路归还进池；以连接关闭定界的响应（无长度的流）、101
+// Upgrade 与 CONNECT 仍照旧方式用完即关。用
+// <see cref="DisableUpstreamKeepAlive"/> 可退回每请求一连。
+// 下游仍然是每连接一个请求（向客户端声明 <c>Connection: close</c>）。

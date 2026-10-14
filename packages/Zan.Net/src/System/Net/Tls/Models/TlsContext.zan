@@ -1,0 +1,265 @@
+using System;
+
+namespace System.Net.Tls;
+
+class TlsContext {
+    bool server;
+    string error;
+    bool verify;
+    bool disableTls13;
+    string certFile;
+    string keyFile;
+    string trust;
+    List<string> pins;
+    bool pinRequired;
+    CertPolicyFn certPolicy;
+    List<X509Certificate> trustedCerts;
+    List<X509Certificate> cachedChain;
+    X509Certificate cachedCert;
+    RsaKey cachedKey;
+    EcKey cachedEcKey;
+    static int MAX_TRUST_BUNDLE_BYTES = 4194304;
+    static int MAX_TRUST_CERT_BYTES = 32768;
+    static int MAX_TRUST_CERTS = 2048;
+    static int MAX_CHAIN_DER_BYTES = 131072;
+    static string PEM_BEGIN = "-----BEGIN CERTIFICATE-----";
+    static string PEM_END = "-----END CERTIFICATE-----";
+
+    TlsContext() {
+        this.server = false;
+        this.error = "";
+        this.verify = true;
+        this.disableTls13 = false;
+        this.certFile = null;
+        this.keyFile = null;
+        this.trust = "";
+        this.pins = null;
+        this.pinRequired = false;
+        this.certPolicy = null;
+        this.trustedCerts = null;
+        this.cachedChain = null;
+        this.cachedCert = null;
+        this.cachedKey = null;
+        this.cachedEcKey = null;
+    }
+
+    // 完整解析证书包后再替换信任列表，防止不完整输入破坏信任链。
+    static List<X509Certificate> ParseTrustBundle(string pem, bool strict) {
+        if (pem == null || pem.Length == 0 || pem.Length > MAX_TRUST_BUNDLE_BYTES) { return null; }
+        List<X509Certificate> certs = new List<X509Certificate>();
+        int pos = 0;
+        int seen = 0;
+        while (pos < pem.Length) {
+            int begin = pem.IndexOf(PEM_BEGIN, pos);
+            int anyBegin = pem.IndexOf("-----BEGIN ", pos);
+            if (strict && anyBegin >= 0 && (begin < 0 || anyBegin < begin)) { return null; }
+            if (begin < 0) { break; }
+            seen = seen + 1;
+            int body = begin + PEM_BEGIN.Length;
+            int end = pem.IndexOf(PEM_END, body);
+            int nested = pem.IndexOf("-----BEGIN ", body);
+            if (end < 0 || end - body > MAX_TRUST_CERT_BYTES || seen > MAX_TRUST_CERTS
+                || (nested >= 0 && nested < end)) { return null; }
+            int next = end + PEM_END.Length;
+            // 精确匹配证书 PEM 标头，忽略无关的密钥或公钥块。
+            X509Certificate cert = X509Certificate.FromPem(pem.Substring(begin, next - begin));
+            if (cert != null && cert.CanSignCertificates()) { certs.Add(cert); }
+            else if (strict) { return null; }
+            pos = next;
+        }
+        return certs.Count > 0 ? certs : null;
+    }
+
+    static List<X509Certificate> ReadTrustBundle(string path, bool strict) {
+        if (path == null || !File.Exists(path)) { return null; }
+        try {
+            int size = File.GetSize(path);
+            if (size < 1 || size > MAX_TRUST_BUNDLE_BYTES) { return null; }
+            byte[] raw = File.ReadBytes(path, 0, size + 1);
+            if (raw == null || raw.Length != size) { return null; }
+            return TlsContext.ParseTrustBundle(raw.ToStr(0, raw.Length), strict);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // 解析服务端证书 PEM 链束：全部证书按出现顺序保留（叶子在
+    // 前），数量与 DER 总长受限；任何一张无法解析即整体拒绝。
+    static List<X509Certificate> ParseCertChain(string pem) {
+        if (pem == null || pem.Length == 0 || pem.Length > MAX_TRUST_BUNDLE_BYTES) { return null; }
+        List<X509Certificate> chain = new List<X509Certificate>();
+        int pos = 0;
+        int totalDer = 0;
+        while (pos < pem.Length) {
+            int begin = pem.IndexOf(PEM_BEGIN, pos);
+            if (begin < 0) { break; }
+            int body = begin + PEM_BEGIN.Length;
+            int end = pem.IndexOf(PEM_END, body);
+            if (end < 0 || end - body > MAX_TRUST_CERT_BYTES
+                || chain.Count >= MAX_TRUST_CERTS) { return null; }
+            int next = end + PEM_END.Length;
+            X509Certificate cert = X509Certificate.FromPem(pem.Substring(begin, next - begin));
+            if (cert == null || cert.RawDer() == null) { return null; }
+            totalDer = totalDer + cert.RawDerLen();
+            if (totalDer > MAX_CHAIN_DER_BYTES) { return null; }
+            chain.Add(cert);
+            pos = next;
+        }
+        return chain.Count > 0 ? chain : null;
+    }
+
+    static List<X509Certificate> ReadCertChainFile(string path) {
+        if (path == null || !File.Exists(path)) { return null; }
+        try {
+            int size = File.GetSize(path);
+            if (size < 1 || size > MAX_TRUST_BUNDLE_BYTES) { return null; }
+            byte[] raw = File.ReadBytes(path, 0, size + 1);
+            if (raw == null || raw.Length != size) { return null; }
+            return TlsContext.ParseCertChain(raw.ToStr(0, raw.Length));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // 按顺序尝试每个候选 bundle 路径：存在但损坏/不可解析的
+    // 候选只被跳过，不阻断后续候选；全部候选都不可用才返回 null
+    // （调用方随之 fail-closed）。
+    static List<X509Certificate> TrustFromCandidates(string[] paths) {
+        if (paths == null) { return null; }
+        for (int i = 0; i < paths.Length; i = i + 1) {
+            if (!File.Exists(paths[i])) { continue; }
+            List<X509Certificate> roots = TlsContext.ReadTrustBundle(paths[i], false);
+            if (roots != null && roots.Count > 0) { return roots; }
+        }
+        return null;
+    }
+
+    bool AddTrustedCert(string pemFile) {
+        List<X509Certificate> certs = TlsContext.ReadTrustBundle(pemFile, true);
+        if (certs == null) { return false; }
+        if (this.trustedCerts == null) { this.trustedCerts = new List<X509Certificate>(); }
+        for (int i = 0; i < certs.Count; i = i + 1) { this.trustedCerts.Add(certs[i]); }
+        return true;
+    }
+
+    static List<X509Certificate> SystemTrustRoots() {
+        #if LINUX
+        // Linux 系统读取系统内置 CA 证书包，避免直接遍历 /etc/ssl/certs 造成悬空链接。
+        string[] paths = new string[] {
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/ca-bundle.pem",
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        };
+        return TlsContext.TrustFromCandidates(paths);
+        #endif
+        #if MACOS
+        string[] macPaths = new string[] {
+            "/etc/ssl/cert.pem",
+            "/opt/homebrew/etc/openssl@3/cert.pem",
+            "/usr/local/etc/openssl@3/cert.pem",
+            "/opt/homebrew/etc/openssl@1.1/cert.pem",
+            "/usr/local/etc/openssl@1.1/cert.pem"
+        };
+        return TlsContext.TrustFromCandidates(macPaths);
+        #endif
+        return null;
+    }
+
+    void SetCertPolicy(CertPolicyFn fn) {
+        this.certPolicy = fn;
+    }
+
+    bool PolicyActive() { return this.certPolicy != null; }
+
+    void AddPin(string spkiSha256Base64) {
+        if (this.pins == null) { this.pins = new List<string>(); }
+        this.pins.Add(spkiSha256Base64);
+    }
+
+    void RequirePinning(bool on) {
+        this.pinRequired = on;
+    }
+
+    bool PinningActive() {
+        return this.pinRequired && this.pins != null && this.pins.Count > 0;
+    }
+
+    bool PinMatches(string got) {
+        if (this.pins == null) { return false; }
+        for (int i = 0; i < this.pins.Count; i = i + 1) {
+            if (this.pins[i] == got) { return true; }
+        }
+        return false;
+    }
+
+    // 创建服务器端 TLS 上下文。证书文件可以是 PEM 链束
+    // （叶子在前，其后为中间证书）；单证书文件行为不变。链束任何一环
+    // 无法解析即整体拒绝，不得静默降级为只发叶子。
+    static TlsContext CreateServer(string certFile, string keyFile) {
+        TlsContext c = new TlsContext();
+        c.server = true;
+        c.certFile = certFile;
+        c.keyFile = keyFile;
+        if (certFile != null && File.Exists(certFile)) {
+            c.cachedChain = TlsContext.ReadCertChainFile(certFile);
+            if (c.cachedChain != null && c.cachedChain.Count > 0) {
+                c.cachedCert = c.cachedChain[0];
+            } else {
+                c.cachedCert = X509Certificate.FromPemFile(certFile);
+            }
+        }
+        if (keyFile != null && File.Exists(keyFile)) {
+            string privKeyPem = File.ReadAllText(keyFile);
+            c.cachedKey = RsaKey.FromPrivatePem(privKeyPem);
+            // RSA 加载失败再试 EC（PKCS#8/SEC1 P-256）；由密钥文件实际类型决定。
+            if (c.cachedKey == null) {
+                c.cachedEcKey = EcKey.FromPrivatePem(privKeyPem);
+            }
+        }
+        return c;
+    }
+
+    // 创建客户端 TLS 上下文；Windows 使用系统 SSL 链策略，Linux 使用发行版 CA bundle。
+    static TlsContext CreateClient() {
+        TlsContext c = new TlsContext();
+        c.trustedCerts = TlsContext.SystemTrustRoots();
+        return c;
+    }
+
+    // 创建带客户端证书与私钥的 TLS 上下文（双向认证）。
+    static TlsContext CreateClientWithCertificate(string certFile, string keyFile) {
+        TlsContext c = TlsContext.CreateClient();
+        c.certFile = certFile;
+        c.keyFile = keyFile;
+        return c;
+    }
+
+    // 禁用对端证书与主机名校验（仅用于本地自签名开发调试）。
+    void DisableVerify() {
+        this.verify = false;
+    }
+
+    // 禁用 TLS 1.3，将协商上限限制为 TLS 1.2。
+    void DisableTls13() {
+        this.disableTls13 = true;
+    }
+
+    string Handle() {
+        return "native_tls_engine";
+    }
+
+    bool IsServer() {
+        return this.server;
+    }
+
+    string TrustHint() {
+        return "";
+    }
+
+    void Free() {
+    }
+}
+
+// 非阻塞套接字上的纯 Zan 原生 TLS 1.2 / TLS 1.3 流。
+// 原生 AES-128-GCM、X25519、HKDF 与 X.509 握手；Windows 客户端另用 Crypt32 SSL 链策略。

@@ -1,0 +1,105 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace System.Net.WebSocket;
+
+class WsHandshake {
+    static bool HasToken(string value, string token) {
+        if (value == null) { return false; }
+        int n = value.Length;
+        int start = 0;
+        while (start < n) {
+            int stop = start;
+            while (stop < n && (value[stop] & 255) != 44) { stop = stop + 1; }
+            int a = start;
+            while (a < stop && ((value[a] & 255) == 32 || (value[a] & 255) == 9)) { a = a + 1; }
+            int b = stop;
+            while (b > a && ((value[b - 1] & 255) == 32 || (value[b - 1] & 255) == 9)) { b = b - 1; }
+            if (b - a == token.Length) {
+                bool match = true;
+                for (int i = 0; i < token.Length; i = i + 1) {
+                    int c = value[a + i] & 255;
+                    if (c >= 65 && c <= 90) { c = c + 32; }
+                    if (c != (token[i] & 255)) { match = false; break; }
+                }
+                if (match) { return true; }
+            }
+            start = stop + 1;
+        }
+        return false;
+    }
+
+    static bool Valid(HttpRequest req) {
+        if (req == null || req.parseStatus != 0 || req.method != "GET"
+            || req.version != "HTTP/1.1" || !WsHandshake.SafeRequestPart(req.path, true)
+            || !WsHandshake.SafeRequestPart(req.GetHeader("Host"), false)
+            || !WsHandshake.HasToken(req.GetHeader("Upgrade"), "websocket")
+            || !WsHandshake.HasToken(req.GetHeader("Connection"), "upgrade")
+            || req.GetHeader("Sec-WebSocket-Version") != "13") { return false; }
+        string key = req.GetHeader("Sec-WebSocket-Key");
+        if (key == null || key.Length != 24) { return false; }
+        List<int> decodedLen = new List<int>();
+        decodedLen.Add(0);
+        byte[] decoded = Base64.Decode(key, decodedLen);
+        return decoded != null && decodedLen[0] == 16
+            && Base64.Encode(decoded, 16) == key;
+    }
+
+    static bool SafeRequestPart(string value, bool allowEmpty) {
+        if (value == null || value.Length == 0) { return false; }
+        for (int i = 0; i < value.Length; i = i + 1) {
+            int c = value[i] & 255;
+            if (c <= 32 || c == 127 || c == 0) { return false; }
+        }
+        return true;
+    }
+
+    static bool ValidResponse(string head, string expectedAccept) {
+        if (head == null || expectedAccept == null) { return false; }
+        int firstEnd = head.IndexOf("\r\n", 0);
+        if (firstEnd < 12 || head.Substring(0, 12) != "HTTP/1.1 101") { return false; }
+        if (firstEnd > 12 && (head[12] & 255) != 32) { return false; }
+        int upgradeCount = 0;
+        int connectionCount = 0;
+        int acceptCount = 0;
+        string upgrade = "";
+        string connection = "";
+        string accept = "";
+        int pos = firstEnd + 2;
+        while (pos < head.Length) {
+            int end = head.IndexOf("\r\n", pos);
+            if (end < 0) { end = head.Length; }
+            if (end == pos) { break; }
+            int colon = head.IndexOf(":", pos);
+            if (colon <= pos || colon >= end) { return false; }
+            for (int i = pos; i < colon; i = i + 1) {
+                int c = head[i] & 255;
+                if (c <= 32 || c >= 127 || c == 58) { return false; }
+            }
+            int start = colon + 1;
+            while (start < end && ((head[start] & 255) == 32 || (head[start] & 255) == 9)) { start = start + 1; }
+            string name = head.Substring(pos, colon - pos);
+            string value = head.Substring(start, end - start);
+            if (WsHandshake.HasToken(name, "upgrade")) {
+                upgradeCount = upgradeCount + 1; upgrade = value;
+            } else if (WsHandshake.HasToken(name, "connection")) {
+                connectionCount = connectionCount + 1; connection = value;
+            } else if (WsHandshake.HasToken(name, "sec-websocket-accept")) {
+                acceptCount = acceptCount + 1; accept = value;
+            }
+            for (int i = 0; i < value.Length; i = i + 1) {
+                int c = value[i] & 255;
+                if (c == 0 || c == 10 || c == 13 || c == 127) { return false; }
+            }
+            if (end >= head.Length) { break; }
+            pos = end + 2;
+        }
+        return upgradeCount == 1 && connectionCount == 1 && acceptCount == 1
+            && WsHandshake.HasToken(upgrade, "websocket")
+            && WsHandshake.HasToken(connection, "upgrade")
+            && accept == expectedAccept;
+    }
+}
+
+// WebSocket 帧构建与解析器（RFC 6455）。

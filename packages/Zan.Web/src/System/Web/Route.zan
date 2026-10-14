@@ -1,0 +1,96 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Web;
+
+class Route {
+    string method;
+    string pattern;
+    List<string> segs;
+    HttpHandler handler;
+    string key;
+    string action;  // "Controller.Method" -- for docs / menu / diagnostics
+
+    // [Title] 人类可读标题（菜单文案 / 文档）。
+    string title;  // [Title] human label (menu text / docs)
+    // [Custom(ApiMax=n)] 每秒请求上限；0（默认）不限——限流须显式声明。
+    int rateLimit;
+    string rateScope;
+    bool needsLogin;  // Authorization = Login: a resolved user is required
+    bool needsAuth;
+    string lockScope;  // [Lock]  request lock: "" none | "user" | "global"
+    bool streamUpload;
+    // [Menu] 在管理菜单展示本路由；节与文案来自 URL 和 [Description]。
+    bool inMenu;
+                        // 路由参数元数据，由编译器根据动作签名与特性自动生成。
+    List<ApiParam> docParams;
+    // 自由属性表（Rank/ApiMax/Component/Icon/ContentType/...）。
+    StrMap meta;
+
+    // 路由平坦表紧凑索引。
+    int idx;
+
+    // 构造路由：模式立即按 '/' 预切分为段。
+    Route(string method, string pattern, HttpHandler handler) {
+        this.method = method;
+        this.pattern = pattern;
+        this.segs = Router.SplitPath(pattern);
+        this.handler = handler;
+        this.key = method + " " + pattern;
+        this.action = "";
+        this.title = "";
+        this.rateLimit = 0;
+        this.rateScope = "route";
+        this.needsLogin = false;
+        this.needsAuth = false;
+        this.lockScope = "";
+        this.streamUpload = false;
+        this.inMenu = false;
+        this.docParams = new List<ApiParam>();
+        this.meta = new StrMap();
+        this.idx = -1;
+    }
+
+    // 动作名（"Controller.Method"，文档/菜单/诊断用）。
+    Route Named(string action) { this.action = action; return this; }
+    // 标题（菜单文案 / 文档 summary）。
+    Route Title(string title) { this.title = title; return this; }
+    // 每秒限流上限；0 不限流。
+    Route Limit(int maxPerWindow) { this.rateLimit = maxPerWindow; return this; }
+    // 同时设限流上限与维度（"route"/"uid"/"ip"）。
+    Route LimitBy(int maxPerWindow, string scope) {
+        this.rateLimit = maxPerWindow;
+        this.rateScope = scope;
+        return this;
+    }
+    // 只设限流维度不改上限。
+    Route RateBy(string scope) { this.rateScope = scope; return this; }
+    // 要求已解析的登录用户（未登录 401）。
+    Route Login() { this.needsLogin = true; return this; }
+    // 要求登录 + 对 `action` 的权限（无权 403）；蕴含 Login。
+    Route Auth() { this.needsAuth = true; this.needsLogin = true; return this; }
+    // 请求锁维度："" 无 | "user" 用户级 | "global" 全局。
+    Route Lock(string scope) { this.lockScope = scope; return this; }
+    // 请求体流式写盘而非驻留内存（大文件上传）。
+    Route Upload() { this.streamUpload = true; return this; }
+    // 在管理菜单中展示本路由（节与文案来自 URL 和 [Description]）。
+    Route Menu() { this.inMenu = true; return this; }
+    // 写入自由属性（Rank/ApiMax/Component/Icon/ContentType/...）。
+    Route Meta(string key, string val) { this.meta.Set(key, val); return this; }
+    // 请求参数元数据描述符（由编译器根据动作签名生成）。
+    Route Param(string name, string type, bool required, string def, string desc,
+                string source) {
+        for (int i = 0; i < this.docParams.Count; i = i + 1) {
+            if (this.docParams[i].Name() == name) { return this; }
+        }
+        this.docParams.Add(new ApiParam(name, type, required, def, desc, source));
+        return this;
+    }
+    // 读自由属性；缺失返回空串。
+    string MetaGet(string key) { return this.meta.Get(key); }
+
+    // 预计算的 "METHOD pattern"（每请求统计/锁键）。
+    string Key() { return this.key; }
+}
+
+// 扁平路由统计键元数据条目实体（消除 flatKeys / flatHashes 平行列表反模式）。

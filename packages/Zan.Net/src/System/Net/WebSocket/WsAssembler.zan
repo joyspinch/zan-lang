@@ -1,0 +1,96 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+
+namespace System.Net.WebSocket;
+
+class WsAssembler {
+    int opcode;      // -1 = 无分片进行中
+    int dataLen;
+    int maxLen;
+    // 双倍增量的累积缓冲（显式长度/容量），交付时才转换为 string。
+    byte[] dataBuf;
+    int bufCap;
+
+    // 内部构造：状态复位，消息上限由调用方给定；经 WebSocketClient
+    // / 服务器各路径使用。
+    WsAssembler(int maxLen) {
+        this.opcode = 0 - 1;
+        this.dataLen = 0;
+        this.maxLen = maxLen;
+        this.dataBuf = null;
+        this.bufCap = 0;
+    }
+
+    // 喂入一个已解码的完整数据帧（控制帧不进这里）。
+    // 返回：0 = 分片进行中；1 = 消息完整，用 Message/MessageLen/
+    // MessageOpcode 取出；-1 = 协议违规（无起始帧的 continuation
+    // 或分片中途插入新数据帧）；-2 = 累计超过 maxLen。
+    int Feed(WsFrame frame) {
+        if (frame.opcode == WsOpcode.Continuation) {
+            if (this.opcode < 0) { return 0 - 1; }
+        } else if (this.opcode >= 0) {
+            // 分片中途插入新数据帧：RFC 6455 §5.4 的协议错误。
+            return 0 - 1;
+        } else {
+            this.opcode = frame.opcode;
+        }
+        int newLen = this.dataLen + frame.payloadLen;
+        if (newLen > this.maxLen) { return 0 - 2; }
+        if (frame.payloadLen > 0) {
+            // 翻倍扩容只搬移旧字节；不在每帧转换整条消息。
+            int cap = this.bufCap > 0 ? this.bufCap : 1024;
+            if (newLen > cap) {
+                while (cap < newLen) { cap = cap * 2; }
+            }
+            if (cap != this.bufCap) {
+                byte[] nb = new byte[cap + 1];
+                if (this.dataLen > 0) {
+                    NativeMemory.Copy((nint)nb, (nint)this.dataBuf, this.dataLen);
+                }
+                this.dataBuf = nb;
+                this.bufCap = cap;
+            }
+            NativeMemory.PutString((nint)this.dataBuf, this.dataLen, frame.payload, frame.payloadLen);
+        }
+        this.dataLen = newLen;
+        if (frame.fin) { return 1; }
+        return 0;
+    }
+
+    // 完成消息前校验文本消息的 UTF-8；二进制消息不做编码约束。
+    bool ValidComplete() {
+        if (this.opcode != WsOpcode.Text) { return true; }
+        string m = this.dataLen > 0 ? this.dataBuf.ToStr(0, this.dataLen) : "";
+        return WsFrame.ValidUtf8(m, this.dataLen);
+    }
+
+    // 取出重组完成的消息并复位状态。按显式长度一次转换，
+    // 内嵌 NUL 仍是消息的一部分；保留缓冲容量供下一条消息复用。
+    string Complete() {
+        string m = this.dataLen > 0 ? this.dataBuf.ToStr(0, this.dataLen) : "";
+        this.opcode = 0 - 1;
+        this.dataLen = 0;
+        return m;
+    }
+
+    // 取出重组完成的消息原始字节并复位状态。
+    byte[] CompleteBytes() {
+        int dl = this.dataLen;
+        byte[] b = new byte[dl + 1];
+        if (dl > 0) {
+            NativeMemory.Copy((nint)b, (nint)this.dataBuf, dl);
+        }
+        this.opcode = 0 - 1;
+        this.dataLen = 0;
+        return b;
+    }
+
+    // 重组完成消息的 opcode（Text 或 Binary）。
+    int MessageOpcode() { return this.opcode; }
+
+    // 重组负载的字节数（Complete 复位后为 0）。
+    int MessageLen() { return this.dataLen; }
+}
+
+// WebSocket 客户端。

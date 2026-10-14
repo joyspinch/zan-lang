@@ -1,0 +1,63 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Web;
+
+class RateLimiter {
+    SharedTable table;
+    int windowMs;
+
+    // 构造限流器；windowMs 为固定窗口宽度（毫秒），非正数忽略。
+    RateLimiter(int windowMs) {
+        if (windowMs > 0) { this.windowMs = windowMs; }
+    }
+
+    // 新建计数表：65536 个键位，每键 count 与 window_start 两列。
+    static SharedTable NewTable() {
+        SharedTable t = new SharedTable("", 65536);
+        t.KeySize(192);
+        t.ColumnInt("count");
+        t.ColumnInt("window_start");
+        return t;
+    }
+
+    static RateLimiter Owned(int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        SharedTable t = RateLimiter.NewTable();
+        if (t.CreateAnonymous()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    static RateLimiter Attach(long osHandle, int windowMs) {
+        RateLimiter r = new RateLimiter(windowMs);
+        if (osHandle == 0) { return r; }
+        SharedTable t = SharedTable.Attach(osHandle);
+        if (t.IsOpen()) {
+            t.Label("web rate limit");
+            r.table = t;
+        }
+        return r;
+    }
+
+    long OsHandle() {
+        if (this.table == null) { return 0; }
+        return this.table.OsHandle();
+    }
+
+    // 本窗口内 key 是否仍允许通过：limit<=0 恒允许；表未就绪一律拒绝
+    // （fail closed，被限流的路由不会悄悄放开）。
+    bool Allow(string key, int limit) {
+        if (limit <= 0) { return true; }
+        if (this.table == null) { return false; }
+        return this.table.RateAllow(key, -1, this.windowMs, limit);
+    }
+
+    // key 当前窗口已计的请求数；表未就绪返回 0。
+    int CountOf(string key) {
+        if (this.table == null) { return 0; }
+        return (int)this.table.GetInt(key, "count");
+    }
+}

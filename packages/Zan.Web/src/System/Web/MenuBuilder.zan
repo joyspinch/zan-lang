@@ -1,0 +1,159 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Web;
+
+class MenuBuilder {
+    // Display name per URL segment ("system" -> "系统").
+    static StrMap labels = new StrMap();
+    static List<string> sections = new List<string>();
+
+    // 声明 URL 路由段对应的菜单分组名称与排序。
+    static void Section(string segment, string label) {
+        if (!MenuBuilder.labels.Has(segment)) {
+            MenuBuilder.sections.Add(segment);
+        }
+        MenuBuilder.labels.Set(segment, label);
+    }
+
+    static async List<MenuNode> ForUser(WebApp app, string uid, string activePath) {
+        List<Route> routes = app.router.All();
+        List<MenuNode> outp = new List<MenuNode>();
+        for (int i = 0; i < routes.Count; i = i + 1) {
+            Route r = routes[i];
+            if (!r.inMenu) { continue; }
+            if (r.method != "GET") { continue; }
+            if ((r.needsLogin || r.needsAuth) && uid.Length == 0) { continue; }
+            if (r.needsAuth && !await app.Allow(uid, r.action)) { continue; }
+
+            MenuNode n = new MenuNode();
+            n.title = r.title;
+            if (n.title.Length == 0) { n.title = r.action; }
+            n.path = r.pattern;
+            n.group = MenuBuilder.GroupOf(r.pattern);
+            n.groupOrder = MenuBuilder.OrderOf(r.pattern);
+            n.order = r.pattern;
+            n.icon = r.meta.Get("Icon");
+            n.active = MenuBuilder.Matches(r.pattern, activePath);
+            outp.Add(n);
+        }
+        MenuBuilder.Sort(outp);
+        return outp;
+    }
+
+    static async string LandingFor(WebApp app, string uid) {
+        List<MenuNode> nodes = await MenuBuilder.ForUser(app, uid, "");
+        if (nodes.Count == 0) { return ""; }
+        return nodes[0].Path();
+    }
+
+    static async string JsonFor(WebApp app, string uid, string activePath) {
+        List<MenuNode> nodes = await MenuBuilder.ForUser(app, uid, activePath);
+        List<MenuNodeDoc> outp = new List<MenuNodeDoc>();
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            MenuNodeDoc o = new MenuNodeDoc();
+            o.title = n.title;
+            o.path = n.path;
+            o.group = n.group;
+            o.icon = n.icon;
+            o.active = n.active;
+            outp.Add(o);
+        }
+        return Json.Serialize<List<MenuNodeDoc>>(outp);
+    }
+
+    static void Fill(List<StrMap> rows, List<MenuNode> nodes) {
+        string group = "";
+        bool first = true;
+        for (int i = 0; i < nodes.Count; i = i + 1) {
+            MenuNode n = nodes[i];
+            if (first || n.group != group) {
+                first = false;
+                group = n.group;
+                if (group.Length > 0) {
+                    StrMap head = new StrMap();
+                    head.Set("group", group);
+                    rows.Add(head);
+                }
+            }
+            StrMap row = new StrMap();
+            row.Set("title", n.title);
+            row.Set("path", n.path);
+            row.Set("icon", n.icon);
+            if (n.active) { row.Set("active", "active"); }
+            rows.Add(row);
+        }
+    }
+
+    // pages do.
+    static string GroupOf(string path) {
+        List<string> segs = MenuBuilder.Body(path);
+        if (segs.Count == 0) { return ""; }
+        if (segs.Count == 1 && !MenuBuilder.labels.Has(segs[0])) { return ""; }
+        return MenuBuilder.Label(segs[0]);
+    }
+
+    static int OrderOf(string path) {
+        List<string> segs = MenuBuilder.Body(path);
+        if (MenuBuilder.GroupOf(path).Length == 0) { return -1; }
+        for (int i = 0; i < MenuBuilder.sections.Count; i = i + 1) {
+            if (MenuBuilder.sections[i] == segs[0]) { return i; }
+        }
+        return 0x7FFFFFFF;
+    }
+
+    static List<string> Body(string pattern) {
+        List<string> raw = Router.SplitPath(pattern);
+        List<string> outp = new List<string>();
+        for (int i = 0; i < raw.Count; i = i + 1) {
+            string s = raw[i];
+            if (s.Length == 0 || s.StartsWith("{")) { continue; }
+            if (outp.Count == 0 && (s == "admin" || s == "api")) { continue; }
+            outp.Add(s);
+        }
+        return outp;
+    }
+
+    static string Label(string s) {
+        if (s.Length == 0) { return s; }
+        string named = MenuBuilder.labels.Get(s);
+        if (named.Length > 0) { return named; }
+        return s.Substring(0, 1).ToUpper() + s.Substring(1);
+    }
+
+    static bool Matches(string pattern, string path) {
+        if (path.Length == 0) { return false; }
+        if (pattern == path) { return true; }
+        List<string> want = Router.SplitPath(pattern);
+        List<string> have = Router.SplitPath(path);
+        if (want.Count == 0 || have.Count < want.Count) { return false; }
+        for (int i = 0; i < want.Count; i = i + 1) {
+            string w = want[i];
+            if (w.Length > 0 && w.Substring(0, 1) == "{") { continue; }
+            if (w != have[i]) { return false; }
+        }
+        return true;
+    }
+
+    static void Sort(List<MenuNode> list) {
+        for (int i = 1; i < list.Count; i = i + 1) {
+            MenuNode n = list[i];
+            int j = i - 1;
+            while (j >= 0 && MenuBuilder.Before(n, list[j])) {
+                list[j + 1] = list[j];
+                j = j - 1;
+            }
+            list[j + 1] = n;
+        }
+    }
+
+    // 排序键：节注册序 → 节名字典序 → URL 字典序。
+    static bool Before(MenuNode a, MenuNode b) {
+        if (a.groupOrder != b.groupOrder) { return a.groupOrder < b.groupOrder; }
+        if (a.group != b.group) {
+            return String.CompareOrdinal(a.group, b.group) < 0;
+        }
+        return String.CompareOrdinal(a.order, b.order) < 0;
+    }
+}
