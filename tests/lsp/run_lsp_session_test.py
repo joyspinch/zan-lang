@@ -258,7 +258,11 @@ def main():
     if args.zanc:
         root = Path(__file__).resolve().parents[2]
         sources = [root / "tests/lsp/lsp_session_test.zan",
+                   root / "src/ide_zan/src/models/LspModels.zan",
                    root / "src/ide_zan/src/services/LspSession.zan",
+                   root / "src/ide_zan/src/services/LspSession.Transport.zan",
+                   root / "src/ide_zan/src/services/LspSession.Protocol.zan",
+                   root / "src/ide_zan/src/editor/LspSession.Editor.zan",
                    root / "src/ide_zan/src/services/DebugSession.zan"]
         compiled = subprocess.run([str(args.zanc.resolve()), *map(str, sources),
                                    "--auto-stdlib", "-o", str(args.client.resolve())],
