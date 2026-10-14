@@ -1,0 +1,369 @@
+using System;
+using System.Diagnostics;
+namespace System.Scripting;
+
+// 一个 Lua 值。底层值存放在 Lua 注册表的一个槽位里，包装被 ARC
+// 回收时该槽位被置 nil，因此 Lua 的 GC 与 Zan 的生命周期对齐。
+// nil 值的槽位号为 0，不占用注册表。
+class LuaValue {
+    public long slot;
+
+    // 包装一个已分配的槽位（0 表示 nil）。
+    static LuaValue Wrap(long slot) {
+        LuaValue v = new LuaValue();
+        v.slot = slot;
+        return v;
+    }
+
+    // 把栈顶的值移进注册表并包装（弹出栈顶）。
+    static LuaValue CaptureTop() {
+        return LuaValue.Wrap(Lua.StoreTop());
+    }
+
+    // ARC 回收包装时释放注册表槽位，Lua 的 GC 随后回收该值。
+    ~LuaValue() {
+        if (this.slot != 0) {
+            Lua.DropSlot(this.slot);
+            this.slot = 0;
+        }
+    }
+
+    // 注册表槽位号（nil 为 0）。
+    long Slot() { return this.slot; }
+
+    // 把该值压到 Lua 栈上。
+    void Push() {
+        Lua.PushSlot(this.slot);
+    }
+
+    // lua_type 值。
+    int Type() { return Lua.TypeOfSlot(this.slot); }
+
+    // 该值为 nil 时为 true。
+    bool IsNil() { return this.slot == 0 || this.Type() == 0; }
+
+    // 该值为表时为 true。
+    bool IsTable() { return this.Type() == 5; }
+
+    // 该值为函数（Lua 函数或 C 函数）时为 true。
+    bool IsFunction() { return this.Type() == 6; }
+
+    // 读为 double。
+    double ToDouble() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaNumFn f = (LuaNumFn)Lua.addr_tonumberx;
+        double v = f(Lua.state, 0 - 1, 0);
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 读为 64 位整数。
+    long ToLong() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaIntegerFn f = (LuaIntegerFn)Lua.addr_tointegerx;
+        long v = f(Lua.state, 0 - 1, 0);
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 读为字符串（number 会按 Lua 规则转成字符串）。
+    string ToStr() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+        int t = ty(Lua.state, 0 - 1);
+        string s = "";
+        if (t == 4 || t == 3) {
+            LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+            s = f(Lua.state, 0 - 1, 0);
+        }
+        Lua.SetTop(mark);
+        return s;
+    }
+
+    // 读取真值（Lua 语义：只有 nil 和 false 为假）。
+    bool ToBool() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaIdxIntFn f = (LuaIdxIntFn)Lua.addr_toboolean;
+        bool b = f(Lua.state, 0 - 1) != 0;
+        Lua.SetTop(mark);
+        return b;
+    }
+
+    // 表的数组长度（# 运算符的 raw 版本）。
+    long Length() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaRawLenFn f = (LuaRawLenFn)Lua.addr_rawlen;
+        long n = f(Lua.state, 0 - 1);
+        Lua.SetTop(mark);
+        return n;
+    }
+
+    // 读表的整数下标（下标从 1 起）。
+    LuaValue At(long index) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaGetIFn g = (LuaGetIFn)Lua.addr_geti;
+        int _t = g(Lua.state, 0 - 1, index);
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 写表的整数下标。
+    void SetAt(long index, LuaValue val) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        val.Push();
+        LuaSetIFn s = (LuaSetIFn)Lua.addr_seti;
+        s(Lua.state, 0 - 2, index);  // 弹出值
+        Lua.SetTop(mark);
+    }
+
+    // 读表的字符串键。
+    LuaValue Get(string key) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        LuaGetFieldFn g = (LuaGetFieldFn)Lua.addr_getfield;
+        int _t = g(Lua.state, 0 - 1, key);
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 写表的字符串键。
+    void Set(string key, LuaValue val) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        val.Push();
+        LuaSetFieldFn s = (LuaSetFieldFn)Lua.addr_setfield;
+        s(Lua.state, 0 - 2, key);  // 弹出值
+        Lua.SetTop(mark);
+    }
+
+    // 以任意数量的参数调用该值（必须是可调用的）。
+    LuaValue Call(params LuaValue[] args) {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        for (int i = 0; i < args.Length; i = i + 1) {
+            args[i].Push();
+        }
+        Lua.Protected(args.Length, 1, mark, "call");
+        LuaValue v = LuaValue.CaptureTop();
+        Lua.SetTop(mark);
+        return v;
+    }
+
+    // 把 Lua 数组表拆成 LuaValue 列表。
+    List<LuaValue> ToList() {
+        long n = this.Length();
+        List<LuaValue> outList = new List<LuaValue>();
+        for (long i = 1; i <= n; i = i + 1) {
+            outList.Add(this.At(i));
+        }
+        return outList;
+    }
+
+    // 把 Lua 数组表拆成 double 列表。
+    List<double> ToListDouble() {
+        List<LuaValue> items = this.ToList();
+        List<double> outList = new List<double>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            outList.Add(items[i].ToDouble());
+        }
+        return outList;
+    }
+
+    // 把 Lua 数组表拆成 long 列表。
+    List<long> ToListLong() {
+        List<LuaValue> items = this.ToList();
+        List<long> outList = new List<long>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            outList.Add(items[i].ToLong());
+        }
+        return outList;
+    }
+
+    // 把 Lua 数组表拆成字符串列表。
+    List<string> ToListStr() {
+        List<LuaValue> items = this.ToList();
+        List<string> outList = new List<string>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            outList.Add(items[i].ToStr());
+        }
+        return outList;
+    }
+
+    // 把 Lua 表拆成以字符串为键的映射。键按 Lua 的转换规则读为
+    // 字符串，因此数字键也能取到（"1"、"2" ...）。
+    Dictionary<string, LuaValue> ToDict() {
+        Lua.EnsureReady();
+        int mark = Lua.Top();
+        this.Push();
+        int t = Lua.Top();  // 表的绝对索引
+        Dictionary<string, LuaValue> outMap = new Dictionary<string, LuaValue>();
+        LuaVoid1Fn nil = (LuaVoid1Fn)Lua.addr_pushnil;
+        LuaNextFn next = (LuaNextFn)Lua.addr_next;
+        LuaVoidIntFn pv = (LuaVoidIntFn)Lua.addr_pushvalue;
+        LuaToStrFn ts = (LuaToStrFn)Lua.addr_tolstring;
+        LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+        nil(Lua.state);
+        while (next(Lua.state, t) != 0) {
+            // 键在 -2，值在 -1。值先进注册表（CaptureTop 会弹出它，
+            // 所以先复制一份，键必须留在栈上供下一轮 next 使用）。
+            pv(Lua.state, 0 - 1);
+            LuaValue v = LuaValue.CaptureTop();
+            // 键转字符串同样用副本：tolstring 会就地改写 number 键，
+            // 那会打乱 lua_next。
+            pv(Lua.state, 0 - 2);
+            string k = "";
+            int kt = ty(Lua.state, 0 - 1);
+            if (kt == 4 || kt == 3) { k = ts(Lua.state, 0 - 1, 0); }
+            Lua.SetTop(t + 1);  // 只留下键
+            if (k.Length > 0) { outMap[k] = v; }
+        }
+        Lua.SetTop(mark);
+        return outMap;
+    }
+
+    // 运算符重载：<c>fn(a, b)</c> 调用 Lua 函数。由编译器的 op_call
+    // 降级启用；标量重载自动封送 string/double/long/bool 参数。
+    static LuaValue op_call(LuaValue self, string a) {
+        return self.Call(Lua.FromStr(a));
+    }
+
+    // 运算符重载：fn(a)，a 封送为 double。
+    static LuaValue op_call(LuaValue self, double a) {
+        return self.Call(Lua.FromDouble(a));
+    }
+
+    // 运算符重载：fn(a)，a 封送为 long。
+    static LuaValue op_call(LuaValue self, long a) {
+        return self.Call(Lua.FromLong(a));
+    }
+
+    // 运算符重载：fn(a)，a 封送为 bool。
+    static LuaValue op_call(LuaValue self, bool a) {
+        return self.Call(Lua.FromBool(a));
+    }
+
+    // 运算符重载：fn(a)，a 为另一个 LuaValue。
+    static LuaValue op_call(LuaValue self, LuaValue a) {
+        return self.Call(a);
+    }
+
+    // 运算符重载：fn(a, b, ...)，参数逐一封送为 double。
+    static LuaValue op_call(LuaValue self, params double[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromDouble(args[i]);
+        }
+        return self.Call(vs);
+    }
+
+    // 运算符重载：fn(a, b, ...)，参数逐一封送为 long。
+    static LuaValue op_call(LuaValue self, params long[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromLong(args[i]);
+        }
+        return self.Call(vs);
+    }
+
+    // 运算符重载：fn(a, b, ...)，参数逐一封送为 string。
+    static LuaValue op_call(LuaValue self, params string[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromStr(args[i]);
+        }
+        return self.Call(vs);
+    }
+
+    // 运算符重载：fn(a, b, ...)，参数逐一封送为 bool。
+    static LuaValue op_call(LuaValue self, params bool[] args) {
+        LuaValue[] vs = new LuaValue[args.Length];
+        for (int i = 0; i < args.Length; i = i + 1) {
+            vs[i] = Lua.FromBool(args[i]);
+        }
+        return self.Call(vs);
+    }
+
+    // 运算符重载：fn(a, b, ...)，参数均为 LuaValue。
+    static LuaValue op_call(LuaValue self, params LuaValue[] args) {
+        return self.Call(args);
+    }
+
+    // 运算符重载：<c>t[2]</c>，同 <see cref="At"/>。
+    static LuaValue op_index(LuaValue self, long index) {
+        return self.At(index);
+    }
+
+    // 运算符重载：<c>t["k"]</c>，同 <see cref="Get"/>。
+    static LuaValue op_index(LuaValue self, string key) {
+        return self.Get(key);
+    }
+
+    // 运算符重载：<c>t[2] = v</c>，同 <see cref="SetAt"/>。
+    static void op_index_set(LuaValue self, long index, LuaValue val) {
+        self.SetAt(index, val);
+    }
+
+    // 运算符重载：<c>t[2] = "s"</c>，封送字符串值。
+    static void op_index_set(LuaValue self, long index, string val) {
+        self.SetAt(index, Lua.FromStr(val));
+    }
+
+    // 运算符重载：<c>t["k"] = v</c>，同 <see cref="Set"/>。
+    static void op_index_set(LuaValue self, string key, LuaValue val) {
+        self.Set(key, val);
+    }
+
+    // 运算符重载：<c>t["k"] = "s"</c>，封送字符串值。
+    static void op_index_set(LuaValue self, string key, string val) {
+        self.Set(key, Lua.FromStr(val));
+    }
+}
+
+// ---- lua_CFunction 回调形式：int (*)(lua_State *) -------------------
+// lua_CFunction 回调形式：int (*)(lua_State*)。
+delegate int LuaCFunction(nint L);
+
+// ---- 已解析入口点的内部调用形式 -----------------------
+delegate nint LuaNewStateFn();
+delegate void LuaVoid1Fn(nint L);
+delegate int LuaIntFn(nint L);
+delegate void LuaVoidIntFn(nint L, int n);
+delegate int LuaIdxIntFn(nint L, int idx);
+delegate int LuaLoadFn(nint L, string code);
+delegate int LuaLoadBufFn(nint L, string buf, long sz, string chunkName, string mode);
+delegate int LuaPcallFn(nint L, int nargs, int nres, int errfunc, nint ctx, nint k);
+delegate double LuaNumFn(nint L, int idx, nint isnum);
+delegate long LuaIntegerFn(nint L, int idx, nint isnum);
+delegate string LuaToStrFn(nint L, int idx, nint len);
+delegate void LuaPushNumFn(nint L, double v);
+delegate void LuaPushIntFn(nint L, long v);
+delegate nint LuaPushStrFn(nint L, string s);
+delegate void LuaPushCClosureFn(nint L, nint fn, int upvals);
+delegate int LuaGetGlobalFn(nint L, string name);
+delegate void LuaVoidStrFn(nint L, string name);
+delegate int LuaGetFieldFn(nint L, int idx, string key);
+delegate void LuaSetFieldFn(nint L, int idx, string key);
+delegate int LuaGetIFn(nint L, int idx, long n);
+delegate void LuaSetIFn(nint L, int idx, long n);
+delegate long LuaRawLenFn(nint L, int idx);
+delegate int LuaNextFn(nint L, int idx);
+delegate void LuaCreateTableFn(nint L, int narr, int nrec);
