@@ -1,0 +1,222 @@
+using System;
+using Gui;
+using Gui.Component;
+using Gui.Widget;
+
+class WxChatWindow : ChildWindow {
+    // 每个会话至多一扇窗（拖出同一条会话不再开第二扇）。
+    static List<WxChatWindow> wins;
+    // 各窗口的 WidgetId 基线：同进程内窗口不许撞号，每扇窗占一段
+    // （同基线会让两扇窗的悬停/按压 id 互相覆盖）。
+    static int nextBase = 930000;
+    WxSession sess;
+    App owner;
+    Action notify;
+    int idBaseVal;
+    ChatView chat;
+    TextArea box;
+    WxProfilePanel prof;
+
+    WxChatWindow() {
+        this.idBaseVal = WxChatWindow.nextBase;
+        WxChatWindow.nextBase = WxChatWindow.nextBase + 2000;
+        this.sess = null;
+        this.owner = null;
+        this.notify = null;
+    }
+
+    // 把会话 `s` 开成独立窗口。`afterSend` 由宿主传入，用于在浮窗里
+    // 发出消息后刷新主窗口（列表摘要 + 当前会话记录）。
+    static void Open(App app, WxSession s, Action afterSend) {
+        WxChatWindow old = WxChatWindow.Find(s);
+        if (old != null) {
+            old.notify = afterSend;
+            old.RequestRedraw();
+            return;
+        }
+        WxChatWindow w = new WxChatWindow();
+        w.sess = s;
+        w.owner = app;
+        w.notify = afterSend;
+        w.BuildWindow();
+        if (WxChatWindow.wins == null) {
+            WxChatWindow.wins = new List<WxChatWindow>();
+        }
+        WxChatWindow.wins.Add(w);
+    }
+
+    // 已开着的该会话窗口（按会话对象认：槽身份跟对端走，同一会话
+    // 在轮询重建前后是同一个对象）。
+    static WxChatWindow Find(WxSession s) {
+        if (WxChatWindow.wins == null) { return null; }
+        for (int i = 0; i < WxChatWindow.wins.Count; i = i + 1) {
+            WxChatWindow w = WxChatWindow.wins[i];
+            if (w.IsOpen() && w.sess == s) { return w; }
+        }
+        return null;
+    }
+
+    // 共享模型变了（轮询并入新消息、回执翻位）就重画气泡区。
+    // WxIm.RefreshViews 对每扇开着的窗调一遍。
+    static void RefreshAll() {
+        if (WxChatWindow.wins == null) { return; }
+        for (int i = 0; i < WxChatWindow.wins.Count; i = i + 1) {
+            WxChatWindow w = WxChatWindow.wins[i];
+            if (w.IsOpen()) { w.OnModelChanged(); }
+        }
+    }
+
+    void OnModelChanged() {
+        if (chat == null || !this.IsOpen()) { return; }
+        this.BindChat();
+        this.RequestRedraw();
+    }
+
+    override string Title() { return sess.name; }
+    // 独立会话窗比主窗口窄：一列气泡 + 一条输入区。
+    override int Width() { return 520; }
+    override int Height() { return 680; }
+    override bool ShowMaximize() { return false; }
+    override int IdBase() { return idBaseVal; }
+
+    // 搭窗口的控件树。结构与主窗口聊天页右侧一致（标题条 / 气泡记录 /
+    // 输入区），所以沿用同一批 wx* 类；这里一个像素也不画。
+    void BuildWindow() {
+        Panel root = Wx.Col("wxchatwin");
+
+        Flex head = Wx.Row("wxhead");
+        Avatar headAva = Wx.Ava(sess.initial, 34, sess.tint);
+        headAva.OnClick(() => {
+            this.ShowProfile(WxProfiles.Of(sess.name, sess.initial,
+                sess.tint));
+        });
+        head.Add(headAva);
+        Panel hp = Panel.Column();
+        hp.Class = "grow";
+        hp.Grow();
+        hp.Add(Wx.Lbl(sess.name, "wxheadname"));
+        if (sess.group) {
+            hp.Add(Wx.Lbl("群聊 · " + Convert.ToString(sess.people) + " 人",
+                "wxheaddesc"));
+        } else {
+            hp.Add(Wx.Lbl("独立窗口", "wxheaddesc"));
+        }
+        head.Add(hp);
+        head.Add(Wx.IconBtn("dots"));
+        root.Add(head);
+        root.Add(Wx.Line());
+
+        Panel comp = Wx.Col("wxcomposer");
+        // 与主窗口聊天页同款：输入框在上，图标 + 发送在底部。
+        Panel tw = Wx.Col("wxtypewrap");
+        tw.Grow();
+        box = new TextArea("");
+        box.Class = "wxtype";
+        box.Grow();
+        tw.Add(box);
+        comp.Add(tw);
+        ToolStrip bar = new ToolStrip();
+        bar.SetIconOnly(true);
+        bar.Class = "grow";
+        bar.Add("", "mood-smile");
+        bar.Add("", "folder");
+        bar.Add("", "scissors");
+        Flex bb = Wx.Row("wxbottom");
+        bb.Add(bar);
+        Button send = new Button("发送");
+        send.Class = "primary small";
+        send.OnClick(() => { this.Send(); });
+        bb.Add(send);
+        comp.Add(bb);
+        root.Add(comp);
+        root.Add(Wx.Line());
+
+        chat = new ChatView();
+        chat.Class = "wxchat";
+        chat.Grow();
+        chat.WithStyle(ChatStyle.Bubble());
+        chat.WithBubbleWidth(560);
+        this.BindChat();
+        chat.OnAvatarClick((idx) => { this.OpenMsgProfile(idx); });
+        root.Add(chat);
+
+        prof = WxProfilePanel.Of();
+        root.Add(prof);
+
+        this.SetRoot(root, null);
+        this.Wire();
+        this.OpenHost(this.owner);
+        // 子窗口是另一个 App：主窗口铺的 .wx* 应用样式表要再铺一遍，
+        // 否则这扇窗里只有皮肤基线、没有会话布局类。
+        this.host.UseAppCss(WxSkin.Css());
+        this.RequestRedraw();
+    }
+
+    // 点气泡头像弹名片：解析与主窗口聊天页同一套（user=我，
+    // agent 按注册表，其余用会话对方）。
+    void OpenMsgProfile(int idx) {
+        if (idx < 0 || idx >= sess.msgs.Count) { return; }
+        ChatMessage m = sess.msgs[idx];
+        if (m.role == "user") {
+            this.ShowProfile(WxProfiles.Me());
+            return;
+        }
+        if (m.agent != "") {
+            string nm = WxData.NameOf(m.agent);
+            if (nm != null) {
+                this.ShowProfile(WxProfiles.Of(nm,
+                    WxData.IniOf(m.agent), WxData.TintOfId(m.agent)));
+                return;
+            }
+        }
+        this.ShowProfile(WxProfiles.Of(sess.name, sess.initial, sess.tint));
+    }
+
+    // 弹名片。浮窗没有抽屉/弹出层，名片直接盖上即可。
+    void ShowProfile(WxProfileCard c) {
+        prof.Show(c);
+        this.RequestRedraw();
+    }
+
+    // 与主窗口同一套气泡配置（发言人解析走同一份虚构数据）。
+    void BindChat() {
+        ChatStrings cs = ChatStrings.Default();
+        cs.you = "我";
+        cs.assistant = sess.name;
+        cs.empty = "还没有消息";
+        chat.WithStrings(cs);
+        chat.WithSpeakerNames(sess.group);
+        chat.WithSpeakers(WxData.Speaker, WxData.KindLabel);
+        chat.Reset();
+        chat.Bind(sess.msgs);
+        chat.Invalidate();
+    }
+
+    // 在浮窗里发送。接了服务端的会话走 WxIm.Send——与主窗口同一条
+    // 链路：本地先进气泡、服务端落账、回执随轮询翻位；气泡上屏由
+    // WxIm.RefreshViews → RefreshAll 回到这扇窗完成。没接服务端的
+    // 示例行维持纯本地行为。
+    void Send() {
+        string t = box.GetText();
+        if (t == "") { return; }
+        if (sess.Linked()) {
+            WxIm.Send(sess, t);
+        } else {
+            ChatMessage m = ChatMessage.Create("user", t);
+            m.at = DateTime.UtcNow().ToUnixSeconds();
+            sess.msgs.Add(m);
+            sess.snippet = t;
+            sess.time = "刚刚";
+        }
+        sess.unread = 0;
+        box.SetText("");
+        chat.Invalidate();
+        this.RequestRedraw();
+        if (notify != null) { notify(); }
+    }
+}
+
+// 聊天记录窗口：聊天页标题条上的聊天图标打开的那扇独立子窗口
+// （原版的「聊天记录」）。上半是搜索框与类型标签条（文件/图片与
+// 视频/链接/…，标签可点、只挪选中态——示例记录全是文本，没有
+// 按类型筛的内容），下半是带日期列的记录行列表。
