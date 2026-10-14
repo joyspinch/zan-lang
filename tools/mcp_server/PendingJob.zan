@@ -1,0 +1,2511 @@
+using System;
+
+class PendingJob {
+        int id;
+        string cmd;
+        bool started;
+        bool done;
+        ProcessResult result;
+    }
+
+    static List<PendingJob> jobs;
+    static nint jobLock;
+    static int jobSeq;
+
+    static void InitJobs() {
+        McpServer.jobs = new List<PendingJob>();
+        McpServer.jobLock = Mutex.Create();
+        McpServer.jobSeq = 0;
+    }
+
+    static async ProcessResult RunProcessAsync(string cmd) {
+        PendingJob job = new PendingJob();
+        McpServer.jobSeq = McpServer.jobSeq + 1;
+        job.id = McpServer.jobSeq;
+        job.cmd = cmd;
+        job.started = false;
+        job.done = false;
+        job.result = null;
+        Mutex.Lock(McpServer.jobLock);
+        McpServer.jobs.Add(job);
+        Mutex.Unlock(McpServer.jobLock);
+        if (!Thread.Start(McpServer.ProcessWorker)) {
+            job.result = Process.Capture(job.cmd);
+            job.done = true;
+        }
+        while (!job.done) { await Task.Delay(10); }
+        Mutex.Lock(McpServer.jobLock);
+        for (int i = 0; i < McpServer.jobs.Count; i = i + 1) {
+            if (McpServer.jobs[i].id == job.id) {
+                McpServer.jobs.RemoveAt(i);
+                break;
+            }
+        }
+        Mutex.Unlock(McpServer.jobLock);
+        if (job.result == null) { job.result = new ProcessResult(); }
+        if (job.result.lines == null) { job.result.lines = new List<string>(); }
+        return job.result;
+    }
+
+    static void ProcessWorker() {
+        while (true) {
+            PendingJob job = null;
+            Mutex.Lock(McpServer.jobLock);
+            for (int i = 0; i < McpServer.jobs.Count; i = i + 1) {
+                if (!McpServer.jobs[i].started) {
+                    McpServer.jobs[i].started = true;
+                    job = McpServer.jobs[i];
+                    break;
+                }
+            }
+            Mutex.Unlock(McpServer.jobLock);
+            if (job == null) { return; }
+            job.result = Process.Capture(job.cmd);
+            job.done = true;
+        }
+    }
+
+
+    static string ApiSearch(string query, int limit) {
+        if (query == "") { return "error: 'query' is required"; }
+        if (!File.Exists(McpServer.indexPath)) {
+            return "error: symbol index not found at " + McpServer.indexPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe stdlib";
+        }
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> cands = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (cands.Count >= McpServer.CandCap()) { break; }
+            string line = lines[i];
+            if (McpServer.Find(line, "\"name\"") < 0) { continue; }
+            if (!McpServer.TokensMatch(line, query)) { continue; }
+            string trimmed = line;
+            if (trimmed.Length > 0
+                && trimmed.Substring(trimmed.Length - 1, 1) == ",") {
+                trimmed = trimmed.Substring(0, trimmed.Length - 1);
+            }
+            JsonValue rec = McpServer.ParseBody(trimmed);
+            if (rec == null) { continue; }
+            cands.Add(rec);
+        }
+        JsonValue results = McpServer.RankedTake(cands, limit);
+        int found = results.Count();
+        JsonValue o = JsonValue.NewObject();
+        o.Put("query", JsonValue.NewStr(query));
+        o.Put("count", JsonValue.NewNum(Convert.ToString(found)));
+        o.Put("results", results);
+        if (found == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "no match; try a shorter symbol fragment, e.g. 'Button'"));
+        }
+        return o.ToJson();
+    }
+
+    static string LookupSymbol(string name, int limit) {
+        if (name == "") { return "error: 'name' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string lower = name.ToLower();
+        string dotted = "." + lower;
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> exactRecs = new List<JsonValue>();
+        List<JsonValue> memberRecs = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (exactRecs.Count + memberRecs.Count >= McpServer.CandCap()) { break; }
+            string full = McpServer.NameField(lines[i]);
+            if (full == "") { continue; }
+            bool isExact = full == lower;
+            bool isMember = full.Length > dotted.Length
+                && full.Substring(full.Length - dotted.Length, dotted.Length) == dotted;
+            if (!isExact && !isMember) { continue; }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            if (isExact) { exactRecs.Add(rec); } else { memberRecs.Add(rec); }
+        }
+        JsonValue exact = McpServer.RankedTake(exactRecs, limit);
+        JsonValue member = McpServer.RankedTake(memberRecs, limit);
+        int found = exact.Count() + member.Count();
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(name));
+        o.Put("exact", exact);
+        o.Put("members", member);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(found)));
+        if (found == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "no exact match; try zan_api_search for fuzzy fragments"));
+        }
+        return o.ToJson();
+    }
+
+    static string ListMembers(string type, string filter, int limit) {
+        if (type == "") { return "error: 'type' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string owner = type.ToLower();
+        string prefix = owner + ".";
+        string want = filter.ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> declCands = new List<JsonValue>();
+        List<JsonValue> memberCands = new List<JsonValue>();
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (memberCands.Count >= McpServer.CandCap()) { break; }
+            string lower = McpServer.NameField(lines[i]);
+            if (lower == "") { continue; }
+            bool isSelf = lower == owner;
+            if (!isSelf) {
+                if (lower.Length <= prefix.Length) { continue; }
+                if (lower.Substring(0, prefix.Length) != prefix) { continue; }
+                if (want != "" && McpServer.Find(lower, want) < 0) { continue; }
+            }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            if (isSelf) { declCands.Add(rec); } else { memberCands.Add(rec); }
+        }
+        JsonValue decls = McpServer.RankedTake(declCands, 1);
+        bool haveDecl = decls.Count() > 0;
+        JsonValue decl = JsonValue.NewObject();
+        int best = McpServer.RANK_MAX();
+        if (haveDecl) {
+            decl = decls.At(0);
+            best = McpServer.SourceRank(decl.Str("file", ""));
+        } else {
+            for (int i = 0; i < memberCands.Count; i = i + 1) {
+                int r = McpServer.SourceRank(memberCands[i].Str("file", ""));
+                if (r < best) { best = r; }
+            }
+        }
+        JsonValue members = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < memberCands.Count; i = i + 1) {
+            JsonValue rec = memberCands[i];
+            if (McpServer.SourceRank(rec.Str("file", "")) != best) { continue; }
+            total = total + 1;
+            if (members.Count() >= limit) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("name", JsonValue.NewStr(rec.Str("name", "")));
+            row.Put("kind", JsonValue.NewStr(rec.Str("kind", "")));
+            row.Put("sig", JsonValue.NewStr(rec.Str("sig", "")));
+            row.Put("file", JsonValue.NewStr(rec.Str("file", "")));
+            row.Put("line", JsonValue.NewNum(Convert.ToString(rec.Int("line", 0))));
+            string doc = rec.Str("doc", "");
+            if (doc != "") { row.Put("doc", JsonValue.NewStr(doc)); }
+            members.Append(row);
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("type", JsonValue.NewStr(type));
+        if (haveDecl) { o.Put("declaration", decl); }
+        o.Put("memberCount", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("returned", JsonValue.NewNum(Convert.ToString(members.Count())));
+        o.Put("members", members);
+        if (total == 0) {
+            o.Put("hint", JsonValue.NewStr(
+                "unknown type; call zan_api_search to find the exact name"));
+        } else if (members.Count() < total) {
+            o.Put("hint", JsonValue.NewStr(
+                "truncated; narrow with 'filter' or raise 'limit'"));
+        }
+        return o.ToJson();
+    }
+
+    // 
+    static string FindRefs(string name, int limit) {
+        if (name == "") { return "error: 'name' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: reference index not found at " + McpServer.refsPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe .";
+        }
+        string simple = McpServer.AfterLastDot(name).ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) != simple) { continue; }
+            JsonValue rec = McpServer.IndexRecord(lines[i]);
+            if (rec == null) { continue; }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("name", JsonValue.NewStr(rec.Str("name", "")));
+            o.Put("kinds", rec.Get("kinds"));
+            o.Put("owners", rec.Get("owners"));
+            o.Put("defs", rec.Get("defs"));
+            o.Put("defCount", JsonValue.NewNum(
+                Convert.ToString(rec.Int("defCount", 0))));
+            o.Put("refCount", JsonValue.NewNum(
+                Convert.ToString(rec.Int("refCount", 0))));
+            o.Put("testRefs", JsonValue.NewNum(
+                Convert.ToString(rec.Int("testRefs", 0))));
+            o.Put("refs", McpServer.HeadOf(rec.Get("refs"), limit));
+            o.Put("subtypes", rec.Get("subtypes"));
+            o.Put("evidence", JsonValue.NewStr(
+                "text-level identifier matches minus declaration lines; not"
+                + " overload-resolved. 'subtypes' comes from declared bases."));
+            return o.ToJson();
+        }
+        JsonValue miss = JsonValue.NewObject();
+        miss.Put("name", JsonValue.NewStr(name));
+        miss.Put("refCount", JsonValue.NewNum("0"));
+        miss.Put("hint", JsonValue.NewStr(
+            "no indexed name matches; the index keys simple names"
+            + " (\"ReadAllText\", not \"File.ReadAllText\")"));
+        return miss.ToJson();
+    }
+
+    static string GameSimulateTrajectory(float gravity, float jumpVelocity, float airFriction, int frames) {
+        if (frames <= 0) { frames = 60; }
+        if (frames > 180) { frames = 180; }
+        if (gravity <= 0.0f) { gravity = 980.0f; }
+        if (jumpVelocity <= 0.0f) { jumpVelocity = 450.0f; }
+
+        float dt = 1.0f / 60.0f;
+        float y = 0.0f;
+        float vy = 0.0f - jumpVelocity;
+        float maxApex = 0.0f;
+        int apexFrame = 0;
+        int landFrame = 0;
+        bool landed = false;
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== Trajectory Simulation ===\n");
+        sb.Append("Params: Gravity=" + Convert.ToString(gravity) + " px/s^2, JumpVy=" + Convert.ToString(jumpVelocity) + " px/s, AirFriction=" + Convert.ToString(airFriction) + "\n\n");
+        sb.Append("Frame |   Time(s) |  Height(px) |   Vy(px/s) | Event\n");
+        sb.Append("------+-----------+-------------+------------+----------------\n");
+
+        for (int f = 1; f <= frames; f = f + 1) {
+            float prevVy = vy;
+            vy = vy + gravity * dt;
+            if (airFriction > 0.0f) {
+                vy = vy * (1.0f - airFriction * dt);
+            }
+            y = y + vy * dt;
+
+            float height = 0.0f - y;
+            if (height > maxApex) {
+                maxApex = height;
+                apexFrame = f;
+            }
+
+            string evt = "";
+            if (f == 1) { evt = "Jump Start"; }
+            else if (prevVy < 0.0f && vy >= 0.0f) { evt = "Apex (Peak)"; }
+
+            if (f > 1 && y >= 0.0f && !landed) {
+                landed = true;
+                landFrame = f;
+                y = 0.0f;
+                height = 0.0f;
+                evt = "Touchdown";
+            }
+
+            if (f <= 25 || f == apexFrame || f == landFrame || f % 5 == 0 || (f <= landFrame + 3 && landed)) {
+                sb.Append(Convert.ToString(f));
+                sb.Append("     | ");
+                sb.Append(Convert.ToString(f * dt));
+                sb.Append("s   | ");
+                sb.Append(Convert.ToString(height));
+                sb.Append("px    | ");
+                sb.Append(Convert.ToString(vy));
+                sb.Append("px/s | ");
+                sb.Append(evt);
+                sb.Append("\n");
+            }
+        }
+
+        sb.Append("\n--- Analysis & Feel Summary ---\n");
+        sb.Append("Max Apex Height : " + Convert.ToString(maxApex) + " px\n");
+        sb.Append("Time to Apex    : " + Convert.ToString(apexFrame * dt) + " s (" + Convert.ToString(apexFrame) + " frames)\n");
+        if (landed) {
+            sb.Append("Total Air Time  : " + Convert.ToString(landFrame * dt) + " s (" + Convert.ToString(landFrame) + " frames)\n");
+        } else {
+            sb.Append("Total Air Time  : > " + Convert.ToString(frames * dt) + " s (Did not land within frames)\n");
+        }
+
+        string style = "Balanced Platformer (Celeste / Mario-like)";
+        if (apexFrame < 15 && maxApex < 120.0f) {
+            style = "Snappy & Grounded (Hollow Knight / Megaman-like)";
+        } else if (apexFrame > 28 || maxApex > 260.0f) {
+            style = "Floaty / Lunar (Moon Gravity / Super Meat Boy float-hang)";
+        }
+        sb.Append("Game Feel Style : " + style + "\n");
+
+        JsonValue res = JsonValue.NewObject();
+        res.Put("ok", JsonValue.NewBool(true));
+        res.Put("apex_height", JsonValue.NewNum(Convert.ToString(maxApex)));
+        res.Put("apex_frame", JsonValue.NewNum(Convert.ToString(apexFrame)));
+        res.Put("air_time_frames", JsonValue.NewNum(Convert.ToString(landFrame)));
+        res.Put("style", JsonValue.NewStr(style));
+        res.Put("report", JsonValue.NewStr(sb.ToString()));
+        return res.ToJson();
+    }
+
+    static string GameFrameBudgetCheck(string file) {
+        string full = file;
+        if (!File.Exists(full)) {
+            full = McpServer.root + "/" + file;
+        }
+        if (!File.Exists(full)) {
+            return "error: source file not found: " + file;
+        }
+
+        string code = File.ReadAllText(full);
+        List<string> warnings = new List<string>();
+        int allocCount = 0;
+
+        int pos = 0;
+        int lineNum = 1;
+        bool inUpdate = false;
+
+        List<string> lines = code.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string l = lines[i];
+            string trimmed = McpServer.Trim(l);
+
+            if (McpServer.Find(l, "void Update(") >= 0 || McpServer.Find(l, "void OnUpdate(") >= 0
+                || McpServer.Find(l, "void Tick(") >= 0 || McpServer.Find(l, "void Render(") >= 0
+                || McpServer.Find(l, "void Draw(") >= 0) {
+                inUpdate = true;
+            }
+
+            if (inUpdate) {
+                if (McpServer.Find(trimmed, "new ") >= 0 && McpServer.Find(trimmed, "new List") >= 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [HOT-PATH ALLOC] 'new List' in frame loop. Pre-allocate or reuse instance.");
+                    allocCount = allocCount + 1;
+                } else if (McpServer.Find(trimmed, "new ") >= 0 && McpServer.Find(trimmed, "new ") != McpServer.Find(trimmed, "new Point") && McpServer.Find(trimmed, "new Rect") < 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [HOT-PATH ALLOC] Heap allocation 'new' detected in hot frame loop. Use ObjectPool<T>.");
+                    allocCount = allocCount + 1;
+                }
+
+                if (McpServer.Find(trimmed, "GC.Collect(") >= 0) {
+                    warnings.Add("Line " + Convert.ToString(i + 1) + ": [CRITICAL] GC.Collect() invoked in frame loop! Guaranteed frame hitch.");
+                }
+
+                if (trimmed == "}") {
+                    if (l.Length > 0 && l[0] == '}') {
+                        inUpdate = false;
+                    }
+                }
+            }
+        }
+
+        JsonValue res = JsonValue.NewObject();
+        res.Put("file", JsonValue.NewStr(file));
+        res.Put("budget_ms", JsonValue.NewNum("16.6"));
+        res.Put("hot_path_allocations", JsonValue.NewNum(Convert.ToString(allocCount)));
+        res.Put("pass", JsonValue.NewBool(allocCount == 0));
+
+        JsonValue warnArr = JsonValue.NewArray();
+        for (int w = 0; w < warnings.Count; w = w + 1) {
+            warnArr.Append(JsonValue.NewStr(warnings[w]));
+        }
+        res.Put("diagnostics", warnArr);
+        return res.ToJson();
+    }
+
+    static JsonValue HeadOf(JsonValue arr, int limit) {
+        JsonValue outp = JsonValue.NewArray();
+        if (arr == null) { return outp; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            if (i >= limit) { break; }
+            outp.Append(JsonValue.NewStr(arr.At(i).AsString("")));
+        }
+        return outp;
+    }
+
+    static string AfterLastDot(string s) {
+        int cut = -1;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (s.Substring(i, 1) == ".") { cut = i; }
+        }
+        if (cut < 0) { return s; }
+        return s.Substring(cut + 1, s.Length - cut - 1);
+    }
+
+    static string NameField(string line) {
+        int key = McpServer.Find(line, "\"name\":\"");
+        if (key < 0) { return ""; }
+        int from = key + 8;
+        int end = from;
+        while (end < line.Length && (line[end] & 255) != 34) { end = end + 1; }
+        if (end >= line.Length) { return ""; }
+        return line.Substring(from, end - from).ToLower();
+    }
+
+    static JsonValue IndexRecord(string line) {
+        string t = line;
+        if (McpServer.Find(t, "\"name\"") < 0) { return null; }
+        if (t.Length > 0 && t.Substring(t.Length - 1, 1) == ",") {
+            t = t.Substring(0, t.Length - 1);
+        }
+        return McpServer.ParseBody(t);
+    }
+
+    static int SourceRank(string file) {
+        if (McpServer.Starts(file, "stdlib/")) { return 0; }
+        if (McpServer.Starts(file, "src/")) { return 0; }
+        if (McpServer.Starts(file, "tools/")) { return 1; }
+        if (McpServer.Starts(file, "templates/")) { return 2; }
+        if (McpServer.Starts(file, "examples/")) { return 2; }
+        if (McpServer.Starts(file, "tests/")) { return 3; }
+        return 2;
+    }
+
+    static int RANK_MAX() { return 3; }
+
+    static int CandCap() { return 400; }
+
+    static bool Starts(string s, string p) {
+        if (s.Length < p.Length) { return false; }
+        return s.Substring(0, p.Length) == p;
+    }
+
+    // rank.
+    static JsonValue RankedTake(List<JsonValue> recs, int limit) {
+        JsonValue outp = JsonValue.NewArray();
+        for (int r = 0; r <= McpServer.RANK_MAX(); r = r + 1) {
+            for (int i = 0; i < recs.Count; i = i + 1) {
+                if (outp.Count() >= limit) { return outp; }
+                JsonValue rec = recs[i];
+                if (McpServer.SourceRank(rec.Str("file", "")) != r) { continue; }
+                outp.Append(rec);
+            }
+        }
+        return outp;
+    }
+
+    static string NoIndex() {
+        return "error: symbol index not found at " + McpServer.indexPath
+            + "; generate it with: zanc tools/repomap/RepoMap.zan"
+            + " --auto-stdlib -o repomap.exe && repomap.exe .";
+    }
+
+    // record, case-insensitively.
+    static bool TokensMatch(string line, string query) {
+        string l = line.ToLower();
+        string q = query.ToLower();
+        int start = 0;
+        int i = 0;
+        while (i <= q.Length) {
+            bool end = i == q.Length;
+            bool space = false;
+            if (!end) {
+                int c = q[i] & 255;
+                space = c == 32 || c == 9;
+            }
+            if (end || space) {
+                if (i > start) {
+                    if (McpServer.Find(l, q.Substring(start, i - start)) < 0) {
+                        return false;
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+
+    static string IndexMissingMsg(string rel) {
+        return "error: " + rel + " has not been generated for this workspace;"
+            + " call zan_refresh_index (or compile with ZAN_INDEX_DIR=<root>"
+            + "/.zanmap set) to build it";
+    }
+
+    static bool FieldHas(JsonValue rec, string key, string needle) {
+        return McpServer.Find(rec.Str(key, "").ToLower(), needle) >= 0;
+    }
+
+    static string RouteLookup(JsonValue args) {
+        if (!File.Exists(McpServer.routesIndexPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/routes.json");
+        }
+        JsonValue all = McpServer.ParseBody(
+            File.ReadAllText(McpServer.routesIndexPath));
+        if (all == null || !all.IsArray()) {
+            return "error: .zanmap/routes.json is not a JSON array";
+        }
+        string q = args.Str("query", "").ToLower();
+        string verb = args.Str("method", "").ToUpper();
+        bool unmarked = args.Bool("unmarked_perm", false);
+        int limit = args.Int("limit", 40);
+        JsonValue hits = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            JsonValue r = all.At(i);
+            if (verb != "" && r.Str("method", "") != verb) { continue; }
+            if (unmarked && r.Str("perm", "") != "") { continue; }
+            if (q != "" && !McpServer.FieldHas(r, "path", q)
+                && !McpServer.FieldHas(r, "action", q)
+                && !McpServer.FieldHas(r, "controller", q)
+                && !McpServer.FieldHas(r, "module", q)
+                && !McpServer.FieldHas(r, "title", q)) {
+                continue;
+            }
+            total = total + 1;
+            if (hits.Count() < limit) { hits.Append(r); }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("routes", hits);
+        o.Put("matched", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("indexed", JsonValue.NewNum(Convert.ToString(all.Count())));
+        o.Put("truncated", JsonValue.NewBool(total > hits.Count()));
+        return o.ToJson();
+    }
+
+    static string OrmLookup(JsonValue args) {
+        if (!File.Exists(McpServer.entitiesIndexPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/entities.json");
+        }
+        JsonValue all = McpServer.ParseBody(
+            File.ReadAllText(McpServer.entitiesIndexPath));
+        if (all == null || !all.IsArray()) {
+            return "error: .zanmap/entities.json is not a JSON array";
+        }
+        string q = args.Str("query", "").ToLower();
+        string col = args.Str("column", "").ToLower();
+        int limit = args.Int("limit", 10);
+        JsonValue hits = JsonValue.NewArray();
+        JsonValue names = JsonValue.NewArray();
+        int total = 0;
+        for (int i = 0; i < all.Count(); i = i + 1) {
+            JsonValue e = all.At(i);
+            names.Append(JsonValue.NewStr(e.Str("name", "")
+                + " -> " + e.Str("table", "")));
+            if (q != "" && !McpServer.FieldHas(e, "name", q)
+                && !McpServer.FieldHas(e, "table", q)
+                && !McpServer.FieldHas(e, "ns", q)) {
+                continue;
+            }
+            if (col != "" && !McpServer.EntityHasColumn(e, col)) { continue; }
+            total = total + 1;
+            if (hits.Count() < limit) { hits.Append(e); }
+        }
+        JsonValue o = JsonValue.NewObject();
+        if (q == "" && col == "") {
+            o.Put("entities", names);
+            o.Put("usage", JsonValue.NewStr(
+                "pass query=<entity|table> for the full column list, or"
+                + " column=<name> to find which entities carry a column"));
+            return o.ToJson();
+        }
+        o.Put("entities", hits);
+        o.Put("matched", JsonValue.NewNum(Convert.ToString(total)));
+        o.Put("indexed", JsonValue.NewNum(Convert.ToString(all.Count())));
+        o.Put("truncated", JsonValue.NewBool(total > hits.Count()));
+        return o.ToJson();
+    }
+
+    static bool EntityHasColumn(JsonValue e, string needle) {
+        JsonValue cols = e.Get("columns");
+        if (cols == null) { return false; }
+        for (int i = 0; i < cols.Count(); i = i + 1) {
+            JsonValue c = cols.At(i);
+            if (McpServer.FieldHas(c, "column", needle)) { return true; }
+            if (McpServer.FieldHas(c, "field", needle)) { return true; }
+        }
+        return false;
+    }
+
+    static string ProjectOverview(int limit) {
+        if (!File.Exists(McpServer.indexManifestPath)) {
+            return McpServer.IndexMissingMsg(".zanmap/index.json");
+        }
+        JsonValue man = McpServer.ParseBody(
+            File.ReadAllText(McpServer.indexManifestPath));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("root", JsonValue.NewStr(McpServer.root));
+        if (man != null) {
+            o.Put("generatedBy", man.Get("generatedBy"));
+            o.Put("sourceFiles", man.Get("sourceFiles"));
+        }
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue mods = JsonValue.NewObject();
+        JsonValue verbs = JsonValue.NewObject();
+        JsonValue unmarked = JsonValue.NewArray();
+        int unmarkedTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null) { continue; }
+            McpServer.Bump(mods, r.Str("module", ""));
+            McpServer.Bump(verbs, r.Str("method", ""));
+            if (r.Str("perm", "") == "" && r.Str("auth", "") == "Grant") {
+                unmarkedTotal = unmarkedTotal + 1;
+                if (unmarked.Count() < limit) {
+                    unmarked.Append(JsonValue.NewStr(r.Str("action", "")));
+                }
+            }
+        }
+        JsonValue tables = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            if (tables.Count() >= limit) { break; }
+            tables.Append(JsonValue.NewStr(e.Str("name", "") + " -> "
+                + e.Str("table", "")));
+        }
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes.Count())));
+        o.Put("routesByModule", mods);
+        o.Put("routesByMethod", verbs);
+        o.Put("entities", JsonValue.NewNum(Convert.ToString(ents.Count())));
+        o.Put("tables", tables);
+        o.Put("authorizedWithoutPerm",
+            JsonValue.NewNum(Convert.ToString(unmarkedTotal)));
+        o.Put("authorizedWithoutPermSample", unmarked);
+        o.Put("next", JsonValue.NewStr(
+            "zan_route_lookup for an URL or action, zan_orm_lookup for an"
+            + " entity's columns and facades, zan_change_impact before"
+            + " editing a shared symbol, zan_read_context to see one"
+            + " definition"));
+        return o.ToJson();
+    }
+
+    static JsonValue IndexArray(string path) {
+        if (!File.Exists(path)) { return JsonValue.NewArray(); }
+        JsonValue all = McpServer.ParseBody(File.ReadAllText(path));
+        if (all == null || !all.IsArray()) { return JsonValue.NewArray(); }
+        return all;
+    }
+
+    static void Bump(JsonValue map, string key) {
+        string k = key;
+        if (k == "") { k = "(none)"; }
+        int n = 0;
+        if (map.Has(k)) {
+            JsonValue cur = map.Get(k);
+            if (cur != null) { n = cur.AsInt(0); }
+        }
+        map.Set(k, JsonValue.NewNum(Convert.ToString(n + 1)));
+    }
+
+    // 
+    static string ChangeImpact(string name, int limit) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: reference index not found at " + McpServer.refsPath
+                + "; generate it with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o repomap.exe && repomap.exe .";
+        }
+        string simple = McpServer.AfterLastDot(name).ToLower();
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        JsonValue rec = null;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) != simple) { continue; }
+            rec = McpServer.IndexRecord(lines[i]);
+            if (rec != null) { break; }
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        if (rec == null) {
+            o.Put("hint", JsonValue.NewStr(
+                "no indexed name matches; the index keys simple names"
+                + " (\"OpenRouterKey\", not \"Model.OpenRouterKey\")"));
+            return o.ToJson();
+        }
+        JsonValue files = JsonValue.NewObject();
+        McpServer.CountSites(files, rec.Get("defs"));
+        McpServer.CountSites(files, rec.Get("refs"));
+        o.Put("defs", rec.Get("defs"));
+        o.Put("refCount", JsonValue.NewNum(
+            Convert.ToString(rec.Int("refCount", 0))));
+        o.Put("testRefs", JsonValue.NewNum(
+            Convert.ToString(rec.Int("testRefs", 0))));
+        o.Put("files", files);
+        o.Put("subtypes", rec.Get("subtypes"));
+
+        JsonValue routes = McpServer.IndexArray(McpServer.routesIndexPath);
+        JsonValue hitRoutes = JsonValue.NewArray();
+        int routeTotal = 0;
+        for (int i = 0; i < routes.Count(); i = i + 1) {
+            JsonValue r = routes.At(i);
+            if (r == null || !files.Has(r.Str("file", ""))) { continue; }
+            routeTotal = routeTotal + 1;
+            if (hitRoutes.Count() >= limit) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("method", r.Get("method"));
+            row.Put("path", r.Get("path"));
+            row.Put("action", r.Get("action"));
+            row.Put("perm", r.Get("perm"));
+            hitRoutes.Append(row);
+        }
+        JsonValue ents = McpServer.IndexArray(McpServer.entitiesIndexPath);
+        JsonValue hitEnts = JsonValue.NewArray();
+        for (int i = 0; i < ents.Count(); i = i + 1) {
+            JsonValue e = ents.At(i);
+            if (e == null) { continue; }
+            bool byFile = files.Has(e.Str("file", ""));
+            bool byName = e.Str("name", "").ToLower() == simple;
+            if (!byFile && !byName) { continue; }
+            JsonValue row = JsonValue.NewObject();
+            row.Put("name", e.Get("name"));
+            row.Put("table", e.Get("table"));
+            row.Put("file", e.Get("file"));
+            hitEnts.Append(row);
+        }
+        o.Put("routes", hitRoutes);
+        o.Put("routesAffected", JsonValue.NewNum(
+            Convert.ToString(routeTotal)));
+        o.Put("entities", hitEnts);
+        o.Put("evidence", JsonValue.NewStr(
+            "'files' and 'refCount' are text-level identifier matches (review"
+            + " them); 'routes'/'entities' are exact, derived from the"
+            + " compiler's unit metadata for the files that mention the name"));
+        return o.ToJson();
+    }
+
+    static void CountSites(JsonValue map, JsonValue arr) {
+        if (arr == null || !arr.IsArray()) { return; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            string site = arr.At(i).AsString("");
+            int cut = site.LastIndexOf(":");
+            if (cut > 0) { site = site.Substring(0, cut); }
+            if (site == "") { continue; }
+            McpServer.Bump(map, site);
+        }
+    }
+
+    static string ReadContext(string name, int before, int lines) {
+        if (name == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.indexPath)) { return McpServer.NoIndex(); }
+        string lower = name.ToLower();
+        string dotted = "." + lower;
+        List<string> idx = File.ReadAllLines(McpServer.indexPath);
+        List<JsonValue> cands = new List<JsonValue>();
+        for (int i = 0; i < idx.Count; i = i + 1) {
+            if (cands.Count >= McpServer.CandCap()) { break; }
+            string full = McpServer.NameField(idx[i]);
+            if (full == "") { continue; }
+            bool exact = full == lower;
+            bool member = full.Length > dotted.Length
+                && full.Substring(full.Length - dotted.Length,
+                                  dotted.Length) == dotted;
+            if (!exact && !member) { continue; }
+            JsonValue rec = McpServer.IndexRecord(idx[i]);
+            if (rec != null) { cands.Add(rec); }
+        }
+        JsonValue best = McpServer.RankedTake(cands, 1);
+        if (best.Count() == 0) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("hint", JsonValue.NewStr(
+                "no definition indexed for that name; try zan_api_search"));
+            return miss.ToJson();
+        }
+        JsonValue def = best.At(0);
+        string rel = def.Str("file", "");
+        int line = def.Int("line", 0);
+        string full2 = McpServer.Resolve(rel);
+        if (rel == "" || full2 == "" || !File.Exists(full2)) {
+            JsonValue miss = JsonValue.NewObject();
+            miss.Put("symbol", JsonValue.NewStr(name));
+            miss.Put("definition", def);
+            miss.Put("hint", JsonValue.NewStr(
+                "the definition lives outside this workspace ('" + rel
+                + "'); the index record above is all this server can show"));
+            return miss.ToJson();
+        }
+        int from = line - before;
+        if (from < 1) { from = 1; }
+        JsonValue args = JsonValue.NewObject();
+        args.Put("from_line", JsonValue.NewNum(Convert.ToString(from)));
+        args.Put("max_lines", JsonValue.NewNum(Convert.ToString(lines)));
+        JsonValue win = McpServer.ParseBody(
+            McpServer.ReadLinesDoc(rel, full2, args));
+        JsonValue o = JsonValue.NewObject();
+        o.Put("symbol", JsonValue.NewStr(name));
+        o.Put("definition", def);
+        if (win != null) {
+            o.Put("from_line", win.Get("from_line"));
+            o.Put("to_line", win.Get("to_line"));
+            o.Put("fileLines", win.Get("lines"));
+            o.Put("content", win.Get("content"));
+        }
+        return o.ToJson();
+    }
+
+
+    static string CleanJsonStr(string s) {
+        if (s.Length >= 2 && s.Substring(0, 1) == "\"" && s.Substring(s.Length - 1, 1) == "\"") {
+            return s.Substring(1, s.Length - 2);
+        }
+        return s;
+    }
+
+
+    static bool LoadCallGraph(Dictionary<string, JsonValue> byId, Dictionary<string, List<JsonValue>> byName) {
+        if (!File.Exists(McpServer.callGraphPath)) { return false; }
+        if (McpServer.callGraphPath.Length >= 6 && McpServer.callGraphPath.Substring(McpServer.callGraphPath.Length - 6, 6) == ".jsonl") {
+            List<string> lines = File.ReadAllLines(McpServer.callGraphPath);
+            for (int i = 0; i < lines.Count; i = i + 1) {
+                string l = lines[i];
+                if (l.Length == 0) { continue; }
+                JsonValue n = McpServer.ParseBody(l);
+                if (n == null) { continue; }
+                string id = n.Str("id", "");
+                string name = n.Str("name", "");
+                byId[id] = n;
+                if (!byName.ContainsKey(name)) { byName[name] = new List<JsonValue>(); }
+                byName[name].Add(n);
+            }
+            return true;
+        }
+        string raw = File.ReadAllText(McpServer.callGraphPath);
+        JsonValue doc = McpServer.ParseBody(raw);
+        if (doc == null) { return false; }
+        JsonValue nodes = doc.Get("nodes");
+        if (nodes == null || !nodes.IsArray()) { return false; }
+        for (int i = 0; i < nodes.Count(); i = i + 1) {
+            JsonValue n = nodes.At(i);
+            string id = n.Str("id", "");
+            string name = n.Str("name", "");
+            byId[id] = n;
+            if (!byName.ContainsKey(name)) { byName[name] = new List<JsonValue>(); }
+            byName[name].Add(n);
+        }
+        return true;
+    }
+
+    static string CallChain(string symbol, string direction, int maxDepth) {
+        if (symbol == "") { return "error: 'symbol' is required (e.g. 'Program.Main' or 'CallTool')"; }
+        if (!File.Exists(McpServer.callGraphPath)) {
+            return "error: call graph not found at " + McpServer.callGraphPath
+                + "; generate it with: repomap.exe .";
+        }
+        Dictionary<string, JsonValue> byId = new Dictionary<string, JsonValue>();
+        Dictionary<string, List<JsonValue>> byName = new Dictionary<string, List<JsonValue>>();
+        if (!McpServer.LoadCallGraph(byId, byName)) {
+            return "error: failed to load call graph from " + McpServer.callGraphPath;
+        }
+
+        JsonValue rootNode = null;
+        if (byId.ContainsKey(symbol)) {
+            rootNode = byId[symbol];
+        } else if (byName.ContainsKey(symbol)) {
+            List<JsonValue> cands = byName[symbol];
+            if (cands.Count == 1) {
+                rootNode = cands[0];
+            } else {
+                StringBuilder candMsg = new StringBuilder();
+                candMsg.Append("Ambiguous symbol '" + symbol + "', matches " + Convert.ToString(cands.Count) + " methods:\n");
+                for (int c = 0; c < cands.Count && c < 8; c = c + 1) {
+                    candMsg.Append("  - " + cands[c].Str("id", "") + " (" + cands[c].Str("file", "") + ":" + Convert.ToString(cands[c].Int("line", 0)) + ")\n");
+                }
+                candMsg.Append("Please specify full ID: ClassName.MethodName");
+                return candMsg.ToString();
+            }
+        }
+
+        if (rootNode == null) {
+            return "Symbol '" + symbol + "' not found in project call graph.";
+        }
+
+        bool outgoing = (direction != "incoming");
+        StringBuilder sb = new StringBuilder();
+        sb.Append("[Call Hierarchy (" + (outgoing ? "outgoing / Callee Tree" : "incoming / Caller Tree") + ", maxDepth=" + Convert.ToString(maxDepth) + ")]\n");
+
+        List<string> visited = new List<string>();
+        McpServer.FormatCallTree(rootNode, byId, outgoing, 0, maxDepth, visited, sb);
+        return sb.ToString();
+    }
+
+    static void FormatCallTree(JsonValue current, Dictionary<string, JsonValue> byId, bool outgoing, int depth, int maxDepth, List<string> visited, StringBuilder sb) {
+        string indent = "";
+        for (int i = 0; i < depth; i = i + 1) { indent = indent + "  "; }
+
+        string id = current.Str("id", "");
+        string file = current.Str("file", "");
+        int line = current.Int("line", 0);
+        string sig = current.Str("sig", "");
+
+        sb.Append(indent);
+        if (depth > 0) { sb.Append("├── "); }
+        sb.Append(id);
+        if (line > 0) {
+            sb.Append(" [");
+            sb.Append(file);
+            sb.Append(":");
+            sb.Append(Convert.ToString(line));
+            sb.Append("]");
+        }
+        if (sig.Length > 0 && depth == 0) {
+            sb.Append(" :: ");
+            sb.Append(sig);
+        }
+
+        for (int v = 0; v < visited.Count; v = v + 1) {
+            if (visited[v] == id) {
+                sb.Append(" (recursion)\n");
+                return;
+            }
+        }
+        sb.Append("\n");
+
+        if (depth >= maxDepth) { return; }
+
+        visited.Add(id);
+
+        JsonValue targets = outgoing ? current.Get("callees") : current.Get("callers");
+        if (targets != null && targets.IsArray()) {
+            for (int i = 0; i < targets.Count(); i = i + 1) {
+                string targetId = McpServer.CleanJsonStr(targets.At(i).ToJson());
+                if (byId.ContainsKey(targetId)) {
+                    McpServer.FormatCallTree(byId[targetId], byId, outgoing, depth + 1, maxDepth, visited, sb);
+                } else {
+                    sb.Append(indent + "  ├── " + targetId + " (external/stdlib)\n");
+                }
+            }
+        }
+
+        visited.RemoveAt(visited.Count - 1);
+    }
+
+    static string TypeHierarchy(string typeName) {
+        if (typeName == "") { return "error: 'type' is required"; }
+        if (!File.Exists(McpServer.refsPath)) {
+            return "error: refs.json not found at " + McpServer.refsPath;
+        }
+        List<string> lines = File.ReadAllLines(McpServer.refsPath);
+        string simple = McpServer.AfterLastDot(typeName).ToLower();
+        JsonValue targetRec = null;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (McpServer.NameField(lines[i]) == simple) {
+                targetRec = McpServer.IndexRecord(lines[i]);
+                if (targetRec != null) { break; }
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Type Hierarchy for '" + typeName + "'] ===\n");
+        if (targetRec == null) {
+            sb.Append("Type '" + typeName + "' not found in reference index.\n");
+            return sb.ToString();
+        }
+
+        JsonValue defs = targetRec.Get("defs");
+        if (defs != null && defs.IsArray() && defs.Count() > 0) {
+            sb.Append("Declared at:\n");
+            for (int d = 0; d < defs.Count(); d = d + 1) {
+                sb.Append("  - " + defs.At(d).ToJson() + "\n");
+            }
+        }
+
+        JsonValue subtypes = targetRec.Get("subtypes");
+        if (subtypes != null && subtypes.IsArray() && subtypes.Count() > 0) {
+            sb.Append("Derived Classes / Implementations (" + Convert.ToString(subtypes.Count()) + "):\n");
+            for (int s = 0; s < subtypes.Count(); s = s + 1) {
+                sb.Append("  ├── " + subtypes.At(s).ToJson() + "\n");
+            }
+        } else {
+            sb.Append("No known derived classes or subtypes in this workspace.\n");
+        }
+        return sb.ToString();
+    }
+
+    static string BlastRadius(string symbol, int maxDepth) {
+        if (symbol == "") { return "error: 'symbol' is required"; }
+        if (!File.Exists(McpServer.callGraphPath)) {
+            return "error: call graph not found at " + McpServer.callGraphPath;
+        }
+        Dictionary<string, JsonValue> byId = new Dictionary<string, JsonValue>();
+        Dictionary<string, List<JsonValue>> byName = new Dictionary<string, List<JsonValue>>();
+        if (!McpServer.LoadCallGraph(byId, byName)) {
+            return "error: failed to load call graph from " + McpServer.callGraphPath;
+        }
+
+        JsonValue rootNode = null;
+        if (byId.ContainsKey(symbol)) { rootNode = byId[symbol]; }
+        else if (byName.ContainsKey(symbol)) {
+            List<JsonValue> cands = byName[symbol];
+            if (cands.Count == 1) { rootNode = cands[0]; }
+        }
+
+        if (rootNode == null) {
+            return "Symbol '" + symbol + "' not found in call graph.";
+        }
+
+        string rootId = rootNode.Str("id", "");
+        List<string> directCallers = new List<string>();
+        List<string> indirectCallers = new List<string>();
+        List<string> affectedFiles = new List<string>();
+        List<string> queue = new List<string>();
+        Dictionary<string, int> visited = new Dictionary<string, int>();
+
+        visited[rootId] = 1;
+        string rootFile = rootNode.Str("file", "");
+        if (rootFile.Length > 0) { affectedFiles.Add(rootFile); }
+
+        JsonValue callers = rootNode.Get("callers");
+        if (callers != null && callers.IsArray()) {
+            for (int i = 0; i < callers.Count(); i = i + 1) {
+                string cid = McpServer.CleanJsonStr(callers.At(i).ToJson());
+                directCallers.Add(cid);
+                queue.Add(cid);
+                visited[cid] = 1;
+            }
+        }
+
+        int curDepth = 1;
+        while (queue.Count > 0 && curDepth < maxDepth) {
+            int qLen = queue.Count;
+            for (int q = 0; q < qLen; q = q + 1) {
+                string nextId = queue[0];
+                queue.RemoveAt(0);
+                if (byId.ContainsKey(nextId)) {
+                    JsonValue n = byId[nextId];
+                    string f = n.Str("file", "");
+                    bool found = false;
+                    for (int fi = 0; fi < affectedFiles.Count; fi = fi + 1) {
+                        if (affectedFiles[fi] == f) { found = true; break; }
+                    }
+                    if (!found && f.Length > 0) { affectedFiles.Add(f); }
+
+                    JsonValue upCallers = n.Get("callers");
+                    if (upCallers != null && upCallers.IsArray()) {
+                        for (int u = 0; u < upCallers.Count(); u = u + 1) {
+                            string upId = McpServer.CleanJsonStr(upCallers.At(u).ToJson());
+                            if (!visited.ContainsKey(upId)) {
+                                visited[upId] = 1;
+                                indirectCallers.Add(upId);
+                                queue.Add(upId);
+                            }
+                        }
+                    }
+                }
+            }
+            curDepth = curDepth + 1;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Blast Radius / Impact Matrix for " + rootId + "] ===\n");
+        sb.Append("Target: " + rootNode.Str("file", "") + ":" + Convert.ToString(rootNode.Int("line", 0)) + "\n");
+        sb.Append("Direct Callers (" + Convert.ToString(directCallers.Count) + "):\n");
+        for (int i = 0; i < directCallers.Count; i = i + 1) {
+            sb.Append("  - " + directCallers[i]);
+            if (byId.ContainsKey(directCallers[i])) {
+                sb.Append(" (" + byId[directCallers[i]].Str("file", "") + ")");
+            }
+            sb.Append("\n");
+        }
+        sb.Append("Indirect Callers (" + Convert.ToString(indirectCallers.Count) + "):\n");
+        for (int i = 0; i < indirectCallers.Count && i < 15; i = i + 1) {
+            sb.Append("  - " + indirectCallers[i]);
+            if (byId.ContainsKey(indirectCallers[i])) {
+                sb.Append(" (" + byId[indirectCallers[i]].Str("file", "") + ")");
+            }
+            sb.Append("\n");
+        }
+        if (indirectCallers.Count > 15) {
+            sb.Append("  ... and " + Convert.ToString(indirectCallers.Count - 15) + " more.\n");
+        }
+
+        sb.Append("Total Affected Files: " + Convert.ToString(affectedFiles.Count) + "\n");
+        string risk = "Low";
+        if (directCallers.Count > 10 || indirectCallers.Count > 25) { risk = "HIGH (Critical Hub Symbol)"; }
+        else if (directCallers.Count > 3 || indirectCallers.Count > 8) { risk = "MEDIUM"; }
+        sb.Append("Risk Rating: " + risk + "\n");
+        return sb.ToString();
+    }
+
+    static string ArchCheck() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Zan Architecture & Rules Check (Rules as Code)] ===\n");
+        int violations = 0;
+
+        string ideDir = McpServer.root + "/src/ide_zan";
+        if (Directory.Exists(ideDir)) {
+            List<string> ideFiles = new List<string>();
+            McpServer.Walk("src/ide_zan", ideDir, "*.zan", "", 1000, ideFiles, 0);
+            for (int i = 0; i < ideFiles.Count; i = i + 1) {
+                string rel = ideFiles[i];
+                string abs = McpServer.root + "/" + rel;
+                string content = File.ReadAllText(abs);
+                List<string> lines = File.ReadAllLines(abs);
+                for (int l = 0; l < lines.Count; l = l + 1) {
+                    string line = lines[l];
+                    if (McpServer.Find(line, "DirectDraw(") >= 0 || McpServer.Find(line, "DrawText(") >= 0 || McpServer.Find(line, "FillRect(") >= 0) {
+                        violations = violations + 1;
+                        sb.Append("[FAIL - ArchRule-01: ZanIDE Custom Draw Forbidden]\n");
+                        sb.Append("  File: " + rel + ":" + Convert.ToString(l + 1) + "\n");
+                        sb.Append("  Code: " + line.Trim() + "\n");
+                        sb.Append("  Constraint: ZanIDE must use standard library components (stdlib/Gui/Component/*), direct drawing is forbidden.\n");
+                    }
+                }
+            }
+        }
+
+        string ctrlDir = McpServer.root + "/src/Controller";
+        if (Directory.Exists(ctrlDir)) {
+            List<string> ctrlFiles = new List<string>();
+            McpServer.Walk("src/Controller", ctrlDir, "*.zan", "", 1000, ctrlFiles, 0);
+            for (int i = 0; i < ctrlFiles.Count; i = i + 1) {
+                string rel = ctrlFiles[i];
+                string abs = McpServer.root + "/" + rel;
+                string content = File.ReadAllText(abs);
+                if (McpServer.Find(content, "DllImport(") >= 0) {
+                    violations = violations + 1;
+                    sb.Append("[FAIL - ArchRule-02: Controller Native Leak]\n");
+                    sb.Append("  File: " + rel + "\n");
+                    sb.Append("  Constraint: Web Controllers must delegate through Service layer and never invoke Native DllImport directly.\n");
+                }
+            }
+        }
+
+        if (violations == 0) {
+            sb.Append("All Architecture Rules PASSED (0 violations detected).\n");
+        } else {
+            sb.Append("Total Violations: " + Convert.ToString(violations) + ". Build gate BLOCKED.\n");
+        }
+        return sb.ToString();
+    }
+
+    static async string GuiSnapshotAsync(string srcPath, string actionScript) {
+        if (srcPath == "") { return "error: 'file' is required (e.g. 'examples/gui_gallery/App.zan')"; }
+        string fullSrc = srcPath;
+        if (!File.Exists(fullSrc) && File.Exists(McpServer.root + "/" + srcPath)) {
+            fullSrc = McpServer.root + "/" + srcPath;
+        }
+        if (!File.Exists(fullSrc)) {
+            return "error: source file not found: " + srcPath;
+        }
+
+        string outDir = McpServer.root + "/_scratch/gui_snapshot";
+        Directory.CreateDirectoryRecursive(outDir);
+        string exePath = outDir + "/app.exe";
+        string scriptPath = outDir + "/script.txt";
+        string lintLogPath = outDir + "/lint.log";
+        string treeJsonPath = outDir + "/tree.json";
+        string regionsJsonPath = outDir + "/regions.json";
+
+        if (File.Exists(exePath)) { File.Delete(exePath); }
+        if (File.Exists(lintLogPath)) { File.Delete(lintLogPath); }
+        if (File.Exists(treeJsonPath)) { File.Delete(treeJsonPath); }
+        if (File.Exists(regionsJsonPath)) { File.Delete(regionsJsonPath); }
+
+        string zanc = McpServer.zancPath;
+        if (!File.Exists(zanc)) { zanc = "build/zanc.exe"; }
+        if (!File.Exists(zanc)) {
+            return "error: zanc compiler not found at " + zanc;
+        }
+
+        // 1. 快速构建目标 GUI 程序
+        // 若目标为 .html，需作为首参，并自动关联同目录下所有 .zan code-behind 文件
+        string buildArgs = "\"" + fullSrc + "\"";
+        if (fullSrc.EndsWith(".html") || fullSrc.EndsWith(".htm")) {
+            string srcDir = Path.GetDirectoryName(fullSrc);
+            if (Directory.Exists(srcDir)) {
+                List<string> zanFiles = Directory.GetFiles(srcDir);
+                for (int zi = 0; zi < zanFiles.Count; zi = zi + 1) {
+                    string zf = zanFiles[zi];
+                    if (zf.EndsWith(".zan")) {
+                        string fullZf = srcDir + "/" + zf;
+                        buildArgs = buildArgs + " \"" + fullZf + "\"";
+                    }
+                }
+            }
+        }
+        string buildCmd = "\"" + zanc + "\" " + buildArgs + " --auto-stdlib -o \"" + exePath + "\"";
+        ProcessResult bres = await McpServer.RunProcessAsync(buildCmd);
+        if (bres.exitCode != 0 || !File.Exists(exePath)) {
+            StringBuilder errSb = new StringBuilder();
+            for (int i = 0; i < bres.lines.Count; i = i + 1) {
+                errSb.Append(bres.lines[i]);
+                errSb.Append("\n");
+            }
+            return "error: build failed:\n" + errSb.ToString();
+        }
+
+        // 2. 准备 UiDriver 执行脚本
+        if (actionScript == "") {
+            actionScript = "wait 300\ndump tree tree.json\ndump hitregions regions.json\ndump theme theme.json\nquit\n";
+        } else {
+            if (!actionScript.EndsWith("\n")) { actionScript = actionScript + "\n"; }
+            if (actionScript.IndexOf("quit") < 0) { actionScript = actionScript + "quit\n"; }
+        }
+        File.WriteAllText(scriptPath, actionScript);
+
+        // 3. 在 UiDriver 和 LayoutLint 环境下无头执行
+        string batPath = outDir + "/run.bat";
+        StringBuilder batSb = new StringBuilder();
+        batSb.Append("@echo off\r\n");
+        batSb.Append("set ZAN_UI_SCRIPT=" + scriptPath.Replace("/", "\\") + "\r\n");
+        batSb.Append("set ZAN_UI_OUT=" + outDir.Replace("/", "\\") + "\r\n");
+        batSb.Append("set ZAN_GUI_LAYOUTLINT=1\r\n");
+        batSb.Append("set ZAN_GUI_OVERLAP_LOG=" + lintLogPath.Replace("/", "\\") + "\r\n");
+        batSb.Append("\"" + exePath.Replace("/", "\\") + "\"\r\n");
+        File.WriteAllText(batPath, batSb.ToString());
+
+        string runCmd = "cmd /c \"" + batPath.Replace("/", "\\") + "\"";
+        ProcessResult rres = await McpServer.RunProcessAsync(runCmd);
+
+        // 4. 回收产物与组装诊断
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== [Zan GUI Snapshot & Layout Inspection] ===\n");
+        sb.Append("Target: " + srcPath + "\n");
+        sb.Append("Output Dir: _scratch/gui_snapshot\n\n");
+
+        if (File.Exists(lintLogPath)) {
+            string lintText = File.ReadAllText(lintLogPath);
+            if (lintText.Trim().Length > 0) {
+                sb.Append("--- [Layout Warnings / Lint Diagnostics] ---\n");
+                sb.Append(lintText.Trim() + "\n\n");
+            }
+        }
+
+        if (File.Exists(treeJsonPath)) {
+            string treeJson = File.ReadAllText(treeJsonPath);
+            sb.Append("--- [Control Tree Summary] ---\n");
+            if (treeJson.Length > 2048) {
+                sb.Append(treeJson.Substring(0, 2048) + "\n... (truncated for brevity)\n\n");
+            } else {
+                sb.Append(treeJson + "\n\n");
+            }
+        }
+
+        if (File.Exists(regionsJsonPath)) {
+            string regionsJson = File.ReadAllText(regionsJsonPath);
+            sb.Append("--- [Hit Regions] ---\n");
+            if (regionsJson.Length > 1024) {
+                sb.Append(regionsJson.Substring(0, 1024) + "\n... (truncated)\n\n");
+            } else {
+                sb.Append(regionsJson + "\n\n");
+            }
+        }
+
+        sb.Append("Snapshot execution settled with exit code " + Convert.ToString(rres.exitCode) + ".\n");
+        return sb.ToString();
+    }
+
+
+    static async string RefreshIndex() {
+        List<string> srcs = new List<string>();
+        string scope = "src";
+        if (!Directory.Exists(McpServer.root + "/src")) { scope = ""; }
+        McpServer.Walk(scope, McpServer.Resolve(scope), "*.zan", "",
+                       20000, srcs, 0);
+        JsonValue o = JsonValue.NewObject();
+        if (srcs.Count == 0) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(
+                "no .zan sources found under " + McpServer.root));
+            return o.ToJson();
+        }
+        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
+        string listPath = McpServer.root + "/_scratch/mcp_index_sources.txt";
+        StringBuilder list = new StringBuilder();
+        for (int i = 0; i < srcs.Count; i = i + 1) {
+            list.Append(McpServer.root + "/" + srcs[i]);
+            list.Append("\n");
+        }
+        File.WriteAllText(listPath, list.ToString());
+        string metaPath = McpServer.root + "/_scratch/mcp_index_meta.json";
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"@" + listPath
+            + "\" --stdlib-path \"" + McpServer.stdlibPath
+            + "\" --gen-meta \"" + metaPath + "\"");
+        if (!File.Exists(metaPath)) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr(
+                "zanc --gen-meta produced no metadata"));
+            o.Put("compiler", McpServer.ParseBody(McpServer.DiagResult(res)));
+            return o.ToJson();
+        }
+        JsonValue unit = McpServer.ParseBody(File.ReadAllText(metaPath));
+        if (unit == null) {
+            o.Put("ok", JsonValue.NewBool(false));
+            o.Put("error", JsonValue.NewStr("metadata is not valid JSON"));
+            return o.ToJson();
+        }
+        // 元数据用绝对路径喂的编译器,索引对外只给工作区相对路径。
+        GenIndex.Base = McpServer.root;
+        int routes = GenIndex.WriteTo(unit, McpServer.root + "/.zanmap");
+        JsonValue man = McpServer.ParseBody(
+            File.ReadAllText(McpServer.indexManifestPath));
+        o.Put("ok", JsonValue.NewBool(true));
+        o.Put("sources", JsonValue.NewNum(Convert.ToString(srcs.Count)));
+        o.Put("routes", JsonValue.NewNum(Convert.ToString(routes)));
+        if (man != null) { o.Put("entities", man.Get("entities")); }
+        JsonValue arte = JsonValue.NewArray();
+        arte.Append(JsonValue.NewStr(".zanmap/routes.json"));
+        arte.Append(JsonValue.NewStr(".zanmap/entities.json"));
+        arte.Append(JsonValue.NewStr(".zanmap/index.json"));
+        o.Put("artefacts", arte);
+        o.Put("note", JsonValue.NewStr(
+            "symbols.json/refs.json/repo.map.txt come from"
+            + " tools/repomap/RepoMap.zan and are not touched here"));
+        return o.ToJson();
+    }
+
+    static string Example(string topic) {
+        if (!File.Exists(McpServer.galleryPath)) {
+            return "error: gallery.json not found at " + McpServer.galleryPath;
+        }
+        JsonValue man = McpServer.ParseBody(File.ReadAllText(McpServer.galleryPath));
+        if (man == null) { return "error: gallery.json is not valid JSON"; }
+        JsonValue entries = man.Get("entries");
+        if (entries == null) { return "error: gallery.json has no 'entries'"; }
+        if (topic == "") {
+            JsonValue list = JsonValue.NewArray();
+            for (int i = 0; i < entries.Count(); i = i + 1) {
+                JsonValue e = entries.At(i);
+                JsonValue row = JsonValue.NewObject();
+                row.Put("topic", JsonValue.NewStr(e.Str("topic", "")));
+                row.Put("kind", JsonValue.NewStr(e.Str("kind", "")));
+                row.Put("summary", JsonValue.NewStr(e.Str("summary", "")));
+                list.Append(row);
+            }
+            JsonValue o = JsonValue.NewObject();
+            o.Put("topics", list);
+            o.Put("usage", JsonValue.NewStr(
+                "call zan_example with one of these 'topic' values to get the files"));
+            return o.ToJson();
+        }
+        JsonValue match = McpServer.MatchEntry(entries, topic);
+        if (match == null) {
+            return "error: no example for topic '" + topic
+                + "'; call zan_example with no topic to list the catalog";
+        }
+        string kind = match.Str("kind", "");
+        JsonValue o = JsonValue.NewObject();
+        o.Put("topic", JsonValue.NewStr(match.Str("topic", "")));
+        o.Put("kind", JsonValue.NewStr(kind));
+        o.Put("summary", JsonValue.NewStr(match.Str("summary", "")));
+        o.Put("build", JsonValue.NewStr(match.Str("build", "")));
+        JsonValue models = man.Get("models");
+        if (models != null && models.Has(kind)) { o.Put("model", models.Get(kind)); }
+        JsonValue files = match.Get("files");
+        JsonValue outFiles = JsonValue.NewArray();
+        if (files != null) {
+            for (int i = 0; i < files.Count(); i = i + 1) {
+                string rel = files.At(i).AsString("");
+                JsonValue fo = JsonValue.NewObject();
+                fo.Put("path", JsonValue.NewStr(rel));
+                string full = McpServer.TrimTrailingSep(Environment.ExeDir())
+                    + "/" + rel;
+                if (!File.Exists(full)) { full = McpServer.root + "/" + rel; }
+                if (File.Exists(full)) {
+                    fo.Put("content", JsonValue.NewStr(File.ReadAllText(full)));
+                } else {
+                    fo.Put("error", JsonValue.NewStr("file missing on server"));
+                }
+                outFiles.Append(fo);
+            }
+        }
+        o.Put("files", outFiles);
+        return o.ToJson();
+    }
+
+    static string FormSchema(string control) {
+        if (!File.Exists(McpServer.formSchemaPath)) {
+            return "error: controls.json not found at " + McpServer.formSchemaPath;
+        }
+        JsonValue schema = McpServer.ParseBody(
+            File.ReadAllText(McpServer.formSchemaPath));
+        if (schema == null) { return "error: controls.json is not valid JSON"; }
+        JsonValue controls = schema.Get("controls");
+        if (controls == null || !controls.IsArray()) {
+            return "error: controls.json has no 'controls'";
+        }
+        JsonValue out0 = JsonValue.NewObject();
+        if (control == "") {
+            out0.Put("document", schema.Get("document"));
+            out0.Put("fields", schema.Get("fields"));
+            out0.Put("commonEvents", schema.Get("commonEvents"));
+            JsonValue names = JsonValue.NewArray();
+            for (int i = 0; i < controls.Count(); i = i + 1) {
+                names.Append(JsonValue.NewStr(controls.At(i).Str("name", "")));
+            }
+            out0.Put("controls", names);
+            return out0.ToJson();
+        }
+        JsonValue match = null;
+        for (int i = 0; i < controls.Count(); i = i + 1) {
+            if (controls.At(i).Str("name", "") == control) {
+                match = controls.At(i);
+                break;
+            }
+        }
+        if (match == null) {
+            for (int i = 0; i < controls.Count(); i = i + 1) {
+                if (McpServer.Find(controls.At(i).Str("name", ""), control) >= 0) {
+                    match = controls.At(i);
+                    break;
+                }
+            }
+        }
+        if (match == null) {
+            return "error: no form control matching '" + control + "'";
+        }
+        out0.Put("control", match);
+        return out0.ToJson();
+    }
+
+    static JsonValue MatchEntry(JsonValue entries, string topic) {
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            if (entries.At(i).Str("topic", "") == topic) { return entries.At(i); }
+        }
+        for (int i = 0; i < entries.Count(); i = i + 1) {
+            if (McpServer.Find(entries.At(i).Str("topic", ""), topic) >= 0) {
+                return entries.At(i);
+            }
+        }
+        return null;
+    }
+
+    static async string Compile(string filename, string content) {
+        if (filename == "") { filename = "snippet.zan"; }
+        if (!McpServer.IsBareName(filename)) {
+            return "error: filename must be a bare file name with no path separators";
+        }
+        McpServer.compileSeq = McpServer.compileSeq + 1;
+        string dir = McpServer.workRoot + "/" + Convert.ToString(McpServer.compileSeq);
+        Directory.CreateDirectoryRecursive(dir);
+        File.WriteAllText(dir + "/" + filename, content);
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"" + dir + "/" + filename
+            + "\" --stdlib-path \"" + McpServer.stdlibPath + "\" -o \""
+            + dir + "/out" + McpServer.ExeSuffix() + "\"");
+        return McpServer.DiagResult(res);
+    }
+
+    static async string BuildProject(string entry) {
+        if (entry == "") {
+            if (File.Exists(McpServer.root + "/src/App.zan")) { entry = "src/App.zan"; }
+            else { entry = "src/main.zan"; }
+        }
+        string full = McpServer.Resolve(entry);
+        if (full == "") { return McpServer.OutsideMsg(entry); }
+        if (!File.Exists(full)) { return "error: entry not found: " + entry; }
+        Directory.CreateDirectoryRecursive(McpServer.root + "/_scratch");
+        string outPath = McpServer.root + "/_scratch/mcp_project_out"
+            + McpServer.ExeSuffix();
+        ProcessResult res = await McpServer.RunProcessAsync(
+            "\"" + McpServer.zancPath + "\" \"" + full
+            + "\" --stdlib-path \"" + McpServer.stdlibPath + "\" -o \""
+            + outPath + "\"");
+        return McpServer.DiagResult(res);
+    }
+
+    static string DiagResult(ProcessResult res) {
+        JsonValue diags = JsonValue.NewArray();
+        StringBuilder rawSb = new StringBuilder();
+        for (int i = 0; i < res.lines.Count; i = i + 1) {
+            string line = McpServer.StripAnsi(res.lines[i]);
+            rawSb.Append(line);
+            rawSb.Append("\n");
+            string sev = "";
+            int pos = McpServer.Find(line, " error:");
+            if (pos >= 0) { sev = "error"; }
+            if (sev == "") {
+                pos = McpServer.Find(line, " warning:");
+                if (pos >= 0) { sev = "warning"; }
+            }
+            if (sev == "") {
+                pos = McpServer.Find(line, " note:");
+                if (pos >= 0) { sev = "note"; }
+            }
+            if (sev == "") { continue; }
+            string loc = line.Substring(0, pos);
+            if (loc.Length > 0 && loc.Substring(loc.Length - 1, 1) == ":") {
+                loc = loc.Substring(0, loc.Length - 1);
+            }
+            int markerLen = sev.Length + 2;
+            string msg = line.Substring(pos + markerLen, line.Length - pos - markerLen);
+            JsonValue d = JsonValue.NewObject();
+            d.Put("severity", JsonValue.NewStr(sev));
+            d.Put("location", JsonValue.NewStr(loc));
+            McpServer.PeelLineCol(loc, d);
+            d.Put("message", JsonValue.NewStr(McpServer.Trim(msg)));
+            diags.Append(d);
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("ok", JsonValue.NewBool(res.exitCode == 0));
+        o.Put("exitCode", JsonValue.NewNum(Convert.ToString(res.exitCode)));
+        o.Put("diagnostics", diags);
+        o.Put("raw", JsonValue.NewStr(rawSb.ToString()));
+        return o.ToJson();
+    }
+
+    static void PeelLineCol(string loc, JsonValue d) {
+        int c2 = McpServer.LastColon(loc);
+        if (c2 < 0) { return; }
+        string colStr = loc.Substring(c2 + 1, loc.Length - c2 - 1);
+        string head = loc.Substring(0, c2);
+        int c1 = McpServer.LastColon(head);
+        if (c1 < 0) { return; }
+        string lineStr = head.Substring(c1 + 1, head.Length - c1 - 1);
+        if (McpServer.AllDigits(colStr) && McpServer.AllDigits(lineStr)) {
+            d.Put("file", JsonValue.NewStr(head.Substring(0, c1)));
+            d.Put("line", JsonValue.NewNum(lineStr));
+            d.Put("col", JsonValue.NewNum(colStr));
+        }
+    }
+
+    static int LastColon(string s) {
+        for (int i = s.Length - 1; i >= 0; i = i - 1) {
+            if ((s[i] & 255) == 58) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static bool IsBareName(string s) {
+        if (s == "") { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 47 || c == 92) { return false; }
+        }
+        for (int i = 0; i + 1 < s.Length; i = i + 1) {
+            if (s.Substring(i, 2) == "..") { return false; }
+        }
+        return true;
+    }
+
+    static void CopyPackageDir(string src, string dest) {
+        Directory.CreateDirectoryRecursive(dest);
+        List<string> files = Directory.GetFiles(src);
+        for (int i = 0; i < files.Count; i = i + 1) {
+            string dstFile = dest + "/" + files[i];
+            if (File.Exists(dstFile)) { File.Delete(dstFile); }
+            File.Copy(src + "/" + files[i], dstFile);
+        }
+        List<string> dirs = Directory.GetDirectories(src);
+        for (int i = 0; i < dirs.Count; i = i + 1) {
+            McpServer.CopyPackageDir(src + "/" + dirs[i], dest + "/" + dirs[i]);
+        }
+    }
+
+    static string PkgListInstalled() {
+        string pkgDir = McpServer.root + "/.zan-packages";
+        JsonValue o = JsonValue.NewObject();
+        JsonValue list = JsonValue.NewArray();
+        if (!Directory.Exists(pkgDir)) {
+            o.Put("installed", list);
+            o.Put("count", JsonValue.NewNum("0"));
+            o.Put("tip", JsonValue.NewStr("No packages installed in current project (.zan-packages/ does not exist)."));
+            return o.ToJson();
+        }
+        List<string> subdirs = Directory.GetDirectories(pkgDir);
+        for (int i = 0; i < subdirs.Count; i = i + 1) {
+            string name = subdirs[i];
+            string d = pkgDir + "/" + name;
+            string manifestPath = d + "/zan.pkg";
+            string ver = "1.0.0";
+            string desc = "";
+            if (File.Exists(manifestPath)) {
+                string content = File.ReadAllText(manifestPath);
+                JsonValue parsed = McpServer.ParseBody(content);
+                if (parsed != null) {
+                    ver = parsed.Str("version", "1.0.0");
+                    desc = parsed.Str("description", "");
+                }
+            }
+            JsonValue item = JsonValue.NewObject();
+            item.Put("name", JsonValue.NewStr(name));
+            item.Put("version", JsonValue.NewStr(ver));
+            item.Put("description", JsonValue.NewStr(desc));
+            item.Put("path", JsonValue.NewStr(".zan-packages/" + name));
+            list.Append(item);
+        }
+        o.Put("installed", list);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(list.Count())));
+        return o.ToJson();
+    }
+
+    static string PkgSearch(string query) {
+        string catalogPath = McpServer.knowledge + "/packages-catalog.json";
+        if (!File.Exists(catalogPath)) {
+            catalogPath = McpServer.sdkRoot + "/knowledge/packages-catalog.json";
+        }
+        if (!File.Exists(catalogPath)) {
+            catalogPath = McpServer.root + "/knowledge/packages-catalog.json";
+        }
+
+        JsonValue o = JsonValue.NewObject();
+        JsonValue results = JsonValue.NewArray();
+
+        if (File.Exists(catalogPath)) {
+            string text = File.ReadAllText(catalogPath);
+            JsonValue root = McpServer.ParseBody(text);
+            if (root != null && root.IsArray()) {
+                string qLower = query.ToLower();
+                for (int i = 0; i < root.Count(); i = i + 1) {
+                    JsonValue p = root.At(i);
+                    string name = p.Str("name", "");
+                    string desc = p.Str("description", "");
+                    bool match = query == ""
+                        || McpServer.Find(name.ToLower(), qLower) >= 0
+                        || McpServer.Find(desc.ToLower(), qLower) >= 0;
+                    if (!match) {
+                        JsonValue nsArr = p.Get("namespaces");
+                        if (nsArr != null && nsArr.IsArray()) {
+                            for (int j = 0; j < nsArr.Count(); j = j + 1) {
+                                if (McpServer.Find(nsArr.At(j).AsString("").ToLower(), qLower) >= 0) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (match) {
+                        results.Append(p);
+                    }
+                }
+            }
+        } else {
+            string pkgsDir = McpServer.sdkRoot + "/packages";
+            if (!Directory.Exists(pkgsDir)) { pkgsDir = McpServer.root + "/packages"; }
+            if (Directory.Exists(pkgsDir)) {
+                List<string> subs = Directory.GetDirectories(pkgsDir);
+                string qLower = query.ToLower();
+                for (int i = 0; i < subs.Count; i = i + 1) {
+                    string name = subs[i];
+                    if (query == "" || McpServer.Find(name.ToLower(), qLower) >= 0) {
+                        JsonValue p = JsonValue.NewObject();
+                        p.Put("name", JsonValue.NewStr(name));
+                        p.Put("version", JsonValue.NewStr("1.0.0"));
+                        p.Put("description", JsonValue.NewStr("Discovered in local packages/ repository"));
+                        results.Append(p);
+                    }
+                }
+            }
+        }
+        o.Put("packages", results);
+        o.Put("count", JsonValue.NewNum(Convert.ToString(results.Count())));
+        return o.ToJson();
+    }
+
+    static string PkgInstall(string pkgName, string scope) {
+        if (pkgName == "") { return "error: 'name' is required (e.g. 'Zan.Gui.Charts')"; }
+        string srcPkgDir = McpServer.sdkRoot + "/packages/" + pkgName;
+        if (!Directory.Exists(srcPkgDir)) {
+            srcPkgDir = McpServer.sdkRoot + "/packages_cache/" + pkgName;
+        }
+        if (!Directory.Exists(srcPkgDir)) {
+            srcPkgDir = McpServer.root + "/packages/" + pkgName;
+        }
+
+        string destPkgDir = McpServer.root + "/.zan-packages/" + pkgName;
+        JsonValue o = JsonValue.NewObject();
+        if (Directory.Exists(srcPkgDir)) {
+            try {
+                McpServer.CopyPackageDir(srcPkgDir, destPkgDir);
+                o.Put("ok", JsonValue.NewBool(true));
+                o.Put("package", JsonValue.NewStr(pkgName));
+                o.Put("path", JsonValue.NewStr(".zan-packages/" + pkgName));
+                o.Put("message", JsonValue.NewStr("Package installed into project successfully."));
+                return o.ToJson();
+            } catch (Exception e) {
+                return "error: failed to install package " + pkgName + ": " + e.Message;
+            }
+        }
+        return "error: package '" + pkgName + "' not found in local package repository/cache (" + McpServer.sdkRoot + "/packages).";
+    }
+
+    static string PkgInfo(string pkgName) {
+        if (pkgName == "") { return "error: 'name' is required"; }
+        string pkgDir = McpServer.sdkRoot + "/packages/" + pkgName;
+        if (!Directory.Exists(pkgDir)) { pkgDir = McpServer.root + "/packages/" + pkgName; }
+        if (!Directory.Exists(pkgDir)) { pkgDir = McpServer.root + "/.zan-packages/" + pkgName; }
+        if (!Directory.Exists(pkgDir)) {
+            return "error: package '" + pkgName + "' not found.";
+        }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("name", JsonValue.NewStr(pkgName));
+        string readmePath = pkgDir + "/README.md";
+        if (File.Exists(readmePath)) {
+            o.Put("readme", JsonValue.NewStr(File.ReadAllText(readmePath)));
+        }
+        string manifestPath = pkgDir + "/zan.pkg";
+        if (File.Exists(manifestPath)) {
+            string raw = File.ReadAllText(manifestPath);
+            JsonValue parsed = McpServer.ParseBody(raw);
+            if (parsed != null) {
+                o.Put("manifest", parsed);
+            }
+        }
+        return o.ToJson();
+    }
+
+
+    static JsonValue ToolsDoc() {
+        JsonValue arr = JsonValue.NewArray();
+
+        JsonValue t = McpServer.NewTool("zan_start_here",
+            "START HERE. Everything you need to work in this project in one"
+            + " call: layout and entry point, build/run/test commands, the Zan"
+            + " coding rules, the tool catalog with what to use each tool for,"
+            + " and the available resources. Costs one round trip and replaces"
+            + " browsing the tree.");
+        arr.Append(t);
+
+        t = McpServer.NewTool("health_check",
+            "Liveness and configuration of this server: workspace root,"
+            + " read-only/exec flags, protocol version, platform.");
+        arr.Append(t);
+
+        t = McpServer.NewTool("list_dir",
+            "List one directory of the workspace. Returns"
+            + " {type,path,count,entries:[{name,type,size}]}.");
+        McpServer.AddParam(t, "path", "string",
+            "Workspace-relative directory ('' or '.' for the root).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("read_file",
+            "Read a workspace file -- ideally ONE window of it. Pass"
+            + " from_line/max_lines (numbered output) to read just the"
+            + " neighbourhood of a search_text hit; that is the cheap read and"
+            + " it gives you the line numbers to cite and to edit by. Reading"
+            + " the whole file, or the same lines twice, buys nothing: what a"
+            + " tool result already told you in this conversation is still"
+            + " true unless you changed it. Text comes back in 'content',"
+            + " binary (or encoding='base64') in 'content_base64'.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "from_line", "integer",
+            "First line (1-based). Preferred over offset for source code.", false);
+        McpServer.AddParam(t, "max_lines", "integer",
+            "Lines to return (default 120).", false);
+        McpServer.AddParam(t, "numbered", "boolean",
+            "Prefix each line with its number (default true).", false);
+        McpServer.AddParam(t, "offset", "integer", "First byte to read.", false);
+        McpServer.AddParam(t, "limit", "integer", "Maximum bytes to read.", false);
+        McpServer.AddParam(t, "encoding", "string",
+            "'text' (default when the bytes are valid UTF-8) or 'base64'.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("write_file",
+            "Create or overwrite a workspace file, byte for byte. Parent"
+            + " directories are created. Pass content_base64 for binary data"
+            + " and append=true to add to the end.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "content", "string", "UTF-8 text to write.", false);
+        McpServer.AddParam(t, "content_base64", "string", "Base64 bytes to write.", false);
+        McpServer.AddParam(t, "append", "boolean", "Append instead of replacing.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("edit_file",
+            "Change a file in place by replacing an exact snippet. This is the"
+            + " normal way to edit: you send only the lines that change, so"
+            + " there is no reason to read the whole file first. 'old' must"
+            + " match byte for byte (whitespace included) and must be unique"
+            + " unless all=true; an ambiguous match is refused, not guessed."
+            + " Make the whole change in one call rather than one line per"
+            + " call. Returns {ok,path,replacements,line}.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative file.", true);
+        McpServer.AddParam(t, "old", "string",
+            "Exact text to replace, with enough context to be unique.", true);
+        McpServer.AddParam(t, "new", "string",
+            "Replacement text ('' deletes).", true);
+        McpServer.AddParam(t, "all", "boolean",
+            "Replace every occurrence instead of requiring uniqueness.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("skills_list",
+            "Catalogue of the skills available here: name, one-line summary,"
+            + " size. Bodies are NOT included -- call skill_read only for the"
+            + " one that matches the task (progressive disclosure keeps the"
+            + " prompt small and cacheable).");
+        arr.Append(t);
+
+        t = McpServer.NewTool("skill_read",
+            "Read one skill's instructions (SKILL.md by default, or another"
+            + " file inside that skill's directory).");
+        McpServer.AddParam(t, "name", "string", "Skill name from skills_list.", true);
+        McpServer.AddParam(t, "file", "string",
+            "File inside the skill directory (default SKILL.md).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("mkdir", "Create a directory (recursively).");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative directory.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("delete_path",
+            "Delete a file, or a directory when recursive=true.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative path.", true);
+        McpServer.AddParam(t, "recursive", "boolean", "Allow deleting a tree.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("move_path", "Move or rename a file.");
+        McpServer.AddParam(t, "from", "string", "Source path.", true);
+        McpServer.AddParam(t, "to", "string", "Destination path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("copy_path", "Copy a file.");
+        McpServer.AddParam(t, "from", "string", "Source path.", true);
+        McpServer.AddParam(t, "to", "string", "Destination path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("stat_path",
+            "Existence, type, size and modification time of one path.");
+        McpServer.AddParam(t, "path", "string", "Workspace-relative path.", true);
+        arr.Append(t);
+
+        t = McpServer.NewTool("find_files",
+            "Find files by name under a directory. 'glob' supports * and ?;"
+            + " 'contains' is a case-insensitive substring of the name."
+            + " .git/node_modules/build/dist are skipped.");
+        McpServer.AddParam(t, "path", "string", "Directory to walk ('' = root).", false);
+        McpServer.AddParam(t, "glob", "string", "Name pattern, e.g. '*.zan'.", false);
+        McpServer.AddParam(t, "contains", "string", "Substring of the name.", false);
+        McpServer.AddParam(t, "max_results", "integer", "Result cap (default 500).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("search_text",
+            "Grep the workspace: literal substring search over text files,"
+            + " returning {file,line,text} matches.");
+        McpServer.AddParam(t, "query", "string", "Text to search for.", true);
+        McpServer.AddParam(t, "path", "string", "Directory to search ('' = root).", false);
+        McpServer.AddParam(t, "glob", "string", "Restrict to names matching this.", false);
+        McpServer.AddParam(t, "ignore_case", "boolean", "Default true.", false);
+        McpServer.AddParam(t, "max_results", "integer", "Result cap (default 200).", false);
+        arr.Append(t);
+
+        if (McpServer.CanExec() || McpServer.frozenTools) {
+            t = McpServer.NewTool("run_command",
+                "Run a shell command in the workspace and return"
+                + " {ok,exitCode,stdout} with stdout and stderr merged.");
+            McpServer.AddParam(t, "command", "string", "Command line to run.", true);
+            McpServer.AddParam(t, "shell", "string",
+                "'cmd' or 'powershell' on Windows; 'sh'/'bash' elsewhere.", false);
+            McpServer.AddParam(t, "cwd", "string",
+                "Workspace-relative working directory.", false);
+            arr.Append(t);
+        }
+
+        // ---- package management tools for AI-assisted development ------------
+        t = McpServer.NewTool("pkg_list_installed",
+            "List all installed packages and versions in the current project (.zan-packages/).");
+        arr.Append(t);
+
+        t = McpServer.NewTool("pkg_search",
+            "Search for available packages in the official Zan ecosystem catalog by keyword or namespace.");
+        McpServer.AddParam(t, "query", "string", "Keyword, topic, or namespace fragment to search.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("pkg_install",
+            "Install an official or local package into the project (.zan-packages/).");
+        McpServer.AddParam(t, "name", "string", "Package name, e.g. 'Zan.Gui.Charts' or 'Zan.Data'.", true);
+        McpServer.AddParam(t, "scope", "string", "'project' (default) or 'global'.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("pkg_info",
+            "Get details, exported namespaces, and usage of a specific package.");
+        McpServer.AddParam(t, "name", "string", "Package name.", true);
+        arr.Append(t);
+
+        // ---- API inspection tools (always available for AI clients) -----------
+        t = McpServer.NewTool("zan_api_search",
+            "Search the Zan stdlib symbol index (name/kind/file/line/signature)."
+            + " Use it before writing Zan code instead of guessing signatures.");
+        McpServer.AddParam(t, "query", "string", "Symbol fragment(s).", true);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 40).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_lookup_symbol",
+            "Locate a definition exactly: pass \"File\" or \"File.ReadAllText\""
+            + " (or a bare member name) and get kind, signature, summary and"
+            + " file:line back. Use this instead of reading a file to find"
+            + " out what something is.");
+        McpServer.AddParam(t, "name", "string",
+            "Type, Type.Member, or member name.", true);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 10).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_list_members",
+            "List every member of one type with signatures and file:line --"
+            + " the per-type API page. Cheaper than fetching a whole"
+            + " namespace reference page.");
+        McpServer.AddParam(t, "type", "string", "Type name.", true);
+        McpServer.AddParam(t, "filter", "string",
+            "Only members whose name contains this fragment.", false);
+        McpServer.AddParam(t, "limit", "integer", "Result cap (default 80).", false);
+        arr.Append(t);
+
+        if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_find_refs",
+                "Impact of a change: declarations, the lines that mention the"
+                + " name, how many of them are tests, and the types that"
+                + " inherit it. Reference sites are text-level identifier"
+                + " matches (not overload-resolved), so review them as"
+                + " candidates; 'subtypes' comes from declared bases and is"
+                + " exact.");
+            McpServer.AddParam(t, "name", "string",
+                "Simple name (\"ReadAllText\") or Type.Member.", true);
+            McpServer.AddParam(t, "limit", "integer",
+                "Reference sites to return (default 30).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.indexManifestPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_project_overview",
+                "Read this before touching a project you do not know: size,"
+                + " routes grouped by module and by verb, entity -> table"
+                + " map, and the actions that are authorized but carry no"
+                + " Perm. One .zanmap read instead of walking the tree.");
+            McpServer.AddParam(t, "limit", "integer",
+                "Cap for the sample lists (default 40).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.routesIndexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_route_lookup",
+                "Answer \"which action serves this URL, and what may call"
+                + " it\" without opening a controller: verb, path, action"
+                + " name, controller, module, title, auth gate, Perm bits,"
+                + " bound parameters and file:line. Derived from the"
+                + " compiler's route generation, so it is what the app"
+                + " registers at startup.");
+            McpServer.AddParam(t, "query", "string",
+                "Fragment of the URL, action, controller, module or title.",
+                false);
+            McpServer.AddParam(t, "method", "string",
+                "Restrict to one HTTP verb.", false);
+            McpServer.AddParam(t, "unmarked_perm", "boolean",
+                "Only actions with no Perm attribute (RBAC audit).", false);
+            McpServer.AddParam(t, "limit", "integer",
+                "Result cap (default 40).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.entitiesIndexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_orm_lookup",
+                "Entity -> table -> columns without reading the model: column"
+                + " names, types, primary key/identity, nullability, string"
+                + " length, navigations, indexes, and the generated facades"
+                + " to write against (__DbQ_/__DbI_/__DbU_/__DbD_/Cols)."
+                + " Call with no argument for the entity->table map.");
+            McpServer.AddParam(t, "query", "string",
+                "Entity name, table name or namespace fragment.", false);
+            McpServer.AddParam(t, "column", "string",
+                "Find the entities that carry this column/field.", false);
+            McpServer.AddParam(t, "limit", "integer",
+                "Result cap (default 10).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.refsPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_change_impact",
+                "Before editing a shared symbol: where it is declared, which"
+                + " files mention it, how much of that is tests, and -- what"
+                + " a grep cannot tell you -- the routes and entities those"
+                + " files own, so you see the URLs and tables at risk."
+                + " Reference sites are text-level candidates; the route and"
+                + " entity attribution is exact.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name (\"OpenRouterKey\") or Type.Member.", true);
+            McpServer.AddParam(t, "limit", "integer",
+                "Route rows to return (default 30).", false);
+            arr.Append(t);
+        }
+        if (File.Exists(McpServer.indexPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_read_context",
+                "The source of ONE definition: resolves the symbol in the"
+                + " index and returns that window of the file, numbered."
+                + " Use it instead of read_file when you know the name but"
+                + " not the file, and instead of reading a whole file to see"
+                + " one method.");
+            McpServer.AddParam(t, "symbol", "string",
+                "Simple name or Type.Member.", true);
+            McpServer.AddParam(t, "before", "integer",
+                "Lines of context above the declaration (default 4).", false);
+            McpServer.AddParam(t, "lines", "integer",
+                "Lines to return (default 80).", false);
+            arr.Append(t);
+        }
+        if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_refresh_index",
+                "Rebuild the project semantic index (.zanmap/routes.json,"
+                + " entities.json, index.json) from the workspace sources via"
+                + " zanc --gen-meta. Run it after adding or re-attributing a"
+                + " controller or an entity. Leaves symbols.json / refs.json"
+                + " (RepoMap) alone.");
+            arr.Append(t);
+        }
+        // ---- example template inspection tool --------------------------------
+        t = McpServer.NewTool("zan_example",
+            "Return a shipped, build-verified Zan template for a topic."
+            + " Call with no topic to list the catalog.");
+        McpServer.AddParam(t, "topic", "string", "Catalog topic.", false);
+        arr.Append(t);
+
+        if (File.Exists(McpServer.formSchemaPath) || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_control_schema",
+                "Return the control catalog and generated control specifications."
+                + " Call without control for names, or pass a control"
+                + " class name (substring matching is supported) for its full"
+                + " Props()/Events() entry.");
+            McpServer.AddParam(t, "control", "string",
+                "Control class name or fragment.", false);
+            arr.Append(t);
+            t = McpServer.NewTool("zan_form_schema",
+                "Legacy alias of zan_control_schema. Return the generated control"
+                + " catalog. Call without control for names, or pass a control"
+                + " class name for its full Props()/Events() entry.");
+            McpServer.AddParam(t, "control", "string",
+                "Control class name or fragment.", false);
+            arr.Append(t);
+        }
+        if ((McpServer.Mutable() && McpServer.KnowledgeInputs())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_refresh_knowledge",
+                "Regenerate gallery.json in the server's"
+                + " knowledge directory from the workspace sources. Does"
+                + " not build RepoMap or replace symbols.json.");
+            arr.Append(t);
+        }
+        if ((McpServer.ZanToolsAvailable() && McpServer.Mutable())
+            || McpServer.frozenTools) {
+            t = McpServer.NewTool("zan_compile",
+                "Compile one Zan snippet in an isolated directory; returns"
+                + " {ok,exitCode,diagnostics[],raw}.");
+            McpServer.AddParam(t, "filename", "string", "Bare file name.", false);
+            McpServer.AddParam(t, "content", "string", "Source text.", true);
+            arr.Append(t);
+
+            t = McpServer.NewTool("zan_build_project",
+                "Compile the workspace project (default entry src/App.zan or"
+                + " src/main.zan); returns {ok,exitCode,diagnostics[],raw}.");
+            McpServer.AddParam(t, "entry", "string", "Entry source file.", false);
+            arr.Append(t);
+        }
+
+        t = McpServer.NewTool("zan_gui_snapshot",
+            "GUI visual snapshot and layout probe: compiles target GUI source, executes under UiDriver,"
+            + " captures layout tree, interactive hit regions, and layout-lint diagnostics."
+            + " Enables closed-loop visual & constraint verification for AI.");
+        McpServer.AddParam(t, "file", "string",
+            "Path to the Zan GUI source file (e.g. 'src/App.zan' or 'examples/gui_gallery/App.zan').", true);
+        McpServer.AddParam(t, "action_script", "string",
+            "Optional UiDriver script (e.g. 'wait 300; dump tree tree.json; quit').", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_gui_preview",
+            "Alias for zan_gui_snapshot: compiles and runs GUI probe to capture layout tree and diagnostics.");
+        McpServer.AddParam(t, "file", "string",
+            "Path to the Zan GUI source file (e.g. 'src/App.zan').", true);
+        McpServer.AddParam(t, "action_script", "string",
+            "Optional UiDriver script.", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_game_simulate_trajectory",
+            "Game feel & physics probe: simulates jump/trajectory curve off-line with gravity, jump velocity, and air friction."
+            + " Returns maximum apex height, frames-to-apex, air-time, and game feel classification without requiring live gameplay.");
+        McpServer.AddParam(t, "gravity", "number", "Gravity acceleration in px/s^2 (default 980.0).", false);
+        McpServer.AddParam(t, "jump_velocity", "number", "Initial upward jump velocity in px/s (default 450.0).", false);
+        McpServer.AddParam(t, "air_friction", "number", "Air drag coefficient (default 0.0).", false);
+        McpServer.AddParam(t, "frames", "integer", "Number of 60FPS frames to simulate (default 60).", false);
+        arr.Append(t);
+
+        t = McpServer.NewTool("zan_game_frame_budget_check",
+            "Game 16.6ms frame budget & zero-alloc gate: scans hot-path loops (Update/OnUpdate/Tick/Render)"
+            + " in source files for heap allocations (new List, new Object) that cause garbage collection hitches.");
+        McpServer.AddParam(t, "file", "string", "Game source file to analyze (e.g. 'src/main.zan').", true);
+        arr.Append(t);
+
+        return arr;
+    }
+
+    // ---- orientation ---------------------------------------------------------
+
+    static JsonValue StartHere() {
+        McpServer.KnowledgeCheck(true);
+        JsonValue o = JsonValue.NewObject();
+        o.Put("workspace", JsonValue.NewStr(McpServer.root));
+        o.Put("platform", JsonValue.NewStr(McpServer.Platform()));
+        o.Put("language", JsonValue.NewStr(
+            "Zan - statically typed, C#-like syntax, ARC memory management,"
+            + " compiled to a native executable by zanc."));
+
+        JsonValue proj = JsonValue.NewObject();
+        string entry = McpServer.DetectEntry();
+        proj.Put("entry", JsonValue.NewStr(entry));
+        proj.Put("kind", JsonValue.NewStr(McpServer.DetectKind()));
+        JsonValue dirs = JsonValue.NewArray();
+        McpServer.AddIfDir(dirs, "src", "Zan sources");
+        McpServer.AddIfDir(dirs, "src/Controller", "MVC controllers: attribute-driven routes");
+        McpServer.AddIfDir(dirs, "src/Model", "ORM models");
+        McpServer.AddIfDir(dirs, "src/Dao", "data access");
+        McpServer.AddIfDir(dirs, "src/Feature", "feature services");
+        McpServer.AddIfDir(dirs, "src/Framework", "app framework wiring");
+        McpServer.AddIfDir(dirs, "views", "server-rendered templates");
+        McpServer.AddIfDir(dirs, "wwwroot", "static assets");
+        McpServer.AddIfDir(dirs, "config", "external runtime configuration (app.json)");
+        McpServer.AddIfDir(dirs, "stdlib", "Zan standard library sources");
+        McpServer.AddIfDir(dirs, "templates", "project templates");
+        McpServer.AddIfDir(dirs, "examples", "runnable example programs");
+        McpServer.AddIfDir(dirs, "tests", "test suite");
+        McpServer.AddIfDir(dirs, "docs", "documentation");
+        proj.Put("directories", dirs);
+        JsonValue cfg = JsonValue.NewArray();
+        McpServer.AddIfFile(cfg, "config/app.json",
+            "runtime configuration, read at startup and NOT compiled in:"
+            + " change behaviour here before changing code");
+        McpServer.AddIfFile(cfg, "AGENTS.md", "rules for agents working in this project");
+        McpServer.AddIfFile(cfg, "README.md", "project overview");
+        proj.Put("keyFiles", cfg);
+        o.Put("project", proj);
+
+        // ---- commands -------------------------------------------------------
+        JsonValue cmd = JsonValue.NewObject();
+        cmd.Put("compiler", JsonValue.NewStr(McpServer.zancPath));
+        cmd.Put("stdlib", JsonValue.NewStr(McpServer.stdlibPath));
+        if (entry != "") {
+            cmd.Put("build", JsonValue.NewStr("\"" + McpServer.zancPath + "\" "
+                + entry + " --auto-stdlib -o build/app" + McpServer.ExeSuffix()));
+            cmd.Put("buildTool", JsonValue.NewStr(
+                "zan_build_project - compiles the project and returns"
+                + " structured diagnostics; prefer it over run_command"));
+        }
+        cmd.Put("checkSnippet", JsonValue.NewStr(
+            "zan_compile - compiles one snippet in an isolated directory;"
+            + " use it to verify an API call before editing a real file"));
+        McpServer.AddIfFile2(cmd, "test", "scripts/test.ps1",
+            "powershell -File scripts/test.ps1 smoke");
+        McpServer.AddIfFile2(cmd, "languageServer",
+            "toolchain/zan-lsp" + McpServer.ExeSuffix(),
+            "toolchain/zan-lsp" + McpServer.ExeSuffix()
+            + " - LSP over stdio with Content-Length framing (completion,"
+            + " hover, definition, references, rename, diagnostics)");
+        McpServer.AddIfFile2(cmd, "debugAdapter",
+            "toolchain/zan-dap" + McpServer.ExeSuffix(),
+            "toolchain/zan-dap" + McpServer.ExeSuffix()
+            + " - Debug Adapter Protocol over stdio (breakpoints, stepping,"
+            + " variables, evaluate)");
+        o.Put("commands", cmd);
+
+        // ---- rules ----------------------------------------------------------
+        JsonValue rules = JsonValue.NewArray();
+        rules.Append(JsonValue.NewStr(
+            "Never guess an API. Call zan_api_search for the signature and"
+            + " zan_example for a working pattern before you write code."));
+        rules.Append(JsonValue.NewStr(
+            "Compile before you claim anything works: zan_compile for a"
+            + " snippet, zan_build_project for the project. Read the"
+            + " diagnostics array, which carries file, line, column and code."));
+        rules.Append(JsonValue.NewStr(
+            "Read once, precisely, then edit. search_text for the line,"
+            + " read_file(path, from_line, max_lines) for that window,"
+            + " edit_file for the whole change in one call. Do not re-read a"
+            + " range you already have and do not read a file just to be able"
+            + " to write it back: a tool result stays true until you change"
+            + " it."));
+        rules.Append(JsonValue.NewStr(
+            "Reuse what exists. Prefer an existing class, service or template"
+            + " over a new interface with the same job."));
+        rules.Append(JsonValue.NewStr(
+            "Configuration lives in config/app.json (or the project's own"
+            + " config file) and is read at run time; do not hard-code hosts,"
+            + " ports, credentials or business limits into sources."));
+        rules.Append(JsonValue.NewStr(
+            "GUI code uses the standard library's Gui components. Do not"
+            + " hand-draw widgets."));
+        rules.Append(JsonValue.NewStr(
+            "Keep throwaway files out of the project: probes and scratch"
+            + " builds belong in _scratch/."));
+        rules.Append(JsonValue.NewStr(
+            "Say what you verified and what you did not. Do not report a"
+            + " build or a test as passing unless you ran it."));
+        o.Put("rules", rules);
+
+        JsonValue how = JsonValue.NewArray();
+        how.Append(JsonValue.NewStr(
+            "zan_api_search(query) - stdlib symbol index: name, kind, file,"
+            + " line, signature. First stop for 'how do I call X'."));
+        how.Append(JsonValue.NewStr(
+            "zan_example(topic) - shipped, build-verified programs; call with"
+            + " no topic to list the catalog."));
+        how.Append(JsonValue.NewStr(
+            "search_text / find_files - locate code in this workspace."));
+        how.Append(JsonValue.NewStr(
+            "read_file(path, from_line, max_lines) - one numbered window, not"
+            + " the whole file; offset/limit for bytes and binaries."));
+        how.Append(JsonValue.NewStr(
+            "edit_file(path, old, new) - replace an exact snippet in place;"
+            + " the default way to change code."));
+        how.Append(JsonValue.NewStr(
+            "write_file(path, content) - create a file or replace it whole."));
+        how.Append(JsonValue.NewStr(
+            "skills_list() then skill_read(name) - the project's own"
+            + " procedures; read a body only when its summary fits the task."));
+        how.Append(JsonValue.NewStr(
+            "zan_build_project(entry) / zan_compile(content) - compile and get"
+            + " {ok, exitCode, diagnostics[], raw}."));
+        how.Append(JsonValue.NewStr(
+            "run_command(command) - anything else (tests, git, generators)."));
+        o.Put("toolGuide", how);
+
+        JsonValue avail = JsonValue.NewArray();
+        JsonValue cat = McpServer.ToolsDoc();
+        for (int i = 0; i < cat.Count(); i = i + 1) {
+            avail.Append(JsonValue.NewStr(cat.At(i).Str("name", "")));
+        }
+        o.Put("tools", avail);
+        JsonValue res = McpServer.ResourcesDoc();
+        o.Put("resources", res);
+        if (res.Count() == 0) {
+            o.Put("resourcesHint", JsonValue.NewStr(
+                "No repo:// resources yet: they are the .zanmap/ artefacts of"
+                + " tools/repomap (repo.map.txt, symbols.json, routes.json)."
+                + " Generate them with: zanc tools/repomap/RepoMap.zan"
+                + " --auto-stdlib -o build/repomap" + McpServer.ExeSuffix()
+                + " && build/repomap" + McpServer.ExeSuffix() + " ."));
+        }
+
+        JsonValue st = JsonValue.NewObject();
+        st.Put("apiIndex", JsonValue.NewBool(File.Exists(McpServer.indexPath)));
+        st.Put("exampleCatalog", JsonValue.NewBool(File.Exists(McpServer.galleryPath)));
+        st.Put("formSchema", JsonValue.NewBool(File.Exists(McpServer.formSchemaPath)));
+        st.Put("knowledgeFresh", JsonValue.NewBool(McpServer.knowledgeFresh));
+        st.Put("knowledgeStatus", JsonValue.NewStr(McpServer.knowledgeStatus));
+        st.Put("knowledgeRefresh",
+            JsonValue.NewBool(McpServer.Mutable() && McpServer.KnowledgeInputs()));
+        st.Put("compiler", JsonValue.NewBool(McpServer.ZanToolsAvailable()));
+        st.Put("exec", JsonValue.NewBool(McpServer.CanExec()));
+        st.Put("writable", JsonValue.NewBool(McpServer.Mutable()));
+        o.Put("available", st);
+
+        JsonValue next = JsonValue.NewArray();
+        next.Append(JsonValue.NewStr(
+            "1. read the project entry and the file you must change"
+            + " (read_file), or search for it (search_text)"));
+        next.Append(JsonValue.NewStr(
+            "2. look up every API you are about to use (zan_api_search,"
+            + " zan_example)"));
+        next.Append(JsonValue.NewStr("3. edit (edit_file, one call per change)"));
+        next.Append(JsonValue.NewStr(
+            "4. compile (zan_build_project) and fix the diagnostics"));
+        next.Append(JsonValue.NewStr(
+            "5. run the tests or the program (run_command)"));
+        o.Put("workflow", next);
+        return o;
+    }
+
+    static string DetectEntry() {
+        if (File.Exists(McpServer.root + "/src/main.zan")) { return "src/main.zan"; }
+        if (File.Exists(McpServer.root + "/src/App.zan")) { return "src/App.zan"; }
+        if (File.Exists(McpServer.root + "/main.zan")) { return "main.zan"; }
+        return "";
+    }
+
+    static string DetectKind() {
+        if (Directory.Exists(McpServer.root + "/src/Controller")) {
+            return "server-mvc: routes and permissions come from attributes"
+                + " evaluated at compile time -- [Route(\"api/[controller]/"
+                + "[action]\")] on the class, [HttpGet]/[HttpPost]/[HttpPut]/"
+                + "[HttpDelete] on the action, [Custom(Authorization ="
+                + " CustomAuthorization.None|Auth|Login|Grant|ApiAuth)] for the"
+                + " auth gate (method overrides class), [Description] for the"
+                + " label; ORM models, config/app.json read at run time,"
+                + " API docs at /api/docs";
+        }
+        if (Directory.Exists(McpServer.root + "/views")) { return "server"; }
+        if (McpServer.DetectEntry() == "") { return "unknown"; }
+        return "program";
+    }
+
+    static void AddIfDir(JsonValue arr, string rel, string desc) {
+        if (!Directory.Exists(McpServer.root + "/" + rel)) { return; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("contains", JsonValue.NewStr(desc));
+        arr.Append(o);
+    }
+
+    static void AddIfFile(JsonValue arr, string rel, string desc) {
+        if (!File.Exists(McpServer.root + "/" + rel)) { return; }
+        JsonValue o = JsonValue.NewObject();
+        o.Put("path", JsonValue.NewStr(rel));
+        o.Put("purpose", JsonValue.NewStr(desc));
+        arr.Append(o);
+    }
+
+    static void AddIfFile2(JsonValue o, string key, string rel, string value) {
+        if (File.Exists(McpServer.root + "/" + rel)) {
+            o.Put(key, JsonValue.NewStr(value));
+            return;
+        }
+        string exeDir = McpServer.TrimTrailingSep(Environment.ExeDir());
+        if (File.Exists(exeDir + "/" + rel)) {
+            o.Put(key, JsonValue.NewStr(exeDir + "/" + rel));
+        }
+    }
+
+    static JsonValue NewTool(string name, string desc) {
+        JsonValue schema = JsonValue.NewObject();
+        schema.Put("type", JsonValue.NewStr("object"));
+        schema.Put("properties", JsonValue.NewObject());
+        schema.Put("required", JsonValue.NewArray());
+        JsonValue t = JsonValue.NewObject();
+        t.Put("name", JsonValue.NewStr(name));
+        t.Put("description", JsonValue.NewStr(desc));
+        t.Put("inputSchema", schema);
+        return t;
+    }
+
+    static void AddParam(JsonValue tool, string name, string type, string desc,
+                         bool required) {
+        JsonValue schema = tool.Get("inputSchema");
+        if (schema == null) { return; }
+        JsonValue props = schema.Get("properties");
+        if (props == null) { return; }
+        JsonValue p = JsonValue.NewObject();
+        p.Put("type", JsonValue.NewStr(type));
+        p.Put("description", JsonValue.NewStr(desc));
+        props.Put(name, p);
+        if (required) {
+            JsonValue req = schema.Get("required");
+            if (req != null) { req.Append(JsonValue.NewStr(name)); }
+        }
+    }
+
+
+    static string Resolve(string rel) {
+        if (rel == "" || rel == "." || rel == "./") { return McpServer.root; }
+        int n = rel.Length;
+        int c0 = rel[0] & 255;
+        if (c0 == 47 || c0 == 92) { return ""; }                 // '/' or '\'
+        if (n > 1 && (rel[1] & 255) == 58) { return ""; }        // 'C:'
+        StringBuilder sb = new StringBuilder();
+        sb.Append(McpServer.root);
+        int start = 0;
+        int i = 0;
+        while (i <= n) {
+            bool end = i == n;
+            bool sep = false;
+            if (!end) {
+                int c = rel[i] & 255;
+                sep = c == 47 || c == 92;
+            }
+            if (end || sep) {
+                int segLen = i - start;
+                if (segLen > 0) {
+                    string seg = rel.Substring(start, segLen);
+                    if (seg == "..") { return ""; }
+                    if (seg != ".") {
+                        sb.Append("/");
+                        sb.Append(seg);
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    static string TrimTrailingSep(string p) {
+        string s = p;
+        while (s.Length > 1) {
+            int c = s[s.Length - 1] & 255;
+            if (c != 47 && c != 92) { break; }
+            s = s.Substring(0, s.Length - 1);
+        }
+        return s;
+    }
+
+
+    static string Query(string qs, string key) {
+        int n = qs.Length;
+        int i = 0;
+        while (i < n) {
+            int amp = i;
+            while (amp < n && (qs[amp] & 255) != 38) { amp = amp + 1; }
+            int eq = i;
+            while (eq < amp && (qs[eq] & 255) != 61) { eq = eq + 1; }
+            if (eq < amp && qs.Substring(i, eq - i) == key) {
+                return Encoding.UrlDecode(qs.Substring(eq + 1, amp - eq - 1));
+            }
+            if (eq == amp && qs.Substring(i, amp - i) == key) { return ""; }
+            i = amp + 1;
+        }
+        return "";
+    }
+
+    static bool Utf8Valid(byte[] b, int n) {
+        int i = 0;
+        while (i < n) {
+            int c = b[i] & 255;
+            int extra = 0;
+            if (c == 0) { return false; }
+            if (c < 128) { extra = 0; }
+            else if (c >= 194 && c <= 223) { extra = 1; }
+            else if (c >= 224 && c <= 239) { extra = 2; }
+            else if (c >= 240 && c <= 244) { extra = 3; }
+            else { return false; }
+            if (i + extra >= n && extra > 0) { return false; }
+            for (int k = 1; k <= extra; k = k + 1) {
+                int cc = b[i + k] & 255;
+                if (cc < 128 || cc > 191) { return false; }
+            }
+            i = i + extra + 1;
+        }
+        return true;
+    }
+
+    static int Find(string s, string pat) {
+        if (pat.Length == 0) { return 0; }
+        if (s.Length < pat.Length) { return 0 - 1; }
+        int last = s.Length - pat.Length;
+        int first = pat[0] & 255;
+        for (int i = 0; i <= last; i = i + 1) {
+            if ((s[i] & 255) != first) { continue; }
+            int k = 1;
+            while (k < pat.Length && (s[i + k] & 255) == (pat[k] & 255)) {
+                k = k + 1;
+            }
+            if (k == pat.Length) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    static int ParseInt(string s, int dflt) {
+        if (s.Length == 0) { return dflt; }
+        int n = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+            n = n * 10 + (c - 48);
+        }
+        return n;
+    }
+
+    static bool AllDigits(string s) {
+        if (s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    static string Trim(string s) {
+        int a = 0;
+        int b = s.Length;
+        while (a < b) {
+            int c = s[a] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            a = a + 1;
+        }
+        while (b > a) {
+            int c = s[b - 1] & 255;
+            if (c != 32 && c != 9 && c != 13 && c != 10) { break; }
+            b = b - 1;
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static string StripAnsi(string s) {
+        int n = s.Length;
+        int i = 0;
+        while (i < n && (s[i] & 255) != 27) { i = i + 1; }
+        if (i == n) { return s; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(s.Substring(0, i));
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 27 && i + 1 < n && (s[i + 1] & 255) == 91) {
+                i = i + 2;
+                while (i < n) {
+                    int c2 = s[i] & 255;
+                    i = i + 1;
+                    if ((c2 >= 65 && c2 <= 90) || (c2 >= 97 && c2 <= 122)) { break; }
+                }
+                continue;
+            }
+            sb.Append(s.Substring(i, 1));
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+}
