@@ -2108,7 +2108,8 @@ endif()
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   # arc_net_publish 只挂手工档（3696 行），GLOB 孪生档跳过。
-  if(_name STREQUAL "arc_net_publish")
+  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
+  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
     continue()
   endif()
   set(_extra_args "")
@@ -2214,7 +2215,8 @@ set(_known_leaky
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   # arc_net_publish 只挂手工档（3702 行），GLOB 孪生档跳过。
-  if(_name STREQUAL "arc_net_publish")
+  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
+  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
@@ -2286,7 +2288,8 @@ endforeach()
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   # arc_net_publish 只挂手工档（3711 行），GLOB 孪生档跳过。
-  if(_name STREQUAL "arc_net_publish")
+  # embed_compress 同理（run_embed_compress.cmake：--embed 压缩烘焙 + 净目录）。
+  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "embed_compress")
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)

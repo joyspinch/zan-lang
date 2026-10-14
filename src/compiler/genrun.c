@@ -290,19 +290,6 @@ static void zan_gen_sweep_one(const char *name, void *ud) {
 #else
             remove(path);
 #endif
-        } else if (kind == 1 && ctx->keep_key != 0) {
-            /* 淘汰非当前活跃版本的过期生成器二进制，避免长期累积垃圾 */
-            char active_name[64];
-            snprintf(active_name, sizeof(active_name), "%016llx%s",
-                     (unsigned long long)ctx->keep_key, GEN_EXE_SUFFIX);
-            if (strcmp(rest, active_name) != 0) {
-                snprintf(path, sizeof(path), "%s%c%s", dir, sep, name);
-#ifdef _WIN32
-                DeleteFileA(path);
-#else
-                remove(path);
-#endif
-            }
         }
         return;
     }
