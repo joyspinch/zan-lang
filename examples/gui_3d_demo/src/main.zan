@@ -25,6 +25,9 @@ class DemoLoop : IGuiHostLoop {
 
     int cubeMesh;
     int discMesh;
+    int unitMesh;
+    MeshBatch ring;
+    float ringPhase;
     int lastBackend;
     int frames;
     string backendName = "";
@@ -71,19 +74,57 @@ class DemoLoop : IGuiHostLoop {
         Mesh3D disc = new Mesh3D();
         disc.AddGroundDisc(40, 2.4f);
         this.discMesh = c.MeshUpload(disc);
+
+        // 顶点色小立方体（白顶点色，颜色全靠每实例 tint），批量实例用
+        Mesh3D unit = new Mesh3D();
+        unit.AddCubeColored(1.0f, 1.0f, 1.0f, 1.0f);
+        this.unitMesh = c.MeshUpload(unit);
+        this.ring = MeshBatch.Create(32);
+    }
+
+    // 相机观察-投影阵（P * V，列主序由调用方再乘模型阵）。
+    Mat4 ViewProj(int cw, int ch) {
+        Mat4 p = Mat4.Perspective(1.0472f, (float)cw / (float)ch, 0.1f, 100.0f);
+        float ex = (float)Math.Cos(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
+        float ey = (float)Math.Sin(this.pitch) * this.dist + 1.2f;
+        float ez = (float)Math.Sin(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
+        Mat4 v = Mat4.LookAt(ex, ey, ez, 0, 0.6f, 0, 0, 1, 0);
+        return p.Mul(v);
     }
 
     // MVP = P * V * M（列主序上传）。spinY 是立方体的模型自转（绕 Y），
     // 把模型阵接在相机链末端：MVP = P * V * Spin。地台网格坐标已在
     // 世界系，M 用单位阵。
     float[] CubeMvp(int cw, int ch, float spinY) {
-        Mat4 p = Mat4.Perspective(1.0472f, (float)cw / (float)ch, 0.1f, 100.0f);
-        float ex = (float)Math.Cos(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
-        float ey = (float)Math.Sin(this.pitch) * this.dist + 1.2f;
-        float ez = (float)Math.Sin(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
-        Mat4 v = Mat4.LookAt(ex, ey, ez, 0, 0.6f, 0, 0, 1, 0);
         Mat4 spin = Mat4.RotateAxis(0, 1, 0, spinY);
-        return p.Mul(v).Mul(spin).ToColumnMajor();
+        return this.ViewProj(cw, ch).Mul(spin).ToColumnMajor();
+    }
+
+    // 一圈小立方体绕主立方体公转：批量实例通路演示——同一网格 12 个
+    // 实例一次 Begin/End 提交，每实例独立 MVP（公转位姿 + 上下浮动）
+    // 与队伍 tint，批内深度解析（转到主立方体后面时被正确遮挡……仅在
+    // 批内；与单次 DrawMesh3D 之间按调用顺序合成，见 Render.zan 契约）。
+    void DrawRing(GuiHost host, Canvas c, int cw, int ch) {
+        if (this.ring == null || this.unitMesh <= 0) { return; }
+        int[] palette = new int[] {
+            CDraw.Argb(255, 235, 87, 87),  CDraw.Argb(255, 255, 195, 66),
+            CDraw.Argb(255, 96, 211, 148), CDraw.Argb(255, 78, 154, 241),
+            CDraw.Argb(255, 186, 122, 232), CDraw.Argb(255, 240, 240, 245),
+        };
+        Mat4 pv = this.ViewProj(cw, ch);
+        this.ring.Begin();
+        for (int i = 0; i < 12; i = i + 1) {
+            float ang = this.ringPhase + i * 0.5235988f;
+            float bob = (float)Math.Sin(this.ringPhase * 2.0 + i) * 0.22f;
+            Mat4 m = Mat4.Translate((float)Math.Cos(ang) * 3.4f,
+                                    0.55f + bob,
+                                    (float)Math.Sin(ang) * 3.4f);
+            m = m.Mul(Mat4.RotateAxis(0, 1, 0, this.ringPhase + i));
+            m = m.Mul(Mat4.Scale(0.32f, 0.32f, 0.32f));
+            this.ring.Add(this.unitMesh, "", pv.Mul(m).ToColumnMajor(),
+                          palette[i % 6]);
+        }
+        this.ring.Draw(c);
     }
 
     // ---------- 2D 回退：同一份相机数学把 8 个角点投影成线框。
@@ -171,6 +212,8 @@ class DemoLoop : IGuiHostLoop {
             this.yaw = this.yaw + dtMilliseconds * 0.00012f;
             if (this.yaw > 6.2831853f) { this.yaw = this.yaw - 6.2831853f; }
         }
+        this.ringPhase = this.ringPhase + dtMilliseconds * 0.0009f;
+        if (this.ringPhase > 6.2831853f) { this.ringPhase = this.ringPhase - 6.2831853f; }
         this.frames = this.frames + 1;
     }
 
@@ -195,6 +238,10 @@ class DemoLoop : IGuiHostLoop {
         int drewCube = c.DrawMesh3D(this.cubeMesh, mvp,
                                     CDraw.Argb(255, 255, 235, 210), "mem:3dchecker");
 
+        // 一圈彩色小立方体：批量实例通路（GPU 档才有内容，CPU 档
+        // DrawMesh3DBatchBegin 返回 0 自动整批跳过）
+        this.DrawRing(host, c, cw, ch);
+
         if (drewCube == 0) {
             // CPU 兜底档（或该平台尚未接 3D 管线）：同一份相机数学的 2D 线框。
             DrawWireCube(c, cw, ch, mvp, this.autoSpin);
@@ -209,7 +256,7 @@ class DemoLoop : IGuiHostLoop {
         c.DrawText(16, hudY + 26, "frames: " + this.frames,
                    CDraw.Argb(200, 160, 172, 196), 14);
         string hint = drewCube == 1
-            ? "drag to orbit - arrows to zoom - checker texture + half-lambert"
+            ? "drag to orbit - arrows to zoom - checker + half-lambert + instance ring"
             : "GPU backend unavailable here - wireframe fallback";
         c.DrawText(16, ch - 26, hint, CDraw.Argb(180, 150, 160, 180), 14);
 
