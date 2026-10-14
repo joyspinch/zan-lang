@@ -290,16 +290,6 @@ static zan_istr_t flatten_qname_buf(zan_ast_node_t *q, char *buf, size_t buf_cap
     return empty;
 }
 
-static int count_simple(nr_ctx_t *c, zan_istr_t simple) {
-    int n = 0;
-    for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
-         node >= 0; node = c->by_simple.chains[node].next) {
-        if (ns_istr_eq(c->items[c->by_simple.chains[node].idx].simple, simple))
-            n++;
-    }
-    return n;
-}
-
 static bool name_taken(nr_ctx_t *c, const char *s, size_t n) {
     for (int i = 0; i < c->count; i++) {
         zan_istr_t f = c->items[i].final;
@@ -347,14 +337,12 @@ static int decl_type_param_count(const zan_ast_node_t *d) {
 }
 
 static bool arity_matches(const zan_ast_node_t *tr, const nr_type_t *t) {
-    if (tr->type_ref.type_args.count == 0) return true;
     return decl_type_param_count(t->decl) == tr->type_ref.type_args.count;
 }
 
 static int count_simple_matching(nr_ctx_t *c, zan_istr_t simple,
                                  const zan_ast_node_t *tr) {
     int want = tr->type_ref.type_args.count;
-    if (want == 0) return count_simple(c, simple);
     int n = 0;
     for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
          node >= 0; node = c->by_simple.chains[node].next) {
