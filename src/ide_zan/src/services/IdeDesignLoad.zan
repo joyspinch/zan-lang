@@ -114,15 +114,12 @@ class IdeDesignSave {
     string componentName;
     int revision;
     bool html;
-    bool upgrade;
     string diskPath;
     string diskText;
     string text;
     string componentPath = "";
     string failure = "";
     bool wrote;
-    bool migrated;
-    bool migrationConflict;
     List<UserComponent> components;
     LspSession session;
 }
@@ -387,7 +384,7 @@ partial class ZanIDE {
             if (component != "" || !formDesigner.DocumentMatchesSnapshot(displayedForm.form)) {
                 DesignerDocumentSnapshot snapshot = formDesigner.CaptureDocumentSnapshot();
                 displayedForm.form = snapshot;
-                this.QueueDesignSave(displayedForm, snapshot, null, component, false);
+                this.QueueDesignSave(displayedForm, snapshot, null, component);
             }
             string openComponent = formDesigner.ConsumeOpenComponent();
             if (openComponent != "" && !designStopping) {
@@ -399,19 +396,18 @@ partial class ZanIDE {
             && !sceneDesigner.DocumentMatchesSnapshot(displayedScene.scene)) {
             SceneDoc snapshot = sceneDesigner.CaptureDocumentSnapshot();
             displayedScene.scene = snapshot;
-            this.QueueDesignSave(displayedScene, null, snapshot, "", false);
+            this.QueueDesignSave(displayedScene, null, snapshot, "");
         }
     }
 
     void QueueDesignSave(IdeDesignDocument document, DesignerDocumentSnapshot form, SceneDoc scene,
-                         string componentName, bool upgrade) {
+                         string componentName) {
         if (designStopping || navigationCommitBusy || designWritesPausing) { return; }
         document.revision = document.revision + 1;
         IdeDesignSave save = new IdeDesignSave();
         save.previous = document.tail; save.form = form; save.scene = scene;
         save.path = document.path; save.sourceText = document.tab.body; save.project = document.project;
         save.componentName = componentName; save.html = document.tab.designDoc;
-        save.upgrade = upgrade;
         save.revision = document.revision; save.session = lspSess;
         save.work.saving = true; save.work.workspace = document.workspace;
         save.work.tabSet = document.tabSet; save.work.tab = document.tab; save.work.path = document.path;
@@ -455,28 +451,12 @@ partial class ZanIDE {
         try {
             save.text = save.form != null ? save.form.ToHtml() : save.scene.ToHtml();
             if (save.work.cancelled.Load() != 0) { return; }
-            if (save.upgrade && !save.diskPath.EndsWith(".html")) {
-                int suffix = 5;
-                string htmlPath = save.diskPath.Substring(0, save.diskPath.Length - suffix) + ".html";
-                if (!File.Exists(htmlPath)) {
-                    string html = save.form.ToHtml();
-                    if (File.Exists(save.diskPath) && File.ReadAllText(save.diskPath) != save.diskText) {
-                        throw new IOException("Design changed on disk: " + save.diskPath);
-                    }
-                    File.WriteAllText(htmlPath, html);
-                    if (File.ReadAllText(htmlPath) != html) { throw new IOException("Could not verify " + htmlPath); }
-                    File.Delete(save.diskPath);
-                    save.diskPath = htmlPath; save.text = html; save.migrated = true; save.wrote = true;
-                } else { save.migrationConflict = true; }
-            }
-            if (save.text != save.diskText || save.migrated) {
-                if (!save.migrated) {
-                    if (File.Exists(save.diskPath) && File.ReadAllText(save.diskPath) != save.diskText) {
-                        throw new IOException("Design changed on disk: " + save.diskPath);
-                    }
-                    File.WriteAllText(save.diskPath, save.text);
-                    if (File.ReadAllText(save.diskPath) != save.text) { throw new IOException("Could not verify " + save.diskPath); }
+            if (save.text != save.diskText) {
+                if (File.Exists(save.diskPath) && File.ReadAllText(save.diskPath) != save.diskText) {
+                    throw new IOException("Design changed on disk: " + save.diskPath);
                 }
+                File.WriteAllText(save.diskPath, save.text);
+                if (File.ReadAllText(save.diskPath) != save.text) { throw new IOException("Could not verify " + save.diskPath); }
                 save.diskText = save.text; save.wrote = true;
                 string codeBehind = save.scene != null ? ZanIDE.SceneCodeBehindPath(save.diskPath) : ZanIDE.CodeBehindPath(save.diskPath);
                 if (!File.Exists(codeBehind)) {
@@ -512,16 +492,6 @@ partial class ZanIDE {
         }
         if (document.revision != save.revision || save.work.cancelled.Load() != 0
             || document.tab.body != save.sourceText) { return; }
-        if (save.migrationConflict) { log.Add("> Legacy form kept as-is: HTML target already exists."); }
-        if (save.diskPath != document.path) {
-            string oldPath = document.path;
-            document.path = save.diskPath; document.tab.path = save.diskPath;
-            document.tab.name = Path.GetFileName(save.diskPath); document.tab.designDoc = true;
-            if (loadedFormPath == oldPath) { loadedFormPath = save.diskPath; }
-            if (codeViewForm == oldPath) { codeViewForm = save.diskPath; }
-            log.Add("> legacy form upgraded -> " + save.diskPath);
-            rescan = true;
-        }
         if (save.text != null) { document.body = save.text; document.tab.body = save.text; }
         if (displayedForm == document) { formCache = document.body; }
         if (displayedScene == document) { sceneCache = document.body; }

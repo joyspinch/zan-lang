@@ -4634,25 +4634,6 @@ int main(int argc, char **argv) {
         fprintf(stderr, "error: no input file\n");
         return 1;
     }
-    for (int fi = 0; fi < input_count; fi++) {
-        size_t pn = strlen(input_files[fi]);
-        if (pn > 6 && strcmp(input_files[fi] + pn - 6, ".zform") == 0) {
-            fprintf(stderr,
-                    "error: '%s': the legacy .zform design format is no "
-                    "longer supported; convert the document to an .html "
-                    "design doc and recompile\n",
-                    input_files[fi]);
-            return 1;
-        }
-        if (pn > 7 && strcmp(input_files[fi] + pn - 7, ".zscene") == 0) {
-            fprintf(stderr,
-                    "error: '%s': the legacy .zscene format is no longer "
-                    "supported; convert the scene document to an .html "
-                    "scene doc (<body data-zan-scene=...>) and recompile\n",
-                    input_files[fi]);
-            return 1;
-        }
-    }
 
     input_file = input_files[0];
     if (package_project)

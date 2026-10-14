@@ -1,90 +1,48 @@
-# Zan 官网 (Cloudflare Workers)
+# Zan 官网
 
-Zan 编程语言官网，使用 **Cloudflare Workers 静态资源**（Static Assets）托管，免费额度（10 万请求/天）足够使用。
-
-## 目录
-
-```
-zan-site/
-├── public/           # 站点静态资源（部署内容）
-│   ├── index.html    # 官网首页（手工维护）
-│   ├── styles.css    # 站点样式（手工维护）
-│   ├── app.js        # 语言切换/滚动监听/搜索等
-│   ├── app.json
-│   ├── lang.html / gui.html / stdlib.html / wiki.html / examples.html
-│   │                  # 文档页（由 guides/*.md 生成）
-│   ├── lang.md / gui.md / ...     # 同一内容的 Markdown（供 AI 检索）
-│   └── ref/          # 标准库 API 参考（自动生成）
-│       ├── index.json # 命名空间索引（机器可读，供 AI 检索）
-│       ├── <ns>.html  # 每命名空间参考页
-│       └── <ns>.md    # 每命名空间 Markdown（供 AI 检索）
-│       # 全量 API 模型是构建中间产物 gen/ref-data.json（~19MB），只在构建时使用，不部署
-├── guides/           # 手写指南（Markdown 源）
-│   ├── lang.md       # 语言参考（全部语言能力，实测语义）
-│   ├── gui.md        # GUI 开发指南（.html 设计稿 + 代码式组件 + 控件）
-│   ├── stdlib.md     # 标准库总览与索引
-│   ├── wiki.md       # IDE 指南
-│   └── examples.md   # 示例与模板
-├── gen/
-│   ├── api_extract.py  # 从 ../stdlib/**/*.zan 提取 API → public/ref/data.json
-│   └── site_build.py   # guides/*.md → HTML + ref/data.json → ref/<ns>.html/.md
-├── wrangler.toml     # Workers 配置（assets-only，无需服务端代码）
-└── package.json
-```
-
-## 重新生成文档
-
-标准库更新或指南修改后，运行：
-
-```bash
-python gen/api_extract.py   # 1) stdlib → public/ref/data.json（约 10 s）
-python gen/site_build.py    # 2) 数据 + guides → 所有 HTML/MD 页面
-```
-
-- `api_extract.py` 是语法感知的 token 扫描器：解析 namespace/类型声明/成员
-  （字段/属性/方法/构造/运算符/事件/嵌套类型），把 `///` 文档注释附着到
-  声明上。全量模型写到 gen/ref-data.json（仅构建用，不部署）；
-  轻量索引 public/ref/index.json 随站部署。改动 stdlib 后重跑即可。
-- 两个脚本输出全部提交到 `public/`，部署不依赖构建步骤。
+从零构建的中文展示站，采用原生 HTML、CSS、ES modules 和 Node 内置静态服务；没有第三方前端运行依赖。
 
 ## 本地预览
 
-```bash
-npm install
-npm run dev        # wrangler dev，本地 http://localhost:8787
-# 或纯静态：
-python -m http.server 8787 --directory public
+在仓库根目录运行：
+
+```sh
+npm --prefix zan-site run dev
 ```
 
-## 部署到 Cloudflare
+默认地址为 `http://127.0.0.1:4173/`。使用 `PORT` 环境变量可更换端口。
 
-1. 安装依赖并登录（首次）：
-   ```bash
-   npm install
-   npx wrangler login          # 浏览器授权你的 Cloudflare 账号
-   ```
-2. 部署：
-   ```bash
-   npm run deploy              # 等价于 npx wrangler deploy
-   ```
-   部署后会得到 `https://zan-site.<你的子域>.workers.dev`。
+## 检查与构建
 
-### 用 API Token 部署（CI / 无浏览器）
-
-```bash
-export CLOUDFLARE_API_TOKEN=xxxxx        # 需含 "Edit Cloudflare Workers" 权限
-export CLOUDFLARE_ACCOUNT_ID=xxxxx
-npx wrangler deploy
+```sh
+npm --prefix zan-site run check
+npm --prefix zan-site run build
 ```
 
-## 文档约定
+发布文件输出到仓库的 `build/zan-site/`。将该目录内容上传到静态托管平台即可。网站不依赖 API 服务器，不需要 SPA 路由回退；资源与页面使用相对路径，可部署到子路径。
 
-- 链接统一用**无扩展名**形式（`/lang`、`/ref/System.IO`）：Cloudflare Workers
-  Assets 会把无扩展名路径自动解析到同名 `.html` 资产，同时会把 `.html`
-  请求 307 剥掉扩展名——不要加 `.html` 后缀，也不要配置把这些路径
-  重定向回 `.html`（会与 307 互跳成环）。
-- 每份文档同时发布 `.md` 版本（`/lang.md`、`/ref/System.IO.md`），供 AI
-  直接抓取作为检索上下文；`/ref/index.json` 是机器可读的全量索引。
-- 导航栏活跃页标记：`.nav-links a.active`（styles.css）。
-- 站点内容若与 `docs/SPEC.md` 冲突，以 conformance 用例与 stdlib 源码为准
-  （SPEC.md 部分章节已过时，如 `?.`/record 实际已实现）。
+## 内容结构
+
+- `index.html`：首页结构、基础语义与入口。
+- `src/styles.css`、`src/experience.css`、`src/immersive.css`：基础视觉、渐进披露与蓝紫空间布局。
+- `src/creation.js`、`src/creation.css`：待办、CSV、HTTP 三种创作场景及可操作概念预览，可将所选场景带入 AI 项目指令。
+- `src/interactions.js`、`src/interactions.css`：阅读进度、章节导航、返回顶部、指针光效和统一暂停状态。
+- `src/intelligence.js`、`src/intelligence.css`：粒子核心、轨道信号与指针响应；减少动态效果、离屏及页面隐藏时停止动画。
+- `src/content.js`：代码片段、AI 流程示意、指南与搜索入口。
+- `src/onboarding.js`：三类用户的选择理由、真实客户端配置与一句话 AI 指令；支持示例及自定义想法，指令附带发布仓库中的官方入门链接。
+- `src/capabilities.js`：差异化能力与平台分层状态。
+- `src/ecosystem.js`：核心标准库摘要、六类场景、38 个第一方包与清单状态。
+- `src/app.js`、`src/explore.js`：交互演示、检索、可访问标签页与新增内容渲染。
+- `agent-guide.md`、`llms.txt`：供 AI 读取的站点与开发指南。
+
+## 内容维护
+
+技术描述来自当前源码、包清单与仓库文档。更新功能时同步修订源码链接、限制与平台状态，避免把“存在编译路径”写成“全部设备实机验证”，或把“源码可用”写成“生产环境成熟”。38 是当前第一方包清单数量，不是生态总规模承诺。
+
+AI 调用与 ARC 动画为流程示意；代码区域是静态示例，不是在线编译器。对外下载统一指向发布仓库 `https://github.com/joyspinch/zanlang`。该仓库当前提供打包的 Windows SDK，按 README 通过 Code → Download ZIP 下载，完整解压后运行 ZanIDE.exe；Releases 当前为空。生态卡片展示能力清单，相关包是否随附或单独提供以发布仓库说明为准，不承诺 38 个包均有独立下载。用户入口不链接编译器源码或要求自行构建工具链。JS 共用入口定义在 `src/content.js`，静态 HTML 与机器可读指南同步维护。页面视觉不依赖外链字体或图片。
+
+默认入口为“描述想法 → 复制给 AI”，SDK 与 MCP 配置折叠在高级接入说明中；手动编译单独面向有经验的开发者。普通聊天窗口不能直接在用户电脑上创建和运行应用，环境准备由能操作本地文件的 AI 编程工具引导。
+
+`--init-agent` 默认跳过已有文件，不会自动合并 MCP JSON，也不创建应用代码。网站所给 Windows 路径为示例，需要按真实环境替换。
+
+性能部分解释 AOT、ARC、值类型与原生 I/O 的机制，不展示没有可重复基准支持的性能数字。商业授权包等独立许可按各包清单为准。
