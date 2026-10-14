@@ -1,0 +1,308 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+using Gui.Widget;
+
+namespace Gui;
+
+// 并驱动帧循环，每帧在标题栏装饰之下
+// 布局并渲染整棵树。
+class Form : Control {
+    App app;
+    string title;
+    // 周期任务（见 Every），在事件循环中按期触发。
+    List<FormTask> tasks;
+    // 设计出的 `on<Event>` 绑定的 Name -> Action 表（与
+    // UiDoc/HandlerRegistry 契约相同）：设计文档存储处理器名，
+    // 业务文件用 On() 注册 Action，生成的
+    // 生成代码把每个控件的事件订阅到 Handle(name)。从未注册的
+    // 处理器自然不会触发。
+    HandlerRegistry handlers;
+
+    // 构建底层窗口和 app。树可以在 Run() 之前
+    // 组装并布局好。
+    Form(string title, int width, int height) {
+        InitForm(title, width, height, false);
+    }
+
+    Form(string title, int width, int height, bool offscreen) {
+        InitForm(title, width, height, offscreen);
+    }
+
+    void InitForm(string title, int width, int height, bool offscreen) {
+        this.InitControl(title, 5);
+        this.title = title;
+        this.app = offscreen ? App.CreateOffscreen(title, width, height)
+                             : new App(title, width, height);
+        this.handlers = new HandlerRegistry();
+        this.tasks = new List<FormTask>();
+    }
+
+    // 独立画布、样式和命中环境，不创建系统窗口。
+    static Form CreateOffscreen(string title, int width, int height) {
+        return new Form(title, width, height, true);
+    }
+
+    // 浅色主题的窗口（默认外观）；标题栏的皮肤选择器仍可
+    // 切换浅色/深色与已打包的皮肤。
+    static Form Create(string title, int width, int height) {
+        return new Form(title, width, height);
+    }
+
+    // 深色主题的窗口，且关闭皮肤切换（EnableSkins(0)）：
+    // 外观锁定为内置深色主题。
+    static Form CreateDark(string title, int width, int height) {
+        Form f = new Form(title, width, height);
+        f.app.SetDark(true);
+        f.app.EnableSkins(0);
+        return f;
+    }
+
+    // 底层 App（画布、主题、事件泵、时钟）。
+    App GetApp() {
+        return app;
+    }
+
+    // 运行时改写窗口标题：自绘标题栏下一帧就用新文字，
+    // 同时同步操作系统窗口标题（任务栏/Alt-Tab）。
+    void SetTitle(string text) {
+        if (this.title == text) { return; }
+        this.title = text;
+        app.SetWindowTitle(text);
+        app.RequestRedraw();
+    }
+
+    // 当前窗口标题。
+    string Title() { return this.title; }
+
+    // 编程式关闭窗口。
+    void Close() {
+        if (app != null) { app.RequestClose(); }
+    }
+
+    // 最小化窗口。
+    void Minimize() {
+        if (app != null) { app.MinimizeWindow(); }
+    }
+
+    // 在最大化与还原之间切换。
+    void ToggleMaximize() {
+        if (app != null) { app.ToggleMaximizeWindow(); }
+    }
+
+    // 登记标题栏右侧客户区保护带宽度（设备像素）。
+    void SetCaptionZone(int width) {
+        if (app != null) { app.SetCaptionZone(width); }
+    }
+
+    // 窗口根不是一张卡片：它就是客户区本身。因此它按
+    // `window` 解析样式（base.css 里无边框、无阴影、内边距 0），
+    // 而不是落到"未知类型"的通用表面默认值上——那会给整个
+    // 设计加上一圈外边框，并把内容往里缩 paddingLarge。
+    override string StyleType() { return "window"; }
+
+    // ---- 每帧钩子 ----
+
+    // 每帧回调（在事件处理之后、周期任务与渲染之前执行）。
+    // 供宿主在保留模式循环中泵其它窗口 / 驱动动画 / 轮询
+    // 后台任务（IDE 的多窗口 pump、向导等）。覆盖旧值。
+    Action frameHook;
+
+    // 安装每帧回调（覆盖旧值；回调时机见 frameHook 字段说明）。
+    void FrameHook(Action a) {
+        frameHook = a;
+    }
+
+    // ---- 退出钩子 ----
+
+    // 事件循环结束（窗口关闭）后调用一次的回调，
+    // 供宿主保存状态 / 清理。
+    Action exitHook;
+
+    // 注册退出回调（事件循环结束、窗口关闭后调用一次；见 exitHook）。
+    void OnExit(Action a) {
+        exitHook = a;
+    }
+
+    // ---- 周期任务 ----
+
+    // 每 `ms` 毫秒跑一次 `a`，由事件循环驱动（采集、报警
+    // 扫描、趋势取点都用它）。任务跑完就请求重绘，因此
+    // 它改的信号会在下一帧体现。
+    FormTask Every(int ms, Action a) {
+        FormTask t = new FormTask(ms, a);
+        t.Schedule(app.nowMs + t.Period());
+        tasks.Add(t);
+        return t;
+    }
+
+    // 到期的周期任务全部跑一遍，并把下一个到期时刻告知
+    // 事件循环（以便在无输入时也能醒过来）。手写循环可
+    // 直接调用它。
+    // 时钟取 `Window.GetTickMs()` 而不是 `app.nowMs`：后者只在
+    // **渲染了一帧**的 BeginFrame 里推进，而"没到期"的那一圈恰恰
+    // 不渲染（`if (!app.needsRedraw) continue;`）。用缓存时钟的后果是
+    // 任务放完第一炮就再也不响——第二圈算出 `due` 还没到，于是按
+    // 120ms 重新排一次唤醒，唤醒回来读到的还是上一帧的旧时间，循环
+    // 往复，直到鼠标划过窗口触发一次真渲染才补跑一拍。实机上表现
+    // 为"空闲窗口 Every(120) 每几秒才跑一拍"（传奇模板页 31 的挂机
+    // 动画就是这么静止的）。GetTickMs 是真实单调时钟，冻结时钟时
+    // 仍返回冻结值，确定性截图不受影响。
+    void PumpTasks() {
+        if (tasks.Count == 0) { return; }
+        int now = Window.GetTickMs();
+        int soonest = 0 - 1;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FormTask t = tasks[i];
+            if (now >= t.Due()) {
+                t.Fire();
+                t.Schedule(now + t.Period());
+                app.RequestRedraw();
+            }
+            int wait = t.Due() - now;
+            if (wait < 0) { wait = 0; }
+            if (soonest < 0 || wait < soonest) { soonest = wait; }
+        }
+        if (soonest >= 0) { app.RequestWakeIn(soonest); }
+    }
+
+    // 在帧渲染呈现后（BeginFrame 清空了 wakeNextMs 之后）重新武装 Form 周期任务的唤醒时钟，
+    // 确保空闲无输入状态下事件循环仍能准时唤醒执行下一拍任务，彻底消除"必须晃动鼠标才刷新"的死锁。
+    void FoldTaskDeadlines() {
+        if (tasks.Count == 0) { return; }
+        int now = Window.GetTickMs();
+        int soonest = 0 - 1;
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            int wait = tasks[i].Due() - now;
+            if (wait < 0) { wait = 0; }
+            if (soonest < 0 || wait < soonest) { soonest = wait; }
+        }
+        if (soonest >= 0) { app.RequestWakeIn(soonest); }
+    }
+
+    // ---- 动态控件通道 ----
+    // 类型化的控件字段是访问控件的主要、经编译检查的方式。
+    // 这些按名查找是次要通道，供
+    // 编译期不知道类型的代码使用（数据驱动 UI、设计器
+    // 脚本、插件胶水）：Ctl()/Get<T>() 遍历实时树。
+
+    // 第一个（深度优先）名为 `name` 的控件，或 null。
+    // 设计器总是为每个字段分配唯一名称，因此实际中它是精确的；
+    // 但你自己写的代码永远不要假定结果非空。
+    Control Ctl(string name) {
+        return this.Find(name);
+    }
+
+    // 类型化按名查找：`Checkbox c = form.Get<Checkbox>("agree");`
+    // 名称不存在或控件不是该类型时返回 null。
+    T Get<T>(string name) {
+        Control c = this.Find(name);
+        if (c == null) { return null; }
+        if (c is T) { return (T)c; }
+        return null;
+    }
+
+    // ---- 设计的事件绑定 ----
+
+    // 注册（或替换）绑定到设计处理器名的 Action。
+    // 生成代码通过此表解析每个控件的 `on<Event>` 值，
+    // 因此设计中的处理器名必须与此处一致。
+    void On(string name, Action a) {
+        handlers.Set(name, a);
+    }
+
+    // 为 `name` 注册的 Action；未注册时为 null。
+    Action Handle(string name) {
+        return handlers.Get(name);
+    }
+
+    // 运行为 `name` 注册的 Action（若有）。对未注册的名称
+    // 安全（空操作）。让设计器和数据驱动代码无需持有
+    // 控件引用即可触发处理器。
+    void Call(string name) {
+        Action a = handlers.Get(name);
+        if (a != null) { a(); }
+    }
+
+    // 在当前帧中一次性测量、布局并绘制整棵树，
+    // 位于装饰之下。公开以便手写循环可以组合调用它。
+    void RenderFrame(App a) {
+        int top = a.ContentTop();
+        int offX = a.ShapeOffX();
+        int offY = a.ShapeOffY();
+        int clientW = a.ClientWidth();
+        int clientH = a.ClientHeight() - top;
+        int W = a.canvas.Width();
+        int H = a.canvas.Height();
+        // 在树后绘制当前皮肤的主题背景（渐变 + 玻璃壁纸，
+        // 或纯色填充），让磨砂玻璃面板模糊真实
+        // 色彩而不是纯色清屏——与 IDE/画廊
+        // 设置窗口的方式相同。槽 0 是惯例的背景缓存槽。
+        a.PhaseBegin();
+        a.RenderBackground(0, top, W, H - top, 0);
+        a.PhaseEnd(0);
+        this.MeasureTree(a);
+        a.PhaseEnd(1);
+        this.Arrange(offX, top + offY, clientW, clientH);
+        a.PhaseEnd(2);
+        this.RenderTree(a);
+        a.PhaseEnd(3);
+    }
+
+    // 标准保留模式循环：处理事件、泵子窗口、布局、渲染树、绘制
+    // 装饰、呈现。子窗口（ChildWindow）与共享文件选择器由
+    // ChildWindows 注册表在此自动泵送，宿主无需手写任何泵逻辑。
+    void Run() {
+        app.Show();
+        App prior = App.frameApp;
+        // 拖动窗口边框时 OS 进入模态尺寸调整循环，下面这个循环拿不到
+        // 控制权：把同一份帧体登记给框架，窗口过程收到 WM_SIZE 就地
+        // 画一帧，界面随拖动实时跟随，而不是松手后才刷新。
+        app.SetFrameBody(() => {
+            this.RenderFrame(app);
+            app.RenderChrome(title);
+        });
+        UiDriver.SetRoot(this);
+        while (app.isRunning) {
+            if (!app.ProcessEvent()) {
+                break;
+            }
+            if (frameHook != null) { frameHook(); }
+            app.PerfMark("sh.framehook");
+            ChildWindows.PumpAll();
+            app.PerfMark("sh.childpump");
+            ChildWindows.FoldDeadlines(app);
+            app.PerfMark("sh.deadlines");
+            this.PumpTasks();
+            app.PerfMark("sh.tasks");
+            app.PerfMark("sh.framegate");
+            if (!app.needsRedraw) {
+                continue;
+            }
+            app.BeginFrame();
+            RenderFrame(app);
+            app.RenderChrome(title);
+            app.PresentFrame();
+            ChildWindows.FoldDeadlines(app);
+            this.FoldTaskDeadlines();
+        }
+        // 嵌套窗口（对话框等）跑完自己的循环后，把就地重绘的归属
+        // 交还给之前那个窗口，别让它指着一个已关闭的窗口。
+        App.frameApp = prior;
+        if (exitHook != null) { exitHook(); }
+    }
+
+    // 极简快照与离屏渲染封装：自动步进单帧管线，无需外部手动管理
+    // Viewport、DPI、BeginOffscreenFrame、RenderFrame 与 EndOffscreenFrame。
+    Canvas CaptureSnapshot() {
+        if (this.app == null) { return null; }
+        this.app.BeginOffscreenFrame();
+        this.RenderFrame(this.app);
+        this.app.RenderChrome(this.title);
+        this.app.EndOffscreenFrame();
+        return this.app.canvas;
+    }
+}
+
+// 具名停靠值，使树中写 `.Dock(Dock.Top())` 而不是魔法
