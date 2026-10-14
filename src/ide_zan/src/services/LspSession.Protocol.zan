@@ -1,0 +1,278 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+using Platform;
+
+partial class LspSession {
+    static int ByteColumnToUtf16(string text, int byteCol) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && pos < byteCol) {
+            int next = Text.NextCharEnd(text, pos);
+            if (next > byteCol) { break; }
+            units = units + (next - pos == 4 ? 2 : 1);
+            pos = next;
+        }
+        return units;
+    }
+
+    static int Utf16ColumnToByte(string text, int column) {
+        int pos = 0;
+        int units = 0;
+        while (pos < text.Length && units < column) {
+            int next = Text.NextCharEnd(text, pos);
+            int width = next - pos == 4 ? 2 : 1;
+            if (units + width > column) { break; }
+            units = units + width;
+            pos = next;
+        }
+        return pos;
+    }
+
+    static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        int start = 0;
+        int len = text.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            char c = text[i];
+            if (c == '\n') {
+                int end = i;
+                if (end > start && text[end - 1] == '\r') { end = end - 1; }
+                lines.Add(text.Substring(start, end - start));
+                start = i + 1;
+            }
+        }
+        if (start <= len) {
+            lines.Add(text.Substring(start, len - start));
+        }
+        return lines;
+    }
+
+    static LspPosition ParsePosition(JsonValue value) {
+        if (value == null || !value.IsObject()) { return null; }
+        JsonValue lineValue = value.Get("line");
+        JsonValue characterValue = value.Get("character");
+        if (lineValue == null || characterValue == null || !lineValue.IsInt() || !characterValue.IsInt()) { return null; }
+        int line = lineValue.AsInt(-1);
+        int character = characterValue.AsInt(-1);
+        if (line < 0 || character < 0) { return null; }
+        return LspSession.PosObj(line, character);
+    }
+
+    static LspDefinitionTarget ParseDefinitionLocation(JsonValue value) {
+        if (value == null || !value.IsObject()) { return null; }
+        string uri = value.Str("uri", "");
+        JsonValue range = value.Get("range");
+        if (uri.Length == 0) {
+            uri = value.Str("targetUri", "");
+            range = value.Get("targetSelectionRange");
+            if (range == null) { range = value.Get("targetRange"); }
+        }
+        if (uri.Length == 0 || range == null || !range.IsObject()) { return null; }
+        LspPosition start = LspSession.ParsePosition(range.Get("start"));
+        LspPosition end = LspSession.ParsePosition(range.Get("end"));
+        if (start == null || end == null || end.line < start.line
+            || (end.line == start.line && end.character < start.character)) { return null; }
+        LspDefinitionTarget target = new LspDefinitionTarget();
+        target.path = LspSession.UriToPath(uri);
+        if (target.path.Length == 0) { return null; }
+        target.line = start.line;
+        target.column = start.character;
+        return target;
+    }
+
+    static JsonValue ParseResponse(string message) {
+        JsonValue root = null;
+        try { root = JsonValue.ParseLenient(message); } catch (Exception) { return null; }
+        if (root == null || !root.IsObject() || root.Has("error")) { return null; }
+        return root;
+    }
+
+    static LspDefinitionTarget ParseDefinition(string message) {
+        JsonValue root = LspSession.ParseResponse(message);
+        if (root == null) { return null; }
+        JsonValue result = root.Get("result");
+        if (result == null || result.IsNull()) { return null; }
+        if (!result.IsArray()) { return LspSession.ParseDefinitionLocation(result); }
+        for (int i = 0; i < result.Count(); i = i + 1) {
+            LspDefinitionTarget target = LspSession.ParseDefinitionLocation(result.At(i));
+            if (target != null) { return target; }
+        }
+        return null;
+    }
+
+    static bool AppendRenameEdits(List<LspRenameEdit> output, string uri, JsonValue edits, int version) {
+        if (uri.Length == 0 || edits == null || !edits.IsArray()) { return false; }
+        string path = LspSession.UriToPath(uri);
+        if (path.Length == 0) { return false; }
+        for (int i = 0; i < edits.Count(); i = i + 1) {
+            JsonValue edit = edits.At(i);
+            if (edit == null || !edit.IsObject()) { return false; }
+            JsonValue range = edit.Get("range");
+            JsonValue newText = edit.Get("newText");
+            if (range == null || !range.IsObject() || newText == null || !newText.IsString()) { return false; }
+            LspPosition start = LspSession.ParsePosition(range.Get("start"));
+            LspPosition end = LspSession.ParsePosition(range.Get("end"));
+            if (start == null || end == null || end.line < start.line
+                || (end.line == start.line && end.character < start.character)) { return false; }
+            LspRenameEdit item = new LspRenameEdit();
+            item.path = path; item.start = start; item.end = end;
+            item.newText = newText.AsString(""); item.version = version;
+            output.Add(item);
+        }
+        return true;
+    }
+
+    static List<LspRenameEdit> ParseWorkspaceEdit(string m) {
+        List<LspRenameEdit> output = new List<LspRenameEdit>();
+        JsonValue root = LspSession.ParseResponse(m);
+        if (root == null) { return null; }
+        JsonValue result = root.Get("result");
+        if (result == null) { return null; }
+        if (result.IsNull()) { return output; }
+        if (!result.IsObject()) { return null; }
+        JsonValue changes = result.Get("changes");
+        JsonValue documentChanges = result.Get("documentChanges");
+        if (changes != null && documentChanges != null) { return null; }
+        if (changes != null) {
+            if (!changes.IsObject()) { return null; }
+            for (int f = 0; f < changes.Count(); f = f + 1) {
+                if (!LspSession.AppendRenameEdits(output, changes.KeyAt(f), changes.ValAt(f), -1)) { return null; }
+            }
+        } else if (documentChanges != null) {
+            if (!documentChanges.IsArray()) { return null; }
+            for (int f = 0; f < documentChanges.Count(); f = f + 1) {
+                JsonValue entry = documentChanges.At(f);
+                if (entry == null || !entry.IsObject() || entry.Has("kind")) { return null; }
+                JsonValue document = entry.Get("textDocument");
+                if (document == null || !document.IsObject()) { return null; }
+                JsonValue versionValue = document.Get("version");
+                int version = -1;
+                if (versionValue != null && !versionValue.IsNull()) {
+                    if (!versionValue.IsInt()) { return null; }
+                    version = versionValue.AsInt(-1);
+                    if (version < 0) { return null; }
+                }
+                if (!LspSession.AppendRenameEdits(output, document.Str("uri", ""), entry.Get("edits"), version)) { return null; }
+            }
+        }
+        return output;
+    }
+
+    static int PositionOffset(string text, LspPosition position) {
+        if (position == null || position.line < 0 || position.character < 0) { return -1; }
+        int start = 0;
+        for (int line = 0; line < position.line; line = line + 1) {
+            int next = text.IndexOf("\n", start);
+            if (next < 0) { return -1; }
+            start = next + 1;
+        }
+        int end = text.IndexOf("\n", start);
+        if (end < 0) { end = text.Length; }
+        if (end > start && (text[end - 1] & 255) == 13) { end = end - 1; }
+        string source = text.Substring(start, end - start);
+        int col = LspSession.Utf16ColumnToByte(source, position.character);
+        if (LspSession.ByteColumnToUtf16(source, col) != position.character) { return -1; }
+        return start + col;
+    }
+
+    static LspEditApplication ApplyTextEdits(string text, List<LspRenameEdit> edits, string path) {
+        LspEditApplication result = new LspEditApplication();
+        result.text = text;
+        if (edits == null) { return result; }
+        List<LspEditSpan> spans = new List<LspEditSpan>();
+        for (int i = 0; i < edits.Count; i = i + 1) {
+            LspRenameEdit edit = edits[i];
+            if (edit == null) { return result; }
+            if (!LspSession.SameDocumentPath(edit.path, path)) { continue; }
+            int start = LspSession.PositionOffset(text, edit.start);
+            int end = LspSession.PositionOffset(text, edit.end);
+            if (start < 0 || end < start) { return result; }
+            LspEditSpan span = new LspEditSpan();
+            span.start = start; span.end = end; span.newText = edit.newText;
+            int at = 0;
+            while (at < spans.Count && (spans[at].start > start
+                || (spans[at].start == start && spans[at].end > end))) { at = at + 1; }
+            spans.Insert(at, span);
+        }
+        for (int i = 1; i < spans.Count; i = i + 1) {
+            if (spans[i].end > spans[i - 1].start) { return result; }
+        }
+        string output = text;
+        for (int i = 0; i < spans.Count; i = i + 1) {
+            LspEditSpan span = spans[i];
+            output = output.Substring(0, span.start) + span.newText
+                + output.Substring(span.end, output.Length - span.end);
+        }
+        result.valid = true;
+        result.text = output;
+        return result;
+    }
+
+    static bool SameDocumentPath(string left, string right) {
+        left = left.Replace("\\", "/");
+        right = right.Replace("\\", "/");
+        #if WINDOWS
+        left = left.ToLower(); right = right.ToLower();
+        #endif
+        return left == right;
+    }
+
+    static string MarkupText(JsonValue value) {
+        if (value == null) { return ""; }
+        if (value.IsString()) { return value.AsString(""); }
+        if (value.IsArray()) {
+            List<string> parts = new List<string>();
+            for (int i = 0; i < value.Count(); i = i + 1) {
+                parts.Add(LspSession.MarkupText(value.At(i)));
+            }
+            return string.Join("\n", parts);
+        }
+        return value.Str("value", "");
+    }
+
+    static string PosParams(string path, int line0, int col0) {
+        LspDocPosParams p = new LspDocPosParams();
+        p.textDocument = LspSession.UriObj(path);
+        p.position = LspSession.PosObj(line0, col0);
+        return Json.Serialize<LspDocPosParams>(p);
+    }
+
+    static LspTextDocumentIdentifier UriObj(string path) {
+        LspTextDocumentIdentifier o = new LspTextDocumentIdentifier();
+        o.uri = LspSession.PathToUri(path);
+        return o;
+    }
+
+    static LspPosition PosObj(int line0, int col0) {
+        LspPosition o = new LspPosition();
+        o.line = line0;
+        o.character = col0;
+        return o;
+    }
+
+    static string PathToUri(string path) {
+        string p = "";
+        for (int i = 0; i < path.Length; i = i + 1) {
+            string ch = path.Substring(i, 1);
+            if (ch == "\\") { p = p + "/"; } else { p = p + ch; }
+        }
+        p = Encoding.UrlEncode(p).Replace("+", "%20").Replace("%2f", "/").Replace("%3a", ":");
+        if (p.StartsWith("//")) { return "file:" + p; }
+        if (p.StartsWith("/")) { return "file://" + p; }
+        return "file:///" + p;
+    }
+
+    static string UriToPath(string uri) {
+        if (!uri.StartsWith("file://")) { return ""; }
+        string p = uri.Substring(7);
+        if (p.StartsWith("localhost/")) { p = p.Substring(9); }
+        else if (!p.StartsWith("/")) { p = "//" + p; }
+        p = Encoding.UrlDecode(p.Replace("+", "%2b"));
+        if (p.Length >= 3 && (p[0] & 255) == 47 && (p[2] & 255) == 58
+            && (((p[1] & 255) >= 65 && (p[1] & 255) <= 90)
+                || ((p[1] & 255) >= 97 && (p[1] & 255) <= 122))) { p = p.Substring(1); }
+        return p;
+    }
+}

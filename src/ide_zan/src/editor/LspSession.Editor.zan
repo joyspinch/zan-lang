@@ -1,0 +1,194 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Component.CodeEditor;
+
+partial class LspSession {
+    CodeEditor boundEditor;
+
+    static LspSession StartAsync(App app, string root, LspReadyHandler completed = null) {
+        return LspSession.StartAsync(app != null ? (Action act) => { app.Post(act); } : null, root, completed);
+    }
+
+    LspPendingRequest CachedRequest(CodeEditor editor, string method, string path,
+        int line, int col, string name) {
+        if (!alive || stopping || editor != boundEditor || path != editor.documentPath
+            || line < 0 || line >= editor.LineCount() || col < 0 || col > editor.LineAt(line).Length) { return null; }
+        string text = editor.GetText();
+        SyncDoc(path, text);
+        CancelStaleEditorRequests();
+        int version = DocVersion(path);
+        LspPendingRequest request = null;
+        for (int i = 0; i < cache.Count; i = i + 1) {
+            LspPendingRequest candidate = cache[i];
+            if (candidate.method == method && candidate.path == path && candidate.line == line
+                && candidate.col == col && candidate.name == name && candidate.version == version
+                && candidate.generation == generation && candidate.documentGeneration == documentGeneration) {
+                request = candidate;
+                break;
+            }
+        }
+        bool created = request == null;
+        if (created) {
+            request = NewRequest(method);
+            request.path = path;
+            request.name = name;
+            request.line = line;
+            request.col = col;
+            request.version = version;
+            request.documentGeneration = documentGeneration;
+            cache.Add(request);
+        }
+        request.editor = editor;
+        request.text = text;
+        request.stamp = editor.TextStamp();
+        request.caretLine = editor.CurLine();
+        request.caretCol = editor.CurCol();
+        request.completionToken = editor.SemanticCompletionToken();
+        if (created) {
+            if (background) {
+                request.cancellation = new CancellationTokenSource();
+                LspCommand command = CreateCommand(method, path, line, col);
+                command.id = request.id;
+                command.name = name;
+                command.stamp = request.stamp;
+                command.cancellation = request.cancellation.Token;
+                QueueCommand(command);
+            } else { SendRequest(request, DocPosParams(path, line, col)); }
+        }
+        return request.state == LspPendingState.Ready ? request : null;
+    }
+
+    void RefreshEditor(LspPendingRequest request) {
+        CodeEditor editor = request.editor;
+        if (editor == null || editor != boundEditor || request.generation != generation
+            || request.documentGeneration != documentGeneration || DocVersion(request.path) != request.version
+            || editor.documentPath != request.path || editor.TextStamp() != request.stamp
+            || editor.CurLine() != request.caretLine || editor.CurCol() != request.caretCol
+            || editor.GetText() != request.text) { return; }
+        if (editor.RefreshSemanticResult(request.method, request.path, request.stamp,
+            request.line, request.col, request.name, request.completionToken)) {
+            editorRefreshNeeded = true;
+        }
+    }
+
+    static List<CodeCompletionItem> EditorCompletions(List<LspCompletionItem> items, string sourceLine, int line0, int col0) {
+        if (items == null || items.Count == 0) { return null; }
+        List<CodeCompletionItem> res = new List<CodeCompletionItem>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            string k = "M";
+            if (items[i].kind == 7) { k = "C"; }
+            else if (items[i].kind == 5) { k = "F"; }
+            else if (items[i].kind == 10) { k = "P"; }
+            else if (items[i].kind == 14) { k = "K"; }
+            // 客户端未声明 snippetSupport，不能把占位符作为普通文本插入。
+            if (items[i].insertTextFormat == 2) { continue; }
+            CodeCompletionItem item = new CodeCompletionItem(items[i].label, k,
+                items[i].detail, LspSession.MarkupText(items[i].documentation));
+            item.insertText = items[i].insertText != null ? items[i].insertText : "";
+            JsonValue edit = items[i].textEdit;
+            if (edit != null && !edit.IsNull()) {
+                JsonValue range = edit.Get("range");
+                if (range == null) { range = edit.Get("replace"); }
+                if (range == null || !range.IsObject()) { continue; }
+                JsonValue start = range.Get("start");
+                JsonValue end = range.Get("end");
+                JsonValue newText = edit.Get("newText");
+                if (start == null || end == null || !start.IsObject() || !end.IsObject()
+                    || newText == null || !newText.IsString()) { continue; }
+                item.startLine = start.Int("line", -1);
+                item.endLine = end.Int("line", -1);
+                // Completion 的编辑范围必须在请求行内并包含请求光标。
+                if (item.startLine != line0 || item.endLine != line0) { continue; }
+                int startUtf16 = start.Int("character", -1);
+                int endUtf16 = end.Int("character", -1);
+                int lineUtf16 = LspSession.ByteColumnToUtf16(sourceLine, sourceLine.Length);
+                if (startUtf16 < 0 || endUtf16 < startUtf16 || endUtf16 > lineUtf16) { continue; }
+                item.startCol = LspSession.Utf16ColumnToByte(sourceLine, startUtf16);
+                item.endCol = LspSession.Utf16ColumnToByte(sourceLine, endUtf16);
+                if (LspSession.ByteColumnToUtf16(sourceLine, item.startCol) != startUtf16
+                    || LspSession.ByteColumnToUtf16(sourceLine, item.endCol) != endUtf16
+                    || item.startCol > col0 || item.endCol < col0) { continue; }
+                item.hasTextEdit = true;
+                item.insertText = edit.Str("newText", "");
+            }
+            res.Add(item);
+        }
+        return res;
+    }
+
+    static string SignatureLabel(LspSignatureHelp sh) {
+        if (sh == null || sh.signatures == null || sh.signatures.Count == 0) { return ""; }
+        int actSig = sh.activeSignature;
+        if (actSig < 0 || actSig >= sh.signatures.Count) { actSig = 0; }
+        return sh.signatures[actSig].label;
+    }
+
+    void DetachEditor() {
+        onSemanticReset = null;
+        onSemanticDocUpdated = null;
+        if (boundEditor == null) { return; }
+        boundEditor.CancelSemanticCompletion();
+        boundEditor.ResetSemanticProviders();
+        boundEditor.externalCompletion = null;
+        boundEditor.externalSignature = null;
+        boundEditor.externalHover = null;
+        boundEditor = null;
+    }
+
+    void BindToEditor(CodeEditor editor) {
+        if (editor == null || stopping) { return; }
+        DetachEditor();
+        boundEditor = editor;
+        onSemanticReset = () => {
+            if (boundEditor != null) { boundEditor.ResetSemanticProviders(); }
+        };
+        onSemanticDocUpdated = (string docPath) => {
+            if (boundEditor != null) {
+                if (LspSession.SameDocumentPath(boundEditor.documentPath, docPath)) {
+                    boundEditor.ClearSemanticTextMemos();
+                } else {
+                    boundEditor.ResetSemanticProviders();
+                }
+            }
+        };
+        generation = generation + 1;
+        if (background) { CancelUiRequests(LspPendingState.Cancelled); }
+        else { CancelStaleEditorRequests(); cache.Clear(); }
+        editor.ResetSemanticProviders();
+        LspSession self = this;
+        editor.externalCompletion = (string path, int line0, int col0) => {
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/completion", path, line0, col0, "");
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != line0 || editor.CurCol() != col0
+                || editor.GetText() != text) { return null; }
+            return request != null ? request.editorCompletions : null;
+        };
+        editor.externalSignature = (string path, int line0, int col0, string callee) => {
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/signatureHelp", path, line0, col0, callee);
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != line0 || editor.CurCol() != col0
+                || editor.GetText() != text) { return ""; }
+            return request != null ? request.signatureLabel : "";
+        };
+        editor.externalHover = (string path, int line0, int col0, string word) => {
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            int caretLine = editor.CurLine();
+            int caretCol = editor.CurCol();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/hover", path, line0, col0, word);
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != caretLine || editor.CurCol() != caretCol
+                || editor.GetText() != text) { return ""; }
+            return request != null ? request.hover : "";
+        };
+    }
+}
