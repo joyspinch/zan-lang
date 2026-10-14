@@ -41,8 +41,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-STYLESHEET = os.path.join(ROOT, 'stdlib', 'Gui', 'StyleSheet.zan')
-STYLE = os.path.join(ROOT, 'stdlib', 'Gui', 'Style.zan')
+STYLESHEET = os.path.join(ROOT, 'packages', 'Zan.Gui', 'src', 'Gui', 'Styling', 'StyleSheet.zan')
+STYLE = os.path.join(ROOT, 'packages', 'Zan.Gui', 'src', 'Gui', 'Styling', 'Style.zan')
 
 # 本项目自带的皮肤文件（不含 13 个图表主题包，那是另一条线）。
 CORPUS_A = [
