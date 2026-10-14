@@ -58,6 +58,10 @@ if(NOT _current)
     OUTPUT_VARIABLE compile_out
     ERROR_VARIABLE  compile_err)
   if(NOT compile_rc EQUAL 0)
+    if(compile_err MATCHES "runtime object not found at.*toolchain")
+      message(STATUS "cross runtime object not present for ${TARGET}; skipping test")
+      return()
+    endif()
     message(FATAL_ERROR
       "library compile failed (rc=${compile_rc})\n${compile_out}${compile_err}")
   endif()
