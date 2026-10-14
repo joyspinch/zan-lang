@@ -1,0 +1,108 @@
+using System;
+
+namespace System.IO;
+
+// 目录遍历的过滤条件：保留哪些后缀、隐藏哪些后缀、跳过哪些子目录。
+// 后缀表和目录表都是空格分隔的字符串，因此调用点一行写完：
+class PathFilter {
+    // 只保留这些后缀（"" 表示全部文件）。
+    string exts;
+    // 即使命中 exts 也要隐藏的后缀（如资源管理器里的 ".proj"）。
+    string hideExts;
+    // 不进入的子目录名。
+    string skipDirs;
+    // 跳过以 "." 开头的目录 / 文件。
+    bool skipDotDirs;
+    // 跳过以 "." 开头的文件（默认保留）。
+    bool skipDotFiles;
+
+    // 构造默认过滤条件（全部文件、跳点开头目录）。
+    PathFilter() {
+        exts = "";
+        hideExts = "";
+        skipDirs = "";
+        skipDotDirs = true;
+        skipDotFiles = false;
+    }
+
+    // 全部文件。
+    static PathFilter Any() { return new PathFilter(); }
+
+    // 只要这些后缀的文件。
+    static PathFilter Only(string suffixes) {
+        PathFilter f = new PathFilter();
+        f.exts = suffixes;
+        return f;
+    }
+
+    // 隐藏这些后缀（即使命中 exts），链式。
+    PathFilter Hide(string suffixes) { hideExts = suffixes; return this; }
+    // 不进入这些名字的子目录，链式。
+    PathFilter Skip(string dirs) { skipDirs = dirs; return this; }
+
+    // 是否跳过点开头的目录 / 文件（默认跳目录、留文件）。
+    PathFilter Dots(bool dirs, bool files) {
+        skipDotDirs = dirs;
+        skipDotFiles = files;
+        return this;
+    }
+
+    // 该文件名是否应收录（点开头/隐藏后缀的判断优先于 exts）。
+    bool KeepFile(string name) {
+        if (skipDotFiles && PathFilter.Dotted(name)) { return false; }
+        if (hideExts != "" && PathFilter.AnySuffix(hideExts, name)) { return false; }
+        if (exts == "") { return true; }
+        return PathFilter.AnySuffix(exts, name);
+    }
+
+    // 是否进入该子目录（点开头目录与 skipDirs 命中的不进）。
+    bool EnterDir(string name) {
+        if (skipDotDirs && PathFilter.Dotted(name)) { return false; }
+        return !PathFilter.AnyWord(skipDirs, name);
+    }
+
+    // 名字以 "." 开头时为 true。
+    static bool Dotted(string name) {
+        return name.Length > 0 && (name[0] & 255) == 46;  // '.'
+    }
+
+    // 空格分隔的表里有一项是 `name` 的结尾时为 true。
+    static bool AnySuffix(string list, string name) {
+        List<string> parts = PathFilter.Words(list);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (DirectoryTree.EndsWith(name, parts[i])) { return true; }
+        }
+        return false;
+    }
+
+    // 空格分隔的表里有一项等于 `name` 时为 true。
+    static bool AnyWord(string list, string name) {
+        List<string> parts = PathFilter.Words(list);
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (parts[i] == name) { return true; }
+        }
+        return false;
+    }
+
+    // 按空格拆分列表（忽略连续空格）。
+    static List<string> Words(string list) {
+        List<string> res = new List<string>();
+        string cur = "";
+        for (int i = 0; i <= list.Length; i = i + 1) {
+            string ch = " ";
+            if (i < list.Length) { ch = list.Substring(i, 1); }
+            if (ch == " ") {
+                if (cur != "") { res.Add(cur); }
+                cur = "";
+            } else {
+                cur = cur + ch;
+            }
+        }
+        return res;
+    }
+}
+
+// 目录遍历的唯一实现：递归收集匹配的文件路径。Directory 只给出单层的
+// 名字列表，所以每个调用点以前都要自己写一遍「递归 + 后缀判断 + 跳过
+// build/bin/. 开头目录」；改成：
+// 返回的都是可直接打开的完整路径（以 "/" 连接）。

@@ -1,0 +1,64 @@
+using System;
+
+namespace System.IO.Compression;
+
+// 纯 Zan 实现的 RFC 1951 DEFLATE —— 不依赖 zlib 或任何外部
+// 依赖，可在所有平台运行。
+// Inflate 支持解码 stored、固定 Huffman 和动态 Huffman 块。
+// Deflate 对不可压缩输入输出 stored 块；对可压缩输入，
+// 使用带 LZ77 哈希表匹配器的固定 Huffman 块（级别
+// 1-9 选择哈希链长度；格式与 zlib 默认输出一致，
+// 的输出整体是一次合法的 DEFLATE 流。
+class DeflateChunker {
+    // 上一块遗留的部分字节（低 pendingBits 位有效）。
+    int pending;
+    int pendingBits;
+
+    // 构造从零残位开始的分块压缩器。
+    DeflateChunker() {
+        this.pending = 0;
+        this.pendingBits = 0;
+    }
+
+    // 压缩一块（非收尾块）。返回可落盘的完整字节。
+    byte[] Push(byte[] chunk, int level) {
+        if (chunk.Length == 0) { return new byte[0]; }
+        // 最坏情况：全字面量固定码 9 位/字节 + 头尾。
+        byte[] out2 = new byte[chunk.Length * 2 + 16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        // 块头：BFINAL=0, BTYPE=01（固定）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        bitPos = Deflate.BlockInto(chunk, chunk.Length, Deflate.ChainLength(level),
+            out2, bitPos);
+        return DeflateChunker.TakeComplete(out2, bitPos, this);
+    }
+
+    // 收尾：发射 BFINAL=1 的空块并冲出最后的残位。
+    byte[] Finish() {
+        byte[] out2 = new byte[16];
+        out2[0] = (byte)this.pending;
+        int bitPos = this.pendingBits;
+        Deflate.WriteBits(out2, ref bitPos, 1, 1);
+        Deflate.WriteBits(out2, ref bitPos, 1, 2);
+        // 空块的块结束符号（7 位，码 0）。
+        Deflate.WriteBits(out2, ref bitPos, 0, 7);
+        this.pending = 0;
+        this.pendingBits = 0;
+        int bytes = (bitPos + 7) / 8;
+        return Deflate.Trim(out2, bytes);
+    }
+
+    // 把位流切成完整字节返回；末尾残位存回 chunker 状态。
+    static byte[] TakeComplete(byte[] out2, int bitPos, DeflateChunker ch) {
+        int bytes = bitPos / 8;
+        int rem = bitPos - bytes * 8;
+        ch.pendingBits = rem;
+        ch.pending = 0;
+        if (rem > 0) { ch.pending = out2[bytes] & 255; }
+        return Deflate.Trim(out2, bytes);
+    }
+}
+
+
