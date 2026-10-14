@@ -12,12 +12,12 @@
 | `Controller.zan` | 控制器基型 + HTTP 方法属性（HttpGet/Post/Put/Patch/Delete/NonAction）与 Filter/Hooks |
 | `HttpContext.zan` | 请求上下文（Listing/ListQuery/RowList/StrMap/VNode） |
 | `View.zan` | 视图渲染（View/ViewData） |
-| `Validate.zan` | 校验器（Validator/ApiEnvelope/ApiError） |
+| `Validator.zan` / `Filter.zan` | 校验器（Validator/ApiEnvelope/ApiError）与过滤器 |
 | `StaticFiles.zan` | 静态文件挂载（StaticMount/ContentTypes） |
 | `ApiDocs.zan` | API 文档生成（ApiParam/ApiParam 描述） |
-| `Menu.zan` | 菜单构建（MenuBuilder/MenuNode） |
-| `Security.zan` | Csrf/RateLimiter/PermBit/LockManager/LockLease/CustomAuthorization |
-| `Attributes.zan` | 自定义特性（CustomAttribute/DescriptionAttribute 等） |
+| `MenuNode.zan` | 菜单构建（MenuBuilder/MenuNode） |
+| `LockManager.zan` / `Csrf.zan` | 分布式锁/Csrf/RateLimiter/PermBit/CustomAuthorization |
+| `Attribute.zan` | 自定义特性（Attribute/CustomAttribute/DescriptionAttribute 等） |
 | `WebWs.zan` / `WsSession.zan` | WebSocket 与会话（Sessions） |
 
 ## 留守 stdlib（生成器子编译闭包，`--no-packages` 可达）

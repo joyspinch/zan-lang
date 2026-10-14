@@ -170,7 +170,7 @@ stdlib/
 │       Web/, Windows/)
 │
 ├── Gui/                             # self-hosted GUI framework (Zan source)
-│   ├── App.zan / Point.zan / Color.zan / Theme.zan / Signal.zan / FlexLayout.zan
+│   ├── App.zan / Point.zan / Color.zan / Theme.zan / Signal.zan / FlexStyle.zan / FlexNode.zan
 │   ├── Canvas.zan / EventHub.zan / Text.zan / Icon.zan / Css.zan / Style*.zan
 │   ├── Backend/                     # Window.zan, UiDriver.zan, Win32Shell.zan
 │   ├── Component/                   # Chart, CodeEditor, DataTable, WebView, ...
