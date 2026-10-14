@@ -1,0 +1,199 @@
+using System;
+
+namespace Game.Arcade2D;
+
+// 街机世界中的单个实体（敌人/子弹/粒子等）：极简物理（速度按
+// 秒积分）、碰撞体、生命与冷却等通用槽位。实体不自我构造，
+// 由 ArcadeWorld.Spawn 分配并复用失活槽位。
+class ArcadeEntity {
+    int id;
+    int kind;
+    int team;
+    bool active;
+    double x;
+    double y;
+    double previousX;
+    double previousY;
+    double velocityX;
+    double velocityY;
+    double width;
+    double height;
+    double radius;
+    int hp;
+    int maxHp;
+    int targetId;
+    int cooldown;
+    int lifetime;
+    int pathIndex;
+    int data;
+
+    // （重）初始化实体：写入 id/kind/team/位置与碰撞矩形，清零
+    // 速度与各槽位，激活实体；碰撞半径重置为 (宽+高)/4，生命
+    // 重置为 1，寿命重置为无限（-1）。由 Spawn 调用。
+    void Reset(
+        int id,
+        int kind,
+        int team,
+        double x,
+        double y,
+        double width,
+        double height
+    ) {
+        this.id = id;
+        this.kind = kind;
+        this.team = team;
+        this.active = true;
+        this.x = x;
+        this.y = y;
+        this.previousX = x;
+        this.previousY = y;
+        this.velocityX = 0.0;
+        this.velocityY = 0.0;
+        this.width = width;
+        this.height = height;
+        this.radius = (width + height) / 4.0;
+        this.hp = 1;
+        this.maxHp = 1;
+        this.targetId = 0;
+        this.cooldown = 0;
+        this.lifetime = -1;
+        this.pathIndex = 0;
+        this.data = 0;
+    }
+
+    // 推进一帧：记录上一帧位置后按速度积分位移（速度单位为
+    // 单位/秒），冷却毫秒递减到 0，寿命毫秒递减、减到 0 即失活。
+    // 失活实体或 deltaMilliseconds ≤ 0 时无操作。
+    void Step(int deltaMilliseconds) {
+        if (!this.active || deltaMilliseconds <= 0) { return; }
+        this.previousX = this.x;
+        this.previousY = this.y;
+        double seconds = (double)deltaMilliseconds / 1000.0;
+        this.x = this.x + this.velocityX * seconds;
+        this.y = this.y + this.velocityY * seconds;
+        if (this.cooldown > 0) {
+            this.cooldown = this.cooldown - deltaMilliseconds;
+            if (this.cooldown < 0) { this.cooldown = 0; }
+        }
+        if (this.lifetime >= 0) {
+            this.lifetime = this.lifetime - deltaMilliseconds;
+            if (this.lifetime <= 0) { this.active = false; }
+        }
+    }
+
+    // 把速度设为指向 (targetX, targetY) 的 speed（单位/秒）。已到
+    // 达目标（距离平方 ≤ 0.0001）或 speed ≤ 0 时清零速度。
+    // 只改速度不移动，位移在 Step 中积分。
+    void MoveTowards(double targetX, double targetY, double speed) {
+        double dx = targetX - this.x;
+        double dy = targetY - this.y;
+        double lengthSquared = dx * dx + dy * dy;
+        if (lengthSquared <= 0.0001 || speed <= 0.0) {
+            this.velocityX = 0.0;
+            this.velocityY = 0.0;
+            return;
+        }
+        double length = Math.Sqrt(lengthSquared);
+        this.velocityX = dx / length * speed;
+        this.velocityY = dy / length * speed;
+    }
+
+    // 结算一次伤害：失活或 amount ≤ 0 时返回 0 无副作用；实际
+    // 生效量按剩余生命钳制，生命减到 0 即失活。返回实际扣除的
+    // 生命值。
+    int Damage(int amount) {
+        if (!this.active || amount <= 0) { return 0; }
+        int applied = amount;
+        if (applied > this.hp) { applied = this.hp; }
+        this.hp = this.hp - applied;
+        if (this.hp <= 0) {
+            this.hp = 0;
+            this.active = false;
+        }
+        return applied;
+    }
+
+    // 以中心点为准的碰撞矩形（宽高为 Width × Height）。
+    Rect2 Bounds() {
+        return new Rect2(
+            this.x - this.width / 2.0,
+            this.y - this.height / 2.0,
+            this.width,
+            this.height);
+    }
+
+    // 以中心为圆心的碰撞圆（半径可被 SetRadius 覆盖）。
+    Circle2 Circle() { return new Circle2(this.x, this.y, this.radius); }
+
+    // 实例唯一 ID（由 World.Spawn 分配，递增且不复用）。
+    int Id() { return this.id; }
+    // 类型标签（调用方自定义的枚举值）。
+    int Kind() { return this.kind; }
+    // 阵营标签（同队互为目标查找排除）。
+    int Team() { return this.team; }
+    // 是否活跃（失活槽位会被 Spawn 回收复用）。
+    bool Active() { return this.active; }
+    // 当前世界坐标 X（单位由调用方约定，通常像素）。
+    double X() { return this.x; }
+    // 当前世界坐标 Y。
+    double Y() { return this.y; }
+    // 上一帧的 X（Step 前的位置）。
+    double PreviousX() { return this.previousX; }
+    // 上一帧的 Y。
+    double PreviousY() { return this.previousY; }
+    // X 方向速度（单位/秒）。
+    double VelocityX() { return this.velocityX; }
+    // Y 方向速度（单位/秒）。
+    double VelocityY() { return this.velocityY; }
+    // 宽度（碰撞矩形尺寸）。
+    double Width() { return this.width; }
+    // 高度（碰撞矩形尺寸）。
+    double Height() { return this.height; }
+    // 碰撞半径（默认 (宽+高)/4）。
+    double Radius() { return this.radius; }
+    // 当前生命值（0 表示已死亡/失活）。
+    int Hp() { return this.hp; }
+    // 生命上限（SetHealth 设置的值）。
+    int MaxHp() { return this.maxHp; }
+    // 目标实体 ID（0 表示未设置；由调用方维护语义）。
+    int TargetId() { return this.targetId; }
+    // 剩余冷却毫秒（Step 中递减到 0）。
+    int Cooldown() { return this.cooldown; }
+    // 剩余寿命毫秒；-1 表示无限。
+    int Lifetime() { return this.lifetime; }
+    // 当前路径点索引（ArcadePath.Follow 使用）。
+    int PathIndex() { return this.pathIndex; }
+    // 调用方自定义整数槽位（如伤害值、掉落类型）。
+    int Value() { return this.data; }
+
+    // 设置活跃状态；设为 false 后 Step/Damage 均无操作。
+    void SetActive(bool active) { this.active = active; }
+    // 直接设置世界坐标（不影响上一帧位置的记录时序）。
+    void SetPosition(double x, double y) { this.x = x; this.y = y; }
+    // 设置速度分量（单位/秒）。
+    void SetVelocity(double x, double y) {
+        this.velocityX = x;
+        this.velocityY = y;
+    }
+    // 覆盖碰撞半径（默认 (宽+高)/4，Reset 时重置）。
+    void SetRadius(double radius) { this.radius = radius; }
+    // 设置生命值并回满：小于 1 时钳制为 1，maxHp 与 hp 同时置为该值。
+    void SetHealth(int hp) {
+        if (hp < 1) { hp = 1; }
+        this.maxHp = hp;
+        this.hp = hp;
+    }
+    // 设置目标实体 ID（语义由调用方维护，0 表示未设置）。
+    void SetTargetId(int targetId) { this.targetId = targetId; }
+    // 设置冷却毫秒数，负值钳制为 0；Step 中递减。
+    void SetCooldown(int cooldown) {
+        this.cooldown = cooldown;
+        if (this.cooldown < 0) { this.cooldown = 0; }
+    }
+    // 设置剩余寿命（毫秒）；负值表示无限（Step 不再递减失活）。
+    void SetLifetime(int lifetime) { this.lifetime = lifetime; }
+    // 设置当前路径点索引（配合 ArcadePath.Follow 使用）。
+    void SetPathIndex(int pathIndex) { this.pathIndex = pathIndex; }
+    // 写入调用方自定义整数槽位。
+    void SetValue(int data) { this.data = data; }
+}

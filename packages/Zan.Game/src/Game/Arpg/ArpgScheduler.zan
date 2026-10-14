@@ -1,0 +1,107 @@
+using System;
+
+namespace Game.Arpg;
+
+// 与文档所述 "join event" 行为一致的具名一次性/循环事件
+// 。载荷特意序列化，以保持调度器的类型安全。
+class ArpgScheduler {
+    List<ArpgTimerTask> tasks;
+
+    // 构造空调度器。
+    ArpgScheduler() {
+        this.tasks = new List<ArpgTimerTask>();
+    }
+
+    // 注册具名定时事件：delayMilliseconds 后触发 handler；
+    // autoRemove=true 触发一次后移除，false 则按间隔循环。
+    // 同名任务先移除再注册（天然去重）。间隔最小为 1ms。
+    void Add(
+        string name,
+        string payload,
+        int delayMilliseconds,
+        bool autoRemove,
+        ArpgTimedEvent handler
+    ) {
+        this.Remove(name);
+        this.tasks.Add(new ArpgTimerTask(name, payload,
+            ArpgMath.Max(1, delayMilliseconds), autoRemove, handler));
+    }
+
+    // 按名移除任务（删掉全部同名项），删到了返回 true。
+    bool Remove(string name) {
+        int i = this.tasks.Count - 1;
+        bool removed = false;
+        while (i >= 0) {
+            if (this.tasks[i].name == name) {
+                this.tasks.RemoveAt(i);
+                removed = true;
+            }
+            i = i - 1;
+        }
+        return removed;
+    }
+
+    // 是否存在同名任务。
+    bool Contains(string name) {
+        return this.IndexOf(name) >= 0;
+    }
+
+    // 当前任务数。
+    int Count() { return this.tasks.Count; }
+
+    // 第一个同名任务的下标；没有返回 -1。
+    int IndexOf(string name) {
+        for (int i = 0; i < this.tasks.Count; i = i + 1) {
+            if (this.tasks[i].name == name) { return i; }
+        }
+        return -1;
+    }
+
+    // 推进全部任务 elapsed 并触发到期的：回调参数依次为任务名、
+    // 载荷、本次帧间隔毫秒、累计毫秒。回调可安全移除/替换自身
+    // （框架先快照任务列表再逐个触发）。返回本次触发的任务数。
+    int Tick(int deltaMilliseconds) {
+        if (deltaMilliseconds <= 0) { return 0; }
+        List<string> pending = new List<string>();
+        int i = 0;
+        for (; i < this.tasks.Count; i = i + 1) {
+            pending.Add(this.tasks[i].name);
+        }
+
+        int fired = 0;
+        i = 0;
+        while (i < pending.Count) {
+            string eventName = pending[i];
+            int eventIndex = this.IndexOf(eventName);
+            if (eventIndex >= 0) {
+                ArpgTimerTask task = this.tasks[eventIndex];
+                int total = task.elapsed + deltaMilliseconds;
+                task.elapsed = total;
+                int interval = task.interval;
+                bool autoRemove = task.oneShot;
+                string payload = task.payload;
+                ArpgTimedEvent handler = task.handler;
+                if (total < interval) {
+                    i = i + 1;
+                    continue;
+                }
+                if (handler != null) {
+                    handler(eventName, payload, deltaMilliseconds, total);
+                }
+                fired = fired + 1;
+
+                // 回调可以移除或替换自身的事件。
+                eventIndex = this.IndexOf(eventName);
+                if (eventIndex >= 0 && this.tasks[eventIndex].handler == handler) {
+                    if (autoRemove) {
+                        this.tasks.RemoveAt(eventIndex);
+                    } else {
+                        this.tasks[eventIndex].elapsed = total - interval;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        return fired;
+    }
+}
