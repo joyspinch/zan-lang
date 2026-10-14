@@ -93,7 +93,7 @@
             }
         },
 
-        // 兼容原模板直属函数
+        // 窗口操作快捷顶层别名
         windowMinimize: function () { this.window.minimize(); },
         windowMaximize: function () { this.window.maximize(); },
         windowRestore: function () { this.window.restore(); },
