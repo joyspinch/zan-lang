@@ -29,7 +29,7 @@ string(FIND "${_workspace}" "string pubFlag = IdeCompileMode.Flags(true, dbg, fa
 if(_direct_publish LESS 0)
   message(FATAL_ERROR "Direct cross/library publish must use the deployment policy")
 endif()
-file(READ "${ROOT}/src/ide_zan/src/services/IdeJobMonitor.zan" _monitor)
+file(READ "${ROOT}/src/ide_zan/src/shell/IdeJobMonitor.zan" _monitor)
 if(NOT _monitor MATCHES "CompileToExe\\([^;]*ll, preparedExe, false, true\\)")
   message(FATAL_ERROR "F5 must select local debug mode")
 endif()
