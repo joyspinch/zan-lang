@@ -1,0 +1,69 @@
+using System;
+
+namespace System;
+
+// 用 Zan 实现的 COM 对象：`Add` 按 vtable 顺序追加方法地址
+// （从三个 IUnknown 槽位开始），`Build` 返回
+// 可供原生代码回调的接口指针。
+// ComVtbl v = ComVtbl.Create(4);
+// 对象为 `{ vtable, state }`：`State()` 为调用者提供一个槽位，
+// 用于存放其关联 id，静态 handler 可从中
+// 通过传入的 `self` 指针读回。
+class ComVtbl {
+    // vtable 内存。
+    nint vtbl;
+    // Build() 分配的对象指针（0 为未构建）。
+    nint obj;
+    // vtable 容量（槽数）。
+    int slots;
+    // 已填充的槽数。
+    int count;
+
+    // 创建可容纳 slots 个条目的 vtable。
+    static ComVtbl Create(int slots) {
+        ComVtbl v = new ComVtbl();
+        v.slots = slots;
+        v.count = 0;
+        v.vtbl = NativeMemory.Alloc(slots * 8);
+        v.obj = 0;
+        return v;
+    }
+
+    // 追加下一个 vtable 条目；超过 `slots` 的多余条目会被忽略。
+    ComVtbl Add(nint method) {
+        if (count < slots) {
+            new Span<long>(vtbl + count * 8, 1)[0] = method;
+            count = count + 1;
+        }
+        return this;
+    }
+
+    // 分配对象（vtable 指针 + 一个状态字）并返回
+    // 接口指针。
+    nint Build() {
+        if (obj == 0) {
+            obj = NativeMemory.Alloc(16);
+            new Span<long>(obj, 1)[0] = vtbl;
+            new Span<long>(obj + 8, 1)[0] = 0;
+        }
+        return obj;
+    }
+
+    // 由调用者持有、随对象携带的状态字。
+    void SetState(int v) {
+        if (obj != 0) { new Span<long>(obj + 8, 1)[0] = v; }
+    }
+
+    // 静态 handler 侧：从回调收到的 self 指针读回 SetState 写入的
+    // 状态字。
+    static int State(nint self) {
+        if (self == 0) { return 0; }
+        return new Span<long>(self + 8, 1)[0];
+    }
+
+    // 释放对象与 vtable 内存（Build 之后调用才有效）。
+    void Destroy() {
+        if (obj != 0) { NativeMemory.Free(obj); obj = 0; }
+        if (vtbl != 0) { NativeMemory.Free(vtbl); vtbl = 0; }
+    }
+}

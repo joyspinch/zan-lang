@@ -1,0 +1,80 @@
+using System;
+
+namespace System;
+
+// 针对 Win32/COM 宽字符（`W`）接口的 UTF-16 封送。
+// Zan 字符串是 UTF-8，因此宽字符参数是显式持有的缓冲区：
+// nav(webview, w);
+// Wide.Free(w);
+class Wide {
+    [DllImport("kernel32", EntryPoint = "MultiByteToWideChar")]
+    static extern int ToWide(int page, int flags, nint mb, int mbLen,
+                             nint wide, int wideLen);
+
+    [DllImport("kernel32", EntryPoint = "WideCharToMultiByte")]
+    static extern int ToMulti(int page, int flags, nint wide, int wideLen,
+                              nint mb, int mbLen, nint defChar, nint usedDef);
+
+    // 代码页 CP_UTF8（65001）。
+    static int Utf8() { return 65001; }
+
+    // 分配 `s` 的 NUL 结尾 UTF-16 副本。用 Free() 释放。
+    // null 返回 0（Win32 宽字符参数的"缺失"约定），不再空引用崩溃。
+    static nint Of(string s) {
+        if (s == null) { return 0; }
+        int bytes = s.Length;
+        nint src = NativeMemory.Alloc(bytes + 1);
+        nint dst = 0;
+        try {
+            NativeMemory.PutString(src, 0, s, bytes);
+            new Span<byte>(src + bytes, 1)[0] = 0;
+            int units = Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, 0, 0);
+            if (units <= 0) { units = 1; }
+            dst = NativeMemory.Alloc(units * 2 + 2);
+            Wide.ToWide(Wide.Utf8(), 0, src, bytes + 1, dst, units);
+        } finally {
+            NativeMemory.Free(src);
+        }
+        return dst;
+    }
+
+    // 将 NUL 结尾的 UTF-16 缓冲区复制回 Zan 字符串。
+    static string Read(nint p) {
+        if (p == 0) { return ""; }
+        int bytes = Wide.ToMulti(Wide.Utf8(), 0, p, -1, 0, 0, 0, 0);
+        if (bytes <= 1) { return ""; }
+        nint buf = NativeMemory.Alloc(bytes + 1);
+        string s = "";
+        try {
+            Wide.ToMulti(Wide.Utf8(), 0, p, -1, buf, bytes, 0, 0);
+            s = NativeMemory.GetString(buf, 0, bytes - 1);
+        } finally {
+            NativeMemory.Free(buf);
+        }
+        return s;
+    }
+
+    // 宽字符缓冲区中 NUL 终止符前的 UTF-16 码元数量。
+    static int Length(nint p) {
+        if (p == 0) { return 0; }
+        int n = 0;
+        for (; new Span<ushort>(p + n * 2, 1)[0] != 0; n = n + 1) { }
+        return n;
+    }
+
+    // 释放 Of() 分配的缓冲区（即 NativeMemory.Free）。
+    static void Free(nint p) {
+        NativeMemory.Free(p);
+    }
+}
+
+// vtable 方法的调用形式：每个 COM 方法都把接口
+// 指针作为第一个参数并返回 HRESULT，宽于
+// 寄存器的参数（RECT、结构体出参）以地址传递。
+// ComCall0Fn 到 ComCall5Fn 依次带 0 到 5 个指针参数。
+delegate int ComCall0Fn(nint self);
+// 1 个指针参数的 COM 方法形式。
+delegate int ComCall1Fn(nint self, nint a);
+// 2 个指针参数的 COM 方法形式。
+delegate int ComCall2Fn(nint self, nint a, nint b);
+// 3 个指针参数的 COM 方法形式。
