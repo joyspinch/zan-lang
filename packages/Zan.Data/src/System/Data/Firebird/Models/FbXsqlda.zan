@@ -1,0 +1,174 @@
+using System;
+using System.Data;
+
+namespace System.Data.Firebird;
+
+// 预编译语句输出行的布局；
+// 该布局从服务器的 describe 缓冲区解码而来。
+class FbXsqlda {
+    List<FbColumn> cols;
+    int stmtType;
+
+    // 空布局，经 <see cref="Parse"/> 填充。
+    FbXsqlda() {
+        this.cols = new List<FbColumn>();
+        this.stmtType = 0;
+    }
+
+    // 列数。
+    int Count() { return this.cols.Count; }
+    // 第 i 列。
+    FbColumn At(int i) { return this.cols[i]; }
+    // 语句类型（FbType.STMT_*）。
+    int StmtType() { return this.stmtType; }
+    // 记录语句类型。
+    void SetStmtType(int t) { this.stmtType = t; }
+
+    // 当语句需要逐行取回结果时为 true。
+    bool IsSelect() {
+        return this.stmtType == FbType.STMT_SELECT
+            || this.stmtType == FbType.STMT_SELECT_FOR_UPD;
+    }
+
+    // 保证至少有 n 个列描述。
+    void Resize(int n) {
+        while (this.cols.Count < n) {
+            this.cols.Add(new FbColumn());
+        }
+    }
+
+    // 将 describe 缓冲区读入本布局。返回服务器截断处的 1 起始索引，
+    // 以便调用方用 <c>isc_info_sql_sqlda_start</c> 请求剩余部分；
+    // 描述完整时返回 -1，
+    // 缓冲区根本不是 describe 应答时返回 -2。
+    int Parse(FbBytes buf) {
+        FbReader r = FbReader.Over(buf);
+        int next = 0 - 1;
+        while (!r.Eof()) {
+            int item = r.U8();
+            if (item == FbType.INFO_END) {
+                return next;
+            }
+            if (item == FbType.INFO_STMT_TYPE) {
+                int ln = r.U16LE();
+                this.stmtType = r.IntLE(ln);
+            } else if (item == FbType.INFO_SELECT) {
+                if (r.U8() != FbType.INFO_DESCRIBE_VARS) { return 0 - 2; }
+                int ln = r.U16LE();
+                int n = r.IntLE(ln);
+                Resize(n);
+                next = ParseItems(r);
+                if (next > 0) { return next; }
+            } else if (item == FbType.INFO_TRUNCATED) {
+                return next;
+            } else {
+                return 0 - 2;
+            }
+        }
+        return next;
+    }
+
+    // 读取逐列条目；服务器缓冲区耗尽时返回续读索引，
+    // 列表读完时返回 -1。
+    int ParseItems(FbReader r) {
+        int index = 0;
+        while (!r.Eof()) {
+            int item = r.U8();
+            if (item == FbType.INFO_END) { return 0 - 1; }
+            if (item == FbType.INFO_TRUNCATED) { return index; }
+            if (item == FbType.INFO_DESCRIBE_END) { continue; }
+            int ln = r.U16LE();
+            if (item == FbType.INFO_SQLDA_SEQ) {
+                index = r.IntLE(ln);
+                Resize(index);
+                continue;
+            }
+            if (index < 1) {
+                r.Skip(ln);
+                continue;
+            }
+            FbColumn c = this.cols[index - 1];
+            if (item == FbType.INFO_TYPE) {
+                // 类型的最低位标记“可为 NULL”；类型本体
+                // 为偶数。
+                int tv = r.IntLE(ln);
+                c.sqltype = tv - (tv & 1);
+            } else if (item == FbType.INFO_SUB_TYPE) {
+                c.subtype = r.IntLE(ln);
+            } else if (item == FbType.INFO_SCALE) {
+                c.scale = r.IntLE(ln);
+            } else if (item == FbType.INFO_LENGTH) {
+                c.sqllen = r.IntLE(ln);
+            } else if (item == FbType.INFO_NULL_IND) {
+                c.nullOk = r.IntLE(ln) != 0;
+            } else if (item == FbType.INFO_FIELD) {
+                c.field = r.Text(ln);
+            } else if (item == FbType.INFO_RELATION) {
+                c.relation = r.Text(ln);
+            } else if (item == FbType.INFO_OWNER) {
+                c.owner = r.Text(ln);
+            } else if (item == FbType.INFO_ALIAS) {
+                c.alias = r.Text(ln);
+            } else {
+                r.Skip(ln);
+            }
+        }
+        return 0 - 1;
+    }
+
+    // 服务器返回取回行时使用的行格式。
+    FbBytes CalcBlr() {
+        FbBuf b = new FbBuf();
+        int ln = this.cols.Count * 2;
+        b.U8(5); b.U8(2); b.U8(4); b.U8(0);
+        b.U8(ln & 255); b.U8((ln >> 8) & 255);
+        for (int i = 0; i < this.cols.Count; i = i + 1) {
+            FbColumn c = this.cols[i];
+            int t = c.sqltype;
+            if (t == FbType.VARYING) {
+                b.U8(37); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            } else if (t == FbType.TEXT) {
+                b.U8(14); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            } else if (t == FbType.LONG) {
+                b.U8(8); b.U8(c.scale & 255);
+            } else if (t == FbType.SHORT) {
+                b.U8(7); b.U8(c.scale & 255);
+            } else if (t == FbType.INT64) {
+                b.U8(16); b.U8(c.scale & 255);
+            } else if (t == FbType.INT128 || t == FbType.DEC_FIXED) {
+                b.U8(26); b.U8(c.scale & 255);
+            } else if (t == FbType.QUAD) {
+                b.U8(9); b.U8(c.scale & 255);
+            } else if (t == FbType.DOUBLE) {
+                b.U8(27);
+            } else if (t == FbType.FLOAT) {
+                b.U8(10);
+            } else if (t == FbType.D_FLOAT) {
+                b.U8(11);
+            } else if (t == FbType.DATE) {
+                b.U8(12);
+            } else if (t == FbType.TIME) {
+                b.U8(13);
+            } else if (t == FbType.TIMESTAMP) {
+                b.U8(35);
+            } else if (t == FbType.BLOB || t == FbType.ARRAY) {
+                b.U8(9); b.U8(0);
+            } else if (t == FbType.BOOLEAN) {
+                b.U8(23);
+            } else if (t == FbType.DEC64) {
+                b.U8(24);
+            } else if (t == FbType.DEC128) {
+                b.U8(25);
+            } else if (t == FbType.TIME_TZ) {
+                b.U8(28);
+            } else if (t == FbType.TIMESTAMP_TZ) {
+                b.U8(29);
+            } else {
+                b.U8(14); b.U8(c.sqllen & 255); b.U8((c.sqllen >> 8) & 255);
+            }
+            b.U8(7); b.U8(0);  // blr_short：NULL 指示符
+        }
+        b.U8(255); b.U8(76);  // blr_end, blr_eoc
+        return b.ToBytes();
+    }
+}

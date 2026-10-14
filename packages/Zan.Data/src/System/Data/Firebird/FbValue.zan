@@ -1,0 +1,293 @@
+using System;
+using System.Data;
+
+namespace System.Data.Firebird;
+
+// 语句取值的编码器与解码器。
+class FbValue {
+    // 十六进制渲染用的字符表。
+    static string HEX = "0123456789abcdef";
+
+    // double 的 IEEE-754 位模式：编译器内建 bitcast
+    // （NativeMemory.AsI64，零开销、逐位精确——含次正规；NaN 归一为
+    // quiet 位型）。取代旧手工归一化（截断丢 1 ULP、次正规指数域
+    // 变负）。
+    static long DoubleBits(double v) {
+        return NativeMemory.AsI64(v);
+    }
+
+    // 以 double 表示的 2^e（e 可为负）。
+    static double Pow2(int e) {
+        double v = 1.0;
+        int i = 0;
+        if (e >= 0) {
+            while (i < e) { v = v * 2.0; i = i + 1; }
+        } else {
+            while (i > e) { v = v / 2.0; i = i - 1; }
+        }
+        return v;
+    }
+
+    // 由 IEEE 754 位型（符号/指数/尾数/偏置/尾数位数）渲染浮点文本。
+    static string Ieee(int sign, int exp, long mant, int bias, int mantBits) {
+        if (exp == 0 && mant == 0) { return "0"; }
+        double m = 1.0;
+        int b = mantBits - 1;
+        while (b >= 0) {
+            if (((mant >> b) & 1) == 1) { m = m + FbValue.Pow2(b - mantBits); }
+            b = b - 1;
+        }
+        double v = m * FbValue.Pow2(exp - bias);
+        if (sign == 1) { v = 0.0 - v; }
+        return Convert.ToString(v);
+    }
+
+    // 两位零填充十进制。
+    static string Pad2(int v) {
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+
+    // 四位零填充十进制。
+    static string Pad4(int v) {
+        string s = Convert.ToString(v);
+        while (s.Length < 4) { s = "0" + s; }
+        return s;
+    }
+
+    // 由相对于 1970-01-01 的天数得到公历日期。
+    static string CivilDate(int z) {
+        z = z + 719468;
+        int era = z / 146097;
+        if (z < 0) { era = (z - 146096) / 146097; }
+        int doe = z - era * 146097;
+        int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        int y = yoe + era * 400;
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        int mp = (5 * doy + 2) / 153;
+        int d = doy - (153 * mp + 2) / 5 + 1;
+        int m = mp + 3;
+        if (mp >= 10) { m = mp - 9; }
+        if (m <= 2) { y = y + 1; }
+        return FbValue.Pad4(y) + "-" + FbValue.Pad2(m) + "-" + FbValue.Pad2(d);
+    }
+
+    // Firebird 以自 1858-11-17 起的天数存储日期（修正的
+    // 儒略历纪元）；其中有 40587 天在 1970-01-01 之前。
+    static string Date(int nday) {
+        return FbValue.CivilDate(nday - 40587);
+    }
+
+    // 一天内的时间，单位为万分之一秒。
+    static string Time(int n) {
+        int frac = n % 10000;
+        int secs = n / 10000;
+        string s = FbValue.Pad2(secs / 3600) + ":" + FbValue.Pad2((secs / 60) % 60)
+            + ":" + FbValue.Pad2(secs % 60);
+        if (frac == 0) { return s; }
+        string f = Convert.ToString(frac);
+        while (f.Length < 4) { f = "0" + f; }
+        return s + "." + f;
+    }
+
+    // 渲染带有 <paramref name="scale"/> 个隐含小数的整数
+    // （Firebird 元数据中 scale 为负数）。
+    static string Scaled(long units, int scale) {
+        if (scale >= 0) { return Convert.ToString(units); }
+        int digitsAfter = 0 - scale;
+        bool neg = units < 0;
+        if (neg) { units = 0 - units; }
+        string digits = Convert.ToString(units);
+        while (digits.Length <= digitsAfter) { digits = "0" + digits; }
+        int cut = digits.Length - digitsAfter;
+        string outp = digits.Substring(0, cut) + "."
+            + digits.Substring(cut, digitsAfter);
+        if (neg) { outp = "-" + outp; }
+        return outp;
+    }
+
+    // 任意宽度的二进制补码大端整数的十进制文本
+    // （INT128 放不进机器字）。
+    static string WideDecimal(FbBytes raw, int scale) {
+        int n = raw.Len();
+        List<int> mag = new List<int>();
+        bool neg = (raw.At(0) & 128) != 0;
+        int carry = 1;
+        int i = n - 1;
+        while (i >= 0) {
+            int v = raw.At(i);
+            if (neg) {
+                v = (v ^ 255) + carry;
+                carry = (v >> 8) & 1;
+                v = v & 255;
+            }
+            mag.Add(v);  // 小端序的数值大小
+            i = i - 1;
+        }
+        StringBuilder rev = new StringBuilder();
+        bool any = true;
+        while (any) {
+            int rem = 0;
+            int k = mag.Count - 1;
+            any = false;
+            while (k >= 0) {
+                int cur = (rem << 8) | mag[k];
+                int q = cur / 10;
+                rem = cur - q * 10;
+                mag[k] = q;
+                if (q != 0) { any = true; }
+                k = k - 1;
+            }
+            byte[] db = new byte[1];
+            db[0] = (byte)(rem < 10 ? rem + 48 : rem + 87);
+            rev.Append(db.ToStr(0, 1));
+        }
+        string s = rev.ToString();
+        int slen = s.Length;
+        byte[] buf = new byte[slen];
+        for (int k = 0; k < slen; k = k + 1) {
+            buf[k] = (byte)(s[slen - 1 - k] & 255);
+        }
+        int start = 0;
+        while (start < slen - 1 && buf[start] == 48) {
+            start = start + 1;
+        }
+        string digits = buf.ToStr(start, slen - start);
+        if (scale < 0) {
+            int after = 0 - scale;
+            while (digits.Length <= after) { digits = "0" + digits; }
+            int cut = digits.Length - after;
+            digits = digits.Substring(0, cut) + "." + digits.Substring(cut, after);
+        }
+        if (neg && digits != "0") { digits = "-" + digits; }
+        return digits;
+    }
+
+    // 把原始字节渲染为 "0x…" 十六进制（无法识别/DECFLOAT 类型的兜底）。
+    static string Hex(FbBytes raw) {
+        return "0x" + raw.Hex();
+    }
+
+    // 把取回的一个值渲染为文本。BLOB 列不在此解码——
+    // 其载荷需要另外几轮往返，连接层
+    // 会在组装行之前先取回它们。
+    static string Decode(FbColumn col, FbBytes raw) {
+        int t = col.SqlType();
+        FbReader r = FbReader.Over(raw);
+        if (t == FbType.TEXT) {
+            string s = r.Text(raw.Len());
+            int end = s.Length;
+            while (end > 0 && s.Substring(end - 1, 1) == " ") { end = end - 1; }
+            return s.Substring(0, end);
+        }
+        if (t == FbType.VARYING) {
+            return r.Text(raw.Len());
+        }
+        if (t == FbType.SHORT || t == FbType.LONG || t == FbType.INT64) {
+            return FbValue.Scaled(r.LongBE(raw.Len()), col.Scale());
+        }
+        if (t == FbType.INT128 || t == FbType.DEC_FIXED) {
+            return FbValue.WideDecimal(raw, col.Scale());
+        }
+        if (t == FbType.BOOLEAN) {
+            if (r.U8() == 0) { return "0"; }
+            return "1";
+        }
+        if (t == FbType.FLOAT) {
+            int bits = r.Int() & 4294967295;
+            return FbValue.Ieee((bits >> 31) & 1, (bits >> 23) & 255,
+                                bits & 8388607, 127, 23);
+        }
+        if (t == FbType.DOUBLE || t == FbType.D_FLOAT) {
+            long bits = r.LongBE(8);
+            return FbValue.Ieee((int)((bits >> 63) & 1), (int)((bits >> 52) & 2047),
+                                bits & 4503599627370495, 1023, 52);
+        }
+        if (t == FbType.DATE) {
+            return FbValue.Date(r.IntBE(4));
+        }
+        if (t == FbType.TIME) {
+            return FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIMESTAMP) {
+            string d = FbValue.Date(r.IntBE(4));
+            return d + " " + FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIME_TZ) {
+            // 丢弃时区 id：将 id 映射为名称需要服务器的
+            // 时区表。时间本身仍以记录时的时区为准。
+            return FbValue.Time(r.IntBE(4));
+        }
+        if (t == FbType.TIMESTAMP_TZ) {
+            string d = FbValue.Date(r.IntBE(4));
+            return d + " " + FbValue.Time(r.IntBE(4));
+        }
+        // DECFLOAT 及任何无法识别的类型保留原始字节，
+        // 而不是被悄悄弄成一个错误的数值。
+        return FbValue.Hex(raw);
+    }
+
+    // 把参数列表编码成 BLR 消息加上 <c>op_execute</c> 携带的取值。
+    // 协议 13 在取值前放置 NULL 位图，所以 NULL 参数
+    // 只贡献自己的一个位。
+    static FbParamBlock Params(DbParams prms) {
+        int count = 0;
+        if (prms != null) { count = prms.Count(); }
+        FbBuf blr = new FbBuf();
+        int ln = count * 2;
+        blr.U8(5); blr.U8(2); blr.U8(4); blr.U8(0);
+        blr.U8(ln & 255); blr.U8((ln >> 8) & 255);
+
+        FbBuf vals = new FbBuf();
+        int nbytes = count / 8;
+        if ((count % 8) != 0) { nbytes = nbytes + 1; }
+        if ((nbytes % 4) != 0) { nbytes = nbytes + 4 - (nbytes % 4); }
+        int i = 0;
+        for (; i < nbytes; i = i + 1) {
+            int bits = 0;
+            for (int k = 0; k < 8; k = k + 1) {
+                int idx = i * 8 + k;
+                if (idx < count && prms.KindAt(idx) == DbParams.KindNull) {
+                    bits = bits | (1 << k);
+                }
+            }
+            vals.U8(bits);
+        }
+
+        i = 0;
+        while (i < count) {
+            int kind = prms.KindAt(i);
+            if (kind == DbParams.KindNull) {
+                blr.U8(14); blr.U8(0); blr.U8(0);  // blr_text，长度为 0
+            } else if (kind == DbParams.KindInt) {
+                blr.U8(16); blr.U8(0);  // blr_int64
+                FbValue.appendBE(vals, prms.IntAt(i), 8);
+            } else if (kind == DbParams.KindDouble) {
+                blr.U8(27);  // blr_double
+                FbValue.appendBE(vals, FbValue.DoubleBits(prms.DoubleAt(i)), 8);
+            } else {
+                string s = prms.TextAt(i);
+                int n = s.Length;
+                blr.U8(14); blr.U8(n & 255); blr.U8((n >> 8) & 255);
+                vals.Raw(s);
+                int pad = (4 - (n % 4)) % 4;
+                for (int p = 0; p < pad; p = p + 1) {
+                    vals.U8(0);
+                }
+            }
+            blr.U8(7); blr.U8(0);  // blr_short：NULL 标志
+            i = i + 1;
+        }
+        blr.U8(255); blr.U8(76);  // blr_end, blr_eoc
+        return FbParamBlock.Of(blr.ToBytes(), vals.ToBytes());
+    }
+
+    // 向 b 追加 v 的 n 字节大端形式。
+    static void appendBE(FbBuf b, long v, int n) {
+        int i = n - 1;
+        while (i >= 0) {
+            b.U8((int)((v >> (i * 8)) & 255));
+            i = i - 1;
+        }
+    }
+}

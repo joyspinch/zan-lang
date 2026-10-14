@@ -1,0 +1,1255 @@
+using System;
+using Gui;
+
+partial class SecurityApp {
+    static int currentPageIndex = 0;
+    static int currentProtectSubIndex = 0;
+    static bool isMaximized = false;
+
+    // 常用工具列表
+    static List<ToolEntry> toolsList = new List<ToolEntry>();
+    static List<ProtectItem> virusItems = new List<ProtectItem>();
+    static List<ProtectItem> systemItems = new List<ProtectItem>();
+    static List<ProtectItem> networkItems = new List<ProtectItem>();
+    static List<AccessItem> accessItems = new List<AccessItem>();
+    static bool isFavEditing = false;
+
+    // 常用工具拖拽手势与悬浮图标状态机
+    static bool isDraggingTool = false;
+    static bool dragMouseDown = false;
+    static int dragStartX = 0;
+    static int dragStartY = 0;
+    static ToolEntry pendingDragTool = null;
+    static string dragToolId = "";
+    static string dragToolName = "";
+    static string dragToolIcon = "";
+    static long lastDragEndMs = 0;
+
+    // 查杀扫描状态
+    static bool isScanning = false;
+    static bool isScanPaused = false;
+    static int scanPercent = 0;
+    static int scanCount = 0;
+    static int scanTick = 0;
+    static long scanStartMs = 0;
+    static string scanCurrentPath = "";
+    static bool isCustomScan = false;
+
+    // 首页芯片与落区动态效果计时
+    static int animTick = 0;
+    static int dragAnimTick = 0;
+    static int dragDurationFrames = 0;
+    static long lastAnimMs = 0;
+
+    static void OnLoad(Form form) {
+        __form = form;
+        Console.WriteLine("[SecurityGuard] 火绒安全软件桌面端已就绪");
+
+        // 设置无边框自绘标题栏拖动保护高度与右上角按钮区防拖拽保护带
+        form.GetApp().SetTitlebarHeight(38);
+        form.GetApp().SetCaptionZone(form.GetApp().Scale(160));
+
+        // 初始化首页高保真科技感安全芯片首帧（无缝矢量 2.5D 等轴测芯片）
+        if (imgChip != null) {
+            imgChip.Src.Set("data:image/svg+xml;utf8," + BuildChipSvg(0));
+        }
+
+        // 初始化常用工具落区首帧
+        if (imgDropzone != null) {
+            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(0, false, false));
+        }
+
+        // 安装每帧动态刷新钩子（用于光标极速跟随与外部拖拽事件分发）
+        form.FrameHook(OnFrameAnimation);
+
+        // 注册 40ms 自主定时唤醒时钟（驱动雷达光束、呼吸光圈与查杀进度无需鼠标移动自动运转）
+        form.Every(40, OnTimerAnimation);
+
+        // 一级导航事件绑定
+        form.On("OnNavHome", OnNavHome);
+        form.On("OnNavProtect", OnNavProtect);
+        form.On("OnNavAccess", OnNavAccess);
+        form.On("OnNavTools", OnNavTools);
+        form.On("OnNavSettings", OnNavSettings);
+
+        // 窗口系统控制按钮事件绑定
+        form.On("OnWinClose", OnWinClose);
+        form.On("OnWinMin", OnWinMin);
+        form.On("OnWinMax", OnWinMax);
+        form.On("OnWinMenu", OnWinMenu);
+
+        // 首页查杀与底部操作事件绑定
+        form.On("OnQuickScan", OnQuickScan);
+        form.On("OnScanMenu", OnScanMenu);
+        form.On("OnActionUpdate", OnActionUpdate);
+        form.On("OnActionLog", OnActionLog);
+        form.On("OnActionTrust", OnActionTrust);
+        form.On("OnActionIso", OnActionIso);
+
+        // 查杀扫描模态弹窗事件绑定
+        form.On("OnScanModalClose", OnScanModalClose);
+        form.On("OnScanPause", OnScanPause);
+        form.On("OnScanStop", OnScanStop);
+
+        // 防护中心二级分类导航与开关
+        form.On("OnProtectSubVirus", OnProtectSubVirus);
+        form.On("OnProtectSubSystem", OnProtectSubSystem);
+        form.On("OnProtectSubNetwork", OnProtectSubNetwork);
+        form.On("OnToggleSwitch", OnToggleSwitch);
+
+        // 安全工具常用工具编辑与收藏交互
+        form.On("OnToggleEditFavTools", OnToggleEditFavTools);
+        form.On("OnFavCardVuln", OnFavCardVuln);
+        form.On("OnFavCardPopup", OnFavCardPopup);
+        form.On("OnFavCardTrash", OnFavCardTrash);
+        form.On("OnFavCardSysFix", OnFavCardSysFix);
+        form.On("OnFavCardStartup", OnFavCardStartup);
+        form.On("OnFavCardNetTraffic", OnFavCardNetTraffic);
+        form.On("OnDropzoneClick", OnDropzoneClick);
+
+        form.On("OnToolCardVuln", OnToolCardVuln);
+        form.On("OnToolCardSysFix", OnToolCardSysFix);
+        form.On("OnToolCardPopup", OnToolCardPopup);
+        form.On("OnToolCardTrash", OnToolCardTrash);
+        form.On("OnToolCardStartup", OnToolCardStartup);
+        form.On("OnToolCardShred", OnToolCardShred);
+        form.On("OnToolCardContextMenu", OnToolCardContextMenu);
+        form.On("OnToolCardNetRescue", OnToolCardNetRescue);
+        form.On("OnToolCardNetTraffic", OnToolCardNetTraffic);
+        form.On("OnToolCardNetSpeed", OnToolCardNetSpeed);
+        form.On("OnToolCardDnsOpt", OnToolCardDnsOpt);
+
+        // 数据驱动初始化
+        InitProtectItems();
+        InitAccessItems();
+        InitToolsList();
+
+        RenderAccessItems();
+        RenderToolGrids();
+
+        int orange = unchecked((int)0xFFF58220);
+        InitSwitch(swPwdProtect, orange, false);
+        InitSwitch(swGameMode, orange, false);
+
+        // 初始化常用工具数据列表
+        InitToolsList();
+
+        // 查杀弹窗默认隐藏
+        if (scanOverlay != null) { scanOverlay.visible = false; }
+
+        // 拖拽悬浮图标默认隐藏
+        if (dragAvatar != null) { dragAvatar.visible = false; }
+
+        // 默认显示首页，防护中心默认显示病毒防护子页
+        ShowPage(0);
+        ShowProtectSub(0);
+    }
+
+    static void InitToolsList() {
+        toolsList.Clear();
+        toolsList.Add(new ToolEntry("vuln", "漏洞修复", "shield-check", "扫描并修复系统漏洞", true));
+        toolsList.Add(new ToolEntry("popup", "弹窗拦截", "square", "拦截程序推送的不受欢迎弹窗", true));
+        toolsList.Add(new ToolEntry("trash", "垃圾清理", "trash", "清理各种系统垃圾", true));
+        toolsList.Add(new ToolEntry("sysfix", "系统修复", "tools", "修复因病毒等导致系统异常", false));
+        toolsList.Add(new ToolEntry("startup", "启动项管理", "device-desktop", "管理各类软件的开机自启动", false));
+        toolsList.Add(new ToolEntry("net_traffic", "流量监控", "world", "监控各程序网络流量占用", false));
+        toolsList.Add(new ToolEntry("shred", "文件粉碎", "file-text", "强制删除或彻底粉碎文件", false));
+        toolsList.Add(new ToolEntry("menu", "右键管理", "settings", "管理右键菜单", false));
+        toolsList.Add(new ToolEntry("net_rescue", "断网急救箱", "tools", "解决电脑无法上网问题", false));
+        toolsList.Add(new ToolEntry("net_speed", "网络测速", "refresh", "测试当前宽带上下行速率", false));
+        toolsList.Add(new ToolEntry("dns_opt", "DNS优选", "world", "测试并配置高速安全DNS", false));
+        SyncFavCards();
+    }
+
+    static void InitSwitch(Switch sw, int color, bool on) {
+        if (sw != null) {
+            sw.CheckedColor = color;
+            sw.SetOn(on);
+        }
+    }
+
+    // ================= 1. 一级主页面路由 =================
+    static void ShowPage(int idx) {
+        currentPageIndex = idx;
+        if (pageHome != null) { pageHome.visible = (idx == 0); }
+        if (pageProtect != null) { pageProtect.visible = (idx == 1); }
+        if (pageAccess != null) { pageAccess.visible = (idx == 2); }
+        if (pageTools != null) { pageTools.visible = (idx == 3); }
+        if (pageSettings != null) { pageSettings.visible = (idx == 4); }
+
+        UpdateNavBtn(navBtnHome, idx == 0);
+        UpdateNavBtn(navBtnProtect, idx == 1);
+        UpdateNavBtn(navBtnAccess, idx == 2);
+        UpdateNavBtn(navBtnTools, idx == 3);
+        UpdateNavBtn(navBtnSettings, idx == 4);
+
+        if (__form != null) {
+            __form.GetApp().RequestRedraw();
+        }
+    }
+
+    static void UpdateNavBtn(Button btn, bool active) {
+        if (btn == null) { return; }
+        if (active) {
+            btn.AddClass("active");
+        } else {
+            btn.SetClassIn("active", "");
+        }
+    }
+
+    static void OnNavHome() { ShowPage(0); }
+    static void OnNavProtect() { ShowPage(1); }
+    static void OnNavAccess() { ShowPage(2); }
+    static void OnNavTools() { ShowPage(3); }
+    static void OnNavSettings() { ShowPage(4); }
+
+    // ================= 2. 窗口控制按钮 =================
+    static void OnWinClose() {
+        Console.WriteLine("[SecurityGuard] 触发窗口控制：关闭窗口");
+        if (__form != null) { __form.Close(); }
+    }
+
+    static void OnWinMin() {
+        Console.WriteLine("[SecurityGuard] 触发窗口控制：最小化窗口");
+        if (__form != null) { __form.Minimize(); }
+    }
+
+    static void OnWinMax() {
+        Console.WriteLine("[SecurityGuard] 触发窗口控制：最大化/还原切换");
+        if (__form != null) {
+            __form.ToggleMaximize();
+            isMaximized = !isMaximized;
+            if (winBtnMax != null) {
+                winBtnMax.Icon = isMaximized ? "restore" : "maximize";
+            }
+        }
+    }
+
+    static void OnWinMenu() {
+        Console.WriteLine("[SecurityGuard] 弹出火绒主功能菜单：关于、检查更新、设置、帮助");
+    }
+
+    // ================= 3. 防护中心二级分类子页切换与模板列表驱动 =================
+    static void ShowProtectSub(int subIdx) {
+        currentProtectSubIndex = subIdx;
+
+        UpdateProtectNavCard(protectNavVirus, subIdx == 0);
+        UpdateProtectNavCard(protectNavSystem, subIdx == 1);
+        UpdateProtectNavCard(protectNavNetwork, subIdx == 2);
+
+        if (subIdx == 0) {
+            if (protectDetailTitle != null) { protectDetailTitle.SetProp("text", "病毒防护"); }
+            if (protectDetailDesc != null) { protectDetailDesc.SetProp("text", "发现并清除病毒，保护计算机不受病毒侵害"); }
+            RenderProtectItems(virusItems);
+        } else if (subIdx == 1) {
+            if (protectDetailTitle != null) { protectDetailTitle.SetProp("text", "系统防护"); }
+            if (protectDetailDesc != null) { protectDetailDesc.SetProp("text", "防止各类恶意行为对计算机系统造成的破坏"); }
+            RenderProtectItems(systemItems);
+        } else if (subIdx == 2) {
+            if (protectDetailTitle != null) { protectDetailTitle.SetProp("text", "网络防护"); }
+            if (protectDetailDesc != null) { protectDetailDesc.SetProp("text", "阻止黑客攻击与恶意网络请求，保护网络通信安全"); }
+            RenderProtectItems(networkItems);
+        }
+
+        if (__form != null) {
+            __form.GetApp().RequestRedraw();
+        }
+    }
+
+    static Control CreateProtectRow(ProtectItem item) {
+        Element row = new Element();
+        row.InitElement("div", "protectRow_" + item.id);
+        row.Class = "protect-row-card";
+        row.Prefer(0, 50);
+        row.SetProp("style", "height: 50px; min-height: 50px; max-height: 50px; flex: 0 0 50px; flex-shrink: 0;");
+
+        Element left = new Element();
+        left.InitElement("div", "");
+        left.Class = "protect-row-left";
+
+        Button btnIcon = new Button();
+        btnIcon.Class = "protect-row-icon";
+        btnIcon.Icon = item.icon;
+        left.AddKid(btnIcon);
+
+        Element nameEl = new Element();
+        nameEl.InitElement("span", "");
+        nameEl.Class = "protect-row-name";
+        nameEl.SetText(item.name);
+        left.AddKid(nameEl);
+        row.AddKid(left);
+
+        Element right = new Element();
+        right.InitElement("div", "");
+        right.Class = "protect-row-right";
+
+        Switch sw = new Switch();
+        sw.name = "sw_" + item.id;
+        InitSwitch(sw, unchecked((int)0xFFF58220), item.enabled);
+        sw.Change.Add(OnToggleSwitch);
+        right.AddKid(sw);
+
+        Button btnCfg = new Button();
+        btnCfg.Class = "btn-item-cfg";
+        btnCfg.Icon = "settings";
+        right.AddKid(btnCfg);
+
+        row.AddKid(right);
+        return row;
+    }
+
+    static void RenderProtectItems(List<ProtectItem> items) {
+        if (protectItemsList == null || items == null) { return; }
+        protectItemsList.ClearKids();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            protectItemsList.AddKid(CreateProtectRow(items[i]));
+        }
+    }
+
+    static void InitProtectItems() {
+        virusItems.Clear();
+        virusItems.Add(new ProtectItem("file", "文件实时监控", "folder", true));
+        virusItems.Add(new ProtectItem("malware", "恶意行为监控", "eye", true));
+        virusItems.Add(new ProtectItem("memory", "内存防护", "cpu", true));
+        virusItems.Add(new ProtectItem("usb", "U盘保护", "device-desktop", true));
+        virusItems.Add(new ProtectItem("download", "下载保护", "download", true));
+        virusItems.Add(new ProtectItem("mail", "邮件监控", "mail", true));
+        virusItems.Add(new ProtectItem("web", "Web扫描", "world", true));
+
+        systemItems.Clear();
+        systemItems.Add(new ProtectItem("sys_integrity", "系统完整性保护", "shield-check", true));
+        systemItems.Add(new ProtectItem("sys_shred", "文件粉碎保护", "trash", true));
+        systemItems.Add(new ProtectItem("sys_process", "进程保护", "cpu", true));
+        systemItems.Add(new ProtectItem("sys_registry", "注册表防护", "file-text", true));
+        systemItems.Add(new ProtectItem("sys_boot", "引导扇区防护", "device-desktop", true));
+        systemItems.Add(new ProtectItem("sys_driver", "驱动防护", "settings", true));
+        systemItems.Add(new ProtectItem("sys_exploit", "漏洞利用防护", "tools", true));
+        systemItems.Add(new ProtectItem("sys_install", "软件安装拦截", "download", true));
+
+        networkItems.Clear();
+        networkItems.Add(new ProtectItem("net_firewall", "防火墙", "shield", true));
+        networkItems.Add(new ProtectItem("net_lan", "局域网防护", "device-desktop", true));
+        networkItems.Add(new ProtectItem("net_portscan", "端口扫描防护", "search", true));
+        networkItems.Add(new ProtectItem("net_rdp", "远程桌面保护", "lock", true));
+        networkItems.Add(new ProtectItem("net_urlfilter", "恶意网址拦截", "world", true));
+        networkItems.Add(new ProtectItem("net_botnet", "僵尸网络防护", "bell", true));
+        networkItems.Add(new ProtectItem("net_browserhome", "浏览器主页保护", "home", true));
+    }
+
+    static void InitAccessItems() {
+        accessItems.Clear();
+        accessItems.Add(new AccessItem("time", "上网时段控制", "控制计算机上网的时间段或者累计的上网时长", "device-desktop", false));
+        accessItems.Add(new AccessItem("web", "网站内容控制", "限制计算机访问特定类型网站", "world", false));
+        accessItems.Add(new AccessItem("app", "程序执行控制", "限制指定应用程序的执行", "cpu", false));
+        accessItems.Add(new AccessItem("usb", "USB设备控制", "限制未信任的USB设备接入计算机", "tools", false));
+        accessItems.Add(new AccessItem("ip", "IP协议控制", "在IP协议层进行网络访问控制", "device-desktop", false));
+        accessItems.Add(new AccessItem("black", "IP黑名单", "限制对指定IP的出站、入站请求", "file-text", false));
+    }
+
+    static Control CreateAccessCard(AccessItem item) {
+        Element card = new Element();
+        card.InitElement("div", "accessCard_" + item.id);
+        card.Class = "access-card";
+
+        Element iconBox = new Element();
+        iconBox.InitElement("div", "");
+        iconBox.Class = "access-card-icon";
+        Button btnIcon = new Button();
+        btnIcon.Class = "tool-icon-btn";
+        btnIcon.Icon = item.icon;
+        btnIcon.Prefer(24, 24);
+        iconBox.AddKid(btnIcon);
+        card.AddKid(iconBox);
+
+        Element body = new Element();
+        body.InitElement("div", "");
+        body.Class = "access-card-body";
+
+        Element head = new Element();
+        head.InitElement("div", "");
+        head.Class = "access-card-head";
+
+        Element titleEl = new Element();
+        titleEl.InitElement("span", "");
+        titleEl.Class = "access-card-title";
+        titleEl.SetText(item.name);
+        head.AddKid(titleEl);
+
+        Element badgeEl = new Element();
+        badgeEl.InitElement("span", "");
+        badgeEl.Class = "access-card-badge";
+        badgeEl.SetText(item.enabled ? "已开启" : "未开启");
+        head.AddKid(badgeEl);
+        body.AddKid(head);
+
+        Element descEl = new Element();
+        descEl.InitElement("span", "");
+        descEl.Class = "access-card-desc";
+        descEl.SetText(item.desc);
+        body.AddKid(descEl);
+
+        card.AddKid(body);
+        return card;
+    }
+
+    static void RenderAccessItems() {
+        if (accessGrid == null) { return; }
+        accessGrid.ClearKids();
+        for (int i = 0; i < accessItems.Count; i = i + 1) {
+            accessGrid.AddKid(CreateAccessCard(accessItems[i]));
+        }
+    }
+
+    static Control CreateToolItemCard(ToolEntry item) {
+        Element card = new Element();
+        card.InitElement("div", "toolCard_" + item.id);
+        card.Class = "tool-item-card";
+        card.Prefer(0, 72);
+        card.SetProp("style", "height: 72px; min-height: 72px; max-height: 72px; flex: 0 0 31%; flex-shrink: 0; cursor: pointer;");
+
+        Element iconBox = new Element();
+        iconBox.InitElement("div", "");
+        iconBox.Class = "tool-item-icon";
+        Button btnIcon = new Button();
+        btnIcon.Class = "tool-icon-btn";
+        btnIcon.Icon = item.icon;
+        btnIcon.Prefer(24, 24);
+
+        Element info = new Element();
+        info.InitElement("div", "");
+        info.Class = "tool-item-info";
+
+        Element nameEl = new Element();
+        nameEl.InitElement("span", "");
+        nameEl.Class = "tool-item-name";
+        nameEl.SetText(item.name);
+        info.AddKid(nameEl);
+
+        Element descEl = new Element();
+        descEl.InitElement("span", "");
+        descEl.Class = "tool-item-desc";
+        descEl.SetText(item.desc);
+        info.AddKid(descEl);
+
+        iconBox.AddKid(btnIcon);
+        card.AddKid(iconBox);
+        card.AddKid(info);
+
+        // 统一手势处理：鼠标按下时记录拖拽意图，移动超阈值进入浮动拖拽；原位点击启动对应工具
+        Gui.Action onMouseDownCard = () => {
+            if (!item.isFav && !isDraggingTool) {
+                if (__form != null) {
+                    App app = __form.GetApp();
+                    dragStartX = app.mouseX;
+                    dragStartY = app.mouseY;
+                }
+                dragMouseDown = true;
+                pendingDragTool = item;
+            }
+        };
+
+        Gui.Action onClickCard = () => {
+            long now = Window.GetTickMs();
+            if (now - lastDragEndMs < 400) { return; }
+            if (isDraggingTool) { return; }
+            OnLaunchTool(item.id, item.name);
+        };
+
+        // 绑定到整个卡片及所有子节点，确保点击或按压卡片任何区域（图标、标题、说明或留白）均完美触发
+        card.OnMouseDown(onMouseDownCard);
+        card.OnClick(onClickCard);
+        btnIcon.OnMouseDown(onMouseDownCard);
+        btnIcon.OnClick(onClickCard);
+        iconBox.OnMouseDown(onMouseDownCard);
+        iconBox.OnClick(onClickCard);
+        info.OnMouseDown(onMouseDownCard);
+        info.OnClick(onClickCard);
+        nameEl.OnMouseDown(onMouseDownCard);
+        nameEl.OnClick(onClickCard);
+        descEl.OnMouseDown(onMouseDownCard);
+        descEl.OnClick(onClickCard);
+
+        return card;
+    }
+
+    static void OnLaunchTool(string id, string name) {
+        Console.WriteLine("[SecurityGuard] 启动安全工具: " + name);
+    }
+
+    static void RenderToolGrids() {
+        if (sysToolsGrid != null) {
+            sysToolsGrid.ClearKids();
+            for (int i = 0; i < toolsList.Count && i < 7; i = i + 1) {
+                sysToolsGrid.AddKid(CreateToolItemCard(toolsList[i]));
+            }
+        }
+        if (netToolsGrid != null) {
+            netToolsGrid.ClearKids();
+            for (int i = 7; i < toolsList.Count; i = i + 1) {
+                netToolsGrid.AddKid(CreateToolItemCard(toolsList[i]));
+            }
+        }
+    }
+
+    static void UpdateProtectNavCard(Element card, bool active) {
+        if (card == null) { return; }
+        if (active) {
+            card.AddClass("active");
+        } else {
+            card.SetClassIn("active", "");
+        }
+    }
+
+    static void OnProtectSubVirus() { ShowProtectSub(0); }
+    static void OnProtectSubSystem() { ShowProtectSub(1); }
+    static void OnProtectSubNetwork() { ShowProtectSub(2); }
+
+    static void OnToggleSwitch() {
+        Console.WriteLine("[SecurityGuard] 防护中心开关状态变更，防护规则已热更新");
+    }
+
+    // ================= 4. 安全工具'常用工具'收藏与编辑交互 (统一数据驱动) =================
+    static ToolEntry FindTool(string id) {
+        for (int i = 0; i < toolsList.Count; i = i + 1) {
+            if (toolsList[i].id == id) { return toolsList[i]; }
+        }
+        return null;
+    }
+
+    static string GetToolColor(string id) {
+        if (id == "vuln") { return "#f58220"; }
+        if (id == "popup") { return "#3370ff"; }
+        if (id == "trash") { return "#00b578"; }
+        if (id == "sysfix") { return "#722ed1"; }
+        if (id == "startup") { return "#fa8c16"; }
+        if (id == "net_traffic") { return "#13c2c2"; }
+        if (id == "net_fix") { return "#1890ff"; }
+        if (id == "leak") { return "#eb2f96"; }
+        if (id == "arp") { return "#52c41a"; }
+        if (id == "ip_block") { return "#fa541c"; }
+        if (id == "app_control") { return "#2f54eb"; }
+        return "#f58220";
+    }
+
+    static Control CreateFavToolCard(ToolEntry item) {
+        Element card = new Element();
+        card.InitElement("div", "favCard_" + item.id);
+        card.Class = "fav-tool-card";
+        card.Prefer(120, 72);
+        card.SetProp("style", "width: 120px; height: 72px; min-height: 72px; max-height: 72px; display: flex; flex-direction: column; align-items: center; justify-content: center; box-sizing: border-box;");
+
+        Element iconBox = new Element();
+        iconBox.InitElement("div", "");
+        iconBox.Class = "tool-item-icon";
+        Button btnIcon = new Button();
+        btnIcon.Class = "tool-icon-btn";
+        btnIcon.Icon = item.icon;
+        btnIcon.Prefer(24, 24);
+        btnIcon.SetProp("style", "color:" + GetToolColor(item.id) + ";");
+        iconBox.AddKid(btnIcon);
+        card.AddKid(iconBox);
+
+        Element nameEl = new Element();
+        nameEl.InitElement("span", "");
+        nameEl.Class = "fav-tool-name";
+        nameEl.SetText(item.name);
+        card.AddKid(nameEl);
+
+        Button badge = new Button();
+        badge.Class = "fav-tool-del-badge";
+        badge.Icon = "minus";
+        badge.visible = isFavEditing;
+        badge.OnClick(() => {
+            RemoveFavoriteTool(item.id);
+        });
+        card.AddKid(badge);
+
+        card.OnClick(() => {
+            OnFavCardClick(item.id);
+        });
+        return card;
+    }
+
+    static void RenderFavTools() {
+        if (favToolsList == null) { return; }
+        favToolsList.ClearKids();
+        int favCount = 0;
+        for (int i = 0; i < toolsList.Count; i = i + 1) {
+            ToolEntry t = toolsList[i];
+            if (t.isFav) {
+                favToolsList.AddKid(CreateFavToolCard(t));
+                favCount = favCount + 1;
+            }
+        }
+        if (dropzoneBox != null) {
+            dropzoneBox.visible = (favCount < 6);
+            if (favCount < 6) {
+                favToolsList.AddKid(dropzoneBox);
+            }
+        }
+    }
+
+    static void SyncFavCards() {
+        RenderFavTools();
+        RenderToolGrids();
+    }
+
+    static void OnToggleEditFavTools() {
+        isFavEditing = !isFavEditing;
+        if (btnEditFavTools != null) {
+            if (isFavEditing) {
+                btnEditFavTools.AddClass("active");
+                btnEditFavTools.Text = "完成";
+            } else {
+                btnEditFavTools.SetClassIn("active", "");
+                btnEditFavTools.Text = "编辑";
+            }
+        }
+        RenderFavTools();
+        if (__form != null) {
+            __form.GetApp().RequestRedraw();
+        }
+    }
+
+    static void RemoveFavoriteTool(string id) {
+        ToolEntry t = FindTool(id);
+        if (t != null) {
+            t.isFav = false;
+            Console.WriteLine("[SecurityGuard] 已将 [" + t.name + "] 从常用工具中移除");
+            SyncFavCards();
+            if (__form != null) { __form.GetApp().RequestRedraw(); }
+        }
+    }
+
+    static void OnFavCardClick(string id) {
+        ToolEntry t = FindTool(id);
+        if (t == null) { return; }
+        if (isFavEditing) {
+            RemoveFavoriteTool(id);
+        } else {
+            Console.WriteLine("[SecurityGuard] 启动 [" + t.name + "] 模块");
+        }
+    }
+
+    static void OnFavCardVuln() { OnFavCardClick("vuln"); }
+    static void OnFavCardPopup() { OnFavCardClick("popup"); }
+    static void OnFavCardTrash() { OnFavCardClick("trash"); }
+    static void OnFavCardSysFix() { OnFavCardClick("sysfix"); }
+    static void OnFavCardStartup() { OnFavCardClick("startup"); }
+    static void OnFavCardNetTraffic() { OnFavCardClick("net_traffic"); }
+
+    // 拖拽工具跟随与置入常用工具
+    static void StartDragTool(string id, string name, string icon) {
+        if (isDraggingTool) { return; }
+        isDraggingTool = true;
+        dragToolId = id;
+        dragToolName = name;
+        dragToolIcon = icon;
+        dragDurationFrames = 0;
+        if (dragAvatar != null) {
+            dragAvatar.visible = true;
+            dragAvatar.designFloat = true;
+            dragAvatar.logPlaceSet = true;
+            dragAvatar.logW = 130;
+            dragAvatar.logH = 42;
+            dragAvatar.prefW = 130;
+            dragAvatar.prefH = 42;
+            if (__form != null) {
+                App app = __form.GetApp();
+                int scale = app.dpiScale > 0 ? app.dpiScale : 100;
+                dragAvatar.logX = (app.mouseX + app.Scale(12)) * 100 / scale;
+                dragAvatar.logY = (app.mouseY + app.Scale(12)) * 100 / scale;
+                int curX = app.mouseX + app.Scale(12);
+                int curY = app.mouseY + app.Scale(12);
+                int curW = app.Scale(130);
+                int curH = app.Scale(42);
+                dragAvatar.Arrange(curX, curY, curW, curH);
+            }
+        }
+        if (btnDragAvatarIcon != null) {
+            btnDragAvatarIcon.Icon = icon;
+            btnDragAvatarIcon.logW = 24;
+            btnDragAvatarIcon.logH = 24;
+            btnDragAvatarIcon.prefW = 24;
+            btnDragAvatarIcon.prefH = 24;
+            btnDragAvatarIcon.bw = 24;
+            btnDragAvatarIcon.bh = 24;
+            btnDragAvatarIcon.SetProp("style", "width:24px;height:24px;color:" + GetToolColor(id) + ";");
+        }
+        if (txtDragAvatarName != null) {
+            txtDragAvatarName.Text = name;
+        }
+        if (imgDropzone != null) {
+            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(0, true, false));
+        }
+        Console.WriteLine("[SecurityGuard] 拖拽开始: 拽出 [" + name + "] 图标跟随光标");
+        if (__form != null) { __form.GetApp().RequestRedraw(); }
+    }
+
+    static void EndDragTool(bool dock) {
+        if (!isDraggingTool) { return; }
+        lastDragEndMs = Window.GetTickMs();
+        string toolNameToDock = dragToolName;
+        isDraggingTool = false;
+        dragMouseDown = false;
+        pendingDragTool = null;
+        dragToolId = "";
+        dragToolName = "";
+        dragToolIcon = "";
+        dragDurationFrames = 0;
+        if (dragAvatar != null) {
+            dragAvatar.visible = false;
+            dragAvatar.SetProp("class", "drag-avatar");
+        }
+        if (imgDropzone != null) {
+            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(0, false, false));
+        }
+        if (dock && toolNameToDock != "") {
+            DockFavoriteTool(toolNameToDock);
+        }
+        if (__form != null) { __form.GetApp().RequestRedraw(); }
+    }
+
+    static void DockFavoriteTool(string toolName) {
+        int currentFavCount = 0;
+        for (int i = 0; i < toolsList.Count; i = i + 1) {
+            if (toolsList[i].isFav) { currentFavCount = currentFavCount + 1; }
+        }
+        if (currentFavCount >= 6) {
+            Console.WriteLine("[SecurityGuard] 常用工具栏已达上限 (最多6个): 无法置入 " + toolName);
+            return;
+        }
+
+        for (int i = 0; i < toolsList.Count; i = i + 1) {
+            if (toolsList[i].name == toolName) {
+                toolsList[i].isFav = true;
+                Console.WriteLine("[SecurityGuard] 常用工具成功置顶置入: " + toolName);
+                SyncFavCards();
+                if (__form != null) { __form.GetApp().RequestRedraw(); }
+                return;
+            }
+        }
+        Console.WriteLine("[SecurityGuard] 常用工具栏未匹配: " + toolName);
+    }
+
+    static void OnDropzoneClick() {
+        long now = Window.GetTickMs();
+        if (now - lastDragEndMs < 400) {
+            // 刚松开鼠标完成拖拽入槽，防范松手事件分发原生 click 导致误触发
+            return;
+        }
+        if (isDraggingTool) {
+            EndDragTool(true);
+            return;
+        }
+        Console.WriteLine("[SecurityGuard] 常用工具插槽就绪，可从下方长按并拖拽任意系统/网络工具至此添加");
+    }
+
+    static void TriggerTool(string id) {
+        ToolEntry tool = FindTool(id);
+        if (tool == null) { return; }
+        if (!tool.isFav) {
+            StartDragTool(tool.id, tool.name, tool.icon);
+        } else {
+            Console.WriteLine("[SecurityGuard] 打开工具: " + tool.name);
+        }
+    }
+
+    static void OnToolCardVuln() { TriggerTool("vuln"); }
+    static void OnToolCardSysFix() { TriggerTool("sysfix"); }
+    static void OnToolCardPopup() { TriggerTool("popup"); }
+    static void OnToolCardTrash() { TriggerTool("trash"); }
+    static void OnToolCardStartup() { TriggerTool("startup"); }
+    static void OnToolCardShred() { TriggerTool("shred"); }
+    static void OnToolCardContextMenu() { TriggerTool("menu"); }
+    static void OnToolCardNetRescue() { TriggerTool("net_rescue"); }
+    static void OnToolCardNetTraffic() { TriggerTool("net_traffic"); }
+    static void OnToolCardNetSpeed() { TriggerTool("net_speed"); }
+    static void OnToolCardDnsOpt() { TriggerTool("dns_opt"); }
+
+    // ================= 5. 首页火绒 2.5D 等轴测科技芯片与立体金盾纯矢量无缝绘制 =================
+    static string BuildChipSvg(int tick) {
+        // 轻量平滑脉冲
+        int pulse = tick % 16;
+        int rPulse = 110 + pulse * 2;
+        string opPulse = (pulse < 8) ? "0.15" : "0.08";
+
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 380 260' width='380' height='260'>");
+        sb.Append("<defs>");
+        // 柔和环境光晕径向渐变
+        sb.Append("<radialGradient id='haloGlow' cx='50%' cy='50%' r='50%'>");
+        sb.Append("<stop offset='0%' stop-color='#FFF2E8' stop-opacity='0.85'/>");
+        sb.Append("<stop offset='65%' stop-color='#FFF8F0' stop-opacity='0.35'/>");
+        sb.Append("<stop offset='100%' stop-color='#FFFFFF' stop-opacity='0'/>");
+        sb.Append("</radialGradient>");
+        // 芯片表面质感线性渐变
+        sb.Append("<linearGradient id='chipTopGrad' x1='0%' y1='0%' x2='100%' y2='100%'>");
+        sb.Append("<stop offset='0%' stop-color='#2A2E39'/>");
+        sb.Append("<stop offset='100%' stop-color='#191B22'/>");
+        sb.Append("</linearGradient>");
+        // 芯片侧边倒角
+        sb.Append("<linearGradient id='chipSideL' x1='0%' y1='0%' x2='0%' y2='100%'>");
+        sb.Append("<stop offset='0%' stop-color='#14161C'/>");
+        sb.Append("<stop offset='100%' stop-color='#0B0C0E'/>");
+        sb.Append("</linearGradient>");
+        sb.Append("<linearGradient id='chipSideR' x1='0%' y1='0%' x2='0%' y2='100%'>");
+        sb.Append("<stop offset='0%' stop-color='#20242D'/>");
+        sb.Append("<stop offset='100%' stop-color='#101217'/>");
+        sb.Append("</linearGradient>");
+        // 黄金盾牌左亮面与右暗面渐变
+        sb.Append("<linearGradient id='goldShieldL' x1='0%' y1='0%' x2='100%' y2='100%'>");
+        sb.Append("<stop offset='0%' stop-color='#FFD074'/>");
+        sb.Append("<stop offset='50%' stop-color='#FFA940'/>");
+        sb.Append("<stop offset='100%' stop-color='#F58220'/>");
+        sb.Append("</linearGradient>");
+        sb.Append("<linearGradient id='goldShieldR' x1='0%' y1='0%' x2='100%' y2='100%'>");
+        sb.Append("<stop offset='0%' stop-color='#FA8C16'/>");
+        sb.Append("<stop offset='60%' stop-color='#D46B08'/>");
+        sb.Append("<stop offset='100%' stop-color='#AD4E00'/>");
+        sb.Append("</linearGradient>");
+        sb.Append("</defs>");
+
+        // 1. 无缝底色与极柔环境光晕 (完美融入 #ffffff，无任何方块切边)
+        sb.Append("<ellipse cx='190' cy='135' rx='160' ry='95' fill='url(#haloGlow)'/>");
+        sb.Append("<ellipse cx='190' cy='135' rx='");
+        sb.Append(Convert.ToString(rPulse));
+        sb.Append("' ry='");
+        sb.Append(Convert.ToString(rPulse * 6 / 10));
+        sb.Append("' fill='none' stroke='#FFA940' stroke-width='1.2' stroke-opacity='");
+        sb.Append(opPulse);
+        sb.Append("'/>");
+
+        // 2. PCB 等轴测外围金色信号走线与过孔引脚 (极具秩序感的工业科技感)
+        // 左上方引脚线
+        sb.Append("<path d='M 110 90 L 75 70 M 125 80 L 95 62 M 140 70 L 115 55' fill='none' stroke='#D4B106' stroke-width='1.2' stroke-opacity='0.45'/>");
+        sb.Append("<circle cx='75' cy='70' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        sb.Append("<circle cx='95' cy='62' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        sb.Append("<circle cx='115' cy='55' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        // 右上方引脚线
+        sb.Append("<path d='M 270 90 L 305 70 M 255 80 L 285 62 M 240 70 L 265 55' fill='none' stroke='#D4B106' stroke-width='1.2' stroke-opacity='0.45'/>");
+        sb.Append("<circle cx='305' cy='70' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        sb.Append("<circle cx='285' cy='62' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        sb.Append("<circle cx='265' cy='55' r='1.5' fill='#D4B106' fill-opacity='0.6'/>");
+        // 左下方与右下方引脚线
+        sb.Append("<path d='M 110 180 L 75 200 M 125 190 L 95 208 M 140 200 L 115 215' fill='none' stroke='#D4B106' stroke-width='1.2' stroke-opacity='0.45'/>");
+        sb.Append("<path d='M 270 180 L 305 200 M 255 190 L 285 208 M 240 200 L 265 215' fill='none' stroke='#D4B106' stroke-width='1.2' stroke-opacity='0.45'/>");
+
+        // 3. 2.5D 等轴测芯片底座侧边厚度 (立体封装厚度 14px)
+        // 左侧厚度面
+        sb.Append("<polygon points='80,135 190,195 190,209 80,149' fill='url(#chipSideL)'/>");
+        // 右侧厚度面
+        sb.Append("<polygon points='190,195 300,135 300,149 190,209' fill='url(#chipSideR)'/>");
+
+        // 4. 2.5D 等轴测芯片顶表面 (深灰高精密哑光陶瓷封装菱形)
+        sb.Append("<polygon points='190,75 300,135 190,195 80,135' fill='url(#chipTopGrad)' stroke='#3E4453' stroke-width='1.5'/>");
+
+        // 芯片表面内嵌金色防静电边框
+        sb.Append("<polygon points='190,83 290,135 190,187 90,135' fill='none' stroke='#D4B106' stroke-width='1.2' stroke-opacity='0.65'/>");
+
+        // 5. 芯片内部精密切割核心凹槽 (带微弱内发光)
+        sb.Append("<polygon points='190,95 265,135 190,175 115,135' fill='#15171D' stroke='#FFA940' stroke-width='1' stroke-opacity='0.4'/>");
+
+        // 6. 悬浮核心立体金盾 (高保真 2.5D 晶面切角黄金盾牌，中心立柱 (190, 130))
+        // 盾牌投影
+        sb.Append("<path d='M 190 102 L 222 116 C 222 152 190 174 190 174 C 190 174 158 152 158 116 Z' fill='#000000' fill-opacity='0.35'/>");
+        // 盾牌左半侧高光亮面
+        sb.Append("<path d='M 190 94 L 158 108 C 158 144 190 166 190 166 Z' fill='url(#goldShieldL)' stroke='#FFF1B8' stroke-width='1.2'/>");
+        // 盾牌右半侧背光暗面
+        sb.Append("<path d='M 190 94 L 222 108 C 222 144 190 166 190 166 Z' fill='url(#goldShieldR)' stroke='#FFE58F' stroke-width='1.2'/>");
+        // 盾牌中脊棱线高光与倒角高光折射
+        sb.Append("<polyline points='162,109 190,96 218,109' fill='none' stroke='#FFFFFF' stroke-width='1.5' stroke-linecap='round' stroke-opacity='0.9'/>");
+        sb.Append("<line x1='190' y1='96' x2='190' y2='166' stroke='#FFFBE6' stroke-width='1.2' stroke-opacity='0.85'/>");
+
+        // 7. 盾心纯净白金神火标识 (火绒 Security 核心图腾)
+        sb.Append("<path d='M 190 112 C 197 121 202 128 199 137 C 195 144 186 146 190 140 C 190 134 183 129 190 112 Z' fill='#FFFFFF' filter='drop-shadow(0 2px 4px rgba(212,107,8,0.4))'/>");
+        sb.Append("<path d='M 190 122 C 193 126 196 130 194 135 C 192 139 188 140 190 137 C 190 134 186 131 190 122 Z' fill='#FFE7BA'/>");
+
+        // 8. 芯片四角精致螺丝与镀金引脚焊盘微观细节
+        sb.Append("<circle cx='104' cy='135' r='2' fill='#D4B106' stroke='#876800' stroke-width='0.5'/>");
+        sb.Append("<circle cx='276' cy='135' r='2' fill='#D4B106' stroke='#876800' stroke-width='0.5'/>");
+        sb.Append("<circle cx='190' cy='89' r='2' fill='#D4B106' stroke='#876800' stroke-width='0.5'/>");
+        sb.Append("<circle cx='190' cy='181' r='2' fill='#D4B106' stroke='#876800' stroke-width='0.5'/>");
+
+        sb.Append("</svg>");
+        return sb.ToString();
+    }
+
+    // ================= 6. 查杀扫描盾牌雷达与进度条矢量图生成 =================
+    static string BuildScanShieldSvg(int tick, bool isCompleted) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 140 140' width='140' height='140'>");
+        if (!isCompleted) {
+            int[] scanDx = new int[] { 45, 43, 39, 32, 22, 12, 0, -12, -22, -32, -39, -43, -45, -43, -39, -32, -22, -12, 0, 12, 22, 32, 39, 43 };
+            int[] scanDy = new int[] { 0, 12, 22, 32, 39, 43, 45, 43, 39, 32, 22, 12, 0, -12, -22, -32, -39, -43, -45, -43, -39, -32, -22, -12 };
+            int step = tick % 24;
+            int sx = 70 + scanDx[step];
+            int sy = 70 + scanDy[step];
+            int pulse = 32 + (tick % 6);
+            string pulseOpacity = (tick % 2 == 0) ? "0.5" : "0.25";
+
+            // 外围雷达光环
+            sb.Append("<circle cx='70' cy='70' r='58' fill='none' stroke='#F58220' stroke-width='1.5' stroke-dasharray='4,3' stroke-opacity='0.4'/>");
+            sb.Append("<circle cx='70' cy='70' r='"); sb.Append(Convert.ToString(pulse)); sb.Append("' fill='none' stroke='#FFB066' stroke-width='2' stroke-opacity='"); sb.Append(pulseOpacity); sb.Append("'/>");
+            sb.Append("<line x1='70' y1='70' x2='"); sb.Append(Convert.ToString(sx)); sb.Append("' y2='"); sb.Append(Convert.ToString(sy)); sb.Append("' stroke='#F58220' stroke-width='2.5' stroke-opacity='0.85'/>");
+
+            // 中心金橙色火绒安全盾牌
+            sb.Append("<path d='M 70 34 L 102 48 C 102 88 70 106 70 106 C 70 106 38 88 38 48 Z' fill='#F58220' stroke='#FFE0B2' stroke-width='2'/>");
+            sb.Append("<path d='M 70 42 L 94 53 C 94 82 70 98 70 98 C 70 98 46 82 46 53 Z' fill='#FF9F43'/>");
+            sb.Append("<path d='M 70 50 C 76 58 82 64 78 74 C 75 82 66 84 70 78 C 70 72 64 68 70 50 Z' fill='#FFFFFF'/>");
+        } else {
+            // 完成状态：安全绿光圈 + 绿盾牌 + 醒目白色对勾
+            sb.Append("<circle cx='70' cy='70' r='60' fill='none' stroke='#00B578' stroke-width='2' stroke-opacity='0.3'/>");
+            sb.Append("<circle cx='70' cy='70' r='52' fill='#E6F9F2' stroke='#00B578' stroke-width='2'/>");
+            sb.Append("<path d='M 70 34 L 102 48 C 102 88 70 106 70 106 C 70 106 38 88 38 48 Z' fill='#00B578' stroke='#B7EB8F' stroke-width='2'/>");
+            sb.Append("<polyline points='55,70 66,81 87,58' fill='none' stroke='#FFFFFF' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/>");
+        }
+        sb.Append("</svg>");
+        return sb.ToString();
+    }
+
+    static string BuildScanProgressSvg(int percent) {
+        if (percent < 0) { percent = 0; }
+        if (percent > 100) { percent = 100; }
+        int w = 400 * percent / 100;
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 400 8' width='400' height='8'>");
+        sb.Append("<rect x='0' y='0' width='400' height='8' rx='4' fill='#EEF1F5'/>");
+        if (w > 0) {
+            sb.Append("<rect x='0' y='0' width='");
+            sb.Append(Convert.ToString(w));
+            sb.Append("' height='8' rx='4' fill='#F58220'/>");
+        }
+        sb.Append("</svg>");
+        return sb.ToString();
+    }
+
+    // ================= 7. 常用工具落区动态视觉反馈 (流动虚线、呼吸光晕与吸附高亮) =================
+    static string BuildDropzoneSvg(int tick, bool isDragging, bool isOver) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<svg width='120' height='72' viewBox='0 0 120 72' xmlns='http://www.w3.org/2000/svg'>");
+
+        if (!isDragging) {
+            // 常态：规整虚线边框与居中加号
+            sb.Append("<rect x='1.5' y='1.5' width='117' height='69' rx='6' fill='#FAFBFD' stroke='#D6DADE' stroke-width='1.5' stroke-dasharray='4,3' />");
+            sb.Append("<path d='M 60 22 L 60 32 M 55 27 L 65 27' stroke='#8A9099' stroke-width='1.8' stroke-linecap='round' />");
+            sb.Append("<text x='60' y='48' font-size='11' font-family='sans-serif' fill='#8A9099' text-anchor='middle'>拖拽到此</text>");
+        } else if (!isOver) {
+            // 拖拽进行中（流动跑马灯虚线 + 呼吸引导下落箭头）
+            int dashOffset = 0 - (tick * 2 % 14);
+            int arrowY = 17 + (tick % 4);
+
+            sb.Append("<rect x='1.5' y='1.5' width='117' height='69' rx='6' fill='#FFFDF8' stroke='#F58220' stroke-width='1.8' stroke-dasharray='6,4' stroke-dashoffset='");
+            sb.Append(Convert.ToString(dashOffset));
+            sb.Append("'/>");
+
+            // 动态跳动引导箭头
+            sb.Append("<path d='M 60 ");
+            sb.Append(Convert.ToString(arrowY));
+            sb.Append(" L 60 ");
+            sb.Append(Convert.ToString(arrowY + 9));
+            sb.Append(" M 56 ");
+            sb.Append(Convert.ToString(arrowY + 5));
+            sb.Append(" L 60 ");
+            sb.Append(Convert.ToString(arrowY + 9));
+            sb.Append(" L 64 ");
+            sb.Append(Convert.ToString(arrowY + 5));
+            sb.Append("' fill='none' stroke='#F58220' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' />");
+
+            sb.Append("<text x='60' y='46' font-size='11' font-weight='bold' font-family='sans-serif' fill='#F58220' text-anchor='middle'>拖拽到此处添加</text>");
+            sb.Append("<text x='60' y='59' font-size='9' font-family='sans-serif' fill='#B07030' text-anchor='middle'>加入常用工具栏</text>");
+        } else {
+            // 悬停命中落区：高亮吸附就绪状态！
+            sb.Append("<rect x='1.5' y='1.5' width='117' height='69' rx='6' fill='#FFF2E0' stroke='#F58220' stroke-width='2.5' />");
+
+            // 扩散脉冲外环
+            int ringR = 12 + (tick % 5);
+            sb.Append("<circle cx='60' cy='23' r='");
+            sb.Append(Convert.ToString(ringR));
+            sb.Append("' fill='#F58220' fill-opacity='0.25' />");
+
+            // 绿色对勾吸附徽章
+            sb.Append("<circle cx='60' cy='23' r='9' fill='#52C41A' />");
+            sb.Append("<path d='M 56 23 L 59 26 L 64 20' fill='none' stroke='#FFFFFF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' />");
+
+            sb.Append("<text x='60' y='46' font-size='12' font-weight='bold' font-family='sans-serif' fill='#D46B08' text-anchor='middle'>松开鼠标放入</text>");
+            sb.Append("<text x='60' y='59' font-size='9' font-weight='bold' font-family='sans-serif' fill='#52C41A' text-anchor='middle'>✔ 吸附就绪</text>");
+        }
+
+        sb.Append("</svg>");
+        return sb.ToString();
+    }
+
+    // ================= 8. 查杀扫描启动与交互链路 =================
+    static void StartScan(string targetPath, bool isDrop) {
+        isScanning = true;
+        isScanPaused = false;
+        scanPercent = 0;
+        scanCount = 18;
+        scanTick = 0;
+        scanStartMs = Stopwatch.GetMicroseconds() / 1000;
+        scanCurrentPath = targetPath;
+        isCustomScan = isDrop;
+
+        if (scanOverlay != null) { scanOverlay.visible = true; }
+        if (scanModalTitle != null) {
+            scanModalTitle.Text = (isDrop ? "火绒安全 · 自定义文件查杀" : "火绒安全 · 快速查杀");
+        }
+        if (scanHeadline != null) {
+            scanHeadline.SetText("正在进行病毒与恶意威胁查杀...");
+        }
+        if (scanTargetFile != null) {
+            scanTargetFile.SetText("正在检测: " + targetPath);
+        }
+        if (btnScanPause != null) {
+            btnScanPause.visible = true;
+            btnScanPause.Text = "暂停查杀";
+        }
+        if (btnScanStop != null) {
+            btnScanStop.Text = "停止查杀";
+        }
+        if (scanPercentText != null) { scanPercentText.Text = "0%"; }
+        if (scanMetricCount != null) { scanMetricCount.Text = "18"; }
+        if (scanMetricTime != null) { scanMetricTime.Text = "00:00"; }
+        if (scanMetricThreats != null) { scanMetricThreats.Text = "0"; }
+        if (imgScanProgress != null) {
+            imgScanProgress.Src.Set("data:image/svg+xml;utf8," + BuildScanProgressSvg(0));
+        }
+        if (imgScanShield != null) {
+            imgScanShield.Src.Set("data:image/svg+xml;utf8," + BuildScanShieldSvg(0, false));
+        }
+        if (__form != null) {
+            __form.GetApp().RequestRedraw();
+        }
+    }
+
+    static void OnScanModalClose() {
+        isScanning = false;
+        if (scanOverlay != null) { scanOverlay.visible = false; }
+        if (__form != null) { __form.GetApp().RequestRedraw(); }
+    }
+
+    static void OnScanStop() {
+        isScanning = false;
+        if (scanOverlay != null) { scanOverlay.visible = false; }
+        if (__form != null) { __form.GetApp().RequestRedraw(); }
+    }
+
+    static void OnScanPause() {
+        if (!isScanning) { return; }
+        isScanPaused = !isScanPaused;
+        if (btnScanPause != null) {
+            btnScanPause.Text = isScanPaused ? "继续查杀" : "暂停查杀";
+        }
+        if (scanHeadline != null) {
+            scanHeadline.SetText(isScanPaused ? "查杀已暂停" : "正在进行病毒与恶意威胁查杀...");
+        }
+        if (__form != null) { __form.GetApp().RequestRedraw(); }
+    }
+
+    // ================= 8. 动画节律与每帧驱动 (自主定时时钟 + 光标极速跟随) =================
+    // 8.1 40ms 自主定时时钟驱动动画推进（无需鼠标移动，由 form.Every + RequestAnimationFrame 调度）
+    static void OnTimerAnimation() {
+        if (__form == null) { return; }
+        App app = __form.GetApp();
+        if (app == null) { return; }
+
+        // 双保险自主唤醒：主动要求动画帧在 40ms 内唤醒，确保不依赖鼠标移动
+        app.RequestAnimationFrame(40);
+
+        long now = Stopwatch.GetMicroseconds() / 1000;
+
+        // 查杀扫描动态推进逻辑
+        if (isScanning) {
+            scanTick = scanTick + 1;
+            if (!isScanPaused && scanPercent < 100) {
+                scanPercent = scanPercent + 5;
+                if (scanPercent > 100) { scanPercent = 100; }
+                scanCount = scanCount + 142;
+
+                long elapsedSec = (now - scanStartMs) / 1000;
+                long sec = elapsedSec % 60;
+                long min = elapsedSec / 60;
+                string timeStr = (min < 10 ? "0" : "") + Convert.ToString(min) + ":" + (sec < 10 ? "0" : "") + Convert.ToString(sec);
+
+                if (imgScanProgress != null) {
+                    imgScanProgress.Src.Set("data:image/svg+xml;utf8," + BuildScanProgressSvg(scanPercent));
+                }
+                if (scanPercentText != null) {
+                    scanPercentText.Text = Convert.ToString(scanPercent) + "%";
+                }
+                if (scanMetricCount != null) {
+                    scanMetricCount.Text = Convert.ToString(scanCount);
+                }
+                if (scanMetricTime != null) {
+                    scanMetricTime.Text = timeStr;
+                }
+
+                if (scanPercent >= 100) {
+                    if (scanHeadline != null) { scanHeadline.SetText("查杀完成，未发现安全威胁"); }
+                    if (scanTargetFile != null) { scanTargetFile.SetText("已全面扫描完成 · 系统防护环境安全"); }
+                    if (btnScanStop != null) { btnScanStop.Text = "完成"; }
+                    if (btnScanPause != null) { btnScanPause.visible = false; }
+                    if (imgScanShield != null) {
+                        imgScanShield.Src.Set("data:image/svg+xml;utf8," + BuildScanShieldSvg(scanTick, true));
+                    }
+                } else {
+                    if (imgScanShield != null) {
+                        imgScanShield.Src.Set("data:image/svg+xml;utf8," + BuildScanShieldSvg(scanTick, false));
+                    }
+                }
+            }
+            app.RequestRedraw();
+            return;
+        }
+
+        // 首页芯片与环境光晕轻量脉冲推进 (无需多余跳动文本)
+        if (currentPageIndex == 0) {
+            animTick = (animTick + 1) % 16;
+            if (imgChip != null && animTick % 2 == 0) {
+                imgChip.Src.Set("data:image/svg+xml;utf8," + BuildChipSvg(animTick));
+            }
+            app.RequestRedraw();
+            return;
+        }
+
+        // 安全工具页：拖拽状态下落区流动跑马灯/呼吸光晕自主推进
+        if (currentPageIndex == 3 && imgDropzone != null) {
+            dragAnimTick = (dragAnimTick + 1) % 40;
+            bool isOver = false;
+            if (isDraggingTool && dropzoneBox != null) {
+                int mx = app.mouseX;
+                int my = app.mouseY;
+                if (mx >= dropzoneBox.bx && mx <= dropzoneBox.bx + dropzoneBox.bw &&
+                    my >= dropzoneBox.by && my <= dropzoneBox.by + dropzoneBox.bh) {
+                    isOver = true;
+                }
+            }
+            imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragAnimTick, isDraggingTool, isOver));
+            app.RequestRedraw();
+        }
+    }
+
+    // 8.2 每帧硬件输入钩子（光标极速跟随、外部文件拖拽监听与松手落区判定）
+    static void OnFrameAnimation() {
+        if (__form == null) { return; }
+        App app = __form.GetApp();
+        if (app == null) { return; }
+
+        // 持续预约下一帧唤醒，使事件循环即便在无输入状态下也能定时渲染
+        app.RequestAnimationFrame(40);
+
+        // 1. 全局监听外部拖入文件（支持任何页面将文件拖入火绒窗口触发查杀）
+        if (app.window != null) {
+            List<string> drops = app.window.TakeDroppedFiles();
+            if (drops != null && drops.Count > 0) {
+                string droppedFile = drops[0];
+                Console.WriteLine("[SecurityGuard] 捕获外部拖入文件/目录: " + droppedFile + "，正在启动专项查杀...");
+                StartScan(droppedFile, true);
+                return;
+            }
+        }
+
+        // 2. 常用工具拖拽手势判定与光标极速跟随
+        if (dragMouseDown && !isDraggingTool && pendingDragTool != null) {
+            if (!app.pointerDown || (app.window != null && app.window.EventKind() == 3)) {
+                // 未达到拖拽位移阈值就已松手，视为普通点击/取消
+                dragMouseDown = false;
+                pendingDragTool = null;
+            } else {
+                int dx = app.mouseX - dragStartX;
+                if (dx < 0) { dx = 0 - dx; }
+                int dy = app.mouseY - dragStartY;
+                if (dy < 0) { dy = 0 - dy; }
+                // 移动超过 4 个逻辑像素阈值，正式启动拖拽悬浮态
+                if (dx >= 4 || dy >= 4) {
+                    StartDragTool(pendingDragTool.id, pendingDragTool.name, pendingDragTool.icon);
+                    dragMouseDown = false;
+                }
+            }
+        }
+
+        if (isDraggingTool && dragAvatar != null) {
+            dragDurationFrames = dragDurationFrames + 1;
+            int mx = app.mouseX;
+            int my = app.mouseY;
+            int scale = app.dpiScale > 0 ? app.dpiScale : 100;
+            dragAvatar.logX = (mx + app.Scale(12)) * 100 / scale;
+            dragAvatar.logY = (my + app.Scale(12)) * 100 / scale;
+            dragAvatar.logPlaceSet = true;
+            dragAvatar.designFloat = true;
+            int curX = mx + app.Scale(12);
+            int curY = my + app.Scale(12);
+            int curW = app.Scale(130);
+            int curH = app.Scale(42);
+            dragAvatar.Arrange(curX, curY, curW, curH);
+
+            bool isOverDropzone = false;
+            int favCount = 0;
+            for (int i = 0; i < toolsList.Count; i = i + 1) {
+                if (toolsList[i].isFav) { favCount = favCount + 1; }
+            }
+            if (favCount < 6) {
+                if (dropzoneBox != null && dropzoneBox.visible) {
+                    if (mx >= dropzoneBox.bx && mx <= dropzoneBox.bx + dropzoneBox.bw &&
+                        my >= dropzoneBox.by && my <= dropzoneBox.by + dropzoneBox.bh) {
+                        isOverDropzone = true;
+                    }
+                }
+                if (!isOverDropzone && favToolsList != null) {
+                    if (mx >= favToolsList.bx && mx <= favToolsList.bx + favToolsList.bw &&
+                        my >= favToolsList.by && my <= favToolsList.by + favToolsList.bh) {
+                        isOverDropzone = true;
+                    }
+                }
+            }
+
+            if (isOverDropzone) {
+                dragAvatar.SetProp("class", "drag-avatar docking");
+            } else {
+                dragAvatar.SetProp("class", "drag-avatar");
+            }
+
+            if (imgDropzone != null) {
+                imgDropzone.Src.Set("data:image/svg+xml;utf8," + BuildDropzoneSvg(dragDurationFrames, true, isOverDropzone));
+            }
+
+            // 监听释放判定（松开鼠标释放）
+            bool shouldEndDrag = false;
+            if (!app.pointerDown || (app.window != null && app.window.EventKind() == 3)) {
+                shouldEndDrag = true;
+            }
+            if (shouldEndDrag) {
+                Console.WriteLine("[SecurityGuard] 拖拽释放: 落区检测 = " + (isOverDropzone ? "命中[常用工具]" : "未命中"));
+                EndDragTool(isOverDropzone);
+            }
+            app.RequestRedraw();
+        }
+    }
+
+    // ================= 9. 首页快速查杀与安全操作 =================
+    static void OnQuickScan() {
+        Console.WriteLine("[SecurityGuard] 触发快速查杀，正在扫描关键内存与系统文件...");
+        StartScan("系统核心内存区与开机启动项", false);
+    }
+
+    static void OnScanMenu() {
+        Console.WriteLine("[SecurityGuard] 打开查杀选项（全盘查杀、自定义查杀）");
+    }
+
+    static void OnActionUpdate() {
+        Console.WriteLine("[SecurityGuard] 检查更新：已是最新版本 (病毒库 2026-10-12 19:17)");
+    }
+
+    static void OnActionLog() {
+        Console.WriteLine("[SecurityGuard] 打开安全日志");
+    }
+
+    static void OnActionTrust() {
+        Console.WriteLine("[SecurityGuard] 打开信任区");
+    }
+
+    static void OnActionIso() {
+        Console.WriteLine("[SecurityGuard] 打开隔离区");
+    }
+}

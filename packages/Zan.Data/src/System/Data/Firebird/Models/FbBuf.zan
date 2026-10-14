@@ -1,0 +1,88 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Data.Firebird;
+
+// 协议类 XDR 帧格式的构建器：每个整数占 4 字节
+// 大端，每个变长块为长度后跟数据，并
+// 补齐到 4 字节边界。
+class FbBuf {
+    List<int> b;
+
+    // 分配 n 字节的零填充块（读侧解码复用）。
+    static byte[] Alloc(int n) { return new byte[n + 1]; }
+
+    // 私有构造；写入方法链式累积字节。
+    FbBuf() {
+        this.b = new List<int>();
+    }
+
+    // 当前字节数。
+    int Count() { return this.b.Count; }
+    // 下标 i 处的字节。
+    int At(int i) { return this.b[i]; }
+
+    // 追加单字节，返回自身以链式写入。
+    FbBuf U8(int v) {
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    // 4 字节大端整数。
+    FbBuf Int(int v) {
+        this.b.Add((v >> 24) & 255);
+        this.b.Add((v >> 16) & 255);
+        this.b.Add((v >> 8) & 255);
+        this.b.Add(v & 255);
+        return this;
+    }
+
+    // Zan 字符串的原始字节，至 NUL 终止符为止。
+    FbBuf Raw(string s) {
+        for (int i = 0; i < s.Length; i = i + 1) {
+            this.b.Add(s[i] & 255);
+        }
+        return this;
+    }
+
+    // 带长度块的原始字节。
+    FbBuf RawBlock(FbBytes src) {
+        for (int i = 0; i < src.Len(); i = i + 1) {
+            this.b.Add(src.At(i));
+        }
+        return this;
+    }
+
+    // 补零到 4 字节边界（块尾对齐是 XDR 帧格式的要求）。
+    void pad() {
+        while ((this.b.Count % 4) != 0) {
+            this.b.Add(0);
+        }
+    }
+
+    // 带长度前缀、4 字节对齐的块。
+    FbBuf Block(FbBytes src) {
+        Int(src.Len());
+        RawBlock(src);
+        pad();
+        return this;
+    }
+
+    // 带长度前缀、4 字节对齐的文本。
+    FbBuf Str(string s) {
+        Int(s.Length);
+        Raw(s);
+        pad();
+        return this;
+    }
+
+    // 将缓冲区物化为带长度的块。
+    FbBytes ToBytes() {
+        int n = this.b.Count;
+        byte[] t = new byte[n + 1];
+        for (int i = 0; i < n; i = i + 1) {
+            t[i] = (byte)(this.b[i] & 255);
+        }
+        return FbBytes.Own(t, n);
+    }
+}

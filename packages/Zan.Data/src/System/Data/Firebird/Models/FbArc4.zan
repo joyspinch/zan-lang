@@ -1,0 +1,50 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Data.Firebird;
+
+// ARC4 密钥流，即每个 Firebird 3+ 服务器自带的线路加密插件。
+// 按现代标准它很弱，但这是无 TLS 隧道时协议
+// 能提供的选择；注重安全的部署应把连接放进 TLS 隧道。
+// 发送与接收方向各需独立实例，因为
+// 密钥流是有状态的。
+class FbArc4 {
+    List<int> s;
+    int x;
+    int y;
+
+    // 由会话密钥构建（K = SHA1(S)，见 <see cref="FbSrp.Prove"/>）。
+    FbArc4(FbBytes key) {
+        List<int> s = new List<int>();
+        int i = 0;
+        for (; i < 256; i = i + 1) {
+            s.Add(i);
+        }
+        int j = 0;
+        i = 0;
+        while (i < 256) {
+            j = (j + s[i] + key.At(i % key.Len())) % 256;
+            int t = s[i];
+            s[i] = s[j];
+            s[j] = t;
+            i = i + 1;
+        }
+        this.s = s;
+        this.x = 0;
+        this.y = 0;
+    }
+
+    // 就地异或缓冲区中的 <paramref name="len"/> 字节；
+    // 加密与解密是同一操作。
+    void Translate(string buf, int off, int len) {
+        for (int i = 0; i < len; i = i + 1) {
+            this.x = (this.x + 1) % 256;
+            this.y = (this.y + this.s[this.x]) % 256;
+            int t = this.s[this.x];
+            this.s[this.x] = this.s[this.y];
+            this.s[this.y] = t;
+            int k = this.s[(this.s[this.x] + this.s[this.y]) % 256];
+            buf[off + i] = (buf[off + i] & 255) ^ k;
+        }
+    }
+}
