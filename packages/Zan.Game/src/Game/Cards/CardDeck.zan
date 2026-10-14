@@ -1,0 +1,103 @@
+using System;
+using Game.Foundation;
+
+namespace Game.Cards;
+
+// 三区牌堆运行时：管理抽牌堆、手牌、弃牌堆与消耗堆，抽空
+// 自动回收弃牌堆洗入抽牌堆。实例 id 从 1 递增分配；随机源
+// 由种子确定，可复现。
+class CardDeck {
+    CardZone draw;
+    CardZone hand;
+    CardZone discard;
+    CardZone exhaust;
+    DeterministicRandom random;
+    int nextInstanceId;
+
+    // 构造牌堆：seed 为随机源种子（同种子产生相同抽牌序列）；四个区域初始为空，下一个实例 id 为 1。
+    CardDeck(int seed) {
+        this.draw = new CardZone("draw");
+        this.hand = new CardZone("hand");
+        this.discard = new CardZone("discard");
+        this.exhaust = new CardZone("exhaust");
+        this.random = new DeterministicRandom(seed);
+        this.nextInstanceId = 1;
+    }
+
+    // 向抽牌堆添加一张卡并返回其实例：definition 为 null 返回 null 不产生实例；实例 id 自动递增分配。
+    CardInstance Add(CardDefinition definition) {
+        if (definition == null) { return null; }
+        CardInstance card =
+            new CardInstance(this.nextInstanceId, definition);
+        this.nextInstanceId = this.nextInstanceId + 1;
+        this.draw.Add(card);
+        return card;
+    }
+
+    // 洗牌抽牌堆：使用牌堆自带的确定性随机源；在抽牌前调用一次以保证可复现。
+    void ShuffleDraw() { this.draw.Shuffle(this.random); }
+
+    // 回收弃牌堆：把弃牌堆全部卡移回抽牌堆并重新洗牌。
+    void RecycleDiscard() {
+        while (this.discard.Count() > 0) {
+            this.draw.Add(this.discard.TakeLast());
+        }
+        this.ShuffleDraw();
+    }
+
+    // 抽一张牌到手牌：抽牌堆为空时先回收弃牌堆；仍无牌可抽返回 null（不消耗堆中其他状态）。
+    CardInstance DrawOne() {
+        if (this.draw.Count() == 0) { this.RecycleDiscard(); }
+        if (this.draw.Count() == 0) { return null; }
+        CardInstance card = this.draw.TakeLast();
+        this.hand.Add(card);
+        return card;
+    }
+
+    // 连续抽牌：在牌源耗尽时提前停止；返回实际抽到的张数（可小于 amount，包括 0；负数按 0 张处理）。
+    int Draw(int amount) {
+        int drawn = 0;
+        for (int i = 0; i < amount; i = i + 1) {
+            if (this.DrawOne() == null) { return drawn; }
+            drawn = drawn + 1;
+        }
+        return drawn;
+    }
+
+    // 弃掉手牌指定索引的牌：成功返回该卡并移入弃牌堆；索引越界返回 null。
+    CardInstance DiscardFromHand(int index) {
+        CardInstance card = this.hand.TakeAt(index);
+        if (card != null) { this.discard.Add(card); }
+        return card;
+    }
+
+    // 消耗掉手牌指定索引的牌：成功返回该卡并移入消耗堆（本局不再循环）；索引越界返回 null。
+    CardInstance ExhaustFromHand(int index) {
+        CardInstance card = this.hand.TakeAt(index);
+        if (card != null) { this.exhaust.Add(card); }
+        return card;
+    }
+
+    // 弃掉整手牌：Retained 为 true 的保留卡留在手中，其余按顺序移入弃牌堆。
+    void DiscardHand() {
+        int i = this.hand.Count() - 1;
+        while (i >= 0) {
+            CardInstance card = this.hand.At(i);
+            if (!card.Retained()) {
+                this.discard.Add(this.hand.TakeAt(i));
+            }
+            i = i - 1;
+        }
+    }
+
+    // 抽牌堆（直接访问可查看/清点，勿绕过 Draw 增删以免破坏流程）。
+    CardZone DrawPile() { return this.draw; }
+    // 手牌区域。
+    CardZone Hand() { return this.hand; }
+    // 弃牌堆。
+    CardZone DiscardPile() { return this.discard; }
+    // 消耗堆（被消耗的卡本局不再进入循环）。
+    CardZone ExhaustPile() { return this.exhaust; }
+    // 随机源当前状态，可用于存档/恢复随机序列。
+    int RandomState() { return this.random.State(); }
+}

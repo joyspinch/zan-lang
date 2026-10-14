@@ -1,0 +1,224 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Web;
+using Gui;
+
+namespace Game.Scene;
+
+// 单个放置的元素。位置/尺寸以*设计*像素编写。anchorX /
+// anchorY 为千分比（0..1000）。x/y 是相对锚点的偏移，因此
+// 锚定左上角的血条在任何分辨率下都保持角偏移，
+// 而居中的准星（锚点 500/500，x=0，y=0）始终居中。
+// 单个放置的元素。位置/尺寸以设计像素编写；anchorX/anchorY
+// 为千分比（0..1000），x/y 是相对锚点的偏移，因此锚定左上角
+// 的血条在任何分辨率下都保持角偏移，而居中的准星（锚点
+// 500/500，x=0，y=0）始终居中。
+// // 种类 kind 为设计器与运行时渲染器可识别的名字：控件有
+// minimap/slider/scrollbar/combobox/input/listbox，绘制组件有
+// text/arttext/sprite/rect/circle/anim；旧种类（"bar"、"panel"）
+// 仍可解析。格子类元素可组成网格组：rows x cols 个 w x h 单元，
+// 间距为 (gapX, gapY)。
+class SceneElement {
+    string kind;
+    string ename;
+    int x;
+    int y;
+    int w;
+    int h;
+    int anchorX;      // 千分比 0..1000
+    int anchorY;      // 千分比 0..1000
+    int z;            // 绘制顺序（小的先）
+    string image;     // 精灵/按钮/面板的资源 id / 路径
+    string text;      // 标签/按钮/条的标题文本
+    int cr;
+    int cg;
+    int cb;
+    int ca;
+    bool visible;
+    int rows;         // 网格组行数（>=1）；1x1 = 单个元素
+    int cols;         // 网格组列数（>=1）
+    int gapX;         // 网格单元之间的水平间距（设计像素）
+    int gapY;         // 网格单元之间的垂直间距（设计像素）
+    int val;          // 进度条/滑块/滚动条 0..100，复选框 0/1
+    string items;     // 下拉框/列表框/选项卡框的 ';' 分隔条目
+    bool locked;      // 仅设计器使用：元素不可移动/缩放
+    // 归属层名（"" = 基础层）。同一层的元素作为一个浮层整体
+    // 显隐（弹窗/菜单页/对话框），运行时按激活层集合过滤渲染。
+    string layer;
+    string cssClass;     // CSS 样式类名（如 "game-btn gold-border inventory-slot"）
+    int position;        // 定位模式：0 = flow (Flex弹性流式), 1 = float (脱离文档流浮动/锚定定位)
+    int flexGrow;        // 弹性权重（0 = 不伸展，>0 弹性分配）
+    // 强类型声明式事件动作实体列表
+    List<SceneActionBinding> actionList;
+    // 声明式事件绑定字典（on* 键，如 "onClick"），供序列化与事件派发使用
+    JsonValue actions;
+    // 设计器未建模的键（未来版本/手写设计稿的额外声明）。
+    // 往返时原样写回，使旧运行时打开新设计稿不丢数据——
+    // 与 Gui.Designer 的 FormField.extra 同一策略。
+    JsonValue extra;
+
+    SceneElement(string kind, string name) {
+        this.kind = kind;
+        this.ename = name;
+        this.x = 0; this.y = 0; this.w = 0; this.h = 0;
+        this.anchorX = 0; this.anchorY = 0;
+        this.z = 0;
+        this.image = "";
+        this.text = "";
+        this.cr = 255; this.cg = 255; this.cb = 255; this.ca = 255;
+        this.visible = true;
+        this.rows = 1; this.cols = 1;
+        this.gapX = 0; this.gapY = 0;
+        this.val = 0;
+        this.items = "";
+        this.locked = false;
+        this.layer = "";
+        this.cssClass = "";
+        this.position = 1; // 默认 float 浮动/锚定定位
+        this.flexGrow = 0;
+        this.actionList = new List<SceneActionBinding>();
+        this.actions = null;
+    }
+
+    // 设置设计空间位置（x/y 为相对锚点的偏移），返回自身以链式调用。
+    SceneElement At(int x, int y) { this.x = x; this.y = y; return this; }
+    // 设置单个单元的设计像素尺寸，返回自身以链式调用。
+    SceneElement Size(int w, int h) { this.w = w; this.h = h; return this; }
+    // 设置九宫格锚点（ax/ay 千分比 0..1000），返回自身以链式调用。
+    SceneElement AnchorTo(int ax, int ay) { this.anchorX = ax; this.anchorY = ay; return this; }
+    // 设置绘制顺序 z（小者先画），返回自身以链式调用。
+    SceneElement Order(int z) { this.z = z; return this; }
+    // 设置精灵/按钮/面板的资源 id 或路径，返回自身以链式调用。
+    SceneElement Image(string img) { this.image = img; return this; }
+    // 设置标签/按钮等的标题文本，返回自身以链式调用。
+    SceneElement Caption(string t) { this.text = t; return this; }
+    // 设置着色 RGBA（各分量 0..255），作用于填充与精灵染色，返回自身以链式调用。
+    SceneElement Tint(int r, int g, int b, int a) {
+        this.cr = r; this.cg = g; this.cb = b; this.ca = a; return this;
+    }
+    // 设置可见性（false 的元素不渲染也不参与命中），返回自身以链式调用。
+    SceneElement SetVisible(bool v) { this.visible = v; return this; }
+    // 设置网格组行列数与单元间距（设计像素）；rows/cols 小于 1 时钳制为 1，返回自身以链式调用。
+    SceneElement Grid(int rows, int cols, int gapX, int gapY) {
+        this.rows = rows; this.cols = cols;
+        this.gapX = gapX; this.gapY = gapY;
+        if (this.rows < 1) { this.rows = 1; }
+        if (this.cols < 1) { this.cols = 1; }
+        return this;
+    }
+    // 设置值：进度条/滑块/滚动条为 0..100，复选框为 0/1，返回自身以链式调用。
+    SceneElement SetValue(int v) { this.val = v; return this; }
+    // 设置下拉框/列表框/选项卡的 ';' 分隔条目串，返回自身以链式调用。
+    SceneElement SetItems(string s) { this.items = s; return this; }
+    // 设置设计器锁定标记（锁定后不可拖动/缩放），返回自身以链式调用。
+    SceneElement SetLocked(bool v) { this.locked = v; return this; }
+    // 设置归属层名（"" = 基础层），返回自身以链式调用。
+    SceneElement SetLayer(string layer) { this.layer = layer; return this; }
+    // 设置 CSS 类名（皮肤与样式美化），返回自身以链式调用。
+    SceneElement SetCssClass(string cls) { this.cssClass = cls; return this; }
+    // 设置定位模式（0 = flow Flex弹性流式, 1 = float 浮动/锚定定位），返回自身以链式调用。
+    SceneElement SetPosition(int pos) { this.position = pos; return this; }
+    // 设置弹性权重（0 = 不伸展），返回自身以链式调用。
+    SceneElement SetFlexGrow(int g) { this.flexGrow = g; return this; }
+
+    // 绑定一个 on* 动作串（如 On("onClick", "ShowLayer:bag")）。
+    // 同时记录强类型 SceneActionBinding 实体与 JsonValue 兼容通道。
+    // 空值清除该事件的绑定。
+    SceneElement On(string evt, string actions) {
+        if (this.actionList == null) { this.actionList = new List<SceneActionBinding>(); }
+        // 清理同名旧事件
+        int i = 0;
+        while (i < this.actionList.Count) {
+            if (this.actionList[i].event == evt) {
+                this.actionList.RemoveAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        if (actions != null && actions.Length > 0) {
+            this.actionList.Add(new SceneActionBinding(evt, actions));
+        }
+
+        if (this.actions == null) { this.actions = JsonValue.NewObject(); }
+        this.actions.Set(evt, JsonValue.NewStr(actions == null ? "" : actions));
+        return this;
+    }
+
+    // 绑定到 `evt` 的动作串（优先从强类型 actionList 实体列表读取）。
+    string OnAction(string evt) {
+        if (this.actionList != null) {
+            for (int i = 0; i < this.actionList.Count; i = i + 1) {
+                if (this.actionList[i].event == evt) {
+                    return this.actionList[i].action;
+                }
+            }
+        }
+        if (this.actions == null) { return ""; }
+        JsonValue v = this.actions.Get(evt);
+        if (v == null || !v.IsString()) { return ""; }
+        return v.AsString("");
+    }
+
+    // 元素种类名（如 "label"、"sprite"），与文档里的 kind 字段一致。
+    string Kind() { return this.kind; }
+    // 元素名（文档内唯一；重名会导致编译期投影生成重复字段）。
+    string Name() { return this.ename; }
+    // 相对锚点的水平偏移（设计像素）。
+    int X() { return this.x; }
+    // 相对锚点的垂直偏移（设计像素）。
+    int Y() { return this.y; }
+    // 单个单元宽（设计像素；总占地见 TotalW）。
+    int W() { return this.w; }
+    // 单个单元高（设计像素；总占地见 TotalH）。
+    int H() { return this.h; }
+    // 水平锚点千分比（0..1000）。
+    int AnchorX() { return this.anchorX; }
+    // 垂直锚点千分比（0..1000）。
+    int AnchorY() { return this.anchorY; }
+    // 绘制顺序（小者先画）。
+    int Z() { return this.z; }
+    // 精灵/按钮/面板的资源 id 或路径（"" = 无）。
+    string ImageId() { return this.image; }
+    // 标签/按钮等的标题文本。
+    string Text() { return this.text; }
+    // 着色红分量（0..255）。
+    int R() { return this.cr; }
+    // 着色绿分量（0..255）。
+    int G() { return this.cg; }
+    // 着色蓝分量（0..255）。
+    int B() { return this.cb; }
+    // 着色 alpha 分量（0..255；设计器的幽灵元素也用它近似半透明）。
+    int A() { return this.ca; }
+    // 是否可见（false 不渲染且不参与命中）。
+    bool Visible() { return this.visible; }
+    // 网格组行数（>=1；1 = 单行）。
+    int Rows() { return this.rows; }
+    // 网格组列数（>=1；1 = 单列）。
+    int Cols() { return this.cols; }
+    // 网格单元水平间距（设计像素）。
+    int GapX() { return this.gapX; }
+    // 网格单元垂直间距（设计像素）。
+    int GapY() { return this.gapY; }
+    // 值：进度条/滑块/滚动条 0..100，复选框 0/1。
+    int Value() { return this.val; }
+    // 下拉框/列表框/选项卡的 ';' 分隔条目串。
+    string Items() { return this.items; }
+    // 设计器锁定标记（锁定后不可拖动/缩放）。
+    bool Locked() { return this.locked; }
+    // 归属层名（"" = 基础层；命名层需被打开才渲染/命中）。
+    string Layer() { return this.layer; }
+    // CSS 样式类名。
+    string CssClass() { return this.cssClass; }
+    // 定位模式：0 = flow (Flex弹性流式), 1 = float (浮动/锚定定位)。
+    int Position() { return this.position; }
+    // 弹性权重。
+    int FlexGrow() { return this.flexGrow; }
+    // 是否为网格组（rows 或 cols 大于 1）。
+    bool IsGrid() { return this.rows > 1 || this.cols > 1; }
+
+    // 网格组总占地宽（设计像素）：cols 个单元加列间间距；单个元素等于 w。
+    int TotalW() { return this.cols * this.w + (this.cols - 1) * this.gapX; }
+    // 网格组总占地高（设计像素）：rows 个单元加行间间距；单个元素等于 h。
+    int TotalH() { return this.rows * this.h + (this.rows - 1) * this.gapY; }
+}
