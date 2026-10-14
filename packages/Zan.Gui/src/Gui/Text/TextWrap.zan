@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Backend;
+
+namespace Gui;
+
+class TextWrap {
+    // 去除首尾的 ASCII 空白（空格、制表符、CR、LF）。
+    static string Trim(string s) {
+        int len = s.Length;
+        int a = 0;
+        for (; a < len; a = a + 1) {
+            int b = s[a];
+            if (b != 32 && b != 9 && b != 13 && b != 10) { break; }
+        }
+        int z = len;
+        while (z > a) {
+            int b = s[z - 1];
+            if (b != 32 && b != 9 && b != 13 && b != 10) { break; }
+            z = z - 1;
+        }
+        if (a == 0 && z == len) { return s; }
+        return s.Substring(a, z - a);
+    }
+
+    // 换行并记录每行在原文里的起始字节偏移（`Lines` 的带账版本）。
+    // 换行规则与 `Lines` 逐字一致（调用方按行绘制时两者结果必须同一
+    // 份）；差别只在这里把每行的起点也留下来。硬换行（字节 10）不计
+    // 入行文本，因此下一行的起点要跳过它——偏移口径与 `Lines` 拼回
+    // 原文时丢掉的正是那一个换行符，两处一致才对得上。
+    static WrappedText LinesAt(string s, int maxW, int fs) {
+        // `out` 是语言关键字（out 参数），局部变量不能叫它。
+        WrappedText acc = new WrappedText();
+        if (maxW <= 0) { maxW = 1; }
+        int len = s.Length;
+        int i = 0;
+        while (i < len) {
+            if (s[i] == 10) {
+                acc.Add("", i);
+                i = i + 1;
+                continue;
+            }
+            int w = 0;
+            int k = i;
+            int lastSpace = -1;
+            int end = i;
+            while (k < len && s[k] != 10) {
+                int kk = Text.NextCharEnd(s, k);
+                int cw = Canvas.MeasureText(s.Substring(k, kk - k), fs);
+                if (w + cw > maxW && end > i) { break; }
+                w = w + cw;
+                end = kk;
+                if (s[k] == 32) { lastSpace = kk; }
+                k = kk;
+            }
+            int take = end;
+            if (k < len && s[k] != 10 && lastSpace > i) { take = lastSpace; }
+            if (take <= i) { take = Text.NextCharEnd(s, i); }
+            acc.Add(s.Substring(i, take - i), i);
+            i = take;
+            if (i < len && s[i] == 10) { i = i + 1; }
+        }
+        if (acc.lines.Count == 0) {
+            acc.Add("", 0);
+            return acc;
+        }
+        return acc;
+    }
+
+    // 将 `s` 拆成行，每行在 `fs` 磅下都能放进 `maxW` 像素，
+    // 尽可能在空格处换行，否则在任意字符处换行（因此无空格的 CJK
+    // 文本也能换行）。硬换行（字节 10）始终断行。
+    // 至少返回一行；结尾换行不会增加空行。
+    static List<string> Lines(string s, int maxW, int fs) {
+        List<string> lines = new List<string>();
+        if (maxW <= 0) { maxW = 1; }
+        int len = s.Length;
+        int i = 0;
+        while (i < len) {
+            if (s[i] == 10) { lines.Add(""); i = i + 1; continue; }
+            int w = 0;
+            int k = i;
+            int lastSpace = -1;
+            int end = i;
+            while (k < len && s[k] != 10) {
+                int kk = Text.NextCharEnd(s, k);
+                int cw = Canvas.MeasureText(s.Substring(k, kk - k), fs);
+                if (w + cw > maxW && end > i) { break; }
+                w = w + cw;
+                end = kk;
+                if (s[k] == 32) { lastSpace = kk; }
+                k = kk;
+            }
+            int take = end;
+            // 超宽但行内更早有空格断点时：回退到那里，
+            // 让完整单词保持在一起（跳过前导空格）。
+            if (k < len && s[k] != 10 && lastSpace > i) { take = lastSpace; }
+            if (take <= i) { take = Text.NextCharEnd(s, i); }
+            lines.Add(s.Substring(i, take - i));
+            i = take;
+            if (i < len && s[i] == 10) { i = i + 1; }
+        }
+        if (lines.Count == 0) { lines.Add(""); }
+        return lines;
+    }
+
+    // 按 '\n' 把字符串拆分为行（去除 '\r'）。至少返回一行。
+    static List<string> SplitLines(string s) {
+        return s.Replace("\r", "").Split("\n");
+    }
+
+    // 把像素 x 偏移（相对文本原点）映射为列索引：
+    // 即测量前缀宽度达到 `px` 的第一个字符边界。
+    // 前缀宽度随边界单调递增，因此对边界二分查找只需
+    // O(log n) 次 MeasureText 调用，而非每字符一次。
+    // 这两个原语住在这里而不是 CodeEditor：Input/TextArea
+    // 的鼠标定位只依赖文本布局，不必拖入整个代码编辑器。
+    static int ColFromX(string s, int px, int fontSize) {
+        if (px <= 0) { return 0; }
+        List<int> ends = new List<int>();
+        int p = Text.NextCharEnd(s, 0);
+        while (p <= s.Length) {
+            ends.Add(p);
+            if (p >= s.Length) { break; }
+            p = Text.NextCharEnd(s, p);
+        }
+        int lo = 0;
+        int hi = ends.Count - 1;
+        int ansIdx = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int w = Canvas.MeasureText(Text.Left(s, ends[mid]), fontSize);
+            if (w >= px) { ansIdx = mid; hi = mid - 1; }
+            else { lo = mid + 1; }
+        }
+        if (ansIdx < 0) { return s.Length; }
+        return ends[ansIdx];
+    }
+}
