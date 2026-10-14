@@ -34,6 +34,7 @@ function Invoke-GameTests {
     $cases = Get-ChildItem -Path $TestRoot -Filter "game_*.zan" |
         Sort-Object Name
     $passed = 0
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     foreach ($case in $cases) {
         $base = [IO.Path]::GetFileNameWithoutExtension($case.Name)
         $exe = Join-Path $Root ("build\direct_" + $base + ".exe")
