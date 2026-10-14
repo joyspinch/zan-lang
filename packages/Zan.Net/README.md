@@ -7,7 +7,7 @@ package source roots automatically.
 
 ## Contents (namespace → what lives there)
 
-- `System.Net` — root types: `Net.zan` (DNS/endpoint helpers), `NetworkInterface`,
+- `System.Net` — root types: `IPAddress.zan` (DNS/endpoint helpers), `NetworkInterface`,
   `Ping`, `ServerBanner`, the `Worker`/`WorkerMqtt`/`WorkerSse`/`WorkerWs`
   background-worker family
 - `System.Net.Sockets` — `TcpClient`, `TcpListener`, `UdpClient`

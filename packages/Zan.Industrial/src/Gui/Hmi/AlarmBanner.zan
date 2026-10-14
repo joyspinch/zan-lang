@@ -1,0 +1,122 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+// 报警横幅（alarm banner）：窗口顶部/底部的一条，显示最新未确认
+// 报警并带"确认"按钮，未确认时按优先级闪烁。
+class AlarmBanner : Control {
+    // 数据源（可与 AlarmList 共享同一份报警）。
+    AlarmBuffer buffer;
+    // 整条命中 id。
+    int wid;
+    // 确认按钮命中 id。
+    int ackId;
+    // 报警被确认时触发。
+    UiEvent Ack;
+
+    // 自带缓冲区（设计器 / 表单编译路径用），之后可用 Bind()
+    // 换成与报警列表共享的同一个缓冲区。
+    AlarmBanner() : this(new AlarmBuffer()) { }
+
+    // 换绑缓冲区（与 AlarmList 共享同一份报警）。
+    void Bind(AlarmBuffer buf) { buffer = buf; }
+
+    // 当前绑定的缓冲区。
+    AlarmBuffer Buffer() { return buffer; }
+
+    // 共享缓冲区构造。
+    AlarmBanner(AlarmBuffer buf) {
+        this.InitControl("alarmBanner", 1);
+        buffer = buf;
+        wid = WidgetId.Next();
+        ackId = WidgetId.Next();
+        wiresOwnEvents = true;
+        Ack = new UiEvent();
+        prefH = 0;
+    }
+
+    // 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "AlarmBanner"; }
+
+    // 覆写：无设计器属性（内容由数据源驱动）。
+    override List<PropSpec> Props() {
+        return new List<PropSpec>();
+    }
+
+    // 覆写：公共事件之外提供 "Ack"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Ack");
+        return e;
+    }
+
+    // 覆写："Ack" 挂 Ack 事件，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Ack") { Ack.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // 首选高度 = 主题的 medium 行高。
+    override void OnMeasure(App app) {
+        prefH = app.theme.heightMedium;
+        prefW = 0;
+    }
+
+    // 覆写：画最新未确认报警文本与"确认"按钮，未确认时按优先级周期闪烁。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "medium");
+        AlarmItem a = buffer.Newest();
+        if (a == null) {
+            c.FillRect(bx, by, bw, bh, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0));
+            c.DrawText(bx + app.Scale(10),
+                       by + bh / 2 - Canvas.FontHeight(fs) / 2,
+                       "无未确认报警", Style.Part(app, "hmi", "hint", "", "", "", Style.SNormal()).FgOr(0), fs);
+            return;
+        }
+        int col = AlarmItem.ColorOf(app, a.Priority());
+        // 未确认报警闪烁：故障级 400ms，其它 800ms。
+        int period = 800;
+        if (a.Priority() >= 2) { period = 400; }
+        int bg = col;
+        if ((app.nowMs / period) % 2 == 1) { bg = App.Darken(col, 35); }
+        // 只在下一个闪烁边界要一帧，且只声明横幅自己的像素。原来的
+        // RequestRedraw() 既不限速（画面每 period 才变一次，事件循环
+        // 却按最高帧率忙转），也不声明范围（整页跟着一起重新混合）。
+        int rem = period - (app.nowMs % period);
+        if (rem < 1) { rem = 1; }
+        app.RequestAnimationFrameIn(rem, bx, by, bw, bh);
+        c.FillRect(bx, by, bw, bh, bg);
+        string txt = a.Stamp() + "  " + AlarmItem.LevelOf(a.Priority())
+                     + "  " + a.Point() + "  " + a.Message();
+        c.DrawText(bx + app.Scale(10), by + bh / 2 - Canvas.FontHeight(fs) / 2,
+                   txt, Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), fs);
+
+        int n = buffer.UnackedCount();
+        string btn = "确认 (" + Convert.ToString(n) + ")";
+        int fsS = Style.FontFallback(app, "small");
+        int bwid = Canvas.MeasureText(btn, fsS) + app.Scale(20);
+        int bxx = bx + bw - bwid - app.Scale(8);
+        int byy = by + (bh - t.heightSmall) / 2;
+        int hv = Ui.HoverLevelMsIn(app, ackId, 0, bxx, byy, bwid, t.heightSmall);
+        c.FillRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
+                        App.Lighten(bg, 20 + hv / 20));
+        c.DrawRoundRect(bxx, byy, bwid, t.heightSmall, t.borderRadiusSmall,
+                        Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), 1);
+        c.DrawTextCentered(bxx, byy, bwid, t.heightSmall, btn,
+                           Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).FgOr(0), fsS);
+        app.hitTester.RegisterRect(ackId, bxx, byy, bwid,
+                                            t.heightSmall, 0);
+        if (Ui.Clicked(app, ackId)) {
+            buffer.AckAll();
+            Ack.RaiseS(this);
+            app.RequestRedraw();
+        }
+        app.hitTester.RegisterRect(wid, bx, by, bw, bh, 0);
+        On.Fire(app, wid, this);
+    }
+}

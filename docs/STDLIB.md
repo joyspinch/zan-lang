@@ -130,7 +130,7 @@ stdlib/
 │   │   └── Encoding.zan             # UTF-8/16/32 encoding
 │   │
 │   ├── Net/                         # System.Net
-│   │   ├── Net.zan / NetworkInterface.zan / ServerBanner.zan
+│   │   ├── IPAddress.zan / NetworkInterface.zan / ServerBanner.zan
 │   │   ├── Ping.zan                 # ICMP ping
 │   │   ├── Worker.zan               # background worker helpers
 │   │   ├── Http/                    # Client/ (HttpClient, CookieJar, SseSink),
@@ -140,7 +140,7 @@ stdlib/
 │   │   ├── Sockets/                 # Socket, TcpClient, TcpListener,
 │   │   │                            # UdpClient, AsyncSocket
 │   │   ├── Tls/                     # TlsStream.zan (+ drivers/)
-│   │   ├── WebSocket/               # WebSocket.zan (+ Secure/)
+│   │   ├── WebSocket/               # WebSocketClient.zan (+ Secure/)
 │   │   ├── Sse/                     # server-sent events
 │   │   ├── Mqtt/                    # MqttClient, MqttBroker
 │   │   ├── Coap/                    # CoapClient

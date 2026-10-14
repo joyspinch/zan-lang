@@ -1,0 +1,121 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+// 数显表（digital readout）：大字号数值 + 单位 + 标题，超限时
+// 数值转报警色。这是上位机画面上用得最多的一个件。
+class Digital : Control {
+    string caption;
+    IoTag tag;
+    // 无位号时的自持值（原始计数）与刻度。
+    SignalInt raw;
+    // 每工程单位的计数（显示值 = raw / scale，<1 按 1）。
+    int scale;
+    // 工程单位后缀；空串不画。
+    string unit;
+
+    // 初始化：标题 + 数据源（位号或独立信号）+ 缩放与单位。
+    void InitDigital(string text, IoTag t, SignalInt v, int sc, string u) {
+        this.InitControl("digital", 0);
+        caption = text;
+        tag = t;
+        raw = v;
+        scale = sc;
+        if (scale < 1) { scale = 1; }
+        unit = u;
+    }
+
+    // 标题 + 绑定位号（缩放与单位取自位号）。
+    Digital(string text, IoTag t) {
+        InitDigital(text, t, t.Value(), t.Scale(), t.Unit());
+    }
+
+    // 标题 + 独立信号 + 缩放与单位。
+    Digital(string text, SignalInt v, int sc, string u) {
+        InitDigital(text, null, v, sc, u);
+    }
+
+    // 标题 + 内部自持信号（初始 0，缩放 1，无单位）。
+    Digital(string text) {
+        InitDigital(text, null, new SignalInt(0), 1, "");
+    }
+
+    Digital() {
+        InitDigital("", null, new SignalInt(0), 1, "");
+    }
+
+    // 底层信号（换绑位号请用 <c>Bind</c>）。
+    SignalInt Value() { return raw; }
+    // 换绑位号（同步缩放与单位）。
+    void Bind(IoTag t) {
+        tag = t;
+        raw = t.Value();
+        scale = t.Scale();
+        unit = t.Unit();
+    }
+
+    // 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "Digital"; }
+
+    // 覆写：返回设计器属性清单（标题 / 单位 / 缩放 / 数值信号）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        PropSpec cap = PropSpec.Text("label", "Caption");
+        cap.str = caption;
+        ps.Add(cap);
+        PropSpec un = PropSpec.Text("unit", "Unit");
+        un.str = unit;
+        ps.Add(un);
+        PropSpec sc = PropSpec.Int("scale", "Scale");
+        sc.num = scale;
+        ps.Add(sc);
+        PropSpec v = PropSpec.Int("value", "Value");
+        v.snum = raw;
+        ps.Add(v);
+        return ps;
+    }
+
+    // 覆写：固定首选尺寸 150 x 72（逻辑 px）。
+    override void OnMeasure(App app) {
+        prefW = app.Scale(150);
+        prefH = app.Scale(72);
+    }
+
+    // 覆写：画数显面板、标题与工程量值；超限转报警色，坏质量显示 "----"。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int rad = t.borderRadiusMedium;
+        c.FillRoundRect(bx, by, bw, bh, rad, App.Darken(Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0), 25));
+        c.DrawRoundRect(bx, by, bw, bh, rad, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+        int pad = app.Scale(8);
+        int fsCap = Style.FontFallback(app, "small");
+        if (caption != "") {
+            c.DrawText(bx + pad, by + pad, caption, Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fsCap);
+        }
+        int alarm = 0;
+        bool good = true;
+        if (tag != null) {
+            alarm = tag.Alarm();
+            good = tag.IsGood();
+        }
+        int col = Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0);
+        if (alarm == 1) { col = Style.Part(app, "hmi", "status", "", "", "", Style.SNormal()).BgOr(0); }
+        if (alarm == 2) { col = Style.Part(app, "hmi", "status", "", "error", "", Style.SNormal()).BgOr(0); }
+        if (!good) { col = Style.Part(app, "hmi", "status", "", "off", "", Style.SNormal()).FgOr(0); }
+        string txt = IoTag.Format(raw.Get(), scale);
+        if (!good) { txt = "----"; }
+        int fsVal = Style.FontFallback(app, "huge");
+        int vy = by + bh - pad - Canvas.FontHeight(fsVal);
+        c.DrawText(bx + pad, vy, txt, col, fsVal);
+        if (unit != "") {
+            int vw = Canvas.MeasureText(txt, fsVal);
+            c.DrawText(bx + pad + vw + app.Scale(6),
+                       vy + Canvas.FontHeight(fsVal) - Canvas.FontHeight(fsCap)
+                           - app.Scale(2),
+                       unit, Style.Part(app, "hmi", "hint", "", "", "", Style.SNormal()).FgOr(0), fsCap);
+        }
+    }
+}

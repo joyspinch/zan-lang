@@ -10,7 +10,7 @@
 | `Markdown.zan` | Markdown → HTML 渲染 |
 | `Pinyin.zan` | 汉字转拼音（`data/pinyin.txt` 数据表） |
 | `Bm25Index.zan` | BM25 全文检索 |
-| `FuzzyMatching.zan` | 模糊匹配 |
+| `Fuzzy.zan` | 模糊匹配 |
 | `Template.zan` | 文本模板（占位符展开） |
 | `TextTable.zan` | 等宽文本表格 |
 | `RegularExpressions/` | 正则引擎（Regex/Match/RegexProgram，`System.Text.RegularExpressions`） |

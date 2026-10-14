@@ -1,0 +1,136 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Hmi;
+
+// 报警列表（alarm list）：时间 / 级别 / 位号 / 描述 / 状态五列，
+// 未确认行以优先级色底显示，点击行选中。
+class AlarmList : Control {
+    // 数据源（可与 AlarmBanner 共享同一份报警）。
+    AlarmBuffer buffer;
+    // 整条命中 id（On.Fire 用）。
+    int wid;
+    // 行命中区的连续 id 块（缓冲上限即最大行数）。
+    int rowBaseId;
+    // 当前选中行下标（-1 = 无）。
+    int selected;
+    // 选中行变化时触发。
+    UiEvent RowClick;
+
+    // 自带缓冲区（设计器 / 表单编译路径用）。
+    AlarmList() : this(new AlarmBuffer()) { }
+
+    // 换绑缓冲区（与 AlarmBanner 共享同一份报警）。
+    void Bind(AlarmBuffer buf) { buffer = buf; }
+
+    // 当前绑定的缓冲区。
+    AlarmBuffer Buffer() { return buffer; }
+
+    // 共享缓冲区构造。
+    AlarmList(AlarmBuffer buf) {
+        this.InitControl("alarmList", 5);
+        buffer = buf;
+        wid = WidgetId.Next();
+        rowBaseId = WidgetId.Block(256);
+        selected = -1;
+        wiresOwnEvents = true;
+        RowClick = new UiEvent();
+    }
+
+    // 当前选中行下标（-1 = 无选中）。
+    int Selected() { return selected; }
+    // 选中的报警记录；无选中或下标越界返回 null。
+    AlarmItem SelectedItem() {
+        if (selected < 0 || selected >= buffer.Count()) { return null; }
+        return buffer.At(selected);
+    }
+
+    // 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "AlarmList"; }
+
+    // 覆写：无设计器属性（内容由数据源驱动）。
+    override List<PropSpec> Props() {
+        return new List<PropSpec>();
+    }
+
+    // 覆写：公共事件之外提供 "RowClick"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("RowClick");
+        return e;
+    }
+
+    // 覆写："RowClick" 挂 RowClick 事件，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "RowClick") { RowClick.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // 覆写：固定首选尺寸 480 x 200（逻辑 px）。
+    override void OnMeasure(App app) {
+        prefW = app.Scale(480);
+        prefH = app.Scale(200);
+    }
+
+    // 覆写：画表头与五列报警行（最新在最上），点击行选中并触发 RowClick。
+    override void OnPaint(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "small");
+        int rowH = t.heightSmall;
+        c.FillRect(bx, by, bw, bh, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawRect(bx, by, bw, bh, Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BorderOr(0), 1);
+
+        int c0 = bx + app.Scale(8);
+        int c1 = c0 + app.Scale(76);
+        int c2 = c1 + app.Scale(60);
+        int c3 = c2 + app.Scale(110);
+        int c4 = bx + bw - app.Scale(70);
+        c.FillRect(bx, by, bw, rowH, Style.Part(app, "hmi", "track", "", "", "", Style.SNormal()).BgOr(0));
+        c.DrawText(c0, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "时间",
+                   Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+        c.DrawText(c1, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "级别",
+                   Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+        c.DrawText(c2, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "位号",
+                   Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+        c.DrawText(c3, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "描述",
+                   Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+        c.DrawText(c4, by + rowH / 2 - Canvas.FontHeight(fs) / 2, "状态",
+                   Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+
+        c.PushClip(bx, by + rowH, bw, bh - rowH);
+        int y = by + rowH;
+        // 最新的排在最上面：现场值班看的是刚发生的那条。
+        for (int k = buffer.Count() - 1; k >= 0; k = k - 1) {
+            if (y >= by + bh) { break; }
+            AlarmItem a = buffer.At(k);
+            int col = AlarmItem.ColorOf(app, a.Priority());
+            int bg = Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0);
+            if (!a.IsAcked()) { bg = App.LerpColor(Style.Part(app, "hmi", "panel", "", "", "", Style.SNormal()).BgOr(0), col, 28); }
+            if (k == selected) { bg = App.LerpColor(bg, Style.Part(app, "hmi", "accent", "", "", "", Style.SNormal()).BgOr(0), 22); }
+            c.FillRect(bx, y, bw, rowH, bg);
+            c.DrawLine(bx, y + rowH - 1, bx + bw, y + rowH - 1, Style.Part(app, "hmi", "grid", "", "", "", Style.SNormal()).BgOr(0), 1);
+            int ty = y + rowH / 2 - Canvas.FontHeight(fs) / 2;
+            c.DrawText(c0, ty, a.Stamp(), Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            c.DrawText(c1, ty, AlarmItem.LevelOf(a.Priority()), col, fs);
+            c.DrawText(c2, ty, a.Point(), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
+            c.DrawText(c3, ty, a.Message(), Style.Part(app, "hmi", "value", "", "", "", Style.SNormal()).FgOr(0), fs);
+            string st = "已复归";
+            if (a.IsActive()) { st = "活动"; }
+            if (!a.IsAcked()) { st = st + "*"; }
+            c.DrawText(c4, ty, st, Style.Part(app, "hmi", "label", "", "", "", Style.SNormal()).FgOr(0), fs);
+            int rowId = rowBaseId + (k % 256);
+            app.hitTester.RegisterRect(rowId, bx, y, bw, rowH, 0);
+            if (Ui.Clicked(app, rowId)) {
+                selected = k;
+                RowClick.RaiseS(this);
+                app.RequestRedraw();
+            }
+            y = y + rowH;
+        }
+        c.PopClip();
+        On.Fire(app, wid, this);
+    }
+}
