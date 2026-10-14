@@ -1,0 +1,375 @@
+using System;
+using Gui;
+using Gui.Backend;
+
+namespace Gui.Widget;
+
+// 浮动层的保留状态，支撑两种形态：
+// kind 0 —— 可拖动的“页面”窗口（layui `layer` 的 page/iframe 风格）：
+// 持有几何信息、拖动状态及最小化/最大化/还原。
+// kind 1 —— 居中的模态对话框（alert / confirm），变暗的背景遮罩，
+// 图标 + 标题 + 正文 + 操作行。
+// kind 2 —— 居中的提示对话框：类似 confirm 再加一个文本输入框。
+// state：0 正常，1 最大化，2 最小化（仅窗口）。
+class LayerState {
+    public string title;
+    public string body;
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    // 保存的正常几何信息，从最大化/最小化还原时回到这里。
+    public int sx;
+    public int sy;
+    public int sw;
+    public int sh;
+    public int state;
+    public bool open;
+    public bool dragging;
+    public int grabDx;
+    public int grabDy;
+    public int barId;
+    public int closeId;
+    public int maxId;
+    public int minId;
+    // 是否绘制底部操作行（OK / Cancel）。
+    public bool footer;
+    // 最近一次底部操作：0 无，1 确定，2 取消，3 关闭(X)。
+    public int action;
+    // --- 统一 layer 扩展 ---
+    public int kind;  // 0 窗口，1 对话框，2 提示框
+    public bool modal;  // 绘制变暗的背景遮罩并让层居中
+    public int dtype;  // 对话框图标：0 信息，1 成功，2 警告，3 错误
+    public bool twoButtons;  // confirm/prompt（OK+Cancel）对比 alert（仅 OK）
+    public string okText;
+    public string cancelText;
+    // 可选的第三种退路（“Don't save”），绘制在 Cancel 左侧，
+    // 报告为 action 4。常规双按钮对话框传 ""。
+    public string altText;
+    // 保留的操作按钮 + 关闭图标 id。Layer 每帧渲染这些按钮，
+    // 但绝不能重建：重建的 Button 每帧都会拿到全新的 WidgetId，
+    // 因此对照上一帧命中区解析出的点击目标
+    // 永远不会匹配新 id，按钮看起来就像失效了（保留式宿主如
+    // IDE 不会调用 WidgetId.ResetFrame）。在 Create() 中只创建一次。
+    public Button okBtn;
+    public Button cancelBtn;
+    public Button altBtn;
+    public Input promptInput;  // kind 2 的文本输入框（其他情况为 null）
+    public int openMs;  // layer 打开时的墙钟毫秒数（入场动画用）
+    // 最小化任务条槽位（左下角横排第几个），由 RenderStack 每帧
+    // 按堆叠顺序指派；单独 Render 的窗口保持 0。
+    public int minSlot;
+    // page 层的嵌入式正文控件树（layui page 层放任意 HTML 的等价物）：
+    // 宿主构造一棵保留的组件树（表单/面板等）挂进来，每帧渲染在
+    // 正文区。构造必须包在 Layer.BeginBody()/EndBody() 里领保留段 id。
+    public Control view;
+    // 点遮罩关闭（模态对话框）：按下与抬起都落在遮罩、且不在对话框
+    // 矩形内时报告 action 2，由调用方关闭。
+    public bool shadeClose;
+    // prompt 形态：0 文本，1 密码（Input.password），2 多行（TextArea）。
+    public int promptFormType;
+    // >0 时输入的 UTF-8 字节上限（Input 内部按字节计游标）。
+    public int promptMaxLen;
+    public TextArea promptArea;  // formType 2 的多行输入框（此时 promptInput 为 null）
+    // ---- 窗口缩放（左/右/下缘 + 左下/右下角） ----
+    public bool sizing;
+    public int rDir;  // 1 左缘，2 右缘，3 下缘，4 右下角，5 左下角
+    public int rStartX;
+    public int rStartY;
+    public int rStartW;
+    public int rStartH;
+    public int rsLId;
+    public int rsRId;
+    public int rsBId;
+    public int rsSEId;
+    public int rsSWId;
+    // ---- 生命周期回调（layui success/end 的等价物） ----
+    // Opened：入场动画走完（或无动画时首帧渲染）触发一次。
+    // Closed：层关闭后的第一次渲染沿（或 Layer.Close 立即）触发
+    // 一次——直接置 open=false 的宿主只要照常渲染该层就会收到。
+    public UiEvent Opened;
+    public UiEvent Closed;
+    // 渲染沿检测用：Open 时置位，Closed 触发时清掉（重开重新武装）。
+    public bool wasOpen;
+    public bool openedRaised;
+    // >0 时打开这么多毫秒后自动关闭（layui 的 time），经 Layer.Close
+    // 走统一路径（同样触发 Closed）。
+    public int AutoCloseMs;
+    // ---- 出场动画（layui isOutAnim:true 的等价物） ----
+    // Close 时层不立即消失：open 立即为 false（宿主状态机、Esc 往返
+    // 立刻稳定，Closed 也在关闭沿照旧触发），但层进入 closing 态在
+    // 屏幕上再停留出场时长，由渲染沿推 exitP 淡出并加速上滑，走完
+    // 自动摘除。
+    public bool closing;
+    public int closeMs;
+    // 关闭沿是否已触发 Closed（Layer.Close 就地触发；宿主直接翻
+    // open=false 的由渲染沿的关闭沿补触发——只触发一次）。
+    public bool closedRaised;
+    // SizeToContent 打开的窗口保持画布居中（layui offset:'auto'）：
+    // 深链/点击回调可能在画布定型前创建窗口，出生时算好的居中会随
+    // 画布尺寸变化失效；渲染沿按当前画布重新居中，用户拖动/缩放/
+    // 最大化一次后让位（此后是用户自己的摆放）。
+    public bool autoCenter;
+    // SizeToContent 的原始参数（逻辑 px，渲染沿按当前 DPI 现算设备
+    // 值）：深链在画布/DPI 定型前就可能建窗（此时 dpiScale 还是
+    // 100），出生时量出的几何是错的，真正的定宽高在渲染沿重算。
+    public int sizeMinW;
+    public int sizeMaxH;
+    // 超高时包住 view 的滚动列（SizeToContent 现算时才可能建立）；
+    // 渲染与命中都走 wrap，view 始终是宿主 SetBody 的原树。
+    public Control wrap;
+
+    // Layer 专用保留 id 段的游标（seq 域，id = 1000000 + 段内序号）。
+    static int winSeq;
+
+    LayerState(string title, int x, int y, int w, int h) {
+        // 窗口在点击回调里中途创建，而即时模式宿主每帧 ResetFrame
+        // 会把计数器回卷重发：从这里直接领号，领走的正是宿主随后
+        // 每帧控件的本命 id（gallery 里 barId 恰好等于下一帧 Photos
+        // 按钮的 id——点窗口标题栏会触发 Photos，点关闭触发别的
+        // 演示控件，即“信号污染”）。与 ChildWindow / FilePicker /
+        // Designer 一样改钉专属高位段，与宿主计数器互不相扰。
+        // 930000 与 Designer(840000/860000)、FilePicker/ChildWindow
+        // (900000) 错开；步长 16 远超本构造器 + 子控件的一次用量。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
+        this.title = title;
+        this.body = "";
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+        this.sx = x;
+        this.sy = y;
+        this.sw = w;
+        this.sh = h;
+        this.state = 0;
+        this.open = false;
+        this.dragging = false;
+        this.grabDx = 0;
+        this.grabDy = 0;
+        this.barId = WidgetId.Next();
+        this.closeId = WidgetId.Next();
+        this.maxId = WidgetId.Next();
+        this.minId = WidgetId.Next();
+        this.footer = true;
+        this.action = 0;
+        this.kind = 0;
+        this.modal = false;
+        this.dtype = 0;
+        this.twoButtons = true;
+        this.okText = "OK";
+        this.cancelText = "Cancel";
+        this.altText = "";
+        this.okBtn = new Button { Class = "primary" };
+        this.cancelBtn = new Button { };
+        this.altBtn = new Button { };
+        this.promptInput = null;
+        this.promptArea = null;
+        this.view = null;
+        this.shadeClose = false;
+        this.promptFormType = 0;
+        this.promptMaxLen = 0;
+        this.sizing = false;
+        this.rDir = 0;
+        this.rStartX = 0;
+        this.rStartY = 0;
+        this.rStartW = 0;
+        this.rStartH = 0;
+        // 缩放把手也领保留段 id（渲染时每帧注册，id 必须跨帧稳定）。
+        this.rsLId = WidgetId.Next();
+        this.rsRId = WidgetId.Next();
+        this.rsBId = WidgetId.Next();
+        this.rsSEId = WidgetId.Next();
+        this.rsSWId = WidgetId.Next();
+        this.Opened = new UiEvent();
+        this.Closed = new UiEvent();
+        this.wasOpen = false;
+        this.openedRaised = false;
+        this.AutoCloseMs = 0;
+        this.closing = false;
+        this.closeMs = 0;
+        this.closedRaised = false;
+        this.autoCenter = false;
+        this.sizeMinW = 0;
+        this.sizeMaxH = 0;
+        this.wrap = null;
+        WidgetId.SetSeq(outer);
+    }
+
+    // 居中的模态确认对话框（OK + Cancel）。dtype 决定图标。
+    static LayerState Confirm(string title, string body, int dtype) {
+        LayerState s = new LayerState(title, 0, 0, 420, 200);
+        s.body = body;
+        s.kind = 1;
+        s.modal = true;
+        s.dtype = dtype;
+        s.twoButtons = true;
+        return s;
+    }
+
+    // 居中的模态对话框，提供三种出路——“保存它，
+    // 丢弃它，还是保持原状”，这是关闭编辑器时必须问的问题。
+    // 主操作报告 1，取消（及 X）报告 2 / 3，备选操作报告 4。
+    static LayerState Choose(string title, string body, int dtype, string okText,
+                             string altText, string cancelText) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.okText = okText;
+        s.altText = altText;
+        s.cancelText = cancelText;
+        return s;
+    }
+
+    // 居中的模态 alert 对话框（仅一个 OK 按钮）。
+    static LayerState Alert(string title, string body, int dtype) {
+        LayerState s = LayerState.Confirm(title, body, dtype);
+        s.twoButtons = false;
+        return s;
+    }
+
+    // 带文本输入框的居中模态 prompt 对话框（OK + Cancel）。
+    static LayerState Prompt(string title, string hint) {
+        return LayerState.PromptWith(title, hint, 0, "", 0);
+    }
+
+    // 强化版 prompt：formType 0 文本 / 1 密码 / 2 多行，value 为
+    // 初值（"" 表示空），maxLen > 0 时限制输入的 UTF-8 字节长度。
+    static LayerState PromptWith(string title, string hint, int formType,
+                                 string value, int maxLen) {
+        LayerState s = new LayerState(title, 0, 0, 420,
+                                      formType == 2 ? 340 : 220);
+        s.kind = 2;
+        s.modal = true;
+        s.dtype = 0;
+        s.twoButtons = true;
+        s.promptFormType = formType;
+        s.promptMaxLen = maxLen;
+        // promptInput 在构造器之外创建，同样领保留段 id（理由见构造器）。
+        int outer = WidgetId.SeqValue();
+        WidgetId.SetSeq(930000 + LayerState.winSeq);
+        LayerState.winSeq = LayerState.winSeq + 16;
+        if (formType == 2) {
+            s.promptArea = new TextArea(hint);
+            if (value != "") { s.promptArea.SetText(value); }
+        } else {
+            s.promptInput = new Input(hint);
+            if (value != "") { s.promptInput.SetText(value); }
+            if (formType == 1) { s.promptInput.password = true; }
+            if (maxLen > 0) { s.promptInput.MaxLen = maxLen; }
+        }
+        WidgetId.SetSeq(outer);
+        return s;
+    }
+
+    // page 层宿主控件：把一棵保留的组件树挂进窗口正文
+    // （layui page 层放任意 HTML 的等价物——表单、面板等组合）。
+    // 构造这棵树时必须包在 Layer.BeginBody()/EndBody() 里，否则
+    // 控件在点击回调里中途领宿主计数器的 id，会重演“信号污染”。
+    void SetBody(Control v) {
+        view = v;
+    }
+
+    // layui `area:'auto'` + `offset:'auto'` 的组件层等价物：按正文
+    // 控件树的自然测量尺寸定窗宽高（minW 兜底窄表单），在画布上
+    // 居中；正文自然高度超过可用正文高度时自动包一层 ScrollColumn，
+    // 超出部分交给滚动条。SetBody 之后、Open 之前调用一次；
+    // maxH > 0 时额外压低正文高度上限（弹窗不顶满视口）。
+    // 参数是逻辑 px（内部按 DPI 换算）。深链可能在画布/DPI 定型前
+    // 建窗，这里只记参数；真正的量测与定几何在渲染沿
+    // ApplySizeToContent 现算（此时画布、DPI、主题都已是真值）。
+    void SizeToContent(App app, int minW, int maxH) {
+        sizeMinW = minW;
+        sizeMaxH = maxH;
+        this.ApplySizeToContent(app);
+    }
+
+    // SizeToContent 的现算体（LayerState 成员）：量正文树 → 定窗
+    // 宽高 → 居中。窗口渲染沿也会调用它（画布定型/重算窗口尺寸），
+    // 保证深链建窗与 DPI 切换后几何都正确。
+    void ApplySizeToContent(App app) {
+        if (view == null) { return; }
+        view.MeasureTree(app);
+        int contentW = view.prefW;
+        int contentH = view.prefH;
+        int aw = app.canvas.Width();
+        int ah = app.canvas.Height();
+        int bar = Layer.BarH(app);
+        int footH = 0;
+        if (footer) { footH = Layer.FooterH(app); }
+        // 与 RenderLayerBody 的正文几何同一套衬距：左右 20、顶 16、
+        // 底 8；正文文本占一行时控件树整体下移 28。
+        int padT = app.Scale(16);
+        int padB = app.Scale(8);
+        int padX = app.Scale(40);
+        int textH = 0;
+        if (body != "") { textH = app.Scale(28); }
+        int availBody = ah - app.titlebarH - app.Scale(32)
+            - bar - padT - padB - textH - footH;
+        if (availBody < app.Scale(60)) { availBody = app.Scale(60); }
+        int maxH = sizeMaxH;
+        if (maxH > 0) { maxH = app.Scale(maxH); }
+        if (maxH > 0 && availBody > maxH) { availBody = maxH; }
+        bool scrolling = contentH > availBody
+            && view.Kind() != "ScrollColumn";
+        if (scrolling) {
+            ScrollColumn sc = new ScrollColumn();
+            sc.With(view);
+            wrap = sc;
+        } else {
+            wrap = null;
+        }
+        int w = contentW + padX;
+        int minW = sizeMinW;
+        if (minW > 0) { minW = app.Scale(minW); }
+        if (w < minW) { w = minW; }
+        if (w > aw - app.Scale(32)) { w = aw - app.Scale(32); }
+        int bodyH = contentH;
+        if (scrolling) { bodyH = availBody; }
+        int h = bar + padT + textH + bodyH + padB + footH;
+        if (h > ah - app.titlebarH - app.Scale(16)) {
+            h = ah - app.titlebarH - app.Scale(16);
+        }
+        int wx = (aw - w) / 2;
+        int wy = (ah - h) / 2;
+        if (wy < app.titlebarH) { wy = app.titlebarH; }
+        if (wy + h > ah) { wy = ah - h; }
+        this.w = w;
+        this.h = h;
+        this.x = wx;
+        this.y = wy;
+        // 居中后的几何同时作为最大化/最小化还原的基准。
+        sx = x;
+        sy = y;
+        sw = w;
+        sh = h;
+        // 打开期间跟随画布重新居中，画布定型后窗口不偏在角落。
+        autoCenter = true;
+    }
+
+    void Open() {
+        open = true;
+        action = 0;
+        openMs = Window.GetTickMs();
+        // 重新武装生命周期回调：Opened 等入场走完再触发一次，
+        // Closed 在下一次关闭沿触发。打断未走完的出场动画。
+        wasOpen = true;
+        openedRaised = false;
+        closedRaised = false;
+        closing = false;
+        closeMs = 0;
+        if (state == 2) { state = 0; }
+        // 进打开注册表（按打开顺序，末尾最上）——键盘语义
+        // （Esc/Enter）与 CloseLast/CloseAll 依赖这份次序。
+        Layer.EnsureZorder();
+        Layer.zorder.Remove(this);
+        Layer.zorder.Add(this);
+    }
+
+    // 用户在 prompt layer 中键入的文字（未输入时为空）。
+    string PromptText() {
+        if (promptArea != null) { return promptArea.GetText(); }
+        if (promptInput == null) { return ""; }
+        return promptInput.GetText();
+    }
+}

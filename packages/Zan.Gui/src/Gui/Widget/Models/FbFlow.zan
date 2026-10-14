@@ -1,0 +1,136 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+// 24 列流式容器（设计器/运行时/FormBuilder 共用的唯一布局原语）。
+// 把子节点按各自 span（1..24）贪心打包成多行：一行累计 span 超过 24
+// 就换行；每个单元宽度按 span/24 比例分配（与设计器 LayoutFlowList
+// 完全一致：按 24 列而非行内总和分配，列间留 colGap，行间留 rowGap），
+// 行高取该行子节点 prefH 的最大值。无表面。
+class FbFlow : Panel {
+    // 与 children 平行的列宽表（span 1..24）。
+    public List<int> spans;
+    // 逻辑像素（100% 下的样子）。
+    public int colGap;
+    public int rowGap;
+    // 单元最小宽度（逻辑像素，过窄时兜底）。
+    public int minCell;
+    // OnMeasure 按当前缩放解析出的实际间距，供拿不到 App 的
+    // Arrange 复用 —— 直接用逻辑值排布，150% 下列间距会偏窄、
+    // 行距不足，字段互相贴住。
+    public int mColGap;
+    public int mRowGap;
+    public int mMinCell;
+
+    // 构造：列距 12 / 行距 6 / 最小单元 24（逻辑像素）。
+    FbFlow() {
+        this.InitPanel("fbflow", 3);
+        this.spans = new List<int>();
+        this.colGap = 12;
+        this.rowGap = 6;
+        this.minCell = 24;
+        this.mColGap = 12;
+        this.mRowGap = 6;
+        this.mMinCell = 24;
+    }
+
+    // 追加一个单元及其列宽（span，1..24）。
+    void AddCell(Control c, int span) {
+        this.spans.Add(span);
+        this.Add(c);
+    }
+
+    // 第 i 单元的列宽（钳制 1..24；越界按 24）。
+    int SpanAt(int i) {
+        if (i < this.spans.Count) {
+            int s = this.spans[i];
+            if (s < 1) { return 1; }
+            if (s > 24) { return 24; }
+            return s;
+        }
+        return 24;
+    }
+
+    // 行结束下标（不含）：从 start 起贪心累计到超过 24 列。
+    int RowEnd(int start) {
+        int n = this.children.Count;
+        int end = start;
+        int cols = 0;
+        while (end < n) {
+            int sp = this.SpanAt(end);
+            if (end > start && cols + sp > 24) { break; }
+            cols = cols + sp;
+            end = end + 1;
+            if (cols >= 24) { break; }
+        }
+        return end;
+    }
+
+    // [start,end) 行高 = 行内子节点 prefH 的最大值。
+    int RowHeight(int start, int end) {
+        int rowH = 0;
+        for (int k = start; k < end; k = k + 1) {
+            int hk = this.children[k].prefH;
+            if (hk > rowH) { rowH = hk; }
+        }
+        return rowH;
+    }
+
+    // 覆写：不画任何表面（画布容器，视觉全由子控件承担）。
+    override void OnPaint(App app) {
+    }
+
+    // 覆写：按 24 栅格分行的行高累计出首选高（宽随宿主）。
+    override void OnMeasure(App app) {
+        this.mColGap = app.Scale(this.colGap);
+        this.mRowGap = app.Scale(this.rowGap);
+        this.mMinCell = app.Scale(this.minCell);
+        int n = this.children.Count;
+        int i = 0;
+        int total = 0;
+        int rows = 0;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            total = total + this.RowHeight(i, end);
+            rows = rows + 1;
+            i = end;
+        }
+        if (rows > 1) { total = total + this.mRowGap * (rows - 1); }
+        this.prefH = total;
+        this.prefW = 0;
+    }
+
+    // 覆写：按每项 span 把 24 栅格宽折算成单元格矩形逐行摆放。
+    override void Arrange(int px, int py, int pw, int ph) {
+        if (pw < 0) { pw = 0; }
+        if (ph < 0) { ph = 0; }
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        int cx = px + this.StylePadL();
+        int cy = py + this.StylePadT();
+        int cw = pw - this.StylePadL() - this.StylePadR();
+        if (cw < 0) { cw = 0; }
+        int n = this.children.Count;
+        int i = 0;
+        int rowY = cy;
+        while (i < n) {
+            int end = this.RowEnd(i);
+            int rowH = this.RowHeight(i, end);
+            int acc = 0;
+            for (int k = i; k < end; k = k + 1) {
+                int xa = cx + cw * acc / 24;
+                acc = acc + this.SpanAt(k);
+                int xb = cx + cw * acc / 24;
+                int wCell = xb - xa;
+                if (k < end - 1) { wCell = wCell - this.mColGap; }
+                if (wCell < this.mMinCell) { wCell = this.mMinCell; }
+                this.children[k].Arrange(xa, rowY, wCell, rowH);
+            }
+            rowY = rowY + rowH + this.mRowGap;
+            i = end;
+        }
+    }
+}

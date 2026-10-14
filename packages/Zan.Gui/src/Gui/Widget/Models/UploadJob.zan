@@ -1,0 +1,201 @@
+using System;
+using System.IO;
+using System.Net.External;
+using System.Threading;
+using Gui;
+using Gui.Component;
+
+namespace Gui.Widget;
+
+// 一项内置 HTTP 上传的工作对象：绑定到具体项（实例方法组），
+// 在后台线程跑 HttpClient.UploadFileBytesAsync，进度/完成经
+// App.Post 封送回 UI 线程。
+// 这里走「静态队列 + 单 worker」范式：Enqueue 在空闲时拉起
+// UploadJob.Run，Run 取一项 await 一项，队列排空即退，下次
+// 入队再拉起。线程入口用静态方法组是风格选择，不是语言限制
+// ——实例方法组与捕获 lambda 自 2026-09 起都能直接交给
+// Thread.Start（见 docs/ABI.md §3.6）；而作业状态本就要传实例，
+// 走队列 + 静态字段比每条作业连宿主一起捕获更清楚
+// （ImageHttp、DataTable.Export 同此形状）。
+class UploadJob {
+    // 任务队列互斥锁句柄（懒建）。
+    static nint lockHandle;
+    // 待处理作业队列（锁保护）。
+    static List<UploadJob> pending;
+    // 后台 worker 是否存活（队列排空即退出并复位）。
+    static bool workerStarted;
+
+    // 作业归属的宿主组件（进度/完成封送目标）。
+    public Upload host;
+    // 传输的文件项与它的 id（封送后按 id 反查，列表可能已变）。
+    public UploadFile item;
+    public int itemId;
+    // 作业创建时从 Upload 快照的统一外部调用策略。
+    public ExternalCallPolicy callPolicy;
+    // 目标连接参数（Init 从 Action URL 解析；无端口时按 scheme 补 80/443）。
+    public bool tls;
+    public string hostName;
+    public int port;
+    public string urlPart;
+    // multipart 表单字段名。
+    public string field;
+    // 上次封送的进度百分比（去重用）；-1 = 尚未报过。
+    public int lastPct;
+    // 完成结果快照（ReportDone 写入，UI 线程 FlushDone 消费）：
+    // HTTP 状态码、响应体、错误信息，donePosted 防重复封送。
+    public int doneCode;
+    public string doneBody;
+    public string doneErr;
+    public bool donePosted;
+
+    // UI 线程：入队并（worker 空闲时）拉起后台线程。
+    // 线程起不来时返回 false（任务已从队列摘除），调用方负责失败该项。
+    static bool Enqueue(UploadJob job) {
+        if (lockHandle == 0) {
+            lockHandle = Mutex.Create();
+            pending = new List<UploadJob>();
+        }
+        Mutex.Lock(lockHandle);
+        pending.Add(job);
+        bool needWorker = !workerStarted;
+        workerStarted = true;
+        Mutex.Unlock(lockHandle);
+        if (needWorker && !Thread.Start(UploadJob.Run)) {
+            Mutex.Lock(lockHandle);
+            int i = 0;
+            while (i < pending.Count) {
+                if (pending[i].itemId == job.itemId) { pending.RemoveAt(i); }
+                else { i = i + 1; }
+            }
+            workerStarted = false;
+            Mutex.Unlock(lockHandle);
+            return false;
+        }
+        return true;
+    }
+
+    // 后台线程入口（静态方法组）：逐条取任务直到队列清空，
+    // 然后退出（下一次入队会重新拉起）。await 让出期间
+    // IO 反应器推进传输——与 ImageHttp.WorkerLoop 同构。
+    static void Run() {
+        Socket.Initialize();
+        while (true) {
+            UploadJob job = UploadJob.Take();
+            if (job == null) {
+                Mutex.Lock(lockHandle);
+                if (pending.Count == 0) {
+                    workerStarted = false;
+                    Mutex.Unlock(lockHandle);
+                    return;
+                }
+                Mutex.Unlock(lockHandle);
+                continue;
+            }
+            await job.Execute();
+        }
+    }
+
+    // 取队首任务；null = 队列已空。
+    static UploadJob Take() {
+        UploadJob job = null;
+        Mutex.Lock(lockHandle);
+        if (pending.Count > 0) {
+            job = pending[0];
+            pending.RemoveAt(0);
+        }
+        Mutex.Unlock(lockHandle);
+        return job;
+    }
+
+    // 解析 Action URL（scheme/host[:port]/path）并绑定任务。
+    // policy 在此处快照，之后修改 Upload 不影响已排队的作业。
+    void Init(Upload h, UploadFile f, string url, string fieldName,
+              ExternalCallPolicy policy) {
+        host = h;
+        item = f;
+        itemId = f.id;
+        callPolicy = policy;
+        field = fieldName;
+        lastPct = 0 - 1;
+        doneCode = 0;
+        doneBody = "";
+        doneErr = "";
+        donePosted = false;
+        string rest = url;
+        tls = false;
+        if (rest.StartsWith("https://")) {
+            tls = true;
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+        }
+        string authority = rest;
+        string pathPart = "/";
+        int i = 0;
+        while (i < rest.Length) {
+            if (rest[i] == 47) {
+                authority = rest.Substring(0, i);
+                pathPart = rest.Substring(i);
+                i = rest.Length;
+            } else { i = i + 1; }
+        }
+        int colon = 0 - 1;
+        i = 0;
+        while (i < authority.Length) {
+            if (authority[i] == 58) { colon = i; }
+            i = i + 1;
+        }
+        if (colon > 0) {
+            hostName = authority.Substring(0, colon);
+            port = Convert.ToInt32(authority.Substring(colon + 1));
+        } else {
+            hostName = authority;
+            if (tls) { port = 443; } else { port = 80; }
+        }
+        if (pathPart == "") { pathPart = "/"; }
+        urlPart = pathPart;
+    }
+
+    // 后台线程上跑一项的传输（由静态 Run 循环调用）。
+    async int Execute() {
+        HttpClient cli;
+        if (tls) { cli = HttpClient.CreateHttps(hostName, port); }
+        else { cli = new HttpClient(hostName, port); }
+        cli.SetTimeout(120000);
+        cli.SetCallPolicy(callPolicy);
+        cli.SetUploadProbe(this.Probe);
+        try {
+            HttpResponse resp = await cli.UploadFileBytesAsync(urlPart, field,
+                                                               item.path, item.name);
+            this.ReportDone(resp.statusCode, resp.body, "");
+        } catch (Exception ex) {
+            this.ReportDone(0, "", ex.Message);
+        }
+        return 0;
+    }
+
+    // HttpClient 发送探针（后台线程）：折算百分比后封送回 UI。
+    void Probe(int sent, int total) {
+        if (total <= 0) { return; }
+        int pct = sent * 100 / total;
+        if (pct > 100) { pct = 100; }
+        if (pct == lastPct) { return; }
+        lastPct = pct;
+        if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushProgress); }
+    }
+
+    // 记录完成结果并（仅首次）封送 FlushDone 回 UI 线程。
+    void ReportDone(int code, string body, string err) {
+        doneCode = code;
+        doneBody = body;
+        doneErr = err;
+        if (donePosted) { return; }
+        donePosted = true;
+        if (host != null && host.uiApp != null) { host.uiApp.Post(this.FlushDone); }
+    }
+
+    // UI 线程侧转发：进度 / 完成结果交给宿主 Upload 入账。
+    void FlushProgress() { if (host != null) { host.ApplyProgress(this); } }
+    // UI 线程侧转发：完成结果交给宿主 Upload 入账（仅首次）。
+    void FlushDone() { if (host != null) { host.ApplyDone(this); } }
+}

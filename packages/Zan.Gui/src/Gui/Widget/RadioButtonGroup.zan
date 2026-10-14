@@ -1,0 +1,289 @@
+using System;
+using Gui;
+
+namespace Gui.Widget;
+
+// 连体按钮段组（不依赖 RadioGroup 独立使用时的容器）：一排
+// RadioButton 共享一个选中信号（写选项 value），水平连体、窄宽
+// 自动换行。段的绘制/命中由组统一调度：未选中段先画，选中段最后
+// 画并外扩 1px 压住两条接缝。
+class RadioButtonGroup : Control {
+    // 组共享选中信号（值为选中选项的 value）。
+    SignalInt model;
+    // 段列表（与添加顺序一致）。
+    List<RadioButton> items;
+    // 组级 Change：任一选项被用户切换时触发。
+    UiEvent Change;
+    // 组命中 id。
+    int wid;
+    // 尺寸档位类（RadioGroup 或本组 Size 落下来的）。
+    string sizeCls;
+    // 皮肤行距/列缝（radiogroup.button；独立时自己解析，
+    // RadioGroup 挂载时由组下发）。
+    int rowGapPx;
+    int colGapPx;
+    // 最近一次 LayoutRows 折行后的行数。
+    int rowCount;
+    // 独立使用时的尺寸档位。
+    Binding<string> Size;
+
+    // 公共初始化：自持事件、默认 medium 档。
+    void InitRadioButtonGroup(SignalInt m) {
+        this.InitControl("radiobutton.group", 3);
+        model = m;
+        wid = WidgetId.Next();
+        items = new List<RadioButton>();
+        Change = new UiEvent();
+        sizeCls = "";
+        rowGapPx = 0;
+        colGapPx = 0;
+        rowCount = 0;
+        Size = "medium";
+        wiresOwnEvents = true;
+    }
+
+    // 构造：自持信号，默认选中 value 0。
+    RadioButtonGroup() { InitRadioButtonGroup(new SignalInt(0)); }
+    // 构造：共享组选中信号。
+    RadioButtonGroup(SignalInt m) { InitRadioButtonGroup(m); }
+
+    // 选中信号：组内写的是选中选项的 value。
+    SignalInt Selected() { return this.model; }
+
+    // 段数。
+    int Count() { return items.Count; }
+
+    // 追加选项（value 默认 = 下标）。
+    RadioButton AddOption(string label) {
+        return this.AddOption(label, this.items.Count);
+    }
+    // 追加选项（显式 value）：段经 weak parent 冒泡到本组的
+    // OnChildEvent（不挂捕获组的闭包——引用环，逐段泄漏）。
+    // 注意段不进 children（组自行调度绘制），只指 parent 供冒泡与
+    // 禁用链上行。
+    RadioButton AddOption(string label, int value) {
+        if (label == "") { return null; }
+        RadioButton b = new RadioButton(this.model, value, label);
+        b.parent = this;
+        this.items.Add(b);
+        return b;
+    }
+
+    // 段的用户切换冒泡：先触发本组 Change，再向自己的容器继续冒泡
+    // （挂载在 RadioGroup 按钮形态下时即组级联动）。
+    override void OnChildEvent(Control child, string evt) {
+        if (evt == "Change") {
+            this.Change.RaiseS(this);
+            if (parent != null) { parent.OnChildEvent(this, "Change"); }
+        }
+    }
+
+    // 清空全部段。
+    void ClearItems() { items.Clear(); }
+
+    // 设尺寸档位类（RadioGroup 下发或独立使用时经 Size 解析）。
+    void SetSize(string cls) { sizeCls = cls; }
+
+    // RadioGroup 每帧下发皮肤行距/列缝（按钮形态列缝恒 0）。
+    void SetGap(int rg, int cg) {
+        rowGapPx = rg;
+        colGapPx = cg;
+    }
+
+    // 把各段按 `avail` 宽流式排成行（avail <= 0 = 单行不折），
+    // 结果直接写进各段的 bx/by/bw/bh + row（供组与 RadioGroup 查
+    // 行归属）。返回行数。测量（mw/mh）必须先由 Measure 做好。
+    int LayoutRows(int avail) {
+        int n = items.Count;
+        if (n == 0) { rowCount = 0; return 0; }
+        int x = this.bx;
+        int y = this.by;
+        int row = 0;
+        int rowH = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            RadioButton b = items[i];
+            int w = b.mw;
+            int h = b.mh;
+            if (i > 0 && avail > 0 && x + colGapPx + w > this.bx + avail) {
+                y = y + rowH + rowGapPx;
+                x = this.bx;
+                row = row + 1;
+                rowH = 0;
+            } else if (i > 0) {
+                x = x + colGapPx;
+            }
+            if (h > rowH) { rowH = h; }
+            b.row = row;
+            b.bx = x;
+            b.by = y;
+            b.bw = w;
+            b.bh = h;
+            x = x + w;
+        }
+        rowCount = row + 1;
+        return rowCount;
+    }
+
+    // 第 i 段的行号。
+    int rowOf(int i) {
+        if (i < 0 || i >= items.Count) { return 0; }
+        return items[i].row;
+    }
+    // 第 i 段在本行内的列序（行首 = 0）。
+    int colOf(int i) {
+        if (i < 0 || i >= items.Count) { return 0; }
+        int r = items[i].row;
+        int c = 0;
+        for (int j = 0; j < i; j = j + 1) {
+            if (items[j].row == r) { c = c + 1; }
+        }
+        return c;
+    }
+    // 第 r 行最后一段的列序。
+    int lastColOf(int r) {
+        int last = 0;
+        int c = 0;
+        for (int j = 0; j < items.Count; j = j + 1) {
+            if (items[j].row == r) { last = c; c = c + 1; }
+        }
+        return last;
+    }
+
+    // 独立使用（无 RadioGroup 托管）时从皮肤解析按钮形态行距。
+    void SyncGap(App app) {
+        StyleBox g = Style.Of(app, "radiogroup", "button", Style.SNormal());
+        rowGapPx = g.RowGapOr(app.Scale(6));
+        colGapPx = g.ColGapOr(0);
+    }
+
+    // 量好所有段并回写本组的自然尺寸（单行总宽 / 最高段）。
+    override void OnMeasure(App app) {
+        this.SyncGap(app);
+        string sz = Control.SizeClass(this.Size.Get());
+        if (sz != "") { sizeCls = sz; }
+        int n = items.Count;
+        int x = 0;
+        int hmax = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            RadioButton b = items[i];
+            b.Measure(app);
+            if (i > 0) { x = x + colGapPx; }
+            x = x + b.mw;
+            if (b.mh > hmax) { hmax = b.mh; }
+        }
+        this.prefW = x;
+        this.prefH = hmax;
+    }
+
+    // 覆写：占满给定矩形并把各段流式折行排布（LayoutRows）。
+    override void Arrange(int px, int py, int pw, int ph) {
+        this.bx = px;
+        this.by = py;
+        this.bw = pw;
+        this.bh = ph;
+        this.LayoutRows(pw);
+    }
+
+    // 未选中段先画，选中段最后画并左右各外扩 1px：它的强调色描边
+    // 压住两条接缝（Element Plus 同款处理），自身不挡别人（透明底）。
+    override void OnPaint(App app) {
+        int n = items.Count;
+        if (n == 0) { return; }
+        int sel = this.IndexOfSelected();
+        for (int i = 0; i < n; i = i + 1) {
+            if (i == sel) { continue; }
+            RadioButton b = items[i];
+            b.PaintSeg(app, b.bx, b.by, b.bw, b.bh);
+        }
+        if (sel >= 0) {
+            RadioButton b = items[sel];
+            b.PaintSeg(app, b.bx - 1, b.by, b.bw + 2, b.bh);
+        }
+        // 命中与键盘：段的矩形已在 PaintSeg 注册，这里统一判点击。
+        for (int i = 0; i < n; i = i + 1) {
+            RadioButton b = items[i];
+            if (b.IsDisabled()) { continue; }
+            app.focus.RegisterFocusable(b.wid);
+            bool fire = Ui.Clicked(app, b.wid);
+            if (!fire && Ui.Focused(app, b.wid) && app.EventKind() == 4) {
+                int kc = app.window.EventKeyCode();
+                if (kc == 32 || kc == 13) { fire = true; }
+            }
+            if (fire) {
+                b.Select();
+                app.RequestRedraw();
+            }
+        }
+    }
+
+    // 当前选中段的下标（无 -1）。
+    int IndexOfSelected() {
+        int v = this.model.Get();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].optionValue == v) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // 控件类型标识（序列化/设计器用）。
+    override string Kind() { return "RadioButtonGroup"; }
+
+    // 覆写："Change" 挂组事件，其余按名称走通用路由。
+    override void BindEvent(string evt, Action a) {
+        if (evt == "Change") { Change.Add(a); return; }
+        On.AddByName(evt, a);
+    }
+
+    // <see cref="BindEvent"/> 的 sender 通道（S = Sender）：
+    // 特化事件接本控件的 UiEvent，通用事件按名路由。
+    override void BindEventS(string evt, ControlEvent a) {
+        if (evt == "Change") { Change.AddS(a); return; }
+        On.AddByNameS(evt, a);
+    }
+
+
+    // 覆写：公共事件之外提供 "Change"。
+    override List<string> Events() {
+        List<string> e = Control.CommonEvents();
+        e.Add("Change");
+        return e;
+    }
+
+    // 设计器读取 `options`（"A|B|C" 文本）与 `size`；其余返回 ""。
+    override string GetExtra(string key) {
+        if (key == "options") {
+            string outp = "";
+            for (int i = 0; i < items.Count; i = i + 1) {
+                if (i > 0) { outp = outp + "|"; }
+                outp = outp + items[i].label;
+            }
+            return outp;
+        }
+        return "";
+    }
+
+    // 设计器写入 `options`（"A|B|C" 逐项追加段）与 `size`；
+    // 其他键返回 false。
+    override bool SetExtra(string key, string val) {
+        if (key == "options") {
+            if (val == null || val.Length == 0) { return true; }
+            List<string> parts = val.Split("|");
+            for (int i = 0; i < parts.Count; i = i + 1) {
+                if (parts[i] != "") { this.AddOption(parts[i]); }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // 覆写：返回设计器属性清单（options/size）。
+    override List<PropSpec> Props() {
+        List<PropSpec> ps = new List<PropSpec>();
+        ps.Add(PropSpec.Text("options", "Options"));
+        PropSpec sz = PropSpec.Enum("size", "Size",
+            PropSpec.Sizes());
+        sz.str = Size;
+        ps.Add(sz);
+        return ps;
+    }
+}
