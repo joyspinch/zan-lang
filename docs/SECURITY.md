@@ -199,7 +199,7 @@ C layout (see `docs/ABI.md` §3.2).
 There is **no static data-race analysis** and no `ZAN2001`-style warning: the
 compiler does not analyze sharing across tasks. Synchronizing access to shared
 mutable state is the developer's responsibility. The shipped primitive is the
-static, handle-style `Mutex` (`stdlib/System/Threading/Threading.zan`):
+static, handle-style `Mutex` (`stdlib/System/Threading/Mutex.zan`):
 
 ```csharp
 nint mtx = Mutex.Create();

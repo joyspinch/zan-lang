@@ -1,0 +1,124 @@
+using System;
+
+namespace System.Threading;
+
+// 用于协程间通信的协程感知 channel。
+// 平台无关（纯 Zan 实现）。容量为 0 表示无界；
+// 正容量表示有界缓冲；<see cref="CreateUnbuffered"/>
+// 创建容量为 1 的 channel（阻塞当且仅当缓冲已满）。
+// 泛型强类型实现请使用 <see cref="Channel<T>"/>。
+class StringChannel {
+    List<string> buffer;
+    int capacity;
+    bool closed;
+    int sendWaiters;
+    int recvWaiters;
+    Gate sendGate;
+    Gate recvGate;
+    nint lockHandle;
+
+    // 创建指定容量的 channel（容量语义见类注释：0 无界，
+    // 正值有界，1 即 CreateUnbuffered）。
+    StringChannel(int capacity) {
+        this.buffer = new List<string>();
+        this.capacity = capacity;
+        this.closed = false;
+        this.sendWaiters = 0;
+        this.recvWaiters = 0;
+        this.sendGate = new Gate();
+        this.recvGate = new Gate();
+        this.lockHandle = Mutex.Create();
+    }
+
+    // 创建无缓冲 channel。
+    static StringChannel CreateUnbuffered() {
+        return new StringChannel(1);
+    }
+
+    // 向 channel 发送一个值（满时阻塞）。
+    // 已关闭的 channel 上发送会被忽略。
+    async void Send(string item) {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.capacity > 0
+               && this.buffer.Count >= this.capacity) {
+            this.sendWaiters = this.sendWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.sendGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.sendWaiters = this.sendWaiters - 1;
+        }
+        if (this.closed) {
+            Mutex.Unlock(this.lockHandle);
+            return;
+        }
+        this.buffer.Add(item);
+        Mutex.Unlock(this.lockHandle);
+        this.recvGate.Signal();
+    }
+
+    // 从 channel 接收一个值（空时阻塞）。
+    // 关闭并取空后返回空字符串。
+    async string Receive() {
+        Mutex.Lock(this.lockHandle);
+        while (!this.closed && this.buffer.Count == 0) {
+            this.recvWaiters = this.recvWaiters + 1;
+            Mutex.Unlock(this.lockHandle);
+            await this.recvGate.Wait();
+            Mutex.Lock(this.lockHandle);
+            this.recvWaiters = this.recvWaiters - 1;
+        }
+        if (this.closed && this.buffer.Count == 0) {
+            Mutex.Unlock(this.lockHandle);
+            return "";
+        }
+        string val = this.buffer[0];
+        this.buffer.RemoveAt(0);
+        Mutex.Unlock(this.lockHandle);
+        this.sendGate.Signal();
+        return val;
+    }
+
+    // 关闭 channel，唤醒所有阻塞的
+    // 发送方和接收方。
+    void Close() {
+        Mutex.Lock(this.lockHandle);
+        this.closed = true;
+        int sw = this.sendWaiters;
+        int rw = this.recvWaiters;
+        Mutex.Unlock(this.lockHandle);
+        int i = 0;
+        while (i < sw) {
+            this.sendGate.Signal();
+            i = i + 1;
+        }
+        i = 0;
+        while (i < rw) {
+            this.recvGate.Signal();
+            i = i + 1;
+        }
+    }
+
+    // channel 已关闭时返回 true。
+    bool IsClosed() {
+        Mutex.Lock(this.lockHandle);
+        bool v = this.closed;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    // 返回当前缓冲条目数。
+    int Count() {
+        Mutex.Lock(this.lockHandle);
+        int v = this.buffer.Count;
+        Mutex.Unlock(this.lockHandle);
+        return v;
+    }
+
+    // 析构兜底：释放底层互斥锁资源。
+    ~StringChannel() {
+        if (this.lockHandle != 0) {
+            Mutex.Destroy(this.lockHandle);
+            this.lockHandle = 0;
+        }
+    }
+}

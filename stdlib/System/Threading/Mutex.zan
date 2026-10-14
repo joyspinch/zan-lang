@@ -1,0 +1,98 @@
+using System;
+
+namespace System.Threading;
+
+// 用于线程同步的跨平台互斥锁。
+class Mutex {
+    #if WINDOWS
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint WinCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void WinFree(nint ptr);
+
+    [DllImport("kernel32", EntryPoint = "InitializeSRWLock")]
+    static extern void WinInitializeSRWLock(nint srwLock);
+
+    [DllImport("kernel32", EntryPoint = "AcquireSRWLockExclusive")]
+    static extern void WinAcquireSRWLockExclusive(nint srwLock);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSRWLockExclusive")]
+    static extern void WinReleaseSRWLockExclusive(nint srwLock);
+    #else
+    /* pthread 互斥锁分配于 64 字节内存块，跨平台使用 nint 传递地址。 */
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern nint PthreadCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void PthreadFree(nint ptr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_init")]
+    static extern int PthreadMutexInit(nint mutex, nint attr);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_lock")]
+    static extern int PthreadMutexLock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_unlock")]
+    static extern int PthreadMutexUnlock(nint mutex);
+
+    [DllImport("crt", EntryPoint = "pthread_mutex_destroy")]
+    static extern int PthreadMutexDestroy(nint mutex);
+    #endif
+
+    #if WINDOWS
+    // 创建轻量用户态 SRWLOCK 互斥锁（无需进入内核态创建内核对象，性能极高且无跨进程命名冲突）。
+    static nint Create() {
+        nint lockPtr = WinCalloc(1, 8);
+        WinInitializeSRWLock(lockPtr);
+        return lockPtr;
+    }
+
+    // 独占加锁（用户态快速路径，配对 Unlock）。
+    static void Lock(nint handle) {
+        if (handle == 0) { return; }
+        WinAcquireSRWLockExclusive(handle);
+    }
+
+    // 释放独占锁。
+    static void Unlock(nint handle) {
+        if (handle == 0) { return; }
+        WinReleaseSRWLockExclusive(handle);
+    }
+
+    // 销毁并释放内存。
+    static void Destroy(nint handle) {
+        if (handle != 0) {
+            WinFree(handle);
+        }
+    }
+    #else
+    // 创建 POSIX 互斥锁；句柄是内联存放 pthread_mutex_t 的
+    // 64 字节块的地址。
+    static nint Create() {
+        nint mtx = PthreadCalloc(1, 64);
+        PthreadMutexInit(mtx, 0);
+        return mtx;
+    }
+
+    // 无限阻塞加锁（配对 Unlock）。
+    static void Lock(nint handle) {
+        if (handle == 0) { return; }
+        PthreadMutexLock(handle);
+    }
+
+    // 解锁。
+    static void Unlock(nint handle) {
+        if (handle == 0) { return; }
+        PthreadMutexUnlock(handle);
+    }
+
+    // 销毁并释放内存。
+    static void Destroy(nint handle) {
+        if (handle != 0) {
+            PthreadMutexDestroy(handle);
+            PthreadFree(handle);
+        }
+    }
+    #endif
+}

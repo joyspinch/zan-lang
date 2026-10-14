@@ -151,8 +151,8 @@ stdlib/
 │   │   └── Rpc/                     # RpcClient/RpcServer, codecs, transports
 │   │
 │   ├── Threading/                   # System.Threading
-│   │   ├── Threading.zan            # Thread, Mutex, Semaphore,
-│   │   │                            # AtomicInt, SharedTable, Channel
+│   │   ├── Thread.zan / Mutex.zan / Semaphore.zan
+│   │   │                            # AtomicInt.zan / SharedTable.zan
 │   │   ├── AsyncGate.zan / AsyncRwLock.zan / BlockingQueue.zan
 │   │   ├── Gate.zan / SemaphoreSlim.zan / Timer.zan
 │   │
@@ -601,7 +601,7 @@ joiner reads after the join. `TaskGroup`, lambda-form `Task.Run` and
 
 `Channel` **is** implemented, but it is **string-only** (non-generic):
 `Send(string)` / `async string Receive()`; a closed-and-drained channel returns
-`""` (`stdlib/System/Threading/Threading.zan:738`).
+`""` (`stdlib/System/Threading/StringChannel.zan`).
 
 The async I/O stack is implemented end to end and verified on Linux, macOS and
 Windows: one readiness/completion reactor (`src/runtime/rt_io.c`) with `epoll`

@@ -1,0 +1,205 @@
+using System;
+
+namespace System.Threading;
+
+// 跨平台信号量。
+class Semaphore {
+    #if WINDOWS
+    // name 以 nint 传 NULL（与 Mutex 同理：空字符串仍是合法命名对象，
+    // 传空串会让全部实例共享同一个内核信号量导致意外碰撞）。
+    [DllImport("kernel32", EntryPoint = "CreateSemaphoreA")]
+    static extern nint WinCreateSemaphore(nint secAttrs, int initialCount, int maxCount, nint name);
+
+    [DllImport("kernel32", EntryPoint = "WaitForSingleObject")]
+    static extern int WinWaitForSingleObject(nint handle, int milliseconds);
+
+    [DllImport("kernel32", EntryPoint = "ReleaseSemaphore")]
+    static extern int WinReleaseSemaphore(nint handle, int releaseCount, nint prevCount);
+
+    [DllImport("kernel32", EntryPoint = "CloseHandle")]
+    static extern int WinCloseHandle(nint handle);
+    #elif MACOS
+    // macOS 没有未命名的 POSIX 信号量（sem_init 会设置 ENOSYS 并返回
+    // -1），因此改用 GCD dispatch 信号量。不透明的 dispatch_semaphore_t
+    // 指针以字符串句柄形式承载，与下方 Linux 的 sem_t*
+    // 约定一致。dispatch_* 位于 libSystem，由 -lc 解析。
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_create")]
+    static extern string MacSemCreate(int initValue);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWait(string sem, long timeout);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_signal")]
+    static extern int MacSemSignal(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_release")]
+    static extern void MacSemRelease(string sem);
+
+    [DllImport("crt", EntryPoint = "dispatch_semaphore_wait")]
+    static extern int MacSemWaitUntil(string sem, long deadline);
+
+    [DllImport("crt", EntryPoint = "dispatch_time")]
+    static extern long MacDispatchTime(long baseTime, long deltaNs);
+    #else
+    [DllImport("crt", EntryPoint = "calloc")]
+    static extern string SemCalloc(long count, long size);
+
+    [DllImport("crt", EntryPoint = "free")]
+    static extern void SemFree(string ptr);
+
+    [DllImport("crt", EntryPoint = "sem_init")]
+    static extern int SemInit(string sem, int pshared, int initValue);
+
+    [DllImport("crt", EntryPoint = "sem_wait")]
+    static extern int SemWait(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_post")]
+    static extern int SemPost(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_destroy")]
+    static extern int SemDestroy(string sem);
+
+    [DllImport("crt", EntryPoint = "sem_timedwait")]
+    static extern int SemTimedWait(string sem, nint absTime);
+
+    [DllImport("crt", EntryPoint = "clock_gettime")]
+    static extern int SemClockGettime(int clkId, nint tp);
+
+    // errno 读取（线程局部）：sem_wait/sem_timedwait 被 signal 打断时
+    // 返回 -1 + EINTR，必须重试而不是当成失败/超时。
+    // Darwin 使用 __error()，Android Bionic 使用 __errno()，
+    // glibc/musl 使用 __errno_location()。EINTR 在这些平台都是 4。
+    #if MACOS
+    [DllImport("crt", EntryPoint = "__error")]
+    static extern nint SemErrnoLoc();
+    #elif ANDROID
+    [DllImport("crt", EntryPoint = "__errno")]
+    static extern nint SemErrnoLoc();
+    #else
+    [DllImport("crt", EntryPoint = "__errno_location")]
+    static extern nint SemErrnoLoc();
+    #endif
+
+    static int SemErrno() {
+        return new Span<int>(SemErrnoLoc(), 1)[0];
+    }
+
+    static int SemEintr() { return 4; }
+    #endif
+
+    #if WINDOWS
+    // 创建信号量：initialCount 初始许可，maxCount 上限（匿名，name 传 NULL）。
+    static nint Create(int initialCount, int maxCount) {
+        return WinCreateSemaphore(0, initialCount, maxCount, 0);
+    }
+
+    // 无限阻塞获取一个许可（配对 Release）。
+    static void Wait(nint handle) {
+        WinWaitForSingleObject(handle, -1);
+    }
+
+    // 最多等待 `timeoutMs` 毫秒获取一个许可。
+    // 获取到返回 true；超时返回 false（此时不消耗许可）。
+    // 负超时无限等待，0 则轮询。
+    static bool WaitFor(nint handle, int timeoutMs) {
+        return WinWaitForSingleObject(handle, timeoutMs) == 0;
+    }
+
+    // 归还一个许可（超过 maxCount 时失败）。
+    static void Release(nint handle) {
+        WinReleaseSemaphore(handle, 1, 0);
+    }
+
+    // 销毁并关闭句柄。
+    static void Destroy(nint handle) {
+        WinCloseHandle(handle);
+    }
+    #elif MACOS
+    // 创建 GCD 信号量：initialCount 初始许可（maxCount 由 dispatch
+    // 信号量语义忽略，仅为 API 对齐）。
+    static string Create(int initialCount, int maxCount) {
+        return MacSemCreate(initialCount);
+    }
+
+    // 无限阻塞获取一个许可（配对 Release）。
+    static void Wait(string handle) {
+        MacSemWait(handle, -1);   // -1 表示 DISPATCH_TIME_FOREVER
+    }
+
+    // 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    // 负超时无限等待。
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            MacSemWait(handle, -1);
+            return true;
+        }
+        // dispatch_time(DISPATCH_TIME_NOW, delta) 以纳秒为单位。
+        long deadline = MacDispatchTime(0, (long)timeoutMs * 1000000);
+        return MacSemWaitUntil(handle, deadline) == 0;
+    }
+
+    // 归还一个许可。
+    static void Release(string handle) {
+        MacSemSignal(handle);
+    }
+
+    // 释放 dispatch 信号量。
+    static void Destroy(string handle) {
+        MacSemRelease(handle);
+    }
+    #else
+    // 创建 POSIX 信号量：initialCount 初始许可（maxCount 由
+    // sem_t 语义忽略，仅为 API 对齐）。
+    static string Create(int initialCount, int maxCount) {
+        string sem = SemCalloc(1, 64);
+        SemInit(sem, 0, initialCount);
+        return sem;
+    }
+
+    // 无限阻塞获取一个许可（配对 Release）。EINTR（被 signal 打断）
+    // 重试，其它错误直接返回。
+    static void Wait(string handle) {
+        while (SemWait(handle) != 0) {
+            if (SemErrno() != Semaphore.SemEintr()) { return; }
+        }
+    }
+
+    // 限时获取：获取到返回 true；超时返回 false（不消耗许可）。
+    // 负超时无限等待。sem_timedwait 接受 ABSOLUTE CLOCK_REALTIME
+    // 绝对截止时间，因此需读时钟再加上超时；EINTR 重试时重算截止
+    // 时间（剩余超时从当前时刻起算）。
+    static bool WaitFor(string handle, int timeoutMs) {
+        if (timeoutMs < 0) {
+            Semaphore.Wait(handle);
+            return true;
+        }
+        nint ts = NativeMemory.Alloc(16);
+        bool ok = false;
+        try {
+            while (true) {
+                SemClockGettime(0, ts);
+                Span<long> f = new Span<long>(ts, 2);
+                long ns = f[1] + (long)timeoutMs * 1000000;
+                f[0] = f[0] + ns / 1000000000;
+                f[1] = ns % 1000000000;
+                if (SemTimedWait(handle, ts) == 0) { ok = true; break; }
+                if (SemErrno() != Semaphore.SemEintr()) { ok = false; break; }
+            }
+        } finally {
+            NativeMemory.Free(ts);
+        }
+        return ok;
+    }
+
+    // 归还一个许可。
+    static void Release(string handle) {
+        SemPost(handle);
+    }
+
+    // 销毁并释放内存。
+    static void Destroy(string handle) {
+        SemDestroy(handle);
+        SemFree(handle);
+    }
+    #endif
+}
