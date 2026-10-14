@@ -857,9 +857,11 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     }
 
     bool is_decimal = false;
+    int float_suffix = 0;
     /* suffix: f/F (float), m/M (decimal) */
     if (lexer_peek_ch(lex) == 'f' || lexer_peek_ch(lex) == 'F') {
         is_float = true;
+        float_suffix = 1;
         lexer_advance(lex);
     } else if (lexer_peek_ch(lex) == 'm' || lexer_peek_ch(lex) == 'M') {
         is_decimal = true;
@@ -897,6 +899,8 @@ static zan_token_t lexer_number(zan_lexer_t *lex) {
     } else if (is_float) {
         zan_token_t tok = lexer_make(lex, TK_FLOAT_LIT, loc);
         tok.float_val = strtod(buf, NULL);
+        /* f/F 后缀标记:字面量按 float(f32) 语义参与类型检查与发射 */
+        tok.lit_suffix = float_suffix;
         return tok;
     } else {
         zan_token_t tok = lexer_make(lex, TK_INT_LIT, loc);

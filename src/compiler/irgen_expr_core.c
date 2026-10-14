@@ -1378,6 +1378,8 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
             return g->binder->type_int;
         }
     case AST_FLOAT_LITERAL:
+        /* 与 checker 一致:f 后缀字面量推断为 float */
+        if (g->binder && e->lit_suffix) { return g->binder->type_float; }
         return g->binder ? g->binder->type_double : NULL;
     case AST_DECIMAL_LITERAL:
         return g->binder ? g->binder->type_decimal : NULL;

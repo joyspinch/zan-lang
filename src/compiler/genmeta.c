@@ -153,7 +153,8 @@ static json_value *gm_expr_tree(zan_ast_node_t *n) {
         break;
     case AST_FLOAT_LITERAL:
         json_obj_set(o, "k", json_new_str("lit"));
-        json_obj_set(o, "t", json_new_str("double"));
+        json_obj_set(o, "t",
+            json_new_str(n->lit_suffix ? "float" : "double"));
         json_obj_set(o, "v", json_new_num(n->float_val));
         break;
     case AST_DECIMAL_LITERAL:
@@ -1401,6 +1402,10 @@ zan_ast_node_t *zan_genmeta_expr_from_json(json_value *j, zan_arena_t *arena) {
         } else if (t && strcmp(t, "double") == 0) {
             n = zan_ast_new(arena, AST_FLOAT_LITERAL, loc);
             n->float_val = json_get_num(v, 0);
+        } else if (t && strcmp(t, "float") == 0) {
+            n = zan_ast_new(arena, AST_FLOAT_LITERAL, loc);
+            n->float_val = json_get_num(v, 0);
+            n->lit_suffix = 1;
         } else if (t && strcmp(t, "bool") == 0) {
             n = zan_ast_new(arena, AST_BOOL_LITERAL, loc);
             n->bool_val = json_get_bool(v, false);

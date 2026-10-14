@@ -1978,7 +1978,9 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             return c->binder->type_int;
         }
     case AST_FLOAT_LITERAL:
-        return c->binder->type_double;
+        /* f/F 后缀字面量按 float 语义定型(C# 同规):无后缀仍为 double */
+        return expr->lit_suffix ? c->binder->type_float
+                                : c->binder->type_double;
     case AST_DECIMAL_LITERAL:
         return c->binder->type_decimal;
     case AST_STRING_LITERAL:

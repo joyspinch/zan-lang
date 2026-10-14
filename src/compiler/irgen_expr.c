@@ -10736,6 +10736,13 @@ static LLVMValueRef emit_expr(zan_irgen_t *g, zan_ast_node_t *expr, local_scope_
     }
 
     case AST_FLOAT_LITERAL:
+        /* f/F 后缀字面量发射为 f32 常量:此前一律发射 double 常量,
+         * 导致 float 变量与字面量比较时被提升到 double 空间,
+         * 非精确表示的值(如 0.2f)永远不等。 */
+        if (expr->lit_suffix) {
+            return LLVMConstReal(LLVMFloatTypeInContext(g->ctx),
+                                 expr->float_val);
+        }
         return LLVMConstReal(LLVMDoubleTypeInContext(g->ctx), expr->float_val);
 
     case AST_DECIMAL_LITERAL: {
