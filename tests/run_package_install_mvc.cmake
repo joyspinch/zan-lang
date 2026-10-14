@@ -37,7 +37,7 @@ file(GLOB_RECURSE _source_files "${SRC}/src/*.zan")
 file(GLOB_RECURSE _installed_files "${_installed}/src/*.zan")
 list(LENGTH _source_files _source_count)
 list(LENGTH _installed_files _installed_count)
-if(NOT _source_count EQUAL 119 OR NOT _installed_count EQUAL _source_count)
+if(NOT _source_count EQUAL 121 OR NOT _installed_count EQUAL _source_count)
   message(FATAL_ERROR "MVC sources were duplicated or lost: ${_source_count} -> ${_installed_count}")
 endif()
 
