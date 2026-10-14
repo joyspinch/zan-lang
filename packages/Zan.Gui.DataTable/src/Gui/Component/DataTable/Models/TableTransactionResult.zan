@@ -1,0 +1,103 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+// 一次事务的不可变结果快照。结果列表通过 Add 只在构造阶段填充，
+// 读取时使用 ResultAt 的复制值，避免调用方修改内部对象。
+class TableTransactionResult {
+    // 1 确认、2 拒绝、3 冲突、4 取消。
+    static const int Acked = 1;
+    static const int Rejected = 2;
+    static const int Conflict = 3;
+    static const int Cancelled = 4;
+
+    string transactionId;
+    int status;
+    List<MutationResult> results;
+
+    // 构造结果快照；id 为 null 记空串，results 由 Add 填充。
+    TableTransactionResult(string id, int resultStatus) {
+        this.transactionId = id;
+        this.status = resultStatus;
+        if (this.transactionId == null) { this.transactionId = ""; }
+        this.results = new List<MutationResult>();
+    }
+
+    // 创建指定状态的结果快照。
+    static TableTransactionResult Create(string id, int resultStatus) {
+        return new TableTransactionResult(id, resultStatus);
+    }
+
+    // 事务标识。
+    string TransactionId() { return this.transactionId; }
+    // 事务级状态（Acked/Rejected/Conflict/Cancelled）。
+    int Status() { return this.status; }
+    // 单个结果条数。
+    int Count() { return this.results.Count; }
+
+    // 结果可采信：id 非空、状态合法且至少包含一条结果。
+    bool IsValid() {
+        return this.transactionId.Length > 0
+            && (this.status == TableTransactionResult.Acked
+                || this.status == TableTransactionResult.Rejected
+                || this.status == TableTransactionResult.Conflict
+                || this.status == TableTransactionResult.Cancelled)
+            && this.results.Count > 0;
+    }
+
+    // 构造阶段追加一条结果；null 被忽略并返回 false。
+    bool Add(MutationResult result) {
+        if (result == null) { return false; }
+        this.results.Add(result);
+        return true;
+    }
+
+    // 第 index 个结果的复制值；越界返回 null。
+    MutationResult ResultAt(int index) {
+        if (index < 0 || index >= this.results.Count) { return null; }
+        MutationResult r = this.results[index];
+        return new MutationResult(r.MutationId(), r.Status(), r.CanonicalValue(),
+            r.ServerValue(), r.ServerRevision(), r.Message());
+    }
+
+    // 状态为 Accepted 的结果条数。
+    int AcceptedCount() {
+        int count = 0;
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            if (this.results[i].Status() == MutationResult.Accepted) { count = count + 1; }
+        }
+        return count;
+    }
+
+    // 非 Accepted 的结果条数（含取消）。
+    int FailedCount() { return this.results.Count - this.AcceptedCount(); }
+
+    // 深复制：状态与全部结果逐条复制，内部列表与原对象独立。
+    TableTransactionResult Copy() {
+        TableTransactionResult copy = TableTransactionResult.Create(
+            this.transactionId, this.status);
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            MutationResult result = this.results[i];
+            copy.Add(new MutationResult(result.MutationId(), result.Status(),
+                result.CanonicalValue(), result.ServerValue(),
+                result.ServerRevision(), result.Message()));
+        }
+        return copy;
+    }
+
+    // 序列化为传输 JSON：事务 id/status 加逐条结果的 JSON 对象数组。
+    string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum("1"));
+        root.Put("id", JsonValue.NewStr(this.transactionId));
+        root.Put("status", JsonValue.NewNum(Convert.ToString(this.status)));
+        JsonValue values = JsonValue.NewArray();
+        for (int i = 0; i < this.results.Count; i = i + 1) {
+            JsonValue value = JsonValue.ParseLenient(this.results[i].ToJson());
+            if (value != null) { values.Append(value); }
+        }
+        root.Put("results", values);
+        return root.ToJson();
+    }
+}

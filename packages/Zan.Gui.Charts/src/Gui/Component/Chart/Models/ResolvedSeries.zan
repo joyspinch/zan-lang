@@ -1,0 +1,163 @@
+using System;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// 单个源系列的只读绘制快照。保留 source 引用，使渲染器
+// 无需复制数据，同时把继承值和交互状态隔离在当前帧。
+class ResolvedSeries {
+    ChartSeries source;
+    int color;
+    int lineColor;
+    int lineWidth;
+    int areaColor;
+    int labelColor;
+    int labelFontSize;
+    int emphColor;  // itemStyle.emphasis.color（0 = 同 normal）
+    int emphBorderColor;  // 强调描边色
+    int emphBorderWidth;  // 强调描边宽（0 = 无强调描边）
+    bool hidden;
+    int wid;
+    bool animate;
+    bool visBlocked;  // 源系列显式声明了 lineStyle.color
+
+    // 解析单个系列：主色/线色/线宽/面积色/标签字号按
+    // 系列值 -> itemStyle.normal -> 调色板/theme 依次回退；
+    // emphasis 强调 paint 同步解析（缺省回退 normal）。
+    // hidden/wid/animate 原样记录。
+    static ResolvedSeries Of(ChartSeries source, Theme theme, int index,
+                             int wid, bool animate, bool hidden, List<int> pal) {
+        ResolvedSeries r = new ResolvedSeries();
+        r.source = source;
+        r.color = source.color;
+        if (r.color == 0) { r.color = source.itemStyle.normal.color; }
+        // ECharts 根级 color 调色板：优先于官方缺省 9 档，按绘制序
+        // 取模循环（官方 paletteSwap 同语义）。
+        if (r.color == 0 && pal != null && pal.Count > 0) {
+            r.color = pal[index % pal.Count];
+        }
+        if (r.color == 0) { r.color = Chart.Palette(theme, index); }
+        r.lineColor = source.itemStyle.normal.lineStyle.color;
+        r.visBlocked = r.lineColor != 0;
+        if (r.lineColor == 0) { r.lineColor = r.color; }
+        r.lineWidth = source.itemStyle.normal.lineStyle.width;
+        if (r.lineWidth <= 0) { r.lineWidth = 2; }
+        r.areaColor = source.itemStyle.normal.areaStyle.color;
+        if (r.areaColor == 0) { r.areaColor = r.color; }
+        r.labelColor = source.label.color;
+        r.labelFontSize = source.label.fontSize;
+        if (r.labelFontSize <= 0) { r.labelFontSize = theme.fontSizeSmall; }
+        // 强调（hover）paint：解析到 ResolvedSeries，命中时
+        // 渲染器用 Effective* 取色，源系列永不被改写。
+        r.emphColor = source.itemStyle.emphasis.color;
+        if (r.emphColor == 0) { r.emphColor = r.color; }
+        r.emphBorderColor = source.itemStyle.emphasis.borderColor;
+        if (r.emphBorderColor == 0) { r.emphBorderColor = source.itemStyle.normal.borderColor; }
+        r.emphBorderWidth = source.itemStyle.emphasis.borderWidth;
+        if (r.emphBorderWidth < 0) { r.emphBorderWidth = 0; }
+        r.hidden = hidden;
+        r.wid = wid;
+        r.animate = animate;
+        return r;
+    }
+
+    // 第 index 个数据项的绘制色：数据项自带 color 非零时优先，
+    // 否则回退系列解析主色。
+    int DataColor(int index) {
+        if (index >= 0 && index < this.source.data.Count
+            && this.source.data[index].color != 0) {
+            return this.source.data[index].color;
+        }
+        return this.color;
+    }
+
+    // CSS 覆写入口（chart::series-N）：替换系列主色并同步
+    // 未被显式指定的派生色（线/面积/强调色跟随主色）。
+    void OverrideColor(int cssColor) {
+        if (cssColor == 0) { return; }
+        this.color = cssColor;
+        if (this.source.itemStyle.normal.lineStyle.color == 0) { this.lineColor = cssColor; }
+        if (this.source.itemStyle.normal.areaStyle.color == 0) { this.areaColor = cssColor; }
+        if (this.source.itemStyle.emphasis.color == 0) { this.emphColor = cssColor; }
+    }
+
+    // 命中（hover）后的有效 paint：强调色优先；普通状态
+    // 返回解析色。三者都只读，不触碰源系列。
+    int EffectiveColor(bool hovered) {
+        if (hovered) { return this.emphColor; }
+        return this.color;
+    }
+    // 有效边框色：hovered 取 emphasis.borderColor（解析时缺省
+    // 已回退 normal），普通状态取 normal.borderColor。
+    int EffectiveBorderColor(bool hovered) {
+        if (hovered) { return this.emphBorderColor; }
+        return this.source.itemStyle.normal.borderColor;
+    }
+    // 有效边框宽：hovered 取 emphasis.borderWidth（解析时负值
+    // 已钳为 0），普通状态取 normal.borderWidth。
+    int EffectiveBorderWidth(bool hovered) {
+        if (hovered) { return this.emphBorderWidth; }
+        return this.source.itemStyle.normal.borderWidth;
+    }
+
+    // 把解析结果物化回一份源系列的深复制：外壳样式字段（主色/
+    // hidden/线色/线宽/面积色/标签色与字号）用解析值覆盖，数据
+    // 集合与其余字段原样保留。供仍按 ChartSeries 绘制的路径使用。
+    // allowShare（阶段 B 克隆税豁免）：本帧渲染路径对数据集合
+    // 只读时，data/points/candles 等逐项大集合与源系列只读共享
+    // （ChartSeries.Clone(src, true)），不逐项深拷。凡可能经
+    // ApplyDataLegend 写 data[].hidden/selected 的系列（pie/rose/
+    // funnel 面板与 pie/funnel 覆盖层）必须保持全量克隆，否则
+    // 交互态会漏写进长寿缓存的源 option。
+    ChartSeries Materialize(bool allowShare) {
+        ChartSeries src = this.source;
+        bool share = allowShare && src.type != ChartType.Pie
+            && src.type != ChartType.Funnel;
+        ChartSeries s = ChartSeries.Clone(src, share);
+        if (s == null) { return null; }
+        s.color = this.color; s.hidden = this.hidden;
+        ChartItemStyle style = ChartItemStyle.Create();
+        style.normal.color = src.itemStyle.normal.color;
+        style.normal.color0 = src.itemStyle.normal.color0;
+        style.normal.borderColor = src.itemStyle.normal.borderColor;
+        style.normal.borderWidth = src.itemStyle.normal.borderWidth;
+        style.normal.lineStyle.color = this.lineColor;
+        s.visBlocked = this.visBlocked;
+        style.normal.lineStyle.color0 = src.itemStyle.normal.lineStyle.color0;
+        style.normal.lineStyle.width = this.lineWidth;
+        style.normal.lineStyle.type = src.itemStyle.normal.lineStyle.type;
+        style.normal.lineStyle.shadowColor = src.itemStyle.normal.lineStyle.shadowColor;
+        style.normal.lineStyle.shadowBlur = src.itemStyle.normal.lineStyle.shadowBlur;
+        // __grad 渐变 stops（只读共享引用）。
+        style.normal.lineStyle.gradStops = src.itemStyle.normal.lineStyle.gradStops;
+        style.normal.lineStyle.transparent = src.itemStyle.normal.lineStyle.transparent;
+        style.normal.areaStyle.color = this.areaColor;
+        style.normal.areaStyle.type = src.itemStyle.normal.areaStyle.type;
+        style.normal.areaStyle.gradStops = src.itemStyle.normal.areaStyle.gradStops;
+        style.normal.areaStyle.alpha = src.itemStyle.normal.areaStyle.alpha;
+        style.normal.borderRadius = new List<int>();
+        for (int bri = 0; bri < src.itemStyle.normal.borderRadius.Count; bri = bri + 1) {
+            style.normal.borderRadius.Add(src.itemStyle.normal.borderRadius[bri]);
+        }
+        style.emphasis = ChartItemStyle.CloneState(src.itemStyle.emphasis);
+        s.itemStyle = style;
+        ChartTextStyle label = ChartTextStyle.Create();
+        label.color = this.labelColor; label.fontSize = this.labelFontSize;
+        label.fontStyle = src.label.fontStyle; label.fontWeight = src.label.fontWeight;
+        label.fontFamily = src.label.fontFamily; label.shadowColor = src.label.shadowColor;
+        label.shadowBlur = src.label.shadowBlur; s.label = label;
+        // 富文本表与整块底板随行（rich 表只读共享——解析后渲染期
+        // 不可变，不必逐样式深拷）。
+        label.rich = src.label.rich;
+        label.lineHeight = src.label.lineHeight;
+        label.boxBg = src.label.boxBg;
+        label.boxBorder = src.label.boxBorder;
+        label.boxBorderW = src.label.boxBorderW;
+        label.boxRadius = src.label.boxRadius;
+        label.padT = src.label.padT;
+        label.padR = src.label.padR;
+        label.padB = src.label.padB;
+        label.padL = src.label.padL;
+        return s;
+    }
+}

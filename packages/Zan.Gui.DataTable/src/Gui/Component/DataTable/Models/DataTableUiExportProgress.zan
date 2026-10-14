@@ -1,0 +1,63 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// 内置进度实现：后台回调只写静态暂存，UI 线程每帧拉取。
+// 进程内同一时刻至多一个导出（Export.zan 的 sExportBusy 原子门），
+// 静态槽因此安全。
+class DataTableUiExportProgress : DataTableExportProgress {
+    // 当前弹层状态（包装入口 Bind；Cancelled 在后台线程读取）。
+    public static DataTableExportUi ui;
+    static int sDone;
+    static int sTotal;
+    static bool sOk;
+    static string sMsg;
+    static bool sFinished;
+
+    // 包装入口在启动导出前登记状态对象并复位暂存。
+    public static void Bind(DataTableExportUi target) {
+        DataTableUiExportProgress.ui = target;
+        DataTableUiExportProgress.sDone = 0;
+        DataTableUiExportProgress.sTotal = 0;
+        DataTableUiExportProgress.sOk = false;
+        DataTableUiExportProgress.sMsg = "";
+        DataTableUiExportProgress.sFinished = false;
+    }
+
+    public override void OnStart(int totalRows) {
+        DataTableUiExportProgress.sDone = 0;
+        DataTableUiExportProgress.sTotal = totalRows;
+    }
+
+    public override void OnProgress(int doneRows, int totalRows) {
+        DataTableUiExportProgress.sDone = doneRows;
+        DataTableUiExportProgress.sTotal = totalRows;
+    }
+
+    public override void OnDone(bool ok, string error) {
+        DataTableUiExportProgress.sOk = ok;
+        DataTableUiExportProgress.sMsg = error;
+        DataTableUiExportProgress.sFinished = true;
+    }
+
+    public override bool Cancelled() {
+        return DataTableUiExportProgress.ui != null
+            && DataTableUiExportProgress.ui.cancel.Load() != 0;
+    }
+
+    // UI 线程：渲染弹层前把后台暂存拉取进弹层状态。完成态只在
+    // 首次到达时提交（message/ok 不被后续帧改写）。
+    public static void SyncUi() {
+        DataTableExportUi u = DataTableUiExportProgress.ui;
+        if (u == null) { return; }
+        u.done = DataTableUiExportProgress.sDone;
+        u.total = DataTableUiExportProgress.sTotal;
+        if (DataTableUiExportProgress.sFinished && !u.finished) {
+            u.finished = true;
+            u.ok = DataTableUiExportProgress.sOk;
+            u.message = DataTableUiExportProgress.sMsg;
+        }
+    }
+}

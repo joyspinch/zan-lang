@@ -1,0 +1,78 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// 透视视图数据源：把 DataTableState 里物化好的交叉聚合
+// （pvRowKeys × pvColKeys → pvCells）当成普通行×列源交给
+// 渲染管线。列 0 是行维度标签，之后每列一个列键的聚合值，
+// Sum/Max/Min 模式再追加一列“Total”行总计。聚合格是派生结果，
+// 写入被忽略、不可插入——视图层的所有排序/筛选/汇总
+// （作用于交叉结果本身）照常工作。
+// Poll 代理到底层源：底层交付新数据时标记交叉表脏，
+// 下一帧重物化，服务端/实时源的增量自动跟进。
+class PivotDataSource : DataSource {
+    DataTableState st;
+    DataSource inner;
+
+    PivotDataSource(DataTableState state, DataSource innerSrc) {
+        this.st = state;
+        this.inner = innerSrc;
+    }
+
+    override int RowCount() { return this.st.pvRowKeys.Count; }
+
+    override string CellText(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR) { return ""; }
+        if (col == 0) { return this.st.pvRowKeys[row]; }
+        // 平均值固定两位小数；其余聚合的小数位随原值列
+        // （与 PivotBuildCols 的“格式化随原值列”契约一致）。
+        int dec = 0;
+        if (this.st.pivotAgg == 1) { dec = 2; }
+        else if (this.st.pvOrigColsList != null && this.st.pvValueCol >= 0
+                 && this.st.pvValueCol < this.st.pvOrigColsList.Count) {
+            dec = this.st.pvOrigColsList[this.st.pvValueCol].decimals;
+        }
+        // Sum/Max/Min 模式在生成列末尾有一列“Total”：读行总计。
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return DataTable.FormatReal(this.st.pvRowTot[row], dec);
+        }
+        if (col - 1 >= 0 && col - 1 < nC) {
+            return DataTable.FormatReal(this.st.pvCells[row * nC + (col - 1)], dec);
+        }
+        return "";
+    }
+
+    override int CellNum(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR || col < 1) { return 0; }
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return (int)this.st.pvRowTot[row];
+        }
+        if (col - 1 < nC) { return (int)this.st.pvCells[row * nC + (col - 1)]; }
+        return 0;
+    }
+
+    override double CellReal(int row, int col) {
+        int nR = this.st.pvRowKeys.Count;
+        int nC = this.st.pvColKeys.Count;
+        if (row < 0 || row >= nR || col < 1) { return 0.0; }
+        if (this.st.pvRowTot.Count == nR && col == nC + 1) {
+            return this.st.pvRowTot[row];
+        }
+        if (col - 1 < nC) { return this.st.pvCells[row * nC + (col - 1)]; }
+        return 0.0;
+    }
+
+    override bool Poll() {
+        if (this.inner != null && this.inner.Poll()) {
+            this.st.pvDirty = true;
+            return true;
+        }
+        return false;
+    }
+}

@@ -1,0 +1,534 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// 纯 Zan 图表库 —— ECharts 标准的声明性子集，全部用
+// stdlib 组件与确定性的整数几何绘制，无 JS / DOM / WebView：
+// · 17 种原生 series.type：line / bar / pie / scatter / k /
+// treemap / tree / wordCloud / heatmap，外加 custom kind
+// venn）。
+// · 轴：category / value / time（整数天数，表格驱动日期）/
+// log（仅正值、10 的幂刻度），独立左右轴 min/max/reversed。
+// · 交互：hover tooltip、图例切换可见性、dataZoom 窗口、
+// · 确定性：无随机数、无系统时钟；布局/命中/指纹均为整数运算，
+// conformance 测试可逐值断言。
+// Zan 扩展：ChartOption.Of /
+// OfBoxes / OfErrors / OfPoints、pieRings 嵌套环、eventRiver 由
+// 数值系列驱动（按类别索引映射时间）、图表数据用 List<int> /
+// ChartData 直接表达。
+// 渲染由 ChartView（partial）分发到每类一个渲染器；所有绘制走
+// ChartOption -> ResolvedChart -> Canvas 管道。
+// 内部持有者：计算出的绘图矩形加上解析后的数值轴
+// 范围（左轴 + 可选右轴），使每个渲染器以相同方式
+// 映射数值 -> 像素。leftMin/leftMax 始终有效；rightMin/rightMax 仅在有右轴时有效。
+// leftLog/rightLog 为对数轴（仅正值）；isTime 为时间 X 轴
+// （整数天数，标签由 Chart.TimeLabel 生成）。
+class ChartFrame {
+    int plotX;
+    int plotY;
+    int plotW;
+    int plotH;
+    int leftMin;
+    int leftMax;
+    int leftMinF;  // 左轴 [lo,hi] ×1000 定点（小数轴专用，lo=hi=0 为整数轴）
+    int leftMaxF;
+    int rightMin;
+    int rightMax;
+    int rightMinF;  // 右轴同上（line6 降雨量 -1000..0 定点）
+    int rightMaxF;
+    bool hasRight;
+    bool reversed;  // 左轴翻转
+    bool rightReversed;  // 右轴翻转（独立于左轴）
+    bool leftLog;  // 左轴对数刻度
+    bool rightLog;  // 右轴对数刻度
+    bool isTime;  // X 轴时间刻度
+    int timeMin;
+    int timeMax;
+    bool catBoundaryGap;  // X 类目轴 boundaryGap（false：点落在刻度线上）
+    bool catY;  // Y 轴类目（ECharts 轴互换：数值在 X）
+    int xLo;  // X 数值轴范围（catY / 值对折线用）
+    int xHi;
+    bool leftNegate;  // 左轴刻度/工具提示按 -值 显示（axisLabel.formatter=-v）
+    bool rightNegate;  // 右轴同上
+    // ---- A15 断轴（axis.breaks）---- 左/右轴各自的解算结果。breaks 空
+    // = 无断带，全部映射走原路径（逐像素一致）。
+    List<ChartBreakResolved> resolvedBrkL;  // 左轴断带强类型实体（包含 gapReal）
+    List<ChartBreak> brkL;  // 兼容视图（升序、仅界内）
+    List<double> brkGapL;  // 兼容视图
+    double brkSpanL;  // 线性（elapsed）总跨度 = 数据跨度 − Σ断带跨度 + ΣgapReal
+    double brkIvL;  // 断轴刻度 interval（BrkNiceExtent 算一次存这里）
+    List<ChartBreakResolved> resolvedBrkR;  // 右轴断带强类型实体
+    List<ChartBreak> brkR;  // 兼容视图
+    List<double> brkGapR;  // 兼容视图
+    double brkSpanR;
+    double brkIvR;
+    List<ChartBreakResolved> resolvedBrkX;  // X 数值/时间轴断带强类型实体
+    List<ChartBreak> brkX;  // 兼容视图
+    List<double> brkGapX;  // 兼容视图
+    double brkSpanX;
+
+    // 第 i 类目左缘。用 i*W/n 而不是固定 step，余数摊到末格，
+    // 最后一根柱/最后一个标签贴上绘图区右缘。boundaryGap=false
+    // （线落在刻度上）时槽位退化为刻度点：第 i 点 = i*W/(n-1)。
+    int CatLeft(int i, int n) {
+        if (n < 1) { return this.plotX; }
+        if (!this.catBoundaryGap && n > 1) {
+            int px = this.plotX + i * this.plotW / (n - 1);
+            if (px > this.plotX + this.plotW) { px = this.plotX + this.plotW; }
+            return px;
+        }
+        return this.plotX + i * this.plotW / n;
+    }
+    // 第 i 类目的宽度（相邻左缘之差，余数摊在末格）。
+    int CatWidth(int i, int n) {
+        return this.CatLeft(i + 1, n) - this.CatLeft(i, n);
+    }
+    // 第 i 类目的水平中线。
+    int CatMid(int i, int n) {
+        return this.CatLeft(i, n) + this.CatWidth(i, n) / 2;
+    }
+
+    // 第 i 类目上「数据点」的 x：boundaryGap=true（带状，柱/K 线
+    // 默认）落格子中线；false（刻度线模式，ECharts 折线/散点的
+    // 默认轴形态）落刻度本身——首点贴 y 轴、末点贴绘图区右缘。
+    // 折线/散点/十字线/悬浮提示等点几何一律走这里；柱/K 线继续
+    // 用带状 CatLeft/CatMid。
+    int CatX(int i, int n) {
+        if (!this.catBoundaryGap && n > 1) { return this.CatLeft(i, n); }
+        return this.CatMid(i, n);
+    }
+
+    // 局部类目窗口内的像素 -> 类目索引反解；返回值与
+    // CatLeft/CatMid 使用同一整数分桶规则。
+    int CatIndexAt(int px, int n) {
+        if (n < 1 || this.plotW < 1) { return 0 - 1; }
+        int q = px - this.plotX;
+        if (q < 0) { q = 0; }
+        if (q >= this.plotW) { q = this.plotW - 1; }
+        if (!this.catBoundaryGap && n > 1) {
+            // 刻度模式（boundaryGap=false，点贴刻度、末点贴绘图区
+            // 右缘）：按等宽 n 格分桶、像素右缘 q+1 落格定类目——
+            // ECharts axis tooltip 手感，最后一格也能选中末类目。
+            // 带状「最后一个左缘 ≤ 像素」在这里永远够不到 n-1
+            // （CatLeft(n-1)=plotW 是开右端点），末类目的
+            // tooltip 就再也出不来。
+            int fi = (q + 1) * n / this.plotW;
+            if (fi > n - 1) { fi = n - 1; }
+            return fi;
+        }
+        // 带状（boundaryGap=true）：CatLeft 用逐项 floor(i*W/n)
+        // 分桶；反解必须在同一组边界上找最后一个左缘不超过像素
+        // 的位置，不能用 q*n/W（非整除时会在每个余数边界错一格）。
+        int lo = 0;
+        int hi = n;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) / 2;
+            if (this.CatLeft(mid, n) <= this.plotX + q) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < 0) { lo = 0; }
+        if (lo > n - 1) { lo = n - 1; }
+        return lo;
+    }
+
+    // 左轴（axisIndex 0）或右轴（1）上数值对应的像素 Y，
+    // 遵循各轴预设的翻转标志。
+    int YOf(int v, int axisIndex) {
+        // A15：该轴挂有断带时走 elapsed 映射（breakImpl.ts normalize：
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)v, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLog(v, axisIndex); }
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
+        long span = (long)hi - (long)lo;
+        if (span == 0) { span = 1; }
+        int d = (int)(((long)v - (long)lo) * (long)this.plotH / span);
+        if (rev) { return this.plotY + d; }
+        return this.plotY + this.plotH - d;
+    }
+
+    // A15：断轴 Y 映射。axisIndex 轴挂有断带时，把值映进 elapsed
+    // 线性空间再走同一比例映射（elapsed(0)=0 不必成立——elapsed 是
+    // 位移量，值域端点 elapsed(lo)/elapsed(hi) 才是 0/1 锚）。
+    bool BrkHas(int axisIndex) {
+        if (axisIndex == 1) { return this.brkR != null && this.brkR.Count > 0; }
+        return this.brkL != null && this.brkL.Count > 0;
+    }
+
+    int YOfBrk(double v, int axisIndex) {
+        List<ChartBreak> brks = axisIndex == 1 ? this.brkR : this.brkL;
+        List<double> grs = axisIndex == 1 ? this.brkGapR : this.brkGapL;
+        double lo = axisIndex == 1 ? this.rightMin : this.leftMin;
+        double hi = axisIndex == 1 ? this.rightMax : this.leftMax;
+        bool rev = axisIndex == 1 ? this.rightReversed : this.reversed;
+        double span = this.brkSpanR;
+        if (axisIndex != 1) { span = this.brkSpanL; }
+        double eLo = Chart.BrkElapsed(brks, grs, lo);
+        double eHi = Chart.BrkElapsed(brks, grs, hi);
+        double eSpan = eHi - eLo;
+        if (eSpan < 1e-9) { eSpan = 1.0; }
+        double e = Chart.BrkElapsed(brks, grs, v) - eLo;
+        int d = (int)(e * (long)this.plotH / eSpan);
+        if (rev) { return this.plotY + d; }
+        return this.plotY + this.plotH - d;
+    }
+
+    // X 数值/时间轴断轴映射（轴互换/值对折线的 X 数值轴挂断带时）。
+    int XOfBrk(double v) {
+        double eLo = Chart.BrkElapsed(this.brkX, this.brkGapX, (double)this.xLo);
+        double eHi = Chart.BrkElapsed(this.brkX, this.brkGapX, (double)this.xHi);
+        double eSpan = eHi - eLo;
+        if (eSpan < 1e-9) { eSpan = 1.0; }
+        double e = Chart.BrkElapsed(this.brkX, this.brkGapX, v) - eLo;
+        return this.plotX + (int)(e * (long)this.plotW / eSpan);
+    }
+    // YOf 的 16.8 定点版本（1/256 px）：堆叠面积带的填充边界走
+    // 亚像素光栅化（FillBandFx），整数 YOf 会把边界量化到整行，
+    // 缓坡上每列硬跳 1 行——正是"面积边缘锯齿"的来源。
+    int YOfFx(int v, int axisIndex) {
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
+        long span = (long)hi - (long)lo;
+        if (span == 0) { span = 1; }
+        // ×256 定点：大数值时乘积必超 int32（10万×1500×256≈3.8e10）。
+        int d = (int)(((long)v - (long)lo) * ((long)this.plotH * 256) / span);
+        if (rev) { return (this.plotY + this.plotH) * 256 - d; }
+        return this.plotY * 256 + this.plotH * 256 - d;
+    }
+
+    // 小数轴的 Y 映射：v 为 值×1000 定点，leftMinF/leftMaxF（或右轴
+    // rightMinF/rightMaxF）是 ×1000 的轴界（line6 流量 0.86..1.5、
+    // 降雨量 -0.005..-0.955 这类数据在 int Value() 四舍五入后全折成
+    // 1..2 / 0..-1，画成平线）。轴不是小数轴时按整数轴界做定点
+    // 映射：vF=值×1000 对 [lo×1000, hi×1000] 比例映射，整数数据
+    // （vF 恰为 1000 的倍数）与 YOf 逐像素一致，小数数据不再被
+    // vF/1000 截断丢掉小数位。
+    int YOfF(int vF, int axisIndex) {
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLogF(vF, axisIndex); }
+        int loF = this.leftMinF;
+        int hiF = this.leftMaxF;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { loF = this.rightMinF; hiF = this.rightMaxF; rev = this.rightReversed; }
+        if (loF == 0 && hiF == 0) {
+            int lo = this.leftMin;
+            int hi = this.leftMax;
+            if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; }
+            long span = (long)hi - (long)lo;
+            if (span == 0) { span = 1; }
+            long d = ((long)vF - (long)lo * 1000L) * (long)this.plotH / (span * 1000L);
+            if (rev) { return this.plotY + (int)d; }
+            return this.plotY + this.plotH - (int)d;
+        }
+        long spanF = (long)hiF - (long)loF;
+        if (spanF == 0) { spanF = 1; }
+        int dF = (int)(((long)vF - (long)loF) * (long)this.plotH / spanF);
+        if (rev) { return this.plotY + dF; }
+        return this.plotY + this.plotH - dF;
+    }
+
+    // YOfF 的 long 版：亿级整值（candlestick-touch 成交量
+    // 8.6e7、成交额）×1000 定点后 8.6e10 必爆 int32，调用方
+    // 以 long 承载定点值走这里；映射体与 YOfF 同式。
+    int YOfFL(long vF, int axisIndex) {
+        // A15：该轴挂断带时先折进 elapsed 空间（vF 是 ×1000 定点）。
+        if (this.BrkHas(axisIndex)) { return this.YOfBrk((double)vF / 1000.0, axisIndex); }
+        if (axisIndex == 1 ? this.rightLog : this.leftLog) { return this.YOfLogF(vF, axisIndex); }
+        int loF = this.leftMinF;
+        int hiF = this.leftMaxF;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { loF = this.rightMinF; hiF = this.rightMaxF; rev = this.rightReversed; }
+        if (loF == 0 && hiF == 0) {
+            int lo = this.leftMin;
+            int hi = this.leftMax;
+            if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; }
+            long span = (long)hi - (long)lo;
+            if (span == 0) { span = 1; }
+            long d = (vF - (long)lo * 1000L) * (long)this.plotH / (span * 1000L);
+            if (rev) { return this.plotY + (int)d; }
+            return this.plotY + this.plotH - (int)d;
+        }
+        long spanFL = (long)hiF - (long)loF;
+        if (spanFL == 0) { spanFL = 1; }
+        long dFL = (vF - (long)loF) * (long)this.plotH / spanFL;
+        if (rev) { return this.plotY + (int)dFL; }
+        return this.plotY + this.plotH - (int)dFL;
+    }
+
+    // 系列所在轴的零线像素（ECharts 面积/柱的填充基线）：
+    // 0 在该轴范围内时返回其映射（钳制进绘图区），否则返回
+    // 绘图区底——与 ECharts「0 不在范围内时填到对侧边缘」一致。
+    int ZeroBase(int axisIndex) {
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; }
+        if (lo > 0 || hi < 0) { return this.plotY + this.plotH; }
+        int zy = this.YOf(0, axisIndex);
+        if (zy < this.plotY) { zy = this.plotY; }
+        if (zy > this.plotY + this.plotH) { zy = this.plotY + this.plotH; }
+        return zy;
+    }
+
+    // 目标值轴（0 左 / 1 右）的 0 像素——axisLine.onZero 骑线的
+    // 落点（cartesianAxisHelper.ts 的 otherAxis.toGlobalCoord(
+    // dataToCoord(0))）。小数轴走 ×1000 定点域保亚像素精度；
+    // 结果钳制进绘图区（官方同样 clamp 进网格矩形）。
+    int ZeroLineY(int axisIndex) {
+        bool frac = axisIndex == 1
+            ? (this.rightMinF != 0 || this.rightMaxF != 0)
+            : (this.leftMinF != 0 || this.leftMaxF != 0);
+        int zy;
+        if (frac) {
+            int loF = this.leftMinF;
+            int hiF = this.leftMaxF;
+            if (axisIndex == 1) { loF = this.rightMinF; hiF = this.rightMaxF; }
+            zy = Chart.ValueYF1000(this.plotY, this.plotH, loF, hiF, 0);
+        } else {
+            zy = this.YOf(0, axisIndex);
+        }
+        if (zy < this.plotY) { zy = this.plotY; }
+        if (zy > this.plotY + this.plotH) { zy = this.plotY + this.plotH; }
+        return zy;
+    }
+
+    // X 数值轴（catY / 值 X）的 0 像素——y 轴骑线时的落点，
+    // 同样钳制进绘图区。
+    int ZeroLineX() {
+        int zx = this.XOfValue(0);
+        if (zx < this.plotX) { zx = this.plotX; }
+        if (zx > this.plotX + this.plotW) { zx = this.plotX + this.plotW; }
+        return zx;
+    }
+
+    // Y 类目轴第 i 槽的垂直中线（轴互换折线的点行）。
+    int CatMidY(int i, int n) {
+        if (n < 1) { return this.plotY + this.plotH / 2; }
+        // ECharts 类目 Y 轴 index 0 在底部（自下而上）。
+        if (!this.catBoundaryGap && n > 1) {
+            // boundaryGap=false：首尾类目贴绘图区上下缘（刻度线）。
+            return this.plotY + this.plotH - i * this.plotH / (n - 1);
+        }
+        int band = this.plotH / n;
+        if (band < 1) { band = 1; }
+        int y = this.plotY + this.plotH - (i * band + band / 2);
+        if (y < this.plotY) { y = this.plotY; }
+        return y;
+    }
+
+    // X 数值轴上数值 v 的像素（轴互换折线 / 值对折线）。
+    int XOfValue(int v) {
+        // A15：X 数值轴挂断带时走 elapsed 映射。
+        if (this.brkX != null && this.brkX.Count > 0) {
+            return this.XOfBrk((double)v);
+        }
+        return Chart.ValueX(this.plotX, this.plotW, this.xLo, this.xHi, v);
+    }
+
+    // 对数 Y 映射：仅正值（v < 1 钳制到 1），log10 连续线性化后
+    // 按轴范围映射。整数 floor-log10 会把同一数量级内的所有值
+    // 压到同一档（3、5、9 全同高），曲线呈台阶状——官方 type:'log'
+    // 是连续对数。lg 值用 ×1000 定点（Log10F），域差转像素走 long。
+    // 低于/高于范围钳制在绘图区内。
+    int YOfLog(int v, int axisIndex) {
+        // 小数对数域（leftMinF/leftMaxF 生效）走定点口径：整数
+        // floor-log10 承载不了 sub-1 十进位（0.001 线在整数域会被
+        // 钳成 1）。
+        if (this.leftMinF != 0 || this.leftMaxF != 0
+            || this.rightMinF != 0 || this.rightMaxF != 0) {
+            return this.YOfLogF((long)v * 1000L, axisIndex);
+        }
+        if (v < 1) { v = 1; }
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        if (axisIndex == 1) { lo = this.rightMin; hi = this.rightMax; rev = this.rightReversed; }
+        if (lo < 1) { lo = 1; }
+        if (hi < lo + 1) { hi = lo + 1; }
+        long llo = ChartFrame.Log10F(lo);
+        long lhi = ChartFrame.Log10F(hi);
+        if (lhi <= llo) { lhi = llo + 1000; }
+        long d = (ChartFrame.Log10F(v) - llo) * (long)this.plotH / (lhi - llo);
+        if (d < 0) { d = 0; }
+        if (d > (long)this.plotH) { d = this.plotH; }
+        if (rev) { return this.plotY + (int)d; }
+        return this.plotY + this.plotH - (int)d;
+    }
+
+    // 同 YOfLog 但参数是 ×1000 定点的对数轴投影，
+    // 供细分刻度（2.8/4.6 这类非整值）用。
+    // 比 YOfLog 的整数口径多一档尾数分辨率。
+    // 域读取：帧带 leftMinF/leftMaxF（小数对数域，line-log 的
+    // 0.001..10000）时用定点域；否则退回整数域 ×1000。
+    int YOfLogF(long vF, int axisIndex) {
+        long lo;
+        long hi;
+        bool rev = this.reversed;
+        if (axisIndex == 1) {
+            rev = this.rightReversed;
+            if (this.rightMinF != 0 || this.rightMaxF != 0) {
+                lo = this.rightMinF; hi = this.rightMaxF;
+            } else {
+                lo = (long)this.rightMin * 1000L;
+                hi = (long)this.rightMax * 1000L;
+            }
+        } else {
+            if (this.leftMinF != 0 || this.leftMaxF != 0) {
+                lo = this.leftMinF; hi = this.leftMaxF;
+            } else {
+                lo = (long)this.leftMin * 1000L;
+                hi = (long)this.leftMax * 1000L;
+            }
+        }
+        if (lo < 1L) { lo = 1L; }
+        if (hi < lo + 1000L) { hi = lo + 1000L; }
+        if (vF < lo) { vF = lo; }
+        if (vF > hi) { vF = hi; }
+        long llo = ChartFrame.Log10Fx(lo);
+        long lhi = ChartFrame.Log10Fx(hi);
+        if (lhi <= llo) { lhi = llo + 1000L; }
+        long d = (ChartFrame.Log10Fx(vF) - llo) * (long)this.plotH / (lhi - llo);
+        if (d < 0L) { d = 0L; }
+        if (d > (long)this.plotH) { d = (long)this.plotH; }
+        if (rev) { return this.plotY + (int)d; }
+        return this.plotY + this.plotH - (int)d;
+    }
+
+    // 10 的整数对数（floor log10），仅正值（v < 1 → 0）。
+    static int Log10(int v) {
+        if (v < 1) { return 0; }
+        int e = 0;
+        int p = 1;
+        while (p * 10 <= v) { p = p * 10; e = e + 1; }
+        return e;
+    }
+
+    // 连续 log10 ×1000 定点（1/1000 档精度），对数轴前向映射用。
+    // lg 整数段逐档 +1000；尾数段 x∈[1,10) 用四段折线近似
+    // （节点 lg(1)=0、lg(3)≈477、lg(6)≈778、lg(10)=1000 的割线），
+    // 最大偏差 <0.03 档——视觉连续，曲线无台阶。纯整数运算。
+    static long Log10F(int v) {
+        if (v < 1) { return 0; }
+        int e = 0;
+        int x = v;
+        while (x >= 10) {
+            int p = 10;
+            int se = 1;
+            while (x / p >= 10) { p = p * 10; se = se + 1; }
+            e = e + se;
+            x = x / p;
+        }
+        long frac;
+        if (x < 3) {
+            frac = (long)(x - 1) * 239;
+        } else if (x < 6) {
+            frac = 477 + (long)(x - 3) * 100;
+        } else {
+            frac = 778 + (long)(x - 6) * 74;
+        }
+        return (long)e * 1000 + frac;
+    }
+
+    // Log10F 的 ×1000 定点入口版：参数也是定点
+    // （v×1000），尾数段不再被整除截成整数。
+    // 折线节点与 Log10F 同源（lg1=0、lg3≈478、
+    // lg6≈778、lg10=1000），所以对整数点两者
+    // 输出完全一致（Log10Fx(8000*1000)==Log10F(8000)）。
+    static long Log10Fx(long vF) {
+        if (vF <= 0L) { return 0L - 4000L; }
+        // sub-1 定点值（0.5 → 500‰）：先升到 ≥1 档记负指数，
+        // line-log 的 Log1/2 系列 0.5..0.002 才能落到正确的负十进位。
+        long e = 0L;
+        long x = vF;
+        while (x < 1000L) { x = x * 10L; e = e - 1L; }
+        while (x >= 10000L) { x = x / 10L; e = e + 1L; }
+        long frac;
+        if (x < 3000L) { frac = (x - 1000L) * 477L / 2000L; }
+        else if (x < 6000L) { frac = 477L + (x - 3000L) * 301L / 3000L; }
+        else { frac = 778L + (x - 6000L) * 296L / 4000L; }
+        return e * 1000L + frac;
+    }
+
+    // 线性/对数 Y 的像素 -> 值域反解。对数轴与当前
+    // floor-log10 前向映射保持一致，返回所在十进制段的下界。
+    int ValueAtY(int py, int axisIndex) {
+        int lo = this.leftMin;
+        int hi = this.leftMax;
+        bool rev = this.reversed;
+        bool log = this.leftLog;
+        if (axisIndex == 1) {
+            lo = this.rightMin; hi = this.rightMax;
+            rev = this.rightReversed; log = this.rightLog;
+        }
+        if (this.plotH < 1) { return lo; }
+        int q = py - this.plotY;
+        if (q < 0) { q = 0; }
+        if (q > this.plotH) { q = this.plotH; }
+        if (log) {
+            if (lo < 1) { lo = 1; }
+            if (hi < lo + 1) { hi = lo + 1; }
+            // 与连续前向映射（Log10F）同解：定点 lg 值回推所在
+            // 十进制段的下界（精度对齐 YOfLog 的 1/1000 档）。
+            long llo = ChartFrame.Log10F(lo);
+            long lhi = ChartFrame.Log10F(hi);
+            if (lhi <= llo) { lhi = llo + 1000; }
+            long d = rev ? q : this.plotH - q;
+            long e = llo + d * (lhi - llo) / this.plotH;
+            int seg = (int)(e / 1000);
+            int v = Chart.Pow10(seg);
+            if (v < lo) { v = lo; }
+            if (v > hi) { v = hi; }
+            return v;
+        }
+        int d = rev ? q : this.plotH - q;
+        long span = (long)hi - (long)lo;
+        if (span == 0) { span = 1; }
+        return lo + (int)((long)d * span / (long)this.plotH);
+    }
+
+    // 时间 X 映射：整数时间值 → 像素 x，钳制在绘图区内。
+    // 时间跨度（秒/毫秒）× plotW 轻易超 int32，乘法走 long。
+    int XOfTime(int t) {
+        // A15：时间轴断带（intraday-breaks-1/2、matrix-stock 的周内闭市段）：
+        // epoch-ms 值走 elapsed 映射，闭市段整段收敛到 gapReal 宽。
+        if (this.brkX != null && this.brkX.Count > 0) {
+            return this.XOfBrk((double)t);
+        }
+        int lo = this.timeMin;
+        int hi = this.timeMax;
+        long span = (long)hi - (long)lo;
+        if (span == 0) { span = 1; }
+        int d = (int)(((long)t - (long)lo) * (long)this.plotW / span);
+        if (d < 0) { d = 0; }
+        if (d > this.plotW) { d = this.plotW; }
+        return this.plotX + d;
+    }
+
+    // 像素 Y → 数值文本（左/右轴，follows negate 标志）。轴是
+    // 小数轴（leftMinF/rightMinF 生效）时按 1/1000 定点输出小数，
+    // 整数轴与原 Commas 行为一致。
+    string ValueTextAtY(int py, int axisIndex) {
+        int loF = this.leftMinF;
+        int hiF = this.leftMaxF;
+        bool rev = this.reversed;
+        bool yNeg = this.leftNegate;
+        if (axisIndex == 1) { loF = this.rightMinF; hiF = this.rightMaxF; rev = this.rightReversed; yNeg = this.rightNegate; }
+        int q = py - this.plotY;
+        if (q < 0) { q = 0; }
+        if (q > this.plotH) { q = this.plotH; }
+        int d = rev ? q : this.plotH - q;
+        if (loF != 0 || hiF != 0) {
+            long vf = (long)loF + (long)d * ((long)hiF - (long)loF) / this.plotH;
+            return Chart.FracText(yNeg ? (int)(0 - vf) : (int)vf);
+        }
+        int v = this.ValueAtY(py, axisIndex);
+        return Chart.Commas(yNeg ? 0 - v : v);
+    }
+}

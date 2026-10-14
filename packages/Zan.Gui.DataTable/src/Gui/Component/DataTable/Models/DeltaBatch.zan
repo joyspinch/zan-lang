@@ -1,0 +1,92 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+// 一批实时增量。批是应用/传输的最小单元：同批内后面的 op
+// 可以覆盖前面的（同键 upsert 两次 = 一次最终态），应用方
+// 只在整批成功后触发一次刷新。
+class DeltaBatch {
+    static const int FormatVersion = 1;
+
+    int version;
+    List<DeltaOp> ops;
+
+    // 构造空批，版本固定为 FormatVersion。
+    DeltaBatch() {
+        this.version = DeltaBatch.FormatVersion;
+        this.ops = new List<DeltaOp>();
+    }
+
+    // 创建空批。
+    static DeltaBatch Create() {
+        return new DeltaBatch();
+    }
+
+    // 追加一个 op 的瘦身拷贝；null 忽略。
+    void Add(DeltaOp op) {
+        if (op != null) { this.ops.Add(op.Copy()); }
+    }
+
+    // 批内 op 数。
+    int Count() { return this.ops.Count; }
+    // 第 i 个 op。
+    DeltaOp At(int i) { return this.ops[i]; }
+    // 批格式版本。
+    int Version() { return this.version; }
+
+    // 同键去重合并：保留每个 (键, 种类, cell 的列) 组合中最后一次
+    // 出现的 op。批次典型规模是几十条，O(n²) 保序线性扫描足够。
+    void Compress() {
+        List<DeltaOp> kept = new List<DeltaOp>();
+        for (int i = 0; i < this.ops.Count; i = i + 1) {
+            DeltaOp op = this.ops[i];
+            int hit = -1;
+            for (int j = 0; j < kept.Count; j = j + 1) {
+                DeltaOp prior = kept[j];
+                bool sameRow = prior.Key() == op.Key();
+                bool sameKind = prior.Kind() == op.Kind();
+                bool sameField = op.Kind() != DeltaOp.Cell
+                    || prior.Field() == op.Field();
+                if (sameRow && sameKind && sameField) { hit = j; }
+            }
+            if (hit >= 0) { kept[hit] = op; }
+            else { kept.Add(op); }
+        }
+        this.ops = kept;
+    }
+
+    // 批的 JSON 形式（ver/ops 数组）。
+    JsonValue ToJsonValue() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(this.version)));
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.ops.Count; i = i + 1) {
+            arr.Append(this.ops[i].ToJsonValue());
+        }
+        root.Put("ops", arr);
+        return root;
+    }
+
+    // ToJsonValue 的序列化文本。
+    string ToJson() { return this.ToJsonValue().ToJson(); }
+
+    // 解析一批；文本为空、结构不是对象、版本未知或任何一条 op
+    // 非法时返回 null——部分应用的批次会造成幽灵行，宁缺毋滥。
+    static DeltaBatch FromJson(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null || !root.IsObject()) { return null; }
+        if (!root.Has("ver") || !root.Has("ops")) { return null; }
+        if (root.Int("ver", 0) != DeltaBatch.FormatVersion) { return null; }
+        JsonValue arr = root.Get("ops");
+        if (arr == null || !arr.IsArray()) { return null; }
+        DeltaBatch batch = new DeltaBatch();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            DeltaOp op = DeltaOp.FromJsonValue(arr.At(i));
+            if (op == null) { return null; }
+            batch.ops.Add(op);
+        }
+        return batch;
+    }
+}

@@ -1,0 +1,301 @@
+using System;
+using System.Json;
+using Gui;
+
+namespace Gui.Component.Chart;
+
+// 纯饼图布局：把可见 Pie 系列的 data 项归一化为扇区，供
+// chart_pie_layout 测试直接断言几何。语义：
+// - 每条可见 Pie series 的每个 ChartData 是一个扇区；
+// - 隐藏扇区（data.hidden 或系列 hidden）不进 total，也不占角度；
+// - pieRings=true 时每条可见系列 = 一独立环，各自计算 total
+// （各自 360°）；否则所有可见系列的扇区合并进同一张饼；
+// - 颜色解析：数据项色 > 单数据项系列的系列色 > 按扇区序调色板。
+// - 总和用 long 宽累计（totalWide / ringTotalWide），角度与
+// 百分比一律按宽值计算；int total / ringTotal 是饱和兼容
+// 字段，超过 int 上限时钉在 int.MaxValue。
+// 不触碰 App/Canvas —— (主题, 选项) 进，扇区几何出。
+class PieLayout {
+    List<PieSlice> slices;
+    int total;  // 兼容字段：总和超过 int 上限时饱和为 int.MaxValue
+    long totalWide;  // 非环模式：所有可见扇区值之和（未截断）
+    int ringCount;  // 环数（非环模式 = 1）
+    List<PieRingMeta> rings;  // 逐环实体列表（消除平行列表）
+    List<int> ringTotal;  // 兼容转发字段（映射 rings 实体数据）
+    List<long> ringTotalWide;  // 兼容转发字段（映射 rings 实体数据）
+    List<int> ringInner;  // 兼容转发字段（映射 rings 实体数据）
+    List<ChartPosition> ringCenter;  // 兼容转发字段（映射 rings 实体数据）
+    List<ChartScalar> ringRadius;  // 兼容转发字段（映射 rings 实体数据）
+    List<ChartScalar> ringRadiusIn;  // 兼容转发字段（映射 rings 实体数据）
+    int rot;  // 起始边顺时针偏移（度）：90 - series.startAngle
+
+    // 归一化布局入口：收集可见 Pie 系列的全部正值非隐藏数据项；
+    // 环模式（pieRings）逐环独立 total，合并模式共享 total；
+    // startAngle 换算为起始边顺时针偏移 rot。无可见 Pie 系列
+    // 或 total < 1 时返回空布局。
+    static PieLayout Of(Theme t, ChartOption o) {
+        PieLayout l = new PieLayout();
+        l.slices = new List<PieSlice>();
+        l.rings = new List<PieRingMeta>();
+        l.ringTotal = new List<int>();
+        l.ringTotalWide = new List<long>();
+        l.ringInner = new List<int>();
+        l.ringCenter = new List<ChartPosition>();
+        l.ringRadius = new List<ChartScalar>();
+        l.ringRadiusIn = new List<ChartScalar>();
+        l.total = 0;
+        l.totalWide = 0;
+        l.ringCount = 0;
+        l.rot = 0;
+
+        // 可见 Pie 系列（隐藏系列不参与）。origIdx 记录其在
+        // o.series 里的原始下标——扇区命中要回查该系列的 itemStyle。
+        List<ChartSeries> pies = new List<ChartSeries>();
+        List<int> origIdx = new List<int>();
+        bool ringGeo = false;
+        for (int i = 0; i < o.series.Count; i = i + 1) {
+            ChartSeries s = o.series[i];
+            if (!s.hidden && s.type == ChartType.Pie) {
+                pies.Add(s);
+                origIdx.Add(i);
+                // 任一系列自带 center/radius（ECharts 多饼/多环布局）
+                // 即按逐环独立几何走环模式。
+                if (s.center != null || s.radius != null || s.radiusInner != null) {
+                    ringGeo = true;
+                }
+            }
+        }
+        if (pies.Count < 1) { return l; }
+        // ECharts startAngle 是数学角（0=3 点钟，逆时针），默认 90
+        // 视觉上=12 点钟；本库扇区角 0=12 点钟顺时针，换算 90-值。
+        l.rot = ((90 - pies[0].startAngle) % 360 + 360) % 360;
+
+        if (o.pieRings || ringGeo) {
+            // 每条可见系列 = 一环，各自 total。ECharts 嵌套饼的系列
+            // 按内→外排列（series[0] 是最内实心饼，后续依次向外），
+            // 而环号 0 = 最外，故系列 si 落在环 ringCount-1-si
+            // （pie3：来源实心内饼 + 细分外环）。
+            l.ringCount = pies.Count;
+            for (int si = pies.Count - 1; si >= 0; si = si - 1) {
+                ChartSeries s = pies[si];
+                int inner = s.innerPct;
+                // 多环的内外径是逐环布局语义，没有全局 donut 回退：
+                // innerPct=0 即从圆心画起的实心饼（ECharts
+                // radius [0, x%]）；单环保留 donutPct 回退。
+                if (inner <= 0 && pies.Count == 1) { inner = o.donutPct; }
+                if (inner < 0) { inner = 0; }
+                if (inner > 95) { inner = 95; }
+                long rt = 0;
+                for (int di = 0; di < s.Count(); di = di + 1) {
+                    if (!s.data[di].hidden && s.Value(di) > 0) {
+                        rt = rt + s.Value(di);
+                    }
+                }
+                PieRingMeta rm = new PieRingMeta();
+                rm.innerPct = inner;
+                rm.center = s.center;
+                rm.radius = s.radius;
+                rm.radiusInner = s.radiusInner;
+                rm.totalWide = rt;
+                rm.total = PieLayout.ClampInt(rt);
+                l.rings.Add(rm);
+                l.ringInner.Add(rm.innerPct);
+                l.ringCenter.Add(rm.center);
+                l.ringRadius.Add(rm.radius);
+                l.ringRadiusIn.Add(rm.radiusInner);
+                l.ringTotalWide.Add(rm.totalWide);
+                l.ringTotal.Add(rm.total);
+                l.totalWide = l.totalWide + rt;
+                l.total = PieLayout.ClampInt(l.totalWide);
+                if (rt < 1) { continue; }
+                // ECharts sort（玫瑰图系列）：'ascending' 按值升序铺
+                // 扇区（pie4 面积模式）。饼图默认保持 data 顺序——
+                // sort 字段默认值来自 funnel，不据此重排。
+                List<int> order = new List<int>();
+                for (int di4 = 0; di4 < s.Count(); di4 = di4 + 1) {
+                    order.Add(di4);
+                }
+                if (s.roseType.Length > 0 && s.sort == "ascending") {
+                    for (int oi = 0; oi < order.Count; oi = oi + 1) {
+                        for (int oj = oi + 1; oj < order.Count; oj = oj + 1) {
+                            if (s.Value(order[oj]) < s.Value(order[oi])) {
+                                int tmpO = order[oi];
+                                order[oi] = order[oj];
+                                order[oj] = tmpO;
+                            }
+                        }
+                    }
+                }
+                // 玫瑰图：radius 模式外径随值线性（v/vMax），area 模式
+                // 等角均分 + 外径 ∝ √(v/vMax)（面积∝值，最大片贴外
+                // 径）。统一折算成带内千分比 roseP，渲染时在环内径..
+                // 环外径间内插。
+                int roseMax = 0;
+                int roseVis = 0;
+                if (s.roseType.Length > 0) {
+                    for (int di5 = 0; di5 < s.Count(); di5 = di5 + 1) {
+                        if (!s.data[di5].hidden && s.Value(di5) > 0) {
+                            roseVis = roseVis + 1;
+                            if (s.Value(di5) > roseMax) { roseMax = s.Value(di5); }
+                        }
+                    }
+                }
+                long acc = 0;
+                int visIdx = 0;
+                for (int oi2 = 0; oi2 < order.Count; oi2 = oi2 + 1) {
+                    ChartData d = s.data[order[oi2]];
+                    if (d.hidden) { continue; }
+                    int v = s.Value(order[oi2]);
+                    if (v <= 0) { continue; }
+                    int a0;
+                    int a1;
+                    if (s.roseType == "area" && roseVis > 0) {
+                        // 面积模式等角：可见片均分 360°。
+                        a0 = visIdx * 360 / roseVis;
+                        a1 = (visIdx + 1) * 360 / roseVis;
+                    } else {
+                        a0 = (int)(acc * 360 / rt);
+                        a1 = (int)((acc + v) * 360 / rt);
+                    }
+                    visIdx = visIdx + 1;
+                    // clockWise=false：逆时针铺扇区——把顺时针弧
+                    // [a0,a1] 镜像为 [360-a1, 360-a0]，几何消费端
+                    // 仍用顺时针域绘制。
+                    if (!s.clockWise) {
+                        int mA = 360 - a1;
+                        a1 = 360 - a0;
+                        a0 = mA;
+                        if (a0 < 0) { a0 = 0; }
+                        if (a1 > 360) { a1 = 360; }
+                    }
+                    l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, order[oi2], PieLayout.SlicePalIndex(o, s, order[oi2], origIdx[si] * 16 + order[oi2])),
+                        PieLayout.SliceName(s, order[oi2]), origIdx[si], order[oi2], a0, a1,
+                        pies.Count - 1 - si));
+                    l.slices[l.slices.Count - 1].selected = d.selected;
+                    if (s.roseType == "radius" && roseMax > 0) {
+                        l.slices[l.slices.Count - 1].roseP = v * 1000 / roseMax;
+                    } else if (s.roseType == "area" && roseMax > 0) {
+                        // 半径 ∝ √(v/vMax)：ISqrt(v·10^6/maxV)
+                        // = 1000·sqrt(v/maxV)（v ≤ maxV，商 ≤ 10^6）。
+                        l.slices[l.slices.Count - 1].roseP =
+                            ChartView.ISqrt((int)((long)v * 1000000 / roseMax));
+                    }
+                    acc = acc + v;
+                }
+            }
+            return l;
+        }
+
+        // 非环模式：合并所有可见系列的扇区，共享一个 total。
+        l.ringCount = 1;
+        int leadInner = 0;
+        if (pies[0].innerPct > 0) { leadInner = pies[0].innerPct; }
+        else { leadInner = o.donutPct; }
+        if (leadInner < 0) { leadInner = 0; }
+        if (leadInner > 95) { leadInner = 95; }
+        long total = 0;
+        for (int p = 0; p < pies.Count; p = p + 1) {
+            ChartSeries s = pies[p];
+            for (int di = 0; di < s.Count(); di = di + 1) {
+                if (!s.data[di].hidden && s.Value(di) > 0) {
+                    total = total + s.Value(di);
+                }
+            }
+        }
+        PieRingMeta rm0 = new PieRingMeta();
+        rm0.innerPct = leadInner;
+        rm0.totalWide = total;
+        rm0.total = PieLayout.ClampInt(total);
+        l.rings.Add(rm0);
+        l.ringInner.Add(rm0.innerPct);
+        l.ringCenter.Add(null);
+        l.ringRadius.Add(null);
+        l.ringRadiusIn.Add(null);
+        l.ringTotalWide.Add(rm0.totalWide);
+        l.ringTotal.Add(rm0.total);
+        l.totalWide = total;
+        l.total = PieLayout.ClampInt(total);
+        if (total < 1) { return l; }
+        long acc2 = 0;
+        for (int p2 = 0; p2 < pies.Count; p2 = p2 + 1) {
+            ChartSeries s = pies[p2];
+            for (int di2 = 0; di2 < s.Count(); di2 = di2 + 1) {
+                ChartData d = s.data[di2];
+                if (d.hidden) { continue; }
+                int v = s.Value(di2);
+                if (v <= 0) { continue; }
+                int a0 = (int)(acc2 * 360 / total);
+                int a1 = (int)((acc2 + v) * 360 / total);
+                l.slices.Add(PieSlice.Of(v, PieLayout.SliceColor(t, s, di2, PieLayout.SlicePalIndex(o, s, di2, origIdx[p2] * 16 + di2)),
+                    PieLayout.SliceName(s, di2), origIdx[p2], di2, a0, a1, 0));
+                l.slices[l.slices.Count - 1].selected = d.selected;
+                acc2 = acc2 + v;
+            }
+        }
+        return l;
+    }
+
+    // long -> int 饱和夹取：兼容字段保持正值语义，超过 int 上限
+    // 钉在 int.MaxValue，不发生二补码回绕成负数。
+    static int ClampInt(long v) {
+        if (v > 2147483647) { return 2147483647; }
+        if (v < 0) { return 0; }
+        return (int)v;
+    }
+
+    // ECharts 同名同色：扇区调色板下标按名字在整个 option 中首次
+    // 出现的顺序（去重）分配——多饼同板时同名项恒取同色（官方
+    // pie.opt.js 三饼里 直达 恒为第 1 色、邮件营销 恒为第 4 色）。
+    // 无名项回落 fallback（系列下标*16+项下标）。
+    static int GlobalColorIndex(ChartOption o, string nm, int fallback) {
+        if (nm == null || nm.Length == 0) { return fallback; }
+        List<string> seen = new List<string>();
+        for (int a = 0; a < o.series.Count; a = a + 1) {
+            ChartSeries ps = o.series[a];
+            for (int b = 0; b < ps.data.Count; b = b + 1) {
+                string pn = PieLayout.SliceName(ps, b);
+                if (pn.Length == 0) { continue; }
+                bool dup = false;
+                for (int c3 = 0; c3 < seen.Count; c3 = c3 + 1) {
+                    if (seen[c3] == pn) { dup = true; break; }
+                }
+                if (!dup) { seen.Add(pn); }
+            }
+        }
+        for (int c4 = 0; c4 < seen.Count; c4 = c4 + 1) {
+            if (seen[c4] == nm) { return c4; }
+        }
+        return fallback;
+    }
+
+    // 扇区调色板下标入口：数据项自带名字才参与同名同色去重
+    // （ECharts 语义按项名，不是系列名）；无名项回落 fallback
+    // （系列下标*16+项下标），各项取各自的色。不能拿 SliceName
+    // 的系列名回退去重——同一系列的无名项会全部共享系列名的
+    // 同一个下标，整张单色。
+    static int SlicePalIndex(ChartOption o, ChartSeries s, int di,
+                             int fallback) {
+        if (di >= 0 && di < s.data.Count && s.data[di].name.Length > 0) {
+            return PieLayout.GlobalColorIndex(o, s.data[di].name, fallback);
+        }
+        return fallback;
+    }
+
+    // 扇区颜色：数据项色 > 单数据项系列的系列色 > 按数据项下标调色板。
+    // 用 di（而不是可见扇区序）着色，图例开关后颜色不会错位。
+    static int SliceColor(Theme t, ChartSeries s, int di, int sliceIndex) {        if (di >= 0 && di < s.data.Count && s.data[di].color != 0) {
+            return s.data[di].color;
+        }
+        if (s.data.Count <= 1 && s.color != 0) { return s.color; }
+        return Chart.Palette(t, sliceIndex);
+    }
+
+    // 扇区名：数据项名优先，其次系列名，最后回退到序号。
+    static string SliceName(ChartSeries s, int di) {
+        if (di >= 0 && di < s.data.Count && s.data[di].name.Length > 0) {
+            return s.data[di].name;
+        }
+        if (s.name.Length > 0) { return s.name; }
+        return "Item " + Convert.ToString(di + 1);
+    }
+}

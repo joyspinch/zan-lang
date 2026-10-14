@@ -6,59 +6,6 @@ using Gui.Component.DataTable;
 
 namespace Gui.Component.DataTable;
 
-// DataTable 的 XLSX 导出支路：XlsxRowSource 适配器与 xlsx 写盘核心。
-// 单独成文件是发布体积治理的一环——XlsxBook/Deflate/Zip 流式写盘
-// 家族（~770 行 + Compression 依赖）只有真的导出 Excel 的程序才
-// 需要；CSV 支路只要 StreamWriter。与按需拉取的 GridImageSlot 同一
-// 机理：partial 家族的分片随 "DataTable" 名字整体拉入，本文件
-// 绝不能声明 partial DataTable（类名一进 top 名单，家族触发词
-// 就把 Xlsx 拖回每个放表格的程序），写盘核心改挂独立类
-// DataTableXlsx；ExportJob.Worker 的分派行是唯一反向引用——
-// 未拉入本文件时那行代码不可达，但按需拉取按名计数，所以
-// Worker 只拼 ExportJob/ExportCsvSnapshot（主文件），xlsx 分派
-// 经 DataTableXlsx.ExportSnapshot 二跳。VM 契约：本文件被拉入
-// 的前提是有人真的导出 xlsx，此刻家族必然完整在图。
-
-// <see cref="XlsxRowSource"/> 适配器：把快照 + DataSource 逐行喂给
-// 流式写盘。排序/过滤/勾选状态已在快照里冻结（所见即所得）；
-// CellText/CellNum 等直接读应用侧数据源——导出期间应用不应改写
-// 数据源内容（行数上限 1048576 由 XlsxBook 自动分表兜住）。
-class DataTableRowSource : XlsxRowSource {
-    public DataSource src;
-    public List<DataColumn> cols;
-    public DataTableExportSnapshot snap;
-    public DataTableExportProgress progress;
-
-    // 行数 = 快照行数 + 1（表头行）。
-    override int RowCount() { return this.snap.rows.Count + 1; }
-
-    // index 0 写表头（快照列区间内的列标题），其余按快照行序
-    // 逐格写出数据行。
-    override bool FillRow(int index, List<XlsxCell> row) {
-        if (index == 0) {
-            for (int cc = this.snap.c0; cc <= this.snap.c1; cc = cc + 1) {
-                row.Add(XlsxCell.Str(this.cols[cc].title));
-            }
-            return true;
-        }
-        int ri = this.snap.rows[index - 1];
-        for (int cc = this.snap.c0; cc <= this.snap.c1; cc = cc + 1) {
-            row.Add(DataTableXlsx.ExportCell(cc, this.cols, this.cols[cc], this.src, ri));
-        }
-        return true;
-    }
-
-    // 把写盘进度转发给调用方钩子；未挂接 progress 时忽略。
-    override void OnProgress(int done, int total) {
-        if (this.progress != null) { this.progress.OnProgress(done, total); }
-    }
-
-    // 把取消询问转发给调用方钩子；未挂接 progress 时恒不取消。
-    override bool Cancelled() {
-        return this.progress != null && this.progress.Cancelled();
-    }
-}
-
 // xlsx 写盘核心与带弹层的导出入口（原 DataTable partial 的
 // XLSX 支路，见文件头）。
 class DataTableXlsx {

@@ -1,0 +1,334 @@
+using System;
+using System.Json;
+
+namespace Gui.Component.DataTable;
+
+// 可传给本地/远端查询执行器的稳定查询快照。
+// 过滤器和排序键只使用声明式标量，不捕获 lambda 或 UI 对象，
+// 因而可以直接序列化、哈希和下推到服务端。
+class QueryDescriptor {
+    static const int FormatVersion = 1;
+
+    int version;
+    string dataset;
+    int dataRevision;
+    int queryRevision;
+    int viewRevision;
+    int capabilities;
+    List<QueryFilterClause> filters;
+    List<QuerySortClause> sorts;
+    List<QueryGroupClause> groups;
+    List<QueryAggregateClause> aggregates;
+
+    // 构造空查询描述：版本固定为 FormatVersion，四类子句列表为空；
+    // datasetName 为 null 记空串。
+    QueryDescriptor(string datasetName, int dataRev, int queryRev,
+                    int viewRev, int caps) {
+        this.version = QueryDescriptor.FormatVersion;
+        if (datasetName == null) { datasetName = ""; }
+        this.dataset = datasetName;
+        this.dataRevision = dataRev;
+        this.queryRevision = queryRev;
+        this.viewRevision = viewRev;
+        this.capabilities = caps;
+        this.filters = new List<QueryFilterClause>();
+        this.sorts = new List<QuerySortClause>();
+        this.groups = new List<QueryGroupClause>();
+        this.aggregates = new List<QueryAggregateClause>();
+    }
+
+    // 从表格状态取 data/query/view 三个 revision 构造描述。
+    static QueryDescriptor Of(DataTableState st, string datasetName, int caps) {
+        return new QueryDescriptor(datasetName, st.dataRevision,
+            st.queryRevision, st.viewRevision, caps);
+    }
+
+    // 目标数据集名。
+    string Dataset() { return this.dataset; }
+    // 数据内容 revision。
+    int DataRevision() { return this.dataRevision; }
+    // 查询参数 revision。
+    int QueryRevision() { return this.queryRevision; }
+    // 视图（几何/显示）revision。
+    int ViewRevision() { return this.viewRevision; }
+    // 能力掩码。
+    int Capabilities() { return this.capabilities; }
+    // 过滤子句列表（构建阶段可变）。
+    List<QueryFilterClause> Filters() { return this.filters; }
+    // 排序子句列表（构建阶段可变）。
+    List<QuerySortClause> Sorts() { return this.sorts; }
+    // 分组子句列表（构建阶段可变）。
+    List<QueryGroupClause> Groups() { return this.groups; }
+    // 聚合子句列表（构建阶段可变）。
+    List<QueryAggregateClause> Aggregates() { return this.aggregates; }
+
+    // 追加一个过滤子句；null 忽略。
+    void AddFilter(QueryFilterClause clause) {
+        if (clause != null) { this.filters.Add(clause); }
+    }
+
+    // 追加一个排序子句；null 忽略。
+    void AddSort(QuerySortClause clause) {
+        if (clause != null) { this.sorts.Add(clause); }
+    }
+
+    // 追加一个分组子句；null 忽略。
+    void AddGroup(QueryGroupClause clause) {
+        if (clause != null) { this.groups.Add(clause); }
+    }
+
+    // 追加一个聚合子句；null 忽略。
+    void AddAggregate(QueryAggregateClause clause) {
+        if (clause != null) { this.aggregates.Add(clause); }
+    }
+
+    // 清空过滤子句。
+    void ClearFilters() { this.filters.Clear(); }
+    // 清空排序子句。
+    void ClearSorts() { this.sorts.Clear(); }
+    // 清空分组子句。
+    void ClearGroups() { this.groups.Clear(); }
+    // 清空聚合子句。
+    void ClearAggregates() { this.aggregates.Clear(); }
+
+    // 校验并构建查询计划（列数已知，columnCount<0 表示未知）。
+    QueryPlan BuildPlan(int columnCount, QueryCapabilities supported) {
+        return QueryPlan.Build(this, columnCount, supported);
+    }
+
+    // 校验并构建查询计划（追加 schema 值类型匹配检查）。
+    QueryPlan BuildPlan(List<SchemaColumn> schema, QueryCapabilities supported) {
+        return QueryPlan.Build(this, schema, supported);
+    }
+
+    // 逻辑查询相同的判断不包含 viewRevision；列宽、隐藏和冻结不应
+    // 让远端查询缓存失效。
+    bool SameQuery(QueryDescriptor other) {
+        if (other == null) { return false; }
+        return this.version == other.version
+            && this.dataset == other.dataset
+            && this.dataRevision == other.dataRevision
+            && this.queryRevision == other.queryRevision
+            && this.capabilities == other.capabilities
+            && this.QueryJson() == other.QueryJson();
+    }
+
+    // 渲染/显示快照是否仍对应当前状态。
+    bool IsCurrent(DataTableState st) {
+        if (st == null) { return false; }
+        return this.dataRevision == st.dataRevision
+            && this.queryRevision == st.queryRevision
+            && this.viewRevision == st.viewRevision;
+    }
+
+    // 单个过滤子句的 JSON 形式（col/op/kind/a/b）。
+    JsonValue FilterJson(QueryFilterClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        value.Put("a", JsonValue.NewStr(clause.Value()));
+        value.Put("b", JsonValue.NewStr(clause.Value2()));
+        return value;
+    }
+
+    // 单个排序子句的 JSON 形式（col/dir/kind）。
+    JsonValue SortJson(QuerySortClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("dir", JsonValue.NewNum(Convert.ToString(clause.Direction())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
+    }
+
+    // 单个分组子句的 JSON 形式（col/kind）。
+    JsonValue GroupJson(QueryGroupClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
+    }
+
+    // 单个聚合子句的 JSON 形式（col/op/kind）。
+    JsonValue AggregateJson(QueryAggregateClause clause) {
+        JsonValue value = JsonValue.NewObject();
+        value.Put("col", JsonValue.NewNum(Convert.ToString(clause.Column())));
+        value.Put("op", JsonValue.NewNum(Convert.ToString(clause.Mode())));
+        value.Put("kind", JsonValue.NewNum(Convert.ToString(clause.Kind())));
+        return value;
+    }
+
+    // 把 groups/aggregates 数组写入 root；相应类别为空时不写键。
+    void PutShape(JsonValue root) {
+        JsonValue groups = JsonValue.NewArray();
+        for (int i = 0; i < this.groups.Count; i = i + 1) {
+            groups.Append(this.GroupJson(this.groups[i]));
+        }
+        if (this.groups.Count > 0) { root.Put("groups", groups); }
+        JsonValue aggregates = JsonValue.NewArray();
+        for (int i = 0; i < this.aggregates.Count; i = i + 1) {
+            aggregates.Append(this.AggregateJson(this.aggregates[i]));
+        }
+        if (this.aggregates.Count > 0) { root.Put("aggregates", aggregates); }
+    }
+
+    // 完整描述的 canonical JSON：字段写入顺序固定，含 filters/sorts/
+    // groups/aggregates（空类别不写键）；view revision 也在其中。
+    JsonValue ToJsonValue() {
+        JsonValue root = JsonValue.NewObject();
+        // 字段写入顺序固定，ToJson() 可作为稳定 canonical 文本。
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(this.version)));
+        root.Put("dataset", JsonValue.NewStr(this.dataset));
+        root.Put("data", JsonValue.NewNum(Convert.ToString(this.dataRevision)));
+        root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
+        root.Put("view", JsonValue.NewNum(Convert.ToString(this.viewRevision)));
+        root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
+        JsonValue filters = JsonValue.NewArray();
+        for (int i = 0; i < this.filters.Count; i = i + 1) {
+            filters.Append(this.FilterJson(this.filters[i]));
+        }
+        if (this.filters.Count > 0) { root.Put("filters", filters); }
+        JsonValue sorts = JsonValue.NewArray();
+        for (int i = 0; i < this.sorts.Count; i = i + 1) {
+            sorts.Append(this.SortJson(this.sorts[i]));
+        }
+        if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
+        this.PutShape(root);
+        return root;
+    }
+
+    // ToJsonValue 的序列化文本（完整描述的 canonical JSON）。
+    string ToJson() { return this.ToJsonValue().ToJson(); }
+
+    // 供查询执行和页缓存使用的逻辑 canonical。视图 revision 不属于
+    // 数据内容身份；列宽、隐藏和冻结变化不应丢弃已获取的查询页。
+    string QueryJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Put("ver", JsonValue.NewNum(Convert.ToString(this.version)));
+        root.Put("dataset", JsonValue.NewStr(this.dataset));
+        root.Put("data", JsonValue.NewNum(Convert.ToString(this.dataRevision)));
+        root.Put("query", JsonValue.NewNum(Convert.ToString(this.queryRevision)));
+        root.Put("caps", JsonValue.NewNum(Convert.ToString(this.capabilities)));
+        JsonValue filters = JsonValue.NewArray();
+        for (int i = 0; i < this.filters.Count; i = i + 1) {
+            filters.Append(this.FilterJson(this.filters[i]));
+        }
+        if (this.filters.Count > 0) { root.Put("filters", filters); }
+        JsonValue sorts = JsonValue.NewArray();
+        for (int i = 0; i < this.sorts.Count; i = i + 1) {
+            sorts.Append(this.SortJson(this.sorts[i]));
+        }
+        if (this.sorts.Count > 0) { root.Put("sorts", sorts); }
+        this.PutShape(root);
+        return root.ToJson();
+    }
+
+    // FNV-1a 的 30 位稳定查询指纹；只是缓存键辅助，不替代文本比较。
+    int QueryFingerprint() {
+        int h = 0x811C9DC5;
+        string text = this.QueryJson();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            h = ((h ^ ((int)text[i] & 255)) * 16777619) & 1073741823;
+        }
+        return h;
+    }
+
+    // 完整描述的旧入口保留兼容；查询缓存使用 QueryFingerprint。
+    int Fingerprint() {
+        int h = 0x811C9DC5;
+        string text = this.ToJson();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            h = ((h ^ ((int)text[i] & 255)) * 16777619) & 1073741823;
+        }
+        return h;
+    }
+
+    // 从 ToJson 文本恢复描述。文本为空、结构不符、版本不匹配、
+    // revision/caps 为负或任一子句非法时返回 null。
+    static QueryDescriptor FromJson(string text) {
+        if (text == null || text.Length == 0) { return null; }
+        JsonValue root = JsonValue.ParseLenient(text);
+        if (root == null || !root.IsObject()) { return null; }
+        if (!root.Has("ver") || !root.Has("dataset") || !root.Has("data")
+            || !root.Has("query") || !root.Has("view") || !root.Has("caps")) {
+            return null;
+        }
+        if (root.Int("ver", 0) != QueryDescriptor.FormatVersion) { return null; }
+        int dataRev = root.Int("data", -1);
+        int queryRev = root.Int("query", -1);
+        int viewRev = root.Int("view", -1);
+        int caps = root.Int("caps", -1);
+        if (dataRev < 0 || queryRev < 0 || viewRev < 0 || caps < 0) { return null; }
+        QueryDescriptor result = new QueryDescriptor(root.Str("dataset", ""),
+            dataRev, queryRev, viewRev, caps);
+        JsonValue filters = root.Get("filters");
+        if (filters != null) {
+            if (!filters.IsArray()) { return null; }
+            for (int i = 0; i < filters.Count(); i = i + 1) {
+                JsonValue item = filters.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("op") || !item.Has("kind")
+                    || !item.Has("a") || !item.Has("b")) { return null; }
+                int col = item.Int("col", -1);
+                int op = item.Int("op", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || op < QueryFilterMode.Equals
+                    || op > QueryFilterMode.NotEmpty || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddFilter(new QueryFilterClause(col, op,
+                    item.Str("a", ""), item.Str("b", ""), kind));
+            }
+        }
+        JsonValue sorts = root.Get("sorts");
+        if (sorts != null) {
+            if (!sorts.IsArray()) { return null; }
+            for (int i = 0; i < sorts.Count(); i = i + 1) {
+                JsonValue item = sorts.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("dir") || !item.Has("kind")) {
+                    return null;
+                }
+                int col = item.Int("col", -1);
+                int dir = item.Int("dir", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || (dir != 1 && dir != 2) || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddSort(new QuerySortClause(col, dir, kind));
+            }
+        }
+        JsonValue groups = root.Get("groups");
+        if (groups != null) {
+            if (!groups.IsArray()) { return null; }
+            for (int i = 0; i < groups.Count(); i = i + 1) {
+                JsonValue item = groups.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("kind")) { return null; }
+                int col = item.Int("col", -1);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || kind < 0 || kind > 3) { return null; }
+                result.AddGroup(new QueryGroupClause(col, kind));
+            }
+        }
+        JsonValue aggregates = root.Get("aggregates");
+        if (aggregates != null) {
+            if (!aggregates.IsArray()) { return null; }
+            for (int i = 0; i < aggregates.Count(); i = i + 1) {
+                JsonValue item = aggregates.At(i);
+                if (item == null || !item.IsObject()
+                    || !item.Has("col") || !item.Has("op") || !item.Has("kind")) {
+                    return null;
+                }
+                int col = item.Int("col", -1);
+                int op = item.Int("op", 0);
+                int kind = item.Int("kind", -1);
+                if (col < 0 || op < 1 || op > 5 || kind < 0 || kind > 3) {
+                    return null;
+                }
+                result.AddAggregate(new QueryAggregateClause(col, op, kind));
+            }
+        }
+        return result;
+    }
+}

@@ -1,0 +1,88 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// "bandgrid" 适配器：把数值序列按行优先灌进 BandGrid 矩阵。
+// 形状缺省 1×序列长度（单行条）；heatBand 经 HeatBands 映射为
+// 底色梯度回调。点击/拖选随 BandGrid 自身交互，CompPos 读其
+// CellRow/CellCol。
+class BandGridComp : CellComp {
+    // 池：键 = RowKey 序列化文本 + 列号。控件与形状缓存在一起，
+    // 形状变化（列配置重声明）时重建。
+    List<string> poolKeys;
+    List<Control> poolCtl;
+    List<int> poolShape;
+
+    BandGridComp() : base("bandgrid") {
+        this.poolKeys = new List<string>();
+        this.poolCtl = new List<Control>();
+        this.poolShape = new List<int>();
+    }
+
+    override Control Acquire(App app, DataSource src, int row, int col,
+                             RowKey key, int x, int y, int w, int h,
+                             int rows, int cols) {
+        string k = key.Canonical() + ":" + Convert.ToString(col);
+        int shape = rows * 1024 + cols;
+        for (int i = 0; i < this.poolKeys.Count; i = i + 1) {
+            if (this.poolKeys[i] == k) {
+                if (this.poolShape[i] != shape) {
+                    // 形状变了：换新实例（旧实例交 GC）。
+                    this.poolKeys.RemoveAt(i);
+                    this.poolCtl.RemoveAt(i);
+                    this.poolShape.RemoveAt(i);
+                    break;
+                }
+                return this.poolCtl[i];
+            }
+        }
+        BandGrid g = new BandGrid();
+        g.Bind(rows, cols);
+        g.CellSize(16, 14);
+        g.wiresOwnEvents = true;
+        if (this.poolKeys.Count >= CellComp.PoolCap) { this.Reset(); }
+        this.poolKeys.Add(k);
+        this.poolCtl.Add(g);
+        this.poolShape.Add(shape);
+        return g;
+    }
+
+    override void Fill(Control ctl, List<int> vals, int rows, int cols,
+                       string heatBand) {
+        BandGrid g = (BandGrid)ctl;
+        // 色带只把深端锚色交给 BandGrid：浅端由它绘制时从当前
+        // 皮肤表面色派生（HeatBands 的浅端是亮色皮肤参考值）。
+        if (heatBand != "") {
+            int lo = 0;
+            int hi = 0;
+            DataColumn.HeatBands(heatBand, ref lo, ref hi);
+            g.Heat(hi);
+        } else {
+            g.Heat(0);
+        }
+        int n = rows * cols;
+        for (int i = 0; i < n; i = i + 1) {
+            int v = 0;
+            if (vals != null && i < vals.Count) { v = vals[i]; }
+            if (g.NumAt(i / cols, i % cols) != v) {
+                g.SetNum(i / cols, i % cols, v);
+            }
+        }
+    }
+
+    override bool CompPos(Control ctl, ref int r, ref int c) {
+        BandGrid g = (BandGrid)ctl;
+        if (g.CellRow() < 0) { return false; }
+        r = g.CellRow();
+        c = g.CellCol();
+        return true;
+    }
+
+    override void Reset() {
+        this.poolKeys.Clear();
+        this.poolCtl.Clear();
+        this.poolShape.Clear();
+    }
+}
