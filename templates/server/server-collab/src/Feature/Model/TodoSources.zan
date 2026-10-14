@@ -1,0 +1,89 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Dao.Crm;
+using ZanWeb.Dao.Flow;
+using ZanWeb.Dao.Oa;
+using ZanWeb.Dao.Wms;
+using ZanWeb.Model.Crm;
+using ZanWeb.Model.Flow;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model;
+using ZanWeb.Model.Wms;
+using ZanWeb.Modules.Flow;
+
+class TodoSources {
+    /* Flow：流转到我头上的未完成任务；办结以 flow_task.status 为准
+       （完成即从源消失，自然同步，无需标记行）。 */
+    static async List<TodoItem> Flow(IDbConnection db, int tenantId, SysUser me) {
+        List<TodoItem> items = new List<TodoItem>();
+        List<FlowTask> tasks = await db.FlowTask.PendingByAssignee(me.id);
+        if (tasks.Count == 0) { return items; }
+        List<FlowInst> insts = await db.FlowInst.ByTenant(tenantId);
+        for (int i = 0; i < tasks.Count; i = i + 1) {
+            FlowTask t = tasks[i];
+            TodoItem it = new TodoItem();
+            it.source = "flow";
+            it.title = "流程审批：" + Engine.InstTitle(insts, t.instId);
+            it.link = "/admin/flow/tasks/detail?id="
+                + Convert.ToString(t.id);
+            it.dueAt = 0;
+            it.relatedType = "flow_task";
+            it.relatedId = t.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* CRM：我名下未结商机且预期成交日在未来一周内——到期跟进提醒。 */
+    static async List<TodoItem> Crm(IDbConnection db, int tenantId, SysUser me) {
+        List<TodoItem> items = new List<TodoItem>();
+        long horizon = WebApp.NowSeconds() + 7 * 86400;
+        List<CrmOpportunity> rows = await db.CrmOpportunity.ApproachingByOwner(tenantId, me.id, horizon);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            CrmOpportunity o = rows[i];
+            TodoItem it = new TodoItem();
+            it.source = "crm";
+            it.title = "商机跟进：" + o.title;
+            it.link = "/admin/crm/opportunities";
+            it.dueAt = o.expectedCloseAt;
+            it.relatedType = "crm_opportunity";
+            it.relatedId = o.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+
+    /* WMS：库存不高于补货阈值（Settings "wms.reorder.qty"，默认 10）的
+       补货项。全局运营项，登录即可见（阈值属运营配置，不做个人范围）。 */
+    static async List<TodoItem> Wms(IDbConnection db, int tenantId, SysUser me) {
+        List<TodoItem> items = new List<TodoItem>();
+        long threshold = Filter.ToInt(await Settings.Get("wms.reorder.qty",
+            "10"), 10);
+        List<WmsInventory> rows = await db.WmsInventory.LowStockByTenant(tenantId, threshold);
+        if (rows.Count == 0) { return items; }
+        List<WmsSku> skus = await db.WmsSku.ByTenant(tenantId);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            WmsInventory inv = rows[i];
+            string name = Convert.ToString(inv.skuId);
+            for (int k = 0; k < skus.Count; k = k + 1) {
+                if (skus[k].id == inv.skuId) { name = skus[k].name; break; }
+            }
+            TodoItem it = new TodoItem();
+            it.source = "wms";
+            it.title = "库存补货：" + name + "（余 "
+                + Convert.ToString(inv.qty) + "）";
+            it.link = "/admin/wms/inventory";
+            it.dueAt = 0;
+            it.relatedType = "wms_inventory";
+            it.relatedId = inv.id;
+            it.rowId = 0;
+            items.Add(it);
+        }
+        return items;
+    }
+}

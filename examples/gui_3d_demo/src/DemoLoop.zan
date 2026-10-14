@@ -1,0 +1,267 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Game.Foundation.Gui;
+
+class DemoLoop : IGuiHostLoop {
+    // 相机状态：yaw/pitch 拖拽控制，dist 滚轮控制；auto 公转在没有拖拽
+    // 时缓慢推进，让无输入的窗口也一直是活的。
+    float yaw = 0.6f;
+    float pitch = 0.42f;
+    float dist = 5.2f;
+    bool dragging;
+    float autoSpin = 0.0f;
+
+    int cubeMesh;
+    int discMesh;
+    int unitMesh;
+    MeshBatch ring;
+    float ringPhase;
+    int lastBackend;
+    int frames;
+    string backendName = "";
+
+    GuiHost host;
+
+    // ---------- 纹理：一张 64x64 BGRA 棋盘 TGA（未压缩 32 位，类型 2）。
+
+    static byte[] MakeCheckerTga() {
+        int size = 64;
+        int cell = 8;
+        byte[] tga = new byte[18 + size * size * 4];
+        tga[2] = 2;  // 未压缩真彩
+        tga[12] = (byte)(size & 255);  // 宽（小端）
+        tga[13] = (byte)(size >> 8);
+        tga[14] = (byte)(size & 255);  // 高
+        tga[15] = (byte)(size >> 8);
+        tga[16] = 32;  // 32bpp
+        tga[17] = 0x28;  // 顶行在前 + 8 位 alpha
+        int o = 18;
+        for (int y = 0; y < size; y = y + 1) {
+            for (int x = 0; x < size; x = x + 1) {
+                bool light = ((x / cell + y / cell) & 1) == 0;
+                if (light) {
+                    // 暖橙格：BGRA 内存序
+                    tga[o] = 46; tga[o + 1] = 138; tga[o + 2] = 236; tga[o + 3] = 255;
+                } else {
+                    // 深蓝灰格
+                    tga[o] = 88; tga[o + 1] = 62; tga[o + 2] = 40; tga[o + 3] = 255;
+                }
+                o = o + 4;
+            }
+        }
+        return tga;
+    }
+
+    // ---------- 场景几何。
+
+    void BuildMeshes(Canvas c) {
+        Mesh3D cube = new Mesh3D();
+        cube.AddCube();
+        this.cubeMesh = c.MeshUpload(cube);
+
+        Mesh3D disc = new Mesh3D();
+        disc.AddGroundDisc(40, 2.4f);
+        this.discMesh = c.MeshUpload(disc);
+
+        // 顶点色小立方体（白顶点色，颜色全靠每实例 tint），批量实例用
+        Mesh3D unit = new Mesh3D();
+        unit.AddCubeColored(1.0f, 1.0f, 1.0f, 1.0f);
+        this.unitMesh = c.MeshUpload(unit);
+        this.ring = MeshBatch.Create(32);
+    }
+
+    // 相机观察-投影阵（P * V，列主序由调用方再乘模型阵）。
+    Mat4 ViewProj(int cw, int ch) {
+        Mat4 p = Mat4.Perspective(1.0472f, (float)cw / (float)ch, 0.1f, 100.0f);
+        float ex = (float)Math.Cos(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
+        float ey = (float)Math.Sin(this.pitch) * this.dist + 1.2f;
+        float ez = (float)Math.Sin(this.yaw) * (float)Math.Cos(this.pitch) * this.dist;
+        Mat4 v = Mat4.LookAt(ex, ey, ez, 0, 0.6f, 0, 0, 1, 0);
+        return p.Mul(v);
+    }
+
+    // MVP = P * V * M（列主序上传）。spinY 是立方体的模型自转（绕 Y），
+    // 把模型阵接在相机链末端：MVP = P * V * Spin。地台网格坐标已在
+    // 世界系，M 用单位阵。
+    float[] CubeMvp(int cw, int ch, float spinY) {
+        Mat4 spin = Mat4.RotateAxis(0, 1, 0, spinY);
+        return this.ViewProj(cw, ch).Mul(spin).ToColumnMajor();
+    }
+
+    // 整个 3D 场景一次批次提交：地台、主立方体、公转环装进同一个
+    // MeshBatch，共享批内深度缓冲，得到真实的互相遮挡——实例公转到
+    // 主立方体背后时必须被它挡住。这是批次相对"多次单发 DrawMesh3D"
+    // 的本质差异：单发之间按调用顺序合成、不解析深度（见 Render.zan
+    // 契约），环绕场景一旦有几何转到别的几何背后就会画错。
+    // 返回 1 = GPU 批次已提交；0 = CPU 兜底档（整批跳过，调用方换 2D）。
+    int DrawScene(Canvas c, int cw, int ch) {
+        if (this.ring == null || this.cubeMesh <= 0) { return 0; }
+        Mat4 pv = this.ViewProj(cw, ch);
+        this.ring.Begin();
+        // 地台：世界系网格，模型阵为单位阵。
+        this.ring.Add(this.discMesh, "", pv.ToColumnMajor(),
+                      CDraw.Argb(255, 96, 108, 140));
+        // 主立方体：棋盘纹理 + 暖白染色，模型自转接在相机链末端。
+        this.ring.Add(this.cubeMesh, "mem:3dchecker",
+                      pv.Mul(Mat4.RotateAxis(0, 1, 0, this.autoSpin))
+                        .ToColumnMajor(),
+                      CDraw.Argb(255, 255, 235, 210));
+        // 12 个彩色小立方体绕圈公转，每实例独立位姿（公转 + 浮动 +
+        // 自转）与六色 tint，同一顶点色网格一次连段提交。
+        if (this.unitMesh > 0) {
+            int[] palette = new int[] {
+                CDraw.Argb(255, 235, 87, 87),  CDraw.Argb(255, 255, 195, 66),
+                CDraw.Argb(255, 96, 211, 148), CDraw.Argb(255, 78, 154, 241),
+                CDraw.Argb(255, 186, 122, 232), CDraw.Argb(255, 240, 240, 245),
+            };
+            for (int i = 0; i < 12; i = i + 1) {
+                float ang = this.ringPhase + i * 0.5235988f;
+                float bob = (float)Math.Sin(this.ringPhase * 2.0 + i) * 0.22f;
+                Mat4 m = Mat4.Translate((float)Math.Cos(ang) * 3.4f,
+                                        0.55f + bob,
+                                        (float)Math.Sin(ang) * 3.4f);
+                m = m.Mul(Mat4.RotateAxis(0, 1, 0, this.ringPhase + i));
+                m = m.Mul(Mat4.Scale(0.32f, 0.32f, 0.32f));
+                this.ring.Add(this.unitMesh, "", pv.Mul(m).ToColumnMajor(),
+                              palette[i % 6]);
+            }
+        }
+        return this.ring.Draw(c);
+    }
+
+    // ---------- 2D 回退：同一份相机数学把 8 个角点投影成线框。
+
+    static void DrawWireCube(Canvas c, int canvasW, int canvasH, float[] colMajor,
+                             float yawSpin) {
+        // 12 条棱（角点对），绕 Y 自转的立方体，中心抬高到 y=0.6
+        // （与 GPU 档的模型阵一致：立方体浮在地台上方）。
+        float[] v = new float[8 * 3];
+        int[] corners = new int[] {
+            -1, -1, -1,   1, -1, -1,   1, 1, -1,   -1, 1, -1,
+            -1, -1,  1,   1, -1,  1,   1, 1,  1,   -1, 1,  1,
+        };
+        float cy = (float)Math.Cos(yawSpin);
+        float sy = (float)Math.Sin(yawSpin);
+        float[] sx = new float[8];
+        float[] sy2 = new float[8];
+        for (int i = 0; i < 8; i = i + 1) {
+            float px = corners[i * 3];
+            float py = corners[i * 3 + 1] + 0.6f;
+            float pz = corners[i * 3 + 2];
+            // 绕 Y 旋转与 3D 管线的自转同步
+            float rx = px * cy + pz * sy;
+            float rz = -px * sy + pz * cy;
+            // 列主序 MVP：out = M[0..3] 列 * vec
+            float projX = colMajor[0] * rx + colMajor[4] * py + colMajor[8] * rz + colMajor[12];
+            float projY = colMajor[1] * rx + colMajor[5] * py + colMajor[9] * rz + colMajor[13];
+            float projW = colMajor[3] * rx + colMajor[7] * py + colMajor[11] * rz + colMajor[15];
+            if (projW < 0.001f) { projW = 0.001f; }
+            sx[i] = (projX / projW * 0.5f + 0.5f) * canvasW;
+            sy2[i] = (0.5f - projY / projW * 0.5f) * canvasH;
+        }
+        int[] edges = new int[] { 0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7 };
+        List<int> xs = new List<int>();
+        List<int> ys = new List<int>();
+        for (int e = 0; e < edges.Length; e = e + 2) {
+            xs.Clear(); ys.Clear();
+            xs.Add((int)sx[edges[e]]); ys.Add((int)sy2[edges[e]]);
+            xs.Add((int)sx[edges[e + 1]]); ys.Add((int)sy2[edges[e + 1]]);
+            c.DrawPolyline(xs, ys, CDraw.Argb(255, 122, 200, 255), 2);
+        }
+    }
+
+    // ---------- IGuiHostLoop。
+
+    public void Start(GuiHost host) {
+        this.host = host;
+        // 要 GPU 档（GL 3.3）；拿不到就留在 CPU 档跑线框回退，不算失败。
+        this.lastBackend = host.App().SetRenderBackend(1);
+        this.backendName = host.App().RenderBackendName();
+        // 立方体纹理：纯内存的棋盘 TGA 注册成 mem: 键。3D 管线按
+        // 纹理名取图，没注册会回退 1x1 白——立方体就成一面纯色墙。
+        byte[] tga = MakeCheckerTga();
+        host.App().canvas.ImageLoadMem("mem:3dchecker", tga, tga.Length);
+    }
+
+    public void Event(GuiHost host, int kind, int code) {
+        int mx = host.MouseX();
+        int my = host.MouseY();
+        if (kind == 2) {
+            this.dragging = true;
+        } else if (kind == 3) {
+            this.dragging = false;
+        } else if (kind == 1 && this.dragging) {
+            // 鼠标移动没有增量事件，用画面中心的相对角速度近似拖拽。
+            this.yaw = this.yaw + (mx - host.Width() / 2) * 0.0008f;
+            this.pitch = this.pitch + (my - host.Height() / 2) * 0.0008f;
+            if (this.pitch > 1.45f) { this.pitch = 1.45f; }
+            if (this.pitch < -0.2f) { this.pitch = -0.2f; }
+        } else if (kind == 4) {
+            if (code == 37 || code == 39) {
+                // 左/右方向键推拉（触屏键盘可用时同样生效）。下限保持在
+                // 公转环（半径 3.4 + 实例自身 0.32）之外——相机钻进环里
+                // 会让贴镜头的实例糊满画面、近裁剪撕裂，失去空间参照。
+                this.dist = this.dist + (code == 37 ? -0.4f : 0.4f);
+                if (this.dist < 4.6f) { this.dist = 4.6f; }
+                if (this.dist > 12.0f) { this.dist = 12.0f; }
+            }
+        }
+    }
+
+    public void FixedUpdate(GuiHost host, int dtMilliseconds) { }
+
+    public void Update(GuiHost host, int dtMilliseconds) {
+        if (!this.dragging) {
+            this.autoSpin = this.autoSpin + dtMilliseconds * 0.0006f;
+            this.yaw = this.yaw + dtMilliseconds * 0.00012f;
+            if (this.yaw > 6.2831853f) { this.yaw = this.yaw - 6.2831853f; }
+        }
+        this.ringPhase = this.ringPhase + dtMilliseconds * 0.0009f;
+        if (this.ringPhase > 6.2831853f) { this.ringPhase = this.ringPhase - 6.2831853f; }
+        this.frames = this.frames + 1;
+    }
+
+    public void Render(GuiHost host, Canvas c, double alpha) {
+        int cw = c.Width();
+        int ch = c.Height();
+        // 背景先铺满整幅（标题栏条带会被 RenderChrome 盖回）
+        c.FillVGrad(0, 0, cw, ch, CDraw.Argb(255, 16, 18, 30), CDraw.Argb(255, 30, 34, 52));
+
+        if (this.cubeMesh <= 0) {
+            this.BuildMeshes(c);
+        }
+
+        // 立方体与线框共用同一份 MVP（模型自转接在相机链末端）。
+        float[] mvp = this.CubeMvp(cw, ch, this.autoSpin);
+
+        // 整场景一个批次提交（跨网格真实遮挡，见 DrawScene 契约）；
+        // CPU 兜底档返回 0，落 2D 线框回退。
+        int drewScene = this.DrawScene(c, cw, ch);
+
+        if (drewScene == 0) {
+            // CPU 兜底档（或该平台尚未接 3D 管线）：同一份相机数学的 2D 线框。
+            DrawWireCube(c, cw, ch, mvp, this.autoSpin);
+        }
+
+        // HUD：从标题栏保留带之下开始（chrome 画在内容之上，y<titlebarH
+        // 的区域会被它盖掉——HUD 从那里起笔就会从标题栏下缘渗出）。
+        int hudY = Window.TitlebarHeight() + 12;
+        string mode = drewScene == 1 ? "GPU 3D" : "CPU wireframe";
+        c.DrawText(16, hudY, "Zan 3D — " + mode + " (" + this.backendName + ")",
+                   CDraw.Argb(255, 235, 240, 250), 18);
+        c.DrawText(16, hudY + 26, "frames: " + this.frames,
+                   CDraw.Argb(200, 160, 172, 196), 14);
+        string hint = drewScene == 1
+            ? "drag to orbit - arrows to zoom - checker + half-lambert + instance ring"
+            : "GPU backend unavailable here - wireframe fallback";
+        c.DrawText(16, ch - 26, hint, CDraw.Argb(180, 150, 160, 180), 14);
+
+        // 每 90 帧把后端名刷一次（切后端时能看到变化）
+        if (this.frames % 90 == 0) {
+            this.backendName = host.App().RenderBackendName();
+        }
+    }
+
+    public void Stop(GuiHost host) { }
+}

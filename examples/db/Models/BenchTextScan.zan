@@ -1,0 +1,71 @@
+using System;
+using System.Text;
+
+class BenchTextScan {
+    TextTokenizer tokenizer;
+    List<BenchTextDocument> docs = new List<BenchTextDocument>();
+    long totalLength;
+    int lastVisitedDocuments;
+
+    BenchTextScan(TextTokenizer tokenizer) { this.tokenizer = tokenizer; }
+
+    void Add(int id, string text) {
+        BenchTextDocument doc = new BenchTextDocument(id, this.tokenizer.Tokenize(text));
+        this.docs.Add(doc);
+        this.totalLength = this.totalLength + doc.length;
+    }
+
+    int LastVisitedDocuments() { return this.lastVisitedDocuments; }
+
+    List<Bm25Hit> SearchTop(string query, int k) {
+        this.lastVisitedDocuments = 0;
+        List<Bm25Hit> result = new List<Bm25Hit>();
+        if (k <= 0 || this.docs.Count == 0 || this.totalLength == 0) { return result; }
+        List<TextToken> tokens = this.tokenizer.Tokenize(query);
+        List<BenchTextQueryTerm> terms = new List<BenchTextQueryTerm>();
+        for (int i = 0; i < tokens.Count; i = i + 1) {
+            TextToken token = tokens[i];
+            double weight = token.kind == 0 ? 1.0 : 0.2;
+            BenchTextQueryTerm term = null;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                if (terms[t].text == token.text) { term = terms[t]; break; }
+            }
+            if (term == null) { terms.Add(new BenchTextQueryTerm(token.text, weight)); }
+            else if (weight > term.weight) { term.weight = weight; }
+        }
+        if (terms.Count == 0) { return result; }
+        for (int d = 0; d < this.docs.Count; d = d + 1) {
+            BenchTextDocument doc = this.docs[d];
+            this.lastVisitedDocuments = this.lastVisitedDocuments + 1;
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                if (doc.Frequency(terms[t].text) > 0.0) { terms[t].df = terms[t].df + 1; }
+            }
+        }
+        for (int t = 0; t < terms.Count; t = t + 1) {
+            BenchTextQueryTerm term = terms[t];
+            term.idf = Math.Log(1.0 + ((double)(this.docs.Count - term.df) + 0.5) / ((double)term.df + 0.5));
+        }
+        double avgdl = (double)this.totalLength / (double)this.docs.Count;
+        for (int d = 0; d < this.docs.Count; d = d + 1) {
+            BenchTextDocument doc = this.docs[d];
+            this.lastVisitedDocuments = this.lastVisitedDocuments + 1;
+            double score = 0.0;
+            double normalization = 1.2 * (0.25 + 0.75 * (double)doc.length / avgdl);
+            for (int t = 0; t < terms.Count; t = t + 1) {
+                BenchTextQueryTerm term = terms[t];
+                double tf = doc.Frequency(term.text);
+                if (tf > 0.0) { score = score + term.weight * term.idf * tf * 2.2 / (tf + normalization); }
+            }
+            if (score <= 0.0) { continue; }
+            Bm25Hit hit = new Bm25Hit(doc.id, score);
+            int at = result.Count;
+            result.Add(hit);
+            while (at > 0 && result[at - 1].score < score) {
+                result[at] = result[at - 1]; at = at - 1;
+            }
+            result[at] = hit;
+            if (result.Count > k) { result.RemoveAt(result.Count - 1); }
+        }
+        return result;
+    }
+}

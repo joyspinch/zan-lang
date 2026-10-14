@@ -1,0 +1,258 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Component.WebView;
+
+class Browser {
+    static App app;
+    static List<Tab> tabs;
+    static int active;
+    static string shownUrl;  // URL last mirrored into the address bar
+    static int cookieCount;  // cookies for the active page (refreshed on nav)
+
+    static Input address;
+    static Button backBtn;
+    static Button fwdBtn;
+    static Button reloadBtn;
+    static Button newTabBtn;
+
+    static void Main() {
+        App a = App.CreateDark("Zan Browser", 1100, 760);
+        Browser.app = a;
+        Browser.tabs = new List<Tab>();
+        Browser.active = 0;
+        Browser.shownUrl = "";
+        Browser.cookieCount = 0;
+
+        Browser.address = new Input("Enter a URL and press Enter");
+        Browser.address.Submit += Browser.OnAddressSubmit;
+
+        Browser.backBtn = new Button { Icon = "arrow-left", Class = "circle" };
+        Browser.backBtn.Click += Browser.OnBack;
+        Browser.fwdBtn = new Button { Icon = "arrow-right", Class = "circle" };
+        Browser.fwdBtn.Click += Browser.OnForward;
+        Browser.reloadBtn = new Button { Icon = "refresh", Class = "circle" };
+        Browser.reloadBtn.Click += Browser.OnReload;
+        Browser.newTabBtn = new Button { Icon = "plus", Class = "circle small" };
+        Browser.newTabBtn.Click += Browser.OnNewTab;
+
+        string first = "https://www.baidu.com";
+        if (Environment.ArgCount() > 0) { first = Environment.ArgAt(0); }
+        Browser.NewTab(first);
+
+        a.Show();
+        WidgetId.Mark();
+        while (a.isRunning) {
+            if (!a.ProcessEvent()) { break; }
+            a.BeginFrame();
+            WidgetId.ResetFrame();
+            Browser.Render(a);
+            a.RenderChrome("Zan Browser");
+            a.PresentFrame();
+        }
+    }
+
+    static Tab Active() { return Browser.tabs[Browser.active]; }
+
+    static void NewTab(string url) {
+        Tab t = Tab.Create(url);
+        t.view.Navigate(url);
+        Browser.tabs.Add(t);
+        Browser.active = Browser.tabs.Count - 1;
+        Browser.shownUrl = "";
+    }
+
+    static void CloseTab(int i) {
+        Tab t = Browser.tabs[i];
+        t.view.Destroy();
+        Browser.tabs.RemoveAt(i);
+        if (Browser.tabs.Count == 0) {
+            Browser.NewTab("https://www.baidu.com");
+            return;
+        }
+        if (Browser.active >= Browser.tabs.Count) {
+            Browser.active = Browser.tabs.Count - 1;
+        }
+        Browser.shownUrl = "";
+        Browser.app.RequestRedraw();
+    }
+
+    static void SetActive(int i) {
+        Browser.active = i;
+        Browser.shownUrl = "";
+        Browser.app.RequestRedraw();
+    }
+
+    static void OnBack() { Browser.Active().view.Back(); Browser.app.RequestRedraw(); }
+    static void OnForward() { Browser.Active().view.Forward(); Browser.app.RequestRedraw(); }
+    static void OnReload() { Browser.Active().view.Reload(); Browser.app.RequestRedraw(); }
+    static void OnNewTab() { Browser.NewTab("https://www.baidu.com"); Browser.app.RequestRedraw(); }
+
+    static void OnAddressSubmit() {
+        string u = Browser.address.GetText();
+        if (u == "") { return; }
+        Browser.Active().view.Navigate(u);
+        Browser.app.RequestRedraw();
+    }
+
+    static void Render(App app) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int W = c.Width();
+        int H = c.Height();
+        int top = app.titlebarH;
+        int tabH = app.Scale(34);
+        int barH = app.Scale(48);
+        int statusH = app.Scale(26);
+
+        c.FillRect(0, top, W, H - top, t.bgPrimary);
+
+        Browser.RenderToolbar(app, 0, top, W, barH);
+        Browser.RenderTabs(app, 0, top + barH, W, tabH);
+
+        int wy = top + barH + tabH;
+        int wh = H - wy - statusH;
+        if (wh < 0) { wh = 0; }
+
+        for (int i = 0; i < Browser.tabs.Count; i = i + 1) {
+            Tab tab = Browser.tabs[i];
+            if (i == Browser.active) {
+                tab.view.Render(app, 0, wy, W, wh);
+                string pageTitle = tab.view.CurrentTitle();
+                if (pageTitle != "") { tab.title.Set(pageTitle); }
+                // 导航事件同步：页面完成跳转后将真实目标 URL 反映至地址输入框。
+                if (!tab.view.IsLoading()) {
+                    string u = tab.view.CurrentUrl();
+                    if (u != "" && u != Browser.shownUrl) {
+                        Browser.address.SetText(u);
+                        Browser.shownUrl = u;
+                        Browser.cookieCount = Browser.CountCookies(tab.view.GetCookies(u));
+                    }
+                }
+            } else {
+                tab.view.Hide();
+            }
+        }
+
+        Browser.RenderStatus(app, 0, H - statusH, W, statusH);
+    }
+
+    static void RenderTabs(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+
+        int tabW = app.Scale(168);
+        int gap = app.Scale(3);
+        int closeW = app.Scale(22);
+        bool click = app.window.EventKind() == 3;
+        int tx = x + app.Scale(6);
+
+        for (int i = 0; i < Browser.tabs.Count; i = i + 1) {
+            Tab tab = Browser.tabs[i];
+            int bg = t.bgTertiary;
+            int fg = t.textSecondary;
+            if (i == Browser.active) { bg = t.bgPrimary; fg = t.textPrimary; }
+            c.FillRoundRect(tx, y + app.Scale(4), tabW, h - app.Scale(6),
+                app.Scale(6), bg);
+
+            string ti = tab.title.Get();
+            if (ti == "") { ti = "New Tab"; }
+            int labelW = tabW - closeW - app.Scale(16);
+            c.DrawText(tx + app.Scale(10),
+                y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+                Browser.Elide(ti, labelW, t.fontSizeSmall), fg, t.fontSizeSmall);
+
+            int cbx = tx + tabW - closeW;
+            c.DrawGlyphIn("close", cbx, y, closeW, h,
+                app.Scale(9), t.textTertiary);
+
+            if (click) {
+                bool inClose = app.mouseX >= cbx && app.mouseX < cbx + closeW &&
+                               app.mouseY >= y && app.mouseY < y + h;
+                bool inTab = app.mouseX >= tx && app.mouseX < tx + tabW &&
+                             app.mouseY >= y && app.mouseY < y + h;
+                if (inClose) { Browser.CloseTab(i); return; }
+                if (inTab) { Browser.SetActive(i); }
+            }
+
+            tx = tx + tabW + gap;
+        }
+
+        int nb = Browser.newTabBtn.AutoWidth(app);
+        Browser.newTabBtn.Render(app, tx + app.Scale(2), y + (h - nb) / 2, nb);
+    }
+
+    static void RenderToolbar(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgPrimary);
+        c.DrawLine(x, y + h - 1, x + w, y + h - 1, t.divider, 1);
+
+        int rowH = t.heightMedium;
+        int by = y + (h - rowH) / 2;
+        int pad = app.Scale(10);
+        int bw = app.Scale(36);
+        int bx = x + pad;
+
+        Browser.backBtn.Render(app, bx, by, bw);
+        bx = bx + bw + app.Scale(4);
+        Browser.fwdBtn.Render(app, bx, by, bw);
+        bx = bx + bw + app.Scale(4);
+        Browser.reloadBtn.Render(app, bx, by, bw);
+        bx = bx + bw + app.Scale(10);
+
+        int addrW = x + w - bx - pad;
+        if (addrW < app.Scale(120)) { addrW = app.Scale(120); }
+        Browser.address.Render(app, bx, by, addrW, rowH);
+    }
+
+    static void RenderStatus(App app, int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        c.FillRect(x, y, w, h, t.bgSecondary);
+        c.DrawLine(x, y, x + w, y, t.divider, 1);
+
+        Tab tab = Browser.Active();
+        WebView v = tab.view;
+        string s = "";
+        if (!v.IsSupported()) {
+            s = "WebView is not supported on this platform";
+        } else {
+            string st = "Ready";
+            if (v.IsLoading()) { st = "Loading..."; }
+            s = st + "   ·   HTTP " + Convert.ToString(v.LastStatus()) +
+                "   ·   " + Convert.ToString(Browser.cookieCount) + " cookies" +
+                "   ·   " + v.CurrentUrl();
+        }
+        c.DrawText(x + app.Scale(12),
+            y + (h - Canvas.FontHeight(t.fontSizeSmall)) / 2,
+            s, t.textSecondary, t.fontSizeSmall);
+    }
+
+    static int CountCookies(string s) {
+        if (s == "") { return 0; }
+        int n = 1;
+        for (int i = 0; i + 1 < s.Length; i = i + 1) {
+            if (s[i] == ';' && s[i + 1] == ' ') { n = n + 1; }
+        }
+        return n;
+    }
+
+    static string Elide(string s, int budget, int fontSize) {
+        if (Canvas.MeasureText(s, fontSize) <= budget) { return s; }
+        int dotsW = Canvas.MeasureText("...", fontSize);
+        int room = budget - dotsW;
+        if (room < 0) { room = 0; }
+        int n = s.Length;
+        int lo = 0;
+        int hi = n;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) / 2;
+            if (Canvas.MeasureText(s.Substring(0, mid), fontSize) <= room) { lo = mid; }
+            else { hi = mid - 1; }
+        }
+        return s.Substring(0, lo) + "...";
+    }
+}

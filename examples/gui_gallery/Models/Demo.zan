@@ -1,0 +1,145 @@
+using System;
+using System.Globalization;
+using System.IO;
+using System.Json;
+using System.Threading;
+using System.Net.Http;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Diagnostics;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+using Gui.Component.Chart;
+using Gui.Component.CodeEditor;
+using Gui.Component.DataTable;
+using Gui.Designer;
+using Gui.Hmi;
+
+class Demo {
+    string title;
+    string desc;
+    string previewId;
+    int previewH;  // unscaled preview box height
+    string code;
+    string json;
+    // 当前卡片源码视图类型：0 = Zan 代码，1 = JSON 声明。
+    int tab;
+    // 卡片稳定唯一标识符，用于在组件列表重建时保留视图切换状态。
+    static int seq;
+    int uid;
+
+    // 渲染缓存：缓存代码分词高亮与折行描述，按 (长度 ^ 标题哈希) 惰性刷新。
+    string cacheSig;
+    string cacheSrc;
+    // 渲染缓存字号标识，防移动端与桌面端自适应重排时字号脱节。
+    int cacheFs;
+    List<string> cacheDescLines;
+    List<CodeDisplayLine> cacheDisplayLines;
+    // 行号槽位宽度，根据代码总行数自动计算，防止与正文重叠。
+    int cacheGutterW;
+    Button copyBtn;
+    // 按钮状态切换：短暂停留“已复制”绿色提示后重置。
+    int copiedUntilMs;
+
+    Demo(string title, string desc, string previewId,
+            int previewH, string code, string json) {
+        this.title = title;
+        this.desc = desc;
+        this.previewId = previewId;
+        this.previewH = previewH;
+        this.code = code;
+        this.json = json;
+        this.tab = 0;
+        this.uid = Demo.seq;
+        Demo.seq = Demo.seq + 1;
+        this.cacheSig = "";
+        this.copyBtn = new Button { Text = "Copy", Icon = "copy",
+                                    Class = "primary small" };
+    }
+
+    void EnsureCache(App app, Theme t, int cw, int tab) {
+        // 手机上的代码可读性下限：fontSizeSmall（13dp）在 2.6x 密度下
+        // 渲染出来仍是一行塞满几十个字形的密集小字，截图里读作乱码。
+        // 高密度窄屏把代码字号提到 fontSizeMedium 档，行数换可读性。
+        // 卡片描述行与代码行共用同一 fs，高度核算（DemoCardHeight）才不会错位。
+        int fs = t.fontSizeSmall;
+        if (app.canvas.Width() < app.canvas.Height()
+            && cw < app.Scale(700)) { fs = t.fontSizeMedium; }
+        string sig = Convert.ToString(cw) + "|" + Convert.ToString(tab)
+            + "|" + Convert.ToString(fs) + "|" + Convert.ToString(t.bgPrimary);
+        if (sig == cacheSig) { return; }
+        cacheSig = sig;
+        cacheFs = fs;
+
+        cacheDescLines = Gallery.WrapText(desc, cw, fs);
+
+        string src = code;
+        if (tab == 1) {
+            if (json != "") { src = json; }
+            else { src = "// This demo has no JSON config version yet."; }
+        }
+        cacheSrc = src;
+        List<string> srcLines = CodeEditor.SplitLines(src);
+        cacheDisplayLines = new List<CodeDisplayLine>();
+
+        int gnW = Canvas.MeasureText(Convert.ToString(srcLines.Count), fs);
+        cacheGutterW = gnW + app.Scale(20);
+        int maxTextW = cw - cacheGutterW - app.Scale(8) - app.Scale(10);
+        if (maxTextW < app.Scale(80)) { maxTextW = app.Scale(80); }
+
+        for (int ci = 0; ci < srcLines.Count; ci = ci + 1) {
+            List<CodeSpan> spans = new List<CodeSpan>();
+            CodeEditor.HighlightSpans(srcLines[ci], t.info, t.success,
+                t.warning, t.textTertiary, t.primary, t.textPrimary, false, spans);
+            WrapCode(fs, maxTextW, ci + 1, spans);
+        }
+    }
+
+    void WrapCode(int fs, int maxW, int lineNo, List<CodeSpan> spans) {
+        string curText = "";
+        List<CodeSpan> curSpans = new List<CodeSpan>();
+        int curW = 0;
+        bool first = true;
+
+        for (int gi = 0; gi < spans.Count; gi = gi + 1) {
+            CodeSpan span = spans[gi];
+            string s = span.text;
+            int col = span.color;
+            int p = 0;
+            int slen = s.Length;
+            while (p < slen) {
+                int start = p;
+                while (p < slen) {
+                    int chW = Canvas.MeasureText(s.Substring(p, 1), fs);
+                    if (curW + chW > maxW && curW > 0) { break; }
+                    curW = curW + chW;
+                    p = p + 1;
+                }
+                if (p > start) {
+                    string piece = s.Substring(start, p - start);
+                    curSpans.Add(new CodeSpan(piece, col));
+                    curText = curText + piece;
+                }
+                if (p < slen) {
+                    FlushRow(curText, curSpans, first, lineNo);
+                    first = false;
+                    curText = "";
+                    curSpans = new List<CodeSpan>();
+                    curW = 0;
+                }
+            }
+        }
+        FlushRow(curText, curSpans, first, lineNo);
+    }
+
+    void FlushRow(string text, List<CodeSpan> spans, bool first, int lineNo) {
+        int displayLineNo = 0;
+        if (first) { displayLineNo = lineNo; }
+        cacheDisplayLines.Add(new CodeDisplayLine(text, displayLineNo, spans));
+    }
+
+}
+
+// Transfer.custom 演示的行实体（自定义标签：文案与图标都由委托现拼）。

@@ -1,0 +1,54 @@
+using System;
+using System.Collections;
+using System.Csv;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Excel;
+using System.Json;
+using System.Text;
+using System.Web;
+using ZanWeb.Dao.Oa;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model;
+
+class ImportRecord {
+    List<ImportField> fields;
+
+    ImportRecord() {
+        this.fields = new List<ImportField>();
+    }
+
+    void Add(string key, string val) {
+        this.fields.Add(ImportField.Make(key, val));
+    }
+
+    string Get(string key) {
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            ImportField f = this.fields[i];
+            if (f.Key() == key) { return f.Val(); }
+        }
+        return "";
+    }
+}
+
+/* 行处理器：拿到已过列校验的强类型行数据 ImportRecord。业务侧
+   在此完成查重、外键解析与插入；返回 null/""=成功，非空=错误文本
+   （约定 "字段=消息" 格式，无 "=" 时字段记空——见 ExcelIo.Import）。
+   重要约定 1：handler 必须是同步函数（内部用同步 ORM：Count() /
+   ExecuteAffrows()），不得 await——async delegate 的续体在"await 之后
+   携带非空返回值提前结束"路径上触发空指针崩溃（zan_crash.log 取证 +
+   DWARF 定位 ExcelIoSmoke_SaveCustomer$resume，已记入偏差）。
+   重要约定 2：行数据以强类型 ImportRecord 承载，内部各字段为 ImportField
+   强类型实体，彻底消除平行 List 反模式，同时规避早期 Dict 崩溃问题。 */
+delegate string ImportRow(IDbConnection db, int tenantId, SysUser me,
+                          ImportRecord rec);
+
+/* 导入导出公共层（架构 §2.6 WP-6 / T6）：全站唯一的表格进出入口。
+   导出 CSV（Csv.Serialize）与 XLSX（XlsxBook，stdlib 仅写侧）双格式；
+   导入仅 CSV（一期，XLSX 无读侧）——表头按模板列名映射、列校验
+   （FieldRule）+ 行处理器（ImportRow）、每 500 行一个事务提交
+   （SQLite 写锁粒度对策）、行级错误跳过不回滚好行，报告落
+   oa_import_batch。
+   偏差记录：架构草图的 ExportSource delegate（流式供行）收敛为调用方
+   直传 rows——Zan 无闭包，delegate 方法组需把 db/me/sc/q 全部显式穿参，
+   一期万行内全量 List 内存可承受（XlsxBook.FromText 本身也是全量）。 */
