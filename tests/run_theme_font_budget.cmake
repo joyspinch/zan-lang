@@ -25,7 +25,7 @@ set(_budget
   "packages/Zan.Gui/src/Gui/Styling/Theme.zan=15"
   "packages/Zan.Gui/src/Gui/Styling/StyleBox.zan=1"
   "packages/Zan.Gui/src/Gui/Backend/UiDriver.zan=5"
-  "packages/Zan.Gui.Charts/src/Gui/Component/Chart/ChartResolved.zan=1"
+  "packages/Zan.Gui.Charts/src/Gui/Component/Chart/ResolvedChart.zan=1"
   "packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan=1"
 )
 set(_members "fontSizeTiny|fontSizeSmall|fontSizeMedium|fontSizeLarge|fontSizeHuge")
