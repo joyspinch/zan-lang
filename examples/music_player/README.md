@@ -31,7 +31,7 @@
 
 ### 1. 命令行编译并启动
 ```bash
-build\zanc.exe examples/music_player/src/App.html examples/music_player/src/App.zan --auto-stdlib -o _scratch/music.exe
+build\zanc.exe examples/music_player/src/MusicApp.html examples/music_player/src/MusicApp.zan --auto-stdlib -o _scratch/music.exe
 _scratch\music.exe
 ```
 
