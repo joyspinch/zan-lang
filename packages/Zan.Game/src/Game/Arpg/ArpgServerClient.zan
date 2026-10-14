@@ -1,0 +1,89 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+namespace Game.Arpg;
+
+// 已连接的服务器端客户端。它使用与 ArpgTcpClientRuntime 相同的帧封装
+// ArpgMessage 协议，但消息上限取自 ServerConfig。
+// 已连接的服务器端客户端：与客户端运行时共用同一套帧封装
+// ArpgMessage 协议，消息上限取自 ServerConfig。收发均为 async；
+// 断开时自动触发 ArpgServerEvents 的 ClientDisconnected。
+class ArpgServerClient {
+    ServerConfig config;
+    int id;
+    nint sock;
+    bool connected;
+    byte[] recvBuf;
+    ArpgServerEvents events;
+
+    // 包装服务器 accept 得到的套接字并分配客户端 id。
+    static ArpgServerClient FromSocket(
+        ServerConfig config,
+        int id,
+        nint sock,
+        ArpgServerEvents events
+    ) {
+        ArpgServerClient client = new ArpgServerClient();
+        client.config = config;
+        client.id = id;
+        client.sock = sock;
+        client.connected = true;
+        client.recvBuf = null;
+        client.events = events;
+        return client;
+    }
+
+    // 服务器分配的连接 id（从 1 起自增）。
+    int Id() { return this.id; }
+    // 底层套接字句柄。
+    nint Handle() { return this.sock; }
+    // 是否仍处于连接状态。
+    bool IsConnected() { return this.connected; }
+
+    // 异步发送一条帧封装消息，返回 AsyncSocket.Send 的错误码
+    // （0 为成功）。
+    async int SendMessageAsync(ArpgMessage message) {
+        byte[] buf = message.Encode();
+        return await AsyncSocket.Send(
+            this.sock, buf, message.FrameLength());
+    }
+
+    // 异步接收一条消息：断开时置 connected=false、触发
+    // ClientDisconnected 并返回 null；成功时触发 MessageReceived
+    // 后返回消息（帧不完整返回 null 且不触发事件）。
+    async ArpgMessage ReceiveMessageAsync() {
+        int cap = this.config.MessageLength();
+        if (this.recvBuf == null) {
+            this.recvBuf = new byte[cap + 1];
+        }
+        int n = await AsyncSocket.ReceiveInto(
+            this.sock, this.recvBuf, cap);
+        if (n <= 0) {
+            this.connected = false;
+            if (this.events != null) {
+                this.events.RaiseClientDisconnected(this);
+            }
+            return null;
+        }
+        ArpgMessage message = ArpgMessage.Decode(this.recvBuf, n);
+        if (message != null && this.events != null) {
+            this.events.RaiseMessageReceived(this, message);
+        }
+        return message;
+    }
+
+    // 关闭连接并触发 ClientDisconnected（已关闭时安全调用）。
+    void Close() {
+        if (this.connected) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+            if (this.events != null) {
+                this.events.RaiseClientDisconnected(this);
+            }
+        }
+        this.recvBuf = null;
+    }
+}

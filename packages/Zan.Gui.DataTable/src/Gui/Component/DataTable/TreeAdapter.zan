@@ -1,0 +1,73 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// 树模式适配器：把任意层级结构投影成"每行有若干子行"
+// 的形状，网格据此交错显示。行身份仍是源行索引（与
+// 排序/筛选/选择的读取路径一致）；适配器只回答结构问题。
+// 继承它并重写 RootCount / ChildCount / ChildOf：
+// - `RootCount` 返回顶层行数，`RootAt(i)` 返回第 i 个
+// 顶层行的源索引。默认实现遍历源，把无父行（`ParentOf`
+// 返回 -1）当根；按需重写成直接索引。
+// - `ChildCount(src, row)` 返回该行的子行数（0 = 叶子）；
+// `ChildOf(src, row, index)` 返回第 index 个子行的源索引。
+// - 可选重写 `ParentOf`（默认 -1）：无重写时根 = 全部行
+// 中 ParentOf < 0 者，需要 O(n) 扫描；重写后 RootAt 走
+// RootCount 直接索引。
+class TreeAdapter {
+    // 顶层行数。
+    virtual int RootCount(DataSource src) {
+        int n = 0;
+        if (src == null) { return 0; }
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (this.ParentOf(src, row) < 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 第 i 个顶层行的源索引。默认实现再次扫描源，
+    // 与 RootCount 的判定保持一致。
+    virtual int RootAt(DataSource src, int i) {
+        if (src == null) { return -1; }
+        int seen = 0;
+        for (int row = 0; row < src.RowCount(); row = row + 1) {
+            if (this.ParentOf(src, row) < 0) {
+                if (seen == i) { return row; }
+                seen = seen + 1;
+            }
+        }
+        return -1;
+    }
+
+    // `row` 的子行数；0 = 叶子。
+    virtual int ChildCount(DataSource src, int row) { return 0; }
+
+    // `row` 的第 `index` 个子行的源索引；越界返回 -1。
+    virtual int ChildOf(DataSource src, int row, int index) { return -1; }
+
+    // `row` 的父行源索引；顶层行返回 -1。仅默认
+    // RootCount/RootAt 的"无父即根"判定使用它。
+    virtual int ParentOf(DataSource src, int row) { return -1; }
+
+    // ---- 懒加载（VTable 树形懒加载的同类项） ----
+    // 三个虚方法构成异步展开契约：IsLazy 声明该行的子行
+    // 需要按需取回；ChildrenLoaded 回答是否已取回；网格在
+    // 用户展开未取回的行时置 loading 标记并调用 LoadChildren，
+    // 应用取回子行（把行插入数据源）后调用
+    // DataTable.TreeLoaded(st, src, row) 收尾——加载中的行
+    // 在树列上显示 spinner 占位，子行到位后下一帧自然长出。
+    // `row` 的子行是否需要按需（异步）取回。默认 false =
+    // 子行已在数据源里，展开即得。
+    virtual bool IsLazy(DataSource src, int row) { return false; }
+
+    // 懒加载行的子行是否已取回。仅 IsLazy 行会被询问；
+    // 未取回的行展开时触发 LoadChildren。
+    virtual bool ChildrenLoaded(DataSource src, int row) { return true; }
+
+    // 开始异步取回 `row` 的子行。实现应尽快把取到的子行
+    // 插入数据源，然后调用 DataTable.TreeLoaded(st, src, row)。
+    // 网格不等待：加载期间该行显示 spinner。
+    virtual void LoadChildren(DataSource src, int row) { }
+}

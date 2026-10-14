@@ -1,0 +1,776 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+namespace Gui.Component.DataTable;
+
+// DataTable 持久状态——创建一次（在帧循环外）并
+// 每帧传入，使选择/排序/过滤/滚动在重绘之间得以保留。
+class DataTableState {
+    bool inited;
+    int sortCol;
+    int sortDir;
+    // 多列排序键（外→内优先级）。sortCol/sortDir 与
+    // 主键（索引 0）保持一致以向后兼容；空列表表示“未排序”。
+    List<SortKey> sortKeys;
+    List<bool> selected;
+    // 稳定 RowKey 选择模型：普通模式维护显式业务键；全选模式
+    // 维护排除键。旧 selected 数组仅作为渲染兼容投影存在。
+    SelectionModel selectionModel;
+    // 首次 SyncSelectionModel 把旧 bool 选择导入模型之后置 true；
+    // 此后模型是权威，selected 由模型投影生成。
+    bool selectionModelAuthoritative;
+    // 选择模型同步的失效标记：键快照代次 + 行数。二者都没变时
+    // SyncSelectionModel 是 O(1) 空转——同步本身要对全部行做
+    // GetRowKey 探测/投影，百万行源每帧全表扫会吃掉数百毫秒
+    // （legacy 键每次调用还 new 一个 RowKey + 字符串）。
+    int selectionSyncRevision;
+    int selectionSyncRows;
+    List<int> colWidths;
+    List<int> dispW;
+    List<int> order;
+    List<ColFilter> filters;
+    int openMenu;
+    int scrollRow;
+    int scrollX;  // 数据列的水平像素偏移
+    int resizeCol;
+    int resizeStartX;
+    int resizeStartW;
+    bool dirty;
+
+    RowKeyProvider keyProvider;
+    List<RowKey> rowKeys;
+    int rowKeysRevision;
+    List<TableDiagnostic> diagnostics;
+    int dataRevision;
+    int queryRevision;
+    int viewRevision;
+    // 上一次初始化时的列数；列模型可在首帧后动态增加，
+    // 变化必须使派生显示模型失效，否则新列只能到下一次偶然重算才出现。
+    int columnCount;
+
+    // 组件列控件池的命名空间（DataTable.CompPoolKey）：CellComp
+    // 注册表是全局单例，池键必须冠以表实例序号，同屏两个网格
+    // 声明同一 compId 时才不会互抢池化控件。
+    static int instSeq;
+    // 本状态实例序号（构造时分配，进程内唯一）。
+    int inst;
+
+    int filterTab;
+    string searchText;
+    int valScroll;
+    int editFocus;
+    List<string> batchLines;
+    int batchExactFlag;
+    List<string> menuVals;
+    List<string> menuMatched;
+    string menuSearchCache;
+
+    bool showRowNum;
+    bool showSelect;
+    bool striped;
+    int rowH;  // 行高（逻辑像素，0 = 跟随主题 heightMedium）
+    bool rowReorder;  // 允许用行手柄拖动重排（默认关闭）
+
+    // ---- 汇总（总计）行 ----
+    bool showSummary;
+    List<ColumnAggregateState> aggregates;  // 强类型列聚合状态实体集合（主表示）
+    List<int> aggMode;  // 兼容视图：逐列：0 无，1 总和，2 平均，3 最小，4 最大，5 计数，6 派生
+    List<int> aggValue;  // 兼容视图：每列缓存的原始聚合值（供派生列使用）
+    List<double> aggReal;  // 兼容视图：每列的精确聚合（小数列/平均值）
+    List<string> summaryText;  // 兼容视图：每列缓存的格式化聚合值
+    // 分组页脚复用的总计累加器：BuildDisplay 将
+    // 每个最外层分组的基础总和/最小/最大汇入此处，页脚无需
+    // 自己的百万行扫描。表格未分组时无意义。
+    List<double> aggSumR;
+    List<double> aggMinR;
+    List<double> aggMaxR;
+
+    // ---- 条件格式：过滤集合上每列的 min/max，
+    // 缓存后，数据条/色阶单元格无需每帧扫描即可归一化 ----
+    List<ColumnCfExtents> cfExtents;  // 强类型列条件格式极值实体集合（主表示）
+    List<int> cfMin;  // 兼容视图
+    List<int> cfMax;  // 兼容视图
+    // 与 cfMin/cfMax 范围相同但更精确，使小数列上的
+    // 数据条和色阶归一化时不会坍缩为整数桶。
+    List<double> cfMinR;  // 兼容视图
+    List<double> cfMaxR;  // 兼容视图
+    // Top/Bottom 规则（cfMode 5/6）的降序排名缓存：rankDesc[oi]
+    // = 该行在此列过滤集合中的名次（0 起，值相同并列按先见者高）。
+    // 与 min/max 同周期重建（Recompute -> ComputeColStats）。
+    List<int> cfRank;
+    // 行源索引 -> st.order 显示序，仅当存在 Top/Bottom 规则列时
+    // 维护（ComputeColStats 同周期重建）。渲染的命中判定 O(1)
+    // 查表，替代对 st.order 的逐格线性查找。
+    Dict<int, int> cfOrderPos;
+    // 上一帧 EnsureInit 见到的逐列公式串：只在公式面真的变化时
+    // 作废全局编译缓存（此前每帧无条件作废，稳定列集的应用
+    // 每帧重编译全部表达式）。
+    List<string> formulaSeen;
+
+    // ---- 条件格式：右键菜单应用的规则 ----
+    // 调用方常每帧重建列（新 DataColumn 实例），菜单 dispatch
+    // 写进列对象的改动会在下一帧丢失。规则因此落在状态槽里，
+    // EnsureColumnSlots 每帧回写到当前列集：mode 0 表示"菜单
+    // 未启用"，列上工厂预设的规则照常生效；用户清除只清菜单槽。
+    List<ColumnCfRule> cfRules;  // 强类型列级条件格式规则实体（消除旧 menuCfMode/menuCfColor 等平行列表）
+
+    // ---- 清除条件格式规则弹窗 ----
+    bool cfClearOpen;  // 弹窗打开中
+    List<CfClearItem> cfClearItems;  // 强类型清除选择项实体（替代旧 cfClearCols/cfClearSel 平行列表）
+    int cfClearScroll;  // 规则多到超出弹窗高度时的滚动
+
+    // ---- 分页 ----
+    bool paged;
+    SignalInt pageModel;  // 从 1 起的当前页码，绑定到 Pagination 控件
+    int pageRows;  // 每页行数（自动适配），每帧重新计算
+
+    // ---- 双向数据绑定（编译器降级的 Binding；可选） ----
+    // 绑定的主选择：`st.selection = vm.selectedRow;` 使
+    // 选中行双向同步。绑定值是第一个选中行的
+    // 源行索引（无选中时为 -1）；从模型侧写入
+    // 会独占选中该行。
+    Binding<int> selection;
+    // 绑定的当前页：`st.page = vm.page;` 使从 1 起的页码
+    // （pageModel）双向同步。
+    Binding<int> page;
+    int lastSelSync;  // 上次对账的选择值（较新一侧胜出）
+    int lastPageSync;  // 上次对账的页码值（较新一侧胜出）
+
+    // ---- 选择与交互 ----
+    int selAnchor;  // Shift 范围选行的顺序索引锚点（-1 无）
+    int selAnchorCol;  // Shift 范围选单元格的列锚点（-1 无，与 selAnchor 成对）
+    int multiAnchor;  // Ctrl 多区域锚点区域（活动区域 r1<0 占位）
+    int rangeR0;  // 单元格范围起始行（顺序索引，-1 = 无范围）
+    int rangeC0;  // 单元格范围起始列
+    int rangeR1;  // 单元格范围结束行（顺序索引）
+    int rangeC1;  // 单元格范围结束列
+    bool rangeDrag;  // 正在拖拽选择单元格范围
+    List<int> rangeSelTouched;  // 本手势勾选的显示槽位（范围缩小时退勾用）
+    // Excel 式多区域选区：Ctrl+点击/拖拽把已固化的范围归档到
+    // cellRanges 后再开新区域，选区=已归档区域+当前 range 的并集。
+    // 普通（无 Ctrl）选择会清空归档——单矩形仍是主路径，多区域只在
+    // Ctrl 参与时出现。
+    List<TableCellRange> cellRanges;  // 强类型多区域选区实体（消除旧 multiRanges 扁平四元整数列表）
+    // 当前范围/活动区域是否属于一个多区域选区（Ctrl 追加过）。
+    // true 时状态栏、复制、清空按全部区域并集取数。
+    bool multiActive;
+    int tipOi;  // 悬停提示正在跟踪的显示槽位（-1 无）
+    int tipCol;  // 悬停提示正在跟踪的列索引
+    int tipSinceMs;  // 指针进入该单元格的时刻（毫秒时钟）
+    int hdrTipCol;  // 表头悬停提示正在跟踪的列（-1 无）
+    int hdrTipSinceMs;  // 指针进入该列表头的时刻（毫秒时钟）
+    int dragRow;  // 正在拖拽重排的行的顺序索引位置（-1 无）
+    int dragStartY;  // 行按下时的指针 Y 坐标
+    bool dragMoved;  // 指针移动足够远，变为重排拖拽
+    bool rowGripDrag;  // 本次行拖拽由行号右侧的专用手柄发起
+    bool rowSelDrag;  // 正在行号列上拖动多选行
+    bool ctxOpen;  // 右键上下文菜单已打开
+    bool externalRowMenu;  // 行右键交给外部菜单处理
+    int ctxX;  // 上下文菜单锚点 X
+    int ctxY;  // 上下文菜单锚点 Y
+    int ctxRow;  // 最近一次行右键命中的源行索引（-1 = 空白/非数据行）
+    int ctxOrder;  // 最近一次行右键命中的顺序索引（-1 = 空白/非数据行）
+    List<bool> colHidden;  // 逐列可见性（true = 隐藏）
+    List<int> colFreeze;  // 逐列冻结：0 无，1 左边缘，2 右边缘
+    List<int> colOrder;  // 用户列顺序（列索引的主序列）
+    // 用户折叠的表头带路径。折叠的带只显示其
+    // 第一列，宽分组可折叠成一个小条，而无需
+    // 完全隐藏——列保留各自状态，展开后完好恢复。
+    List<string> bandCollapsed;
+    // 上述折叠隐藏的列，展开时只恢复这些列，
+    // 用户手动隐藏的列保持不变。
+    List<int> bandAutoHidden;
+    int dragCol;  // 正在表头拖拽重排的列索引（-1 无）
+    int dragColStartX;  // 表头按下时的指针 X 坐标
+    bool dragColMoved;  // 指针移动足够远，变为重排拖拽
+    int dropVis;  // 列拖拽期间的视觉插入槽位（-1 无）
+    bool hdrCtxOpen;  // 表头右键上下文菜单已打开
+    int hdrCtxCol;  // 表头上下文菜单针对的列
+    int hdrCtxX;  // 表头上下文菜单锚点 X
+    int hdrCtxY;  // 表头上下文菜单锚点 Y
+    string toast;  // 临时状态消息（复制/导出反馈）
+    int toastFrames;  // toast 剩余显示帧数
+
+    // ---- 表头/行右键菜单的 RichMenu（通用弹出菜单组件）状态 ----
+    // 菜单体每帧由 RenderHeaderMenu/RenderContextMenu 声明式构建，
+    // 交给 app.AddOverlay(OverlayPopup.RichMenu(...)) 渲染分发；
+    // 子菜单展开、外部点击关闭、Escape 全部由 RichMenu 自理。
+    int hdrMenuBaseId;  // 表头菜单稳定 id 块（WidgetId.Block(256)）
+    SignalInt hdrMenuResult;  // 表头菜单选中的 action 码（-1 无）
+    SignalBool hdrMenuOpen;  // RichMenu 开关（镜像 hdrCtxOpen）
+    SignalInt hdrMenuSub;  // 表头菜单子菜单展开行（-1 无）
+    SignalInt hdrMenuSub2;  // 表头菜单孙级展开行（-1 无，条件格式两级色板）
+    SignalInt hdrMenuScroll;  // 表头菜单滚动偏移（跨帧持有）
+    int ctxMenuBaseId;  // 行菜单稳定 id 块
+    SignalInt ctxMenuResult;  // 行菜单选中的 action 码（-1 无）
+    SignalBool ctxMenuOpen;  // RichMenu 开关（镜像 ctxOpen）
+    SignalInt ctxMenuSub;  // 行菜单子菜单展开行（-1 无）
+    SignalInt ctxMenuScroll;  // 行菜单滚动偏移（跨帧持有）
+
+    // ---- 筛选行（DevExpress 风格、表头下方的内联快速筛选） ----
+    // 每个可见列都有一个文本输入框。在其中输入会实时过滤表格，
+    // 使用不区分大小写的 Contains 匹配（同 textMode 1）。
+    bool showFilterRow;  // 绘制筛选行（默认 false）
+    List<string> filterRowText;  // 每列当前的筛选文本（与 cols 对齐）
+    int filterRowFocusCol;  // 当前获得焦点的输入框所在列（-1 无）
+    string filterRowBuf;  // 焦点单元格的编辑缓冲区
+    int filterRowCur;  // filterRowBuf 中的光标字节偏移
+
+    // ---- 筛选面板（DevExpress Filter Panel 风格、表头上方的条件芯片条） ----
+    // 把全部活动筛选（逐列 ColFilter、筛选行文本、组合树）
+    // 投影成一行芯片：点芯片直接打开该列的筛选菜单，
+    // × 清除该条件；透视视图激活时常驻一张透视芯片
+    // （点击切换聚合，× 退出视图）。透视视图开启时
+    // 面板自动出现，即使 showFilterPanel 为 false。
+    bool showFilterPanel;  // 绘制筛选面板条带（默认 false）
+
+    // ---- 状态栏（DevExpress 风格底部条） ----
+    // 显示当前单元格范围或选中行的
+    // 行数/选中数/范围聚合（总和、平均、计数）——隐藏时零开销。
+    bool showStatusBar;  // 绘制状态栏（默认 false）
+
+    // ---- 列选择器（Column Chooser 弹层） ----
+    // DevExpress/ag-Grid 风格：勾选列表控制各列显隐，
+    // 搜索框按标题过滤，重排按钮按显示顺序前移/后移。
+    // 程序化 API 见 SetColumnChooser / IsColumnChooserOpen；
+    // UI 常驻入口是分组面板右侧的 "Columns" 按钮
+    // （showGroupPanel 时）。隐藏时零开销。
+    bool colChooserOpen;  // 绘制列选择器弹层（默认 false）
+    string colChooserSearch;  // 选择器搜索框文本
+    int colChooserScroll;  // 勾选列表的滚动起始索引
+
+    // ---- 查找条（Ctrl+F，VTable/浏览器式网格内查找） ----
+    // 与筛选互补：筛选丢弃不匹配的行，查找定位并高亮全部
+    // 命中格。findHits 不物化——命中随视图（排序/筛选）即时
+    // 变化，导航沿当前显示顺序现场扫描（键位触发，非每帧）；
+    // 高亮则每帧只扫可见窗口，百万行也不加重渲染。
+    bool findOpen;  // 查找条可见
+    bool findFocused;  // 查找输入框持有键盘
+    string findQuery;  // 生效的查找文本（Enter 提交）
+    string findBuf;  // 输入缓冲
+    int findCur;  // 光标（字节偏移）
+    int findIndex;  // 当前命中序号（0 基；-1 无）
+    int findCount;  // 命中总数（查询提交时统计，抽样上限见 Search.zan）
+
+    // ---- 转置视图（VTable Transpose 的同类项） ----
+    // 整表行列互换：显示行 = 原列（首列为列标题），显示列 =
+    // 原（过滤后）行。与透视同一实现套路——渲染管线看到的是
+    // 生成列 + 包装源，排序/选区/剪贴板照常；生成列只读。
+    // 透视与转置互斥：进入其一先退出另一个。
+    bool transposeView;  // 表格当前显示转置投影
+    List<DataColumn> trViewCols;  // 生成列（0 号 = 列标题列）
+    TransposeDataSource trSource;  // 包装源（行列互换的 CellText）
+    DataSource trInner;  // 进入视图时的源引用
+    List<DataColumn> trOrigColsList;  // 进入视图时的原始列引用
+    int trOrigCols;  // 进入视图时的列数（退出时裁掉生成槽位）
+    int trRows;  // 已转置的行数（列数随之确定）
+    bool trDirty;  // 需要重新物化（行数变化等）
+
+    // ---- 选区生成图表浮层 ----
+    bool chartOpen;  // 绘制在网格上方的条形图浮层
+    string chartTitle;  // 图表标题（值列名称）
+    List<ChartBar> chartBars;  // 每根条 {类别标签, 值}
+    int chartMax;  // 最大的条值（>=1），用于缩放
+
+    // ---- 导出进度弹层（居中模态，ExportToXlsxAsyncUi 驱动） ----
+    DataTableExportUi exportUi;  // null = 无弹层；状态类见 DataTable.ExportUi.zan
+
+    // ---- 透视视图（ag-Grid 风格：表格整体切换为交叉表） ----
+    // 激活后 RenderSource 用 PivotDataSource 包住原源，把
+    // “行维度 × 列维度”的交叉聚合当成普通行×列数据交给
+    // 现有管线——排序/筛选/汇总/状态栏原样可用，无需独立的
+    // 物化只聚合通过当前筛选（进入视图前的原始筛选状态）
+    // 的行；视图层的筛选/排序再作用于交叉结果本身。
+    bool pivotView;  // 表格当前显示透视投影而非原始数据
+    int pvRowCol;  // 行维度源列（-1 未配置）
+    int pvColDim;  // 列维度源列（-1 无第二维度 → 单值汇总列）
+    int pvValueCol;  // 值源列
+    List<string> pvRowKeys;  // 行键（去重保序）
+    List<string> pvColKeys;  // 列键（去重保序；无第二维度时为单个空串）
+    List<double> pvCells;  // 聚合值，行优先平铺
+    List<double> pvRowTot;  // 每行总计（Sum/Max/Min 模式物化）
+    List<double> pvCellSum;  // 每格原始值求和（列总计行的加权平均/求和用）
+    List<int> pvCellCnt;  // 每格计数（列总计行的计数/加权平均用）
+    List<double> pvCellMx;  // 每格最大（列总计行的 Max 聚合用）
+    List<double> pvCellMn;  // 每格最小（列总计行的 Min 聚合用）
+    List<DataColumn> pvViewCols;  // 透视视图的生成列描述
+    DataSource pvInner;  // 原始数据源（物化与 Poll 代理）
+    PivotDataSource pvSource;  // 交给渲染管线的包装源
+    bool pvDirty;  // 交叉表需要重建
+    int pvOrigCols;  // 进入视图时的列数（退出时裁掉追加的视图槽位）
+    List<DataColumn> pvOrigColsList;  // 进入视图时的原始列引用（芯片标题、重建用）
+    List<ColFilter> pvSavedFilters;  // 进入前的逐列筛选（物化据此过滤）
+    List<string> pvSavedFilterRowText;  // 进入前的筛选行文本
+    List<int> pvSavedGroupCols;  // 进入前的分组列
+    List<SortKey> pvSavedSortKeys;  // 进入前的排序键
+    bool pvSavedSummary;  // 进入前的 showSummary
+    string pvRowTitle;  // 行维度列标题（筛选面板芯片显示用）
+    string pvColTitle;  // 列维度列标题
+    string pvValTitle;  // 值列标题
+    int pivotAgg;  // 0 Sum，1 Average，2 Count，3 Max，4 Min
+
+    // ---- 行分组（ag-Grid / DevExpress 风格） ----
+    List<int> groupCols;  // 分组列，外→内（空 = 扁平表格）
+    List<string> collapsedKeys;  // 其行被折叠隐藏的分组路径键
+    List<DispRow> dispRows;  // 扁平显示模型（见 DispRow）
+
+    // ---- 树模式（TreeGrid） ----
+    // 适配器非 null 即启用：显示模型按树交错（父行后跟
+    // 其可见后代），树列渲染缩进与展开箭头。展开状态
+    // 按源行索引保存在 expandedTree；行经历排序/筛选时
+    // 身份随源索引走，与选择/详情一致。
+    TreeAdapter treeAdapter;
+    List<bool> expandedTree;  // 按源行索引对齐的展开标志
+    int treeCol;  // 渲染缩进/箭头的列（-1 = 无，首列前不显示）
+    List<bool> treeLoading;  // 懒加载进行中的行（按源行索引对齐；
+                               // LoadChildren 已发出、TreeLoaded 未到）
+
+    // ---- 组合筛选树（Filter Builder） ----
+    // 程序化构建的 AND/OR 嵌套树，与逐列 ColFilter 正交：
+    // Recompute 在逐列筛选与筛选行之外整体求值。
+    // null = 未启用（RowPassesFilterTree 恒真）。
+    FilterGroup filterTree;
+    // 显示模型为隐式时为 true：未分组且无
+    // 展开详情带的表格，每个有序行对应一个显示槽位，
+    // 槽位可从 `order` 推导，`dispRows` 保持为空。
+    // 通过 DataTable.DispCount / DispKind / DispRowOf / DispNo / DispPart 读取模型，
+    // 而非 `dispRows`，后者仅在分组和
+    // 详情布局时才会物化。
+    bool dispFlat;
+    List<GroupRow> groups;  // 分组标题行（见 GroupRow）
+
+    // ---- 分组面板（DevExpress 风格、表头上方的条） ----
+    // 把“按此列分组”变成拖拽操作的放置目标：
+    // 将列表头拖入条中即按它分组，横向拖动 chip 重新嵌套，
+    // 点击 chip 的 × 只取消该列分组。条位于
+    // 表头上方，显示时把表头和表格体向下推移。
+    bool showGroupPanel;  // 绘制该条（默认 false）
+    int dragChip;  // 正在条内拖拽的分组列（-1 无）
+    // 滚动条拖拽标志：按下时置位，直到主键释放。拖动期间横向
+    // 滚动会改变可见的按钮/组件单元格，这些格子按可见性领取
+    // 即时模式 id，滚动条自己的 id 随之平移——按
+    // `pressedId == 滚动条id` 判定拖拽会在第一格滚出后失配，
+    // 表现为滚动条拖不动。以持久的布尔标志代替逐帧 id 比对。
+    bool dragHbar;
+    bool dragVbar;
+    int chipDropVis;  // 拖拽期间显示的插入槽位（-1 无）
+    bool hdrDragToPanel;  // 表头拖拽已被拉到条上方
+
+    // ---- 语义事件接口（sender = 此状态；处理器通过
+    // HitRow()/HitCol()/SortColIndex()/... 按无参模型拉取上下文） ----
+    UiEvent FilterChanged;  // 任何筛选变化（筛选行、弹窗、批量）
+    UiEvent HeaderClick;  // 可排序/可筛选的表头标题被点击
+    UiEvent Sort;  // 排序列/方向变化（读取 SortColIndex/SortDirection）
+    UiEvent RowClick;  // 某行被点击（读取 HitRow/HitOrderIndex）
+    UiEvent RowContext;  // 行体右键（读取 CtxRow/CtxX/CtxY）
+    UiEvent RowDoubleClick;  // 某行被双击
+    UiEvent CellClick;  // 某数据单元格被点击（读取 HitRow/HitCol）
+    UiEvent CellDoubleClick;  // 某数据单元格被双击（读取 HitRow/HitCol）
+    UiEvent CellEdit;  // 单元格内编辑已提交（读取 EditRow/EditCol/EditValue）
+    UiEvent CellValidating;  // 正在校验一次提交：读取 EditRow/EditCol/EditValue
+                               // 并调用 Reject(msg) 拒绝（见 editError）
+    UiEvent SelectionChanged;  // 选中行集合变化
+    UiEvent ColumnResize;  // 拖拽改变列宽（读取 HitCol）
+    UiEvent ColumnResizeEnd;  // 列宽拖拽结束（读取 HitCol）
+    UiEvent ScrollChanged;  // 虚拟行窗口滚动（读取 ScrollTop）
+    UiEvent GroupChanged;  // 分组列变化（读取 GroupCount）
+    UiEvent ColumnReorder;  // 列被拖拽重排（读取 HitCol）
+    UiEvent RowInserted;  // 添加了一行（读取 HitRow 获取其索引）
+    UiEvent RowDeleted;  // 移除了一行（读取 HitRow 获取其索引）
+    UiEvent BandToggled;  // 表头带被折叠或展开
+    int hitRow;  // 最近一次行/单元格交互的数据行索引
+    int hitOrder;  // 该行（排序/过滤后）的顺序位置
+    int hitCol;  // 最近一次表头/单元格交互的列索引
+    int editRow;  // 正在编辑的数据行索引（CellEdit）
+    int editCol;  // 正在编辑的列索引（CellEdit）
+    string editVal;  // 已提交的值（CellEdit）
+    bool editing;  // 当前有内联编辑器打开
+    string editBuf;  // 打开编辑器中的工作文本
+    int editCur;  // editBuf 中的光标位置（字符数）
+
+    // ---- 校验 ----
+    // 被拒绝的提交会保持编辑器打开并在其下方显示 editError，
+    // 让用户能修正值而不是悄悄丢失。
+    string editError;  // 拒绝信息（“” = 值有效）
+    bool editRejected;  // CellValidating 运行期间由 Reject() 设置
+
+    // ---- 编辑器弹窗（下拉列表 / 日历） ----
+    bool edPopOpen;  // 打开的编辑器正在显示其弹窗
+    int edPopSel;  // 高亮的下拉项，或日历日期
+    int edPopScroll;  // 第一个可见的下拉项
+    List<int> edPopItems;  // 下拉框：指向列 `choices` 的索引，
+                               // 即与输入文本匹配的项，按列表顺序
+    int edCalMonth;  // 日历：显示的月份，即 y * 12 + (m - 1)
+    bool edPopHot;  // 每帧：指针位于编辑器弹窗上，
+                               // 表格体不得同时响应按压
+
+    // ---- 外观钩子 ----
+    CellStyler styler;  // 可选的行/单元格着色 + 自定义单元格绘制
+                               // （null = 默认外观；见 CellStyler）
+
+    // ---- 单元格控件插槽 ----
+    // 非 null 时渲染循环对每格调用 provider.Provide 取真控件
+    // （PropertyGrid 同款控件内嵌），控件按格矩形渲染；
+    // 返回 null 的格走内置 cellType 渲染。见 CellWidgetProvider。
+    CellWidgetProvider cellWidgets;
+
+    // ---- 组件列（cellType 9）----
+    // 最近一次组件列点击在矩阵内的位置（CellClick 处理器经
+    // DataTable.CompPosR/CompPosC 读取；-1 = 无）。
+    int compR;
+    int compC;
+
+    // ---- 主从详情 ----
+    // 用户展开的行，以*源*行索引保存，
+    // 展开状态随行经历排序和过滤，而不是钉在
+    // 某个显示位置上。provider 为 null = 功能关闭，零开销。
+    DetailProvider detail;
+    // 兼容的源索引列表；新 API 以 expandedKeys 为权威身份。
+    List<int> expandedRows;
+    List<RowKey> expandedKeys;
+    bool expandedByKey;
+
+    // ---- 行添加/删除 + 撤销 ----
+    // 日志有上限（undoLimit），长时间编辑不会让它无限增长，
+    // 溢出时丢弃最旧的条目。
+    List<RowEdit> undoLog;  // 可逆更改，最旧在前
+    List<RowEdit> redoLog;  // 被 Ctrl+Z 弹出的条目，组内最旧在末尾；
+                               // 新编辑会立刻清空它（分支历史）
+    int undoLimit;  // 日志条目上限（默认 100）
+    bool allowAddRow;  // 在最后一行下方显示新行占位符
+    bool undoing;  // 正在应用撤销：不要记录其自身的写入
+    int lastAddedRow;  // 最近一次插入的数据行索引（-1 无）
+    int undoGroup;  // 盖在新条目上的分组 id（0 = 未分组）
+    int undoGroupSeq;  // BeginUndoGroup 发出的最后一个分组 id
+
+    // ---- 填充柄（Excel 式拖拽填充） ----
+    // 渲染层在活动范围右下角画小方块；fillHX/HY 是角点像素
+    // （无范围或角点滚出视口时为 -1，按下时不拦截）。
+    bool fillDrag;  // 填充拖拽进行中
+    int fillHX;  // 填充柄角点 X
+    int fillHY;  // 填充柄角点 Y
+    int fillSR0;  // 拖拽开始时的源矩形快照（显示槽位/列）
+    int fillSC0;
+    int fillSR1;
+    int fillSC1;
+    int fillTR0;  // 当前填充目标矩形（归一化；无目标时 TR0>TR1）
+    int fillTC0;
+    int fillTR1;
+    int fillTC1;
+
+    // ---- 空态/加载覆盖层（AG Grid noRows/loadingOverlay 惯例） ----
+    string emptyText;  // 自定义空态文案；"" 用内置"暂无数据"
+    string loadingText;  // 自定义加载中文案；"" 用内置"加载中…"
+    string overlayKind;  // 本帧渲染的覆盖层："" / "empty" /
+                               // "loading"（诊断与探针读取）
+
+    DataTableState() {
+        this.inited = false;
+        this.sortCol = -1;
+        this.sortDir = 1;
+        this.sortKeys = new List<SortKey>();
+        this.selected = new List<bool>();
+        this.selectionModel = SelectionModel.Row();
+        this.selectionModelAuthoritative = false;
+        this.selectionSyncRevision = -1;
+        this.selectionSyncRows = -1;
+        this.colWidths = new List<int>();
+        this.dispW = new List<int>();
+        this.order = new List<int>();
+        this.filters = new List<ColFilter>();
+        this.openMenu = -1;
+        this.scrollRow = 0;
+        this.scrollX = 0;
+        this.resizeCol = -1;
+        this.resizeStartX = 0;
+        this.resizeStartW = 0;
+        this.dirty = true;
+        this.cellRanges = new List<TableCellRange>();
+        this.multiActive = false;
+        this.keyProvider = null;
+        this.cellWidgets = null;
+        this.compR = 0 - 1;
+        this.compC = 0 - 1;
+        this.rowKeys = new List<RowKey>();
+        this.rowKeysRevision = -1;
+        this.diagnostics = new List<TableDiagnostic>();
+        this.dataRevision = 0;
+        this.queryRevision = 0;
+        this.viewRevision = 0;
+        this.columnCount = 0 - 1;
+        this.filterTab = 0;
+        this.searchText = "";
+        this.valScroll = 0;
+        this.editFocus = 0;
+        this.batchLines = new List<string>();
+        this.batchLines.Add("");
+        this.batchExactFlag = 0;
+        this.menuVals = new List<string>();
+        this.menuMatched = new List<string>();
+        this.menuSearchCache = "";
+        instSeq = instSeq + 1;
+        this.inst = instSeq;
+        this.showRowNum = true;
+        this.showSelect = true;
+        this.striped = true;
+        this.rowH = 0;
+        this.rowReorder = false;
+        this.showSummary = false;
+        this.aggregates = new List<ColumnAggregateState>();
+        this.aggMode = new List<int>();
+        this.aggValue = new List<int>();
+        this.aggReal = new List<double>();
+        this.summaryText = new List<string>();
+        this.aggSumR = new List<double>();
+        this.aggMinR = new List<double>();
+        this.aggMaxR = new List<double>();
+        this.cfExtents = new List<ColumnCfExtents>();
+        this.cfMin = new List<int>();
+        this.cfMax = new List<int>();
+        this.cfMinR = new List<double>();
+        this.cfMaxR = new List<double>();
+        this.cfRank = new List<int>();
+        this.cfOrderPos = null;
+        this.formulaSeen = null;
+        this.cfRules = new List<ColumnCfRule>();
+        this.cfClearOpen = false;
+        this.cfClearItems = new List<CfClearItem>();
+        this.cfClearScroll = 0;
+        this.paged = false;
+        this.pageModel = new SignalInt(1);
+        this.pageRows = 0;
+        this.lastSelSync = -1;
+        this.lastPageSync = 1;
+        this.selAnchor = -1;
+        this.selAnchorCol = -1;
+        this.rangeR0 = -1;
+        this.rangeC0 = -1;
+        this.rangeR1 = -1;
+        this.rangeC1 = -1;
+        this.rangeDrag = false;
+        this.rangeSelTouched = new List<int>();
+        this.tipOi = -1;
+        this.tipCol = -1;
+        this.tipSinceMs = 0;
+        this.hdrTipCol = -1;
+        this.hdrTipSinceMs = 0;
+        this.dragRow = -1;
+        this.dragStartY = 0;
+        this.dragMoved = false;
+        this.rowGripDrag = false;
+        this.rowSelDrag = false;
+        this.ctxOpen = false;
+        this.externalRowMenu = false;
+        this.ctxX = 0;
+        this.ctxY = 0;
+        this.ctxRow = -1;
+        this.ctxOrder = -1;
+        this.colHidden = new List<bool>();
+        this.colFreeze = new List<int>();
+        this.bandCollapsed = new List<string>();
+        this.bandAutoHidden = new List<int>();
+        this.colOrder = new List<int>();
+        this.dragCol = -1;
+        this.dragColStartX = 0;
+        this.dragColMoved = false;
+        this.dropVis = -1;
+        this.hdrCtxOpen = false;
+        this.hdrCtxCol = -1;
+        this.hdrCtxX = 0;
+        this.hdrCtxY = 0;
+        this.toast = "";
+        this.toastFrames = 0;
+        this.hdrMenuBaseId = -1;
+        this.hdrMenuResult = new SignalInt(0 - 1);
+        this.hdrMenuOpen = new SignalBool(false);
+        this.hdrMenuSub = new SignalInt(0 - 1);
+        this.hdrMenuSub2 = new SignalInt(0 - 1);
+        this.hdrMenuScroll = new SignalInt(0);
+        this.ctxMenuBaseId = -1;
+        this.ctxMenuResult = new SignalInt(0 - 1);
+        this.ctxMenuOpen = new SignalBool(false);
+        this.ctxMenuSub = new SignalInt(0 - 1);
+        this.ctxMenuScroll = new SignalInt(0);
+        this.showFilterRow = false;
+        this.filterRowText = new List<string>();
+        this.filterRowFocusCol = -1;
+        this.filterRowBuf = "";
+        this.filterRowCur = 0;
+        this.showFilterPanel = false;
+        this.showStatusBar = false;
+        this.colChooserOpen = false;
+        this.colChooserSearch = "";
+        this.colChooserScroll = 0;
+        this.findOpen = false;
+        this.findFocused = false;
+        this.findQuery = "";
+        this.findBuf = "";
+        this.findCur = 0;
+        this.findIndex = -1;
+        this.findCount = 0;
+        this.chartOpen = false;
+        this.chartTitle = "";
+        this.chartBars = new List<ChartBar>();
+        this.chartMax = 1;
+        this.exportUi = null;
+        this.pivotView = false;
+        this.pvRowCol = -1;
+        this.pvColDim = -1;
+        this.pvValueCol = -1;
+        this.pvRowKeys = new List<string>();
+        this.pvColKeys = new List<string>();
+        this.pvCells = new List<double>();
+        this.pvRowTot = new List<double>();
+        this.pvCellSum = new List<double>();
+        this.pvCellCnt = new List<int>();
+        this.pvCellMx = new List<double>();
+        this.pvCellMn = new List<double>();
+        this.pvViewCols = new List<DataColumn>();
+        this.pvInner = null;
+        this.pvSource = null;
+        this.pvDirty = false;
+        this.pvOrigCols = 0;
+        this.pvOrigColsList = null;
+        this.pvSavedFilters = null;
+        this.pvSavedFilterRowText = null;
+        this.pvSavedGroupCols = null;
+        this.pvSavedSortKeys = null;
+        this.pvSavedSummary = false;
+        this.pvRowTitle = "";
+        this.pvColTitle = "";
+        this.pvValTitle = "";
+        this.pivotAgg = 0;
+        this.transposeView = false;
+        this.trViewCols = new List<DataColumn>();
+        this.trSource = null;
+        this.trInner = null;
+        this.trOrigColsList = null;
+        this.trOrigCols = 0;
+        this.trRows = 0;
+        this.trDirty = false;
+        this.FilterChanged = new UiEvent();
+        this.HeaderClick = new UiEvent();
+        this.Sort = new UiEvent();
+        this.RowClick = new UiEvent();
+        this.RowContext = new UiEvent();
+        this.RowDoubleClick = new UiEvent();
+        this.CellClick = new UiEvent();
+        this.CellDoubleClick = new UiEvent();
+        this.CellEdit = new UiEvent();
+        this.CellValidating = new UiEvent();
+        this.SelectionChanged = new UiEvent();
+        this.ColumnResize = new UiEvent();
+        this.ColumnResizeEnd = new UiEvent();
+        this.ScrollChanged = new UiEvent();
+        this.GroupChanged = new UiEvent();
+        this.ColumnReorder = new UiEvent();
+        this.RowInserted = new UiEvent();
+        this.RowDeleted = new UiEvent();
+        this.BandToggled = new UiEvent();
+        this.groupCols = new List<int>();
+        this.collapsedKeys = new List<string>();
+        this.treeAdapter = null;
+        this.expandedTree = new List<bool>();
+        this.treeCol = -1;
+        this.treeLoading = new List<bool>();
+        this.filterTree = null;
+        this.showGroupPanel = false;
+        this.dragChip = -1;
+        this.dragHbar = false;
+        this.dragVbar = false;
+        this.chipDropVis = -1;
+        this.hdrDragToPanel = false;
+        this.dispRows = new List<DispRow>();
+        this.dispFlat = true;
+        this.groups = new List<GroupRow>();
+        this.hitRow = -1;
+        this.hitOrder = -1;
+        this.hitCol = -1;
+        this.editRow = -1;
+        this.editCol = -1;
+        this.editVal = "";
+        this.editing = false;
+        this.editBuf = "";
+        this.editCur = 0;
+        this.editError = "";
+        this.editRejected = false;
+        this.edPopOpen = false;
+        this.edPopSel = -1;
+        this.edPopScroll = 0;
+        this.edPopItems = new List<int>();
+        this.edCalMonth = 0;
+        this.edPopHot = false;
+        this.styler = null;
+        this.detail = null;
+        this.expandedRows = new List<int>();
+        this.expandedKeys = new List<RowKey>();
+        this.expandedByKey = false;
+        this.undoLog = new List<RowEdit>();
+        this.redoLog = new List<RowEdit>();
+        this.undoLimit = 100;
+        this.allowAddRow = false;
+        this.undoing = false;
+        this.lastAddedRow = -1;
+        this.undoGroup = 0;
+        this.undoGroupSeq = 0;
+        this.fillDrag = false;
+        this.fillHX = -1;
+        this.fillHY = -1;
+        this.fillSR0 = -1;
+        this.fillSC0 = -1;
+        this.fillSR1 = -1;
+        this.fillSC1 = -1;
+        this.fillTR0 = 0;
+        this.fillTC0 = 0;
+        this.fillTR1 = -1;
+        this.fillTC1 = -1;
+        this.emptyText = "";
+        this.loadingText = "";
+        this.overlayKind = "";
+    }
+
+    // ---- 事件上下文访问器（方案 A：处理器读取 sender） ----
+    int HitRow() { return hitRow; }
+
+    // 导出进度弹层是否显示中（模态：表体按下/滚轮/按键等
+    // 事件路径据此抑制，弹层由 RenderExportUi 最后绘制并
+    // 独占处理自己的按钮）。
+    bool ExportUiOpen() {
+        return this.exportUi != null && this.exportUi.visible;
+    }
+
+    int HitOrderIndex() { return hitOrder; }
+    int CtxRow() { return ctxRow; }
+    int CtxOrder() { return ctxOrder; }
+    int CtxX() { return ctxX; }
+    int CtxY() { return ctxY; }
+    int HitCol() { return hitCol; }
+    int SortColIndex() { return sortCol; }
+    int SortDirection() { return sortDir; }
+    int ScrollTop() { return scrollRow; }
+    int EditRow() { return editRow; }
+    int EditCol() { return editCol; }
+    string EditValue() { return editVal; }
+
+    // 返回当前全部选中行的源行索引，顺序与数据源索引一致。
+    // 业务侧可在 RowContext 处理器中读取多选对象。
+    List<int> SelectedRowIndices() {
+        List<int> rows = new List<int>();
+        for (int i = 0; i < selected.Count; i = i + 1) {
+            if (selected[i]) { rows.Add(i); }
+        }
+        return rows;
+    }
+
+    // 拒绝正在校验的值。在 `CellValidating` 处理器中调用：
+    // 编辑器保持打开并在下方显示 `msg`，不会有写入
+    // 到达数据源。
+    void Reject(string msg) {
+        editRejected = true;
+        editError = msg;
+    }
+
+    // 当前的拒绝信息（上次提交被接受时为“”）。
+    string EditError() { return editError; }
+}

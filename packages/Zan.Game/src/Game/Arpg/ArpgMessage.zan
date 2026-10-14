@@ -1,0 +1,86 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+namespace Game.Arpg;
+
+// 以通信 id（cid）为键的 ZGM 消息。在线上以
+// 长度前缀记录进行帧封装，使 ArpgTcpClient/ArpgTcpServer 组合能在流上
+// 恢复消息边界。这是净室帧格式（u32 载荷
+// 长度 + u32 cid + 正文）。
+// 以通信 id（cid）为键的 ZGM 消息。线上帧格式为
+// u32 载荷长度 + u32 cid + 正文（各字段大端序），Encode/Decode
+// 互为逆操作；正文按单字节字符收发。
+class ArpgMessage {
+    // 通信 id，业务侧用于路由消息。
+    int cid;
+    // 消息正文。
+    string body;
+    // 正文长度（与 body.Length 一致）。
+    int bodyLen;
+
+    // 构造消息（显式给出正文长度）。
+    static ArpgMessage Of(int cid, string body, int bodyLen) {
+        ArpgMessage m = new ArpgMessage();
+        m.cid = cid;
+        m.body = body;
+        m.bodyLen = bodyLen;
+        return m;
+    }
+
+    // 构造文本消息（正文长度自动取 body.Length）。
+    static ArpgMessage Text(int cid, string body) {
+        return ArpgMessage.Of(cid, body, body.Length);
+    }
+
+    // 通信 id。
+    int Cid() { return this.cid; }
+    // 消息正文。
+    string Body() { return this.body; }
+    // 正文长度。
+    int BodyLength() { return this.bodyLen; }
+
+    // 编码总大小：4（长度）+ 4（cid）+ 正文。
+    // 整帧字节数：8 字节头 + 正文长度。
+    int FrameLength() { return 8 + this.bodyLen; }
+
+    // 编码为帧字节序列（长度前缀 + cid 大端序 + 正文）。
+    byte[] Encode() {
+        int total = 8 + this.bodyLen;
+        byte[] buf = new byte[total + 1];
+        int payload = 4 + this.bodyLen;  // 长度字段之后的字节数
+        buf[0] = (byte)((payload >> 24) & 0xFF);
+        buf[1] = (byte)((payload >> 16) & 0xFF);
+        buf[2] = (byte)((payload >> 8) & 0xFF);
+        buf[3] = (byte)(payload & 0xFF);
+        buf[4] = (byte)((this.cid >> 24) & 0xFF);
+        buf[5] = (byte)((this.cid >> 16) & 0xFF);
+        buf[6] = (byte)((this.cid >> 8) & 0xFF);
+        buf[7] = (byte)(this.cid & 0xFF);
+        for (int i = 0; i < this.bodyLen; i = i + 1) {
+            buf[8 + i] = (byte)(this.body[i] & 0xFF);
+        }
+        return buf;
+    }
+
+    // 解码 `buf` 开头的第一条帧记录；若
+    // 现有字节少于声明长度则返回 null。
+    // 解码 buf[0..len) 中的第一条帧记录；字节不足 8（头）或不足
+    // 声明长度时返回 null，调用方应继续等待更多数据。
+    static ArpgMessage Decode(string buf, int len) {
+        if (len < 8) { return null; }
+        int payload = ((buf[0] & 0xFF) << 24) | ((buf[1] & 0xFF) << 16) |
+                      ((buf[2] & 0xFF) << 8) | (buf[3] & 0xFF);
+        int total = 4 + payload;
+        if (len < total) { return null; }
+        int cid = ((buf[4] & 0xFF) << 24) | ((buf[5] & 0xFF) << 16) |
+                  ((buf[6] & 0xFF) << 8) | (buf[7] & 0xFF);
+        int bodyLen = payload - 4;
+        byte[] body = new byte[bodyLen + 1];
+        for (int i = 0; i < bodyLen; i = i + 1) {
+            body[i] = (byte)(buf[8 + i] & 0xFF);
+        }
+        return ArpgMessage.Of(cid, body.ToStr(0, bodyLen), bodyLen);
+    }
+}

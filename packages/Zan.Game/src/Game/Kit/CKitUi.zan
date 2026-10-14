@@ -1,0 +1,226 @@
+using System;
+using System.IO;
+using Gui;
+
+namespace Game.Kit;
+
+// 共享 UI 套件：整幅铺底图 + 压暗纱，
+// 三态圆角按钮。
+class CKitUi {
+    // 背景图铺满画布（路径为空退化为竖向渐变），再叠可读性压暗纱。
+    static void Backdrop(Canvas c, string bgPath, int w, int h) {
+        if (bgPath != null && bgPath.Length > 0) {
+            CDraw.BlitImage(c, bgPath, 0, 0, w, h);
+        } else {
+            CDraw.FillVGrad(c, 0, 0, w, h, CDraw.Argb(255, 18, 22, 32),
+                            CDraw.Argb(255, 8, 10, 16));
+        }
+        CDraw.FillVGrad(c, 0, 0, w, h, CDraw.Argb(70, 6, 8, 14),
+                        CDraw.Argb(70, 6, 8, 14));
+        CDraw.FillVGrad(c, 0, h * 3 / 5, w, h * 2 / 5, CDraw.Argb(150, 6, 8, 14),
+                        CDraw.Argb(150, 8, 10, 16));
+    }
+
+    // 三态扁平圆角按钮（kind: 0 普通、1 强调、2 选中），悬停返回 true。
+    // 配色与 KitUi.Button 逐项一致。
+    static bool Button(Canvas c, int mx, int my, int x, int y, int w, int h,
+                       string label, int scale, int kind) {
+        bool hov = CDraw.PointIn(mx, my, x, y, w, h);
+        int mr = 47; int mg = 54; int mb = 72;
+        int tc = 238;
+        if (kind == 1) {
+            mr = 44; mg = 128; mb = 88;
+        } else if (kind == 2) {
+            mr = 226; mg = 178; mb = 64; tc = 36;
+        }
+        if (hov) {
+            if (kind == 1) { mr = 56; mg = 152; mb = 104; }
+            else if (kind == 2) { mr = 244; mg = 196; mb = 78; }
+            else { mr = 62; mg = 71; mb = 96; }
+        }
+        if (hov) {
+            int gr = 130; int gg = 190; int gb = 245;
+            if (kind == 1) { gr = 120; gg = 230; gb = 170; }
+            if (kind == 2) { gr = 250; gg = 210; gb = 110; }
+            CDraw.RoundRectFill(c, x - 5, y - 5, w + 10, h + 10, 17, gr, gg, gb, 50);
+        }
+        // 深色外圈 + 平色主体 + 一道极细内亮边（无中线分缝）。
+        CDraw.RoundRectFill(c, x - 2, y - 2, w + 4, h + 4, 14, 10, 12, 20, 240);
+        CDraw.RoundRectFill(c, x, y, w, h, 12, mr, mg, mb, 255);
+        c.DrawRoundRect(CDraw.MapX(x + 1 + CDraw.originX),
+                        CDraw.MapY(y + 1 + CDraw.originY),
+                        CDraw.MapW(w - 2), CDraw.MapW(h - 2), CDraw.MapW(11),
+                        CDraw.Argb(28, 255, 255, 255), CDraw.MapW(1));
+        CText.DrawCenteredShadow(c, label, x + w / 2, y + (h - CText.LineHeight(scale)) / 2,
+                                 scale, tc, tc, tc, 255);
+        return hov;
+    }
+}
+
+// 美术化支持层（CFx）：真实美术资产（背景/棋盘/棋子/面板贴图）之外的
+// 画布效果——投影、渐变面板、描金、暗角、鎏金按钮。定位是支持层：
+// 大面积表面优先贴资产，CFx 负责资产落位后的压影/提亮/描金，以及
+// 无资产时的同观感直绘回退。所有几何都经 CDraw 映射（视口缩放 +
+// 模块原点），命中区语义与 CKitUi 完全一致。
+class CFx {
+    // 柔和投影（SDF smoothstep，几何连续、不随层叠变黑）。
+    static void ShadowRect(Canvas c, int x, int y, int w, int h, int rad,
+                           int blur, int cr, int cg, int cb, int ca) {
+        if (blur <= 0 || ca <= 0) { return; }
+        c.ShadowRoundRect(CDraw.MapX(x + CDraw.originX),
+                          CDraw.MapY(y + CDraw.originY), CDraw.MapW(w),
+                          CDraw.MapW(h), CDraw.MapW(rad), CDraw.MapW(blur),
+                          CDraw.Argb(ca, cr, cg, cb));
+    }
+
+    // 圆角渐变面（dir: 0 上→下 1 左→右 2 右下对角 3 左下对角；
+    // c0/cv/c1 是 0xAARRGGBB，cv=0 表示无中间停靠点，端点可带 alpha）。
+    static void GradRect(Canvas c, int x, int y, int w, int h, int rad,
+                         int dir, int c0, int cv, int c1) {
+        c.FillGradMask(CDraw.MapX(x + CDraw.originX),
+                       CDraw.MapY(y + CDraw.originY), CDraw.MapW(w),
+                       CDraw.MapW(h), CDraw.MapW(rad), 15, dir, c0, cv, c1);
+    }
+
+    // 圆角描边环（厚度 t 画在轮廓上；ca<=0 跳过）。
+    static void Ring(Canvas c, int x, int y, int w, int h, int rad, int t,
+                     int cr, int cg, int cb, int ca) {
+        if (ca <= 0 || t <= 0 || w <= 0 || h <= 0) { return; }
+        c.DrawRoundRect(CDraw.MapX(x + CDraw.originX),
+                        CDraw.MapY(y + CDraw.originY), CDraw.MapW(w),
+                        CDraw.MapW(h), CDraw.MapW(rad),
+                        CDraw.Argb(ca, cr, cg, cb), CDraw.MapW(t));
+    }
+
+    static void RingCircle(Canvas c, int cx, int cy, int rad, int t,
+                           int cr, int cg, int cb, int ca) {
+        if (ca <= 0 || t <= 0 || rad <= 0) { return; }
+        c.DrawCircle(CDraw.MapX(cx + CDraw.originX),
+                     CDraw.MapY(cy + CDraw.originY), CDraw.MapW(rad),
+                     CDraw.Argb(ca, cr, cg, cb), CDraw.MapW(t));
+    }
+
+    // 提亮卡：投影 + 竖向渐变面 + 描边 + 顶部一道内亮线。
+    static void Card(Canvas c, int x, int y, int w, int h, int rad,
+                     int fr, int fg, int fb, int f2r, int f2g, int f2b,
+                     int tr, int tg, int tb, int ta, int t, int dir) {
+        CFx.ShadowRect(c, x, y + 4, w, h, rad, 16, 0, 0, 0, 110);
+        CFx.GradRect(c, x, y, w, h, rad, dir,
+                     CDraw.Argb(255, fr, fg, fb), 0,
+                     CDraw.Argb(255, f2r, f2g, f2b));
+        CFx.Ring(c, x, y, w, h, rad, t, tr, tg, tb, ta);
+        if (h > 2 * rad + 4) {
+            CDraw.FillRect(c, x + rad / 2, y + 1, w - rad, 1,
+                           CDraw.Argb(56, 255, 244, 220));
+        }
+    }
+
+    // 胶囊条（rad = h/2）：投影 + 渐变 + 细描边，做徽标/分段条。
+    static void Pill(Canvas c, int x, int y, int w, int h, int dir,
+                     int fr, int fg, int fb, int f2r, int f2g, int f2b,
+                     int tr, int tg, int tb, int ta) {
+        int rad = h / 2;
+        if (rad < 4) { rad = 4; }
+        CFx.ShadowRect(c, x, y + 2, w, h, rad, 8, 0, 0, 0, 90);
+        CFx.GradRect(c, x, y, w, h, rad, dir,
+                     CDraw.Argb(255, fr, fg, fb), 0,
+                     CDraw.Argb(255, f2r, f2g, f2b));
+        CFx.Ring(c, x, y, w, h, rad, 1, tr, tg, tb, ta);
+    }
+
+    // 鎏金/漆木按钮（kind: 0 漆木 1 鎏金 2 暗金）。命中区与
+    // CKitUi.Button 完全一致（同一矩形，悬停光晕外扩不算命中），
+    // 两者混用不产生命中漂移。
+    static bool GoldButton(Canvas c, int mx, int my, int x, int y, int w,
+                           int h, string label, int scale, int kind) {
+        bool hov = CDraw.PointIn(mx, my, x, y, w, h);
+        int rad = h / 3;
+        if (rad > 12) { rad = 12; }
+        int fr = 66; int fg = 42; int fb = 26;
+        int f2r = 38; int f2g = 24; int f2b = 14;
+        int tcR = 244; int tcG = 232; int tcB = 208;
+        bool shadowText = true;
+        if (kind == 1) {
+            fr = 250; fg = 214; fb = 132;
+            f2r = 196; f2g = 138; f2b = 54;
+            tcR = 62; tcG = 38; tcB = 10;
+            shadowText = false;
+        } else if (kind == 2) {
+            fr = 236; fg = 196; fb = 110;
+            f2r = 186; f2g = 132; f2b = 44;
+            tcR = 56; tcG = 34; tcB = 10;
+            shadowText = false;
+        }
+        if (hov) {
+            int gr = 240; int gg = 210; int gb = 160;
+            if (kind != 0) { gr = 255; gg = 220; gb = 140; }
+            CDraw.RoundRectFill(c, x - 6, y - 6, w + 12, h + 12, rad + 6,
+                                gr, gg, gb, 46);
+            fr = fr + 16; fg = fg + 14; fb = fb + 10;
+            f2r = f2r + 14; f2g = f2g + 12; f2b = f2b + 8;
+        }
+        CFx.ShadowRect(c, x, y + 3, w, h, rad, 10, 0, 0, 0, 120);
+        CFx.GradRect(c, x, y, w, h, rad, 0,
+                     CDraw.Argb(255, fr, fg, fb), 0,
+                     CDraw.Argb(255, f2r, f2g, f2b));
+        if (kind == 0) {
+            CFx.Ring(c, x, y, w, h, rad, 1, 226, 186, 128, 90);
+        } else {
+            CFx.Ring(c, x, y, w, h, rad, 1, 96, 58, 20, 200);
+        }
+        // 顶部一道弧面高光（裁剪在按钮上沿内），给鎏金面一点釉光。
+        int gh = h * 2 / 5;
+        if (gh > 0) {
+            c.PushClip(CDraw.MapX(x + CDraw.originX),
+                       CDraw.MapY(y + CDraw.originY), CDraw.MapW(w),
+                       CDraw.MapW(gh));
+            CFx.GradRect(c, x, y, w, gh, rad, 0,
+                         CDraw.Argb(85, 255, 250, 235), 0,
+                         CDraw.Argb(0, 255, 250, 235));
+            c.PopClip();
+        }
+        int ty = y + (h - CText.LineHeight(scale)) / 2;
+        if (shadowText) {
+            CText.DrawCenteredShadow(c, label, x + w / 2, ty, scale,
+                                     tcR, tcG, tcB, 255);
+        } else {
+            CText.DrawCentered(c, label, x + w / 2, ty, scale,
+                               tcR, tcG, tcB, 255);
+        }
+        return hov;
+    }
+
+    // 四边暗角：向内渐隐的暗纱（不做模糊，不遮交互），a 是外沿 alpha。
+    static void Vignette(Canvas c, int w, int h, int a) {
+        if (a <= 0 || w < 16 || h < 16) { return; }
+        int e = 72;
+        if (e > h / 4) { e = h / 4; }
+        if (e > w / 4) { e = w / 4; }
+        if (e < 2) { return; }
+        int dark = CDraw.Argb(a, 8, 5, 2);
+        int clear = CDraw.Argb(0, 8, 5, 2);
+        CFx.GradRect(c, 0, 0, w, e, 0, 0, dark, 0, clear);
+        CFx.GradRect(c, 0, h - e, w, e, 0, 0, clear, 0, dark);
+        CFx.GradRect(c, 0, 0, e, h, 0, 1, dark, 0, clear);
+        CFx.GradRect(c, w - e, 0, e, h, 0, 1, clear, 0, dark);
+    }
+
+    // 描金分隔线：中央小结 + 两侧向外渐隐的金线与点饰（标题下饰线、
+    // 楚河汉界水面线共用）。
+    static void Rule(Canvas c, int cx, int cy, int halfW,
+                     int cr, int cg, int cb, int ca) {
+        if (halfW < 24 || ca <= 0) { return; }
+        int lw = halfW - 14;
+        CFx.GradRect(c, cx - halfW, cy - 1, lw, 2, 0, 1,
+                     CDraw.Argb(0, cr, cg, cb), 0,
+                     CDraw.Argb(ca, cr, cg, cb));
+        CFx.GradRect(c, cx + 14, cy - 1, lw, 2, 0, 1,
+                     CDraw.Argb(ca, cr, cg, cb), 0,
+                     CDraw.Argb(0, cr, cg, cb));
+        CDraw.FillCircle(c, cx, cy, 3, cr, cg, cb, ca);
+        CDraw.FillCircle(c, cx - 9, cy, 2, cr, cg, cb, ca / 2);
+        CDraw.FillCircle(c, cx + 9, cy, 2, cr, cg, cb, ca / 2);
+    }
+}
+
+class CanvasPrims { }

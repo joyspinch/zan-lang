@@ -1,0 +1,143 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+namespace Game.Arpg;
+
+// ArpgTcpServer 组件的实时 TCP 服务器运行时。将
+// ServerConfig 绑定到监听套接字，并跟踪已接受的 ArpgServerClient
+// 连接。
+// ArpgTcpServer 组件的实时 TCP 服务器运行时：绑定监听套接字
+// （非阻塞、SO_REUSEADDR），跟踪已接受的 ArpgServerClient。
+// Start 失败（配置为空、被 Starting 否决、bind/listen 失败）返回
+// null；事件在 Starting/Started/Stopping/Stopped/ClientConnected/
+// ClientDisconnected 上回调。
+class ArpgTcpServerRuntime {
+    ServerConfig config;
+    nint listener;
+    bool running;
+    int nextClientId;
+    List<ArpgServerClient> clients;
+    ArpgServerEvents events;
+
+    // 以默认事件总线启动监听（无 Starting/Stopping 否决）。
+    static ArpgTcpServerRuntime Start(ServerConfig config, string bindHost) {
+        return ArpgTcpServerRuntime.Start(
+            config, bindHost, new ArpgServerEvents());
+    }
+
+    // 启动监听：先触发 Starting（返回 false 则放弃），随后
+    // bind/listen/设非阻塞，任一步失败即返回 null（套接字已
+    // 清理）；成功后触发 Started 并返回运行中的服务器。
+    static ArpgTcpServerRuntime Start(
+        ServerConfig config,
+        string bindHost,
+        ArpgServerEvents events
+    ) {
+        if (config == null) { return null; }
+        if (events != null && !events.RaiseStarting(bindHost)) {
+            return null;
+        }
+        Socket.Initialize();
+        ArpgTcpServerRuntime s = new ArpgTcpServerRuntime();
+        s.config = config;
+        s.events = events;
+        s.listener = Socket.CreateTcp();
+        if (s.listener < 0) { return null; }
+        Socket.SetReuseAddr(s.listener);
+        int bindResult = Socket.Bind(s.listener, bindHost, config.Port());
+        if (bindResult != 0) {
+            Socket.Close(s.listener);
+            return null;
+        }
+        int listenResult = Socket.Listen(s.listener, 16);
+        if (listenResult != 0) {
+            Socket.Close(s.listener);
+            return null;
+        }
+        int nonBlockingResult = Socket.SetNonBlocking(s.listener);
+        if (nonBlockingResult != 0) {
+            Socket.Close(s.listener);
+            return null;
+        }
+        s.running = true;
+        s.nextClientId = 1;
+        s.clients = new List<ArpgServerClient>();
+        if (s.events != null) {
+            s.events.RaiseStarted(config, bindHost);
+        }
+        return s;
+    }
+
+    // Start 的 async 包装（设置本身同步，无需额外让出）。
+    static async ArpgTcpServerRuntime StartAsync(
+        ServerConfig config,
+        string bindHost
+    ) {
+        // Start() 是同步设置；无需轮询/让出。
+        return ArpgTcpServerRuntime.Start(config, bindHost);
+    }
+
+    // 异步接受一个裸套接字（已设为非阻塞）。
+    async nint AcceptAsync() {
+        nint client = await AsyncSocket.Accept(this.listener);
+        Socket.SetNonBlocking(client);
+        return client;
+    }
+
+    // 异步接受并登记一个客户端，分配自增 id，触发
+    // ClientConnected 后返回客户端对象。
+    async ArpgServerClient AcceptClientAsync() {
+        nint clientSock = await this.AcceptAsync();
+        ArpgServerClient client = ArpgServerClient.FromSocket(
+            this.config, this.nextClientId, clientSock, this.events);
+        this.nextClientId = this.nextClientId + 1;
+        this.clients.Add(client);
+        if (this.events != null) {
+            this.events.RaiseClientConnected(client);
+        }
+        return client;
+    }
+
+    // 服务器是否处于运行状态。
+    bool IsRunning() { return this.running; }
+    // 监听端口（来自 ServerConfig）。
+    int Port() { return this.config.Port(); }
+    // 当前已接受的客户端数。
+    int ClientCount() { return this.clients.Count; }
+    // 第 index 个客户端（不查越界）。
+    ArpgServerClient ClientAt(int index) { return this.clients[index]; }
+
+    // 按 id 关闭并移除客户端；找到返回 true，否则 false。
+    bool RemoveClient(int id) {
+        for (int i = 0; i < this.clients.Count; i = i + 1) {
+            if (this.clients[i].Id() == id) {
+                this.clients[i].Close();
+                this.clients.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 停止服务器：先触发 Stopping（返回 false 则中止停止），
+    // 随后关闭全部客户端与监听套接字并触发 Stopped。未运行时
+    // 调用为空操作。
+    void Stop() {
+        if (this.running) {
+            if (this.events != null && !this.events.RaiseStopping()) {
+                return;
+            }
+            for (int i = 0; i < this.clients.Count; i = i + 1) {
+                this.clients[i].Close();
+            }
+            this.clients.Clear();
+            Socket.Close(this.listener);
+            this.running = false;
+            if (this.events != null) {
+                this.events.RaiseStopped(this.config);
+            }
+        }
+    }
+}

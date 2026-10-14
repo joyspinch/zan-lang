@@ -1,0 +1,97 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+
+namespace Game.Arpg;
+
+// ArpgTcpClient 组件的实时 TCP 客户端运行时。将
+// TcpClientConfig 绑定到真实的 reactor 驱动套接字，并交换长度帧封装的
+// ArpgMessages。
+// ArpgTcpClient 组件的实时 TCP 客户端运行时：把 TcpClientConfig
+// 绑定到非阻塞套接字，收发长度帧封装的 ArpgMessage。所有
+// Connect/Send/Receive 均为 async；ReceiveMessageAsync 返回 null
+// 表示连接已断开（IsConnected 随之变 false）。
+class ArpgTcpClientRuntime {
+    TcpClientConfig config;
+    nint sock;
+    bool connected;
+    byte[] recvBuf;
+
+    // 由组件配置构造未连接的客户端运行时。
+    static ArpgTcpClientRuntime FromConfig(TcpClientConfig config) {
+        ArpgTcpClientRuntime c = new ArpgTcpClientRuntime();
+        c.config = config;
+        c.sock = -1;
+        c.connected = false;
+        c.recvBuf = null;
+        return c;
+    }
+
+    // 包装一个已被接受的服务器端套接字。
+    // 包装服务器端已接受的套接字（直接处于已连接状态）。
+    static ArpgTcpClientRuntime FromSocket(TcpClientConfig config, nint sock) {
+        ArpgTcpClientRuntime c = new ArpgTcpClientRuntime();
+        c.config = config;
+        c.sock = sock;
+        c.connected = true;
+        c.recvBuf = null;
+        return c;
+    }
+
+    // 是否已连接。
+    bool IsConnected() { return this.connected; }
+    // 底层套接字句柄（未连接为 -1）。
+    nint Handle() { return this.sock; }
+
+    // 异步发起连接（不等待结果，用 IsConnected 查询）。
+    async void ConnectAsync() {
+        await this.ConnectAndWaitAsync();
+    }
+
+    // 异步连接并等待结果，返回 Socket 约定的错误码（0 为成功）。
+    async int ConnectAndWaitAsync() {
+        Socket.Initialize();
+        this.sock = Socket.CreateTcp();
+        Socket.SetNonBlocking(this.sock);
+        int rc = await AsyncSocket.Connect(
+            this.sock, this.config.Ip(), this.config.Port());
+        this.connected = rc == 0;
+        return rc;
+    }
+
+    // 异步发送一条帧封装消息，返回 AsyncSocket.Send 的错误码
+    // （0 为成功）。
+    async int SendMessageAsync(ArpgMessage message) {
+        byte[] buf = message.Encode();
+        return await AsyncSocket.Send(this.sock, buf, message.FrameLength());
+    }
+
+    // 接收一条帧封装消息（假定单条小消息在一次
+    // 读取中到达，对这里测试的回环/控制流量成立）。
+    // 异步接收一条帧封装消息（假定一次读取收到完整帧）。读到
+    // EOF/错误时把 IsConnected 置 false 并返回 null；帧不完整时
+    // 也返回 null。接收缓冲容量取自 config.MessageLength()。
+    async ArpgMessage ReceiveMessageAsync() {
+        int cap = this.config.MessageLength();
+        if (this.recvBuf == null) {
+            this.recvBuf = new byte[cap + 1];
+        }
+        int n = await AsyncSocket.ReceiveInto(this.sock, this.recvBuf, cap);
+        if (n <= 0) {
+            this.connected = false;
+            return null;
+        }
+        return ArpgMessage.Decode(this.recvBuf, n);
+    }
+
+    // 关闭套接字并释放缓冲；未连接时也安全。
+    void Close() {
+        if (this.connected) {
+            Socket.Close(this.sock);
+            this.connected = false;
+            this.sock = -1;
+        }
+        this.recvBuf = null;
+    }
+}

@@ -1,0 +1,70 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Gui.Widget;
+
+class IdeCodeNavigationWork {
+    nint syncLock = Mutex.Create();
+    int pending;
+    List<TaskCompletionSource<int>> waiting = new List<TaskCompletionSource<int>>();
+
+    void Begin() {
+        Mutex.Lock(syncLock);
+        pending = pending + 1;
+        Mutex.Unlock(syncLock);
+    }
+
+    void Complete() {
+        List<TaskCompletionSource<int>> ready = null;
+        Mutex.Lock(syncLock);
+        pending = pending - 1;
+        if (pending == 0) {
+            ready = waiting;
+            waiting = new List<TaskCompletionSource<int>>();
+        }
+        Mutex.Unlock(syncLock);
+        if (ready != null) {
+            for (int i = 0; i < ready.Count; i = i + 1) {
+                ready[i].SetResult(0);
+                ready[i].Close();
+            }
+        }
+    }
+
+    Task Run(Action worker) {
+        this.Begin();
+        try {
+            return Task.Run(delegate () {
+                try { worker(); }
+                finally {
+                    worker = null;
+                    this.Complete();
+                }
+            });
+        } catch (Exception error) {
+            this.Complete();
+            throw error;
+        }
+    }
+
+    Task DrainAsync() {
+        TaskCompletionSource<int> completion = null;
+        Mutex.Lock(syncLock);
+        if (pending > 0) {
+            completion = new TaskCompletionSource<int>();
+            waiting.Add(completion);
+        }
+        Mutex.Unlock(syncLock);
+        if (completion == null) {
+            TaskCompletionSource<int> ready = new TaskCompletionSource<int>();
+            ready.SetResult(0);
+            Task done = ready.Task;
+            ready.Close();
+            return done;
+        }
+        return completion.Task;
+    }
+
+    ~IdeCodeNavigationWork() { Mutex.Destroy(syncLock); }
+}
