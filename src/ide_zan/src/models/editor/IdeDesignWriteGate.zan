@@ -1,0 +1,62 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Designer;
+using Game.Scene;
+
+class IdeDesignWriteGate {
+    nint sync = Mutex.Create();
+    bool paused;
+    int writing;
+    List<TaskCompletionSource<bool>> writers = new List<TaskCompletionSource<bool>>();
+    List<TaskCompletionSource<bool>> pauses = new List<TaskCompletionSource<bool>>();
+
+    async void EnterAsync() {
+        while (true) {
+            TaskCompletionSource<bool> ready = null;
+            Mutex.Lock(sync);
+            if (!paused) { writing = writing + 1; }
+            else { ready = new TaskCompletionSource<bool>(); writers.Add(ready); }
+            Mutex.Unlock(sync);
+            if (ready == null) { return; }
+            await ready.Task;
+        }
+    }
+
+    void Leave() {
+        List<TaskCompletionSource<bool>> ready = null;
+        Mutex.Lock(sync);
+        writing = writing - 1;
+        if (writing == 0) { ready = pauses; pauses = new List<TaskCompletionSource<bool>>(); }
+        Mutex.Unlock(sync);
+        if (ready != null) {
+            for (int i = 0; i < ready.Count; i = i + 1) { ready[i].TrySetResult(true); }
+        }
+    }
+
+    TaskCompletionSource<bool> Pause() {
+        TaskCompletionSource<bool> ready = new TaskCompletionSource<bool>();
+        Mutex.Lock(sync);
+        paused = true;
+        bool idle = writing == 0;
+        if (!idle) { pauses.Add(ready); }
+        Mutex.Unlock(sync);
+        if (idle) { ready.TrySetResult(true); }
+        return ready;
+    }
+
+    void Resume() {
+        Mutex.Lock(sync);
+        paused = false;
+        List<TaskCompletionSource<bool>> ready = writers;
+        writers = new List<TaskCompletionSource<bool>>();
+        Mutex.Unlock(sync);
+        for (int i = 0; i < ready.Count; i = i + 1) { ready[i].TrySetResult(true); }
+    }
+
+    ~IdeDesignWriteGate() { Mutex.Destroy(sync); }
+}

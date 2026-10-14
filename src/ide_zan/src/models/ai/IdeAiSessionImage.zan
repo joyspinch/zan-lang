@@ -1,0 +1,128 @@
+using System;
+using System.IO;
+using System.Json;
+using System.Threading;
+using System.Data;
+using System.Data.Sqlite;
+using Gui;
+
+class IdeAiSessionImage {
+    List<ChatMessage> messages;
+    List<AiPlanStep> plan;
+    ChatTeamSave team;
+    AiRun run;
+
+    static IdeAiSessionImage Empty() {
+        IdeAiSessionImage image = new IdeAiSessionImage();
+        image.messages = new List<ChatMessage>();
+        image.plan = new List<AiPlanStep>();
+        image.team = ChatTeamSave.Create();
+        return image;
+    }
+
+    static AiRun CopyRun(AiRun source) {
+        if (source == null) { return null; }
+        AiRun copy = AiRun.Begin(source.taskId, source.title, source.createdMs);
+        copy.updatedMs = source.updatedMs;
+        copy.phase = source.phase;
+        copy.status = source.status;
+        copy.resumeAt = source.resumeAt;
+        copy.repairs = source.repairs;
+        copy.fault = source.fault;
+        copy.lastError = source.lastError;
+        copy.steps = new List<AiRunStep>();
+        for (int i = 0; i < source.steps.Count; i = i + 1) {
+            AiRunStep s = source.steps[i];
+            AiRunStep d = AiRunStep.Create(s.phase);
+            d.status = s.status; d.title = s.title; d.command = s.command;
+            d.calls = s.calls; d.exitCode = s.exitCode;
+            d.startedMs = s.startedMs; d.endedMs = s.endedMs;
+            d.retries = s.retries; d.fault = s.fault; d.error = s.error;
+            for (int g = 0; g < s.diagnostics.Count; g = g + 1) { d.diagnostics.Add(s.diagnostics[g]); }
+            for (int a = 0; a < s.artifacts.Count; a = a + 1) { d.artifacts.Add(s.artifacts[a]); }
+            copy.steps.Add(d);
+        }
+        if (source.changes != null) {
+            for (int c = 0; c < source.changes.Count; c = c + 1) {
+                AiFileChange change = source.changes[c];
+                copy.changes.Add(new AiFileChange(change.path, change.adds, change.dels));
+            }
+        }
+        return copy;
+    }
+
+    static IdeAiSessionImage Capture(List<ChatMessage> messages, List<AiPlanStep> plan,
+                                     bool teamOn, AiTeamState state, List<AiTask> tasks, AiRun run) {
+        IdeAiSessionImage copy = IdeAiSessionImage.Empty();
+        if (messages != null) {
+            for (int i = 0; i < messages.Count; i = i + 1) {
+                ChatMessage s = messages[i];
+                ChatMessage d = ChatMessage.CreateWithReason(s.role, s.text, s.reason);
+                d.agent = s.agent; d.to = s.to; d.kind = s.kind;
+                d.taskId = s.taskId; d.progress = s.progress; d.call = s.call; d.at = s.at;
+                copy.messages.Add(d);
+            }
+        }
+        if (plan != null) {
+            for (int p = 0; p < plan.Count; p = p + 1) {
+                copy.plan.Add(AiPlanStep.Create(plan[p].text, plan[p].done));
+            }
+        }
+        if (teamOn) { copy.team.on = 1; }
+        if (state != null) {
+            copy.team.st.activeAgent = state.activeAgent;
+            copy.team.st.activeTask = state.activeTask;
+            copy.team.st.awaitingUser = state.awaitingUser;
+            copy.team.st.askedBy = state.askedBy;
+        }
+        if (tasks != null) {
+            for (int t = 0; t < tasks.Count; t = t + 1) {
+                AiTask s = tasks[t];
+                AiTask d = AiTask.Create(s.id, s.title, s.owner);
+                d.state = s.state; d.progress = s.progress;
+                d.accept = s.accept; d.outcome = s.outcome;
+                if (s.deps != null) {
+                    for (int k = 0; k < s.deps.Count; k = k + 1) { d.deps.Add(s.deps[k]); }
+                }
+                if (s.parts != null) {
+                    for (int k = 0; k < s.parts.Count; k = k + 1) {
+                        AiTaskPart part = AiTaskPart.Create(s.parts[k].role);
+                        part.model = s.parts[k].model; part.rounds = s.parts[k].rounds; part.lastTs = s.parts[k].lastTs;
+                        d.parts.Add(part);
+                    }
+                }
+                if (s.items != null) {
+                    for (int k = 0; k < s.items.Count; k = k + 1) { d.items.Add(AiPlanStep.Create(s.items[k].text, s.items[k].done)); }
+                }
+                copy.team.tasks.Add(d);
+            }
+        }
+        copy.run = IdeAiSessionImage.CopyRun(run);
+        return copy;
+    }
+
+    IdeAiSessionImage Copy() {
+        return IdeAiSessionImage.Capture(this.messages, this.plan, this.team.on == 1,
+            this.team.st, this.team.tasks, this.run);
+    }
+
+    string Pack() {
+        ChatTeamSave team = ChatTeamSave.Create();
+        team.on = this.team.on; team.st = this.team.st; team.tasks = this.team.tasks;
+        if (this.run != null) { team.run = this.run.ToJson(); }
+        return ChatArea.ChatPack(this.messages, this.plan, team);
+    }
+
+    static IdeAiSessionImage Read(string pack) {
+        IdeAiSessionImage image = IdeAiSessionImage.Empty();
+        ChatArea.ChatUnpack(pack, image.messages, image.plan, image.team);
+        image.run = AiRun.FromJson(image.team.run);
+        if (image.run != null && image.run.Finished()) { image.run = null; }
+        return image;
+    }
+
+    bool HasContent() {
+        return this.messages.Count > 0 || this.plan.Count > 0 || this.team.on != 0
+            || this.team.tasks.Count > 0 || this.run != null;
+    }
+}

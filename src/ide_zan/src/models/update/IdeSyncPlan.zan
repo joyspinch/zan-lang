@@ -1,0 +1,83 @@
+using System;
+using System.Json;
+using System.Net.Http.Client;
+using System.Net.External;
+using System.Net.Sockets;
+
+class IdeSyncPlan {
+    List<IdeDownloadItem> items;
+    long downloadBytes;
+    int matchCount;
+    string error;
+
+    static IdeSyncPlan Parse(string done) {
+        IdeSyncPlan plan = new IdeSyncPlan();
+        plan.items = new List<IdeDownloadItem>();
+        plan.error = "";
+        if (done.Length > 4 && done.Substring(0, 4) == "err:") {
+            plan.error = done.Substring(4, done.Length - 4);
+            return plan;
+        }
+        if (done.Length < 3 || done.Substring(0, 3) != "ok:") {
+            plan.error = "invalid sync response";
+            return plan;
+        }
+        JsonValue envelope = null;
+        try {
+            envelope = JsonValue.Parse(done.Substring(3, done.Length - 3));
+        } catch (JsonException ex) {
+            envelope = null;
+        }
+        if (envelope == null || !envelope.IsObject()
+            || envelope.Str("code", "") != "0000") {
+            plan.error = "sync rejected";
+            return plan;
+        }
+        JsonValue data = envelope.Get("data");
+        JsonValue downloads = data != null ? data.Get("download") : null;
+        if (downloads != null && downloads.IsArray()) {
+            for (int i = 0; i < downloads.Count(); i = i + 1) {
+                JsonValue f = downloads.At(i);
+                string p = f.Str("path", "");
+                string m = f.Str("md5", "");
+                long s = IdeSyncPlan.ParseLong(f.Str("size", "0"));
+                plan.items.Add(new IdeDownloadItem(p, m, s));
+                plan.downloadBytes = plan.downloadBytes + s;
+            }
+        }
+        JsonValue match = data != null ? data.Get("match") : null;
+        plan.matchCount = match != null ? match.AsInt(0) : 0;
+        return plan;
+    }
+
+    // 无依赖的十进制解析（IDE 不编 System.Web 的 Filter）。
+    static long ParseLong(string s) {
+        long v = 0;
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + c - 48;
+        }
+        return v;
+    }
+
+    List<IdeDownloadItem> Items() { return items; }
+    List<string> DownloadPaths() {
+        List<string> paths = new List<string>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            paths.Add(items[i].Path());
+        }
+        return paths;
+    }
+    List<string> DownloadMd5s() {
+        List<string> md5s = new List<string>();
+        for (int i = 0; i < items.Count; i = i + 1) {
+            md5s.Add(items[i].Md5());
+        }
+        return md5s;
+    }
+    long DownloadBytes() { return downloadBytes; }
+    int MatchCount() { return matchCount; }
+    string Error() { return error; }
+    bool Ok() { return error == ""; }
+}
