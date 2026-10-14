@@ -100,31 +100,45 @@ class DemoLoop : IGuiHostLoop {
         return this.ViewProj(cw, ch).Mul(spin).ToColumnMajor();
     }
 
-    // 一圈小立方体绕主立方体公转：批量实例通路演示——同一网格 12 个
-    // 实例一次 Begin/End 提交，每实例独立 MVP（公转位姿 + 上下浮动）
-    // 与队伍 tint，批内深度解析（转到主立方体后面时被正确遮挡……仅在
-    // 批内；与单次 DrawMesh3D 之间按调用顺序合成，见 Render.zan 契约）。
-    void DrawRing(GuiHost host, Canvas c, int cw, int ch) {
-        if (this.ring == null || this.unitMesh <= 0) { return; }
-        int[] palette = new int[] {
-            CDraw.Argb(255, 235, 87, 87),  CDraw.Argb(255, 255, 195, 66),
-            CDraw.Argb(255, 96, 211, 148), CDraw.Argb(255, 78, 154, 241),
-            CDraw.Argb(255, 186, 122, 232), CDraw.Argb(255, 240, 240, 245),
-        };
+    // 整个 3D 场景一次批次提交：地台、主立方体、公转环装进同一个
+    // MeshBatch，共享批内深度缓冲，得到真实的互相遮挡——实例公转到
+    // 主立方体背后时必须被它挡住。这是批次相对"多次单发 DrawMesh3D"
+    // 的本质差异：单发之间按调用顺序合成、不解析深度（见 Render.zan
+    // 契约），环绕场景一旦有几何转到别的几何背后就会画错。
+    // 返回 1 = GPU 批次已提交；0 = CPU 兜底档（整批跳过，调用方换 2D）。
+    int DrawScene(Canvas c, int cw, int ch) {
+        if (this.ring == null || this.cubeMesh <= 0) { return 0; }
         Mat4 pv = this.ViewProj(cw, ch);
         this.ring.Begin();
-        for (int i = 0; i < 12; i = i + 1) {
-            float ang = this.ringPhase + i * 0.5235988f;
-            float bob = (float)Math.Sin(this.ringPhase * 2.0 + i) * 0.22f;
-            Mat4 m = Mat4.Translate((float)Math.Cos(ang) * 3.4f,
-                                    0.55f + bob,
-                                    (float)Math.Sin(ang) * 3.4f);
-            m = m.Mul(Mat4.RotateAxis(0, 1, 0, this.ringPhase + i));
-            m = m.Mul(Mat4.Scale(0.32f, 0.32f, 0.32f));
-            this.ring.Add(this.unitMesh, "", pv.Mul(m).ToColumnMajor(),
-                          palette[i % 6]);
+        // 地台：世界系网格，模型阵为单位阵。
+        this.ring.Add(this.discMesh, "", pv.ToColumnMajor(),
+                      CDraw.Argb(255, 96, 108, 140));
+        // 主立方体：棋盘纹理 + 暖白染色，模型自转接在相机链末端。
+        this.ring.Add(this.cubeMesh, "mem:3dchecker",
+                      pv.Mul(Mat4.RotateAxis(0, 1, 0, this.autoSpin))
+                        .ToColumnMajor(),
+                      CDraw.Argb(255, 255, 235, 210));
+        // 12 个彩色小立方体绕圈公转，每实例独立位姿（公转 + 浮动 +
+        // 自转）与六色 tint，同一顶点色网格一次连段提交。
+        if (this.unitMesh > 0) {
+            int[] palette = new int[] {
+                CDraw.Argb(255, 235, 87, 87),  CDraw.Argb(255, 255, 195, 66),
+                CDraw.Argb(255, 96, 211, 148), CDraw.Argb(255, 78, 154, 241),
+                CDraw.Argb(255, 186, 122, 232), CDraw.Argb(255, 240, 240, 245),
+            };
+            for (int i = 0; i < 12; i = i + 1) {
+                float ang = this.ringPhase + i * 0.5235988f;
+                float bob = (float)Math.Sin(this.ringPhase * 2.0 + i) * 0.22f;
+                Mat4 m = Mat4.Translate((float)Math.Cos(ang) * 3.4f,
+                                        0.55f + bob,
+                                        (float)Math.Sin(ang) * 3.4f);
+                m = m.Mul(Mat4.RotateAxis(0, 1, 0, this.ringPhase + i));
+                m = m.Mul(Mat4.Scale(0.32f, 0.32f, 0.32f));
+                this.ring.Add(this.unitMesh, "", pv.Mul(m).ToColumnMajor(),
+                              palette[i % 6]);
+            }
         }
-        this.ring.Draw(c);
+        return this.ring.Draw(c);
     }
 
     // ---------- 2D 回退：同一份相机数学把 8 个角点投影成线框。
@@ -196,9 +210,11 @@ class DemoLoop : IGuiHostLoop {
             if (this.pitch < -0.2f) { this.pitch = -0.2f; }
         } else if (kind == 4) {
             if (code == 37 || code == 39) {
-                // 左/右方向键推拉（触屏键盘可用时同样生效）
+                // 左/右方向键推拉（触屏键盘可用时同样生效）。下限保持在
+                // 公转环（半径 3.4 + 实例自身 0.32）之外——相机钻进环里
+                // 会让贴镜头的实例糊满画面、近裁剪撕裂，失去空间参照。
                 this.dist = this.dist + (code == 37 ? -0.4f : 0.4f);
-                if (this.dist < 2.5f) { this.dist = 2.5f; }
+                if (this.dist < 4.6f) { this.dist = 4.6f; }
                 if (this.dist > 12.0f) { this.dist = 12.0f; }
             }
         }
@@ -227,22 +243,14 @@ class DemoLoop : IGuiHostLoop {
             this.BuildMeshes(c);
         }
 
-        // 立方体与线框共用同一份 MVP（模型自转接在相机链末端）；
-        // 地台用去掉模型自转的相机阵（世界系网格，M 为单位阵）。
+        // 立方体与线框共用同一份 MVP（模型自转接在相机链末端）。
         float[] mvp = this.CubeMvp(cw, ch, this.autoSpin);
 
-        // 地台：模型阵为单位（自转传 0）
-        int discDrew = c.DrawMesh3D(this.discMesh, this.CubeMvp(cw, ch, 0.0f),
-                                    CDraw.Argb(255, 96, 108, 140), "");
-        // 立方体：棋盘纹理 + 暖白染色，模型自转已含在 MVP 里
-        int drewCube = c.DrawMesh3D(this.cubeMesh, mvp,
-                                    CDraw.Argb(255, 255, 235, 210), "mem:3dchecker");
+        // 整场景一个批次提交（跨网格真实遮挡，见 DrawScene 契约）；
+        // CPU 兜底档返回 0，落 2D 线框回退。
+        int drewScene = this.DrawScene(c, cw, ch);
 
-        // 一圈彩色小立方体：批量实例通路（GPU 档才有内容，CPU 档
-        // DrawMesh3DBatchBegin 返回 0 自动整批跳过）
-        this.DrawRing(host, c, cw, ch);
-
-        if (drewCube == 0) {
+        if (drewScene == 0) {
             // CPU 兜底档（或该平台尚未接 3D 管线）：同一份相机数学的 2D 线框。
             DrawWireCube(c, cw, ch, mvp, this.autoSpin);
         }
@@ -250,12 +258,12 @@ class DemoLoop : IGuiHostLoop {
         // HUD：从标题栏保留带之下开始（chrome 画在内容之上，y<titlebarH
         // 的区域会被它盖掉——HUD 从那里起笔就会从标题栏下缘渗出）。
         int hudY = Window.TitlebarHeight() + 12;
-        string mode = drewCube == 1 ? "GPU 3D" : "CPU wireframe";
+        string mode = drewScene == 1 ? "GPU 3D" : "CPU wireframe";
         c.DrawText(16, hudY, "Zan 3D — " + mode + " (" + this.backendName + ")",
                    CDraw.Argb(255, 235, 240, 250), 18);
         c.DrawText(16, hudY + 26, "frames: " + this.frames,
                    CDraw.Argb(200, 160, 172, 196), 14);
-        string hint = drewCube == 1
+        string hint = drewScene == 1
             ? "drag to orbit - arrows to zoom - checker + half-lambert + instance ring"
             : "GPU backend unavailable here - wireframe fallback";
         c.DrawText(16, ch - 26, hint, CDraw.Argb(180, 150, 160, 180), 14);
