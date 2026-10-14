@@ -778,7 +778,6 @@ static void package_add_input(const char *path, void *context) {
 static int auto_include_namespace(const char *stdlib_root, const char *subdir,
                                   const char ***files, int *count, int *cap) {
     int found = glob_stdlib_dir(stdlib_root, subdir, files, count, cap);
-    char probe_dir[1024];
     int hierarchical = stdlib_has_dir(stdlib_root, subdir) == 0;
     pkg_auto_include_t args = { files, count, cap };
     int package_count = package_visit_namespace(subdir, package_add_input,
@@ -2252,7 +2251,7 @@ static void pi_seed_chain(const zan_ast_node_t *n, int in_chain) {
         zan_ast_node_t *obj = n->member.object;
         /* `Ns */
         if (in_chain) {
-            zan_ast_node_t *rt = n;
+            const zan_ast_node_t *rt = n;
             while (rt->kind == AST_MEMBER_ACCESS)
                 rt = rt->member.object;
             if (rt->kind == AST_IDENTIFIER &&
@@ -2429,12 +2428,6 @@ static void pi_unsatisfied_mark_declared(pi_name_t *n) {
     }
 }
 
-static int pi_name_in_unsatisfied(pi_name_t *n) {
-    for (int i = 0; i < pi_unsatisfied_count; i++)
-        if (pi_unsatisfied_set[i] == n) return 1;
-    return 0;
-}
-
 static void pi_repair_scan_file(const char *path) {
     pi_file_t f;
     memset(&f, 0, sizeof(f));
@@ -2593,21 +2586,6 @@ static void pi_debug_dump(void) {
                     d->files[i].included ? "INCL" : "skip",
                     d->files[i].path ? d->files[i].path : "(null)",
                     d->files[i].top_count, d->files[i].ident_count);
-}
-
-static int pi_append_included(const char ***files, int *count, int *cap);
-
-static int pi_close_converged(const char *stdlib_root, const char ***files,
-                              int *count, int *cap) {
-    int appended = 0;
-    for (;;) {
-        int changed = pi_close_once(stdlib_root);
-        int fresh = pi_append_included(files, count, cap);
-        appended += fresh;
-        if (!changed && !fresh) break;
-    }
-    pi_debug_dump();
-    return appended;
 }
 
 static int pi_append_included(const char ***files, int *count, int *cap) {
@@ -3507,10 +3485,6 @@ static int zan_copy_file_ex(const char *src, const char *dst, char *err_buf, siz
         }
     }
     return rc;
-}
-
-static int zan_copy_file(const char *src, const char *dst) {
-    return zan_copy_file_ex(src, dst, NULL, 0);
 }
 
 static bool zan_is_safe_bundle_name(const char *name) {
