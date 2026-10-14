@@ -1,0 +1,94 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+
+namespace System.Drawing.Printing;
+
+#if !WINDOWS
+// CUPS 没有逐页的 spooler API：把 RAW 字节流收集到临时文件，
+// EndDoc 时用 `lp -o raw` 整份提交（-o raw 让 CUPS 跳过过滤链，
+// 字节原样送给打印机，与 Windows 的 RAW 数据类型一致）。
+internal class CupsRawPrinterBackend : IRawPrinterBackend {
+    string printer;
+    string document;
+    string spoolPath;
+    bool failed;
+
+    // 记住打印机名；系统里有 lp 命令才算打开成功。
+    bool Open(string printerName) {
+        this.printer = printerName;
+        this.spoolPath = "";
+        this.failed = false;
+        // 没有 lp 就谈不上打印，直接失败而不是假装成功。
+        List<string> args = new List<string>();
+        args.Add("-c");
+        args.Add("command -v lp >/dev/null 2>&1");
+        return Process.CaptureSafe("/bin/sh", args).exitCode == 0;
+    }
+
+    // 创建按 PID 和 GUID 命名的临时 spool 文件（防止多线程打印并发冲突与符号链接攻击）；创建失败返回 false。
+    bool StartDoc(string documentName) {
+        this.spoolPath = Path.GetTempPath() + "zan_raw_"
+            + Convert.ToString(ProcessHost.Pid()) + "_"
+            + Guid.New() + ".prn";
+        try {
+            File.WriteAllBytes(this.spoolPath, new byte[0]);
+        } catch (IOException e) {
+            this.spoolPath = "";
+            return false;
+        }
+        this.document = documentName;
+        return true;
+    }
+
+    // spool 文件就绪即成功（CUPS 无逐页提交的概念）。
+    bool StartPage() { return this.spoolPath != ""; }
+
+    // 追加到 spool 文件，返回写入字节数；失败返回 -1 并标记文档失败。
+    int Write(byte[] data) {
+        if (this.spoolPath == "") { return 0 - 1; }
+        try {
+            File.AppendAllBytes(this.spoolPath, data);
+        } catch (IOException e) {
+            this.failed = true;
+            return 0 - 1;
+        }
+        return data.Length;
+    }
+
+    // 本页是否无失败。
+    bool EndPage() { return !this.failed; }
+
+    // 用 `lp -d <printer> -t <doc> -o raw` 提交整份 spool 文件。
+    bool EndDoc() {
+        if (this.spoolPath == "" || this.failed) { return false; }
+        List<string> args = new List<string>();
+        args.Add("-d");
+        args.Add(this.printer);
+        args.Add("-t");
+        args.Add(this.document);
+        args.Add("-o");
+        args.Add("raw");
+        args.Add(this.spoolPath);
+        return Process.CaptureSafe("lp", args).exitCode == 0;
+    }
+
+    // 标记文档失败：EndDoc 将拒绝提交。
+    void Abort() { this.failed = true; }
+
+    // 删除 spool 临时文件。
+    bool Close() {
+        if (this.spoolPath != "") {
+            File.Delete(this.spoolPath);
+            this.spoolPath = "";
+        }
+        return true;
+    }
+
+    // 单引号包裹 shell 参数，内部单引号按 POSIX 方式（'\''）转义。
+    static string Quote(string s) {
+        return "'" + s.Replace("'", "'\\''") + "'";
+    }
+}
+#endif
+
