@@ -1,0 +1,99 @@
+using System;
+using System.Json;
+using System.Text;
+using Gui;
+namespace Gui.Component.Chart;
+
+class ChartVisualMap {
+    int type;  // 0 = continuous，1 = piecewise
+    bool show;  // 是否绘制控件面板
+    bool hasMin; bool hasMax;
+    int minV; int maxV;  // ×1000 定点域
+    int dimension;  // -1 = 默认（按 0 处理）
+    int seriesIndex;  // -1 = 全部系列
+    List<int> rangeColors;  // inRange.color 渐变 stop（continuous）
+    // 显式声明过 inRange.color（/2.x 的 color）。rangeColors 在
+    // "continuous 且未声明颜色"时会填官方缺省彩虹带，那不是用户的
+    // 着色意图——接线到全局 o.rampColors 时只能认显式声明，否则
+    // scatter-nutrients 的 symbolSize-only visualMap 会把分组色
+    // 覆盖成按值彩虹（官方是 piecewise 分组色）。
+    bool colorsExplicit;
+    // 声明的边界按**原始数据单位**另存一份：minV/maxV 是 ×1000 定点，
+    // 大数（map-usa max:38000000 → 3.8e10）强转会溢出成 INT_MIN；
+    // 而 o.rampLo/Hi 的消费者（ChartViewMap/Heatmap/Scatter）都按
+    // 原值比较，需要原值。超出 int 范围时记 Auto() 按未声明处理。
+    int minRaw; int maxRaw;
+    List<ChartVisualPiece> pieces;
+    // piecewise 类目模式（官方 nutrients）：categories 列出数据列里
+    // 出现过的字符串类目，inRange.color 同序一一对应；行按该列的
+    // 字符串值查下标取色，找不到的类目走 outOfRange（#ccc）。
+    List<string> vmCats;
+    // inRange.opacity（0..1000 千分位）：官方 lunar 的 heatmap 是 0.3，
+    // 让底下的日历格与叠在上面的农历日名都透出来。0 = 未声明（不透明）。
+    int inOpacity;
+    // inRange.symbolSize [lo,hi]（px 直径）：geo 投影散点按值线性映射
+    // 符号大小（官方 scatter-world-population [6,60]）。hasSize=false =
+    // 未声明（渲染器走旧启发式 + 硬帽）。
+    int sizeLo; int sizeHi;
+    bool hasSize;
+    // piecewise 等分桶数（ECharts splitNumber，缺省 5）：值域 [min,max]
+    // 均分成 N 桶，热力格取所在桶中点经色带取色（heatmap-large-
+    // piecewise 声明 8 桶）。0 = 未声明（按缺省 5）。
+    int splitNumber;
+
+    static ChartVisualMap Of() {
+        ChartVisualMap vm = new ChartVisualMap();
+        vm.type = 0; vm.show = true; vm.hasMin = false; vm.hasMax = false;
+        vm.minV = 0; vm.maxV = 0; vm.dimension = 0 - 1; vm.seriesIndex = 0 - 1;
+        vm.rangeColors = new List<int>();
+        vm.colorsExplicit = false;
+        vm.minRaw = ChartOption.Auto(); vm.maxRaw = ChartOption.Auto();
+        vm.pieces = new List<ChartVisualPiece>();
+        vm.vmCats = new List<string>();
+        vm.inOpacity = 0;
+        vm.sizeLo = 0; vm.sizeHi = 0; vm.hasSize = false;
+        vm.splitNumber = 0;
+        return vm;
+    }
+
+    static ChartVisualMap Clone(ChartVisualMap src) {
+        if (src == null) { return null; }
+        ChartVisualMap vm = ChartVisualMap.Of();
+        vm.type = src.type; vm.show = src.show;
+        vm.hasMin = src.hasMin; vm.hasMax = src.hasMax;
+        vm.minV = src.minV; vm.maxV = src.maxV;
+        vm.dimension = src.dimension; vm.seriesIndex = src.seriesIndex;
+        for (int i = 0; i < src.rangeColors.Count; i = i + 1) {
+            vm.rangeColors.Add(src.rangeColors[i]);
+        }
+        vm.colorsExplicit = src.colorsExplicit;
+        vm.minRaw = src.minRaw; vm.maxRaw = src.maxRaw;
+        for (int i = 0; i < src.pieces.Count; i = i + 1) { vm.pieces.Add(src.pieces[i]); }
+        for (int i = 0; i < src.vmCats.Count; i = i + 1) { vm.vmCats.Add(src.vmCats[i]); }
+        vm.inOpacity = src.inOpacity;
+        vm.sizeLo = src.sizeLo; vm.sizeHi = src.sizeHi; vm.hasSize = src.hasSize;
+        vm.splitNumber = src.splitNumber;
+        return vm;
+    }
+
+    // inRange.color 多 stop 线性插值；tF 为 0..1000 归一位置。
+    static int Lerp(List<int> stops, int tF) {
+        int k = stops.Count;
+        if (k < 1) { return 0; }
+        if (k == 1 || tF <= 0) { return stops[0]; }
+        if (tF >= 1000) { return stops[k - 1]; }
+        int seg = tF * (k - 1);
+        int i = seg / 1000;
+        if (i > k - 2) { return stops[k - 1]; }
+        int f = seg - i * 1000;
+        int a = stops[i]; int b = stops[i + 1];
+        int rr = ((a >> 16) & 255) * (1000 - f) / 1000 + ((b >> 16) & 255) * f / 1000;
+        int gg = ((a >> 8) & 255) * (1000 - f) / 1000 + ((b >> 8) & 255) * f / 1000;
+        int bb = (a & 255) * (1000 - f) / 1000 + (b & 255) * f / 1000;
+        int aa = ((a >> 24) & 255) * (1000 - f) / 1000 + ((b >> 24) & 255) * f / 1000;
+        return (aa << 24) | (rr << 16) | (gg << 8) | bb;
+    }
+}
+
+// ECharts dataset：一个命名数据集。source 保留原始 JSON（首行
+// 约定为表头），rows 是 transform 过滤/排序后的有效行号表。

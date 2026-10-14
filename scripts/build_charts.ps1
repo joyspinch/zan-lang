@@ -25,7 +25,9 @@ if (-not (Test-Path $chartDir)) {
     $chartDir = "packages\Zan.Gui.Charts\src\Gui\Component\Chart"
 }
 $files += (Get-ChildItem $chartDir\*.zan).FullName
+$files += (Get-ChildItem $chartDir\Models\*.zan).FullName
 $files += (Get-ChildItem examples\gui_charts\*.zan).FullName
+$files += (Get-ChildItem examples\gui_charts\Models\*.zan).FullName
 
 $zanArgs = @()
 $zanArgs += $files

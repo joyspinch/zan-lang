@@ -1,0 +1,318 @@
+using System;
+using System.Json;
+using System.Text;
+using Gui;
+namespace Gui.Component.Chart;
+
+class ChartMatrixSpec {
+    // 盒布局（官方 defaultOption: 四边 '10%'）：px 与百分比互斥。
+    ChartBoxParam lRaw; ChartBoxParam tRaw;
+    ChartBoxParam rRaw; ChartBoxParam bRaw;
+
+    bool xShow;  // x.show（false = 头带 0 宽，标签/线不画）
+    bool yShow;
+    ChartBoxParam xLevelSize;  // x.levelSize：x 树层带沿 y 的厚度声明
+    ChartBoxParam yLevelSize;  // y.levelSize：y 树层带沿 x 的宽度声明
+    int xItemColor;  // x.itemStyle.color 头带填充（0 = none，官方缺省）
+    int yItemColor;
+    List<ChartMatrixBandNode> xNodes;
+    List<ChartMatrixBandNode> yNodes;
+    int xLeaves;  // 叶子数 = 布局单位数
+    int yLeaves;
+    int xLevels;  // 层级带数 = 最大树深
+    int yLevels;
+    // 值→格查找表（任意层级，首见为准——官方重复名只有首个可查）。
+    List<ChartMatrixCellQuery> queries;
+
+    // body.data：体区合并格文本（官方 {value, coord}，coord 数字 =
+    // 叶序号、串 = 格名、[a,b] = 跨度；渲染端画在合并域中心）。
+    List<ChartMatrixBodyCell> bodyCells;
+    bool bodyBorder;  // body.itemStyle.borderColor != "none"（官方缺省有边）
+
+    // corner.data：角区文本（sparkline 的 "Time"；coord [-1,-1] =
+    // 整个角区，文本画角区中心）。
+    List<string> cornerText;
+
+    // parseSizeOption 语义；声明 width 后 left 才接受 center）。
+    ChartBoxParam wRaw; ChartBoxParam hRaw;
+    bool leftCenter; bool topMiddle;
+
+    // 头带标签样式（x.label/y.label：fontSize/color/fontWeight）。
+    int xLabelFontSize; int xLabelColor; bool xLabelBold;
+    int yLabelFontSize; int yLabelColor; bool yLabelBold;
+
+    List<ChartBoxParam> XSizes() {
+        List<ChartBoxParam> sz = new List<ChartBoxParam>();
+        for (int i = 0; i < xNodes.Count; i = i + 1) {
+            sz.Add(xNodes[i].size);
+        }
+        return sz;
+    }
+
+    List<ChartBoxParam> YSizes() {
+        List<ChartBoxParam> sz = new List<ChartBoxParam>();
+        for (int i = 0; i < yNodes.Count; i = i + 1) {
+            sz.Add(yNodes[i].size);
+        }
+        return sz;
+    }
+
+    static ChartMatrixSpec Of() {
+        ChartMatrixSpec m = new ChartMatrixSpec();
+        m.lRaw = null; m.tRaw = null; m.rRaw = null; m.bRaw = null;
+        m.xShow = true; m.yShow = true;
+        m.xLevelSize = null; m.yLevelSize = null;
+        m.xItemColor = 0; m.yItemColor = 0;
+        m.bodyCells = new List<ChartMatrixBodyCell>();
+        m.bodyBorder = true;
+        m.cornerText = new List<string>();
+        m.wRaw = null; m.hRaw = null;
+        m.leftCenter = false; m.topMiddle = false;
+        m.xLabelFontSize = 0; m.xLabelColor = 0; m.xLabelBold = false;
+        m.yLabelFontSize = 0; m.yLabelColor = 0; m.yLabelBold = false;
+        m.xNodes = new List<ChartMatrixBandNode>();
+        m.yNodes = new List<ChartMatrixBandNode>();
+        m.xLeaves = 0; m.yLeaves = 0;
+        m.xLevels = 0; m.yLevels = 0;
+        m.queries = new List<ChartMatrixCellQuery>();
+        return m;
+    }
+
+    // matrix 组件对象：盒布局四边（数值 px / "N%" 字符串）+ x/y
+    // 维度树 data + 尺寸声明（levelSize/size）+ body.data 合并格。
+    // ovrX/ovrY：media 缺省项的 x/y 覆盖（null = 无），data 数组
+    // 覆盖根声明（grid-layout 的响应式缺省形态）。
+    static ChartMatrixSpec ParseOne(JsonValue v) {
+        return ChartMatrixSpec.ParseOne(v, null, null);
+    }
+
+    static ChartMatrixSpec ParseOne(JsonValue v, JsonValue ovrX,
+                                    JsonValue ovrY) {
+        ChartMatrixSpec m = ChartMatrixSpec.Of();
+        m.lRaw = ChartOption.ParseBoxParam(v.Get("left"));
+        if (v.Has("left")) {
+            JsonValue lv = v.Get("left");
+            if (lv != null && lv.IsString()
+                && lv.AsString("") == "center") { m.leftCenter = true; }
+        }
+        m.tRaw = ChartOption.ParseBoxParam(v.Get("top"));
+        if (v.Has("top")) {
+            JsonValue tvv = v.Get("top");
+            if (tvv != null && tvv.IsString()
+                && tvv.AsString("") == "middle") { m.topMiddle = true; }
+        }
+        m.rRaw = ChartOption.ParseBoxParam(v.Get("right"));
+        m.bRaw = ChartOption.ParseBoxParam(v.Get("bottom"));
+        m.wRaw = ChartOption.ParseBoxParam(v.Get("width"));
+        m.hRaw = ChartOption.ParseBoxParam(v.Get("height"));
+        JsonValue xj = v.Get("x");
+        if (xj != null && xj.IsObject()) {
+            m.xShow = xj.Bool("show", true);
+            m.xLevelSize = ChartOption.ParseBoxParam(xj.Get("levelSize"));
+            JsonValue xis = xj.Get("itemStyle");
+            if (xis != null && xis.IsObject()) {
+                m.xItemColor = ChartOption.ParseColor(xis.Get("color"), 0);
+            }
+            JsonValue xlb = xj.Get("label");
+            if (xlb != null && xlb.IsObject()) {
+                m.xLabelFontSize = xlb.Int("fontSize", 0);
+                m.xLabelColor = ChartOption.ParseColor(xlb.Get("color"), 0);
+                m.xLabelBold = xlb.Str("fontWeight", "") == "bold";
+            }
+            JsonValue xd = xj.Get("data");
+            if (ovrX != null && ovrX.IsObject() && ovrX.Has("data")) {
+                xd = ovrX.Get("data");
+            }
+            m.xLeaves = ChartMatrixSpec.ParseCells(xd, m, true, 0, 0);
+        } else if (ovrX != null && ovrX.IsObject() && ovrX.Has("data")) {
+            m.xLeaves = ChartMatrixSpec.ParseCells(ovrX.Get("data"), m, true, 0, 0);
+        }
+        JsonValue yj = v.Get("y");
+        if (yj != null && yj.IsObject()) {
+            m.yShow = yj.Bool("show", true);
+            m.yLevelSize = ChartOption.ParseBoxParam(yj.Get("levelSize"));
+            JsonValue yis = yj.Get("itemStyle");
+            if (yis != null && yis.IsObject()) {
+                m.yItemColor = ChartOption.ParseColor(yis.Get("color"), 0);
+            }
+            JsonValue ylb = yj.Get("label");
+            if (ylb != null && ylb.IsObject()) {
+                m.yLabelFontSize = ylb.Int("fontSize", 0);
+                m.yLabelColor = ChartOption.ParseColor(ylb.Get("color"), 0);
+                m.yLabelBold = ylb.Str("fontWeight", "") == "bold";
+            }
+            JsonValue yd = yj.Get("data");
+            if (ovrY != null && ovrY.IsObject() && ovrY.Has("data")) {
+                yd = ovrY.Get("data");
+            }
+            m.yLeaves = ChartMatrixSpec.ParseCells(yd, m, false, 0, 0);
+        } else if (ovrY != null && ovrY.IsObject() && ovrY.Has("data")) {
+            m.yLeaves = ChartMatrixSpec.ParseCells(ovrY.Get("data"), m, false, 0, 0);
+        }
+        // corner.data：角区文本（sparkline "Time"；coord [-1,-1] =
+        // 整角区，暂只收 value 文本画角区中心）。
+        JsonValue cj = v.Get("corner");
+        if (cj != null && cj.IsObject()) {
+            JsonValue cdata = cj.Get("data");
+            if (cdata != null && cdata.IsArray()) {
+                for (int ci2 = 0; ci2 < cdata.Count(); ci2 = ci2 + 1) {
+                    JsonValue cit = cdata.At(ci2);
+                    if (cit == null || !cit.IsObject()) { continue; }
+                    string cv = cit.Str("value", "");
+                    if (cv.Length > 0) { m.cornerText.Add(cv); }
+                }
+            }
+        }
+        // body.data：体区合并格文本。coord 各维是 数字（叶序号）|
+        // 格名 | [起, 止]，统一归一成叶子域 [first, first+span-1]。
+        JsonValue bj = v.Get("body");
+        if (bj != null && bj.IsObject()) {
+            JsonValue bis = bj.Get("itemStyle");
+            if (bis != null && bis.IsObject()) {
+                JsonValue bbc = bis.Get("borderColor");
+                if (bbc != null && bbc.IsString()
+                    && bbc.AsString("") == "none") {
+                    m.bodyBorder = false;
+                }
+            }
+            JsonValue bdata = bj.Get("data");
+            if (bdata != null && bdata.IsArray()) {
+                for (int bi = 0; bi < bdata.Count(); bi = bi + 1) {
+                    JsonValue bit = bdata.At(bi);
+                    if (bit == null || !bit.IsObject()) { continue; }
+                    JsonValue bcrd = bit.Get("coord");
+                    if (bcrd == null || !bcrd.IsArray()
+                        || bcrd.Count() < 2) { continue; }
+                    int bx0;
+                    int bx1;
+                    ChartMatrixSpec.MatCoordSpan(m, true, bcrd.At(0),
+                        out bx0, out bx1);
+                    int by0;
+                    int by1;
+                    ChartMatrixSpec.MatCoordSpan(m, false, bcrd.At(1),
+                        out by0, out by1);
+                    int blc = 0;
+                    int blf = 0;
+                    JsonValue blbl = bit.Get("label");
+                    if (blbl != null && blbl.IsObject()) {
+                        blc = ChartOption.ParseColor(blbl.Get("color"), 0);
+                        blf = blbl.Int("fontSize", 0);
+                    }
+                    m.bodyCells.Add(new ChartMatrixBodyCell(bit.Str("value", ""),
+                        bx0, bx1, by0, by1, blc, blf));
+                }
+            }
+        }
+        // 层级带数 = 最大树深（官方 _levels.length：每深一层一带）。
+        for (int i = 0; i < m.xNodes.Count; i = i + 1) {
+            if (m.xNodes[i].level + 1 > m.xLevels) { m.xLevels = m.xNodes[i].level + 1; }
+        }
+        for (int j = 0; j < m.yNodes.Count; j = j + 1) {
+            if (m.yNodes[j].level + 1 > m.yLevels) { m.yLevels = m.yNodes[j].level + 1; }
+        }
+        return m;
+    }
+
+    // 单个 coord 元素归一成叶子域 [c0, c1]：数字 = 叶序号；串 =
+    // 格名（可落在组，展开为叶子域）；[a, b] = 两端各解一次。
+    static void MatCoordSpan(ChartMatrixSpec m, bool isX, JsonValue e,
+                             out int c0, out int c1) {
+        c0 = 0;
+        c1 = 0;
+        if (e == null) {
+            // null = 整维（sparkline 的 Break 合并行 coord [null, 2]）。
+            c1 = (isX ? m.xLeaves : m.yLeaves) - 1;
+            return;
+        }
+        if (e.IsNumber()) {
+            c0 = e.AsInt(0);
+            c1 = c0;
+            return;
+        }
+        if (e.IsString()) {
+            int ci = m.FindCell(isX, e.AsString(""));
+            if (ci < 0) { c0 = 0 - 1; c1 = 0 - 1; return; }
+            c0 = isX ? m.xNodes[ci].first : m.yNodes[ci].first;
+            c1 = c0 + (isX ? m.xNodes[ci].span : m.yNodes[ci].span) - 1;
+            return;
+        }
+        if (e.IsArray() && e.Count() >= 2) {
+            int a0;
+            int a1;
+            ChartMatrixSpec.MatCoordSpan(m, isX, e.At(0), out a0, out a1);
+            int b0;
+            int b1;
+            ChartMatrixSpec.MatCoordSpan(m, isX, e.At(1), out b0, out b1);
+            c0 = a0;
+            c1 = b1;
+            return;
+        }
+    }
+
+    // 维度树前序展平；返回本数组覆盖的叶子数。data 项：字符串 |
+    // {value, children, label}；无 children 即叶子（官方子树空时
+    // span 取 1）。value 注册进查找表；label 仅覆盖显示文本。
+    static int ParseCells(JsonValue arr, ChartMatrixSpec m, bool isX,
+                          int first, int level) {
+        if (arr == null || !arr.IsArray()) { return 0; }
+        int total = 0;
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue it = arr.At(i);
+            string val = "";
+            string lab = "";
+            JsonValue children = null;
+            if (it == null) {
+                // null 项 = 匿名叶（media 缺省项的 [null,null,...] 占位
+                // 维度——grid-layout 的响应式骨架）。
+                val = "";
+            } else if (it.IsString()) {
+                val = it.AsString("");
+            } else if (it.IsObject()) {
+                JsonValue vv = it.Get("value");
+                if (vv != null && vv.IsString()) { val = vv.AsString(""); }
+                JsonValue lj = it.Get("label");
+                if (lj != null && lj.IsString()) { lab = lj.AsString(""); }
+                children = it.Get("children");
+            }
+            int idx;
+            int kind = children != null && children.IsArray()
+                && children.Count() > 0 ? 1 : 0;
+            // 官方只有叶消费 size（Matrix.js layOutUnitsOnDimension 的
+            // tmpCellModel.get('size')），组上的声明直接不收。
+            ChartBoxParam sizeRaw = it != null && kind == 0
+                ? ChartOption.ParseBoxParam(it.Get("size")) : null;
+            if (isX) {
+                idx = m.xNodes.Count;
+                m.xNodes.Add(new ChartMatrixBandNode(lab.Length > 0 ? lab : val,
+                    level, first + total, 1, kind, sizeRaw));
+            } else {
+                idx = m.yNodes.Count;
+                m.yNodes.Add(new ChartMatrixBandNode(lab.Length > 0 ? lab : val,
+                    level, first + total, 1, kind, sizeRaw));
+            }
+            if (val.Length > 0) {
+                m.queries.Add(new ChartMatrixCellQuery(val, idx, isX));
+            }
+            int sub = ChartMatrixSpec.ParseCells(children, m, isX,
+                first + total, level + 1);
+            if (sub < 1) { sub = 1; }
+            if (isX) { m.xNodes[idx].span = sub; }
+            else { m.yNodes[idx].span = sub; }
+            total = total + sub;
+        }
+        return total;
+    }
+
+    // 按名解格下标（叶或组）；查无返回 -1。
+    int FindCell(bool isX, string name) {
+        if (name == null || name.Length < 1) { return 0 - 1; }
+        for (int i = 0; i < queries.Count; i = i + 1) {
+            if (queries[i].isX == isX && queries[i].name == name) { return queries[i].index; }
+        }
+        return 0 - 1;
+    }
+}
+
+// grid 数组的一项：矩形四边 inset（百分比或像素），或直接声明
+// width/height（scatter-matrix 的 15 宫格形态）。多 grid 布局按
+// series.xAxisIndex 分组入格。

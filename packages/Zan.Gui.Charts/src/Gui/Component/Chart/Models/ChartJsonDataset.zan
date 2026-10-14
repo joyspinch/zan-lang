@@ -1,0 +1,860 @@
+using System;
+using System.Json;
+using System.Text;
+using Gui;
+namespace Gui.Component.Chart;
+
+class ChartJsonDataset {
+    string id;
+    JsonValue source;
+    List<int> rows;
+    // dimensions 形态的表头：此时 source 全是数据行（无表头行），
+    // 列名查找/表头读取都走 dims。
+    List<string> dims;
+    // 推断出的无表头形态（首行与数据行同构，如全数值的原始观测
+    // 行）：行 0 就是数据。Header/ColumnOf 对它返回空/-1。
+    bool noHdr;
+    // transform 的第二个结果（如 boxplot 的离群点表），
+    // fromTransformResult:1 的数据集克隆这里。
+    JsonValue source1;
+    List<int> rows1;
+
+    // 表头占的行数：dimensions / 无表头形态为 0，常规 source 形态
+    // 首行按约定是表头，占 1 行。行号换算全走这里。
+    int HdrRows() {
+        return (dims != null || noHdr) ? 0 : 1;
+    }
+
+    // 表头行推断（ECharts sourceHeader:'auto' 的对应物）：行 0 至
+    // 少一列是字符串而同列后续行出现数值 => 行 0 是表头；全数值
+    // 或全列同构（K 线日期列）=> 无表头。样本不足两行按有表头。
+    static bool HeaderEvidence(JsonValue source) {
+        if (source == null || !source.IsArray() || source.Count() < 2) { return true; }
+        JsonValue r0 = source.At(0);
+        if (!r0.IsArray()) { return true; }
+        int cols = r0.Count();
+        int check = source.Count() < 20 ? source.Count() : 20;
+        for (int c2 = 0; c2 < cols; c2 = c2 + 1) {
+            JsonValue h = r0.At(c2);
+            if (h == null || h.IsNumber()) { continue; }
+            if (h.AsString("").Length == 0) { continue; }
+            for (int r = 1; r < check; r = r + 1) {
+                JsonValue row = source.At(r);
+                if (row == null || !row.IsArray() || c2 >= row.Count()) { continue; }
+                JsonValue cell = row.At(c2);
+                if (cell != null && cell.IsNumber()) { return true; }
+            }
+        }
+        return false;
+    }
+
+    // 按 id 查数据集；找不到返回 null。
+    static ChartJsonDataset ById(List<ChartJsonDataset> list, string want) {
+        if (want == null || want.Length == 0) { return null; }
+        for (int i = 0; i < list.Count; i = i + 1) {
+            if (list[i].id == want) { return list[i]; }
+        }
+        return null;
+    }
+
+    // datasetIndex 旧形式取数据集；越界返回 null。
+    static ChartJsonDataset At(List<ChartJsonDataset> list, int index) {
+        if (index < 0 || index >= list.Count) { return null; }
+        return list[index];
+    }
+
+    // 行数（不含表头行）。
+    int RowCount() {
+        if (source == null || !source.IsArray() || rows.Count < 1) { return 0; }
+        int n = rows.Count - this.HdrRows();
+        return n < 0 ? 0 : n;
+    }
+
+    // 数据列数：dimensions 形态取 dims 长度，常规形态取表头行
+    // 宽度（无表头时取首数据行宽度）。
+    int Width() {
+        if (dims != null) { return dims.Count; }
+        if (source == null || !source.IsArray() || source.Count() < 1) { return 0; }
+        JsonValue head = source.At(0);
+        if (head == null) { return 0; }
+        return head.Count();
+    }
+
+    // 表头列名；越界或无表头返回 ""。第 0 行按约定是表头；
+    // dimensions 形态直接查 dims。
+    string Header(int col) {
+        if (dims != null) {
+            if (col < 0 || col >= dims.Count) { return ""; }
+            return dims[col];
+        }
+        if (source == null || !source.IsArray() || source.Count() < 1) { return ""; }
+        JsonValue head = source.At(0);
+        if (!head.IsArray() || col < 0 || col >= head.Count()) { return ""; }
+        return head.At(col).AsString("");
+    }
+
+    // 列名/序号 -> 列下标（encode 的两种形态）。找不到返回 -1。
+    int ColumnOf(JsonValue dim) {
+        if (dim == null) { return 0 - 1; }
+        if (dim.IsNumber()) { return dim.AsInt(0 - 1); }
+        string name = dim.AsString("");
+        if (dims != null) {
+            for (int c2 = 0; c2 < dims.Count; c2 = c2 + 1) {
+                if (dims[c2] == name) { return c2; }
+            }
+            return 0 - 1;
+        }
+        if (source == null || !source.IsArray() || source.Count() < 1) { return 0 - 1; }
+        JsonValue head = source.At(0);
+        if (!head.IsArray()) { return 0 - 1; }
+        for (int c = 0; c < head.Count(); c = c + 1) {
+            if (head.At(c).AsString("") == name) { return c; }
+        }
+        return 0 - 1;
+    }
+
+    // 读单元格（绝对行号，含表头行）；越界返回 null。
+    JsonValue CellAbs(int absRow, int col) {
+        if (source == null || !source.IsArray()) { return null; }
+        if (absRow < 0 || absRow >= source.Count()) { return null; }
+        JsonValue row = source.At(absRow);
+        if (row == null || !row.IsArray() || col < 0 || col >= row.Count()) { return null; }
+        return row.At(col);
+    }
+
+    // 读单元格原始 JsonValue；越界返回 null。
+    JsonValue Cell(int rowIdx, int col) {
+        if (source == null || !source.IsArray()) { return null; }
+        if (rowIdx < 0 || rowIdx >= rows.Count) { return null; }
+        JsonValue row = source.At(rows[rowIdx]);
+        if (row == null || !row.IsArray() || col < 0 || col >= row.Count()) { return null; }
+        return row.At(col);
+    }
+
+    // 数据行 r（0 = 第一条数据行）、列 c 的数值。
+    double Num(int r, int c) {
+        JsonValue cell = Cell(r + this.HdrRows(), c);
+        if (cell == null) { return 0.0; }
+        if (cell.IsNumber()) { return cell.AsDouble(0.0); }
+        return JsonValue.DoubleOf(cell.AsString(""));
+    }
+
+    // 数据行 r、列 c 的文本形态。
+    string Text(int r, int c) {
+        JsonValue cell = Cell(r + this.HdrRows(), c);
+        if (cell == null) { return ""; }
+        return cell.AsString("");
+    }
+
+    // 应用 transform（filter / sort / ecStat 回归·聚类；boxplot
+    // 等其余类型暂原样透传源行集）。into 的 source 指向结果数据，
+    // rows 为有效行号表；dims 随上游继承。
+    static void Transform(ChartJsonDataset from, ChartJsonDataset into, JsonValue tr) {
+        if (tr == null || !tr.IsObject()) { into.rows = from.rows; return; }
+        into.source = from.source;
+        into.dims = from.dims;
+        string type = tr.Str("type", "");
+        JsonValue cfg = tr.Get("config");
+        if (type == "ecStat:regression") {
+            ChartJsonDataset.Regression(from, into, cfg);
+            return;
+        }
+        if (type == "ecStat:clustering") {
+            ChartJsonDataset.Clustering(from, into, cfg);
+            return;
+        }
+        if (type == "boxplot") {
+            ChartJsonDataset.Boxplot(from, into, cfg);
+            return;
+        }
+        if (type == "ecSimpleTransform:aggregate") {
+            ChartJsonDataset.Aggregate(from, into, cfg);
+            return;
+        }
+        if (type == "filter" && cfg != null && cfg.IsObject()) {
+            // 行号表沿用「rows[0] = 表头行」约定（sort 分支同款）——
+            // 此前从 r=1 起筛且不回填表头，结果集首条数据行被当表头
+            // 吃掉、末条被 RowCount 的 -1 截掉（data-transform-filter
+            // 的 1950 与最末年凭空消失）。noHdr 一并继承，否则无表头
+            // 上游的变换结果按 1 行表头错位读取。
+            List<int> outRows = new List<int>();
+            into.noHdr = from.noHdr;
+            int fhdr = from.HdrRows();
+            for (int h2 = 0; h2 < fhdr; h2 = h2 + 1) { outRows.Add(from.rows[h2]); }
+            for (int r = fhdr; r < from.rows.Count; r = r + 1) {
+                if (ChartJsonDataset.FilterRow(from, from.rows[r], cfg)) { outRows.Add(from.rows[r]); }
+            }
+            into.rows = outRows;
+            return;
+        }
+        if (type == "sort" && cfg != null && (cfg.IsObject() || cfg.IsArray())) {
+            // 表头行留在槽 0 不参与比较；比较方向为
+            // key < outRows[j] 时右移。
+            List<int> outRows = new List<int>();
+            into.noHdr = from.noHdr;
+            int shdr = from.HdrRows();
+            for (int h3 = 0; h3 < shdr; h3 = h3 + 1) { outRows.Add(from.rows[h3]); }
+            for (int sr = shdr; sr < from.rows.Count; sr = sr + 1) { outRows.Add(from.rows[sr]); }
+            List<JsonValue> cfgs = new List<JsonValue>();
+            if (cfg.IsArray()) {
+                for (int ci = 0; ci < cfg.Count(); ci = ci + 1) { cfgs.Add(cfg.At(ci)); }
+            } else { cfgs.Add(cfg); }
+            // 稳定插入排序（行数典型几百，足够）。
+            for (int i2 = shdr; i2 < outRows.Count; i2 = i2 + 1) {
+                int key = outRows[i2];
+                int j = i2 - 1;
+                while (j >= shdr && ChartJsonDataset.RowLess(from, key, outRows[j], cfgs)) {
+                    outRows[j + 1] = outRows[j];
+                    j = j - 1;
+                }
+                outRows[j + 1] = key;
+            }
+            into.rows = outRows;
+            return;
+        }
+        into.rows = from.rows;
+    }
+
+    // 排序比较：a 行是否应排在 b 行前（按各 cfg 维度/顺序）。
+    static bool RowLess(ChartJsonDataset ds, int a, int b, List<JsonValue> cfgs) {
+        for (int i = 0; i < cfgs.Count; i = i + 1) {
+            JsonValue cfg = cfgs[i];
+            if (cfg == null || !cfg.IsObject()) { continue; }
+            int col = ds.ColumnOf(cfg.Get("dimension"));
+            if (col < 0) { continue; }
+            bool asc = cfg.Str("order", "asc") != "desc";
+            JsonValue av = ds.CellAbs(a, col);
+            JsonValue bv = ds.CellAbs(b, col);
+            if (av != null && bv != null && av.IsNumber() && bv.IsNumber()) {
+                double ad = av.AsDouble(0.0);
+                double bd = bv.AsDouble(0.0);
+                if (ad == bd) { continue; }
+                return asc ? ad < bd : bd < ad;
+            }
+            string asv = av == null ? "" : av.AsString("");
+            string bsv = bv == null ? "" : bv.AsString("");
+            if (asv == bsv) { continue; }
+            int cmp = String.CompareOrdinal(asv, bsv);
+            return asc ? cmp < 0 : cmp > 0;
+        }
+        return false;
+    }
+
+    // ---- ecStat 变换（回归 / 聚类）--------------------------------
+    // 输出按常规 source 形态合成（首行表头），列：回归 [x,y]、
+    // 聚类 [x,y,cluster]（outputClusterIndexDimension 固定第 3 列，
+    // 与 scatter-clustering 的 visualMap.dimension=2 对齐）。
+
+    // 用数值行集合成结果 source（带表头行）。
+    static JsonValue SynthRows(string[] header, List<List<double>> rows) {
+        JsonValue arr = JsonValue.NewArray();
+        JsonValue head = JsonValue.NewArray();
+        for (int h = 0; h < header.Length; h = h + 1) { head.Append(JsonValue.NewStr(header[h])); }
+        arr.Append(head);
+        for (int r = 0; r < rows.Count; r = r + 1) {
+            JsonValue row = JsonValue.NewArray();
+            List<double> src = rows[r];
+            for (int c = 0; c < src.Count; c = c + 1) { row.Append(JsonValue.NewDouble(src[c])); }
+            arr.Append(row);
+        }
+        return arr;
+    }
+
+    // echarts boxplot 变换（对照 boxplotTransform.ts）：逐输入行
+    // 一只箱——行内数值升序后取四分位（H=(n−1)p+1 线性插值），
+    // 默认 1.5×IQR 须界（boundIQR:"none" 取极值），结果 0 = 每行
+    // [ItemName, low, Q1, Q2, Q3, high]，结果 1 = 离群点
+    // [ItemName, value]（fromTransformResult:1 取）。itemName 取
+    // 行号或 itemNameFormatter 模板（{value} = 行号）。
+    static void Boxplot(ChartJsonDataset from, ChartJsonDataset into, JsonValue cfg) {
+        string fmt = cfg == null ? "" : cfg.Str("itemNameFormatter", "");
+        double biqr = 1.5;
+        if (cfg != null && cfg.Has("boundIQR")) {
+            JsonValue bj = cfg.Get("boundIQR");
+            if (bj != null && bj.IsNumber()) { biqr = bj.AsDouble(1.5); }
+            else if (bj != null && bj.AsString("") == "none") { biqr = 0.0; }
+        }
+        JsonValue arr0 = JsonValue.NewArray();
+        JsonValue head0 = JsonValue.NewArray();
+        head0.Append(JsonValue.NewStr("ItemName"));
+        head0.Append(JsonValue.NewStr("low"));
+        head0.Append(JsonValue.NewStr("Q1"));
+        head0.Append(JsonValue.NewStr("Q2"));
+        head0.Append(JsonValue.NewStr("Q3"));
+        head0.Append(JsonValue.NewStr("high"));
+        arr0.Append(head0);
+        JsonValue arr1 = JsonValue.NewArray();
+        JsonValue head1 = JsonValue.NewArray();
+        head1.Append(JsonValue.NewStr("ItemName"));
+        head1.Append(JsonValue.NewStr("value"));
+        arr1.Append(head1);
+        int n = from.RowCount();
+        int cols = from.Width();
+        for (int r = 0; r < n; r = r + 1) {
+            List<double> vals = new List<double>();
+            for (int c2 = 0; c2 < cols; c2 = c2 + 1) {
+                JsonValue cell = from.Cell(r + from.HdrRows(), c2);
+                if (cell != null && cell.IsNumber()) { vals.Add(cell.AsDouble(0.0)); }
+            }
+            if (vals.Count < 1) { continue; }
+            // 升序插入排序（行内数值典型几十个，足够）。
+            for (int i = 1; i < vals.Count; i = i + 1) {
+                double key = vals[i];
+                int j = i - 1;
+                while (j >= 0 && vals[j] > key) {
+                    vals[j + 1] = vals[j];
+                    j = j - 1;
+                }
+                vals[j + 1] = key;
+            }
+            double q1 = ChartJsonDataset.Quantile(vals, 0.25);
+            double q2 = ChartJsonDataset.Quantile(vals, 0.5);
+            double q3 = ChartJsonDataset.Quantile(vals, 0.75);
+            double bound = biqr * (q3 - q1);
+            double lo = q1 - bound;
+            if (lo < vals[0]) { lo = vals[0]; }
+            double hi = q3 + bound;
+            if (hi > vals[vals.Count - 1]) { hi = vals[vals.Count - 1]; }
+            string label = fmt.Length > 0
+                ? fmt.Replace("{value}", Convert.ToString(r))
+                : Convert.ToString(r);
+            JsonValue row0 = JsonValue.NewArray();
+            row0.Append(JsonValue.NewStr(label));
+            row0.Append(JsonValue.NewDouble(lo));
+            row0.Append(JsonValue.NewDouble(q1));
+            row0.Append(JsonValue.NewDouble(q2));
+            row0.Append(JsonValue.NewDouble(q3));
+            row0.Append(JsonValue.NewDouble(hi));
+            arr0.Append(row0);
+            for (int i2 = 0; i2 < vals.Count; i2 = i2 + 1) {
+                if (vals[i2] < lo || vals[i2] > hi) {
+                    JsonValue row1 = JsonValue.NewArray();
+                    row1.Append(JsonValue.NewStr(label));
+                    row1.Append(JsonValue.NewDouble(vals[i2]));
+                    arr1.Append(row1);
+                }
+            }
+        }
+        into.dims = null;
+        into.source = arr0;
+        into.rows = new List<int>();
+        for (int ri = 0; ri < arr0.Count(); ri = ri + 1) { into.rows.Add(ri); }
+        into.source1 = arr1;
+        into.rows1 = new List<int>();
+        for (int ri2 = 0; ri2 < arr1.Count(); ri2 = ri2 + 1) { into.rows1.Add(ri2); }
+    }
+
+    // ecSimpleTransform:aggregate——按 groupBy 列分组（组序按
+    // 首现顺序），resultDimensions 逐列聚合：method = min/Q1/
+    // median/Q3/max/sum/average/count，缺 method 为直通（取组内
+    // 首行原值）。输出表头 = 各 resultDimension.name。
+    static void Aggregate(ChartJsonDataset from, ChartJsonDataset into, JsonValue cfg) {
+        JsonValue arr = JsonValue.NewArray();
+        JsonValue head = JsonValue.NewArray();
+        List<JsonValue> rds = new List<JsonValue>();
+        int gcol = 0 - 1;
+        if (cfg != null && cfg.IsObject()) {
+            JsonValue rj = cfg.Get("resultDimensions");
+            if (rj != null && rj.IsArray()) {
+                for (int i = 0; i < rj.Count(); i = i + 1) {
+                    rds.Add(rj.At(i));
+                    head.Append(JsonValue.NewStr(rj.At(i).Str("name", "")));
+                }
+            }
+            gcol = from.ColumnOf(cfg.Get("groupBy"));
+        }
+        arr.Append(head);
+        if (rds.Count > 0) {
+            int n = from.RowCount();
+            List<string> keys = new List<string>();
+            List<List<int>> groups = new List<List<int>>();
+            for (int r = 0; r < n; r = r + 1) {
+                string key = gcol >= 0 ? from.Text(r, gcol) : "";
+                int gi = 0 - 1;
+                for (int k = 0; k < keys.Count; k = k + 1) {
+                    if (keys[k] == key) { gi = k; break; }
+                }
+                if (gi < 0) {
+                    keys.Add(key);
+                    groups.Add(new List<int>());
+                    gi = groups.Count - 1;
+                }
+                groups[gi].Add(r);
+            }
+            for (int g = 0; g < groups.Count; g = g + 1) {
+                List<int> grp = groups[g];
+                JsonValue row = JsonValue.NewArray();
+                for (int d = 0; d < rds.Count; d = d + 1) {
+                    JsonValue rd = rds[d];
+                    int col = from.ColumnOf(rd.Get("from"));
+                    string method = rd.Str("method", "");
+                    if (method.Length == 0 || col < 0) {
+                        // 直通：组内首行原值（文本/数值照抄）。
+                        JsonValue cell = grp.Count > 0
+                            ? from.Cell(grp[0] + from.HdrRows(), col < 0 ? 0 : col)
+                            : null;
+                        if (cell != null && cell.IsNumber()) {
+                            row.Append(JsonValue.NewDouble(cell.AsDouble(0.0)));
+                        } else {
+                            row.Append(JsonValue.NewStr(cell == null ? "" : cell.AsString("")));
+                        }
+                        continue;
+                    }
+                    List<double> vals = new List<double>();
+                    for (int gi2 = 0; gi2 < grp.Count; gi2 = gi2 + 1) {
+                        JsonValue cell2 = from.Cell(grp[gi2] + from.HdrRows(), col);
+                        if (cell2 != null && cell2.IsNumber()) {
+                            vals.Add(cell2.AsDouble(0.0));
+                        }
+                    }
+                    double outv = 0.0;
+                    if (method == "count") {
+                        outv = vals.Count;
+                    } else if (vals.Count > 0) {
+                        if (method == "sum") {
+                            for (int vi = 0; vi < vals.Count; vi = vi + 1) { outv = outv + vals[vi]; }
+                        } else if (method == "average") {
+                            for (int vi2 = 0; vi2 < vals.Count; vi2 = vi2 + 1) { outv = outv + vals[vi2]; }
+                            outv = outv / vals.Count;
+                        } else {
+                            for (int i3 = 1; i3 < vals.Count; i3 = i3 + 1) {
+                                double key = vals[i3];
+                                int j = i3 - 1;
+                                while (j >= 0 && vals[j] > key) {
+                                    vals[j + 1] = vals[j];
+                                    j = j - 1;
+                                }
+                                vals[j + 1] = key;
+                            }
+                            if (method == "min") { outv = vals[0]; }
+                            else if (method == "max") { outv = vals[vals.Count - 1]; }
+                            else if (method == "Q1") { outv = ChartJsonDataset.Quantile(vals, 0.25); }
+                            else if (method == "median") { outv = ChartJsonDataset.Quantile(vals, 0.5); }
+                            else if (method == "Q3") { outv = ChartJsonDataset.Quantile(vals, 0.75); }
+                        }
+                    }
+                    row.Append(JsonValue.NewDouble(outv));
+                }
+                arr.Append(row);
+            }
+        }
+        ChartJsonDataset.TakeSynth(into, arr);
+    }
+
+    // 分位数（升序序列，H=(n−1)p+1 线性插值，与 echarts
+    // quantile 一致）。
+    static double Quantile(List<double> asc, double p) {
+        int n = asc.Count;
+        if (n < 1) { return 0.0; }
+        if (n == 1) { return asc[0]; }
+        double h = (n - 1) * p + 1.0;
+        int fl = (int)h;
+        if (fl < 1) { fl = 1; }
+        if (fl > n) { fl = n; }
+        double v = asc[fl - 1];
+        double e = h - fl;
+        if (e > 0.0 && fl < n) { return v + e * (asc[fl] - v); }
+        return v;
+    }
+
+    // 合成结果落 into：source 指向新数组，rows 全量、dims 清空。
+    static void TakeSynth(ChartJsonDataset into, JsonValue arr) {
+        into.dims = null;
+        into.source = arr;
+        into.rows = new List<int>();
+        for (int ri = 0; ri < arr.Count(); ri = ri + 1) { into.rows.Add(ri); }
+    }
+
+    // 列是否全为数值单元格（轴型智能推断：全数值 + 类目轴无显式
+    // data = 该轴实为 value，与 ECharts 行为一致）。
+    static bool ColNumeric(ChartJsonDataset ds, int col) {
+        int n = ds.RowCount();
+        if (n <= 0) { return false; }
+        for (int r = 0; r < n; r = r + 1) {
+            JsonValue cell = ds.Cell(r + ds.HdrRows(), col);
+            if (cell == null || !cell.IsNumber()) { return false; }
+        }
+        return true;
+    }
+
+    // double -> 千倍定点 int（四舍五入，散点/数值点存储形态）。
+    static int Mul1000(double v) {
+        return (int)(v >= 0.0 ? v * 1000.0 + 0.5 : v * 1000.0 - 0.5);
+    }
+
+    // double -> 就近 int（箱线五数取整）。
+    static int Rint(double v) {
+        return (int)(v >= 0.0 ? v + 0.5 : v - 0.5);
+    }
+
+    // 类目位置（×1000 定点）：文本在类目轴里查序号；查不到回落
+    // 0（类目列与轴回填同源，正常都命中）。
+    static int CatIdx1000(ChartAxis a, string text) {
+        if (a != null) {
+            for (int i = 0; i < a.categories.Count; i = i + 1) {
+                if (a.categories[i] == text) { return i * 1000; }
+            }
+        }
+        return 0;
+    }
+
+    // piecewise visualMap（pieces 为 value 精确匹配形态）按 point.z
+    // 给散点逐点上色（scatter-clustering 的 cluster 分色）。
+    static void PieceColorPoints(ChartOption o, ChartSeries cs) {
+        for (int vi = 0; vi < o.visualMaps.Count; vi = vi + 1) {
+            ChartVisualMap vm = o.visualMaps[vi];
+            if (vm.type != 1 || vm.pieces.Count == 0) { continue; }
+            if (vm.dimension >= 0 && vm.dimension != 2) { continue; }
+            if (vm.seriesIndex >= 0) { continue; }
+            for (int pi = 0; pi < vm.pieces.Count; pi = pi + 1) {
+                ChartVisualPiece pc = vm.pieces[pi];
+                if (!pc.hasEq || pc.color == 0) { continue; }
+                for (int pt = 0; pt < cs.points.Count; pt = pt + 1) {
+                    if (cs.points[pt].z == pc.eq) { cs.points[pt].color = pc.color; }
+                }
+            }
+            return;
+        }
+    }
+
+    // ecStat:regression——最小二乘拟合。linear/logarithmic/
+    // exponential 输出定义域两端点（与 ecStat 相同的直线形态），
+    // polynomial 输出 33 个等距点勾出曲线。
+    static void Regression(ChartJsonDataset from, ChartJsonDataset into, JsonValue cfg) {
+        string method = cfg == null ? "linear" : cfg.Str("method", "linear");
+        int order = cfg == null ? 2 : cfg.Int("order", 2);
+        if (order < 1) { order = 1; }
+        if (order > 4) { order = 4; }
+        bool lnX = method == "logarithmic";
+        bool lnY = method == "exponential";
+        List<double> xs = new List<double>();
+        List<double> ys = new List<double>();
+        int n = from.RowCount();
+        for (int r = 0; r < n; r = r + 1) {
+            double x = from.Num(r, 0);
+            double y = from.Num(r, 1);
+            // 定义域保护（与 ecStat 一致：跳过取不到对数的非法行）。
+            if (lnX && x <= 0.0) { continue; }
+            if (lnY && y <= 0.0) { continue; }
+            xs.Add(lnX ? ChartJsonDataset.Ln(x) : x);
+            ys.Add(lnY ? ChartJsonDataset.Ln(y) : y);
+        }
+        List<List<double>> outRows = new List<List<double>>();
+        int m = xs.Count;
+        if (m >= 2) {
+            double minX = 0.0; double maxX = 0.0;
+            for (int i = 0; i < m; i = i + 1) {
+                if (i == 0 || xs[i] < minX) { minX = xs[i]; }
+                if (i == 0 || xs[i] > maxX) { maxX = xs[i]; }
+            }
+            if (method == "polynomial") {
+                // 正规方程 A·c = b（A[i][j] = Σx^(i+j)，b[i] = Σx^i·y），
+                // 列主元高斯消元解系数。
+                int k = order + 1;
+                List<List<double>> A = new List<List<double>>();
+                List<double> b = new List<double>();
+                for (int i2 = 0; i2 < k; i2 = i2 + 1) {
+                    List<double> rowA = new List<double>();
+                    for (int j = 0; j < k; j = j + 1) {
+                        double s = 0.0;
+                        for (int t = 0; t < m; t = t + 1) {
+                            s = s + ChartJsonDataset.Pow(xs[t], i2 + j);
+                        }
+                        rowA.Add(s);
+                    }
+                    A.Add(rowA);
+                    double s2 = 0.0;
+                    for (int t2 = 0; t2 < m; t2 = t2 + 1) {
+                        s2 = s2 + ys[t2] * ChartJsonDataset.Pow(xs[t2], i2);
+                    }
+                    b.Add(s2);
+                }
+                List<double> coef = ChartJsonDataset.Solve(A, b, k);
+                int steps = 32;
+                for (int si = 0; si <= steps; si = si + 1) {
+                    double x = minX + (maxX - minX) * si / steps;
+                    double y = 0.0;
+                    for (int ci = 0; ci < k; ci = ci + 1) {
+                        y = y + coef[ci] * ChartJsonDataset.Pow(x, ci);
+                    }
+                    List<double> pr = new List<double>();
+                    pr.Add(lnX ? ChartJsonDataset.Exp(x) : x);
+                    pr.Add(lnY ? ChartJsonDataset.Exp(y) : y);
+                    outRows.Add(pr);
+                }
+            } else {
+                double sx = 0.0; double sy = 0.0;
+                double sxx = 0.0; double sxy = 0.0;
+                for (int i3 = 0; i3 < m; i3 = i3 + 1) {
+                    sx = sx + xs[i3]; sy = sy + ys[i3];
+                    sxx = sxx + xs[i3] * xs[i3];
+                    sxy = sxy + xs[i3] * ys[i3];
+                }
+                double den = m * sxx - sx * sx;
+                double b2 = den != 0.0 ? (m * sxy - sx * sy) / den : 0.0;
+                double a = (sy - b2 * sx) / m;
+                double y0 = a + b2 * minX;
+                double y1 = a + b2 * maxX;
+                List<double> p0 = new List<double>();
+                p0.Add(lnX ? ChartJsonDataset.Exp(minX) : minX);
+                p0.Add(lnY ? ChartJsonDataset.Exp(y0) : y0);
+                outRows.Add(p0);
+                List<double> p1 = new List<double>();
+                p1.Add(lnX ? ChartJsonDataset.Exp(maxX) : maxX);
+                p1.Add(lnY ? ChartJsonDataset.Exp(y1) : y1);
+                outRows.Add(p1);
+            }
+        }
+        List<string> head = new List<string>();
+        head.Add("x");
+        head.Add("y");
+        ChartJsonDataset.TakeSynth(into, ChartJsonDataset.SynthRows(head.ToArray(), outRows));
+    }
+
+    // ecStat:clustering——确定性 k-means：k-means++ 初始化
+    // （固定种子 LCG，截图回归不抖）+ Lloyd 迭代至多 30 轮。
+    // 输出 [x,y,cluster]。
+    static void Clustering(ChartJsonDataset from, ChartJsonDataset into, JsonValue cfg) {
+        int k = cfg == null ? 4 : cfg.Int("clusterCount", 4);
+        if (k < 1) { k = 1; }
+        if (k > 8) { k = 8; }
+        List<double> xs = new List<double>();
+        List<double> ys = new List<double>();
+        int n = from.RowCount();
+        if (n > 20000) { n = 20000; }
+        for (int r = 0; r < n; r = r + 1) {
+            xs.Add(from.Num(r, 0));
+            ys.Add(from.Num(r, 1));
+        }
+        List<List<double>> outRows = new List<List<double>>();
+        if (n > 0 && k > n) { k = n; }
+        if (n > 0) {
+            long seed = 20240601;
+            List<double> cx = new List<double>();
+            List<double> cy = new List<double>();
+            // k-means++：首心取固定种子落点，其后按 D² 加权抽取。
+            for (int c = 0; c < k; c = c + 1) {
+                if (c == 0) {
+                    seed = (seed * 1103515245 + 12345) % 2147483648;
+                    int i0 = (int)(seed % n);
+                    cx.Add(xs[i0]); cy.Add(ys[i0]);
+                    continue;
+                }
+                double total = 0.0;
+                List<double> dist = new List<double>();
+                for (int i = 0; i < n; i = i + 1) {
+                    double best = 0.0 - 1.0;
+                    for (int c2 = 0; c2 < cx.Count; c2 = c2 + 1) {
+                        double dx = xs[i] - cx[c2];
+                        double dy = ys[i] - cy[c2];
+                        double d2 = dx * dx + dy * dy;
+                        if (best < 0.0 || d2 < best) { best = d2; }
+                    }
+                    dist.Add(best < 0.0 ? 0.0 : best);
+                    total = total + (best < 0.0 ? 0.0 : best);
+                }
+                seed = (seed * 1103515245 + 12345) % 2147483648;
+                double target = total * (double)(seed % 1000000) / 1000000.0;
+                double acc = 0.0;
+                int pick = n - 1;
+                for (int i2 = 0; i2 < n; i2 = i2 + 1) {
+                    acc = acc + dist[i2];
+                    if (acc >= target) { pick = i2; break; }
+                }
+                cx.Add(xs[pick]); cy.Add(ys[pick]);
+            }
+            List<int> assign = new List<int>();
+            for (int i3 = 0; i3 < n; i3 = i3 + 1) { assign.Add(0 - 1); }
+            for (int iter = 0; iter < 30; iter = iter + 1) {
+                bool changed = false;
+                for (int i4 = 0; i4 < n; i4 = i4 + 1) {
+                    int bestK = 0;
+                    double bestD = 0.0;
+                    for (int c3 = 0; c3 < k; c3 = c3 + 1) {
+                        double dx = xs[i4] - cx[c3];
+                        double dy = ys[i4] - cy[c3];
+                        double d2 = dx * dx + dy * dy;
+                        if (c3 == 0 || d2 < bestD) { bestD = d2; bestK = c3; }
+                    }
+                    if (assign[i4] != bestK) { changed = true; assign[i4] = bestK; }
+                }
+                if (!changed && iter > 0) { break; }
+                for (int c4 = 0; c4 < k; c4 = c4 + 1) {
+                    double sx = 0.0; double sy = 0.0; int cnt = 0;
+                    for (int i5 = 0; i5 < n; i5 = i5 + 1) {
+                        if (assign[i5] == c4) {
+                            sx = sx + xs[i5]; sy = sy + ys[i5]; cnt = cnt + 1;
+                        }
+                    }
+                    if (cnt > 0) { cx[c4] = sx / cnt; cy[c4] = sy / cnt; }
+                }
+            }
+            for (int i6 = 0; i6 < n; i6 = i6 + 1) {
+                List<double> pr = new List<double>();
+                pr.Add(xs[i6]);
+                pr.Add(ys[i6]);
+                pr.Add(assign[i6] < 0 ? 0.0 : (double)assign[i6]);
+                outRows.Add(pr);
+            }
+        }
+        List<string> head2 = new List<string>();
+        head2.Add("x");
+        head2.Add("y");
+        head2.Add("cluster");
+        ChartJsonDataset.TakeSynth(into, ChartJsonDataset.SynthRows(head2.ToArray(), outRows));
+    }
+
+    // 列主元高斯消元解 k 元线性方程组；奇异时回落零解。
+    static List<double> Solve(List<List<double>> A, List<double> b, int k) {
+        List<double> x = new List<double>();
+        for (int i = 0; i < k; i = i + 1) { x.Add(0.0); }
+        for (int col = 0; col < k; col = col + 1) {
+            int piv = col;
+            double pivAbs = A[piv][col] < 0.0 ? 0.0 - A[piv][col] : A[piv][col];
+            for (int r = col + 1; r < k; r = r + 1) {
+                double rAbs = A[r][col] < 0.0 ? 0.0 - A[r][col] : A[r][col];
+                if (rAbs > pivAbs) { piv = r; pivAbs = rAbs; }
+            }
+            List<double> tmp = A[col]; A[col] = A[piv]; A[piv] = tmp;
+            double tv = b[col]; b[col] = b[piv]; b[piv] = tv;
+            double pv = A[col][col];
+            if (pv == 0.0) { continue; }
+            for (int r2 = col + 1; r2 < k; r2 = r2 + 1) {
+                double f = A[r2][col] / pv;
+                if (f == 0.0) { continue; }
+                for (int c2 = col; c2 < k; c2 = c2 + 1) {
+                    A[r2][c2] = A[r2][c2] - f * A[col][c2];
+                }
+                b[r2] = b[r2] - f * b[col];
+            }
+        }
+        for (int row = k - 1; row >= 0; row = row - 1) {
+            double s = b[row];
+            for (int c3 = row + 1; c3 < k; c3 = c3 + 1) { s = s - A[row][c3] * x[c3]; }
+            x[row] = A[row][row] != 0.0 ? s / A[row][row] : 0.0;
+        }
+        return x;
+    }
+
+    // 整指数幂（回归正规方程用；负指数回落 0）。
+    static double Pow(double b, int e) {
+        if (e < 0) { return 0.0; }
+        double r = 1.0;
+        for (int i = 0; i < e; i = i + 1) { r = r * b; }
+        return r;
+    }
+
+    const double Ln2 = 0.6931471805599453;
+
+    // 自然对数：归一到 [0.5,2] 后 atanh 级数
+    // ln(x) = 2(t + t³/3 + t⁵/5 + …)，t = (x−1)/(x+1)。
+    static double Ln(double v) {
+        if (v <= 0.0) { return 0.0; }
+        int k = 0;
+        while (v > 2.0) { v = v / 2.0; k = k + 1; }
+        while (v < 0.5) { v = v * 2.0; k = k - 1; }
+        double t = (v - 1.0) / (v + 1.0);
+        double t2 = t * t;
+        double s = 0.0;
+        double tp = t;
+        for (int i = 1; i <= 19; i = i + 2) {
+            s = s + tp / i;
+            tp = tp * t2;
+        }
+        return 2.0 * s + k * ChartJsonDataset.Ln2;
+    }
+
+    // 指数：归一到 r∈[−ln2/2, ln2/2] 后泰勒展开，再按 2^k 缩放。
+    static double Exp(double v) {
+        if (v < 0 - 700.0) { return 0.0; }
+        int k = (int)(v / ChartJsonDataset.Ln2 + (v >= 0.0 ? 0.5 : 0 - 0.5));
+        double r = v - k * ChartJsonDataset.Ln2;
+        double s = 1.0;
+        double term = 1.0;
+        for (int i = 1; i <= 15; i = i + 1) {
+            term = term * r / i;
+            s = s + term;
+        }
+        double p = 1.0;
+        int e = k < 0 ? 0 - k : k;
+        double b2 = 2.0;
+        while (e > 0) {
+            if ((e & 1) == 1) { p = p * b2; }
+            b2 = b2 * b2;
+            e = e >> 1;
+        }
+        return k < 0 ? s / p : s * p;
+    }
+
+    // 过滤子句：{and:[...]} / {or:[...]} / {dimension, op 值对}。
+    static bool FilterRow(ChartJsonDataset ds, int absRow, JsonValue cfg) {
+        JsonValue andL = cfg.Get("and");
+        if (andL != null && andL.IsArray()) {
+            for (int i = 0; i < andL.Count(); i = i + 1) {
+                if (!ChartJsonDataset.FilterRow(ds, absRow, andL.At(i))) { return false; }
+            }
+            return true;
+        }
+        JsonValue orL = cfg.Get("or");
+        if (orL != null && orL.IsArray()) {
+            for (int j = 0; j < orL.Count(); j = j + 1) {
+                if (ChartJsonDataset.FilterRow(ds, absRow, orL.At(j))) { return true; }
+            }
+            return false;
+        }
+        int col = ds.ColumnOf(cfg.Get("dimension"));
+        if (col < 0) { return true; }
+        JsonValue row = ds.source.At(absRow);
+        JsonValue cell = row.IsArray() && col < row.Count() ? row.At(col) : null;
+        double cnum = 0.0;
+        bool cIsNum = false;
+        JsonValue vj = cfg.Get("value");
+        if (vj != null) {
+            cIsNum = vj.IsNumber();
+            if (cIsNum) { cnum = vj.AsDouble(0.0); }
+        }
+        // ops：'='/='=='/eq、'!='/'ne'、'>'/'gt'、'>='/'gte'、
+        // '<'/'lt'、'<='/'lte'。Zan JSON 对象键访问用 Has/Get。
+        if (cfg.Has("=") || cfg.Has("==") || cfg.Has("eq")) {
+            JsonValue opv = cfg.Has("=") ? cfg.Get("=")
+                : (cfg.Has("==") ? cfg.Get("==") : cfg.Get("eq"));
+            return ChartJsonDataset.CellEq(cell, opv);
+        }
+        if (cfg.Has("!=") || cfg.Has("ne")) {
+            JsonValue opv2 = cfg.Has("!=") ? cfg.Get("!=") : cfg.Get("ne");
+            return !ChartJsonDataset.CellEq(cell, opv2);
+        }
+        if (cfg.Has(">") || cfg.Has("gt") || cfg.Has(">=") || cfg.Has("gte")
+            || cfg.Has("<") || cfg.Has("lt") || cfg.Has("<=") || cfg.Has("lte")) {
+            string opk = cfg.Has(">") ? ">" : cfg.Has("gt") ? "gt"
+                : cfg.Has(">=") ? ">=" : cfg.Has("gte") ? "gte"
+                : cfg.Has("<") ? "<" : cfg.Has("lt") ? "lt"
+                : cfg.Has("<=") ? "<=" : "lte";
+            JsonValue opv3 = cfg.Get(opk);
+            if (opv3 == null) { return true; }
+            double cd = opv3.IsNumber() ? opv3.AsDouble(0.0)
+                : JsonValue.DoubleOf(opv3.AsString(""));
+            double cv = cell == null ? 0.0
+                : (cell.IsNumber() ? cell.AsDouble(0.0)
+                    : JsonValue.DoubleOf(cell.AsString("")));
+            if (opk == ">") { return cv > cd; }
+            if (opk == ">=" || opk == "gte") { return cv >= cd; }
+            if (opk == "<") { return cv < cd; }
+            return cv <= cd;
+        }
+        return true;
+    }
+
+    static bool CellEq(JsonValue cell, JsonValue want) {
+        if (cell == null || want == null) { return false; }
+        if (want.IsNumber()) {
+            double cv = cell.IsNumber() ? cell.AsDouble(0.0)
+                : JsonValue.DoubleOf(cell.AsString(""));
+            return cv == want.AsDouble(0.0);
+        }
+        return cell.AsString("") == want.AsString("");
+    }
+}
+
+// dataRange.splitList 的一个命名值区间（ECharts dataRange.data）。
+// lo/hi 用 ChartOption.Auto() 表示开口。
