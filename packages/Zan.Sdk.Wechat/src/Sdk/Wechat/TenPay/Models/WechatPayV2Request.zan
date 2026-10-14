@@ -1,0 +1,186 @@
+using System;
+using System.Collections.Generic;
+
+namespace Sdk.Wechat.TenPay;
+
+class WechatPayV2Request {
+    List<WechatPayV2Field> fields;
+
+    public WechatPayV2Request() {
+        this.fields = new List<WechatPayV2Field>();
+    }
+
+    WechatPayV2Request Set(string name, string fieldValue) {
+        int i = this.Index(name);
+        if (i >= 0) { this.fields[i].value = fieldValue; }
+        else { this.fields.Add(new WechatPayV2Field(name, fieldValue)); }
+        return this;
+    }
+
+    bool Has(string name) { return this.Index(name) >= 0; }
+
+    string Get(string name, string dflt) {
+        int i = this.Index(name);
+        if (i < 0) { return dflt; }
+        return this.fields[i].value;
+    }
+
+    int Count() { return this.fields.Count; }
+
+    string Canonical(string merchantKey) {
+        List<WechatPayV2Field> sorted = new List<WechatPayV2Field>();
+        int i = 0;
+        for (; i < this.fields.Count; i = i + 1) {
+            WechatPayV2Field field = this.fields[i];
+            if (field.name != "sign" && field.value.Length > 0) {
+                int at = sorted.Count;
+                int j = 0;
+                for (; j < sorted.Count; j = j + 1) {
+                    if (WechatPayV2Request.Compare(field.name, sorted[j].name) < 0) {
+                        at = j; break;
+                    }
+                }
+                sorted.Add(field);
+                j = sorted.Count - 1;
+                while (j > at) {
+                    sorted[j] = sorted[j - 1];
+                    j = j - 1;
+                }
+                sorted[at] = field;
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        i = 0;
+        while (i < sorted.Count) {
+            if (i > 0) { sb.Append("&"); }
+            sb.Append(sorted[i].name); sb.Append("="); sb.Append(sorted[i].value);
+            i = i + 1;
+        }
+        if (sb.Length > 0) { sb.Append("&"); }
+        sb.Append("key="); sb.Append(merchantKey);
+        return sb.ToString();
+    }
+
+    string Sign(string merchantKey, string signType) {
+        string source = this.Canonical(merchantKey);
+        byte[] digest;
+        if (signType == "HMAC-SHA256") {
+            digest = Hmac.Sha256Mac(merchantKey, merchantKey.Length,
+                                    source, source.Length);
+            return WechatPayV2Request.Upper(Hex.Encode(digest, 32));
+        }
+        digest = Md5.Hash(source, source.Length);
+        return WechatPayV2Request.Upper(Hex.Encode(digest, 16));
+    }
+
+    bool Verify(string merchantKey) {
+        // 空 merchantKey 拒绝：否则攻击者可用空密钥自签伪造回调
+        string actual = this.Get("sign", "");
+        if (merchantKey.Length == 0 || actual.Length == 0) { return false; }
+        string signType = this.Get("sign_type", "MD5");
+        string expected = this.Sign(merchantKey, signType);
+        // 常数时间比较，防逐字节探测签名
+        return Jwt.fixedEquals(actual, actual.Length, expected, expected.Length);
+    }
+
+    string ToSignedXml(WechatPayV2Config config) {
+        if (!this.Has("appid") && config.AppId.Length > 0) {
+            this.Set("appid", config.AppId);
+        }
+        if (!this.Has("mch_id") && config.MerchantId.Length > 0) {
+            this.Set("mch_id", config.MerchantId);
+        }
+        if (!this.Has("nonce_str")) {
+            byte[] random = RandomNumberGenerator.GetBytes(16);
+            this.Set("nonce_str", Hex.Encode(random, 16));
+        }
+        if (!this.Has("notify_url") && config.NotifyUrl.Length > 0) {
+            this.Set("notify_url", config.NotifyUrl);
+        }
+        if (config.SignType == "HMAC-SHA256" && !this.Has("sign_type")) {
+            this.Set("sign_type", config.SignType);
+        }
+        this.Set("sign", this.Sign(config.MerchantKey, config.SignType));
+        return this.ToXml();
+    }
+
+    string ToXml() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("<xml>");
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            sb.Append("<"); sb.Append(this.fields[i].name); sb.Append("><![CDATA[");
+            sb.Append(this.fields[i].value);
+            sb.Append("]]></"); sb.Append(this.fields[i].name); sb.Append(">");
+        }
+        sb.Append("</xml>");
+        return sb.ToString();
+    }
+
+    static WechatPayV2Request ParseXml(string xml) {
+        WechatPayV2Request result = new WechatPayV2Request();
+        int pos = XmlUtil.IndexOf(xml, "<xml", 0);
+        if (pos < 0) { return result; }
+        pos = XmlUtil.IndexOf(xml, ">", pos);
+        if (pos < 0) { return result; }
+        pos = pos + 1;
+        int xmlEnd = XmlUtil.IndexOf(xml, "</xml>", pos);
+        if (xmlEnd < 0) { xmlEnd = xml.Length; }
+        while (pos < xmlEnd) {
+            int open = XmlUtil.IndexOf(xml, "<", pos);
+            if (open < 0 || open >= xmlEnd) { break; }
+            if (open + 1 < xml.Length && (xml[open + 1] & 255) == 47) { break; }
+            int gt = XmlUtil.IndexOf(xml, ">", open + 1);
+            if (gt < 0) { break; }
+            int nameEnd = gt;
+            int scan = open + 1;
+            while (scan < gt) {
+                int c = xml[scan] & 255;
+                if (c == 32 || c == 9 || c == 13 || c == 10) {
+                    nameEnd = scan; break;
+                }
+                scan = scan + 1;
+            }
+            string name = xml.Substring(open + 1, nameEnd - open - 1);
+            string close = "</" + name + ">";
+            int end = XmlUtil.IndexOf(xml, close, gt + 1);
+            if (end < 0 || end > xmlEnd) { break; }
+            string fieldValue = XmlUtil.StripCdata(xml.Substring(gt + 1,
+                                                   end - gt - 1));
+            result.Set(name, fieldValue);
+            pos = end + close.Length;
+        }
+        return result;
+    }
+
+    int Index(string name) {
+        for (int i = 0; i < this.fields.Count; i = i + 1) {
+            if (this.fields[i].name == name) { return i; }
+        }
+        return -1;
+    }
+
+    static int Compare(string a, string b) {
+        int n = a.Length;
+        if (b.Length < n) { n = b.Length; }
+        for (int i = 0; i < n; i = i + 1) {
+            int x = a[i] & 255; int y = b[i] & 255;
+            if (x < y) { return -1; }
+            if (x > y) { return 1; }
+        }
+        if (a.Length < b.Length) { return -1; }
+        if (a.Length > b.Length) { return 1; }
+        return 0;
+    }
+
+    static string Upper(string text) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c >= 97 && c <= 122) { c = c - 32; }
+            sb.Append(Encoding.CharFromCode(c));
+        }
+        return sb.ToString();
+    }
+}
+
+// 微信支付 V2 XML 客户端，支持普通 HTTPS 与退款/红包所需 mTLS。

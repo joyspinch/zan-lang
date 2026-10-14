@@ -1,0 +1,85 @@
+using System;
+using System.Collections.Generic;
+
+namespace Sdk.Wechat.TenPay;
+
+class WechatPayV2Client {
+
+    WechatPayV2Config config;
+    WechatApiTransport transport;
+    WechatApiTransport mutualTransport;
+
+    public WechatPayV2Client(WechatPayV2Config config) {
+        this.config = config;
+        this.transport = new WechatApiTransport("api.mch.weixin.qq.com");
+        this.mutualTransport = new WechatApiTransport("api.mch.weixin.qq.com");
+        if (config.ClientCertificateFile.Length > 0
+            && config.ClientPrivateKeyFile.Length > 0) {
+            this.mutualTransport.SetClientCertificate(config.ClientCertificateFile,
+                                                      config.ClientPrivateKeyFile);
+        }
+    }
+
+    WechatPayV2Client Server(string host, int port) {
+        this.transport.Server(host, port); this.mutualTransport.Server(host, port);
+        return this;
+    }
+    WechatPayV2Client Timeout(int ms) {
+        this.transport.Timeout(ms); this.mutualTransport.Timeout(ms); return this;
+    }
+    WechatPayV2Client SetCallPolicy(ExternalCallPolicy policy) {
+        this.transport.SetCallPolicy(policy);
+        this.mutualTransport.SetCallPolicy(policy);
+        return this;
+    }
+    ExternalCallPolicy CallPolicy() {
+        return this.transport.CallPolicy();
+    }
+
+    async WechatRawResponse RequestAsync(string path, WechatPayV2Request request,
+                                         bool requireClientCertificate) {
+        string xml = request.ToSignedXml(this.config);
+        return await this.RequestXmlAsync(path, xml, requireClientCertificate);
+    }
+
+    async WechatRawResponse RequestXmlAsync(string path, string signedXml,
+                                            bool requireClientCertificate) {
+        if (requireClientCertificate) {
+            if (this.config.ClientCertificateFile.Length == 0
+                || this.config.ClientPrivateKeyFile.Length == 0) {
+                throw new InvalidOperationException("此微信支付 V2 接口需要配置 PEM 客户端证书和私钥");
+            }
+            return await this.mutualTransport.RequestSimpleRawAsync("POST", path,
+                signedXml, "text/xml; charset=utf-8");
+        }
+        return await this.transport.RequestSimpleRawAsync("POST", path, signedXml,
+                                                     "text/xml; charset=utf-8");
+    }
+
+    bool VerifyResponse(string xml) {
+        return WechatPayV2Request.ParseXml(xml).Verify(this.config.MerchantKey);
+    }
+
+    string DecodeRefundReqInfo(string encryptedBase64) {
+        byte[] md5 = Md5.Hash(this.config.MerchantKey,
+                              this.config.MerchantKey.Length);
+        string key = Hex.Encode(md5, 16);
+        List<int> cipherLen = new List<int>(); cipherLen.Add(0);
+        byte[] encrypted = Base64.Decode(encryptedBase64, cipherLen);
+        if (encrypted == null || cipherLen[0] == 0 || (cipherLen[0] % 16) != 0) {
+            throw new ArgumentException("退款通知密文长度无效");
+        }
+        byte[] plain = new byte[cipherLen[0] + 1];
+        int off = 0;
+        while (off < cipherLen[0]) {
+            string block = encrypted.ToStr(off, 16);
+            byte[] decoded = Aes.DecryptBlockEcb(key, 32, block);
+            for (int j = 0; j < 16; j = j + 1) { plain[off + j] = decoded[j]; }
+            off = off + 16;
+        }
+        int resultLen = cipherLen[0];
+        int padding = plain[resultLen - 1] & 255;
+        if (padding >= 1 && padding <= 16) { resultLen = resultLen - padding; }
+        return plain.ToStr(0, resultLen);
+    }
+}

@@ -1,0 +1,508 @@
+using System;
+using System.Collections.Generic;
+
+namespace Mall.Feature;
+
+class MetricsStore {
+    static List<MinuteBucket> buckets = new List<MinuteBucket>();
+    static List<MetricError> errors = new List<MetricError>();
+    /* 待写入的 SQL 模板聚合（按模板聚合，每个慢查询只累加一次）。 */
+    static List<MetricSql> sqlBuckets = new List<MetricSql>();
+    /* 未刷新桶数上限，超出则丢弃最旧记录。 */
+    static int MaxBuckets = 8192;
+    static int MaxErrors = 4096;
+    /* 内存 SQL 模板数上限，超出时折叠为"其他语句"。 */
+    static int MaxSqlShapes = 512;
+    static string OtherSql = "(其他语句)";
+    static DbPool pool = null;
+    static bool ready = false;
+    static bool flushing = false;
+    static long lastSweep = 0;
+
+    /* 历史库是否就绪：不就绪时查询端（告警评估等）直接空手而回。 */
+    static bool Ready() { return MetricsStore.ready; }
+
+    /* 初始化 metrics.db，创建表并启动后台刷新；失败时继续运行但不记历史。 */
+    static async bool Start() {
+        if (!Cfg.Metrics.enabled) { return false; }
+        Db.EnsureFileDir(Cfg.Metrics.path);
+        MetricsStore.pool = SqliteConnector.Pool(Cfg.Metrics.path, 1);
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return false; }
+        try {
+            /* WAL 模式：刷新写入时历史界面仍可读取。 */
+            await DbSchema.UseWriteAheadLogAsync(db);
+            /* 旧版使用不同键（route 列 + 毫秒单位），新表独立创建，旧数据归档为 _legacy。 */
+            await MetricsStore.RetireLegacyMinutes(db);
+            /* CodeFirst 建表/加列/建索引；SQL 统计按天聚合，分钟仅用于刷新时机。 */
+            await db.SyncStructureAsync<MetricMinute>();
+            await db.SyncStructureAsync<MetricError>();
+            await db.SyncStructureAsync<MetricSql>();
+            await db.SyncStructureAsync<MetricLive>();
+        } finally {
+            MetricsStore.Give(db);
+        }
+        MetricsStore.ready = true;
+        return true;
+    }
+
+    static async IDbConnection Lease() {
+        if (MetricsStore.pool == null) { return null; }
+        IDbConnection db = await MetricsStore.pool.AcquireAsync();
+        if (db == null || !db.IsConnected()) {
+            MetricsStore.pool.Release(db);
+            return null;
+        }
+        return db;
+    }
+
+    static void Give(IDbConnection db) {
+        if (MetricsStore.pool == null || db == null) { return; }
+        MetricsStore.pool.Release(db);
+    }
+
+    /* 截断到分钟的 epoch 秒。 */
+    static long Minute(long sec) { return sec - (sec % 60); }
+
+    /* 截断到午夜的 epoch 秒。 */
+    static long Day(long sec) { return sec - (sec % 86400); }
+
+    /* 检测并重命名旧版 metrics_minute 表（按 route 或 total_ms 列判断），归档为 _legacy。 */
+    static async void RetireLegacyMinutes(IDbConnection db) {
+        try {
+            bool exists = await DbSchema.TableExistsAsync(db,
+                MetricMinuteCols.Table);
+            if (!exists) { return; }
+            /* 通过 route 或 total_ms 列判断是否为旧版表结构。 */
+            List<string> gone = new List<string> { "route", "total_ms" };
+            bool old = await DbSchema.HasAnyColumnAsync(db,
+                MetricMinuteCols.Table, gone);
+            if (!old) { return; }
+            await DbSchema.RenameTableAsync(db, MetricMinuteCols.Table,
+                MetricMinuteCols.Table + "_legacy");
+            Console.WriteLine("[metrics] history schema changed: previous "
+                + "rows kept in metrics_minute_legacy");
+        } catch (Exception ex) {
+            /* 检查失败不影响服务启动。 */
+            Console.WriteLine("[metrics] legacy history check failed: "
+                + ex.Message);
+        }
+    }
+
+    /* 首次有数据可刷新时启动后台刷新协程，避免启动阶段阻塞。 */
+    static void Arm() {
+        if (MetricsStore.flushing || !MetricsStore.ready) { return; }
+        MetricsStore.flushing = true;
+        Task.Spawn(MetricsStore.Loop());
+        Task.Spawn(MetricsCluster.Loop());
+    }
+
+    /* 获取当前分钟的桶，不存在则创建。 */
+    static MinuteBucket Bucket(string method, string path) {
+        MetricsStore.Arm();
+        long m = MetricsStore.Minute((long)WebApp.NowSeconds());
+        int n = MetricsStore.buckets.Count;
+        /* 当前分钟桶位于列表末尾，倒序查找即可。 */
+        for (int i = n - 1; i >= 0; i = i - 1) {
+            MinuteBucket b = MetricsStore.buckets[i];
+            if (b.row.minute != m) { break; }
+            if (b.row.method == method && b.row.path == path) { return b; }
+        }
+        MinuteBucket b2 = new MinuteBucket();
+        b2.row = new MetricMinute();
+        b2.row.minute = m;
+        b2.row.method = method;
+        b2.row.path = path;
+        /* 直方图与 ServerMetrics 实时序列同一套档位：同一耗时口径，
+           屏上实时 P95 与这里落库的 P95 可互相对照。 */
+        b2.hist = new long[ServerMetrics.HIST_BINS];
+        MetricsStore.buckets.Add(b2);
+        while (MetricsStore.buckets.Count > MetricsStore.MaxBuckets) {
+            MetricsStore.buckets.RemoveAt(0);
+        }
+        return b2;
+    }
+
+    /* 记录一次请求完成（含状态码与耗时）。 */
+    static void Record(string method, string path, int status, long us) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MinuteBucket b = MetricsStore.Bucket(method, path);
+        b.row.calls = b.row.calls + 1;
+        b.row.totalUs = b.row.totalUs + us;
+        if (us > b.row.maxUs) { b.row.maxUs = us; }
+        if (status >= 500) { b.row.errors = b.row.errors + 1; }
+        int bin = ServerMetrics.HistBin(us);
+        b.hist[bin] = b.hist[bin] + 1;
+    }
+
+    /* 长连接以推送帧数/字节计量，不计耗时。 */
+    static void Pushed(string method, string path, long frames, long bytes) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MinuteBucket b = MetricsStore.Bucket(method, path);
+        b.row.frames = b.row.frames + frames;
+        b.row.bytes = b.row.bytes + bytes;
+    }
+
+    /* 记录一条 SQL 执行结果，累加到当天模板聚合中。SQL 已规范化，耗时单位微秒。 */
+    static void RecordSql(string norm, long us, bool slow) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricsStore.Arm();
+        MetricSql e = MetricsStore.SqlEntry(norm);
+        e.calls = e.calls + 1;
+        e.totalUs = e.totalUs + us;
+        if (us > e.maxUs) { e.maxUs = us; }
+        if (slow) { e.slow = e.slow + 1; }
+    }
+
+    /* 获取今日 SQL 模板聚合项，上限超出则折叠为"其他语句"。 */
+    static MetricSql SqlEntry(string norm) {
+        long d = MetricsStore.Day((long)WebApp.NowSeconds());
+        for (int i = MetricsStore.sqlBuckets.Count - 1; i >= 0; i = i - 1) {
+            MetricSql e = MetricsStore.sqlBuckets[i];
+            if (e.day == d && e.sql == norm) { return e; }
+        }
+        if (MetricsStore.sqlBuckets.Count >= MetricsStore.MaxSqlShapes) {
+            for (int i = 0; i < MetricsStore.sqlBuckets.Count; i = i + 1) {
+                MetricSql o = MetricsStore.sqlBuckets[i];
+                if (o.day == d && o.sql == MetricsStore.OtherSql) { return o; }
+            }
+            norm = MetricsStore.OtherSql;
+        }
+        MetricSql n = new MetricSql();
+        n.day = d;
+        n.sql = norm;
+        MetricsStore.sqlBuckets.Add(n);
+        return n;
+    }
+
+    /* 向错误队列添加一条错误记录。 */
+    static void Failed(long ts, string origin, string detail) {
+        if (!Cfg.Metrics.enabled) { return; }
+        MetricError e = new MetricError();
+        e.ts = ts;
+        e.origin = origin;
+        e.detail = detail;
+        MetricsStore.errors.Add(e);
+        while (MetricsStore.errors.Count > MetricsStore.MaxErrors) {
+            MetricsStore.errors.RemoveAt(0);
+        }
+    }
+
+    /* 直方图 P95：第 95 百分位所在档位的上沿（微秒）；末档没有上沿，
+       用实测最慢值兜底。档位粒度是买的确定性的价格：每次请求一次增量，
+       不留样本、不排序。 */
+    static long HistP95(long[] hist, long calls, long maxUs) {
+        if (calls <= 0) { return 0; }
+        long cut = calls * 95 / 100;
+        if (cut < 1) { cut = 1; }
+        long acc = 0;
+        for (int b = 0; b < ServerMetrics.HIST_BINS; b = b + 1) {
+            acc = acc + hist[b];
+            if (acc >= cut) {
+                if (b >= ServerMetrics.HIST_BINS - 1) { return maxUs; }
+                return ServerMetrics.HistEdge(b);
+            }
+        }
+        return maxUs;
+    }
+
+    /* 后台刷新协程：每秒检查一次，到达间隔或数量阈值时刷新。 */
+    static async void Loop() {
+        int waited = 0;
+        while (true) {
+            await Task.Delay(1000);
+            waited = waited + 1;
+            bool due = waited >= Cfg.Metrics.flushSeconds;
+            bool full = MetricsStore.buckets.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.errors.Count >= Cfg.Metrics.flushRows
+                || MetricsStore.sqlBuckets.Count >= Cfg.Metrics.flushRows;
+            if (!due && !full) { continue; }
+            waited = 0;
+            await MetricsStore.Flush();
+        }
+    }
+
+    /* 事务性刷新所有缓冲数据，当前分钟也写入以防进程退出丢失。 */
+    static async int Flush() {
+        if (!MetricsStore.ready) { return 0; }
+        if (MetricsStore.buckets.Count == 0 && MetricsStore.errors.Count == 0
+            && MetricsStore.sqlBuckets.Count == 0) {
+            return 0;
+        }
+        List<MetricMinute> mine = new List<MetricMinute>();
+        for (int i = 0; i < MetricsStore.buckets.Count; i = i + 1) {
+            MinuteBucket b = MetricsStore.buckets[i];
+            b.row.p95Us = MetricsStore.HistP95(b.hist, b.row.calls,
+                b.row.maxUs);
+            mine.Add(b.row);
+        }
+        List<MetricError> errs = MetricsStore.errors;
+        List<MetricSql> sqls = MetricsStore.sqlBuckets;
+        MetricsStore.buckets = new List<MinuteBucket>();
+        MetricsStore.errors = new List<MetricError>();
+        MetricsStore.sqlBuckets = new List<MetricSql>();
+
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return 0; }
+        int written = 0;
+        try {
+            await db.BeginTransactionAsync();
+            /* 写入时按复合键合并：冲突时累加计数器、取最大 maxUs，最终每桶一行。 */
+            if (mine.Count > 0) {
+                written = written + await db.Insert<MetricMinute>(mine)
+                    .OnConflict(a => new { a.minute, a.method, a.path })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.errors)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .SetMax(a => a.p95Us)
+                    .SetIncr(a => a.frames)
+                    .SetIncr(a => a.bytes)
+                    .ExecuteAffrowsAsync();
+            }
+            /* 按 (day, sql) 合并，所有工作进程累积到同一行。 */
+            if (sqls.Count > 0) {
+                written = written + await db.Insert<MetricSql>(sqls)
+                    .OnConflict(a => new { a.day, a.sql })
+                    .SetIncr(a => a.calls)
+                    .SetIncr(a => a.slow)
+                    .SetIncr(a => a.totalUs)
+                    .SetMax(a => a.maxUs)
+                    .ExecuteAffrowsAsync();
+            }
+            /* 错误为事件记录，每条独立一行。 */
+            if (errs.Count > 0) {
+                written = written + await db.Insert<MetricError>(errs)
+                    .ExecuteAffrowsAsync();
+            }
+            await db.CommitAsync();
+            await MetricsStore.Sweep(db);
+        } catch (Exception ex) {
+            await db.RollbackAsync();
+            /* 刷新失败不回滚请求，且错误记录器自身不递归。 */
+            Console.WriteLine("[metrics] flush failed: " + ex.Message);
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return written;
+    }
+
+    /* 按保留天数清理过期数据，每小时最多执行一次。 */
+    static async void Sweep(IDbConnection db) {
+        long now = (long)WebApp.NowSeconds();
+        if (now - MetricsStore.lastSweep < 3600) { return; }
+        MetricsStore.lastSweep = now;
+        long cut = now - (long)Cfg.Metrics.keepDays * 86400;
+        long dayCut = MetricsStore.Day(cut);
+        int _a = await db.Delete<MetricMinute>()
+            .Where(a => a.minute < cut).ExecuteAffrowsAsync();
+        int _b = await db.Delete<MetricError>()
+            .Where(a => a.ts < cut).ExecuteAffrowsAsync();
+        int _c = await db.Delete<MetricSql>()
+            .Where(a => a.day < dayCut).ExecuteAffrowsAsync();
+    }
+
+    /* 查询窗口内 SQL 模板聚合，按调用/耗时/慢次数排序，数据库端聚合，无原始行入内存。 */
+    static async List<MetricSql> SqlTotals(long from, long to, int limit,
+                                           string rank) {
+        List<MetricSql> outp = new List<MetricSql>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        long a0 = MetricsStore.Day(from);
+        long b0 = MetricsStore.Day(to);
+        int order = 2;
+        if (rank == "time") {
+            order = 4;
+        } else if (rank == "slow") {
+            order = 3;
+        }
+        string sql = "SELECT sql, SUM(calls), SUM(slow), SUM(total_us), "
+            + "MAX(max_us) FROM metrics_sql_day "
+            + "WHERE day >= ? AND day <= ? "
+            + "GROUP BY sql ORDER BY " + Convert.ToString(order)
+            + " DESC LIMIT " + Convert.ToString(limit);
+        DbParams prms = new DbParams().AddLong(a0).AddLong(b0);
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricSql e = new MetricSql();
+                e.day = a0;
+                e.sql = r.GetString(i, 0);
+                e.calls = r.GetLong(i, 1);
+                e.slow = r.GetLong(i, 2);
+                e.totalUs = r.GetLong(i, 3);
+                e.maxUs = r.GetLong(i, 4);
+                outp.Add(e);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 聚合历史：按 stepSec 分桶（分钟/小时/天），可按 method/path 过滤。 */
+    static async List<MetricMinute> HistoryBuckets(long from, long to,
+                                                    string method, string path,
+                                                    long stepSec, int limit) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        if (stepSec < 1) { stepSec = 60; }
+        string sql = "SELECT minute - (minute % " + Convert.ToString(stepSec)
+            + "), SUM(calls), SUM(errors), SUM(total_us), MAX(max_us), "
+            + "MAX(p95_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY minute - (minute % "
+            + Convert.ToString(stepSec) + ") ORDER BY 1 DESC LIMIT "
+            + Convert.ToString(limit);
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute b = new MetricMinute();
+                b.minute = r.GetLong(i, 0);
+                b.method = method;
+                b.path = path;
+                b.calls = r.GetLong(i, 1);
+                b.errors = r.GetLong(i, 2);
+                b.totalUs = r.GetLong(i, 3);
+                b.maxUs = r.GetLong(i, 4);
+                b.p95Us = r.GetLong(i, 5);
+                b.frames = r.GetLong(i, 6);
+                b.bytes = r.GetLong(i, 7);
+                outp.Add(b);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 窗口内按接口聚合，按调用次数排序。 */
+    static async List<MetricMinute> RouteTotals(long from, long to,
+                                                string method, string path,
+                                                int limit) {
+        return await MetricsStore.RouteTotalsBy(from, to, method, path, limit,
+            "calls");
+    }
+
+    /* 按接口聚合，可按调用次数或耗时排序。 */
+    static async List<MetricMinute> RouteTotalsBy(long from, long to,
+                                                  string method, string path,
+                                                  int limit, string rank) {
+        List<MetricMinute> outp = new List<MetricMinute>();
+        int firstOrder = 3;
+        int secondOrder = 5;
+        if (rank == "time") {
+            firstOrder = 5;
+            secondOrder = 3;
+        }
+        string sql = "SELECT method, path, SUM(calls), SUM(errors), "
+            + "SUM(total_us), MAX(max_us), MAX(p95_us), SUM(frames), "
+            + "SUM(bytes) FROM metrics_minute WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        sql = sql + " GROUP BY method, path ORDER BY "
+            + Convert.ToString(firstOrder) + " DESC, "
+            + Convert.ToString(secondOrder) + " DESC LIMIT "
+            + Convert.ToString(limit);
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            for (int i = 0; i < r.RowCount(); i = i + 1) {
+                MetricMinute e = new MetricMinute();
+                e.minute = 0;
+                e.method = r.GetString(i, 0);
+                e.path = r.GetString(i, 1);
+                e.calls = r.GetLong(i, 2);
+                e.errors = r.GetLong(i, 3);
+                e.totalUs = r.GetLong(i, 4);
+                e.maxUs = r.GetLong(i, 5);
+                e.p95Us = r.GetLong(i, 6);
+                e.frames = r.GetLong(i, 7);
+                e.bytes = r.GetLong(i, 8);
+                outp.Add(e);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+
+    /* 窗口整体汇总（单次聚合行，无数据时各字段为 0）。 */
+    static async MetricMinute WindowTotals(long from, long to, string method,
+                                           string path) {
+        MetricMinute b = new MetricMinute();
+        b.minute = from;
+        b.method = method;
+        b.path = path;
+        if (!MetricsStore.ready) { return b; }
+        string sql = "SELECT SUM(calls), SUM(errors), SUM(total_us), "
+            + "MAX(max_us), SUM(frames), SUM(bytes) FROM metrics_minute "
+            + "WHERE minute >= ? AND minute <= ?";
+        DbParams prms = new DbParams().AddLong(from).AddLong(to);
+        if (method.Length > 0) {
+            sql = sql + " AND method = ?";
+            prms.Add(method);
+        }
+        if (path.Length > 0) {
+            sql = sql + " AND path = ?";
+            prms.Add(path);
+        }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return b; }
+        try {
+            DbResult r = await db.QueryAsync(sql, prms);
+            if (r.RowCount() > 0) {
+                b.calls = r.GetLong(0, 0);
+                b.errors = r.GetLong(0, 1);
+                b.totalUs = r.GetLong(0, 2);
+                b.maxUs = r.GetLong(0, 3);
+                b.frames = r.GetLong(0, 4);
+                b.bytes = r.GetLong(0, 5);
+            }
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return b;
+    }
+
+    /* 查询持久化的错误记录，按时间倒序。 */
+    static async List<MetricError> Errors(long from, long to, int limit) {
+        List<MetricError> outp = new List<MetricError>();
+        if (!MetricsStore.ready) { return outp; }
+        IDbConnection db = await MetricsStore.Lease();
+        if (db == null) { return outp; }
+        try {
+            outp = await db.Select<MetricError>()
+                .Where(a => a.ts >= from && a.ts <= to)
+                .OrderByDescending(a => a.id)
+                .Limit(limit)
+                .ToListAsync();
+        } finally {
+            MetricsStore.Give(db);
+        }
+        return outp;
+    }
+}
+
+/* 聚合所有工作进程的实时指标：各 worker 独立发布，读取端合并。 */
