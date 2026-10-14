@@ -8,7 +8,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `Path.zan` / `PathEx.zan` | 路径组合/解析与扩展（判扩展名、规范化） |
+| `Path.zan` | 路径组合/解析与扩展（判扩展名、规范化、Glob匹配） |
 | `MemoryStream.zan` | 内存流（Stream 公共基类的内存实现） |
 | `StreamReader.zan` / `StreamWriter.zan` | 文本读写流 |
 | `MemoryMappedFile.zan` | 内存映射文件 |

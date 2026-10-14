@@ -104,7 +104,6 @@ stdlib/
 │   │   ├── MemoryStream.zan         # in-memory stream
 │   │   ├── ByteBuffer.zan           # growable byte buffer
 │   │   ├── FileInfo.zan / FileInfoEx.zan
-│   │   ├── PathEx.zan               # extended path helpers
 │   │   ├── DirectoryTree.zan        # directory tree enumeration
 │   │   ├── Watch/                   # System.IO.Watch — DirectoryWatcher
 │   │   │                            # (separate namespace: it needs a
