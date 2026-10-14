@@ -1,0 +1,85 @@
+// Redis（RESP 协议，FreeRedis 风格强类型客户端）—— 缓存、哈希、列表、集合与排行榜示例
+// 演示内容：
+// 1. FreeRedis 规范连接：支持连接字符串 "127.0.0.1:6379,poolsize=10" 自动池化
+// 3. 哈希：HSetAsync / HGetAsync / HGetAllAsync（告别手动拼 HSET / HGET 命令）
+// 4. 列表：RPushAsync / LRangeAsync（直接返回 List<string>）
+// 5. 集合与有序集合：SAddAsync / SMembersAsync / ZAddAsync / ZRangeWithScoresAsync
+// 6. 典型缓存模式：cache-aside（先查缓存，未命中回源再回填 + 过期时间）
+// 说明：本示例需要一个可连接的 Redis。没有可用服务时会打印提示并跳过。
+// 准备：docker run -p 6379:6379 redis:7
+using System;
+using System.Collections.Generic;
+using System.Data.Redis;
+
+class RedisCacheProgram {
+    // cache-aside：命中直接返回；未命中"回源"（这里模拟为计算）后回填并设过期。
+    static async string LoadUserName(RedisClient r, int userId) {
+        string key = "user:" + Convert.ToString(userId) + ":name";
+        string cached = await r.GetAsync(key);
+        if (cached != null && cached.Length > 0) { return cached + " (cache)"; }
+        string fresh = "Alice#" + Convert.ToString(userId);  // 假装查了数据库
+        bool ok = await r.SetAsync(key, fresh, 60);  // 60 秒过期原子设置
+        return fresh + " (db)";
+    }
+
+    static async int Run() {
+        // ---- 1. 连接（FreeRedis 规范，自动池化） ---------------------------------
+        RedisClient r = new RedisClient("127.0.0.1:6379,poolsize=10");
+        bool alive = await r.PingAsync();
+        if (!alive) {
+            Console.WriteLine("Redis 未就绪，跳过示例。启动方法: docker run -p 6379:6379 redis:7");
+            return 0;
+        }
+
+        // ---- 2. 字符串：SET / GET / EXISTS / DEL ---------------------------------
+        await r.SetAsync("greeting", "你好, Zan!");
+        Console.WriteLine("get: " + await r.GetAsync("greeting"));
+        Console.WriteLine("exists: " + Convert.ToString(await r.ExistsAsync("greeting")));
+        Console.WriteLine("del: " + Convert.ToString(await r.DelAsync("greeting")));
+
+        // ---- 3. 计数器：INCR + EXPIRE（限流、PV 统计的基本件） -------------------
+        await r.DelAsync("page:home:pv");
+        Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
+        Console.WriteLine("pv: " + Convert.ToString(await r.IncrAsync("page:home:pv")));
+        await r.ExpireAsync("page:home:pv", 3600);
+
+        // ---- 4. 哈希：强类型调用，彻底告别手拼命令 ------------------------------
+        await r.HSetAsync("user:1", "name", "Alice");
+        await r.HSetAsync("user:1", "age", "30");
+        string age = await r.HGetAsync("user:1", "age");
+        Console.WriteLine("hget age: " + age);
+
+        Dictionary<string, string> userMap = await r.HGetAllAsync("user:1");
+        Console.WriteLine("hgetall: name=" + userMap["name"] + ", age=" + userMap["age"]);
+
+        // ---- 5. 列表：RPushAsync 与 LRangeAsync 直接获取 List<string> -----------
+        await r.RPushAsync("queue:jobs", "job-a");
+        await r.RPushAsync("queue:jobs", "job-b");
+        List<string> jobs = await r.LRangeAsync("queue:jobs", 0, -1);
+        Console.WriteLine("jobs: " + Convert.ToString(jobs.Count) + " first=" + jobs[0]);
+
+        // ---- 6. 有序集合与排行榜 (ZSet) -------------------------------------------
+        await r.ZAddAsync("leaderboard", 100.0, "player-tom");
+        await r.ZAddAsync("leaderboard", 95.5, "player-jerry");
+        List<ZMember> top = await r.ZRevRangeWithScoresAsync("leaderboard", 0, 5);
+        if (top.Count > 0) {
+            Console.WriteLine("top player: " + top[0].member + " score=" + Convert.ToString(top[0].score));
+        }
+
+        // ---- 7. cache-aside 模式 ---------------------------------------------------
+        await r.DelAsync("user:42:name");
+        Console.WriteLine("first : " + await LoadUserName(r, 42));  // 未命中 -> db
+        Console.WriteLine("second: " + await LoadUserName(r, 42));  // 命中 -> cache
+
+        // ---- 清理 -------------------------------------------------------------------
+        List<string> cleanup = new List<string>{ "page:home:pv", "user:1", "queue:jobs", "user:42:name", "leaderboard" };
+        await r.DelMultipleAsync(cleanup);
+        r.Close();
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

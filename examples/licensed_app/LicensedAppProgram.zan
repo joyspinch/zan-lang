@@ -1,0 +1,87 @@
+using System;
+using System.Commercial;
+using System.IO;
+
+/* licensed_app.zan -- 商业成品软件接入授权 SDK 的最小完整示例。
+ *
+ * 演示 C 端成品软件的标准接入姿势（约五行核心）：
+ *   1. LicenseClient.Shared() 拿共享客户端；
+ *   2. Server()/Product() 指向部署好的授权服务端与产品标识；
+ *   3. Check() 总校验：本地状态在宽限期内直接放行（离线可用），
+ *      本地无授权则提示用户激活/登录；
+ *   4. 激活码 Activate("XXXX-XXXX-XXXX-XXXX") 或账号密码 Login()；
+ *   5. 运行期可定期 Heartbeat() 占座，登出 LogoutOnline() 释放座位。
+ *
+ * 编译运行（在仓库根目录，配 templates/server/server-licensing 使用）：
+ *
+ *   build/zanc.exe examples/licensed_app/licensed_app.zan --auto-stdlib -o licensed_app.exe
+ *   ./licensed_app.exe http:  // 127.0.0.1:8096 demo-app
+ *
+ * 服务端模板自带种子产品 demo-app 与演示激活码 ZPQ-D1QJ-M8RR-K3SA（30 天）/
+ * ETJ-3FGW-HG62-UU1D（终身）；管理后台 /admin 可发放更多（admin/admin1234）。
+ */
+class LicensedAppProgram {
+    static async void Main() {
+        string server = "http://127.0.0.1:8096";
+        string product = "demo-app";
+        if (Environment.ArgCount() > 0) { server = Environment.ArgAt(0); }
+        if (Environment.ArgCount() > 1) { product = Environment.ArgAt(1); }
+
+        LicenseClient lic = LicenseClient.Shared();
+        lic.Server(server, "ZanSoft");
+        lic.Product(product);
+
+        /* 1) 启动总校验：本地授权在宽限期内即放行，无网也能跑。 */
+        LicenseCheckResult r = await lic.Check();
+        if (r.ok) {
+            Console.WriteLine("[licensed_app] 授权有效：mode=" + r.reason);
+            LicensedMain();
+            return;
+        }
+        Console.WriteLine("[licensed_app] 未授权：" + r.message);
+
+        /* 2) 交互式激活：输入 A 用激活码，输入 L 用账号密码。 */
+        Console.Write("激活方式 A=激活码 / L=账号密码（回车退出）> ");
+        /* 管道/控制台两种输入都按去掉首尾空白比较与上送。 */
+        string choice = Console.ReadLine().Trim();
+        if (choice == "A" || choice == "a") {
+            Console.Write("激活码（形如 XXXX-XXXX-XXXX-XXXX）> ");
+            string code = Console.ReadLine().Trim();
+            r = await lic.Activate(code);
+        } else if (choice == "L" || choice == "l") {
+            Console.Write("账号 > ");
+            string account = Console.ReadLine().Trim();
+            Console.Write("密码 > ");
+            string password = Console.ReadLine().Trim();
+            r = await lic.Login(account, password);
+        } else {
+            Console.WriteLine("[licensed_app] 未激活，退出。");
+            return;
+        }
+        if (!r.ok) {
+            Console.WriteLine("[licensed_app] 激活失败：" + r.message);
+            return;
+        }
+        Console.WriteLine("[licensed_app] 激活成功，进入主功能。");
+        LicensedMain();
+    }
+
+    /* 激活后才允许进入的业务主体。真实软件里这里之后就是你的窗口/主循环；
+       本示例只展示授权有效期并演示一次心跳与登出。 */
+    static async void LicensedMain() {
+        LicenseClient lic = LicenseClient.Shared();
+        LicenseCheckResult r = await lic.Heartbeat();
+        if (r.ok) {
+            string life = r.expiresAt == 0 ? "终身"
+                : "至 epoch " + Convert.ToString(r.expiresAt);
+            Console.WriteLine("[licensed_app] 心跳 OK，授权 " + life
+                + "，宽限 " + Convert.ToString(r.graceSeconds) + "s");
+        } else {
+            Console.WriteLine("[licensed_app] 心跳失败：" + r.message);
+        }
+
+        /* 心跳失败不再满足授权时，应用应回到激活界面（此处省略 UI）。 */
+        LicenseCheckResult quit = await lic.LogoutOnline();
+        Console.WriteLine("[licensed_app] " + quit.message);
+    }
+}

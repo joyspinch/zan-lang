@@ -1,0 +1,95 @@
+// WebSocket —— 服务端 + 客户端双向通信完整示例
+// WebSocket 在一次 HTTP 握手后升级为全双工二进制帧协议，
+// 适合聊天、协同编辑、游戏等需要"双向、低延迟、长连接"的场景。
+// 服务端唯一宿主是 Worker：Worker("websocket")（或注册了 onMessage 的
+// "http" worker，同端口双协议）自带握手、帧编解码、ping/pong 与分片重组。
+// 未注册 onMessage 时默认按 echo 应答，注册回调即可写业务逻辑。
+// 演示内容：
+// 单进程模式直接驱动（RunAll 会打印 banner，示例输出要干净）
+// 2. WebSocketClient.ConnectAsync(host, port, path)：客户端握手
+// 3. SendText / RecvText：文本帧收发
+// 4. Ping：心跳（服务端自动回 pong，对应用透明）
+// 5. Close：发送关闭帧，优雅断开
+// 6. 多客户端并发连接同一服务端
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSocket;
+using System.Threading;
+
+class WebsocketChatProgram {
+    static int PORT = 54451;
+    static int CLIENTS = 2;
+    static int doneCount = 0;
+
+    // Worker 的 WS 消息回调：返回值编码成帧发回客户端。
+    // 这里实现群聊广播的极简版：把发送者 id 拼进消息再回显。
+    static async string ChatEcho(Connection conn, string message) {
+        return "client#" + Convert.ToString(conn.GetId()) + " " + message;
+    }
+
+    // ---- 客户端协程 ----------------------------------------------------------
+    static async void Client(int id) {
+        // 握手：发送 HTTP Upgrade 请求，校验 101 响应
+        WebSocketClient c = await WebSocketClient.ConnectAsync(
+            "127.0.0.1", PORT, "/chat");
+        if (!c.IsConnected()) {
+            Console.WriteLine("client " + Convert.ToString(id) + ": handshake failed");
+            doneCount = doneCount + 1;
+            return;
+        }
+
+        // 发一条消息，等服务端回调加工后的回文。
+        for (int m = 0; m < 2; m = m + 1) {
+            string msg = "msg-" + Convert.ToString(id) + "-" + Convert.ToString(m);
+            await c.SendText(msg);
+            string reply = await c.RecvText();  // 挂起直到收到文本帧
+            Console.WriteLine("client " + Convert.ToString(id)
+                + " got [" + reply + "]");
+        }
+
+        // 心跳：Ping 帧由服务端自动应答 Pong，
+        // 生产环境用定时 Ping 检测半开连接（对端悄悄消失）。
+        await c.Ping();
+
+        // 优雅关闭：发送 Close 帧后再断 TCP
+        await c.Close();
+        doneCount = doneCount + 1;
+    }
+
+    static async int Run() {
+        Socket.Initialize();
+
+        // 服务端：握手 + 帧编解码全在 Worker。"websocket" 协议的 worker
+        // 在升级前是普通 HTTP 端口——不带 Sec-WebSocket-Key 的请求走
+        // HTTP 循环，携带该头的请求进入帧循环（swoole 的 WebSocket\Server
+        // 同款）。未注册 onMessage 时每条消息默认 echo。
+        Worker server = new Worker("websocket", "127.0.0.1", PORT);
+        server.onMessage = WebsocketChatProgram.ChatEcho;
+        WorkerWs.Install();  // ws 编解码 opt-in，按需载入编译图
+        nint listenSock = server.BindSocket(false);
+        if (listenSock < 0) {
+            Console.WriteLine("bind failed");
+            return 1;
+        }
+        List<nint> socks = new List<nint>();
+        socks.Add(listenSock);
+        Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
+        await Task.Delay(50);
+
+        for (int i = 0; i < CLIENTS; i = i + 1) {
+            Task.Spawn(Client(i));
+        }
+        while (doneCount < CLIENTS) { await Task.Delay(10); }
+
+        server.Stop();
+        // 让 accept 循环与连接协程收干净再退出。
+        for (int i = 0; i < 20; i = i + 1) { await Task.Delay(10); }
+        Console.WriteLine("done");
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}
