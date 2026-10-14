@@ -37,7 +37,8 @@ if (-not $WorkDir) { $WorkDir = Join-Path $toolDir '_knowledge_work' }
 # ---- API index (symbols.json) via RepoMap over the shipped stdlib ----------
 if (Test-Path $RepomapSrc) {
   $repomapExe = Join-Path $toolDir 'repomap.exe'
-  & $Zanc $RepomapSrc --auto-stdlib -o $repomapExe
+  $repomapSources = @(Get-ChildItem -Path (Split-Path -Parent $RepomapSrc) -Filter *.zan -Recurse | Select-Object -ExpandProperty FullName)
+  & $Zanc $repomapSources --auto-stdlib -o $repomapExe
   if ($LASTEXITCODE -eq 0 -and (Test-Path $repomapExe)) {
     # RepoMap writes <cwd>\.zanmap\symbols.json; run it against the shipped
     # stdlib from a scratch cwd, then lift the index into knowledge\.
