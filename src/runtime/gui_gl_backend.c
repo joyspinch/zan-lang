@@ -1482,8 +1482,18 @@ static zgl_uint zgl_bitmap_tex(const zan_bitmap *img) {
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_S, ZGL_CLAMP_TO_EDGE);
     gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_WRAP_T, ZGL_CLAMP_TO_EDGE);
     gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, img->stride);
-    gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->width, img->height, 0,
-                  ZGL_BGRA, ZGL_UNSIGNED_BYTE, img->pixels);
+    if (g_zgl.is_gles) {
+        /* ES 核心没有 BGRA 上传格式：按 RGBA 读入（字节序 B,G,R,A 落成
+         * R=B、B=R），再用纹理分量交换把红蓝换回。桌面 GL 直接 BGRA。 */
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_SWIZZLE_R, ZGL_BLUE);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_SWIZZLE_G, ZGL_GREEN);
+        gl.TexParameteri(ZGL_TEXTURE_2D, ZGL_TEXTURE_SWIZZLE_B, ZGL_RED);
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->width, img->height, 0,
+                      ZGL_RGBA, ZGL_UNSIGNED_BYTE, img->pixels);
+    } else {
+        gl.TexImage2D(ZGL_TEXTURE_2D, 0, ZGL_RGBA8, img->width, img->height, 0,
+                      ZGL_BGRA, ZGL_UNSIGNED_BYTE, img->pixels);
+    }
     gl.PixelStorei(ZGL_UNPACK_ROW_LENGTH, 0);
     if (gl.GetError() != ZGL_NO_ERROR) { gl.DeleteTextures(1, &tex); return 0; }
     g_bitmap_textures[slot].serial = img->serial;

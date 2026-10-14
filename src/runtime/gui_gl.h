@@ -38,6 +38,11 @@ typedef float         zgl_float;
 #define ZGL_RGBA                         0x1908
 #define ZGL_BGRA                         0x80E1
 #define ZGL_RED                          0x1903
+#define ZGL_GREEN                        0x1904
+#define ZGL_BLUE                         0x1905
+#define ZGL_TEXTURE_SWIZZLE_R            0x8E42
+#define ZGL_TEXTURE_SWIZZLE_G            0x8E43
+#define ZGL_TEXTURE_SWIZZLE_B            0x8E44
 #define ZGL_R8                           0x8229
 #define ZGL_RGBA8                        0x8058
 #define ZGL_NEAREST                      0x2600

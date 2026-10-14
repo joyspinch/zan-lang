@@ -46,7 +46,7 @@ function Invoke-GameTests {
         if ($LASTEXITCODE -ne 0) {
             throw "Game program failed: $($case.Name)"
         }
-        $expected = Get-Content -LiteralPath (
+        $expected = Get-Content -Encoding UTF8 -LiteralPath (
             Join-Path $TestRoot ($base + ".out")) -Raw
         $actualNorm = (($actual -replace "`r`n", "`n").TrimEnd())
         $expectedNorm = (($expected -replace "`r`n", "`n").TrimEnd())

@@ -3,6 +3,7 @@
 #include "zan_image.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #define ZAN_GAME_SPRITE_CAP 4096
@@ -144,11 +145,29 @@ static const zan_bitmap g_game_white = {
     &g_game_white_pixel, 1, 1, 1, UINT64_C(1)
 };
 
+/* GLSL 方言头：桌面 GL 用 330 core；GLES（Android/OHOS/EGL）用 300 es，
+ * 片元着色器没有默认浮点精度，必须补 highp 声明。判别式与 gui_gl_backend
+ * 的 2D 程序一致（GL_VERSION 含 "OpenGL ES"；安卓/鸿蒙编译期即真）。
+ * 下面的着色器常量本体只放方言无关部分，建程序时拼上头。 */
+static const char ZAN_GAME_GLSL_HEAD_DESKTOP[] = "#version 330 core\n";
+static const char ZAN_GAME_GLSL_HEAD_GLES[] =
+    "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+
+static const char *zan_game_glsl_head(void) {
+#if defined(__ANDROID__) || defined(__OHOS__)
+    return ZAN_GAME_GLSL_HEAD_GLES;
+#else
+    if (!g_game_gl || !g_game_gl->GetString) return ZAN_GAME_GLSL_HEAD_DESKTOP;
+    const char *ver = (const char *)g_game_gl->GetString(ZGL_VERSION);
+    return (ver && strstr(ver, "OpenGL ES"))
+               ? ZAN_GAME_GLSL_HEAD_GLES : ZAN_GAME_GLSL_HEAD_DESKTOP;
+#endif
+}
+
 /* 属性位置常量与 VAO 配置一一对应（ZAN_GAME_LOC_*），四种变体共享同一
  * 网格 VAO。Y 翻转：3D 画进画布 FBO（顶朝下表面），clip 空间先翻 Y。 */
 
 static const char *const ZAN_GAME_3D_VS_PLAIN =
-"#version 330 core\n"
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 1) in vec3 a_normal;\n"
 "layout(location = 2) in vec2 a_uv;\n"
@@ -163,7 +182,6 @@ static const char *const ZAN_GAME_3D_VS_PLAIN =
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_COLOR =
-"#version 330 core\n"
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 1) in vec3 a_normal;\n"
 "layout(location = 2) in vec2 a_uv;\n"
@@ -181,7 +199,6 @@ static const char *const ZAN_GAME_3D_VS_COLOR =
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_INST =
-"#version 330 core\n"
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 1) in vec3 a_normal;\n"
 "layout(location = 2) in vec2 a_uv;\n"
@@ -199,7 +216,6 @@ static const char *const ZAN_GAME_3D_VS_INST =
 "}\n";
 
 static const char *const ZAN_GAME_3D_VS_INST_COLOR =
-"#version 330 core\n"
 "layout(location = 0) in vec3 a_pos;\n"
 "layout(location = 1) in vec3 a_normal;\n"
 "layout(location = 2) in vec2 a_uv;\n"
@@ -220,7 +236,6 @@ static const char *const ZAN_GAME_3D_VS_INST_COLOR =
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_PLAIN =
-"#version 330 core\n"
 "uniform sampler2D uTex;\n"
 "uniform vec4 uColor;\n"
 "in vec2 v_uv;\n"
@@ -234,7 +249,6 @@ static const char *const ZAN_GAME_3D_FS_PLAIN =
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_COLOR =
-"#version 330 core\n"
 "uniform sampler2D uTex;\n"
 "uniform vec4 uColor;\n"
 "in vec2 v_uv;\n"
@@ -250,7 +264,6 @@ static const char *const ZAN_GAME_3D_FS_COLOR =
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_INST =
-"#version 330 core\n"
 "uniform sampler2D uTex;\n"
 "in vec2 v_uv;\n"
 "in vec3 v_normal;\n"
@@ -264,7 +277,6 @@ static const char *const ZAN_GAME_3D_FS_INST =
 "}\n";
 
 static const char *const ZAN_GAME_3D_FS_INST_COLOR =
-"#version 330 core\n"
 "uniform sampler2D uTex;\n"
 "in vec2 v_uv;\n"
 "in vec3 v_normal;\n"
@@ -355,7 +367,14 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     const char *fs = instanced
         ? (colored ? ZAN_GAME_3D_FS_INST_COLOR : ZAN_GAME_3D_FS_INST)
         : (colored ? ZAN_GAME_3D_FS_COLOR : ZAN_GAME_3D_FS_PLAIN);
-    zgl_uint program = zan_gui_gpu_program(vs, fs);
+    /* 方言头 + 本体拼成完整源（缓冲按最长变体留足，截断只会导致
+     * 编译失败整体关停，不会带病运行）。 */
+    char vs_src[1600];
+    char fs_src[1600];
+    const char *head = zan_game_glsl_head();
+    snprintf(vs_src, sizeof(vs_src), "%s%s", head, vs);
+    snprintf(fs_src, sizeof(fs_src), "%s%s", head, fs);
+    zgl_uint program = zan_gui_gpu_program(vs_src, fs_src);
     if (!program) return NULL;
     zgl_int tex = g_game_gl->GetUniformLocation(program, "uTex");
     zgl_int pos = g_game_gl->GetAttribLocation(program, "a_pos");
