@@ -26,7 +26,6 @@ if (-not (Test-Path $chartDir)) {
 }
 $files += (Get-ChildItem $chartDir\*.zan).FullName
 $files += (Get-ChildItem examples\gui_charts\*.zan).FullName
-$files += (Join-Path (Get-Location) "examples\gui_gallery\MapChinaData.zan")
 
 $zanArgs = @()
 $zanArgs += $files
