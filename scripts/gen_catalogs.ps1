@@ -31,7 +31,7 @@ if (Test-Path $packagesDir) {
         $license = "MIT"
         
         if (Test-Path $pkgManifest) {
-            $raw = Get-Content $pkgManifest -Raw
+            $raw = Get-Content $pkgManifest -Raw -Encoding UTF8
             try {
                 $j = $raw | ConvertFrom-Json
                 if ($j.description) { $desc = [string]$j.description }
@@ -48,7 +48,7 @@ if (Test-Path $packagesDir) {
         }
         
         if (-not $desc -and (Test-Path $pkgReadme)) {
-            $lines = Get-Content $pkgReadme | Where-Object { $_.Trim() -ne "" -and -not ($_.StartsWith('#')) }
+            $lines = Get-Content $pkgReadme -Encoding UTF8 | Where-Object { $_.Trim() -ne "" -and -not ($_.StartsWith('#')) }
             if ($lines.Count -gt 0) { $desc = $lines[0].Trim() }
         }
         
@@ -113,7 +113,7 @@ if (Test-Path $examplesDir) {
         $desc = ""
         
         if (Test-Path $readme) {
-            $lines = Get-Content $readme
+            $lines = Get-Content $readme -Encoding UTF8
             foreach ($line in $lines) {
                 $trim = $line.Trim()
                 if ($trim.StartsWith('# ')) {
