@@ -540,7 +540,8 @@ EXPORT void zan_gui_draw_text_rot(
 }
 
 typedef struct {
-    char    *text;
+    char     inline_buf[48];
+    char    *heap_text;
     int      size;
     int      width;
     uint64_t used;
@@ -551,10 +552,19 @@ typedef struct {
 static zan_measure_cache_t g_mcache[ZAN_MEAS_CACHE_CAP];
 static uint64_t g_mcache_clock = 0;
 
+static char g_last_meas_text[48] = {0};
+static int  g_last_meas_size = 0;
+static int  g_last_meas_width = 0;
+
 static int measure_text_gdi(const char *text, int size) {
     int wlen = MultiByteToWideChar(CP_UTF8, 0, text, -1, NULL, 0);
-    wchar_t *wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-    if (!wtext) return 0;
+    if (wlen <= 0) return 0;
+    wchar_t stack_wtext[256];
+    wchar_t *wtext = stack_wtext;
+    if ((size_t)wlen > sizeof(stack_wtext) / sizeof(stack_wtext[0])) {
+        wtext = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+        if (!wtext) return 0;
+    }
     MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, wlen);
     HFONT font = get_or_create_font(size, 0);
     HFONT old_font = (HFONT)SelectObject(g_text_dc, font);
@@ -566,7 +576,9 @@ static int measure_text_gdi(const char *text, int size) {
     if (missing) {
         w = win_dw_text_width(wtext, wlen - 1, size, 0);
     }
-    free(wtext);
+    if (wtext != stack_wtext) {
+        free(wtext);
+    }
     if (w > 0) return w;
     return (int)text_size.cx;
 }
@@ -575,6 +587,15 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     if (!text || !*text) return 0;
     int size = (int)font_size;
     if (size < 8) size = 8;
+
+    if (size == g_last_meas_size && text[0] == g_last_meas_text[0] &&
+        strcmp(text, g_last_meas_text) == 0) {
+        if (g_text_stats_enabled) {
+            g_text_measure_calls++;
+            g_text_measure_cache_hits++;
+        }
+        return (i64)g_last_meas_width;
+    }
 
     ensure_text_dc();
     uint64_t t0 = 0;
@@ -590,15 +611,21 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
     uint64_t best = ~0ULL;
     for (int i = 0; i < ZAN_MEAS_CACHE_PROBE; i++) {
         zan_measure_cache_t *e = &g_mcache[(base + i) % ZAN_MEAS_CACHE_CAP];
-        if (e->text && e->size == size && strcmp(e->text, text) == 0) {
+        const char *ctext = e->heap_text ? e->heap_text : e->inline_buf;
+        if (ctext[0] && e->size == size && strcmp(ctext, text) == 0) {
             e->used = ++g_mcache_clock;
             if (g_text_stats_enabled) {
                 g_text_measure_cache_hits++;
                 g_text_measure_us += text_qpc_us() - t0;
             }
+            if (strlen(text) < sizeof(g_last_meas_text)) {
+                g_last_meas_size = size;
+                g_last_meas_width = e->width;
+                memcpy(g_last_meas_text, text, strlen(text) + 1);
+            }
             return (i64)e->width;
         }
-        if (!e->text) { if (!victim || best != 0) { victim = e; best = 0; } }
+        if (!ctext[0]) { if (!victim || best != 0) { victim = e; best = 0; } }
         else if (e->used < best) { best = e->used; victim = e; }
     }
 
@@ -607,19 +634,30 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
         g_text_measure_cache_misses++;
     }
 
+    size_t klen = strlen(text) + 1;
     if (victim) {
-        if (victim->text) { free(victim->text); victim->text = NULL; }
-        size_t klen = strlen(text) + 1;
-        victim->text = (char *)malloc(klen);
-        if (victim->text) {
-            memcpy(victim->text, text, klen);
-            victim->size = size;
-            victim->width = w;
-            victim->used = ++g_mcache_clock;
+        if (klen <= sizeof(victim->inline_buf)) {
+            if (victim->heap_text) { free(victim->heap_text); victim->heap_text = NULL; }
+            memcpy(victim->inline_buf, text, klen);
+        } else {
+            victim->inline_buf[0] = '\0';
+            if (victim->heap_text) { free(victim->heap_text); }
+            victim->heap_text = (char *)malloc(klen);
+            if (victim->heap_text) {
+                memcpy(victim->heap_text, text, klen);
+            }
         }
+        victim->size = size;
+        victim->width = w;
+        victim->used = ++g_mcache_clock;
     }
     if (g_text_stats_enabled) {
         g_text_measure_us += text_qpc_us() - t0;
+    }
+    if (klen <= sizeof(g_last_meas_text)) {
+        g_last_meas_size = size;
+        g_last_meas_width = w;
+        memcpy(g_last_meas_text, text, klen);
     }
     return (i64)w;
 }
