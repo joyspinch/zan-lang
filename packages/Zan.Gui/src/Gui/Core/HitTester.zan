@@ -18,6 +18,8 @@ class HitTester {
     // 来确认自己位于阻挡之上并保持可用。
     List<HitRegion> blockers;
     List<HitRegion> prevBlockers;
+    List<HitRegion> blockersA;
+    List<HitRegion> blockersB;
     // 命中区对象池。每帧每个控件注册一个命中区，一个稠密
     // 界面一秒就要新建上万个 HitRegion；池化后只在控件数
     // 创新高时才分配。两个池交替使用，因为 prevBlockers 还
@@ -26,6 +28,7 @@ class HitTester {
     List<HitRegion> poolB;
     bool useA;
     int used;
+    int activeAnchorCount;
 
     // 目标锚点（0 按下、1 点击、2 右键按下、3 右键点击）。鼠标事件
     // 在上一帧的命中区上解析出目标，而控件要到下一帧渲染时才去对比
@@ -63,9 +66,12 @@ class HitTester {
         useA = true;
         used = 0;
         regions = poolA;
-        blockers = new List<HitRegion>();
-        prevBlockers = new List<HitRegion>();
+        blockersA = new List<HitRegion>();
+        blockersB = new List<HitRegion>();
+        blockers = blockersA;
+        prevBlockers = blockersB;
         anchors = new List<HitAnchor>{ new HitAnchor(), new HitAnchor(), new HitAnchor(), new HitAnchor() };
+        activeAnchorCount = 0;
         snapshots = new List<HitSnapshotItem>();
         snapUsed = 0;
     }
@@ -92,10 +98,17 @@ class HitTester {
     // 开启新的一帧：当前阻挡区转为 prevBlockers，切换到另一个
     // 复用池并把已用计数清零（上一帧对象留待就地改写）。
     void Clear() {
-        prevBlockers = blockers;
-        blockers = new List<HitRegion>();
         useA = !useA;
-        if (useA) { regions = poolA; } else { regions = poolB; }
+        if (useA) {
+            regions = poolA;
+            blockers = blockersA;
+            prevBlockers = blockersB;
+        } else {
+            regions = poolB;
+            blockers = blockersB;
+            prevBlockers = blockersA;
+        }
+        blockers.Clear();
         used = 0;
     }
 
@@ -109,6 +122,7 @@ class HitTester {
             bool skip = below && wtype == -1;
             if (!skip && px >= sn.x && px < sn.x + sn.width
                 && py >= sn.y && py < sn.y + sn.height) {
+                if (anchors[k].isSet == 0) { activeAnchorCount = activeAnchorCount + 1; }
                 anchors[k].Set(sn.id, sn.x, sn.y, sn.width, sn.height, wtype);
                 return sn.id;
             }
@@ -120,6 +134,7 @@ class HitTester {
 
     // 作废锚点 `k`（id 复位为 -1）。
     void ClearAnchor(int k) {
+        if (anchors[k].isSet == 1) { activeAnchorCount = activeAnchorCount - 1; }
         anchors[k].Clear();
     }
 
@@ -163,20 +178,22 @@ class HitTester {
         // 首匹配会让按住/点击目标被下层的孪生控件抢走，顶层窗口
         // 的按钮/拖动全部失效。持续扫到最后一个匹配，与一次全新
         // AnchorAt 在同一点上的解析结果一致。
-        for (int k = 0; k < 4; k = k + 1) {
-            HitAnchor a = anchors[k];
-            if (a.isSet == 1
-                && a.widgetType == wtype
-                && a.x == x && a.y == y
-                && a.width == w && a.height == h) {
-                // 按下锚点（k==0）换了 id 且按压还握在旧 id 上：把
-                // 按压一并带到新 id（见 focus 字段的注释）。释放后
-                // pressedId 为 -1，不会被锚点的滞留值重新点亮。
-                if (k == 0 && focus != null && a.id >= 0
-                    && a.id != id && focus.pressedId == a.id) {
-                    focus.SetPressed(id);
+        if (activeAnchorCount > 0) {
+            for (int k = 0; k < 4; k = k + 1) {
+                HitAnchor a = anchors[k];
+                if (a.isSet == 1
+                    && a.widgetType == wtype
+                    && a.x == x && a.y == y
+                    && a.width == w && a.height == h) {
+                    // 按下锚点（k==0）换了 id 且按压还握在旧 id 上：把
+                    // 按压一并带到新 id（见 focus 字段的注释）。释放后
+                    // pressedId 为 -1，不会被锚点的滞留值重新点亮。
+                    if (k == 0 && focus != null && a.id >= 0
+                        && a.id != id && focus.pressedId == a.id) {
+                        focus.SetPressed(id);
+                    }
+                    a.id = id;
                 }
-                a.id = id;
             }
         }
     }
