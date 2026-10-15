@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.Intrinsics;
 
 namespace Gui;
 
@@ -12,11 +13,13 @@ class Mesh3D {
     List<float> v;
     List<ushort> idx;
     bool colored;
+    int vertexCount;
 
     public Mesh3D() {
         this.v = new List<float>();
         this.idx = new List<ushort>();
         this.colored = false;
+        this.vertexCount = 0;
     }
 
     // 本网格是否为顶点色布局（12 float/顶点）。
@@ -32,7 +35,9 @@ class Mesh3D {
         this.v.Add(px); this.v.Add(py); this.v.Add(pz);
         this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
         this.v.Add(u); this.v.Add(vv);
-        return (this.v.Count >> 3) - 1;
+        int idx = this.vertexCount;
+        this.vertexCount = idx + 1;
+        return idx;
     }
 
     // 追加一个带颜色的顶点（r,g,b,a 线性 0..1），网格切换为顶点色布局，
@@ -46,7 +51,9 @@ class Mesh3D {
         this.v.Add(nx); this.v.Add(ny); this.v.Add(nz);
         this.v.Add(u); this.v.Add(vv);
         this.v.Add(r); this.v.Add(g); this.v.Add(b); this.v.Add(a);
-        return this.v.Count / 12 - 1;
+        int idx = this.vertexCount;
+        this.vertexCount = idx + 1;
+        return idx;
     }
 
     // 按逆时针（从观察方向看）追加一个三角形，保证正面朝外。
@@ -62,14 +69,23 @@ class Mesh3D {
         this.Triangle(a, c, d);
     }
 
-    public int VertexCount() { return this.colored ? (this.v.Count / 12) : (this.v.Count >> 3); }
+    public int VertexCount() { return this.vertexCount; }
     public int IndexCount() { return this.idx.Count; }
 
-    // 直接复制顶点到原生内存，避免中途分配 float[] 堆数组。
+    // 直接复制顶点到原生内存，采用 128 位 SIMD 流水线写出，避免中途分配 float[] 堆数组。
     public void CopyVerticesTo(nint dest) {
         int n = this.v.Count;
+        int i = 0;
+        int simdEnd = n - 3;
+        while (i < simdEnd) {
+            Vector128.Store(dest + (nint)(i * 4), Vector128.Create(this.v[i], this.v[i + 1], this.v[i + 2], this.v[i + 3]));
+            i = i + 4;
+        }
         Span<float> s = new Span<float>(dest, n);
-        for (int i = 0; i < n; i = i + 1) { s[i] = this.v[i]; }
+        while (i < n) {
+            s[i] = this.v[i];
+            i = i + 1;
+        }
     }
 
     // 直接复制索引到原生内存，避免中途分配 ushort[] 堆数组。
@@ -79,11 +95,20 @@ class Mesh3D {
         for (int i = 0; i < n; i = i + 1) { s[i] = this.idx[i]; }
     }
 
-    // 交错顶点缓冲（Canvas.MeshUpload 封送用）。
+    // 交错顶点缓冲（Canvas.MeshUpload 封送用），128 位 SIMD 快速拷贝。
     public float[] VertexArray() {
         int n = this.v.Count;
         float[] outv = new float[n];
-        for (int i = 0; i < n; i = i + 1) { outv[i] = this.v[i]; }
+        int i = 0;
+        int simdEnd = n - 3;
+        while (i < simdEnd) {
+            Vector128.Store(outv, i, Vector128.Create(this.v[i], this.v[i + 1], this.v[i + 2], this.v[i + 3]));
+            i = i + 4;
+        }
+        while (i < n) {
+            outv[i] = this.v[i];
+            i = i + 1;
+        }
         return outv;
     }
 
