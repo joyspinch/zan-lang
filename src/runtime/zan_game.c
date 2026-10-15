@@ -4,12 +4,14 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define ZAN_GAME_SPRITE_CAP 4096
 #define ZAN_GAME_KEY_CAP 512
 #define ZAN_GAME_QUAD_FLOATS 10
-#define ZAN_GAME_MESH_CAP 256
+#define ZAN_GAME_MESH_INIT_CAP 256
+#define ZAN_GAME_MESH_MAX_CAP 65536
 #define ZAN_GAME_SURFACE_CAP 64
 #define ZAN_GAME_VERTEX_FLOATS 8
 #define ZAN_GAME_COLORED_VERTEX_FLOATS 12
@@ -128,7 +130,8 @@ typedef struct {
 #define ZAN_GAME_LOC_IMVP 4   /* mat4 占用 4..7 */
 #define ZAN_GAME_LOC_ITINT 8
 
-static zan_game_mesh g_game_meshes[ZAN_GAME_MESH_CAP];
+static zan_game_mesh *g_game_meshes = NULL;
+static int g_game_mesh_cap = 0;
 static zan_game_depth g_game_depth[ZAN_GAME_SURFACE_CAP];
 static const zan_gl_api *g_game_gl;
 static uint64_t g_game_epoch;
@@ -313,7 +316,9 @@ static void zan_game_forget_gpu(void) {
         if (g_game_instance_vbo)
             g_game_gl->DeleteBuffers(1, &g_game_instance_vbo);
     }
-    memset(g_game_meshes, 0, sizeof(g_game_meshes));
+    if (g_game_meshes) {
+        memset(g_game_meshes, 0, (size_t)g_game_mesh_cap * sizeof(zan_game_mesh));
+    }
     memset(g_game_depth, 0, sizeof(g_game_depth));
     memset(g_game_progs, 0, sizeof(g_game_progs));
     g_game_instance_vbo = 0;
@@ -330,8 +335,10 @@ static void zan_game_gpu_cleanup(int32_t surface_id) {
     }
     if (surface_id != -1) return;
     if (g_game_gl) {
-        for (int i = 0; i < ZAN_GAME_MESH_CAP; ++i)
-            zan_game_drop_mesh(&g_game_meshes[i]);
+        if (g_game_meshes) {
+            for (int i = 0; i < g_game_mesh_cap; ++i)
+                zan_game_drop_mesh(&g_game_meshes[i]);
+        }
         for (int i = 0; i < ZAN_GAME_SURFACE_CAP; ++i)
             zan_game_drop_depth(&g_game_depth[i]);
     }
@@ -409,8 +416,39 @@ static zan_game_program *zan_game_program_get(int colored, int instanced) {
     return prog;
 }
 
+static zan_game_mesh *zan_game_mesh_alloc(void) {
+    if (!g_game_meshes) {
+        g_game_meshes = (zan_game_mesh *)calloc(ZAN_GAME_MESH_INIT_CAP, sizeof(zan_game_mesh));
+        if (!g_game_meshes) return NULL;
+        g_game_mesh_cap = ZAN_GAME_MESH_INIT_CAP;
+    }
+    for (int i = 0; i < g_game_mesh_cap; ++i) {
+        if (!g_game_meshes[i].id) {
+            return &g_game_meshes[i];
+        }
+    }
+    if (g_game_mesh_cap < ZAN_GAME_MESH_MAX_CAP) {
+        int new_cap = g_game_mesh_cap * 2;
+        if (new_cap > ZAN_GAME_MESH_MAX_CAP) new_cap = ZAN_GAME_MESH_MAX_CAP;
+        zan_game_mesh *new_arr = (zan_game_mesh *)realloc(g_game_meshes, (size_t)new_cap * sizeof(zan_game_mesh));
+        if (new_arr) {
+            memset(new_arr + g_game_mesh_cap, 0, (size_t)(new_cap - g_game_mesh_cap) * sizeof(zan_game_mesh));
+            int slot = g_game_mesh_cap;
+            g_game_meshes = new_arr;
+            g_game_mesh_cap = new_cap;
+            return &g_game_meshes[slot];
+        }
+    }
+    return NULL;
+}
+
 static zan_game_mesh *zan_game_find_mesh(int32_t id, uint64_t epoch) {
-    for (int i = 0; i < ZAN_GAME_MESH_CAP; ++i)
+    if (id <= 0 || !g_game_meshes || g_game_mesh_cap <= 0) return NULL;
+    int fast_slot = (uint32_t)(id - 1) % (uint32_t)g_game_mesh_cap;
+    if (g_game_meshes[fast_slot].id == id && g_game_meshes[fast_slot].epoch == epoch) {
+        return &g_game_meshes[fast_slot];
+    }
+    for (int i = 0; i < g_game_mesh_cap; ++i)
         if (g_game_meshes[i].id == id && g_game_meshes[i].epoch == epoch)
             return &g_game_meshes[i];
     return NULL;
@@ -440,9 +478,7 @@ ZAN_GAME_API int32_t zan_game_mesh_create_ex(int32_t surface_id,
     if (!zan_gui_gpu_begin(surface_id, &frame)) return 0;
     int32_t result = 0;
     if (!zan_game_gpu_prepare(&frame)) goto done;
-    zan_game_mesh *mesh = NULL;
-    for (int i = 0; i < ZAN_GAME_MESH_CAP; ++i)
-        if (!g_game_meshes[i].id) { mesh = &g_game_meshes[i]; break; }
+    zan_game_mesh *mesh = zan_game_mesh_alloc();
     if (!mesh || !zan_game_program_get(colored, 0)) goto done;
 
     const zan_gl_api *gl = frame.api;

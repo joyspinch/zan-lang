@@ -426,6 +426,16 @@ int main(int argc, char **argv) {
         CHECK(((right >> 16) & 255) < 60 && ((right >> 8) & 255) < 60);
     }
 
+    /* 验证动态网格池扩容：突破原有 256 静态上限，连续创建 300 个网格 */
+    int last_mesh = 0;
+    for (int mi = 0; mi < 300; ++mi) {
+        int m = mesh_create(s, cube_verts, 24, cube_idx, 36);
+        CHECK(m > 0);
+        last_mesh = m;
+    }
+    CHECK(last_mesh > 0);
+    CHECK(draw3d(s, last_mesh, cube_mvp(0.0f, 4.0f, 1.0f), 0xFFFFFFFF, NULL) == 1);
+
     destroy(s);
     fprintf(stderr, "GL 3D: OK\n");
     return 0;
