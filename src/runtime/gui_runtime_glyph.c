@@ -3,8 +3,11 @@
 #define ZAN_TILE_RUN   0
 #define ZAN_TILE_GLYPH 1
 
+#define ZAN_ATLAS_INLINE_KEY 32
+
 typedef struct {
-    char    *key;
+    char     inline_key[ZAN_ATLAS_INLINE_KEY];
+    char    *heap_key;
     int      key_len;
     int      kind;
     int      size;
@@ -86,9 +89,24 @@ static uint64_t zan_atlas_hash(int kind, int size,
     return h;
 }
 
+static int g_atlas_last_kind = -1;
+static int g_atlas_last_size = -1;
+static int g_atlas_last_klen = -1;
+static char g_atlas_last_key[ZAN_ATLAS_INLINE_KEY];
+static const zan_glyph_tile *g_atlas_last_tile = NULL;
+
 static void zan_atlas_release(zan_atlas_slot *slot) {
-    if (!slot->key) return;
-    free(slot->key);
+    if (slot->key_len <= 0) return;
+    if (g_atlas_last_tile == &slot->tile) {
+        g_atlas_last_tile = NULL;
+        g_atlas_last_klen = -1;
+    }
+    if (slot->heap_key) {
+        free(slot->heap_key);
+        slot->heap_key = NULL;
+    }
+    slot->inline_key[0] = '\0';
+    slot->key_len = 0;
     zan_cov_pool_put((void *)slot->tile.cov, zan_cov_round(slot->bytes));
     g_atlas_bytes -= slot->bytes;
     memset(slot, 0, sizeof(*slot));
@@ -98,7 +116,7 @@ static void zan_atlas_trim(void) {
     while (g_atlas_bytes > ZAN_ATLAS_BYTES) {
         zan_atlas_slot *oldest = NULL;
         for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
-            if (!g_atlas[i].key) continue;
+            if (g_atlas[i].key_len <= 0) continue;
             if (!oldest || g_atlas[i].used < oldest->used) oldest = &g_atlas[i];
         }
         if (!oldest) return;
@@ -112,7 +130,7 @@ static void zan_atlas_trim(void) {
 static void zan_atlas_sweep(void) {
     for (int i = 0; i < ZAN_ATLAS_CAP; i++) {
         zan_atlas_slot *e = &g_atlas[i];
-        if (!e->key) continue;
+        if (e->key_len <= 0) continue;
         if (g_atlas_stores - e->stamped >= ZAN_ATLAS_COLD_STORES) {
             zan_atlas_release(e);
             g_atlas_swept++;
@@ -122,16 +140,31 @@ static void zan_atlas_sweep(void) {
 
 static const zan_glyph_tile *zan_atlas_find(int kind, int size,
                                             const char *key, int key_len) {
+    if (kind == g_atlas_last_kind && size == g_atlas_last_size &&
+        key_len == g_atlas_last_klen && key_len <= ZAN_ATLAS_INLINE_KEY &&
+        memcmp(key, g_atlas_last_key, (size_t)key_len) == 0 && g_atlas_last_tile != NULL) {
+        g_atlas_hits++;
+        return g_atlas_last_tile;
+    }
+
     uint64_t h = zan_atlas_hash(kind, size, key, key_len);
     int base = (int)(h % ZAN_ATLAS_CAP);
     for (int i = 0; i < ZAN_ATLAS_PROBE; i++) {
         zan_atlas_slot *e = &g_atlas[(base + i) % ZAN_ATLAS_CAP];
-        if (!e->key) continue;
+        if (e->key_len <= 0) continue;
+        const char *ekey = e->heap_key ? e->heap_key : e->inline_key;
         if (e->kind == kind && e->size == size && e->key_len == key_len
-            && memcmp(e->key, key, (size_t)key_len) == 0) {
+            && memcmp(ekey, key, (size_t)key_len) == 0) {
             e->used = ++g_atlas_clock;
             e->stamped = g_atlas_stores;
             g_atlas_hits++;
+            if (key_len <= ZAN_ATLAS_INLINE_KEY) {
+                g_atlas_last_kind = kind;
+                g_atlas_last_size = size;
+                g_atlas_last_klen = key_len;
+                memcpy(g_atlas_last_key, key, (size_t)key_len);
+                g_atlas_last_tile = &e->tile;
+            }
             return &e->tile;
         }
     }
@@ -150,23 +183,38 @@ static const zan_glyph_tile *zan_atlas_store(
     zan_atlas_slot *victim = NULL;
     for (int i = 0; i < ZAN_ATLAS_PROBE; i++) {
         zan_atlas_slot *e = &g_atlas[(base + i) % ZAN_ATLAS_CAP];
-        if (!e->key) { victim = e; break; }
+        if (e->key_len <= 0) { victim = e; break; }
         if (!victim || e->used < victim->used) victim = e;
     }
 
     size_t bytes = (size_t)w * (size_t)h * (size_t)bpp;
-    char *key_copy = (char *)malloc((size_t)key_len ? (size_t)key_len : 1);
     void *cov_copy = bytes ? zan_cov_pool_take(zan_cov_round(bytes)) : NULL;
-    if (!key_copy || (bytes && !cov_copy)) {
-        free(key_copy);
-        free(cov_copy);
-        return NULL;
+    char *heap_key_copy = NULL;
+    if (key_len > ZAN_ATLAS_INLINE_KEY) {
+        heap_key_copy = (char *)malloc((size_t)key_len);
+        if (!heap_key_copy || (bytes && !cov_copy)) {
+            free(heap_key_copy);
+            free(cov_copy);
+            return NULL;
+        }
+        memcpy(heap_key_copy, key, (size_t)key_len);
+    } else {
+        if (bytes && !cov_copy) {
+            return NULL;
+        }
     }
-    memcpy(key_copy, key, (size_t)key_len);
     if (bytes) memcpy(cov_copy, cov, bytes);
 
+    if (g_atlas_last_tile == &victim->tile) {
+        g_atlas_last_tile = NULL;
+        g_atlas_last_klen = -1;
+    }
     zan_atlas_release(victim);
-    victim->key = key_copy;
+    if (heap_key_copy) {
+        victim->heap_key = heap_key_copy;
+    } else {
+        memcpy(victim->inline_key, key, (size_t)key_len);
+    }
     victim->key_len = key_len;
     victim->kind = kind;
     victim->size = size;
@@ -187,6 +235,14 @@ static const zan_glyph_tile *zan_atlas_store(
     g_atlas_stores++;
     if ((g_atlas_stores & (ZAN_ATLAS_SWEEP - 1)) == 0) { zan_atlas_sweep(); }
     zan_atlas_trim();
+
+    if (key_len <= ZAN_ATLAS_INLINE_KEY) {
+        g_atlas_last_kind = kind;
+        g_atlas_last_size = size;
+        g_atlas_last_klen = key_len;
+        memcpy(g_atlas_last_key, key, (size_t)key_len);
+        g_atlas_last_tile = &victim->tile;
+    }
     return &victim->tile;
 }
 
