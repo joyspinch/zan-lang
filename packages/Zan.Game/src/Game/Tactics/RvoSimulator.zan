@@ -24,6 +24,13 @@ class RvoSimulator {
     int[] neighborBuf;
     int maxNeighbors;
 
+    // 空闲槽位栈 + 紧凑活跃列表：AddAgent O(1) 取槽、RemoveAgent O(1) 释放，
+    // Step 三个阶段只遍历活跃单位，消除对非活跃槽位的无效空转循环。
+    int[] freeStack;
+    int freeTop;
+    int[] activeList;
+    int[] activePos;
+
     RvoSimulator(int capacity, int cellSize) {
         this.maxAgents = capacity > 16 ? capacity : 1024;
         this.agentCount = 0;
@@ -39,6 +46,17 @@ class RvoSimulator {
         this.radius = new double[maxAgents];
         this.maxSpeed = new double[maxAgents];
 
+        this.freeStack = new int[maxAgents];
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            this.freeStack[i] = maxAgents - 1 - i;
+        }
+        this.freeTop = maxAgents;
+        this.activeList = new int[maxAgents];
+        this.activePos = new int[maxAgents];
+        for (int i = 0; i < maxAgents; i = i + 1) {
+            this.activePos[i] = -1;
+        }
+
         int gridCell = cellSize > 8 ? cellSize : 48;
         this.spatialGrid = SpatialHash2D.Create(gridCell, maxAgents);
 
@@ -53,16 +71,11 @@ class RvoSimulator {
     int AgentCount { get { return agentCount; } }
     int Capacity { get { return maxAgents; } }
 
-    // 添加或重用一个 RVO 运动体。
+    // 添加或重用一个 RVO 运动体（O(1) 弹栈与紧凑表登记）。
     int AddAgent(double x, double y, double r, double speed) {
-        int slot = -1;
-        for (int i = 0; i < maxAgents; i = i + 1) {
-            if (!active[i]) {
-                slot = i;
-                break;
-            }
-        }
-        if (slot < 0) { return -1; }
+        if (freeTop <= 0) { return -1; }
+        freeTop = freeTop - 1;
+        int slot = freeStack[freeTop];
 
         active[slot] = true;
         agentIds[slot] = slot;
@@ -75,6 +88,8 @@ class RvoSimulator {
         radius[slot] = r > 1.0 ? r : 12.0;
         maxSpeed[slot] = speed > 1.0 ? speed : 100.0;
 
+        activePos[slot] = agentCount;
+        activeList[agentCount] = slot;
         agentCount = agentCount + 1;
         return slot;
     }
@@ -82,7 +97,17 @@ class RvoSimulator {
     void RemoveAgent(int slot) {
         if (slot >= 0 && slot < maxAgents && active[slot]) {
             active[slot] = false;
-            agentCount = agentCount - 1;
+            int pos = activePos[slot];
+            if (pos >= 0 && pos < agentCount) {
+                int last = agentCount - 1;
+                int lastSlot = activeList[last];
+                activeList[pos] = lastSlot;
+                activePos[lastSlot] = pos;
+                activePos[slot] = -1;
+                agentCount = last;
+            }
+            freeStack[freeTop] = slot;
+            freeTop = freeTop + 1;
         }
     }
 
@@ -98,21 +123,20 @@ class RvoSimulator {
     double GetVx(int slot) { return velX[slot]; }
     double GetVy(int slot) { return velY[slot]; }
 
-    // 逐物理步更新互斥避障计算并推进位置。
+    // 逐物理步更新互斥避障计算并推进位置（只遍历活跃单位段）。
     void Step(double dt) {
-        if (dt <= 0.0) { return; }
+        if (dt <= 0.0 || agentCount <= 0) { return; }
 
         // 1. 刷新空间哈希网格
         spatialGrid.Clear();
-        for (int i = 0; i < maxAgents; i = i + 1) {
-            if (active[i]) {
-                spatialGrid.Insert(i, posX[i], posY[i], radius[i]);
-            }
+        for (int m = 0; m < agentCount; m = m + 1) {
+            int i = activeList[m];
+            spatialGrid.Insert(i, posX[i], posY[i], radius[i]);
         }
 
         // 2. 针对每个活跃单位计算 RVO2 避让速度
-        for (int i = 0; i < maxAgents; i = i + 1) {
-            if (!active[i]) { continue; }
+        for (int m = 0; m < agentCount; m = m + 1) {
+            int i = activeList[m];
 
             double px_i = posX[i];
             double py_i = posY[i];
@@ -210,12 +234,11 @@ class RvoSimulator {
             velY[i] = nvy;
         }
 
-        // 3. 推进位置
-        for (int i = 0; i < maxAgents; i = i + 1) {
-            if (active[i]) {
-                posX[i] = posX[i] + velX[i] * dt;
-                posY[i] = posY[i] + velY[i] * dt;
-            }
+        // 3. 推进位置（紧凑活跃段推进）
+        for (int m = 0; m < agentCount; m = m + 1) {
+            int i = activeList[m];
+            posX[i] = posX[i] + velX[i] * dt;
+            posY[i] = posY[i] + velY[i] * dt;
         }
     }
 }
