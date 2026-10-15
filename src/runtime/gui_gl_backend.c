@@ -772,22 +772,40 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
     float du = (q->u1 - q->u0), dv = (q->v1 - q->v0);
     float qw = (x1 - x0), qh = (y1 - y0);
     (void)qw; (void)qh;
+
+    float inv_2hw = (q->hw > 0.0f) ? (1.0f / (2.0f * q->hw)) : 0.0f;
+    float inv_2hh = (q->hh > 0.0f) ? (1.0f / (2.0f * q->hh)) : 0.0f;
+    float min_x = q->cx - q->hw;
+    float min_y = q->cy - q->hh;
+
+    typedef struct { float d[4]; } zgl_v4;
+    zgl_v4 c0 = *(const zgl_v4 *)q->col0;
+    zgl_v4 c1 = *(const zgl_v4 *)q->col1;
+    zgl_v4 c2 = *(const zgl_v4 *)q->col2;
+    zgl_v4 sg = *(const zgl_v4 *)q->seg;
+    float clip_x0 = (float)s->clip_x0, clip_y0 = (float)s->clip_y0;
+    float clip_x1 = (float)s->clip_x1, clip_y1 = (float)s->clip_y1;
+    float q_cx = q->cx, q_cy = q->cy;
+    float q_hw = q->hw, q_hh = q->hh;
+    float q_radius = q->radius, q_stroke = q->stroke;
+    float q_kind = (float)q->kind, q_p0 = q->p0, q_p1 = q->p1, q_p2 = q->p2;
+
     for (int i = 0; i < 6; i++) {
         float *v = g_zgl.verts + g_zgl.count;
         float px = corner[i][0], py = corner[i][1];
         v[0] = px;            v[1] = py;
-        v[2] = q->cx;         v[3] = q->cy;
-        v[4] = q->hw;         v[5] = q->hh;
-        v[6] = q->radius;     v[7] = q->stroke;
-        v[8] = (float)q->kind; v[9] = q->p0; v[10] = q->p1; v[11] = q->p2;
-        memcpy(v + 12, q->col0, 4 * sizeof(float));
-        memcpy(v + 16, q->col1, 4 * sizeof(float));
-        memcpy(v + 20, q->col2, 4 * sizeof(float));
-        v[24] = (float)s->clip_x0; v[25] = (float)s->clip_y0;
-        v[26] = (float)s->clip_x1; v[27] = (float)s->clip_y1;
-        memcpy(v + 28, q->seg, 4 * sizeof(float));
-        float fu = (q->hw > 0.0f) ? (px - (q->cx - q->hw)) / (2.0f * q->hw) : 0.0f;
-        float fv = (q->hh > 0.0f) ? (py - (q->cy - q->hh)) / (2.0f * q->hh) : 0.0f;
+        v[2] = q_cx;          v[3] = q_cy;
+        v[4] = q_hw;          v[5] = q_hh;
+        v[6] = q_radius;      v[7] = q_stroke;
+        v[8] = q_kind;        v[9] = q_p0; v[10] = q_p1; v[11] = q_p2;
+        *(zgl_v4 *)(v + 12) = c0;
+        *(zgl_v4 *)(v + 16) = c1;
+        *(zgl_v4 *)(v + 20) = c2;
+        v[24] = clip_x0;      v[25] = clip_y0;
+        v[26] = clip_x1;      v[27] = clip_y1;
+        *(zgl_v4 *)(v + 28) = sg;
+        float fu = (inv_2hw > 0.0f) ? (px - min_x) * inv_2hw : 0.0f;
+        float fv = (inv_2hh > 0.0f) ? (py - min_y) * inv_2hh : 0.0f;
         v[32] = q->u0 + du * fu;
         v[33] = q->v0 + dv * fv;
         g_zgl.count += ZGL_VF;
