@@ -14,8 +14,12 @@ class SpatialAudio2D {
     double listenerX;
     double listenerY;
     double panSpanWidth;  // 产生最大偏相的水平半跨度（如 640px 对应半屏宽）
+    double invPanSpanWidth;
     double minDistance;  // 满音量无衰减半径（如 80px）
     double maxDistance;  // 最大可听半径（超出则裁切静音，如 1200px）
+    double minDistSq;
+    double maxDistSq;
+    double invDistRange;
     AudioBus audioBus;
 
     SpatialAudio2D(AudioBus bus, double spanW, double minD, double maxD) {
@@ -25,6 +29,7 @@ class SpatialAudio2D {
         this.panSpanWidth = spanW > 50.0 ? spanW : 640.0;
         this.minDistance = minD > 0.0 ? minD : 80.0;
         this.maxDistance = maxD > minD ? maxD : 1200.0;
+        this.UpdateCachedMetrics();
     }
 
     static SpatialAudio2D Create(AudioBus bus, double spanW, double minD, double maxD) {
@@ -33,8 +38,16 @@ class SpatialAudio2D {
 
     double ListenerX { get { return listenerX; } set { listenerX = value; } }
     double ListenerY { get { return listenerY; } set { listenerY = value; } }
-    double MinDistance { get { return minDistance; } set { minDistance = value; } }
-    double MaxDistance { get { return maxDistance; } set { maxDistance = value; } }
+    double MinDistance { get { return minDistance; } set { minDistance = value; UpdateCachedMetrics(); } }
+    double MaxDistance { get { return maxDistance; } set { maxDistance = value; UpdateCachedMetrics(); } }
+
+    void UpdateCachedMetrics() {
+        this.invPanSpanWidth = 1.0 / this.panSpanWidth;
+        this.minDistSq = this.minDistance * this.minDistance;
+        this.maxDistSq = this.maxDistance * this.maxDistance;
+        double range = this.maxDistance - this.minDistance;
+        this.invDistRange = range > 0.001 ? (1.0 / range) : 1.0;
+    }
 
     void SetListenerPosition(double x, double y) {
         this.listenerX = x;
@@ -49,26 +62,24 @@ class SpatialAudio2D {
         double dy = sourceY - listenerY;
         double distSq = dx * dx + dy * dy;
 
-        // 1. 声相计算（水平偏移跨度归一化）
-        double rawPan = dx / panSpanWidth;
+        // 1. 声相计算（水平偏移跨度归一化，乘倒数消除除法）
+        double rawPan = dx * invPanSpanWidth;
         if (rawPan < -1.0) { rawPan = -1.0; }
         if (rawPan > 1.0) { rawPan = 1.0; }
         outPan = rawPan;
 
         // 2. 距离衰减计算（基于平方距离短路判断，避免无谓的 Math.Sqrt 开销）
-        double maxDistSq = maxDistance * maxDistance;
         if (distSq >= maxDistSq) {
             outGain = 0.0;
             return;
         }
 
-        double minDistSq = minDistance * minDistance;
         if (distSq <= minDistSq) {
             outGain = baseGain;
         } else {
             double dist = Math.Sqrt(distSq);
-            // 平滑线性插值
-            double t = (dist - minDistance) / (maxDistance - minDistance);
+            // 平滑线性插值（乘倒数消除除法）
+            double t = (dist - minDistance) * invDistRange;
             double atten = 1.0 - t;
             // 平滑衰减曲线 (SmoothStep 体验更佳)
             atten = atten * atten;
