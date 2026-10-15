@@ -7,7 +7,9 @@ namespace Game.Core;
 // 内部基于紧凑静态扁平链表实现，查询与插入完全零 GC 分配，O(1) 检索周围邻域。
 class SpatialHash2D {
     int cellSize;
-    int tableSize;  // 哈希桶总数（质数或 2 的幂）
+    double invCellSize;  // 1.0 / cellSize 乘法快速倒数，消除高频浮点除法
+    int tableSize;  // 哈希桶总数（2 的幂：4096）
+    int tableMask;  // tableSize - 1（位与屏蔽取代 64 位整数除模）
     int maxEntities;  // 支持的最大实体容量
     int count;
 
@@ -33,8 +35,10 @@ class SpatialHash2D {
         if (maxEntities < 100) { maxEntities = 2048; }
 
         this.cellSize = cellSize;
+        this.invCellSize = 1.0 / (double)cellSize;
         this.maxEntities = maxEntities;
-        this.tableSize = 4099;  // 优质哈希素数桶
+        this.tableSize = 4096;  // 2^12 优质紧凑哈希桶
+        this.tableMask = this.tableSize - 1;
         this.count = 0;
 
         this.bucketHead = new int[tableSize];
@@ -74,11 +78,9 @@ class SpatialHash2D {
     }
 
     int HashCoords(int cellX, int cellY) {
-        // 优质大质数混淆哈希，防止聚簇
+        // 优质大质数混淆哈希，位与屏蔽消除 64 位整数除模
         long h = ((long)cellX * 73856093L) ^ ((long)cellY * 19349663L);
-        int idx = (int)(h % (long)tableSize);
-        if (idx < 0) { idx = idx + tableSize; }
-        return idx;
+        return (int)(h & (long)tableMask);
     }
 
     // 插入一个实体到哈希网格中。
@@ -95,8 +97,8 @@ class SpatialHash2D {
         posY[entryIdx] = y;
         radius[entryIdx] = r;
 
-        int cx = (int)Math.Floor(x / (double)cellSize);
-        int cy = (int)Math.Floor(y / (double)cellSize);
+        int cx = (int)Math.Floor(x * invCellSize);
+        int cy = (int)Math.Floor(y * invCellSize);
         int bIdx = HashCoords(cx, cy);
 
         // 桶从空变非空时登记下标，供 Clear 只清扫写过的桶
@@ -119,10 +121,10 @@ class SpatialHash2D {
 
         // 扫描范围按本帧最大插入半径外扩（见 maxInsertRadius 注释）
         double effR = qRadius + maxInsertRadius;
-        int minCx = (int)Math.Floor((qx - effR) / (double)cellSize);
-        int maxCx = (int)Math.Floor((qx + effR) / (double)cellSize);
-        int minCy = (int)Math.Floor((qy - effR) / (double)cellSize);
-        int maxCy = (int)Math.Floor((qy + effR) / (double)cellSize);
+        int minCx = (int)Math.Floor((qx - effR) * invCellSize);
+        int maxCx = (int)Math.Floor((qx + effR) * invCellSize);
+        int minCy = (int)Math.Floor((qy - effR) * invCellSize);
+        int maxCy = (int)Math.Floor((qy + effR) * invCellSize);
 
         int hitCount = 0;
 
@@ -156,10 +158,10 @@ class SpatialHash2D {
     int FindNearest(double qx, double qy, double maxRange) {
         // 扫描范围按本帧最大插入半径外扩（见 maxInsertRadius 注释）
         double effR = maxRange + maxInsertRadius;
-        int minCx = (int)Math.Floor((qx - effR) / (double)cellSize);
-        int maxCx = (int)Math.Floor((qx + effR) / (double)cellSize);
-        int minCy = (int)Math.Floor((qy - effR) / (double)cellSize);
-        int maxCy = (int)Math.Floor((qy + effR) / (double)cellSize);
+        int minCx = (int)Math.Floor((qx - effR) * invCellSize);
+        int maxCx = (int)Math.Floor((qx + effR) * invCellSize);
+        int minCy = (int)Math.Floor((qy - effR) * invCellSize);
+        int maxCy = (int)Math.Floor((qy + effR) * invCellSize);
 
         double bestDist2 = maxRange * maxRange;
         int bestId = -1;
