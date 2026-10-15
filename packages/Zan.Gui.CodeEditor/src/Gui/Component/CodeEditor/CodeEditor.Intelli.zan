@@ -143,6 +143,12 @@ partial class CodeEditor {
     // 语义提供者还依赖光标位置，独立缓存避免复用旧实参上下文。
     string SigHelpFor(string name) {
         int stamp = TextStamp();
+        string bareName = name;
+        int dot = name.LastIndexOf(".");
+        if (dot >= 0 && dot + 1 < name.Length) {
+            bareName = name.Substring(dot + 1, name.Length - (dot + 1));
+        }
+
         if (externalSignature != null && documentPath.Length > 0) {
             string path = documentPath;
             int line = curLine;
@@ -152,6 +158,10 @@ partial class CodeEditor {
                 lspSig = signatureLspMemo.text;
             } else {
                 lspSig = externalSignature(path, line, col, name);
+                // 若限定名未查到，尝试查询裸方法名
+                if (lspSig.Length == 0 && bareName != name) {
+                    lspSig = externalSignature(path, line, col, bareName);
+                }
                 // 提供者可能泵事件，旧调用的结果不能污染新文档的缓存。
                 if (documentPath != path || TextStamp() != stamp
                     || curLine != line || curCol != col) { return ""; }
@@ -164,7 +174,9 @@ partial class CodeEditor {
         }
         if (sigMemoName == name && sigMemoStamp == stamp) { return sigMemoText; }
         string sig = RealSigFor(name);
+        if (sig.Length == 0 && bareName != name) { sig = RealSigFor(bareName); }
         if (sig.Length == 0) { sig = CodeEditor.DescSig(name); }
+        if (sig.Length == 0 && bareName != name) { sig = CodeEditor.DescSig(bareName); }
         sigMemoName = name;
         sigMemoStamp = stamp;
         sigMemoText = sig;
@@ -217,11 +229,34 @@ partial class CodeEditor {
         }
         if (at < 0) { return ""; }
         int e2 = at;
+        while (e2 > 0 && (ln[e2 - 1] & 255) == 32) { e2 = e2 - 1; }
+        int identEnd = e2;
         while (e2 > 0 && CodeEditor.IsIdentByte(ln[e2 - 1] & 255)) {
             e2 = e2 - 1;
         }
-        string name = ln.Substring(e2, at - e2);
+        string name = ln.Substring(e2, identEnd - e2);
         if (name.Length == 0 || CodeEditor.IsControlWord(name)) { return ""; }
+
+        // 若被调用方法紧跟在成员访问符（.）之后，提取前置的限定符（类名或实例名）
+        // 例如：MainStatusBar.SetText(...) -> 优先查 MainStatusBar.SetText 或 StatusBar.SetText
+        int pDot = e2;
+        while (pDot > 0 && (ln[pDot - 1] & 255) == 32) { pDot = pDot - 1; }
+        if (pDot > 0 && (ln[pDot - 1] & 255) == 46) {
+            int recvEnd = pDot - 1;
+            while (recvEnd > 0 && (ln[recvEnd - 1] & 255) == 32) { recvEnd = recvEnd - 1; }
+            int recvStart = recvEnd;
+            while (recvStart > 0 && CodeEditor.IsIdentByte(ln[recvStart - 1] & 255)) {
+                recvStart = recvStart - 1;
+            }
+            if (recvEnd > recvStart) {
+                string recv = ln.Substring(recvStart, recvEnd - recvStart);
+                if (recv.Length > 0 && !CodeEditor.IsControlWord(recv)) {
+                    outArg.Add(args);
+                    return recv + "." + name;
+                }
+            }
+        }
+
         outArg.Add(args);
         return name;
     }
@@ -958,29 +993,39 @@ partial class CodeEditor {
             return;
         }
         if (code == 8) {
-            if (selActive) { ClearExtraCarets(); DeleteSelection(); }
-            else if (carets.Count > 0) { McBackspace(); }
-            else {
-                // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧
-                string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
-                if (curCol > 0 && curCol < ln.Length) {
-                    string lCh = ln.Substring(curCol - 1, 1);
-                    string rCh = ln.Substring(curCol, 1);
-                    if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                        || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                        || (lCh == "'" && rCh == "'")) {
-                        SaveUndo();
-                        lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
-                        curCol = curCol - 1;
-                        UpdateCompletion();
-                        app.RequestRedraw();
-                        return;
-                    }
-                }
-                SaveUndoBackspace(); BackspaceEdit();
+            if (selActive) {
+                ClearExtraCarets();
+                DeleteSelection();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
             }
+            if (carets.Count > 0) {
+                McBackspace();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
+            }
+            // 工业级成对删除：光标在 () [] {} "" '' 中间时退格同时删除两侧
+            string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
+            if (curCol > 0 && curCol < ln.Length) {
+                string lCh = ln.Substring(curCol - 1, 1);
+                string rCh = ln.Substring(curCol, 1);
+                if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
+                    || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
+                    || (lCh == "'" && rCh == "'")) {
+                    SaveUndo();
+                    lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
+                    curCol = curCol - 1;
+                    UpdateCompletion();
+                    app.RequestRedraw();
+                    return;
+                }
+            }
+            SaveUndoBackspace(); BackspaceEdit();
             UpdateCompletion();
             app.RequestRedraw();
+            return;
         } else if (code == 13) {
             EndUndoGroup();
             if (acActive) { AcceptCompletion(false); }
@@ -1215,29 +1260,36 @@ partial class CodeEditor {
             if (selActive) {
                 ClearExtraCarets();
                 DeleteSelection();
-            } else if (carets.Count > 0) {
-                McBackspace();
-            } else {
-                string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
-                if (curCol > 0 && curCol < ln.Length) {
-                    string lCh = ln.Substring(curCol - 1, 1);
-                    string rCh = ln.Substring(curCol, 1);
-                    if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
-                        || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
-                        || (lCh == "'" && rCh == "'")) {
-                        SaveUndo();
-                        lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
-                        curCol = curCol - 1;
-                        UpdateCompletion();
-                        app.RequestRedraw();
-                        return;
-                    }
-                }
-                SaveUndoBackspace();
-                BackspaceEdit();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
             }
+            if (carets.Count > 0) {
+                McBackspace();
+                UpdateCompletion();
+                app.RequestRedraw();
+                return;
+            }
+            string ln = curLine >= 0 && curLine < lines.Count ? lines[curLine] : "";
+            if (curCol > 0 && curCol < ln.Length) {
+                string lCh = ln.Substring(curCol - 1, 1);
+                string rCh = ln.Substring(curCol, 1);
+                if ((lCh == "(" && rCh == ")") || (lCh == "[" && rCh == "]")
+                    || (lCh == "{" && rCh == "}") || (lCh == "\"" && rCh == "\"")
+                    || (lCh == "'" && rCh == "'")) {
+                    SaveUndo();
+                    lines[curLine] = ln.Substring(0, curCol - 1) + ln.Substring(curCol + 1, ln.Length - (curCol + 1));
+                    curCol = curCol - 1;
+                    UpdateCompletion();
+                    app.RequestRedraw();
+                    return;
+                }
+            }
+            SaveUndoBackspace();
+            BackspaceEdit();
             UpdateCompletion();
             app.RequestRedraw();
+            return;
         }
         else if (kc == 46) {
             EndUndoGroup();
