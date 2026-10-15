@@ -28,7 +28,24 @@ class BigNum {
         if (v < 1000) { return sign + Convert.ToString((int)v); }
         int tier = 0;
         long scaled = v;
-        /* 归约到 [1000, 999999]：每除一次进一个千进制档。 */
+        /* 分档快速跳跃，避免多重 64 位长除法循环 */
+        if (scaled >= 1000000000000000000L) {
+            scaled = scaled / 1000000000000000L;
+            tier = 5;
+        } else if (scaled >= 1000000000000000L) {
+            scaled = scaled / 1000000000000L;
+            tier = 4;
+        } else if (scaled >= 1000000000000L) {
+            scaled = scaled / 1000000000L;
+            tier = 3;
+        } else if (scaled >= 1000000000L) {
+            scaled = scaled / 1000000L;
+            tier = 2;
+        } else if (scaled >= 1000000L) {
+            scaled = scaled / 1000L;
+            tier = 1;
+        }
+        /* 兜底边界归约到 [1000, 999999] */
         while (scaled >= 1000000 && tier < 10) {
             scaled = scaled / 1000;
             tier = tier + 1;
@@ -56,7 +73,13 @@ class BigNum {
             long hi = v / 1000000000;
             long lo = v % 1000000000;
             string los = Convert.ToString((int)lo);
-            while (los.Length < 9) { los = "0" + los; }
+            int pad = 9 - los.Length;
+            if (pad > 0) {
+                byte[] pbuf = new byte[9];
+                for (int pi = 0; pi < pad; pi = pi + 1) { pbuf[pi] = (byte)48; }
+                for (int pj = 0; pj < los.Length; pj = pj + 1) { pbuf[pad + pj] = (byte)(los[pj] & 255); }
+                los = pbuf.ToStr(0, 9);
+            }
             s = GroupDigits(Convert.ToString((int)hi) + los);
         } else {
             s = GroupDigits(Convert.ToString((int)v));
@@ -64,19 +87,28 @@ class BigNum {
         return sign + s;
     }
 
-    // 纯数字串按 3 位分组（无符号，调用方已保证形状）。
+    // 纯数字串按 3 位分组（无符号，单次字节缓冲区构造消除反复字符串拼接）。
     static string GroupDigits(string digits) {
-        if (digits.Length <= 3) { return digits; }
-        string head = digits.Substring(0, digits.Length % 3);
-        if (head == "") { head = digits.Substring(0, 3); }
-        string tail = digits.Substring(head.Length);
-        string outp = head;
-        int i = 0;
-        while (i + 3 <= tail.Length) {
-            outp = outp + "," + tail.Substring(i, 3);
-            i = i + 3;
+        int len = digits.Length;
+        if (len <= 3) { return digits; }
+        int commas = (len - 1) / 3;
+        int newLen = len + commas;
+        byte[] buf = new byte[newLen];
+        int src = len - 1;
+        int dst = newLen - 1;
+        int grp = 0;
+        while (src >= 0) {
+            if (grp == 3) {
+                buf[dst] = (byte)44;
+                dst = dst - 1;
+                grp = 0;
+            }
+            buf[dst] = (byte)(digits[src] & 255);
+            dst = dst - 1;
+            src = src - 1;
+            grp = grp + 1;
         }
-        return outp;
+        return buf.ToStr(0, newLen);
     }
 
     // 当前值换算成 double（用于与公式库互操作；>2^53 精度自然损失，
