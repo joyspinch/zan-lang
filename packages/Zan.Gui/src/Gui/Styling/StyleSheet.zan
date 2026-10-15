@@ -639,7 +639,7 @@ class StyleSheet {
     // 派发走同一条路径，因此新增属性不会和这份清单脱节）。
     // 会改到盒子的探针无妨：盒子是新建的，用完即弃。
     static bool Known(string key) {
-        if (key == "" || key.Substring(0, 1) == "_") { return false; }
+        if (key == "" || (key[0] & 255) == 95) { return false; }
         if (StyleSheet.Inert(key)) { return false; }
         StyleBox probe = new StyleBox();
         return StyleSheet.Decl(probe, key, "1");
@@ -650,7 +650,7 @@ class StyleSheet {
     static bool SupportsDecl(string prop, string val) {
         string p = StyleSheet.StripVendor(StyleSheet.Lower(StyleSheet.Trim(prop)));
         if (p == "" || val == "") { return false; }
-        if (p.Length > 2 && p.Substring(0, 2) == "--") { return true; }
+        if (p.Length > 2 && (p[0] & 255) == 45 && (p[1] & 255) == 45) { return true; }
         if (!StyleSheet.GuardValueKnown(p, val)) { return false; }
         StyleBox probe = new StyleBox();
         return StyleSheet.Decl(probe, p, val);
@@ -2294,7 +2294,7 @@ class StyleSheet {
     static int ParseColorRaw(string val) {
         string s = StyleSheet.Trim(val);
         if (s.Length == 0) { return 0; }
-        if (s.Substring(0, 1) == "#") {
+        if ((s[0] & 255) == 35) {
             string h = s.Substring(1, s.Length - 1);
             if (h.Length == 3) {
                 string r = h.Substring(0, 1);
@@ -2310,7 +2310,7 @@ class StyleSheet {
                 h = a + a + r + r + g + g + b + b;
             }
             if (h.Length == 6) { h = "FF" + h; }
-            if (h.Length == 8 && StyleSheet.HexDigit(h.Substring(0, 1)) < 0) { return 0; }
+            if (h.Length == 8 && StyleSheet.HexDigitByte(h[0] & 255) < 0) { return 0; }
             if (h.Length != 8) { return 0; }
             return StyleSheet.HexToInt(h);
         }
@@ -2862,76 +2862,77 @@ class StyleSheet {
         if (name == "yellowgreen") { return StyleSheet.Pack(255, 154, 205, 50); }
     }
 
+    // 单个十六进制字节的数值（0-15），非十六进制时 -1（ASCII 区间快速计算，消除 16 次字符串比对）。
+    static int HexDigitByte(int b) {
+        if (b >= 48 && b <= 57) { return b - 48; }
+        if (b >= 97 && b <= 102) { return b - 87; }
+        if (b >= 65 && b <= 70) { return b - 55; }
+        return -1;
+    }
+
     // 将十六进制字符串（最多 8 位）转换为打包 int。最高位为 1
     // （alpha >= 0x80）自然产生负数，与 Theme token 一致。
     static int HexToInt(string h) {
+        if (h == null) { return 0; }
         int acc = 0;
-        for (int i = 0; i < h.Length; i = i + 1) {
-            int d = StyleSheet.HexDigit(h.Substring(i, 1));
+        int len = h.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int d = StyleSheet.HexDigitByte(h[i] & 255);
             if (d < 0) { return 0; }
-            acc = (acc * 16) + d;
+            acc = (acc << 4) | d;
         }
         return acc;
     }
 
     // 单个十六进制字符的值（0-15），非十六进制时 -1。
     static int HexDigit(string ch) {
-        if (ch == "0") { return 0; }
-        if (ch == "1") { return 1; }
-        if (ch == "2") { return 2; }
-        if (ch == "3") { return 3; }
-        if (ch == "4") { return 4; }
-        if (ch == "5") { return 5; }
-        if (ch == "6") { return 6; }
-        if (ch == "7") { return 7; }
-        if (ch == "8") { return 8; }
-        if (ch == "9") { return 9; }
-        if (ch == "a" || ch == "A") { return 10; }
-        if (ch == "b" || ch == "B") { return 11; }
-        if (ch == "c" || ch == "C") { return 12; }
-        if (ch == "d" || ch == "D") { return 13; }
-        if (ch == "e" || ch == "E") { return 14; }
-        if (ch == "f" || ch == "F") { return 15; }
-        return -1;
+        if (ch == null || ch.Length == 0) { return -1; }
+        return StyleSheet.HexDigitByte(ch[0] & 255);
     }
 
     // 字符是否为十进制数字。
     static bool Digit(string ch) {
-        int d = StyleSheet.HexDigit(ch);
-        return d >= 0 && d <= 9;
+        if (ch == null || ch.Length == 0) { return false; }
+        int b = ch[0] & 255;
+        return b >= 48 && b <= 57;
     }
 
     // token 读作数字时返回 true（可选符号、十进制、带
     // px/ms/s/%/deg 等单位后缀），而非关键字或颜色。
     static bool IsNumeric(string tok) {
         string s = StyleSheet.Trim(tok);
-        if (s.Length == 0) { return false; }
-        string first = s.Substring(0, 1);
-        if (first == "-" || first == "+" || first == ".") {
-            if (s.Length < 2) { return false; }
-            return StyleSheet.Digit(s.Substring(1, 1));
+        int len = s.Length;
+        if (len == 0) { return false; }
+        int b0 = s[0] & 255;
+        if (b0 == 45 || b0 == 43 || b0 == 46) {
+            if (len < 2) { return false; }
+            int b1 = s[1] & 255;
+            return b1 >= 48 && b1 <= 57;
         }
-        return StyleSheet.Digit(first);
+        return b0 >= 48 && b0 <= 57;
     }
 
     // 将 CSS 长度/数字转为 int：感知符号、容忍单位（`12px`、`-4`、
     // `1.5rem` -> 1、`200ms`），非数字 token 返回 0。
     static int Num(string val) {
         string s = StyleSheet.Trim(val);
-        if (s.Length == 0) { return 0; }
+        int len = s.Length;
+        if (len == 0) { return 0; }
         int sign = 1;
         int i = 0;
-        if (s.Substring(0, 1) == "-") { sign = -1; i = 1; }
-        else if (s.Substring(0, 1) == "+") { i = 1; }
+        int b0 = s[0] & 255;
+        if (b0 == 45) { sign = -1; i = 1; }
+        else if (b0 == 43) { i = 1; }
         int acc = 0;
         bool any = false;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (!StyleSheet.Digit(ch)) { i = s.Length; }
-            else {
-                acc = acc * 10 + StyleSheet.HexDigit(ch);
+        while (i < len) {
+            int b = s[i] & 255;
+            if (b >= 48 && b <= 57) {
+                acc = acc * 10 + (b - 48);
                 any = true;
                 i = i + 1;
+            } else {
+                break;
             }
         }
         if (!any) { return 0; }
