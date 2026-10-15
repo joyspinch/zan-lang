@@ -150,6 +150,8 @@ static zgl_uint g_game_instance_vbo;
 static int32_t g_game_batch_surface = -1;
 static zan_gpu_frame g_game_batch_frame;
 static int g_game_batch_clip_empty;
+static zgl_uint g_game_batch_prog = 0;
+static zgl_uint g_game_batch_tex = 0;
 static int g_game_cleanup_registered;
 static uint32_t g_game_next_mesh_id = 1;
 
@@ -692,6 +694,8 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch_begin(int32_t surface_id) {
     g_game_batch_frame = frame;
     g_game_batch_clip_empty = !clip_w || !clip_h;
     g_game_batch_surface = surface_id;
+    g_game_batch_prog = 0;
+    g_game_batch_tex = 0;
     return 1;
 }
 
@@ -750,10 +754,16 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch(int32_t surface_id, int32_t mesh_id,
             sizeof(float)), instances);
     gl->BindBuffer(ZGL_ARRAY_BUFFER, 0);
     if (!zan_game_mesh_inst_ready(mesh, gl)) return 0;
-    gl->UseProgram(prog->program);
-    gl->ActiveTexture(ZGL_TEXTURE0);
-    gl->BindTexture(ZGL_TEXTURE_2D, tex);
-    gl->Uniform1i(prog->u_tex, 0);
+    if (prog->program != g_game_batch_prog) {
+        gl->UseProgram(prog->program);
+        gl->Uniform1i(prog->u_tex, 0);
+        g_game_batch_prog = prog->program;
+    }
+    if (tex != g_game_batch_tex) {
+        gl->ActiveTexture(ZGL_TEXTURE0);
+        gl->BindTexture(ZGL_TEXTURE_2D, tex);
+        g_game_batch_tex = tex;
+    }
     gl->BindVertexArray(mesh->vao);
     gl->DrawElementsInstanced(ZGL_TRIANGLES, mesh->index_count,
         ZGL_UNSIGNED_SHORT, NULL, count);
@@ -766,6 +776,8 @@ ZAN_GAME_API int32_t zan_game_draw3d_batch_end(int32_t surface_id) {
     if (g_game_gl) g_game_gl->Finish();
     g_game_batch_surface = -1;
     g_game_batch_clip_empty = 0;
+    g_game_batch_prog = 0;
+    g_game_batch_tex = 0;
     zan_gui_gpu_end(surface_id);
     return 1;
 }
