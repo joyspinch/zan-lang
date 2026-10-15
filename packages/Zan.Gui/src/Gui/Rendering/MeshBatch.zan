@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.Intrinsics;
 
 namespace Gui;
 
@@ -75,23 +76,25 @@ class MeshBatch {
 
     // 装一个实例。缓冲满时静默丢弃（容量在 Create 时定）。
     // mvpColumnMajor 为 16 个 float（列主序）；tintArgb 为 0xAARRGGBB。
+    // 采用 128 位 SIMD 流水线直接写入 NativeMemory 缓冲，彻底规避逐元素标量拷贝与 Span 开销。
     public void Add(int mesh, string texture, float[] mvpColumnMajor,
                     int tintArgb) {
         if (this.count >= this.capInstances) { return; }
         if (mvpColumnMajor == null || mvpColumnMajor.Length < 16) { return; }
-        nint p = this.buf + this.count * 80;
-        Span<float> sf = new Span<float>(p, 20);
-        for (int i = 0; i < 16; i = i + 1) { sf[i] = mvpColumnMajor[i]; }
+        nint p = this.buf + (nint)(this.count * 80);
+        Vector128.Store(p, Vector128.Load(mvpColumnMajor, 0));
+        Vector128.Store(p + (nint)16, Vector128.Load(mvpColumnMajor, 4));
+        Vector128.Store(p + (nint)32, Vector128.Load(mvpColumnMajor, 8));
+        Vector128.Store(p + (nint)48, Vector128.Load(mvpColumnMajor, 12));
         if (tintArgb == -1) {
-            sf[16] = 1.0f;
-            sf[17] = 1.0f;
-            sf[18] = 1.0f;
-            sf[19] = 1.0f;
+            Vector128.Store(p + (nint)64, Vector128.Create(1.0f));
         } else {
-            sf[16] = (float)((tintArgb >> 16) & 255) * 0.0039215686f;
-            sf[17] = (float)((tintArgb >> 8) & 255) * 0.0039215686f;
-            sf[18] = (float)(tintArgb & 255) * 0.0039215686f;
-            sf[19] = (float)((tintArgb >> 24) & 255) * 0.0039215686f;
+            Vector128.Store(p + (nint)64, Vector128.Create(
+                (float)((tintArgb >> 16) & 255) * 0.0039215686f,
+                (float)((tintArgb >> 8) & 255) * 0.0039215686f,
+                (float)(tintArgb & 255) * 0.0039215686f,
+                (float)((tintArgb >> 24) & 255) * 0.0039215686f
+            ));
         }
         int texId = GetOrAddTexture(texture);
         this.meshIds[this.count] = mesh;
@@ -102,23 +105,21 @@ class MeshBatch {
     // 装一个实例（Mat4 直通重载，原位转置写入原生缓冲，彻底消除逐实例 float[16] 临时数组分配）。
     public void Add(int mesh, string texture, Mat4 mvp, int tintArgb) {
         if (this.count >= this.capInstances || mvp == null || mvp.m == null || mvp.m.Length < 16) { return; }
-        nint p = this.buf + this.count * 80;
-        Span<float> sf = new Span<float>(p, 20);
+        nint p = this.buf + (nint)(this.count * 80);
         float[] m = mvp.m;
-        sf[0] = m[0];  sf[1] = m[4];  sf[2] = m[8];   sf[3] = m[12];
-        sf[4] = m[1];  sf[5] = m[5];  sf[6] = m[9];   sf[7] = m[13];
-        sf[8] = m[2];  sf[9] = m[6];  sf[10] = m[10]; sf[11] = m[14];
-        sf[12] = m[3]; sf[13] = m[7]; sf[14] = m[11]; sf[15] = m[15];
+        Vector128.Store(p, Vector128.Create(m[0], m[4], m[8], m[12]));
+        Vector128.Store(p + (nint)16, Vector128.Create(m[1], m[5], m[9], m[13]));
+        Vector128.Store(p + (nint)32, Vector128.Create(m[2], m[6], m[10], m[14]));
+        Vector128.Store(p + (nint)48, Vector128.Create(m[3], m[7], m[11], m[15]));
         if (tintArgb == -1) {
-            sf[16] = 1.0f;
-            sf[17] = 1.0f;
-            sf[18] = 1.0f;
-            sf[19] = 1.0f;
+            Vector128.Store(p + (nint)64, Vector128.Create(1.0f));
         } else {
-            sf[16] = (float)((tintArgb >> 16) & 255) * 0.0039215686f;
-            sf[17] = (float)((tintArgb >> 8) & 255) * 0.0039215686f;
-            sf[18] = (float)(tintArgb & 255) * 0.0039215686f;
-            sf[19] = (float)((tintArgb >> 24) & 255) * 0.0039215686f;
+            Vector128.Store(p + (nint)64, Vector128.Create(
+                (float)((tintArgb >> 16) & 255) * 0.0039215686f,
+                (float)((tintArgb >> 8) & 255) * 0.0039215686f,
+                (float)(tintArgb & 255) * 0.0039215686f,
+                (float)((tintArgb >> 24) & 255) * 0.0039215686f
+            ));
         }
         int texId = GetOrAddTexture(texture);
         this.meshIds[this.count] = mesh;
