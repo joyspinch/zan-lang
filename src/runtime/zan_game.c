@@ -27,10 +27,20 @@ typedef struct {
 
 static zan_game_sprite g_game_sprites[ZAN_GAME_SPRITE_CAP];
 static int g_game_sprite_count;
+static int g_game_last_sprite_idx = -1;
 
 static int32_t zan_game_find_sprite(const char *key) {
-    for (int i = 0; i < g_game_sprite_count; ++i)
-        if (strcmp(g_game_sprites[i].key, key) == 0) return i + 1;
+    if (!key) return 0;
+    if (g_game_last_sprite_idx >= 0 && g_game_last_sprite_idx < g_game_sprite_count) {
+        if (strcmp(g_game_sprites[g_game_last_sprite_idx].key, key) == 0)
+            return g_game_last_sprite_idx + 1;
+    }
+    for (int i = 0; i < g_game_sprite_count; ++i) {
+        if (strcmp(g_game_sprites[i].key, key) == 0) {
+            g_game_last_sprite_idx = i;
+            return i + 1;
+        }
+    }
     return 0;
 }
 
