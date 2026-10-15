@@ -21,6 +21,13 @@ class LootScatter {
     bool[] isSettled;  // 是否已平稳落地可拾取
     Random rnd;
 
+    // 空闲槽位栈与运动项紧凑表：Burst O(1) 取槽、Update O(movingCount) 仅迭代空中弹跳物品
+    int[] freeStack;
+    int freeTop;
+    int[] movingList;
+    int[] movingPos;
+    int movingCount;
+
     LootScatter(int cap) {
         this.capacity = cap > 0 ? cap : 512;
         this.activeCount = 0;
@@ -37,6 +44,16 @@ class LootScatter {
         this.velZ = new double[capacity];
         this.bounceCount = new int[capacity];
         this.isSettled = new bool[capacity];
+
+        this.freeStack = new int[capacity];
+        this.movingList = new int[capacity];
+        this.movingPos = new int[capacity];
+        for (int i = 0; i < capacity; i = i + 1) {
+            this.freeStack[i] = capacity - 1 - i;
+            this.movingPos[i] = -1;
+        }
+        this.freeTop = capacity;
+        this.movingCount = 0;
     }
 
     static LootScatter Create(int cap) {
@@ -55,14 +72,9 @@ class LootScatter {
     // 在 (originX, originY) 处引爆多件战利品向四周喷射。
     void Burst(double originX, double originY, int count, int startItemId) {
         for (int i = 0; i < count; i = i + 1) {
-            int slot = -1;
-            for (int s = 0; s < capacity; s = s + 1) {
-                if (!active[s]) {
-                    slot = s;
-                    break;
-                }
-            }
-            if (slot < 0) { break; }
+            if (freeTop <= 0) { break; }
+            freeTop = freeTop - 1;
+            int slot = freeStack[freeTop];
 
             active[slot] = true;
             itemIds[slot] = startItemId + i;
@@ -80,16 +92,31 @@ class LootScatter {
             bounceCount[slot] = 3;
             isSettled[slot] = false;
 
+            movingPos[slot] = movingCount;
+            movingList[movingCount] = slot;
+            movingCount = movingCount + 1;
+
             activeCount = activeCount + 1;
         }
     }
 
     // 逐物理步长更新弹跳重力模拟。
+    // 仅迭代处于空中弹跳状态的项（movingList），物品落地静止后 O(1) 移出。
     void Update(double dt) {
         double gravity = 600.0;  // 重力加速度 (px/s^2)
 
-        for (int i = 0; i < capacity; i = i + 1) {
-            if (!active[i] || isSettled[i]) { continue; }
+        int m = 0;
+        while (m < movingCount) {
+            int i = movingList[m];
+            if (!active[i] || isSettled[i]) {
+                int last = movingCount - 1;
+                int moving = movingList[last];
+                movingList[m] = moving;
+                movingPos[moving] = m;
+                movingPos[i] = -1;
+                movingCount = last;
+                continue;
+            }
 
             // 水平滑行衰减
             posX[i] = posX[i] + velX[i] * dt;
@@ -109,13 +136,23 @@ class LootScatter {
                     velZ[i] = -velZ[i] * 0.45;  // 45% 弹性恢复系数
                     velX[i] = velX[i] * 0.6;
                     velY[i] = velY[i] * 0.6;
+                    m = m + 1;
                 } else {
                     // 彻底落地静止
                     velX[i] = 0.0;
                     velY[i] = 0.0;
                     velZ[i] = 0.0;
                     isSettled[i] = true;
+                    // O(1) 移出 movingList
+                    int last = movingCount - 1;
+                    int moving = movingList[last];
+                    movingList[m] = moving;
+                    movingPos[moving] = m;
+                    movingPos[i] = -1;
+                    movingCount = last;
                 }
+            } else {
+                m = m + 1;
             }
         }
     }
@@ -125,6 +162,8 @@ class LootScatter {
         if (slot >= 0 && slot < capacity && active[slot] && isSettled[slot]) {
             active[slot] = false;
             activeCount = activeCount - 1;
+            freeStack[freeTop] = slot;
+            freeTop = freeTop + 1;
             return true;
         }
         return false;

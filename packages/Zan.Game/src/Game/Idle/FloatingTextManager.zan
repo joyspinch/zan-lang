@@ -9,13 +9,22 @@ namespace Game.Idle;
 class FloatingTextManager {
     FloatingTextItem[] pool;
     int maxCount;
+    int[] freeStack;
+    int freeTop;
+    int[] activeList;
+    int activeCount;
 
     FloatingTextManager(int capacity) {
         this.maxCount = capacity > 16 ? capacity : 128;
         this.pool = new FloatingTextItem[this.maxCount];
+        this.freeStack = new int[this.maxCount];
+        this.activeList = new int[this.maxCount];
         for (int i = 0; i < this.maxCount; i = i + 1) {
             this.pool[i] = FloatingTextItem.Create();
+            this.freeStack[i] = this.maxCount - 1 - i;
         }
+        this.freeTop = this.maxCount;
+        this.activeCount = 0;
     }
 
     static FloatingTextManager Create(int capacity) {
@@ -24,13 +33,7 @@ class FloatingTextManager {
 
     int ActiveCount {
         get {
-            int cnt = 0;
-            for (int i = 0; i < maxCount; i = i + 1) {
-                if (pool[i] != null && pool[i].Active) {
-                    cnt = cnt + 1;
-                }
-            }
-            return cnt;
+            return activeCount;
         }
     }
 
@@ -48,34 +51,58 @@ class FloatingTextManager {
         Spawn(x, y, txt, 0xFFE066, 1.1, false, 0.8);
     }
 
-    // 底层生成跳字。
+    // 底层生成跳字（O(1) 槽位分配与活跃表维护）。
     void Spawn(double x, double y, string text, int color, double scale, bool isCrit, double duration) {
-        for (int i = 0; i < maxCount; i = i + 1) {
-            if (pool[i] != null && !pool[i].Active) {
-                pool[i].Spawn(x, y, text, color, scale, isCrit, duration);
-                return;
+        int slot = -1;
+        if (freeTop > 0) {
+            freeTop = freeTop - 1;
+            slot = freeStack[freeTop];
+            activeList[activeCount] = slot;
+            activeCount = activeCount + 1;
+        } else if (activeCount > 0) {
+            // 若满，覆盖最旧项 (activeList[0])
+            slot = activeList[0];
+            for (int i = 0; i < activeCount - 1; i = i + 1) {
+                activeList[i] = activeList[i + 1];
             }
+            activeList[activeCount - 1] = slot;
         }
-        // 若满，覆盖最旧项
-        if (pool[0] != null) {
-            pool[0].Spawn(x, y, text, color, scale, isCrit, duration);
+        if (slot >= 0 && slot < maxCount && pool[slot] != null) {
+            pool[slot].Spawn(x, y, text, color, scale, isCrit, duration);
         }
     }
 
-    // 时钟推进。
+    // 时钟推进：仅遍历活跃跳字，过期项 O(1) 移出归还空闲栈。
     void Update(double dt) {
-        for (int i = 0; i < maxCount; i = i + 1) {
-            if (pool[i] != null && pool[i].Active) {
-                pool[i].Update(dt);
+        int i = 0;
+        while (i < activeCount) {
+            int slot = activeList[i];
+            FloatingTextItem item = pool[slot];
+            if (item != null && item.Active) {
+                item.Update(dt);
+                if (!item.Active) {
+                    freeStack[freeTop] = slot;
+                    freeTop = freeTop + 1;
+                    activeCount = activeCount - 1;
+                    activeList[i] = activeList[activeCount];
+                } else {
+                    i = i + 1;
+                }
+            } else {
+                freeStack[freeTop] = slot;
+                freeTop = freeTop + 1;
+                activeCount = activeCount - 1;
+                activeList[i] = activeList[activeCount];
             }
         }
     }
 
-    // 极速渲染所有活跃跳字。
+    // 极速渲染所有活跃跳字（仅扫描 activeList，无空转开销）。
     void Render(Canvas c, Camera2D cam) {
         if (c == null) { return; }
-        for (int i = 0; i < maxCount; i = i + 1) {
-            FloatingTextItem item = pool[i];
+        for (int i = 0; i < activeCount; i = i + 1) {
+            int slot = activeList[i];
+            FloatingTextItem item = pool[slot];
             if (item != null && item.Active) {
                 double sx = item.X;
                 double sy = item.Y;
