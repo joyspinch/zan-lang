@@ -617,29 +617,31 @@ class Css {
         return -1;
     }
 
-    // s 是否以 prefix 开头。
+    // s 是否以 prefix 开头（原生零分配比较）。
     static bool StartsWithStr(string s, string prefix) {
-        if (s.Length < prefix.Length) { return false; }
-        return s.Substring(0, prefix.Length) == prefix;
+        if (s == null || prefix == null) { return false; }
+        return s.StartsWith(prefix);
     }
 
     // 与 `open`（一个 `{` 的下标）配对的那个 `}`，按嵌套深度找；
     // 没有配对时返回 -1。引号里的花括号不计数（`content: "}"`）。
+    // （纯字节扫描消除每字符临时子串分配）
     static int MatchBrace(string s, int open) {
         int depth = 0;
         int i = open;
-        string quote = "";
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (quote != "") {
-                if (ch == "\\") { i = i + 2; continue; }
-                if (ch == quote) { quote = ""; }
+        int quote = 0;
+        int len = s.Length;
+        while (i < len) {
+            int ch = s[i] & 255;
+            if (quote != 0) {
+                if (ch == 92) { i = i + 2; continue; }
+                if (ch == quote) { quote = 0; }
                 i = i + 1;
                 continue;
             }
-            if (ch == "\"" || ch == "'") { quote = ch; }
-            else if (ch == "{") { depth = depth + 1; }
-            else if (ch == "}") {
+            if (ch == 34 || ch == 39) { quote = ch; }
+            else if (ch == 123) { depth = depth + 1; }
+            else if (ch == 125) {
                 depth = depth - 1;
                 if (depth == 0) { return i; }
             }
@@ -912,13 +914,15 @@ class Css {
     // 与 `open`（一个 `(` 的下标）配对的那个 `)`，按嵌套深度找；
     // 没有配对时返回 -1。`var(--x, rgba(0,0,0,.4))` 的第一个 `)` 是
     // 内层 rgba 的，直接取会把回退值截断成 `rgba(0,0,0,.4`。
+    // （纯字节扫描消除每字符临时子串分配）
     static int MatchParen(string s, int open) {
         int depth = 0;
         int i = open;
-        while (i < s.Length) {
-            string ch = s.Substring(i, 1);
-            if (ch == "(") { depth = depth + 1; }
-            else if (ch == ")") {
+        int len = s.Length;
+        while (i < len) {
+            int ch = s[i] & 255;
+            if (ch == 40) { depth = depth + 1; } // '('
+            else if (ch == 41) { // ')'
                 depth = depth - 1;
                 if (depth == 0) { return i; }
             }
@@ -930,11 +934,12 @@ class Css {
     // `s` 中第一个括号外层的 `,` 下标，没有时 -1。
     static int TopComma(string s) {
         int depth = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (ch == "(") { depth = depth + 1; }
-            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
-            else if (ch == "," && depth == 0) { return i; }
+        int len = s.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int ch = s[i] & 255;
+            if (ch == 40) { depth = depth + 1; }
+            else if (ch == 41) { if (depth > 0) { depth = depth - 1; } }
+            else if (ch == 44 && depth == 0) { return i; } // ','
         }
         return -1;
     }
@@ -971,27 +976,31 @@ class Css {
     // 不拆，因此 `linear-gradient(90deg, rgba(0,0,0,.5), #fff)` 的
     // 函数式颜色停靠点、`[class="a,b"]` 的属性值、`tab:is(.a, .b)`
     // 的选择器列表都作为整体保留。
+    // （使用直接字节扫描，杜绝每字符分配 1 个字符的中间小字符串）
     static List<string> SplitTopTrim(string s, string sep) {
         List<string> outp = new List<string>();
+        if (s == null || s.Length == 0) { return outp; }
+        int sepByte = sep[0] & 255;
         int depth = 0;
-        string quote = "";
+        int quote = 0;
         int start = 0;
-        for (int i = 0; i < s.Length; i = i + 1) {
-            string ch = s.Substring(i, 1);
-            if (quote != "") {
-                if (ch == "\\") { i = i + 1; continue; }
-                if (ch == quote) { quote = ""; }
+        int len = s.Length;
+        for (int i = 0; i < len; i = i + 1) {
+            int ch = s[i] & 255;
+            if (quote != 0) {
+                if (ch == 92) { i = i + 1; continue; } // '\\'
+                if (ch == quote) { quote = 0; }
                 continue;
             }
-            if (ch == "\"" || ch == "'") { quote = ch; continue; }
-            if (ch == "(") { depth = depth + 1; }
-            else if (ch == ")") { if (depth > 0) { depth = depth - 1; } }
-            else if (ch == sep && depth == 0) {
+            if (ch == 34 || ch == 39) { quote = ch; continue; } // '"' 或 '\''
+            if (ch == 40) { depth = depth + 1; } // '('
+            else if (ch == 41) { if (depth > 0) { depth = depth - 1; } } // ')'
+            else if (ch == sepByte && depth == 0) {
                 outp.Add(Css.Trim(s.Substring(start, i - start)));
                 start = i + 1;
             }
         }
-        outp.Add(Css.Trim(s.Substring(start, s.Length - start)));
+        outp.Add(Css.Trim(s.Substring(start, len - start)));
         return outp;
     }
 
