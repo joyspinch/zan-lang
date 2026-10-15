@@ -62,6 +62,11 @@ class StyleSheet {
     // 结构性伪类）。这类规则只在 retained 控件树上命中，且命中结果
     // 随节点位置变化——Style.Resolve 因此把位置签名加进缓存键。
     bool relational;
+    // 标记表中是否存在 !important 规则；绝大部分样式表无此类规则，
+    // 置 false 时 ApplyImportantCtx 可在 O(1) 彻底旁路，免除二次全规则遍历。
+    bool hasImportant;
+    bool hasMediaImportant;
+    List<int> importantRules;
 
     // ---- @media 规则（运行期按窗口/主题求值）----
     // 与 rules 分开存：同一选择器可能同时有守卫/无守卫两份声明，
@@ -82,6 +87,9 @@ class StyleSheet {
         this.atGuardsSkipped = 0;
         this.atRuleGuards = new Dict<string, int>();
         this.lintGen = 0 - 1;
+        this.hasImportant = false;
+        this.hasMediaImportant = false;
+        this.importantRules = new List<int>();
     }
 
     // 记下一条被跳过的 at-rule（Css 解析器调用）。
@@ -132,6 +140,9 @@ class StyleSheet {
             this.mediaEntries = new List<StyleMediaEntry>();
         }
         JsonValue imp = block == null ? null : block.Get("__zan_important");
+        if (imp != null && imp.IsObject() && imp.Count() > 0) {
+            this.hasMediaImportant = true;
+        }
         this.mediaEntries.Add(new StyleMediaEntry(p, block, imp, cond));
         this.mediaCount = this.mediaCount + 1;
     }
@@ -356,28 +367,17 @@ class StyleSheet {
 
     void ApplyImportantCtx(StyleBox b, string type, string cls, string id,
                            string part, int stateBits, Control node) {
+        if (!this.hasImportant && !this.hasMediaImportant) {
+            return;
+        }
         List<string> want = Style.Classes(cls);
-        List<int> typed = null;
-        if (type != "") { this.byType.TryGetValue(type, out typed); }
-        int a = 0;
-        int c = 0;
-        bool more = true;
-        while (more) {
-            int ia = 0 - 1;
-            int ic = 0 - 1;
-            if (typed != null && a < typed.Count) { ia = typed[a]; }
-            if (c < anyType.Count) { ic = anyType[c]; }
-            if (ia < 0 && ic < 0) {
-                more = false;
-            } else {
-                int i;
-                if (ic < 0 || (ia >= 0 && ia < ic)) { i = ia; a = a + 1; }
-                else { i = ic; c = c + 1; }
-                if (!this.MatchesCtx(i, type, want, id, part, stateBits, cls,
-                                     node)) {
+        if (this.hasImportant && this.importantRules != null) {
+            for (int idx = 0; idx < this.importantRules.Count; idx = idx + 1) {
+                int i = this.importantRules[idx];
+                if (this.ruleEntries == null || i >= this.ruleEntries.Count) {
                     continue;
                 }
-                if (this.ruleEntries == null || i >= this.ruleEntries.Count) {
+                if (!this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) {
                     continue;
                 }
                 JsonValue imp = this.ruleEntries[i].important;
@@ -389,7 +389,9 @@ class StyleSheet {
                 }
             }
         }
-        this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, true);
+        if (this.hasMediaImportant) {
+            this.ApplyMedia(b, type, want, cls, id, part, stateBits, node, true);
+        }
     }
 
     // 把已经取到的声明块叠加到样式盒上（`!important` 由
@@ -453,7 +455,7 @@ class StyleSheet {
             // 在权重相同的规则中插入到最后（保持文档顺序）。
             int at = selSpecs.Count;
             while (at > 0 && selSpecs[at - 1] > spec) { at = at - 1; }
-            JsonValue blk = this.Block(sel);
+            JsonValue blk = this.rules.ValAt(i - 1);
             JsonValue imp = blk == null ? null : blk.Get("__zan_important");
             ruleEntries.Insert(at, new StyleRuleEntry(sel, p, blk, imp));
             selSpecs.Insert(at, spec);
@@ -461,8 +463,15 @@ class StyleSheet {
         // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
         this.byType = new Dict<string, List<int>>();
         this.anyType = new List<int>();
+        this.hasImportant = false;
+        this.importantRules = new List<int>();
         for (int k = 0; k < ruleEntries.Count; k = k + 1) {
-            string ty = ruleEntries[k].selector.type;
+            StyleRuleEntry re = ruleEntries[k];
+            if (re.important != null && re.important.IsObject() && re.important.Count() > 0) {
+                this.hasImportant = true;
+                this.importantRules.Add(k);
+            }
+            string ty = re.selector.type;
             if (ty == "") {
                 anyType.Add(k);
             } else {
@@ -2146,6 +2155,7 @@ class StyleSheet {
         StyleSheet sheet = Css.Parse(".zan-inline { " + c.inlineStyleCss + " }");
         JsonValue block = sheet.Block(".zan-inline");
         if (block == null) { return; }
+        StyleSheet.ApplyBlock(c, block);
         JsonValue dock = block.Get("dock");
         if (dock != null) { c.dock = StyleSheet.DockValue(StyleSheet.ValStr(dock)); }
         JsonValue x = block.Get("x");
