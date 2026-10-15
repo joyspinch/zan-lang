@@ -11,11 +11,16 @@ namespace Game.Graphics;
 class Mesh3DProjection {
     double pixelsPerUnit;  // 像素转 3D 单位（默认 64.0，即 64 像素 = 1 米）
     double invPixelsPerUnit; // 倒数预计算，避免逐顶点投影的浮点除法
+    double ppuHalf;        // pixelsPerUnit * 0.5 预计算
+    double ppuQuarter;     // pixelsPerUnit * 0.25 预计算
 
     // 旋转平滑参数（弧度制）
     double currentYaw;
     double targetYaw;
     double rotationSpeed;  // 角速度（弧度/秒，例如 12.0）
+    double cachedYaw;
+    double cachedCos;
+    double cachedSin;
 
     // 动作交叉融合（CrossFade）
     Animation3DTrack currentTrack;
@@ -31,9 +36,14 @@ class Mesh3DProjection {
     Mesh3DProjection(double ppu, int maxSockets) {
         this.pixelsPerUnit = ppu > 1.0 ? ppu : 64.0;
         this.invPixelsPerUnit = 1.0 / this.pixelsPerUnit;
+        this.ppuHalf = this.pixelsPerUnit * 0.5;
+        this.ppuQuarter = this.pixelsPerUnit * 0.25;
         this.currentYaw = 0.0;
         this.targetYaw = 0.0;
         this.rotationSpeed = 12.5;  // 约每秒旋转 2 圈，手感极为顺滑
+        this.cachedYaw = 10000.0;
+        this.cachedCos = 1.0;
+        this.cachedSin = 0.0;
 
         this.currentTrack = null;
         this.fadeTrack = null;
@@ -70,12 +80,8 @@ class Mesh3DProjection {
     // screenX = (X - Z) * PPU * 0.5
     // screenY = (X + Z) * PPU * 0.25 - Y * PPU
     void Project3DtoScreen(double x3d, double y3d, double z3d, out double screenX, out double screenY) {
-        double px = x3d * pixelsPerUnit;
-        double py = y3d * pixelsPerUnit;
-        double pz = z3d * pixelsPerUnit;
-
-        screenX = (px - pz) * 0.5;
-        screenY = (px + pz) * 0.25 - py;
+        screenX = (x3d - z3d) * this.ppuHalf;
+        screenY = (x3d + z3d) * this.ppuQuarter - y3d * this.pixelsPerUnit;
     }
 
     // 设置目标朝向（360度任意角度，弧度制）。
@@ -96,11 +102,17 @@ class Mesh3DProjection {
     // 获取挂点在世界 3D 空间中的坐标（叠加角色自身 3D 位置与当前朝向偏转）。
     bool GetSocketWorldPosition(string name, double charX3d, double charY3d, double charZ3d, out double outX, out double outY, out double outZ) {
         outX = charX3d; outY = charY3d; outZ = charZ3d;
+        if (socketCount <= 0) { return false; }
+        if (this.currentYaw != this.cachedYaw) {
+            this.cachedYaw = this.currentYaw;
+            this.cachedCos = Math.Cos(this.currentYaw);
+            this.cachedSin = Math.Sin(this.currentYaw);
+        }
         for (int i = 0; i < socketCount; i = i + 1) {
             BoneSocket s = sockets[i];
             if (s != null && s.Name == name) {
                 double ox = 0.0; double oy = 0.0; double oz = 0.0;
-                s.ResolveWorldOffset(currentYaw, out ox, out oy, out oz);
+                s.ResolveWorldOffsetCached(this.cachedCos, this.cachedSin, out ox, out oy, out oz);
                 outX = charX3d + ox;
                 outY = charY3d + oy;
                 outZ = charZ3d + oz;
