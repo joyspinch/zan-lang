@@ -5568,8 +5568,10 @@ int main(int argc, char **argv) {
                                  sizeof(cross_dylibs[0]), "%s", dylib);
                         cross_dylib_count++;
                     }
-                } else if (target.os == ZAN_OS_IOS && strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
-                    /* iOS 使用静态内嵌的 zanrt_gui.o 提供 GUI 原生外壳，不打桩也不需要外部 dylib */
+                } else if (target.os == ZAN_OS_IOS &&
+                           (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0 ||
+                            strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0)) {
+                    /* iOS 使用静态内嵌的 zanrt_gui.o / zanrt_image.o，不打桩也不需要外部 dylib */
                 } else {
                     int n = zan_irgen_stub_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
@@ -7735,7 +7737,7 @@ int main(int argc, char **argv) {
             }
             bool has_gui_driver = false;
             if (target.os == ZAN_OS_IOS) {
-                for (size_t li = 0; li < irgen.extern_lib_count; li++) {
+                for (int li = 0; li < irgen.extern_lib_count; li++) {
                     if (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
                         has_gui_driver = true;
                         break;
@@ -7752,6 +7754,28 @@ int main(int argc, char **argv) {
             }
             if (has_gui_driver && zan_file_exists(macrt_gui)) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_gui);
+            }
+            char macrt_image[1400] = {0};
+            snprintf(macrt_image, sizeof(macrt_image), "%s/zanrt_image.o", macrt);
+            if (!zan_file_exists(macrt_image)) {
+                if (target.os == ZAN_OS_IOS) {
+                    snprintf(macrt_image, sizeof(macrt_image), "%s/toolchain/ios/arm64/zanrt_image.o", exe_dir2);
+                    if (!zan_file_exists(macrt_image)) {
+                        snprintf(macrt_image, sizeof(macrt_image), "toolchain/ios/arm64/zanrt_image.o");
+                    }
+                }
+            }
+            bool has_image_driver = false;
+            if (target.os == ZAN_OS_IOS) {
+                for (int li = 0; li < irgen.extern_lib_count; li++) {
+                    if (strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0) {
+                        has_image_driver = true;
+                        break;
+                    }
+                }
+            }
+            if (has_image_driver && zan_file_exists(macrt_image)) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_image);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",

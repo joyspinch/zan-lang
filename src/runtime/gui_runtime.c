@@ -3041,6 +3041,8 @@ static inline int zan_gui_in_hit_guard(iptr hwnd, int x, int y) {
 #include "gui_runtime_ohos.c"
 #elif defined(ZAN_GUI_ANDROID_NATIVE)
 #include "gui_runtime_android_native.c"
+#elif defined(ZAN_GUI_IOS)
+#include "gui_runtime_ios.c"
 #elif defined(__wasm__)
 #include "gui_runtime_wasm.c"
 #else
@@ -3166,7 +3168,7 @@ const zan_gui_backend zan_cpu_backend = {
 EXPORT i32 zan_gui_set_render_backend(i32 mode) {
     const zan_gui_backend *be = NULL;
     if (mode == 1 || mode == 2) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(ZAN_GUI_IOS)
         if (zan_gui_internal_metal_supported() && zan_gui_internal_metal_install()) {
             be = &zan_metal_backend;
         } else if (zan_gui_internal_gl_install()) {
@@ -3187,7 +3189,7 @@ EXPORT i32 zan_gui_set_render_backend(i32 mode) {
     }
     if (!be) {
         zan_gui_internal_gl_drop_present();
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(ZAN_GUI_IOS)
         zan_gui_internal_metal_drop_present();
 #endif
     }

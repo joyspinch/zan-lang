@@ -10,54 +10,39 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <dlfcn.h>
 
-typedef int32_t i32;
-typedef int64_t i64;
-typedef intptr_t iptr;
-typedef uint32_t u32;
-
+#ifndef EXPORT
 #define EXPORT __attribute__((visibility("default")))
+#endif
 
-typedef void *id_t;
-typedef void *sel_t;
-typedef void *class_t;
-typedef void *method_t;
-typedef id_t (*imp_t)(id_t, sel_t, ...);
-
-extern void *dlsym(void *handle, const char *symbol);
+#ifndef RTLD_DEFAULT
 #define RTLD_DEFAULT ((void *)(intptr_t)-2)
+#endif
 
-/* Darwin POSIX declarations */
-struct timespec {
-    long tv_sec;
-    long tv_nsec;
-};
-
-extern int nanosleep(const struct timespec *req, struct timespec *rem);
-extern void *memset(void *s, int c, size_t n);
-extern void *memcpy(void *dest, const void *src, size_t n);
-
-typedef struct {
-    long __sig;
-    char __opaque[56];
-} zan_pthread_mutex_t;
-
-extern int pthread_mutex_lock(zan_pthread_mutex_t *mutex);
-extern int pthread_mutex_unlock(zan_pthread_mutex_t *mutex);
-#define ZAN_PTHREAD_MUTEX_INITIALIZER { 0x32AAABA7, {0} }
+typedef void *zan_id_t;
+typedef void *zan_sel_t;
+typedef void *zan_class_t;
+typedef void *zan_method_t;
+typedef zan_id_t (*zan_imp_t)(zan_id_t, zan_sel_t, ...);
 
 typedef struct {
     int initialized;
-    class_t (*objc_getClass)(const char *name);
-    sel_t   (*sel_registerName)(const char *str);
-    imp_t   objc_msgSend;
-    class_t (*objc_allocateClassPair)(class_t superclass, const char *name, size_t extraBytes);
-    void    (*objc_registerClassPair)(class_t cls);
-    int     (*class_addMethod)(class_t cls, sel_t name, imp_t imp, const char *types);
-    method_t (*class_getInstanceMethod)(class_t cls, sel_t name);
-    imp_t   (*method_getImplementation)(method_t m);
-    imp_t   (*method_setImplementation)(method_t m, imp_t imp);
-    int32_t (*zan_gui_wake)(void);
+    zan_class_t (*objc_getClass)(const char *name);
+    zan_sel_t   (*sel_registerName)(const char *str);
+    zan_imp_t   objc_msgSend;
+    zan_class_t (*objc_allocateClassPair)(zan_class_t superclass, const char *name, size_t extraBytes);
+    void        (*objc_registerClassPair)(zan_class_t cls);
+    int         (*class_addMethod)(zan_class_t cls, zan_sel_t name, zan_imp_t imp, const char *types);
+    zan_method_t (*class_getInstanceMethod)(zan_class_t cls, zan_sel_t name);
+    zan_imp_t   (*method_getImplementation)(zan_method_t m);
+    zan_imp_t   (*method_setImplementation)(zan_method_t m, zan_imp_t imp);
+    int32_t     (*zan_gui_wake)(void);
 } zan_ios_objc_bridge_t;
 
 static zan_ios_objc_bridge_t g_bridge;
@@ -68,9 +53,9 @@ typedef struct {
     int width;
     int height;
     int dpi;
-    id_t ui_window;
-    id_t ui_view;
-    id_t ui_controller;
+    zan_id_t ui_window;
+    zan_id_t ui_view;
+    zan_id_t ui_controller;
 } zan_ios_win_t;
 
 static zan_ios_win_t g_iwin;
@@ -80,7 +65,7 @@ typedef struct { int e[8]; iptr win; } zan_iev_t;
 #define ZAN_IQ_CAP 512
 static zan_iev_t g_iq[ZAN_IQ_CAP];
 static int g_iq_head = 0, g_iq_tail = 0;
-static zan_pthread_mutex_t g_iq_lock = ZAN_PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_iq_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int g_pending_event[8];
 static iptr g_event_win = 0;
@@ -119,15 +104,15 @@ static int iq_pop(void) {
 
 static void zan_ios_init_bridge(void) {
     if (g_bridge.initialized) return;
-    g_bridge.objc_getClass = (class_t (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
-    g_bridge.sel_registerName = (sel_t (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
-    g_bridge.objc_msgSend = (imp_t)dlsym(RTLD_DEFAULT, "objc_msgSend");
-    g_bridge.objc_allocateClassPair = (class_t (*)(class_t, const char *, size_t))dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
-    g_bridge.objc_registerClassPair = (void (*)(class_t))dlsym(RTLD_DEFAULT, "objc_registerClassPair");
-    g_bridge.class_addMethod = (int (*)(class_t, sel_t, imp_t, const char *))dlsym(RTLD_DEFAULT, "class_addMethod");
-    g_bridge.class_getInstanceMethod = (method_t (*)(class_t, sel_t))dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
-    g_bridge.method_getImplementation = (imp_t (*)(method_t))dlsym(RTLD_DEFAULT, "method_getImplementation");
-    g_bridge.method_setImplementation = (imp_t (*)(method_t, imp_t))dlsym(RTLD_DEFAULT, "method_setImplementation");
+    g_bridge.objc_getClass = (zan_class_t (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
+    g_bridge.sel_registerName = (zan_sel_t (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+    g_bridge.objc_msgSend = (zan_imp_t)dlsym(RTLD_DEFAULT, "objc_msgSend");
+    g_bridge.objc_allocateClassPair = (zan_class_t (*)(zan_class_t, const char *, size_t))dlsym(RTLD_DEFAULT, "objc_allocateClassPair");
+    g_bridge.objc_registerClassPair = (void (*)(zan_class_t))dlsym(RTLD_DEFAULT, "objc_registerClassPair");
+    g_bridge.class_addMethod = (int (*)(zan_class_t, zan_sel_t, zan_imp_t, const char *))dlsym(RTLD_DEFAULT, "class_addMethod");
+    g_bridge.class_getInstanceMethod = (zan_method_t (*)(zan_class_t, zan_sel_t))dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
+    g_bridge.method_getImplementation = (zan_imp_t (*)(zan_method_t))dlsym(RTLD_DEFAULT, "method_getImplementation");
+    g_bridge.method_setImplementation = (zan_imp_t (*)(zan_method_t, zan_imp_t))dlsym(RTLD_DEFAULT, "method_setImplementation");
     g_bridge.zan_gui_wake = (int32_t (*)(void))dlsym(RTLD_DEFAULT, "zan_gui_wake");
 
     if (g_bridge.objc_getClass && g_bridge.sel_registerName && g_bridge.objc_msgSend) {
@@ -146,13 +131,13 @@ static void zan_ios_ensure_ui(const char *title, int width, int height) {
     g_iwin.height = height > 0 ? height : 844;
     g_iwin.dpi = 192; /* standard Retina baseline @2x */
 
-    class_t cls_screen = g_bridge.objc_getClass("UIScreen");
+    zan_class_t cls_screen = g_bridge.objc_getClass("UIScreen");
     if (cls_screen) {
-        sel_t sel_main = g_bridge.sel_registerName("mainScreen");
-        id_t main_screen = g_bridge.objc_msgSend((id_t)cls_screen, sel_main);
+        zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
+        zan_id_t main_screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
         if (main_screen) {
-            sel_t sel_scale = g_bridge.sel_registerName("scale");
-            typedef double (*scale_fn)(id_t, sel_t);
+            zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
+            typedef double (*scale_fn)(zan_id_t, zan_sel_t);
             scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
             double sc = fn_scale(main_screen, sel_scale);
             if (sc >= 1.0) {
@@ -278,42 +263,58 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_iwin.
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_iwin.dpi * 100 / 96); }
 
-EXPORT void zan_gui_present_full(void) {}
-
-__attribute__((weak))
-int32_t zan_gui_font_height(int32_t font_size) {
-    return font_size > 0 ? (int32_t)(font_size * 1.2) : 16;
+static inline i64 ios_tick_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (i64)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
 }
 
-EXPORT int32_t zan_gui_font_ascent(int32_t font_size) {
-    if (font_size <= 0) return 0;
-    int32_t h = zan_gui_font_height(font_size);
-    if (h <= 0) h = font_size;
-    return (int32_t)((h * 4 + 2) / 5);
+EXPORT i64 zan_gui_get_tick_ms(void) {
+    return ios_tick_ms();
 }
 
-__attribute__((weak))
-void zan_gui_draw_text(int32_t surface_id, int32_t x, int32_t y, const char *text, int32_t color, int32_t font_size) {
-    (void)surface_id; (void)x; (void)y; (void)text; (void)color; (void)font_size;
-}
-
-EXPORT void zan_gui_draw_text_bold(int32_t surface_id, int32_t x, int32_t y, const char *text, int32_t color, int32_t font_size) {
-    zan_gui_draw_text(surface_id, x, y, text, color, font_size);
-}
-
-__attribute__((weak))
-void zan_gui_draw_polyline(int32_t surface_id, const int32_t *pts, int32_t n, int32_t color, int32_t thickness) {
-    (void)surface_id; (void)pts; (void)n; (void)color; (void)thickness;
-}
-
-EXPORT void zan_gui_draw_polybatch(int32_t surface_id, const int32_t *pts, const int32_t *counts, int32_t n_paths, int32_t color, int32_t thickness) {
-    if (!pts || !counts || n_paths < 1) return;
-    int32_t off = 0;
-    for (int32_t p = 0; p < n_paths; p++) {
-        int32_t n = counts[p];
-        if (n >= 2) {
-            zan_gui_draw_polyline(surface_id, pts + off, n, color, thickness);
-        }
-        off += n * 2;
+EXPORT void zan_gui_sleep_ms(i32 ms) {
+    if (ms > 0) {
+        struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000 * 1000 };
+        nanosleep(&ts, NULL);
     }
 }
+
+EXPORT void zan_gui_present_full(void) {}
+
+EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
+    (void)hwnd_val;
+    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
+    g_last_surface = surface_id;
+    return 0;
+}
+
+EXPORT i32 zan_gui_present_dirty_add(i32 x, i32 y, i32 w, i32 h) {
+    (void)x; (void)y; (void)w; (void)h;
+    return 0;
+}
+
+EXPORT int zan_gui_drop_pending(void) { return 0; }
+EXPORT const char *zan_gui_drop_take(void) { return ""; }
+
+EXPORT i32 zan_gui_enable_glass(iptr hwnd_val, i32 tint_argb) { (void)hwnd_val; (void)tint_argb; return 0; }
+EXPORT i32 zan_gui_disable_glass(iptr hwnd_val) { (void)hwnd_val; return 0; }
+EXPORT i32 zan_gui_set_opacity(iptr hwnd_val, i32 percent) { (void)hwnd_val; (void)percent; return 0; }
+
+EXPORT void zan_gui_set_ime_pos(i32 x, i32 y) { (void)x; (void)y; }
+
+static char g_ios_clipboard_buf[256] = {0};
+EXPORT i32 zan_gui_set_clipboard(const char *utf8) {
+    if (!utf8) return 0;
+    strncpy(g_ios_clipboard_buf, utf8, sizeof(g_ios_clipboard_buf) - 1);
+    return 1;
+}
+
+EXPORT const char *zan_gui_get_clipboard(void) {
+    return g_ios_clipboard_buf;
+}
+
+EXPORT void zan_gui_internal_metal_drop_present(void) {}
+
+__attribute__((weak)) void zan_ui_thread_set(void) {}
+
