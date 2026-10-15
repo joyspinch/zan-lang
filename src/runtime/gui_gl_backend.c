@@ -817,13 +817,20 @@ static void zgl_push(zan_surface_t *s, const zgl_quad *q,
 static void zgl_rect_quad(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, int stroke, int gdir,
                           u32 c0, u32 c1, u32 via, int opaque) {
+    float x0 = (float)x, y0 = (float)y;
+    float x1 = (float)(x + w), y1 = (float)(y + h);
+    if (x1 <= (float)s->clip_x0 || x0 >= (float)s->clip_x1 ||
+        y1 <= (float)s->clip_y0 || y0 >= (float)s->clip_y1) {
+        return;
+    }
     zgl_quad q;
     memset(&q, 0, sizeof(q));
     q.kind = ZGL_K_RECT;
-    q.cx = (float)x + (float)w / 2.0f;
-    q.cy = (float)y + (float)h / 2.0f;
-    q.hw = (float)w / 2.0f;
-    q.hh = (float)h / 2.0f;
+    float fw = (float)w, fh = (float)h;
+    q.hw = fw * 0.5f;
+    q.hh = fh * 0.5f;
+    q.cx = x0 + q.hw;
+    q.cy = y0 + q.hh;
     int r = radius;
     if (r < 0) r = 0;
     if (r > 0 && (corners & 15) == 0) r = 0;
@@ -837,15 +844,17 @@ static void zgl_rect_quad(zan_surface_t *s, int x, int y, int w, int h,
     zgl_color(q.col0, c0, opaque);
     zgl_color(q.col1, c1, opaque);
     zgl_color(q.col2, via, opaque);
-    zgl_push(s, &q, (float)x, (float)y, (float)(x + w), (float)(y + h));
+    zgl_push(s, &q, x0, y0, x1, y1);
 }
 
 static void gl_clear_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
+    if (w <= 0 || h <= 0) return;
     if (!zgl_begin(s, ZGL_MODE_REPLACE)) { cpu_clear_rect(s, x, y, w, h, c); return; }
     zgl_rect_quad(s, x, y, w, h, 0, ZAN_CORNERS_ALL, 0, -1, c, c, 0, 0);
 }
 
 static void gl_fill_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
+    if (w <= 0 || h <= 0) return;
     if (((c >> 24) & 0xFF) == 0) return;
     if (!zgl_begin(s, ZGL_MODE_BLEND)) { cpu_fill_rect(s, x, y, w, h, c); return; }
     zgl_rect_quad(s, x, y, w, h, 0, ZAN_CORNERS_ALL, 0, -1, c, c, 0, 0);
@@ -853,6 +862,8 @@ static void gl_fill_rect(zan_surface_t *s, int x, int y, int w, int h, u32 c) {
 
 static void gl_fill_round(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 c) {
+    if (w <= 0 || h <= 0) return;
+    if (((c >> 24) & 0xFF) == 0) return;
     if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         cpu_fill_round(s, x, y, w, h, radius, corners, c); return;
     }
@@ -861,7 +872,8 @@ static void gl_fill_round(zan_surface_t *s, int x, int y, int w, int h,
 
 static void gl_draw_round(zan_surface_t *s, int x, int y, int w, int h,
                           int radius, int corners, u32 c, int thickness) {
-    if (thickness <= 0) return;
+    if (w <= 0 || h <= 0 || thickness <= 0) return;
+    if (((c >> 24) & 0xFF) == 0) return;
     if (!zgl_begin(s, ZGL_MODE_BLEND)) {
         cpu_draw_round(s, x, y, w, h, radius, corners, c, thickness); return;
     }
