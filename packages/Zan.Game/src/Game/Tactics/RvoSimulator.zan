@@ -126,6 +126,7 @@ class RvoSimulator {
     // 逐物理步更新互斥避障计算并推进位置（只遍历活跃单位段）。
     void Step(double dt) {
         if (dt <= 0.0 || agentCount <= 0) { return; }
+        double invDtHalf = 0.5 / dt;
 
         // 1. 刷新空间哈希网格
         spatialGrid.Clear();
@@ -173,14 +174,15 @@ class RvoSimulator {
                 }
 
                 double dist = Math.Sqrt(distSq);
+                double invDist = 1.0 / dist;
+                double nx = dx * invDist;
+                double ny = dy * invDist;
 
                 if (dist < combinedR) {
                     // 情况 A：已经发生物理重叠穿透！产生刚体排斥推力（各退一半）
                     double overlap = combinedR - dist;
-                    double nx = dx / dist;
-                    double ny = dy / dist;
                     // 推力大小与穿透深度成正比
-                    double sepSpd = (overlap / dt) * 0.5;
+                    double sepSpd = overlap * invDtHalf;
                     if (sepSpd > spd_i * 1.5) { sepSpd = spd_i * 1.5; }
                     pushX = pushX - nx * sepSpd;
                     pushY = pushY - ny * sepSpd;
@@ -196,9 +198,6 @@ class RvoSimulator {
                         // 相对速度正朝着对方逼近
                         double timeToCollision = distSq / (dot + 0.001);
                         if (timeToCollision < tau) {
-                            // 垂直于相对位移方向的切向侧向滑移避让向量
-                            double nx = dx / dist;
-                            double ny = dy / dist;
                             // 侧向法向量 (-ny, nx)
                             double sideX = -ny;
                             double sideY = nx;
@@ -210,9 +209,9 @@ class RvoSimulator {
                                 sideY = -sideY;
                             }
 
-                            double avoidanceFactor = (1.0 - (timeToCollision / tau)) * spd_i * 0.7;
-                            pushX = pushX + sideX * avoidanceFactor * 0.5;
-                            pushY = pushY + sideY * avoidanceFactor * 0.5;
+                            double avoidanceFactor = (1.0 - timeToCollision * 0.8333333333333334) * spd_i * 0.35;
+                            pushX = pushX + sideX * avoidanceFactor;
+                            pushY = pushY + sideY * avoidanceFactor;
                             orcaWeightSum = orcaWeightSum + 1.0;
                         }
                     }
@@ -223,11 +222,14 @@ class RvoSimulator {
             nvx = nvx + pushX;
             nvy = nvy + pushY;
 
-            // 速度钳制不超过自身最大移速
-            double currentSpeed = Math.Sqrt(nvx * nvx + nvy * nvy);
-            if (currentSpeed > spd_i) {
-                nvx = (nvx / currentSpeed) * spd_i;
-                nvy = (nvy / currentSpeed) * spd_i;
+            // 速度钳制不超过自身最大移速（平方比较避免多余开方，单次除法算缩放比）
+            double curSpd2 = nvx * nvx + nvy * nvy;
+            double maxSpd2 = spd_i * spd_i;
+            if (curSpd2 > maxSpd2) {
+                double currentSpeed = Math.Sqrt(curSpd2);
+                double scale = spd_i / currentSpeed;
+                nvx = nvx * scale;
+                nvy = nvy * scale;
             }
 
             velX[i] = nvx;
