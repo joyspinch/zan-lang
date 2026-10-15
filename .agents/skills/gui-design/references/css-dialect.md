@@ -256,13 +256,11 @@
     (`again = (sel == index)` 才发 Activate):「再点一下收起」这类
     切换语义必须同时绑 OnSelect 与 OnActivate,只绑 Select 的点开
     就收不起(微信模板通讯录折叠分组,。
-12. **Label 的文字从盒子左缘起画,`text-align` 对它无效**。`Label.OnPaint`
-    只做垂直居中(`Canvas.CenterTextY`),水平方向不做对齐——给标签挂
-    `text-align:center` 是**静默无效**的(legend 页 31 血字实测贴左约 10
-    设备像素)。要水平居中就把标签装进挂
-    `display:flex; justify-content:center` 的盒子(皮肤里已有先例
-    `.tbl-cell`),或容器用 Flex 的 `Justify("center")`;别指望标签自己
-    居中,也别用一个"和字一样宽"的盒子去蒙(字宽随字体度量变)。
+12. **Label 原生支持 `text-align`（left/center/right）**。`Label.OnPaint`
+    已完整接入样式盒的 `s.align` 以及内边距与边框，在单行与 wrap 折行模式下
+    按可用槽宽自动做居中与靠右偏移计算。给标签挂 `text-align: center` 或
+    `text-align: right` 直接生效，不再需要为了水平居中而在外面套一层 Flex 容器，
+    大幅减少嵌套容器开销并提高大规模界面的布局与绘制性能。
 13. **要手摆子项的宿主容器不能是 flex**。给子项 `DockManual` +
     `Place(x,y)` 的宿主,皮肤类里不能有 `display:flex`——flex 把子项按
     add 序流式排,`Place` 与 dock 一起被忽略(同第 9 条,。**分工写死**:手摆宿主只给背景/边框,子项一个

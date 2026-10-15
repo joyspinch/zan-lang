@@ -920,14 +920,12 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
     `b.DockManual; b.Place(dx, dy); box.Add(b);` 才落回量出来的位置。
     注意 `DockManual` 是 `dock = 0`，容器只在 `dock==0` 分支读 `mx/my`，
     所以这条也意味着**这个子项退出了自动流**，尺寸要自己给（`Prefer`）。
-11. **`Label` 不认 `text-align`，居中靠容器的 flex `justify-content`**。
-    `Label.OnPaint` 直接 `canvas.DrawText(bx, …)` 按盒子左缘画字；认
-    `text-align` 的是 `StyleBox.DrawLabel`（自绘/控件内部走的那条路），Label
-    没走。所以给 Label 的类写 `text-align: center` 是**死规则**——实测整张表
-    的文字都贴左、与原版差 29 设备。正解：让**容器**挂
-    `display: flex; justify-content: center; align-items: center`，Label 作为
-    flex 项按自身测量宽排布（代码里的 `Grow` 在 flex 容器里不参与，见第 7 条）。
-    同理：控件默认尺寸/配色跟原图不一致时**先改皮肤规则**（如 stdlib
+11. **`Label` 原生支持 `text-align`（left/center/right）**。
+    `Label.OnPaint` 会读取样式的 `s.align` 与 `padding`/`border`，在单行或
+    折行（wrap）模式下直接完成居中与靠右偏移绘制。因此无需为了给文本居中
+    而在外面额外包一层 Flex 容器，直接在 CSS 里对 `label` 或类名声明
+    `text-align: center` 或 `text-align: right` 即可生效。减少冗余嵌套容器
+    能显著减少控件树层级并提升大规模界面的测量/排版性能。同理：控件默认尺寸/配色跟原图不一致时**先改皮肤规则**（如 stdlib
     `Pagination` 默认吃 `heightMedium` 34 逻辑，原图页脚只有 20 逻辑，加一条
     `pagination { height: 20; font-size: 12; }` 即可），不要回去自绘、也不要在
     每个使用处补坐标。
