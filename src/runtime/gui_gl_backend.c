@@ -1535,29 +1535,40 @@ static void zgl_blit_pixels_batch(zan_surface_t *s, const zan_bitmap *img,
         g_zgl.bitmap_tex = tex;
     }
     int iw = img->width, ih = img->height, i;
+    float inv_iw = (iw > 0) ? (1.0f / (float)iw) : 0.0f;
+    float inv_ih = (ih > 0) ? (1.0f / (float)ih) : 0.0f;
+    float fiw = (float)iw, fih = (float)ih;
+    float clip_x0 = (float)s->clip_x0, clip_y0 = (float)s->clip_y0;
+    float clip_x1 = (float)s->clip_x1, clip_y1 = (float)s->clip_y1;
+
+    zgl_quad sq;
+    memset(&sq, 0, sizeof(sq));
+    sq.kind = ZGL_K_BITMAP;
+
     for (i = 0; i < count; i++) {
         const float *q = quads + i * 10;
-        u32 tint_raw;
-        zgl_quad sq;
         float dx = q[0], dy = q[1], dw = q[2], dh = q[3];
+        if (dw <= 0.0f) dw = fiw;
+        if (dh <= 0.0f) dh = fih;
+        float r_x1 = dx + dw, r_y1 = dy + dh;
+        if (r_x1 <= clip_x0 || dx >= clip_x1 || r_y1 <= clip_y0 || dy >= clip_y1) {
+            continue;
+        }
+
         float sx = q[4], sy = q[5], sw = q[6], sh = q[7];
-        memcpy(&tint_raw, q + 8, sizeof(u32));
-        memset(&sq, 0, sizeof(sq));
-        sq.kind = ZGL_K_BITMAP;
-        if (dw <= 0.0f) dw = (float)iw;
-        if (dh <= 0.0f) dh = (float)ih;
-        if (sw <= 0.0f) { sx = 0.0f; sw = (float)iw; }
-        if (sh <= 0.0f) { sy = 0.0f; sh = (float)ih; }
+        u32 tint_raw = *(const u32 *)(q + 8);
+        if (sw <= 0.0f) { sx = 0.0f; sw = fiw; }
+        if (sh <= 0.0f) { sy = 0.0f; sh = fih; }
         sq.cx = dx + dw * 0.5f;
         sq.cy = dy + dh * 0.5f;
         sq.hw = dw * 0.5f;
         sq.hh = dh * 0.5f;
-        sq.u0 = sx / (float)iw;
-        sq.v0 = sy / (float)ih;
-        sq.u1 = (sx + sw) / (float)iw;
-        sq.v1 = (sy + sh) / (float)ih;
+        sq.u0 = sx * inv_iw;
+        sq.v0 = sy * inv_ih;
+        sq.u1 = (sx + sw) * inv_iw;
+        sq.v1 = (sy + sh) * inv_ih;
         zgl_color(sq.col0, tint_raw, 0);
-        zgl_push(s, &sq, dx, dy, dx + dw, dy + dh);
+        zgl_push(s, &sq, dx, dy, r_x1, r_y1);
     }
 }
 
