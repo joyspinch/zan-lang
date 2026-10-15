@@ -2,6 +2,80 @@ using System;
 
 namespace Gui;
 
+// 预计算的形状区域参数（物理像素与 1/16 定点数），
+// 用于在 Coverage 采样循环中进行 AABB 内外盒快速短路与无重复计算的 SDF 采样。
+class PreparedShapeItem {
+    public int kind;
+    public int in1X1; public int in1X2; public int in1Y1; public int in1Y2;
+    public int in2X1; public int in2X2; public int in2Y1; public int in2Y2;
+    public int outX1; public int outX2; public int outY1; public int outY2;
+    public long cx16;
+    public long cy16;
+    public long hw2;
+    public long hh2;
+    public long r16;
+    public long rx;
+    public long ry;
+    public long denom;
+
+    public PreparedShapeItem(WindowShapeRegion reg, int dpiScale) {
+        this.kind = reg.kind;
+        int px = reg.x * dpiScale / 100;
+        int py = reg.y * dpiScale / 100;
+        int pw = reg.width * dpiScale / 100;
+        int ph = reg.height * dpiScale / 100;
+        int pr = reg.radius * dpiScale / 100;
+        if (pr < 0) { pr = 0; }
+        if (pr * 2 > pw) { pr = pw / 2; }
+        if (pr * 2 > ph) { pr = ph / 2; }
+
+        this.outX1 = px - 1;
+        this.outX2 = px + pw;
+        this.outY1 = py - 1;
+        this.outY2 = py + ph;
+
+        long x16 = (long)px * 16;
+        long y16 = (long)py * 16;
+        long w16 = (long)pw * 16;
+        long h16 = (long)ph * 16;
+
+        if (reg.kind == 2) { // 椭圆
+            long rxVal = w16 / 2;
+            long ryVal = h16 / 2;
+            if (rxVal < 1) { rxVal = 1; }
+            if (ryVal < 1) { ryVal = 1; }
+            this.rx = rxVal;
+            this.ry = ryVal;
+            this.cx16 = x16 + rxVal;
+            this.cy16 = y16 + ryVal;
+            this.denom = rxVal > ryVal ? rxVal : ryVal;
+            // 椭圆内接安全盒（以中心缩进 70%）
+            int inW = (pw * 7) / 20;
+            int inH = (ph * 7) / 20;
+            int midX = px + pw / 2;
+            int midY = py + ph / 2;
+            this.in1X1 = midX - inW; this.in1X2 = midX + inW;
+            this.in1Y1 = midY - inH; this.in1Y2 = midY + inH;
+            this.in2X1 = this.in1X1; this.in2X2 = this.in1X2;
+            this.in2Y1 = this.in1Y1; this.in2Y2 = this.in1Y2;
+        } else { // 矩形 / 圆角矩形
+            long r16Val = (long)pr * 16;
+            this.r16 = r16Val;
+            this.cx16 = x16 + w16 / 2;
+            this.cy16 = y16 + h16 / 2;
+            this.hw2 = w16 / 2 - r16Val;
+            this.hh2 = h16 / 2 - r16Val;
+
+            // 内盒 1：垂直条（避开左右圆角 pr，上下避开边缘 1px）
+            this.in1X1 = px + pr; this.in1X2 = px + pw - pr;
+            this.in1Y1 = py + 1; this.in1Y2 = py + ph - 1;
+            // 内盒 2：水平条（左右避开边缘 1px，上下避开圆角 pr）
+            this.in2X1 = px + 1; this.in2X2 = px + pw - 1;
+            this.in2Y1 = py + pr; this.in2Y2 = py + ph - pr;
+        }
+    }
+}
+
 // 窗口最终轮廓的 coverage 缓存；每个宿主/预览持有独立实例。
 // 区域为逻辑像素，尺寸为表面物理像素，dpiScale 为百分比。
 // 不读取 App、Window 或后端全局状态。
@@ -44,34 +118,90 @@ class WindowShapeMask {
             return cachedCoverage;
         }
         List<WindowShapeRegion> snapshot = new List<WindowShapeRegion>();
+        List<PreparedShapeItem> items = new List<PreparedShapeItem>();
         bool shadowBand = false;
         for (int i = 0; i < regions.Count; i = i + 1) {
             WindowShapeRegion reg = regions[i];
             snapshot.Add(new WindowShapeRegion(reg.kind, reg.x, reg.y,
                 reg.width, reg.height, reg.radius));
             if (reg.kind == 3) { shadowBand = true; }
+            if (reg.kind == 1 || reg.kind == 2) {
+                items.Add(new PreparedShapeItem(reg, dpiScale));
+            }
         }
         int n = width * height;
         byte[] mask = new byte[n];
-        for (int i = 0; i < n; i = i + 1) {
-            int px = i % width;
-            int py = i / width;
-            int sum = 0;
-            // 十六个样本在像素的 1/8、3/8、5/8、7/8 处；
-            // 每样本 clamp(0.5px - sdf, 0, 1px)，总和为 0..256。
-            for (int sa = 0; sa < 4; sa = sa + 1) {
-                for (int sb = 0; sb < 4; sb = sb + 1) {
-                    long sx = (long)px * 16 + sa * 4 + 2;
-                    long sy = (long)py * 16 + sb * 4 + 2;
-                    long d = WindowShapeMask.SdfFp(snapshot, sx, sy, dpiScale);
-                    long cov = 8 - d;
-                    if (cov < 0) { cov = 0; }
-                    if (cov > 16) { cov = 16; }
-                    sum = sum + (int)cov;
+        int itemCount = items.Count;
+
+        // 若无有效几何轮廓区域，直接返回全零
+        if (itemCount == 0) {
+            cachedWidth = width;
+            cachedHeight = height;
+            cachedDpiScale = dpiScale;
+            cachedRegions = snapshot;
+            cachedCoverage = mask;
+            cachedShadowBand = shadowBand;
+            return mask;
+        }
+
+        // 双层循环遍历物理像素：
+        // 95% 以上的核心内部像素通过 AABB 内盒短路直接填 255；
+        // 外部像素通过 AABB 外包围盒短路直接填 0；
+        // 仅在真实圆角弧线与边缘过渡带（极少数像素）才执行 16 次 SDF 定点采样。
+        for (int py = 0; py < height; py = py + 1) {
+            int rowIdx = py * width;
+            for (int px = 0; px < width; px = px + 1) {
+                int idx = rowIdx + px;
+
+                // 阶段 1：快速内盒命中检查（核心区域 100% 满覆盖）
+                bool insideCore = false;
+                for (int k = 0; k < itemCount; k = k + 1) {
+                    PreparedShapeItem it = items[k];
+                    if ((px >= it.in1X1 && px < it.in1X2 && py >= it.in1Y1 && py < it.in1Y2)
+                            || (px >= it.in2X1 && px < it.in2X2 && py >= it.in2Y1 && py < it.in2Y2)) {
+                        insideCore = true;
+                        break;
+                    }
                 }
+                if (insideCore) {
+                    mask[idx] = (byte)255;
+                    continue;
+                }
+
+                // 阶段 2：快速外盒完全不命中检查（轮廓外完全不覆盖）
+                bool nearAny = false;
+                for (int k = 0; k < itemCount; k = k + 1) {
+                    PreparedShapeItem it = items[k];
+                    if (px >= it.outX1 && px <= it.outX2 && py >= it.outY1 && py <= it.outY2) {
+                        nearAny = true;
+                        break;
+                    }
+                }
+                if (!nearAny) {
+                    mask[idx] = (byte)0;
+                    continue;
+                }
+
+                // 阶段 3：过渡边缘抗锯齿超采样（4x4 = 16 采样点）
+                int sum = 0;
+                for (int sa = 0; sa < 4; sa = sa + 1) {
+                    for (int sb = 0; sb < 4; sb = sb + 1) {
+                        long sx = (long)px * 16 + sa * 4 + 2;
+                        long sy = (long)py * 16 + sb * 4 + 2;
+                        long best = 9223372036854775807;
+                        for (int k = 0; k < itemCount; k = k + 1) {
+                            long d = WindowShapeMask.SdfItem(items[k], sx, sy);
+                            if (d < best) { best = d; }
+                        }
+                        long cov = 8 - best;
+                        if (cov < 0) { cov = 0; }
+                        if (cov > 16) { cov = 16; }
+                        sum = sum + (int)cov;
+                    }
+                }
+                if (sum > 255) { sum = 255; }
+                mask[idx] = (byte)sum;
             }
-            if (sum > 255) { sum = 255; }
-            mask[i] = (byte)sum;
         }
         cachedWidth = width;
         cachedHeight = height;
@@ -80,6 +210,37 @@ class WindowShapeMask {
         cachedCoverage = mask;
         cachedShadowBand = shadowBand;
         return mask;
+    }
+
+    // 单项已准备区域的定点数 SDF 距离计算
+    static long SdfItem(PreparedShapeItem item, long sx, long sy) {
+        if (item.kind == 2) {
+            long dx = sx - item.cx16;
+            if (dx < 0) { dx = 0 - dx; }
+            long dy = sy - item.cy16;
+            if (dy < 0) { dy = 0 - dy; }
+            if (item.rx == item.ry) {
+                long dist = WindowShapeMask.ISqrt64(dx * dx + dy * dy);
+                return dist - item.rx;
+            }
+            long term1 = dx * item.ry;
+            long term2 = dy * item.rx;
+            long k = WindowShapeMask.ISqrt64(term1 * term1 + term2 * term2);
+            return (k - item.rx * item.ry) / item.denom;
+        }
+        // item.kind == 1 (矩形 / 圆角矩形)
+        long ax = sx - item.cx16;
+        if (ax < 0) { ax = 0 - ax; }
+        long ay = sy - item.cy16;
+        if (ay < 0) { ay = 0 - ay; }
+        long qx = ax - item.hw2;
+        long qy = ay - item.hh2;
+        long inner = qx > qy ? qx : qy;
+        if (inner > 0) { inner = 0; }
+        if (qx < 0) { qx = 0; }
+        if (qy < 0) { qy = 0; }
+        long dist = WindowShapeMask.ISqrt64(qx * qx + qy * qy);
+        return dist + inner - item.r16;
     }
 
     // 最近一次成功 Coverage 的规格是否声明了类型 3 阴影带。
@@ -134,8 +295,6 @@ class WindowShapeMask {
                 long hh2 = h / 2 - r;
                 long qx = ax - hw2;
                 long qy = ay - hh2;
-                // 保留核心内部的负距离；缺此项时 radius=0 内部也为 d=0，
-                // 整块窗口会被误算成半覆盖。边界与外部的 inner 恒为零。
                 long inner = qx > qy ? qx : qy;
                 if (inner > 0) { inner = 0; }
                 if (qx < 0) { qx = 0; }
@@ -160,7 +319,7 @@ class WindowShapeMask {
     }
 
     // 最终裁切后的 straight-alpha ARGB32。
-    // coverage 为零时只允许声明阴影带的 0&lt;alpha&lt;240 像素透出；
+    // coverage 为零时只允许声明阴影带的 0<alpha<240 像素透出；
     // 边缘仅缩 alpha，RGB 保持直通，避免图像合成时重复预乘。
     static int SnapshotStraightArgb(int argb, int coverage, bool shadowBand) {
         int a = (argb >> 24) & 255;
@@ -177,8 +336,6 @@ class WindowShapeMask {
     static int LayeredArgb(int argb, int coverage, bool shadowBand) {
         int p = WindowShapeMask.SnapshotStraightArgb(argb, coverage, shadowBand);
         int a = (p >> 24) & 255;
-        // RGB 必须乘最终 alpha；只乘 coverage 会使半透明边缘 RGB>A，
-        // 例如 0x80FF0000/cov128 曾变成非法的 0x40800000。
         int r = ((p >> 16) & 255) * a / 255;
         int g = ((p >> 8) & 255) * a / 255;
         int b = (p & 255) * a / 255;
