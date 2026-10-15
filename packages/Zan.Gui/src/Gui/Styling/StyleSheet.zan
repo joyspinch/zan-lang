@@ -27,6 +27,10 @@ class StyleSheet {
     Dict<string, List<int>> byType;
     // 没有类型选择器的规则下标（`.primary`、`#save`、`::option`）。
     List<int> anyType;
+    // 无类型且无 class/id 要求的规则下标（通配符 `*`、仅部件 `::thumb` 或纯伪状态 `:hover`）。
+    // 控件在 cls=="" 且 id=="" 时（如多数容器/基础标签）直接与此桶归并，
+    // 旁路扫全表数百条类选择器的沉重开销。
+    List<int> anyUniversal;
 
     // 解析时被跳过的 at-rule 块数（`@media` / `@keyframes` / …）。
     // 跳过是浏览器行为，但"跳过了多少"必须能看见——否则一整块
@@ -90,6 +94,7 @@ class StyleSheet {
         this.hasImportant = false;
         this.hasMediaImportant = false;
         this.importantRules = new List<int>();
+        this.anyUniversal = new List<int>();
     }
 
     // 记下一条被跳过的 at-rule（Css 解析器调用）。
@@ -332,7 +337,8 @@ class StyleSheet {
         List<int> typed = null;
         if (type != "") { this.byType.TryGetValue(type, out typed); }
         int aLen = typed != null ? typed.Count : 0;
-        int cLen = this.anyType != null ? this.anyType.Count : 0;
+        List<int> candidateAny = (cls == "" && id == "") ? this.anyUniversal : this.anyType;
+        int cLen = candidateAny != null ? candidateAny.Count : 0;
 
         if (aLen == 0 && cLen == 0) {
             if (this.mediaEntries != null && this.mediaEntries.Count > 0) {
@@ -346,7 +352,7 @@ class StyleSheet {
 
         if (aLen == 0) {
             for (int c = 0; c < cLen; c = c + 1) {
-                int i = this.anyType[c];
+                int i = candidateAny[c];
                 if (this.MatchesCtx(i, type, want, id, part, stateBits, cls, node)) {
                     if (this.ruleEntries != null && i < this.ruleEntries.Count) {
                         this.ApplyDecls(b, this.ruleEntries[i].block);
@@ -368,14 +374,14 @@ class StyleSheet {
             while (a < aLen || c < cLen) {
                 int i;
                 if (a >= aLen) {
-                    i = this.anyType[c];
+                    i = candidateAny[c];
                     c = c + 1;
                 } else if (c >= cLen) {
                     i = typed[a];
                     a = a + 1;
                 } else {
                     int ia = typed[a];
-                    int ic = this.anyType[c];
+                    int ic = candidateAny[c];
                     if (ia < ic) { i = ia; a = a + 1; }
                     else { i = ic; c = c + 1; }
                 }
@@ -503,6 +509,7 @@ class StyleSheet {
         // 分桶要等排序完成再做：上面的 Insert 会挪动下标。
         this.byType = new Dict<string, List<int>>();
         this.anyType = new List<int>();
+        this.anyUniversal = new List<int>();
         this.hasImportant = false;
         this.importantRules = new List<int>();
         for (int k = 0; k < ruleEntries.Count; k = k + 1) {
@@ -514,6 +521,9 @@ class StyleSheet {
             string ty = re.selector.type;
             if (ty == "") {
                 anyType.Add(k);
+                if (re.selector.classList.Count == 0 && re.selector.clsContains == "" && re.selector.id == "") {
+                    anyUniversal.Add(k);
+                }
             } else {
                 List<int> bucket;
                 if (!byType.TryGetValue(ty, out bucket)) {
