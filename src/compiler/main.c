@@ -5568,6 +5568,8 @@ int main(int argc, char **argv) {
                                  sizeof(cross_dylibs[0]), "%s", dylib);
                         cross_dylib_count++;
                     }
+                } else if (target.os == ZAN_OS_IOS && strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
+                    /* iOS 使用静态内嵌的 zanrt_gui.o 提供 GUI 原生外壳，不打桩也不需要外部 dylib */
                 } else {
                     int n = zan_irgen_stub_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
@@ -6262,7 +6264,8 @@ int main(int argc, char **argv) {
         }
         if (cross_compiling && rt_sync_obj && target.os != ZAN_OS_LINUX
             && target.os != ZAN_OS_ANDROID && target.os != ZAN_OS_OHOS
-            && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS) {
+            && target.os != ZAN_OS_MACOS && target.os != ZAN_OS_WINDOWS
+            && target.os != ZAN_OS_IOS) {
             int needs_sync = 1;
             if (target.os == ZAN_OS_WASI) {
                 static const char *const disp_pre[] = {
@@ -7731,10 +7734,20 @@ int main(int argc, char **argv) {
                 }
             }
             bool has_gui_driver = false;
-            for (int di = 0; di < cross_dylib_count; di++) {
-                if (strstr(cross_dylibs[di], "zan_gui") != NULL) {
-                    has_gui_driver = true;
-                    break;
+            if (target.os == ZAN_OS_IOS) {
+                for (size_t li = 0; li < irgen.extern_lib_count; li++) {
+                    if (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
+                        has_gui_driver = true;
+                        break;
+                    }
+                }
+            }
+            if (!has_gui_driver) {
+                for (int di = 0; di < cross_dylib_count; di++) {
+                    if (strstr(cross_dylibs[di], "zan_gui") != NULL) {
+                        has_gui_driver = true;
+                        break;
+                    }
                 }
             }
             if (has_gui_driver && zan_file_exists(macrt_gui)) {
