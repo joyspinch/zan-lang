@@ -93,6 +93,33 @@ partial class ZanIDE {
         return vars;
     }
 
+    // 从配对的 code-behind 源码中扫描候选事件响应方法名（用于设计器事件下拉选择）
+    static List<string> ScanCandidateHandlers(string code) {
+        List<string> handlers = new List<string>();
+        if (code == null || code == "") { return handlers; }
+        List<string> lines = CodeEditor.SplitLines(code);
+        for (int i = 0; i < lines.Count && handlers.Count < 60; i = i + 1) {
+            string ln = ZanIDE.TrimStr(lines[i]);
+            if (ln.StartsWith("//") || ln.StartsWith("/*")) { continue; }
+            int vIdx = ZanIDE.IndexOfStr(ln, "void ");
+            if (vIdx >= 0) {
+                string after = ZanIDE.TrimStr(ln.Substring(vIdx + 5, ln.Length - vIdx - 5));
+                int pIdx = ZanIDE.IndexOfStr(after, "(");
+                if (pIdx > 0) {
+                    string nm = ZanIDE.TrimStr(after.Substring(0, pIdx));
+                    if (nm != "" && nm != "Main" && ZanIDE.IsIdent(nm)) {
+                        bool dup = false;
+                        for (int di = 0; di < handlers.Count; di = di + 1) {
+                            if (handlers[di] == nm) { dup = true; break; }
+                        }
+                        if (!dup) { handlers.Add(nm); }
+                    }
+                }
+            }
+        }
+        return handlers;
+    }
+
     static string TrimStr(string s) {
         int a = 0;
         int b = s.Length;
@@ -365,6 +392,146 @@ partial class ZanIDE {
         }
         editor.LoadText(newBody);
         return ins;
+    }
+
+    // 针对指定 Code-Behind 文件与 Tab 执行强一致事件方法注入与持久化，返回目标定位行号。
+    static int EnsureCodeBehindFileHandler(string cbPath, string ctrlName, List<TabRecord> tabs, int tabIdx, CodeEditor editor) {
+        if (cbPath == "" || ctrlName == "") { return -1; }
+        string src = "";
+        if (tabIdx >= 0 && tabIdx < tabs.Count && tabs[tabIdx].body != "") {
+            src = tabs[tabIdx].body;
+        } else if (File.Exists(cbPath)) {
+            src = File.ReadAllText(cbPath);
+        }
+        if (src == "") {
+            string fbase = ZanIDE.FormBaseName(cbPath);
+            src = ZanIDE.GenBusinessShell(fbase);
+        }
+
+        string target = ctrlName;
+        string handlerName = "";
+        bool isHandler = false;
+        if (target.StartsWith("handler:")) {
+            handlerName = target.Substring(8, target.Length - 8);
+            isHandler = true;
+        } else if (target.StartsWith("On")) {
+            handlerName = target;
+            isHandler = true;
+        }
+
+        List<string> lines = CodeEditor.SplitLines(src);
+        int targetLine = -1;
+
+        if (isHandler && handlerName != "") {
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                string ln = lines[li];
+                if ((ZanIDE.IndexOfStr(ln, "void " + handlerName) >= 0
+                    || ZanIDE.IndexOfStr(ln, handlerName + "(") >= 0
+                    || ZanIDE.IndexOfStr(ln, handlerName + " (") >= 0)
+                    && ZanIDE.IndexOfStr(ln, "//") < 0) {
+                    targetLine = li;
+                    break;
+                }
+            }
+            if (targetLine < 0) {
+                for (int li = 0; li < lines.Count; li = li + 1) {
+                    if (ZanIDE.IndexOfStr(lines[li], handlerName) >= 0) {
+                        targetLine = li;
+                        break;
+                    }
+                }
+            }
+
+            if (targetLine < 0) {
+                int insertLine = -1;
+                for (int i = lines.Count - 1; i >= 0; i = i - 1) {
+                    string tr = ZanIDE.TrimTrailSpaces(ZanIDE.TrimLeadSpaces(lines[i]));
+                    if (tr == "}" || tr == "};") {
+                        insertLine = i;
+                        break;
+                    }
+                }
+                if (insertLine < 0) { insertLine = lines.Count; }
+
+                lines.Insert(insertLine, "");
+                lines.Insert(insertLine + 1, "    static void " + handlerName + "() {");
+                lines.Insert(insertLine + 2, "    }");
+
+                StringBuilder sb = new StringBuilder();
+                for (int k = 0; k < lines.Count; k = k + 1) {
+                    sb.Append(lines[k]);
+                    sb.Append("\n");
+                }
+                src = sb.ToString();
+                targetLine = insertLine + 1;
+
+                // 持久化到磁盘文件，确保绝对不会丢失
+                File.WriteAllText(cbPath, src);
+            }
+        } else {
+            for (int li = 0; li < lines.Count; li = li + 1) {
+                if (ZanIDE.IndexOfStr(lines[li], ctrlName) >= 0) {
+                    targetLine = li;
+                    break;
+                }
+            }
+            if (targetLine < 0) {
+                int onLoadLine = -1;
+                for (int i = 0; i < lines.Count; i = i + 1) {
+                    string l = lines[i];
+                    if (ZanIDE.IndexOfStr(l, "OnLoad") >= 0 && ZanIDE.IndexOfStr(l, "(") >= 0) {
+                        onLoadLine = i;
+                        break;
+                    }
+                }
+                if (onLoadLine >= 0) {
+                    int ins = onLoadLine + 1;
+                    for (int j = onLoadLine + 1; j < lines.Count; j = j + 1) {
+                        string tr = ZanIDE.TrimTrailSpaces(ZanIDE.TrimLeadSpaces(lines[j]));
+                        if (tr == "}" || tr == "};") {
+                            ins = j;
+                            break;
+                        }
+                    }
+                    string evtMethod = "OnClick";
+                    string cnLower = ctrlName.ToLower();
+                    if (cnLower.EndsWith("check") || cnLower.EndsWith("checkbox")
+                        || cnLower.EndsWith("switch") || cnLower.EndsWith("select")
+                        || cnLower.EndsWith("radio")) {
+                        evtMethod = "OnChange";
+                    } else if (cnLower.EndsWith("input") || cnLower.EndsWith("text")
+                               || cnLower.EndsWith("edit") || cnLower.EndsWith("box")) {
+                        evtMethod = "OnChange";
+                    }
+                    string stub = "        " + ctrlName + "." + evtMethod + "(() => {\n        });";
+                    lines.Insert(ins, stub);
+                    StringBuilder sb = new StringBuilder();
+                    for (int k = 0; k < lines.Count; k = k + 1) {
+                        sb.Append(lines[k]);
+                        sb.Append("\n");
+                    }
+                    src = sb.ToString();
+                    targetLine = ins;
+                    File.WriteAllText(cbPath, src);
+                }
+            }
+        }
+
+        // 同步内存 Tab
+        if (tabIdx >= 0 && tabIdx < tabs.Count) {
+            tabs[tabIdx].body = src;
+        }
+
+        // 同步编辑器并定位
+        if (editor != null) {
+            editor.documentPath = cbPath;
+            editor.LoadText(src);
+            if (targetLine >= 0) {
+                editor.GoToLine(targetLine);
+            }
+        }
+
+        return targetLine;
     }
 
     // 配对设计稿探测：给定 .zan 源码路径，寻找同名对应 .html/.htm 设计稿。
