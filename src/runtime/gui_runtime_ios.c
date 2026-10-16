@@ -993,9 +993,9 @@ static zan_ct_font_t zan_ios_create_font(int font_size) {
         if (font) return font;
     }
 
-    /* 3. PostScript font names: PingFangSC-Regular, Helvetica */
+    /* 3. PostScript font names: AppleSystemUIFont, PingFang SC, Helvetica */
     if (p_CTFontCreateWithName && p_CFStringCreateWithCString) {
-        const char *cand_names[] = { "PingFangSC-Regular", "PingFangSC-Light", "Helvetica", "HelveticaNeue", NULL };
+        const char *cand_names[] = { ".AppleSystemUIFont", "PingFangSC-Regular", "PingFangSC-Light", "PingFangSC-Medium", "HelveticaNeue", "Helvetica", NULL };
         for (int i = 0; cand_names[i]; i++) {
             zan_cf_str_t fname = p_CFStringCreateWithCString(NULL, cand_names[i], 0x08000100);
             if (fname) {
@@ -1106,36 +1106,72 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
     int th = (int)ceil(ascent + descent + leading) + 2;
     unsigned char *mask = (victim && victim->key && strcmp(victim->key, utf8) == 0) ? victim->mask : NULL;
 
-    if (need_mask && tw > 0 && th > 0 && cs_rgb && p_CGBitmapContextCreate && p_CTLineDraw) {
+    if (need_mask && tw > 0 && th > 0 && p_CGBitmapContextCreate && p_CTLineDraw) {
         if (!mask) mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
-        size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
-        uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
-        if (rgba_buf && mask) {
-            /* 32-bit RGBA context: kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast */
-            zan_cg_context_t ctx = p_CGBitmapContextCreate(
-                rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
-                cs_rgb, (4 << 12) | 1);
-            if (ctx) {
-                if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
-                }
-                p_CTLineDraw(line, ctx);
-                if (p_CGContextFlush) p_CGContextFlush(ctx);
-                if (p_CGContextRelease) p_CGContextRelease(ctx);
+        int rendered = 0;
 
-                /* Invert rows during copy to match Quartz bottom-left with Zan top-left */
-                for (int py = 0; py < th; py++) {
-                    const uint32_t *src_row = rgba_buf + (size_t)(th - 1 - py) * (size_t)tw;
-                    unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
-                    for (int px = 0; px < tw; px++) {
-                        uint32_t pix = src_row[px];
-                        uint32_t a = (pix >> 24) & 0xFF;
-                        uint32_t r = (pix >> 16) & 0xFF;
-                        dst_row[px] = (unsigned char)(a > r ? a : r);
+        /* 1. DeviceGray: direct 8-bit native vector antialiasing, zero color conversion, crisp typography */
+        CGColorSpaceRef cs_gray = p_CGColorSpaceCreateDeviceGray ? p_CGColorSpaceCreateDeviceGray() : NULL;
+        if (cs_gray && mask) {
+            unsigned char *gray_buf = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
+            if (gray_buf) {
+                zan_cg_context_t ctx = p_CGBitmapContextCreate(
+                    gray_buf, (size_t)tw, (size_t)th, 8, (size_t)tw,
+                    cs_gray, 0 /* kCGImageAlphaNone */);
+                if (ctx) {
+                    if (p_CGContextSetGrayFillColor) {
+                        p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                     }
+                    if (p_CGContextSetTextPosition) {
+                        p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                    }
+                    p_CTLineDraw(line, ctx);
+                    if (p_CGContextFlush) p_CGContextFlush(ctx);
+                    if (p_CGContextRelease) p_CGContextRelease(ctx);
+
+                    /* Copy row by row inverted from Quartz coordinate */
+                    for (int py = 0; py < th; py++) {
+                        const unsigned char *src_row = gray_buf + (size_t)(th - 1 - py) * (size_t)tw;
+                        unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
+                        memcpy(dst_row, src_row, (size_t)tw);
+                    }
+                    rendered = 1;
                 }
+                free(gray_buf);
             }
-            free(rgba_buf);
+            if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_gray);
+        }
+
+        /* 2. RGBA fallback with complete subpixel luminance max extraction */
+        if (!rendered && cs_rgb && mask) {
+            size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
+            uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
+            if (rgba_buf) {
+                zan_cg_context_t ctx = p_CGBitmapContextCreate(
+                    rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
+                    cs_rgb, (4 << 12) | 1);
+                if (ctx) {
+                    if (p_CGContextSetTextPosition) {
+                        p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                    }
+                    p_CTLineDraw(line, ctx);
+                    if (p_CGContextFlush) p_CGContextFlush(ctx);
+                    if (p_CGContextRelease) p_CGContextRelease(ctx);
+
+                    for (int py = 0; py < th; py++) {
+                        const unsigned char *src_row = (const unsigned char *)(rgba_buf + (size_t)(th - 1 - py) * (size_t)tw);
+                        unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
+                        for (int px = 0; px < tw; px++) {
+                            const unsigned char *p = src_row + (px * 4);
+                            unsigned char r = p[0], g = p[1], b = p[2], a = p[3];
+                            unsigned char max_c = (r > g) ? (r > b ? r : b) : (g > b ? g : b);
+                            dst_row[px] = (a > max_c) ? a : max_c;
+                        }
+                    }
+                    rendered = 1;
+                }
+                free(rgba_buf);
+            }
         }
     }
 
