@@ -7791,7 +7791,7 @@ int main(int argc, char **argv) {
             }
             { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", tbd); }
             if (target.os == ZAN_OS_IOS && has_gui_driver) {
-                const char *ios_tbds[] = {"UIKit.tbd", "Foundation.tbd", "CoreGraphics.tbd", "QuartzCore.tbd"};
+                const char *ios_tbds[] = {"UIKit.tbd", "Foundation.tbd", "CoreGraphics.tbd", "QuartzCore.tbd", "CoreText.tbd"};
                 for (size_t ti = 0; ti < sizeof(ios_tbds) / sizeof(ios_tbds[0]); ti++) {
                     char fw_tbd[1200];
                     snprintf(fw_tbd, sizeof(fw_tbd), "%s/ios/%s", exe_dir2, ios_tbds[ti]);

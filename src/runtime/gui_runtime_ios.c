@@ -19,6 +19,10 @@
 #include <math.h>
 #include <dlfcn.h>
 
+typedef int32_t i32;
+typedef int64_t i64;
+typedef intptr_t iptr;
+
 #ifndef EXPORT
 #define EXPORT __attribute__((visibility("default")))
 #endif
@@ -90,6 +94,7 @@ typedef void *zan_cg_context_t;
 typedef void *zan_cg_color_t;
 
 static zan_ct_font_t (*p_CTFontCreateWithName)(zan_cf_str_t name, double size, const void *matrix) = NULL;
+static zan_ct_font_t (*p_CTFontCreateUIFontForLanguage)(uint32_t uiType, double size, zan_cf_str_t language) = NULL;
 static zan_ct_line_t (*p_CTLineCreateWithAttributedString)(zan_cf_attr_str_t attrString) = NULL;
 static double (*p_CTLineGetTypographicBounds)(zan_ct_line_t line, double *ascent, double *descent, double *leading) = NULL;
 static void (*p_CTLineDraw)(zan_ct_line_t line, zan_cg_context_t context) = NULL;
@@ -101,6 +106,8 @@ static zan_cg_context_t (*p_CGBitmapContextCreate)(void *data, size_t width, siz
 static CGColorSpaceRef (*p_CGColorSpaceCreateDeviceGray)(void) = NULL;
 static void (*p_CGContextSetGrayFillColor)(zan_cg_context_t c, double gray, double alpha) = NULL;
 static void (*p_CGContextSetTextPosition)(zan_cg_context_t c, double x, double y) = NULL;
+static void (*p_CGContextTranslateCTM)(zan_cg_context_t c, double tx, double ty) = NULL;
+static void (*p_CGContextScaleCTM)(zan_cg_context_t c, double sx, double sy) = NULL;
 static void (*p_CGContextFlush)(zan_cg_context_t c) = NULL;
 static void (*p_CGContextRelease)(zan_cg_context_t c) = NULL;
 static zan_cg_color_t (*p_CGColorCreate)(CGColorSpaceRef space, const double *components) = NULL;
@@ -113,6 +120,7 @@ static zan_cf_attr_str_t (*p_CFAttributedStringCreate)(void *alloc, zan_cf_str_t
 
 static void **p_kCTFontAttributeName = NULL;
 static void **p_kCTForegroundColorAttributeName = NULL;
+static void **p_NSFontAttributeName = NULL;
 static const void *p_kCFTypeDictionaryKeyCallBacks = NULL;
 static const void *p_kCFTypeDictionaryValueCallBacks = NULL;
 
@@ -264,6 +272,7 @@ static void zan_ios_init_bridge(void) {
 
     /* CoreText font & glyph rasterization symbols */
     p_CTFontCreateWithName = (zan_ct_font_t (*)(zan_cf_str_t, double, const void *))dlsym(RTLD_DEFAULT, "CTFontCreateWithName");
+    p_CTFontCreateUIFontForLanguage = (zan_ct_font_t (*)(uint32_t, double, zan_cf_str_t))dlsym(RTLD_DEFAULT, "CTFontCreateUIFontForLanguage");
     p_CTLineCreateWithAttributedString = (zan_ct_line_t (*)(zan_cf_attr_str_t))dlsym(RTLD_DEFAULT, "CTLineCreateWithAttributedString");
     p_CTLineGetTypographicBounds = (double (*)(zan_ct_line_t, double *, double *, double *))dlsym(RTLD_DEFAULT, "CTLineGetTypographicBounds");
     p_CTLineDraw = (void (*)(zan_ct_line_t, zan_cg_context_t))dlsym(RTLD_DEFAULT, "CTLineDraw");
@@ -275,6 +284,8 @@ static void zan_ios_init_bridge(void) {
     p_CGColorSpaceCreateDeviceGray = (CGColorSpaceRef (*)(void))dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceGray");
     p_CGContextSetGrayFillColor = (void (*)(zan_cg_context_t, double, double))dlsym(RTLD_DEFAULT, "CGContextSetGrayFillColor");
     p_CGContextSetTextPosition = (void (*)(zan_cg_context_t, double, double))dlsym(RTLD_DEFAULT, "CGContextSetTextPosition");
+    p_CGContextTranslateCTM = (void (*)(zan_cg_context_t, double, double))dlsym(RTLD_DEFAULT, "CGContextTranslateCTM");
+    p_CGContextScaleCTM = (void (*)(zan_cg_context_t, double, double))dlsym(RTLD_DEFAULT, "CGContextScaleCTM");
     p_CGContextFlush = (void (*)(zan_cg_context_t))dlsym(RTLD_DEFAULT, "CGContextFlush");
     p_CGContextRelease = (void (*)(zan_cg_context_t))dlsym(RTLD_DEFAULT, "CGContextRelease");
     p_CGColorCreate = (zan_cg_color_t (*)(CGColorSpaceRef, const double *))dlsym(RTLD_DEFAULT, "CGColorCreate");
@@ -287,6 +298,7 @@ static void zan_ios_init_bridge(void) {
 
     p_kCTFontAttributeName = (void **)dlsym(RTLD_DEFAULT, "kCTFontAttributeName");
     p_kCTForegroundColorAttributeName = (void **)dlsym(RTLD_DEFAULT, "kCTForegroundColorAttributeName");
+    p_NSFontAttributeName = (void **)dlsym(RTLD_DEFAULT, "NSFontAttributeName");
     p_kCFTypeDictionaryKeyCallBacks = dlsym(RTLD_DEFAULT, "kCFTypeDictionaryKeyCallBacks");
     p_kCFTypeDictionaryValueCallBacks = dlsym(RTLD_DEFAULT, "kCFTypeDictionaryValueCallBacks");
 
@@ -295,7 +307,164 @@ static void zan_ios_init_bridge(void) {
     }
 }
 
-static void zan_ios_handle_touch(zan_id_t view, zan_id_t touches, int kind) {
+/* ========================================================================= */
+/* iOS Mobile Touch Gestures: Tap, Drag, Wheel-Scroll & Inertia Fling        */
+/* ========================================================================= */
+
+static int g_ios_touch_down = 0;
+static int g_ios_touch_drag = 0;
+static float g_ios_touch_ax = 0.0f;
+static float g_ios_touch_ay = 0.0f;
+static float g_ios_touch_x = 0.0f;
+static float g_ios_touch_y = 0.0f;
+static float g_ios_touch_acc = 0.0f;
+#define IOS_TOUCH_HIST 8
+static long long g_ios_touch_ht[IOS_TOUCH_HIST];
+static float g_ios_touch_hy[IOS_TOUCH_HIST];
+static int g_ios_touch_hi = 0;
+static int g_ios_touch_hn = 0;
+
+#define IOS_TOUCH_SLOP2 (8.0f * 8.0f)
+#define IOS_FLING_TAU_MS 280.0f
+#define IOS_FLING_START_PX_S 120.0f
+#define IOS_FLING_STOP_PX_S 40.0f
+
+static volatile int g_ios_fling_active = 0;
+static float g_ios_fling_v = 0.0f;
+static float g_ios_fling_acc = 0.0f;
+static int g_ios_fling_x = 0;
+static int g_ios_fling_y = 0;
+static long long g_ios_fling_last = 0;
+static pthread_t g_ios_fling_thr;
+static int g_ios_fling_thr_up = 0;
+
+static long long ios_tick_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void *ios_fling_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_iq_lock);
+        int live = g_ios_fling_active;
+        if (live) {
+            long long now = ios_tick_ms();
+            float dt = (float)(now - g_ios_fling_last) / 1000.0f;
+            g_ios_fling_last = now;
+            if (dt > 0.0f) {
+                g_ios_fling_v *= expf(-dt * 1000.0f / IOS_FLING_TAU_MS);
+                float dpi = (float)(g_iwin.dpi > 0 ? g_iwin.dpi : 192);
+                g_ios_fling_acc += g_ios_fling_v * dt * 288.0f / dpi;
+                int delta = (int)g_ios_fling_acc;
+                if (delta != 0) {
+                    g_ios_fling_acc -= (float)delta;
+                    iq_push_locked(13, g_ios_fling_x, g_ios_fling_y, 0, delta, 0);
+                }
+            }
+            if (fabsf(g_ios_fling_v) < IOS_FLING_STOP_PX_S) g_ios_fling_active = 0;
+        }
+        pthread_mutex_unlock(&g_iq_lock);
+        if (!live) break;
+        struct timespec ts = { 0, 16 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    g_ios_fling_thr_up = 0;
+    return NULL;
+}
+
+static void ios_fling_cancel_locked(void) { g_ios_fling_active = 0; }
+
+static void ios_fling_start(float v, int x, int y) {
+    if (fabsf(v) < IOS_FLING_START_PX_S) return;
+    pthread_mutex_lock(&g_iq_lock);
+    g_ios_fling_v = v;
+    g_ios_fling_acc = 0.0f;
+    g_ios_fling_x = x; g_ios_fling_y = y;
+    g_ios_fling_last = ios_tick_ms();
+    g_ios_fling_active = 1;
+    int need = !g_ios_fling_thr_up;
+    g_ios_fling_thr_up = 1;
+    pthread_mutex_unlock(&g_iq_lock);
+    if (need && pthread_create(&g_ios_fling_thr, NULL, ios_fling_thread, NULL) != 0) {
+        g_ios_fling_thr_up = 0;
+    }
+}
+
+static void zan_ios_touch_action(int action, int x, int y) {
+    if (action == 0) { /* touch began */
+        pthread_mutex_lock(&g_iq_lock);
+        ios_fling_cancel_locked();
+        g_ios_touch_down = 1;
+        g_ios_touch_drag = 0;
+        g_ios_touch_acc = 0.0f;
+        g_ios_touch_x = g_ios_touch_ax = (float)x;
+        g_ios_touch_y = g_ios_touch_ay = (float)y;
+        g_ios_touch_hn = 1;
+        g_ios_touch_hi = 1 % IOS_TOUCH_HIST;
+        g_ios_touch_ht[0] = ios_tick_ms();
+        g_ios_touch_hy[0] = g_ios_touch_y;
+        iq_push_locked(1, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 0, 0, 0);
+        iq_push_locked(2, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 1, 0, 0);
+        pthread_mutex_unlock(&g_iq_lock);
+        return;
+    }
+    if (action == 1 && g_ios_touch_down) { /* touch moved */
+        pthread_mutex_lock(&g_iq_lock);
+        float fx = (float)x, fy = (float)y;
+        if (!g_ios_touch_drag) {
+            float dx = fx - g_ios_touch_ax, dy = fy - g_ios_touch_ay;
+            if (dx * dx + dy * dy < IOS_TOUCH_SLOP2) {
+                pthread_mutex_unlock(&g_iq_lock);
+                return;
+            }
+            g_ios_touch_drag = 1;
+        }
+        float dpi = (float)(g_iwin.dpi > 0 ? g_iwin.dpi : 192);
+        g_ios_touch_acc += (fy - g_ios_touch_y) * 288.0f / dpi;
+        int delta = (int)g_ios_touch_acc;
+        if (delta != 0) {
+            g_ios_touch_acc -= (float)delta;
+            iq_push_locked(13, x, y, 0, delta, 0);
+        }
+        g_ios_touch_ht[g_ios_touch_hi] = ios_tick_ms();
+        g_ios_touch_hy[g_ios_touch_hi] = fy;
+        g_ios_touch_hi = (g_ios_touch_hi + 1) % IOS_TOUCH_HIST;
+        if (g_ios_touch_hn < IOS_TOUCH_HIST) g_ios_touch_hn++;
+        g_ios_touch_x = fx; g_ios_touch_y = fy;
+        iq_push_locked(1, x, y, 0, 0, 0);
+        pthread_mutex_unlock(&g_iq_lock);
+        return;
+    }
+    if (action == 2 && g_ios_touch_down) { /* touch ended / cancelled */
+        g_ios_touch_down = 0;
+        pthread_mutex_lock(&g_iq_lock);
+        if (g_ios_touch_drag) {
+            iq_push_locked(3, (int)g_ios_touch_x, (int)g_ios_touch_y, 1, 0, 0);
+            pthread_mutex_unlock(&g_iq_lock);
+            int last = (g_ios_touch_hi + IOS_TOUCH_HIST - 1) % IOS_TOUCH_HIST;
+            int old = last;
+            for (int k = 0; k < g_ios_touch_hn; k++) {
+                int idx = (last - k + IOS_TOUCH_HIST) % IOS_TOUCH_HIST;
+                if (g_ios_touch_ht[idx] + 120 < g_ios_touch_ht[last]) break;
+                old = idx;
+            }
+            long long span = g_ios_touch_ht[last] - g_ios_touch_ht[old];
+            if (span > 0 && g_ios_touch_hn >= 2) {
+                float v = (g_ios_touch_hy[last] - g_ios_touch_hy[old]) * 1000.0f / (float)span;
+                ios_fling_start(v, (int)g_ios_touch_x, (int)g_ios_touch_y);
+            }
+        } else {
+            int ax = (int)g_ios_touch_ax, ay = (int)g_ios_touch_ay;
+            iq_push_locked(3, ax, ay, 1, 0, 0);
+            pthread_mutex_unlock(&g_iq_lock);
+        }
+        return;
+    }
+}
+
+static void zan_ios_handle_touch(zan_id_t view, zan_id_t touches, int action) {
     if (!touches) return;
     zan_sel_t sel_any = g_bridge.sel_registerName("anyObject");
     zan_id_t touch = zan_send0(touches, sel_any);
@@ -312,15 +481,12 @@ static void zan_ios_handle_touch(zan_id_t view, zan_id_t touches, int kind) {
 
     int x = (int)(pt.x * scale);
     int y = (int)(pt.y * scale);
-
-    pthread_mutex_lock(&g_iq_lock);
-    iq_push_locked(kind, x, y, 1, 0, 0);
-    pthread_mutex_unlock(&g_iq_lock);
+    zan_ios_touch_action(action, x, y);
 }
 
 static void zan_ios_touches_began(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
     (void)_cmd; (void)event;
-    zan_ios_handle_touch(self, touches, 2);
+    zan_ios_handle_touch(self, touches, 0);
 }
 
 static void zan_ios_touches_moved(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
@@ -330,12 +496,12 @@ static void zan_ios_touches_moved(zan_id_t self, zan_sel_t _cmd, zan_id_t touche
 
 static void zan_ios_touches_ended(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
     (void)_cmd; (void)event;
-    zan_ios_handle_touch(self, touches, 3);
+    zan_ios_handle_touch(self, touches, 2);
 }
 
 static void zan_ios_touches_cancelled(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
     (void)_cmd; (void)event;
-    zan_ios_handle_touch(self, touches, 3);
+    zan_ios_handle_touch(self, touches, 2);
 }
 
 static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t app, zan_id_t opts) {
@@ -646,14 +812,8 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return zan_gui
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_iwin.dpi * 100 / 96); }
 
-static inline i64 ios_tick_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (i64)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
-}
-
 EXPORT i64 zan_gui_get_tick_ms(void) {
-    return ios_tick_ms();
+    return (i64)ios_tick_ms();
 }
 
 EXPORT void zan_gui_sleep_ms(i32 ms) {
@@ -713,21 +873,43 @@ static unsigned int zan_ios_text_hash(const char *s, int font_size) {
 }
 
 static zan_ct_font_t zan_ios_create_font(int font_size) {
-    if (!p_CTFontCreateWithName || !p_CFStringCreateWithCString) return NULL;
+    if (!g_bridge.initialized) zan_ios_init_bridge();
     double size = (double)font_size;
     if (size < 8.0) size = 8.0;
-    zan_cf_str_t fname = p_CFStringCreateWithCString(NULL, ".AppleSystemUIFont", 0x08000100);
-    zan_ct_font_t font = p_CTFontCreateWithName(fname, size, NULL);
-    if (fname && p_CFRelease) p_CFRelease(fname);
-    if (!font) {
-        fname = p_CFStringCreateWithCString(NULL, "PingFang SC", 0x08000100);
-        font = p_CTFontCreateWithName(fname, size, NULL);
-        if (fname && p_CFRelease) p_CFRelease(fname);
+
+    /* 1. UIKit UIFont systemFontOfSize: (toll-free bridged with CTFontRef on iOS) */
+    if (g_bridge.objc_getClass && g_bridge.sel_registerName && g_bridge.objc_msgSend) {
+        zan_class_t cls_uifont = g_bridge.objc_getClass("UIFont");
+        if (cls_uifont) {
+            zan_sel_t sel_sys = g_bridge.sel_registerName("systemFontOfSize:");
+            if (sel_sys) {
+                typedef zan_id_t (*zan_msg_dbl_ret_id_fn)(zan_id_t, zan_sel_t, double);
+                zan_msg_dbl_ret_id_fn fn_sys = (zan_msg_dbl_ret_id_fn)g_bridge.objc_msgSend;
+                zan_id_t uifont = fn_sys((zan_id_t)cls_uifont, sel_sys, size);
+                if (uifont) return (zan_ct_font_t)uifont;
+            }
+        }
     }
-    if (!font) {
-        font = p_CTFontCreateWithName(NULL, size, NULL);
+
+    /* 2. CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, NULL) */
+    if (p_CTFontCreateUIFontForLanguage) {
+        zan_ct_font_t font = p_CTFontCreateUIFontForLanguage(3 /* kCTFontUIFontSystem */, size, NULL);
+        if (font) return font;
     }
-    return font;
+
+    /* 3. PostScript font names: PingFangSC-Regular, Helvetica */
+    if (p_CTFontCreateWithName && p_CFStringCreateWithCString) {
+        const char *cand_names[] = { "PingFangSC-Regular", "PingFangSC-Light", "Helvetica", "HelveticaNeue", NULL };
+        for (int i = 0; cand_names[i]; i++) {
+            zan_cf_str_t fname = p_CFStringCreateWithCString(NULL, cand_names[i], 0x08000100);
+            if (fname) {
+                zan_ct_font_t font = p_CTFontCreateWithName(fname, size, NULL);
+                if (p_CFRelease) p_CFRelease(fname);
+                if (font) return font;
+            }
+        }
+    }
+    return NULL;
 }
 
 static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
@@ -740,37 +922,14 @@ static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
 
     zan_cf_dict_t attrs = NULL;
     void *font_attr_key = p_kCTFontAttributeName ? *p_kCTFontAttributeName : NULL;
-    void *fg_attr_key = p_kCTForegroundColorAttributeName ? *p_kCTForegroundColorAttributeName : NULL;
+    if (!font_attr_key && p_NSFontAttributeName) font_attr_key = *p_NSFontAttributeName;
 
-    zan_cg_color_t white_col = NULL;
-    if (p_CGColorCreate && p_CGColorSpaceCreateDeviceGray) {
-        CGColorSpaceRef gray_cs = p_CGColorSpaceCreateDeviceGray();
-        if (gray_cs) {
-            const double comps[2] = { 1.0, 1.0 };
-            white_col = p_CGColorCreate(gray_cs, comps);
-            if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(gray_cs);
-        }
-    }
-
-    if (p_CFDictionaryCreate) {
-        const void *keys[2];
-        const void *values[2];
-        int num = 0;
-        if (font_attr_key) {
-            keys[num] = font_attr_key;
-            values[num] = font;
-            num++;
-        }
-        if (fg_attr_key && white_col) {
-            keys[num] = fg_attr_key;
-            values[num] = white_col;
-            num++;
-        }
-        if (num > 0) {
-            attrs = p_CFDictionaryCreate(NULL, keys, values, num,
-                                         p_kCFTypeDictionaryKeyCallBacks,
-                                         p_kCFTypeDictionaryValueCallBacks);
-        }
+    if (font_attr_key && p_CFDictionaryCreate) {
+        const void *keys[1] = { font_attr_key };
+        const void *values[1] = { font };
+        attrs = p_CFDictionaryCreate(NULL, keys, values, 1,
+                                     p_kCFTypeDictionaryKeyCallBacks,
+                                     p_kCFTypeDictionaryValueCallBacks);
     }
 
     zan_cf_attr_str_t attr_str = p_CFAttributedStringCreate(NULL, str, attrs);
@@ -778,15 +937,12 @@ static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
 
     if (attr_str && p_CFRelease) p_CFRelease(attr_str);
     if (attrs && p_CFRelease) p_CFRelease(attrs);
-    if (white_col) {
-        if (p_CGColorRelease) p_CGColorRelease(white_col);
-        else if (p_CFRelease) p_CFRelease(white_col);
-    }
     if (str && p_CFRelease) p_CFRelease(str);
     return line;
 }
 
 static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size, bool need_mask) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
     if (!utf8 || !*utf8 || !p_CTFontCreateWithName || !p_CTLineCreateWithAttributedString ||
         !p_CTLineGetTypographicBounds) {
         return NULL;
@@ -812,24 +968,60 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
     int th = (int)ceil(ascent + descent + leading) + 2;
     unsigned char *mask = NULL;
 
-    if (need_mask && tw > 0 && th > 0 && p_CGBitmapContextCreate && p_CGColorSpaceCreateDeviceGray) {
+    if (need_mask && tw > 0 && th > 0 && p_CGBitmapContextCreate) {
         mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
         if (mask) {
-            CGColorSpaceRef cs = p_CGColorSpaceCreateDeviceGray();
-            /* kCGImageAlphaNone = 0 */
+            /* Try 1: kCGImageAlphaOnly (8 bits per pixel, colorSpace NULL) */
             zan_cg_context_t ctx = p_CGBitmapContextCreate(
-                mask, (size_t)tw, (size_t)th, 8, (size_t)tw, cs, 0);
+                mask, (size_t)tw, (size_t)th, 8, (size_t)tw, NULL, 7 /* kCGImageAlphaOnly */);
+            if (!ctx && p_CGColorSpaceCreateDeviceGray) {
+                CGColorSpaceRef cs_gray = p_CGColorSpaceCreateDeviceGray();
+                if (cs_gray) {
+                    ctx = p_CGBitmapContextCreate(mask, (size_t)tw, (size_t)th, 8, (size_t)tw, cs_gray, 7);
+                    if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_gray);
+                }
+            }
+
             if (ctx) {
-                if (p_CGContextSetGrayFillColor) p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
-                if (p_CGContextSetTextPosition) p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
+                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
+                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                }
+                if (p_CGContextSetTextPosition) p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
                 if (p_CTLineDraw) p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
                 if (p_CGContextRelease) p_CGContextRelease(ctx);
-            } else {
-                free(mask);
-                mask = NULL;
+            } else if (p_CGColorSpaceCreateDeviceRGB) {
+                /* Try 2: 32-bit RGBA context fallback */
+                CGColorSpaceRef cs_rgb = p_CGColorSpaceCreateDeviceRGB();
+                if (cs_rgb) {
+                    size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
+                    uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
+                    if (rgba_buf) {
+                        ctx = p_CGBitmapContextCreate(
+                            rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
+                            cs_rgb, (4 << 12) | 1 /* kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast */);
+                        if (ctx) {
+                            if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
+                                p_CGContextTranslateCTM(ctx, 0.0, (double)th);
+                                p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                            }
+                            if (p_CGContextSetTextPosition) p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+                            if (p_CTLineDraw) p_CTLineDraw(line, ctx);
+                            if (p_CGContextFlush) p_CGContextFlush(ctx);
+                            if (p_CGContextRelease) p_CGContextRelease(ctx);
+                            for (size_t i = 0; i < (size_t)tw * (size_t)th; i++) {
+                                uint32_t pix = rgba_buf[i];
+                                uint32_t a = (pix >> 24) & 0xFF;
+                                uint32_t r = (pix >> 16) & 0xFF;
+                                mask[i] = (unsigned char)(a > r ? a : r);
+                            }
+                        }
+                        free(rgba_buf);
+                    }
+                    if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
+                }
             }
-            if (cs && p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs);
         }
     }
 
