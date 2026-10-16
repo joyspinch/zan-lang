@@ -709,6 +709,13 @@ static int run_completion_checks(child_t *child) {
               "completion: generic static call retains concrete type argument");
     ext_check(completion_has(child, suffix_uri, suffix_text, "base.Fetch().", "Length"),
               "completion: base receiver retains generic argument");
+    response = request_at_marker(child, suffix_uri, suffix_text, "base.Fetch",
+                                  "textDocument/definition", NULL);
+    root = response ? json_parse(response) : NULL;
+    start = json_obj_get(json_obj_get(json_obj_get(root, "result"), "range"), "start");
+    ext_check(start && json_get_num(json_obj_get(start, "line"), -1) == 0,
+              "definition: base receiver jumps to base class method");
+    json_free(root); free(response);
 
     const char *factory_uri = "file:///lsp_project_factory.zan";
     const char *factory_text = "class ProjectFactory { public static string Fetch() { return \"x\"; } }\n";

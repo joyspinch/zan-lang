@@ -199,8 +199,14 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line);
 hover_info_t intel_hover(intellisense_t *is, const char *word);
 hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
                                 const char *member);
+hover_info_t intel_hover_member_ex(intellisense_t *is, intellisense_t *project,
+                                   const char *type_name, const char *member);
 bool intel_goto_member(intellisense_t *is, const char *type_name,
                        const char *member, goto_def_t *out);
+bool intel_goto_member_ex(intellisense_t *is, intellisense_t *project,
+                          const char *type_name, const char *member, goto_def_t *out);
+const isym_t *intel_member_sym_ex(intellisense_t *is, intellisense_t *project,
+                                  const char *type_name, const char *member);
 
 /* Go to definition of a symbol */
 goto_def_t intel_goto_def(intellisense_t *is, const char *word);

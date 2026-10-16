@@ -1602,14 +1602,18 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
                                          fm, sizeof(fm), line, character);
         }
         if (rt && rt[0]) {
-            h = intel_hover_member(is, rt, word);
-            if (!h.valid && g_project_intel)
-                h = intel_hover_member(g_project_intel, rt, word);
+            h = intel_hover_member_ex(is, g_project_intel, rt, word);
         }
     }
 
     if (!h.valid)
         h = intel_hover_pos(is, word, line, character);
+
+    if (!h.valid) {
+        const char *encl = intel_enclosing_type_at(is, line, character);
+        if (encl && encl[0])
+            h = intel_hover_member_ex(is, g_project_intel, encl, word);
+    }
 
     if (!h.valid && g_project_intel)
         h = intel_hover_at(g_project_intel, word, -1);
@@ -1660,17 +1664,44 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
             rt = intel_resolve_chain_pos(g_project_intel, is, chain,
                                          fm, sizeof(fm), line, character);
         }
-        if (rt && rt[0] && g_project_intel) {
-            intel_goto_member(g_project_intel, rt, word, &g);
+        if (rt && rt[0]) {
+            intel_goto_member_ex(is, g_project_intel, rt, word, &g);
         }
     }
     if (!g.found) {
         const isym_t *loc = intel_lookup_symbol_at(is, word, line, character);
-        if (loc && (loc->kind == ISYM_VARIABLE || loc->kind == ISYM_PARAMETER)) {
-            g.found = true;
-            g.line = loc->line;
-            g.col = loc->col;
-            g.file[0] = '\0';
+        if (loc) {
+            if (loc->kind == ISYM_VARIABLE || loc->kind == ISYM_PARAMETER) {
+                g.found = true;
+                g.line = loc->line;
+                g.col = loc->col;
+                g.file[0] = '\0';
+            } else if (loc->kind == ISYM_FIELD || loc->kind == ISYM_PROPERTY ||
+                       loc->kind == ISYM_EVENT || loc->kind == ISYM_METHOD ||
+                       loc->kind == ISYM_CONSTRUCTOR) {
+                g.found = true;
+                g.line = loc->line;
+                g.col = loc->col;
+                if (loc->file[0])
+                    strncpy(g.file, loc->file, sizeof(g.file) - 1);
+                else
+                    g.file[0] = '\0';
+            } else if (loc->kind == ISYM_CLASS || loc->kind == ISYM_STRUCT ||
+                       loc->kind == ISYM_ENUM || loc->kind == ISYM_INTERFACE) {
+                g.found = true;
+                g.line = loc->line;
+                g.col = loc->col;
+                if (loc->file[0])
+                    strncpy(g.file, loc->file, sizeof(g.file) - 1);
+                else
+                    g.file[0] = '\0';
+            }
+        }
+    }
+    if (!g.found) {
+        const char *encl = intel_enclosing_type_at(is, line, character);
+        if (encl && encl[0]) {
+            intel_goto_member_ex(is, g_project_intel, encl, word, &g);
         }
     }
     if (!g.found)
@@ -1899,6 +1930,7 @@ static bool type_simple_same(const char *a, const char *b) {
 typedef struct {
     bool ok;
     bool is_local;
+    bool is_type;
     char rt_simple[128];
     bool have_decl;
     char decl_ref[512];
@@ -1929,6 +1961,38 @@ static bool occurrence_matches(const sym_target_t *t, const char *text,
                s2->line == t->ldecl_line && s2->col == t->ldecl_col;
     }
     if (sym_target_is_decl(t, doc_uri, rl, rc)) return true;
+
+    if (t->is_type) {
+        if (off > 0 && text[off - 1] == '.') {
+            char chain[256];
+            if (!receiver_chain_before(text, off, chain, sizeof(chain)))
+                return false;
+        }
+        const isym_t *s2 = de ? intel_lookup_symbol_at(de, t->word, rl, rc) : NULL;
+        if (s2) {
+            if (s2->kind == ISYM_VARIABLE || s2->kind == ISYM_PARAMETER ||
+                s2->kind == ISYM_FIELD || s2->kind == ISYM_PROPERTY ||
+                s2->kind == ISYM_METHOD || s2->kind == ISYM_EVENT) {
+                return false;
+            }
+            if (s2->kind == ISYM_CLASS || s2->kind == ISYM_STRUCT ||
+                s2->kind == ISYM_ENUM || s2->kind == ISYM_INTERFACE) {
+                return type_simple_same(s2->name, t->rt_simple);
+            }
+        }
+        if (project) {
+            for (int i = 0; i < project->symbol_count; i++) {
+                const isym_t *ps = &project->symbols[i];
+                if (strcmp(ps->name, t->word) == 0 &&
+                    (ps->kind == ISYM_CLASS || ps->kind == ISYM_STRUCT ||
+                     ps->kind == ISYM_ENUM || ps->kind == ISYM_INTERFACE)) {
+                    return type_simple_same(ps->name, t->rt_simple);
+                }
+            }
+        }
+        return false;
+    }
+
     char chain[256];
     if (receiver_chain_before(text, off, chain, sizeof(chain))) {
         char fm[64];
@@ -1938,12 +2002,24 @@ static bool occurrence_matches(const sym_target_t *t, const char *text,
         if ((!rt2 || !rt2[0]) && project)
             rt2 = intel_resolve_chain_pos(project, de, chain, fm, sizeof(fm),
                                           rl, rc);
-        if (rt2 && rt2[0] && type_simple_same(rt2, t->rt_simple)) return true;
+        if (rt2 && rt2[0]) {
+            if (type_simple_same(rt2, t->rt_simple)) return true;
+            const isym_t *msym = intel_member_sym_ex(de, project, rt2, t->word);
+            if (msym && msym->parent[0] && type_simple_same(msym->parent, t->rt_simple))
+                return true;
+        }
     }
     if (de) {
         const isym_t *s2 = intel_lookup_symbol_at(de, t->word, rl, rc);
         if (s2 && s2->parent[0] && type_simple_same(s2->parent, t->rt_simple))
             return true;
+        const char *encl = intel_enclosing_type_at(de, rl, rc);
+        if (encl && encl[0]) {
+            if (type_simple_same(encl, t->rt_simple)) return true;
+            const isym_t *msym = intel_member_sym_ex(de, project, encl, t->word);
+            if (msym && msym->parent[0] && type_simple_same(msym->parent, t->rt_simple))
+                return true;
+        }
     }
     return false;
 }
@@ -1965,19 +2041,19 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
         if ((!rt || !rt[0]) && project)
             rt = intel_resolve_chain_pos(project, is, chain, fm, sizeof(fm),
                                          line, character);
-        if (rt && rt[0] && project) {
-            goto_def_t decl;
-            memset(&decl, 0, sizeof(decl));
-            if (intel_goto_member(project, rt, word, &decl) && decl.file[0]) {
+        if (rt && rt[0]) {
+            const isym_t *decl_sym = intel_member_sym_ex(is, project, rt, word);
+            if (decl_sym) {
                 char duri[512];
-                fspath_to_uri(decl.file, duri, sizeof(duri));
+                fspath_to_uri(decl_sym->file[0] ? decl_sym->file : uri, duri, sizeof(duri));
                 t->ok = true;
                 t->is_local = false;
-                snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", rt);
+                t->is_type = false;
+                snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", decl_sym->parent[0] ? decl_sym->parent : rt);
                 t->have_decl = true;
                 snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
-                t->decl_line = decl.line;
-                t->decl_col = decl.col;
+                t->decl_line = decl_sym->line;
+                t->decl_col = decl_sym->col;
                 return true;
             }
         }
@@ -1985,34 +2061,89 @@ static bool resolve_sym_target(intellisense_t *is, intellisense_t *project,
 
     if (!is) return false;
     const isym_t *sym = intel_lookup_symbol_at(is, word, line, character);
-    if (!sym) return false;
-    if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) {
-        if (sym->line < 0) return false;
-        char dcheck[128];
-        word_at(text, pos_to_offset(text, sym->line, sym->col), dcheck,
-                sizeof(dcheck));
-        if (strcmp(dcheck, word) != 0) return false;
-        t->ok = true;
-        t->is_local = true;
-        t->ldecl_line = sym->line;
-        t->ldecl_col = sym->col;
-        return true;
-    }
-    if ((sym->kind == ISYM_FIELD || sym->kind == ISYM_PROPERTY ||
-         sym->kind == ISYM_EVENT || sym->kind == ISYM_METHOD) &&
-        sym->parent[0]) {
-        t->ok = true;
-        t->is_local = false;
-        snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", sym->parent);
-        t->have_decl = true;
-        {
+    if (sym) {
+        if (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER) {
+            if (sym->line < 0) return false;
+            char dcheck[128];
+            word_at(text, pos_to_offset(text, sym->line, sym->col), dcheck,
+                    sizeof(dcheck));
+            if (strcmp(dcheck, word) != 0) return false;
+            t->ok = true;
+            t->is_local = true;
+            t->is_type = false;
+            t->ldecl_line = sym->line;
+            t->ldecl_col = sym->col;
+            return true;
+        }
+        if ((sym->kind == ISYM_FIELD || sym->kind == ISYM_PROPERTY ||
+             sym->kind == ISYM_EVENT || sym->kind == ISYM_METHOD ||
+             sym->kind == ISYM_CONSTRUCTOR) &&
+            sym->parent[0]) {
+            t->ok = true;
+            t->is_local = false;
+            t->is_type = false;
+            snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", sym->parent);
+            t->have_decl = true;
             char duri[512];
             fspath_to_uri(sym->file[0] ? sym->file : uri, duri, sizeof(duri));
             snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+            t->decl_line = sym->line;
+            t->decl_col = sym->col;
+            return true;
         }
-        t->decl_line = sym->line;
-        t->decl_col = sym->col;
-        return true;
+        if (sym->kind == ISYM_CLASS || sym->kind == ISYM_STRUCT ||
+            sym->kind == ISYM_ENUM || sym->kind == ISYM_INTERFACE) {
+            t->ok = true;
+            t->is_local = false;
+            t->is_type = true;
+            snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", sym->name);
+            t->have_decl = true;
+            char duri[512];
+            fspath_to_uri(sym->file[0] ? sym->file : uri, duri, sizeof(duri));
+            snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+            t->decl_line = sym->line;
+            t->decl_col = sym->col;
+            return true;
+        }
+    }
+
+    const char *encl = intel_enclosing_type_at(is, line, character);
+    if (encl && encl[0]) {
+        const isym_t *decl_sym = intel_member_sym_ex(is, project, encl, word);
+        if (decl_sym) {
+            char duri[512];
+            fspath_to_uri(decl_sym->file[0] ? decl_sym->file : uri, duri, sizeof(duri));
+            t->ok = true;
+            t->is_local = false;
+            t->is_type = false;
+            snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", decl_sym->parent[0] ? decl_sym->parent : encl);
+            t->have_decl = true;
+            snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+            t->decl_line = decl_sym->line;
+            t->decl_col = decl_sym->col;
+            return true;
+        }
+    }
+
+    if (project) {
+        for (int i = 0; i < project->symbol_count; i++) {
+            const isym_t *ps = &project->symbols[i];
+            if (strcmp(ps->name, word) == 0 &&
+                (ps->kind == ISYM_CLASS || ps->kind == ISYM_STRUCT ||
+                 ps->kind == ISYM_ENUM || ps->kind == ISYM_INTERFACE)) {
+                t->ok = true;
+                t->is_local = false;
+                t->is_type = true;
+                snprintf(t->rt_simple, sizeof(t->rt_simple), "%s", ps->name);
+                t->have_decl = true;
+                char duri[512];
+                fspath_to_uri(ps->file[0] ? ps->file : uri, duri, sizeof(duri));
+                snprintf(t->decl_ref, sizeof(t->decl_ref), "%s", duri);
+                t->decl_line = ps->line;
+                t->decl_col = ps->col;
+                return true;
+            }
+        }
     }
     return false;
 }

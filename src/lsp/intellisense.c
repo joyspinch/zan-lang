@@ -1987,9 +1987,9 @@ hover_info_t intel_hover_at(intellisense_t *is, const char *word, int line) {
     return intel_hover_pos(is, word, line, -1);
 }
 
-static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
-                                      const char *member) {
-    if (!is || !type_name || !type_name[0] || !member || !member[0]) return NULL;
+const isym_t *intel_member_sym_ex(intellisense_t *is, intellisense_t *project,
+                                  const char *type_name, const char *member) {
+    if ((!is && !project) || !type_name || !type_name[0] || !member || !member[0]) return NULL;
 
     char bare[64];
     snprintf(bare, sizeof(bare), "%s", type_name);
@@ -2003,26 +2003,43 @@ static const isym_t *intel_member_sym(intellisense_t *is, const char *type_name,
         simple[strcspn(simple, "<?")] = '\0';
         const char *sp = strrchr(simple, '.');
         sp = sp ? sp + 1 : simple;
-        for (int i = 0; i < is->symbol_count; i++) {
-            const isym_t *sym = &is->symbols[i];
-            if (!sym->parent[0] || strcmp(sym->parent, sp) != 0) continue;
-            if (strcmp(sym->name, member) != 0) continue;
-            if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
-                continue;
-            return sym;
+        if (is) {
+            for (int i = 0; i < is->symbol_count; i++) {
+                const isym_t *sym = &is->symbols[i];
+                if (!sym->parent[0] || strcmp(sym->parent, sp) != 0) continue;
+                if (strcmp(sym->name, member) != 0) continue;
+                if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                    sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER &&
+                    sym->kind != ISYM_EVENT && sym->kind != ISYM_CONSTRUCTOR)
+                    continue;
+                return sym;
+            }
         }
-        cls = class_base(is, cls);
+        if (project && project != is) {
+            for (int i = 0; i < project->symbol_count; i++) {
+                const isym_t *sym = &project->symbols[i];
+                if (!sym->parent[0] || strcmp(sym->parent, sp) != 0) continue;
+                if (strcmp(sym->name, member) != 0) continue;
+                if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                    sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER &&
+                    sym->kind != ISYM_EVENT && sym->kind != ISYM_CONSTRUCTOR)
+                    continue;
+                return sym;
+            }
+        }
+        const char *next_cls = is ? class_base(is, cls) : NULL;
+        if (!next_cls && project) next_cls = class_base(project, cls);
+        cls = next_cls;
     }
     return NULL;
 }
 
-hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
-                                const char *member) {
+hover_info_t intel_hover_member_ex(intellisense_t *is, intellisense_t *project,
+                                   const char *type_name, const char *member) {
     hover_info_t info = {0};
-    if (!is) return info;
+    if (!is && !project) return info;
 
-    const isym_t *sym = intel_member_sym(is, type_name, member);
+    const isym_t *sym = intel_member_sym_ex(is, project, type_name, member);
     if (sym) {
         if (sym->signature[0])
             strncpy(info.text, sym->signature, sizeof(info.text) - 1);
@@ -2051,16 +2068,26 @@ hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
     return info;
 }
 
-bool intel_goto_member(intellisense_t *is, const char *type_name,
-                       const char *member, goto_def_t *out) {
+hover_info_t intel_hover_member(intellisense_t *is, const char *type_name,
+                                const char *member) {
+    return intel_hover_member_ex(is, NULL, type_name, member);
+}
+
+bool intel_goto_member_ex(intellisense_t *is, intellisense_t *project,
+                          const char *type_name, const char *member, goto_def_t *out) {
     if (!out) return false;
-    const isym_t *sym = intel_member_sym(is, type_name, member);
+    const isym_t *sym = intel_member_sym_ex(is, project, type_name, member);
     if (!sym) return false;
     strncpy(out->file, sym->file, sizeof(out->file) - 1);
     out->line = sym->line;
     out->col = sym->col;
     out->found = true;
     return true;
+}
+
+bool intel_goto_member(intellisense_t *is, const char *type_name,
+                       const char *member, goto_def_t *out) {
+    return intel_goto_member_ex(is, NULL, type_name, member, out);
 }
 
 hover_info_t intel_hover(intellisense_t *is, const char *word) {
