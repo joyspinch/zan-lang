@@ -1,5 +1,4 @@
 using System;
-using System.Runtime.Intrinsics;
 
 namespace Gui;
 
@@ -56,89 +55,62 @@ class Mat4 {
     }
 
     // 矩阵乘 this * b（先施 b 再施 this，与 v' = M*v 一致）。
-    // 采用 Vector128 FMA 融和乘加向量化流水线加速计算。
     public static Mat4 Mul(Mat4 a, Mat4 b) {
         Mat4 r = new Mat4();
-        Vector128 b0 = Vector128.Load(b.m, 0);
-        Vector128 b1 = Vector128.Load(b.m, 4);
-        Vector128 b2 = Vector128.Load(b.m, 8);
-        Vector128 b3 = Vector128.Load(b.m, 12);
-
         for (int i = 0; i < 4; i = i + 1) {
             int off = i * 4;
-            Vector128 a0 = Vector128.Create(a.m[off + 0]);
-            Vector128 a1 = Vector128.Create(a.m[off + 1]);
-            Vector128 a2 = Vector128.Create(a.m[off + 2]);
-            Vector128 a3 = Vector128.Create(a.m[off + 3]);
-            Vector128 row = Vector128.Multiply(a0, b0);
-            row = Vector128.MultiplyAdd(a1, b1, row);
-            row = Vector128.MultiplyAdd(a2, b2, row);
-            row = Vector128.MultiplyAdd(a3, b3, row);
-            Vector128.Store(r.m, off, row);
+            float a0 = a.m[off + 0];
+            float a1 = a.m[off + 1];
+            float a2 = a.m[off + 2];
+            float a3 = a.m[off + 3];
+            for (int j = 0; j < 4; j = j + 1) {
+                r.m[off + j] = a0 * b.m[j] + a1 * b.m[4 + j] + a2 * b.m[8 + j] + a3 * b.m[12 + j];
+            }
         }
         return r;
     }
 
     public Mat4 Mul(Mat4 b) { return Mat4.Mul(this, b); }
 
-    // 使用当前矩阵对批量 3D 顶点 (x, y, z) 进行批量坐标变换（FMA 融和乘加向量化流水线）。
+    // 使用当前矩阵对批量 3D 顶点 (x, y, z) 进行批量坐标变换。
     // inXyz: 输入顶点数组，每顶点占 3 个 float。
     // outXyz: 输出顶点数组，每顶点占 3 个 float。
     // count: 顶点数量。
     public void TransformPoints(float[] inXyz, int inOffset, float[] outXyz, int outOffset, int count) {
         if (inXyz == null || outXyz == null || count <= 0) return;
 
-        Vector128 c0 = Vector128.Create(this.m[0], this.m[4], this.m[8], this.m[12]);
-        Vector128 c1 = Vector128.Create(this.m[1], this.m[5], this.m[9], this.m[13]);
-        Vector128 c2 = Vector128.Create(this.m[2], this.m[6], this.m[10], this.m[14]);
-        Vector128 c3 = Vector128.Create(this.m[3], this.m[7], this.m[11], this.m[15]);
-
-        float[] tmp = new float[4];
-
         for (int i = 0; i < count; i = i + 1) {
             int srcIdx = inOffset + i * 3;
             int dstIdx = outOffset + i * 3;
 
-            Vector128 vx = Vector128.Create(inXyz[srcIdx + 0]);
-            Vector128 vy = Vector128.Create(inXyz[srcIdx + 1]);
-            Vector128 vz = Vector128.Create(inXyz[srcIdx + 2]);
+            float vx = inXyz[srcIdx + 0];
+            float vy = inXyz[srcIdx + 1];
+            float vz = inXyz[srcIdx + 2];
 
             // P' = c3 + vx*c0 + vy*c1 + vz*c2
-            Vector128 r = Vector128.MultiplyAdd(vx, c0, c3);
-            r = Vector128.MultiplyAdd(vy, c1, r);
-            r = Vector128.MultiplyAdd(vz, c2, r);
-
-            Vector128.Store(tmp, 0, r);
-            outXyz[dstIdx + 0] = tmp[0];
-            outXyz[dstIdx + 1] = tmp[1];
-            outXyz[dstIdx + 2] = tmp[2];
+            outXyz[dstIdx + 0] = this.m[3] + vx * this.m[0] + vy * this.m[1] + vz * this.m[2];
+            outXyz[dstIdx + 1] = this.m[7] + vx * this.m[4] + vy * this.m[5] + vz * this.m[6];
+            outXyz[dstIdx + 2] = this.m[11] + vx * this.m[8] + vy * this.m[9] + vz * this.m[10];
         }
     }
 
-    // 使用当前矩阵对批量 4D 齐次坐标 (x, y, z, w) 进行批量变换，单周期 16 字节对齐写出。
+    // 使用当前矩阵对批量 4D 齐次坐标 (x, y, z, w) 进行批量变换。
     public void TransformPoints4(float[] inXyzw, int inOffset, float[] outXyzw, int outOffset, int count) {
         if (inXyzw == null || outXyzw == null || count <= 0) return;
-
-        Vector128 c0 = Vector128.Create(this.m[0], this.m[4], this.m[8], this.m[12]);
-        Vector128 c1 = Vector128.Create(this.m[1], this.m[5], this.m[9], this.m[13]);
-        Vector128 c2 = Vector128.Create(this.m[2], this.m[6], this.m[10], this.m[14]);
-        Vector128 c3 = Vector128.Create(this.m[3], this.m[7], this.m[11], this.m[15]);
 
         for (int i = 0; i < count; i = i + 1) {
             int srcIdx = inOffset + i * 4;
             int dstIdx = outOffset + i * 4;
 
-            Vector128 vx = Vector128.Create(inXyzw[srcIdx + 0]);
-            Vector128 vy = Vector128.Create(inXyzw[srcIdx + 1]);
-            Vector128 vz = Vector128.Create(inXyzw[srcIdx + 2]);
-            Vector128 vw = Vector128.Create(inXyzw[srcIdx + 3]);
+            float vx = inXyzw[srcIdx + 0];
+            float vy = inXyzw[srcIdx + 1];
+            float vz = inXyzw[srcIdx + 2];
+            float vw = inXyzw[srcIdx + 3];
 
-            Vector128 r = Vector128.Multiply(vx, c0);
-            r = Vector128.MultiplyAdd(vy, c1, r);
-            r = Vector128.MultiplyAdd(vz, c2, r);
-            r = Vector128.MultiplyAdd(vw, c3, r);
-
-            Vector128.Store(outXyzw, dstIdx, r);
+            outXyzw[dstIdx + 0] = vx * this.m[0] + vy * this.m[1] + vz * this.m[2] + vw * this.m[3];
+            outXyzw[dstIdx + 1] = vx * this.m[4] + vy * this.m[5] + vz * this.m[6] + vw * this.m[7];
+            outXyzw[dstIdx + 2] = vx * this.m[8] + vy * this.m[9] + vz * this.m[10] + vw * this.m[11];
+            outXyzw[dstIdx + 3] = vx * this.m[12] + vy * this.m[13] + vz * this.m[14] + vw * this.m[15];
         }
     }
 
