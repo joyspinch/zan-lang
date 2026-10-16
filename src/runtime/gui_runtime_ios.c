@@ -836,13 +836,12 @@ static void zan_ios_do_present(void *arg) {
             zan_sel_t sel_begin = g_bridge.sel_registerName("begin");
             zan_sel_t sel_set_disable = g_bridge.sel_registerName("setDisableActions:");
             zan_sel_t sel_commit = g_bridge.sel_registerName("commit");
-            zan_sel_t sel_flush = g_bridge.sel_registerName("flush");
             zan_send0((zan_id_t)cls_tx, sel_begin);
             zan_send1_bool((zan_id_t)cls_tx, sel_set_disable, true);
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
             zan_send0((zan_id_t)cls_tx, sel_commit);
-            zan_send0((zan_id_t)cls_tx, sel_flush);
+            /* Do not flush synchronously from worker thread; commit presents on vsync smoothly */
         } else {
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
@@ -860,16 +859,19 @@ typedef struct {
     int tw, th;
     double width;
     unsigned char *mask;
+    uint32_t last_used;
 } zan_ios_text_entry_t;
 
-#define ZAN_IOS_TEXT_CACHE_SLOTS 1024
-static zan_ios_text_entry_t g_ios_text_cache[ZAN_IOS_TEXT_CACHE_SLOTS];
+#define ZAN_IOS_CACHE_SETS 1024
+#define ZAN_IOS_CACHE_WAYS 4
+static zan_ios_text_entry_t g_ios_text_cache[ZAN_IOS_CACHE_SETS][ZAN_IOS_CACHE_WAYS];
+static uint32_t g_ios_text_clock = 0;
 
 static unsigned int zan_ios_text_hash(const char *s, int font_size) {
     unsigned int h = 2166136261u;
     while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
     h ^= (unsigned int)font_size * 2654435761u;
-    return h % ZAN_IOS_TEXT_CACHE_SLOTS;
+    return h % ZAN_IOS_CACHE_SETS;
 }
 
 static zan_ct_font_t zan_ios_create_font(int font_size) {
@@ -912,7 +914,7 @@ static zan_ct_font_t zan_ios_create_font(int font_size) {
     return NULL;
 }
 
-static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
+static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font, zan_cg_color_t white_color) {
     if (!utf8 || !*utf8 || !font || !p_CFStringCreateWithCString ||
         !p_CFAttributedStringCreate || !p_CTLineCreateWithAttributedString) {
         return NULL;
@@ -923,13 +925,34 @@ static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
     zan_cf_dict_t attrs = NULL;
     void *font_attr_key = p_kCTFontAttributeName ? *p_kCTFontAttributeName : NULL;
     if (!font_attr_key && p_NSFontAttributeName) font_attr_key = *p_NSFontAttributeName;
+    if (!font_attr_key && p_CFStringCreateWithCString) {
+        font_attr_key = p_CFStringCreateWithCString(NULL, "NSFont", 0x08000100);
+    }
 
-    if (font_attr_key && p_CFDictionaryCreate) {
-        const void *keys[1] = { font_attr_key };
-        const void *values[1] = { font };
-        attrs = p_CFDictionaryCreate(NULL, keys, values, 1,
-                                     p_kCFTypeDictionaryKeyCallBacks,
-                                     p_kCFTypeDictionaryValueCallBacks);
+    void *color_attr_key = p_kCTForegroundColorAttributeName ? *p_kCTForegroundColorAttributeName : NULL;
+    if (!color_attr_key && p_CFStringCreateWithCString) {
+        color_attr_key = p_CFStringCreateWithCString(NULL, "NSColor", 0x08000100);
+    }
+
+    if (p_CFDictionaryCreate) {
+        const void *keys[2];
+        const void *values[2];
+        int count = 0;
+        if (font_attr_key) {
+            keys[count] = font_attr_key;
+            values[count] = font;
+            count++;
+        }
+        if (color_attr_key && white_color) {
+            keys[count] = color_attr_key;
+            values[count] = white_color;
+            count++;
+        }
+        if (count > 0) {
+            attrs = p_CFDictionaryCreate(NULL, keys, values, count,
+                                         p_kCFTypeDictionaryKeyCallBacks,
+                                         p_kCFTypeDictionaryValueCallBacks);
+        }
     }
 
     zan_cf_attr_str_t attr_str = p_CFAttributedStringCreate(NULL, str, attrs);
@@ -943,21 +966,42 @@ static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font) {
 
 static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size, bool need_mask) {
     if (!g_bridge.initialized) zan_ios_init_bridge();
-    if (!utf8 || !*utf8 || !p_CTFontCreateWithName || !p_CTLineCreateWithAttributedString ||
-        !p_CTLineGetTypographicBounds) {
+    if (!utf8 || !*utf8 || !p_CTLineCreateWithAttributedString || !p_CTLineGetTypographicBounds) {
         return NULL;
     }
-    unsigned int slot = zan_ios_text_hash(utf8, font_size);
-    zan_ios_text_entry_t *e = &g_ios_text_cache[slot];
-    if (e->key && e->font_size == font_size && strcmp(e->key, utf8) == 0 &&
-        (!need_mask || e->mask)) {
-        return e;
+
+    unsigned int set = zan_ios_text_hash(utf8, font_size);
+    uint32_t now = ++g_ios_text_clock;
+
+    /* 1. 4-way set associative cache lookup */
+    zan_ios_text_entry_t *victim = NULL;
+    for (int w = 0; w < ZAN_IOS_CACHE_WAYS; w++) {
+        zan_ios_text_entry_t *cand = &g_ios_text_cache[set][w];
+        if (cand->key && cand->font_size == font_size && strcmp(cand->key, utf8) == 0) {
+            cand->last_used = now;
+            if (!need_mask || cand->mask) return cand;
+            victim = cand;
+            break;
+        }
+        if (!victim || !cand->key || cand->last_used < victim->last_used) {
+            victim = cand;
+        }
     }
 
     zan_ct_font_t font = zan_ios_create_font(font_size);
     if (!font) return NULL;
-    zan_ct_line_t line = zan_ios_create_line(utf8, font);
+
+    CGColorSpaceRef cs_rgb = p_CGColorSpaceCreateDeviceRGB ? p_CGColorSpaceCreateDeviceRGB() : NULL;
+    zan_cg_color_t white_color = NULL;
+    if (cs_rgb && p_CGColorCreate) {
+        const double white_rgba[4] = { 1.0, 1.0, 1.0, 1.0 };
+        white_color = p_CGColorCreate(cs_rgb, white_rgba);
+    }
+
+    zan_ct_line_t line = zan_ios_create_line(utf8, font, white_color);
     if (!line) {
+        if (white_color && p_CGColorRelease) p_CGColorRelease(white_color);
+        if (cs_rgb && p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
         if (p_CFRelease) p_CFRelease(font);
         return NULL;
     }
@@ -966,79 +1010,61 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
     double measured = p_CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
     int tw = (int)ceil(measured) + 2;
     int th = (int)ceil(ascent + descent + leading) + 2;
-    unsigned char *mask = NULL;
+    unsigned char *mask = (victim && victim->key && strcmp(victim->key, utf8) == 0) ? victim->mask : NULL;
 
-    if (need_mask && tw > 0 && th > 0 && p_CGBitmapContextCreate) {
-        mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
-        if (mask) {
-            /* Try 1: kCGImageAlphaOnly (8 bits per pixel, colorSpace NULL) */
+    if (need_mask && tw > 0 && th > 0 && cs_rgb && p_CGBitmapContextCreate && p_CTLineDraw) {
+        if (!mask) mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
+        size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
+        uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
+        if (rgba_buf && mask) {
+            /* 32-bit RGBA context: kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast */
             zan_cg_context_t ctx = p_CGBitmapContextCreate(
-                mask, (size_t)tw, (size_t)th, 8, (size_t)tw, NULL, 7 /* kCGImageAlphaOnly */);
-            if (!ctx && p_CGColorSpaceCreateDeviceGray) {
-                CGColorSpaceRef cs_gray = p_CGColorSpaceCreateDeviceGray();
-                if (cs_gray) {
-                    ctx = p_CGBitmapContextCreate(mask, (size_t)tw, (size_t)th, 8, (size_t)tw, cs_gray, 7);
-                    if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_gray);
-                }
-            }
-
+                rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
+                cs_rgb, (4 << 12) | 1);
             if (ctx) {
-                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
-                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
-                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                if (p_CGContextSetTextPosition) {
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
                 }
-                if (p_CGContextSetTextPosition) p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
-                if (p_CTLineDraw) p_CTLineDraw(line, ctx);
+                p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
                 if (p_CGContextRelease) p_CGContextRelease(ctx);
-            } else if (p_CGColorSpaceCreateDeviceRGB) {
-                /* Try 2: 32-bit RGBA context fallback */
-                CGColorSpaceRef cs_rgb = p_CGColorSpaceCreateDeviceRGB();
-                if (cs_rgb) {
-                    size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
-                    uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
-                    if (rgba_buf) {
-                        ctx = p_CGBitmapContextCreate(
-                            rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
-                            cs_rgb, (4 << 12) | 1 /* kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast */);
-                        if (ctx) {
-                            if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
-                                p_CGContextTranslateCTM(ctx, 0.0, (double)th);
-                                p_CGContextScaleCTM(ctx, 1.0, -1.0);
-                            }
-                            if (p_CGContextSetTextPosition) p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
-                            if (p_CTLineDraw) p_CTLineDraw(line, ctx);
-                            if (p_CGContextFlush) p_CGContextFlush(ctx);
-                            if (p_CGContextRelease) p_CGContextRelease(ctx);
-                            for (size_t i = 0; i < (size_t)tw * (size_t)th; i++) {
-                                uint32_t pix = rgba_buf[i];
-                                uint32_t a = (pix >> 24) & 0xFF;
-                                uint32_t r = (pix >> 16) & 0xFF;
-                                mask[i] = (unsigned char)(a > r ? a : r);
-                            }
-                        }
-                        free(rgba_buf);
+
+                /* Invert rows during copy to match Quartz bottom-left with Zan top-left */
+                for (int py = 0; py < th; py++) {
+                    const uint32_t *src_row = rgba_buf + (size_t)(th - 1 - py) * (size_t)tw;
+                    unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
+                    for (int px = 0; px < tw; px++) {
+                        uint32_t pix = src_row[px];
+                        uint32_t a = (pix >> 24) & 0xFF;
+                        uint32_t r = (pix >> 16) & 0xFF;
+                        dst_row[px] = (unsigned char)(a > r ? a : r);
                     }
-                    if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
                 }
             }
+            free(rgba_buf);
         }
     }
 
+    if (white_color && p_CGColorRelease) p_CGColorRelease(white_color);
+    if (cs_rgb && p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
     if (p_CFRelease) {
         p_CFRelease(line);
         p_CFRelease(font);
     }
 
-    if (e->key) free(e->key);
-    if (e->mask) free(e->mask);
-    e->key = strdup(utf8);
-    e->font_size = font_size;
-    e->tw = tw;
-    e->th = th;
-    e->width = measured;
-    e->mask = mask;
-    return e;
+    if (!victim) victim = &g_ios_text_cache[set][0];
+    if (victim->key && victim->key != utf8 && (!victim->mask || victim->mask != mask)) {
+        free(victim->key);
+        if (victim->mask && victim->mask != mask) free(victim->mask);
+    }
+    victim->key = strdup(utf8);
+    victim->font_size = font_size;
+    victim->tw = tw;
+    victim->th = th;
+    victim->width = measured;
+    victim->mask = mask;
+    victim->last_used = now;
+    return victim;
 }
 
 static inline uint32_t zan_ios_blend_pixel(uint32_t dst, uint32_t color, unsigned int coverage) {
@@ -1098,8 +1124,14 @@ int zan_ios_draw_text(i32 surface_id, i32 x, i32 y, const char *utf8, i32 color,
 i32 zan_ios_measure_text(const char *utf8, i32 font_size) {
     if (!utf8 || !*utf8) return 0;
     zan_ios_text_entry_t *e = zan_ios_text_lookup(utf8, (int)font_size, false);
-    if (!e) return -1;
-    return (i32)ceil(e->width);
+    if (e && e->width > 0.0) return (i32)ceil(e->width);
+    int len = 0;
+    const char *p = utf8;
+    while (*p) {
+        if ((*p & 0xC0) != 0x80) len++;
+        p++;
+    }
+    return (i32)(len * font_size * 60 / 100);
 }
 
 i32 zan_ios_font_height(i32 font_size) {
@@ -1107,16 +1139,21 @@ i32 zan_ios_font_height(i32 font_size) {
     static i32 cached[MAXSZ];
     int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
     if (idx >= 0 && cached[idx] > 0) return cached[idx];
-    if (!p_CTFontCreateWithName || !p_CTFontGetAscent || !p_CTFontGetDescent || !p_CTFontGetLeading) {
-        return -1;
+    if (p_CTFontGetAscent && p_CTFontGetDescent) {
+        zan_ct_font_t font = zan_ios_create_font(font_size);
+        if (font) {
+            double lead = p_CTFontGetLeading ? p_CTFontGetLeading(font) : 0.0;
+            if (lead < 0.0) lead = 0.0;
+            double h = p_CTFontGetAscent(font) + p_CTFontGetDescent(font) + lead;
+            if (p_CFRelease) p_CFRelease(font);
+            i32 r = (i32)ceil(h);
+            if (r > 0) {
+                if (idx >= 0) cached[idx] = r;
+                return r;
+            }
+        }
     }
-    zan_ct_font_t font = zan_ios_create_font(font_size);
-    if (!font) return -1;
-    double h = p_CTFontGetAscent(font) + p_CTFontGetDescent(font) + p_CTFontGetLeading(font);
-    if (p_CFRelease) p_CFRelease(font);
-    i32 r = (i32)ceil(h);
-    if (idx >= 0) cached[idx] = r;
-    return r;
+    return (i32)(font_size > 0 ? (font_size * 125 / 100) : 16);
 }
 
 i32 zan_ios_font_ascent(i32 font_size) {
@@ -1124,18 +1161,20 @@ i32 zan_ios_font_ascent(i32 font_size) {
     static i32 cached[MAXSZ];
     int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
     if (idx >= 0 && cached[idx] > 0) return cached[idx];
-    if (!p_CTFontCreateWithName || !p_CTFontGetAscent) return -1;
-    zan_ct_font_t font = zan_ios_create_font(font_size);
-    if (!font) return -1;
-    double a = p_CTFontGetAscent(font);
-    if (p_CFRelease) p_CFRelease(font);
-    i32 r = (i32)ceil(a);
-    if (idx >= 0) cached[idx] = r;
-    return r;
+    if (p_CTFontGetAscent) {
+        zan_ct_font_t font = zan_ios_create_font(font_size);
+        if (font) {
+            double a = p_CTFontGetAscent(font);
+            if (p_CFRelease) p_CFRelease(font);
+            i32 r = (i32)ceil(a);
+            if (r > 0) {
+                if (idx >= 0) cached[idx] = r;
+                return r;
+            }
+        }
+    }
+    return (i32)(font_size > 0 ? (font_size * 95 / 100) : 12);
 }
-
-static uint32_t *g_present_rgba = NULL;
-static size_t g_present_rgba_cap = 0;
 
 EXPORT void zan_gui_present_full(void) {}
 
@@ -1157,45 +1196,23 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     CGColorSpaceRef cs = p_CGColorSpaceCreateDeviceRGB();
     if (!cs) return 1;
 
-    size_t needed = (size_t)s->width * (size_t)s->height;
-    if (needed > g_present_rgba_cap) {
-        uint32_t *p = (uint32_t *)realloc(g_present_rgba, needed * sizeof(uint32_t));
-        if (!p) {
-            p_CGColorSpaceRelease(cs);
-            return 1;
-        }
-        g_present_rgba = p;
-        g_present_rgba_cap = needed;
-    }
-
-    /* Convert Zan 0xAARRGGBB ([B, G, R, A] in little-endian RAM)
-     * to Apple iOS CoreGraphics RGBA ([R, G, B, A] in memory).
-     * Fixes inverted / blue color tinting completely.
-     */
-    for (int y = 0; y < s->height; y++) {
-        const uint32_t *src_row = s->pixels + (size_t)y * s->stride;
-        uint32_t *dst_row = g_present_rgba + (size_t)y * s->width;
-        for (int x = 0; x < s->width; x++) {
-            uint32_t c = src_row[x];
-            dst_row[x] = ((c & 0x00FF0000) >> 16) | (c & 0x0000FF00) | ((c & 0x000000FF) << 16) | 0xFF000000;
-        }
-    }
-
-    size_t bytes_per_row = (size_t)s->width * sizeof(uint32_t);
+    size_t bytes_per_row = (size_t)s->stride * sizeof(uint32_t);
     size_t total_bytes = bytes_per_row * (size_t)s->height;
 
+    /* Zero-copy 32-bit Little-Endian presentation:
+     * In Apple CoreGraphics:
+     * kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst = (2 << 12) | 6.
+     * Physically maps [B, G, R, X] in memory directly to Zan's 0xAARRGGBB in little-endian RAM.
+     * Zero CPU memory copying, zero byte-swapping latency.
+     */
     CGDataProviderRef provider = p_CGDataProviderCreateWithData(
-        NULL, g_present_rgba, total_bytes, NULL);
+        NULL, s->pixels, total_bytes, NULL);
     if (!provider) {
         p_CGColorSpaceRelease(cs);
         return 1;
     }
 
-    /* iOS CoreGraphics canonical 32-bit RGBA formats:
-     * kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast = (4 << 12) | 5
-     * kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast = (4 << 12) | 1
-     */
-    uint32_t bitmap_info = (4 << 12) | 5;
+    uint32_t bitmap_info = (2 << 12) | 6; /* kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst */
     CGImageRef img = p_CGImageCreate(
         (size_t)s->width, (size_t)s->height,
         8, 32, bytes_per_row,
@@ -1203,25 +1220,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         NULL, false, 0
     );
     if (!img) {
-        bitmap_info = (4 << 12) | 1;
-        img = p_CGImageCreate(
-            (size_t)s->width, (size_t)s->height,
-            8, 32, bytes_per_row,
-            cs, bitmap_info, provider,
-            NULL, false, 0
-        );
-    }
-    if (!img) {
-        bitmap_info = 5;
-        img = p_CGImageCreate(
-            (size_t)s->width, (size_t)s->height,
-            8, 32, bytes_per_row,
-            cs, bitmap_info, provider,
-            NULL, false, 0
-        );
-    }
-    if (!img) {
-        bitmap_info = 1;
+        bitmap_info = (2 << 12) | 2; /* kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst */
         img = p_CGImageCreate(
             (size_t)s->width, (size_t)s->height,
             8, 32, bytes_per_row,
