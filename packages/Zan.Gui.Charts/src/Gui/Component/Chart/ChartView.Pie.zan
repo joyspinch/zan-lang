@@ -1324,76 +1324,65 @@ partial class ChartView {
         return stages;
     }
 
+    static List<ChartStage> GatherStagesForSeries(App app, ChartSeries s, int seriesIndex) {
+        List<ChartStage> stages = new List<ChartStage>();
+        Theme t = app.theme;
+        int n = s.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            if (s.data[i].hidden) { continue; }
+            int col = Chart.Palette(t, i);
+            if (s.data[i].color != 0) { col = s.data[i].color; }
+            string nm = s.data[i].name;
+            ChartStage st = new ChartStage(s.Value(i), col, nm, seriesIndex);
+            st.dataIndex = i;
+            stages.Add(st);
+        }
+        return stages;
+    }
+
     // ---- 漏斗图 / 金字塔图 ----
 
-    // 漏斗（pyramid=false）/金字塔（pyramid=true，阶段序反转）
-    // 渲染入口：阶段宽度 ∝ 值/maxV，逐行按 1/256 亚像素覆盖率
-    // 画斜边；对齐/层间隙/转化率百分比取首系列配置；右侧可选
-    // 图例；行命中（FunnelStage 事件）+ 横向指示线 + tooltip。
-    static void DrawFunnel(App app, int x, int y, int w, int h,
-                           ChartOption o, int g, bool pyramid) {
+    static void DrawFunnelStages(App app, int curX, int curY, int curW, int curH,
+                                 ChartSeries s, List<ChartStage> stages,
+                                 int g, bool isPyramid, ChartOption o, int userSi) {
         Canvas c = app.canvas;
         Theme t = app.theme;
-        int pad = t.paddingMedium;
-        // 覆盖层 option：不重画面板底/头（mix11 双漏斗与仪表盘同图）。
-        int top = y + pad;
-        if (!o.overlay) { top = ChartView.PanelHead(app, x, y, w, h, o.title); }
-
-        ChartView.ApplyDataLegend(app, o);
-        List<ChartStage> stages = ChartView.GatherStages(app, o.series);
         int n = stages.Count;
-        int legendW = 0;
-        if (o.showLegend) { legendW = app.Scale(120); }
-        if (n < 1) {
-            if (o.showLegend) {
-                ChartView.DrawStageLegend(app, o, x + w - pad - legendW,
-                    Chart.LegendStartY(app, y, top), legendW);
-            }
-            return;
-        }
+        if (n < 1) { return; }
         int maxV = 1;
         foreach (ChartStage st in stages) { if (st.val > maxV) { maxV = st.val; } }
 
-        // 系列级参数（首系列承载）：funnelAlign 三态、层间隙 px、
-        ChartSeries fs0 = ChartView.LeadSeries(o);
-        string fAlign = "";
-        int fGap = 0 - 1;
-        bool fPct = false;
-        if (fs0 != null) {
-            fAlign = fs0.funnelAlign;
-            fGap = fs0.funnelGap;
-            fPct = fs0.funnelPercent;
-        }
-        int areaW = w - pad * 2 - legendW;
-        int areaH = (y + h - pad) - top;
-        int cx = x + pad + areaW / 2;
-        if (fAlign == "left") { cx = x + pad; }
-        else if (fAlign == "right") { cx = x + pad + areaW; }
+        string fAlign = s != null ? s.funnelAlign : "";
+        int fGap = s != null ? s.funnelGap : 0 - 1;
+        bool fPct = s != null && s.funnelPercent;
+        int cx = curX + curW / 2;
+        if (fAlign == "left") { cx = curX; }
+        else if (fAlign == "right") { cx = curX + curW; }
         int gapPx = 0;
         if (fGap >= 0) { gapPx = app.Scale(fGap); }
-        // maxSize（ECharts funnel.maxSize '80%'）：最宽层占宽上限，
-        // 双漏斗同位叠放时内层收窄露出外层（mix11 预期/实际）。
-        int maxW = areaW;
-        if (fs0 != null && fs0.maxSizePct > 0 && fs0.maxSizePct < 100) {
-            maxW = areaW * fs0.maxSizePct / 100;
+        int maxW = curW;
+        if (s != null && s.maxSizePct > 0 && s.maxSizePct < 100) {
+            maxW = curW * s.maxSizePct / 100;
         }
-        int rowH = areaH / n;
+        int rowH = curH / n;
+        if (rowH < 1) { rowH = 1; }
 
         for (int i2 = 0; i2 < n; i2 = i2 + 1) {
             int idx = i2;
-            if (pyramid) { idx = n - 1 - i2; }
+            if (isPyramid) { idx = n - 1 - i2; }
             int vTop = stages[idx].val;
             int vBot = vTop;
             int nextIdx = idx + 1;
-            if (pyramid) { nextIdx = idx - 1; }
+            if (isPyramid) { nextIdx = idx - 1; }
             if (nextIdx >= 0 && nextIdx < n) { vBot = stages[nextIdx].val; }
             int wTop = (int)((long)vTop * maxW * g / ((long)maxV * 1000L));
             int wBot = (int)((long)vBot * maxW * g / ((long)maxV * 1000L));
-            int ry = top + i2 * rowH;
+            int ry = curY + i2 * rowH;
             int col = stages[idx].color;
             int strip = rowH - gapPx;
-            int wTopF = wTop * 256;  // 1/256 px，使斜边获得
-            int wBotF = wBot * 256;  // 亚像素覆盖率而非阶梯状
+            if (strip < 1) { strip = 1; }
+            int wTopF = wTop * 256;
+            int wBotF = wBot * 256;
             int cxF = cx * 256;
             for (int r = 0; r < strip; r = r + 1) {
                 int tt = 0;
@@ -1405,16 +1394,11 @@ partial class ChartView {
                 if (xlF < 0) { xl = (xlF - 255) / 256; }
                 int xr = (xrF + 255) / 256;
                 int yRow = ry + r;
-                // 边缘像素获得小数覆盖率；内部行保持
-                // 实心，使倾斜轮廓平滑而非
-                // 锯齿。左侧覆盖率 = 像素 xl 的右缘减去
-                // 形状左边界；右侧覆盖率 = 形状右
-                // 边界减去像素 xr-1 的左缘。
                 int lcov = (xl + 1) * 256 - xlF;
                 if (lcov >= 256) { c.FillRect(xl, yRow, 1, 1, col); }
                 else if (lcov > 0) { c.FillRect(xl, yRow, 1, 1, Chart.WithAlpha(col, lcov)); }
                 int m0 = xl + 1;
-                int m1 = xr - 1;  // 实心中间段（不含端点）
+                int m1 = xr - 1;
                 if (m1 > m0) { c.FillRect(m0, yRow, m1 - m0, 1, col); }
                 int rcov = xrF - (xr - 1) * 256;
                 if (rcov >= 256) { c.FillRect(xr - 1, yRow, 1, 1, col); }
@@ -1423,41 +1407,27 @@ partial class ChartView {
             string lbl = stages[idx].name;
             if (lbl.Length == 0) { lbl = Convert.ToString(stages[idx].val); }
             if (fPct) { lbl = lbl + ChartView.FunnelPct(stages, idx); }
-            if (fs0 != null && fs0.funnelLabelOut && stages[idx].name.Length > 0) {
-                // 外标：阶段名画在层右端之外（官方 label.formatter
-                // '{b}预期' 在漏斗右侧竖排一列，labelLine 关闭）。
+            if (s != null && s.funnelLabelOut && stages[idx].name.Length > 0) {
                 int ox = cx + (wTop > wBot ? wTop : wBot) / 2 + app.Scale(6);
-                if (ox + app.Scale(60) > x + w - pad) {
-                    ox = x + w - pad - app.Scale(60);
+                if (ox + app.Scale(60) > curX + curW) {
+                    ox = curX + curW - app.Scale(60);
                 }
-                c.DrawText(ox, ry + (rowH - Canvas.FontHeight(
-                    ChartFonts.SeriesLabel(app))) / 2, lbl,
-                    Style.Part(app, "chart", "label", "", "", "",
-                        Style.SNormal()).FgOr(0),
+                c.DrawText(ox, ry + (rowH - Canvas.FontHeight(ChartFonts.SeriesLabel(app))) / 2, lbl,
+                    Style.Part(app, "chart", "label", "", "", "", Style.SNormal()).FgOr(0),
                     ChartFonts.SeriesLabel(app));
             } else {
-                c.DrawTextCentered(cx - areaW / 2, ry + rowH / 2 - Canvas.FontHeight(ChartFonts.Legend(app)) / 2,
-                    areaW, Canvas.FontHeight(ChartFonts.SeriesLabel(app)), lbl,
+                c.DrawTextCentered(cx - curW / 2, ry + rowH / 2 - Canvas.FontHeight(ChartFonts.Legend(app)) / 2,
+                    curW, Canvas.FontHeight(ChartFonts.SeriesLabel(app)), lbl,
                     Style.Part(app, "chart", "value", "", "", "", Style.SNormal()).FgOr(0),
                     ChartFonts.SeriesLabel(app));
             }
         }
 
-        if (o.showLegend) {
-            int lx = x + w - pad - legendW;
-            int ly = Chart.LegendStartY(app, y, top);
-            ChartView.DrawStageLegend(app, o, lx, ly, legendW);
-        }
-
-        // 命中几何与 tooltip 展示解耦：关闭 tooltip 不能关闭
-        // 漏斗阶段的 Hover/MouseOut/Click 事件。行化与 tooltip
-        // 完全同域：idx 按行高取整行。
         int mx = app.mouseX;
         int my = app.mouseY;
         if (ChartView.HoverBlocked(app)) { return; }
-        if (mx >= x + pad && mx < x + w - pad - legendW
-            && my >= top && my < y + h - pad) {
-            int idx = (my - top) / rowH;
+        if (mx >= curX && mx < curX + curW && my >= curY && my < curY + curH) {
+            int idx = (my - curY) / rowH;
             if (idx < 0) { idx = 0; }
             if (idx > n - 1) { idx = n - 1; }
             ChartStage st = stages[idx];
@@ -1465,37 +1435,104 @@ partial class ChartView {
             if (nm.Length == 0) { nm = ChartView.StageName(idx); }
             if (ChartView.activeEventView != null) {
                 ChartHit fh = ChartHit.Of(ChartElementType.FunnelStage,
-                    ChartView.SeriesIndexOf(o, fs0), fs0 != null ? fs0.name : "",
-                    idx, nm, st.val, mx, my);
-                if (fs0 != null) { fh.axisIndex = fs0.axisIndex; }
+                    userSi, s != null ? s.name : "", idx, nm, st.val, mx, my);
+                if (s != null) { fh.axisIndex = s.axisIndex; }
                 ChartView.OfferActiveHit(fh);
             }
             if (o.showTooltip) {
-                // axisPointer 漏斗版：行中线处 1px 横线（数据带外
-                // 缘 + 1px 指示线）+ 行号 chip（与 CartesianTooltip
-                // 的 axis label 等价）。径向无法画纵线故不画。
-                int cy = top + idx * rowH + rowH / 2;
-                int crossCol = Style.Part(app, "chart", "crosshair", "", "",
-                    "", Style.SNormal()).BgOr(0);
-                c.FillRect(x + pad, cy, x + w - pad - legendW - (x + pad), 1,
-                    Chart.WithAlpha(crossCol, 200));
+                int cy2 = curY + idx * rowH + rowH / 2;
+                int crossCol = Style.Part(app, "chart", "crosshair", "", "", "", Style.SNormal()).BgOr(0);
+                c.FillRect(curX, cy2, curW, 1, Chart.WithAlpha(crossCol, 200));
                 string lblF = nm + "  " + Convert.ToString(st.val);
                 if (fPct) { lblF = lblF + ChartView.FunnelPct(stages, idx); }
                 int fs = ChartFonts.SeriesLabel(app);
                 int lw = Canvas.MeasureText(lblF, fs);
-                int labelX = x + pad - lw - app.Scale(6);
+                int labelX = curX - lw - app.Scale(6);
                 if (labelX < 0) { labelX = 0; }
-                int labelY = cy - Canvas.FontHeight(fs) / 2;
+                int labelY = cy2 - Canvas.FontHeight(fs) / 2;
                 c.FillRoundRect(labelX - app.Scale(2), labelY, lw + app.Scale(4),
                     Canvas.FontHeight(fs), app.Scale(2), crossCol);
-c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
+                c.DrawText(labelX, labelY, lblF, Style.Part(app, "chart",
                     "crosshair-label", "", "", "", Style.SNormal()).FgOr(crossCol), fs);
-                List<TooltipRow> rows = new List<TooltipRow>{
-                    TooltipRow.Of(0, o.title),
-                    TooltipRow.Of(st.color, nm + "  " + Convert.ToString(st.val)
-                        + (fPct ? ChartView.FunnelPct(stages, idx) : "")) };
-                ChartView.TooltipCard(app, mx, my, x + w, rows);
+                List<TooltipRow> rows = new List<TooltipRow>();
+                string sTitle = s != null && s.name.Length > 0 ? s.name : o.title;
+                rows.Add(TooltipRow.Of(0, sTitle));
+                rows.Add(TooltipRow.Of(st.color, nm + "  " + Convert.ToString(st.val)
+                    + (fPct ? ChartView.FunnelPct(stages, idx) : "")));
+                ChartView.TooltipCard(app, mx, my, curX + curW, rows);
             }
+        }
+    }
+
+    // 漏斗（pyramid=false）/金字塔（pyramid=true，阶段序反转）
+    // 渲染入口：阶段宽度 ∝ 值/maxV，逐行按 1/256 亚像素覆盖率
+    // 画斜边；支持单漏斗与多漏斗独立盒模型排版；右侧可选
+    // 图例；行命中（FunnelStage 事件）+ 横向指示线 + tooltip。
+    static void DrawFunnel(App app, int x, int y, int w, int h,
+                           ChartOption o, int g, bool pyramid) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int pad = t.paddingMedium;
+        // 覆盖层 option：不重画面板底/头（mix11 双漏斗与仪表盘同图）。
+        int top = y + pad;
+        if (!o.overlay) { top = ChartView.PanelHead(app, x, y, w, h, o.title); }
+
+        ChartView.ApplyDataLegend(app, o);
+        int legendW = 0;
+        if (o.showLegend) { legendW = app.Scale(120); }
+        int areaW = w - pad * 2 - legendW;
+        int areaH = (y + h - pad) - top;
+
+        bool multiFunnel = false;
+        int funnelCount = 0;
+        for (int fi = 0; fi < o.series.Count; fi = fi + 1) {
+            ChartSeries fs = o.series[fi];
+            if (!fs.hidden && fs.type == ChartType.Funnel) {
+                funnelCount = funnelCount + 1;
+                if (fs.data.Count > 1) { multiFunnel = true; }
+            }
+        }
+
+        if (multiFunnel && funnelCount > 1) {
+            for (int si = 0; si < o.series.Count; si = si + 1) {
+                ChartSeries s = o.series[si];
+                if (s.hidden || s.type != ChartType.Funnel) { continue; }
+                List<ChartStage> stages = ChartView.GatherStagesForSeries(app, s, si);
+                if (stages.Count < 1) { continue; }
+                int subX = x + pad;
+                int subY = top;
+                int subW = areaW;
+                int subH = areaH;
+                if (s.boxLeft != null) { subX = x + ChartView.GaugeScalar(app, s.boxLeft, w); }
+                if (s.boxTop != null) { subY = y + ChartView.GaugeScalar(app, s.boxTop, h); }
+                if (s.boxWidth != null) { subW = ChartView.GaugeScalar(app, s.boxWidth, w); }
+                if (s.boxHeight != null) { subH = ChartView.GaugeScalar(app, s.boxHeight, h); }
+                bool isPyr = s.sort == "ascending" || pyramid;
+                ChartView.DrawFunnelStages(app, subX, subY, subW, subH, s, stages, g, isPyr, o, si);
+            }
+        } else {
+            List<ChartStage> stages = ChartView.GatherStages(app, o.series);
+            if (stages.Count > 0) {
+                ChartSeries fs0 = ChartView.LeadSeries(o);
+                bool isPyr = (fs0 != null && fs0.sort == "ascending") || pyramid;
+                int subX = x + pad;
+                int subY = top;
+                int subW = areaW;
+                int subH = areaH;
+                if (fs0 != null) {
+                    if (fs0.boxLeft != null) { subX = x + ChartView.GaugeScalar(app, fs0.boxLeft, w); }
+                    if (fs0.boxTop != null) { subY = y + ChartView.GaugeScalar(app, fs0.boxTop, h); }
+                    if (fs0.boxWidth != null) { subW = ChartView.GaugeScalar(app, fs0.boxWidth, w); }
+                    if (fs0.boxHeight != null) { subH = ChartView.GaugeScalar(app, fs0.boxHeight, h); }
+                }
+                ChartView.DrawFunnelStages(app, subX, subY, subW, subH, fs0, stages, g, isPyr, o, 0);
+            }
+        }
+
+        if (o.showLegend) {
+            int lx = x + w - pad - legendW;
+            int ly = Chart.LegendStartY(app, y, top);
+            ChartView.DrawStageLegend(app, o, lx, ly, legendW);
         }
     }
 
