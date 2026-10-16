@@ -1,5 +1,6 @@
 
 #include "ipa.h"
+#include "miniz.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +66,9 @@ typedef struct {
     char name[256];
     size_t offset;
     uint32_t crc;
-    uint32_t size;
+    uint32_t uncomp_size;
+    uint32_t comp_size;
+    uint16_t method;
     uint32_t mode;
 } ipa_zip_ent_t;
 
@@ -105,26 +108,44 @@ static int zip_add(ipa_zip_t *z, const char *name, const void *data, size_t sz, 
     ipa_zip_ent_t *e = &z->ents[z->nent];
     strncpy(e->name, name, sizeof(e->name) - 1);
     e->name[sizeof(e->name) - 1] = '\0';
-    e->size = (uint32_t)sz;
+    e->uncomp_size = (uint32_t)sz;
     e->crc = ipa_crc32((const unsigned char *)data, sz);
     e->offset = z->out.len;
     e->mode = mode;
+
+    size_t comp_len = 0;
+    void *comp = NULL;
+    if (sz > 64) {
+        comp = tdefl_compress_mem_to_heap(data, sz, &comp_len, TDEFL_DEFAULT_MAX_PROBES);
+    }
+
+    const void *payload = data;
+    if (comp && comp_len < sz) {
+        e->method = 8; /* Deflate */
+        e->comp_size = (uint32_t)comp_len;
+        payload = comp;
+    } else {
+        e->method = 0; /* Store */
+        e->comp_size = (uint32_t)sz;
+    }
 
     size_t name_len = strlen(name);
 
     buf_u32(&z->out, 0x04034b50u);
     buf_u16(&z->out, 20);
     buf_u16(&z->out, 0);            /* flags */
-    buf_u16(&z->out, 0);            /* method: 0 (store) */
+    buf_u16(&z->out, e->method);    /* method: 8 (deflate) or 0 (store) */
     buf_u16(&z->out, 0);
     buf_u16(&z->out, 0x21);
     buf_u32(&z->out, e->crc);
-    buf_u32(&z->out, e->size);
-    buf_u32(&z->out, e->size);
+    buf_u32(&z->out, e->comp_size);
+    buf_u32(&z->out, e->uncomp_size);
     buf_u16(&z->out, (uint16_t)name_len);
     buf_u16(&z->out, 0);
     buf_write(&z->out, name, name_len);
-    buf_write(&z->out, data, sz);
+    buf_write(&z->out, payload, e->comp_size);
+
+    if (comp) free(comp);
 
     z->nent++;
     return 0;
@@ -140,12 +161,12 @@ static int zip_finish(ipa_zip_t *z) {
         buf_u16(&z->out, 0x0314);
         buf_u16(&z->out, 20);
         buf_u16(&z->out, 0);        /* flags */
-        buf_u16(&z->out, 0);        /* compression: store */
+        buf_u16(&z->out, e->method);/* compression: deflate / store */
         buf_u16(&z->out, 0);
         buf_u16(&z->out, 0x21);
         buf_u32(&z->out, e->crc);
-        buf_u32(&z->out, e->size);
-        buf_u32(&z->out, e->size);
+        buf_u32(&z->out, e->comp_size);
+        buf_u32(&z->out, e->uncomp_size);
         buf_u16(&z->out, (uint16_t)name_len);
         buf_u16(&z->out, 0);        /* extra */
         buf_u16(&z->out, 0);        /* comment */
