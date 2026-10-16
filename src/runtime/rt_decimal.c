@@ -422,7 +422,8 @@ int zan_decimal_to_string(zan_decimal_t d, char *buf, size_t buf_size) {
 #endif
 }
 
-/* 导出运行时外部符号实现 */
+/* 导出运行时外部符号实现（当启用纯 Zan runtime_core 时，由 runtime_core.zan 提供并弱导出） */
+#ifndef ZAN_RT_CORE_ZAN
 void __zan_decimal_add(const zan_decimal_t *a, const zan_decimal_t *b, zan_decimal_t *out) {
     if (out) *out = zan_decimal_add(*a, *b);
 }
@@ -478,3 +479,4 @@ int32_t __zan_decimal_to_string(const zan_decimal_t *a, char *buf, size_t buf_si
 bool __zan_decimal_parse(const char *str, size_t len, zan_decimal_t *out) {
     return zan_decimal_parse(str, len, out);
 }
+#endif

@@ -4,13 +4,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if __has_include("nanosvg/nanosvg.h")
 #define NANOSVG_IMPLEMENTATION
 #include "nanosvg/nanosvg.h"
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvg/nanosvgrast.h"
+#endif
 
 int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
                    int *outH, int boxW, int boxH) {
+#if __has_include("nanosvg/nanosvg.h")
     char *doc;
     NSVGimage *img;
     NSVGrasterizer *rast;
@@ -70,4 +73,9 @@ int zan_svg_raster(const char *text, int len, uint32_t **outPix, int *outW,
     nsvgDelete(img);
     free(doc);
     return *outPix != NULL;
+#else
+    (void)text; (void)len; (void)boxW; (void)boxH;
+    *outPix = NULL; *outW = 0; *outH = 0;
+    return 0;
+#endif
 }

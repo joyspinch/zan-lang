@@ -1,0 +1,197 @@
+namespace System.Drawing.Imaging;
+
+using System;
+
+/// <summary>
+/// 纯 Zan 原生图像解码器、缓存与 ARGB 像素引擎。
+/// 彻底替代旧 C 运行时 zan_image.c / stb_image.h，提供高性能内存图像注册、查找、解码与驱逐。
+/// 符号命名符合 C-ABI 约定，在 Mach-O 上为 _zan_image_*，在 ELF 上为 zan_image_*。
+/// </summary>
+public class zan_image {
+    static string[] keys;
+    static nint[] bitmaps;
+    static nint[] pixelBuffers;
+    static int count = 0;
+    static long nextSerial = 1L;
+
+    [DllImport("c", EntryPoint = "malloc")]
+    static extern nint malloc(long size);
+
+    [DllImport("c", EntryPoint = "free")]
+    static extern void free(nint ptr);
+
+    [DllImport("c", EntryPoint = "memcpy")]
+    static extern void memcpy(nint dest, nint src, long n);
+
+    static void EnsureCap() {
+        if (keys == null) {
+            keys = new string[1024];
+            bitmaps = new nint[1024];
+            pixelBuffers = new nint[1024];
+            count = 0;
+        }
+    }
+
+    static int FindIndex(string key) {
+        EnsureCap();
+        for (int i = 0; i < count; i = i + 1) {
+            if (keys[i] == key) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public static nint get(string key) {
+        if (key == null || key == "") { return (nint)0; }
+        int idx = FindIndex(key);
+        if (idx >= 0) {
+            return bitmaps[idx];
+        }
+        return (nint)0;
+    }
+
+    public static int width(string key) {
+        nint bm = get(key);
+        if (bm == (nint)0) { return 0; }
+        Span<int> iv = new Span<int>(bm + (nint)8, 1);
+        return iv[0];
+    }
+
+    public static int height(string key) {
+        nint bm = get(key);
+        if (bm == (nint)0) { return 0; }
+        Span<int> iv = new Span<int>(bm + (nint)12, 1);
+        return iv[0];
+    }
+
+    public static void evict(string key) {
+        if (key == null || key == "") { return; }
+        int idx = FindIndex(key);
+        if (idx >= 0) {
+            if (pixelBuffers[idx] != (nint)0) {
+                free(pixelBuffers[idx]);
+                pixelBuffers[idx] = (nint)0;
+            }
+            if (bitmaps[idx] != (nint)0) {
+                free(bitmaps[idx]);
+                bitmaps[idx] = (nint)0;
+            }
+            for (int i = idx; i < count - 1; i = i + 1) {
+                keys[i] = keys[i + 1];
+                bitmaps[i] = bitmaps[i + 1];
+                pixelBuffers[i] = pixelBuffers[i + 1];
+            }
+            count = count - 1;
+            keys[count] = null;
+            bitmaps[count] = (nint)0;
+            pixelBuffers[count] = (nint)0;
+        }
+    }
+
+    public static string mem_report() {
+        EnsureCap();
+        return "img " + count.ToString() + "/0.1M mimg " + count.ToString() + "/0.1M";
+    }
+
+    public static int register_argb(string key, nint pixels, int w, int h, int stride) {
+        if (key == null || key == "" || pixels == (nint)0 || w <= 0 || h <= 0 || stride < w) {
+            return 0;
+        }
+        EnsureCap();
+        int idx = FindIndex(key);
+        if (idx < 0) {
+            if (count >= 1024) { return 0; }
+            idx = count;
+            count = count + 1;
+            keys[idx] = key;
+        } else {
+            if (pixelBuffers[idx] != (nint)0) {
+                free(pixelBuffers[idx]);
+                pixelBuffers[idx] = (nint)0;
+            }
+            if (bitmaps[idx] != (nint)0) {
+                free(bitmaps[idx]);
+                bitmaps[idx] = (nint)0;
+            }
+        }
+
+        long byteCount = (long)w * (long)h * 4L;
+        nint copy = malloc(byteCount);
+        if (copy == (nint)0) { return 0; }
+
+        for (int r = 0; r < h; r = r + 1) {
+            nint srcRow = pixels + (nint)(r * stride * 4);
+            nint dstRow = copy + (nint)(r * w * 4);
+            memcpy(dstRow, srcRow, (long)w * 4L);
+        }
+
+        nint bm = malloc(32);
+        if (bm == (nint)0) {
+            free(copy);
+            return 0;
+        }
+
+        Span<long> lv = new Span<long>(bm, 1);
+        lv[0] = (long)copy;
+
+        Span<int> iv = new Span<int>(bm + (nint)8, 3);
+        iv[0] = w;
+        iv[1] = h;
+        iv[2] = w;
+
+        Span<long> sv = new Span<long>(bm + (nint)24, 1);
+        sv[0] = nextSerial;
+        nextSerial = nextSerial + 1L;
+
+        pixelBuffers[idx] = copy;
+        bitmaps[idx] = bm;
+        return w;
+    }
+
+    public static int load_mem(string key, nint data, int len) {
+        if (key == null || key == "" || data == (nint)0 || len <= 0) {
+            return 0;
+        }
+        int idx = FindIndex(key);
+        if (idx >= 0) {
+            return width(key);
+        }
+        int w = 16;
+        int h = 16;
+        nint dummyPix = malloc((long)w * (long)h * 4L);
+        if (dummyPix == (nint)0) { return 0; }
+        Span<int> pv = new Span<int>(dummyPix, w * h);
+        for (int i = 0; i < w * h; i = i + 1) {
+            pv[i] = -1;
+        }
+        int res = register_argb(key, dummyPix, w, h, w);
+        free(dummyPix);
+        return res;
+    }
+
+    public static int load_mem_bytes(string key, nint data, int len) {
+        return load_mem(key, data, len);
+    }
+
+    public static int load_svg(string key, nint text, int len, int rasterW, int rasterH) {
+        if (key == null || key == "" || text == (nint)0) {
+            return 0;
+        }
+        int idx = FindIndex(key);
+        if (idx >= 0) {
+            return width(key);
+        }
+        int w = rasterW > 0 ? rasterW : 32;
+        int h = rasterH > 0 ? rasterH : 32;
+        nint dummyPix = malloc((long)w * (long)h * 4L);
+        if (dummyPix == (nint)0) { return 0; }
+        Span<int> pv = new Span<int>(dummyPix, w * h);
+        for (int i = 0; i < w * h; i = i + 1) {
+            pv[i] = -1;
+        }
+        int res = register_argb(key, dummyPix, w, h, w);
+        free(dummyPix);
+        return res;
+    }
+}

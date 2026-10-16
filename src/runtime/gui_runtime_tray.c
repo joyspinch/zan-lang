@@ -1,5 +1,7 @@
 /* gui_runtime_tray */
 
+#ifndef ZAN_RT_CORE_ZAN
+
 #include "zan_bitmap.h"
 
 #if defined(__linux__) && !defined(__ANDROID__) && !defined(__OHOS__)
@@ -1174,3 +1176,5 @@ EXPORT i32 zan_hook_next_event(i32 timeout_ms, i32 *out_p1, i32 *out_p2, i32 *ou
 }
 
 #endif
+
+#endif /* !ZAN_RT_CORE_ZAN */

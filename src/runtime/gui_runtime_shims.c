@@ -1,6 +1,6 @@
 /* gui_runtime_shims */
 
-#if defined(__APPLE__) && !defined(ZAN_GUI_COCOA)
+#if defined(__APPLE__) && !defined(ZAN_GUI_COCOA) && !defined(ZAN_RT_CORE_ZAN)
 EXPORT i32 zan_gui_webview_create(iptr hwnd, const char *profile_id) {
     (void)hwnd; (void)profile_id; return 0;
 }

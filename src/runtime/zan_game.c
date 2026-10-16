@@ -2,6 +2,8 @@
 #include "zan_gui_graphics.h"
 #include "zan_image.h"
 
+#ifndef ZAN_RT_CORE_ZAN
+
 #include <stddef.h>
 #include <string.h>
 
@@ -392,3 +394,5 @@ done:
     zan_gui_gpu_end(surface_id);
     return result;
 }
+
+#endif /* !ZAN_RT_CORE_ZAN */

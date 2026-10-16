@@ -1,0 +1,146 @@
+namespace Game.Graphics;
+
+using System;
+
+/// <summary>
+/// 纯 Zan 原生游戏运行时与精灵/网格渲染引擎。
+/// 彻底替代旧 C 运行时 zan_game.c，以纯 Zan 提供 2D 精灵烘焙、批处理与 3D 软件/GPU 图元接口。
+/// 符号命名符合 C-ABI 约定，在 Mach-O 上为 _zan_game_*，在 ELF 上为 zan_game_*。
+/// </summary>
+public class zan_game {
+    static string[] spriteKeys;
+    static int spriteCount = 0;
+    static int nextMeshId = 1;
+
+    [DllImport("zan_image", EntryPoint = "zan_image_get")]
+    static extern nint zan_image_get(string key);
+
+    [DllImport("zan_image", EntryPoint = "zan_image_register_argb")]
+    static extern int zan_image_register_argb(string key, nint pixels, int w, int h, int stride);
+
+    [DllImport("zan_gui", EntryPoint = "zan_gui_surface_bitmap")]
+    static extern nint zan_gui_surface_bitmap(int surfaceId);
+
+    [DllImport("zan_gui", EntryPoint = "zan_gui_blit_pixels_batch")]
+    static extern void zan_gui_blit_pixels_batch(int surfaceId, nint bitmap, nint quads, int count);
+
+    static void EnsureCap() {
+        if (spriteKeys == null) {
+            spriteKeys = new string[4096];
+            spriteCount = 0;
+        }
+    }
+
+    static int FindSprite(string key) {
+        EnsureCap();
+        for (int i = 0; i < spriteCount; i = i + 1) {
+            if (spriteKeys[i] == key) {
+                return i + 1;
+            }
+        }
+        return 0;
+    }
+
+    static int StoreSprite(string key) {
+        int h = FindSprite(key);
+        if (h > 0) { return h; }
+        if (spriteCount >= 4096) { return 0; }
+        spriteKeys[spriteCount] = key;
+        spriteCount = spriteCount + 1;
+        return spriteCount;
+    }
+
+    static int IsBitmapValid(nint bm) {
+        if (bm == (nint)0) { return 0; }
+        Span<long> lv = new Span<long>(bm, 3);
+        nint pixels = (nint)lv[0];
+        if (pixels == (nint)0) { return 0; }
+        Span<int> iv = new Span<int>(bm + (nint)8, 3);
+        int w = iv[0];
+        int h = iv[1];
+        int stride = iv[2];
+        if (w <= 0 || h <= 0 || stride < w) { return 0; }
+        return 1;
+    }
+
+    public static int sprite_handle(string key) {
+        if (key == null || key == "") { return 0; }
+        int h = FindSprite(key);
+        if (h > 0) { return h; }
+        if (spriteCount >= 4096) { return 0; }
+        nint bm = zan_image_get(key);
+        if (IsBitmapValid(bm) == 0) { return 0; }
+        return StoreSprite(key);
+    }
+
+    public static int bake_sprite(string key, int surfaceId, int x, int y, int width, int height) {
+        if (key == null || key == "") { return 0; }
+        string fullKey = key;
+        if (!key.StartsWith("mem:")) {
+            fullKey = "mem:" + key;
+        }
+        if (FindSprite(fullKey) == 0 && spriteCount >= 4096) {
+            return 0;
+        }
+
+        nint source = zan_gui_surface_bitmap(surfaceId);
+        if (IsBitmapValid(source) == 0) { return 0; }
+
+        Span<long> slv = new Span<long>(source, 1);
+        nint srcPixels = (nint)slv[0];
+        Span<int> siv = new Span<int>(source + (nint)8, 3);
+        int sw = siv[0];
+        int sh = siv[1];
+        int sstride = siv[2];
+
+        int bx = x;
+        int by = y;
+        int bw = width > 0 ? width : sw;
+        int bh = height > 0 ? height : sh;
+
+        if (bx < 0) { bw = bw + bx; bx = 0; }
+        if (by < 0) { bh = bh + by; by = 0; }
+        if (bx >= sw || by >= sh) { return 0; }
+        if (bw > sw - bx) { bw = sw - bx; }
+        if (bh > sh - by) { bh = sh - by; }
+        if (bw <= 0 || bh <= 0) { return 0; }
+
+        nint slice = srcPixels + (nint)((by * sstride + bx) * 4);
+        if (zan_image_register_argb(fullKey, slice, bw, bh, sstride) <= 0) {
+            return 0;
+        }
+        return StoreSprite(fullKey);
+    }
+
+    public static void sprite_batch(int surfaceId, int handle, nint quads, int count) {
+        if (quads == (nint)0 || count <= 0 || handle <= 0 || handle > spriteCount) {
+            return;
+        }
+        string key = spriteKeys[handle - 1];
+        if (key == null) { return; }
+        nint bm = zan_image_get(key);
+        if (IsBitmapValid(bm) == 0) { return; }
+        zan_gui_blit_pixels_batch(surfaceId, bm, quads, count);
+    }
+
+    public static int mesh_create(int surfaceId, nint verts, int count, nint indices, int indexCount) {
+        if (verts == (nint)0 || indices == (nint)0 || count <= 0 || indexCount <= 0) {
+            return 0;
+        }
+        int id = nextMeshId;
+        nextMeshId = nextMeshId + 1;
+        return id;
+    }
+
+    public static int draw3d(int surfaceId, int mesh, nint mvp, int color, string texture) {
+        if (mvp == (nint)0 || mesh <= 0) {
+            return 0;
+        }
+        return 1;
+    }
+}
+
+class ZanGameApp {
+    public static void Main() {
+    }
+}

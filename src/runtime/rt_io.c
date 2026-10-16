@@ -988,7 +988,7 @@ int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
     FD_ZERO(&wfds); FD_ZERO(&efds);
     FD_SET((SOCKET)fd, &wfds); FD_SET((SOCKET)fd, &efds);
     struct timeval tv, *ptv = NULL;
-    if (timeout_ms >= 0) { tv.tv_sec = timeout_ms / 1000;
+    if (timeout_ms > 0) { tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000; ptv = &tv; }
     if (select(0, NULL, &wfds, &efds, ptv) <= 0) return -3;
     int err = 0, len = (int)sizeof(err);
@@ -1000,7 +1000,7 @@ int64_t zan_io_connect_sa(intptr_t fd, const void *sa, int32_t salen,
     if (fd < 0 || fd >= FD_SETSIZE) return -1;
     FD_SET((int)fd, &wfds); FD_SET((int)fd, &efds);
     struct timeval tv, *ptv = NULL;
-    if (timeout_ms >= 0) { tv.tv_sec = timeout_ms / 1000;
+    if (timeout_ms > 0) { tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000; ptv = &tv; }
     int sr;
     do { sr = select((int)fd + 1, NULL, &wfds, &efds, ptv); }

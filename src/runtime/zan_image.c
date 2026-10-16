@@ -24,6 +24,7 @@
 #endif
 #include "zan_image.h"
 
+#if __has_include("stb_image.h")
 /* 避免 MinGW 静态链接 TLS 故障，使用标准内存布局 */
 #define STBI_NO_THREAD_LOCALS
 /* 统一解码为 RGBA8/ARGB32 格式，剥离 HDR/浮点路径以降低体积 */
@@ -31,8 +32,10 @@
 #define STBI_NO_HDR
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
+#endif
 
 /* 集成内嵌 libwebp 解码子集与 NanoSVG 栅格化器 */
+#if __has_include("libwebp/src/dec/alpha_dec.c")
 #define HAVE_CONFIG_H
 #include "libwebp/src/dec/alpha_dec.c"
 #include "libwebp/src/dec/buffer_dec.c"
@@ -70,6 +73,7 @@
 #include "libwebp/src/utils/rescaler_utils.c"
 #include "libwebp/src/utils/thread_utils.c"
 #include "libwebp/src/utils/utils.c"
+#endif
 #include "gui_image_svg.c"
 
 #define ZAN_IMG_CACHE_CAP 1024
@@ -254,6 +258,7 @@ static uint32_t *zan_img_decode(const unsigned char *data, int len,
     }
     if (len >= 12 && memcmp(data, "RIFF", 4) == 0
         && memcmp(data + 8, "WEBP", 4) == 0) {
+#if __has_include("libwebp/src/dec/alpha_dec.c")
         if (WebPGetInfo(data, (size_t)len, &w, &h)
             && zan_img_dimensions_ok(w, h)) {
             uint8_t *rgba = WebPDecodeRGBA(data, (size_t)len, &w, &h);
@@ -262,12 +267,15 @@ static uint32_t *zan_img_decode(const unsigned char *data, int len,
                 WebPFree(rgba);
             }
         }
+#endif
     } else {
+#if __has_include("stb_image.h")
         unsigned char *rgba = stbi_load_from_memory(data, len, &w, &h, &n, 4);
         if (rgba) {
             pix = zan_rgba_to_argb(rgba, w, h);
             stbi_image_free(rgba);
         }
+#endif
     }
     if (pix) { *out_w = w; *out_h = h; }
     return pix;

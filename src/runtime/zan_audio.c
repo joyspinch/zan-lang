@@ -43,9 +43,11 @@
 #include <aaudio/AAudio.h>
 #endif
 
+#if __has_include("stb_vorbis.c")
 #define STB_VORBIS_NO_PUSHDATA_API
 #define STB_VORBIS_NO_STDIO
 #include "stb_vorbis.c"
+#endif
 
 #ifndef ZAN_VOICE_SLOTS
 #define ZAN_VOICE_SLOTS 256
@@ -350,6 +352,7 @@ static int zan_wav_parse(const unsigned char *b, int n, ZanAudioClip *c) {
 }
 
 static int zan_ogg_decode(const unsigned char *b, int n, ZanAudioClip *c) {
+#if __has_include("stb_vorbis.c")
     int channels = 0, freq = 0;
     short *decoded = NULL;
     int total = stb_vorbis_decode_memory(b, n, &channels, &freq, &decoded);
@@ -363,6 +366,11 @@ static int zan_ogg_decode(const unsigned char *b, int n, ZanAudioClip *c) {
     c->freq = freq;
     c->channels = channels;
     return 1;
+#else
+    (void)b; (void)n; (void)c;
+    zan_audio_set_err("ogg decoder not available");
+    return 0;
+#endif
 }
 
 /* Mixer (Windows) */
