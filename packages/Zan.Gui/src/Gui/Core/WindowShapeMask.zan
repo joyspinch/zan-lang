@@ -161,10 +161,94 @@ class WindowShapeMask {
         if (maxBoundX >= width) { maxBoundX = width - 1; }
         if (maxBoundY >= height) { maxBoundY = height - 1; }
 
-        // 双层循环遍历物理像素：包围盒外像素默认为零无需循环；
-        // 95% 以上的核心内部像素通过 AABB 内盒短路直接填 255；
-        // 外部像素通过 AABB 外包围盒短路直接填 0；
-        // 仅在真实圆角弧线与边缘过渡带（极少数像素）才执行 16 次 SDF 定点采样。
+        // 高频单圆角/矩形快速光栅化路径（覆盖 99.9% 的常规圆角窗口）：
+        // 核心直角内部跨距直接批量填 255，仅在 4 个四角半径微小方块（4*r*r 像素，通常仅千分之一）采样 SDF。
+        if (itemCount == 1 && items[0].kind == 1) {
+            PreparedShapeItem it = items[0];
+            int rx1 = it.outX1 + 1;
+            int rx2 = it.outX2;
+            int ry1 = it.outY1 + 1;
+            int ry2 = it.outY2;
+            if (rx1 < 0) { rx1 = 0; }
+            if (ry1 < 0) { ry1 = 0; }
+            if (rx2 > width) { rx2 = width; }
+            if (ry2 > height) { ry2 = height; }
+            int pr = (int)(it.r16 / 16);
+            if (pr < 0) { pr = 0; }
+            if (pr * 2 > (rx2 - rx1)) { pr = (rx2 - rx1) / 2; }
+            if (pr * 2 > (ry2 - ry1)) { pr = (ry2 - ry1) / 2; }
+
+            // 1. 中间水平主区域：整行全部填 255（完全不含圆角弧度）
+            int midY1 = ry1 + pr;
+            int midY2 = ry2 - pr;
+            for (int py = midY1; py < midY2; py = py + 1) {
+                int rowIdx = py * width;
+                for (int px = rx1; px < rx2; px = px + 1) {
+                    mask[rowIdx + px] = (byte)255;
+                }
+            }
+
+            // 2. 上部和下部中心直通区域：避开左右圆角 pr 像素后全部填 255
+            int topBottomX1 = rx1 + pr;
+            int topBottomX2 = rx2 - pr;
+            for (int py = ry1; py < midY1; py = py + 1) {
+                int rowIdx = py * width;
+                for (int px = topBottomX1; px < topBottomX2; px = px + 1) {
+                    mask[rowIdx + px] = (byte)255;
+                }
+            }
+            for (int py = midY2; py < ry2; py = py + 1) {
+                int rowIdx = py * width;
+                for (int px = topBottomX1; px < topBottomX2; px = px + 1) {
+                    mask[rowIdx + px] = (byte)255;
+                }
+            }
+
+            // 3. 仅在 4 个角部小区域（四角 pr x pr）计算 16 采样 SDF 抗锯齿
+            if (pr > 0) {
+                int c1X1 = rx1; int c1X2 = rx1 + pr; int c1Y1 = ry1; int c1Y2 = midY1;
+                int c2X1 = rx2 - pr; int c2X2 = rx2; int c2Y1 = ry1; int c2Y2 = midY1;
+                int c3X1 = rx1; int c3X2 = rx1 + pr; int c3Y1 = midY2; int c3Y2 = ry2;
+                int c4X1 = rx2 - pr; int c4X2 = rx2; int c4Y1 = midY2; int c4Y2 = ry2;
+
+                for (int c = 0; c < 4; c = c + 1) {
+                    int bX1 = c == 0 || c == 2 ? c1X1 : c2X1;
+                    int bX2 = c == 0 || c == 2 ? c1X2 : c2X2;
+                    int bY1 = c < 2 ? c1Y1 : c3Y1;
+                    int bY2 = c < 2 ? c1Y2 : c3Y2;
+
+                    for (int py = bY1; py < bY2; py = py + 1) {
+                        int rowIdx = py * width;
+                        for (int px = bX1; px < bX2; px = px + 1) {
+                            int sum = 0;
+                            for (int sa = 0; sa < 4; sa = sa + 1) {
+                                for (int sb = 0; sb < 4; sb = sb + 1) {
+                                    long sx = (long)px * 16 + sa * 4 + 2;
+                                    long sy = (long)py * 16 + sb * 4 + 2;
+                                    long d = WindowShapeMask.SdfItem(it, sx, sy);
+                                    long cov = 8 - d;
+                                    if (cov < 0) { cov = 0; }
+                                    if (cov > 16) { cov = 16; }
+                                    sum = sum + (int)cov;
+                                }
+                            }
+                            if (sum > 255) { sum = 255; }
+                            mask[rowIdx + px] = (byte)sum;
+                        }
+                    }
+                }
+            }
+
+            cachedWidth = width;
+            cachedHeight = height;
+            cachedDpiScale = dpiScale;
+            cachedRegions = snapshot;
+            cachedCoverage = mask;
+            cachedShadowBand = shadowBand;
+            return mask;
+        }
+
+        // 多区域复合形状通用回退循环
         for (int py = minBoundY; py <= maxBoundY; py = py + 1) {
             int rowIdx = py * width;
             for (int px = minBoundX; px <= maxBoundX; px = px + 1) {

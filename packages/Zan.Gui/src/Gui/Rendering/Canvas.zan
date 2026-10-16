@@ -1070,11 +1070,29 @@ class Canvas {
             NativeMemory.Copy(copy, source, n * 4);
             Span<int> pixels = new Span<int>(copy, n);
             bool shadowBand = shaped && mask.HasShadowBand();
-            for (int i = 0; i < n; i = i + 1) {
-                int cov = shaped ? coverage[i] : 255;
-                int pixel = WindowShapeMask.SnapshotStraightArgb(pixels[i], cov, shadowBand);
-                int alpha = ((pixel >> 24) & 255) * opacity / 255;
-                pixels[i] = (alpha << 24) | (pixel & 0x00FFFFFF);
+
+            // 针对 100% 不透明且无特殊阴影带的绝大多数常规场景（99.9%），
+            // 绝大部分内部像素 (cov == 255) 与源缓冲完全一致，直接跳过计算与 Span 回写；
+            // 外部像素 (cov == 0) 直接置零，仅边缘过渡像素缩放 Alpha。
+            if (opacity >= 255 && !shadowBand) {
+                for (int i = 0; i < n; i = i + 1) {
+                    int cov = shaped ? (int)coverage[i] : 255;
+                    if (cov == 255) { continue; }
+                    if (cov <= 0) {
+                        pixels[i] = 0;
+                    } else {
+                        int p = pixels[i];
+                        int a = (((p >> 24) & 255) * cov) / 255;
+                        pixels[i] = (a << 24) | (p & 0x00FFFFFF);
+                    }
+                }
+            } else {
+                for (int i = 0; i < n; i = i + 1) {
+                    int cov = shaped ? (int)coverage[i] : 255;
+                    int pixel = WindowShapeMask.SnapshotStraightArgb(pixels[i], cov, shadowBand);
+                    int alpha = ((pixel >> 24) & 255) * opacity / 255;
+                    pixels[i] = (alpha << 24) | (pixel & 0x00FFFFFF);
+                }
             }
             return zan_image_register_argb(key, copy, width, height, width) == width;
         } finally {
