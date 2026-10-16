@@ -217,6 +217,10 @@ const isym_t *intel_member_sym_ex(intellisense_t *is, intellisense_t *project,
 /* Go to definition of a symbol */
 goto_def_t intel_goto_def(intellisense_t *is, const char *word);
 
+int intel_signature_help_list_ex(intellisense_t *is, intellisense_t *project,
+                                const char *method_name, const char *class_context,
+                                int line, int col,
+                                signature_info_t *out_sigs, int max_sigs);
 signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
                                              const char *method_name, const char *class_context,
                                              int line, int col);
