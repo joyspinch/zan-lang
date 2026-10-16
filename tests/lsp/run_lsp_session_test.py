@@ -259,6 +259,7 @@ def main():
         root = Path(__file__).resolve().parents[2]
         sources = [root / "tests/lsp/lsp_session_test.zan",
                    *sorted((root / "src/ide_zan/src/models/lsp").glob("*.zan")),
+                   *sorted((root / "src/ide_zan/src/models/dap").glob("*.zan")),
                    root / "src/ide_zan/src/services/LspSession.zan",
                    root / "src/ide_zan/src/services/LspSession.Transport.zan",
                    root / "src/ide_zan/src/services/LspSession.Protocol.zan",

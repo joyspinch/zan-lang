@@ -1529,6 +1529,11 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
     if (strcmp(type_name, "this") == 0 || strcmp(type_name, "self") == 0) {
         const char *encl = intel_enclosing_type_at(is, line, col);
         if (encl && encl[0]) type_name = encl;
+    } else if (strcmp(type_name, "base") == 0) {
+        const char *encl = intel_enclosing_type_at(is, line, col);
+        const char *b = (encl && encl[0]) ? class_base(is, encl) : NULL;
+        if (!b && project && encl && encl[0]) b = class_base(project, encl);
+        if (b && b[0]) type_name = b;
     }
     bool is_known_type = false;
     for (int i = 0; i < is->symbol_count; i++) {
@@ -2200,7 +2205,7 @@ signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t 
             if (!indices[k]) continue;
             for (int i = 0; i < indices[k]->symbol_count; i++) {
                 const isym_t *s = &indices[k]->symbols[i];
-                if (s->kind != ISYM_METHOD || strcmp(s->name, method_name) != 0 ||
+                if ((s->kind != ISYM_METHOD && s->kind != ISYM_CONSTRUCTOR) || strcmp(s->name, method_name) != 0 ||
                     !intel_type_owner_is(receiver, s->parent) ||
                     !member_visible(indices[k], s->visibility, s->parent, from_class)) continue;
                 substitute_generics(receiver, declaration ? declaration->signature : NULL,
@@ -2211,10 +2216,57 @@ signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t 
                 return sig;
             }
         }
-        if (!declaration || !declaration->type_name[0]) break;
+        const char *next_base = declaration ? declaration->type_name : NULL;
+        if (!next_base || !next_base[0]) {
+            next_base = class_base(is, receiver);
+            if (!next_base && project) next_base = class_base(project, receiver);
+        }
+        if (!next_base || !next_base[0]) break;
         char base[128];
-        substitute_generics(receiver, declaration->signature, declaration->type_name, base, sizeof(base));
+        substitute_generics(receiver, declaration ? declaration->signature : NULL, next_base, base, sizeof(base));
         snprintf(receiver, sizeof(receiver), "%s", base);
+    }
+    if (!sig.valid) {
+        intellisense_t *indices[] = {is, project};
+        for (int k = 0; k < 2; k++) {
+            if (!indices[k]) continue;
+            for (int i = 0; i < indices[k]->symbol_count; i++) {
+                const isym_t *s = &indices[k]->symbols[i];
+                if (s->kind == ISYM_CONSTRUCTOR && strcmp(s->name, method_name) == 0) {
+                    snprintf(sig.label, sizeof(sig.label), "%s", s->signature);
+                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
+                    sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
+                    sig.valid = true;
+                    return sig;
+                }
+            }
+        }
+        for (int k = 0; k < 2; k++) {
+            if (!indices[k]) continue;
+            for (int i = 0; i < indices[k]->symbol_count; i++) {
+                const isym_t *s = &indices[k]->symbols[i];
+                if ((s->kind == ISYM_CLASS || s->kind == ISYM_STRUCT) && strcmp(s->name, method_name) == 0) {
+                    snprintf(sig.label, sizeof(sig.label), "%s()", s->name);
+                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
+                    sig.param_count = 0;
+                    sig.valid = true;
+                    return sig;
+                }
+            }
+        }
+        for (int k = 0; k < 2; k++) {
+            if (!indices[k]) continue;
+            for (int i = 0; i < indices[k]->symbol_count; i++) {
+                const isym_t *s = &indices[k]->symbols[i];
+                if (s->kind == ISYM_METHOD && strcmp(s->name, method_name) == 0) {
+                    snprintf(sig.label, sizeof(sig.label), "%s", s->signature);
+                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
+                    sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
+                    sig.valid = true;
+                    return sig;
+                }
+            }
+        }
     }
     return sig;
 }
@@ -2435,9 +2487,14 @@ const char *intel_resolve_method_return_ex(intellisense_t *is, intellisense_t *p
                 return buf[0] ? buf : NULL;
             }
         }
-        if (!declaration || !declaration->type_name[0]) break;
+        const char *next_base = declaration ? declaration->type_name : NULL;
+        if (!next_base || !next_base[0]) {
+            next_base = class_base(is, simple);
+            if (!next_base && project) next_base = class_base(project, simple);
+        }
+        if (!next_base || !next_base[0]) break;
         char base[128];
-        substitute_generics(current, declaration->signature, declaration->type_name, base, sizeof(base));
+        substitute_generics(current, declaration ? declaration->signature : NULL, next_base, base, sizeof(base));
         snprintf(current, sizeof(current), "%s", base);
     }
     return NULL;
@@ -2572,10 +2629,10 @@ const char *intel_resolve_chain_pos(intellisense_t *is, intellisense_t *project,
         if (is && line >= 0) {
             current_type = intel_resolve_type_pos(is, fn, line, col);
         }
-        if (line < 0 && (!current_type || !current_type[0])) {
+        if (!current_type || !current_type[0]) {
             if (is) current_type = intel_resolve_type(is, fn);
         }
-        if (line < 0 && (!current_type || !current_type[0])) {
+        if (!current_type || !current_type[0]) {
             if (project) current_type = intel_resolve_type(project, fn);
         }
         if (!current_type || !current_type[0]) {
