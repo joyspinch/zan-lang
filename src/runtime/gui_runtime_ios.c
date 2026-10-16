@@ -239,6 +239,7 @@ static int iq_pop(void) {
 }
 
 static void zan_ios_load_frameworks(void) {
+    dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_GLOBAL | RTLD_NOW);
     dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_GLOBAL | RTLD_NOW);
     dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_GLOBAL | RTLD_NOW);
     dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_GLOBAL | RTLD_NOW);
@@ -969,12 +970,13 @@ static void zan_ios_do_present(void *arg) {
             zan_sel_t sel_begin = g_bridge.sel_registerName("begin");
             zan_sel_t sel_set_disable = g_bridge.sel_registerName("setDisableActions:");
             zan_sel_t sel_commit = g_bridge.sel_registerName("commit");
+            zan_sel_t sel_flush = g_bridge.sel_registerName("flush");
             zan_send0((zan_id_t)cls_tx, sel_begin);
             zan_send1_bool((zan_id_t)cls_tx, sel_set_disable, true);
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
             zan_send0((zan_id_t)cls_tx, sel_commit);
-            /* Do not flush synchronously from worker thread; commit presents on vsync smoothly */
+            zan_send0((zan_id_t)cls_tx, sel_flush);
         } else {
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
@@ -1149,18 +1151,45 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
         if (!mask) mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
         int rendered = 0;
 
-        /* 1. DeviceGray: direct 8-bit native vector antialiasing into mask */
-        CGColorSpaceRef cs_gray = p_CGColorSpaceCreateDeviceGray ? p_CGColorSpaceCreateDeviceGray() : NULL;
+        /* 1. Direct 8-bit Alpha-Only context (canonical iOS format, zero color-conversion overhead) */
+        if (!rendered && mask) {
+            zan_cg_context_t ctx = p_CGBitmapContextCreate(
+                mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
+                NULL, 7 /* kCGImageAlphaOnly */);
+            if (ctx) {
+                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
+                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
+                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                }
+                if (p_CGContextSetGrayFillColor) {
+                    p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
+                }
+                if (p_CGContextSetTextPosition) {
+                    p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+                }
+                p_CTLineDraw(line, ctx);
+                if (p_CGContextFlush) p_CGContextFlush(ctx);
+                if (p_CGContextRelease) p_CGContextRelease(ctx);
+                rendered = 1;
+            }
+        }
+
+        /* 2. DeviceGray fallback */
+        CGColorSpaceRef cs_gray = (!rendered && p_CGColorSpaceCreateDeviceGray) ? p_CGColorSpaceCreateDeviceGray() : NULL;
         if (cs_gray && mask) {
             zan_cg_context_t ctx = p_CGBitmapContextCreate(
                 mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
                 cs_gray, 0 /* kCGImageAlphaNone */);
             if (ctx) {
+                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
+                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
+                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                }
                 if (p_CGContextSetGrayFillColor) {
                     p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
                 if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                    p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
                 }
                 p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1170,7 +1199,7 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
             if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_gray);
         }
 
-        /* 2. RGBA fallback */
+        /* 3. RGBA fallback */
         if (!rendered && cs_rgb && mask) {
             size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
             uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
@@ -1179,8 +1208,12 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                     rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
                     cs_rgb, (4 << 12) | 1);
                 if (ctx) {
+                    if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
+                        p_CGContextTranslateCTM(ctx, 0.0, (double)th);
+                        p_CGContextScaleCTM(ctx, 1.0, -1.0);
+                    }
                     if (p_CGContextSetTextPosition) {
-                        p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                        p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
                     }
                     p_CTLineDraw(line, ctx);
                     if (p_CGContextFlush) p_CGContextFlush(ctx);
