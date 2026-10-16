@@ -8,6 +8,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#endif
+
 typedef struct {
     unsigned char *data;
     size_t len;
@@ -261,10 +268,62 @@ static unsigned char *extract_png_from_ico_or_png(const unsigned char *data, siz
     return NULL;
 }
 
+static void ipa_add_tree(ipa_zip_t *zip, const char *fs_dir, const char *zip_prefix) {
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", fs_dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        char sub_fs[1024];
+        snprintf(sub_fs, sizeof(sub_fs), "%s/%s", fs_dir, fd.cFileName);
+        char sub_zip[1024];
+        snprintf(sub_zip, sizeof(sub_zip), "%s/%s", zip_prefix, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ipa_add_tree(zip, sub_fs, sub_zip);
+        } else {
+            size_t sz = 0;
+            unsigned char *d = read_file_bytes(sub_fs, &sz);
+            if (d) {
+                zip_add(zip, sub_zip, d, sz, 0100644);
+                free(d);
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(fs_dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char sub_fs[1024];
+        snprintf(sub_fs, sizeof(sub_fs), "%s/%s", fs_dir, e->d_name);
+        char sub_zip[1024];
+        snprintf(sub_zip, sizeof(sub_zip), "%s/%s", zip_prefix, e->d_name);
+        struct stat st;
+        if (stat(sub_fs, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            ipa_add_tree(zip, sub_fs, sub_zip);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t sz = 0;
+            unsigned char *data = read_file_bytes(sub_fs, &sz);
+            if (data) {
+                zip_add(zip, sub_zip, data, sz, 0100644);
+                free(data);
+            }
+        }
+    }
+    closedir(d);
+#endif
+}
+
 int zan_ipa_build(const char *ipa_path, const char *binary_path,
                   const char *app_name, const char *bundle_id,
                   const char *display_name, const char *version,
-                  const char *icon_path) {
+                  const char *icon_path, const char *assets_dir) {
     if (!ipa_path || !binary_path || !app_name) {
         fprintf(stderr, "error: invalid arguments to zan_ipa_build\n");
         return -1;
@@ -471,6 +530,12 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         zip_add(&zip, "iTunesArtwork", icon_png, icon_png_sz, 0100644);
     }
     if (icon_png) free(icon_png);
+
+    if (assets_dir && assets_dir[0]) {
+        char zip_assets[512];
+        snprintf(zip_assets, sizeof(zip_assets), "Payload/%s.app/assets", app_name);
+        ipa_add_tree(&zip, assets_dir, zip_assets);
+    }
 
     zip_finish(&zip);
 

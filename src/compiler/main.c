@@ -8505,7 +8505,35 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0", effective_icon) != 0) {
+            const char *effective_assets = NULL;
+            char assets_cand[1200] = {0};
+            if (input_file) {
+                char adir[1200];
+                snprintf(adir, sizeof(adir), "%s", input_file);
+                char *s1 = strrchr(adir, '/');
+                char *s2 = strrchr(adir, '\\');
+                if (!s1 || (s2 && s2 > s1)) s1 = s2;
+                if (s1) {
+                    *s1 = 0;
+                    snprintf(assets_cand, sizeof(assets_cand), "%s/assets", adir);
+                    if (zan_file_exists(assets_cand)) {
+                        effective_assets = assets_cand;
+                    } else {
+                        char *p1 = strrchr(adir, '/');
+                        char *p2 = strrchr(adir, '\\');
+                        if (!p1 || (p2 && p2 > p1)) p1 = p2;
+                        if (p1) {
+                            *p1 = 0;
+                            snprintf(assets_cand, sizeof(assets_cand), "%s/assets", adir);
+                            if (zan_file_exists(assets_cand)) effective_assets = assets_cand;
+                        }
+                    }
+                }
+            }
+            if (!effective_assets && zan_file_exists("assets")) {
+                effective_assets = "assets";
+            }
+            if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0", effective_icon, effective_assets) != 0) {
                 remove(obj_path);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);

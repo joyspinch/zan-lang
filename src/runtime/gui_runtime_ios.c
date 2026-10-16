@@ -199,6 +199,7 @@ typedef struct { int e[8]; iptr win; } zan_iev_t;
 static zan_iev_t g_iq[ZAN_IQ_CAP];
 static int g_iq_head = 0, g_iq_tail = 0;
 static pthread_mutex_t g_iq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_iq_cond = PTHREAD_COND_INITIALIZER;
 
 static int g_pending_event[8];
 static iptr g_event_win = 0;
@@ -209,6 +210,7 @@ static void iq_push_locked(int kind, int x, int y, int button, int code, int mod
     int has_last = (g_iq_head != g_iq_tail);
     if (kind == 1 && has_last && g_iq[last].e[0] == 1) {
         g_iq[last].e[1] = x; g_iq[last].e[2] = y;
+        pthread_cond_signal(&g_iq_cond);
         return;
     }
     int next = (g_iq_tail + 1) % ZAN_IQ_CAP;
@@ -218,6 +220,7 @@ static void iq_push_locked(int kind, int x, int y, int button, int code, int mod
     z->e[4] = code; z->e[5] = mods; z->e[6] = 0; z->e[7] = 0;
     z->win = ZAN_IOS_HWND;
     g_iq_tail = next;
+    pthread_cond_signal(&g_iq_cond);
 }
 
 static int iq_pop(void) {
@@ -406,8 +409,8 @@ static void zan_ios_touch_action(int action, int x, int y) {
         g_ios_touch_hi = 1 % IOS_TOUCH_HIST;
         g_ios_touch_ht[0] = ios_tick_ms();
         g_ios_touch_hy[0] = g_ios_touch_y;
-        iq_push_locked(1, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 0, 0, 0);
-        iq_push_locked(2, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 1, 0, 0);
+        /* Primary button = 0 (Left click) for all UI button click triggers */
+        iq_push_locked(2, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 0, 0, 0);
         pthread_mutex_unlock(&g_iq_lock);
         return;
     }
@@ -428,13 +431,14 @@ static void zan_ios_touch_action(int action, int x, int y) {
         if (delta != 0) {
             g_ios_touch_acc -= (float)delta;
             iq_push_locked(13, x, y, 0, delta, 0);
+        } else {
+            iq_push_locked(1, x, y, 0, 0, 0);
         }
         g_ios_touch_ht[g_ios_touch_hi] = ios_tick_ms();
         g_ios_touch_hy[g_ios_touch_hi] = fy;
         g_ios_touch_hi = (g_ios_touch_hi + 1) % IOS_TOUCH_HIST;
         if (g_ios_touch_hn < IOS_TOUCH_HIST) g_ios_touch_hn++;
         g_ios_touch_x = fx; g_ios_touch_y = fy;
-        iq_push_locked(1, x, y, 0, 0, 0);
         pthread_mutex_unlock(&g_iq_lock);
         return;
     }
@@ -442,7 +446,7 @@ static void zan_ios_touch_action(int action, int x, int y) {
         g_ios_touch_down = 0;
         pthread_mutex_lock(&g_iq_lock);
         if (g_ios_touch_drag) {
-            iq_push_locked(3, (int)g_ios_touch_x, (int)g_ios_touch_y, 1, 0, 0);
+            iq_push_locked(3, (int)g_ios_touch_x, (int)g_ios_touch_y, 0, 0, 0);
             pthread_mutex_unlock(&g_iq_lock);
             int last = (g_ios_touch_hi + IOS_TOUCH_HIST - 1) % IOS_TOUCH_HIST;
             int old = last;
@@ -458,7 +462,7 @@ static void zan_ios_touch_action(int action, int x, int y) {
             }
         } else {
             int ax = (int)g_ios_touch_ax, ay = (int)g_ios_touch_ay;
-            iq_push_locked(3, ax, ay, 1, 0, 0);
+            iq_push_locked(3, ax, ay, 0, 0, 0);
             pthread_mutex_unlock(&g_iq_lock);
         }
         return;
@@ -842,30 +846,65 @@ EXPORT i32 zan_gui_poll_event(void) {
 
 EXPORT i32 zan_gui_wait_event(void) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
-    while (!iq_pop()) {
-        if (g_iwin.closed) return -1;
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = 4 * 1000 * 1000;
-        nanosleep(&ts, NULL);
+    pthread_mutex_lock(&g_iq_lock);
+    while (g_iq_head == g_iq_tail) {
+        if (g_iwin.closed) {
+            pthread_mutex_unlock(&g_iq_lock);
+            return -1;
+        }
+        pthread_cond_wait(&g_iq_cond, &g_iq_lock);
     }
+    zan_iev_t *z = &g_iq[g_iq_head];
+    for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
+    g_event_win = z->win;
+    g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+    g_ev_seq++;
+    pthread_mutex_unlock(&g_iq_lock);
     return 0;
 }
 
 EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
     memset(g_pending_event, 0, sizeof(g_pending_event));
-    if (iq_pop()) return 0;
-    int remain = (ms < 0) ? 0 : ms;
-    while (remain > 0) {
-        if (g_iwin.closed) return -1;
-        long step = (remain > 8) ? 8 : (long)remain;
-        struct timespec ts;
-        ts.tv_sec = 0;
-        ts.tv_nsec = step * 1000 * 1000;
-        nanosleep(&ts, NULL);
-        remain -= (int)step;
-        if (iq_pop()) return 0;
+    pthread_mutex_lock(&g_iq_lock);
+    if (g_iq_head != g_iq_tail) {
+        zan_iev_t *z = &g_iq[g_iq_head];
+        for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
+        g_event_win = z->win;
+        g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+        g_ev_seq++;
+        pthread_mutex_unlock(&g_iq_lock);
+        return 0;
     }
+    if (ms <= 0) {
+        pthread_mutex_unlock(&g_iq_lock);
+        return 1;
+    }
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    now.tv_sec += ms / 1000;
+    now.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (now.tv_nsec >= 1000000000L) {
+        now.tv_sec += 1;
+        now.tv_nsec -= 1000000000L;
+    }
+    while (g_iq_head == g_iq_tail) {
+        if (g_iwin.closed) {
+            pthread_mutex_unlock(&g_iq_lock);
+            return -1;
+        }
+        int rc = pthread_cond_timedwait(&g_iq_cond, &g_iq_lock, &now);
+        if (rc != 0) break;
+    }
+    if (g_iq_head != g_iq_tail) {
+        zan_iev_t *z = &g_iq[g_iq_head];
+        for (int i = 0; i < 8; i++) g_pending_event[i] = z->e[i];
+        g_event_win = z->win;
+        g_iq_head = (g_iq_head + 1) % ZAN_IQ_CAP;
+        g_ev_seq++;
+        pthread_mutex_unlock(&g_iq_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_iq_lock);
     return 1;
 }
 
@@ -1110,39 +1149,28 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
         if (!mask) mask = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
         int rendered = 0;
 
-        /* 1. DeviceGray: direct 8-bit native vector antialiasing, zero color conversion, crisp typography */
+        /* 1. DeviceGray: direct 8-bit native vector antialiasing into mask */
         CGColorSpaceRef cs_gray = p_CGColorSpaceCreateDeviceGray ? p_CGColorSpaceCreateDeviceGray() : NULL;
         if (cs_gray && mask) {
-            unsigned char *gray_buf = (unsigned char *)calloc((size_t)tw * (size_t)th, 1);
-            if (gray_buf) {
-                zan_cg_context_t ctx = p_CGBitmapContextCreate(
-                    gray_buf, (size_t)tw, (size_t)th, 8, (size_t)tw,
-                    cs_gray, 0 /* kCGImageAlphaNone */);
-                if (ctx) {
-                    if (p_CGContextSetGrayFillColor) {
-                        p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
-                    }
-                    if (p_CGContextSetTextPosition) {
-                        p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
-                    }
-                    p_CTLineDraw(line, ctx);
-                    if (p_CGContextFlush) p_CGContextFlush(ctx);
-                    if (p_CGContextRelease) p_CGContextRelease(ctx);
-
-                    /* Copy row by row inverted from Quartz coordinate */
-                    for (int py = 0; py < th; py++) {
-                        const unsigned char *src_row = gray_buf + (size_t)(th - 1 - py) * (size_t)tw;
-                        unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
-                        memcpy(dst_row, src_row, (size_t)tw);
-                    }
-                    rendered = 1;
+            zan_cg_context_t ctx = p_CGBitmapContextCreate(
+                mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
+                cs_gray, 0 /* kCGImageAlphaNone */);
+            if (ctx) {
+                if (p_CGContextSetGrayFillColor) {
+                    p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
-                free(gray_buf);
+                if (p_CGContextSetTextPosition) {
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
+                }
+                p_CTLineDraw(line, ctx);
+                if (p_CGContextFlush) p_CGContextFlush(ctx);
+                if (p_CGContextRelease) p_CGContextRelease(ctx);
+                rendered = 1;
             }
             if (p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_gray);
         }
 
-        /* 2. RGBA fallback with complete subpixel luminance max extraction */
+        /* 2. RGBA fallback */
         if (!rendered && cs_rgb && mask) {
             size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
             uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
@@ -1159,7 +1187,7 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                     if (p_CGContextRelease) p_CGContextRelease(ctx);
 
                     for (int py = 0; py < th; py++) {
-                        const unsigned char *src_row = (const unsigned char *)(rgba_buf + (size_t)(th - 1 - py) * (size_t)tw);
+                        const unsigned char *src_row = (const unsigned char *)(rgba_buf + (size_t)py * (size_t)tw);
                         unsigned char *dst_row = mask + (size_t)py * (size_t)tw;
                         for (int px = 0; px < tw; px++) {
                             const unsigned char *p = src_row + (px * 4);
@@ -1216,11 +1244,14 @@ static inline uint32_t zan_ios_blend_pixel(uint32_t dst, uint32_t color, unsigne
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+extern uint32_t *zan_gui_internal_surface_data(int64_t id, int *w, int *h, int *stride);
+extern void zan_gui_internal_surface_clip(int64_t id, int *x0, int *y0, int *x1, int *y1);
+
 int zan_ios_draw_text(i32 surface_id, i32 x, i32 y, const char *utf8, i32 color, i32 font_size, i32 angle) {
     (void)angle;
-    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 0;
-    zan_surface_t *s = g_surfaces[surface_id];
-    if (!s || !utf8 || !*utf8) return 1;
+    int sw = 0, sh = 0, stride = 0;
+    uint32_t *pixels = zan_gui_internal_surface_data((int64_t)surface_id, &sw, &sh, &stride);
+    if (!pixels || !utf8 || !*utf8) return 1;
 
     zan_ios_text_entry_t *e = zan_ios_text_lookup(utf8, (int)font_size, true);
     if (!e || !e->mask) return 0;
@@ -1228,16 +1259,13 @@ int zan_ios_draw_text(i32 surface_id, i32 x, i32 y, const char *utf8, i32 color,
     int tw = e->tw, th = e->th;
     const unsigned char *mask = e->mask;
 
-    int cx0 = 0, cy0 = 0, cx1 = s->width, cy1 = s->height;
-    if (s->clip_x0 > cx0) cx0 = s->clip_x0;
-    if (s->clip_y0 > cy0) cy0 = s->clip_y0;
-    if (s->clip_x1 < cx1) cx1 = s->clip_x1;
-    if (s->clip_y1 < cy1) cy1 = s->clip_y1;
+    int cx0 = 0, cy0 = 0, cx1 = sw, cy1 = sh;
+    zan_gui_internal_surface_clip((int64_t)surface_id, &cx0, &cy0, &cx1, &cy1);
 
     for (int py = 0; py < th; py++) {
         int dy = (int)y + py - 1;
         if (dy < cy0 || dy >= cy1) continue;
-        uint32_t *dst_row = s->pixels + (size_t)dy * s->stride;
+        uint32_t *dst_row = pixels + (size_t)dy * stride;
         const unsigned char *mask_row = mask + (size_t)py * tw;
         for (int px = 0; px < tw; px++) {
             int dx = (int)x + px - 1;
@@ -1310,24 +1338,21 @@ EXPORT void zan_gui_present_full(void) {}
 
 EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     (void)hwnd_val;
-    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) {
+    int sw = 0, sh = 0, stride = 0;
+    uint32_t *pixels = zan_gui_internal_surface_data((int64_t)surface_id, &sw, &sh, &stride);
+    if (!pixels || sw <= 0 || sh <= 0 || stride < sw) {
         return 1;
     }
-    zan_surface_t *s = g_surfaces[surface_id];
-    g_last_surface = surface_id;
 
     if (!p_CGColorSpaceCreateDeviceRGB || !p_CGDataProviderCreateWithData || !p_CGImageCreate) {
         return 0;
-    }
-    if (s->width <= 0 || s->height <= 0 || s->stride < s->width || !s->pixels) {
-        return 1;
     }
 
     CGColorSpaceRef cs = p_CGColorSpaceCreateDeviceRGB();
     if (!cs) return 1;
 
-    size_t bytes_per_row = (size_t)s->stride * sizeof(uint32_t);
-    size_t total_bytes = bytes_per_row * (size_t)s->height;
+    size_t bytes_per_row = (size_t)stride * sizeof(uint32_t);
+    size_t total_bytes = bytes_per_row * (size_t)sh;
 
     /* Zero-copy 32-bit Little-Endian presentation:
      * In Apple CoreGraphics:
@@ -1336,7 +1361,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
      * Zero CPU memory copying, zero byte-swapping latency.
      */
     CGDataProviderRef provider = p_CGDataProviderCreateWithData(
-        NULL, s->pixels, total_bytes, NULL);
+        NULL, pixels, total_bytes, NULL);
     if (!provider) {
         p_CGColorSpaceRelease(cs);
         return 1;
@@ -1344,7 +1369,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
 
     uint32_t bitmap_info = (2 << 12) | 6; /* kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst */
     CGImageRef img = p_CGImageCreate(
-        (size_t)s->width, (size_t)s->height,
+        (size_t)sw, (size_t)sh,
         8, 32, bytes_per_row,
         cs, bitmap_info, provider,
         NULL, false, 0
@@ -1352,7 +1377,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!img) {
         bitmap_info = (2 << 12) | 2; /* kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst */
         img = p_CGImageCreate(
-            (size_t)s->width, (size_t)s->height,
+            (size_t)sw, (size_t)sh,
             8, 32, bytes_per_row,
             cs, bitmap_info, provider,
             NULL, false, 0
@@ -1368,7 +1393,6 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         }
         p_CGImageRelease(img);
     }
-
     p_CGDataProviderRelease(provider);
     p_CGColorSpaceRelease(cs);
     return 0;
