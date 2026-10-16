@@ -50,4 +50,136 @@ partial class DataTable {
 
     // ---------- 内置 provider ----------
 
+    static DetailProvider MakeChildGrid(DataSource childSrc, int masterKeyCol, int childKeyCol,
+                                        List<DataColumn> childCols, int maxSlots) {
+        return new ChildGridDetailProvider(childSrc, masterKeyCol, childKeyCol, childCols, maxSlots);
+    }
+
+    static DetailProvider MakeCard(List<string> labels, List<int> cols, int slots) {
+        return new CardDetailProvider(labels, cols, slots);
+    }
+}
+
+// 嵌套子表格详情提供器（DevExpress GridControl 嵌套子网格等位）
+class ChildGridDetailProvider : DetailProvider {
+    DataSource childSrc;
+    int masterKeyCol;
+    int childKeyCol;
+    List<DataColumn> childCols;
+    int maxSlots;
+
+    ChildGridDetailProvider(DataSource childSrc, int masterKeyCol, int childKeyCol,
+                            List<DataColumn> childCols, int maxSlots) {
+        this.childSrc = childSrc;
+        this.masterKeyCol = masterKeyCol;
+        this.childKeyCol = childKeyCol;
+        this.childCols = childCols;
+        this.maxSlots = maxSlots > 0 ? maxSlots : 8;
+    }
+
+    override bool CanExpand(DataSource src, int row) {
+        if (this.childSrc == null) { return false; }
+        List<int> idx = new List<int>();
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol, src.CellText(row, this.masterKeyCol), idx);
+        return idx.Count > 0;
+    }
+
+    override int Slots(DataSource src, int row) {
+        return DataTable.ChildGridSlots(this.childSrc, this.childKeyCol,
+                                        src.CellText(row, this.masterKeyCol), this.maxSlots);
+    }
+
+    override void Paint(App app, DataSource src, int row,
+                       int x, int y, int w, int h) {
+        if (this.childSrc == null || this.childCols == null) { return; }
+        List<int> subRows = new List<int>();
+        DataTable.ChildRowsOf(this.childSrc, this.childKeyCol, src.CellText(row, this.masterKeyCol), subRows);
+        if (subRows.Count == 0) { return; }
+
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        int fs = Style.FontFallback(app, "small");
+        int subRowH = app.Scale(24);
+        int pad = app.Scale(8);
+
+        // 缩进子表格内边距
+        int subX = x + app.Scale(24);
+        int subW = w - app.Scale(36);
+        int curY = y + app.Scale(4);
+
+        // 1. 绘制子表表头
+        StyleBox sHdr = Style.Part(app, "datatable", "header", "", "", "", Style.SNormal());
+        c.FillRect(subX, curY, subW, subRowH, sHdr.BgOr(0xF0F2F5));
+        c.FillRect(subX, curY + subRowH - 1, subW, 1, 0xD0D7DE);
+
+        int colX = subX;
+        for (int ci = 0; ci < this.childCols.Count; ci = ci + 1) {
+            DataColumn dc = this.childCols[ci];
+            int cw = dc.width > 0 ? dc.width : app.Scale(100);
+            c.DrawText(colX + pad, Canvas.CenterTextY(curY, subRowH, fs), dc.title, sHdr.FgOr(0x333333), fs);
+            colX = colX + cw;
+        }
+        curY = curY + subRowH;
+
+        // 2. 绘制子表数据行
+        for (int ri = 0; ri < subRows.Count && curY + subRowH <= y + h; ri = ri + 1) {
+            int subRowIdx = subRows[ri];
+            int rowBg = (ri % 2 == 1) ? 0xF9FAFB : 0xFFFFFF;
+            c.FillRect(subX, curY, subW, subRowH, rowBg);
+            c.FillRect(subX, curY + subRowH - 1, subW, 1, 0xEEEEEE);
+
+            int cx = subX;
+            for (int ci = 0; ci < this.childCols.Count; ci = ci + 1) {
+                DataColumn dc = this.childCols[ci];
+                int cw = dc.width > 0 ? dc.width : app.Scale(100);
+                string cellTxt = this.childSrc.CellText(subRowIdx, ci);
+                c.DrawText(cx + pad, Canvas.CenterTextY(curY, subRowH, fs), cellTxt, 0x24292F, fs);
+                cx = cx + cw;
+            }
+            curY = curY + subRowH;
+        }
+    }
+}
+
+// 键值卡片详情提供器（适合单行详细属性与备注信息的 DevExpress Form/Card 样式）
+class CardDetailProvider : DetailProvider {
+    List<string> labels;
+    List<int> cols;
+    int slotCount;
+
+    CardDetailProvider(List<string> labels, List<int> cols, int slots) {
+        this.labels = labels != null ? labels : new List<string>();
+        this.cols = cols != null ? cols : new List<int>();
+        this.slotCount = slots > 0 ? slots : 3;
+    }
+
+    override int Slots(DataSource src, int row) {
+        return this.slotCount;
+    }
+
+    override void Paint(App app, DataSource src, int row,
+                       int x, int y, int w, int h) {
+        Canvas c = app.canvas;
+        int fs = Style.FontFallback(app, "small");
+        int pad = app.Scale(12);
+
+        int cardX = x + app.Scale(24);
+        int cardY = y + app.Scale(6);
+        int cardW = w - app.Scale(36);
+        int cardH = h - app.Scale(12);
+
+        // 卡片底板
+        c.FillRoundRect(cardX, cardY, cardW, cardH, app.Scale(4), 0xFFFFFF);
+        c.DrawRoundRect(cardX, cardY, cardW, cardH, app.Scale(4), 1, 0xE1E4E8);
+
+        int itemH = app.Scale(20);
+        int cy = cardY + pad;
+        for (int i = 0; i < this.labels.Count && i < this.cols.Count && cy + itemH <= cardY + cardH; i = i + 1) {
+            string lb = this.labels[i] + ":";
+            string val = src.CellText(row, this.cols[i]);
+            c.DrawText(cardX + pad, cy, lb, 0x6E7781, fs);
+            c.DrawText(cardX + pad + app.Scale(90), cy, val, 0x24292F, fs);
+            cy = cy + itemH;
+        }
+    }
 }
