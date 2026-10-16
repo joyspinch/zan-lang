@@ -73,7 +73,13 @@ class DataTableXlsx {
     static bool ExportXlsxSnapshot(DataTableExportSnapshot snap, List<DataColumn> cols,
                                    DataSource src, string path,
                                    DataTableExportProgress progress) {
-        int total = snap.rows.Count + 1;
+        int maxBandDepth = 0;
+        for (int cc = snap.c0; cc <= snap.c1 && cc < cols.Count; cc = cc + 1) {
+            int d = DataTable.BandDepth(cols[cc].band);
+            if (d > maxBandDepth) { maxBandDepth = d; }
+        }
+        int headerRows = maxBandDepth > 0 ? maxBandDepth + 1 : 1;
+        int total = snap.rows.Count + headerRows;
         if (progress != null) { progress.OnStart(total); }
         XlsxBook book = XlsxBook.New();
         XlsxSheet sheet = book.AddSheet("Sheet1");
@@ -85,7 +91,50 @@ class DataTableXlsx {
             checkC = checkC + 1;
         }
         sheet.freezeCols = pinnedLeft;
+        sheet.freezeRows = headerRows;
         sheet.freezeHeader = true;
+
+        // 多级复合表头（Banded Headers）OpenXML 单元格合并：
+        if (headerRows > 1) {
+            int bandLevels = headerRows - 1;
+            // 1. 横向合并：同级共享前缀的连续列
+            for (int blv = 0; blv < bandLevels; blv = blv + 1) {
+                int row1 = blv + 1;
+                int cc = snap.c0;
+                while (cc <= snap.c1 && cc < cols.Count) {
+                    string p = DataTable.BandPrefix(cols[cc].band, blv + 1);
+                    if (p == "" || DataTable.BandDepth(p) <= blv) {
+                        cc = cc + 1;
+                        continue;
+                    }
+                    int ccNext = cc + 1;
+                    while (ccNext <= snap.c1 && ccNext < cols.Count
+                           && DataTable.BandPrefix(cols[ccNext].band, blv + 1) == p) {
+                        ccNext = ccNext + 1;
+                    }
+                    if (ccNext - 1 > cc) {
+                        int cStart0 = cc - snap.c0;
+                        int cEnd0 = (ccNext - 1) - snap.c0;
+                        string mref = Xlsx.ColRef(cStart0) + Convert.ToString(row1)
+                                    + ":" + Xlsx.ColRef(cEnd0) + Convert.ToString(row1);
+                        sheet.AddMerge(mref);
+                    }
+                    cc = ccNext;
+                }
+            }
+            // 2. 纵向合并：深度不足的列向下补齐延伸
+            for (int cc = snap.c0; cc <= snap.c1 && cc < cols.Count; cc = cc + 1) {
+                int d = DataTable.BandDepth(cols[cc].band);
+                int startRow1 = (d == 0) ? 1 : (d + 1);
+                int endRow1 = headerRows;
+                if (endRow1 > startRow1) {
+                    int col0 = cc - snap.c0;
+                    string mref = Xlsx.ColRef(col0) + Convert.ToString(startRow1)
+                                + ":" + Xlsx.ColRef(col0) + Convert.ToString(endRow1);
+                    sheet.AddMerge(mref);
+                }
+            }
+        }
 
         // 自动计算并同步单元格合并区间（CellSpan -> OpenXML mergeCells）：
         if (snap.spanProvider != null) {
@@ -94,7 +143,7 @@ class DataTableXlsx {
                 for (int cc = snap.c0; cc <= snap.c1 && cc < cols.Count; cc = cc + 1) {
                     CellSpan sp = snap.spanProvider.GetSpan(src, srcRow, cc);
                     if (sp != null && sp.IsMaster()) {
-                        int startRow1 = ri + 2;
+                        int startRow1 = ri + headerRows + 1;
                         int endRow1 = startRow1 + sp.rowSpan - 1;
                         int startCol0 = cc - snap.c0;
                         int endCol0 = startCol0 + sp.colSpan - 1;
@@ -111,6 +160,7 @@ class DataTableXlsx {
         rs.cols = cols;
         rs.snap = snap;
         rs.progress = progress;
+        rs.headerRows = headerRows;
         bool ok = book.SaveStreaming(path, new List<XlsxRowSource>{ rs });
         if (progress != null) {
             if (ok) {
