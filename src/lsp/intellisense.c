@@ -1602,7 +1602,8 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
             if (sym->parent[0] == '\0') continue;
             if (strcmp(sym->parent, simple) != 0) continue;
             if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER &&
+                sym->kind != ISYM_EVENT)
                 continue;
             if (!member_visible(is, sym->visibility, sym->parent, from_class))
                 continue;
@@ -1636,7 +1637,8 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
                 if (sym->parent[0] == '\0') continue;
                 if (strcmp(sym->parent, simple) != 0) continue;
                 if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
-                    sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                    sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER &&
+                    sym->kind != ISYM_EVENT)
                     continue;
                 if (!member_visible(project, sym->visibility, sym->parent, from_class))
                     continue;
