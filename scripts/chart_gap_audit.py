@@ -62,8 +62,10 @@ def config_keys(obj, path=()):
 
 def load_engine():
     src = {}
-    for p in sorted(glob.glob(os.path.join(ENGINE, '*.zan'))):
-        src[os.path.basename(p)] = open(p, encoding='utf-8', errors='replace').read()
+    pattern = os.path.join(ENGINE, '**', '*.zan')
+    for p in sorted(glob.glob(pattern, recursive=True)):
+        rel = os.path.relpath(p, ENGINE).replace('\\', '/')
+        src[rel] = open(p, encoding='utf-8', errors='replace').read()
     return src
 
 
