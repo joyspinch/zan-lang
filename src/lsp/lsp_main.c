@@ -695,8 +695,17 @@ static void method_call_context(const char *text, size_t offset,
         if (cn >= class_cap) cn = class_cap - 1;
         memcpy(class_out, text + cls_start, cn);
         class_out[cn] = '\0';
-    } else if (recv_chain_out && recv_chain_cap > 0) {
-        recv_chain_out[0] = '\0';
+    } else {
+        if (recv_chain_out && recv_chain_cap > 0) {
+            recv_chain_out[0] = '\0';
+        }
+        size_t kw = end;
+        while (kw > 0 && (text[kw - 1] == ' ' || text[kw - 1] == '\t')) kw--;
+        if (kw >= 3 && strncmp(text + kw - 3, "new", 3) == 0 &&
+            (kw == 3 || !is_ident_char(text[kw - 4]))) {
+            strncpy(class_out, method_out, class_cap - 1);
+            class_out[class_cap - 1] = '\0';
+        }
     }
 }
 
@@ -2468,11 +2477,12 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
 
-    signature_info_t sig = intel_signature_help_pos_ex(is, g_project_intel, method_name,
+    signature_info_t sig_list[32];
+    int sig_count = intel_signature_help_list_ex(is, g_project_intel, method_name,
                                                  class_context[0] ? class_context : NULL,
-                                                 line, character);
+                                                 line, character, sig_list, 32);
 
-    if (!sig.valid && recv_chain[0]) {
+    if (sig_count == 0 && recv_chain[0]) {
         char fm[64];
         const char *rt = intel_resolve_chain_pos(is, g_project_intel, recv_chain,
                                                  fm, sizeof(fm), line, character);
@@ -2481,44 +2491,55 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
                                          fm, sizeof(fm), line, character);
         }
         if (rt && rt[0])
-            sig = intel_signature_help_pos_ex(is, g_project_intel, method_name,
-                                              rt, line, character);
+            sig_count = intel_signature_help_list_ex(is, g_project_intel, method_name,
+                                                     rt, line, character, sig_list, 32);
     }
 
-    if (!sig.valid) { send_response(s, id, json_new_null()); return; }
+    if (sig_count == 0) { send_response(s, id, json_new_null()); return; }
+
+    int active_sig = 0;
+    for (int i = 0; i < sig_count; i++) {
+        if (sig_list[i].param_count > active_param) {
+            active_sig = i;
+            break;
+        }
+    }
 
     json_value *result = json_new_obj();
-
     json_value *sigs = json_new_arr();
-    json_value *sig_obj = json_new_obj();
-    json_obj_set(sig_obj, "label", json_new_str(sig.label));
-    if (sig.doc[0]) {
-        json_value *doc_obj = json_new_obj();
-        json_obj_set(doc_obj, "kind", json_new_str("markdown"));
-        json_obj_set(doc_obj, "value", json_new_str(sig.doc));
-        json_obj_set(sig_obj, "documentation", doc_obj);
-    }
 
-    /* parameters */
-    json_value *param_arr = json_new_arr();
-    for (int i = 0; i < sig.param_count; i++) {
-        json_value *p = json_new_obj();
-        char param_label[128];
-        if (sig.params[i].type[0])
-            snprintf(param_label, sizeof(param_label), "%s %s",
-                    sig.params[i].type, sig.params[i].label);
-        else
-            strncpy(param_label, sig.params[i].label, sizeof(param_label) - 1);
-        json_obj_set(p, "label", json_new_str(param_label));
-        if (sig.params[i].doc[0])
-            json_obj_set(p, "documentation", json_new_str(sig.params[i].doc));
-        json_arr_add(param_arr, p);
+    for (int s_idx = 0; s_idx < sig_count; s_idx++) {
+        signature_info_t *sig = &sig_list[s_idx];
+        json_value *sig_obj = json_new_obj();
+        json_obj_set(sig_obj, "label", json_new_str(sig->label));
+        if (sig->doc[0]) {
+            json_value *doc_obj = json_new_obj();
+            json_obj_set(doc_obj, "kind", json_new_str("markdown"));
+            json_obj_set(doc_obj, "value", json_new_str(sig->doc));
+            json_obj_set(sig_obj, "documentation", doc_obj);
+        }
+
+        /* parameters */
+        json_value *param_arr = json_new_arr();
+        for (int i = 0; i < sig->param_count; i++) {
+            json_value *p = json_new_obj();
+            char param_label[128];
+            if (sig->params[i].type[0])
+                snprintf(param_label, sizeof(param_label), "%s %s",
+                        sig->params[i].type, sig->params[i].label);
+            else
+                strncpy(param_label, sig->params[i].label, sizeof(param_label) - 1);
+            json_obj_set(p, "label", json_new_str(param_label));
+            if (sig->params[i].doc[0])
+                json_obj_set(p, "documentation", json_new_str(sig->params[i].doc));
+            json_arr_add(param_arr, p);
+        }
+        json_obj_set(sig_obj, "parameters", param_arr);
+        json_arr_add(sigs, sig_obj);
     }
-    json_obj_set(sig_obj, "parameters", param_arr);
-    json_arr_add(sigs, sig_obj);
 
     json_obj_set(result, "signatures", sigs);
-    json_obj_set(result, "activeSignature", json_new_num(0));
+    json_obj_set(result, "activeSignature", json_new_num(active_sig));
     json_obj_set(result, "activeParameter", json_new_num(active_param));
 
     send_response(s, id, result);

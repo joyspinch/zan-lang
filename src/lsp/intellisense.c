@@ -2208,11 +2208,14 @@ static void sig_param_list(param_info_t *params, int *count, int max,
 static void substitute_generics(const char *parent_type, const char *declaration,
                                  const char *raw_ret, char *out, size_t cap);
 
-signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
-                                             const char *method_name, const char *class_context,
-                                             int line, int col) {
-    signature_info_t sig = {0};
-    if (!is || !method_name || !method_name[0]) return sig;
+int intel_signature_help_list_ex(intellisense_t *is, intellisense_t *project,
+                                const char *method_name, const char *class_context,
+                                int line, int col,
+                                signature_info_t *out_sigs, int max_sigs) {
+    if (!out_sigs || max_sigs <= 0) return 0;
+    if (!is || !method_name || !method_name[0]) return 0;
+
+    int count = 0;
     const char *from_class = intel_enclosing_type_at(is, line, col);
     char receiver[128] = "";
     if (!class_context || !class_context[0] || strcmp(class_context, "this") == 0 ||
@@ -2240,97 +2243,146 @@ signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t 
             if (known) snprintf(receiver, sizeof(receiver), "%s", class_context);
         }
     }
-    if (!receiver[0] || intel_array_suffix(receiver)) return sig;
 
-    for (int depth = 0; receiver[0] && depth < 16; depth++) {
-        const zan_builtin_type_t *bt = builtin_receiver(receiver);
-        if (bt) {
-            for (int i = 0; i < bt->member_count; i++) {
-                const zan_builtin_member_t *m = &bt->members[i];
-                if (m->kind != 'M' || strcmp(m->name, method_name) != 0) continue;
-                substitute_generics(receiver, bt->display, m->sig, sig.label, sizeof(sig.label));
-                snprintf(sig.doc, sizeof(sig.doc), "%s.%s", bt->name_public, m->name);
-                sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
-                sig.valid = true;
-                return sig;
+    if (receiver[0] && !intel_array_suffix(receiver)) {
+        for (int depth = 0; receiver[0] && depth < 16 && count < max_sigs; depth++) {
+            const zan_builtin_type_t *bt = builtin_receiver(receiver);
+            if (bt) {
+                for (int i = 0; i < bt->member_count && count < max_sigs; i++) {
+                    const zan_builtin_member_t *m = &bt->members[i];
+                    if (m->kind != 'M' || strcmp(m->name, method_name) != 0) continue;
+                    signature_info_t *sig = &out_sigs[count];
+                    memset(sig, 0, sizeof(*sig));
+                    substitute_generics(receiver, bt->display, m->sig, sig->label, sizeof(sig->label));
+                    snprintf(sig->doc, sizeof(sig->doc), "%s.%s", bt->name_public, m->name);
+                    sig_param_list(sig->params, &sig->param_count, INTEL_MAX_PARAMS, sig->label);
+                    sig->valid = true;
+                    count++;
+                }
+                if (count > 0) return count;
             }
-        }
-        const isym_t *declaration = NULL;
-        intellisense_t *indices[] = {is, project};
-        for (int k = 0; !declaration && k < 2; k++) {
-            if (!indices[k]) continue;
-            for (int i = 0; i < indices[k]->symbol_count; i++) {
-                const isym_t *s = &indices[k]->symbols[i];
-                if ((s->kind == ISYM_CLASS || s->kind == ISYM_STRUCT || s->kind == ISYM_INTERFACE) &&
-                    intel_type_owner_is(receiver, s->name)) { declaration = s; break; }
+            const isym_t *declaration = NULL;
+            intellisense_t *indices[] = {is, project};
+            for (int k = 0; !declaration && k < 2; k++) {
+                if (!indices[k]) continue;
+                for (int i = 0; i < indices[k]->symbol_count; i++) {
+                    const isym_t *s = &indices[k]->symbols[i];
+                    if ((s->kind == ISYM_CLASS || s->kind == ISYM_STRUCT || s->kind == ISYM_INTERFACE) &&
+                        intel_type_owner_is(receiver, s->name)) { declaration = s; break; }
+                }
             }
-        }
-        for (int k = 0; k < 2; k++) {
-            if (!indices[k]) continue;
-            for (int i = 0; i < indices[k]->symbol_count; i++) {
-                const isym_t *s = &indices[k]->symbols[i];
-                if ((s->kind != ISYM_METHOD && s->kind != ISYM_CONSTRUCTOR) || strcmp(s->name, method_name) != 0 ||
-                    !intel_type_owner_is(receiver, s->parent) ||
-                    !member_visible(indices[k], s->visibility, s->parent, from_class)) continue;
-                substitute_generics(receiver, declaration ? declaration->signature : NULL,
-                                    s->signature, sig.label, sizeof(sig.label));
-                snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
-                sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
-                sig.valid = true;
-                return sig;
+            for (int k = 0; k < 2 && count < max_sigs; k++) {
+                if (!indices[k]) continue;
+                for (int i = 0; i < indices[k]->symbol_count && count < max_sigs; i++) {
+                    const isym_t *s = &indices[k]->symbols[i];
+                    if ((s->kind != ISYM_METHOD && s->kind != ISYM_CONSTRUCTOR) || strcmp(s->name, method_name) != 0 ||
+                        !intel_type_owner_is(receiver, s->parent) ||
+                        !member_visible(indices[k], s->visibility, s->parent, from_class)) continue;
+
+                    bool dup = false;
+                    for (int j = 0; j < count; j++) {
+                        if (strcmp(out_sigs[j].label, s->signature) == 0) { dup = true; break; }
+                    }
+                    if (dup) continue;
+
+                    signature_info_t *sig = &out_sigs[count];
+                    memset(sig, 0, sizeof(*sig));
+                    substitute_generics(receiver, declaration ? declaration->signature : NULL,
+                                        s->signature, sig->label, sizeof(sig->label));
+                    snprintf(sig->doc, sizeof(sig->doc), "%s", s->doc);
+                    sig_param_list(sig->params, &sig->param_count, INTEL_MAX_PARAMS, sig->label);
+                    sig->valid = true;
+                    count++;
+                }
             }
+            if (count > 0) return count;
+
+            const char *next_base = declaration ? declaration->type_name : NULL;
+            if (!next_base || !next_base[0]) {
+                next_base = class_base(is, receiver);
+                if (!next_base && project) next_base = class_base(project, receiver);
+            }
+            if (!next_base || !next_base[0]) break;
+            char base[128];
+            substitute_generics(receiver, declaration ? declaration->signature : NULL, next_base, base, sizeof(base));
+            snprintf(receiver, sizeof(receiver), "%s", base);
         }
-        const char *next_base = declaration ? declaration->type_name : NULL;
-        if (!next_base || !next_base[0]) {
-            next_base = class_base(is, receiver);
-            if (!next_base && project) next_base = class_base(project, receiver);
-        }
-        if (!next_base || !next_base[0]) break;
-        char base[128];
-        substitute_generics(receiver, declaration ? declaration->signature : NULL, next_base, base, sizeof(base));
-        snprintf(receiver, sizeof(receiver), "%s", base);
     }
-    if (!sig.valid) {
+
+    if (count == 0) {
         intellisense_t *indices[] = {is, project};
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < 2 && count < max_sigs; k++) {
             if (!indices[k]) continue;
-            for (int i = 0; i < indices[k]->symbol_count; i++) {
+            for (int i = 0; i < indices[k]->symbol_count && count < max_sigs; i++) {
                 const isym_t *s = &indices[k]->symbols[i];
                 if (s->kind == ISYM_CONSTRUCTOR && strcmp(s->name, method_name) == 0) {
-                    snprintf(sig.label, sizeof(sig.label), "%s", s->signature);
-                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
-                    sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
-                    sig.valid = true;
-                    return sig;
+                    bool dup = false;
+                    for (int j = 0; j < count; j++) {
+                        if (strcmp(out_sigs[j].label, s->signature) == 0) { dup = true; break; }
+                    }
+                    if (dup) continue;
+
+                    signature_info_t *sig = &out_sigs[count];
+                    memset(sig, 0, sizeof(*sig));
+                    snprintf(sig->label, sizeof(sig->label), "%s", s->signature);
+                    snprintf(sig->doc, sizeof(sig->doc), "%s", s->doc);
+                    sig_param_list(sig->params, &sig->param_count, INTEL_MAX_PARAMS, sig->label);
+                    sig->valid = true;
+                    count++;
                 }
             }
         }
-        for (int k = 0; k < 2; k++) {
+        if (count > 0) return count;
+
+        for (int k = 0; k < 2 && count < max_sigs; k++) {
             if (!indices[k]) continue;
-            for (int i = 0; i < indices[k]->symbol_count; i++) {
+            for (int i = 0; i < indices[k]->symbol_count && count < max_sigs; i++) {
                 const isym_t *s = &indices[k]->symbols[i];
                 if ((s->kind == ISYM_CLASS || s->kind == ISYM_STRUCT) && strcmp(s->name, method_name) == 0) {
-                    snprintf(sig.label, sizeof(sig.label), "%s()", s->name);
-                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
-                    sig.param_count = 0;
-                    sig.valid = true;
-                    return sig;
+                    signature_info_t *sig = &out_sigs[count];
+                    memset(sig, 0, sizeof(*sig));
+                    snprintf(sig->label, sizeof(sig->label), "%s()", s->name);
+                    snprintf(sig->doc, sizeof(sig->doc), "%s", s->doc);
+                    sig->param_count = 0;
+                    sig->valid = true;
+                    count++;
+                    return count;
                 }
             }
         }
-        for (int k = 0; k < 2; k++) {
+
+        for (int k = 0; k < 2 && count < max_sigs; k++) {
             if (!indices[k]) continue;
-            for (int i = 0; i < indices[k]->symbol_count; i++) {
+            for (int i = 0; i < indices[k]->symbol_count && count < max_sigs; i++) {
                 const isym_t *s = &indices[k]->symbols[i];
                 if (s->kind == ISYM_METHOD && strcmp(s->name, method_name) == 0) {
-                    snprintf(sig.label, sizeof(sig.label), "%s", s->signature);
-                    snprintf(sig.doc, sizeof(sig.doc), "%s", s->doc);
-                    sig_param_list(sig.params, &sig.param_count, INTEL_MAX_PARAMS, sig.label);
-                    sig.valid = true;
-                    return sig;
+                    bool dup = false;
+                    for (int j = 0; j < count; j++) {
+                        if (strcmp(out_sigs[j].label, s->signature) == 0) { dup = true; break; }
+                    }
+                    if (dup) continue;
+
+                    signature_info_t *sig = &out_sigs[count];
+                    memset(sig, 0, sizeof(*sig));
+                    snprintf(sig->label, sizeof(sig->label), "%s", s->signature);
+                    snprintf(sig->doc, sizeof(sig->doc), "%s", s->doc);
+                    sig_param_list(sig->params, &sig->param_count, INTEL_MAX_PARAMS, sig->label);
+                    sig->valid = true;
+                    count++;
                 }
             }
         }
+    }
+    return count;
+}
+
+signature_info_t intel_signature_help_pos_ex(intellisense_t *is, intellisense_t *project,
+                                             const char *method_name, const char *class_context,
+                                             int line, int col) {
+    signature_info_t sig = {0};
+    signature_info_t sigs[1];
+    if (intel_signature_help_list_ex(is, project, method_name, class_context, line, col, sigs, 1) > 0) {
+        return sigs[0];
     }
     return sig;
 }
