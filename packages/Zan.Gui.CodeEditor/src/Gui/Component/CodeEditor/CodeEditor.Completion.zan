@@ -277,8 +277,9 @@ partial class CodeEditor {
     }
 
     // 显式打开补全（Ctrl+Space），列出作用域内所有内容，
-    // 即使尚未输入前缀。
+    // 即使尚未输入前缀。若处于字符串或注释内则绝对不打开。
     void ForceCompletion() {
+        if (InStringOrCommentContext()) { return; }
         acDot = false;
         acActive = true;
         acForced = true;
@@ -395,7 +396,7 @@ partial class CodeEditor {
             CeCandidateItem candidate = new CeCandidateItem(item.label, kind);
             candidate.semantic = item;
             acAllCandidates.Add(candidate);
-            scores.Add(score + 500);
+            scores.Add(score + 1000);
         }
         return true;
     }
@@ -429,7 +430,10 @@ partial class CodeEditor {
             List<int> dscores = new List<int>();
             Dict<string, bool> taken = new Dict<string, bool>();
 
-            // 1. 优先填充精确类型的原生/已知成员（如 Convert.ToString, MainStatusBar.SetText 等）
+            // 1. 优先补充外部 LSP 语义补全项（精确、带类型推导与参数详情）
+            if (!ScoreExternalCompletion(prefix, taken, dscores)) { acActive = false; return; }
+
+            // 2. 用本地已知的原生成员作为补充与兜底，去重合并
             for (int fi = 0; fi < acFull.Count; fi = fi + 1) {
                 string mName = acFull[fi];
                 if (taken.ContainsKey(mName)) { continue; }
@@ -437,12 +441,9 @@ partial class CodeEditor {
                 if (sc >= 0) {
                     taken[mName] = true;
                     acAllCandidates.Add(new CeCandidateItem(mName, CodeEditor.MemberKind(mName)));
-                    dscores.Add(sc + 1000); // 精确类型已知成员获得最高权重置顶
+                    dscores.Add(sc + 500); // 兜底候选项
                 }
             }
-
-            // 2. 补充外部 LSP 语义补全项，去重合并
-            if (!ScoreExternalCompletion(prefix, taken, dscores)) { acActive = false; return; }
 
             if (acAllCandidates.Count == 0) { acActive = false; acDot = false; return; }
             CodeEditor.SortCandidatesByScore(acAllCandidates, dscores);
@@ -484,7 +485,7 @@ partial class CodeEditor {
         if (acAllCandidates.Count == 0) { acActive = false; return; }
         // 排序后保留最优的少数：按收集顺序截断会
         // 在明显候选项扫描较晚时将其丢弃。
-        CodeEditor.SortCandidatesByScoreTop(acAllCandidates, scores, 60);
+        CodeEditor.SortCandidatesByScoreTop(acAllCandidates, scores, 80);
         acSel = 0;
         ApplyKindFilter();
     }
@@ -2262,10 +2263,39 @@ partial class CodeEditor {
         int n = ln.Length;
         int limit = curCol;
         if (limit > n) { limit = n; }
+
+        // 检查前序多行块注释（未闭合的 /*）
+        int pLine = curLine - 1;
+        int checkStart = pLine - 25;
+        if (checkStart < 0) { checkStart = 0; }
+        bool priorBlockComment = false;
+        for (int pl = checkStart; pl <= pLine; pl = pl + 1) {
+            string pln = lines[pl];
+            int pn = pln.Length;
+            int pi = 0;
+            while (pi < pn) {
+                int pb = pln[pi] & 255;
+                if (!priorBlockComment) {
+                    if (pb == 47 && pi + 1 < pn && (pln[pi + 1] & 255) == 42) {
+                        priorBlockComment = true;
+                        pi = pi + 2;
+                        continue;
+                    }
+                } else {
+                    if (pb == 42 && pi + 1 < pn && (pln[pi + 1] & 255) == 47) {
+                        priorBlockComment = false;
+                        pi = pi + 2;
+                        continue;
+                    }
+                }
+                pi = pi + 1;
+            }
+        }
+
         int i = 0;
         bool inStr = false;
         int strQuote = 0;
-        bool inBlockComment = false;
+        bool inBlockComment = priorBlockComment;
         while (i < limit) {
             int b = ln[i] & 255;
             // 检查行注释（Zan // 或 Python # 或 Lua --）

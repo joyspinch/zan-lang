@@ -1518,8 +1518,9 @@ static bool member_visible(const intellisense_t *is, ivis_t vis,
            intel_owner_distance((intellisense_t *)is, from_class, parent) >= 0;
 }
 
-int intel_complete_members_pos(intellisense_t *is, const char *type_name,
-                               const char *prefix, int line, int col) {
+int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
+                                  const char *type_name,
+                                  const char *prefix, int line, int col) {
     is->completion_count = 0;
     is->completion_selected = 0;
 
@@ -1538,10 +1539,23 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
             break;
         }
     }
+    if (!is_known_type && project) {
+        for (int i = 0; i < project->symbol_count; i++) {
+            isym_kind_t k = project->symbols[i].kind;
+            if ((k == ISYM_CLASS || k == ISYM_STRUCT || k == ISYM_INTERFACE ||
+                 k == ISYM_ENUM) && strcmp(project->symbols[i].name, type_name) == 0) {
+                is_known_type = true;
+                break;
+            }
+        }
+    }
     if (!is_known_type && builtin_receiver(type_name)) is_known_type = true;
     if (!is_known_type) {
         const char *rv = (col >= 0) ? intel_resolve_type_pos(is, type_name, line, col)
                                     : intel_resolve_type_at(is, type_name, line);
+        if (!rv && project) {
+            rv = intel_resolve_type_pos(project, type_name, -1, -1);
+        }
         if (rv && rv[0]) type_name = rv;
     }
 
@@ -1610,7 +1624,47 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
             c->kind = sym->kind;
             c->sort_priority = (guard == 0) ? 0 : 1;
         }
-        cls = class_base(is, cls);
+
+        if (project) {
+            for (int i = 0; i < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+                isym_t *sym = &project->symbols[i];
+                if (sym->parent[0] == '\0') continue;
+                if (strcmp(sym->parent, simple) != 0) continue;
+                if (sym->kind != ISYM_METHOD && sym->kind != ISYM_FIELD &&
+                    sym->kind != ISYM_PROPERTY && sym->kind != ISYM_ENUM_MEMBER)
+                    continue;
+                if (!member_visible(project, sym->visibility, sym->parent, from_class))
+                    continue;
+
+                if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
+
+                bool dup = false;
+                for (int k = 0; k < is->completion_count; k++) {
+                    if (strcmp(is->completions[k].label, sym->name) == 0) { dup = true; break; }
+                }
+                if (dup) continue;
+
+                completion_t *c = &is->completions[is->completion_count++];
+                strncpy(c->label, sym->name, sizeof(c->label) - 1);
+                if (sym->kind == ISYM_METHOD)
+                    snprintf(c->insert_text, sizeof(c->insert_text), "%s(", sym->name);
+                else
+                    strncpy(c->insert_text, sym->name, sizeof(c->insert_text) - 1);
+                if (sym->signature[0])
+                    strncpy(c->detail, sym->signature, sizeof(c->detail) - 1);
+                else
+                    snprintf(c->detail, sizeof(c->detail), "%s.%s : %s", cls, sym->name, sym->type_name);
+                strncpy(c->doc, sym->doc, sizeof(c->doc) - 1);
+                c->kind = sym->kind;
+                c->sort_priority = (guard == 0) ? 0 : 1;
+            }
+        }
+
+        const char *next_cls = class_base(is, cls);
+        if (!next_cls && project) {
+            next_cls = class_base(project, cls);
+        }
+        cls = next_cls;
         guard++;
     }
 
@@ -1650,8 +1704,34 @@ int intel_complete_members_pos(intellisense_t *is, const char *type_name,
         }
     }
 
+    if (project) {
+        for (int i = 0; i < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (project->symbols[i].kind == ISYM_ENUM && strcmp(project->symbols[i].name, bare_type) == 0) {
+                for (int j = 0; j < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
+                    if (project->symbols[j].kind == ISYM_ENUM_MEMBER &&
+                        strcmp(project->symbols[j].parent, bare_type) == 0) {
+                        if (plen > 0 && _strnicmp(project->symbols[j].name, prefix, plen) != 0) continue;
+                        if (already_offered(is, project->symbols[j].name)) continue;
+                        completion_t *c = &is->completions[is->completion_count++];
+                        strncpy(c->label, project->symbols[j].name, sizeof(c->label) - 1);
+                        strncpy(c->insert_text, project->symbols[j].name, sizeof(c->insert_text) - 1);
+                        snprintf(c->detail, sizeof(c->detail), "%s.%s", type_name, project->symbols[j].name);
+                        c->kind = ISYM_ENUM_MEMBER;
+                        c->sort_priority = 0;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     is->completion_active = is->completion_count > 0;
     return is->completion_count;
+}
+
+int intel_complete_members_pos(intellisense_t *is, const char *type_name,
+                               const char *prefix, int line, int col) {
+    return intel_complete_members_pos_ex(is, NULL, type_name, prefix, line, col);
 }
 
 int intel_complete_members_at(intellisense_t *is, const char *type_name,
@@ -1699,24 +1779,22 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
     is->completion_count = 0;
     is->completion_selected = 0;
 
-    size_t plen = strlen(prefix);
-    if (plen == 0) {
-        is->completion_active = false;
-        return 0;
-    }
+    size_t plen = prefix ? strlen(prefix) : 0;
 
     if (context_class && context_class[0]) {
         return intel_complete_members_pos(is, context_class, prefix, line, col);
     }
 
-    for (int i = 0; i < is->snippet_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        if (_strnicmp(is->snippets[i].trigger, prefix, plen) != 0) continue;
-        completion_t *c = &is->completions[is->completion_count++];
-        snprintf(c->label, sizeof(c->label), "%s (snippet)", is->snippets[i].trigger);
-        strncpy(c->insert_text, is->snippets[i].body, sizeof(c->insert_text) - 1);
-        strncpy(c->detail, is->snippets[i].description, sizeof(c->detail) - 1);
-        c->kind = ISYM_SNIPPET;
-        c->sort_priority = -1;
+    if (plen > 0) {
+        for (int i = 0; i < is->snippet_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (_strnicmp(is->snippets[i].trigger, prefix, plen) != 0) continue;
+            completion_t *c = &is->completions[is->completion_count++];
+            snprintf(c->label, sizeof(c->label), "%s (snippet)", is->snippets[i].trigger);
+            strncpy(c->insert_text, is->snippets[i].body, sizeof(c->insert_text) - 1);
+            strncpy(c->detail, is->snippets[i].description, sizeof(c->detail) - 1);
+            c->kind = ISYM_SNIPPET;
+            c->sort_priority = -1;
+        }
     }
 
     const char *from_class = (from_class_override && from_class_override[0])
@@ -1724,7 +1802,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
                                  : intel_enclosing_type_at(is, line, col);
     for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
         isym_t *sym = &is->symbols[i];
-        if (_strnicmp(sym->name, prefix, plen) != 0) continue;
+        if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
         int rank = intel_bare_symbol_rank(is, sym, from_class, line, col);
         if (rank < 0 || already_offered(is, sym->name)) continue;
         bool hidden = false;
@@ -1755,7 +1833,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
     }
 
     for (int i = 0; builtin_keywords[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        if (_strnicmp(builtin_keywords[i], prefix, plen) != 0) continue;
+        if (plen > 0 && _strnicmp(builtin_keywords[i], prefix, plen) != 0) continue;
         bool dup = false;
         for (int j = 0; j < is->completion_count; j++) {
             if (strcmp(is->completions[j].insert_text, builtin_keywords[i]) == 0 ||
@@ -1773,7 +1851,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
     }
 
     for (int i = 0; builtin_types[i] && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        if (_strnicmp(builtin_types[i], prefix, plen) != 0) continue;
+        if (plen > 0 && _strnicmp(builtin_types[i], prefix, plen) != 0) continue;
         bool dup = false;
         for (int j = 0; j < is->completion_count; j++) {
             if (strcmp(is->completions[j].label, builtin_types[i]) == 0) { dup = true; break; }
@@ -1792,7 +1870,7 @@ static int intel_complete_pos_ex(intellisense_t *is, const char *prefix,
         const zan_builtin_type_t *all = zan_builtin_types(&btcount);
         for (int i = 0; i < btcount && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
             const char *tname = all[i].name_public;
-            if (_strnicmp(tname, prefix, plen) != 0) continue;
+            if (plen > 0 && _strnicmp(tname, prefix, plen) != 0) continue;
             if (already_offered(is, tname)) continue;
             completion_t *c = &is->completions[is->completion_count++];
             snprintf(c->label, sizeof(c->label), "%s", tname);

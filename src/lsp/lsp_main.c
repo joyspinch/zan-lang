@@ -586,7 +586,12 @@ static void member_context(const char *text, size_t offset, char *out, size_t ca
         else if (chain_expr[i] == '.' && pd == 0) dot_count++;
     }
 
-    if (dot_count > 1) {
+    bool has_complex = (strchr(chain_expr, '(') != NULL) ||
+                       (strchr(chain_expr, '[') != NULL) ||
+                       (chain_expr[0] == '"' || chain_expr[0] == '\'') ||
+                       (chain_expr[0] >= '0' && chain_expr[0] <= '9') ||
+                       (dot_count > 1);
+    if (has_complex) {
         if (strlen(chain_expr) + 7 < cap) {
             snprintf(out, cap, "CHAIN:%s", chain_expr);
             return;
@@ -1361,6 +1366,55 @@ static int complete_var_init_members(const lsp_doc_t *doc, intellisense_t *is,
     return intel_complete_members_pos(is, ct, prefix, line, character);
 }
 
+static bool is_in_string_or_comment(const char *text, size_t offset) {
+    if (!text || offset == 0) return false;
+    bool in_str = false;
+    char str_quote = 0;
+    bool in_line_comment = false;
+    bool in_block_comment = false;
+    for (size_t i = 0; i < offset && text[i]; i++) {
+        char ch = text[i];
+        if (in_line_comment) {
+            if (ch == '\n') in_line_comment = false;
+            continue;
+        }
+        if (in_block_comment) {
+            if (ch == '*' && text[i + 1] == '/') {
+                in_block_comment = false;
+                i++;
+            }
+            continue;
+        }
+        if (in_str) {
+            if (ch == '\\' && text[i + 1]) {
+                i++;
+                continue;
+            }
+            if (ch == str_quote) {
+                in_str = false;
+                str_quote = 0;
+            }
+            continue;
+        }
+        if (ch == '/' && text[i + 1] == '/') {
+            in_line_comment = true;
+            i++;
+            continue;
+        }
+        if (ch == '/' && text[i + 1] == '*') {
+            in_block_comment = true;
+            i++;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            in_str = true;
+            str_quote = ch;
+            continue;
+        }
+    }
+    return in_str || in_line_comment || in_block_comment;
+}
+
 static void handle_completion(lsp_server_t *s, json_value *id, json_value *params) {    const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
         send_response(s, id, json_new_null());
@@ -1370,6 +1424,10 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     if (!doc) { send_response(s, id, json_new_arr()); return; }
 
     size_t off = pos_to_offset(doc->text, line, character);
+    if (is_in_string_or_comment(doc->text, off)) {
+        send_response(s, id, json_new_arr());
+        return;
+    }
     char prefix[128], context[128];
     prefix_before(doc->text, off, prefix, sizeof(prefix));
     member_context(doc->text, off, context, sizeof(context));
@@ -1412,8 +1470,8 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
         }
 
         if (resolve_type[0]) {
-            count = intel_complete_members_pos(is, resolve_type, effective,
-                                               line, character);
+            count = intel_complete_members_pos_ex(is, g_project_intel, resolve_type, effective,
+                                                  line, character);
             if (count == 0 && strncmp(context, "CHAIN:", 6) != 0) {
                 count = complete_var_init_members(doc, is, context, line,
                                                   character, effective);
@@ -1421,6 +1479,9 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
             if (g_project_intel) {
                 const char *local_t = intel_resolve_type_pos(is, resolve_type,
                                                              line, character);
+                if (!local_t && g_project_intel) {
+                    local_t = intel_resolve_type_pos(g_project_intel, resolve_type, -1, -1);
+                }
                 const char *query_t = (local_t && local_t[0]) ? local_t
                                                               : resolve_type;
                 int before = count;
@@ -1446,9 +1507,9 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
                 is->completion_count = count;
             }
         }
-    } else if (!ns_mode && effective[0]) {
+    } else if (!ns_mode) {
         count = intel_complete_pos(is, effective, NULL, line, character);
-        if (g_project_intel && count < 20) {
+        if (g_project_intel && count < INTEL_MAX_COMPLETIONS) {
             const char *encl = intel_enclosing_type_at(is, line, character);
             int proj_count = intel_complete_bare(g_project_intel, effective, encl);
             for (int pi = 0; pi < proj_count && count < INTEL_MAX_COMPLETIONS; pi++) {
@@ -2189,8 +2250,9 @@ static void handle_signature_help(lsp_server_t *s, json_value *id, json_value *p
     intellisense_t *is = doc_intel_for(s, uri);
     if (!is) { send_response(s, id, json_new_null()); return; }
 
-    signature_info_t sig = intel_signature_help(is, method_name,
-                                                 class_context[0] ? class_context : NULL);
+    signature_info_t sig = intel_signature_help_pos_ex(is, g_project_intel, method_name,
+                                                 class_context[0] ? class_context : NULL,
+                                                 line, character);
 
     if (!sig.valid && recv_chain[0]) {
         char fm[64];

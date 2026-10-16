@@ -181,6 +181,9 @@ int intel_complete(intellisense_t *is, const char *prefix,
 int intel_complete_bare(intellisense_t *is, const char *prefix,
                         const char *from_class);
 
+int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
+                                  const char *type_name, const char *prefix,
+                                  int line, int col);
 int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                                const char *prefix, int line, int col);
 int intel_complete_members_at(intellisense_t *is, const char *type_name,

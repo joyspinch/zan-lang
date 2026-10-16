@@ -282,9 +282,9 @@ class PropertyGrid : Control {
     }
 
     // 单行高度（逻辑像素，绘制时按 DPI 缩放）。
-    int RowHeight(App app) { return app.Scale(38); }
+    int RowHeight(App app) { return app.Scale(32); }
 
-    // 全部行的高度（宿主据此在自己的滚动区里给出槽位，折叠分组下的项不占高）。
+    // 全部行的高度（宿主据此在自己的滚动区里给出槽位，折叠分组下的项不占高，等分配对半行合并计算）。
     int ContentHeight(App app) {
         int rowH = this.RowHeight(app);
         int totalH = 0;
@@ -299,10 +299,129 @@ class PropertyGrid : Control {
             } else {
                 if (!curCollapsed) {
                     totalH = totalH + rowH;
+                    if (p.halfRow && (i + 1 < data.Count) && data[i + 1].halfRow && data[i + 1].kind != 5) {
+                        i = i + 1;
+                    }
                 }
             }
         }
         return totalH;
+    }
+
+    // 绘制单个属性项的标签与编辑器（支持全宽行或等分列单元格内排版）
+    void RenderPropField(App app, Canvas c, Theme t, int i, int cx, int cy, int cw, int ch,
+                         int flabelW, int fs, StyleBox valueStyle, StyleBox accentStyle,
+                         StyleBox rowHoverStyle, StyleBox stepStyle, StyleBox stepHoverStyle) {
+        if (i < 0 || i >= data.Count || i >= rows.Count) { return; }
+        PropSpec p = data[i];
+        PropertyGridRow r = rows[i];
+        int ex = cx + flabelW;
+        int ew = cw - flabelW;
+        int eh = app.Scale(24);
+        int ey = cy + (ch - eh) / 2;
+
+        c.DrawText(cx, Canvas.CenterTextY(cy, ch, fs),
+            Ellipsis.Fit(p.label, flabelW - t.gapSmall, fs),
+            valueStyle.FgOr(0), fs);
+
+        if (p.kind == 2) {
+            int swH = app.Scale(18);
+            int swY = cy + (ch - swH) / 2;
+            r.flag.Render(app, ex, swY);
+        } else if (p.kind == 3) {
+            int optCount = p.options.Count;
+            bool useSegmented = optCount >= 2 && optCount <= 4 && !p.halfRow;
+            if (useSegmented) {
+                int segW = ew / optCount;
+                for (int si = 0; si < optCount; si = si + 1) {
+                    int tw = Canvas.MeasureText(p.options[si], fs);
+                    if (tw + app.Scale(16) > segW) {
+                        useSegmented = false;
+                        break;
+                    }
+                }
+                if (segW < app.Scale(24)) { useSegmented = false; }
+            }
+
+            if (useSegmented) {
+                int curIdx = r.pick.Value();
+                int segW = ew / optCount;
+                int br = app.Scale(4);
+                c.FillRoundRect(ex, ey, ew, eh, br, valueStyle.BgOr(0));
+                c.DrawRoundRect(ex, ey, ew, eh, br, valueStyle.BorderOr(0), 1);
+
+                for (int si = 0; si < optCount; si = si + 1) {
+                    int sx = ex + si * segW;
+                    int sw = (si == optCount - 1) ? (ex + ew - sx) : segW;
+                    bool isSel = (si == curIdx);
+                    bool segHover = Ui.Over(app, sx, ey, sw, eh);
+                    int segId = (si < r.pickSegIds.Count)
+                        ? r.pickSegIds[si] : WidgetId.Next();
+                    app.hitTester.RegisterRect(segId, sx, ey, sw, eh, 0);
+
+                    if (Ui.Clicked(app, segId)) {
+                        if (!isSel) {
+                            r.pick.SetIndex(si);
+                            if (this.BeforeChange != null) {
+                                this.BeforeChange(p.key);
+                            }
+                            p.Write(this.PickValue(p, si));
+                            r.shadow = p.Read();
+                            hitRow = i;
+                            Change.PostS(this);
+                            app.RequestRedraw();
+                        }
+                    }
+
+                    if (isSel) {
+                        int accBg = accentStyle.BgOr(t.primary);
+                        int accFg = accentStyle.FgOr(t.textInverse);
+                        c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
+                            sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), accBg);
+                        int tw = Canvas.MeasureText(p.options[si], fs);
+                        c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
+                            p.options[si], accFg, fs);
+                    } else {
+                        if (segHover) {
+                            c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
+                                sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), rowHoverStyle.BgOr(0));
+                        }
+                        int tw = Canvas.MeasureText(p.options[si], fs);
+                        c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
+                            p.options[si], valueStyle.FgOr(0), fs);
+                        if (si > 0 && !isSel && (si - 1 != curIdx)) {
+                            c.DrawLine(sx, ey + app.Scale(3), sx, ey + eh - app.Scale(3), valueStyle.BorderOr(0), 1);
+                        }
+                    }
+                }
+            } else {
+                r.pick.RenderIn(app, ex, ey, ew, eh);
+            }
+        } else if (p.kind == 1) {
+            int gap = app.Scale(4);
+            int minStepW = (eh + gap) * 2 + app.Scale(32);
+            if (ew >= minStepW) {
+                int inW = ew - (eh + gap) * 2;
+                if (this.StepBtn(app, r.minusId, ex, ey, eh, "-",
+                        stepStyle, stepHoverStyle)) {
+                    this.Step(app, i, 0 - p.step);
+                }
+                r.text.Render(app, ex + eh + gap, ey, inW, eh);
+                if (this.StepBtn(app, r.plusId, ex + ew - eh,
+                        ey, eh, "+", stepStyle, stepHoverStyle)) {
+                    this.Step(app, i, p.step);
+                }
+            } else {
+                r.text.Render(app, ex, ey, ew, eh);
+            }
+        } else {
+            r.text.Render(app, ex, ey, ew, eh);
+        }
+        this.Sync(app, i);
+        if (p.tip != "" && Ui.Over(app, cx, cy, cw, ch)) {
+            Tooltip.RequestBox(app, cx, cy, cw, ch, p.tip,
+                Tooltip.Left(), app.Scale(240));
+        }
     }
 
     // 布局测量：首选高度 = 全部行高之和。
@@ -419,115 +538,30 @@ class PropertyGrid : Control {
                     c.DrawText(bx + app.Scale(15), Canvas.CenterTextY(secY, secBarH, fs),
                         arrow + Ellipsis.Fit(p.label, rowW - app.Scale(30), fs), sectionStyle.FgOr(0), fs);
                 } else {
-                    c.DrawText(bx, Canvas.CenterTextY(y, rowH, fs),
-                        Ellipsis.Fit(p.label, labelW - t.gapSmall, fs),
-                        valueStyle.FgOr(0), fs);
-                    int ex = bx + labelW;
-                    int ew = rowW - labelW;
-                    int eh = app.Scale(24);
-                    int ey = y + (rowH - eh) / 2;
-                    PropertyGridRow r = rows[i];
-                    if (p.kind == 2) {
-                        int swH = app.Scale(18);
-                        int swY = y + (rowH - swH) / 2;
-                        r.flag.Render(app, ex, swY);
-                    } else if (p.kind == 3) {
-                        int optCount = p.options.Count;
-                        // 选项在 2~4 个之间且宽度充裕时，自动升格为分段单选按钮组，点选更直观快捷
-                        bool useSegmented = optCount >= 2 && optCount <= 4;
-                        if (useSegmented) {
-                            int segW = ew / optCount;
-                            for (int si = 0; si < optCount; si = si + 1) {
-                                int tw = Canvas.MeasureText(p.options[si], fs);
-                                if (tw + app.Scale(16) > segW) {
-                                    useSegmented = false;
-                                    break;
-                                }
-                            }
-                            if (segW < app.Scale(24)) { useSegmented = false; }
-                        }
+                    bool isPair = p.halfRow && (i + 1 < data.Count) && data[i + 1].halfRow && data[i + 1].kind != 5;
+                    if (isPair) {
+                        int pGap = app.Scale(6);
+                        int colW = (rowW - pGap) / 2;
+                        PropSpec p2 = data[i + 1];
 
-                        if (useSegmented) {
-                            int curIdx = r.pick.Value();
-                            int segW = ew / optCount;
-                            int br = app.Scale(4);
-                            c.FillRoundRect(ex, ey, ew, eh, br, valueStyle.BgOr(0));
-                            c.DrawRoundRect(ex, ey, ew, eh, br, valueStyle.BorderOr(0), 1);
+                        int lW1 = Canvas.MeasureText(p.label, fs) + app.Scale(6);
+                        if (lW1 > colW * 45 / 100) { lW1 = colW * 45 / 100; }
+                        if (lW1 < app.Scale(20)) { lW1 = app.Scale(20); }
 
-                            for (int si = 0; si < optCount; si = si + 1) {
-                                int sx = ex + si * segW;
-                                int sw = (si == optCount - 1) ? (ex + ew - sx) : segW;
-                                bool isSel = (si == curIdx);
-                                bool segHover = Ui.Over(app, sx, ey, sw, eh);
-                                int segId = (si < r.pickSegIds.Count)
-                                    ? r.pickSegIds[si] : WidgetId.Next();
-                                app.hitTester.RegisterRect(segId, sx, ey, sw, eh, 0);
+                        int lW2 = Canvas.MeasureText(p2.label, fs) + app.Scale(6);
+                        if (lW2 > colW * 45 / 100) { lW2 = colW * 45 / 100; }
+                        if (lW2 < app.Scale(20)) { lW2 = app.Scale(20); }
 
-                                if (Ui.Clicked(app, segId)) {
-                                    if (!isSel) {
-                                        r.pick.SetIndex(si);
-                                        if (this.BeforeChange != null) {
-                                            this.BeforeChange(p.key);
-                                        }
-                                        p.Write(this.PickValue(p, si));
-                                        r.shadow = p.Read();
-                                        hitRow = i;
-                                        Change.PostS(this);
-                                        app.RequestRedraw();
-                                    }
-                                }
+                        this.RenderPropField(app, c, t, i, bx, y, colW, rowH, lW1, fs,
+                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
 
-                                if (isSel) {
-                                    int accBg = accentStyle.BgOr(t.primary);
-                                    int accFg = accentStyle.FgOr(t.textInverse);
-                                    c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
-                                        sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), accBg);
-                                    int tw = Canvas.MeasureText(p.options[si], fs);
-                                    c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
-                                        p.options[si], accFg, fs);
-                                } else {
-                                    if (segHover) {
-                                        c.FillRoundRect(sx + app.Scale(1), ey + app.Scale(1),
-                                            sw - app.Scale(2), eh - app.Scale(2), app.Scale(3), rowHoverStyle.BgOr(0));
-                                    }
-                                    int tw = Canvas.MeasureText(p.options[si], fs);
-                                    c.DrawText(sx + (sw - tw) / 2, Canvas.CenterTextY(ey, eh, fs),
-                                        p.options[si], valueStyle.FgOr(0), fs);
-                                    if (si > 0 && !isSel && (si - 1 != curIdx)) {
-                                        c.DrawLine(sx, ey + app.Scale(3), sx, ey + eh - app.Scale(3), valueStyle.BorderOr(0), 1);
-                                    }
-                                }
-                            }
-                        } else {
-                            r.pick.RenderIn(app, ex, ey, ew, eh);
-                        }
-                    } else if (p.kind == 1) {
-	                        // 整数行：[-] [可点击键入的输入框] [+]。
-	                        int gap = app.Scale(4);
-	                        int minStepW = (eh + gap) * 2 + app.Scale(36);
-	                        if (ew >= minStepW) {
-	                            int inW = ew - (eh + gap) * 2;
-	                            if (this.StepBtn(app, r.minusId, ex, ey, eh, "-",
-	                                    stepStyle, stepHoverStyle)) {
-	                                this.Step(app, i, 0 - p.step);
-	                            }
-	                            r.text.Render(app, ex + eh + gap, ey, inW, eh);
-	                            if (this.StepBtn(app, r.plusId, ex + ew - eh,
-	                                    ey, eh, "+", stepStyle, stepHoverStyle)) {
-	                                this.Step(app, i, p.step);
-	                            }
-	                        } else {
-	                            r.text.Render(app, ex, ey, ew, eh);
-	                        }
+                        this.RenderPropField(app, c, t, i + 1, bx + colW + pGap, y, colW, rowH, lW2, fs,
+                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
+
+                        i = i + 1;
                     } else {
-                        r.text.Render(app, ex, ey, ew, eh);
-                    }
-                    this.Sync(app, i);
-                    // 悬停该行且有说明时请求气泡提示（帧末由宿主 Flush）。
-                    if (p.tip != "" && Ui.Over(app, bx, y, rowW, rowH)
-                            && app.mouseY >= by && app.mouseY < by + bh) {
-                        Tooltip.RequestBox(app, bx, y, rowW, rowH, p.tip,
-                            Tooltip.Left(), app.Scale(240));
+                        this.RenderPropField(app, c, t, i, bx, y, rowW, rowH, labelW, fs,
+                            valueStyle, accentStyle, rowHoverStyle, stepStyle, stepHoverStyle);
                     }
                 }
             }
