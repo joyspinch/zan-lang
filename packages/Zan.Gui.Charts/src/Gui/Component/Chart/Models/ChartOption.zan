@@ -168,6 +168,7 @@ class ChartOption {
     int windowStart;  // 渲染器实际使用的窗口（类别索引，含端点）
     int windowEnd;  // 由 ResolvedChart 从 app 状态解析；-1 = 未窗口化
     int backgroundColor;  // 0 = 跟随主题，不主动填充背景
+    List<int> backgroundGradStops;  // 背景渐变色标列表
     // ECharts 根级 color：整图定性调色板（替换官方缺省 9 档）。
     // 系列未声明色时按绘制序取 colorPal[i % n]（ChartResolved.Of）。
     // null = 未声明，走 ChartSkin/主题 token/官方缺省。
@@ -275,7 +276,7 @@ class ChartOption {
         o.zoomX = ChartZoom.Clone(src.zoomX);
         o.zoomY = ChartZoom.Clone(src.zoomY);
         o.windowStart = src.windowStart; o.windowEnd = src.windowEnd;
-        o.backgroundColor = src.backgroundColor; o.iwid = src.iwid;
+        o.backgroundColor = src.backgroundColor; o.backgroundGradStops = src.backgroundGradStops; o.iwid = src.iwid;
         o.parLayout = src.parLayout;
         o.connectGroup = src.connectGroup; o.rampLo = src.rampLo; o.rampHi = src.rampHi;
         o.radarIndicators = new List<RadarIndicator>();
@@ -471,6 +472,7 @@ class ChartOption {
         this.windowStart = 0;
         this.windowEnd = 0 - 1;
         this.backgroundColor = 0;
+        this.backgroundGradStops = null;
         this.iwid = 0;
         this.connectGroup = 0;
     }
@@ -763,6 +765,11 @@ class ChartOption {
     static int ParseColor(JsonValue v, int dflt) {
         if (v == null) { return dflt; }
         if (v.IsNumber()) { return v.AsInt(dflt); }
+        if (v.IsObject()) {
+            List<int> gs = ChartOption.ParseGradStops(v);
+            if (gs != null && gs.Count > 0) { return gs[0]; }
+            return dflt;
+        }
         string s = v.AsString("");
         if (s == "auto") { return 0; }
         if (s == "transparent") { return Chart.Transparent(); }
@@ -772,12 +779,18 @@ class ChartOption {
     }
 
     // __grad 渐变对象（converter 序列化 echarts.graphic.
-    // LinearGradient 的产物）的 colorStops → ARGB 表。offset 暂
-    // 忽略（等分插值，绝大多数示例是 0/1 双停）；非渐变对象
+    // LinearGradient / RadialGradient 的产物）的 colorStops → ARGB 表。
+    // 支持 colorStops、y2（径向渐变色标数组）及 stops 键。非渐变对象
     // 或停点不足两个返回 null。
     static List<int> ParseGradStops(JsonValue cv) {
         if (cv == null || !cv.IsObject()) { return null; }
         JsonValue stops = cv.Get("colorStops");
+        if (stops == null || !stops.IsArray()) {
+            stops = cv.Get("y2");
+        }
+        if (stops == null || !stops.IsArray()) {
+            stops = cv.Get("stops");
+        }
         if (stops == null || !stops.IsArray()) { return null; }
         List<int> outv = new List<int>();
         for (int i = 0; i < stops.Count(); i = i + 1) {
@@ -1091,7 +1104,18 @@ class ChartOption {
     // （数组最多取 4 个，单数值展开为四角同值）与线/面积子样式。
     static void ParseItemStateStyle(JsonValue v, ChartItemStateStyle style) {
         if (v == null || !v.IsObject()) { return; }
-        if (v.Has("color")) { style.color = ChartOption.ParseColor(v.Get("color"), style.color); }
+        if (v.Has("color")) {
+            JsonValue cv = v.Get("color");
+            if (cv != null && cv.IsObject()) {
+                List<int> stops = ChartOption.ParseGradStops(cv);
+                if (stops != null && stops.Count > 0) {
+                    style.gradStops = stops;
+                    style.color = stops[0];
+                }
+            } else {
+                style.color = ChartOption.ParseColor(cv, style.color);
+            }
+        }
         if (v.Has("color0")) { style.color0 = ChartOption.ParseColor(v.Get("color0"), style.color0); }
         if (v.Has("borderColor")) { style.borderColor = ChartOption.ParseColor(v.Get("borderColor"), style.borderColor); }
         style.borderWidth = v.Int("borderWidth", style.borderWidth);
@@ -3062,7 +3086,18 @@ class ChartOption {
         } else {
             o.title = v.Str("title", "");
         }
-        if (v.Has("backgroundColor")) { o.backgroundColor = ChartOption.ParseColor(v.Get("backgroundColor"), o.backgroundColor); }
+        if (v.Has("backgroundColor")) {
+            JsonValue bg = v.Get("backgroundColor");
+            if (bg != null && bg.IsObject()) {
+                List<int> gs = ChartOption.ParseGradStops(bg);
+                if (gs != null && gs.Count > 0) {
+                    o.backgroundGradStops = gs;
+                    o.backgroundColor = gs[0];
+                }
+            } else {
+                o.backgroundColor = ChartOption.ParseColor(bg, o.backgroundColor);
+            }
+        }
         // ECharts 根级 color：string 数组，整图替换定性调色板。
         JsonValue palv = v.Get("color");
         if (palv != null && palv.IsArray()) {
@@ -3803,6 +3838,7 @@ class ChartOption {
                 }
                 cs.startAngle = s.Int("startAngle", cs.startAngle);
                 cs.selectedOffset = s.Int("selectedOffset", cs.selectedOffset);
+                cs.padAngle = s.Int("padAngle", cs.padAngle);
                 // barWidth 百分比形式（"60%"）单独入 barWidthPct，
                 // 像素形式照旧；渲染按带宽百分比定柱宽。
                 JsonValue bwp = s.Get("barWidth");
@@ -4291,11 +4327,27 @@ class ChartOption {
                                 cs.pointG = 1000;
                                 double rpx = it.At(0).AsDouble(0.0);
                                 double rpy = it.At(1).AsDouble(0.0);
-                                cs.points.Add(ChartPoint.Of(
+                                ChartPoint cp = ChartPoint.Of(
                                     (int)(rpx >= 0.0 ? rpx * 1000.0 + 0.5
                                         : rpx * 1000.0 - 0.5),
                                     (int)(rpy >= 0.0 ? rpy * 1000.0 + 0.5
-                                        : rpy * 1000.0 - 0.5)));
+                                        : rpy * 1000.0 - 0.5));
+                                if (it.Count() >= 3) {
+                                    if (it.At(2).IsNumber()) {
+                                        double rpz = it.At(2).AsDouble(0.0);
+                                        if (rpz > 2000000.0 || rpz < -2000000.0) {
+                                            cp.z = (int)rpz;
+                                        } else {
+                                            cp.z = (int)(rpz >= 0.0 ? rpz * 1000.0 + 0.5 : rpz * 1000.0 - 0.5);
+                                        }
+                                    } else if (it.At(2).IsString()) {
+                                        cp.name = it.At(2).AsString("");
+                                    }
+                                }
+                                if (it.Count() >= 4 && it.At(3).IsString()) {
+                                    cp.name = it.At(3).AsString("");
+                                }
+                                cs.points.Add(cp);
                             }
                         } else if (it.IsObject()) {
                             // matrix 坐标系对象项 {value:[x名,y名,值],
