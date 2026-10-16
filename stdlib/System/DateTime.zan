@@ -2,14 +2,17 @@ using System;
 
 namespace System;
 
-// UTC 时刻，精度为 1 秒，存储为
-// Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
-// 日历字段由 civil-from-days 算法推导，因此
-// 该类完全跨平台，仅需 libc <c>time()</c> 来获取
-// 当前时刻。<see cref="Now"/> 与 <see cref="UtcNow"/> 都返回 UTC；
-// 本机时区的墙钟时间由 <see cref="LocalNow"/> /
-// <see cref="ToLocalTime"/> 给出，偏移取自 libc 的时区库
-// （<see cref="LocalOffsetMinutes"/>），因此含夏令时。
+/// <summary>
+/// UTC 时刻，精度为 1 秒，存储为
+/// Unix 纪元（1970-01-01 00:00:00 UTC）以来的秒数。
+///
+/// 日历字段由 civil-from-days 算法推导，因此
+/// 该类完全跨平台，仅需 libc <c>time()</c> 来获取
+/// 当前时刻。<see cref="Now"/> 与 <see cref="UtcNow"/> 都返回 UTC；
+/// 本机时区的墙钟时间由 <see cref="LocalNow"/> /
+/// <see cref="ToLocalTime"/> 给出，偏移取自 libc 的时区库
+/// （<see cref="LocalOffsetMinutes"/>），因此含夏令时。
+/// </summary>
 class DateTime {
     [DllImport("crt")]
     static extern long time(nint ptr);
@@ -17,85 +20,62 @@ class DateTime {
     #if WINDOWS
     [DllImport("kernel32", EntryPoint = "GetSystemTimeAsFileTime")]
     static extern void GetSystemTimeAsFileTime(nint lpFileTime);
-    #else
-    [DllImport("crt", EntryPoint = "clock_gettime")]
-    static extern int clock_gettime(int clkId, nint tp);
     #endif
 
-    // 本机时区换算：localtime_r（POSIX）/ _localtime64_s（Windows）
-    // 将纪元秒展开进线程局部 struct tm 缓冲，避免并发冲突。
-    // 再用 timegm / _mkgmtime 将其当作 UTC 折回纪元秒，两者的差值
-    // 即为该时刻的实际本地偏移（包含夏令时）。
+    /// 本机时区换算全部交给 libc 的时区库：localtime 把纪元秒展开成本地
+    /// 墙钟字段，再用 timegm（Windows 上是 _mkgmtime）把这组字段当作 UTC
+    /// 折回纪元秒，两者之差就是该时刻的实际偏移（自带夏令时）。
     #if WINDOWS
-    [DllImport("crt", EntryPoint = "_localtime64_s")]
-    static extern int plat_localtime(nint tmOut, nint tptr);
+    [DllImport("crt", EntryPoint = "localtime")]
+    static extern nint plat_localtime(nint tptr);
     [DllImport("crt", EntryPoint = "_mkgmtime")]
     static extern long plat_timegm(nint tm);
     #else
-    [DllImport("crt", EntryPoint = "localtime_r")]
-    static extern nint plat_localtime(nint tptr, nint tmOut);
+    [DllImport("crt", EntryPoint = "localtime")]
+    static extern nint plat_localtime(nint tptr);
     [DllImport("crt", EntryPoint = "timegm")]
     static extern long plat_timegm(nint tm);
     #endif
 
-    // 自 1970-01-01T00:00:00Z 以来的毫秒数。
+    /// 自 1970-01-01T00:00:00Z 以来的毫秒数。
     long epochMs;
-    // 自 1970-01-01T00:00:00Z 以来的秒数。
+    /// 自 1970-01-01T00:00:00Z 以来的秒数（向后兼容）。
     long epoch;
-    // 年。
+    /// 年。
     int year;
-    // 月，1..12。
+    /// 月，1..12。
     int month;
-    // 日，1..31。
+    /// 日，1..31。
     int day;
-    // 时，0..23。
+    /// 时，0..23。
     int hour;
-    // 分，0..59。
+    /// 分，0..59。
     int minute;
-    // 秒，0..59。
+    /// 秒，0..59。
     int second;
-    // 毫秒，0..999。
+    /// 毫秒，0..999。
     int millisecond;
-    // 星期几，0=星期日 .. 6=星期六。
+    /// 星期几，0=星期日 .. 6=星期六。
     int dayOfWeek;
 
-    // 内部精确获取当前系统 Unix 纪元毫秒。
+    /// <summary>内部精确获取当前系统 Unix 纪元毫秒。</summary>
     static long GetCurrentUnixMilliseconds() {
         #if WINDOWS
         nint p = NativeMemory.Alloc(8);
-        long ft = 0;
-        try {
-            GetSystemTimeAsFileTime(p);
-            ft = new Span<long>(p, 1)[0];
-        } finally {
-            NativeMemory.Free(p);
-        }
+        GetSystemTimeAsFileTime(p);
+        long ft = new Span<long>(p, 1)[0];
+        NativeMemory.Free(p);
         // 100ns 刻度折算为毫秒，减去 1601 到 1970 偏移 (11644473600000 ms)
         return (ft / 10000) - 11644473600000;
         #else
-        nint ts = NativeMemory.Alloc(16);
-        long ms = 0;
-        try {
-            // CLOCK_REALTIME = 0 on POSIX
-            int r = clock_gettime(0, ts);
-            if (r == 0) {
-                long sec = new Span<long>(ts, 1)[0];
-                long nsec = new Span<long>(ts + 8, 1)[0];
-                ms = sec * 1000 + (nsec / 1000000);
-            } else {
-                ms = time(0) * 1000;
-            }
-        } finally {
-            NativeMemory.Free(ts);
-        }
-        return ms;
+        return time(0) * 1000;
         #endif
     }
 
-    // 根据 Unix 时间戳（秒，UTC）构造时刻（毫秒置 0）。
+    /// <summary>根据 Unix 时间戳（秒，UTC）构造时刻（毫秒置 0）。</summary>
     DateTime(long unixSeconds) : this(unixSeconds * 1000, 0) {}
 
-    // 根据 Unix 时间戳（毫秒，UTC）构造时刻。
+    /// <summary>根据 Unix 时间戳（毫秒，UTC）构造时刻。</summary>
     DateTime(long unixMs, int dummy) {
         epochMs = unixMs;
         epoch = unixMs / 1000;
@@ -106,23 +86,21 @@ class DateTime {
         millisecond = remMs;
 
         int days = (int)FloorDivL(totalSeconds, 86400);
-        int sod = (int)(totalSeconds - (long)days * 86400);  // 0..86399
+        int sod = (int)(totalSeconds - (long)days * 86400);   // 0..86399
         hour = sod / 3600;
         minute = (sod / 60) - hour * 60;
         second = sod - hour * 3600 - minute * 60;
-        dayOfWeek = FloorMod(days + 4, 7);  // 1970-01-01 是星期四
+        dayOfWeek = FloorMod(days + 4, 7);       // 1970-01-01 是星期四
 
-        // 从天数推算公历日期（Howard Hinnant 算法）。era 必须向下
-        // 取整：z 为负（纪元前约 1970 年以前，如 proleptic 0000 年）
-        // 时截断除法会让 doe 变负、整个日历崩溃。
+        // 从天数推算公历日期（Howard Hinnant 算法）。
         int z = days + 719468;
-        int era = FloorDiv(z, 146097);
-        int doe = z - era * 146097;  // 0..146096
+        int era = z / 146097;
+        int doe = z - era * 146097;                          // 0..146096
         int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
         int y = yoe + era * 400;
-        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);  // 0..365
-        int mp = (5 * doy + 2) / 153;  // 0..11
-        int d = doy - (153 * mp + 2) / 5 + 1;  // 1..31
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);   // 0..365
+        int mp = (5 * doy + 2) / 153;                        // 0..11
+        int d = doy - (153 * mp + 2) / 5 + 1;                // 1..31
         int m = mp + 3;
         if (mp >= 10) { m = mp - 9; }
         if (m <= 2) { y = y + 1; }
@@ -134,123 +112,107 @@ class DateTime {
 
     // ---- 构造 -------------------------------------------------------
 
-    // 当前时刻（UTC，毫秒精度）。
+    /// <summary>当前时刻（UTC，毫秒精度）。</summary>
     static DateTime UtcNow() {
         return DateTime.FromUnixMilliseconds(GetCurrentUnixMilliseconds());
     }
 
-    // <see cref="UtcNow"/> 的别名；不应用本地时区偏移。
+    /// <summary><see cref="UtcNow"/> 的别名；不应用本地时区偏移。</summary>
     static DateTime Now() {
         return DateTime.UtcNow();
     }
 
     // ---- 本机时区 ---------------------------------------------------
 
-    // 本机时区在 <paramref name="unixSeconds"/> 这一时刻相对 UTC 的偏移
-    // （分钟，东为正，如东八区 480），含该时刻是否处于夏令时。
-    // 时区信息不可用时返回 0（等同 UTC）。
+    /// <summary>
+    /// 本机时区在 <paramref name="unixSeconds"/> 这一时刻相对 UTC 的偏移
+    /// （分钟，东为正，如东八区 480），含该时刻是否处于夏令时。
+    /// 时区信息不可用时返回 0（等同 UTC）。
+    /// </summary>
     static int LocalOffsetMinutesAt(long unixSeconds) {
-        nint tbuf = NativeMemory.Alloc(8);
-        nint tm = 0;
-        bool ok = false;
-        try {
-            new Span<long>(tbuf, 1)[0] = unixSeconds;
-            // struct tm 布局平台各异（glibc/Darwin 56 字节、MSVC 36 字节），
-            // 给 128 字节清零缓冲；读端只经 plat_timegm（libc 自己解释布局）。
-            tm = NativeMemory.Alloc(128);
-            NativeMemory.Fill(tm, 0, 128);
-            #if WINDOWS
-            ok = plat_localtime(tm, tbuf) == 0;
-            #else
-            ok = plat_localtime(tbuf, tm) != 0;
-            #endif
-        } finally {
-            NativeMemory.Free(tbuf);
-        }
-
-        if (!ok || tm == 0) {
-            if (tm != 0) { NativeMemory.Free(tm); }
-            return 0;
-        }
-
-        long wall = 0;
-        try {
-            wall = plat_timegm(tm);
-        } finally {
-            NativeMemory.Free(tm);
-        }
-
+        nint p = NativeMemory.Alloc(8);
+        new Span<long>(p, 1)[0] = unixSeconds;
+        nint tm = plat_localtime(p);
+        NativeMemory.Free(p);
+        if (tm == 0) { return 0; }
+        long wall = plat_timegm(tm);
         if (wall == 0 - 1) { return 0; }
         return (int)((wall - unixSeconds) / 60);
     }
 
-    // 本机时区当前相对 UTC 的偏移（分钟，东为正）。
+    /// <summary>本机时区当前相对 UTC 的偏移（分钟，东为正）。</summary>
     static int LocalOffsetMinutes() {
         return LocalOffsetMinutesAt(time(0));
     }
 
-    // 同一时刻的本地墙钟表示：年月日时分秒都是本机时区读数。
-    // 注意它的 <see cref="ToUnixSeconds"/> 已被偏移，不再是纪元秒；
-    // 需要纪元秒请用原来的 UTC 时刻。
+    /// <summary>
+    /// 同一时刻的本地墙钟表示：年月日时分秒都是本机时区读数。
+    /// 注意它的 <see cref="ToUnixSeconds"/> 已被偏移，不再是纪元秒；
+    /// 需要纪元秒请用原来的 UTC 时刻。
+    /// </summary>
     DateTime ToLocalTime() {
         return new DateTime(epoch
             + (long)DateTime.LocalOffsetMinutesAt(epoch) * 60);
     }
 
-    // 本机时区的当前墙钟时间（见 <see cref="ToLocalTime"/>）。
+    /// <summary>本机时区的当前墙钟时间（见 <see cref="ToLocalTime"/>）。</summary>
     static DateTime LocalNow() {
         return DateTime.UtcNow().ToLocalTime();
     }
 
-    // 根据 Unix 时间戳（自纪元起的秒数）构造时刻。
+    /// <summary>根据 Unix 时间戳（自纪元起的秒数）构造时刻。</summary>
     static DateTime FromUnixSeconds(long seconds) {
         return new DateTime(seconds);
     }
 
-    // 根据 Unix 时间戳（自纪元起的毫秒数）构造时刻。
+    /// <summary>根据 Unix 时间戳（自纪元起的毫秒数）构造时刻。</summary>
     static DateTime FromUnixMilliseconds(long milliseconds) {
         return new DateTime(milliseconds, 0);
     }
 
-    // 给定日历日期当天的 UTC 午夜零点。
+    /// <summary>给定日历日期当天的 UTC 午夜零点。</summary>
     static DateTime FromDate(int year, int month, int day) {
         return new DateTime(DaysFromCivil(year, month, day) * 86400);
     }
 
-    // 给定的日历日期和墙上时钟时间，按 UTC 处理。
+    /// <summary>给定的日历日期和墙上时钟时间，按 UTC 处理。</summary>
     static DateTime FromParts(int year, int month, int day,
                               int hour, int minute, int second) {
         return new DateTime(DaysFromCivil(year, month, day) * 86400
                             + hour * 3600 + minute * 60 + second);
     }
 
-    // 公历日期到 Unix 纪元的天数——与构造器所用的
-    // civil-from-days 算法互为逆运算。
-    // 1970 年之前的日期为负。
+    /// <summary>
+    /// 公历日期到 Unix 纪元的天数——与构造器所用的
+    /// civil-from-days 算法互为逆运算。
+    /// 1970 年之前的日期为负。
+    /// </summary>
     static int DaysFromCivil(int year, int month, int day) {
         int y = year;
         if (month <= 2) { y = y - 1; }
         int era = FloorDiv(y, 400);
-        int yoe = y - era * 400;  // 0..399
-        int mp = month - 3;  // 以 3 月为基准的月份
+        int yoe = y - era * 400;                             // 0..399
+        int mp = month - 3;                                  // 以 3 月为基准的月份
         if (month <= 2) { mp = month + 9; }
-        int doy = (153 * mp + 2) / 5 + day - 1;  // 0..365
-        int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  // 0..146096
+        int doy = (153 * mp + 2) / 5 + day - 1;              // 0..365
+        int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;     // 0..146096
         return era * 146097 + doe - 719468;
     }
 
-    // <see cref="DaysFromCivil"/> 的逆运算：把 Unix 纪元天序换算回公历年月日。
-    // 结果按 <paramref name="year"/>/<paramref name="month"/>/<paramref name="day"/>
-    // 三个 out 参数返回（1970 年之前的天序为负，同样成立）。
+    /// <summary>
+    /// <see cref="DaysFromCivil"/> 的逆运算：把 Unix 纪元天序换算回公历年月日。
+    /// 结果按 <paramref name="year"/>/<paramref name="month"/>/<paramref name="day"/>
+    /// 三个 out 参数返回（1970 年之前的天序为负，同样成立）。
+    /// </summary>
     static void CivilFromDays(int days, out int year, out int month, out int day) {
         int z = days + 719468;
-        int era = FloorDiv(z, 146097);  // floor：z 可为负
-        int doe = z - era * 146097;  // 0..146096
+        int era = FloorDiv(z, 146097);
+        int doe = z - era * 146097;                          // 0..146096
         int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
         int y = yoe + era * 400;
-        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);  // 0..365
-        int mp = (5 * doy + 2) / 153;  // 0..11
-        int d = doy - (153 * mp + 2) / 5 + 1;  // 1..31
+        int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);   // 0..365
+        int mp = (5 * doy + 2) / 153;                        // 0..11
+        int d = doy - (153 * mp + 2) / 5 + 1;                // 1..31
         int m = mp + 3;
         if (mp >= 10) { m = mp - 9; }
         if (m <= 2) { y = y + 1; }
@@ -259,7 +221,7 @@ class DateTime {
         day = d;
     }
 
-    // <paramref name="year"/> 年 <paramref name="month"/> 月的天数。
+    /// <summary><paramref name="year"/> 年 <paramref name="month"/> 月的天数。</summary>
     static int DaysInMonth(int year, int month) {
         if (month < 1 || month > 12) { return 0; }
         if (month == 2) {
@@ -270,7 +232,7 @@ class DateTime {
         return 31;
     }
 
-    // <paramref name="year"/> 是否为公历闰年。
+    /// <summary><paramref name="year"/> 是否为公历闰年。</summary>
     static bool IsLeapYear(int year) {
         if (FloorMod(year, 4) != 0) { return false; }
         if (FloorMod(year, 100) != 0) { return true; }
@@ -279,67 +241,67 @@ class DateTime {
 
     // ---- 访问器 -------------------------------------------------------
 
-    // 年。
+    /// 年。
     int Year() { return year; }
-    // 月（1..12）。
+    /// 月（1..12）。
     int Month() { return month; }
-    // 日（1..31）。
+    /// 日（1..31）。
     int Day() { return day; }
-    // 时（0..23）。
+    /// 时（0..23）。
     int Hour() { return hour; }
-    // 分（0..59）。
+    /// 分（0..59）。
     int Minute() { return minute; }
-    // 秒（0..59）。
+    /// 秒（0..59）。
     int Second() { return second; }
 
-    // 星期几，0=星期日 .. 6=星期六。
+    /// <summary>星期几，0=星期日 .. 6=星期六。</summary>
     int DayOfWeek() { return dayOfWeek; }
 
-    // 毫秒（0..999）。
+    /// <summary>毫秒（0..999）。</summary>
     int Millisecond() { return millisecond; }
 
-    // Unix 纪元以来的秒数（UTC）。
+    /// <summary>Unix 纪元以来的秒数（UTC）。</summary>
     long ToUnixSeconds() { return epoch; }
 
-    // Unix 纪元以来的毫秒数（UTC）。
+    /// <summary>Unix 纪元以来的毫秒数（UTC）。</summary>
     long ToUnixMilliseconds() { return epochMs; }
 
     // ---- 算术 -------------------------------------------------------
 
-    // 加 n 毫秒。
+    /// 加 n 毫秒。
     DateTime AddMilliseconds(long ms) { return DateTime.FromUnixMilliseconds(epochMs + ms); }
-    // 加 n 秒。
+    /// 加 n 秒。
     DateTime AddSeconds(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 1000); }
-    // 加 n 分钟。
+    /// 加 n 分钟。
     DateTime AddMinutes(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 60000); }
-    // 加 n 小时。
+    /// 加 n 小时。
     DateTime AddHours(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 3600000); }
-    // 加 n 天。
+    /// 加 n 天。
     DateTime AddDays(long n) { return DateTime.FromUnixMilliseconds(epochMs + n * 86400000); }
 
-    // 此时刻与 <paramref name="other"/> 之间的间隔（毫秒精度）。
+    /// <summary>此时刻与 <paramref name="other"/> 之间的间隔（毫秒精度）。</summary>
     TimeSpan Subtract(DateTime other) {
         return TimeSpan.FromMilliseconds(epochMs - other.epochMs);
     }
 
     // ---- 比较 -------------------------------------------------------
 
-    // 同一时刻（纪元毫秒相等）。
+    /// 同一时刻（纪元毫秒相等）。
     bool Equals(DateTime other) { return epochMs == other.epochMs; }
-    // 早于 other。
+    /// 早于 other。
     bool IsBefore(DateTime other) { return epochMs < other.epochMs; }
-    // 晚于 other。
+    /// 晚于 other。
     bool IsAfter(DateTime other) { return epochMs > other.epochMs; }
 
     // ---- 格式化 -------------------------------------------------------
 
-    // 类 ISO 文本："YYYY-MM-DD HH:MM:SS"。
+    /// <summary>类 ISO 文本："YYYY-MM-DD HH:MM:SS"。</summary>
     string ToString() {
         return "" + year + "-" + Pad2(month) + "-" + Pad2(day) + " " +
                Pad2(hour) + ":" + Pad2(minute) + ":" + Pad2(second);
     }
 
-    // 带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"。
+    /// <summary>带毫秒的类 ISO 文本："YYYY-MM-DD HH:MM:SS.fff"。</summary>
     string ToStringWithMillis() {
         string msStr = Convert.ToString(millisecond);
         if (millisecond < 10) { msStr = "00" + msStr; }
@@ -347,23 +309,25 @@ class DateTime {
         return this.ToString() + "." + msStr;
     }
 
-    // 仅日期："YYYY-MM-DD"。
+    /// <summary>仅日期："YYYY-MM-DD"。</summary>
     string ToDateString() {
         return "" + year + "-" + Pad2(month) + "-" + Pad2(day);
     }
 
-    // 仅时间："HH:MM:SS"。
+    /// <summary>仅时间："HH:MM:SS"。</summary>
     string ToTimeString() {
         return Pad2(hour) + ":" + Pad2(minute) + ":" + Pad2(second);
     }
 
-    // 解析严格的 "YYYY-MM-DD" 为当天 00:00:00；长度、分隔符或
-    // 取值非法（月 1..12、日不超过当月天数）返回 null。年份须
-    // 四位数字，供文本输入与属性面板回传使用。
+    /// <summary>
+    /// 解析严格的 "YYYY-MM-DD" 为当天 00:00:00；长度、分隔符或
+    /// 取值非法（月 1..12、日不超过当月天数）返回 null。年份须
+    /// 四位数字，供文本输入与属性面板回传使用。
+    /// </summary>
     static DateTime ParseDate(string value) {
         if (value == null) { return null; }
         if (value.Length != 10) { return null; }
-        if ((value[4] & 255) != 45 || (value[7] & 255) != 45) {  // '-'
+        if (value.Substring(4, 1) != "-" || value.Substring(7, 1) != "-") {
             return null;
         }
         int y = DateTime.ParseDigits(value, 0, 4);
@@ -374,19 +338,18 @@ class DateTime {
         return DateTime.FromDate(y, m, d);
     }
 
-    // 解析 `at` 起 `count` 位十进制数字；含非数字返回 -1。
+    /// <summary>解析 `at` 起 `count` 位十进制数字；含非数字返回 -1。</summary>
     static int ParseDigits(string s, int at, int count) {
-        if (s == null || at < 0 || at + count > s.Length) { return -1; }
         int outp = 0;
         for (int i = 0; i < count; i = i + 1) {
-            int c = s[at + i] & 255;
-            if (c < 48 || c > 57) { return -1; }
-            outp = outp * 10 + (c - 48);
+            int d = DateTime.Digit(s.Substring(at + i, 1));
+            if (d < 0) { return -1; }
+            outp = outp * 10 + d;
         }
         return outp;
     }
 
-    // 十进制数字字符的值，非数字返回 -1。
+    /// 十进制数字字符的值，非数字返回 -1。
     static int Digit(string c) {
         if (c == "0") { return 0; }
         if (c == "1") { return 1; }
@@ -403,13 +366,13 @@ class DateTime {
 
     // ---- 共享整数辅助函数 -------------------------------------------
 
-    // 将 0..99 的值补零到两位。
+    /// <summary>将 0..99 的值补零到两位。</summary>
     static string Pad2(long n) {
         if (n < 10 && n >= 0) { return "0" + n; }
         return "" + n;
     }
 
-    // 对 64 位秒数做向下取整的整数除法。
+    /// <summary>对 64 位秒数做向下取整的整数除法。</summary>
     static long FloorDivL(long a, long b) {
         long q = a / b;
         long r = a - q * b;
@@ -417,7 +380,7 @@ class DateTime {
         return q;
     }
 
-    // 向下取整的整数除法（向负无穷取整）。
+    /// <summary>向下取整的整数除法（向负无穷取整）。</summary>
     static int FloorDiv(int a, int b) {
         int q = a / b;
         int r = a - q * b;
@@ -425,7 +388,7 @@ class DateTime {
         return q;
     }
 
-    // 向下取整的模运算；结果符号与除数一致。
+    /// <summary>向下取整的模运算；结果符号与除数一致。</summary>
     static int FloorMod(int a, int b) {
         return a - FloorDiv(a, b) * b;
     }

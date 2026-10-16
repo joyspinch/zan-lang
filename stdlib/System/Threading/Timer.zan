@@ -2,36 +2,38 @@ using System;
 
 namespace System.Threading;
 
-// 简单的周期定时器。<see cref="Start"/> 将定时器注册到
-// 共享的定时器线程，该线程约每 10 毫秒唤醒一次，触发每个到期的
-// 回调；<see cref="Stop"/> 注销定时器。慢回调会延迟共享线程上的
-// 所有其他定时器，因此回调应保持简短，或把工作
-// 转交给另一个线程。
-// t.Start();
-// ...
-// t.Stop();
+/// <summary>
+/// 简单的周期定时器。<see cref="Start"/> 将定时器注册到
+/// 共享的定时器线程，该线程约每 10 毫秒唤醒一次，触发每个到期的
+/// 回调；<see cref="Stop"/> 注销定时器。慢回调会延迟共享线程上的
+/// 所有其他定时器，因此回调应保持简短，或把工作
+/// 转交给另一个线程。
+///
+///   Timer t = new Timer(1000, () => { counter = counter + 1; });
+///   t.Start();
+///   ...
+///   t.Stop();
+/// </summary>
 class Timer {
     int intervalMs;
     ThreadStart callback;
     bool running;
     int tickCount;
-    int pendingTicks;  // selected callbacks, including one already executing
-    // 下次触发时刻（单调毫秒）。
-    long nextDue;  // 下次触发的时间（单调毫秒，ServerMetrics.MonoMillis()）
+    /// 下次触发时刻（单调毫秒）。
+    long nextDue;   // 下次触发的时间（单调毫秒，ServerMetrics.MonoMillis()）
 
-    // 创建一个每隔 `intervalMs` 毫秒触发一次 `callback` 的定时器。
-    // 在调用 <see cref="Start"/> 之前不会启动。
+    /// 创建一个每隔 `intervalMs` 毫秒触发一次 `callback` 的定时器。
+    /// 在调用 <see cref="Start"/> 之前不会启动。
     Timer(int intervalMs, ThreadStart callback) {
         this.intervalMs = intervalMs;
         this.callback = callback;
         this.running = false;
         this.tickCount = 0;
-        this.pendingTicks = 0;
         this.nextDue = 0;
     }
 
-    // 启动定时器。已在运行时为无操作。
-    // 定时器处于运行状态时返回 true。
+    /// <summary>启动定时器。已在运行时为无操作。
+    /// 定时器处于运行状态时返回 true。</summary>
     bool Start() {
         Mutex.Lock(Timer.lockHandle);
         if (this.running) {
@@ -56,8 +58,8 @@ class Timer {
         return true;
     }
 
-    // 停止定时器并注销它。正在进行的 tick（如有）
-    // 会执行完；后续 tick 不再触发。未运行时为无操作。
+    /// <summary>停止定时器并注销它。正在进行的 tick（如有）
+    /// 会执行完；后续 tick 不再触发。未运行时为无操作。</summary>
     void Stop() {
         Mutex.Lock(Timer.lockHandle);
         if (!this.running) {
@@ -65,98 +67,70 @@ class Timer {
             return;
         }
         this.running = false;
-        if (Timer.timers != null) {
-            int i = 0;
-            while (i < Timer.timers.Count) {
-                if (Timer.timers[i] == this) {
-                    Timer.timers.RemoveAt(i);
-                    break;
-                }
-                i = i + 1;
+        int i = 0;
+        while (i < Timer.timers.Count) {
+            if (Timer.timers[i] == this) {
+                Timer.timers.RemoveAt(i);
+                break;
             }
+            i = i + 1;
         }
         Mutex.Unlock(Timer.lockHandle);
     }
 
-    // 停止并等待已选中的回调结束。最后一个定时器还会等待
-    // 共享泵释放临时回调批次并退出，适合异步 finally/进程退出前使用。
-    // 不在回调内同步等待自身；回调内可继续使用 Stop。不要在本次
-    // StopAsync 完成前重启同一个定时器。
-    async void StopAsync() {
-        this.Stop();
-        while (!this.IsDrained()) { await Task.Delay(1); }
-    }
-
-    private bool IsDrained() {
-        Mutex.Lock(Timer.lockHandle);
-        bool done = this.pendingTicks == 0 &&
-            (Timer.timers == null || Timer.timers.Count > 0 || !Timer.pumpRunning);
-        Mutex.Unlock(Timer.lockHandle);
-        return done;
-    }
-
-    // 自 Start（或上次 Reset）以来已选中的 tick 数。
+    /// <summary>自 Start（或上次 Reset）以来已完成的 tick 数。</summary>
     int TickCount() {
         return this.tickCount;
     }
 
-    // 将 tick 计数器重置为零。
+    /// <summary>将 tick 计数器重置为零。</summary>
     void Reset() {
         this.tickCount = 0;
     }
 
-    // 定时器运行期间（Start 与 Stop 之间）为 true。
+    /// 定时器运行期间（Start 与 Stop 之间）为 true。
     bool IsRunning() {
         return this.running;
     }
 
-    // 共享泵的一个同步批次。临时列表和回调引用在方法返回时释放，
-    // 不留到 Sleep/空注册表退出路径，避免 Stop 后仍由后台线程保活。
-    private static bool PumpBatch() {
-        Mutex.Lock(Timer.lockHandle);
-        if (Timer.timers == null || Timer.timers.Count == 0) {
-            Timer.pumpRunning = false;
-            Mutex.Unlock(Timer.lockHandle);
-            return false;
-        }
-        long now = Timer.Now();
-        List<Timer> due = new List<Timer>();
-        int i = Timer.timers.Count - 1;
-        while (i >= 0) {
-            Timer t = Timer.timers[i];
-            if (t.running && now >= t.nextDue) {
-                t.nextDue = now + t.intervalMs;
-                t.tickCount = t.tickCount + 1;
-                t.pendingTicks = t.pendingTicks + 1;
-                due.Add(t);
-            }
-            i = i - 1;
-        }
-        Mutex.Unlock(Timer.lockHandle);
-        int j = due.Count - 1;
-        while (j >= 0) {
-            Timer t = due[j];
-            try {
-                if (t.callback != null) { t.callback(); }
-            } catch (Exception e) {
-                Console.WriteLine("Timer callback failed: " + e.Message);
-            } finally {
-                due.RemoveAt(j);
-                Mutex.Lock(Timer.lockHandle);
-                t.pendingTicks = t.pendingTicks - 1;
-                Mutex.Unlock(Timer.lockHandle);
-            }
-            j = j - 1;
-        }
-        return true;
-    }
-
-    // 共享泵线程体：批次不跨 sleep；最后一个 StopAsync 等其退出。
+    // 共享泵线程：约每 10 毫秒遍历注册表，触发到期的定时器。
+    // 遍历采用倒序，这样回调中停止/移除某个定时器（自身或
+    // 其他的、当前索引处或之后的）都不会跳过条目。
+    /// 共享泵线程体：遍历注册表触发到期定时器；无定时器时退出。
     static void Pump() {
-        while (Timer.PumpBatch()) { Thread.Sleep(10); }
+        while (true) {
+            Mutex.Lock(Timer.lockHandle);
+            if (Timer.timers.Count == 0) {
+                Timer.pumpRunning = false;
+                Mutex.Unlock(Timer.lockHandle);
+                break;
+            }
+            long now = Timer.Now();
+            List<Timer> due = new List<Timer>();
+            int i = Timer.timers.Count - 1;
+            while (i >= 0) {
+                Timer t = Timer.timers[i];
+                if (t.running && now >= t.nextDue) {
+                    t.nextDue = now + t.intervalMs;
+                    t.tickCount = t.tickCount + 1;
+                    due.Add(t);
+                }
+                i = i - 1;
+            }
+            Mutex.Unlock(Timer.lockHandle);
+            int j = due.Count - 1;
+            while (j >= 0) {
+                Timer t = due[j];
+                if (t.callback != null) { t.callback(); }
+                j = j - 1;
+            }
+            Thread.Sleep(10);
+        }
     }
 
-    // 获取当前单调时间戳（毫秒）。使用根命名空间的 Stopwatch，避免引入多余依赖。
+    /// 单调毫秒。原来走 `ServerMetrics.MonoMillis()`，为了一个时钟读数把整个
+    /// `System.Diagnostics`（进程/日志/指标 → System.IO）拉进了每个用线程的
+    /// 程序；`Stopwatch` 就在根命名空间，且分辨率更高。
     static long Now() {
         return Stopwatch.GetMilliseconds();
     }
@@ -169,7 +143,7 @@ class Timer {
     static nint lockHandle;
     #endif
 
-    // 静态初始化：创建注册表互斥锁。
+    /// 静态初始化：创建注册表互斥锁。
     static Timer() {
         Timer.lockHandle = Mutex.Create();
     }

@@ -1,35 +1,17 @@
 using System;
-using System.Numerics;
-using System.Runtime.Intrinsics;
 
 namespace System;
 
-// 提供针对 byte[] 数组与连续内存块的高吞吐向量化加速扩展方法（SequenceEqual、IndexOf、LastIndexOf、Contains）。
-// 核心循环全面基于 AVX2 256 位宽与 SSE2 128 位硬件向量单周期并行扫描，
-// 配合 BitOperations.TrailingZeroCount / LeadingZeroCount 硬件指令实现 O(1) 瞬时索引定位。
+/// <summary>
+/// 提供针对 byte[] 数组与连续内存块的扩展方法（SequenceEqual、IndexOf、LastIndexOf、Contains、IndexOfAny 等）。
+/// </summary>
 class MemoryExtensions {
-    // 确定两个字节序列是否在内容上完全相等（AVX2 32 字节并行扫描）。
+    // 确定两个字节序列是否在内容上完全相等。
     public static bool SequenceEqual(this byte[] first, byte[] second) {
         if (first == null || second == null) return first == second;
         if (first.Length != second.Length) return false;
         int n = first.Length;
         int i = 0;
-        while (i + 32 <= n) {
-            Vector256 v1 = Vector256.Load(first, i);
-            Vector256 v2 = Vector256.Load(second, i);
-            Vector256 eq = Vector256.Equals(v1, v2);
-            int mask = Vector256.ExtractMostSignificantBits(eq);
-            if (mask != -1) return false;
-            i = i + 32;
-        }
-        while (i + 16 <= n) {
-            Vector128 v1 = Vector128.Load(first, i);
-            Vector128 v2 = Vector128.Load(second, i);
-            Vector128 eq = Vector128.Equals(v1, v2);
-            int mask = Vector128.ExtractMostSignificantBits(eq);
-            if (mask != 65535) return false;
-            i = i + 16;
-        }
         while (i < n) {
             if (first[i] != second[i]) return false;
             i = i + 1;
@@ -37,41 +19,14 @@ class MemoryExtensions {
         return true;
     }
 
-    // 在字节序列切片中查找指定字节值的第一个匹配项索引（AVX2 32 字节并行 + TrailingZeroCount 硬件指令单周期定位）。
+    // 在字节序列切片中查找指定字节值的第一个匹配项索引。
     public static int IndexOf(this byte[] source, byte value, int startIndex, int count) {
         if (source == null || count <= 0) return -1;
         int n = source.Length;
         if (startIndex < 0) startIndex = 0;
-        // 减法比较钳制：startIndex+count 在两者都大时 i32
-        // 会回绕成负数导致 end 钳制失效，因此用减法比对。
         if (count > n - startIndex) count = n - startIndex;
         int end = startIndex + count;
         int i = startIndex;
-        Vector256 target256 = Vector256.Create(value);
-
-        while (i + 32 <= end) {
-            Vector256 v = Vector256.Load(source, i);
-            Vector256 eq = Vector256.Equals(v, target256);
-            int mask = Vector256.ExtractMostSignificantBits(eq);
-            if (mask != 0) {
-                int bit = BitOperations.TrailingZeroCount(mask);
-                return i + bit;
-            }
-            i = i + 32;
-        }
-
-        Vector128 target128 = Vector128.Create(value);
-        while (i + 16 <= end) {
-            Vector128 v = Vector128.Load(source, i);
-            Vector128 eq = Vector128.Equals(v, target128);
-            int mask = Vector128.ExtractMostSignificantBits(eq);
-            if (mask != 0) {
-                int bit = BitOperations.TrailingZeroCount(mask);
-                return i + bit;
-            }
-            i = i + 16;
-        }
-
         while (i < end) {
             if (source[i] == value) return i;
             i = i + 1;
@@ -79,7 +34,7 @@ class MemoryExtensions {
         return -1;
     }
 
-    // 在字节序列中查找指定字节值的第一个匹配项索引（AVX2 32 字节并行 + TrailingZeroCount 硬件指令单周期定位）。
+    // 在字节序列中查找指定字节值的第一个匹配项索引。
     public static int IndexOf(this byte[] source, byte value, int startIndex) {
         if (source == null) return -1;
         return MemoryExtensions.IndexOf(source, value, startIndex, source.Length - startIndex);
@@ -90,26 +45,10 @@ class MemoryExtensions {
         return MemoryExtensions.IndexOf(source, value, 0);
     }
 
-    // 在字节序列中从后往前查找指定字节值的最后一个匹配项索引（AVX2 32 字节逆向扫描 + LeadingZeroCount 单周期定位）。
+    // 在字节序列中从后往前查找指定字节值的最后一个匹配项索引。
     public static int LastIndexOf(this byte[] source, byte value) {
         if (source == null || source.Length == 0) return -1;
-        int n = source.Length;
-        int i = n - 32;
-        Vector256 target256 = Vector256.Create(value);
-
-        while (i >= 0) {
-            Vector256 v = Vector256.Load(source, i);
-            Vector256 eq = Vector256.Equals(v, target256);
-            int mask = Vector256.ExtractMostSignificantBits(eq);
-            if (mask != 0) {
-                int bit = 31 - BitOperations.LeadingZeroCount(mask);
-                return i + bit;
-            }
-            i = i - 32;
-        }
-
-        int rem = i + 32;
-        int k = rem - 1;
+        int k = source.Length - 1;
         while (k >= 0) {
             if (source[k] == value) return k;
             k = k - 1;
@@ -122,29 +61,14 @@ class MemoryExtensions {
         return MemoryExtensions.IndexOf(source, value, 0) >= 0;
     }
 
-    // 检查指定字节序列切片是否全为 ASCII 字符（0..127）。AVX2 32 字节并行扫描高位掩码（vpmovmskb == 0）。
+    // 检查指定字节序列切片是否全为 ASCII 字符（0..127）。
     public static bool IsAscii(this byte[] source, int offset, int length) {
         if (source == null || length <= 0) return true;
         int end = offset + length;
         if (end > source.Length) end = source.Length;
         int i = offset;
-
-        while (i + 32 <= end) {
-            Vector256 v = Vector256.Load(source, i);
-            int mask = Vector256.ExtractMostSignificantBits(v);
-            if (mask != 0) return false;
-            i = i + 32;
-        }
-
-        while (i + 16 <= end) {
-            Vector128 v = Vector128.Load(source, i);
-            int mask = Vector128.ExtractMostSignificantBits(v);
-            if (mask != 0) return false;
-            i = i + 16;
-        }
-
         while (i < end) {
-            if (source[i] >= 128) return false;
+            if ((source[i] & 128) != 0) return false;
             i = i + 1;
         }
         return true;
@@ -156,46 +80,14 @@ class MemoryExtensions {
         return MemoryExtensions.IsAscii(source, 0, source.Length);
     }
 
-    // 在字节序列切片中并发查找两个目标字节中的任意一个匹配项（例如快速扫描 \r 或 \n，引号或反斜杠）。AVX2 32 字节双目标单周期比对。
+    // 在字节序列切片中并发查找两个目标字节中的任意一个匹配项。
     public static int IndexOfAny(this byte[] source, byte value1, byte value2, int startIndex, int count) {
         if (source == null || count <= 0) return -1;
         int n = source.Length;
         if (startIndex < 0) startIndex = 0;
-        // 减法比较钳制：同 IndexOf，防 i32 回绕越界。
         if (count > n - startIndex) count = n - startIndex;
         int end = startIndex + count;
         int i = startIndex;
-        Vector256 t1_256 = Vector256.Create(value1);
-        Vector256 t2_256 = Vector256.Create(value2);
-
-        while (i + 32 <= end) {
-            Vector256 v = Vector256.Load(source, i);
-            Vector256 eq1 = Vector256.Equals(v, t1_256);
-            Vector256 eq2 = Vector256.Equals(v, t2_256);
-            Vector256 combined = Vector256.Or(eq1, eq2);
-            int mask = Vector256.ExtractMostSignificantBits(combined);
-            if (mask != 0) {
-                int bit = BitOperations.TrailingZeroCount(mask);
-                return i + bit;
-            }
-            i = i + 32;
-        }
-
-        Vector128 t1_128 = Vector128.Create(value1);
-        Vector128 t2_128 = Vector128.Create(value2);
-        while (i + 16 <= end) {
-            Vector128 v = Vector128.Load(source, i);
-            Vector128 eq1 = Vector128.Equals(v, t1_128);
-            Vector128 eq2 = Vector128.Equals(v, t2_128);
-            Vector128 combined = Vector128.Or(eq1, eq2);
-            int mask = Vector128.ExtractMostSignificantBits(combined);
-            if (mask != 0) {
-                int bit = BitOperations.TrailingZeroCount(mask);
-                return i + bit;
-            }
-            i = i + 16;
-        }
-
         while (i < end) {
             byte b = source[i];
             if (b == value1 || b == value2) return i;
@@ -204,7 +96,7 @@ class MemoryExtensions {
         return -1;
     }
 
-    // 在字节序列中并发查找两个目标字节中的任意一个匹配项（例如快速扫描 \r 或 \n，引号或反斜杠）。AVX2 32 字节双目标单周期比对。
+    // 在字节序列中并发查找两个目标字节中的任意一个匹配项。
     public static int IndexOfAny(this byte[] source, byte value1, byte value2, int startIndex) {
         if (source == null) return -1;
         return MemoryExtensions.IndexOfAny(source, value1, value2, startIndex, source.Length - startIndex);
@@ -215,45 +107,12 @@ class MemoryExtensions {
         return MemoryExtensions.IndexOfAny(source, value1, value2, 0);
     }
 
-    // 将指定切片内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。AVX2 32 字节无分支饱和算术并行变换。
+    // 将指定切片内的 ASCII 小写字母（a-z）就地转换为大写字母（A-Z）。
     public static void ToUpperAscii(this byte[] source, int offset, int length) {
         if (source == null || length <= 0) return;
         int end = offset + length;
         if (end > source.Length) end = source.Length;
         int i = offset;
-
-        Vector256 baseA_256 = Vector256.Create((byte)97);
-        Vector256 range25_256 = Vector256.Create((byte)25);
-        Vector256 bit32_256 = Vector256.Create((byte)32);
-        Vector256 zero_256 = Vector256.Zero;
-
-        while (i + 32 <= end) {
-            Vector256 v = Vector256.Load(source, i);
-            Vector256 off = Vector256.Subtract(v, baseA_256);
-            Vector256 sat = Vector256.SubtractSaturate(off, range25_256);
-            Vector256 isLower = Vector256.Equals(sat, zero_256);
-            Vector256 mask = Vector256.And(isLower, bit32_256);
-            Vector256 upper = Vector256.Xor(v, mask);
-            Vector256.Store(source, i, upper);
-            i = i + 32;
-        }
-
-        Vector128 baseA_128 = Vector128.Create((byte)97);
-        Vector128 range25_128 = Vector128.Create((byte)25);
-        Vector128 bit32_128 = Vector128.Create((byte)32);
-        Vector128 zero_128 = Vector128.Zero;
-
-        while (i + 16 <= end) {
-            Vector128 v = Vector128.Load(source, i);
-            Vector128 off = Vector128.Subtract(v, baseA_128);
-            Vector128 sat = Vector128.SubtractSaturate(off, range25_128);
-            Vector128 isLower = Vector128.Equals(sat, zero_128);
-            Vector128 mask = Vector128.And(isLower, bit32_128);
-            Vector128 upper = Vector128.Xor(v, mask);
-            Vector128.Store(source, i, upper);
-            i = i + 16;
-        }
-
         while (i < end) {
             byte b = source[i];
             if (b >= 97 && b <= 122) {
@@ -269,45 +128,12 @@ class MemoryExtensions {
         MemoryExtensions.ToUpperAscii(source, 0, source.Length);
     }
 
-    // 将指定切片内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。AVX2 32 字节无分支饱和算术并行变换。
+    // 将指定切片内的 ASCII 大写字母（A-Z）就地转换为小写字母（a-z）。
     public static void ToLowerAscii(this byte[] source, int offset, int length) {
         if (source == null || length <= 0) return;
         int end = offset + length;
         if (end > source.Length) end = source.Length;
         int i = offset;
-
-        Vector256 baseA_256 = Vector256.Create((byte)65);
-        Vector256 range25_256 = Vector256.Create((byte)25);
-        Vector256 bit32_256 = Vector256.Create((byte)32);
-        Vector256 zero_256 = Vector256.Zero;
-
-        while (i + 32 <= end) {
-            Vector256 v = Vector256.Load(source, i);
-            Vector256 off = Vector256.Subtract(v, baseA_256);
-            Vector256 sat = Vector256.SubtractSaturate(off, range25_256);
-            Vector256 isUpper = Vector256.Equals(sat, zero_256);
-            Vector256 mask = Vector256.And(isUpper, bit32_256);
-            Vector256 lower = Vector256.Or(v, mask);
-            Vector256.Store(source, i, lower);
-            i = i + 32;
-        }
-
-        Vector128 baseA_128 = Vector128.Create((byte)65);
-        Vector128 range25_128 = Vector128.Create((byte)25);
-        Vector128 bit32_128 = Vector128.Create((byte)32);
-        Vector128 zero_128 = Vector128.Zero;
-
-        while (i + 16 <= end) {
-            Vector128 v = Vector128.Load(source, i);
-            Vector128 off = Vector128.Subtract(v, baseA_128);
-            Vector128 sat = Vector128.SubtractSaturate(off, range25_128);
-            Vector128 isUpper = Vector128.Equals(sat, zero_128);
-            Vector128 mask = Vector128.And(isUpper, bit32_128);
-            Vector128 lower = Vector128.Or(v, mask);
-            Vector128.Store(source, i, lower);
-            i = i + 16;
-        }
-
         while (i < end) {
             byte b = source[i];
             if (b >= 65 && b <= 90) {
@@ -323,15 +149,32 @@ class MemoryExtensions {
         MemoryExtensions.ToLowerAscii(source, 0, source.Length);
     }
 
-    // 将字节数组快速编码为小写十六进制字符串（零中间对象分配）。
+    // 将字节数组快速编码为小写十六进制字符串。
     public static string ToHexString(this byte[] source) {
         if (source == null) return "";
-        return System.Convert.ToHexString(source, 0, source.Length);
+        return MemoryExtensions.ToHexString(source, 0, source.Length);
     }
 
-    // 将字节数组切片快速编码为小写十六进制字符串（零中间对象分配）。
+    // 将字节数组切片快速编码为小写十六进制字符串。
     public static string ToHexString(this byte[] source, int offset, int length) {
-        if (source == null) return "";
-        return System.Convert.ToHexString(source, offset, length);
+        if (source == null || length <= 0) return "";
+        int end = offset + length;
+        if (end > source.Length) end = source.Length;
+        int realLen = end - offset;
+        if (realLen <= 0) return "";
+        byte[] buf = new byte[realLen * 2];
+        byte[] digits = new byte[] {
+            48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102
+        };
+        int di = 0;
+        int i = offset;
+        while (i < end) {
+            int v = source[i] & 255;
+            buf[di] = digits[v >> 4];
+            buf[di + 1] = digits[v & 15];
+            di = di + 2;
+            i = i + 1;
+        }
+        return buf.ToStr(0, realLen * 2);
     }
 }

@@ -1,32 +1,36 @@
 // GenDbEmit.zan -- 实体绑定类文本生成。
+//
 // 编译期只发射「实体列元数据 + 薄类型门面」：
-// __DbQ_<E>       类型化 SELECT 门面(转发 OrmSelect,用实体类型收口结果)
-// __DbI_<E>       类型化 INSERT 门面(转发 OrmInsert)
-// __DbU_<E>       类型化 UPDATE 门面(转发 OrmUpdate)
-// __DbD_<E>       类型化 DELETE 门面(转发 OrmDelete)
-// __DbCF_<E>      CodeFirst 门面(转发 OrmSync)
-// __DbM_<E>       实体字段取值/赋值口(按列元数据分发到直接字段访问)
-// __DbB_<E>       IOrmRows 实现:把实体行交给运行期按列取值
+//   <Entity>Cols    列名常量 + Has/Kind/Require + OrmMeta（表名/列/导航/索引）
+//   __DbQ_<E>       类型化 SELECT 门面(转发 OrmSelect,用实体类型收口结果)
+//   __DbI_<E>       类型化 INSERT 门面(转发 OrmInsert)
+//   __DbU_<E>       类型化 UPDATE 门面(转发 OrmUpdate)
+//   __DbD_<E>       类型化 DELETE 门面(转发 OrmDelete)
+//   __DbCF_<E>      CodeFirst 门面(转发 OrmSync)
+//   __DbM_<E>       实体字段取值/赋值口(按列元数据分发到直接字段访问)
+//   __DbB_<E>       IOrmRows 实现:把实体行交给运行期按列取值
 // 以及汇总类 __DbBind(工厂方法 + SyncAll)。
+//
 // SQL 文本、动态列集合、参数绑定、行映射、方言差异、SQL 缓存都在
+// System.Data.Orm 的共享实现里(OrmMeta/IOrmRows/OrmDialect/OrmSelect/
 // OrmInsert/OrmUpdate/OrmDelete/OrmSync)：改 SQL 规则只改那一处，
 // 用户工程加实体/加字段只多几行元数据，不再复制成段的 SQL 代码。
 namespace System.Compiler;
 
-// 实体绑定类文本生成：`<Entity>Cols`、`__DbQ_/I_/U_/D_/CF_`
-// 各门面、`__DbM_` 取值/赋值口与 `__DbB_` 行来源,以及汇总类
-// `__DbBind`。由 <see cref="GenDb"/> 在收集到实体后调用
-// <see cref="Run"/> 产出整段源码。
+/// <summary>实体绑定类文本生成：`<Entity>Cols`、`__DbQ_/I_/U_/D_/CF_`
+/// 各门面、`__DbM_` 取值/赋值口与 `__DbB_` 行来源,以及汇总类
+/// `__DbBind`。由 <see cref="GenDb"/> 在收集到实体后调用
+/// <see cref="Run"/> 产出整段源码。</summary>
 class GenDbEmit {
-    // 声明类型是否是 64 位整数(需要 BIGINT 列与 64 位绑定/读取)。
+    /// 声明类型是否是 64 位整数(需要 BIGINT 列与 64 位绑定/读取)。
     static bool Is64(string type) {
         return type == "long" || type == "ulong" || type == "nint";
     }
 
-    // 布尔值的 Zan 字面量("true"/"false"),拼进生成的代码。
+    /// 布尔值的 Zan 字面量("true"/"false"),拼进生成的代码。
     static string Bl(bool v) { return v ? "true" : "false"; }
 
-    // 行的 Getter 名(按字段类型)——投影仍按目标类型直接取值。
+    /// 行的 Getter 名(按字段类型)——投影仍按目标类型直接取值。
     static string Getter(int kind) {
         if (kind == 0 || kind == 4) { return "GetInt"; }
         if (kind == 1) { return "GetDouble"; }
@@ -34,21 +38,19 @@ class GenDbEmit {
         return "GetString";
     }
 
-    // `m.Col(...)` 的实参文本：列名、字段名、类型码、是否 64 位、
-    // 主键、自增、非空、字符串长度。列名/字段名可来自
-    // [Column(...)] 特性文本，过 GenCommon.Esc 才进字面量。
+    /// `m.Col(...)` 的实参文本：列名、字段名、类型码、是否 64 位、
+    /// 主键、自增、非空、字符串长度。
     static string ColArgs(DbField f) {
-        return "\"" + GenCommon.Esc(f.Col) + "\", \"" + GenCommon.Esc(f.Name)
-            + "\", "
+        return "\"" + f.Col + "\", \"" + f.Name + "\", "
             + Convert.ToString(f.Kind) + ", "
             + GenDbEmit.Bl(GenDbEmit.Is64(f.TypeName)) + ", "
             + GenDbEmit.Bl(f.IsPk) + ", " + GenDbEmit.Bl(f.IsIdent) + ", "
             + GenDbEmit.Bl(f.NotNull) + ", " + Convert.ToString(f.StrLen);
     }
 
-    // 聚合/列投影终端:GenDb.Projs 里属于本实体的每个形状生成
-    // `Pj<N>()` / `Pj<N>Async()` / `Pj<N>One()` / `Pj<N>OneAsync()`,
-    // 结果映射到业务侧声明的目标类型(类型安全,业务侧不出现 SQL)。
+    /// 聚合/列投影终端:GenDb.Projs 里属于本实体的每个形状生成
+    /// `Pj<N>()` / `Pj<N>Async()` / `Pj<N>One()` / `Pj<N>OneAsync()`,
+    /// 结果映射到业务侧声明的目标类型(类型安全,业务侧不出现 SQL)。
     static void Projections(StringBuilder b, string cls) {
         for (int i = 0; i < GenDb.Projs.Count; i = i + 1) {
             JsonValue p = GenDb.Projs[i];
@@ -67,7 +69,7 @@ class GenDbEmit {
                 if (items.At(k).Bool("key", false)) {
                     if (lit.ToString().Length > 0) {
                         cols.Append((open ? " + " : "") + "\"" +
-                                    GenCommon.Esc(lit.ToString()) + "\"");
+                                    lit.ToString() + "\"");
                         open = true;
                         lit = new StringBuilder();
                     }
@@ -78,8 +80,8 @@ class GenDbEmit {
                 }
             }
             if (lit.ToString().Length > 0) {
-                cols.Append((open ? " + " : "") + "\"" +
-                            GenCommon.Esc(lit.ToString()) + "\"");
+                cols.Append((open ? " + " : "") + "\"" + lit.ToString() +
+                            "\"");
                 open = true;
             }
             if (!open) { cols.Append("\"\""); }
@@ -127,9 +129,9 @@ class GenDbEmit {
         }
     }
 
-    // 实体的取值/赋值口 `__DbM_<T>` 与行来源 `__DbB_<T>`。列集合和 SQL
-    // 仍由运行期决定；这里仅把列元数据分发到实体的直接字段访问，避免为每个
-    // 实体拉入通用反射读写表。
+    /// 实体的取值/赋值口 `__DbM_<T>` 与行来源 `__DbB_<T>`。列集合和 SQL
+    /// 仍由运行期决定；这里仅把列元数据分发到实体的直接字段访问，避免为每个
+    /// 实体拉入通用反射读写表。
     static bool Has(List<string> l, string v) {
         for (int i = 0; i < l.Count; i = i + 1) {
             if (l[i] == v) { return true; }
@@ -137,9 +139,9 @@ class GenDbEmit {
         return false;
     }
 
-    // 生成 `__DbM_<E>`(按列字段名分发到实体直接字段的
-    // Read/Bind)与 `__DbB_<E>`(IOrmRows:实体列表按行按列绑定)。
-    // 导航字段(Kind 5)不参与列绑定。
+    /// 生成 `__DbM_<E>`(按列字段名分发到实体直接字段的
+    /// Read/Bind)与 `__DbB_<E>`(IOrmRows:实体列表按行按列绑定)。
+    /// 导航字段(Kind 5)不参与列绑定。
     static void GenAccess(StringBuilder b, string cls) {
         List<DbField> fs = GenDb.FieldsOf(cls, 0);
         b.Append("class __DbM_" + cls + " {\n" +
@@ -204,8 +206,8 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 只有标识符字符的名字才写进 DDL:索引名来自实体上的字面量,
-    // 但生成侧仍然自己把关,不把任何别的东西拼进语句。
+    /// 只有标识符字符的名字才写进 DDL:索引名来自实体上的字面量,
+    /// 但生成侧仍然自己把关,不把任何别的东西拼进语句。
     static bool IsIdent(string s) {
         if (s.Length == 0) { return false; }
         for (int i = 0; i < s.Length; i = i + 1) {
@@ -217,10 +219,10 @@ class GenDbEmit {
         return true;
     }
 
-    // 实体 `[Index(Name=, Fields=, IsUnique=)]` -> 每条索引一行
-    // `m.Index(name, cols, unique)` 的实参文本。`Fields` 写的是实体
-    // 字段名,进语句的是它们的物理列名;既有表也补建缺失的索引
-    // (存在性由 OrmDialect 按方言判断)。
+    /// 实体 `[Index(Name=, Fields=, IsUnique=)]` -> 每条索引一行
+    /// `m.Index(name, cols, unique)` 的实参文本。`Fields` 写的是实体
+    /// 字段名,进语句的是它们的物理列名;既有表也补建缺失的索引
+    /// (存在性由 OrmDialect 按方言判断)。
     static List<string> IndexArgs(string cls, List<DbField> fs, string tbl) {
         List<string> outl = new List<string>();
         List<JsonValue> attrs = GenDb.IndexAttrs(cls);
@@ -253,29 +255,27 @@ class GenDbEmit {
                 GenDb.Diag(a, "Index Name must be an identifier: " + nm);
                 return new List<string>();
             }
-            outl.Add("\"" + nm + "\", \"" + GenCommon.Esc(cols.ToString())
-                     + "\", "
+            outl.Add("\"" + nm + "\", \"" + cols.ToString() + "\", "
                      + GenDbEmit.Bl(GenDb.AttrBool(a, "IsUnique", false)));
         }
         return outl;
     }
 
-    // `<Entity>Cols`:表名 + 列名常量 + Has/Kind/Require + 运行期元数据。
-    // 元数据只建一次(静态缓存),SQL 片段的缓存挂在它上面。
+    /// `<Entity>Cols`:表名 + 列名常量 + Has/Kind/Require + 运行期元数据。
+    /// 元数据只建一次(静态缓存),SQL 片段的缓存挂在它上面。
     static void GenCols(StringBuilder b, string cls, List<DbField> fs,
                         string tbl) {
         b.Append("class " + cls + "Cols {\n");
-        /* 表名/列名可来自 [Table(...)]/[Column(...)] 特性文本：
-         * 进生成的字符串字面量前统一过 GenCommon.Esc。 */
+        /* 表名常量:让内省/运维接口拿到物理表名,而不是业务侧再写一遍
+         * 字面量。实体自己有 Table 字段时让位给它。 */
         if (GenDb.FieldFind(fs, "Table") == null) {
-            b.Append("    static string Table = \"" + GenCommon.Esc(tbl)
-                     + "\";\n");
+            b.Append("    static string Table = \"" + tbl + "\";\n");
         }
         for (int i = 0; i < fs.Count; i = i + 1) {
             DbField f = fs[i];
             if (f.Kind == 5) { continue; }
-            b.Append("    static string " + f.Name + " = \""
-                     + GenCommon.Esc(f.Col) + "\";\n");
+            b.Append("    static string " + f.Name + " = \"" + f.Col +
+                     "\";\n");
         }
         /* 运行期元数据:列、导航连接、索引 */
         b.Append("    static OrmMeta __M;\n" +
@@ -286,8 +286,8 @@ class GenDbEmit {
                  "        lock (" + cls + "Cols.__MGuard) {\n" +
                  "            if (" + cls + "Cols.__M != null) { return " +
                  cls + "Cols.__M; }\n" +
-                 "        OrmMeta m = OrmMeta.Of(\"" + cls + "\", \""
-                 + GenCommon.Esc(tbl) + "\");\n");
+                 "        OrmMeta m = OrmMeta.Of(\"" + cls + "\", \"" + tbl +
+                 "\");\n");
         for (int i = 0; i < fs.Count; i = i + 1) {
             DbField f = fs[i];
             if (f.Kind == 5) { continue; }
@@ -299,15 +299,13 @@ class GenDbEmit {
             if (f.Kind != 5) { continue; }
             string v = "n" + Convert.ToString(nv);
             b.Append("        OrmNav " + v + " = m.Nav(\"" + f.Name +
-                     "\", \"" + GenCommon.Esc(GenDb.TableOf(f.TypeName))
-                     + "\");\n");
+                     "\", \"" + GenDb.TableOf(f.TypeName) + "\");\n");
             List<DbField> nfs = GenDb.FieldsOf(f.TypeName, 0);
             for (int k = 0; k < nfs.Count; k = k + 1) {
                 DbField g = nfs[k];
                 if (g.Kind == 5) { continue; }
-                b.Append("        " + v + ".Col(\"" + GenCommon.Esc(g.Col)
-                         + "\", \"" + GenCommon.Esc(g.Name) + "\", "
-                         + Convert.ToString(g.Kind) + ", " +
+                b.Append("        " + v + ".Col(\"" + g.Col + "\", \"" +
+                         g.Name + "\", " + Convert.ToString(g.Kind) + ", " +
                          GenDbEmit.Bl(GenDbEmit.Is64(g.TypeName)) + ");\n");
             }
             nv = nv + 1;
@@ -331,8 +329,8 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 查询门面 __DbQ_<E>:链式方法转发给 OrmSelect,只有行映射与终端
-    // 需要实体类型。
+    /// 查询门面 __DbQ_<E>:链式方法转发给 OrmSelect,只有行映射与终端
+    /// 需要实体类型。
     static void GenEntity(StringBuilder b, string cls) {
         List<DbField> fs = GenDb.FieldsOf(cls, 0);
         string q = "__DbQ_" + cls;
@@ -344,7 +342,8 @@ class GenDbEmit {
                  "Cols.__Meta());\n" +
                  "        return r;\n" +
                  "    }\n");
-        b.Append("    " + q + " Where(Expr<" + cls + "> e) {\n" +
+        b.Append("    " + q + " W(string f) { this.q.W(f); return this; }\n" +
+                 "    " + q + " Where(Expr<" + cls + "> e) {\n" +
                  "        if (e == null) { return this; }\n" +
                  "        this.q.WExpr(e.Root);\n" +
                  "        return this;\n" +
@@ -355,56 +354,28 @@ class GenDbEmit {
                  "return this; }\n" +
                  "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
                  "    " + q + " AsTable(string t) { this.q.AsTable(t); " +
-                 "return this; }\n");
-        /* 值自带条件原语:列名按实体校验、值随条件原子绑定——应用层
-         * 拼条件的唯一入口,裸片段在这里没有名字。 */
-        b.Append("    " + q + " WhereEq(string c, string v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, int v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, long v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereGe(string c, long v) { " +
-                 "this.q.WhereGe(c, v); return this; }\n" +
-                 "    " + q + " WhereLe(string c, long v) { " +
-                 "this.q.WhereLe(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<int> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<long> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<string> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereLikeAny(string cols, string v) { " +
-                 "this.q.WhereLikeAny(cols, v); return this; }\n" +
-                 "    " + q + " WhereNone() { this.q.WhereNone(); " +
                  "return this; }\n" +
-                 "    " + q + " WhereConds(List<OrmCond> cs) { " +
-                 "this.q.WhereConds(cs); return this; }\n");
-        /* 降级专用:类型化 lambda 的机器产物。`__` 前缀示意应用层不得
-         * 手写——片段与参数分离的配对写法只属于生成代码。 */
-        b.Append("    " + q + " __Frag(string f) { this.q.W(f); " +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __P(string v) { this.q.P(v); return this; }\n" +
-                 "    " + q + " __Pi(int v) { this.q.Pi(v); return this; }\n" +
-                 "    " + q + " __Pl(long v) { this.q.Pl(v); return this; }\n" +
-                 "    " + q + " __Pd(double v) { this.q.Pd(v); return this; }\n" +
-                 "    " + q + " __InI(List<int> vs) { this.q.InI(vs); " +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InL(List<long> vs) { this.q.InL(vs); " +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InS(List<string> vs) { this.q.InS(vs); " +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InD(List<double> vs) { this.q.InD(vs); " +
+                 "    " + q + " OB(string col) { this.q.OB(col); " +
                  "return this; }\n" +
-                 "    " + q + " __OB(string col) { this.q.OB(col); " +
+                 "    " + q + " OBD(string col) { this.q.OBD(col); " +
                  "return this; }\n" +
-                 "    " + q + " __OBD(string col) { this.q.OBD(col); " +
+                 "    " + q + " GB(string col) { this.q.GB(col); " +
                  "return this; }\n" +
-                 "    " + q + " __GB(string col) { this.q.GB(col); " +
-                 "return this; }\n" +
-                 "    " + q + " __OBK() { this.q.OBK(); return this; }\n" +
-                 "    " + q + " __OBDK() { this.q.OBDK(); return this; }\n" +
-                 "    " + q + " __H(string f) { this.q.H(f); return this; }\n" +
+                 "    " + q + " OBK() { this.q.OBK(); return this; }\n" +
+                 "    " + q + " OBDK() { this.q.OBDK(); return this; }\n" +
+                 "    " + q + " H(string f) { this.q.H(f); return this; }\n" +
                  "    " + q + " DISTINCT() { this.q.DISTINCT(); " +
                  "return this; }\n" +
                  "    " + q + " Take(int n) { this.q.Take(n); return this; }\n" +
@@ -412,8 +383,6 @@ class GenDbEmit {
                  "return this; }\n" +
                  "    " + q + " Limit(int n) { this.q.Take(n); " +
                  "return this; }\n" +
-                 "    " + q + " Limit(int n, int off) { this.q.Take(n); " +
-                 "this.q.SkipN(off); return this; }\n" +
                  "    " + q + " Offset(int n) { this.q.SkipN(n); " +
                  "return this; }\n" +
                  "    " + q + " Page(int index, int size) { " +
@@ -514,8 +483,8 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 插入门面 __DbI_<E>:行列表/动态列/Only/Skip/Upsert 都转发给
-    // OrmInsert,只有实体类型的重载需要在这里。
+    /// 插入门面 __DbI_<E>:行列表/动态列/Only/Skip/Upsert 都转发给
+    /// OrmInsert,只有实体类型的重载需要在这里。
     static void GenInsert(StringBuilder b, string cls, List<DbField> fs,
                           string tbl) {
         string q = "__DbI_" + cls;
@@ -576,8 +545,8 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 更新门面 __DbU_<E>：Set/SetIncr/Where 链转发给 OrmUpdate；
-    // 实体整体更新在运行期按元数据展开。
+    /// 更新门面 __DbU_<E>：Set/SetIncr/Where 链转发给 OrmUpdate；
+    /// 实体整体更新在运行期按元数据展开。
     static void GenUpdate(StringBuilder b, string cls, List<DbField> fs,
                           string tbl) {
         string q = "__DbU_" + cls;
@@ -601,51 +570,37 @@ class GenDbEmit {
                  "return this; }\n" +
                  "    " + q + " CondBegin(bool c) { this.q.CondBegin(c); " +
                  "return this; }\n" +
-                 "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n");
-        /* 值自带条件原语:列名按实体校验、值随条件原子绑定。 */
-        b.Append("    " + q + " WhereEq(string c, string v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, int v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, long v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<int> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<long> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereNone() { this.q.WhereNone(); " +
-                 "return this; }\n");
-        /* 降级专用(`__` 前缀,应用层不得手写):片段与参数分离的
-         * 配对写法只属于生成代码。 */
-        b.Append("    " + q + " __Frag(string f) { this.q.W(f); " +
+                 "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
+                 "    " + q + " W(string f) { this.q.W(f); return this; }\n" +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __P(string v) { this.q.P(v); return this; }\n" +
-                 "    " + q + " __Pi(int v) { this.q.Pi(v); return this; }\n" +
-                 "    " + q + " __Pl(long v) { this.q.Pl(v); return this; }\n" +
-                 "    " + q + " __Pd(double v) { this.q.Pd(v); return this; }\n" +
-                 "    " + q + " __InI(List<int> vs) { this.q.InI(vs); " +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InL(List<long> vs) { this.q.InL(vs); " +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InS(List<string> vs) { this.q.InS(vs); " +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InD(List<double> vs) { this.q.InD(vs); " +
-                 "return this; }\n");
-        b.Append("    " + q + " SetInt(string c, int v) { " +
-                 "this.q.SetI(c, v); return this; }\n" +
-                 "    " + q + " SetLong(string c, long v) { " +
-                 "this.q.SetL(c, v); return this; }\n" +
-                 "    " + q + " SetDouble(string c, double v) { " +
+                 "    " + q + " Frag(string f) { this.q.Frag(f); " +
+                 "return this; }\n" +
+                 "    " + q + " SetI(string c, int v) { this.q.SetI(c, v); " +
+                 "return this; }\n" +
+                 "    " + q + " SetL(string c, long v) { this.q.SetL(c, v); " +
+                 "return this; }\n" +
+                 "    " + q + " SetD(string c, double v) { " +
                  "this.q.SetD(c, v); return this; }\n" +
-                 "    " + q + " SetString(string c, string v) { " +
+                 "    " + q + " SetS(string c, string v) { " +
                  "this.q.SetS(c, v); return this; }\n" +
-                 "    " + q + " SetBool(string c, bool v) { this.q.SetB(c, v); " +
+                 "    " + q + " SetB(string c, bool v) { this.q.SetB(c, v); " +
                  "return this; }\n" +
-                 "    " + q + " SetIncrInt(string c, int v) { " +
+                 "    " + q + " SetIncrI(string c, int v) { " +
                  "this.q.SetIncrI(c, v); return this; }\n" +
-                 "    " + q + " SetIncrLong(string c, long v) { " +
+                 "    " + q + " SetIncrL(string c, long v) { " +
                  "this.q.SetIncrL(c, v); return this; }\n" +
-                 "    " + q + " SetIncrDouble(string c, double v) { " +
+                 "    " + q + " SetIncrD(string c, double v) { " +
                  "this.q.SetIncrD(c, v); return this; }\n" +
                  "    " + q + " SetSource(" + cls + " o) {\n" +
                  "        __DbB_" + cls + " b = __DbB_" + cls + ".New();\n" +
@@ -660,7 +615,7 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 删除门面 __DbD_<E>：Where 链转发给 OrmDelete。
+    /// 删除门面 __DbD_<E>：Where 链转发给 OrmDelete。
     static void GenDelete(StringBuilder b, string cls, List<DbField> fs,
                           string tbl) {
         string q = "__DbD_" + cls;
@@ -677,35 +632,20 @@ class GenDbEmit {
                  "    " + q + " CondBegin(bool c) { this.q.CondBegin(c); " +
                  "return this; }\n" +
                  "    " + q + " CondEnd() { this.q.CondEnd(); return this; }\n" +
+                 "    " + q + " W(string f) { this.q.W(f); return this; }\n" +
                  "    " + q + " WhereDict(DbValues v) { this.q.WhereDict(v); " +
-                 "return this; }\n");
-        /* 值自带条件原语:列名按实体校验、值随条件原子绑定。 */
-        b.Append("    " + q + " WhereEq(string c, string v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, int v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereEq(string c, long v) { " +
-                 "this.q.WhereEq(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<int> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereIn(string c, List<long> v) { " +
-                 "this.q.WhereIn(c, v); return this; }\n" +
-                 "    " + q + " WhereNone() { this.q.WhereNone(); " +
-                 "return this; }\n");
-        /* 降级专用(`__` 前缀,应用层不得手写)。 */
-        b.Append("    " + q + " __Frag(string f) { this.q.W(f); " +
                  "return this; }\n" +
-                 "    " + q + " __P(string v) { this.q.P(v); return this; }\n" +
-                 "    " + q + " __Pi(int v) { this.q.Pi(v); return this; }\n" +
-                 "    " + q + " __Pl(long v) { this.q.Pl(v); return this; }\n" +
-                 "    " + q + " __Pd(double v) { this.q.Pd(v); return this; }\n" +
-                 "    " + q + " __InI(List<int> vs) { this.q.InI(vs); " +
+                 "    " + q + " P(string v) { this.q.P(v); return this; }\n" +
+                 "    " + q + " Pi(int v) { this.q.Pi(v); return this; }\n" +
+                 "    " + q + " Pl(long v) { this.q.Pl(v); return this; }\n" +
+                 "    " + q + " Pd(double v) { this.q.Pd(v); return this; }\n" +
+                 "    " + q + " InI(List<int> vs) { this.q.InI(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InL(List<long> vs) { this.q.InL(vs); " +
+                 "    " + q + " InL(List<long> vs) { this.q.InL(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InS(List<string> vs) { this.q.InS(vs); " +
+                 "    " + q + " InS(List<string> vs) { this.q.InS(vs); " +
                  "return this; }\n" +
-                 "    " + q + " __InD(List<double> vs) { this.q.InD(vs); " +
+                 "    " + q + " InD(List<double> vs) { this.q.InD(vs); " +
                  "return this; }\n" +
                  "    int ExecuteAffrows() { return " +
                  "this.q.ExecuteAffrows(); }\n" +
@@ -714,7 +654,7 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // CodeFirst 门面 __DbCF_<E>：建表/加列/补索引都由 OrmSync 按元数据做。
+    /// CodeFirst 门面 __DbCF_<E>：建表/加列/补索引都由 OrmSync 按元数据做。
     static void GenCodeFirst(StringBuilder b, string cls, List<DbField> fs,
                              string tbl) {
         b.Append("class __DbCF_" + cls + " {\n" +
@@ -725,7 +665,7 @@ class GenDbEmit {
                  "}\n");
     }
 
-    // 汇总 __DbBind + 各实体类,产出整段生成源码。
+    /// 汇总 __DbBind + 各实体类,产出整段生成源码。
     static void Run() {
         StringBuilder outb = new StringBuilder();
         List<string> need = GenDb.NeedNames;
