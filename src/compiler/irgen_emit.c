@@ -70,7 +70,7 @@ static void emit_main_method(zan_irgen_t *g, zan_ast_node_t *method, zan_symbol_
             LLVMValueRef one = LLVMConstInt(svi32, 1, 0);
             stdout_ptr = zan_call2(g->builder, iob_type, iobfn, &one, 1, "stdout");
         } else {
-            const char *soname = g->target_is_macos ? "__stdoutp" : "stdout";
+            const char *soname = (g->target_is_macos || g->target_is_ios) ? "__stdoutp" : "stdout";
             LLVMValueRef sg = LLVMGetNamedGlobal(g->mod, soname);
             if (!sg) sg = LLVMAddGlobal(g->mod, i8p, soname);
             stdout_ptr = LLVMBuildLoad2(g->builder, i8p, sg, "stdout");
@@ -3209,9 +3209,15 @@ zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
             }
         }
     }
+    if (g->target_is_ios) {
+        LLVMValueRef mainf = LLVMGetNamedFunction(g->mod, "main");
+        if (mainf && LLVMCountBasicBlocks(mainf) > 0) {
+            LLVMSetValueName2(mainf, "zan_user_main", strlen("zan_user_main"));
+        }
+    }
     zan_init_llvm_targets();
 
-    if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_wasm) {
+    if (g->obfuscate_strings /* publish */ && !g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
         for (LLVMValueRef fn = LLVMGetFirstFunction(g->mod); fn;
              fn = LLVMGetNextFunction(fn)) {
             if (LLVMIsDeclaration(fn) || LLVMGetSection(fn)) continue;

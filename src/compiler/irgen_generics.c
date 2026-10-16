@@ -2246,7 +2246,7 @@ void zan_irgen_emit_string_deobf(zan_irgen_t *g) {
     LLVMBuildRetVoid(b);
     LLVMDisposeBuilder(b);
 
-    bool is_elf = !g->target_is_windows && !g->target_is_macos
+    bool is_elf = !g->target_is_windows && !g->target_is_macos && !g->target_is_ios
         && strncmp(g->target_triple, "wasm", 4) != 0;
     if (is_elf) {
         LLVMValueRef ent = LLVMAddGlobal(g->mod, ptr, "__zan.init_array.deobf");

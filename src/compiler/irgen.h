@@ -601,6 +601,7 @@ struct zan_irgen {
     char target_triple[128];
     bool target_is_windows;
     bool target_is_macos;     /* Darwin 平台 stdio 流导出符号适配 */
+    bool target_is_ios;       /* iOS 平台生命周期与 UIKit 代理适配 */
     bool target_is_wasm;      /* WebAssembly 原生异常处理模式标记 */
     bool external_async_executor;
     bool mf_native;           /* 本机宿主平台构建标记 (x64/arm64) */
@@ -660,7 +661,7 @@ static inline void zan_set_module_local(LLVMValueRef fn) {
 static inline void zan_set_odr_comdat(zan_irgen_t *g, LLVMValueRef val, const char *name) {
     if (!val || !g) return;
     LLVMSetLinkage(val, LLVMLinkOnceODRLinkage);
-    if (!g->target_is_macos && !g->target_is_wasm) {
+    if (!g->target_is_macos && !g->target_is_ios && !g->target_is_wasm) {
         LLVMComdatRef group = LLVMGetOrInsertComdat(g->mod, name);
         LLVMSetComdatSelectionKind(group, LLVMAnyComdatSelectionKind);
         LLVMSetComdat(val, group);

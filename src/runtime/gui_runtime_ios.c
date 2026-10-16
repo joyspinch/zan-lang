@@ -12,6 +12,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -30,6 +31,34 @@ typedef void *zan_sel_t;
 typedef void *zan_class_t;
 typedef void *zan_method_t;
 typedef zan_id_t (*zan_imp_t)(zan_id_t, zan_sel_t, ...);
+
+typedef struct {
+    double x, y;
+} zan_cg_point_t;
+
+typedef struct {
+    double width, height;
+} zan_cg_size_t;
+
+typedef struct {
+    zan_cg_point_t origin;
+    zan_cg_size_t size;
+} zan_cg_rect_t;
+
+typedef void *CGColorSpaceRef;
+typedef void *CGDataProviderRef;
+typedef void *CGImageRef;
+typedef void (*CGDataProviderReleaseDataCallback)(void *info, const void *data, size_t size);
+
+static CGColorSpaceRef (*p_CGColorSpaceCreateDeviceRGB)(void) = NULL;
+static void (*p_CGColorSpaceRelease)(CGColorSpaceRef space) = NULL;
+static CGDataProviderRef (*p_CGDataProviderCreateWithData)(void *info, const void *data, size_t size, CGDataProviderReleaseDataCallback releaseData) = NULL;
+static void (*p_CGDataProviderRelease)(CGDataProviderRef provider) = NULL;
+static CGImageRef (*p_CGImageCreate)(size_t width, size_t height, size_t bitsPerComponent, size_t bitsPerPixel, size_t bytesPerRow,
+                                     CGColorSpaceRef space, uint32_t bitmapInfo, CGDataProviderRef provider,
+                                     const double *decode, bool shouldInterpolate, int intent) = NULL;
+static void (*p_CGImageRelease)(CGImageRef image) = NULL;
+static int (*p_UIApplicationMain)(int argc, char **argv, zan_id_t principalClassName, zan_id_t delegateClassName) = NULL;
 
 typedef struct {
     int initialized;
@@ -102,8 +131,18 @@ static int iq_pop(void) {
     return 1;
 }
 
+static void zan_ios_load_frameworks(void) {
+    dlopen("/System/Library/Frameworks/Foundation.framework/Foundation", RTLD_GLOBAL | RTLD_NOW);
+    dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_GLOBAL | RTLD_NOW);
+    dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_GLOBAL | RTLD_NOW);
+    dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_GLOBAL | RTLD_NOW);
+}
+
 static void zan_ios_init_bridge(void) {
     if (g_bridge.initialized) return;
+
+    zan_ios_load_frameworks();
+
     g_bridge.objc_getClass = (zan_class_t (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
     g_bridge.sel_registerName = (zan_sel_t (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
     g_bridge.objc_msgSend = (zan_imp_t)dlsym(RTLD_DEFAULT, "objc_msgSend");
@@ -115,48 +154,200 @@ static void zan_ios_init_bridge(void) {
     g_bridge.method_setImplementation = (zan_imp_t (*)(zan_method_t, zan_imp_t))dlsym(RTLD_DEFAULT, "method_setImplementation");
     g_bridge.zan_gui_wake = (int32_t (*)(void))dlsym(RTLD_DEFAULT, "zan_gui_wake");
 
+    p_CGColorSpaceCreateDeviceRGB = (CGColorSpaceRef (*)(void))dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
+    p_CGColorSpaceRelease = (void (*)(CGColorSpaceRef))dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
+    p_CGDataProviderCreateWithData = (CGDataProviderRef (*)(void *, const void *, size_t, CGDataProviderReleaseDataCallback))dlsym(RTLD_DEFAULT, "CGDataProviderCreateWithData");
+    p_CGDataProviderRelease = (void (*)(CGDataProviderRef))dlsym(RTLD_DEFAULT, "CGDataProviderRelease");
+    p_CGImageCreate = (CGImageRef (*)(size_t, size_t, size_t, size_t, size_t, CGColorSpaceRef, uint32_t, CGDataProviderRef, const double *, bool, int))dlsym(RTLD_DEFAULT, "CGImageCreate");
+    p_CGImageRelease = (void (*)(CGImageRef))dlsym(RTLD_DEFAULT, "CGImageRelease");
+    p_UIApplicationMain = (int (*)(int, char **, zan_id_t, zan_id_t))dlsym(RTLD_DEFAULT, "UIApplicationMain");
+
     if (g_bridge.objc_getClass && g_bridge.sel_registerName && g_bridge.objc_msgSend) {
         g_bridge.initialized = 1;
     }
 }
 
-static void zan_ios_ensure_ui(const char *title, int width, int height) {
-    (void)title;
-    zan_ios_init_bridge();
-    if (!g_bridge.initialized) return;
+static void zan_ios_handle_touch(zan_id_t view, zan_id_t touches, int kind) {
+    if (!touches) return;
+    zan_sel_t sel_any = g_bridge.sel_registerName("anyObject");
+    zan_id_t touch = g_bridge.objc_msgSend(touches, sel_any);
+    if (!touch) return;
 
-    if (g_iwin.attached) return;
+    zan_sel_t sel_loc = g_bridge.sel_registerName("locationInView:");
+    typedef zan_cg_point_t (*loc_fn)(zan_id_t, zan_sel_t, zan_id_t);
+    loc_fn fn_loc = (loc_fn)g_bridge.objc_msgSend;
+    zan_cg_point_t pt = fn_loc(touch, sel_loc, view);
 
-    g_iwin.width = width > 0 ? width : 390;
-    g_iwin.height = height > 0 ? height : 844;
-    g_iwin.dpi = 192; /* standard Retina baseline @2x */
+    zan_sel_t sel_scale = g_bridge.sel_registerName("contentScaleFactor");
+    typedef double (*scale_fn)(zan_id_t, zan_sel_t);
+    scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
+    double scale = fn_scale(view, sel_scale);
+    if (scale < 1.0) scale = 1.0;
+
+    int x = (int)(pt.x * scale);
+    int y = (int)(pt.y * scale);
+
+    pthread_mutex_lock(&g_iq_lock);
+    iq_push_locked(kind, x, y, 1, 0, 0);
+    pthread_mutex_unlock(&g_iq_lock);
+}
+
+static void zan_ios_touches_began(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
+    (void)_cmd; (void)event;
+    zan_ios_handle_touch(self, touches, 2);
+}
+
+static void zan_ios_touches_moved(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
+    (void)_cmd; (void)event;
+    zan_ios_handle_touch(self, touches, 1);
+}
+
+static void zan_ios_touches_ended(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
+    (void)_cmd; (void)event;
+    zan_ios_handle_touch(self, touches, 3);
+}
+
+static void zan_ios_touches_cancelled(zan_id_t self, zan_sel_t _cmd, zan_id_t touches, zan_id_t event) {
+    (void)_cmd; (void)event;
+    zan_ios_handle_touch(self, touches, 3);
+}
+
+static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t app, zan_id_t opts) {
+    (void)self; (void)_cmd; (void)app; (void)opts;
 
     zan_class_t cls_screen = g_bridge.objc_getClass("UIScreen");
-    if (cls_screen) {
-        zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
-        zan_id_t main_screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
-        if (main_screen) {
-            zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
-            typedef double (*scale_fn)(zan_id_t, zan_sel_t);
-            scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
-            double sc = fn_scale(main_screen, sel_scale);
-            if (sc >= 1.0) {
-                g_iwin.dpi = (int)(96.0 * sc);
-            }
-        }
-    }
+    zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
+    zan_id_t screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
 
+    zan_sel_t sel_bounds = g_bridge.sel_registerName("bounds");
+    typedef zan_cg_rect_t (*bounds_fn)(zan_id_t, zan_sel_t);
+    bounds_fn fn_bounds = (bounds_fn)g_bridge.objc_msgSend;
+    zan_cg_rect_t bounds = fn_bounds(screen, sel_bounds);
+
+    zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
+    typedef double (*scale_fn)(zan_id_t, zan_sel_t);
+    scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
+    double scale = fn_scale(screen, sel_scale);
+    if (scale < 1.0) scale = 1.0;
+
+    g_iwin.dpi = (int)(96.0 * scale);
+    g_iwin.width = (int)(bounds.size.width * scale);
+    g_iwin.height = (int)(bounds.size.height * scale);
+
+    zan_class_t cls_win = g_bridge.objc_getClass("UIWindow");
+    zan_sel_t sel_alloc = g_bridge.sel_registerName("alloc");
+    zan_sel_t sel_init_frame = g_bridge.sel_registerName("initWithFrame:");
+    typedef zan_id_t (*init_frame_fn)(zan_id_t, zan_sel_t, zan_cg_rect_t);
+    init_frame_fn fn_init_frame = (init_frame_fn)g_bridge.objc_msgSend;
+
+    zan_id_t win = fn_init_frame(g_bridge.objc_msgSend((zan_id_t)cls_win, sel_alloc), sel_init_frame, bounds);
+
+    zan_class_t cls_vc = g_bridge.objc_getClass("UIViewController");
+    zan_sel_t sel_init = g_bridge.sel_registerName("init");
+    zan_id_t vc = g_bridge.objc_msgSend(g_bridge.objc_msgSend((zan_id_t)cls_vc, sel_alloc), sel_init);
+
+    zan_class_t cls_zanview = g_bridge.objc_getClass("ZanView");
+    if (!cls_zanview) cls_zanview = g_bridge.objc_getClass("UIView");
+    zan_id_t view = fn_init_frame(g_bridge.objc_msgSend((zan_id_t)cls_zanview, sel_alloc), sel_init_frame, bounds);
+
+    zan_sel_t sel_set_scale = g_bridge.sel_registerName("setContentScaleFactor:");
+    typedef void (*set_scale_fn)(zan_id_t, zan_sel_t, double);
+    ((set_scale_fn)g_bridge.objc_msgSend)(view, sel_set_scale, scale);
+
+    zan_sel_t sel_set_multi = g_bridge.sel_registerName("setMultipleTouchEnabled:");
+    typedef void (*set_bool_fn)(zan_id_t, zan_sel_t, bool);
+    ((set_bool_fn)g_bridge.objc_msgSend)(view, sel_set_multi, true);
+
+    zan_sel_t sel_set_view = g_bridge.sel_registerName("setView:");
+    g_bridge.objc_msgSend(vc, sel_set_view, view);
+
+    zan_sel_t sel_set_root = g_bridge.sel_registerName("setRootViewController:");
+    g_bridge.objc_msgSend(win, sel_set_root, vc);
+
+    zan_sel_t sel_make_key = g_bridge.sel_registerName("makeKeyAndVisible");
+    g_bridge.objc_msgSend(win, sel_make_key);
+
+    g_iwin.ui_window = win;
+    g_iwin.ui_controller = vc;
+    g_iwin.ui_view = view;
     g_iwin.attached = 1;
     g_iwin.closed = 0;
 
     pthread_mutex_lock(&g_iq_lock);
-    /* Push initial attach event */
     iq_push_locked(0, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_iq_lock);
+
+    return true;
+}
+
+static void zan_ios_register_classes(void) {
+    zan_class_t cls_uiview = g_bridge.objc_getClass("UIView");
+    if (cls_uiview && !g_bridge.objc_getClass("ZanView")) {
+        zan_class_t cls_zanview = g_bridge.objc_allocateClassPair(cls_uiview, "ZanView", 0);
+        if (cls_zanview) {
+            g_bridge.class_addMethod(cls_zanview, g_bridge.sel_registerName("touchesBegan:withEvent:"), (zan_imp_t)zan_ios_touches_began, "v@:@@");
+            g_bridge.class_addMethod(cls_zanview, g_bridge.sel_registerName("touchesMoved:withEvent:"), (zan_imp_t)zan_ios_touches_moved, "v@:@@");
+            g_bridge.class_addMethod(cls_zanview, g_bridge.sel_registerName("touchesEnded:withEvent:"), (zan_imp_t)zan_ios_touches_ended, "v@:@@");
+            g_bridge.class_addMethod(cls_zanview, g_bridge.sel_registerName("touchesCancelled:withEvent:"), (zan_imp_t)zan_ios_touches_cancelled, "v@:@@");
+            g_bridge.objc_registerClassPair(cls_zanview);
+        }
+    }
+
+    zan_class_t cls_uiresponder = g_bridge.objc_getClass("UIResponder");
+    if (cls_uiresponder && !g_bridge.objc_getClass("ZanAppDelegate")) {
+        zan_class_t cls_appdel = g_bridge.objc_allocateClassPair(cls_uiresponder, "ZanAppDelegate", 0);
+        if (cls_appdel) {
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("application:didFinishLaunchingWithOptions:"), (zan_imp_t)zan_ios_did_finish_launching, "B@:@@");
+            g_bridge.objc_registerClassPair(cls_appdel);
+        }
+    }
+}
+
+extern int zan_user_main(int argc, char **argv) __attribute__((weak));
+
+static int g_zan_argc = 0;
+static char **g_zan_argv = NULL;
+
+static void *zan_ios_worker_entry(void *arg) {
+    (void)arg;
+    while (!g_iwin.attached) {
+        struct timespec ts = {0, 5 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
+    if (zan_user_main) {
+        zan_user_main(g_zan_argc, g_zan_argv);
+    }
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    g_zan_argc = argc;
+    g_zan_argv = argv;
+
+    zan_ios_init_bridge();
+    zan_ios_register_classes();
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, zan_ios_worker_entry, NULL);
+
+    zan_class_t cls_str = g_bridge.objc_getClass("NSString");
+    zan_sel_t sel_utf8 = g_bridge.sel_registerName("stringWithUTF8String:");
+    typedef zan_id_t (*str_fn)(zan_id_t, zan_sel_t, const char *);
+    str_fn fn_str = (str_fn)g_bridge.objc_msgSend;
+    zan_id_t del_name = fn_str((zan_id_t)cls_str, sel_utf8, "ZanAppDelegate");
+
+    if (p_UIApplicationMain) {
+        return p_UIApplicationMain(argc, argv, NULL, del_name);
+    }
+    return 0;
 }
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {
-    zan_ios_ensure_ui(title, width, height);
+    (void)title; (void)width; (void)height;
+    while (!g_iwin.attached) {
+        struct timespec ts = {0, 5 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
     return ZAN_IOS_HWND;
 }
 
@@ -256,10 +447,10 @@ EXPORT i32 zan_gui_event_mods(void)    { return g_pending_event[5]; }
 EXPORT i32 zan_gui_event_flag(void)    { return g_pending_event[6]; }
 EXPORT iptr zan_gui_event_hwnd(void)   { return g_event_win; }
 
-EXPORT i32 zan_gui_window_width(void)  { return g_iwin.width; }
-EXPORT i32 zan_gui_window_height(void) { return g_iwin.height; }
-EXPORT i32 zan_gui_client_width(iptr hwnd_val)  { (void)hwnd_val; return g_iwin.width; }
-EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return g_iwin.height; }
+EXPORT i32 zan_gui_window_width(void)  { return g_iwin.width > 0 ? g_iwin.width : 390; }
+EXPORT i32 zan_gui_window_height(void) { return g_iwin.height > 0 ? g_iwin.height : 844; }
+EXPORT i32 zan_gui_client_width(iptr hwnd_val)  { (void)hwnd_val; return zan_gui_window_width(); }
+EXPORT i32 zan_gui_client_height(iptr hwnd_val) { (void)hwnd_val; return zan_gui_window_height(); }
 
 EXPORT i32 zan_gui_get_dpi_scale(void) { return (i32)(g_iwin.dpi * 100 / 96); }
 
@@ -285,7 +476,46 @@ EXPORT void zan_gui_present_full(void) {}
 EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     (void)hwnd_val;
     if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
+    if (!g_iwin.attached || !g_iwin.ui_view) return 1;
+
+    zan_surface_t *s = g_surfaces[surface_id];
     g_last_surface = surface_id;
+
+    if (!p_CGColorSpaceCreateDeviceRGB || !p_CGDataProviderCreateWithData || !p_CGImageCreate) {
+        return 0;
+    }
+
+    CGColorSpaceRef cs = p_CGColorSpaceCreateDeviceRGB();
+    if (!cs) return 1;
+
+    CGDataProviderRef provider = p_CGDataProviderCreateWithData(
+        NULL, s->pixels, (size_t)s->stride * s->height, NULL);
+    if (!provider) {
+        p_CGColorSpaceRelease(cs);
+        return 1;
+    }
+
+    /* 32-bit ARGB little-endian (BGRA: kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst) */
+    uint32_t bitmap_info = (4 << 12) | 2;
+    CGImageRef img = p_CGImageCreate(
+        (size_t)s->width, (size_t)s->height,
+        8, 32, (size_t)s->stride,
+        cs, bitmap_info, provider,
+        NULL, false, 0
+    );
+
+    if (img) {
+        zan_sel_t sel_layer = g_bridge.sel_registerName("layer");
+        zan_id_t layer = g_bridge.objc_msgSend(g_iwin.ui_view, sel_layer);
+        if (layer) {
+            zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
+            g_bridge.objc_msgSend(layer, sel_set_contents, (zan_id_t)img);
+        }
+        p_CGImageRelease(img);
+    }
+
+    p_CGDataProviderRelease(provider);
+    p_CGColorSpaceRelease(cs);
     return 0;
 }
 
@@ -317,4 +547,3 @@ EXPORT const char *zan_gui_get_clipboard(void) {
 EXPORT void zan_gui_internal_metal_drop_present(void) {}
 
 __attribute__((weak)) void zan_ui_thread_set(void) {}
-

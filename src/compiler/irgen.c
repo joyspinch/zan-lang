@@ -1564,8 +1564,10 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         snprintf(g->target_triple, sizeof(g->target_triple), "%s", target_triple);
     g->target_is_windows = target_is_windows;
     if (g->target_triple[0]) {
-        g->target_is_macos = strstr(g->target_triple, "apple") != NULL
-                             || strstr(g->target_triple, "darwin") != NULL;
+        g->target_is_ios = strstr(g->target_triple, "ios") != NULL;
+        g->target_is_macos = (strstr(g->target_triple, "apple") != NULL
+                             || strstr(g->target_triple, "darwin") != NULL)
+                             && !g->target_is_ios;
         g->target_is_wasm = strstr(g->target_triple, "wasm") != NULL;
     } else {
 #ifdef __APPLE__
