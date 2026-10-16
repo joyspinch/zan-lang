@@ -16,7 +16,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZANC = os.path.join(ROOT, "build/zanc")
 ZANGEN = os.path.join(ROOT, "build/zangen")
 RT_CORE = os.path.join(ROOT, "crt-transition/runtime_core.o")
-GUI_DYLIB = os.path.join(ROOT, "stdlib/Gui/drivers/macos-arm64/libzan_gui.dylib")
+GUI_DYLIB = os.path.join(ROOT, "packages/Zan.Gui/src/Gui/drivers/macos-arm64/libzan_gui.dylib")
 WORK = "/tmp/zan_all_template_tests"
 OPENSSL_LIB = "/Users/qq/.homebrew/opt/openssl@3/lib"
 
