@@ -1690,24 +1690,41 @@ partial class DataTable {
         if (hBand >= 0) { c.PopClip(); }
         c.FillRect(x, y + headerH - 1, viewW, 1, gridColor);
 
-        // 列拖拽反馈与放置：2px 强调线标记插入
-        // 边界，浮动芯片跟随指针。松开时
-        // 列移到目标槽位之前（或末尾）。
+        // 列拖拽反馈与放置：双三角对齐线标记插入边界，浮动半透明幽灵芯片跟随指针
         if (colDragging) {
             if (dropVisLocal < 0) { dropX = hx; }
-            // 插入线贯穿整个表头——包括 band
-            // 行，因为两列之间放置也可能把列移出
-            // 分组——但芯片跟随其来源的标题行。
-            c.FillRect(dropX - 1, y, app.Scale(2), headerH, sAccent.BgOr(0));
+            int indCol = sAccent.BgOr(0);
+            int lineW = app.Scale(2);
+            c.FillRect(dropX - lineW / 2, y, lineW, headerH, indCol);
+
+            // 插入位置顶部倒三角与底部正三角提示符（Drop Indicator Carets）
+            int caretH = app.Scale(4);
+            for (int dy = 0; dy < caretH; dy = dy + 1) {
+                int halfW = caretH - dy;
+                c.FillRect(dropX - halfW, y + dy, halfW * 2, 1, indCol);
+            }
+            for (int dy = 0; dy < caretH; dy = dy + 1) {
+                int halfW = dy + 1;
+                c.FillRect(dropX - halfW, y + headerH - caretH + dy, halfW * 2, 1, indCol);
+            }
+
+            // 浮动幽灵芯片（Ghost Drag Chip）：跟随鼠标自由浮动，半透明微阴影与高亮边框
             string dl = cols[st.dragCol].title;
-            int chW = Canvas.MeasureText(dl, fs) + app.Scale(16);
+            int chW = Canvas.MeasureText(dl, fs) + app.Scale(18);
+            int chH = titleRowH - app.Scale(6);
             int chX = app.mouseX - chW / 2;
+            int chY = app.mouseY - chH / 2;
             if (chX < x) { chX = x; }
             if (chX + chW > x + viewW) { chX = x + viewW - chW; }
-            c.FillRoundRect(chX, titleTop + app.Scale(3), chW, titleRowH - app.Scale(6),
-                            t.borderRadiusSmall, sAccent.BgOr(0));
-            c.DrawText(chX + app.Scale(8),
-                       Canvas.CenterTextY(titleTop, titleRowH, fs), dl, sAccent.FgOr(0), fs);
+            if (chY < y - app.Scale(20)) { chY = y - app.Scale(20); }
+            if (chY + chH > y + headerH + app.Scale(40)) { chY = y + headerH + app.Scale(40) - chH; }
+
+            // 投影与半透明芯片底
+            c.FillRoundRect(chX + 1, chY + 2, chW, chH, t.borderRadiusSmall, 0x40000000);
+            c.FillRoundRect(chX, chY, chW, chH, t.borderRadiusSmall, DataTable.ColorAlpha(sAccent.BgOr(0), 220));
+            c.DrawRoundRect(chX, chY, chW, chH, t.borderRadiusSmall, 1, DataTable.ColorAlpha(sAccent.FgOr(0), 120));
+            c.DrawText(chX + app.Scale(9),
+                       Canvas.CenterTextY(chY, chH, fs), dl, sAccent.FgOr(0), fs);
         }
         // 按住按钮期间记住放置槽位，使下面的收尾
         // 使用最后一次实时拖拽位置，而非松手帧上
@@ -2145,10 +2162,33 @@ partial class DataTable {
                     continue;
                 }
                 if (ccl < cBandR) {
+                    CellSpan cSpan = null;
+                    if (st.spanProvider != null) {
+                        cSpan = st.spanProvider.GetSpan(src, rowIdx, cc);
+                    }
+                    if (cSpan != null && cSpan.IsCovered()) {
+                        continue;
+                    }
+                    int drawCw = cw;
+                    int drawRowH = rowH;
+                    if (cSpan != null && cSpan.IsMaster()) {
+                        if (cSpan.colSpan > 1) {
+                            drawCw = 0;
+                            for (int sc = cc; sc < cc + cSpan.colSpan && sc < cols.Count; sc = sc + 1) {
+                                if (sc < st.dispW.Count && (sc >= st.colHidden.Count || !st.colHidden[sc])) {
+                                    drawCw = drawCw + st.dispW[sc];
+                                }
+                            }
+                        }
+                        if (cSpan.rowSpan > 1) {
+                            drawRowH = cSpan.rowSpan * rowH;
+                        }
+                    }
+
                     // 单元格级样式背景绘制在范围
                     // 高亮之下，选中的单元格仍能看出是选中状态。
                     int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
-                    if (cellBg != 0) { c.FillRect(ccl, ry, cw, rowH, cellBg); }
+                    if (cellBg != 0) { c.FillRect(ccl, ry, drawCw, drawRowH, cellBg); }
                     bool cellInRange = rowInRange && cc >= rgC0 && cc <= rgC1;
                     for (int mi = 0; mi < multiN && !cellInRange; mi = mi + 1) {
                         int mr0 = -1; int mc0 = -1; int mr1 = -1; int mc1 = -1;
@@ -2158,16 +2198,16 @@ partial class DataTable {
                         }
                     }
                     if (cellInRange) {
-                        c.FillRect(ccl, ry, cw, rowH, sRowSel.BgOr(0));
+                        c.FillRect(ccl, ry, drawCw, drawRowH, sRowSel.BgOr(0));
                     }
                     // 填充拖拽的目标区域用半透明强调色铺出，
                     // 与源块（不透明选区色）区分。
                     if (st.fillDrag && oiRow >= st.fillTR0 && oiRow <= st.fillTR1
                         && cc >= st.fillTC0 && cc <= st.fillTC1) {
-                        c.FillRect(ccl, ry, cw, rowH, DataTable.ColorAlpha(sAccent.BgOr(0), 40));
+                        c.FillRect(ccl, ry, drawCw, drawRowH, DataTable.ColorAlpha(sAccent.BgOr(0), 40));
                     }
                     if (st.editing && rowIdx == st.editRow && cc == st.editCol) {
-                        edX = ccl; edY = ry; edW = cw; edH = rowH; edVis = true;
+                        edX = ccl; edY = ry; edW = drawCw; edH = drawRowH; edVis = true;
                     }
                     // 单元格控件插槽：真控件按格矩形渲染
                     // （PropertyGrid/设计器 PvCtrl 同款 Measure+Arrange+
@@ -2177,10 +2217,10 @@ partial class DataTable {
                     // 相邻单元格。
                     bool painted = false;
                     if (st.cellWidgets != null) {
-                        c.PushClip(ccl, ry, cw, rowH);
-                        Control wc = st.cellWidgets.Provide(app, src, rowIdx, cc, ccl, ry, cw, rowH);
+                        c.PushClip(ccl, ry, drawCw, drawRowH);
+                        Control wc = st.cellWidgets.Provide(app, src, rowIdx, cc, ccl, ry, drawCw, drawRowH);
                         if (wc != null) {
-                            Rect cellRect = new Rect(ccl, ry, cw, rowH);
+                            Rect cellRect = new Rect(ccl, ry, drawCw, drawRowH);
                             wc.MeasureTree(app);
                             wc.Arrange(cellRect.x, cellRect.y, cellRect.width, cellRect.height);
                             wc.RenderTree(app);
@@ -2192,16 +2232,16 @@ partial class DataTable {
                     // 自身的矩形内，行为异常的绘制器不会溢出到
                     // 相邻单元格或表格之外。
                     if (!painted && st.styler != null) {
-                        c.PushClip(ccl, ry, cw, rowH);
-                        painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, cw, rowH);
+                        c.PushClip(ccl, ry, drawCw, drawRowH);
+                        painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, drawCw, drawRowH);
                         c.PopClip();
                     }
                     if (!painted) {
                         CellRenderer cr = cols[cc].renderer;
                         if (cr == null) { cr = st.cellRenderer; }
                         if (cr != null) {
-                            c.PushClip(ccl, ry, cw, rowH);
-                            painted = cr.Paint(app, c, src, rowIdx, cc, ccl, ry, cw, rowH, rSel, oiRow == st.hitOrder && cc == st.hitCol);
+                            c.PushClip(ccl, ry, drawCw, drawRowH);
+                            painted = cr.Paint(app, c, src, rowIdx, cc, ccl, ry, drawCw, drawRowH, rSel, oiRow == st.hitOrder && cc == st.hitCol);
                             c.PopClip();
                         }
                     }
@@ -2244,7 +2284,23 @@ partial class DataTable {
                                 md = md + 1;
                             }
                         }
-                        if (mu + md > 0) {
+                        if (cSpan != null && cSpan.IsMaster()) {
+                            // 显式合并单元格（CellSpan colSpan/rowSpan）：充满跨越矩形并居中文本
+                            c.FillRect(ccl, ry, drawCw, drawRowH, rowBg);
+                            string mShown = DataTable.Truncate(
+                                DataTable.FormatCell(cols[cc], cellText), fs,
+                                drawCw - t.paddingSmall * 2);
+                            int mTw = Canvas.MeasureText(mShown, fs);
+                            int mTx = ccl + t.paddingSmall;
+                            if (cols[cc].align == 1) { mTx = ccl + (drawCw - mTw) / 2; }
+                            else if (cols[cc].align == 2) { mTx = ccl + drawCw - t.paddingSmall - mTw; }
+                            int mFg = DataTable.CellForeground(st, src, rowIdx, cc);
+                            if (mFg == 0) { mFg = sCellBox.FgOr(0); }
+                            int mTy = Canvas.CenterTextY(ry, drawRowH, fs);
+                            c.PushClip(ccl, ry, drawCw, drawRowH);
+                            c.DrawText(mTx, mTy, mShown, mFg, fs);
+                            c.PopClip();
+                        } else if (mu + md > 0) {
                             // 块底色只画本行段：行状态（斑马/悬停/选中/
                             // styler 行底）属于行自身。若整块重绘，块的
                             // 可见底色会收敛到「最后绘制行」的状态——
@@ -2316,7 +2372,7 @@ partial class DataTable {
                                 DataTable.CellForeground(st, src, rowIdx, cc),
                                 depth, true, canExp, isExp);
                         } else {
-                            DataTable.DrawCellRangeCtx(app, cols[cc], cellText, ccl, ry, cw, rowH,
+                            DataTable.DrawCellRangeCtx(app, cols[cc], cellText, ccl, ry, drawCw, drawRowH,
                                                   cfLo, cfHi, DataTable.CellForeground(st, src, rowIdx, cc),
                                                   rowIdx, cc, st, src);
                         }
