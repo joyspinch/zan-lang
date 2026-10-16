@@ -1520,7 +1520,8 @@ static bool member_visible(const intellisense_t *is, ivis_t vis,
 
 int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
                                   const char *type_name,
-                                  const char *prefix, int line, int col) {
+                                  const char *prefix, int line, int col,
+                                  int static_filter) {
     is->completion_count = 0;
     is->completion_selected = 0;
 
@@ -1529,11 +1530,13 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
     if (strcmp(type_name, "this") == 0 || strcmp(type_name, "self") == 0) {
         const char *encl = intel_enclosing_type_at(is, line, col);
         if (encl && encl[0]) type_name = encl;
+        if (static_filter == INTEL_FILTER_ALL) static_filter = INTEL_FILTER_INSTANCE;
     } else if (strcmp(type_name, "base") == 0) {
         const char *encl = intel_enclosing_type_at(is, line, col);
         const char *b = (encl && encl[0]) ? class_base(is, encl) : NULL;
         if (!b && project && encl && encl[0]) b = class_base(project, encl);
         if (b && b[0]) type_name = b;
+        if (static_filter == INTEL_FILTER_ALL) static_filter = INTEL_FILTER_INSTANCE;
     }
     bool is_known_type = false;
     for (int i = 0; i < is->symbol_count; i++) {
@@ -1561,11 +1564,18 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
         if (!rv && project) {
             rv = intel_resolve_type_pos(project, type_name, -1, -1);
         }
-        if (rv && rv[0]) type_name = rv;
+        if (rv && rv[0]) {
+            type_name = rv;
+            if (static_filter == INTEL_FILTER_ALL) static_filter = INTEL_FILTER_INSTANCE;
+        }
     }
 
     const char *rank = intel_array_suffix(type_name);
     if (rank) {
+        if (static_filter == INTEL_FILTER_STATIC) {
+            is->completion_active = false;
+            return 0;
+        }
         const char *members[] = {"Length", "Count", "GetLength"};
         int count = rank[1] == ',' ? 3 : 2;
         for (int i = 0; i < count; i++) {
@@ -1608,6 +1618,15 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
             if (!member_visible(is, sym->visibility, sym->parent, from_class))
                 continue;
 
+            /* Visual Studio C# filtering: static vs instance */
+            if (static_filter == INTEL_FILTER_STATIC) {
+                if (!sym->is_static && sym->kind != ISYM_ENUM_MEMBER)
+                    continue;
+            } else if (static_filter == INTEL_FILTER_INSTANCE) {
+                if (sym->is_static || sym->kind == ISYM_ENUM_MEMBER)
+                    continue;
+            }
+
             if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
             bool dup = false;
@@ -1643,6 +1662,15 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
                 if (!member_visible(project, sym->visibility, sym->parent, from_class))
                     continue;
 
+                /* Visual Studio C# filtering: static vs instance */
+                if (static_filter == INTEL_FILTER_STATIC) {
+                    if (!sym->is_static && sym->kind != ISYM_ENUM_MEMBER)
+                        continue;
+                } else if (static_filter == INTEL_FILTER_INSTANCE) {
+                    if (sym->is_static || sym->kind == ISYM_ENUM_MEMBER)
+                        continue;
+                }
+
                 if (plen > 0 && _strnicmp(sym->name, prefix, plen) != 0) continue;
 
                 bool dup = false;
@@ -1677,57 +1705,64 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
 
     const zan_builtin_type_t *bt = builtin_receiver(bare_type);
     if (bt) {
-        for (int i = 0; i < bt->member_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            const zan_builtin_member_t *m = &bt->members[i];
-            if (plen > 0 && _strnicmp(m->name, prefix, plen) != 0) continue;
-            if (already_offered(is, m->name)) continue;
-            completion_t *c = &is->completions[is->completion_count++];
-            snprintf(c->label, sizeof(c->label), "%s", m->name);
-            if (m->kind == 'M')
-                snprintf(c->insert_text, sizeof(c->insert_text), "%s(", m->name);
-            else
-                snprintf(c->insert_text, sizeof(c->insert_text), "%s", m->name);
-            snprintf(c->detail, sizeof(c->detail), "%s", m->sig);
-            c->kind = (m->kind == 'M') ? ISYM_METHOD : ISYM_FIELD;
-            c->sort_priority = 1;
-        }
-    }
-
-    for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-        if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, bare_type) == 0) {
-            for (int j = 0; j < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
-                if (is->symbols[j].kind == ISYM_ENUM_MEMBER &&
-                    strcmp(is->symbols[j].parent, bare_type) == 0) {
-                    if (plen > 0 && _strnicmp(is->symbols[j].name, prefix, plen) != 0) continue;
-                    completion_t *c = &is->completions[is->completion_count++];
-                    strncpy(c->label, is->symbols[j].name, sizeof(c->label) - 1);
-                    strncpy(c->insert_text, is->symbols[j].name, sizeof(c->insert_text) - 1);
-                    snprintf(c->detail, sizeof(c->detail), "%s.%s", type_name, is->symbols[j].name);
-                    c->kind = ISYM_ENUM_MEMBER;
-                    c->sort_priority = 0;
-                }
+        bool match = true;
+        if (static_filter == INTEL_FILTER_STATIC && !bt->is_static) match = false;
+        if (static_filter == INTEL_FILTER_INSTANCE && bt->is_static) match = false;
+        if (match) {
+            for (int i = 0; i < bt->member_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+                const zan_builtin_member_t *m = &bt->members[i];
+                if (plen > 0 && _strnicmp(m->name, prefix, plen) != 0) continue;
+                if (already_offered(is, m->name)) continue;
+                completion_t *c = &is->completions[is->completion_count++];
+                snprintf(c->label, sizeof(c->label), "%s", m->name);
+                if (m->kind == 'M')
+                    snprintf(c->insert_text, sizeof(c->insert_text), "%s(", m->name);
+                else
+                    snprintf(c->insert_text, sizeof(c->insert_text), "%s", m->name);
+                snprintf(c->detail, sizeof(c->detail), "%s", m->sig);
+                c->kind = (m->kind == 'M') ? ISYM_METHOD : ISYM_FIELD;
+                c->sort_priority = 1;
             }
-            break;
         }
     }
 
-    if (project) {
-        for (int i = 0; i < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
-            if (project->symbols[i].kind == ISYM_ENUM && strcmp(project->symbols[i].name, bare_type) == 0) {
-                for (int j = 0; j < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
-                    if (project->symbols[j].kind == ISYM_ENUM_MEMBER &&
-                        strcmp(project->symbols[j].parent, bare_type) == 0) {
-                        if (plen > 0 && _strnicmp(project->symbols[j].name, prefix, plen) != 0) continue;
-                        if (already_offered(is, project->symbols[j].name)) continue;
+    if (static_filter != INTEL_FILTER_INSTANCE) {
+        for (int i = 0; i < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+            if (is->symbols[i].kind == ISYM_ENUM && strcmp(is->symbols[i].name, bare_type) == 0) {
+                for (int j = 0; j < is->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
+                    if (is->symbols[j].kind == ISYM_ENUM_MEMBER &&
+                        strcmp(is->symbols[j].parent, bare_type) == 0) {
+                        if (plen > 0 && _strnicmp(is->symbols[j].name, prefix, plen) != 0) continue;
                         completion_t *c = &is->completions[is->completion_count++];
-                        strncpy(c->label, project->symbols[j].name, sizeof(c->label) - 1);
-                        strncpy(c->insert_text, project->symbols[j].name, sizeof(c->insert_text) - 1);
-                        snprintf(c->detail, sizeof(c->detail), "%s.%s", type_name, project->symbols[j].name);
+                        strncpy(c->label, is->symbols[j].name, sizeof(c->label) - 1);
+                        strncpy(c->insert_text, is->symbols[j].name, sizeof(c->insert_text) - 1);
+                        snprintf(c->detail, sizeof(c->detail), "%s.%s", type_name, is->symbols[j].name);
                         c->kind = ISYM_ENUM_MEMBER;
                         c->sort_priority = 0;
                     }
                 }
                 break;
+            }
+        }
+
+        if (project) {
+            for (int i = 0; i < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; i++) {
+                if (project->symbols[i].kind == ISYM_ENUM && strcmp(project->symbols[i].name, bare_type) == 0) {
+                    for (int j = 0; j < project->symbol_count && is->completion_count < INTEL_MAX_COMPLETIONS; j++) {
+                        if (project->symbols[j].kind == ISYM_ENUM_MEMBER &&
+                            strcmp(project->symbols[j].parent, bare_type) == 0) {
+                            if (plen > 0 && _strnicmp(project->symbols[j].name, prefix, plen) != 0) continue;
+                            if (already_offered(is, project->symbols[j].name)) continue;
+                            completion_t *c = &is->completions[is->completion_count++];
+                            strncpy(c->label, project->symbols[j].name, sizeof(c->label) - 1);
+                            strncpy(c->insert_text, project->symbols[j].name, sizeof(c->insert_text) - 1);
+                            snprintf(c->detail, sizeof(c->detail), "%s.%s", type_name, project->symbols[j].name);
+                            c->kind = ISYM_ENUM_MEMBER;
+                            c->sort_priority = 0;
+                        }
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1738,7 +1773,7 @@ int intel_complete_members_pos_ex(intellisense_t *is, intellisense_t *project,
 
 int intel_complete_members_pos(intellisense_t *is, const char *type_name,
                                const char *prefix, int line, int col) {
-    return intel_complete_members_pos_ex(is, NULL, type_name, prefix, line, col);
+    return intel_complete_members_pos_ex(is, NULL, type_name, prefix, line, col, INTEL_FILTER_ALL);
 }
 
 int intel_complete_members_at(intellisense_t *is, const char *type_name,

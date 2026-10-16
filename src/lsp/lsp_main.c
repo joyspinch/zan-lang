@@ -11,6 +11,7 @@
 #include "checker.h"
 
 #include "intellisense.h"
+#include "builtin_api.h"
 #include "zan_version.h"
 #include "package.h"
 
@@ -1109,8 +1110,16 @@ static void ensure_stdlib_indexed(lsp_server_t *s) {
     char pkg_roots[32][1024];
     int pkg_n = zan_pkg_all_source_roots(project_dir, pkg_roots, 32);
     for (int i = 0; i < pkg_n; i++) {
-        if (!intel_cancel_flag)
+        if (!intel_cancel_flag) {
+            /* 跳过非项目工作区直接依赖的海量大型第三方 SDK（如 Zan.Sdk.Wechat 5600+ 文件、Zan.Sdk.Jd 680+ 文件等），
+             * 避免全局启动索引卡死数百秒引发客户端握手与请求超时。若工作区明确包含/安装了该包则正常索引。 */
+            if (strstr(pkg_roots[i], "Zan.Sdk.") != NULL) {
+                if (!s->workspace_root[0] || strncmp(pkg_roots[i], s->workspace_root, strlen(s->workspace_root)) != 0) {
+                    continue;
+                }
+            }
             intel_index_project(g_project_intel, pkg_roots[i]);
+        }
     }
 }
 
@@ -1415,6 +1424,79 @@ static bool is_in_string_or_comment(const char *text, size_t offset) {
     return in_str || in_line_comment || in_block_comment;
 }
 
+static int determine_member_filter(intellisense_t *is, const char *context, int line, int character) {
+    if (!context || !context[0]) return INTEL_FILTER_ALL;
+    const char *expr = context;
+    if (strncmp(expr, "CHAIN:", 6) == 0) expr += 6;
+
+    if (expr[0] == '"' || expr[0] == '\'' || (expr[0] >= '0' && expr[0] <= '9'))
+        return INTEL_FILTER_INSTANCE;
+    if (strncmp(expr, "this.", 5) == 0 || strcmp(expr, "this") == 0 ||
+        strncmp(expr, "self.", 5) == 0 || strcmp(expr, "self") == 0 ||
+        strncmp(expr, "base.", 5) == 0 || strcmp(expr, "base") == 0)
+        return INTEL_FILTER_INSTANCE;
+
+    size_t len = strlen(expr);
+    if (len > 1 && expr[len - 1] == '.') {
+        if (expr[len - 2] == ')' || expr[len - 2] == ']')
+            return INTEL_FILTER_INSTANCE;
+    }
+
+    int dots = 0;
+    int pd = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (expr[i] == '(') pd++;
+        else if (expr[i] == ')' && pd > 0) pd--;
+        else if (expr[i] == '.' && pd == 0) dots++;
+    }
+    if (dots > 1) {
+        return INTEL_FILTER_INSTANCE;
+    }
+
+    char ident[128];
+    size_t ilen = 0;
+    while (ilen < sizeof(ident) - 1 && is_ident_char(expr[ilen])) {
+        ident[ilen] = expr[ilen];
+        ilen++;
+    }
+    ident[ilen] = '\0';
+
+    if (ident[0]) {
+        const char *t = intel_resolve_type_pos(is, ident, line, character);
+        if (t && t[0]) {
+            return INTEL_FILTER_INSTANCE;
+        }
+        const isym_t *sym = intel_lookup_symbol_at(is, ident, line, character);
+        if (sym && (sym->kind == ISYM_VARIABLE || sym->kind == ISYM_PARAMETER ||
+                    sym->kind == ISYM_FIELD || sym->kind == ISYM_PROPERTY)) {
+            return INTEL_FILTER_INSTANCE;
+        }
+        if (zan_builtin_find(ident)) {
+            return INTEL_FILTER_STATIC;
+        }
+        for (int i = 0; i < is->symbol_count; i++) {
+            if ((is->symbols[i].kind == ISYM_CLASS || is->symbols[i].kind == ISYM_STRUCT ||
+                 is->symbols[i].kind == ISYM_ENUM || is->symbols[i].kind == ISYM_INTERFACE) &&
+                strcmp(is->symbols[i].name, ident) == 0) {
+                return INTEL_FILTER_STATIC;
+            }
+        }
+        if (g_project_intel) {
+            for (int i = 0; i < g_project_intel->symbol_count; i++) {
+                if ((g_project_intel->symbols[i].kind == ISYM_CLASS ||
+                     g_project_intel->symbols[i].kind == ISYM_STRUCT ||
+                     g_project_intel->symbols[i].kind == ISYM_ENUM ||
+                     g_project_intel->symbols[i].kind == ISYM_INTERFACE) &&
+                    strcmp(g_project_intel->symbols[i].name, ident) == 0) {
+                    return INTEL_FILTER_STATIC;
+                }
+            }
+        }
+    }
+
+    return INTEL_FILTER_ALL;
+}
+
 static void handle_completion(lsp_server_t *s, json_value *id, json_value *params) {    const char *uri; int line, character;
     if (!get_position(params, &uri, &line, &character)) {
         send_response(s, id, json_new_null());
@@ -1447,6 +1529,7 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
     if (!ns_mode && context[0]) {
         const char *resolve_type = context;
         char chain_prefix[128] = "";
+        int static_filter = determine_member_filter(is, context, line, character);
 
         if (strncmp(context, "CHAIN:", 6) == 0) {
             const char *chain_expr = context + 6;
@@ -1471,7 +1554,7 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
 
         if (resolve_type[0]) {
             count = intel_complete_members_pos_ex(is, g_project_intel, resolve_type, effective,
-                                                  line, character);
+                                                  line, character, static_filter);
             if (count == 0 && strncmp(context, "CHAIN:", 6) != 0) {
                 count = complete_var_init_members(doc, is, context, line,
                                                   character, effective);
@@ -1485,7 +1568,8 @@ static void handle_completion(lsp_server_t *s, json_value *id, json_value *param
                 const char *query_t = (local_t && local_t[0]) ? local_t
                                                               : resolve_type;
                 int before = count;
-                intel_complete_members(g_project_intel, query_t, effective);
+                intel_complete_members_pos_ex(g_project_intel, NULL, query_t, effective,
+                                              line, character, static_filter);
                 for (int pi = 0;
                      pi < g_project_intel->completion_count &&
                      count < INTEL_MAX_COMPLETIONS;
@@ -1667,8 +1751,7 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
         if (rt && rt[0]) {
             intel_goto_member_ex(is, g_project_intel, rt, word, &g);
         }
-    }
-    if (!g.found) {
+    } else {
         const isym_t *loc = intel_lookup_symbol_at(is, word, line, character);
         if (loc) {
             if (loc->kind == ISYM_VARIABLE || loc->kind == ISYM_PARAMETER) {
@@ -1697,17 +1780,17 @@ static void handle_definition(lsp_server_t *s, json_value *id, json_value *param
                     g.file[0] = '\0';
             }
         }
-    }
-    if (!g.found) {
-        const char *encl = intel_enclosing_type_at(is, line, character);
-        if (encl && encl[0]) {
-            intel_goto_member_ex(is, g_project_intel, encl, word, &g);
+        if (!g.found) {
+            const char *encl = intel_enclosing_type_at(is, line, character);
+            if (encl && encl[0]) {
+                intel_goto_member_ex(is, g_project_intel, encl, word, &g);
+            }
         }
+        if (!g.found)
+            g = intel_goto_def(is, word);
+        if (!g.found && g_project_intel)
+            g = intel_goto_def(g_project_intel, word);
     }
-    if (!g.found)
-        g = intel_goto_def(is, word);
-    if (!g.found && g_project_intel)
-        g = intel_goto_def(g_project_intel, word);
     if (!g.found) { send_response(s, id, json_new_null()); return; }
 
     char target_uri[1800];
@@ -2008,6 +2091,7 @@ static bool occurrence_matches(const sym_target_t *t, const char *text,
             if (msym && msym->parent[0] && type_simple_same(msym->parent, t->rt_simple))
                 return true;
         }
+        return false;
     }
     if (de) {
         const isym_t *s2 = intel_lookup_symbol_at(de, t->word, rl, rc);
