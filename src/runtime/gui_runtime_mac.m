@@ -1163,6 +1163,10 @@ EXPORT i32 zan_gui_client_height(iptr hwnd_val) {
 
 EXPORT i32 zan_gui_titlebar_height(void) { return (i32)zan_titlebar_h(); }
 EXPORT i32 zan_gui_caption_button_width(void) { return (i32)zan_caption_btn_w(); }
+EXPORT i32 zan_gui_safe_area_top(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_bottom(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_left(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_right(void) { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     ZAN_MAC_ENSURE_MAIN_THREAD(zan_gui_set_caption_buttons(hwnd_val, count));
     if (count < 0 || count > 8) return 0;

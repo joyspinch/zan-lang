@@ -853,6 +853,10 @@ EXPORT i32 zan_gui_window_focused(iptr hwnd_val)   { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_titlebar_height(void)           { return 0; }
 EXPORT i32 zan_gui_caption_button_width(void)      { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr h, i32 n) { (void)h; (void)n; return 0; }
+EXPORT i32 zan_gui_safe_area_top(void)             { return 0; }
+EXPORT i32 zan_gui_safe_area_bottom(void)          { return 0; }
+EXPORT i32 zan_gui_safe_area_left(void)            { return 0; }
+EXPORT i32 zan_gui_safe_area_right(void)           { return 0; }
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val)    { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on)     { (void)h; (void)on; return 0; }

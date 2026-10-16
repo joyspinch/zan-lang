@@ -1078,6 +1078,10 @@ EXPORT i32 zan_gui_set_topmost(iptr hwnd_val, i32 on) {
 
 EXPORT i32 zan_gui_titlebar_height(void) { return g_titlebar_h_l; }
 EXPORT i32 zan_gui_caption_button_width(void) { return g_btn_w_l; }
+EXPORT i32 zan_gui_safe_area_top(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_bottom(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_left(void) { return 0; }
+EXPORT i32 zan_gui_safe_area_right(void) { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr hwnd_val, i32 count) {
     (void)hwnd_val;
     if (count >= 0 && count <= 8) { g_caption_btn_count_l = (int)count; }

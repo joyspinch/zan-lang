@@ -50,6 +50,7 @@ typedef void (*zan_msg1_bool_fn)(zan_id_t, zan_sel_t, bool);
 typedef void (*zan_msg1_dbl_fn)(zan_id_t, zan_sel_t, double);
 typedef zan_id_t (*zan_msg1_str_fn)(zan_id_t, zan_sel_t, const char *);
 typedef zan_id_t (*zan_msg2_fn)(zan_id_t, zan_sel_t, zan_id_t, zan_id_t);
+typedef bool (*zan_msg_bool1_fn)(zan_id_t, zan_sel_t, zan_id_t);
 
 typedef struct {
     double x, y;
@@ -734,6 +735,99 @@ EXPORT i32 zan_gui_window_focused(iptr hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_titlebar_height(void) { return 0; }
 EXPORT i32 zan_gui_caption_button_width(void) { return 0; }
 EXPORT i32 zan_gui_set_caption_buttons(iptr h, i32 n) { (void)h; (void)n; return 0; }
+
+typedef struct {
+    double top;
+    double left;
+    double bottom;
+    double right;
+} zan_ui_edge_insets_t;
+
+EXPORT i32 zan_gui_safe_area_top(void) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    double scale = (double)g_iwin.dpi / 96.0;
+    if (scale < 1.0) scale = 2.0;
+
+    if (g_iwin.ui_view && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_sel_t sel_insets = g_bridge.sel_registerName("safeAreaInsets");
+        zan_sel_t sel_resp = g_bridge.sel_registerName("respondsToSelector:");
+        zan_msg_bool1_fn fn_resp = (zan_msg_bool1_fn)g_bridge.objc_msgSend;
+        if (fn_resp(g_iwin.ui_view, sel_resp, (zan_id_t)sel_insets)) {
+            typedef zan_ui_edge_insets_t (*zan_msg_insets0_fn)(zan_id_t, zan_sel_t);
+            zan_msg_insets0_fn fn_insets = (zan_msg_insets0_fn)g_bridge.objc_msgSend;
+            zan_ui_edge_insets_t insets = fn_insets(g_iwin.ui_view, sel_insets);
+            if (insets.top > 0.0) {
+                return (i32)ceil(insets.top * scale);
+            }
+        }
+    }
+    /* Fallback on modern iPhone screens: Notch/Dynamic Island is >= 44pt */
+    if (g_iwin.height >= 800) {
+        return (i32)ceil(44.0 * scale);
+    }
+    return (i32)ceil(20.0 * scale);
+}
+
+EXPORT i32 zan_gui_safe_area_bottom(void) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    double scale = (double)g_iwin.dpi / 96.0;
+    if (scale < 1.0) scale = 2.0;
+
+    if (g_iwin.ui_view && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_sel_t sel_insets = g_bridge.sel_registerName("safeAreaInsets");
+        zan_sel_t sel_resp = g_bridge.sel_registerName("respondsToSelector:");
+        zan_msg_bool1_fn fn_resp = (zan_msg_bool1_fn)g_bridge.objc_msgSend;
+        if (fn_resp(g_iwin.ui_view, sel_resp, (zan_id_t)sel_insets)) {
+            typedef zan_ui_edge_insets_t (*zan_msg_insets0_fn)(zan_id_t, zan_sel_t);
+            zan_msg_insets0_fn fn_insets = (zan_msg_insets0_fn)g_bridge.objc_msgSend;
+            zan_ui_edge_insets_t insets = fn_insets(g_iwin.ui_view, sel_insets);
+            if (insets.bottom > 0.0) {
+                return (i32)ceil(insets.bottom * scale);
+            }
+        }
+    }
+    /* Fallback on modern iPhone screens: Home bar is ~34pt */
+    if (g_iwin.height >= 800) {
+        return (i32)ceil(34.0 * scale);
+    }
+    return 0;
+}
+
+EXPORT i32 zan_gui_safe_area_left(void) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    double scale = (double)g_iwin.dpi / 96.0;
+    if (scale < 1.0) scale = 2.0;
+    if (g_iwin.ui_view && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_sel_t sel_insets = g_bridge.sel_registerName("safeAreaInsets");
+        zan_sel_t sel_resp = g_bridge.sel_registerName("respondsToSelector:");
+        zan_msg_bool1_fn fn_resp = (zan_msg_bool1_fn)g_bridge.objc_msgSend;
+        if (fn_resp(g_iwin.ui_view, sel_resp, (zan_id_t)sel_insets)) {
+            typedef zan_ui_edge_insets_t (*zan_msg_insets0_fn)(zan_id_t, zan_sel_t);
+            zan_msg_insets0_fn fn_insets = (zan_msg_insets0_fn)g_bridge.objc_msgSend;
+            zan_ui_edge_insets_t insets = fn_insets(g_iwin.ui_view, sel_insets);
+            if (insets.left > 0.0) return (i32)ceil(insets.left * scale);
+        }
+    }
+    return 0;
+}
+
+EXPORT i32 zan_gui_safe_area_right(void) {
+    if (!g_bridge.initialized) zan_ios_init_bridge();
+    double scale = (double)g_iwin.dpi / 96.0;
+    if (scale < 1.0) scale = 2.0;
+    if (g_iwin.ui_view && g_bridge.objc_msgSend && g_bridge.sel_registerName) {
+        zan_sel_t sel_insets = g_bridge.sel_registerName("safeAreaInsets");
+        zan_sel_t sel_resp = g_bridge.sel_registerName("respondsToSelector:");
+        zan_msg_bool1_fn fn_resp = (zan_msg_bool1_fn)g_bridge.objc_msgSend;
+        if (fn_resp(g_iwin.ui_view, sel_resp, (zan_id_t)sel_insets)) {
+            typedef zan_ui_edge_insets_t (*zan_msg_insets0_fn)(zan_id_t, zan_sel_t);
+            zan_msg_insets0_fn fn_insets = (zan_msg_insets0_fn)g_bridge.objc_msgSend;
+            zan_ui_edge_insets_t insets = fn_insets(g_iwin.ui_view, sel_insets);
+            if (insets.right > 0.0) return (i32)ceil(insets.right * scale);
+        }
+    }
+    return 0;
+}
 EXPORT i32 zan_gui_set_window_pos(iptr h, i32 x, i32 y) { (void)h; (void)x; (void)y; return 0; }
 EXPORT i32 zan_gui_center_window(iptr hwnd_val) { (void)hwnd_val; return 1; }
 EXPORT i32 zan_gui_set_topmost(iptr h, i32 on) { (void)h; (void)on; return 0; }
