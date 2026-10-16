@@ -8425,7 +8425,25 @@ int main(int argc, char **argv) {
                 snprintf(def_bundle_id, sizeof(def_bundle_id), "dev.zan.%s", app_name);
                 bundle_id = def_bundle_id;
             }
-            if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0") != 0) {
+            const char *effective_icon = icon_path;
+            if (!effective_icon) {
+                const char *candidates[] = {
+                    "assets/icon.png",
+                    "assets/icon.ico",
+                    "icon.png",
+                    "icon.ico",
+                    NULL
+                };
+                for (int ci = 0; candidates[ci]; ci++) {
+                    FILE *ft = fopen(candidates[ci], "rb");
+                    if (ft) {
+                        fclose(ft);
+                        effective_icon = candidates[ci];
+                        break;
+                    }
+                }
+            }
+            if (zan_ipa_build(ipa_path, obj_path, app_name, bundle_id, app_name, "1.0.0", effective_icon) != 0) {
                 remove(obj_path);
                 zan_diag_free_buffers(irgen.diag);
                 zan_irgen_destroy(&irgen);
