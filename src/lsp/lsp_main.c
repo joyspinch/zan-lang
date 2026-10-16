@@ -1601,8 +1601,11 @@ static void handle_hover(lsp_server_t *s, json_value *id, json_value *params) {
             rt = intel_resolve_chain_pos(g_project_intel, is, chain,
                                          fm, sizeof(fm), line, character);
         }
-        if (rt && rt[0] && g_project_intel)
-            h = intel_hover_member(g_project_intel, rt, word);
+        if (rt && rt[0]) {
+            h = intel_hover_member(is, rt, word);
+            if (!h.valid && g_project_intel)
+                h = intel_hover_member(g_project_intel, rt, word);
+        }
     }
 
     if (!h.valid)
