@@ -116,6 +116,14 @@ partial class CodeEditor {
 
     // 从候选实体重建当前种类过滤器的可见列表并更新弹窗状态。
     void ApplyKindFilter() {
+        // 字符串或注释内绝对不弹窗
+        if (InStringOrCommentContext()) {
+            acActive = false;
+            acDot = false;
+            acAllCandidates = new List<CeCandidateItem>();
+            acItems = new List<string>();
+            return;
+        }
         // 切换过滤器不能把旧候选的编辑范围重新标记为当前文档。
         if (!CompletionSourceCurrent()) { acActive = false; acDot = false; return; }
         acItems = new List<string>();
@@ -404,6 +412,10 @@ partial class CodeEditor {
         if (!acForced && InStringOrCommentContext()) {
             acActive = false;
             acDot = false;
+            acAllCandidates = new List<CeCandidateItem>();
+            acItems = new List<string>();
+            acKinds = new List<string>();
+            CancelSemanticCompletion();
             return;
         }
 
@@ -1355,6 +1367,10 @@ partial class CodeEditor {
         if (!acForced && InStringOrCommentContext()) {
             acActive = false;
             acDot = false;
+            acAllCandidates = new List<CeCandidateItem>();
+            acItems = new List<string>();
+            acKinds = new List<string>();
+            CancelSemanticCompletion();
             return;
         }
         string ln = lines[curLine];
@@ -1372,6 +1388,7 @@ partial class CodeEditor {
         acStart = dotPos + 1;
         acFull = new List<string>();
         acDot = true;
+        acDotReceiverType = "";
 
         // 解析接收者类型，然后只列出该类型的真实成员。
         // 优先级：硬编码 stdlib 静态类型 -> 用户/项目类型 ->
@@ -1382,15 +1399,19 @@ partial class CodeEditor {
         string norm = CodeEditor.NormalizeStdlibType(recv);
         if (CodeEditor.IsKnownStdlibType(norm)) {
             // 接收者就是类型本身，只能访问其静态成员。
+            acDotReceiverType = norm;
             CodeEditor.AddMembersIn(acFull, norm, 1);
         } else {
             List<string> mem = new List<string>();
             bool found = FindTypeMembers(recv, mem);
             bool coll = false;
-            if (!found) {
+            if (found) {
+                acDotReceiverType = recv;
+            } else {
                 string vt = ResolveVarType(recv);
                 if (vt.Length > 0) {
                     string nvt = CodeEditor.NormalizeStdlibType(vt);
+                    acDotReceiverType = nvt;
                     if (CodeEditor.IsKnownStdlibType(nvt)) {
                         // 接收者是值：列出其实例成员。
                         CodeEditor.AddMembersIn(acFull, nvt, 0);
@@ -2234,7 +2255,7 @@ partial class CodeEditor {
         return false;
     }
 
-    // 检查光标是否处于字符串字面量或单行注释内部，避免在引号或注释中弹出无意义的代码补全
+    // 检查光标是否处于字符串字面量或单行/块注释内部，避免在引号或注释中弹出无意义的代码补全
     bool InStringOrCommentContext() {
         if (curLine < 0 || curLine >= lines.Count) { return false; }
         string ln = lines[curLine];
@@ -2244,19 +2265,33 @@ partial class CodeEditor {
         int i = 0;
         bool inStr = false;
         int strQuote = 0;
+        bool inBlockComment = false;
         while (i < limit) {
-            int b = ln[i];
+            int b = ln[i] & 255;
             // 检查行注释（Zan // 或 Python # 或 Lua --）
-            if (!inStr) {
-                if (syntaxLang == 0 && b == 47 && i + 1 < n && ln[i + 1] == 47) {
+            if (!inStr && !inBlockComment) {
+                if (syntaxLang == 0 && b == 47 && i + 1 < n && (ln[i + 1] & 255) == 47) {
                     return true;
                 }
-                if (syntaxLang == 1 && b == 45 && i + 1 < n && ln[i + 1] == 45) {
+                if (syntaxLang == 0 && b == 47 && i + 1 < n && (ln[i + 1] & 255) == 42) {
+                    inBlockComment = true;
+                    i = i + 2;
+                    continue;
+                }
+                if (syntaxLang == 1 && b == 45 && i + 1 < n && (ln[i + 1] & 255) == 45) {
                     return true;
                 }
                 if (syntaxLang == 2 && b == 35) {
                     return true;
                 }
+            } else if (inBlockComment) {
+                if (b == 42 && i + 1 < n && (ln[i + 1] & 255) == 47) {
+                    inBlockComment = false;
+                    i = i + 2;
+                    continue;
+                }
+                i = i + 1;
+                continue;
             }
 
             if (inStr) {
@@ -2276,7 +2311,17 @@ partial class CodeEditor {
             }
             i = i + 1;
         }
-        return inStr;
+        if (inBlockComment) { return true; }
+        if (inStr) { return true; }
+        // 兜底检查：若当前光标左右紧邻引号（如刚刚自动成对补全的 "" 或 ''），一律属于字符串内部
+        if (limit > 0 && limit < n) {
+            int prevB = ln[limit - 1] & 255;
+            int nextB = ln[limit] & 255;
+            if ((prevB == 34 && nextB == 34) || (prevB == 39 && nextB == 39)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // 扫描缓冲区中使用 `using X;` 类型却缺少所需导入之处，
