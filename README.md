@@ -1,4 +1,4 @@
-﻿# Zan Programming Language
+# Zan Programming Language
 
 Modern systems programming language with **C# syntax**, **LLVM backend**, and **ARC memory management**.
 
@@ -63,5 +63,10 @@ docs/                  # Language specifications & architectural documentation
 
 ## License
 
-MIT
+Zan Programming Language is distributed under the [Zan Community Source License (ZCSL)](./LICENSE):
+
+- ✅ **免费商用 (Free for Commercial Use)**：允许个人及企业免费用于商业开发与生产部署。
+- ✅ **产物自由 (Output Exception)**：用 Zan 编译出来的任何程序（可执行文件/库）完全归开发者所有，分发与售卖不受任何限制。
+- ❌ **禁止二开分发 (No Derivative Redistribution)**：禁止修改 Zan 编译器/运行时/工具链后对外二次打包分发、换皮发布或转售。
+
 
