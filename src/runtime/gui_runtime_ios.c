@@ -216,19 +216,34 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     (void)self; (void)_cmd; (void)app; (void)opts;
 
     zan_class_t cls_screen = g_bridge.objc_getClass("UIScreen");
-    zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
-    zan_id_t screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
+    zan_id_t screen = NULL;
+    if (cls_screen) {
+        zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
+        screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
+    }
 
-    zan_sel_t sel_bounds = g_bridge.sel_registerName("bounds");
-    typedef zan_cg_rect_t (*bounds_fn)(zan_id_t, zan_sel_t);
-    bounds_fn fn_bounds = (bounds_fn)g_bridge.objc_msgSend;
-    zan_cg_rect_t bounds = fn_bounds(screen, sel_bounds);
+    zan_cg_rect_t bounds = { {0.0, 0.0}, {390.0, 844.0} };
+    double scale = 2.0;
 
-    zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
-    typedef double (*scale_fn)(zan_id_t, zan_sel_t);
-    scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
-    double scale = fn_scale(screen, sel_scale);
-    if (scale < 1.0) scale = 1.0;
+    if (screen) {
+        zan_sel_t sel_bounds = g_bridge.sel_registerName("bounds");
+        typedef zan_cg_rect_t (*bounds_fn)(zan_id_t, zan_sel_t);
+        bounds_fn fn_bounds = (bounds_fn)g_bridge.objc_msgSend;
+        bounds = fn_bounds(screen, sel_bounds);
+
+        zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
+        typedef double (*scale_fn)(zan_id_t, zan_sel_t);
+        scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
+        scale = fn_scale(screen, sel_scale);
+    }
+
+    if (scale < 1.0) scale = 2.0;
+    if (bounds.size.width < 100.0 || bounds.size.height < 100.0) {
+        bounds.origin.x = 0;
+        bounds.origin.y = 0;
+        bounds.size.width = 390.0;
+        bounds.size.height = 844.0;
+    }
 
     g_iwin.dpi = (int)(96.0 * scale);
     g_iwin.width = (int)(bounds.size.width * scale);
@@ -280,6 +295,21 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     return true;
 }
 
+static zan_id_t zan_ios_get_window(zan_id_t self, zan_sel_t _cmd) {
+    (void)self; (void)_cmd;
+    return g_iwin.ui_window;
+}
+
+static void zan_ios_set_window(zan_id_t self, zan_sel_t _cmd, zan_id_t win) {
+    (void)self; (void)_cmd;
+    g_iwin.ui_window = win;
+}
+
+static bool zan_ios_open_url(zan_id_t self, zan_sel_t _cmd, zan_id_t app, zan_id_t url, zan_id_t opts) {
+    (void)self; (void)_cmd; (void)app; (void)url; (void)opts;
+    return true;
+}
+
 static void zan_ios_register_classes(void) {
     zan_class_t cls_uiview = g_bridge.objc_getClass("UIView");
     if (cls_uiview && !g_bridge.objc_getClass("ZanView")) {
@@ -298,6 +328,9 @@ static void zan_ios_register_classes(void) {
         zan_class_t cls_appdel = g_bridge.objc_allocateClassPair(cls_uiresponder, "ZanAppDelegate", 0);
         if (cls_appdel) {
             g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("application:didFinishLaunchingWithOptions:"), (zan_imp_t)zan_ios_did_finish_launching, "B@:@@");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("window"), (zan_imp_t)zan_ios_get_window, "@@:");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("setWindow:"), (zan_imp_t)zan_ios_set_window, "v@:@");
+            g_bridge.class_addMethod(cls_appdel, g_bridge.sel_registerName("application:openURL:options:"), (zan_imp_t)zan_ios_open_url, "B@:@@@");
             g_bridge.objc_registerClassPair(cls_appdel);
         }
     }
@@ -324,11 +357,25 @@ int main(int argc, char **argv) {
     g_zan_argc = argc;
     g_zan_argv = argv;
 
+    if (argv && argv[0]) {
+        char exe_dir[1024];
+        snprintf(exe_dir, sizeof(exe_dir), "%s", argv[0]);
+        char *slash = strrchr(exe_dir, '/');
+        if (slash) {
+            *slash = '\0';
+            chdir(exe_dir);
+        }
+    }
+
     zan_ios_init_bridge();
     zan_ios_register_classes();
 
     pthread_t tid;
     pthread_create(&tid, NULL, zan_ios_worker_entry, NULL);
+
+    void *(*p_objc_autoreleasePoolPush)(void) = (void *(*)(void))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPush");
+    void (*p_objc_autoreleasePoolPop)(void *) = (void (*)(void *))dlsym(RTLD_DEFAULT, "objc_autoreleasePoolPop");
+    void *pool = p_objc_autoreleasePoolPush ? p_objc_autoreleasePoolPush() : NULL;
 
     zan_class_t cls_str = g_bridge.objc_getClass("NSString");
     zan_sel_t sel_utf8 = g_bridge.sel_registerName("stringWithUTF8String:");
@@ -336,10 +383,15 @@ int main(int argc, char **argv) {
     str_fn fn_str = (str_fn)g_bridge.objc_msgSend;
     zan_id_t del_name = fn_str((zan_id_t)cls_str, sel_utf8, "ZanAppDelegate");
 
+    int ret = 0;
     if (p_UIApplicationMain) {
-        return p_UIApplicationMain(argc, argv, NULL, del_name);
+        ret = p_UIApplicationMain(argc, argv, NULL, del_name);
     }
-    return 0;
+
+    if (pool && p_objc_autoreleasePoolPop) {
+        p_objc_autoreleasePoolPop(pool);
+    }
+    return ret;
 }
 
 EXPORT iptr zan_gui_create_window(const char *title, i32 width, i32 height) {

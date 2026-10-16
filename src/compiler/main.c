@@ -7790,6 +7790,19 @@ int main(int argc, char **argv) {
                          " -rpath @loader_path");
             }
             { cmd_appendf(cmd, sizeof(cmd), " \"%s\"", tbd); }
+            if (target.os == ZAN_OS_IOS && has_gui_driver) {
+                const char *ios_tbds[] = {"UIKit.tbd", "Foundation.tbd", "CoreGraphics.tbd", "QuartzCore.tbd"};
+                for (size_t ti = 0; ti < sizeof(ios_tbds) / sizeof(ios_tbds[0]); ti++) {
+                    char fw_tbd[1200];
+                    snprintf(fw_tbd, sizeof(fw_tbd), "%s/ios/%s", exe_dir2, ios_tbds[ti]);
+                    if (!zan_file_exists(fw_tbd)) {
+                        snprintf(fw_tbd, sizeof(fw_tbd), "toolchain/ios/%s", ios_tbds[ti]);
+                    }
+                    if (zan_file_exists(fw_tbd)) {
+                        cmd_appendf(cmd, sizeof(cmd), " \"%s\"", fw_tbd);
+                    }
+                }
+            }
             link_ret = system(cmd);
         } else if (cross_compiling && target.os == ZAN_OS_FREESTANDING) {
             remove(obj_path);
@@ -8410,9 +8423,12 @@ int main(int argc, char **argv) {
             const char *app_name = ipa_name;
             char def_name[256];
             if (!app_name) {
-                const char *base = zan_path_basename(input_file);
+                const char *base = zan_path_basename(ipa_path);
+                if (!base || !base[0] || strcmp(base, "out.exe") == 0 || strcmp(base, "main") == 0) {
+                    base = zan_path_basename(input_file);
+                }
                 size_t blen = strlen(base);
-                if (blen > 4 && strcmp(base + blen - 4, ".zan") == 0) {
+                if (blen > 4 && (strcmp(base + blen - 4, ".ipa") == 0 || strcmp(base + blen - 4, ".exe") == 0 || strcmp(base + blen - 4, ".zan") == 0)) {
                     snprintf(def_name, sizeof(def_name), "%.*s", (int)(blen - 4), base);
                 } else {
                     snprintf(def_name, sizeof(def_name), "%s", base);
