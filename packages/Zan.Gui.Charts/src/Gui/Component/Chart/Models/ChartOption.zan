@@ -646,6 +646,12 @@ class ChartOption {
         return ChartAxis.Category(this.XCategories());
     }
 
+    // 第二个 x 轴；只有一根时回退为 XAxis0()（双 X 轴图顶轴）。
+    ChartAxis XAxis1() {
+        if (this.xAxes.Count > 1) { return this.xAxes[1]; }
+        return this.XAxis0();
+    }
+
     // 第一个 y 轴；未配置时返回默认数值轴（不写入列表）。
     ChartAxis YAxis0() {
         if (this.yAxes.Count > 0) { return this.yAxes[0]; }
@@ -1070,11 +1076,35 @@ class ChartOption {
         }
         JsonValue pointer = v.Get("pointer");
         if (pointer != null && pointer.IsObject()) {
+            gauge.pointer.show = pointer.Bool("show", gauge.pointer.show);
             gauge.pointer.length = ChartOption.ParseScalar(pointer.Get("length"), gauge.pointer.length);
             gauge.pointer.width = pointer.Int("width", gauge.pointer.width);
             if (pointer.Has("color")) { gauge.pointer.color = ChartOption.ParseColor(pointer.Get("color"), gauge.pointer.color); }
             if (pointer.Has("shadowColor")) { gauge.pointer.shadowColor = ChartOption.ParseColor(pointer.Get("shadowColor"), gauge.pointer.shadowColor); }
             gauge.pointer.shadowBlur = pointer.Int("shadowBlur", gauge.pointer.shadowBlur);
+        }
+        JsonValue prog = v.Get("progress");
+        if (prog != null && prog.IsObject()) {
+            gauge.progress.show = prog.Bool("show", gauge.progress.show);
+            gauge.progress.overlap = prog.Bool("overlap", gauge.progress.overlap);
+            gauge.progress.width = prog.Int("width", gauge.progress.width);
+            gauge.progress.roundCap = prog.Bool("roundCap", gauge.progress.roundCap);
+            JsonValue pis = prog.Get("itemStyle");
+            if (pis != null && pis.IsObject() && pis.Has("color")) {
+                gauge.progress.color = ChartOption.ParseColor(pis.Get("color"), gauge.progress.color);
+            }
+        }
+        JsonValue anc = v.Get("anchor");
+        if (anc != null && anc.IsObject()) {
+            gauge.anchor.show = anc.Bool("show", gauge.anchor.show);
+            gauge.anchor.showAbove = anc.Bool("showAbove", gauge.anchor.showAbove);
+            gauge.anchor.size = anc.Int("size", gauge.anchor.size);
+            JsonValue ais = anc.Get("itemStyle");
+            if (ais != null && ais.IsObject()) {
+                if (ais.Has("color")) { gauge.anchor.color = ChartOption.ParseColor(ais.Get("color"), gauge.anchor.color); }
+                if (ais.Has("borderColor")) { gauge.anchor.borderColor = ChartOption.ParseColor(ais.Get("borderColor"), gauge.anchor.borderColor); }
+                gauge.anchor.borderWidth = ais.Int("borderWidth", gauge.anchor.borderWidth);
+            }
         }
         JsonValue title = v.Get("title");
         if (title != null && title.IsObject()) {
@@ -1118,6 +1148,7 @@ class ChartOption {
         }
         if (v.Has("color0")) { style.color0 = ChartOption.ParseColor(v.Get("color0"), style.color0); }
         if (v.Has("borderColor")) { style.borderColor = ChartOption.ParseColor(v.Get("borderColor"), style.borderColor); }
+        if (v.Has("borderColor0")) { style.borderColor0 = ChartOption.ParseColor(v.Get("borderColor0"), style.borderColor0); }
         style.borderWidth = v.Int("borderWidth", style.borderWidth);
         JsonValue brad = v.Get("borderRadius");
         if (brad != null) {
@@ -2984,6 +3015,28 @@ class ChartOption {
             }
             if (it.Has("color")) { m.color = ChartOption.ParseColor(it.Get("color"), 0); }
             if (it.Has("label")) { m.label = it.Str("label", it.Str("name", "")); }
+            if (it.Has("symbol")) { m.symbol = ChartKinds.SymbolSanitize(it.Str("symbol", "")); }
+            if (it.Has("symbolSize")) { m.size = it.Int("symbolSize", 0); m.sizeSet = true; }
+            JsonValue itOff = it.Get("symbolOffset");
+            if (itOff != null && itOff.IsArray() && itOff.Count() >= 2) {
+                m.offSet = true;
+                JsonValue ox0 = itOff.At(0);
+                JsonValue oy0 = itOff.At(1);
+                if (ox0.IsNumber()) { m.offX = ox0.AsInt(0); }
+                else if (ox0.IsString() && ox0.AsString("").EndsWith("%")) {
+                    string s0 = ox0.AsString("");
+                    int pct0 = Convert.ToInt(s0.Substring(0, s0.Length - 1));
+                    int baseSz0 = m.sizeSet && m.size > 0 ? m.size : 20;
+                    m.offX = baseSz0 * pct0 / 100;
+                }
+                if (oy0.IsNumber()) { m.offY = oy0.AsInt(0); }
+                else if (oy0.IsString() && oy0.AsString("").EndsWith("%")) {
+                    string s1 = oy0.AsString("");
+                    int pct1 = Convert.ToInt(s1.Substring(0, s1.Length - 1));
+                    int baseSz1 = m.sizeSet && m.size > 0 ? m.size : 20;
+                    m.offY = baseSz1 * pct1 / 100;
+                }
+            }
             m.valueIndex = it.Int("valueIndex", 0 - 1);
             into.Add(m);
         }
@@ -3312,6 +3365,8 @@ class ChartOption {
                         if (inm.Length == 0) { inm = ax.Str("name", ""); }
                         int amax = ax.Int("max", 0);
                         p.indicators.Add(new RadarIndicator(inm, amax));
+                        p.indicatorText.Add(inm);
+                        p.indicatorMax.Add(amax);
                         if (ri == 0) {
                             o.radarIndicators.Add(new RadarIndicator(inm, amax));
                             o.radarMax.Add(amax);
@@ -3361,7 +3416,12 @@ class ChartOption {
                 if (ind != null && ind.IsArray()) {
                     for (int ii = 0; ii < ind.Count(); ii = ii + 1) {
                         JsonValue ax = ind.At(ii);
-                        p.indicators.Add(new RadarIndicator(ax.Str("text", ""), ax.Int("max", 0)));
+                        string ptext = ax.Str("text", "");
+                        if (ptext.Length == 0) { ptext = ax.Str("name", ""); }
+                        int pmax = ax.Int("max", 0);
+                        p.indicators.Add(new RadarIndicator(ptext, pmax));
+                        p.indicatorText.Add(ptext);
+                        p.indicatorMax.Add(pmax);
                     }
                 }
                 JsonValue nm = ps.Get("name");
@@ -3712,6 +3772,22 @@ class ChartOption {
                     } else if (psz != null && psz.IsNumber()) {
                         cs.picW = psz.AsInt(0);
                         cs.picH = cs.picW;
+                    }
+                    JsonValue pso = s.Get("symbolOffset");
+                    if (pso != null && pso.IsArray() && pso.Count() >= 2) {
+                        cs.picOffSet = true;
+                        JsonValue ox0 = pso.At(0);
+                        JsonValue oy0 = pso.At(1);
+                        if (ox0.IsNumber()) { cs.picOffX = ox0.AsInt(0); }
+                        else if (ox0.IsString() && ox0.AsString("").EndsWith("%")) {
+                            string so0 = ox0.AsString("");
+                            cs.picOffXPct = Convert.ToInt(so0.Substring(0, so0.Length - 1));
+                        }
+                        if (oy0.IsNumber()) { cs.picOffY = oy0.AsInt(0); }
+                        else if (oy0.IsString() && oy0.AsString("").EndsWith("%")) {
+                            string so1 = oy0.AsString("");
+                            cs.picOffYPct = Convert.ToInt(so1.Substring(0, so1.Length - 1));
+                        }
                     }
                 }
                 if (cs.custom == "parallel") {
@@ -4122,6 +4198,22 @@ class ChartOption {
                         }
                     }
                     cs.markSymbolSize = mpObj.Int("symbolSize", cs.markSymbolSize);
+                    JsonValue mpo = mpObj.Get("symbolOffset");
+                    if (mpo != null && mpo.IsArray() && mpo.Count() >= 2) {
+                        cs.markOffSet = true;
+                        JsonValue ox0 = mpo.At(0);
+                        JsonValue oy0 = mpo.At(1);
+                        if (ox0.IsNumber()) { cs.markOffX = ox0.AsInt(0); }
+                        else if (ox0.IsString() && ox0.AsString("").EndsWith("%")) {
+                            string so0 = ox0.AsString("");
+                            cs.markOffXPct = Convert.ToInt(so0.Substring(0, so0.Length - 1));
+                        }
+                        if (oy0.IsNumber()) { cs.markOffY = oy0.AsInt(0); }
+                        else if (oy0.IsString() && oy0.AsString("").EndsWith("%")) {
+                            string so1 = oy0.AsString("");
+                            cs.markOffYPct = Convert.ToInt(so1.Substring(0, so1.Length - 1));
+                        }
+                    }
                 }
                 // series.labelLayout：标签绝对位/偏移/对齐/解叠（对象
                 // 形态；官方 JS 函数形 JSON 导出已丢失，见 skill 11）。
@@ -4410,6 +4502,26 @@ class ChartOption {
                             if (it.Has("symbolSize")) {
                                 item.size = it.Int("symbolSize", 0);
                                 item.sizeSet = true;
+                            }
+                            JsonValue itOff = it.Get("symbolOffset");
+                            if (itOff != null && itOff.IsArray() && itOff.Count() >= 2) {
+                                item.offSet = true;
+                                JsonValue ox0 = itOff.At(0);
+                                JsonValue oy0 = itOff.At(1);
+                                if (ox0.IsNumber()) { item.offX = ox0.AsInt(0); }
+                                else if (ox0.IsString() && ox0.AsString("").EndsWith("%")) {
+                                    string so0 = ox0.AsString("");
+                                    int pct0 = Convert.ToInt(so0.Substring(0, so0.Length - 1));
+                                    int baseSz0 = item.sizeSet && item.size > 0 ? item.size : 20;
+                                    item.offX = baseSz0 * pct0 / 100;
+                                }
+                                if (oy0.IsNumber()) { item.offY = oy0.AsInt(0); }
+                                else if (oy0.IsString() && oy0.AsString("").EndsWith("%")) {
+                                    string so1 = oy0.AsString("");
+                                    int pct1 = Convert.ToInt(so1.Substring(0, so1.Length - 1));
+                                    int baseSz1 = item.sizeSet && item.size > 0 ? item.size : 20;
+                                    item.offY = baseSz1 * pct1 / 100;
+                                }
                             }
                             item.symbol = ChartKinds.SymbolSanitize(it.Str("symbol", ""));
                             // 逐根 itemStyle：逐柱颜色/圆角/透明
@@ -4984,6 +5096,13 @@ class ChartOption {
                                             o.polars[rmatPg].indicators[rmatPm].max * 1000;
                                     }
                                 }
+                                for (int rmatPm2 = 0; rmatPm2 < o.polars[rmatPg].indicatorMax.Count;
+                                     rmatPm2 = rmatPm2 + 1) {
+                                    if (o.polars[rmatPg].indicatorMax[rmatPm2] > 0) {
+                                        o.polars[rmatPg].indicatorMax[rmatPm2] =
+                                            o.polars[rmatPg].indicatorMax[rmatPm2] * 1000;
+                                    }
+                                }
                             }
                         }
                         o.radarScaled = true;
@@ -5256,6 +5375,7 @@ class ChartOption {
         }
         a.title = v.Str("name", "");
         a.axisId = v.Str("id", "");
+        a.gridIndex = v.Int("gridIndex", 0);
         a.reversed = v.Bool("inverse", false);
         // nice 步长钳制。未声明记 AutoD()（源码里的 null 分支，
         // axisNiceTicks.ts:263-264）。**0 是合法显式值**，所以只能靠
@@ -5455,6 +5575,10 @@ class ChartOption {
             // 标签与轴线像素距离（bump-chart Y=30，X=30）——此前丢弃。
             a.labelMargin = al.Int("margin", a.labelMargin);
             a.labelShow = al.Bool("show", a.labelShow);
+            a.labelInside = al.Bool("inside", a.labelInside);
+            if (al.Has("color")) {
+                a.labelColor = ChartOption.ParseColor(al.Get("color"), a.labelColor);
+            }
             a.labelFontSize = al.Int("fontSize", a.labelFontSize);
             // 模板标签："{value} °C"——{value} 替换为刻度值。
             a.labelFormatter = al.Str("formatter", a.labelFormatter);
@@ -5468,6 +5592,24 @@ class ChartOption {
                 a.labelSt = ast;
             }
         }
+        JsonValue at = v.Get("axisTick");
+        if (at != null && at.IsObject()) {
+            a.axisTickShow = at.Bool("show", a.axisTickShow);
+            a.axisTickAlignWithLabel = at.Bool("alignWithLabel", a.axisTickAlignWithLabel);
+            a.axisTickInside = at.Bool("inside", a.axisTickInside);
+            a.axisTickLength = at.Int("length", a.axisTickLength);
+            JsonValue atls = at.Get("lineStyle");
+            if (atls != null && atls.IsObject()) {
+                if (atls.Has("color")) { a.axisTickColor = ChartOption.ParseColor(atls.Get("color"), a.axisTickColor); }
+                a.axisTickWidth = atls.Int("width", a.axisTickWidth);
+            }
+        }
+        JsonValue nts = v.Get("nameTextStyle");
+        if (nts != null && nts.IsObject()) {
+            if (nts.Has("color")) { a.nameColor = ChartOption.ParseColor(nts.Get("color"), a.nameColor); }
+            a.nameFontSize = nts.Int("fontSize", a.nameFontSize);
+        }
+        a.offset = v.Int("offset", a.offset);
         into.Add(a);
     }
 }
