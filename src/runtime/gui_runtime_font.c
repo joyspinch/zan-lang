@@ -925,6 +925,9 @@ EXPORT void zan_gui_draw_text(
     zan_surface_t *s = g_surfaces[surface_id];
     if (!s || !text || !*text) return;
     ZAN_BE(s, draw_text, s, (int)x, (int)y, text, (u32)color, (int)font_size);
+#if defined(ZAN_GUI_IOS)
+    if (zan_ios_draw_text(surface_id, x, y, text, color, font_size, 0)) return;
+#endif
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
         ft_draw_text(surface_id, x, y, text, color, (int)font_size, 0);
@@ -952,6 +955,9 @@ EXPORT void zan_gui_draw_text_rot(
         zan_gui_draw_text(surface_id, x, y, text, color, font_size);
         return;
     }
+#if defined(ZAN_GUI_IOS)
+    if (zan_ios_draw_text(surface_id, x, y, text, color, font_size, angle)) return;
+#endif
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
         ft_draw_text(surface_id, x, y, text, color, (int)font_size, angle);
@@ -962,6 +968,10 @@ EXPORT void zan_gui_draw_text_rot(
 }
 
 EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
+#if defined(ZAN_GUI_IOS)
+    i32 m = zan_ios_measure_text(text, font_size);
+    if (m >= 0) return m;
+#endif
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) return ft_measure_text(text, (int)font_size);
 #endif
@@ -969,6 +979,10 @@ EXPORT i32 zan_gui_measure_text(const char *text, i32 font_size) {
 }
 
 EXPORT i32 zan_gui_font_height(i32 font_size) {
+#if defined(ZAN_GUI_IOS)
+    i32 h = zan_ios_font_height(font_size);
+    if (h > 0) return h;
+#endif
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size)) {
         FT_Size_Metrics m = g_ft_face->size->metrics;
@@ -981,6 +995,10 @@ EXPORT i32 zan_gui_font_height(i32 font_size) {
 }
 
 EXPORT i32 zan_gui_font_ascent(i32 font_size) {
+#if defined(ZAN_GUI_IOS)
+    i32 a = zan_ios_font_ascent(font_size);
+    if (a > 0) return a;
+#endif
 #ifdef ZAN_GUI_FREETYPE
     if (ft_prepare((int)font_size))
         return (i64)(g_ft_face->size->metrics.ascender >> 6);
