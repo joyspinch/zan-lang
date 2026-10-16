@@ -20,7 +20,7 @@
 
 ## 快速上手
 
-### 1. 折线图 / 柱状图示例
+### 1. 窗口控件形态（`ChartHost`）
 
 ```zan
 using System;
@@ -30,7 +30,7 @@ using Gui.Component.Chart;
 
 class ChartDemo : Window {
     public ChartDemo() {
-        Chart chart = new Chart();
+        ChartHost chart = new ChartHost();
         chart.SetBounds(20, 20, 600, 400);
 
         // 创建图表配置
@@ -44,16 +44,17 @@ class ChartDemo : Window {
         ChartSeries s1 = ChartSeries.Line("销售额", new List<int>{ 120, 200, 150, 280, 220, 310 });
         opt.series.Add(s1);
 
-        // 应用配置并刷新
+        // 应用配置并挂载至控件树
         chart.SetOption(opt);
         this.Add(chart);
     }
 }
 ```
 
-### 2. 饼图 / 环形图示例
+### 2. 即时渲染形态（`ChartView`）
 
 ```zan
+// 即时模式帧渲染循环中直接调用
 ChartOption opt = new ChartOption();
 opt.title = "市场份额占比";
 
@@ -65,12 +66,17 @@ pie.data = new List<ChartData>{
     new ChartData("其他", 10)
 };
 opt.series.Add(pie);
-chart.SetOption(opt);
+
+// 在 App 帧绘制中单行呈现
+ChartView.Of(opt).Render(app, x, y, width, height);
 ```
 
 ### 3. 切换主题
 
 ```zan
-// 支持直接设置预设主题名称
-chart.SetTheme("macarons"); // 或 "dark", "shine", "blue" 等
+// 支持在 ChartHost 控件上设置预设主题名称
+chart.SetTheme("macarons"); // 或 "dark", "shine", "blue", "echarts6" 等
+
+// 亦支持全局切换当前图表皮肤主题
+ChartSkin.SetCurrent("echarts6");
 ```
