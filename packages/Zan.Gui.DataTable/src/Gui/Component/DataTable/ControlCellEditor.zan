@@ -4,57 +4,37 @@ using Gui.Widget;
 
 namespace Gui.Component.DataTable;
 
-// 万能 Gui 控件悬浮编辑器适配器（零胶水代码，任意 Gui 组件直接挂载进单元格）：
-// 自动探测 Input, TextArea, SelectBox, Checkbox, Switch 等标准控件的数据通道，
-// 并支持未知自定义控件的属性协议（"value"）与生命周期焦点挂载。
+// 单元格数据通道委托：允许调用方对任意复杂复合组件自由定制赋值/取值（彻底杜绝硬编码）
+delegate void CellValueSetter(Control ctl, string value);
+delegate string CellValueGetter(Control ctl);
+
+// 万能 Gui 控件悬浮编辑器适配器（纯协议驱动 + 开放委托定制）：
+// 1. 契约驱动（Protocol-Driven）：任意 Gui.Control 默认走统一的标准 "value" 属性通道（SetProp("value") / GetProp("value")）；
+// 2. 委托开放（Open-Closed）：支持注入自定义 Setter/Getter 委托，无需在表格核心代码里硬编码任何具体控件类型；
+// 3. 焦点收敛：依托 Control.WidgetId() 统一将键盘输入焦点授予组件内部交互内核。
 class ControlCellEditor : CellEditor {
     Control widget;
+    CellValueSetter customSetter;
+    CellValueGetter customGetter;
 
     ControlCellEditor(Control ctl) {
         this.widget = ctl;
+    }
+
+    ControlCellEditor(Control ctl, CellValueSetter setter, CellValueGetter getter) {
+        this.widget = ctl;
+        this.customSetter = setter;
+        this.customGetter = getter;
     }
 
     override Control CreateWidget(App app, DataTableState st, DataColumn col) {
         return this.widget;
     }
 
-    static bool IsNumeric(string s) {
-        if (s == null || s == "") { return false; }
-        int start = 0;
-        if (s[0] == 45) { start = 1; } // '-'
-        if (start >= s.Length) { return false; }
-        for (int i = start; i < s.Length; i = i + 1) {
-            if (s[i] < 48 || s[i] > 57) { return false; }
-        }
-        return true;
-    }
-
     override void BeginEdit(Control ctl, string initValue, DataColumn col) {
         if (ctl == null) { return; }
-        if (ctl is Input) {
-            ((Input)ctl).SetText(initValue);
-            return;
-        }
-        if (ctl is TextArea) {
-            ((TextArea)ctl).SetText(initValue);
-            return;
-        }
-        if (ctl is SelectBox) {
-            ((SelectBox)ctl).SetExtra("value", initValue);
-            return;
-        }
-        if (ctl is InputNumber) {
-            if (initValue != "" && ControlCellEditor.IsNumeric(initValue)) {
-                ((InputNumber)ctl).SetValue(Convert.ToInt32(initValue));
-            }
-            return;
-        }
-        if (ctl is Checkbox) {
-            ((Checkbox)ctl).SetChecked(DataTable.ParseBool(initValue));
-            return;
-        }
-        if (ctl is Switch) {
-            ((Switch)ctl).SetOn(DataTable.ParseBool(initValue));
+        if (this.customSetter != null) {
+            this.customSetter(ctl, initValue);
             return;
         }
         ctl.SetProp("value", initValue);
@@ -62,21 +42,19 @@ class ControlCellEditor : CellEditor {
 
     override string GetValue(Control ctl, DataColumn col) {
         if (ctl == null) { return ""; }
-        if (ctl is Input) { return ((Input)ctl).GetText(); }
-        if (ctl is TextArea) { return ((TextArea)ctl).GetText(); }
-        if (ctl is SelectBox) { return ((SelectBox)ctl).Text(); }
-        if (ctl is InputNumber) { return Convert.ToString(((InputNumber)ctl).Value()); }
-        if (ctl is Checkbox) { return ((Checkbox)ctl).IsChecked() ? "true" : "false"; }
-        if (ctl is Switch) { return ((Switch)ctl).IsOn() ? "true" : "false"; }
+        if (this.customGetter != null) {
+            return this.customGetter(ctl);
+        }
+        string val = ctl.GetProp("selectedValue");
+        if (val != "") { return val; }
         return ctl.GetProp("value");
     }
 
     override void Focus(App app, Control ctl) {
         if (ctl == null || app == null) { return; }
-        if (ctl is Input) {
-            app.focus.SetFocused(((Input)ctl).wid);
-        } else if (ctl is SelectBox) {
-            app.focus.SetFocused(((SelectBox)ctl).wid);
+        int wid = ctl.WidgetId();
+        if (wid > 0) {
+            app.focus.SetFocused(wid);
         } else if (ctl.commonId > 0) {
             app.focus.SetFocused(ctl.commonId);
         }
