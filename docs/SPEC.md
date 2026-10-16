@@ -1,9 +1,12 @@
 # Zan Language Specification
 
-> 本文档描述 Zan 语言的**当前实测语义**（zanc v0.2.1，2026-08-08 复核）。
-> 所有声称的特性均在 `tests/conformance/` 有对应用例或经编译探针验证；
-> 未实现/行为不标准的特性不在此列，见文末附录 A。
-> 本文件由 `docs/WORKSPACE_CONVENTIONS.md`《附录：docs 文档维护规则》的分层规则维护：只写现状，不写设计意图。
+<p align="left">
+  <b>English</b> | <a href="SPEC.zh-CN.md">简体中文</a>
+</p>
+
+> This document describes the **current verified semantics** of the Zan programming language (zanc v0.2.1).
+> All features documented here are backed by conformance tests in `tests/conformance/` or validated via compiler probes.
+> Unimplemented or non-standard behaviors are excluded and tracked in Appendix A.
 
 ## 1. Overview
 
