@@ -327,6 +327,15 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     zan_sel_t sel_set_scale = g_bridge.sel_registerName("setContentScaleFactor:");
     zan_send1_dbl(view, sel_set_scale, scale);
 
+    zan_sel_t sel_layer = g_bridge.sel_registerName("layer");
+    zan_id_t layer = zan_send0(view, sel_layer);
+    if (layer) {
+        zan_sel_t sel_set_contents_scale = g_bridge.sel_registerName("setContentsScale:");
+        zan_send1_dbl(layer, sel_set_contents_scale, scale);
+        zan_sel_t sel_set_opaque = g_bridge.sel_registerName("setOpaque:");
+        zan_send1_bool(layer, sel_set_opaque, true);
+    }
+
     zan_sel_t sel_set_multi = g_bridge.sel_registerName("setMultipleTouchEnabled:");
     zan_send1_bool(view, sel_set_multi, true);
 
@@ -586,8 +595,20 @@ typedef struct {
 static void zan_ios_do_present(void *arg) {
     zan_present_ctx_t *ctx = (zan_present_ctx_t *)arg;
     if (ctx && ctx->layer && ctx->img) {
-        zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
-        zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
+        zan_class_t cls_tx = g_bridge.objc_getClass("CATransaction");
+        if (cls_tx) {
+            zan_sel_t sel_begin = g_bridge.sel_registerName("begin");
+            zan_sel_t sel_set_disable = g_bridge.sel_registerName("setDisableActions:");
+            zan_sel_t sel_commit = g_bridge.sel_registerName("commit");
+            zan_send0((zan_id_t)cls_tx, sel_begin);
+            zan_send1_bool((zan_id_t)cls_tx, sel_set_disable, true);
+            zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
+            zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
+            zan_send0((zan_id_t)cls_tx, sel_commit);
+        } else {
+            zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
+            zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
+        }
     }
 }
 
@@ -604,12 +625,18 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     if (!p_CGColorSpaceCreateDeviceRGB || !p_CGDataProviderCreateWithData || !p_CGImageCreate) {
         return 0;
     }
+    if (s->width <= 0 || s->height <= 0 || s->stride < s->width || !s->pixels) {
+        return 1;
+    }
 
     CGColorSpaceRef cs = p_CGColorSpaceCreateDeviceRGB();
     if (!cs) return 1;
 
+    size_t bytes_per_row = (size_t)s->stride * sizeof(uint32_t);
+    size_t total_bytes = bytes_per_row * (size_t)s->height;
+
     CGDataProviderRef provider = p_CGDataProviderCreateWithData(
-        NULL, s->pixels, (size_t)s->stride * s->height, NULL);
+        NULL, s->pixels, total_bytes, NULL);
     if (!provider) {
         p_CGColorSpaceRelease(cs);
         return 1;
@@ -619,7 +646,7 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     uint32_t bitmap_info = (4 << 12) | 2;
     CGImageRef img = p_CGImageCreate(
         (size_t)s->width, (size_t)s->height,
-        8, 32, (size_t)s->stride,
+        8, 32, bytes_per_row,
         cs, bitmap_info, provider,
         NULL, false, 0
     );
