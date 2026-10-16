@@ -62,9 +62,8 @@ GUI = [p for p in sorted(glob.glob("src/runtime/gui_*"))
     "src/runtime/zan_fortify_compat.c"]
 IMAGE = ["src/runtime/zan_image.c", "src/runtime/zan_image.h",
          "src/runtime/zan_bitmap.h", "src/runtime/gui_image_svg.c",
-         "src/runtime/stb_image.h", "src/runtime/libwebp",
          "src/common/host_oom.h"]
-AUDIO = ["src/runtime/zan_audio.c", "src/runtime/stb_vorbis.c",
+AUDIO = ["src/runtime/zan_audio.c",
          "src/common/host_oom.h"]
 GAME = ["src/runtime/zan_game.c", "src/runtime/zan_game.h",
         "src/runtime/zan_gui_graphics.h", "src/runtime/zan_image.h",
@@ -427,8 +426,6 @@ def rebuild_cmd(artifact, zig, ndk):
             source, static_macro = feature_sources[name]
             cmd = [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",
                    "-I", rt]
-            if name == "zanrt_image.o":
-                cmd += ["-I", f"{rt}/libwebp/src"]
             return cmd + ["-O2", "-c", f"{rt}/{source}", f"-D{static_macro}"]
         if name == "zanrt_syncw.o":
             return [zig, "cc", "-target", "wasm32-wasi", "-g0", "-std=gnu11",

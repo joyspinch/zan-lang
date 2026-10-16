@@ -709,7 +709,7 @@ if(ZAN_BUILD_GUI)
         # Real Cocoa backend (Objective-C) + shared renderer + Metal GPU pipeline. The C file
         # is compiled with ZAN_GUI_COCOA so its macOS stub branch is disabled and
         # gui_runtime_mac.m supplies the native windowing/window-management ABI.
-        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m src/runtime/gui_metal_backend.m)
+        add_library(zan_gui SHARED src/runtime/gui_runtime.c src/runtime/gui_runtime_mac.m)
         set_source_files_properties(src/runtime/gui_runtime.c
             PROPERTIES COMPILE_DEFINITIONS ZAN_GUI_COCOA)
         target_link_libraries(zan_gui PRIVATE m "-framework Cocoa" "-framework CoreText" "-framework QuartzCore" "-framework IOSurface" "-framework WebKit" "-framework Metal")

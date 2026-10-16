@@ -46,8 +46,12 @@ for pair in arm64:aarch64 x64:x86_64; do
     "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
         -c "$RT/rt_timer.c" -o "$out/zanrt_timer.o"
     # GUI compatibility stubs (event seq/flag, font ascent, full surface presentation).
-    "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
-        -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
+    if [ -f "$RT/gui_compat_mac.c" ]; then
+        "$ZIG" cc -target "$arch-macos.11.0" -g0 -std=c11 -fPIC -I "$RT" -O2 \
+            -c "$RT/gui_compat_mac.c" -o "$out/zanrt_gui.o"
+    elif [ -x "$ROOT/build/zanc" ]; then
+        "$ROOT/build/zanc" --target "macos-$sub" -c "$RT/gui_compat_mac.zan" -o "$out/zanrt_gui.o"
+    fi
     # Embedded-resource API + compressed-resource decoder: GUI programs pull
     # skins/icons through the auto-embed path, so irgen sets uses_embed_api /
     # uses_inflate and the cross link injects these two objects (same flags as
@@ -62,8 +66,10 @@ for pair in arm64:aarch64 x64:x86_64; do
     echo "built toolchain/macos/$sub: zanrt_io.o zanrt_io_mt.o zanrt_sync.o zanrt_file.o zanrt_timer.o zanrt_gui.o zan_embed_api.o zan_inflate.o"
 done
 
-mkdir -p "$ROOT/toolchain/ios/arm64"
-"$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 \
-    -c "$RT/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
-echo "built toolchain/ios/arm64: zanrt_gui.o"
+if [ -f "$RT/gui_compat_mac.c" ]; then
+    mkdir -p "$ROOT/toolchain/ios/arm64"
+    "$ZIG" cc -target aarch64-ios -g0 -std=c11 -fPIC -I "$RT" -O2 \
+        -c "$RT/gui_compat_mac.c" -o "$ROOT/toolchain/ios/arm64/zanrt_gui.o"
+    echo "built toolchain/ios/arm64: zanrt_gui.o"
+fi
 
