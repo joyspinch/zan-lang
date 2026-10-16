@@ -116,6 +116,7 @@ static void (*p_CGColorRelease)(zan_cg_color_t color) = NULL;
 
 static zan_cf_str_t (*p_CFStringCreateWithCString)(void *alloc, const char *cStr, uint32_t encoding) = NULL;
 static void (*p_CFRelease)(void *cf) = NULL;
+static void *(*p_CFRetain)(void *cf) = NULL;
 static zan_cf_dict_t (*p_CFDictionaryCreate)(void *alloc, const void **keys, const void **values, long numValues, const void *keyCallBacks, const void *valueCallBacks) = NULL;
 static zan_cf_attr_str_t (*p_CFAttributedStringCreate)(void *alloc, zan_cf_str_t str, zan_cf_dict_t attributes) = NULL;
 
@@ -205,7 +206,7 @@ static int g_pending_event[8];
 static iptr g_event_win = 0;
 static int64_t g_ev_seq = 0;
 
-static void iq_push_locked(int kind, int x, int y, int button, int code, int mods) {
+static void iq_push_locked(int kind, int x, int y, int button, int code, int mods, int flag) {
     int last = (g_iq_tail + ZAN_IQ_CAP - 1) % ZAN_IQ_CAP;
     int has_last = (g_iq_head != g_iq_tail);
     if (kind == 1 && has_last && g_iq[last].e[0] == 1) {
@@ -213,11 +214,17 @@ static void iq_push_locked(int kind, int x, int y, int button, int code, int mod
         pthread_cond_signal(&g_iq_cond);
         return;
     }
+    if (kind == 13 && has_last && g_iq[last].e[0] == 13) {
+        g_iq[last].e[1] = x; g_iq[last].e[2] = y;
+        g_iq[last].e[4] += code;
+        pthread_cond_signal(&g_iq_cond);
+        return;
+    }
     int next = (g_iq_tail + 1) % ZAN_IQ_CAP;
     if (next == g_iq_head) return;
     zan_iev_t *z = &g_iq[g_iq_tail];
     z->e[0] = kind; z->e[1] = x; z->e[2] = y; z->e[3] = button;
-    z->e[4] = code; z->e[5] = mods; z->e[6] = 0; z->e[7] = 0;
+    z->e[4] = code; z->e[5] = mods; z->e[6] = flag; z->e[7] = 0;
     z->win = ZAN_IOS_HWND;
     g_iq_tail = next;
     pthread_cond_signal(&g_iq_cond);
@@ -298,6 +305,7 @@ static void zan_ios_init_bridge(void) {
 
     p_CFStringCreateWithCString = (zan_cf_str_t (*)(void *, const char *, uint32_t))dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
     p_CFRelease = (void (*)(void *))dlsym(RTLD_DEFAULT, "CFRelease");
+    p_CFRetain = (void *(*)(void *))dlsym(RTLD_DEFAULT, "CFRetain");
     p_CFDictionaryCreate = (zan_cf_dict_t (*)(void *, const void **, const void **, long, const void *, const void *))dlsym(RTLD_DEFAULT, "CFDictionaryCreate");
     p_CFAttributedStringCreate = (zan_cf_attr_str_t (*)(void *, zan_cf_str_t, zan_cf_dict_t))dlsym(RTLD_DEFAULT, "CFAttributedStringCreate");
 
@@ -365,7 +373,7 @@ static void *ios_fling_thread(void *arg) {
                 int delta = (int)g_ios_fling_acc;
                 if (delta != 0) {
                     g_ios_fling_acc -= (float)delta;
-                    iq_push_locked(13, g_ios_fling_x, g_ios_fling_y, 0, delta, 0);
+                    iq_push_locked(13, g_ios_fling_x, g_ios_fling_y, 0, delta, 0, 0);
                 }
             }
             if (fabsf(g_ios_fling_v) < IOS_FLING_STOP_PX_S) g_ios_fling_active = 0;
@@ -411,29 +419,33 @@ static void zan_ios_touch_action(int action, int x, int y) {
         g_ios_touch_ht[0] = ios_tick_ms();
         g_ios_touch_hy[0] = g_ios_touch_y;
         /* Primary button = 0 (Left click) for all UI button click triggers */
-        iq_push_locked(2, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 0, 0, 0);
+        iq_push_locked(2, (int)g_ios_touch_ax, (int)g_ios_touch_ay, 0, 0, 0, 0);
         pthread_mutex_unlock(&g_iq_lock);
         return;
     }
     if (action == 1 && g_ios_touch_down) { /* touch moved */
         pthread_mutex_lock(&g_iq_lock);
         float fx = (float)x, fy = (float)y;
+        float dpi = (float)(g_iwin.dpi > 0 ? g_iwin.dpi : 192);
+        float scale = dpi / 96.0f;
+        if (scale < 1.0f) scale = 2.0f;
+        float slop_px = 12.0f * scale;
+        float slop2 = slop_px * slop_px;
         if (!g_ios_touch_drag) {
             float dx = fx - g_ios_touch_ax, dy = fy - g_ios_touch_ay;
-            if (dx * dx + dy * dy < IOS_TOUCH_SLOP2) {
+            if (dx * dx + dy * dy < slop2) {
                 pthread_mutex_unlock(&g_iq_lock);
                 return;
             }
             g_ios_touch_drag = 1;
         }
-        float dpi = (float)(g_iwin.dpi > 0 ? g_iwin.dpi : 192);
         g_ios_touch_acc += (fy - g_ios_touch_y) * 288.0f / dpi;
         int delta = (int)g_ios_touch_acc;
         if (delta != 0) {
             g_ios_touch_acc -= (float)delta;
-            iq_push_locked(13, x, y, 0, delta, 0);
+            iq_push_locked(13, x, y, 0, delta, 0, 0);
         } else {
-            iq_push_locked(1, x, y, 0, 0, 0);
+            iq_push_locked(1, x, y, 0, 0, 0, 0);
         }
         g_ios_touch_ht[g_ios_touch_hi] = ios_tick_ms();
         g_ios_touch_hy[g_ios_touch_hi] = fy;
@@ -447,7 +459,7 @@ static void zan_ios_touch_action(int action, int x, int y) {
         g_ios_touch_down = 0;
         pthread_mutex_lock(&g_iq_lock);
         if (g_ios_touch_drag) {
-            iq_push_locked(3, (int)g_ios_touch_x, (int)g_ios_touch_y, 0, 0, 0);
+            iq_push_locked(3, (int)g_ios_touch_x, (int)g_ios_touch_y, 0, 0, 0, 1);
             pthread_mutex_unlock(&g_iq_lock);
             int last = (g_ios_touch_hi + IOS_TOUCH_HIST - 1) % IOS_TOUCH_HIST;
             int old = last;
@@ -463,7 +475,7 @@ static void zan_ios_touch_action(int action, int x, int y) {
             }
         } else {
             int ax = (int)g_ios_touch_ax, ay = (int)g_ios_touch_ay;
-            iq_push_locked(3, ax, ay, 0, 0, 0);
+            iq_push_locked(3, ax, ay, 0, 0, 0, 0);
             pthread_mutex_unlock(&g_iq_lock);
         }
         return;
@@ -601,7 +613,7 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     g_iwin.closed = 0;
 
     pthread_mutex_lock(&g_iq_lock);
-    iq_push_locked(0, 0, 0, 0, 0, 0);
+    iq_push_locked(0, 0, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_iq_lock);
 
     return true;
@@ -723,7 +735,7 @@ EXPORT i32 zan_gui_close_window(iptr hwnd_val) {
     (void)hwnd_val;
     pthread_mutex_lock(&g_iq_lock);
     g_iwin.closed = 1;
-    iq_push_locked(8, 0, 0, 0, 0, 0);
+    iq_push_locked(8, 0, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_iq_lock);
     return 0;
 }
@@ -911,7 +923,7 @@ EXPORT i32 zan_gui_wait_event_timeout(i32 ms) {
 
 EXPORT i32 zan_gui_wake(void) {
     pthread_mutex_lock(&g_iq_lock);
-    iq_push_locked(0, 0, 0, 0, 0, 0);
+    iq_push_locked(0, 0, 0, 0, 0, 0, 0);
     pthread_mutex_unlock(&g_iq_lock);
     return 0;
 }
@@ -920,7 +932,7 @@ EXPORT i32 zan_gui_inject_event(
     iptr hwnd_val, i32 kind, i32 x, i32 y, i32 button, i32 keycode, i32 mods) {
     (void)hwnd_val;
     pthread_mutex_lock(&g_iq_lock);
-    iq_push_locked((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods);
+    iq_push_locked((int)kind, (int)x, (int)y, (int)button, (int)keycode, (int)mods, 0);
     pthread_mutex_unlock(&g_iq_lock);
     return 0;
 }
@@ -1009,10 +1021,20 @@ static unsigned int zan_ios_text_hash(const char *s, int font_size) {
     return h % ZAN_IOS_CACHE_SETS;
 }
 
-static zan_ct_font_t zan_ios_create_font(int font_size) {
+static zan_ct_font_t g_font_table[128] = {0};
+static int g_font_height_table[128] = {0};
+static int g_font_ascent_table[128] = {0};
+static CGColorSpaceRef g_cs_rgb = NULL;
+static zan_cg_color_t g_white_color = NULL;
+
+static zan_ct_font_t zan_ios_get_font(int font_size) {
+    if (font_size < 8) font_size = 8;
+    if (font_size > 127) font_size = 127;
+    if (g_font_table[font_size]) return g_font_table[font_size];
+
     if (!g_bridge.initialized) zan_ios_init_bridge();
     double size = (double)font_size;
-    if (size < 8.0) size = 8.0;
+    zan_ct_font_t font = NULL;
 
     /* 1. UIKit UIFont systemFontOfSize: (toll-free bridged with CTFontRef on iOS) */
     if (g_bridge.objc_getClass && g_bridge.sel_registerName && g_bridge.objc_msgSend) {
@@ -1023,30 +1045,44 @@ static zan_ct_font_t zan_ios_create_font(int font_size) {
                 typedef zan_id_t (*zan_msg_dbl_ret_id_fn)(zan_id_t, zan_sel_t, double);
                 zan_msg_dbl_ret_id_fn fn_sys = (zan_msg_dbl_ret_id_fn)g_bridge.objc_msgSend;
                 zan_id_t uifont = fn_sys((zan_id_t)cls_uifont, sel_sys, size);
-                if (uifont) return (zan_ct_font_t)uifont;
+                if (uifont) font = (zan_ct_font_t)uifont;
             }
         }
     }
 
     /* 2. CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, NULL) */
-    if (p_CTFontCreateUIFontForLanguage) {
-        zan_ct_font_t font = p_CTFontCreateUIFontForLanguage(3 /* kCTFontUIFontSystem */, size, NULL);
-        if (font) return font;
+    if (!font && p_CTFontCreateUIFontForLanguage) {
+        font = p_CTFontCreateUIFontForLanguage(3 /* kCTFontUIFontSystem */, size, NULL);
     }
 
     /* 3. PostScript font names: AppleSystemUIFont, PingFang SC, Helvetica */
-    if (p_CTFontCreateWithName && p_CFStringCreateWithCString) {
+    if (!font && p_CTFontCreateWithName && p_CFStringCreateWithCString) {
         const char *cand_names[] = { ".AppleSystemUIFont", "PingFangSC-Regular", "PingFangSC-Light", "PingFangSC-Medium", "HelveticaNeue", "Helvetica", NULL };
         for (int i = 0; cand_names[i]; i++) {
             zan_cf_str_t fname = p_CFStringCreateWithCString(NULL, cand_names[i], 0x08000100);
             if (fname) {
-                zan_ct_font_t font = p_CTFontCreateWithName(fname, size, NULL);
+                font = p_CTFontCreateWithName(fname, size, NULL);
                 if (p_CFRelease) p_CFRelease(fname);
-                if (font) return font;
+                if (font) break;
             }
         }
     }
-    return NULL;
+
+    if (font) {
+        if (p_CFRetain) {
+            p_CFRetain(font);
+        }
+        g_font_table[font_size] = font;
+        if (p_CTFontGetAscent && p_CTFontGetDescent) {
+            double lead = p_CTFontGetLeading ? p_CTFontGetLeading(font) : 0.0;
+            if (lead < 0.0) lead = 0.0;
+            double asc = p_CTFontGetAscent(font);
+            double desc = p_CTFontGetDescent(font);
+            g_font_ascent_table[font_size] = (int)ceil(asc);
+            g_font_height_table[font_size] = (int)ceil(asc + desc + lead);
+        }
+    }
+    return font;
 }
 
 static zan_ct_line_t zan_ios_create_line(const char *utf8, zan_ct_font_t font, zan_cg_color_t white_color) {
@@ -1123,23 +1159,19 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
         }
     }
 
-    zan_ct_font_t font = zan_ios_create_font(font_size);
+    zan_ct_font_t font = zan_ios_get_font(font_size);
     if (!font) return NULL;
 
-    CGColorSpaceRef cs_rgb = p_CGColorSpaceCreateDeviceRGB ? p_CGColorSpaceCreateDeviceRGB() : NULL;
-    zan_cg_color_t white_color = NULL;
-    if (cs_rgb && p_CGColorCreate) {
+    if (!g_cs_rgb && p_CGColorSpaceCreateDeviceRGB) {
+        g_cs_rgb = p_CGColorSpaceCreateDeviceRGB();
+    }
+    if (!g_white_color && g_cs_rgb && p_CGColorCreate) {
         const double white_rgba[4] = { 1.0, 1.0, 1.0, 1.0 };
-        white_color = p_CGColorCreate(cs_rgb, white_rgba);
+        g_white_color = p_CGColorCreate(g_cs_rgb, white_rgba);
     }
 
-    zan_ct_line_t line = zan_ios_create_line(utf8, font, white_color);
-    if (!line) {
-        if (white_color && p_CGColorRelease) p_CGColorRelease(white_color);
-        if (cs_rgb && p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
-        if (p_CFRelease) p_CFRelease(font);
-        return NULL;
-    }
+    zan_ct_line_t line = zan_ios_create_line(utf8, font, g_white_color);
+    if (!line) return NULL;
 
     double ascent = 0.0, descent = 0.0, leading = 0.0;
     double measured = p_CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
@@ -1157,15 +1189,11 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                 mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
                 NULL, 7 /* kCGImageAlphaOnly */);
             if (ctx) {
-                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
-                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
-                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
-                }
                 if (p_CGContextSetGrayFillColor) {
                     p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
                 if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
                 }
                 p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1181,15 +1209,11 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                 mask, (size_t)tw, (size_t)th, 8, (size_t)tw,
                 cs_gray, 0 /* kCGImageAlphaNone */);
             if (ctx) {
-                if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
-                    p_CGContextTranslateCTM(ctx, 0.0, (double)th);
-                    p_CGContextScaleCTM(ctx, 1.0, -1.0);
-                }
                 if (p_CGContextSetGrayFillColor) {
                     p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
                 if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
                 }
                 p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1200,20 +1224,16 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
         }
 
         /* 3. RGBA fallback */
-        if (!rendered && cs_rgb && mask) {
+        if (!rendered && g_cs_rgb && mask) {
             size_t rgba_sz = (size_t)tw * (size_t)th * sizeof(uint32_t);
             uint32_t *rgba_buf = (uint32_t *)calloc(rgba_sz, 1);
             if (rgba_buf) {
                 zan_cg_context_t ctx = p_CGBitmapContextCreate(
                     rgba_buf, (size_t)tw, (size_t)th, 8, (size_t)tw * sizeof(uint32_t),
-                    cs_rgb, (4 << 12) | 1);
+                    g_cs_rgb, (4 << 12) | 1);
                 if (ctx) {
-                    if (p_CGContextTranslateCTM && p_CGContextScaleCTM) {
-                        p_CGContextTranslateCTM(ctx, 0.0, (double)th);
-                        p_CGContextScaleCTM(ctx, 1.0, -1.0);
-                    }
                     if (p_CGContextSetTextPosition) {
-                        p_CGContextSetTextPosition(ctx, 1.0, ascent + 1.0);
+                        p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
                     }
                     p_CTLineDraw(line, ctx);
                     if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1236,11 +1256,8 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
         }
     }
 
-    if (white_color && p_CGColorRelease) p_CGColorRelease(white_color);
-    if (cs_rgb && p_CGColorSpaceRelease) p_CGColorSpaceRelease(cs_rgb);
-    if (p_CFRelease) {
+    if (line && p_CFRelease) {
         p_CFRelease(line);
-        p_CFRelease(font);
     }
 
     if (!victim) victim = &g_ios_text_cache[set][0];
@@ -1299,7 +1316,7 @@ int zan_ios_draw_text(i32 surface_id, i32 x, i32 y, const char *utf8, i32 color,
         int dy = (int)y + py - 1;
         if (dy < cy0 || dy >= cy1) continue;
         uint32_t *dst_row = pixels + (size_t)dy * stride;
-        const unsigned char *mask_row = mask + (size_t)py * tw;
+        const unsigned char *mask_row = mask + (size_t)(th - 1 - py) * tw;
         for (int px = 0; px < tw; px++) {
             int dx = (int)x + px - 1;
             if (dx < cx0 || dx >= cx1) continue;
@@ -1326,44 +1343,20 @@ i32 zan_ios_measure_text(const char *utf8, i32 font_size) {
 }
 
 i32 zan_ios_font_height(i32 font_size) {
-    enum { MAXSZ = 128 };
-    static i32 cached[MAXSZ];
-    int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
-    if (idx >= 0 && cached[idx] > 0) return cached[idx];
-    if (p_CTFontGetAscent && p_CTFontGetDescent) {
-        zan_ct_font_t font = zan_ios_create_font(font_size);
-        if (font) {
-            double lead = p_CTFontGetLeading ? p_CTFontGetLeading(font) : 0.0;
-            if (lead < 0.0) lead = 0.0;
-            double h = p_CTFontGetAscent(font) + p_CTFontGetDescent(font) + lead;
-            if (p_CFRelease) p_CFRelease(font);
-            i32 r = (i32)ceil(h);
-            if (r > 0) {
-                if (idx >= 0) cached[idx] = r;
-                return r;
-            }
-        }
-    }
+    if (font_size < 8) font_size = 8;
+    if (font_size > 127) font_size = 127;
+    if (g_font_height_table[font_size] > 0) return g_font_height_table[font_size];
+    zan_ios_get_font(font_size);
+    if (g_font_height_table[font_size] > 0) return g_font_height_table[font_size];
     return (i32)(font_size > 0 ? (font_size * 125 / 100) : 16);
 }
 
 i32 zan_ios_font_ascent(i32 font_size) {
-    enum { MAXSZ = 128 };
-    static i32 cached[MAXSZ];
-    int idx = (font_size > 0 && font_size < MAXSZ) ? (int)font_size : -1;
-    if (idx >= 0 && cached[idx] > 0) return cached[idx];
-    if (p_CTFontGetAscent) {
-        zan_ct_font_t font = zan_ios_create_font(font_size);
-        if (font) {
-            double a = p_CTFontGetAscent(font);
-            if (p_CFRelease) p_CFRelease(font);
-            i32 r = (i32)ceil(a);
-            if (r > 0) {
-                if (idx >= 0) cached[idx] = r;
-                return r;
-            }
-        }
-    }
+    if (font_size < 8) font_size = 8;
+    if (font_size > 127) font_size = 127;
+    if (g_font_ascent_table[font_size] > 0) return g_font_ascent_table[font_size];
+    zan_ios_get_font(font_size);
+    if (g_font_ascent_table[font_size] > 0) return g_font_ascent_table[font_size];
     return (i32)(font_size > 0 ? (font_size * 95 / 100) : 12);
 }
 
