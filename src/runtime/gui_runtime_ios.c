@@ -296,7 +296,7 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     }
 
     if (scale < 1.0) scale = 2.0;
-    if (bounds.size.width < 100.0 || bounds.size.height < 100.0) {
+    if (!(bounds.size.width >= 100.0 && bounds.size.height >= 100.0)) {
         bounds.origin.x = 0;
         bounds.origin.y = 0;
         bounds.size.width = 390.0;
@@ -334,6 +334,11 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
         zan_send1_dbl(layer, sel_set_contents_scale, scale);
         zan_sel_t sel_set_opaque = g_bridge.sel_registerName("setOpaque:");
         zan_send1_bool(layer, sel_set_opaque, true);
+        zan_sel_t sel_set_gravity = g_bridge.sel_registerName("setContentsGravity:");
+        zan_class_t cls_str = g_bridge.objc_getClass("NSString");
+        zan_sel_t sel_utf8 = g_bridge.sel_registerName("stringWithUTF8String:");
+        zan_id_t grav = zan_send1_str((zan_id_t)cls_str, sel_utf8, "kCAGravityResize");
+        zan_send1(layer, sel_set_gravity, grav);
     }
 
     zan_sel_t sel_set_multi = g_bridge.sel_registerName("setMultipleTouchEnabled:");
@@ -344,6 +349,9 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
 
     zan_sel_t sel_set_root = g_bridge.sel_registerName("setRootViewController:");
     zan_send1(win, sel_set_root, vc);
+
+    zan_sel_t sel_set_win = g_bridge.sel_registerName("setWindow:");
+    zan_send1(self, sel_set_win, win);
 
     zan_sel_t sel_make_key = g_bridge.sel_registerName("makeKeyAndVisible");
     zan_send0(win, sel_make_key);
@@ -413,6 +421,8 @@ static void *zan_ios_worker_entry(void *arg) {
         struct timespec ts = {0, 5 * 1000 * 1000};
         nanosleep(&ts, NULL);
     }
+    struct timespec ts_wait = {0, 30 * 1000 * 1000};
+    nanosleep(&ts_wait, NULL);
     if (zan_user_main) {
         zan_user_main(g_zan_argc, g_zan_argv);
     }
@@ -600,11 +610,13 @@ static void zan_ios_do_present(void *arg) {
             zan_sel_t sel_begin = g_bridge.sel_registerName("begin");
             zan_sel_t sel_set_disable = g_bridge.sel_registerName("setDisableActions:");
             zan_sel_t sel_commit = g_bridge.sel_registerName("commit");
+            zan_sel_t sel_flush = g_bridge.sel_registerName("flush");
             zan_send0((zan_id_t)cls_tx, sel_begin);
             zan_send1_bool((zan_id_t)cls_tx, sel_set_disable, true);
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
             zan_send0((zan_id_t)cls_tx, sel_commit);
+            zan_send0((zan_id_t)cls_tx, sel_flush);
         } else {
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
@@ -642,27 +654,43 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
         return 1;
     }
 
-    /* 32-bit ARGB little-endian (BGRA: kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst) */
-    uint32_t bitmap_info = (4 << 12) | 2;
+    /* 32-bit ARGB little-endian:
+     * kCGBitmapByteOrder32Little = (2 << 12) = 0x2000
+     * kCGImageAlphaPremultipliedFirst = 2
+     * kCGImageAlphaNoneSkipFirst = 6
+     */
+    uint32_t bitmap_info = (2 << 12) | 2;
     CGImageRef img = p_CGImageCreate(
         (size_t)s->width, (size_t)s->height,
         8, 32, bytes_per_row,
         cs, bitmap_info, provider,
         NULL, false, 0
     );
+    if (!img) {
+        bitmap_info = (2 << 12) | 6;
+        img = p_CGImageCreate(
+            (size_t)s->width, (size_t)s->height,
+            8, 32, bytes_per_row,
+            cs, bitmap_info, provider,
+            NULL, false, 0
+        );
+    }
+    if (!img) {
+        bitmap_info = 2;
+        img = p_CGImageCreate(
+            (size_t)s->width, (size_t)s->height,
+            8, 32, bytes_per_row,
+            cs, bitmap_info, provider,
+            NULL, false, 0
+        );
+    }
 
     if (img) {
         zan_sel_t sel_layer = g_bridge.sel_registerName("layer");
         zan_id_t layer = zan_send0(g_iwin.ui_view, sel_layer);
         if (layer) {
             zan_present_ctx_t ctx = { layer, img };
-            if (p_pthread_main_np && p_pthread_main_np()) {
-                zan_ios_do_present(&ctx);
-            } else if (p_dispatch_sync_f && p_dispatch_main_q) {
-                p_dispatch_sync_f(p_dispatch_main_q, &ctx, zan_ios_do_present);
-            } else {
-                zan_ios_do_present(&ctx);
-            }
+            zan_ios_do_present(&ctx);
         }
         p_CGImageRelease(img);
     }
