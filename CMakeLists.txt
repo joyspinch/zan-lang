@@ -60,6 +60,7 @@ message(STATUS "Zan version: ${ZAN_VERSION}")
 # icon travels inside the compiler, so no loose assets folder has to ship with
 # a redistributable toolchain.
 set(ZAN_DEFAULT_ICON "${CMAKE_SOURCE_DIR}/assets/zan.ico")
+set(ZAN_DEFAULT_IOS_ICON "${CMAKE_SOURCE_DIR}/assets/zan_ios_icon.png")
 set(ZAN_DEFAULT_ICON_H "${CMAKE_BINARY_DIR}/generated/zan_default_icon.h")
 if(EXISTS "${ZAN_DEFAULT_ICON}")
     file(READ "${ZAN_DEFAULT_ICON}" ZAN_DEFAULT_ICON_HEX HEX)
@@ -68,12 +69,20 @@ else()
     message(WARNING "assets/zan.ico missing; produced .exe files get no default icon")
     set(ZAN_DEFAULT_ICON_BYTES "")
 endif()
+if(EXISTS "${ZAN_DEFAULT_IOS_ICON}")
+    file(READ "${ZAN_DEFAULT_IOS_ICON}" ZAN_DEFAULT_IOS_ICON_HEX HEX)
+    string(REGEX REPLACE "(..)" "0x\\1," ZAN_DEFAULT_IOS_ICON_BYTES "${ZAN_DEFAULT_IOS_ICON_HEX}")
+else()
+    set(ZAN_DEFAULT_IOS_ICON_BYTES "")
+endif()
 file(WRITE "${ZAN_DEFAULT_ICON_H}"
-"/* Generated from assets/zan.ico by CMake -- do not edit. */\n"
+"/* Generated from assets/zan.ico and assets/zan_ios_icon.png by CMake -- do not edit. */\n"
 "#ifndef ZAN_DEFAULT_ICON_H\n"
 "#define ZAN_DEFAULT_ICON_H\n"
 "static const unsigned char zan_default_icon[] = { ${ZAN_DEFAULT_ICON_BYTES} 0 };\n"
 "#define ZAN_DEFAULT_ICON_LEN (sizeof(zan_default_icon) - 1)\n"
+"static const unsigned char zan_default_ios_icon[] = { ${ZAN_DEFAULT_IOS_ICON_BYTES} 0 };\n"
+"#define ZAN_DEFAULT_IOS_ICON_LEN (sizeof(zan_default_ios_icon) - 1)\n"
 "#endif\n")
 
 

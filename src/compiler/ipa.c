@@ -288,7 +288,14 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         }
     }
     if (!icon_png) {
-        icon_png = extract_png_from_ico_or_png(zan_default_icon, ZAN_DEFAULT_ICON_LEN, &icon_png_sz);
+#ifdef ZAN_DEFAULT_IOS_ICON_LEN
+        if (ZAN_DEFAULT_IOS_ICON_LEN > 0) {
+            icon_png = extract_png_from_ico_or_png(zan_default_ios_icon, ZAN_DEFAULT_IOS_ICON_LEN, &icon_png_sz);
+        }
+#endif
+        if (!icon_png) {
+            icon_png = extract_png_from_ico_or_png(zan_default_icon, ZAN_DEFAULT_ICON_LEN, &icon_png_sz);
+        }
     }
 
     char default_bundle[256];
@@ -347,6 +354,8 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         "        <string>UIInterfaceOrientationLandscapeLeft</string>\n"
         "        <string>UIInterfaceOrientationLandscapeRight</string>\n"
         "    </array>\n"
+        "    <key>UILaunchScreen</key>\n"
+        "    <dict/>\n"
         "    <key>CFBundleIcons</key>\n"
         "    <dict>\n"
         "        <key>CFBundlePrimaryIcon</key>\n"
@@ -360,6 +369,8 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         "            </array>\n"
         "            <key>CFBundleIconName</key>\n"
         "            <string>AppIcon</string>\n"
+        "            <key>UIPrerenderedIcon</key>\n"
+        "            <true/>\n"
         "        </dict>\n"
         "    </dict>\n"
         "    <key>CFBundleIcons~ipad</key>\n"
@@ -377,8 +388,12 @@ int zan_ipa_build(const char *ipa_path, const char *binary_path,
         "            </array>\n"
         "            <key>CFBundleIconName</key>\n"
         "            <string>AppIcon</string>\n"
+        "            <key>UIPrerenderedIcon</key>\n"
+        "            <true/>\n"
         "        </dict>\n"
         "    </dict>\n"
+        "    <key>UIPrerenderedIcon</key>\n"
+        "    <true/>\n"
         "    <key>CFBundleIconFiles</key>\n"
         "    <array>\n"
         "        <string>AppIcon20x20</string>\n"

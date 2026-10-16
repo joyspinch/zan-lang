@@ -32,6 +32,20 @@ typedef void *zan_class_t;
 typedef void *zan_method_t;
 typedef zan_id_t (*zan_imp_t)(zan_id_t, zan_sel_t, ...);
 
+/*
+ * Objective-C message dispatch signatures for Apple ARM64 ABI.
+ * On ARM64, variadic functions pass extra arguments on the stack, while
+ * methods receive them in registers (x2..x7, d0..d7). We must use exact
+ * non-variadic function pointers for objc_msgSend to avoid uninitialized
+ * register state and immediate launch crashes.
+ */
+typedef zan_id_t (*zan_msg0_fn)(zan_id_t, zan_sel_t);
+typedef zan_id_t (*zan_msg1_fn)(zan_id_t, zan_sel_t, zan_id_t);
+typedef void (*zan_msg1_bool_fn)(zan_id_t, zan_sel_t, bool);
+typedef void (*zan_msg1_dbl_fn)(zan_id_t, zan_sel_t, double);
+typedef zan_id_t (*zan_msg1_str_fn)(zan_id_t, zan_sel_t, const char *);
+typedef zan_id_t (*zan_msg2_fn)(zan_id_t, zan_sel_t, zan_id_t, zan_id_t);
+
 typedef struct {
     double x, y;
 } zan_cg_point_t;
@@ -44,6 +58,11 @@ typedef struct {
     zan_cg_point_t origin;
     zan_cg_size_t size;
 } zan_cg_rect_t;
+
+typedef zan_cg_rect_t (*zan_msg_rect0_fn)(zan_id_t, zan_sel_t);
+typedef double (*zan_msg_dbl0_fn)(zan_id_t, zan_sel_t);
+typedef zan_id_t (*zan_msg_init_rect_fn)(zan_id_t, zan_sel_t, zan_cg_rect_t);
+typedef zan_cg_point_t (*zan_msg_loc_fn)(zan_id_t, zan_sel_t, zan_id_t);
 
 typedef void *CGColorSpaceRef;
 typedef void *CGDataProviderRef;
@@ -75,6 +94,45 @@ typedef struct {
 } zan_ios_objc_bridge_t;
 
 static zan_ios_objc_bridge_t g_bridge;
+
+static void (*p_dispatch_sync_f)(void *queue, void *context, void (*work)(void *)) = NULL;
+static void *p_dispatch_main_q = NULL;
+static int (*p_pthread_main_np)(void) = NULL;
+
+static inline zan_id_t zan_send0(zan_id_t receiver, zan_sel_t sel) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return NULL;
+    return ((zan_msg0_fn)g_bridge.objc_msgSend)(receiver, sel);
+}
+
+static inline zan_id_t zan_send1(zan_id_t receiver, zan_sel_t sel, zan_id_t arg1) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return NULL;
+    return ((zan_msg1_fn)g_bridge.objc_msgSend)(receiver, sel, arg1);
+}
+
+static inline void zan_send1_bool(zan_id_t receiver, zan_sel_t sel, bool arg1) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return;
+    ((zan_msg1_bool_fn)g_bridge.objc_msgSend)(receiver, sel, arg1);
+}
+
+static inline void zan_send1_dbl(zan_id_t receiver, zan_sel_t sel, double arg1) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return;
+    ((zan_msg1_dbl_fn)g_bridge.objc_msgSend)(receiver, sel, arg1);
+}
+
+static inline zan_id_t zan_send1_str(zan_id_t receiver, zan_sel_t sel, const char *arg1) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return NULL;
+    return ((zan_msg1_str_fn)g_bridge.objc_msgSend)(receiver, sel, arg1);
+}
+
+static inline zan_id_t zan_send2(zan_id_t receiver, zan_sel_t sel, zan_id_t arg1, zan_id_t arg2) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return NULL;
+    return ((zan_msg2_fn)g_bridge.objc_msgSend)(receiver, sel, arg1, arg2);
+}
+
+static inline zan_id_t zan_send_init_rect(zan_id_t receiver, zan_sel_t sel, zan_cg_rect_t rect) {
+    if (!receiver || !sel || !g_bridge.objc_msgSend) return NULL;
+    return ((zan_msg_init_rect_fn)g_bridge.objc_msgSend)(receiver, sel, rect);
+}
 
 typedef struct {
     int attached;
@@ -154,6 +212,10 @@ static void zan_ios_init_bridge(void) {
     g_bridge.method_setImplementation = (zan_imp_t (*)(zan_method_t, zan_imp_t))dlsym(RTLD_DEFAULT, "method_setImplementation");
     g_bridge.zan_gui_wake = (int32_t (*)(void))dlsym(RTLD_DEFAULT, "zan_gui_wake");
 
+    p_dispatch_sync_f = (void (*)(void *, void *, void (*)(void *)))dlsym(RTLD_DEFAULT, "dispatch_sync_f");
+    p_dispatch_main_q = dlsym(RTLD_DEFAULT, "_dispatch_main_q");
+    p_pthread_main_np = (int (*)(void))dlsym(RTLD_DEFAULT, "pthread_main_np");
+
     p_CGColorSpaceCreateDeviceRGB = (CGColorSpaceRef (*)(void))dlsym(RTLD_DEFAULT, "CGColorSpaceCreateDeviceRGB");
     p_CGColorSpaceRelease = (void (*)(CGColorSpaceRef))dlsym(RTLD_DEFAULT, "CGColorSpaceRelease");
     p_CGDataProviderCreateWithData = (CGDataProviderRef (*)(void *, const void *, size_t, CGDataProviderReleaseDataCallback))dlsym(RTLD_DEFAULT, "CGDataProviderCreateWithData");
@@ -170,17 +232,15 @@ static void zan_ios_init_bridge(void) {
 static void zan_ios_handle_touch(zan_id_t view, zan_id_t touches, int kind) {
     if (!touches) return;
     zan_sel_t sel_any = g_bridge.sel_registerName("anyObject");
-    zan_id_t touch = g_bridge.objc_msgSend(touches, sel_any);
+    zan_id_t touch = zan_send0(touches, sel_any);
     if (!touch) return;
 
     zan_sel_t sel_loc = g_bridge.sel_registerName("locationInView:");
-    typedef zan_cg_point_t (*loc_fn)(zan_id_t, zan_sel_t, zan_id_t);
-    loc_fn fn_loc = (loc_fn)g_bridge.objc_msgSend;
+    zan_msg_loc_fn fn_loc = (zan_msg_loc_fn)g_bridge.objc_msgSend;
     zan_cg_point_t pt = fn_loc(touch, sel_loc, view);
 
     zan_sel_t sel_scale = g_bridge.sel_registerName("contentScaleFactor");
-    typedef double (*scale_fn)(zan_id_t, zan_sel_t);
-    scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
+    zan_msg_dbl0_fn fn_scale = (zan_msg_dbl0_fn)g_bridge.objc_msgSend;
     double scale = fn_scale(view, sel_scale);
     if (scale < 1.0) scale = 1.0;
 
@@ -219,7 +279,7 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     zan_id_t screen = NULL;
     if (cls_screen) {
         zan_sel_t sel_main = g_bridge.sel_registerName("mainScreen");
-        screen = g_bridge.objc_msgSend((zan_id_t)cls_screen, sel_main);
+        screen = zan_send0((zan_id_t)cls_screen, sel_main);
     }
 
     zan_cg_rect_t bounds = { {0.0, 0.0}, {390.0, 844.0} };
@@ -227,13 +287,11 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
 
     if (screen) {
         zan_sel_t sel_bounds = g_bridge.sel_registerName("bounds");
-        typedef zan_cg_rect_t (*bounds_fn)(zan_id_t, zan_sel_t);
-        bounds_fn fn_bounds = (bounds_fn)g_bridge.objc_msgSend;
+        zan_msg_rect0_fn fn_bounds = (zan_msg_rect0_fn)g_bridge.objc_msgSend;
         bounds = fn_bounds(screen, sel_bounds);
 
         zan_sel_t sel_scale = g_bridge.sel_registerName("scale");
-        typedef double (*scale_fn)(zan_id_t, zan_sel_t);
-        scale_fn fn_scale = (scale_fn)g_bridge.objc_msgSend;
+        zan_msg_dbl0_fn fn_scale = (zan_msg_dbl0_fn)g_bridge.objc_msgSend;
         scale = fn_scale(screen, sel_scale);
     }
 
@@ -252,35 +310,34 @@ static bool zan_ios_did_finish_launching(zan_id_t self, zan_sel_t _cmd, zan_id_t
     zan_class_t cls_win = g_bridge.objc_getClass("UIWindow");
     zan_sel_t sel_alloc = g_bridge.sel_registerName("alloc");
     zan_sel_t sel_init_frame = g_bridge.sel_registerName("initWithFrame:");
-    typedef zan_id_t (*init_frame_fn)(zan_id_t, zan_sel_t, zan_cg_rect_t);
-    init_frame_fn fn_init_frame = (init_frame_fn)g_bridge.objc_msgSend;
 
-    zan_id_t win = fn_init_frame(g_bridge.objc_msgSend((zan_id_t)cls_win, sel_alloc), sel_init_frame, bounds);
+    zan_id_t win_alloc = zan_send0((zan_id_t)cls_win, sel_alloc);
+    zan_id_t win = zan_send_init_rect(win_alloc, sel_init_frame, bounds);
 
     zan_class_t cls_vc = g_bridge.objc_getClass("UIViewController");
     zan_sel_t sel_init = g_bridge.sel_registerName("init");
-    zan_id_t vc = g_bridge.objc_msgSend(g_bridge.objc_msgSend((zan_id_t)cls_vc, sel_alloc), sel_init);
+    zan_id_t vc_alloc = zan_send0((zan_id_t)cls_vc, sel_alloc);
+    zan_id_t vc = zan_send0(vc_alloc, sel_init);
 
     zan_class_t cls_zanview = g_bridge.objc_getClass("ZanView");
     if (!cls_zanview) cls_zanview = g_bridge.objc_getClass("UIView");
-    zan_id_t view = fn_init_frame(g_bridge.objc_msgSend((zan_id_t)cls_zanview, sel_alloc), sel_init_frame, bounds);
+    zan_id_t view_alloc = zan_send0((zan_id_t)cls_zanview, sel_alloc);
+    zan_id_t view = zan_send_init_rect(view_alloc, sel_init_frame, bounds);
 
     zan_sel_t sel_set_scale = g_bridge.sel_registerName("setContentScaleFactor:");
-    typedef void (*set_scale_fn)(zan_id_t, zan_sel_t, double);
-    ((set_scale_fn)g_bridge.objc_msgSend)(view, sel_set_scale, scale);
+    zan_send1_dbl(view, sel_set_scale, scale);
 
     zan_sel_t sel_set_multi = g_bridge.sel_registerName("setMultipleTouchEnabled:");
-    typedef void (*set_bool_fn)(zan_id_t, zan_sel_t, bool);
-    ((set_bool_fn)g_bridge.objc_msgSend)(view, sel_set_multi, true);
+    zan_send1_bool(view, sel_set_multi, true);
 
     zan_sel_t sel_set_view = g_bridge.sel_registerName("setView:");
-    g_bridge.objc_msgSend(vc, sel_set_view, view);
+    zan_send1(vc, sel_set_view, view);
 
     zan_sel_t sel_set_root = g_bridge.sel_registerName("setRootViewController:");
-    g_bridge.objc_msgSend(win, sel_set_root, vc);
+    zan_send1(win, sel_set_root, vc);
 
     zan_sel_t sel_make_key = g_bridge.sel_registerName("makeKeyAndVisible");
-    g_bridge.objc_msgSend(win, sel_make_key);
+    zan_send0(win, sel_make_key);
 
     g_iwin.ui_window = win;
     g_iwin.ui_controller = vc;
@@ -379,9 +436,7 @@ int main(int argc, char **argv) {
 
     zan_class_t cls_str = g_bridge.objc_getClass("NSString");
     zan_sel_t sel_utf8 = g_bridge.sel_registerName("stringWithUTF8String:");
-    typedef zan_id_t (*str_fn)(zan_id_t, zan_sel_t, const char *);
-    str_fn fn_str = (str_fn)g_bridge.objc_msgSend;
-    zan_id_t del_name = fn_str((zan_id_t)cls_str, sel_utf8, "ZanAppDelegate");
+    zan_id_t del_name = zan_send1_str((zan_id_t)cls_str, sel_utf8, "ZanAppDelegate");
 
     int ret = 0;
     if (p_UIApplicationMain) {
@@ -523,13 +578,26 @@ EXPORT void zan_gui_sleep_ms(i32 ms) {
     }
 }
 
+typedef struct {
+    zan_id_t layer;
+    CGImageRef img;
+} zan_present_ctx_t;
+
+static void zan_ios_do_present(void *arg) {
+    zan_present_ctx_t *ctx = (zan_present_ctx_t *)arg;
+    if (ctx && ctx->layer && ctx->img) {
+        zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
+        zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
+    }
+}
+
 EXPORT void zan_gui_present_full(void) {}
 
 EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
     (void)hwnd_val;
-    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) return 1;
-    if (!g_iwin.attached || !g_iwin.ui_view) return 1;
-
+    if (surface_id < 0 || surface_id >= g_surface_count || !g_surfaces[surface_id]) {
+        return 1;
+    }
     zan_surface_t *s = g_surfaces[surface_id];
     g_last_surface = surface_id;
 
@@ -558,10 +626,16 @@ EXPORT i32 zan_gui_present(iptr hwnd_val, i32 surface_id) {
 
     if (img) {
         zan_sel_t sel_layer = g_bridge.sel_registerName("layer");
-        zan_id_t layer = g_bridge.objc_msgSend(g_iwin.ui_view, sel_layer);
+        zan_id_t layer = zan_send0(g_iwin.ui_view, sel_layer);
         if (layer) {
-            zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
-            g_bridge.objc_msgSend(layer, sel_set_contents, (zan_id_t)img);
+            zan_present_ctx_t ctx = { layer, img };
+            if (p_pthread_main_np && p_pthread_main_np()) {
+                zan_ios_do_present(&ctx);
+            } else if (p_dispatch_sync_f && p_dispatch_main_q) {
+                p_dispatch_sync_f(p_dispatch_main_q, &ctx, zan_ios_do_present);
+            } else {
+                zan_ios_do_present(&ctx);
+            }
         }
         p_CGImageRelease(img);
     }
