@@ -18,7 +18,7 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 
 | 文档 | 内容 |
 | --- | --- |
-| [SPEC.md](SPEC.md) | 语言规范——语法与语义的权威 |
+| [SPEC.md](SPEC.md) ([中文版](SPEC.zh-CN.md)) | 语言规范——语法与语义的权威（中英双语） |
 | [ABI.md](ABI.md) | 二进制接口：类型布局、调用约定、运行时 ABI |
 | [ASYNC_CPS_DESIGN.md](ASYNC_CPS_DESIGN.md) | async/await 的 CPS 下降设计 + I/O 反应器现状（编译器/运行时注释锚定） |
 | [SECURITY.md](SECURITY.md) | 内存安全/unsafe/FFI 的当前行为（含"不存在 X"负向事实清单） |
@@ -27,8 +27,8 @@ GAME_ENGINE_GUIDE 各自的附录），逐文件仓库地图与编译器架构�
 
 | 文档 | 内容 |
 | --- | --- |
-| [ZANC_CLI.md](ZANC_CLI.md) | `zanc` 全部命令行参数与已知坑——改参数解析时同提交更新 |
-| [BUILD_TOOLCHAIN.md](BUILD_TOOLCHAIN.md) | 各平台固定的构建工具链（勿自行更换） |
+| [ZANC_CLI.md](ZANC_CLI.md) ([English](ZANC_CLI.en.md)) | `zanc` 全部命令行参数与已知坑——改参数解析时同提交更新（中英双语） |
+| [BUILD_TOOLCHAIN.md](BUILD_TOOLCHAIN.md) ([English](BUILD_TOOLCHAIN.en.md)) | 各平台固定的构建工具链（勿自行更换，中英双语） |
 | [platform-targets.md](platform-targets.md) | 交叉编译目标平台矩阵 |
 | [native-rendering-modules.md](native-rendering-modules.md) | 原生绘图、图片、游戏与音频驱动职责与接入说明 |
 | [TOOLING.md](TOOLING.md) | `zan-lsp` / `zan-dap` 协议与能力 |
