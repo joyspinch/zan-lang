@@ -124,7 +124,7 @@ docs/                  # 语言规范、架构设计与操作文档
 
 ## 许可证 (License)
 
-本项目采用 [Zan 社区源码许可协议 (Zan Community Source License, ZCSL)](./LICENSE)：
+本项目采用 [Zan 社区源码许可协议 (ZCSL)](./LICENSE.zh-CN)（英文正本见 [LICENSE](./LICENSE)）：
 
 - ✅ **免费商用 (Free for Commercial Use)**：个人与企业均可免费无偿用于商业开发与生产服务部署。
 - ✅ **产物完全自由 (Runtime & Output Exception)**：使用 Zan 编写的代码及由 Zan 编译生成的任何可执行程序/库文件，其知识产权完全归开发者所有，分发、闭源、商业售卖不受任何限制。
