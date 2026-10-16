@@ -652,21 +652,29 @@ partial class DataTable {
         if (col.align == 1) { tx = cx + (cw - tw) / 2; }
         if (col.align == 2) { tx = cx + cw - pad - tw; }
         int ty = Canvas.CenterTextY(cy, rowH, fs);
-        // ---- 查找命中高亮：查询串在已显示文本中的首个出现垫
-        // 一块强调色底（VTable 搜索插件的视觉）。高亮随截断与
+        // ---- 查找/快速检索命中高亮：查询串在已显示文本中的全部出现垫
+        // 强调色底（AG Grid & DevExpress 风格全量多处子串高亮）。高亮随截断与
         // 对齐走，只标可见部分。
-        if (st != null && st.findOpen && st.findQuery.Length > 0
-            && rowIdx >= 0 && cc >= 0 && col.cellType < 6 && !col.isBool) {
-            int mi = DataTable.IndexOfCI(shown, st.findQuery);
-            if (mi >= 0) {
-                int qw = Canvas.MeasureText(
-                    shown.Substring(mi, st.findQuery.Length), fs);
+        string q = "";
+        if (st != null) {
+            if (st.highlightQuery.Length > 0) { q = st.highlightQuery; }
+            else if (st.findOpen && st.findQuery.Length > 0) { q = st.findQuery; }
+        }
+        if (q.Length > 0 && rowIdx >= 0 && cc >= 0 && col.cellType < 6 && !col.isBool) {
+            int qLen = q.Length;
+            int searchPos = 0;
+            int acc = Style.Part(app, "datatable", "accent", "", "", "",
+                                 Style.SNormal()).BgOr(0);
+            while (searchPos < shown.Length) {
+                int mi = DataTable.IndexOfCI(shown.Substring(searchPos), q);
+                if (mi < 0) { break; }
+                int actualMi = searchPos + mi;
                 int pw = 0;
-                if (mi > 0) { pw = Canvas.MeasureText(shown.Substring(0, mi), fs); }
-                int acc = Style.Part(app, "datatable", "accent", "", "", "",
-                                     Style.SNormal()).BgOr(0);
+                if (actualMi > 0) { pw = Canvas.MeasureText(shown.Substring(0, actualMi), fs); }
+                int qw = Canvas.MeasureText(shown.Substring(actualMi, qLen), fs);
                 c.FillRoundRect(tx + pw - 1, ty - 1, qw + 2, fs + 2, app.Scale(2),
-                                DataTable.ColorAlpha(acc, 70));
+                                DataTable.ColorAlpha(acc, 75));
+                searchPos = actualMi + qLen;
             }
         }
         c.DrawText(tx, ty, shown, color, fs);
@@ -1747,8 +1755,12 @@ partial class DataTable {
         if (st.showFilterRow) { filterRowH = rowH; }
         int statusBarH = 0;
         if (st.showStatusBar) { statusBarH = app.Scale(28); }
-        int bodyTop = y + headerH + filterRowH;
-        int bodyH = viewH - headerH - filterRowH - summaryH - pagerH - statusBarH;
+        int topPinnedH = 0;
+        if (st.pinnedTopRows != null) { topPinnedH = st.pinnedTopRows.Count * rowH; }
+        int bottomPinnedH = 0;
+        if (st.pinnedBottomRows != null) { bottomPinnedH = st.pinnedBottomRows.Count * rowH; }
+        int bodyTop = y + headerH + filterRowH + topPinnedH;
+        int bodyH = viewH - headerH - filterRowH - topPinnedH - bottomPinnedH - summaryH - pagerH - statusBarH;
         if (bodyH < rowH) { bodyH = rowH; }
         int visRows = bodyH / rowH;
         if (visRows < 1) { visRows = 1; }
@@ -1883,6 +1895,17 @@ partial class DataTable {
         int edW = 0;
         int edH = 0;
         bool edVis = false;
+
+        // ---------------- 置顶固定行 (Pinned Top Rows，AG Grid & DevExpress 对标) ----------------
+        if (st.pinnedTopRows != null && st.pinnedTopRows.Count > 0) {
+            for (int pti = 0; pti < st.pinnedTopRows.Count; pti = pti + 1) {
+                int pty = (bodyTop - topPinnedH) + pti * rowH;
+                DataTable.RenderPinnedRow(app, x, pty, viewW, rowH, numW, selW, cols,
+                                         st.pinnedTopRows[pti], st, frameColumns,
+                                         firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW,
+                                         clipRight, gridColor, "📌");
+            }
+        }
 
         int r = 0;
         while (r < visRows && (start + r) < total) {
@@ -3240,9 +3263,20 @@ partial class DataTable {
         // 空状态：文案已由上方空态/加载覆盖层统一绘制
         // （empty/loading 双态 + overlayKind 诊断），这里不再重复。
 
+        // ---------------- 置底固定行 (Pinned Bottom Rows，AG Grid & DevExpress 对标) ----------------
+        if (st.pinnedBottomRows != null && st.pinnedBottomRows.Count > 0) {
+            for (int pbi = 0; pbi < st.pinnedBottomRows.Count; pbi = pbi + 1) {
+                int pby = (bodyTop + bodyH) + pbi * rowH;
+                DataTable.RenderPinnedRow(app, x, pby, viewW, rowH, numW, selW, cols,
+                                         st.pinnedBottomRows[pbi], st, frameColumns,
+                                         firstDataX, bandX, bandW, rightX, pinnedW, pinnedRW,
+                                         clipRight, gridColor, "📌");
+            }
+        }
+
         // ---------------- 汇总（总计）行 ----------------
         if (st.showSummary) {
-            int sumY = bodyTop + bodyH;
+            int sumY = bodyTop + bodyH + bottomPinnedH;
             c.FillRect(x + 1, sumY, viewW - 2, summaryH, sFooter.BgOr(0));
             c.FillRect(x + 1, sumY, viewW - 2, 1, gridColor);
             int sx = x + numW + selW;
@@ -3288,7 +3322,7 @@ partial class DataTable {
 
         // ---------------- 分页器页脚（复用 Pagination 控件） ----------------
         if (st.paged) {
-            int fY = bodyTop + bodyH + summaryH;
+            int fY = bodyTop + bodyH + bottomPinnedH + summaryH;
             c.FillRect(x + 1, fY, viewW - 2, pagerH, sFooter.BgOr(0));
             c.FillRect(x + 1, fY, viewW - 2, 1, gridColor);
             int totalPages = 1;
@@ -3314,7 +3348,7 @@ partial class DataTable {
         // 让用户不用离开网格就能快速估算总计，
         // 与 Excel/DevExpress 的状态栏相同。
         if (st.showStatusBar) {
-            int sbY = bodyTop + bodyH + summaryH + pagerH;
+            int sbY = bodyTop + bodyH + bottomPinnedH + summaryH + pagerH;
             c.FillRect(x + 1, sbY, viewW - 2, statusBarH, sFooter.BgOr(0));
             c.FillRect(x + 1, sbY, viewW - 2, 1, gridColor);
             int sbFs = Style.FontFallback(app, "small");
@@ -3632,4 +3666,59 @@ partial class DataTable {
         }
     }
 
+    // 渲染单行置顶或置底固定行（Pinned / Floating Rows，不随纵向垂直滚动）：
+    static void RenderPinnedRow(App app, int x, int ry, int viewW, int rowH, int numW, int selW,
+                               List<DataColumn> cols, DataRow pRow, DataTableState st,
+                               List<FrameColumn> frameColumns, int firstDataX, int bandX, int bandW,
+                               int rightX, int pinnedW, int pinnedRW, int clipRight, int gridColor,
+                               string prefixLabel) {
+        Canvas c = app.canvas;
+        Theme t = app.theme;
+        StyleBox sPinned = Style.Part(app, "datatable", "footer", "", "", "", Style.SNormal());
+        StyleBox sCell = Style.Part(app, "datatable", "cell", "", "", "", Style.SNormal());
+        StyleBox sHint = Style.Part(app, "datatable", "hint", "", "", "", Style.SNormal());
+        int fs = Style.FontFallback(app, "small");
+
+        // 固定行背景（微带底色以区分普通行）与下边框线
+        c.FillRect(x + 1, ry, viewW - 2, rowH, sPinned.BgOr(0));
+        c.FillRect(x + 1, ry + rowH - 1, viewW - 2, 1, gridColor);
+
+        if (prefixLabel.Length > 0 && (st.showRowNum || st.showSelect)) {
+            c.DrawTextCentered(x, ry, numW + selW, rowH, prefixLabel, sHint.FgOr(0), fs);
+        }
+
+        int sBand = -1;
+        for (int soi = 0; soi < frameColumns.Count; soi = soi + 1) {
+            FrameColumn fCol = frameColumns[soi];
+            int sc = fCol.column;
+            int cw = st.dispW[sc];
+            if (fCol.band != sBand) {
+                if (sBand >= 0) { c.PopClip(); }
+                sBand = fCol.band;
+                DataTable.PushBandClip(c, sBand, firstDataX, bandX, bandW, rightX,
+                                       pinnedW, pinnedRW, ry, rowH, clipRight);
+            }
+            int cx = fCol.x;
+            int sBandL = DataTable.BandLeft(fCol.band, firstDataX, bandX, rightX);
+            int sBandR = DataTable.BandRight(fCol.band, firstDataX, bandX, bandW,
+                                             rightX, pinnedW, pinnedRW, clipRight);
+            if (cx + cw > sBandL && cx < sBandR) {
+                string cellText = "";
+                if (pRow != null && sc < pRow.cells.Count) {
+                    cellText = pRow.cells[sc];
+                }
+                if (cellText.Length > 0) {
+                    int pad = t.paddingSmall;
+                    string shown = DataTable.Truncate(cellText, fs, cw - pad * 2);
+                    int tw = Canvas.MeasureText(shown, fs);
+                    int tx = cx + pad;
+                    if (cols[sc].align == 2) { tx = cx + cw - pad - tw; }
+                    else if (cols[sc].align == 1) { tx = cx + (cw - tw) / 2; }
+                    int ty = Canvas.CenterTextY(ry, rowH, fs);
+                    c.DrawText(tx, ty, shown, sCell.FgOr(0), fs);
+                }
+            }
+        }
+        if (sBand >= 0) { c.PopClip(); }
+    }
 }
