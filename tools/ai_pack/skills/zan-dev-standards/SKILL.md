@@ -75,6 +75,11 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
   ③ 实体强类型与 Enum 规范：高频渲染、设计器文档模型与动作分发全面采用强类型实体（如 `SceneActionBinding`、`FieldPositionMode`、`SceneAnchor`）替代动态弱类型字典或通用 `JsonValue` 解包，彻底根除高频帧循环中的哈希查找与堆内存浪费；`JsonValue` 仅作为磁盘持久化边缘的序列化载体。
 - **stdlib/Gui 界面禁止自绘**，全部用标准库控件与布局原语完成。
+- **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
+  ① **职责唯一性约束**：UI 线程（主事件消息泵）核心使命是保持 60/120Hz 丝滑响应，只负责系统输入事件分发与界面排版绘制（Layout -> Paint -> Present），单次事件或帧处理耗时红线严禁超过 2ms；
+  ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；
+  ③ **架构解耦三段式**：立即响应反馈（UI 立即置灰/挂起 Loading，<1ms 放行） -> 后台非阻塞执行（Worker/Thread/Task.Run，纯内存隔离，严禁直接读写 UI 控件） -> `App.Post` 封送回传（唤醒消息泵，在 UI 线程统一排空回调回填数据并触发 `needsRedraw`）；
+  ④ **生命周期与协同取消**：后台作业必须挂接 `CancellationToken` 或取消标志，窗口关闭或请求作废时即刻终止，杜绝野回调污染。
 - 组件写法与同目录既有组件保持一致：命名、事件命名、state 管理同构。
 - 注释只写代码看不出来的约束与"为什么"；不复述代码、不写日期流水、
   不写"本轮修改了什么"。

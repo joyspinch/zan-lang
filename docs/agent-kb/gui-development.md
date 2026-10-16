@@ -33,8 +33,31 @@ while (app.isRunning) {
    `SetSeq(outer)` 还原。
 2. **状态放在调用方**，用 `SignalInt` / `Input` 等承载（`Gui/Reactive.zan`、
    `Widget/Input.zan`），控件本身不存状态。
-3. **不要在绘制中做阻塞 IO**。长任务丢到后台并用面板/通知反馈（IDE 的构建/发布就是
-   这么做的）。
+3. **UI 线程专职渲染与交互，一切耗时业务/IO/计算完全异步解耦非阻塞（开发基本铁律）**：
+   - **职责边界**：UI 线程（主线程事件循环）有且仅有两项职责：分发操作系统输入事件（按键/鼠标/焦点/窗口尺寸）与推进界面排版绘制（Layout/Paint/Present）。任何单次超过 1~2ms 的操作严禁在 UI 线程执行。
+   - **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络请求（HTTP/WebSocket）、磁盘文件大读写、数据库存取、大 JSON 解析、图像编解码、压缩解压、重 CPU 矩阵/分词计算或同步 `Sleep`。同步阻塞是造成界面掉帧、卡顿、甚至触发系统“未响应”白屏的万恶之源。
+   - **标准异步解耦定式（Worker + App.Post）**：
+     ```zan
+     // 1. UI 立即给用户反馈（置灰按钮/转圈/骨架屏），绝对不要阻塞
+     btn.Disabled = true;
+     status.Text = "加载中...";
+     app.RequestRedraw();
+
+     // 2. 耗时重活彻底交由后台异步执行（Worker/Thread/Task.Run）
+     Thread.Start(() => {
+         // 纯业务或 IO 计算，严禁触碰 UI 控件状态
+         var data = FetchRemoteDataOrCompute();
+
+         // 3. 计算完成，通过 App.Post 封送回 UI 线程安全更新
+         app.Post(() => {
+             btn.Disabled = false;
+             status.Text = "完成";
+             view.UpdateData(data);
+             // Post 会自动通过 window.Wake 唤醒阻塞的消息泵，并在 DrainPosts 后置位 needsRedraw
+         });
+     });
+     ```
+   - **生命周期与取消协同**：后台任务必须支持协作取消（`CancellationToken` 或 atomic 标志），在窗口关闭或前序操作作废时停止后续回传，杜绝后台游离任务向已销毁控件回调导致的空引用或野指针异常。
 4. 尺寸一律走 `app.Scale(n)` 做 DPI 缩放，不要写死像素。
 
 ## Theme token（`packages/Zan.Gui/src/Gui/Styling/Theme.zan`）
