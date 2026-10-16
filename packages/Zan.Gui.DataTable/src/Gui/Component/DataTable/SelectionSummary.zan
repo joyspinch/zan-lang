@@ -1,0 +1,109 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.DataTable;
+
+// Excel / DevExpress / AG Grid 风格多选单元格状态栏自动统计模型
+// 当选区包含多个单元格时，自动统计格数、数值格数、和、平均值、极小极大值。
+class SelectionSummary {
+    int cellCount;
+    int numericCount;
+    double sum;
+    double average;
+    double min;
+    double max;
+    bool hasNumeric;
+
+    SelectionSummary() {
+        this.cellCount = 0;
+        this.numericCount = 0;
+        this.sum = 0.0;
+        this.average = 0.0;
+        this.min = 0.0;
+        this.max = 0.0;
+        this.hasNumeric = false;
+    }
+
+    string Format() {
+        if (this.cellCount <= 0) { return ""; }
+        string res = "Count: " + Convert.ToString(this.cellCount);
+        if (this.hasNumeric) {
+            res = res + "   Sum: " + DataTable.FormatReal(this.sum, 2)
+                      + "   Avg: " + DataTable.FormatReal(this.average, 2)
+                      + "   Min: " + DataTable.FormatReal(this.min, 2)
+                      + "   Max: " + DataTable.FormatReal(this.max, 2);
+        }
+        return res;
+    }
+}
+
+partial class DataTable {
+    // 独立计算选区统计指标（纯函数式查询，不修改视图状态）
+    static SelectionSummary ComputeSelectionSummary(DataTableState st, List<DataColumn> cols, DataSource src) {
+        SelectionSummary res = new SelectionSummary();
+        if (!DataTable.HasRange(st) && !DataTable.HasMulti(st)) {
+            return res;
+        }
+
+        int nRanges = DataTable.RangeCount(st);
+        bool firstNum = true;
+
+        for (int qi = 0; qi < nRanges; qi = qi + 1) {
+            int qr0 = -1; int qc0 = -1; int qr1 = -1; int qc1 = -1;
+            if (!DataTable.RangeAt(st, qi, out qr0, out qc0, out qr1, out qc1)) { continue; }
+            int rri = qr0;
+            while (rri <= qr1 && rri < DataTable.DispCount(st)) {
+                if (DataTable.DispKind(st, rri) == 0) {
+                    int drow = DataTable.DispRowOf(st, rri);
+                    int rci = qc0;
+                    while (rci <= qc1 && rci < cols.Count) {
+                        bool dup = false;
+                        for (int qj = 0; qj < qi && !dup; qj = qj + 1) {
+                            int jr0 = -1; int jc0 = -1; int jr1 = -1; int jc1 = -1;
+                            if (DataTable.RangeAt(st, qj, out jr0, out jc0, out jr1, out jc1)
+                                && rri >= jr0 && rri <= jr1 && rci >= jc0 && rci <= jc1) {
+                                dup = true;
+                            }
+                        }
+                        if (!dup) {
+                            res.cellCount = res.cellCount + 1;
+                            string val = src.CellText(drow, rci);
+                            string trimmed = DataTable.TrimSpace(val);
+                            if (trimmed.Length > 0 && DataTable.IsNumericStr(trimmed)) {
+                                double d = DataTable.ParseReal(trimmed);
+                                res.numericCount = res.numericCount + 1;
+                                res.sum = res.sum + d;
+                                if (firstNum) {
+                                    res.min = d;
+                                    res.max = d;
+                                    firstNum = false;
+                                    res.hasNumeric = true;
+                                } else {
+                                    if (d < res.min) { res.min = d; }
+                                    if (d > res.max) { res.max = d; }
+                                }
+                            }
+                        }
+                        rci = rci + 1;
+                    }
+                }
+                rri = rri + 1;
+            }
+        }
+
+        if (res.numericCount > 0) {
+            res.average = res.sum / (double)res.numericCount;
+        }
+        return res;
+    }
+
+    static SelectionSummary GetSelectionSummary(DataTableState st, List<DataColumn> cols, DataSource src) {
+        return DataTable.ComputeSelectionSummary(st, cols, src);
+    }
+
+    static string GetSelectionSummaryText(DataTableState st, List<DataColumn> cols, DataSource src) {
+        SelectionSummary s = DataTable.ComputeSelectionSummary(st, cols, src);
+        return s.Format();
+    }
+}
