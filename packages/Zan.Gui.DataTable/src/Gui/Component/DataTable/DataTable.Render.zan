@@ -2102,7 +2102,17 @@ partial class DataTable {
                 int cBandL = DataTable.BandLeft(bodyColumn.band, firstDataX, bandX, rightX);
                 int cBandR = DataTable.BandRight(bodyColumn.band, firstDataX, bandX, bandW,
                                                  rightX, pinnedW, pinnedRW, clipRight);
-                if (ccl + cw > cBandL && ccl < cBandR) {
+                // 列虚拟化裁剪（Column Virtualization）：中间滚动带滚出视口右侧时快速跳过后续不可见列
+                if (bodyColumn.band == 1 && ccl >= cBandR) {
+                    while (coi + 1 < frameColumns.Count && frameColumns[coi + 1].band == 1) {
+                        coi = coi + 1;
+                    }
+                    continue;
+                }
+                if (ccl + cw <= cBandL) {
+                    continue;
+                }
+                if (ccl < cBandR) {
                     // 单元格级样式背景绘制在范围
                     // 高亮之下，选中的单元格仍能看出是选中状态。
                     int cellBg = DataTable.CellBackground(st, src, rowIdx, cc);
@@ -2153,6 +2163,15 @@ partial class DataTable {
                         c.PushClip(ccl, ry, cw, rowH);
                         painted = st.styler.PaintCell(app, src, rowIdx, cc, ccl, ry, cw, rowH);
                         c.PopClip();
+                    }
+                    if (!painted) {
+                        CellRenderer cr = cols[cc].renderer;
+                        if (cr == null) { cr = st.cellRenderer; }
+                        if (cr != null) {
+                            c.PushClip(ccl, ry, cw, rowH);
+                            painted = cr.Paint(app, c, src, rowIdx, cc, ccl, ry, cw, rowH, rSel, oiRow == st.hitOrder && cc == st.hitCol);
+                            c.PopClip();
+                        }
                     }
                     if (!painted) {
                         double cfLo = 0.0;
@@ -2702,11 +2721,46 @@ partial class DataTable {
         // 按压处理器，它会在重新选择前先提交编辑。
         if (st.editing) {
             DataColumn ecol = cols[st.editCol];
+            bool shiftHeld = Modifiers.HasShift(emods);
             if (ek == 6) {
                 int code = app.window.EventKeyCode();
-                if (code == 13) { DataTable.CommitEdit(st, cols, src); }
+                if (code == 13) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int nextSlot = DataTable.NextDataSlot(st, prevSlot, shiftHeld ? -1 : 1);
+                        if (nextSlot >= 0) {
+                            DataTable.MoveCursor(st, src, nextSlot, curCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
                 else if (code == 27) { DataTable.CancelEdit(st); }
-                else if (code == 9) { DataTable.CommitEdit(st, cols, src); }
+                else if (code == 9) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int delta = shiftHeld ? -1 : 1;
+                        int nextCol = curCol + delta;
+                        int nextSlot = prevSlot;
+                        if (nextCol >= cols.Count) {
+                            nextCol = 0;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, 1);
+                        } else if (nextCol < 0) {
+                            nextCol = cols.Count - 1;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, -1);
+                        }
+                        if (nextSlot >= 0 && nextCol >= 0 && nextCol < cols.Count) {
+                            DataTable.MoveCursor(st, src, nextSlot, nextCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            DataTable.ScrollColIntoView(st, frameColumns, nextCol, dataViewW, pinnedW);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
                 else if (code == 8) {
                     if (st.editCur > 0) {
                         int startp = Text.PrevCharStart(st.editBuf, st.editCur);
@@ -2754,7 +2808,42 @@ partial class DataTable {
                     // 这样关闭列表不会丢掉已输入的文字。
                     if (st.edPopOpen) { st.edPopOpen = false; }
                     else { DataTable.CancelEdit(st); }
-                } else if (kc == 13) { DataTable.CommitEdit(st, cols, src); }
+                } else if (kc == 13) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int nextSlot = DataTable.NextDataSlot(st, prevSlot, shiftHeld ? -1 : 1);
+                        if (nextSlot >= 0) {
+                            DataTable.MoveCursor(st, src, nextSlot, curCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
+                else if (kc == 9) {
+                    int prevSlot = st.hitOrder;
+                    int curCol = st.editCol;
+                    DataTable.CommitEdit(st, cols, src);
+                    if (!st.editing) {
+                        int delta = shiftHeld ? -1 : 1;
+                        int nextCol = curCol + delta;
+                        int nextSlot = prevSlot;
+                        if (nextCol >= cols.Count) {
+                            nextCol = 0;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, 1);
+                        } else if (nextCol < 0) {
+                            nextCol = cols.Count - 1;
+                            nextSlot = DataTable.NextDataSlot(st, prevSlot, -1);
+                        }
+                        if (nextSlot >= 0 && nextCol >= 0 && nextCol < cols.Count) {
+                            DataTable.MoveCursor(st, src, nextSlot, nextCol, false);
+                            DataTable.ScrollSlotIntoView(st, nextSlot, visRows);
+                            DataTable.ScrollColIntoView(st, frameColumns, nextCol, dataViewW, pinnedW);
+                            st.CellClick.Raise();
+                        }
+                    }
+                }
                 else if (kc == 37) {
                     if (ecol.editorKind == 2) { DataTable.CalendarStep(st, ecol, -1); }
                     else if (st.editCur > 0) { st.editCur = Text.PrevCharStart(st.editBuf, st.editCur); }
@@ -2807,6 +2896,28 @@ partial class DataTable {
                 }
                 ek = 0;
                 app.RequestRedraw();
+            }
+        }
+
+        // Type-to-Edit（Excel/DevExpress 标配）：在当前可编辑格直接敲击可打印字符激活编辑
+        if (!st.editing && ek == 6 && st.hitRow >= 0 && st.hitCol >= 0
+            && st.hitCol < cols.Count && cols[st.hitCol].editable && !cols[st.hitCol].isBool
+            && st.filterRowFocusCol < 0 && st.openMenu < 0 && !st.colChooserOpen) {
+            int code = app.window.EventKeyCode();
+            if (code >= 32 && code != 127) {
+                string ch = Text.CharStr(code);
+                if (ch.Length > 0) {
+                    DataTable.BeginEdit(st, cols, src, st.hitRow, st.hitCol);
+                    st.editBuf = ch;
+                    st.editCur = ch.Length;
+                    if (st.activeEditorWidget != null) {
+                        CellEditor activeEd = cols[st.hitCol].editor;
+                        if (activeEd == null) { activeEd = st.cellEditor; }
+                        if (activeEd != null) { activeEd.BeginEdit(st.activeEditorWidget, ch, cols[st.hitCol]); }
+                    }
+                    ek = 0;
+                    app.RequestRedraw();
+                }
             }
         }
 
