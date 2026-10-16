@@ -1,5 +1,9 @@
 # 构建工具链（每个平台一份固定配置）
 
+<p align="left">
+  <b>简体中文</b> | <a href="BUILD_TOOLCHAIN.en.md">English</a>
+</p>
+
 配错工具链的代价不是"编译失败"这么轻：CMake 缓存一旦被写成错误的编译器，
 `cmake --build build --target zanc` 会在链接阶段失败，而 ninja 会先删除输出，
 于是 `build\zanc.exe` 直接消失，所有测试与 IDE 构建一起挂掉。所以每个平台的
