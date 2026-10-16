@@ -5570,8 +5570,10 @@ int main(int argc, char **argv) {
                     }
                 } else if (target.os == ZAN_OS_IOS &&
                            (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0 ||
-                            strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0)) {
-                    /* iOS 使用静态内嵌的 zanrt_gui.o / zanrt_image.o，不打桩也不需要外部 dylib */
+                            strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0 ||
+                            strncmp(irgen.extern_libs[li].str, "zan_game", irgen.extern_libs[li].len) == 0 ||
+                            strncmp(irgen.extern_libs[li].str, "zan_audio", irgen.extern_libs[li].len) == 0)) {
+                    /* iOS 使用静态内嵌的 zanrt_gui.o / zanrt_image.o / zanrt_game.o / zanrt_audio.o，不打桩也不需要外部 dylib */
                 } else {
                     int n = zan_irgen_stub_extern_lib(
                         &irgen, irgen.extern_libs[li].str,
@@ -7735,8 +7737,17 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            bool has_gui_driver = false;
+            bool has_game_driver = false;
             if (target.os == ZAN_OS_IOS) {
+                for (int li = 0; li < irgen.extern_lib_count; li++) {
+                    if (strncmp(irgen.extern_libs[li].str, "zan_game", irgen.extern_libs[li].len) == 0) {
+                        has_game_driver = true;
+                        break;
+                    }
+                }
+            }
+            bool has_gui_driver = has_game_driver;
+            if (target.os == ZAN_OS_IOS && !has_gui_driver) {
                 for (int li = 0; li < irgen.extern_lib_count; li++) {
                     if (strncmp(irgen.extern_libs[li].str, "zan_gui", irgen.extern_libs[li].len) == 0) {
                         has_gui_driver = true;
@@ -7765,8 +7776,8 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            bool has_image_driver = false;
-            if (target.os == ZAN_OS_IOS) {
+            bool has_image_driver = has_game_driver;
+            if (target.os == ZAN_OS_IOS && !has_image_driver) {
                 for (int li = 0; li < irgen.extern_lib_count; li++) {
                     if (strncmp(irgen.extern_libs[li].str, "zan_image", irgen.extern_libs[li].len) == 0) {
                         has_image_driver = true;
@@ -7776,6 +7787,41 @@ int main(int argc, char **argv) {
             }
             if (has_image_driver && zan_file_exists(macrt_image)) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_image);
+            }
+            char macrt_game[1400] = {0};
+            snprintf(macrt_game, sizeof(macrt_game), "%s/zanrt_game.o", macrt);
+            if (!zan_file_exists(macrt_game)) {
+                if (target.os == ZAN_OS_IOS) {
+                    snprintf(macrt_game, sizeof(macrt_game), "%s/toolchain/ios/arm64/zanrt_game.o", exe_dir2);
+                    if (!zan_file_exists(macrt_game)) {
+                        snprintf(macrt_game, sizeof(macrt_game), "toolchain/ios/arm64/zanrt_game.o");
+                    }
+                }
+            }
+            if (has_game_driver && zan_file_exists(macrt_game)) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_game);
+            }
+            char macrt_audio[1400] = {0};
+            snprintf(macrt_audio, sizeof(macrt_audio), "%s/zanrt_audio.o", macrt);
+            if (!zan_file_exists(macrt_audio)) {
+                if (target.os == ZAN_OS_IOS) {
+                    snprintf(macrt_audio, sizeof(macrt_audio), "%s/toolchain/ios/arm64/zanrt_audio.o", exe_dir2);
+                    if (!zan_file_exists(macrt_audio)) {
+                        snprintf(macrt_audio, sizeof(macrt_audio), "toolchain/ios/arm64/zanrt_audio.o");
+                    }
+                }
+            }
+            bool has_audio_driver = false;
+            if (target.os == ZAN_OS_IOS) {
+                for (int li = 0; li < irgen.extern_lib_count; li++) {
+                    if (strncmp(irgen.extern_libs[li].str, "zan_audio", irgen.extern_libs[li].len) == 0) {
+                        has_audio_driver = true;
+                        break;
+                    }
+                }
+            }
+            if (has_audio_driver && zan_file_exists(macrt_audio)) {
+                cmd_appendf(cmd, sizeof(cmd), " \"%s\"", macrt_audio);
             }
             for (int ei = 0; ei < extra_link_input_count; ei++) {
                 cmd_appendf(cmd, sizeof(cmd), " \"%s\"",
