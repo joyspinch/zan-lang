@@ -1,5 +1,9 @@
 # Zan Programming Language
 
+<p align="left">
+  <b>English</b> | <a href="README.zh-CN.md">简体中文</a>
+</p>
+
 Modern systems programming language with **C# syntax**, **LLVM backend**, and **ARC memory management**.
 
 ## Features
