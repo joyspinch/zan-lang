@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 namespace Zan;
 
+// One diagnostic message with source position. `warn` selects the severity
+// (true = warning, false = error); warnings never gate compilation.
 class Diag {
     public string msg;
     public int line;
@@ -10,20 +12,12 @@ class Diag {
     public Diag(string m, int ln, int c, bool w) { msg = m; line = ln; col = c; warn = w; }
 }
 
-class DiagFileEntry {
-    public string path;
-    public int startLine;
-
-    public DiagFileEntry(string path, int startLine) {
-        this.path = path != null ? path : "";
-        this.startLine = startLine;
-    }
-}
-
+// Diagnostic sink shared across compiler phases.
 class Diags {
     public List<Diag> items;
-    List<DiagFileEntry> fileEntries;
-    public Diags() { items = new List<Diag>(); fileEntries = null; }
+    List<string> files;
+    List<int> fileStarts;
+    public Diags() { items = new List<Diag>(); files = null; fileStarts = null; }
     public void Error(string m, int line, int col) { items.Add(new Diag(m, line, col, false)); }
     public void Warning(string m, int line, int col) { items.Add(new Diag(m, line, col, true)); }
     public int Count() { return items.Count; }
@@ -36,21 +30,12 @@ class Diags {
         return false;
     }
 
+    // Registers the source files that were concatenated into the translation
+    // unit: `names[i]` starts at 1-based global line `starts[i]`. Lets Report
+    // print "file:line:col" with per-file line numbers.
     public void SetFiles(List<string> names, List<int> starts) {
-        if (names == null || starts == null) {
-            fileEntries = null;
-            return;
-        }
-        fileEntries = new List<DiagFileEntry>();
-        int i = 0;
-        while (i < names.Count && i < starts.Count) {
-            fileEntries.Add(new DiagFileEntry(names[i], starts[i]));
-            i = i + 1;
-        }
-    }
-
-    public void SetFileEntries(List<DiagFileEntry> entries) {
-        fileEntries = entries;
+        files = names;
+        fileStarts = starts;
     }
 
     string Esc() {
@@ -65,6 +50,10 @@ class Diags {
         return r;
     }
 
+    // Render each diagnostic as "file:line:col: error/warning: msg" followed by
+    // the offending source line in a gutter and a caret, matching the C host
+    // shape (warnings yellow, errors red). Prints only entries at index >=
+    // start so a phase can flush just its own.
     public void Report(string src, int start) {
         string red = Esc() + "[31m";
         string yel = Esc() + "[33m";
@@ -74,15 +63,15 @@ class Diags {
             Diag e = items[j];
             int shown = e.line;
             string loc = "";
-            if (fileEntries != null && fileEntries.Count > 0) {
+            if (files != null && fileStarts != null && fileStarts.Count > 0) {
                 int fi = 0;
                 int k = 1;
-                while (k < fileEntries.Count) {
-                    if (fileEntries[k].startLine <= e.line) { fi = k; }
+                while (k < fileStarts.Count) {
+                    if (fileStarts[k] <= e.line) { fi = k; }
                     k = k + 1;
                 }
-                shown = e.line - fileEntries[fi].startLine + 1;
-                loc = fileEntries[fi].path + ":";
+                shown = e.line - fileStarts[fi] + 1;
+                loc = files[fi] + ":";
             }
             if (e.warn) {
                 Console.WriteLine(loc + shown + ":" + e.col + ": " + yel + "warning" + rst + ": " + e.msg);
@@ -101,6 +90,7 @@ class Diags {
         }
     }
 
+    // Prints the closing "N error(s), M warning(s)" summary line.
     public void Summary() {
         int errs = 0;
         int warns = 0;
@@ -113,13 +103,32 @@ class Diags {
         Console.WriteLine("" + errs + " error(s), " + warns + " warning(s)");
     }
 
-    string LineOf(string src, int line) {
-        int cur = 1;
+    // Extract the 1-based source line (without its trailing newline / CR).
+    // A line-offset table is built once per source text so N diagnostics cost
+    // N short extracts instead of N full-text scans.
+    List<int> lineOffs;
+    string lineSrc;
+
+    void BuildLineOffs(string src) {
+        lineOffs = new List<int>();
+        lineSrc = src;
+        lineOffs.Add(0);
         int i = 0;
-        int start = 0;
-        while (i < src.Length && cur < line) {
-            if ((int)src[i] == 10) { cur = cur + 1; start = i + 1; }
+        while (i < src.Length) {
+            if ((int)src[i] == 10) { lineOffs.Add(i + 1); }
             i = i + 1;
+        }
+    }
+
+    string LineOf(string src, int line) {
+        if (lineOffs == null || lineSrc != src) { BuildLineOffs(src); }
+        // out-of-range lines keep the old scan's semantics: a line before 1
+        // resolves to the text start, a line past EOF to the last newline's
+        // successor (i.e. an empty tail when the text ends with '\n')
+        int start = 0;
+        if (line > 1) {
+            if (line <= lineOffs.Count) { start = lineOffs[line - 1]; }
+            else { start = lineOffs[lineOffs.Count - 1]; }
         }
         int end = start;
         while (end < src.Length && (int)src[end] != 10) { end = end + 1; }

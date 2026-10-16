@@ -2,24 +2,33 @@ using System;
 using System.Collections;
 namespace Zan;
 
-class JsonNeedEntry {
-    public string name;
-    public int isRootList;
-
-    public JsonNeedEntry(string name, int isRootList) {
-        this.name = name != null ? name : "";
-        this.isRootList = isRootList;
-    }
-}
-
+// Compile-time entity mapper generation for System.Json. Mirrors the C host
+// pass in src/compiler/jsongen.c.
+//
+// `Json.Deserialize<T>(text)` / `Json.Serialize<T>(obj)` are lowered at parse
+// time: for every class T reachable from a call site (including classes
+// referenced by fields, transitively), a binder (`B_T`), tree serializer
+// (`T_T`), direct writer (`W_T`) and the string-facing entry points
+// (`D_T`/`S_T`, `DL_T`/`SL_T` for List roots) are generated as Zan source
+// into a synthetic `__JsonBind` class, parsed, and merged into the unit.
+// Call sites are rewritten to the generated methods, so no reflection or
+// runtime type info is needed. Mapping is lenient: missing keys keep field
+// defaults, scalar mismatches coerce through the JsonValue As* helpers, a
+// single object binds into List<T> as one element, extra keys are ignored,
+// and JsonValue-typed fields pass their subtree through untouched. Field
+// types outside the supported set are a compile error unless the field is
+// annotated [JsonIgnore] (fail closed — never silently drop a field).
 class Jsongen {
     Node unit;
     Diags diags;
-    List<JsonNeedEntry> needs;
+    List<string> needNames;
+    List<int> needRootList;
     bool any;
 
+    // field-kind classification (mirrors jg_fk_t)
     static int FkSkip() { return 0; }
     static int FkInt() { return 1; }
+    static int FkLong() { return 9; }
     static int FkFloat() { return 2; }
     static int FkBool() { return 3; }
     static int FkString() { return 4; }
@@ -27,14 +36,17 @@ class Jsongen {
     static int FkClass() { return 6; }
     static int FkJson() { return 7; }
     static int FkList() { return 8; }
+    static int FkList2() { return 10; }
 
+    // Classify() side results for list element types.
     string elemName;
     int elemKind;
 
     public Jsongen() {
         unit = null;
         diags = null;
-        needs = new List<JsonNeedEntry>();
+        needNames = new List<string>();
+        needRootList = new List<int>();
         any = false;
         elemName = "";
         elemKind = 0;
@@ -51,9 +63,12 @@ class Jsongen {
     }
 
     bool IsIntName(string n) {
-        return n == "int" || n == "long" || n == "short" || n == "byte"
-            || n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong"
-            || n == "char";
+        return n == "int" || n == "short" || n == "byte"
+            || n == "sbyte" || n == "uint" || n == "ushort" || n == "char";
+    }
+
+    bool IsLongName(string n) {
+        return n == "long" || n == "ulong";
     }
 
     bool IsFloatName(string n) {
@@ -61,6 +76,7 @@ class Jsongen {
     }
 
     int ClassifyBase(string name) {
+        if (IsLongName(name)) { return Jsongen.FkLong(); }
         if (IsIntName(name)) { return Jsongen.FkInt(); }
         if (IsFloatName(name)) { return Jsongen.FkFloat(); }
         if (name == "bool") { return Jsongen.FkBool(); }
@@ -71,12 +87,30 @@ class Jsongen {
         return Jsongen.FkSkip();
     }
 
+    // Classify a field's type-ref; for lists, elemName/elemKind carry the
+    // element classification.
     int Classify(Node tref) {
         if (tref == null || tref.kind != AK.TypeRef()) { return Jsongen.FkSkip(); }
-        if (tref.ival == 1) { return Jsongen.FkSkip(); }  // arrays unsupported
+        if (tref.ival == 1) { return Jsongen.FkSkip(); } // arrays unsupported
         if (tref.sval == "List" && tref.kids.Count == 1) {
             Node ea = tref.kids[0];
-            if (ea == null || ea.kind != AK.TypeRef() || ea.ival == 1 || ea.kids.Count > 0) {
+            if (ea == null || ea.kind != AK.TypeRef() || ea.ival == 1) {
+                return Jsongen.FkSkip();
+            }
+            // nested List<List<elem>>: matrix fields (SDK response DTOs)
+            if (ea.sval == "List" && ea.kids.Count == 1) {
+                Node e2 = ea.kids[0];
+                if (e2 == null || e2.kind != AK.TypeRef() || e2.ival == 1
+                        || e2.kids.Count > 0) {
+                    return Jsongen.FkSkip();
+                }
+                int ik2 = ClassifyBase(e2.sval);
+                if (ik2 == Jsongen.FkSkip()) { return Jsongen.FkSkip(); }
+                elemName = e2.sval;
+                elemKind = ik2;
+                return Jsongen.FkList2();
+            }
+            if (ea.kids.Count > 0) {
                 return Jsongen.FkSkip();
             }
             int ek = ClassifyBase(ea.sval);
@@ -91,8 +125,8 @@ class Jsongen {
 
     int NeedFind(string name) {
         int i = 0;
-        while (i < needs.Count) {
-            if (needs[i].name == name) { return i; }
+        while (i < needNames.Count) {
+            if (needNames[i] == name) { return i; }
             i = i + 1;
         }
         return 0 - 1;
@@ -101,11 +135,14 @@ class Jsongen {
     int NeedAdd(string name) {
         int at = NeedFind(name);
         if (at >= 0) { return at; }
-        needs.Add(new JsonNeedEntry(name, 0));
-        return needs.Count - 1;
+        needNames.Add(name);
+        needRootList.Add(0);
+        return needNames.Count - 1;
     }
 
+    // ---- call-site scan + rewrite ----
 
+    // True when `call` is Json.Deserialize<...>(...) / Json.Serialize<...>(...).
     bool IsJsonCall(Node call) {
         if (call.kind != AK.Call()) { return false; }
         Node callee = call.a;
@@ -149,7 +186,7 @@ class Jsongen {
             return;
         }
         int at = NeedAdd(cls);
-        if (asList) { needs[at].isRootList = 1; }
+        if (asList) { needRootList[at] = 1; }
         any = true;
 
         string prefix = "S_";
@@ -161,6 +198,8 @@ class Jsongen {
         callee.b = null;
     }
 
+    // Generic AST walk: rewriting only mutates call nodes in place, so slot
+    // order does not matter.
     void Visit(Node n) {
         if (n == null) { return; }
         if (n.kind == AK.Call() && IsJsonCall(n)) { RewriteCall(n); }
@@ -172,9 +211,10 @@ class Jsongen {
         while (i < n.kids.Count) { Visit(n.kids[i]); i = i + 1; }
     }
 
+    // ---- per-class code generation ----
 
     string WriteScalar(int k, string item, string tname) {
-        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkLong() || k == Jsongen.FkFloat()) {
             return "sb.Append(Convert.ToString(" + item + "));";
         }
         if (k == Jsongen.FkEnum()) {
@@ -194,7 +234,7 @@ class Jsongen {
     }
 
     string TreeScalar(int k, string item, string tname) {
-        if (k == Jsongen.FkInt() || k == Jsongen.FkFloat()) {
+        if (k == Jsongen.FkInt() || k == Jsongen.FkLong() || k == Jsongen.FkFloat()) {
             return "JsonValue.NewNum(Convert.ToString(" + item + "))";
         }
         if (k == Jsongen.FkEnum()) {
@@ -210,7 +250,11 @@ class Jsongen {
         if (k == Jsongen.FkInt()) {
             return "(" + tname + ")" + item + ".AsInt(0)";
         }
+        if (k == Jsongen.FkLong()) {
+            return "(" + tname + ")" + item + ".AsLong(0)";
+        }
         if (k == Jsongen.FkEnum()) {
+            // enum casts are not parseable; int -> enum is implicit
             return item + ".AsInt(0)";
         }
         if (k == Jsongen.FkFloat()) {
@@ -222,10 +266,13 @@ class Jsongen {
         return "__JsonBind.B_" + tname + "(" + item + ")";
     }
 
+    // mode: 1 = bind (JsonValue -> entity), 0 = tree (entity -> JsonValue),
+    // 2 = write (entity -> JSON text into `sb`).
     int emitted;
     string GenFields(string clsName, Node cls, int mode, int depth) {
         string s = "";
         if (depth > 16 || cls == null) { return s; }
+        // base class fields first (C#-style ordering)
         if (cls.sval2 != "") {
             Node bdecl = FindDecl(cls.sval2, AK.ClassDecl());
             if (bdecl != null) {
@@ -247,10 +294,14 @@ class Jsongen {
             string tname = "?";
             if (m.type != null && m.type.kind == AK.TypeRef()) { tname = m.type.sval; }
             if (fk == Jsongen.FkSkip()) {
+                // unsupported field type: only reachable here for fields
+                // explicitly exempted with [JsonIgnore] — ValidateFields has
+                // already errored on anything unannotated.
                 continue;
             }
             if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
-            if (fk == Jsongen.FkList() && ek == Jsongen.FkClass()) { NeedAdd(en); }
+            if ((fk == Jsongen.FkList() || fk == Jsongen.FkList2())
+                    && ek == Jsongen.FkClass()) { NeedAdd(en); }
 
             if (mode == 2) {
                 string comma = "";
@@ -270,13 +321,38 @@ class Jsongen {
                     s = s + "            }\n";
                     s = s + "        }\n";
                     s = s + "        sb.Append(\"]\");\n";
+                } else if (fk == Jsongen.FkList2()) {
+                    string item = "o." + f + "[i_" + f + "][k_" + f + "]";
+                    string wr = WriteScalar(ek, item, en);
+                    s = s + "        sb.Append(\"[\");\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                if (i_" + f + " > 0) { sb.Append(\",\"); }\n";
+                    s = s + "                sb.Append(\"[\");\n";
+                    s = s + "                if (o." + f + "[i_" + f + "] != null) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < o." + f + "[i_" + f + "].Count) {\n";
+                    s = s + "                        if (k_" + f + " > 0) { sb.Append(\",\"); }\n";
+                    s = s + "                        " + wr + "\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                sb.Append(\"]\");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        sb.Append(\"]\");\n";
                 } else {
                     s = s + "        " + WriteScalar(fk, "o." + f, tname) + "\n";
                 }
             } else if (mode == 1) {
                 if (fk == Jsongen.FkInt()) {
                     s = s + "        o." + f + " = (" + tname + ")v.Int(\"" + f + "\", 0);\n";
+                } else if (fk == Jsongen.FkLong()) {
+                    s = s + "        o." + f + " = (" + tname + ")v.Long(\"" + f + "\", 0);\n";
                 } else if (fk == Jsongen.FkEnum()) {
+                    // enum casts are not parseable; int -> enum is implicit
                     s = s + "        o." + f + " = v.Int(\"" + f + "\", 0);\n";
                 } else if (fk == Jsongen.FkFloat()) {
                     s = s + "        o." + f + " = (" + tname + ")v.Double(\"" + f + "\", 0.0);\n";
@@ -289,7 +365,9 @@ class Jsongen {
                 } else if (fk == Jsongen.FkClass()) {
                     s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
                     s = s + "        if (j_" + f + " != null && j_" + f + ".IsObject()) { o." + f + " = __JsonBind.B_" + tname + "(j_" + f + "); }\n";
-                } else {
+                } else if (fk == Jsongen.FkList()) {
+                    // list: array binds element-wise; a lone object becomes a
+                    // one-element list
                     string convAt = BindElem(ek, "j_" + f + ".At(i_" + f + ")", en);
                     string convOne = BindElem(ek, "j_" + f, en);
                     s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
@@ -303,6 +381,28 @@ class Jsongen {
                     s = s + "        } else if (j_" + f + " != null && !j_" + f + ".IsNull()) {\n";
                     s = s + "            o." + f + ".Add(" + convOne + ");\n";
                     s = s + "        }\n";
+                } else {
+                    // list of lists: strictly row arrays, no single-object
+                    // fallback
+                    string convRow = BindElem(ek, "row_" + f + ".At(k_" + f + ")", en);
+                    s = s + "        JsonValue j_" + f + " = v.Get(\"" + f + "\");\n";
+                    s = s + "        o." + f + " = new List<List<" + en + ">>();\n";
+                    s = s + "        if (j_" + f + " != null && j_" + f + ".IsArray()) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < j_" + f + ".Count()) {\n";
+                    s = s + "                JsonValue row_" + f + " = j_" + f + ".At(i_" + f + ");\n";
+                    s = s + "                List<" + en + "> values_" + f + " = new List<" + en + ">();\n";
+                    s = s + "                if (row_" + f + " != null && row_" + f + ".IsArray()) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < row_" + f + ".Count()) {\n";
+                    s = s + "                        values_" + f + ".Add(" + convRow + ");\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                o." + f + ".Add(values_" + f + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
                 }
             } else {
                 // tree (serialize) direction
@@ -313,6 +413,25 @@ class Jsongen {
                     s = s + "            int i_" + f + " = 0;\n";
                     s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
                     s = s + "                a_" + f + ".Append(" + conv + ");\n";
+                    s = s + "                i_" + f + " = i_" + f + " + 1;\n";
+                    s = s + "            }\n";
+                    s = s + "        }\n";
+                    s = s + "        v.Put(\"" + f + "\", a_" + f + ");\n";
+                } else if (fk == Jsongen.FkList2()) {
+                    string conv2 = TreeScalar(ek, "o." + f + "[i_" + f + "][k_" + f + "]", en);
+                    s = s + "        JsonValue a_" + f + " = JsonValue.NewArray();\n";
+                    s = s + "        if (o." + f + " != null) {\n";
+                    s = s + "            int i_" + f + " = 0;\n";
+                    s = s + "            while (i_" + f + " < o." + f + ".Count) {\n";
+                    s = s + "                JsonValue row_" + f + " = JsonValue.NewArray();\n";
+                    s = s + "                if (o." + f + "[i_" + f + "] != null) {\n";
+                    s = s + "                    int k_" + f + " = 0;\n";
+                    s = s + "                    while (k_" + f + " < o." + f + "[i_" + f + "].Count) {\n";
+                    s = s + "                        row_" + f + ".Append(" + conv2 + ");\n";
+                    s = s + "                        k_" + f + " = k_" + f + " + 1;\n";
+                    s = s + "                    }\n";
+                    s = s + "                }\n";
+                    s = s + "                a_" + f + ".Append(row_" + f + ");\n";
                     s = s + "                i_" + f + " = i_" + f + " + 1;\n";
                     s = s + "            }\n";
                     s = s + "        }\n";
@@ -331,7 +450,14 @@ class Jsongen {
         return r == 1;
     }
 
+    // ---- fail-closed field validation ----
 
+    // Walk every field of every class reachable from a Json call and reject
+    // unsupported field types unless the field is explicitly exempted with
+    // [JsonIgnore]. Without this gate a mapper would be generated that looks
+    // successful but silently drops fields (the old behaviour was to skip them
+    // with no diagnostic at all). Class-typed fields are added to needNames so
+    // the walk reaches transitively referenced classes too.
     void ValidateClass(string cls) {
         Node decl = FindDecl(cls, AK.ClassDecl());
         if (decl == null) { return; }
@@ -340,6 +466,7 @@ class Jsongen {
 
     void ValidateFields(Node cls, int depth) {
         if (depth > 16 || cls == null) { return; }
+        // base class fields first (C#-style ordering), like GenFields
         if (cls.sval2 != "") {
             Node bdecl = FindDecl(cls.sval2, AK.ClassDecl());
             if (bdecl != null) { ValidateFields(bdecl, depth + 1); }
@@ -367,16 +494,18 @@ class Jsongen {
                 continue;
             }
             if (fk == Jsongen.FkClass()) { NeedAdd(tname); }
-            if (fk == Jsongen.FkList() && elemKind == Jsongen.FkClass()) { NeedAdd(elemName); }
+            if ((fk == Jsongen.FkList() || fk == Jsongen.FkList2())
+                    && elemKind == Jsongen.FkClass()) { NeedAdd(elemName); }
         }
     }
 
-    string GenClass(int idx) {
-        string cls = needs[idx].name;
+    string ZedMapperCls(int idx) {
+        string cls = needNames[idx];
         Node decl = FindDecl(cls, AK.ClassDecl());
         if (decl == null) { return ""; }
         string s = "";
 
+        // binder: JsonValue -> entity (lenient)
         s = s + "    static " + cls + " B_" + cls + "(JsonValue v) {\n";
         s = s + "        " + cls + " o = new " + cls + "();\n";
         s = s + "        if (v == null || !v.IsObject()) { return o; }\n";
@@ -390,6 +519,7 @@ class Jsongen {
         s = s + GenFields(cls, decl, 0, 0);
         s = s + "        return v;\n    }\n";
 
+        // writer: entity -> JSON text appended directly to a StringBuilder
         s = s + "    static void W_" + cls + "(StringBuilder sb, " + cls + " o) {\n";
         s = s + "        if (o == null) { sb.Append(\"null\"); return; }\n";
         s = s + "        sb.Append(\"{\");\n";
@@ -397,10 +527,11 @@ class Jsongen {
         s = s + GenFields(cls, decl, 2, 0);
         s = s + "        sb.Append(\"}\");\n    }\n";
 
+        // string-facing entry points
         s = s + "    static " + cls + " D_" + cls + "(string s) { return __JsonBind.B_" + cls + "(JsonValue.ParseLenient(s)); }\n";
         s = s + "    static string S_" + cls + "(" + cls + " o) { StringBuilder sb = new StringBuilder(); __JsonBind.W_" + cls + "(sb, o); return sb.ToString(); }\n";
 
-        if (needs[idx].isRootList == 1) {
+        if (needRootList[idx] == 1) {
             s = s + "    static List<" + cls + "> DL_" + cls + "(string s) {\n";
             s = s + "        JsonValue v = JsonValue.ParseLenient(s);\n";
             s = s + "        List<" + cls + "> r = new List<" + cls + ">();\n";
@@ -430,11 +561,13 @@ class Jsongen {
         return s;
     }
 
+    // ---- entry point ----
 
     public void Run(Node u, Diags d) {
         unit = u;
         diags = d;
 
+        // scan every method/ctor body and field initializer
         int i = 0;
         while (i < unit.kids.Count) {
             Node dc = unit.kids[i];
@@ -450,9 +583,13 @@ class Jsongen {
         }
         if (!any || diags.HasErrors()) { return; }
 
+        // Fail closed: validate every reachable class's fields before
+        // generating any mapper code. Unsupported fields must be annotated
+        // [JsonIgnore]; anything else aborts compilation rather than emitting
+        // a serializer that silently omits the field.
         int vi = 0;
-        while (vi < needs.Count) {
-            ValidateClass(needs[vi].name);
+        while (vi < needNames.Count) {
+            ValidateClass(needNames[vi]);
             vi = vi + 1;
         }
         if (diags.HasErrors()) { return; }
@@ -460,9 +597,10 @@ class Jsongen {
         string src = "class __JsonBind {\n";
         src = src + "    static JsonValue T_Str(string s) { if (s == null) { return JsonValue.NewNull(); } return JsonValue.NewStr(s); }\n";
         src = src + "    static JsonValue T_Jv(JsonValue x) { if (x == null) { return JsonValue.NewNull(); } return x; }\n";
+        // ZedMapperCls may append to needNames while generating (nested classes)
         int gi = 0;
-        while (gi < needs.Count) {
-            src = src + GenClass(gi);
+        while (gi < needNames.Count) {
+            src = src + ZedMapperCls(gi);
             gi = gi + 1;
         }
         src = src + "}\n";

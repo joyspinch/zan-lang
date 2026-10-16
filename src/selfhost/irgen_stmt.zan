@@ -2,10 +2,14 @@ using System;
 using System.Collections;
 namespace Zan;
 
+// Irgen part: statement codegen, vtable emission for polymorphic classes
+// and the non-emitting argument typer used for overload resolution.
 partial class Irgen {
     // ---- statements ----
     void GenStmt(Node s) {
         if (s == null) { return; }
+        // A label is a branch target, so it must be emitted even when the
+        // current block is already terminated (e.g. code after a goto).
         if (s.kind == AK.LabelStmt()) {
             int lid = LabelId(s.sval);
             if (!term) { L("  br label %L" + lid); }
@@ -17,24 +21,24 @@ partial class Irgen {
         if (IsAwaitStmt(s)) { GenAwaitStmt(s); return; }
         if (curAsync && k == AK.ReturnStmt()) { GenAsyncReturn(s); return; }
         if (k == AK.Block()) {
-            int scopeStart = locals.Count;
+            int scopeStart = locName.Count;
             int i = 0;
             while (i < s.kids.Count) { GenStmt(s.kids[i]); i = i + 1; }
             if (!term) { ReleaseLocalsFrom(scopeStart); }
             TrimLocals(scopeStart);
         } else if (k == AK.VarDecl()) {
-            stmtTemps = new List<StmtTempEntry>();
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             GenVarDecl(s);
             EmitTempReleases();
         } else if (k == AK.DeconDecl()) {
             GenDecon(s);
         } else if (k == AK.ExprStmt()) {
-            stmtTemps = new List<StmtTempEntry>();
+            stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
             GenExpr(s.a);
             EmitTempReleases();
         } else if (k == AK.ReturnStmt()) {
             if (s.a != null) {
-                stmtTemps = new List<StmtTempEntry>();
+                stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
                 ExprVal v = GenExpr(s.a);
                 if (curRet == "void") {
                     EmitTempReleases();
@@ -56,6 +60,8 @@ partial class Irgen {
             GenIf(s);
         } else if (k == AK.WhileStmt()) {
             GenWhile(s);
+        } else if (k == AK.DoWhileStmt()) {
+            GenDoWhile(s);
         } else if (k == AK.ForStmt()) {
             GenFor(s);
         } else if (k == AK.ForeachStmt()) {
@@ -86,15 +92,21 @@ partial class Irgen {
         return true;
     }
 
+    // Any LLVM pointer type (class pointer, array i64*, generic i8*, etc.).
     bool IsPtrLL(string s) {
-        if (s == "i8*") { return true; }
-        return IsClassPtr(s);
+        if (s == null) { return false; }
+        int len = s.Length;
+        if (len > 0 && s.Substring(len - 1, 1) == "*") { return true; }
+        return false;
     }
 
+    // when null literal, retype to the target LLVM type; bitcast class pointers
+    // (e.g. a derived instance stored into a base-typed slot)
     string Coerce(ExprVal v, string llty) {
         if (v.op == "null") { if (llty == "i64") { return "0"; } return "null"; }
         if (v.op == "0" && IsPtrLL(llty)) { return "null"; }
         string vt = MapType(v.ty);
+        // erased i64 slots: pack pointers via ptrtoint / unpack via inttoptr
         if (llty == "i64" && IsPtrLL(vt)) { return ToI64(v.op, vt); }
         if (vt == "i64" && IsPtrLL(llty)) {
             string tp = NT();
@@ -106,6 +118,7 @@ partial class Irgen {
             L("  " + t + " = bitcast " + vt + " " + v.op + " to " + llty);
             return t;
         }
+        // implicit integer -> double promotion (e.g. `double x = 5;`)
         if (vt == "i64" && llty == "double") {
             string t = NT();
             L("  " + t + " = sitofp i64 " + v.op + " to double");
@@ -114,6 +127,9 @@ partial class Irgen {
         return v.op;
     }
 
+    // ---- vtable emission for polymorphic classes ----
+    // Slots are matched by name AND parameter tags so overloaded virtual
+    // methods each get their own slot bound to the right definition symbol.
     void EmitVtable(Node cls) {
         List<Node> ms = new List<Node>();
         CollectVSlotNodes(cls, ms);
@@ -139,6 +155,7 @@ partial class Irgen {
         H(s);
     }
 
+    // "_tag1_tag2" parameter-type signature of a method, for overload matching.
     string ParamTags(Node m) {
         string s = "";
         int i = 0;
@@ -150,6 +167,7 @@ partial class Irgen {
         return s;
     }
 
+    // method declared directly on cls with the given name and parameter tags
     Node FindMethodSig(Node cls, string name, string tags) {
         if (cls == null) { return null; }
         int i = 0;
@@ -180,6 +198,7 @@ partial class Irgen {
         return "";
     }
 
+    // Number of methods named `name` declared directly in `cls`.
     int MethodCount(Node cls, string name) {
         if (cls == null) { return 0; }
         int n = 0;
@@ -192,6 +211,7 @@ partial class Irgen {
         return n;
     }
 
+    // A type name reduced to a symbol-safe tag for overload mangling.
     string TypeTag(Node t) {
         if (t == null) { return "v"; }
         if (t.sval == "") { return "v"; }
@@ -201,6 +221,7 @@ partial class Irgen {
         return s;
     }
 
+    // does a type reference mention an unbound generic type parameter?
     bool MentionsTypeParam(Node t) {
         if (t == null) { return false; }
         if (binder.IsTypeParam(t.sval)) { return true; }
@@ -209,6 +230,8 @@ partial class Irgen {
         return false;
     }
 
+    // static type of an expression-bodied lambda's result, with its typed
+    // parameters visible (only same-name parameter references are resolved).
     Node LambdaRetType(Node lam) {
         if (lam == null || lam.a == null) { return null; }
         Node b = lam.a;
@@ -224,6 +247,10 @@ partial class Irgen {
         return ArgTypeNode(b);
     }
 
+    // The LLVM symbol for a method. Non-overloaded names stay `Owner_Name`
+    // (so all existing output -- including the self-host fixed point, which
+    // has no overloads -- is unchanged); an overloaded name gains an arity and
+    // per-parameter-type suffix so each overload is a distinct definition.
     string MethodSym(string owner, Node m) {
         if (HasMod(m, MOD.Extern())) { return ExternName(m); }
         Node oc = binder.FindType(owner);
@@ -245,6 +272,36 @@ partial class Irgen {
         return sb.ToString();
     }
 
+    // number of constructor declarations in a class
+    int CtorDeclCount(Node cls) {
+        if (cls == null) { return 0; }
+        int n = 0; int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.CtorDecl()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Symbol for a constructor. With a single ctor this stays the historical
+    // `Type_ctor`; with overloads the parameter types are appended (mirrors
+    // MethodSym) so two ctors cannot collide on one LLVM symbol.
+    string CtorSym(string owner, Node ctor) {
+        if (CtorDeclCount(binder.FindType(owner)) <= 1) { return owner + "_ctor"; }
+        string s = owner + "_ctor__";
+        int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) { s = s + "_" + TypeTag(p.type); }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // ---- non-emitting argument typer (for overload resolution only) ----
+    // Yields the static type of an argument expression without generating any
+    // IR. Returns null when the type cannot be determined; callers treat that
+    // as "compatible with anything" so nothing is mis-resolved.
     Node ArgTypeNode(Node e) {
         if (e == null) { return null; }
         int k = e.kind;
@@ -259,7 +316,7 @@ partial class Irgen {
         if (k == AK.IsExpr()) { return MkType("bool"); }
         if (k == AK.Ident()) {
             int li = LocalIdx(e.sval);
-            if (li >= 0) { return locals[li].type; }
+            if (li >= 0) { return locType[li]; }
             return FieldType(binder.FindType(curClass), e.sval);
         }
         if (k == AK.MemberAccess()) {
@@ -292,8 +349,14 @@ partial class Irgen {
         return null;
     }
 
+    // Full tag (including generic arguments) so e.g. List<int> vs List<double>
+    // overloads score an exact match instead of tying as ambiguous.
     string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return TypeTag(t); }
 
+    // How well candidate `m` fits the call `e`: +1 for matching the caller's
+    // static/instance context, +4 for each exact argument-type match, -1 for a
+    // known mismatch (an implicit conversion may still apply, so it is not
+    // disqualifying). Unknown argument types are neutral.
     int ScoreCand(Node m, Node e, int argc, bool wantStatic) {
         int score = 0;
         if (IsStatic(m) == wantStatic) { score = score + 1; }
@@ -302,6 +365,8 @@ partial class Irgen {
             Node pt = ParamTypeNode(m, a);
             Node arg = e.kids[a];
             if (arg.kind == AK.Lambda()) {
+                // score a lambda argument by its result type against the
+                // delegate parameter's declared return type
                 Node dd = null;
                 if (pt != null) { dd = binder.FindDelegate(pt.sval); }
                 if (dd != null) {
@@ -325,6 +390,13 @@ partial class Irgen {
         return score;
     }
 
+    // Select the method named `name` in `cls` for the call `e`. With a single
+    // candidate the behaviour is unchanged (arity is not consulted, so
+    // default-argument calls still resolve, and the self-host fixed point --
+    // which has no overloads -- emits byte-identical IR). With several
+    // overloads we keep those whose arity admits the call, then pick the best
+    // argument-type match for the caller's static/instance context; an empty
+    // candidate set or a tie is a diagnostic.
     Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
         if (cls == null) { return null; }
         List<Node> cands = new List<Node>();
@@ -376,6 +448,7 @@ partial class Irgen {
         return best;
     }
 
+    // Like ResolveMethod but walks base classes, matching FindMethodUp.
     Node ResolveMethodUp(Node cls, string name, Node e, bool wantStatic) {
         Node c = cls;
         while (c != null) {
@@ -386,6 +459,51 @@ partial class Irgen {
         return null;
     }
 
+    // Select the constructor for `new C(args)`: with a single ctor the
+    // behaviour is unchanged (arity is not consulted, so default-argument
+    // calls still resolve); with several overloads, keep those whose arity
+    // admits the call (trailing defaults fill the gap) and pick the best
+    // argument-type match. `exclude` rules a ctor out (a `: this(...)`
+    // chain must not retarget itself). Returns null when nothing fits.
+    Node ResolveCtorEx(Node cls, Node e, Node exclude) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            if (cls.kids[i].kind == AK.CtorDecl() && cls.kids[i] != exclude) { cands.Add(cls.kids[i]); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int argc = e.kids.Count;
+        List<Node> fit = new List<Node>();
+        i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int tot = 0; int req = 0; int j = 0;
+            while (j < m.kids.Count) {
+                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } }
+                j = j + 1;
+            }
+            if (argc >= req && argc <= tot) { fit.Add(m); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) { return null; }
+        if (fit.Count == 1) { return fit[0]; }
+        int mx = -2000000000;
+        List<int> sc = new List<int>();
+        i = 0;
+        while (i < fit.Count) { int s = ScoreCand(fit[i], e, argc, false); sc.Add(s); if (s > mx) { mx = s; } i = i + 1; }
+        i = 0;
+        while (i < fit.Count) { if (sc[i] == mx) { return fit[i]; } i = i + 1; }
+        return fit[0];
+    }
+
+    Node ResolveCtor(Node cls, Node e) {
+        return ResolveCtorEx(cls, e, null);
+    }
+
+    // vtable slot method names, base classes first
     void CollectVSlots(Node cls, List<string> slots) {
         if (cls == null) { return; }
         CollectVSlots(BaseClassOf(cls), slots);
@@ -416,6 +534,7 @@ partial class Irgen {
         return -1;
     }
 
+    // slot index of the specific overload m; falls back to a unique name match
     int VSlotIndexM(Node cls, Node m) {
         List<Node> ms = new List<Node>();
         CollectVSlotNodes(cls, ms);
@@ -436,6 +555,9 @@ partial class Irgen {
         return -1;
     }
 
+    // most-derived class (from cls upward) providing a concrete body for a slot.
+    // Matches explicit override AND implicit interface implementation (a plain
+    // method whose name matches an inherited abstract/virtual slot).
     string ResolveImpl(Node cls, string name) {
         Node c = cls;
         while (c != null) {
@@ -460,7 +582,7 @@ partial class Irgen {
         if (curAsync) {
             int pli = LocalIdx(s.sval);
             if (pli >= 0) {
-                Node pty0 = locals[pli].type; string preg0 = locals[pli].reg; string plt0 = MapType(pty0);
+                Node pty0 = locType[pli]; string preg0 = locReg[pli]; string plt0 = MapType(pty0);
                 if (s.b != null) {
                     ExprVal iv0 = GenExpr(s.b);
                     if (IsNullableValue(pty0)) {
@@ -477,6 +599,7 @@ partial class Irgen {
         Node ty = s.type;
         ExprVal init;
         bool hasInit = (s.b != null);
+        // propagate delegate parameter/return types onto an initialising lambda
         if (hasInit && s.b.kind == AK.Lambda() && ty != null && IsDelegate(ty)) {
             AnnotateLambda(s.b, ty);
         }
@@ -496,6 +619,8 @@ partial class Irgen {
         } else {
             Node sd = binder.FindType(ty.sval);
             if (sd != null && sd.kind == AK.StructDecl() && ty.ival == 0 && !IsNullable(ty)) {
+                // value struct default-initialised: allocate zeroed storage so
+                // field accesses operate on real memory (calloc zeroes fields).
                 string cn = ty.sval;
                 string szp = NT();
                 L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
@@ -509,6 +634,13 @@ partial class Irgen {
             } else if (ArcManaged(ty)) {
                 L("  store " + lt + " null, " + lt + "* " + reg);
             }
+        }
+        // multi-declarator: extra declarators ride as VarDecl kids; handled
+        // after this declaration's store so `int a = 1, b = a + 1` sees a
+        int mdi = 0;
+        while (mdi < s.kids.Count) {
+            GenVarDecl(s.kids[mdi]);
+            mdi = mdi + 1;
         }
     }
 
@@ -546,7 +678,7 @@ partial class Irgen {
         int sb = brkTarget; int sc = contTarget;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = lc;
-        loopScopeBase = locals.Count;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         string c = GenCond(s.a);
@@ -559,14 +691,34 @@ partial class Irgen {
         loopScopeBase = sls;
     }
 
+    void GenDoWhile(Node s) {
+        int lb = NL(); int lc = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
+        brkTarget = lend; contTarget = lc;
+        loopScopeBase = locName.Count;
+        L("  br label %L" + lb);
+        Label(lb);
+        GenStmt(s.b);
+        if (!term) {
+            L("  br label %L" + lc);
+            Label(lc);
+            string c = GenCond(s.a);
+            L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        }
+        Label(lend);
+        brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
+    }
+
     void GenFor(Node s) {
-        int forScope = locals.Count;
+        int forScope = locName.Count;
         if (s.a != null) { GenStmt(s.a); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
-        loopScopeBase = locals.Count;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         if (s.b != null) {
@@ -588,6 +740,8 @@ partial class Irgen {
         loopScopeBase = sls;
     }
 
+    // Infer the projected element type of a query's `select` expression, with
+    // the range variable resolving to the source element type.
     Node QueryElem(Node sel, string qv, Node elemTy) {
         if (sel == null) { return elemTy; }
         int k = sel.kind;
@@ -601,7 +755,7 @@ partial class Irgen {
         if (k == AK.Ident()) {
             if (sel.sval == qv) { return elemTy; }
             int li = LocalIdx(sel.sval);
-            if (li >= 0) { return locals[li].type; }
+            if (li >= 0) { return locType[li]; }
             return elemTy;
         }
         if (k == AK.Unary()) {
@@ -627,8 +781,10 @@ partial class Irgen {
         return elemTy;
     }
 
+    // from x in src [where c]... select e — an eager loop that filters and
+    // projects each element into a fresh List<sel>. Mirrors the C host lowering.
     ExprVal GenQuery(Node e) {
-        int qScope = locals.Count;
+        int qScope = locName.Count;
         ExprVal coll = GenExpr(e.a);
         Node srcElem = ListElem(coll.ty);
         if (srcElem == null) { srcElem = MkType("int"); }
@@ -686,8 +842,9 @@ partial class Irgen {
         return new ExprVal(list, resListTy);
     }
 
+    // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
     void GenForeach(Node s) {
-        int feScope = locals.Count;
+        int feScope = locName.Count;
         ExprVal coll = GenExpr(s.b);
         if (!IsListType(coll.ty)) { return; }
         Node elemTy = s.type;
@@ -703,7 +860,7 @@ partial class Irgen {
         int sb = brkTarget; int sc = contTarget;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
-        loopScopeBase = locals.Count;
+        loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
         string iv = NT();
@@ -742,6 +899,8 @@ partial class Irgen {
         loopScopeBase = sls;
     }
 
+    // throw expr — store the exception object, pop the innermost handler and
+    // longjmp back into its try (setjmp returns nonzero -> catch path).
     void GenThrow(Node s) {
         ExprVal v = GenExpr(s.a);
         string vt = MapType(v.ty);
@@ -761,8 +920,13 @@ partial class Irgen {
         EmitRaise();
     }
 
+    // pop the innermost handler and longjmp into its try (the exception
+    // object/tid globals already hold the in-flight exception).
     void EmitRaise() {
         if (curAsync) {
+            // the longjmp may skip suspended coroutine frames: persist this
+            // frame's locals (the handler reloads them) and release/free the
+            // frames the jump bypasses (stops at the first armed handler).
             EmitAsyncSaveSlots();
             L("  call void @__zan_async_unwind(i8* %fp)");
         }
@@ -788,7 +952,11 @@ partial class Irgen {
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
     }
 
+    // try { } catch (T e) { } finally { }  — setjmp/longjmp based
     void GenTry(Node s) {
+        // the jmp_buf lives in a global array slot (not a stack alloca): in a
+        // coroutine the resume invocation that armed the handler may have
+        // returned by the time a throw longjmps here, so its stack is dead.
         string sp = NT();
         L("  " + sp + " = load i64, i64* @__exc_sp");
         string bufe = NT();
@@ -802,6 +970,10 @@ partial class Irgen {
         L("  " + sp1 + " = add i64 " + sp + ", 1");
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
         if (curAsync) {
+            // arm: unwind stops at a frame with hcount > 0 (the handler
+            // resumes inside it); keep the heap frame authoritative across
+            // this try -- a throw crossing a suspension longjmps into a stale
+            // invocation whose stack allocas are garbage.
             EmitAsyncHcAdd(1);
             EmitAsyncSaveSlots();
         }
@@ -825,9 +997,17 @@ partial class Irgen {
         term = false;
         Label(lcatch);
         if (curAsync) {
+            // disarm, then reload frame-resident locals: if the throw crossed
+            // a suspension this invocation's stack allocas are stale -- the
+            // frame (saved at try entry, every suspension and every async
+            // throw) is the authoritative copy.
             EmitAsyncHcAdd(-1);
             EmitAsyncReloadSlots();
         }
+        // handler already popped by throw; dispatch to the first clause whose
+        // type matches the thrown tid (walking the base chain), rethrowing to
+        // the outer handler when no clause matches. A null tid (string/legacy
+        // throw) matches the first clause.
         int lfin = NL();
         if (s.b != null) {
             int lrethrow = NL();
@@ -875,11 +1055,12 @@ partial class Irgen {
                     L("  store i8* " + nx + ", i8** " + tidSlot);
                     L("  br label %L" + lloop);
                 } else {
+                    // untyped clause (or unknown type): catches everything
                     L("  br label %L" + lbody);
                     sawAll = true;
                 }
                 Label(lbody);
-                int catchScope = locals.Count;
+                int catchScope = locName.Count;
                 if (cc.sval != "" && cc.type != null) {
                     string exv = NT();
                     L("  " + exv + " = load i8*, i8** @__exc_val");
@@ -905,6 +1086,9 @@ partial class Irgen {
                 if (sawAll) { cc = null; } else { cc = cc.b; }
                 if (cc != null && lmiss != lrethrow) { Label(lmiss); }
             }
+            // no clause matched: re-raise to the next outer handler (this
+            // try's frame was already popped by the throw); note the finally
+            // body is bypassed on this path (mirrors the C host).
             if (!sawAll) {
                 Label(lrethrow);
                 EmitRaise();
@@ -914,8 +1098,32 @@ partial class Irgen {
             L("  br label %L" + lfin);
         }
         Label(lfin);
-        if (s.c != null) { GenStmt(s.c); }
-        if (!term) { L("  br label %L" + lend); }
+        if (s.c != null) {
+            // the finally body may run try/catch of its own; keep the
+            // in-flight exception intact across it
+            string sv2 = NT(); string st2 = NT();
+            L("  " + sv2 + " = alloca i8*");
+            L("  " + st2 + " = alloca i8*");
+            string ev0 = NT(); L("  " + ev0 + " = load i8*, i8** @__exc_val");
+            L("  store i8* " + ev0 + ", i8** " + sv2);
+            string td0 = NT(); L("  " + td0 + " = load i8*, i8** @__exc_tid");
+            L("  store i8* " + td0 + ", i8** " + st2);
+            GenStmt(s.c);
+            string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
+            L("  store i8* " + ev1 + ", i8** @__exc_val");
+            string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
+            L("  store i8* " + td1 + ", i8** @__exc_tid");
+        }
+        if (!term) {
+            if (s.b == null) {
+                // finally-only try: the exception keeps unwinding (the C
+                // host runs the finally at the throw site and propagates)
+                EmitRaise();
+                term = false;
+            } else {
+                L("  br label %L" + lend);
+            }
+        }
         Label(lend);
         term = false;
     }

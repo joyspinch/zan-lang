@@ -2,13 +2,19 @@ using System;
 using System.Collections;
 namespace Zan;
 
+// Binder: collects top-level type declarations into a symbol table and
+// resolves type/field/method names. Mirrors src/compiler/binder.c for the
+// bootstrap subset. Uses linear lookup over declaration lists (no dependency
+// on Dictionary, which gen0 does not fully support).
 class Binder {
-    public List<Node> types;  
-    public List<string> tparams;  
-    public List<Node> delegDecls;  
+    public List<Node> types;   // class/struct/enum decls across all units
+    public List<string> tparams; // generic type-parameter names across all units
+    public List<string> delegates; // named delegate types (lowered as closures)
+    public List<Node> delegDecls;  // their declaration nodes (params + return type)
 
-    public Binder() { types = new List<Node>(); tparams = new List<string>(); delegDecls = new List<Node>(); }
+    public Binder() { types = new List<Node>(); tparams = new List<string>(); delegates = new List<string>(); delegDecls = new List<Node>(); }
 
+    // Register every type declaration in a compilation unit.
     public void Bind(Node unit) {
         int i = 0;
         while (i < unit.kids.Count) {
@@ -29,6 +35,7 @@ class Binder {
                     j = j + 1;
                 }
             } else if (d.kind == AK.DelegateDecl()) {
+                delegates.Add(d.sval);
                 delegDecls.Add(d);
             }
             i = i + 1;
@@ -47,7 +54,9 @@ class Binder {
     public bool IsDelegateName(string name) {
         if (name == "Func") { return true; }
         if (name == "Action") { return true; }
-        return FindDelegate(name) != null;
+        int i = 0;
+        while (i < delegates.Count) { if (delegates[i] == name) { return true; } i = i + 1; }
+        return false;
     }
 
     public bool IsTypeParam(string name) {
@@ -87,6 +96,7 @@ class Binder {
         return false;
     }
 
+    // Container generics recognised by the backend.
     public bool IsBuiltinGeneric(string name) {
         if (name == "List") { return true; }
         if (name == "Dictionary") { return true; }
@@ -127,6 +137,8 @@ class Binder {
         return null;
     }
 
+    // Find an extension method `name` (static, marked with a `this` receiver of
+    // type recvTy) anywhere in the program. ownerOut receives its class name.
     public Node FindExtension(string recvTy, string name, List<string> ownerOut) {
         int i = 0;
         while (i < types.Count) {
@@ -148,6 +160,7 @@ class Binder {
         return null;
     }
 
+    // All extension-method overloads named `name` for receiver type `recvTy`.
     public void FindExtensionAll(string recvTy, string name, List<Node> ms, List<string> owners) {
         int i = 0;
         while (i < types.Count) {
@@ -173,6 +186,26 @@ class Binder {
         int i = 0;
         while (i < cls.kids.Count) {
             if (cls.kids[i].kind == AK.CtorDecl()) { return cls.kids[i]; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // First constructor whose parameter count matches argc (overload
+    // resolution by arity, mirroring the C host's find_ctor).
+    public Node FindCtorArity(Node cls, int argc) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node c = cls.kids[i];
+            if (c.kind == AK.CtorDecl()) {
+                int n = 0; int j = 0;
+                while (j < c.kids.Count) {
+                    if (c.kids[j].kind == AK.Param()) { n = n + 1; }
+                    j = j + 1;
+                }
+                if (n == argc) { return c; }
+            }
             i = i + 1;
         }
         return null;

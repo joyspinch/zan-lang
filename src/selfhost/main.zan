@@ -3,7 +3,98 @@ using System.Collections;
 using System.IO;
 namespace Zan;
 
+// Self-hosted compiler driver. Mirrors src/compiler/main.c for the bootstrap
 // subset. Usage:
+//
+//   zanc <output.ll> <input1.zan> [input2.zan ...]
+//
+// All inputs are concatenated into a single translation unit (they share one
+// namespace), lexed, parsed, bound, checked and lowered to LLVM IR text which
+// is written to <output.ll>. clang then compiles that to a native executable.
+//
+// Like the C host, stdlib modules are auto-included by PATH: every
+// `using X.Y.Z;` directive maps to <stdlib_root>/X/Y/Z, resolved to a
+// fixpoint (a pulled-in module may itself `using` another namespace).
+// stdlib_root is discovered relative to the compiler executable
+// (exe_dir/../stdlib, else exe_dir/stdlib).
+//
+// Pull-in is demand-driven (the C host's pi_* filter): user sources seed a
+// live-name set, globbed stdlib files carry only lexed metadata, and a file
+// joins the parse when a live name can reach it -- see the Pi* classes and
+// PiSeedSource/PiCloseOnce below.
+
+// ---- demand-driven stdlib pull-in (port of the C host's pi_* filter) ----
+//
+// The glob-everything scan compiles every *.zan under each `using`-ed
+// namespace even when the program names a handful of types (`using System;`
+// parses 100+ files for one Console call). With the filter, globbed files
+// join the parse only when something live can name them:
+//
+//   - every identifier in the already-included user sources seeds a live
+//     name set (a deliberate over-approximation: namespace segments, member
+//     names and keywords only ever add candidates, never remove them);
+//   - a reached directory is scanned once per file with the real lexer for
+//     metadata only -- top-level declared type names, `using` directives, an
+//     extension-method marker and its own identifier set. No parse, no AST,
+//     so the scan is an order of magnitude cheaper than a parse;
+//   - a file joins the parse when one of its top-level names is live, or
+//     when it hosts extension methods (an extension call names the receiver
+//     and the method, never the host class, so the host file needs its own
+//     trigger);
+//   - including a file makes its identifiers live and reaches its `using`
+//     directories; the closure runs to a fixpoint before any file parses.
+//
+// Observable semantics are preserved: every name user code spells pulls the
+// declaring file exactly as the full glob did, so simple-name collision
+// mangling sees the same declaration pairs, and prune keeps everything
+// transitively referenced. What disappears is the parse of files whose names
+// appear nowhere reachable -- and with it the failure mode where a syntax
+// error in an unreachable stdlib file failed unrelated programs.
+class PiName {
+    public string str;
+    public int flagged;   // live: some parsed source spells this name
+    public int userDecl;  // declared as a top-level type by an input file:
+                          // unqualified mentions in user code resolve to the
+                          // user's own declaration, so they must not pull a
+                          // same-named stdlib file (qualified `Ns.Name`
+                          // mentions still do -- see PiSeedSource)
+    public int nsRoot;    // segment of a known namespace path
+    public PiName next;   // intern chain within the hash bucket
+    public PiName(string s) {
+        str = s; flagged = 0; userDecl = 0; nsRoot = 0; next = null;
+    }
+}
+
+class PiFile {
+    public string path;
+    public List<PiName> top;     // declared type names
+    public List<PiName> idents;  // every identifier
+    public List<string> usings;  // dotted subdirs
+    public string ns;            // declared namespace (probe for subdir pull)
+    public int hasExt;           // hosts an extension method
+    public int hasController;    // hosts a controller / route entity
+    public int included;         // joins the parse
+    public int parsed;           // already appended to the input list
+    public PiFile(string p) {
+        path = p;
+        top = new List<PiName>();
+        idents = new List<PiName>();
+        usings = new List<string>();
+        ns = null;
+        hasExt = 0; hasController = 0; included = 0; parsed = 0;
+    }
+}
+
+class PiDir {
+    public string subdir;        // 'A/B/C' form, as written after `using`
+    public List<PiFile> files;
+    public int reached;          // globbed + metadata-scanned
+    public PiDir next;
+    public PiDir(string s) {
+        subdir = s; files = new List<PiFile>(); reached = 0; next = null;
+    }
+}
+
 class Program {
     static string stdlibRoot;
     static List<string> inclPaths;
@@ -39,57 +130,674 @@ class Program {
 
     static string FindStdlibRoot() {
         string exe = Environment.ExeDir();
-        string up = exe + "\\..\\stdlib";
-        if (Directory.ListNames(up + "\\*") != "") { return up; }
-        string sib = exe + "\\stdlib";
-        if (Directory.ListNames(sib + "\\*") != "") { return sib; }
+        string up = exe + "/../stdlib";
+        if (Directory.ListNames(up + "/*") != "") { return up; }
+        string up2 = exe + "/../../stdlib";
+        if (Directory.ListNames(up2 + "/*") != "") { return up2; }
+        string up3 = exe + "/../../../stdlib";
+        if (Directory.ListNames(up3 + "/*") != "") { return up3; }
+        string sib = exe + "/stdlib";
+        if (Directory.ListNames(sib + "/*") != "") { return sib; }
         return "stdlib";
     }
 
-    static bool ScanUsings(string src) {
-        bool added = false;
-        int n = src.Length;
+    // ---- package stores (the C host's package.c + auto_include_namespace):
+    // a using namespace with no stdlib directory also reaches installed
+    // packages' source trees, scanned in the C host's store order ----
+    static string pkgProjectRoot;   // nearest zan.proj owner of the input
+    static string pkgExeStore;      // toolchain sibling packages/
+    static string pkgGlobalStore;   // ~/.local/share/zan/packages (or XDG)
+
+    static string PkgParentDir(string path) {
+        int last = -1;
         int i = 0;
-        while (i + 6 <= n) {
-            bool atStart = i == 0;
-            if (!atStart) {
-                string pv = src.Substring(i - 1, 1);
-                if (pv == "\n" || pv == "\r" || pv == " " || pv == "\t" || pv == ";") { atStart = true; }
-            }
-            if (atStart && src.Substring(i, 6) == "using ") {
-                int j = i + 6;
-                string ns = "";
-                bool alias = false;
-                while (j < n) {
-                    string c = src.Substring(j, 1);
-                    if (c == ";") { break; }
-                    if (c == "=") { alias = true; break; }
-                    if (c == "\n" || c == "\r") { break; }
-                    if (c != " " && c != "\t") { ns = ns + c; }
-                    j = j + 1;
-                }
-                if (!alias && ns != "" && j < n && src.Substring(j, 1) == ";") {
-                    string rel = "";
-                    int k = 0;
-                    while (k < ns.Length) {
-                        string c2 = ns.Substring(k, 1);
-                        if (c2 == ".") { c2 = "\\"; }
-                        rel = rel + c2;
-                        k = k + 1;
+        while (i < path.Length) {
+            if (path.Substring(i, 1) == "/") { last = i; }
+            i = i + 1;
+        }
+        if (last <= 0) { return "."; }
+        return path.Substring(0, last);
+    }
+
+    // walk up from the input file to the nearest zan.proj manifest,
+    // defaulting to the working directory (resolve_package_project_root)
+    static string ResolvePkgProjectRoot(string input) {
+        string dir = PkgParentDir(input);
+        for (;;) {
+            if (File.Exists(dir + "/zan.proj")) { return dir; }
+            string parent = PkgParentDir(dir);
+            if (parent == dir) { break; }
+            dir = parent;
+        }
+        return ".";
+    }
+
+    static void PiInitPkg(string firstInput) {
+        pkgProjectRoot = ResolvePkgProjectRoot(firstInput);
+        string exe = Environment.ExeDir();
+        pkgExeStore = exe + "/../packages";
+        string base0 = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+        if (base0 == null || base0.Length == 0) {
+            base0 = Environment.GetEnvironmentVariable("HOME");
+        }
+        if (base0 == null || base0.Length == 0) {
+            pkgGlobalStore = "";
+        } else {
+            pkgGlobalStore = base0 + "/.local/share/zan/packages";
+        }
+    }
+
+    // one store: every installed package providing the namespace directory
+    // (<pkg>/src/<ns>, then <pkg>/stdlib/<ns>, then flat <pkg>/<ns>)
+    static void PiGlobStore(PiDir d, string store) {
+        if (store == null || store.Length == 0) { return; }
+        string seg0 = d.subdir;
+        int slash = seg0.IndexOf("/");
+        if (slash > 0) { seg0 = seg0.Substring(0, slash); }
+
+        string ents = Directory.ListNames(store + "/*");
+        int en = ents.Length;
+        int ei = 0;
+        string ecur = "";
+        while (ei <= en) {
+            string c = "";
+            if (ei < en) { c = ents.Substring(ei, 1); }
+            if (c == "\n" || ei == en) {
+                if (ecur.Length > 0 && ecur.Substring(0, 1) != ".") {
+                    string root = store + "/" + ecur;
+                    if (Directory.ListNames(root + "/src/" + seg0 + "/*") != "") {
+                        int f0 = d.files.Count;
+                        PiGlobFiles(d, root + "/src/" + d.subdir);
+                        PiGlobFiles(d, root + "/stdlib/" + d.subdir);
+                        PiGlobFiles(d, root + "/" + d.subdir);
+                        if (d.files.Count == f0 && seg0 == "ZanWeb") {
+                            if (d.subdir == "ZanWeb" || d.subdir == "ZanWeb/Web") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Framework");
+                            } else if (d.subdir == "ZanWeb/Core") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Framework/Core");
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Engine");
+                            } else if (d.subdir == "ZanWeb/Security") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Framework/Security");
+                            } else if (d.subdir == "ZanWeb/Services") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Framework/Services");
+                            } else if (d.subdir == "ZanWeb/Ai") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Framework/Ai");
+                            } else if (d.subdir == "ZanWeb/Model" || d.subdir.IndexOf("ZanWeb/Model/") == 0) {
+                                string sub = d.subdir == "ZanWeb/Model" ? "" : d.subdir.Substring(12);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Model" + sub);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Model" + sub);
+                            } else if (d.subdir == "ZanWeb/Dao" || d.subdir.IndexOf("ZanWeb/Dao/") == 0) {
+                                string sub = d.subdir == "ZanWeb/Dao" ? "" : d.subdir.Substring(10);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Dao" + sub);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Dao" + sub);
+                            } else if (d.subdir == "ZanWeb/Admin" || d.subdir.IndexOf("ZanWeb/Admin/") == 0) {
+                                if (d.subdir == "ZanWeb/Admin") {
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/System");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/Content");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/Monitor");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/Dev");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/Media");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin/Wiki");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Controller/Admin");
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Controller/Admin/Dev");
+                                } else {
+                                    string sub = d.subdir.Substring(12);
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Admin" + sub);
+                                    PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Controller/Admin" + sub);
+                                }
+                            } else if (d.subdir == "ZanWeb/Api" || d.subdir.IndexOf("ZanWeb/Api/") == 0) {
+                                string sub = d.subdir == "ZanWeb/Api" ? "" : d.subdir.Substring(10);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Api" + sub);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Crud/Controller/Api" + sub);
+                            } else if (d.subdir == "ZanWeb/Account" || d.subdir.IndexOf("ZanWeb/Account/") == 0) {
+                                string sub = d.subdir == "ZanWeb/Account" ? "" : d.subdir.Substring(14);
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Account" + sub);
+                            } else if (d.subdir == "ZanWeb/Blog") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Blog");
+                            } else if (d.subdir == "ZanWeb/Users") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Users");
+                            } else if (d.subdir == "ZanWeb/Live") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Live");
+                            } else if (d.subdir == "ZanWeb/Index") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Index");
+                            } else if (d.subdir == "ZanWeb/Health") {
+                                PiGlobFiles(d, root + "/src/ZanWeb/Modules/Sys/Controller/Health");
+                            }
+                        }
                     }
-                    if (AddStdlibDir(rel)) { added = true; }
                 }
-                i = j;
+                ecur = "";
+            } else {
+                ecur = ecur + c;
+            }
+            ei = ei + 1;
+        }
+    }
+
+    // reach the namespace through every package store
+    static void PiGlobPkgs(PiDir d) {
+        PiGlobStore(d, pkgProjectRoot + "/packages");
+        PiGlobStore(d, pkgProjectRoot + "/.zan-packages");
+        PiGlobStore(d, pkgExeStore);
+        PiGlobStore(d, pkgGlobalStore);
+    }
+
+    // ---- demand-driven pull-in state ----
+    static List<PiName> piTable;   // hash buckets, null-filled
+    static PiDir piDirs;
+    static PiDir piDirsTail;
+    static bool piDb;              // pull-in trace: marker file /tmp/zan_pullin_debug
+
+    // Dotted-name reader results (shared by seed + metadata scan).
+    static string piDotName;       // 'A/B/C' form
+    static int piDotStop;          // kind of the token that ended the run
+    static int piDotIdx;           // index of that token
+
+    static int PiHash(string s) {
+        long h = 2166136261;
+        int i = 0;
+        while (i < s.Length) {
+            h = h ^ (int)s[i];
+            h = h * 16777619;
+            h = h & 4294967295;
+            i = i + 1;
+        }
+        return (int)(h & 16383);
+    }
+
+    static PiName PiIntern(string s) {
+        int b = PiHash(s);
+        PiName p = piTable[b];
+        while (p != null) {
+            if (p.str == s) { return p; }
+            p = p.next;
+        }
+        PiName q = new PiName(s);
+        q.next = piTable[b];
+        piTable[b] = q;
+        return q;
+    }
+
+    static void PiInit() {
+        piTable = new List<PiName>();
+        int i = 0;
+        while (i < 16384) { piTable.Add(null); i = i + 1; }
+        piDirs = null;
+        piDirsTail = null;
+    }
+
+    static void PiReach(string subdir) {
+        if (subdir == "") { return; }
+        PiDir d = piDirs;
+        while (d != null) {
+            if (d.subdir == subdir) { return; }
+            d = d.next;
+        }
+        PiDir nd = new PiDir(subdir);
+        if (piDirsTail != null) { piDirsTail.next = nd; } else { piDirs = nd; }
+        piDirsTail = nd;
+    }
+
+    // Record a dotted `using A.B.C;` target (already in 'A/B/C' form) as a
+    // reached directory.
+    static void PiNoteUsing(PiFile f, string subdir) {
+        if (subdir == "") { return; }
+        f.usings.Add(subdir);
+        PiReach(subdir);
+    }
+
+    // Read `A.B.C` after a USING/NAMESPACE token (index i = first candidate).
+    // piDotName gets the 'A/B/C' path, piDotStop/piDotIdx the stop token.
+    static void PiReadDotted(List<Token> toks, int i) {
+        piDotName = "";
+        piDotStop = TK.Eof();
+        piDotIdx = toks.Count;
+        int n = toks.Count;
+        if (i >= n || toks[i].kind != TK.Ident()) {
+            // Mirror the C host's malformed-using quirk (prev = TK_IDENT).
+            piDotStop = TK.Ident();
+            piDotIdx = i;
+            return;
+        }
+        for (;;) {
+            if (piDotName != "") { piDotName = piDotName + "/"; }
+            piDotName = piDotName + toks[i].text;
+            i = i + 1;
+            if (i >= n || toks[i].kind != TK.Dot()) { break; }
+            i = i + 1;
+            if (i >= n || toks[i].kind != TK.Ident()) { break; }
+        }
+        if (i < n) {
+            piDotStop = toks[i].kind;
+            piDotIdx = i;
+        }
+    }
+
+    static void PiMarkSegments(string dotted) {
+        // Every segment of a known namespace path is a namespace root.
+        int start = 0;
+        int i = 0;
+        while (i <= dotted.Length) {
+            if (i == dotted.Length || dotted.Substring(i, 1) == "/") {
+                PiName s = PiIntern(dotted.Substring(start, i - start));
+                s.nsRoot = 1;
+                start = i + 1;
             }
             i = i + 1;
         }
-        return added;
     }
 
-    static bool AddStdlibDir(string rel) {
-        string dir = stdlibRoot + "\\" + rel;
-        string names = Directory.ListNames(dir + "\\*.zan");
-        bool added = false;
+    // Token kinds a declaration's return type can start with (the
+    // method/property-declaration shape check in PiSeedSource).
+    static bool PiTypeishTok(int k) {
+        return k == TK.Ident() || k == TK.String() || k == TK.Bool()
+            || k == TK.Char() || k == TK.Int() || k == TK.Long()
+            || k == TK.Short() || k == TK.Byte() || k == TK.Double()
+            || k == TK.Float() || k == TK.Uint() || k == TK.Ulong()
+            || k == TK.Object() || k == TK.Void();
+    }
+
+    // an extension-form LINQ call (`xs.Where(...)`) carries no type name
+    // from Enumerable.zan -- the member names never match a top-level
+    // declaration -- so the demand engine cannot see it. Recognize the
+    // DISTINCTIVE Enumerable members by shape (`.Name(`) and reach
+    // System/Linq. Ultra-generic names (Count/All/Skip/Contains/First...)
+    // are deliberately absent: user classes declare methods with those
+    // names constantly (router.All(), q.Skip()), and the pull would add
+    // same-name Enumerable overloads that shift resolution (kernel11's
+    // List<string>.Contains rendered 0/1 until Enumerable's exact-fit
+    // non-generic Contains re-typed it bool).
+    static bool PiLinqExtMethod(string s) {
+        return s == "Where" || s == "Select" || s == "SelectMany"
+            || s == "OrderBy" || s == "OrderByDescending"
+            || s == "OrderByStr" || s == "OrderByStrDescending"
+            || s == "OrderByNum" || s == "OrderByNumDescending"
+            || s == "Aggregate" || s == "TakeWhile" || s == "SkipWhile"
+            || s == "Distinct" || s == "DistinctStr"
+            || s == "FirstOrDefault" || s == "LastOrDefault"
+            || s == "SingleOrDefault"
+            || s == "GroupBy" || s == "GroupByStr" || s == "ToList"
+            || s == "SumNum" || s == "MinNum" || s == "MaxNum"
+            || s == "AverageNum"
+            || s == "With" || s == "JoinPairs" || s == "JoinInto"
+            || s == "GroupBySel" || s == "GroupBySelStr";
+    }
+
+    // Lex one globbed file for pull-in metadata: top-level declared type
+    // names (brace depth <= 1 covers the block `namespace X { ... }` spelling
+    // too), `using` directives, extension-method marker and the full
+    // identifier set. A token-level pass cannot be a perfect declaration
+    // parser -- it does not need to be: missed names only ever under-include,
+    // and the prev!=Colon/Comma guard keeps the generic-constraint spelling
+    // (`where T : class`) from minting bogus candidates.
+    static void PiScanFile(PiFile f) {
+        if (!File.Exists(f.path)) {
+            // Unreadable: include it so the real parse reports the error the
+            // full-glob path produced ("cannot read '<path>'").
+            f.included = 1;
+            return;
+        }
+        string src = File.ReadAllText(f.path);
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        int depth = 0;
+        int prev = TK.Eof();
+        string lastId = null;   // previous chain segment (Task.WhenAll mirror)
+        int n = toks.Count;
+        int i = 0;
+        while (i < n) {
+            Token t = toks[i];
+            int k = t.kind;
+            if (k == TK.LBrace()) { depth = depth + 1; prev = k; i = i + 1; continue; }
+            if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } prev = k; i = i + 1; continue; }
+            if (k == TK.Using()) {
+                PiReadDotted(toks, i + 1);
+                if (piDotStop == TK.Semicolon()) { PiNoteUsing(f, piDotName); }
+                prev = piDotStop;
+                i = piDotIdx + 1;
+                continue;
+            }
+            if (k == TK.Namespace() && depth == 0 && f.ns == null) {
+                // declared namespace (subdir form, directly comparable to
+                // PiDir.subdir), for the same-ns subdir pull probe
+                PiReadDotted(toks, i + 1);
+                f.ns = piDotName;
+                prev = piDotStop;
+                i = piDotIdx + 1;
+                continue;
+            }
+            if ((k == TK.Class() || k == TK.Struct() || k == TK.Enum() || k == TK.Interface())
+                    && depth <= 1 && prev != TK.Colon() && prev != TK.Comma()) {
+                if (i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                    f.top.Add(PiIntern(toks[i + 1].text));
+                    prev = TK.Ident();
+                    i = i + 2;
+                    continue;
+                }
+                prev = k;
+                i = i + 1;
+                continue;
+            }
+            if (k == TK.Ident() && t.text == "delegate"
+                    && depth <= 1 && prev != TK.Colon() && prev != TK.Comma()) {
+                // `delegate ReturnType Name<T>(...)` -- the declared name is
+                // the last identifier outside angle brackets before the
+                // parameter list's '('; identifiers inside <...> are the
+                // delegate's own type parameters and must not mint names (a
+                // bare `T` top name would match every generic mention in
+                // every later file).
+                int j = i + 1;
+                int angle = 0;
+                PiName dname = null;
+                int stop = TK.Eof();
+                while (j < n) {
+                    int kk = toks[j].kind;
+                    if (kk == TK.Eof() || kk == TK.Semicolon()) { stop = kk; break; }
+                    if (kk == TK.LParen() && angle == 0) { stop = kk; break; }
+                    if (kk == TK.Less()) { angle = angle + 1; }
+                    else if (kk == TK.Greater()) { if (angle > 0) { angle = angle - 1; } }
+                    else if (kk == TK.Ident() && angle == 0) { dname = PiIntern(toks[j].text); }
+                    j = j + 1;
+                }
+                if (dname != null && stop == TK.LParen()) { f.top.Add(dname); }
+                prev = stop;
+                i = j + 1;
+                continue;
+            }
+            if (k == TK.LBracket() && i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                string aname = toks[i + 1].text;
+                if (aname == "Route" || aname == "HttpGet" || aname == "HttpPost"
+                        || aname == "HttpPut" || aname == "HttpDelete" || aname == "HttpPatch") {
+                    f.hasController = 1;
+                }
+            }
+            if (k == TK.This()) {
+                // Extension-declaration shape: `( this Type name` -- `this`
+                // right after '(' AND followed by a type token. The receiver
+                // is frequently a builtin (`this string s`), where the type
+                // is a KEYWORD token. Expression mentions (`M(this.x)`,
+                // `M(this)`) have '.' / ')' after, and `this` inside an
+                // argument list has a non-'(' before, so they never trigger.
+                if (prev == TK.LParen() && i + 1 < n
+                        && toks[i + 1].kind != TK.Void()
+                        && PiTypeishTok(toks[i + 1].kind)) {
+                    f.hasExt = 1;
+                }
+                prev = k;
+                i = i + 1;
+                continue;
+            }
+            if (k == TK.Ident()) {
+                if (prev == TK.Colon()) {
+                    if (t.text == "Controller" || t.text == "ApiController"
+                            || t.text == "AppController" || t.text == "AdminController") {
+                        f.hasController = 1;
+                    }
+                }
+                // `record Name(...)` lowers to a class; the name is the next
+                // identifier, and 'record' itself is a contextual keyword.
+                if (t.text == "record" && depth <= 1 && i + 1 < n
+                        && toks[i + 1].kind == TK.Ident()) {
+                    f.top.Add(PiIntern(toks[i + 1].text));
+                    prev = TK.Ident();
+                    i = i + 2;
+                    continue;
+                }
+                if (prev != TK.Dot()) { lastId = t.text; }
+                f.idents.Add(PiIntern(t.text));
+                // Mirror the parser's Task.WhenAll/WhenAny -> TaskJoin rewrite
+                // (desugar_task_join): the call survives in this file's own
+                // references as TaskJoin, so the closure must pull its file.
+                if (prev == TK.Dot() && lastId != null && lastId == "Task"
+                        && (t.text == "WhenAll" || t.text == "WhenAny")) {
+                    f.idents.Add(PiIntern("TaskJoin"));
+                }
+            }
+            prev = k;
+            i = i + 1;
+        }
+    }
+
+    // Seed the live-name worklist and the reached-directory set from one
+    // already-included source. Identifiers become live, with one carve-out: a
+    // top-level type declared by an input file shadows its own name for every
+    // unqualified use in user code, so those mentions do not pull a same-named
+    // stdlib file -- otherwise the customary `class App` template drags in the
+    // whole Gui framework via stdlib Gui.App. Qualified (dotted) mentions still
+    // seed, preserving the rare `Gui.App`-style escapes to the shadowed type.
+    //
+    // Pass 1 collects namespace roots -- segments of `using` targets and of
+    // the file's own `namespace` declaration. Pass 2 needs them to tell a
+    // namespace-qualified type (`Gui.App`, `System.String`) apart from a
+    // member access on a variable (`b.Label()`): only chains rooted at a
+    // namespace segment can name a pull-in candidate. Usings conventionally
+    // sit at the top of the file, but a second lex keeps the order irrelevant.
+    static void PiSeedSource(string src) {
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        int n = toks.Count;
+        int pass = 0;
+        while (pass < 2) {
+            int depth = 0;
+            int prev = TK.Eof();
+            string chain = null;   // first segment of the dotted chain
+            int i = 0;
+            while (i < n) {
+                Token t = toks[i];
+                int k = t.kind;
+                if (k == TK.LBrace()) { depth = depth + 1; }
+                else if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } }
+                else if (k == TK.Using()) {
+                    PiReadDotted(toks, i + 1);
+                    if (piDotStop == TK.Semicolon() && piDotName != "") {
+                        PiReach(piDotName);
+                        // every segment is a namespace root for pass 2
+                        PiMarkSegments(piDotName);
+                    }
+                    prev = piDotStop;
+                    chain = null;
+                    i = piDotIdx + 1;
+                    continue;
+                }
+                else if (k == TK.Namespace()) {
+                    // the file's own namespace: its segments are roots too
+                    PiReadDotted(toks, i + 1);
+                    if ((piDotStop == TK.Semicolon() || piDotStop == TK.LBrace())
+                            && piDotName != "") {
+                        PiReach(piDotName);
+                        if (piDotName.IndexOf("ZanWeb/Admin") == 0) {
+                            PiReach("ZanWeb/Admin");
+                        }
+                        PiMarkSegments(piDotName);
+                    }
+                    prev = piDotStop;
+                    chain = null;
+                    i = piDotIdx + 1;
+                    continue;
+                }
+                else if ((k == TK.Class() || k == TK.Struct() || k == TK.Enum() || k == TK.Interface())
+                        && depth <= 1 && prev != TK.Colon() && prev != TK.Comma() && pass == 1) {
+                    if (i + 1 < n && toks[i + 1].kind == TK.Ident()) {
+                        PiName dnm = PiIntern(toks[i + 1].text);
+                        dnm.userDecl = 1;
+                        prev = TK.Ident();
+                        chain = null;
+                        i = i + 2;
+                        continue;
+                    }
+                    // peek failed: the C host breaks out of the switch with
+                    // prev = the keyword itself
+                }
+                else if (k == TK.Ident() && t.text == "delegate") {
+                    if (depth <= 1 && prev != TK.Colon() && prev != TK.Comma() && pass == 1) {
+                        int j = i + 1;
+                        int angle = 0;
+                        string dname = null;
+                        int stop = TK.Eof();
+                        while (j < n) {
+                            int kk = toks[j].kind;
+                            if (kk == TK.Eof() || kk == TK.Semicolon()) { stop = kk; break; }
+                            if (kk == TK.LParen() && angle == 0) { stop = kk; break; }
+                            if (kk == TK.Less()) { angle = angle + 1; }
+                            else if (kk == TK.Greater()) { if (angle > 0) { angle = angle - 1; } }
+                            else if (kk == TK.Ident() && angle == 0) { dname = toks[j].text; }
+                            j = j + 1;
+                        }
+                        if (dname != null && stop == TK.LParen()) {
+                            PiName dnm = PiIntern(dname);
+                            dnm.userDecl = 1;
+                        }
+                        prev = stop;
+                        chain = null;
+                        i = j + 1;
+                        continue;
+                    }
+                    // fall-through in the C host ends the chain (a non-IDENT
+                    // token kind always does)
+                    chain = null;
+                }
+                else if (k == TK.Ident()) {
+                    // `record Name(...)` lowers to a class.
+                    if (t.text == "record" && depth <= 1 && i + 1 < n
+                            && toks[i + 1].kind == TK.Ident() && pass == 1) {
+                        PiName rnm = PiIntern(toks[i + 1].text);
+                        rnm.userDecl = 1;
+                        prev = TK.Ident();
+                        chain = null;
+                        i = i + 2;
+                        continue;
+                    }
+                    if (pass == 1) {
+                        PiName name = PiIntern(t.text);
+                        if (prev != TK.Dot()) {
+                            chain = name.str;
+                            // Mirror the parser's Task.WhenAll/WhenAny ->
+                            // TaskJoin rewrite (desugar_task_join): flag
+                            // TaskJoin when this bare `Task` is followed by
+                            // `.WhenAll`/`.WhenAny`. Kept as a shape-only
+                            // check, independent of whether `Task` sits
+                            // under a namespace root.
+                            if (t.text == "Task" && i + 1 < n && toks[i + 1].kind == TK.Dot()
+                                    && i + 2 < n && toks[i + 2].kind == TK.Ident()
+                                    && (toks[i + 2].text == "WhenAll" || toks[i + 2].text == "WhenAny")) {
+                                PiName tj = PiIntern("TaskJoin");
+                                tj.flagged = 1;
+                            }
+                            // `from X in` query syntax lowers at parse time
+                            // to the Enumerable chain, so none of those
+                            // member names appear in the source text; mirror
+                            // the desugar (reach System/Linq and flag the
+                            // host class) or Enumerable.zan is never pulled.
+                            if (t.text == "from" && i + 2 < n
+                                    && toks[i + 1].kind == TK.Ident()
+                                    && toks[i + 2].kind == TK.In()) {
+                                PiReach("System/Linq");
+                                PiName qen = PiIntern("Enumerable");
+                                qen.flagged = 1;
+                            }
+                            Token nx = null;
+                            if (i + 1 < n) { nx = toks[i + 1]; }
+                            if (depth >= 1 && PiTypeishTok(prev) && nx != null
+                                    && (nx.kind == TK.LParen() || nx.kind == TK.LBrace())) {
+                                // `string Label(` / `string Label {` inside a
+                                // type body: a method or property DECLARATION.
+                                // Method names collide with stdlib type names
+                                // constantly (a widget named Label, a method
+                                // named Label) and a declaration never
+                                // references a stdlib type. `new Label(...)`
+                                // keeps prev==New, so real constructor calls
+                                // still pull.
+                            } else if (name.userDecl == 0) {
+                                name.flagged = 1;
+                            }
+                        } else if (chain != null && PiIntern(chain).nsRoot == 1) {
+                            // `Ns.Segment` under a known namespace root.
+                            name.flagged = 1;
+                        } else if (chain != null && chain == "Task"
+                                && (t.text == "WhenAll" || t.text == "WhenAny")) {
+                            // parser desugars Task.WhenAll/WhenAny to class
+                            // TaskJoin; the seed sees the pre-desugar
+                            // spelling, so mirror the rewrite or TaskJoin.zan
+                            // is never pulled.
+                            PiName tj = PiIntern("TaskJoin");
+                            tj.flagged = 1;
+                        } else if (i + 1 < n && toks[i + 1].kind == TK.LParen()
+                                && PiLinqExtMethod(t.text)) {
+                            // Extension-form LINQ (`nums.Select(n => ...)`
+                            // with no query and no `using System.Linq`):
+                            // the member names never match a top-level
+                            // declaration, so flag by call shape
+                            // (see PiLinqExtMethod) or Enumerable.zan is
+                            // never pulled.
+                            PiReach("System/Linq");
+                            PiName len = PiIntern("Enumerable");
+                            len.flagged = 1;
+                        }
+                    }
+                }
+                // An IDENT may have just started a chain and must survive to
+                // the dot that follows it; every other token ends the chain.
+                if (k != TK.Dot() && k != TK.Ident()) { chain = null; }
+                prev = k;
+                i = i + 1;
+            }
+            pass = pass + 1;
+        }
+    }
+
+    static void PiGlobInto(PiDir d) {
+        string dir = stdlibRoot + "/" + d.subdir;
+        PiGlobFiles(d, dir);
+        // Same-namespace subdirectory descent (the C host's pi_glob_into):
+        // an immediate subdirectory whose .zan files declare the target
+        // directory's own namespace joins the pull (`using Gui;` gathers
+        // Gui/Rendering/*.zan and Gui/Text/*.zan alongside Gui/*.zan, since
+        // those files declare `namespace Gui;`). Namespaced subdirs like
+        // Gui/Widget (ns Gui.Widget) stay out until a `using Gui.Widget;`
+        // reaches them.
+        string ents = Directory.ListNames(dir + "/*");
+        int en = ents.Length;
+        int ei = 0;
+        string ecur = "";
+        while (ei <= en) {
+            string c = "";
+            if (ei < en) { c = ents.Substring(ei, 1); }
+            if (c == "\n" || ei == en) {
+                bool isZan = ecur.Length >= 4
+                    && ecur.Substring(ecur.Length - 4, 4) == ".zan";
+                if (ecur != "" && !isZan) {
+                    PiGlobSameNs(d, dir + "/" + ecur, d.subdir);
+                }
+                ecur = "";
+            } else {
+                ecur = ecur + c;
+            }
+            ei = ei + 1;
+        }
+        // installed packages providing this namespace (project stores,
+        // toolchain sibling, then the global user store; direct glob only,
+        // like the C host's package branch of auto_include_namespace).
+        // Package stores are a FALLBACK: a namespace the stdlib tree already
+        // provides must not also pull its installed-package copy, or every
+        // type in it registers twice and dangling references (the generated
+        // __JsonBind binders) die on "ambiguous type" — the sdk_wechat tests
+        // pull Sdk.Wechat from both the stdlib snapshot and the installed
+        // Zan.Sdk.Wechat when both copies load.
+        if (d.files.Count == 0) { PiGlobPkgs(d); }
+    }
+
+    static bool PiDirHasFile(PiDir d, string path) {
+        int i = 0;
+        while (i < d.files.Count) {
+            if (d.files[i].path == path) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void PiGlobFiles(PiDir d, string dir) {
+        string names = Directory.ListNames(dir + "/*.zan");
         int n = names.Length;
         int i = 0;
         string cur = "";
@@ -98,11 +806,33 @@ class Program {
             if (i < n) { c = names.Substring(i, 1); }
             if (c == "\n" || i == n) {
                 if (cur != "") {
-                    string full = dir + "\\" + cur;
-                    string norm = NormPath(full);
-                    if (!Included(norm)) {
-                        AddInput(full);
-                        added = true;
+                    string path = dir + "/" + cur;
+                    if (!PiDirHasFile(d, path)) { d.files.Add(new PiFile(path)); }
+                }
+                cur = "";
+            } else {
+                cur = cur + c;
+            }
+            i = i + 1;
+        }
+    }
+
+    // Add a subdirectory's .zan files whose declared namespace matches the
+    // pulling directory's own (both are PiReadDotted's subdir form, so the
+    // strings compare directly).
+    static void PiGlobSameNs(PiDir d, string sub, string tns) {
+        string names = Directory.ListNames(sub + "/*.zan");
+        int n = names.Length;
+        int i = 0;
+        string cur = "";
+        while (i <= n) {
+            string c = "";
+            if (i < n) { c = names.Substring(i, 1); }
+            if (c == "\n" || i == n) {
+                if (cur != "") {
+                    string path = sub + "/" + cur;
+                    if (tns != null && PiProbeNs(path) == tns) {
+                        d.files.Add(new PiFile(path));
                     }
                 }
                 cur = "";
@@ -111,11 +841,140 @@ class Program {
             }
             i = i + 1;
         }
-        return added;
+    }
+
+    // Minimal namespace probe: lex the file, return the first depth-0
+    // `namespace X.Y` declaration in subdir form (null when none).
+    static string PiProbeNs(string path) {
+        if (!File.Exists(path)) { return null; }
+        string src = File.ReadAllText(path);
+        Lexer lx = new Lexer(src);
+        List<Token> toks = lx.Run();
+        int depth = 0;
+        int i = 0;
+        int n = toks.Count;
+        while (i < n) {
+            Token t = toks[i];
+            int k = t.kind;
+            if (k == TK.LBrace()) { depth = depth + 1; }
+            else if (k == TK.RBrace()) { if (depth > 0) { depth = depth - 1; } }
+            else if (k == TK.Namespace() && depth == 0) {
+                PiReadDotted(toks, i + 1);
+                return piDotName;
+            }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Glob a reached directory and metadata-scan every file once.
+    static void PiProcessDir(PiDir d) {
+        if (d.reached == 1) { return; }
+        d.reached = 1;
+        PiGlobInto(d);
+        int i = 0;
+        while (i < d.files.Count) {
+            PiScanFile(d.files[i]);
+            i = i + 1;
+        }
+    }
+
+    // One closure round over every reached directory. Newly reached dirs are
+    // appended to the chain as we walk, so the walk covers them in-round.
+    static int PiCloseOnce() {
+        int changed = 0;
+        PiDir d = piDirs;
+        while (d != null) {
+            if (d.reached == 0) { PiProcessDir(d); }
+            int i = 0;
+            while (i < d.files.Count) {
+                PiFile f = d.files[i];
+                if (f.included == 0) {
+                    int hit = f.hasExt == 1 || f.hasController == 1 ? 1 : 0;
+                    string why = f.hasExt == 1 ? "ext" : (f.hasController == 1 ? "controller" : "");
+                    int kk = 0;
+                    while (kk < f.top.Count) {
+                        if (f.top[kk].flagged == 1) { hit = 1; why = f.top[kk].str; break; }
+                        kk = kk + 1;
+                    }
+                    if (hit == 1) {
+                        f.included = 1;
+                        changed = 1;
+                        if (piDb) { Console.WriteLine("[pullin] incl " + f.path + " because " + why); }
+                        int q = 0;
+                        while (q < f.idents.Count) {
+                            f.idents[q].flagged = 1;
+                            q = q + 1;
+                        }
+                        int u = 0;
+                        while (u < f.usings.Count) {
+                            PiReach(f.usings[u]);
+                            u = u + 1;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            d = d.next;
+        }
+        return changed;
+    }
+
+    static void PiAppendIncluded() {
+        PiDir d = piDirs;
+        while (d != null) {
+            int i = 0;
+            while (i < d.files.Count) {
+                PiFile f = d.files[i];
+                if (f.included == 1 && f.parsed == 0) {
+                    f.parsed = 1;
+                    AddInput(f.path);
+                }
+                i = i + 1;
+            }
+            d = d.next;
+        }
+    }
+
+    // Top-level type dedup. User sources sit before the stdlib pull-ins in
+    // inclSrcs, so when user code declares a type the stdlib also has (the
+    // customary `class StringExtensions` extension host), the FIRST
+    // declaration wins and same-named later declarations are dropped. The C
+    // host reaches the same shape by pruning the unreferenced stdlib decl
+    // before the binder's duplicate-type check; without this ngen collects
+    // both decls' synthesized ctors under one symbol name and the link
+    // fails (ld: atomShouldReplaceExisting).
+    static void DedupTopTypes(Node unit) {
+        List<string> seen = new List<string>();
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node d = unit.kids[i];
+            int k = d.kind;
+            bool isType = k == AK.ClassDecl() || k == AK.StructDecl()
+                || k == AK.EnumDecl() || k == AK.DelegateDecl();
+            bool dup = false;
+            if (isType) {
+                int j = 0;
+                while (j < seen.Count) {
+                    if (seen[j] == d.sval) { dup = true; break; }
+                    j = j + 1;
+                }
+            }
+            if (dup) {
+                unit.kids.RemoveAt(i);
+                continue;
+            }
+            if (isType) { seen.Add(d.sval); }
+            i = i + 1;
+        }
     }
 
     static void Main() {
         int argc = Environment.ArgCount();
+        if (argc >= 1 && Environment.ArgAt(0) == "--lsp") {
+            LspServer.Run();
+            return;
+        }
         if (argc < 2) {
             Console.WriteLine("usage: zanc <output.ll> <input.zan> [more.zan ...]");
             throw "zanc: no input files";
@@ -129,16 +988,23 @@ class Program {
                 i = i + 1;
             }
 
+            // stdlib auto-include: demand-driven pull-in (mirrors the C
+            // host). User sources seed the live-name set and the reached
+            // directories; globbed stdlib files join the parse only when a
+            // live name or an extension-method host requires them, to a
+            // fixpoint, before anything parses.
             stdlibRoot = FindStdlibRoot();
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                int fi = 0;
-                while (fi < inclSrcs.Count) {
-                    if (ScanUsings(inclSrcs[fi])) { changed = true; }
-                    fi = fi + 1;
-                }
+            PiInitPkg(Environment.ArgAt(1));
+            piDb = File.Exists("/tmp/zan_pullin_debug");
+            PiInit();
+            int pi = 0;
+            while (pi < inclSrcs.Count) {
+                PiSeedSource(inclSrcs[pi]);
+                pi = pi + 1;
             }
+            while (PiCloseOnce() == 1) { }
+            PiAppendIncluded();
+            if (piDb) { Console.WriteLine("[pullin] total " + inclPaths.Count + " files"); }
 
             string src = "";
             List<int> fileStarts = new List<int>();
@@ -164,10 +1030,73 @@ class Program {
             Diags d = new Diags();
             d.SetFiles(inclPaths, fileStarts);
             Parser ps = new Parser(toks, d);
+            ps.SetFileBounds(fileStarts);
             Node unit = ps.ParseUnit();
+
+            // post-codegen pull-in round (mirrors the C host's second
+            // zan_pullin pass): ORM codegen references stdlib namespaces
+            // through the generated file's own usings, which the pre-parse
+            // pull-in never saw. Seed the demand graph from the generated
+            // text; when the include set grew, rebuild the concatenated
+            // stream and reparse. The second parse regenerates identical
+            // ORM text and pulls in nothing further, so one round settles.
+            if (ps.genDbSrc != null || ps.genAttrSrc != null) {
+                if (ps.genDbSrc != null) { PiSeedSource(ps.genDbSrc); }
+                if (ps.genAttrSrc != null) { PiSeedSource(ps.genAttrSrc); }
+                while (PiCloseOnce() == 1) { }
+                int nsrc = inclSrcs.Count;
+                PiAppendIncluded();
+                if (inclSrcs.Count > nsrc) {
+                    src = "";
+                    fileStarts = new List<int>();
+                    int nl2 = 1;
+                    int si2 = 0;
+                    while (si2 < inclSrcs.Count) {
+                        fileStarts.Add(nl2);
+                        string body = inclSrcs[si2];
+                        int nlc2 = 0;
+                        int ci2 = 0;
+                        while (ci2 < body.Length) {
+                            if ((int)body[ci2] == 10) { nlc2 = nlc2 + 1; }
+                            ci2 = ci2 + 1;
+                        }
+                        nl2 = nl2 + nlc2 + 1;
+                        src = src + body + "\n";
+                        si2 = si2 + 1;
+                    }
+                    toks = new Lexer(src).Run();
+                    d.SetFiles(inclPaths, fileStarts);
+                    ps = new Parser(toks, d);
+                    ps.SetFileBounds(fileStarts);
+                    unit = ps.ParseUnit();
+                }
+            }
+
+            DedupTopTypes(unit);
 
             Binder b = new Binder();
             b.Bind(unit);
+
+            // native backend: `zanc out.o input.zan` emits arm64 object code
+            // directly (kernel subset, see ngen.zan); `zanc out.obj ...`
+            // selects the PE-COFF arm64 writer (ngen_coff.zan, Windows target);
+            // `zanc out.wasm ...` selects the WebAssembly binary writer (ngen_wasm.zan)
+            bool wasmOut = outPath.Length >= 5 && outPath.Substring(outPath.Length - 5, 5) == ".wasm";
+            bool coffOut = outPath.Length >= 4 && outPath.Substring(outPath.Length - 4, 4) == ".obj";
+            if (wasmOut || coffOut || (outPath.Length >= 2 && outPath.Substring(outPath.Length - 2, 2) == ".o")) {
+                Ngen.StdlibRoot = stdlibRoot;
+                Ngen ng = new Ngen(b, d, inclPaths[0]);
+                if (wasmOut) { ng.SetTargetWasm(); }
+                else if (coffOut) { ng.SetTargetCoff(); }
+                List<int> obj = ng.Gen(unit);
+                d.Report(src, 0);
+                if (d.HasErrors()) {
+                    d.Summary();
+                    throw "zanc: compilation failed";
+                }
+                Nio.WriteBytes(outPath, obj);
+                return;
+            }
 
             Checker chk = new Checker(b, d);
             chk.Check(unit);

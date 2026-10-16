@@ -1,0 +1,186 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// Binding<T> assignment sugar for Ngen (mirrors the C host's
+// emit_binding_value): assigning a non-Binding expression to a
+// Binding<T>-typed slot wraps it in a fresh Binding object instead of
+// storing a raw T where the slot's readers expect {target, getter, setter,
+// live, constVal, version}. A field lvalue on the right (`input.data =
+// user.name`, including a bare own-class field name meaning `this.field`)
+// builds a LIVE binding around a synthesized accessor pair; any other
+// expression builds a const binding holding its value. `b = null` and a
+// Binding-typed RHS fall through to the plain store (clear / share).
+//
+// The accessor delegates reuse the delegate slice's invoke ABI (x0=env,
+// x1..=arguments): one shared thunk per (field offset, direction), keyed by
+// offset alone since the code only reads that offset off the target.
+partial class Ngen {
+    List<string> bindAccKeys;   // "<off>#g" / "<off>#s" -> shared thunk id
+    List<int> bindAccIds;
+    List<int> bindAccOffs;      // thunk id -> target field offset
+
+    void InitBindingNg() {
+        if (bindAccKeys != null) { return; }
+        bindAccKeys = new List<string>();
+        bindAccIds = new List<int>();
+        bindAccOffs = new List<int>();
+    }
+
+    bool IsBindingTyNg(string ty) {
+        return ty != null && ty.IndexOf("Binding<") == 0;
+    }
+
+    string BindingElemTyNg(string ty) {
+        int p = ty.IndexOf("<");
+        return ty.Substring(p + 1, ty.Length - p - 2);
+    }
+
+    // Does this expression materialize an object that dies at statement end?
+    // Trimmed mirror of the C host's expr_yields_owned_rc_value, covering the
+    // forms our codegen lowers as fresh results: call/new/await results,
+    // chains off them, custom-getter property reads (get_Prop calls) and
+    // op_index element reads. Bare locals / this / real fields / static
+    // reads are borrowed and stay live-bindable.
+    bool YieldsOwnedTempNg(Node e) {
+        if (e == null) { return false; }
+        if (e.kind == AK.Call() || e.kind == AK.NewExpr()
+                || e.kind == AK.AwaitExpr() || e.kind == AK.CallInit()) { return true; }
+        if (e.kind == AK.Conditional()) {
+            return YieldsOwnedTempNg(e.b) || YieldsOwnedTempNg(e.c);
+        }
+        if (e.kind == AK.Index()) {
+            if (YieldsOwnedTempNg(e.a)) { return true; }
+            string oc = ExprCls(e.a);
+            return oc != null && OpIndexMethod(oc) != null;
+        }
+        if (e.kind == AK.MemberAccess()) {
+            if (YieldsOwnedTempNg(e.a)) { return true; }
+            if (FieldOf(e) != null) { return false; }    // field/auto-prop slot
+            // static-qualified reads (ClsName.Prop) are shared globals
+            if (e.a != null && e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0
+                    && FindClass(e.a.sval) != null) { return false; }
+            string gc = ExprCls(e.a);
+            return gc != null && AccessorInChain(gc, "get_" + e.sval) != null;
+        }
+        return false;
+    }
+
+    // shared accessor thunk id for one (field offset, direction); registering
+    // also guarantees the delegate intern runtime gets emitted
+    int InternBindAcc(int off, bool isSet) {
+        InitBindingNg();
+        InitDelegateNg();
+        string key = off + (isSet ? "#s" : "#g");
+        int i = 0;
+        while (i < bindAccKeys.Count) {
+            if (bindAccKeys[i] == key) { return bindAccIds[i]; }
+            i = i + 1;
+        }
+        bindAccKeys.Add(key); bindAccIds.Add(bindAccKeys.Count - 1);
+        bindAccOffs.Add(off);
+        return bindAccKeys.Count - 1;
+    }
+
+    // Emit a fresh Binding object into x0 for `rhs` when slot type `slotTy`
+    // is a Binding instantiation and the sugar applies; false leaves the
+    // slot's plain-store path in charge.
+    bool TryGenBindingValue(Node rhs, string slotTy) {
+        if (!IsBindingTyNg(slotTy) || rhs == null) { return false; }
+        if (rhs.kind == AK.NullLit()) { return false; }          // b = null
+        if (IsBindingTyNg(StaticTyOf(rhs))) { return false; }    // share, don't wrap
+        // A bare field name inside its own class means `this.<field>`, so it
+        // binds live like any other field lvalue.
+        Node rhs2 = rhs;
+        if (rhs.kind == AK.Ident() && LocalIdx(rhs.sval) < 0) {
+            Fld own = CurField(rhs.sval);
+            if (own != null) {
+                Node ma = new Node(AK.MemberAccess());
+                ma.a = new Node(AK.ThisExpr());
+                ma.sval = rhs.sval;
+                rhs2 = ma;
+            }
+        }
+        // live case: an instance field lvalue whose declared type matches T
+        Fld ff = null;
+        if (rhs2.kind == AK.MemberAccess()) {
+            Fld mf = FieldOf(rhs2);
+            if (mf != null && BindingElemTyNg(slotTy) == mf.ty) { ff = mf; }
+        }
+        // A310: the live target is a NON-OWNING reference (cycle avoidance),
+        // so a receiver that yields an owned temp (`f().name`) would dangle
+        // once the statement ends -- divert to the const path and snapshot
+        // the field value instead (mirrors emit_binding_value's
+        // owned-receiver check). A held root (local, this, field, element of
+        // a held container) owns nothing here and keeps live bindings.
+        if (ff != null && rhs2.a != null && ExprCls(rhs2.a) != null
+                && YieldsOwnedTempNg(rhs2.a)) {
+            ff = null;
+        }
+        Cls bc = FindClass("Binding");
+        if (bc == null) { return false; }
+        int offTgt = FieldOff("Binding", "target");
+        int offGet = FieldOff("Binding", "getter");
+        int offSet = FieldOff("Binding", "setter");
+        int offLive = FieldOff("Binding", "live");
+        int offConst = FieldOff("Binding", "constVal");
+        if (offTgt < 0 || offGet < 0 || offSet < 0 || offLive < 0 || offConst < 0) { return false; }
+        // allocate the zero-filled binding object with the class's real
+        // layout (fields may sit behind a vtable slot)
+        LoadImm(0, bc.size + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        RtLdur(1, 0, -8);
+        E4((int)(0xD2C00000 | (((long)bc.site) << 5) | 2));
+        E4(0xAA020021);
+        RtStur(1, 0, -8);
+        if (ff == null) {
+            PushV(0);                          // push obj
+            GenExpr(rhs2);                           // x0 = value snapshot
+            PopV(1);                          // pop obj -> x1
+            StrU(0, 1, offConst);                    // constVal
+            MovRR(0, 1);                             // result = obj
+            return true;                             // live stays 0
+        }
+        PushV(0);                              // push obj
+        GenExpr(rhs2.a);                             // x0 = target (non-owning)
+        PopV(1);                              // pop obj -> x1
+        StrU(0, 1, offTgt);                          // target
+        // obj stays stack-resident across the intern calls: _zan_dlg_intern
+        // is an ordinary callee and x1 is not preserved
+        PushV(1);                              // push obj
+        LoadSymRef("_zan_bindacc_" + InternBindAcc(ff.off, false), 0);
+        LoadImm(1, 0);
+        LoadImm(2, 0);
+        BLInternal("_zan_dlg_intern");
+        PopV(1);                              // pop obj -> x1
+        StrU(0, 1, offGet);                          // getter delegate
+        PushV(1);                              // push obj
+        LoadSymRef("_zan_bindacc_" + InternBindAcc(ff.off, true), 0);
+        LoadImm(1, 0);
+        LoadImm(2, 0);
+        BLInternal("_zan_dlg_intern");
+        PopV(1);                              // pop obj -> x1
+        StrU(0, 1, offSet);                          // setter delegate
+        LoadImm(0, 1);
+        StrU(0, 1, offLive);                         // live = 1
+        MovRR(0, 1);                                 // result = obj
+        return true;
+    }
+
+    // accessor thunks collected during emission: x0=env, x1=target,
+    // x2=value; the thunk just moves the field word
+    void EmitBindingAccessors() {
+        if (bindAccKeys == null) { return; }
+        int id = 0;
+        while (id < bindAccKeys.Count) {
+            int off = bindAccOffs[id];
+            syms.Add(new Sym("_zan_bindacc_" + id, FnPad()));
+            RtPrologue();
+            if (bindAccKeys[id].Substring(bindAccKeys[id].Length - 1, 1) == "s") { StrU(2, 1, off); }
+            else { LdrU(0, 1, off); }
+            RtEpilogue();
+            id = id + 1;
+        }
+    }
+}

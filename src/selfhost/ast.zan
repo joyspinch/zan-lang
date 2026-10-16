@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 namespace Zan;
 
+// AST node kinds. Mirrors src/compiler/ast.h. Plain int constants.
 class AK {
     static int CompUnit() { return 1; }
     static int UsingDecl() { return 2; }
@@ -61,8 +62,18 @@ class AK {
     static int LabelStmt() { return 58; }
     static int GotoStmt() { return 59; }
     static int OutArg() { return 60; }
+    static int AsExpr() { return 61; }
+    static int WithExpr() { return 62; }
+    static int DoWhileStmt() { return 63; }
+    static int LockStmt() { return 64; }
+    static int MonitorExitStmt() { return 65; }
+    // 工厂调用延续初始化器 `Panel.Row() { X = v, Items = { a } }`：a 是
+    // 刚解析完的调用，kids 是成员写（oracle parse_postfix 的 call_init）
+    static int CallInit() { return 66; }
+    static int BaseExpr() { return 67; }
 }
 
+// Modifier bit flags (subset of ast.h MOD_*).
 class MOD {
     static int Public() { return 1; }
     static int Private() { return 2; }
@@ -78,29 +89,64 @@ class MOD {
     static int Partial() { return 4096; }
     static int Event() { return 8192; }
     static int Unsafe() { return 16384; }
-    static int JsonIgnore() { return 32768; }  // [JsonIgnore] field attribute
+    static int JsonIgnore() { return 32768; } // [JsonIgnore] field attribute
+    static int Variadic() { return 65536; }   // [DllImport(Variadic = true)] extern
+    static int Iface() { return 262144; }     // parser marker: declared via `interface` (reflection kind)
+    static int ThreadEntry() { return 524288; } // [ThreadEntry]: pthread-safe entry (x19-x28 saves)
+    static int AtomicCas() { return 1048576; }   // [AtomicCas]: body -> casal (witnessed compare-exchange)
+    static int StaticAddr() { return 2097152; }  // [StaticAddr("fld")]: body -> adrp+add of the data global
+    static int AtomicLoad() { return 4194304; }  // [AtomicLoad]: body -> ldar (seq_cst load)
+    static int AtomicStore() { return 8388608; } // [AtomicStore]: body -> stlr (seq_cst store)
 }
 
+// Tagged AST node. A single class with generic child slots (a..d), a child
+// list (kids), a type slot, and scalar payloads. This uniform representation
+// keeps the host requirements to what gen0 already supports (no inheritance
+// or virtual dispatch).
 class Node {
     public int kind;
-    public int op;  // operator token kind for Binary/Unary/Assignment
-    public long ival;  // int/char/bool literal value
-    public string sval;  // name / string literal / member name
+    public int op;        // operator token kind for Binary/Unary/Assignment
+    public long ival;     // int/char/bool literal value
+    public int suffix;    // int-literal suffix (0=none 1=L 2=U 3=UL); radix
+                          // folds into bit 4 (16 = hex, 8 = binary)
+    public string sval;   // name / string literal / member name
     public string sval2;  // secondary name (e.g. base class)
     public Node a;
     public Node b;
     public Node c;
     public Node d;
-    public Node type;  // associated type-ref (var/field/param/method/cast/new)
+    public Node type;     // associated type-ref (var/field/param/method/cast/new)
     public List<Node> kids;
     public int mods;
     public int line;
     public int col;
+    public bool layoutExplicit;
+    public int fieldOffset;
+    public string nsName;        // declaring file's namespace (nsresolve stamp)
+    public List<string> nsUsings; // declaring file's using directives
+    // dbgen attribute surface: [Table] presence + explicit table name on a
+    // class; [Column(...)] flags on a field, encoded
+    // "colName|isPrimary|isIdentity|isNullable|strLen" with -1 for unset
+    // bools (empty string when the field carries no [Column]).
+    public string attrTable;
+    public bool attrHasTable;
+    public string attrStaticAddr; // [StaticAddr("fld")] on a method: data-global symbol to take the address of
+    public List<string> attrIndexes; // "name|fields|unique" per [Index]
+    public string attrCol;
+    // attrgen attribute surface ([Route]/[HttpGet]/[Tx]/[Opt]/[Custom]...),
+    // packed "route\nverb\ndesc\nflags\nopts\nmeta" ("\n"-separated fields,
+    // ";"-separated list items, meta records "kind:name=value"); empty when
+    // the declaration carries no web attributes
+    public string attrWeb;
 
     public Node(int k) {
         kind = k; op = 0; ival = 0; sval = ""; sval2 = "";
         a = null; b = null; c = null; d = null; type = null;
         kids = new List<Node>(); mods = 0; line = 0; col = 0;
+        layoutExplicit = false; fieldOffset = -1;
+        nsName = ""; nsUsings = null;
+        attrTable = ""; attrHasTable = false; attrIndexes = null; attrCol = "";
+        attrWeb = "";
     }
 
     public void Add(Node n) { kids.Add(n); }

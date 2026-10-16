@@ -1,0 +1,1828 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// M2/M3: reflection for Ngen -- typeof(T) / obj.GetType() records and the
+// member surface the oracle lowers (src/compiler/irgen_reflect.c). The record
+// itself IS a managed string holding the type's display name, with the
+// reflection slots in FRONT of it (the same shape gen0 emits, so a TypeInfo is
+// printable, concatenable and comparable with no conversion):
+//
+//     offset from the TypeInfo value
+//     -88   methods*      -80  method_count
+//     -72   ctors*        -64  ctor_count
+//     -56   elem rec      -48  targs* (null-terminated rec array)
+//     -40   fields*       -32  field_count
+//     -24   kind          -16  string rc sentinel    -8  string tag|length
+//       0   NUL-terminated display name
+//
+// Field record 32B { name*, type*, kind, value }; method/ctor record 56B
+// { name*, ret*, retkind, param_count, param_types*, thunk*, flags }.
+// Records are built lazily by generated _refl_build_<i> functions (the object
+// writer cannot emit initialized pointer data), cached in a per-record __DATA
+// slot; field kind codes and method flags mirror the oracle's ZAN_REFL_*.
+//
+// `obj.GetType()` resolves the CONCRETE type at runtime from the class site
+// `new` stamps into the upper half of obj-8; a header word that is not a
+// class site (string tag, array magic, rectangular rank) falls back to the
+// `object` record. On a statically class-typed receiver the instance surface
+// (GetField*/SetField*/Invoke*/Has*) lowers to ordinary calls and field
+// accesses; the emitted _refl_*_rt helpers serve object-typed receivers and
+// runtime names by scanning the receiver's concrete record.
+
+partial class Ngen {
+
+    List<string> reflKeys;      // display name per record ("Dog", "int[]")
+    List<string> reflClsName;   // backing open class/enum name (null: shape)
+    List<int> reflKind;         // record kind (class 1 struct 2 enum 3
+                                // interface 4 primitive 6-other array 7
+                                // nullable 8 delegate 9)
+    List<int> reflElem;         // elem record index (-1: none)
+    List<int> reflTargOff;      // start in reflTargFlat per record
+    List<int> reflTargCnt;      // targ count per record (the flat list is
+                                // shared: a window computed as flat.Count -
+                                // off would swallow later records' targs)
+    List<int> reflTargFlat;     // targ record indexes
+    List<string> reflThunkKeys; // thunk dedup keys
+    List<string> reflThunkSyms; // emitted thunk symbols
+    int reflThunkSeq;
+    int[] reflKindStrIdx;       // interned kind names 0..9
+    int reflSymObjType;         // 1 once emitted
+    int reflUsed;               // some reflection surface was lowered
+    int reflSymPacc;
+    int reflSymInvokeRt;
+    int reflSymGetfRt;
+    int reflSymSetfRt;
+    int reflSymHasfRt;
+    int reflSymHasmRt;
+    int reflSymCnewRt;
+
+    // ---- markers and small queries ---------------------------------------
+
+    bool IsTypeofNode(Node e) {
+        // typeof(T) folds to a StringLit display name; the parsed type node
+        // rides in `b` (nothing else populates b on a StringLit)
+        return e != null && e.kind == AK.StringLit() && e.b != null;
+    }
+
+    bool IsReflPrimitive(string t) {
+        return t == "int" || t == "uint" || t == "long" || t == "ulong"
+            || t == "short" || t == "ushort" || t == "byte" || t == "sbyte"
+            || t == "char" || t == "bool" || t == "string" || t == "double"
+            || t == "float" || t == "object" || t == "nint" || t == "nuint";
+    }
+
+    // field-slot kind code from a type name (ZAN_REFL_FK_* shape)
+    int ReflFkOf(string t) {
+        if (t == "bool") { return 1; }
+        if (t == "sbyte") { return 2; }
+        if (t == "byte") { return 3; }
+        if (t == "short") { return 4; }
+        if (t == "ushort") { return 5; }
+        if (t == "int" || t == "uint") { return 6; }
+        if (t == "long" || t == "ulong" || t == "nint") { return 8; }
+        if (t == "char") { return 10; }
+        if (FindEnum(t) >= 0) { return 11; }
+        if (t == "float") { return 12; }
+        if (t == "double") { return 13; }
+        if (t == "string") { return 14; }
+        if (FindClass(t) != null) { return 15; }
+        return 16;
+    }
+
+    int ReflFindKey(string disp) {
+        if (reflKeys == null) { return -1; }
+        int i = 0;
+        while (i < reflKeys.Count) { if (reflKeys[i] == disp) { return i; } i = i + 1; }
+        return -1;
+    }
+
+    // open generic / nullable spelling down to the declared name
+    string ReflBaseName(string disp) {
+        string s = disp;
+        if (s.Length > 0 && s.Substring(s.Length - 1, 1) == "?") {
+            s = s.Substring(0, s.Length - 1);
+        }
+        int lt = s.IndexOf("<");
+        if (lt > 0 && s.Substring(s.Length - 1, 1) == ">") { s = s.Substring(0, lt); }
+        return s;
+    }
+
+    int ReflRecIdx(string disp, string clsName, int kind) {
+        if (reflKeys == null) {
+            reflKeys = new List<string>();
+            reflClsName = new List<string>();
+            reflKind = new List<int>();
+            reflElem = new List<int>();
+            reflTargOff = new List<int>();
+            reflTargCnt = new List<int>();
+            reflTargFlat = new List<int>();
+            reflThunkKeys = new List<string>();
+            reflThunkSyms = new List<string>();
+            reflThunkSeq = 0;
+            reflKindStrIdx = null;
+        }
+        int k = ReflFindKey(disp);
+        if (k >= 0) { return k; }
+        int idx = reflKeys.Count;
+        reflKeys.Add(disp);
+        reflClsName.Add(clsName);
+        reflKind.Add(kind);
+        reflElem.Add(-1);
+        reflTargOff.Add(reflTargFlat.Count);
+        reflTargCnt.Add(0);
+        dglbs.Add(new DGlob("refl." + idx, 8, dataLen));
+        dataLen = dataLen + 8;
+        return idx;
+    }
+
+    // strip one array layer ("int[]" -> "int", "int[,]" -> "int")
+    Node ReflStripArr(Node ty) {
+        Node n = new Node(AK.TypeRef());
+        n.sval = ty.sval;
+        n.ival = ty.ival - 1;
+        n.op = ty.op;
+        n.sval2 = null;
+        if (n.ival > 0) { n.sval2 = ty.sval2; }
+        if (ty.kids != null) {
+            int i = 0;
+            while (i < ty.kids.Count) { n.Add(ty.kids[i]); i = i + 1; }
+        }
+        return n;
+    }
+
+    // strip the nullable marker ("int?" -> "int")
+    Node ReflStripNul(Node ty) {
+        Node n = new Node(AK.TypeRef());
+        n.sval = ty.sval;
+        n.ival = ty.ival;
+        n.op = 0;
+        n.sval2 = ty.sval2;
+        if (ty.kids != null) {
+            int i = 0;
+            while (i < ty.kids.Count) { n.Add(ty.kids[i]); i = i + 1; }
+        }
+        return n;
+    }
+
+    // classify a type node: register the record and its elem / targs
+    int ReflEnsureTyRec(Node ty) {
+        if (ty == null) { return ReflRecIdx("object", null, 1); }
+        string disp = TypeFullName(ty);
+        int k = ReflFindKey(disp);
+        if (k >= 0) { return k; }
+        int idx;
+        if (ty.ival > 0) {
+            idx = ReflRecIdx(disp, null, 7);
+            reflElem[idx] = ReflEnsureTyRec(ReflStripArr(ty));
+            return idx;
+        }
+        if (ty.op == 1 && disp.Length > 0 && disp.Substring(disp.Length - 1, 1) == "?") {
+            idx = ReflRecIdx(disp, null, 8);
+            reflElem[idx] = ReflEnsureTyRec(ReflStripNul(ty));
+            return idx;
+        }
+        string base_ = ReflBaseName(disp);
+        if (FindEnum(base_) >= 0) { return ReflRecIdx(disp, base_, 3); }
+        Cls c = FindClass(base_);
+        if (c != null) {
+            int kind = c.isIface == 1 ? 4 : (c.isStruct == 1 ? 2 : 1);
+            idx = ReflRecIdx(disp, c.name, kind);
+            if (ty.kids != null && ty.kids.Count > 0) {
+                reflTargCnt[idx] = ty.kids.Count;
+                int i = 0;
+                while (i < ty.kids.Count) {
+                    reflTargFlat.Add(ReflEnsureTyRec(ty.kids[i]));
+                    i = i + 1;
+                }
+            }
+            return idx;
+        }
+        if (IsDelegateTyNg(disp)) { return ReflRecIdx(disp, null, 9); }
+        if (IsReflPrimitive(base_)) { return ReflRecIdx(disp, null, 5); }
+        return ReflRecIdx(disp, null, 6);
+    }
+
+    // a record for a declared class (obj.GetType() can reach any of them
+    // through the site stamp); the `object` fallback registers on demand
+    int ReflRecForClass(Cls c) {
+        int k = ReflFindKey(c.name);
+        if (k >= 0) { return k; }
+        int kind = c.isIface == 1 ? 4 : (c.isStruct == 1 ? 2 : 1);
+        return ReflRecIdx(c.name, c.name, kind);
+    }
+
+    // ---- type model (StaticTyOf / CallRetTy hooks) ------------------------
+
+    // the reflection member a TypeInfo receiver names, or null
+    string ReflMemberTy(Node e) {
+        if (e == null || e.a == null) { return null; }
+        string n = e.sval;
+        if (n == "Name" || n == "Kind" || n == "GetFieldName" || n == "GetFieldType"
+                || n == "GetMethodName" || n == "GetMethodReturnType"
+                || n == "GetMethodParamType" || n == "GetCtorParamType") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "string";
+        }
+        if (n == "FieldCount" || n == "MethodCount" || n == "ConstructorCount"
+                || n == "GetMethodParamCount" || n == "GetCtorParamCount"
+                || n == "TypeArgCount") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "int";
+        }
+        if (n == "GetMemberValue") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "long";
+        }
+        if (n == "HasField" || n == "HasMethod" || n == "IsMethodStatic"
+                || n == "IsArray" || n == "IsNullable" || n == "IsInterface"
+                || n == "IsGeneric") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "bool";
+        }
+        if (n == "ElementType" || n == "GetTypeArg") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "TypeInfo";
+        }
+        if (n == "CreateInstance") {
+            if (!IsTypeInfoExpr(e.a)) { return null; }
+            return "object";
+        }
+        return null;
+    }
+
+    string ReflInstRetTyOf(string n) {
+        if (n == "GetType") { return "TypeInfo"; }
+        if (n == "HasField" || n == "HasMethod" || n == "SetFieldInt" || n == "SetFieldLong"
+                || n == "SetFieldDouble" || n == "SetFieldString" || n == "SetFieldBool"
+                || n == "Invoke") { return "bool"; }
+        if (n == "GetFieldInt" || n == "InvokeInt") { return "int"; }
+        if (n == "GetFieldLong" || n == "InvokeLong") { return "long"; }
+        if (n == "GetFieldDouble" || n == "InvokeDouble") { return "double"; }
+        if (n == "GetFieldString" || n == "InvokeString") { return "string"; }
+        if (n == "GetFieldBool") { return "bool"; }
+        return null;
+    }
+
+    // the reflection result of an instance-surface call, or null
+    string ReflCallRetTy(Node e) {
+        if (e == null || e.a == null || e.a.kind != AK.MemberAccess()) { return null; }
+        string rty = ReflInstRetTyOf(e.a.sval);
+        if (rty == null) { return ReflMemberTy(e.a); }
+        // a TypeInfo receiver answers through the member table (HasField
+        // and HasMethod exist on both surfaces, with different results)
+        if (IsTypeInfoExpr(e.a.a)) { return ReflMemberTy(e.a); }
+        if (!ReflReceiverAllowed(e.a.a)) { return null; }
+        string rc = ExprCls(e.a.a);
+        if (rc != null && ClassHasMemberUp(rc, e.a.sval)) { return null; }
+        return rty;
+    }
+
+    bool IsTypeInfoExpr(Node e) {
+        if (e == null) { return false; }
+        if (IsTypeofNode(e)) { return true; }
+        if (e.kind == AK.Ident()) { return NamedSlotTy(e.sval) == "TypeInfo"; }
+        if (e.kind == AK.Call()) { return ReflCallRetTy(e) == "TypeInfo"; }
+        if (e.kind == AK.MemberAccess()) { return ReflMemberTy(e) == "TypeInfo"; }
+        return false;
+    }
+
+    // builtin collections lower through their own tables, never through the
+    // records (the oracle's zan_refl_is_reflectable)
+    bool ReflReceiverAllowed(Node recv) {
+        if (recv == null) { return false; }
+        string rc = ExprCls(recv);
+        if (rc == "List" || rc == "Dict" || rc == "StringBuilder" || rc == "Span"
+                || rc == "Task" || rc == "Grouping") { return false; }
+        string rty = StaticTyOf(recv);
+        if (rty == "TypeInfo" || IsTypeofNode(recv)) { return false; }
+        if (IsDelegateTyNg(rty)) { return false; }
+        return rc != null || rty == "object";
+    }
+
+    // full-chain member existence: a user declaration of the name (method,
+    // accessor or field) disables the reflection surface for it
+    bool ClassHasMemberUp(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            Cls c = FindClass(cur);
+            if (c == null) { return false; }
+            List<int> ms = MethCandsClsName(c.name, name);
+            if (ms != null && ms.Count > 0) { return true; }
+            if (FindField(c, name) != null) { return true; }
+            if (MethCandsClsName(c.name, "get_" + name) != null) { return true; }
+            if (MethCandsClsName(c.name, "set_" + name) != null) { return true; }
+            cur = c.baseName;
+        }
+        return false;
+    }
+
+    // any method (instance or static) of that name, up the chain
+    bool ReflMethodExistsUp(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            Cls c = FindClass(cur);
+            if (c == null) { return false; }
+            List<int> ms = MethCandsClsName(c.name, name);
+            if (ms != null && ms.Count > 0) { return true; }
+            cur = c.baseName;
+        }
+        return false;
+    }
+
+    Fld ReflFindFieldUp(string cls, string name) {
+        string cur = cls;
+        while (cur != null) {
+            Cls c = FindClass(cur);
+            if (c == null) { return null; }
+            MergeBaseFields(c);
+            Fld f = FindField(c, name);
+            if (f != null) { return f; }
+            cur = c.baseName;
+        }
+        return null;
+    }
+
+    // ---- code emission hooks ----------------------------------------------
+
+    // typeof(T): build-or-load the record (x0 = rec)
+    void ReflLoadTypeofRec(Node e) {
+        int idx = ReflEnsureTyRec(e.b);
+        reflUsed = 1;
+        BLInternal("_refl_build_" + idx);
+    }
+
+    // property-style reads on a TypeInfo (x0 = value)
+    bool GenReflPropRead(Node mem) {
+        if (!IsTypeInfoExpr(mem.a)) { return false; }
+        reflUsed = 1;
+        string n = mem.sval;
+        if (n == "Name") { GenExpr(mem.a); return true; }        // the record IS the name
+        if (n == "Kind") { GenExpr(mem.a); ReflKindStrOut(); return true; }
+        if (n == "FieldCount") { GenExpr(mem.a); RtLdur(0, 0, -32); return true; }
+        if (n == "MethodCount") { GenExpr(mem.a); RtLdur(0, 0, -80); return true; }
+        if (n == "ConstructorCount") { GenExpr(mem.a); RtLdur(0, 0, -64); return true; }
+        if (n == "IsArray") { ReflKindTest(mem, 7); return true; }
+        if (n == "IsNullable") { ReflKindTest(mem, 8); return true; }
+        if (n == "IsInterface") { ReflKindTest(mem, 4); return true; }
+        if (n == "IsGeneric") {
+            GenExpr(mem.a);
+            RtLdur(1, 0, -48);
+            int no = NL();
+            int done = NL();
+            CbzReg(1, no);
+            LoadImm(0, 1);
+            EmitB(done);
+            Mark(no);
+            LoadImm(0, 0);
+            Mark(done);
+            return true;
+        }
+        if (n == "TypeArgCount") { GenExpr(mem.a); ReflCountTargsOut(); return true; }
+        if (n == "ElementType") {
+            // null-safe like the oracle: a shapeless type answers itself
+            GenExpr(mem.a);
+            PushV(0);                          // push rec
+            RtLdur(0, 0, -56);
+            int self = NL();
+            int end = NL();
+            CbzReg(0, self);
+            EmitB(end);
+            Mark(self);
+            LdrU(0, 31, 0);                          // elem 0: the record itself
+            Mark(end);
+            AddSPImm(16, true);
+            return true;
+        }
+        return false;
+    }
+
+    // kind -> name string (x0 = rec, x0 = name)
+    void ReflKindStrOut() {
+        RtLdur(1, 0, -24);
+        ReflKindStrs();
+        int end = NL();
+        int k = 1;
+        while (k <= 9) {
+            int next = NL();
+            LoadImm(2, k);
+            CmpRR(1, 2);                                 // cmp x1, x2
+            EmitBcond(1, next);                           // b.ne next
+            LoadStr(reflKindStrIdx[k], 0);
+            EmitB(end);
+            Mark(next);
+            k = k + 1;
+        }
+        LoadStr(reflKindStrIdx[6], 0);
+        Mark(end);
+    }
+
+    void ReflKindStrs() {
+        if (reflKindStrIdx != null) { return; }
+        reflKindStrIdx = new int[10];
+        reflKindStrIdx[0] = InternStr("other");
+        reflKindStrIdx[1] = InternStr("class");
+        reflKindStrIdx[2] = InternStr("struct");
+        reflKindStrIdx[3] = InternStr("enum");
+        reflKindStrIdx[4] = InternStr("interface");
+        reflKindStrIdx[5] = InternStr("primitive");
+        reflKindStrIdx[6] = InternStr("other");
+        reflKindStrIdx[7] = InternStr("array");
+        reflKindStrIdx[8] = InternStr("nullable");
+        reflKindStrIdx[9] = InternStr("delegate");
+    }
+
+    // kind == want -> 1/0
+    void ReflKindTest(Node mem, int want) {
+        GenExpr(mem.a);
+        RtLdur(1, 0, -24);
+        LoadImm(2, want);
+        CmpRR(1, 2);                                 // cmp x1, x2
+        int no = NL();
+        int done = NL();
+        EmitBcond(1, no);                                 // b.ne no
+        LoadImm(0, 1);
+        EmitB(done);
+        Mark(no);
+        LoadImm(0, 0);
+        Mark(done);
+    }
+
+    // targs count (x0 = rec, x0 = count)
+    void ReflCountTargsOut() {
+        RtLdur(1, 0, -48);
+        int zero = NL();
+        int loop = NL();
+        int done = NL();
+        int end = NL();
+        CbzReg(1, zero);
+        LoadImm(2, 0);
+        EmitB(loop);
+        Mark(loop);
+        LdrU(0, 1, 0);
+        CbzReg(0, done);
+        AddImm(2, 2, 1);
+        AddImm(1, 1, 8);
+        EmitB(loop);
+        Mark(done);
+        MovRR(0, 2);
+        EmitB(end);
+        Mark(zero);
+        LoadImm(0, 0);
+        Mark(end);
+    }
+
+    // an instance-surface call (GetType/GetField*/SetField*/Invoke*/Has*)
+    bool TryGenReflCall(Node e) {
+        if (e == null || e.a == null || e.a.kind != AK.MemberAccess()) { return false; }
+        string n = e.a.sval;
+        if (IsTypeInfoExpr(e.a.a)) {
+            if (ReflMemberTy(e.a) == null) { return false; }
+            reflUsed = 1;
+            GenReflTiCall(e);
+            return true;
+        }
+        if (ReflInstRetTyOf(n) == null) { return false; }
+        if (!ReflReceiverAllowed(e.a.a)) { return false; }
+        string rc = ExprCls(e.a.a);
+        if (rc != null && ClassHasMemberUp(rc, n)) { return false; }
+        reflUsed = 1;
+        GenReflInstCall(e, n, rc);
+        return true;
+    }
+
+    // ---- TypeInfo member calls --------------------------------------------
+
+    void GenReflTiCall(Node e) {
+        Node cc = e.a;
+        string n = cc.sval;
+        if (n == "Name") { GenExpr(cc.a); return; }
+        if (n == "Kind") { GenExpr(cc.a); ReflKindStrOut(); return; }
+        if (n == "FieldCount") { GenExpr(cc.a); RtLdur(0, 0, -32); return; }
+        if (n == "MethodCount") { GenExpr(cc.a); RtLdur(0, 0, -80); return; }
+        if (n == "ConstructorCount") { GenExpr(cc.a); RtLdur(0, 0, -64); return; }
+        if (n == "IsArray") { ReflKindTest(cc.a, 7); return; }
+        if (n == "IsNullable") { ReflKindTest(cc.a, 8); return; }
+        if (n == "IsInterface") { ReflKindTest(cc.a, 4); return; }
+        if (n == "IsGeneric") {
+            GenExpr(cc.a);
+            RtLdur(1, 0, -48);
+            int no = NL();
+            int done = NL();
+            CbzReg(1, no);
+            LoadImm(0, 1);
+            EmitB(done);
+            Mark(no);
+            LoadImm(0, 0);
+            Mark(done);
+            return;
+        }
+        if (n == "TypeArgCount") { GenExpr(cc.a); ReflCountTargsOut(); return; }
+        if (n == "ElementType") {
+            GenExpr(cc.a);
+            PushV(0);
+            RtLdur(0, 0, -56);
+            int self = NL();
+            int end = NL();
+            CbzReg(0, self);
+            EmitB(end);
+            Mark(self);
+            LdrU(0, 31, 0);
+            Mark(end);
+            AddSPImm(16, true);
+            return;
+        }
+        if (n == "GetTypeArg") {
+            // targs[idx]: the targ recs sit in a null-terminated array at -48
+            GenExpr(cc.a);
+            PushV(0);                          // rec @+16
+            GenExpr(e.kids[0]);                      // x0 = index
+            PopV(1);                          // pop rec -> x1
+            RtLdur(2, 1, -48);                       // x2 = targs
+            AddLsl(2, 2, 0, 3);                      // x2 += idx * 8
+            LdrU(0, 2, 0);
+            return;
+        }
+        // ---- members taking the record plus one runtime argument
+        GenExpr(cc.a);
+        PushV(0);                              // push rec
+        if (n == "GetFieldName" || n == "GetFieldType" || n == "GetMemberValue") {
+            GenExpr(e.kids[0]);                      // x0 = field index
+            PopV(1);                          // pop rec -> x1
+            RtLdur(1, 1, -40);                       // x1 = fields base
+            AddLsl(1, 1, 0, 5);                      // x1 += i * 32
+            if (n == "GetFieldName") { LdrU(0, 1, 0); }
+            else if (n == "GetFieldType") { LdrU(0, 1, 8); }
+            else { LdrU(0, 1, 24); }                 // enum member value (long)
+            return;
+        }
+        if (n == "HasField") {
+            GenExpr(e.kids[0]);                      // x0 = name
+            PopV(1);                          // x1 = rec
+            RtLdur(2, 1, -40);                       // x2 = fields base
+            RtLdur(3, 1, -32);                       // x3 = count
+            MovRR(9, 2);
+            MovRR(2, 0);                             // x2 = needle
+            MovRR(1, 9);                             // x1 = base
+            ReflScanName2();
+            return;
+        }
+        if (n == "HasMethod") {
+            GenExpr(e.kids[0]);
+            PopV(1);                          // x1 = rec
+            RtLdur(2, 1, -88);                       // methods base
+            RtLdur(3, 1, -80);                       // count
+            MovRR(9, 2);
+            MovRR(2, 0);
+            MovRR(1, 9);
+            ReflScanName2S(56);
+            return;
+        }
+        if (n == "GetMethodName" || n == "GetMethodReturnType" || n == "GetMethodParamCount"
+                || n == "IsMethodStatic") {
+            GenExpr(e.kids[0]);
+            PopV(1);                          // pop rec -> x1
+            RtLdur(1, 1, -88);                       // methods base
+            LoadImm(2, 56);
+            MulRR(0, 0, 2);
+            AddRR(1, 1, 0);                          // x1 = &mrec
+            if (n == "GetMethodName") { LdrU(0, 1, 0); }
+            else if (n == "GetMethodReturnType") { LdrU(0, 1, 8); }
+            else if (n == "GetMethodParamCount") { LdrU(0, 1, 24); }
+            else { LdrU(0, 1, 48); E4(0xD3400000); } // ubfm x0, x0, #0, #0
+            return;
+        }
+        if (n == "GetMethodParamType") {
+            GenExpr(e.kids[0]);
+            PopV(1);
+            RtLdur(1, 1, -88);
+            LoadImm(2, 56);
+            MulRR(0, 0, 2);
+            AddRR(1, 1, 0);                          // x1 = &mrec
+            PushV(1);                          // hold &mrec across arg eval
+            GenExpr(e.kids[1]);                      // x0 = param index
+            PopV(2);                          // pop &mrec -> x2
+            LdrU(2, 2, 32);                          // ptypes base
+            AddLsl(2, 2, 0, 3);
+            LdrU(0, 2, 0);
+            return;
+        }
+        if (n == "GetCtorParamCount") {
+            GenExpr(e.kids[0]);
+            PopV(1);
+            RtLdur(1, 1, -72);                       // ctors base
+            LoadImm(2, 56);
+            MulRR(0, 0, 2);
+            AddRR(1, 1, 0);
+            LdrU(0, 1, 24);
+            return;
+        }
+        if (n == "GetCtorParamType") {
+            GenExpr(e.kids[0]);
+            PopV(1);
+            RtLdur(1, 1, -72);
+            LoadImm(2, 56);
+            MulRR(0, 0, 2);
+            AddRR(1, 1, 0);                          // x1 = &crec
+            PushV(1);
+            GenExpr(e.kids[1]);                      // x0 = param index
+            PopV(2);
+            LdrU(2, 2, 32);
+            AddLsl(2, 2, 0, 3);
+            LdrU(0, 2, 0);
+            return;
+        }
+        if (n == "CreateInstance") {
+            GenExpr(cc.a);
+            PushV(0);                          // rec @+16
+            int argc = e.kids.Count;
+            int bsz = argc * 8;
+            if (bsz < 8) { bsz = 8; }
+            LoadImm(0, bsz);
+            LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");
+            PushV(0);                          // buf @+0
+            int k = 0;
+            while (k < argc) {
+                ReflPackArg(e.kids[k], k);
+                k = k + 1;
+            }
+            LoadImm(2, argc);
+            LdrU(1, 31, 0);                          // buf
+            LdrU(0, 31, 16);                         // rec
+            BLInternal("_refl_cnew_rt");
+            AddSPImm(32, true);
+            return;
+        }
+        diags.Error("ngen: unsupported reflection member '" + n + "'", e.line, e.col);
+        AddSPImm(16, true);
+        LoadImm(0, 0);
+    }
+
+    // evaluate one reflection argument into its packed i64 slot k of the
+    // buffer whose address sits at the stack top
+    void ReflPackArg(Node ae, int slot) {
+        GenExpr(ae);
+        GenCloneIfStruct(ae);
+        if (IsDblExpr(ae)) {
+            E4(0x9E670000);                          // fmov x0, d0
+        } else {
+            string at = StaticTyOf(ae);
+            if (at == "int" || at == "bool" || at == "char" || at == "short"
+                    || at == "byte" || at == "sbyte" || at == "uint"
+                    || (at != null && FindEnum(at) >= 0)) {
+                Sxtw0();                      // sxtw x0, w0
+            }
+        }
+        LdrU(1, 31, 0);
+        StrU(0, 1, 8 * slot);
+    }
+
+    // add/sub/mul register encodings used only by the reflection emitters
+    void AddLsl(int rd, int rn, int rm, int sh) {
+        if (tgt86 == 1) {                        // x86 孪生(批 46:反射桶下标
+            int n = XMapReal(rn);                // rn + i*步长 现形):SIB 比例
+            if (n < 0 || XMapReal(rm) == 10) {   // 上限 8,更高移位补 shl
+                XFailClosed("AddLsl operand shape", curLine, curCol); return;
+            }
+            if (sh == 0) {
+                XGetV(rn, 10);
+                XGetV(rm, 11);
+                Xop(0x01, 10, 11);               // add r10, r11
+            } else {
+                int sc = sh < 3 ? sh : 3;
+                XGetV(rm, 11);
+                X1(0x4F); X1(0x8D); X1(0x14); X1((sc << 6) | 0x1B);   // lea r10, [r11 + r11*2^sc]
+                if (sh > 3) { X2(0x49, 0xC1); X2(0xE2, sh - 3); }     // shl r10, sh-3
+            }
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0x8B000000 | (rm << 16) | (sh << 10) | (rn << 5) | rd);
+    }
+    void MulRR(int rd, int rn, int rm) {
+        // MUL is MADD with the addend = XZR (Ra=31); Ra=0 would add x0.
+        // batch 24: x86 twin via imul(rm 暂存 r10/r11,槽位经 XGetV/XSetV)
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("MulRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            // 批 35:XrexW 首参是 reg 域操作数(imul r64,r/m64 的 reg=目
+            // 的)——首版 XrexW(tmp, dd) R/B 两位互换,dd=rdi/tmp=r11 时
+            // 发出 imul r15, rbx(双被调者保存寄存器,目的也丢);仅当
+            // dd/tmp 同处低半或同处高半才侥幸对(string_replace 实证)
+            X1(XrexW(dd, tmp)); X2(0x0F, 0xAF); X1(0xC0 | ((dd & 7) << 3) | (tmp & 7));   // imul dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x9B000000 | (31 << 10) | (rm << 16) | (rn << 5) | rd);
+    }
+
+    // strcmp scan of a 32B-stride record column: x1 = base, x2 = needle,
+    // x3 = count -> x0 = 1/0 (leaf frame, balanced)
+    // x1 = table base, x2 = needle, x3 = count; stride: 32 for field
+    // records, 56 for method / ctor records
+    void ReflScanName2() { ReflScanName2S(32); }
+    void ReflScanName2S(int stride) {
+        E4(0xF81F0FF3);                              // push x19 (needle)
+        E4(0xF81F0FF4);                              // push x20 (cursor)
+        E4(0xF81F0FF5);                              // push x21 (count)
+        MovRR(19, 2);
+        MovRR(20, 1);
+        MovRR(21, 3);
+        int loop = NL();
+        int hit = NL();
+        int miss = NL();
+        int done = NL();
+        Mark(loop);
+        CbzReg(21, miss);
+        LdrU(0, 20, 0);
+        MovRR(1, 19);
+        BLExtern("_strcmp");
+        CbzReg(0, hit);
+        AddImm(20, 20, stride);
+        AddImm(21, 21, -1);
+        EmitB(loop);
+        Mark(hit);
+        LoadImm(0, 1);
+        EmitB(done);
+        Mark(miss);
+        LoadImm(0, 0);
+        Mark(done);
+        E4(0xF84107F5);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+    }
+
+    // ---- instance surface ---------------------------------------------------
+
+    // lower to an ordinary instance call of methName (the desugared
+    // accessors included); false when the name/arity does not resolve
+    bool ReflTryDirectCall(Node e, string methName) {
+        string rc = ExprCls(e.a.a);
+        if (rc == null) { return false; }
+        Node found = null;
+        string cur = rc;
+        while (cur != null && found == null) {
+            Cls c2 = FindClass(cur);
+            if (c2 == null) { break; }
+            List<int> cs = MethCandsClsName(c2.name, methName);
+            if (cs != null) {
+                int i = 0;
+                while (i < cs.Count) {
+                    Node m2 = methNodes[cs[i]];
+                    if (methStat[cs[i]] == 0 && !HasTypeParams(m2)
+                            && ParamCount(m2) == e.kids.Count - 1) {
+                        found = m2;
+                        break;
+                    }
+                    i = i + 1;
+                }
+            }
+            cur = c2.baseName;
+        }
+        if (found == null) { return false; }
+        Node syn = new Node(AK.Call());
+        Node cal = new Node(AK.MemberAccess());
+        cal.a = e.a.a;
+        cal.sval = methName;
+        syn.a = cal;
+        syn.line = e.line;
+        syn.col = e.col;
+        int i2 = 1;
+        while (i2 < e.kids.Count) { syn.Add(e.kids[i2]); i2 = i2 + 1; }
+        GenCall(syn);
+        return true;
+    }
+
+    void GenReflInstCall(Node e, string n, string rc) {
+        Node cc = e.a;
+        bool litName = e.kids.Count > 0 && e.kids[0].kind == AK.StringLit()
+            && e.kids[0].b == null;
+        string nameVal = litName ? e.kids[0].sval : null;
+        if (n == "GetType") {
+            GenExpr(cc.a);                           // x0 = receiver
+            LoadImm(1, 0);                           // fallback resolved inside
+            BLInternal("_refl_obj_type");
+            return;
+        }
+        if (n == "GetFieldInt" || n == "GetFieldLong" || n == "GetFieldBool"
+                || n == "GetFieldDouble" || n == "GetFieldString") {
+            bool resolved = false;
+            if (rc != null && litName) {
+                Node gg = AccessorInChain(rc, "get_" + nameVal);
+                if (gg != null && !HasMod(gg, MOD.Static()) && ReflTryDirectCall(e, "get_" + nameVal)) { return; }
+                Fld ff = ReflFindFieldUp(rc, nameVal);
+                if (ff != null) {
+                    GenExpr(cc.a);
+                    int gn = NL();
+                    int gd = NL();
+                    CbzReg(0, gn);
+                    LoadFieldNg(0, 0, ff);
+                    EmitB(gd);
+                    Mark(gn);
+                    LoadImm(0, 0);
+                    Mark(gd);
+                    return;
+                }
+                // a miss on a non-class receiver (struct / enum /
+                // primitive) is definitive: no record exists to consult at
+                // runtime; `object` must keep going through the helper
+                Cls mc = FindClass(rc);
+                if (rc != "object" && (mc == null || mc.isStruct == 1)) { resolved = true; }
+            }
+            if (resolved) {
+                if (n == "GetFieldString") { LoadStr(emptyIdx, 0); } else { LoadImm(0, 0); }
+                return;
+            }
+            GenExpr(cc.a);                           // x0 = obj
+            PushV(0);                          // obj @+0 (one slot)
+            GenExpr(e.kids[0]);                      // x0 = name
+            MovRR(1, 0);
+            LdrU(0, 31, 0);                          // obj
+            if (n == "GetFieldString") { LoadStr(emptyIdx, 2); }
+            else { LoadImm(2, 0); }                  // miss value
+            BLInternal("_refl_getf_rt");
+            AddSPImm(16, true);
+            return;
+        }
+        if (n == "HasField") {
+            bool resolved = false;
+            if (rc != null && litName) {
+                if (ReflFindFieldUp(rc, nameVal) != null) { LoadImm(0, 1); return; }
+                Cls mc = FindClass(rc);
+                if (rc != "object" && (mc == null || mc.isStruct == 1)) { LoadImm(0, 0); return; }
+                resolved = true;
+            }
+            if (resolved) { LoadImm(0, 0); return; }
+            GenExpr(cc.a);
+            PushV(0);                          // obj @+0 (one slot)
+            GenExpr(e.kids[0]);
+            MovRR(1, 0);
+            LdrU(0, 31, 0);                          // obj
+            BLInternal("_refl_hasf_rt");
+            AddSPImm(16, true);
+            return;
+        }
+        if (n == "HasMethod") {
+            bool resolved = false;
+            if (rc != null && litName) {
+                if (ReflMethodExistsUp(rc, nameVal)) { LoadImm(0, 1); return; }
+                Cls mc = FindClass(rc);
+                if (rc != "object" && (mc == null || mc.isStruct == 1)) { LoadImm(0, 0); return; }
+                resolved = true;
+            }
+            if (resolved) { LoadImm(0, 0); return; }
+            GenExpr(cc.a);
+            PushV(0);                          // obj @+0 (one slot)
+            GenExpr(e.kids[0]);
+            MovRR(1, 0);
+            LdrU(0, 31, 0);                          // obj
+            BLInternal("_refl_hasm_rt");
+            AddSPImm(16, true);
+            return;
+        }
+        if (n == "SetFieldInt" || n == "SetFieldLong" || n == "SetFieldBool"
+                || n == "SetFieldDouble" || n == "SetFieldString") {
+            if (rc != null && litName) {
+                Node ss = AccessorInChain(rc, "set_" + nameVal);
+                if (ss != null && !HasMod(ss, MOD.Static())
+                        && ReflTryDirectCall(e, "set_" + nameVal)) {
+                    LoadImm(0, 1);
+                    return;
+                }
+                Fld ff = ReflFindFieldUp(rc, nameVal);
+                if (ff != null) {
+                    GenExpr(cc.a);
+                    PushV(0);                  // push obj
+                    Node ve = e.kids[1];
+                    GenExpr(ve);
+                    if (IsDblTy(ff.ty) && !IsDblExpr(ve)) { ConvI2D(); }
+                    if (ff.ty == "float") { NarrowF32(); }
+                    PopV(1);                  // pop obj -> x1
+                    StoreFieldNg(0, 1, ff);
+                    LoadImm(0, 1);
+                    return;
+                }
+                LoadImm(0, 0);
+                return;
+            }
+            GenExpr(cc.a);                           // x0 = obj
+            PushV(0);                          // obj @+32
+            GenExpr(e.kids[0]);                      // name
+            PushV(0);                          // name @+16
+            Node ve = e.kids[1];
+            GenExpr(ve);
+            GenCloneIfStruct(ve);
+            if (IsDblExpr(ve)) {
+                E4(0x9E670000);
+            } else {
+                string vt = StaticTyOf(ve);
+                if (vt == "int" || vt == "bool" || vt == "char" || vt == "short"
+                        || vt == "byte" || vt == "sbyte" || vt == "uint"
+                        || (vt != null && FindEnum(vt) >= 0)) {
+                    Sxtw0();
+                }
+            }
+            MovRR(2, 0);                             // x2 = value
+            LdrU(1, 31, 16);                         // x1 = name
+            LdrU(0, 31, 32);                         // x0 = obj
+            BLInternal("_refl_setf_rt");
+            AddSPImm(48, true);
+            return;
+        }
+        // Invoke / InvokeInt / InvokeLong / InvokeDouble / InvokeString
+        if (rc != null && litName && ReflTryDirectCall(e, nameVal)) {
+            if (n == "Invoke") { LoadImm(0, 1); }    // found
+            return;
+        }
+        int argc = e.kids.Count - 1;
+        GenExpr(cc.a);                               // x0 = obj
+        PushV(0);                              // obj @+16
+        int bsz = argc * 8;
+        if (bsz < 8) { bsz = 8; }
+        LoadImm(0, bsz);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        PushV(0);                              // buf @+0
+        int k = 0;
+        while (k < argc) {
+            ReflPackArg(e.kids[k + 1], k);
+            k = k + 1;
+        }
+        GenExpr(e.kids[0]);                          // name
+        MovRR(1, 0);
+        LdrU(2, 31, 0);                              // buf
+        LdrU(0, 31, 16);                             // obj
+        LoadSymRef("l_.str." + emptyIdx, 3);         // x3 = miss value
+        BLInternal("_refl_invoke_rt");
+        AddSPImm(32, true);
+        if (n == "Invoke") {
+            // x1 = found flag is the result
+            MovRR(0, 1);
+        } else if (n != "InvokeString") {
+            // a miss must answer the type's zero, not the miss token
+            int nz = NL();
+            int nd = NL();
+            CbzReg(1, nz);
+            EmitB(nd);
+            Mark(nz);
+            LoadImm(0, 0);
+            Mark(nd);
+        }
+    }
+
+    // ---- runtime helpers (emitted once, from EmitReflApi) -------------------
+
+    // i64 _refl_obj_type(i64 obj, i64 fb): the record for obj's CONCRETE
+    // class, resolved from the site in obj-8's upper half; a header word
+    // that names no class (string tag, array magic, rank) falls back to fb,
+    // or to the `object` record when fb is 0
+    void EmitReflObjType() {
+        if (reflSymObjType != 0) { return; }
+        reflSymObjType = 1;
+        // every class needs a record before this can resolve
+        int i = 0;
+        while (i < classes.Count) { ReflRecForClass(classes[i]); i = i + 1; }
+        int objIdx = ReflRecIdx("object", null, 1);
+        syms.Add(new Sym("_refl_obj_type", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // push x19 (obj)
+        E4(0xF81F0FF4);                              // push x20 (fallback)
+        MovRR(19, 0);
+        MovRR(20, 1);
+        int fbL = NL();
+        int done = NL();
+        int havef = NL();
+        int useobj = NL();
+        CbzReg(19, fbL);                             // null obj -> fallback
+        int scan = NL();
+        EmitB(scan);
+        Mark(fbL);
+        CbnzReg(20, havef);                          // caller fallback wins
+        EmitB(useobj);
+        Mark(havef);
+        MovRR(0, 20);
+        EmitB(done);
+        Mark(useobj);
+        LoadSymRef(DGlobalSym("refl." + objIdx), 9);
+        LdrU(0, 9, 0);
+        int haveO = NL();
+        CbnzReg(0, haveO);
+        BLInternal("_refl_build_" + objIdx);
+        Mark(haveO);
+        EmitB(done);
+        Mark(scan);
+        RtLdur(1, 19, -8);
+        LsrImm64(1, 32);                              // lsr x1, x1, #32 (site)
+        i = 0;
+        while (i < classes.Count) {
+            int ridx = ReflFindKey(classes[i].name);
+            LoadImm(2, i + 1);
+            CmpRR(1, 2);                                 // cmp x1, x2
+            int next = NL();
+            EmitBcond(1, next);                           // not this class
+            LoadSymRef(DGlobalSym("refl." + ridx), 9);
+            LdrU(0, 9, 0);
+            int have = NL();
+            CbnzReg(0, done);                             // already built
+            BLInternal("_refl_build_" + ridx);
+            LoadSymRef(DGlobalSym("refl." + ridx), 9);   // x0 = rec
+            LdrU(0, 9, 0);
+            EmitB(done);
+            Mark(next);
+            i = i + 1;
+        }
+        EmitB(fbL);
+        Mark(done);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // i64 _refl_pacc(i64 rec, i64 name, i64 want): the get_/set_ accessor
+    // thunk of the record (want 0/1), or 0
+    void EmitReflPacc() {
+        if (reflSymPacc != 0) { return; }
+        reflSymPacc = 1;
+        syms.Add(new Sym("_refl_pacc", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // name
+        E4(0xF81F0FF4);                              // cursor
+        E4(0xF81F0FF5);                              // count
+        E4(0xF81F0FF6);                              // want
+        MovRR(19, 1);
+        MovRR(22, 2);
+        RtLdur(1, 0, -88);                           // methods base
+        RtLdur(2, 0, -80);                           // count
+        MovRR(20, 1);
+        MovRR(21, 2);
+        int loop = NL();
+        int hit = NL();
+        int no = NL();
+        int done = NL();
+        Mark(loop);
+        CbzReg(21, no);
+        E4(0xB9400280 | 8);                          // ldr w8, [x20] (prefix word)
+        int setpfx = NL();
+        int pfxok = NL();
+        int cont = NL();
+        CbnzReg(22, setpfx);
+        LoadImm(9, 0x5F746567);                      // "get_"
+        EmitB(pfxok);
+        Mark(setpfx);
+        LoadImm(9, 0x5F746573);                      // "set_"
+        Mark(pfxok);
+        E4(0x6B09011F);                              // cmp w8, w9
+        EmitBcond(1, cont);                          // wrong prefix
+        AddImm(0, 20, 4);                            // mname + 4
+        MovRR(1, 19);
+        BLExtern("_strcmp");
+        CbzReg(0, hit);
+        Mark(cont);
+        AddImm(20, 20, 56);
+        AddImm(21, 21, -1);
+        EmitB(loop);
+        Mark(hit);
+        LdrU(0, 20, 40);                             // thunk
+        EmitB(done);
+        Mark(no);
+        LoadImm(0, 0);
+        Mark(done);
+        E4(0xF84107F6);
+        E4(0xF84107F5);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // i64 _refl_invoke_rt(i64 obj, i64 name, i64 buf, i64 miss): dispatch a
+    // method by name on obj's concrete record; x0 = result, x1 = found
+    void EmitReflInvokeRt() {
+        if (reflSymInvokeRt != 0) { return; }
+        reflSymInvokeRt = 1;
+        EmitReflObjType();
+        syms.Add(new Sym("_refl_invoke_rt", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // obj
+        E4(0xF81F0FF4);                              // name
+        E4(0xF81F0FF5);                              // buf
+        E4(0xF81F0FF6);                              // miss
+        E4(0xF81F0FF9);                              // cursor (x25)
+        E4(0xF81F0FFA);                              // count (x26)
+        MovRR(19, 0);
+        MovRR(20, 1);
+        MovRR(21, 2);
+        MovRR(22, 3);
+        int miss = NL();
+        int done = NL();
+        CbzReg(19, miss);
+        MovRR(0, 19);
+        LoadImm(1, 0);
+        BLInternal("_refl_obj_type");                // x0 = rec
+        CbzReg(0, miss);
+        RtLdur(1, 0, -88);                           // methods base
+        RtLdur(2, 0, -80);                           // count
+        MovRR(25, 1);
+        MovRR(26, 2);
+        int loop = NL();
+        int hit = NL();
+        Mark(loop);
+        CbzReg(26, miss);
+        LdrU(0, 25, 0);                              // record name
+        MovRR(1, 20);
+        BLExtern("_strcmp");
+        CbzReg(0, hit);
+        AddImm(25, 25, 56);
+        AddImm(26, 26, -1);
+        EmitB(loop);
+        Mark(hit);
+        LdrU(0, 25, 48);                             // flags
+        E4(0xD3400000);                              // x0 = flags & 1
+        CbnzReg(0, miss);                            // statics not invocable here
+        LdrU(9, 25, 40);                             // thunk
+        MovRR(0, 19);
+        MovRR(1, 21);
+        E4(0xD63F0120);                              // blr x9
+        LoadImm(1, 1);                               // found
+        EmitB(done);
+        Mark(miss);
+        MovRR(0, 22);
+        LoadImm(1, 0);
+        Mark(done);
+        E4(0xF84107FA);
+        E4(0xF84107F9);
+        E4(0xF84107F6);
+        E4(0xF84107F5);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // i64 _refl_getf_rt(i64 obj, i64 name, i64 miss): a property getter
+    // first (through its thunk), else the field slot
+    void EmitReflGetfRt() {
+        if (reflSymGetfRt != 0) { return; }
+        reflSymGetfRt = 1;
+        EmitReflObjType();
+        EmitReflPacc();
+        syms.Add(new Sym("_refl_getf_rt", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // obj
+        E4(0xF81F0FF4);                              // name
+        E4(0xF81F0FF5);                              // miss
+        E4(0xF81F0FF8);                              // rec (x24)
+        E4(0xF81F0FF9);                              // cursor (x25)
+        E4(0xF81F0FFA);                              // count (x26)
+        MovRR(19, 0);
+        MovRR(20, 1);
+        MovRR(22, 2);
+        int miss = NL();
+        int done = NL();
+        int noProp = NL();
+        CbzReg(19, miss);
+        MovRR(0, 19);
+        LoadImm(1, 0);
+        BLInternal("_refl_obj_type");
+        CbzReg(0, miss);
+        MovRR(24, 0);                                // rec
+        MovRR(0, 24);
+        MovRR(1, 20);
+        LoadImm(2, 0);                               // want get_
+        BLInternal("_refl_pacc");
+        CbzReg(0, noProp);
+        MovRR(9, 0);
+        MovRR(0, 19);                                // obj
+        LoadImm(1, 0);                               // no args
+        E4(0xD63F0120);                              // blr thunk
+        EmitB(done);
+        Mark(noProp);
+        RtLdur(1, 24, -40);                          // fields base
+        RtLdur(2, 24, -32);                          // count
+        MovRR(25, 1);
+        MovRR(26, 2);
+        int loop = NL();
+        int fhit = NL();
+        Mark(loop);
+        CbzReg(26, miss);
+        LdrU(0, 25, 0);
+        MovRR(1, 20);
+        BLExtern("_strcmp");
+        CbzReg(0, fhit);
+        AddImm(25, 25, 32);
+        AddImm(26, 26, -1);
+        EmitB(loop);
+        Mark(fhit);
+        LdrU(9, 25, 24);                             // offset
+        AddRR(10, 19, 9);
+        LdrU(0, 10, 0);                              // the slot word (all kinds)
+        EmitB(done);
+        Mark(miss);
+        MovRR(0, 22);
+        Mark(done);
+        E4(0xF84107FA);
+        E4(0xF84107F9);
+        E4(0xF84107F8);
+        E4(0xF84107F5);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // i64 _refl_setf_rt(i64 obj, i64 name, i64 value): a property setter
+    // first, else the field slot; x0 = 1/0
+    void EmitReflSetfRt() {
+        if (reflSymSetfRt != 0) { return; }
+        reflSymSetfRt = 1;
+        EmitReflObjType();
+        EmitReflPacc();
+        syms.Add(new Sym("_refl_setf_rt", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // obj
+        E4(0xF81F0FF4);                              // name
+        E4(0xF81F0FF5);                              // value
+        E4(0xF81F0FF6);                              // thunk (x22)
+        E4(0xF81F0FF8);                              // rec (x24)
+        E4(0xF81F0FF9);                              // cursor (x25)
+        E4(0xF81F0FFA);                              // count (x26)
+        MovRR(19, 0);
+        MovRR(20, 1);
+        MovRR(21, 2);
+        int no = NL();
+        int done = NL();
+        int noProp = NL();
+        CbzReg(19, no);
+        MovRR(0, 19);
+        LoadImm(1, 0);
+        BLInternal("_refl_obj_type");
+        CbzReg(0, no);
+        MovRR(24, 0);                                // rec
+        MovRR(0, 24);
+        MovRR(1, 20);
+        LoadImm(2, 1);                               // want set_
+        BLInternal("_refl_pacc");
+        CbzReg(0, noProp);
+        MovRR(22, 0);                                // thunk (callee-saved)
+        LoadImm(0, 8);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // 1-slot args buffer
+        StrU(21, 0, 0);
+        MovRR(1, 0);
+        MovRR(0, 19);
+        MovRR(9, 22);
+        E4(0xD63F0120);                              // blr thunk
+        LoadImm(0, 1);
+        EmitB(done);
+        Mark(noProp);
+        RtLdur(1, 24, -40);
+        RtLdur(2, 24, -32);
+        MovRR(25, 1);
+        MovRR(26, 2);
+        int loop = NL();
+        int fhit = NL();
+        Mark(loop);
+        CbzReg(26, no);
+        LdrU(0, 25, 0);
+        MovRR(1, 20);
+        BLExtern("_strcmp");
+        CbzReg(0, fhit);
+        AddImm(25, 25, 32);
+        AddImm(26, 26, -1);
+        EmitB(loop);
+        Mark(fhit);
+        LdrU(9, 25, 24);
+        AddRR(10, 19, 9);
+        StrU(21, 10, 0);
+        LoadImm(0, 1);
+        EmitB(done);
+        Mark(no);
+        LoadImm(0, 0);
+        Mark(done);
+        E4(0xF84107FA);
+        E4(0xF84107F9);
+        E4(0xF84107F8);
+        E4(0xF84107F6);
+        E4(0xF84107F5);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    void EmitReflHasfRt() {
+        if (reflSymHasfRt != 0) { return; }
+        reflSymHasfRt = 1;
+        EmitReflObjType();
+        syms.Add(new Sym("_refl_hasf_rt", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);
+        E4(0xF81F0FF4);
+        MovRR(19, 0);
+        MovRR(20, 1);
+        int no = NL();
+        int done = NL();
+        CbzReg(19, no);
+        MovRR(0, 19);
+        LoadImm(1, 0);
+        BLInternal("_refl_obj_type");
+        CbzReg(0, no);
+        RtLdur(1, 0, -40);
+        RtLdur(3, 0, -32);
+        MovRR(2, 20);
+        ReflScanName2();
+        EmitB(done);
+        Mark(no);
+        LoadImm(0, 0);
+        Mark(done);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    void EmitReflHasmRt() {
+        if (reflSymHasmRt != 0) { return; }
+        reflSymHasmRt = 1;
+        EmitReflObjType();
+        syms.Add(new Sym("_refl_hasm_rt", FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);
+        E4(0xF81F0FF4);
+        MovRR(19, 0);
+        MovRR(20, 1);
+        int no = NL();
+        int done = NL();
+        CbzReg(19, no);
+        MovRR(0, 19);
+        LoadImm(1, 0);
+        BLInternal("_refl_obj_type");
+        CbzReg(0, no);
+        RtLdur(1, 0, -88);
+        RtLdur(3, 0, -80);
+        MovRR(2, 20);
+        ReflScanName2S(56);
+        EmitB(done);
+        Mark(no);
+        LoadImm(0, 0);
+        Mark(done);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // i64 _refl_cnew_rt(i64 rec, i64 buf, i64 argc): the ctor whose
+    // parameter count matches, invoked through its allocation thunk
+    void EmitReflCnewRt() {
+        if (reflSymCnewRt != 0) { return; }
+        reflSymCnewRt = 1;
+        syms.Add(new Sym("_refl_cnew_rt", FnPad()));
+        E4(0xF81F0FFE);                              // push x30: the blr
+                                                     // below overwrites lr
+        RtLdur(9, 0, -72);                           // ctors base
+        RtLdur(10, 0, -64);                          // count
+        int loop = NL();
+        int fail = NL();
+        int hit = NL();
+        Mark(loop);
+        CbzReg(10, fail);
+        LdrU(8, 9, 24);                              // param count
+        CmpRR(8, 2);                            // cmp x8, x2 (argc)
+        EmitBcond(0, hit);
+        AddImm(9, 9, 56);
+        AddImm(10, 10, -1);
+        EmitB(loop);
+        Mark(hit);
+        LdrU(9, 9, 40);                              // thunk
+        MovRR(0, 1);                                 // buf
+        E4(0xD63F0120);                              // blr -> x0 = obj
+        E4(0xF84107FE);                              // pop x30
+        E4(0xD65F03C0);                              // ret
+        Mark(fail);
+        E4(0xF84107FE);                              // pop x30
+        LoadImm(0, 0);
+        E4(0xD65F03C0);
+    }
+
+    // ---- builders ------------------------------------------------------------
+
+    // emit every registered record's builder plus the runtime helpers;
+    // runs after all method bodies (their typeof/GetType references resolve
+    // by symbol name at patch time)
+    void EmitReflApi() {
+        if (reflUsed == 0 && (reflKeys == null || reflKeys.Count == 0)) { return; }
+        reflUsed = 1;
+        int i = 0;
+        while (i < classes.Count) { ReflRecForClass(classes[i]); i = i + 1; }
+        ReflRecIdx("object", null, 1);
+        i = 0;
+        while (i < reflKeys.Count) { EmitReflBuilder(i); i = i + 1; }
+        EmitReflObjType();
+        EmitReflPacc();
+        EmitReflInvokeRt();
+        EmitReflGetfRt();
+        EmitReflSetfRt();
+        EmitReflHasfRt();
+        EmitReflHasmRt();
+        EmitReflCnewRt();
+    }
+
+    void EmitReflBuilder(int i) {
+        string disp = reflKeys[i];
+        string clsName = reflClsName[i];
+        int kind = reflKind[i];
+        bool isEnum = clsName != null && FindEnum(clsName) >= 0;
+        bool genericCls = false;
+        if (clsName != null && !isEnum) {
+            Cls gc = FindClass(clsName);
+            genericCls = gc != null && gc.tps.Count > 0;
+        }
+        int nameIdx = InternStr(disp);
+        int nameLen = disp.Length;
+        // ---- plan: fields
+        List<string> fNames = new List<string>();
+        List<string> fTys = new List<string>();
+        List<long> fVals = new List<long>();
+        if (isEnum) {
+            int ei = FindEnum(clsName);
+            int m = 0;
+            while (m < enCnt[ei]) {
+                fNames.Add(enMem[enOff[ei] + m]);
+                fTys.Add(disp);
+                fVals.Add(enVal[enOff[ei] + m]);
+                m = m + 1;
+            }
+        } else if (clsName != null && !genericCls) {
+            Cls c = FindClass(clsName);
+            if (c != null) {
+                MergeBaseFields(c);
+                int fi = 0;
+                while (fi < c.flds.Count) {
+                    Fld f = c.flds[fi];
+                    fNames.Add(f.name);
+                    fTys.Add(f.ty);
+                    fVals.Add(f.off);
+                    fi = fi + 1;
+                }
+            }
+        }
+        // ---- plan: methods and ctors (base chain flattened, base first);
+        // open generic templates carry no emitted bodies, so their records
+        // have empty tables (runtime dispatch answers 0 there)
+        List<Node> mM = new List<Node>();
+        List<int> mSt = new List<int>();
+        List<string> mOwn = new List<string>();
+        List<Node> cN = new List<Node>();
+        if (clsName != null && !isEnum && !genericCls) {
+            ReflCollectMembers(clsName, mM, mSt, mOwn, cN);
+        }
+        int nf = fNames.Count;
+        int nm = mM.Count;
+        int nc = cN.Count;
+        int ntarg = reflTargCnt[i];
+        // the table area must sit on an 8-byte boundary: LdrU/StrU scale
+        // their offset by 8 and silently truncate a remainder
+        int fbase = 88 + nameLen + 1;
+        fbase = fbase + (8 - fbase % 8) % 8;
+        int mbase = fbase + 32 * nf;
+        int cbase = mbase + 56 * nm;
+        int off = cbase + 56 * nc;
+        int[] mPb = new int[nm];
+        int[] mRi = new int[nm];
+        int[] mRk = new int[nm];
+        int[] mFl = new int[nm];
+        string[] mTh = new string[nm];
+        int mi = 0;
+        while (mi < nm) {
+            mPb[mi] = off;
+            off = off + 8 * ParamCount(mM[mi]);
+            mi = mi + 1;
+        }
+        int[] cPb = new int[nc];
+        int ci2 = 0;
+        while (ci2 < nc) {
+            cPb[ci2] = off;
+            off = off + 8 * ParamCount(cN[ci2]);
+            ci2 = ci2 + 1;
+        }
+        int tbase = -1;
+        if (ntarg > 0) { tbase = off; off = off + 8 * (ntarg + 1); }
+        int total = off;
+        int[] fNi = new int[nf];
+        int[] fTi = new int[nf];
+        int fi2 = 0;
+        while (fi2 < nf) {
+            fNi[fi2] = InternStr(fNames[fi2]);
+            fTi[fi2] = InternStr(fTys[fi2]);
+            fi2 = fi2 + 1;
+        }
+        int[] mNi = new int[nm];
+        mi = 0;
+        while (mi < nm) {
+            Node m = mM[mi];
+            mNi[mi] = InternStr(m.sval);
+            string rt = m.type != null ? TypeFullName(m.type) : "void";
+            mRi[mi] = InternStr(rt);
+            mRk[mi] = ReflFkOf(rt);
+            mFl[mi] = mSt[mi] == 1 ? 1 : 0;
+            if (HasMod(m, MOD.Virtual()) || HasMod(m, MOD.Override()) || HasMod(m, MOD.Abstract())) {
+                mFl[mi] = mFl[mi] + 2;
+            }
+            if (m.sval.Length > 4 && m.sval.Substring(0, 4) == "get_") { mFl[mi] = mFl[mi] + 4; }
+            if (m.sval.Length > 4 && m.sval.Substring(0, 4) == "set_") { mFl[mi] = mFl[mi] + 8; }
+            mTh[mi] = EmitReflThunkM(MethSymNg(mOwn[mi], m), m, mSt[mi] == 1);
+            mi = mi + 1;
+        }
+        int[] cNi = new int[nc];
+        string[] cTh = new string[nc];
+        ci2 = 0;
+        while (ci2 < nc) {
+            cNi[ci2] = InternStr(disp);
+            cTh[ci2] = EmitReflThunkC(clsName, cN[ci2]);
+            ci2 = ci2 + 1;
+        }
+        // ---- emit
+        syms.Add(new Sym("_refl_build_" + i, FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // x19 = &slot
+        E4(0xF81F0FF4);                              // x20 = base
+        LoadSymRef(DGlobalSym("refl." + i), 19);
+        LdrU(0, 19, 0);
+        int bdone = NL();
+        CbnzReg(0, bdone);
+        LoadImm(0, total);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // zeroed, rc=1
+        MovRR(20, 0);
+        // string header: rc sentinel + tag|length
+        LoadImm(1, -1);
+        StrU(1, 20, 72);
+        LoadImm(1, nameLen);
+        LoadImm(2, 0x5A414E53);
+        E4(0xD3607C42);                              // lsl x2, x2, #32
+        E4(0xAA010041);                              // orr x1, x2, x1
+        StrU(1, 20, 80);
+        // payload
+        AddImm(0, 20, 88);
+        LoadSymRef("l_.str." + nameIdx, 1);
+        LoadImm(2, nameLen + 1);
+        BLExtern("_memcpy");
+        // kind / elem
+        LoadImm(1, kind);
+        StrU(1, 20, 64);
+        int eidx = reflElem[i];
+        if (eidx >= 0) {
+            BLInternal("_refl_build_" + eidx);
+            StrU(0, 20, 32);
+        }
+        // fields
+        if (nf > 0) {
+            fi2 = 0;
+            while (fi2 < nf) {
+                LoadStr(fNi[fi2], 1);
+                StrU(1, 20, fbase + 32 * fi2);
+                LoadStr(fTi[fi2], 1);
+                StrU(1, 20, fbase + 32 * fi2 + 8);
+                LoadImm(1, ReflFkOf(fTys[fi2]));
+                StrU(1, 20, fbase + 32 * fi2 + 16);
+                LoadImm(1, fVals[fi2]);
+                StrU(1, 20, fbase + 32 * fi2 + 24);
+                fi2 = fi2 + 1;
+            }
+            LoadImm(1, fbase);
+            AddRR(1, 1, 20);                         // fields base: ABSOLUTE
+            StrU(1, 20, 48);
+            LoadImm(1, nf);
+            StrU(1, 20, 56);
+        }
+        // methods
+        if (nm > 0) {
+            mi = 0;
+            while (mi < nm) {
+                int rb = mbase + 56 * mi;
+                int pcnt = ParamCount(mM[mi]);
+                int pk = 0;
+                while (pk < pcnt) {
+                    Node pp = ParamAt(mM[mi], pk);
+                    int pti = InternStr(pp != null && pp.type != null ? TypeFullName(pp.type) : "object");
+                    LoadStr(pti, 1);
+                    StrU(1, 20, mPb[mi] + 8 * pk);
+                    pk = pk + 1;
+                }
+                LoadImm(1, mPb[mi]);
+                AddRR(1, 1, 20);                     // ptypes base: ABSOLUTE
+                StrU(1, 20, rb + 32);
+                LoadStr(mNi[mi], 1);
+                StrU(1, 20, rb);
+                LoadStr(mRi[mi], 1);
+                StrU(1, 20, rb + 8);
+                LoadImm(1, mRk[mi]);
+                StrU(1, 20, rb + 16);
+                LoadImm(1, pcnt);
+                StrU(1, 20, rb + 24);
+                LoadSymRef(mTh[mi], 1);
+                StrU(1, 20, rb + 40);
+                LoadImm(1, mFl[mi]);
+                StrU(1, 20, rb + 48);
+                mi = mi + 1;
+            }
+            LoadImm(1, mbase);
+            AddRR(1, 1, 20);                         // methods base: ABSOLUTE
+            StrU(1, 20, 0);
+            LoadImm(1, nm);
+            StrU(1, 20, 8);
+        }
+        // ctors
+        if (nc > 0) {
+            ci2 = 0;
+            while (ci2 < nc) {
+                int rb = cbase + 56 * ci2;
+                int pcnt = ParamCount(cN[ci2]);
+                int pk = 0;
+                while (pk < pcnt) {
+                    Node pp = ParamAt(cN[ci2], pk);
+                    int pti = InternStr(pp != null && pp.type != null ? TypeFullName(pp.type) : "object");
+                    LoadStr(pti, 1);
+                    StrU(1, 20, cPb[ci2] + 8 * pk);
+                    pk = pk + 1;
+                }
+                LoadImm(1, cPb[ci2]);
+                AddRR(1, 1, 20);                     // ptypes base: ABSOLUTE
+                StrU(1, 20, rb + 32);
+                LoadStr(cNi[ci2], 1);
+                StrU(1, 20, rb);
+                LoadStr(cNi[ci2], 1);                // ret slot: the class name
+                StrU(1, 20, rb + 8);
+                LoadImm(1, 0);
+                StrU(1, 20, rb + 16);
+                LoadImm(1, pcnt);
+                StrU(1, 20, rb + 24);
+                LoadSymRef(cTh[ci2], 1);
+                StrU(1, 20, rb + 40);
+                LoadImm(1, 0);
+                StrU(1, 20, rb + 48);
+                ci2 = ci2 + 1;
+            }
+            LoadImm(1, cbase);
+            AddRR(1, 1, 20);                         // ctors base: ABSOLUTE
+            StrU(1, 20, 16);
+            LoadImm(1, nc);
+            StrU(1, 20, 24);
+        }
+        // type args
+        if (ntarg > 0) {
+            int k = 0;
+            while (k < ntarg) {
+                BLInternal("_refl_build_" + reflTargFlat[reflTargOff[i] + k]);
+                StrU(0, 20, tbase + 8 * k);
+                k = k + 1;
+            }
+            LoadImm(1, 0);
+            StrU(1, 20, tbase + 8 * ntarg);
+            LoadImm(1, tbase);
+            AddRR(1, 1, 20);                         // targs base: ABSOLUTE
+            StrU(1, 20, 40);
+        }
+        // publish: x0 = rec
+        AddImm(0, 20, 88);
+        StrU(0, 19, 0);
+        Mark(bdone);
+        E4(0xF84107F4);
+        E4(0xF84107F3);
+        RtEpilogue();
+    }
+
+    // methods and ctors of the base chain, base first, declaration order;
+    // `owns` receives the declaring class of each entry in ms (needed for
+    // the mangled method symbol)
+    void ReflCollectMembers(string cls, List<Node> ms, List<int> stats, List<string> owns, List<Node> ctors) {
+        Cls c = FindClass(cls);
+        if (c == null) { return; }
+        if (c.baseName != null) {
+            // interfaces are not runtime base classes: their abstract
+            // methods have no bodies and the oracle leaves them out of the
+            // implementing class's table
+            Cls bc = FindClass(c.baseName);
+            if (bc == null || bc.isIface != 1) {
+                ReflCollectMembers(c.baseName, ms, stats, owns, ctors);
+            }
+        }
+        List<int> mine = MethCandsCls(c.name);
+        if (mine == null) { return; }
+        int i = 0;
+        while (i < mine.Count) {
+            Node m = methNodes[mine[i]];
+            int st = methStat[mine[i]];
+            if (st == 2 && (m.sval2 == null || m.sval2 == "")) {
+                if (!HasTypeParams(m) && !HasMod(m, MOD.Extern())) { ctors.Add(m); }
+            } else if (st == 0 || st == 1) {
+                // externs carry no Zan body (the host provides them), so a
+                // thunk has nothing to call
+                if (!HasTypeParams(m) && !HasMod(m, MOD.Extern())) {
+                    ms.Add(m); stats.Add(st); owns.Add(c.name);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // i64 thunk(i64 obj, i64 args*): unpack the packed slots per signature
+    // and call the real method (x0 = this for instance methods); `target`
+    // is the mangled symbol of the method being wrapped
+    string EmitReflThunkM(string target, Node m, bool isStatic) {
+        // dedup by target symbol
+        string key = (isStatic ? "s|" : "i|") + target;
+        int k = ReflFindThunk(key);
+        if (k >= 0) { return reflThunkSyms[k]; }
+        string sym = "_refl_th_" + reflThunkSeq;
+        reflThunkSeq = reflThunkSeq + 1;
+        reflThunkKeys.Add(key);
+        reflThunkSyms.Add(sym);
+        int pc = ParamCount(m);
+        syms.Add(new Sym(sym, FnPad()));
+        E4(0xF81F0FFE);                              // push x30: the internal
+                                                     // call below clobbers lr
+        if (pc > 4) {
+            // beyond the 4-slot pack the oracle cannot reach it either
+            LoadImm(0, 0);
+            E4(0xF84107FE);
+            E4(0xD65F03C0);
+            return sym;
+        }
+        int r = 0;
+        while (r < pc) {
+            if (isStatic) { LdrU(r, 1, 8 * r); }
+            else { LdrU(r + 1, 1, 8 * r); }
+            r = r + 1;
+        }
+        BLInternal(target);
+        E4(0xF84107FE);                              // pop x30
+        E4(0xD65F03C0);                              // ret (result: raw x0)
+        return sym;
+    }
+
+    // i64 thunk(i64 args*): allocate and construct a fresh instance
+    string EmitReflThunkC(string cls, Node ctor) {
+        string target = ReflCtorTargetSym(cls, ctor);
+        string key = target + "|c";
+        int k = ReflFindThunk(key);
+        if (k >= 0) { return reflThunkSyms[k]; }
+        string sym = "_refl_th_" + reflThunkSeq;
+        reflThunkSeq = reflThunkSeq + 1;
+        reflThunkKeys.Add(key);
+        reflThunkSyms.Add(sym);
+        Cls c = FindClass(cls);
+        int cSize = (c != null) ? c.size : 0;
+        int cSite = (c != null) ? c.site : 0;
+        int cPoly = (c != null) ? c.poly : 0;
+        syms.Add(new Sym(sym, FnPad()));
+        RtPrologue();
+        E4(0xF81F0FF3);                              // x19 = args
+        MovRR(19, 0);
+        LoadImm(0, cSize + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        RtLdur(1, 0, -8);
+        E4((int)(0xD2C00000 | (((long)cSite) << 5) | 2));   // movz x2, #site, lsl #32
+        E4(0xAA020021);                              // orr x1, x1, x2
+        RtStur(1, 0, -8);
+        if (cPoly == 1) {
+            PushV(0);                          // push obj
+            LoadSymRef(DGlobalSym("vt." + cls), 9);
+            LdrU(1, 9, 0);
+            int vtd = NL();
+            CbnzReg(1, vtd);
+            BLInternal("_vtinit_" + cls);
+            MovRR(1, 0);
+            Mark(vtd);
+            PopV(0);
+            StrU(1, 0, 0);                           // obj->vptr
+        }
+        int pc = ParamCount(ctor);
+        int r = 0;
+        while (r < pc) {
+            LdrU(r + 1, 19, 8 * r);
+            r = r + 1;
+        }
+        PushV(0);                              // keep obj across the ctor
+        BLInternal(target);
+        PopV(0);                              // x0 = obj
+        E4(0xF84107F3);
+        RtEpilogue();
+        return sym;
+    }
+
+    // the ctor symbol a call through GenNew would use
+    string ReflCtorTargetSym(string cls, Node ctor) {
+        return CtorSymNg(cls, ctor);
+    }
+
+    int ReflFindThunk(string key) {
+        int i = 0;
+        while (i < reflThunkKeys.Count) {
+            if (reflThunkKeys[i] == key) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+}

@@ -1,0 +1,492 @@
+using System;
+using System.Collections;
+namespace Zan;
+
+// x86_64 (SysV) instruction encoding for Ngen -- 第十六批 opener.
+//
+// The front end speaks the arm64 register contract (x0 accumulator/arg0,
+// x1.. arg1.., x16/x17 scratch, x9 short-range scratch, x19-x28
+// callee-saved); this layer maps virtual registers onto SysV x86_64 so
+// argument marshaling needs no moves and every helper stays a branch:
+//
+//   v0 -> rdi  arg0 AND accumulator; the call shim reloads rax into rdi
+//              after every call -- the one unavoidable move per call
+//   v1..v5 -> rsi,rdx,rcx,r8,r9   (zero-move args for the first six)
+//   v6, v7 -> dedicated arg-stack slots: SysV stack args 7/8. The BL shim
+//              pushes both unconditionally; a callee reads only what it
+//              declares and the caller cleans up, so the junk is invisible.
+//   v8-v15, v19-v28 -> frame spill slots (arm64 v19-v28 are callee-saved;
+//              slots survive calls trivially, zero push/pop bookkeeping)
+//   v9 -> rax   short-range scratch; rax is free between the post-call
+//              rdi reload and the next call. Sites must not carry v9
+//              across a BL (they don't: LoadSymRef+StrU pairs, vtable blr).
+//   v16,v17 -> r10,r11 scratch; v29 -> rbp; v30(lr) -> [rbp+8]
+//
+// Stack invariant: rsp % 16 == 0 at every call instruction (entry rsp%16==8,
+// push rbp -> 0, frame alloc + every scratch push uses 16-byte steps).
+// The slot area is 160 bytes (20 slots); slot k lives at [rbp - 8(k+1)].
+//
+// Coverage (batch 16): the kernel1 surface -- int arithmetic/comparisons,
+// locals, managed calls, Console.WriteLine(int/bool/line), recursion, the
+// _main shim, print_int/println/strpool_init runtime cores. Anything else
+// the front end reaches fails CLOSED with a diagnostic (never silent
+// arm64 bytes in an x86 text section).
+
+partial class Ngen {
+    int tgt86;          // 1 = x86_64-macos codegen (set from ZAN_TARGET)
+
+    // ---- byte emitters (arm64's E4 appends 4 LE bytes; x86 is variable) ----
+    void X1(int b) { txt.Add(b & 255); }
+    void X2(int a, int b) { X1(a); X1(b); }
+    void X3(int a, int b, int c) { X1(a); X1(b); X1(c); }
+    void X4(long v) { X1((int)v); X1((int)(v >> 8)); X1((int)(v >> 16)); X1((int)(v >> 24)); }
+
+    // x86 code is byte-aligned, so the raw-code delegate tag can't borrow
+    // bit0 unless every function entry is even. Pad to even before each
+    // registration (<=1 nop); arm64 entries are 4-aligned already and the
+    // bit is free there, so this is a no-op on that lane.
+    int FnPad() {
+        if (tgt86 == 1 && (txt.Count & 1) == 1) { X1(0x90); }
+        return txt.Count;
+    }
+    void X8(long v) { X4(v); X4(ShiftRight(v, 32)); }
+
+    // ---- register map ----
+    // real x86 regs: 0=rax 1=rcx 2=rdx 3=rbx 4=rsp 5=rbp 6=rsi 7=rdi 8..15
+    int XMapReal(int v) {
+        if (v == 0) { return 7; }
+        if (v == 1) { return 6; }
+        if (v == 2) { return 2; }
+        if (v == 3) { return 1; }
+        if (v == 4) { return 8; }
+        if (v == 5) { return 9; }
+        if (v == 9) { return 0; }
+        if (v == 16) { return 10; }
+        if (v == 17) { return 11; }
+        if (v == 29) { return 5; }              // frame pointer
+        return -1;                              // spilled (or v18/v30)
+    }
+    int XVSlot(int v) {                         // slot index 0..19, -1 = real
+        if (v == 6) { return 18; }
+        if (v == 7) { return 19; }
+        if (v >= 8 && v <= 15) { return v - 8; }
+        if (v >= 19 && v <= 28) { return v - 19 + 8; }
+        return -1;
+    }
+    // 泼溅家在局部区之下:[rbp - frame - 8*(slot+1)]。批 33 前家固定在
+    // [rbp-8..-160],与局部区 [rbp-frame..-16] 重叠——运行时面局部少
+    // 从未踩到,用户方法一旦写 v6+ 家(9+ 参调用、EmitArrElemLoad 之
+    // 外的泛用暂存)就与局部槽互踩。xFrame 由 XPrologue 布防。
+    int xFrame = 0;
+    int XSlotFp(int slot) { return -(xFrame + 8 * (slot + 1)); }
+
+    void XFailClosed(string what, int line, int col) {
+        diags.Error("ngen x86: " + what + " is not ported yet (batch 16 covers the kernel1 surface) [in " + (syms.Count > 0 ? syms[syms.Count - 1].name : "?") + "]", line, col);
+    }
+
+    // ---- REX + ModRM primitives ----
+    int XrexW(int reg, int rm) { return 0x48 | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1); }
+    void XMov(int rd, int rs) { X1(XrexW(rs, rd)); X1(0x89); X1(0xC0 | ((rs & 7) << 3) | (rd & 7)); }
+    void Xop(int op, int rd, int rs) { X1(XrexW(rs, rd)); X1(op); X1(0xC0 | ((rs & 7) << 3) | (rd & 7)); }
+    // 批45:整参规范化原语。movsxd r64, r32(MR:目的地在 reg 场,R=目
+    // 的,B=源)符号展宽;mov r32, r32 硬件零扩高 32。
+    void Xmovsxd(int rd, int rs) { X1(0x48 | (((rd >> 3) & 1) << 2) | ((rs >> 3) & 1)); X1(0x63); X1(0xC0 | ((rd & 7) << 3) | (rs & 7)); }
+    void Xmov32(int rd, int rs) {
+        int rex45 = 0x40 | (((rs >> 3) & 1) << 2) | ((rd >> 3) & 1);
+        if (rex45 != 0x40) { X1(rex45); }
+        X1(0x89); X1(0xC0 | ((rs & 7) << 3) | (rd & 7));
+    }
+    // rm-operand form: op [reg + disp32], reg  (reg field = rs). rm=100 (rsp)
+    // requires a SIB byte (0x24: no index, base=rsp).
+    void XopMemR(int op, int rs, int rbase, int disp) {
+        X1(XrexW(rs, rbase)); X1(op);
+        if ((rbase & 7) == 4) {
+            X1(0x80 | ((rs & 7) << 3) | 4); X1(0x24);
+        } else {
+            X1(0x80 | ((rs & 7) << 3) | (rbase & 7));
+        }
+        X4(disp);
+    }
+    // reg-operand form: op reg, [reg + disp32]  (reg field = rd)
+    void XopRMem(int op, int rd, int rbase, int disp) {
+        X1(XrexW(rd, rbase)); X1(op);
+        if ((rbase & 7) == 4) {
+            X1(0x80 | ((rd & 7) << 3) | 4); X1(0x24);
+        } else {
+            X1(0x80 | ((rd & 7) << 3) | (rbase & 7));
+        }
+        X4(disp);
+    }
+
+    // ---- virtual-register staging ----
+    void XGetV(int v, int tmp) {                // value of v -> real tmp
+        int r = XMapReal(v);
+        if (r >= 0) {
+            if (r != tmp) { XMov(tmp, r); }
+        } else {
+            XopRMem(0x8B, tmp, 5, XSlotFp(XVSlot(v)));   // mov tmp, [rbp+off]
+        }
+    }
+    void XSetV(int v, int tmp) {                // tmp -> v
+        int r = XMapReal(v);
+        if (r >= 0) {
+            if (r != tmp) { XMov(r, tmp); }
+        } else {
+            XopMemR(0x89, tmp, 5, XSlotFp(XVSlot(v)));   // mov [rbp+off], tmp
+        }
+    }
+
+    // ---- immediates ----
+    void XLoadImm(int v, long val) {
+        int r = XMapReal(v);
+        if (r < 0) {
+            XLoadImm(16, val);                   // stage through r10
+            XSetV(v, 10);
+            return;
+        }
+        if (val >= -2147483648L && val <= 2147483647L) {
+            X1(XrexW(0, r)); X1(0xC7); X1(0xC0 | (r & 7));   // mov r, imm32 (sign-ext)
+            X4(val);
+        } else {
+            X1(XrexW(0, r) | 8); X1(0xB8 | (r & 7));         // movabs r, imm64
+            X8(val);
+        }
+    }
+
+    // ---- stack ----
+    void XSubRsp(long n) {
+        if (n == 0) { return; }
+        if (n >= -128 && n <= 127) { X3(0x48, 0x83, 0xEC); X1((int)n); }
+        else { X3(0x48, 0x81, 0xEC); X4(n); }
+    }
+    void XAddRsp(long n) {
+        if (n == 0) { return; }
+        if (n >= -128 && n <= 127) { X3(0x48, 0x83, 0xC4); X1((int)n); }
+        else { X3(0x48, 0x81, 0xC4); X4(n); }
+    }
+    // the arm64 `str x0, [sp, #-16]!` scratch push/pop sites, in 16-byte
+    // steps so the call-time alignment invariant never moves. Target-aware:
+    // under arm64 they emit the original word, so every call site can name
+    // the helper unconditionally.
+    void XPushV0() {
+        if (tgt86 != 1) { E4(0xF81F0FE0); return; }
+        XSubRsp(16); XopMemR(0x89, 7, 4, 0);          // mov [rsp], rdi
+    }
+    void XPushV1() {
+        if (tgt86 != 1) { E4(0xF81F0FE1); return; }
+        XSubRsp(16); XopMemR(0x89, 6, 4, 0);          // mov [rsp], rsi
+    }
+    void XPushR(int v) {                              // push v's value (x_v)
+        if (tgt86 != 1) { E4(0xF81F0FE0 | v); return; }
+        XSubRsp(16);
+        int r = XMapReal(v);
+        if (r >= 0) { XopMemR(0x89, r, 4, 0); }
+        else { XGetV(v, 10); XopMemR(0x89, 10, 4, 0); }
+    }
+    void XPopV(int v) {
+        if (tgt86 != 1) { E4(0xF84107E0 | v); return; }
+        int r = XMapReal(v);
+        if (r >= 0) { XopRMem(0x8B, r, 4, 0); }                       // mov r, [rsp]
+        else { XopRMem(0x8B, 10, 4, 0); XSetV(v, 10); }
+        XAddRsp(16);
+    }
+    void XPushPair01() {                              // stp x0, x1, [sp, #-16]!
+        if (tgt86 != 1) { E4(0xA9BF07E0); return; }
+        XSubRsp(16);
+        XopMemR(0x89, 7, 4, 0);                       // mov [rsp], rdi
+        XopMemR(0x89, 6, 4, 8);                       // mov [rsp+8], rsi
+    }
+
+    // RtStur/RtLdur twin: the runtime cores address frame slots and sp
+    // scratch through the arm64 fixed names (29 = frame pointer, 31 = stack
+    // pointer); every other operand is a v-register. Offsets travel as
+    // disp32, so negative rbp offsets need no special form.
+    void XMemV(int isLoad, int rt, int rn, int off) {
+        int b;
+        if (rn == 31) { b = 4; }                                      // rsp
+        else {
+            b = XMapReal(rn);
+            if (b < 0) { XGetV(rn, 11); b = 11; }
+        }
+        int r = XMapReal(rt);
+        if (isLoad == 1) {
+            if (r >= 0) { XopRMem(0x8B, r, b, off); }
+            else { XopRMem(0x8B, 10, b, off); XSetV(rt, 10); }
+        } else {
+            if (r >= 0) { XopMemR(0x89, r, b, off); }
+            else { XGetV(rt, 10); XopMemR(0x89, 10, b, off); }
+        }
+    }
+
+    // ---- prologue / epilogue ----
+    void XPrologue(int frame) {
+        xFrame = frame;
+        X1(0x55);                                // push rbp
+        X3(0x48, 0x89, 0xE5);                    // mov rbp, rsp
+        XSubRsp(frame + 160);                    // frame + 20 spill slots
+    }
+    // every function returns its v0 in RAX (the SysV return register --
+    // the one move per return; RDI stays the v0 accumulator). The call
+    // shim already reads results back from RAX, so internal calls, the
+    // export shims and the _main exit code all see the same contract.
+    void XEpilogue() {
+        X3(0x48, 0x89, 0xF8);                    // mov rax, rdi
+        X1(0xC9); X1(0xC3);                      // leave; ret
+    }
+
+    // ---- branches (fixup kinds reused: 0 = jmp rel32, 1/2 = jcc rel32,
+    // 3 = call rel32; Patch()'s x86 arms apply them at their new widths) ----
+    void XB(int label) {
+        X1(0xE9);
+        fixups.Add(new Fixup(txt.Count - 1, 0, label, 0, null));
+        X4(0);
+    }
+    // arm64 condition -> x86 jcc low nibble (x86 cc = 0x80 | nibble)
+    int XccOf(int armcond) {
+        if (armcond == 0) { return 0x04; }       // eq
+        if (armcond == 1) { return 0x05; }       // ne
+        if (armcond == 2) { return 0x03; }       // cs/hs
+        if (armcond == 3) { return 0x02; }       // cc/lo
+        if (armcond == 4) { return 0x08; }       // mi
+        if (armcond == 5) { return 0x09; }       // pl
+        // vs 在本库的每个调用点都是 comisd/ucomisd 之后的"无序"分支
+        // (ngen_numeric 三处注释明写 jp;标量路径手滚 0F 8A)。SSE 无序
+        // 置的是奇偶位不是 OF——0x00(jo)永远不跳,NaN 检查全体失效。
+        // x86 整数溢出无人用 cond 6,修成 jp(0x0A)。
+        if (armcond == 6) { return 0x0A; }       // vs -> jp: FP unordered
+        if (armcond == 7) { return 0x0B; }       // vc -> jnp
+        if (armcond == 8) { return 0x07; }       // hi
+        if (armcond == 9) { return 0x06; }       // ls
+        if (armcond == 10) { return 0x0D; }      // ge
+        if (armcond == 11) { return 0x0C; }      // lt
+        if (armcond == 12) { return 0x0F; }      // gt
+        if (armcond == 13) { return 0x0E; }      // le
+        return -1;
+    }
+    void XBcond(int cond, int label) {
+        int cc = XccOf(cond);
+        X2(0x0F, 0x80 | cc);
+        fixups.Add(new Fixup(txt.Count - 2, 1, label, cond, null));
+        X4(0);
+    }
+    void XCbz(int v, int label, int invert) {
+        int r = XMapReal(v);
+        if (r >= 0) { X1(XrexW(r, r)); X1(0x85); X1(0xC0 | ((r & 7) << 3) | (r & 7)); }   // test r, r
+        else { XGetV(v, 10); X3(0x4D, 0x85, 0xD2); }            // test r10, r10
+        X2(0x0F, invert != 0 ? 0x85 : 0x84);
+        fixups.Add(new Fixup(txt.Count - 2, 1, label, invert, null));
+        X4(0);
+    }
+
+    // ---- calls: the SysV shim ----
+    // Stages the stack-class arguments (batch 33: arg(6+k) rides in the
+    // v(6+k) home, lands at [rsp+8k] -- the callee reads it back at
+    // [rbp+16+8k]), calls, reclaims, and lands the return in v0
+    // (mov rdi, rax). xStackArgs is set by the call sites that pushed more
+    // than six register-class arguments; a callee with a shorter parameter
+    // list never reads the junk slots.
+    int xStackArgs = 0;
+    int xVecArgs = 0;          // SysV al:本调用用掉的 xmm 寄存器数(变参 C
+                               // 调用方 ABI 要求;musl printf 的 va_start
+                               // 按 al==0 跳过 xmm 溢出,%f 直接读溢出区)
+    void XCallSeq(string sym, int isExtern) {
+        int n = xStackArgs; xStackArgs = 0;
+        int area = 16 * ((n + 1) / 2);           // 8*n rounded to 16, min 16
+        if (area < 16) { area = 16; }
+        XSubRsp(area);
+        int k = 0;
+        while (k < n) {
+            // 批50:v16/v17 物理映射 = r10/r11 scratch,按位换号到 v19/v20
+            // 真家(装载端同步改道,XArgVOf)—— 否则轮到 v16 时 XGetV
+            // 空转,r10 已被上一槽覆盖(S17 探针现形)。
+            XGetV(XArgVOf(6 + k), 10);
+            XopMemR(0x89, 10, 4, 8 * k);         // mov [rsp+8k], r10
+            k = k + 1;
+        }
+        if (isExtern != 0 && xVecArgs != 0) {
+            X2(0xB0, xVecArgs);                  // mov al, n(非变参 callee 忽略 al)
+        }
+        xVecArgs = 0;
+        X1(0xE8);
+        fixups.Add(new Fixup(txt.Count - 1, isExtern != 0 ? 4 : 3, 0, 0, sym));
+        X4(0);
+        XAddRsp(area);
+        XMov(7, 0);                              // mov rdi, rax  (v0 = result)
+    }
+
+    // ---- physical GPR move for the export shim's SysV permute (批 36):
+    // mov r_dst, r_src = 89 /r with reg=src rm=dst; REX.R covers r8-r15
+    // sources, REX.B r8-r15 destinations. Shim level: no v-homes involved.
+    void XMovGG(int dst, int src) {
+        X1(0x48 | ((src >> 3) << 2) | (dst >> 3));
+        X1(0x89);
+        X1(0xC0 | ((src & 7) << 3) | (dst & 7));
+    }
+
+    // ---- setcc into v0 (the cset twins): flags from cmp rsi, rdi (v1 vs v0)
+    // land in al (v0's low byte), then zero-extend. setop: 94 eq 95 ne
+    // 92 b 93 ae 96 be 97 a 9C l 9D ge 9E le 9F g 98 s 99 ns
+    void XSetV0cc(int setop) {
+        X3(0x0F, setop, 0xC0);                   // setcc al
+        X1(0x48); X1(0x0F); X1(0xB6); X1(0xF8);  // movzx rdi, al
+    }
+
+    // ---- three-operand add (AddRR twin): 2-addr machine, so stage. r10/r11
+    // are both scratch AND possible operands (v16/v17); pick an accumulator
+    // that is neither input, fail closed on the impossible both-scratch case.
+    void XAddRR(int rd, int rn, int rm) {
+        // v31 在基址/加数位置是 sp(arm64 寄存器 31 的双义:基址=sp,
+        // 比较源=xzr——xzr 由 HostCmp/StringCmp 各自处理)
+        int n = rn == 31 ? 4 : XMapReal(rn);
+        int m = rm == 31 ? 4 : XMapReal(rm);
+        if (n == 10 && m == 11) { XFailClosed("add with both scratch operands", curLine, curCol); return; }
+        int acc = (n == 10 || m == 10) ? 11 : 10;
+        if (n >= 0) { if (n != acc) { XMov(acc, n); } }
+        else { XopRMem(0x8B, acc, 5, XSlotFp(XVSlot(rn))); }
+        if (m >= 0) { Xop(0x01, acc, m); }
+        else { XGetV(rm, 10 == acc ? 11 : 10); Xop(0x01, acc, 10 == acc ? 11 : 10); }
+        XSetV(rd, acc);
+    }
+
+    // rd = rn -/+ imm when rd != rn (or either is spilled): stage through
+    // racc, apply imm, store. sub != 0 selects SUB (op /5) over ADD (/0).
+    // modrm = C0 | (op<<3) | rm(010=r10):ADD 0xC2,SUB 0xEA。(曾误写 0xED:
+    // rm 位 101 经 REX.B 变 r13,动的是没人读的 r13,r10 原值未减——
+    // rd!=rn 的 SubImm 会存回旧值;kernel1-8 未踩中,本批 header 慢路径
+    // SubImm(1,0,16) 必踩。)
+    void XAddImmTwin(int rd, int rn, int imm, int sub) {
+        if (rn == 31) {
+            // rd = rsp ± imm:lea/sub 直达(基址 31 = sp)
+            XopRMem(sub != 0 ? 0x8D : 0x8D, 10, 4, sub != 0 ? -imm : imm);
+            XSetV(rd, 10);
+            return;
+        }
+        XGetV(rn, 10);
+        int opc = sub != 0 ? 0xEA : 0xC2;
+        if (imm >= -128 && imm <= 127) { X3(0x49, 0x83, opc); X1(imm); }
+        else { X3(0x49, 0x81, opc); X4(imm); }
+        XSetV(rd, 10);
+    }
+
+    // ---- generic int/ulong binary op, x86 twin of the arm64 chains ----
+    // operands staged by the caller: b in v0 (rdi), a in v1 (rsi) -- the
+    // arm64 push-a/pop-into-x1 order reversed by the accumulator; result
+    // into v0. Mirrors the signed/unsigned split and the zero-divisor
+    // guard (int also folds i64min / -1).
+    void X86IntBinop(Node e, int op) {
+        int k32a = Int32Kind(e.a);
+        int k32b = Int32Kind(e.b);
+        bool isU = IsUlongExpr(e.a) || IsUlongExpr(e.b) || (k32a == 2 && k32b == 2);
+        if (op == TK.Plus()) {
+            Xop(0x01, 7, 6);                        // add rdi, rsi (b+a)
+            if (k32a == 1 && k32b == 1) { Wrap32(1); }
+        } else if (op == TK.Minus()) {
+            Xop(0x29, 6, 7);                        // sub rsi, rdi (a-b)
+            XMov(7, 6);                             // mov rdi, rsi
+            if (k32a == 1 && k32b == 1) { Wrap32(1); }
+        } else if (op == TK.Star()) {
+            X1(XrexW(6, 7)); X2(0x0F, 0xAF); X1(0xC0 | (7 << 3) | 6);   // imul rdi, rsi
+            if (k32a == 1 && k32b == 1) { Wrap32(1); }
+        } else if (op == TK.Slash() || op == TK.Percent()) {
+            int bad = NL();
+            int cont = NL();
+            CbzReg(0, bad);                         // test rdi, rdi; jz
+            EmitB(cont);
+            Mark(bad);
+            XPushV1();                              // keep the dividend across the guard call
+            LoadSymRef("l_.str." + guardFileIdx, 0);
+            LoadImm(1, curLine);
+            LoadImm(2, curCol);
+            if (op == TK.Slash()) { LoadSymRef("l_.str." + guardDivIdx, 3); }
+            else { LoadSymRef("l_.str." + guardModIdx, 3); }
+            BLInternal("_zan_rt_guard_fail3");
+            XPopV(1);                               // restore dividend (own push; cont must not pop)
+            LoadImm(0, 1);                          // safe divisor
+            Mark(cont);
+            if (!isU) {
+                int safe = NL();
+                LoadImm(2, -9223372036854775807L - 1L);  // v2 = rdx = i64 min
+                LoadImm(3, -1);                     // v3 = rcx
+                Xop(0x39, 7, 1);                    // cmp rdi, rcx
+                EmitBcond(1, safe);                 // jne safe
+                Xop(0x39, 6, 2);                    // cmp rsi, rdx
+                EmitBcond(1, safe);
+                LoadImm(0, 1);
+                Mark(safe);
+            }
+            XMov(0, 6);                             // mov rax, rsi (dividend; XMov takes REAL regs -- v1 is r6)
+            if (isU) {
+                X2(0x31, 0xD2);                     // xor edx, edx
+                X3(0x48, 0xF7, 0xF0 | 7);           // div rdi
+            } else {
+                X2(0x48, 0x99);                     // cqo
+                X3(0x48, 0xF7, 0xF8 | 7);           // idiv rdi
+            }
+            if (op == TK.Slash()) {
+                XMov(7, 0);                         // mov rdi, rax (quotient)
+                if (!isU && k32a == 1 && k32b == 1) { Wrap32(1); }
+            } else {
+                XMov(7, 2);                         // mov rdi, rdx (remainder)
+            }
+        } else if (op == TK.Less() || op == TK.Greater() || op == TK.LessEq()
+                || op == TK.GreaterEq() || op == TK.EqEq() || op == TK.BangEq()) {
+            Xop(0x39, 6, 7);                        // cmp rsi, rdi (a-b direction, like cmp x1, x0)
+            int setop;
+            if (op == TK.EqEq()) { setop = 0x94; }
+            else if (op == TK.BangEq()) { setop = 0x95; }
+            else if (op == TK.Less()) { setop = isU ? 0x92 : 0x9C; }
+            else if (op == TK.Greater()) { setop = isU ? 0x97 : 0x9F; }
+            else if (op == TK.LessEq()) { setop = isU ? 0x96 : 0x9E; }
+            else { setop = isU ? 0x93 : 0x9D; }
+            XSetV0cc(setop);
+        } else if (op == TK.LessLess() || op == TK.GreaterGreater()
+                || op == TK.GreaterGreaterGreater()) {
+            bool bothU = k32a == 2 && k32b == 2;
+            bool mask = op == TK.GreaterGreaterGreater() ? (bothU || ShiftMask32(e.a))
+                : ShiftMask32(e.a);
+            if (mask) {
+                X3(0x48, 0x83, 0xE7); X1(31);       // and rdi, 31
+            }
+            XMov(1, 7);                             // mov rcx, rdi (count)
+            XMov(0, 6);                             // mov rax, rsi (value)
+            if (op == TK.LessLess()) { X3(0x48, 0xD3, 0xE0); }             // shl rax, cl
+            // >> is arithmetic only for signed operands; ulong shifts go
+            // logical (the arm64 path emits lsrv for the same expression)
+            else if (op == TK.GreaterGreater()) {
+                if (isU) { X3(0x48, 0xD3, 0xE8); }                         // shr rax, cl
+                else { X3(0x48, 0xD3, 0xF8); }                             // sar rax, cl
+            }
+            else { X3(0x48, 0xD3, 0xE8); }                                 // shr
+            XMov(7, 0);                             // mov rdi, rax
+        } else if (op == TK.Amp()) { Xop(0x21, 7, 6); }
+        else if (op == TK.Pipe()) { Xop(0x09, 7, 6); }
+        else if (op == TK.Caret()) { Xop(0x31, 7, 6); }
+        else {
+            diags.Error("ngen x86: unsupported operator " + op, e.line, e.col);
+        }
+    }
+
+    // int narrowing twin (the arm64 `sxtw x0, w0` sites): movsxd rdi, edi
+    void Sxtw0() {
+        if (tgt86 == 1) { X3(0x48, 0x63, 0xFF); return; }
+        E4(0x93407C00);
+    }
+
+    // ---- rip-relative address load (LoadSymRef/LoadStr twins) ----
+    // lea reg, [rip+disp32]; one X86_64_RELOC_SIGNED pcrel reloc at the
+    // disp32. The writer emits it from the StrRef whose addPos == adrpPos.
+    void XLeaSym(string sym, int v) {
+        int r = XMapReal(v);
+        if (r < 0) {
+            XLeaSym(sym, 16);
+            XSetV(v, 10);
+            return;
+        }
+        int pos = txt.Count;
+        X1(XrexW(r, 0));                         // REX.W + REX.R for r8-r15
+        X1(0x8D);
+        X1(0x05 | ((r & 7) << 3));               // mod=00, rm=101 (rip-rel)
+        X4(0);
+        strRefs.Add(new StrRef(pos, pos, sym));
+    }
+}

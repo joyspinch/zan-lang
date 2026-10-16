@@ -2,54 +2,69 @@ using System;
 using System.Collections;
 namespace Zan;
 
-class ScopeSymbol {
-    public string name;
-    public Node type;
-
-    public ScopeSymbol(string name, Node type) {
-        this.name = name != null ? name : "";
-        this.type = type;
-    }
-}
-
+// Checker: semantic pass over the bound AST. Beyond resolving every type
+// reference (primitive, builtin generic, type parameter or declared type) it
+// walks method/constructor bodies with a typed lexical scope and a light
+// expression typer so that it can reject the illegal programs that the
+// resolution-only pass used to wave through:
+//   * local variables, parameters and other bindings are tracked with types;
+//   * identifiers used in value positions must resolve to a local, parameter,
+//     field/method of the enclosing type, a known type or an enum member;
+//   * a member access / call on a value of a *known* user type must name a
+//     real field, method or property of that type (walking base classes);
+//   * a call must pass an argument count some overload accepts;
+//   * `return` must carry a value in a non-void method and must not in a void
+//     one; a static method may not use `this` or an instance field;
+//   * break/continue may only appear inside a loop or switch;
+//   * a parameter name may not be declared twice in one signature.
+//
+// The typer is deliberately conservative: when it cannot determine a type it
+// yields null and the dependent check is skipped, so standard-library calls
+// (Console, File, Math, ...) whose receiver types the bootstrap binder does
+// not track are never mis-flagged. Mirrors src/compiler/checker.c for the
+// bootstrap subset while being strictly more thorough.
 class Checker {
     public Binder binder;
     public Diags diags;
 
-    Node curClass;  // type declaration whose body is being checked
-    Node curRet;  
-    bool curVoid;  // is the current method void / a constructor
-    bool curStatic;  // is the current method static
+    Node curClass;              // type declaration whose body is being checked
+    Node curRet;                // return type of the current method (null=void)
+    bool curVoid;               // is the current method void / a constructor
+    bool curStatic;             // is the current method static
     int infCount;
-    int loopDepth;  // enclosing loop/switch nesting
-    List<ScopeSymbol> scopes;  // 结构化词法作用域符号表
+    int loopDepth;              // enclosing loop/switch nesting
+    List<string> scopeName;     // value names currently in scope
+    List<Node> scopeType;       // parallel declared/inferred types (may be null)
 
     public Checker(Binder b, Diags d) {
         binder = b; diags = d; curClass = null; curRet = null;
         curVoid = true; curStatic = false; loopDepth = 0;
-        scopes = new List<ScopeSymbol>();
+        scopeName = new List<string>(); scopeType = new List<Node>();
     }
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
     bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
 
-    int ScopeMark() { return scopes.Count; }
+    // ---- lexical scope ----
+    int ScopeMark() { return scopeName.Count; }
     void ScopeTrim(int to) {
-        List<ScopeSymbol> nn = new List<ScopeSymbol>();
+        List<string> nn = new List<string>();
+        List<Node> nt = new List<Node>();
         int i = 0;
-        while (i < to) { nn.Add(scopes[i]); i = i + 1; }
-        scopes = nn;
+        while (i < to) { nn.Add(scopeName[i]); nt.Add(scopeType[i]); i = i + 1; }
+        scopeName = nn; scopeType = nt;
     }
     void ScopeAdd(string name, Node ty) {
-        if (name != "") { scopes.Add(new ScopeSymbol(name, ty)); }
+        if (name != "") { scopeName.Add(name); scopeType.Add(ty); }
     }
     int ScopeIdx(string name) {
-        int i = scopes.Count - 1;
-        while (i >= 0) { if (scopes[i].name == name) { return i; } i = i - 1; }
+        int i = scopeName.Count - 1;
+        while (i >= 0) { if (scopeName[i] == name) { return i; } i = i - 1; }
         return -1;
     }
     bool ScopeHas(string name) { return ScopeIdx(name) >= 0; }
 
+    // ---- type-directed lookup, walking base classes ----
     Node FieldUp(Node cls, string name) {
         Node c = cls;
         int cg = 0;
@@ -74,6 +89,7 @@ class Checker {
         }
         return null;
     }
+    // A field, method or property accessor named `name`, up the base chain.
     bool HasMember(Node cls, string name) {
         if (FieldUp(cls, name) != null) { return true; }
         if (MethodUp(cls, name) != null) { return true; }
@@ -82,11 +98,13 @@ class Checker {
         return false;
     }
 
+    // An extension method `name` whose `this` receiver matches type `tyName`.
     bool HasExt(string tyName, string name) {
         List<string> owner = new List<string>();
         return binder.FindExtension(tyName, name, owner) != null;
     }
 
+    // The user class/struct declaration a type refers to, or null.
     Node ClassOf(Node t) {
         if (t == null) { return null; }
         Node d = binder.FindType(t.sval);
@@ -125,6 +143,10 @@ class Checker {
         return false;
     }
 
+    // ---- overload arity ----
+    // True if some method named `name` (up the base chain) can accept `argc`
+    // positional arguments, or if any candidate is an extension method (whose
+    // receiver shifts the count) -- in which case we do not second-guess it.
     bool AcceptsArgc(Node cls, string name, int argc) {
         Node c = cls;
         int cg3 = 0;
@@ -146,6 +168,7 @@ class Checker {
                         j = j + 1;
                     }
                     if (argc >= req && argc <= tot) { return true; }
+                    // `params T[]` tail accepts any argc >= fixed params
                     if (lastP != null && lastP.op == 1 && argc >= req - 1) { return true; }
                 }
                 i = i + 1;
@@ -157,6 +180,7 @@ class Checker {
         return false;
     }
 
+    // ---- expression typer (null == unknown) ----
     Node InferType(Node e) {
         infCount = infCount + 1;
         if (e == null) { return null; }
@@ -170,7 +194,7 @@ class Checker {
         if (k == AK.ThisExpr()) { if (curClass != null) { return MkType(curClass.sval); } return null; }
         if (k == AK.Ident()) {
             int si = ScopeIdx(e.sval);
-            if (si >= 0) { return scopes[si].type; }
+            if (si >= 0) { return scopeType[si]; }
             Node f = FieldUp(curClass, e.sval);
             if (f != null) { return f.type; }
             return null;
@@ -178,6 +202,7 @@ class Checker {
         if (k == AK.CastExpr()) { return e.type; }
         if (k == AK.AwaitExpr()) { return InferType(e.a); }
         if (k == AK.NewExpr()) { return e.type; }
+        if (k == AK.CallInit()) { return InferType(e.a); }
         if (k == AK.IsExpr()) { return MkType("bool"); }
         if (k == AK.QueryExpr()) {
             Node srcT = InferType(e.a);
@@ -257,6 +282,7 @@ class Checker {
 
     bool IsStr(Node t) { return t != null && t.sval == "string"; }
 
+    // A type node resolves if its base name is known. Generic args are checked
     // recursively.
     void CheckType(Node t) {
         if (t == null) { return; }
@@ -265,6 +291,7 @@ class Checker {
         if (!ok) { ok = binder.IsBuiltinGeneric(name); }
         if (!ok) { ok = binder.IsTypeParam(name); }
         if (!ok) { ok = binder.IsDelegateName(name); }
+        if (!ok) { ok = name == "TypeInfo"; }   // builtin reflection handle
         if (!ok) { if (binder.FindType(name) != null) { ok = true; } }
         if (!ok) { diags.Error("unknown type '" + name + "'", t.line, t.col); }
         int i = 0;
@@ -300,7 +327,7 @@ class Checker {
 
     void CheckMethod(Node m, bool ctor) {
         if (m.type != null) { CheckType(m.type); }
-        scopes = new List<ScopeSymbol>();
+        scopeName = new List<string>(); scopeType = new List<Node>();
         loopDepth = 0;
         curRet = m.type;
         curVoid = ctor || m.type == null || m.type.sval == "void";
@@ -323,13 +350,17 @@ class Checker {
         }
     }
 
+    // ---- control-flow: does a statement definitely return/throw? ----
+    // Over-approximates "returns" (favours reporting nothing) so a real
+    // fall-through is caught without flagging exhaustive constructs.
     bool IsTrueLit(Node e) { return e != null && e.kind == AK.BoolLit() && e.ival == 1; }
 
     bool HasBreak(Node n) {
         if (n == null) { return false; }
         int k = n.kind;
         if (k == AK.BreakStmt()) { return true; }
-        if (k == AK.WhileStmt() || k == AK.ForStmt() || k == AK.ForeachStmt() || k == AK.SwitchStmt()) { return false; }
+        // nested loops / switch capture their own breaks
+        if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.ForStmt() || k == AK.ForeachStmt() || k == AK.SwitchStmt()) { return false; }
         if (HasBreak(n.a) || HasBreak(n.b) || HasBreak(n.c) || HasBreak(n.d)) { return true; }
         int i = 0;
         while (i < n.kids.Count) { if (HasBreak(n.kids[i])) { return true; } i = i + 1; }
@@ -348,6 +379,7 @@ class Checker {
             return n.c != null && DefinitelyReturns(n.b) && DefinitelyReturns(n.c);
         }
         if (k == AK.WhileStmt()) { return IsTrueLit(n.a) && !HasBreak(n.b); }
+        if (k == AK.DoWhileStmt()) { return IsTrueLit(n.a) && !HasBreak(n.b); }
         if (k == AK.SwitchStmt()) {
             bool hasDefault = false;
             int i = 0;
@@ -384,6 +416,15 @@ class Checker {
             Node ty = n.type;
             if (ty == null) { ty = InferType(n.b); }
             ScopeAdd(n.sval, ty);
+            int di = 0;
+            while (di < n.kids.Count) {
+                Node d = n.kids[di];
+                CheckExpr(d.b);
+                Node dty = d.type;
+                if (dty == null) { dty = InferType(d.b); }
+                ScopeAdd(d.sval, dty);
+                di = di + 1;
+            }
             return;
         }
         if (k == AK.DeconDecl()) {
@@ -421,6 +462,13 @@ class Checker {
             loopDepth = loopDepth + 1;
             int m = ScopeMark(); CheckStmt(n.b); ScopeTrim(m);
             loopDepth = loopDepth - 1;
+            return;
+        }
+        if (k == AK.DoWhileStmt()) {
+            loopDepth = loopDepth + 1;
+            int m = ScopeMark(); CheckStmt(n.b); ScopeTrim(m);
+            loopDepth = loopDepth - 1;
+            CheckExpr(n.a);
             return;
         }
         if (k == AK.ForStmt()) {
@@ -486,6 +534,8 @@ class Checker {
     }
 
     // ---- expressions ----
+    // The object of a member access / callee of a call is not flagged as an
+    // undefined identifier: it may name a stdlib type or namespace.
     void CheckObj(Node n) {
         if (n == null) { return; }
         if (n.kind == AK.Ident()) { return; }
@@ -513,6 +563,9 @@ class Checker {
         if (k == AK.MemberAccess()) { CheckMember(n); return; }
         if (k == AK.Call()) { CheckCall(n); return; }
         if (k == AK.OutArg()) {
+            // `ref x` place form: check the referenced expression
+            if (n.a != null) { CheckExpr(n.a); return; }
+            // `out T name` declares a new local visible after the call
             if (n.type != null) { ScopeAdd(n.sval, n.type); }
             else if (!KnownValue(n.sval)) {
                 diags.Error("undefined identifier '" + n.sval + "'", n.line, n.col);
@@ -522,12 +575,22 @@ class Checker {
         if (k == AK.Binary() || k == AK.Assignment()) { CheckExpr(n.a); CheckExpr(n.b); return; }
         if (k == AK.Unary() || k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
         if (k == AK.Index()) { CheckExpr(n.a); CheckExpr(n.b); return; }
+        if (k == AK.CallInit()) { CheckCallInitItems(n); return; }
         if (k == AK.NewExpr()) {
+            // anonymous new has no type node: it only appears inside db
+            // query lambdas, which the dbgen rewrite replaces before this
+            // walk; anything surviving to here is a user error
+            if (n.type == null) {
+                diags.Error("anonymous types are only supported in database query lambdas", n.line, n.col);
+                return;
+            }
             CheckType(n.type);
             CheckExpr(n.b);
             int i = 0;
             while (i < n.kids.Count) {
                 Node it = n.kids[i];
+                // object initializer `Field = v`: the lhs names a field of the
+                // new type, not a local, so only the value is checked here.
                 if (n.ival == 2 && it.kind == AK.Assignment()) {
                     CheckExpr(it.b);
                 } else {
@@ -590,12 +653,27 @@ class Checker {
         }
     }
 
+    // The reflection instance surface lowers to generated helpers (ngen),
+    // not user members -- accepted on any receiver, like the oracle.
+    bool IsReflInstName(string n) {
+        if (n == "GetType" || n == "HasField" || n == "HasMethod") { return true; }
+        if (n == "GetFieldInt" || n == "GetFieldLong" || n == "GetFieldBool"
+                || n == "GetFieldDouble" || n == "GetFieldString") { return true; }
+        if (n == "SetFieldInt" || n == "SetFieldLong" || n == "SetFieldBool"
+                || n == "SetFieldDouble" || n == "SetFieldString") { return true; }
+        if (n == "Invoke" || n == "InvokeInt" || n == "InvokeLong"
+                || n == "InvokeDouble" || n == "InvokeString") { return true; }
+        return false;
+    }
+
     void CheckMember(Node n) {
         CheckObj(n.a);
         Node ot = InferType(n.a);
         Node cls = ClassOf(ot);
         if (cls != null && !HasMember(cls, n.sval) && !HasExt(cls.sval, n.sval)) {
-            diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
+            if (!IsReflInstName(n.sval)) {
+                diags.Error("type '" + cls.sval + "' has no member '" + n.sval + "'", n.line, n.col);
+            }
         }
     }
 
@@ -610,6 +688,7 @@ class Checker {
         }
         int argc = n.kids.Count;
         if (callee != null && callee.kind == AK.Ident()) {
+            // bare call: resolve against the enclosing type's methods
             Node cands = MethodUp(curClass, callee.sval);
             if (cands != null && !hasNamed && !AcceptsArgc(curClass, callee.sval, argc)) {
                 diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
@@ -622,7 +701,9 @@ class Checker {
             Node cls = ClassOf(ot);
             if (cls != null) {
                 if (!HasMember(cls, callee.sval) && !HasExt(cls.sval, callee.sval)) {
-                    diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
+                    if (!IsReflInstName(callee.sval)) {
+                        diags.Error("type '" + cls.sval + "' has no member '" + callee.sval + "'", n.line, n.col);
+                    }
                 } else if (MethodUp(cls, callee.sval) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
                     diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
                 }
@@ -630,5 +711,17 @@ class Checker {
             return;
         }
         CheckObj(callee);
+    }
+    // 工厂调用延续初始化器的成员写（独立方法：CheckExpr 已在每方法的
+    // 局部槽预算边缘，不再往里长）：调用本身照常查，成员写只查右值
+    // （lhs 是返回对象的成员名，不是局部量）。
+    void CheckCallInitItems(Node n) {
+        CheckExpr(n.a);
+        int i = 0;
+        while (i < n.kids.Count) {
+            Node it = n.kids[i];
+            if (it.kind == AK.Assignment()) { CheckExpr(it.b); } else { CheckExpr(it); }
+            i = i + 1;
+        }
     }
 }
