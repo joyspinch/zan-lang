@@ -429,7 +429,7 @@ static void zan_ios_touch_action(int action, int x, int y) {
         float dpi = (float)(g_iwin.dpi > 0 ? g_iwin.dpi : 192);
         float scale = dpi / 96.0f;
         if (scale < 1.0f) scale = 2.0f;
-        float slop_px = 12.0f * scale;
+        float slop_px = 6.0f * scale;
         float slop2 = slop_px * slop_px;
         if (!g_ios_touch_drag) {
             float dx = fx - g_ios_touch_ax, dy = fy - g_ios_touch_ay;
@@ -974,7 +974,7 @@ typedef struct {
     CGImageRef img;
 } zan_present_ctx_t;
 
-static void zan_ios_do_present(void *arg) {
+static void zan_ios_present_on_main(void *arg) {
     zan_present_ctx_t *ctx = (zan_present_ctx_t *)arg;
     if (ctx && ctx->layer && ctx->img) {
         zan_class_t cls_tx = g_bridge.objc_getClass("CATransaction");
@@ -993,6 +993,16 @@ static void zan_ios_do_present(void *arg) {
             zan_sel_t sel_set_contents = g_bridge.sel_registerName("setContents:");
             zan_send1(ctx->layer, sel_set_contents, (zan_id_t)ctx->img);
         }
+    }
+}
+
+static void zan_ios_do_present(zan_present_ctx_t *ctx) {
+    if (p_pthread_main_np && p_pthread_main_np()) {
+        zan_ios_present_on_main(ctx);
+    } else if (p_dispatch_sync_f && p_dispatch_main_q) {
+        p_dispatch_sync_f(p_dispatch_main_q, ctx, zan_ios_present_on_main);
+    } else {
+        zan_ios_present_on_main(ctx);
     }
 }
 
@@ -1193,7 +1203,7 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                     p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
                 if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
                 }
                 p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1213,7 +1223,7 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                     p_CGContextSetGrayFillColor(ctx, 1.0, 1.0);
                 }
                 if (p_CGContextSetTextPosition) {
-                    p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
+                    p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
                 }
                 p_CTLineDraw(line, ctx);
                 if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1233,7 +1243,7 @@ static zan_ios_text_entry_t *zan_ios_text_lookup(const char *utf8, int font_size
                     g_cs_rgb, (4 << 12) | 1);
                 if (ctx) {
                     if (p_CGContextSetTextPosition) {
-                        p_CGContextSetTextPosition(ctx, 1.0, descent + leading + 1.0);
+                        p_CGContextSetTextPosition(ctx, 1.0, descent + 1.0);
                     }
                     p_CTLineDraw(line, ctx);
                     if (p_CGContextFlush) p_CGContextFlush(ctx);
@@ -1316,7 +1326,7 @@ int zan_ios_draw_text(i32 surface_id, i32 x, i32 y, const char *utf8, i32 color,
         int dy = (int)y + py - 1;
         if (dy < cy0 || dy >= cy1) continue;
         uint32_t *dst_row = pixels + (size_t)dy * stride;
-        const unsigned char *mask_row = mask + (size_t)(th - 1 - py) * tw;
+        const unsigned char *mask_row = mask + (size_t)py * tw;
         for (int px = 0; px < tw; px++) {
             int dx = (int)x + px - 1;
             if (dx < cx0 || dx >= cx1) continue;
