@@ -7,7 +7,7 @@ namespace System.Net.Sockets;
 // 跨平台异步 TCP 监听器。构造后首次 Accept 可自动 Start；
 // 显式 Stop 后不会自动重开。Stop 取消挂起的 accept，保留描述符
 // 到这些操作结束；StopAsync 可等待它们全部结束。
-class TcpListener {
+public class TcpListener : IDisposable {
     nint sock;
     string host;
     int port;
@@ -18,7 +18,7 @@ class TcpListener {
     private int activeAccepts;
     private CancellationTokenSource acceptCancellation;
 
-    TcpListener(string host, int port) {
+    public TcpListener(string host, int port) {
         Socket.Initialize();
         this.host = host;
         this.port = port;
@@ -32,7 +32,7 @@ class TcpListener {
     }
 
     // 创建并启动一个带自定义 backlog 的监听器。
-    static TcpListener CreateAndStart(string host, int port, int backlog) {
+    public static TcpListener CreateAndStart(string host, int port, int backlog) {
         TcpListener listener = new TcpListener(host, port);
         listener.backlog = backlog;
         listener.Start();
@@ -42,14 +42,14 @@ class TcpListener {
     // 开始监听；运行中为无操作。创建、绑定、监听、非阻塞
     // 任一步失败都关闭新 fd 并抛 SocketException。IPv6 字面量使用
     // AF_INET6。显式 Stop 后可再 Start，但须先等待旧 accept 结束。
-    void Start() {
+    public void Start() {
         lock (this.sync) { this.StartOwned(false); }
     }
 
     // 在 bind 前启用 SO_REUSEPORT，让 Linux/macOS 的多个
     // worker 共享同一端口。Windows 与 Start 相同。生命周期与 Start
     // 相同：正在运行不重开，旧 accept 排空前拒绝重启。
-    void StartReusePort() {
+    public void StartReusePort() {
         lock (this.sync) { this.StartOwned(true); }
     }
 
@@ -126,7 +126,7 @@ class TcpListener {
     // 等待并接受非阻塞客户端。取消/失败返回 -1。停止状态
     // 在启动操作前与 await 后均检查；accept 的取消定时器先结束，
     // 最后一个操作才关闭监听 fd，避免迟到通知误伤复用的描述符。
-    async nint AcceptAsync() {
+    public async nint AcceptAsync() {
         nint listener = this.BeginAccept();
         if (listener < 0) { return -1; }
         try {
@@ -138,14 +138,14 @@ class TcpListener {
     }
 
     // 等待连接并返回非阻塞 TcpClient。取消/失败返回 null。
-    async TcpClient AcceptTcpClientAsync() {
+    public async TcpClient AcceptTcpClientAsync() {
         nint client = await this.AcceptAsync();
         if (client < 0) { return null; }
         return TcpClient.FromSocket(client);
     }
 
     // 同步尝试接受连接；停止后返回 -1，不自动重开。
-    nint Accept() {
+    public nint Accept() {
         nint listener = this.BeginAccept();
         if (listener < 0) { return -1; }
         try {
@@ -157,7 +157,7 @@ class TcpListener {
 
     // 首次 Accept 前可自动启动；显式 Stop 后只允许显式
     // Start/StartReusePort 重启，避免停止与 accept 启动竞态重开端口。
-    void EnsureStarted() {
+    public void EnsureStarted() {
         lock (this.sync) {
             if (!this.stopped && !this.running) { this.StartOwned(false); }
         }
@@ -166,7 +166,7 @@ class TcpListener {
     // 请求停止。取消令牌先置位，再通知 reactor；所有挂起
     // accept 结束前保留 fd。可取消的 accept 重复通知覆盖通知早于
     // 注册的竞态；POSIX 无需依赖监听套接字的 shutdown 行为。
-    void Stop() {
+    public void Stop() {
         lock (this.sync) {
             this.stopped = true;
             this.running = false;
@@ -192,25 +192,35 @@ class TcpListener {
     }
 
     // 请求停止并等挂起的 accept 清理完成、fd 已释放。
-    async void StopAsync() {
+    public async void StopAsync() {
         this.Stop();
         while (this.PendingAccepts() > 0) { await Task.Delay(1); }
     }
 
     // 返回监听器是否仍允许新 accept。
-    bool IsRunning() {
+    public bool IsRunning() {
         lock (this.sync) { return this.running; }
     }
 
     // 底层句柄；Stop 后排空期间仍分配，最后一个 accept
     // 结束后才变为 -1。调用方不要直接关闭监听器拥有的句柄。
-    nint GetSocket() {
+    public nint GetSocket() {
         lock (this.sync) { return this.sock; }
     }
 
     // 返回绑定的端口。
-    int GetPort() { return this.port; }
+    public int GetPort() { return this.port; }
 
     // 返回绑定的主机。
-    string GetHost() { return this.host; }
+    public string GetHost() { return this.host; }
+
+    // 实现 IDisposable 接口：停止监听并释放句柄。
+    public void Dispose() {
+        this.Stop();
+    }
+
+    // 析构安全兜底：防止开发者漏调用 Stop 造成监听套接字句柄泄漏。
+    ~TcpListener() {
+        this.Stop();
+    }
 }
