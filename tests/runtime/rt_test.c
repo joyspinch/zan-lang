@@ -174,6 +174,57 @@ static void test_scheduler(void) {
     CHECK(g_sched_ok == 1, "expected 7*7=49 and 11*11=121 from awaited coroutines");
 }
 
+/* 多 Worker 并发压力测试 */
+#define CONC_TASKS 128
+static void worker_calc_body(zan_task_t *t) {
+    int64_t val = (int64_t)(intptr_t)zan_task_arg(t);
+    for (int i = 0; i < 5; i++) {
+        zan_task_yield();
+    }
+    zan_task_return(t, val);
+}
+
+static int64_t g_multi_worker_sum = 0;
+static void multi_worker_main(zan_task_t *t) {
+    zan_task_t *tasks[CONC_TASKS];
+    for (int i = 0; i < CONC_TASKS; i++) {
+        tasks[i] = zan_spawn(worker_calc_body, (void *)(intptr_t)i);
+    }
+    int64_t sum = 0;
+    for (int i = 0; i < CONC_TASKS; i++) {
+        sum += zan_task_await(tasks[i]);
+        zan_task_release(tasks[i]);
+    }
+    g_multi_worker_sum = sum;
+    zan_task_return(t, 0);
+}
+
+static void test_scheduler_concurrent_workers(void) {
+    banner("scheduler: multi-worker concurrent dispatch & work-stealing stress");
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=4");
+#else
+    setenv("ZAN_SCHED_WORKERS", "4", 1);
+#endif
+    zan_sched_init();
+    zan_task_t *main_task = zan_spawn(multi_worker_main, NULL);
+    zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "concurrent tasks leaked: %zu still tracked", zan_task_live());
+    zan_sched_shutdown();
+
+    int64_t expected = (int64_t)CONC_TASKS * (CONC_TASKS - 1) / 2;
+    CHECK(g_multi_worker_sum == expected,
+          "multi-worker sum mismatch: got %lld, expected %lld",
+          (long long)g_multi_worker_sum, (long long)expected);
+
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=1");
+#else
+    setenv("ZAN_SCHED_WORKERS", "1", 1);
+#endif
+}
+
 
 static int64_t g_delay_elapsed = -1;
 static void delay_body(zan_task_t *t) {
@@ -531,6 +582,7 @@ int main(void) {
     printf("=== Zan runtime test suite ===\n");
 
     test_scheduler();
+    test_scheduler_concurrent_workers();
     test_timer();
     test_co_statemachine();
     test_co_io(19803);
