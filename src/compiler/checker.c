@@ -3614,7 +3614,17 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                       expr->member.name.str);
                         return c->binder->type_error;
                     }
-                    return m->type ? m->type : c->binder->type_error;
+                    zan_type_t *mt = m->type;
+                    if (mt && obj_type->type_args && obj_type->type_arg_count > 0 &&
+                        s->decl &&
+                        (s->decl->kind == AST_CLASS_DECL ||
+                         s->decl->kind == AST_STRUCT_DECL)) {
+                        zan_ast_list_t *tps = &s->decl->type_decl.type_params;
+                        if (tps->count == obj_type->type_arg_count) {
+                            mt = zan_binder_subst_named(c->binder, mt, tps, obj_type->type_args);
+                        }
+                    }
+                    return mt ? mt : c->binder->type_error;
                 }
             }
         }
