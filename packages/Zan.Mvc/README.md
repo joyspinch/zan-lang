@@ -777,7 +777,7 @@ every sign-in "wrong password").
 - `GET /admin/menu` — admin menu built from `[Menu]` routes (`[Auth] [Rank(9)]`)
 - `POST /upload` — streaming upload
 
-## Database & ORM (FreeSQL-style, bidirectional)
+## Database & ORM (ZanSql, bidirectional)
 
 `System.Data.Orm.Model` maps both directions:
 

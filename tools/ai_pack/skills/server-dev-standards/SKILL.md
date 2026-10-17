@@ -92,11 +92,11 @@ description: 服务端开发通用规范——四层架构（接入/业务/数�
 9. **诊断副作用不得打断业务流**：日志/埋点 IO 自己吞错降级（失败置空路径、
    下次重试），绝不向业务调用抛异常——一次瞬时文件锁就能让整个数据目录
    加载失败，症状（空数据）离根因（写日志失败）极远。
-10. **数据层规范对齐 FreeSql 体系**：数据访问以强类型 CodeFirst 实体为核心，
-    统一通过 `IFreeSql` / `FreeSqlBuilder` 作为入口；表结构同步走
-    `fsql.CodeFirst.SyncStructure<T>`；实体仓储继承泛型 `BaseRepository<T>`
+10. **数据层规范对齐 ZanSql 体系**：数据访问以强类型 CodeFirst 实体为核心，
+    统一通过 `IZanSql` / `ZanSqlBuilder` 作为入口；表结构同步走
+    `zsql.CodeFirst.SyncStructure<T>`；实体仓储继承泛型 `BaseRepository<T>`
     直接获得通用 CRUD 能力（禁止机械编写一两行的空壳 DAO 样板代码）；
-    多表/事务操作统一步骤进 `IUnitOfWork`（`fsql.CreateUnitOfWork`）；
+    多表/事务操作统一步骤进 `IUnitOfWork`（`zsql.CreateUnitOfWork`）；
     严禁使用历史遗留的弱类型字符串拼表（ModelRow/Model.Define）。
 
 ## 五、AI 协作纪律（写码前后的固定动作）

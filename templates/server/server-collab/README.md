@@ -565,7 +565,7 @@ WHERE id=? AND tenantId=? AND assigneeId=0 AND status='unassigned' AND version=?
   `POST /admin/flow/flows/kill?id=` 返回 200"实例不在进行中"而非 404；
   Update 条件含 `status==1`，语义无害且不越租户（T17 隔离矩阵 N 已验证）。
 
-## Database & ORM (FreeSQL-style, bidirectional)
+## Database & ORM (ZanSql, bidirectional)
 
 Application data access uses typed entity facades. Controllers query `this.Entity` on their request connection; background jobs and import callbacks use `db.Entity` on the connection passed to them, with `using System.Data.Orm;`:
 

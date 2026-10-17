@@ -7,7 +7,7 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
 
 - `System.Data` — `DbConnection` / `DbPool` / `DbResult` core, connector and
   executor interfaces, tracing wrapper.
-- `System.Data.Orm` — FreeSQL-style ORM. `[DbTable]` models plus
+- `System.Data.Orm` — ZanSQL ORM. `[DbTable]` models plus
   `db.Select<T>()` fluent queries; the compiler's ORM codegen
   (`System/Compiler/ZanGen.zan`) emits the per-entity facades, so user code
   never spells `OrmMeta`/`OrmSelect` directly.
