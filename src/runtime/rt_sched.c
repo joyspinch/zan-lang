@@ -84,8 +84,33 @@ typedef struct zan_co {
     zan_co_body_t  body;
     zan_task_t    *task;
     int            finished;
+    volatile int   running;
     struct zan_co *next;
 } zan_co_t;
+
+static inline void co_acquire(zan_co_t *co) {
+#ifdef _WIN32
+    while (InterlockedCompareExchange((volatile LONG *)&co->running, 1, 0) != 0) {
+        YieldProcessor();
+    }
+#else
+    while (__atomic_test_and_set(&co->running, __ATOMIC_ACQUIRE)) {
+        #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+        __builtin_ia32_pause();
+        #else
+        __asm__ __volatile__("yield" ::: "memory");
+        #endif
+    }
+#endif
+}
+
+static inline void co_release(zan_co_t *co) {
+#ifdef _WIN32
+    InterlockedExchange((volatile LONG *)&co->running, 0);
+#else
+    __atomic_clear(&co->running, __ATOMIC_RELEASE);
+#endif
+}
 
 struct zan_task {
     zan_mutex_t lock;
@@ -159,7 +184,7 @@ static void plat_sleep(int64_t ms) {
 static int64_t plat_now_ms(void)       { return (int64_t)GetTickCount64(); }
 
 #else
-static ucontext_t g_sched_ctx;
+static ZAN_THREAD_LOCAL ucontext_t g_sched_ctx;
 #if UINTPTR_MAX > 0xFFFFFFFFu
 static void co_trampoline_posix(unsigned hi, unsigned lo);
 #else
@@ -170,16 +195,29 @@ typedef struct { ucontext_t ctx; char *stack; } posix_fiber_t;
 
 #define ZAN_CO_STACK_POOL_MAX 256
 
+static zan_mutex_t g_stack_pool_lock;
+static volatile int g_stack_pool_lock_inited = 0;
 static void *g_stack_pool;
 static int g_stack_pool_n;
 
+static void ensure_stack_pool_lock(void) {
+    if (!g_stack_pool_lock_inited) {
+        zan_mutex_init(&g_stack_pool_lock);
+        g_stack_pool_lock_inited = 1;
+    }
+}
+
 static char *plat_stack_alloc(void) {
+    ensure_stack_pool_lock();
+    zan_mutex_lock(&g_stack_pool_lock);
     if (g_stack_pool) {
         char *s = (char *)g_stack_pool;
         g_stack_pool = *(void **)s;
         g_stack_pool_n--;
+        zan_mutex_unlock(&g_stack_pool_lock);
         return s;
     }
+    zan_mutex_unlock(&g_stack_pool_lock);
     long page = sysconf(_SC_PAGESIZE);
     size_t total = co_stack_size() + (size_t)page;
     char *base = (char *)mmap(NULL, total, PROT_READ | PROT_WRITE,
@@ -193,12 +231,16 @@ static char *plat_stack_alloc(void) {
 }
 
 static void plat_stack_free(char *stack) {
+    ensure_stack_pool_lock();
+    zan_mutex_lock(&g_stack_pool_lock);
     if (g_stack_pool_n < ZAN_CO_STACK_POOL_MAX) {
         *(void **)stack = g_stack_pool;
         g_stack_pool = stack;
         g_stack_pool_n++;
+        zan_mutex_unlock(&g_stack_pool_lock);
         return;
     }
+    zan_mutex_unlock(&g_stack_pool_lock);
     long page = sysconf(_SC_PAGESIZE);
     munmap((char *)stack - page, co_stack_size() + (size_t)page);
 }
@@ -426,6 +468,7 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop();
         if (co) {
+            co_acquire(co);
             g_current = co;
             plat_switch(co->fiber);
             g_current = NULL;
@@ -433,6 +476,8 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
                 plat_fiber_delete(co->fiber);
                 free(co);
                 zan_atomic_dec(&g_live);
+            } else {
+                co_release(co);
             }
         } else {
             plat_sleep(1);
@@ -463,6 +508,7 @@ static void *worker_thread_main(void *arg) {
     while (!g_sched_stop) {
         zan_co_t *co = ready_pop();
         if (co) {
+            co_acquire(co);
             g_current = co;
             plat_switch(co->fiber);
             g_current = NULL;
@@ -470,6 +516,8 @@ static void *worker_thread_main(void *arg) {
                 plat_fiber_delete(co->fiber);
                 free(co);
                 zan_atomic_dec(&g_live);
+            } else {
+                co_release(co);
             }
         } else {
             plat_sleep(1);
@@ -638,6 +686,7 @@ void zan_sched_run(void) {
         }
 
         if (co) {
+            co_acquire(co);
             g_current = co;
             plat_switch(co->fiber);
             g_current = NULL;
@@ -645,6 +694,8 @@ void zan_sched_run(void) {
                 plat_fiber_delete(co->fiber);
                 free(co);
                 zan_atomic_dec(&g_live);
+            } else {
+                co_release(co);
             }
         }
     }
