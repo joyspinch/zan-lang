@@ -33,6 +33,7 @@ class ChartOption {
     // 左到右排开，每根轴竖置）。缺省 horizontal（与 ECharts
     // 时代的既有渲染一致）。axisIndex 映射为数据列号 parAxes[i].dim。
     string parLayout;
+    List<ChartGraphic> graphics;  // ECharts graphic 组件（原生矢量图元列表）
 
     ChartType defaultType;  // Add(name, values) / AddLabel 使用的类型
 
@@ -341,6 +342,12 @@ class ChartOption {
         for (int i = 0; i < src.dataRangeList.Count; i = i + 1) {
             o.dataRangeList.Add(ChartRangeSplit.Clone(src.dataRangeList[i]));
         }
+        o.graphics = new List<ChartGraphic>();
+        if (src.graphics != null) {
+            for (int i = 0; i < src.graphics.Count; i = i + 1) {
+                o.graphics.Add(src.graphics[i]);
+            }
+        }
         return o;
     }
 
@@ -376,6 +383,7 @@ class ChartOption {
         this.parAxes = new List<ChartParAxis>();
         this.angleAxes = new List<PolarAxisSpec>();
         this.radiusAxes = new List<PolarAxisSpec>();
+        this.graphics = new List<ChartGraphic>();
         this.parLayout = "";
         this.defaultType = ChartType.Line;
         this.showLegend = true;
@@ -2210,6 +2218,157 @@ class ChartOption {
         if (into.Count == ax.polarIndex) { into.Add(ax); } else { into[ax.polarIndex] = ax; }
     }
 
+    static void ParseGraphic(JsonValue v, ChartOption o) {
+        if (v == null) { return; }
+        if (v.IsArray()) {
+            for (int i = 0; i < v.Count(); i = i + 1) {
+                ChartOption.ParseGraphicElement(v.At(i), o.graphics);
+            }
+        } else if (v.IsObject()) {
+            JsonValue els = v.Get("elements");
+            if (els != null && els.IsArray()) {
+                for (int i = 0; i < els.Count(); i = i + 1) {
+                    ChartOption.ParseGraphicElement(els.At(i), o.graphics);
+                }
+            } else {
+                ChartOption.ParseGraphicElement(v, o.graphics);
+            }
+        }
+    }
+
+    static void ParseGraphicElement(JsonValue v, List<ChartGraphic> outList) {
+        if (v == null || !v.IsObject()) { return; }
+        ChartGraphic g = ChartGraphic.Create();
+        g.type = v.Str("type", "rect");
+        g.id = v.Str("id", "");
+        g.x = v.Int("x", 0);
+        g.y = v.Int("y", 0);
+        g.left = v.Str("left", "");
+        g.top = v.Str("top", "");
+        g.right = v.Str("right", "");
+        g.bottom = v.Str("bottom", "");
+        g.z = v.Int("z", 0);
+        if (v.Has("keyframeAnimation")) {
+            g.keyframeAnimation = true;
+            JsonValue ka = v.Get("keyframeAnimation");
+            if (ka != null && ka.IsObject()) {
+                g.animDuration = ka.Int("duration", 1000);
+            }
+        }
+        JsonValue shape = v.Get("shape");
+        if (shape != null && shape.IsObject()) {
+            g.shapeX = shape.Int("x", 0);
+            g.shapeY = shape.Int("y", 0);
+            g.shapeW = shape.Int("width", 0);
+            g.shapeH = shape.Int("height", 0);
+            g.shapeR = shape.Int("r", 0);
+        }
+        JsonValue style = v.Get("style");
+        if (style != null && style.IsObject()) {
+            if (style.Has("fill")) {
+                string fs = style.Str("fill", "");
+                if (fs == "transparent" || fs == "none") {
+                    g.fill = 0;
+                    g.hasFill = false;
+                } else {
+                    g.fill = ChartOption.ParseColor(style.Get("fill"), 0);
+                    g.hasFill = true;
+                }
+            }
+            if (style.Has("stroke")) {
+                g.stroke = ChartOption.ParseColor(style.Get("stroke"), 0);
+            }
+            g.strokeWidth = style.Int("lineWidth", 1);
+            g.text = style.Str("text", "");
+            g.fontSize = style.Int("fontSize", 14);
+            g.fontWeight = style.Str("fontWeight", "normal");
+            if (style.Has("font")) {
+                string font = style.Str("font", "");
+                int pidx = font.IndexOf("px");
+                if (pidx > 0) {
+                    int fsNum = 0;
+                    for (int k = 0; k < pidx; k = k + 1) {
+                        char ch = font[k];
+                        if (ch >= '0' && ch <= '9') {
+                            fsNum = fsNum * 10 + (ch - '0');
+                        }
+                    }
+                    if (fsNum > 0) { g.fontSize = fsNum; }
+                }
+            }
+        }
+        JsonValue children = v.Get("children");
+        if (children != null && children.IsArray()) {
+            for (int ci = 0; ci < children.Count(); ci = ci + 1) {
+                ChartOption.ParseGraphicElement(children.At(ci), g.children);
+            }
+        }
+        outList.Add(g);
+    }
+
+    static int LastDotOf(string s) {
+        if (s == null) { return -1; }
+        for (int i = s.Length - 1; i >= 0; i = i - 1) {
+            if (s[i] == '.') { return i; }
+        }
+        return -1;
+    }
+
+    static void BuildHierarchyFromDataset(ChartJsonDataset ds, ChartSeries cs) {
+        if (ds == null || ds.source == null || !ds.source.IsArray()) { return; }
+        JsonValue src = ds.source;
+        int n = src.Count();
+        if (n == 0) { return; }
+        JsonValue item0 = src.At(0);
+        if (item0 == null || !item0.IsObject() || !item0.Has("id")) { return; }
+
+        List<ChartNode> allNodes = new List<ChartNode>();
+        List<string> allIds = new List<string>();
+        for (int i = 0; i < n; i = i + 1) {
+            JsonValue it = src.At(i);
+            if (it == null || !it.IsObject()) { continue; }
+            string id = it.Str("id", "");
+            int val = it.Int("value", 0);
+            string name = id;
+            int lastDot = ChartOption.LastDotOf(id);
+            if (lastDot >= 0 && lastDot + 1 < id.Length) {
+                name = id.Substring(lastDot + 1);
+            }
+            ChartNode node = ChartNode.Leaf(name, val);
+            node.id = id;
+            allNodes.Add(node);
+            allIds.Add(id);
+        }
+
+        for (int i = 0; i < allNodes.Count; i = i + 1) {
+            string id = allIds[i];
+            int lastDot = ChartOption.LastDotOf(id);
+            if (lastDot < 0) {
+                cs.tree.Add(allNodes[i]);
+            } else {
+                string parentId = id.Substring(0, lastDot);
+                bool foundParent = false;
+                for (int j = 0; j < allIds.Count; j = j + 1) {
+                    if (allIds[j] == parentId) {
+                        allNodes[j].children.Add(allNodes[i]);
+                        foundParent = true;
+                        break;
+                    }
+                }
+                if (!foundParent) {
+                    cs.tree.Add(allNodes[i]);
+                }
+            }
+        }
+        if (cs.tree.Count > 0) {
+            if (cs.tree.Count == 1 && cs.tree[0].children != null && cs.tree[0].children.Count > 0) {
+                List<ChartNode> roots = cs.tree[0].children;
+                cs.tree = roots;
+            }
+            cs.custom = "sunburst";
+        }
+    }
+
     static void ParseGeoOne(JsonValue g, ChartOption o, int index) {
         if (g == null || !g.IsObject()) { return; }
         ChartGeo geo = ChartGeo.Of();
@@ -3613,6 +3772,7 @@ class ChartOption {
         // 由合成块挂载。
         ChartOption.ParseGeo(v.Get("geo"), o);
         ChartOption.ParseCalendar(v.Get("calendar"), o);
+        ChartOption.ParseGraphic(v.Get("graphic"), o);
         // 锚定 coord 依赖格查找表）。
         ChartOption.ParseParAxes(v.Get("parallelAxis"), o);
         // ECharts 极坐标轴（angleAxis/radiusAxis）：对象或数组形态，
@@ -4695,6 +4855,10 @@ class ChartOption {
                         cs.points.Add(ChartPoint.Of((int)sX, (int)sY));
                     }
                     o.title = "800 Points";
+                }
+                // 自定义层级图（如 circle-packing-with-d3）：dataset.source 含有 id/value/depth 树结构
+                if (cs.type == ChartType.Custom && cs.custom == "" && cs.tree.Count == 0 && o.datasets.Count > 0) {
+                    ChartOption.BuildHierarchyFromDataset(o.datasets[0], cs);
                 }
                 // map 系列：注册表几何 + data 值 + regions 覆盖，
                 // 在 data/regions 都解析完后统一绑定。
