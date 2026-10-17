@@ -298,36 +298,74 @@ zan_constfold_stats_t zan_opt_const_fold(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
     while (fn) {
-        LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
-        while (bb) {
-            LLVMValueRef inst = LLVMGetFirstInstruction(bb);
-            while (inst) {
-                LLVMValueRef next = LLVMGetNextInstruction(inst);
-                unsigned opcode = LLVMGetInstructionOpcode(inst);
+        bool fn_changed = true;
+        int pass = 0;
+        while (fn_changed && pass < 4) {
+            fn_changed = false;
+            pass++;
+            LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+            while (bb) {
+                LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+                while (inst) {
+                    LLVMValueRef next = LLVMGetNextInstruction(inst);
+                    unsigned opcode = LLVMGetInstructionOpcode(inst);
 
-                if (opcode == LLVMAdd || opcode == LLVMSub ||
-                    opcode == LLVMMul || opcode == LLVMSDiv) {
-                    LLVMValueRef lhs = LLVMGetOperand(inst, 0);
-                    LLVMValueRef rhs = LLVMGetOperand(inst, 1);
-                    if (LLVMIsAConstantInt(lhs) && LLVMIsAConstantInt(rhs)) {
-                        stats.constants_folded++;
+                    if (opcode == LLVMAdd || opcode == LLVMSub ||
+                        opcode == LLVMMul || opcode == LLVMSDiv) {
+                        LLVMValueRef lhs = LLVMGetOperand(inst, 0);
+                        LLVMValueRef rhs = LLVMGetOperand(inst, 1);
+                        if (LLVMIsAConstantInt(lhs) && LLVMIsAConstantInt(rhs)) {
+                            long long v1 = (long long)LLVMConstIntGetSExtValue(lhs);
+                            long long v2 = (long long)LLVMConstIntGetSExtValue(rhs);
+                            bool can_fold = true;
+                            long long res = 0;
+                            if (opcode == LLVMAdd) res = v1 + v2;
+                            else if (opcode == LLVMSub) res = v1 - v2;
+                            else if (opcode == LLVMMul) res = v1 * v2;
+                            else if (opcode == LLVMSDiv) {
+                                if (v2 != 0) res = v1 / v2;
+                                else can_fold = false;
+                            }
+                            if (can_fold) {
+                                LLVMTypeRef ty = LLVMTypeOf(inst);
+                                LLVMValueRef folded = LLVMConstInt(ty, (unsigned long long)res, 1);
+                                LLVMReplaceAllUsesWith(inst, folded);
+                                LLVMInstructionEraseFromParent(inst);
+                                stats.constants_folded++;
+                                fn_changed = true;
+                                inst = next;
+                                continue;
+                            }
+                        }
                     }
-                }
 
 #if ZAN_LLVM_MAJOR >= 23
-                if (opcode == LLVMCondBr && LLVMGetNumOperands(inst) == 3) {
+                    if (opcode == LLVMCondBr && LLVMGetNumOperands(inst) == 3) {
 #else
-                if (opcode == LLVMBr && LLVMGetNumOperands(inst) == 3) {
+                    if (opcode == LLVMBr && LLVMGetNumOperands(inst) == 3) {
 #endif
-                    LLVMValueRef cond = LLVMGetCondition(inst);
-                    if (cond && LLVMIsAConstantInt(cond)) {
-                        stats.branches_eliminated++;
+                        LLVMValueRef cond = LLVMGetCondition(inst);
+                        if (cond && LLVMIsAConstantInt(cond)) {
+                            unsigned long long cval = LLVMConstIntGetZExtValue(cond);
+                            LLVMBasicBlockRef target_bb = (cval != 0) ? LLVMGetSuccessor(inst, 0)
+                                                                     : LLVMGetSuccessor(inst, 1);
+                            if (target_bb) {
+                                LLVMBuilderRef b = g->builder;
+                                LLVMPositionBuilderBefore(b, inst);
+                                LLVMBuildBr(b, target_bb);
+                                LLVMInstructionEraseFromParent(inst);
+                                stats.branches_eliminated++;
+                                fn_changed = true;
+                                inst = next;
+                                continue;
+                            }
+                        }
                     }
-                }
 
-                inst = next;
+                    inst = next;
+                }
+                bb = LLVMGetNextBasicBlock(bb);
             }
-            bb = LLVMGetNextBasicBlock(bb);
         }
         fn = LLVMGetNextFunction(fn);
     }
@@ -342,18 +380,40 @@ zan_dce_stats_t zan_opt_dce(zan_irgen_t *g) {
     LLVMValueRef fn = LLVMGetFirstFunction(mod);
 
     while (fn) {
-        /* LLVMGetFirstBasicBlock 对声明返回 NULL，跳过无函数体定义 */
-        LLVMBasicBlockRef entry = LLVMGetFirstBasicBlock(fn);
-        if (entry) {
-            LLVMValueRef inst = LLVMGetFirstInstruction(entry);
-            while (inst) {
-                LLVMValueRef next = LLVMGetNextInstruction(inst);
-                if (LLVMGetInstructionOpcode(inst) == LLVMAlloca) {
-                    if (!LLVMGetFirstUse(inst)) {
-                        stats.dead_stores++;
+        bool changed = true;
+        int pass = 0;
+        while (changed && pass < 4) {
+            changed = false;
+            pass++;
+            LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn);
+            while (bb) {
+                LLVMValueRef inst = LLVMGetFirstInstruction(bb);
+                while (inst) {
+                    LLVMValueRef next = LLVMGetNextInstruction(inst);
+                    unsigned opcode = LLVMGetInstructionOpcode(inst);
+
+                    if (opcode == LLVMAlloca) {
+                        if (!LLVMGetFirstUse(inst)) {
+                            LLVMInstructionEraseFromParent(inst);
+                            stats.dead_stores++;
+                            changed = true;
+                            inst = next;
+                            continue;
+                        }
+                    } else if (opcode == LLVMAdd || opcode == LLVMSub || opcode == LLVMMul ||
+                               opcode == LLVMBitCast || opcode == LLVMAddrSpaceCast ||
+                               opcode == LLVMZExt || opcode == LLVMSExt || opcode == LLVMTrunc) {
+                        if (!LLVMGetFirstUse(inst)) {
+                            LLVMInstructionEraseFromParent(inst);
+                            stats.dead_stores++;
+                            changed = true;
+                            inst = next;
+                            continue;
+                        }
                     }
+                    inst = next;
                 }
-                inst = next;
+                bb = LLVMGetNextBasicBlock(bb);
             }
         }
         fn = LLVMGetNextFunction(fn);
