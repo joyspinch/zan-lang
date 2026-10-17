@@ -14,19 +14,19 @@ namespace System.Data.Postgres;
 // 用法：
 // pool.Release(db);
 // pool.Close();
-class PgPool {
+public class PgPool : IDisposable {
     string conninfo;
     PoolCore<PgConnection> core;
     string lastOpenError;
 
-    PgPool(string conninfo, int maxSize) {
+    public PgPool(string conninfo, int maxSize) {
         this.conninfo = conninfo;
         this.core = new PoolCore<PgConnection>(maxSize);
         this.lastOpenError = "";
     }
 
     // 以主机/端口/库/用户/密码构造连接池（内部拼成 conninfo）。
-    PgPool(string host, int port, string database, string user,
+    public PgPool(string host, int port, string database, string user,
             string password, int maxSize) : this(
                 "host=" + host + " port=" + Convert.ToString(port)
                 + " dbname=" + database + " user=" + user
@@ -47,7 +47,7 @@ class PgPool {
     // 未达上限则新建，否则挂起协程直到有连接被归还。饱和等待有
     // 硬上限（见 <see cref="PoolWait"/>）：超时返回 null，绝不定死。
     // 连接池关闭后返回 null。
-    async PgConnection AcquireAsync() {
+    public async PgConnection AcquireAsync() {
         PoolWait wait = new PoolWait();
         while (true) {
             if (this.core.IsClosed()) {
@@ -121,24 +121,36 @@ class PgPool {
         this.core.Pool(c);
     }
 
+    public void Release(PgConnection c) {
+        if (c == null) {
+            return;
+        }
+        if (this.core.IsClosed() || !c.IsConnected()) {
+            c.Close();
+            this.core.Drop(c);
+            return;
+        }
+        this.core.Pool(c);
+    }
+
     // 空闲（已入池、立即可用）连接数。
-    int IdleCount() {
+    public int IdleCount() {
         return this.core.IdleCount();
     }
 
     // 存活连接总数（空闲 + 借出）。
-    int LiveCount() {
+    public int LiveCount() {
         return this.core.LiveCount();
     }
 
     // 当前停泊等待连接的协程数。
-    int WaitingCount() {
+    public int WaitingCount() {
         return this.core.WaitingCount();
     }
 
     // 关闭所有空闲连接并标记连接池已关闭。仍
     // 被借出的连接在归还时关闭。
-    void Close() {
+    public void Close() {
         this.core.MarkClosed();
         PgConnection c = this.core.TakeIdle();
         while (c != null) {
@@ -147,5 +159,13 @@ class PgPool {
             c = this.core.TakeIdle();
         }
         this.core.WakeAll();
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+
+    ~PgPool() {
+        this.Dispose();
     }
 }

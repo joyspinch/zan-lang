@@ -21,13 +21,13 @@ namespace System.Data;
 // 查询本身即为协程的驱动（MySQL、PostgreSQL）还提供
 // 类型化连接池——<c>MySqlPool</c>、<c>PgPool</c>——返回
 // 具体连接类型，使 <c>QueryAsync</c> 仍可调用。
-class DbPool {
+public class DbPool : IDisposable {
     IDbConnector connector;
     PoolCore<IDbConnection> core;
     string lastOpenError;
 
-    // 由各 Connector 的 <c>Pool()</c> 工厂构造（构造器不公开）。
-    DbPool(IDbConnector connector, int maxSize) {
+    // 由各 Connector 的 <c>Pool()</c> 工厂构造。
+    public DbPool(IDbConnector connector, int maxSize) {
         this.connector = connector;
         this.core = new PoolCore<IDbConnection>(maxSize);
         this.lastOpenError = "";
@@ -53,7 +53,7 @@ class DbPool {
     // worker 拖成永久假死（实测教训：协程死锁时 CPU 空转、端口照收、
     // 全站无响应）。
     // 连接池关闭后同样返回 null。
-    async IDbConnection AcquireAsync() {
+    public async IDbConnection AcquireAsync() {
         PoolWait wait = new PoolWait();
         while (true) {
             if (this.core.IsClosed()) {
@@ -116,7 +116,7 @@ class DbPool {
 
     // 将连接归还连接池。已损坏或 Close() 之后
     // 的连接会被关闭丢弃，不再入池。
-    void Release(IDbConnection c) {
+    public void Release(IDbConnection c) {
         if (c == null) {
             return;
         }
@@ -134,7 +134,7 @@ class DbPool {
     // 打开连接是协程操作，所以应在启动时用
     // <see cref="WarmupAsync"/> 预热连接池，并把 null 视为
     // "容量已耗尽"。归还方式与借出的连接相同。
-    IDbConnection TryAcquire() {
+    public IDbConnection TryAcquire() {
         if (this.core.IsClosed()) {
             return null;
         }
@@ -153,7 +153,7 @@ class DbPool {
     // maxSize）并停放，使首批请求——以及每次
     // <see cref="TryAcquire"/> 的调用方——都能拿到活跃连接。返回
     // 当前空闲的数量；数据库不可达时返回 0。
-    async int WarmupAsync(int count) {
+    public async int WarmupAsync(int count) {
         int want = count;
         if (want > this.core.MaxSize()) { want = this.core.MaxSize(); }
         List<IDbConnection> opened = new List<IDbConnection>();
@@ -171,38 +171,38 @@ class DbPool {
     }
 
     // 空闲（已入池、可即用）连接数。
-    int IdleCount() {
+    public int IdleCount() {
         return this.core.IdleCount();
     }
 
     // 活跃连接总数（空闲 + 已借出）。
-    int LiveCount() {
+    public int LiveCount() {
         return this.core.LiveCount();
     }
 
     // 当前挂起等待连接的协程数。
-    int WaitingCount() {
+    public int WaitingCount() {
         return this.core.WaitingCount();
     }
 
     // 并发活跃连接的最大数量。
-    int MaxSize() {
+    public int MaxSize() {
         return this.core.MaxSize();
     }
 
     // <see cref="Close"/> 调用过后为 true。
-    bool IsClosed() {
+    public bool IsClosed() {
         return this.core.IsClosed();
     }
 
     // 此连接池服务的 <see cref="DbProvider"/> id。
-    int GetProvider() {
+    public int GetProvider() {
         return this.connector.GetProvider();
     }
 
     // 关闭所有空闲连接并将连接池标记为已关闭。仍
     // 被借出的连接会在归还时关闭。
-    void Close() {
+    public void Close() {
         this.core.MarkClosed();
         IDbConnection c = this.core.TakeIdle();
         while (c != null) {
@@ -211,5 +211,13 @@ class DbPool {
             c = this.core.TakeIdle();
         }
         this.core.WakeAll();
+    }
+
+    public void Dispose() {
+        this.Close();
+    }
+
+    ~DbPool() {
+        this.Dispose();
     }
 }
