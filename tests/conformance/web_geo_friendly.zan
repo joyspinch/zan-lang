@@ -1,0 +1,89 @@
+using System;
+using System.Web;
+
+namespace Conf;
+
+class Program {
+    static int failures;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Program.failures = Program.failures + 1;
+            Console.WriteLine("FAIL " + label);
+        } else {
+            Console.WriteLine("OK " + label);
+        }
+    }
+
+    static void Main() {
+        /* 1. 测试 GeoAgent 爬虫识别 */
+        Program.Check(GeoAgent.IsAiBot("Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)"), "GPTBot recognized");
+        Program.Check(GeoAgent.IsAiBot("Mozilla/5.0 (compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)"), "PerplexityBot recognized");
+        Program.Check(GeoAgent.IsAiBot("ClaudeBot/1.0; +https://www.anthropic.com/claudebot"), "ClaudeBot recognized");
+        Program.Check(!GeoAgent.IsAiBot("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"), "Regular Chrome ignored");
+
+        /* 2. 测试内容协商 WantsMarkdown */
+        HttpRequest reqMd = HttpRequest.Parse("GET /doc HTTP/1.1\r\nHost: test\r\nAccept: text/markdown\r\n\r\n");
+        HttpContext ctxMd = new HttpContext(reqMd, "127.0.0.1");
+        Program.Check(ctxMd.WantsMarkdown(), "Accept: text/markdown wants markdown");
+
+        HttpRequest reqAi = HttpRequest.Parse("GET /doc HTTP/1.1\r\nHost: test\r\nUser-Agent: GPTBot/1.0\r\n\r\n");
+        HttpContext ctxAi = new HttpContext(reqAi, "127.0.0.1");
+        Program.Check(ctxAi.WantsMarkdown(), "AI bot default wants markdown");
+
+        HttpRequest reqParam = HttpRequest.Parse("GET /doc?format=md HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext ctxParam = new HttpContext(reqParam, "127.0.0.1");
+        Program.Check(ctxParam.WantsMarkdown(), "Query format=md wants markdown");
+
+        HttpRequest reqBrowser = HttpRequest.Parse("GET /doc HTTP/1.1\r\nHost: test\r\nUser-Agent: Mozilla/5.0 Chrome/120.0\r\nAccept: text/html\r\n\r\n");
+        HttpContext ctxBrowser = new HttpContext(reqBrowser, "127.0.0.1");
+        Program.Check(!ctxBrowser.WantsMarkdown(), "Browser wants HTML not markdown");
+
+        /* 3. 测试 GeoSchema JSON-LD */
+        GeoSchema article = GeoSchema.Article("Zan Web GEO", "面向生成式 AI 搜索引擎优化指南", "Zan Team", "2026-10-17");
+        string json = article.ToJson();
+        Program.Check(json.Contains("\"@context\": \"https://schema.org\""), "Schema context present");
+        Program.Check(json.Contains("\"@type\": \"TechArticle\""), "Schema type present");
+        Program.Check(json.Contains("\"headline\": \"Zan Web GEO\""), "Schema headline present");
+
+        string tag = article.ToHtmlTag();
+        Program.Check(tag.Contains("<script type=\"application/ld+json\">"), "Schema script tag wrapped");
+
+        /* 4. 测试 GeoMeta */
+        GeoMeta meta = GeoMeta.Create()
+            .SetTitle("Zan GEO")
+            .SetDescription("AI Engine Optimization")
+            .SetCanonical("https://zan-lang.org/geo")
+            .AddSchema(article);
+        string head = meta.RenderHead();
+        Program.Check(head.Contains("canonical\" href=\"https://zan-lang.org/geo\""), "Canonical present");
+        Program.Check(head.Contains("og:title\" content=\"Zan GEO\""), "OpenGraph present");
+        Program.Check(head.Contains("max-snippet:-1"), "Robots directives present");
+
+        /* 5. 测试 LlmsTxt */
+        LlmsTxt llms = LlmsTxt.Create("Zan Portal", "Zan Official Knowledge Base for LLMs")
+            .AddLink("Docs", "Architecture", "/docs/arch", "System Architecture & Philosophy")
+            .AddLink("API", "WebApp", "/api/webapp", "Web Application Host");
+        string llmsMd = llms.ToMarkdown();
+        Program.Check(llmsMd.Contains("# Zan Portal"), "Llms title present");
+        Program.Check(llmsMd.Contains("> Zan Official Knowledge Base for LLMs"), "Llms summary present");
+        Program.Check(llmsMd.Contains("## Docs"), "Llms section present");
+        Program.Check(llmsMd.Contains("- [Architecture](/docs/arch): System Architecture & Philosophy"), "Llms link present");
+
+        /* 6. 测试 WebApp UseLlmsTxt 路由挂载 */
+        WebApp app = new WebApp("127.0.0.1", 0);
+        app.UseLlmsTxt(llms);
+
+        HttpRequest reqLlms = HttpRequest.Parse("GET /.well-known/llms.txt HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext ctxLlms = new HttpContext(reqLlms, "127.0.0.1");
+        Route r1 = app.router.Match(ctxLlms);
+        Program.Check(r1 != null, "/.well-known/llms.txt route matched");
+
+        HttpRequest reqLlmsRoot = HttpRequest.Parse("GET /llms.txt HTTP/1.1\r\nHost: test\r\n\r\n");
+        HttpContext ctxLlmsRoot = new HttpContext(reqLlmsRoot, "127.0.0.1");
+        Route r2 = app.router.Match(ctxLlmsRoot);
+        Program.Check(r2 != null, "/llms.txt route matched");
+
+        Console.WriteLine("failures=" + Convert.ToString(Program.failures));
+    }
+}
