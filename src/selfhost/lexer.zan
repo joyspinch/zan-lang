@@ -1,20 +1,10 @@
 using System;
-using System.Collections;
+using System.Collections.Generic;
 namespace Zan;
 
-// 条件编译栈帧实体（消除 ppActive/ppParent/ppTaken 平行列表反模式）。
-class PpFrame {
-    public int active;
-    public int parent;
-    public int taken;
-
-    public PpFrame(int active, int parent, int taken) {
-        this.active = active;
-        this.parent = parent;
-        this.taken = taken;
-    }
-}
-
+// Faithful port of src/compiler/lexer.c (bootstrap subset). Produces a
+// List<Token> covering identifiers/keywords, int/float/string/char literals,
+// comments and the operator/punctuation set the compiler itself uses.
 class Lexer {
     public string src;
     public int pos;
@@ -22,18 +12,55 @@ class Lexer {
     public int line;
     public int col;
 
+    // Preprocessor state (mirrors src/compiler/lexer.c): a define table and a
+    // nested #if/#else conditional stack. Only the target-platform macros the
+    // stdlib tests are predefined.
     public List<string> ppName;
-    public List<PpFrame> ppFrames;
-    public int ppTop;  // logical conditional-stack depth (no List.RemoveAt)
-    string peSrc; int pePos; int peN;  // scratch for #if expression evaluation
+    public List<int> ppActive;   // this frame emits tokens (accounts for ancestors)
+    public List<int> ppParent;   // enclosing region was active when frame pushed
+    public List<int> ppTaken;    // some branch of this frame has been taken
+    public int ppTop;            // logical conditional-stack depth (no List.RemoveAt)
+    string peSrc; int pePos; int peN;   // scratch for #if expression evaluation
 
     public Lexer(string s) {
         src = s; pos = 0; n = s.Length; line = 1; col = 1;
         ppName = new List<string>();
-        ppFrames = new List<PpFrame>();
+        ppActive = new List<int>();
+        ppParent = new List<int>();
+        ppTaken = new List<int>();
         ppTop = 0;
         peSrc = ""; pePos = 0; peN = 0;
-        ppName.Add("WINDOWS"); ppName.Add("WIN32"); ppName.Add("X86_64"); ppName.Add("ZAN");
+        // matches the oracle's built-in defines per host OS: ZAN always;
+        // MACOS+APPLE+ARM64 on macOS arm64 (never WINDOWS/WIN32/X86_64).
+        // MACOS matters on its own: stdlib code picks Darwin struct
+        // layouts via `#elif MACOS` (dirent offsets, fs stat shapes) and
+        // silently compiled the LINUX branch without it.
+        // ZAN_TARGET=aarch64-linux retargets the table (stdlib's contract:
+        // "交叉编译的程序报告目标系统而非构建主机" — Platform/Runtime.zan):
+        // LINUX replaces MACOS/APPLE so `#if LINUX`/`#else` POSIX arms
+        // compile (dirent offsets 18/19, POSIX semaphores, /proc paths)
+        // instead of the Darwin ones. ARM64 stays: the target is arm64.
+        // Presence-based like the whole table; any other env value (or
+        // none) keeps the host table exactly as before.
+        ppName.Add("ZAN");
+        long tgtEnv = ElfTargetEnv.GetEnvPtr("ZAN_TARGET");
+        if (tgtEnv != 0 && ElfTargetEnv.Cmp(tgtEnv, "aarch64-linux") == 0) {
+            ppName.Add("LINUX"); ppName.Add("ARM64");
+        } else if (tgtEnv != 0 && ElfTargetEnv.Cmp(tgtEnv, "x86_64-linux") == 0) {
+            // 批 46:x86_64 Linux 目标此前落进 host 表(MACOS/APPLE/
+            // ARM64),runtime_core 的 #if MACOS 臂(darwin exe_path/
+            // threadid 胶水)被烘进自包含容器,musl 永远供不了这两个
+            // 符号——vehicle 首启实证。与 aarch64-linux 同源:LINUX 换
+            // MACOS/APPLE,#if 臂编 POSIX/dirent/proc 面;X86_64 换
+            // ARM64(stdlib 的结构布局按字长挑选)。
+            ppName.Add("LINUX"); ppName.Add("X86_64");
+        } else if (tgtEnv != 0 && ElfTargetEnv.Cmp(tgtEnv, "x86_64-macos") == 0) {
+            // x86_64 macOS target: Darwin stdlib arms (the MACOS/APPLE
+            // contract is about the OS, not the chip), X86_64 replaces ARM64
+            ppName.Add("MACOS"); ppName.Add("APPLE"); ppName.Add("X86_64");
+        } else {
+            ppName.Add("MACOS"); ppName.Add("APPLE"); ppName.Add("ARM64");
+        }
     }
 
     bool PpIsDef(string name) {
@@ -50,21 +77,18 @@ class Lexer {
         }
     }
     void PpPush(int pa, int c, int t) {
-        if (ppTop < ppFrames.Count) {
-            ppFrames[ppTop].active = c;
-            ppFrames[ppTop].parent = pa;
-            ppFrames[ppTop].taken = t;
-        } else {
-            ppFrames.Add(new PpFrame(c, pa, t));
-        }
+        if (ppTop < ppActive.Count) { ppActive[ppTop] = c; ppParent[ppTop] = pa; ppTaken[ppTop] = t; }
+        else { ppActive.Add(c); ppParent.Add(pa); ppTaken.Add(t); }
         ppTop = ppTop + 1;
     }
     void PpPop() { if (ppTop > 0) { ppTop = ppTop - 1; } }
     bool PpActiveNow() {
         if (ppTop == 0) { return true; }
-        return ppFrames[ppTop - 1].active == 1;
+        return ppActive[ppTop - 1] == 1;
     }
 
+    // ---- #if expression evaluation (bare ident = defined?1:0, ints, defined(),
+    // !, &&, ||, ==, != and parentheses) ----
     int PeEval(string s) { peSrc = s; pePos = 0; peN = s.Length; return PeOr(); }
     void PeWs() { while (pePos < peN && (peSrc[pePos] == ' ' || peSrc[pePos] == '\t')) { pePos = pePos + 1; } }
     int PeCh() { if (pePos < peN) { return (int)peSrc[pePos]; } return 0; }
@@ -126,18 +150,45 @@ class Lexer {
         return 0;
     }
 
+    // A second directive may share the condition's line ("#if 0 x #endif"):
+    // the condition text ends at that '#', and pos rewinds so the run loop
+    // re-reads the trailing directive instead of swallowing it
+    string TruncAtInnerDirective(string s, int rs) {
+        int i = 0;
+        while (i < s.Length) {
+            if (s[i] == '#') {
+                int j = i + 1;
+                while (j < s.Length && (s[j] == ' ' || s[j] == '\t')) { j = j + 1; }
+                int k = j;
+                while (k < s.Length && IsAlpha(s[k])) { k = k + 1; }
+                string w = k > j ? s.Substring(j, k - j) : "";
+                if (w == "endif" || w == "else" || w == "elif") {
+                    pos = rs + i;
+                    return s.Substring(0, i);
+                }
+            }
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // Consume a `#...` directive line (the leading '#' is already consumed) and
+    // update the define table / conditional stack.
     void Directive() {
+        // directive keyword
         while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
         int ds = pos;
         while (pos < n && IsAlpha(Peek())) { Adv(); }
         string dir = src.Substring(ds, pos - ds);
+        // rest of line (argument text)
         while (pos < n && (Peek() == 32 || Peek() == 9)) { Adv(); }
         int rs = pos;
         while (pos < n && Peek() != 10) { Adv(); }
         string rest = src.Substring(rs, pos - rs);
         if (dir == "if") {
+            string cond = TruncAtInnerDirective(rest, rs);
             int pa = 0; if (PpActiveNow()) { pa = 1; }
-            int c = 0; if (pa == 1 && PeEval(rest) != 0) { c = 1; }
+            int c = 0; if (pa == 1 && PeEval(cond) != 0) { c = 1; }
             PpPush(pa, c, c);
         } else if (dir == "ifdef" || dir == "ifndef") {
             int pa = 0; if (PpActiveNow()) { pa = 1; }
@@ -149,20 +200,15 @@ class Lexer {
         } else if (dir == "elif") {
             int top = ppTop - 1;
             if (top >= 0) {
-                if (ppFrames[top].taken == 0 && ppFrames[top].parent == 1 && PeEval(rest) != 0) {
-                    ppFrames[top].active = 1; ppFrames[top].taken = 1;
-                } else {
-                    ppFrames[top].active = 0;
-                }
+                string cond = TruncAtInnerDirective(rest, rs);
+                if (ppTaken[top] == 0 && ppParent[top] == 1 && PeEval(cond) != 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
             }
         } else if (dir == "else") {
             int top = ppTop - 1;
             if (top >= 0) {
-                if (ppFrames[top].parent == 1 && ppFrames[top].taken == 0) {
-                    ppFrames[top].active = 1; ppFrames[top].taken = 1;
-                } else {
-                    ppFrames[top].active = 0;
-                }
+                if (ppParent[top] == 1 && ppTaken[top] == 0) { ppActive[top] = 1; ppTaken[top] = 1; }
+                else { ppActive[top] = 0; }
             }
         } else if (dir == "endif") {
             PpPop();
@@ -239,7 +285,6 @@ class Lexer {
         if (s == "float") { return TK.Float(); }
         if (s == "for") { return TK.For(); }
         if (s == "foreach") { return TK.Foreach(); }
-        if (s == "get") { return TK.Get(); }
         if (s == "if") { return TK.If(); }
         if (s == "in") { return TK.In(); }
         if (s == "int") { return TK.Int(); }
@@ -262,7 +307,6 @@ class Lexer {
         if (s == "catch") { return TK.Catch(); }
         if (s == "throw") { return TK.Throw(); }
         if (s == "finally") { return TK.Finally(); }
-        if (s == "set") { return TK.Set(); }
         if (s == "short") { return TK.Short(); }
         if (s == "static") { return TK.Static(); }
         if (s == "string") { return TK.String(); }
@@ -271,6 +315,8 @@ class Lexer {
         if (s == "this") { return TK.This(); }
         if (s == "true") { return TK.True(); }
         if (s == "using") { return TK.Using(); }
+        // `value` is contextual (like C#): only special inside a setter body.
+        // Not reserved here, so members named `value` (field.value) work.
         if (s == "var") { return TK.Var(); }
         if (s == "virtual") { return TK.Virtual(); }
         if (s == "void") { return TK.Void(); }
@@ -289,8 +335,10 @@ class Lexer {
             if (c == 32 || c == 9 || c == 13 || c == 10) {
                 Adv();
             } else if (c == 47 && Peek2() == 47) {
+                // line comment
                 while (pos < n && Peek() != 10) { Adv(); }
             } else if (c == 47 && Peek2() == 42) {
+                // block comment
                 Adv(); Adv();
                 while (pos < n) {
                     if (Peek() == 42 && Peek2() == 47) { Adv(); Adv(); break; }
@@ -314,8 +362,11 @@ class Lexer {
         int start = pos;
         long val = 0;
         bool isFloat = false;
+        bool isHex = false;
+        bool isBin = false;
         if (Peek() == 48 && (Peek2() == 120 || Peek2() == 88)) {
             // hex
+            isHex = true;
             Adv(); Adv();
             while (pos < n && (IsHex(Peek()) || Peek() == 95)) {
                 int c = Peek();
@@ -328,50 +379,99 @@ class Lexer {
                 }
                 Adv();
             }
-            string ht = src.Substring(start, pos - start);
-            return new Token(TK.IntLit(), ht, val, startLine, startCol);
         }
-        while (pos < n && (IsDigit(Peek()) || Peek() == 95)) {
-            int c = Peek();
-            if (c != 95) { val = val * 10 + (c - 48); }
-            Adv();
+        if (Peek() == 48 && (Peek2() == 98 || Peek2() == 66)) {
+            // binary (0b/0B); gen0 also lexes these
+            isBin = true;
+            Adv(); Adv();
+            while (pos < n && (Peek() == 48 || Peek() == 49 || Peek() == 95)) {
+                int c = Peek();
+                if (c != 95) { val = val * 2 + (c - 48); }
+                Adv();
+            }
         }
-        if (Peek() == 46 && IsDigit(Peek2())) {
-            isFloat = true;
-            Adv();
-            while (pos < n && (IsDigit(Peek()) || Peek() == 95)) { Adv(); }
+        bool isOct = false;
+        if (Peek() == 48 && (Peek2() == 111 || Peek2() == 79)) {
+            // octal (0o/0O); gen0 lexes radix literals with the same
+            // suffix scan, so 0o17L is one int literal
+            isOct = true;
+            Adv(); Adv();
+            while (pos < n && ((Peek() >= 48 && Peek() <= 55) || Peek() == 95)) {
+                int c = Peek();
+                if (c != 95) { val = val * 8 + (c - 48); }
+                Adv();
+            }
         }
+        if (!isHex && !isBin && !isOct) {
+            while (pos < n && (IsDigit(Peek()) || Peek() == 95)) {
+                int c = Peek();
+                if (c != 95) { val = val * 10 + (c - 48); }
+                Adv();
+            }
+            if (Peek() == 46 && IsDigit(Peek2())) {
+                isFloat = true;
+                Adv();
+                while (pos < n && (IsDigit(Peek()) || Peek() == 95)) { Adv(); }
+            }
+            // exponent (1e21, 1.5E-3): makes the literal a float like gen0
+            if (pos < n && (Peek() == 101 || Peek() == 69)) {
+                isFloat = true;
+                Adv();
+                if (pos < n && (Peek() == 43 || Peek() == 45)) { Adv(); }
+                while (pos < n && IsDigit(Peek())) { Adv(); }
+            }
+        }
+        // numeric text excludes any trailing type suffix
         string t = src.Substring(start, pos - start);
-        if (pos < n && (Peek() == 102 || Peek() == 70 || Peek() == 109 || Peek() == 77)) {
+        // suffix: f/F (float), m/M (decimal, mapped to double)
+        if (!isHex && !isBin && !isOct && pos < n && (Peek() == 102 || Peek() == 70 || Peek() == 109 || Peek() == 77)) {
             isFloat = true;
             Adv();
         }
         if (isFloat) { return new Token(TK.FloatLit(), t, 0, startLine, startCol); }
-        return new Token(TK.IntLit(), t, val, startLine, startCol);
+        // int-literal suffix: L/l (long), U/u (uint), in either order (UL/lu
+        // = ulong); only one of each may appear, like gen0's lexer_int_suffix
+        int litSuffix = 0;
+        if (pos < n && (Peek() == 76 || Peek() == 108)) {
+            litSuffix = 1;
+            Adv();
+            if (pos < n && (Peek() == 85 || Peek() == 117)) { litSuffix = 3; Adv(); }
+        } else if (pos < n && (Peek() == 85 || Peek() == 117)) {
+            litSuffix = 2;
+            Adv();
+            if (pos < n && (Peek() == 76 || Peek() == 108)) { litSuffix = 3; Adv(); }
+        }
+        Token it = new Token(TK.IntLit(), t, val, startLine, startCol);
+        it.litSuffix = litSuffix;
+        return it;
     }
 
     int EscapeChar(int c) {
         if (c == 110) { return 10; }  // n
-        if (c == 116) { return 9; }  // t
+        if (c == 116) { return 9; }   // t
         if (c == 114) { return 13; }  // r
-        if (c == 48) { return 0; }  // 0
-        return c;  // \ " ' and others
+        if (c == 48) { return 0; }    // 0
+        return c;                     // \ " ' and others
     }
 
     Token Str(int startLine, int startCol) {
-        Adv();  // opening quote
+        Adv(); // opening quote
         int start = pos;
         while (pos < n && Peek() != 34) {
             if (Peek() == 92) { Adv(); Adv(); } else { Adv(); }
         }
         string t = src.Substring(start, pos - start);
-        Adv();  // closing quote
+        Adv(); // closing quote
         return new Token(TK.StringLit(), t, 0, startLine, startCol);
     }
 
+    // Verbatim string @"...". No escape processing: backslashes are literal and
+    // a doubled quote ("") is a single literal quote; the string may span lines.
+    // Stored as an ordinary StringLit whose value round-trips through
+    // Irgen.DecodeStr, so each literal backslash is emitted here doubled.
     Token Verbatim(int startLine, int startCol) {
-        Adv();  // @
-        Adv();  // opening quote
+        Adv(); // @
+        Adv(); // opening quote
         string t = "";
         while (pos < n) {
             int c = Peek();
@@ -389,10 +489,14 @@ class Lexer {
         return new Token(TK.StringLit(), t, 0, startLine, startCol);
     }
 
+    // Verbatim interpolated string $@"...{expr}...". Verbatim text rules (no
+    // escape processing, "" is a literal quote, may span lines) combined with
+    // {expr} interpolation. Spliced into the same concatenation token stream
+    // as InterpStr so the parser sees ordinary "+".
     void InterpVerbatim(List<Token> toks, int sl, int sc) {
-        Adv();  // $ or @
-        Adv();  // @ or $
-        Adv();  // opening quote
+        Adv(); // $ or @
+        Adv(); // @ or $
+        Adv(); // opening quote
         toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
         toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
         string seg = "";
@@ -400,14 +504,14 @@ class Lexer {
             int c = Peek();
             if (c == 34) {
                 if (Peek2() == 34) { seg = seg + "\""; Adv(); Adv(); continue; }
-                Adv();  // closing quote
+                Adv(); // closing quote
                 break;
             }
             if (c == 123) {
                 toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
                 toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
                 seg = "";
-                Adv();  // '{'
+                Adv(); // '{'
                 toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
                 toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
                 int depth = 1;
@@ -419,6 +523,8 @@ class Lexer {
                     if (ic == 123) { depth = depth + 1; Adv(); continue; }
                     if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
                     else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 36 && Peek2() == 34) { InterpStr(toks, line, col); }
+                    else if ((ic == 36 && Peek2() == 64) || (ic == 64 && Peek2() == 36)) { InterpVerbatim(toks, line, col); }
                     else if (ic == 34) { toks.Add(Str(line, col)); }
                     else if (ic == 39) { toks.Add(CharLit(line, col)); }
                     else { toks.Add(Punct(line, col)); }
@@ -435,9 +541,12 @@ class Lexer {
         toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
     }
 
+    // Interpolated string $"...{expr}...". Spliced into an ordinary
+    // concatenation token stream: ( "" + "seg" + ( expr ) + "seg" + ... ).
+    // The leading "" guarantees a string-typed result even for $"{x}".
     void InterpStr(List<Token> toks, int sl, int sc) {
-        Adv();  // $
-        Adv();  // opening quote
+        Adv(); // $
+        Adv(); // opening quote
         toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
         toks.Add(new Token(TK.StringLit(), "", 0, sl, sc));
         int start = pos;
@@ -448,23 +557,47 @@ class Lexer {
                 string seg = src.Substring(start, pos - start);
                 toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
                 toks.Add(new Token(TK.StringLit(), seg, 0, sl, sc));
-                Adv();  // '{'
+                Adv(); // '{'
                 toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
                 toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
                 int depth = 1;
+                int paren = 0;
+                string fspec = null;
                 while (pos < n && depth > 0) {
                     SkipTrivia();
                     if (pos >= n) { break; }
                     int ic = Peek();
                     if (ic == 125) { depth = depth - 1; Adv(); if (depth == 0) { break; } continue; }
                     if (ic == 123) { depth = depth + 1; Adv(); continue; }
+                    if (ic == 58 && depth == 1 && paren == 0) {
+                        // a top-level ':' starts the format specifier
+                        // ({v:D4}, C#); ternaries in a hole must be
+                        // parenthesized, so this never steals one
+                        int fs = pos;
+                        Adv(); // ':'
+                        while (pos < n && Peek() != 125) { Adv(); }
+                        fspec = src.Substring(fs + 1, pos - fs - 1);
+                        continue;          // the hole closes at the next '}'
+                    }
+                    if (ic == 40) { paren = paren + 1; }
+                    else if (ic == 41 && paren > 0) { paren = paren - 1; }
                     if (IsAlpha(ic)) { toks.Add(Ident(line, col)); }
                     else if (IsDigit(ic)) { toks.Add(Number(line, col)); }
+                    else if (ic == 36 && Peek2() == 34) { InterpStr(toks, line, col); }
+                    else if ((ic == 36 && Peek2() == 64) || (ic == 64 && Peek2() == 36)) { InterpVerbatim(toks, line, col); }
                     else if (ic == 34) { toks.Add(Str(line, col)); }
                     else if (ic == 39) { toks.Add(CharLit(line, col)); }
                     else { toks.Add(Punct(line, col)); }
                 }
                 toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                if (fspec != null) {
+                    // splice the spec as ToString("spec") on the hole value
+                    toks.Add(new Token(TK.Dot(), "", 0, sl, sc));
+                    toks.Add(new Token(TK.Ident(), "ToString", 0, sl, sc));
+                    toks.Add(new Token(TK.LParen(), "", 0, sl, sc));
+                    toks.Add(new Token(TK.StringLit(), fspec, 0, sl, sc));
+                    toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
+                }
                 start = pos;
             }
             else { Adv(); }
@@ -472,17 +605,51 @@ class Lexer {
         string tail = src.Substring(start, pos - start);
         toks.Add(new Token(TK.Plus(), "", 0, sl, sc));
         toks.Add(new Token(TK.StringLit(), tail, 0, sl, sc));
-        Adv();  // closing quote
+        Adv(); // closing quote
         toks.Add(new Token(TK.RParen(), "", 0, sl, sc));
     }
 
     Token CharLit(int startLine, int startCol) {
-        Adv();  // opening '
+        Adv(); // opening '
         int v = 0;
-        if (Peek() == 92) { Adv(); v = EscapeChar(Peek()); Adv(); }
+        if (Peek() == 92) {
+            Adv();
+            if (Peek() == 120) {
+                // \xH[HH..]: greedy 1..4 hex digits (C# rule)
+                Adv();
+                int hv = 0;
+                int cnt = 0;
+                while (cnt < 4 && pos < n && IsHex(Peek())) {
+                    hv = hv * 16 + HexDigitVal(Peek());
+                    Adv();
+                    cnt = cnt + 1;
+                }
+                v = hv;
+            } else if (Peek() == 117) {
+                // \uHHHH: exactly four hex digits
+                Adv();
+                int hv2 = 0;
+                int cnt2 = 0;
+                while (cnt2 < 4 && pos < n && IsHex(Peek())) {
+                    hv2 = hv2 * 16 + HexDigitVal(Peek());
+                    Adv();
+                    cnt2 = cnt2 + 1;
+                }
+                v = hv2;
+            } else {
+                v = EscapeChar(Peek());
+                Adv();
+            }
+        }
         else { v = Peek(); Adv(); }
-        if (Peek() == 39) { Adv(); }  // closing '
+        if (Peek() == 39) { Adv(); } // closing '
         return new Token(TK.CharLit(), "", v, startLine, startCol);
+    }
+
+    int HexDigitVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 97 + 10; }
+        return c - 65 + 10;
     }
 
     public List<Token> Run() {
@@ -496,7 +663,7 @@ class Lexer {
                 return toks;
             }
             int c = Peek();
-            if (c == 35) { Adv(); Directive(); }  // '#' preprocessor line
+            if (c == 35) { Adv(); Directive(); }               // '#' preprocessor line
             else if (!PpActiveNow()) { while (pos < n && Peek() != 10) { Adv(); } }
             else if (c == 36 && Peek2() == 64) { InterpVerbatim(toks, sl, sc); }
             else if (c == 64 && Peek2() == 36) { InterpVerbatim(toks, sl, sc); }
@@ -527,10 +694,10 @@ class Lexer {
         if (c == 46) { return Mk(TK.Dot(), sl, sc); }
         if (c == 63) {
             if (d == 63) { Adv(); return Mk(TK.QQ(), sl, sc); }
-            if (d == 46) { Adv(); return Mk(TK.QDot(), sl, sc); }  // ?.
+            if (d == 46) { Adv(); return Mk(TK.QDot(), sl, sc); } // ?.
             return Mk(TK.Question(), sl, sc);
         }
-        if (c == 126) { return Mk(TK.Bang(), sl, sc); }  // ~ (reuse bang slot rarely used)
+        if (c == 126) { return Mk(TK.Tilde(), sl, sc); } // ~ (bitwise complement)
         if (c == 43) {
             if (d == 43) { Adv(); return Mk(TK.PlusPlus(), sl, sc); }
             if (d == 61) { Adv(); return Mk(TK.PlusEq(), sl, sc); }

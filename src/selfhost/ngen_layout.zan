@@ -1,0 +1,140 @@
+using System;
+namespace Zan;
+
+partial class Ngen {
+    Binder layoutBinder;
+    // Only explicit fields adopt natural storage widths. The ordinary native
+    // object ABI, locals, statics and expression float-as-double ABI are unchanged.
+    int ExplicitFieldWidth(string ty) {
+        if (ty == "bool" || ty == "byte" || ty == "sbyte") { return 1; }
+        if (ty == "short" || ty == "ushort") { return 2; }
+        if (ty == "int" || ty == "uint" || ty == "char" || ty == "float") { return 4; }
+        if (ty == "long" || ty == "ulong" || ty == "double") { return 8; }
+        if (ty == "string" || ty == "object" || IsArrTy(ty)) { return 8; }
+        Node d = layoutBinder.FindType(ty);
+        if (d != null && d.kind == AK.ClassDecl()) { return 8; }
+        // A boxed native struct is not its language-level inline representation.
+        // Do not guess a pointer width for embedded structs or open type params.
+        return 0;
+    }
+
+    // Materialize a byte address for large or unaligned offsets. Select a
+    // scratch that cannot alias either the base or the source/destination.
+    int FieldMemBase(Fld f, int rn, int valueReg) {
+        if (f.off % f.width == 0 && f.off / f.width <= 4095) { return rn; }
+        int scratch = 16;
+        if (rn == scratch || valueReg == scratch) { scratch = 17; }
+        if (rn == scratch || valueReg == scratch) { scratch = 15; }
+        LoadImm(scratch, f.off);
+        AddRR(scratch, rn, scratch);
+        return scratch;
+    }
+
+    int FieldMemOffset(Fld f) {
+        if (f.off % f.width != 0 || f.off / f.width > 4095) { return 0; }
+        return (f.off / f.width) << 10;
+    }
+
+    void LoadFieldNg(int rd, int rn, Fld f) {
+        if (!f.explicitLayout) { LdrU(rd, rn, f.off); return; }
+        if (tgt86 == 1) {
+            // 批40:x86 显式布局字段装载。基址过 r10 批38 族约定;体内
+            // 模型:窄整 = 64 位符号/零扩展,float = 加宽 double 位型,
+            // double/8 字节 = 位型直读。disp32 全覆盖(arm64 需要
+            // FieldMemBase 大位移物化,x86 [r10+disp32] 一发入魂)。
+            XGetV(rn, 10);
+            if (f.ty == "float") {
+                // movss xmm15, [r10+off](F3 45 0F 10 /r,modrm
+                // 80|111<<3|010 = BA)→ cvtss2sd → movq rdi, xmm15
+                X3(0xF3, 0x45, 0x0F); X1(0x10); X1(0xBA); X4(f.off);
+                X3(0xF3, 0x45, 0x0F); X1(0x5A); X1(0xFF);
+                X3(0x66, 0x4C, 0x0F); X1(0x7E); X1(0xFF);
+                XSetV(rd, 7);
+                return;
+            }
+            if (f.width == 8) {
+                XopRMem(0x8B, 7, 10, f.off);            // mov rdi, [r10+off]
+            } else if (f.width == 4) {
+                if (f.ty == "int") { X3(0x49, 0x63, 0xBA); X4(f.off); }   // movsxd rdi, dword [r10+off]
+                else { X3(0x41, 0x8B, 0xBA); X4(f.off); }                 // mov edi, dword [r10+off](零扩展)
+            } else if (f.width == 2) {
+                if (f.ty == "short") { X3(0x49, 0x0F, 0xBF); X1(0xBA); X4(f.off); }   // movswq rdi, word [r10+off]
+                else { X3(0x49, 0x0F, 0xB7); X1(0xBA); X4(f.off); }                   // movzwq rdi, word [r10+off]
+            } else {
+                if (f.ty == "sbyte") { X3(0x49, 0x0F, 0xBE); X1(0xBA); X4(f.off); }   // movsbq rdi, byte [r10+off]
+                else { X3(0x49, 0x0F, 0xB6); X1(0xBA); X4(f.off); }                   // movzbq rdi, byte [r10+off]
+            }
+            XSetV(rd, 7);
+            return;
+        }
+        int baseReg = FieldMemBase(f, rn, rd);
+        int bits = FieldMemOffset(f) | (baseReg << 5);
+        if (f.ty == "float") {
+            E4(0xBD400000 | bits | 31);              // ldr s31, [base, off]
+            E4(0x1E22C3FF);                         // fcvt d31, s31
+            E4(0x9E6603E0 | rd);                    // fmov xd, d31
+            return;
+        }
+        int op = 0xF9400000;
+        if (f.width == 1) { op = f.ty == "sbyte" ? 0x39800000 : 0x39400000; }
+        if (f.width == 2) { op = f.ty == "short" ? 0x79800000 : 0x79400000; }
+        if (f.width == 4) { op = f.ty == "int" ? 0xB9800000 : 0xB9400000; }
+        E4(op | bits | rd);
+    }
+
+    void StoreFieldNg(int rt, int rn, Fld f) {
+        if (!f.explicitLayout) { StrU(rt, rn, f.off); return; }
+        if (tgt86 == 1) {
+            // 批40:x86 显式布局字段存储。窄存储取 r11 低 8/16/32 位
+            // (体内窄整是加宽位型,截断即语义;arm64 同);float 取
+            // double 位型低 32 位(=cvtsd2ss 位型,批38 NarrowF32Bits
+            // 同一数学),movd 回 GPR 再 4 字节存储。
+            XGetV(rn, 10);
+            XGetV(rt, 11);
+            if (f.ty == "float") {
+                // movq xmm15, r11 → cvtsd2ss xmm15 → movd r11d, xmm15
+                // → mov dword [r10+off], r11d(45 89 9A)
+                X3(0x66, 0x4D, 0x0F); X1(0x6E); X1(0xFB);
+                X3(0xF2, 0x45, 0x0F); X1(0x5A); X1(0xFF);
+                X3(0x66, 0x45, 0x0F); X1(0x7E); X1(0xFB);
+                X3(0x45, 0x89, 0x9A); X4(f.off);
+                return;
+            }
+            if (f.width == 8) {
+                XopMemR(0x89, 11, 10, f.off);           // mov [r10+off], r11
+            } else if (f.width == 4) {
+                X3(0x45, 0x89, 0x9A); X4(f.off);        // mov dword [r10+off], r11d
+            } else if (f.width == 2) {
+                X1(0x66); X3(0x45, 0x89, 0x9A); X4(f.off);   // mov word [r10+off], r11w
+            } else {
+                X3(0x45, 0x88, 0x9A); X4(f.off);        // mov byte [r10+off], r11b
+            }
+            return;
+        }
+        int baseReg = FieldMemBase(f, rn, rt);
+        int bits = FieldMemOffset(f) | (baseReg << 5);
+        if (f.ty == "float") {
+            E4(0x9E67001F | (rt << 5));              // fmov d31, xt
+            E4(0x1E6243FF);                         // fcvt s31, d31
+            E4(0xBD000000 | bits | 31);              // str s31, [base, off]
+            return;
+        }
+        int op = 0xF9000000;
+        if (f.width == 1) { op = 0x39000000; }
+        if (f.width == 2) { op = 0x79000000; }
+        if (f.width == 4) { op = 0xB9000000; }
+        E4(op | bits | rt);
+    }
+
+    void FieldAddressNg(Fld f, Node place) {
+        // ref/out currently dereferences legacy 8-byte slots; passing a narrow
+        // union field would overwrite adjacent bytes (float also has a distinct ABI).
+        if (f.explicitLayout && f.width != 8) {
+            diags.Error("ngen: ref/out of a narrow explicit-layout field is unsupported", place.line, place.col);
+            LoadImm(0, 0);
+            return;
+        }
+        if (f.off <= 4095) { AddImm(0, 0, f.off); }
+        else { LoadImm(16, f.off); AddRR(0, 0, 16); }
+    }
+}

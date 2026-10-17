@@ -1,0 +1,340 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// PE-COFF 64-bit object file writer for Ngen (aarch64, Windows ARM64). This
+// mirrors ngen_macho.zan's emission interface: it reads the final emission
+// state (txt, syms, fixups, strRefs, strs, dglbs, dataLen) and returns the
+// whole object image as bytes. Selected by the target switch below; the
+// dispatcher lives at the top of ngen_macho.zan's BuildMachO().
+//
+// Layout:
+//
+//   COFF header (20) + section table (3 * 40 = 120)
+//   .text$mn  at 140           executable code (16-aligned)
+//   .rdata    after text       string literals (initialized, read-only)
+//   .data     after .rdata     module globals as explicit zero bytes
+//   .text$mn relocations (10 bytes each, sorted by VirtualAddress)
+//   symbol table (18 bytes per entry, aux records included)
+//   string table (4-byte size field + long names)
+//
+// Symbol table: canonical PE form -- one STATIC section-definition symbol
+// per section (each with one aux record), then defined code symbols
+// (EXTERNAL), string/data literals (STATIC), then undefined externs
+// (EXTERNAL, section number 0).
+//
+// Relocations (ARM64 codes verified against llvm/BinaryFormat/COFF.h,
+// enum RelocationTypesARM64 -- NOTE: not the sequential values guessed in
+// some planning notes):
+//   BL extern                 -> IMAGE_REL_ARM64_BRANCH26       (0x3)
+//   adrp ref                  -> IMAGE_REL_ARM64_PAGEBASE_REL21 (0x4)
+//   add  ref                  -> IMAGE_REL_ARM64_PAGEOFFSET_12A (0x6)
+//   ldr ref (GOT-style pair)  -> IMAGE_REL_ARM64_PAGEOFFSET_12L (0x7)
+// Immediates stay zero in the object; the PE linker fills them (COFF
+// relocations carry no explicit addend, and our addends are 0 anyway).
+//
+// Name decoration: arm64 Windows does NOT prefix C symbols with '_'
+// (unlike 32-bit x86 Windows; x64 and ARM64 are undecorated), so the
+// Mach-O-style leading '_' is stripped from symbol names at write time
+// ("_main" -> "main", "___stderrp" -> "__stderrp"). Local names that do
+// not start with '_' (l_.str.N, l_.g.NAME) pass through unchanged.
+//
+// GOT-style adrp+ldr pairs (dylib data symbols) translate directly:
+// adrp@PAGEBASE_REL21 + ldr@PAGEOFFSET_12L against the plain extern
+// symbol; PE has no GOT indirection for non-dllimport data.
+partial class Ngen {
+    // target switch: 0 = Mach-O arm64 (macOS, default), 1 = PE-COFF arm64
+    // (Windows). Set via SetTargetCoff() from the driver (main.zan picks it
+    // by output-file suffix: out.obj => PE-COFF, out.o => Mach-O).
+    int coffTarget = 0;
+    public void SetTargetCoff() { coffTarget = 1; }
+
+    // running string-table offset (first entry lives at offset 4, after the
+    // 4-byte size field) and the string-table body being accumulated
+    int coffStro = 4;
+    List<int> coffStrTab;
+
+    // arm64 Windows name de-decoration: drop exactly one leading '_'
+    string CoffSymName(string n) {
+        if (n.Length > 0 && (int)n[0] == 0x5F) { return n.Substring(1, n.Length - 1); }
+        return n;
+    }
+
+    // undefined externs in first-reference order: extern BL targets plus
+    // every strRef target not defined in this object (unlike the Mach-O
+    // list, non-GOT extern data refs are included too)
+    List<string> CoffExternSyms() {
+        List<string> es = new List<string>();
+        MethIndex defIx = BuildDefSymIdx();
+        MethIndex esIx = new MethIndex();
+        int i = 0;
+        while (i < fixups.Count) {
+            Fixup f = fixups[i];
+            if (f.kind == 4 && esIx.Get(f.sym) == null) { es.Add(f.sym); esIx.Add(f.sym, es.Count - 1); }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < strRefs.Count) {
+            StrRef r = strRefs[i];
+            if (DefinedSymIdx(defIx, r.sym) == 0 && esIx.Get(r.sym) == null) { es.Add(r.sym); esIx.Add(r.sym, es.Count - 1); }
+            i = i + 1;
+        }
+        // the underlying externs behind the homemade __nl_symbol_ptr slots
+        // are undefined even though the slot globals themselves are defined
+        i = 0;
+        while (i < nlExts.Count) {
+            if (esIx.Get(nlExts[i]) == null) { es.Add(nlExts[i]); esIx.Add(nlExts[i], es.Count - 1); }
+            i = i + 1;
+        }
+        return es;
+    }
+
+    void InsertCoffReloc(List<int> addrs, List<int> atSym, List<int> typs, int addr, int symnum, int typ) {
+        addrs.Add(addr);
+        atSym.Add(symnum);
+        typs.Add(typ);
+    }
+
+    void SortReloc3(List<int> a, List<int> s, List<int> t) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        int i = n / 2;
+        while (i > 0) { i = i - 1; SiftReloc3(a, s, t, i, n); }
+        i = n - 1;
+        while (i > 0) {
+            int x = a[0]; a[0] = a[i]; a[i] = x;
+            x = s[0]; s[0] = s[i]; s[i] = x;
+            x = t[0]; t[0] = t[i]; t[i] = x;
+            SiftReloc3(a, s, t, 0, i);
+            i = i - 1;
+        }
+    }
+
+    void SiftReloc3(List<int> a, List<int> s, List<int> t, int root, int n) {
+        while (true) {
+            int l = root * 2 + 1;
+            if (l >= n) { break; }
+            int m = l;
+            if (l + 1 < n && a[l + 1] > a[m]) { m = l + 1; }
+            if (a[root] >= a[m]) { break; }
+            int x = a[root]; a[root] = a[m]; a[m] = x;
+            x = s[root]; s[root] = s[m]; s[m] = x;
+            x = t[root]; t[root] = t[m]; t[m] = x;
+            root = m;
+        }
+    }
+
+    int Align8(int v) {
+        int r = v - (v / 8) * 8;
+        if (r != 0) { v = v + 8 - r; }
+        return v;
+    }
+
+    // build the whole PE-COFF object image; returns bytes
+    List<int> BuildCoff() {
+        int textLen = txt.Count;
+        int cstrLen = 0;
+        int i = 0;
+        while (i < strs.Count) { cstrLen = cstrLen + strs[i].Length + 1; i = i + 1; }
+        if (cstrLen == 0) { cstrLen = 1; } // keep the section non-empty
+
+        // relocation symbol numbers: 3 section symbols + 3 aux records
+        // precede the real symbols (defined methods, then string literals,
+        // then data globals, then undefined externs -- RefSymNum order)
+        List<string> exts = CoffExternSyms();
+        int extBase = syms.Count + strs.Count + dglbs.Count;
+        int symBase = 6;
+        MethIndex refIdx = BuildRefSymIdx(exts, extBase, symBase);
+
+        List<int> rAddr = new List<int>();
+        List<int> rSym = new List<int>();
+        List<int> rTyp = new List<int>();
+        i = 0;
+        while (i < fixups.Count) {
+            Fixup f = fixups[i];
+            if (f.kind == 4) {
+                InsertCoffReloc(rAddr, rSym, rTyp, f.pos, RefSymNum(f.sym, refIdx, symBase + extBase), 3); // BRANCH26
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < strRefs.Count) {
+            StrRef r = strRefs[i];
+            int symnum = RefSymNum(r.sym, refIdx, symBase + extBase);
+            InsertCoffReloc(rAddr, rSym, rTyp, r.adrpPos, symnum, 4); // PAGEBASE_REL21
+            if (r.got != 0) {
+                InsertCoffReloc(rAddr, rSym, rTyp, r.addPos, symnum, 7); // PAGEOFFSET_12L (ldr)
+            } else {
+                InsertCoffReloc(rAddr, rSym, rTyp, r.addPos, symnum, 6); // PAGEOFFSET_12A (add)
+            }
+            i = i + 1;
+        }
+        SortReloc3(rAddr, rSym, rTyp);
+        int nrel = rAddr.Count;
+        if (nrel > 65535) { diags.Error("ngen_coff: more than 65535 relocations in .text$mn", 0, 0); }
+
+        // homemade __nl_symbol_ptr slots ride at the tail of .data; each
+        // quad carries an ADDR64 against the underlying extern
+        List<int> dAddr = new List<int>();
+        List<int> dSym = new List<int>();
+        List<int> dTyp = new List<int>();
+        i = 0;
+        while (i < dglbs.Count) {
+            if (IsNlSlot(dglbs[i].name) != 0) {
+                InsertCoffReloc(dAddr, dSym, dTyp, dataLen + dglbs[i].off,
+                                RefSymNum(nlExts[dAddr.Count], refIdx, symBase + extBase), 14); // ADDR64
+            }
+            i = i + 1;
+        }
+        int ndrel = dAddr.Count;
+
+        // file layout: header (20) + section table (120) = 140, then payload
+        int textOff = 140;
+        int rdataOff = Align8(textOff + textLen);
+        int dataOff = Align8(rdataOff + cstrLen);
+        int relocOff = Align8(dataOff + dataLen + nlLen);
+        int nsyms = symBase + extBase + exts.Count;
+        int symOff = relocOff + nrel * 10 + ndrel * 10;
+
+        coffStro = 4;
+        coffStrTab = new List<int>();
+
+        List<int> img = new List<int>();
+        // ---- COFF header ----
+        Put16(img, 0xAA64);              // Machine: IMAGE_FILE_MACHINE_ARM64
+        Put16(img, 3);                   // NumberOfSections
+        Put32(img, 0);                   // TimeDateStamp (deterministic)
+        Put32(img, symOff);              // PointerToSymbolTable
+        Put32(img, nsyms);               // NumberOfSymbols (incl. aux)
+        Put16(img, 0);                   // SizeOfOptionalHeader (0 for objects)
+        Put16(img, 0);                   // Characteristics
+        // ---- section table ----
+        // .text$mn: CODE | MEM_EXECUTE | MEM_READ | ALIGN_16BYTES
+        CoffSection(img, ".text$mn", textLen, textOff, relocOff, nrel, 0x60500020);
+        // .rdata: CNT_INITIALIZED_DATA | MEM_READ | ALIGN_8BYTES
+        CoffSection(img, ".rdata", cstrLen, rdataOff, 0, 0, 0x40400040);
+        // .data: CNT_INITIALIZED_DATA | MEM_READ | MEM_WRITE | ALIGN_8BYTES
+        CoffSection(img, ".data", dataLen + nlLen, dataOff, relocOff + nrel * 10, ndrel, 0xC0000040);
+        // ---- payload ----
+        Append(img, txt, 0, textLen);
+        i = 0;
+        while (i < rdataOff - (textOff + textLen)) { Put8(img, 0); i = i + 1; }
+        i = 0;
+        while (i < strs.Count) {
+            PutName(img, strs[i], strs[i].Length + 1);
+            i = i + 1;
+        }
+        if (strs.Count == 0) { Put8(img, 0); }
+        i = 0;
+        while (i < dataOff - (rdataOff + cstrLen)) { Put8(img, 0); i = i + 1; }
+        EmitDataPayload(img);
+        i = 0;
+        while (i < nlLen) { Put8(img, 0); i = i + 1; } // __nl_symbol_ptr slots
+        i = 0;
+        while (i < nrel) {
+            Put32(img, rAddr[i]);        // VirtualAddress (within section)
+            Put32(img, rSym[i]);         // SymbolTableIndex
+            Put16(img, rTyp[i]);         // Type
+            i = i + 1;
+        }
+        // .data relocations: one ADDR64 per slot
+        i = 0;
+        while (i < ndrel) {
+            Put32(img, dAddr[i]);
+            Put32(img, dSym[i]);
+            Put16(img, dTyp[i]);
+            i = i + 1;
+        }
+        // ---- symbol table ----
+        // section-definition symbols (STATIC, one aux record each)
+        PutCoffSym(img, ".text$mn", 0, 1, 0, 3, 1);
+        PutCoffSecAux(img, textLen, nrel, 1);
+        PutCoffSym(img, ".rdata", 0, 2, 0, 3, 1);
+        PutCoffSecAux(img, cstrLen, 0, 2);
+        PutCoffSym(img, ".data", 0, 3, 0, 3, 1);
+        PutCoffSecAux(img, dataLen + nlLen, ndrel, 3);
+        // defined code symbols (EXTERNAL, function type)
+        i = 0;
+        while (i < syms.Count) {
+            PutCoffSym(img, CoffSymName(syms[i].name), syms[i].pos, 1, 0x20, 2, 0);
+            i = i + 1;
+        }
+        // string literals (STATIC, .rdata)
+        List<int> coffSoffs = StrOffsets();
+        i = 0;
+        while (i < strs.Count) {
+            PutCoffSym(img, StrSym(i), coffSoffs[i], 2, 0, 3, 0);
+            i = i + 1;
+        }
+        // data globals (STATIC, .data; slot globals sit in the trailing
+        // __nl_symbol_ptr part of .data)
+        i = 0;
+        while (i < dglbs.Count) {
+            PutCoffSym(img, DGlobalSym(dglbs[i].name),
+                       (IsNlSlot(dglbs[i].name) != 0) ? dataLen + dglbs[i].off : dglbs[i].off, 3, 0, 3, 0);
+            i = i + 1;
+        }
+        // undefined externs (EXTERNAL, section 0 = IMAGE_SYM_UNDEFINED)
+        i = 0;
+        while (i < exts.Count) {
+            PutCoffSym(img, CoffSymName(exts[i]), 0, 0, 0, 2, 0);
+            i = i + 1;
+        }
+        // ---- string table ----
+        Put32(img, coffStro);            // total size including this field
+        i = 0;
+        while (i < coffStrTab.Count) { img.Add(coffStrTab[i]); i = i + 1; }
+        return img;
+    }
+
+    // 40-byte section header
+    void CoffSection(List<int> img, string name, int rawSize, int rawPtr, int relPtr, int nrel, int chars) {
+        PutName(img, name, 8);           // Name (inline, NUL-padded)
+        Put32(img, 0);                   // VirtualSize (0 for objects)
+        Put32(img, 0);                   // VirtualAddress
+        Put32(img, rawSize);             // SizeOfRawData
+        Put32(img, rawPtr);              // PointerToRawData
+        Put32(img, relPtr);              // PointerToRelocations
+        Put32(img, 0);                   // PointerToLinenumbers
+        Put16(img, nrel);                // NumberOfRelocations
+        Put16(img, 0);                   // NumberOfLinenumbers
+        Put32(img, chars);               // Characteristics
+    }
+
+    // 18-byte symbol table entry; long names spill into the string table
+    // (first 4 name bytes zero, last 4 = string-table offset)
+    void PutCoffSym(List<int> img, string name, int value, int sect, int typ, int cls, int aux) {
+        if (name.Length <= 8) {
+            PutName(img, name, 8);
+        } else {
+            Put32(img, 0);
+            Put32(img, coffStro);
+            AppendCoffStr(name);
+        }
+        Put32(img, value);
+        Put16(img, sect);
+        Put16(img, typ);
+        Put8(img, cls);
+        Put8(img, aux);
+    }
+
+    void AppendCoffStr(string s) {
+        int i = 0;
+        while (i < s.Length) { coffStrTab.Add(ByteAt(s[i], 0)); i = i + 1; }
+        coffStrTab.Add(0);
+        coffStro = coffStro + s.Length + 1;
+    }
+
+    // 18-byte auxiliary section-definition record: Length, NumberOfRelocations,
+    // NumberOfLinenumbers, CheckSum, Number (1-based section), Selection, pad
+    void PutCoffSecAux(List<int> img, int length, int nrel, int number) {
+        Put32(img, length);
+        Put16(img, nrel);
+        Put16(img, 0);                   // NumberOfLinenumbers
+        Put32(img, 0);                   // CheckSum
+        Put16(img, number);              // Number: primary definition
+        Put8(img, 0);                    // Selection: none
+        Put8(img, 0);                    // bReserved
+        Put16(img, 0);                   // pad to 18
+    }
+}

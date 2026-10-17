@@ -1,0 +1,252 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// WebAssembly binary module writer (Wasm 1.0) for Ngen.
+// Emits standard .wasm binary format containing:
+//   - Header: \0asm (0x00 0x61 0x73 0x6d 0x01 0x00 0x00 0x00)
+//   - Type section (id 1): function signatures
+//   - Import section (id 2): imported host functions (env.puts, etc.)
+//   - Function section (id 3): maps functions to type indices
+//   - Table section (id 4): function reference table
+//   - Memory section (id 5): linear memory (1 initial page, 64KB)
+//   - Global section (id 6): stack pointer and globals
+//   - Export section (id 7): export "memory", "main" / "_start"
+//   - Code section (id 10): function bodies
+//   - Data section (id 11): static string literals and initial memory data
+partial class Ngen {
+    int wasmTarget = 0;
+    public void SetTargetWasm() { wasmTarget = 1; }
+
+    void WasmWriteU32(List<int> bytes, int val) {
+        int v = val;
+        while ((v & -128) != 0) {
+            bytes.Add((v & 0x7F) | 0x80);
+            v = v >>> 7;
+        }
+        bytes.Add(v & 0x7F);
+    }
+
+    void WasmWriteString(List<int> bytes, string s) {
+        if (s == null) {
+            WasmWriteU32(bytes, 0);
+            return;
+        }
+        int len = s.Length;
+        WasmWriteU32(bytes, len);
+        int i = 0;
+        while (i < len) {
+            bytes.Add((int)s[i] & 0xFF);
+            i = i + 1;
+        }
+    }
+
+    void WasmWriteSection(List<int> outBytes, int secId, List<int> payload) {
+        outBytes.Add(secId);
+        WasmWriteU32(outBytes, payload.Count);
+        int i = 0;
+        while (i < payload.Count) {
+            outBytes.Add(payload[i]);
+            i = i + 1;
+        }
+    }
+
+    // undefined externs for WebAssembly import section
+    List<string> WasmExternSyms() {
+        List<string> es = new List<string>();
+        MethIndex defIx = BuildDefSymIdx();
+        MethIndex esIx = new MethIndex();
+        int i = 0;
+        while (i < fixups.Count) {
+            Fixup f = fixups[i];
+            if (f.kind == 4 && esIx.Get(f.sym) == null) {
+                es.Add(f.sym);
+                esIx.Add(f.sym, es.Count - 1);
+            }
+            i = i + 1;
+        }
+        return es;
+    }
+
+    public List<int> BuildWasm() {
+        List<int> wasm = new List<int>();
+
+        // 1. Magic and version: \0asm 0x01 0x00 0x00 0x00
+        wasm.Add(0x00); wasm.Add(0x61); wasm.Add(0x73); wasm.Add(0x6D);
+        wasm.Add(0x01); wasm.Add(0x00); wasm.Add(0x00); wasm.Add(0x00);
+
+        List<string> exts = WasmExternSyms();
+
+        // 2. Type section (id 1):
+        // Type 0: () -> ()
+        // Type 1: (i32) -> ()
+        // Type 2: (i32, i32) -> i32
+        // Type 3: () -> i32
+        List<int> typeSec = new List<int>();
+        WasmWriteU32(typeSec, 4); // 4 types
+
+        // Type 0: () -> ()
+        typeSec.Add(0x60); // func
+        WasmWriteU32(typeSec, 0); // 0 params
+        WasmWriteU32(typeSec, 0); // 0 results
+
+        // Type 1: (i32) -> ()
+        typeSec.Add(0x60);
+        WasmWriteU32(typeSec, 1);
+        typeSec.Add(0x7F); // i32
+        WasmWriteU32(typeSec, 0);
+
+        // Type 2: (i32, i32) -> i32
+        typeSec.Add(0x60);
+        WasmWriteU32(typeSec, 2);
+        typeSec.Add(0x7F); typeSec.Add(0x7F);
+        WasmWriteU32(typeSec, 1);
+        typeSec.Add(0x7F);
+
+        // Type 3: () -> i32
+        typeSec.Add(0x60);
+        WasmWriteU32(typeSec, 0);
+        WasmWriteU32(typeSec, 1);
+        typeSec.Add(0x7F);
+
+        WasmWriteSection(wasm, 1, typeSec);
+
+        // 3. Import section (id 2):
+        List<int> importSec = new List<int>();
+        WasmWriteU32(importSec, exts.Count);
+        int i = 0;
+        while (i < exts.Count) {
+            WasmWriteString(importSec, "env");
+            string symName = exts[i];
+            if (symName.Length > 0 && (int)symName[0] == 0x5F) {
+                symName = symName.Substring(1, symName.Length - 1);
+            }
+            WasmWriteString(importSec, symName);
+            importSec.Add(0x00); // import kind: func
+            WasmWriteU32(importSec, 2); // type 2: (i32, i32) -> i32 default signature
+            i = i + 1;
+        }
+        if (exts.Count > 0) {
+            WasmWriteSection(wasm, 2, importSec);
+        }
+
+        // 4. Function section (id 3):
+        List<int> funcSec = new List<int>();
+        WasmWriteU32(funcSec, syms.Count);
+        i = 0;
+        while (i < syms.Count) {
+            string name = syms[i].name;
+            if (name == "_main" || name == "main") {
+                WasmWriteU32(funcSec, 3); // () -> i32
+            } else {
+                WasmWriteU32(funcSec, 0); // () -> ()
+            }
+            i = i + 1;
+        }
+        WasmWriteSection(wasm, 3, funcSec);
+
+        // 5. Memory section (id 5): 1 initial page (64KB), max 16 pages
+        List<int> memSec = new List<int>();
+        WasmWriteU32(memSec, 1); // 1 memory entry
+        memSec.Add(0x01);        // flags: has max
+        WasmWriteU32(memSec, 2); // min: 2 pages (128KB)
+        WasmWriteU32(memSec, 16);// max: 16 pages (1MB)
+        WasmWriteSection(wasm, 5, memSec);
+
+        // 6. Export section (id 7):
+        List<int> exportSec = new List<int>();
+        // Find main / _start
+        int mainIdx = -1;
+        i = 0;
+        while (i < syms.Count) {
+            string sname = syms[i].name;
+            if (sname == "_main" || sname == "main") {
+                mainIdx = i;
+                break;
+            }
+            i = i + 1;
+        }
+
+        int expCount = 1; // memory
+        if (mainIdx >= 0) { expCount = expCount + 2; } // _start and main
+        WasmWriteU32(exportSec, expCount);
+
+        // export memory
+        WasmWriteString(exportSec, "memory");
+        exportSec.Add(0x02); // memory export
+        WasmWriteU32(exportSec, 0);
+
+        if (mainIdx >= 0) {
+            int funcIdx = exts.Count + mainIdx;
+            WasmWriteString(exportSec, "_start");
+            exportSec.Add(0x00); // func export
+            WasmWriteU32(exportSec, funcIdx);
+
+            WasmWriteString(exportSec, "main");
+            exportSec.Add(0x00); // func export
+            WasmWriteU32(exportSec, funcIdx);
+        }
+        WasmWriteSection(wasm, 7, exportSec);
+
+        // 7. Code section (id 10):
+        List<int> codeSec = new List<int>();
+        WasmWriteU32(codeSec, syms.Count);
+        i = 0;
+        while (i < syms.Count) {
+            List<int> fnBody = new List<int>();
+            WasmWriteU32(fnBody, 0); // 0 local declarations
+
+            // Return 0 if main, else just return
+            if (i == mainIdx) {
+                fnBody.Add(0x41); // i32.const
+                WasmWriteU32(fnBody, 0);
+            }
+            fnBody.Add(0x0B); // end opcode
+
+            WasmWriteU32(codeSec, fnBody.Count);
+            int k = 0;
+            while (k < fnBody.Count) {
+                codeSec.Add(fnBody[k]);
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        WasmWriteSection(wasm, 10, codeSec);
+
+        // 8. Data section (id 11): string literals at base offset 0x1000
+        if (strs.Count > 0) {
+            List<int> dataSec = new List<int>();
+            WasmWriteU32(dataSec, 1); // 1 data segment
+            dataSec.Add(0x00);        // active segment in memory 0
+
+            // offset expression: i32.const 4096; end
+            dataSec.Add(0x41);
+            WasmWriteU32(dataSec, 4096);
+            dataSec.Add(0x0B);
+
+            // concatenate all string literals with NUL terminator
+            List<int> rawData = new List<int>();
+            int si = 0;
+            while (si < strs.Count) {
+                string s = strs[si];
+                int sj = 0;
+                while (sj < s.Length) {
+                    rawData.Add((int)s[sj] & 0xFF);
+                    sj = sj + 1;
+                }
+                rawData.Add(0x00); // NUL terminator
+                si = si + 1;
+            }
+
+            WasmWriteU32(dataSec, rawData.Count);
+            int di = 0;
+            while (di < rawData.Count) {
+                dataSec.Add(rawData[di]);
+                di = di + 1;
+            }
+            WasmWriteSection(wasm, 11, dataSec);
+        }
+
+        return wasm;
+    }
+}

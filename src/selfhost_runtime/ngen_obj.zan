@@ -1,0 +1,3499 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// M2: class/object support for Ngen -- class layout, allocation, instance
+// methods, field access, string concat, Console.WriteLine, and the
+// Ngen-emitted object runtime core (alloc / str ops / print). The runtime
+// core mirrors gen0's IR-embedded runtime (zan_rt_alloc: 16-byte header,
+// [-16]=refcount, [-8]=descriptor; strings stamped with the ZANS magic) so
+// both backends stay ABI-identical.
+//
+// Object layout: fields in declaration order, 8-byte-aligned slots; int
+// fields occupy 8 bytes (value in slot 0). %List matches {i64,i64,ptr}.
+
+class Fld {
+    public string name;
+    public int off;
+    public string ty;   // "int" / "string" / class name
+    public int width;    // storage width in bytes (8 for legacy slots)
+    public bool explicitLayout;
+    // 批43:struct 值字段的扁平展开 —— 该字段不再是引用槽,其载荷按内层
+    // struct 的字段递归内联在 off 起的连续槽里(成员链走偏移算术,整体
+    // 赋值/读取走载荷拷贝)。普通布局展开;显式布局与开放泛型不展开。
+    public bool expanded;
+    // 批47:expanded 字段的区域形状单一真源。普通具名 struct = FindClass
+    // 可达的类记录;实例化泛型 struct = 替换视图(StructInstExpandTy 建,
+    // 槽叶规则保证视图布局与开模板箱载荷布局恒等)。ExpandedStructOf 只
+    // 认这个指针,不再按 ty 串二次解析。
+    public Cls expCls;
+    public Fld(string n, int o, string t) { name = n; off = o; ty = t; width = 8; explicitLayout = false; expanded = false; }
+    public Fld(string n, int o, string t, int w, bool ex) { name = n; off = o; ty = t; width = w; explicitLayout = ex; expanded = false; }
+}
+
+class Cls {
+    public string name;
+    public List<Fld> flds;
+    public int size;
+    public string baseName;  // ": Base" clause, null when none
+    public int based;        // base fields already merged into flds
+    public int site;         // runtime class-site id (1-based); 'new' stamps it
+                             // into the upper half of obj-8 so `x is T` can do a
+                             // runtime check (strings keep the full magic there,
+                             // which reads as site 0x5A41 -- above every real
+                             // site, so a string never matches a class)
+    public int isStruct;     // 1 when declared as `struct` (ngen still boxes
+                             // them, but containers must not adopt pointer
+                             // semantics for struct elements: gen0 stores
+                             // structs inline with value semantics)
+    public int isIface;      // 1 when declared via `interface` (reflection kind)
+    public bool explicitLayout; // explicit byte offsets supplied by struct layout
+    public int poly;         // layout tri-state: 0 unknown, 1 polymorphic
+                             // (carries a vtable pointer at obj+0, own fields
+                             // shifted by 8), 2 known not polymorphic
+    public List<string> tps; // type-parameter names in declaration order
+                             // (Box<T> keeps ["T"]); call sites substitute
+                             // the receiver's type arguments into member
+                             // declared types
+    public Cls(string n) { name = n; flds = new List<Fld>(); size = 0; baseName = null; based = 0; site = 0; isStruct = 0; explicitLayout = false; poly = 0; tps = new List<string>(); }
+}
+
+class DGlob {
+    public string name; // data global name (without the l_.g. prefix); the
+                        // "nl." prefix marks a __nl_symbol_ptr slot, whose
+                        // off is relative to that section instead of __data
+    public int size;
+    public int off;     // offset within __DATA,__data (or __nl_symbol_ptr)
+    public List<int> bytes; // initialized payload, or null for zero-filled
+    public DGlob(string n, int s, int o) { name = n; size = s; off = o; bytes = null; }
+}
+
+partial class Ngen {
+    List<Cls> classes;
+    List<DGlob> dglbs;
+    int dataLen;
+    List<string> nlExts;    // extern symbols behind the homemade __nl_symbol_ptr slots
+    int nlLen;              // total slot bytes (8 per distinct extern)
+    List<string> sfNames;   // static field names
+    List<string> sfCls;     // static field declaring class
+    List<string> sfSyms;    // static field data-global symbol
+    List<string> sfTy;      // static field declared type
+    int fmtiIdx;
+    int fmtsIdx;
+    List<string> sfInitCls;
+    List<string> sfInitSym;
+    List<Node> sfInitExpr;
+    List<string> sfInitTy;
+    List<string> ifInitCls;
+    List<string> ifInitName;
+    List<Node> ifInitExpr;
+    int fmtnIdx;
+    int fmtuIdx;
+    int fmtuNIdx;
+    int fmtwIdx;
+    int fmtcIdx;
+    int emptyIdx;
+    int fmtUnhandledIdx;      // "Unhandled exception: " (heap via strp)
+    int fmtUnhandledClsIdx;   // "Unhandled exception (class object)"
+    int fmtUnhandledBareIdx;  // "Unhandled exception"
+
+    Cls FindClass(string n) {
+        if (n == null) { return null; }
+        // instantiated generic names ("Pool<Conn>") resolve to the open
+        // class: erasure keeps one layout and one method table
+        int lt = n.IndexOf("<");
+        if (lt > 0 && n.Substring(n.Length - 1, 1) == ">") {
+            n = n.Substring(0, lt);
+        }
+        if (clsByName == null) { return null; }
+        List<int> hit = clsByName.Get(n);
+        if (hit == null) { return null; }
+        return classes[hit[0]];
+    }
+
+    Fld FindField(Cls c, string n) {
+        if (c == null) { return null; }
+        // most-derived declaration wins: a derived field may hide a base
+        // field of the same name (field_hiding), and the layout appends the
+        // derived declarations after the base prefix
+        int i = c.flds.Count - 1;
+        while (i >= 0) { if (c.flds[i].name == n) { return c.flds[i]; } i = i - 1; }
+        return null;
+    }
+
+    int FieldOff(string cls, string fld) {
+        Fld f = FindField(FindClass(cls), fld);
+        if (f == null) { return -1; }
+        return f.off;
+    }
+
+    int FieldWidth(string cls, string fld) {
+        Fld f = FindField(FindClass(cls), fld);
+        return f == null ? -1 : f.width;
+    }
+
+    bool IsExplicitField(string cls, string fld) {
+        Fld f = FindField(FindClass(cls), fld);
+        return f != null && f.explicitLayout;
+    }
+
+    bool IsExplicitClass(string cls) {
+        Cls c = FindClass(cls);
+        return c != null && c.explicitLayout;
+    }
+
+    void CollectClasses(Node unit) {
+        classes = new List<Cls>();
+        dglbs = new List<DGlob>();
+        nlExts = new List<string>();
+        nlLen = 0;
+        sfNames = new List<string>();
+        sfCls = new List<string>();
+        sfSyms = new List<string>();
+        sfTy = new List<string>();
+        sfInitCls = new List<string>();
+        sfInitSym = new List<string>();
+        sfInitExpr = new List<Node>();
+        sfInitTy = new List<string>();
+        ifInitCls = new List<string>();
+        ifInitName = new List<string>();
+        ifInitExpr = new List<Node>();
+        dataLen = 0;
+        int i = 0;
+        while (i < unit.kids.Count) {
+            Node dcl = unit.kids[i];
+            if (dcl.kind == AK.ClassDecl() || dcl.kind == AK.StructDecl()) { CollectClass(dcl); }
+            i = i + 1;
+        }
+        ExpandStructFields();
+        // builtin Exception: synthesized when the program derives from it or
+        // touches it without declaring it (gen0 hosts it as a runtime class).
+        // Non-polymorphic by fiat: the message lives at obj+0, so a caught
+        // exception's `Message` is a plain field read.
+        bool hasExc = false;
+        i = 0;
+        while (i < classes.Count) {
+            if (classes[i].name == "Exception") { hasExc = true; }
+            i = i + 1;
+        }
+        bool needsExc = false;
+        i = 0;
+        while (i < classes.Count) {
+            if (classes[i].baseName == "Exception") { needsExc = true; }
+            i = i + 1;
+        }
+        if (!hasExc && !needsExc) {
+            int mi2 = 0;
+            while (mi2 < methNodes.Count && !needsExc) {
+                needsExc = TreeNeedsException(methNodes[mi2].b)
+                    || TreeNeedsException(methNodes[mi2].c)
+                    || TreeNeedsException(methNodes[mi2].d);
+                mi2 = mi2 + 1;
+            }
+        }
+        if (!hasExc && needsExc) {
+            Cls ec = new Cls("Exception");
+            ec.flds.Add(new Fld("Message", 0, "string"));
+            ec.size = 8;
+            RegCls(ec);
+            Node pt = new Node(AK.TypeRef()); pt.sval = "string";
+            Node pm = new Node(AK.Param()); pm.type = pt; pm.sval = "m";
+            Node ms2 = new Node(AK.Ident()); ms2.sval = "Message";
+            Node mv2 = new Node(AK.Ident()); mv2.sval = "m";
+            Node asg2 = new Node(AK.Assignment()); asg2.op = TK.Eq(); asg2.a = ms2; asg2.b = mv2;
+            Node es2 = new Node(AK.ExprStmt()); es2.a = asg2;
+            Node body2 = new Node(AK.Block()); body2.Add(es2);
+            Node c1 = new Node(AK.CtorDecl()); c1.Add(pm); c1.d = body2;
+            AddMethNg(c1, "Exception", 2);
+            Node c0 = new Node(AK.CtorDecl()); c0.d = new Node(AK.Block());
+            AddMethNg(c0, "Exception", 2);
+        }
+        bool hasObj = false;
+        i = 0;
+        while (i < classes.Count) {
+            if (classes[i].name == "object" || classes[i].name == "Object") { hasObj = true; }
+            i = i + 1;
+        }
+        if (!hasObj) {
+            Cls oc = new Cls("object");
+            oc.size = 0;
+            RegCls(oc);
+            Node oc0 = new Node(AK.CtorDecl()); oc0.d = new Node(AK.Block());
+            AddMethNg(oc0, "object", 2);
+            Cls oc2 = new Cls("Object");
+            oc2.size = 0;
+            RegCls(oc2);
+            Node oc20 = new Node(AK.CtorDecl()); oc20.d = new Node(AK.Block());
+            AddMethNg(oc20, "Object", 2);
+        }
+        i = 0;
+        while (i < classes.Count) { classes[i].site = i + 1; i = i + 1; }
+        // polymorphism layout: any virtual/override instance method in the
+        // class or an ancestor makes the whole chain polymorphic -- every
+        // instance carries a vtable pointer at obj+0 and its fields shift
+        // by 8. Decided before MergeBaseFields so a poly base's grown size
+        // is what derived fields are shifted by.
+        i = 0;
+        while (i < classes.Count) { PolyOf(classes[i]); i = i + 1; }
+        i = 0;
+        while (i < classes.Count) {
+            if (classes[i].poly == 1) { ShiftForVptr(classes[i]); }
+            i = i + 1;
+        }
+        // fold inherited instance fields into each subclass (base fields
+        // first, own fields shifted after); recursion handles chains
+        i = 0;
+        while (i < classes.Count) { MergeBaseFields(classes[i]); i = i + 1; }
+        // tuple layouts before any method emits: Main may read
+        // GetPair().Item2 whichever order bodies are compiled in
+        i = 0;
+        while (i < methNodes.Count) { TupleSweepMethodNg(methNodes[i]); i = i + 1; }
+        i = 0;
+        while (i < sfInitExpr.Count) { TupleSweepNg(sfInitExpr[i]); i = i + 1; }
+    }
+
+    int PolyOf(Cls c) {
+        if (c.poly != 0) { return c.poly; }
+        int p = ClassDeclaresVirtual(c.name) ? 1 : 0;
+        if (p == 0 && c.baseName != null) {
+            Cls b = FindClass(c.baseName);
+            if (b != null && PolyOf(b) == 1) { p = 1; }
+        }
+        c.poly = p == 1 ? 1 : 2;
+        return c.poly;
+    }
+
+    bool ClassDeclaresVirtual(string cls) {
+        List<int> mine = MethCandsCls(cls);
+        if (mine == null) { return false; }
+        int i = 0;
+        while (i < mine.Count) {
+            // abstract methods count too: an interface is modelled as an
+            // all-abstract class, and its implementers must carry a vtable
+            // so interface-typed references reach the concrete body
+            int mi = mine[i];
+            if (methStat[mi] == 0
+                    && (HasMod(methNodes[mi], MOD.Virtual()) || HasMod(methNodes[mi], MOD.Override())
+                        || HasMod(methNodes[mi], MOD.Abstract()))) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    void ShiftForVptr(Cls c) {
+        int k = 0;
+        while (k < c.flds.Count) { c.flds[k].off = c.flds[k].off + 8; k = k + 1; }
+        c.size = c.size + 8;
+    }
+
+    void MergeBaseFields(Cls c) {
+        if (c.based != 0) { return; }
+        c.based = 1;
+        if (c.baseName == null) { return; }
+        Cls b = FindClass(c.baseName);
+        if (b == null || b == c) { return; }
+        MergeBaseFields(b);
+        int shift = b.size;
+        if (shift <= 0) { return; }
+        List<Fld> merged = new List<Fld>();
+        int k = 0;
+        while (k < b.flds.Count) { merged.Add(b.flds[k]); k = k + 1; }
+        k = 0;
+        while (k < c.flds.Count) {
+            Fld f = c.flds[k];
+            Fld mf = new Fld(f.name, f.off + shift, f.ty, f.width, f.explicitLayout);
+            mf.expanded = f.expanded;
+            mf.expCls = f.expCls;                    // 批47:区域形状随字段走
+            merged.Add(mf);
+            k = k + 1;
+        }
+        c.flds = merged;
+        c.size = c.size + shift;
+    }
+
+    // static field storage: one 8-byte data-global slot per field; lookup
+    // prefers the given class, then falls back to any (ngen dispatches by
+    // name everywhere else too)
+    // static-field indexes: same shape and rationale as the method indexes
+    MethIndex sfByClsName;
+    MethIndex sfByName;
+
+    void AddSf(string name, string cls, string sym, string ty) {
+        sfNames.Add(name);
+        sfCls.Add(cls);
+        sfSyms.Add(sym);
+        sfTy.Add(ty);
+        int i = sfNames.Count - 1;
+        if (sfByClsName == null) {
+            sfByClsName = new MethIndex();
+            sfByName = new MethIndex();
+        }
+        sfByClsName.Add(cls + "|" + name, i);
+        sfByName.Add(name, i);
+    }
+
+    string FindStaticSym(string cls, string name) {
+        if (cls != null && sfByClsName != null) {
+            List<int> hit = sfByClsName.Get(cls + "|" + name);
+            if (hit != null) { return sfSyms[hit[0]]; }
+        }
+        if (sfByName != null) {
+            List<int> hit = sfByName.Get(name);
+            if (hit != null) { return sfSyms[hit[0]]; }
+        }
+        return null;
+    }
+
+    string FindStaticTy(string cls, string name) {
+        if (cls != null && sfByClsName != null) {
+            List<int> hit = sfByClsName.Get(cls + "|" + name);
+            if (hit != null) { return sfTy[hit[0]]; }
+        }
+        if (sfByName != null) {
+            List<int> hit = sfByName.Get(name);
+            if (hit != null) { return sfTy[hit[0]]; }
+        }
+        return null;
+    }
+
+    void CollectClass(Node dcl) {
+        Cls c = new Cls(dcl.sval);
+        c.baseName = dcl.sval2;
+        c.explicitLayout = dcl.layoutExplicit;
+        if (dcl.kind == AK.StructDecl()) { c.isStruct = 1; }
+        if (HasMod(dcl, MOD.Iface())) { c.isIface = 1; }
+        if (c.explicitLayout && dcl.kind != AK.StructDecl()) {
+            diags.Error("ngen: explicit layout is only supported on structs", dcl.line, dcl.col);
+            c.explicitLayout = false;
+        }
+        int tk = 0;
+        while (tk < dcl.kids.Count) {
+            if (dcl.kids[tk].kind == AK.TypeParam()) { c.tps.Add(dcl.kids[tk].sval); }
+            tk = tk + 1;
+        }
+        int off = 0;
+        int k = 0;
+        while (k < dcl.kids.Count) {
+            Node m = dcl.kids[k];
+            if (m.kind == AK.FieldDecl() && m.type != null) {
+                if (HasMod(m, MOD.Static())) {
+                    string dn = "fld." + c.name + "." + m.sval;
+                    dglbs.Add(new DGlob(dn, 8, dataLen));
+                    dataLen = dataLen + 8;
+                    AddSf(m.sval, c.name, DGlobalSym(dn), TypeFullName(m.type));
+                    // `static int[] shared = new int[3]` runs before Main
+                    if (m.b != null) {
+                        sfInitCls.Add(c.name);
+                        sfInitSym.Add(DGlobalSym(dn));
+                        sfInitExpr.Add(m.b);
+                        sfInitTy.Add(sfTy[sfTy.Count - 1]);
+                    }
+                } else {
+                    // instance initializers run once per ctor that does not
+                    // chain with `: this(...)` -- after the base call
+                    if (m.b != null) {
+                        ifInitCls.Add(c.name);
+                        ifInitName.Add(m.sval);
+                        ifInitExpr.Add(m.b);
+                    }
+                    // TypeFullName keeps the array suffix and generic
+                    // argument (m.type.sval alone would turn `byte[] data`
+                    // into "byte" and `List<string> items` into "List")
+                    string fty = TypeFullName(m.type);
+                    int fw = 8;
+                    if (c.explicitLayout) {
+                        fw = ExplicitFieldWidth(fty);
+                        if (fw == 0) {
+                            diags.Error("ngen: unsupported explicit-layout field type '" + fty + "'", m.line, m.col);
+                            fw = 8;
+                        }
+                        int eo = m.fieldOffset;
+                        if (eo < 0 || eo > 0x7FFFFFFF - fw) {
+                            diags.Error("ngen: explicit-layout field offset out of range or missing", m.line, m.col);
+                            eo = 0;
+                        }
+                        // Overlap is intentional: explicit layout implements unions.
+                        c.flds.Add(new Fld(m.sval, eo, fty, fw, true));
+                        int end = eo + fw;
+                        if (end > off) { off = end; }
+                    } else {
+                        c.flds.Add(new Fld(m.sval, off, fty));
+                        off = off + 8;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        c.size = off;
+        RegCls(c);
+    }
+
+    // 批43:struct 值字段的扁平展开 —— 第二遍(全部类注册后运行,前向
+    // 引用同样解析)。struct 类型实例字段不再占一个引用槽:其载荷按内层
+    // struct 的字段递归内联为连续 8 字节槽(f.off = 区域基,expanded 打
+    // 开,size 按内层尺寸增长;alloc 零填充天然给出 default 值,整体
+    // 拷贝 = 载荷 memcpy)。展开条件:具名 struct、普通布局、无环、
+    // 非元组。显式布局 struct 不能内联为值字段(fail-closed,批40 的
+    // ExplicitFieldWidth 已在反向形状拒译);开放泛型/未知类型名保持
+    // 旧引用槽(遗留面,行为与批43 前一致)。元组类保持引用槽:容器
+    // 对 struct 元素一律指针语义(isStruct 约定)。
+    void ExpandStructFields() {
+        int ci = 0;
+        while (ci < classes.Count) {
+            RelayoutExpanded(classes[ci]);
+            ci = ci + 1;
+        }
+    }
+
+    void RelayoutExpanded(Cls c) {
+        if (c.explicitLayout) { return; }
+        if (c.name != null && c.name.IndexOf("__Tuple_") == 0) { return; }
+        int cursor = 0;
+        int k = 0;
+        while (k < c.flds.Count) {
+            Fld f = c.flds[k];
+            List<string> stack = new List<string>();
+            stack.Add(c.name);
+            Cls nc = StructExpandTy(f.ty, stack);
+            if (nc != null) {
+                f.expanded = true;
+                f.expCls = nc;                       // 批47:区域形状单一真源
+                f.off = cursor;
+                cursor = cursor + StructValueSize(nc, stack);
+            } else {
+                f.expanded = false;
+                f.expCls = null;
+                f.off = cursor;
+                cursor = cursor + 8;
+            }
+            k = k + 1;
+        }
+        c.size = cursor;
+    }
+
+    int StructValueSize(Cls c, List<string> stack) {
+        int total = 0;
+        int k = 0;
+        while (k < c.flds.Count) {
+            Fld f = c.flds[k];
+            // 批49:按布局结果(f.expanded/expCls)计尺寸 —— 重新解析会
+            // 与布局期的栈守卫分叉(布局判槽,此处缓存回视图自身 → 视图
+            // 环无限递归);expCls 的布局在其自身 RelayoutExpanded 完成
+            if (f.expanded == true && f.expCls != null) { total = total + f.expCls.size; }
+            else { total = total + 8; }
+            k = k + 1;
+        }
+        return total;
+    }
+
+    // the concrete struct a field type expands into, else null
+    Cls StructExpandTy(string ty, List<string> stack) {
+        if (ty == null || ty == "") { return null; }
+        if (ty.IndexOf("<") >= 0) {
+            // 批47:实例化泛型 struct 字段("Pair<int,long>")按替换视图
+            // 展开;其余带 < 形(裸类型参数、未闭合形)保持旧槽
+            int lt = ty.IndexOf("<");
+            if (lt > 0 && ty.Substring(ty.Length - 1, 1) == ">") {
+                return StructInstExpandTy(ty, lt, stack);
+            }
+            return null;
+        }
+        Cls c = FindClass(ty);
+        if (c == null || c.isStruct != 1) { return null; }
+        if (c.explicitLayout) {
+            diags.Error("ngen: struct value field of explicit-layout type '" + ty + "' is not supported", 0, 0);
+            return null;
+        }
+        if (IndexOfStrNg(stack, ty) >= 0) {
+            diags.Error("ngen: recursive struct value layout through '" + ty + "'", 0, 0);
+            return null;
+        }
+        return c;
+    }
+
+    // ---- 批47:实例化泛型 struct 字段展开(槽叶规则)----
+    // 替换视图缓存(按完整实例化名 "Pair<int,long>"):布局二遍对同一
+    // 实例化只建一次。批49:视图 = 实例化的特化布局真源 —— 箱分配/
+    // 克隆/构造体一律按视图落位,成员访问经 FieldOfInst 视图优先,
+    // "替换视图布局 ≡ 箱载荷布局"由构造顺序恒等(同一 RelayoutExpanded
+    // 游标),载荷 memcpy(整体值存取)因此健全。
+    List<string> instViewKeys;
+    List<Cls> instViewVals;
+    // 正在构建视图的实例化名:布局期重入即循环(Odd<int> 字段仍是
+    // "Odd<int>"),静默回槽 —— 递归实例化保持箱链语义(无视图,擦除
+    // 分配与访问全走开模板,自洽)
+    List<string> instViewBuilding;
+    // 视图嵌套深度(深度帽 8):无界加深链在帽处回槽
+    int instViewDepth;
+
+    Cls StructInstExpandTy(string ty, int lt, List<string> stack) {
+        string open = ty.Substring(0, lt);
+        Cls c = FindClass(open);
+        if (c == null || c.isStruct != 1 || c.tps.Count == 0) { return null; }
+        // 基类/虚方法开模板不展开:箱载荷带基字段与 vptr(布局二遍之后
+        // 的 MergeBaseFields/ShiftForVptr 才落),替换视图只看自身字段,
+        // 两布局必分叉 —— 保持旧引用槽(静默)
+        if (c.baseName != null && c.baseName != "") { return null; }
+        if (ClassDeclaresVirtual(open)) { return null; }
+        List<string> args = SplitTyArgs(ty.Substring(lt + 1, ty.Length - lt - 2));
+        if (args.Count != c.tps.Count) { return null; }
+        if (c.explicitLayout) {
+            diags.Error("ngen: struct value field of explicit-layout type '" + ty + "' is not supported", 0, 0);
+            return null;
+        }
+        // 递归守卫(静默回槽,不报错),两道:
+        // 1) 构建集:同一实例化重入(Odd<int> 字段仍是 "Odd<int>")——
+        //    先于缓存查询,重入撞缓存会拿半布局视图无限展开;
+        // 2) 深度帽:无界加深(A<int>→B<int>→A<List<int>>→… 名字互异,
+        //    构建集兜不住)在深度 8 截断回槽。合法嵌套(Hold<Hold<Pt>>)
+        //    深度 2~3,不受影响。开名栈守卫不可用:会把无环的同开名
+        //    嵌套(Hold 内嵌 Hold)误判成递归。
+        if (instViewBuilding == null) { instViewBuilding = new List<string>(); }
+        if (IndexOfStrNg(instViewBuilding, ty) >= 0) { return null; }
+        if (instViewDepth > 8) { return null; }
+        if (instViewKeys == null) { instViewKeys = new List<string>(); instViewVals = new List<Cls>(); }
+        int vi = IndexOfStrNg(instViewKeys, ty);
+        if (vi >= 0) { return instViewVals[vi]; }
+        Cls view = new Cls(ty);
+        view.isStruct = 1;
+        int k = 0;
+        while (k < c.flds.Count) {
+            Fld sf = c.flds[k];
+            Fld nf = new Fld(sf.name, sf.off, SubstTy(sf.ty, c.tps, args), sf.width, sf.explicitLayout);
+            view.flds.Add(nf);
+            k = k + 1;
+        }
+        // 缓存与构建集先登记再布局:布局期经 StructExpandTy 重入同一
+        // 实例化(递归)会先撞构建集回 null,不会拿到半布局视图
+        instViewKeys.Add(ty);
+        instViewVals.Add(view);
+        instViewBuilding.Add(ty);
+        // 叶型按替换视图展开(struct 实参、嵌套实例化)→ 游标平铺;
+        // 嵌套视图计入深度帽
+        instViewDepth = instViewDepth + 1;
+        RelayoutExpanded(view);
+        instViewDepth = instViewDepth - 1;
+        instViewBuilding.RemoveAt(instViewBuilding.Count - 1);
+        return view;
+    }
+
+    // class-name -> classes index; FindClass is on every resolution path
+    // (base-chain walks, static typing) and the linear name scan dominated
+    // profiles on big inputs
+    MethIndex clsByName;
+
+    void RegCls(Cls c) {
+        classes.Add(c);
+        if (clsByName == null) { clsByName = new MethIndex(); }
+        clsByName.Add(c.name, classes.Count - 1);
+    }
+
+    // ---- register-op helpers (encodings verified against clang -arch arm64) ----
+    void MovRR(int rd, int rm) {
+        if (tgt86 == 1) {
+            int d = XMapReal(rd);
+            if (d >= 0) { XGetV(rm, d); }
+            else { XGetV(rm, 10); XSetV(rd, 10); }
+            return;
+        }
+        E4(0xAA000000 | (rm << 16) | (31 << 5) | rd); // mov rd, rm (orr with xzr)
+    }
+    void AddRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) { XAddRR(rd, rn, rm); return; }
+        E4(0x8B000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void SubImm(int rd, int rn, int imm) {
+        if (tgt86 == 1) {
+            if (rd == rn) {
+                int d = XMapReal(rd);
+                if (d >= 0) {
+                    if (imm >= -128 && imm <= 127) { X1(XrexW(0, d)); X1(0x83); X1(0xE8 | (d & 7)); X1(imm); }
+                    else { X1(XrexW(0, d)); X1(0x81); X1(0xE8 | (d & 7)); X4(imm); }
+                    return;
+                }
+            }
+            XAddImmTwin(rd, rn, imm, 1);
+            return;
+        }
+        E4(0xD1000000 | (imm << 10) | (rn << 5) | rd);
+    }
+    // ---- 三寄存器算术族(batch 24)----
+    // x86 是两地址机:经 r10/r11 暂存,r 槽位寄存器(v8-v15)经 XGetV/
+    // XSetV 进出,真寄存器直通。arm64 字与既有裸 E4 逐位一致(基址从
+    // 在用裸字反推),替换不改变 arm64 码流。
+    void AndRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("AndRR d-slot with rn=v16", curLine, curCol); return; }
+            // and 写穿暂存 r10:家在 r10 的 v16 作被操作数时会被毁
+            int tmp = (dd == 11) ? 10 : 11;      // 目的地是 r11 时避开
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x21, dd, tmp);                  // and dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x8A000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void OrrRR(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("OrrRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x09, dd, tmp);                  // or dd, tmp (r/m 为目的的形态)
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xAA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void SubRR(int rd, int rn, int rm) {         // 与 AndRR/OrrRR 同构的减法族(批 46:
+        if (tgt86 == 1) {                        // 协程定时器头差/整型减法现形)
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("SubRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;      // 目的地是 r11 时避开
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x29, dd, tmp);                  // sub dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xCB000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    // 字节级载入/存储([rn+off] 单字节;batch 34 sha256 的 big-endian 拼装)
+    void LoadB(int rd, int rn, int off) {
+        if (tgt86 == 1) {
+            if (rn == 31) {
+                X1(0x44); X1(0x0F); X1(0xB6); X1(0x9C); X1(0x24); X4(off);   // movzx r11d, byte [rsp+disp32]
+                XSetV(rd, 11);
+                return;
+            }
+            XGetV(rn, 11);
+            X3(0x45, 0x0F, 0xB6); X1(0x5B); X1(off & 0xFF);    // movzx r11d, byte [r11+disp8]
+            XSetV(rd, 11);
+            return;
+        }
+        E4(0x39400000 | (off << 10) | (rn << 5) | rd);
+    }
+    void StoreB(int rt, int rn, int off) {
+        if (tgt86 == 1) {
+            if (rn == 31) {
+                XGetV(rt, 10);
+                X1(0x44); X1(0x88); X1(0x94); X1(0x24); X4(off);   // mov byte [rsp+disp32], r10b
+                return;
+            }
+            XGetV(rt, 10);
+            XGetV(rn, 11);
+            X3(0x45, 0x88, 0x53); X1(off & 0xFF);              // mov byte [r11+disp8], r10b(rm=r11 需 B——首版 44 解码成 [rbx],sha256 全部 scratch 写入落空)
+            return;
+        }
+        E4(0x39000000 | (off << 10) | (rn << 5) | rt);
+    }
+    void MaddRR(int rd, int rn, int rm, int ra) {  // rd = rn*rm + ra(batch 34 DateTime)
+        if (tgt86 == 1) {
+            XGetV(rn, 10);
+            XGetV(rm, 11);
+            // modrm D3: reg=r10(目的) rm=r11——首版 DA 的 reg 域是 r11,
+            // 积落 r11,后面按 r10 取读到旧值
+            X3(0x4D, 0x0F, 0xAF); X1(0xD3);      // imul r10, r11
+            if (ra == 31) { XSetV(rd, 10); return; }   // xzr 加数 = 纯 mul;XAddRR 不认 v31
+            XAddRR(rd, 16, ra);                  // v16 = 实 r10(积);首版传 v10 是陈旧 spill 槽
+            return;
+        }
+        E4(0x9B000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+    }
+    void UdivRR(int rd, int rn, int rm) {        // 无符号除;x86 除法必须占 rdx(v2 的家)——
+        if (tgt86 == 1) {                        // 调用点 v2 活跃时先 HostSave
+            // 批 35:div 的被除数是 rdx:rax——首版把 rn 装进 r10 就 div,
+            // rax 一直是陈旧值,商随调用点垃圾浮动(b64 groups 根因)
+            XGetV(rn, 0);                        // 被除数 -> rax
+            XGetV(rm, 11);
+            X2(0x31, 0xD2);                      // xor edx, edx(清满 rdx)
+            X3(0x49, 0xF7, 0xF3);                // div r11
+            XSetV(rd, 0);                        // 商在 rax
+            return;
+        }
+        E4(0x9AC00800 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LdrHImm(int rt, int rn, int off) {      // 半字零扩展载入(batch 34 stat mode)
+        if (tgt86 == 1) {
+            XGetV(rn, 11);
+            X3(0x45, 0x0F, 0xB7); X1(0x5B); X1(off & 0xFF);   // movzx r11d, word [r11+disp8]
+            XSetV(rt, 11);
+            return;
+        }
+        E4(0x79400000 | (off << 10) | (rn << 5) | rt);
+    }
+    void SdivRR(int rd, int rn, int rm) {        // 带符号除(截断向零;batch 34 DateTime)
+        if (tgt86 == 1) {
+            XGetV(rn, 0);                        // 被除数 -> rax
+            XGetV(rm, 10);
+            X2(0x48, 0x99);                      // cqo
+            X1(0x48); X2(0xF7, 0xFA);            // idiv r10
+            XSetV(rd, 0);                        // 商 -> rd
+            return;
+        }
+        E4(0x9AC00C00 | (rm << 16) | (rn << 5) | rd);
+    }
+    void XorRR(int rd, int rn, int rm) {         // 批 34:sha256 的 Σ/σ 需要
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("XorRR d-slot with rn=v16", curLine, curCol); return; }
+            int tmp = (dd == 11) ? 10 : 11;
+            XGetV(rm, tmp);
+            XGetV(rn, dd);
+            Xop(0x31, dd, tmp);                  // xor dd, tmp
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xCA000000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LslImm(int rd, int rn, int sh) {        // 逻辑左移立即数(= lsl #sh;ExtLsl 的同字双臂化)
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("LslImm d-slot with rn=v16", curLine, curCol); return; }
+            XGetV(rn, dd);
+            X1(XrexW(0, dd)); X1(0xC1); X1(0xC0 | (4 << 3) | (dd & 7)); X1(sh);   // shl dd, imm8
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xD3400000 | (((64 - sh) & 63) << 16) | ((63 - sh) << 10) | (rn << 5) | rd);
+    }
+    void LsrImm(int rd, int rn, int sh) {        // 逻辑右移立即数(= ubfm sh..63)
+        if (tgt86 == 1) {
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            if (dd == 10 && XMapReal(rn) == 10) { XFailClosed("LsrImm d-slot with rn=v16", curLine, curCol); return; }
+            XGetV(rn, dd);
+            X1(XrexW(0, dd)); X1(0xC1); X1(0xC0 | (5 << 3) | (dd & 7)); X1(sh);   // shr dd, imm8
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0xD3400000 | (sh << 16) | (63 << 10) | (rn << 5) | rd);
+    }
+    void Uxtw32(int rd, int rn) {                // 零扩展低 32(= ubfm #0,#31);x86 用 32 位 mov 自零扩展
+        if (tgt86 == 1) {
+            // 批 31:统一 r10 暂存形态。旧臂的 89 modrm 无 REX——r=10/d=10
+            // 时 reg/rm 域编码静默别名到 rdx(89 modrm 的 reg 域 bit3 被
+            // REX.R 才能带出来),只有双撞 r10 被闸住,单侧 v16 是无声坏
+            // 字节。45 89 D2 = mov r10d,r10d(R|B 齐全)对一切 rd/rn 形态
+            // 正确;零扩展在 32 位 mov 里天然发生。
+            XGetV(rn, 10);
+            X3(0x45, 0x89, 0xD2);                // mov r10d, r10d(高 32 清零)
+            XSetV(rd, 10);
+            return;
+        }
+        E4(0xD3400000 | (31 << 10) | (rn << 5) | rd);
+    }
+    // 可变量移位(lslv/lsrv):x86 移位量必须经 cl(rcx = v3 的家)。
+    // rn=v3 且 rm≠v3 时 rcx 先被移位量占用,取 rn 会读到移位量——
+    // 该组合 fail-closed;rm=v3 或两者皆 v3 均正确。
+    void LslvVV(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            if (rn == 3 && rm != 3) { XFailClosed("LslvVV rn=v3 loses rcx", curLine, curCol); return; }
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            XGetV(rm, 1);                        // mov rcx, 移位量
+            XGetV(rn, dd);
+            X1(XrexW(1, dd)); X1(0xD3); X1(0xC0 | (4 << 3) | (dd & 7));   // shl dd, cl
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x9AC02000 | (rm << 16) | (rn << 5) | rd);
+    }
+    void LsrvVV(int rd, int rn, int rm) {
+        if (tgt86 == 1) {
+            if (rn == 3 && rm != 3) { XFailClosed("LsrvVV rn=v3 loses rcx", curLine, curCol); return; }
+            int dd = XMapReal(rd);
+            if (dd < 0) { dd = 10; }
+            XGetV(rm, 1);
+            XGetV(rn, dd);
+            X1(XrexW(1, dd)); X1(0xD3); X1(0xC0 | (5 << 3) | (dd & 7));   // shr dd, cl
+            if (XMapReal(rd) < 0) { XSetV(rd, 10); }
+            return;
+        }
+        E4(0x9AC02400 | (rm << 16) | (rn << 5) | rd);
+    }
+    void CbzReg(int rt, int lbl) {
+        if (tgt86 == 1) { XCbz(rt, lbl, 0); return; }
+        E4(0xB4000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null));
+    }
+    void CbnzReg(int rt, int lbl) {
+        if (tgt86 == 1) { XCbz(rt, lbl, 1); return; }
+        E4(0xB5000000 | rt); fixups.Add(new Fixup(txt.Count - 4, 1, lbl, 0, null));
+    }
+    void LdrU(int rd, int rn, int off) {
+        if (tgt86 == 1) {
+            int b;
+            if (rn == 31) { b = 4; }                      // sp base (x31 is sp in a base position)
+            else {
+                b = XMapReal(rn);
+                if (b < 0) { XGetV(rn, 11); b = 11; }
+            }
+            int r = XMapReal(rd);
+            if (r >= 0) { XopRMem(0x8B, r, b, off); }
+            else { XopRMem(0x8B, 10, b, off); XSetV(rd, 10); }
+            return;
+        }
+        E4(0xF9400000 | ((off / 8) << 10) | (rn << 5) | rd);
+    }
+    void StrU(int rt, int rn, int off) {
+        if (tgt86 == 1) {
+            int b;
+            if (rn == 31) { b = 4; }                      // sp base
+            else {
+                b = XMapReal(rn);
+                if (b < 0) { XGetV(rn, 11); b = 11; }
+            }
+            if (rt == 31) {
+                // xzr 源(基址位置 31 是 sp,源位置是零寄存器):存字面 0
+                XopMemR(0xC7, 0, b, off); X4(0);
+                return;
+            }
+            int r = XMapReal(rt);
+            if (r >= 0) { XopMemR(0x89, r, b, off); }
+            else { XGetV(rt, 10); XopMemR(0x89, 10, b, off); }
+            return;
+        }
+        E4(0xF9000000 | ((off / 8) << 10) | (rn << 5) | rt);
+    }
+    void Strb0(int rn) {
+        if (tgt86 == 1) {
+            int b = XMapReal(rn);
+            if (b < 0) { XGetV(rn, 11); b = 11; }
+            // mov byte [b], 0 -- mod=00 form, no disp byte. Rosetta 2
+            // mis-decodes the mod=01 disp8 encoding (c6 47 00): it steals
+            // the next instruction's REX byte as the immediate, so the
+            // terminator store lands as 0x48 ('H') and the swallowed
+            // prefix demotes the following instruction to its 32-bit
+            // form. The operand is always a v-register (never sp/SIB or
+            // the rbp/rip mod=00 traps), so the short form is safe.
+            if (b >= 8) { X1(0x41); X2(0xC6, b & 7); }
+            else { X2(0xC6, b & 7); }
+            X1(0);
+            return;
+        }
+        E4(0x39000000 | (rn << 5) | 31); // strb wzr, [rn]
+    }
+
+    // stur/ldur with explicit base register, signed 9-bit unscaled offset
+    void RtStur(int rt, int rn, int off) {
+        if (tgt86 == 1) { XMemV(0, rt, rn, off); return; }
+        E4(0xF8000000 | ((off & 0x1FF) << 12) | (rn << 5) | rt);
+    }
+    void RtLdur(int rd, int rn, int off) {
+        if (tgt86 == 1) { XMemV(1, rd, rn, off); return; }
+        E4(0xF8400000 | ((off & 0x1FF) << 12) | (rn << 5) | rd);
+    }
+
+    // ---- hand-emitted runtime core ----
+    void RtPrologue() {
+        if (tgt86 == 1) { XPrologue(0); return; }
+        E4(0xA9BF7BFD); // stp x29, x30, [sp, #-16]!
+        E4(0x910003FD); // mov x29, sp
+    }
+    void RtEpilogue() {
+        if (tgt86 == 1) { XEpilogue(); return; }
+        E4(0xA8C17BFD); // ldp x29, x30, [sp], #16
+        E4(0xD65F03C0); // ret
+    }
+    void RtOom() { // prints the oom message and exits; clobbers everything
+        LoadSymRef("l_.str." + oomIdx, 0);
+        if (tgt86 == 1) { X2(0x31, 0xC0); }   // xor eax, eax: SysV varargs al=0
+        BLExtern("_printf");
+        LoadImm(0, 1);
+        BLExtern("_exit");
+    }
+
+    int oomIdx;
+
+    void EmitRtCore() {
+        strs.Add("zan: out of memory\n");
+        oomIdx = strs.Count - 1;
+        strs.Add("%lld\n");
+        fmtiIdx = strs.Count - 1;
+        strs.Add("%s\n");
+        fmtsIdx = strs.Count - 1;
+        strs.Add("%lld");
+        fmtnIdx = strs.Count - 1;
+        strs.Add("%llu");
+        fmtuIdx = strs.Count - 1;
+        strs.Add("%llu\n");
+        fmtuNIdx = strs.Count - 1;
+        strs.Add("%s");
+        fmtwIdx = strs.Count - 1;
+        strs.Add("%lc");
+        fmtcIdx = strs.Count - 1;
+        strs.Add("");
+        emptyIdx = strs.Count - 1;
+        strs.Add("Unhandled exception: ");
+        fmtUnhandledIdx = strs.Count - 1;
+        strs.Add("Unhandled exception (class object)");
+        fmtUnhandledClsIdx = strs.Count - 1;
+        strs.Add("Unhandled exception");
+        fmtUnhandledBareIdx = strs.Count - 1;
+        dglbs.Add(new DGlob("zan_eh", 8, dataLen));
+        dataLen = dataLen + 8;
+        // batch 27: the soft-diag scratch cell (64 zeroed bytes) -- the
+        // softdiag probe DllImports its getter, and the zan-native runtime
+        // owns the face now instead of the stale C-host rest stubs
+        dglbs.Add(new DGlob("zan_soft_scratch", 64, dataLen));
+        dataLen = dataLen + 64;
+        if (tgt86 == 1) {
+            // batch 16 opener: only the cores kernel1's surface needs are
+            // ported. Anything else stays un-emitted, so a program that
+            // references it dies at link time (unresolved internal symbol)
+            // instead of running arm64 semantics on x86_64. The host
+            // argc/argv slots are data-only and unconditional: the _main
+            // shim stores through them. The string pool is emitted once by
+            // the compile epilogue (it trails every other section).
+            dglbs.Add(new DGlob("host_argc", 8, dataLen)); dataLen = dataLen + 8;
+            dglbs.Add(new DGlob("host_argv", 8, dataLen)); dataLen = dataLen + 8;
+            RtEmitPrintInt();
+            RtEmitPrintln();
+            // batch 17: the object-model + string slice (kernel2 surface)
+            RtEmitAlloc();
+            RtEmitStrAlloc();
+            RtEmitStrCat2();
+            RtEmitStrlen0();
+            // batch 19: the exception slice (kernel4 surface)
+            RtEmitEhState();
+            // batch 20: the int->string concat slice (kernel5 surface)
+            RtEmitInt2Str();
+            RtEmitUint2Str();
+            // batch 21: the guard slice (kernel6 surface) — division/
+            // modulo zero-divide guard family + its own lock core
+            EmitGuardRuntime();
+            // batch 22: the double slice (kernel7 surface) — %g writer,
+            // parse specials, dbl2str heap string + print shim
+            EmitNumericRuntime();
+            RtEmitDbl2Str();
+            RtEmitPrintDouble();
+            // batch 23: the ulong print shim (kernel8 surface)
+            RtEmitPrintUint();
+            // batch 24: the string-method family (kernel9 surface) --
+            // strcmp0/substr2/chrstr builders + the header/length/index
+            // reader family with its own darwin vm_read probe
+            RtEmitStrcmp0();
+            RtEmitSubstr2();
+            RtEmitChrstr();
+            EmitStringRuntime();
+            // batch 26: the kernel11 surface -- join + list removeat
+            // (Contains/IndexOf run inline via GenListSearch)
+            RtEmitStrjoin();
+            RtEmitListRemoveAt();
+            // batch 30: the two-argument Substring faces (safe-window clamp
+            // and the raw-receiver form)
+            RtEmitSubstr3();
+            RtEmitSubstrRaw();
+            // batch 28: the dict lane -- the linear-walk core
+            // (index/set/get/contains/remove/clear/tryget/keys/values);
+            // GenDictNew's calloc/alloc site was already dual-arm
+            RtEmitDictIndex();
+            RtEmitDictSet();
+            RtEmitDictGet();
+            RtEmitDictQuery();
+            RtEmitDictTryGet();
+            RtEmitDictKeysValues(16);
+            RtEmitDictKeysValues(24);
+            // batch 29: the list operation family -- insert/reverse/
+            // reserve/indexof(+str)/addrange/toarray/toarray_f32
+            RtEmitListInsert();
+            RtEmitListReverse();
+            RtEmitListReserve();
+            RtEmitListIndexOf(false);
+            RtEmitListIndexOf(true);
+            RtEmitListAddRange();
+            RtEmitListToArray(8);
+            RtEmitListToArray(4);
+            RtEmitListToArray(2);
+            RtEmitListToArray(1);
+            RtEmitListToArrayF32();
+            // batch 27: the soft-diag scratch getter (both lanes; the face
+            // no longer depends on the frozen C-host rest stubs)
+            RtEmitSoftScratch();
+            // batch 34: the zan-emitted FIPS 180-4 digest (both lanes)
+            EmitZanSha256();
+            // batch 35: the host family (args/files/paths/sb/utf8/digests/
+            // host2) -- the string-op half has been on since batch 31
+            EmitHostRuntime();
+            // 批 35:HostEmitFail/Copy/StrOps/StrContains 已并入
+            // EmitHostRuntime 的面家族(此处曾重复调用,链接期
+            // atomShouldReplaceExisting 断言崩),单独入口删除
+            // 批 35:七个 C 宿主原语的 zan 本体(exe_path/urandom/
+            // thread_id/hmac;sha1/md5/sha512 随后加入)——x86 链接
+            // 零运行时对象,arm64 保持 C 宿主,故仅 x86 发射
+            EmitZanHostPrims();
+            return;
+        }
+        RtEmitAlloc();
+        RtEmitStrAlloc();
+        RtEmitStrCat2();
+        RtEmitStrlen0();
+        RtEmitStrcmp0();
+        RtEmitPrintInt();
+        RtEmitPrintln();
+        RtEmitInt2Str();
+        RtEmitDbl2Str();
+        RtEmitPrintDouble();
+        RtEmitUint2Str();
+        RtEmitFmt();
+        RtEmitListOps();
+        RtEmitPrintUint();
+        RtEmitChrstr();
+        RtEmitSubstr2();
+        RtEmitSubstr3();
+        RtEmitSubstrRaw();
+        RtEmitStrjoin();
+        RtEmitSoftScratch();
+        RtEmitEhState();
+        EmitHostRuntime();
+        EmitNumericRuntime();
+        EmitGuardRuntime();
+        EmitStringRuntime();
+    }
+
+    // ptr zan_rt_int2str(i64 v) -- str_alloc a 32-byte buffer and
+    // sprintf("%lld", v) into it; 32 bytes hold any 64-bit decimal + NUL.
+    // The string goes out with the standard header at buf-8 (str_alloc
+    // reserves the slot): Length/Substring read it, and a bare malloc
+    // buffer would hand them malloc's own size word as the length.
+    // Darwin arm64 passes variadic arguments on the stack (at [sp] at the
+    // call), not in x2..x7, so v gets a dedicated stack slot.
+    void RtEmitInt2Str() {
+        syms.Add(new Sym("_zan_rt_int2str", FnPad()));
+        if (tgt86 == 1) {
+            // SysV: sprintf(rdi=buf, rsi="%lld", rdx=v) -- the third
+            // argument rides a register, no Darwin stack vararg slot;
+            // al=0 declares no vector arguments. Same 32-byte str_alloc
+            // buffer and buf-8 header stamp as the arm64 body; the two
+            // 16-byte pushes give [sp]=buf, [sp+16]=v, matching the
+            // arm64 reload offsets.
+            RtPrologue();
+            XPushV0();                             // save v
+            LoadImm(0, 32);
+            BLInternal("_zan_rt_str_alloc");       // v0 = buf
+            XPushV0();                             // save buf
+            LdrU(2, 31, 16);                       // rdx = v
+            LdrU(0, 31, 0);                        // rdi = buf
+            XLeaSym("l_.str." + fmtnIdx, 1);       // rsi = "%lld"
+            X2(0x31, 0xC0);                        // xor eax, eax
+            BLExtern("_sprintf");
+            LdrU(0, 31, 0);                        // rdi = buf (len returns in v0)
+            BLExtern("_strlen");
+            MovRR(1, 0);                           // rsi = len
+            LoadImm(4, 0x5A414E5300000000);
+            Xop(0x09, 6, 8);                       // or rsi, r8
+            LdrU(5, 31, 0);                        // r9 = buf
+            SubImm(5, 5, 8);
+            RtStur(1, 5, 0);                       // mov [r9], rsi (== buf-8)
+            LdrU(0, 31, 0);                        // rdi = buf
+            AddSPImm(32, true);                    // pop buf + v
+            RtEpilogue();
+            return;
+        }
+        RtPrologue();
+        PushV(0);                        // str x0, [sp, #-16]! (save v)
+        LoadImm(0, 32);
+        BLInternal("_zan_rt_str_alloc");      // x0 = buf (header slot at buf-8)
+        PushV(0);                        // str x0, [sp, #-16]! (save buf)
+        LdrU(2, 31, 16);                       // x2 = v (reload)
+        if (EnvTargetElf() == 1) {
+            LdrU(0, 31, 0);                    // x0 = buf; v rides in x2
+        } else {
+            AddSPImm(16, false);               // variadic argument slot (Darwin)
+            StrU(2, 31, 0);                    // [sp] = v
+            LdrU(0, 31, 16);                   // x0 = buf
+        }
+        LoadSymRef("l_.str." + fmtnIdx, 1);    // x1 = "%lld"
+        BLExtern("_sprintf");
+        if (EnvTargetElf() == 0) {
+            AddSPImm(16, true);                // drop the vararg slot
+        }
+        // stamp the Zan string header at buf-8: magic | strlen(buf).
+        // strlen0/Substring/Length all read that header -- a bare malloc
+        // buffer makes them read malloc's own size word as the length
+        LdrU(0, 31, 0);                        // x0 = buf
+        BLExtern("_strlen");                  // x0 = len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        LdrU(5, 31, 0);                        // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
+        LdrU(0, 31, 0);                        // x0 = buf
+        AddSPImm(32, true);                    // pop buf + v
+        RtEpilogue();
+    }
+
+    // zan_rt_print_double(double v) -- gen0 embeds this shim in its IR (the
+    // C objects only carry the underlying zan_rt_dbl_str writer), so the
+    // native backend mirrors it: 40-byte stack buffer, %g render, println.
+    // arm64: v rides d0. x86: v rides rdx as bits (the dbl_str ABI).
+    void RtEmitPrintDouble() {
+        syms.Add(new Sym("_zan_rt_print_double", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);                   // 40-byte buffer, 16-aligned
+        if (tgt86 == 1) {
+            MovRR(2, 0);                       // rdx = v bits
+            GuardSp(0, 0);                     // rdi = buf
+            LoadImm(1, 40);                    // rsi = cap
+            BLInternal("_zan_rt_dbl_str");
+            GuardSp(0, 0);                     // rdi = buf
+            BLInternal("_zan_rt_println");     // printf("%s\n", buf)
+        } else {
+            E4(0x910003E0);                    // mov x0, sp
+            LoadImm(1, 40);
+            BLInternal("_zan_rt_dbl_str");     // v flows through in d0
+            E4(0x910003E0);                    // x0 = buf
+            BLInternal("_zan_rt_println");     // printf("%s\n", buf)
+        }
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_uint2str(i64 v) -- as int2str but "%llu", matching
+    // gen0's ulong rendering (the high bit prints unsigned)
+    void RtEmitUint2Str() {
+        syms.Add(new Sym("_zan_rt_uint2str", FnPad()));
+        if (tgt86 == 1) {
+            // as int2str but "%llu", matching gen0's ulong rendering
+            RtPrologue();
+            XPushV0();                             // save v
+            LoadImm(0, 32);
+            BLInternal("_zan_rt_str_alloc");       // v0 = buf
+            XPushV0();                             // save buf
+            LdrU(2, 31, 16);                       // rdx = v
+            LdrU(0, 31, 0);                        // rdi = buf
+            XLeaSym("l_.str." + fmtuIdx, 1);       // rsi = "%llu"
+            X2(0x31, 0xC0);                        // xor eax, eax
+            BLExtern("_sprintf");
+            LdrU(0, 31, 0);                        // rdi = buf (len returns in v0)
+            BLExtern("_strlen");
+            MovRR(1, 0);                           // rsi = len
+            LoadImm(4, 0x5A414E5300000000);
+            Xop(0x09, 6, 8);                       // or rsi, r8
+            LdrU(5, 31, 0);                        // r9 = buf
+            SubImm(5, 5, 8);
+            RtStur(1, 5, 0);                       // mov [r9], rsi (== buf-8)
+            LdrU(0, 31, 0);                        // rdi = buf
+            AddSPImm(32, true);                    // pop buf + v
+            RtEpilogue();
+            return;
+        }
+        RtPrologue();
+        PushV(0);                        // str x0, [sp, #-16]! (save v)
+        LoadImm(0, 32);
+        BLInternal("_zan_rt_str_alloc");      // x0 = buf (header slot at buf-8)
+        PushV(0);                        // str x0, [sp, #-16]! (save buf)
+        LdrU(2, 31, 16);                       // x2 = v (reload)
+        if (EnvTargetElf() == 1) {
+            LdrU(0, 31, 0);                    // x0 = buf; v rides in x2
+        } else {
+            AddSPImm(16, false);               // variadic argument slot (Darwin)
+            StrU(2, 31, 0);                    // [sp] = v
+            LdrU(0, 31, 16);                   // x0 = buf
+        }
+        LoadSymRef("l_.str." + fmtuIdx, 1);    // x1 = "%llu"
+        BLExtern("_sprintf");
+        if (EnvTargetElf() == 0) {
+            AddSPImm(16, true);                // drop the vararg slot
+        }
+        // stamp the Zan string header at buf-8, like int2str
+        LdrU(0, 31, 0);                        // x0 = buf
+        BLExtern("_strlen");                  // x0 = len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        LdrU(5, 31, 0);                        // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
+        LdrU(0, 31, 0);                        // x0 = buf
+        AddSPImm(32, true);                    // pop buf + v
+        RtEpilogue();
+    }
+
+    // zan_rt_print_uint(i64 v) -- gen0 embeds this shim in its IR
+    // (printf("%llu\n", v); Darwin arm64 takes the variadic on the stack)
+    void RtEmitPrintUint() {
+        syms.Add(new Sym("_zan_rt_print_uint", FnPad()));
+        if (tgt86 == 1) {
+            // Same SysV shape as print_int: v rides rdi, moved to rsi
+            // before the format lea claims rdi. AL=0: no vector args.
+            RtPrologue();
+            XMov(6, 7);            // mov rsi, rdi (v)
+            XLeaSym("l_.str." + fmtuNIdx, 0);
+            X2(0x31, 0xC0);        // xor eax, eax
+            BLExtern("_printf");
+            RtEpilogue();
+            return;
+        }
+        RtPrologue();
+        if (EnvTargetElf() == 1) {
+            MovRR(9, 0);                       // x9 = v
+        } else {
+            AddSPImm(16, false);               // variadic argument slot (Darwin)
+            StrU(0, 31, 0);                    // [sp] = v
+        }
+        LoadSymRef("l_.str." + fmtuNIdx, 0);   // x0 = "%llu\n"
+        if (EnvTargetElf() == 1) {
+            MovRR(1, 9);                       // x1 = v
+        }
+        BLExtern("_printf");
+        if (EnvTargetElf() == 0) {
+            AddSPImm(16, true);
+        }
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_fmt(i64 vbits, ptr cfmt): snprintf-render a value under a
+    // printf pattern the compiler mapped from an interpolation format
+    // specifier ({v:D4} -> "%08lld"), returned as a heap string. The value
+    // arrives as its i64 bit pattern (our expression model carries doubles
+    // that way) and is the trailing variadic, so it travels on the stack per
+    // AAPCS64 -- unnamed FP arguments are stack slots, not d registers.
+    // Frame (48 below the saved pair): cfmt@-16, buf@-24, vbits@-32, len@-40.
+    void RtEmitFmt() {
+        syms.Add(new Sym("_zan_rt_fmt", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);
+        RtStur(0, 29, -32);                    // vbits
+        RtStur(1, 29, -16);                    // cfmt
+        // probe: snprintf(NULL, 0, cfmt, v)
+        LoadImm(0, 0);
+        LoadImm(1, 0);
+        RtLdur(2, 29, -16);
+        RtLdur(3, 29, -32);
+        if (EnvTargetElf() == 0) {
+            StrU(3, 31, 0);                    // [sp] = v (Darwin variadic slot)
+        }
+        BLExtern("_snprintf");
+        RtStur(0, 29, -40);                    // len
+        AddImm(0, 0, 1);                       // + NUL
+        BLInternal("_zan_rt_str_alloc");       // x0 = buf
+        RtStur(0, 29, -24);
+        // render: snprintf(buf, len+1, cfmt, v)
+        RtLdur(0, 29, -24);
+        RtLdur(1, 29, -40);
+        AddImm(1, 1, 1);
+        RtLdur(2, 29, -16);
+        RtLdur(3, 29, -32);
+        if (EnvTargetElf() == 0) {
+            StrU(3, 31, 0);                    // [sp] = v (Darwin variadic slot)
+        }
+        BLExtern("_snprintf");
+        // stamp the header at buf-8: 0x5A414E53_00000000 | strlen(buf)
+        RtLdur(0, 29, -24);
+        BLExtern("_strlen");
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040001);                        // orr x1, x0, x4
+        RtLdur(5, 29, -24);
+        SubImm(5, 5, 8);
+        RtStur(1, 5, 0);                       // str x1, [x5] (== buf-8)
+        RtLdur(0, 29, -24);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+
+    // ptr zan_rt_dbl2str(i64 bits) -- the value arrives as the i64 bit
+    // pattern our expression model carries (x0 on arm64, rdi on x86);
+    // renders with the C runtime's %g writer into a 40-byte stack buffer
+    // and returns a heap string (a copy through strcat2's allocator, so
+    // it outlives the buffer)
+    void RtEmitDbl2Str() {
+        syms.Add(new Sym("_zan_rt_dbl2str", FnPad()));
+        RtPrologue();
+        if (tgt86 == 1) {
+            AddSPImm(48, false);               // 40-byte buffer, 16-aligned
+            MovRR(2, 0);                       // rdx = v bits (dbl_str ABI)
+            GuardSp(0, 0);                     // rdi = buf
+            LoadImm(1, 40);                    // rsi = cap
+            BLInternal("_zan_rt_dbl_str");
+            GuardSp(9, 0);                     // v9 = buf: unlike the arm64
+                                               // path, v0 no longer holds buf
+                                               // here (the call lands its void
+                                               // return in v0 via mov rdi,rax)
+            LoadSymRef("l_.str." + emptyIdx, 0);   // rdi = ""
+            MovRR(1, 9);                       // rsi = buf
+            BLInternal("_zan_rt_strcat2");
+        } else {
+            E4(0x9E670000);                        // fmov d0, x0
+            AddSPImm(48, false);                   // 40-byte buffer, 16-aligned
+            E4(0x910003E0);                        // mov x0, sp
+            LoadImm(1, 40);
+            BLInternal("_zan_rt_dbl_str");
+            E4(0x910003E0);                        // x0 = buf
+            MovRR(9, 0);                           // x9 = buf
+            LoadSymRef("l_.str." + emptyIdx, 0);   // x0 = ""
+            MovRR(1, 9);                           // x1 = buf
+            BLInternal("_zan_rt_strcat2");
+        }
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_chrstr(i64 cp) -- render one codepoint as a heap string.
+    // Pure UTF-8 arithmetic like gen0's emit_char_to_cstr: snprintf("%lc")
+    // is locale-dependent (the C locale drops anything above 0xFF), so the
+    // lead/continuum bytes are built and packed into one little-endian i64,
+    // covering all four encoded lengths with a single memcpy. Like the
+    // oracle, the length stays implicit: char 0 encodes as one NUL byte,
+    // whose string length is 0, so the stamp reads zero for it.
+    // Frame: [0]=cp [8]=packed [16]=len [24]=dst.
+    void RtEmitChrstr() {
+        syms.Add(new Sym("_zan_rt_chrstr", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);
+        StrU(0, 31, 0);                        // [sp] = cp
+        LoadImm(9, 0x1FFFFF);
+        AndRR(9, 0, 9);                        // and x9, x0, x9 (cp = cp & mask)
+        StrU(9, 31, 0);
+        // len = cp<0x80 ? 1 : cp<0x800 ? 2 : cp<0x10000 ? 3 : 4
+        LdrU(9, 31, 0);
+        LoadImm(10, 0x80);
+        StringCmp(9, 10);                      // cmp x9, x10
+        int l1 = NL(); EmitBcond(3, l1);
+        LoadImm(10, 0x800);
+        StringCmp(9, 10);
+        int l2 = NL(); EmitBcond(3, l2);
+        LoadImm(10, 0x10000);
+        StringCmp(9, 10);
+        int l3 = NL(); EmitBcond(3, l3);
+        LoadImm(10, 4);
+        int lend = NL(); EmitB(lend);
+        Mark(l3); LoadImm(10, 3); EmitB(lend);
+        Mark(l2); LoadImm(10, 2); EmitB(lend);
+        Mark(l1); LoadImm(10, 1);
+        Mark(lend);
+        StrU(10, 31, 16);                      // [sp+16] = len
+        // packed select: byte(n) = payload | tag, packed at 8*n bits
+        LdrU(9, 31, 0);
+        LoadImm(10, 0x80);
+        StringCmp(9, 10);
+        int p1 = NL(); EmitBcond(3, p1);
+        LoadImm(10, 0x800);
+        StringCmp(9, 10);
+        int p2 = NL(); EmitBcond(3, p2);
+        LoadImm(10, 0x10000);
+        StringCmp(9, 10);
+        int p3 = NL(); EmitBcond(3, p3);
+        // 4-byte form: 0xF0|(cp>>18) | b1<<8 | b2<<16 | b3<<24
+        LoadImm(11, 0x3F);
+        AndRR(12, 9, 11);                      // and x12, x9, x11
+        LoadImm(13, 0x80);
+        OrrRR(12, 12, 13);                     // orr x12, x12, x13
+        LoadImm(13, 24);
+        LslvVV(12, 12, 13);                    // lslv x12, x12, x13
+        LoadImm(14, 6);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        LoadImm(13, 0x80);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        LoadImm(13, 16);
+        LslvVV(15, 15, 13);                    // lslv x15, x15, x13
+        OrrRR(12, 12, 15);                     // orr x12, x12, x15
+        LoadImm(14, 12);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        AndRR(15, 15, 11);                     // and x15, x15, x11
+        LoadImm(13, 0x80);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        LoadImm(13, 8);
+        LslvVV(15, 15, 13);                    // lslv x15, x15, x13
+        OrrRR(12, 12, 15);                     // orr x12, x12, x15
+        LoadImm(14, 18);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        LoadImm(13, 0xF0);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        OrrRR(10, 15, 12);                     // orr x10, x15, x12
+        int pd = NL(); EmitB(pd);
+        Mark(p3);
+        // 3-byte form: 0xE0|(cp>>12) | b1<<8 | b2<<16
+        LoadImm(11, 0x3F);
+        AndRR(12, 9, 11);                      // and x12, x9, x11
+        LoadImm(13, 0x80);
+        OrrRR(12, 12, 13);                     // orr x12, x12, x13
+        LoadImm(13, 16);
+        LslvVV(12, 12, 13);                    // lslv x12, x12, x13
+        LoadImm(14, 6);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        AndRR(15, 15, 11);                     // and x15, x15, x11
+        LoadImm(13, 0x80);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        LoadImm(13, 8);
+        LslvVV(15, 15, 13);                    // lslv x15, x15, x13
+        OrrRR(12, 12, 15);                     // orr x12, x12, x15
+        LoadImm(14, 12);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        LoadImm(13, 0xE0);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        OrrRR(10, 15, 12);                     // orr x10, x15, x12
+        EmitB(pd);
+        Mark(p2);
+        // 2-byte form: 0xC0|(cp>>6) | b1<<8
+        LoadImm(11, 0x3F);
+        AndRR(12, 9, 11);                      // and x12, x9, x11
+        LoadImm(13, 0x80);
+        OrrRR(12, 12, 13);                     // orr x12, x12, x13
+        LoadImm(13, 8);
+        LslvVV(12, 12, 13);                    // lslv x12, x12, x13
+        LoadImm(14, 6);
+        LsrvVV(15, 9, 14);                     // lsrv x15, x9, x14
+        LoadImm(13, 0xC0);
+        OrrRR(15, 15, 13);                     // orr x15, x15, x13
+        OrrRR(10, 15, 12);                     // orr x10, x15, x12
+        EmitB(pd);
+        Mark(p1);
+        MovRR(10, 9);                          // 1-byte form: packed = cp
+        Mark(pd);
+        StrU(10, 31, 8);                       // [sp+8] = packed
+        // char 0 keeps len 0 (single NUL byte, empty string)
+        LdrU(9, 31, 0);
+        int nz = NL(); CbnzReg(9, nz);
+        LoadImm(10, 0);
+        StrU(10, 31, 16);
+        Mark(nz);
+        // dst = str_alloc(len + 1); memcpy(dst, &packed, len); dst[len] = 0
+        LdrU(10, 31, 16);
+        AddImm(0, 10, 1);
+        BLInternal("_zan_rt_str_alloc");
+        StrU(0, 31, 24);
+        LdrU(0, 31, 24);
+        AddImm(1, 31, 8);                      // x1 = &packed
+        LdrU(2, 31, 16);
+        BLExtern("_memcpy");
+        LdrU(0, 31, 24);
+        LdrU(9, 31, 16);
+        AddRR(0, 0, 9);
+        Strb0(0);
+        // stamp the real length header: [dst-8] = MAGIC | len
+        LdrU(0, 31, 24);
+        SubImm(9, 0, 8);                       // sub x9, x0, #8
+        LoadImm(10, 0x5A414E5300000000);
+        LdrU(11, 31, 16);
+        OrrRR(10, 10, 11);                     // orr x10, x10, x11
+        StrU(10, 9, 0);
+        LdrU(0, 31, 24);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_substr2(ptr s, i64 start) -- caller checked start <= len
+    // (gen0 folds an out-of-range start to 0 at the call site). Builds the
+    // substring with str_alloc/memcpy and stamps the real length header.
+    void RtEmitSubstr2() {
+        syms.Add(new Sym("_zan_rt_substr2", FnPad()));
+        RtPrologue();
+        XPushV0();                             // push s
+        XPushV1();                             // push start
+        LdrU(1, 31, 16);                       // x1 = s
+        SubImm(2, 1, 8);                       // sub x2, x1, #8
+        LdrU(2, 2, 0);                         // ldr x2, [x2]
+        Uxtw32(2, 2);                          // ubfm x2, x2, #0, #31 (len)
+        LdrU(3, 31, 0);                        // x3 = start
+        StringSub(4, 2, 3);                    // sub x4, x2, x3 (subl)
+        StringCmp(4, 31);                      // cmp x4, xzr
+        EmitBcond(10, NL());
+        int ok = lblPos.Count - 1;
+        LoadImm(4, 0);
+        Mark(ok);
+        AddImm(0, 4, 1);                       // add x0, x4, #1 (size)
+        XPushR(4);                             // push subl
+        BLInternal("_zan_rt_str_alloc");       // x0 = dst
+        XPushV0();                             // push dst
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 48);                       // s
+        LdrU(2, 31, 32);                       // start
+        AddRR(1, 1, 2);                        // add x1, x1, x2 (s + start)
+        LdrU(2, 31, 16);                       // subl
+        BLExtern("_memcpy");
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 16);                       // subl
+        AddRR(0, 0, 1);                        // add x0, x0, x1
+        Strb0(0);                              // *end = 0
+        LdrU(0, 31, 0);                        // dst
+        SubImm(9, 0, 8);                       // sub x9, x0, #8
+        LoadImm(1, 0x5A414E5300000000);
+        LdrU(2, 31, 16);                       // subl
+        OrrRR(0, 1, 2);                        // orr x0, x1, x2 (hdr | len)
+        StrU(0, 9, 0);
+        LdrU(0, 31, 0);                        // return dst
+        AddSPImm(64, true);                    // pop dst/subl/start/s
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_substr3(s, start, len) -- two-argument Substring. gen0's
+    // safe-window clamp: any out-of-range window (negative start/len,
+    // start past the end, or start+len crossing the NUL) answers the empty
+    // string, exactly like the IR backend's select pair.
+    // Frame slots: [0]=len [16]=start [32]=s [48]=dst.
+    void RtEmitSubstr3() {
+        syms.Add(new Sym("_zan_rt_substr3", FnPad()));
+        RtPrologue();
+        XPushR(0);                             // push s
+        XPushR(1);                             // push start
+        XPushR(2);                             // push len
+        LdrU(1, 31, 32);                       // x1 = s
+        SubImm(2, 1, 8);                       // sub x2, x1, #8
+        LdrU(2, 2, 0);                         // ldr x2, [x2]
+        Uxtw32(2, 2);                          // ubfm x2, x2, #0, #31 (slen)
+        LdrU(3, 31, 16);                       // x3 = start
+        LdrU(4, 31, 0);                        // x4 = len
+        int c1 = NL();
+        StringCmp(3, 31);                      // cmp x3, xzr
+        EmitBcond(10, c1);                     // b.ge -- start is not negative
+        int badL = NL();
+        EmitB(badL);
+        Mark(c1);
+        int c2 = NL();
+        StringCmp(4, 31);                      // cmp x4, xzr
+        EmitBcond(10, c2);                     // b.ge -- len is not negative
+        EmitB(badL);
+        Mark(c2);
+        int c3 = NL();
+        StringCmp(3, 2);                       // cmp x3, x2
+        EmitBcond(13, c3);                     // b.le -- start within the string
+        EmitB(badL);
+        Mark(c3);
+        StringSub(5, 2, 3);                    // sub x5, x2, x3 (remaining)
+        int c4 = NL();
+        StringCmp(4, 5);                       // cmp x4, x5
+        EmitBcond(13, c4);                     // b.le -- window fits
+        EmitB(badL);
+        Mark(c4);
+        int okL = NL();
+        EmitB(okL);
+        Mark(badL);
+        LoadImm(3, 0);                         // bad window: start = len = 0
+        LoadImm(4, 0);
+        Mark(okL);
+        StrU(4, 31, 0);                        // [sp] = clamped len
+        StrU(3, 31, 16);                       // [sp+16] = clamped start
+        LdrU(0, 31, 0);
+        AddImm(0, 0, 1);                       // add x0, x0, #1 (size)
+        BLInternal("_zan_rt_str_alloc");       // x0 = dst
+        XPushR(0);                             // push dst
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 48);                       // s
+        LdrU(2, 31, 32);                       // start
+        AddRR(1, 1, 2);                        // add x1, x1, x2 (s + start)
+        LdrU(2, 31, 16);                       // len
+        BLExtern("_memcpy");
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 16);                       // len
+        AddRR(0, 0, 1);                        // add x0, x0, x1
+        Strb0(0);                              // *end = 0
+        LdrU(0, 31, 0);                        // dst
+        SubImm(9, 0, 8);                       // sub x9, x0, #8
+        LoadImm(1, 0x5A414E5300000000);
+        LdrU(2, 31, 16);                       // len
+        OrrRR(0, 1, 2);                        // orr x0, x1, x2 (hdr | len)
+        StrU(0, 9, 0);
+        LdrU(0, 31, 0);                        // return dst
+        AddSPImm(64, true);                    // pop dst/len/start/s
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_substr_raw(s, start, len) -- two-argument Substring on a
+    // receiver WITHOUT a trusted length header (raw FFI buffers typed as
+    // `string`, e.g. the stdlib's struct dirent* sliced byte by byte). The
+    // C host skips the window check for those receivers
+    // (expr_has_reliable_string_bounds), so slice raw; a null receiver or a
+    // negative start/len answers the empty string. Frame slots:
+    // [0]=len [16]=start [32]=s [48]=dst.
+    void RtEmitSubstrRaw() {
+        syms.Add(new Sym("_zan_rt_substr_raw", FnPad()));
+        RtPrologue();
+        XPushR(0);                             // push s
+        XPushR(1);                             // push start
+        XPushR(2);                             // push len
+        int snull = NL();
+        LdrU(2, 31, 32);                       // x2 = s
+        CbzReg(2, snull);                      // s == 0 -> empty
+        int c1 = NL();
+        LdrU(3, 31, 16);                       // x3 = start
+        StringCmp(3, 31);                      // cmp x3, xzr
+        EmitBcond(10, c1);                     // b.ge -- start is not negative
+        EmitB(snull);
+        Mark(c1);
+        int c2 = NL();
+        LdrU(4, 31, 0);                        // x4 = len
+        StringCmp(4, 31);                      // cmp x4, xzr
+        EmitBcond(10, c2);                     // b.ge -- len is not negative
+        EmitB(snull);
+        Mark(c2);
+        int okL = NL();
+        EmitB(okL);
+        Mark(snull);
+        LoadImm(3, 0);                         // empty: start = len = 0
+        LoadImm(4, 0);
+        Mark(okL);
+        StrU(4, 31, 0);                        // [sp] = len
+        StrU(3, 31, 16);                       // [sp+16] = start
+        LdrU(0, 31, 0);
+        AddImm(0, 0, 1);                       // add x0, x0, #1 (size)
+        BLInternal("_zan_rt_str_alloc");       // x0 = dst
+        XPushR(0);                             // push dst
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 48);                       // s
+        LdrU(2, 31, 32);                       // start
+        AddRR(1, 1, 2);                        // add x1, x1, x2 (s + start)
+        LdrU(2, 31, 16);                       // len
+        BLExtern("_memcpy");
+        LdrU(0, 31, 0);                        // dst
+        LdrU(1, 31, 16);                       // len
+        AddRR(0, 0, 1);                        // add x0, x0, x1
+        Strb0(0);                              // *end = 0
+        LdrU(0, 31, 0);                        // dst
+        SubImm(9, 0, 8);                       // sub x9, x0, #8
+        LoadImm(1, 0x5A414E5300000000);
+        LdrU(2, 31, 16);                       // len
+        OrrRR(0, 1, 2);                        // orr x0, x1, x2 (hdr | len)
+        StrU(0, 9, 0);
+        LdrU(0, 31, 0);                        // return dst
+        AddSPImm(64, true);                    // pop dst/len/start/s
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_strjoin(sep, list) -- string.Join(sep, List<string>).
+    // Two passes exactly like gen0's __zan_str_join: one strlen pass for
+    // the total (sep counted n-1 times, only when n > 0), then str_alloc
+    // of align32(total + 1) (min 32) and a copy pass with the sep between
+    // elements. Null elements count as "". The length header is stamped
+    // at buf-8 like every other heap-string producer.
+    // Frame slots: [0]=total [8]=i [16]=list [24]=sep [32]=seplen
+    // [40]=pos [48]=buf [56]=elem [64]=sl.
+    void RtEmitStrjoin() {
+        syms.Add(new Sym("_zan_rt_strjoin", FnPad()));
+        RtPrologue();
+        AddSPImm(80, false);
+        int retNull = NL(); int sepFix = NL(); int retDone = NL();
+        StrU(1, 31, 16);                       // [sp+16] = list (x1)
+        StrU(0, 31, 24);                       // [sp+24] = sep (x0)
+        if (tgt86 == 1) {
+            // host join 面的文档契约(null sep/list 都按 "" 处理)在 x86
+            // 车道由本面对齐:zan 体只在元素级设防
+            sepFix = NL();
+            CbnzReg(0, sepFix);                    // sep != 0 -> keep it;
+                                                   // fall through == null only
+            LoadStr(emptyIdx, 0);
+            StrU(0, 31, 24);
+            Mark(sepFix);
+            retNull = NL();
+            LdrU(1, 31, 16);
+            CbzReg(1, retNull);
+        }
+        LdrU(0, 31, 24);
+        BLExtern("_strlen");                   // x0 = seplen
+        StrU(0, 31, 32);
+        // total = n > 0 ? seplen * (n - 1) : 0
+        LoadImm(4, 0);                         // movz x4, #0
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // x2 = n
+        int sepskip = NL();
+        CbzReg(2, sepskip);
+        LdrU(3, 31, 32);
+        SubImm(2, 2, 1);                       // sub x2, x2, #1
+        MulRR(4, 3, 2);                        // mul x4, x3, x2
+        Mark(sepskip);
+        StrU(4, 31, 0);                        // [sp] = total
+        LoadImm(0, 0);                         // movz x0, #0
+        StrU(0, 31, 8);                        // i = 0
+        // pass 1: total += strlen(elem or "")
+        int l1 = NL();
+        int d1 = NL();
+        int isn1 = NL();
+        int isa1 = NL();
+        Mark(l1);
+        LdrU(0, 31, 8);                        // i
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }   // cmp x0, x2
+        EmitBcond(10, d1);                     // b.ge d1
+        LdrU(3, 31, 16);
+        LdrU(3, 3, 16);                        // x3 = data
+        EmitArrElemLoad(8, "long", 3, 0, 0);   // ldr x0, [x3, x0, lsl #3]
+        CbzReg(0, isn1);
+        BLExtern("_strlen");                   // x0 = sl
+        EmitB(isa1);
+        Mark(isn1);
+        LoadImm(0, 0);                         // movz x0, #0
+        Mark(isa1);
+        LdrU(1, 31, 0);
+        AddRR(1, 1, 0);
+        StrU(1, 31, 0);                        // total += sl
+        LdrU(0, 31, 8);
+        AddImm(0, 0, 1);
+        StrU(0, 31, 8);                        // i++
+        EmitB(l1);
+        Mark(d1);
+        // buf = str_alloc(max(align32(total + 1), 32))
+        LdrU(0, 31, 0);
+        AddImm(0, 0, 1);
+        AddImm(0, 0, 31);
+        if (tgt86 == 1) { X4(0xE0E78348); } else { E4(0x927BE800); }   // and x0, x0, #-32
+        LoadImm(9, 32);
+        if (tgt86 == 1) { Xop(0x39, 7, 0); } else { E4(0xEB09001F); }   // cmp x0, x9
+        int ok32 = NL();
+        EmitBcond(2, ok32);                    // b.hs ok32
+        LoadImm(0, 32);
+        Mark(ok32);
+        BLInternal("_zan_rt_str_alloc");
+        StrU(0, 31, 48);                       // [sp+48] = buf
+        LoadImm(0, 0);                         // movz x0, #0
+        StrU(0, 31, 40);                       // pos = 0
+        StrU(0, 31, 8);                        // i = 0
+        // pass 2: copy element, sep when i + 1 < n, NUL at the end
+        int l2 = NL();
+        int d2 = NL();
+        int nosep = NL();
+        int isn2 = NL();
+        int isa2 = NL();
+        Mark(l2);
+        LdrU(0, 31, 8);                        // i
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }   // cmp x0, x2
+        EmitBcond(10, d2);                     // b.ge d2
+        LdrU(3, 31, 16);
+        LdrU(3, 3, 16);                        // x3 = data
+        EmitArrElemLoad(8, "long", 3, 0, 3);   // ldr x3, [x3, x0, lsl #3]
+        StrU(3, 31, 56);                       // [sp+56] = elem
+        CbzReg(3, isn2);
+        LdrU(0, 31, 56);
+        BLExtern("_strlen");
+        StrU(0, 31, 64);                       // [sp+64] = sl
+        EmitB(isa2);
+        Mark(isn2);
+        LoadImm(0, 0);                         // movz x0, #0
+        StrU(0, 31, 64);
+        Mark(isa2);
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        AddRR(0, 0, 9);                        // add x0, x0, x9 (dst)
+        LdrU(1, 31, 56);                       // elem
+        LdrU(2, 31, 64);                       // sl
+        BLExtern("_memcpy");
+        LdrU(1, 31, 64);
+        LdrU(2, 31, 40);
+        AddRR(2, 2, 1);
+        StrU(2, 31, 40);                       // pos += sl
+        LdrU(0, 31, 8);                        // i
+        AddImm(0, 0, 1);                       // i + 1
+        LdrU(2, 31, 16);
+        LdrU(2, 2, 0);                         // n
+        if (tgt86 == 1) { Xop(0x39, 7, 2); } else { E4(0xEB02001F); }   // cmp i+1, n
+        EmitBcond(10, nosep);                  // b.ge nosep
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        AddRR(0, 0, 9);                        // add x0, x0, x9 (dst)
+        LdrU(1, 31, 24);                       // sep
+        LdrU(2, 31, 32);                       // seplen
+        BLExtern("_memcpy");
+        LdrU(1, 31, 32);
+        LdrU(2, 31, 40);
+        AddRR(2, 2, 1);
+        StrU(2, 31, 40);                       // pos += seplen
+        Mark(nosep);
+        LdrU(0, 31, 8);
+        AddImm(0, 0, 1);
+        StrU(0, 31, 8);                        // i++
+        EmitB(l2);
+        Mark(d2);
+        LdrU(0, 31, 48);                       // buf
+        LdrU(9, 31, 40);                       // pos
+        AddRR(0, 0, 9);                        // add x0, x0, x9
+        Strb0(0);                              // buf[pos] = NUL
+        // stamp the Zan string header at buf-8: magic | pos. Join results
+        // flow into the same Length/Substring readers as any other string
+        LdrU(1, 31, 40);                       // x1 = pos (the copy length)
+        LoadImm(4, 0x5A414E5300000000);
+        OrrRR(1, 1, 4);                        // orr x1, x1, x4
+        LdrU(5, 31, 48);                       // x5 = buf
+        SubImm(5, 5, 8);
+        StrU(1, 5, 0);                         // str x1, [buf-8]
+        LdrU(0, 31, 48);                       // return buf
+        if (tgt86 == 1) { EmitB(retDone); Mark(retNull); LoadStr(emptyIdx, 0); Mark(retDone); }
+        AddSPImm(80, true);
+        RtEpilogue();
+    }
+
+    // every interned literal becomes a directly-addressed immutable blob in
+    // __data: [off+0] rc = -1 (immortal sentinel, mirroring the reflect
+    // blobs — nothing in this lane decrements, but -1 documents
+    // non-ownership), [off+8] = 0x5A414E53<<32|len, [off+16..] text + NUL,
+    // padded to 8. LoadStr hands out blob+16, so Length/index probe the same
+    // header layout as any heap string. This replaced the old
+    // _zan_rt_strpool_init startup stamping: those l_.g.strp.N slots were
+    // only filled when the object holding Main ran its startup shim, so a
+    // separately compiled library object's literals read as null.
+    void RtEmitStrpool() {
+        syms.Add(new Sym("_zan_rt_strpool_init", FnPad()));
+        RtPrologue();
+        RtEpilogue();
+        int i = 0;
+        while (i < strs.Count) { EmitStrdBlob(i); i = i + 1; }
+    }
+
+    // one literal's initialized __data blob (8-aligned start and size)
+    void EmitStrdBlob(int si) {
+        string s = strs[si];
+        int len = s.Length;
+        int pad = dataLen - (dataLen / 8) * 8;
+        if (pad != 0) { dataLen = dataLen + 8 - pad; }
+        int sz = 16 + len + 1;
+        int rem = sz - (sz / 8) * 8;
+        if (rem != 0) { sz = sz + 8 - rem; }
+        DGlob g = new DGlob("strd." + si, sz, dataLen);
+        g.bytes = new List<int>();
+        Put32(g.bytes, -1);            // rc: immortal sentinel (64-bit field)
+        Put32(g.bytes, -1);
+        Put32(g.bytes, len);           // header low word = length
+        Put32(g.bytes, 0x5A414E53);    // header high word = SNAZ magic
+        int k = 0;
+        while (k < len) { g.bytes.Add(ByteAt((int)s[k], 0)); k = k + 1; }
+        g.bytes.Add(0);
+        while (g.bytes.Count < sz) { g.bytes.Add(0); }
+        dglbs.Add(g);
+        dataLen = dataLen + sz;
+    }
+
+    // __data payload: zeroed except DGlobs carrying initialized bytes (the
+    // literal blobs). "nl." slots live past dataLen and never carry bytes.
+    void EmitDataPayload(List<int> img) {
+        List<int> payload = new List<int>();
+        int i = 0;
+        while (i < dataLen) { payload.Add(0); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) {
+            if (dglbs[i].bytes != null && IsNlSlot(dglbs[i].name) == 0) {
+                int k = 0;
+                while (k < dglbs[i].bytes.Count) {
+                    payload[dglbs[i].off + k] = dglbs[i].bytes[k];
+                    k = k + 1;
+                }
+            }
+            i = i + 1;
+        }
+        Append(img, payload, 0, dataLen);
+    }
+
+    // ptr _zan_eh_cls_name(long site): pure-code lookup returning the HEAP
+    // strpool string for a thrown object's site id (1-based), or 0. The
+    // uncaught-exception tail reports it like the oracle resolves names
+    // through its tid-name registry (irgen_stmt.c reh.cls). Returning the
+    // pool object (not the raw cstring) lets the tail feed it straight into
+    // _zan_rt_strcat2/_zan_rt_println -- the same path as Console.WriteLine.
+    void EmitClsNameFn() {
+        syms.Add(new Sym("_zan_eh_cls_name", FnPad()));
+        RtPrologue();
+        int i = 0;
+        while (i < classes.Count) {
+            LoadImm(1, i + 1);
+            if (tgt86 == 1) { Xop(0x39, 7, 6); }     // cmp rdi, rsi (x0 - x1)
+            else { E4(0xEB01001F); }                 // cmp x0, x1
+            EmitBcond(1, NL());                // b.ne next
+            int hit = lblPos.Count - 1;
+            strs.Add(classes[i].name);
+            LoadStr(strs.Count - 1, 0);        // x0 = heap "Oops"
+            RtEpilogue();                      // return name
+            Mark(hit);
+            i = i + 1;
+        }
+        LoadImm(0, 0);
+        RtEpilogue();                          // unknown site: 0
+    }
+
+    // ptr _zan_rt_eh_state(): the exception-state block. The STORAGE is
+    // per-thread (zan_eh_tls_state, __thread in the transition runtime /
+    // a static block in the qemu stub): it used to sit behind one
+    // process-global pointer, and with real OS threads a thread could
+    // longjmp into a slot armed by another frame's thread (the
+    // exception_threads case). The block layout stays compiler-owned:
+    // { i32 top, ptr exc, 256 x 1024-byte setjmp slots }.
+    void RtEmitEhState() {
+        syms.Add(new Sym("_zan_rt_eh_state", FnPad()));
+        if (tgt86 == 1) {
+            // the x86 lane owns the storage: lazy calloc once, the cached
+            // block pointer living in a compiler-owned __data quad. No
+            // threads exist on this lane yet, so a process-global cache has
+            // the same semantics as the qemu stub's static block; revisit
+            // to per-thread storage when ThreadEntry lands.
+            dglbs.Add(new DGlob("zan_eh_state_cache", 8, dataLen)); dataLen = dataLen + 8;
+            RtPrologue();
+            LoadSymRef(DGlobalSym("zan_eh_state_cache"), 1);
+            LdrU(0, 1, 0);
+            CbzReg(0, NL());
+            int have = lblPos.Count - 1;
+            RtEpilogue();
+            Mark(have);
+            LoadImm(0, 16 + 256 * 1024);             // { i32 top, ptr exc, 256 x 1024-byte setjmp slots }
+            LoadImm(1, 1);
+            BLExtern("_calloc");
+            CbzReg(0, NL());
+            int oom = lblPos.Count - 1;
+            MovRR(9, 0);                             // r9 = block
+            LoadSymRef(DGlobalSym("zan_eh_state_cache"), 1);
+            StrU(9, 1, 0);                           // cache = block
+            RtEpilogue();
+            Mark(oom);
+            RtOom();
+            return;
+        }
+        RtPrologue();
+        BLExtern("_zan_eh_tls_state");
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_soft_scratch(): stable process-global 64-byte zeroed cell.
+    // The soft-diag probe (tests/selfhost/softdiag.zan) asserts the pointer
+    // is non-null, stable across calls, and the payload stays zeroed.
+    void RtEmitSoftScratch() {
+        syms.Add(new Sym("_zan_rt_soft_scratch", FnPad()));
+        RtPrologue();
+        LoadSymRef(DGlobalSym("zan_soft_scratch"), 0);
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_alloc(i64 size, i64 desc): zeroed (calloc), rc=1, desc at raw+8
+    void RtEmitAlloc() {
+        syms.Add(new Sym("_zan_rt_alloc", FnPad()));
+        RtPrologue();
+        if (tgt86 == 1) {
+            // rdi=size, rsi=desc. The desc survives calloc in the [rsp]
+            // scratch; the payload hands back raw+16.
+            XSubRsp(16);
+            XopMemR(0x89, 6, 4, 0);              // mov [rsp], rsi
+            X4(0x107F8D48);          // lea rdi, [rdi+16]
+            XLoadImm(1, 1);                      // mov rsi, 1
+            BLExtern("_calloc");
+            CbzReg(0, NL());
+            int oom = lblPos.Count - 1;
+            XLoadImm(2, 1);
+            XopMemR(0x89, 2, 7, 0);              // mov [rdi], rdx (rc=1)
+            XopRMem(0x8B, 6, 4, 0);              // mov rsi, [rsp]
+            XopMemR(0x89, 6, 7, 8);              // mov [rdi+8], rsi (desc)
+            X4(0x107F8D48);          // lea rdi, [rdi+16]
+            XAddRsp(16);
+            RtEpilogue();
+            Mark(oom);
+            RtOom();
+            return;
+        }
+        AddSPImm(16, false);      // sub sp, sp, #16 (scratch below the saved pair)
+        StrU(1, 31, 0);           // str x1, [sp]      (save desc)
+        AddImm(0, 0, 16);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        CbzReg(0, NL());
+        int oom = lblPos.Count - 1;
+        LoadImm(2, 1);
+        StrU(2, 0, 0);
+        LdrU(1, 31, 0);
+        StrU(1, 0, 8);
+        AddImm(0, 0, 16);
+        AddSPImm(16, true);       // add sp, sp, #16
+        RtEpilogue();
+        Mark(oom);
+        RtOom();
+    }
+
+    // _vtinit_<Cls>: build the class's vtable once -- calloc the slot array,
+    // store each slot's effective implementation address (adrp+add materializes
+    // the text symbol at runtime, so no data relocations are needed), and
+    // publish it in the class's lazy data slot. Returns the table in x0.
+    void EmitVtInit(Cls c) {
+        syms.Add(new Sym("_vtinit_" + c.name, FnPad()));
+        RtPrologue();
+        List<string> slots = new List<string>();
+        CollectVSlotsNg(c.name, slots);
+        // an all-abstract class (interface) legitimately leaves slots
+        // unimplemented; such a class is never instantiated, so it gets no
+        // table rather than a half-built one
+        int pre = 0;
+        while (pre < slots.Count) {
+            string pc2 = VSlotImplCls(c.name, slots[pre]);
+            if (pc2 == null || FindInstanceInClsKey(pc2, slots[pre]) == null) {
+                RtEpilogue();
+                return;
+            }
+            pre = pre + 1;
+        }
+        LoadImm(0, slots.Count * 8);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        int okL = NL();
+        CbnzReg(0, okL);
+        RtOom();
+        Mark(okL);
+        int s = 0;
+        while (s < slots.Count) {
+            string implCls = VSlotImplCls(c.name, slots[s]);
+            Node impl = FindInstanceInClsKey(implCls, slots[s]);
+            LoadSymRef(MethSymNg(implCls, impl), 1);
+            StrU(1, 0, s * 8);
+            s = s + 1;
+        }
+        LoadSymRef(DGlobalSym("vt." + c.name), 9);
+        StrU(0, 9, 0);                                   // publish the table
+        RtEpilogue();
+    }
+
+    // ptr zan_rt_str_alloc(i64 total): malloc'd, rc=1, magic|sentinel at raw+8
+    void RtEmitStrAlloc() {        syms.Add(new Sym("_zan_rt_str_alloc", FnPad()));
+        RtPrologue();
+        if (tgt86 == 1) {
+            X4(0x107F8D48);          // lea rdi, [rdi+16]
+            BLExtern("_malloc");
+            CbzReg(0, NL());
+            int oom = lblPos.Count - 1;
+            XLoadImm(2, 1);
+            XopMemR(0x89, 2, 7, 0);              // [raw] = rc 1
+            XLoadImm(2, 0x5A414E5354524D47);
+            XopMemR(0x89, 2, 7, 8);              // [raw+8] = magic
+            X4(0x107F8D48);          // payload = raw+16
+            RtEpilogue();
+            Mark(oom);
+            RtOom();
+            return;
+        }
+        AddImm(0, 0, 16);
+        BLExtern("_malloc");
+        CbzReg(0, NL());
+        int oom = lblPos.Count - 1;
+        LoadImm(2, 1);
+        StrU(2, 0, 0);
+        LoadImm(2, 0x5A414E5354524D47);
+        StrU(2, 0, 8);
+        AddImm(0, 0, 16);
+        RtEpilogue();
+        Mark(oom);
+        RtOom();
+    }
+
+    // ptr zan_rt_strcat2(ptr a, ptr b)
+    // frame 96: a@-96, b@-80, l1@-64, l2@-48, buf@-32 (l1+l2 recomputed via slots)
+    void RtEmitStrCat2() {
+        syms.Add(new Sym("_zan_rt_strcat2", FnPad()));
+        RtPrologue();
+        if (tgt86 == 1) {
+            // Same shape as the arm64 body; the one extra move is XMov(7,0)
+            // after strlen0 (its result lands in rax, the accumulator lives
+            // in rdi). v4 is r8 on x86, so the header OR is or rsi, r8.
+            AddSPImm(96, false);
+            RtStur(0, 29, -96);       // a
+            RtStur(1, 29, -80);       // b
+            RtLdur(0, 29, -96);
+            BLInternal("_zan_rt_strlen0");
+            RtStur(0, 29, -64);       // l1
+            RtLdur(0, 29, -80);
+            BLInternal("_zan_rt_strlen0");
+            RtStur(0, 29, -48);       // l2
+            // memcpy(buf, a, l1) -- buf allocated after lengths so total is known
+            RtLdur(0, 29, -64);       // l1
+            RtLdur(1, 29, -48);       // l2
+            XAddRR(0, 0, 1);          // l1 + l2
+            AddImm(0, 0, 1);          // total (bytes incl NUL)
+            BLInternal("_zan_rt_str_alloc");
+            RtStur(0, 29, -32);       // buf
+            RtLdur(0, 29, -32);
+            RtLdur(1, 29, -96);
+            RtLdur(2, 29, -64);
+            BLExtern("_memcpy");
+            // memcpy(buf + l1, b, l2)
+            RtLdur(0, 29, -32);
+            RtLdur(3, 29, -64);
+            XAddRR(0, 0, 3);
+            RtLdur(1, 29, -80);
+            RtLdur(2, 29, -48);
+            BLExtern("_memcpy");
+            // *end = 0 at buf + l1 + l2
+            RtLdur(0, 29, -32);
+            RtLdur(1, 29, -64);
+            XAddRR(0, 0, 1);
+            RtLdur(1, 29, -48);
+            XAddRR(0, 0, 1);
+            Strb0(0);
+            // stamp header at buf-8: 0x5A414E53_00000000 | (l1 + l2)
+            RtLdur(1, 29, -64);
+            RtLdur(2, 29, -48);
+            XAddRR(1, 1, 2);          // len
+            LoadImm(4, 0x5A414E5300000000);
+            Xop(0x09, 6, 8);          // or rsi, r8 (v1=rsi, v4=r8)
+            RtLdur(5, 29, -32);
+            SubImm(5, 5, 8);
+            RtStur(1, 5, 0);          // mov [r9], rsi (== buf-8)
+            RtLdur(0, 29, -32);
+            AddSPImm(96, true);
+            RtEpilogue();
+            return;
+        }
+        E4(0xD10403FF);           // sub sp, sp, #96
+        RtStur(0, 29, -96);       // a
+        RtStur(1, 29, -80);       // b
+        RtLdur(0, 29, -96);
+        BLInternal("_zan_rt_strlen0");
+        RtStur(0, 29, -64);       // l1
+        RtLdur(0, 29, -80);
+        BLInternal("_zan_rt_strlen0");
+        RtStur(0, 29, -48);       // l2
+        // memcpy(buf, a, l1) -- buf allocated after lengths so total is known
+        RtLdur(0, 29, -64);       // l1
+        RtLdur(1, 29, -48);       // l2
+        AddRR(0, 0, 1);           // x0 = l1 + l2
+        AddImm(0, 0, 1);          // total (bytes incl NUL)
+        BLInternal("_zan_rt_str_alloc");
+        RtStur(0, 29, -32);       // buf
+        RtLdur(0, 29, -32);
+        RtLdur(1, 29, -96);
+        RtLdur(2, 29, -64);
+        BLExtern("_memcpy");
+        // memcpy(buf + l1, b, l2)
+        RtLdur(0, 29, -32);
+        RtLdur(3, 29, -64);
+        AddRR(0, 0, 3);
+        RtLdur(1, 29, -80);
+        RtLdur(2, 29, -48);
+        BLExtern("_memcpy");
+        // *end = 0 at buf + l1 + l2 (memcpy returned buf+l1, so recompute)
+        RtLdur(0, 29, -32);
+        RtLdur(1, 29, -64);
+        AddRR(0, 0, 1);
+        RtLdur(1, 29, -48);
+        AddRR(0, 0, 1);
+        Strb0(0);
+        // stamp header at buf-8: 0x5A414E53_00000000 | (l1 + l2)
+        RtLdur(1, 29, -64);
+        RtLdur(2, 29, -48);
+        AddRR(1, 1, 2);           // len
+        LoadImm(4, 0x5A414E5300000000);
+        E4(0xAA040021);           // orr x1, x1, x4
+        RtLdur(5, 29, -32);
+        SubImm(5, 5, 8);
+        RtStur(1, 5, 0);          // str x1, [x5] (== buf-8)
+        RtLdur(0, 29, -32);
+        E4(0x910403FF);           // add sp, sp, #96
+        RtEpilogue();
+    }
+
+    // i64 _zan_rt_strlen0(ptr s): null-safe strlen -- a null string acts as
+    // the empty string, like gen0's probes ("abc" + null, concat of nulls)
+    void RtEmitStrlen0() {
+        syms.Add(new Sym("_zan_rt_strlen0", FnPad()));
+        RtPrologue();
+        CbzReg(0, NL());
+        int nul = lblPos.Count - 1;
+        BLExtern("_strlen");
+        if (tgt86 == 1) { XMov(7, 0); }       // move rax home before the epilogue reads rdi
+        RtEpilogue();
+        Mark(nul);
+        LoadImm(0, 0);
+        RtEpilogue();
+    }
+
+    // i64 _zan_rt_strcmp0(ptr a, ptr b): null-safe strcmp -- null equals
+    // null and sorts before every string (gen0 parity for ==, <, ...)
+    void RtEmitStrcmp0() {
+        syms.Add(new Sym("_zan_rt_strcmp0", FnPad()));
+        RtPrologue();
+        RtStur(0, 29, -16);                  // a
+        RtStur(1, 29, -24);                  // b
+        RtLdur(0, 29, -16);
+        CbzReg(0, NL());
+        int aNull = lblPos.Count - 1;
+        RtLdur(0, 29, -24);
+        CbzReg(0, NL());
+        int bNull = lblPos.Count - 1;
+        RtLdur(0, 29, -16);
+        RtLdur(1, 29, -24);
+        BLExtern("_strcmp");
+        RtEpilogue();
+        Mark(aNull);
+        RtLdur(0, 29, -24);
+        CbzReg(0, NL());
+        int bothNull = lblPos.Count - 1;
+        LoadImm(0, -1);                      // a null, b non-null: a < b
+        RtEpilogue();
+        Mark(bothNull);
+        LoadImm(0, 0);                       // both null: equal
+        RtEpilogue();
+        Mark(bNull);
+        LoadImm(0, 1);                       // b null, a non-null: a > b
+        RtEpilogue();
+    }
+
+    // void zan_rt_print_int(i64 v) -- printf("%lld\n", v on stack)
+    void RtEmitPrintInt() {
+        syms.Add(new Sym("_zan_rt_print_int", FnPad()));
+        if (tgt86 == 1) {
+            // SysV: v arrives in rdi (arg0); move it to rsi BEFORE the
+            // format lea overwrites rdi. AL=0 declares no vector arguments.
+            RtPrologue();
+            XMov(6, 7);            // mov rsi, rdi (v)
+            XLeaSym("l_.str." + fmtiIdx, 0);
+            X2(0x31, 0xC0);        // xor eax, eax
+            BLExtern("_printf");
+            RtEpilogue();
+            return;
+        }
+        RtPrologue();
+        PushV(0);           // str x0, [sp, #-16]!
+        if (EnvTargetElf() == 1) {
+            LdrU(1, 31, 0);       // Linux: x1 = v (register vararg)
+        }
+        LoadSymRef("l_.str." + fmtiIdx, 0);
+        BLExtern("_printf");
+        PopV(0);           // ldr x0, [sp], #16
+        RtEpilogue();
+    }
+
+    // void zan_rt_println(ptr s) -- printf("%s\n", s on stack)
+    void RtEmitPrintln() {
+        syms.Add(new Sym("_zan_rt_println", FnPad()));
+        if (tgt86 == 1) {
+            RtPrologue();
+            XMov(6, 7);            // mov rsi, rdi (s)
+            XLeaSym("l_.str." + fmtsIdx, 0);
+            X2(0x31, 0xC0);        // xor eax, eax
+            BLExtern("_printf");
+            RtEpilogue();
+            return;
+        }
+        RtPrologue();
+        PushV(0);
+        if (EnvTargetElf() == 1) {
+            LdrU(1, 31, 0);       // Linux: x1 = s (register vararg)
+        }
+        LoadSymRef("l_.str." + fmtsIdx, 0);
+        BLExtern("_printf");
+        PopV(0);
+        RtEpilogue();
+    }
+
+    // ---- List<T>, ABI-identical to gen0's %List = {i64 count, i64 cap, ptr data} ----
+
+    // new List<T>(): alloc 24+16 (calloc-zeroed count), cap = 8,
+    // data = calloc(8, 8) -- mirrors gen0's collection initializer
+    void GenListNew(Node e) {
+        // batch 12: a view stored in a list would outlive the method frame
+        // that owns its box (ref-struct shape)
+        if (e != null && e.type != null && e.type.kids != null
+                && e.type.kids.Count > 0
+                && SpanTyNg(TypeFullName(e.type.kids[0]))) {
+            diags.Error("ngen: a Span view cannot be a List element (ref-struct shape)", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        // copy constructor: `new List<T>(src)` clones count/cap and copies
+        // the slot array (shallow: class elements share instances, gen0
+        // parity; the copy is independent of later Add on either side)
+        if (e != null && e.ival != 2 && e.kids.Count == 1
+                && ExprCls(e.kids[0]) == "List") {
+            GenExpr(e.kids[0]);                          // x0 = src
+            XPushV0();                                   // push src
+            LoadImm(0, 24 + 16);
+            LoadImm(1, 0);
+            BLInternal("_zan_rt_alloc");                 // x0 = obj
+            XPushV0();                                   // push obj
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(2, 1, 0);                               // src->count
+            StrU(2, 0, 0);                               // obj->count
+            LdrU(2, 1, 8);                               // src->cap
+            StrU(2, 0, 8);                               // obj->cap
+            MovRR(0, 2);                                 // x0 = cap
+            LoadImm(1, 8);
+            BLExtern("_calloc");                         // x0 = data
+            MovRR(9, 0);                                 // x9 = data
+            LdrU(0, 31, 0);                              // x0 = obj
+            StrU(9, 0, 16);                              // obj->data = data
+            MovRR(0, 9);                                 // dst
+            LdrU(1, 31, 16);                             // x1 = src
+            LdrU(1, 1, 16);                              // src->data
+            LdrU(2, 31, 0);                              // x2 = obj
+            LdrU(2, 2, 0);                               // count
+            LoadImm(3, 8);
+            if (tgt86 == 1) { X3(0x48, 0x0F, 0xAF); X1(0xD1); }  // imul rdx, rcx
+            else { E4(0x9B037C42); }                     // mul x2, x2, x3
+            BLExtern("_memcpy");                         // copy the slots
+            LdrU(0, 31, 0);                              // x0 = obj (result)
+            AddSPImm(32, true);                          // pop obj + src
+            return;
+        }
+        LoadImm(0, 24 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");
+        XPushV0();                                   // str x0, [sp, #-16]! (obj)
+        LoadImm(1, 8);
+        StrU(1, 0, 8);                               // obj->cap = 8
+        LoadImm(0, 8);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                         // data = calloc(8, 8)
+        XPopV(1);                                    // ldr x1, [sp], #16 (obj)
+        StrU(0, 1, 16);                              // obj->data = x0
+        MovRR(0, 1);                                 // result = obj
+        // collection initializer: `new List<T> { a, b, c }` appends each
+        // item through the same growth path as Add
+        if (e != null && e.ival == 2) {
+            XPushV0();                               // push list
+            int j = 0;
+            while (j < e.kids.Count) {
+                GenExpr(e.kids[j]);
+                MovRR(1, 0);                         // x1 = value
+                LdrU(0, 31, 0);                      // x0 = list (peek)
+                ListAppendRaw();
+                j = j + 1;
+            }
+            XPopV(0);                                // pop list -> x0
+        }
+    }
+
+    // append with x0 = list and x1 = value: grows the backing store when
+    // full, stores the value, bumps the count
+    void ListAppendRaw() {
+        // re-push list+value as one pair: the str-only push leaves the
+        // upper half of the slot stale (callee-saved LR from earlier calls)
+        XPushPair01();                               // stp x0, x1, [sp, #-16]!
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 8);                               // cap
+        if (tgt86 == 1) { Xop(0x39, 2, 1); }         // cmp rdx, rcx (x2 - x3)
+        else { E4(0xEB03005F); }                     // cmp x2, x3
+        int skip = NL();
+        EmitBcond(1, skip);                          // b.ne skip (cond 1 = NE)
+        AddRR(3, 3, 3);                              // ncap = cap * 2
+        StrU(3, 0, 8);                               // cap = ncap
+        LdrU(4, 0, 16);                              // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                              // x9 = ncap * 8 bytes
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        LdrU(5, 31, 0);                              // x5 = list
+        StrU(0, 5, 16);                              // list->data = new data
+        Mark(skip);
+        LdrU(0, 31, 0);                              // list
+        LdrU(2, 0, 0);                               // count
+        LdrU(3, 0, 16);                              // data
+        LdrU(1, 31, 8);                              // value
+        if (tgt86 == 1) {
+            X3(0x48, 0x89, 0x34); X1(0xD1);          // mov [rcx + rdx*8], rsi
+        } else {                                     // (str x1, [x3, x2, lsl #3])
+            E4(0xF8207800 | (2 << 16) | (3 << 5) | 1);   // str x1, [x3, x2, lsl #3]
+        }
+        AddImm(2, 2, 1);                             // count + 1
+        StrU(2, 0, 0);                               // list->count
+        AddSPImm(16, true);                          // pop the stp'd pair
+    }
+
+    // ---- Dictionary<K, V>: parallel 8-byte slots, payload size 40 --
+    // { i64 count, i64 cap, ptr keys, ptr vals, i64 kinds }.
+    // kinds bit 0: signed int keys (narrowed to i32 at the set boundary);
+    // bit 1: signed int values; bit 2: full-width integer keys (long/nint,
+    // stored raw and compared as 64-bit, matching the oracle's is_str=0
+    // key equality). All other supported slots retain their full 64-bit
+    // value/pointer. Never treat an unsupported key type or a boxed struct
+    // as an integer slot.
+    string DictSlotTy(Node recv, bool key) {
+        string ty = StaticTyOf(recv);
+        if (recv != null && recv.kind == AK.NewExpr()) { ty = TypeFullName(recv.type); }
+        if (ty == null) { return null; }
+        int lt = ty.IndexOf("<");
+        if (lt < 0 || ty.Substring(ty.Length - 1, 1) != ">") { return null; }
+        List<string> args = SplitTyArgs(ty.Substring(lt + 1, ty.Length - lt - 2));
+        if (args.Count != 2) { return null; }
+        return key ? args[0] : args[1];
+    }
+
+    bool DictCheckType(Node recv) {
+        string kt = DictSlotTy(recv, true);
+        string vt = DictSlotTy(recv, false);
+        // an open generic body ("Dict<T, int>" inside HashSet<T>) emits
+        // under erasure: keys/values travel as words, the int-kind bits
+        // stay clear; concrete instantiations go through the spec pipeline
+        if (kt != "string" && kt != "int" && kt != "long" && kt != "nint"
+                && !IsTypeParamErasedNg(kt)) {
+            diags.Error("ngen: unsupported Dictionary key type '" + kt
+                + "'; supported keys are string, int, long and nint", curLine, curCol);
+            return false;
+        }
+        string valueClass = ClassTyOf(vt);
+        Cls vc = null;
+        if (valueClass != null) { vc = FindClass(valueClass); }
+        // struct values ride the 8-byte slot as a fresh heap box per store
+        // (ngen boxes structs; copy-on-store/copy-on-read keeps gen0's value
+        // semantics), so the slot kind stays a reference word
+        bool structValue = vc != null && vc.isStruct == 1;
+        bool refValue = vt != null && (vt == "string" || vt == "object"
+            || vt == "ptr" || (vt.Length > 2 && vt.Substring(vt.Length - 2, 2) == "[]") || vt.IndexOf("List<") == 0
+            || vt.IndexOf("Dictionary<") == 0 || (vc != null && vc.isStruct == 0)
+            || IsDelegateTyNg(vt));
+        if (vt != "int" && vt != "long" && vt != "ulong" && vt != "nint"
+                && vt != "bool" && vt != "double" && !refValue && !structValue && !IsTypeParamErasedNg(vt)) {
+            diags.Error("ngen: unsupported Dictionary value type '" + vt
+                + "'; expected int, long, ulong, nint, bool, double or a reference (struct values are unsupported)", curLine, curCol);
+            return false;
+        }
+        return true;
+    }
+
+    // Optional call-site hook: reject reference/struct-to-int conversions
+    // before generation instead of silently narrowing an object address.
+    void DictCheckOperand(Node recv, Node arg, bool key) {
+        if (!DictCheckType(recv) || arg == null) { return; }
+        string target = DictSlotTy(recv, key);
+        string source = StaticTyOf(arg);
+        if (arg.kind == AK.StringLit()) { source = "string"; }
+        if (arg.kind == AK.NewExpr()) { source = TypeFullName(arg.type); }
+        if (target == "int" && (arg.kind == AK.NullLit() || IsStrExpr(arg)
+                || (source != null && source != "int" && source != "long"
+                && source != "ulong" && source != "nint" && source != "uint"
+                && source != "short" && source != "ushort" && source != "byte"
+                && source != "sbyte" && source != "char" && source != "bool"))) {
+            diags.Error("ngen: cannot convert Dictionary " + (key ? "key" : "value")
+                + " from '" + source + "' to int", arg.line, arg.col);
+        }
+        if (target == "string" && !IsStrExpr(arg) && arg.kind != AK.NullLit()) {
+            diags.Error("ngen: Dictionary string " + (key ? "key" : "value")
+                + " requires a string operand", arg.line, arg.col);
+        }
+        if (target == "long" && (arg.kind == AK.NullLit() || IsStrExpr(arg)
+                || (source != null && source != "int" && source != "long"
+                && source != "ulong" && source != "nint" && source != "uint"
+                && source != "short" && source != "ushort" && source != "byte"
+                && source != "sbyte" && source != "char"))) {
+            diags.Error("ngen: cannot convert Dictionary " + (key ? "key" : "value")
+                + " from '" + source + "' to long", arg.line, arg.col);
+        }
+    }
+
+    // new Dictionary<K, V>(): alloc 40+16, keys/vals calloc'd at cap 4
+    void GenDictNew(Node e) {
+        if (!DictCheckType(e)) { LoadImm(0, 0); return; }
+        // batch 12: a view as a dict key or value would outlive the method
+        // frame that owns its box (ref-struct shape)
+        if (SpanTyNg(DictSlotTy(e, true)) || SpanTyNg(DictSlotTy(e, false))) {
+            diags.Error("ngen: a Span view cannot be a Dictionary key or value (ref-struct shape)", e.line, e.col);
+            LoadImm(0, 0);
+            return;
+        }
+        int kinds = 0;
+        string kty = DictSlotTy(e, true);
+        if (kty == "int") { kinds = kinds | 1; }
+        else if (kty == "long" || kty == "nint") { kinds = kinds | 4; }
+        if (DictSlotTy(e, false) == "int") { kinds = kinds | 2; }
+        // calloc both arrays first, then the object; the arrays survive on
+        // the stack while the object allocates
+        LoadImm(0, 4);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                         // keys = calloc(4, 8)
+        XPushV0();                                   // push keys
+        LoadImm(0, 4);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                         // vals = calloc(4, 8)
+        XPushV0();                                   // push vals
+        LoadImm(0, 40 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");                 // obj = alloc (zeroed)
+        XPopV(1);                                    // pop vals -> x1
+        StrU(1, 0, 24);                              // obj->vals
+        XPopV(1);                                    // pop keys -> x1
+        StrU(1, 0, 16);                              // obj->keys
+        LoadImm(1, 4);
+        StrU(1, 0, 8);                               // obj->cap = 4
+        LoadImm(1, kinds);
+        StrU(1, 0, 32);                              // immutable key/value kinds
+        // collection initializer appends through the set path
+        if (e != null && e.ival == 2 && e.kids.Count > 0) {
+            XPushV0();                               // push dict
+            int j = 0;
+            while (j < e.kids.Count) {
+                Node kv = e.kids[j];
+                if (kv != null && kv.kids.Count >= 2) {
+                    DictCheckOperand(e, kv.kids[0], true);
+                    DictCheckOperand(e, kv.kids[1], false);
+                    LdrU(0, 31, 0);                  // x0 = dict (peek)
+                    GenExpr(kv.kids[0]);             // key -> x0
+                    XPushV0();                       // push key
+                    GenExpr(kv.kids[1]);             // value -> x0
+                    GenCloneIfStruct(kv.kids[1]);    // struct values: fresh box
+                    MovRR(2, 0);                     // x2 = value
+                    XPopV(1);                        // pop key -> x1
+                    XPopV(0);                        // pop dict -> x0
+                    BLInternal("_zan_rt_dict_set");
+                    XPushV0();                       // re-push dict
+                }
+                j = j + 1;
+            }
+            XPopV(0);                                // pop dict -> x0
+        }
+    }
+
+    // per-instantiation statics: every generic-class instantiation a body
+    // touched gets its own copy of the class's static fields (globals plus
+    // initializer entries), so Stat<int>.s and Stat<double>.s differ like
+    // gen0's per-instantiation storage
+    void MaterializeInstStatics() {
+        int ci = 0;
+        while (ci < instCls.Count) {
+            string inst = instCls[ci];
+            int lt = inst.IndexOf("<");
+            if (lt > 0) {
+                string open = inst.Substring(0, lt);
+                List<string> args = SplitTyArgs(inst.Substring(lt + 1, inst.Length - lt - 2));
+                Cls c = FindClass(open);
+                if (c != null) {
+                    int n0 = sfNames.Count;
+                    int i0 = sfInitCls.Count;
+                    int si = 0;
+                    while (si < n0) {
+                        if (sfCls[si] == open) {
+                            string dn = "fld." + inst + "." + sfNames[si];
+                            dglbs.Add(new DGlob(dn, 8, dataLen));
+                            dataLen = dataLen + 8;
+                            AddSf(sfNames[si], inst, DGlobalSym(dn), SubstTy(sfTy[si], c.tps, args));
+                            // clone this field's initializer, if any
+                            int j = 0;
+                            while (j < i0) {
+                                if (sfInitCls[j] == open && sfInitSym[j] == sfSyms[si]) {
+                                    Node ex = CloneNode(sfInitExpr[j]);
+                                    if (ex != null) { SubstTypeNode(ex, c.tps, args); }
+                                    sfInitCls.Add(inst);
+                                    sfInitSym.Add(DGlobalSym(dn));
+                                    sfInitExpr.Add(ex);
+                                    sfInitTy.Add(sfInitTy[j]);
+                                }
+                                j = j + 1;
+                            }
+                        }
+                        si = si + 1;
+                    }
+                }
+            }
+            ci = ci + 1;
+        }
+    }
+
+    // new T[count]: gen0's inline array allocation. Layout from the user
+    // pointer arr: count = i64 at arr-16, magic2 at arr-24, data at arr+0.
+    // raw = calloc(count*esz + 32): [raw]=rc 1, [raw+8]=25404552263127619,
+    // [raw+16]=count, [raw+24]=6503565379360670041. A negative count reports
+    // "negative array length" and then fails the overflow guard (which
+    // zeroes count, like gen0's select pair); a failed calloc reports and
+    // stores into null exactly like gen0's continue-after-guard flow.
+    void GenArrNew(Node countExpr, int esz) {
+        if (countExpr == null) {
+            LoadImm(0, 0);
+        } else {
+            GenExpr(countExpr);                          // x0 = count
+        }
+        // negative guard: report, keep the value (gen0's rt.cont keeps %0)
+        StringCmp(0, 31);                            // cmp x0, xzr
+        int okneg = NL();
+        EmitBcond(10, okneg);                        // b.ge okneg
+        XPushR(0);                                   // keep count
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrNeg, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        XPopV(0);                                    // pop count
+        Mark(okneg);
+        // total = count * esz; overflow = total > 2^64-33 (unsigned)
+        MovRR(1, 0);                                 // x1 = count
+        if (tgt86 == 1) {
+            // shl rdi, 2/3(v0 常驻 rdi;C1 /4 imm8 形态)
+            X1(0x48); X1(0xC1); X1(0xE7); X1(esz == 4 ? 2 : 3);
+        } else if (esz == 4) {
+            E4(0xD37EF400);                          // lsl x0, x0, #2
+        } else {
+            E4(0xD37DF000);                          // lsl x0, x0, #3
+        }
+        LoadImm(9, -33);                             // x9 = 0xFFFF...FFDF
+        StringCmp(0, 9);                             // cmp x0, x9
+        int okovf = NL();
+        EmitBcond(9, okovf);                         // b.ls okovf (unsigned <=)
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrOvf, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        LoadImm(0, 0);                               // safe total = 0
+        LoadImm(1, 0);                               // safe count = 0
+        Mark(okovf);
+        // bytes = total + 32; raw = calloc(bytes, 1)
+        AddImm(0, 0, 32);                            // add x0, x0, #32
+        XPushR(1);                                   // push count
+        LoadImm(1, 1);
+        BLExtern("_calloc");                         // x0 = raw
+        XPopV(1);                                    // pop count -> x1
+        // null guard: gen0 reports and continues into the stores
+        int okalloc = NL();
+        CbnzReg(0, okalloc);
+        LoadSymRef("l_.str." + guardFileIdx, 0);
+        LoadImm(1, curLine);
+        LoadImm(2, curCol);
+        LoadSymRef("l_.str." + guardArrFail, 3);
+        BLInternal("_zan_rt_guard_fail3");
+        Mark(okalloc);
+        XPushR(0);                                   // push raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                               // raw->rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                               // raw->rcmagic
+        StrU(1, 0, 16);                              // raw->count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                              // raw->magic2
+        XPopV(0);                                    // pop raw -> x0
+        AddImm(0, 0, 32);                            // add x0, x0, #32 (arr)
+    }
+
+    // list.Count: load field 0
+    void GenListCount(Node recv) {
+        GenExpr(recv);
+        LdrU(0, 0, 0);
+    }
+
+    // list.Add(v) inlined: grow when count == cap (cap*2, realloc data),
+    // then data[count++] = v -- mirrors gen0's inline Add sequence
+    // dict.Add / d[key] = v call tail: the stack holds dict (top), then
+    // key, then value; the str-only pushes leave each slot's upper half
+    // stale, so pop straight into the ABI registers: x0 = d, x1 = key,
+    // x2 = value for _zan_rt_dict_set.
+    void RtDictSet3() {
+        XPopV(0);                                    // pop dict -> x0
+        XPopV(1);                                    // pop key -> x1
+        XPopV(2);                                    // pop value -> x2
+        BLInternal("_zan_rt_dict_set");
+    }
+
+    void GenListAdd(Node recv, Node arg) {
+        GenExpr(recv);
+        XPushV0();                                   // push list
+        GenExpr(arg);
+        // List<double>.Add(3) coerces the int at the boundary (gen0's
+        // int-coerce path); the slot then carries the double bit pattern.
+        // List<int>.Add of a long-valued literal narrows to int32.
+        if (StaticTyOf(recv) == "List<double>" && !IsDblExpr(arg)) {
+            ConvI2D();
+        } else if (StaticTyOf(recv) == "List<int>" && !IsDblExpr(arg) && !IsStrExpr(arg)) {
+            Sxtw0();                          // sxtw x0, w0
+        } else if (StaticTyOf(recv) == "List<float>" && !IsStrExpr(arg)) {
+            // batch 29: float slots round on the way in -- but an int
+            // argument must widen BEFORE the round: NarrowF32 alone
+            // reinterprets the integer bits as a double bit pattern, and
+            // 2 became a denormal that rounds to 0.0f (kernel-gap: no
+            // golden covered List<float>.Add(int)). Double-valued args
+            // arrive as double bits, which NarrowF32 rounds idempotently.
+            if (!IsDblExpr(arg)) { ConvI2D(); }
+            NarrowF32();
+        }
+        GenCloneIfStruct(arg);                       // element copies by value
+        MovRR(1, 0);                                 // x1 = value
+        LdrU(0, 31, 0);                              // x0 = list (peek)
+        ListAppendRaw();
+        AddSPImm(16, true);                          // pop list
+    }
+
+    // ---- List<T> operation family (gen0-compatible inline sequences;
+    // layout: [list+0] count, [list+8] cap, [list+16] data of 8-byte slots) ----
+
+    // one shared prologue discipline: frame 32 below the saved pair
+    void RtListFrame(string name) {
+        syms.Add(new Sym(name, FnPad()));
+        RtPrologue();
+        AddSPImm(32, false);
+    }
+    void RtListReturn() {
+        AddSPImm(32, true);
+        RtEpilogue();
+    }
+
+    void RtDictReturn() {
+        RtLdur(19, 29, -8);
+        RtListReturn();
+    }
+
+    void RtEmitListOps() {
+        RtEmitListRemoveAt();
+        RtEmitListInsert();
+        RtEmitListReverse();
+        RtEmitListReserve();
+        RtEmitListIndexOf(false);
+        RtEmitListIndexOf(true);
+        RtEmitListAddRange();
+        RtEmitListToArray(8);
+        RtEmitListToArray(4);
+        RtEmitListToArray(2);
+        RtEmitListToArray(1);
+        RtEmitListToArrayF32();
+        RtEmitDictIndex();
+        RtEmitDictSet();
+        RtEmitDictGet();
+        RtEmitDictQuery();
+        RtEmitDictTryGet();
+        RtEmitDictKeysValues(16);
+        RtEmitDictKeysValues(24);
+    }
+
+    // Compare x0=stored key with x1=query, with d saved at fp-16.
+    // Return EQ flags; integer comparisons use their i32 values, never
+    // addresses. Full-width integer keys (kinds bit 2) compare as raw
+    // 64-bit words; string pointer equality also handles two null keys.
+    void RtDictCompareKey() {
+        RtLdur(9, 29, -16);
+        LdrU(9, 9, 32);
+        // batch 28: x86 的位测试走 r10(裸立即数 test),不经 LoadImm(10)
+        // ——v10 的泼溅家在 [rbp-24],恰好是调用方 RtStur(1,29,-24) 的
+        // key 槽;经 LoadImm(10) 落盘会把 key 踩成掩码,第二圈循环起全错
+        if (tgt86 == 1) { XLoadImm(16, 1); Xop(0x85, 0, 10); }   // mov r10,#1; test rax,r10
+        else { LoadImm(10, 1); E4(0xEA0A013F); }                 // tst x9, x10
+        int strings = NL(); int done = NL(); int different = NL(); int notint = NL();
+        EmitBcond(1, notint);                  // bit 0 set: int keys
+        if (tgt86 == 1) { XLoadImm(16, 4); Xop(0x85, 0, 10); }   // mov r10,#4; test rax,r10
+        else { LoadImm(10, 4); E4(0xEA0A013F); }                 // tst x9, x10
+        EmitBcond(0, strings);                 // bit 2 clear: string keys
+        if (tgt86 == 1) { Xop(0x39, 7, 6); } else { E4(0xEB01001F); }   // cmp x0, x1 (64-bit key)
+        EmitB(done);
+        Mark(notint);
+        if (tgt86 == 1) { X2(0x39, 0xFE); } else { E4(0x6B01001F); }   // cmp edi, esi (w0/w1)
+        EmitB(done);
+        Mark(strings);
+        if (tgt86 == 1) { Xop(0x39, 7, 6); } else { E4(0xEB01001F); }   // cmp x0, x1
+        EmitBcond(0, done);
+        CbzReg(0, different);
+        CbzReg(1, different);
+        BLExtern("_strcmp");
+        if (tgt86 == 1) { X2(0x85, 0xC0); } else { E4(0x7100001F); }   // test eax,eax (cmp w0,#0)
+        EmitB(done);
+        Mark(different);
+        if (tgt86 == 1) { Xop(0x39, 7, 6); } else { E4(0xEB01001F); }   // unequal pointers, one null
+        Mark(done);
+    }
+
+    // Canonicalize typed slots at the shared set boundary (x0=d).
+    // Applies to Add, index assignment, and collection initializers alike.
+    void RtDictNarrowSlots() {
+        LdrU(9, 0, 32);
+        if (tgt86 == 1) { XLoadImm(16, 1); Xop(0x85, 0, 10); }   // test rax, 1
+        else { LoadImm(10, 1); E4(0xEA0A013F); }                 // tst x9, x10
+        int keyDone = NL(); int valDone = NL(); int key64 = NL();
+        EmitBcond(0, key64);                   // bit 0 clear: not int keys
+        if (tgt86 == 1) { X3(0x48, 0x63, 0xF6); } else { E4(0x93407C21); }   // movsxd rsi,esi / sxtw x1, w1
+        EmitB(keyDone);
+        Mark(key64);
+        if (tgt86 == 1) { XLoadImm(16, 4); Xop(0x85, 0, 10); }   // test rax, 4
+        else { LoadImm(10, 4); E4(0xEA0A013F); }
+        EmitBcond(0, keyDone);                 // bit 2 clear: string keys stay raw
+        Mark(keyDone);
+        if (tgt86 == 1) { XLoadImm(16, 2); Xop(0x85, 0, 10); }   // test rax, 2
+        else { LoadImm(10, 2); E4(0xEA0A013F); }
+        EmitBcond(0, valDone);
+        if (tgt86 == 1) { X3(0x48, 0x63, 0xD2); } else { E4(0x93407C42); }   // movsxd rdx,edx / sxtw x2, w2
+        Mark(valDone);
+    }
+
+    // i64 _zan_rt_dict_index(ptr d, slot key): linear walk, -1 on miss
+    void RtEmitDictIndex() {
+        RtListFrame("_zan_rt_dict_index");
+        RtStur(0, 29, -16);                    // d
+        RtStur(1, 29, -24);                    // key
+        RtStur(19, 29, -8);
+        LoadImm(19, 0);
+        int head = NL();
+        Mark(head);
+        RtLdur(0, 29, -16);
+        LdrU(2, 0, 0);
+        // batch 28:x86 的 i 常驻 v19 槽位([rbp-72],槽位互不冲突),比
+        // 较前经 r10 暂存;三处循环同款(Index/Set/Get)
+        if (tgt86 == 1) { XGetV(19, 10); Xop(0x39, 2, 10); } else { E4(0xEB00005F | (19 << 16)); }   // cmp count, i
+        int notfound = NL();
+        EmitBcond(9, notfound);                // b.ls -> miss (i >= count)
+        RtLdur(4, 29, -16);
+        LdrU(4, 4, 16);                        // keys (x4 is caller-saved: strcmp clobbers it)
+        EmitArrElemLoad(8, "long", 4, 19, 0);  // ldr x0, [x4, x19, lsl #3]
+        RtLdur(1, 29, -24);                    // key
+        RtDictCompareKey();
+        int found = NL();
+        EmitBcond(0, found);                   // b.eq -> found
+        RtLdur(0, 29, -16);
+        AddImm(19, 19, 1);                     // i++
+        EmitB(head);
+        Mark(found);
+        MovRR(0, 19);                          // x0 = i (the index)
+        RtDictReturn();
+        Mark(notfound);
+        LoadImm(0, -1);
+        RtDictReturn();
+    }
+
+    // grow keys/vals in tandem when count == cap: cap *= 2 (0 -> 4 first)
+    // x0 = d on entry; RtStur list must be live at [x29, -16]
+    void DictGrow() {
+        LdrU(2, 0, 0);                         // count
+        LdrU(3, 0, 8);                         // cap
+        int have = NL(); int allocate = NL(); int done = NL();
+        CbnzReg(3, have);
+        LoadImm(3, 4);                        // zero-cap dict needs initial allocation
+        EmitB(allocate);
+        Mark(have);
+        if (tgt86 == 1) { Xop(0x39, 2, 1); } else { E4(0xEB03005F); }   // cmp count(x2), cap(x3)
+        EmitBcond(3, done);                    // b.lo -> space remains
+        AddRR(3, 3, 3);                        // ncap = cap * 2
+        Mark(allocate);
+        StrU(3, 0, 8);                         // d->cap = ncap
+        LdrU(4, 0, 16);                        // old keys
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // x9 = ncap * 8
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        RtLdur(5, 29, -16);                    // d (realloc clobbers x0)
+        StrU(0, 5, 16);                        // d->keys
+        RtLdur(5, 29, -16);
+        LdrU(4, 5, 24);                        // old vals
+        LdrU(9, 5, 8);                         // realloc does not preserve x9
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        RtLdur(5, 29, -16);
+        StrU(0, 5, 24);                        // d->vals
+        Mark(done);
+    }
+
+    // void _zan_rt_dict_set(ptr d, ptr key, i64 val): insert or update
+    void RtEmitDictSet() {
+        RtListFrame("_zan_rt_dict_set");
+        RtDictNarrowSlots();
+        RtStur(0, 29, -16);                    // d
+        RtStur(1, 29, -24);                    // key
+        RtStur(2, 29, -32);                    // val
+        RtStur(19, 29, -8);
+        LoadImm(19, 0);
+        int head = NL();
+        Mark(head);
+        RtLdur(0, 29, -16);
+        LdrU(2, 0, 0);
+        if (tgt86 == 1) { XGetV(19, 10); Xop(0x39, 2, 10); } else { E4(0xEB00005F | (19 << 16)); }   // cmp count, i
+        int insert = NL();
+        EmitBcond(9, insert);                  // b.ls -> append (i >= count)
+        RtLdur(4, 29, -16);
+        LdrU(4, 4, 16);                        // keys (x4 is caller-saved: strcmp clobbers it)
+        EmitArrElemLoad(8, "long", 4, 19, 0);  // keys[i]
+        RtLdur(1, 29, -24);
+        RtDictCompareKey();
+        int upd = NL();
+        EmitBcond(0, upd);                     // b.eq -> update
+        RtLdur(0, 29, -16);
+        AddImm(19, 19, 1);
+        EmitB(head);
+        Mark(upd);
+        RtLdur(0, 29, -16);
+        LdrU(4, 0, 24);                        // vals
+        RtLdur(2, 29, -32);
+        // str x2, [x4, x19, lsl #3]:x86 = mov [r8+r10*8], rdx(SIB 11_010_000,
+        // REX W|X|B = 4B——批 27 的 REX.X 课文这里逐位落实)
+        if (tgt86 == 1) { XGetV(19, 10); X4(0xD014894B); } else { E4(0xF8207880 | (19 << 16) | (4 << 5) | 2); }
+        RtDictReturn();
+        Mark(insert);
+        RtLdur(0, 29, -16);
+        DictGrow();
+        RtLdur(0, 29, -16);
+        LdrU(2, 0, 0);                         // count
+        LdrU(3, 0, 16);                        // keys
+        RtLdur(1, 29, -24);
+        // keys[count] = key:x86 = mov [rcx+rdx*8], rsi(三个都是真寄存器,零暂存)
+        if (tgt86 == 1) { X4(0xD1348948); } else { E4(0xF8207800 | (2 << 16) | (3 << 5) | 1); }
+        RtLdur(0, 29, -16);
+        LdrU(3, 0, 24);                        // vals
+        RtLdur(4, 29, -32);                    // value
+        // vals[count] = value:x86 = mov [rcx+rdx*8], r8(src=r8 需 REX.R = 4C)
+        if (tgt86 == 1) { X4(0xD104894C); } else { E4(0xF8207800 | (2 << 16) | (3 << 5) | 4); }
+        AddImm(2, 2, 1);
+        RtLdur(0, 29, -16);
+        StrU(2, 0, 0);                         // d->count = count + 1
+        RtDictReturn();
+    }
+
+    // i64 _zan_rt_dict_get(ptr d, ptr key): 0 on miss (zero-value semantics)
+    void RtEmitDictGet() {
+        RtListFrame("_zan_rt_dict_get");
+        RtStur(0, 29, -16);
+        RtStur(1, 29, -24);
+        RtStur(19, 29, -8);
+        LoadImm(19, 0);
+        int head = NL();
+        Mark(head);
+        RtLdur(0, 29, -16);
+        LdrU(2, 0, 0);
+        if (tgt86 == 1) { XGetV(19, 10); Xop(0x39, 2, 10); } else { E4(0xEB00005F | (19 << 16)); }   // cmp count, i
+        int miss = NL();
+        EmitBcond(9, miss);
+        RtLdur(4, 29, -16);
+        LdrU(4, 4, 16);                        // keys (x4 is caller-saved: strcmp clobbers it)
+        EmitArrElemLoad(8, "long", 4, 19, 0);  // keys[i]
+        RtLdur(1, 29, -24);
+        RtDictCompareKey();
+        int hit = NL();
+        EmitBcond(0, hit);                     // b.eq -> found
+        RtLdur(0, 29, -16);
+        AddImm(19, 19, 1);                     // i++
+        EmitB(head);
+        Mark(hit);
+        RtLdur(0, 29, -16);
+        LdrU(4, 0, 24);                        // vals
+        EmitArrElemLoad(8, "long", 4, 19, 0);  // vals[i]
+        RtDictReturn();
+        Mark(miss);
+        LoadImm(0, 0);
+        RtDictReturn();
+    }
+
+    // i64 _zan_rt_dict_contains / _dict_remove / _dict_clear, plus
+    // _dict_tryget and the Keys/Values snapshot builders
+    void RtEmitDictQuery() {
+        // i64 _zan_rt_dict_contains(ptr d, ptr key): 1 when index >= 0
+        RtListFrame("_zan_rt_dict_contains");
+        RtStur(0, 29, -16);
+        RtStur(1, 29, -24);
+        RtLdur(0, 29, -16);
+        RtLdur(1, 29, -24);
+        BLInternal("_zan_rt_dict_index");
+        // cmp x0,#0 + cset x0,ge:x86 = cmp rdi,0; setge al; movzx rdi,al
+        if (tgt86 == 1) { X3(0x48, 0x83, 0xF8); X1(0); XSetV0cc(0x9D); }
+        else { E4(0xF100001F); E4(0x9A9FB7E0); }
+        RtListReturn();
+
+        // i64 _zan_rt_dict_remove(ptr d, ptr key): 1 when removed, 0 on miss;
+        // both columns shift LEFT from idx (list_removeat shape), count -= 1
+        RtListFrame("_zan_rt_dict_remove");
+        RtStur(0, 29, -16);                    // d
+        RtStur(1, 29, -24);                    // key
+        RtLdur(0, 29, -16);
+        RtLdur(1, 29, -24);
+        BLInternal("_zan_rt_dict_index");
+        if (tgt86 == 1) { X3(0x48, 0x83, 0xF8); X1(0); } else { E4(0xF100001F); }   // cmp x0(idx), #0 / cmp rdi,0
+        int miss = NL();
+        EmitBcond(11, miss);                   // b.lt -> not found
+        RtStur(0, 29, -32);                    // idx
+        // keys: dst = keys + idx*8, src = dst + 8, n = (count - idx - 1)*8
+        RtLdur(0, 29, -16);
+        LdrU(3, 0, 16);                        // keys
+        RtLdur(1, 29, -32);
+        if (tgt86 == 1) { X4(0xF13C8D48); } else { E4(0x8B000000 | (1 << 16) | (3 << 10) | (3 << 5) | 0); } // add x0,x3,x1,lsl#3 / lea rdi,[rcx+rsi*8]
+        AddImm(1, 0, 8);                       // src = dst + 8
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);                         // count
+        RtLdur(9, 29, -32);
+        if (tgt86 == 1) { Xop(0x29, 2, 0); } else { E4(0xCB000000 | (9 << 16) | (2 << 5) | 2); } // sub x2, x2, x9(idx) / sub rdx,rax
+        SubImm(2, 2, 1);
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2,x2,#3 / shl rdx,3
+        BLExtern("_memmove");
+        // vals: same shift on the parallel column
+        RtLdur(0, 29, -16);
+        LdrU(3, 0, 24);                        // vals
+        RtLdur(1, 29, -32);
+        if (tgt86 == 1) { X4(0xF13C8D48); } else { E4(0x8B000000 | (1 << 16) | (3 << 10) | (3 << 5) | 0); } // add x0,x3,x1,lsl#3 / lea rdi,[rcx+rsi*8]
+        AddImm(1, 0, 8);
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        RtLdur(9, 29, -32);
+        if (tgt86 == 1) { Xop(0x29, 2, 0); } else { E4(0xCB000000 | (9 << 16) | (2 << 5) | 2); } // sub x2, x2, x9 / sub rdx,rax
+        SubImm(2, 2, 1);
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2,x2,#3 / shl rdx,3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);
+        LdrU(2, 0, 0);
+        SubImm(2, 2, 1);
+        StrU(2, 0, 0);                         // count - 1
+        LoadImm(0, 1);
+        RtListReturn();
+        Mark(miss);
+        LoadImm(0, 0);
+        RtListReturn();
+
+        // void _zan_rt_dict_clear(ptr d): Count folds to 0; the arrays stay
+        // allocated (a later Add overwrites slots from 0)
+        RtListFrame("_zan_rt_dict_clear");
+        StrU(31, 0, 0);                        // d->count = 0 (xzr)
+        RtListReturn();
+    }
+
+    // i64 _zan_rt_dict_tryget(ptr d, ptr key, ptr out): *out = value and 1
+    // when found; a miss leaves the out slot unchanged, matching gen0
+    void RtEmitDictTryGet() {
+        RtListFrame("_zan_rt_dict_tryget");
+        RtStur(0, 29, -16);                    // d
+        RtStur(1, 29, -24);                    // key
+        RtStur(2, 29, -32);                    // out
+        RtLdur(0, 29, -16);
+        RtLdur(1, 29, -24);
+        BLInternal("_zan_rt_dict_index");
+        if (tgt86 == 1) { X3(0x48, 0x83, 0xF8); X1(0); } else { E4(0xF100001F); }   // cmp x0(idx), #0 / cmp rdi,0
+        int miss = NL();
+        EmitBcond(11, miss);
+        RtLdur(1, 29, -16);
+        LdrU(1, 1, 24);                        // vals
+        EmitArrElemLoad(8, "long", 1, 0, 0);   // ldr x0, [x1, x0, lsl #3]
+        RtLdur(1, 29, -32);                    // out
+        StrU(0, 1, 0);                         // *out = value
+        LoadImm(0, 1);
+        RtListReturn();
+        Mark(miss);
+        LoadImm(0, 0);
+        RtListReturn();
+    }
+
+    // ptr _zan_rt_dict_keys / _dict_values: a fresh List whose slots are a
+    // copy of the dict's key (offset 16) or value (offset 24) column
+    void RtEmitDictKeysValues(int colOff) {
+        RtListFrame(colOff == 16 ? "_zan_rt_dict_keys" : "_zan_rt_dict_values");
+        RtStur(0, 29, -16);                    // d
+        LoadImm(0, 24 + 16);
+        LoadImm(1, 0);
+        BLInternal("_zan_rt_alloc");           // x0 = obj (zeroed)
+        XPushV0();                             // push obj
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);                         // count (reload; alloc clobbers)
+        RtStur(2, 29, -24);                    // count
+        int nz = NL();
+        CbnzReg(2, nz);
+        LoadImm(2, 1);                         // cap = count > 0 ? count : 1
+        Mark(nz);
+        MovRR(0, 2);
+        LoadImm(1, 8);
+        BLExtern("_calloc");                   // x0 = data
+        XPushV0();                             // push data
+        LdrU(9, 31, 16);                       // x9 = obj (data on top)
+        RtLdur(2, 29, -24);                    // count (reload; calloc clobbers x2)
+        StrU(2, 9, 0);                         // obj->count
+        StrU(2, 9, 8);                         // obj->cap = count
+        LdrU(3, 31, 0);                        // data
+        StrU(3, 9, 16);                        // obj->data
+        // memcpy(data, column, count * 8) — size 0 when the dict is empty
+        MovRR(0, 3);
+        RtLdur(1, 29, -16);
+        LdrU(1, 1, colOff);
+        RtLdur(2, 29, -24);
+        LoadImm(3, 8);
+        if (tgt86 == 1) { X3(0x48, 0x0F, 0xAF); X1(0xD1); } else { E4(0x9B037C42); }   // mul x2,x2,x3 / imul rdx,rcx
+        BLExtern("_memcpy");
+        XPopV(0);                              // pop data (discard)
+        XPopV(0);                              // pop obj -> x0
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_removeat(ptr list, i64 idx): an out-of-range idx
+    // leaves the list untouched
+    void RtEmitListRemoveAt() {
+        RtListFrame("_zan_rt_list_removeat");
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int ok = NL();
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp x3(idx), x2(count)
+        EmitBcond(3, ok);                      // b.lo (unsigned: negatives fail)
+        RtListReturn();
+        Mark(ok);
+        LdrU(4, 0, 16);                        // data
+        RtLdur(3, 29, -24);
+        // x0 = data + idx*8 (dst), x1 = x0 + 8 (src): elements shift LEFT
+        if (tgt86 == 1) { X4(0xC83C8D49); } else { E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 0); }   // add x0,x4,x3,lsl#3 / lea rdi,[r8+rcx*8]
+        AddImm(1, 0, 8);
+        // x2 = (count - idx - 1) * 8
+        if (tgt86 == 1) { X3(0x48, 0x29, 0xCA); } else { E4(0xCB030042); }   // sub x2, x2, x3
+        SubImm(2, 2, 1);
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2, x2, #3 / shl rdx,3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        LdrU(2, 0, 0);
+        SubImm(2, 2, 1);
+        StrU(2, 0, 0);                         // count - 1
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_insert(ptr list, i64 idx, i64 value): idx == count
+    // appends; out of range leaves the list untouched
+    void RtEmitListInsert() {
+        RtListFrame("_zan_rt_list_insert");
+        AddSPImm(16, false);                   // value@-32 (frame 48 total)
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // idx
+        RtStur(2, 29, -32);                    // value
+        LdrU(2, 0, 0);                         // count
+        RtLdur(3, 29, -24);
+        int oki = NL();
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp idx,count / cmp rcx,rdx
+        EmitBcond(3, oki);                     // b.lo ok (idx < count)
+        if (tgt86 == 1) { Xop(0x39, 1, 2); } else { E4(0xEB02007F); }   // cmp idx, count
+        EmitBcond(0, oki);                     // b.eq ok (idx == count)
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(oki);
+        LdrU(6, 0, 0);
+        AddImm(6, 6, 1);                       // wanted = count + 1
+        ListGrow();
+        RtLdur(0, 29, -16);                    // x0 = list (ListGrow clobbers x0)
+        // shift: memmove(data + (idx+1)*8, data + idx*8, (count - idx) * 8)
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        if (tgt86 == 1) { XGetV(3, 10); X4(0xC8348D49); } else { E4(0x8B000000 | (3 << 16) | (3 << 10) | (4 << 5) | 1); }   // x1 = data + idx*8 / lea rsi,[r8+rcx*8]
+        AddImm(0, 1, 8);                       // x0 = x1 + 8
+        RtLdur(2, 29, -16);                    // x2 = list (x0 is dst now)
+        LdrU(2, 2, 0);                         // count
+        if (tgt86 == 1) { Xop(0x29, 2, 1); } else { E4(0xCB030042); }   // sub x2,x2,x3 / sub rdx,rcx
+        if (tgt86 == 1) { X4(0x03E2C148); } else { E4(0xD37DF042); }   // lsl x2,x2,#3 / shl rdx,3
+        BLExtern("_memmove");
+        RtLdur(0, 29, -16);                    // x0 = list (memmove returns dst)
+        // data[idx] = value; count + 1
+        LdrU(4, 0, 16);
+        RtLdur(3, 29, -24);
+        RtLdur(6, 29, -32);
+        // str x6, [x4, x3, lsl #3]:x86 = mov [r8+rcx*8], r10——REX = W|R|B
+        // = 4D(R 是 bit2=4!首写成 4B=W|X|B:源变 rdx、下标变垃圾 r9,
+        // Rosetta 直接 UE;capstone 反汇编 4919 当场抓获)
+        if (tgt86 == 1) { XGetV(6, 10); X4(0xC814894D); } else { E4(0xF8207800 | (3 << 16) | (4 << 5) | 6); }   // str x6,[x4,x3,lsl#3] / mov [r8+rcx*8],r10
+        LdrU(2, 0, 0);
+        AddImm(2, 2, 1);
+        StrU(2, 0, 0);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // grow the list in x0 until cap >= x6 (the wanted count): doubles from 4
+    // and reallocs; list lives at [x29-16]. Clobbers x2..x5, x9, x0, x1 --
+    // reload pointers from the frame afterwards.
+    void ListGrow() {
+        LdrU(2, 0, 0);                         // count
+        LdrU(3, 0, 8);                         // cap
+        int have = NL();
+        CbnzReg(3, have);
+        LoadImm(3, 4);                         // first growth from zero
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 1, 10); } else { E4(0xEB06007F); }   // cmp cap,wanted / cmp rcx,r10
+        EmitBcond(8, grown);                   // b.hi cap > wanted: done
+        AddRR(3, 3, 3);                        // cap *= 2
+        EmitB(chk);
+        Mark(grown);
+        StrU(3, 0, 8);                         // list->cap
+        LdrU(4, 0, 16);                        // old data
+        MovRR(9, 3);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // x9 = cap * 8
+        MovRR(0, 4);
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        RtLdur(5, 29, -16);                    // list
+        StrU(0, 5, 16);                        // list->data
+    }
+
+    // void _zan_rt_list_reserve(ptr list, i64 want): pre-grow the backing
+    // buffer so the next adds never realloc; want <= cap (including any
+    // negative request) leaves the list untouched
+    void RtEmitListReserve() {
+        RtListFrame("_zan_rt_list_reserve");
+        RtStur(0, 29, -16);                    // list
+        RtStur(1, 29, -24);                    // want
+        LdrU(6, 0, 8);                         // x6 = cap
+        RtLdur(2, 29, -24);                    // x2 = want
+        int done = NL();
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 10, 2); } else { E4(0xEB020000 | (2 << 16) | (6 << 5) | 31); }   // cmp cap,want / cmp r10,rdx
+        EmitBcond(8, done);                    // b.hi cap > want
+        EmitBcond(0, done);                    // b.eq cap == want
+        MovRR(6, 2);                           // wanted = want
+        ListGrow();                            // grow + realloc (caps at >= want)
+        Mark(done);
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_reverse(ptr list)
+    void RtEmitListReverse() {
+        RtListFrame("_zan_rt_list_reverse");
+        RtStur(0, 29, -16);
+        LdrU(2, 0, 0);                         // count
+        LoadImm(3, 2);
+        int go = NL();
+        if (tgt86 == 1) { Xop(0x39, 2, 1); } else { E4(0xEB03005F); }   // cmp count,2 / cmp rdx,rcx
+        EmitBcond(10, go);                     // b.ge (>= 2)
+        RtListReturn();
+        Mark(go);
+        LdrU(4, 0, 16);                        // data
+        LoadImm(5, 0);                         // x5 = i = 0 (same arm64 word)
+        SubImm(6, 2, 1);                       // x6 = j = count - 1
+        int lp2 = NL();
+        int fin = NL();
+        Mark(lp2);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 9, 10); } else { E4(0xEB0600BF); }   // cmp i,j / cmp r9,r10
+        EmitBcond(10, fin);                    // b.ge done
+        EmitArrElemLoad(8, "long", 4, 5, 7);   // x7 = data[i]
+        EmitArrElemLoad(8, "long", 4, 6, 8);   // x8 = data[j]
+        if (tgt86 == 1) { XGetV(8, 10); X4(0xC814894F); } else { E4(0xF8207800 | (5 << 16) | (4 << 5) | 8); }   // data[i]=x8 / mov [r8+r9*8],r10
+        if (tgt86 == 1) { XGetV(7, 10); XGetV(6, 11); X4(0xD814894F); } else { E4(0xF8207800 | (6 << 16) | (4 << 5) | 7); }   // data[j]=x7 / mov [r8+r11*8],r10
+        AddImm(5, 5, 1);
+        SubImm(6, 6, 1);
+        EmitB(lp2);
+        Mark(fin);
+        RtListReturn();
+    }
+
+    // i64 _zan_rt_list_indexof[_str](ptr list, i64 value): first equal slot,
+    // or -1; the _str form compares strings by value
+    void RtEmitListIndexOf(bool strForm) {
+        RtListFrame(strForm ? "_zan_rt_list_indexof_str" : "_zan_rt_list_indexof");
+        RtStur(0, 29, -16);
+        RtStur(1, 29, -24);
+        LdrU(4, 0, 16);                        // data
+        LdrU(5, 0, 0);                         // count
+        RtLdur(7, 29, -24);                    // value
+        LoadImm(6, 0);                         // i = 0 (same arm64 word)
+        RtStur(6, 29, -32);
+        int lp = NL();
+        int miss = NL();
+        int hit = NL();
+        Mark(lp);
+        RtLdur(0, 29, -16);
+        LdrU(4, 0, 16);
+        LdrU(5, 0, 0);
+        RtLdur(7, 29, -24);
+        RtLdur(6, 29, -32);
+        if (tgt86 == 1) { XGetV(6, 10); Xop(0x39, 10, 9); } else { E4(0xEB0500DF); }   // cmp i,count / cmp r10,r9
+        EmitBcond(10, miss);                   // b.ge -> -1
+        EmitArrElemLoad(8, "long", 4, 6, 0);   // x0 = data[i]
+        if (strForm) {
+            MovRR(1, 7);
+            BLExtern("_strcmp");
+            if (tgt86 == 1) { X2(0x85, 0xC0); } else { E4(0x7100001F); }   // cmp w0,#0 / test eax,eax
+            EmitBcond(0, hit);
+        } else {
+            if (tgt86 == 1) { XGetV(7, 10); Xop(0x39, 7, 10); } else { E4(0xEB07001F); }   // cmp x0,value / cmp rdi,r10
+            EmitBcond(0, hit);
+        }
+        RtLdur(6, 29, -32);
+        AddImm(6, 6, 1);
+        RtStur(6, 29, -32);
+        EmitB(lp);
+        Mark(miss);
+        LoadImm(0, -1);
+        RtListReturn();
+        Mark(hit);
+        RtLdur(0, 29, -32);
+        RtListReturn();
+    }
+
+    // void _zan_rt_list_addrange(ptr dst, ptr src): appends every src slot;
+    // self-append is safe (reads [0, oldCount), writes [oldCount, ...)).
+    // State lives in callee-saved x19-x23 (realloc/memcpy preserve them),
+    // so there are no frame-slot reloads to get out of sync.
+    void RtEmitListAddRange() {
+        syms.Add(new Sym("_zan_rt_list_addrange", FnPad()));
+        RtPrologue();
+        AddSPImm(48, false);                   // saves: x19@-16..x23@-48
+        RtStur(19, 29, -16);
+        RtStur(20, 29, -24);
+        RtStur(21, 29, -32);
+        RtStur(22, 29, -40);
+        RtStur(23, 29, -48);
+        MovRR(19, 0);                          // x19 = dst
+        MovRR(20, 1);                          // x20 = src
+        CbzReg(20, NL());
+        int snul = lblPos.Count - 1;
+        LdrU(21, 20, 0);                       // x21 = n
+        CbzReg(21, snul);
+        // grow dst until cap >= count + n
+        LdrU(22, 19, 0);                       // x22 = wanted = count
+        AddRR(22, 22, 21);
+        LdrU(23, 19, 8);                       // x23 = cap
+        int have = NL();
+        CbnzReg(23, have);
+        LoadImm(23, 4);
+        Mark(have);
+        int chk = NL();
+        int grown = NL();
+        Mark(chk);
+        if (tgt86 == 1) { XGetV(23, 10); XGetV(22, 11); Xop(0x39, 10, 11); } else { E4(0xEB000000 | (22 << 16) | (23 << 5) | 31); }   // cmp cap,wanted / cmp r10,r11
+        EmitBcond(8, grown);                   // b.hi
+        AddRR(23, 23, 23);
+        EmitB(chk);
+        Mark(grown);
+        StrU(23, 19, 8);                       // dst->cap
+        LdrU(0, 19, 16);                       // old data
+        MovRR(9, 23);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);
+        AddRR(9, 9, 9);                        // cap * 8
+        MovRR(1, 9);
+        BLExtern("_realloc");
+        StrU(0, 19, 16);                       // dst->data
+        // memcpy(dst->data + count*8, src->data, n*8)
+        LdrU(4, 19, 16);
+        LdrU(6, 19, 0);
+        // add x0,x4,x6,lsl#3 三操作数直写 x0(m memcpy 第一参数);x86 的 lea
+        // 是二操作数,目的必须显式落 rdi——首版写成 lea rax,rdi 仍是 realloc
+        // 返回值,memcpy 落在 data 起点而不是 data+count(第二次 AddRange 把
+        // 前 count 个同值覆写、后 n 个不写,索引读出 10,20,30,40,0,0,0,0)
+        if (tgt86 == 1) { XGetV(6, 10); X4(0xD03C8D4B); } else { E4(0x8B000000 | (6 << 16) | (3 << 10) | (4 << 5) | 0); }   // x0 = dstdata+count*8 / lea rdi,[r8+r10*8]
+        LdrU(1, 20, 16);
+        if (tgt86 == 1) { XGetV(21, 2); X4(0x03E2C148); } else { E4(0xD37DF000 | (21 << 5) | 2); }   // lsl x2,x21,#3 / shl rdx,3
+        BLExtern("_memcpy");
+        // dst.count += n
+        LdrU(3, 19, 0);
+        AddRR(3, 3, 21);
+        StrU(3, 19, 0);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+        Mark(snul);
+        RtLdur(19, 29, -16);
+        RtLdur(20, 29, -24);
+        RtLdur(21, 29, -32);
+        RtLdur(22, 29, -40);
+        RtLdur(23, 29, -48);
+        AddSPImm(48, true);
+        RtEpilogue();
+    }
+
+    // List<T>.ToArray() per packed element size (float has its own face):
+    // the list's slots are always 8 bytes wide, but the RESULT array packs
+    // the static element size (long/double/string/object = 8, int/uint/
+    // char = 4, short/ushort = 2, bool/byte/sbyte = 1). esz==8 is a flat
+    // memcpy; esz<8 repacks element-by-element like toarray_f32. The first
+    // cut memcpy'd count*8 bytes for every type -- reading the result as
+    // int[] then yields interleaved zeros (10,0,20,0,...) on BOTH lanes;
+    // the arm64 reference shipped the same wrong bytes, so the fixture was
+    // green while self-consistent, not while correct.
+    void RtEmitListToArray(int esz) {
+        string face = "_zan_rt_list_toarray";
+        if (esz == 4) { face = "_zan_rt_list_toarray4"; }
+        else if (esz == 2) { face = "_zan_rt_list_toarray2"; }
+        else if (esz == 1) { face = "_zan_rt_list_toarray1"; }
+        RtListFrame(face);
+        RtStur(0, 29, -16);
+        LdrU(20, 0, 0);                        // x20 = n (callee-saved; calloc preserves)
+        MovRR(4, 20);
+        if (esz == 8) { AddRR(4, 4, 4); }
+        if (esz >= 4) { AddRR(4, 4, 4); }
+        if (esz >= 2) { AddRR(4, 4, 4); }      // x4 = n*esz
+        AddImm(4, 4, 32);                      // bytes = n*esz + 32
+        MovRR(0, 4);
+        LoadImm(1, 1);
+        BLExtern("_calloc");                   // raw
+        MovRR(23, 0);                          // x23 = raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        if (esz == 8) {
+            // memcpy(raw + 32, data, n * 8) -- all helpers, no raw shifts
+            AddImm(0, 23, 32);                 // dst
+            RtLdur(1, 29, -16);
+            LdrU(1, 1, 16);                    // src = list->data
+            MovRR(2, 20);
+            AddRR(2, 2, 2);
+            AddRR(2, 2, 2);
+            AddRR(2, 2, 2);                    // n*8
+            BLExtern("_memcpy");
+        } else {
+            RtLdur(21, 29, -16);
+            LdrU(21, 21, 16);                  // x21 = data
+            AddImm(19, 23, 32);                // x19 = dst
+            LoadImm(22, 0);                    // x22 = i
+            int loop = NL();
+            int done = NL();
+            Mark(loop);
+            if (tgt86 == 1) { XGetV(22, 10); XGetV(20, 11); Xop(0x39, 10, 11); } else { E4(0xEB1402DF); }   // cmp i,n
+            EmitBcond(10, done);
+            EmitArrElemLoad(8, "long", 21, 22, 9);   // qword slot -> x9/rax
+            MovRR(11, 22);
+            if (esz >= 4) { AddRR(11, 11, 11); }
+            if (esz >= 2) { AddRR(11, 11, 11); }     // x11 = i*esz (byte offset)
+            if (esz == 4) {
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048943); } else { E4(0xB8206A00 | (11 << 16) | (19 << 5) | 9); }   // str w9,[x19,x11] / mov [r10+r11],eax
+            } else if (esz == 2) {
+                // STRH(register) 基址 0x78206800:bits15:10 = 011 0 10,写成
+                // …6000 时 bits11:10=00 会落进原子类(ldumaxh),存储变读
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X1(0x66); X4(0x1A048943); } else { E4(0x78206800 | (11 << 16) | (19 << 5) | 9); }   // strh w9,[x19,x11] / mov word [r10+r11],ax
+            } else {
+                if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048843); } else { E4(0x38206800 | (11 << 16) | (19 << 5) | 9); }   // strb w9,[x19,x11] / mov byte [r10+r11],al
+            }
+            AddImm(22, 22, 1);
+            EmitB(loop);
+            Mark(done);
+        }
+        AddImm(0, 23, 32);                     // arr = raw + 32
+        RtListReturn();
+    }
+
+    // List<float>.ToArray(): repack the 8-byte widened-double slots into a
+    // real packed float[] (4-byte single bits), like the reference host
+    void RtEmitListToArrayF32() {
+        RtListFrame("_zan_rt_list_toarray_f32");
+        RtStur(0, 29, -16);
+        LdrU(20, 0, 0);                        // x20 = n (callee-saved; calloc preserves)
+        AddRR(4, 20, 20);                      // x4 = n*4
+        AddRR(4, 4, 4);
+        AddImm(4, 4, 32);                      // bytes = n*4 + 32
+        MovRR(0, 4);
+        LoadImm(1, 1);
+        BLExtern("_calloc");
+        MovRR(23, 0);                          // x23 = raw
+        LoadImm(2, 1);
+        StrU(2, 0, 0);                         // rc = 1
+        LoadImm(2, 25404552263127619);
+        StrU(2, 0, 8);                         // rcmagic
+        RtLdur(2, 29, -16);
+        LdrU(2, 2, 0);
+        StrU(2, 0, 16);                        // count
+        LoadImm(2, 6503565379360670041);
+        StrU(2, 0, 24);                        // magic2
+        RtLdur(21, 29, -16);
+        LdrU(21, 21, 16);                      // x21 = data
+        AddImm(19, 23, 32);                    // x19 = dst (raw + 32)
+        LoadImm(22, 0);                        // x22 = i
+        int loop = NL();
+        int done = NL();
+        Mark(loop);
+        if (tgt86 == 1) { XGetV(22, 10); XGetV(20, 11); Xop(0x39, 10, 11); } else { E4(0xEB1402DF); }   // cmp i,n / cmp r10,r11
+        EmitBcond(10, done);
+        EmitArrElemLoad(8, "long", 21, 22, 9); // ldr x9, [x21, x22, lsl #3]
+        if (tgt86 == 1) {
+            X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC0);   // movq xmm0, rax (fmov d31, x9)
+            X3(0xF2, 0x0F, 0x5A); X1(0xC0);         // cvtsd2ss xmm0, xmm0 (fcvt s31, d31; F3 是 cvtss2sd 方向反了)
+            X3(0x66, 0x0F, 0x7E); X1(0xC0);         // movd eax, xmm0 (fmov w0, s31)
+        } else {
+        E4(0x9E67013F);                        // fmov d31, x9
+        E4(0x1E6243FF);                        // fcvt s31, d31
+        E4(0x1E2603E0);                        // fmov w0, s31 (single bits)
+        }
+        AddRR(11, 22, 22);                     // x11 = i*4
+        AddRR(11, 11, 11);
+        if (tgt86 == 1) { XGetV(19, 10); XGetV(11, 11); X4(0x1A048943); } else { E4(0xB82B6A60); }   // str w0,[x19,x11] / mov [r10+r11],eax
+        AddImm(22, 22, 1);
+        EmitB(loop);
+        Mark(done);
+        MovRR(0, 19);                          // arr = raw + 32
+        RtListReturn();
+    }
+
+}

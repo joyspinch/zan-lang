@@ -1,0 +1,752 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// ELF64 little-endian aarch64 relocatable object writer for Ngen (Linux).
+// Second object container beside the Mach-O writer in ngen_macho.zan; it
+// consumes the same emission-time data (txt, syms, fixups, strRefs, strs,
+// dglbs) and is selected at write time by BuildMachO() when the environment
+// variable ZAN_TARGET equals "aarch64-linux". Anything else stays Mach-O.
+//
+// Layout (all fields little-endian):
+//   ELF header (64)
+//   .text      SHF_ALLOC|SHF_EXECINSTR, align 8
+//   .rodata    SHF_ALLOC,                 align 1  (string literals)
+//   .data      SHF_ALLOC|SHF_WRITE,       align 8  (module globals, zeros)
+//   .rela.text SHT_RELA, link .symtab, info .text, 24 bytes per entry,
+//              sorted by r_offset
+//   .symtab    SHT_SYMTAB, link .strtab, info = first GLOBAL index;
+//              entry 0 is the required null symbol
+//   .strtab    SHT_STRTAB
+//   .shstrtab  SHT_STRTAB
+//   section headers (64 bytes each, 8 sections)
+//
+// Relocations (numbers per the ELF for AArch64 ABI, cross-checked against
+// LLVM's ELFRelocs/AArch64.def):
+//   BL extern    -> R_AARCH64_CALL26         (283), addend 0
+//   adrp ref     -> R_AARCH64_ADR_PREL_PG_HI21 (275), addend 0
+//   add  ref     -> R_AARCH64_ADD_ABS_LO12_NC  (277), addend 0
+//   ldr/str ref  -> R_AARCH64_LDST8/16/32/64_ABS_LO12_NC (278/284/285/286)
+//                                                 or LDST128 (299), addend 0
+//   adrp @GOT    -> R_AARCH64_ADR_GOT_PAGE     (311), addend 0
+//   ldr  @GOT    -> R_AARCH64_LD64_GOT_LO12_NC (312), addend 0
+//
+// Symbols: Mach-O stores C symbols with one leading underscore; ELF has no
+// prefix convention, so exactly one leading "_" is stripped here at write
+// time (symmetric to how the Mach-O side materializes it). The Mach-O stdio
+// data symbols ___stdinp / ___stderrp map to the Linux names stdin / stderr.
+
+// Environment access for the target switch, written as plain DllImport
+// externs so older bootstrap seeds (which lack host shim equivalents) already
+// support compiling this call shape. getenv returns a borrowed C string or
+// null; it is kept as a raw long and compared with libc strcmp, so a missing
+// variable can never be dereferenced.
+class ElfTargetEnv {
+    [DllImport("crt", EntryPoint="getenv")] public static extern long GetEnvPtr(string name);
+    [DllImport("crt", EntryPoint="strcmp")] public static extern int Cmp(long a, string b);
+}
+
+partial class Ngen {
+    // 1 when ZAN_TARGET=aarch64-linux is set in the compiler's environment.
+    int EnvTargetElf() {
+        long v = ElfTargetEnv.GetEnvPtr("ZAN_TARGET");
+        if (v == 0) { return 0; }
+        if (ElfTargetEnv.Cmp(v, "aarch64-linux") == 0) { return 1; }
+        return 0;
+    }
+
+    // 1 when ZAN_TARGET=x86_64-macos: SysV x86_64 codegen behind the same
+    // Mach-O MH_OBJECT container (Rosetta-runnable on arm64 macOS hosts;
+    // the ELF x86_64 container rides a later batch).
+    int EnvTargetX86() {
+        long v = ElfTargetEnv.GetEnvPtr("ZAN_TARGET");
+        if (v == 0) { return 0; }
+        if (ElfTargetEnv.Cmp(v, "x86_64-macos") == 0) { return 1; }
+        // 批 36:x86_64-linux 走同一 SysV 代码生成,容器换 BuildElfX86
+        if (ElfTargetEnv.Cmp(v, "x86_64-linux") == 0) { return 1; }
+        return 0;
+    }
+
+    // 1 when ZAN_TARGET=x86_64-linux: the ELF64 x86_64 container select.
+    int EnvTargetX86Elf() {
+        long v = ElfTargetEnv.GetEnvPtr("ZAN_TARGET");
+        if (v == 0) { return 0; }
+        if (ElfTargetEnv.Cmp(v, "x86_64-linux") == 0) { return 1; }
+        return 0;
+    }
+
+    // ELF has no C-symbol underscore prefix: strip exactly one leading "_".
+    // Known Mach-O data symbols with no Linux counterpart by that name map
+    // to their glibc/musl equivalents.
+    string ElfSymName(string s) {
+        if (s == "___stdinp") { return "stdin"; }
+        if (s == "___stderrp") { return "stderr"; }
+        if (s.Length > 0 && s.Substring(0, 1) == "_") { return s.Substring(1, s.Length - 1); }
+        return s;
+    }
+
+    int AlignTo8(int v) {
+        int p = v - (v / 8) * 8;
+        if (p != 0) { p = 8 - p; }
+        return v + p;
+    }
+
+    // symbol-table index of a referenced symbol: null, string literals,
+    // data globals, defined methods, then undefined externs (locals first,
+    // then globals, matching the sh_info convention)
+    // ELF numbering: 0 = null, then strs, dglbs, syms, then externs
+    MethIndex BuildElfRefIdx(List<string> exts, int extBase) {
+        MethIndex ix = new MethIndex();
+        int i = 0;
+        while (i < strs.Count) { ix.Add(StrSym(i), 1 + i); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { ix.Add(DGlobalSym(dglbs[i].name), 1 + strs.Count + i); i = i + 1; }
+        i = 0;
+        while (i < syms.Count) { ix.Add(syms[i].name, 1 + strs.Count + dglbs.Count + i); i = i + 1; }
+        i = 0;
+        while (i < exts.Count) { ix.Add(exts[i], extBase + i); i = i + 1; }
+        return ix;
+    }
+
+    int ElfRefSym(string name, MethIndex ix, int extBase) {
+        List<int> hit = ix.Get(name);
+        if (hit != null) { return hit[0]; }
+        return extBase - 1;
+    }
+
+    // classify the second half of a strRef pair: the relocation type that
+    // fills its low 12 bits
+    int ElfLo12Reloc(int pos) {
+        int w = WordAt(pos);
+        if ((w & 0x3B000000) == 0x39000000) {
+            // unsigned-offset load/store: size in bits 31..30 (ByteAt
+            // normalizes the top byte, so this is safe for negative words)
+            int sz = ByteAt(w, 3) / 64;
+            if (sz == 0) { return 278; }   // LDST8_ABS_LO12_NC
+            if (sz == 1) { return 284; }   // LDST16_ABS_LO12_NC
+            if (sz == 2) { return 285; }   // LDST32_ABS_LO12_NC
+            return 286;                    // LDST64_ABS_LO12_NC
+        }
+        if ((w & 0xFFC00000) == 0x3DC00000) { return 299; } // LDST128_ABS_LO12_NC
+        return 277;                                          // ADD_ABS_LO12_NC
+    }
+
+    // sorted-by-offset reloc bookkeeping: entries are appended in arrival
+    // order and sorted once before emission (heapsort in SortReloc4), so a
+    // big object costs O(R log R) instead of the O(R^2) insertion sort
+    void ElfAddRelo(List<int> offs, List<int> symsI, List<int> tys, List<int> adds,
+                    int off, int symi, int ty, int add) {
+        offs.Add(off);
+        symsI.Add(symi);
+        tys.Add(ty);
+        adds.Add(add);
+    }
+
+    void SortReloc4(List<int> a, List<int> s, List<int> t, List<int> ad) {
+        int n = a.Count;
+        if (n < 2) { return; }
+        int i = n / 2;
+        while (i > 0) { i = i - 1; SiftReloc4(a, s, t, ad, i, n); }
+        i = n - 1;
+        while (i > 0) {
+            int x = a[0]; a[0] = a[i]; a[i] = x;
+            x = s[0]; s[0] = s[i]; s[i] = x;
+            x = t[0]; t[0] = t[i]; t[i] = x;
+            x = ad[0]; ad[0] = ad[i]; ad[i] = x;
+            SiftReloc4(a, s, t, ad, 0, i);
+            i = i - 1;
+        }
+    }
+
+    void SiftReloc4(List<int> a, List<int> s, List<int> t, List<int> ad, int root, int n) {
+        while (true) {
+            int l = root * 2 + 1;
+            if (l >= n) { break; }
+            int m = l;
+            if (l + 1 < n && a[l + 1] > a[m]) { m = l + 1; }
+            if (a[root] >= a[m]) { break; }
+            int x = a[root]; a[root] = a[m]; a[m] = x;
+            x = s[root]; s[root] = s[m]; s[m] = x;
+            x = t[root]; t[root] = t[m]; t[m] = x;
+            x = ad[root]; ad[root] = ad[m]; ad[m] = x;
+            root = m;
+        }
+    }
+
+    // byte length of .strtab for the emission order below
+    int ElfStrTabSize(List<string> exts) {
+        int n = 1;
+        int i = 0;
+        while (i < strs.Count) { n = n + StrSym(i).Length + 1; i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { n = n + DGlobalSym(dglbs[i].name).Length + 1; i = i + 1; }
+        i = 0;
+        while (i < syms.Count) { string s = ElfSymName(syms[i].name); n = n + s.Length + 1; i = i + 1; }
+        i = 0;
+        while (i < exts.Count) { string s = ElfSymName(exts[i]); n = n + s.Length + 1; i = i + 1; }
+        return n;
+    }
+
+    // build the whole ELF64 object image; returns bytes
+    List<int> BuildElf() {
+        int textLen = txt.Count;
+        int cstrLen = 0;
+        int i = 0;
+        while (i < strs.Count) { cstrLen = cstrLen + strs[i].Length + 1; i = i + 1; }
+        if (cstrLen == 0) { cstrLen = 1; }
+
+        List<string> exts = ExternSyms();
+        int nloc = syms.Count + strs.Count + dglbs.Count;
+        // symtab order: null, LOCAL strings, LOCAL data globals, GLOBAL
+        // methods, GLOBAL externs
+        int firstGlobal = 1 + strs.Count + dglbs.Count;
+        int extBase = firstGlobal + syms.Count;
+        int nsyms = 1 + nloc + exts.Count;
+        MethIndex refIdx = BuildElfRefIdx(exts, extBase);
+
+        List<int> rOff = new List<int>();
+        List<int> rSym = new List<int>();
+        List<int> rTy = new List<int>();
+        List<int> rAdd = new List<int>();
+        i = 0;
+        while (i < fixups.Count) {
+            Fixup f = fixups[i];
+            if (f.kind == 4) {
+                // BL extern: imm26 stays zero; the linker resolves the call
+                // to the symbol address itself (addend 0, matching clang)
+                ElfAddRelo(rOff, rSym, rTy, rAdd, f.pos,
+                           ElfRefSym(f.sym, refIdx, extBase), 283, 0);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < strRefs.Count) {
+            StrRef r = strRefs[i];
+            int sn = ElfRefSym(r.sym, refIdx, extBase);
+            // got==1 references load through the homemade __nl_symbol_ptr
+            // slot (a plain .data quad); ElfLo12Reloc picks the LDR form
+            // off the opcode, so both shapes share this path
+            ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos, sn, 275, 0); // ADR_PREL_PG_HI21
+            ElfAddRelo(rOff, rSym, rTy, rAdd, r.addPos, sn, ElfLo12Reloc(r.addPos), 0);
+            i = i + 1;
+        }
+        SortReloc4(rOff, rSym, rTy, rAdd);
+        int nrel = rOff.Count;
+
+        // homemade __nl_symbol_ptr slots live at the tail of .data; each
+        // quad gets an R_AARCH64_ABS64 in .rela.data so the static link
+        // writes the bound symbol address into it. With no slots the
+        // section collapses and the image is byte-identical to before.
+        int ndrel = nlExts.Count;
+        List<int> rdOff = new List<int>();
+        List<int> rdSym = new List<int>();
+        List<int> rdTy = new List<int>();
+        List<int> rdAdd = new List<int>();
+        i = 0;
+        while (i < dglbs.Count) {
+            if (IsNlSlot(dglbs[i].name) != 0) {
+                ElfAddRelo(rdOff, rdSym, rdTy, rdAdd, dataLen + dglbs[i].off,
+                           ElfRefSym(nlExts[rdOff.Count], refIdx, extBase), 257, 0); // ABS64
+            }
+            i = i + 1;
+        }
+
+        // ---- file layout ----
+        int textOff = 64;
+        int roOff = textOff + textLen;
+        int dataOff = AlignTo8(roOff + cstrLen);
+        int relOff = AlignTo8(dataOff + dataLen + nlLen);
+        int relSize = nrel * 24;
+        int relDataOff = AlignTo8(relOff + relSize);
+        int relDataSize = rdOff.Count * 24;
+        int symOff = AlignTo8(relDataOff + relDataSize);
+        int symSize = nsyms * 24;
+        int strTabOff = symOff + symSize;
+        int strTabSize = ElfStrTabSize(exts);
+        int shstrOff = strTabOff + strTabSize;
+        // .shstrtab: "" ".text" ".rodata" ".data" ".rela.text" ".symtab"
+        //            ".strtab" ".shstrtab" [".rela.data"]
+        int shstrSize = 1 + 6 + 8 + 6 + 11 + 8 + 8 + 10 + ((ndrel != 0) ? 11 : 0);
+        int shOff = AlignTo8(shstrOff + shstrSize);
+        int shnum = (ndrel != 0) ? 9 : 8;
+        int fileEnd = shOff + shnum * 64;
+
+        List<int> img = new List<int>();
+        // ---- ELF header ----
+        Put8(img, 0x7F); Put8(img, 0x45); Put8(img, 0x4C); Put8(img, 0x46); // \x7fELF
+        Put8(img, 2);                    // EI_CLASS = ELFCLASS64
+        Put8(img, 1);                    // EI_DATA = ELFDATA2LSB
+        Put8(img, 1);                    // EI_VERSION
+        Put8(img, 0);                    // EI_OSABI = SysV
+        Put8(img, 0); Put8(img, 0); Put8(img, 0); Put8(img, 0);
+        Put8(img, 0); Put8(img, 0); Put8(img, 0); Put8(img, 0); // pad to e_ident[16]
+        Put16(img, 1);                   // e_type = ET_REL
+        Put16(img, 183);                 // e_machine = EM_AARCH64
+        Put32(img, 1);                   // e_version
+        Put64(img, 0);                   // e_entry
+        Put64(img, 0);                   // e_phoff
+        Put64(img, shOff);               // e_shoff
+        Put32(img, 0);                   // e_flags
+        Put16(img, 64);                  // e_ehsize
+        Put16(img, 0);                   // e_phentsize
+        Put16(img, 0);                   // e_phnum
+        Put16(img, 64);                  // e_shentsize
+        Put16(img, shnum);               // e_shnum
+        Put16(img, 7);                   // e_shstrndx
+        // ---- payload: .text ----
+        Append(img, txt, 0, textLen);
+        // .rodata (string literals)
+        i = 0;
+        while (i < strs.Count) {
+            PutName(img, strs[i], strs[i].Length + 1);
+            i = i + 1;
+        }
+        if (strs.Count == 0) { Put8(img, 0); }
+        while (img.Count < dataOff) { Put8(img, 0); } // pad to .data
+        EmitDataPayload(img);
+        i = 0;
+        while (i < nlLen) { Put8(img, 0); i = i + 1; } // __nl_symbol_ptr slots
+        while (img.Count < relOff) { Put8(img, 0); }
+        // .rela.text
+        i = 0;
+        while (i < nrel) {
+            Put64(img, rOff[i]);
+            Put32(img, rTy[i]);          // r_info low word = type
+            Put32(img, rSym[i]);         // r_info high word = symbol index
+            Put64(img, rAdd[i]);         // signed addend
+            i = i + 1;
+        }
+        while (img.Count < relDataOff) { Put8(img, 0); }
+        // .rela.data: one ABS64 per __nl_symbol_ptr slot
+        i = 0;
+        while (i < rdOff.Count) {
+            Put64(img, rdOff[i]);
+            Put32(img, rdTy[i]);
+            Put32(img, rdSym[i]);
+            Put64(img, rdAdd[i]);
+            i = i + 1;
+        }
+        while (img.Count < symOff) { Put8(img, 0); }
+        // ---- .symtab ----
+        // entry 0: the reserved null symbol
+        Put32(img, 0); Put8(img, 0); Put8(img, 0); Put16(img, 0); Put64(img, 0); Put64(img, 0);
+        // string literal symbols (LOCAL OBJECT in .rodata)
+        // strtab name offsets via prefix sums (the per-entry ElfStrOff*
+        // walks are O(n) each and the symbol loops call them per entry).
+        // Two different prefix sets: elfSoffs are the string-pool CONTENT
+        // offsets (st_value for l_.str.N symbols), elfNoffs are the .strtab
+        // NAME offsets (sums of the l_.str.N symbol spellings).
+        i = 0;
+        List<int> elfSoffs = StrOffsets();
+        List<int> elfNoffs = new List<int>();
+        elfNoffs.Add(0);
+        i = 0;
+        while (i < strs.Count) { elfNoffs.Add(elfNoffs[i] + StrSym(i).Length + 1); i = i + 1; }
+        int dglbBase = 1 + elfNoffs[strs.Count];
+        List<int> dgoffs = new List<int>();
+        dgoffs.Add(0);
+        i = 0;
+        while (i < dglbs.Count) { dgoffs.Add(dgoffs[i] + DGlobalSym(dglbs[i].name).Length + 1); i = i + 1; }
+        int symBase = dglbBase + dgoffs[dglbs.Count];
+        List<int> symoffs = new List<int>();
+        symoffs.Add(0);
+        i = 0;
+        while (i < syms.Count) { symoffs.Add(symoffs[i] + ElfSymName(syms[i].name).Length + 1); i = i + 1; }
+        int extNameBase = symBase + symoffs[syms.Count];
+        List<int> extoffs = new List<int>();
+        extoffs.Add(0);
+        i = 0;
+        while (i < exts.Count) { extoffs.Add(extoffs[i] + ElfSymName(exts[i]).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < strs.Count) {
+            Put32(img, 1 + elfNoffs[i]);
+            Put8(img, 0x01);             // bind LOCAL (0) << 4 | type OBJECT (1)
+            Put8(img, 0);
+            Put16(img, 2);               // st_shndx = .rodata
+            Put64(img, elfSoffs[i]);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        // data global symbols (LOCAL OBJECT in .data; slot globals sit in
+        // the trailing __nl_symbol_ptr part of .data)
+        i = 0;
+        while (i < dglbs.Count) {
+            Put32(img, dglbBase + dgoffs[i]);
+            Put8(img, 0x01);             // bind LOCAL (0) << 4 | type OBJECT (1)
+            Put8(img, 0);
+            Put16(img, 3);               // st_shndx = .data
+            Put64(img, (IsNlSlot(dglbs[i].name) != 0) ? dataLen + dglbs[i].off : dglbs[i].off);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        // defined method/runtime symbols (GLOBAL FUNC in .text)
+        i = 0;
+        while (i < syms.Count) {
+            Put32(img, symBase + symoffs[i]);
+            Put8(img, 0x12);             // bind GLOBAL (1) << 4 | type FUNC (2)
+            Put8(img, 0);                // st_other
+            Put16(img, 1);               // st_shndx = .text
+            Put64(img, syms[i].pos);     // section-relative value
+            Put64(img, 0);               // st_size
+            i = i + 1;
+        }
+        // undefined externs (GLOBAL NOTYPE, SHN_UNDEF)
+        i = 0;
+        while (i < exts.Count) {
+            Put32(img, extNameBase + extoffs[i]);
+            Put8(img, 0x10);             // bind GLOBAL << 4 | type NOTYPE
+            Put8(img, 0);
+            Put16(img, 0);               // SHN_UNDEF
+            Put64(img, 0);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        // ---- .strtab ----
+        Put8(img, 0);
+        i = 0;
+        while (i < strs.Count) { PutName(img, StrSym(i), StrSym(i).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { PutName(img, DGlobalSym(dglbs[i].name), DGlobalSym(dglbs[i].name).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < syms.Count) {
+            string nm3 = ElfSymName(syms[i].name);
+            PutName(img, nm3, nm3.Length + 1);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < exts.Count) {
+            PutName(img, ElfSymName(exts[i]), ElfSymName(exts[i]).Length + 1);
+            i = i + 1;
+        }
+        // ---- .shstrtab ----
+        Put8(img, 0);
+        PutName(img, ".text", 6);
+        PutName(img, ".rodata", 8);
+        PutName(img, ".data", 6);
+        PutName(img, ".rela.text", 11);
+        PutName(img, ".symtab", 8);
+        PutName(img, ".strtab", 8);
+        PutName(img, ".shstrtab", 10);
+        if (ndrel != 0) { PutName(img, ".rela.data", 11); }
+        while (img.Count < shOff) { Put8(img, 0); } // pad before section headers
+        // ---- section headers ----
+        // 0: SHN_UNDEF null section
+        // PROGBITS 尾参是 (info, align, entsize):.text 的 align 必须 ≥8——
+        // 传 0 时 lld 把本段紧贴 crt1 的 .text 放置(crt1 文本 0x39 字节,
+        // 非对齐),全部函数入口整体搬到奇地址,委托 bit0 标剥完就落进
+        // 上一条函数的 ret——批46 thr_probe 实证。
+        ElfSHeader(img, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        ElfSHeader(img, 1, 1, 6, 0, textOff, textLen, 0, 8, 0);          // .text PROGBITS AX
+        ElfSHeader(img, 7, 1, 2, 0, roOff, cstrLen, 0, 1, 0);            // .rodata PROGBITS A
+        ElfSHeader(img, 15, 1, 3, 0, dataOff, dataLen + nlLen, 0, 8, 0); // .data PROGBITS WA
+        ElfSHeader(img, 21, 4, 0, 5, relOff, relSize, 1, 8, 24);          // .rela.text: link .symtab, info .text
+        ElfSHeader(img, 32, 2, 0, 6, symOff, symSize, firstGlobal, 8, 24); // .symtab
+        ElfSHeader(img, 40, 3, 0, 0, strTabOff, strTabSize, 0, 0, 0);    // .strtab
+        ElfSHeader(img, 48, 3, 0, 0, shstrOff, shstrSize, 0, 0, 0);      // .shstrtab
+        if (ndrel != 0) {
+            // index 8, so the fixed indexes above never shift; link .symtab,
+            // info .data
+            ElfSHeader(img, 58, 4, 0, 5, relDataOff, relDataSize, 3, 3, 24);
+        }
+        return img;
+    }
+
+    void ElfSHeader(List<int> img, int nameOff, int ty, long flags, int link,
+                    int off, int size, int info, int align, int entsize) {
+        Put32(img, nameOff);
+        Put32(img, ty);
+        Put64(img, flags);
+        Put64(img, 0);                   // sh_addr (relocatable)
+        Put64(img, off);
+        Put64(img, size);
+        Put32(img, link);
+        Put32(img, info);
+        Put64(img, align);
+        Put64(img, entsize);
+    }
+
+    // ELF64 little-endian x86_64 relocatable writer (批 36) — the third
+    // container beside BuildElf (aarch64) and BuildMachOImage. Same emission
+    // state, same section layout and symbol table rules; only the relocation
+    // shape differs, because x86 has no adrp/add pair — every data reference
+    // is ONE rip-relative disp32 (REX+opcode+modrm put it at +3), and every
+    // extern call is `E8 rel32` (disp32 at +1). ELF numbers per the ELF for
+    // x86-64 ABI, cross-checked against LLVM's ELFRelocs/X86.def:
+    //   BL extern   -> R_X86_64_PLT32 (4),  addend -4 (P = disp32's address)
+    //   data ref    -> R_X86_64_PC32 (2),   addend -4; got==1 refs relocate
+    //                  against the local nl. slot, whose .data quad gets
+    //                  R_X86_64_64 (1) against the extern — same two-step
+    //                  as the aarch64 ABS64 slots
+    // Immediates stay zero in the object; the linker computes the value.
+    List<int> BuildElfX86() {
+        int textLen = txt.Count;
+        int cstrLen = 0;
+        int i = 0;
+        while (i < strs.Count) { cstrLen = cstrLen + strs[i].Length + 1; i = i + 1; }
+        if (cstrLen == 0) { cstrLen = 1; }
+
+        List<string> exts = ExternSyms();
+        int nloc = syms.Count + strs.Count + dglbs.Count;
+        int firstGlobal = 1 + strs.Count + dglbs.Count;
+        int extBase = firstGlobal + syms.Count;
+        int nsyms = 1 + nloc + exts.Count;
+        MethIndex refIdx = BuildElfRefIdx(exts, extBase);
+
+        List<int> rOff = new List<int>();
+        List<int> rSym = new List<int>();
+        List<int> rTy = new List<int>();
+        List<int> rAdd = new List<int>();
+        i = 0;
+        while (i < fixups.Count) {
+            Fixup f = fixups[i];
+            if (f.kind == 4) {
+                // E8 at f.pos; the rel32 field sits at f.pos+1 and pcrel
+                // runs against its end == the instruction's own base
+                ElfAddRelo(rOff, rSym, rTy, rAdd, f.pos + 1,
+                           ElfRefSym(f.sym, refIdx, extBase), 4, -4);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < strRefs.Count) {
+            StrRef r = strRefs[i];
+            ElfAddRelo(rOff, rSym, rTy, rAdd, r.adrpPos + 3,
+                       ElfRefSym(r.sym, refIdx, extBase), 2, -4);
+            i = i + 1;
+        }
+        SortReloc4(rOff, rSym, rTy, rAdd);
+        int nrel = rOff.Count;
+
+        // .rela.data: one R_X86_64_64 per __nl_symbol_ptr slot quad
+        int ndrel = nlExts.Count;
+        List<int> rdOff = new List<int>();
+        List<int> rdSym = new List<int>();
+        List<int> rdTy = new List<int>();
+        List<int> rdAdd = new List<int>();
+        i = 0;
+        while (i < dglbs.Count) {
+            if (IsNlSlot(dglbs[i].name) != 0) {
+                ElfAddRelo(rdOff, rdSym, rdTy, rdAdd, dataLen + dglbs[i].off,
+                           ElfRefSym(nlExts[rdOff.Count], refIdx, extBase), 1, 0);
+            }
+            i = i + 1;
+        }
+
+        // ---- file layout (identical to the aarch64 writer) ----
+        int textOff = 64;
+        int roOff = textOff + textLen;
+        int dataOff = AlignTo8(roOff + cstrLen);
+        int relOff = AlignTo8(dataOff + dataLen + nlLen);
+        int relSize = nrel * 24;
+        int relDataOff = AlignTo8(relOff + relSize);
+        int relDataSize = rdOff.Count * 24;
+        int symOff = AlignTo8(relDataOff + relDataSize);
+        int symSize = nsyms * 24;
+        int strTabOff = symOff + symSize;
+        int strTabSize = ElfStrTabSize(exts);
+        int shstrOff = strTabOff + strTabSize;
+        int shstrSize = 1 + 6 + 8 + 6 + 11 + 8 + 8 + 10 + ((ndrel != 0) ? 11 : 0);
+        int shOff = AlignTo8(shstrOff + shstrSize);
+        int shnum = (ndrel != 0) ? 9 : 8;
+        int fileEnd = shOff + shnum * 64;
+
+        List<int> img = new List<int>();
+        // ---- ELF header ----
+        Put8(img, 0x7F); Put8(img, 0x45); Put8(img, 0x4C); Put8(img, 0x46);
+        Put8(img, 2);                    // ELFCLASS64
+        Put8(img, 1);                    // ELFDATA2LSB
+        Put8(img, 1);                    // EI_VERSION
+        Put8(img, 0);                    // EI_OSABI = SysV
+        Put8(img, 0); Put8(img, 0); Put8(img, 0); Put8(img, 0);
+        Put8(img, 0); Put8(img, 0); Put8(img, 0); Put8(img, 0);
+        Put16(img, 1);                   // ET_REL
+        Put16(img, 62);                  // EM_X86_64
+        Put32(img, 1);                   // e_version
+        Put64(img, 0);                   // e_entry
+        Put64(img, 0);                   // e_phoff
+        Put64(img, shOff);               // e_shoff
+        Put32(img, 0);                   // e_flags
+        Put16(img, 64);                  // e_ehsize
+        Put16(img, 0);                   // e_phentsize
+        Put16(img, 0);                   // e_phnum
+        Put16(img, 64);                  // e_shentsize
+        Put16(img, shnum);               // e_shnum
+        Put16(img, 7);                   // e_shstrndx
+        // ---- payload: .text ----
+        Append(img, txt, 0, textLen);
+        i = 0;
+        while (i < strs.Count) {
+            PutName(img, strs[i], strs[i].Length + 1);
+            i = i + 1;
+        }
+        if (strs.Count == 0) { Put8(img, 0); }
+        while (img.Count < dataOff) { Put8(img, 0); }
+        EmitDataPayload(img);
+        i = 0;
+        while (i < nlLen) { Put8(img, 0); i = i + 1; }
+        while (img.Count < relOff) { Put8(img, 0); }
+        // .rela.text
+        i = 0;
+        while (i < nrel) {
+            Put64(img, rOff[i]);
+            Put32(img, rTy[i]);
+            Put32(img, rSym[i]);
+            Put64(img, rAdd[i]);
+            i = i + 1;
+        }
+        while (img.Count < relDataOff) { Put8(img, 0); }
+        // .rela.data
+        i = 0;
+        while (i < rdOff.Count) {
+            Put64(img, rdOff[i]);
+            Put32(img, rdTy[i]);
+            Put32(img, rdSym[i]);
+            Put64(img, rdAdd[i]);
+            i = i + 1;
+        }
+        while (img.Count < symOff) { Put8(img, 0); }
+        // ---- .symtab (same rules as the aarch64 writer) ----
+        Put32(img, 0); Put8(img, 0); Put8(img, 0); Put16(img, 0); Put64(img, 0); Put64(img, 0);
+        i = 0;
+        List<int> elfSoffs = StrOffsets();
+        List<int> elfNoffs = new List<int>();
+        elfNoffs.Add(0);
+        i = 0;
+        while (i < strs.Count) { elfNoffs.Add(elfNoffs[i] + StrSym(i).Length + 1); i = i + 1; }
+        int dglbBase = 1 + elfNoffs[strs.Count];
+        List<int> dgoffs = new List<int>();
+        dgoffs.Add(0);
+        i = 0;
+        while (i < dglbs.Count) { dgoffs.Add(dgoffs[i] + DGlobalSym(dglbs[i].name).Length + 1); i = i + 1; }
+        int symBase = dglbBase + dgoffs[dglbs.Count];
+        List<int> symoffs = new List<int>();
+        symoffs.Add(0);
+        i = 0;
+        while (i < syms.Count) { symoffs.Add(symoffs[i] + ElfSymName(syms[i].name).Length + 1); i = i + 1; }
+        int extNameBase = symBase + symoffs[syms.Count];
+        List<int> extoffs = new List<int>();
+        extoffs.Add(0);
+        i = 0;
+        while (i < exts.Count) { extoffs.Add(extoffs[i] + ElfSymName(exts[i]).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < strs.Count) {
+            Put32(img, 1 + elfNoffs[i]);
+            Put8(img, 0x01);
+            Put8(img, 0);
+            Put16(img, 2);               // .rodata
+            Put64(img, elfSoffs[i]);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < dglbs.Count) {
+            Put32(img, dglbBase + dgoffs[i]);
+            Put8(img, 0x01);
+            Put8(img, 0);
+            Put16(img, 3);               // .data
+            Put64(img, (IsNlSlot(dglbs[i].name) != 0) ? dataLen + dglbs[i].off : dglbs[i].off);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < syms.Count) {
+            Put32(img, symBase + symoffs[i]);
+            Put8(img, 0x12);             // GLOBAL FUNC
+            Put8(img, 0);
+            Put16(img, 1);               // .text
+            Put64(img, syms[i].pos);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < exts.Count) {
+            Put32(img, extNameBase + extoffs[i]);
+            Put8(img, 0x10);             // GLOBAL NOTYPE
+            Put8(img, 0);
+            Put16(img, 0);               // SHN_UNDEF
+            Put64(img, 0);
+            Put64(img, 0);
+            i = i + 1;
+        }
+        // ---- .strtab ----
+        Put8(img, 0);
+        i = 0;
+        while (i < strs.Count) { PutName(img, StrSym(i), StrSym(i).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < dglbs.Count) { PutName(img, DGlobalSym(dglbs[i].name), DGlobalSym(dglbs[i].name).Length + 1); i = i + 1; }
+        i = 0;
+        while (i < syms.Count) {
+            string nm3 = ElfSymName(syms[i].name);
+            PutName(img, nm3, nm3.Length + 1);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < exts.Count) {
+            PutName(img, ElfSymName(exts[i]), ElfSymName(exts[i]).Length + 1);
+            i = i + 1;
+        }
+        // ---- .shstrtab ----
+        Put8(img, 0);
+        PutName(img, ".text", 6);
+        PutName(img, ".rodata", 8);
+        PutName(img, ".data", 6);
+        PutName(img, ".rela.text", 11);
+        PutName(img, ".symtab", 8);
+        PutName(img, ".strtab", 8);
+        PutName(img, ".shstrtab", 10);
+        if (ndrel != 0) { PutName(img, ".rela.data", 11); }
+        while (img.Count < shOff) { Put8(img, 0); }
+        // ---- section headers ----
+        // PROGBITS 尾参是 (info, align, entsize):.text align 必须 ≥8——
+        // 传 0 时 lld 把本段紧贴 crt1 的 .text 放置(crt1 文本 0x39 字节,
+        // 非对齐),全部函数入口整体搬到奇地址,委托 bit0 标剥完就落进
+        // 上一条函数的 ret——批46 thr_probe 实证。
+        ElfSHeader(img, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        ElfSHeader(img, 1, 1, 6, 0, textOff, textLen, 0, 8, 0);           // .text PROGBITS AX
+        ElfSHeader(img, 7, 1, 2, 0, roOff, cstrLen, 0, 1, 0);             // .rodata PROGBITS A
+        ElfSHeader(img, 15, 1, 3, 0, dataOff, dataLen + nlLen, 0, 8, 0);  // .data PROGBITS WA
+        ElfSHeader(img, 21, 4, 0, 5, relOff, relSize, 1, 8, 24);          // .rela.text
+        ElfSHeader(img, 32, 2, 0, 6, symOff, symSize, firstGlobal, 8, 24);// .symtab
+        ElfSHeader(img, 40, 3, 0, 0, strTabOff, strTabSize, 0, 0, 0);     // .strtab
+        ElfSHeader(img, 48, 3, 0, 0, shstrOff, shstrSize, 0, 0, 0);       // .shstrtab
+        if (ndrel != 0) {
+            ElfSHeader(img, 58, 4, 0, 5, relDataOff, relDataSize, 3, 3, 24); // .rela.data
+        }
+        return img;
+    }
+
+    // strtab offsets are walked in the .strtab emission order: string
+    // symbols, data globals, methods, externs
+    int ElfStrOffStrings(int target, List<string> exts) {
+        int o = 1;
+        int i = 0;
+        while (i < target) { o = o + StrSym(i).Length + 1; i = i + 1; }
+        return o;
+    }
+    int ElfStrOffGlobals(int target, List<string> exts) {
+        int o = ElfStrOffStrings(strs.Count, exts);
+        int i = 0;
+        while (i < target) { o = o + DGlobalSym(dglbs[i].name).Length + 1; i = i + 1; }
+        return o;
+    }
+    int ElfStrOffMethods(int target, List<string> exts) {
+        int o = ElfStrOffGlobals(dglbs.Count, exts);
+        int i = 0;
+        while (i < target) {
+            string s = ElfSymName(syms[i].name);
+            o = o + s.Length + 1;
+            i = i + 1;
+        }
+        return o;
+    }
+    int ElfStrOffExts(int target, List<string> exts) {
+        int o = ElfStrOffMethods(syms.Count, exts);
+        int i = 0;
+        while (i < target) {
+            string s = ElfSymName(exts[i]);
+            o = o + s.Length + 1;
+            i = i + 1;
+        }
+        return o;
+    }
+}

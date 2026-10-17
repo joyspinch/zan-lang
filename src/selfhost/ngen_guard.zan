@@ -1,0 +1,442 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// macOS arm64, hand-emitted libSystem-only guard runtime.
+// Integration (this partial deliberately changes no existing source):
+//  1. Include ngen_guard.zan in every compiler-stage source list.
+//  2. Call EmitGuardRuntime() once at the END of EmitRtCore(), or immediately
+//     after EmitRtCore() in Ngen.Gen (one location only, never both).
+//     CollectClasses must already have initialized dglbs; emit before
+//     RtEmitStrpool/Patch/BuildMachO. No startup/main hook is needed.
+//  3. Change ALL BLExtern("_zan_rt_guard_fail3") to BLInternal in ngen*.zan.
+//     Do not link rt_timer.o (duplicate guard/strict symbols). Other unrelated
+//     C runtime dependencies are outside this partial's scope.
+//  4. A future --strict-runtime main prologue can BLInternal
+//     ("_zan_rt_set_strict") before user code/first policy query.
+//
+// Source of truth: zan-lang/src/runtime/rt_timer.c:160-457, POSIX branch.
+// It reads ZAN_RT_HARD, NOT ZAN_RUNTIME_ERRORS. Unset uses baked strict (0
+// initially); empty or first byte '0' explicitly opts out; any other first
+// byte opts in. Policy is cached on first query, including strict's value.
+// On macOS hard means exit(70), WITHOUT stderr/log (those are Windows-only).
+// Soft always appends a newline, even if msg already has one; 1400-byte
+// snprintf output clamps to 1398 before adding newline/NUL. Dedup uses the
+// ORIGINAL file pointer plus unsigned 32-bit line/col; 256 stored sites,
+// overflow sites keep reporting. Null file/msg render as <unknown>/empty.
+// ZAN_LOG_DIR must be nonempty and shorter than 4096. Otherwise the current
+// C code tries /proc/self/exe and falls back to cwd-relative "logs", NOT
+// _NSGetExecutablePath. Likewise log headers normally say exe=<unknown>.
+// Log path: logdir/YYYYMM/DD.log, mkdir 0755 (not recursive), fopen "ab",
+// header only for size==0; timestamp/localtime, close/flush each report.
+// Path/date/open failures degrade as in the reference (zan_soft.log fallback
+// on localtime/path overflow; no abort on filesystem/allocation failure).
+//
+// Lock: the runtime zan_lock_enter/exit face (casal CAS spin on an
+// 8-byte zero-initialized slot, sched_yield after 64 spins). Serializes
+// cache, strict, dedup AND log I/O, a
+// stronger race-free version of the reference's timer-lock critical section.
+// No heap allocation of our own. All libc-crossing live values are in real
+// allocated frames. SP stays 16-aligned, x18 and x19..x28 untouched; fp/lr
+// saved. Darwin variadic arguments occupy 8-byte stack slots, including %u.
+partial class Ngen {
+    void GuardString(string text, int reg) {
+        LoadSymRef("l_.str." + InternStr(text), reg);
+    }
+    void GuardGlobal(string name, int size) {
+        dglbs.Add(new DGlob("guard." + name, size, dataLen));
+        dataLen = dataLen + size;
+    }
+    void GuardAddr(string name, int reg) { LoadSymRef("l_.g.guard." + name, reg); }
+    void GuardFrame(string name, int size) {
+        syms.Add(new Sym(name, FnPad()));
+        RtPrologue();
+        GuardStack(size, false);
+    }
+    void GuardStack(int size, bool add) {
+        // Existing AddSPImm only accepts imm12. Chunk large frames without
+        // accidentally setting the shift bit; <=4080 also touches no red zone.
+        while (size > 4080) { AddSPImm(4080, add); size = size - 4080; }
+        if (size > 0) { AddSPImm(size, add); }
+    }
+    void GuardReturn(int size) { GuardStack(size, true); RtEpilogue(); }
+    void GuardSp(int reg, int off) { AddImm(reg, 31, off); }
+    // cmp x_a, x_b: flags of a-b, matching arm64 subs xzr, x_a, x_b
+    void GuardCmp(int a, int b) {
+        if (tgt86 == 1) { Xop(0x39, XMapReal(a), XMapReal(b)); return; }
+        E4(0xEB00001F | (b << 16) | (a << 5));
+    }
+    // cmp x_a, #imm (imm12; every guard site fits)
+    void GuardCmpImm(int a, int imm) {
+        if (tgt86 == 1) {
+            int r = XMapReal(a);
+            X1(XrexW(0, r)); X1(0x81); X1(0xF8 | (r & 7)); X4(imm);   // cmp r, imm32
+            return;
+        }
+        E4(0xF100001F | (imm << 10) | (a << 5));
+    }
+    // ldrb w_rd, [x_rn] -- zero-extended byte load (mod=00, no disp; the
+    // guard sites never name sp/rbp as the base)
+    void GuardByte(int rd, int rn) {
+        if (tgt86 == 1) {
+            int d = XMapReal(rd);
+            int b = XMapReal(rn);
+            if (b < 0) {
+                int bt = (d == 11) ? 10 : 11;  // stage the base out of rd's way
+                XGetV(rn, bt);
+                b = bt;
+            }
+            if (d < 0) {
+                // slot-backed destination: zero-extend into a scratch (never
+                // the staged base), then store the full quad to v's slot
+                int sc = (b == 10) ? 11 : 10;
+                X1(XrexW(sc, b)); X2(0x0F, 0xB6);
+                X1(((sc & 7) << 3) | (b & 7));
+                XSetV(rd, sc);
+                return;
+            }
+            X1(XrexW(d, b)); X2(0x0F, 0xB6);
+            X1(((d & 7) << 3) | (b & 7));      // movzx rd, byte [rn]
+            return;
+        }
+        E4(0x39400000 | (rn << 5) | rd);
+    }
+    void GuardLock() {
+        if (tgt86 == 1) { GuardAddr("lock", 0); BLInternal("_zan_lock_enter"); return; }
+        GuardAddr("lock", 0); BLExtern("_zan_lock_enter");
+    }
+    void GuardUnlock() {
+        if (tgt86 == 1) { GuardAddr("lock", 0); BLInternal("_zan_lock_exit"); return; }
+        GuardAddr("lock", 0); BLExtern("_zan_lock_exit");
+    }
+    void GuardStderr(int reg) {
+        LoadSymRefGOT("___stderrp", reg);
+        LdrU(reg, reg, 0);
+    }
+
+    // x86_64 twin of runtime_core's zan_lock_enter/exit (arm64 lane links
+    // them from runtime_core.o). 64-bit CAS 0->1 with the lock slot being
+    // an 8-byte zero-init global: first 64 spins pure, then sched_yield.
+    // Values return in rdi (the v0 convention). rdi crosses the yield call
+    // through [rbp-8] because the call tail overwrites it with rax.
+    void GuardEmitLock() {
+        GuardFrame("_zan_lock_enter", 16);
+        int have = NL(); int retry = NL(); int bump = NL(); int ok = NL();
+        int einval = NL();
+        X3(0x48, 0x85, 0xFF);                  // test rdi, rdi
+        EmitBcond(1, have);                    // jne have
+        Mark(einval);
+        X1(0xBF); X4(22);                      // mov edi, 22
+        RtEpilogue();
+        Mark(have);
+        X2(0x31, 0xC0);                        // xor eax, eax (expected)
+        X1(0xB9); X4(1);                       // mov ecx, 1 (new)
+        X2(0x31, 0xD2);                        // xor edx, edx (spins)
+        Mark(retry);
+        X2(0xF0, 0x48); X2(0x0F, 0xB1); X1(0x0F);   // lock cmpxchg qword [rdi], rcx
+        EmitBcond(0, ok);                      // jz ok
+        X3(0x83, 0xFA, 64);                    // cmp edx, 64
+        EmitBcond(13, bump);                   // jl bump
+        XopMemR(0x89, 7, 5, -8);               // mov [rbp-8], rdi
+        BLExtern("_sched_yield");
+        XopRMem(0x8B, 7, 5, -8);               // mov rdi, [rbp-8]
+        X2(0x31, 0xC0);                        // xor eax, eax
+        XB(retry);
+        Mark(bump);
+        X2(0xFF, 0xC2);                        // inc edx
+        X2(0xF3, 0x90);                        // pause
+        X2(0x31, 0xC0);                        // xor eax, eax
+        XB(retry);
+        Mark(ok);
+        X2(0x31, 0xFF);                        // xor edi, edi
+        RtEpilogue();
+
+        GuardFrame("_zan_lock_exit", 16);
+        int have2 = NL();
+        X3(0x48, 0x85, 0xFF);                  // test rdi, rdi
+        EmitBcond(1, have2);                   // jne have2
+        X1(0xBF); X4(22);                      // mov edi, 22
+        RtEpilogue();
+        Mark(have2);
+        X3(0x48, 0xC7, 0x07); X4(0);           // mov qword [rdi], 0
+        X2(0x31, 0xFF);                        // xor edi, edi
+        RtEpilogue();
+    }
+
+    void EmitGuardRuntime() {
+        GuardGlobal("lock", 8); // 8-byte slot for the runtime CAS lock
+        GuardGlobal("policy", 8); // 0=unqueried, 1=soft, 2=hard
+        GuardGlobal("strict", 8);
+        GuardGlobal("count", 8);
+        GuardGlobal("sites", 256 * 24); // {ptr, zero-extended unsigned, unsigned}
+        GuardGlobal("logdir", 4096);
+        if (tgt86 == 1) { GuardEmitLock(); } // x86 lane has no runtime_core.o lock face
+        GuardEmitPolicy();
+        GuardEmitFail3();
+        GuardEmitLogdir();
+        GuardEmitPath();
+        GuardEmitAppend();
+    }
+
+    void GuardEmitPolicy() {
+        // Caller holds the lock. x0 returns bool; no global -1 initializer.
+        GuardFrame("_zan_guard_policy_locked", 16);
+        GuardAddr("policy", 9); LdrU(0, 9, 0);
+        int cached = NL(); CbnzReg(0, cached);
+        GuardString("ZAN_RT_HARD", 0); BLExtern("_getenv");
+        int absent = NL(); int store = NL(); int soft = NL();
+        CbzReg(0, absent);
+        GuardByte(1, 0); CbzReg(1, soft);
+        GuardCmpImm(1, 48); EmitBcond(0, soft);
+        LoadImm(0, 2); EmitB(store);
+        Mark(soft); LoadImm(0, 1); EmitB(store);
+        Mark(absent); GuardAddr("strict", 9); LdrU(0, 9, 0); AddImm(0, 0, 1);
+        Mark(store); GuardAddr("policy", 9); StrU(0, 9, 0);
+        Mark(cached); SubImm(0, 0, 1); GuardReturn(16);
+
+        GuardFrame("_zan_rt_soft_is_hard", 16);
+        GuardLock(); BLInternal("_zan_guard_policy_locked"); StrU(0, 31, 0);
+        GuardUnlock(); LdrU(0, 31, 0); GuardReturn(16);
+
+        GuardFrame("_zan_rt_set_strict", 16);
+        GuardLock(); GuardAddr("strict", 9); LoadImm(0, 1); StrU(0, 9, 0);
+        GuardUnlock(); GuardReturn(16);
+    }
+
+    void GuardEmitFail3() {
+        // Frame: varargs[0..31], file32,line40,col48,msg56, buf[64..1463].
+        GuardFrame("_zan_rt_guard_fail3", 1472);
+        StrU(0, 31, 32);
+        if (tgt86 == 1) {
+            X2(0x89, 0xF6);                        // mov esi,esi (zero-extend)
+            X2(0x89, 0xD2);                        // mov edx,edx
+        } else {
+            E4(0x2A0103E1); // mov w1,w1: unsigned arguments ignore upper 32 bits
+            E4(0x2A0203E2); // mov w2,w2
+        }
+        StrU(1, 31, 40); StrU(2, 31, 48); StrU(3, 31, 56);
+        GuardLock(); BLInternal("_zan_guard_policy_locked");
+        int soft = NL(); CbzReg(0, soft);
+        GuardUnlock(); LoadImm(0, 70); BLExtern("_exit");
+        if (tgt86 == 1) { X2(0x0F, 0x0B); }        // ud2 if a broken exit returns
+        else { E4(0xD4200000); } // unreachable BRK if a broken exit interposer returns
+        Mark(soft);
+        LdrU(0, 31, 32); int fileOk = NL(); CbnzReg(0, fileOk);
+        GuardString("<unknown>", 0); Mark(fileOk); StrU(0, 31, 0);
+        LdrU(0, 31, 40); StrU(0, 31, 8);
+        LdrU(0, 31, 48); StrU(0, 31, 16);
+        LdrU(0, 31, 56); int msgOk = NL(); CbnzReg(0, msgOk);
+        GuardString("", 0); Mark(msgOk); StrU(0, 31, 24);
+        if (tgt86 == 1) {
+            // SysV varargs: rdi=buf, rsi=1400, rdx=fmt, rcx=file, r8=line,
+            // r9=col——snprintf 共七参,msg 是第 7 个 = 栈尾**首槽** [rsp+0]。
+            // XCallSeq 的栈尾装载读 v(6+k) 的家(k=0 → v6→[rsp+0]);旧码
+            // 把 msg 停在 v7(会落 [rsp+8]=第 8 参)且 xStackArgs=0(装载
+            // 循环根本不跑),%s 读到 [rsp] 的陈旧草稿字节——x86 首次点亮
+            // 触发守卫即现形("dy4l#$" 定案,批38b)。停 v6 + xStackArgs=1。
+            GuardSp(0, 64); LoadImm(1, 1400);
+            GuardString("%s:%u:%u: runtime error: %s", 2);
+            XopRMem(0x8B, 1, 4, 0);                // rcx = file
+            XopRMem(0x8B, 8, 4, 8);                // r8  = line
+            XopRMem(0x8B, 9, 4, 16);               // r9  = col
+            XopRMem(0x8B, 0, 4, 24);               // rax = msg
+            XSetV(6, 0);                           // msg -> v6 home -> [rsp+0]
+            xStackArgs = 1;                        // 调用垫片装载 v6 栈尾一参
+            X2(0x31, 0xC0);                        // al = 0
+            BLExtern("_snprintf");
+        } else if (EnvTargetElf() == 1) {
+            // Linux AAPCS64: unnamed args ride in registers
+            LdrU(3, 31, 0); LdrU(4, 31, 8); LdrU(5, 31, 16); LdrU(6, 31, 24);
+            GuardSp(0, 64); LoadImm(1, 1400);
+            GuardString("%s:%u:%u: runtime error: %s", 2); BLExtern("_snprintf");
+        } else {
+            GuardSp(0, 64); LoadImm(1, 1400);
+            GuardString("%s:%u:%u: runtime error: %s", 2); BLExtern("_snprintf");
+        }
+        Sxtw0(); // sxtw x0,w0: snprintf returns signed int
+        int done = NL(); GuardCmpImm(0, 0); EmitBcond(13, done);
+        int shortText = NL(); GuardCmpImm(0, 1399); EmitBcond(3, shortText);
+        LoadImm(0, 1398); Mark(shortText);
+        if (tgt86 == 1) {
+            // newline + NUL at buf + r (len rides v0 = rdi after Sxtw0)
+            XopRMem(0x8D, 10, 4, 64);              // r10 = &buf
+            Xop(0x01, 10, 7);                      // add r10, rdi
+            X3(0x41, 0xC6, 0x02); X1(10);          // mov byte [r10], '\n'
+            X3(0x49, 0xFF, 0xC2);                  // inc r10
+            X3(0x41, 0xC6, 0x02); X1(0);           // mov byte [r10], 0 (rm=010: r10 -- rm=000 with REX.B is r8!)
+        } else {
+            GuardSp(9, 64); AddRR(9, 9, 0); LoadImm(10, 10);
+            E4(0x3900012A); // strb w10,[x9]
+            AddImm(9, 9, 1); Strb0(9);
+        }
+        // No calls during scan: entry/count/index/temp in live scratch.
+        if (tgt86 == 1) {
+            // entry=r10, count=r11, index=rax, temp=rcx; the compared
+            // file/line/col sit in rdi/rsi/rdx (v0/v1/v2)
+            XLeaSym(DGlobalSym("guard.sites"), 9); // rax = &sites
+            XMov(10, 0);                           // r10 = entry
+            XLeaSym(DGlobalSym("guard.count"), 9); // rax = &count
+            XopRMem(0x8B, 11, 0, 0);               // r11 = count
+            X2(0x31, 0xC0);                        // rax = 0 (index)
+            XopRMem(0x8B, 7, 4, 32);               // rdi = file
+            XopRMem(0x8B, 6, 4, 40);               // rsi = line
+            XopRMem(0x8B, 2, 4, 48);               // rdx = col
+            int xscan = NL(); int xnext = NL(); int xinsert = NL(); int xreport = NL();
+            Mark(xscan);
+            Xop(0x39, 0, 11); EmitBcond(2, xinsert);      // cmp rax, r11; jae
+            XopRMem(0x8B, 1, 10, 0);                      // rcx = [entry]
+            Xop(0x39, 1, 7); EmitBcond(1, xnext);         // cmp rcx, rdi; jne
+            XopRMem(0x8B, 1, 10, 8);
+            Xop(0x39, 1, 6); EmitBcond(1, xnext);         // cmp rcx, rsi; jne
+            XopRMem(0x8B, 1, 10, 16);
+            Xop(0x39, 1, 2); EmitBcond(0, done);          // cmp rcx, rdx; je
+            Mark(xnext);
+            X3(0x49, 0x83, 0xC2); X1(24);                 // add r10, 24
+            X3(0x48, 0xFF, 0xC0);                         // inc rax
+            XB(xscan);
+            Mark(xinsert);
+            X3(0x49, 0x81, 0xFB); X4(256);                // cmp r11, 256
+            EmitBcond(2, xreport);                        // jae report
+            XopMemR(0x89, 7, 10, 0);                      // site = file/line/col
+            XopMemR(0x89, 6, 10, 8);
+            XopMemR(0x89, 2, 10, 16);
+            // 批 35:计数累加器是 r11(与 cmp r11,256 / [guard.count]<-r11
+            // 配对)——首版 48 FF C3 是 inc rbx:被调者保存寄存器被裸踩,
+            // 计数也永不增长,guard.count 恒 0
+            X3(0x49, 0xFF, 0xC3);                         // inc r11(count)
+            XLeaSym(DGlobalSym("guard.count"), 10);       // r10 = &count
+            XopMemR(0x89, 11, 10, 0);                     // [r10] = r11
+            Mark(xreport);
+        } else {
+            GuardAddr("sites", 9); GuardAddr("count", 10); LdrU(10, 10, 0);
+            LoadImm(11, 0);
+            LdrU(0, 31, 32); LdrU(1, 31, 40); LdrU(2, 31, 48);
+            int scan = NL(); int next = NL(); int insert = NL(); int report = NL();
+            Mark(scan); GuardCmp(11, 10); EmitBcond(2, insert);
+            LdrU(12, 9, 0); GuardCmp(12, 0); EmitBcond(1, next);
+            LdrU(12, 9, 8); GuardCmp(12, 1); EmitBcond(1, next);
+            LdrU(12, 9, 16); GuardCmp(12, 2); EmitBcond(0, done);
+            Mark(next); AddImm(9, 9, 24); AddImm(11, 11, 1); EmitB(scan);
+            Mark(insert); GuardCmpImm(10, 256); EmitBcond(2, report);
+            StrU(0, 9, 0); StrU(1, 9, 8); StrU(2, 9, 16);
+            AddImm(10, 10, 1); GuardAddr("count", 9); StrU(10, 9, 0);
+            Mark(report);
+        }
+        GuardSp(0, 64); StrU(0, 31, 0);
+        GuardStderr(0); GuardString("%s", 1);
+        if (EnvTargetElf() == 1) {
+            LdrU(2, 31, 0);                    // Linux: x2 = text
+        }
+        if (tgt86 == 1) {
+            XopRMem(0x8B, 2, 4, 0);            // rdx = text (fprintf vararg al=0)
+            X2(0x31, 0xC0);
+        }
+        BLExtern("_fprintf");
+        GuardStderr(0); BLExtern("_fflush");
+        GuardSp(0, 64); BLInternal("_zan_guard_append");
+        Mark(done); GuardUnlock(); GuardReturn(1472);
+    }
+
+    void GuardEmitLogdir() {
+        GuardFrame("_zan_guard_init_logdir", 32);
+        GuardString("ZAN_LOG_DIR", 0); BLExtern("_getenv");
+        int fallback = NL(); int done = NL();
+        CbzReg(0, fallback); GuardByte(1, 0); CbzReg(1, fallback);
+        StrU(0, 31, 0); BLExtern("_strlen");
+        LoadImm(9, 4096); GuardCmp(0, 9); EmitBcond(2, fallback);
+        AddImm(2, 0, 1); LdrU(1, 31, 0); GuardAddr("logdir", 0);
+        BLExtern("_memcpy"); EmitB(done);
+        Mark(fallback);
+        GuardAddr("logdir", 0); GuardString("logs", 1); LoadImm(2, 5); BLExtern("_memcpy");
+        GuardString("/proc/self/exe", 0); GuardAddr("logdir", 1);
+        LoadImm(2, 4090); BLExtern("_readlink");
+        GuardCmpImm(0, 0); EmitBcond(13, done);
+        GuardAddr("logdir", 9); AddRR(9, 9, 0); Strb0(9);
+        GuardAddr("logdir", 0); LoadImm(1, 47); BLExtern("_strrchr");
+        int slash = NL(); CbnzReg(0, slash);
+        GuardAddr("logdir", 0); GuardString("logs", 1); LoadImm(2, 5);
+        BLExtern("_memcpy"); EmitB(done);
+        Mark(slash); AddImm(0, 0, 1); Strb0(0);
+        // readlink cap 4090 guarantees room for "logs\0" after last slash.
+        GuardString("logs", 1); LoadImm(2, 5); BLExtern("_memcpy");
+        Mark(done); GuardReturn(32);
+    }
+
+    void GuardEmitPath() {
+        // x0=path[4096]. Frame varargs0..31,path32,now48,tm56..111,
+        // month112..127,day128..143,dir144..4239 (Darwin struct tm=56).
+        GuardFrame("_zan_guard_log_path", 4240); StrU(0, 31, 32);
+        GuardAddr("logdir", 9); GuardByte(9, 9);
+        int initialized = NL(); CbnzReg(9, initialized);
+        BLInternal("_zan_guard_init_logdir"); Mark(initialized);
+        LoadImm(0, 0); BLExtern("_time"); StrU(0, 31, 48);
+        GuardSp(0, 48); GuardSp(1, 56); BLExtern("_localtime_r");
+        int fallback = NL(); int done = NL(); CbzReg(0, fallback);
+        GuardSp(0, 112); LoadImm(1, 16); GuardString("%Y%m", 2); GuardSp(3, 56);
+        BLExtern("_strftime");
+        GuardSp(0, 128); LoadImm(1, 16); GuardString("%d", 2); GuardSp(3, 56);
+        BLExtern("_strftime");
+        GuardAddr("logdir", 0); StrU(0, 31, 0);
+        GuardSp(0, 112); StrU(0, 31, 8);
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            // Linux: x3/x4 regs; x86: SysV unnamed args 4/5 = rcx/r8.
+            // Darwin arm64 alone reads these two from the stack slots.
+            LdrU(3, 31, 0); LdrU(4, 31, 8);    // logdir, month
+        }
+        GuardSp(0, 144); LoadImm(1, 4096); GuardString("%s/%s", 2);
+        BLExtern("_snprintf"); Sxtw0(); // sign extend before size_t compare
+        LoadImm(9, 4096); GuardCmp(0, 9); EmitBcond(2, fallback);
+        GuardAddr("logdir", 0); LoadImm(1, 493); BLExtern("_mkdir");
+        GuardSp(0, 144); LoadImm(1, 493); BLExtern("_mkdir");
+        GuardSp(0, 144); StrU(0, 31, 0); GuardSp(0, 128); StrU(0, 31, 8);
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            LdrU(3, 31, 0); LdrU(4, 31, 8);   // dir, day (regs on Linux/x86)
+        }
+        LdrU(0, 31, 32); LoadImm(1, 4096); GuardString("%s/%s.log", 2);
+        BLExtern("_snprintf"); EmitB(done);
+        Mark(fallback); LdrU(0, 31, 32); GuardString("zan_soft.log", 1);
+        LoadImm(2, 13); BLExtern("_memcpy");
+        Mark(done); GuardReturn(4240);
+    }
+
+    void GuardEmitAppend() {
+        // Frame varargs0..31,text32,FILE40,now48,tm56..111,stamp112..143,
+        // path/exe144..4239. Reuse path as exe only AFTER fopen.
+        GuardFrame("_zan_guard_append", 4240); StrU(0, 31, 32);
+        GuardSp(0, 144); BLInternal("_zan_guard_log_path");
+        GuardSp(0, 144); GuardString("ab", 1); BLExtern("_fopen");
+        int done = NL(); CbzReg(0, done); StrU(0, 31, 40);
+        LoadImm(1, 0); LoadImm(2, 2); BLExtern("_fseek");
+        LdrU(0, 31, 40); BLExtern("_ftell");
+        int stamp = NL(); CbnzReg(0, stamp);
+        GuardString("/proc/self/exe", 0); GuardSp(1, 144); LoadImm(2, 4095);
+        BLExtern("_readlink");
+        int unknown = NL(); int header = NL();
+        GuardCmpImm(0, 0); EmitBcond(13, unknown);
+        GuardSp(9, 144); AddRR(9, 9, 0); Strb0(9); EmitB(header);
+        Mark(unknown); GuardSp(0, 144); GuardString("<unknown>", 1);
+        LoadImm(2, 10); BLExtern("_memcpy");
+        Mark(header); GuardSp(0, 144); StrU(0, 31, 0);
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            LdrU(2, 31, 0);                    // exe path: reg on Linux/x86
+        }
+        LdrU(0, 31, 40); GuardString("==== ZAN RUNTIME (soft) ====\nexe=%s\n", 1);
+        BLExtern("_fprintf");
+        Mark(stamp); LoadImm(0, 0); BLExtern("_time"); StrU(0, 31, 48);
+        GuardSp(0, 48); GuardSp(1, 56); BLExtern("_localtime_r");
+        // The reference ignores this second localtime_r failure (undefined
+        // tm contents). Avoid consuming uninitialized memory: omit this log
+        // entry and close, rather than crash in the error handler itself.
+        int close = NL(); CbzReg(0, close);
+        GuardSp(0, 112); LoadImm(1, 32); GuardString("%Y-%m-%d %H:%M:%S", 2);
+        GuardSp(3, 56); BLExtern("_strftime");
+        GuardSp(0, 112); StrU(0, 31, 0); LdrU(0, 31, 32); StrU(0, 31, 8);
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            LdrU(2, 31, 0); LdrU(3, 31, 8);   // ts, msg (regs on Linux/x86)
+        }
+        LdrU(0, 31, 40); GuardString("%s soft runtime error: %s", 1);
+        BLExtern("_fprintf");
+        Mark(close); LdrU(0, 31, 40); BLExtern("_fclose");
+        Mark(done); GuardReturn(4240);
+    }
+}

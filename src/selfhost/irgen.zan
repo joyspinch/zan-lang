@@ -1,87 +1,24 @@
 using System;
-using System.Collections;
+using System.Collections.Generic;
 namespace Zan;
 
+// A generated value: its LLVM operand text plus the source type node it has.
 class ExprVal {
     public string op;
     public Node ty;
     public ExprVal(string o, Node t) { op = o; ty = t; }
 }
 
-class LocalBinding {
-    public string name;
-    public Node type;
-    public string reg;
-
-    public LocalBinding(string n, Node t, string r) {
-        name = n;
-        type = t;
-        reg = r;
-    }
-}
-
-class GotoLabelEntry {
-    public string name;
-    public int id;
-
-    public GotoLabelEntry(string n, int i) {
-        name = n;
-        id = i;
-    }
-}
-
-// 泛型方法单态化特化待发射条目实体（消除 specMs/specClss/specSyms 隐式平行列表）。
-class SpecializedMethodEntry {
-    public Node method;
-    public Node ownerClass;
-    public string symbol;
-
-    public SpecializedMethodEntry(Node m, Node clss, string sym) {
-        this.method = m;
-        this.ownerClass = clss;
-        this.symbol = sym;
-    }
-}
-
-// 语句临时 ARC 管理值条目实体（消除 stmtTemps/stmtTempTypes 隐式平行列表）。
-class StmtTempEntry {
-    public string op;
-    public Node type;
-
-    public StmtTempEntry(string o, Node t) {
-        this.op = o;
-        this.type = t;
-    }
-}
-
-// 异步状态机栈槽映射条目实体（消除 asyncSlotReg/asyncSlotTy/asyncSlotIdx 隐式平行列表）。
-class AsyncSlotEntry {
-    public string reg;
-    public Node type;
-    public int slotIdx;
-
-    public AsyncSlotEntry(string r, Node t, int idx) {
-        this.reg = r;
-        this.type = t;
-        this.slotIdx = idx;
-    }
-}
-
-// 类字段描述实体（消除 CollectFields 中 names/types 平行列表反模式）。
-class ClassFieldEntry {
-    public string name;
-    public Node type;
-    public Node decl;
-
-    public ClassFieldEntry(string name, Node type, Node decl) {
-        this.name = name;
-        this.type = type;
-        this.decl = decl;
-    }
-}
-
+// IR backend: lowers the bound AST to LLVM IR text. Mirrors src/compiler/
+// irgen.c for the bootstrap subset. Integer/bool/char/enum are i64; string is
+// i8*; class/struct instances are heap objects referenced by %Name*; List<T>
+// is a growable i64-slot runtime array referenced by i8* (pointer elements are
+// stored via ptrtoint / read back via inttoptr).
 partial class Irgen {
     public Binder binder;
+    // The gen1 IR is compiled and run on the same host as this compiler, so
+    // OS-specific runtime shims (console code page, timers, sleep) follow the
+    // host platform: a drive-letter ExeDir means Windows, else POSIX.
     public bool hostWin;
     public Diags diags;
     public StringBuilder head;
@@ -93,35 +30,44 @@ partial class Irgen {
     public string curClass;
     public string curRet;
     public bool curHasThis;
-    public List<LocalBinding> locals;  // 编译器后端局部变量表实体列表
+    public List<string> locName;
+    public List<Node> locType;
+    public List<string> locReg;
     public int locSeq;
     public int qdotSeq;
     public string curLbl;
     public int brkTarget;
     public int contTarget;
     public List<string> tparamNames;
-    public List<SpecializedMethodEntry> specEntries;
-    public StringBuilder deferred;  // hoisted lambda function definitions
-    public StringBuilder entryAllocas;  // per-function allocas hoisted to entry
+    // method-level monomorphization: specialized clones pending emission
+    public List<Node> specMs;
+    public List<Node> specClss;
+    public List<string> specSyms;
+    public StringBuilder deferred; // hoisted lambda function definitions
+    public StringBuilder entryAllocas; // per-function allocas hoisted to entry
     public bool eaActive;
     public int lamCount;
-    public List<StmtTempEntry> stmtTemps;
+    public List<string> stmtTemps;
+    public List<Node> stmtTempTypes;
     public int loopScopeBase;
-    public List<string> externDecls;  // extern C symbols already `declare`d
+    public List<string> externDecls; // extern C symbols already `declare`d
     public bool curAsync;
     public string curResumeSym;
     public int curSubBase;
     public int curAwaitSeq;
     public bool usesAsync;
     public bool usesDirList;
-    public bool usesStrOps;  // Trim/ToUpper/ToLower/Replace/LastIndexOf helpers
-    List<string> mgTargets;  // method-group thunks already emitted
-    public List<AsyncSlotEntry> asyncSlots;
+    public bool usesStrOps; // Trim/ToUpper/ToLower/Replace/LastIndexOf helpers
+    List<string> mgTargets; // method-group thunks already emitted
+    public List<string> asyncSlotReg;
+    public List<Node> asyncSlotTy;
+    public List<int> asyncSlotIdx;
     public bool curAsyncThis;
     public int curAsyncThisSlot;
     public Node curAsyncThisTy;
-    public List<GotoLabelEntry> gotoLabels;
-    public bool crcEmitted;  // NativeMemory.Crc32 helper+table emitted once
+    public List<string> gotoNames; // per-function goto label name -> id
+    public List<int> gotoIds;
+    public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -130,8 +76,9 @@ partial class Irgen {
         entryAllocas = new StringBuilder(); eaActive = false;
         tmp = 0; lbl = 0; strn = 0; term = false;
         curClass = ""; curRet = "void"; curHasThis = false;
-        locals = new List<LocalBinding>();
-        gotoLabels = new List<GotoLabelEntry>();
+        locName = new List<string>();
+        locType = new List<Node>();
+        locReg = new List<string>();
         locSeq = 0;
         qdotSeq = 0;
         curAsync = false; usesAsync = false; usesDirList = false; usesStrOps = false;
@@ -139,19 +86,25 @@ partial class Irgen {
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
         tparamNames = new List<string>();
-        specEntries = new List<SpecializedMethodEntry>();
-        stmtTemps = new List<StmtTempEntry>();
-        asyncSlots = new List<AsyncSlotEntry>();
+        specMs = new List<Node>();
+        specClss = new List<Node>();
+        specSyms = new List<string>();
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
         externDecls = new List<string>();
         crcEmitted = false;
     }
 
+    // The raw C-ABI symbol an extern (DllImport) method binds to: the
+    // EntryPoint override when given (stored in sval2), else the method name.
     string ExternName(Node m) {
         if (m.sval2 != "") { return m.sval2; }
         return m.sval;
     }
 
+    // Pre-register the C symbols already `declare`d in the module header so a
+    // [DllImport] of e.g. calloc/malloc does not emit a duplicate declaration.
     void SeedExternBuiltins() {
         externDecls.Add("printf"); externDecls.Add("malloc"); externDecls.Add("calloc");
         externDecls.Add("realloc"); externDecls.Add("free"); externDecls.Add("strlen");
@@ -171,6 +124,9 @@ partial class Irgen {
         return false;
     }
 
+    // Emit `declare <ret> @<sym>(<params>)` for a [DllImport] extern method,
+    // deduplicated against builtins and prior declarations. Calls route to the
+    // raw symbol via MethodSym.
     void DeclareExtern(Node cls, Node m) {
         string sym = ExternName(m);
         if (ExternSeen(sym)) { return; }
@@ -195,6 +151,9 @@ partial class Irgen {
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
     int NL() { lbl = lbl + 1; return lbl; }
     void L(string s) { body.Append(s); body.Append("\n"); }
+    // Emit an alloca into the function's entry block when a hoist buffer is
+    // active, so locals declared inside loop bodies reuse one stack slot per
+    // call instead of growing the stack every iteration at -O0.
     void EA(string reg, string lt) {
         if (eaActive) { entryAllocas.Append("  " + reg + " = alloca " + lt + "\n"); }
         else { L("  " + reg + " = alloca " + lt); }
@@ -204,6 +163,10 @@ partial class Irgen {
 
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
 
+    // ---- type mapping ----
+    // ---- generics (type erasure) ----
+    // A type is "erased" if its name is a generic type parameter of some class;
+    // all such types are lowered to i64 slots (pointers packed via ptrtoint).
     bool IsErasedType(Node t) {
         if (t == null) { return false; }
         int i = 0;
@@ -222,6 +185,8 @@ partial class Irgen {
         return r;
     }
 
+    // resolve an erased type to the concrete argument supplied by a receiver's
+    // static type (e.g. T in Box<int> -> int); returns t itself when unresolved.
     Node ConcreteTP(Node t, Node recvTy) {
         if (!IsErasedType(t)) { return t; }
         if (recvTy == null) { return t; }
@@ -253,6 +218,7 @@ partial class Irgen {
         return "i64";
     }
 
+    // box a value into a heap slot, returning the i8* handle (null = no value)
     string BoxVal(ExprVal v, Node ty) {
         string ult = UnderLL(ty);
         string raw = NT();
@@ -263,27 +229,42 @@ partial class Irgen {
         return raw;
     }
 
+    // operand to store into a nullable value-type slot (i8*)
     string BoxFor(ExprVal v, Node ty) {
         if (v.op == "null") { return "null"; }
         if (IsNullableValue(v.ty)) { return v.op; }
         return BoxVal(v, ty);
     }
 
-    string NmAddr(string adr, string off) {
-        string p = NT();
-        L("  " + p + " = inttoptr i64 " + adr + " to i8*");
+    // ---- NativeMemory intrinsics (mirror src/compiler/irgen.c) ----
+    // A raw address may be an i64 (nint) or already an i8* / pointer type (such as string).
+    // addr(base,off) yields an i8* at base+off.
+    string NmAddr(ExprVal v, string off) {
+        string vt = MapType(v.ty);
+        string p = v.op;
+        if (vt == "i64") {
+            p = NT();
+            L("  " + p + " = inttoptr i64 " + v.op + " to i8*");
+        } else if (vt != "i8*") {
+            p = NT();
+            L("  " + p + " = bitcast " + vt + " " + v.op + " to i8*");
+        }
         if (off == "0") { return p; }
         string a = NT();
         L("  " + a + " = getelementptr i8, i8* " + p + ", i64 " + off);
         return a;
     }
 
+    // Emit the self-contained CRC32 (IEEE 802.3, reflected poly 0xEDB88320)
+    // helper and its compile-time-computed 256-entry table, once per module.
     void EmitCrc32Helper() {
         if (crcEmitted) { return; }
         crcEmitted = true;
         string tab = "";
         int i = 0;
         while (i < 256) {
+            // the reflected polynomial and every intermediate word are unsigned
+            // 32-bit quantities, so the lane is a long (int is signed 32-bit).
             long c = i;
             int k = 0;
             while (k < 8) {
@@ -324,6 +305,8 @@ partial class Irgen {
         H("}");
     }
 
+    // Lower a NativeMemory.<Method>(...) call inline, mirroring the C host.
+    // Returns null when the call is not a recognised intrinsic.
     ExprVal GenNativeMemory(Node callee, Node e) {
         string m = callee.sval;
         int argc = e.kids.Count;
@@ -346,8 +329,8 @@ partial class Irgen {
             ExprVal dst = GenExpr(e.kids[0]);
             ExprVal src = GenExpr(e.kids[1]);
             ExprVal n = GenExpr(e.kids[2]);
-            string dp = NmAddr(dst.op, "0");
-            string spp = NmAddr(src.op, "0");
+            string dp = NmAddr(dst, "0");
+            string spp = NmAddr(src, "0");
             L("  call i8* @memmove(i8* " + dp + ", i8* " + spp + ", i64 " + n.op + ")");
             return new ExprVal("0", MkType("void"));
         }
@@ -355,7 +338,7 @@ partial class Irgen {
             ExprVal p = GenExpr(e.kids[0]);
             ExprVal v = GenExpr(e.kids[1]);
             ExprVal n = GenExpr(e.kids[2]);
-            string dp = NmAddr(p.op, "0");
+            string dp = NmAddr(p, "0");
             string vb = NT();
             L("  " + vb + " = trunc i64 " + v.op + " to i32");
             L("  call i8* @memset(i8* " + dp + ", i32 " + vb + ", i64 " + n.op + ")");
@@ -365,8 +348,8 @@ partial class Irgen {
             ExprVal a = GenExpr(e.kids[0]);
             ExprVal b = GenExpr(e.kids[1]);
             ExprVal n = GenExpr(e.kids[2]);
-            string ap = NmAddr(a.op, "0");
-            string bp = NmAddr(b.op, "0");
+            string ap = NmAddr(a, "0");
+            string bp = NmAddr(b, "0");
             string r = NT();
             L("  " + r + " = call i32 @memcmp(i8* " + ap + ", i8* " + bp + ", i64 " + n.op + ")");
             string r64 = NT();
@@ -381,7 +364,7 @@ partial class Irgen {
             L("  " + total + " = add i64 " + len.op + ", 1");
             string s = NT();
             L("  " + s + " = call i8* @malloc(i64 " + total + ")");
-            string src = NmAddr(p.op, off.op);
+            string src = NmAddr(p, off.op);
             L("  call i8* @memcpy(i8* " + s + ", i8* " + src + ", i64 " + len.op + ")");
             string endp = NT();
             L("  " + endp + " = getelementptr i8, i8* " + s + ", i64 " + len.op);
@@ -393,7 +376,7 @@ partial class Irgen {
             ExprVal off = GenExpr(e.kids[1]);
             ExprVal s = GenExpr(e.kids[2]);
             ExprVal len = GenExpr(e.kids[3]);
-            string dp = NmAddr(p.op, off.op);
+            string dp = NmAddr(p, off.op);
             L("  call i8* @memcpy(i8* " + dp + ", i8* " + s.op + ", i64 " + len.op + ")");
             return new ExprVal("0", MkType("void"));
         }
@@ -401,7 +384,7 @@ partial class Irgen {
             EmitCrc32Helper();
             ExprVal p = GenExpr(e.kids[0]);
             ExprVal len = GenExpr(e.kids[1]);
-            string dp = NmAddr(p.op, "0");
+            string dp = NmAddr(p, "0");
             string r = NT();
             L("  " + r + " = call i64 @__zan_nm_crc32(i8* " + dp + ", i64 " + len.op + ")");
             return new ExprVal(r, MkType("int"));
@@ -422,6 +405,9 @@ partial class Irgen {
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
         if (n == "StringBuilder") { return "i8*"; }
+        // Span<T> is a non-owning view; the host carries { base, len } but the
+        // selfhost backend has no aggregate values, so a span travels as its
+        // base address (spans are never bounds-checked).
         if (n == "Span") { return "i64"; }
         Node d = binder.FindType(n);
         if (d != null) {
@@ -463,15 +449,20 @@ partial class Irgen {
         return MkType("int");
     }
 
+    // LLVM integer type of one span element (its storage width, not the i64
+    // every scalar travels in).
     string SpanIty(Node el) {
         string n = "int";
         if (el != null) { n = el.sval; }
         if (n == "byte" || n == "sbyte" || n == "bool") { return "i8"; }
         if (n == "short" || n == "ushort") { return "i16"; }
         if (n == "int" || n == "uint") { return "i32"; }
+        if (n == "double") { return "double"; }
+        if (n == "float") { return "float"; }
         return "i64";
     }
 
+    // Whether loading a span element widens without sign extension.
     bool SpanZext(Node el) {
         string n = "int";
         if (el != null) { n = el.sval; }
@@ -480,6 +471,7 @@ partial class Irgen {
         return false;
     }
 
+    // i8*/i16*/i32*/i64* to the span's element at `idx`.
     string SpanElemPtr(string baseOp, string idxOp, string ity) {
         string bp = NT();
         L("  " + bp + " = inttoptr i64 " + baseOp + " to " + ity + "*");
@@ -505,6 +497,7 @@ partial class Irgen {
         return MkType("int");
     }
 
+    // class decl referenced by a class-pointer type, or null
     Node ClassOf(Node t) {
         if (t == null) { return null; }
         Node d = binder.FindType(t.sval);
@@ -512,6 +505,9 @@ partial class Irgen {
         return null;
     }
 
+    // per-class type descriptor: the global's address is the type identity
+    // and its value links to the base class's descriptor (chain walk for
+    // catch-clause matching; see GenTry).
     void EmitTid(Node d) {
         Node bt = BaseClassOf(d);
         if (bt != null) {
@@ -521,6 +517,7 @@ partial class Irgen {
         }
     }
 
+    // ---- inheritance / virtual dispatch helpers ----
     Node BaseClassOf(Node cls) {
         if (cls == null) { return null; }
         if (cls.sval2 == "") { return null; }
@@ -531,8 +528,12 @@ partial class Irgen {
     bool IsVirtual(Node m) { return HasMod(m, MOD.Virtual()); }
     bool IsOverride(Node m) { return HasMod(m, MOD.Override()); }
     bool IsAbstract(Node m) { return HasMod(m, MOD.Abstract()); }
+    // introduces a fresh vtable slot: virtual or abstract, but not an override
     bool IsVSlotIntro(Node m) { return (IsVirtual(m) || IsAbstract(m)) && !IsOverride(m); }
 
+    // A class is polymorphic if it or any ancestor declares a virtual/abstract/
+    // override method; such classes carry a vtable pointer in field slot 0.
+    // Interfaces are modelled as abstract classes and are polymorphic too.
     bool IsPolyClass(Node cls) {
         if (cls == null) { return false; }
         int i = 0;
@@ -544,21 +545,25 @@ partial class Irgen {
         return IsPolyClass(BaseClassOf(cls));
     }
 
+    // field slot offset: 1 when a vtable pointer occupies slot 0
     int FieldBase(Node cls) { if (IsPolyClass(cls)) { return 1; } return 0; }
 
+    // weak fields are non-owning back-references: never retained or released.
     bool WeakTy(Node t) { if (t == null) { return false; } int b = t.mods / 1024; return b - (b / 2) * 2 == 1; }
 
-    void CollectFields(Node cls, List<ClassFieldEntry> fields) {
+    // ordered fields, base classes first (layout-compatible with base pointers)
+    void CollectFields(Node cls, List<string> names, List<Node> types) {
         if (cls == null) { return; }
-        CollectFields(BaseClassOf(cls), fields);
+        CollectFields(BaseClassOf(cls), names, types);
         int i = 0;
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
-            if (m.kind == AK.FieldDecl() && !IsStatic(m)) { fields.Add(new ClassFieldEntry(m.sval, m.type, m)); }
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) { names.Add(m.sval); types.Add(m.type); }
             i = i + 1;
         }
     }
 
+    // ---- static class fields: backed by internal module globals ----
     Node FindStaticField(Node cls, string name) {
         Node c = cls;
         while (c != null) {
@@ -618,6 +623,7 @@ partial class Irgen {
         }
         L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + g);
     }
+    // Emit an internal global for each static field declared in `cls`.
     void EmitStaticGlobals(Node cls) {
         int i = 0;
         while (i < cls.kids.Count) {
@@ -629,12 +635,14 @@ partial class Irgen {
             i = i + 1;
         }
     }
+    // Run static-field initializers once at program entry (mirrors var-decl init).
     void EmitStaticInits(Node unit) {
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
                 curClass = d.sval; curHasThis = false;
+                locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>();
                 int j = 0;
                 while (j < d.kids.Count) {
                     Node m = d.kids[j];
@@ -659,22 +667,24 @@ partial class Irgen {
     }
 
     int FieldIndex(Node cls, string name) {
-        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
-        CollectFields(cls, fields);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         int i = 0;
-        while (i < fields.Count) {
-            if (fields[i].name == name) { return FieldBase(cls) + i; }
+        while (i < names.Count) {
+            if (names[i] == name) { return FieldBase(cls) + i; }
             i = i + 1;
         }
         return -1;
     }
 
     Node FieldType(Node cls, string name) {
-        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
-        CollectFields(cls, fields);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         int i = 0;
-        while (i < fields.Count) {
-            if (fields[i].name == name) { return fields[i].type; }
+        while (i < names.Count) {
+            if (names[i] == name) { return types[i]; }
             i = i + 1;
         }
         return null;
@@ -684,23 +694,17 @@ partial class Irgen {
     string AddLocal(string name, Node ty) {
         locSeq = locSeq + 1;
         string r = "%v." + name + "." + locSeq;
-        locals.Add(new LocalBinding(name, ty, r));
+        locName.Add(name); locType.Add(ty); locReg.Add(r);
         return r;
     }
-    string RegOf(string name) {
-        int i = LocalIdx(name);
-        if (i < 0) { return "%v." + name; }
-        return locals[i].reg;
-    }
+    string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
     int LocalIdx(string name) {
-        int i = locals.Count - 1;
-        while (i >= 0) {
-            if (locals[i].name == name) { return i; }
-            i = i - 1;
-        }
+        int i = locName.Count - 1;
+        while (i >= 0) { if (locName[i] == name) { return i; } i = i - 1; }
         return -1;
     }
 
+    // ---- string helpers ----
     string HEXD(int d) { return "0123456789ABCDEF".Substring(d, 1); }
     string Hex2(int b) { int hi = b / 16; int lo = b - hi * 16; return HEXD(hi) + HEXD(lo); }
 
@@ -824,24 +828,29 @@ partial class Irgen {
         EmitListRuntime();
         EmitSbRuntime();
         EmitDictRuntime();
+        EmitStrcmp0();
+        // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitStruct(d); EmitStaticGlobals(d); EmitTid(d); }
             i = i + 1;
         }
+        // vtables for polymorphic classes
         i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) && IsPolyClass(d) && !HasMod(d, MOD.Abstract())) { EmitVtable(d); }
             i = i + 1;
         }
+        // per-class destructors (release ARC-managed fields)
         i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitClassDtor(d); }
             i = i + 1;
         }
+        // function bodies
         i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
@@ -849,9 +858,11 @@ partial class Irgen {
             i = i + 1;
         }
         GenMainWrapper(unit);
+        // emit queued generic-method specializations (a specialized body may
+        // queue further specializations, so drain until the list stops growing)
         int sp = 0;
-        while (sp < specEntries.Count) {
-            GenMethod(specEntries[sp].ownerClass, specEntries[sp].method, false);
+        while (sp < specMs.Count) {
+            GenMethod(specClss[sp], specMs[sp], false);
             sp = sp + 1;
         }
         if (usesAsync) { EmitAsyncRuntime(); }
@@ -861,15 +872,16 @@ partial class Irgen {
     }
 
     void EmitStruct(Node cls) {
-        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
-        CollectFields(cls, fields);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         string s = "%" + cls.sval + " = type { ";
         int cnt = 0;
         if (IsPolyClass(cls)) { s = s + "i8*"; cnt = 1; }
         int i = 0;
-        while (i < fields.Count) {
+        while (i < types.Count) {
             if (cnt > 0) { s = s + ", "; }
-            s = s + MapType(fields[i].type);
+            s = s + MapType(types[i]);
             cnt = cnt + 1;
             i = i + 1;
         }
@@ -883,6 +895,7 @@ partial class Irgen {
         EmitListRuntimeOps();
     }
 
+    /// %zlist type + dtor/reverse/new.
     void EmitListRuntimeCore() {
         H("%zlist = type { i64, i64, i64*, i64 }");
         H("define void @zlist_dtor(i8* %p) {");
@@ -967,6 +980,7 @@ partial class Irgen {
         H("}");
     }
 
+    /// zlist add/get/set/count/removeat/clear.
     void EmitListRuntimeOps() {
         H("define void @zlist_add(i8* %p, i64 %v) {");
         H("entry:");
@@ -1112,7 +1126,14 @@ partial class Irgen {
         H("}");
     }
 
+    // ARC: every heap object carries a hidden 8-byte refcount header that lives
+    // immediately BEFORE the pointer handed out, so object field layout, vtable
+    // slot 0 and container internals are all unchanged. zalloc initialises the
+    // count to 1; zretain/zrelease adjust it; zrelease frees at count 0.
     void EmitArcRuntime() {
+        // header layout, 16 bytes before the object pointer: [ i64 refcount ]
+        // [ i8* destructor ]. zalloc records both; zrelease at count 0 runs the
+        // destructor (which releases members / frees internal buffers) then frees.
         H("define i8* @zalloc(i64 %n, i8* %dtor) {");
         H("  %tot = add i64 %n, 16");
         H("  %raw = call i8* @calloc(i64 1, i64 %tot)");
@@ -1168,6 +1189,9 @@ partial class Irgen {
         H("}");
     }
 
+    // is `t` a heap object carrying an ARC header (class/struct instance or one
+    // of the built-in containers routed through zalloc)? Strings, primitives,
+    // erased generic slots and nullable value boxes are not ARC-managed.
     bool ArcManaged(Node t) {
         if (t == null) { return false; }
         if (IsErasedType(t)) { return false; }
@@ -1206,68 +1230,74 @@ partial class Irgen {
 
     void EmitLocalReleases() {
         int i = 0;
-        while (i < locals.Count) {
-            if (ArcManaged(locals[i].type)) {
-                string lt = MapType(locals[i].type);
+        while (i < locName.Count) {
+            if (ArcManaged(locType[i])) {
+                string lt = MapType(locType[i]);
                 string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locals[i].reg);
-                EmitArcRelease(t, locals[i].type);
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                EmitArcRelease(t, locType[i]);
             }
             i = i + 1;
         }
     }
 
     void AddTemp(string op, Node ty) {
-        if (ArcManaged(ty)) { stmtTemps.Add(new StmtTempEntry(op, ty)); }
+        if (ArcManaged(ty)) { stmtTemps.Add(op); stmtTempTypes.Add(ty); }
     }
 
     void EmitTempReleases() {
         int i = 0;
         while (i < stmtTemps.Count) {
-            EmitArcRelease(stmtTemps[i].op, stmtTemps[i].type);
+            EmitArcRelease(stmtTemps[i], stmtTempTypes[i]);
             i = i + 1;
         }
-        stmtTemps = new List<StmtTempEntry>();
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
     }
 
     void ReleaseLocalsFrom(int from) {
         int i = from;
-        while (i < locals.Count) {
-            if (locals[i].name.Length >= 6 && locals[i].name.Substring(0, 6) == "__qdot") { i = i + 1; continue; }
-            if (ArcManaged(locals[i].type)) {
-                string lt = MapType(locals[i].type);
+        while (i < locName.Count) {
+            // __qdot temps hold a borrowed `?.` receiver: not owned, never released
+            if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
+            if (ArcManaged(locType[i])) {
+                string lt = MapType(locType[i]);
                 string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locals[i].reg);
-                EmitArcRelease(t, locals[i].type);
+                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                EmitArcRelease(t, locType[i]);
             }
             i = i + 1;
         }
     }
 
     void TrimLocals(int to) {
-        List<LocalBinding> nl = new List<LocalBinding>();
+        List<string> nn = new List<string>();
+        List<Node> nt = new List<Node>();
+        List<string> nr = new List<string>();
         int i = 0;
         while (i < to) {
-            nl.Add(locals[i]);
+            nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
             i = i + 1;
         }
-        locals = nl;
+        locName = nn; locType = nt; locReg = nr;
     }
 
+    // per-class destructor: release every ARC-managed field, then return (the
+    // object storage itself is freed by zrelease after this runs).
     void EmitClassDtor(Node cls) {
         string cn = cls.sval;
         H("define void @" + cn + "_dtor(i8* %p) {");
         H("  %o = bitcast i8* %p to %" + cn + "*");
-        List<ClassFieldEntry> fields = new List<ClassFieldEntry>();
-        CollectFields(cls, fields);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
         int fb = FieldBase(cls);
         int i = 0;
         int seq = 0;
-        while (i < fields.Count) {
-            Node fty = fields[i].type;
-            if (ArcManaged(fty) && !WeakTy(fty)) {
+        while (i < names.Count) {
+            if (ArcManaged(types[i]) && !WeakTy(types[i])) {
                 int idx = fb + i;
-                string lt = MapType(fty);
+                string lt = MapType(types[i]);
                 string fp = "%f" + seq;
                 string fv = "%v" + seq;
                 H("  " + fp + " = getelementptr %" + cn + ", %" + cn + "* %o, i32 0, i32 " + idx);
@@ -1287,6 +1317,8 @@ partial class Irgen {
         H("}");
     }
 
+    // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
+    // amortised O(1) (capacity doubling); ToString materialises one string.
     void EmitSbRuntime() {
         H("%zsb = type { i64, i64, i8* }");
         H("define void @zsb_dtor(i8* %p) {");
@@ -1352,12 +1384,15 @@ partial class Irgen {
         H("}");
     }
 
+    // String helpers needing loops: LastIndexOf, Replace, Trim, ToUpper/ToLower.
+    // Emitted only when a program uses one of them (usesStrOps).
     void EmitStrOpsRuntime() {
         EmitStrOpsSearch();
         EmitStrOpsTransform();
         EmitStrOpsSplitJoin();
     }
 
+    /// zstr_lastidx / zstr_replace.
     void EmitStrOpsSearch() {
         if (!ExternSeen("strstr")) { externDecls.Add("strstr"); H("declare i8* @strstr(i8*, i8*)"); }
         if (!ExternSeen("strncmp")) { externDecls.Add("strncmp"); H("declare i32 @strncmp(i8*, i8*, i64)"); }
@@ -1440,6 +1475,7 @@ partial class Irgen {
         H("}");
     }
 
+    /// zstr_trim / zstr_case / zstr_split.
     void EmitStrOpsTransform() {
         H("define i8* @zstr_trim(i8* %s) {");
         H("entry:");
@@ -1576,6 +1612,7 @@ partial class Irgen {
         H("}");
     }
 
+    /// zstr_join / zstr_isempty.
     void EmitStrOpsSplitJoin() {
         H("define i8* @zstr_join(i8* %sep, i8* %lst) {");
         H("entry:");
@@ -1656,12 +1693,16 @@ partial class Irgen {
         H("}");
     }
 
+    // Dictionary<string,V>: growable parallel arrays { count, cap, i8** keys,
+    // i64* values } with linear-scan lookup. Set updates in place on an existing
+    // key, otherwise appends (capacity doubling). Keys are strings (strcmp).
     void EmitDictRuntime() {
         EmitDictRuntimeCore();
         EmitDictRuntimeMutate();
         EmitDictRuntimeQuery();
     }
 
+    /// %zdict type + dtor/new/keys/values/index.
     void EmitDictRuntimeCore() {
         H("%zdict = type { i64, i64, i8**, i64*, i64 }");
         H("define void @zdict_dtor(i8* %p) {");
@@ -1799,6 +1840,7 @@ partial class Irgen {
         H("}");
     }
 
+    /// zdict_set / zdict_get (insert-or-update + lookup).
     void EmitDictRuntimeMutate() {
         H("define void @zdict_set(i8* %p, i8* %key, i64 %val) {");
         H("entry:");
@@ -1891,6 +1933,7 @@ partial class Irgen {
         H("}");
     }
 
+    /// zdict_contains / zdict_remove / zdict_count.
     void EmitDictRuntimeQuery() {
         H("define i64 @zdict_contains(i8* %p, i8* %key) {");
         H("  %idx = call i64 @zdict_index(i8* %p, i8* %key)");
@@ -1954,6 +1997,59 @@ partial class Irgen {
         H("  %c = load i64, i64* %cptr");
         H("  ret i64 %c");
         H("}");
+        H("define void @zdict_clear(i8* %p) {");
+        H("  %d = bitcast i8* %p to %zdict*");
+        H("  %cptr = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %vptr = getelementptr %zdict, %zdict* %d, i32 0, i32 3");
+        H("  %vals = load i64*, i64** %vptr");
+        H("  %optr = getelementptr %zdict, %zdict* %d, i32 0, i32 4");
+        H("  %owns = load i64, i64* %optr");
+        H("  %owned = icmp ne i64 %owns, 0");
+        H("  br i1 %owned, label %loop, label %done");
+        H("loop:");
+        H("  %i = alloca i64");
+        H("  store i64 0, i64* %i");
+        H("  br label %lc");
+        H("lc:");
+        H("  %iv = load i64, i64* %i");
+        H("  %more = icmp slt i64 %iv, %count");
+        H("  br i1 %more, label %lb, label %done");
+        H("lb:");
+        H("  %vp = getelementptr i64, i64* %vals, i64 %iv");
+        H("  %vv = load i64, i64* %vp");
+        H("  %obj = inttoptr i64 %vv to i8*");
+        H("  call void @zrelease(i8* %obj)");
+        H("  %next = add i64 %iv, 1");
+        H("  store i64 %next, i64* %i");
+        H("  br label %lc");
+        H("done:");
+        H("  store i64 0, i64* %cptr");
+        H("  ret void");
+        H("}");
+    }
+
+    void EmitStrcmp0() {
+        H("define internal i32 @__zan_strcmp0(i8* %a, i8* %b) {");
+        H("entry:");
+        H("  %p_eq = icmp eq i8* %a, %b");
+        H("  br i1 %p_eq, label %ret_zero, label %chk_a");
+        H("chk_a:");
+        H("  %a_null = icmp eq i8* %a, null");
+        H("  br i1 %a_null, label %ret_neg, label %chk_b");
+        H("chk_b:");
+        H("  %b_null = icmp eq i8* %b, null");
+        H("  br i1 %b_null, label %ret_pos, label %do_cmp");
+        H("do_cmp:");
+        H("  %r = call i32 @strcmp(i8* %a, i8* %b)");
+        H("  ret i32 %r");
+        H("ret_zero:");
+        H("  ret i32 0");
+        H("ret_neg:");
+        H("  ret i32 -1");
+        H("ret_pos:");
+        H("  ret i32 1");
+        H("}");
     }
 
     void GenClass(Node cls) {
@@ -1962,6 +2058,7 @@ partial class Irgen {
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
             if (m.kind == AK.MethodDecl()) {
+                // abstract/interface methods have no body: no function is emitted
                 if (HasMod(m, MOD.Extern())) { DeclareExtern(cls, m); }
                 else if (!IsAbstract(m)) { GenMethod(cls, m, false); }
             }
@@ -1975,21 +2072,28 @@ partial class Irgen {
     void StartFn() {
         tmp = 0; lbl = 0; term = false;
         curLbl = "entry";
-        locals = new List<LocalBinding>();
+        locName = new List<string>();
+        locType = new List<Node>();
+        locReg = new List<string>();
         locSeq = 0;
-        stmtTemps = new List<StmtTempEntry>();
+        stmtTemps = new List<string>();
+        stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
-        gotoLabels = new List<GotoLabelEntry>();
+        gotoNames = new List<string>();
+        gotoIds = new List<int>();
     }
 
+    // Resolve a goto label name to a stable per-function label id, allocating
+    // one on first use so forward references (goto before label) work.
     int LabelId(string name) {
         int i = 0;
-        while (i < gotoLabels.Count) {
-            if (gotoLabels[i].name == name) { return gotoLabels[i].id; }
+        while (i < gotoNames.Count) {
+            if (gotoNames[i] == name) { return gotoIds[i]; }
             i = i + 1;
         }
         int id = NL();
-        gotoLabels.Add(new GotoLabelEntry(name, id));
+        gotoNames.Add(name);
+        gotoIds.Add(id);
         return id;
     }
 

@@ -1,0 +1,408 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Native ARM64/Darwin counterpart of rt_timer.c:1065-1150. No Zan C
+// runtime imports: only libSystem snprintf/strtod/strchr/atoi/strcmp.
+// Integrator: call EmitNumericRuntime() before Patch()/BuildMachO(), and
+// change the dbl_str/dbl_parse callers to BLInternal. Emit exactly once.
+// These are C-buffer functions, NOT heap-string constructors. dbl2str's
+// existing str_alloc/strcat2 path retains rc at -16 and ZANS|length at -8.
+// Like the reference, libc uses the ambient locale and FP rounding mode;
+// shortest round-trip assumes the normal round-to-nearest environment.
+// We deliberately preserve the reference's 17-digit fallback under other
+// rounding modes rather than promising a stronger round-trip contract.
+partial class Ngen {
+    void EmitNumericRuntime() {
+        NumericEmitDblStr();
+        NumericEmitDblParse();
+    }
+
+    void NumericText(int reg, string text) {
+        int idx = InternStr(text);
+        LoadSymRef("l_.str." + idx, reg);
+    }
+    // cmp rn, rm -- v10..v15 have no x86 mapping, so an unmapped side
+    // stages through scratch before the flags-form op
+    void NumericCmp(int rn, int rm) {
+        if (tgt86 == 1) {
+            int n = XMapReal(rn); int m = XMapReal(rm);
+            if (n >= 0 && m >= 0) { Xop(0x39, n, m); return; }
+            if (n >= 0) { XGetV(rm, 10); Xop(0x39, n, 10); return; }
+            if (m >= 0) { XGetV(rn, 11); Xop(0x39, 11, m); return; }
+            XGetV(rn, 11); XGetV(rm, 10); Xop(0x39, 11, 10);
+            return;
+        }
+        E4(0xEB00001F | (rm << 16) | (rn << 5)); // cmp xn, xm
+    }
+    void NumericCmpImm(int rn, int value) {
+        if (tgt86 == 1) {
+            int n = XMapReal(rn);
+            if (n >= 0) { X1(XrexW(0, n)); X1(0x81); X1(0xF8 | (n & 7)); X4(value); return; }
+            XGetV(rn, 11); X1(0x49); X1(0x81); X1(0xFB); X4(value);   // cmp r11, imm32
+            return;
+        }
+        E4(0xF100001F | (value << 10) | (rn << 5));
+    }
+    void NumericByte(int rd, int rn) {
+        GuardByte(rd, rn);                        // ldrb/movzx (dual-armed)
+    }
+    void NumericPut(int rt, int rn) {
+        if (tgt86 == 1) {
+            // mov [addr], value-byte -- either side may be a spill slot
+            int r = XMapReal(rt); int b = XMapReal(rn);
+            if (b < 0) { XGetV(rn, 11); b = 11; }
+            if (r < 0) { XGetV(rt, 10); XopMemR(0x88, 10, b, 0); }
+            else { XopMemR(0x88, r, b, 0); }
+        } else {
+            E4(0x39000000 | (rn << 5) | rt);         // strb wt, [xn]
+        }
+        AddImm(rn, rn, 1);
+    }
+    void NumericChar(int rn, int ch) {
+        LoadImm(15, ch);
+        NumericPut(15, rn);
+    }
+
+    // void dbl_str(char *buf=x0, uint64_t cap=x1, double v=d0 [arm64] /
+    // rdx bits [x86]). Frame below saved fp/lr, offsets from sp (240 bytes,
+    // 16 aligned):
+    //   0..15 outgoing Darwin variadics (int@0, double@8 for %.*e)
+    //   32 m[40], 80 sig[24], 112 out[48]
+    //   176 buf, 184 cap, 192 v bits, 200 precision (1..17).
+    // No live caller-saved registers survive a libc call. No x18 usage.
+    void NumericEmitDblStr() {
+        syms.Add(new Sym("_zan_rt_dbl_str", FnPad()));
+        RtPrologue();
+        AddSPImm(240, false);
+        StrU(0, 31, 176);
+        StrU(1, 31, 184);
+        if (tgt86 == 1) { MovRR(9, 2); }       // v rides rdx as bits on x86
+        else { E4(0x9E660009); }               // fmov x9, d0
+        StrU(9, 31, 192);
+        int nan = NL(); int zero = NL(); int inf = NL();
+        int finish = NL(); int search = NL(); int split = NL();
+        if (tgt86 == 1) {
+            // comisd xmm0, [rsp+192] against itself: only NaN is unordered
+            // (192 needs the mod=10 disp32 form -- disp8 would decode as -64)
+            X2(0xF2, 0x0F); X2(0x10, 0x84); X1(0x24); X4(0xC0);   // movsd xmm0, [rsp+192]
+            X3(0x66, 0x0F, 0x2F); X1(0xC0);                   // comisd xmm0, xmm0
+            EmitBcond(6, nan);                 // vs -> jp: unordered
+        } else {
+            E4(0x1E602000);                        // fcmp d0, d0
+            EmitBcond(6, nan);                     // vs: unordered
+        }
+        LoadImm(10, 0x7FFFFFFFFFFFFFFF);
+        if (tgt86 == 1) {
+            XGetV(10, 11);                     // r11 = sign mask (v10 spills)
+            Xop(0x21, 0, 11);                  // and rax, r11 (absolute bits)
+        } else {
+            E4(0x8A0A0129);                    // and x9, x9, x10 (absolute bits)
+        }
+        CbzReg(9, zero);                       // both signed zeros -> "0"
+        LoadImm(10, 0x7FF0000000000000);
+        NumericCmp(9, 10);
+        EmitBcond(0, inf);
+
+        LoadImm(9, 1);
+        StrU(9, 31, 200);
+        Mark(search);
+        // snprintf(m, 40, "%.*e", p-1, v). Darwin's unnamed FP arg
+        // goes on STACK, not d0; int takes 4 bytes, double aligns to 8.
+        // Linux AAPCS64: unnamed args ride in w3 (int) and d0 (double).
+        // x86 SysV: int -> rcx, the vector arg -> xmm0 with al=1.
+        LdrU(9, 31, 200);
+        SubImm(9, 9, 1);
+        if (tgt86 == 1) {
+            MovRR(3, 9);                       // rcx = p-1
+        } else if (EnvTargetElf() == 1) {
+            MovRR(3, 9);                       // w3 = p-1
+        } else {
+            StrU(9, 31, 0);                    // [sp] = p-1
+        }
+        if (tgt86 == 1) {
+            GuardSp(0, 32);                    // rdi = m
+            LoadImm(1, 40);                    // rsi = cap
+            NumericText(2, "%.*e");            // rdx = fmt
+            X2(0xF2, 0x0F); X2(0x10, 0x84); X1(0x24); X4(0xC0);   // movsd xmm0, [rsp+192] (FP vararg)
+            X2(0xB0, 0x01);                    // mov al, 1 (one vector arg)
+            BLExtern("_snprintf");
+        } else {
+            LdrU(9, 31, 192);
+            if (EnvTargetElf() == 1) {
+                E4(0x9E670120);                    // fmov d0, x9 (v bit pattern)
+            } else {
+                StrU(9, 31, 8);                    // [sp+8] = v
+            }
+            AddImm(0, 31, 32);
+            LoadImm(1, 40);
+            NumericText(2, "%.*e");
+            BLExtern("_snprintf");
+        }
+        // At p=17 this is precisely the reference's final %.16e.
+        LdrU(9, 31, 200);
+        NumericCmpImm(9, 17);
+        EmitBcond(0, split);
+        if (tgt86 == 1) {
+            // strtod round-trip: parsed (xmm0) == v bits?
+            int xpp = NL();
+            GuardSp(0, 32);
+            LoadImm(1, 0);
+            BLExtern("_strtod");               // xmm0 = parsed double
+            X2(0xF2, 0x0F); X2(0x10, 0x8C); X1(0x24); X4(0xC0);   // movsd xmm1, [rsp+192]
+            X3(0x66, 0x0F, 0x2F); X1(0xC1);                   // comisd xmm0, xmm1
+            EmitBcond(6, xpp);                 // unordered -> keep searching
+            EmitBcond(0, split);               // ordered equal -> done
+            EmitB(xpp);                        // ordered unequal -> p++
+            Mark(xpp);
+            LdrU(9, 31, 200);
+            AddImm(9, 9, 1);
+            StrU(9, 31, 200);
+            EmitB(search);
+        } else {
+            AddImm(0, 31, 32);
+            LoadImm(1, 0);
+            BLExtern("_strtod");
+            LdrU(9, 31, 192);
+            E4(0x9E670121);                        // fmov d1, x9
+            E4(0x1E612000);                        // fcmp d0, d1
+            EmitBcond(0, split);
+            LdrU(9, 31, 200);
+            AddImm(9, 9, 1);
+            StrU(9, 31, 200);
+            EmitB(search);
+        }
+
+        Mark(split);
+        AddImm(0, 31, 32);
+        LoadImm(1, 101);                       // 'e'
+        BLExtern("_strchr");
+        AddImm(0, 0, 1);
+        BLExtern("_atoi");
+        if (tgt86 == 1) {
+            // v12 has no x86 real mapping: land the sign-extended exponent
+            // in scratch r10, then store it to v12's slot
+            X3(0x4C, 0x63, 0xD7);                  // movsxd r10, edi
+            XSetV(12, 10);
+        } else {
+            E4(0x93407C0C);                        // sxtw x12, w0 (e10)
+        }
+        AddImm(9, 31, 32);                     // q = m
+        AddImm(10, 31, 80);                    // digit write cursor
+        LoadImm(11, 0);                        // n
+        AddImm(13, 31, 112);                   // output cursor
+        NumericByte(14, 9);
+        NumericCmpImm(14, 45);
+        int digits = NL(); int digitLoop = NL(); int digitSkip = NL();
+        int trim = NL(); int trimmed = NL();
+        EmitBcond(1, digits);
+        NumericPut(14, 13);                    // negative sign
+        AddImm(9, 9, 1);
+        Mark(digits);
+        Mark(digitLoop);
+        NumericByte(14, 9);
+        NumericCmpImm(14, 101);
+        EmitBcond(0, trim);
+        NumericCmpImm(14, 48);
+        EmitBcond(3, digitSkip);               // lo
+        NumericCmpImm(14, 57);
+        EmitBcond(8, digitSkip);               // hi
+        NumericPut(14, 10);
+        AddImm(11, 11, 1);
+        Mark(digitSkip);
+        AddImm(9, 9, 1);
+        EmitB(digitLoop);
+        Mark(trim);
+        NumericCmpImm(11, 1);
+        EmitBcond(9, trimmed);                 // n <= 1
+        SubImm(9, 10, 1);
+        NumericByte(14, 9);
+        NumericCmpImm(14, 48);
+        EmitBcond(1, trimmed);
+        SubImm(10, 10, 1);
+        SubImm(11, 11, 1);
+        EmitB(trim);
+        Mark(trimmed);
+        Strb0(10);
+        AddImm(9, 31, 80);                     // sig read cursor
+        int scientific = NL(); int small = NL(); int fixedLoop = NL();
+        int fixedNext = NL(); int fixedDone = NL();
+        LoadImm(14, -4);
+        NumericCmp(12, 14);
+        EmitBcond(11, scientific);             // e10 < -4
+        NumericCmpImm(12, 14);
+        EmitBcond(12, scientific);             // e10 > 14
+        NumericCmpImm(12, 0);
+        EmitBcond(11, small);
+        // e10 >= 0: copy digits, insert a point only when digits remain,
+        // then pad to e10+1 digits if necessary. x10 is the digit index.
+        LoadImm(10, 0);
+        Mark(fixedLoop);
+        NumericCmp(10, 11);
+        EmitBcond(10, fixedDone);              // index >= n
+        NumericByte(14, 9);
+        NumericPut(14, 13);
+        AddImm(9, 9, 1);
+        NumericCmp(10, 12);
+        EmitBcond(1, fixedNext);
+        AddImm(14, 10, 1);
+        NumericCmp(14, 11);
+        EmitBcond(10, fixedNext);              // no trailing decimal point
+        NumericChar(13, 46);
+        Mark(fixedNext);
+        AddImm(10, 10, 1);
+        EmitB(fixedLoop);
+        Mark(fixedDone);
+        int pad = NL(); int outDone = NL();
+        Mark(pad);
+        NumericCmp(10, 12);
+        EmitBcond(12, outDone);
+        NumericChar(13, 48);
+        AddImm(10, 10, 1);
+        EmitB(pad);
+
+        Mark(small);
+        NumericChar(13, 48);
+        NumericChar(13, 46);
+        AddImm(10, 12, 1);                     // e10+1 zeros until zero
+        int smallPad = NL(); int copy = NL();
+        Mark(smallPad);
+        CbzReg(10, copy);
+        NumericChar(13, 48);
+        AddImm(10, 10, 1);
+        EmitB(smallPad);
+        Mark(copy);
+        NumericByte(14, 9);
+        CbzReg(14, outDone);
+        NumericPut(14, 13);
+        AddImm(9, 9, 1);
+        EmitB(copy);
+
+        Mark(scientific);
+        NumericByte(14, 9);
+        NumericPut(14, 13);
+        AddImm(9, 9, 1);
+        int exponent = NL(); int sciCopy = NL();
+        NumericCmpImm(11, 1);
+        EmitBcond(0, exponent);
+        NumericChar(13, 46);
+        Mark(sciCopy);
+        NumericByte(14, 9);
+        CbzReg(14, exponent);
+        NumericPut(14, 13);
+        AddImm(9, 9, 1);
+        EmitB(sciCopy);
+        Mark(exponent);
+        // Remaining space is >= 28 bytes. E%+03d is 4 or 5 bytes + NUL.
+        // Using libc here also preserves the reference's exponent padding.
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            MovRR(3, 12);                      // w3/rcx = exponent
+        } else {
+            StrU(12, 31, 0);                   // [sp] = exponent (Darwin)
+        }
+        MovRR(0, 13);
+        LoadImm(1, 16);
+        NumericText(2, "E%+03d");
+        if (tgt86 == 1) { X2(0x31, 0xC0); }    // al = 0 (no vector args)
+        BLExtern("_snprintf");
+        AddImm(9, 31, 112);
+        EmitB(finish);
+        Mark(outDone);
+        Strb0(13);
+        AddImm(9, 31, 112);
+        EmitB(finish);
+
+        Mark(nan);
+        NumericText(9, "NaN");
+        EmitB(finish);
+        Mark(zero);
+        NumericText(9, "0");
+        EmitB(finish);
+        Mark(inf);
+        LdrU(9, 31, 192);
+        NumericCmpImm(9, 0);
+        int negativeInf = NL();
+        EmitBcond(11, negativeInf);
+        NumericText(9, "Infinity");
+        EmitB(finish);
+        Mark(negativeInf);
+        NumericText(9, "-Infinity");
+        Mark(finish);
+        // snprintf supplies exactly the C reference's cap/NUL semantics,
+        // including buf==NULL when cap==0, and truncated special strings.
+        if (EnvTargetElf() == 1 || tgt86 == 1) {
+            MovRR(3, 9);                       // x3/rcx = s
+        } else {
+            StrU(9, 31, 0);                    // [sp] = s (Darwin)
+        }
+        LdrU(0, 31, 176);
+        LdrU(1, 31, 184);
+        NumericText(2, "%s");
+        if (tgt86 == 1) { X2(0x31, 0xC0); }    // al = 0 (no vector args)
+        BLExtern("_snprintf");
+        AddSPImm(240, true);
+        RtEpilogue();
+    }
+
+    // One exact-match special case. Saved s/endp are at sp+0/sp+8.
+    void NumericParseSpecial(string text, int length, long bits) {
+        int next = NL(); int done = NL();
+        LdrU(0, 31, 0);
+        NumericText(1, text);
+        BLExtern("_strcmp");
+        // strcmp returns int; test w0, not unspecified upper return bits.
+        if (tgt86 == 1) { X3(0x83, 0xF8, 0); }     // cmp eax, 0 (32-bit)
+        else { E4(0x7100001F); }                   // cmp w0, #0
+        EmitBcond(1, next);
+        LdrU(1, 31, 8);
+        CbzReg(1, done);
+        LdrU(0, 31, 0);
+        AddImm(0, 0, length);
+        StrU(0, 1, 0);
+        Mark(done);
+        if (tgt86 == 1) {
+            // 双返回走 FP ABI:调用点从 xmm0 取值(arm64 同 d0)。bits 先
+            // 落 rdi 再 movq 进 xmm0——之前直接把 bits 留在 rdi,调用点读
+            // xmm0 拿到的是 strcmp 链残留(XInf/NaN 全变 0/1.5e-317,批46
+            // numeric 现形;strtod 臂只是侥幸:xmm0 恰好还留着 strtod 值)。
+            LoadImm(0, bits);
+            X3(0x66, 0x48, 0x0F); X2(0x6E, 0xC7);  // movq xmm0, rdi
+        }
+        else {
+            LoadImm(9, bits);
+            E4(0x9E670120);                        // fmov d0, x9
+        }
+        AddSPImm(16, true);
+        RtEpilogue();
+        Mark(next);
+    }
+
+    // double dbl_parse(const char *s=x0, char **endp=x1), result d0 [arm64]
+    // / rdi bits [x86]. Exact C spellings first, then libc for whitespace,
+    // prefixes, hex, overflow/underflow and no-conversion endp semantics
+    // (no validation policy here: Parse/TryParse callers decide whether
+    // *endp is NUL).
+    void NumericEmitDblParse() {
+        syms.Add(new Sym("_zan_rt_dbl_parse", FnPad()));
+        RtPrologue();
+        AddSPImm(16, false);
+        StrU(0, 31, 0);
+        StrU(1, 31, 8);
+        int initialized = NL();
+        CbzReg(1, initialized);
+        StrU(0, 1, 0);
+        Mark(initialized);
+        NumericParseSpecial("NaN", 3, 0x7FF8000000000000);
+        NumericParseSpecial("Infinity", 8, 0x7FF0000000000000);
+        NumericParseSpecial("+Infinity", 9, 0x7FF0000000000000);
+        NumericParseSpecial("-Infinity", 9, -4503599627370496);
+        LdrU(0, 31, 0);
+        LdrU(1, 31, 8);
+        BLExtern("_strtod");
+        // x86:xmm0 已是 strtod 的返回,原样作为本函数的 FP 返回(调用点
+        // 从 xmm0 取)——之前 movq rdi, xmm0 把 bits 搬去 rdi,单纯靠
+        // xmm0 未被覆盖才侥幸对。arm64 d0 同样直通。
+        AddSPImm(16, true);
+        RtEpilogue();
+    }
+}

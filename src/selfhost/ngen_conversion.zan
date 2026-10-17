@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Integration contract (all values use the existing x0 bit-pattern ABI):
+// MethSymNg FIRST: string cs = ConversionSymNg(cls,m); if (cs != null) return cs;
+// CastExpr FIRST: if (TryGenConversionCastNg(e)) return;
+// VarDecl/Return/plain Assignment: replace GenExpr + GenCloneIfStruct +
+// numeric widening with GenConversionValueNg(expr, destinationType).
+// ConvArg FIRST (x0 already evaluated AND source cloned):
+// if (TryEmitConversionNg(arg,TypeFullName(p.type),false,false)) return;
+// WrapImplicitCtorArg FIRST: if (ConversionIndexNg(ConversionExprTyNg(arg),
+// TypeFullName(p.type),false) != -1) return null; (operators precede ctor sugar).
+// ArgParamScore before literal disqualification: implicit match scores 2.
+// Binary AFTER TryOpOverloadNg, BEFORE builtin cases:
+// else if (TryGenConversionBinaryNg(e)) { }
+// The binary hook wraps operands in casts and reuses existing code emission;
+// no numeric bytecode is duplicated. Explicit-only operators never enter it.
+// Optional: params elements/field initializers use GenConversionValueNg too.
+partial class Ngen {
+    List<Node> conversionImplicitCasts;
+
+    bool IsConversionNg(Node m) {
+        return m != null && (m.sval == "op_implicit" || m.sval == "op_explicit");
+    }
+
+    // Length-delimited full names retain arrays and generic arguments, unlike
+    // TypeTagNg, and distinguish conversions with identical input parameters.
+    string ConversionSymNg(string cls, Node m) {
+        if (!IsConversionNg(m)) { return null; }
+        string rt = TypeFullName(m.type);
+        string s = "_" + cls + "_" + m.sval + "__to" + rt.Length + "_" + rt;
+        int i = 0;
+        while (i < ParamCount(m)) {
+            Node pi = ParamAt(m, i);
+            string pt = (pi != null && pi.type != null) ? TypeFullName(pi.type) : "object";
+            s = s + "__from" + pt.Length + "_" + pt;
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // Exact concrete source AND target, declared on either endpoint only.
+    // -1 means absent; -2 means ambiguous (never choose declaration order).
+    int ConversionNamedIndexNg(string from, string to, string name) {
+        if (from == null || to == null || from == "" || to == "" || from == to) { return -1; }
+        int found = -1;
+        List<int> cs = MethCandsName(name);
+        if (cs != null) {
+            int i = 0;
+            while (i < cs.Count) {
+                int mi = cs[i];
+                Node m = methNodes[mi];
+                if (methStat[mi] == 1 && !HasTypeParams(m)
+                        && (methCls[mi] == from || methCls[mi] == to)
+                        && TypeFullName(m.type) == to && ParamCount(m) == 1) {
+                    Node p = ParamAt(m, 0);
+                    if (p != null && p.ival != 1 && p.op != 1 && p.type != null && TypeFullName(p.type) == from) {
+                        if (found >= 0) { return -2; }
+                        found = mi;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return found;
+    }
+
+    int ConversionIndexNg(string from, string to, bool allowExplicit) {
+        if (allowExplicit) {
+            int ex = ConversionNamedIndexNg(from, to, "op_explicit");
+            if (ex != -1) { return ex; }
+        }
+        return ConversionNamedIndexNg(from, to, "op_implicit");
+    }
+
+    string ConversionExprTyNg(Node e) {
+        if (e == null) { return null; }
+        if (e.kind == AK.CastExpr() || e.kind == AK.AsExpr()) { return TypeFullName(e.type); }
+        if (e.kind == AK.Assignment()) { return AssignTargetTy(e.a); }
+        string t = StaticTyOf(e);
+        if (t != null && t != "") { return t; }
+        if (e.kind == AK.NullLit()) { return null; }
+        if (e.kind == AK.StringLit() || IsStrExpr(e)) { return "string"; }
+        if (e.kind == AK.FloatLit() || IsDblExpr(e)) { return "double"; }
+        if (e.kind == AK.BoolLit() || IsBoolExpr(e)) { return "bool"; }
+        if (e.kind == AK.CharLit()) { return "char"; }
+        if (IsUlongExpr(e)) { return "ulong"; }
+        if (e.kind == AK.IntLit()) { return "int"; }
+        t = ArgSrcTy(e);
+        if (t != null) { return t; }
+        if (e.kind == AK.Unary()) { return ConversionExprTyNg(e.a); }
+        if (e.kind == AK.Binary()) {
+            string a = ConversionExprTyNg(e.a);
+            string b = ConversionExprTyNg(e.b);
+            if (a == b) { return a; }
+        }
+        return null;
+    }
+
+    // x0 has the source value. False emits NOTHING; true leaves the final
+    // destination value in x0. cloneSource=false is for legacy ConvArg only.
+    bool TryEmitConversionNg(Node expr, string to, bool allowExplicit, bool cloneSource) {
+        string from = ConversionExprTyNg(expr);
+        int mi = ConversionIndexNg(from, to, allowExplicit);
+        if (mi == -1) {
+            if (!allowExplicit && ConversionNamedIndexNg(from, to, "op_explicit") != -1) {
+                diags.Error("ngen: explicit conversion required from '" + from + "' to '" + to + "'", expr.line, expr.col);
+                return true;
+            }
+            return false;
+        }
+        if (mi == -2) {
+            diags.Error("ngen: ambiguous user conversion '" + from + "' to '" + to + "'", expr.line, expr.col);
+            return true;
+        }
+        if (cloneSource) { GenCloneIfStruct(expr); }
+        Node m = methNodes[mi];
+        if (HasMod(m, MOD.Extern())) { BLExtern(ExternSymNg(m)); }
+        else { BLInternal(MethSymNg(methCls[mi], m)); }
+        return true;
+    }
+
+    // Full implicit value boundary; use INSTEAD OF the old source clone and
+    // ConvI2D, never before them (cloning a converted scalar as a struct is bad).
+    void GenConversionValueNg(Node expr, string to) {
+        GenExpr(expr);
+        if (TryEmitConversionNg(expr, to, false, true)) { return; }
+        // a nullable target boxes a raw payload into its cell; null
+        // literals and already-nullable sources ride as the null cell /
+        // pointer unchanged. Struct payloads clone first (value semantics).
+        if (to != null && IsNulTy(to) && !IsNulExpr(expr)) {
+            GenCloneIfStruct(expr);
+            GenNulWrap(IsDblTy(NulPayOf(to)));
+            return;
+        }
+        GenCloneIfStruct(expr);
+        if (to != null && IsDblTy(to) && !IsDblExpr(expr)) {
+            ConvI2D();
+            if (to == "float") { NarrowF32(); }          // float slots round on the way in
+            return;
+        }
+        if (to == "float" && !IsStrExpr(expr)) { NarrowF32(); return; }
+        // a long-valued literal (decimal 4294967295) narrowing into an int
+        // slot keeps the low 32 bits two's-complement, like gen0
+        if (to == "int" && !IsDblExpr(expr) && !IsStrExpr(expr)) { Sxtw0(); }   // sxtw x0, w0
+        // uint targets wrap the same way but zero-extend (umax + 1 -> 0)
+        else if (to == "uint" && !IsDblExpr(expr) && !IsStrExpr(expr)) { E4(0xD3407C00); }   // ubfm: zero-extend low 32
+    }
+
+    bool TryGenConversionCastNg(Node e) {
+        if (e == null || e.type == null || e.b == null) { return false; }
+        string to = TypeFullName(e.type);
+        bool allowExplicit = true;
+        int i = 0;
+        if (conversionImplicitCasts != null) {
+            while (i < conversionImplicitCasts.Count) {
+                if (conversionImplicitCasts[i] == e) { allowExplicit = false; }
+                i = i + 1;
+            }
+        }
+        if (ConversionIndexNg(ConversionExprTyNg(e.b), to, allowExplicit) == -1) { return false; }
+        GenExpr(e.b);
+        TryEmitConversionNg(e.b, to, allowExplicit, true);
+        return true;
+    }
+
+    int ConversionArgScoreNg(Node arg, string to) {
+        int mi = ConversionIndexNg(ConversionExprTyNg(arg), to, false);
+        if (mi == -2) { return -100; }
+        return mi >= 0 ? 2 : 0;
+    }
+
+    Node ConversionCastNodeNg(Node e, string to) {
+        Node c = new Node(AK.CastExpr());
+        c.line = e.line; c.col = e.col; c.b = e;
+        c.type = new Node(AK.TypeRef()); c.type.sval = to;
+        if (conversionImplicitCasts == null) { conversionImplicitCasts = new List<Node>(); }
+        conversionImplicitCasts.Add(c);
+        return c;
+    }
+
+    bool ConversionNumericTyNg(string t) {
+        return t == "double" || t == "float" || t == "int" || t == "long"
+            || t == "uint" || t == "ulong" || t == "short" || t == "ushort"
+            || t == "byte" || t == "sbyte" || t == "char";
+    }
+
+    // Only a builtin numeric peer supplies a target. No speculative chain,
+    // no guessing between two user types, and no change to string concat/null.
+    bool TryGenConversionBinaryNg(Node e) {
+        int op = e.op;
+        if (op != TK.Plus() && op != TK.Minus() && op != TK.Star()
+                && op != TK.Slash() && op != TK.Percent() && op != TK.Less()
+                && op != TK.Greater() && op != TK.LessEq() && op != TK.GreaterEq()
+                && op != TK.EqEq() && op != TK.BangEq()) { return false; }
+        string a = ConversionExprTyNg(e.a);
+        string b = ConversionExprTyNg(e.b);
+        if (a == b || a == null || b == null) { return false; }
+        Node left = e.a; Node right = e.b;
+        if (ConversionNumericTyNg(a) && ConversionIndexNg(b, a, false) != -1) {
+            right = ConversionCastNodeNg(e.b, a);
+        } else if (ConversionNumericTyNg(b) && ConversionIndexNg(a, b, false) != -1) {
+            left = ConversionCastNodeNg(e.a, b);
+        } else { return false; }
+        Node bin = new Node(AK.Binary());
+        bin.line = e.line; bin.col = e.col; bin.op = e.op;
+        bin.a = left; bin.b = right;
+        GenExpr(bin);
+        return true;
+    }
+}
