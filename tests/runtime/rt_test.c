@@ -47,6 +47,10 @@
   typedef pthread_t thread_t;
 #endif
 
+void *__real_malloc(size_t n) { return malloc(n); }
+void  __real_free(void *p) { free(p); }
+void *__real_calloc(size_t n, size_t m) { return calloc(n, m); }
+void *__real_realloc(void *p, size_t n) { return realloc(p, n); }
 
 static int g_checks = 0;
 static int g_fails  = 0;

@@ -10,6 +10,7 @@
 #include "rt_sched.h"
 #include "rt_io.h"
 #include "rt_timer.h"
+#include "rt_co.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -567,6 +568,11 @@ void zan_sched_init(void) {
     g_sched_stop = 0;
 
     g_worker_count = 1;
+    int cfg_w = zan_async_cfg_workers();
+    if (cfg_w > 1) {
+        if (cfg_w > ZAN_MAX_WORKERS) cfg_w = ZAN_MAX_WORKERS;
+        g_worker_count = cfg_w;
+    }
     const char *env = getenv("ZAN_SCHED_WORKERS");
     if (env && env[0]) {
         int w = atoi(env);
@@ -585,6 +591,12 @@ void zan_sched_init(void) {
 
 void zan_sched_run(void) {
     g_sched_stop = 0;
+
+    int cfg_w = zan_async_cfg_workers();
+    if (cfg_w > 1) {
+        if (cfg_w > ZAN_MAX_WORKERS) cfg_w = ZAN_MAX_WORKERS;
+        g_worker_count = cfg_w;
+    }
 
     /* 启动多 Worker 辅助线程 */
     for (int i = 1; i < g_worker_count; i++) {

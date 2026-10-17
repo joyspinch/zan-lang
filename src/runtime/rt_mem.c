@@ -27,17 +27,11 @@
 #include <windows.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-void * __attribute__((weak)) __real_malloc(size_t n) { return malloc(n); }
-void   __attribute__((weak)) __real_free(void *p) { free(p); }
-void * __attribute__((weak)) __real_calloc(size_t n, size_t m) { return calloc(n, m); }
-void * __attribute__((weak)) __real_realloc(void *p, size_t n) { return realloc(p, n); }
-#else
+/* The real allocator, behind the linker wrap. */
 void *__real_malloc(size_t n);
 void  __real_free(void *p);
 void *__real_calloc(size_t n, size_t m);
 void *__real_realloc(void *p, size_t n);
-#endif
 
 #define ZAN_MEM_MAX_SMALL   2048u
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
