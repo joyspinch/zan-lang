@@ -645,3 +645,7 @@ long long zan_mmap_unlink(const char *name) {
     return 0;
 }
 
+void zan_ui_thread_set(void) {}
+int32_t zan_ui_thread_check(void) { return 1; }
+void zan_ui_thread_assert(const char *msg) { (void)msg; }
+
