@@ -4,7 +4,7 @@ using System.IO;
 namespace System.IO.Compression;
 
 // 中途放弃时调 <see cref="Abort"/> 删掉半成品文件。
-class ZipWriter {
+public class ZipWriter : IDisposable {
     [DllImport("crt", EntryPoint = "zan_file_fopen")]
     static extern nint fopen(string path, string mode);
     [DllImport("crt")]
@@ -41,7 +41,7 @@ class ZipWriter {
     DeflateChunker curChunker;
 
     // 构造空写出器；实例经 <see cref="Open"/> 创建。
-    ZipWriter() {
+    public ZipWriter() {
         this.fp = 0;
         this.offsets = new List<long>();
         this.names = new List<string>();
@@ -53,7 +53,7 @@ class ZipWriter {
     }
 
     // 创建/截断归档文件。打不开时抛 IOException。
-    static ZipWriter Open(string path) {
+    public static ZipWriter Open(string path) {
         nint h = ZipWriter.fopen(path, "w+b");
         if (h == 0) { throw new IOException("Could not open file for writing: " + path); }
         ZipWriter w = new ZipWriter();
@@ -64,7 +64,7 @@ class ZipWriter {
 
     // 一次性写入整个条目（内容已在内存）。级别 0 存储，
     // 1-9 deflate；内容 < 64 字节时自动转为存储。
-    void AddEntry(string name, byte[] data, int level) {
+    public void AddEntry(string name, byte[] data, int level) {
         int crc = Crc32.Compute(data, 0, data.Length, 0);
         int method = Zip.MethodStored;
         byte[] payload = data;
@@ -86,7 +86,7 @@ class ZipWriter {
     // 开始一个分块条目：写出本地头（CRC/尺寸先占位，
     // <see cref="EndEntry"/> 时回填）。之后用 <see cref="WriteData"/>
     // 喂数据。级别 0 表示存储（原样写盘），1-9 分块 deflate。
-    void BeginEntry(string name, int level) {
+    public void BeginEntry(string name, int level) {
         this.curName = name;
         this.curMethod = level > 0 ? Zip.MethodDeflate : Zip.MethodStored;
         this.curLevel = level;
@@ -103,7 +103,7 @@ class ZipWriter {
     }
 
     // 向进行中的分块条目追加一块数据。
-    void WriteData(byte[] chunk, int len) {
+    public void WriteData(byte[] chunk, int len) {
         if (len <= 0) { return; }
         this.curCrc = Crc32.Compute(chunk, 0, len, this.curCrc);
         this.curUsize = this.curUsize + len;
@@ -119,7 +119,7 @@ class ZipWriter {
 
     // 结束进行中的分块条目：冲出压缩尾块、回填本地头的
     // CRC/尺寸、登记中央目录。
-    void EndEntry() {
+    public void EndEntry() {
         if (this.curMethod == Zip.MethodDeflate) {
             byte[] tail = this.curChunker.Finish();
             this.WriteRaw(tail, tail.Length);
@@ -144,7 +144,8 @@ class ZipWriter {
     }
 
     // 写中央目录与 EOCD，关闭文件。之后归档可读。
-    void Close() {
+    public void Close() {
+        if (this.fp == 0) { return; }
         long cdPos = this.Tell();
         int cdSize = 0;
         for (int i = 0; i < this.names.Count; i = i + 1) {
@@ -190,12 +191,25 @@ class ZipWriter {
     }
 
     // 关闭并删除半成品归档（导出被取消/出错时用）。
-    void Abort() {
+    public void Abort() {
         if (this.fp != 0) {
             ZipWriter.fclose(this.fp);
             this.fp = 0;
         }
         ZipWriter.remove(this.path);
+    }
+
+    public void Dispose() {
+        if (this.fp != 0) {
+            this.Close();
+        }
+    }
+
+    ~ZipWriter() {
+        if (this.fp != 0) {
+            ZipWriter.fclose(this.fp);
+            this.fp = 0;
+        }
     }
 
     // 30 字节本地文件头（不含名称）。签名+版本+标志+方法+时间

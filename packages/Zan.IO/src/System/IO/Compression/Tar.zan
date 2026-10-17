@@ -4,7 +4,7 @@ using System.IO;
 namespace System.IO.Compression;
 
 // ustar 前缀字段，因此长路径也能保留。
-class Tar {
+public class Tar {
     [DllImport("crt", EntryPoint = "fopen")]
     static extern nint PlatFopen(string path, string mode);
 
@@ -21,7 +21,7 @@ class Tar {
     // 标记 isDirectory（或名称以 "/" 结尾）。mode 为 0 时文件取 0644、
     // 目录取 0755；超过 100 字节的路径按 ustar 规则拆入 prefix 字段，
     // 无法拆分时截断到 100 字节。归档以两个 512 字节零块结尾。
-    static byte[] Create(List<TarEntry> entries) {
+    public static byte[] Create(List<TarEntry> entries) {
         // 每个头部 512 字节；数据按 512 字节边界补齐。
         int total = 1024;  // 结尾的两个零块
         int i = 0;
@@ -52,7 +52,7 @@ class Tar {
     // 校验和；归档损坏（校验和不符、size 越界）返回 null。普通文件
     // 与目录照常解析，符号链接/设备等特殊条目 data 为 null、
     // isDirectory 为 false。
-    static List<TarEntry> Read(byte[] tar) {
+    public static List<TarEntry> Read(byte[] tar) {
         List<TarEntry> entries = new List<TarEntry>();
         int pos = 0;
         while (pos + 512 <= tar.Length) {
@@ -257,7 +257,7 @@ class Tar {
     // 整体读入内存，适合数百 MB 的运行时包）。支持 ustar 前缀长名与
     // GNU 长名（'L'）条目；符号链接/设备等条目被跳过。返回写出的文件与
     // 目录数，归档损坏或路径越界时返回 -1。
-    static int ExtractFile(string tarPath, string destDir) {
+    public static int ExtractFile(string tarPath, string destDir) {
         nint fp = PlatFopen(tarPath, "rb");
         if (fp == 0) { return 0 - 1; }
         string root = destDir;
@@ -270,57 +270,60 @@ class Tar {
         int count = 0;
         int failed = 0;
         bool more = true;
-        while (more) {
-            long got = PlatFread(hdr, 1, 512, fp);
-            if (got <= 0) {
-                more = false;
-            } else if (got < 512) {
-                failed = 1; more = false;
-            } else if (Tar.IsZeroBlock(hdr, 0)) {
-                more = false;
-            } else if (Tar.ParseOctal(hdr, 148, 8) != Tar.HeaderSum(hdr, 0)) {
-                failed = 1; more = false;
-            } else {
-                string name = Tar.ReadStr(hdr, 0, 100);
-                string prefix = Tar.ReadStr(hdr, 345, 155);
-                if (prefix.Length > 0) { name = prefix + "/" + name; }
-                if (longName.Length > 0) { name = longName; longName = ""; }
-                long size = Tar.ParseSize(hdr, 124);
-                int mode = Tar.ParseOctal(hdr, 100, 8);
-                int type = hdr[156] & 255;
-                long pad = ((size + 511) / 512) * 512 - size;
+        try {
+            while (more) {
+                long got = PlatFread(hdr, 1, 512, fp);
+                if (got <= 0) {
+                    more = false;
+                } else if (got < 512) {
+                    failed = 1; more = false;
+                } else if (Tar.IsZeroBlock(hdr, 0)) {
+                    more = false;
+                } else if (Tar.ParseOctal(hdr, 148, 8) != Tar.HeaderSum(hdr, 0)) {
+                    failed = 1; more = false;
+                } else {
+                    string name = Tar.ReadStr(hdr, 0, 100);
+                    string prefix = Tar.ReadStr(hdr, 345, 155);
+                    if (prefix.Length > 0) { name = prefix + "/" + name; }
+                    if (longName.Length > 0) { name = longName; longName = ""; }
+                    long size = Tar.ParseSize(hdr, 124);
+                    int mode = Tar.ParseOctal(hdr, 100, 8);
+                    int type = hdr[156] & 255;
+                    long pad = ((size + 511) / 512) * 512 - size;
 
-                if (size < 0) {
-                    failed = 1; more = false;
-                } else if (type == 76) {  // GNU 长名条目
-                    longName = Tar.ReadName(fp, buf, size);
-                    if (longName == null) { failed = 1; more = false; }
-                    else if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
-                } else if (!Tar.SafeName(name)) {
-                    failed = 1; more = false;
-                } else if (type == 53 || name.EndsWith("/")) {  // 目录
-                    Directory.CreateDirectoryRecursive(root + name);
-                    count = count + 1;
-                    if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
-                } else if (type == 0 || type == 48) {  // 普通文件
-                    string outPath = root + name;
-                    int slash = Tar.LastSlash(outPath);
-                    if (slash > 0) {
-                        Directory.CreateDirectoryRecursive(outPath.Substring(0, slash));
-                    }
-                    if (!Tar.WriteMember(fp, buf, outPath, size)) {
+                    if (size < 0) {
                         failed = 1; more = false;
-                    } else {
+                    } else if (type == 76) {  // GNU 长名条目
+                        longName = Tar.ReadName(fp, buf, size);
+                        if (longName == null) { failed = 1; more = false; }
+                        else if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
+                    } else if (!Tar.SafeName(name)) {
+                        failed = 1; more = false;
+                    } else if (type == 53 || name.EndsWith("/")) {  // 目录
+                        Directory.CreateDirectoryRecursive(root + name);
                         count = count + 1;
-                        if ((mode & 73) != 0) { File.SetExecutable(outPath, true); }
-                        if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
+                        if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
+                    } else if (type == 0 || type == 48) {  // 普通文件
+                        string outPath = root + name;
+                        int slash = Tar.LastSlash(outPath);
+                        if (slash > 0) {
+                            Directory.CreateDirectoryRecursive(outPath.Substring(0, slash));
+                        }
+                        if (!Tar.WriteMember(fp, buf, outPath, size)) {
+                            failed = 1; more = false;
+                        } else {
+                            count = count + 1;
+                            if ((mode & 73) != 0) { File.SetExecutable(outPath, true); }
+                            if (!Tar.SkipBytes(fp, buf, pad)) { failed = 1; more = false; }
+                        }
+                    } else {  // 链接/设备/其他
+                        if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
                     }
-                } else {  // 链接/设备/其他
-                    if (!Tar.SkipBytes(fp, buf, size + pad)) { failed = 1; more = false; }
                 }
             }
+        } finally {
+            PlatFclose(fp);
         }
-        PlatFclose(fp);
         if (failed != 0) { return 0 - 1; }
         return count;
     }
@@ -329,7 +332,7 @@ class Tar {
     // 不含 ".." 段。注意 "\\" 仅在段边界处当分隔符参与 ".." 判定，
     // 普通段内的反斜杠不拒绝——Windows 上会原样成为文件名的一部分。
     // 非法时返回 false。
-    static bool SafeName(string name) {
+    public static bool SafeName(string name) {
         if (name.Length == 0) { return false; }
         int c0 = name[0] & 255;
         if (c0 == 47 || c0 == 92) { return false; }  // 绝对路径
@@ -365,17 +368,20 @@ class Tar {
         if (ofp == 0) { return false; }
         long left = size;
         bool ok = true;
-        while (ok && left > 0) {
-            long want = left > 65536 ? 65536 : left;
-            long got = PlatFread(buf, 1, want, fp);
-            if (got <= 0) { ok = false; }
-            else {
-                long put = PlatFwrite(buf, 1, got, ofp);
-                if (put != got) { ok = false; }
-                left = left - got;
+        try {
+            while (ok && left > 0) {
+                long want = left > 65536 ? 65536 : left;
+                long got = PlatFread(buf, 1, want, fp);
+                if (got <= 0) { ok = false; }
+                else {
+                    long put = PlatFwrite(buf, 1, got, ofp);
+                    if (put != got) { ok = false; }
+                    left = left - got;
+                }
             }
+        } finally {
+            PlatFclose(ofp);
         }
-        PlatFclose(ofp);
         return ok;
     }
 

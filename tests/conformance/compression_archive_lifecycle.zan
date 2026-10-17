@@ -1,0 +1,94 @@
+using System;
+using System.IO;
+using System.IO.Compression;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) {
+            Console.WriteLine("FAIL: " + label);
+            bad = bad + 1;
+        }
+    }
+
+    static void Main() {
+        bad = 0;
+
+        // 1. GZip Compress & Decompress
+        byte[] original = "Enterprise Zan Platform GZip Data Stream Payload 1234567890".ToBytes();
+        byte[] gzipped = GZip.Compress(original, 6);
+        Check(gzipped != null && gzipped.Length > 0, "gzip compress");
+        byte[] uncompressed = GZip.Decompress(gzipped);
+        Check(uncompressed != null && uncompressed.Length == original.Length, "gzip decompress length");
+        bool match = true;
+        for (int i = 0; i < original.Length; i = i + 1) {
+            if (original[i] != uncompressed[i]) { match = false; break; }
+        }
+        Check(match, "gzip decompress content");
+
+        // 2. Deflate & Inflate
+        byte[] deflated = Deflate.Deflate(original, 6);
+        Check(deflated != null && deflated.Length > 0, "deflate compress");
+        byte[] inflated = Deflate.Inflate(deflated, 0, deflated.Length, 0);
+        Check(inflated != null && inflated.Length == original.Length, "deflate inflate length");
+        bool matchDeflate = true;
+        for (int i = 0; i < original.Length; i = i + 1) {
+            if (original[i] != inflated[i]) { matchDeflate = false; break; }
+        }
+        Check(matchDeflate, "deflate content match");
+
+        // 3. Crc32
+        int crc = Crc32.Compute(original);
+        Check(crc != 0, "crc32 non-zero");
+        int crc2 = Crc32.Compute(original, 0, original.Length, 0);
+        Check(crc == crc2, "crc32 overload match");
+
+        // 4. Zip in-memory Create & Read & Extract
+        List<ZipEntry> entries = new List<ZipEntry>();
+        ZipEntry e1 = new ZipEntry("test1.txt", "Content of entry 1".ToBytes());
+        entries.Add(e1);
+        ZipEntry e2 = new ZipEntry("dir/");
+        e2.isDirectory = true;
+        entries.Add(e2);
+        ZipEntry e3 = new ZipEntry("dir/test2.txt", "Content of nested entry 2".ToBytes());
+        entries.Add(e3);
+
+        byte[] zipBytes = Zip.Create(entries, 6);
+        Check(zipBytes != null && zipBytes.Length > 0, "zip create");
+        List<ZipEntry> readEntries = Zip.Read(zipBytes);
+        Check(readEntries != null && readEntries.Count == 3, "zip read count");
+
+        byte[] ext1 = Zip.Extract(zipBytes, readEntries[0]);
+        Check(ext1 != null && ext1.Length == e1.data.Length, "zip extract e1 length");
+        byte[] ext3 = Zip.Extract(zipBytes, readEntries[2]);
+        Check(ext3 != null && ext3.Length == e3.data.Length, "zip extract e3 length");
+
+        // 5. Streaming ZipWriter with IDisposable using block
+        string tmpZip = "_scratch/test_stream_writer.zip";
+        using (ZipWriter zw = ZipWriter.Open(tmpZip)) {
+            zw.AddEntry("added.txt", "Added entry data".ToBytes(), 6);
+            zw.BeginEntry("streamed.txt", 6);
+            zw.WriteData("chunk1 ".ToBytes(), 7);
+            zw.WriteData("chunk2".ToBytes(), 6);
+            zw.EndEntry();
+        }
+
+        Check(File.Exists(tmpZip), "zipwriter file created");
+        byte[] diskZip = File.ReadAllBytes(tmpZip);
+        Check(diskZip != null && diskZip.Length > 0, "read disk zip");
+        List<ZipEntry> diskEntries = Zip.Read(diskZip);
+        Check(diskEntries != null && diskEntries.Count == 2, "disk entries count");
+        byte[] extStreamed = Zip.Extract(diskZip, diskEntries[1]);
+        Check(extStreamed != null && extStreamed.Length == 13, "streamed length match");
+
+        File.Delete(tmpZip);
+        Check(!File.Exists(tmpZip), "zipwriter cleanup file");
+
+        if (bad == 0) {
+            Console.WriteLine("PASS: compression archive lifecycle ok");
+        } else {
+            Console.WriteLine("FAIL: " + bad + " tests failed");
+        }
+    }
+}
