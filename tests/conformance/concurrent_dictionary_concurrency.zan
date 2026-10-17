@@ -1,0 +1,63 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Threading;
+
+class Program {
+    static async void Worker(ConcurrentDictionary<string, int> dict, int workerId, int count) {
+        for (int i = 0; i < count; i = i + 1) {
+            string key = "key_" + Convert.ToString(i);
+            dict.TryAdd(key, workerId);
+            dict.GetOrAdd(key, workerId);
+        }
+    }
+
+    static async void Main() {
+        ConcurrentDictionary<string, int> dict = new ConcurrentDictionary<string, int>(16);
+
+        // 验证单线程操作正确性
+        if (!dict.TryAdd("alpha", 100)) {
+            Console.WriteLine("FAIL: TryAdd alpha failed");
+            return;
+        }
+        if (dict.TryAdd("alpha", 200)) {
+            Console.WriteLine("FAIL: duplicate TryAdd succeeded");
+            return;
+        }
+
+        int val;
+        if (!dict.TryGetValue("alpha", out val) || val != 100) {
+            Console.WriteLine("FAIL: TryGetValue alpha incorrect");
+            return;
+        }
+
+        dict["beta"] = 300;
+        if (dict["beta"] != 300) {
+            Console.WriteLine("FAIL: indexer get/set incorrect");
+            return;
+        }
+
+        // 验证并发写入与冲突
+        for (int w = 0; w < 8; w = w + 1) {
+            Program.Worker(dict, w, 50);
+        }
+
+        await Task.Delay(80);
+
+        // 检查全局锁与计数聚合
+        int total = dict.Count();
+        if (total < 52) { // 50 keys from workers + alpha + beta
+            Console.WriteLine("FAIL: total count mismatch: " + Convert.ToString(total));
+            return;
+        }
+
+        // 验证快照提取无锁死
+        List<string> keys = dict.Keys();
+        if (keys.Count != total) {
+            Console.WriteLine("FAIL: keys snapshot count mismatch");
+            return;
+        }
+
+        Console.WriteLine("PASS: concurrent dictionary striped lock ok");
+    }
+}
