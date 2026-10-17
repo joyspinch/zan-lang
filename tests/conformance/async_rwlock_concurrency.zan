@@ -1,0 +1,85 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+class Program {
+    static async void Reader(AsyncRwLock rw, int id, List<int> reads) {
+        await rw.EnterRead();
+        // 验证读锁期间独占写者不能持有
+        if (rw.IsWriteLocked()) {
+            Console.WriteLine("FAIL: write lock held during read");
+        }
+        reads.Add(id);
+        rw.ExitRead();
+    }
+
+    static async void Writer(AsyncRwLock rw, int val, List<int> writes) {
+        await rw.EnterWrite();
+        // 验证写锁期间读者数为0
+        if (rw.ReaderCount() != 0) {
+            Console.WriteLine("FAIL: readers active during write");
+        }
+        writes.Add(val);
+        rw.ExitWrite();
+    }
+
+    static async void Main() {
+        AsyncRwLock rw = new AsyncRwLock();
+        List<int> reads = new List<int>();
+        List<int> writes = new List<int>();
+
+        // 阶段 1: 并发获取读锁
+        await rw.EnterRead();
+        if (rw.ReaderCount() != 1) {
+            Console.WriteLine("FAIL: reader count not 1");
+            return;
+        }
+
+        await rw.EnterRead();
+        if (rw.ReaderCount() != 2) {
+            Console.WriteLine("FAIL: reader count not 2");
+            return;
+        }
+
+        rw.ExitRead();
+        rw.ExitRead();
+
+        if (rw.ReaderCount() != 0) {
+            Console.WriteLine("FAIL: reader count not 0 after exits");
+            return;
+        }
+
+        // 阶段 2: 获取排他写锁
+        await rw.EnterWrite();
+        if (!rw.IsWriteLocked()) {
+            Console.WriteLine("FAIL: write lock not marked active");
+            return;
+        }
+        rw.ExitWrite();
+        if (rw.IsWriteLocked()) {
+            Console.WriteLine("FAIL: write lock still active after exit");
+            return;
+        }
+
+        // 阶段 3: 多读者与写者混合并发
+        for (int i = 0; i < 10; i = i + 1) {
+            Program.Reader(rw, i, reads);
+        }
+        Program.Writer(rw, 999, writes);
+
+        // 稍作让步等待协程执行完成
+        await Task.Delay(100);
+
+        if (reads.Count != 10) {
+            Console.WriteLine("FAIL: not all readers completed: " + Convert.ToString(reads.Count));
+            return;
+        }
+        if (writes.Count != 1) {
+            Console.WriteLine("FAIL: writer not completed");
+            return;
+        }
+
+        rw.Close();
+        Console.WriteLine("PASS: async rwlock concurrency ok");
+    }
+}

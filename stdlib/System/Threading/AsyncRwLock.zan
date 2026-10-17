@@ -6,12 +6,14 @@ namespace System.Threading;
 // 写者。等待者真正挂起在调度器上（经由 AsyncGate）——
 // 无轮询。写者优先：一旦写者排队，新读者
 // 便需等待，持续的读流不会饿死写操作。
+// 内部状态由 Mutex 进行轻量互斥保护，确保多 Worker 调度下的绝对线程安全。
 class AsyncRwLock {
     int readers;
     bool writer;
     int writersWaiting;
     AsyncGate readGate;
     AsyncGate writeGate;
+    nint mtx;
 
     AsyncRwLock() {
         this.readers = 0;
@@ -19,23 +21,40 @@ class AsyncRwLock {
         this.writersWaiting = 0;
         this.readGate = new AsyncGate();
         this.writeGate = new AsyncGate();
+        this.mtx = Mutex.Create();
+    }
+
+    ~AsyncRwLock() {
+        if (this.mtx != 0) {
+            Mutex.Destroy(this.mtx);
+            this.mtx = 0;
+        }
     }
 
     // 获取共享（读）访问；当写者持有锁
     // 或正在等待锁时挂起。
     async void EnterRead() {
-        while (this.writer || this.writersWaiting > 0) {
+        while (true) {
+            Mutex.Lock(this.mtx);
+            if (!this.writer && this.writersWaiting == 0) {
+                this.readers = this.readers + 1;
+                Mutex.Unlock(this.mtx);
+                // 级联唤醒，让所有排队的读者都能进入。
+                this.readGate.Signal();
+                return;
+            }
+            Mutex.Unlock(this.mtx);
             await this.readGate.Wait();
         }
-        this.readers = this.readers + 1;
-        // 级联唤醒，让所有排队的读者都能进入。
-        this.readGate.Signal();
     }
 
     // 释放共享访问。
     void ExitRead() {
+        Mutex.Lock(this.mtx);
         this.readers = this.readers - 1;
-        if (this.readers == 0) {
+        bool wakeWriter = (this.readers == 0);
+        Mutex.Unlock(this.mtx);
+        if (wakeWriter) {
             this.writeGate.Signal();
         }
     }
@@ -43,27 +62,48 @@ class AsyncRwLock {
     // 获取排他（写）访问；挂起直到所有读线程
     // 以及当前写线程都释放。
     async void EnterWrite() {
+        Mutex.Lock(this.mtx);
         this.writersWaiting = this.writersWaiting + 1;
-        while (this.writer || this.readers > 0) {
+        Mutex.Unlock(this.mtx);
+
+        while (true) {
+            Mutex.Lock(this.mtx);
+            if (!this.writer && this.readers == 0) {
+                this.writersWaiting = this.writersWaiting - 1;
+                this.writer = true;
+                Mutex.Unlock(this.mtx);
+                return;
+            }
+            Mutex.Unlock(this.mtx);
             await this.writeGate.Wait();
         }
-        this.writersWaiting = this.writersWaiting - 1;
-        this.writer = true;
     }
 
     // 释放排他访问，先唤醒排队的写线程，
     // 然后唤醒排队的读线程。
     void ExitWrite() {
+        Mutex.Lock(this.mtx);
         this.writer = false;
+        Mutex.Unlock(this.mtx);
         this.writeGate.Signal();
         this.readGate.Signal();
     }
 
     // 当前读线程数（诊断用）。
-    int ReaderCount() { return this.readers; }
+    int ReaderCount() {
+        Mutex.Lock(this.mtx);
+        int r = this.readers;
+        Mutex.Unlock(this.mtx);
+        return r;
+    }
 
     // 当前是否有写线程持有锁（诊断用）。
-    bool IsWriteLocked() { return this.writer; }
+    bool IsWriteLocked() {
+        Mutex.Lock(this.mtx);
+        bool w = this.writer;
+        Mutex.Unlock(this.mtx);
+        return w;
+    }
 
     // 释放读/写两个门的底层句柄（锁废弃时调用）。
     void Close() {
