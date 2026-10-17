@@ -7,11 +7,31 @@ namespace System.Threading;
 public class TaskScheduler {
     static List<UnobservedTaskExceptionHandler> handlers;
     static nint syncLock;
+    static AtomicInt initGate;
 
     static void EnsureInitialized() {
-        if (TaskScheduler.syncLock == 0) {
-            TaskScheduler.syncLock = Mutex.Create();
-            TaskScheduler.handlers = new List<UnobservedTaskExceptionHandler>();
+        if (TaskScheduler.syncLock != 0) {
+            return;
+        }
+
+        // 使用 AtomicInt CAS 抢占全局单例互斥锁初始化权，杜绝多线程竞争创建撕裂
+        if (TaskScheduler.initGate == null) {
+            TaskScheduler.initGate = new AtomicInt(0);
+        }
+
+        long old = TaskScheduler.initGate.CompareExchange(0, 1);
+        if (old == 0) {
+            if (TaskScheduler.syncLock == 0) {
+                TaskScheduler.syncLock = Mutex.Create();
+                TaskScheduler.handlers = new List<UnobservedTaskExceptionHandler>();
+            }
+            TaskScheduler.initGate.Store(2);
+        } else {
+            // 等待胜出线程完成单例初始化
+            while (TaskScheduler.initGate.Load() != 2) {
+                // 短暂让出 CPU 避免自旋锁死
+                Thread.Sleep(1);
+            }
         }
     }
 
