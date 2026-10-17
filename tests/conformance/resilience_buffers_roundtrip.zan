@@ -1,0 +1,151 @@
+using System;
+using System.Buffers;
+using System.Resilience;
+
+namespace ConformanceTests;
+
+class Program {
+    static void Main() {
+        TestArrayPool();
+        TestCircuitBreaker();
+        TestRetryStrategy();
+        TestTokenBucketRateLimiter();
+        Console.WriteLine("ALL RESILIENCE AND BUFFERS TESTS PASSED");
+    }
+
+    static void TestArrayPool() {
+        using (ArrayPool pool = ArrayPool.Create()) {
+            byte[] b1 = pool.Rent(64);
+            if (b1 == null || b1.Length < 64) {
+                Console.WriteLine("FAIL: ArrayPool Rent 64");
+            }
+
+            b1[0] = (byte)123;
+            b1[63] = (byte)234;
+
+            pool.Return(b1, true);
+
+            byte[] b2 = pool.Rent(64);
+            if (b2 == null || b2.Length < 64) {
+                Console.WriteLine("FAIL: ArrayPool Rent 64 reuse");
+            }
+            if (b2[0] != (byte)0) {
+                Console.WriteLine("FAIL: ArrayPool Return clearArray");
+            }
+
+            pool.Return(b2);
+        }
+
+        ArrayPool shared = ArrayPool.Shared;
+        if (shared == null) {
+            Console.WriteLine("FAIL: ArrayPool.Shared null");
+        }
+        byte[] sBuf = shared.Rent(128);
+        if (sBuf == null || sBuf.Length < 128) {
+            Console.WriteLine("FAIL: shared rent");
+        }
+        shared.Return(sBuf);
+
+        Console.WriteLine("OK: ArrayPool");
+    }
+
+    static void TestCircuitBreaker() {
+        using (CircuitBreaker cb = new CircuitBreaker(2, 500, 2)) {
+            if (cb.State() != CircuitState.Closed) {
+                Console.WriteLine("FAIL: initial state not Closed");
+            }
+            if (!cb.CanExecute()) {
+                Console.WriteLine("FAIL: initial CanExecute false");
+            }
+
+            cb.RecordFailure();
+            if (cb.State() != CircuitState.Closed) {
+                Console.WriteLine("FAIL: state after 1 failure not Closed");
+            }
+
+            cb.RecordFailure();
+            if (cb.State() != CircuitState.Open) {
+                Console.WriteLine("FAIL: state after 2 failures not Open");
+            }
+            if (cb.CanExecute()) {
+                Console.WriteLine("FAIL: Open CanExecute true");
+            }
+
+            cb.Reset();
+            if (cb.State() != CircuitState.Closed) {
+                Console.WriteLine("FAIL: reset state not Closed");
+            }
+            if (!cb.CanExecute()) {
+                Console.WriteLine("FAIL: reset CanExecute false");
+            }
+
+            cb.RecordSuccess();
+            if (cb.State() != CircuitState.Closed) {
+                Console.WriteLine("FAIL: RecordSuccess in Closed");
+            }
+        }
+
+        Console.WriteLine("OK: CircuitBreaker");
+    }
+
+    static void TestRetryStrategy() {
+        RetryStrategy strat = RetryStrategy.CreateDefault();
+        if (strat.MaxRetries() != 3) {
+            Console.WriteLine("FAIL: RetryStrategy MaxRetries");
+        }
+        if (strat.InitialDelayMs() != 50) {
+            Console.WriteLine("FAIL: RetryStrategy InitialDelayMs");
+        }
+        if (strat.MaxDelayMs() != 2000) {
+            Console.WriteLine("FAIL: RetryStrategy MaxDelayMs");
+        }
+
+        int d1 = strat.ComputeDelayMs(1);
+        int d2 = strat.ComputeDelayMs(2);
+        int d3 = strat.ComputeDelayMs(3);
+        int d10 = strat.ComputeDelayMs(10);
+
+        if (d1 != 50) {
+            Console.WriteLine("FAIL: ComputeDelayMs 1");
+        }
+        if (d2 != 100) {
+            Console.WriteLine("FAIL: ComputeDelayMs 2");
+        }
+        if (d3 != 200) {
+            Console.WriteLine("FAIL: ComputeDelayMs 3");
+        }
+        if (d10 != 2000) {
+            Console.WriteLine("FAIL: ComputeDelayMs 10 cap");
+        }
+
+        Console.WriteLine("OK: RetryStrategy");
+    }
+
+    static void TestTokenBucketRateLimiter() {
+        using (TokenBucketRateLimiter limiter = new TokenBucketRateLimiter(3, 10)) {
+            if (limiter.Capacity() != 3 || limiter.RefillRatePerSec() != 10) {
+                Console.WriteLine("FAIL: TokenBucketRateLimiter config");
+            }
+
+            bool a1 = limiter.TryAcquire();
+            bool a2 = limiter.TryAcquire();
+            bool a3 = limiter.TryAcquire();
+            bool a4 = limiter.TryAcquire();
+
+            if (!a1 || !a2 || !a3) {
+                Console.WriteLine("FAIL: TryAcquire within capacity");
+            }
+            if (a4) {
+                Console.WriteLine("FAIL: TryAcquire beyond capacity allowed");
+            }
+
+            limiter.Reset();
+            bool a5 = limiter.TryAcquire();
+            if (!a5) {
+                Console.WriteLine("FAIL: TryAcquire after Reset");
+            }
+        }
+
+        Console.WriteLine("OK: TokenBucketRateLimiter");
+    }
+}

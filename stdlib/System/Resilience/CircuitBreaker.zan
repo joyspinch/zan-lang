@@ -4,15 +4,15 @@ using System.Threading;
 namespace System.Resilience;
 
 // 熔断器状态机三态。
-public class CircuitBreaker {
-    CircuitState state;
-    int failureThreshold;
-    long breakDurationMs;
-    int successThreshold;
-    int consecutiveFailures;
-    int consecutiveSuccesses;
-    long trippedAtMs;
-    nint mtx;
+public class CircuitBreaker : IDisposable {
+    public CircuitState state;
+    public int failureThreshold;
+    public long breakDurationMs;
+    public int successThreshold;
+    public int consecutiveFailures;
+    public int consecutiveSuccesses;
+    public long trippedAtMs;
+    public nint mtx;
 
     public CircuitBreaker(int failureThreshold, long breakDurationMs, int successThreshold) {
         this.failureThreshold = failureThreshold > 0 ? failureThreshold : 5;
@@ -25,12 +25,24 @@ public class CircuitBreaker {
         this.mtx = Mutex.Create();
     }
 
+    ~CircuitBreaker() {
+        this.Dispose();
+    }
+
+    public void Dispose() {
+        if (this.mtx != 0) {
+            Mutex.Destroy(this.mtx);
+            this.mtx = 0;
+        }
+    }
+
     public static CircuitBreaker CreateDefault() {
         return new CircuitBreaker(5, 5000, 2);
     }
 
     // 获取当前生效的熔断状态（如果处于 Open 且熔断时间已过，自动推进至 HalfOpen）。
     public CircuitState State() {
+        if (this.mtx == 0) { return this.state; }
         Mutex.Lock(this.mtx);
         try {
             this.UpdateStateInternal();
@@ -42,6 +54,7 @@ public class CircuitBreaker {
 
     // 检查是否允许放行调用（Open 状态快速失败拦截，杜绝雪崩）。
     public bool CanExecute() {
+        if (this.mtx == 0) { return false; }
         Mutex.Lock(this.mtx);
         try {
             this.UpdateStateInternal();
@@ -59,6 +72,7 @@ public class CircuitBreaker {
 
     // 记录一次成功调用。
     public void RecordSuccess() {
+        if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
         try {
             if (this.state == CircuitState.HalfOpen) {
@@ -80,6 +94,7 @@ public class CircuitBreaker {
 
     // 记录一次失败调用。
     public void RecordFailure() {
+        if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
         try {
             long now = CircuitBreaker.NowMs();
@@ -104,6 +119,7 @@ public class CircuitBreaker {
 
     // 手动重置熔断器至 Closed 初始正常状态。
     public void Reset() {
+        if (this.mtx == 0) { return; }
         Mutex.Lock(this.mtx);
         try {
             this.state = CircuitState.Closed;

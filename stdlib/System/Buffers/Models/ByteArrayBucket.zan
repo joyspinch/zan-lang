@@ -4,7 +4,7 @@ using System.Threading;
 namespace System.Buffers;
 
 // 字节数组桶，管理特定容量梯度的数组缓存。
-class ByteArrayBucket {
+public class ByteArrayBucket : IDisposable {
     public int bufferLength;
     public int maxCount;
     public List<byte[]> buffers;
@@ -17,17 +17,36 @@ class ByteArrayBucket {
         this.syncLock = Mutex.Create();
     }
 
-    public byte[] Rent() {
-        Mutex.Lock(this.syncLock);
-        if (this.buffers.Count > 0) {
-            int lastIdx = this.buffers.Count - 1;
-            byte[] arr = this.buffers[lastIdx];
-            this.buffers.RemoveAt(lastIdx);
-            Mutex.Unlock(this.syncLock);
-            return arr;
+    ~ByteArrayBucket() {
+        this.Dispose();
+    }
+
+    public void Dispose() {
+        if (this.syncLock != 0) {
+            Mutex.Destroy(this.syncLock);
+            this.syncLock = 0;
         }
-        Mutex.Unlock(this.syncLock);
-        return new byte[this.bufferLength];
+        if (this.buffers != null) {
+            this.buffers.Clear();
+        }
+    }
+
+    public byte[] Rent() {
+        if (this.syncLock == 0) {
+            return new byte[this.bufferLength];
+        }
+        Mutex.Lock(this.syncLock);
+        try {
+            if (this.buffers.Count > 0) {
+                int lastIdx = this.buffers.Count - 1;
+                byte[] arr = this.buffers[lastIdx];
+                this.buffers.RemoveAt(lastIdx);
+                return arr;
+            }
+            return new byte[this.bufferLength];
+        } finally {
+            Mutex.Unlock(this.syncLock);
+        }
     }
 
     public void Return(byte[] array, bool clearArray) {
@@ -39,10 +58,16 @@ class ByteArrayBucket {
                 array[i] = (byte)0;
             }
         }
-        Mutex.Lock(this.syncLock);
-        if (this.buffers.Count < this.maxCount) {
-            this.buffers.Add(array);
+        if (this.syncLock == 0) {
+            return;
         }
-        Mutex.Unlock(this.syncLock);
+        Mutex.Lock(this.syncLock);
+        try {
+            if (this.buffers.Count < this.maxCount) {
+                this.buffers.Add(array);
+            }
+        } finally {
+            Mutex.Unlock(this.syncLock);
+        }
     }
 }

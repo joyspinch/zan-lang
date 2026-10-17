@@ -4,11 +4,11 @@ using System.Threading;
 namespace System.Buffers;
 
 // 工业级高性能分桶字节缓冲池，消除高频网络 IO、组帧与序列化过程中的频繁堆分配与内存碎片。
-public class ArrayPool {
+public class ArrayPool : IDisposable {
     static ArrayPool shared;
     static nint globalLock;
 
-    List<ByteArrayBucket> buckets;
+    public List<ByteArrayBucket> buckets;
 
     public ArrayPool() {
         this.buckets = new List<ByteArrayBucket>();
@@ -21,6 +21,32 @@ public class ArrayPool {
         }
     }
 
+    public ArrayPool(int maxArrayLength, int maxArraysPerBucket) {
+        this.buckets = new List<ByteArrayBucket>();
+        int sz = 16;
+        while (sz <= maxArrayLength) {
+            this.buckets.Add(new ByteArrayBucket(sz, maxArraysPerBucket));
+            if (sz > 0x3fffffff) { break; }
+            sz = sz * 2;
+        }
+    }
+
+    ~ArrayPool() {
+        this.Dispose();
+    }
+
+    public void Dispose() {
+        if (this.buckets != null) {
+            for (int i = 0; i < this.buckets.Count; i = i + 1) {
+                ByteArrayBucket b = this.buckets[i];
+                if (b != null) {
+                    b.Dispose();
+                }
+            }
+            this.buckets.Clear();
+        }
+    }
+
     // 全局共享缓冲池单例。
     public static ArrayPool Shared {
         get {
@@ -29,13 +55,26 @@ public class ArrayPool {
                     ArrayPool.globalLock = Mutex.Create();
                 }
                 Mutex.Lock(ArrayPool.globalLock);
-                if (ArrayPool.shared == null) {
-                    ArrayPool.shared = new ArrayPool();
+                try {
+                    if (ArrayPool.shared == null) {
+                        ArrayPool.shared = new ArrayPool();
+                    }
+                } finally {
+                    Mutex.Unlock(ArrayPool.globalLock);
                 }
-                Mutex.Unlock(ArrayPool.globalLock);
             }
             return ArrayPool.shared;
         }
+    }
+
+    // 创建新的隔离缓冲池实例。
+    public static ArrayPool Create() {
+        return new ArrayPool();
+    }
+
+    // 创建具有指定上限配置的新缓冲池实例。
+    public static ArrayPool Create(int maxArrayLength, int maxArraysPerBucket) {
+        return new ArrayPool(maxArrayLength, maxArraysPerBucket);
     }
 
     // 租借长度不小于 minimumLength 字节的缓冲区。
@@ -49,7 +88,7 @@ public class ArrayPool {
                 return b.Rent();
             }
         }
-        // 超过 1MB 梯度上限直接分配
+        // 超过梯度上限直接分配
         return new byte[minimumLength];
     }
 
