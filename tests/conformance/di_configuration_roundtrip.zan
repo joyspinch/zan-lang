@@ -1,0 +1,163 @@
+using System;
+using System.Configuration;
+using System.DependencyInjection;
+
+namespace ConformanceTests;
+
+class DisposableService : IDisposable {
+    public int id;
+    public bool disposed;
+
+    public DisposableService(int id) {
+        this.id = id;
+        this.disposed = false;
+    }
+
+    public void Dispose() {
+        this.disposed = true;
+    }
+}
+
+class TransientWorker {
+    public int tag;
+    public TransientWorker(int tag) {
+        this.tag = tag;
+    }
+}
+
+class Program {
+    static int nextId = 1;
+
+    static void Main() {
+        TestConfiguration();
+        TestDependencyInjection();
+        Console.WriteLine("ALL DI AND CONFIGURATION TESTS PASSED");
+    }
+
+    static void TestConfiguration() {
+        ConfigurationBuilder builder = new ConfigurationBuilder();
+        builder.AddInMemoryValue("AppName", "ZanApp");
+        builder.AddInMemoryValue("Database:Port", "5432");
+        builder.AddInMemoryValue("Database:Enabled", "true");
+        builder.AddInMemoryValue("Database:TimeoutMs", "30000");
+        builder.AddInMemoryValue("Server:Host", "${ZAN_NONEXISTENT_HOST:-127.0.0.1}");
+
+        using (IConfiguration config = builder.Build()) {
+            string appName = config.GetString("AppName", "");
+            if (appName != "ZanApp") {
+                Console.WriteLine("FAIL: config GetString AppName");
+            }
+
+            int port = config.GetInt("Database:Port", 0);
+            if (port != 5432) {
+                Console.WriteLine("FAIL: config GetInt Database:Port");
+            }
+
+            bool enabled = config.GetBool("Database:Enabled", false);
+            if (!enabled) {
+                Console.WriteLine("FAIL: config GetBool Database:Enabled");
+            }
+
+            long timeout = config.GetLong("Database:TimeoutMs", 0);
+            if (timeout != 30000) {
+                Console.WriteLine("FAIL: config GetLong Database:TimeoutMs");
+            }
+
+            string host = config.GetString("Server:Host", "");
+            if (host != "127.0.0.1") {
+                Console.WriteLine("FAIL: config placeholder fallback");
+            }
+
+            IConfigurationSection dbSec = config.GetSection("Database");
+            if (dbSec == null) {
+                Console.WriteLine("FAIL: GetSection Database");
+            } else {
+                if (dbSec.GetKey() != "Database" || dbSec.GetPath() != "Database") {
+                    Console.WriteLine("FAIL: Section Key/Path");
+                }
+                int secPort = dbSec.GetInt("Port", 0);
+                if (secPort != 5432) {
+                    Console.WriteLine("FAIL: Section GetInt Port");
+                }
+                bool secEnabled = dbSec.GetBool("Enabled", false);
+                if (!secEnabled) {
+                    Console.WriteLine("FAIL: Section GetBool Enabled");
+                }
+            }
+
+            int defInt = config.GetInt("Nonexistent:Key", 999);
+            if (defInt != 999) {
+                Console.WriteLine("FAIL: config default value");
+            }
+        }
+
+        Console.WriteLine("OK: Configuration");
+    }
+
+    static void SubTestDI(ServiceCollection services) {
+        using (ServiceProvider sp = services.BuildServiceProvider()) {
+            DisposableService title = (DisposableService)sp.GetService("ConfigTitle");
+            if (title == null || title.id != 100) {
+                Console.WriteLine("FAIL: DI SingletonInstance");
+            }
+
+            DisposableService s1 = (DisposableService)sp.GetService("SingletonCounter");
+            DisposableService s2 = (DisposableService)sp.GetService("SingletonCounter");
+            if (s1 == null || s2 == null || s1.id != s2.id) {
+                Console.WriteLine("FAIL: DI Singleton identity");
+            }
+
+            TransientWorker w1 = (TransientWorker)sp.GetService("Worker");
+            TransientWorker w2 = (TransientWorker)sp.GetService("Worker");
+            if (w1 == null || w2 == null || w1.tag == w2.tag) {
+                Console.WriteLine("FAIL: DI Transient different instances");
+            }
+
+            bool scope1Disposed = false;
+            using (IServiceScope scope1 = sp.CreateScope()) {
+                IServiceProvider scopedSp1 = scope1.GetServiceProvider();
+                DisposableService scoped1Obj = (DisposableService)scopedSp1.GetService("ScopedService");
+                DisposableService scoped1Again = (DisposableService)scopedSp1.GetService("ScopedService");
+                if (scoped1Obj == null || scoped1Again == null || scoped1Obj.id != scoped1Again.id) {
+                    Console.WriteLine("FAIL: Scoped within same scope");
+                }
+            }
+
+            using (IServiceScope scope2 = sp.CreateScope()) {
+                IServiceProvider scopedSp2 = scope2.GetServiceProvider();
+                DisposableService scoped2Obj = (DisposableService)scopedSp2.GetService("ScopedService");
+                if (scoped2Obj == null) {
+                    Console.WriteLine("FAIL: Scoped in scope 2");
+                }
+            }
+        }
+    }
+
+    static void TestDependencyInjection() {
+        ServiceCollection services = new ServiceCollection();
+        DisposableService sInstance = new DisposableService(100);
+        services.AddSingletonInstance("ConfigTitle", sInstance);
+
+        services.AddSingleton("SingletonCounter", (sp) => {
+            int cur = nextId;
+            nextId = nextId + 1;
+            return (object)new DisposableService(cur);
+        });
+
+        services.AddScoped("ScopedService", (sp) => {
+            int cur = nextId;
+            nextId = nextId + 1;
+            return (object)new DisposableService(cur);
+        });
+
+        services.AddTransient("Worker", (sp) => {
+            int cur = nextId;
+            nextId = nextId + 1;
+            return (object)new TransientWorker(cur);
+        });
+
+        SubTestDI(services);
+
+        Console.WriteLine("OK: DependencyInjection");
+    }
+}

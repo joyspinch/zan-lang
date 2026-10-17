@@ -370,6 +370,8 @@ static int expr_yields_delegate_value(zan_irgen_t *g, zan_ast_node_t *e,
 static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
                                       local_scope_t *locals) {
     if (!e) return 0;
+    if (e->kind == AST_CAST_EXPR)
+        return expr_yields_owned_rc_value(g, e->cast.expr, locals);
     if (e->kind == AST_POSTFIX_UNARY && e->unary.op == TK_BANG)
         return expr_yields_owned_rc_value(g, e->unary.operand, locals);
     if (e->kind == AST_TUPLE_EXPR) return 1;
