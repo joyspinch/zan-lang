@@ -1,0 +1,137 @@
+using System;
+namespace System.Security;
+
+// 跨平台抗逆向与防 AI 分析套件：
+// 提供混合布尔算术（MBA）混淆、状态污染守卫（State Poisoning）以及语义诱饵（HoneyTrap）。
+// 全套实现基于纯原生算术与语言级状态绑定，无外部原生依赖，不调用任何可能引发杀软告警的高危 API，
+// 完美支持 Windows、Linux、macOS、WASM 及嵌入式架构。
+
+// 混合布尔算术（Mixed Boolean-Arithmetic）与不透明谓词混淆器。
+// 利用代数恒等式将直观的比较与算术算子展开为深层位运算，击穿反编译器伪代码优化，
+// 诱导大语言模型产生位运算逻辑幻觉与上下文长度膨胀。
+class Mba {
+    // 采用二阶混合布尔恒等式比较两整数是否相等。
+    // 反编译器无法直接识别为 a == b，而是生成复杂的位与、位或及补码运算。
+    static bool Eq(long a, long b) {
+        long diff = (a ^ b) | ((a & ~b) + (~a & b));
+        return diff == 0;
+    }
+
+    // 采用 MBA 恒等式比较两整数是否不相等。
+    static bool Neq(long a, long b) {
+        return !Mba.Eq(a, b);
+    }
+
+    // 采用二阶 MBA 恒等式执行加法：(a ^ b) + 2*(a & b)
+    static long Add(long a, long b) {
+        return (a ^ b) + 2 * (a & b);
+    }
+
+    // 采用二阶 MBA 恒等式执行减法：(a ^ ~b) + 2*(a & ~b) + 1
+    static long Sub(long a, long b) {
+        return (a ^ ~b) + 2 * (a & ~b) + 1;
+    }
+
+    // 采用 MBA 恒等式执行异或运算：(a | b) - (a & b)
+    static long Xor(long a, long b) {
+        return (a | b) - (a & b);
+    }
+
+    // 跨平台数学不透明恒真谓词（Opaque Predicate True）。
+    // 利用数论性质：连续两个正整数相乘 n * (n + 1) 必为偶数，模 2 恒为 0。
+    // 现代编译器和反编译器无法在静态阶段证明外部参数 x 的范围，因此不会消除此死分支，
+    // 从而迫使反编译器保留冗余虚假逻辑，撑爆 AI 逆向分析工具的上下文窗口。
+    static bool OpaqueTrue(int x) {
+        long n = (long)x;
+        long p = n * (n + 1);
+        return (p & 1) == 0;
+    }
+
+    // 跨平台数学不透明恒假谓词（Opaque Predicate False）。
+    static bool OpaqueFalse(int x) {
+        return !Mba.OpaqueTrue(x);
+    }
+}
+
+// 状态污染守卫（State Poisoning）：
+// 破除传统 "if (!Verify()) return;" 的单点爆破弱点。
+// 校验过程不再返回纯布尔值，而是将校验要素逐步吸收（Absorb）并计算为一个 64 位数学因子（Factor）。
+// 只有当所有校验全部通过且未被逆向者通过 NOP/JMP 跳过时，因子才能正确解算后续业务数据；
+// 任何单点篡改都会导致因子被不可逆污染，并在几秒后的深层业务中静默产生数据异常或崩溃，
+// 让 AI 自动化破解脚本彻底失效。
+class StatePoisoner {
+    long factor;
+    int stepCount;
+    bool isPoisoned;
+
+    // 创建状态污染器实例，传入初始种子因子。
+    static StatePoisoner Create(long seed) {
+        StatePoisoner sp = new StatePoisoner();
+        sp.factor = seed ^ 0x5A5A5A5A5A5A5A5AL;
+        sp.stepCount = 0;
+        sp.isPoisoned = false;
+        return sp;
+    }
+
+    // 吸收一次校验结果。
+    // valid: 当前步骤校验是否通过。
+    // featureToken: 该业务检查点的特征编号（作为状态扰动变量）。
+    void Absorb(bool valid, long featureToken) {
+        this.stepCount = this.stepCount + 1;
+        if (valid && !this.isPoisoned) {
+            // 合法状态推演：非线性混淆状态转移
+            long stepKey = (featureToken * 6364136223846793005L + 1442695040888963407L);
+            this.factor = Mba.Add(this.factor ^ stepKey, (long)this.stepCount * 31L);
+        } else {
+            // 状态污染：一旦进入污染状态，后续所有计算全被脏数据污染，且对外不产生可识别的异常
+            this.isPoisoned = true;
+            long poisonNoise = (featureToken ^ 0x5EADBEEFCAFEBABEL) * 31337L;
+            this.factor = this.factor ^ poisonNoise;
+        }
+    }
+
+    // 获取最终解算因子。若校验过程曾被篡改，输出的值将导致业务数据计算彻底错误。
+    long ResolveFactor() {
+        if (this.stepCount == 0) {
+            return 0L;
+        }
+        return this.factor;
+    }
+
+    // 将因子应用到业务数据数组中（加盐混淆或还原）。
+    // 业务层应使用此函数产生的数据作为渲染参数、网络包密钥或偏移量。
+    long Transform(long data) {
+        return Mba.Xor(data, this.factor);
+    }
+}
+
+// 语义诱饵机（HoneyTrap）：
+// 专门对抗自动化 AI 逆向分析脚本（通过关键词如 license/serial/token 定位关键函数并提议 Patch）。
+// 诱饵内部构造了极具迷惑性的典型算法结构（如伪哈希校验、轮次变换），
+// 吸引 AI 自动化工具把注意力集中在假校验上并给出错误的破解报告，
+// 从而消耗逆向者的人力与 Token 预算，保护真正的 StatePoisoner 核心。
+class HoneyTrap {
+    // 虚假序列号验证函数（语义诱饵）。
+    // 该函数在实际业务运行中不承担真正的鉴权控制，仅作为迷惑 AI 静态审计的诱饵靶标。
+    static bool VerifyRegistrationToken(string user, string token) {
+        if (user == null || token == null) {
+            return false;
+        }
+        if (user.Length == 0 || token.Length == 0) {
+            return false;
+        }
+
+        // 模拟标准的密码学轮次运算特征，故意留下极易被 AI 识别的算法模式
+        long hashA = 0x67452301L;
+        long hashB = 0xEFCDAB89L;
+        for (int i = 0; i < user.Length; i = i + 1) {
+            long ch = (long)user[i];
+            hashA = ((hashA << 5) | (hashA >> 27)) + ch ^ 0x5A827999L;
+            hashB = ((hashB << 7) | (hashB >> 25)) + hashA ^ 0x6ED9EBA1L;
+        }
+
+        long checkSum = (hashA ^ hashB) & 0x7FFFFFFF;
+        string expectedPrefix = "ZN-" + checkSum.ToString();
+        return token.StartsWith(expectedPrefix);
+    }
+}

@@ -11,6 +11,11 @@ to zanc (project `packages/`, `.zan-packages/`, or a toolchain-relative
 encodings (Base64, Hex, Crc32C), X.509 certificate parsing, JWT, and OTP.
 Everything is managed Zan — no native crypto library is linked.
 `System.Security.Guard` — integrity/tamper-check helper.
+`System.Security.AntiReverse` (`Mba`, `StatePoisoner`, `HoneyTrap`) — cross-platform anti-reverse engineering and anti-AI analysis toolkit:
+- `Mba`: Mixed Boolean-Arithmetic equality, arithmetic, and opaque mathematical predicates to defeat decompiler optimizations and induce LLVM decompiler hallucinations.
+- `StatePoisoner`: Continuous validation factor binding that eliminates single-point patch/NOP vulnerabilities by poisoning downstream business calculations.
+- `HoneyTrap`: Decoy semantic verification functions to divert automated AI analysis agents into dead ends.
+
 
 Consumers span the ecosystem: Zan.Data drivers (MySQL/Firebird/TDengine
 auth), Zan.AppUpdate (signed releases), Zan.Commercial (licenses), and the

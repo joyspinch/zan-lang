@@ -1,5 +1,9 @@
 # Zan 游戏引擎全新架构与品类开发指南
 
+<p align="left">
+  <b>简体中文</b> | <a href="GAME_ENGINE_GUIDE.en.md">English</a>
+</p>
+
 本文档全面阐述 Zan 现代化游戏引擎（`packages/Zan.Game`）的设计哲学、架构分层、主流品类子系统、2.5D 纯帧素材管理与 2.5D+3D 混合渲染方案，以及工业级素材工具链。
 
 ---
