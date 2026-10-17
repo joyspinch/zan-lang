@@ -6,6 +6,7 @@
 #include "src/runtime/rt_sched.h"
 #include "src/runtime/rt_io.h"
 #include "src/runtime/rt_co.h"
+#include "src/common/zan_abi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -575,6 +576,23 @@ static void test_co_io(int port) {
     free(root);
 }
 
+static void test_mem_stats(void) {
+    banner("memory: heap observability & slab metrics");
+    zan_mem_stats_t s0;
+    memset(&s0, 0, sizeof(s0));
+    zan_mem_get_stats(&s0);
+    CHECK(s0.slab_bytes == s0.slab_count * (1u << 20),
+          "initial slab_bytes calculation mismatch");
+
+    /* 验证结构体输出正常 */
+    zan_mem_stats_t s1;
+    memset(&s1, 0, sizeof(s1));
+    zan_mem_get_stats(&s1);
+    CHECK(s1.slab_count >= s0.slab_count, "slab_count decreased");
+    CHECK(s1.slab_bytes == s1.slab_count * (1u << 20),
+          "slab_bytes calculation mismatch");
+}
+
 int main(void) {
 #if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
@@ -584,6 +602,7 @@ int main(void) {
     test_scheduler();
     test_scheduler_concurrent_workers();
     test_timer();
+    test_mem_stats();
     test_co_statemachine();
     test_co_io(19803);
     test_io_echo(19801);

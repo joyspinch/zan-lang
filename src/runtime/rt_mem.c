@@ -27,10 +27,17 @@
 #include <windows.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+void * __attribute__((weak)) __real_malloc(size_t n) { return malloc(n); }
+void   __attribute__((weak)) __real_free(void *p) { free(p); }
+void * __attribute__((weak)) __real_calloc(size_t n, size_t m) { return calloc(n, m); }
+void * __attribute__((weak)) __real_realloc(void *p, size_t n) { return realloc(p, n); }
+#else
 void *__real_malloc(size_t n);
 void  __real_free(void *p);
 void *__real_calloc(size_t n, size_t m);
 void *__real_realloc(void *p, size_t n);
+#endif
 
 #define ZAN_MEM_MAX_SMALL   2048u
 #define ZAN_MEM_SLAB        (1u << 20)      /* 1 MiB */
@@ -63,9 +70,18 @@ static int g_class_ready;
 #define ZAN_MEM_SET_MASK  (ZAN_MEM_SET_SIZE - 1u)
 static uintptr_t g_slab_set[ZAN_MEM_SET_SIZE];
 static size_t g_slab_count;
+static size_t g_small_alloc_count;
 
 size_t zan_mem_slabs(void) {
     return __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
+}
+
+void zan_mem_get_stats(zan_mem_stats_t *out) {
+    if (!out) return;
+    size_t slabs = __atomic_load_n(&g_slab_count, __ATOMIC_RELAXED);
+    out->slab_count = slabs;
+    out->slab_bytes = slabs * (size_t)ZAN_MEM_SLAB;
+    out->small_alloc_count = __atomic_load_n(&g_small_alloc_count, __ATOMIC_RELAXED);
 }
 
 #define ZAN_MEM_REMOTE_STRIPES 8
@@ -363,6 +379,7 @@ static void *zan_mem_small(size_t n) {
         __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELAXED);
         __atomic_store_n(&h->owner, c, __ATOMIC_RELAXED);
         __atomic_store_n(&h->magic, ZAN_MEM_MAGIC, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&g_small_alloc_count, 1, __ATOMIC_RELAXED);
         return p;
     }
     size_t need = (size_t)k_class_size[cls] + ZAN_MEM_HDR;
@@ -376,6 +393,7 @@ static void *zan_mem_small(size_t n) {
     __atomic_store_n(&h->cls, (uint32_t)cls, __ATOMIC_RELAXED);
     __atomic_store_n(&h->owner, c, __ATOMIC_RELAXED);
     __atomic_store_n(&h->magic, ZAN_MEM_MAGIC, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&g_small_alloc_count, 1, __ATOMIC_RELAXED);
     return (char *)h + ZAN_MEM_HDR;
 }
 
@@ -480,3 +498,4 @@ void *__wrap_realloc(void *p, size_t n) {
     __wrap_free(p);
     return np;
 }
+
