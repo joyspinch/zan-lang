@@ -1,0 +1,73 @@
+using System;
+using System.Data;
+using System.Data.Orm;
+using System.Data.Sqlite;
+using System.IO;
+
+class HardeningProgram {
+    static void Main() {
+        string path = "_scratch/orm_hardening.tmp.db";
+        if (File.Exists(path)) { File.Delete(path); }
+
+        SqliteConnection db = SqliteConnection.Open(path);
+
+        // 1. DDL 与参数化执行验证
+        db.Execute("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, price REAL, qty INTEGER)");
+
+        DbParams p1 = new DbParams().Add("Notebook").AddDouble(19.99).AddInt(10);
+        int aff1 = db.Execute("INSERT INTO items (title, price, qty) VALUES (?, ?, ?)", p1);
+        Console.WriteLine("aff1: " + Convert.ToString(aff1));
+
+        DbParams p2 = new DbParams().Add("Pen").AddDouble(2.50).AddInt(100);
+        int aff2 = db.Execute("INSERT INTO items (title, price, qty) VALUES (?, ?, ?)", p2);
+        Console.WriteLine("aff2: " + Convert.ToString(aff2));
+
+        // 2. QueryBuilder 参数化构建测试
+        QueryBuilder qb = QueryBuilder.From("items").WhereEq("title", "Notebook");
+        DbResult r = db.Query(qb.BuildSelectParams("id, price, qty"), qb.SelectParams());
+        Console.WriteLine("qb rows: " + Convert.ToString(r.RowCount()));
+        Console.WriteLine("item price: " + Convert.ToString(r.GetDouble(0, 1)));
+        Console.WriteLine("item qty: " + Convert.ToString(r.GetInt(0, 2)));
+
+        // 3. OrmMeta 与 OrmSelect 构建测试
+        OrmMeta meta = OrmMeta.Of("Item", "items");
+        meta.Col("id", "Id", DbParams.KindInt, true, true, true, true, 0);
+        meta.Col("title", "Title", DbParams.KindText, false, false, false, true, 100);
+        meta.Col("price", "Price", DbParams.KindDouble, false, false, false, true, 0);
+        meta.Col("qty", "Qty", DbParams.KindInt, false, false, false, true, 0);
+        meta.Seal();
+
+        OrmSelect sel = OrmSelect.Create(db, meta);
+        sel.WhereEq("title", "Pen");
+        DbResult rPen = sel.Rows();
+        Console.WriteLine("orm pen count: " + Convert.ToString(rPen.RowCount()));
+        Console.WriteLine("orm pen title: " + rPen.GetString(0, 1));
+
+        // 4. UnitOfWork 事务提交与回滚生命周期验证
+        UnitOfWork uow = UnitOfWork.Create(db, false);
+        uow.Execute("INSERT INTO items (title, price, qty) VALUES ('Eraser', 1.0, 50)");
+        uow.Rollback();
+        uow.Dispose();
+
+        DbResult rEraser = db.Query("SELECT COUNT(*) FROM items WHERE title = 'Eraser'");
+        Console.WriteLine("eraser after rollback: " + Convert.ToString(rEraser.GetInt(0, 0)));
+
+        UnitOfWork uow2 = UnitOfWork.Create(db, false);
+        uow2.Execute("INSERT INTO items (title, price, qty) VALUES ('Ruler', 3.5, 30)");
+        uow2.Commit();
+        uow2.Dispose();
+
+        DbResult rRuler = db.Query("SELECT COUNT(*) FROM items WHERE title = 'Ruler'");
+        Console.WriteLine("ruler after commit: " + Convert.ToString(rRuler.GetInt(0, 0)));
+
+        // 5. ZanSql facade 门面与聚合测试
+        IZanSql zanSql = ZanSql.FromConnection(db);
+        DbResult rTotal = zanSql.Query("SELECT COUNT(*) FROM items");
+        Console.WriteLine("total items: " + Convert.ToString(rTotal.GetInt(0, 0)));
+
+        // 6. 析构与 Dispose 释放闭环
+        db.Dispose();
+        if (File.Exists(path)) { File.Delete(path); }
+        Console.WriteLine("orm hardening completed successfully");
+    }
+}
