@@ -3114,6 +3114,13 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 checker_check_assignable(c, c->current_return_type, rv,
                                          stmt->ret.value, stmt->loc,
                                          "return statement");
+            if (c->current_type_sym && c->current_type_sym->kind == SYM_CLASS) {
+                if (has_closure_capturing_this(c, stmt->ret.value)) {
+                    zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                        "returned closure captures 'this' and escapes method scope; "
+                        "ensure the caller does not retain it indefinitely to prevent ARC memory leaks");
+                }
+            }
         }
         break;
 
