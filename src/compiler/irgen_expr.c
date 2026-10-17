@@ -12676,6 +12676,16 @@ static LLVMValueRef emit_arg_typed(zan_irgen_t *g, zan_ast_node_t *arg,
 static LLVMValueRef emit_ref_lvalue_ptr(zan_irgen_t *g, zan_ast_node_t *tgt,
                                         local_scope_t *locals) {
     if (!tgt) return NULL;
+    if (tgt->kind == AST_THIS_EXPR) {
+        if (g->current_this && g->current_type_sym) {
+            LLVMTypeRef st = get_struct_llvm_type(g, g->current_type_sym);
+            if (st) {
+                return LLVMBuildLoad2(g->builder, LLVMPointerType(st, 0),
+                                      g->current_this, "ref.this");
+            }
+        }
+        return NULL;
+    }
     if (tgt->kind == AST_IDENTIFIER) {
         local_var_t *local = local_find(locals, tgt->ident.name);
         if (local) return local->alloca;
