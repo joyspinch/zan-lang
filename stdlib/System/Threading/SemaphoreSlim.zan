@@ -21,7 +21,7 @@ namespace System.Threading;
 // 能够干净地停止，而不是挂在一个无人释放的门上。将其视为
 // 一次性操作——Cancel 之后门必须被 Dispose，调用方不得
 // 与它并发归还槽位（Release / SetLimit）。
-class SemaphoreSlim {
+public class SemaphoreSlim : IDisposable {
     // 可同时持有的槽位数。可由 SetLimit 随时修改。
     int limit;
     // 已从 Wait 返回的调用方当前持有的槽位数。
@@ -34,15 +34,17 @@ class SemaphoreSlim {
     nint lockHandle;
     nint sem;
 
-    SemaphoreSlim() {
+    public SemaphoreSlim() {
         this.limit = 1;
         this.active = 0;
         this.waiters = 0;
         this.canceled = 0;
+        this.lockHandle = Mutex.Create();
+        this.sem = Semaphore.Create(0, 1048576);
     }
 
     // 一次放行 `limit` 个调用方的节流器。
-    SemaphoreSlim(int limit) {
+    public SemaphoreSlim(int limit) {
         if (limit < 0) { limit = 0; }
         this.limit = limit;
         this.active = 0;
@@ -57,7 +59,7 @@ class SemaphoreSlim {
 
     // 获取一个槽位，阻塞调用线程直到空位
     // 释放。<see cref="Cancel"/> 之后则立即返回，不占槽位。
-    void Wait() {
+    public void Wait() {
         Mutex.Lock(this.lockHandle);
         if (this.canceled != 0 || this.active < this.limit) {
             if (this.canceled == 0) { this.active = this.active + 1; }
@@ -76,7 +78,7 @@ class SemaphoreSlim {
     // 获取一个槽位，最多等待 `timeoutMs` 毫秒。
     // 获取到槽位返回 true（调用方必须 Release）；等待超时
     // 或门被取消返回 false。负超时表示无限等待。
-    bool WaitFor(int timeoutMs) {
+    public bool WaitFor(int timeoutMs) {
         Mutex.Lock(this.lockHandle);
         if (this.canceled != 0) {
             Mutex.Unlock(this.lockHandle);
@@ -116,7 +118,7 @@ class SemaphoreSlim {
 
     // 仅当当前有可用槽位时才获取。
     // 获取到返回 true——调用方必须 Release。Cancel 之后恒为 false。
-    bool TryWait() {
+    public bool TryWait() {
         Mutex.Lock(this.lockHandle);
         bool got = this.canceled == 0 && this.active < this.limit;
         if (got) { this.active = this.active + 1; }
@@ -127,7 +129,7 @@ class SemaphoreSlim {
     // 归还一个槽位。若上限允许，唤醒一个等待者。
     // <see cref="Cancel"/> 之后对准入为无操作（持有者仍可
     // 归还槽位，但不会唤醒任何人）。
-    void Release() {
+    public void Release() {
         Mutex.Lock(this.lockHandle);
         if (this.active > 0) { this.active = this.active - 1; }
         bool wake = this.canceled == 0 && this.waiters > 0
@@ -142,7 +144,7 @@ class SemaphoreSlim {
 
     // 随时调整可同时持有槽位的调用方数量。
     // 返回新上限放行了几名挂起的等待者。
-    int SetLimit(int limit) {
+    public int SetLimit(int limit) {
         if (limit < 0) { limit = 0; }
         Mutex.Lock(this.lockHandle);
         this.limit = limit;
@@ -165,7 +167,7 @@ class SemaphoreSlim {
     // 任务保留其槽位（其 Release 对准入仍为无操作）。此后
     // 必须 <see cref="Dispose"/> 该门，调用方不得
     // 与其并发归还槽位。
-    void Cancel() {
+    public void Cancel() {
         Mutex.Lock(this.lockHandle);
         this.canceled = 1;
         int wake = this.waiters;
@@ -177,7 +179,7 @@ class SemaphoreSlim {
     }
 
     // 在 <see cref="Cancel"/> 之后为 true：门不再放行任何人。
-    bool IsCanceled() {
+    public bool IsCanceled() {
         Mutex.Lock(this.lockHandle);
         int v = this.canceled;
         Mutex.Unlock(this.lockHandle);
@@ -185,7 +187,7 @@ class SemaphoreSlim {
     }
 
     // 当前上限。
-    int Limit() {
+    public int Limit() {
         Mutex.Lock(this.lockHandle);
         int v = this.limit;
         Mutex.Unlock(this.lockHandle);
@@ -193,7 +195,7 @@ class SemaphoreSlim {
     }
 
     // 当前持有的槽位数。
-    int Active() {
+    public int Active() {
         Mutex.Lock(this.lockHandle);
         int v = this.active;
         Mutex.Unlock(this.lockHandle);
@@ -201,7 +203,7 @@ class SemaphoreSlim {
     }
 
     // 等待槽位而挂起的调用方数。
-    int Waiting() {
+    public int Waiting() {
         Mutex.Lock(this.lockHandle);
         int v = this.waiters;
         Mutex.Unlock(this.lockHandle);
@@ -209,7 +211,7 @@ class SemaphoreSlim {
     }
 
     // 释放操作系统句柄。幂等安全，不允许有挂起的调用方。
-    void Dispose() {
+    public void Dispose() {
         if (this.sem != 0) {
             Semaphore.Destroy(this.sem);
             this.sem = 0;
