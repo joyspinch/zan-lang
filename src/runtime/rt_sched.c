@@ -130,14 +130,23 @@ typedef struct zan_timer {
 } zan_timer_t;
 
 #define ZAN_MAX_WORKERS 32
+#define ZAN_LOCAL_QUEUE_CAP 256
 
 typedef struct zan_worker {
     int          id;
     int          active;
+    volatile int sleeping;
+    zan_mutex_t  lock;
+    zan_co_t    *local_head;
+    zan_co_t    *local_tail;
+    int          local_count;
 #ifdef _WIN32
     HANDLE       thread;
+    HANDLE       wake_event;
 #else
-    pthread_t    thread;
+    pthread_t       thread;
+    pthread_cond_t  wake_cond;
+    pthread_mutex_t wake_mutex;
 #endif
 } zan_worker_t;
 
@@ -150,7 +159,7 @@ static ZAN_THREAD_LOCAL void     *g_sched_fiber;
 static ZAN_THREAD_LOCAL zan_co_t *g_current;
 static ZAN_THREAD_LOCAL int       g_worker_id = -1;
 
-/* 全局就绪队列（多 worker 线程安全） */
+/* 全局就绪队列（溢出或跨线程任务） */
 static zan_mutex_t         g_global_lock;
 static zan_co_t           *g_ready_head;
 static zan_co_t           *g_ready_tail;
@@ -295,25 +304,135 @@ static void switch_to_sched(void) {
 }
 
 
+static void wake_one_worker(void) {
+    if (g_worker_count <= 1) return;
+    for (int i = 0; i < g_worker_count; i++) {
+        if (g_workers[i].active && g_workers[i].sleeping) {
+#ifdef _WIN32
+            SetEvent(g_workers[i].wake_event);
+#else
+            pthread_mutex_lock(&g_workers[i].wake_mutex);
+            pthread_cond_signal(&g_workers[i].wake_cond);
+            pthread_mutex_unlock(&g_workers[i].wake_mutex);
+#endif
+            break;
+        }
+    }
+}
+
+static void wake_all_workers(void) {
+    for (int i = 0; i < g_worker_count; i++) {
+        if (g_workers[i].active) {
+#ifdef _WIN32
+            SetEvent(g_workers[i].wake_event);
+#else
+            pthread_mutex_lock(&g_workers[i].wake_mutex);
+            pthread_cond_broadcast(&g_workers[i].wake_cond);
+            pthread_mutex_unlock(&g_workers[i].wake_mutex);
+#endif
+        }
+    }
+}
+
 static void ready_push(zan_co_t *co) {
     co->next = NULL;
+    int wid = g_worker_id;
+    if (wid >= 0 && wid < g_worker_count) {
+        zan_worker_t *w = &g_workers[wid];
+        zan_mutex_lock(&w->lock);
+        if (w->local_count < ZAN_LOCAL_QUEUE_CAP) {
+            if (w->local_tail) w->local_tail->next = co;
+            else               w->local_head = co;
+            w->local_tail = co;
+            w->local_count++;
+            zan_mutex_unlock(&w->lock);
+            wake_one_worker();
+            return;
+        }
+        zan_mutex_unlock(&w->lock);
+    }
+
     zan_mutex_lock(&g_global_lock);
     if (g_ready_tail) g_ready_tail->next = co;
     else              g_ready_head = co;
     g_ready_tail = co;
     zan_mutex_unlock(&g_global_lock);
+    wake_one_worker();
 }
 
-static zan_co_t *ready_pop(void) {
+static zan_co_t *ready_pop_worker(int wid) {
+    zan_worker_t *w = (wid >= 0 && wid < g_worker_count) ? &g_workers[wid] : NULL;
+
+    // 1. 本地私有就绪队列优先弹出（无跨核锁争用）
+    if (w) {
+        zan_mutex_lock(&w->lock);
+        zan_co_t *co = w->local_head;
+        if (co) {
+            w->local_head = co->next;
+            if (!w->local_head) w->local_tail = NULL;
+            w->local_count--;
+            co->next = NULL;
+            zan_mutex_unlock(&w->lock);
+            return co;
+        }
+        zan_mutex_unlock(&w->lock);
+    }
+
+    // 2. 全局就绪队列弹出
     zan_mutex_lock(&g_global_lock);
     zan_co_t *co = g_ready_head;
     if (co) {
         g_ready_head = co->next;
         if (!g_ready_head) g_ready_tail = NULL;
         co->next = NULL;
+        zan_mutex_unlock(&g_global_lock);
+        return co;
     }
     zan_mutex_unlock(&g_global_lock);
-    return co;
+
+    // 3. 工作窃取：从其他 Worker 本地队列窃取任务
+    if (w && g_worker_count > 1) {
+        for (int k = 1; k < g_worker_count; k++) {
+            int victim_id = (wid + k) % g_worker_count;
+            zan_worker_t *victim = &g_workers[victim_id];
+            if (victim->local_count > 0) {
+                zan_mutex_lock(&victim->lock);
+                if (victim->local_count > 0 && victim->local_head) {
+                    co = victim->local_head;
+                    victim->local_head = co->next;
+                    if (!victim->local_head) victim->local_tail = NULL;
+                    victim->local_count--;
+                    co->next = NULL;
+                    zan_mutex_unlock(&victim->lock);
+                    return co;
+                }
+                zan_mutex_unlock(&victim->lock);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+static void worker_wait(zan_worker_t *w, int timeout_ms) {
+    if (!w) {
+        plat_sleep(timeout_ms > 0 ? timeout_ms : 1);
+        return;
+    }
+    w->sleeping = 1;
+#ifdef _WIN32
+    WaitForSingleObject(w->wake_event, (DWORD)(timeout_ms > 0 ? timeout_ms : 1));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long nsec = ts.tv_nsec + (long)(timeout_ms > 0 ? timeout_ms : 1) * 1000000L;
+    ts.tv_sec += nsec / 1000000000L;
+    ts.tv_nsec = nsec % 1000000000L;
+    pthread_mutex_lock(&w->wake_mutex);
+    pthread_cond_timedwait(&w->wake_cond, &w->wake_mutex, &ts);
+    pthread_mutex_unlock(&w->wake_mutex);
+#endif
+    w->sleeping = 0;
 }
 
 /* ================= tasks ================= */
@@ -466,7 +585,7 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
     plat_sched_enter();
 
     while (!g_sched_stop) {
-        zan_co_t *co = ready_pop();
+        zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
             co_acquire(co);
             g_current = co;
@@ -480,7 +599,7 @@ static DWORD WINAPI worker_thread_main(LPVOID arg) {
                 co_release(co);
             }
         } else {
-            plat_sleep(1);
+            worker_wait(w, 2);
         }
     }
 
@@ -506,7 +625,7 @@ static void *worker_thread_main(void *arg) {
     plat_sched_enter();
 
     while (!g_sched_stop) {
-        zan_co_t *co = ready_pop();
+        zan_co_t *co = ready_pop_worker(w->id);
         if (co) {
             co_acquire(co);
             g_current = co;
@@ -520,7 +639,7 @@ static void *worker_thread_main(void *arg) {
                 co_release(co);
             }
         } else {
-            plat_sleep(1);
+            worker_wait(w, 2);
         }
     }
 
@@ -615,6 +734,23 @@ void zan_sched_init(void) {
     g_live = 0;
     g_sched_stop = 0;
 
+    for (int i = 0; i < ZAN_MAX_WORKERS; i++) {
+        g_workers[i].id = i;
+        g_workers[i].active = 0;
+        g_workers[i].sleeping = 0;
+        zan_mutex_init(&g_workers[i].lock);
+        g_workers[i].local_head = NULL;
+        g_workers[i].local_tail = NULL;
+        g_workers[i].local_count = 0;
+#ifdef _WIN32
+        g_workers[i].wake_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+        g_workers[i].thread = NULL;
+#else
+        pthread_cond_init(&g_workers[i].wake_cond, NULL);
+        pthread_mutex_init(&g_workers[i].wake_mutex, NULL);
+#endif
+    }
+
     g_worker_count = 1;
     int cfg_w = zan_async_cfg_workers();
     if (cfg_w > 1) {
@@ -629,7 +765,6 @@ void zan_sched_init(void) {
             g_worker_count = w;
         }
     }
-    g_workers[0].id = 0;
     g_workers[0].active = 1;
     g_worker_id = 0;
 
@@ -661,20 +796,20 @@ void zan_sched_run(void) {
     while (zan_atomic_read(&g_live) > 0) {
         int64_t next_timer = timers_process();
 
-        zan_co_t *co = ready_pop();
+        zan_co_t *co = ready_pop_worker(0);
         if (!co) {
             int64_t poll_timeout = -1;
             if (next_timer >= 0) poll_timeout = next_timer;
             if (zan_io_has_pending()) {
                 zan_io_poll(poll_timeout);
-                co = ready_pop();
+                co = ready_pop_worker(0);
             } else if (next_timer >= 0) {
                 int64_t slp = next_timer > 5 ? 5 : next_timer;
-                plat_sleep(slp);
+                worker_wait(&g_workers[0], (int)slp);
                 continue;
             } else {
                 if (zan_atomic_read(&g_live) > 0) {
-                    plat_sleep(1);
+                    worker_wait(&g_workers[0], 2);
                     continue;
                 }
                 break;
@@ -702,6 +837,7 @@ void zan_sched_run(void) {
 
     /* 通知并等待所有辅助 Worker 退出 */
     g_sched_stop = 1;
+    wake_all_workers();
     for (int i = 1; i < g_worker_count; i++) {
         if (g_workers[i].active) {
 #ifdef _WIN32
@@ -733,6 +869,19 @@ void zan_sched_shutdown(void) {
     g_timers = NULL;
     g_timer_n = g_timer_cap = 0;
     zan_mutex_unlock(&g_timer_lock);
+
+    for (int i = 0; i < ZAN_MAX_WORKERS; i++) {
+        zan_mutex_destroy(&g_workers[i].lock);
+#ifdef _WIN32
+        if (g_workers[i].wake_event) {
+            CloseHandle(g_workers[i].wake_event);
+            g_workers[i].wake_event = NULL;
+        }
+#else
+        pthread_cond_destroy(&g_workers[i].wake_cond);
+        pthread_mutex_destroy(&g_workers[i].wake_mutex);
+#endif
+    }
 
     zan_mutex_destroy(&g_global_lock);
     zan_mutex_destroy(&g_timer_lock);

@@ -230,6 +230,50 @@ static void test_scheduler_concurrent_workers(void) {
 #endif
 }
 
+/* 10,000 并发任务高负载压力测试（8 Worker 跨核工作窃取） */
+#define HIGH_LOAD_TASKS 10000
+static int64_t g_high_load_sum = 0;
+static void high_load_main(zan_task_t *t) {
+    zan_task_t **tasks = (zan_task_t **)malloc(HIGH_LOAD_TASKS * sizeof(zan_task_t *));
+    for (int i = 0; i < HIGH_LOAD_TASKS; i++) {
+        tasks[i] = zan_spawn(worker_calc_body, (void *)(intptr_t)i);
+    }
+    int64_t sum = 0;
+    for (int i = 0; i < HIGH_LOAD_TASKS; i++) {
+        sum += zan_task_await(tasks[i]);
+        zan_task_release(tasks[i]);
+    }
+    free(tasks);
+    g_high_load_sum = sum;
+    zan_task_return(t, 0);
+}
+
+static void test_scheduler_concurrent_high_load(void) {
+    banner("scheduler: 10,000 concurrent tasks stress test (8 workers)");
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=8");
+#else
+    setenv("ZAN_SCHED_WORKERS", "8", 1);
+#endif
+    zan_sched_init();
+    zan_task_t *main_task = zan_spawn(high_load_main, NULL);
+    zan_sched_run();
+    zan_task_release(main_task);
+    CHECK(zan_task_live() == 0, "high-load tasks leaked: %zu still tracked", zan_task_live());
+    zan_sched_shutdown();
+
+    int64_t expected = (int64_t)HIGH_LOAD_TASKS * (HIGH_LOAD_TASKS - 1) / 2;
+    CHECK(g_high_load_sum == expected,
+          "high-load sum mismatch: got %lld, expected %lld",
+          (long long)g_high_load_sum, (long long)expected);
+
+#if defined(_WIN32)
+    _putenv("ZAN_SCHED_WORKERS=1");
+#else
+    setenv("ZAN_SCHED_WORKERS", "1", 1);
+#endif
+}
+
 
 static int64_t g_delay_elapsed = -1;
 static void delay_body(zan_task_t *t) {
@@ -605,6 +649,7 @@ int main(void) {
 
     test_scheduler();
     test_scheduler_concurrent_workers();
+    test_scheduler_concurrent_high_load();
     test_timer();
     test_mem_stats();
     test_co_statemachine();
