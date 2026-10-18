@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+// 链路导出事件或性能抽样记录项
+public class TraceEvent {
+    public string name;
+    public string category;
+    public string phase; // "B" (begin), "E" (end), "X" (complete), "i" (instant)
+    public long ts;      // 微秒时间戳
+    public long dur;     // 持续时间（微秒，用于 "X" 阶段）
+    public int pid;      // 进程 ID
+    public int tid;      // 线程/纤程 ID
+    public Dictionary<string, string> args;
+
+    public TraceEvent(string name, string category, string phase, long ts, int tid) {
+        this.name = name;
+        this.category = category;
+        this.phase = phase;
+        this.ts = ts;
+        this.dur = 0;
+        this.pid = 1;
+        this.tid = tid;
+        this.args = new Dictionary<string, string>();
+    }
+}
+
+// 生产级轻量性能剖析与链路导出器。
+// 支持将跟踪与执行指标导出为 Chrome Trace Event Format (Perfetto / Speedscope 原生兼容格式)。
+public class TraceExporter {
+    public List<TraceEvent> events;
+
+    public TraceExporter() {
+        this.events = new List<TraceEvent>();
+    }
+
+    public static TraceExporter Create() {
+        return new TraceExporter();
+    }
+
+    // 从当前执行的 Activity 节点追加一条完整的跨度事件
+    public void AddActivity(Activity act) {
+        if (act == null) { return; }
+        // 转换为微秒
+        long freq = Stopwatch.Frequency();
+        long tsMicro = 0;
+        if (freq > 0) {
+            tsMicro = (long)(act.startTimeTicks * 1000000.0 / (double)freq);
+        } else {
+            tsMicro = act.startTimeTicks;
+        }
+        long durMicro = act.durationMs * 1000;
+
+        TraceEvent evt = new TraceEvent(act.operationName, "trace", "X", tsMicro, 1);
+        evt.dur = durMicro;
+        evt.args.Add("traceId", act.traceId);
+        evt.args.Add("spanId", act.spanId);
+        if (act.parentSpanId != null && act.parentSpanId.Length > 0) {
+            evt.args.Add("parentSpanId", act.parentSpanId);
+        }
+        foreach (string k in act.tags.Keys) {
+            evt.args.Add(k, act.tags[k]);
+        }
+        this.events.Add(evt);
+    }
+
+    // 手动记录区间事件
+    public void RecordDuration(string name, string category, long startTicks, long endTicks, int tid) {
+        long freq = Stopwatch.Frequency();
+        long tsMicro = 0;
+        long durMicro = 0;
+        if (freq > 0) {
+            tsMicro = (long)(startTicks * 1000000.0 / (double)freq);
+            durMicro = (long)((endTicks - startTicks) * 1000000.0 / (double)freq);
+        } else {
+            tsMicro = startTicks;
+            durMicro = endTicks - startTicks;
+        }
+
+        TraceEvent evt = new TraceEvent(name, category, "X", tsMicro, tid);
+        evt.dur = durMicro;
+        this.events.Add(evt);
+    }
+
+    // 导出为 Perfetto / Speedscope / Chrome://tracing 兼容的标准 JSON 格式
+    public string ToPerfettoJson() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"traceEvents\":[");
+        for (int i = 0; i < this.events.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            TraceEvent e = this.events[i];
+            sb.Append("{\"name\":\"");
+            sb.Append(e.name);
+            sb.Append("\",\"cat\":\"");
+            sb.Append(e.category);
+            sb.Append("\",\"ph\":\"");
+            sb.Append(e.phase);
+            sb.Append("\",\"ts\":");
+            sb.Append(Convert.ToString(e.ts));
+            if (e.phase == "X") {
+                sb.Append(",\"dur\":");
+                sb.Append(Convert.ToString(e.dur));
+            }
+            sb.Append(",\"pid\":");
+            sb.Append(Convert.ToString(e.pid));
+            sb.Append(",\"tid\":");
+            sb.Append(Convert.ToString(e.tid));
+
+            if (e.args.Count > 0) {
+                sb.Append(",\"args\":{");
+                int aIdx = 0;
+                foreach (string k in e.args.Keys) {
+                    if (aIdx > 0) { sb.Append(","); }
+                    sb.Append("\"");
+                    sb.Append(k);
+                    sb.Append("\":\"");
+                    sb.Append(e.args[k]);
+                    sb.Append("\"");
+                    aIdx = aIdx + 1;
+                }
+                sb.Append("}");
+            }
+            sb.Append("}");
+        }
+        sb.Append("],\"displayTimeUnit\":\"ms\"}");
+        return sb.ToString();
+    }
+}
