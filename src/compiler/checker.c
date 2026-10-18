@@ -3406,6 +3406,40 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             }
             zan_checker_check_stmt(c, sc->switch_case.body);
         }
+
+        if (sw_type && sw_type->kind == TYPE_ENUM && sw_type->sym && !seen_wildcard) {
+            zan_symbol_t *esym = sw_type->sym;
+            for (int mi = 0; mi < esym->member_count; mi++) {
+                zan_symbol_t *em = esym->members[mi];
+                if (em->kind != SYM_ENUM_MEMBER) continue;
+                bool handled = false;
+                for (int ci = 0; ci < stmt->switch_stmt.cases.count; ci++) {
+                    zan_ast_node_t *sc = stmt->switch_stmt.cases.items[ci];
+                    if (sc->switch_case.pattern) {
+                        zan_ast_node_t *pat = sc->switch_case.pattern;
+                        while (pat && pat->kind == AST_CAST_EXPR) pat = pat->cast.expr;
+                        if (pat && pat->kind == AST_MEMBER_ACCESS &&
+                            pat->member.name.len == em->name.len &&
+                            memcmp(pat->member.name.str, em->name.str, em->name.len) == 0) {
+                            handled = true;
+                            break;
+                        }
+                        if (pat && pat->kind == AST_IDENTIFIER &&
+                            pat->ident.name.len == em->name.len &&
+                            memcmp(pat->ident.name.str, em->name.str, em->name.len) == 0) {
+                            handled = true;
+                            break;
+                        }
+                    }
+                }
+                if (!handled) {
+                    zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                                  "switch statement does not handle enum member '%.*s' of '%.*s'; add missing case or default label",
+                                  (int)em->name.len, em->name.str,
+                                  (int)esym->name.len, esym->name.str);
+                }
+            }
+        }
         break;
     }
 
