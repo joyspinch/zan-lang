@@ -1,0 +1,144 @@
+using System;
+using System.Collections.Generic;
+using System.Caching;
+using System.Threading;
+
+// 远端后端的假实现：只验证 LayeredCache 的读写/回填/失效协议，
+// 不做 TTL（TTL 契约由 MemoryCache 侧用例覆盖）。
+class FakeRemote : IStringCache {
+    public Dict<string, string> data = new Dict<string, string>();
+    public int gets = 0;
+
+    public string Get(string key) {
+        this.gets = this.gets + 1;
+        string v = "";
+        if (this.data.TryGetValue(key, out v)) { return v; }
+        return null;
+    }
+
+    public void Set(string key, string value, long ttlMs) {
+        if (this.data.ContainsKey(key)) { this.data.Remove(key); }
+        this.data.Add(key, value);
+    }
+
+    public bool Remove(string key) {
+        if (!this.data.ContainsKey(key)) { return false; }
+        this.data.Remove(key);
+        return true;
+    }
+
+    public bool Contains(string key) { return this.data.ContainsKey(key); }
+}
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond, string name) {
+        if (!cond) { Console.WriteLine("FAIL " + name); bad = bad + 1; }
+    }
+
+    static void Main() {
+        MemoryCache<string> c = new MemoryCache<string>();
+        c.Set("a", "1");
+        Check(c.Get("a") == "1", "set-get");
+        Check(c.Get("missing") == null, "miss-null");
+        Check(c.Count() == 1, "count-1");
+        c.Set("a", "2");
+        Check(c.Get("a") == "2", "overwrite");
+        Check(c.Count() == 1, "count-still-1");
+        Check(c.Remove("a"), "remove-true");
+        Check(c.Remove("a") == false, "remove-false");
+        Check(c.TryRemove("nope") == null, "tryremove-miss");
+
+        // TTL：命中即续期不生效（固定 TTL），过期项惰性清除
+        MemoryCache<string> t = new MemoryCache<string>();
+        t.Set("k", "v", 5000);
+        Check(t.Get("k") == "v", "ttl-alive");
+        t.Set("e", "v", 5);
+        Thread.Sleep(40);
+        Check(t.Get("e") == null, "ttl-expired");
+        CacheStats ts = t.Stats();
+        Check(ts.expirations == 1, "ttl-expirations-1");
+        Check(t.Contains("e") == false, "ttl-contains-false");
+
+        // LRU：容量满淘汰最久未用，命中会把条目提到头部
+        MemoryCache<string> l = new MemoryCache<string>();
+        l.SetCapacity(2);
+        l.Set("a", "A");
+        l.Set("b", "B");
+        Check(l.Get("a") == "A", "lru-touch-a");
+        l.Set("c", "C");
+        Check(l.Get("a") == "A", "lru-keep-touched");
+        Check(l.Get("b") == null, "lru-evict-tail");
+        Check(l.Count() == 2, "lru-count-2");
+        Check(l.Stats().evictions == 1, "lru-evictions-1");
+
+        // 滑动 TTL：命中续期，停止访问后过期
+        MemoryCache<string> s = new MemoryCache<string>();
+        s.SetSlidingTtl(300);
+        s.Set("k", "v");
+        Thread.Sleep(100);
+        Check(s.Get("k") == "v", "sliding-renew-1");
+        Thread.Sleep(100);
+        Check(s.Get("k") == "v", "sliding-renew-2");
+        Thread.Sleep(600);
+        Check(s.Get("k") == null, "sliding-expired");
+        Check(s.IsSliding(), "sliding-flag");
+
+        // Sweep：不访问的过期项也能回收，且回收后槽位可复用
+        MemoryCache<string> w = new MemoryCache<string>();
+        w.Set("a", "1", 1);
+        w.Set("b", "2", 1);
+        Thread.Sleep(40);
+        Check(w.Sweep() == 2, "sweep-2");
+        Check(w.Count() == 0, "sweep-count-0");
+        w.Set("z", "9");
+        Check(w.Get("z") == "9", "reuse-after-clear");
+
+        // 统计
+        MemoryCache<string> q = new MemoryCache<string>();
+        q.Set("x", "1");
+        q.Get("x");
+        q.Get("y");
+        CacheStats qs = q.Stats();
+        Check(qs.hits == 1 && qs.misses == 1, "stats-hits-misses");
+        Check(qs.sets == 1, "stats-sets");
+        Check(qs.HitRate() > 0.49 && qs.HitRate() < 0.51, "stats-rate");
+
+        // Clear 后完全可复用
+        q.Clear();
+        Check(q.Count() == 0, "clear-count-0");
+        q.Set("x", "again");
+        Check(q.Get("x") == "again", "clear-reuse");
+
+        // 加锁形态：单线程下行为与不加锁一致（并发母题由多线程用例覆盖）
+        MemoryCache<string> sync = MemoryCache<string>.Synchronized(4, 0);
+        sync.Set("s", "v");
+        Check(sync.Get("s") == "v", "sync-set-get");
+        Check(sync.Capacity() == 4, "sync-capacity");
+
+        // 分层缓存：L1 未命中读 L2 并回填；写穿两层；失效两层同删
+        FakeRemote remote = new FakeRemote();
+        remote.Set("r", "R", 0);
+        LayeredCache lc = new LayeredCache(remote, 8, 0);
+        Check(lc.Get("r") == "R", "layered-l2-hit");
+        Check(lc.L1Hits() == 0 && lc.L2Hits() == 1, "layered-counts-l2");
+        Check(remote.gets == 1, "layered-backfill-once");
+        Check(lc.Get("r") == "R", "layered-l1-hit");
+        Check(lc.L1Hits() == 1 && lc.L2Hits() == 1, "layered-counts-l1");
+        Check(remote.gets == 1, "layered-no-second-remote");
+        Check(lc.Get("nope") == null, "layered-miss");
+        Check(lc.Misses() == 1, "layered-miss-count");
+        lc.Set("w", "W", 0);
+        Check(remote.Get("w") == "W", "layered-write-through-remote");
+        Check(lc.Get("w") == "W", "layered-write-through-local");
+        Check(lc.Remove("w"), "layered-remove-remote");
+        Check(remote.Contains("w") == false, "layered-removed-remote");
+        Check(lc.Get("w") == null, "layered-removed-local");
+        lc.InvalidateLocal("r");
+        Check(lc.Local().Contains("r") == false, "layered-invalidate-local");
+        Check(remote.Contains("r"), "layered-remote-kept");
+
+        Console.WriteLine("cache-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

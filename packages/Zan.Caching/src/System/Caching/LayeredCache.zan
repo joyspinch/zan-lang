@@ -1,0 +1,75 @@
+using System;
+
+namespace System.Caching;
+
+// 二层缓存：L1 进程内（MemoryCache<string>，快、容量小、TTL 短），
+// L2 远端（IStringCache，慢、容量大、TTL 长）。
+//
+// 语义：
+//   * 读：L1 命中直接返回；否则读 L2，命中则回填 L1（read-through）。
+//   * 写：先 L2 再 L1（write-through）——先落远端，进程崩了也不会
+//     出现"本地以为写成功、远端没有"的裂缝。
+//   * 失效：Remove 两层同删，返回远端是否删到了东西。
+//   * L1 的 TTL 默认短于 L2（L1 只是加速层），也可显式给。
+//   * 计数：l1Hits/l2Hits/misses 让调用方能判断 L1 容量与 TTL 是否合理。
+public class LayeredCache {
+    private MemoryCache<string> l1;
+    private IStringCache l2;
+    private long l1Hits;
+    private long l2Hits;
+    private long misses;
+
+    public LayeredCache(IStringCache backend, int l1Capacity, long l1TtlMs) {
+        this.l1 = new MemoryCache<string>();
+        this.l1.SetCapacity(l1Capacity);
+        this.l1.SetTtl(l1TtlMs);
+        this.l2 = backend;
+        this.l1Hits = 0;
+        this.l2Hits = 0;
+        this.misses = 0;
+    }
+
+    public string Get(string key) {
+        string v = this.l1.Get(key);
+        if (v != null) {
+            this.l1Hits = this.l1Hits + 1;
+            return v;
+        }
+        string remote = this.l2.Get(key);
+        if (remote != null) {
+            this.l2Hits = this.l2Hits + 1;
+            this.l1.Set(key, remote);
+            return remote;
+        }
+        this.misses = this.misses + 1;
+        return null;
+    }
+
+    // ttlMs 同时作用于两层；l1TtlMs 传 0 时 L1 用构造时的默认 TTL。
+    public void Set(string key, string value, long ttlMs, long l1TtlMs) {
+        this.l2.Set(key, value, ttlMs);
+        if (l1TtlMs > 0) { this.l1.Set(key, value, l1TtlMs); }
+        else { this.l1.Set(key, value); }
+    }
+
+    public void Set(string key, string value, long ttlMs) {
+        this.Set(key, value, ttlMs, 0);
+    }
+
+    // 只失效 L1（远端可能被别的进程改过，L2 交给 TTL）。
+    public void InvalidateLocal(string key) { this.l1.Remove(key); }
+
+    public bool Remove(string key) {
+        this.l1.Remove(key);
+        return this.l2.Remove(key);
+    }
+
+    public void ClearLocal() { this.l1.Clear(); }
+
+    public MemoryCache<string> Local() { return this.l1; }
+    public IStringCache Remote() { return this.l2; }
+
+    public long L1Hits() { return this.l1Hits; }
+    public long L2Hits() { return this.l2Hits; }
+    public long Misses() { return this.misses; }
+}

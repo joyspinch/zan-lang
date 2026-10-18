@@ -1,0 +1,319 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace System.Caching;
+
+// 进程内 LRU + TTL 缓存。O(1) 命中、O(1) 淘汰、稳态零堆分配。
+//
+// 语义：
+//   * TValue 必须是引用类型（string / 类 / JsonValue）。命中判断以 null
+//     为未命中信号，值类型请用 MemoryCache<string> 存文本形态。
+//   * 默认**不加锁**（单线程/协程内使用最快）。跨线程共享时用
+//     MemoryCache<TValue>.Synchronized(...) 建，或先 UseLock()。
+//   * TTL 用 Stopwatch 单调微秒，不受系统时钟回拨影响。
+//   * capacity > 0 时按 LRU 淘汰；capacity == 0 表示不限制条目数
+//     （仍然会清 TTL 过期项）。
+//   * 过期是**惰性**的：Get 命中时发现自己过期会就地清除并算未命中；
+//     不访问的过期项由 Sweep() 主动回收（进程内缓存不必开定时器）。
+public class MemoryCache<TValue> {
+    private List<CacheEntry<TValue>> slots;
+    private Dict<string, int> index;
+    private int used;        // 占用槽位数
+    private int freeHead;    // 空闲槽链表头，-1 = 无
+    private int head;        // LRU 头（最近使用）
+    private int tail;        // LRU 尾（最久未用，先淘汰）
+    private int capacity;    // 0 = 不限
+    private long ttlUs;      // 0 = 不过期
+    private bool sliding;
+    private bool locked;
+    private nint mutex;
+    private CacheStats stats;
+
+    public MemoryCache() {
+        this.slots = new List<CacheEntry<TValue>>();
+        this.index = new Dict<string, int>();
+        this.used = 0;
+        this.freeHead = -1;
+        this.head = -1;
+        this.tail = -1;
+        this.capacity = 0;
+        this.ttlUs = 0;
+        this.sliding = false;
+        this.locked = false;
+        this.mutex = 0;
+        this.stats = new CacheStats();
+    }
+
+    // 跨线程共享的写法。capacity/ttlMs 传 0 表示不限/不过期。
+    public static MemoryCache<TValue> Synchronized(int capacity, long ttlMs) {
+        MemoryCache<TValue> c = new MemoryCache<TValue>();
+        c.SetCapacity(capacity);
+        c.SetTtl(ttlMs);
+        c.UseLock();
+        return c;
+    }
+
+    // 打开内部互斥锁。必须在任何并发访问之前调用。
+    public void UseLock() {
+        if (this.locked) { return; }
+        this.mutex = Mutex.Create();
+        this.locked = true;
+    }
+
+    private void Enter() { if (this.locked) { Mutex.Lock(this.mutex); } }
+    private void Leave() { if (this.locked) { Mutex.Unlock(this.mutex); } }
+
+    private static long NowUs() { return Stopwatch.GetMicroseconds(); }
+
+    // ---- 配置（仅在单线程阶段调整；并发期改配置请自行加锁） ----
+
+    public void SetCapacity(int maxEntries) {
+        this.Enter();
+        if (maxEntries < 0) { maxEntries = 0; }
+        this.capacity = maxEntries;
+        while (this.capacity > 0 && this.used > this.capacity) {
+            this.EvictTail();
+        }
+        this.Leave();
+    }
+
+    // 固定 TTL（写入时刻起算）。
+    public void SetTtl(long ttlMs) {
+        this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
+        this.sliding = false;
+    }
+
+    // 滑动 TTL（每次命中续期）。
+    public void SetSlidingTtl(long ttlMs) {
+        this.ttlUs = ttlMs > 0 ? ttlMs * 1000 : 0;
+        this.sliding = ttlMs > 0;
+    }
+
+    public int Capacity() { return this.capacity; }
+    public long TtlMs() { return this.ttlUs / 1000; }
+    public bool IsSliding() { return this.sliding; }
+    public int Count() { return this.used; }
+
+    // ---- 读写 ----
+
+    // 命中返回值，未命中返回 null（值类型不适用，见类注释）。
+    public TValue Get(string key) {
+        this.Enter();
+        int i = -1;
+        if (!this.index.TryGetValue(key, out i)) {
+            this.stats.misses = this.stats.misses + 1;
+            this.Leave();
+            return null;
+        }
+        long now = MemoryCache<TValue>.NowUs();
+        if (this.slots[i].expiresAtUs != 0 && now >= this.slots[i].expiresAtUs) {
+            this.DropSlot(i);
+            this.stats.expirations = this.stats.expirations + 1;
+            this.stats.misses = this.stats.misses + 1;
+            this.Leave();
+            return null;
+        }
+        this.stats.hits = this.stats.hits + 1;
+        this.slots[i].touchedUs = now;
+        if (this.sliding && this.ttlUs > 0) {
+            this.slots[i].expiresAtUs = now + this.ttlUs;
+        }
+        if (this.head != i) {
+            this.Unlink(i);
+            this.LinkHead(i);
+        }
+        TValue v = this.slots[i].value;
+        this.Leave();
+        return v;
+    }
+
+    // 存在性判断，不续期、不计命中、不动 LRU（探针/探活专用）。
+    public bool Contains(string key) {
+        this.Enter();
+        int i = -1;
+        if (!this.index.TryGetValue(key, out i)) { this.Leave(); return false; }
+        bool ok = true;
+        if (this.slots[i].expiresAtUs != 0
+            && MemoryCache<TValue>.NowUs() >= this.slots[i].expiresAtUs) {
+            this.DropSlot(i);
+            this.stats.expirations = this.stats.expirations + 1;
+            ok = false;
+        }
+        this.Leave();
+        return ok;
+    }
+
+    // 按构造时配置的 TTL 写入。
+    public void Set(string key, TValue value) {
+        this.Set(key, value, this.ttlUs / 1000);
+    }
+
+    // ttlMs <= 0 表示该条不过期（覆盖默认 TTL）。
+    public void Set(string key, TValue value, long ttlMs) {
+        this.Enter();
+        long now = MemoryCache<TValue>.NowUs();
+        long expiresAt = ttlMs > 0 ? now + ttlMs * 1000 : 0;
+        int i = -1;
+        if (this.index.TryGetValue(key, out i)) {
+            this.slots[i].value = value;
+            this.slots[i].expiresAtUs = expiresAt;
+            this.slots[i].touchedUs = now;
+            if (this.head != i) {
+                this.Unlink(i);
+                this.LinkHead(i);
+            }
+            this.stats.sets = this.stats.sets + 1;
+            this.Leave();
+            return;
+        }
+        if (this.capacity > 0 && this.used >= this.capacity) {
+            this.EvictTail();
+        }
+        int s = this.AllocSlot();
+        this.slots[s].key = key;
+        this.slots[s].value = value;
+        this.slots[s].expiresAtUs = expiresAt;
+        this.slots[s].touchedUs = now;
+        this.LinkHead(s);
+        this.index.Add(key, s);
+        this.used = this.used + 1;
+        this.stats.sets = this.stats.sets + 1;
+        this.Leave();
+    }
+
+    // 移除并返回原值；不存在返回 null。
+    public TValue TryRemove(string key) {
+        this.Enter();
+        int i = -1;
+        if (!this.index.TryGetValue(key, out i)) {
+            this.Leave();
+            return null;
+        }
+        TValue v = this.slots[i].value;
+        this.DropSlot(i);
+        this.stats.removes = this.stats.removes + 1;
+        this.Leave();
+        return v;
+    }
+
+    public bool Remove(string key) {
+        TValue v = this.TryRemove(key);
+        return v != null;
+    }
+
+    public void Clear() {
+        this.Enter();
+        int n = this.slots.Count;
+        int i = 0;
+        while (i < n) {
+            this.slots[i].key = "";
+            this.slots[i].value = null;
+            this.slots[i].expiresAtUs = 0;
+            this.slots[i].touchedUs = 0;
+            this.slots[i].prev = -1;
+            this.slots[i].next = (i + 1 < n) ? i + 1 : -1;
+            i = i + 1;
+        }
+        this.index.Clear();
+        this.freeHead = n > 0 ? 0 : -1;
+        this.head = -1;
+        this.tail = -1;
+        this.used = 0;
+        this.Leave();
+    }
+
+    // 回收所有已过期的槽位，返回回收个数。不访问的过期项靠它释放。
+    public int Sweep() {
+        this.Enter();
+        long now = MemoryCache<TValue>.NowUs();
+        List<int> dead = new List<int>();
+        int n = this.slots.Count;
+        int i = 0;
+        while (i < n) {
+            string k = this.slots[i].key;
+            if (k != "" && this.slots[i].expiresAtUs != 0 && now >= this.slots[i].expiresAtUs) {
+                dead.Add(i);
+            }
+            i = i + 1;
+        }
+        int m = dead.Count;
+        i = 0;
+        while (i < m) {
+            this.DropSlot(dead[i]);
+            this.stats.expirations = this.stats.expirations + 1;
+            i = i + 1;
+        }
+        this.Leave();
+        return m;
+    }
+
+    public CacheStats Stats() {
+        this.Enter();
+        CacheStats s = new CacheStats();
+        s.hits = this.stats.hits;
+        s.misses = this.stats.misses;
+        s.evictions = this.stats.evictions;
+        s.expirations = this.stats.expirations;
+        s.sets = this.stats.sets;
+        s.removes = this.stats.removes;
+        this.Leave();
+        return s;
+    }
+
+    // ---- 内部：槽位与 LRU ----
+
+    private int AllocSlot() {
+        if (this.freeHead >= 0) {
+            int s = this.freeHead;
+            this.freeHead = this.slots[s].next;
+            this.slots[s].prev = -1;
+            this.slots[s].next = -1;
+            return s;
+        }
+        CacheEntry<TValue> e = new CacheEntry<TValue>();
+        this.slots.Add(e);
+        return this.slots.Count - 1;
+    }
+
+    private void FreeSlot(int i) {
+        this.slots[i].key = "";
+        this.slots[i].value = null;
+        this.slots[i].expiresAtUs = 0;
+        this.slots[i].touchedUs = 0;
+        this.slots[i].prev = -1;
+        this.slots[i].next = this.freeHead;
+        this.freeHead = i;
+        this.used = this.used - 1;
+    }
+
+    private void DropSlot(int i) {
+        this.index.Remove(this.slots[i].key);
+        this.Unlink(i);
+        this.FreeSlot(i);
+    }
+
+    private void EvictTail() {
+        if (this.tail < 0) { return; }
+        int t = this.tail;
+        this.DropSlot(t);
+        this.stats.evictions = this.stats.evictions + 1;
+    }
+
+    private void LinkHead(int i) {
+        this.slots[i].prev = -1;
+        this.slots[i].next = this.head;
+        if (this.head >= 0) { this.slots[this.head].prev = i; }
+        this.head = i;
+        if (this.tail < 0) { this.tail = i; }
+    }
+
+    private void Unlink(int i) {
+        int p = this.slots[i].prev;
+        int nx = this.slots[i].next;
+        if (p >= 0) { this.slots[p].next = nx; } else { this.head = nx; }
+        if (nx >= 0) { this.slots[nx].prev = p; } else { this.tail = p; }
+        this.slots[i].prev = -1;
+        this.slots[i].next = -1;
+    }
+}
