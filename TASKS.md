@@ -8,13 +8,6 @@
 
 ## 未完成
 
-- [ ] **A375 `.zanmap` 调用图 id 退化为裸成员名**
-  证据：重构后 `callgraph.jsonl` 的 `id`/`name` 是裸成员名、`owner` 恒空
-  （对照重构前为 `Owner.Member`），`File.ReadAllText` 与任意 `ReadAllText`
-  无法区分，`-Callers` 只能按成员名查。
-  修点：`tools/repomap` 恢复 `<Owner>.<Member>` 形式的 id 并同步
-  `symbols.json`。现状：`tools/agent/map.ps1 -Callers` 已做裸名容错并提示。
-
 - [ ] **A376 模板验收门缺跨平台官方入口**
   证据：`scripts/test_all_templates.py` 硬编码 `/Users/qq` 与
   `libzan_gui.dylib`，并依赖 `build/zangen`（源仓库构建目录没有）。

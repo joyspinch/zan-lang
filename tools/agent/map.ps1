@@ -75,15 +75,15 @@ switch ($PSCmdlet.ParameterSetName) {
 
     'Callers' {
         if (-not (Test-Path $Graph)) { Write-Error "no callgraph at $Graph"; exit 2 }
-        # 重构后 callgraph 的 id/owner 退了：id 是裸成员名，owner 恒空。
-        # 所以 'File.ReadAllText' 和 'ReadAllText' 都按成员名匹配；
-        # 代价是不同类的同名成员无法区分——那是索引侧的缺陷，不是查询能补的。
         $id = $Callers
-        $member = ($id -split '\.')[-1]
-        if ($member -ne $id) { Write-Output "note: callgraph 只用裸成员名，按 '$member' 查（owner 不可用）" }
-        $needle = '"' + $member + '"'
+        $needle = '"' + $id + '"'
         $rows = @()
         $cand = Select-String -Path $Graph -SimpleMatch -Pattern $needle -ErrorAction SilentlyContinue
+        if (-not $cand -and ($id -match '\.')) {
+            $member = ($id -split '\.')[-1]
+            $needle = '"' + $member + '"'
+            $cand = Select-String -Path $Graph -SimpleMatch -Pattern $needle -ErrorAction SilentlyContinue
+        }
         foreach ($c in $cand) {
             if ($c.Line -notmatch '"callees"\s*:\s*\[') { continue }
             $arr = [regex]::Match($c.Line, '"callees"\s*:\s*\[([^\]]*)\]').Groups[1].Value
@@ -100,10 +100,14 @@ switch ($PSCmdlet.ParameterSetName) {
     'Callees' {
         if (-not (Test-Path $Graph)) { Write-Error "no callgraph at $Graph"; exit 2 }
         $id = $Callees
-        $member = ($id -split '\.')[-1]
-        $needle = '"id":"' + $member + '"'
+        $needle = '"id":"' + $id + '"'
         $row = Select-String -Path $Graph -SimpleMatch -Pattern $needle -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $row) { Write-Output "no node $member"; exit 1 }
+        if (-not $row -and ($id -match '\.')) {
+            $member = ($id -split '\.')[-1]
+            $needle = '"id":"' + $member + '"'
+            $row = Select-String -Path $Graph -SimpleMatch -Pattern $needle -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+        if (-not $row) { Write-Output "no node $id"; exit 1 }
         $node = $row.Line | ConvertFrom-Json
         if (-not $node.callees -or $node.callees.Count -eq 0) { Write-Output "$id calls nothing indexed"; exit 0 }
         $node.callees | Select-Object -First $Limit | ForEach-Object { 'calls -> {0}' -f $_ }
