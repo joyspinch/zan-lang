@@ -542,6 +542,33 @@ static bool expr_captures_this(zan_checker_t *c, zan_ast_node_t *node) {
                expr_captures_this(c, node->for_stmt.cond) ||
                expr_captures_this(c, node->for_stmt.step) ||
                expr_captures_this(c, node->for_stmt.body);
+    case AST_DO_WHILE_STMT:
+        return expr_captures_this(c, node->while_stmt.cond) ||
+               expr_captures_this(c, node->while_stmt.body);
+    case AST_FOREACH_STMT:
+        return expr_captures_this(c, node->foreach_stmt.collection) ||
+               expr_captures_this(c, node->foreach_stmt.body);
+    case AST_TRY_STMT:
+        if (expr_captures_this(c, node->try_stmt.try_body)) return true;
+        for (int i = 0; i < node->try_stmt.catches.count; i++) {
+            zan_ast_node_t *cc = node->try_stmt.catches.items[i];
+            if (cc && expr_captures_this(c, cc->catch_clause.body)) return true;
+        }
+        if (node->try_stmt.finally_body && expr_captures_this(c, node->try_stmt.finally_body)) return true;
+        return false;
+    case AST_SWITCH_STMT:
+        if (expr_captures_this(c, node->switch_stmt.expr)) return true;
+        for (int i = 0; i < node->switch_stmt.cases.count; i++) {
+            zan_ast_node_t *sc = node->switch_stmt.cases.items[i];
+            if (sc) {
+                if (expr_captures_this(c, sc->switch_case.pattern)) return true;
+                if (expr_captures_this(c, sc->switch_case.when_cond)) return true;
+                if (expr_captures_this(c, sc->switch_case.body)) return true;
+            }
+        }
+        return false;
+    case AST_THROW_STMT:
+        return expr_captures_this(c, node->throw_stmt.value);
     case AST_EXPR_STMT:
         return expr_captures_this(c, node->expr_stmt.expr);
     case AST_CAST_EXPR:
@@ -569,6 +596,15 @@ static bool has_closure_capturing_this(zan_checker_t *c, zan_ast_node_t *node) {
     }
     if (node->kind == AST_ASSIGNMENT) {
         return has_closure_capturing_this(c, node->binary.right);
+    }
+    if (node->kind == AST_CONDITIONAL) {
+        return has_closure_capturing_this(c, node->conditional.then_expr) ||
+               has_closure_capturing_this(c, node->conditional.else_expr);
+    }
+    if (node->kind == AST_CALL) {
+        for (int i = 0; i < node->call.args.count; i++) {
+            if (has_closure_capturing_this(c, node->call.args.items[i])) return true;
+        }
     }
     if (node->kind == AST_NEW_EXPR) {
         for (int i = 0; i < node->new_expr.args.count; i++) {
