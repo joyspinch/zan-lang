@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Diagnostics;
+
+// 剖析作用域统计快照（Profile Scope Metrics）
+public class ProfileMetric {
+    public string name;
+    public int callCount;
+    public long totalMicroseconds;
+    public long minMicroseconds;
+    public long maxMicroseconds;
+
+    public ProfileMetric(string name) {
+        this.name = name != null ? name : "";
+        this.callCount = 0;
+        this.totalMicroseconds = 0;
+        this.minMicroseconds = 0;
+        this.maxMicroseconds = 0;
+    }
+
+    public void Record(long elapsedUs) {
+        if (this.callCount == 0) {
+            this.minMicroseconds = elapsedUs;
+            this.maxMicroseconds = elapsedUs;
+        } else {
+            if (elapsedUs < this.minMicroseconds) { this.minMicroseconds = elapsedUs; }
+            if (elapsedUs > this.maxMicroseconds) { this.maxMicroseconds = elapsedUs; }
+        }
+        this.callCount = this.callCount + 1;
+        this.totalMicroseconds = this.totalMicroseconds + elapsedUs;
+    }
+
+    public long AverageMicroseconds {
+        get {
+            if (this.callCount == 0) { return 0; }
+            return this.totalMicroseconds / (long)this.callCount;
+        }
+    }
+}
+
+// 轻量级作用域守卫（RAII-style IDisposable scope）
+public class ProfileScopeGuard : IDisposable {
+    private ProfileSession session;
+    private string name;
+    private long startTicks;
+
+    public ProfileScopeGuard(ProfileSession session, string name) {
+        this.session = session;
+        this.name = name;
+        this.startTicks = Stopwatch.NowTicks();
+    }
+
+    public void Dispose() {
+        if (this.session != null) {
+            long endTicks = Stopwatch.NowTicks();
+            long elapsedTicks = endTicks - this.startTicks;
+            long freq = Stopwatch.Frequency();
+            long elapsedUs = 0;
+            if (freq > 0) {
+                elapsedUs = (long)(elapsedTicks * 1000000.0 / (double)freq);
+            } else {
+                elapsedUs = elapsedTicks;
+            }
+            this.session.RecordScope(this.name, elapsedUs);
+            this.session = null;
+        }
+    }
+}
+
+// 生产级 CPU / 执行耗时剖析会话（ProfileSession）。
+// 记录各业务函数、数据库查询或计算热点的调用次数、累计微秒、最大/最小值，
+// 并可导出为 Speedscope / Chrome://tracing 兼容的时序图谱。
+public class ProfileSession {
+    public string sessionName;
+    public List<ProfileMetric> metrics;
+    public List<string> metricNames;
+
+    public ProfileSession(string sessionName) {
+        this.sessionName = sessionName != null ? sessionName : "default";
+        this.metrics = new List<ProfileMetric>();
+        this.metricNames = new List<string>();
+    }
+
+    public static ProfileSession Start(string sessionName) {
+        return new ProfileSession(sessionName);
+    }
+
+    public ProfileScopeGuard Scope(string scopeName) {
+        return new ProfileScopeGuard(this, scopeName);
+    }
+
+    public void RecordScope(string name, long elapsedUs) {
+        ProfileMetric metric = null;
+        for (int i = 0; i < this.metrics.Count; i = i + 1) {
+            if (this.metrics[i].name == name) {
+                metric = this.metrics[i];
+                break;
+            }
+        }
+        if (metric == null) {
+            metric = new ProfileMetric(name);
+            this.metrics.Add(metric);
+            this.metricNames.Add(name);
+        }
+        metric.Record(elapsedUs);
+    }
+
+    // 根据名称获取指标
+    public ProfileMetric GetMetric(string name) {
+        for (int i = 0; i < this.metrics.Count; i = i + 1) {
+            if (this.metrics[i].name == name) {
+                return this.metrics[i];
+            }
+        }
+        return null;
+    }
+
+    // 格式化输出人类可读的统计报表
+    public string GenerateSummary() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("=== Profile Summary: ");
+        sb.Append(this.sessionName);
+        sb.Append(" ===\n");
+        for (int i = 0; i < this.metrics.Count; i = i + 1) {
+            ProfileMetric m = this.metrics[i];
+            sb.Append("  [");
+            sb.Append(m.name);
+            sb.Append("] calls: ");
+            sb.Append(Convert.ToString(m.callCount));
+            sb.Append(", total: ");
+            sb.Append(Convert.ToString(m.totalMicroseconds));
+            sb.Append("us, avg: ");
+            sb.Append(Convert.ToString(m.AverageMicroseconds));
+            sb.Append("us\n");
+        }
+        return sb.ToString();
+    }
+}
