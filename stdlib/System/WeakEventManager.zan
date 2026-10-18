@@ -1,0 +1,85 @@
+using System;
+using System.Collections.Generic;
+
+namespace System;
+
+// 针对对象实例方法的回调委托
+public delegate void ActionRef<TTarget, TArgs>(TTarget target, TArgs args);
+
+// 弱引用事件订阅包装项，持有一个弱引用并在 Target 回收后自动退化
+class WeakSubscription<TTarget, TArgs> {
+    private WeakReference<TTarget> weakTarget;
+    private ActionRef<TTarget, TArgs> callback;
+
+    public WeakSubscription(TTarget target, ActionRef<TTarget, TArgs> callback) {
+        this.weakTarget = new WeakReference<TTarget>(target);
+        this.callback = callback;
+    }
+
+    public bool Invoke(TArgs args) {
+        TTarget target;
+        if (this.weakTarget.TryGetTarget(out target)) {
+            this.callback(target, args);
+            return true;
+        }
+        return false;
+    }
+
+    public bool IsAlive {
+        get { return this.weakTarget.IsAlive; }
+    }
+}
+
+// 弱引用事件管理器（WeakEventManager）。
+// 在 GUI、长生命周期服务与观察者模式下，传统强引用事件监听容易阻碍发布者/订阅者的回收导致 ARC 内存泄露；
+// WeakEventManager 使用 WeakReference 包装监听者，当监听者被释放后，事件分发时自动惰性移除无效项，
+// 彻底解决闭包/事件委托引用的循环引用与长常驻泄露问题。
+public class WeakEventManager<TTarget, TArgs> {
+    private List<WeakSubscription<TTarget, TArgs>> subscriptions;
+
+    public WeakEventManager() {
+        this.subscriptions = new List<WeakSubscription<TTarget, TArgs>>();
+    }
+
+    public static WeakEventManager<TTarget, TArgs> Create() {
+        return new WeakEventManager<TTarget, TArgs>();
+    }
+
+    // 添加弱引用事件监听
+    public void AddHandler(TTarget target, ActionRef<TTarget, TArgs> callback) {
+        if (target == null || callback == null) { return; }
+        this.Purge();
+        this.subscriptions.Add(new WeakSubscription<TTarget, TArgs>(target, callback));
+    }
+
+    // 触发事件分发，自动清理已消亡的目标
+    public void Raise(TArgs args) {
+        List<WeakSubscription<TTarget, TArgs>> alive = new List<WeakSubscription<TTarget, TArgs>>();
+        for (int i = 0; i < this.subscriptions.Count; i = i + 1) {
+            WeakSubscription<TTarget, TArgs> sub = this.subscriptions[i];
+            if (sub.Invoke(args)) {
+                alive.Add(sub);
+            }
+        }
+        this.subscriptions = alive;
+    }
+
+    // 清理已释放的订阅项
+    public void Purge() {
+        List<WeakSubscription<TTarget, TArgs>> alive = new List<WeakSubscription<TTarget, TArgs>>();
+        for (int i = 0; i < this.subscriptions.Count; i = i + 1) {
+            if (this.subscriptions[i].IsAlive) {
+                alive.Add(this.subscriptions[i]);
+            }
+        }
+        this.subscriptions = alive;
+    }
+
+    // 存活订阅者数量
+    public int Count {
+        get {
+            this.Purge();
+            return this.subscriptions.Count;
+        }
+    }
+}
