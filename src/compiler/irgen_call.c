@@ -1,22 +1,38 @@
 
 static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
                                            bool keep_result) {
-    if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind ||
-        !LLVMIsACallInst(sub))
+    if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
         return NULL;
+
+    /* 直接调用：被调函数是具名符号，按 "<callee>$resume" 直接取 resume 入口。 */
+    LLVMValueRef sub_resume = NULL;
     LLVMValueRef callee = LLVMGetCalledValue(sub);
-    if (!callee) return NULL;
-    size_t nl = 0;
-    const char *cn = LLVMGetValueName2(callee, &nl);
-    if (!cn || nl == 0 || nl >= 240) return NULL;
-    char rn[256];
-    memcpy(rn, cn, nl);
-    memcpy(rn + nl, "$resume", 8);
-    LLVMValueRef sub_resume = LLVMGetNamedFunction(g->mod, rn);
-    if (!sub_resume) return NULL;
+    if (callee) {
+        size_t nl = 0;
+        const char *cn = LLVMGetValueName2(callee, &nl);
+        if (cn && nl != 0 && nl < 240) {
+            char rn[256];
+            memcpy(rn, cn, nl);
+            memcpy(rn + nl, "$resume", 8);
+            sub_resume = LLVMGetNamedFunction(g->mod, rn);
+        }
+    }
 
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     LLVMValueRef sub_i8 = LLVMBuildBitCast(g->builder, sub, i8ptr, "spawn.sub");
+
+    /* 间接调用（接口/虚方法/委托分发）：被调入口不是静态符号，按名字取不到
+       $resume。此时从帧头的 SELF_STEP 槽加载本协程的 resume 入口——ramp 里
+       一定会写入它，await 的间接分支用的就是同一招（irgen_expr.c）。
+       缺了这一步，Task.Spawn/Task.Run 会静默丢弃协程：返回 0 句柄、循环体
+       永不执行，而 IsDone(0) 对空帧报"已完成"，症状极难与业务 bug 区分。 */
+    if (!sub_resume) {
+        LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, g->co_header_type,
+            sub_i8, ASYNC_FRAME_SELF_STEP, "spawn.selfstep.p");
+        sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp,
+                                    "spawn.selfstep");
+    }
+    if (!sub_resume) return NULL;
     if (!keep_result) {
         LLVMTypeRef hdr = g->co_header_type;
         LLVMBuildStore(g->builder, sub_i8,

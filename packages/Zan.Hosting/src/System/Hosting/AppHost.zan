@@ -1,0 +1,137 @@
+using System;
+using System.Collections.Generic;
+using System.DependencyInjection;
+using System.Threading;
+
+namespace System.Hosting;
+
+// 应用宿主。控制台程序、常驻 worker、服务端后台都可以用它统一生命周期：
+// 启动阶段**按注册顺序**依次 StartAsync，关闭阶段**逆序**依次 StopAsync
+// （后起的先收摊——依赖者在被依赖者之前停），每个服务带独立停止超时，
+// 单个服务启动/停止失败只记账，不阻断其余服务。
+//
+// 关闭请求来自两处：程序自己调 RequestStop()，或等待外部传入的
+// CancellationToken（宿主只是把它接到同一个 shutdown 源上）。
+//
+// 用法：
+//   AppHost host = new AppHost("collector");
+//   host.Add(new PollService());
+//   host.Add(new FlushService());
+//   host.SetStopTimeout(5000);
+//   host.Run();                 // 阻塞直到 RequestStop()
+public class AppHost {
+    public string name = "app";
+    public List<IHostedService> services = new List<IHostedService>();
+    public CancellationTokenSource shutdown = new CancellationTokenSource();
+    public Gate gate = new Gate();
+    public long stopTimeoutMs = 5000;
+    public bool started = false;
+    public int startFailures = 0;
+    public int stopFailures = 0;
+    public int stoppedCount = 0;
+
+    public AppHost() { }
+
+    public AppHost(string name) { this.name = name; }
+
+    public void Add(IHostedService svc) {
+        if (svc != null) { this.services.Add(svc); }
+    }
+
+    // 从 DI 容器按服务名取实例登记。取不到、或注册的不是托管服务时返回
+    // false——宿主要的是"明确登记"，不在错误类型上静默跳过。
+    public bool AddFrom(IServiceProvider sp, string serviceType) {
+        if (sp == null) { return false; }
+        object o = sp.GetService(serviceType);
+        if (o == null) { return false; }
+        if (!(o is IHostedService)) { return false; }
+        this.Add((IHostedService)o);
+        return true;
+    }
+
+    public int Count() { return this.services.Count; }
+    public void SetStopTimeout(long ms) { this.stopTimeoutMs = ms; }
+    public CancellationToken Token() { return this.shutdown.Token; }
+    public bool IsRunning() { return this.started && !this.shutdown.Token.IsCancellationRequested; }
+
+    public async bool StartAsync() {
+        if (this.started) { return true; }
+        this.started = true;
+        int n = this.services.Count;
+        int i = 0;
+        while (i < n) {
+            IHostedService s = this.services[i];
+            try {
+                bool ok = await s.StartAsync(this.shutdown.Token);
+                if (!ok) { this.startFailures = this.startFailures + 1; }
+            } catch (Exception e) {
+                this.startFailures = this.startFailures + 1;
+            } catch {
+                this.startFailures = this.startFailures + 1;
+            }
+            i = i + 1;
+        }
+        return this.startFailures == 0;
+    }
+
+    // 逆序停止；每个服务独立超时（悬挂的服务不会拖住整个进程收尾）。
+    public async bool StopAsync() {
+        if (!this.started) { return true; }
+        this.shutdown.Cancel();
+        int i = this.services.Count - 1;
+        while (i >= 0) {
+            IHostedService s = this.services[i];
+            if (await this.StopOne(s)) { this.stoppedCount = this.stoppedCount + 1; }
+            else { this.stopFailures = this.stopFailures + 1; }
+            i = i - 1;
+        }
+        this.started = false;
+        return this.stopFailures == 0;
+    }
+
+    // 请求关闭。Cancel 先置位、再放行等待者，两者顺序不能反——先 Signal
+    // 后 Cancel 会让 Run 醒来时仍看到"未取消"而重新挂起。
+    public void RequestStop() {
+        this.shutdown.Cancel();
+        this.gate.Signal();
+    }
+
+    // 阻塞式运行：启动 → 等关闭请求 → 停止。常规 main 的最后一句。
+    public async void Run() {
+        await this.StartAsync();
+        while (!this.shutdown.Token.IsCancellationRequested) {
+            await this.gate.Wait();
+        }
+        await this.StopAsync();
+    }
+
+    public HostStatus Status() {
+        HostStatus s = new HostStatus();
+        s.name = this.name;
+        s.running = this.IsRunning();
+        s.services = this.services.Count;
+        s.startFailures = this.startFailures;
+        s.stopFailures = this.stopFailures;
+        s.stopped = this.stoppedCount;
+        return s;
+    }
+
+    // 单个服务的带超时停止：Task.Spawn 出句柄后轮询 IsDone，超时就放弃
+    // 等待（进程退出前不会为它再等下去）。
+    private async bool StopOne(IHostedService s) {
+        long h = 0;
+        try {
+            h = Task.Spawn(s.StopAsync(this.shutdown.Token));
+        } catch (Exception e) {
+            return false;
+        } catch {
+            return false;
+        }
+        long waited = 0;
+        while (Task.IsDone(h) == 0 && waited < this.stopTimeoutMs) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        return Task.IsDone(h) != 0;
+    }
+}

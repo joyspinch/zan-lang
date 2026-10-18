@@ -1,0 +1,71 @@
+using System;
+using System.Collections.Generic;
+
+// 回归：Task.Spawn/Task.Run 作用在**间接**异步调用（接口/虚方法分发）上时，
+// 必须真的把协程挂上调度器。曾经的缺陷是：调用点按 "<被调函数名>$resume"
+// 找 resume 入口，间接调用的入口不是具名符号 → 找不到 → 静默返回 0 句柄、
+// 协程永不执行，而 Task.IsDone(0) 对空帧报"已完成"，症状与业务 bug 极难区分。
+// 本用例故意声明两个实现者以**阻止去虚拟化**，强制走间接分发路径。
+interface IJob {
+    async bool Run(int tag);
+}
+
+class GoodJob : IJob {
+    public List<string> log;
+    public GoodJob(List<string> log) { this.log = log; }
+    public async bool Run(int tag) {
+        this.log.Add("good:" + Convert.ToString(tag));
+        await Task.Yield();
+        this.log.Add("good:" + Convert.ToString(tag) + ":done");
+        return true;
+    }
+}
+
+// 第二个实现者：只为让 IJob.Run 无法被静态去虚拟化
+class OtherJob : IJob {
+    public async bool Run(int tag) {
+        await Task.Yield();
+        return true;
+    }
+}
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond, string name) {
+        if (!cond) { Console.WriteLine("FAIL " + name); bad = bad + 1; }
+    }
+
+    static async void Main() {
+        List<string> log = new List<string>();
+        IJob j = new GoodJob(log);
+
+        // 间接调用的句柄不能是 0（0 = 本次调用没有产出协程）
+        long h = Task.Spawn(j.Run(1));
+        Check(h != 0, "spawn-handle-nonzero");
+
+        // 挂上去之后必须真的执行完（WhenAll 等全部句柄结束）
+        List<long> hs = new List<long>();
+        hs.Add(h);
+        int n = await Task.WhenAll(hs);
+        Check(n == 1, "whenall-1");
+        Check(log.Count == 2, "log-2");
+        Check(log[0] == "good:1", "log-head");
+        Check(log[1] == "good:1:done", "log-tail");
+
+        // Task.Run 同样走这条分发路径
+        long h2 = Task.Run(j.Run(2));
+        Check(h2 != 0, "run-handle-nonzero");
+        List<long> hs2 = new List<long>();
+        hs2.Add(h2);
+        await Task.WhenAll(hs2);
+        Check(log.Count == 4, "log-4");
+
+        // 语句级 fire-and-forget 的间接异步调用（另一处 detach 调用点）
+        j.Run(3);
+        await Task.Delay(50);
+        Check(log.Count == 6, "log-6-after-statement-spawn");
+
+        Console.WriteLine("spawn-indirect-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

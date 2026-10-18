@@ -1,0 +1,155 @@
+using System;
+using System.Collections.Generic;
+using System.DependencyInjection;
+using System.Hosting;
+using System.Threading;
+
+// Zan.Hosting 契约用例：启动顺序/逆序停止/失败记账/周期服务异常不杀循环/
+// 返回 false 自停/有界停止/DI 登记/状态快照。输出即金样。
+class Rec : IHostedService {
+    public string id;
+    public List<string> log;
+    public bool failStart;
+    public Rec(string id, List<string> log) {
+        this.id = id;
+        this.log = log;
+        this.failStart = false;
+    }
+    public async bool StartAsync(CancellationToken ct) {
+        this.log.Add("start:" + this.id);
+        await Task.Yield();
+        return !this.failStart;
+    }
+    public async bool StopAsync(CancellationToken ct) {
+        this.log.Add("stop:" + this.id);
+        await Task.Yield();
+        return true;
+    }
+}
+
+class Ticker : BackgroundService {
+    public Ticker() {
+        this.name = "ticker";
+        this.SetInterval(5);
+    }
+    public override async bool ExecuteAsync(CancellationToken ct) {
+        await Task.Yield();
+        return true;
+    }
+}
+
+class Angry : BackgroundService {
+    public Angry() {
+        this.name = "angry";
+        this.SetInterval(5);
+    }
+    public override async bool ExecuteAsync(CancellationToken ct) {
+        await Task.Yield();
+        throw new InvalidOperationException("boom");
+    }
+}
+
+class Once : BackgroundService {
+    public int run = 0;
+    public Once() {
+        this.name = "once";
+        this.SetInterval(5);
+    }
+    public override async bool ExecuteAsync(CancellationToken ct) {
+        this.run = this.run + 1;
+        await Task.Yield();
+        return this.run < 3;
+    }
+}
+
+class Prog {
+    static int bad = 0;
+
+    static void Check(bool cond, string name) {
+        if (!cond) { Console.WriteLine("FAIL " + name); bad = bad + 1; }
+    }
+
+    static async void Main() {
+        // 顺序启动 + 逆序停止 + 状态快照
+        List<string> log = new List<string>();
+        AppHost h = new AppHost("probe");
+        h.Add(new Rec("a", log));
+        h.Add(new Rec("b", log));
+        h.Add(new Rec("c", log));
+        Check(h.Count() == 3, "count-3");
+        Check(await h.StartAsync(), "start-ok");
+        Check(h.IsRunning(), "running");
+        h.RequestStop();
+        Check(await h.StopAsync(), "stop-ok");
+        Check(log.Count == 6, "log-6");
+        Check(log[0] == "start:a" && log[1] == "start:b" && log[2] == "start:c", "start-order");
+        Check(log[3] == "stop:c" && log[4] == "stop:b" && log[5] == "stop:a", "stop-reverse");
+        Check(h.IsRunning() == false, "not-running");
+        HostStatus st = h.Status();
+        Check(st.services == 3 && st.stopped == 3, "status-counts");
+        Check(st.startFailures == 0 && st.stopFailures == 0, "status-failures");
+        Console.WriteLine(st.Line());
+
+        // 启动失败只记账，后续服务照常起
+        List<string> log2 = new List<string>();
+        AppHost h2 = new AppHost("fail");
+        Rec bad1 = new Rec("bad", log2);
+        bad1.failStart = true;
+        h2.Add(bad1);
+        h2.Add(new Rec("good", log2));
+        Check(await h2.StartAsync() == false, "start-reports-failure");
+        Check(log2.Count == 2, "start-continued");
+        Check(h2.Status().startFailures == 1, "start-failures-1");
+        h2.RequestStop();
+        await h2.StopAsync();
+
+        // 周期服务：跑得起来、停得干净
+        Ticker t = new Ticker();
+        AppHost h3 = new AppHost("ticker-host");
+        h3.Add(t);
+        await h3.StartAsync();
+        await Task.Delay(60);
+        Check(t.ticks > 0, "ticker-ticks");
+        Check(t.stopped == false, "ticker-running");
+        h3.RequestStop();
+        await h3.StopAsync();
+        Check(t.stopped, "ticker-stopped");
+        Check(t.errors == 0, "ticker-no-errors");
+        Check(t.StoppedCleanly(), "ticker-clean");
+
+        // 循环体抛异常不杀循环
+        Angry a = new Angry();
+        AppHost h4 = new AppHost("angry-host");
+        h4.Add(a);
+        await h4.StartAsync();
+        await Task.Delay(60);
+        Check(a.errors > 0, "angry-errors");
+        Check(a.ticks >= a.errors, "angry-ticks-survive");
+        Check(a.lastError == "boom", "angry-last-error");
+        h4.RequestStop();
+        await h4.StopAsync();
+
+        // 循环体返回 false：自停
+        Once o = new Once();
+        AppHost h5 = new AppHost("once-host");
+        h5.Add(o);
+        await h5.StartAsync();
+        await Task.Delay(60);
+        Check(o.stopped, "once-self-stopped");
+        Check(o.ticks == 3, "once-ticks-3");
+        Check(o.errors == 0, "once-no-errors");
+        h5.RequestStop();
+        await h5.StopAsync();
+
+        // DI 集成：按服务名取实例登记
+        ServiceCollection sc = new ServiceCollection();
+        sc.AddSingletonInstance("svc.hosted", new Rec("di", new List<string>()));
+        ServiceProvider sp = sc.BuildServiceProvider();
+        AppHost h6 = new AppHost("di-host");
+        Check(h6.AddFrom(sp, "svc.hosted"), "addfrom-ok");
+        Check(h6.AddFrom(sp, "svc.missing") == false, "addfrom-missing");
+        Check(h6.Count() == 1, "addfrom-count");
+
+        Console.WriteLine("hosting-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+    }
+}

@@ -8,9 +8,31 @@
 
 ## 未完成
 
-（暂无欠账）
+- [ ] **A373 `zanfmt --check` 在 Windows 检出上 100% 假红**
+  证据：`.zan` 工作树是 CRLF（`.gitattributes` 规定提交 LF），`--check` 拿
+  CRLF 原文与自身 LF 输出逐字节比 → 实测 8356/8356 全红；改用
+  `--stdout` 归一化行尾后比较即正常（`stdlib/System/Action.zan` 判 ok）。
+  修点：`src/fmt/ZanFmt.zan` 的 check 路径先归一化行尾。
+  现状：`tools/agent/verify.ps1` 已在内部绕过该缺陷。
 
+- [ ] **A374 MCP `zan_start_here` 仍宣传已失效的 repomap 单文件命令**
+  证据：`tools/mcp_server/McpServer.zan` 共 8 处（约 1129/1301/1332/2046/
+  2187/2446/2655/4213 行）输出 `zanc tools/repomap/RepoMap.zan --auto-stdlib`
+  ；而 RepoMap 已在 c6413641 / 85938c5a 拆成 `RepoMap.zan + Str.zan +
+  Models/*.zan`，单文件形式报一串 `undefined type 'RefBucket'`。
+  修点：文案改指向 `scripts/build_repomap.ps1`（已加，负责枚举全部源），
+  并重编 `zan-mcp` 才生效。
 
-## 未完成
+- [ ] **A375 `.zanmap` 调用图 id 退化为裸成员名**
+  证据：重构后 `callgraph.jsonl` 的 `id`/`name` 是裸成员名、`owner` 恒空
+  （对照重构前为 `Owner.Member`），`File.ReadAllText` 与任意 `ReadAllText`
+  无法区分，`-Callers` 只能按成员名查。
+  修点：`tools/repomap` 恢复 `<Owner>.<Member>` 形式的 id 并同步
+  `symbols.json`。现状：`tools/agent/map.ps1 -Callers` 已做裸名容错并提示。
 
-（暂无欠账）
+- [ ] **A376 模板验收门缺跨平台官方入口**
+  证据：`scripts/test_all_templates.py` 硬编码 `/Users/qq` 与
+  `libzan_gui.dylib`，并依赖 `build/zangen`（源仓库构建目录没有）。
+  现状：`tools/agent/gate-templates.ps1` 是 Windows 等价物（按
+  `template.manifest` + `zan.proj` 的声明做替换副本，46 个模板全量可跑）。
+  修点：官方脚本走平台探测，或把 Windows 侧纳入 `scripts/` 统一入口。

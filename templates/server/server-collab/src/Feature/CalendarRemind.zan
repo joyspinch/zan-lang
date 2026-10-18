@@ -1,0 +1,61 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Orm;
+using ZanWeb.Dao.Oa;
+using ZanWeb.Model.Oa;
+using ZanWeb.Model;
+
+namespace ZanWeb;
+
+/* 日程提醒后台协程（T11）+ 日历待办源。两者共用 OaCalendarEvent，
+   与 Oa 域 Calendar 控制器（屏面）分层：后台无请求上下文，db/tenantId
+   显式传参（Notify.Send / TodoSource 同款纪律）。 */
+
+/* 日程提醒扫描：每 30s 一拍。
+   本单核心设计——多 worker 抢占式原子置位：Task.Spawn 协程是
+   per-worker 各跑一份（Metrics.zan:551 自证），"查询→发送→置位"
+   若非原子，同一日程会被 4 个 worker 各发一遍。故先
+   UPDATE oa_calendar_event SET reminded=1 WHERE id=? AND reminded=0
+   （SQLite 单写锁下仅一个 worker 的 UPDATE 命中 1 行），
+   ExecuteAffrowsAsync()==1 者才 Notify.Send。
+   到点窗口：startAt-remindMinutes*60 <= now（已到提醒时刻）且
+   startAt > now-3600（过期 1h 内补发，更早放弃）。
+   扫描谓词不加 tenantId（后台无请求上下文），逐行按行上 tenantId
+   显式传参（Engine.Note 同款）。 */
+public class CalendarRemind {
+    /* 拍间隔（秒）。 */
+    public static int Interval = 30;
+    /* 过期补发窗口（秒）：开始时刻已过 1h 内仍补发。 */
+    public static long GraceSeconds = 3600;
+
+    public static async void Loop() {
+        IZanSql fsql = AppServices.Current()?.Orm();
+        while (true) {
+            await Task.Delay(CalendarRemind.Interval * 1000);
+            if (fsql == null) { continue; }
+            await CalendarRemind.Sweep(fsql);
+        }
+    }
+
+    public static async void Sweep(IZanSql fsql) {
+        long now = WebApp.NowSeconds();
+        OaCalendarEventDao events = new OaCalendarEventDao(fsql);
+        /* ORM 谓词不允许字段间算术（a.startAt - a.remindMinutes*60 不可编译），
+           预取上限改为按最大提醒档 1440min 扩窗取行；逐行"是否已到提醒时刻"
+           在循环内判定（普通算术）。 */
+        List<OaCalendarEvent> rows = await events.CandidateReminds(now, CalendarRemind.GraceSeconds);
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            OaCalendarEvent ev = rows[i];
+            /* 未到提醒时刻（startAt-remindMinutes*60 > now）：跳过等下一拍。 */
+            if (ev.startAt - (long)ev.remindMinutes * 60 > now) { continue; }
+            /* 抢占：UPDATE 命中 1 行的 worker 独得发送权，其余跳过。 */
+            int hit = await events.MarkReminded(ev.id);
+            if (hit != 1) { continue; }
+            await Notify.Send(fsql, ev.tenantId, ev.ownerId, "calendar",
+                "remind", "日程提醒：" + ev.title,
+                Fmt.Stamp(ev.startAt) + " 开始", "/admin/oa/calendar");
+        }
+    }
+}

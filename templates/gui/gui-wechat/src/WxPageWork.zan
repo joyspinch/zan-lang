@@ -483,3 +483,242 @@ public class WxPageWork : Control {
     Input eDesc;
     // 编辑中的行控件（与 stages 一一对应，只活在两次重建之间）。
     List<WxStageRow> stageRows;
+
+    void BuildEditor() {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+        stageRows = new List<WxStageRow>();
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead(editDefId == "0" ? "新建模板"
+            : "编辑模板", card);
+        body.Add(Wx.Lbl("环节按从上到下依次流转；不指派人的环节由所选"
+            + "部门整队认领。", "wxpsub"));
+        eName = new Input("流程名称（必填）");
+        if (edName.Length > 0) { eName.SetText(edName); }
+        body.Add(eName);
+        eDesc = new Input("描述（选填）");
+        if (edDesc.Length > 0) { eDesc.SetText(edDesc); }
+        body.Add(eDesc);
+        stageBox = Panel.Column();
+        body.Add(stageBox);
+        for (int i = 0; i < stages.Count; i = i + 1) {
+            this.AddStageRow(stages[i]);
+        }
+
+        this.ActBtn(body, "+ 添加环节", () => {
+            this.SaveEditorState();
+            stages.Add(new WxStageData());
+            this.BuildEditor();
+        });
+        this.ActBtn(body, "保存模板", () => { this.SaveTpl(); });
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+
+        if (detailCol != null) { detailCol.visible = true; }
+        this.RequestRedrawHost();
+    }
+
+    WxStageRow AddStageRow(WxStageData data) {
+        WxStageRow r = new WxStageRow();
+        r.data = data;
+        r.row = Wx.Row("");
+        r.name = new Input("环节名称");
+        r.name.Class = "grow";
+        if (data.name.Length > 0) { r.name.SetText(data.name); }
+        r.row.Add(r.name);
+        r.pick = new Button(data.who);
+        r.pick.Class = "text small";
+        WxStageRow captured = r;
+        r.pick.OnClick(() => { this.BeginPickFor(captured); });
+        r.row.Add(r.pick);
+        r.del = new Button("删");
+        r.del.Class = "text small";
+        r.del.OnClick(() => {
+            this.SaveEditorState();
+            stages.Remove(captured.data);
+            this.BuildEditor();
+        });
+        r.row.Add(r.del);
+        stageRows.Add(r);
+        stageBox.Add(r.row);
+        return r;
+    }
+
+    // 把两根输入框与各环节名的现值收回数据侧（重建前必调）。
+    void SaveEditorState() {
+        if (eName != null) { edName = eName.GetText(); }
+        if (eDesc != null) { edDesc = eDesc.GetText(); }
+        for (int i = 0; i < stageRows.Count; i = i + 1) {
+            stageRows[i].data.name = stageRows[i].name.GetText();
+        }
+    }
+
+    void SaveTpl() {
+        this.SaveEditorState();
+        if (edName.Length == 0) {
+            this.Note("名称不能为空");
+            return;
+        }
+        if (stages.Count == 0) {
+            this.Note("至少一个环节");
+            return;
+        }
+        string nodes = "[";
+        for (int i = 0; i < stages.Count; i = i + 1) {
+            WxStageData d = stages[i];
+            if (d.name.Length == 0) {
+                this.Note("第 " + Convert.ToString(i + 1) + " 个环节缺名称");
+                return;
+            }
+            if (i > 0) { nodes = nodes + ","; }
+            nodes = nodes + "{\"name\":\""
+                + Encoding.UrlEncode(d.name) + "\",\"assignUserId\":\""
+                + d.userId + "\",\"deptId\":\"" + d.deptId + "\"}";
+        }
+        nodes = nodes + "]";
+        WxNetReq r2 = WxNet.NewReq();
+        WxNet.ApiPost(r2, "/api/flow/flowsave",
+            "id=" + editDefId
+            + "&name=" + Encoding.UrlEncode(edName)
+            + "&description=" + Encoding.UrlEncode(edDesc)
+            + "&nodes=" + nodes
+            + "&clientRequestId=" + WxIm.NextCrid(), () => {
+                try {
+                    if (!WxNet.OkOf(r2)) {
+                        this.Note(WxNet.ErrOf(r2));
+                        return;
+                    }
+                    this.CloseDetail();
+                    this.LoadAll();
+                } catch (Exception ex) { this.Note(ex.Message); }
+            });
+    }
+
+    /* ---- 形态四：选负责人（联系人直派 或 部门整队认领）---- */
+
+    WxStageData picking;
+
+    void BeginPickFor(WxStageRow row) {
+        this.SaveEditorState();
+        picking = row.data;
+        if (contacts.Count > 0) { this.BuildPickPanel(); return; }
+        WxNetReq r = WxNet.NewReq();
+        WxNet.Get(r, "contacts", () => {
+            try {
+                if (!WxNet.OkOf(r) || WxNet.DataOf(r) == null) {
+                    this.Note("联系人拉取失败：" + WxNet.ErrOf(r));
+                    return;
+                }
+                JsonValue items = WxNet.DataOf(r).Get("contacts");
+                int n = items == null ? 0 : items.Count();
+                for (int i = 0; i < n; i = i + 1) {
+                    contacts.Add(WxDept.Of(items.At(i).Str("id", "0"),
+                        items.At(i).Str("name", "?")));
+                }
+                this.BuildPickPanel();
+            } catch (Exception ex) { this.Note(ex.Message); }
+        });
+    }
+
+    void BuildPickPanel() {
+        this.EnsureDetailBody();
+        detailBody.RemoveAll();
+        statusLbl = null;
+
+        Panel card = Panel.Root("wxworkcard");
+        card.Class = "grow";
+        Panel body = this.CardHead("环节负责人", card);
+        body.Add(Wx.Lbl("指定人直派本环节；部门则整队进认领池。", "wxpsub"));
+        body.Add(Wx.Line());
+        for (int i = 0; i < contacts.Count; i = i + 1) {
+            WxDept c = contacts[i];
+            Button b = new Button(c.name);
+            b.Class = "text small";
+            b.OnClick(() => {
+                picking.userId = c.id;
+                picking.deptId = "0";
+                picking.who = c.name;
+                this.BuildEditor();
+            });
+            body.Add(b);
+        }
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            WxDept dp = depts[i];
+            Button b = new Button("部门池：" + dp.name);
+            b.Class = "text small";
+            b.OnClick(() => {
+                picking.userId = "0";
+                picking.deptId = dp.id;
+                picking.who = "部门池：" + dp.name;
+                this.BuildEditor();
+            });
+            body.Add(b);
+        }
+        Button back = new Button("返回编辑");
+        back.Class = "text small";
+        back.OnClick(() => { this.BuildEditor(); });
+        body.Add(back);
+        statusLbl = Wx.Lbl("", "wxpsub");
+        body.Add(statusLbl);
+        detailBody.Add(card);
+        this.RequestRedrawHost();
+    }
+
+    // 模板详情卡里的「编辑」入口：强类型实体喂进编辑器状态。
+    void EditTemplateDetail(WxFlowDefDetail d) {
+        editDefId = d.id;
+        edName = d.name;
+        edDesc = d.description;
+        stages = new List<WxStageData>();
+        int nn = d.nodes != null ? d.nodes.Count : 0;
+        for (int i = 0; i < nn; i = i + 1) {
+            WxFlowNodeItem n = d.nodes[i];
+            WxStageData sd = new WxStageData();
+            sd.name = n.name;
+            sd.userId = n.assignUserId;
+            sd.deptId = n.deptId;
+            if (sd.userId != "0") {
+                sd.who = WxTaskSheet.Who(sd.userId);
+            } else if (sd.deptId != "0") {
+                sd.who = this.DeptName(sd.deptId);
+            }
+            stages.Add(sd);
+        }
+        this.BuildEditor();
+    }
+
+    string DeptName(string id) {
+        for (int i = 0; i < depts.Count; i = i + 1) {
+            if (depts[i].id == id) { return "部门池：" + depts[i].name; }
+        }
+        return "部门认领";
+    }
+
+    override string Kind() { return "WxPageWork"; }
+
+    /* ---- 词典 ---- */
+
+    static string InstZh(int st) {
+        if (st == 2) { return "已完成"; }
+        if (st == 3) { return "已终止"; }
+        return "进行中";
+    }
+
+    static string TaskTint(int st) {
+        if (st == 3) { return "warning"; }
+        if (st == 1) { return "success"; }
+        return "info";
+    }
+
+    static string TaskZh(int st) {
+        if (st == 0) { return "待处理"; }
+        if (st == 1) { return "已完成"; }
+        if (st == 2) { return "已跳过"; }
+        if (st == 3) { return "待验收"; }
+        return "未知";
+    }
+}

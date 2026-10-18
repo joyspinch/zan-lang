@@ -52,6 +52,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 6. **目标架构指令集特性基线（`tm_features`）**：
    - 动作：底层指令特性开关必须严格符合目标平台的 ABI 基线（如 Android x86_64 仅开启 SSE4.2，不开启 AVX2）。
    - 理由：防止高级指令在不支持的目标硬件运行时抛出 SIGILL 非法指令异常。
+7. **子协程 resume 入口在调用点必须"具名符号 + 帧头回退"双路可取**：
+   - 动作：任何在调用点需要子协程 resume 入口的下沉路径（`await` 挂起、
+     `Task.Spawn`/`Task.Run` 脱钩、语句级 fire-and-forget）都必须先按
+     `<callee>$resume` 查具名函数；查不到时（间接调用——接口/虚方法/委托分发，
+     被调入口不是静态符号）回退到从协程帧头 `ASYNC_FRAME_SELF_STEP` 槽加载；
+     两条都失败才允许放弃。
+   - 理由：间接调用按名字必然查不到 → `Task.Spawn` 静默返回 0 句柄、协程永不
+     入调度器；而 `__zan_co_isdone` 对不在活协程表里的帧返回 1，于是
+     `Task.IsDone` 报"已完成"，业务代码永远等不到副作用，症状与业务逻辑 bug
+     无法区分。await 路径早有 SELF_STEP 回退（`irgen_expr.c` 间接 await 分支），
+     detach 路径漏掉即是此坑（`Task.Spawn` 的 `emit_detach_async_call`）。
+   - 边界：回退只对协程帧指针有效；ramp 必然在任何调度之前把 resume 写进
+     SELF_STEP，故加载安全。单实现者会被去虚拟化成直接调用从而掩盖该缺陷，
+     回归用例必须声明 ≥2 个实现者以强制走间接分发。
 
 ---
 

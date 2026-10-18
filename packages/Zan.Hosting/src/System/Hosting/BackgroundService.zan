@@ -1,0 +1,107 @@
+using System;
+using System.Threading;
+
+namespace System.Hosting;
+
+// 周期循环型后台服务的基类。子类只写 ExecuteAsync（一次循环体），
+// 取消请求到来时循环自然退出——不要在里面写死循环，循环由基类管。
+//
+// 规矩：
+//   * ExecuteAsync 抛异常**不会**杀死循环：记 errors/lastError 后继续下一轮
+//     （后台循环因一轮失败而死是线上最常见的静默失效）。
+//   * ExecuteAsync 返回 false 表示"我干完了"，循环主动结束（一次性任务）。
+//   * 每轮之间等 intervalMs；intervalMs == 0 表示让出执行权后立刻下一轮
+//     （适合靠 await 挂起等待的队列消费型任务），不要用它做忙等轮询。
+//   * ticks/errors/lastError/lastTickUs 是本服务的健康状态，宿主状态行与
+//     管理页直接读它。
+public class BackgroundService : IHostedService {
+    public string name = "";
+    public long intervalMs = 1000;
+    public long handle = 0;
+    public bool started = false;
+    public bool stopped = false;
+    public int ticks = 0;
+    public int errors = 0;
+    public string lastError = "";
+    // 上一轮循环体的耗时（微秒，不含间隔等待）。
+    public long lastTickUs = 0;
+    public CancellationTokenSource cts = null;
+
+    public BackgroundService() { }
+
+    public BackgroundService(string name) { this.name = name; }
+
+    // 子类实现一次循环体；返回 false 结束本服务。
+    public virtual async bool ExecuteAsync(CancellationToken ct) { return true; }
+
+    public void SetInterval(long ms) {
+        if (ms < 0) { ms = 0; }
+        this.intervalMs = ms;
+    }
+
+    public CancellationToken Token() {
+        if (this.cts == null) { return CancellationToken.None; }
+        return this.cts.Token;
+    }
+
+    // 关闭请求是否已经到达（循环体内做长任务时用它分段检查）。
+    public bool StopRequested() {
+        if (this.cts == null) { return false; }
+        return this.cts.Token.IsCancellationRequested;
+    }
+
+    // 循环是否已经干净退出（已启动且 RunLoop 已返回）。宿主状态行与健康检查
+    // 用它区分"还在跑"与"已经收摊"，不必自己看 stopped 字段。
+    public bool StoppedCleanly() { return this.started && this.stopped; }
+
+    public async bool StartAsync(CancellationToken ct) {
+        if (this.started) { return true; }
+        this.started = true;
+        this.stopped = false;
+        this.cts = new CancellationTokenSource();
+        this.handle = Task.Spawn(this.RunLoop());
+        return true;
+    }
+
+    public async bool StopAsync(CancellationToken ct) {
+        if (!this.started) { return true; }
+        if (this.cts != null) { this.cts.Cancel(); }
+        return await this.Join(3000);
+    }
+
+    // 有界等待循环退出。Task 侧没有带超时的 WhenAll，用 IsDone 轮询实现，
+    // 返回是否真的退出了（false = 超时，循环体里可能有长任务不响应取消）。
+    public async bool Join(long timeoutMs) {
+        long waited = 0;
+        while (this.handle != 0 && Task.IsDone(this.handle) == 0 && waited < timeoutMs) {
+            await Task.Delay(10);
+            waited = waited + 10;
+        }
+        return this.handle != 0 && Task.IsDone(this.handle) != 0;
+    }
+
+    public async void RunLoop() {
+        while (this.cts != null && !this.cts.Token.IsCancellationRequested) {
+            long t0 = Stopwatch.GetMicroseconds();
+            bool more = true;
+            try {
+                more = await this.ExecuteAsync(this.cts.Token);
+            } catch (Exception e) {
+                this.errors = this.errors + 1;
+                this.lastError = e.Message == null ? "threw" : e.Message;
+            } catch {
+                this.errors = this.errors + 1;
+                this.lastError = "threw non-exception";
+            }
+            /* 循环体已经跑了一轮就计数——抛异常的那轮也算，健康状态里
+               "tick 在涨但任务从不成功"是比"循环停了"更早可见的信号。 */
+            this.ticks = this.ticks + 1;
+            this.lastTickUs = Stopwatch.GetMicroseconds() - t0;
+            if (!more) { break; }
+            if (this.cts.Token.IsCancellationRequested) { break; }
+            if (this.intervalMs > 0) { await Task.Delay(this.intervalMs); }
+            else { await Task.Yield(); }
+        }
+        this.stopped = true;
+    }
+}
