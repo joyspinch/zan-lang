@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test;
+
+// 轻量测试运行器。无反射、无 codegen：用例显式注册，行为与真机一致，
+// 交叉编译/嵌入式目标同样能跑（只依赖 Console 与 Stopwatch）。
+//
+// 规矩：
+//   * 用例体自带断言，断言失败**不中断**——Assert 打 FAIL 行并计数，
+//     Test.Run 比对计数差值判定用例是否通过；因此一个用例里的多个问题
+//     一次运行全部暴露。
+//   * 用例体抛异常（Exception 或字符串 throw）也算失败，消息进结果。
+//   * setup/teardown 包住用例体；teardown 一定会跑，且不覆盖用例体原本
+//     的失败原因。
+//   * 输出只有三类行，方便 grep 与金样比对：
+//       ok <name>              （verbose 模式）
+//       FAIL <name>: <原因>    （异常/teardown 失败；断言失败行由 Assert 打）
+//       skip <name>: <原因>
+public class Test {
+    public static int total = 0;
+    public static int passed = 0;
+    public static int failed = 0;
+    public static int skipped = 0;
+    // true 时每个通过用例也打一行 ok（默认只打失败与汇总）。
+    public static bool verbose = false;
+    // 用例体耗时超过该值（微秒）时，verbose 下标注 slow；0 = 不标注。
+    public static long slowUs = 0;
+    // 当前分组前缀，Group("cache") 后用例名成 "cache.<name>"。
+    public static string group = "";
+    public static TestBody setup;
+    public static TestBody teardown;
+    public static List<TestResult> results = new List<TestResult>();
+
+    // 清空全部状态（同一进程里多轮跑用）。
+    public static void Reset() {
+        Test.total = 0;
+        Test.passed = 0;
+        Test.failed = 0;
+        Test.skipped = 0;
+        Test.group = "";
+        Test.setup = null;
+        Test.teardown = null;
+        Test.results.Clear();
+        Assert.Reset();
+    }
+
+    public static void Group(string name) { Test.group = name; }
+    public static void EndGroup() { Test.group = ""; }
+    public static void Setup(TestBody body) { Test.setup = body; }
+    public static void Teardown(TestBody body) { Test.teardown = body; }
+    public static List<TestResult> Results() { return Test.results; }
+
+    public static void Skip(string name, string reason) {
+        string full = Test.FullName(name);
+        Test.total = Test.total + 1;
+        Test.skipped = Test.skipped + 1;
+        Console.WriteLine("skip " + full + ": " + reason);
+    }
+
+    // 跑一个用例。断言失败在 Assert 里已经打过行，这里只处理异常与结果记账。
+    public static void Run(string name, TestBody body) {
+        string full = Test.FullName(name);
+        Test.total = Test.total + 1;
+        long t0 = Stopwatch.GetMicroseconds();
+        int before = Assert.Failures();
+        string err = "";
+        try {
+            if (Test.setup != null) { Test.setup(); }
+            body();
+        } catch (Exception e) {
+            err = e.Message == null ? "threw" : e.Message;
+        } catch {
+            err = "threw non-exception";
+        }
+        if (Test.teardown != null) {
+            try {
+                Test.teardown();
+            } catch (Exception e) {
+                if (err == "") { err = "teardown: " + e.Message; }
+            } catch {
+                if (err == "") { err = "teardown threw"; }
+            }
+        }
+        long dt = Stopwatch.GetMicroseconds() - t0;
+        bool ok = err == "" && Assert.Failures() == before;
+        TestResult r = new TestResult(full, ok, err, dt);
+        Test.results.Add(r);
+        if (ok) {
+            Test.passed = Test.passed + 1;
+            if (Test.verbose) {
+                string tail = "";
+                if (Test.slowUs > 0 && dt >= Test.slowUs) { tail = " (slow " + Convert.ToString(dt) + "us)"; }
+                Console.WriteLine("ok " + full + tail);
+            }
+            return;
+        }
+        Test.failed = Test.failed + 1;
+        if (err != "") { Console.WriteLine("FAIL " + full + ": " + err); }
+    }
+
+    // 打印汇总行，返回失败数（0 = 全绿）。
+    public static int Report() {
+        Console.WriteLine("tests: " + Convert.ToString(Test.passed) + " passed, "
+            + Convert.ToString(Test.failed) + " failed, "
+            + Convert.ToString(Test.skipped) + " skipped");
+        return Test.failed;
+    }
+
+    // Report() + 以失败数为退出码结束进程。测试可执行文件的收尾就写这一句。
+    public static void Finish() {
+        int n = Test.Report();
+        Environment.Exit(n == 0 ? 0 : 1);
+    }
+
+    private static string FullName(string name) {
+        if (Test.group == "") { return name; }
+        return Test.group + "." + name;
+    }
+}
