@@ -248,9 +248,9 @@ zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
                 LLVMValueRef next = LLVMGetNextInstruction(inst);
                 if (LLVMGetInstructionOpcode(inst) == LLVMCall) {
                     LLVMValueRef callee = LLVMGetCalledValue(inst);
-                    if (callee && LLVMGetInstructionOpcode(callee) == LLVMLoad) {
+                    if (callee && LLVMIsAInstruction(callee) && LLVMGetInstructionOpcode(callee) == LLVMLoad) {
                         LLVMValueRef ptr = LLVMGetOperand(callee, 0);
-                        if (ptr && LLVMGetInstructionOpcode(ptr) == LLVMGetElementPtr) {
+                        if (ptr && LLVMIsAInstruction(ptr) && LLVMGetInstructionOpcode(ptr) == LLVMGetElementPtr) {
                             LLVMValueRef base = LLVMGetOperand(ptr, 0);
                             if (base && LLVMIsAGlobalVariable(base) && LLVMGetInitializer(base)) {
                                 const char *vt_name = LLVMGetValueName(base);
@@ -460,7 +460,10 @@ void zan_opt_configure_llvm_passes(zan_irgen_t *g, zan_opt_level_t level) {
     }
 #endif
 
-    zan_opt_run_passes_on_module(g->mod, NULL, level);
+    LLVMTargetMachineRef tm = NULL;
+    zan_irgen_create_target_machine(g, &tm);
+    zan_opt_run_passes_on_module(g->mod, tm, level);
+    if (tm) LLVMDisposeTargetMachine(tm);
 }
 
 void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, zan_opt_level_t level) {
@@ -485,6 +488,14 @@ void zan_opt_run_passes_on_module(LLVMModuleRef mod, LLVMTargetMachineRef tm, za
         LLVMPassBuilderOptionsSetSLPVectorization(opts, 1);
         LLVMPassBuilderOptionsSetLoopUnrolling(opts, 1);
     }
+
+    char *vmsg = NULL;
+    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &vmsg)) {
+        if (vmsg) LLVMDisposeMessage(vmsg);
+        LLVMDisposePassBuilderOptions(opts);
+        return;
+    }
+    if (vmsg) LLVMDisposeMessage(vmsg);
 
     LLVMErrorRef err = LLVMRunPasses(mod, passes, tm, opts);
     if (err) {
@@ -536,7 +547,6 @@ zan_opt_report_t zan_optimize(zan_irgen_t *g, zan_binder_t *binder, zan_opt_leve
     report.constfold = zan_opt_const_fold(g);
     report.dce = zan_opt_dce(g);
     report.inlining = zan_opt_inline(g, level);
-
     zan_opt_configure_llvm_passes(g, level);
 
     double t1 = get_time_ms();

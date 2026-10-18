@@ -3064,6 +3064,11 @@ void zan_irgen_bind_target(zan_irgen_t *g) {
     zan_bind_target_layout(g, NULL);
 }
 
+zan_status_t zan_irgen_create_target_machine(zan_irgen_t *g, LLVMTargetMachineRef *out_tm) {
+    zan_init_llvm_targets();
+    return zan_bind_target_layout(g, out_tm);
+}
+
 zan_status_t zan_irgen_write_obj(zan_irgen_t *g, const char *path) {
     abi_pending_report(g);
     if (zan_diag_has_errors(g->diag)) return ZAN_ERROR;
