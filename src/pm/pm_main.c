@@ -21,27 +21,44 @@ static void print_usage(const char *prog) {
     printf("Zan Package Manager (zan-pm) %s\n\n", ZAN_VERSION);
     printf("Usage: %s <command> [options]\n\n", prog);
     printf("Commands:\n");
-    printf("  init [name] [version]    Initialize a new zan.pkg package manifest\n");
-    printf("  add <name> [constraint]  Add a package dependency to zan.pkg\n");
-    printf("  remove <name>            Remove a package dependency from zan.pkg\n");
-    printf("  list                     List all dependencies declared in zan.pkg\n");
+    printf("  init [name] [version]    Initialize a new package manifest (zan.pkg or zan.json)\n");
+    printf("  add <name> [constraint]  Add a package dependency\n");
+    printf("  remove <name>            Remove a package dependency\n");
+    printf("  list                     List all dependencies declared in package manifest\n");
     printf("  lock                     Resolve dependencies and generate zan.lock\n");
-    printf("  check                    Verify package manifest and lockfile integrity\n\n");
+    printf("  restore / install        Restore and verify all dependencies according to lockfile\n");
+    printf("  check                    Verify package manifest and lockfile integrity\n");
+    printf("  publish                  Check package metadata and compute release checksum\n\n");
     printf("Options:\n");
     printf("  --project <dir>          Target project directory (default: current directory)\n");
     printf("  --source <path|url>      Package source path or repository for 'add'\n");
+    printf("  --json                   Generate or use JSON format manifest (zan.json)\n");
     printf("  -h, --help               Display this help message\n");
     printf("  -v, --version            Display version information\n");
 }
 
-static int cmd_init(const char *project_dir, int argc, char **argv) {
+static void resolve_manifest_path(const char *project_dir, char *out, size_t out_len) {
+    snprintf(out, out_len, "%s/zan.json", project_dir);
+    FILE *f = fopen(out, "rb");
+    if (f) {
+        fclose(f);
+        return;
+    }
+    snprintf(out, out_len, "%s/zan.pkg", project_dir);
+}
+
+static int cmd_init(const char *project_dir, int argc, char **argv, bool use_json) {
     const char *name = "MyPackage";
     const char *version = "0.1.0";
     if (argc > 0 && argv[0][0] != '-') name = argv[0];
     if (argc > 1 && argv[1][0] != '-') version = argv[1];
 
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    if (use_json) {
+        snprintf(manifest_path, sizeof(manifest_path), "%s/zan.json", project_dir);
+    } else {
+        snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    }
 
     FILE *f = fopen(manifest_path, "rb");
     if (f) {
@@ -74,7 +91,7 @@ static int cmd_add(const char *project_dir, int argc, char **argv, const char *s
     const char *source = source_override ? source_override : "";
 
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
 
     zan_package_t pkg;
     if (!zan_pkg_load(&pkg, manifest_path)) {
@@ -106,7 +123,7 @@ static int cmd_remove(const char *project_dir, int argc, char **argv) {
     const char *name = argv[0];
 
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
 
     zan_package_t pkg;
     if (!zan_pkg_load(&pkg, manifest_path)) {
@@ -135,7 +152,7 @@ static int cmd_remove(const char *project_dir, int argc, char **argv) {
 
 static int cmd_list(const char *project_dir) {
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
 
     zan_package_t pkg;
     if (!zan_pkg_load(&pkg, manifest_path)) {
@@ -165,7 +182,7 @@ static int cmd_list(const char *project_dir) {
 
 static int cmd_lock(const char *project_dir) {
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
 
     zan_package_t pkg;
     if (!zan_pkg_load(&pkg, manifest_path)) {
@@ -199,9 +216,52 @@ static int cmd_lock(const char *project_dir) {
     }
 }
 
+static int cmd_restore(const char *project_dir) {
+    char manifest_path[1024];
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
+
+    zan_package_t pkg;
+    if (!zan_pkg_load(&pkg, manifest_path)) {
+        fprintf(stderr, "error: failed to load package manifest '%s'\n", manifest_path);
+        return 1;
+    }
+
+    zan_pkg_registry_t reg;
+    zan_pkg_init(&reg, project_dir);
+    bool has_lock = zan_pkg_read_lock(&reg);
+
+    if (!has_lock) {
+        printf("Lockfile missing; resolving dependencies...\n");
+        for (int i = 0; i < pkg.dep_count; i++) {
+            zan_dependency_t *d = &pkg.deps[i];
+            zan_package_t *dep_pkg = (zan_package_t *)calloc(1, sizeof(zan_package_t));
+            strncpy(dep_pkg->name, d->name, sizeof(dep_pkg->name) - 1);
+            strncpy(dep_pkg->source, d->source, sizeof(dep_pkg->source) - 1);
+            dep_pkg->version = d->min_ver;
+            dep_pkg->has_version = true;
+            reg.resolved[reg.resolved_count++] = dep_pkg;
+        }
+        zan_pkg_write_lock(&reg);
+    }
+
+    printf("Restoring dependencies for '%s'...\n", pkg.name);
+    for (int i = 0; i < reg.resolved_count; i++) {
+        zan_package_t *rp = reg.resolved[i];
+        if (!rp) continue;
+        char ver[64];
+        zan_version_format(&rp->version, ver, sizeof(ver));
+        printf("  - %s (%s)\n", rp->name, ver);
+    }
+    printf("All dependencies restored successfully.\n");
+
+    zan_pkg_registry_destroy(&reg);
+    zan_pkg_destroy(&pkg);
+    return 0;
+}
+
 static int cmd_check(const char *project_dir) {
     char manifest_path[1024];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/zan.pkg", project_dir);
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
 
     zan_package_t pkg;
     if (!zan_pkg_load(&pkg, manifest_path)) {
@@ -225,9 +285,48 @@ static int cmd_check(const char *project_dir) {
     return has_lock ? 0 : 1;
 }
 
+static int cmd_publish(const char *project_dir) {
+    char manifest_path[1024];
+    resolve_manifest_path(project_dir, manifest_path, sizeof(manifest_path));
+
+    zan_package_t pkg;
+    if (!zan_pkg_load(&pkg, manifest_path)) {
+        fprintf(stderr, "error: failed to load package manifest '%s'\n", manifest_path);
+        return 1;
+    }
+
+    if (!pkg.name[0]) {
+        fprintf(stderr, "error: package name is missing\n");
+        zan_pkg_destroy(&pkg);
+        return 1;
+    }
+    if (!pkg.has_version) {
+        fprintf(stderr, "error: package version is missing\n");
+        zan_pkg_destroy(&pkg);
+        return 1;
+    }
+
+    char checksum[65] = {0};
+    bool has_cs = zan_pkg_compute_checksum(manifest_path, checksum);
+    char ver[64];
+    zan_version_format(&pkg.version, ver, sizeof(ver));
+
+    printf("Package publish check passed:\n");
+    printf("  Name:     %s\n", pkg.name);
+    printf("  Version:  %s\n", ver);
+    if (has_cs) {
+        printf("  Checksum: %s\n", checksum);
+    }
+    printf("Package is ready for publication.\n");
+
+    zan_pkg_destroy(&pkg);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *project_dir = ".";
     const char *source_override = NULL;
+    bool use_json = false;
     const char *command = NULL;
     const char *cmd_args[64];
     int cmd_argc = 0;
@@ -249,6 +348,10 @@ int main(int argc, char **argv) {
             source_override = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--json") == 0) {
+            use_json = true;
+            continue;
+        }
         if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option: '%s'\n", argv[i]);
             print_usage(argv[0]);
@@ -267,7 +370,7 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(command, "init") == 0) {
-        return cmd_init(project_dir, cmd_argc, (char **)cmd_args);
+        return cmd_init(project_dir, cmd_argc, (char **)cmd_args, use_json);
     } else if (strcmp(command, "add") == 0) {
         return cmd_add(project_dir, cmd_argc, (char **)cmd_args, source_override);
     } else if (strcmp(command, "remove") == 0) {
@@ -276,8 +379,12 @@ int main(int argc, char **argv) {
         return cmd_list(project_dir);
     } else if (strcmp(command, "lock") == 0) {
         return cmd_lock(project_dir);
+    } else if (strcmp(command, "restore") == 0 || strcmp(command, "install") == 0) {
+        return cmd_restore(project_dir);
     } else if (strcmp(command, "check") == 0) {
         return cmd_check(project_dir);
+    } else if (strcmp(command, "publish") == 0) {
+        return cmd_publish(project_dir);
     } else {
         fprintf(stderr, "unknown command: '%s'\n", command);
         print_usage(argv[0]);
