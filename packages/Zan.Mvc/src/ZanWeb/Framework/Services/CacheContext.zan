@@ -5,71 +5,71 @@ using ZanWeb.Core;
 namespace ZanWeb.Services;
 
 /* 带注入 Redis 池的缓存。main.zan 根据 [cache] 配置构建池并注入（或传 null）。命名即语义：GetAsync/SetAsync/SetTtlAsync/DelAsync = 共享缓存（Redis，所有 worker 可见）；LocalGet/LocalSet/LocalSetTtl/LocalDel = 本 worker 私有内存。driver != "redis" 时无共享缓存，async 方法回退到本地内存（仅 worker.count=1 时正确）。Redis 不可达时读 MISS 写丢弃，调用方回退到数据库。 */
-class CacheContext {
+public class CacheContext {
     StrMap store;
     StrMap expiry;
     RedisPool redis;
 
-    CacheContext(RedisPool redis) {
+    public CacheContext(RedisPool redis) {
         this.store = new StrMap();
         this.expiry = new StrMap();
         this.redis = redis;
     }
 
-    static CacheContext Of(RedisPool redis) {
+    public static CacheContext Of(RedisPool redis) {
         return new CacheContext(redis);
     }
 
     /* 已配置共享（跨 worker）缓存时返回 true。 */
-    bool Shared() {
+    public bool Shared() {
         return this.redis != null;
     }
 
     /* ---- worker 本地内存（不出进程）---- */
-    bool Alive(string key) {
+    public bool Alive(string key) {
         if (!this.store.Has(key)) { return false; }
         string expires = this.expiry.GetOr(key, "0");
         if (expires == "0") { return true; }
         if (WebApp.NowSeconds() >= Filter.ToInt(expires, 0)) {
-            this.store.Set(key, "");
-            this.expiry.Set(key, "0");
+            this.store.Remove(key);
+            this.expiry.Remove(key);
             return false;
         }
         return true;
     }
 
-    bool LocalHas(string key) {
+    public bool LocalHas(string key) {
         return this.Alive(key);
     }
 
-    string LocalGet(string key) {
+    public string LocalGet(string key) {
         if (!this.Alive(key)) { return ""; }
         return this.store.Get(key);
     }
 
-    string LocalGetOr(string key, string fallback) {
+    public string LocalGetOr(string key, string fallback) {
         if (!this.Alive(key)) { return fallback; }
         return this.store.Get(key);
     }
 
-    void LocalSet(string key, string text) {
+    public void LocalSet(string key, string text) {
         this.store.Set(key, text);
         this.expiry.Set(key, "0");
     }
 
-    void LocalSetTtl(string key, string text, int seconds) {
+    public void LocalSetTtl(string key, string text, int seconds) {
         this.store.Set(key, text);
         this.expiry.Set(key, Convert.ToString(WebApp.NowSeconds() + seconds));
     }
 
-    void LocalDel(string key) {
-        this.store.Set(key, "");
-        this.expiry.Set(key, "0");
+    public void LocalDel(string key) {
+        this.store.Remove(key);
+        this.expiry.Remove(key);
     }
 
     /* ---- 共享缓存（Redis，所有 worker 看到同一值）---- */
     /* 读取共享缓存；"" 表示 MISS（Redis 不可达时同样返回，调用方回退到数据源）。 */
-    async string GetAsync(string key) {
+    public async string GetAsync(string key) {
         if (this.redis == null) { return this.LocalGet(key); }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return ""; }
@@ -80,7 +80,7 @@ class CacheContext {
         }
     }
 
-    async void SetAsync(string key, string text) {
+    public async void SetAsync(string key, string text) {
         if (this.redis == null) { this.LocalSet(key, text); return; }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return; }
@@ -91,7 +91,7 @@ class CacheContext {
         }
     }
 
-    async void SetTtlAsync(string key, string text, int seconds) {
+    public async void SetTtlAsync(string key, string text, int seconds) {
         if (this.redis == null) { this.LocalSetTtl(key, text, seconds); return; }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return; }
@@ -103,7 +103,7 @@ class CacheContext {
         }
     }
 
-    async void DelAsync(string key) {
+    public async void DelAsync(string key) {
         if (this.redis == null) { this.LocalDel(key); return; }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return; }
@@ -114,7 +114,7 @@ class CacheContext {
         }
     }
 
-    async int IssueCodeAsync(string key, string cooldownKey, string ipKey, string code,
+    public async int IssueCodeAsync(string key, string cooldownKey, string ipKey, string code,
                             int seconds, int cooldownSeconds, int windowSeconds, int maxSends) {
         if (seconds <= 0 || cooldownSeconds <= 0 || windowSeconds <= 0 || maxSends <= 0
             || code.Length == 0) { return -1; }
@@ -167,7 +167,7 @@ class CacheContext {
 
     /* 验证码写入须一次性带 TTL；Redis 不可达时不发出不可验证的码。
  重发即重置错试预算（发送侧另有限速，见 VerifyCode）。 */
-    async bool SetCodeAsync(string key, string code, int seconds) {
+    public async bool SetCodeAsync(string key, string code, int seconds) {
         string tryKey = key + ":tries";
         if (this.redis == null) {
             lock (this.store) {
@@ -194,7 +194,7 @@ class CacheContext {
     }
 
     /* 比对与删除在 Redis 单个脚本中执行；本地内存同一把锁保护。 错误、过期、重复使用、超过错试上限以及缓存故障一律拒绝。 脚本返回 1=通过，0=错码（计数+1），-1=错满已作废。 */
-    async bool ConsumeCodeAsync(string key, string code) {
+    public async bool ConsumeCodeAsync(string key, string code) {
         string tryKey = key + ":tries";
         if (this.redis == null) {
             lock (this.store) {
@@ -234,7 +234,7 @@ class CacheContext {
     }
 
     /* 预热一条连接以免首次请求支付建连成本，返回 Redis 是否应答。 */
-    async bool Warmup() {
+    public async bool Warmup() {
         if (this.redis == null) { return false; }
         RedisClient client = await this.redis.AcquireAsync();
         if (client == null) { return false; }
@@ -242,7 +242,7 @@ class CacheContext {
         return true;
     }
 
-    void Close() {
+    public void Close() {
         if (this.redis != null) { this.redis.Close(); }
     }
 }
