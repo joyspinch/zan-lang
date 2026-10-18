@@ -3218,9 +3218,41 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
             zan_type_t *col = zan_checker_check_expr(c, stmt->foreach_stmt.collection);
             zan_type_t *elem = NULL;
             if (col) {
-                if (col->kind == TYPE_ARRAY) elem = col->element_type;
-                else if (col->kind == TYPE_CLASS && col->type_arg_count == 1)
-                    elem = col->type_args[0];
+                if (col->kind == TYPE_ARRAY) {
+                    elem = col->element_type;
+                } else if (col->kind == TYPE_CLASS || col->kind == TYPE_STRUCT) {
+                    zan_symbol_t *csym = col->sym;
+                    if (csym) {
+                        zan_istr_t gi = { (char *)"GetEnumerator", 13 };
+                        zan_symbol_t *gm = checker_find_method(csym, gi);
+                        if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
+                            gm->decl->method_decl.return_type) {
+                            zan_type_t *rt = zan_binder_resolve_type(c->binder,
+                                gm->decl->method_decl.return_type);
+                            if (rt && rt->sym) {
+                                zan_istr_t ci = { (char *)"Current", 7 };
+                                zan_symbol_t *cm = checker_find_method(rt->sym, ci);
+                                if (cm && cm->decl && cm->decl->kind == AST_METHOD_DECL &&
+                                    cm->decl->method_decl.return_type) {
+                                    elem = zan_binder_resolve_type(c->binder,
+                                        cm->decl->method_decl.return_type);
+                                } else {
+                                    zan_symbol_t *cf = checker_find_field(rt->sym, ci);
+                                    if (cf && cf->decl &&
+                                        (cf->decl->kind == AST_FIELD_DECL ||
+                                         cf->decl->kind == AST_PROPERTY_DECL) &&
+                                        cf->decl->field_decl.type) {
+                                        elem = zan_binder_resolve_type(c->binder,
+                                            cf->decl->field_decl.type);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (!elem && col->kind == TYPE_CLASS && col->type_arg_count == 1) {
+                        elem = col->type_args[0];
+                    }
+                }
             }
             if (stmt->foreach_stmt.var_type) {
                 elem = zan_binder_resolve_type(c->binder,
