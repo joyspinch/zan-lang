@@ -1,0 +1,137 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.Firebird;
+using System.Data.MySql;
+using System.Data.Postgres;
+using System.Data.Redis;
+using System.Data.Sqlite;
+using System.Data.SqlServer;
+using System.Data.TDengine;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+class Program {
+    static void Clean(string basePath) {
+        File.Delete(basePath);
+        File.Delete(basePath + ".m0");
+        File.Delete(basePath + ".m1");
+        for (int i = 0; i < 40; i = i + 1) {
+            File.Delete(basePath + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static void Main() {
+        Console.WriteLine("=== DATA CONNECTORS HARDENING TEST ===");
+
+        // 1. SQLite in-memory & SqlitePool export verification
+        Console.WriteLine("-- 1. SQLite --");
+        SqliteConnection sqlite = SqliteConnection.Open(":memory:");
+        sqlite.Execute("CREATE TABLE test_tab (id INTEGER PRIMARY KEY, name TEXT)");
+        DbParams prms = new DbParams().AddInt(101).Add("zenith");
+        int aff = sqlite.Execute("INSERT INTO test_tab (id, name) VALUES (?, ?)", prms);
+        Console.WriteLine("sqlite insert aff: " + Convert.ToString(aff));
+
+        DbResult r = sqlite.Query("SELECT id, name FROM test_tab WHERE id = ?", new DbParams().AddInt(101));
+        Console.WriteLine("sqlite row count: " + Convert.ToString(r.RowCount()));
+        Console.WriteLine("sqlite val: " + r.GetString(0, 1));
+        sqlite.Close();
+
+        SqlitePool pool = new SqlitePool(":memory:", 2);
+        Console.WriteLine("sqlite pool idle: " + Convert.ToString(pool.IdleCount()));
+        pool.Dispose();
+
+        // 2. Redis models & value objects
+        Console.WriteLine("-- 2. Redis Models --");
+        RedisOptions ropt = new RedisOptions();
+        ropt.host = "127.0.0.1";
+        ropt.port = 6379;
+        ropt.connectTimeoutMs = 1500;
+        Console.WriteLine("redis options: " + ropt.host + ":" + Convert.ToString(ropt.port));
+
+        RedisReply repStr = new RedisReply();
+        repStr.kind = RedisReply.STR;
+        repStr.str = "PONG";
+        Console.WriteLine("redis reply kind: " + Convert.ToString(repStr.kind) + ", str: " + repStr.str);
+
+        RedisReply repInt = new RedisReply();
+        repInt.kind = RedisReply.INT;
+        repInt.integer = 42;
+        Console.WriteLine("redis reply int: " + Convert.ToString(repInt.integer));
+
+        RedisEntry rent = new RedisEntry("cfg:timeout", "3000");
+        Console.WriteLine("redis entry: " + rent.key + "=" + rent.value);
+
+        ZMember zm = new ZMember("player1", 100.5);
+        Console.WriteLine("redis zmember: " + zm.member + "@" + Convert.ToString(zm.score));
+
+        NoticeEventArgs nea = new NoticeEventArgs("PING ok", 5, null);
+        Console.WriteLine("redis notice: " + nea.Log + " elapsed=" + Convert.ToString(nea.ElapsedMs));
+
+        // 3. Database Connectors instantiation & provider checks
+        Console.WriteLine("-- 3. Connectors --");
+        MySqlConnection myConn = new MySqlConnection();
+        Console.WriteLine("mysql provider: " + Convert.ToString(myConn.GetProvider()) + ", connected: " + (myConn.IsConnected() ? "true" : "false"));
+
+        PgConnection pgConn = new PgConnection();
+        Console.WriteLine("pg provider: " + Convert.ToString(pgConn.GetProvider()) + ", connected: " + (pgConn.IsConnected() ? "true" : "false"));
+
+        SqlServerConnection msConn = new SqlServerConnection();
+        Console.WriteLine("sqlserver provider: " + Convert.ToString(msConn.GetProvider()) + ", connected: " + (msConn.IsConnected() ? "true" : "false"));
+
+        TDengineConnection tdConn = new TDengineConnection();
+        Console.WriteLine("tdengine provider: " + Convert.ToString(tdConn.GetProvider()) + ", connected: " + (tdConn.IsConnected() ? "true" : "false"));
+
+        FirebirdConnection fbConn = new FirebirdConnection();
+        Console.WriteLine("firebird provider: " + Convert.ToString(fbConn.GetProvider()) + ", connected: " + (fbConn.IsConnected() ? "true" : "false"));
+
+        // 4. ZanDb & Models
+        Console.WriteLine("-- 4. ZanDb --");
+        string dbPath = "_scratch/test_zandb_hardening";
+        Clean(dbPath);
+
+        ZanDatabase zdb = ZanDatabase.Open(dbPath);
+        zdb.Begin();
+        Console.WriteLine("zandb in txn: " + (zdb.InTransaction() ? "true" : "false"));
+        zdb.Commit();
+
+        Collection coll = zdb.GetCollection("items");
+        Console.WriteLine("coll name: " + coll.Name());
+
+        JsonValue doc = JsonValue.NewObject();
+        doc.Put("title", JsonValue.NewStr("Zan Language"));
+        doc.Put("tag", JsonValue.NewStr("compiler"));
+        int docId = coll.Insert(doc);
+        Console.WriteLine("inserted id: " + Convert.ToString(docId));
+
+        JsonValue fetched = coll.FindById(docId);
+        if (fetched != null) {
+            JsonValue titleVal = fetched.Get("title");
+            if (titleVal != null) {
+                Console.WriteLine("fetched title: " + titleVal.AsString(""));
+            }
+        }
+
+        DocQuery query = coll.Query().WhereEq("tag", "compiler");
+        List<JsonValue> qres = query.ToList();
+        Console.WriteLine("query matches: " + Convert.ToString(qres.Count));
+
+        KvEntry kve = new KvEntry("app:version", "1.0.0");
+        Console.WriteLine("kventry: " + kve.key + "=" + kve.val);
+
+        VectorHit vh = new VectorHit(7, 0.123);
+        Console.WriteLine("vectorhit: " + Convert.ToString(vh.id) + " dist=" + Convert.ToString(vh.distance));
+
+        HybridHit hh = new HybridHit(8, 0.987);
+        Console.WriteLine("hybridhit: " + Convert.ToString(hh.id) + " score=" + Convert.ToString(hh.score));
+
+        VectorIndexOptions vio = new VectorIndexOptions(128, 0);
+        Console.WriteLine("vector opts dim: " + Convert.ToString(vio.dimensions) + " m: " + Convert.ToString(vio.m));
+
+        zdb.Close();
+        Clean(dbPath);
+
+        Console.WriteLine("=== ALL HARDENING CHECKS PASSED ===");
+    }
+}
