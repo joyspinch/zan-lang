@@ -1,0 +1,73 @@
+using System;
+using System.Data;
+
+namespace System.Data.Orm;
+
+// 事务作用域包装器（零反射自动化事务上下文控制）。
+// 支持基于 IUnitOfWork / IDbConnection 的安全事务生命周期管理。
+// 遵循经典 using / Complete 模式：只有显式调用 Complete() 时才会在 Dispose 阶段 Commit，
+// 否则自动 Rollback，杜绝未捕获异常导致脏事务泄露或未提交死锁。
+public class TransactionScope {
+    public IUnitOfWork uow;
+    public bool completed;
+    public bool disposed;
+
+    public TransactionScope(IUnitOfWork uow) {
+        this.uow = uow;
+        this.completed = false;
+        this.disposed = false;
+    }
+
+    public TransactionScope(IDbConnection conn) {
+        this.uow = new UnitOfWork(conn, false);
+        this.completed = false;
+        this.disposed = false;
+    }
+
+    public static TransactionScope Create(IUnitOfWork uow) {
+        return new TransactionScope(uow);
+    }
+
+    public static TransactionScope Create(IDbConnection conn) {
+        return new TransactionScope(conn);
+    }
+
+    // 标记当前作用域内所有操作均成功，允许在 Dispose 时提交事务。
+    public void Complete() {
+        if (this.disposed) {
+            throw new Exception("Cannot complete a disposed TransactionScope");
+        }
+        this.completed = true;
+    }
+
+    // 显式提交
+    public void Commit() {
+        if (this.uow != null && !this.disposed) {
+            this.uow.Commit();
+            this.completed = true;
+        }
+    }
+
+    // 显式回滚
+    public void Rollback() {
+        if (this.uow != null && !this.disposed) {
+            this.uow.Rollback();
+            this.completed = false;
+        }
+    }
+
+    // 释放作用域：如果未标记 Complete 则自动执行回滚，保障 ACID 一致性。
+    public void Dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+
+        if (this.uow != null) {
+            if (this.completed) {
+                this.uow.Commit();
+            } else {
+                this.uow.Rollback();
+            }
+            this.uow.Dispose();
+        }
+    }
+}
