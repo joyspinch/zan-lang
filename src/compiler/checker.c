@@ -37,6 +37,10 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
         name.len == 5 && memcmp(name.str, "Slice", 5) == 0) {
         return recv;
     }
+    if (recv->kind == TYPE_NULLABLE && recv->element_type &&
+        name.len == 17 && memcmp(name.str, "GetValueOrDefault", 17) == 0) {
+        return recv->element_type;
+    }
     if (!bt) return NULL;
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);

@@ -636,6 +636,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             }
         }
 
+        if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
+            expr->call.args.count == 1) {
+            zan_ast_node_t *recv = expr->call.callee->member.object;
+            zan_istr_t mname = expr->call.callee->member.name;
+            zan_type_t *nt = infer_expr_type(g, recv, locals);
+            bool is_gvod = mname.len == 17 &&
+                memcmp(mname.str, "GetValueOrDefault", 17) == 0;
+            if (nt && nt->kind == TYPE_NULLABLE && is_gvod) {
+                LLVMValueRef nv = emit_expr(g, recv, locals);
+                if (llvm_is_nullable(LLVMTypeOf(nv))) {
+                    LLVMValueRef payload = nullable_get_payload(g, nv);
+                    LLVMValueRef has_val = nullable_has_value(g, nv);
+                    LLVMValueRef dflt = emit_expr(g, expr->call.args.items[0], locals);
+                    if (LLVMTypeOf(dflt) != LLVMTypeOf(payload)) {
+                        dflt = coerce_int_to(g, dflt, LLVMTypeOf(payload));
+                    }
+                    return LLVMBuildSelect(g->builder, has_val, payload, dflt, "gvod.val");
+                }
+            }
+        }
+
         /* `md */
         if (expr->call.callee->kind == AST_MEMBER_ACCESS &&
             expr->call.args.count == 1) {
