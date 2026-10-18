@@ -785,8 +785,11 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
 
-        // 点击诊断/滚动条（右缘）：跳到对应行。
-        int diagStripW = app.Scale(14);
+        // 点击缩略图或滚动条（右侧）：跳到对应行。
+        int minimapW = app.Scale(56);
+        if (area.width < app.Scale(360)) { minimapW = 0; }
+        int scrollBarW = app.Scale(14);
+        int diagStripW = minimapW + scrollBarW;
         int diagStripX = area.x + area.width - diagStripW;
         if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
             && !ctxOpen && !overPopup && !overFilter && !overCodeLens
@@ -1027,8 +1030,24 @@ partial class CodeEditor {
             }
             // 绘制（可能多行、JSON 格式化的）提示。
             if (hoverTip != null) {
+                List<string> rawHl = new List<string>();
+                CodeEditor.BuildHoverLines(hoverTip, rawHl);
+                int capW = area.width - app.Scale(16);
+                if (capW > app.Scale(500)) { capW = app.Scale(500); }
+                if (capW < app.Scale(200)) { capW = app.Scale(200); }
+                int capInnerW = capW - app.Scale(16);
+
                 List<string> hl = new List<string>();
-                CodeEditor.BuildHoverLines(hoverTip, hl);
+                for (int ri = 0; ri < rawHl.Count; ri = ri + 1) {
+                    string rLine = rawHl[ri];
+                    if (Canvas.MeasureText(rLine, fontSize) > capInnerW) {
+                        CodeEditor.WrapText(rLine, capInnerW, fontSize, hl, 6);
+                    } else {
+                        hl.Add(rLine);
+                    }
+                }
+                if (hl.Count == 0 && rawHl.Count > 0) { hl.Add(rawHl[0]); }
+
                 int rowh = Canvas.FontHeight(fontSize) + app.Scale(2);
                 int maxw = 0;
                 for (int k = 0; k < hl.Count; k = k + 1) {
@@ -1036,15 +1055,14 @@ partial class CodeEditor {
                     if (mw > maxw) { maxw = mw; }
                 }
                 int ttW2 = maxw + app.Scale(16);
-                int capW = area.width - app.Scale(8);
                 if (ttW2 > capW) { ttW2 = capW; }
                 int ttH2 = rowh * hl.Count + app.Scale(8);
                 int ttX2 = hoverTipX + app.Scale(8);
                 int ttY2 = hoverTipY + app.Scale(20);
                 if (ttX2 + ttW2 > area.x + area.width) { ttX2 = area.x + area.width - ttW2 - app.Scale(4); }
-                if (ttX2 < area.x) { ttX2 = area.x; }
+                if (ttX2 < area.x) { ttX2 = area.x + app.Scale(2); }
                 if (ttY2 + ttH2 > area.y + area.height) { ttY2 = hoverTipY - ttH2 - app.Scale(6); }
-                if (ttY2 < area.y) { ttY2 = area.y; }
+                if (ttY2 < area.y) { ttY2 = area.y + app.Scale(2); }
                 c.FillRoundRect(ttX2 - 1, ttY2 - 1, ttW2 + 2, ttH2 + 2, app.Scale(4), pal.shadowStrong);
                 c.SurfaceRoundRect(ttX2, ttY2, ttW2, ttH2, app.Scale(4), pal.hoverBg, pal.accent, 1);
                 int ty = ttY2 + app.Scale(4);
@@ -1121,7 +1139,10 @@ partial class CodeEditor {
                     // 固定内部文本宽度；签名和文档都按它换行，
                     // 内容不会溢出框体，再按实际生成的最宽
                     // 行收缩框体（绝不宽于上限）。
-                    int innerW = app.Scale(300);
+                    int maxHoverW = area.width - app.Scale(24);
+                    if (maxHoverW > app.Scale(380)) { maxHoverW = app.Scale(380); }
+                    if (maxHoverW < app.Scale(220)) { maxHoverW = app.Scale(220); }
+                    int innerW = maxHoverW - hpad * 2;
                     List<string> siglines = new List<string>();
                     CodeEditor.WrapText(hsig, innerW, fontSize, siglines, 4);
                     List<string> hlines = new List<string>();
@@ -1272,7 +1293,11 @@ partial class CodeEditor {
         int gutterDotX = area.x + scale6;
         int gutterNumBaseX = area.x + gutterW - scale8;
         int gutterChevX = area.x + gutterW - scale16;
-        int lineContentW = area.width - gutterW - 1;
+        int minimapW = app.Scale(56);
+        if (area.width < app.Scale(360)) { minimapW = 0; }
+        int rightStripW = minimapW + app.Scale(14);
+        int lineContentW = area.width - gutterW - rightStripW - 1;
+        if (lineContentW < 0) { lineContentW = 0; }
         int caretH = lineH - scale4;
 
         for (int i = 0; i < visibleRows.Count; i = i + 1) {
@@ -1290,8 +1315,18 @@ partial class CodeEditor {
                                lineH, hoverColor);
                 }
 
+                bool isCompilerErr = HasCompilerErr(ln);
+                bool isLocalErr = LocalDiagnosticMessage(ln).Length > 0;
+                bool hasErr = isCompilerErr || isLocalErr;
+
+                if (hasErr) {
+                    c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, 0x18FF4444);
+                }
+
                 if (HasBreakpoint(ln)) {
                     c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, breakpointColor);
+                } else if (hasErr) {
+                    c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, dotSz, pal.error);
                 }
                 if (ln == execLine) {
                     c.FillRoundRect(gutterDotX, rowY + dotYOffset, dotSz, dotSz, scale2, pal.warn);
@@ -1299,8 +1334,9 @@ partial class CodeEditor {
 
                 string num = GetLineNumStr(ln + 1);
                 int numW = num.Length * digitW;
+                int numColor = hasErr ? pal.error : lineNumberColor;
                 c.DrawText(gutterNumBaseX - numW, textY, num,
-                           lineNumberColor, fontSize);
+                           numColor, fontSize);
 
                 // 折叠标记：有效折叠起点行在槽位最右列画箭头，
                 // 折叠中 ▸、展开 ▾；点击该列切换（见槽位点击处理）。
@@ -1332,12 +1368,11 @@ partial class CodeEditor {
                 }
 
                 // 错误指示（红色下划线）。真实编译器错误具有权威优先权；
-                // 当存在有效的真实编译器诊断时，仅以真实编译器错误为准，消除启发式误报。
-                bool hasCompVal = (compErrors != null && !CompilerDiagStale());
-                if (HasCompilerErr(ln)) {
+                // 出现编译器错误时以其为准，否则显示本地语法诊断。
+                if (isCompilerErr) {
                     c.FillRect(textX, rowY + lineH - scale2,
                         Canvas.MeasureText(text, fontSize), scale2, pal.error);
-                } else if (!hasCompVal && LocalDiagnosticMessage(ln).Length > 0) {
+                } else if (isLocalErr) {
                     c.FillRect(textX, rowY + lineH - scale2,
                         Canvas.MeasureText(text, fontSize), scale2, pal.errorDim);
                 }
@@ -1414,21 +1449,46 @@ partial class CodeEditor {
                     }
                 }
 
-                // 显示光标行的错误原因。编译器诊断具有权威优先权；
-                // 当存在有效的真实编译器诊断时，仅以真实诊断为准。
-                bool hasCompVal2 = (compErrors != null && !CompilerDiagStale());
-                bool shouldShowErr = HasCompilerErr(ln) || (!hasCompVal2 && LocalDiagnosticMessage(ln).Length > 0);
-                if (shouldShowErr && ln == curLine) {
-                    string errMsg = CompilerErrMsg(ln);
-                    if (errMsg.Length == 0 && !hasCompVal2) { errMsg = LocalDiagnosticMessage(ln); }
+                // 显示光标行或鼠标悬停行的错误原因。编译器诊断具有权威优先权；
+                int rightBoundX = area.x + area.width - rightStripW;
+                bool isHovered = (app.mouseX >= textX && app.mouseX < rightBoundX && app.mouseY >= rowY && app.mouseY < rowY + lineH);
+                bool shouldShowErr = isCompilerErr || isLocalErr;
+                if (shouldShowErr && (ln == curLine || isHovered)) {
+                    string errMsg = isCompilerErr ? CompilerErrMsg(ln) : LocalDiagnosticMessage(ln);
+                    if (errMsg.Length == 0 && isLocalErr) { errMsg = LocalDiagnosticMessage(ln); }
                     if (errMsg.Length > 0) {
-                        int ttW = Canvas.MeasureText(errMsg, fontSize) + app.Scale(12);
-                        int ttH = lineH;
+                        int errPad = app.Scale(6);
+                        int errFh = Canvas.FontHeight(fontSize);
+                        int maxErrBoxW = area.width - (textX - area.x) - rightStripW - app.Scale(8);
+                        if (maxErrBoxW > app.Scale(480)) { maxErrBoxW = app.Scale(480); }
+                        if (maxErrBoxW < app.Scale(220)) { maxErrBoxW = app.Scale(220); }
+                        int maxErrInnerW = maxErrBoxW - errPad * 2;
+
+                        List<string> errLines = new List<string>();
+                        CodeEditor.WrapText(errMsg, maxErrInnerW, fontSize, errLines, 4);
+                        if (errLines.Count == 0) { errLines.Add(errMsg); }
+
+                        int errWidest = 0;
+                        for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
+                            int lw = Canvas.MeasureText(errLines[eli], fontSize);
+                            if (lw > errWidest) { errWidest = lw; }
+                        }
+                        int ttW = errWidest + errPad * 2;
+                        int ttH = errPad * 2 + errLines.Count * errFh + (errLines.Count - 1) * app.Scale(2);
                         int ttX = textX;
+                        if (ttX + ttW > area.x + area.width - rightStripW) {
+                            ttX = area.x + area.width - rightStripW - ttW - app.Scale(2);
+                        }
+                        if (ttX < area.x) { ttX = area.x + app.Scale(2); }
                         int ttY = rowY - ttH - app.Scale(2);
-                        if (ttY < area.y) { ttY = rowY + lineH; }
+                        if (ttY < area.y) { ttY = rowY + lineH + app.Scale(2); }
+                        c.FillRoundRect(ttX + 1, ttY + 1, ttW, ttH, app.Scale(3), pal.shadowSoft);
                         c.SurfaceRoundRect(ttX, ttY, ttW, ttH, app.Scale(3), pal.errTipBg, pal.error, 1);
-                        c.DrawText(ttX + app.Scale(6), ttY + app.Scale(3), errMsg, pal.errTipText, fontSize);
+                        int ety = ttY + errPad;
+                        for (int eli = 0; eli < errLines.Count; eli = eli + 1) {
+                            c.DrawText(ttX + errPad, ety, errLines[eli], pal.errTipText, fontSize);
+                            ety = ety + errFh + app.Scale(2);
+                        }
                     }
                 }
             }
@@ -1436,52 +1496,110 @@ partial class CodeEditor {
         c.PopClip();
     }
 
-    // 右侧概览标尺：视口滑块加每个诊断行一个刻度。
+    // 右侧代码缩略图（Minimap）与概览标尺（Overview Ruler）：
+    // 渲染代码微缩轮廓、视口滑块与错误位置高亮指示，支持点击快速跳转与拖动定位。
     void RenderOverviewRuler(App app, Rect area, int visLines) {
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
-        // ---- 右侧诊断 / 滚动条（VS 风格概览标尺） ----
-        // 显示视口滑块，并为每个诊断行显示红色刻度，
-        // 用户可直接跳到问题区域；点击条带滚动到该处。
-        {
-            int stripW = app.Scale(14);
-            int stripX = area.x + area.width - stripW;
-            c.FillRect(stripX, area.y, stripW, area.height, pal.minimapBg);
-            c.FillRect(stripX, area.y, app.Scale(1), area.height, pal.border);
-            int total = lines.Count;
-            if (total < 1) { total = 1; }
-            int thumbH = visLines * area.height / total;
-            if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
-            if (thumbH > area.height) { thumbH = area.height; }
-            int travel = area.height - thumbH;
-            int thumbY = area.y;
-            if (travel > 0 && maxScrollY > 0) {
-                thumbY = area.y + scrollY * travel / maxScrollY;
-            } else {
-                thumbY = area.y + scrollLine * area.height / total;
-            }
-            if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
-            if (thumbY < area.y) { thumbY = area.y; }
-            c.FillRoundRect(stripX + app.Scale(3), thumbY, stripW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);
-            for (int mi = 0; LocalDiagnosticsCurrent() && mi < errors.Count; mi = mi + 1) {
-                if (errors[mi].line == curLine && errors[mi].msg == "Missing ';' after using") { continue; }
-                int el = errors[mi].line;
-                if (el >= 0 && el < lines.Count) {
-                    int my = area.y + el * area.height / total;
-                    c.FillRect(stripX + app.Scale(2), my, stripW - app.Scale(4), app.Scale(3), pal.error);
+
+        int minimapW = app.Scale(56);
+        if (area.width < app.Scale(360)) { minimapW = 0; }
+        int scrollBarW = app.Scale(14);
+        int rightStripW = minimapW + scrollBarW;
+        int minimapX = area.x + area.width - rightStripW;
+        int scrollBarX = area.x + area.width - scrollBarW;
+
+        int total = lines.Count;
+        if (total < 1) { total = 1; }
+
+        // 1. 缩略图背景与微缩代码轮廓
+        if (minimapW > 0) {
+            c.FillRect(minimapX, area.y, minimapW, area.height, pal.minimapBg);
+            c.FillRect(minimapX, area.y, app.Scale(1), area.height, pal.border);
+
+            int maxLines = area.height;
+            int step = total > maxLines ? (total / maxLines + 1) : 1;
+            for (int li = 0; li < lines.Count; li = li + step) {
+                string lntxt = lines[li];
+                if (lntxt.Length == 0) { continue; }
+                int ly = area.y + li * area.height / total;
+                int indent = CodeEditor.LeadWs(lntxt).Length;
+                int lx = minimapX + app.Scale(3) + indent * app.Scale(1);
+                int lw = (lntxt.Length - indent) * app.Scale(1);
+                if (lx + lw > minimapX + minimapW - app.Scale(3)) {
+                    lw = minimapX + minimapW - app.Scale(3) - lx;
                 }
-            }
-            if (!CompilerDiagStale()) {
-                for (int ci2 = 0; ci2 < compErrors.Count; ci2 = ci2 + 1) {
-                    int el2 = compErrors[ci2].line;
-                    if (el2 >= 0 && el2 < lines.Count) {
-                        int my2 = area.y + el2 * area.height / total;
-                        c.FillRect(stripX + app.Scale(2), my2, stripW - app.Scale(4), app.Scale(3), pal.error);
-                    }
+                if (lw > 0) {
+                    c.FillRect(lx, ly, lw, 1, (pal.plain & 0x00FFFFFF) | 0x30000000);
                 }
             }
         }
+
+        // 2. 收集所有错误行（编译器错误 + 本地启发式错误）
+        List<int> errLines = new List<int>();
+        for (int mi = 0; mi < errors.Count; mi = mi + 1) {
+            if (errors[mi].line == curLine && errors[mi].msg == "Missing ';' after using") { continue; }
+            int el = errors[mi].line;
+            if (el >= 0 && el < lines.Count) {
+                bool exists = false;
+                for (int ei = 0; ei < errLines.Count; ei = ei + 1) {
+                    if (errLines[ei] == el) { exists = true; break; }
+                }
+                if (!exists) { errLines.Add(el); }
+            }
+        }
+        if (!CompilerDiagStale() && compErrors != null) {
+            for (int ci2 = 0; ci2 < compErrors.Count; ci2 = ci2 + 1) {
+                int el2 = compErrors[ci2].line;
+                if (el2 >= 0 && el2 < lines.Count) {
+                    bool exists2 = false;
+                    for (int ei2 = 0; ei2 < errLines.Count; ei2 = ei2 + 1) {
+                        if (errLines[ei2] == el2) { exists2 = true; break; }
+                    }
+                    if (!exists2) { errLines.Add(el2); }
+                }
+            }
+        }
+
+        // 3. 在缩略图与滚动条上鲜明标注错误位置
+        for (int ei = 0; ei < errLines.Count; ei = ei + 1) {
+            int eln = errLines[ei];
+            int ely = area.y + eln * area.height / total;
+            if (minimapW > 0) {
+                // 缩略图红色高亮条与左侧标记
+                c.FillRoundRect(minimapX + app.Scale(2), ely - app.Scale(1),
+                    minimapW - app.Scale(4), app.Scale(3), app.Scale(1), pal.error);
+                c.FillRect(minimapX, ely - app.Scale(1), app.Scale(2), app.Scale(3), pal.error);
+            }
+            // 滚动条上的刻度
+            c.FillRect(scrollBarX + app.Scale(2), ely, scrollBarW - app.Scale(4), app.Scale(3), pal.error);
+        }
+
+        // 4. 计算视口滑块（Viewport Indicator）
+        int thumbH = visLines * area.height / total;
+        if (thumbH < app.Scale(24)) { thumbH = app.Scale(24); }
+        if (thumbH > area.height) { thumbH = area.height; }
+        int travel = area.height - thumbH;
+        int thumbY = area.y;
+        if (travel > 0 && maxScrollY > 0) {
+            thumbY = area.y + scrollY * travel / maxScrollY;
+        } else {
+            thumbY = area.y + scrollLine * area.height / total;
+        }
+        if (thumbY + thumbH > area.y + area.height) { thumbY = area.y + area.height - thumbH; }
+        if (thumbY < area.y) { thumbY = area.y; }
+
+        // 缩略图上的视口框
+        if (minimapW > 0) {
+            c.FillRoundRect(minimapX + app.Scale(1), thumbY, minimapW - app.Scale(2), thumbH, app.Scale(2), (pal.minimapThumb & 0x00FFFFFF) | 0x20000000);
+            c.SurfaceRoundRect(minimapX + app.Scale(1), thumbY, minimapW - app.Scale(2), thumbH, app.Scale(2), 0, (pal.plain & 0x00FFFFFF) | 0x30000000, 1);
+        }
+
+        // 5. 右侧滚动条
+        c.FillRect(scrollBarX, area.y, scrollBarW, area.height, pal.minimapBg);
+        c.FillRect(scrollBarX, area.y, app.Scale(1), area.height, pal.border);
+        c.FillRoundRect(scrollBarX + app.Scale(3), thumbY, scrollBarW - app.Scale(6), thumbH, app.Scale(3), pal.minimapThumb);
     }
 
     // 自动补全弹窗 + 种类过滤条 + 描述面板，
@@ -1750,17 +1868,40 @@ partial class CodeEditor {
         int pad = app.Scale(8);
         int fh = Canvas.FontHeight(fontSize);
         int sfh = Canvas.FontHeight(Style.FontFallback(app, "small"));
-        int sigW = Canvas.MeasureText(sig, fontSize);
-        int boxW = sigW + pad * 2;
-        int docW = 0;
+
+        int maxBoxW = area.width - app.Scale(16);
+        if (maxBoxW > app.Scale(480)) { maxBoxW = app.Scale(480); }
+        if (maxBoxW < app.Scale(240)) { maxBoxW = app.Scale(240); }
+        int maxInnerW = maxBoxW - pad * 2;
+
+        List<string> siglines = new List<string>();
+        CodeEditor.WrapText(sig, maxInnerW, fontSize, siglines, 4);
+        if (siglines.Count == 0) { siglines.Add(sig); }
+
+        List<string> doclines = new List<string>();
         if (doc.Length > 0) {
-            docW = Canvas.MeasureText(doc, Style.FontFallback(app, "small")) + pad * 2;
-            if (docW > boxW) { boxW = docW; }
+            CodeEditor.WrapText(doc, maxInnerW, Style.FontFallback(app, "small"), doclines, 4);
         }
-        int maxW = area.width - app.Scale(8);
-        if (boxW > maxW) { boxW = maxW; }
-        int boxH = pad * 2 + fh;
-        if (doc.Length > 0) { boxH = boxH + app.Scale(2) + sfh; }
+
+        int widest = 0;
+        for (int si = 0; si < siglines.Count; si = si + 1) {
+            int lw = Canvas.MeasureText(siglines[si], fontSize);
+            if (lw > widest) { widest = lw; }
+        }
+        for (int di = 0; di < doclines.Count; di = di + 1) {
+            int lw = Canvas.MeasureText(doclines[di], Style.FontFallback(app, "small"));
+            if (lw > widest) { widest = lw; }
+        }
+        int minInnerW = app.Scale(160);
+        if (widest < minInnerW) { widest = minInnerW; }
+        if (widest > maxInnerW) { widest = maxInnerW; }
+        int boxW = widest + pad * 2;
+
+        int boxH = pad * 2 + siglines.Count * fh;
+        if (doclines.Count > 0) {
+            boxH = boxH + app.Scale(4) + doclines.Count * (sfh + app.Scale(2));
+        }
+
         int px = textX;
         int rowY = LineTopY(curLine);
         int py = rowY - boxH - app.Scale(2);
@@ -1773,28 +1914,45 @@ partial class CodeEditor {
         c.FillRoundRect(px + 2, py + 2, boxW, boxH, app.Scale(4), pal.shadowSoft);
         c.SurfaceRoundRect(px, py, boxW, boxH, app.Scale(4), pal.popupBg,
             pal.border, 1);
-        // 活动参数用强调色，签名其余部分
-        // 用柔和的签名色，长实参列表保持可读。
+
+        // 活动参数用强调色，签名其余部分用柔和的签名色，长实参列表保持可读。
         List<int> span = new List<int>();
         CodeEditor.ParamSpan(sig, argOut[0], span);
-        int ty = py + pad;
+        string activeMid = "";
         if (span.Count == 2 && span[0] + span[1] <= sig.Length) {
-            string head = sig.Substring(0, span[0]);
-            string mid = sig.Substring(span[0], span[1]);
-            string tail = sig.Substring(span[0] + span[1],
-                sig.Length - span[0] - span[1]);
-            int cx = px + pad;
-            c.DrawText(cx, ty, head, pal.signature, fontSize);
-            cx = cx + Canvas.MeasureText(head, fontSize);
-            c.DrawText(cx, ty, mid, pal.accent, fontSize);
-            cx = cx + Canvas.MeasureText(mid, fontSize);
-            c.DrawText(cx, ty, tail, pal.signature, fontSize);
-        } else {
-            c.DrawText(px + pad, ty, sig, pal.signature, fontSize);
+            activeMid = sig.Substring(span[0], span[1]);
         }
-        if (doc.Length > 0) {
-            c.DrawText(px + pad, ty + fh + app.Scale(2), doc, pal.muted,
-                Style.FontFallback(app, "small"));
+        int ty = py + pad;
+        bool midDrawn = false;
+        for (int sl = 0; sl < siglines.Count; sl = sl + 1) {
+            string slTxt = siglines[sl];
+            if (!midDrawn && activeMid.Length > 0 && slTxt.Contains(activeMid)) {
+                int mPos = slTxt.IndexOf(activeMid);
+                string head = slTxt.Substring(0, mPos);
+                string tail = slTxt.Substring(mPos + activeMid.Length);
+                int cx = px + pad;
+                if (head.Length > 0) {
+                    c.DrawText(cx, ty, head, pal.signature, fontSize);
+                    cx = cx + Canvas.MeasureText(head, fontSize);
+                }
+                c.DrawText(cx, ty, activeMid, pal.accent, fontSize);
+                cx = cx + Canvas.MeasureText(activeMid, fontSize);
+                if (tail.Length > 0) {
+                    c.DrawText(cx, ty, tail, pal.signature, fontSize);
+                }
+                midDrawn = true;
+            } else {
+                c.DrawText(px + pad, ty, slTxt, pal.signature, fontSize);
+            }
+            ty = ty + fh;
+        }
+
+        if (doclines.Count > 0) {
+            ty = ty + app.Scale(4);
+            for (int dl = 0; dl < doclines.Count; dl = dl + 1) {
+                c.DrawText(px + pad, ty, doclines[dl], pal.muted, Style.FontFallback(app, "small"));
+                ty = ty + sfh + app.Scale(2);
+            }
         }
     }
 
