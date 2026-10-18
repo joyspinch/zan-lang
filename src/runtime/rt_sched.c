@@ -281,6 +281,9 @@ static void plat_fiber_delete(void *f) {
     free(pf);
 }
 static void plat_switch(void *to) {
+#ifndef _WIN32
+    ((posix_fiber_t *)to)->ctx.uc_link = &g_sched_ctx;
+#endif
     swapcontext(&g_sched_ctx, &((posix_fiber_t *)to)->ctx);
 }
 static void plat_sleep(int64_t ms) {
@@ -306,7 +309,9 @@ static void switch_to_sched(void) {
 
 static void wake_one_worker(void) {
     if (g_worker_count <= 1) return;
-    for (int i = 0; i < g_worker_count; i++) {
+    int start = (g_worker_id >= 0) ? (g_worker_id + 1) % g_worker_count : 0;
+    for (int k = 0; k < g_worker_count; k++) {
+        int i = (start + k) % g_worker_count;
         if (g_workers[i].active && g_workers[i].sleeping) {
 #ifdef _WIN32
             SetEvent(g_workers[i].wake_event);
@@ -617,6 +622,7 @@ static void co_trampoline_posix(unsigned ptr) {
     co->body(co->task);
     co->finished = 1;
     complete_task(co->task, 0);
+    switch_to_sched();
 }
 
 static void *worker_thread_main(void *arg) {
