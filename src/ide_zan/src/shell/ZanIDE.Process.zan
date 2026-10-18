@@ -1,0 +1,168 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Diagnostics;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+partial class ZanIDE {
+    static string TermLogPath() { return ZanIDE.WindowCacheDir() + "/term_session.log"; }
+
+    static nint TermOpen(string root) {
+        ZanIDE.EnsureCacheDir();
+        File.WriteAllText(ZanIDE.TermLogPath(), "");
+        #if WINDOWS
+        string cmd = "cmd /q /k cd /d \"" + root + "\" >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
+        #else
+        string cmd = "cd \"" + root + "\" && exec sh >>\"" + ZanIDE.TermLogPath() + "\" 2>&1";
+        #endif
+        return Process.ShellOpen(cmd);
+    }
+
+    static int PollLogFile(string path, int consumed, List<string> outLog) {
+        if (!File.Exists(path)) { return consumed; }
+        FileStream fs = null;
+        try {
+            fs = FileStream.OpenRead(path);
+            long total = fs.Length();
+            if (total > 8388608) {
+                fs.Close();
+                fs = null;
+                File.WriteAllText(path, "");
+                return 0;
+            }
+            if (consumed > total) { consumed = 0; }
+            if (consumed >= total) { fs.Close(); return consumed; }
+            int want = (int)(total - consumed);
+            if (want > 1048576) { want = 1048576; }
+            fs.SeekTo(consumed);
+            string chunk = fs.Read(want);
+            fs.Close();
+            fs = null;
+            if (chunk.Length == 0) { return consumed; }
+            int last = 0 - 1;
+            for (int i = chunk.Length - 1; i >= 0; i = i - 1) {
+                if (chunk.Substring(i, 1) == "\n") { last = i; i = 0 - 1; }
+            }
+            if (last < 0) { return consumed; }
+            List<string> nl = CodeEditor.SplitLines(chunk.Substring(0, last + 1));
+            for (int k = 0; k < nl.Count; k = k + 1) {
+                if (!(k == nl.Count - 1 && nl[k] == "")) { outLog.Add(nl[k]); }
+            }
+            // 商业插件使用账目：从构建输出里捞 ZANPKG_USAGE 信号行
+            // （安装/编译命中商业插件时编译器各打一行），去重后异步上报。
+            for (int k = 0; k < nl.Count; k = k + 1) {
+                PluginUsage.Observe(nl[k]);
+            }
+            while (outLog.Count > 2000) { outLog.RemoveAt(0); }
+            return consumed + last + 1;
+        } catch (Exception e) {
+            if (fs != null) { fs.Close(); }
+            return consumed;
+        }
+    }
+
+    static int TermPoll(int consumed, List<string> termLog) {
+        return ZanIDE.PollLogFile(ZanIDE.TermLogPath(), consumed, termLog);
+    }
+
+    static string RunLogPath() { return ZanIDE.WindowCacheDir() + "/run_output.log"; }
+
+    static string RunDonePath() { return ZanIDE.WindowCacheDir() + "/run_done.marker"; }
+
+    static void RunConsole(string exe, string cwd) {
+        ZanIDE.EnsureCacheDir();
+        File.WriteAllText(ZanIDE.RunLogPath(), "");
+        if (File.Exists(ZanIDE.RunDonePath())) { File.Delete(ZanIDE.RunDonePath()); }
+        #if WINDOWS
+        string ps = "$e=New-Object System.Text.UTF8Encoding $false; & '" + exe
+            + "' 2>&1 | %{ $_; [IO.File]::AppendAllText('" + ZanIDE.RunLogPath()
+            + "',($_ -as [string])+[Environment]::NewLine,$e) }; [IO.File]::WriteAllText('"
+            + ZanIDE.RunDonePath() + "','1')";
+        Process.RunDetached("cmd /c start \"Zan Run\" /D \"" + ZanIDE.ToWinPath(cwd)
+            + "\" powershell -NoProfile -ExecutionPolicy Bypass -NoExit -Command \"" + ps + "\"");
+        #else
+        Process.RunDetached("sh -c 'cd \"" + cwd + "\" && \"" + exe
+            + "\" 2>&1 | tee \"" + ZanIDE.RunLogPath()
+            + "\"; echo 1 > \"" + ZanIDE.RunDonePath() + "\"' &");
+        #endif
+    }
+
+    static int RunPoll(int consumed, List<string> outLog) {
+        return ZanIDE.PollLogFile(ZanIDE.RunLogPath(), consumed, outLog);
+    }
+
+    static void LaunchUnderUiDriver(string exe, string cwd, string scriptPath,
+                                    string outDir, string donePath) {
+        if (File.Exists(donePath)) { File.Delete(donePath); }
+        #if WINDOWS
+        Process.RunDetached("cmd /c \"cd /d \"" + ZanIDE.ToWinPath(cwd)
+            + "\"&set ZAN_UI_SCRIPT=" + ZanIDE.ToWinPath(scriptPath)
+            + "&set ZAN_UI_OUT=" + ZanIDE.ToWinPath(outDir)
+            + "&\"" + exe + "\"&echo ok>\"" + ZanIDE.ToWinPath(donePath) + "\"\"");
+        #else
+        Process.RunDetached("sh -c 'cd \"" + cwd + "\" && ZAN_UI_SCRIPT=\""
+            + scriptPath + "\" ZAN_UI_OUT=\"" + outDir + "\" \"" + exe
+            + "\" >/dev/null 2>&1 ; echo ok > \"" + donePath + "\"'");
+        #endif
+    }
+
+    static string AiDiffResult(string root) {
+        List<string> lines = Process.RunCapture("git -C \"" + root
+            + "\" --no-pager diff --stat HEAD");
+        List<string> body = Process.RunCapture("git -C \"" + root
+            + "\" --no-pager diff HEAD");
+        StringBuilder sb = new StringBuilder();
+        if (body.Count == 0 && lines.Count == 0) {
+            return "diff: no output (is this a git repository?).";
+        }
+        bool empty = true;
+        for (int i = 0; i < body.Count; i = i + 1) {
+            if (AiAgent.Trim(body[i]) != "") { empty = false; }
+        }
+        if (empty) {
+            return "diff: the working tree is clean (nothing to review).";
+        }
+        sb.Append("--- changed files ---\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            sb.Append(lines[i] + "\n");
+        }
+        sb.Append("--- unified diff ---\n");
+        int budget = 12000;
+        int used = 0;
+        bool cut = false;
+        for (int i = 0; i < body.Count; i = i + 1) {
+            if (used + body[i].Length > budget) { cut = true; }
+            if (cut) { i = body.Count; } else {
+                sb.Append(body[i] + "\n");
+                used = used + body[i].Length + 1;
+            }
+        }
+        if (cut) {
+            sb.Append("...(diff truncated; read the remaining files directly)\n");
+        }
+        return sb.ToString();
+    }
+
+    static string AiRunErrorsResult() {
+        string lp = ZanIDE.RunLogPath();
+        if (!File.Exists(lp)) {
+            return "run_errors: nothing has been run yet in this session"
+                + " (call run or ui_check first).";
+        }
+        string txt = File.ReadAllText(lp);
+        if (AiAgent.Trim(txt) == "") {
+            return "run_errors: the last run produced no output"
+                + " (it may still be running, or it was a GUI launch whose"
+                + " output is not captured).";
+        }
+        if (txt.Length > 8000) {
+            txt = "...(earlier output omitted)\n"
+                + AiAgent.ClipTail(txt, 8000);
+        }
+        return "--- last run output (stdout+stderr, tail) ---\n" + txt;
+    }
+}

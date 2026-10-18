@@ -1,0 +1,134 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component;
+using Gui.Backend;
+
+partial class ZanIDE {
+    static string GitLogPath() { return ZanIDE.WindowCacheDir() + "/git_job.log"; }
+    static string GitDonePath() { return ZanIDE.WindowCacheDir() + "/git_job_done.txt"; }
+
+    static string GitRefreshMark() { return "--zan-git-branch--"; }
+
+    static string GitHeadMark() { return "--zan-git-head--"; }
+
+    static void GitBegin(string root, string args) {
+        ZanIDE.GitBeginRaw("git -C \"" + root + "\" " + args);
+    }
+
+    static void GitBeginRaw(string cmd) {
+        ZanIDE.EnsureCacheDir();
+        File.WriteAllText(ZanIDE.GitLogPath(), "");
+        if (File.Exists(ZanIDE.GitDonePath())) { File.Delete(ZanIDE.GitDonePath()); }
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        Process.RunDetached("((" + cmd + ") >> \"" + ZanIDE.GitLogPath() + "\" 2>&1)"
+            + sep + "echo ok > \"" + ZanIDE.GitDonePath() + "\"");
+    }
+
+    static void GitRefreshBegin(string root) {
+        #if WINDOWS
+        string sep = " & ";
+        #else
+        string sep = " ; ";
+        #endif
+        string g = "git -C \"" + root + "\" ";
+        ZanIDE.GitBeginRaw(g + "status --porcelain" + sep
+            + "echo " + ZanIDE.GitRefreshMark() + sep
+            + g + "branch --show-current" + sep
+            + "echo " + ZanIDE.GitHeadMark() + sep
+            + g + "rev-parse --short HEAD");
+    }
+
+    static bool GitJobDone() { return File.Exists(ZanIDE.GitDonePath()); }
+
+    static List<string> GitJobTake() {
+        List<string> lines = new List<string>();
+        if (File.Exists(ZanIDE.GitLogPath())) {
+            lines = CodeEditor.SplitLines(File.ReadAllText(ZanIDE.GitLogPath()));
+        }
+        if (File.Exists(ZanIDE.GitDonePath())) { File.Delete(ZanIDE.GitDonePath()); }
+        return lines;
+    }
+
+    static string GitRefreshApply(List<string> out2, List<string> files) {
+        while (files.Count > 0) { files.RemoveAt(files.Count - 1); }
+        string branch = "";
+        int section = 0;
+        for (int i = 0; i < out2.Count; i = i + 1) {
+            string line = ZanIDE.TrimTail(out2[i]);
+            if (line == ZanIDE.GitRefreshMark()) {
+                section = 1;
+            } else if (line == ZanIDE.GitHeadMark()) {
+                section = 2;
+            } else if (section == 1) {
+                if (branch == "" && !ZanIDE.GitNoise(line)) { branch = line; }
+            } else if (section == 0 && line != "") {
+                files.Add(out2[i]);
+            }
+        }
+        return branch;
+    }
+
+    static string GitRefreshHead(List<string> out2) {
+        bool afterHead = false;
+        for (int i = 0; i < out2.Count; i = i + 1) {
+            string line = ZanIDE.TrimTail(out2[i]);
+            if (line == ZanIDE.GitHeadMark()) {
+                afterHead = true;
+            } else if (afterHead && !ZanIDE.GitNoise(line)) {
+                return line;
+            }
+        }
+        return "";
+    }
+
+    static bool GitNoise(string line) {
+        if (line == "") { return true; }
+        return ZanIDE.StartsWith(line, "fatal:")
+            || ZanIDE.StartsWith(line, "error:")
+            || ZanIDE.StartsWith(line, "warning:")
+            || ZanIDE.StartsWith(line, "hint:");
+    }
+
+    static string TrimTail(string s) {
+        int end = s.Length;
+        while (end > 0 && s.Substring(end - 1, 1) == " ") { end = end - 1; }
+        return s.Substring(0, end);
+    }
+
+    static string GitPathOf(string line) {
+        if (line.Length < 4) { return ""; }
+        string p = line.Substring(3, line.Length - 3);
+        int arrow = ZanIDE.IndexOfStr(p, " -> ");
+        if (arrow >= 0) { p = p.Substring(arrow + 4, p.Length - arrow - 4); }
+        if (p.Length >= 2 && p.Substring(0, 1) == "\"") {
+            p = p.Substring(1, p.Length - 2);
+        }
+        return p;
+    }
+
+    static int GitStatusColor(Theme t, string line) {
+        if (line.Length < 2) { return t.textSecondary; }
+        string x = line.Substring(0, 1);
+        string y = line.Substring(1, 1);
+        if (x == "?") { return t.error; }
+        if (y == " ") { return t.success; }
+        return t.warning;
+    }
+
+    static void GitFileActivated() {
+        ZanIDE ide = ZanIDE.current;
+        if (ide == null || !ide.gitList.HasSelection()) { return; }
+        string gp = ide.root + "/" + ZanIDE.GitPathOf(ide.gitList.Selected());
+        if (!File.Exists(gp)) { return; }
+        ZanIDE.OpenPath(ide.tabs, ide.activeTab, gp, Path.GetFileName(gp));
+        ide.lastActive = 0 - 1;
+    }
+}
