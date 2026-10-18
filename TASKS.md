@@ -8,14 +8,6 @@
 
 ## 未完成
 
-- [ ] **A374 MCP `zan_start_here` 仍宣传已失效的 repomap 单文件命令**
-  证据：`tools/mcp_server/McpServer.zan` 共 8 处（约 1129/1301/1332/2046/
-  2187/2446/2655/4213 行）输出 `zanc tools/repomap/RepoMap.zan --auto-stdlib`
-  ；而 RepoMap 已在 c6413641 / 85938c5a 拆成 `RepoMap.zan + Str.zan +
-  Models/*.zan`，单文件形式报一串 `undefined type 'RefBucket'`。
-  修点：文案改指向 `scripts/build_repomap.ps1`（已加，负责枚举全部源），
-  并重编 `zan-mcp` 才生效。
-
 - [ ] **A375 `.zanmap` 调用图 id 退化为裸成员名**
   证据：重构后 `callgraph.jsonl` 的 `id`/`name` 是裸成员名、`owner` 恒空
   （对照重构前为 `Owner.Member`），`File.ReadAllText` 与任意 `ReadAllText`
