@@ -8,13 +8,6 @@
 
 ## 未完成
 
-- [ ] **A373 `zanfmt --check` 在 Windows 检出上 100% 假红**
-  证据：`.zan` 工作树是 CRLF（`.gitattributes` 规定提交 LF），`--check` 拿
-  CRLF 原文与自身 LF 输出逐字节比 → 实测 8356/8356 全红；改用
-  `--stdout` 归一化行尾后比较即正常（`stdlib/System/Action.zan` 判 ok）。
-  修点：`src/fmt/ZanFmt.zan` 的 check 路径先归一化行尾。
-  现状：`tools/agent/verify.ps1` 已在内部绕过该缺陷。
-
 - [ ] **A374 MCP `zan_start_here` 仍宣传已失效的 repomap 单文件命令**
   证据：`tools/mcp_server/McpServer.zan` 共 8 处（约 1129/1301/1332/2046/
   2187/2446/2655/4213 行）输出 `zanc tools/repomap/RepoMap.zan --auto-stdlib`

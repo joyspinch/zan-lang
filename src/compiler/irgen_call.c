@@ -1,6 +1,6 @@
 
 static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
-                                           bool keep_result) {
+                                           bool keep_result, bool is_explicit_spawn) {
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
         return NULL;
 
@@ -26,7 +26,7 @@ static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
        一定会写入它，await 的间接分支用的就是同一招（irgen_expr.c）。
        缺了这一步，Task.Spawn/Task.Run 会静默丢弃协程：返回 0 句柄、循环体
        永不执行，而 IsDone(0) 对空帧报"已完成"，症状极难与业务 bug 区分。 */
-    if (!sub_resume) {
+    if (!sub_resume && is_explicit_spawn) {
         LLVMValueRef ssp = LLVMBuildStructGEP2(g->builder, g->co_header_type,
             sub_i8, ASYNC_FRAME_SELF_STEP, "spawn.selfstep.p");
         sub_resume = LLVMBuildLoad2(g->builder, g->co_step_ptr, ssp,
@@ -774,7 +774,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             bool keep_result = is_call_to(expr, "Task", "Run") &&
                 !is_call_to(expr, "Task", "Spawn") &&
                 sub_ty && sub_ty->kind != TYPE_VOID;
-            LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result);
+            LLVMValueRef sub_i8 = emit_detach_async_call(g, sub, keep_result, true);
             emit_release_owned_call_temp(g, sub_arg, sub, locals);
             /* Task */
             if (sub_i8) return LLVMBuildPtrToInt(g->builder, sub_i8, sp_i64, "spawn.h");

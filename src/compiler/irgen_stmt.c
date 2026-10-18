@@ -122,6 +122,39 @@ static void emit_eh_hook_call(zan_irgen_t *g, const char *name) {
     zan_call2(g->builder, fty, f, NULL, 0, "");
 }
 
+static bool call_is_async_callee(zan_irgen_t *g, zan_ast_node_t *call, local_scope_t *locals) {
+    if (!call || call->kind != AST_CALL) return false;
+    zan_ast_node_t *callee = call->call.callee;
+    if (!callee) return false;
+
+    if (callee->kind == AST_MEMBER_ACCESS) {
+        zan_type_t *obj_ty = infer_expr_type(g, callee->member.object, locals);
+        if (obj_ty) {
+            if (obj_ty->kind == TYPE_INTERFACE && obj_ty->sym) {
+                zan_symbol_t *iface_m = resolve_iface_overload(obj_ty->sym,
+                                            callee->member.name,
+                                            call->call.args.count,
+                                            call->call.type_args.count);
+                if (iface_m && iface_m->decl && iface_m->decl->kind == AST_METHOD_DECL)
+                    return (iface_m->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+            }
+            zan_symbol_t *ts = obj_ty->sym ? obj_ty->sym : expr_class_sym(g, callee->member.object, locals);
+            if (ts) {
+                zan_symbol_t *msym = resolve_overload_typed(g, ts, callee->member.name, call, locals);
+                if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
+                    return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+            }
+        }
+    } else if (callee->kind == AST_IDENTIFIER) {
+        if (g->current_type_sym) {
+            zan_symbol_t *msym = resolve_overload_typed(g, g->current_type_sym, callee->ident.name, call, locals);
+            if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
+                return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+        }
+    }
+    return false;
+}
+
 static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *locals);
 
 static void emit_switch_pattern_bind(zan_irgen_t *g, local_scope_t *locals,
@@ -1545,7 +1578,7 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
     case AST_EXPR_STMT: {
         zan_ast_node_t *e = stmt->expr_stmt.expr;
         LLVMValueRef ev = emit_expr(g, e, locals);
-        if (ev && e->kind == AST_CALL && emit_detach_async_call(g, ev, false))
+        if (ev && e->kind == AST_CALL && emit_detach_async_call(g, ev, false, call_is_async_callee(g, e, locals)))
             break;
         if (ev && expr_yields_owned_rc_value(g, e, locals)) {
             zan_type_t *et = infer_expr_type(g, e, locals);
