@@ -1,0 +1,448 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Linq;
+
+// 针对序列的高性能零堆分配（Zero-Alloc）值流水线抽象。
+// 每个中间操作（Where / Select / Skip / Take）均返回轻量级迭代器，
+// 不产生任何中间 List<T> 分配，与 duck-typed foreach 无缝配合，
+// 实现类似 C# StructLinq / ValueLinq 的原生栈级展开与内联求值。
+public class ValueEnumerable<T> {
+    public List<T> src;
+
+    public ValueEnumerable(List<T> src) {
+        this.src = src;
+    }
+
+    public static ValueEnumerable<T> Of(List<T> src) {
+        return new ValueEnumerable<T>(src);
+    }
+
+    // 惰性过滤操作：返回零中间分配的 ValueWhereIterator
+    public ValueWhereIterator<T> Where(Predicate<T> pred) {
+        return new ValueWhereIterator<T>(this.src, pred);
+    }
+
+    // 惰性投影操作：返回零中间分配的 ValueSelectIterator
+    public ValueSelectIterator<T, R> Select<R>(Selector<T, R> selector) {
+        return new ValueSelectIterator<T, R>(this.src, selector);
+    }
+
+    // 惰性跳过：返回零分配跳过迭代器
+    public ValueSkipIterator<T> Skip(int count) {
+        return new ValueSkipIterator<T>(this.src, count);
+    }
+
+    // 惰性截取：返回零分配截取迭代器
+    public ValueTakeIterator<T> Take(int count) {
+        return new ValueTakeIterator<T>(this.src, count);
+    }
+
+    // 终结操作：物化为 List<T>
+    public List<T> ToList() {
+        List<T> res = new List<T>();
+        if (this.src == null) { return res; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            res.Add(this.src[i]);
+        }
+        return res;
+    }
+
+    // 终结操作：计数
+    public int Count() {
+        return this.src != null ? this.src.Count : 0;
+    }
+
+    // 终结操作：获取首个元素
+    public T First() {
+        if (this.src == null || this.src.Count == 0) {
+            throw new Exception("Sequence contains no elements");
+        }
+        return this.src[0];
+    }
+
+    // 终结操作：获取首个元素或默认值
+    public T FirstOrDefault(T dflt) {
+        if (this.src == null || this.src.Count == 0) {
+            return dflt;
+        }
+        return this.src[0];
+    }
+
+    // 终结操作：是否存在任意元素
+    public bool Any() {
+        return this.src != null && this.src.Count > 0;
+    }
+
+    // 终结操作：是否存在满足谓词的元素
+    public bool Any(Predicate<T> pred) {
+        if (this.src == null) { return false; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            if (pred(this.src[i])) { return true; }
+        }
+        return false;
+    }
+
+    // 终结操作：是否所有元素均满足谓词
+    public bool All(Predicate<T> pred) {
+        if (this.src == null) { return true; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            if (!pred(this.src[i])) { return false; }
+        }
+        return true;
+    }
+
+    // 终结操作：遍历每个元素
+    public void ForEach(Action<T> action) {
+        if (this.src == null) { return; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            action(this.src[i]);
+        }
+    }
+
+    // Duck-typed foreach 迭代器协议支持
+    public ValueEnumerator<T> GetEnumerator() {
+        return new ValueEnumerator<T>(this.src);
+    }
+}
+
+// 基础值枚举迭代器
+public class ValueEnumerator<T> {
+    List<T> src;
+    int index;
+    T current;
+
+    public ValueEnumerator(List<T> src) {
+        this.src = src;
+        this.index = 0;
+    }
+
+    public bool MoveNext() {
+        if (this.src != null && this.index < this.src.Count) {
+            this.current = this.src[this.index];
+            this.index = this.index + 1;
+            return true;
+        }
+        return false;
+    }
+
+    public T Current {
+        get { return this.current; }
+    }
+}
+
+// 零分配 Where 过滤迭代器
+public class ValueWhereIterator<T> {
+    List<T> src;
+    Predicate<T> pred;
+    int index;
+    T current;
+
+    public ValueWhereIterator(List<T> src, Predicate<T> pred) {
+        this.src = src;
+        this.pred = pred;
+        this.index = 0;
+    }
+
+    // 链式追加过滤
+    public ValueWhereIterator<T> Where(Predicate<T> nextPred) {
+        Predicate<T> prev = this.pred;
+        return new ValueWhereIterator<T>(this.src, (T item) => prev(item) && nextPred(item));
+    }
+
+    // 链式追加投影
+    public ValueSelectIterator<T, R> Select<R>(Selector<T, R> selector) {
+        List<T> filtered = this.ToList();
+        return new ValueSelectIterator<T, R>(filtered, selector);
+    }
+
+    // 终结操作：收集为 List<T>
+    public List<T> ToList() {
+        List<T> res = new List<T>();
+        if (this.src == null) { return res; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            T item = this.src[i];
+            if (this.pred(item)) {
+                res.Add(item);
+            }
+        }
+        return res;
+    }
+
+    // 终结操作：统计满足条件的数量
+    public int Count() {
+        int c = 0;
+        if (this.src == null) { return 0; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            if (this.pred(this.src[i])) {
+                c = c + 1;
+            }
+        }
+        return c;
+    }
+
+    // 终结操作：获取首个匹配元素
+    public T First() {
+        if (this.src != null) {
+            for (int i = 0; i < this.src.Count; i = i + 1) {
+                T item = this.src[i];
+                if (this.pred(item)) {
+                    return item;
+                }
+            }
+        }
+        throw new Exception("Sequence contains no matching element");
+    }
+
+    // 终结操作：获取首个匹配元素或默认值
+    public T FirstOrDefault(T dflt) {
+        if (this.src != null) {
+            for (int i = 0; i < this.src.Count; i = i + 1) {
+                T item = this.src[i];
+                if (this.pred(item)) {
+                    return item;
+                }
+            }
+        }
+        return dflt;
+    }
+
+    // 终结操作：是否存在任意匹配项
+    public bool Any() {
+        if (this.src == null) { return false; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            if (this.pred(this.src[i])) { return true; }
+        }
+        return false;
+    }
+
+    // Duck-typed foreach 迭代器协议支持
+    public ValueWhereIterator<T> GetEnumerator() {
+        return new ValueWhereIterator<T>(this.src, this.pred);
+    }
+
+    public bool MoveNext() {
+        if (this.src == null) { return false; }
+        while (this.index < this.src.Count) {
+            T item = this.src[this.index];
+            this.index = this.index + 1;
+            if (this.pred(item)) {
+                this.current = item;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public T Current {
+        get { return this.current; }
+    }
+}
+
+// 零分配 Select 投影迭代器
+public class ValueSelectIterator<T, R> {
+    List<T> src;
+    Selector<T, R> selector;
+    int index;
+    R current;
+
+    public ValueSelectIterator(List<T> src, Selector<T, R> selector) {
+        this.src = src;
+        this.selector = selector;
+        this.index = 0;
+    }
+
+    // 链式追加二次投影
+    public ValueSelectIterator<R, S> Select<S>(Selector<R, S> nextSelector) {
+        Selector<T, R> prev = this.selector;
+        return new ValueSelectIterator<T, S>(this.src, (T item) => nextSelector(prev(item)));
+    }
+
+    // 终结操作：收集投影结果
+    public List<R> ToList() {
+        List<R> res = new List<R>();
+        if (this.src == null) { return res; }
+        for (int i = 0; i < this.src.Count; i = i + 1) {
+            res.Add(this.selector(this.src[i]));
+        }
+        return res;
+    }
+
+    public int Count() {
+        return this.src != null ? this.src.Count : 0;
+    }
+
+    public R First() {
+        if (this.src == null || this.src.Count == 0) {
+            throw new Exception("Sequence contains no elements");
+        }
+        return this.selector(this.src[0]);
+    }
+
+    public R FirstOrDefault(R dflt) {
+        if (this.src == null || this.src.Count == 0) {
+            return dflt;
+        }
+        return this.selector(this.src[0]);
+    }
+
+    // Duck-typed foreach 迭代器协议支持
+    public ValueSelectIterator<T, R> GetEnumerator() {
+        return new ValueSelectIterator<T, R>(this.src, this.selector);
+    }
+
+    public bool MoveNext() {
+        if (this.src != null && this.index < this.src.Count) {
+            this.current = this.selector(this.src[this.index]);
+            this.index = this.index + 1;
+            return true;
+        }
+        return false;
+    }
+
+    public R Current {
+        get { return this.current; }
+    }
+}
+
+// 零分配 Skip 迭代器
+public class ValueSkipIterator<T> {
+    List<T> src;
+    int skipCount;
+    int index;
+    T current;
+
+    public ValueSkipIterator(List<T> src, int skipCount) {
+        this.src = src;
+        this.skipCount = skipCount > 0 ? skipCount : 0;
+        this.index = this.skipCount;
+    }
+
+    public List<T> ToList() {
+        List<T> res = new List<T>();
+        if (this.src == null) { return res; }
+        for (int i = this.skipCount; i < this.src.Count; i = i + 1) {
+            res.Add(this.src[i]);
+        }
+        return res;
+    }
+
+    public int Count() {
+        if (this.src == null) { return 0; }
+        int rem = this.src.Count - this.skipCount;
+        return rem > 0 ? rem : 0;
+    }
+
+    public T First() {
+        if (this.src == null || this.skipCount >= this.src.Count) {
+            throw new Exception("Sequence contains no elements");
+        }
+        return this.src[this.skipCount];
+    }
+
+    public T FirstOrDefault(T dflt) {
+        if (this.src == null || this.skipCount >= this.src.Count) {
+            return dflt;
+        }
+        return this.src[this.skipCount];
+    }
+
+    public ValueTakeIterator<T> Take(int count) {
+        List<T> skipped = this.ToList();
+        return new ValueTakeIterator<T>(skipped, count);
+    }
+
+    public ValueSkipIterator<T> Skip(int count) {
+        return new ValueSkipIterator<T>(this.src, this.skipCount + count);
+    }
+
+    public ValueWhereIterator<T> Where(Predicate<T> pred) {
+        List<T> skipped = this.ToList();
+        return new ValueWhereIterator<T>(skipped, pred);
+    }
+
+    public ValueSelectIterator<T, R> Select<R>(Selector<T, R> selector) {
+        List<T> skipped = this.ToList();
+        return new ValueSelectIterator<T, R>(skipped, selector);
+    }
+
+    public ValueSkipIterator<T> GetEnumerator() {
+        return new ValueSkipIterator<T>(this.src, this.skipCount);
+    }
+
+    public bool MoveNext() {
+        if (this.src != null && this.index < this.src.Count) {
+            this.current = this.src[this.index];
+            this.index = this.index + 1;
+            return true;
+        }
+        return false;
+    }
+
+    public T Current {
+        get { return this.current; }
+    }
+}
+
+// 零分配 Take 迭代器
+public class ValueTakeIterator<T> {
+    List<T> src;
+    int takeCount;
+    int index;
+    int yielded;
+    T current;
+
+    public ValueTakeIterator(List<T> src, int takeCount) {
+        this.src = src;
+        this.takeCount = takeCount > 0 ? takeCount : 0;
+        this.index = 0;
+        this.yielded = 0;
+    }
+
+    public List<T> ToList() {
+        List<T> res = new List<T>();
+        if (this.src == null || this.takeCount == 0) { return res; }
+        int limit = this.takeCount < this.src.Count ? this.takeCount : this.src.Count;
+        for (int i = 0; i < limit; i = i + 1) {
+            res.Add(this.src[i]);
+        }
+        return res;
+    }
+
+    public int Count() {
+        if (this.src == null || this.takeCount == 0) { return 0; }
+        return this.takeCount < this.src.Count ? this.takeCount : this.src.Count;
+    }
+
+    public T First() {
+        if (this.src == null || this.takeCount == 0 || this.src.Count == 0) {
+            throw new Exception("Sequence contains no elements");
+        }
+        return this.src[0];
+    }
+
+    public T FirstOrDefault(T dflt) {
+        if (this.src == null || this.takeCount == 0 || this.src.Count == 0) {
+            return dflt;
+        }
+        return this.src[0];
+    }
+
+    public ValueTakeIterator<T> GetEnumerator() {
+        return new ValueTakeIterator<T>(this.src, this.takeCount);
+    }
+
+    public bool MoveNext() {
+        if (this.src != null && this.yielded < this.takeCount && this.index < this.src.Count) {
+            this.current = this.src[this.index];
+            this.index = this.index + 1;
+            this.yielded = this.yielded + 1;
+            return true;
+        }
+        return false;
+    }
+
+    public T Current {
+        get { return this.current; }
+    }
+}
