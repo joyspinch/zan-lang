@@ -211,6 +211,64 @@ class GenJson {
 
     /* ---- 按模式生成字段行 ---- */
 
+    // 判断字段/属性是否带有 [JsonIgnore] 特性。
+    static bool IsIgnored(JsonValue m) {
+        if (m == null) { return false; }
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return false; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            string aname = a.Str("name", "");
+            int dot = aname.LastIndexOf(".");
+            if (dot >= 0) { aname = aname.Substring(dot + 1); }
+            if (aname == "JsonIgnore" || aname == "JsonIgnoreAttribute") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 获取字段/属性在 JSON 中的键名（支持 [JsonProperty("name")]、[JsonPropertyName("name")] 等重命名特性）。
+    static string GetJsonKey(JsonValue m, string defName) {
+        if (m == null) { return defName; }
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return defName; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            string aname = a.Str("name", "");
+            int dot = aname.LastIndexOf(".");
+            if (dot >= 0) { aname = aname.Substring(dot + 1); }
+            if (aname == "JsonProperty" || aname == "JsonPropertyAttribute" ||
+                aname == "JsonPropertyName" || aname == "JsonPropertyNameAttribute") {
+                JsonValue args = a.Get("args");
+                if (args != null && args.IsArray() && args.Count() > 0) {
+                    JsonValue arg0 = args.At(0);
+                    if (arg0 != null) {
+                        if (arg0.IsString()) {
+                            string s = arg0.AsString("");
+                            if (s.Length > 0) { return s; }
+                        } else if (arg0.IsObject()) {
+                            string k = arg0.Str("k", "");
+                            if (k == "assign") {
+                                JsonValue r = arg0.Get("r");
+                                if (r != null) {
+                                    string rv = r.Str("v", "");
+                                    if (rv.Length > 0) { return rv; }
+                                }
+                            } else {
+                                string v = arg0.Str("v", "");
+                                if (v.Length > 0) { return v; }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return defName;
+    }
+
     // 2 = writer(entity -> JSON 文本,emitted 计数字段数跨基类递归)。
     // 返回新的 emitted(仅 mode 2 有意义)。
     static int GenFields(StringBuilder out0, string cls, int mode, int depth,
@@ -231,37 +289,80 @@ class GenJson {
             }
         }
         JsonValue fields = c.Get("fields");
-        if (fields == null || !fields.IsArray()) { return emitted; }
-        for (int i = 0; i < fields.Count(); i = i + 1) {
-            JsonValue f = fields.At(i);
-            if (f.Bool("static", false)) { continue; }
-            string fname = f.Str("name", "");
-            string tname = f.Str("type", "");
-            GenJson.FElemName = "";
-            GenJson.FElemKind = 0;
-            int fk = GenJson.FieldKind(tname);
-            if (fk == 0) {
-                GenJson.Warn(f, "Json mapper for '" + cls + "': field '" +
-                                fname + "' has an unsupported type and is skipped");
-                continue;
-            }
-            if (fk == 8) { GenJson.NeedAdd(tname); }
-            if ((fk == 9 || fk == 10) && GenJson.FElemKind == 8) {
-                GenJson.NeedAdd(GenJson.FElemName);
-            }
-
-            if (mode == 2) {
-                if (emitted > 0) {
-                    out0.Append("        sb.Append(\",\\\"" + fname + "\\\":\");\n");
-                } else {
-                    out0.Append("        sb.Append(\"\\\"" + fname + "\\\":\");\n");
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                JsonValue f = fields.At(i);
+                if (f.Bool("static", false)) { continue; }
+                if (GenJson.IsIgnored(f)) { continue; }
+                string fname = f.Str("name", "");
+                string jsonKey = GenJson.GetJsonKey(f, fname);
+                string tname = f.Str("type", "");
+                GenJson.FElemName = "";
+                GenJson.FElemKind = 0;
+                int fk = GenJson.FieldKind(tname);
+                if (fk == 0) {
+                    GenJson.Warn(f, "Json mapper for '" + cls + "': field '" +
+                                    fname + "' has an unsupported type and is skipped");
+                    continue;
                 }
-                emitted = emitted + 1;
-                GenJson.GenFieldW(out0, fk, fname, tname);
-            } else if (mode == 1) {
-                GenJson.GenFieldB(out0, fk, fname, tname);
-            } else {
-                GenJson.GenFieldT(out0, fk, fname, tname);
+                if (fk == 8) { GenJson.NeedAdd(tname); }
+                if ((fk == 9 || fk == 10) && GenJson.FElemKind == 8) {
+                    GenJson.NeedAdd(GenJson.FElemName);
+                }
+
+                if (mode == 2) {
+                    if (emitted > 0) {
+                        out0.Append("        sb.Append(\",\\\"" + jsonKey + "\\\":\");\n");
+                    } else {
+                        out0.Append("        sb.Append(\"\\\"" + jsonKey + "\\\":\");\n");
+                    }
+                    emitted = emitted + 1;
+                    GenJson.GenFieldW(out0, fk, fname, tname);
+                } else if (mode == 1) {
+                    GenJson.GenFieldB(out0, fk, fname, jsonKey, tname);
+                } else {
+                    GenJson.GenFieldT(out0, fk, fname, jsonKey, tname);
+                }
+            }
+        }
+        JsonValue props = c.Get("props");
+        if (props != null && props.IsArray()) {
+            for (int i = 0; i < props.Count(); i = i + 1) {
+                JsonValue p = props.At(i);
+                if (p.Bool("static", false)) { continue; }
+                if (GenJson.IsIgnored(p)) { continue; }
+                if (mode == 2 && !p.Bool("get", false)) { continue; }
+                if (mode == 1 && !p.Bool("set", false)) { continue; }
+                if (mode == 0 && !p.Bool("get", false)) { continue; }
+                string pname = p.Str("name", "");
+                string jsonKey = GenJson.GetJsonKey(p, pname);
+                string tname = p.Str("type", "");
+                GenJson.FElemName = "";
+                GenJson.FElemKind = 0;
+                int fk = GenJson.FieldKind(tname);
+                if (fk == 0) {
+                    GenJson.Warn(p, "Json mapper for '" + cls + "': property '" +
+                                    pname + "' has an unsupported type and is skipped");
+                    continue;
+                }
+                if (fk == 8) { GenJson.NeedAdd(tname); }
+                if ((fk == 9 || fk == 10) && GenJson.FElemKind == 8) {
+                    GenJson.NeedAdd(GenJson.FElemName);
+                }
+
+                if (mode == 2) {
+                    if (emitted > 0) {
+                        out0.Append("        sb.Append(\",\\\"" + jsonKey + "\\\":\");\n");
+                    } else {
+                        out0.Append("        sb.Append(\"\\\"" + jsonKey + "\\\":\");\n");
+                    }
+                    emitted = emitted + 1;
+                    GenJson.GenFieldW(out0, fk, pname, tname);
+                } else if (mode == 1) {
+                    GenJson.GenFieldB(out0, fk, pname, jsonKey, tname);
+                } else {
+                    GenJson.GenFieldT(out0, fk, pname, jsonKey, tname);
+                }
             }
         }
         return emitted;
@@ -365,23 +466,23 @@ class GenJson {
     // binder（mode 1）字段行：从 JsonValue 宽容地读回字段
     // （缺键取类型缺省值；枚举按 int 直赋）。List 字段遇非数组的
     // 单个值时也接受，包装成单元素列表。
-    static void GenFieldB(StringBuilder out0, int fk, string fname, string tname) {
+    static void GenFieldB(StringBuilder out0, int fk, string fname, string jsonKey, string tname) {
         if (fk == 1) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Int(\"" + fname + "\", 0);\n");
+            out0.Append("        o." + fname + " = (" + tname + ")v.Int(\"" + jsonKey + "\", 0);\n");
         } else if (fk == 2) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Long(\"" + fname + "\", 0);\n");
+            out0.Append("        o." + fname + " = (" + tname + ")v.Long(\"" + jsonKey + "\", 0);\n");
         } else if (fk == 7) {
-            out0.Append("        o." + fname + " = v.Int(\"" + fname + "\", 0);\n");
+            out0.Append("        o." + fname + " = v.Int(\"" + jsonKey + "\", 0);\n");
         } else if (fk == 3) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Double(\"" + fname + "\", 0.0);\n");
+            out0.Append("        o." + fname + " = (" + tname + ")v.Double(\"" + jsonKey + "\", 0.0);\n");
         } else if (fk == 4) {
-            out0.Append("        o." + fname + " = v.Bool(\"" + fname + "\", false);\n");
+            out0.Append("        o." + fname + " = v.Bool(\"" + jsonKey + "\", false);\n");
         } else if (fk == 5) {
-            out0.Append("        o." + fname + " = v.Str(\"" + fname + "\", \"\");\n");
+            out0.Append("        o." + fname + " = v.Str(\"" + jsonKey + "\", \"\");\n");
         } else if (fk == 6) {
-            out0.Append("        o." + fname + " = v.Get(\"" + fname + "\");\n");
+            out0.Append("        o." + fname + " = v.Get(\"" + jsonKey + "\");\n");
         } else if (fk == 8) {
-            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + fname + "\");\n");
+            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + jsonKey + "\");\n");
             out0.Append("        if (j_" + fname + " != null && j_" + fname + ".IsObject()) { o." + fname + " = __JsonBind.B_" + tname + "(j_" + fname + "); }\n");
         } else if (fk == 9) {
             string elem = GenJson.FElemName;
@@ -397,7 +498,7 @@ class GenJson {
             else { elemFrom = "__JsonBind.B_" + elem + "(%s)"; }
             string convAt = GenJson.Fmt(elemFrom, "j_" + fname + ".At(i_" + fname + ")");
             string convOne = GenJson.Fmt(elemFrom, "j_" + fname);
-            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + fname + "\");\n");
+            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + jsonKey + "\");\n");
             out0.Append("        o." + fname + " = new List<" + elem + ">();\n");
             out0.Append("        if (j_" + fname + " != null && j_" + fname + ".IsArray()) {\n");
             out0.Append("            int i_" + fname + " = 0;\n");
@@ -422,7 +523,7 @@ class GenJson {
             else { elemFrom = "__JsonBind.B_" + elem + "(%s)"; }
             string conv = GenJson.Fmt(elemFrom,
                 "row_" + fname + ".At(k_" + fname + ")");
-            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + fname + "\");\n");
+            out0.Append("        JsonValue j_" + fname + " = v.Get(\"" + jsonKey + "\");\n");
             out0.Append("        o." + fname + " = new List<List<" + elem + ">>();\n");
             out0.Append("        if (j_" + fname + " != null && j_" + fname + ".IsArray()) {\n");
             out0.Append("            int i_" + fname + " = 0;\n");
@@ -448,21 +549,21 @@ class GenJson {
     // tree（mode 0）字段行：把字段转成 JsonValue 节点放入对象
     // （null→NewNull，string 过 T_Str，类嵌套调 T_）。List 元素
     // 种类读 FElemName/FElemKind。
-    static void GenFieldT(StringBuilder out0, int fk, string fname, string tname) {
+    static void GenFieldT(StringBuilder out0, int fk, string fname, string jsonKey, string tname) {
         if (fk == 3) {
-            out0.Append("        v.Put(\"" + fname + "\", __JsonBind.T_Num(o." + fname + "));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", __JsonBind.T_Num(o." + fname + "));\n");
         } else if (fk == 1 || fk == 2) {
-            out0.Append("        v.Put(\"" + fname + "\", JsonValue.NewNum(Convert.ToString(o." + fname + ")));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", JsonValue.NewNum(Convert.ToString(o." + fname + ")));\n");
         } else if (fk == 7) {
-            out0.Append("        v.Put(\"" + fname + "\", JsonValue.NewNum(Convert.ToString((int)o." + fname + ")));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", JsonValue.NewNum(Convert.ToString((int)o." + fname + ")));\n");
         } else if (fk == 4) {
-            out0.Append("        v.Put(\"" + fname + "\", JsonValue.NewBool(o." + fname + "));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", JsonValue.NewBool(o." + fname + "));\n");
         } else if (fk == 5) {
-            out0.Append("        v.Put(\"" + fname + "\", __JsonBind.T_Str(o." + fname + "));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", __JsonBind.T_Str(o." + fname + "));\n");
         } else if (fk == 6) {
-            out0.Append("        v.Put(\"" + fname + "\", __JsonBind.T_Jv(o." + fname + "));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", __JsonBind.T_Jv(o." + fname + "));\n");
         } else if (fk == 8) {
-            out0.Append("        v.Put(\"" + fname + "\", __JsonBind.T_" + tname + "(o." + fname + "));\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", __JsonBind.T_" + tname + "(o." + fname + "));\n");
         } else if (fk == 9) {
             string elem = GenJson.FElemName;
             int ek = GenJson.FElemKind;
@@ -483,7 +584,7 @@ class GenJson {
             out0.Append("                i_" + fname + " = i_" + fname + " + 1;\n");
             out0.Append("            }\n");
             out0.Append("        }\n");
-            out0.Append("        v.Put(\"" + fname + "\", a_" + fname + ");\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", a_" + fname + ");\n");
         } else if (fk == 10) {
             string elem = GenJson.FElemName;
             int ek = GenJson.FElemKind;
@@ -513,7 +614,7 @@ class GenJson {
             out0.Append("                i_" + fname + " = i_" + fname + " + 1;\n");
             out0.Append("            }\n");
             out0.Append("        }\n");
-            out0.Append("        v.Put(\"" + fname + "\", a_" + fname + ");\n");
+            out0.Append("        v.Put(\"" + jsonKey + "\", a_" + fname + ");\n");
         }
     }
 
