@@ -3167,7 +3167,8 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
     }
     case TYPE_STRUCT:
     case TYPE_CLASS: {
-        if (type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0)
+        if ((type->name.len == 4 && memcmp(type->name.str, "Span", 4) == 0) ||
+            (type->name.len == 12 && memcmp(type->name.str, "ReadOnlySpan", 12) == 0))
             return g->span_struct_type;
         for (int i = 0; i < g->struct_type_count; i++) {
             if (g->struct_types[i].sym == type->sym) {

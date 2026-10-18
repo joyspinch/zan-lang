@@ -421,6 +421,12 @@ static LLVMValueRef nm_copy2d_fn(zan_irgen_t *g) {
     return fn;
 }
 
+static LLVMTypeRef span_elem_storage_type(zan_irgen_t *g, zan_type_t *elem_type) {
+    if (!elem_type) return LLVMInt32TypeInContext(g->ctx);
+    if (elem_type->kind == TYPE_CHAR) return LLVMInt8TypeInContext(g->ctx);
+    return map_type(g, elem_type);
+}
+
 /* Span<T> 原语：将切片操作降解为 { i8* base, i64 len } 胖指针视图 */
 static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
                            local_scope_t *locals, LLVMValueRef *out) {
@@ -432,11 +438,23 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     if (mm.len == 6 && memcmp(mm.str, "AsSpan", 6) == 0) {
         zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
-        if (!ot || ot->kind != TYPE_ARRAY || !ot->element_type) return false;
-        LLVMValueRef arr = emit_expr(g, callee->member.object, locals);
-        LLVMValueRef base = LLVMBuildBitCast(g->builder, arr, i8ptr, "span.base");
-        LLVMValueRef len = zan_array_len(g, arr);
-        LLVMTypeRef elem_llvm = map_type(g, ot->element_type);
+        if (!ot) return false;
+        LLVMValueRef base = NULL;
+        LLVMValueRef len = NULL;
+        LLVMTypeRef elem_llvm = NULL;
+        if (ot->kind == TYPE_ARRAY && ot->element_type) {
+            LLVMValueRef arr = emit_expr(g, callee->member.object, locals);
+            base = LLVMBuildBitCast(g->builder, arr, i8ptr, "span.base");
+            len = zan_array_len(g, arr);
+            elem_llvm = span_elem_storage_type(g, ot->element_type);
+        } else if (ot->kind == TYPE_STRING) {
+            LLVMValueRef sobj = emit_expr(g, callee->member.object, locals);
+            base = emit_str_nonnull(g, sobj);
+            len = emit_string_length(g, base, callee->loc);
+            elem_llvm = span_elem_storage_type(g, g->binder->type_char);
+        } else {
+            return false;
+        }
         if (expr->call.args.count >= 1) {
             LLVMValueRef start = coerce_int_to(g,
                 emit_expr(g, expr->call.args.items[0], locals), i64t);
@@ -460,8 +478,7 @@ static bool emit_span_call(zan_irgen_t *g, zan_ast_node_t *expr,
         zan_type_t *ot = infer_expr_type(g, callee->member.object, locals);
         if (!is_span_type(ot) || expr->call.args.count < 1) return false;
         zan_type_t *elem = container_elem_type(ot);
-        LLVMTypeRef elem_llvm = elem ? map_type(g, elem)
-                                     : LLVMInt32TypeInContext(g->ctx);
+        LLVMTypeRef elem_llvm = span_elem_storage_type(g, elem);
         LLVMValueRef span_val = emit_expr(g, callee->member.object, locals);
         LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "sl.base");
         LLVMValueRef len = LLVMBuildExtractValue(g->builder, span_val, 1, "sl.len");
@@ -5002,7 +5019,7 @@ static LLVMValueRef emit_struct_elem_ptr(zan_irgen_t *g, zan_ast_node_t *expr,
         emit_index_bounds_check(g, idx, slen, expr->loc, "span");
         idx = emit_index_safe_bounds(g, idx, slen, expr->loc, "span");
         zan_type_t *et = container_elem_type(bt);
-        LLVMTypeRef etl = et ? map_type(g, et) : i64;
+        LLVMTypeRef etl = span_elem_storage_type(g, et);
         LLVMValueRef typed = LLVMBuildBitCast(g->builder, sbase,
             LLVMPointerType(etl, 0), "spp");
         LLVMValueRef ep = LLVMBuildGEP2(g->builder, etl, typed, &idx, 1, "ep");
@@ -5265,8 +5282,7 @@ binding_lowered:
                 zan_type_t *sot = infer_expr_type(g, arr_expr, locals);
                 if (is_span_type(sot)) {
                     zan_type_t *et = container_elem_type(sot);
-                    LLVMTypeRef elem_llvm = et ? map_type(g, et)
-                        : LLVMInt32TypeInContext(g->ctx);
+                    LLVMTypeRef elem_llvm = span_elem_storage_type(g, et);
                     LLVMValueRef span_val = emit_expr(g, arr_expr, locals);
                     LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "sps.base");
                     LLVMValueRef typed = LLVMBuildBitCast(g->builder, base,
@@ -7272,8 +7288,7 @@ static LLVMValueRef emit_expr_index(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_type_t *sot = infer_expr_type(g, expr->index.object, locals);
             if (is_span_type(sot)) {
                 zan_type_t *et = container_elem_type(sot);
-                LLVMTypeRef elem_llvm = et ? map_type(g, et)
-                    : LLVMInt32TypeInContext(g->ctx);
+                LLVMTypeRef elem_llvm = span_elem_storage_type(g, et);
                 LLVMValueRef span_val = emit_expr(g, expr->index.object, locals);
                 LLVMValueRef base = LLVMBuildExtractValue(g->builder, span_val, 0, "spx.base");
                 LLVMValueRef typed = LLVMBuildBitCast(g->builder, base,

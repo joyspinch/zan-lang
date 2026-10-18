@@ -512,8 +512,10 @@ static zan_type_t *container_elem_type(zan_type_t *t) {
 }
 
 static int is_span_type(zan_type_t *t) {
-    return t && t->kind == TYPE_STRUCT && t->name.len == 4 &&
-           memcmp(t->name.str, "Span", 4) == 0;
+    if (!t || t->kind != TYPE_STRUCT) return 0;
+    if (t->name.len == 4 && memcmp(t->name.str, "Span", 4) == 0) return 1;
+    if (t->name.len == 12 && memcmp(t->name.str, "ReadOnlySpan", 12) == 0) return 1;
+    return 0;
 }
 
 static zan_type_t *dict_key_type(zan_irgen_t *g, zan_type_t *t) {
@@ -1665,6 +1667,8 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_type_t *aot = infer_expr_type(g, callee->member.object, locals);
                 if (aot && aot->kind == TYPE_ARRAY && aot->element_type)
                     return zan_binder_make_span_type(g->binder, aot->element_type);
+                if (aot && aot->kind == TYPE_STRING)
+                    return zan_binder_make_readonly_span_type(g->binder, g->binder->type_char);
                 if (is_span_type(aot)) return aot;
             }
             if (mm.len == 5 && memcmp(mm.str, "Slice", 5) == 0) {

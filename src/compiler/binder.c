@@ -456,6 +456,15 @@ zan_type_t *zan_binder_make_span_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+zan_type_t *zan_binder_make_readonly_span_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_STRUCT, "ReadOnlySpan", 12);
+    t->type_args =
+        (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
+    t->type_args[0] = elem;
+    t->type_arg_count = 1;
+    return t;
+}
+
 zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem) {
     zan_type_t *t = make_type(b->arena, TYPE_ARRAY, elem->name.str, elem->name.len);
     t->element_type = elem;
@@ -768,6 +777,8 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         base = make_type(b->arena, TYPE_CLASS, "StringBuilder", 13);
     else if (istr_eq(name, "Span", 4))
         base = make_type(b->arena, TYPE_STRUCT, "Span", 4);
+    else if (istr_eq(name, "ReadOnlySpan", 12))
+        base = make_type(b->arena, TYPE_STRUCT, "ReadOnlySpan", 12);
     else if (istr_eq(name, "TypeInfo", 8)) base = b->type_typeinfo;
     else if (istr_eq(name, "Task", 4))
         base = make_type(b->arena, TYPE_TASK, "Task", 4);
@@ -814,6 +825,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
     if (type_ref->type_ref.type_args.count > 0) {
         bool builtin_generic = istr_eq(name, "List", 4) || istr_eq(name, "Dict", 4) ||
                                istr_eq(name, "Dictionary", 10) || istr_eq(name, "Span", 4) ||
+                               istr_eq(name, "ReadOnlySpan", 12) ||
                                istr_eq(name, "Task", 4);
         bool user_generic = !builtin_generic &&
             (base->kind == TYPE_CLASS || base->kind == TYPE_STRUCT ||
@@ -821,7 +833,7 @@ zan_type_t *zan_binder_resolve_type(zan_binder_t *b, zan_ast_node_t *type_ref) {
         if (builtin_generic || user_generic) {
             int nargs = type_ref->type_ref.type_args.count;
             int expected_tps = -1;
-            if (istr_eq(name, "List", 4) || istr_eq(name, "Span", 4) || istr_eq(name, "Task", 4))
+            if (istr_eq(name, "List", 4) || istr_eq(name, "Span", 4) || istr_eq(name, "ReadOnlySpan", 12) || istr_eq(name, "Task", 4))
                 expected_tps = 1;
             else if (istr_eq(name, "Dict", 4) || istr_eq(name, "Dictionary", 10))
                 expected_tps = 2;

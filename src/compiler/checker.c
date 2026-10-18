@@ -23,6 +23,20 @@ static zan_type_t *builtin_call_result_type(zan_checker_t *c,
     else if (recv->kind == TYPE_CLASS && recv->name.len == 13 &&
              memcmp(recv->name.str, "StringBuilder", 13) == 0)
         bt = "StringBuilder";
+    if (recv->kind == TYPE_STRING && name.len == 6 &&
+        memcmp(name.str, "AsSpan", 6) == 0) {
+        return zan_binder_make_readonly_span_type(c->binder, c->binder->type_char);
+    }
+    if (recv->kind == TYPE_ARRAY && recv->element_type && name.len == 6 &&
+        memcmp(name.str, "AsSpan", 6) == 0) {
+        return zan_binder_make_span_type(c->binder, recv->element_type);
+    }
+    if (recv->kind == TYPE_STRUCT &&
+        ((recv->name.len == 4 && memcmp(recv->name.str, "Span", 4) == 0) ||
+         (recv->name.len == 12 && memcmp(recv->name.str, "ReadOnlySpan", 12) == 0)) &&
+        name.len == 5 && memcmp(name.str, "Slice", 5) == 0) {
+        return recv;
+    }
     if (!bt) return NULL;
     if (zan_builtin_member_kind(bt, name.str, (int)name.len) != 'M') return NULL;
     const char *res = zan_builtin_member_result(bt, name.str, (int)name.len);
@@ -300,6 +314,15 @@ static zan_symbol_t *assign_target_field(zan_checker_t *c, zan_ast_node_t *lhs,
 }
 
 static void check_readonly_assignment(zan_checker_t *c, zan_ast_node_t *expr) {
+    if (expr && expr->binary.left && expr->binary.left->kind == AST_INDEX) {
+        zan_type_t *obj = zan_checker_check_expr(c, expr->binary.left->index.object);
+        if (obj && obj->kind == TYPE_STRUCT && obj->name.len == 12 &&
+            memcmp(obj->name.str, "ReadOnlySpan", 12) == 0) {
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "cannot assign to indexing expression of ReadOnlySpan");
+            return;
+        }
+    }
     if (expr && expr->binary.left && expr->binary.left->kind == AST_IDENTIFIER &&
         checker_find_local(c, expr->binary.left->ident.name))
         return;
@@ -386,6 +409,9 @@ static zan_type_t *checker_assignment_target_type(zan_checker_t *c,
         if (obj && obj->kind == TYPE_STRING) return c->binder->type_char;
         if (obj && obj->kind == TYPE_CLASS && obj->type_arg_count == 1 &&
             obj->name.len == 4 && memcmp(obj->name.str, "List", 4) == 0)
+            return obj->type_args[0];
+        if (obj && obj->kind == TYPE_STRUCT && obj->type_arg_count == 1 &&
+            obj->name.len == 4 && memcmp(obj->name.str, "Span", 4) == 0)
             return obj->type_args[0];
     }
     return NULL;
@@ -1128,6 +1154,35 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
                 !checker_type_equal(target, value))
                 return true;
             return checker_type_derives_from(value, target);
+        }
+        return false;
+    case TYPE_STRUCT:
+        if (target->name.len == 12 && memcmp(target->name.str, "ReadOnlySpan", 12) == 0) {
+            zan_type_t *te = (target->type_args && target->type_arg_count > 0) ? target->type_args[0] : NULL;
+            if (value->kind == TYPE_STRUCT &&
+                ((value->name.len == 4 && memcmp(value->name.str, "Span", 4) == 0) ||
+                 (value->name.len == 12 && memcmp(value->name.str, "ReadOnlySpan", 12) == 0))) {
+                zan_type_t *ve = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                if (te && ve && checker_type_equal(te, ve)) return true;
+            }
+            if (value->kind == TYPE_ARRAY && value->element_type && te &&
+                checker_type_equal(te, value->element_type)) return true;
+            if (value->kind == TYPE_STRING && te &&
+                (te->kind == TYPE_CHAR || te->kind == TYPE_BYTE)) return true;
+        }
+        if (target->name.len == 4 && memcmp(target->name.str, "Span", 4) == 0) {
+            zan_type_t *te = (target->type_args && target->type_arg_count > 0) ? target->type_args[0] : NULL;
+            if (value->kind == TYPE_STRUCT && value->name.len == 4 &&
+                memcmp(value->name.str, "Span", 4) == 0) {
+                zan_type_t *ve = (value->type_args && value->type_arg_count > 0) ? value->type_args[0] : NULL;
+                if (te && ve && checker_type_equal(te, ve)) return true;
+            }
+            if (value->kind == TYPE_ARRAY && value->element_type && te &&
+                checker_type_equal(te, value->element_type)) return true;
+        }
+        if (value->kind == TYPE_STRUCT) {
+            if (target->sym && value->sym && target->sym == value->sym) return true;
+            if (same_generic_container(target, value) && checker_type_equal(target, value)) return true;
         }
         return false;
     case TYPE_ARRAY:
@@ -2563,6 +2618,13 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 zan_checker_check_expr(c, expr->index.extra.items[i]);
             return c->binder->type_char;
         }
+        if (obj->kind == TYPE_STRUCT && obj->name.len == 4 &&
+            memcmp(obj->name.str, "Span", 4) == 0) {
+            for (int i = 0; i < expr->index.extra.count; i++)
+                zan_checker_check_expr(c, expr->index.extra.items[i]);
+            return (obj->type_args && obj->type_arg_count > 0)
+                ? obj->type_args[0] : c->binder->type_int;
+        }
         return c->binder->type_error;
     }
 
@@ -3635,6 +3697,15 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         if (rt) return rt;
     }
     if (obj_type && obj_type->kind == TYPE_ARRAY) {
+        bool is_len = expr->member.name.len == 6 &&
+            memcmp(expr->member.name.str, "Length", 6) == 0;
+        bool is_cnt = expr->member.name.len == 5 &&
+            memcmp(expr->member.name.str, "Count", 5) == 0;
+        if (is_len || is_cnt) return c->binder->type_int;
+    }
+    if (obj_type && obj_type->kind == TYPE_STRUCT &&
+        ((obj_type->name.len == 4 && memcmp(obj_type->name.str, "Span", 4) == 0) ||
+         (obj_type->name.len == 12 && memcmp(obj_type->name.str, "ReadOnlySpan", 12) == 0))) {
         bool is_len = expr->member.name.len == 6 &&
             memcmp(expr->member.name.str, "Length", 6) == 0;
         bool is_cnt = expr->member.name.len == 5 &&
