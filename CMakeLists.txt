@@ -658,6 +658,22 @@ else()
     target_link_libraries(zan-dap PRIVATE m)
 endif()
 
+# ---- Package Manager (zan-pm) ----
+# Standalone CLI package manager for the Zan language ecosystem.
+add_executable(zan-pm
+    src/pm/pm_main.c
+    src/compiler/package.c
+    src/compiler/arena.c
+    src/common/json.c
+)
+target_include_directories(zan-pm PRIVATE src/compiler src/common src/pm)
+if(MSVC)
+    target_compile_definitions(zan-pm PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+if(NOT WIN32)
+    target_link_libraries(zan-pm PRIVATE m)
+endif()
+
 
 # ---- Independent native GUI / image / audio / game drivers ----
 # GUI owns the windowing shell and base drawing context. Image decoding/cache
@@ -1032,6 +1048,13 @@ file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/_scratch")
 add_test(NAME unit_package_namespace
     COMMAND zan_package_namespace_test "${CMAKE_SOURCE_DIR}/_scratch")
 set_tests_properties(unit_package_namespace PROPERTIES TIMEOUT 30)
+
+add_test(NAME unit_zan_pm_cli
+    COMMAND ${CMAKE_COMMAND}
+      -DZAN_PM=$<TARGET_FILE:zan-pm>
+      -DWORK_DIR=${CMAKE_SOURCE_DIR}/_scratch/test_pm_cli
+      -P ${CMAKE_SOURCE_DIR}/tests/run_pm_cli.cmake)
+set_tests_properties(unit_zan_pm_cli PROPERTIES TIMEOUT 30)
 
 # A design doc node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
