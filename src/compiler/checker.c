@@ -3440,6 +3440,30 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                 }
             }
         }
+
+        if (sw_type && sw_type->kind == TYPE_BOOL && !seen_wildcard) {
+            bool has_true = false;
+            bool has_false = false;
+            for (int ci = 0; ci < stmt->switch_stmt.cases.count; ci++) {
+                zan_ast_node_t *sc = stmt->switch_stmt.cases.items[ci];
+                if (sc->switch_case.pattern && sc->switch_case.when_cond == NULL) {
+                    zan_ast_node_t *pat = sc->switch_case.pattern;
+                    while (pat && pat->kind == AST_CAST_EXPR) pat = pat->cast.expr;
+                    if (pat && pat->kind == AST_BOOL_LITERAL) {
+                        if (pat->bool_val) has_true = true;
+                        else has_false = true;
+                    }
+                }
+            }
+            if (!has_true) {
+                zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                              "switch statement on bool does not handle 'true' case; add missing case or default label");
+            }
+            if (!has_false) {
+                zan_diag_emit(c->diag, DIAG_WARNING, stmt->loc,
+                              "switch statement on bool does not handle 'false' case; add missing case or default label");
+            }
+        }
         break;
     }
 
