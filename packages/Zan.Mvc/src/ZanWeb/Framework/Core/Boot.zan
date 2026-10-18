@@ -13,6 +13,17 @@ namespace ZanWeb.Core;
    只存在于应用内，框架经此挂点执行注册而不感知具体路由表。 */
 public delegate void RouteFn(WebApp app);
 
+/* 项目侧业务种子委托：Schema 就绪后、服务器启动前执行一次——业务表建表、
+   种子数据、旧库数据迁移等。异步方法（async bool）经 async delegate 回调，
+   注册：Boot.OnSeed(Program.Seed)。回调内经 AppServices.Current().Db()
+   借还连接；返回 false 只记账不阻断启动（与 Schema 失败同语义）。 */
+public async delegate bool SeedFn();
+
+/* 项目侧 WebApp 接线委托：Boot 装配完标准件（解析器/静态挂载/中间件）
+   之后、路由注册之前调用——应用侧追加全局中间件、替换解析器、挂业务
+   通道等最后接线位。注册：Boot.OnApp(Program.Wire)。 */
+public delegate void AppFn(WebApp app);
+
 /* ZanWeb 应用引导：配置、日志、连接池、缓存、Schema 迁移、WebApp 装配、
    中间件、指标、集群总线、任务调度、路由授权、接口文档与服务器生命周期
    全部在此收口。应用侧 main.zan 只做三件事：声明业务菜单分组、注册路由
@@ -31,6 +42,20 @@ public class Boot {
        Boot.OnRoutes(Program.RegisterRoutes); */
     public static void OnRoutes(RouteFn fn) {
         routes = fn;
+    }
+
+    /* 业务种子挂点：调用时机见 SeedFn 注释。 */
+    static SeedFn seedFn;
+
+    public static void OnSeed(SeedFn fn) {
+        seedFn = fn;
+    }
+
+    /* WebApp 应用侧接线挂点：调用时机见 AppFn 注释。 */
+    static AppFn appFn;
+
+    public static void OnApp(AppFn fn) {
+        appFn = fn;
     }
 
     /* 引导并运行服务器；返回值即进程退出码（start/stop/restart 命令语义）。 */
@@ -97,6 +122,20 @@ public class Boot {
                 + " process is restarted");
             Console.WriteLine("[db] schema unavailable after retries --"
                 + " see error log");
+        }
+
+        /* 业务种子：schema 就绪后执行一次（业务建表/种子/旧库迁移）。
+           失败只记账不阻断启动——种子多数可幂等重试，应用日志可查。 */
+        if (ready && seedFn != null) {
+            try {
+                bool seeded = await seedFn();
+                if (!seeded) {
+                    Log.Error("[seed] business seed reported failure"
+                        + " -- check app log");
+                }
+            } catch (Exception seedError) {
+                Log.Error("[seed] business seed hook failed");
+            }
         }
 
         WebApp app = new WebApp(Cfg.Server.host, Cfg.Server.port);
@@ -187,6 +226,9 @@ public class Boot {
         }
 
         /* 路由：编译期从控制器属性生成，运行时只执行注册（挂点由应用侧注册） */
+        if (appFn != null) {
+            appFn(app);
+        }
         if (routes != null) {
             routes(app);
         }
