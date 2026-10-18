@@ -331,6 +331,15 @@ static int run_basic(const char *dap_exe, const char *target, const char *source
     dap_send(&c, body);
     check(wait_response(&c, "evaluate", msg, sizeof(msg)), "evaluate response");
 
+    /* heapSnapshot */
+    snprintf(body, sizeof(body),
+             "{\"seq\":%d,\"type\":\"request\",\"command\":\"zan/heapSnapshot\"}",
+             ++g_seq);
+    dap_send(&c, body);
+    check(wait_response(&c, "zan/heapSnapshot", msg, sizeof(msg)), "zan/heapSnapshot response");
+    check(strstr(msg, "\"summary\"") != NULL, "heapSnapshot summary present");
+    check(strstr(msg, "\"nodes\"") != NULL, "heapSnapshot nodes present");
+
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"next\","
              "\"arguments\":{\"threadId\":1}}", ++g_seq);
@@ -378,7 +387,7 @@ static int run_hitcount(const char *dap_exe, const char *burn, const char *burn_
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
              "\"arguments\":{\"source\":{\"path\":\"%s\"},"
-             "\"breakpoints\":[{\"line\":15,\"hitCondition\":\"==1000\"}]}}",
+             "\"breakpoints\":[{\"line\":8,\"hitCondition\":\"==1000\"}]}}",
              ++g_seq, burn_src);
     dap_send(&c, body);
     check(wait_response(&c, "setBreakpoints", msg, sizeof(msg)),
@@ -430,7 +439,7 @@ static int run_logpoint(const char *dap_exe, const char *burn, const char *burn_
     snprintf(body, sizeof(body),
              "{\"seq\":%d,\"type\":\"request\",\"command\":\"setBreakpoints\","
              "\"arguments\":{\"source\":{\"path\":\"%s\"},"
-             "\"breakpoints\":[{\"line\":30,\"logMessage\":\"tick outer={outer}\"}]}}",
+             "\"breakpoints\":[{\"line\":23,\"logMessage\":\"tick outer={outer}\"}]}}",
              ++g_seq, burn_src);
     dap_send(&c, body);
     check(wait_response(&c, "setBreakpoints", msg, sizeof(msg)),

@@ -574,6 +574,98 @@ static void handle_exception_info(dap_t *d, json_value *request) {
     dap_send_response(d, request, true, body);
 }
 
+static void handle_heap_snapshot(dap_t *d, json_value *request) {
+    if (d->dbg.state == DBG_PAUSED || d->dbg.state == DBG_RUNNING) {
+        dbg_refresh_locals(&d->dbg);
+        dbg_refresh_callstack(&d->dbg);
+    }
+
+    json_value *nodes = json_new_arr();
+    json_value *edges = json_new_arr();
+
+    int next_node_id = 1;
+    int root_count = 0;
+    int edge_count = 0;
+
+    for (int i = 0; i < d->dbg.local_count; i++) {
+        dbg_local_t *loc = &d->dbg.locals[i];
+        int node_id = next_node_id++;
+        root_count++;
+
+        json_value *node = json_new_obj();
+        json_obj_set(node, "id", json_new_num(node_id));
+        json_obj_set(node, "name", json_new_str(loc->name));
+        json_obj_set(node, "type", json_new_str(loc->type));
+        json_obj_set(node, "value", json_new_str(loc->value));
+        json_obj_set(node, "kind", json_new_str("local"));
+        json_obj_set(node, "hasChildren", json_new_bool(loc->has_children));
+        json_arr_add(nodes, node);
+
+        if (loc->has_children) {
+            dbg_var_t kids[64];
+            int n = dbg_expand_variables(&d->dbg, i + 3000, kids, 64);
+            for (int k = 0; k < n; k++) {
+                int child_id = next_node_id++;
+                json_value *cnode = json_new_obj();
+                json_obj_set(cnode, "id", json_new_num(child_id));
+                json_obj_set(cnode, "name", json_new_str(kids[k].name));
+                json_obj_set(cnode, "type", json_new_str(kids[k].type));
+                json_obj_set(cnode, "value", json_new_str(kids[k].value));
+                json_obj_set(cnode, "kind", json_new_str("field"));
+                json_obj_set(cnode, "hasChildren", json_new_bool(kids[k].expand_ref != 0));
+                json_arr_add(nodes, cnode);
+
+                json_value *edge = json_new_obj();
+                json_obj_set(edge, "source", json_new_num(node_id));
+                json_obj_set(edge, "target", json_new_num(child_id));
+                json_obj_set(edge, "field", json_new_str(kids[k].name));
+                json_arr_add(edges, edge);
+                edge_count++;
+            }
+        }
+    }
+
+    if (d->dbg.watch_count > 0) {
+        dbg_evaluate_watches(&d->dbg);
+        for (int i = 0; i < d->dbg.watch_count; i++) {
+            dbg_watch_t *w = &d->dbg.watches[i];
+            int node_id = next_node_id++;
+            json_value *node = json_new_obj();
+            json_obj_set(node, "id", json_new_num(node_id));
+            json_obj_set(node, "name", json_new_str(w->expression));
+            json_obj_set(node, "type", json_new_str(w->type[0] ? w->type : "unknown"));
+            json_obj_set(node, "value", json_new_str(w->value));
+            json_obj_set(node, "kind", json_new_str("watch"));
+            json_obj_set(node, "hasChildren", json_new_bool(w->has_children));
+            json_arr_add(nodes, node);
+        }
+    }
+
+    const char *state_str = "idle";
+    switch (d->dbg.state) {
+        case DBG_IDLE: state_str = "idle"; break;
+        case DBG_RUNNING: state_str = "running"; break;
+        case DBG_PAUSED: state_str = "paused"; break;
+        case DBG_STEPPING: state_str = "stepping"; break;
+        case DBG_TERMINATED: state_str = "terminated"; break;
+    }
+
+    json_value *summary = json_new_obj();
+    json_obj_set(summary, "state", json_new_str(state_str));
+    json_obj_set(summary, "nodeCount", json_new_num(next_node_id - 1));
+    json_obj_set(summary, "edgeCount", json_new_num(edge_count));
+    json_obj_set(summary, "rootCount", json_new_num(root_count));
+    json_obj_set(summary, "callstackDepth", json_new_num(d->dbg.callstack_depth));
+    json_obj_set(summary, "threadId", json_new_num(d->dbg.current_thread));
+
+    json_value *body = json_new_obj();
+    json_obj_set(body, "summary", summary);
+    json_obj_set(body, "nodes", nodes);
+    json_obj_set(body, "edges", edges);
+
+    dap_send_response(d, request, true, body);
+}
+
 static void handle_continue(dap_t *d, json_value *request) {
     json_value *body = json_new_obj();
     json_obj_set(body, "allThreadsContinued", json_new_bool(true));
@@ -764,6 +856,7 @@ static void dispatch(dap_t *d, json_value *request) {
     else if (strcmp(cmd, "stepIn") == 0)            handle_step_in(d, request);
     else if (strcmp(cmd, "stepOut") == 0)           handle_step_out(d, request);
     else if (strcmp(cmd, "pause") == 0)             handle_pause(d, request);
+    else if (strcmp(cmd, "zan/heapSnapshot") == 0 || strcmp(cmd, "heapSnapshot") == 0) handle_heap_snapshot(d, request);
     else if (strcmp(cmd, "terminate") == 0)         handle_disconnect(d, request);
     else if (strcmp(cmd, "disconnect") == 0)        handle_disconnect(d, request);
     else                                            dap_send_response(d, request, true, NULL);

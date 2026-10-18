@@ -900,6 +900,34 @@ add_test(NAME runtime_io_addr COMMAND zanrt_io_addr_test)
 set_tests_properties(runtime_io_addr PROPERTIES TIMEOUT 30)
 add_dependencies(zanc zanrt_io_addr_test)
 
+# M:N coroutine scheduler + runtime verification
+add_executable(zanrt_sched_test
+    tests/runtime/rt_test.c
+    src/runtime/rt_sched.c
+    src/runtime/rt_io.c
+    src/runtime/rt_co.c
+    src/runtime/rt_timer.c
+    src/runtime/rt_mem.c
+)
+target_include_directories(zanrt_sched_test PRIVATE ${CMAKE_SOURCE_DIR})
+set_target_properties(zanrt_sched_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(NOT WIN32)
+    target_compile_definitions(zanrt_sched_test PRIVATE _GNU_SOURCE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(zanrt_sched_test PRIVATE Threads::Threads m)
+    if(NOT APPLE)
+        target_link_libraries(zanrt_sched_test PRIVATE rt)
+    endif()
+else()
+    target_link_libraries(zanrt_sched_test PRIVATE ws2_32 mswsock)
+endif()
+add_test(NAME runtime_sched COMMAND zanrt_sched_test)
+set_tests_properties(runtime_sched PROPERTIES TIMEOUT 60)
+add_dependencies(zanc zanrt_sched_test)
+
 # A hung-up peer (a closed SSE tab) must not kill the process with SIGPIPE.
 # POSIX only: Windows has no such signal.
 if(NOT WIN32)
