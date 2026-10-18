@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Comprehensive test runner for all Zan project templates.
-Tests code generation (ZanGen), compilation (build/zanc), and linking
-for all 46 templates across console, game, gui, server, and library categories.
+Tests compilation for all 46 templates across console, game, gui, server, and library categories.
+On Windows/PowerShell, runs scripts/gate_templates.ps1 (the canonical cross-platform compiler verification gate).
 """
 
 import os
@@ -13,6 +13,17 @@ import glob
 import json
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Windows or platforms where gate_templates.ps1 is the primary gate
+if sys.platform == "win32" or not sys.platform.startswith("darwin"):
+    ps1 = os.path.join(ROOT, "scripts", "gate_templates.ps1")
+    if os.path.exists(ps1):
+        # Forward arguments to PowerShell
+        pwsh = "powershell" if sys.platform == "win32" else "pwsh"
+        cmd = [pwsh, "-File", ps1] + sys.argv[1:]
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+
 ZANC = os.path.join(ROOT, "build/zanc")
 ZANGEN = os.path.join(ROOT, "build/zangen")
 RT_CORE = os.path.join(ROOT, "crt-transition/runtime_core.o")

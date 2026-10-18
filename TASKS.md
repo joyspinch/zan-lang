@@ -8,9 +8,4 @@
 
 ## 未完成
 
-- [ ] **A376 模板验收门缺跨平台官方入口**
-  证据：`scripts/test_all_templates.py` 硬编码 `/Users/qq` 与
-  `libzan_gui.dylib`，并依赖 `build/zangen`（源仓库构建目录没有）。
-  现状：`tools/agent/gate-templates.ps1` 是 Windows 等价物（按
-  `template.manifest` + `zan.proj` 的声明做替换副本，46 个模板全量可跑）。
-  修点：官方脚本走平台探测，或把 Windows 侧纳入 `scripts/` 统一入口。
+（当前已全部闭账）
