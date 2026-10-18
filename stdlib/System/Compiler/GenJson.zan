@@ -269,6 +269,66 @@ class GenJson {
         return defName;
     }
 
+    // 判断字段/属性是否带有 [JsonRequired] 特性。
+    static bool IsRequired(JsonValue m) {
+        if (m == null) { return false; }
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return false; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            string aname = a.Str("name", "");
+            int dot = aname.LastIndexOf(".");
+            if (dot >= 0) { aname = aname.Substring(dot + 1); }
+            if (aname == "JsonRequired" || aname == "JsonRequiredAttribute") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 获取字段/属性在 [JsonDefault(val)] 中指定的默认值表达式代码；若未指定则返回 ""。
+    static string GetJsonDefault(JsonValue m, int fk) {
+        if (m == null) { return ""; }
+        JsonValue attrs = m.Get("attrs");
+        if (attrs == null || !attrs.IsArray()) { return ""; }
+        for (int i = 0; i < attrs.Count(); i = i + 1) {
+            JsonValue a = attrs.At(i);
+            if (a == null) { continue; }
+            string aname = a.Str("name", "");
+            int dot = aname.LastIndexOf(".");
+            if (dot >= 0) { aname = aname.Substring(dot + 1); }
+            if (aname == "JsonDefault" || aname == "JsonDefaultAttribute") {
+                JsonValue args = a.Get("args");
+                if (args != null && args.IsArray() && args.Count() > 0) {
+                    JsonValue arg0 = args.At(0);
+                    if (arg0 != null) {
+                        if (arg0.IsObject() && arg0.Str("k", "") == "assign") {
+                            arg0 = arg0.Get("r");
+                        }
+                        if (arg0 != null) {
+                            if (fk == 5) {
+                                string s = arg0.Str("v", "");
+                                if (s.Length == 0 && arg0.IsString()) { s = arg0.AsString(""); }
+                                return "\"" + s + "\"";
+                            } else if (fk == 4) {
+                                if (arg0.IsBool()) { return arg0.AsBool(false) ? "true" : "false"; }
+                                string bv = arg0.Str("v", "");
+                                if (bv == "true" || bv == "1") { return "true"; }
+                                return "false";
+                            } else {
+                                string nv = arg0.Str("v", "");
+                                if (nv.Length > 0) { return nv; }
+                                if (arg0.IsNumber()) { return Convert.ToString(arg0.AsLong(0)); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return "";
+    }
+
     // 2 = writer(entity -> JSON 文本,emitted 计数字段数跨基类递归)。
     // 返回新的 emitted(仅 mode 2 有意义)。
     static int GenFields(StringBuilder out0, string cls, int mode, int depth,
@@ -319,7 +379,7 @@ class GenJson {
                     emitted = emitted + 1;
                     GenJson.GenFieldW(out0, fk, fname, tname);
                 } else if (mode == 1) {
-                    GenJson.GenFieldB(out0, fk, fname, jsonKey, tname);
+                    GenJson.GenFieldB(out0, fk, fname, jsonKey, tname, f);
                 } else {
                     GenJson.GenFieldT(out0, fk, fname, jsonKey, tname);
                 }
@@ -359,7 +419,7 @@ class GenJson {
                     emitted = emitted + 1;
                     GenJson.GenFieldW(out0, fk, pname, tname);
                 } else if (mode == 1) {
-                    GenJson.GenFieldB(out0, fk, pname, jsonKey, tname);
+                    GenJson.GenFieldB(out0, fk, pname, jsonKey, tname, p);
                 } else {
                     GenJson.GenFieldT(out0, fk, pname, jsonKey, tname);
                 }
@@ -466,19 +526,29 @@ class GenJson {
     // binder（mode 1）字段行：从 JsonValue 宽容地读回字段
     // （缺键取类型缺省值；枚举按 int 直赋）。List 字段遇非数组的
     // 单个值时也接受，包装成单元素列表。
-    static void GenFieldB(StringBuilder out0, int fk, string fname, string jsonKey, string tname) {
+    static void GenFieldB(StringBuilder out0, int fk, string fname, string jsonKey, string tname, JsonValue m) {
+        if (GenJson.IsRequired(m)) {
+            out0.Append("        if (!v.Has(\"" + jsonKey + "\")) { throw new Exception(\"Missing required JSON property: " + jsonKey + "\"); }\n");
+        }
+        string dflt = GenJson.GetJsonDefault(m, fk);
         if (fk == 1) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Int(\"" + jsonKey + "\", 0);\n");
+            string defVal = (dflt.Length > 0) ? dflt : "0";
+            out0.Append("        o." + fname + " = (" + tname + ")v.Int(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 2) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Long(\"" + jsonKey + "\", 0);\n");
+            string defVal = (dflt.Length > 0) ? dflt : "0";
+            out0.Append("        o." + fname + " = (" + tname + ")v.Long(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 7) {
-            out0.Append("        o." + fname + " = v.Int(\"" + jsonKey + "\", 0);\n");
+            string defVal = (dflt.Length > 0) ? dflt : "0";
+            out0.Append("        o." + fname + " = v.Int(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 3) {
-            out0.Append("        o." + fname + " = (" + tname + ")v.Double(\"" + jsonKey + "\", 0.0);\n");
+            string defVal = (dflt.Length > 0) ? dflt : "0.0";
+            out0.Append("        o." + fname + " = (" + tname + ")v.Double(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 4) {
-            out0.Append("        o." + fname + " = v.Bool(\"" + jsonKey + "\", false);\n");
+            string defVal = (dflt.Length > 0) ? dflt : "false";
+            out0.Append("        o." + fname + " = v.Bool(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 5) {
-            out0.Append("        o." + fname + " = v.Str(\"" + jsonKey + "\", \"\");\n");
+            string defVal = (dflt.Length > 0) ? dflt : "\"\"";
+            out0.Append("        o." + fname + " = v.Str(\"" + jsonKey + "\", " + defVal + ");\n");
         } else if (fk == 6) {
             out0.Append("        o." + fname + " = v.Get(\"" + jsonKey + "\");\n");
         } else if (fk == 8) {
