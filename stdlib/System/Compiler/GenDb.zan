@@ -34,7 +34,7 @@ class GenDb {
         return v != null && v.Str("kind", "") == "enum";
     }
 
-    // 属性读取(与 dbgen.c 的 dg_attr 一致,名字精确匹配)。
+    // 属性读取(支持全限定名、简写名与 Attribute 后缀匹配)。
     static JsonValue AttrOf(JsonValue cls, string name) {
         if (cls == null) { return null; }
         JsonValue attrs = cls.Get("attrs");
@@ -42,7 +42,10 @@ class GenDb {
         for (int i = 0; i < attrs.Count(); i = i + 1) {
             JsonValue a = attrs.At(i);
             if (a == null) { continue; }
-            if (a.Str("name", "") == name) { return a; }
+            string an = a.Str("name", "");
+            int dot = an.LastIndexOf(".");
+            if (dot >= 0) { an = an.Substring(dot + 1); }
+            if (an == name || an == (name + "Attribute")) { return a; }
         }
         return null;
     }
@@ -161,7 +164,40 @@ class GenDb {
         return outl;
     }
 
-    // FieldsOf 的递归体: 先基类后自身收集字段, depth 防继承环(>8 停)。
+    // 单个字段/属性转换为 DbField 并入列表，处理忽略与别名特性。
+    static void CollectMember(JsonValue m, List<DbField> outl) {
+        if (m == null) { return; }
+        if (m.Bool("static", false)) { return; }
+        if (GenDb.AttrOf(m, "NotMapped") != null) { return; }
+        JsonValue ca = GenDb.AttrOf(m, "Column");
+        if (GenDb.AttrBool(ca, "Ignore", false)) { return; }
+
+        string name = m.Str("name", "");
+        if (GenDb.FieldFind(outl, name) != null) { return; }
+
+        DbField df = new DbField();
+        df.Name = name;
+        df.TypeName = m.Str("type", "");
+        df.Kind = GenDb.ClassifyKind(df.TypeName);
+        string cn = GenDb.AttrStr(ca, "Name");
+        if (cn.Length == 0) {
+            JsonValue pos = GenDb.AttrPositional(ca);
+            if (pos != null && pos.Str("k", "") == "lit"
+                    && pos.Str("t", "") == "str") {
+                cn = pos.Str("v", "");
+            }
+        }
+        df.Col = cn.Length > 0 ? cn : df.Name;
+        df.IsPk = GenDb.AttrBool(ca, "IsPrimary", df.Name == "id");
+        df.IdentSet = GenDb.AttrArg(ca, "IsIdentity") != null;
+        df.IsIdent = GenDb.AttrBool(ca, "IsIdentity",
+                                    df.IsPk && df.Kind == 0);
+        df.NotNull = !GenDb.AttrBool(ca, "IsNullable", !df.IsPk);
+        df.StrLen = GenDb.AttrInt(ca, "StringLength", 0);
+        if (df.Kind != 6) { outl.Add(df); }
+    }
+
+    // FieldsOf 的递归体: 先基类后自身收集字段与属性, depth 防继承环(>8 停)。
     static void FieldsInto(string cls, int depth, List<DbField> outl) {
         if (depth > 8) { return; }
         JsonValue decl = GenDb.ClassGet(cls);
@@ -174,25 +210,16 @@ class GenDb {
             }
         }
         JsonValue fields = decl.Get("fields");
-        if (fields == null || !fields.IsArray()) { return; }
-        for (int i = 0; i < fields.Count(); i = i + 1) {
-            JsonValue f = fields.At(i);
-            if (f == null) { continue; }
-            if (f.Bool("static", false)) { continue; }
-            DbField df = new DbField();
-            df.Name = f.Str("name", "");
-            df.TypeName = f.Str("type", "");
-            df.Kind = GenDb.ClassifyKind(df.TypeName);
-            JsonValue ca = GenDb.AttrOf(f, "Column");
-            string cn = GenDb.AttrStr(ca, "Name");
-            df.Col = cn.Length > 0 ? cn : df.Name;
-            df.IsPk = GenDb.AttrBool(ca, "IsPrimary", df.Name == "id");
-            df.IdentSet = GenDb.AttrArg(ca, "IsIdentity") != null;
-            df.IsIdent = GenDb.AttrBool(ca, "IsIdentity",
-                                        df.IsPk && df.Kind == 0);
-            df.NotNull = !GenDb.AttrBool(ca, "IsNullable", !df.IsPk);
-            df.StrLen = GenDb.AttrInt(ca, "StringLength", 0);
-            if (df.Kind != 6) { outl.Add(df); }
+        if (fields != null && fields.IsArray()) {
+            for (int i = 0; i < fields.Count(); i = i + 1) {
+                GenDb.CollectMember(fields.At(i), outl);
+            }
+        }
+        JsonValue props = decl.Get("props");
+        if (props != null && props.IsArray()) {
+            for (int i = 0; i < props.Count(); i = i + 1) {
+                GenDb.CollectMember(props.At(i), outl);
+            }
         }
     }
 
