@@ -1564,7 +1564,9 @@ static zan_type_t *foreach_proto_enum_type(zan_irgen_t *g, zan_type_t *ct) {
     if (gm && gm->decl && gm->decl->kind == AST_METHOD_DECL &&
         gm->decl->method_decl.return_type)
         et = resolve_type_ctx(g, gm->decl->method_decl.return_type);
-    if (!et || et->kind != TYPE_CLASS || !et->sym) return NULL;
+    if (!et) return NULL;
+    if (ct) et = subst_type_param_deep(g, et, ct);
+    if (et->kind != TYPE_CLASS || !et->sym) return NULL;
     zan_istr_t ni = { (char *)"MoveNext", 8 };
     zan_istr_t ci = { (char *)"Current", 7 };
     if (!resolve_overload(et->sym, ni, 0, 0)) return NULL;
@@ -1584,16 +1586,24 @@ static zan_type_t *foreach_proto_current_type(zan_irgen_t *g, zan_type_t *ct) {
     zan_istr_t ci = { (char *)"Current", 7 };
     zan_symbol_t *cm = resolve_overload(et->sym, ci, 0, 0);
     if (cm && cm->decl && cm->decl->kind == AST_METHOD_DECL &&
-        cm->decl->method_decl.return_type)
-        return resolve_type_ctx(g, cm->decl->method_decl.return_type);
+        cm->decl->method_decl.return_type) {
+        zan_type_t *cur = resolve_type_ctx(g, cm->decl->method_decl.return_type);
+        if (cur && et) cur = subst_type_param_deep(g, cur, et);
+        if (cur && ct) cur = subst_type_param_deep(g, cur, ct);
+        return cur;
+    }
     for (int i = 0; i < et->sym->member_count; i++) {
         zan_symbol_t *m = et->sym->members[i];
         if (m && m->kind == SYM_PROPERTY && member_name_is(m, ci)) {
             zan_symbol_t *getter = property_getter_sym(g, m);
             if (getter && getter->decl && getter->decl->kind == AST_METHOD_DECL &&
-                getter->decl->method_decl.return_type)
-                return resolve_type_ctx(g,
+                getter->decl->method_decl.return_type) {
+                zan_type_t *cur = resolve_type_ctx(g,
                     getter->decl->method_decl.return_type);
+                if (cur && et) cur = subst_type_param_deep(g, cur, et);
+                if (cur && ct) cur = subst_type_param_deep(g, cur, ct);
+                return cur;
+            }
         }
     }
     return NULL;

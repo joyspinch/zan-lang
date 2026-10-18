@@ -3249,6 +3249,18 @@ void zan_checker_check_stmt(zan_checker_t *c, zan_ast_node_t *stmt) {
                             }
                         }
                     }
+                    if (elem && elem->kind == TYPE_TYPE_PARAM) {
+                        if (col->type_args && col->type_arg_count > 0 && csym && csym->decl &&
+                            (csym->decl->kind == AST_CLASS_DECL || csym->decl->kind == AST_STRUCT_DECL)) {
+                            zan_ast_list_t *tps = &csym->decl->type_decl.type_params;
+                            if (tps->count == col->type_arg_count) {
+                                elem = zan_binder_subst_named(c->binder, elem, tps, col->type_args);
+                            }
+                        }
+                        if (elem && elem->kind == TYPE_TYPE_PARAM && col->type_arg_count == 1) {
+                            elem = col->type_args[0];
+                        }
+                    }
                     if (!elem && col->kind == TYPE_CLASS && col->type_arg_count == 1) {
                         elem = col->type_args[0];
                     }

@@ -282,4 +282,66 @@ public class Stream<T> {
             }
         }
     }
+
+    // 为流开启原生 duck-typed foreach 迭代器支持
+    public StreamEnumerator<T> GetEnumerator() {
+        return new StreamEnumerator<T>(this);
+    }
 }
+
+// 针对 Stream<T> 的轻量单趟流式迭代器，实现 GetEnumerator / MoveNext / Current 协议。
+public class StreamEnumerator<T> {
+    Stream<T> stream;
+    int index;
+    int yielded;
+    int skipped;
+    T current;
+    Dict<T, bool> seen;
+
+    public StreamEnumerator(Stream<T> stream) {
+        this.stream = stream;
+        this.index = 0;
+        this.yielded = 0;
+        this.skipped = 0;
+        this.seen = stream.distinct ? new Dict<T, bool>() : null;
+    }
+
+    public bool MoveNext() {
+        if (this.stream.takeN >= 0 && this.yielded >= this.stream.takeN) {
+            return false;
+        }
+        while (this.index < this.stream.src.Count) {
+            T item = this.stream.src[this.index];
+            this.index = this.index + 1;
+            if (this.stream.takeWhilePred != null && !this.stream.takeWhilePred(item)) {
+                return false;
+            }
+            bool pass = true;
+            for (int f = 0; f < this.stream.filters.Count; f = f + 1) {
+                if (!this.stream.filters[f](item)) {
+                    pass = false;
+                    break;
+                }
+            }
+            if (pass) {
+                if (this.seen != null) {
+                    if (this.seen.ContainsKey(item)) { continue; }
+                    this.seen[item] = true;
+                }
+                if (this.skipped < this.stream.skipN) {
+                    this.skipped = this.skipped + 1;
+                    continue;
+                }
+                this.current = item;
+                this.yielded = this.yielded + 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public T Current {
+        get { return this.current; }
+    }
+}
+
