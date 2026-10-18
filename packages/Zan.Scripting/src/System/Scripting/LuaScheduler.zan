@@ -1,0 +1,151 @@
+using System;
+using System.Collections.Generic;
+namespace System.Scripting;
+
+// 调度任务节点
+public class ScheduledTask {
+    public LuaCoroutine Coroutine;
+    public double WakeTime;
+    public bool IsWaitingTimer;
+
+    public ScheduledTask(LuaCoroutine co, double wakeTime, bool isTimer) {
+        this.Coroutine = co;
+        this.WakeTime = wakeTime;
+        this.IsWaitingTimer = isTimer;
+    }
+}
+
+// 专为游戏循环与 GUI 主线程设计的非阻塞异步调度器。
+// 让 Lua 脚本能以直观线性的顺序写法调用 Async.Sleep / Async.Yield，
+// 底层通过协程出让让出执行权，完全不卡死、不阻塞主线程。
+public static class LuaScheduler {
+    public static List<ScheduledTask> tasks = new List<ScheduledTask>();
+    public static double currentTime = 0.0;
+    public static ScheduledTask currentRunningTask = null;
+    public static bool initialized = false;
+
+    // 初始化调度器并向 Lua 全局环境注册 Async 模块 (Async.Sleep, Async.Yield)。幂等。
+    public static void Initialize() {
+        if (LuaScheduler.initialized) { return; }
+        Lua.EnsureReady();
+
+        // 注册 Async 回调原语
+        Lua.RegisterFunction("__zan_async_sleep", LuaScheduler.NativeSleep);
+        Lua.RegisterFunction("__zan_async_yield", LuaScheduler.NativeYield);
+
+        // 封装脚本层友好的 Async 全局表
+        Lua.Exec("Async = Async or {}\n" +
+                 "function Async.Sleep(seconds)\n" +
+                 "    return __zan_async_sleep(seconds or 0)\n" +
+                 "end\n" +
+                 "function Async.Yield()\n" +
+                 "    return __zan_async_yield()\n" +
+                 "end\n");
+
+        LuaScheduler.initialized = true;
+    }
+
+    // 启动一段 Lua 代码作为非阻塞协程运行。
+    // 如果代码中有 Async.Sleep 或协程出让，它将自动进入调度器挂起并按时唤醒，绝不卡死主循环。
+    public static LuaCoroutine Start(string code) {
+        LuaScheduler.Initialize();
+        LuaCoroutine co = LuaCoroutine.Create(code);
+        ScheduledTask task = new ScheduledTask(co, 0.0, false);
+
+        // 首次驱动执行
+        LuaScheduler.currentRunningTask = task;
+        int rc = co.Resume();
+        LuaScheduler.currentRunningTask = null;
+
+        if (rc == Lua.LUA_YIELD) {
+            // 挂起出让：加入任务列表在后续每帧 Tick 中按时恢复
+            LuaScheduler.tasks.Add(task);
+        }
+        return co;
+    }
+
+    // 启动全局已注册函数作为非阻塞协程运行。
+    public static LuaCoroutine StartFunction(string funcName, params LuaValue[] args) {
+        LuaScheduler.Initialize();
+        LuaCoroutine co = LuaCoroutine.CreateFromFunction(funcName);
+        ScheduledTask task = new ScheduledTask(co, 0.0, false);
+
+        LuaScheduler.currentRunningTask = task;
+        int rc = co.Resume(args);
+        LuaScheduler.currentRunningTask = null;
+
+        if (rc == Lua.LUA_YIELD) {
+            LuaScheduler.tasks.Add(task);
+        }
+        return co;
+    }
+
+    // 主循环单帧步进（在游戏 Update/Tick 或 GUI 定时器中调用）。
+    // 完全非阻塞：只检查并唤醒到期任务，顺带平摊微量 GC 预算。
+    // 返回值：当前仍存活并在等待的协程任务数量。
+    public static int Tick(double deltaSeconds) {
+        if (!LuaScheduler.initialized || LuaScheduler.tasks.Count == 0) {
+            return 0;
+        }
+
+        LuaScheduler.currentTime = LuaScheduler.currentTime + deltaSeconds;
+        List<ScheduledTask> activeTasks = new List<ScheduledTask>();
+
+        for (int i = 0; i < LuaScheduler.tasks.Count; i = i + 1) {
+            ScheduledTask task = LuaScheduler.tasks[i];
+            if (task.Coroutine.IsDone()) {
+                continue;
+            }
+
+            // 检查唤醒条件：已到达等待时间
+            if (LuaScheduler.currentTime >= task.WakeTime) {
+                LuaScheduler.currentRunningTask = task;
+                int rc = task.Coroutine.Resume();
+                LuaScheduler.currentRunningTask = null;
+
+                if (rc == Lua.LUA_YIELD) {
+                    activeTasks.Add(task);
+                }
+            } else {
+                activeTasks.Add(task);
+            }
+        }
+
+        LuaScheduler.tasks = activeTasks;
+
+        // 每一帧顺便回收 2KB 垃圾，平摊 GC 负担，杜绝突发掉帧卡顿
+        Lua.StepGC(2);
+
+        return LuaScheduler.tasks.Count;
+    }
+
+    // 当前活跃任务数。
+    public static int ActiveCount() {
+        return LuaScheduler.tasks.Count;
+    }
+
+    // 清空并取消所有当前正在挂起的协程任务。
+    public static void Clear() {
+        LuaScheduler.tasks.Clear();
+        LuaScheduler.currentRunningTask = null;
+    }
+
+    // ---- 原生 C 回调处理 ----------------------------------------
+
+    private static int NativeSleep(nint L) {
+        double seconds = Lua.ArgDouble(L, 1);
+        if (LuaScheduler.currentRunningTask != null) {
+            LuaScheduler.currentRunningTask.WakeTime = LuaScheduler.currentTime + seconds;
+            LuaScheduler.currentRunningTask.IsWaitingTimer = true;
+        }
+        return Lua.Yield(L, 0);
+    }
+
+    private static int NativeYield(nint L) {
+        if (LuaScheduler.currentRunningTask != null) {
+            LuaScheduler.currentRunningTask.WakeTime = LuaScheduler.currentTime;
+            LuaScheduler.currentRunningTask.IsWaitingTimer = false;
+        }
+        return Lua.Yield(L, 0);
+    }
+}

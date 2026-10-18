@@ -1,0 +1,66 @@
+using System;
+using System.Scripting;
+
+class Program {
+    static void Main() {
+        if (!Lua.IsAvailable()) {
+            Console.WriteLine("scripting_available=0");
+            Console.WriteLine("scripting_async_ok");
+            return;
+        }
+
+        Console.WriteLine("scripting_available=1");
+        Lua.Initialize();
+
+        // 1. StepGC 验证
+        int gcStep = Lua.StepGC(2);
+        Console.WriteLine("gc_step_ok=" + (gcStep >= 0));
+
+        // 2. TryCall 容错保护验证
+        string err = "";
+        bool okCall = Lua.TryCall("math.abs", out err, Lua.FromDouble(-42.0));
+        Console.WriteLine("try_call_ok=" + okCall);
+
+        bool badCall = Lua.TryCall("non_existent_func_xyz", out err);
+        Console.WriteLine("bad_call_protected=" + (!badCall && err.Length > 0));
+
+        // 3. ExecEncrypted 内存解密执行验证
+        string rawScript = "secret_magic = 999";
+        string secretKey = "MyGameKey2026";
+        byte[] cipher = new byte[rawScript.Length];
+        for (int i = 0; i < rawScript.Length; i = i + 1) {
+            cipher[i] = (byte)((byte)rawScript[i] ^ (byte)secretKey[i % secretKey.Length]);
+        }
+        Lua.ExecEncrypted(cipher, secretKey, "secret.lua");
+        long magicVal = Lua.Eval("secret_magic").ToLong();
+        Console.WriteLine("secret_magic_val=" + magicVal);
+
+        // 4. LuaScheduler 异步非阻塞调度验证
+        Lua.Exec("npc_talk_step = 0");
+        LuaScheduler.Start(
+            "npc_talk_step = 1\n" +
+            "Async.Sleep(0.1)\n" +
+            "npc_talk_step = 2\n"
+        );
+
+        long stepImmediately = Lua.Eval("npc_talk_step").ToLong();
+        Console.WriteLine("step_immediately=" + stepImmediately);
+        Console.WriteLine("active_tasks_count=" + LuaScheduler.ActiveCount());
+
+        // 推进时间 0.02 * 3 = 0.06 < 0.1，尚未唤醒
+        for (int frame = 1; frame <= 3; frame = frame + 1) {
+            LuaScheduler.Tick(0.02);
+        }
+        long stepMid = Lua.Eval("npc_talk_step").ToLong();
+        Console.WriteLine("step_mid=" + stepMid);
+
+        // 推进 0.05，累计 0.11 >= 0.1，唤醒完成
+        LuaScheduler.Tick(0.05);
+        long stepFinished = Lua.Eval("npc_talk_step").ToLong();
+        Console.WriteLine("step_after_resume=" + stepFinished);
+        Console.WriteLine("active_tasks_after=" + LuaScheduler.ActiveCount());
+
+        Lua.Finalize();
+        Console.WriteLine("scripting_async_ok");
+    }
+}

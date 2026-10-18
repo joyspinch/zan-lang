@@ -1,0 +1,110 @@
+using System;
+namespace System.Scripting;
+
+// 封装 Lua 协程（Coroutine 线程对象）。
+// 协程与主状态机共享全局表与函数，但在独立的栈上运行。
+// 协程在注册表中有固定槽位锚定，离开作用域被 ARC 回收时自动释放槽位。
+public class LuaCoroutine {
+    public nint threadState;
+    public long threadSlot;
+    public bool isStarted;
+    public bool isDead;
+    public string error;
+
+    public LuaCoroutine(nint co, long slot) {
+        this.threadState = co;
+        this.threadSlot = slot;
+        this.isStarted = false;
+        this.isDead = false;
+        this.error = "";
+    }
+
+    // 析构函数：ARC 回收时释放注册表锚定槽位，Lua GC 将在适当时机回收协程栈
+    ~LuaCoroutine() {
+        if (this.threadSlot != 0) {
+            Lua.DropSlot(this.threadSlot);
+            this.threadSlot = 0;
+            this.threadState = 0;
+        }
+    }
+
+    // 从一段 Lua 代码创建并准备一个协程（将代码编译为 chunk 压入协程栈顶）。
+    public static LuaCoroutine Create(string code) {
+        Lua.EnsureReady();
+        long slot = 0;
+        nint co = Lua.NewThread(out slot);
+        LuaLoadFn load = (LuaLoadFn)Lua.addr_loadstring;
+        int rc = load(co, code);
+        if (rc != 0) {
+            LuaIdxIntFn ty = (LuaIdxIntFn)Lua.addr_type;
+            string err = "(load error)";
+            if (ty(co, 0 - 1) == Lua.TSTRING) {
+                LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+                err = f(co, 0 - 1, 0);
+            }
+            Lua.DropSlot(slot);
+            throw new InvalidOperationException("Lua 协程代码编译失败: " + err);
+        }
+        return new LuaCoroutine(co, slot);
+    }
+
+    // 从全局已注册的函数名（如 "OnTalk" 或 "Quest.Dialog"）创建协程。
+    public static LuaCoroutine CreateFromFunction(string funcName) {
+        Lua.EnsureReady();
+        long slot = 0;
+        nint co = Lua.NewThread(out slot);
+        // 将函数推入新协程栈顶
+        int mark = Lua.Top();
+        Lua.PushPath(funcName, mark);
+        // 把主栈的值转移到协程中：通过全局表读取
+        LuaGetGlobalFn g = (LuaGetGlobalFn)Lua.addr_getglobal;
+        g(co, funcName);
+        Lua.SetTop(mark);
+        return new LuaCoroutine(co, slot);
+    }
+
+    // 单步非阻塞恢复协程执行。
+    // 返回状态码：
+    // Lua.LUA_OK (0): 执行结束。
+    // Lua.LUA_YIELD (1): 主动挂起出让，等待下一次唤醒。
+    // 其它: 执行报错（可通过 Error 属性读取详细堆栈）。
+    public int Resume(params LuaValue[] args) {
+        if (this.isDead || this.threadState == 0) {
+            return Lua.LUA_OK;
+        }
+        this.isStarted = true;
+        // 把传入参数压入协程栈
+        for (int i = 0; i < args.Length; i = i + 1) {
+            args[i].PushTo(this.threadState);
+        }
+
+        int nresults = 0;
+        int rc = Lua.ResumeThread(this.threadState, args.Length, out nresults);
+        if (rc == Lua.LUA_OK) {
+            this.isDead = true;
+            return Lua.LUA_OK;
+        } else if (rc == Lua.LUA_YIELD) {
+            return Lua.LUA_YIELD;
+        } else {
+            this.isDead = true;
+            LuaToStrFn f = (LuaToStrFn)Lua.addr_tolstring;
+            this.error = f(this.threadState, 0 - 1, 0);
+            return rc;
+        }
+    }
+
+    // 协程是否正处于挂起等待唤醒状态。
+    public bool IsSuspended() {
+        return !this.isDead && this.isStarted && Lua.Status(this.threadState) == Lua.LUA_YIELD;
+    }
+
+    // 协程是否已经执行完毕。
+    public bool IsDone() {
+        return this.isDead;
+    }
+
+    // 底层协程句柄。
+    public nint Handle() {
+        return this.threadState;
+    }
+}
