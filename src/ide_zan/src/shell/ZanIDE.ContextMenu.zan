@@ -1,0 +1,273 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Json;
+using System.Data;
+using System.Data.Sqlite;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+using Gui.Backend;
+
+partial class ZanIDE {
+    void RenderContextMenu(App app) {
+        if (ctxKind == 0 || ctxKind == 7) { return; }
+        List<string> cmLabels = new List<string>();
+        if (ctxKind == 1) {
+            cmLabels.Add(ZanIDE.T("New File", "新建文件"));
+            cmLabels.Add(ZanIDE.T("New Folder", "新建文件夹"));
+            cmLabels.Add("-");
+            int delN = 1;
+            if (explorerTv != null && explorerTv.IsMarked(ctxTarget)) {
+                delN = explorerTv.SelectionCount();
+            }
+            if (delN > 1) {
+                cmLabels.Add(ZanIDE.T("Delete ", "删除 ") + Convert.ToString(delN)
+                    + ZanIDE.T(" items", " 项"));
+            } else {
+                cmLabels.Add(ZanIDE.T("Delete", "删除"));
+            }
+            cmLabels.Add("-");
+            cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+            cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+            cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+            string genRel = this.CtxProjRel();
+            if (genRel != "") {
+                string cur = ZanIDE.ProjGenAction(root, genRel);
+                cmLabels.Add("-");
+                cmLabels.Add(ZanIDE.GenMark(cur, "none")
+                    + ZanIDE.T("Build Action: None", "生成操作：不处理"));
+                cmLabels.Add(ZanIDE.GenMark(cur, "copy")
+                    + ZanIDE.T("Build Action: Copy to Output", "生成操作：复制到输出"));
+                cmLabels.Add(ZanIDE.GenMark(cur, "embed")
+                    + ZanIDE.T("Build Action: Embed", "生成操作：内嵌到程序"));
+            }
+        } else if (ctxKind == 2) {
+            cmLabels.Add(ZanIDE.T("Open", "打开"));
+            cmLabels.Add("-");
+            cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+            cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+            cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+        } else if (ctxKind == 3) {
+            cmLabels.Add(ZanIDE.T("Close", "关闭"));
+            cmLabels.Add(ZanIDE.T("Close Others", "关闭其他"));
+            cmLabels.Add("-");
+            cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+        } else if (ctxKind == 4) {
+            cmLabels.Add(ZanIDE.T("Open in Editor", "在编辑器中打开"));
+            cmLabels.Add(ZanIDE.T("Run", "运行"));
+            cmLabels.Add("-");
+            cmLabels.Add(ZanIDE.T("Refresh", "刷新"));
+            cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+            cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+        } else if (ctxKind == 5) {
+            cmLabels.Add(ZanIDE.T("Open", "打开"));
+            cmLabels.Add("-");
+            cmLabels.Add(ZanIDE.T("Copy Path", "复制路径"));
+            cmLabels.Add(ZanIDE.T("Reveal in Explorer", "在资源管理器中显示"));
+        } else if (ctxKind == 6) {
+            if (this.StructEditable()) {
+                int selN = 1;
+                if (structTv != null && structTv.IsMarked(ctxTarget)) {
+                    selN = structTv.SelectionCount();
+                }
+                if (selN > 1) {
+                    cmLabels.Add(ZanIDE.T("Delete ", "删除 ")
+                        + Convert.ToString(selN)
+                        + ZanIDE.T(" components", " 个组件"));
+                } else {
+                    cmLabels.Add(ZanIDE.T("Delete", "删除"));
+                }
+                cmLabels.Add(ZanIDE.T("Duplicate", "创建副本"));
+                cmLabels.Add("-");
+            }
+            cmLabels.Add(ZanIDE.T("Copy Name", "复制名称"));
+        }
+        app.BeginIdScope(935000);
+        app.BlockHitsMenu();
+        int chosen = ContextMenu.Render(app, ctxX, ctxY, cmLabels);
+        app.EndIdScope();
+        if (chosen == 0 - 2) {
+            ctxKind = 0;
+            app.RequestRedraw();
+        } else if (chosen >= 0) {
+            if (ctxKind == 1) {
+                if (chosen == 0 && dlg == null) {
+                    dlg = this.OpenWizardHost(app, ZanIDE.T("New File", "新建文件"), 720, 470, 2);
+                    dlgMode = 2;
+                } else if (chosen == 1 && dlg == null) {
+                    dlg = this.OpenWizardHost(app, ZanIDE.T("New Folder", "新建文件夹"), 720, 470, 2);
+                    fNameInput.SetText("NewFolder");
+                    fSel.Set(ZanIDE.FileKindFolder());
+                    dlgMode = 2;
+                } else if (chosen == 3) {
+                    List<int> delRows = new List<int>();
+                    if (explorerTv != null && explorerTv.IsMarked(ctxTarget)) {
+                        delRows = explorerTv.SelectedIndices();
+                    } else {
+                        delRows.Add(ctxTarget);
+                    }
+                    int nDel = 0;
+                    string lastName = "";
+                    for (int dj = 0; dj < delRows.Count; dj = dj + 1) {
+                        int rowd = delRows[dj];
+                        if (rowd >= 0 && rowd < treeShow.Count) {
+                            string dp = treeShow[rowd].path;
+                            if (haveProject && dp != "" && ZanIDE.StartsWith(dp, root) && dp != root) {
+                                ZanIDE.DeletePathRecursive(dp);
+                                log.Add("> Deleted " + dp + ".");
+                                lastName = Path.GetFileName(dp);
+                                nDel = nDel + 1;
+                            }
+                        }
+                    }
+                    if (nDel > 1) {
+                        Layer.Notify(ZanIDE.T("Deleted ", "已删除 ") + Convert.ToString(nDel)
+                            + ZanIDE.T(" items", " 项"), 3);
+                    } else if (nDel == 1) {
+                        Layer.Notify(ZanIDE.T("Deleted: ", "已删除：") + lastName, 3);
+                    }
+                    if (nDel > 0) {
+                        explorerTv.ClearSelection();
+                        rescan = true;
+                    }
+                } else if (chosen == 5) {
+                    rescan = true;
+                } else if (chosen == 6) {
+                    if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                        Clipboard.SetText(treeShow[ctxTarget].path);
+                        log.Add("> Copied path: " + treeShow[ctxTarget].path);
+                    }
+                } else if (chosen == 7) {
+                    if (ctxTarget >= 0 && ctxTarget < treeShow.Count) {
+                        ZanIDE.RevealInFileManager(treeShow[ctxTarget].path);
+                    }
+                } else if (chosen >= 9 && chosen <= 11) {
+                    string grel = this.CtxProjRel();
+                    if (grel != "") {
+                        string act = "none";
+                        if (chosen == 10) { act = "copy"; }
+                        if (chosen == 11) { act = "embed"; }
+                        ZanIDE.SetProjGenAction(root, grel, act);
+                        log.Add("> Build action for " + grel + ": " + act
+                            + " (zan.proj).");
+                        Layer.Notify(grel + " → " + ZanIDE.GenLabel(act), 3);
+                    }
+                }
+            } else if (ctxKind == 2) {
+                if (ctxTarget >= 0 && ctxTarget < exShow.Count) {
+                    TreeNode exn = exShow[ctxTarget];
+                    bool exReal = exn.path != "" && !ZanIDE.StartsWith(exn.path, "@");
+                    if (chosen == 0) {
+                        if (exReal && !exn.isDir) {
+                            ZanIDE.OpenPath(tabs, activeTab, exn.path, exn.label);
+                            log.Add("> Opened " + exn.path + ".");
+                        }
+                    } else if (chosen == 2) {
+                        exTree = ZanIDE.BuildStdlibTree();
+                        log.Add("> Refreshed standard library / tools / examples.");
+                    } else if (chosen == 3) {
+                        if (exReal) {
+                            Clipboard.SetText(exn.path);
+                            log.Add("> Copied path: " + exn.path);
+                        }
+                    } else if (chosen == 4) {
+                        if (exReal) { ZanIDE.RevealInFileManager(exn.path); }
+                    }
+                }
+            } else if (ctxKind == 3) {
+                if (chosen == 0) {
+                    this.RequestCloseTab(ctxTarget);
+                } else if (chosen == 1) {
+                    if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                        this.RequestCloseOthers(tabs[ctxTarget].path);
+                    }
+                } else if (chosen == 3) {
+                    if (ctxTarget >= 0 && ctxTarget < tabs.Count) {
+                        Clipboard.SetText(tabs[ctxTarget].path);
+                        log.Add("> Copied path: " + tabs[ctxTarget].path);
+                    }
+                }
+            } else if (ctxKind == 4) {
+                if (chosen == 3) {
+                    rtToolTree = ZanIDE.BuildDirTree(ZanIDE.ToolsDir());
+                    log.Add("> Refreshed tools: " + ZanIDE.ToolsDir());
+                } else if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                    TreeNode rtrn = rtCtxShow[ctxTarget];
+                    bool rtReal = rtrn.path != "" && !ZanIDE.StartsWith(rtrn.path, "@");
+                    if (!rtrn.isDir && rtReal) {
+                        if (chosen == 0) {
+                            ZanIDE.OpenPath(tabs, activeTab, rtrn.path, Path.GetFileName(rtrn.path));
+                            log.Add("> Opened tool: " + rtrn.path + ".");
+                        } else if (chosen == 1) {
+                            string rtcT = ZanIDE.RunTarget(rtrn.path, root);
+                            if (buildBusy || pubBusy) {
+                                Layer.Msg(ZanIDE.T("Build or publish already running…", "构建或发布进行中…"), 2);
+                            } else if (rtcT != "") {
+                                log.Add(ZanIDE.T("> Running tool ", "> 运行工具 ") + rtrn.path + " ...");
+                                buildBusy = true;
+                                buildStartMs = Window.GetTickMs();
+                                buildThenRun = true;
+                                buildExe = ZanIDE.RunBuildBegin(root, rtcT);
+                                buildIsGui = ZanIDE.IsWindowedTarget(root, rtcT);
+                                buildTargetPath = rtrn.path;
+                                buildLogLen = 0;
+                                dock.Focus("output");
+                                app.RequestAnimationFrame(80);
+                            }
+                        } else if (chosen == 4) {
+                            Clipboard.SetText(rtrn.path);
+                            log.Add("> Copied path: " + rtrn.path);
+                        } else if (chosen == 5) {
+                            ZanIDE.RevealInFileManager(rtrn.path);
+                        }
+                    }
+                }
+            } else if (ctxKind == 6) {
+                int strDel = 0;
+                int strDup = 1;
+                int strCopy = 3;
+                if (!this.StructEditable()) {
+                    strDel = 0 - 1;
+                    strDup = 0 - 1;
+                    strCopy = 0;
+                }
+                if (chosen == strDel) {
+                    this.StructureDeleteSelection();
+                } else if (chosen == strDup) {
+                    this.StructureDuplicate();
+                } else if (chosen == strCopy) {
+                    if (ctxTarget >= 0 && structShow != null
+                        && ctxTarget < structShow.Count) {
+                        Clipboard.SetText(structShow[ctxTarget].label);
+                        log.Add("> Copied name: "
+                            + structShow[ctxTarget].label);
+                    }
+                }
+            } else if (ctxKind == 5) {
+                if (ctxTarget >= 0 && ctxTarget < rtCtxShow.Count) {
+                    TreeNode exrn = rtCtxShow[ctxTarget];
+                    bool exrReal = exrn.path != "" && !ZanIDE.StartsWith(exrn.path, "@");
+                    if (chosen == 0) {
+                        if (!exrn.isDir && exrReal) {
+                            ZanIDE.OpenPath(tabs, activeTab, exrn.path, exrn.label);
+                            log.Add("> Opened " + exrn.path + ".");
+                        }
+                    } else if (chosen == 2) {
+                        if (exrReal) {
+                            Clipboard.SetText(exrn.path);
+                            log.Add("> Copied path: " + exrn.path);
+                        }
+                    } else if (chosen == 3) {
+                        if (exrReal) { ZanIDE.RevealInFileManager(exrn.path); }
+                    }
+                }
+            }
+            ctxKind = 0;
+            app.RequestRedraw();
+        }
+    }
+}

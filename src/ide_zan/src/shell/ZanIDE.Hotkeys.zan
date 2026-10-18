@@ -1,0 +1,169 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using Platform;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+using Gui.Component;
+using Game.Scene;
+
+partial class ZanIDE {
+    void HandleFrameHotkeys(int kind) {
+        if (kind == 5) {
+            int kc = app.window.EventKeyCode();
+            if (kc == 116 && dbgState == 0) {
+                if (pubBusy) {
+                    Layer.Msg(ZanIDE.T("Publish in progress…", "发布进行中…"), 2);
+                } else if (!buildBusy) {
+                    string target = ZanIDE.PathOf(tabs, activeTab);
+                    this.SaveActiveTabThen(delegate () { this.BeginBuildJob(target, false, true); });
+                }
+                app.RequestRedraw();
+            } else if (kc == 116 && dbgState == 2) {
+                this.BeginDebugCommand("continue");
+                app.RequestRedraw();
+            } else if (kc == 121 && dbgState == 2) {
+                this.BeginDebugCommand("next");
+                app.RequestRedraw();
+            } else if (kc == 122 && dbgState == 2) {
+                this.BeginDebugCommand("stepIn");
+                app.RequestRedraw();
+            } else if (kc == 27 && dbgState == 2) {
+                this.BeginDebugCommand("stop");
+                app.RequestRedraw();
+            } else if (kc == 27 && refList.IsOpen()) {
+                refList.Close();
+                app.RequestRedraw();
+            } else if (kc == 27 && findMode > 0) {
+                findMode = 0;
+                app.focus.SetFocused(editor.LastWidgetId());
+                app.RequestRedraw();
+            } else if (kc == 27 && pubWin != null && pubWin.IsOpen()) {
+                pubWin.Close();
+                app.RequestRedraw();
+            } else if (kc == 27 && marketplaceWin != null && marketplaceWin.IsOpen()) {
+                marketplaceWin.Close();
+                app.RequestRedraw();
+            } else if (kc == 123 && !designerMode && dbgState == 0) {
+                this.GoToDefinitionAsync();
+            } else if (kc == 113 && !designerMode && dbgState == 0) {
+                renameWord = editor.WordAtCaret();
+                if (renameWord.Length > 0) {
+                    findMode = 5;
+                } else {
+                    log.Add("> Rename: no symbol under caret.");
+                }
+                app.RequestRedraw();
+            } else if (kc == 119 && !designerMode && dbgState == 0) {
+                if (fifHits.Count == 0) {
+                    log.Add(ZanIDE.T("> No search results. Ctrl+Shift+F searches the project.",
+                        "> 没有搜索结果。Ctrl+Shift+F 可搜索整个项目。"));
+                } else {
+                    if (Modifiers.HasShift(app.window.EventMods())) {
+                        fifSel = fifSel - 1;
+                        if (fifSel < 0) { fifSel = fifHits.Count - 1; }
+                    } else {
+                        fifSel = fifSel + 1;
+                        if (fifSel >= fifHits.Count) { fifSel = 0; }
+                    }
+                    this.GotoSearchHitAsync(fifHits, fifSel);
+                }
+                app.RequestRedraw();
+            } else if (kc == 118 && dbgState == 0) {
+                int actF7 = activeTab.Get();
+                if (actF7 >= 0 && actF7 < tabs.Count
+                        && (ZanIDE.IsFormPath(tabs[actF7].path)
+                            || tabs[actF7].designDoc
+                            || ZanIDE.IsScenePath(tabs[actF7].path))) {
+                    string fp7 = tabs[actF7].path;
+                    if (codeViewForm == fp7) {
+                        codeViewForm = "";
+                        log.Add(ZanIDE.T("> Design view.", "> 设计视图。"));
+                    } else {
+                        codeViewForm = fp7;
+                        formCodeLoaded = "";
+                        log.Add(ZanIDE.T("> Code view.", "> 代码视图。"));
+                    }
+                    lastActive = 0 - 1;
+                } else if (actF7 >= 0 && actF7 < tabs.Count) {
+                    string ap7 = tabs[actF7].path;
+                    string cand7 = ZanIDE.FindPairedDesignPath(ap7);
+                    if (cand7 != "") {
+                        int ci7 = ZanIDE.FindTabByPath(tabs, cand7);
+                        if (ci7 >= 0) { activeTab.Set(ci7); }
+                        else { ZanIDE.OpenPath(tabs, activeTab, cand7, Path.GetFileName(cand7)); }
+                        loadedFormPath = "";
+                        lastActive = 0 - 1;
+                    } else {
+                        log.Add("> No paired design doc for " + Path.GetFileName(ap7) + ".");
+                    }
+                }
+                app.RequestRedraw();
+            }
+        }
+        app.PerfMark("sh.debug");
+        if (kind == 6) {
+            int cc = app.window.EventKeyCode();
+            if (cc == 6) {
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    findMode = 6;
+                    fifQuery = "";
+                } else {
+                    if (findMode != 2) { findMode = 1; }
+                    findBar.Open(false, this.FindSeed());
+                }
+                app.RequestRedraw();
+            } else if (cc == 7) {
+                findMode = 3;
+                app.RequestRedraw();
+            } else if (cc == 18) {
+                if (Modifiers.HasShift(app.window.EventMods())) {
+                    findMode = 7;
+                    fifRepl = "";
+                } else {
+                    findMode = 2;
+                    findBar.Open(true, this.FindSeed());
+                }
+                app.RequestRedraw();
+            } else if (cc == 2) {
+                if (!designerMode) {
+                    findMode = 4;
+                }
+                app.RequestRedraw();
+            } else if (cc == 5) {
+                if (!designerMode && !sceneMode && findMode == 0) {
+                    ZanIDE.FormatDocument(editor, log);
+                }
+                app.RequestRedraw();
+            } else if (cc == 19) {
+                int aSv = activeTab.Get();
+                if (aSv >= 0 && aSv < tabs.Count
+                        && (ZanIDE.IsFormPath(tabs[aSv].path)
+                            || tabs[aSv].designDoc)
+                        && codeViewForm == tabs[aSv].path) {
+                    log.Add(ZanIDE.T("> The design HTML is read-only here; edit the design, or open Name.zan for logic.", "> 设计稿 HTML 此处只读；请在设计器中修改，或打开 Name.zan 编写逻辑。"));
+                } else if (aSv >= 0 && aSv < tabs.Count
+                        && ZanIDE.IsScenePath(tabs[aSv].path) && codeViewForm == tabs[aSv].path) {
+                    log.Add(ZanIDE.T("> The projected scene code is read-only; edit the design, or open Name.zan for logic.", "> 场景投影代码只读；请修改设计，或打开 Name.zan 编写逻辑。"));
+                } else if (!designerMode && !sceneMode && aSv >= 0 && aSv < tabs.Count && tabs[aSv].path != "@start") {
+                    string savedPath = tabs[aSv].path;
+                    this.SaveActiveTabThen(delegate () {
+                        rescan = true;
+                        Layer.Msg(ZanIDE.T("Saved", "已保存"), 3);
+                        if (autoRun) {
+                            this.BeginBuildJob(savedPath, true, false, true);
+                            dock.Focus("output");
+                        }
+                        app.RequestRedraw();
+                    });
+                }
+                app.RequestRedraw();
+            } else if (cc == 26) {
+                if (Modifiers.HasAlt(app.window.EventMods()) || Modifiers.HasShift(app.window.EventMods())) {
+                    this.UndoRename();
+                }
+            }
+        }
+    }
+}

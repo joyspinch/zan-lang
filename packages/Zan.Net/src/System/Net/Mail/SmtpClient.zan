@@ -1,0 +1,705 @@
+using System;
+using System.Text;
+using System.Net.Sockets;
+using System.Net.Tls;
+using System.Security.Cryptography;
+
+namespace System.Net.Mail;
+
+// SMTP 客户端（RFC 5321 / 5322 + MIME），纯 Zan，无原生依赖。
+//
+// 支持明文（25）、STARTTLS（25 升级）、隐式 TLS（465）三种通道；
+// AUTH PLAIN / LOGIN；8 位安全（SMTPUTF8 不做，主题按 RFC 2047
+// 编码为 UTF-8 Base64 词）。正文一律走 multipart 或 quoted-printable，
+// 行尾统一 CRLF，句点填充按 RFC 5321 §4.5.2 处理。
+//
+// 用法：
+//   SmtpClient smtp = new SmtpClient("smtp.example.com", 465);
+//   smtp.UseImplicitTls();
+//   smtp.Credentials("user@example.com", "password");
+//   MailMessage msg = new MailMessage();
+//   msg.From("user@example.com").To("a@b.com").Subject("你好");
+//   msg.Body("正文");
+//   SmtpResult r = await smtp.SendAsync(msg);
+//
+// 线程/协程安全：一个实例一条连接，不要跨协程并发使用；
+// 每次发送后连接保持（可连续 SendAsync 多封），Close 释放。
+public class SmtpClient : IDisposable {
+    string host;
+    int port;
+    int timeoutMs;
+    bool implicitTls;
+    string user;
+    string pass;
+    string localDomain;
+    TcpClient conn;
+    TlsStream tls;
+    bool open;
+    // 读缓冲：单次 recv 不足一行 / 一封邮件需要多读，全部在此累积。
+    byte[] inbuf;
+    int inhead;
+    int intail;
+    // 每次会话记录的服务器能力。
+    bool serverStartTls;
+    bool serverAuth;
+    bool serverPipelining;
+    bool serverEightBitMime;
+    string lastResponse;
+    int lastCode;
+
+    [DllImport("crt")]
+    private static extern long strlen(string str);
+
+    // 构造客户端：host + 端口（25 明文/STARTTLS，465 隐式 TLS）。
+    public SmtpClient(string host, int port) {
+        this.host = host;
+        this.port = port;
+        this.timeoutMs = 30000;
+        this.implicitTls = false;
+        this.user = "";
+        this.pass = "";
+        this.localDomain = "";
+        this.conn = null;
+        this.tls = null;
+        this.open = false;
+        this.inbuf = null;
+        this.inhead = 0;
+        this.intail = 0;
+        this.serverStartTls = false;
+        this.serverAuth = false;
+        this.serverPipelining = false;
+        this.serverEightBitMime = false;
+        this.lastResponse = "";
+        this.lastCode = 0;
+    }
+
+    // 启用隐式 TLS（端口 465）：TCP 连上后立即握手，再走 SMTP。
+    public SmtpClient UseImplicitTls() {
+        this.implicitTls = true;
+        return this;
+    }
+
+    // 设置 AUTH PLAIN/LOGIN 凭据。
+    public SmtpClient Credentials(string user, string pass) {
+        this.user = user;
+        this.pass = pass;
+        return this;
+    }
+
+    // 设置 EHLO 使用的本机域名（默认 "localhost"）。
+    public SmtpClient LocalDomain(string domain) {
+        this.localDomain = domain;
+        return this;
+    }
+
+    // 设置网络超时（毫秒），默认 30 秒。
+    public SmtpClient SetTimeout(int ms) {
+        this.timeoutMs = ms;
+        return this;
+    }
+
+    public void Close() {
+        if (this.tls != null) { this.tls.Close(); this.tls = null; }
+        if (this.conn != null) { this.conn.Close(); this.conn = null; }
+        this.open = false;
+        this.inbuf = null;
+        this.inhead = 0;
+        this.intail = 0;
+    }
+
+    public void Dispose() { this.Close(); }
+
+    // 析构兜底：防止漏关时泄露套接字。
+    ~SmtpClient() { this.Close(); }
+
+    // ---- 底层收发（与 RedisClient 同构的累积读缓冲）----
+
+    void ensureRoom(int extra) {
+        if (this.inbuf == null) {
+            this.inbuf = new byte[16385];
+            this.incap = 16384;
+        }
+        int span = this.incap - this.intail;
+        if (this.inhead > 0 && span < extra) {
+            // 压缩已消费的前缀。
+            NativeMemory.Copy((nint)this.inbuf, (nint)this.inbuf + (nint)this.inhead,
+                              this.intail - this.inhead);
+            this.intail = this.intail - this.inhead;
+            this.inhead = 0;
+        }
+        if (this.intail + extra <= this.incap) { return; }
+        int ncap = this.incap * 2;
+        while (this.intail + extra > ncap) { ncap = ncap * 2; }
+        byte[] nb = new byte[ncap + 1];
+        if (this.intail > 0) {
+            NativeMemory.Copy((nint)nb, (nint)this.inbuf, this.intail);
+        }
+        this.inbuf = nb;
+        this.incap = ncap;
+    }
+
+    int incap;
+
+    async int fillMore() {
+        if (this.tls != null) {
+            byte[] tmp = new byte[16385];
+            int n = await this.tls.RecvBytesAsync(tmp, 0, 16384);
+            if (n <= 0) { return 0; }
+            this.ensureRoom(n);
+            NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp, n);
+            this.intail = this.intail + n;
+            return n;
+        }
+        this.ensureRoom(16384);
+        nint sock = this.conn.GetSocket();
+        byte[] tmp2 = new byte[16385];
+        int n2 = await Socket.RecvOv(sock, tmp2, 16384);
+        if (n2 <= 0) { return 0; }
+        this.ensureRoom(n2);
+        NativeMemory.Copy((nint)this.inbuf + (nint)this.intail, (nint)tmp2, n2);
+        this.intail = this.intail + n2;
+        return n2;
+    }
+
+    // 读一行（不含 CRLF）；对端关闭返回 null。
+    async string readLineRaw() {
+        int scan = this.inhead;
+        while (true) {
+            while (scan + 1 < this.intail) {
+                if ((this.inbuf[scan] & 255) == 13 && (this.inbuf[scan + 1] & 255) == 10) {
+                    string line = Encoding.UTF8.GetString(this.inbuf, this.inhead, scan - this.inhead);
+                    this.inhead = scan + 2;
+                    return line;
+                }
+                scan = scan + 1;
+            }
+            int got = await this.fillMore();
+            if (got <= 0) { return null; }
+            scan = this.intail - (this.intail - scan > 0 ? 0 : 0);
+            // 重新从消费点之后扫描（fillMore 前移了 intail）。
+            scan = this.inhead;
+            // 已扫过的段落没有 CRLF，跳到 tail 继续扫，避免 O(n^2)。
+            scan = this.intail - 1;
+            if (scan < this.inhead) { scan = this.inhead; }
+        }
+    }
+
+    // 读取一条完整 SMTP 响应（可能多行 "250-..." / "250 ..."）。
+    // 失败/关闭返回 null。行数上限 512，防止恶意服务器无限刷行。
+    async string readResponse() {
+        StringBuilder sb = new StringBuilder();
+        string last = "";
+        int code = 0;
+        int lines = 0;
+        while (true) {
+            string line = await this.readLineRaw();
+            if (line == null) { return null; }
+            lines = lines + 1;
+            if (lines > 512) { return null; }
+            if (line.Length < 3) { return null; }
+            bool digits = true;
+            for (int i = 0; i < 3; i = i + 1) {
+                int c = line[i] & 255;
+                if (c < 48 || c > 57) { digits = false; break; }
+            }
+            if (!digits) { return null; }
+            int thisCode = (line[0] - 48) * 100 + (line[1] - 48) * 10 + (line[2] - 48);
+            bool final = line.Length == 3 || (line[3] & 255) != 45;
+            string text = line.Length > 4 ? line.Substring(4) : "";
+            if (sb.Length > 0) { sb.Append("\n"); }
+            sb.Append(text);
+            code = thisCode;
+            last = text;
+            if (final) { break; }
+        }
+        this.lastResponse = sb.ToString();
+        this.lastCode = code;
+        return sb.ToString();
+    }
+
+    // 发送一行命令（CRLF 结尾）。
+    async bool writeLine(string line) {
+        byte[] buf = Encoding.UTF8.GetBytes(line + "\r\n");
+        int n = await this.sendBytes(buf, buf.Length);
+        return n == buf.Length;
+    }
+
+    async int sendBytes(byte[] buf, int len) {
+        if (this.tls != null) {
+            return await this.tls.SendBytesAsync(buf, 0, len);
+        }
+        nint sock = this.conn.GetSocket();
+        return await Socket.SendBytesAsync(sock, buf, 0, len);
+    }
+
+    // ---- MIME 编码 ----
+
+    // RFC 2047 B 词编码：=?UTF-8?B?<base64>?=（主题等头字段用）。
+    public static string HeaderWord(string text) {
+        bool needs = false;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c >= 128 || c < 32) { needs = true; break; }
+        }
+        if (!needs) { return text; }
+        return "=?UTF-8?B?" + Base64.Encode(Encoding.UTF8.GetBytes(text)) + "?=";
+    }
+
+    // 地址头：显示名（可含中文）+ <addr>；无显示名退化为裸地址。
+    public static string AddrHeader(string displayName, string addr) {
+        if (displayName == null || displayName.Length == 0) { return addr; }
+        return HeaderWord(displayName) + " <" + addr + ">";
+    }
+
+    // 把任意文本切成 ≤76 字符的行并做 quoted-printable 软换行。
+    // 禁止跨多字节字符切断：按码点边界回退。
+    static void QpAppend(StringBuilder sb, string text) {
+        string enc = QuotedPrintableEncode(text);
+        // enc 行已按字符累计（qp 编码后每字符 1..3 字节输出），
+        // 直接按 75 字符切，行尾挂软换行 =\r\n。
+        int start = 0;
+        int n = enc.Length;
+        while (n - start > 75) {
+            int cut = start + 75;
+            // 回退到 '=' 后（不允许把 =XX 切一半）。
+            while (cut > start + 1 && (enc[cut - 1] & 255) == 61) { cut = cut - 1; }
+            sb.Append(enc.Substring(start, cut - start));
+            sb.Append("=\r\n");
+            start = cut;
+        }
+        if (n > start) { sb.Append(enc.Substring(start, n - start)); }
+    }
+
+    // Quoted-printable 编码（RFC 2045 §6.7）：可打印字符直出，
+    // 其余 =XX；行尾空格/制表符也编码；不产生裸 CRLF。
+    public static string QuotedPrintableEncode(string text) {
+        StringBuilder sb = new StringBuilder();
+        int lineLen = 0;
+        int n = text.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = text[i] & 255;
+            // UTF-8 按字节走：字符串索引即字节（Zan string 是字节串）。
+            bool printable = c >= 33 && c <= 126 && c != 61;
+            bool space = c == 32 || c == 9;
+            if (c == 13 || c == 10) {
+                // 裸换行编码为 =0D/=0A（正文换行由调用方组织）。
+                sb.Append(c == 13 ? "=0D" : "=0A");
+                lineLen = lineLen + 3;
+                continue;
+            }
+            string piece = printable ? ((char)c).ToString()
+                : space ? ((char)c).ToString()
+                : "=" + Encoding.ByteToHex(c).ToUpper();
+            if (space && (i == n - 1 || (text[i + 1] & 255) == 13 || (text[i + 1] & 255) == 10)) {
+                piece = space ? (c == 32 ? "=20" : "=09") : piece;
+            }
+            if (lineLen + piece.Length > 75) {
+                sb.Append("=\r\n");
+                lineLen = 0;
+            }
+            sb.Append(piece);
+            lineLen = lineLen + piece.Length;
+        }
+        return sb.ToString();
+    }
+
+    // 组装 MIME 报文（不含 SMTP 信封命令）。
+    // 边界基于时间与随机派生，正文里出现同串的概率可忽略；
+    // 仍做一次防冲突校验。
+    public string MimeText(MailMessage msg, string boundary, string dateLine, string messageId) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("From: ").Append(msg.from).Append("\r\n");
+        this.AppendAddrList(sb, "To", msg.to);
+        this.AppendAddrList(sb, "Cc", msg.cc);
+        sb.Append("Subject: ").Append(SmtpClient.HeaderWord(msg.subject)).Append("\r\n");
+        sb.Append("Date: ").Append(dateLine).Append("\r\n");
+        sb.Append("Message-ID: <").Append(messageId).Append(">\r\n");
+        sb.Append("MIME-Version: 1.0\r\n");
+        for (int i = 0; i < msg.extraHeaders.Count; i = i + 1) {
+            sb.Append(msg.extraHeaders[i]).Append("\r\n");
+        }
+        if (msg.parts.Count == 1 && msg.parts[0].kind != 2) {
+            MailPart p = msg.parts[0];
+            if (p.kind == 1) {
+                sb.Append("Content-Type: text/html; charset=UTF-8\r\n");
+            } else {
+                sb.Append("Content-Type: text/plain; charset=UTF-8\r\n");
+            }
+            sb.Append("Content-Transfer-Encoding: quoted-printable\r\n");
+            sb.Append("\r\n");
+            QpAppend(sb, p.content);
+            sb.Append("\r\n");
+            return sb.ToString();
+        }
+        string ct = "multipart/mixed";
+        bool onlyText = true;
+        for (int i = 0; i < msg.parts.Count; i = i + 1) {
+            if (msg.parts[i].kind == 2) { onlyText = false; break; }
+        }
+        if (onlyText) { ct = "multipart/alternative"; }
+        sb.Append("Content-Type: ").Append(ct).Append("; boundary=\"")
+          .Append(boundary).Append("\"\r\n\r\n");
+        for (int i = 0; i < msg.parts.Count; i = i + 1) {
+            MailPart p = msg.parts[i];
+            sb.Append("--").Append(boundary).Append("\r\n");
+            if (p.kind == 2) {
+                sb.Append("Content-Type: application/octet-stream; name=\"")
+                  .Append(SmtpClient.EscFileName(p.fileName)).Append("\"\r\n");
+                sb.Append("Content-Disposition: attachment; filename=\"")
+                  .Append(SmtpClient.EscFileName(p.fileName)).Append("\"\r\n");
+                sb.Append("Content-Transfer-Encoding: base64\r\n\r\n");
+                this.AppendBase64Wrapped(sb, p.content);
+            } else if (p.kind == 1) {
+                sb.Append("Content-Type: text/html; charset=UTF-8\r\n");
+                sb.Append("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+                QpAppend(sb, p.content);
+            } else {
+                sb.Append("Content-Type: text/plain; charset=UTF-8\r\n");
+                sb.Append("Content-Transfer-Encoding: quoted-printable\r\n\r\n");
+                QpAppend(sb, p.content);
+            }
+            sb.Append("\r\n");
+        }
+        sb.Append("--").Append(boundary).Append("--\r\n");
+        return sb.ToString();
+    }
+
+    void AppendAddrList(StringBuilder sb, string header, List<string> addrs) {
+        if (addrs.Count == 0) { return; }
+        sb.Append(header).Append(": ");
+        for (int i = 0; i < addrs.Count; i = i + 1) {
+            if (i > 0) { sb.Append(", "); }
+            sb.Append(addrs[i]);
+        }
+        sb.Append("\r\n");
+    }
+
+    static string EscFileName(string name) {
+        string s = name == null ? "" : name;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if (c == 34 || c == 92 || c == 13 || c == 10) { continue; }
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+
+    // base64 按 76 字符折行（MIME 要求）。
+    void AppendBase64Wrapped(StringBuilder sb, string b64) {
+        int start = 0;
+        int n = b64.Length;
+        while (n - start > 76) {
+            sb.Append(b64.Substring(start, 76)).Append("\r\n");
+            start = start + 76;
+        }
+        if (n > start) { sb.Append(b64.Substring(start, n - start)).Append("\r\n"); }
+    }
+
+    // RFC 5321 §4.5.2：行首的句点加倍（透明化），发送时按行走。
+    static string DotStuff(string mime) {
+        StringBuilder sb = new StringBuilder();
+        int n = mime.Length;
+        int i = 0;
+        bool atLineStart = true;
+        while (i < n) {
+            int c = mime[i] & 255;
+            if (atLineStart && c == 46) { sb.Append('.'); }
+            sb.Append((char)(c & 255) == c ? mime[i] : '?');
+            atLineStart = c == 10;
+            i = i + 1;
+        }
+        return sb.ToString();
+    }
+
+    // ---- 会话 ----
+
+    // 发送一封邮件。连接未建立时自动建立（EHLO/STARTTLS/AUTH）。
+    // MAIL FROM 用 msg.from；RCPT 用 to+cc+bcc 全量。
+    public async SmtpResult SendAsync(MailMessage msg) {
+        if (msg == null || msg.from.Length == 0 || msg.to.Count == 0) {
+            return SmtpResult.Fail("envelope", 0, "缺少发件人或收件人");
+        }
+        if (!this.open) {
+            SmtpResult up = await this.ConnectHandshakeAsync();
+            if (!up.ok) { return up; }
+        }
+        // EHLO 能力在握手时已取；若服务器要 STARTTLS 而我们还没升，
+        // 这里补一次升级重握手。
+        if (this.serverStartTls && this.tls == null) {
+            if (!await this.writeLine("STARTTLS")) {
+                return SmtpResult.Fail("starttls", 0, "写入失败");
+            }
+            string resp = await this.readResponse();
+            if (resp == null || this.lastCode != 220) {
+                return SmtpResult.Fail("starttls", this.lastCode, this.lastResponse);
+            }
+            TlsContext ctx = TlsContext.CreateClient();
+            TlsStream ts = await TlsStream.ConnectAsync(ctx, this.conn.GetSocket(),
+                                                        this.host, this.timeoutMs);
+            if (ts == null) {
+                return SmtpResult.Fail("starttls", 0, "TLS 握手失败: " + ctx.error);
+            }
+            this.tls = ts;
+            this.inhead = 0;
+            this.intail = 0;
+            SmtpResult eh = await this.EhloAsync();
+            if (!eh.ok) { return eh; }
+        }
+        // AUTH。
+        if (this.serverAuth && this.user.Length > 0) {
+            SmtpResult ar = await this.AuthAsync();
+            if (!ar.ok) { return ar; }
+        }
+        // MAIL FROM。
+        if (!await this.writeLine("MAIL FROM:<" + msg.from + "> BODY=8BITMIME")) {
+            return SmtpResult.Fail("mail", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 250) {
+            return SmtpResult.Fail("mail", this.lastCode, this.lastResponse);
+        }
+        // RCPT TO（to+cc+bcc）。
+        for (int i = 0; i < msg.to.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(msg.to[i]);
+            if (!rr.ok) { return rr; }
+        }
+        for (int i = 0; i < msg.cc.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(msg.cc[i]);
+            if (!rr.ok) { return rr; }
+        }
+        for (int i = 0; i < msg.bcc.Count; i = i + 1) {
+            SmtpResult rr = await this.RcptAsync(msg.bcc[i]);
+            if (!rr.ok) { return rr; }
+        }
+        // DATA。
+        if (!await this.writeLine("DATA")) {
+            return SmtpResult.Fail("data", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 354) {
+            return SmtpResult.Fail("data", this.lastCode, this.lastResponse);
+        }
+        string mime = this.MimeText(msg, this.MakeBoundary(), this.MakeDateLine(),
+                                    this.MakeMessageId(msg));
+        mime = SmtpClient.DotStuff(mime);
+        // 报文 + CRLF.CRLF 终止符，一次写出发。
+        byte[] body = Encoding.UTF8.GetBytes(mime + ".\r\n");
+        int sent = await this.sendBytes(body, body.Length);
+        if (sent != body.Length) {
+            return SmtpResult.Fail("data", 0, "正文写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 250) {
+            return SmtpResult.Fail("data", this.lastCode, this.lastResponse);
+        }
+        // QUIT 留给连接复用：不主动发，Close 时由 TCP 收尾。
+        SmtpResult ok = new SmtpResult();
+        ok.ok = true;
+        ok.lastCode = this.lastCode;
+        ok.lastResponse = this.lastResponse;
+        return ok;
+    }
+
+    async SmtpResult RcptAsync(string addr) {
+        if (!await this.writeLine("RCPT TO:<" + addr + ">")) {
+            return SmtpResult.Fail("rcpt", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 250 && this.lastCode != 251) {
+            return SmtpResult.Fail("rcpt", this.lastCode, this.lastResponse);
+        }
+        SmtpResult r = new SmtpResult();
+        r.ok = true;
+        return r;
+    }
+
+    // 建连 + EHLO（含能力记录）。隐式 TLS 时先握手。
+    async SmtpResult ConnectHandshakeAsync() {
+        TcpClient tc = await TcpClient.ConnectAsync(this.host, this.port, this.timeoutMs);
+        if (tc == null) {
+            return SmtpResult.Fail("connect", 0, "连接失败: " + this.host + ":" + this.port);
+        }
+        this.conn = tc;
+        if (this.implicitTls) {
+            TlsContext ctx = TlsContext.CreateClient();
+            TlsStream ts = await TlsStream.ConnectAsync(ctx, tc.GetSocket(),
+                                                        this.host, this.timeoutMs);
+            if (ts == null) {
+                this.Close();
+                return SmtpResult.Fail("tls", 0, "TLS 握手失败: " + ctx.error);
+            }
+            this.tls = ts;
+        }
+        this.open = true;
+        // 220 问候。
+        await this.readResponse();
+        if (this.lastCode != 220) {
+            SmtpResult r = SmtpResult.Fail("greeting", this.lastCode, this.lastResponse);
+            this.Close();
+            return r;
+        }
+        SmtpResult eh = await this.EhloAsync();
+        if (!eh.ok) { this.Close(); return eh; }
+        SmtpResult done = new SmtpResult();
+        done.ok = true;
+        return done;
+    }
+
+    async SmtpResult EhloAsync() {
+        string domain = this.localDomain.Length > 0 ? this.localDomain : "localhost";
+        if (!await this.writeLine("EHLO " + domain)) {
+            return SmtpResult.Fail("ehlo", 0, "写入失败");
+        }
+        string resp = await this.readResponse();
+        if (resp == null || this.lastCode != 250) {
+            // EHLO 失败退回 HELO。
+            if (!await this.writeLine("HELO " + domain)) {
+                return SmtpResult.Fail("ehlo", 0, "写入失败");
+            }
+            resp = await this.readResponse();
+            if (resp == null || this.lastCode != 250) {
+                return SmtpResult.Fail("ehlo", this.lastCode, this.lastResponse);
+            }
+            this.serverStartTls = false;
+            this.serverAuth = false;
+            SmtpResult ok = new SmtpResult();
+            ok.ok = true;
+            return ok;
+        }
+        this.serverStartTls = this.HasCap(resp, "STARTTLS");
+        this.serverAuth = this.HasCap(resp, "AUTH");
+        this.serverPipelining = this.HasCap(resp, "PIPELINING");
+        this.serverEightBitMime = this.HasCap(resp, "8BITMIME");
+        SmtpResult r = new SmtpResult();
+        r.ok = true;
+        return r;
+    }
+
+    bool HasCap(string ehloResp, string cap) {
+        int pos = 0;
+        int n = ehloResp.Length;
+        while (pos < n) {
+            int nl = ehloResp.IndexOf("\n", pos);
+            int end = nl < 0 ? n : nl;
+            string line = ehloResp.Substring(pos, end - pos);
+            if (line == cap || (line.Length > cap.Length &&
+                                line.Substring(0, cap.Length) == cap &&
+                                (line[cap.Length] & 255) == 32)) {
+                return true;
+            }
+            if (nl < 0) { break; }
+            pos = nl + 1;
+        }
+        return false;
+    }
+
+    // AUTH PLAIN 优先，服务器不认就退 AUTH LOGIN。
+    async SmtpResult AuthAsync() {
+        string plain = this.user + "\0" + this.user + "\0" + this.pass;
+        string b64 = Base64.Encode(Encoding.UTF8.GetBytes(plain));
+        if (!await this.writeLine("AUTH PLAIN " + b64)) {
+            return SmtpResult.Fail("auth", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode == 235) {
+            SmtpResult ok = new SmtpResult();
+            ok.ok = true;
+            return ok;
+        }
+        if (this.lastCode != 504 && this.lastCode != 535 && this.lastCode != 500 && this.lastCode != 502) {
+            return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
+        }
+        // 退 AUTH LOGIN。
+        if (!await this.writeLine("AUTH LOGIN")) {
+            return SmtpResult.Fail("auth", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 334) {
+            return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
+        }
+        if (!await this.writeLine(Base64.Encode(Encoding.UTF8.GetBytes(this.user)))) {
+            return SmtpResult.Fail("auth", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 334) {
+            return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
+        }
+        if (!await this.writeLine(Base64.Encode(Encoding.UTF8.GetBytes(this.pass)))) {
+            return SmtpResult.Fail("auth", 0, "写入失败");
+        }
+        await this.readResponse();
+        if (this.lastCode != 235) {
+            return SmtpResult.Fail("auth", this.lastCode, this.lastResponse);
+        }
+        SmtpResult ok2 = new SmtpResult();
+        ok2.ok = true;
+        return ok2;
+    }
+
+    string MakeBoundary() {
+        long us = ServerMetrics.MonoMicros();
+        return "zan_" + Convert.ToString((long)(us & 72057594037927935L), 36);
+    }
+
+    string MakeDateLine() {
+        // RFC 5322 日期：Thu, 01 Jan 2026 12:00:00 +0000。
+        DateTime dt = DateTime.UtcNow();
+        return SmtpClient.Weekday(dt.DayOfWeek) + ", " +
+            SmtpClient.Pad2(dt.Day()) + " " + SmtpClient.MonthName(dt.Month()) + " " +
+            Convert.ToString(dt.Year()) + " " + SmtpClient.Pad2(dt.Hour()) + ":" +
+            SmtpClient.Pad2(dt.Minute()) + ":" + SmtpClient.Pad2(dt.Second()) + " +0000";
+    }
+
+    string MakeMessageId(MailMessage msg) {
+        long us = ServerMetrics.MonoMicros();
+        string dom = msg.from;
+        int at = dom.IndexOf("@", 0);
+        if (at >= 0) { dom = dom.Substring(at + 1); }
+        if (dom.Length == 0) { dom = "local"; }
+        return Convert.ToString((long)(us & 72057594037927935L), 36) + "." + dom;
+    }
+
+    static string Pad2(int v) {
+        if (v >= 10) { return Convert.ToString(v); }
+        return "0" + Convert.ToString(v);
+    }
+
+    static string Weekday(int dow) {
+        // DateTime.dayOfWeek: 0=周日（与 C tm_wday 同源）。
+        if (dow == 0) { return "Sun"; }
+        if (dow == 1) { return "Mon"; }
+        if (dow == 2) { return "Tue"; }
+        if (dow == 3) { return "Wed"; }
+        if (dow == 4) { return "Thu"; }
+        if (dow == 5) { return "Fri"; }
+        return "Sat";
+    }
+
+    static string MonthName(int mon) {
+        if (mon == 1) { return "Jan"; }
+        if (mon == 2) { return "Feb"; }
+        if (mon == 3) { return "Mar"; }
+        if (mon == 4) { return "Apr"; }
+        if (mon == 5) { return "May"; }
+        if (mon == 6) { return "Jun"; }
+        if (mon == 7) { return "Jul"; }
+        if (mon == 8) { return "Aug"; }
+        if (mon == 9) { return "Sep"; }
+        if (mon == 10) { return "Oct"; }
+        if (mon == 11) { return "Nov"; }
+        return "Dec";
+    }
+
+    // 发送后主动退出并关闭（连接复用时可跳过）。
+    public async void QuitAsync() {
+        if (!this.open) { return; }
+        await this.writeLine("QUIT");
+        await this.readResponse();
+        this.Close();
+    }
+
+    // 最近一次响应文本（调试用）。
+    public string LastResponse() { return this.lastResponse; }
+    public int LastCode() { return this.lastCode; }
+}

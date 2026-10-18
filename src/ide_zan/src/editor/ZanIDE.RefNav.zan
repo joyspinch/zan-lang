@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Diagnostics;
+using System.Collections.Generic;
+using System.Threading;
 using System.Json;
 using System.Data;
 using System.Data.Sqlite;
@@ -62,5 +64,232 @@ partial class ZanIDE {
         }
         lastActive = 0 - 1;
         app.RequestRedraw();
+    }
+
+    static void CollectRefsInSnapshot(IdeSourceSnapshot source, IdeNavigationSnapshot snapshot,
+            List<SearchHit> hits) {
+        List<string> lines = CodeEditor.SplitLines(source.body);
+        if (snapshot.referenceOwner.Length == 0) {
+            for (int i = 0; i < lines.Count && hits.Count < 2000; i = i + 1) {
+                if (ZanIDE.CountWord(lines[i], snapshot.word) > 0) {
+                    hits.Add(SearchHit.Create(source.path, i, CodeEditor.LTrim(lines[i])));
+                }
+            }
+            return;
+        }
+        CeFileIndex index = CeFileIndex.Of(lines);
+        List<string> receivers = new List<string>();
+        receivers.Add("this"); receivers.Add("base");
+        for (int i = 0; i < snapshot.family.Count; i = i + 1) {
+            string type = snapshot.family[i];
+            if (!CodeEditor.Has(receivers, type)) { receivers.Add(type); }
+            CodeEditor.CollectTypedVarsPre(index.stripped, type, receivers);
+        }
+        List<int> found = new List<int>();
+        CodeEditor.CountMemberRefsWith(index, snapshot.family, receivers, snapshot.word, found);
+        for (int i = 0; i < found.Count && hits.Count < 2000; i = i + 1) {
+            hits.Add(SearchHit.Create(source.path, found[i], CodeEditor.LTrim(lines[found[i]])));
+        }
+    }
+
+    static List<SearchHit> ReferencesInSnapshot(IdeNavigationSnapshot snapshot,
+            IdeProjectSourceCache cache, List<string> rows) {
+        List<SearchHit> hits = new List<SearchHit>();
+        Dictionary<string, List<string>> previews = new Dictionary<string, List<string>>();
+        if (rows != null) {
+            for (int i = 0; i < rows.Count && hits.Count < 2000; i = i + 1) {
+                if (snapshot.cancellation.IsCancellationRequested) { return hits; }
+                int separator = rows[i].IndexOf("\t");
+                if (separator <= 0) { continue; }
+                string path = rows[i].Substring(0, separator);
+                int line = ZanIDE.ParseInt(rows[i].Substring(separator + 1, rows[i].Length - separator - 1));
+                string key = ZanIDE.NormPath(path);
+                if (!previews.ContainsKey(key)) {
+                    IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, path);
+                    string body = opened != null ? opened.body : File.Exists(path) ? File.ReadAllText(path) : "";
+                    previews[key] = CodeEditor.SplitLines(body);
+                }
+                List<string> lines = previews[key];
+                if (line < 0 || line >= lines.Count) { continue; }
+                hits.Add(SearchHit.Create(path, line, CodeEditor.LTrim(lines[line])));
+            }
+            if (hits.Count > 0) { return hits; }
+        }
+        if (snapshot.lacksReferenceMember) { return hits; }
+        List<IdeSourceSnapshot> sources = ZanIDE.MergeSourceSnapshots(cache.project, snapshot.documents);
+        for (int i = 0; i < sources.Count && hits.Count < 2000; i = i + 1) {
+            if (snapshot.cancellation.IsCancellationRequested) { return hits; }
+            if (!sources[i].path.ToLower().EndsWith(".zan")) { continue; }
+            ZanIDE.CollectRefsInSnapshot(sources[i], snapshot, hits);
+        }
+        return hits;
+    }
+
+    void CollectReferencesAsync() {
+        IdeNavigationGuard guard = this.BeginCodeNavigation(true, true);
+        if (guard == null) { return; }
+        if (guard.snapshot.word.Length == 0) {
+            log.Add("> Find All References: no symbol under caret."); app.RequestRedraw(); return;
+        }
+        LspSession session = guard.session;
+        if (session != null && session.Alive()
+            && ZanIDE.NavigationPathInRoot(guard.snapshot.path, guard.snapshot.root)) {
+            session.ReferencesAsync(guard.snapshot.path, guard.snapshot.line, guard.snapshot.column,
+                delegate (LspReferencesResult result) {
+                    if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+                    if (result != null && !session.IsCurrent(result.path, result.version,
+                            result.generation, result.documentGeneration)) { return; }
+                    guard.semantic = result;
+                    this.StartReferenceScan(guard, result != null ? result.rows : null);
+                });
+        } else { this.StartReferenceScan(guard, null); }
+    }
+
+    void StartReferenceScan(IdeNavigationGuard guard, List<string> rows) {
+        this.WithProjectSources(delegate () {
+            if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+            IdeNavigationSnapshot snapshot = guard.snapshot;
+            IdeProjectSourceCache cache = navigationSources;
+            App host = app;
+            navigationWork.Run(delegate () {
+                List<SearchHit> hits = new List<SearchHit>();
+                string failure = "";
+                try { hits = ZanIDE.ReferencesInSnapshot(snapshot, cache, rows); }
+                catch (Exception error) {
+                    failure = error.Message;
+                }
+                if (snapshot.cancellation.IsCancellationRequested) { return; }
+                host.Post(delegate () {
+                    if (!this.NavigationGuardCurrent(guard, true, true)) { return; }
+                    if (failure != "") { log.Add("> Find All References: " + failure); }
+                    else {
+                        log.Add("> " + Convert.ToString(hits.Count) + " reference(s) to '" + snapshot.word + "'.");
+                        refAnchorLine = snapshot.line;
+                        if (hits.Count > 0) { refList.Show(snapshot.word, hits, snapshot.root); }
+                    }
+                    app.RequestRedraw();
+                });
+            });
+        });
+    }
+
+    void GotoSearchHitAsync(List<SearchHit> hits, int index) {
+        if (index < 0 || index >= hits.Count) { return; }
+        SearchHit hit = hits[index];
+        string path = hit.path;
+        int line = hit.line;
+        string message = "> Match " + Convert.ToString(index + 1) + "/"
+            + Convert.ToString(hits.Count) + ": " + Path.GetFileName(path) + ":" + Convert.ToString(line + 1);
+        IdeNavigationGuard guard = this.BeginCodeNavigation(false, false);
+        if (guard == null) { return; }
+        IdeNavigationSnapshot snapshot = guard.snapshot;
+        App host = app;
+        navigationWork.Run(delegate () {
+            IdeNavigationTarget result = new IdeNavigationTarget();
+            try {
+                IdeSourceSnapshot opened = ZanIDE.SnapshotSource(snapshot.documents, path);
+                if (opened != null || File.Exists(path)) {
+                    IdeNavigationDiskText read = opened == null ? ZanIDE.ReadNavigationDiskText(path) : null;
+                    string body = opened != null ? opened.body : read.body;
+                    result = ZanIDE.PrepareNavigationTarget(path, body, line, 0, "", false);
+                    result.fromDisk = read != null;
+                    result.diskStamp = read != null ? read.stamp : 0;
+                }
+                result.message = message;
+            } catch (Exception error) {
+                result.message = "> Match: " + error.Message;
+            }
+            if (snapshot.cancellation.IsCancellationRequested) { return; }
+            host.Post(delegate () { this.ApplyNavigationTarget(guard, result); });
+        });
+    }
+
+    static int CountWord(string line, string word) {
+        int wl = word.Length;
+        if (wl == 0 || line == null) { return 0; }
+        int count = 0;
+        int i = 0;
+        int len = line.Length;
+        while (i + wl <= len) {
+            if (line.Substring(i, wl) == word) {
+                bool leftOk = true;
+                bool rightOk = true;
+                if (i > 0) { leftOk = !CodeEditor.IsIdentByte(line[i - 1]); }
+                if (i + wl < len) { rightOk = !CodeEditor.IsIdentByte(line[i + wl]); }
+                if (leftOk && rightOk) { count = count + 1; i = i + wl; }
+                else { i = i + 1; }
+            } else { i = i + 1; }
+        }
+        return count;
+    }
+
+    static List<SearchHit> CollectReferences(LspSession lsp, CodeEditor editor,
+                                            List<TabRecord> tabs,
+                                            SignalInt active, string root) {
+        List<SearchHit> hits = new List<SearchHit>();
+        string word = editor.WordAtCaret();
+        if (word.Length == 0) { return hits; }
+        int a = active.Get();
+        if (a >= 0 && a < tabs.Count) { tabs[a].body = editor.GetText(); }
+        bool inRoot = a >= 0 && a < tabs.Count
+            && ZanIDE.NormPath(tabs[a].path).StartsWith(ZanIDE.NormPath(root));
+        if (lsp != null && lsp.Alive() && inRoot && tabs[a].path.Length > 0) {
+            lsp.SyncDoc(tabs[a].path, tabs[a].body);
+            List<string> rows = lsp.References(
+                tabs[a].path, editor.CurLine(), editor.CurCol());
+            string cachePath = "";
+            List<string> cacheLines = new List<string>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int sep = ZanIDE.IndexOfStr(rows[i], "\t");
+                if (sep <= 0) { continue; }
+                string rp = rows[i].Substring(0, sep);
+                int ln = ZanIDE.ParseInt(
+                    rows[i].Substring(sep + 1, rows[i].Length - sep - 1));
+                if (rp != cachePath) {
+                    cachePath = rp;
+                    cacheLines = ZanIDE.SourceLines(tabs, rp);
+                }
+                string prev = "";
+                if (ln >= 0 && ln < cacheLines.Count) {
+                    prev = CodeEditor.LTrim(cacheLines[ln]);
+                }
+                hits.Add(SearchHit.Create(rp, ln, prev));
+            }
+            if (hits.Count > 0) { return hits; }
+        }
+        string owner = editor.OwnerTypeAtCaret();
+        if (owner.Length == 0) { owner = editor.EnclosingTypeOfCaretDecl(); }
+        if (owner.Length > 0 && CodeEditor.SymbolTypeLacksMember(owner, word)) {
+            return hits;
+        }
+        for (int i = 0; i < tabs.Count; i = i + 1) {
+            if (!tabs[i].path.EndsWith(".zan")) { continue; }
+            ZanIDE.CollectRefsInFile(tabs[i].path, tabs[i].body, word, owner, hits);
+        }
+        List<string> files = ZanIDE.ListZanFiles(root);
+        for (int fi = 0; fi < files.Count; fi = fi + 1) {
+            string fp = files[fi];
+            if (ZanIDE.FindTabByPath(tabs, fp) >= 0) { continue; }
+            if (!File.Exists(fp)) { continue; }
+            ZanIDE.CollectRefsInFile(fp, File.ReadAllText(fp), word, owner, hits);
+        }
+        return hits;
+    }
+
+    static void CollectRefsInFile(string path, string body, string word,
+                                  string owner, List<SearchHit> hits) {
+        List<string> ls = CodeEditor.SplitLines(body);
+        List<int> lns = new List<int>();
+        if (owner.Length > 0) {
+            CodeEditor.CountMemberRefsIn(ls, word, owner, lns);
+        } else {
+            for (int i = 0; i < ls.Count; i = i + 1) {
+                if (ZanIDE.CountWord(ls[i], word) > 0) { lns.Add(i); }
+            }
+        }
+        for (int h = 0; h < lns.Count; h = h + 1) {
+            if (hits.Count >= 2000) { return; }
+            hits.Add(SearchHit.Create(path, lns[h], CodeEditor.LTrim(ls[lns[h]])));
+        }
     }
 }
