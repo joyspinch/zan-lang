@@ -398,3 +398,67 @@
   `Current` 支持**属性**（`get_Current`）与**方法**（`Current()`）两种形态
   ——与 C 宿主 irgen 的口径一致（字段形态是 C 宿主的缺口，见 A398）。
   用例 `tests/conformance/enumerable_protocol.zan` 钉住。
+
+### [ ] A401 自举：认不出的调用**静默返回 0**——违反 fail-closed
+
+- 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_unknown.zan`）：
+  ```zan
+  Console.WriteLine(Task.Delay(80));
+  ```
+  - C 宿主：编译期报错（`unresolved call 'Task.Delay'`）。
+  - 自举：IR 里是 `printf(@.fmt.nl, i64 0)`——**一个字诊断都没有**，程序
+    拿着错的值继续跑。
+  - 根因：`Task` 是 C 宿主的**内建**（`src/compiler/builtin_api.c`），不在
+    标准库的 Zan 源里，自举的 binder 不认识它 → `GenCall` 落到兜底分支
+    `return new ExprVal("0", MkType("int"))`。
+- 影响面：不止"接收者类型不认识"这一条——字符串/字典/StringBuilder 的**未知
+  方法**也静默降级（字符串返回**接收者本身**，字典返回 0）；被调用者既不是
+  成员访问也不是名字（`filters[f](item)`）也静默返回 0。
+- 方向：这些位置全部改成**报诊断**；诊断发在**降级点**（irgen），因为只有
+  降级点知道"自举到底会不会降级这个调用"（检查器对"接收者类型未知"一律放过）。
+- ✅ 已修（2026-10-20）：`irgen_expr.zan` 的 `GenCall` / `EmitStrMethod` /
+  `EmitDictMethod` / `EmitSbMethod` 全部 fail-closed；接收者名字解析不出来时
+  报 C 宿主同款措辞（`unresolved call 'X.Y': 'X' is not a known variable, type,
+  or namespace`）。两个 reject 用例钉住边界：
+  `tests/selfhost/reject/unsupported_builtin_call.zan`、
+  `tests/selfhost/reject/unresolved_call.zan`。
+
+### [ ] A402 自举：不认识 C 宿主的**编译器内建**——标准库自己就在用，全是错的
+
+- 现象：把 A401 改成 fail-closed 之后，标准库自己编不过了——报的是
+  `call to 'String.CompareOrdinal' is not supported`、`call to 'b.ToStr' is not
+  supported`、`string method 'ToBytes' is not supported`。这三类调用**自举一直
+  在错编**（静默返回 0 / 返回接收者），只是没人跑到。
+- 根因：它们是 **C 宿主后端里的内建**，不是标准库方法：
+  `String.CompareOrdinal(a,b)` → `strcmp`（`irgen_call.c`）；
+  `string.ToBytes()` / `byte[].ToStr(off,len)` → 零拷贝桥接
+  （`irgen_expr.c` 的 `emit_bytes_call`）。标准库只是调用方（`Convert.zan`、
+  `StringExtensions.zan`、`Text/Encoding.zan` …）。
+- 方向：自举按 C 宿主的口径补齐这三个内建。窗口要**钳制**（off 夹到
+  `[0,len]`，长度夹到 `[0,len-off]`）；自举的数组是**每元素一个 8 字节槽**，
+  字节要逐个打包/拆开（不能整块 memcpy）。
+- ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `StrToBytes` /
+  `ByteArrWindowToStr`，`String.CompareOrdinal` 落到 `strcmp`；用例
+  `tests/conformance/bytes_bridge.zan` 钉住（自举与 C 宿主逐字一致）。
+
+### [ ] A403 自举：调**委托类型的表达式**（`filters[f](item)`）静默返回 0
+
+- 现象：LINQ 包 `packages/Zan.Linq/src/System/Linq/Stream.zan` 里的
+  `this.filters[f](item)`（谓词存放在列表里，调用列表元素）自举**编不过**——
+  被调用者是**索引表达式**，既不是成员访问也不是名字。改 fail-closed 之前，
+  它静默返回 0 → 谓词永远返回"假" → 过滤结果全错。
+- 方向：被调用者既不是成员访问也不是名字时，**只有委托类型的表达式**能降级
+  （复用委托调用路径 `EmitDelegateCallVal`），其余报诊断。
+- ✅ 已修（2026-10-20）：`EmitDelegateCall` 拆成"求值 + 调用"两半
+  （`EmitDelegateCallVal`），`GenCall` 的兜底分支先求值再判是不是委托类型。
+  差分门里 `value_enumerable` / `linq_query` 两个用例从"编不过"变回通过。
+
+### [ ] A404 自举：认不出的**标识符**与**成员**仍静默返回 0
+
+- 现象：`GenIdent` 末尾 `return new ExprVal("0", MkType("int"))`、
+  `GenMember` 末尾同样。也就是 `int x = undefinedName;` 在自举里是 `x = 0`，
+  `obj.NoSuchField` 也是 0。
+- 方向：与 A401 同口径——报诊断。但要小心：自举的**类型推断**偏弱
+  （注释里写过"自举常常留一个标识符的值类型没解析出来"），照搬"解析不出来就
+  报错"会把合法程序也拒掉，所以要先摸清自举在哪些地方真的拿不到类型。
+- ⚠ 尚未开工：A401 只覆盖了**调用**路径，标识符/成员访问两条路还开着。

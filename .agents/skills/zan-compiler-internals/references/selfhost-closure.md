@@ -421,5 +421,34 @@ kernel32、shell32、user32、advapi32、version）。
   这些程序自举**必须拒绝**——非零退出**且不落 IR**。fail-closed 的边界要有门
   守着，否则下一次重构就会把它悄悄放回去。
 
+## 27. 自举的调用路径必须 fail-closed：认不出的调用不能静默返回 0
+
+- 动作：自举的调用路径里，凡是"认不出的调用"都要**报诊断**，不能返回常量 0：
+  - 接收者的类型不认识（不是类 / List / Dictionary / StringBuilder）→ 诊断；
+  - 接收者的名字**根本解析不出来**（不是变量、不是类型、不是命名空间）→ 诊断，
+    措辞照 C 宿主：`unresolved call 'X.Y': 'X' is not a known variable, type, or
+    namespace`；
+  - 字符串 / 字典 / StringBuilder 的**未知方法** → 诊断（跟 `List` 早先的做法
+    一致：`List method 'X' is not supported by the self-hosted compiler yet`）；
+  - 被调用者既不是成员访问也不是名字（`filters[f](item)` 这种）→ 只有**委托类型
+    的表达式**能降级（`EmitDelegateCallVal`），其余报诊断。
+- 理由（2026-10-20 差分门实测）：自举不认识 C 宿主的内建（`Task.Delay`、
+  `Math.Max`…），调用**静默降级成常量 0**——程序拿到了错的值却没有一个字提示。
+  更糟的是**标准库自己就在用**这些调用（`String.CompareOrdinal`、
+  `string.ToBytes()`、`byte[].ToStr()`），它们在自举里全是错的，只是没人跑到。
+- 连带：fail-closed 之前必须把标准库用到的**编译器内建**补齐——它们是 C 宿主
+  后端里的内建，**不是标准库方法**，标准库只是调用方：
+  - `String.CompareOrdinal(a,b)` → `strcmp`（C 宿主 `irgen_call.c`）；
+  - `string.ToBytes()` → `byte[]`（`irgen_expr.c` 的 `emit_bytes_call`）；
+  - `byte[].ToStr(off,len)` → `string`（同一个原语；窗口要按 C 宿主的口径
+    **钳制**：off 夹到 `[0, len]`，长度夹到 `[0, len-off]`）。
+  自举的数组是**每元素一个 8 字节槽**，所以字节要逐个打包/拆开，不能整块 memcpy。
+- 边界：诊断要发在**降级点**（irgen），不要放在检查器里猜——只有降级点知道
+  "这个调用自举到底会不会降级"。检查器对"接收者类型未知"一律放过（`cls == null`
+  时不报），所以这类调用会一路走到 irgen。
+- 门：这两条边界各有 reject 用例钉住
+  （`tests/selfhost/reject/unsupported_builtin_call.zan`、
+  `tests/selfhost/reject/unresolved_call.zan`）。
+
 
 

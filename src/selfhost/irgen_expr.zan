@@ -665,6 +665,127 @@ partial class Irgen {
         return new ExprVal(dst, MkType("string"));
     }
 
+    // string -> byte[]: the C host's bridge primitive (irgen_expr.c
+    // emit_bytes_call) allocates an array of the string's exact length and
+    // copies the bytes over. The self-hosted array keeps one element per
+    // 8-byte slot, so the bytes are written into their slots one by one.
+    ExprVal StrToBytes(ExprVal s) {
+        string len = StrLen(s.op);
+        string bytes = NT();
+        L("  " + bytes + " = mul i64 " + len + ", 8");
+        string tot = NT();
+        L("  " + tot + " = add i64 " + bytes + ", 16");
+        string raw = NT();
+        L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+        string hdr = NT();
+        L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
+        L("  store i64 " + len + ", i64* " + lenp);
+        string arr = NT();
+        L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string sp = NT();
+        L("  " + sp + " = getelementptr i8, i8* " + s.op + ", i64 " + ci);
+        string bv = NT();
+        L("  " + bv + " = load i8, i8* " + sp);
+        string b64 = NT();
+        L("  " + b64 + " = zext i8 " + bv + " to i64");
+        string ap = NT();
+        L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
+        L("  store i64 " + b64 + ", i64* " + ap);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        Node at = MkType("byte");
+        at.ival = 1;
+        return new ExprVal(arr, at);
+    }
+
+    // byte[] -> string over the window [off, off+len): the C host clamps the
+    // window to the array and materialises a string of that length
+    // (irgen_expr.c emit_bytes_call). The self-hosted array keeps one byte
+    // per 8-byte slot, so the bytes are packed into a fresh buffer.
+    ExprVal ByteArrWindowToStr(ExprVal a, Node e) {
+        string ap = NT();
+        L("  " + ap + " = bitcast i8* " + a.op + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
+        string alen = NT();
+        L("  " + alen + " = load i64, i64* " + lenp);
+        string off = "0";
+        string len = alen;
+        if (e.kids.Count == 2) {
+            ExprVal o = GenExpr(e.kids[0]);
+            ExprVal l = GenExpr(e.kids[1]);
+            // off := min(max(off, 0), alen)
+            string on = NT();
+            L("  " + on + " = icmp slt i64 " + o.op + ", 0");
+            string o0 = NT();
+            L("  " + o0 + " = select i1 " + on + ", i64 0, i64 " + o.op);
+            string ob = NT();
+            L("  " + ob + " = icmp sgt i64 " + o0 + ", " + alen);
+            off = NT();
+            L("  " + off + " = select i1 " + ob + ", i64 " + alen + ", i64 " + o0);
+            // avail := alen - off
+            string avail = NT();
+            L("  " + avail + " = sub i64 " + alen + ", " + off);
+            // len := min(max(len, 0), avail)
+            string ln = NT();
+            L("  " + ln + " = icmp slt i64 " + l.op + ", 0");
+            string l0 = NT();
+            L("  " + l0 + " = select i1 " + ln + ", i64 0, i64 " + l.op);
+            string lb2 = NT();
+            L("  " + lb2 + " = icmp sgt i64 " + l0 + ", " + avail);
+            len = NT();
+            L("  " + len + " = select i1 " + lb2 + ", i64 " + avail + ", i64 " + l0);
+        }
+        string dst = NT();
+        L("  " + dst + " = call i8* @zstr_new(i64 " + len + ")");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string si = NT();
+        L("  " + si + " = add i64 " + ci + ", " + off);
+        string ep = NT();
+        L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + si);
+        string raw = NT();
+        L("  " + raw + " = load i64, i64* " + ep);
+        string b = NT();
+        L("  " + b + " = trunc i64 " + raw + " to i8");
+        string dp = NT();
+        L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
+        L("  store i8 " + b + ", i8* " + dp);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        return new ExprVal(dst, MkType("string"));
+    }
+
     // assigning a byte[] to a string slot packs it into a managed string.
     // A source whose static type is unknown (the self-host often leaves the
     // type of an identifier's value unresolved) is treated as a byte[]; the
@@ -2653,7 +2774,11 @@ partial class Irgen {
     // function pointer (bit0=0, e.g. from an nint→delegate cast) — the host
     // discriminates on the tag bit; bare pointers are called without env.
     ExprVal EmitDelegateCall(Node calleeExpr, Node dty, Node e) {
-        ExprVal clo = GenExpr(calleeExpr);
+        return EmitDelegateCallVal(GenExpr(calleeExpr), dty, e);
+    }
+
+    // invoke an already-evaluated delegate value
+    ExprVal EmitDelegateCallVal(ExprVal clo, Node dty, Node e) {
         List<Node> pt = DelegParams(dty);
         Node retTy = DelegRet(dty);
         // The arguments are evaluated ONCE, before the closure/bare split.
@@ -2746,6 +2871,52 @@ partial class Irgen {
         L("  " + t + " = phi " + rt + " [ " + rClo + ", %L" + lClo + " ], [ " + rBare + ", %L" + lBare + " ]");
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
+    }
+
+    // Can this name be resolved as a value in the current context? Mirrors
+    // GenIdent's lookup order (local, this-field, this-property, static
+    // field, static method group). The call path uses it to tell an
+    // unknown receiver from a known one.
+    bool IdentResolves(string name) {
+        if (LocalIdx(name) >= 0) { return true; }
+        if (curHasThis) {
+            Node cls = binder.FindType(curClass);
+            if (cls != null) {
+                if (FieldIndex(cls, name) >= 0) { return true; }
+                if (FindMethodUp(cls, "get_" + name) != null) { return true; }
+            }
+        }
+        if (curClass != "") {
+            Node scls = binder.FindType(curClass);
+            if (scls != null) {
+                if (FindStaticField(scls, name) != null) { return true; }
+                Node mg = FindMethodUp(scls, name);
+                if (mg != null && HasMod(mg, MOD.Static())) { return true; }
+            }
+        }
+        return false;
+    }
+
+    // The static classes the C host exposes as builtins. The self-host
+    // lowers only some of their members: a call to a member it does not
+    // know is a capability gap, not a typo, and is reported as such.
+    bool IsBuiltinClassName(string name) {
+        if (name == "Console" || name == "Convert" || name == "Math") { return true; }
+        if (name == "Task" || name == "Gate" || name == "Socket") { return true; }
+        if (name == "Environment" || name == "File" || name == "Directory") { return true; }
+        if (name == "NativeMemory" || name == "BitOperations") { return true; }
+        if (name == "Vector128" || name == "Vector256" || name == "Sse2" || name == "Aes") { return true; }
+        if (name == "string" || name == "String") { return true; }
+        if (name == "int" || name == "long" || name == "double" || name == "float") { return true; }
+        if (name == "Int32" || name == "Int64" || name == "Double" || name == "Single") { return true; }
+        return false;
+    }
+
+    // "Cls.Name" -- the name a diagnostic quotes for a call the self-host
+    // cannot lower.
+    string CallLabel(Node recv, string mname) {
+        if (recv != null && recv.kind == AK.Ident()) { return recv.sval + "." + mname; }
+        return mname;
     }
 
     // ---- calls ----
@@ -3055,6 +3226,22 @@ partial class Irgen {
             ExprVal bv = GenBuiltinStatic(callee.a.sval, callee.sval, e);
             if (bv != null) { return bv; }
         }
+        // String.CompareOrdinal(a, b) -> strcmp: a compiler intrinsic in the
+        // C host (irgen_call.c), not a stdlib method. Byte-wise ordinal
+        // compare of two NUL-terminated strings.
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0
+            && (callee.a.sval == "String" || callee.a.sval == "string")
+            && callee.sval == "CompareOrdinal" && e.kids.Count == 2) {
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            if (!ExternSeen("strcmp")) { externDecls.Add("strcmp"); H("declare i32 @strcmp(i8*, i8*)"); }
+            string r0 = NT();
+            L("  " + r0 + " = call i32 @strcmp(i8* " + a.op + ", i8* " + b.op + ")");
+            string r = NT();
+            L("  " + r + " = sext i32 " + r0 + " to i64");
+            return new ExprVal(r, MkType("int"));
+        }
         // method access forms
         if (callee.kind == AK.MemberAccess()) {
             Node obj = callee.a;
@@ -3071,8 +3258,25 @@ partial class Irgen {
                 }
                 return EmitStaticCall(obj.sval, mname, e);
             }
+            // A receiver that resolves to nothing is a dead end: the call
+            // cannot be lowered. Say so -- evaluating the receiver into a
+            // constant 0 would hand the program wrong answers without a
+            // word (the C host rejects the same program).
+            if (obj.kind == AK.Ident() && !IdentResolves(obj.sval) && !IsBuiltinClassName(obj.sval)) {
+                diags.Error("unresolved call '" + obj.sval + "." + mname + "': '" + obj.sval
+                    + "' is not a known variable, type, or namespace", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
             // evaluate receiver
             ExprVal recv = GenExpr(obj);
+            // byte[] <-> string bridges: compiler intrinsics in the C host
+            // (irgen_expr.c emit_bytes_call), lowered here the same way.
+            if (mname == "ToBytes" && e.kids.Count == 0 && IsStr(recv.ty)) {
+                return StrToBytes(recv);
+            }
+            if (mname == "ToStr" && (e.kids.Count == 0 || e.kids.Count == 2) && IsByteArr(recv.ty)) {
+                return ByteArrWindowToStr(recv, e);
+            }
             // scalar ToString: bool -> "true"/"false", numbers via snprintf
             if (mname == "ToString" && e.kids.Count == 0 && !IsStr(recv.ty)
                 && ClassOf(recv.ty) == null && !IsListType(recv.ty) && !IsDictType(recv.ty) && !IsSbType(recv.ty)) {
@@ -3118,6 +3322,11 @@ partial class Irgen {
                 }
                 return EmitInstanceCall(recv, cls.sval, mname, e);
             }
+            // The receiver's type is not one the self-host can call methods
+            // on. Fail closed: a silent 0 would hand the program wrong
+            // answers without a word.
+            diags.Error("call to '" + CallLabel(obj, mname)
+                + "' is not supported by the self-hosted compiler yet", e.line, e.col);
             return new ExprVal("0", MkType("int"));
         }
         // bare call
@@ -3145,6 +3354,15 @@ partial class Irgen {
             }
             return EmitStaticCall(curClass, name, e);
         }
+        // A call whose callee is neither a member access nor a plain name:
+        // the only shape that lowers is a delegate-typed expression
+        // (`filters[f](item)`). Everything else is reported -- a silent 0
+        // would hand the program wrong answers without a word.
+        ExprVal clo = GenExpr(callee);
+        if (clo.ty != null && IsDelegate(clo.ty)) {
+            return EmitDelegateCallVal(clo, clo.ty, e);
+        }
+        diags.Error("call expression is not supported by the self-hosted compiler yet", e.line, e.col);
         return new ExprVal("0", MkType("int"));
     }
 
@@ -3918,7 +4136,9 @@ partial class Irgen {
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
             return new ExprVal(buf, MkType("string"));
         }
-        // unknown string method: return receiver
+        // An unknown string method must not degrade into "the receiver
+        // itself": the program would silently get wrong answers.
+        diags.Error("string method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
         return recv;
     }
 
@@ -4122,6 +4342,9 @@ partial class Irgen {
             L("  " + t + " = call i64 @zdict_count(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("int"));
         }
+        // An unknown dictionary method must not degrade into a constant 0:
+        // the program would silently get wrong answers.
+        diags.Error("dictionary method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
         return new ExprVal("0", MkType("int"));
     }
 
@@ -4149,6 +4372,9 @@ partial class Irgen {
             L("  " + t + " = call i8* @zsb_tostring(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("string"));
         }
+        // An unknown string-builder method must not degrade into "the
+        // receiver itself": the program would silently get wrong answers.
+        diags.Error("string builder method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
         return recv;
     }
 }
