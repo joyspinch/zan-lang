@@ -12,12 +12,13 @@
 5. description ≤2 行，只写真实触发场景。
 6. 机器专属内容（路径/尺寸/环境限制）进项目文档或代码注释，不进 skill。
 
-## 当前 skill 清单（工作区触发面 8）
+## 当前 skill 清单（工作区触发面 9）
 
 | skill | 定位 |
 |---|---|
 | zan-dev-standards | Zan 开发总纲：工作流闭环、代码规范、验证纪律、沉淀纪律 |
 | zan-workflow | 版本提交与任务管理规范：提交信息格式、提交纪律、任务台账、会话卫生 |
+| app-migration | 业务程序迁移与复刻规范：C#/强类型/业务系统向 Zan 迁移的方法论与纪律 |
 | gui-design | GUI 排版与审美规范（含 references/ 细节） |
 | game-dev | 游戏帧循环/HUD/手感规范 |
 | server-dev-standards | 服务端架构规范 |
