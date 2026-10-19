@@ -254,3 +254,24 @@ kernel32、shell32、user32、advapi32、version）。
   而不是静默给一个错长度。
 - 细节（布局、来源清单、LLVM 层面的坑）见
   [`selfhost-string.md`](selfhost-string.md)。
+
+## 17. async 方法里的捕获：cell 指针存在 spill 槽里
+
+- 动作：async 方法的**局部变量**若被闭包捕获，也要装箱成堆 cell；但 async 的
+  resume 函数每次挂起恢复都是**一次全新的函数调用**（新的栈帧），所以栈上的
+  alloca 槽活不过挂起点——装箱变量的槽必须是 `alloca i8*`（存 **cell 指针**），
+  spill 槽（`asyncSlotReg` / `asyncSlotTy` / `asyncSlotIdx`）也按 cell 指针
+  保存与恢复。变量的读与写都要绕一层 cell（`GenIdent` / `StoreTo` /
+  `GenVarDecl` 的 async 分支）。
+- 理由（2026-10-20 差分门实测）：async 方法的闭包原本拿到的是**值快照**
+  （`f=1`，C 宿主 `f=2`）——async 路径从来没做过装箱，`GenAsyncMethod` 也没有
+  收集闭包捕获的名字。改成装箱后，捕获后的写入、闭包内的写入、跨 `await`
+  的写入都可见（用例 `closure_capture_async` 4 条断言与 C 宿主一致）。
+- 连带：`CollectCapturedNames` 必须放在 **resume 函数的 `StartFn()` 之后**——
+  `StartFn` 会把 `capNames` 清空，放在方法开头会被 ramp 的 `StartFn` 冲掉
+  （症状：装箱没发生，变量槽还是 `alloca i64`）。
+- 边界（已知限制，见 `TASKS.md` A391）：async 方法的**参数**与 **foreach
+  元素变量**被捕获时仍按值捕获——它们的 spill 槽按"存值"设计，要改成
+  cell 指针得动 async 帧布局。async 的 foreach 元素变量尤其不能走同步的
+  `BoxLocal`：那会把 `locReg` 变成一个运行时 cell 指针，而 async 路径的
+  `GenIdent` 按"槽里存 cell 指针"来读，两边对不上 → 生成的 IR 直接坏掉。

@@ -207,6 +207,14 @@ links, runs the programs and compares stdout with the C host's golden file.
   packed** rather than shared as a view (the self-hosted array stores one
   element per 8-byte slot) — tracked in `TASKS.md` (A390), together with
   the substring searches that still use `strstr`.
+- A seventh round (2026-10-20) made **async methods capture by reference** as
+  well. The async resume function is a fresh call with a fresh stack on every
+  suspension, so a captured local cannot live in a stack slot: the local now
+  lives in a heap cell and the *cell pointer* is what the frame spills. The
+  differential-gate case `closure_capture_async` went from `f=1` (a value
+  snapshot) to matching the C host on all four assertions. Two edges are still
+  by value and tracked in `TASKS.md` (A391): an async method's **parameters**
+  and its **foreach element variable**.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR
@@ -224,17 +232,21 @@ links, runs the programs and compares stdout with the C host's golden file.
 - **Runtime class identity is missing in the self-hosted IR backend.** The C host
   decides `x is T` from the allocation site's id plus an ancestor-name table
   (`__zan_site_tynames`); the self-hosted backend stamps no per-object class id
-  at all (its object header is `[-16]=rc, [-8]=dtor` and its strings are raw
-  `malloc`ed C strings). A switch pattern over an `object`-typed scrutinee
+  at all (its object header is `[-16]=rc, [-8]=dtor` and its strings are
+  `malloc`ed blocks with a length header, but they carry no class tag). A switch
+  pattern over an `object`-typed scrutinee
   (`case Dog d`, `case string s`) therefore cannot be decided at runtime: the
   self-hosted compiler now **refuses to compile it** with an explicit diagnostic
   instead of silently never matching. Tracked in `TASKS.md`.
-- **Closure capture is by value inside async methods.** In synchronous code a
-  local that a closure captures lives in a heap cell and the closure holds the
-  cell, so the closure observes later writes (C# semantics). An async method's
-  locals live in the coroutine frame instead of stack allocas, and that path
-  does not box them yet, so a closure created in an async method still gets a
-  value snapshot. Tracked in `TASKS.md` (A387) with the differential-gate case
+- **Two closure-capture edges are still by value inside async methods.** In
+  synchronous code a local that a closure captures lives in a heap cell and the
+  closure holds the cell, so the closure observes later writes (C# semantics);
+  async methods do the same now, with the *cell pointer* spilled into the frame
+  (the resume function is a fresh call with a fresh stack, so a stack slot
+  would not survive a suspension). What is still a value snapshot: an async
+  method's **parameters** and its **foreach element variable** (the latter also
+  has no per-iteration snapshot in the async path). Tracked in `TASKS.md`
+  (A391) with the differential-gate case
   `tests/conformance/closure_capture_async.zan`.
 - **`struct` is a heap object (reference semantics) in the self-hosted
   compiler, while the C host copies it by value.** A `struct` that is

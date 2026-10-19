@@ -60,37 +60,22 @@
 - ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
   差分门的 `diff_known_gaps.txt` 也要同步。
 
-### [ ] A387 自举 async 方法里的闭包仍按值捕获（同步路径已按引用）
+### [ ] A391 自举 async 方法里被闭包捕获的**参数**与 **foreach 元素变量**仍按值捕获
 
-- 现象（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_async.zan`）：
-  同一个程序，C 宿主输出 `f=2`，自举编译器（gen1）输出 `f=1`：
-  ```zan
-  static async void Main() {
-      int x = 1;
-      Func<int> f = () => x;   // 闭包捕获 x
-      x = 2;                   // 捕获之后再写
-      await Task.Delay(1);
-      Console.WriteLine(f());  // C 宿主 2（按引用），自举 1（按值快照）
-  }
-  ```
-- 根因：同步路径的装箱（局部变量住进堆 cell，闭包记录存 cell 指针）已经做完，
-  但 **async 方法的局部变量不住在栈上**——它们住在协程帧里（`GenAsyncMethod` 的
-  `PrescanAsyncLocals` + 帧槽，跨挂起点存活的值都进帧）。自举的装箱路径
-  （`irgen.zan` 的 `BoxLocal`）发的是"栈 alloca + cell 指针"，async 路径没有对应的
-  形态：`GenAsyncMethod` 生成局部变量时**不开箱**，所以 async 里的闭包仍然拿到
-  按值快照的 env。
-- 现状处理：登记为差分门已知缺口（`tests/selfhost/diff_known_gaps.txt` 的
-  `closure_capture_async`），门会持续报出来。同步路径的同一语义已由
-  `tests/conformance/closure_capture_by_ref.zan` 强制。
-- 方向：让 async 帧槽能装 cell 指针——
-  1. async 方法里的局部变量若被闭包捕获，也要装箱：帧槽存 **cell 指针**（i64），
-     而不是变量值；resume 时由 cell 指针重算 payload 指针（payload 指针指向
-     堆 cell，跨挂起稳定）。
-  2. `asyncSlotReg` / `EmitAsyncReloadSlots` 的溢出与回填要按"存 cell 指针"来做，
-     而不是按 `MapType` 的值类型存。
-  3. 闭包创建点（`GenLambda`）在 async 方法里拿到的也应是 cell 指针。
-- ⚠ 动 async 帧布局，必须重跑 `selfhost_fixed_point`（gen2/g3 都要过）与差分门；
-  另外 async 帧布局本身还与 C 宿主的 `zan.co.header` 不一致（A385），两者要一起看。
+- 现象（2026-10-20 修完 async 局部变量装箱后剩下的边界）：
+  - async 方法的**参数**被闭包捕获时，闭包拿到的是**捕获时刻的值**（按值），
+    同步路径与 C 宿主都是按引用（写参数，闭包可见）。
+  - async 的 **foreach 元素变量**被闭包捕获时同样按值；同步路径还有
+    "每次迭代独立快照"（per-iteration）的语义，async 路径完全没有。
+- 根因：async 方法的**局部变量**改成装箱（cell 指针存在 spill 槽里，跨挂起
+  稳定）后，参数与 foreach 元素变量没有对应的槽形态：参数的值在 ramp 里进帧，
+  元素变量的槽是循环专用的三槽布局，两者的 spill 槽都按"存值"设计。
+- 方向：
+  1. 参数：在 ramp 里为被捕获的参数分配 cell（cell 里放参数值，帧里存 cell
+     指针），resume 时按 cell 指针重算 payload 指针——与局部变量同一形态；
+  2. foreach 元素变量：把循环的三槽布局扩成"元素变量的 cell 指针"，并补
+     per-iteration 快照（每次迭代新 cell）。
+- ⚠ 与 async 帧布局耦合（A385），改完必须重跑 `selfhost_fixed_point` 与差分门。
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 

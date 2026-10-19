@@ -53,6 +53,17 @@ partial class Irgen {
             Node ty = locType[li];
             string reg = locReg[li];
             string lt = MapType(ty);
+            if (curAsync && locBox[li]) {
+                // the local lives in a heap cell: the spill slot holds the cell
+                // pointer, the cell holds the value
+                string c = NT();
+                L("  " + c + " = load i8*, i8** " + reg);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                string t = NT();
+                L("  " + t + " = load " + lt + ", " + lt + "* " + p);
+                return new ExprVal(t, ty);
+            }
             string t = NT();
             L("  " + t + " = load " + lt + ", " + lt + "* " + reg);
             return new ExprVal(t, ty);
@@ -813,6 +824,24 @@ partial class Irgen {
                 }
                 v = StrSlotConv(lty, v);
                 string lt = MapType(lty);
+                if (curAsync && locBox[li]) {
+                    // the local lives in a heap cell: write through the cell
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[li]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    string sv = Coerce(v, lt);
+                    if (ArcManaged(lty)) {
+                        string old = NT();
+                        L("  " + old + " = load " + lt + ", " + lt + "* " + p);
+                        L("  store " + lt + " " + sv + ", " + lt + "* " + p);
+                        EmitArcRetain(sv, lty);
+                        EmitArcRelease(old, lty);
+                    } else {
+                        L("  store " + lt + " " + sv + ", " + lt + "* " + p);
+                    }
+                    return;
+                }
                 if (ArcManaged(lty)) {
                     string old = NT();
                     L("  " + old + " = load " + lt + ", " + lt + "* " + locReg[li]);
@@ -2288,7 +2317,13 @@ partial class Irgen {
                 if (capBox[c]) {
                     int li = LocalIdx(caps[c]);
                     string cell = locCell[li];
-                    if (capIter[c]) {
+                    if (curAsync) {
+                        // in an async method the cell pointer lives in the
+                        // local's spill slot (it survives a suspension)
+                        string cp = NT();
+                        L("  " + cp + " = load i8*, i8** " + locReg[li]);
+                        cell = cp;
+                    } else if (capIter[c]) {
                         // per-iteration capture: copy the current value into a
                         // fresh cell so this closure keeps its own iteration
                         string lt = MapType(capTy[c]);
