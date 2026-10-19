@@ -657,6 +657,32 @@ partial class Irgen {
         n = n + CountAwaits(s.a) + CountAwaits(s.b) + CountAwaits(s.c) + CountAwaits(s.d);
         return n;
     }
+    // Count the foreach statements of an async body (two frame slots each).
+    int CountAsyncForeach(Node s) {
+        if (s == null) { return 0; }
+        int n = 0;
+        if (s.kind == AK.ForeachStmt()) { n = 1; }
+        int i = 0;
+        while (i < s.kids.Count) { n = n + CountAsyncForeach(s.kids[i]); i = i + 1; }
+        n = n + CountAsyncForeach(s.a) + CountAsyncForeach(s.b)
+              + CountAsyncForeach(s.c) + CountAsyncForeach(s.d);
+        return n;
+    }
+    // Hand every foreach its frame slots: s.ival = the collection slot, the
+    // loop counter uses the next one, the element variable the one after.
+    void AssignAsyncForeachSlots(Node s) {
+        if (s == null) { return; }
+        if (s.kind == AK.ForeachStmt()) {
+            s.ival = asyncForeachBase + asyncForeachNext;
+            asyncForeachNext = asyncForeachNext + 3;
+        }
+        int i = 0;
+        while (i < s.kids.Count) { AssignAsyncForeachSlots(s.kids[i]); i = i + 1; }
+        AssignAsyncForeachSlots(s.a);
+        AssignAsyncForeachSlots(s.b);
+        AssignAsyncForeachSlots(s.c);
+        AssignAsyncForeachSlots(s.d);
+    }
     void GenAsyncMethod(Node cls, Node m) {
         bool stat = IsStatic(m);
         int thisExtra = 0; if (!stat) { thisExtra = 1; }
@@ -677,7 +703,18 @@ partial class Irgen {
         int paramBase = header + thisExtra;
         int localBase = paramBase + pn.Count;
         int subBase = localBase + lnames.Count;
-        int nfields = subBase + awaitCount;
+        // Every foreach in the body needs three frame slots: the collection,
+        // the loop counter and the element variable. All three are stack
+        // allocas (or plain expression values) in the ordinary lowering, and
+        // a stack alloca is re-created on every resume -- the loop would
+        // restart from zero (or read an uninitialized slot) after an await
+        // inside the body. The frame is heap memory, so it survives the
+        // suspension.
+        int feCount = 0; if (m.d != null) { feCount = CountAsyncForeach(m.d); }
+        int nfields = subBase + awaitCount + feCount * 3;
+        asyncForeachBase = subBase + awaitCount;
+        asyncForeachNext = 0;
+        if (m.d != null) { AssignAsyncForeachSlots(m.d); }
         usesAsync = true;
         string sym = MethodSym(cls.sval, m);
         string resumeSym = sym + "$resume";
@@ -747,6 +784,12 @@ partial class Irgen {
         asyncSlotIdx = new List<int>();
         L("define void @" + resumeSym + "(i8* %fp) {");
         L("entry:");
+        // Every alloca of the resume function must live in the entry block:
+        // the function is re-entered on every resume, and an alloca in a
+        // block that is not re-executed never allocates its stack slot (a
+        // store into it would corrupt the stack).
+        StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
         L("  %ff = bitcast i8* %fp to i64*");
         if (!stat) {
             // receiver is immutable across the coroutine: load once, dominates all.
@@ -782,6 +825,9 @@ partial class Irgen {
         if (m.d != null) { GenStmt(m.d); }
         if (!term) { EmitAsyncEpilogue(); EmitAsyncComplete("0"); }
         L("}");
+        obody.Append(entryAllocas.ToString());
+        obody.Append(body.ToString());
+        body = obody; entryAllocas = oea; eaActive = oact;
         curAsync = false;
         curAsyncThis = false;
         curAsyncThisTy = null;
@@ -1320,11 +1366,13 @@ partial class Irgen {
 
     void GenMainWrapper(Node unit) {
         string owner = "";
+        Node mainMeth = null;
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
-                if (binder.FindMethod(d, "Main") != null) { owner = d.sval; }
+                Node mm = binder.FindMethod(d, "Main");
+                if (mm != null) { owner = d.sval; mainMeth = mm; }
             }
             i = i + 1;
         }
@@ -1358,8 +1406,39 @@ partial class Irgen {
         L("  br i1 " + rc + ", label %L" + lcatch + ", label %L" + lbody);
         Label(lbody);
         EmitStaticInits(unit);
-        L("  call void @" + owner + "_Main()");
-        L("  ret i32 0");
+        if (mainMeth != null && IsAsync(mainMeth) && IsStatic(mainMeth)) {
+            // An async Main is a coroutine: its ramp only allocates the frame
+            // and returns it -- the body runs from $resume. Calling the ramp
+            // like an ordinary function would allocate a frame and never run
+            // the body (the program would print nothing). The entry readies
+            // the frame on the cooperative scheduler and runs it to completion
+            // (mirrors the C host's emit_main_method).
+            string mainSym = MethodSym(owner, mainMeth);
+            string fr = NT(); L("  " + fr + " = call i8* @" + mainSym + "()");
+            L("  call void @zan_co_sched_init()");
+            string rs = NT(); L("  " + rs + " = ptrtoint void(i8*)* @" + mainSym + "$resume to i64");
+            string rf = NT(); L("  " + rf + " = inttoptr i64 " + rs + " to void(i8*)*");
+            L("  call void @zan_co_ready(i8* " + fr + ", void(i8*)* " + rf + ")");
+            L("  call void @zan_co_sched_run()");
+            string mrt = MapType(mainMeth.type);
+            if (mrt == "void") {
+                // The awaiter owns the frame: release it once the coroutine
+                // is done. An exception unwinds the frame through its own
+                // cleanup (which frees it), so this path is completion only.
+                L("  call void @free(i8* " + fr + ")");
+                L("  ret i32 0");
+            } else {
+                // read the result before the frame is released
+                string fh = NT(); L("  " + fh + " = bitcast i8* " + fr + " to i64*");
+                string rp = FrameGep(fh, 4);
+                string ri = NT(); L("  " + ri + " = load i64, i64* " + rp);
+                L("  call void @free(i8* " + fr + ")");
+                L("  ret i32 (trunc i64 " + ri + " to i32)");
+            }
+        } else {
+            L("  call void @" + owner + "_Main()");
+            L("  ret i32 0");
+        }
         Label(lcatch);
         string mp = NT(); L("  " + mp + " = getelementptr inbounds [25 x i8], [25 x i8]* @.msg.unhandled, i64 0, i64 0");
         string xv = NT(); L("  " + xv + " = load i8*, i8** @__exc_val");

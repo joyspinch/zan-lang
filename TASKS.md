@@ -35,6 +35,31 @@
   `selfhost_fixed_point`；同时要把 `cs_b05_pattern_var` / `cs_b06_switch_expr` /
   `pattern_value_types` 从 `diff_known_gaps.txt` 删掉，让差分门开始强制它们。
 
+### [ ] A385 自举协程帧布局与 C 宿主的 `zan.co.header` 不一致——自举产出的程序用不了发行版 mt 运行时
+
+- 现象（2026-10-20 差分门实测）：自举产出的 `.ll` 链接发行版协程运行时
+  （`toolchain/win-x64/zanrt_io_mt.o`，即 `rt_io.c -DZAN_CO_DRIVER` 的产物）会跑飞：
+  该运行时的 `zan_co_ready` 把帧首部当 `zan_co_fhdr` 读写（`src/runtime/rt_io.c:4140`
+  读 `h->sched`、`h->pending`），而自举的帧首 8 字节是**状态机 state**、次 8 字节是
+  **done 标志**——运行时会去改这两个字段，状态机随即错乱。
+- 根因：两套帧布局各写各的：
+  - C 宿主：`zan.co.header`（state/done/awaiter/awaiter_step/result/exc/exc_tid/
+    exc_own/hcount/sched/pending…），运行时按这个布局接管帧；
+  - 自举 IR 后端（`src/selfhost/irgen_async.zan` 的 `GenAsyncMethod`）：自定义布局
+    `[0]=state [1]=done [2]=awaiter [3]=awaiter_step [4]=result [5]=own_resume
+     [6]=cleanup [7]=hcount`，之后才是 this/参数/局部/子任务槽。
+  两边都不认识对方的帧。
+- 现状处理：自举后端**自带一套完整的弱协程运行时**（`EmitAsyncRuntime`：
+  就绪队列 + 定时器表 + 泵），差分门链接集里不放 `rt_co.c`/mt 运行时，让这套弱实现
+  整体生效（`tests/run_selfhost_diff.cmake` 的链接集说明）。自举产出的程序因此
+  **不能**与发行版 mt 运行时混用（异步路径会跑飞），非异步路径无影响。
+- 方向：把自举的帧布局改成 C 宿主的 `zan.co.header`（字段顺序、类型、异常槽都要
+  对齐），然后自举就可以只保留"弱回退"、让发行版运行时接管——那才是与 C 宿主
+  同构的终局。改动面：`irgen_async.zan` 的 `GenAsyncMethod` 全部槽位下标、
+  `EmitAsyncComplete`/`EmitAwait`/`__zan_async_unwind` 的字段访问、以及帧的分配大小。
+- ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
+  差分门的 `diff_known_gaps.txt` 也要同步。
+
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，

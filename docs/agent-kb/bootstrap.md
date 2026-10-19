@@ -170,9 +170,25 @@ links, runs the programs and compares stdout with the C host's golden file.
   only handled `List<T>` and silently dropped arrays and string arrays, an empty
   `case` section did not fall through into the next section, and `x is null`
   dereferenced a null type node inside the self-hosted compiler.
+- A second round (2026-10-20) fixed the whole **async** path: an `async Main` was
+  never started (the entry called the coroutine's ramp like an ordinary function,
+  so the program printed nothing), and values that live across an `await` inside
+  a `foreach` (the collection, the loop counter, the element variable) were kept
+  in stack allocas that a resume re-creates — the loop restarted from zero.
+- Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
+  IR (e.g. a value used in a block it does not dominate) reaches the backend
+  silently and shows up as an access violation. Keep the emitted IR
+  self-consistent; see the skill reference for the rules.
 
 ## Known limitations / future work
 
+- **The self-hosted coroutine frame layout differs from the C host's
+  `zan.co.header`.** The C host's frames are driven by the shipped runtime
+  (`zanrt_io_mt.o`), which reads the frame header as a `zan_co_fhdr`; the
+  self-hosted backend uses its own layout and therefore ships its own (weak)
+  cooperative scheduler. A program compiled by the self-host can therefore not
+  be linked against the shipped multi-threaded runtime for async work. Tracked in
+  `TASKS.md` (A385).
 - **Runtime class identity is missing in the self-hosted IR backend.** The C host
   decides `x is T` from the allocation site's id plus an ancestor-name table
   (`__zan_site_tynames`); the self-hosted backend stamps no per-object class id

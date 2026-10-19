@@ -76,6 +76,10 @@ kernel32、shell32、user32、advapi32、version）。
   支配违规、phi 前驱不匹配；clang 对 `.ll` 输入会自动加
   `-disable-llvm-verifier`，非法 IR 会被静默送进后端然后以 0xC0000005 崩在
   ISel——看到这个崩溃，先用 `llvm-as` 验证，别怀疑后端。
+  ⚠ 本机 CMake 找到的是 VS 自带 LLVM，**没有** `llvm-as`/`opt`（只有 clang、
+  llvm-nm、llvm-objdump…），`clang -Xclang -verify` 与 `-flto` 都**不会**报出
+  支配违规——要验证自举产出的 IR，得另写一个走 LLVM C API 的小工具
+  （`LLVMParseIRInContext` + `LLVMVerifyModule`）。
 - 链接器的 LNK2019/LNK1120 走 **stdout**，不是 stderr；只看 stderr 会误判成
   "没有具体错误"。
 
@@ -89,11 +93,11 @@ kernel32、shell32、user32、advapi32、version）。
   整体错了照样绿。2026-10-20 建差分门时一次挖出三个静默错误：`foreach` 只支持
   `List<T>`（数组/字符串集合被整段丢弃，循环体都不生成）、switch 空段落不落空、
   `x is null` 让自举编译器自己空指针崩。
-- 边界：差分门链接自举产出的 `.ll` 时，必须用**与 zanc 相同的运行时对象集**：
+- 边界：差分门链接自举产出的 `.ll` 时，运行时对象集要跟 zanc 一致：
   `zan_hw_base64_encode/decode` 之类符号在 `zanrt_timer.obj` 里（因为
   `src/runtime/rt_timer.c:1388` 直接 `#include "rt_hw_accel.c"`），只链 clang
-  默认的 libc 会 LNK2019；协程就绪队列在 `rt_co.c` 里，不链它会缺
-  `zan_co_ready`。
+  默认的 libc 会 LNK2019。**但不要链 `rt_co.c`**（见 §11）：它提供部分同名强符号，
+  会把自举的弱协程运行时切一半，定时器就再也等不到。
 
 ## 8. 能力缺口一律 fail-closed
 
@@ -118,3 +122,35 @@ kernel32、shell32、user32、advapi32、version）。
   同样带上头，否则读 obj-24 是越界读，`object` 槽里的字符串会误判成类实例。
 - ⚠ 改对象头会影响自举固定点的 gen2 运行时包（`zanrt_sh_*`），改完必须重跑
   `selfhost_fixed_point`。
+
+## 10. 跨挂起的值必须活在帧里，resume 块必须自己重算
+
+- 动作：异步方法里**跨挂起点存活**的值（循环计数器、被遍历集合、元素变量、
+  表达式临时值）必须放进协程帧（堆内存），不能放栈 alloca；resume 块里用到的
+  帧槽地址必须**在该块内重新计算**（`getelementptr %ff, <idx>`），不能复用
+  在别的块里算好的指针。
+- 理由（2026-10-20 差分门实测）：栈 alloca 每次 resume 都会重建 → 循环从 0 重来
+  或读到未初始化槽位；而"在 co.start 块里算好、resume 块里用"的指针**违反 LLVM
+  支配关系**——`clang` 对 `.ll` 输入默认关掉 verifier（见 §6），非法 IR 被静默
+  送进后端，表现为 0xC0000005 或读出随机地址，排查成本极高。
+- 连带：resume 块是**从分派 switch 直接进入**的，不经过 co.start，所以凡是
+  "块外算好、块内用"的值都要在块内重算；集合这种表达式值也要 spill 进帧
+  （自举的帧槽：每个 foreach 占 3 槽——集合/计数器/元素变量）。
+- 边界：这条只约束异步方法；同步路径的普通 alloca 仍然安全。
+
+## 11. 弱协程回退必须自洽，不能与运行时的强符号混用
+
+- 动作：自举发出的弱协程运行时（`zan_co_ready` / `zan_co_sched_run` /
+  `zan_co_delay` / `zan_co_sched_init`）必须**整套一起生效**；链接集里不要再放
+  提供部分同名强符号的运行时对象（如 `rt_co.c`）。自举的协程帧布局是它自己的
+  （不是 C 宿主的 `zan.co.header`，见 TASKS A385），所以驱动它的必须是自举自己
+  的调度器。
+- 理由（2026-10-20 实测）：`rt_co.c` 的强 `zan_co_ready`/`zan_co_sched_run` 会
+  盖掉自举的弱实现，而 `rt_co.c` 的调度器**不处理定时器**——`Task.Delay` 的
+  计时器被挂进自举自己的定时器表，永远没人 drain，表现为"await 之后没有输出"。
+  混搭出来的两半运行时比"没有运行时"更难查。
+- 连带：自举的协程回退必须**无条件发出**（不是"程序用到 await 才发"）——C 运行时
+  对象（`rt_io.o` 的 `zan_io_recv_co`）本身就引用 `zan_co_ready`，不发就是
+  LNK2019。
+- 边界：弱定义仍会被发行版运行时的强定义盖掉（那是有意的），但自举产出的程序
+  目前**不能**与发行版 mt 运行时混用（帧布局不同，见 TASKS A385）。

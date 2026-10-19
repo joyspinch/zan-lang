@@ -2023,6 +2023,10 @@ function(zan_uses_gui_driver _src _out)
   endif()
 endfunction()
 
+# 用例不走通用 glob 的三个名字（各自有专属档）。这份名单是 glob 跳过逻辑
+# 与"基准文件存在性"守卫的共同真相源：少一处同步，守卫就会误报或漏报。
+set(_conf_skip_cases arc_net_publish genform_click_test embed_compress)
+
 foreach(_src ${_conf_srcs})
   get_filename_component(_name ${_src} NAME_WE)
   # arc_net_publish 有专属档（run_arcnet.cmake，--publish + 网静默
@@ -2032,8 +2036,7 @@ foreach(_src ${_conf_srcs})
   # 明文断言 + 净目录运行，手工登记在 arc net 之后）。
   # genform_click_test 同理：期望输出是 genform_click.out（与
   # <名>_test.zan 同目录不同名），3043 行的手工登记按真实文件名注册。
-  if(_name STREQUAL "arc_net_publish" OR _name STREQUAL "genform_click_test"
-     OR _name STREQUAL "embed_compress")
+  if(_name IN_LIST _conf_skip_cases)
     continue()
   endif()
   zan_uses_gui_driver(${_src} _needs_gui_driver)
@@ -2103,6 +2106,18 @@ foreach(_src ${_conf_srcs})
   set_tests_properties(conformance_${_name} PROPERTIES
     RESOURCE_LOCK src_${_name} TIMEOUT 120)
 endforeach()
+
+# Every globbed conformance case needs its golden <name>.out committed. A
+# missing golden used to fail the case inside run_case.cmake with "file failed
+# to open for reading", which reads like a program bug instead of "the golden
+# was never added" -- 12 cases shipped that way and every one of them was a
+# red light in the standard tier. Guard the invariant directly.
+add_test(NAME policy_conformance_goldens_present
+  COMMAND ${CMAKE_COMMAND}
+    -DSRC_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
+    "-DSKIP_CASES=${_conf_skip_cases}"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_golden_guard.cmake)
+set_tests_properties(policy_conformance_goldens_present PROPERTIES TIMEOUT 60)
 
 # Doubling both live slots and waitpoints must not quadruple async IR.
 add_test(NAME conformance_async_ir_scaling
@@ -2715,11 +2730,20 @@ if(SELFHOST_CLANG)
   # host's golden file. Cases that still differ are listed in
   # tests/selfhost/diff_known_gaps.txt (reported, not failed) until fixed.
   #
-  # The link set is the fixed point's runtime plus rt_co.c: a program under
-  # test may use the coroutine scheduler, whose ready queue lives in rt_co.c
-  # (the fixed point's own compiler module carries its weak copy instead).
+  # The link set is the fixed point's runtime, deliberately WITHOUT rt_co.c:
+  # rt_co.c's ready queue is a plain FIFO with no timer wait, so a program
+  # that awaits Task.Delay would park forever (the timer fires into a queue
+  # nobody drains). The self-host emits a *complete* weak co runtime of its
+  # own (ready queue + timer list + pump, irgen_async.zan), and mixing it
+  # with rt_co.c's strong zan_co_ready/zan_co_sched_run would leave the
+  # timers stranded. So the weak set stays coherent and wins here.
+  #
+  # Consequence: the two sides of the comparison run different co runtimes
+  # (the C host links the shipped mt runtime, the self-host links its own
+  # emitted fallback). The gate therefore compares *compiler* behaviour --
+  # the stdout a program produces -- not runtime internals.
   set(_shd_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
-                    rt_sync.c zan_embed_api.c rt_co.c)
+                    rt_sync.c zan_embed_api.c)
   set(_shd_rt_objs)
   foreach(_shd_src IN LISTS _shd_rt_srcs)
     get_filename_component(_shd_stem ${_shd_src} NAME_WE)
