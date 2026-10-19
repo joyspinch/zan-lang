@@ -215,6 +215,16 @@ links, runs the programs and compares stdout with the C host's golden file.
   snapshot) to matching the C host on all four assertions. Two edges are still
   by value and tracked in `TASKS.md` (A391): an async method's **parameters**
   and its **foreach element variable**.
+- An eighth round (2026-10-20) aligned the **string search and transform
+  methods** with the C host. The C host keeps the exact length for `Length`,
+  indexing, `Substring`, concatenation and equality, but its `Trim`, `ToUpper`,
+  `ToLower`, `Replace`, `Split`, `ToString`, `StartsWith`, `EndsWith` and
+  `LastIndexOf` work on the receiver as a **C string** — they stop at the first
+  NUL. The self-hosted backend used the exact length everywhere, so
+  `"AB\0CD".EndsWith("CD")` answered true there and false in the C host, and
+  `LastIndexOf("C")` answered 3 instead of -1. The backend now has two length
+  helpers — `zstr_len` (exact) and `zstr_clen` (C-visible) — and picks per
+  method. The differential-gate case `string_nul_search` pins the split.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR

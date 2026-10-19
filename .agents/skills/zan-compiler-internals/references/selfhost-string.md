@@ -55,12 +55,46 @@
 
 统一入口：`StrSlotConv(targetTy, v)`——目标是 string、值不是 string 时打包。
 
-## 4. 踩过的坑（都真实发生过）
+## 5. 两种长度语义：精确长度 vs C 可见长度
+
+C 宿主对**同一个**托管串给出两套长度，自举必须照抄，否则差分门红：
+
+| 语义 | 辅助 | 用在 |
+|------|------|------|
+| 精确字节数（嵌入 NUL 也算） | `zstr_len(p)` | `Length`、索引 `p[i]`、`Substring`、拼接 `a + b`、`==` / `!=` |
+| C 可见长度（截断于第一个 NUL） | `zstr_clen(p)` = `strlen(p)` | `Trim` / `ToUpper` / `ToLower` / `Replace` / `Split` / `ToString` / `EndsWith` / `LastIndexOf` / `StartsWith` |
+
+`Contains` / `IndexOf` 用 `strstr`，本身就是 C 语义，不用改。
+
+判据：**C 宿主把 receiver 当 C 字符串**的方法一律用 `zstr_clen`；
+**C 宿主按串的真实长度**的方法用 `zstr_len`。实测（C 宿主，`h = "AB\0CD"`）：
+
+```
+len=5  sublen=2  sub1len=3  catlen=6  eq_same=1  eq_cut=0
+trimlen=2  uplen=2  replen=2  parts=1  tostrlen=2
+indexof_empty=0  lastindexof_empty=2
+h.IndexOf("CD")=-1  h.LastIndexOf("C")=-1  h.EndsWith("CD")=0
+```
+
+- `LastIndexOf("")` 返回 **C 可见长度**（2，不是 5）：扫描到串尾空匹配。
+- `ToString()` 也是 C 可见语义（长度 2），容易漏改。
+
+**改后端的顺序**：先写探针用 C 宿主跑出期望值，再改自举，最后把探针固化成
+`tests/conformance/string_nul_search.zan` + 差分门用例。**不要凭 C# 规范猜**
+——差分门比的是「与 C 宿主一致」。
+
+## 6. 踩过的坑（都真实发生过）
 
 - **头不能写在 malloc 块之外**。`zstr_new` 一开始把 len/magic 写在
   `raw-16` / `raw-8`，而 `raw` 是 malloc 的块首 → 越界写 → 堆损坏
   （0xC0000374 / abort）。头必须放在**块内**（`raw+0` / `raw+8`，payload
   取 `raw+16`）。
+- **payload 中间的指针没有头**。`zstr_split` 的末段、`zstr_replace` 的尾巴
+  指向 payload 内部偏移，`zstr_len` / `zstr_clen` 在那里读到的是正文字节
+  → magic 不匹配 → `abort()`（或读到垃圾长度）。这些位置只能用裸
+  `strlen`。
+- **`zstr_clen` 要保留 magic 校验**：base 指针先用 `zstr_len` 的 magic 判定
+  是托管串，再取 `strlen`；指针不合法就 `abort()`，不要静默量垃圾。
 - **LLVM 的标签名与 SSA 值名共享同一个命名空间**：`label %fin` 与
   `%fin = ...` 在同一函数里会报 "multiple definition of local value"。
   标签叫 `fin` 时，SSA 名要另取（比如 `%finbuf`）。
@@ -73,11 +107,8 @@
 - **clang 对 `.ll` 输入默认不跑 verifier**，非法 IR 静默进后端，表现为
   0xC0000005；IR 文本自己拼错类型片段时优先怀疑分支里手拼的类型。
 
-## 5. 已知未收敛项
+## 7. 已知未收敛项
 
-- `zstr_split` / `zstr_replace` / `zstr_lastidx` / `Contains` / `IndexOf` /
-  `StartsWith` / `EndsWith` 仍用 `strstr` / `strncmp` / `strcmp`：
-  **子串本身含 NUL 时结果不对**（长度对了，内容搜索还是 C 字符串语义）。
 - `byte[]` / `char[]` → `string` 是复制而非共享 view（C 宿主是共享），
   见 `TASKS.md` A390。
 - 自举的 string 不参与 ARC（`malloc` 之后不释放），与改造前一致。

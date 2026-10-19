@@ -243,22 +243,30 @@
   重跑 `selfhost_fixed_point` 与差分门；另外要新增 conformance 用例把
   "struct 按值传参/赋值/入列"钉住，否则修好了也没人守。
 
-### [ ] A390 自举的「数组 → string」是复制打包，不是共享 view；含 NUL 的子串搜索仍按 C 字符串
+### [ ] A390 自举的「数组 → string」是复制打包，不是共享 view
 
 - 现象（2026-10-20 修完 string 长度语义后实测）：
   - `byte[] raw; string v = raw;` 在自举里是**复制**（把每个元素的低 8 位
     拷进新的托管串），C 宿主是**共享 view**（改 `raw[0]`，`v[0]` 跟着变）。
     原因：自举的数组是「每元素一个 8 字节槽」，不是紧凑字节，没法直接
     当字符串指针共享。
-  - `Contains` / `IndexOf` / `StartsWith` / `EndsWith` / `Split` / `Replace`
-    / `LastIndexOf` 仍用 `strstr` / `strncmp` / `strcmp`：**子串本身含 NUL
-    时**结果不对（长度已经对了，内容搜索还是 C 字符串语义）。
 - 方向：
   (1) 数组 → string 要真正共享，得让自举的 `byte[]` 变成紧凑字节布局
       （每元素 1 字节）——这是数组表示级改造，会波及所有数组代码；
   (2) 或者承认自举的数组是 8 字节槽，把「共享 view」在文档里记为**已知
-      语言分歧**，只保证长度与内容正确；
-  (3) 含 NUL 的子串搜索改成按长度比较（`memcmp` + 显式长度）——工作量小，
-      与 (1)(2) 无关，可以单独做。
+      语言分歧**，只保证长度与内容正确。
 - ⚠ 动数组布局会动自举固定点的 gen2 运行时包，改完必须重跑
   `selfhost_fixed_point` 与差分门。
+
+- ✅ 已修（2026-10-20，含 NUL 的子串搜索语义）：原方向 (3)「含 NUL 的子串
+  搜索改成按长度比较（memcmp + 显式长度）」是**错的**——先实测 C 宿主才发现
+  它的搜索/变换类方法用的是 **C 字符串语义**（截断于第一个 NUL）：
+  `"AB\0CD".Trim().Length == 2`、`.EndsWith("CD") == false`、
+  `.LastIndexOf("C") == -1`、`.LastIndexOf("") == 2`、`.ToString().Length == 2`；
+  而 `Length` / 索引 / `Substring` / 拼接 / `==` 才是精确语义
+  （`Length == 5`、`Substring(2,2).Length == 2`、`(h+"X").Length == 6`）。
+  自举原来按精确长度做搜索，**反而**与 C 宿主分歧（`EndsWith` 判 true、
+  `LastIndexOf` 判 3）。已改为与 C 宿主一致：新增运行时 `zstr_clen`
+  （= `strlen`，带 magic 校验），`Trim` / `ToUpper` / `ToLower` / `Replace` /
+  `Split` / `ToString` / `EndsWith` / `LastIndexOf` / `StartsWith` 全部改用
+  C 可见长度；用例 `tests/conformance/string_nul_search.zan` 钉住。

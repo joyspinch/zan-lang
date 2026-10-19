@@ -2155,6 +2155,26 @@ partial class Irgen {
         H("  call void @zstr_bad()");
         H("  ret i64 0");
         H("}");
+        // The C-visible length: the offset of the first NUL byte, i.e. what a
+        // C string operation (strlen / strstr / printf) sees.  The C host keeps
+        // the exact length for Length / indexing / concatenation but truncates
+        // its search and transform methods at the first NUL, so the
+        // self-hosted backend has to split the two as well (A390).
+        // %p must be the base of a managed string; the magic check keeps a
+        // bogus pointer fail-closed instead of silently measuring garbage.
+        H("define i64 @zstr_clen(i8* %p) {");
+        H("entry:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %m = load i64, i64* %mp");
+        H("  %ok = icmp eq i64 %m, 1515082580");
+        H("  br i1 %ok, label %good, label %bad");
+        H("good:");
+        H("  %n = call i64 @strlen(i8* %p)");
+        H("  ret i64 %n");
+        H("bad:");
+        H("  call void @zstr_bad()");
+        H("  ret i64 0");
+        H("}");
         H("define i8* @zstr_dup(i8* %p) {");
         H("entry:");
         H("  %len = call i64 @zstr_len(i8* %p)");
@@ -2253,8 +2273,8 @@ partial class Irgen {
         H("  store i64 -1, i64* %best");
         H("  %i = alloca i64");
         H("  store i64 0, i64* %i");
-        H("  %ls = call i64 @zstr_len(i8* %s)");
-        H("  %lsub = call i64 @zstr_len(i8* %sub)");
+        H("  %ls = call i64 @zstr_clen(i8* %s)");
+        H("  %lsub = call i64 @zstr_clen(i8* %sub)");
         H("  %end = sub i64 %ls, %lsub");
         H("  br label %loop");
         H("loop:");
@@ -2279,9 +2299,9 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_replace(i8* %s, i8* %from, i8* %to) {");
         H("entry:");
-        H("  %lf = call i64 @zstr_len(i8* %from)");
-        H("  %lt = call i64 @zstr_len(i8* %to)");
-        H("  %ls = call i64 @zstr_len(i8* %s)");
+        H("  %lf = call i64 @zstr_clen(i8* %from)");
+        H("  %lt = call i64 @zstr_clen(i8* %to)");
+        H("  %ls = call i64 @zstr_clen(i8* %s)");
         H("  %g0 = mul i64 %ls, %lt");
         H("  %g1 = add i64 %g0, %ls");
         H("  %g2 = add i64 %g1, %lt");
@@ -2315,7 +2335,9 @@ partial class Irgen {
         H("  br label %loop");
         H("rest:");
         H("  %rc = load i8*, i8** %cur");
-        H("  %rl = call i64 @zstr_len(i8* %rc)");
+        // the tail pointer points into the payload, not at a string base, so
+        // it has no header -- measure it as a C string
+        H("  %rl = call i64 @strlen(i8* %rc)");
         H("  %rov = load i64, i64* %out");
         H("  %rdst = getelementptr i8, i8* %buf, i64 %rov");
         H("  call i8* @memcpy(i8* %rdst, i8* %rc, i64 %rl)");
@@ -2331,7 +2353,7 @@ partial class Irgen {
     void EmitStrOpsTransform() {
         H("define i8* @zstr_trim(i8* %s) {");
         H("entry:");
-        H("  %n = call i64 @zstr_len(i8* %s)");
+        H("  %n = call i64 @zstr_clen(i8* %s)");
         H("  %b = alloca i64");
         H("  store i64 0, i64* %b");
         H("  %e = alloca i64");
@@ -2387,7 +2409,7 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_case(i8* %s, i64 %up) {");
         H("entry:");
-        H("  %n = call i64 @zstr_len(i8* %s)");
+        H("  %n = call i64 @zstr_clen(i8* %s)");
         H("  %buf = call i8* @zstr_new(i64 %n)");
         H("  %i = alloca i64");
         H("  store i64 0, i64* %i");
@@ -2421,7 +2443,7 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_split(i8* %s, i8* %sep) {");
         H("entry:");
-        H("  %lsep = call i64 @zstr_len(i8* %sep)");
+        H("  %lsep = call i64 @zstr_clen(i8* %sep)");
         H("  %lst = call i8* @zlist_new(i64 0)");
         H("  %cur = alloca i8*");
         H("  store i8* %s, i8** %cur");
@@ -2445,7 +2467,7 @@ partial class Irgen {
         H("  br label %loop");
         H("last:");
         H("  %lc = load i8*, i8** %cur");
-        H("  %n2 = call i64 @zstr_len(i8* %lc)");
+        H("  %n2 = call i64 @strlen(i8* %lc)");
         H("  %buf2 = call i8* @zstr_new(i64 %n2)");
         H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %n2)");
         H("  %bi2 = ptrtoint i8* %buf2 to i64");
@@ -2459,7 +2481,7 @@ partial class Irgen {
         H("define i8* @zstr_join(i8* %sep, i8* %lst) {");
         H("entry:");
         H("  %n = call i64 @zlist_count(i8* %lst)");
-        H("  %lsep = call i64 @zstr_len(i8* %sep)");
+        H("  %lsep = call i64 @zstr_clen(i8* %sep)");
         H("  %tot = alloca i64");
         H("  store i64 0, i64* %tot");
         H("  %i = alloca i64");
@@ -2472,7 +2494,7 @@ partial class Irgen {
         H("mbody:");
         H("  %sl = call i64 @zlist_get(i8* %lst, i64 %iv)");
         H("  %sp = inttoptr i64 %sl to i8*");
-        H("  %l = call i64 @zstr_len(i8* %sp)");
+        H("  %l = call i64 @zstr_clen(i8* %sp)");
         H("  %t0 = load i64, i64* %tot");
         H("  %t1 = add i64 %t0, %l");
         H("  %t2 = add i64 %t1, %lsep");
@@ -2505,7 +2527,7 @@ partial class Irgen {
         H("citem:");
         H("  %sl2 = call i64 @zlist_get(i8* %lst, i64 %iv2)");
         H("  %sp2 = inttoptr i64 %sl2 to i8*");
-        H("  %l2 = call i64 @zstr_len(i8* %sp2)");
+        H("  %l2 = call i64 @zstr_clen(i8* %sp2)");
         H("  %ov2 = load i64, i64* %out");
         H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov2");
         H("  call i8* @memcpy(i8* %dst2, i8* %sp2, i64 %l2)");
