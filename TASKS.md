@@ -66,6 +66,11 @@
 - ⚠ 与 async 帧布局耦合（A385），改完必须重跑 `selfhost_fixed_point` 与差分门；
   另外 async 方法的返回类型 `Task<T>` 自举还不认识（`unknown type 'Task'`），
   只能先覆盖 `async void`。
+- ✅ 已修（2026-10-20，提交 `c5421633`）：调用点新增 `Irgen.EmitAsyncDetach`，
+  语句位置的 async 调用把帧交给 `zan_co_ready(frame, resume)`（resume 入口从**帧槽 5**
+  读，ramp 写在那儿）。「真 async 调用」用 `ExprVal.asyncCall` 标记区分，**不能**
+  用「类型是 `__task`」——降级路径也带 `__task` 类型但值是常量 0，detach 它会生成
+  `bitcast i8* 0 to i64*`。用例 `tests/conformance/async_void_call.zan` 钉住。
 
 ### [ ] A394 自举在**同步**上下文里遇到 `await` 不 fail-closed——生成读地址 0 的非法 IR
 
@@ -284,3 +289,100 @@
   （= `strlen`，带 magic 校验），`Trim` / `ToUpper` / `ToLower` / `Replace` /
   `Split` / `ToString` / `EndsWith` / `LastIndexOf` / `StartsWith` 全部改用
   C 可见长度；用例 `tests/conformance/string_nul_search.zan` 钉住。
+
+### [ ] A395 闭包不捕获外层方法的接收者 `this`——实例字段在闭包里一律读成 0
+
+- 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_this.zan`）：
+  ```zan
+  class Counter { int n; int[] buf;
+      public Func<int> GetN() { return () => n; } }         // C 宿主 n=3，自举 n=0
+  ```
+  - C 宿主：`n=3` / `len=3` / 嵌套闭包 `p=8`；
+  - 自举：`n=0` / `len=0`（嵌套闭包因捕获的是**字段**同样读 0）。
+- 根因：自举 IR 后端在闭包体里把 `curHasThis` 置 false、`curClass` 置空，
+  于是闭包里的裸标识符既不是局部变量、也够不到实例字段 → 直接返回常量 0。
+  C 宿主（`checker.c` 的 `expr_captures_this`）与 ngen 后端
+  （`ngen_delegate.zan` 的 `DelegateCaptureNameNg("this", …)`）都捕获 `this`，
+  只有自举 IR 后端漏了。
+- 方向：env 多一个槽存接收者；闭包体入口还原成 `%this` 并登记名为 `this` 的局部
+  （嵌套闭包继续捕获它）；闭包体恢复 `curHasThis`/`curClass`。
+- ✅ 已修（2026-10-20）：`CapturesThis` / `LambdaNeedsThis` / `ThisReceiver` /
+  `ReceiverAvailable`（`irgen_expr.zan`）。判据照抄 C 宿主：不是局部变量且是本类
+  的实例字段/实例方法才需要 `this`，且**要递归进嵌套闭包**（否则外层不捕获、
+  内层引用未定义的 `%this` → 非法 IR）。用例
+  `tests/conformance/closure_captures_this.zan` 钉住。
+- 边界：接收者按**借用**语义处理（闭包体入口 retain、出口 release，净值为 0），
+  与自举既有的"捕获局部靠外层帧持有引用"一致；闭包在方法返回后才被调用时，
+  接收者可能已经没了（C 宿主靠闭包持有强引用保活）。
+
+### [ ] A396 委托调用的实参在分支臂里求值——clang 的 X86 指令选择器崩溃
+
+- 现象（2026-10-20 差分门实测）：`value_enumerable` / `linq_query` 两个用例
+  编译到 IR 没问题，但 clang 在
+  `Running pass 'X86 DAG->DAG Instruction Selection' on function '@__lambda_3'`
+  阶段 0xC0000005 崩溃（LLVM 19.1.5 与 mozbuild LLVM 20.1.8 都复现，IR 通过验证器）。
+- 根因：`EmitDelegateCall` 的实参在"堆闭包 / 裸函数指针"两条**分支臂里**求值，
+  于是「实参本身是委托调用」时，内层调用的分支+phi 被塞进外层分支的臂里——
+  这个 IR 形状（phi 的前驱块里还有 phi）触发 clang 的 ISel 崩溃。
+- 方向：实参先求值成临时值，再分支；两条路复用同一批临时值。
+- ✅ 已修（2026-10-20）：实参提到分支之前求值。顺带修掉"实参被求值两次"。
+  用例 `tests/conformance/closure_nested_call.zan` 钉住；两个 GAP 随之闭账。
+- 排查法：clang 在 ISel 崩时，把出问题的函数单独抠出来编译，再逐块删指令二分。
+
+### [ ] A397 闭包的 fn 槽是 `i8*`：直接当函数指针调是非法 IR
+
+- 现象：闭包记录是 `{i8* fn, i8* env}`，`EmitDelegateCall` 取出的 `fn` 是
+  `i8*`，却直接 `call i64 (i8*, i64) %fn(...)`——被调值类型与函数指针类型不符，
+  **非法 IR**。clang 对 `.ll` 输入默认 `-disable-llvm-verifier`，非法 IR 被静默
+  送进后端。
+- 方向：调用前 `bitcast i8* %fn to <函数类型>*`。
+- ✅ 已修（2026-10-20）：闭包路径与裸函数指针路径都先 bitcast（虚方法槽那条路径
+  本来就是对的，两处要一起看）。
+
+### [ ] A398 C 宿主：`Current` 是**字段**的可枚举，检查器收下了但 irgen 不读——循环静默不执行
+
+- 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_enum4.zan`）：
+  ```zan
+  class FieldEnum { public int Current; public bool MoveNext() { ... } }
+  ```
+  - C 宿主：`foreach` **一轮都不跑**（没有报错，也没有输出）——检查器
+    （`checker.c:3360`）把字段 `Current` 也认成元素类型来源，但 irgen
+    （`irgen_stmt.c:2907`）只会 `call` 方法 `Current()` 或属性 getter，
+    两者都没有 → 取不到元素。
+  - 自举：正常迭代（自举的 `GenForeachEnumerable` 直接读字段）。
+- 影响面：只有"`Current` 写成字段"这一种写法；LINQ 的枚举器用的是**属性**，
+  所以现有用例都没碰到。
+- 方向：要么在 C 宿主的 irgen 里补字段分支（与检查器的接受口径对齐），
+  要么在检查器里拒绝这种写法（fail-closed，别静默）。
+- ⚠ 这是 **C 宿主**的缺口，不是自举的：差分门**不收录**该形态（收录就会红），
+  自举保持"能跑且正确"。
+
+### [ ] A399 自举：`T[]`（泛型数组）的字段槽两端类型不一致——存端打包成 i64、读端按 i64*
+
+- 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_enum3.zan`）：
+  ```zan
+  class Box<T> { T[] buf; public Box(List<T> xs) { buf = new T[xs.Count]; } }
+  ```
+  - 症状：`buf.Length` 读成 0（闭包里取到的数组指针丢了）。
+- 根因：`MapType` 先判"是否被擦除"再判"是否数组"，`T[]` 的元素类型是类型参数
+  → 整个数组被降成 i64 槽；而 `IsErasedType` 又把数组算成擦除类型，于是
+  **存端**按 i64 打包、**读端**按 i64\* 读，两端对不上。
+- 方向：数组先于擦除判定（`MapType`），且 `IsErasedType` 排除数组。
+- ✅ 已修（2026-10-20）：`MapType` 的数组判断提到擦除判断之前，
+  `IsErasedType` 对 `t.ival >= 1`（数组）返回 false。探针 p_enum3 现在与
+  C 宿主逐字一致（`p=8`）。
+
+### [ ] A400 自举：`foreach` 不支持可枚举协议（GetEnumerator/MoveNext/Current）
+
+- 现象：自举的 `foreach` 只认 `List<T>` / `T[]` / `string`，其余集合一律
+  **报诊断拒绝编译**；LINQ 的迭代器（`ValueWhereIterator` 等）因此整个用不了，
+  差分门里 `value_enumerable` / `linq_query` 长期是已知缺口。
+- 方向：按 C 宿主的协议降级——`coll.GetEnumerator()` → 枚举器，
+  `enumerator.MoveNext()` → bool，`enumerator.Current` → 元素。
+  自举的泛型是**完全擦除**的，所以 `Foo<T>.GetEnumerator()` 不需要特化，
+  直接走既有的实例调用路径即可。
+- ✅ 已修（2026-10-20）：`irgen_stmt.zan` 新增 `GenForeachEnumerable`，
+  `GenForeach` 在非 List/数组/字符串时先试它、失败才报原诊断。
+  `Current` 支持**属性**（`get_Current`）与**方法**（`Current()`）两种形态
+  ——与 C 宿主 irgen 的口径一致（字段形态是 C 宿主的缺口，见 A398）。
+  用例 `tests/conformance/enumerable_protocol.zan` 钉住。

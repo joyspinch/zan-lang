@@ -325,3 +325,80 @@ kernel32、shell32、user32、advapi32、version）。
 - 边界：`await` 路径自己管调度（`EmitAwait` 里已经 `zan_co_ready`），不要再
   detach 一次；同步 `Main` 里调用 async 方法没有调度器在跑 → 方法体不执行
   （与 C 宿主一致，别去"修"成会执行）。
+
+## 21. 闭包写在实例方法里就必须捕获接收者 `this`
+
+- 动作：实例方法里的闭包若提到**本类的字段或实例方法**（或显式 `this`），就必须
+  捕获接收者。判据照抄 C 宿主的 `checker.c` 的 `expr_captures_this`：**不是局部变量**
+  且是本类的实例字段/实例方法 → 需要 `this`；名字被闭包自己声明的局部变量遮住时
+  不需要。自举的实现形态（`irgen_expr.zan` 的 `CapturesThis` / `LambdaNeedsThis` /
+  `ThisReceiver`）：
+  - env 数组**多一个槽**，存接收者指针（`ptrtoint`/`inttoptr` 打包成 i64）；
+  - 闭包体入口把该槽还原成 `%this`（`inttoptr`），并登记一个名为 `this` 的**局部**
+    ——嵌套闭包才能继续捕获它（`ReceiverAvailable()` 判的就是它）；
+  - 闭包体里 `curHasThis = true` / `curClass = 外层类`，字段与实例方法就走
+    `LoadField("%this", …)` 这条既有路径。
+- 理由（2026-10-20 实测，用例 `tests/conformance/closure_captures_this.zan`）：自举
+  原来在闭包体里 `curHasThis = false`、`curClass = ""`，于是**实例字段一律读成 0**
+  （C 宿主 `n=3 / len=3`，自举 `n=0 / len=0`）。C 宿主与 ngen 后端都捕获 `this`
+  （`ngen_delegate.zan` 的 `DelegateCaptureNameNg("this", …)`），只有自举 IR 后端漏了。
+- 连带：判"要不要捕获"必须在**外层作用域**做完（`CapturesThis` 要**递归进嵌套
+  闭包**），否则外层不捕获、内层要用 `this` → 内层 env 里出现未定义的 `%this`
+  → 非法 IR。
+- 边界：接收者按**借用**语义处理（闭包体入口 retain、出口 release，净值为 0），
+  与自举既有的"捕获局部变量靠外层帧持有引用"一致；闭包在方法返回后才被调用时，
+  接收者可能已经没了（C 宿主靠闭包持有强引用保活，见 TASKS 的闭包生命周期条目）。
+
+## 22. 委托调用的实参必须在分支之前求值
+
+- 动作：`EmitDelegateCall` 里**先把实参求值完**（存成临时值），再按标签位分支走
+  "堆闭包"还是"裸函数指针"两条路；两条路复用同一批临时值。
+- 理由（2026-10-20 实测，用例 `tests/conformance/closure_nested_call.zan`）：实参
+  在分支**臂里**求值时，一个"实参本身是委托调用"的表达式会把内层调用的
+  **分支+phi 塞进外层分支的臂里**；这个 IR 形状（phi 的前驱块里还有 phi）会让
+  **clang 的 X86 指令选择器崩溃**（0xC0000005，`Running pass 'X86 DAG->DAG
+  Instruction Selection'`），LLVM 19 与 20 都复现，IR 本身**通过验证器**。
+  把实参提到分支之前，形状变成"先合并、再分支"，就不再触发。
+- 连带：顺带修掉了"实参被求值两次"（原来两条臂各生成一份，实参副作用会重复出现
+  在 IR 里）。
+- 排查法：clang 在 ISel 崩时，先把出问题的函数**单独抠出来**（`define` 到下一个
+  `define` 之间）编译，再逐块删指令二分——IR 文本手工改比改自举快得多。
+
+## 23. 闭包的 fn 槽是 `i8*`：调用前必须 bitcast 成函数指针
+
+- 动作：闭包记录是 `{i8* fn, i8* env}`，取出的 `fn` 是 **`i8*`**；调用前必须
+  `bitcast i8* %fn to <函数类型>*` 再 `call`，不能拿 `i8*` 直接当函数指针调。
+- 理由（2026-10-20 实测）：`call i64 (i8*, i64) %fn(...)` 而 `%fn` 是 `i8*`，
+  是**非法 IR**（被调值类型与函数指针类型不符）。clang 对 `.ll` 输入默认
+  `-disable-llvm-verifier`（见 §6），非法 IR 被静默送进后端。
+- 边界：同一份文件里**所有**间接调用都要检查——虚方法槽（`EmitInstanceCall` 的
+  vtable 路径）已经是"先 bitcast 再调"，委托调用之前是漏的；两处要一起看。
+
+## 24. `foreach` 的可枚举协议要按 C 宿主的口径降级
+
+- 动作：`foreach` 除了 `List<T>` / `T[]` / `string`，还要支持**鸭子类型的可枚举
+  协议**：`coll.GetEnumerator()` → 枚举器 → `enumerator.MoveNext()` → bool →
+  `enumerator.Current` → 元素。`Current` 的形态要与 C 宿主 irgen 的口径一致：
+  **方法** `Current()` 或**属性** `get_Current`（C 宿主的 `irgen_stmt.c` 只认这两
+  种；`Current` 写成**字段**是 C 宿主自己的缺口——它的检查器收下了、irgen 不读，
+  循环会静默不执行）。
+- 理由（2026-10-20 差分门实测）：自举原来对非 List 集合一律报诊断拒绝编译，
+  LINQ 的迭代器（`ValueWhereIterator` 等）整个用不了，差分门里
+  `value_enumerable` / `linq_query` 长期挂着。
+- 连带：自举的泛型是**完全擦除**的（只生成一个符号，没有特化体），所以
+  `Foo<T>.GetEnumerator()` **不需要**泛型特化机制——直接走既有的实例调用路径
+  （`EmitInstanceCall`）即可，别去补特化。
+- 边界：协议不认得就**报诊断**（fail-closed），不要"安静地不迭代"；async 上下文
+  暂时不支持（枚举器没有帧槽），要显式拒绝。
+
+## 25. 泛型数组 `T[]` 的槽类型：数组先于擦除判定
+
+- 动作：`MapType` 的判定顺序必须是**数组先于擦除**（`t.ival >= 1` → `i64*`），
+  且 `IsErasedType` 对数组返回 false。擦除的是**元素类型**，不是数组本身。
+- 理由（2026-10-20 实测）：`T[]` 的元素类型是类型参数 → 整个数组被降成 i64 槽，
+  **存端**按 i64 打包、**读端**按 `i64*` 读，两端对不上 → 数组指针丢失
+  （`buf.Length` 读成 0）。
+- 边界：这条只管**类型映射**；`List<T>` 的槽位本来就是 i64（元素擦除、列表本身
+  是 `i8*`），别把两套模型混起来。
+
+

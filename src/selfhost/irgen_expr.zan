@@ -2166,6 +2166,68 @@ partial class Irgen {
         }
     }
 
+    // A closure that mentions a field or an instance method of the enclosing
+    // class needs the receiver: the C host captures `this` in the closure's
+    // display class (checker.c's expr_captures_this) and the ngen backend
+    // does the same (ngen_delegate.zan's DelegateCaptureNameNg). The self-host
+    // lowers the receiver into one more env slot.
+    bool CapturesThis(Node n, List<string> declared) {
+        if (n == null) { return false; }
+        int k = n.kind;
+        if (k == AK.ThisExpr()) { return true; }
+        if (k == AK.Ident()) {
+            // a local -- or a name the closure declares itself -- shadows the
+            // member: nothing to capture
+            if (Contains(declared, n.sval)) { return false; }
+            if (LocalIdx(n.sval) >= 0) { return false; }
+            Node cls = binder.FindType(curClass);
+            if (cls == null) { return false; }
+            if (FieldIndex(cls, n.sval) >= 0) { return true; }
+            Node m = FindMethodUp(cls, n.sval);
+            if (m != null && !HasMod(m, MOD.Static())) { return true; }
+            if (FindMethodUp(cls, "get_" + n.sval) != null) { return true; }
+            return false;
+        }
+        if (k == AK.Lambda()) {
+            // a nested closure: its own declarations shadow the outer ones
+            List<string> inner = new List<string>();
+            int i = 0;
+            while (i < declared.Count) { inner.Add(declared[i]); i = i + 1; }
+            CollectDeclared(n, inner);
+            return CapturesThis(n.a, inner) || CapturesThis(n.d, inner);
+        }
+        if (CapturesThis(n.a, declared)) { return true; }
+        if (CapturesThis(n.b, declared)) { return true; }
+        if (CapturesThis(n.c, declared)) { return true; }
+        if (CapturesThis(n.d, declared)) { return true; }
+        int j = 0;
+        while (j < n.kids.Count) { if (CapturesThis(n.kids[j], declared)) { return true; } j = j + 1; }
+        return false;
+    }
+
+    // does this closure need the receiver of the scope it is written in?
+    bool LambdaNeedsThis(Node lam) {
+        if (!ReceiverAvailable()) { return false; }
+        List<string> declared = new List<string>();
+        CollectDeclared(lam, declared);
+        return CapturesThis(lam.a, declared) || CapturesThis(lam.d, declared);
+    }
+
+    // is a receiver reachable here? the method parameter `%this`, or the
+    // receiver an enclosing closure captured
+    bool ReceiverAvailable() {
+        if (LocalIdx("this") >= 0) { return true; }
+        return curHasThis && curClass != "";
+    }
+
+    // the receiver of the current scope: the method parameter `%this`, or the
+    // receiver an enclosing closure captured
+    ExprVal ThisReceiver() {
+        int li = LocalIdx("this");
+        if (li >= 0) { return GenIdent(MkIdent("this")); }
+        return new ExprVal("%this", MkType(curClass));
+    }
+
     // copy delegate parameter/return types onto a lambda's params + return slot
     void AnnotateLambda(Node lam, Node dty) {
         List<Node> pts = DelegParams(dty);
@@ -2352,6 +2414,13 @@ partial class Irgen {
         List<string> caps = new List<string>();
         List<Node> capTy = new List<Node>();
         CollectCaptures(lam, pn, caps, capTy);
+        // The closure may need the receiver of the scope it is written in:
+        // the receiver travels as one more env slot.
+        bool capThis = LambdaNeedsThis(lam);
+        if (capThis) {
+            caps.Add("this");
+            capTy.Add(MkType(curClass));
+        }
         int nc = caps.Count;
 
         // A captured local lives in a heap cell: the closure keeps the cell,
@@ -2408,7 +2477,9 @@ partial class Irgen {
                     L("  " + civ + " = ptrtoint i8* " + cell + " to i64");
                     packed = civ;
                 } else {
-                    ExprVal cv = GenExpr(MkIdent(caps[c]));
+                    ExprVal cv;
+                    if (caps[c] == "this") { cv = ThisReceiver(); }
+                    else { cv = GenExpr(MkIdent(caps[c])); }
                     packed = ToSlot(cv, capTy[c]);
                 }
                 L("  store i64 " + packed + ", i64* " + slot);
@@ -2439,7 +2510,12 @@ partial class Irgen {
         capNames = new List<string>();
         CollectCapturedNames(lam.d, capNames);
         CollectCapturedNames(lam.a, capNames);
-        curRet = MapType(retTy); curClass = ""; curHasThis = false; brkTarget = 0; contTarget = 0;
+        curRet = MapType(retTy);
+        // a closure that captured the receiver sees the class again: its
+        // fields and instance methods resolve through `%this`
+        if (capThis) { curClass = sClass; curHasThis = true; }
+        else { curClass = ""; curHasThis = false; }
+        brkTarget = 0; contTarget = 0;
 
         string sig = "define " + curRet + " " + fname + "(i8* %env";
         int a = 0;
@@ -2470,6 +2546,17 @@ partial class Irgen {
                 string raw = NT();
                 L("  " + raw + " = load i64, i64* " + slot);
                 string lt = MapType(capTy[c]);
+                if (caps[c] == "this") {
+                    // the receiver: the body sees it as `%this`, and a local of
+                    // the same name lets a nested closure capture it too
+                    L("  %this = inttoptr i64 " + raw + " to " + lt);
+                    string treg = AddLocal("this", capTy[c]);
+                    L("  " + treg + " = alloca " + lt);
+                    L("  store " + lt + " %this, " + lt + "* " + treg);
+                    EmitArcRetain("%this", capTy[c]);
+                    c = c + 1;
+                    continue;
+                }
                 string creg = AddLocal(caps[c], capTy[c]);
                 if (capBox[c]) {
                     // the env slot holds the cell: the captured local is read
@@ -2569,6 +2656,23 @@ partial class Irgen {
         ExprVal clo = GenExpr(calleeExpr);
         List<Node> pt = DelegParams(dty);
         Node retTy = DelegRet(dty);
+        // The arguments are evaluated ONCE, before the closure/bare split.
+        // Evaluating them inside the arms nests one call's branch-and-phi
+        // inside the other arm's block, and that shape crashes the X86
+        // instruction selector (clang 19/20 ICE in 'X86 DAG->DAG Instruction
+        // Selection'), so a delegate call whose argument is another delegate
+        // call could not be compiled at all.
+        List<string> argTypes = new List<string>();
+        List<string> argVals = new List<string>();
+        int i = 0;
+        while (i < e.kids.Count) {
+            Node pty = MkType("int"); if (i < pt.Count) { pty = pt[i]; }
+            ExprVal av = GenArgExpr(e.kids[i], pty);
+            string lt = MapType(pty);
+            argTypes.Add(lt);
+            argVals.Add(Coerce(av, lt));
+            i = i + 1;
+        }
         string iv = NT();
         L("  " + iv + " = ptrtoint i8* " + clo.op + " to i64");
         string bit = NT();
@@ -2593,12 +2697,14 @@ partial class Irgen {
         string env = NT();
         L("  " + env + " = load i8*, i8** " + envp);
         string args = "i8* " + env;
-        int i = 0;
-        while (i < e.kids.Count) {
-            Node pty = MkType("int"); if (i < pt.Count) { pty = pt[i]; }
-            ExprVal av = GenArgExpr(e.kids[i], pty);
-            args = args + ", " + MapType(pty) + " " + Coerce(av, MapType(pty));
-            i = i + 1;
+        string ptypesB = "";
+        int ib = 0;
+        while (ib < argTypes.Count) {
+            // the closure arm passes the env first, so every user argument is
+            // preceded by a comma; the bare arm has no env
+            args = args + ", " + argTypes[ib] + " " + argVals[ib];
+            ptypesB = ptypesB + (ib == 0 ? "" : ", ") + argTypes[ib];
+            ib = ib + 1;
         }
         string rt = MapType(retTy);
         string fnt = LamFnType(retTy, pt);
@@ -2606,29 +2712,33 @@ partial class Irgen {
         // rejects `call rt (args)* %ptr(...)`; the modern form is
         // `call (args) %ptr(...)` where the fn type carries ret+params
         string fnty = fnt.Substring(0, fnt.Length - 1);
+        // the closure record holds the function as an i8*: bitcast it to the
+        // function pointer type before calling -- calling an i8* directly is
+        // not valid IR (and the X86 backend crashes on it)
+        string fp = NT();
+        L("  " + fp + " = bitcast i8* " + fni8 + " to " + fnty + "*");
         string rClo = "0";
-        if (rt != "void") { rClo = NT(); L("  " + rClo + " = call " + fnty + " " + fni8 + "(" + args + ")"); }
-        else { L("  call " + fnty + " " + fni8 + "(" + args + ")"); }
+        if (rt != "void") { rClo = NT(); L("  " + rClo + " = call " + fnty + " " + fp + "(" + args + ")"); }
+        else { L("  call " + fnty + " " + fp + "(" + args + ")"); }
         L("  br label %L" + lJoin);
         Label(lBare);
         // 裸原生函数指针没有 env 槽，函数类型只带声明形参；闭包路径的
         // LamFnType 头部塞了 env 的 i8*，在这里不能复用（否则形参个数
         // 与实参个数对不上，调用会被 LLVM 判为签名不符）。
         string argsB = "";
-        string ptypesB = "";
-        int ib = 0;
-        while (ib < e.kids.Count) {
-            Node ptyB = MkType("int"); if (ib < pt.Count) { ptyB = pt[ib]; }
-            ExprVal avB = GenArgExpr(e.kids[ib], ptyB);
+        ib = 0;
+        while (ib < argTypes.Count) {
             string sepB = ib == 0 ? "" : ", ";
-            argsB = argsB + sepB + MapType(ptyB) + " " + Coerce(avB, MapType(ptyB));
-            ptypesB = ptypesB + sepB + MapType(ptyB);
+            argsB = argsB + sepB + argTypes[ib] + " " + argVals[ib];
             ib = ib + 1;
         }
         string fntyB = rt + " (" + ptypesB + ")";
+        // a bare native pointer is an i8* too: bitcast it before the call
+        string fpB = NT();
+        L("  " + fpB + " = bitcast i8* " + clo.op + " to " + fntyB + "*");
         string rBare = "0";
-        if (rt != "void") { rBare = NT(); L("  " + rBare + " = call " + fntyB + " " + clo.op + "(" + argsB + ")"); }
-        else { L("  call " + fntyB + " " + clo.op + "(" + argsB + ")"); }
+        if (rt != "void") { rBare = NT(); L("  " + rBare + " = call " + fntyB + " " + fpB + "(" + argsB + ")"); }
+        else { L("  call " + fntyB + " " + fpB + "(" + argsB + ")"); }
         L("  br label %L" + lJoin);
         Label(lJoin);
         if (rt == "void") { return new ExprVal("0", MkType("void")); }

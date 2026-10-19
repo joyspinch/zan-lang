@@ -900,6 +900,8 @@ partial class Irgen {
         bool feArr = coll.ty != null && coll.ty.ival >= 1;
         bool feStr = IsStr(coll.ty);
         if (!feList && !feArr && !feStr) {
+            // the duck-typed enumerable protocol (GetEnumerator/MoveNext/Current)
+            if (GenForeachEnumerable(s, coll)) { return; }
             string cn = "?"; if (coll.ty != null) { cn = coll.ty.sval; }
             diags.Error("foreach over '" + cn + "' is not supported by the self-hosted compiler yet (List<T>, T[] and string are)", s.line, s.col);
             return;
@@ -1049,6 +1051,104 @@ partial class Irgen {
         TrimLocals(feScope);
         brkTarget = sb; contTarget = sc;
         loopScopeBase = sls;
+    }
+
+    // foreach (T x in coll) over the duck-typed enumerable protocol:
+    // coll.GetEnumerator() -> enumerator, enumerator.MoveNext() -> bool,
+    // enumerator.Current -> element. The enumerator is a class instance, so
+    // the three calls go through the ordinary instance-call path; the
+    // self-hosted backend erases generic type arguments, so a
+    // `Foo<T>.GetEnumerator()` needs no specialization here.
+    // Returns false when the collection does not speak the protocol (the
+    // caller then reports the collection as unsupported).
+    bool GenForeachEnumerable(Node s, ExprVal coll) {
+        if (curAsync) { return false; }   // no frame slot for the enumerator yet
+        Node cls = ClassOf(coll.ty);
+        if (cls == null) { return false; }
+        Node gm = FindMethodUp(cls, "GetEnumerator");
+        if (gm == null || gm.type == null) { return false; }
+        Node enumTy = gm.type;
+        Node ecls = ClassOf(enumTy);
+        if (ecls == null) { return false; }
+        if (FindMethodUp(ecls, "MoveNext") == null) { return false; }
+        // Current is a property (get_Current), a method (Current()) or a field.
+        // The C host lowers the method and the property form
+        // (irgen_stmt.c: fe_cur_m / fe_cur_getter); the field form is a C
+        // host gap (its checker accepts it, its irgen does not read it).
+        Node curGetter = FindMethodUp(ecls, "get_Current");
+        Node curMethod = null;
+        bool curIsField = false;
+        if (curGetter == null) {
+            curMethod = FindMethodUp(ecls, "Current");
+            if (curMethod == null) {
+                curIsField = binder.FindField(ecls, "Current") != null;
+                if (!curIsField) { return false; }
+            }
+        }
+        Node elemTy = s.type;
+        if (elemTy == null) {
+            if (curGetter != null) { elemTy = curGetter.type; }
+            else if (curMethod != null) { elemTy = curMethod.type; }
+        }
+        if (elemTy == null) { return false; }
+        int feScope = locName.Count;
+        Node call0 = new Node(AK.Call()); call0.kids = new List<Node>();
+        ExprVal en = EmitInstanceCall(coll, cls.sval, "GetEnumerator", call0);
+        string enTy = MapType(enumTy);
+        string enReg = AddLocal("__zenum", enumTy);
+        EA(enReg, enTy);
+        L("  store " + enTy + " " + en.op + ", " + enTy + "* " + enReg);
+        string elt = MapType(elemTy);
+        string ereg = AddLocal(s.sval, elemTy);
+        // the element variable is a per-iteration capture: every closure made
+        // in the body keeps its own element
+        locIter[locName.Count - 1] = true;
+        if (ShouldBox(s.sval)) { ereg = BoxLocal(locName.Count - 1); } else { EA(ereg, elt); }
+        if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
+        int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
+        int sb = brkTarget; int sc = contTarget;
+        int sls = loopScopeBase;
+        brkTarget = lend; contTarget = linc;
+        loopScopeBase = locName.Count;
+        L("  br label %L" + lc);
+        Label(lc);
+        Node call1 = new Node(AK.Call()); call1.kids = new List<Node>();
+        ExprVal mn = EmitInstanceCall(en, ecls.sval, "MoveNext", call1);
+        string c = NT();
+        L("  " + c + " = icmp ne i64 " + mn.op + ", 0");
+        L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
+        Label(lb);
+        ExprVal ev;
+        if (curIsField) {
+            ev = LoadField(en.op, enumTy, "Current");
+        } else if (curGetter != null) {
+            Node call2 = new Node(AK.Call()); call2.kids = new List<Node>();
+            ExprVal cv = EmitInstanceCall(en, ecls.sval, "get_Current", call2);
+            ev = FromSlot(cv.op, elemTy);
+        } else {
+            Node call2 = new Node(AK.Call()); call2.kids = new List<Node>();
+            ExprVal cv = EmitInstanceCall(en, ecls.sval, "Current", call2);
+            ev = FromSlot(cv.op, elemTy);
+        }
+        if (ArcManaged(elemTy)) {
+            string old = NT();
+            L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+            EmitArcRetain(ev.op, elemTy);
+            EmitArcRelease(old, elemTy);
+        } else {
+            L("  store " + elt + " " + ev.op + ", " + elt + "* " + ereg);
+        }
+        GenStmt(s.c);
+        if (!term) { L("  br label %L" + linc); }
+        Label(linc);
+        L("  br label %L" + lc);
+        Label(lend);
+        ReleaseLocalsFrom(feScope);
+        TrimLocals(feScope);
+        brkTarget = sb; contTarget = sc;
+        loopScopeBase = sls;
+        return true;
     }
 
     // throw expr — store the exception object, pop the innermost handler and
