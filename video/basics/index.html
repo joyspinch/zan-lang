@@ -1,0 +1,846 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zan 语言基础 · 讲解片</title>
+<style>
+  html,body{margin:0;height:100%;background:#04060a;overflow:hidden}
+  #gl{display:block;margin:auto;position:absolute;inset:0}
+  #boot{position:fixed;inset:0;display:grid;place-items:center;color:#9af7d3;background:#04060a;
+    font:11px/1.9 Consolas,monospace;letter-spacing:.42em;transition:opacity .5s;z-index:9}
+  #boot.off{opacity:0;pointer-events:none}
+  #rec{position:fixed;left:50%;bottom:84px;transform:translateX(-50%);color:#9af7d3;
+    font:13px/1.6 Consolas,monospace;letter-spacing:.08em;opacity:0;transition:opacity .3s;z-index:8;
+    background:rgba(6,10,14,.82);border:1px solid rgba(154,247,211,.22);border-radius:8px;padding:8px 16px}
+  #rec.on{opacity:1}
+  #btn{position:fixed;right:20px;bottom:20px;z-index:9;cursor:pointer;
+    font:12px Consolas,monospace;letter-spacing:.14em;color:#9af7d3;
+    background:rgba(6,10,14,.6);border:1px solid rgba(154,247,211,.35);border-radius:6px;padding:9px 16px;
+    transition:background .2s,border-color .2s}
+  #btn:hover{background:rgba(154,247,211,.12);border-color:rgba(154,247,211,.7)}
+  #fatal{position:fixed;inset:0;display:none;place-items:center;background:#04060a;color:#eef1f2;
+    font:13px/2 Consolas,monospace;padding:40px;text-align:center;z-index:10}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="boot">ZAN</div>
+<div id="rec"></div>
+<button id="btn" title="导出 MP4">导出 MP4</button>
+<div id="fatal"><span id="fatalMsg"></span></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ══════════════════════════════════════════════════════════════════════
+   Zan 语言基础 · 讲解片（66s / 锁机位 / HUD 全画布 / WebCodecs 出片）
+   八段：概览 → 程序结构 → 类型系统 → 面向对象 → 控制流 →
+         内存 ARC → 异步·互操作 → 标准库·界面 → 落版
+   一切动画是 t 的解析函数，t=0 与 t=D 同态（首尾皆是同一片星场）。
+   ══════════════════════════════════════════════════════════════════════ */
+
+const qs     = new URLSearchParams(location.search);
+const PORT   = qs.get('ratio') === '9:16';
+const W      = PORT ? 1080 : 1920;
+const H      = PORT ? 1920 : 1080;
+const D      = qs.has('dur') ? Number(qs.get('dur')) : 66.0;
+const ENCODE = qs.has('encode');
+const FPS    = Number(qs.get('fps')) || 60;
+const EW     = Number(qs.get('w')) || W, EH = Number(qs.get('h')) || H;
+const SHOT   = qs.has('shot') ? Number(qs.get('shot')) : null;
+const canvas = document.getElementById('gl');
+
+const clamp   = (x, a, b) => x < a ? a : x > b ? b : x;
+const smooth  = x => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); };
+const range   = (t, a, b) => b === a ? (t >= a ? 1 : 0) : clamp((t - a) / (b - a), 0, 1);
+const easeOut = x => 1 - Math.pow(1 - clamp(x, 0, 1), 3);
+const env     = (t, a, b, fi = 0.3, fo = 0.3) => smooth(range(t, a, a + fi)) * (1 - smooth(range(t, b - fo, b)));
+const slideIn = (t, a, b) => ({
+  a: smooth(range(t, a, a + 0.5)) * (1 - smooth(range(t, b - 0.5, b))),
+  dx: (1 - easeOut(range(t, a, a + 0.65))) * -42 + easeOut(range(t, b - 0.65, b)) * 42,
+});
+const mulberry32 = a => () => {
+  a |= 0; a = a + 0x6D2B79F5 | 0;
+  let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+  return ((t ^ t >>> 14) >>> 0) / 4294967296;
+};
+
+/* ── 场景 ── */
+let renderer;
+try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false }); }
+catch (e) { fatal('浏览器未启用 WebGL。'); throw e; }
+const DPR = Math.min(Number(qs.get('dpr')) || devicePixelRatio || 1, 1.75);
+renderer.setPixelRatio(DPR);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+const VH = 2, VW = VH * (W / H);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04060a);
+const cam = new THREE.OrthographicCamera(-VW / 2, VW / 2, VH / 2, -VH / 2, -12, 12);
+cam.position.z = 5;
+
+/* 真实景深：星尘在 HUD 画布之后，从画布的透明区透出来 */
+const N = 340;
+const rnd = mulberry32(20261019);
+const spos = new Float32Array(N * 3);
+for (let i = 0; i < N; i++) {
+  spos[i * 3]     = (rnd() * 2 - 1) * VW * 0.62;
+  spos[i * 3 + 1] = (rnd() * 2 - 1) * VH * 0.62;
+  spos[i * 3 + 2] = -2.6 + rnd() * 2.4;
+}
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.BufferAttribute(spos, 3));
+const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({
+  color: 0x9af7d3, size: 2.2, sizeAttenuation: false,
+  transparent: true, opacity: 0.42, depthWrite: false, blending: THREE.AdditiveBlending,
+}));
+scene.add(stars);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, cam));
+const bloom = new UnrealBloomPass(new THREE.Vector2(1280, 720), 0.34, 0.72, 0.90);
+composer.addPass(bloom);
+const grade = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uGrain: { value: 0.018 }, uVig: { value: 0.66 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }',
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float uTime,uGrain,uVig; varying vec2 vUv;
+    float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
+    void main(){
+      vec2 c = vUv-0.5; float r = length(c);
+      vec3 col = texture2D(tDiffuse,vUv).rgb;
+      col *= mix(1.0, 0.40, smoothstep(0.30, 0.98, r*uVig));
+      col += (hash(vUv*vec2(1920.,1080.)+fract(uTime)*91.7)-0.5)*uGrain;
+      gl_FragColor = vec4(max(col,0.0),1.0);
+    }`
+});
+composer.addPass(grade);
+composer.addPass(new OutputPass());
+
+/* ── HUD：一张 W×H 画布承载全部内容（导出时字幕天然在里面）── */
+const hud = document.createElement('canvas');
+hud.width = W; hud.height = H;
+const g = hud.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hud);
+hudTex.colorSpace = THREE.SRGBColorSpace;
+hudTex.minFilter = THREE.LinearFilter;
+hudTex.magFilter = THREE.LinearFilter;
+scene.add(new THREE.Mesh(
+  new THREE.PlaneGeometry(VW, VH),
+  new THREE.MeshBasicMaterial({ map: hudTex, transparent: true, depthWrite: false })
+));
+
+/* ── 版式锚点（横版 / 竖版两套）── */
+const L = PORT ? {
+  rail:  { x: 104, y: 130, dx: 126, dy: 0, horiz: true },
+  head:  { x: 104, y: 216 },
+  code:  { x: 104, y0: 700, size: 26, dy: 50 },
+  cap:   { x: 104, key: 1492, line: 1554, sub: 1622, size: 34, maxW: 1080 - 104 - 90 },
+  panel: { x0: 104, x1: 976 },
+  cx: 540,
+} : {
+  rail:  { x: 150, y: 300, dy: 58 },
+  head:  { x: 620, y: 266 },
+  code:  { x: 620, y0: 322, size: 26, dy: 44 },
+  cap:   { x: 150, key: 838, line: 892, sub: 944, size: 40, maxW: 1920 - 150 - 110 },
+  panel: { x0: 620, x1: 1800 },
+  cx: 960,
+};
+
+const SANS = '"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif';
+const MONO = 'Consolas,"Cascadia Code",monospace';
+const C = { paper: '#eef1f2', mint: '#9af7d3', gold: '#ffc838' };
+
+/* ── 排版原语 ── */
+function text(s, x, y, size, color, o = {}) {
+  g.save();
+  g.font = (o.weight || '400') + ' ' + size + 'px ' + (o.mono ? MONO : SANS);
+  g.fillStyle = color;
+  g.textAlign = o.align || 'center';
+  g.textBaseline = o.base || 'middle';
+  if (o.track) g.letterSpacing = o.track;
+  if (o.alpha != null) g.globalAlpha = o.alpha;
+  g.fillText(s, x, y);
+  g.restore();
+}
+function rrect(x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.quadraticCurveTo(x + w, y, x + w, y + r);
+  g.lineTo(x + w, y + h - r); g.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  g.lineTo(x + r, y + h); g.quadraticCurveTo(x, y + h, x, y + h - r);
+  g.lineTo(x, y + r); g.quadraticCurveTo(x, y, x + r, y);
+  g.closePath();
+}
+function panelBox(x, y, w, h, accent) {
+  rrect(x, y, w, h, 16);
+  g.fillStyle = 'rgba(9,13,18,.96)'; g.fill();
+  g.lineWidth = 1.4;
+  g.strokeStyle = accent ? 'rgba(154,247,211,.5)' : 'rgba(255,255,255,.13)';
+  g.stroke();
+}
+function chipW(label, size) { g.font = '400 ' + size + 'px ' + MONO; return g.measureText(label).width + 30; }
+function chip(cx, cy, label, o = {}) {
+  const size = o.size || 26, h = o.h || 44, w = chipW(label, size);
+  g.save(); g.globalAlpha *= (o.alpha == null ? 1 : o.alpha);
+  rrect(cx - w / 2, cy - h / 2, w, h, 9);
+  g.fillStyle = o.accent ? 'rgba(154,247,211,.10)' : 'rgba(255,255,255,.045)'; g.fill();
+  g.lineWidth = 1.2;
+  g.strokeStyle = o.accent ? 'rgba(154,247,211,.5)' : 'rgba(255,255,255,.18)';
+  g.stroke();
+  g.font = '400 ' + size + 'px ' + MONO;
+  g.fillStyle = o.accent ? C.mint : 'rgba(238,241,242,.86)';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(label, cx, cy + 1);
+  g.restore();
+}
+/* 一行 chip，超宽自动折行、逐行居中 */
+function chipRows(names, cx, y0, size, maxW, alpha, t, t0, step = 0.12, gap = 14) {
+  const widths = names.map(n => chipW(n, size));
+  const rows = [];
+  let cur = [], cw = 0;
+  names.forEach((n, i) => {
+    const add = cur.length ? gap + widths[i] : widths[i];
+    if (cur.length && cw + add > maxW) { rows.push({ items: cur, w: cw }); cur = [n]; cw = widths[i]; }
+    else { cur.push(n); cw += add; }
+  });
+  if (cur.length) rows.push({ items: cur, w: cw });
+  rows.forEach((row, ri) => {
+    let x = cx - row.w / 2;
+    row.items.forEach(n => {
+      const w = chipW(n, size), i = names.indexOf(n);
+      const on = smooth(range(t, t0 + i * step, t0 + i * step + 0.26)) * alpha;
+      chip(x + w / 2, y0 + ri * (size + 30), n, { size, h: size + 18, alpha: on });
+      x += w + gap;
+    });
+  });
+  return rows.length;
+}
+function arrow(x1, y1, x2, y2, color, lw = 1.6, dash) {
+  g.save();
+  g.strokeStyle = color; g.fillStyle = color; g.lineWidth = lw;
+  if (dash) g.setLineDash(dash);
+  g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+  const a = Math.atan2(y2 - y1, x2 - x1), s = 9;
+  g.beginPath();
+  g.moveTo(x2, y2);
+  g.lineTo(x2 - Math.cos(a - 0.42) * s, y2 - Math.sin(a - 0.42) * s);
+  g.lineTo(x2 - Math.cos(a + 0.42) * s, y2 - Math.sin(a + 0.42) * s);
+  g.closePath(); g.fill();
+  g.restore();
+}
+
+/* ── 代码高亮 ── */
+const KW = /^(using|namespace|class|struct|interface|enum|delegate|public|private|protected|internal|static|virtual|override|sealed|abstract|readonly|const|void|var|new|return|if|else|foreach|for|while|do|in|switch|case|default|when|try|catch|finally|throw|lock|async|await|extern|is|as|ref|out|this|base|null|true|false|weak|operator|get|set|value|bool|byte|sbyte|short|ushort|int|uint|long|ulong|float|double|char|nint|string|object|decimal|Task|DllImport)$/;
+const TOK = /(\/\/[^\n]*)|(\$?@?"(?:[^"\\]|\\.)*")|(\b\d[\d_]*(?:\.\d+)?f?\b)|([A-Za-z_]\w*)|(\s+)|([\s\S])/g;
+function codeLine(line, x, y, size) {
+  g.font = '400 ' + size + 'px ' + MONO;
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  let cx = x, m;
+  TOK.lastIndex = 0;
+  while ((m = TOK.exec(line)) !== null) {
+    const tk = m[0];
+    if (!tk) break;
+    let col = 'rgba(238,241,242,.82)';
+    if (m[1]) col = 'rgba(238,241,242,.30)';
+    else if (m[2]) col = C.gold;
+    else if (m[3]) col = 'rgba(255,200,56,.85)';
+    else if (m[4] && KW.test(tk)) col = C.mint;
+    g.fillStyle = col;
+    g.fillText(tk, cx, y);
+    cx += g.measureText(tk).width;
+  }
+  return cx - x;
+}
+/* 逐行长出来的代码面板 + 打字光标 */
+function codePanel(lines, size, dy, x, y0, alpha, t, t0, step = 0.13) {
+  if (alpha <= 0.002) return;
+  g.save(); g.globalAlpha = alpha;
+  g.font = '400 ' + size + 'px ' + MONO;
+  let maxw = 0;
+  for (const ln of lines) maxw = Math.max(maxw, g.measureText(ln).width);
+  let shown = 0;
+  for (let i = 0; i < lines.length; i++) shown += smooth(range(t, t0 + i * step, t0 + i * step + 0.24));
+  const pad = 36;
+  panelBox(x - pad, y0 - size * 0.95, maxw + pad * 2, pad * 2 + Math.max(shown, 0.5) * dy);
+  for (let i = 0; i < lines.length; i++) {
+    const on = smooth(range(t, t0 + i * step, t0 + i * step + 0.24));
+    if (on <= 0.01) continue;
+    g.save(); g.globalAlpha = alpha * on;
+    codeLine(lines[i], x, y0 + i * dy, size);
+    g.restore();
+  }
+  if (shown < lines.length - 0.03 && shown > 0.4) {
+    const li = clamp(Math.ceil(shown) - 1, 0, lines.length - 1);
+    g.globalAlpha = alpha * (0.35 + 0.65 * Math.abs(Math.sin(t * 7)));
+    g.fillStyle = C.mint;
+    g.font = '400 ' + size + 'px ' + MONO;
+    g.fillRect(x + g.measureText(lines[li]).width + 4, y0 + li * dy - size * 0.52, size * 0.5, size * 1.02);
+  }
+  g.restore();
+}
+/* 字幕：超宽自动折行，子行随之下移 */
+function caption(s, alpha, key, sub) {
+  if (alpha <= 0.002) return;
+  const A = L.cap;
+  g.save(); g.globalAlpha = alpha;
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.font = '400 15px ' + MONO; g.fillStyle = 'rgba(154,247,211,.72)';
+  g.fillText(key, A.x, A.key);
+  g.font = '600 ' + A.size + 'px ' + SANS;
+  const lines = [];
+  if (g.measureText(s).width <= A.maxW) lines.push(s);
+  else {
+    let cur = '';
+    for (const ch of s) {
+      if (cur && g.measureText(cur + ch).width > A.maxW) { lines.push(cur); cur = ch; }
+      else cur += ch;
+    }
+    if (cur) lines.push(cur);
+  }
+  lines.forEach((ln, i) => {
+    g.font = '600 ' + A.size + 'px ' + SANS; g.fillStyle = C.paper;
+    g.fillText(ln, A.x, A.line + i * (A.size + 14));
+  });
+  if (sub) {
+    g.font = '400 18px ' + MONO; g.fillStyle = 'rgba(154,247,211,.6)';
+    g.fillText(sub, A.x, A.sub + Math.max(0, lines.length - 1) * (A.size + 14));
+  }
+  g.restore();
+}
+function chapterHead(c, alpha, dx) {
+  if (alpha <= 0.002) return;
+  const h = L.head;
+  g.save(); g.globalAlpha = alpha; g.translate(dx, 0);
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.font = '400 15px ' + MONO; g.fillStyle = 'rgba(154,247,211,.7)';
+  g.fillText(c.no, h.x, h.y);
+  const w = g.measureText(c.no).width;
+  g.font = '600 30px ' + SANS; g.fillStyle = C.paper;
+  g.fillText(c.name, h.x + w + 16, h.y);
+  g.restore();
+}
+/* ── 品牌字标（手绘路径，不依赖字体）── */
+function wordmark(cx, cy, gh, alpha) {
+  const s = gh / 150;
+  g.save(); g.globalAlpha = alpha;
+  g.translate(cx, cy); g.scale(s, s); g.translate(-320, -160);
+  g.strokeStyle = C.paper; g.lineWidth = 38; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.beginPath(); g.moveTo(19, 85); g.lineTo(191, 85); g.lineTo(19, 235); g.lineTo(191, 235); g.stroke();
+  g.beginPath(); g.arc(338, 160, 75, 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.moveTo(413, 85); g.lineTo(413, 235); g.stroke();
+  g.beginPath(); g.moveTo(485, 235); g.lineTo(485, 148);
+  g.arc(548, 148, 63, Math.PI, 0, false); g.lineTo(611, 235); g.stroke();
+  g.beginPath(); g.arc(654, 216, 19, 0, Math.PI * 2); g.fillStyle = C.mint; g.fill();
+  g.restore();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   章节时间表
+   ══════════════════════════════════════════════════════════════════════ */
+const CH = [
+  { no: '01', name: '程序结构',     t0: 5.4,  t1: 13.4 },
+  { no: '02', name: '类型系统',     t0: 13.4, t1: 21.4 },
+  { no: '03', name: '面向对象',     t0: 21.4, t1: 29.4 },
+  { no: '04', name: '控制流',       t0: 29.4, t1: 37.4 },
+  { no: '05', name: '内存 · ARC',   t0: 37.4, t1: 45.4 },
+  { no: '06', name: '异步 · 互操作', t0: 45.4, t1: 53.4 },
+  { no: '07', name: '标准库 · 界面', t0: 53.4, t1: 61.4 },
+];
+
+/* 00 · 概览（0 – 5.4）*/
+function beatIntro(t) {
+  const a = env(t, 0.35, 5.45, 0.7, 0.5);
+  if (a < 0.002) return;
+  const cy = PORT ? 690 : 400;
+  wordmark(L.cx, cy, PORT ? 190 : 168, a);
+  const b = env(t, 1.30, 5.45, 0.5, 0.5);
+  if (b > 0.002) {
+    text('Zan 语言基础', L.cx, cy + (PORT ? 190 : 168), PORT ? 62 : 52, C.paper, { weight: '600', alpha: b, track: '4px' });
+    text('ZAN LANGUAGE BASICS', L.cx, cy + (PORT ? 266 : 236), 19, 'rgba(154,247,211,.62)', { mono: true, alpha: b, track: '7px' });
+  }
+  const anchors = ['C# 风格语法', 'LLVM AOT', 'ARC 确定性内存'];
+  anchors.forEach((s, i) => {
+    const on = env(t, 2.30 + i * 0.32, 5.45, 0.45, 0.5);
+    if (on <= 0.002) return;
+    if (PORT) chip(L.cx, 1112 + i * 78, s, { size: 30, h: 58, accent: i === 2, alpha: on });
+    else chip(L.cx + (i - 1) * 306, 706, s, { size: 28, h: 56, accent: i === 2, alpha: on });
+  });
+  text('面向系统级、桌面与实时应用的强类型语言。', L.cx, PORT ? 1420 : 790, PORT ? 30 : 26,
+    'rgba(238,241,242,.5)', { alpha: env(t, 3.4, 5.45, 0.5, 0.5) });
+}
+
+/* 01 · 程序结构（5.4 – 13.4）*/
+const CODE_STRUCT = [
+  'using System;',
+  '',
+  'namespace HelloWorld;',
+  '',
+  'class Program {',
+  '    static void Main(string[] args) {',
+  '        var p = new Point { X = 3.0, Y = 4.0 };',
+  '        Console.WriteLine($"({p.X}, {p.Y}) -> {p.Length()}");',
+  '    }',
+  '}',
+];
+function beatStructure(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  codePanel(CODE_STRUCT, L.code.size, L.code.dy, L.code.x, L.code.y0, a, t, c.t0 + 0.5, 0.13);
+  caption('命名空间即目录，using 按需拉入源码。', env(t, c.t0 + 5.4, c.t1 - 0.1, 0.45, 0.5),
+    '01 / 程序结构', 'using System; · namespace HelloWorld; · static void Main(string[] args)');
+}
+
+/* 02 · 类型系统（13.4 – 21.4）*/
+const VALUE_CHIPS = ['bool', 'byte', 'sbyte', 'short', 'ushort', 'int', 'uint', 'long', 'ulong', 'float', 'double', 'char', 'nint', 'struct', 'enum'];
+const REF_CHIPS = ['class', 'interface', 'delegate', 'T[]', 'string'];
+function beatTypes(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  g.save(); g.globalAlpha = a; g.translate(dx, 0);
+  const P = L.panel, Wd = P.x1 - P.x0;
+  const cards = PORT
+    ? [{ x: P.x0, y: 340, w: Wd, h: 430 }, { x: P.x0, y: 810, w: Wd, h: 340 }]
+    : [{ x: P.x0, y: 340, w: (Wd - 44) / 2, h: 380 }, { x: P.x0 + (Wd - 44) / 2 + 44, y: 340, w: (Wd - 44) / 2, h: 380 }];
+  const specs = [
+    { title: '值类型', color: C.mint, sub: '栈上分配 · 值拷贝 · 零 ARC 开销', chips: VALUE_CHIPS, t0: c.t0 + 0.7, size: PORT ? 28 : 24 },
+    { title: '引用类型', color: C.gold, sub: '堆上分配 · 由 ARC 自动引用计数管理', chips: REF_CHIPS, t0: c.t0 + 1.8, size: PORT ? 28 : 26 },
+  ];
+  const dT = PORT ? 66 : 56, dS = PORT ? 116 : 100, dC = PORT ? 214 : 176;
+  cards.forEach((card, i) => {
+    const sp = specs[i];
+    panelBox(card.x, card.y, card.w, card.h);
+    text(sp.title, card.x + 34, card.y + dT, PORT ? 34 : 30, sp.color, { weight: '600', align: 'left' });
+    text(sp.sub, card.x + 34, card.y + dS, PORT ? 21 : 20, 'rgba(238,241,242,.5)', { align: 'left' });
+    chipRows(sp.chips, card.x + card.w / 2, card.y + dC, sp.size, card.w - 90, 1, t, sp.t0, 0.1);
+  });
+  g.restore();
+  caption('值类型栈上分配，引用类型堆上由 ARC 托管。', env(t, c.t0 + 5.6, c.t1 - 0.1, 0.45, 0.5),
+    '02 / 类型系统', 'var 局部推导 · int? score = null · score ?? 0 · where T : struct');
+}
+
+/* 03 · 面向对象（21.4 – 29.4）*/
+const CODE_OO = [
+  'public class Person : IGreeter {',
+  '    public string Name { get; set; } = "";',
+  '    public int Age { get; private set; }',
+  '',
+  '    public virtual string Greet() => $"Hi, {Name}";',
+  '}',
+];
+const OO_TRAITS = ['单继承', '多接口', '虚方法重写', '属性与索引器', 'this / base 级联'];
+function beatOO(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  const size = PORT ? 26 : 26, dy = PORT ? 52 : 46;
+  codePanel(CODE_OO, size, dy, L.code.x, L.code.y0, a, t, c.t0 + 0.5, 0.16);
+  g.save(); g.globalAlpha = a; g.translate(dx, 0);
+  if (PORT) {
+    chipRows(OO_TRAITS, L.cx, 1150, 24, W - 208, 1, t, c.t0 + 3.2, 0.14);
+  } else {
+    OO_TRAITS.forEach((s, i) => {
+      const on = smooth(range(t, c.t0 + 3.2 + i * 0.14, c.t0 + 3.45 + i * 0.14));
+      g.save(); g.globalAlpha = on;
+      const bx = 1640, by = 340 + i * 64;
+      g.beginPath(); g.arc(bx - 132, by, 4, 0, Math.PI * 2); g.fillStyle = C.mint; g.fill();
+      text(s, bx - 110, by, 25, 'rgba(238,241,242,.75)', { align: 'left' });
+      g.restore();
+    });
+  }
+  g.restore();
+  caption('单继承 + 多接口；属性 get/set；virtual / override / sealed。', env(t, c.t0 + 5.6, c.t1 - 0.1, 0.45, 0.5),
+    '03 / 面向对象', 'class · struct · interface · enum · public / private / protected / internal');
+}
+
+/* 04 · 控制流（29.4 – 37.4）*/
+const CODE_FLOW = [
+  'foreach (var item in list) {',
+  '    if (item.Score is int s && s > 60) total += s;',
+  '}',
+  '',
+  'switch (shape) {',
+  '    case Circle c:            return c.R * c.R * 3.14;',
+  '    case Rect r when r.W > 0: return r.W * r.H;',
+  '}',
+  '',
+  'using (var f = new FileStream("a.txt")) { ... }',
+];
+function beatFlow(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  codePanel(CODE_FLOW, PORT ? 24 : 25, PORT ? 46 : 40, L.code.x, PORT ? L.code.y0 : 330, a, t, c.t0 + 0.5, 0.12);
+  caption('switch 支持类型模式与 when 保护；using 离开作用域自动 Dispose。', env(t, c.t0 + 5.8, c.t1 - 0.1, 0.45, 0.5),
+    '04 / 控制流', 'if / else · foreach · while · do-while · try / catch / finally · lock');
+}
+
+/* 05 · 内存 · ARC（37.4 – 45.4）*/
+function beatArc(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  g.save(); g.globalAlpha = a; g.translate(dx, 0);
+
+  const p = range(t, c.t0 + 2.4, c.t1 - 1.0);
+  const refs = Math.max(0, 3 - Math.floor(p * 3.7));
+  const dead = refs === 0;
+
+  const G0 = PORT
+    ? { refsY: 600, refsX: 300, refsDx: 240, objX: 540, objY: 860, objW: 500, objH: 190, numY: 1050, numS: 96 }
+    : { refsY: 500, refsX: 720, refsDx: 130, objX: 1300, objY: 500, objW: 330, objH: 140, numX: 1670, numY: 500, numS: 80 };
+
+  for (let i = 0; i < 3; i++) {
+    const alive = i < refs;
+    const on = smooth(range(t, c.t0 + 0.5 + i * 0.2, c.t0 + 0.75 + i * 0.2));
+    if (on <= 0.01) continue;
+    const x = G0.refsX + i * G0.refsDx;
+    g.save(); g.globalAlpha = (alive ? 0.95 : 0.16) * on;
+    rrect(x - 52, G0.refsY - 27, 104, 54, 10);
+    g.fillStyle = 'rgba(255,255,255,.05)'; g.fill();
+    g.lineWidth = 1.2; g.strokeStyle = alive ? 'rgba(154,247,211,.5)' : 'rgba(255,255,255,.16)'; g.stroke();
+    text('ref', x, G0.refsY, 26, alive ? C.mint : 'rgba(238,241,242,.5)', { mono: true });
+    g.restore();
+    if (alive) {
+      if (PORT) arrow(x, G0.refsY + 30, G0.objX + (x - G0.objX) * 0.45, G0.objY - G0.objH / 2 - 8, 'rgba(154,247,211,.42)', 1.4);
+      else arrow(x + 56, G0.refsY, G0.objX - G0.objW / 2 - 10, G0.refsY, 'rgba(154,247,211,.42)', 1.4);
+    }
+  }
+
+  g.save();
+  const glow = dead ? 0.5 + 0.5 * Math.abs(Math.sin(t * 5)) : 0;
+  rrect(G0.objX - G0.objW / 2, G0.objY - G0.objH / 2, G0.objW, G0.objH, 16);
+  g.fillStyle = dead ? 'rgba(255,200,56,.035)' : 'rgba(154,247,211,.045)'; g.fill();
+  g.lineWidth = dead ? 2 : 1.6;
+  g.strokeStyle = dead ? 'rgba(255,200,56,' + (0.45 + 0.45 * glow) + ')' : 'rgba(154,247,211,.55)';
+  g.stroke();
+  text('HttpClient', G0.objX, G0.objY - 22, 28, dead ? 'rgba(238,241,242,.4)' : C.paper, { mono: true, weight: '600' });
+  text(dead ? 'refcount = 0 → 立即析构' : 'refcount', G0.objX, G0.objY + 34, 20, dead ? C.gold : 'rgba(154,247,211,.6)', { mono: true });
+  g.restore();
+
+  const nx = PORT ? L.cx : G0.numX;
+  text('REF', nx, G0.numY - 60, 20, 'rgba(154,247,211,.55)', { mono: true, track: '4px' });
+  text(String(refs), nx, G0.numY + 10, G0.numS, dead ? C.gold : C.paper, { mono: true, weight: '600' });
+
+  const y2 = PORT ? 1300 : 690;
+  const ax = PORT ? 340 : 790, bx = PORT ? 740 : 1150;
+  const g2 = smooth(range(t, c.t0 + 6.2, c.t0 + 6.6)) * a;
+  if (g2 > 0.01) {
+    g.save(); g.globalAlpha = g2;
+    const box = (x, label) => {
+      rrect(x - 78, y2 - 42, 156, 84, 12);
+      g.fillStyle = 'rgba(255,255,255,.04)'; g.fill();
+      g.lineWidth = 1.3; g.strokeStyle = 'rgba(255,255,255,.2)'; g.stroke();
+      text(label, x, y2, 26, 'rgba(238,241,242,.8)', { mono: true });
+    };
+    box(ax, 'Node A'); box(bx, 'Node B');
+    arrow(ax + 84, y2 - 16, bx - 84, y2 - 16, 'rgba(154,247,211,.75)', 1.8);
+    text('strong', (ax + bx) / 2, y2 - 48, 19, 'rgba(154,247,211,.8)', { mono: true });
+    arrow(bx - 84, y2 + 20, ax + 84, y2 + 20, 'rgba(255,200,56,.9)', 1.8, [9, 7]);
+    text('weak', (ax + bx) / 2, y2 + 52, 19, C.gold, { mono: true });
+    if (PORT) text('weak 不增加计数 · 打破循环引用', L.cx, y2 + 122, 24, 'rgba(238,241,242,.5)');
+    else text('weak 弱引用不增加计数 · 打破循环引用', 1560, y2 + 8, 22, 'rgba(238,241,242,.5)');
+    g.restore();
+  }
+  g.restore();
+  caption('引用计数归零即刻析构 —— 没有 GC，没有停顿。', env(t, c.t0 + 6.2, c.t1 - 0.1, 0.45, 0.5),
+    '05 / 内存 · ARC', 'weak 打破循环引用 · using 确定性释放 · 无悬挂指针');
+}
+
+/* 06 · 异步 · 互操作（45.4 – 53.4）*/
+const CODE_ASYNC = [
+  'async Task<int> FetchAsync(string url) {',
+  '    var body = await http.GetStringAsync(url);',
+  '    return body.Length;',
+  '}',
+];
+const CODE_FFI = [
+  '[DllImport("user32.dll")]',
+  'static extern int MessageBoxW(',
+  '    nint h, string text, string cap, uint type);',
+];
+const ASYNC_CHIPS = ['async / await', 'Channel<T>', 'AsyncRuntime'];
+function beatAsync(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  const size = PORT ? 24 : 26;
+  codePanel(CODE_ASYNC, size, PORT ? 46 : 40, L.code.x, PORT ? L.code.y0 : 330, a, t, c.t0 + 0.5, 0.16);
+  codePanel(CODE_FFI, size, PORT ? 46 : 40, L.code.x, PORT ? L.code.y0 + 300 : 580, a, t, c.t0 + 2.6, 0.2);
+  g.save(); g.globalAlpha = a; g.translate(dx, 0);
+  if (PORT) {
+    chipRows(ASYNC_CHIPS, L.cx, 1310, 22, W - 208, 1, t, c.t0 + 4.4, 0.16, 16);
+  } else {
+    ASYNC_CHIPS.forEach((s, i) => {
+      const on = smooth(range(t, c.t0 + 4.4 + i * 0.16, c.t0 + 4.65 + i * 0.16));
+      chip(1540, 400 + i * 66, s, { size: 22, h: 46, alpha: on });
+    });
+  }
+  g.restore();
+  caption('async/await 协程调度；DllImport 免头文件直调 C 动态库。', env(t, c.t0 + 5.6, c.t1 - 0.1, 0.45, 0.5),
+    '06 / 异步 · 互操作', 'async → CPS 转换 · Channel<T> 并发通道 · [DllImport] 原生互操作');
+}
+
+/* 07 · 标准库 · 界面（53.4 – 61.4）*/
+const STDLIB = ['System.Console', 'System.Collections', 'System.Net.Http', 'System.Threading', 'System.Json', 'Guid · DateTime · IO · ...'];
+const MARKUP = ['<card w="340">', '  <text>深夜电台</text>', '  <button onClick="save" />', '</Card>'.replace('C', 'c')];
+function beatLib(c, t) {
+  const { a, dx } = slideIn(t, c.t0, c.t1);
+  if (a <= 0.002) return;
+  chapterHead(c, a, dx);
+  g.save(); g.globalAlpha = a; g.translate(dx, 0);
+  const P = L.panel, Wd = P.x1 - P.x0;
+  const cards = PORT
+    ? [{ x: P.x0, y: 330, w: Wd, h: 500 }, { x: P.x0, y: 870, w: Wd, h: 470 }]
+    : [{ x: P.x0, y: 340, w: (Wd - 44) / 2, h: 420 }, { x: P.x0 + (Wd - 44) / 2 + 44, y: 340, w: (Wd - 44) / 2, h: 420 }];
+
+  // 左：标准库
+  panelBox(cards[0].x, cards[0].y, cards[0].w, cards[0].h);
+  text('标准库 = 纯 .zan 源码', cards[0].x + 34, cards[0].y + 58, PORT ? 28 : 28, C.mint, { weight: '600', align: 'left' });
+  text('用多少，拉多少 —— 零冗余分发', cards[0].x + 34, cards[0].y + 100, PORT ? 19 : 20, 'rgba(238,241,242,.5)', { align: 'left' });
+  STDLIB.forEach((s, i) => {
+    const on = smooth(range(t, c.t0 + 0.7 + i * 0.13, c.t0 + 0.95 + i * 0.13));
+    g.save(); g.globalAlpha = on;
+    text(s, cards[0].x + 70, cards[0].y + 160 + i * 44, 25, 'rgba(238,241,242,.8)', { mono: true, align: 'left' });
+    g.restore();
+  });
+
+  // 右：界面
+  const c2 = cards[1];
+  panelBox(c2.x, c2.y, c2.w, c2.h);
+  text('界面 = HTML / CSS 声明', c2.x + 34, c2.y + 58, PORT ? 28 : 28, C.gold, { weight: '600', align: 'left' });
+  text('编译出来是原生窗口，不是网页', c2.x + 34, c2.y + 100, PORT ? 19 : 20, 'rgba(238,241,242,.5)', { align: 'left' });
+  MARKUP.forEach((s, i) => {
+    const on = smooth(range(t, c.t0 + 2.5 + i * 0.15, c.t0 + 2.75 + i * 0.15));
+    g.save(); g.globalAlpha = on; codeLine(s, c2.x + 60, c2.y + 168 + i * 46, 25); g.restore();
+  });
+  const on = smooth(range(t, c.t0 + 4.0, c.t0 + 4.3));
+  g.save(); g.globalAlpha = on;
+  arrow(c2.x + 60, c2.y + 380, c2.x + (PORT ? 300 : 250), c2.y + 380, 'rgba(154,247,211,.7)', 1.8);
+  text('zanc · 原生窗口', c2.x + (PORT ? 312 : 262), c2.y + 380, 24, C.mint, { mono: true, align: 'left' });
+  g.restore();
+
+  const on2 = smooth(range(t, c.t0 + 4.5, c.t0 + 4.8));
+  if (on2 > 0.01 && PORT) chip(L.cx, 1414, '无虚拟机 · 七个原生目标', { size: 26, h: 58, accent: true, alpha: on2 });
+  g.restore();
+  caption('标准库是源码，按需拉入；界面用 HTML/CSS 声明，编译成原生窗口。', env(t, c.t0 + 5.8, c.t1 - 0.1, 0.45, 0.5),
+    '07 / 标准库 · 界面', 'stdlib/*.zan · packages/Zan.Gui · LLVM AOT · 七个原生目标');
+}
+
+/* 08 · 落版（61.4 – 66）*/
+function beatLockup(t) {
+  const a = env(t, 61.9, D, 0.6, 0.8);
+  if (a < 0.002) return;
+  const cy = PORT ? 780 : 420;
+  wordmark(L.cx, cy, PORT ? 200 : 176, a);
+  const b = env(t, 62.4, D, 0.5, 0.85);
+  if (b > 0.002) {
+    const base = cy + (PORT ? 236 : 204);
+    text('强类型 · C# 风格', L.cx, base, PORT ? 40 : 34, 'rgba(238,241,242,.82)', { weight: '600', alpha: b, track: '4px' });
+    text('LLVM AOT · ARC 确定性内存', L.cx, base + (PORT ? 88 : 68), PORT ? 26 : 23, 'rgba(154,247,211,.7)', { mono: true, alpha: b, track: '3px' });
+    text('一份源码 · 七个原生目标', L.cx, base + (PORT ? 168 : 128), PORT ? 24 : 21, 'rgba(238,241,242,.38)', { mono: true, alpha: b, track: '3px' });
+  }
+}
+
+/* ── 侧栏章节索引 ── */
+function drawRail(t) {
+  const on = smooth(range(t, 5.1, 5.9)) * (1 - smooth(range(t, 61.2, 61.7)));
+  if (on <= 0.002) return;
+  const A = L.rail;
+  let cur = -1;
+  for (let i = 0; i < CH.length; i++) if (t >= CH[i].t0) cur = i;
+  g.save();
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  if (A.horiz) {
+    for (let i = 0; i < CH.length; i++) {
+      const x = A.x + i * A.dx, hot = i === cur;
+      g.globalAlpha = on * (hot ? 1 : 0.34);
+      g.beginPath(); g.arc(x, A.y, hot ? 5 : 3, 0, Math.PI * 2);
+      g.fillStyle = hot ? C.mint : 'rgba(238,241,242,.65)'; g.fill();
+      g.font = '400 22px ' + MONO; g.fillStyle = hot ? C.paper : 'rgba(238,241,242,.5)';
+      g.fillText(CH[i].no, x + 16, A.y);
+    }
+    g.restore();
+    return;
+  }
+  for (let i = 0; i < CH.length; i++) {
+    const y = A.y + i * A.dy, hot = i === cur;
+    g.globalAlpha = on * (hot ? 1 : 0.36);
+    g.beginPath(); g.arc(A.x, y, hot ? 5 : 3, 0, Math.PI * 2);
+    g.fillStyle = hot ? C.mint : 'rgba(238,241,242,.65)'; g.fill();
+    g.font = '400 14px ' + MONO; g.fillStyle = hot ? C.mint : 'rgba(238,241,242,.55)';
+    g.fillText(CH[i].no, A.x + 20, y);
+    g.font = '400 23px ' + SANS; g.fillStyle = hot ? C.paper : 'rgba(238,241,242,.5)';
+    g.fillText(CH[i].name, A.x + 62, y);
+  }
+  g.restore();
+}
+/* ── 帧内 HUD ── */
+function drawHud(t) {
+  const vis = smooth(range(t, 0.15, 0.9)) * (1 - smooth(range(t, D - 0.9, D - 0.15)));
+  if (vis <= 0.002) return;
+  g.save(); g.globalAlpha = vis * 0.30;
+  g.font = '400 13px ' + MONO; g.fillStyle = C.paper;
+  g.textAlign = 'left'; g.textBaseline = 'middle';
+  g.fillText('ZAN · 语言基础', 150, 62);
+  g.textAlign = 'right';
+  g.fillText((PORT ? '9:16' : '16:9') + ' · ' + D.toFixed(3) + 's · LOOP', W - 150, 62);
+  g.globalAlpha = vis * 0.12;
+  g.fillRect(150, H - 54, W - 300, 1);
+  g.globalAlpha = vis * 0.5;
+  g.fillStyle = C.mint;
+  g.fillRect(150, H - 54, (W - 300) * (t / D), 1);
+  g.restore();
+}
+
+/* ── 每帧 ── */
+const BEAT = { '01': beatStructure, '02': beatTypes, '03': beatOO, '04': beatFlow, '05': beatArc, '06': beatAsync, '07': beatLib };
+function draw(t) {
+  stars.rotation.z  = Math.sin(t / D * Math.PI * 2) * 0.06;
+  stars.position.x  = Math.sin(t / D * Math.PI * 2) * 0.05;
+  stars.position.y  = Math.cos(t / D * Math.PI * 2) * 0.035;
+  stars.material.opacity = 0.34 + 0.13 * Math.sin(t / D * Math.PI * 4);
+
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  g.clearRect(0, 0, W, H);
+
+  beatIntro(t);
+  for (const c of CH) BEAT[c.no](c, t);
+  beatLockup(t);
+  drawRail(t);
+  drawHud(t);
+
+  hudTex.needsUpdate = true;
+}
+
+/* ── 尺寸 ── */
+function layout() {
+  const vw = innerWidth, vh = innerHeight;
+  let w = vw, h = vw / (W / H);
+  if (h > vh) { h = vh; w = vh * (W / H); }
+  canvas.style.width = Math.round(w) + 'px';
+  canvas.style.height = Math.round(h) + 'px';
+  if (ENCODE) { renderer.setPixelRatio(1); renderer.setSize(EW, EH, false); composer.setSize(EW, EH); }
+  else { renderer.setPixelRatio(DPR); renderer.setSize(Math.round(w), Math.round(h), false); composer.setSize(Math.round(w), Math.round(h)); }
+  bloom.setSize(Math.round(EW * 2 / 3), Math.round(EH * 2 / 3));
+}
+
+/* ── 主循环 ── */
+let t0 = performance.now();
+let encoding = false;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (ENCODE || encoding) return;
+  const t = SHOT != null ? SHOT : ((now - t0) / 1000) % D;
+  draw(t);
+  grade.uniforms.uTime.value = t;
+  composer.render();
+}
+window.__seek = t => { draw(Number(t) || 0); grade.uniforms.uTime.value = t; composer.render(); };
+
+addEventListener('resize', layout);
+
+/* ── WebCodecs 导出 ── */
+const recEl = document.getElementById('rec');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* rAF 在窗口不可见/被遮挡时不再触发，会导致逐帧循环永久挂起：
+   rAF 与定时器赛跑，谁先到算谁的。 */
+const yieldFrame = () => new Promise(res => {
+  let done = false;
+  const fin = () => { if (!done) { done = true; res(); } };
+  requestAnimationFrame(fin);
+  setTimeout(fin, 200);
+});
+async function encodeVideo() {
+  if (encoding) return;
+  encoding = true;
+  recEl.classList.add('on');
+  recEl.textContent = '准备编码…';
+  renderer.setPixelRatio(1);
+  renderer.setSize(EW, EH, false);
+  composer.setSize(EW, EH);
+  bloom.setSize(Math.round(EW * 2 / 3), Math.round(EH * 2 / 3));
+  let Muxer, ArrayBufferTarget;
+  try { ({ Muxer, ArrayBufferTarget } = await import('https://cdn.jsdelivr.net/npm/mp4-muxer@5/build/mp4-muxer.mjs')); }
+  catch (e) { recEl.textContent = 'mp4-muxer 加载失败'; encoding = false; return; }
+  const muxer = new Muxer({ target: new ArrayBufferTarget(), video: { codec: 'avc', width: EW, height: EH, frameRate: FPS }, fastStart: 'in-memory' });
+  let encErr = null;
+  const encoder = new VideoEncoder({
+    output: (ch, m) => muxer.addVideoChunk(ch, m),
+    error: e => { encErr = e.message; },
+  });
+  let cfg = null;
+  for (const codec of ['avc1.640028', 'avc1.4d0028', 'avc1.42E01F']) {
+    const s = await VideoEncoder.isConfigSupported({ codec, width: EW, height: EH, bitrate: 16e6, framerate: FPS, avc: { format: 'avc' } });
+    if (s.supported) { cfg = { ...s.config, bitrate: 16e6, framerate: FPS, avc: { format: 'avc' } }; break; }
+  }
+  if (!cfg) { recEl.textContent = '无可用 H.264 编码器'; encoding = false; return; }
+  encoder.configure(cfg);
+  const total = Math.round(D * FPS), dt = 1e6 / FPS, start = performance.now();
+  let fail = null;
+  for (let i = 0; i < total; i++) {
+    const t = i / FPS;
+    draw(t); grade.uniforms.uTime.value = t; composer.render();
+    if (encErr || encoder.state !== 'configured') { fail = encErr || ('codec state = ' + encoder.state); break; }
+    const f = new VideoFrame(canvas, { timestamp: Math.round(i * dt), duration: Math.round(dt) });
+    try { encoder.encode(f, { keyFrame: i % (FPS * 2) === 0 }); }
+    catch (err) { fail = err.message; f.close(); break; }
+    f.close();
+    // 背压：队列堆太深会把 codec 顶爆（Cannot call 'encode' on a closed codec）
+    while (encoder.encodeQueueSize > 8) await sleep(2);
+    if (i % 20 === 0) { recEl.textContent = '逐帧渲染 ' + i + ' / ' + total + ' · ' + ((performance.now() - start) / 1000).toFixed(1) + 's'; await yieldFrame(); }
+  }
+  if (fail) {
+    try { encoder.close(); } catch {}
+    recEl.textContent = '编码失败：' + fail;
+    window.__encodeError = fail;
+    encoding = false;
+    layout();
+    return;
+  }
+  await encoder.flush(); encoder.close(); muxer.finalize();
+  const blob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'zan-basics-' + EW + 'x' + EH + '-' + FPS + 'fps.mp4';
+  document.body.appendChild(a); a.click();
+  recEl.textContent = '✓ ' + (blob.size / 1048576).toFixed(1) + ' MB';
+  window.__recording = { size: blob.size, frames: total, name: a.download };
+  layout();
+  encoding = false;
+}
+
+function fatal(msg) {
+  document.getElementById('fatal').style.display = 'grid';
+  document.getElementById('fatalMsg').textContent = msg;
+  document.getElementById('boot').classList.add('off');
+}
+
+layout();
+draw(0);
+composer.render();
+document.getElementById('boot').classList.add('off');
+document.getElementById('btn').addEventListener('click', encodeVideo);
+if (SHOT != null) { document.getElementById('btn').style.display = 'none'; document.getElementById('rec').style.display = 'none'; }
+if (ENCODE) setTimeout(() => { encodeVideo().catch(e => { recEl.textContent = '编码失败：' + e.message; encoding = false; }); }, 700);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
