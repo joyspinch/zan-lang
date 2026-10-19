@@ -1075,7 +1075,10 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/_scratch")
 add_test(NAME unit_package_namespace
     COMMAND zan_package_namespace_test "${CMAKE_SOURCE_DIR}/_scratch")
-set_tests_properties(unit_package_namespace PROPERTIES TIMEOUT 30)
+# 夹具要在源码树的 _scratch 下真建 96 个文件 + 256 个目录（Windows 上还要
+# 过一遍杀软扫描），单跑就要 ~20s；30s 在并行档里必然超时——那不是功能回归，
+# 是资源争用。给足余量，失败才是真信号。
+set_tests_properties(unit_package_namespace PROPERTIES TIMEOUT 180)
 
 add_test(NAME unit_zan_pm_cli
     COMMAND ${CMAKE_COMMAND}
@@ -2550,10 +2553,26 @@ endif()
 #      closed (non-zero, no .ll). clang is optional -- without it the stdout
 #      stage is skipped and the harness still proves gen1 builds and emits IR. ----
 find_program(SELFHOST_CLANG NAMES clang)
+# ---- Self-hosting source list: ONE file, every consumer ----
+# scripts/selfhost_sources.txt is the canonical list of the self-hosted
+# compiler's sources; the ctest harnesses and scripts/bootstrap.* all read it.
+# Previously the harnesses carried their own copy and the bootstrap scripts
+# still listed a 9-file subset -- a source added to one place was silently
+# missing from the closure, which is how the fixed point rotted unnoticed.
+file(STRINGS ${CMAKE_SOURCE_DIR}/scripts/selfhost_sources.txt _sh_lines)
+set(SELFHOST_SOURCES)
+foreach(_sh_line IN LISTS _sh_lines)
+  string(STRIP "${_sh_line}" _sh_line)
+  if(_sh_line STREQUAL "")
+    continue()
+  endif()
+  list(APPEND SELFHOST_SOURCES ${CMAKE_SOURCE_DIR}/src/${_sh_line}.zan)
+endforeach()
 add_test(NAME selfhost_gen1
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
     -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/prog1.out
     -DGEN1=${CMAKE_BINARY_DIR}/selfhost_gen1${_exe_ext}
@@ -2573,6 +2592,7 @@ add_test(NAME selfhost_json_ignore
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
     -DPROG=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/selfhost/json_ignore_ok.out
     -DGEN1=${CMAKE_BINARY_DIR}/selfhost_jsongen1${_exe_ext}
@@ -2589,19 +2609,37 @@ set_tests_properties(selfhost_json_ignore PROPERTIES TIMEOUT 600)
 #      large stack reservation (matching what the host bakes into its own link).
 #      Skipped automatically wherever clang is absent. ----
 if(SELFHOST_CLANG)
-  # The selfhost driver calls the zan_exe_dir_into/zan_dir_list_into runtime
-  # helpers (stdlib auto-include), so gen2 links an rt_sync object built with
-  # the same clang that links the test (the host-toolchain object may target a
-  # different C runtime, e.g. mingw vs MSVC).
-  set(ZAN_RT_SYNC_SELFHOST_OBJ "${CMAKE_BINARY_DIR}/zanrt_sync_selfhost.obj")
-  add_custom_command(
-    OUTPUT ${ZAN_RT_SYNC_SELFHOST_OBJ}
-    COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
-            -o ${ZAN_RT_SYNC_SELFHOST_OBJ}
-    DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.c
-            ${CMAKE_SOURCE_DIR}/src/runtime/rt_sync.h
-    COMMENT "Building rt_sync object for selfhost tests (zanrt_sync_selfhost)")
-  add_custom_target(zanrt_sync_selfhost ALL DEPENDS ${ZAN_RT_SYNC_SELFHOST_OBJ})
+  # gen2 links the same runtime the host links for an ordinary program: the
+  # self-hosted compiler's own sources reach for the file/io/sync/decimal/embed
+  # runtime (FileStream, Environment, embedded resources). The objects are built
+  # with SELFHOST_CLANG -- the same linker the test drives -- so the C runtime
+  # matches (the host-toolchain object may target a different C runtime, e.g.
+  # mingw vs MSVC). rt_co.c is deliberately absent: rt_io.c already provides
+  # the coroutine scheduler, and the self-host emits its own copy as a weak
+  # fallback (mirroring the host's zan_runtime_fallback).
+  set(_sh_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
+                   rt_sync.c zan_embed_api.c)
+  set(_sh_rt_objs)
+  foreach(_sh_src IN LISTS _sh_rt_srcs)
+    get_filename_component(_sh_stem ${_sh_src} NAME_WE)
+    set(_sh_obj "${CMAKE_BINARY_DIR}/zanrt_sh_${_sh_stem}${CMAKE_C_OUTPUT_EXTENSION}")
+    add_custom_command(
+      OUTPUT ${_sh_obj}
+      COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
+              -o ${_sh_obj}
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_sh_src}
+      COMMENT "Building ${_sh_src} for the selfhost fixed point")
+    list(APPEND _sh_rt_objs ${_sh_obj})
+  endforeach()
+  add_custom_target(zanrt_selfhost_bundle ALL DEPENDS ${_sh_rt_objs})
+  # Windows system libraries the pulled-in stdlib calls into (CommandLineToArgvW
+  # / SHGetFileInfoW -> shell32, DestroyIcon -> user32, the version API ->
+  # version). POSIX needs libdl/libpthread for the same stdlib surface.
+  if(WIN32)
+    set(_sh_syslibs "-lkernel32;-lshell32;-luser32;-ladvapi32;-lversion")
+  else()
+    set(_sh_syslibs "-ldl;-lpthread;-lm")
+  endif()
   if(WIN32)
     # Reserve a large stack so gen2 (which self-compiles into g3.ll) does not
     # overflow. The flag depends on the linker clang drives: MSVC-targeting
@@ -2621,13 +2659,15 @@ if(SELFHOST_CLANG)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+      "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
       -DCLANG=${SELFHOST_CLANG}
       -DGEN1=${CMAKE_BINARY_DIR}/fixedpoint_gen1${_exe_ext}
       -DGEN2=${CMAKE_BINARY_DIR}/fixedpoint_gen2${_exe_ext}
       -DG2LL=${CMAKE_BINARY_DIR}/fixedpoint_g2.ll
       -DG3LL=${CMAKE_BINARY_DIR}/fixedpoint_g3.ll
       "-DSTACK_ARGS=${_fixedpoint_stack}"
-      "-DRT_OBJS=${ZAN_RT_SYNC_SELFHOST_OBJ}"
+      "-DRT_OBJS=${_sh_rt_objs}"
+      "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_fixedpoint.cmake)
   set_tests_properties(selfhost_fixed_point PROPERTIES TIMEOUT 1200)
 endif()

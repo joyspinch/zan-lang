@@ -603,6 +603,15 @@ after the join. `TaskGroup` does not exist; the join helpers live in
 `WhenAllPoll` / `WhenAnyPoll` busy-poll variants), `CancelAll(List<long>)` and
 `DoneCount(List<long>)`.
 
+> **The lambda form's handle is a plain `long`** — do *not* re-type it as
+> `Task` / `Task<T>` to reach `.Result` / `.Wait()`. The lambda form runs on a
+> different frame kind whose ownership contract differs (the frame is reaped
+> once by the completion path and once more by the reader), so reading it
+> aborts the process with a runtime double free. Wait on a lambda task through
+> its handle (`Task.IsDone(h)`, `TaskJoin.WhenAll(handles)`) instead. Tracked
+> as TASKS.md A379; the async-call form (`Task.Run(Prog.Work())`) is unaffected
+> and does yield a `Task<T>`.
+
 **Channels** — `Channel<T>` (`stdlib/System/Threading/Channel.zan`) is generic:
 `CreateUnbounded()` / `CreateBounded(capacity)`, `TryWrite(T)` /
 `async bool Write(T)`, `TryRead(out T)` / `async bool Read(out T)`, `Count()`,

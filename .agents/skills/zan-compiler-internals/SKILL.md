@@ -86,6 +86,10 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 5. **委托双形态与闭包捕获保活**：
    - 动作：区分纯函数指针与携带上下文环境的闭包（Tagged Closure）；闭包跨调用帧逃逸或传递至异步线程时必须调用 ARC retain，并在执行入口校验 `ZAN_CLOSURE_TAG`。
    - 理由：确保被捕获的上下文变量在异步或脱钩执行期间生命周期完整。
+6. **协程帧只许被 reap 一次（帧所有权契约）**：
+   - 动作：给帧设置"自 awaiter"（`ASYNC_FRAME_AWAITER = 自身`、`AWAITER_STEP = __zan_co_reap`，即"任务完成即释放"）之前，必须确认没有第二条路径会再释放同一帧；带结果（keep_result）的帧不设自 awaiter，由用户侧 `reap` 释放，**两类帧的所有权契约不可混用**。
+   - 理由：运行时 `__zan_co_frame_free` 的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，但小对象分配器回收时把用户块首 8 字节写成 freelist 指针，守卫读到的已是垃圾 → 二次释放直接 double free（进程 abort）。实例：lambda 形态的 `Task.Run` 走 action 帧并自 reap，用户再读 `.Result`/`.Wait()` 又 reap 一次（详见 TASKS.md A379）。
+   - 边界：运行时的守卫位不要放在分配器会回写的槽位（帧首 8 字节）；若要让 reap 幂等，标记必须落在分配器不覆盖的字段上。
 
 ---
 

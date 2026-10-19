@@ -1,0 +1,36 @@
+// 探针（不进 ctest，tests/_probe/ 不参与收集）：Task.Run(lambda) 的帧被释放两次。
+//
+// 现象：`Task<int> t = Task.Run(() => { ... }); t.Result` 运行期报
+//   zan runtime: fatal (mem): double free of block 0x...
+// 进程直接 abort，退出码 3。
+//
+// 根因（2026-10-20 定位）：
+//   1) lambda 形态的 Task.Run 走 action 帧（zan.co.task_action_frame，
+//      irgen_call.c get_task_action_frame_type）。该帧在任务完成时把自己
+//      登记成自己的 awaiter，AWAITER_STEP = __zan_co_reap，于是完成路径
+//      会 reap(自己) 一次；用户再读 .Result / .Wait() 时又 reap 一次
+//      （irgen_expr_core.c emit_task_member 的 mode 1 / mode 3）。
+//   2) 运行时 __zan_co_frame_free 的幂等守卫读帧首 8 字节的 CO_DEAD 位，
+//      但分配器回收时把用户块首 8 字节写成 freelist 指针，守卫失效 → 二次
+//      free → double free。
+//   3) async 调用形态（Task.Run(Prog.Work())，keep_result）不设自 awaiter，
+//      帧只由用户 reap 一次，所以不炸——差别只在帧所有权，不在 lambda。
+//
+// 两条修法方向（见 TASKS.md A379）：
+//   a) 类型侧精确化：Task.Run(lambda) 的结果类型是 long（句柄），不是
+//      Task/Task<T>；只有 async 调用形态才产出 Task<T>。让检查器把这层
+//      区分开，".Result/.Wait() 作用在 lambda 句柄上"直接编译期拒绝。
+//   b) 帧生命周期侧：让 action 帧只被释放一次（完成路径与用户路径二选一），
+//      或让 reap 对已释放帧幂等（标记位放到分配器不覆盖的槽位）。
+//
+// 用法：
+//   build\zanc.exe tests\_probe\task_run_lambda_result_double_free.zan --auto-stdlib -o _scratch\probe.exe
+//   _scratch\probe.exe
+using System;
+
+class Prog {
+    static void Main() {
+        Task<int> t = Task.Run(() => { Console.WriteLine("action-ran"); });
+        Console.WriteLine("r=" + Convert.ToString(t.Result));
+    }
+}
