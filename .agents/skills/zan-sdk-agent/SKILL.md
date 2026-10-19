@@ -84,6 +84,16 @@ tools/agent/verify.ps1 -Paths tests/conformance/aes_gcm.zan -RunTests
 - **模板**：Windows 用 `tools/agent/gate-templates.ps1`（按 `template.manifest`
   + `zan.proj` 的声明做替换副本）；macOS 用 `scripts/test_all_templates.py`
   （官方脚本，硬编码 macOS 路径）。模板源带 `{{NAME}}` 占位符，**不能直接编译**。
+- **新增 `tests/conformance/*.zan` 必须 re-configure 才进 ctest**：conformance 用例
+  是 CMake `file(GLOB)` 登记的，GLOB 在 configure 时求值——不重新 configure，新用例
+  **文件在、门不跑**。实例：`decimal_arithmetic` / `weak_reference_generic` 两个用例
+  随特性一起提交后从未进过 ctest（`ctest -N -R decimal` 才有）。改完 conformance
+  目录先 `cmake -B build` 再跑。
+- **批量改可见性必须带影响面**：把成员改成 `private`（或补 `public`）会立刻打断
+  外部调用点，而这类破坏不会自己暴露。实例：`Socket.ResolveIpv4` 规范成 `private`
+  后，`conformance_async_dns` / `conformance_async_mt` 从那天起一直红，直到有人
+  手工重跑才发现——档位日志还停在改动前一天。改前先 `tools/agent/impact.ps1`，
+  改后定向跑受影响用例。
 
 ## 5. 影响面：改公共面之前必跑
 

@@ -577,31 +577,65 @@ Differences from C# (by design or pending compiler work — see
 - **No `ToDictionary`** yet (blocked by a Dictionary generic-value bug).
 - `Grouping<T>` exposes `Key` (string), `IntKey` (int) and `Items`.
 
-### 3.7 System.Threading — tasks & channels (implemented surface)
+### 3.7 System.Threading — tasks, channels & cancellation (implemented surface)
 
-The shipped task API takes an *async call*, not a lambda (a spawned coroutine
-is a state machine the compiler lowers from a named `async` method):
+`Task` is a compiler-builtin type (`src/compiler/builtin_api.c`, `members_task`),
+not a library class. A task handle is a `long`; an `async` method is lowered to
+a coroutine state machine (see `docs/ASYNC_CPS_DESIGN.md`).
 
 | Form | Meaning |
 |------|---------|
 | `long h = Task.Spawn(Worker(x))` | run `Worker` as a detached coroutine, return its handle |
-| `long h = Task.Run(Worker(x))` | same lowering under this name |
-| `await Task.Delay(ms)` | suspend this coroutine for `ms` (sleeps at a non-async root) |
+| `long h = Task.Run(Worker(x))` | same lowering, but a **value-returning** async call keeps its result — the handle is then a `Task<T>` |
+| `long h = Task.Run(() => { ... })` | lambda/`Action` form; allowed only for a parameterless `void` body (a result needs an async call) |
+| `await Task.Delay(ms)` / `await Task.Yield()` | suspend this coroutine |
 | `await Task.WhenAll(handles)` | suspend until every handle in a `List<long>` has completed |
 | `await Task.WhenAny(handles)` | suspend until one has completed; yields its index |
 | `Task.IsDone(h)` | 1 once that coroutine finished (also 1 for a reaped frame) |
 | `Task.Cancel(h)` / `Task.IsCancellationRequested()` | cooperative cancellation, propagated down the await chain |
-| `TaskJoin.CancelAll(handles)` | cancel every handle not yet finished |
+| `await t.Result` / `t.Wait()` / `t.IsCompleted` | `Task<T>` only — `Task.Result` on a non-generic task is a compile error |
 
-A handle is **not** a `Task<T>`: joins observe *completion only* — no result, no
-exception hand-off. A spawned coroutine publishes its result through shared
-state (a static field, a queue, `System.Threading.BlockingQueue`) that the
-joiner reads after the join. `TaskGroup`, lambda-form `Task.Run` and
-`CancellationToken` parameters do not exist.
+`Task.Spawn` never keeps a result, so its handle observes *completion only*: no
+result, no exception hand-off. A spawned coroutine publishes its result through
+shared state (a static field, a queue, `BlockingQueue<T>`) that the joiner reads
+after the join. `TaskGroup` does not exist; the join helpers live in
+`TaskJoin` (`stdlib/System/TaskJoin.zan`): `WhenAll` / `WhenAny` (plus the
+`WhenAllPoll` / `WhenAnyPoll` busy-poll variants), `CancelAll(List<long>)` and
+`DoneCount(List<long>)`.
 
-`Channel` **is** implemented, but it is **string-only** (non-generic):
-`Send(string)` / `async string Receive()`; a closed-and-drained channel returns
-`""` (`stdlib/System/Threading/StringChannel.zan`).
+**Channels** — `Channel<T>` (`stdlib/System/Threading/Channel.zan`) is generic:
+`CreateUnbounded()` / `CreateBounded(capacity)`, `TryWrite(T)` /
+`async bool Write(T)`, `TryRead(out T)` / `async bool Read(out T)`, `Count()`,
+`IsCompleted()`, `Complete()`, `Close()`. A closed-and-drained channel reports
+failure instead of blocking. `StringChannel` is the string-only variant kept
+for compatibility (`Send(string)` / `async string Receive()`).
+
+**Cancellation** — `CancellationToken`, `CancellationTokenSource` and
+`CancellationTokenRegistration` (`stdlib/System/Threading/`). A source offers
+`CreateAfter(ms)`, `CreateLinkedTokenSource(...)`, `Cancel()`, `CancelAfter(ms)`;
+a token offers `Register(callback)` / `Unregister(id)`,
+`ThrowIfCancellationRequested()` and `await token.WaitHandle()`. The compiler
+has **no** special knowledge of tokens: a `CancellationToken` handed to an
+async method is a plain parameter and is *not* auto-cancelled with the await
+chain — propagate it yourself, or bridge it through
+`TaskCompletionSource<T>.AttachCancellationToken(token)`.
+
+**Results and exceptions** — `TaskCompletionSource<T>`
+(`stdlib/System/Threading/TaskCompletionSource.zan`) is the result-bearing
+awaitable: `SetResult` / `TrySetResult`, `SetException` / `TrySetException`,
+`SetCanceled` / `TrySetCanceled`, and `await tcs.Task` to consume the outcome
+(a stored exception is rethrown at the await point).
+
+**Synchronization & runtime knobs** — `Mutex` (handle-style), `Gate` /
+`AsyncGate` (async wait), `AsyncRwLock`, `Semaphore` / `SemaphoreSlim`,
+`AtomicInt`, `SharedTable`, `BlockingQueue<T>`, `ThreadLocal<T>`, `Thread`,
+`Timer`, `TaskScheduler`, and `AsyncRuntime` (`SetWorkers` / `SetIoShards` /
+`SetSyncFast`). The M:N work-stealing scheduler is turned on with
+`ZAN_SCHED_WORKERS`.
+
+`Span<T>` / `ReadOnlySpan<T>` are compiler-builtin slice structs (pointer +
+length) rather than library types — they are the only zero-copy view over
+native memory; there is no managed `ArraySegment<T>`.
 
 The async I/O stack is implemented end to end and verified on Linux, macOS and
 Windows: one readiness/completion reactor (`src/runtime/rt_io.c`) with `epoll`

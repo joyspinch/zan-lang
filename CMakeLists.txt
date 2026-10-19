@@ -2310,7 +2310,10 @@ foreach(_src ${_conf_srcs})
     # file:line. -g gives sites their (file, line) key; without it sites
     # would alias by shape onto the last same-shape allocation again.
     set(_extra_args "-g")
-    set(_expect_leak_site "arc_leak_site_label.zan:20:")
+    # 站点是那个被有意保活的 Box 的分配点（`Box keep = new Box("keep")`），
+    # 不是保活它的 Task.Spawn 调用点。5cba3586 删掉了用例顶部的模板注释，
+    # 分配点从 20 行挪到 15 行——期望串跟着行号走，别写死成别的行。
+    set(_expect_leak_site "arc_leak_site_label.zan:15:")
   else()
     set(_extra_args "")
   endif()
@@ -4507,17 +4510,6 @@ add_test(NAME diag_sealed_derive
     "-DEXPECT_REGEX=cannot derive from sealed type 'Base'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_sealed_derive PROPERTIES TIMEOUT 60)
-
-# `decimal` is a reserved keyword with no type: it used to resolve to double
-# silently, giving money math binary-floating semantics. Now a hard error.
-add_test(NAME diag_decimal_unsupported
-  COMMAND ${CMAKE_COMMAND}
-    -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/decimal_unsupported.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_decimal_unsupported${_exe_ext}
-    "-DEXPECT_REGEX='decimal' is not supported: use 'long' \\(minor units\\)"
-    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_decimal_unsupported PROPERTIES TIMEOUT 60)
 
 # The null-receiver guard used to be order-blind: a `x == null` test AFTER
 # the offending member access counted as a guard. Only preceding tests do.

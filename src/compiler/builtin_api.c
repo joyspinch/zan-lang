@@ -41,7 +41,7 @@ static const zan_builtin_member_t members_dict[] = {
     { "Keys",        'P', "List<K> Keys" },
     { "Values",      'P', "List<V> Values" },
     { "Add",         'M', "void Add(K key, V value)" },
-    { "Remove",      'M', "void Remove(K key)" },
+    { "Remove",      'M', "bool Remove(K key)" },
     { "Clear",       'M', "void Clear()" },
     { "ContainsKey", 'M', "bool ContainsKey(K key)" },
     { "TryGetValue", 'M', "bool TryGetValue(K key, out V value)" },
