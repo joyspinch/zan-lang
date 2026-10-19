@@ -484,6 +484,18 @@ zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+/* Task<T>：内建任务句柄类型。T 为结果类型时是"带结果"的任务，
+ * 无类型实参的 Task 是"无结果"任务（只有等待语义）。 */
+zan_type_t *zan_binder_make_task_type(zan_binder_t *b, zan_type_t *elem) {
+    zan_type_t *t = make_type(b->arena, TYPE_TASK, "Task", 4);
+    if (!elem) return t;
+    t->type_args =
+        (zan_type_t **)zan_arena_alloc(b->arena, sizeof(zan_type_t *));
+    t->type_args[0] = elem;
+    t->type_arg_count = 1;
+    return t;
+}
+
 static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (!t || cap == 0) return true;
     size_t used = strlen(buf);

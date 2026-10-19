@@ -10,6 +10,56 @@
 
 static const char *type_name(zan_type_t *t);
 
+/* `Task.<method>(...)` 的静态调用识别：与 irgen 的 is_call_to 同口径
+ * （按接收者标识符的字面名判定，不依赖类型解析结果）。 */
+static bool checker_is_task_call(zan_ast_node_t *expr, const char *method) {
+    if (!expr || expr->kind != AST_CALL) return false;
+    zan_ast_node_t *callee = expr->call.callee;
+    if (!callee || callee->kind != AST_MEMBER_ACCESS) return false;
+    if (!callee->member.object || callee->member.object->kind != AST_IDENTIFIER)
+        return false;
+    zan_istr_t obj_name = callee->member.object->ident.name;
+    zan_istr_t method_name = callee->member.name;
+    return obj_name.len == 4 && memcmp(obj_name.str, "Task", 4) == 0 &&
+           method_name.len == (int)strlen(method) &&
+           memcmp(method_name.str, method, (size_t)method_name.len) == 0;
+}
+
+/* Task.Run / Task.Spawn 的结果类型按实参形态区分，与 irgen 的帧形态一一对应：
+ *
+ *   实参 lambda / 委托   → action 帧：无结果，由完成路径自行释放 → Task（无类型实参）
+ *   实参调用且结果非 void → keep_result 帧：有结果，由用户侧释放   → Task<T>
+ *   实参调用且结果 void   → 脱钩帧：无结果                          → Task
+ *   Task.Spawn(...)       → 脱钩帧：无结果                          → Task
+ *
+ * 这条区分是「Task.Run(lambda) 帧被释放两次」的**类型侧收口**：lambda 形态的
+ * 句柄没有结果，把它当 Task<T> 用去读 .Result/.Wait()，会让同一帧被释放两次
+ * （完成路径 reap 一次 + 用户侧 reap 一次），运行期 double free 直接 abort。
+ * 收口后这种写法在编译期就被拒绝，而"跑一个 Action 再等它"仍然合法
+ * （Task t = Task.Run(action); t.Wait(); —— 无结果任务，Wait 不 reap）。
+ */
+static zan_type_t *task_run_result_type(zan_checker_t *c, zan_ast_node_t *expr,
+                                        zan_type_t **arg_types) {
+    if (!expr || expr->call.args.count != 1 || !arg_types) return NULL;
+    zan_ast_node_t *arg = expr->call.args.items[0];
+    if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+    if (!arg) return NULL;
+    /* 无结果任务句柄 */
+    zan_type_t *base = zan_binder_make_task_type(c->binder, NULL);
+    if (checker_is_task_call(expr, "Spawn")) return base;
+    if (arg->kind == AST_LAMBDA) return base;
+    zan_type_t *at = arg_types[0];
+    if (!at) return NULL; /* 实参类型未知：维持旧的宽松行为 */
+    if (at->kind == TYPE_DELEGATE) return base;
+    if (at == c->binder->type_error) return NULL; /* 类型不明：维持旧的宽松行为 */
+    if (at->kind == TYPE_VOID) return base;
+    zan_type_t *elem = (at->kind == TYPE_TASK)
+                       ? (at->type_arg_count == 1 ? at->type_args[0] : NULL)
+                       : at;
+    if (!elem) return base;
+    return zan_binder_make_task_type(c->binder, elem);
+}
+
 static zan_type_t *builtin_call_result_type(zan_checker_t *c,
                                             zan_type_t *recv,
                                             zan_istr_t name) {
@@ -1155,6 +1205,9 @@ static bool checker_type_assignable(zan_type_t *target, zan_type_t *value) {
 
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK)
         return value->type_arg_count >= target->type_arg_count;
+    /* Task 句柄本质是一个 long 帧指针：允许把它取回裸句柄
+     * （Task.IsDone(h) / TaskJoin.WhenAll(handles) 这类 API 收的就是 long）。 */
+    if (target->kind == TYPE_LONG && value->kind == TYPE_TASK) return true;
     bool tnum = type_is_numeric(target), vnum = type_is_numeric(value);
     if (target->kind == TYPE_DECIMAL && (value->kind == TYPE_FLOAT || value->kind == TYPE_DOUBLE))
         return false;
@@ -1399,6 +1452,17 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
 
+/* 打印带类型实参的类型名（诊断里要区分 Task 与 Task<T>） */
+static const char *task_type_name(zan_type_t *t, char *buf, size_t cap) {
+    if (!t || t->type_arg_count != 1 || !t->type_args || !t->type_args[0]) {
+        snprintf(buf, cap, "%s", type_name(t));
+        return buf;
+    }
+    snprintf(buf, cap, "%.*s<%s>", (int)t->name.len, t->name.str,
+             type_name(t->type_args[0]));
+    return buf;
+}
+
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
@@ -1455,6 +1519,17 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     }
     if (checker_type_assignable(target, value)) return;
     if (checker_has_user_conversion(c, target, value)) return;
+    if (target->kind == TYPE_TASK && value->kind == TYPE_TASK &&
+        target->type_arg_count == 1 && value->type_arg_count == 0) {
+        char tb[160], vb[160];
+        zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                      "cannot convert '%s' to '%s' in %s: a task started from a "
+                      "lambda/Action carries no result; declare 'Task' (not "
+                      "'Task<T>') and wait with .Wait()",
+                      task_type_name(value, vb, sizeof vb),
+                      task_type_name(target, tb, sizeof tb), what);
+        return;
+    }
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
                   "cannot convert '%s' to '%s' in %s: no implicit conversion",
                   type_name(value), type_name(target), what);
@@ -2442,6 +2517,11 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         c->last_call_node = expr;
         c->last_call_method = called_sym;
         check_call_arity(c, expr, recv);
+        if (!callee_is_method &&
+            (checker_is_task_call(expr, "Run") || checker_is_task_call(expr, "Spawn"))) {
+            zan_type_t *tr = task_run_result_type(c, expr, arg_types);
+            if (tr) return tr;
+        }
         if (!callee_is_method && recv) {
             zan_type_t *br = builtin_call_result_type(c, recv,
                                                       expr->call.callee->member.name);

@@ -86,6 +86,14 @@ def main() -> int:
     parser.add_argument("--dotnet", default="dotnet")
     parser.add_argument("--zanc", required=True)
     parser.add_argument("--require-zan-pass", action="store_true")
+    parser.add_argument(
+        "--skip-csharp",
+        action="store_true",
+        help=(
+            "只跑 Zan 一侧：拿 checked-in .expected 当基准，不启动 C# oracle。"
+            "门禁用这个模式——.expected 本身就是 C# 的实测输出，门禁不需要 .NET SDK。"
+        ),
+    )
     args = parser.parse_args()
 
     case_dir = Path(__file__).resolve().parent
@@ -102,11 +110,14 @@ def main() -> int:
         for case in manifest["cases"]:
             name = case["name"]
             expected = normalized((case_dir / f"{name}.expected").read_text(encoding="utf-8"))
-            cs_ok, cs_detail = verify_csharp(case_dir, scratch, name, args.dotnet, expected)
-            if not cs_ok:
-                print(f"FAIL  {name}: {cs_detail}")
-                failures.append(name)
-                continue
+            if args.skip_csharp:
+                cs_ok, cs_detail = True, "C# oracle skipped (checked-in .expected used)"
+            else:
+                cs_ok, cs_detail = verify_csharp(case_dir, scratch, name, args.dotnet, expected)
+                if not cs_ok:
+                    print(f"FAIL  {name}: {cs_detail}")
+                    failures.append(name)
+                    continue
 
             zan_ok, zan_detail = verify_zan(case_dir, scratch, name, zanc, expected)
             status = case["zanStatus"]

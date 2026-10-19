@@ -89,8 +89,16 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 理由：确保被捕获的上下文变量在异步或脱钩执行期间生命周期完整。
 6. **协程帧只许被 reap 一次（帧所有权契约）**：
    - 动作：给帧设置"自 awaiter"（`ASYNC_FRAME_AWAITER = 自身`、`AWAITER_STEP = __zan_co_reap`，即"任务完成即释放"）之前，必须确认没有第二条路径会再释放同一帧；带结果（keep_result）的帧不设自 awaiter，由用户侧 `reap` 释放，**两类帧的所有权契约不可混用**。
-   - 理由：运行时 `__zan_co_frame_free` 的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，但小对象分配器回收时把用户块首 8 字节写成 freelist 指针，守卫读到的已是垃圾 → 二次释放直接 double free（进程 abort）。实例：lambda 形态的 `Task.Run` 走 action 帧并自 reap，用户再读 `.Result`/`.Wait()` 又 reap 一次（详见 TASKS.md A379）。
+   - 理由：运行时 `__zan_co_frame_free` 的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，但小对象分配器回收时把用户块首 8 字节写成 freelist 指针，守卫读到的已是垃圾 → 二次释放直接 double free（进程 abort）。实例：lambda 形态的 `Task.Run` 走 action 帧并自 reap，用户再读 `.Result`/`.Wait()` 又 reap 一次（该缺陷已按类型侧收口闭账，运行时仍缺幂等兜底，见 TASKS.md A380）。
    - 边界：运行时的守卫位不要放在分配器会回写的槽位（帧首 8 字节）；若要让 reap 幂等，标记必须落在分配器不覆盖的字段上。
+7. **释放路径上的"已释放"标记不能放在分配器会回写的槽位**：
+   - 动作：给任何"释放后仍要能被识别"的对象加幂等标记时，标记位必须放在**分配器不会覆盖**的字段上；小对象分配器回收时把用户块首 8 字节写成 freelist 指针（`src/runtime/rt_mem.c`），块首的任何标记在 free 之后立刻变成垃圾。
+   - 理由：把守卫放在块首 → 二次释放读到的不是"已释放"而是 freelist 指针 → 幂等判断失效 → double free abort；`__wrap_free` 自己的双释放检测（块头 magic）才是真正兜底，它一命中就 fatal。
+   - 边界：真要让 reap 幂等，用**注册表仲裁**（活协程表 `zan_co_live_del` 返回"本次是否真的摘掉了这个帧"），别指望对象里的标记位。
+8. **同一块内存有两条释放路径时，先定单一所有者，再谈幂等**：
+   - 动作：动手改帧/缓冲区的释放协议前，先把"谁拥有它、什么时候交棒"写在纸上：完成路径与用户路径同时存在时，必须选一个做唯一 owner，另一个改成只观测（等状态、不释放）。把"两边都释放但加了守卫"当解决方案，等于把 double free 换成偶发 UAF。
+   - 理由：`Task.Run(lambda)` 的 action 帧此前"完成路径 reap 一次 + 用户侧 reap 一次"，靠时序侥幸没炸；真正的收口是让类型区分两种帧（无结果 action 帧 vs 带结果 keep_result 帧），使误用在编译期被拒。
+
 
 ---
 
@@ -124,4 +132,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 动作：把成员改成 `private` 或补 `public` 之前，先查它的跨包调用方（`tools/agent/impact.ps1` / `map.ps1 -Callers`），并定向跑受影响的用例。
    - 理由：可见性一改，**外部调用点立刻编译不过**，而这类破坏不会自己暴露——实例：`Socket.ResolveIpv4` 被规范成 `private` 后，`conformance_async_dns` / `conformance_async_mt` 两个用例从那天起一直红，直到有人手工重跑才发现（档位日志停在改动前一天）。
    - 边界：默认可见性是 public（无修饰符即 public），显式 `private` 才是收窄；规范化的目的是让可见性**显式可读**，不是顺手收紧 API。
+4. **内建静态调用的返回类型必须按实参形态定型，并与 irgen 的分支一一对应**：
+   - 动作：同一个内建静态成员（`Task.Run` / `Task.Spawn` 这类）传不同形态的实参时，若 irgen 会走**不同的帧/所有权分支**，检查器就必须给不同的返回类型（无类型实参的"无结果类型" vs 带类型实参的 `Task<T>`）；检查器不得对内建调用的返回类型一律宽松放行（`type_error` 对一切可赋值），也不得把"结果类型"一律写成 `long`。
+   - 理由：宽松放行会让"把无结果句柄当 `Task<T>` 用"一路通到 IR 与运行期，直到帧被释放两次才 abort；类型侧收口后，误用在编译期就被拒绝，运行期那条 double free 路径根本不可达。实例：`Task.Run(lambda)` 产出的是无结果 action 帧，把它声明成 `Task<int>` 去读 `.Result` 曾经是运行期 double free（已闭账，见 TASKS.md A380 的残留项）。
+   - 边界：改检查器的定型前，先读 irgen 里同一调用的分支（哪个实参形态走 keep_result、哪个走 action 帧），两边必须对得上；类型说 A、代码生成做 B 是最难查的一类 bug。
 

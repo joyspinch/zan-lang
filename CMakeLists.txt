@@ -1087,6 +1087,19 @@ add_test(NAME unit_zan_pm_cli
       -P ${CMAKE_SOURCE_DIR}/tests/run_pm_cli.cmake)
 set_tests_properties(unit_zan_pm_cli PROPERTIES TIMEOUT 30)
 
+# C# 对照语料接进门禁（tests/csharp_compat/）：.expected 就是 C# 程序的实测
+# 输出，所以门禁只跑 Zan 一侧、不需要 .NET SDK。pass 用例必须逐字节吻合；
+# xfail 用例必须仍然不吻合——否则 xfail 标记过期，run_oracle.py 会报 XPASS，
+# 防止"已知红灯"变成永久豁免。这套语料此前没有任何门禁在跑。
+find_program(ZAN_PYTHON_EXE NAMES python3 python)
+if(ZAN_PYTHON_EXE)
+  add_test(NAME csharp_compat_oracle
+    COMMAND ${ZAN_PYTHON_EXE} ${CMAKE_SOURCE_DIR}/tests/csharp_compat/run_oracle.py
+      --zanc $<TARGET_FILE:zanc>
+      --skip-csharp)
+  set_tests_properties(csharp_compat_oracle PROPERTIES TIMEOUT 300)
+endif()
+
 # A design doc node must name a real Zan Control class. Invalid kinds fail at
 # formgen time instead of silently becoming a Panel or Label.
 add_test(NAME diag_invalid_design_kind
@@ -4571,6 +4584,20 @@ add_test(NAME diag_return_type_mismatch
     "-DEXPECT_REGEX=cannot convert 'int' to 'string' in return statement"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_return_type_mismatch PROPERTIES TIMEOUT 60)
+
+# Task.Run(lambda/Action) produces a task WITHOUT a result: the action frame is
+# released by the completion path. Declaring that handle as Task<T> and reading
+# .Result/.Wait() made the same frame be released twice (completion path + user
+# side) -- a runtime double free that aborted the process. The checker now types
+# Task.Run/Spawn by argument shape, so the misuse is a compile-time error.
+add_test(NAME diag_task_run_action_result_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/task_run_action_result_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_task_run_action_result_type${_exe_ext}
+    "-DEXPECT_REGEX=carries no result"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_task_run_action_result_type PROPERTIES TIMEOUT 60)
 
 # An unknown type named in a `where` constraint used to be silently ignored,
 # so the generic instantiation proceeded as if the constraint did not exist.

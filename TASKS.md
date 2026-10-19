@@ -35,43 +35,67 @@
   `selfhost_fixed_point`；同时要把 `cs_b05_pattern_var` / `cs_b06_switch_expr` /
   `pattern_value_types` 从 `diff_known_gaps.txt` 删掉，让差分门开始强制它们。
 
+### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
-### [ ] A379 Task.Run(lambda) 的帧被释放两次——读 .Result/.Wait() 触发 double free
+- 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，
+  把 lambda 句柄当 `Task<T>` 用去读 `.Result`/`.Wait()` 会在**编译期**被拒绝
+  （`tests/diag/task_run_action_result_type.zan`），那条运行期 double free 路径
+  因此不可达。
+- 但运行时本身仍没有防御层：帧若真被释放两次，`__zan_co_frame_free`
+  （`src/runtime/rt_io.c:4164`）的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，而小对象
+  分配器回收时把用户块首 8 字节写成 freelist 指针（`src/runtime/rt_mem.c:447`），
+  守卫读到的已是垃圾 → 二次释放直接 abort（`double free of block`）。
+- 方向（二选一）：
+  - **a. 活协程表仲裁**：`zan_co_live_del(frame)` 改成返回"本次是否真的摘掉了
+    这个帧"，谁摘掉谁负责 free，后到的 reap 看到"已摘"直接返回。活协程表本来
+    就是帧的注册表（`src/runtime/rt_timer.c:956`，带墓碑），天然适合当所有权仲裁。
+  - **b. 守卫位搬家**：把 DEAD 标记挪到分配器不回写的槽位（帧首 8 字节不能用）。
+    但帧释放后那块内存会被复用，标记会变成别的对象的垃圾 → 只能把"误判为已死"
+    的代价从 abort 降成泄漏，不彻底。
+- 连带：`__zan_co_isdone` 在帧已被完成路径释放后仍会读它的 DONE 字段（先查活
+  协程表、再读帧字段，中间有窗口）——4 字节 UAF 读，通常不炸但语义不严。
+- ⚠ 改 `src/runtime/rt_io.c` / `rt_timer.c` 会动到自举固定点的 gen2 运行时包
+  （`zanrt_sh_*`），改完必须重跑 `selfhost_fixed_point`。
 
-- 现象：`Task<int> t = Task.Run(() => { ... }); t.Result` 运行期报
-  `zan runtime: fatal (mem): double free of block 0x...`，进程 abort（退出码 3）。
-  最小复现见 `tests/_probe/task_run_lambda_result_double_free.zan`（该目录不参与
-  ctest 收集）。
-- 根因（三层，缺一不成立）：
-  1. lambda 形态的 `Task.Run` 走 **action 帧**（`zan.co.task_action_frame`，
-     `irgen_call.c:get_task_action_frame_type`）。该帧把**自己**登记成自己的
-     awaiter（`ASYNC_FRAME_AWAITER = 自身`、`AWAITER_STEP = __zan_co_reap`），
-     于是任务完成时完成路径 reap 一次；用户读 `.Result`（`emit_task_member`
-     mode 1）或 `.Wait()`（mode 3）时又 reap 一次 → 同一块内存释放两次。
-  2. 运行时 `__zan_co_frame_free` 的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，
-     但小对象分配器回收时把**用户块首 8 字节**写成 freelist 指针，守卫读到的
-     是垃圾 → 守卫失效（`src/runtime/rt_mem.c:447` 的 freelist 回写）。
-  3. async 调用形态（`Task.Run(Prog.Work())`，keep_result）**不设**自 awaiter，
-     帧只由用户 reap 一次，所以不炸——差别在帧所有权，与 lambda 无关。
-  - 旁证：`() => 21` 这种表达式体 lambda 的函数体被整个丢掉（生成的
-    `lambda_0` 只有 `ret void`），即**值返回 lambda 形态本就没实现**；
-    `tests/csharp_compat/task_result_repeat.zan`（C# 对照用例）期望
-    `Task.Run(() => 21).Result` 可用，但该目录**没有接进任何 ctest/脚本**，
-    所以这个洞一直没被发现。
-- 方向（二选一，优先 a）：
-  - **a. 类型侧精确化**：`Task.Run/Spawn(lambda)` 的结果类型是 `long` 句柄，
-    不是 `Task`/`Task<T>`；只有 async 调用形态才产出 `Task<T>`。检查器把这层
-    区分开，"把 lambda 句柄当 Task 用去读 .Result/.Wait()" 就在**编译期**被
-    拒绝（现在检查器对内建调用的返回类型宽松放行，`Task<int> t = <long>`
-    不报错，类型谎言一路通到 IR）。
-  - **b. 帧生命周期侧**：让 action 帧只被释放一次（完成路径与用户路径二选一），
-    或让 reap 对已释放帧幂等（把 DEAD 标记放到分配器不回写的槽位）。
-- ⚠ 现存代码里有这个形状（`tests/gui/code_navigation_snapshot_test.zan` 用
-  `Task worker = Task.Run(delegate () {...});`），目前是**靠时序侥幸没炸**：
-  用户 reap 先于完成路径 reap 时不炸，反过来就炸。修 a 会让这批代码编译不过，
-  需要一并改写（改用 `long` 句柄 + `TaskJoin`/`Task.IsDone` 等待），属破坏性变更。
-- 连带要补的覆盖：`tests/csharp_compat/` 整个目录（7 个用例 + `.cs` 对照 +
-  `.expected`）目前**没有任何 ctest/脚本在跑**——接进门禁前先修这一条。
+### [ ] A381 SPEC 的"尚未实现"清单 7 项一项没动
+
+`docs/SPEC.md:766-776` 明列、实测仍不可用的：
+
+- `checked` / `unchecked` 关键字是 **no-op**（溢出检查恒关，环绕语义）
+- lazy iterators：`yield` 物化成 list，没有 `IEnumerable<T>` 协议
+- tagged union 枚举（代数数据类型）
+- `params` 之后的可选实参组合未系统验证
+- `$@"..."` 组合字符串、`"""` 原始字符串
+- COW 集合：`List` 赋值是引用共享，修改即共享
+- `[CImport]`、`project.zan` 项目文件、`zan` CLI（实际是 `zanc`）
+
+- 方向：逐项单独立项实现，每项带 conformance 用例；不做半截实现。
+
+### [ ] A382 编译器缺三件基础能力：诊断编号体系、告警级别开关、Marshal
+
+实测（`src/compiler` 全量 grep 0 命中）：
+
+- 无诊断编号：诊断只有自然语言文本，没有 `E001`/`W001` 这样的稳定编号——工具链
+  无法按编号定位/抑制，也做不了 `--warn-as-error` 这类开关
+- 无 `--warn-level`：没有统一的告警级别开关
+- 无 `#pragma warning`：无法在源码里局部调级或禁用
+- 无 `Marshal`（`DllImport` 之外的互操作面）
+- 附带一条语义偏差：越界检查是有的（`src/compiler/irgen_generics.c:1313`
+  数组/string/span），但 `checked`/`unchecked` 开关不了它——只有全局
+  `runtime_checks` 标志能整体关掉，与 C#"checked 上下文才检查"对不上。
+
+- 方向：诊断编号是**破坏性变更**（所有诊断文本与编号都要定版，且影响 golden
+  诊断输出），先定编号规范与兼容策略；`--warn-level` 与 `#pragma warning`
+  跟在编号之后做。
+
+### [ ] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
+
+- 事实（`docs/archive/CHART_CODE_GAP_LEDGER.md`）：对照 ECharts 6.1 的 596 个
+  `.ts` 源，官方 option 用到的 470 个配置键里，引擎**从不读取**的有 278 个（59%）。
+- 表现：用户照官方示例写 option，键被静默丢弃——不报错、不告警，图形少一块也
+  不知道少了哪一块。
+- 方向：先补"未知 option 键"的告警（廉价，立刻让缺口可见），再按官方示例
+  覆盖度逐个补实现；不要一次铺 278 个键。
 
 ### [ ] A377 legend 页 16「将星图谱」页脚被挤成 14 设备高、文字上半被裁
 

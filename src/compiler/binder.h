@@ -151,6 +151,7 @@ zan_type_t *zan_binder_make_readonly_span_type(zan_binder_t *b, zan_type_t *elem
 zan_type_t *zan_binder_make_array_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem);
 zan_type_t *zan_binder_make_grouping_type(zan_binder_t *b, zan_type_t *elem);
+zan_type_t *zan_binder_make_task_type(zan_binder_t *b, zan_type_t *elem);
 
 /* C# tuples `(T1, T2, */
 zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,

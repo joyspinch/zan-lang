@@ -593,7 +593,7 @@ a coroutine state machine (see `docs/ASYNC_CPS_DESIGN.md`).
 | `await Task.WhenAny(handles)` | suspend until one has completed; yields its index |
 | `Task.IsDone(h)` | 1 once that coroutine finished (also 1 for a reaped frame) |
 | `Task.Cancel(h)` / `Task.IsCancellationRequested()` | cooperative cancellation, propagated down the await chain |
-| `await t.Result` / `t.Wait()` / `t.IsCompleted` | `Task<T>` only — `Task.Result` on a non-generic task is a compile error |
+| `await t.Result` / `t.Wait()` / `t.IsCompleted` | `t.Result` needs a `Task<T>`; `t.Wait()` / `t.IsCompleted` work on any task |
 
 `Task.Spawn` never keeps a result, so its handle observes *completion only*: no
 result, no exception hand-off. A spawned coroutine publishes its result through
@@ -603,14 +603,25 @@ after the join. `TaskGroup` does not exist; the join helpers live in
 `WhenAllPoll` / `WhenAnyPoll` busy-poll variants), `CancelAll(List<long>)` and
 `DoneCount(List<long>)`.
 
-> **The lambda form's handle is a plain `long`** — do *not* re-type it as
-> `Task` / `Task<T>` to reach `.Result` / `.Wait()`. The lambda form runs on a
-> different frame kind whose ownership contract differs (the frame is reaped
-> once by the completion path and once more by the reader), so reading it
-> aborts the process with a runtime double free. Wait on a lambda task through
-> its handle (`Task.IsDone(h)`, `TaskJoin.WhenAll(handles)`) instead. Tracked
-> as TASKS.md A379; the async-call form (`Task.Run(Prog.Work())`) is unaffected
-> and does yield a `Task<T>`.
+> **Two task shapes, two handle types** — the checker types `Task.Run` /
+> `Task.Spawn` by argument shape, so mixing them up is a compile-time error
+> (not a runtime abort):
+>
+> | Argument | Handle type | Result |
+> |---|---|---|
+> | `Task.Run(lambda)` / `Task.Run(actionDelegate)` | `Task` (no result) | none — the action frame is released by the completion path |
+> | `Task.Run(asyncCall)` with a non-void result | `Task<T>` | yes — the frame keeps the result, the reader releases it |
+> | `Task.Run(asyncCall)` with a void result, or `Task.Spawn(...)` | `Task` (no result) | none — detached |
+>
+> `Task<int> t = Task.Run(() => { ... });` is rejected: *"a task started from a
+> lambda/Action carries no result"* — that handle has no result to read, and
+> reading one would release the frame twice. The supported form is
+> `Task t = Task.Run(() => { ... }); t.Wait();` — a wait on a result-less task
+> observes completion only; it never releases the frame (the completion path
+> does that, exactly once). A `Task` / `Task<T>` handle is a `long` frame
+> pointer underneath, so it can be handed to the `long`-taking APIs
+> (`Task.IsDone(h)`, `TaskJoin.WhenAll(handles)`). The runtime still has no
+> idempotent-reap backstop for that frame; tracked as TASKS.md A380.
 
 **Channels** — `Channel<T>` (`stdlib/System/Threading/Channel.zan`) is generic:
 `CreateUnbounded()` / `CreateBounded(capacity)`, `TryWrite(T)` /
