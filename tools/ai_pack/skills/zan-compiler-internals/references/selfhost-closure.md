@@ -78,3 +78,43 @@ kernel32、shell32、user32、advapi32、version）。
   ISel——看到这个崩溃，先用 `llvm-as` 验证，别怀疑后端。
 - 链接器的 LNK2019/LNK1120 走 **stdout**，不是 stderr；只看 stderr 会误判成
   "没有具体错误"。
+
+## 7. 固定点只证明"自洽"，不证明"与 C 宿主一致"
+
+- 动作：差分门 `ctest -R selfhost_diff`（`tests/run_selfhost_diff.cmake`）把一批
+  conformance 用例交给 gen1 编译、链接、运行，与 C 宿主的 golden 输出逐字比对。
+  已知缺口列在 `tests/selfhost/diff_known_gaps.txt`（只报告、不失败），修好就删行；
+  用例集在 `tests/selfhost/diff_cases.txt`。
+- 理由：固定点门断言 `g2.ll == g3.ll`，而**两代都是自举后端产出的**——自举后端
+  整体错了照样绿。2026-10-20 建差分门时一次挖出三个静默错误：`foreach` 只支持
+  `List<T>`（数组/字符串集合被整段丢弃，循环体都不生成）、switch 空段落不落空、
+  `x is null` 让自举编译器自己空指针崩。
+- 边界：差分门链接自举产出的 `.ll` 时，必须用**与 zanc 相同的运行时对象集**：
+  `zan_hw_base64_encode/decode` 之类符号在 `zanrt_timer.obj` 里（因为
+  `src/runtime/rt_timer.c:1388` 直接 `#include "rt_hw_accel.c"`），只链 clang
+  默认的 libc 会 LNK2019；协程就绪队列在 `rt_co.c` 里，不链它会缺
+  `zan_co_ready`。
+
+## 8. 能力缺口一律 fail-closed
+
+- 动作：自举后端遇到"判不了"的情况（需要运行期类标识、集合协议等），必须
+  **报诊断并拒绝编译**，不能"猜一个答案"。
+- 理由：自举 IR 后端此前把 `case T x` 这种模式段落当成 `default`（模式段落在
+  `a == null`），把非 `List` 集合的 `foreach` 整段丢掉——两者都**编译通过、
+  结果全错**。差分门能发现，但用户先撞上的是错答案。
+- 边界：诊断要说清"缺什么能力"（例："a 'Dog' pattern over an 'object' value
+  needs a runtime class identity the self-hosted compiler does not emit yet"），
+  不要写成"不支持"。
+
+## 9. 运行期类标识：自举 IR 后端还没有
+
+- 现状：C 宿主用**分配点 site id**（obj-8）+ `__zan_site_tynames` 祖先名表做
+  `x is T`；ngen 后端用 obj-8 高半部的 site id。自举 IR 后端两者都没有：对象头
+  只有 `[-16]=rc`、`[-8]=dtor`，字符串更是裸 malloc 的 C 串（无头无标记）。
+  所以 `object o` 上的 `case Dog d` / `o is Dog` / `case string s` 判不了。
+- 方向：给对象头加第三个槽（obj-24 放类身份），类实例化时写入该类的 tid 全局
+  地址（`@__tid_X` 的值指向基类 tid——`irgen.zan` 的 `EmitTid` 已经是这条链，
+  catch 匹配就在用它），再加一个 `__zan_is_class(obj, tid)` 沿链走。字符串必须
+  同样带上头，否则读 obj-24 是越界读，`object` 槽里的字符串会误判成类实例。
+- ⚠ 改对象头会影响自举固定点的 gen2 运行时包（`zanrt_sh_*`），改完必须重跑
+  `selfhost_fixed_point`。

@@ -854,13 +854,28 @@ partial class Irgen {
         return new ExprVal(list, resListTy);
     }
 
-    // foreach (T x in coll) body  — lowered as an indexed walk over List<T>
+    // foreach (T x in coll) body  — lowered as an indexed walk over the
+    // collection: List<T> (zlist_count/zlist_get), T[] (the length header
+    // sits one slot before the data) and string (strlen + byte walk).
+    // Any other collection kind is rejected instead of silently dropping
+    // the loop: a dropped loop compiles but computes the wrong answer.
     void GenForeach(Node s) {
         int feScope = locName.Count;
         ExprVal coll = GenExpr(s.b);
-        if (!IsListType(coll.ty)) { return; }
+        bool feList = IsListType(coll.ty);
+        bool feArr = coll.ty != null && coll.ty.ival >= 1;
+        bool feStr = IsStr(coll.ty);
+        if (!feList && !feArr && !feStr) {
+            string cn = "?"; if (coll.ty != null) { cn = coll.ty.sval; }
+            diags.Error("foreach over '" + cn + "' is not supported by the self-hosted compiler yet (List<T>, T[] and string are)", s.line, s.col);
+            return;
+        }
         Node elemTy = s.type;
-        if (elemTy == null) { elemTy = ListElem(coll.ty); }
+        if (elemTy == null) {
+            if (feList) { elemTy = ListElem(coll.ty); }
+            else if (feArr) { elemTy = MkType(coll.ty.sval); elemTy.ival = coll.ty.ival - 1; }
+            else { elemTy = MkType("char"); }
+        }
         string elt = MapType(elemTy);
         string idx = NT();
         EA(idx, "i64");
@@ -878,14 +893,40 @@ partial class Irgen {
         string iv = NT();
         L("  " + iv + " = load i64, i64* " + idx);
         string cnt = NT();
-        L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        if (feList) {
+            L("  " + cnt + " = call i64 @zlist_count(i8* " + coll.op + ")");
+        } else if (feArr) {
+            // the length header sits one i64 slot before the element data
+            string lp = NT();
+            L("  " + lp + " = getelementptr i64, i64* " + coll.op + ", i64 -1");
+            L("  " + cnt + " = load i64, i64* " + lp);
+        } else {
+            L("  " + cnt + " = call i64 @strlen(i8* " + coll.op + ")");
+        }
         string c = NT();
         L("  " + c + " = icmp slt i64 " + iv + ", " + cnt);
         L("  br i1 " + c + ", label %L" + lb + ", label %L" + lend);
         Label(lb);
-        string slot = NT();
-        L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
-        ExprVal ev = FromSlot(slot, elemTy);
+        ExprVal ev;
+        if (feList) {
+            string slot = NT();
+            L("  " + slot + " = call i64 @zlist_get(i8* " + coll.op + ", i64 " + iv + ")");
+            ev = FromSlot(slot, elemTy);
+        } else if (feArr) {
+            string ep = NT();
+            L("  " + ep + " = getelementptr i64, i64* " + coll.op + ", i64 " + iv);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + ep);
+            ev = FromSlot(raw, elemTy);
+        } else {
+            string cp = NT();
+            L("  " + cp + " = getelementptr i8, i8* " + coll.op + ", i64 " + iv);
+            string ch = NT();
+            L("  " + ch + " = load i8, i8* " + cp);
+            string z = NT();
+            L("  " + z + " = zext i8 " + ch + " to i64");
+            ev = new ExprVal(z, elemTy);
+        }
         if (ArcManaged(elemTy)) {
             string old = NT();
             L("  " + old + " = load " + elt + ", " + elt + "* " + ereg);

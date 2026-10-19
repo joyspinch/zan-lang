@@ -153,8 +153,34 @@ Where clang is available, the `selfhost_fixed_point` ctest additionally runs the
 automatically when clang is absent (`tests/run_fixedpoint.cmake`).
 **Green on HEAD** (verified 2026-10-20: `g2.ll == g3.ll`, 15,815,207 bytes).
 
+### The fixed point is not the whole story
+
+`g2.ll == g3.ll` proves the self-hosted backend is a fixed point **of itself** —
+both generations come from the self-hosted backend, so a systematically wrong
+backend still passes. The `selfhost_diff` ctest
+(`tests/run_selfhost_diff.cmake`) closes that hole: it hands a curated set of
+conformance cases to gen1, links the emitted IR with the same runtime the host
+links, runs the programs and compares stdout with the C host's golden file.
+
+- The case list lives in `tests/selfhost/diff_cases.txt`.
+- Cases that still differ live in `tests/selfhost/diff_known_gaps.txt`: they are
+  reported (so the gap stays visible) but do not fail the gate. Delete a line
+  there once the gap is closed and the gate starts holding that case.
+- The gate found three silent errors on its first run (2026-10-20): `foreach`
+  only handled `List<T>` and silently dropped arrays and string arrays, an empty
+  `case` section did not fall through into the next section, and `x is null`
+  dereferenced a null type node inside the self-hosted compiler.
+
 ## Known limitations / future work
 
+- **Runtime class identity is missing in the self-hosted IR backend.** The C host
+  decides `x is T` from the allocation site's id plus an ancestor-name table
+  (`__zan_site_tynames`); the self-hosted backend stamps no per-object class id
+  at all (its object header is `[-16]=rc, [-8]=dtor` and its strings are raw
+  `malloc`ed C strings). A switch pattern over an `object`-typed scrutinee
+  (`case Dog d`, `case string s`) therefore cannot be decided at runtime: the
+  self-hosted compiler now **refuses to compile it** with an explicit diagnostic
+  instead of silently never matching. Tracked in `TASKS.md`.
 - **Language coverage.** The self-hosted compiler covers substantially more of
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/

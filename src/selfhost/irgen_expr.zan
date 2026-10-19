@@ -941,6 +941,19 @@ partial class Irgen {
     // subclass of T. Optional `name` binds obj cast to T*.
     ExprVal GenIs(Node e) {
         ExprVal obj = GenExpr(e.a);
+        if (e.type == null) {
+            // `x is null` / `x is not null`: no type, just a null test
+            string cmp = "eq"; if (e.op == 1) { cmp = "ne"; }
+            string t = NT();
+            if (IsPtrType(obj.ty)) {
+                L("  " + t + " = icmp " + cmp + " " + MapType(obj.ty) + " " + obj.op + ", null");
+            } else {
+                L("  " + t + " = icmp " + cmp + " i64 " + obj.op + ", 0");
+            }
+            string z = NT();
+            L("  " + z + " = zext i1 " + t + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
         string tname = e.type.sval;
         string sty = obj.ty.sval;
         Node scls = binder.FindType(sty);
@@ -951,39 +964,50 @@ partial class Irgen {
             L("  " + bc + " = bitcast " + MapType(obj.ty) + " " + obj.op + " to %" + tname + "*");
             L("  store %" + tname + "* " + bc + ", %" + tname + "** " + reg);
         }
+        string res;
         if (scls == null || !IsPolyClass(scls)) {
             int ok = 0;
             if (IsSubclassName(sty, tname)) { ok = 1; }
-            return new ExprVal("" + ok, MkType("bool"));
-        }
-        string vtp = NT();
-        L("  " + vtp + " = getelementptr %" + sty + ", %" + sty + "* " + obj.op + ", i32 0, i32 0");
-        string vt = NT();
-        L("  " + vt + " = load i8*, i8** " + vtp);
-        List<Node> ts = binder.types;
-        string acc = "";
-        int i = 0;
-        while (i < ts.Count) {
-            Node c = ts[i];
-            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
-            if (isCls && IsPolyClass(c) && !HasMod(c, MOD.Abstract()) && IsSubclassName(c.sval, tname)) {
-                List<string> vslots = new List<string>();
-                CollectVSlots(c, vslots);
-                string cmp = NT();
-                L("  " + cmp + " = icmp eq i8* " + vt + ", bitcast ([" + vslots.Count + " x i8*]* @" + c.sval + "_vtable to i8*)");
-                if (acc == "") { acc = cmp; }
-                else {
-                    string o = NT();
-                    L("  " + o + " = or i1 " + acc + ", " + cmp);
-                    acc = o;
+            res = "" + ok;
+        } else {
+            string vtp = NT();
+            L("  " + vtp + " = getelementptr %" + sty + ", %" + sty + "* " + obj.op + ", i32 0, i32 0");
+            string vt = NT();
+            L("  " + vt + " = load i8*, i8** " + vtp);
+            List<Node> ts = binder.types;
+            string acc = "";
+            int i = 0;
+            while (i < ts.Count) {
+                Node c = ts[i];
+                bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+                if (isCls && IsPolyClass(c) && !HasMod(c, MOD.Abstract()) && IsSubclassName(c.sval, tname)) {
+                    List<string> vslots = new List<string>();
+                    CollectVSlots(c, vslots);
+                    string cmp = NT();
+                    L("  " + cmp + " = icmp eq i8* " + vt + ", bitcast ([" + vslots.Count + " x i8*]* @" + c.sval + "_vtable to i8*)");
+                    if (acc == "") { acc = cmp; }
+                    else {
+                        string o = NT();
+                        L("  " + o + " = or i1 " + acc + ", " + cmp);
+                        acc = o;
+                    }
                 }
+                i = i + 1;
             }
-            i = i + 1;
+            if (acc == "") { res = "0"; }
+            else {
+                string z = NT();
+                L("  " + z + " = zext i1 " + acc + " to i64");
+                res = z;
+            }
         }
-        if (acc == "") { return new ExprVal("0", MkType("bool")); }
-        string z = NT();
-        L("  " + z + " = zext i1 " + acc + " to i64");
-        return new ExprVal(z, MkType("bool"));
+        if (e.op == 1) {
+            // `x is not T`: negate the test
+            string n = NT();
+            L("  " + n + " = xor i64 " + res + ", 1");
+            res = n;
+        }
+        return new ExprVal(res, MkType("bool"));
     }
 
     // tuple literal (a, b, ...) -> heap i64[N], each element packed into a slot.
@@ -1555,40 +1579,221 @@ partial class Irgen {
 
     // switch statement: case bodies as an if-else cascade; `break` jumps to
     // the end label (C# switch cases cannot fall through).
+    // A switch section has a body when it carries at least one statement;
+    // an empty section falls through into the next section that has one
+    // (C# section semantics: `case 1: case 2: r = 30;` runs r = 30 for 1).
+    bool SwitchCaseHasBody(Node cse) {
+        if (cse == null || cse.b == null) { return false; }
+        return cse.b.kids.Count > 0;
+    }
+
+    // The type test half of a switch pattern (`case T x:`): an i64 0/1 value.
+    // The IR backend has no per-object class identity, so a pattern that
+    // needs one (an `object`-typed scrutinee against a class or string
+    // pattern) is rejected instead of silently never matching.
+    string EmitTypeTestVal(ExprVal obj, Node pat, Node at) {
+        string tt = pat.sval;
+        string st = obj.ty != null ? obj.ty.sval : "";
+        if (tt == "string") {
+            if (st == "string") { return EmitNonNullVal(obj); }
+            diags.Error("a 'string' pattern over an '" + st + "' value needs a runtime type tag the self-hosted compiler does not emit yet", at.line, at.col);
+            return "0";
+        }
+        Node tc = binder.FindType(tt);
+        bool tCls = tc != null && (tc.kind == AK.ClassDecl() || tc.kind == AK.StructDecl());
+        if (!tCls) {
+            // a value type pattern: the static types decide (gen0's rule)
+            if (st == tt) { return "1"; }
+            return "0";
+        }
+        Node sc = binder.FindType(st);
+        bool sCls = sc != null && (sc.kind == AK.ClassDecl() || sc.kind == AK.StructDecl());
+        if (!sCls) {
+            diags.Error("a '" + tt + "' pattern over an '" + st + "' value needs a runtime class identity the self-hosted compiler does not emit yet", at.line, at.col);
+            return "0";
+        }
+        if (IsSubclassName(st, tt)) {
+            // the static type already guarantees the pattern: only nullness matters
+            return EmitNonNullVal(obj);
+        }
+        if (IsSubclassName(tt, st)) {
+            // a downcast: consult the vtable (polymorphic classes only)
+            if (!IsPolyClass(sc)) {
+                diags.Error("a '" + tt + "' pattern over '" + st + "' needs a runtime class identity the self-hosted compiler does not emit yet", at.line, at.col);
+                return "0";
+            }
+            return EmitVtableTestVal(obj, tt);
+        }
+        diags.Error("'" + st + "' can never be a '" + tt + "'", at.line, at.col);
+        return "0";
+    }
+
+    // null test on a reference value -> i64 0/1
+    string EmitNonNullVal(ExprVal obj) {
+        string t = NT();
+        L("  " + t + " = icmp ne " + MapType(obj.ty) + " " + obj.op + ", null");
+        string z = NT();
+        L("  " + z + " = zext i1 " + t + " to i64");
+        return z;
+    }
+
+    // runtime vtable comparison against every concrete subclass of `tt`
+    // (the same closed-world rule GenIs uses for `x is T`)
+    string EmitVtableTestVal(ExprVal obj, string tt) {
+        string sty = obj.ty.sval;
+        string vtp = NT();
+        L("  " + vtp + " = getelementptr %" + sty + ", %" + sty + "* " + obj.op + ", i32 0, i32 0");
+        string vt = NT();
+        L("  " + vt + " = load i8*, i8** " + vtp);
+        List<Node> ts = binder.types;
+        string acc = "";
+        int i = 0;
+        while (i < ts.Count) {
+            Node c = ts[i];
+            bool isCls = (c.kind == AK.ClassDecl() || c.kind == AK.StructDecl());
+            if (isCls && IsPolyClass(c) && !HasMod(c, MOD.Abstract()) && IsSubclassName(c.sval, tt)) {
+                List<string> vslots = new List<string>();
+                CollectVSlots(c, vslots);
+                string cmp = NT();
+                L("  " + cmp + " = icmp eq i8* " + vt + ", bitcast ([" + vslots.Count + " x i8*]* @" + c.sval + "_vtable to i8*)");
+                if (acc == "") { acc = cmp; }
+                else {
+                    string o = NT();
+                    L("  " + o + " = or i1 " + acc + ", " + cmp);
+                    acc = o;
+                }
+            }
+            i = i + 1;
+        }
+        if (acc == "") { return "0"; }
+        string z = NT();
+        L("  " + z + " = zext i1 " + acc + " to i64");
+        return z;
+    }
+
+    // bind a pattern variable to the scrutinee value (the value type's slot
+    // layout is the same as the scrutinee's; ARC-managed types are retained)
+    void EmitPatternBind(Node cse, ExprVal subj) {
+        if (cse.sval == null || cse.sval == "") { return; }
+        Node pty = cse.type;
+        if (pty == null) { return; }
+        string plt = MapType(pty);
+        string reg = AddLocal(cse.sval, pty);
+        EA(reg, plt);
+        if (IsNullableValue(pty)) {
+            L("  store i8* " + BoxFor(subj, pty) + ", i8** " + reg);
+            return;
+        }
+        string sv = Coerce(subj, plt);
+        L("  store " + plt + " " + sv + ", " + plt + "* " + reg);
+        EmitArcRetain(sv, pty);
+    }
+
     void GenSwitchStmt(Node s) {
         stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
         ExprVal subj = GenExpr(s.a);
         int lend = NL();
         int sBrk = brkTarget; int sLoop = loopScopeBase;
         brkTarget = lend; loopScopeBase = locName.Count;
-        Node deflt = null;
+        int nc = s.kids.Count;
+        int[] bodyL = new int[nc];
+        int[] nextL = new int[nc];
+        int[] matchL = new int[nc];
+        int[] guardL = new int[nc];
         int i = 0;
-        while (i < s.kids.Count) {
+        while (i < nc) { bodyL[i] = NL(); nextL[i] = NL(); matchL[i] = NL(); guardL[i] = NL(); i = i + 1; }
+        // the default section (no label, no pattern)
+        int defIdx = -1;
+        i = 0;
+        while (i < nc) {
             Node cse = s.kids[i];
-            if (cse.a == null) { deflt = cse; i = i + 1; continue; }
-            int bodyL = NL(); int nextL = NL();
-            ExprVal pv = GenExpr(cse.a);
-            string c = NT();
-            if (IsStr(subj.ty) && IsStr(pv.ty)) {
-                string r = NT();
-                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + subj.op + ", i8* " + pv.op + ")");
-                L("  " + c + " = icmp eq i32 " + r + ", 0");
-            } else {
-                L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
-            }
-            L("  br i1 " + c + ", label %L" + bodyL + ", label %L" + nextL);
-            Label(bodyL);
-            int scopeStart = locName.Count;
-            GenStmt(cse.b);
-            if (!term) { ReleaseLocalsFrom(scopeStart); L("  br label %L" + lend); }
-            term = false;
-            TrimLocals(scopeStart);
-            Label(nextL);
+            if (cse.ival != 1 && cse.a == null) { defIdx = i; }
             i = i + 1;
         }
-        if (deflt != null) {
+        // an empty section falls through into the next section that has a body
+        int[] fallTo = new int[nc];
+        int nxt = -1;
+        i = nc - 1;
+        while (i >= 0) {
+            fallTo[i] = nxt;
+            Node cse = s.kids[i];
+            if (i != defIdx && SwitchCaseHasBody(cse)) { nxt = i; }
+            i = i - 1;
+        }
+        // the entry label of a section: a pattern section binds its variable
+        // before the body, a constant section goes straight to the body
+        int[] entryL = new int[nc];
+        i = 0;
+        while (i < nc) {
+            Node cse = s.kids[i];
+            if (cse.ival == 1) { entryL[i] = matchL[i]; } else { entryL[i] = bodyL[i]; }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < nc) {
+            Node cse = s.kids[i];
+            if (i == defIdx) { i = i + 1; continue; }
+            int scopeStart = locName.Count;
+            string c = NT();
+            if (cse.ival == 1) {
+                // pattern section: `case T x [when g]:` or `case null:`
+                if (cse.type == null) {
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("'case null:' needs a reference value to test", cse.line, cse.col);
+                        c = "0";
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
+                } else {
+                    c = EmitTypeTestVal(subj, cse.type, s.a);
+                }
+            } else {
+                ExprVal pv = GenExpr(cse.a);
+                if (IsStr(subj.ty) && IsStr(pv.ty)) {
+                    string r = NT();
+                    L("  " + r + " = call i32 @__zan_strcmp0(i8* " + subj.op + ", i8* " + pv.op + ")");
+                    L("  " + c + " = icmp eq i32 " + r + ", 0");
+                } else {
+                    L("  " + c + " = icmp eq i64 " + subj.op + ", " + pv.op);
+                }
+            }
+            if (cse.c != null) {
+                // a `when` guard: the pattern must match and the guard must hold
+                L("  br i1 " + c + ", label %L" + matchL[i] + ", label %L" + nextL[i]);
+                Label(matchL[i]);
+                EmitPatternBind(cse, subj);
+                L("  br label %L" + guardL[i]);
+                Label(guardL[i]);
+                ExprVal gv = GenExpr(cse.c);
+                string gi = NT();
+                L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                L("  br i1 " + gi + ", label %L" + bodyL[i] + ", label %L" + nextL[i]);
+            } else {
+                L("  br i1 " + c + ", label %L" + matchL[i] + ", label %L" + nextL[i]);
+                Label(matchL[i]);
+                EmitPatternBind(cse, subj);
+                L("  br label %L" + bodyL[i]);
+            }
+            Label(bodyL[i]);
+            if (!SwitchCaseHasBody(cse)) {
+                // empty section: fall through into the next section with a body
+                if (fallTo[i] >= 0) { L("  br label %L" + entryL[fallTo[i]]); }
+                else if (defIdx >= 0 && SwitchCaseHasBody(s.kids[defIdx])) { L("  br label %L" + bodyL[defIdx]); }
+                else { L("  br label %L" + lend); }
+            } else {
+                GenStmt(cse.b);
+                if (!term) { ReleaseLocalsFrom(scopeStart); L("  br label %L" + lend); }
+                term = false;
+                TrimLocals(scopeStart);
+            }
+            Label(nextL[i]);
+            i = i + 1;
+        }
+        if (defIdx >= 0) {
+            L("  br label %L" + bodyL[defIdx]);
+            Label(bodyL[defIdx]);
             int scopeStart2 = locName.Count;
-            GenStmt(deflt.b);
+            GenStmt(s.kids[defIdx].b);
             if (!term) { ReleaseLocalsFrom(scopeStart2); L("  br label %L" + lend); }
             term = false;
             TrimLocals(scopeStart2);
@@ -1613,7 +1818,35 @@ partial class Irgen {
             Node arm = e.kids[i];
             int bodyL = NL();
             int nextL = NL();
-            if (arm.a == null) {
+            if (arm.ival == 1) {
+                // pattern arm: `T x when g => v`
+                string c = NT();
+                if (arm.type == null) {
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("a 'null' pattern needs a reference value to test", arm.line, arm.col);
+                        c = "0";
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
+                } else {
+                    c = EmitTypeTestVal(subj, arm.type, e.a);
+                }
+                int pMatch = NL();
+                int pGuard = NL();
+                L("  br i1 " + c + ", label %L" + pMatch + ", label %L" + nextL);
+                Label(pMatch);
+                EmitPatternBind(arm, subj);
+                if (arm.c != null) {
+                    L("  br label %L" + pGuard);
+                    Label(pGuard);
+                    ExprVal gv = GenExpr(arm.c);
+                    string gi = NT();
+                    L("  " + gi + " = icmp ne i64 " + gv.op + ", 0");
+                    L("  br i1 " + gi + ", label %L" + bodyL + ", label %L" + nextL);
+                } else {
+                    L("  br label %L" + bodyL);
+                }
+            } else if (arm.a == null) {
                 if (arm.c != null) {
                     ExprVal gv = GenExpr(arm.c);
                     string gi = NT();
@@ -1627,6 +1860,14 @@ partial class Irgen {
                 string c = NT();
                 if (arm.op != 0) {
                     L("  " + c + " = icmp " + RelCmp(arm.op) + " i64 " + subj.op + ", " + pv.op);
+                } else if (pv.op == "null") {
+                    // a `null` label: compare against null in the subject's type
+                    if (!IsPtrType(subj.ty)) {
+                        diags.Error("a 'null' label needs a reference value to test", arm.line, arm.col);
+                        c = "0";
+                    } else {
+                        L("  " + c + " = icmp eq " + MapType(subj.ty) + " " + subj.op + ", null");
+                    }
                 } else if (IsStr(subj.ty) && IsStr(pv.ty)) {
                     string r = NT();
                     L("  " + r + " = call i32 @__zan_strcmp0(i8* " + subj.op + ", i8* " + pv.op + ")");

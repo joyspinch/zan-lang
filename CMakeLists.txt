@@ -2670,6 +2670,49 @@ if(SELFHOST_CLANG)
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_fixedpoint.cmake)
   set_tests_properties(selfhost_fixed_point PROPERTIES TIMEOUT 1200)
+
+  # ---- Self-hosting differential gate: gen1 must agree with the C host ----
+  # The fixed-point gate proves gen2 == g3 -- the self-hosted compiler agrees
+  # with *itself*. It says nothing about whether gen1 compiles a program the
+  # way the C host does. This gate closes that hole: every case in
+  # tests/selfhost/diff_cases.txt is compiled by gen1, linked with the same
+  # runtime the host links, run, and its stdout is compared with the C
+  # host's golden file. Cases that still differ are listed in
+  # tests/selfhost/diff_known_gaps.txt (reported, not failed) until fixed.
+  #
+  # The link set is the fixed point's runtime plus rt_co.c: a program under
+  # test may use the coroutine scheduler, whose ready queue lives in rt_co.c
+  # (the fixed point's own compiler module carries its weak copy instead).
+  set(_shd_rt_srcs rt_file.c rt_io.c rt_sched.c rt_timer.c rt_decimal.c
+                    rt_sync.c zan_embed_api.c rt_co.c)
+  set(_shd_rt_objs)
+  foreach(_shd_src IN LISTS _shd_rt_srcs)
+    get_filename_component(_shd_stem ${_shd_src} NAME_WE)
+    set(_shd_obj "${CMAKE_BINARY_DIR}/zanrt_shd_${_shd_stem}${CMAKE_C_OUTPUT_EXTENSION}")
+    add_custom_command(
+      OUTPUT ${_shd_obj}
+      COMMAND ${SELFHOST_CLANG} -O2 -c ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
+              -o ${_shd_obj}
+      DEPENDS ${CMAKE_SOURCE_DIR}/src/runtime/${_shd_src}
+      COMMENT "Building ${_shd_src} for the selfhost differential gate")
+    list(APPEND _shd_rt_objs ${_shd_obj})
+  endforeach()
+  add_custom_target(zanrt_selfhost_diff_bundle ALL DEPENDS ${_shd_rt_objs})
+  add_test(NAME selfhost_diff
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+      "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+      -DCLANG=${SELFHOST_CLANG}
+      -DGEN1=${CMAKE_BINARY_DIR}/selfhost_diff_gen1${_exe_ext}
+      -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_diff
+      -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
+      -DCASES=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_cases.txt
+      -DGAPS=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_known_gaps.txt
+      "-DRTOBJS=${_shd_rt_objs}"
+      "-DSYSLIBS=${_sh_syslibs}"
+      -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
+  set_tests_properties(selfhost_diff PROPERTIES TIMEOUT 1800)
 endif()
 
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----
