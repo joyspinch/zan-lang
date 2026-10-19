@@ -1,0 +1,63 @@
+using System;
+using System.IO;
+
+namespace System.Diagnostics;
+
+// 文件落地端：按文件名模式写滚动日志文件。
+//
+// 与历史 `Log.Write` 的文件行为一致：按 {yyyy}{MM}/{dd}.log 一类模式
+// 落盘，超出字节上限滚到 `名字.1`、`名字.2` …，写失败只降级不抛出。
+//
+// 目录与模式由门面层（Log）在每次写入前同步进来——
+// `Log.dir` / `Log.pattern` 是公开静态字段，外部代码会直接改，
+// 门面层是唯一权威，sink 不自己发明第二份配置。
+public class FileLogSink : ILogSink {
+    public string dir;
+    public string pattern;
+    public long maxBytes;
+    public int format;
+
+    string lastPath;
+
+    public FileLogSink() {
+        this.dir = "";
+        this.pattern = "{yyyy}{MM}/{dd}.log";
+        this.maxBytes = 0;
+        this.format = (int)LogFormat.TEXT;
+        this.lastPath = "";
+    }
+
+    public FileLogSink(string dir, string pattern, int format) {
+        this.dir = dir;
+        this.pattern = pattern;
+        this.maxBytes = 0;
+        this.format = format;
+        this.lastPath = "";
+    }
+
+    public string Name() { return "file"; }
+
+    // 当前生效的日志文件完整路径。
+    public string CurrentPath() {
+        return LogPaths.CurrentPath(this.dir, this.pattern);
+    }
+
+    public void Write(LogEvent e) {
+        if (e == null) { return; }
+        string line = LogFormatter.Format(e, this.format);
+        string path = this.CurrentPath();
+        if (this.maxBytes > 0 && File.Exists(path)
+            && File.GetSize(path) >= this.maxBytes) {
+            path = LogPaths.RollBySize(path);
+        }
+        if (path != this.lastPath) { LogPaths.EnsureDirFor(path); }
+        this.lastPath = path;
+        try {
+            File.AppendAllText(path, line);
+        } catch (Exception ex) {
+            // 写不进去只能降级：清掉 lastPath，下一条重新建目录再试。
+            // 不把异常抛给业务（见 Log.Write 的既有约定）。
+            this.lastPath = "";
+        }
+    }
+}

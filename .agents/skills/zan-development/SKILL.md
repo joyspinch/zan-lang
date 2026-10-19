@@ -134,6 +134,13 @@ the change.
 过没过"，必须手编直跑（`build/zanc.exe <case>.zan --auto-stdlib -o
 _scratch/x.exe && _scratch/x.exe`）当真值，ctest 只当台账。
 
+**stdout 抓不到 ≠ 程序没输出**（实证，Windows）：Zan 程序在**有控制台**时
+直接写控制台，PowerShell 的 `> file` 与 `$out = & exe` 都抓不到——重定向
+文件 0 字节，终端却打出了字（未改动的 conformance 用例同样如此）。要比对
+输出必须走 `tests/run_case.cmake`（cmake `execute_process` 用管道，子进程
+无控制台，捕获正常）或直接 `ctest -R <case>`；拿 PowerShell 重定向判"用例
+没输出"会把通过判成失败。
+
 **`System.Threading.Timer` 构造后不自启**（实证）：`new Timer(50, cb)`
 只是注册，必须再调 `t.Start`，否则共享泵根本不投 tick——全程无任何报错，
 依赖它的轮询/消息泵整个静默失效（gui-webapp 模板的桥消息泵就因此死过，

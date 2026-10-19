@@ -1,0 +1,108 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+// 分类日志器：门面层的"可传递"入口。
+//
+// 用途：库代码不要用全局 `Log.Info` 硬写死分类，而是持有一个
+// `Logger`（`Logger.For("http")` / `Logger.For("db")`），
+// 这样上层可以按分类调整级别，也能把分类写进结构化字段。
+//
+// 用法：
+// <code>
+// Logger log = new Logger("app");
+// log.Info("started");
+// log.Info("request done", Logger.Fields("path", "/api/x", "ms", "12"));
+// </code>
+//
+// 线程安全：Logger 本身不可变（category/minLevel 只在构造期设定），
+// 多个线程共享一个 Logger 是安全的；事件的投递由 `Log` 统一串行化。
+public class Logger {
+    public string category;
+    // 分类级最低级别；-1 表示跟随全局 `Log.minLevel`。
+    public int minLevel;
+
+    public Logger(string category) {
+        this.category = category == null ? "" : category;
+        this.minLevel = -1;
+    }
+
+    // 派生子分类（`a` 的 `b` → `a.b`）。
+    public Logger For(string sub) {
+        string name = sub == null ? "" : sub;
+        if (this.category.Length > 0 && name.Length > 0) {
+            name = this.category + "." + name;
+        } else if (name.Length == 0) {
+            name = this.category;
+        }
+        Logger l = new Logger(name);
+        l.minLevel = this.minLevel;
+        return l;
+    }
+
+    // 设置本分类的最低级别（默认 -1 = 跟随全局）。
+    public Logger MinLevel(int level) {
+        this.minLevel = level;
+        return this;
+    }
+
+    // 该级别是否会被输出（用于避免无谓的字符串拼装）。
+    public bool IsEnabled(int level) {
+        int min = this.minLevel >= 0 ? this.minLevel : Log.minLevel;
+        return level >= min;
+    }
+
+    // 构造字段字典（`Dictionary` 没有集合初始化器，只能这样建）。
+    public static Dictionary<string, string> Fields(string k1, string v1) {
+        Dictionary<string, string> d = new Dictionary<string, string>();
+        d.Add(k1, v1);
+        return d;
+    }
+
+    public static Dictionary<string, string> Fields(string k1, string v1, string k2, string v2) {
+        Dictionary<string, string> d = new Dictionary<string, string>();
+        d.Add(k1, v1);
+        d.Add(k2, v2);
+        return d;
+    }
+
+    public static Dictionary<string, string> Fields(string k1, string v1, string k2, string v2, string k3, string v3) {
+        Dictionary<string, string> d = new Dictionary<string, string>();
+        d.Add(k1, v1);
+        d.Add(k2, v2);
+        d.Add(k3, v3);
+        return d;
+    }
+
+    public void Trace(string msg) { this.Write(Log.TRACE, msg, null); }
+    public void Debug(string msg) { this.Write(Log.DEBUG, msg, null); }
+    public void Info(string msg) { this.Write(Log.INFO, msg, null); }
+    public void Warn(string msg) { this.Write(Log.WARN, msg, null); }
+    public void Error(string msg) { this.Write(Log.ERROR, msg, null); }
+    public void Fatal(string msg) { this.Write(Log.FATAL, msg, null); }
+
+    public void Trace(string msg, Dictionary<string, string> fields) { this.Write(Log.TRACE, msg, fields); }
+    public void Debug(string msg, Dictionary<string, string> fields) { this.Write(Log.DEBUG, msg, fields); }
+    public void Info(string msg, Dictionary<string, string> fields) { this.Write(Log.INFO, msg, fields); }
+    public void Warn(string msg, Dictionary<string, string> fields) { this.Write(Log.WARN, msg, fields); }
+    public void Error(string msg, Dictionary<string, string> fields) { this.Write(Log.ERROR, msg, fields); }
+    public void Fatal(string msg, Dictionary<string, string> fields) { this.Write(Log.FATAL, msg, fields); }
+
+    // 写一条事件：级别过滤 → 造事件 → 挂上链路与作用域 → 投递。
+    public void Write(int level, string msg, Dictionary<string, string> fields) {
+        if (!this.IsEnabled(level)) { return; }
+        LogEvent e = new LogEvent(level, this.category, msg);
+        if (fields != null) {
+            List<string> keys = fields.Keys;
+            int n = keys.Count;
+            for (int i = 0; i < n; i = i + 1) {
+                string v = "";
+                if (!fields.TryGetValue(keys[i], out v)) { continue; }
+                e.fields.Add(keys[i], v);
+            }
+        }
+        Log.AttachContext(e);
+        Log.Emit(e);
+    }
+}

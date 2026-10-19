@@ -1,0 +1,75 @@
+using System;
+using System.IO;
+
+namespace System.Diagnostics;
+
+// 日志文件路径与滚动策略（能力层）。
+//
+// 这里只有**一份**实现：`Log` 的同名公开成员全部转调到这里，
+// 文件 sink 也用同一套展开/滚动规则——同一件事不能有两套算法
+// （否则日志文件名与滚动行为会在两处漂移）。
+public class LogPaths {
+    // 平台路径分隔符。
+    public static string Sep() {
+        #if WINDOWS
+        return "\\";
+        #else
+        return "/";
+        #endif
+    }
+
+    // 把 `text` 中所有字面 `from` 替换为 `to`。
+    public static string Replace(string text, string from, string to) {
+        if (text == null || from == null || from.Length == 0) { return text; }
+        return text.Replace(from, to);
+    }
+
+    // 展开文件名模式中的 {yyyy} {MM} {dd} {HH} {pid} {wid}。
+    public static string Expand(string pattern, DateTime t) {
+        return LogPaths.ExpandFor(pattern, t, ProcessHost.WorkerId());
+    }
+
+    // 同 <see cref="Expand"/>，但 {wid} 用给定的序号展开：
+    // master 要为**即将派生**的 worker 算出文件名，那不是它自己的序号。
+    public static string ExpandFor(string pattern, DateTime t, int wid) {
+        string s = pattern;
+        s = LogPaths.Replace(s, "{yyyy}", Convert.ToString(t.Year()));
+        s = LogPaths.Replace(s, "{MM}", DateTime.Pad2(t.Month()));
+        s = LogPaths.Replace(s, "{dd}", DateTime.Pad2(t.Day()));
+        s = LogPaths.Replace(s, "{HH}", DateTime.Pad2(t.Hour()));
+        s = LogPaths.Replace(s, "{pid}", Convert.ToString(ProcessHost.Pid()));
+        s = LogPaths.Replace(s, "{wid}", Convert.ToString(wid));
+        return s;
+    }
+
+    // 当前生效的日志文件完整路径（目录 + 展开后的文件名）。
+    public static string CurrentPath(string dir, string pattern) {
+        DateTime t = DateTime.Now();
+        string name = LogPaths.Expand(pattern, t);
+        if (dir == "") { return name; }
+        return dir + LogPaths.Sep() + name;
+    }
+
+    // 建出 `path` 的父目录。模式带目录时（按月分目录）新的一个月
+    // 就是一个还不存在的目录，Configure 那次创建管不到它。
+    public static void EnsureDirFor(string path) {
+        string parent = Path.GetDirectoryName(path);
+        if (parent == "") { return; }
+        if (Directory.Exists(parent)) { return; }
+        Directory.CreateDirectoryRecursive(parent);
+    }
+
+    // 把已写满的 `path` 改名为第一个空闲的 `path.N`，返回仍然
+    // 可写的原路径。改名失败（文件被占用）时原样返回，宁可让文件超限
+    // 也不能丢日志。
+    public static string RollBySize(string path) {
+        for (int n = 1; n < 1000; n = n + 1) {
+            string target = path + "." + Convert.ToString(n);
+            if (!File.Exists(target)) {
+                File.Move(path, target);
+                return path;
+            }
+        }
+        return path;
+    }
+}

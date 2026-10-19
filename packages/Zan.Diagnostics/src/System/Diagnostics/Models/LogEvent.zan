@@ -1,0 +1,109 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+// 一条**结构化**日志事件。
+//
+// 设计约束（对齐 docs/STDLIB_COMPONENT_STANDARDS.md）：
+// - 事件是值对象：构造后不再被修改，`With*` 返回派生副本。
+//   同一个事件可以喂给多个 sink 而互不干扰（sink 不得改事件）。
+// - 字段是 `Dictionary<string,string>`：日志字段最终要落到文本或 JSON
+//   的标量上，复合结构由调用方先序列化成字符串再放进字段。
+// - scopes 是栈：外层在前、内层在后，渲染时按序输出。
+//   作用域是**进程级**的（与 Activity.Current 同模型）：高并发下
+//   它表示"当前上下文"而非严格隔离的每协程上下文。
+public class LogEvent {
+    public int level;
+    public string category;
+    public string message;
+    public DateTime timestamp;
+    public Dictionary<string, string> fields;
+    public List<string> scopes;
+    public string traceId;
+    public string spanId;
+
+    public LogEvent(int level, string category, string message) {
+        this.level = level;
+        this.category = category == null ? "" : category;
+        this.message = message == null ? "" : message;
+        this.timestamp = DateTime.Now();
+        this.fields = new Dictionary<string, string>();
+        this.scopes = new List<string>();
+        this.traceId = "";
+        this.spanId = "";
+    }
+
+    // 复制构造：派生副本时字段与作用域各复制一份，
+    // 否则 With* 会改到原事件（多个 sink 共用同一事件时串味）。
+    public LogEvent(LogEvent src) {
+        this.level = src.level;
+        this.category = src.category;
+        this.message = src.message;
+        this.timestamp = src.timestamp;
+        this.traceId = src.traceId;
+        this.spanId = src.spanId;
+        this.fields = new Dictionary<string, string>();
+        List<string> keys = src.fields.Keys;
+        int n = keys.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            string v = "";
+            if (src.fields.TryGetValue(keys[i], out v)) {
+                this.fields.Add(keys[i], v);
+            }
+        }
+        this.scopes = new List<string>();
+        int m = src.scopes.Count;
+        for (int i = 0; i < m; i = i + 1) {
+            this.scopes.Add(src.scopes[i]);
+        }
+    }
+
+    // 派生副本：追加一个字段。已有同名字段被覆盖（Set 语义）。
+    public LogEvent WithField(string key, string value) {
+        LogEvent e = new LogEvent(this);
+        if (key == null || key.Length == 0) { return e; }
+        string v = "";
+        if (e.fields.ContainsKey(key)) {
+            e.fields.Remove(key);
+        }
+        e.fields.Add(key, value == null ? "" : value);
+        return e;
+    }
+
+    // 派生副本：压入一层作用域。
+    public LogEvent WithScope(string scope) {
+        LogEvent e = new LogEvent(this);
+        if (scope != null && scope.Length > 0) {
+            e.scopes.Add(scope);
+        }
+        return e;
+    }
+
+    // 派生副本：换消息正文。
+    public LogEvent WithMessage(string message) {
+        LogEvent e = new LogEvent(this);
+        e.message = message == null ? "" : message;
+        return e;
+    }
+
+    // 取字段值；缺失返回空串（不抛异常——日志路径不该因读字段炸掉）。
+    public string Field(string key) {
+        if (key == null) { return ""; }
+        string v = "";
+        if (this.fields.TryGetValue(key, out v)) { return v; }
+        return "";
+    }
+
+    public bool HasField(string key) {
+        if (key == null) { return false; }
+        return this.fields.ContainsKey(key);
+    }
+
+    public int FieldCount() { return this.fields.Count; }
+    public int ScopeCount() { return this.scopes.Count; }
+
+    // 字段名列表（副本语义由 Dictionary.Keys 自身保证，
+    // 调用方若要排序请自行复制后再排）。
+    public List<string> FieldKeys() { return this.fields.Keys; }
+}

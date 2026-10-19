@@ -1,0 +1,95 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+
+namespace Conf;
+
+class Prog {
+    static void Main() {
+        string dir = Path.GetTempPath() + "zan_log_structured_" + Convert.ToString(ProcessHost.Pid());
+        Log.Configure(dir, "structured-{pid}.log", Log.INFO);
+        Log.EchoToConsole(false);
+        Log.ClearSinks();
+
+        MemoryLogSink mem = new MemoryLogSink(16);
+        Log.AddSink(mem);
+
+        // 1. 分类 + 结构化字段
+        Logger log = Log.Logger("app");
+        log.Info("hello", Logger.Fields("k", "v", "n", "1"));
+        LogEvent e1 = mem.Last();
+        bool b1 = e1 != null && e1.category == "app" && e1.message == "hello";
+        bool b2 = e1 != null && e1.Field("k") == "v" && e1.Field("n") == "1"
+            && e1.HasField("k") && !e1.HasField("zz") && e1.Field("zz") == "";
+        Console.WriteLine(b1 && b2);
+
+        // 2. 级别过滤：DEBUG 低于全局 INFO，应被丢弃
+        int before = mem.Count();
+        log.Debug("dropped");
+        bool b3 = mem.Count() == before;
+        Console.WriteLine(b3);
+
+        // 3. 作用域：压栈期间的事件带作用域，出栈后不带
+        Log.BeginScope("req-1");
+        log.Warn("scoped");
+        LogEvent e2 = mem.Last();
+        bool b4 = e2 != null && e2.ScopeCount() == 1 && e2.scopes[0] == "req-1";
+        Log.EndScope();
+        log.Warn("unscoped");
+        LogEvent e3 = mem.Last();
+        bool b5 = e3 != null && e3.ScopeCount() == 0;
+        Console.WriteLine(b4 && b5);
+
+        // 4. 链路传播：事件带上当前 Activity 的 trace/span
+        Activity act = Activity.Start("span-1");
+        log.Error("in-trace");
+        LogEvent e4 = mem.Last();
+        bool b6 = e4 != null && e4.traceId == act.traceId && e4.spanId == act.spanId;
+        act.Stop();
+        Console.WriteLine(b6);
+
+        // 5. 事件是值对象：WithField 不改原事件
+        LogEvent baseEv = new LogEvent(Log.INFO, "cat", "msg");
+        LogEvent derived = baseEv.WithField("a", "1");
+        bool b7 = !baseEv.HasField("a") && derived.HasField("a") && derived.Field("a") == "1";
+        Console.WriteLine(b7);
+
+        // 6. JSON 渲染：分类/字段进 JSON；控制字符必须被转义
+        //    （手拼转义表会漏掉 U+0001 这类控制字符，产出非法 JSON）
+        string json = LogFormatter.Json(derived);
+        bool b8 = json.Contains("\"category\":\"cat\"") && json.Contains("\"fields\":{\"a\":\"1\"}");
+        bool b9 = !Log.EscapeJson("x\u0001y").Contains("\u0001");
+        Console.WriteLine(b8 && b9);
+
+        // 7. 文本渲染含分类与字段
+        string text = LogFormatter.Text(derived);
+        bool b10 = text.Contains("[cat]") && text.Contains("a=1");
+        Console.WriteLine(b10);
+
+        // 8. sink 注册表
+        bool b11 = Log.SinkCount() == 1 && Log.SinkNames()[0] == "memory";
+        bool b12 = Log.RemoveSink(mem) && Log.SinkCount() == 0;
+        Console.WriteLine(b11 && b12);
+
+        // 9. 内存 sink 的环形容量：超出丢最旧
+        MemoryLogSink ring = new MemoryLogSink(2);
+        ring.Write(new LogEvent(Log.INFO, "c", "m1"));
+        ring.Write(new LogEvent(Log.INFO, "c", "m2"));
+        ring.Write(new LogEvent(Log.INFO, "c", "m3"));
+        LogEvent r0 = ring.At(0);
+        LogEvent r1 = ring.Last();
+        bool b13 = ring.Count() == 2 && r0 != null && r1 != null
+            && r0.message == "m2" && r1.message == "m3";
+        Console.WriteLine(b13);
+
+        // 10. 内建文件落地也吃到了结构化事件
+        string path = Log.CurrentPath();
+        string content = File.ReadAllText(path);
+        bool b14 = content.Contains("[app]");
+        Console.WriteLine(b14);
+
+        // cleanup
+        if (File.Exists(path)) { File.Delete(path); }
+        if (Directory.Exists(dir)) { Directory.Delete(dir); }
+    }
+}

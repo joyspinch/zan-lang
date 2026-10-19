@@ -1,11 +1,15 @@
 using System;
 using System.IO;
+using System.Text;
 using System.Collections.Generic;
+using System.Json;
 
 namespace System.Diagnostics;
 
-// 进程级滚动文件日志。写文件是日志的默认去处：服务跑在后台（worker、
-// 守护进程、Windows 上没有控制台）时，只写 stdout 等于什么都没记，
+// 进程级滚动文件日志 + 结构化日志门面。
+//
+// 写文件是日志的默认去处：服务跑在后台（worker、守护进程、
+// Windows 上没有控制台）时，只写 stdout 等于什么都没记，
 // 出事后无从查起。
 // 文件名是一个**模式**，每次写入时展开，展开结果变化即为一次滚动：
 // {yyyy} 年   {MM} 月   {dd} 日   {HH} 时
@@ -15,13 +19,22 @@ namespace System.Diagnostics;
 // 例如 `"{yyyy}-{MM}-{dd}.log"` 每天一个文件（平铺），
 // `"{yyyy}{MM}/{dd}-{HH}.log"` 按月分目录、每小时一个。
 // 另外可设上限字节数，超过就切到 `名字.1`、`名字.2` …（见 MaxFileSize）。
-// 同一个文件可以被多个进程共写：每条记录都是「打开→追加→关闭」，不长期
-// 持有句柄，所以 master 与全部 worker 写同一个日期文件即可，无需按进程
-// 分文件，跨天也能各自滚到新文件。
+// 同一个文件可以被多个进程共写：每条记录都是「打开→追加→关闭」，
+// 不长期持有句柄，所以 master 与全部 worker 写同一个日期文件即可，
+// 无需按进程分文件，跨天也能各自滚到新文件。
 // 用法：
 // <code>
 // Log.MaxFileSize(64 * 1024 * 1024);
 // </code>
+//
+// 结构化日志（新增）：
+// <code>
+// Logger log = new Logger("app");
+// log.Info("ready", Logger.Fields("port", "8080"));
+// </code>
+// 事件模型是 `LogEvent`，落地端是 `ILogSink`（console / file / memory …）：
+// `Log.AddSink(sink)` 注册自己的落地端，`Log.ClearSinks()` 清空。
+// 静态 `Log.Info(...)` 等历史调用照旧工作，语义不变。
 public class Log {
     // 级别常量，供 Configure / Write 使用。
     public static const int TRACE = 0;
@@ -39,6 +52,12 @@ public class Log {
     public static bool toConsole = true;
     public static bool enabled = false;
     public static string lastPath = "";
+
+    // 用户注册的落地端 + 作用域栈 + 内建 sink（惰性创建）。
+    static List<ILogSink> sinks;
+    static List<string> scopes;
+    static FileLogSink fileSink;
+    static ConsoleLogSink consoleSink;
 
     // 设置日志输出格式（LogFormat.TEXT 或 LogFormat.JSON）。
     public static void SetFormat(int fmt) { Log.format = fmt; }
@@ -74,10 +93,7 @@ public class Log {
 
     // 当前生效的日志文件完整路径。
     public static string CurrentPath() {
-        DateTime t = DateTime.Now();
-        string name = Log.Expand(Log.pattern, t);
-        if (Log.dir == "") { return name; }
-        return Log.dir + Log.Sep() + name;
+        return LogPaths.CurrentPath(Log.dir, Log.pattern);
     }
 
     // 记录一条 TRACE 级消息。
@@ -100,71 +116,137 @@ public class Log {
     // 全灭，服务带空目录上线）。失败后清 lastPath，下一条重验目录。
     public static void Write(int level, string msg) {
         if (level < Log.minLevel) { return; }
-        string line = "";
-        if (Log.format == (int)LogFormat.JSON) {
-            DateTime t = DateTime.Now();
-            string trId = "";
-            string spId = "";
-            if (Activity.Current != null) {
-                trId = Activity.Current.traceId;
-                spId = Activity.Current.spanId;
+        LogEvent e = new LogEvent(level, "", msg);
+        Log.AttachContext(e);
+        Log.Emit(e);
+    }
+
+    // ---- 结构化日志 ---------------------------------------------------
+
+    // 取得（或创建）分类日志器。
+    public static Logger Logger(string category) {
+        return new Logger(category);
+    }
+
+    // 注册一个落地端。注册后所有后续事件都会投给它。
+    // 落地端自己负责吞掉写失败（本层不再包异常）。
+    public static void AddSink(ILogSink sink) {
+        if (sink == null) { return; }
+        Log.SinkList().Add(sink);
+    }
+
+    // 注销一个落地端（按对象身份比较）。
+    public static bool RemoveSink(ILogSink sink) {
+        if (sink == null) { return false; }
+        List<ILogSink> list = Log.SinkList();
+        int n = list.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            if (list[i] == sink) {
+                list.RemoveAt(i);
+                return true;
             }
-            string trPart = "";
-            if (trId.Length > 0) {
-                trPart = ",\"traceId\":\"" + trId + "\",\"spanId\":\"" + spId + "\"";
-            }
-            line = "{\"time\":\"" + t.ToString() + "\",\"level\":\"" + Log.LevelName(level).Trim() + "\",\"pid\":"
-                + Convert.ToString(ProcessHost.Pid()) + ",\"wid\":"
-                + Convert.ToString(ProcessHost.WorkerId()) + trPart
-                + ",\"msg\":\"" + Log.EscapeJson(msg) + "\"}\n";
-        } else {
-            DateTime t = DateTime.Now();
-            line = t.ToString() + " [" + Log.LevelName(level) + "] "
-                + Convert.ToString(ProcessHost.WorkerId()) + " " + msg + "\n";
         }
-        if (Log.toConsole || !Log.enabled) { Console.Write(line); }
-        if (!Log.enabled) { return; }
-        string path = Log.CurrentPath();
-        if (Log.maxBytes > 0 && File.Exists(path)
-            && File.GetSize(path) >= Log.maxBytes) {
-            path = Log.RollBySize(path);
+        return false;
+    }
+
+    // 清空用户注册的落地端（不动内建的 console / file）。
+    public static void ClearSinks() {
+        Log.SinkList().Clear();
+    }
+
+    // 已注册的落地端个数。
+    public static int SinkCount() { return Log.SinkList().Count; }
+
+    // 落地端标识列表（诊断用）。
+    public static List<string> SinkNames() {
+        List<ILogSink> list = Log.SinkList();
+        List<string> names = new List<string>();
+        int n = list.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            names.Add(list[i].Name());
         }
-        if (path != Log.lastPath) { Log.EnsureDirFor(path); }
-        Log.lastPath = path;
-        try {
-            File.AppendAllText(path, line);
-        } catch (Exception ex) {
-            Log.lastPath = "";
+        return names;
+    }
+
+    // 压入一层作用域（请求 id、用户 id 之类的上下文）。
+    // 作用域是进程级的：与 Activity.Current 同一模型，
+    // 高并发下表示"当前上下文"而非严格隔离的每协程上下文。
+    public static void BeginScope(string scope) {
+        if (scope == null || scope.Length == 0) { return; }
+        Log.ScopeList().Add(scope);
+    }
+
+    // 弹出最近一层作用域。
+    public static void EndScope() {
+        List<string> list = Log.ScopeList();
+        if (list.Count == 0) { return; }
+        list.RemoveAt(list.Count - 1);
+    }
+
+    public static int ScopeDepth() { return Log.ScopeList().Count; }
+
+    // 当前作用域栈（外层在前）。
+    public static List<string> Scopes() { return Log.ScopeList(); }
+
+    // 把链路（trace/span）与当前作用域挂到事件上。
+    public static void AttachContext(LogEvent e) {
+        if (e == null) { return; }
+        Activity act = Activity.Current;
+        if (act != null) {
+            e.traceId = act.traceId;
+            e.spanId = act.spanId;
+        }
+        List<string> list = Log.ScopeList();
+        int n = list.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            e.scopes.Add(list[i]);
         }
     }
 
+    // 投递一条事件：控制台（按开关）→ 文件（按开关）→ 用户 sink。
+    public static void Emit(LogEvent e) {
+        if (e == null) { return; }
+        if (Log.toConsole || !Log.enabled) {
+            Log.ConsoleSink().Write(e);
+        }
+        if (Log.enabled) {
+            FileLogSink fs = Log.FileSink();
+            fs.dir = Log.dir;
+            fs.pattern = Log.pattern;
+            fs.maxBytes = Log.maxBytes;
+            fs.format = Log.format;
+            fs.Write(e);
+        }
+        List<ILogSink> list = Log.SinkList();
+        int n = list.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            list[i].Write(e);
+        }
+    }
+
+    // 投递一条自造的事件（高级用法：完全自己控制字段与作用域）。
+    public static void WriteEvent(LogEvent e) {
+        if (e == null) { return; }
+        Log.AttachContext(e);
+        Log.Emit(e);
+    }
+
+    // ---- 工具 ---------------------------------------------------------
+
+    // JSON 转义（走 JsonValue 序列化，不手拼转义表）。
+    // 返回值是**不含首尾引号**的转义后正文。
     public static string EscapeJson(string str) {
         if (str == null) { return ""; }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < str.Length; i = i + 1) {
-            char c = str[i];
-            if (c == '"') { sb.Append("\\\""); }
-            else if (c == '\\') { sb.Append("\\\\"); }
-            else if (c == '\n') { sb.Append("\\n"); }
-            else if (c == '\r') { sb.Append("\\r"); }
-            else if (c == '\t') { sb.Append("\\t"); }
-            else { sb.Append(c); }
-        }
-        return sb.ToString();
+        string j = JsonValue.NewStr(str).ToJson();
+        if (j.Length >= 2) { return j.Substring(1, j.Length - 2); }
+        return j;
     }
 
     // 把已写满的 `path` 改名为第一个空闲的 `path.N`，返回仍然
     // 可写的原路径。改名失败（文件被占用）时原样返回，宁可让文件超限
     // 也不能丢日志。
     public static string RollBySize(string path) {
-        for (int n = 1; n < 1000; n = n + 1) {
-            string target = path + "." + Convert.ToString(n);
-            if (!File.Exists(target)) {
-                File.Move(path, target);
-                return path;
-            }
-        }
-        return path;
+        return LogPaths.RollBySize(path);
     }
 
     // 级别名（INFO/WARN 各补一个空格对齐到 5 字符）；level 越界时
@@ -180,42 +262,52 @@ public class Log {
     // 建出 `path` 的父目录。模式带目录时（按月分目录）新的一个月
     // 就是一个还不存在的目录，Configure 那次创建管不到它。
     public static void EnsureDirFor(string path) {
-        string parent = Path.GetDirectoryName(path);
-        if (parent == "") { return; }
-        if (Directory.Exists(parent)) { return; }
-        Directory.CreateDirectoryRecursive(parent);
+        LogPaths.EnsureDirFor(path);
     }
 
     // 平台路径分隔符。
     public static string Sep() {
-        #if WINDOWS
-        return "\\";
-        #else
-        return "/";
-        #endif
+        return LogPaths.Sep();
     }
 
     // 展开文件名模式中的 {yyyy} {MM} {dd} {HH} {pid} {wid}。
     public static string Expand(string pattern, DateTime t) {
-        return Log.ExpandFor(pattern, t, ProcessHost.WorkerId());
+        return LogPaths.Expand(pattern, t);
     }
 
     // 同 <see cref="Expand"/>，但 {wid} 用给定的序号展开：
     // master 要为**即将派生**的 worker 算出文件名，那不是它自己的序号。
     public static string ExpandFor(string pattern, DateTime t, int wid) {
-        string s = pattern;
-        s = Log.Replace(s, "{yyyy}", Convert.ToString(t.Year()));
-        s = Log.Replace(s, "{MM}", DateTime.Pad2(t.Month()));
-        s = Log.Replace(s, "{dd}", DateTime.Pad2(t.Day()));
-        s = Log.Replace(s, "{HH}", DateTime.Pad2(t.Hour()));
-        s = Log.Replace(s, "{pid}", Convert.ToString(ProcessHost.Pid()));
-        s = Log.Replace(s, "{wid}", Convert.ToString(wid));
-        return s;
+        return LogPaths.ExpandFor(pattern, t, wid);
     }
 
     // 把 `text` 中所有字面 `from` 替换为 `to`。
     public static string Replace(string text, string from, string to) {
-        if (text == null || from == null || from.Length == 0) { return text; }
-        return text.Replace(from, to);
+        return LogPaths.Replace(text, from, to);
+    }
+
+    // ---- 内部状态 -----------------------------------------------------
+
+    static List<ILogSink> SinkList() {
+        if (Log.sinks == null) { Log.sinks = new List<ILogSink>(); }
+        return Log.sinks;
+    }
+
+    static List<string> ScopeList() {
+        if (Log.scopes == null) { Log.scopes = new List<string>(); }
+        return Log.scopes;
+    }
+
+    static FileLogSink FileSink() {
+        if (Log.fileSink == null) { Log.fileSink = new FileLogSink(); }
+        return Log.fileSink;
+    }
+
+    static ConsoleLogSink ConsoleSink() {
+        if (Log.consoleSink == null) {
+            Log.consoleSink = new ConsoleLogSink(Log.format);
+        }
+        Log.consoleSink.format = Log.format;
+        return Log.consoleSink;
     }
 }
