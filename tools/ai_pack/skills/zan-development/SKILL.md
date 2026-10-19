@@ -82,6 +82,13 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   sixth arg `sslCa` (PEM path; unreadable file fails explicitly).
   `HttpClient` has only a verify on/off switch and no CA hook yet — against
   self-signed servers its only option is disabling verification.
+* **包级 static 持有 rc 集合 = 进程退出时的泄漏**（实证，2026-10-20）：编译器
+  退出期只释放**主编译单元**的静态字段，`packages/*/src/**` 里的
+  `static List<T>` / `static Dictionary<K,V>` 不参与回收——集合本身与它持有的
+  整条对象图都留到进程结束，`--check-leaks` 逐条报出。stdlib 的
+  `Activity.Current` 同理，靠 `Stop()` 显式清空。所以：**常驻可变状态放实例**
+  （使用者持有，生命周期跟着走），别放包级 static；确需进程级单例就提供
+  显式清空入口。证据与影响面见 `docs/ECOSYSTEM_ROADMAP.md` §7。
 
 ## 4. Edit
 

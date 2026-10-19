@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+// 结构化日志的**注册表**：持有落地端集合与作用域栈。
+//
+// 为什么是实例而不是静态：`Log` 这样的静态门面里放 `List<LogSink>`
+// 会在进程退出时被 `--check-leaks` 判成"仍存活"——编译器在退出时只
+// 释放**主编译单元**的静态字段，包级 static 持有的集合不参与回收，
+// 集合里的落地端、事件、字段字典整条图都跟着留到进程结束。
+// 注册表由使用者持有（局部变量/字段），生命周期跟着使用者走，
+// 释放路径是已验证的那条。
+//
+// 用法：
+// <code>
+// LogHub hub = LogHub.WithProcessSinks();   // 进程级 console + 文件
+// hub.AddSink(new MemoryLogSink(256));      // 再加自己的落地端
+// Logger log = hub.Logger("app");
+// log.Info("ready", Logger.Fields("port", "8080"));
+// hub.Shutdown();                            // 退出前收尾
+// </code>
+public class LogHub {
+    // 用户注册的落地端。
+    List<LogSink> sinks;
+    // 作用域栈（外层在前）。
+    List<string> scopes;
+    // 是否同时写进程级 console / 滚动文件。
+    bool processSinks;
+
+    public LogHub() {
+        this.sinks = new List<LogSink>();
+        this.scopes = new List<string>();
+        this.processSinks = false;
+    }
+
+    // 带进程级落地端（console + 滚动文件，配置同 `Log.Configure`）的注册表。
+    public static LogHub WithProcessSinks() {
+        LogHub hub = new LogHub();
+        hub.processSinks = true;
+        return hub;
+    }
+
+    // 取得（并创建）绑定到本注册表的分类日志器。
+    public Logger Logger(string category) {
+        return new Logger(this, category);
+    }
+
+    // ---- 落地端注册 ---------------------------------------------------
+
+    public void AddSink(LogSink sink) {
+        if (sink == null) { return; }
+        this.sinks.Add(sink);
+    }
+
+    public bool RemoveSink(LogSink sink) {
+        if (sink == null) { return false; }
+        int n = this.sinks.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.sinks[i] == sink) {
+                this.sinks.RemoveAt(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public void ClearSinks() {
+        this.sinks.Clear();
+    }
+
+    public int SinkCount() { return this.sinks.Count; }
+
+    // 落地端标识列表（诊断用）。
+    public List<string> SinkNames() {
+        List<string> names = new List<string>();
+        int n = this.sinks.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            names.Add(this.sinks[i].Name());
+        }
+        return names;
+    }
+
+    // ---- 作用域 -------------------------------------------------------
+
+    // 压入一层作用域（请求 id、用户 id 之类的上下文）。
+    public void BeginScope(string scope) {
+        if (scope == null || scope.Length == 0) { return; }
+        this.scopes.Add(scope);
+    }
+
+    public void EndScope() {
+        if (this.scopes.Count == 0) { return; }
+        this.scopes.RemoveAt(this.scopes.Count - 1);
+    }
+
+    public int ScopeDepth() { return this.scopes.Count; }
+
+    public List<string> Scopes() { return this.scopes; }
+
+    // ---- 投递 ---------------------------------------------------------
+
+    // 把当前链路与作用域挂到事件上。
+    public void AttachContext(LogEvent e) {
+        if (e == null) { return; }
+        Activity act = Activity.Current;
+        if (act != null) {
+            e.traceId = act.traceId;
+            e.spanId = act.spanId;
+        }
+        int n = this.scopes.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            e.scopes.Add(this.scopes[i]);
+        }
+    }
+
+    // 投递一条事件：进程级落地端（若开启）+ 用户注册端。
+    public void Emit(LogEvent e) {
+        if (e == null) { return; }
+        if (this.processSinks) {
+            Log.EmitProcess(e);
+        }
+        int n = this.sinks.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            this.sinks[i].Write(e);
+        }
+    }
+
+    // 投递一条自造的事件（高级用法：完全自己控制字段与作用域）。
+    public void WriteEvent(LogEvent e) {
+        if (e == null) { return; }
+        this.AttachContext(e);
+        this.Emit(e);
+    }
+
+    // 收尾：清空注册表与作用域栈。**程序退出前调用一次**。
+    public void Shutdown() {
+        this.sinks.Clear();
+        this.scopes.Clear();
+    }
+}

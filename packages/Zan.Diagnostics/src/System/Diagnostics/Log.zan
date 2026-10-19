@@ -6,7 +6,7 @@ using System.Json;
 
 namespace System.Diagnostics;
 
-// 进程级滚动文件日志 + 结构化日志门面。
+// 进程级滚动文件日志（历史门面）+ 结构化事件的进程级落地。
 //
 // 写文件是日志的默认去处：服务跑在后台（worker、守护进程、
 // Windows 上没有控制台）时，只写 stdout 等于什么都没记，
@@ -27,14 +27,20 @@ namespace System.Diagnostics;
 // Log.MaxFileSize(64 * 1024 * 1024);
 // </code>
 //
-// 结构化日志（新增）：
+// 结构化日志（新增）：`LogHub` 持有落地端注册表与作用域栈，
+// `Logger` 是绑定到它的分类日志器：
 // <code>
-// Logger log = new Logger("app");
+// LogHub hub = LogHub.WithProcessSinks();
+// Logger log = hub.Logger("app");
 // log.Info("ready", Logger.Fields("port", "8080"));
+// hub.Shutdown();
 // </code>
-// 事件模型是 `LogEvent`，落地端是 `ILogSink`（console / file / memory …）：
-// `Log.AddSink(sink)` 注册自己的落地端，`Log.ClearSinks()` 清空。
-// 静态 `Log.Info(...)` 等历史调用照旧工作，语义不变。
+// 注册表是**实例级**的，不是静态的：包级 static 持有集合在进程退出时
+// 不会被释放（编译器只释放主编译单元的静态字段），集合里的落地端、
+// 事件、字段字典会整条留到进程结束。注册表由使用者持有，生命周期
+// 跟着使用者走。
+//
+// 本门面只持有两个落地端实例（console / file），不持有任何集合。
 public class Log {
     // 级别常量，供 Configure / Write 使用。
     public static const int TRACE = 0;
@@ -53,9 +59,7 @@ public class Log {
     public static bool enabled = false;
     public static string lastPath = "";
 
-    // 用户注册的落地端 + 作用域栈 + 内建 sink（惰性创建）。
-    static List<ILogSink> sinks;
-    static List<string> scopes;
+    // 进程级落地端（惰性创建；实例而非集合，退出时可释放）。
     static FileLogSink fileSink;
     static ConsoleLogSink consoleSink;
 
@@ -117,94 +121,19 @@ public class Log {
     public static void Write(int level, string msg) {
         if (level < Log.minLevel) { return; }
         LogEvent e = new LogEvent(level, "", msg);
-        Log.AttachContext(e);
-        Log.Emit(e);
-    }
-
-    // ---- 结构化日志 ---------------------------------------------------
-
-    // 取得（或创建）分类日志器。
-    public static Logger Logger(string category) {
-        return new Logger(category);
-    }
-
-    // 注册一个落地端。注册后所有后续事件都会投给它。
-    // 落地端自己负责吞掉写失败（本层不再包异常）。
-    public static void AddSink(ILogSink sink) {
-        if (sink == null) { return; }
-        Log.SinkList().Add(sink);
-    }
-
-    // 注销一个落地端（按对象身份比较）。
-    public static bool RemoveSink(ILogSink sink) {
-        if (sink == null) { return false; }
-        List<ILogSink> list = Log.SinkList();
-        int n = list.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            if (list[i] == sink) {
-                list.RemoveAt(i);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // 清空用户注册的落地端（不动内建的 console / file）。
-    public static void ClearSinks() {
-        Log.SinkList().Clear();
-    }
-
-    // 已注册的落地端个数。
-    public static int SinkCount() { return Log.SinkList().Count; }
-
-    // 落地端标识列表（诊断用）。
-    public static List<string> SinkNames() {
-        List<ILogSink> list = Log.SinkList();
-        List<string> names = new List<string>();
-        int n = list.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            names.Add(list[i].Name());
-        }
-        return names;
-    }
-
-    // 压入一层作用域（请求 id、用户 id 之类的上下文）。
-    // 作用域是进程级的：与 Activity.Current 同一模型，
-    // 高并发下表示"当前上下文"而非严格隔离的每协程上下文。
-    public static void BeginScope(string scope) {
-        if (scope == null || scope.Length == 0) { return; }
-        Log.ScopeList().Add(scope);
-    }
-
-    // 弹出最近一层作用域。
-    public static void EndScope() {
-        List<string> list = Log.ScopeList();
-        if (list.Count == 0) { return; }
-        list.RemoveAt(list.Count - 1);
-    }
-
-    public static int ScopeDepth() { return Log.ScopeList().Count; }
-
-    // 当前作用域栈（外层在前）。
-    public static List<string> Scopes() { return Log.ScopeList(); }
-
-    // 把链路（trace/span）与当前作用域挂到事件上。
-    public static void AttachContext(LogEvent e) {
-        if (e == null) { return; }
+        // 链路注入：当前 Activity 的 trace/span 随记录落地
+        // （历史 JSON 形态带 traceId/spanId 字段，保持不变）。
         Activity act = Activity.Current;
         if (act != null) {
             e.traceId = act.traceId;
             e.spanId = act.spanId;
         }
-        List<string> list = Log.ScopeList();
-        int n = list.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            e.scopes.Add(list[i]);
-        }
+        Log.EmitProcess(e);
     }
 
-    // 投递一条事件：控制台（按开关）→ 文件（按开关）→ 用户 sink。
-    public static void Emit(LogEvent e) {
+    // 进程级落地：控制台（按开关）→ 滚动文件（按开关）。
+    // `LogHub` 开了 processSinks 时也走这里。
+    public static void EmitProcess(LogEvent e) {
         if (e == null) { return; }
         if (Log.toConsole || !Log.enabled) {
             Log.ConsoleSink().Write(e);
@@ -217,18 +146,6 @@ public class Log {
             fs.format = Log.format;
             fs.Write(e);
         }
-        List<ILogSink> list = Log.SinkList();
-        int n = list.Count;
-        for (int i = 0; i < n; i = i + 1) {
-            list[i].Write(e);
-        }
-    }
-
-    // 投递一条自造的事件（高级用法：完全自己控制字段与作用域）。
-    public static void WriteEvent(LogEvent e) {
-        if (e == null) { return; }
-        Log.AttachContext(e);
-        Log.Emit(e);
     }
 
     // ---- 工具 ---------------------------------------------------------
@@ -287,16 +204,6 @@ public class Log {
     }
 
     // ---- 内部状态 -----------------------------------------------------
-
-    static List<ILogSink> SinkList() {
-        if (Log.sinks == null) { Log.sinks = new List<ILogSink>(); }
-        return Log.sinks;
-    }
-
-    static List<string> ScopeList() {
-        if (Log.scopes == null) { Log.scopes = new List<string>(); }
-        return Log.scopes;
-    }
 
     static FileLogSink FileSink() {
         if (Log.fileSink == null) { Log.fileSink = new FileLogSink(); }

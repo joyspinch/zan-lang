@@ -25,12 +25,14 @@
 
 | 项 | 落点 | 状态 |
 |---|---|---|
-| 结构化日志（事件模型 + sink 契约 + 三个落地端 + 分类日志器） | `packages/Zan.Diagnostics/src/System/Diagnostics/` | ✅ 已实现，conformance `log_structured` |
+| 结构化日志（事件模型 + 落地端契约 + 三个落地端 + 分类日志器 + 注册表） | `packages/Zan.Diagnostics/src/System/Diagnostics/` | ✅ 已实现，conformance `log_structured` |
 
 要点：历史 `Log.*` API 语义不变（逐字节兼容，见 `log_hardening`/`log_rolling_file`
-两个既有用例仍绿）；新增 `LogEvent`（值对象）、`ILogSink`、`Logger`、
-`ConsoleLogSink`/`FileLogSink`/`MemoryLogSink`；JSON 渲染改走 `JsonValue`
-（旧实现手拼转义表，会漏控制字符，产出非法 JSON）。
+两个既有用例仍绿）；新增 `LogEvent`（值对象）、`LogSink`（落地端基类）、`Logger`、
+`LogHub`（注册表）、`ConsoleLogSink`/`FileLogSink`/`MemoryLogSink`；JSON 渲染改走
+`JsonValue`（旧实现手拼转义表，会漏控制字符，产出非法 JSON）。
+
+**注册表是实例级而非静态**——这不是风格偏好，是被编译器逼出来的（见 §7）。
 
 ---
 
@@ -113,3 +115,31 @@
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
+
+## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
+
+**现象**：包（`packages/*/src/**`）里的静态字段持有 `List<T>` / `Dictionary<K,V>`
+等 rc 集合时，进程退出时**不会被释放**——编译器退出期的静态释放只覆盖
+**主编译单元**的静态字段，包单元的静态不在其中。后果是集合本身、以及集合
+里的一切（落地端 → 事件 → 字段字典 → 时间戳）整条对象图都留在进程结束那一刻，
+`--check-leaks` 会逐条报出。
+
+**实证**（2026-10-20，结构化日志落地时撞到）：
+
+- 探针：`tests/conformance/log_structured.zan`（注册表写成 `static List<ILogSink>`）
+  → `leakcheck_log_structured` 报 `1 object(s) leaked … [List<ILogSink>]`，
+  去掉注册表调用后同一用例干净。
+- 反证：把注册表从 `static List<ILogSink>` 换成
+  - 静态持有类实例（`static LogState` + 实例字段 `List<ILogSink>`）→ 仍泄漏；
+  - 实例级注册表（`LogHub`，使用者持有）→ **完全干净**。
+- 已知同类形态（本仓库既有）：`Zan.Web.extraOrigins`、
+  `Zan.Desktop.Window.enumBuf`、`Zan.Game.CDraw.blitSources`——它们目前没被
+  leakcheck 用例覆盖，所以没人看见。
+
+**给生态包的规约**：常驻的可变状态放**实例**（使用者持有），不要放包级 static；
+确需进程级单例时，像 `Activity.Current` 那样提供显式清空入口。
+
+**编译器侧的修法方向**（未做，需独立变更）：退出期释放**所有单元**的静态字段，
+或把静态视为 GC 根集（不计入泄漏）。后者语义上更接近 .NET（静态是根，不是泄漏），
+但会改变全仓 leakcheck 用例的判定口径——影响面大，须单独评估；本次未动
+`src/compiler/*`（该目录当时有其他会话的在途改动）。
