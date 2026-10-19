@@ -195,6 +195,18 @@ links, runs the programs and compares stdout with the C host's golden file.
   typed equality (`operator==` → struct field by field → string content →
   class identity → slot value), and a list method the backend does not
   implement is now refused with a diagnostic instead of silently doing nothing.
+- A sixth round (2026-10-20) gave the self-hosted backend **managed
+  strings**: a `string` value points at the payload of a block whose header
+  carries the exact byte length and a magic word, and the payload stays
+  NUL-terminated so the ABI towards the C runtime is unchanged. Before this
+  the backend modelled strings as raw C strings, so `Length` was a
+  `strlen`: `string view = byteArray;` produced a garbage length (measured
+  1 and 6), `"AB\0CD"` was truncated to 2, and an embedded NUL truncated the
+  value. The differential-gate case `string_view_length` now matches the C
+  host line for line. A `byte[]`/`char[]` used as a string is **copied and
+  packed** rather than shared as a view (the self-hosted array stores one
+  element per 8-byte slot) — tracked in `TASKS.md` (A390), together with
+  the substring searches that still use `strstr`.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR

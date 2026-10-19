@@ -29,6 +29,7 @@ partial class Irgen {
     public bool term;
     public string curClass;
     public string curRet;
+    public Node curRetTy;      // the current method's declared return type
     public bool curHasThis;
     public List<string> locName;
     public List<Node> locType;
@@ -88,6 +89,7 @@ partial class Irgen {
         entryAllocas = new StringBuilder(); eaActive = false;
         tmp = 0; lbl = 0; strn = 0; term = false;
         curClass = ""; curRet = "void"; curHasThis = false;
+        curRetTy = null;
         locName = new List<string>();
         locType = new List<Node>();
         locReg = new List<string>();
@@ -384,15 +386,10 @@ partial class Irgen {
             ExprVal p = GenExpr(e.kids[0]);
             ExprVal off = GenExpr(e.kids[1]);
             ExprVal len = GenExpr(e.kids[2]);
-            string total = NT();
-            L("  " + total + " = add i64 " + len.op + ", 1");
             string s = NT();
-            L("  " + s + " = call i8* @malloc(i64 " + total + ")");
+            L("  " + s + " = call i8* @zstr_new(i64 " + len.op + ")");
             string src = NmAddr(p, off.op);
             L("  call i8* @memcpy(i8* " + s + ", i8* " + src + ", i64 " + len.op + ")");
-            string endp = NT();
-            L("  " + endp + " = getelementptr i8, i8* " + s + ", i64 " + len.op);
-            L("  store i8 0, i8* " + endp);
             return new ExprVal(s, MkType("string"));
         }
         if (m == "PutString" && argc == 4) {
@@ -477,10 +474,10 @@ partial class Irgen {
             L("  " + s + " = call i8* @malloc(i64 " + cap + ")");
             string w = NT();
             L("  " + w + " = call i64 @zan_hw_base64_encode(i8* " + NmAddr(p, "0") + ", i64 " + len.op + ", i8* " + s + ")");
-            string ep = NT();
-            L("  " + ep + " = getelementptr i8, i8* " + s + ", i64 " + w);
-            L("  store i8 0, i8* " + ep);
-            return new ExprVal(s, MkType("string"));
+            string m = NT();
+            L("  " + m + " = call i8* @zstr_new(i64 " + w + ")");
+            L("  call i8* @memcpy(i8* " + m + ", i8* " + s + ", i64 " + w + ")");
+            return new ExprVal(m, MkType("string"));
         }
         if (m == "Base64Decode" && argc == 3) {
             // Base64Decode(dst, src, size) -> written bytes
@@ -1347,6 +1344,20 @@ partial class Irgen {
     string HEXD(int d) { return "0123456789ABCDEF".Substring(d, 1); }
     string Hex2(int b) { int hi = b / 16; int lo = b - hi * 16; return HEXD(hi) + HEXD(lo); }
 
+    // eight little-endian bytes of a 64-bit value, as the escaped text an
+    // LLVM c"..." constant needs
+    string HexI64LE(long v) {
+        string s = "";
+        int i = 0;
+        while (i < 8) {
+            int b = (int)(v % 256);
+            s = s + "\\" + Hex2(b);
+            v = v / 256;
+            i = i + 1;
+        }
+        return s;
+    }
+
     List<int> DecodeStr(string raw) {
         List<int> r = new List<int>();
         int i = 0;
@@ -1376,11 +1387,14 @@ partial class Irgen {
         while (i < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[i]); i = i + 1; }
         bodytxt = bodytxt + "\\00";
         int blen = bytes.Count + 1;
+        // managed string header in front of the payload: [i64 len][i64 magic]
+        string hdr = HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
         strn = strn + 1;
         string g = "@.s" + strn;
-        H(g + " = private unnamed_addr constant [" + blen + " x i8] c\"" + bodytxt + "\"");
+        int tlen = 16 + blen;
+        H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\"");
         string t = NT();
-        L("  " + t + " = getelementptr inbounds [" + blen + " x i8], [" + blen + " x i8]* " + g + ", i64 0, i64 0");
+        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 16");
         return new ExprVal(t, MkType("string"));
     }
 
@@ -1471,6 +1485,7 @@ partial class Irgen {
         EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
+        EmitStrRuntime();
         EmitDictRuntime();
         EmitStrcmp0();
         // struct type decls first
@@ -2094,6 +2109,68 @@ partial class Irgen {
         H("}");
     }
 
+    // ---- managed strings ----
+    // A string value points at the payload of a block with a 16-byte header:
+    //   [ i64 len ][ i64 magic ][ bytes... ][ NUL ]
+    // The payload stays NUL-terminated, so a string is still a valid C string
+    // for the runtime (printf and friends) and the ABI towards the C host is
+    // unchanged -- but the length is exact and an embedded NUL no longer
+    // truncates the value.
+    //
+    // The magic guards the header: every string the backend hands out comes
+    // from zstr_new / zstr_of / a literal, and a value that does not carry
+    // the magic is a bug -- zstr_len aborts instead of returning a length
+    // read out of unrelated memory.
+    void EmitStrRuntime() {
+        if (!ExternSeen("abort")) { externDecls.Add("abort"); H("declare void @abort()"); }
+        H("define void @zstr_bad() {");
+        H("entry:");
+        H("  call void @abort()");
+        H("  ret void");
+        H("}");
+        H("define i8* @zstr_new(i64 %len) {");
+        H("entry:");
+        H("  %tot = add i64 %len, 17");
+        H("  %raw = call i8* @malloc(i64 %tot)");
+        H("  %hp = getelementptr i8, i8* %raw, i64 0");
+        H("  store i64 %len, i64* %hp");
+        H("  %mp = getelementptr i8, i8* %raw, i64 8");
+        H("  store i64 1515082580, i64* %mp");
+        H("  %p = getelementptr i8, i8* %raw, i64 16");
+        H("  %endp = getelementptr i8, i8* %p, i64 %len");
+        H("  store i8 0, i8* %endp");
+        H("  ret i8* %p");
+        H("}");
+        H("define i64 @zstr_len(i8* %p) {");
+        H("entry:");
+        H("  %mp = getelementptr i8, i8* %p, i64 -8");
+        H("  %m = load i64, i64* %mp");
+        H("  %ok = icmp eq i64 %m, 1515082580");
+        H("  br i1 %ok, label %good, label %bad");
+        H("good:");
+        H("  %lp = getelementptr i8, i8* %p, i64 -16");
+        H("  %len = load i64, i64* %lp");
+        H("  ret i64 %len");
+        H("bad:");
+        H("  call void @zstr_bad()");
+        H("  ret i64 0");
+        H("}");
+        H("define i8* @zstr_dup(i8* %p) {");
+        H("entry:");
+        H("  %len = call i64 @zstr_len(i8* %p)");
+        H("  %q = call i8* @zstr_new(i64 %len)");
+        H("  call i8* @memcpy(i8* %q, i8* %p, i64 %len)");
+        H("  ret i8* %q");
+        H("}");
+        H("define i8* @zstr_of(i8* %c) {");
+        H("entry:");
+        H("  %n = call i64 @strlen(i8* %c)");
+        H("  %q = call i8* @zstr_new(i64 %n)");
+        H("  call i8* @memcpy(i8* %q, i8* %c, i64 %n)");
+        H("  ret i8* %q");
+        H("}");
+    }
+
     // StringBuilder: growable byte buffer { count, cap, i8* data }. Append is
     // amortised O(1) (capacity doubling); ToString materialises one string.
     void EmitSbRuntime() {
@@ -2119,7 +2196,7 @@ partial class Irgen {
         H("define void @zsb_append(i8* %p, i8* %s) {");
         H("entry:");
         H("  %b = bitcast i8* %p to %zsb*");
-        H("  %slen = call i64 @strlen(i8* %s)");
+        H("  %slen = call i64 @zstr_len(i8* %s)");
         H("  %cptr = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
         H("  %count = load i64, i64* %cptr");
         H("  %capptr = getelementptr %zsb, %zsb* %b, i32 0, i32 1");
@@ -2152,11 +2229,8 @@ partial class Irgen {
         H("  %count = load i64, i64* %cptr");
         H("  %dptr = getelementptr %zsb, %zsb* %b, i32 0, i32 2");
         H("  %data = load i8*, i8** %dptr");
-        H("  %bsz = add i64 %count, 1");
-        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %buf = call i8* @zstr_new(i64 %count)");
         H("  call i8* @memcpy(i8* %buf, i8* %data, i64 %count)");
-        H("  %endp = getelementptr i8, i8* %buf, i64 %count");
-        H("  store i8 0, i8* %endp");
         H("  ret i8* %buf");
         H("}");
     }
@@ -2179,8 +2253,8 @@ partial class Irgen {
         H("  store i64 -1, i64* %best");
         H("  %i = alloca i64");
         H("  store i64 0, i64* %i");
-        H("  %ls = call i64 @strlen(i8* %s)");
-        H("  %lsub = call i64 @strlen(i8* %sub)");
+        H("  %ls = call i64 @zstr_len(i8* %s)");
+        H("  %lsub = call i64 @zstr_len(i8* %sub)");
         H("  %end = sub i64 %ls, %lsub");
         H("  br label %loop");
         H("loop:");
@@ -2205,9 +2279,9 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_replace(i8* %s, i8* %from, i8* %to) {");
         H("entry:");
-        H("  %lf = call i64 @strlen(i8* %from)");
-        H("  %lt = call i64 @strlen(i8* %to)");
-        H("  %ls = call i64 @strlen(i8* %s)");
+        H("  %lf = call i64 @zstr_len(i8* %from)");
+        H("  %lt = call i64 @zstr_len(i8* %to)");
+        H("  %ls = call i64 @zstr_len(i8* %s)");
         H("  %g0 = mul i64 %ls, %lt");
         H("  %g1 = add i64 %g0, %ls");
         H("  %g2 = add i64 %g1, %lt");
@@ -2241,14 +2315,15 @@ partial class Irgen {
         H("  br label %loop");
         H("rest:");
         H("  %rc = load i8*, i8** %cur");
-        H("  %rl = call i64 @strlen(i8* %rc)");
+        H("  %rl = call i64 @zstr_len(i8* %rc)");
         H("  %rov = load i64, i64* %out");
         H("  %rdst = getelementptr i8, i8* %buf, i64 %rov");
         H("  call i8* @memcpy(i8* %rdst, i8* %rc, i64 %rl)");
         H("  %rov1 = add i64 %rov, %rl");
-        H("  %endp = getelementptr i8, i8* %buf, i64 %rov1");
-        H("  store i8 0, i8* %endp");
-        H("  ret i8* %buf");
+        H("  store i64 %rov1, i64* %out");
+        H("  %fin = call i8* @zstr_new(i64 %rov1)");
+        H("  call i8* @memcpy(i8* %fin, i8* %buf, i64 %rov1)");
+        H("  ret i8* %fin");
         H("}");
     }
 
@@ -2256,7 +2331,7 @@ partial class Irgen {
     void EmitStrOpsTransform() {
         H("define i8* @zstr_trim(i8* %s) {");
         H("entry:");
-        H("  %n = call i64 @strlen(i8* %s)");
+        H("  %n = call i64 @zstr_len(i8* %s)");
         H("  %b = alloca i64");
         H("  store i64 0, i64* %b");
         H("  %e = alloca i64");
@@ -2305,19 +2380,15 @@ partial class Irgen {
         H("  %bv3 = load i64, i64* %b");
         H("  %ev3 = load i64, i64* %e");
         H("  %len = sub i64 %ev3, %bv3");
-        H("  %bsz = add i64 %len, 1");
-        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %buf = call i8* @zstr_new(i64 %len)");
         H("  %srcp = getelementptr i8, i8* %s, i64 %bv3");
         H("  call i8* @memcpy(i8* %buf, i8* %srcp, i64 %len)");
-        H("  %endp = getelementptr i8, i8* %buf, i64 %len");
-        H("  store i8 0, i8* %endp");
         H("  ret i8* %buf");
         H("}");
         H("define i8* @zstr_case(i8* %s, i64 %up) {");
         H("entry:");
-        H("  %n = call i64 @strlen(i8* %s)");
-        H("  %bsz = add i64 %n, 1");
-        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %n = call i64 @zstr_len(i8* %s)");
+        H("  %buf = call i8* @zstr_new(i64 %n)");
         H("  %i = alloca i64");
         H("  store i64 0, i64* %i");
         H("  %isup = icmp ne i64 %up, 0");
@@ -2346,13 +2417,11 @@ partial class Irgen {
         H("  store i64 %iv1, i64* %i");
         H("  br label %loop");
         H("done:");
-        H("  %endp = getelementptr i8, i8* %buf, i64 %n");
-        H("  store i8 0, i8* %endp");
         H("  ret i8* %buf");
         H("}");
         H("define i8* @zstr_split(i8* %s, i8* %sep) {");
         H("entry:");
-        H("  %lsep = call i64 @strlen(i8* %sep)");
+        H("  %lsep = call i64 @zstr_len(i8* %sep)");
         H("  %lst = call i8* @zlist_new(i64 0)");
         H("  %cur = alloca i8*");
         H("  store i8* %s, i8** %cur");
@@ -2367,11 +2436,8 @@ partial class Irgen {
         H("  %hi = ptrtoint i8* %hit to i64");
         H("  %ci = ptrtoint i8* %c to i64");
         H("  %n = sub i64 %hi, %ci");
-        H("  %bsz = add i64 %n, 1");
-        H("  %buf = call i8* @malloc(i64 %bsz)");
+        H("  %buf = call i8* @zstr_new(i64 %n)");
         H("  call i8* @memcpy(i8* %buf, i8* %c, i64 %n)");
-        H("  %endp = getelementptr i8, i8* %buf, i64 %n");
-        H("  store i8 0, i8* %endp");
         H("  %bi = ptrtoint i8* %buf to i64");
         H("  call void @zlist_add(i8* %lst, i64 %bi)");
         H("  %ncur = getelementptr i8, i8* %hit, i64 %lsep");
@@ -2379,10 +2445,9 @@ partial class Irgen {
         H("  br label %loop");
         H("last:");
         H("  %lc = load i8*, i8** %cur");
-        H("  %n2 = call i64 @strlen(i8* %lc)");
-        H("  %bsz2 = add i64 %n2, 1");
-        H("  %buf2 = call i8* @malloc(i64 %bsz2)");
-        H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %bsz2)");
+        H("  %n2 = call i64 @zstr_len(i8* %lc)");
+        H("  %buf2 = call i8* @zstr_new(i64 %n2)");
+        H("  call i8* @memcpy(i8* %buf2, i8* %lc, i64 %n2)");
         H("  %bi2 = ptrtoint i8* %buf2 to i64");
         H("  call void @zlist_add(i8* %lst, i64 %bi2)");
         H("  ret i8* %lst");
@@ -2394,7 +2459,7 @@ partial class Irgen {
         H("define i8* @zstr_join(i8* %sep, i8* %lst) {");
         H("entry:");
         H("  %n = call i64 @zlist_count(i8* %lst)");
-        H("  %lsep = call i64 @strlen(i8* %sep)");
+        H("  %lsep = call i64 @zstr_len(i8* %sep)");
         H("  %tot = alloca i64");
         H("  store i64 0, i64* %tot");
         H("  %i = alloca i64");
@@ -2407,7 +2472,7 @@ partial class Irgen {
         H("mbody:");
         H("  %sl = call i64 @zlist_get(i8* %lst, i64 %iv)");
         H("  %sp = inttoptr i64 %sl to i8*");
-        H("  %l = call i64 @strlen(i8* %sp)");
+        H("  %l = call i64 @zstr_len(i8* %sp)");
         H("  %t0 = load i64, i64* %tot");
         H("  %t1 = add i64 %t0, %l");
         H("  %t2 = add i64 %t1, %lsep");
@@ -2440,7 +2505,7 @@ partial class Irgen {
         H("citem:");
         H("  %sl2 = call i64 @zlist_get(i8* %lst, i64 %iv2)");
         H("  %sp2 = inttoptr i64 %sl2 to i8*");
-        H("  %l2 = call i64 @strlen(i8* %sp2)");
+        H("  %l2 = call i64 @zstr_len(i8* %sp2)");
         H("  %ov2 = load i64, i64* %out");
         H("  %dst2 = getelementptr i8, i8* %buf, i64 %ov2");
         H("  call i8* @memcpy(i8* %dst2, i8* %sp2, i64 %l2)");
@@ -2451,9 +2516,9 @@ partial class Irgen {
         H("  br label %ccond");
         H("fin:");
         H("  %ovf = load i64, i64* %out");
-        H("  %fend = getelementptr i8, i8* %buf, i64 %ovf");
-        H("  store i8 0, i8* %fend");
-        H("  ret i8* %buf");
+        H("  %finbuf = call i8* @zstr_new(i64 %ovf)");
+        H("  call i8* @memcpy(i8* %finbuf, i8* %buf, i64 %ovf)");
+        H("  ret i8* %finbuf");
         H("}");
         H("define i64 @zstr_isempty(i8* %s) {");
         H("entry:");
@@ -2603,7 +2668,7 @@ partial class Irgen {
         H("body:");
         H("  %slot = getelementptr i8*, i8** %keys, i64 %i");
         H("  %kk = load i8*, i8** %slot");
-        H("  %cmp = call i32 @strcmp(i8* %kk, i8* %key)");
+        H("  %cmp = call i32 @__zan_strcmp0(i8* %kk, i8* %key)");
         H("  %eq = icmp eq i32 %cmp, 0");
         H("  br i1 %eq, label %found, label %next");
         H("found:");
@@ -2818,8 +2883,22 @@ partial class Irgen {
         H("  %b_null = icmp eq i8* %b, null");
         H("  br i1 %b_null, label %ret_pos, label %do_cmp");
         H("do_cmp:");
-        H("  %r = call i32 @strcmp(i8* %a, i8* %b)");
-        H("  ret i32 %r");
+        // length-aware compare: the strings may carry embedded NUL bytes
+        H("  %la = call i64 @zstr_len(i8* %a)");
+        H("  %lb = call i64 @zstr_len(i8* %b)");
+        H("  %minlt = icmp ult i64 %la, %lb");
+        H("  %min = select i1 %minlt, i64 %la, i64 %lb");
+        H("  %c = call i32 @memcmp(i8* %a, i8* %b, i64 %min)");
+        H("  %neq = icmp ne i32 %c, 0");
+        H("  br i1 %neq, label %ret_c, label %lencmp");
+        H("ret_c:");
+        H("  ret i32 %c");
+        H("lencmp:");
+        H("  %lt_a = icmp slt i64 %la, %lb");
+        H("  br i1 %lt_a, label %ret_neg, label %chk_len2");
+        H("chk_len2:");
+        H("  %lt_b = icmp sgt i64 %la, %lb");
+        H("  br i1 %lt_b, label %ret_pos, label %ret_zero");
         H("ret_zero:");
         H("  ret i32 0");
         H("ret_neg:");

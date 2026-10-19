@@ -560,7 +560,7 @@ partial class Irgen {
             string dbuf = NT();
             L("  " + dbuf + " = call i8* @malloc(i64 " + dbsz + ")");
             L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + dbuf + ", i64 " + dbsz + ", i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
-            return dbuf;
+            return WrapManaged(dbuf);
         }
         // integer -> string ("%llu" for ulong so the high bit prints unsigned)
         string ifmt = "@.fmt.nn";
@@ -574,7 +574,86 @@ partial class Irgen {
         string buf = NT();
         L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
         L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + buf + ", i64 " + bsz + ", i8* getelementptr inbounds ([5 x i8], [5 x i8]* " + ifmt + ", i64 0, i64 0), i64 " + v.op + ")");
-        return buf;
+        return WrapManaged(buf);
+    }
+
+    // wrap a plain C string (a number formatted by snprintf, a file read, a
+    // command-line argument) into the managed string layout
+    string WrapManaged(string cstr) {
+        string r = NT();
+        L("  " + r + " = call i8* @zstr_of(i8* " + cstr + ")");
+        return r;
+    }
+
+    // the exact byte length of a managed string
+    string StrLen(string s) {
+        string r = NT();
+        L("  " + r + " = call i64 @zstr_len(i8* " + s + ")");
+        return r;
+    }
+
+    // a byte[] value (the self-hosted array keeps one element per 8-byte
+    // slot); char[]/sbyte[] count as well -- a character buffer is the usual
+    // way the standard library builds a string
+    bool IsByteArr(Node t) {
+        if (t == null) { return false; }
+        if (t.sval == "byte[]" || t.sval == "char[]" || t.sval == "sbyte[]") { return true; }
+        if (t.ival >= 1 && (t.sval == "byte" || t.sval == "char" || t.sval == "sbyte")) { return true; }
+        return false;
+    }
+
+    // byte[] -> string: pack the byte elements into a managed string. The
+    // self-hosted array stores one element per 8-byte slot, so the bytes are
+    // copied into a fresh buffer; the C host's view shares the array instead
+    // (TASKS A390).
+    ExprVal ByteArrToStr(ExprVal v) {
+        string ap = NT();
+        L("  " + ap + " = bitcast i8* " + v.op + " to i64*");
+        string lenp = NT();
+        L("  " + lenp + " = getelementptr i64, i64* " + ap + ", i64 -1");
+        string len = NT();
+        L("  " + len + " = load i64, i64* " + lenp);
+        string dst = NT();
+        L("  " + dst + " = call i8* @zstr_new(i64 " + len + ")");
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + len);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string ep = NT();
+        L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + ci);
+        string raw = NT();
+        L("  " + raw + " = load i64, i64* " + ep);
+        string b = NT();
+        L("  " + b + " = trunc i64 " + raw + " to i8");
+        string dp = NT();
+        L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
+        L("  store i8 " + b + ", i8* " + dp);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lend);
+        return new ExprVal(dst, MkType("string"));
+    }
+
+    // assigning a byte[] to a string slot packs it into a managed string.
+    // A source whose static type is unknown (the self-host often leaves the
+    // type of an identifier's value unresolved) is treated as a byte[]; the
+    // checker rejects the other mismatches, and a null literal stays null.
+    ExprVal StrSlotConv(Node targetTy, ExprVal v) {
+        if (!IsStr(targetTy)) { return v; }
+        if (v.op == "null") { return v; }
+        if (IsStr(v.ty)) { return v; }
+        if (v.ty != null && !IsByteArr(v.ty)) { return v; }
+        return ByteArrToStr(v);
     }
 
     // True when `e` provably yields a string: a string literal, or a `+`
@@ -618,19 +697,18 @@ partial class Irgen {
     ExprVal StrConcatN(List<Node> parts) {
         List<string> vals = new List<string>();
         List<string> lens = new List<string>();
-        string tot = "1";
+        string tot = "0";
         int i = 0;
         while (i < parts.Count) {
             ExprVal v = GenExpr(parts[i]);
             string s = ToCStr(v);
             vals.Add(s);
-            string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + s + ")");
-            lens.Add(ln);
-            string nt = NT(); L("  " + nt + " = add i64 " + tot + ", " + ln);
+            lens.Add(StrLen(s));
+            string nt = NT(); L("  " + nt + " = add i64 " + tot + ", " + lens[i]);
             tot = nt;
             i = i + 1;
         }
-        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + tot + ")");
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
         string off = "0";
         i = 0;
         while (i < parts.Count) {
@@ -640,19 +718,17 @@ partial class Irgen {
             off = no;
             i = i + 1;
         }
-        string endp = NT(); L("  " + endp + " = getelementptr i8, i8* " + buf + ", i64 " + off);
-        L("  store i8 0, i8* " + endp);
         return new ExprVal(buf, MkType("string"));
     }
 
     ExprVal StrConcat(string a, string b) {
-        string la = NT(); L("  " + la + " = call i64 @strlen(i8* " + a + ")");
-        string lb = NT(); L("  " + lb + " = call i64 @strlen(i8* " + b + ")");
+        string la = StrLen(a);
+        string lb = StrLen(b);
         string tot = NT(); L("  " + tot + " = add i64 " + la + ", " + lb);
-        string tot1 = NT(); L("  " + tot1 + " = add i64 " + tot + ", 1");
-        string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + tot1 + ")");
-        L("  call i8* @strcpy(i8* " + buf + ", i8* " + a + ")");
-        L("  call i8* @strcat(i8* " + buf + ", i8* " + b + ")");
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + tot + ")");
+        L("  call i8* @memcpy(i8* " + buf + ", i8* " + a + ", i64 " + la + ")");
+        string off = NT(); L("  " + off + " = getelementptr i8, i8* " + buf + ", i64 " + la);
+        L("  call i8* @memcpy(i8* " + off + ", i8* " + b + ", i64 " + lb + ")");
         return new ExprVal(buf, MkType("string"));
     }
 
@@ -735,6 +811,7 @@ partial class Irgen {
                     L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
                     return;
                 }
+                v = StrSlotConv(lty, v);
                 string lt = MapType(lty);
                 if (ArcManaged(lty)) {
                     string old = NT();
@@ -871,15 +948,16 @@ partial class Irgen {
             return;
         }
         string ft = MapType(fty);
+        ExprVal src = StrSlotConv(fty, v);
         if (ArcManaged(fty) && !WeakTy(fty)) {
             string old = NT();
             L("  " + old + " = load " + ft + ", " + ft + "* " + p);
-            string sv = Coerce(v, ft);
+            string sv = Coerce(src, ft);
             L("  store " + ft + " " + sv + ", " + ft + "* " + p);
             EmitArcRetain(sv, fty);
             EmitArcRelease(old, fty);
         } else {
-            L("  store " + ft + " " + Coerce(v, ft) + ", " + ft + "* " + p);
+            L("  store " + ft + " " + Coerce(src, ft) + ", " + ft + "* " + p);
         }
     }
 
@@ -1203,8 +1281,7 @@ partial class Irgen {
             return new ExprVal(t, MkType("int"));
         }
         if (e.sval == "Length" && IsStr(obj.ty)) {
-            string t = NT();
-            L("  " + t + " = call i64 @strlen(i8* " + obj.op + ")");
+            string t = StrLen(obj.op);
             return new ExprVal(t, MkType("int"));
         }
         if (e.sval == "Count" && IsListType(obj.ty)) {
@@ -2492,7 +2569,7 @@ partial class Irgen {
                 string av = NT(); L("  " + av + " = load i8**, i8*** @__zan_argv");
                 string sp = NT(); L("  " + sp + " = getelementptr i8*, i8** " + av + ", i64 " + i1);
                 string r = NT(); L("  " + r + " = load i8*, i8** " + sp);
-                return new ExprVal(r, MkType("string"));
+                return new ExprVal(WrapManaged(r), MkType("string"));
             }
             if (cn == "File" && mn == "ReadAllText") {
                 ExprVal path = GenExpr(e.kids[0]);
@@ -2514,7 +2591,7 @@ partial class Irgen {
                 L("  store i8 0, i8* " + ep);
                 string rc = NT(); L("  " + rc + " = call i32 @fclose(i8* " + fp + ")");
                 string rcc = NT(); L("  " + rcc + " = icmp ne i32 " + rc + ", 0"); EmitAbortIf(rcc, "@.msg.rderr", 18);
-                return new ExprVal(buf, MkType("string"));
+                return new ExprVal(WrapManaged(buf), MkType("string"));
             }
             if (cn == "File" && mn == "Exists") {
                 ExprVal path = GenExpr(e.kids[0]);
@@ -2533,13 +2610,13 @@ partial class Irgen {
             if (cn == "Environment" && mn == "ExeDir") {
                 usesDirList = true;
                 string t = NT(); L("  " + t + " = call i8* @zan_exe_dir()");
-                return new ExprVal(t, MkType("string"));
+                return new ExprVal(WrapManaged(t), MkType("string"));
             }
             if (cn == "Directory" && mn == "ListNames") {
                 usesDirList = true;
                 ExprVal pat = GenExpr(e.kids[0]);
                 string t = NT(); L("  " + t + " = call i8* @zan_dir_list(i8* " + pat.op + ")");
-                return new ExprVal(t, MkType("string"));
+                return new ExprVal(WrapManaged(t), MkType("string"));
             }
             if (cn == "File" && mn == "WriteAllText") {
                 ExprVal path = GenExpr(e.kids[0]);
@@ -2547,7 +2624,7 @@ partial class Irgen {
                 string wb = NT(); L("  " + wb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_wb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
                 EmitFopenCheck(fp, "@.msg.wrerr", 19);
-                string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + content.op + ")");
+                string ln = StrLen(content.op);
                 string wr = NT(); L("  " + wr + " = call i64 @fwrite(i8* " + content.op + ", i64 1, i64 " + ln + ", i8* " + fp + ")");
                 string wrc = NT(); L("  " + wrc + " = icmp ne i64 " + wr + ", " + ln); EmitAbortIf(wrc, "@.msg.wrerr", 19);
                 string wrcl = NT(); L("  " + wrcl + " = call i32 @fclose(i8* " + fp + ")");
@@ -2926,7 +3003,8 @@ partial class Irgen {
     // build a call argument for a (possibly erased) parameter type
     string CallArg(ExprVal av, Node pty) {
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
-        return Coerce(av, MapType(pty));
+        ExprVal src = StrSlotConv(pty, av);
+        return Coerce(src, MapType(pty));
     }
 
     int IndexOfStr(List<string> xs, string s) {
@@ -3089,6 +3167,11 @@ partial class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
+        if (m != null && HasMod(m, MOD.Extern()) && IsStr(m.type)) {
+            // an extern hands back a plain C string: wrap it into the managed
+            // layout so its length is exact
+            t = WrapManaged(t);
+        }
         if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(m.type)) {
             // extern C returns a bare fn pointer: rewrap as a {fn, env} closure
             string clo = NT();
@@ -3521,16 +3604,13 @@ partial class Irgen {
             string lenOp;
             if (e.kids.Count >= 2) { ExprVal l = GenExpr(e.kids[1]); lenOp = l.op; }
             else {
-                string sl = NT(); L("  " + sl + " = call i64 @strlen(i8* " + recv.op + ")");
+                string sl = StrLen(recv.op);
                 string rem = NT(); L("  " + rem + " = sub i64 " + sl + ", " + start.op);
                 lenOp = rem;
             }
-            string bsz = NT(); L("  " + bsz + " = add i64 " + lenOp + ", 1");
-            string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + lenOp + ")");
             string srcp = NT(); L("  " + srcp + " = getelementptr i8, i8* " + recv.op + ", i64 " + start.op);
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + srcp + ", i64 " + lenOp + ")");
-            string endp = NT(); L("  " + endp + " = getelementptr i8, i8* " + buf + ", i64 " + lenOp);
-            L("  store i8 0, i8* " + endp);
             return new ExprVal(buf, MkType("string"));
         }
         if (name == "Contains" && e.kids.Count == 1) {
@@ -3572,14 +3652,14 @@ partial class Irgen {
         if ((name == "StartsWith" || name == "EndsWith") && e.kids.Count == 1) {
             ExprVal p = GenExpr(e.kids[0]);
             DeclStrncmp();
-            string lp = NT(); L("  " + lp + " = call i64 @strlen(i8* " + p.op + ")");
+            string lp = StrLen(p.op);
             string z = NT();
             if (name == "StartsWith") {
                 string cmp = NT(); L("  " + cmp + " = call i32 @strncmp(i8* " + recv.op + ", i8* " + p.op + ", i64 " + lp + ")");
                 string r = NT(); L("  " + r + " = icmp eq i32 " + cmp + ", 0");
                 L("  " + z + " = zext i1 " + r + " to i64");
             } else {
-                string ls = NT(); L("  " + ls + " = call i64 @strlen(i8* " + recv.op + ")");
+                string ls = StrLen(recv.op);
                 string off = NT(); L("  " + off + " = sub i64 " + ls + ", " + lp);
                 string fits = NT(); L("  " + fits + " = icmp sge i64 " + off + ", 0");
                 string offc = NT(); L("  " + offc + " = select i1 " + fits + ", i64 " + off + ", i64 0");
@@ -3620,10 +3700,9 @@ partial class Irgen {
         }
         if (name == "ToString" && e.kids.Count == 0) {
             // owned copy of the receiver
-            string n = NT(); L("  " + n + " = call i64 @strlen(i8* " + recv.op + ")");
-            string bsz = NT(); L("  " + bsz + " = add i64 " + n + ", 1");
-            string buf = NT(); L("  " + buf + " = call i8* @malloc(i64 " + bsz + ")");
-            L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + bsz + ")");
+            string n = StrLen(recv.op);
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
+            L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
             return new ExprVal(buf, MkType("string"));
         }
         // unknown string method: return receiver

@@ -236,3 +236,21 @@ kernel32、shell32、user32、advapi32、version）。
 - 边界：差分门只能覆盖"用例集里有的"那部分内建；新增内建方法时，
   顺手把同族方法（`LastIndexOf` / `Sort` / `Remove` …）也补上或明确 fail-closed，
   别留"兜底返回 0"的洞。
+
+## 16. 自举的 string 是「带长度头的托管串」——不是裸 C 字符串
+
+- 动作：自举 IR 后端的 `string` 值指向一个托管块的 payload，块前面是
+  `[i64 len][i64 magic]`，payload 仍以 NUL 结尾（与 C 运行时的 ABI 不变），
+  长度取**精确字节数**而不是 `strlen`。新造字符串只有三条路：`zstr_new(len)`、
+  `zstr_of(裸C串)`、字面量（常量区直接排好头）。数组 → string 的隐式转换
+  必须在**每个 string 位置**做（声明 / 赋值 / 字段 / 实参 / return）。
+- 理由（2026-10-20 差分门实测）：原来自举的 string 是裸 C 字符串，
+  `Length` 走 `strlen`，于是 `string view = byteArray;` 的长度是**垃圾**
+  （实测 1 / 6），`"AB\0CD"` 的长度被截成 2，嵌入 NUL 的内容整个丢——
+  差分门 `string_view_length` 7 条断言全红。改带长度头后该用例 8 行逐字
+  与 C 宿主一致。
+- 连带：头必须写在 malloc 块**内**（写块前会越界 → 堆损坏）；`zstr_len`
+  读到不认识的 magic 直接 `abort()`，让"漏掉的 string 来源"当场炸出来，
+  而不是静默给一个错长度。
+- 细节（布局、来源清单、LLVM 层面的坑）见
+  [`selfhost-string.md`](selfhost-string.md)。
