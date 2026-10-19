@@ -1,6 +1,6 @@
 ---
 name: zan-compiler-internals
-description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契约与底层不变量规范。修改 src/compiler/*、src/runtime/*、交叉目标或 conformance 测试时使用。仓库内有同名项目级版本，会自动优先。
+description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契约与底层不变量规范。修改 src/compiler/*、src/runtime/*、交叉目标或 conformance 测试时使用。
 ---
 
 # zanc 编译器内部设计契约与底层不变量
@@ -11,6 +11,8 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 - LLVM 指令生成与向量优化：[irgen-llvm.md](references/irgen-llvm.md)
 - 运行时数据布局与 ARC 模型：[runtime-abi.md](references/runtime-abi.md)
 - 自举闭环不变量（src/selfhost 改动必读）：[selfhost-closure.md](references/selfhost-closure.md)
+- 自举的托管字符串（长度语义、来源清单）：[selfhost-string.md](references/selfhost-string.md)
+- 自举的运行期类标识（对象头、类型判定）：[selfhost-classid.md](references/selfhost-classid.md)
 
 ---
 
@@ -74,7 +76,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `LLVMGetNumOperands` 之内；聚合常量取元素用 `LLVMGetAggregateElement`，
      不要用 `LLVMGetOperand`。
    - 理由：这些 C API **不做任何边界检查**，按错布局解读就是越界读——读到
-     相邻堆内存，恰好可读时不崩、不可读时访问冲突，症状是"间歇性崩溃"，
+     相邻堆内存，恰好可读时不崩、不可读时 0xC0000005，症状是"间歇性崩溃"，
      定位成本极高。实例：async 调用的返回值是协程帧指针（phi/load），
      从来不是 CallInst；按 CallInst 解读后紧跟的 `LLVMGetValueName2` 就去
      解引用野指针。
@@ -84,8 +86,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 9. **间歇性缺陷的复现、定位与门禁纪律**：
    - 动作：判定"偶发崩溃已修复"必须**重复运行**（≥8 次）而不是单次通过；
      调试器下不复现通常说明堆布局参与了触发条件——改用 Debug 构建 +
-     调试堆复现（Windows 下 `cdb -hd`），再取栈；门禁要重复编译同一输入
-     N 次才拦得住回归。
+     `cdb -hd`（调试堆）复现，再取栈；门禁要重复编译同一输入 N 次才拦得住回归。
    - 理由：野指针类缺陷只在"被解引用的那块内存恰好可读"时发作，单次绿是
      假绿；Release 构建的符号被内联打散，栈上没有可读帧名，只能靠 Debug
      构建才拿得到行号。

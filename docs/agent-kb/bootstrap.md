@@ -225,6 +225,21 @@ links, runs the programs and compares stdout with the C host's golden file.
   `LastIndexOf("C")` answered 3 instead of -1. The backend now has two length
   helpers — `zstr_len` (exact) and `zstr_clen` (C-visible) — and picks per
   method. The differential-gate case `string_nul_search` pins the split.
+- A ninth round (2026-10-20) gave the self-hosted backend a **runtime class
+  identity**. The object header grew a third slot (24 bytes now: class id,
+  refcount, destructor) and a class instance stores the address of its class's
+  tid global in it; the string and array headers were widened to the same
+  shape so the test can read the slot of any heap value without running off
+  the block. `x is T` and the `case T x:` patterns now ask the object instead
+  of refusing to compile, so the three differential-gate cases
+  (`cs_b05_pattern_var`, `cs_b06_switch_expr`, `pattern_value_types`) match
+  the C host line for line. The switch-pattern test was also corrected to
+  return an `i1` (it is a branch condition — the old `i64` was hidden behind
+  the fail-closed diagnostics), the `is T name` binding now uses the mapped
+  type of `T` (`string` is not an LLVM struct type), a reference stored into a
+  class-typed slot is bitcast, and an `object` slot now retains the class
+  instance it holds — without that the temporary release at the end of the
+  statement freed the object right after `object o = new Dog();`.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR

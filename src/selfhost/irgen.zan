@@ -81,6 +81,7 @@ partial class Irgen {
     public List<int> gotoIds;
     public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
     public bool crc32cEmitted; // NativeMemory.Crc32C helpers+table emitted once
+    public List<string> tidNames; // classes whose @__tid_X global was emitted
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -113,6 +114,7 @@ partial class Irgen {
         externDecls = new List<string>();
         crcEmitted = false;
         crc32cEmitted = false;
+        tidNames = new List<string>();
     }
 
     // The raw C-ABI symbol an extern (DllImport) method binds to: the
@@ -1118,6 +1120,7 @@ partial class Irgen {
         } else {
             H("@__tid_" + d.sval + " = global i8* null");
         }
+        tidNames.Add(d.sval);
     }
 
     // ---- inheritance / virtual dispatch helpers ----
@@ -1224,7 +1227,9 @@ partial class Irgen {
             EmitArcRelease(old, fty);
             return;
         }
-        L("  store " + lt + " " + Coerce(v, lt) + ", " + lt + "* " + g);
+        string sv = Coerce(v, lt);
+        L("  store " + lt + " " + sv + ", " + lt + "* " + g);
+        EmitArcRetainStore(sv, fty, v.ty);
     }
     // Emit an internal global for each static field declared in `cls`.
     void EmitStaticGlobals(Node cls) {
@@ -1259,7 +1264,7 @@ partial class Irgen {
                         } else {
                             string sv = Coerce(iv, lt);
                             L("  store " + lt + " " + sv + ", " + lt + "* " + g);
-                            EmitArcRetain(sv, fty);
+                            EmitArcRetainStore(sv, fty, iv.ty);
                         }
                     }
                     j = j + 1;
@@ -1387,14 +1392,16 @@ partial class Irgen {
         while (i < bytes.Count) { bodytxt = bodytxt + "\\" + Hex2(bytes[i]); i = i + 1; }
         bodytxt = bodytxt + "\\00";
         int blen = bytes.Count + 1;
-        // managed string header in front of the payload: [i64 len][i64 magic]
-        string hdr = HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
+        // managed string header in front of the payload: [i64 cid][i64 len]
+        // [i64 magic] -- the same 24-byte shape as an object header, so the
+        // runtime type test can read the class-id slot of any heap value
+        string hdr = HexI64LE(0) + HexI64LE(bytes.Count) + "\\54\\53\\4E\\5A\\00\\00\\00\\00";
         strn = strn + 1;
         string g = "@.s" + strn;
-        int tlen = 16 + blen;
+        int tlen = 24 + blen;
         H(g + " = private unnamed_addr constant [" + tlen + " x i8] c\"" + hdr + bodytxt + "\"");
         string t = NT();
-        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 16");
+        L("  " + t + " = getelementptr inbounds [" + tlen + " x i8], [" + tlen + " x i8]* " + g + ", i64 0, i64 24");
         return new ExprVal(t, MkType("string"));
     }
 
@@ -1639,7 +1646,7 @@ partial class Irgen {
         H("  ret void");
         H("}");
         H("define i8* @zlist_new(i64 %owns) {");
-        H("  %p = call i8* @zalloc(i64 32, i8* bitcast (void (i8*)* @zlist_dtor to i8*))");
+        H("  %p = call i8* @zalloc(i64 32, i8* bitcast (void (i8*)* @zlist_dtor to i8*), i8* null)");
         H("  %l = bitcast i8* %p to %zlist*");
         H("  %c = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -1889,18 +1896,26 @@ partial class Irgen {
     // slot 0 and container internals are all unchanged. zalloc initialises the
     // count to 1; zretain/zrelease adjust it; zrelease frees at count 0.
     void EmitArcRuntime() {
-        // header layout, 16 bytes before the object pointer: [ i64 refcount ]
-        // [ i8* destructor ]. zalloc records both; zrelease at count 0 runs the
-        // destructor (which releases members / frees internal buffers) then frees.
-        H("define i8* @zalloc(i64 %n, i8* %dtor) {");
-        H("  %tot = add i64 %n, 16");
+        // header layout, 24 bytes before the object pointer: [ i8* class id ]
+        // [ i64 refcount ] [ i8* destructor ]. zalloc records all three;
+        // zrelease at count 0 runs the destructor (which releases members /
+        // frees internal buffers) then frees. The class id is the address of
+        // the class's tid global -- the runtime type test compares it against
+        // the tid of every class that derives from the tested type, so an
+        // `object` slot can be asked "which class is this?" at runtime.
+        H("define i8* @zalloc(i64 %n, i8* %dtor, i8* %cid) {");
+        H("  %tot = add i64 %n, 24");
         H("  %raw = call i8* @calloc(i64 1, i64 %tot)");
-        H("  %rc = bitcast i8* %raw to i64*");
+        H("  %cp = getelementptr i8, i8* %raw, i64 0");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  store i8* %cid, i8** %cs");
+        H("  %rp = getelementptr i8, i8* %raw, i64 8");
+        H("  %rc = bitcast i8* %rp to i64*");
         H("  store i64 1, i64* %rc");
-        H("  %ds0 = getelementptr i8, i8* %raw, i64 8");
+        H("  %ds0 = getelementptr i8, i8* %raw, i64 16");
         H("  %ds = bitcast i8* %ds0 to i8**");
         H("  store i8* %dtor, i8** %ds");
-        H("  %obj = getelementptr i8, i8* %raw, i64 16");
+        H("  %obj = getelementptr i8, i8* %raw, i64 24");
         H("  ret i8* %obj");
         H("}");
         H("define void @zretain(i8* %p) {");
@@ -1940,10 +1955,43 @@ partial class Irgen {
         H("  call void %fn(i8* %p)");
         H("  br label %fr");
         H("fr:");
-        H("  call void @free(i8* %hdr)");
+        // the block starts 24 bytes before the object pointer
+        H("  %base = getelementptr i8, i8* %p, i64 -24");
+        H("  call void @free(i8* %base)");
         H("  br label %done");
         H("done:");
         H("  ret void");
+        H("}");
+        // The runtime class identity: the class id stored in the object
+        // header. Null-safe -- a null object has no class.
+        H("define i8* @__zan_class_id(i8* %obj) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %obj, null");
+        H("  br i1 %isnull, label %none, label %read");
+        H("none:");
+        H("  ret i8* null");
+        H("read:");
+        H("  %cp = getelementptr i8, i8* %obj, i64 -24");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  %cid = load i8*, i8** %cs");
+        H("  ret i8* %cid");
+        H("}");
+        // Is the object a managed string? The string header keeps a magic word
+        // right before the payload; a class instance has a destructor pointer
+        // there instead. Null-safe.
+        H("define i64 @__zan_is_string(i8* %obj) {");
+        H("entry:");
+        H("  %isnull = icmp eq i8* %obj, null");
+        H("  br i1 %isnull, label %no, label %read");
+        H("no:");
+        H("  ret i64 0");
+        H("read:");
+        H("  %wp = getelementptr i8, i8* %obj, i64 -8");
+        H("  %wq = bitcast i8* %wp to i64*");
+        H("  %w = load i64, i64* %wq");
+        H("  %eq = icmp eq i64 %w, 1515082580");
+        H("  %z = zext i1 %eq to i64");
+        H("  ret i64 %z");
         H("}");
     }
 
@@ -1974,6 +2022,19 @@ partial class Irgen {
             L("  " + t + " = bitcast " + lt + " " + val + " to i8*");
             L("  call void @zretain(i8* " + t + ")");
         }
+    }
+
+    // Retain a value that is stored into a slot.  An ARC-managed slot type
+    // retains as usual.  A slot that is *not* ARC-managed (an `object` slot)
+    // still owns the reference it holds -- its static type just says nothing
+    // about what that is -- so a class instance stored there is retained by
+    // the *value's* type.  A string has no refcount and must not be retained
+    // (its header carries the length, not a count).
+    void EmitArcRetainStore(string val, Node slotTy, Node valTy) {
+        if (ArcManaged(slotTy)) { EmitArcRetain(val, slotTy); return; }
+        if (valTy == null || !ArcManaged(valTy)) { return; }
+        if (MapType(slotTy) != "i8*") { return; }
+        EmitArcRetain(val, valTy);
     }
 
     void EmitArcRelease(string val, Node ty) {
@@ -2130,13 +2191,18 @@ partial class Irgen {
         H("}");
         H("define i8* @zstr_new(i64 %len) {");
         H("entry:");
-        H("  %tot = add i64 %len, 17");
+        H("  %tot = add i64 %len, 25");
         H("  %raw = call i8* @malloc(i64 %tot)");
-        H("  %hp = getelementptr i8, i8* %raw, i64 0");
+        // the class-id slot makes the string header the same size as an object
+        // header, so reading it is always in bounds
+        H("  %cp = getelementptr i8, i8* %raw, i64 0");
+        H("  %cs = bitcast i8* %cp to i8**");
+        H("  store i8* null, i8** %cs");
+        H("  %hp = getelementptr i8, i8* %raw, i64 8");
         H("  store i64 %len, i64* %hp");
-        H("  %mp = getelementptr i8, i8* %raw, i64 8");
+        H("  %mp = getelementptr i8, i8* %raw, i64 16");
         H("  store i64 1515082580, i64* %mp");
-        H("  %p = getelementptr i8, i8* %raw, i64 16");
+        H("  %p = getelementptr i8, i8* %raw, i64 24");
         H("  %endp = getelementptr i8, i8* %p, i64 %len");
         H("  store i8 0, i8* %endp");
         H("  ret i8* %p");
@@ -2203,7 +2269,7 @@ partial class Irgen {
         H("  ret void");
         H("}");
         H("define i8* @zsb_new() {");
-        H("  %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*))");
+        H("  %p = call i8* @zalloc(i64 24, i8* bitcast (void (i8*)* @zsb_dtor to i8*), i8* null)");
         H("  %b = bitcast i8* %p to %zsb*");
         H("  %c = getelementptr %zsb, %zsb* %b, i32 0, i32 0");
         H("  store i64 0, i64* %c");
@@ -2608,7 +2674,7 @@ partial class Irgen {
         H("  ret void");
         H("}");
         H("define i8* @zdict_new(i64 %owns) {");
-        H("  %p = call i8* @zalloc(i64 40, i8* bitcast (void (i8*)* @zdict_dtor to i8*))");
+        H("  %p = call i8* @zalloc(i64 40, i8* bitcast (void (i8*)* @zdict_dtor to i8*), i8* null)");
         H("  %d = bitcast i8* %p to %zdict*");
         H("  %c = getelementptr %zdict, %zdict* %d, i32 0, i32 0");
         H("  store i64 0, i64* %c");

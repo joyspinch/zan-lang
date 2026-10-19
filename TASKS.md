@@ -8,32 +8,21 @@
 
 ## 未完成
 
-### [ ] A384 自举 IR 后端没有运行期类标识——`x is T` / switch 模式判不了
+### [ ] A392 自举的运行期类型判定看不见接口与容器
 
-- 现象（2026-10-20 差分门 `ctest -R selfhost_diff` 实测）：同一个程序，C 宿主
-  编译运行正确，自举编译器（gen1）要么拒绝编译、要么结果不同：
-  - `tests/conformance/cs_b05_pattern_var.zan`（`case Dog d when ...` / `case string s`
-    打在 `object` 类型的被匹配值上）→ 自举报诊断拒绝；
-  - `cs_b06_switch_expr.zan`（switch **表达式**的 `Circle c when ... => 10`）→ 同上；
-  - `pattern_value_types.zan`（`case Dog d` 打在基类 `Animal` 上）→ 同上。
-- 根因：C 宿主用**分配点 site id**（对象头 obj-8）+ `__zan_site_tynames` 祖先名表
-  做运行期类型判定（`src/compiler/irgen_expr.c:10603` `emit_runtime_is_check`）；
-  ngen 后端用 obj-8 高半部的 site id（`src/selfhost/ngen.zan:8039`
-  `EmitTypeTestNg`）。**自举 IR 后端（`src/selfhost/irgen*.zan`）两者都没有**：
-  它的对象头只有 `[-16]=rc`、`[-8]=dtor`（`irgen.zan` 的 `EmitArcRuntime`），
-  字符串更是裸 `malloc` 的 C 串（无头、无标记）。没有类身份，`object` 槽里的值
-  在运行期无从判断是哪个类、是不是字符串。
-- 现状处理：本轮已把"判不了"从**静默错答案**改成 **fail-closed 诊断**
-  （`irgen_expr.zan` 的 `EmitTypeTestVal`），并在
-  `tests/selfhost/diff_known_gaps.txt` 登记为已知缺口。功能上仍然缺。
-- 方向（实现要点见 `.agents/skills/zan-compiler-internals/references/selfhost-closure.md`
-  §9）：给对象头加第三个槽（obj-24 放类身份），类实例化时写入该类的 tid 全局地址
-  （`@__tid_X` 的值指向基类 tid——`irgen.zan` 的 `EmitTid` 已经是这条链，catch 匹配
-  就在用它），再加一个 `__zan_is_class(obj, tid)` 沿链走；字符串必须同样带上头，
-  否则读 obj-24 是越界读，`object` 槽里的字符串会误判成类实例。
-- ⚠ 改对象头会影响自举固定点的 gen2 运行时包（`zanrt_sh_*`），改完必须重跑
-  `selfhost_fixed_point`；同时要把 `cs_b05_pattern_var` / `cs_b06_switch_expr` /
-  `pattern_value_types` 从 `diff_known_gaps.txt` 删掉，让差分门开始强制它们。
+- 现象（2026-10-20 修完 A384 后的边界）：自举后端现在能给对象判定类身份
+  （对象头里的类标识槽，见
+  `.agents/skills/zan-compiler-internals/references/selfhost-classid.md`），
+  但还有两类值判不出来：
+  - **接口**：接口不是基类链的一环，`IsSubclassName` 沿着基类链走，看不见
+    「某类实现了某接口」→ `x is IFoo` 恒为假（vtable 时代也如此，不是回归）。
+  - **容器**：`List<T>` / `Dictionary<K,V>` / `StringBuilder` 的类标识槽是 0
+    → `o is List<int>` 恒为假（C 宿主能判）。
+- 方向：接口要在基类链之外另建「实现关系表」；容器要给每个实例写自己的
+  tid（泛型实例化按元素类型分别记）。两者都要先决定**类型名怎么写进对象头**
+  （自举现在只存 tid 全局的地址，没有类型名）。
+- ⚠ 泛型容器的 tid 要按元素类型分别发射，工作量不小；先确认差分门是否
+  需要这两种判定再动手。
 
 ### [ ] A385 自举协程帧布局与 C 宿主的 `zan.co.header` 不一致——自举产出的程序用不了发行版 mt 运行时
 

@@ -7,16 +7,20 @@
 自举的 `string` 值是一个 `i8*`，指向托管块的 **payload**：
 
 ```
-  [ i64 len ][ i64 magic ][ bytes... ][ NUL ]
-  ^ payload-16  ^ payload-8  ^ payload(=值)
+  [ i64 cid ][ i64 len ][ i64 magic ][ bytes... ][ NUL ]
+  ^ payload-24  ^ payload-16  ^ payload-8   ^ payload(=值)
 ```
 
 - `len` 是**精确字节数**（不是 `strlen`）：嵌入的 NUL 不再截断长度。
 - `magic` = `1515082580`（0x5A4E5354）：`zstr_len` 读到它才认这是托管串。
+- `cid` 是**类标识槽**（当前恒为 0）：与对象头同宽（24 字节），运行期类型
+  判定读任何堆值的类标识槽都不会越界，见
+  [selfhost-classid.md](selfhost-classid.md)。
 - payload 仍然 **NUL 结尾** → 传给 C 运行时（`printf("%s")` 等）依然合法，
   与 C 宿主的运行时 ABI 不变。
 - 运行时辅助（自举后端生成）：
-  `zstr_new(len)` / `zstr_len(p)` / `zstr_dup(p)` / `zstr_of(cstr)` / `zstr_bad()`。
+  `zstr_new(len)` / `zstr_len(p)` / `zstr_clen(p)` / `zstr_dup(p)` /
+  `zstr_of(cstr)` / `zstr_bad()`。
 
 ## 2. 每一个 string 的来源都要带头
 
@@ -25,8 +29,8 @@
 1. `zstr_new(len)` —— 自己知道长度；
 2. `zstr_of(cstr)` —— 包装一个外部返回的裸 C 串（extern 的 string 返回值、
    `snprintf` 出来的数字字符串）；
-3. **字面量** —— 常量区直接按 `[len][magic][bytes][NUL]` 排好，值取
-   `getelementptr ..., 0, 16`（跳过 16 字节头）。
+3. **字面量** —— 常量区直接按 `[cid][len][magic][bytes][NUL]` 排好，值取
+   `getelementptr ..., 0, 24`（跳过 24 字节头）。
 
 `zstr_len` 读到不认识的 magic 就 `abort()`——这是**故意的**：漏掉一个来源
 会立刻炸，而不是静默返回一个错长度。调试时先想"哪个 string 不是托管的"。
