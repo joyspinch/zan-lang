@@ -1199,6 +1199,9 @@ partial class Irgen {
         NormalizeAwaits(cls, m);
         if (IsAsync(m)) { GenAsyncMethod(cls, m); return; }
         StartFn();
+        // a closure in this method may capture the method's locals: the names
+        // it mentions have to live in a cell
+        CollectCapturedNames(m.d, capNames);
         curClass = cls.sval;
         curRet = MapType(m.type);
         bool stat = IsStatic(m);
@@ -1240,11 +1243,18 @@ partial class Irgen {
                 // variable (mirrors irgen_emit.c). Managed types are rejected
                 // at the call site (no byref ARC here).
                 locName.Add(pn[j]); locType.Add(pt[j]); locReg.Add("%p" + j);
+                locBox.Add(false); locIter.Add(false); locCell.Add("");
                 j = j + 1;
                 continue;
             }
             string preg = AddLocal(pn[j], pt[j]);
-            L("  " + preg + " = alloca " + lt);
+            if (ShouldBox(pn[j])) {
+                // a closure in this method may capture the parameter: it has
+                // to live in a cell
+                preg = BoxLocal(locName.Count - 1);
+            } else {
+                L("  " + preg + " = alloca " + lt);
+            }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
@@ -1264,6 +1274,8 @@ partial class Irgen {
 
     void GenCtor(Node cls, Node m) {
         StartFn();
+        // a closure in this constructor may capture its locals
+        CollectCapturedNames(m.d, capNames);
         curClass = cls.sval;
         curRet = "void";
         curHasThis = true;
@@ -1290,7 +1302,11 @@ partial class Irgen {
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
             string preg = AddLocal(pn[j], pt[j]);
-            L("  " + preg + " = alloca " + lt);
+            if (ShouldBox(pn[j])) {
+                preg = BoxLocal(locName.Count - 1);
+            } else {
+                L("  " + preg + " = alloca " + lt);
+            }
             L("  store " + lt + " %p" + j + ", " + lt + "* " + preg);
             EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;

@@ -33,6 +33,15 @@ partial class Irgen {
     public List<string> locName;
     public List<Node> locType;
     public List<string> locReg;
+    // closure capture: a local a closure may capture lives in a heap cell
+    // (locBox), and a per-iteration variable (for/foreach) is snapshotted
+    // into a fresh cell per capture (locIter). locCell is the cell address.
+    public List<bool> locBox;
+    public List<bool> locIter;
+    public List<string> locCell;
+    // names a closure inside the current function may capture: a local with
+    // one of these names has to live in a cell
+    public List<string> capNames;
     public int locSeq;
     public int qdotSeq;
     public string curLbl;
@@ -82,6 +91,10 @@ partial class Irgen {
         locName = new List<string>();
         locType = new List<Node>();
         locReg = new List<string>();
+        locBox = new List<bool>();
+        locIter = new List<bool>();
+        locCell = new List<string>();
+        capNames = new List<string>();
         locSeq = 0;
         qdotSeq = 0;
         curAsync = false; usesAsync = false; usesDirList = false; usesStrOps = false;
@@ -1288,6 +1301,7 @@ partial class Irgen {
         locSeq = locSeq + 1;
         string r = "%v." + name + "." + locSeq;
         locName.Add(name); locType.Add(ty); locReg.Add(r);
+        locBox.Add(false); locIter.Add(false); locCell.Add("");
         return r;
     }
     string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
@@ -1296,6 +1310,38 @@ partial class Irgen {
         while (i >= 0) { if (locName[i] == name) { return i; } i = i - 1; }
         return -1;
     }
+
+    // byte size of a lowered type: a capture cell holds exactly one value
+    int TypeSizeBytes(string lt) {
+        if (lt == "i1" || lt == "i8") { return 1; }
+        if (lt == "i16") { return 2; }
+        if (lt == "i32" || lt == "float") { return 4; }
+        if (lt == "<2 x i64>") { return 16; }
+        if (lt == "<4 x i64>") { return 32; }
+        return 8;
+    }
+
+    // A local a closure captures has to live in a heap cell: the closure
+    // keeps the cell, so a write to the local after the capture stays
+    // visible inside the closure (C# semantics). The local's register
+    // becomes the cell's payload pointer, so every read and write goes
+    // through the cell. Returns the local's new register.
+    string BoxLocal(int li) {
+        Node ty = locType[li];
+        string lt = MapType(ty);
+        string cell = NT();
+        L("  " + cell + " = call i8* @malloc(i64 " + TypeSizeBytes(lt) + ")");
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + cell + " to " + lt + "*");
+        locReg[li] = p;
+        locBox[li] = true;
+        locCell[li] = cell;
+        return p;
+    }
+
+    // a local whose name shows up inside a lambda of this function may be
+    // captured by a closure: it has to live in a cell
+    bool ShouldBox(string name) { return Contains(capNames, name); }
 
     // ---- string helpers ----
     string HEXD(int d) { return "0123456789ABCDEF".Substring(d, 1); }
@@ -1915,12 +1961,17 @@ partial class Irgen {
         List<string> nn = new List<string>();
         List<Node> nt = new List<Node>();
         List<string> nr = new List<string>();
+        List<bool> nb = new List<bool>();
+        List<bool> ni = new List<bool>();
+        List<string> nc = new List<string>();
         int i = 0;
         while (i < to) {
             nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
+            nb.Add(locBox[i]); ni.Add(locIter[i]); nc.Add(locCell[i]);
             i = i + 1;
         }
         locName = nn; locType = nt; locReg = nr;
+        locBox = nb; locIter = ni; locCell = nc;
     }
 
     // per-class destructor: release every ARC-managed field, then return (the
@@ -2737,6 +2788,10 @@ partial class Irgen {
         locName = new List<string>();
         locType = new List<Node>();
         locReg = new List<string>();
+        locBox = new List<bool>();
+        locIter = new List<bool>();
+        locCell = new List<string>();
+        capNames = new List<string>();
         locSeq = 0;
         stmtTemps = new List<string>();
         stmtTempTypes = new List<Node>();

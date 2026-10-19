@@ -181,6 +181,11 @@ links, runs the programs and compares stdout with the C host's golden file.
   that very bit — so the record address was called as code and the program died
   with an access violation. Producer and consumer now agree on the tag, the same
   convention the C host uses (`rec | 1`).
+- A fourth round (2026-10-20) fixed the **closure capture semantics**: a local
+  that a closure captures now lives in a heap cell, and the closure record holds
+  the cell, so a write to the local after the capture is visible inside the
+  closure (C# semantics). Loop variables are snapshotted per iteration, as
+  before. Async methods still capture by value (`TASKS.md`, A387).
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR
@@ -203,13 +208,13 @@ links, runs the programs and compares stdout with the C host's golden file.
   (`case Dog d`, `case string s`) therefore cannot be decided at runtime: the
   self-hosted compiler now **refuses to compile it** with an explicit diagnostic
   instead of silently never matching. Tracked in `TASKS.md`.
-- **Closure capture is by value in the self-hosted backend.** The C host boxes a
-  local that is captured by a closure and written in the same function, so the
-  closure observes later writes (C# semantics); the self-hosted backend snapshots
-  the value when the closure is built, so a write after the capture is invisible
-  to the closure. Loop variables match (each iteration captures its own value).
-  Tracked in `TASKS.md` (A386) with the differential-gate case
-  `tests/conformance/closure_capture_by_ref.zan`.
+- **Closure capture is by value inside async methods.** In synchronous code a
+  local that a closure captures lives in a heap cell and the closure holds the
+  cell, so the closure observes later writes (C# semantics). An async method's
+  locals live in the coroutine frame instead of stack allocas, and that path
+  does not box them yet, so a closure created in an async method still gets a
+  value snapshot. Tracked in `TASKS.md` (A387) with the differential-gate case
+  `tests/conformance/closure_capture_async.zan`.
 - **Language coverage.** The self-hosted compiler covers substantially more of
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/

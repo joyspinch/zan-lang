@@ -619,7 +619,13 @@ partial class Irgen {
         if (ty == null) { ty = init.ty; }
         string lt = MapType(ty);
         string reg = AddLocal(s.sval, ty);
-        EA(reg, lt);
+        if (ShouldBox(s.sval)) {
+            // a closure in this function may capture the variable: it has to
+            // live in a cell the closure can keep
+            reg = BoxLocal(locName.Count - 1);
+        } else {
+            EA(reg, lt);
+        }
         if (hasInit) {
             if (IsNullableValue(ty)) {
                 L("  store i8* " + BoxFor(init, ty) + ", i8** " + reg);
@@ -726,6 +732,10 @@ partial class Irgen {
     void GenFor(Node s) {
         int forScope = locName.Count;
         if (s.a != null) { GenStmt(s.a); }
+        // a for-statement's init variables are per-iteration captures: every
+        // closure made in the body keeps its own iteration's value
+        int fi = forScope;
+        while (fi < locName.Count) { locIter[fi] = true; fi = fi + 1; }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
         int sls = loopScopeBase;
@@ -812,7 +822,11 @@ partial class Irgen {
         EA(idx, "i64");
         L("  store i64 0, i64* " + idx);
         string ereg = AddLocal(e.sval, srcElem);
-        EA(ereg, selt);
+        if (ShouldBox(e.sval)) {
+            ereg = BoxLocal(locName.Count - 1);
+        } else {
+            EA(ereg, selt);
+        }
         if (ArcManaged(srcElem)) { L("  store " + selt + " null, " + selt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         L("  br label %L" + lc);
@@ -905,7 +919,14 @@ partial class Irgen {
             L("  store i64 0, i64* " + ip0);
         }
         string ereg = AddLocal(s.sval, elemTy);
-        EA(ereg, elt);
+        // the element variable is a per-iteration capture: every closure made
+        // in the body keeps its own element
+        locIter[locName.Count - 1] = true;
+        if (ShouldBox(s.sval)) {
+            ereg = BoxLocal(locName.Count - 1);
+        } else {
+            EA(ereg, elt);
+        }
         if (curAsync) {
             // the element variable crosses the suspension as well
             asyncSlotReg.Add(ereg); asyncSlotTy.Add(elemTy); asyncSlotIdx.Add(s.ival + 2);

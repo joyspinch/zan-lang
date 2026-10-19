@@ -60,42 +60,37 @@
 - ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
   差分门的 `diff_known_gaps.txt` 也要同步。
 
-### [ ] A386 自举闭包按值快照捕获——局部变量后续的写入在闭包里看不见（C# 语义应按引用捕获）
+### [ ] A387 自举 async 方法里的闭包仍按值捕获（同步路径已按引用）
 
-- 现象（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_by_ref.zan`）：
-  同一个程序，C 宿主输出 `2` / `10`，自举编译器（gen1）输出 `1` / `10`：
+- 现象（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_async.zan`）：
+  同一个程序，C 宿主输出 `f=2`，自举编译器（gen1）输出 `f=1`：
   ```zan
-  int x = 1;
-  Func<int> f = () => x;   // 闭包捕获 x
-  x = 2;                   // 捕获之后再写
-  Console.WriteLine(f());  // C 宿主 2（按引用），自举 1（按值快照）
+  static async void Main() {
+      int x = 1;
+      Func<int> f = () => x;   // 闭包捕获 x
+      x = 2;                   // 捕获之后再写
+      await Task.Delay(1);
+      Console.WriteLine(f());  // C 宿主 2（按引用），自举 1（按值快照）
+  }
   ```
-- 根因：两套捕获模型不同。
-  - C 宿主（`src/compiler/irgen_expr.c`）：局部变量**被闭包捕获且在函数体内被写过**
-    就装箱成堆上的 cell（`local_is_lambda_captured` + `body_writes_ident_memo`，
-    `irgen_expr.c:11812`），闭包记录里存的是 **cell 指针**，读写都穿过 cell
-    → 闭包看到后续的写入（C# 语义）。循环变量额外按**每次迭代独立快照**
-    （`per_iteration`，`irgen_stmt.c:1826`；取值时复制一份新 cell，
-    `irgen_expr.c:11509`），所以 `for` 捕获仍是 0,1,2 而不是 0,3,3。
-  - 自举 IR 后端（`src/selfhost/irgen_expr.zan` 的 `GenLambda`/`CollectCaptures`）：
-    建闭包时把捕获变量的**当前值**快照进 malloc 出来的 env 数组（每个槽一个 i64），
-    闭包体入口再把值搬进自己的局部槽。**全程没有 cell**，所以捕获之后再写局部变量，
-    闭包看不见 → 与 C 宿主分叉。
-- 现状处理：已登记为差分门已知缺口（`tests/selfhost/diff_known_gaps.txt`
-  的 `closure_capture_by_ref`），门会持续报出来，不会静默漂移。
-  ⚠ 顺带注意：自举的 env 槽是 i64 一个槽，**宽于 8 字节的捕获值（struct）会被截断**，
-  修捕获模型时要一并把 env 改成按类型分槽。
-- 方向：按 C 宿主的模型重做自举的捕获：
-  1. 函数体生成前做一遍**预扫描**（C 宿主是 `local_is_lambda_captured`）：算出
-     "被本函数内 lambda 捕获 ∧ 在本函数体内被写过"的局部变量集合；
-  2. 这些局部变量改成**堆 cell**（alloca 存 cell 指针，读写都多一层解引用），
-     未被写过的仍按值快照（与 C 宿主一致，语义等价但更省）；
-  3. 闭包 env 存 cell 指针（而不是值），闭包体按 cell 读写；
-  4. `for`/循环变量保留"每次迭代独立快照"（当前按值快照的形态恰好等价，
-     但改成 cell 后必须显式做 per-iter 复制，否则会退化成 0,3,3）。
-- ⚠ 改捕获会动到**所有**局部变量的读写路径（`GenIdent` 的 load、`StoreTo` 的 store），
-  风险面大；改完必须重跑 `selfhost_fixed_point`（gen2/g3 都要过）与差分门，
-  并把 `closure_capture_by_ref` 从 `diff_known_gaps.txt` 删掉。
+- 根因：同步路径的装箱（局部变量住进堆 cell，闭包记录存 cell 指针）已经做完，
+  但 **async 方法的局部变量不住在栈上**——它们住在协程帧里（`GenAsyncMethod` 的
+  `PrescanAsyncLocals` + 帧槽，跨挂起点存活的值都进帧）。自举的装箱路径
+  （`irgen.zan` 的 `BoxLocal`）发的是"栈 alloca + cell 指针"，async 路径没有对应的
+  形态：`GenAsyncMethod` 生成局部变量时**不开箱**，所以 async 里的闭包仍然拿到
+  按值快照的 env。
+- 现状处理：登记为差分门已知缺口（`tests/selfhost/diff_known_gaps.txt` 的
+  `closure_capture_async`），门会持续报出来。同步路径的同一语义已由
+  `tests/conformance/closure_capture_by_ref.zan` 强制。
+- 方向：让 async 帧槽能装 cell 指针——
+  1. async 方法里的局部变量若被闭包捕获，也要装箱：帧槽存 **cell 指针**（i64），
+     而不是变量值；resume 时由 cell 指针重算 payload 指针（payload 指针指向
+     堆 cell，跨挂起稳定）。
+  2. `asyncSlotReg` / `EmitAsyncReloadSlots` 的溢出与回填要按"存 cell 指针"来做，
+     而不是按 `MapType` 的值类型存。
+  3. 闭包创建点（`GenLambda`）在 async 方法里拿到的也应是 cell 指针。
+- ⚠ 动 async 帧布局，必须重跑 `selfhost_fixed_point`（gen2/g3 都要过）与差分门；
+  另外 async 帧布局本身还与 C 宿主的 `zan.co.header` 不一致（A385），两者要一起看。
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
@@ -195,3 +190,27 @@
   实测瓦片外框高定哪套是准。
 - 方向：先定准绳（参考图实测外框高），再把脚本改成**从 `Spec` 取参**并补
   导航 30 号齿轮格，最后拿真 dump 跑绿；不要为了让它变绿去改脚本里的数字。
+
+### [ ] A388 `zanc --emit-ir` 输出的 IR 交给 LLVM 后端会被拒——`<N x i1>` 向量比较拆不开
+
+- 现象：`zanc <file> --emit-ir` 落出的 IR 直接喂给 LLVM 自带的 `llc` 会在
+  `DAGTypeLegalizer::SplitVectorOperand` 处 fatal error：
+  `LLVM ERROR: Do not know how to split this operator's operand!`
+  （停在哪一步：*Running pass 'X86 DAG->DAG Instruction Selection' on function
+  '@MemoryExtensions_SequenceEqual'*）。复现：
+  `zanc tests/conformance/task_spawn_indirect.zan --emit-ir --no-packages > t.ll`
+  然后 `llc -filetype=obj t.ll`（llc 连续 3/3 必崩，确定性）。
+- 根因：编译器把 `Vector256.Equals` 降成 `icmp eq <32 x i8>`，其结果类型是
+  `<32 x i1>`；X86 后端没有 `<32 x i1>` 这种类型，type legalizer 拆它时落到
+  `SplitVectorOperand` 的兜底分支 → 报错退出。
+- 为什么平时不炸：正常构建路径进后端前跑 `zan_opt_strip_unused`（globaldce），
+  没人引用的 stdlib 函数被剔掉，坏的向量比较随之消失；而 `--emit-ir` 分支
+  （`src/compiler/main.c` 的 `do_emit_ir`）**跳过 globaldce**，整份 stdlib 都留在
+  IR 里——包括死的 `MemoryExtensions.SequenceEqual`。
+- 方向（二选一，优先后者）：
+  (1) `--emit-ir` 也做一次 globaldce——但会改变 golden IR 的内容，需一并重生成
+      `tests/golden/expected/` 并复核 `async_skeleton.ir-contains` 之类的子串断言；
+  (2) 在 IRGen 侧把向量相等比较降成标量比较，不产生 `<N x i1>`（`Vector256.Equals`
+      的语义就是逐字节相等，标量化后由 LLVM 自己决定要不要重新向量化）。
+- ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器顺手把向量
+  比较标量化了，编译器自己产出的 IR 仍然过不了自己的后端。

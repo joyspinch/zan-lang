@@ -1939,6 +1939,29 @@ partial class Irgen {
         while (i < n.kids.Count) { CollectIdents(n.kids[i], outv); i = i + 1; }
     }
 
+    // Names a closure inside this function may capture: every identifier
+    // that shows up inside a lambda. Deliberately over-approximated -- a
+    // local that merely shares a name with something a lambda mentions is
+    // boxed too, which costs one allocation but changes no behaviour.
+    void CollectCapturedNames(Node n, List<string> outv) {
+        if (n == null) { return; }
+        if (n.kind == AK.Lambda()) {
+            List<string> used = new List<string>();
+            CollectIdents(n.a, used);
+            CollectIdents(n.d, used);
+            int i = 0;
+            while (i < used.Count) {
+                if (!Contains(outv, used[i])) { outv.Add(used[i]); }
+                i = i + 1;
+            }
+            return;
+        }
+        CollectCapturedNames(n.a, outv); CollectCapturedNames(n.b, outv);
+        CollectCapturedNames(n.c, outv); CollectCapturedNames(n.d, outv);
+        int i = 0;
+        while (i < n.kids.Count) { CollectCapturedNames(n.kids[i], outv); i = i + 1; }
+    }
+
     void CollectDeclared(Node n, List<string> outv) {
         if (n == null) { return; }
         if (n.kind == AK.VarDecl()) { if (!Contains(outv, n.sval)) { outv.Add(n.sval); } }
@@ -2157,6 +2180,22 @@ partial class Irgen {
         CollectCaptures(lam, pn, caps, capTy);
         int nc = caps.Count;
 
+        // A captured local lives in a heap cell: the closure keeps the cell,
+        // so a write to the local after the capture stays visible inside the
+        // closure (C# semantics). A per-iteration variable (for/foreach) is
+        // snapshotted into a fresh cell instead, so every iteration's
+        // closure keeps its own value.
+        List<bool> capBox = new List<bool>();
+        List<bool> capIter = new List<bool>();
+        int cb = 0;
+        while (cb < nc) {
+            int li = LocalIdx(caps[cb]);
+            bool bx = false; bool it = false;
+            if (li >= 0) { bx = locBox[li]; it = locIter[li]; }
+            capBox.Add(bx); capIter.Add(it);
+            cb = cb + 1;
+        }
+
         // build the env with the captured values (in the enclosing function)
         string env = "null";
         if (nc > 0) {
@@ -2166,10 +2205,33 @@ partial class Irgen {
             L("  " + envi + " = bitcast i8* " + env + " to i64*");
             int c = 0;
             while (c < nc) {
-                ExprVal cv = GenExpr(MkIdent(caps[c]));
                 string slot = NT();
                 L("  " + slot + " = getelementptr i64, i64* " + envi + ", i64 " + c);
-                L("  store i64 " + ToSlot(cv, capTy[c]) + ", i64* " + slot);
+                string packed = "0";
+                if (capBox[c]) {
+                    int li = LocalIdx(caps[c]);
+                    string cell = locCell[li];
+                    if (capIter[c]) {
+                        // per-iteration capture: copy the current value into a
+                        // fresh cell so this closure keeps its own iteration
+                        string lt = MapType(capTy[c]);
+                        string val = NT();
+                        L("  " + val + " = load " + lt + ", " + lt + "* " + locReg[li]);
+                        string nc2 = NT();
+                        L("  " + nc2 + " = call i8* @malloc(i64 " + TypeSizeBytes(lt) + ")");
+                        string np2 = NT();
+                        L("  " + np2 + " = bitcast i8* " + nc2 + " to " + lt + "*");
+                        L("  store " + lt + " " + val + ", " + lt + "* " + np2);
+                        cell = nc2;
+                    }
+                    string civ = NT();
+                    L("  " + civ + " = ptrtoint i8* " + cell + " to i64");
+                    packed = civ;
+                } else {
+                    ExprVal cv = GenExpr(MkIdent(caps[c]));
+                    packed = ToSlot(cv, capTy[c]);
+                }
+                L("  store i64 " + packed + ", i64* " + slot);
                 c = c + 1;
             }
         }
@@ -2180,6 +2242,8 @@ partial class Irgen {
         string sRet = curRet; string sClass = curClass; bool sHasThis = curHasThis;
         List<string> sLocName = locName; List<Node> sLocType = locType;
         List<string> sLocReg = locReg; int sLocSeq = locSeq;
+        List<bool> sLocBox = locBox; List<bool> sLocIter = locIter; List<string> sLocCell = locCell;
+        List<string> sCapNames = capNames;
         int sBrk = brkTarget; int sCont = contTarget;
         int sLoopScope = loopScopeBase;
         List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
@@ -2190,6 +2254,11 @@ partial class Irgen {
         entryAllocas = new StringBuilder(); eaActive = true;
         tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
+        locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        // a closure inside this lambda may capture the lambda's own locals
+        capNames = new List<string>();
+        CollectCapturedNames(lam.d, capNames);
+        CollectCapturedNames(lam.a, capNames);
         curRet = MapType(retTy); curClass = ""; curHasThis = false; brkTarget = 0; contTarget = 0;
 
         string sig = "define " + curRet + " " + fname + "(i8* %env";
@@ -2200,7 +2269,13 @@ partial class Irgen {
         while (a < pn.Count) {
             string lt = MapType(pt[a]);
             string preg = AddLocal(pn[a], pt[a]);
-            L("  " + preg + " = alloca " + lt);
+            if (ShouldBox(pn[a])) {
+                // a closure inside this lambda may capture the parameter:
+                // it has to live in a cell
+                preg = BoxLocal(locName.Count - 1);
+            } else {
+                L("  " + preg + " = alloca " + lt);
+            }
             L("  store " + lt + " %p" + a + ", " + lt + "* " + preg);
             EmitArcRetain("%p" + a, pt[a]);
             a = a + 1;
@@ -2214,9 +2289,26 @@ partial class Irgen {
                 L("  " + slot + " = getelementptr i64, i64* " + envi + ", i64 " + c);
                 string raw = NT();
                 L("  " + raw + " = load i64, i64* " + slot);
-                ExprVal cv = FromSlot(raw, capTy[c]);
                 string lt = MapType(capTy[c]);
                 string creg = AddLocal(caps[c], capTy[c]);
+                if (capBox[c]) {
+                    // the env slot holds the cell: the captured local is read
+                    // and written through it, so a write after the capture
+                    // stays visible here
+                    string cell = NT();
+                    L("  " + cell + " = inttoptr i64 " + raw + " to i8*");
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + cell + " to " + lt + "*");
+                    locReg[locName.Count - 1] = p;
+                    locBox[locName.Count - 1] = true;
+                    locCell[locName.Count - 1] = cell;
+                    string cv = NT();
+                    L("  " + cv + " = load " + lt + ", " + lt + "* " + p);
+                    EmitArcRetain(cv, capTy[c]);
+                    c = c + 1;
+                    continue;
+                }
+                ExprVal cv = FromSlot(raw, capTy[c]);
                 L("  " + creg + " = alloca " + lt);
                 string csv = Coerce(cv, lt);
                 L("  store " + lt + " " + csv + ", " + lt + "* " + creg);
@@ -2269,6 +2361,7 @@ partial class Irgen {
         tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
         curRet = sRet; curClass = sClass; curHasThis = sHasThis;
         locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
+        locBox = sLocBox; locIter = sLocIter; locCell = sLocCell; capNames = sCapNames;
         brkTarget = sBrk; contTarget = sCont;
         loopScopeBase = sLoopScope;
         stmtTemps = svT; stmtTempTypes = svTT;
@@ -2335,7 +2428,7 @@ partial class Irgen {
         string fnty = fnt.Substring(0, fnt.Length - 1);
         string rClo = "0";
         if (rt != "void") { rClo = NT(); L("  " + rClo + " = call " + fnty + " " + fni8 + "(" + args + ")"); }
-        else { L("  call void " + fnty.Substring(6) + " " + fni8 + "(" + args + ")"); }
+        else { L("  call " + fnty + " " + fni8 + "(" + args + ")"); }
         L("  br label %L" + lJoin);
         Label(lBare);
         // 裸原生函数指针没有 env 槽，函数类型只带声明形参；闭包路径的
@@ -3073,6 +3166,7 @@ partial class Irgen {
                                 Node pt2 = null;
                                 if (pi < dps.Count) { pt2 = dps[pi]; }
                                 locName.Add(arg.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                                locBox.Add(false); locIter.Add(false); locCell.Add("");
                                 pi = pi + 1;
                             }
                             j = j + 1;
@@ -3206,6 +3300,7 @@ partial class Irgen {
                 Node pt2 = lam.kids[j].type;
                 if (pt2 == null && pi < dps.Count) { pt2 = dps[pi]; }
                 locName.Add(lam.kids[j].sval); locType.Add(pt2); locReg.Add("");
+                locBox.Add(false); locIter.Add(false); locCell.Add("");
                 pi = pi + 1;
             }
             j = j + 1;

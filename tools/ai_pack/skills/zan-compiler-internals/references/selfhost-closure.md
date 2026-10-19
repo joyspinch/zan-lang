@@ -175,21 +175,44 @@ kernel32、shell32、user32、advapi32、version）。
   （`irgen_expr.c:12150`），自举现在是 `{fn, env}`——同一程序内自洽即可，
   但两边**不是二进制兼容**的；真要对齐见 §13。
 
-## 13. 捕获语义：被写过的局部变量必须装箱（按引用捕获）
+## 13. 捕获语义：被闭包捕获的局部变量必须装箱（按引用捕获）
 
-- 动作：局部变量**被本函数内的闭包捕获**且**在本函数体内被写过**时，
-  必须装箱成堆上的 cell，闭包记录里存 **cell 指针**，读写都穿过 cell
-  （C# 语义：闭包看到捕获之后的写入）。没被写过的可以按值快照
-  （语义等价，更省）。循环变量额外按**每次迭代独立快照**（per-iteration），
-  所以 `for` 里捕获仍是 0,1,2 而不是 0,3,3。
-- 理由（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_by_ref.zan`）：
+- 动作：局部变量**被本函数内的闭包捕获**时，必须装箱成堆上的 cell，闭包记录里
+  存 **cell 指针**，读写都穿过 cell（C# 语义：闭包看到捕获之后的写入，闭包里的
+  写外面也看得见）。自举的实现形态：
+  - 函数体生成前先跑一遍**预扫描** `CollectCapturedNames`：把本函数里所有
+    lambda 体内出现过的标识符名字收进 `capNames`（**故意过近似**：名字撞上的
+    局部变量也会装箱，多一次分配而已，语义不变）；
+  - 声明局部变量时，名字在 `capNames` 里就装箱（`irgen.zan` 的 `BoxLocal`）：
+    局部变量的寄存器换成 **cell 里 payload 的指针**，于是 `GenIdent` 的 load 和
+    `StoreTo` 的 store 一行都不用改，读写自动穿 cell；
+  - 建闭包时，捕获项存 cell 指针；闭包体入口由 cell 指针算出 payload 指针当
+    自己的局部变量 → 闭包内外看到的是同一份数据；
+  - `for`/`foreach` 的变量是**每次迭代独立快照**（`locIter`）：建闭包时把当前值
+    复制进**新** cell，所以 `for` 里捕获仍是 0,1,2 而不是 0,3,3。
+- 理由（2026-10-20 差分门实测，用例 `tests/conformance/closure_capture_by_ref.zan`）：
   自举原来在建闭包时把捕获变量的**当前值**快照进 env 数组，全程没有 cell →
   捕获之后再写局部变量，闭包看不见（C 宿主输出 2，自举输出 1）。
-  C 宿主的判定在 `irgen_expr.c:11812`（`local_is_lambda_captured` +
-  `body_writes_ident_memo`），per-iteration 标记在 `irgen_stmt.c:1826`。
-- 连带：自举的 env 槽现在是**每个捕获一个 i64**，宽于 8 字节的捕获值
-  （struct）会被截断——重做捕获模型时要一并改成按类型分槽。
-- 边界：这条动的是**所有**局部变量的读写路径（`GenIdent` 的 load、
-  `StoreTo` 的 store），风险面大；改完必须重跑 `selfhost_fixed_point`
-  与差分门，并把 `closure_capture_by_ref` 从 `diff_known_gaps.txt` 删掉。
-  进展见 TASKS A386。
+  C 宿主是同一套模型：`local_is_lambda_captured` + `body_writes_ident_memo`
+  决定装箱（`irgen_expr.c:11812`），per-iteration 标记在 `irgen_stmt.c:1826`，
+  取值时复制新 cell 在 `irgen_expr.c:11509`。
+- 连带：装箱是**按变量名**判定的，参数、方法体变量、lambda 形参都要走同一条路
+  （`ShouldBox`）；`locBox`/`locIter`/`locCell` 三张表必须与
+  `locName`/`locType`/`locReg` **同步增删**——`AddLocal`、`TrimLocals`、
+  `StartFn` 和那两处直接 `locName.Add` 的地方都要一起改，漏一处就串位。
+- 边界：**async 方法还没做**（async 的局部变量住在协程帧里，不是栈 alloca，
+  装箱路径要按"帧槽存 cell 指针"重做，见 TASKS A387）。async 之外的同步路径
+  已经和 C 宿主一致。
+
+## 14. 发 `call` 时函数类型要整体带上返回值类型
+
+- 动作：自举发间接调用时，函数类型统一由 `LamFnType` 生成、去掉结尾的 `*`
+  （`void (i8*)*` → `void (i8*)`），返回值类型写在类型里，**不要**再单独拼
+  `"call void "` 前缀，也不要按固定偏移切字符串。
+- 理由（2026-10-20 实测）：调用返回 `void` 的委托（`Action`）时，代码走的是
+  另一条手写分支，用 `fnt.Substring(6)` 切函数类型 → 切出 `i8*)*` 这种碎片，
+  生成的 IR 是 `call void i8*) %f(...)`，clang 直接报 "expected value token"。
+  同一段代码的非 void 分支是对的（先 `Substring(0, len-1)` 再 `call <type>`），
+  两条分支各切一次就必然分叉。
+- 边界：clang 报 `.ll` 语法错时，先看那一行是**谁**拼的——多半是某个分支自己
+  手拼了类型片段，而不是 LLVM 类型规则本身有问题。
