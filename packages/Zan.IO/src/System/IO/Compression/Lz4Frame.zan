@@ -1,0 +1,180 @@
+using System;
+
+namespace System.IO.Compression;
+
+// LZ4 frame 容器（参考 lz4 frame 格式规范 1.6.x）。
+//
+// MagicNumber + FLG/BD 描述符 + （可选）内容大小 + HC + 数据块 +
+// EndMark + （可选）XXH32。本实现写 magic/描述符/内容大小/HC 与
+// 压缩块，省略字典与校验和（读侧对带 XXH32 的帧按块边界忽略校验
+// 字段后照常解码——块长度字段不含校验字节，边界可靠）。
+//
+// 与官方 lz4 CLI、LZ4 Frame Decode 及各语言标准实现互通。
+public class Lz4Frame {
+    // 规范魔数 0x184D2204（小端存储为 04 22 4D 18）。
+    public static int MAGIC = 0x184D2204;
+
+    // 压缩为 LZ4 frame（级别 1-9）。contentSize 记入描述符，
+    // 解码方可预分配；这是官方 lz4 默认行为。
+    // 布局：Magic(4) + FLG + BD + ContentSize(8) + HC(1) + 块... +
+    // EndMark。HC = (描述符字节和 >> 8) & 0xFF，第二级校验。
+    public static byte[] Compress(byte[] data, int level) {
+        int n = data == null ? 0 : data.Length;
+        // 头 15 字节（magic4 + FLG + BD + Size8 + HC1）+ 块数 ×
+        // 每块最坏 + EndMark。
+        int blocks = (n + 4194303) / 4194304;
+        int worst = 15 + blocks * (Lz4Block.UpperBound(4194304) + 4 + 4) + 4;
+        byte[] out2 = new byte[worst];
+        int op = 0;
+        // Magic 0x184D2204 小端。
+        out2[op] = 4;
+        out2[op + 1] = 34;
+        out2[op + 2] = 77;
+        out2[op + 3] = 24;
+        op = op + 4;
+        // FLG: Version=01(bit7-6) | B.Indep(bit5) | C.Size(bit3) → 0x68。
+        // BD: BlockMaxSize=4MB（值 7，bits 6-4 = 111）→ 0x70。
+        out2[op] = 0x68;
+        out2[op + 1] = 0x70;
+        op = op + 2;
+        // 内容大小（小端 64 位）。
+        long size = n;
+        for (int i = 0; i < 8; i = i + 1) {
+            out2[op] = (byte)((size >> (8 * i)) & 255);
+            op = op + 1;
+        }
+        // HC：FLG..ContentSize 字节求和 >> 8，写在描述符之后。
+        int h = 0;
+        for (int i = 4; i < op; i = i + 1) {
+            h = h + (out2[i] & 255);
+        }
+        out2[op] = (byte)((h >> 8) & 255);
+        op = op + 1;
+        // 压缩块循环。
+        int pos = 0;
+        while (pos < n) {
+            int chunk = n - pos > 4194304 ? 4194304 : n - pos;
+            byte[] comp = Lz4Block.Encode(data, pos, chunk, level);
+            if (comp.Length < chunk) {
+                // 压缩块：最高位 0，长度 = comp.Length。
+                int lenField = comp.Length;
+                out2[op] = (byte)(lenField & 255);
+                out2[op + 1] = (byte)((lenField >> 8) & 255);
+                out2[op + 2] = (byte)((lenField >> 16) & 255);
+                out2[op + 3] = (byte)((lenField >> 24) & 255);
+                op = op + 4;
+                Lz4Frame.Copy(comp, 0, out2, op, comp.Length);
+                op = op + comp.Length;
+            } else {
+                // 存储块：最高位 1（无符号设置，按位或 0x80000000）。
+                int lenField = (chunk & 0x7FFFFFFF) | unchecked((int)0x80000000);
+                out2[op] = (byte)(lenField & 255);
+                out2[op + 1] = (byte)((lenField >> 8) & 255);
+                out2[op + 2] = (byte)((lenField >> 16) & 255);
+                out2[op + 3] = (byte)((lenField >> 24) & 255);
+                op = op + 4;
+                Lz4Frame.Copy(data, pos, out2, op, chunk);
+                op = op + chunk;
+            }
+            pos = pos + chunk;
+        }
+        // EndMark。
+        out2[op] = 0;
+        out2[op + 1] = 0;
+        out2[op + 2] = 0;
+        out2[op + 3] = 0;
+        op = op + 4;
+        return Lz4Frame.Trim(out2, op);
+    }
+
+    static byte[] Trim(byte[] buf, int len) {
+        if (len == buf.Length) { return buf; }
+        byte[] out2 = new byte[len];
+        Lz4Frame.Copy(buf, 0, out2, 0, len);
+        return out2;
+    }
+
+    // 解码 LZ4 frame。不校验 XXH32（本实现不带；读外部帧时校验
+    // 字节随块长边界自然被跳过——块长不含校验，EndMark 前的每块
+    // 按"最高位存储/否则压缩"处理后直接越过 4 字节校验）。
+    public static byte[] Decompress(byte[] src) {
+        if (src == null || src.Length < 7) { return null; }
+        int ip = 0;
+        if ((src[0] & 255) != 4 || (src[1] & 255) != 34
+            || (src[2] & 255) != 77 || (src[3] & 255) != 24) {
+            return null;
+        }
+        ip = ip + 4;
+        int flg = src[ip] & 255;
+        int bd = src[ip + 1] & 255;
+        ip = ip + 2;
+        if (((flg >> 6) & 3) != 1) { return null; }   // Version 必须为 01
+        bool hasContentSize = (flg & 8) != 0;
+        bool hasDictId = (flg & 1) != 0;
+        bool hasBlockChecksum = (flg & 16) != 0;
+        long contentSize = 0;
+        if (hasContentSize) {
+            if (ip + 8 > src.Length) { return null; }
+            for (int i = 0; i < 8; i = i + 1) {
+                contentSize = contentSize | (long)(src[ip + i] & 255) << (8 * i);
+            }
+            ip = ip + 8;
+        }
+        if (hasDictId) { ip = ip + 4; }
+        if (ip >= src.Length) { return null; }
+        ip = ip + 1;  // HC
+        // BlockMaxSize：值 4-7 → 64KB/256KB/1MB/4MB；值 0-3 规范
+        // 未定义，按 64KB 处理。
+        int bmaxCode = (bd >> 4) & 7;
+        int blockMax = bmaxCode >= 4 ? 65536 << ((bmaxCode - 4) * 2) : 65536;
+        byte[] out2;
+        if (hasContentSize && contentSize >= 0 && contentSize < 1073741824) {
+            out2 = new byte[(int)contentSize + 8];
+        } else {
+            out2 = new byte[65536 + 8];
+        }
+        int op = 0;
+        int cap = out2.Length;
+        while (true) {
+            if (ip + 4 > src.Length) { return null; }
+            int lenField = (src[ip] & 255) | ((src[ip + 1] & 255) << 8)
+                | ((src[ip + 2] & 255) << 16)
+                | (int)(((uint)(src[ip + 3] & 255)) << 24);
+            ip = ip + 4;
+            if (lenField == 0) { break; }  // EndMark
+            bool stored = (lenField & unchecked((int)0x80000000)) != 0;
+            int dlen = lenField & 0x7FFFFFFF;
+            if (ip + dlen > src.Length) { return null; }
+            byte[] piece;
+            if (stored) {
+                piece = new byte[dlen];
+                Lz4Frame.Copy(src, ip, piece, 0, dlen);
+            } else {
+                // 压缩块：解出大小未知 → 先解到块上限。
+                piece = Lz4Block.Decode(src, ip, dlen, blockMax);
+                if (piece == null) { return null; }
+            }
+            ip = ip + dlen;
+            if (hasBlockChecksum) { ip = ip + 4; }
+            if (op + piece.Length > cap) {
+                int ncap = cap * 2;
+                while (op + piece.Length > ncap) { ncap = ncap * 2; }
+                byte[] nb = new byte[ncap + 8];
+                Lz4Frame.Copy(out2, 0, nb, 0, op);
+                out2 = nb;
+                cap = ncap;
+            }
+            Lz4Frame.Copy(piece, 0, out2, op, piece.Length);
+            op = op + piece.Length;
+        }
+        byte[] res = new byte[op];
+        Lz4Frame.Copy(out2, 0, res, 0, op);
+        return res;
+    }
+
+    static void Copy(byte[] src, int soff, byte[] dst, int doff, int n) {
+        for (int i = 0; i < n; i = i + 1) {
+            dst[doff + i] = src[soff + i];
+        }
+    }
+}

@@ -1,0 +1,106 @@
+// LZ4 块/帧 roundtrip：块格式编解码（含短输入、RLE 重叠、
+// 255 扩展、不可压存储块回退）、帧容器（magic/描述符/HC、
+// 4MB 分块、截断防御）、9 级一致性。规范断言，不依赖外部工具。
+using System;
+using System.IO.Compression;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+        else { Console.WriteLine("ok " + label); }
+    }
+
+    static bool Same(byte[] a, byte[] b) {
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    static byte[] Repeat(byte[] unit, int times) {
+        byte[] out2 = new byte[unit.Length * times];
+        for (int i = 0; i < times; i = i + 1) {
+            for (int j = 0; j < unit.Length; j = j + 1) {
+                out2[i * unit.Length + j] = unit[j];
+            }
+        }
+        return out2;
+    }
+
+    static void FrameRoundTrip(byte[] data, int level, string tag) {
+        byte[] comp = Lz4Frame.Compress(data, level);
+        byte[] back = Lz4Frame.Decompress(comp);
+        Check(back != null && Same(data, back), tag);
+    }
+
+    static void Main() {
+        // 帧 roundtrip：文本/空/短输入/短重复/长重复。
+        FrameRoundTrip(Encoding.GetBytes("hello lz4, hello lz4, hello lz4 world"), 3, "frame-text");
+        FrameRoundTrip(new byte[0], 3, "frame-empty");
+        FrameRoundTrip(Encoding.GetBytes("x"), 3, "frame-1byte");
+        FrameRoundTrip(Encoding.GetBytes("1234567"), 3, "frame-7bytes");
+        FrameRoundTrip(Repeat(Encoding.GetBytes("abcdefgh"), 1000), 5, "frame-repeat");
+        // 无匹配字面量段跨越 255 扩展字节路径。
+        byte[] lit = new byte[300];
+        for (int i = 0; i < 300; i = i + 1) { lit[i] = (byte)(i * 7 + 3); }
+        FrameRoundTrip(lit, 5, "frame-lit300");
+        // 伪随机不可压数据 → 存储块路径。
+        byte[] rnd = new byte[70000];
+        int seed = 12345;
+        for (int i = 0; i < 70000; i = i + 1) {
+            seed = seed * 1103515245 + 12345;
+            rnd[i] = (byte)((seed >> 16) & 255);
+        }
+        FrameRoundTrip(rnd, 5, "frame-random");
+        // 前段重复 + 后段随机的混合块。
+        for (int i = 0; i < 60000; i = i + 1) { rnd[i] = rnd[i % 100]; }
+        FrameRoundTrip(rnd, 9, "frame-mixed");
+        // 跨 4MB 分块边界。
+        byte[] big = Repeat(Encoding.GetBytes("0123456789"), 500000);
+        FrameRoundTrip(big, 5, "frame-5mb");
+        Check(Lz4Frame.Compress(big, 5).Length < 500000, "frame-5mb-ratio");
+        // 块级直测。
+        byte[] blk = Encoding.GetBytes("aaaaabbbbbcccccaaaaaabbbbbb");
+        byte[] be = Lz4Block.Encode(blk, 5);
+        byte[] bd = Lz4Block.Decode(be, 0, be.Length, 1024);
+        Check(bd != null && Same(blk, bd), "block-rt");
+        // 最短重叠（offset=1 RLE）：倍增展开路径。
+        byte[] rle = new byte[300];
+        for (int i = 0; i < 300; i = i + 1) { rle[i] = 65; }
+        byte[] re = Lz4Block.Encode(rle, 9);
+        byte[] rd = Lz4Block.Decode(re, 0, re.Length, 1024);
+        Check(rd != null && Same(rle, rd), "block-rle");
+        // 偏移/周期组合矩阵（重叠复制正确性全覆盖）。
+        bool matrixOk = true;
+        for (int unit = 1; unit <= 20; unit = unit + 1) {
+            byte[] src = new byte[unit * 40];
+            for (int i = 0; i < src.Length; i = i + 1) { src[i] = (byte)(i % unit + 33); }
+            byte[] e = Lz4Block.Encode(src, 9);
+            byte[] r = Lz4Block.Decode(e, 0, e.Length, 65536);
+            if (r == null || !Same(src, r)) { matrixOk = false; }
+        }
+        Check(matrixOk, "block-overlap-matrix");
+        // 级别 1..9 全部 roundtrip。
+        byte[] mid = Repeat(Encoding.GetBytes("zanyou"), 300);
+        bool levelsOk = true;
+        for (int lv = 1; lv <= 9; lv = lv + 1) {
+            byte[] c = Lz4Frame.Compress(mid, lv);
+            byte[] d2 = Lz4Frame.Decompress(c);
+            if (d2 == null || !Same(mid, d2)) { levelsOk = false; }
+        }
+        Check(levelsOk, "levels-1-9");
+        Check(Lz4Frame.Compress(mid, 5).Length < mid.Length / 3, "ratio");
+        // 截断防御：损坏帧返回 null 而非崩溃。
+        byte[] c1 = Lz4Frame.Compress(mid, 5);
+        byte[] cut = new byte[c1.Length - 3];
+        for (int i = 0; i < cut.Length; i = i + 1) { cut[i] = c1[i]; }
+        Check(Lz4Frame.Decompress(cut) == null, "truncated-null");
+        Check(Lz4Frame.Decompress(new byte[0]) == null, "empty-null");
+        // 上界公式（规范：n + n/255 + 16）。
+        Check(Lz4Block.UpperBound(1000) == 1000 + 1000 / 255 + 16, "upperbound");
+        if (bad == 0) { Console.WriteLine("lz4-roundtrip-done"); }
+    }
+}

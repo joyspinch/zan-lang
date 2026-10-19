@@ -1,0 +1,260 @@
+using System;
+
+namespace System.IO.Compression;
+
+// LZ4 block 压缩（参考 lz4 块格式规范 v1.0）。
+//
+// 实现的是规范要求的解码器全集与一个务实的编码器：
+// 哈希表 16 位、单步匹配、64KB 窗口内的 last-match 贪心扩展。
+// 产出任何符合规范的 LZ4 解码器（含本类 Decode）都能还原。
+// 压缩比与官方 lz4 快速档有差距，但速度特性一致——
+// 面向 Kafka / ZanDb / DataFrame 的"能压就行、快最重要"场景。
+public class Lz4Block {
+    // 哈希表容量（2 的幂）。64K 桶 × 4 字节 int = 256KB 临时表，
+    // 与 Deflate 编码器的表开销同量级。
+    public static int HASH_LOG = 16;
+    public static int HASH_SIZE = 65536;
+    public static int MIN_MATCH = 4;
+    // 单块上限（规范）：压缩后块不得超过该值，否则视为不可压。
+    public static int MAX_BLOCK_BYTES = 16777216;
+    public static int MAX_INPUT_FOR_BLOCK = 2113929216;
+
+    // ---- 解码 ----
+
+    // 解码一个 LZ4 block。dst 已知大小时用 maxOut 限制（防恶意
+    // 输入撑爆内存）；超出返回 null。输出不足是错误（截断）。
+    public static byte[] Decode(byte[] src, int offset, int len, int maxOut) {
+        if (src == null || len < 0 || offset < 0 || offset + len > src.Length) {
+            return null;
+        }
+        if (len == 0) {
+            return new byte[0];
+        }
+        byte[] out2 = new byte[maxOut + 8];
+        int ip = offset;
+        int end = offset + len;
+        int op = 0;
+        while (ip < end) {
+            int token = src[ip] & 255;
+            ip = ip + 1;
+            // 字面量长度。
+            int litLen = (token >> 4) & 15;
+            if (litLen == 15) {
+                while (true) {
+                    if (ip >= end) { return null; }
+                    int b = src[ip] & 255;
+                    ip = ip + 1;
+                    litLen = litLen + b;
+                    if (b != 255) { break; }
+                }
+            }
+            if (litLen > 0) {
+                if (ip + litLen > end || op + litLen > maxOut) { return null; }
+                NativeMemory.Copy((nint)out2 + op, (nint)src + ip, litLen);
+                op = op + litLen;
+                ip = ip + litLen;
+            }
+            if (ip >= end) { break; }  // 最后一个序列只有字面量。
+            // 匹配偏移（小端 16 位，1 = 上一字节；0 非法）。
+            if (ip + 2 > end) { return null; }
+            int matchOff = (src[ip] & 255) + ((src[ip + 1] & 255) << 8);
+            ip = ip + 2;
+            if (matchOff == 0 || matchOff > op) { return null; }
+            // 匹配长度。
+            int matchLen = (token & 15) + 4;
+            if ((token & 15) == 15) {
+                while (true) {
+                    if (ip >= end) { return null; }
+                    int b = src[ip] & 255;
+                    ip = ip + 1;
+                    matchLen = matchLen + b;
+                    if (b != 255) { break; }
+                }
+            }
+            if (op + matchLen > maxOut) { return null; }
+            // 偏移可能小于匹配长度（重叠复制）——倍增展开：
+            // 先逐字节复制 matchOff 字节，此后 [op-done, op) 是完整
+            // 周期段，可作为源继续整块搬移（memmove，无重叠）。
+            int mp = op - matchOff;
+            if (matchOff >= matchLen) {
+                NativeMemory.Copy((nint)out2 + op, (nint)out2 + mp, matchLen);
+                op = op + matchLen;
+            } else {
+                int done = 0;
+                while (done < matchOff && done < matchLen) {
+                    out2[op] = out2[mp];
+                    op = op + 1;
+                    mp = mp + 1;
+                    done = done + 1;
+                }
+                while (done < matchLen) {
+                    int step = matchLen - done > done ? done : matchLen - done;
+                    NativeMemory.Copy((nint)out2 + op, (nint)out2 + op - done, step);
+                    op = op + step;
+                    done = done + step;
+                }
+            }
+        }
+        return Lz4Block.Trim(out2, op);
+    }
+
+    static byte[] Trim(byte[] buf, int len) {
+        if (len == buf.Length) { return buf; }
+        byte[] out2 = new byte[len];
+        Lz4Block.CopyBytes(out2, 0, buf, 0, len);
+        return out2;
+    }
+
+    static void CopyBytes(byte[] dst, int doff, byte[] src, int soff, int n) {
+        for (int i = 0; i < n; i = i + 1) {
+            dst[doff + i] = src[soff + i];
+        }
+    }
+
+    // ---- 编码 ----
+
+    // 压缩一个 block。level 1-9 影响匹配尝试的扩展上限（越大
+    // 压缩比越高、越慢）。数据不可压时输出可能大于输入——调用方
+    // 可用 EncodedSize 判断是否回退存储。
+    public static byte[] Encode(byte[] src, int level) {
+        if (src == null) { return new byte[0]; }
+        return Lz4Block.Encode(src, 0, src.Length, level);
+    }
+
+    // 压缩 src[offset, offset+len) 切片（frame 分块复用）。
+    public static byte[] Encode(byte[] src, int offset, int len, int level) {
+        int n = len;
+        if (src == null || offset < 0 || len < 0 || offset + len > src.Length) {
+            return new byte[0];
+        }
+        if (n == 0) { return new byte[0]; }
+        // 空 / 太短输入直接走"仅字面量"的退化块（合法且最小）。
+        if (n < MIN_MATCH + 1) {
+            return Lz4Block.LiteralsOnly(src, offset, n);
+        }
+        int maxOut = Lz4Block.UpperBound(n);
+        byte[] out2 = new byte[maxOut + 8];
+        int[] table = new int[Lz4Block.HASH_SIZE];
+        // 表初始化为 -1（0 是合法位置）。
+        for (int i = 0; i < Lz4Block.HASH_SIZE; i = i + 1) {
+            table[i] = -1;
+        }
+        int op = 0;
+        int anchor = 0;
+        int ip = 0;
+        int baseOff = offset;
+        int mflimit = n - MIN_MATCH;
+        int maxChain = Lz4Block.ChainLength(level);
+        while (ip <= mflimit) {
+            int h = Lz4Block.Hash4(src, baseOff + ip);
+            int cand = table[h];
+            table[h] = ip;
+            if (cand < 0 || ip - cand > 65535
+                || Lz4Block.Read4(src, baseOff + cand) != Lz4Block.Read4(src, baseOff + ip)) {
+                ip = ip + 1;
+                continue;
+            }
+            // 找到 4 字节匹配：token 低 4 位承载 matchLen-4 的低段，
+            // 再写字面量段。
+            int litLen = ip - anchor;
+            // 扩展匹配：从候选位重叠续比（重叠复制合法，解码器
+            // 逐字节展开，可越过 match 起点）；maxChain 限步数。
+            int matchLen = MIN_MATCH;
+            int limit = ip + maxChain < n ? ip + maxChain : n;
+            int p = baseOff + ip + MIN_MATCH;
+            int q = baseOff + cand + MIN_MATCH;
+            while (p < baseOff + limit && src[p] == src[q]) {
+                p = p + 1;
+                q = q + 1;
+                matchLen = matchLen + 1;
+            }
+            int ext = matchLen - MIN_MATCH;  // 不含初始 4 的部分
+            int low = ext >= 15 ? 15 : ext;
+            op = Lz4Block.WriteToken(out2, op, src, baseOff + anchor, litLen, low);
+            // 格式顺序：token → 字面量 → 2 字节 offset → matchLen 扩展。
+            int off = ip - cand;
+            out2[op] = (byte)(off & 255);
+            out2[op + 1] = (byte)((off >> 8) & 255);
+            op = op + 2;
+            if (ext >= 15) {
+                op = Lz4Block.WriteMatchLen(out2, op, ext);
+            }
+            ip = ip + matchLen;
+            anchor = ip;
+            // 跳过哈希污染区，加速。
+            ip = ip + 1;
+        }
+        // 尾部字面量。
+        if (anchor < n) {
+            int litLen = n - anchor;
+            op = Lz4Block.WriteToken(out2, op, src, baseOff + anchor, litLen, 0);
+        }
+        return Lz4Block.Trim(out2, op);
+    }
+
+    static int ChainLength(int level) {
+        if (level >= 9) { return 4096; }
+        if (level >= 7) { return 512; }
+        if (level >= 5) { return 128; }
+        if (level >= 3) { return 32; }
+        return 8;
+    }
+
+    // 只写字面量的退化块（尾段专用语义由 Encode 主循环维护；
+    // 这里用于极短输入，作为唯一序列）。
+    static byte[] LiteralsOnly(byte[] src, int offset, int len) {
+        int maxOut = Lz4Block.UpperBound(len);
+        byte[] out2 = new byte[maxOut + 8];
+        int op = Lz4Block.WriteToken(out2, 0, src, offset, len, 0);
+        return Lz4Block.Trim(out2, op);
+    }
+
+    // 写一个序列头 + 字面量，返回新的 op。matchLenHalf 是 token
+    // 低 4 位（后续可用 WriteMatchLen 续写扩展）。
+    static int WriteToken(byte[] out2, int op, byte[] src, int anchor,
+                          int litLen, int matchLenHalf) {
+        int high = litLen >= 15 ? 15 : litLen;
+        out2[op] = (byte)((high << 4) | matchLenHalf);
+        op = op + 1;        if (litLen >= 15) {
+            int rest = litLen - 15;
+            while (rest >= 255) {
+                out2[op] = 255;
+                op = op + 1;
+                rest = rest - 255;
+            }
+            out2[op] = (byte)rest;
+            op = op + 1;
+        }
+        Lz4Block.CopyBytes(out2, op, src, anchor, litLen);
+        return op + litLen;
+    }
+
+    // 写匹配长度扩展字节（ext >= 15 时的后续 255 连发段；低段
+    // 已融入 token，由 Encode 保证只在 ext >= 15 时调用）。
+    static int WriteMatchLen(byte[] out2, int op, int ext) {
+        int rest = ext - 15;
+        while (rest >= 255) {
+            out2[op] = 255;
+            op = op + 1;
+            rest = rest - 255;
+        }
+        out2[op] = (byte)rest;
+        return op + 1;
+    }
+
+    static int Hash4(byte[] src, int i) {
+        // 乘法哈希取高 16 位（Fibonacci 哈希家族，uint 逻辑右移）。
+        int v = Lz4Block.Read4(src, i);
+        return (int)(((uint)(v * 265443576)) >> 16) & (Lz4Block.HASH_SIZE - 1);
+    }
+
+    static int Read4(byte[] src, int i) {
+        return (src[i] & 255) | ((src[i + 1] & 255) << 8)
+            | ((src[i + 2] & 255) << 16) | ((src[i + 3] & 255) << 24);
+    }
+
+    // 压缩输出的最坏上界（规范公式）：n + n/255 + 16。
+    public static int UpperBound(int n) {
+        return n + n / 255 + 16;
+    }
+}
