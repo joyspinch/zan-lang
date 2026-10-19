@@ -34,17 +34,37 @@ set(_srcs
   ${SELFHOST_DIR}/diag.zan
   ${SELFHOST_DIR}/parser.zan
   ${SELFHOST_DIR}/jsongen.zan
+  ${SELFHOST_DIR}/attrgen.zan
   ${SELFHOST_DIR}/dbgen.zan
   ${SELFHOST_DIR}/lexer.zan
+  ${SELFHOST_DIR}/ngen.zan
+  ${SELFHOST_DIR}/ngen_macho.zan
+  ${SELFHOST_DIR}/../selfhost_runtime/ngen_obj.zan
+  ${SELFHOST_DIR}/ngen_x86.zan
+  ${SELFHOST_DIR}/../selfhost_runtime/ngen_host.zan
+  ${SELFHOST_DIR}/ngen_numeric.zan
+  ${SELFHOST_DIR}/ngen_guard.zan
+  ${SELFHOST_DIR}/ngen_string.zan
+  ${SELFHOST_DIR}/ngen_layout.zan
+  ${SELFHOST_DIR}/ngen_conversion.zan
+  ${SELFHOST_DIR}/ngen_delegate.zan
+  ${SELFHOST_DIR}/ngen_binding.zan
+  ${SELFHOST_DIR}/nio.zan
   ${SELFHOST_DIR}/ast.zan
-  ${SELFHOST_DIR}/token.zan)
+  ${SELFHOST_DIR}/token.zan
+  ${SELFHOST_DIR}/ngen_async.zan
+  ${SELFHOST_DIR}/ngen_elf.zan
+  ${SELFHOST_DIR}/ngen_coff.zan
+  ${SELFHOST_DIR}/ngen_reflect.zan
+  ${SELFHOST_DIR}/lsp.zan
+  ${SELFHOST_DIR}/ngen_wasm.zan)
 
 # ---- gen0 -> gen1 ----
 list(GET _srcs 0 _first)
 set(_rest ${_srcs})
 list(REMOVE_AT _rest 0)
 execute_process(
-  COMMAND ${ZANC} ${_first} ${_rest} -o ${GEN1}
+  COMMAND ${ZANC} ${_first} ${_rest} --auto-stdlib -o ${GEN1}
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "gen0 -> gen1 failed (rc=${rc})\n${out}${err}")

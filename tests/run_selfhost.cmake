@@ -33,16 +33,36 @@ set(_srcs
   ${SELFHOST_DIR}/diag.zan
   ${SELFHOST_DIR}/parser.zan
   ${SELFHOST_DIR}/jsongen.zan
+  ${SELFHOST_DIR}/attrgen.zan
   ${SELFHOST_DIR}/dbgen.zan
   ${SELFHOST_DIR}/lexer.zan
+  ${SELFHOST_DIR}/ngen.zan
+  ${SELFHOST_DIR}/ngen_macho.zan
+  ${SELFHOST_DIR}/../selfhost_runtime/ngen_obj.zan
+  ${SELFHOST_DIR}/ngen_x86.zan
+  ${SELFHOST_DIR}/../selfhost_runtime/ngen_host.zan
+  ${SELFHOST_DIR}/ngen_numeric.zan
+  ${SELFHOST_DIR}/ngen_guard.zan
+  ${SELFHOST_DIR}/ngen_string.zan
+  ${SELFHOST_DIR}/ngen_layout.zan
+  ${SELFHOST_DIR}/ngen_conversion.zan
+  ${SELFHOST_DIR}/ngen_delegate.zan
+  ${SELFHOST_DIR}/ngen_binding.zan
+  ${SELFHOST_DIR}/nio.zan
   ${SELFHOST_DIR}/ast.zan
-  ${SELFHOST_DIR}/token.zan)
+  ${SELFHOST_DIR}/token.zan
+  ${SELFHOST_DIR}/ngen_async.zan
+  ${SELFHOST_DIR}/ngen_elf.zan
+  ${SELFHOST_DIR}/ngen_coff.zan
+  ${SELFHOST_DIR}/ngen_reflect.zan
+  ${SELFHOST_DIR}/lsp.zan
+  ${SELFHOST_DIR}/ngen_wasm.zan)
 
 # ---- Stage 1: build gen1 (the self-hosted compiler) with the C host ----
 list(GET _srcs 0 _first)
 list(REMOVE_AT _srcs 0)
 execute_process(
-  COMMAND ${ZANC} ${_first} ${_srcs} -o ${GEN1}
+  COMMAND ${ZANC} ${_first} ${_srcs} --auto-stdlib -o ${GEN1}
   RESULT_VARIABLE build_rc
   OUTPUT_VARIABLE build_out
   ERROR_VARIABLE  build_err)
