@@ -60,6 +60,43 @@
 - ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
   差分门的 `diff_known_gaps.txt` 也要同步。
 
+### [ ] A386 自举闭包按值快照捕获——局部变量后续的写入在闭包里看不见（C# 语义应按引用捕获）
+
+- 现象（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_by_ref.zan`）：
+  同一个程序，C 宿主输出 `2` / `10`，自举编译器（gen1）输出 `1` / `10`：
+  ```zan
+  int x = 1;
+  Func<int> f = () => x;   // 闭包捕获 x
+  x = 2;                   // 捕获之后再写
+  Console.WriteLine(f());  // C 宿主 2（按引用），自举 1（按值快照）
+  ```
+- 根因：两套捕获模型不同。
+  - C 宿主（`src/compiler/irgen_expr.c`）：局部变量**被闭包捕获且在函数体内被写过**
+    就装箱成堆上的 cell（`local_is_lambda_captured` + `body_writes_ident_memo`，
+    `irgen_expr.c:11812`），闭包记录里存的是 **cell 指针**，读写都穿过 cell
+    → 闭包看到后续的写入（C# 语义）。循环变量额外按**每次迭代独立快照**
+    （`per_iteration`，`irgen_stmt.c:1826`；取值时复制一份新 cell，
+    `irgen_expr.c:11509`），所以 `for` 捕获仍是 0,1,2 而不是 0,3,3。
+  - 自举 IR 后端（`src/selfhost/irgen_expr.zan` 的 `GenLambda`/`CollectCaptures`）：
+    建闭包时把捕获变量的**当前值**快照进 malloc 出来的 env 数组（每个槽一个 i64），
+    闭包体入口再把值搬进自己的局部槽。**全程没有 cell**，所以捕获之后再写局部变量，
+    闭包看不见 → 与 C 宿主分叉。
+- 现状处理：已登记为差分门已知缺口（`tests/selfhost/diff_known_gaps.txt`
+  的 `closure_capture_by_ref`），门会持续报出来，不会静默漂移。
+  ⚠ 顺带注意：自举的 env 槽是 i64 一个槽，**宽于 8 字节的捕获值（struct）会被截断**，
+  修捕获模型时要一并把 env 改成按类型分槽。
+- 方向：按 C 宿主的模型重做自举的捕获：
+  1. 函数体生成前做一遍**预扫描**（C 宿主是 `local_is_lambda_captured`）：算出
+     "被本函数内 lambda 捕获 ∧ 在本函数体内被写过"的局部变量集合；
+  2. 这些局部变量改成**堆 cell**（alloca 存 cell 指针，读写都多一层解引用），
+     未被写过的仍按值快照（与 C 宿主一致，语义等价但更省）；
+  3. 闭包 env 存 cell 指针（而不是值），闭包体按 cell 读写；
+  4. `for`/循环变量保留"每次迭代独立快照"（当前按值快照的形态恰好等价，
+     但改成 cell 后必须显式做 per-iter 复制，否则会退化成 0,3,3）。
+- ⚠ 改捕获会动到**所有**局部变量的读写路径（`GenIdent` 的 load、`StoreTo` 的 store），
+  风险面大；改完必须重跑 `selfhost_fixed_point`（gen2/g3 都要过）与差分门，
+  并把 `closure_capture_by_ref` 从 `diff_known_gaps.txt` 删掉。
+
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，

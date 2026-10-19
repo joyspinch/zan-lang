@@ -1991,6 +1991,37 @@ partial class Irgen {
         return s;
     }
 
+    // A closure value is the closure record address with the closure tag
+    // (bit0 = 1) set, the same convention the C host uses: the tag tells a
+    // heap closure apart from a bare native function pointer (an nint cast
+    // to a delegate), which is called without the record.
+    string TagClosure(string rec) {
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + rec + " to i64");
+        string tv = NT();
+        L("  " + tv + " = or i64 " + iv + ", 1");
+        string tp = NT();
+        L("  " + tp + " = inttoptr i64 " + tv + " to i8*");
+        return tp;
+    }
+    // strip the closure tag: the record address is the closure value minus one
+    string UntagClosure(string v) {
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + v + " to i64");
+        string uv = NT();
+        L("  " + uv + " = and i64 " + iv + ", -2");
+        string up = NT();
+        L("  " + up + " = inttoptr i64 " + uv + " to i8*");
+        return up;
+    }
+    // a method group is a module-level { fn, null } record; the delegate value
+    // is that record with the closure tag set
+    string MgClosureValue(string gname) {
+        string rec = NT();
+        L("  " + rec + " = bitcast [2 x i8*]* " + gname + " to i8*");
+        return TagClosure(rec);
+    }
+
     Node DelegTypeOf(Node retTy, List<Node> pt) {
         Node d = new Node(AK.TypeRef());
         int i = 0;
@@ -2073,7 +2104,7 @@ partial class Irgen {
         // one shared closure per target so delegate equality (e.g. `-=`
         // removal) sees the same value for repeated method-group mentions
         if (IndexOfStr(mgTargets, target) >= 0) {
-            return new ExprVal("bitcast ([2 x i8*]* " + gname + " to i8*)", DelegTypeOf(retTy, pt));
+            return new ExprVal(MgClosureValue(gname), DelegTypeOf(retTy, pt));
         }
         mgTargets.Add(target);
         string sig = "define " + rt + " " + fname + "(i8* %env";
@@ -2099,7 +2130,7 @@ partial class Irgen {
         deferred.Append("}\n");
         deferred.Append(gname + " = global [2 x i8*] [i8* bitcast ("
             + LamFnType(retTy, pt) + " " + fname + " to i8*), i8* null]\n");
-        return new ExprVal("bitcast ([2 x i8*]* " + gname + " to i8*)", DelegTypeOf(retTy, pt));
+        return new ExprVal(MgClosureValue(gname), DelegTypeOf(retTy, pt));
     }
 
     ExprVal GenLambda(Node lam) {
@@ -2253,7 +2284,8 @@ partial class Irgen {
         string clop1 = NT();
         L("  " + clop1 + " = getelementptr i8*, i8** " + clop + ", i64 1");
         L("  store i8* " + env + ", i8** " + clop1);
-        return new ExprVal(clo, DelegTypeOf(retTy, pt));
+        // the delegate value is the tagged record, not the bare record address
+        return new ExprVal(TagClosure(clo), DelegTypeOf(retTy, pt));
     }
 
     // invoke a closure value:  f(args) -> load {fn,env}, bitcast fn, call fn(env, args)
@@ -2276,8 +2308,11 @@ partial class Irgen {
         // phi 会把前驱块记成旧块（LLVM: PHI node entries do not match
         // predecessors）。
         Label(lClo);
+        // the closure value is the tagged record: strip the tag before
+        // reading the { fn, env } slots
+        string rec = UntagClosure(clo.op);
         string clop = NT();
-        L("  " + clop + " = bitcast i8* " + clo.op + " to i8**");
+        L("  " + clop + " = bitcast i8* " + rec + " to i8**");
         string fni8 = NT();
         L("  " + fni8 + " = load i8*, i8** " + clop);
         string envp = NT();
@@ -2937,8 +2972,9 @@ partial class Irgen {
             if (i > 0) { args = args + ", "; }
             if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(pty)) {
                 // extern C fn-pointer parameter: pass the closure's code pointer
+                string cprec = UntagClosure(av.op);
                 string cp = NT();
-                L("  " + cp + " = bitcast i8* " + av.op + " to i8**");
+                L("  " + cp + " = bitcast i8* " + cprec + " to i8**");
                 string fp = NT();
                 L("  " + fp + " = load i8*, i8** " + cp);
                 args = args + "i8* " + fp;
@@ -2973,7 +3009,7 @@ partial class Irgen {
             string isn = NT();
             L("  " + isn + " = icmp eq i8* " + t + ", null");
             string res = NT();
-            L("  " + res + " = select i1 " + isn + ", i8* null, i8* " + clo);
+            L("  " + res + " = select i1 " + isn + ", i8* null, i8* " + TagClosure(clo));
             return new ExprVal(res, m.type);
         }
         if (isAsyncCall) { Node tt = MkType("__task"); tt.a = m.type; return new ExprVal(t, tt); }

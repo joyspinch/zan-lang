@@ -175,6 +175,12 @@ links, runs the programs and compares stdout with the C host's golden file.
   so the program printed nothing), and values that live across an `await` inside
   a `foreach` (the collection, the loop counter, the element variable) were kept
   in stack allocas that a resume re-creates — the loop restarted from zero.
+- A third round (2026-10-20) fixed the **closure value ABI**: the self-hosted
+  backend built closure records without the closure tag (bit 0) while its own
+  call site discriminated a heap closure from a bare native function pointer by
+  that very bit — so the record address was called as code and the program died
+  with an access violation. Producer and consumer now agree on the tag, the same
+  convention the C host uses (`rec | 1`).
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR
@@ -197,6 +203,13 @@ links, runs the programs and compares stdout with the C host's golden file.
   (`case Dog d`, `case string s`) therefore cannot be decided at runtime: the
   self-hosted compiler now **refuses to compile it** with an explicit diagnostic
   instead of silently never matching. Tracked in `TASKS.md`.
+- **Closure capture is by value in the self-hosted backend.** The C host boxes a
+  local that is captured by a closure and written in the same function, so the
+  closure observes later writes (C# semantics); the self-hosted backend snapshots
+  the value when the closure is built, so a write after the capture is invisible
+  to the closure. Loop variables match (each iteration captures its own value).
+  Tracked in `TASKS.md` (A386) with the differential-gate case
+  `tests/conformance/closure_capture_by_ref.zan`.
 - **Language coverage.** The self-hosted compiler covers substantially more of
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/

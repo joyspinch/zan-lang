@@ -4,7 +4,7 @@
 固定点门（`ctest -R selfhost_fixed_point`）断言 **gen2 与 gen3 的 LLVM IR 文本逐字节相同**——
 这是自举后端对自己的不动点证明，比"gen1 能编出像样的 IR"强得多。
 
-本文记录闭环会塌的四个坑，每个都是"改一处、门红一次"换来的。
+本文记录闭环会塌的若干坑，每个都是"改一处、门红一次"换来的。
 
 ## 0. 单一源清单
 
@@ -154,3 +154,42 @@ kernel32、shell32、user32、advapi32、version）。
   LNK2019。
 - 边界：弱定义仍会被发行版运行时的强定义盖掉（那是有意的），但自举产出的程序
   目前**不能**与发行版 mt 运行时混用（帧布局不同，见 TASKS A385）。
+
+## 12. 闭包值必须带标签：生产侧与消费侧必须同一套约定
+
+- 动作：闭包值 = **闭包记录地址 | 1**（bit0 = 1），与 C 宿主同约定
+  （`src/compiler/irgen_arc.c:51` 的 `emit_closure_is_tagged`）。
+  自举里**建**闭包的地方（`GenLambda` 的堆记录、方法组的 `{fn,null}` 全局、
+  extern 返回裸函数指针后的再包装）一律打标签；**用**闭包的地方
+  （`EmitDelegateCall` 取 `{fn,env}`、extern 传参取代码指针）一律先
+  `and i64 %iv, -2` 脱标签再取字段。
+- 理由（2026-10-20 差分门实测）：自举原来**生产侧不打标签、消费侧按标签判别**
+  ——闭包记录地址被当成裸函数指针直接 `call`，于是 pc 落在数据地址上，
+  表现为 0xC0000005（ASAN: "UNKNOWN memory access"，pc=数据地址）。
+  判别位是必需的：`(Delegate)nint`（`stdlib/System/Interop.zan` 的
+  `(GetEnvironmentVariableWFn)fn`）产生的是**没有标签的裸原生函数指针**，
+  调用侧要靠标签区分"堆闭包"与"裸函数指针"，后者按声明形参直接调、不带 env。
+- 连带：extern 形参是 delegate 时要的是**代码地址**，必须先脱标签再取
+  `rec[0]`，否则会把 `rec|1` 当指针解引用。
+- 边界：C 宿主的记录布局是 `{fn, dtor, target, cap0..capN, [this]}`
+  （`irgen_expr.c:12150`），自举现在是 `{fn, env}`——同一程序内自洽即可，
+  但两边**不是二进制兼容**的；真要对齐见 §13。
+
+## 13. 捕获语义：被写过的局部变量必须装箱（按引用捕获）
+
+- 动作：局部变量**被本函数内的闭包捕获**且**在本函数体内被写过**时，
+  必须装箱成堆上的 cell，闭包记录里存 **cell 指针**，读写都穿过 cell
+  （C# 语义：闭包看到捕获之后的写入）。没被写过的可以按值快照
+  （语义等价，更省）。循环变量额外按**每次迭代独立快照**（per-iteration），
+  所以 `for` 里捕获仍是 0,1,2 而不是 0,3,3。
+- 理由（2026-10-20 差分门实测，新用例 `tests/conformance/closure_capture_by_ref.zan`）：
+  自举原来在建闭包时把捕获变量的**当前值**快照进 env 数组，全程没有 cell →
+  捕获之后再写局部变量，闭包看不见（C 宿主输出 2，自举输出 1）。
+  C 宿主的判定在 `irgen_expr.c:11812`（`local_is_lambda_captured` +
+  `body_writes_ident_memo`），per-iteration 标记在 `irgen_stmt.c:1826`。
+- 连带：自举的 env 槽现在是**每个捕获一个 i64**，宽于 8 字节的捕获值
+  （struct）会被截断——重做捕获模型时要一并改成按类型分槽。
+- 边界：这条动的是**所有**局部变量的读写路径（`GenIdent` 的 load、
+  `StoreTo` 的 store），风险面大；改完必须重跑 `selfhost_fixed_point`
+  与差分门，并把 `closure_capture_by_ref` 从 `diff_known_gaps.txt` 删掉。
+  进展见 TASKS A386。
