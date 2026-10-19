@@ -1,0 +1,93 @@
+// Prometheus 文本 exposition（text/plain; version=0.0.4）：
+// HELP/TYPE 头、counter/gauge/histogram 输出、累计桶语义、
+// 标签值转义（反斜杠、双引号、换行）、非法 metric 名清洗、
+
+using System;
+using System.Diagnostics;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+        else { Console.WriteLine("ok " + label); }
+    }
+
+    static bool Has(string hay, string needle) {
+        return hay.IndexOf(needle) >= 0;
+    }
+
+
+    static string TrickyValue() {
+        return "a" + Encoding.CharFromCode(34) + "b"
+            + Encoding.CharFromCode(92) + "c"
+            + Encoding.CharFromCode(10) + "d";
+    }
+
+    static void Main() {
+        Prometheus p = new Prometheus();
+        // counter：无标签。
+        p.CounterInc("http_requests_total", "Total HTTP requests.", 5);
+        p.CounterInc("http_requests_total", "", 3);
+        // counter：带标签。
+        List<string> mk = new List<string>();
+        List<string> mv = new List<string>();
+        mk.Add("method"); mv.Add("GET");
+        p.CounterIncLabeled("http_requests_total", "", 10, mk, mv);
+        List<string> mk2 = new List<string>();
+        List<string> mv2 = new List<string>();
+        mk2.Add("method"); mv2.Add("POST");
+        p.CounterIncLabeled("http_requests_total", "", 2, mk2, mv2);
+        // gauge。
+        p.GaugeSet("heap_bytes", "Current heap size in bytes.", 1048576);
+        // histogram。
+        List<double> edges = new List<double>();
+        edges.Add(10); edges.Add(50); edges.Add(100);
+        List<string> hk = new List<string>();
+        List<string> hv = new List<string>();
+        hk.Add("route"); hv.Add("/api");
+        p.HistogramObserve("latency_us", "Latency in microseconds.", edges, hk, hv, 7);
+        p.HistogramObserve("latency_us", "", edges, hk, hv, 80);
+        p.HistogramObserve("latency_us", "", edges, hk, hv, 500);
+        string s = p.Snapshot();
+        Console.WriteLine("---");
+        Console.Write(s);
+        Console.WriteLine("---");
+        Check(Has(s, "# HELP http_requests_total Total HTTP requests."), "help");
+        Check(Has(s, "# TYPE http_requests_total counter"), "type-counter");
+        Check(Has(s, "http_requests_total 8"), "counter-sum");
+        Check(Has(s, "http_requests_total{method=\"GET\"} 10"), "counter-label-get");
+        Check(Has(s, "http_requests_total{method=\"POST\"} 2"), "counter-label-post");
+        Check(Has(s, "# TYPE heap_bytes gauge"), "type-gauge");
+        Check(Has(s, "heap_bytes 1048576"), "gauge-int-nodot");
+        Check(Has(s, "# TYPE latency_us histogram"), "type-hist");
+        Check(Has(s, "latency_us_bucket{le=\"10\",route=\"/api\"} 1"), "hist-b1");
+        Check(Has(s, "latency_us_bucket{le=\"50\",route=\"/api\"} 2"), "hist-b2");
+        Check(Has(s, "latency_us_bucket{le=\"100\",route=\"/api\"} 4"), "hist-b3");
+        Check(Has(s, "latency_us_bucket{le=\"+Inf\",route=\"/api\"} 3"), "hist-inf");
+        Check(Has(s, "latency_us_sum{route=\"/api\"} 587"), "hist-sum");
+        Check(Has(s, "latency_us_count{route=\"/api\"} 3"), "hist-count");
+        // 标签值转义。
+        Prometheus p2 = new Prometheus();
+        List<string> ek = new List<string>();
+        List<string> ev = new List<string>();
+        ek.Add("path"); ev.Add(TrickyValue());
+        p2.GaugeSetLabeled("esc_probe", "", 1, ek, ev);
+        string s2 = p2.Snapshot();
+        Check(Has(s2, "esc_probe{path=\"a\\\"b\\\\c\\nd\"} 1"), "escape");
+        // 非法名清洗。
+        Prometheus p3 = new Prometheus();
+        p3.GaugeSet("9bad-name!", "", 42);
+        string s3 = p3.Snapshot();
+        Check(Has(s3, "badname 42"), "clean-name");
+        // 名称清洗具体形状：9 开头被剔、- 与 ! 被剔。
+        Console.Write(s3);
+        // NaN/Inf 格式化。
+        Check(Prometheus.FormatValue(1.0 / 0.0 - 1.0 / 0.0) == "NaN", "fmt-nan");
+        Check(Prometheus.FormatValue(42) == "42", "fmt-int");
+        // 空 registry 输出空。
+        Prometheus p4 = new Prometheus();
+        Check(p4.Snapshot().Length == 0, "empty-registry");
+        if (bad == 0) { Console.WriteLine("prometheus-done"); }
+    }
+}

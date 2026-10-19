@@ -1,0 +1,320 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Diagnostics;
+
+// Prometheus 文本 exposition 格式导出器（Prometheus data model 的
+// text/plain; version=0.0.4，即 /metrics 端点的标准格式）。
+//
+// 稀疏核心：Counter/Gauge/Histogram 三种基础类型 + 按标签集的
+// 键控索引，覆盖 prometheus-net 与 prometheus-client 各语言库的
+// 主干用法（Prometheus 官方 client 亦以此三类为基）。Snapshot()
+// 输出规范文本：# HELP/# TYPE 头、带 label 的样本行、histogram
+// 的 _bucket{le=...}/_sum/_count 全家。标签值转义（反斜杠、
+// 双引号、换行）按规范处理；metric 名与标签名校验只保留
+// [a-zA-Z_:][a-zA-Z0-9_:]*（不合法字符在注册时丢弃，防注入
+// exposition 流）。
+public class Prometheus {
+    // counter/gauge/histogram 样本：名字 + 标签集（键控结构，一对
+    // List 平行存储标签键值——标签数固定为创建时给定，不是业务记录）。
+    public class Sample {
+        public string name;
+        public List<string> labelKeys;
+        public List<string> labelValues;
+        public double value;
+        // histogram 专用：桶上沿（不含 +Inf；输出时补最后一桶）与计数/和。
+        public List<double> bucketEdges;
+        public List<long> bucketCounts;
+        public long hCount;
+        public double hSum;
+    }
+
+    List<Sample> metrics;
+    Dictionary<string, Sample> idx;  // name + '{' + 标签串 -> 样本
+    // HELP 文本：metric 名 -> 说明（首个注册者生效）。
+    Dictionary<string, string> help;
+    // TYPE：metric 名 -> "counter"/"gauge"/"histogram"。
+    Dictionary<string, string> types;
+
+    public Prometheus() {
+        this.metrics = new List<Sample>();
+        this.idx = new Dictionary<string, Sample>();
+        this.help = new Dictionary<string, string>();
+        this.types = new Dictionary<string, string>();
+    }
+
+    // ---- 名称与标签合法性 ----
+
+    // metric 名首字符 [a-zA-Z_:]，后续 [a-zA-Z0-9_:]；不合法字符剔除。
+    public static string CleanName(string name) {
+        if (name == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int n = name.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = name[i] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+                || c == 95 || c == 58 || (i > 0 && c >= 48 && c <= 57);
+            if (ok) {
+                sb.Append(name.Substring(i, 1));
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 标签名首字符 [a-zA-Z_]，后续 [a-zA-Z0-9_]。
+    public static string CleanLabel(string name) {
+        if (name == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int n = name.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = name[i] & 255;
+            bool ok = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+                || (i > 0 && c >= 48 && c <= 57);
+            if (ok) {
+                sb.Append(name.Substring(i, 1));
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 标签值转义：\ " \n 三字符按规范。
+    public static string EscapeValue(string v) {
+        if (v == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int n = v.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int c = v[i] & 255;
+            if (c == 92) { sb.Append("\\\\"); }
+            else if (c == 34) { sb.Append("\\\""); }
+            else if (c == 10) { sb.Append("\\n"); }
+            else { sb.Append(v.Substring(i, 1)); }
+        }
+        return sb.ToString();
+    }
+
+    // 数值格式化：整数不带小数点，其余 double.ToString；NaN/Inf
+    // 按规范输出 NaN/+Inf/-Inf（NaN: v!=v；无穷: v-v!=0，与
+    // JsonValue.NumText 同一判定惯例）。
+    public static string FormatValue(double v) {
+        if (v != v) { return "NaN"; }
+        if (v - v != 0) {
+            return v > 0 ? "+Inf" : "-Inf";
+        }
+        if (v == (long)v && v >= -9007199254740992 && v <= 9007199254740992) {
+            return Convert.ToString((long)v);
+        }
+        return Convert.ToString(v);
+    }
+
+    string Key(string name, List<string> keys, List<string> values) {
+        if (keys == null || keys.Count == 0) { return name; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append(name);
+        sb.Append("{");
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(keys[i]);
+            sb.Append("=");
+            sb.Append(values[i]);
+        }
+        sb.Append("}");
+        return sb.ToString();
+    }
+
+    // ---- 注册与写入 ----
+
+    // 注册 HELP/TYPE（首个注册者生效；同名不同类型忽略后者）。
+    void Declare(string name, string type, string helpText) {
+        if (!this.types.ContainsKey(name)) {
+            this.types.Add(name, type);
+            if (helpText != null && helpText.Length > 0) {
+                this.help.Add(name, helpText);
+            }
+        }
+    }
+
+    Sample FindOrCreate(string rawName, string type, string helpText,
+                       List<string> labelKeys, List<string> labelValues) {
+        string name = Prometheus.CleanName(rawName);
+        if (name.Length == 0) { return null; }
+        List<string> ck = new List<string>();
+        List<string> cv = new List<string>();
+        if (labelKeys != null) {
+            for (int i = 0; i < labelKeys.Count; i = i + 1) {
+                string k = Prometheus.CleanLabel(labelKeys[i]);
+                if (k.Length == 0) { continue; }
+                ck.Add(k);
+                cv.Add(i < labelValues.Count ? labelValues[i] : "");
+            }
+        }
+        string key = this.Key(name, ck, cv);
+        Sample s = null;
+        if (!this.idx.TryGetValue(key, out s)) {
+            s = new Sample();
+            s.name = name;
+            s.labelKeys = ck;
+            s.labelValues = cv;
+            s.value = 0;
+            this.metrics.Add(s);
+            this.idx.Add(key, s);
+        }
+        this.Declare(name, type, helpText);
+        return s;
+    }
+
+    // 计数器：只增不减（调用方自己维护增量语义）。
+    public void CounterInc(string name, string helpText, double delta) {
+        this.CounterIncLabeled(name, helpText, delta, null, null);
+    }
+
+    public void CounterIncLabeled(string name, string helpText, double delta,
+                                  List<string> labelKeys, List<string> labelValues) {
+        Sample s = this.FindOrCreate(name, "counter", helpText, labelKeys, labelValues);
+        if (s == null) { return; }
+        s.value = s.value + delta;
+    }
+
+    // 仪表：直接设值。
+    public void GaugeSet(string name, string helpText, double value) {
+        this.GaugeSetLabeled(name, helpText, value, null, null);
+    }
+
+    public void GaugeSetLabeled(string name, string helpText, double value,
+                                List<string> labelKeys, List<string> labelValues) {
+        Sample s = this.FindOrCreate(name, "gauge", helpText, labelKeys, labelValues);
+        if (s == null) { return; }
+        s.value = value;
+    }
+
+    // 直方图：edges 升序桶上沿（如 10/50/100/500/1000，单位自定）。
+    // 观测值落入首个 >= 值的桶；sum/count 同步累计。同一样本重复
+    // 调用即累计语义（与 prometheus client 的 Observe 一致）。
+    public void HistogramObserve(string name, string helpText, List<double> edges,
+                                 List<string> labelKeys, List<string> labelValues,
+                                 double v) {
+        Sample s = this.FindOrCreate(name, "histogram", helpText, labelKeys, labelValues);
+        if (s == null) { return; }
+        if (s.bucketEdges == null) {
+            s.bucketEdges = new List<double>();
+            s.bucketCounts = new List<long>();
+            for (int i = 0; i < edges.Count; i = i + 1) {
+                s.bucketEdges.Add(edges[i]);
+                s.bucketCounts.Add(0);
+            }
+        }
+        s.hCount = s.hCount + 1;
+        s.hSum = s.hSum + v;
+        for (int i = 0; i < s.bucketEdges.Count; i = i + 1) {
+            if (v <= s.bucketEdges[i]) {
+                s.bucketCounts[i] = s.bucketCounts[i] + 1;
+            }
+        }
+    }
+
+    // ---- 输出 ----
+
+    // 生成 text/plain; version=0.0.4 全量文本。输出顺序：按注册
+    // 顺序，同 metric 名的所有样本连排；每个 metric 名先输出
+    // # HELP/# TYPE。直方图补 +Inf 桶与 _sum/_count。
+    public string Snapshot() {
+        StringBuilder sb = new StringBuilder();
+        string curName = null;
+        bool declared = false;
+        for (int i = 0; i < this.metrics.Count; i = i + 1) {
+            Sample s = this.metrics[i];
+            if (s.name != curName) {
+                curName = s.name;
+                declared = false;
+            }
+            if (!declared) {
+                string h = null;
+                string t = null;
+                if (this.help.TryGetValue(s.name, out h)) {
+                    sb.Append("# HELP ");
+                    sb.Append(s.name);
+                    sb.Append(" ");
+                    sb.Append(h.Replace("\n", " "));
+                    sb.Append("\n");
+                }
+                if (this.types.TryGetValue(s.name, out t)) {
+                    sb.Append("# TYPE ");
+                    sb.Append(s.name);
+                    sb.Append(" ");
+                    sb.Append(t);
+                    sb.Append("\n");
+                }
+                declared = true;
+            }
+            if (s.bucketEdges != null) {
+                // histogram：_bucket{le="..."} 全家。bucket 行的 '}' 由
+                // AppendLabels(braceOpen=true) 收尾，这里不再补。
+                long cum = 0;
+                for (int b = 0; b < s.bucketEdges.Count; b = b + 1) {
+                    cum = cum + s.bucketCounts[b];
+                    sb.Append(s.name);
+                    sb.Append("_bucket{le=\"");
+                    sb.Append(Prometheus.FormatValue(s.bucketEdges[b]));
+                    sb.Append("\"");
+                    this.AppendLabels(sb, s, true);
+                    sb.Append(" ");
+                    sb.Append(Prometheus.FormatValue(cum));
+                    sb.Append("\n");
+                }
+                sb.Append(s.name);
+                sb.Append("_bucket{le=\"+Inf\"");
+                this.AppendLabels(sb, s, true);
+                sb.Append(" ");
+                sb.Append(Prometheus.FormatValue(s.hCount));
+                sb.Append("\n");
+                sb.Append(s.name);
+                sb.Append("_sum");
+                this.AppendLabels(sb, s, false);
+                sb.Append(" ");
+                sb.Append(Prometheus.FormatValue(s.hSum));
+                sb.Append("\n");
+                sb.Append(s.name);
+                sb.Append("_count");
+                this.AppendLabels(sb, s, false);
+                sb.Append(" ");
+                sb.Append(Prometheus.FormatValue(s.hCount));
+                sb.Append("\n");
+            } else {
+                sb.Append(s.name);
+                this.AppendLabels(sb, s, false);
+                sb.Append(" ");
+                sb.Append(Prometheus.FormatValue(s.value));
+                sb.Append("\n");
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 追加标签集。braceOpen：bucket 行已写 'le="..."' 且开了 '{'，
+    // 直接续逗号；否则（无标签）不开括号，有标签则新开。
+    void AppendLabels(StringBuilder sb, Sample s, bool braceOpen) {
+        if (s.labelKeys.Count == 0) {
+            if (braceOpen) { sb.Append("}"); }
+            return;
+        }
+        if (braceOpen) {
+            for (int i = 0; i < s.labelKeys.Count; i = i + 1) {
+                sb.Append(",");
+                sb.Append(s.labelKeys[i]);
+                sb.Append("=\"");
+                sb.Append(Prometheus.EscapeValue(s.labelValues[i]));
+                sb.Append("\"");
+            }
+            sb.Append("}");
+            return;
+        }
+        sb.Append("{");
+        for (int i = 0; i < s.labelKeys.Count; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append(s.labelKeys[i]);
+            sb.Append("=\"");
+            sb.Append(Prometheus.EscapeValue(s.labelValues[i]));
+            sb.Append("\"");
+        }
+        sb.Append("}");
+    }
+}
