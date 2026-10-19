@@ -57,11 +57,8 @@ gate_check_conflict_markers() {
             > "$_ZAN_GATE_TMP/markers" 2>/dev/null || true
         _gcm_label="staged content"
     else
-        while IFS= read -r _gcm_c; do
-            [ -n "$_gcm_c" ] || continue
-            git grep -IlnE -e '^(<{7}( |$)|\|{7}( |$)|>{7}( |$))' \
-                "$_gcm_c" -- >> "$_ZAN_GATE_TMP/markers" 2>/dev/null || true
-        done < "$_ZAN_GATE_TMP/commits"
+        xargs -r -n 50 git grep -IlnE -e '^(<{7}( |$)|\|{7}( |$)|>{7}( |$))' -- \
+            < "$_ZAN_GATE_TMP/commits" >> "$_ZAN_GATE_TMP/markers" 2>/dev/null || true
         _gcm_label="commits being pushed"
     fi
     if [ -s "$_ZAN_GATE_TMP/markers" ]; then
@@ -98,17 +95,25 @@ gate_check_blob_size() {
         done >> "$_ZAN_GATE_TMP/bigblobs"
         _gbs_label="staged"
     else
-        while IFS= read -r _gbs_c; do
-            [ -n "$_gbs_c" ] || continue
-            git diff-tree --no-commit-id --name-only -r -z "$_gbs_c" |
-            while IFS= read -r -d '' _gbs_p; do
-                _gbs_sz="$(git cat-file -s "$_gbs_c:$_gbs_p" 2>/dev/null)" || continue
-                [ -n "$_gbs_sz" ] || continue
-                if [ "$_gbs_sz" -gt "$GATE_MAX_BLOB_BYTES" ]; then
-                    printf '%s %s\n' "$_gbs_sz" "$_gbs_p"
-                fi
-            done
-        done < "$_ZAN_GATE_TMP/commits" >> "$_ZAN_GATE_TMP/bigblobs"
+        _gbs_remote="$2"
+        _gbs_local="$3"
+        if [ -n "$_gbs_remote" ] && [ -n "$_gbs_local" ] && [ "$_gbs_remote" != "0000000000000000000000000000000000000000" ]; then
+            git rev-list --objects "$_gbs_remote..$_gbs_local" 2>/dev/null |
+            git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname) %(rest)' 2>/dev/null |
+            awk -v max="$GATE_MAX_BLOB_BYTES" '$1 == "blob" && $2 > max { printf "%s %s\n", $2, $4 }' >> "$_ZAN_GATE_TMP/bigblobs"
+        else
+            while IFS= read -r _gbs_c; do
+                [ -n "$_gbs_c" ] || continue
+                git diff-tree --no-commit-id --name-only -r -z "$_gbs_c" |
+                while IFS= read -r -d '' _gbs_p; do
+                    _gbs_sz="$(git cat-file -s "$_gbs_c:$_gbs_p" 2>/dev/null)" || continue
+                    [ -n "$_gbs_sz" ] || continue
+                    if [ "$_gbs_sz" -gt "$GATE_MAX_BLOB_BYTES" ]; then
+                        printf '%s %s\n' "$_gbs_sz" "$_gbs_p"
+                    fi
+                done
+            done < "$_ZAN_GATE_TMP/commits" >> "$_ZAN_GATE_TMP/bigblobs"
+        fi
         _gbs_label="pushed"
     fi
     if [ -s "$_ZAN_GATE_TMP/bigblobs" ]; then
