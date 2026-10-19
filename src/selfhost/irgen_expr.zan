@@ -3658,7 +3658,139 @@ partial class Irgen {
             L("  call void @zlist_clear(i8* " + recv.op + ")");
             return new ExprVal("0", MkType("void"));
         }
+        if (name == "AddRange" && e.kids.Count == 1) {
+            ExprVal other = GenExpr(e.kids[0]);
+            L("  call void @zlist_addrange(i8* " + recv.op + ", i8* " + other.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "Insert" && e.kids.Count == 2) {
+            ExprVal idx = GenExpr(e.kids[0]);
+            ExprVal v = GenExpr(e.kids[1]);
+            string sv = ToSlot(v, ListElem(recv.ty));
+            L("  call void @zlist_insert(i8* " + recv.op + ", i64 " + idx.op + ", i64 " + sv + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        if (name == "IndexOf" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListIndexOf(recv, ListElem(recv.ty), search, false);
+        }
+        if (name == "Contains" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListIndexOf(recv, ListElem(recv.ty), search, true);
+        }
+        // an unknown List method must not compile into a call that does
+        // nothing: the program would silently get wrong answers
+        diags.Error("List method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
         return new ExprVal("0", MkType("int"));
+    }
+
+    // List<T>.IndexOf(value) / Contains(value): walk the list and compare
+    // each element with the typed equality -- an operator== when the element
+    // type defines one, a field-wise compare for structs, a content compare
+    // for strings, identity for classes.
+    ExprVal EmitListIndexOf(ExprVal recv, Node elemTy, ExprVal search, bool asContains) {
+        string res = NT();
+        EA(res, "i64");
+        L("  store i64 -1, i64* " + res);
+        string idx = NT();
+        EA(idx, "i64");
+        L("  store i64 0, i64* " + idx);
+        int lc = NL(); int lb = NL(); int lfound = NL(); int lstep = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string ci = NT();
+        L("  " + ci + " = load i64, i64* " + idx);
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+        string c = NT();
+        L("  " + c + " = icmp uge i64 " + ci + ", " + cnt);
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string raw = NT();
+        L("  " + raw + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
+        ExprVal ev = FromSlot(raw, elemTy);
+        string eq = EmitElemEq(ev, search, elemTy);
+        L("  br i1 " + eq + ", label %L" + lfound + ", label %L" + lstep);
+        Label(lstep);
+        string ni = NT();
+        L("  " + ni + " = add i64 " + ci + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lfound);
+        L("  store i64 " + ci + ", i64* " + res);
+        L("  br label %L" + lend);
+        Label(lend);
+        string r = NT();
+        L("  " + r + " = load i64, i64* " + res);
+        if (asContains) {
+            string hit = NT();
+            L("  " + hit + " = icmp ne i64 " + r + ", -1");
+            string z = NT();
+            L("  " + z + " = zext i1 " + hit + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
+        return new ExprVal(r, MkType("int"));
+    }
+
+    // typed equality of two list elements; returns an i1
+    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {
+        if (elemTy != null) {
+            Node ca = ClassOf(elemTy);
+            if (ca != null) {
+                Node m = binder.FindMethod(ca, "op_eq");
+                if (m != null) {
+                    ExprVal r = TryOpOverload(TK.EqEq(), a, b);
+                    if (r != null) {
+                        string c = NT();
+                        L("  " + c + " = icmp ne i64 " + r.op + ", 0");
+                        return c;
+                    }
+                }
+                if (ca.kind == AK.StructDecl()) {
+                    return EmitStructEq(a, b, elemTy);
+                }
+                // a class without operator== compares by identity
+                string c = NT();
+                L("  " + c + " = icmp eq " + MapType(elemTy) + " " + a.op + ", " + b.op);
+                return c;
+            }
+            if (IsStr(elemTy)) {
+                string r = NT();
+                L("  " + r + " = call i32 @__zan_strcmp0(i8* " + a.op + ", i8* " + b.op + ")");
+                string c = NT();
+                L("  " + c + " = icmp eq i32 " + r + ", 0");
+                return c;
+            }
+            if (IsDbl(elemTy)) {
+                string c = NT();
+                L("  " + c + " = fcmp oeq double " + a.op + ", " + b.op);
+                return c;
+            }
+        }
+        // raw slot compare (int, long, bool, char, enum, ...)
+        string c = NT();
+        L("  " + c + " = icmp eq i64 " + a.op + ", " + b.op);
+        return c;
+    }
+
+    // struct equality without an operator==: compare the fields one by one
+    string EmitStructEq(ExprVal a, ExprVal b, Node elemTy) {
+        Node cls = ClassOf(elemTy);
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(cls, names, types);
+        string acc = "1";
+        int i = 0;
+        while (i < names.Count) {
+            ExprVal fa = LoadField(a.op, elemTy, names[i]);
+            ExprVal fb = LoadField(b.op, elemTy, names[i]);
+            string c = EmitElemEq(fa, fb, types[i]);
+            string na = NT();
+            L("  " + na + " = and i1 " + acc + ", " + c);
+            acc = na;
+            i = i + 1;
+        }
+        return acc;
     }
 
     // dict keys are stored as C strings; scalar keys use their decimal image

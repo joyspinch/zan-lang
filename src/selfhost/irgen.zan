@@ -1782,6 +1782,91 @@ partial class Irgen {
         H("  store i64 0, i64* %cptr");
         H("  ret void");
         H("}");
+        // zlist_addrange: append every element of the source list. The count
+        // is read once, so appending a list to itself copies the elements it
+        // had when the call started (the C host reads the count the same way).
+        H("define void @zlist_addrange(i8* %d, i8* %s) {");
+        H("entry:");
+        H("  %n = call i64 @zlist_count(i8* %s)");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %i = load i64, i64* %ia");
+        H("  %done = icmp uge i64 %i, %n");
+        H("  br i1 %done, label %fin, label %body");
+        H("body:");
+        H("  %v = call i64 @zlist_get(i8* %s, i64 %i)");
+        H("  call void @zlist_add(i8* %d, i64 %v)");
+        H("  %ni = add i64 %i, 1");
+        H("  store i64 %ni, i64* %ia");
+        H("  br label %cond");
+        H("fin:");
+        H("  ret void");
+        H("}");
+        // zlist_insert: shift the elements from the end down to the insert
+        // point, then put the new value there.
+        H("define void @zlist_insert(i8* %p, i64 %idx, i64 %v) {");
+        H("entry:");
+        H("  %l = bitcast i8* %p to %zlist*");
+        H("  %cptr = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
+        H("  %count = load i64, i64* %cptr");
+        H("  %capptr = getelementptr %zlist, %zlist* %l, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %full = icmp sge i64 %count, %cap");
+        H("  br i1 %full, label %grow, label %st");
+        H("grow:");
+        H("  %nc0 = mul i64 %cap, 2");
+        H("  %isz = icmp eq i64 %nc0, 0");
+        H("  %nc = select i1 %isz, i64 4, i64 %nc0");
+        H("  %dptr = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %olddata = load i64*, i64** %dptr");
+        H("  %oldi8 = bitcast i64* %olddata to i8*");
+        H("  %bytes = mul i64 %nc, 8");
+        H("  %newi8 = call i8* @realloc(i8* %oldi8, i64 %bytes)");
+        H("  %newdata = bitcast i8* %newi8 to i64*");
+        H("  store i64* %newdata, i64** %dptr");
+        H("  store i64 %nc, i64* %capptr");
+        H("  br label %st");
+        H("st:");
+        H("  %dptr2 = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %data = load i64*, i64** %dptr2");
+        H("  %ja = alloca i64");
+        H("  %j0 = sub i64 %count, 1");
+        H("  store i64 %j0, i64* %ja");
+        H("  br label %shcond");
+        H("shcond:");
+        H("  %j = load i64, i64* %ja");
+        H("  %c = icmp slt i64 %j, %idx");
+        H("  br i1 %c, label %shdone, label %shbody");
+        H("shbody:");
+        H("  %jn = add i64 %j, 1");
+        H("  %sp = getelementptr i64, i64* %data, i64 %j");
+        H("  %sv = load i64, i64* %sp");
+        H("  %dp = getelementptr i64, i64* %data, i64 %jn");
+        H("  store i64 %sv, i64* %dp");
+        H("  %jp = sub i64 %j, 1");
+        H("  store i64 %jp, i64* %ja");
+        H("  br label %shcond");
+        H("shdone:");
+        // the element that sat at the insert point was moved one slot up by
+        // the shift, so nothing is dropped here: the list keeps exactly one
+        // reference per slot. Only the new value has to be retained.
+        H("  %slot = getelementptr i64, i64* %data, i64 %idx");
+        H("  store i64 %v, i64* %slot");
+        H("  %ncount = add i64 %count, 1");
+        H("  store i64 %ncount, i64* %cptr");
+        H("  %optr = getelementptr %zlist, %zlist* %l, i32 0, i32 3");
+        H("  %owns = load i64, i64* %optr");
+        H("  %doret = icmp ne i64 %owns, 0");
+        H("  br i1 %doret, label %doretain, label %done");
+        H("doretain:");
+        H("  %vp = inttoptr i64 %v to i8*");
+        H("  call void @zretain(i8* %vp)");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
     }
 
     // ARC: every heap object carries a hidden 8-byte refcount header that lives

@@ -186,6 +186,15 @@ links, runs the programs and compares stdout with the C host's golden file.
   the cell, so a write to the local after the capture is visible inside the
   closure (C# semantics). Loop variables are snapshotted per iteration, as
   before. Async methods still capture by value (`TASKS.md`, A387).
+- A fifth round (2026-10-20) fixed the **container built-ins**: `List<T>.AddRange`,
+  `Insert`, `IndexOf` and `Contains` were never lowered by the self-hosted
+  backend — the fallback branch of `EmitListMethod` returned 0 and the call was
+  silently dropped, so the list stayed empty and the following element read ran
+  out of bounds (access violation). They are now really lowered (the runtime
+  grows `zlist_addrange` / `zlist_insert`), element comparison goes through a
+  typed equality (`operator==` → struct field by field → string content →
+  class identity → slot value), and a list method the backend does not
+  implement is now refused with a diagnostic instead of silently doing nothing.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR
@@ -215,6 +224,15 @@ links, runs the programs and compares stdout with the C host's golden file.
   does not box them yet, so a closure created in an async method still gets a
   value snapshot. Tracked in `TASKS.md` (A387) with the differential-gate case
   `tests/conformance/closure_capture_async.zan`.
+- **`struct` is a heap object (reference semantics) in the self-hosted
+  compiler, while the C host copies it by value.** A `struct` that is
+  assigned, passed as an argument or pushed into a `List<T>` shares one heap
+  object in the self-hosted build, so a write through any alias is visible
+  everywhere; the C host copies the value (C# `struct` semantics). Measured
+  2026-10-20 on the same program: after `list.Add(p); p.x = 99;` the
+  self-hosted build prints `list[0].x` as `99` and the C host as `1`; a
+  by-value parameter write and a plain `P3 r = q;` assignment behave the
+  same way. Tracked in `TASKS.md` (A389).
 - **Language coverage.** The self-hosted compiler covers substantially more of
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/
