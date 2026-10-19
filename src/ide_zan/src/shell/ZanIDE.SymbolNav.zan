@@ -1,0 +1,58 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// Ctrl+T 全项目符号检索：输入条拿查询词，zan-lsp 的 workspace/symbol
+// 给出全项目符号（跳过局部变量/参数），结果交给 SymbolListPopup 按
+// 容器名分组列出。选中走 JumpToLocation——与 F12 / 引用跳转同一套
+// 导航历史（Alt+Left 可退回）。
+// 生命周期与其它语义请求一致：结果回来时 LSP 会话已经校验过代际
+// （PublishResult -> IsCurrent），这里只再查一遍查询词与会话还活着，
+// 过期的结果直接丢弃，不弹旧列表。
+partial class ZanIDE {
+    void BeginSymbolSearch() {
+        if (findMode == 9) { return; }
+        findMode = 9;
+        app.RequestRedraw();
+    }
+
+    // 回车之后执行：发起异步 workspace/symbol。
+    void SearchSymbolsAsync(string query) {
+        if (query == null || query.Trim().Length == 0) { return; }
+        LspSession session = lspSess;
+        string q = query.Trim();
+        if (session == null || !session.Alive()) {
+            log.Add(ZanIDE.T("> Workspace symbols: language server is not running.",
+                "> 全项目符号：语言服务未运行。"));
+            app.RequestRedraw();
+            return;
+        }
+        symbolQuery = q;
+        string expected = symbolQuery;
+        session.WorkspaceSymbolsAsync(q, delegate (LspWorkspaceSymbolResult result) {
+            if (session != lspSess) { return; }
+            if (result == null || result.symbols == null) { return; }
+            if (symbolQuery != expected) { return; }
+            symbolHits = result.symbols;
+            if (symbolHits.Count == 0) {
+                log.Add(ZanIDE.T("> No symbols matched '" + expected + "'.",
+                    "> 没有匹配 '" + expected + "' 的符号。"));
+                app.RequestRedraw();
+                return;
+            }
+            log.Add("> " + Convert.ToString(symbolHits.Count) + " "
+                + ZanIDE.T("symbol(s) matched '" + expected + "'.",
+                    "个符号匹配 '" + expected + "'。"));
+            symbolList.Show(expected, symbolHits, root);
+            app.RequestRedraw();
+        });
+    }
+
+    // 浮层里选中一个符号：跳过去并留下导航历史。
+    void GotoSymbol(int idx) {
+        if (idx < 0 || idx >= symbolHits.Count) { return; }
+        LspWorkspaceSymbol symbol = symbolHits[idx];
+        this.JumpToLocation(symbol.path, symbol.line, 0);
+    }
+}

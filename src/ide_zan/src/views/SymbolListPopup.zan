@@ -1,0 +1,192 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// Ctrl+T 全项目符号检索的浮层：LSP workspace/symbol 返回的符号列表，
+// 贴在编辑区顶部。结构与 RefListPopup 同族：标题行 + 关闭按钮、填满
+// 中间的 TreeView 在 `views/SymbolListPopup.html` 里声明，折叠、悬停、
+// 选中、滚动都归控件；这里只把命中构造成节点、取走选中。
+// 浮层走标准的覆盖层通道：打开时把自己交给 `App.AddOverlay`，由
+// `OnPaintOverlay` 在所有页面内容之后绘制。位置贴在编辑区顶部锚点下，
+// 越界自动上翻（OverlayPopup.FitX/FitH）。
+// 点一个符号    跳到声明处（外壳经 JumpToLocation 接导航历史）
+// Escape / X    关闭
+// 列表是快照：打开时构建一次，在屏幕上期间不会重新查询。
+partial class SymbolListPopup {
+    bool open;
+    string query;
+    List<LspWorkspaceSymbol> symbols;
+    // 树的行，以及每行代表的符号（容器名行是 -1）。
+    List<TreeNode> nodes;
+    // 浮层挂在哪里：编辑区左缘的绝对像素。
+    int anchorX;
+    int anchorY;
+    // 本帧被激活的符号，由外壳取走（-1 表示没有）。
+    int picked;
+    // 树的处理器要说话的对象：同一时刻屏幕上只有一个符号列表。
+    static SymbolListPopup current;
+
+    void OnInit() {
+        open = false;
+        query = "";
+        symbols = new List<LspWorkspaceSymbol>();
+        nodes = new List<TreeNode>();
+        anchorX = 0 - 1;
+        anchorY = 0 - 1;
+        picked = 0 - 1;
+        this.CloseBtn.SetProp("tip", ZanIDE.T("Close (Esc)", "关闭 (Esc)"));
+        this.Tree.Bind(nodes);
+        this.Tree.OnSelect(SymbolListPopup.RowPicked);
+        SymbolListPopup.current = this;
+    }
+
+    static void RowPicked() {
+        SymbolListPopup p = SymbolListPopup.current;
+        if (p == null) { return; }
+        int row = p.Tree.SelectedIndex();
+        if (row >= 0 && row < p.nodes.Count) {
+            string payload = p.nodes[row].payload;
+            if (payload != "") { p.picked = ZanIDE.ParseInt(payload); }
+        }
+    }
+
+    // 把浮层挂到绝对坐标 (ax, ay) 下面。打开期间每帧调用，
+    // 因此它随视图滚动跟着锚点走。
+    void Anchor(int ax, int ay) {
+        anchorX = ax;
+        anchorY = ay;
+    }
+
+    bool IsOpen() { return open; }
+    void Close() { open = false; }
+    int Count() { return symbols.Count; }
+
+    // 本帧用户激活的符号（-1 表示没有），取走后清空。
+    int TakePicked() {
+        int p = picked;
+        picked = 0 - 1;
+        return p;
+    }
+
+    // 把 `found` 作为 `q` 的匹配显示。结果为空则关闭列表，
+    // 而不是留一个空面板在屏幕上。按容器名分组（与引用列表按文件
+    // 分组同形）；没有容器名的符号平铺在末尾。
+    void Show(string q, List<LspWorkspaceSymbol> found, string root) {
+        query = q;
+        picked = 0 - 1;
+        symbols = new List<LspWorkspaceSymbol>();
+        nodes = new List<TreeNode>();
+        List<string> order = new List<string>();
+        for (int i = 0; i < found.Count; i = i + 1) {
+            string container = found[i].containerName != null ? found[i].containerName : "";
+            if (SymbolListPopup.IndexOfName(order, container) < 0) {
+                order.Add(container);
+            }
+        }
+        for (int g = 0; g < order.Count; g = g + 1) {
+            string container = order[g];
+            if (container.Length == 0) { continue; }
+            List<LspWorkspaceSymbol> mine = new List<LspWorkspaceSymbol>();
+            for (int k = 0; k < found.Count; k = k + 1) {
+                string c = found[k].containerName != null ? found[k].containerName : "";
+                if (c == container) { mine.Add(found[k]); }
+            }
+            if (mine.Count == 0) { continue; }
+            nodes.Add(TreeNode.Dir(container + " ("
+                + Convert.ToString(mine.Count) + ")", 0, true));
+            for (int k = 0; k < mine.Count; k = k + 1) {
+                SymbolListPopup.AddLeaf(nodes, symbols, mine[k], 1, root);
+            }
+        }
+        for (int k = 0; k < found.Count; k = k + 1) {
+            string c = found[k].containerName != null ? found[k].containerName : "";
+            if (c.Length == 0) {
+                SymbolListPopup.AddLeaf(nodes, symbols, found[k], 0, root);
+            }
+        }
+        this.Tree.Bind(nodes);
+        this.Tree.ClearSelection();
+        open = symbols.Count > 0;
+    }
+
+    static void AddLeaf(List<TreeNode> nodes, List<LspWorkspaceSymbol> symbols,
+                        LspWorkspaceSymbol symbol, int depth, string root) {
+        int idx = symbols.Count;
+        symbols.Add(symbol);
+        string place = SymbolListPopup.RelPath(symbol.path, root) + ":"
+            + Convert.ToString(symbol.line + 1);
+        nodes.Add(TreeNode.FileIcon(symbol.name + "   " + place, depth, "code")
+            .WithPayload(Convert.ToString(idx)));
+    }
+
+    static int IndexOfName(List<string> names, string name) {
+        for (int i = 0; i < names.Count; i = i + 1) {
+            if (names[i] == name) { return i; }
+        }
+        return 0 - 1;
+    }
+
+    // 去掉前面项目根目录的 `path`。
+    static string RelPath(string path, string root) {
+        if (root.Length > 0 && path.Length > root.Length + 1
+                && path.StartsWith(root)) {
+            return path.Substring(root.Length + 1, path.Length - root.Length - 1);
+        }
+        return path;
+    }
+
+    // 每帧调一次：打开时把自己排进覆盖层，关闭时什么都不做。
+    void Frame(App app) {
+        if (!open) { return; }
+        SymbolListPopup.current = this;
+        app.AddOverlay(OverlayPopup.Host(this));
+    }
+
+    // 延迟面板：在所有页面内容之后由 App.RunOverlays 绘制并派发事件。
+    override void OnPaintOverlay(App app) {
+        if (!open) { return; }
+        int chromeH = this.Bar.prefH + app.Scale(8);
+        // 至多十四行高：弹在代码上的浮层，不是占掉半个编辑器的窗格。
+        int rowH = app.theme.heightSmall;
+        int listH = this.Tree.ContentHeight(app);
+        int maxListH = rowH * 14;
+        if (listH > maxListH) { listH = maxListH; }
+        if (listH < rowH) { listH = rowH; }
+        int w = app.Scale(560);
+        int h = OverlayPopup.FitH(app, chromeH + listH);
+        int x = OverlayPopup.FitX(app, anchorX, w);
+        int y = OverlayPopup.FitY(app, anchorY, 0, h);
+
+        app.BlockHitsBelow();
+        app.BlockHitsRect(x, y, w, h);
+
+        this.HeadLbl.Text = Convert.ToString(symbols.Count) + " "
+            + ZanIDE.T("symbols for", "个符号匹配") + " '" + query + "'";
+        this.RenderInside(app, new Rect(x, y, w, h));
+
+        if (this.CloseBtn.WasClicked()) {
+            open = false;
+            app.RequestRedraw();
+            return;
+        }
+        if (picked >= 0) {
+            open = false;
+            app.RequestRedraw();
+            return;
+        }
+        // 别处的按压把浮层收起来，任何弹层都该这样。
+        if (app.ClickAvailable()) {
+            bool inside = app.mouseX >= x && app.mouseX < x + w
+                && app.mouseY >= y && app.mouseY < y + h;
+            if (!inside) {
+                open = false;
+                app.RequestRedraw();
+            }
+        }
+        if (app.EventKind() == 4 && app.window.EventKeyCode() == 27) {
+            open = false;
+            app.RequestRedraw();
+        }
+    }
+}

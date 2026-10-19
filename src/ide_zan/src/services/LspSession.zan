@@ -163,6 +163,14 @@ partial class LspSession {
         QueueCommand(command);
     }
 
+    // 全项目符号检索（Ctrl+T）。query 为空返回全部非局部符号。
+    void WorkspaceSymbolsAsync(string query, LspWorkspaceSymbolHandler completed) {
+        LspCommand command = CreateCommand("workspace/symbol", "", 0, 0);
+        command.name = query;
+        command.symbols = completed;
+        QueueCommand(command);
+    }
+
     static void CopyResult(LspResult result, LspCommand command, LspPendingState state) {
         result.path = command.path;
         result.version = command.version;
@@ -194,6 +202,10 @@ partial class LspSession {
             result.rename = new LspRenameResult();
             LspSession.CopyResult(result.rename, command, state);
             result.rename.documents = command.documents;
+        } else if (command.method == "workspace/symbol") {
+            result.symbols = new LspWorkspaceSymbolResult();
+            LspSession.CopyResult(result.symbols, command, state);
+            result.symbols.symbols = new List<LspWorkspaceSymbol>();
         }
         return result;
     }
@@ -307,6 +319,8 @@ partial class LspSession {
                 result.signatureLabel = LspSession.SignatureLabel(signature);
             } else if (command.method == "textDocument/hover") {
                 result.hover = Hover(command.path, command.line, command.col);
+            } else if (command.method == "workspace/symbol") {
+                result.symbols.symbols = WorkspaceSymbols(command.name);
             }
             result.state = lastRequestState;
             if (result.state == LspPendingState.Ready) {
@@ -316,13 +330,15 @@ partial class LspSession {
                     || (result.rename != null && (result.rename.edits == null || result.rename.edits.Count == 0))
                     || (result.method == "textDocument/completion" && (result.completions == null || result.completions.Count == 0))
                     || (result.method == "textDocument/signatureHelp" && result.signatureLabel.Length == 0)
-                    || (result.method == "textDocument/hover" && result.hover.Length == 0);
+                    || (result.method == "textDocument/hover" && result.hover.Length == 0)
+                    || (result.method == "workspace/symbol" && result.symbols.symbols.Count == 0);
                 if (empty) { result.state = LspPendingState.Empty; }
             }
             if (result.folding != null) { result.folding.state = result.state; }
             if (result.definition != null) { result.definition.state = result.state; }
             if (result.references != null) { result.references.state = result.state; }
             if (result.rename != null) { result.rename.state = result.state; }
+            if (result.symbols != null) { result.symbols.state = result.state; }
             return result;
         } finally { activeCancellation = null; }
     }
@@ -332,8 +348,10 @@ partial class LspSession {
         LspDefinitionHandler definition = command.definition;
         LspReferencesHandler references = command.references;
         LspRenameHandler rename = command.rename;
+        LspWorkspaceSymbolHandler symbols = command.symbols;
         command.folding = null; command.definition = null;
         command.references = null; command.rename = null;
+        command.symbols = null;
         if (uiDispatcher != null) {
             uiDispatcher(() => {
                 if (stopping) { return; }
@@ -344,6 +362,7 @@ partial class LspSession {
                     if (result.definition != null) { result.definition.state = result.state; }
                     if (result.references != null) { result.references.state = result.state; }
                     if (result.rename != null) { result.rename.state = result.state; }
+                    if (result.symbols != null) { result.symbols.state = result.state; }
                 }
                 if (result.id > 0 && pending.ContainsKey(result.id)) {
                     LspPendingRequest request = pending[result.id];
@@ -359,6 +378,7 @@ partial class LspSession {
                 if (definition != null) { definition(result.definition); }
                 if (references != null) { references(result.references); }
                 if (rename != null) { rename(result.rename); }
+                if (symbols != null) { symbols(result.symbols); }
             });
         }
     }
@@ -693,6 +713,16 @@ partial class LspSession {
         LspSignatureHelpResult r = Json.Deserialize<LspSignatureHelpResult>(m);
         if (r == null || r.result == null) { return null; }
         return r.result;
+    }
+
+    List<LspWorkspaceSymbol> WorkspaceSymbols(string query) {
+        if (background) { throw new Exception("Use WorkspaceSymbolsAsync on the UI LSP facade."); }
+        List<LspWorkspaceSymbol> outp = new List<LspWorkspaceSymbol>();
+        JsonValue p = JsonValue.NewObject();
+        p.PutStr("query", query != null ? query : "");
+        string m = this.RequestWait("workspace/symbol", p.ToJson());
+        if (m.Length == 0) { return outp; }
+        return LspSession.ParseWorkspaceSymbols(m);
     }
 
     List<string> FoldingRanges(string path) {
