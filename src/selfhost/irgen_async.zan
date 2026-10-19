@@ -955,13 +955,18 @@ partial class Irgen {
 
     /// zan_io_pump / zan_co_sched_init / __zan_co_reap / zan_co_ready /
     /// zan_co_delay.
+    ///
+    /// 这里的协程调度器是「回退实现」：与 C 宿主的 zan_runtime_fallback
+    /// 同法，必须用 weak 链接——链接了 C 运行时（rt_io.o/rt_co.o 提供同名
+    /// 强符号）时由运行时那份生效，未链接运行时时用自带这份。否则两边
+    /// 同时定义会 LNK2005。
     void EmitAsyncPumpReady() {
         H("define weak i32 @zan_io_pump() {");
         H("entry:");
         H("  %w = call i32 @zan_io_pump_timeout(i64 -1)");
         H("  ret i32 %w");
         H("}");
-        H("define void @zan_co_sched_init() {");
+        H("define weak void @zan_co_sched_init() {");
         H("entry:");
         H("  store i8* null, i8** @co_head");
         H("  store i8* null, i8** @co_tail");
@@ -973,7 +978,7 @@ partial class Irgen {
         H("  call void @free(i8* %f)");
         H("  ret void");
         H("}");
-        H("define void @zan_co_ready(i8* %frame, void(i8*)* %step) {");
+        H("define weak void @zan_co_ready(i8* %frame, void(i8*)* %step) {");
         H("entry:");
         H("  %n = call i8* @malloc(i64 24)");
         H("  %np = bitcast i8* %n to %co_node*");
@@ -998,7 +1003,7 @@ partial class Irgen {
         H("  store i8* %n, i8** @co_tail");
         H("  ret void");
         H("}");
-        H("define void @zan_co_delay(i64 %ms, i8* %frame, void(i8*)* %step) {");
+        H("define weak void @zan_co_delay(i64 %ms, i8* %frame, void(i8*)* %step) {");
         H("entry:");
         H("  %raw = call i8* @malloc(i64 32)");
         H("  %tn = bitcast i8* %raw to %co_timer*");
@@ -1023,7 +1028,7 @@ partial class Irgen {
 
     /// The cooperative scheduler main loop (zan_co_sched_run).
     void EmitAsyncSchedRun() {
-        H("define void @zan_co_sched_run() {");
+        H("define weak void @zan_co_sched_run() {");
         H("entry:");
         H("  %a.best = alloca i8*");
         H("  %a.bestprev = alloca i8*");
@@ -1142,6 +1147,9 @@ partial class Irgen {
     }
 
     void GenMethod(Node cls, Node m, bool ctor) {
+        // hardware vectors: every static body (Zero/AllBitsSet getters etc.)
+        // is lowered at the call site by GenBuiltinStatic — no function bodies
+        if (cls != null && (cls.sval == "Vector128" || cls.sval == "Vector256")) { return; }
         NormalizeAwaits(cls, m);
         if (IsAsync(m)) { GenAsyncMethod(cls, m); return; }
         StartFn();
@@ -1336,7 +1344,7 @@ partial class Irgen {
         }
         // Install a root exception handler so an uncaught throw prints a
         // message and exits 1 instead of longjmp-ing through an empty stack.
-        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64]");
+        string rbuf = NT(); L("  " + rbuf + " = alloca [32 x i64], align 32");
         string rbp = NT(); L("  " + rbp + " = bitcast [32 x i64]* " + rbuf + " to i8*");
         string rsp = NT(); L("  " + rsp + " = load i64, i64* @__exc_sp");
         string rslot = NT(); L("  " + rslot + " = getelementptr [64 x i8*], [64 x i8*]* @__exc_stack, i64 0, i64 " + rsp);

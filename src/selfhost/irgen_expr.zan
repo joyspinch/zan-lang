@@ -855,6 +855,10 @@ partial class Irgen {
     }
 
     void StoreField(string objOp, string clsName, string field, ExprVal v) {
+        // hardware vectors are first-class values with no memory layout:
+        // their getter bodies' V0..V3 field writes fold into the constant
+        // (zeroinitializer / all-ones) and must not touch memory
+        if (clsName == "Vector128" || clsName == "Vector256") { return; }
         Node cls = binder.FindType(clsName);
         int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
@@ -1082,6 +1086,27 @@ partial class Irgen {
     ExprVal GenMember(Node e) {
         if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0) {
             Node tc = binder.FindType(e.a.sval);
+            // Vector128/256 static members (Zero, AllBitsSet) are values, not
+            // storage — lower them inline instead of loading a static field
+            if (tc != null && (e.a.sval == "Vector128" || e.a.sval == "Vector256")) {
+                if (e.sval == "Zero") {
+                    return new ExprVal("zeroinitializer", MkType(e.a.sval));
+                }
+                if (e.sval == "AllBitsSet") {
+                    string vt = e.a.sval == "Vector128" ? "<2 x i64>" : "<4 x i64>";
+                    string ones = NT();
+                    L("  " + ones + " = insertelement " + vt + " undef, i64 -1, i32 0");
+                    int lane = 1;
+                    int lanes = e.a.sval == "Vector128" ? 2 : 4;
+                    while (lane < lanes) {
+                        string r2 = NT();
+                        L("  " + r2 + " = insertelement " + vt + " " + ones + ", i64 -1, i32 " + lane);
+                        ones = r2;
+                        lane = lane + 1;
+                    }
+                    return new ExprVal(ones, MkType(e.a.sval));
+                }
+            }
             if (tc != null && FindStaticField(tc, e.sval) != null) {
                 return LoadStaticField(tc, e.sval);
             }
@@ -1348,6 +1373,13 @@ partial class Irgen {
         }
         // object
         string cn = ty.sval;
+        // hardware vectors are first-class values: `new Vector128()` /
+        // `new Vector256()` yields zeroinitializer and the field stores that
+        // follow (V0..V3 = 0 / -1) fold into the value via the ordinary
+        // constant paths — no heap allocation, no dtor
+        if (cn == "Vector128" || cn == "Vector256") {
+            return new ExprVal("zeroinitializer", ty);
+        }
         Node cls = binder.FindType(cn);
         if (cls == null) { return new ExprVal("null", ty); }
         string szp = NT();
@@ -1984,10 +2016,25 @@ partial class Irgen {
     }
 
     // invoke a closure value:  f(args) -> load {fn,env}, bitcast fn, call fn(env, args)
+    // A delegate value may be a heap closure (tagged bit0=1) or a bare native
+    // function pointer (bit0=0, e.g. from an nint→delegate cast) — the host
+    // discriminates on the tag bit; bare pointers are called without env.
     ExprVal EmitDelegateCall(Node calleeExpr, Node dty, Node e) {
         ExprVal clo = GenExpr(calleeExpr);
         List<Node> pt = DelegParams(dty);
         Node retTy = DelegRet(dty);
+        string iv = NT();
+        L("  " + iv + " = ptrtoint i8* " + clo.op + " to i64");
+        string bit = NT();
+        L("  " + bit + " = and i64 " + iv + ", 1");
+        string isClo = NT();
+        L("  " + isClo + " = icmp ne i64 " + bit + ", 0");
+        int lClo = NL(); int lBare = NL(); int lJoin = NL();
+        L("  br i1 " + isClo + ", label %L" + lClo + ", label %L" + lBare);
+        // 用 Label() 发标签：手工 L("L"+n+":") 不会更新 curLbl，之后的
+        // phi 会把前驱块记成旧块（LLVM: PHI node entries do not match
+        // predecessors）。
+        Label(lClo);
         string clop = NT();
         L("  " + clop + " = bitcast i8* " + clo.op + " to i8**");
         string fni8 = NT();
@@ -1996,8 +2043,6 @@ partial class Irgen {
         L("  " + envp + " = getelementptr i8*, i8** " + clop + ", i64 1");
         string env = NT();
         L("  " + env + " = load i8*, i8** " + envp);
-        string fn = NT();
-        L("  " + fn + " = bitcast i8* " + fni8 + " to " + LamFnType(retTy, pt));
         string args = "i8* " + env;
         int i = 0;
         while (i < e.kids.Count) {
@@ -2007,9 +2052,39 @@ partial class Irgen {
             i = i + 1;
         }
         string rt = MapType(retTy);
-        if (rt == "void") { L("  call void " + fn + "(" + args + ")"); return new ExprVal("0", MkType("void")); }
+        string fnt = LamFnType(retTy, pt);
+        // strip the trailing '*' of the pointer type: opaque-pointer LLVM
+        // rejects `call rt (args)* %ptr(...)`; the modern form is
+        // `call (args) %ptr(...)` where the fn type carries ret+params
+        string fnty = fnt.Substring(0, fnt.Length - 1);
+        string rClo = "0";
+        if (rt != "void") { rClo = NT(); L("  " + rClo + " = call " + fnty + " " + fni8 + "(" + args + ")"); }
+        else { L("  call void " + fnty.Substring(6) + " " + fni8 + "(" + args + ")"); }
+        L("  br label %L" + lJoin);
+        Label(lBare);
+        // 裸原生函数指针没有 env 槽，函数类型只带声明形参；闭包路径的
+        // LamFnType 头部塞了 env 的 i8*，在这里不能复用（否则形参个数
+        // 与实参个数对不上，调用会被 LLVM 判为签名不符）。
+        string argsB = "";
+        string ptypesB = "";
+        int ib = 0;
+        while (ib < e.kids.Count) {
+            Node ptyB = MkType("int"); if (ib < pt.Count) { ptyB = pt[ib]; }
+            ExprVal avB = GenArgExpr(e.kids[ib], ptyB);
+            string sepB = ib == 0 ? "" : ", ";
+            argsB = argsB + sepB + MapType(ptyB) + " " + Coerce(avB, MapType(ptyB));
+            ptypesB = ptypesB + sepB + MapType(ptyB);
+            ib = ib + 1;
+        }
+        string fntyB = rt + " (" + ptypesB + ")";
+        string rBare = "0";
+        if (rt != "void") { rBare = NT(); L("  " + rBare + " = call " + fntyB + " " + clo.op + "(" + argsB + ")"); }
+        else { L("  call " + fntyB + " " + clo.op + "(" + argsB + ")"); }
+        L("  br label %L" + lJoin);
+        Label(lJoin);
+        if (rt == "void") { return new ExprVal("0", MkType("void")); }
         string t = NT();
-        L("  " + t + " = call " + rt + " " + fn + "(" + args + ")");
+        L("  " + t + " = phi " + rt + " [ " + rClo + ", %L" + lClo + " ], [ " + rBare + ", %L" + lBare + " ]");
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
     }
@@ -2100,7 +2175,7 @@ partial class Irgen {
             if (cn == "File" && mn == "WriteAllText") {
                 ExprVal path = GenExpr(e.kids[0]);
                 ExprVal content = GenExpr(e.kids[1]);
-                string wb = NT(); L("  " + wb + " = getelementptr inbounds [2 x i8], [2 x i8]* @.mode_wb, i64 0, i64 0");
+                string wb = NT(); L("  " + wb + " = getelementptr inbounds [3 x i8], [3 x i8]* @.mode_wb, i64 0, i64 0");
                 string fp = NT(); L("  " + fp + " = call i8* @fopen(i8* " + path.op + ", i8* " + wb + ")");
                 EmitFopenCheck(fp, "@.msg.wrerr", 19);
                 string ln = NT(); L("  " + ln + " = call i64 @strlen(i8* " + content.op + ")");
@@ -2309,6 +2384,17 @@ partial class Irgen {
             && callee.a.sval == "NativeMemory" && LocalIdx("NativeMemory") < 0) {
             ExprVal nm = GenNativeMemory(callee, e);
             if (nm != null) { return nm; }
+        }
+        // BitOperations.* -> LLVM bit-manipulation intrinsics; Vector128/256.* ->
+        // hardware SIMD (mirrors the C host's emit_builtin_invocation +
+        // emit_vector128_call). Only reached when the name is the builtin type,
+        // not a local of the same name.
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && LocalIdx(callee.a.sval) < 0
+            && (callee.a.sval == "BitOperations" || callee.a.sval == "Vector128"
+                || callee.a.sval == "Vector256" || callee.a.sval == "Sse2" || callee.a.sval == "Aes")) {
+            ExprVal bv = GenBuiltinStatic(callee.a.sval, callee.sval, e);
+            if (bv != null) { return bv; }
         }
         // method access forms
         if (callee.kind == AK.MemberAccess()) {

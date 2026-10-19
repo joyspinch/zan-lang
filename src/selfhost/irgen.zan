@@ -68,6 +68,7 @@ partial class Irgen {
     public List<string> gotoNames; // per-function goto label name -> id
     public List<int> gotoIds;
     public bool crcEmitted; // NativeMemory.Crc32 helper+table emitted once
+    public bool crc32cEmitted; // NativeMemory.Crc32C helpers+table emitted once
 
     public Irgen(Binder b, Diags d) {
         binder = b; diags = d;
@@ -94,6 +95,7 @@ partial class Irgen {
         loopScopeBase = 0;
         externDecls = new List<string>();
         crcEmitted = false;
+        crc32cEmitted = false;
     }
 
     // The raw C-ABI symbol an extern (DllImport) method binds to: the
@@ -129,6 +131,10 @@ partial class Irgen {
     // raw symbol via MethodSym.
     void DeclareExtern(Node cls, Node m) {
         string sym = ExternName(m);
+        // NativeMemory hardware helpers live in the C runtime under zan_hw_*
+        // (matches the C host's symbol routing); inline-lowered methods are
+        // filtered out by the caller before we get here
+        if (cls.sval == "NativeMemory") { sym = "zan_hw_" + sym; }
         if (ExternSeen(sym)) { return; }
         externDecls.Add(sym);
         string rt = MapType(m.type);
@@ -149,6 +155,9 @@ partial class Irgen {
     }
 
     string NT() { tmp = tmp + 1; return "%t" + tmp; }
+    // entry 槽位名（ARC 临时值溢出用）：%z 前缀，EmitTempReleases 据此
+    // 区分“寄存器值”与“槽位值”。
+    string NTS() { tmp = tmp + 1; return "%z" + tmp; }
     int NL() { lbl = lbl + 1; return lbl; }
     void L(string s) { body.Append(s); body.Append("\n"); }
     // Emit an alloca into the function's entry block when a hoist buffer is
@@ -389,7 +398,585 @@ partial class Irgen {
             L("  " + r + " = call i64 @__zan_nm_crc32(i8* " + dp + ", i64 " + len.op + ")");
             return new ExprVal(r, MkType("int"));
         }
+        if (m == "Crc32C" && argc == 2) {
+            EmitCrc32CHelper();
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal len = GenExpr(e.kids[1]);
+            string dp = NmAddr(p, "0");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_nm_crc32c(i8* " + dp + ", i64 " + len.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        if (m == "Crc32CUpdate" && argc == 3) {
+            EmitCrc32CHelper();
+            ExprVal crc = GenExpr(e.kids[0]);
+            ExprVal p = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]);
+            string dp = NmAddr(p, "0");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_nm_crc32c_update(i64 " + crc.op + ", i8* " + dp + ", i64 " + len.op + ")");
+            return new ExprVal(r, MkType("int"));
+        }
+        if (m == "Find" && argc == 4) {
+            // Find(p, off, b, n): memchr over the window; -1 when absent
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal off = GenExpr(e.kids[1]);
+            ExprVal b = GenExpr(e.kids[2]);
+            ExprVal n = GenExpr(e.kids[3]);
+            if (!ExternSeen("memchr")) { externDecls.Add("memchr"); H("declare i8* @memchr(i8*, i32, i64)"); }
+            string bp = NT();
+            L("  " + bp + " = trunc i64 " + b.op + " to i32");
+            string hit = NT();
+            L("  " + hit + " = call i8* @memchr(i8* " + NmAddr(p, off.op) + ", i32 " + bp + ", i64 " + n.op + ")");
+            string isnull = NT();
+            L("  " + isnull + " = icmp eq i8* " + hit + ", null");
+            string at = NT();
+            L("  " + at + " = ptrtoint i8* " + hit + " to i64");
+            string base0 = NT();
+            L("  " + base0 + " = ptrtoint i8* " + NmAddr(p, "0") + " to i64");
+            string rel = NT();
+            L("  " + rel + " = sub i64 " + at + ", " + base0);
+            string relplus = NT();
+            L("  " + relplus + " = add i64 " + rel + ", " + off.op);
+            string r = NT();
+            L("  " + r + " = select i1 " + isnull + ", i64 -1, i64 " + relplus);
+            return new ExprVal(r, MkType("int"));
+        }
+        if (m == "Base64Encode" && argc == 2) {
+            // Base64Encode(ptr, size) -> heap string (length = ((len+2)/3)*4 + 1)
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal len = GenExpr(e.kids[1]);
+            if (!ExternSeen("zan_hw_base64_encode")) {
+                externDecls.Add("zan_hw_base64_encode");
+                H("declare i64 @zan_hw_base64_encode(i8*, i64, i8*)");
+            }
+            string sp = NT();
+            L("  " + sp + " = add i64 " + len.op + ", 2");
+            string d3 = NT();
+            L("  " + d3 + " = sdiv i64 " + sp + ", 3");
+            string m4 = NT();
+            L("  " + m4 + " = mul i64 " + d3 + ", 4");
+            string cap = NT();
+            L("  " + cap + " = add i64 " + m4 + ", 1");
+            string s = NT();
+            L("  " + s + " = call i8* @malloc(i64 " + cap + ")");
+            string w = NT();
+            L("  " + w + " = call i64 @zan_hw_base64_encode(i8* " + NmAddr(p, "0") + ", i64 " + len.op + ", i8* " + s + ")");
+            string ep = NT();
+            L("  " + ep + " = getelementptr i8, i8* " + s + ", i64 " + w);
+            L("  store i8 0, i8* " + ep);
+            return new ExprVal(s, MkType("string"));
+        }
+        if (m == "Base64Decode" && argc == 3) {
+            // Base64Decode(dst, src, size) -> written bytes
+            ExprVal dst = GenExpr(e.kids[0]);
+            ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]);
+            if (!ExternSeen("zan_hw_base64_decode")) {
+                externDecls.Add("zan_hw_base64_decode");
+                H("declare i64 @zan_hw_base64_decode(i8*, i64, i8*)");
+            }
+            string w = NT();
+            L("  " + w + " = call i64 @zan_hw_base64_decode(i8* " + NmAddr(src, "0") + ", i64 " + size.op + ", i8* " + NmAddr(dst, "0") + ")");
+            return new ExprVal(w, MkType("int"));
+        }
         return null;
+    }
+
+    // Self-contained CRC32C (Castagnoli, reflected poly 0x82F63B78) helpers,
+    // mirroring the C host's __zan_nm_crc32c / __zan_nm_crc32c_update.
+    void EmitCrc32CHelper() {
+        if (crc32cEmitted) { return; }
+        crc32cEmitted = true;
+        string tab = "";
+        int i = 0;
+        while (i < 256) {
+            long c = i;
+            int k = 0;
+            while (k < 8) {
+                if ((c & 1) != 0) { c = -2040169354 ^ (c >> 1); }
+                else { c = c >> 1; }
+                k = k + 1;
+            }
+            if (i > 0) { tab = tab + ", "; }
+            tab = tab + "i32 " + c;
+            i = i + 1;
+        }
+        H("@__zan_crc32c_table = private unnamed_addr constant [256 x i32] [" + tab + "]");
+        H("define internal i64 @__zan_crc32c_scan(i32 %crc, i8* %data, i64 %len) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %entry ], [ %ni, %body ]");
+        H("  %c = phi i32 [ %crc, %entry ], [ %nc, %body ]");
+        H("  %inr = icmp slt i64 %i, %len");
+        H("  br i1 %inr, label %body, label %done");
+        H("body:");
+        H("  %bp = getelementptr i8, i8* %data, i64 %i");
+        H("  %b = load i8, i8* %bp");
+        H("  %b32 = zext i8 %b to i32");
+        H("  %x = xor i32 %c, %b32");
+        H("  %ti = and i32 %x, 255");
+        H("  %ti64 = zext i32 %ti to i64");
+        H("  %ep = getelementptr [256 x i32], [256 x i32]* @__zan_crc32c_table, i64 0, i64 %ti64");
+        H("  %te = load i32, i32* %ep");
+        H("  %sh = lshr i32 %c, 8");
+        H("  %nc = xor i32 %te, %sh");
+        H("  %ni = add i64 %i, 1");
+        H("  br label %loop");
+        H("done:");
+        H("  %fin = xor i32 %c, -1");
+        H("  %fin64 = zext i32 %fin to i64");
+        H("  ret i64 %fin64");
+        H("}");
+        H("define internal i64 @__zan_nm_crc32c(i8* %data, i64 %len) {");
+        H("  %r = call i64 @__zan_crc32c_scan(i32 -1, i8* %data, i64 %len)");
+        H("  ret i64 %r");
+        H("}");
+        H("define internal i64 @__zan_nm_crc32c_update(i64 %seed, i8* %data, i64 %len) {");
+        H("entry:");
+        H("  %s32 = trunc i64 %seed to i32");
+        H("  %inv = xor i32 %s32, -1");
+        H("  %r = call i64 @__zan_crc32c_scan(i32 %inv, i8* %data, i64 %len)");
+        H("  ret i64 %r");
+        H("}");
+    }
+
+    // ---- hardware SIMD + bit builtins (mirror the C host's emit_vector128_call
+    // and the BitOperations intrinsics). A Vector128/256 value is a first-class
+    // LLVM vector (<2 x i64> / <4 x i64>); memory-facing helpers materialise it
+    // from unaligned i8* loads/stores. Returns null when the call is not a
+    // recognised builtin so the ordinary static-call path handles it.
+    string VecBytePtr(ExprVal a) { return NmAddr(a, "0"); }
+
+    // Load N bytes from an address (arg 0, optionally arg 1 = byte offset or
+    // element offset) into a <N/8 x i64> vector.
+    ExprVal VecLoad(Node e, int bits) {
+        string vt = "<" + (bits / 64) + " x i64>";
+        ExprVal vb = GenExpr(e.kids[0]);
+        string off = "0";
+        if (e.kids.Count == 2) {
+            ExprVal o = GenExpr(e.kids[1]);
+            // byte[]/float[] + int: the offset is an element index; scale to bytes
+            bool isArr = vb.ty != null && vb.ty.ival >= 1;
+            if (isArr) {
+                string scaled = NT();
+                L("  " + scaled + " = mul i64 " + o.op + ", 8");
+                off = scaled;
+            } else {
+                off = o.op;
+            }
+        }
+        string bp = VecBytePtr(vb);
+        string p = NT();
+        if (off == "0") {
+            L("  " + p + " = bitcast i8* " + bp + " to " + vt + "*");
+        } else {
+            string ap = NT();
+            L("  " + ap + " = getelementptr i8, i8* " + bp + ", i64 " + off);
+            L("  " + p + " = bitcast i8* " + ap + " to " + vt + "*");
+        }
+        string v = NT();
+        L("  " + v + " = load " + vt + ", " + vt + "* " + p);
+        Node rt = MkType(bits == 128 ? "Vector128" : "Vector256");
+        return new ExprVal(v, rt);
+    }
+
+    // bitwise/arithmetic vector op over two vector operands
+    ExprVal VecBinOp(Node e, string op, string resTy) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal b = GenExpr(e.kids[1]);
+        string at = MapType(a.ty);
+        string r = NT();
+        L("  " + r + " = " + op + " " + at + " " + a.op + ", " + b.op);
+        return new ExprVal(r, MkType(resTy));
+    }
+
+    // broadcast a scalar into all lanes of a <N x i64> vector
+    ExprVal VecCreate(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        string vt = "<" + (bits / 64) + " x i64>";
+        string wide = a.op;
+        if (a.ty != null && a.ty.sval == "int") {
+            // sign-extend int -> i64 so the broadcast is exact per lane
+            string sx = NT();
+            L("  " + sx + " = shl i64 " + a.op + ", 32");
+            string sx2 = NT();
+            L("  " + sx2 + " = ashr i64 " + sx + ", 32");
+            wide = sx2;
+        }
+        string r = NT();
+        L("  " + r + " = insertelement " + vt + " undef, i64 " + wide + ", i32 0");
+        int lane = 1;
+        while (lane < bits / 64) {
+            string r2 = NT();
+            L("  " + r2 + " = insertelement " + vt + " " + r + ", i64 " + wide + ", i32 " + lane);
+            r = r2;
+            lane = lane + 1;
+        }
+        return new ExprVal(r, MkType(bits == 128 ? "Vector128" : "Vector256"));
+    }
+
+    // declare an LLVM intrinsic: sig carries only the parameter types ("i64, i1"),
+    // ret is the return type — emitted as `declare <ret> @name(<sig>)`
+    void EnsureIntrinsic(string name, string ret, string sig) {
+        if (ExternSeen(name)) { return; }
+        externDecls.Add(name);
+        H("declare " + ret + " @" + name + "(" + sig + ")");
+    }
+
+    // AES round function on two <2 x i64> operands (bitcast through <16 x i8>
+    // for the aesni intrinsics; xor-with-key for the "last" variants as the C
+    // host does). With xorKey the second operand is the round key and the
+    // intrinsic runs on the value alone, then XORs the key into the result.
+    ExprVal VecAesOp(Node e, string intrin, bool notUsed) {
+        ExprVal a = GenExpr(e.kids[0]);
+        ExprVal k = GenExpr(e.kids[1]);
+        string vt = "<2 x i64>";
+        string v8 = "<16 x i8>";
+        EnsureIntrinsic(intrin, v8, v8 + ", " + v8);
+        string a8 = NT();
+        L("  " + a8 + " = bitcast " + vt + " " + a.op + " to " + v8);
+        string z = NT();
+        L("  " + z + " = zeroinitializer");
+        string z8 = NT();
+        L("  " + z8 + " = bitcast " + vt + " " + z + " to " + v8);
+        string r8 = NT();
+        L("  " + r8 + " = call " + v8 + " @" + intrin + "(" + v8 + " " + a8 + ", " + v8 + " " + z8 + ")");
+        string r64 = NT();
+        L("  " + r64 + " = bitcast " + v8 + " " + r8 + " to " + vt);
+        string r = NT();
+        L("  " + r + " = xor " + vt + " " + r64 + ", " + k.op);
+        return new ExprVal(r, MkType("Vector128"));
+    }
+
+    // Dispatch a static call on a builtin type to its inline lowering.
+    // Returns null when the method is not a recognised builtin (caller falls
+    // through to the ordinary static-call path).
+    ExprVal GenBuiltinStatic(string cls, string m, Node e) {
+        int argc = e.kids.Count;
+        if (cls == "Vector128" || cls == "Vector256") {
+            int bits = cls == "Vector128" ? 128 : 256;
+            string rty = bits == 128 ? "Vector128" : "Vector256";
+            if (m == "Load" && (argc == 1 || argc == 2)) { return VecLoad(e, bits); }
+            if (m == "LoadVector128" && argc == 1) { return VecLoad(e, bits); }
+            if (m == "Store" && (argc == 2 || argc == 3)) {
+                ExprVal dst = GenExpr(e.kids[0]);
+                ExprVal v = GenExpr(e.kids[argc - 1]);
+                string vt = MapType(v.ty);
+                if (argc == 3) {
+                    ExprVal o = GenExpr(e.kids[1]);
+                    bool isArr = dst.ty != null && dst.ty.ival >= 1;
+                    string off = o.op;
+                    if (isArr) {
+                        string scaled = NT();
+                        L("  " + scaled + " = mul i64 " + o.op + ", 8");
+                        off = scaled;
+                    }
+                    string bp = VecBytePtr(dst);
+                    string ap = NT();
+                    L("  " + ap + " = getelementptr i8, i8* " + bp + ", i64 " + off);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + ap + " to " + vt + "*");
+                    L("  store " + vt + " " + v.op + ", " + vt + "* " + p);
+                } else {
+                    string dbp = VecBytePtr(dst);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + dbp + " to " + vt + "*");
+                    L("  store " + vt + " " + v.op + ", " + vt + "* " + p);
+                }
+                return new ExprVal("0", MkType("void"));
+            }
+            if (m == "Create" && argc == 1) { return VecCreate(e, bits); }
+            if (m == "Zero" && argc == 0) {
+                return new ExprVal("zeroinitializer", MkType(rty));
+            }
+            if (m == "AllBitsSet" && argc == 0) {
+                string vt = "<" + (bits / 64) + " x i64>";
+                string ones = NT();
+                L("  " + ones + " = insertelement " + vt + " undef, i64 -1, i32 0");
+                int lane = 1;
+                while (lane < bits / 64) {
+                    string r2 = NT();
+                    L("  " + r2 + " = insertelement " + vt + " " + ones + ", i64 -1, i32 " + lane);
+                    ones = r2;
+                    lane = lane + 1;
+                }
+                return new ExprVal(ones, MkType(rty));
+            }
+            // element-wise bitwise / arithmetic (i64 lanes)
+            if (m == "And" && argc == 2) { return VecBinOp(e, "and", rty); }
+            if (m == "Or" && argc == 2) { return VecBinOp(e, "or", rty); }
+            if (m == "Xor" && argc == 2) { return VecBinOp(e, "xor", rty); }
+            if (m == "AndNot" && argc == 2) {
+                // ~a & b via xor with all-ones then and (mirror C host semantics)
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string ones = NT();
+                L("  " + ones + " = insertelement " + vt + " undef, i64 -1, i32 0");
+                int lane = 1;
+                while (lane < bits / 64) {
+                    string r2 = NT();
+                    L("  " + r2 + " = insertelement " + vt + " " + ones + ", i64 -1, i32 " + lane);
+                    ones = r2;
+                    lane = lane + 1;
+                }
+                string na = NT();
+                L("  " + na + " = xor " + vt + " " + a.op + ", " + ones);
+                string r = NT();
+                L("  " + r + " = and " + vt + " " + na + ", " + b.op);
+                return new ExprVal(r, MkType(rty));
+            }
+            if (m == "Add" && argc == 2) { return VecBinOp(e, "add", rty); }
+            if (m == "Subtract" && argc == 2) { return VecBinOp(e, "sub", rty); }
+            if (m == "Multiply" && argc == 2) { return VecBinOp(e, "mul", rty); }
+            if ((m == "AddSaturate" || m == "SubtractSaturate") && argc == 2) {
+                // per-lane saturating add/sub (the intrinsic exists in LLVM 9+;
+                // stdlib byte paths use u8 lanes packed into i64 lanes)
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string opn = m == "AddSaturate" ? "llvm.uadd.sat" : "llvm.usub.sat";
+                string full = opn + ".v" + (bits / 64) + "i64";
+                if (!ExternSeen(full)) { externDecls.Add(full); H("declare " + vt + " @" + full + "(" + vt + ", " + vt + ")"); }
+                string fn = NT();
+                L("  " + fn + " = call " + vt + " @" + opn + ".v" + (bits / 64) + "i64(" + vt + " " + a.op + ", " + vt + " " + b.op + ")");
+                return new ExprVal(fn, MkType(rty));
+            }
+            if ((m == "Equals" || m == "CompareEqual") && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string c = NT();
+                L("  " + c + " = icmp eq " + vt + " " + a.op + ", " + b.op);
+                string r = NT();
+                L("  " + r + " = sext <" + vt.Substring(1, vt.IndexOf(" x")) + " x i1> " + c + " to " + vt);
+                return new ExprVal(r, MkType(rty));
+            }
+            if (m == "GreaterThan" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string c = NT();
+                L("  " + c + " = icmp sgt " + vt + " " + a.op + ", " + b.op);
+                string r = NT();
+                L("  " + r + " = sext <" + vt.Substring(1, vt.IndexOf(" x")) + " x i1> " + c + " to " + vt);
+                return new ExprVal(r, MkType(rty));
+            }
+            if (m == "LessThan" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string c = NT();
+                L("  " + c + " = icmp slt " + vt + " " + a.op + ", " + b.op);
+                string r = NT();
+                L("  " + r + " = sext <" + vt.Substring(1, vt.IndexOf(" x")) + " x i1> " + c + " to " + vt);
+                return new ExprVal(r, MkType(rty));
+            }
+            if (m == "ExtractMostSignificantBits" && argc == 1) {
+                // per-64-lane MSB gather: i64 lanes only need bit 63 of each
+                ExprVal a = GenExpr(e.kids[0]);
+                string vt = "<" + (bits / 64) + " x i64>";
+                string l0 = NT();
+                L("  " + l0 + " = extractelement " + vt + " " + a.op + ", i32 0");
+                string s0 = NT();
+                L("  " + s0 + " = lshr i64 " + l0 + ", 63");
+                string acc = s0;
+                int lane = 1;
+                while (lane < bits / 64) {
+                    string lv = NT();
+                    L("  " + lv + " = extractelement " + vt + " " + a.op + ", i32 " + lane);
+                    string sv = NT();
+                    L("  " + sv + " = lshr i64 " + lv + ", 63");
+                    string sh = NT();
+                    L("  " + sh + " = shl i64 " + sv + ", " + lane);
+                    string orv = NT();
+                    L("  " + orv + " = or i64 " + acc + ", " + sh);
+                    acc = orv;
+                    lane = lane + 1;
+                }
+                string t32 = NT();
+                L("  " + t32 + " = and i64 " + acc + ", 4294967295");
+                string r = NT();
+                L("  " + r + " = shl i64 " + t32 + ", 32");
+                string r2 = NT();
+                L("  " + r2 + " = ashr i64 " + r + ", 32");
+                return new ExprVal(r2, MkType("int"));
+            }
+            if (m == "MoveMask" && argc == 1) { return VecExtractMsb(e, bits); }
+        }
+        // Sse2 shares the Vector128 shapes (the C host routes Sse2.* through
+        // emit_vector128_call as well)
+        if (cls == "Sse2") {
+            string vt = "<2 x i64>";
+            if (m == "LoadVector128" && argc == 1) {
+                ExprVal vb = GenExpr(e.kids[0]);
+                string bp = VecBytePtr(vb);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + bp + " to " + vt + "*");
+                string v = NT();
+                L("  " + v + " = load " + vt + ", " + vt + "* " + p);
+                return new ExprVal(v, MkType("Vector128"));
+            }
+            if (m == "Store" && argc == 2) {
+                ExprVal dst = GenExpr(e.kids[0]);
+                ExprVal v = GenExpr(e.kids[1]);
+                string dbp = VecBytePtr(dst);
+                string p = NT();
+                L("  " + p + " = bitcast i8* " + dbp + " to " + vt + "*");
+                L("  store " + vt + " " + v.op + ", " + vt + "* " + p);
+                return new ExprVal("0", MkType("void"));
+            }
+            if (m == "And" && argc == 2) { return VecBinOp(e, "and", "Vector128"); }
+            if (m == "Or" && argc == 2) { return VecBinOp(e, "or", "Vector128"); }
+            if (m == "Xor" && argc == 2) { return VecBinOp(e, "xor", "Vector128"); }
+            if (m == "CompareEqual" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal b = GenExpr(e.kids[1]);
+                string c = NT();
+                L("  " + c + " = icmp eq " + vt + " " + a.op + ", " + b.op);
+                string r = NT();
+                L("  " + r + " = sext <" + vt.Substring(1, vt.IndexOf(" x")) + " x i1> " + c + " to " + vt);
+                return new ExprVal(r, MkType("Vector128"));
+            }
+            if (m == "MoveMask" && argc == 1) { return VecExtractMsb(e, 128); }
+        }
+        // AES-NI round intrinsics (the C host's emit_aes_call)
+        if (cls == "Aes") {
+            string vt = "<2 x i64>";
+            string v8 = "<16 x i8>";
+            if (m == "Encrypt" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesenc", false); }
+            if (m == "EncryptLast" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesenclast", false); }
+            if (m == "Decrypt" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesdec", false); }
+            if (m == "DecryptLast" && argc == 2) { return VecAesOp(e, "llvm.x86.aesni.aesdeclast", false); }
+            if (m == "InverseMixColumns" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.x86.aesni.aesimc", vt, vt);
+                string r = NT();
+                L("  " + r + " = call " + vt + " @llvm.x86.aesni.aesimc(" + vt + " " + a.op + ")");
+                return new ExprVal(r, MkType("Vector128"));
+            }
+            if (m == "KeygenAssist" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal rcon = GenExpr(e.kids[1]);
+                EnsureIntrinsic("llvm.x86.aesni.aeskeygenassist", vt, vt + ", i8");
+                string r8 = NT();
+                L("  " + r8 + " = trunc i64 " + rcon.op + " to i8");
+                string r = NT();
+                L("  " + r + " = call " + vt + " @llvm.x86.aesni.aeskeygenassist(" + vt + " " + a.op + ", i8 " + r8 + ")");
+                return new ExprVal(r, MkType("Vector128"));
+            }
+        }
+        if (cls == "BitOperations") {
+            if ((m == "PopCount" || m == "Popcount") && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.ctpop.i64", "i64", "i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.ctpop.i64(i64 " + a.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "LeadingZeroCount" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.ctlz.i64", "i64", "i64, i1");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.ctlz.i64(i64 " + a.op + ", i1 false)");
+                string r2 = NT();
+                L("  " + r2 + " = and i64 " + r + ", 4294967295");
+                string r3 = NT();
+                L("  " + r3 + " = shl i64 " + r2 + ", 32");
+                string r4 = NT();
+                L("  " + r4 + " = ashr i64 " + r3 + ", 32");
+                return new ExprVal(r4, MkType("int"));
+            }
+            if (m == "TrailingZeroCount" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.cttz.i64", "i64", "i64, i1");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.cttz.i64(i64 " + a.op + ", i1 false)");
+                string r2 = NT();
+                L("  " + r2 + " = and i64 " + r + ", 4294967295");
+                string r3 = NT();
+                L("  " + r3 + " = shl i64 " + r2 + ", 32");
+                string r4 = NT();
+                L("  " + r4 + " = ashr i64 " + r3 + ", 32");
+                return new ExprVal(r4, MkType("int"));
+            }
+            if (m == "RotateLeft" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal n = GenExpr(e.kids[1]);
+                EnsureIntrinsic("llvm.fshl.i64", "i64", "i64, i64, i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.fshl.i64(i64 " + a.op + ", i64 " + a.op + ", i64 " + n.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "RotateRight" && argc == 2) {
+                ExprVal a = GenExpr(e.kids[0]);
+                ExprVal n = GenExpr(e.kids[1]);
+                EnsureIntrinsic("llvm.fshr.i64", "i64", "i64, i64, i64");
+                string r = NT();
+                L("  " + r + " = call i64 @llvm.fshr.i64(i64 " + a.op + ", i64 " + a.op + ", i64 " + n.op + ")");
+                return new ExprVal(r, MkType("int"));
+            }
+            if (m == "IsPow2" && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                string nz = NT();
+                L("  " + nz + " = icmp ne i64 " + a.op + ", 0");
+                string m1 = NT();
+                L("  " + m1 + " = sub i64 " + a.op + ", 1");
+                string p2 = NT();
+                L("  " + p2 + " = icmp eq i64 " + a.op + ", " + m1);
+                string r = NT();
+                L("  " + r + " = and i1 " + nz + ", " + p2);
+                string r64 = NT();
+                L("  " + r64 + " = zext i1 " + r + " to i64");
+                return new ExprVal(r64, MkType("bool"));
+            }
+            if ((m == "Log2" || m == "Log2Floor") && argc == 1) {
+                ExprVal a = GenExpr(e.kids[0]);
+                EnsureIntrinsic("llvm.ctlz.i64", "i64", "i64, i1");
+                string lz = NT();
+                L("  " + lz + " = call i64 @llvm.ctlz.i64(i64 " + a.op + ", i1 false)");
+                string r = NT();
+                L("  " + r + " = sub i64 63, " + lz);
+                return new ExprVal(r, MkType("int"));
+            }
+        }
+        return null;
+    }
+
+    // byte-granular pmovmskb equivalent for the byte paths: gather the MSB of
+    // each of the 16/32 bytes into an int (mirrors llvm.x86.pmovmskb semantics
+    // portably across non-x86 targets, as the C host does).
+    ExprVal VecExtractMsb(Node e, int bits) {
+        ExprVal a = GenExpr(e.kids[0]);
+        string vt = "<" + (bits / 64) + " x i64>";
+        int lanes = bits / 64;
+        string acc = "0";
+        int byteIdx = 0;
+        while (byteIdx < bits / 8) {
+            int lane = byteIdx / 8;
+            int shift = (byteIdx % 8) * 8;
+            string lv = NT();
+            L("  " + lv + " = extractelement " + vt + " " + a.op + ", i32 " + lane);
+            string bv = NT();
+            L("  " + bv + " = lshr i64 " + lv + ", " + (shift + 7));
+            string bb = NT();
+            L("  " + bb + " = and i64 " + bv + ", 1");
+            string sb = NT();
+            L("  " + sb + " = shl i64 " + bb + ", " + byteIdx);
+            string orv = NT();
+            L("  " + orv + " = or i64 " + acc + ", " + sb);
+            acc = orv;
+            byteIdx = byteIdx + 1;
+        }
+        string t32 = NT();
+        L("  " + t32 + " = and i64 " + acc + ", 4294967295");
+        string r = NT();
+        L("  " + r + " = shl i64 " + t32 + ", 32");
+        string r2 = NT();
+        L("  " + r2 + " = ashr i64 " + r + ", 32");
+        return new ExprVal(r2, MkType("int"));
     }
 
     string MapType(Node t) {
@@ -405,6 +992,10 @@ partial class Irgen {
         if (n == "object" || n == "var") { return "i8*"; }
         if (n == "List" || n == "Dictionary" || n == "Dict") { return "i8*"; }
         if (n == "StringBuilder") { return "i8*"; }
+        // hardware vectors travel as first-class LLVM vector values (the C
+        // host's ABI); they are never heap objects
+        if (n == "Vector128") { return "<2 x i64>"; }
+        if (n == "Vector256") { return "<4 x i64>"; }
         // Span<T> is a non-owning view; the host carries { base, len } but the
         // selfhost backend has no aggregate values, so a span travels as its
         // base address (spans are never bounds-checked).
@@ -807,11 +1398,16 @@ partial class Irgen {
         H("@__exc_stack = global [64 x i8*] zeroinitializer");
         H("@__exc_val = global i8* null");
         H("@__exc_tid = global i8* null");
-        H("@__exc_bufs = global [64 x [32 x i64]] zeroinitializer");
+        // align 32: MSVC's _setjmp stores XMM state with movaps, which faults
+        // on a default-8-aligned global buffer
+        H("@__exc_bufs = global [64 x [32 x i64]] zeroinitializer, align 32");
         H("@__zan_argc = global i32 0");
         H("@__zan_argv = global i8** null");
         H("@.mode_rb = private unnamed_addr constant [3 x i8] c\"rb\\00\"");
-        H("@.mode_wb = private unnamed_addr constant [2 x i8] c\"w\\00\"");
+        // 写模式必须是 "wb"（二进制）：文本模式在 Windows 上会把每个 LF
+        // 翻成 CRLF，自举编译器写出的 .ll 因此与 C 宿主写出的不一致，
+        // 固定点 gen2==g3 永远不成立（与 stdlib File.WriteAllText 一致）。
+        H("@.mode_wb = private unnamed_addr constant [3 x i8] c\"wb\\00\"");
         H("@.fmt.nl = private unnamed_addr constant [6 x i8] c\"%lld\\0A\\00\"");
         H("@.fmt.nn = private unnamed_addr constant [5 x i8] c\"%lld\\00\"");
         H("@.fmt.snl = private unnamed_addr constant [4 x i8] c\"%s\\0A\\00\"");
@@ -833,7 +1429,9 @@ partial class Irgen {
         int i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
-            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitStruct(d); EmitStaticGlobals(d); EmitTid(d); }
+            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
+                if (d.sval != "Vector128" && d.sval != "Vector256") { EmitStruct(d); EmitStaticGlobals(d); EmitTid(d); }
+            }
             i = i + 1;
         }
         // vtables for polymorphic classes
@@ -847,7 +1445,8 @@ partial class Irgen {
         i = 0;
         while (i < unit.kids.Count) {
             Node d = unit.kids[i];
-            if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) { EmitClassDtor(d); }
+            if ((d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())
+                && d.sval != "Vector128" && d.sval != "Vector256") { EmitClassDtor(d); }
             i = i + 1;
         }
         // function bodies
@@ -872,6 +1471,9 @@ partial class Irgen {
     }
 
     void EmitStruct(Node cls) {
+        // hardware vectors are first-class LLVM vector values: no named type,
+        // no heap layout, no dtor
+        if (cls.sval == "Vector128" || cls.sval == "Vector256") { return; }
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(cls, names, types);
@@ -1198,6 +1800,8 @@ partial class Irgen {
         if (IsNullableValue(t)) { return false; }
         if (t.ival >= 1) { return false; }
         string n = t.sval;
+        // hardware vectors are first-class values, not ARC-managed heap objects
+        if (n == "Vector128" || n == "Vector256") { return false; }
         if (n == "List" || n == "Dictionary" || n == "Dict" || n == "StringBuilder") { return true; }
         Node d = binder.FindType(n);
         if (d != null && (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl())) { return true; }
@@ -1242,13 +1846,40 @@ partial class Irgen {
     }
 
     void AddTemp(string op, Node ty) {
-        if (ArcManaged(ty)) { stmtTemps.Add(op); stmtTempTypes.Add(ty); }
+        if (!ArcManaged(ty)) { return; }
+        // ARC 临时值的释放点固定在语句末尾，而它可能生成在某个分支里
+        // （三元、if 分支、循环体）。直接拿寄存器值去释放，会在合并块
+        // 里违反支配关系（LLVM: "Instruction does not dominate all uses"）。
+        // 与 C 宿主 emit_entry_alloca 同法：分支内生成的临时值落一个
+        // entry 槽位，释放时再 load 出来；分支没走时槽位是 null，
+        // zrelease(null) 是空操作。
+        if (eaActive && curLbl != "entry") {
+            string lt = MapType(ty);
+            string reg = NTS();
+            entryAllocas.Append("  " + reg + " = alloca " + lt + "\n");
+            entryAllocas.Append("  store " + lt + " null, " + lt + "* " + reg + "\n");
+            L("  store " + lt + " " + op + ", " + lt + "* " + reg);
+            stmtTemps.Add(reg);
+            stmtTempTypes.Add(ty);
+            return;
+        }
+        stmtTemps.Add(op);
+        stmtTempTypes.Add(ty);
     }
 
     void EmitTempReleases() {
         int i = 0;
         while (i < stmtTemps.Count) {
-            EmitArcRelease(stmtTemps[i], stmtTempTypes[i]);
+            string op = stmtTemps[i];
+            if (op.Length > 1 && op[1] == 122) {
+                // entry 槽位（%z 前缀）：load 出值再释放
+                string lt = MapType(stmtTempTypes[i]);
+                string v = NT();
+                L("  " + v + " = load " + lt + ", " + lt + "* " + op);
+                EmitArcRelease(v, stmtTempTypes[i]);
+            } else {
+                EmitArcRelease(op, stmtTempTypes[i]);
+            }
             i = i + 1;
         }
         stmtTemps = new List<string>();
@@ -2059,7 +2690,28 @@ partial class Irgen {
             Node m = cls.kids[i];
             if (m.kind == AK.MethodDecl()) {
                 // abstract/interface methods have no body: no function is emitted
-                if (HasMod(m, MOD.Extern())) { DeclareExtern(cls, m); }
+                if (HasMod(m, MOD.Extern())) {
+                    // builtin-lowered externs (Vector128/256 hardware SIMD,
+                    // BitOperations bit twiddling) get no declaration: their
+                    // call sites are lowered inline and nothing references
+                    // the raw symbol. NativeMemory keeps declarations only
+                    // for methods GenNativeMemory does not lower (they route
+                    // to zan_hw_* in the C runtime).
+                    bool lowered = false;
+                    if (cls.sval == "Vector128" || cls.sval == "Vector256" || cls.sval == "BitOperations"
+                        || cls.sval == "Sse2" || cls.sval == "Aes") {
+                        lowered = true;
+                    } else if (cls.sval == "NativeMemory") {
+                        string nm = ExternName(m);
+                        if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Fill"
+                            || nm == "Compare" || nm == "GetString" || nm == "PutString"
+                            || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
+                            || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode") {
+                            lowered = true;
+                        }
+                    }
+                    if (!lowered) { DeclareExtern(cls, m); }
+                }
                 else if (!IsAbstract(m)) { GenMethod(cls, m, false); }
             }
             else if (m.kind == AK.CtorDecl()) { GenCtor(cls, m); }

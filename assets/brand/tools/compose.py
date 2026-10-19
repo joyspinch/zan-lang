@@ -53,11 +53,11 @@ banner.paste(lock, (64, 44), lock)
 f_tag = font("consola.ttf", 44)
 d.text((88, 424), "AOT. ARC. Adorable.", font=f_tag, fill=(143, 163, 216))
 
-# right: mascot hero, bottom-aligned
+# right: mascot hero, feet landing on the volt baseline
 hero = Image.open(BRAND / "mascot/zanzi-hero.png")
-hh = 540
+hh = 500
 hero = hero.resize((int(hero.width * hh / hero.height), hh), Image.LANCZOS)
-banner.paste(hero, (W - hero.width - 36, H - hh + 30), hero)
+banner.paste(hero, (W - hero.width - 36, H - hh), hero)
 
 # thin volt baseline
 d.rectangle([0, H - 6, W, H], fill=VOLT)
@@ -79,13 +79,14 @@ swatches = [
     ("Volt Deep",    "#2141E6", "Gradient / Hover", VOLT_DEEP),
     ("Zan Sky",      "#7DA2FF", "Tint · 浅底",     SKY),
     ("Zan Spark",    "#FFC838", "Accent · 点缀",   SPARK),
-    ("Zan Cream",    "#FFF3DC", "Surface · 暖底",  (255, 243, 220)),
+    ("Zan Blush",    "#FFB3C7", "Accent 2 · 耳尖", (255, 179, 199)),
+    ("Zan Cream",    "#FFF6E8", "Surface · 毛色",  (255, 246, 232)),
     ("Zan Ink",      "#0F1428", "Text / Dark bg",  INK),
 ]
-sx, sy, sw, sh, gap = 90, 260, 440, 240, 35
+sx, sy, sw, sh, gap = 90, 260, 350, 240, 30
 for i, (name, hexc, role, rgb) in enumerate(swatches):
-    x = sx + (i % 3) * (sw + gap)
-    y = sy + (i // 3) * (sh + gap)
+    x = sx + (i % 4) * (sw + gap)
+    y = sy + (i // 4) * (sh + gap)
     cd.rounded_rectangle([x, y, x + sw, y + sh], radius=28, fill=rgb,
                          outline=(224, 230, 245), width=2)
     dark_bg = sum(rgb) < 420
@@ -109,10 +110,10 @@ for i, (name, hexc, rgb) in enumerate(sem):
 # mascot strip at the bottom, below the semantic row
 strip_names = ["zanzi-run", "zanzi-sleep", "zanzi-cheer", "zanzi-code"]
 strip_x = PW - 90
-strip_y = sy2 + 52 + 96 + 36
+strip_y = PH - 36 - 160
 for n in reversed(strip_names):
     im = Image.open(BRAND / f"mascot/{n}.png")
-    th = 200
+    th = 160
     im = im.resize((int(im.width * th / im.height), th), Image.LANCZOS)
     strip_x -= im.width + 18
     card.paste(im, (strip_x, strip_y), im)

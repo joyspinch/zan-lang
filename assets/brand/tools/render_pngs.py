@@ -5,21 +5,22 @@ from pathlib import Path
 from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-SRC = Path("D:/project/zan-lang/assets/brand/logo")
-DST = SRC / "png"
+SRC = Path("D:/project/zan-lang/assets/brand")
+DST = SRC / "logo" / "png"
 DST.mkdir(parents=True, exist_ok=True)
 HOLE_MIN_PX = 200  # enclosed backdrop pockets (wordmark counters) -> transparent
 
-# (svg, master(w,h), [(w,h), ...])
+# (svg, master(w,h), [(w,h), ...], out dir relative to assets/brand)
 JOBS = [
-    ("zan-mark.svg",           (2048, 2048), [(512, 512), (256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)]),
-    ("zan-mark-mono.svg",      (1024, 1024), [(512, 512), (256, 256)]),
-    ("zan-mark-white.svg",     (1024, 1024), [(512, 512)]),
-    ("zan-wordmark.svg",       (1280, 640),  [(640, 320)]),
-    ("zan-wordmark-white.svg", (1280, 640),  [(640, 320)]),
-    ("zan-logo-horizontal.svg",      (1970, 1024), [(985, 512)]),
-    ("zan-logo-horizontal-dark.svg", (1970, 1024), [(985, 512)]),
-    ("zan-logo-vertical.svg",        (1280, 1592), [(640, 796)]),
+    ("logo/zan-mark.svg",           (2048, 2048), [(512, 512), (256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)], "logo/png"),
+    ("logo/zan-mark-mono.svg",      (1024, 1024), [(512, 512), (256, 256)], "logo/png"),
+    ("logo/zan-mark-white.svg",     (1024, 1024), [(512, 512)], "logo/png"),
+    ("logo/zan-wordmark.svg",       (1280, 640),  [(640, 320)], "logo/png"),
+    ("logo/zan-wordmark-white.svg", (1280, 640),  [(640, 320)], "logo/png"),
+    ("logo/zan-logo-horizontal.svg",      (1970, 1024), [(985, 512)], "logo/png"),
+    ("logo/zan-logo-horizontal-dark.svg", (1970, 1024), [(985, 512)], "logo/png"),
+    ("logo/zan-logo-vertical.svg",        (1280, 1592), [(640, 796)], "logo/png"),
+    ("mascot/zanzi-glyph.svg",      (1024, 1024), [(256, 256), (128, 128), (64, 64), (32, 32)], "mascot/png"),
 ]
 
 def sized_svg(svg: Path, out: Path):
@@ -87,10 +88,12 @@ def key_magenta(im: Image.Image) -> Image.Image:
     out.putalpha(alpha)
     return out
 
-for svg, master, sizes in JOBS:
+for svg, master, sizes, outdir in JOBS:
     stem = Path(svg).stem
+    dst = SRC / outdir
+    dst.mkdir(parents=True, exist_ok=True)
     mw, mh = master
-    master_png = DST / f"_{stem}-master.png"
+    master_png = dst / f"_{stem}-master.png"
     if not shoot(svg, master_png, mw, mh):
         print(f"{stem}: MASTER FAILED", flush=True)
         continue
@@ -104,7 +107,7 @@ for svg, master, sizes in JOBS:
         master_png.unlink()
         continue
     for w, h in sizes:
-        im.resize((w, h), Image.LANCZOS).save(DST / f"{stem}-{w}.png")
+        im.resize((w, h), Image.LANCZOS).save(dst / f"{stem}-{w}.png")
         print(f"{stem}-{w}.png: {(w, h)}", flush=True)
     master_png.unlink()
 print("RENDER_DONE")
