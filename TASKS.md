@@ -462,3 +462,25 @@
   （注释里写过"自举常常留一个标识符的值类型没解析出来"），照搬"解析不出来就
   报错"会把合法程序也拒掉，所以要先摸清自举在哪些地方真的拿不到类型。
 - ⚠ 尚未开工：A401 只覆盖了**调用**路径，标识符/成员访问两条路还开着。
+- ✅ 已修（2026-10-20）：`GenIdent` / `GenMember` 的兜底改成诊断。
+  探针实测：**常见情形检查器早就拦住了**（`undefined identifier 'X'`、
+  `type 'X' has no member 'Y'`，与 C 宿主同款拒绝），所以这条兜底是
+  "检查器与后端不一致"时的**背靠背安全网**，不是日常路径——固定点门
+  （自举编自己的 62 个文件）与差分门（27 个用例 + 标准库）证明它平时不触发。
+  真正被它挖出来的是 A405。
+
+### [ ] A405 自举：不支持**静态属性**（`Cls.Prop`）——标准库 `Encoding.UTF8` 就是它
+
+- 现象（2026-10-20 差分门实测）：把 A404 改成 fail-closed 之后，标准库
+  `stdlib/System/Text/Encoding.zan:137` 报 `unresolved identifier 'Encoding'`：
+  ```zan
+  public static Encoding ASCII { get { return Encoding.UTF8; } }
+  ```
+  `Encoding.UTF8` 是**静态属性**，自举的 `GenMember` 只认静态**字段**、枚举成员、
+  静态方法组——静态属性落到兜底 → 之前**静默返回 0**（`Encoding.UTF8` 拿到 0，
+  编码整个是错的），现在报诊断。
+- 方向：静态属性就是**静态 getter 方法**（解析器把属性拆成 `get_Prop`），
+  按 C 宿主的口径降级成 `Cls.get_Prop()` 的静态调用。
+- ✅ 已修（2026-10-20）：`GenMember` 的静态分支加一条"找静态 `get_<name>`"
+  （`FindMethodUp` 会走基类链）；用例 `tests/conformance/static_property.zan`
+  钉住（自举与 C 宿主逐字一致）。

@@ -450,5 +450,22 @@ kernel32、shell32、user32、advapi32、version）。
   （`tests/selfhost/reject/unsupported_builtin_call.zan`、
   `tests/selfhost/reject/unresolved_call.zan`）。
 
+## 28. 标识符/成员/静态属性：兜底要报诊断，静态属性要降级成静态 getter 调用
+
+- 动作：
+  - `GenIdent` / `GenMember` 的兜底（"解析不出来"）也改成**报诊断**——这是
+    "检查器与后端不一致"时的背靠背安全网。常见情形**检查器早就拦住了**
+    （`undefined identifier 'X'` / `type 'X' has no member 'Y'`，与 C 宿主同款
+    拒绝），所以这条兜底平时不触发；固定点门（自举编自己的 62 个文件）与差分门
+    （27 个用例 + 标准库）是它的证据。
+  - **静态属性**（`Cls.Prop`，`public static T Prop { get { ... } }`）要降级成
+    **静态 getter 调用**：解析器把属性拆成 `get_<name>` 方法，所以静态分支要
+    多找一条 `FindMethodUp(tc, "get_" + name)` + `HasMod(Static)`。
+- 理由（2026-10-20 差分门实测）：标准库 `stdlib/System/Text/Encoding.zan`
+  里的 `Encoding.UTF8` 就是静态属性——自举以前**静默返回 0**（编码整个是错的，
+  没人跑到），把兜底改成诊断之后才暴露出来。
+- 边界：`FindMethodUp` / `FindStaticField` / `CollectFields` 都会走**基类链**，
+  所以继承来的字段、静态字段、静态属性都能找到；别在自举里另写一套查找。
+
 
 
