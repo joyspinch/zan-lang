@@ -1,0 +1,219 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Hosting;
+
+// cron 表达式（参考 Vixie cron 语义，与 NCrontab/Quartz 常用子集
+// 兼容）：分 时 日 月 周 五域，空格分隔。每域支持：
+//   *        全域
+//   5        单值
+//   1-5      闭区间
+//   */3      步进（从域下限起每 3）
+//   1-9/2    区间步进
+//   1,3,5    列表（元素可以是以上任何形式）
+//   5,10-20  混合列表
+// 周域 0/7 都表示星期日（0=周日..6=周六，与 DateTime.DayOfWeek 一致）。
+// 月域 1..12，日/时/分按历法常规。日与周同时被限定（都不是 *）时
+// 按惯例取并集（Vixie cron 语义）；否则取交集。
+//
+// 解析失败返回 null（Cron.Parse），调用方决定如何报错——不做
+// 隐式回退到"每分钟"，那种容错会掩盖配置错误。
+public class Cron {
+    // 五域各自的命中位图。
+    bool[] minute;   // 0..59
+    bool[] hour;     // 0..23
+    bool[] day;      // 1..31（下标 0 不用）
+    bool[] month;    // 1..12（下标 0 不用）
+    bool[] weekday;  // 0..6
+    bool dayStar;
+    bool weekdayStar;
+    string source;
+
+    Cron() { }
+
+    public string Source() { return this.source; }
+
+    // 解析 cron 表达式；失败返回 null。
+    public static Cron Parse(string expr) {
+        if (expr == null) { return null; }
+        List<string> parts = Cron.SplitFields(expr);
+        if (parts.Count != 5) { return null; }
+        Cron c = new Cron();
+        c.source = expr;
+        c.minute = new bool[60];
+        c.hour = new bool[24];
+        c.day = new bool[32];
+        c.month = new bool[13];
+        c.weekday = new bool[8];
+        c.dayStar = false;
+        c.weekdayStar = false;
+        if (!Cron.ParseField(parts[0], 0, 59, c.minute, null)) { return null; }
+        if (!Cron.ParseField(parts[1], 0, 23, c.hour, null)) { return null; }
+        if (!Cron.ParseField(parts[2], 1, 31, c.day, c)) { return null; }
+        if (!Cron.ParseField(parts[3], 1, 12, c.month, null)) { return null; }
+        // 周域先按 0..7 解析（7=周日并入 0），再校验域宽。
+        if (!Cron.ParseField(parts[4], 0, 7, c.weekday, c)) { return null; }
+        return c;
+    }
+
+    static List<string> SplitFields(string expr) {
+        List<string> parts = new List<string>();
+        int n = expr.Length;
+        int i = 0;
+        while (i < n) {
+            while (i < n && (expr[i] == ' ' || expr[i] == '\t')) { i = i + 1; }
+            if (i >= n) { break; }
+            int st = i;
+            while (i < n && expr[i] != ' ' && expr[i] != '\t') { i = i + 1; }
+            parts.Add(expr.Substring(st, i - st));
+        }
+        return parts;
+    }
+
+    // 解析单域：列表逗号分隔。low/high 是该域取值范围。target
+    // 是位图（weekday 用 0..6 / day/month 用 1..，数组冗余位忽略）。
+    // c 非空时（day/weekday 域）记录 * 标记。
+    static bool ParseField(string f, int low, int high, bool[] target, Cron c) {
+        if (f == null || f.Length == 0) { return false; }
+        bool star = f == "*";
+        if (c != null) {
+            if (target == c.day) { c.dayStar = star; }
+            if (target == c.weekday) { c.weekdayStar = star; }
+        }
+        int n = f.Length;
+        int i = 0;
+        while (i < n) {
+            int comma = f.IndexOf(",", i);
+            int end = comma >= 0 ? comma : n;
+            if (!Cron.ParseAtom(f.Substring(i, end - i), low, high, target)) {
+                return false;
+            }
+            if (comma < 0) { break; }
+            i = comma + 1;
+        }
+        return true;
+    }
+
+    // 单原子：* | a | a-b | *\/s | a-b\/s（反斜杠仅为注释，实现不含）。
+    static bool ParseAtom(string atom, int low, int high, bool[] target) {
+        if (atom.Length == 0) { return false; }
+        int step = 1;
+        string rangePart = atom;
+        int slash = atom.IndexOf("/");
+        if (slash >= 0) {
+            rangePart = atom.Substring(0, slash);
+            string stepPart = atom.Substring(slash + 1);
+            if (!Cron.AllDigits(stepPart)) { return false; }
+            step = Convert.ToInt32(stepPart);
+            if (step < 1) { return false; }
+        }
+        int a = low;
+        int b = high;
+        if (rangePart == "*") {
+            if (slash < 0) {
+                a = low; b = high;
+            } else {
+                a = low; b = high;
+            }
+        } else {
+            int dash = rangePart.IndexOf("-");
+            if (dash >= 0) {
+                string sa = rangePart.Substring(0, dash);
+                string sb = rangePart.Substring(dash + 1);
+                if (!Cron.AllDigits(sa) || !Cron.AllDigits(sb)) { return false; }
+                a = Convert.ToInt32(sa);
+                b = Convert.ToInt32(sb);
+            } else {
+                if (!Cron.AllDigits(rangePart)) { return false; }
+                a = Convert.ToInt32(rangePart);
+                if (slash >= 0) {
+                    // 5/3 语义：从 5 起到域顶，步进 3（NCrontab 惯例）。
+                    b = high;
+                } else {
+                    b = a;
+                }
+            }
+        }
+        if (a < low || b > high || a > b) { return false; }
+        for (int v = a; v <= b; v = v + step) {
+            target[v] = true;
+        }
+        // 周域 7 → 星期日（Vixie 惯例，0 与 7 都命中周日）。
+        if (high == 7 && a <= 7 && b >= 7) { target[0] = true; }
+        return true;
+    }
+
+    static bool AllDigits(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i];
+            if (c < 48 || c > 57) { return false; }
+        }
+        return true;
+    }
+
+    // 给定时刻（用 DateTime 的分解字段）是否命中。seconds 参数
+    // 只是完整性检查用（cron 最小粒度是分钟，秒必须为 0 才参与
+    // 判断——调用方按分钟对齐查询即可，这里不校验秒）。
+    public bool Matches(DateTime t) {
+        if (!this.minute[t.Minute()]) { return false; }
+        if (!this.hour[t.Hour()]) { return false; }
+        if (!this.month[t.Month()]) { return false; }
+        bool dayHit = this.day[t.Day()];
+        bool wdHit = this.weekday[t.DayOfWeek()];
+        bool domRestricted = !this.dayStar;
+        bool dowRestricted = !this.weekdayStar;
+        bool dateHit;
+        if (domRestricted && dowRestricted) {
+            // Vixie 惯例：两者都被限定时取并集。
+            dateHit = dayHit || wdHit;
+        } else if (domRestricted) {
+            dateHit = dayHit;
+        } else if (dowRestricted) {
+            dateHit = wdHit;
+        } else {
+            dateHit = true;
+        }
+        return dateHit;
+    }
+
+    // 自 `fromEpochMs` 起的下次命中时刻（毫秒，严格未来——当前
+    // 分钟命中不算）。最多向前搜 366 天，找不到（如 2 月 30 日）
+    // 返回 -1。解析期位图一次性建好，此函数只在任务每次触发后
+    // 重算一次，不在轮询热路径上。
+    public long NextAfter(long fromEpochMs) {
+        DateTime cur = DateTime.FromUnixMilliseconds(fromEpochMs);
+        // 对齐到下一分钟。
+        cur = cur.AddMilliseconds(0 - cur.Millisecond()).AddSeconds(60);
+        for (int day = 0; day < 366; day = day + 1) {
+            if (!this.month[cur.Month()] || !this.WeekdayHit(cur)) {
+                cur = cur.AddDays(1);
+                continue;
+            }
+            for (int h = 0; h < 24; h = h + 1) {
+                if (!this.hour[h]) { continue; }
+                for (int m = 0; m < 60; m = m + 1) {
+                    if (!this.minute[m]) { continue; }
+                    DateTime hit = DateTime.FromParts(cur.Year(), cur.Month(),
+                        cur.Day(), h, m, 0);
+                    if (hit.ToUnixMilliseconds() > fromEpochMs) {
+                        return hit.ToUnixMilliseconds();
+                    }
+                }
+            }
+            cur = cur.AddDays(1);
+        }
+        return 0 - 1;
+    }
+
+    bool WeekdayHit(DateTime t) {
+        bool dayHit = this.day[t.Day()];
+        bool wdHit = this.weekday[t.DayOfWeek()];
+        bool domRestricted = !this.dayStar;
+        bool dowRestricted = !this.weekdayStar;
+        if (domRestricted && dowRestricted) { return dayHit || wdHit; }
+        if (domRestricted) { return dayHit; }
+        if (dowRestricted) { return wdHit; }
+        return true;
+    }
+}

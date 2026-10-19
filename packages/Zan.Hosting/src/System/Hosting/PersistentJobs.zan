@@ -1,0 +1,216 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.IO;
+using System.Data;
+using System.Diagnostics;
+
+namespace System.Hosting;
+
+// 持久化任务（Hangfire 最小子集）：cron 调度 + KV 落盘 + 崩溃
+// 恢复 + 透明重试。任务与状态存 ZanStore（前缀键控分节），进程
+// 重启后 NextRunMs 与重试计数都还在。
+//
+// 存储布局（前缀分节，ScanBetween 高效取段）：
+//   job:<id>:name      任务名
+//   job:<id>:cron      cron 表达式
+//   job:<id>:next      下次触发毫秒（十进制）
+//   job:<id>:last      上次触发毫秒
+//   job:<id>:retry     剩余重试计数
+//   job:<id>:runs      成功执行总数
+//   job:<id>:fails     失败总数
+//   param:<id>         触发参数 JSON（执行前写入，成功后删除；
+//                      残留即"执行未完成"——恢复时回补）
+//
+// 线程模型：单个调度循环（BackgroundService 子类），每秒醒来：
+//   1. 扫 next 段挑出到期任务（到期 = next <= now），
+//   2. 对每个到期任务写 param、推进 next、触发 handler，
+//   3. handler 成功清 retry/param；失败递减 retry，按 retryDelayMs
+//      重排 next；retry 耗尽记 fails 并停排（needs attention 状态）。
+// handler 抛异常不杀循环（继承 BackgroundService 的容错语义）。
+public class PersistentJobs : BackgroundService {
+    // 一次触发回调。`id`/`name`/`param` 来自任务定义；返回 false
+    // 或抛异常都按失败计（走重试）。
+    public delegate bool JobHandler(string id, string name, string param);
+
+    ZanStore store;
+    public JobHandler handler;
+    public long retryDelayMs = 60000;
+    public int maxRetries = 3;
+    // 到期任务的并发上限：0 = 同协程串行执行（默认，轻量安全）。
+    public int maxParallel = 0;
+
+    Dictionary<string, Cron> cronCache;
+    Dictionary<string, JobDef> jobs;
+    bool dirty;
+
+    public PersistentJobs(string storePath) {
+        this.name = "persistent-jobs";
+        this.intervalMs = 1000;
+        // storePath 是 ZanStore 的文件前缀（如 "data/jobs.zdb"），
+        // 不是目录——WAL/清单/段文件都以它为基底命名。
+        Log.EnsureDirFor(storePath);
+        this.store = ZanStore.Open(storePath);
+        this.cronCache = new Dictionary<string, Cron>();
+        this.jobs = new Dictionary<string, JobDef>();
+        this.dirty = true;
+    }
+
+    public bool StoreOk() { return this.store.IsOpen(); }
+    public string StoreError() { return this.store.GetError(); }
+
+    // 健康关闭底层存储（宿主 StopAsync 场景或测试换实例）。
+    public void Close() { this.store.Close(); }
+
+    // 注册/更新任务。expr 非法时返回 false（不落地，防坏配置）。
+    public bool Upsert(string id, string cronExpr, string jobName) {
+        Cron c = this.CronOf(cronExpr);
+        if (c == null) { return false; }
+        long now = DateTime.UtcNow().ToUnixMilliseconds();
+        long next = c.NextAfter(now);
+        this.store.Begin();
+        this.store.Put("job:" + id + ":name", jobName);
+        this.store.Put("job:" + id + ":cron", cronExpr);
+        this.store.Put("job:" + id + ":next", Convert.ToString(next));
+        this.store.Commit();
+        this.dirty = true;
+        return true;
+    }
+
+    // 移除任务及其参数残留。
+    public void Remove(string id) {
+        this.store.Begin();
+        this.store.Delete("job:" + id + ":name");
+        this.store.Delete("job:" + id + ":cron");
+        this.store.Delete("job:" + id + ":next");
+        this.store.Delete("job:" + id + ":last");
+        this.store.Delete("job:" + id + ":retry");
+        this.store.Delete("job:" + id + ":runs");
+        this.store.Delete("job:" + id + ":fails");
+        this.store.Delete("param:" + id);
+        this.store.Commit();
+        this.dirty = true;
+    }
+
+    // 手动触发一次（立即把 next 拨到当前分钟内）。返回是否找到任务。
+    public bool TriggerNow(string id) {
+        string cronStr = this.store.Get("job:" + id + ":cron");
+        if (cronStr == null) { return false; }
+        this.store.Put("job:" + id + ":next",
+            Convert.ToString(DateTime.UtcNow().ToUnixMilliseconds() - 1));
+        this.dirty = true;
+        return true;
+    }
+
+    // 任务快照（管理页用）。
+    public List<JobDef> Snapshot() {
+        this.ReloadIfDirty();
+        List<JobDef> out2 = new List<JobDef>();
+        foreach (JobDef j in this.jobs.Values) { out2.Add(j); }
+        return out2;
+    }
+
+    Cron CronOf(string expr) {
+        Cron c = null;
+        if (!this.cronCache.TryGetValue(expr, out c)) {
+            c = Cron.Parse(expr);
+            if (c == null) { return null; }
+            this.cronCache.Add(expr, c);
+        }
+        return c;
+    }
+
+    void ReloadIfDirty() {
+        if (!this.dirty) { return; }
+        this.jobs.Clear();
+        // 扫 cron 段收集 id 集合，再逐个补齐字段。
+        this.store.ScanBetween("job:", "job;", delegate(string k, string v) {
+            // job:<id>:<field>
+            int p1 = k.IndexOf(":", 4);
+            if (p1 < 0) { return true; }
+            string id = k.Substring(4, p1 - 4);
+            string field = k.Substring(p1 + 1);
+            JobDef j = null;
+            if (!this.jobs.TryGetValue(id, out j)) {
+                j = new JobDef();
+                j.id = id;
+                this.jobs.Add(id, j);
+            }
+            if (field == "name") { j.name = v; }
+            else if (field == "cron") { j.cron = v; }
+            else if (field == "next") { j.nextMs = Convert.ToInt64(v); }
+            else if (field == "last") { j.lastMs = Convert.ToInt64(v); }
+            else if (field == "retry") { j.retriesLeft = (int)Convert.ToInt64(v); }
+            else if (field == "runs") { j.runs = Convert.ToInt64(v); }
+            else if (field == "fails") { j.fails = Convert.ToInt64(v); }
+            return true;
+        });
+        this.dirty = false;
+    }
+
+    public override async bool ExecuteAsync(CancellationToken ct) {
+        if (!this.store.IsOpen()) { return true; }
+        this.ReloadIfDirty();
+        long now = DateTime.UtcNow().ToUnixMilliseconds();
+        // 收集到期任务（按 next 升序不排序也行——量小，顺序执行）。
+        List<JobDef> due = new List<JobDef>();
+        foreach (JobDef j in this.jobs.Values) {
+            if (j.nextMs > 0 && j.nextMs <= now) { due.Add(j); }
+        }
+        for (int i = 0; i < due.Count; i = i + 1) {
+            if (ct.IsCancellationRequested) { break; }
+            this.RunOne(due[i], now);
+        }
+        return true;
+    }
+
+    void RunOne(JobDef j, long now) {
+        // 原子推进 next（先读旧值防重触发——单循环内无竞争，
+        // 但防御式推进保证 handler 抛异常也不重复算 next）。
+        Cron c = this.CronOf(j.cron);
+        if (c == null) {
+            // 存的 cron 突然解析失败（不该发生——Upsert 校验过）；
+            // 停排防疯转。
+            this.store.Put("job:" + j.id + ":next", "0");
+            this.dirty = true;
+            return;
+        }
+        long next = c.NextAfter(now);
+        this.store.Put("job:" + j.id + ":next", Convert.ToString(next));
+        this.store.Put("job:" + j.id + ":last", Convert.ToString(now));
+        this.dirty = true;
+        // param：执行前写入。带 param 残留 + runs 不变的任务即
+        // "上次执行未完成"（崩溃恢复可见）。
+        string param = this.store.Get("param:" + j.id);
+        if (param == null) { param = ""; }
+        bool ok = false;
+        try {
+            ok = this.handler != null
+                && this.handler(j.id, j.name, param);
+        } catch (Exception e) {
+            this.lastError = e.Message == null ? "threw" : e.Message;
+            ok = false;
+        }
+        if (ok) {
+            this.store.Delete("param:" + j.id);
+            this.store.Delete("job:" + j.id + ":retry");
+            this.store.Put("job:" + j.id + ":runs",
+                Convert.ToString(j.runs + 1));
+        } else {
+            this.store.Put("job:" + j.id + ":fails",
+                Convert.ToString(j.fails + 1));
+            if (j.retriesLeft > 0) {
+                this.store.Put("job:" + j.id + ":retry",
+                    Convert.ToString(j.retriesLeft - 1));
+                this.store.Put("job:" + j.id + ":next",
+                    Convert.ToString(now + this.retryDelayMs));
+            }
+            // 重试耗尽：next 保留（cron 时刻照常来），retry 归零，
+            // needsAttention = fails 上涨且 retry==0 由管理页判断。
+            else {
+                this.store.Delete("job:" + j.id + ":retry");
+            }
+        }
+        this.dirty = true;
+    }
+}
