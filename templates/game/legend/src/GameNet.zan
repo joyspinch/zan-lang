@@ -659,6 +659,10 @@ public class GameNet {
                 this.PostLinkDown("握手派生失败");
                 return "stop";
             }
+            this.PushDiag("hs snonce=" + Convert.ToString(snonce.Length)
+                + " cnonce=" + Convert.ToString(cnonce.Length)
+                + " master=" + (master == null ? "null" : Convert.ToString(master.Length))
+                + " pass=" + Convert.ToString(this.cPass.Length));
             JsonValue hello = JsonValue.NewObject();
             hello.PutStr("op", "hello");
             hello.PutStr("enc", "aes-gcm");
@@ -675,9 +679,11 @@ public class GameNet {
             /* 加密通告：切换发送加密，随即认领推送通道（应答带
                push:1，走解密路径回 UI）。 */
             this.wenc = true;
+            this.PushDiag("ack[" + line + "]");
             JsonValue attach = JsonValue.NewObject();
             attach.PutStr("op", "attach");
             attach.PutStr("token", this.token);
+            this.PushDiag("attach tokenLen=" + Convert.ToString(this.token.Length));
             if (this.WSendText(this.secTx.Seal(attach.ToJson()) + "\n")) {
                 return "swallow";
             }
@@ -807,6 +813,14 @@ public class GameNet {
         Mutex.Unlock(GameNet.httpLock);
     }
     static string traceBuf = "";
+    /* 推送通道调试：最近若干条握手/失败记录（只在 UiDriver 探针里读）。
+       只留最近 400 字符——推送断线重连是长期循环，不封顶会一直涨。*/
+    string pushDiag = "";
+    void PushDiag(string what) {
+        string s = what + " | " + this.pushDiag;
+        if (s.Length > 400) { s = s.Substring(0, 400); }
+        this.pushDiag = s;
+    }
 
     /* UI 线程每帧：并入完成的 HTTP 应答（401/429/解析都在
        OnHttpReply），并发起 25 秒会话保活轮询——服务端按「最后一次
@@ -815,6 +829,7 @@ public class GameNet {
     void PollHttp() {
         try {
             if (UiDriver.Active()) { UiDriver.SetProbe("net-http2", GameNet.traceBuf); }
+            if (UiDriver.Active()) { UiDriver.SetProbe("push-diag", this.pushDiag); }
         } catch (Exception) { }
         long now = DateTime.UtcNow().epoch;
         if (this.token.Length > 0 && now - this.lastPollAt >= 25) {
@@ -977,9 +992,15 @@ public class GameNet {
     /* UI 线程：网络线程投来的原始行。推送通道建立后先解帧再解析；
      * 解不开 = 被篡改/重放，摘通道重连。*/
     void OnLine(string line) {
-        if (this.sec != null) {
+        /* 框定规则与服务端 Handle 一致：'{' 开头即明文 JSON，其余才算
+           Base64 加密帧。握手被拒时服务端仍回明文（如「服务器密码不正确」），
+           一律按加密帧解会把真正的错误盖成「加密帧校验失败」（实测）。*/
+        bool clearText = line.Length > 0 && line[0] == '{';
+        if (this.sec != null && !clearText) {
             string plain = this.sec.Open(line);
             if (plain == null) {
+                this.PushDiag("DECRYPT-FAIL n=" + Convert.ToString(line.Length)
+                    + " [" + (line.Length > 90 ? line.Substring(0, 90) : line) + "]");
                 this.pushUp = false;
                 this.ready = false;
                 this.sec = null;
@@ -1014,7 +1035,7 @@ public class GameNet {
     void SyncPlayerState(JsonValue st) {
         if (st == null) { return; }
         if (this.typedSelf == null) { this.typedSelf = new PlayerState(); }
-        this.typedSelf.Id = st.Int("id", this.typedSelf.Id);
+        this.typedSelf.Id = st.Int("uid", st.Int("id", this.typedSelf.Id));
         this.typedSelf.Name = st.Str("name", this.typedSelf.Name);
         this.typedSelf.Realm = st.Int("realm", this.typedSelf.Realm);
         this.typedSelf.Level = st.Int("level", this.typedSelf.Level);
@@ -1027,7 +1048,9 @@ public class GameNet {
         this.typedSelf.Atk = st.Int("atk", this.typedSelf.Atk);
         this.typedSelf.Def = st.Int("def", this.typedSelf.Def);
         this.typedSelf.Gold = (long)st.Int("gold", (int)this.typedSelf.Gold);
-        this.typedSelf.Ingots = (long)st.Int("ingots", (int)this.typedSelf.Ingots);
+        /* 服务端 self 的元宝字段名是 gems（Gateway.SelfJson 同时给了
+           yuan 别名）；旧客户端读 ingots → 永远 0，左栏元宝显示假值。*/
+        this.typedSelf.Ingots = (long)st.Int("gems", st.Int("yuan", (int)this.typedSelf.Ingots));
         this.typedSelf.Kills = st.Int("kills", this.typedSelf.Kills);
         this.typedSelf.MapId = st.Int("map", this.typedSelf.MapId);
         this.typedSelf.MapUnlocked = st.Int("mapUnlocked", this.typedSelf.MapUnlocked);
