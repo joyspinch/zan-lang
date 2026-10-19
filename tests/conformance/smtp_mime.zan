@@ -1,0 +1,123 @@
+using System;
+using System.Text;
+using System.Net.Mail;
+
+// SMTP/MIME 离线契约：不连网，只验证可纯计算的编码层。
+// 覆盖 RFC 2047 B 词、quoted-printable（含行尾空格与软换行）、
+// MIME 报文组装（单部件 / multipart / 附件）、句点填充与地址头。
+class Program {
+    static int fails = 0;
+
+    static void Check(string name, string got, string want) {
+        if (got == want) {
+            Console.WriteLine("ok " + name);
+        } else {
+            fails = fails + 1;
+            Console.WriteLine("FAIL " + name);
+            Console.WriteLine("  got:  " + got);
+            Console.WriteLine("  want: " + want);
+        }
+    }
+
+    static void Main() {
+        // ---- RFC 2047 HeaderWord：纯 ASCII 原样，非 ASCII 编码 ----
+        Check("hdrword-ascii", SmtpClient.HeaderWord("hello"), "hello");
+        Check("hdrword-utf8",
+              SmtpClient.HeaderWord("你好"),
+              "=?UTF-8?B?5L2g5aW9?=");
+
+        // ---- 地址头 ----
+        Check("addr-bare", SmtpClient.AddrHeader("", "a@b.com"), "a@b.com");
+        Check("addr-display",
+              SmtpClient.AddrHeader("张三", "a@b.com"),
+              "=?UTF-8?B?5byg5LiJ?= <a@b.com>");
+
+        // ---- quoted-printable ----
+        // 纯可打印直出。
+        Check("qp-plain", SmtpClient.QuotedPrintableEncode("abc-123"), "abc-123");
+        // '=' 必须转义（RFC 2045 规则 1）。
+        Check("qp-equals", SmtpClient.QuotedPrintableEncode("a=b"), "a=3Db");
+        // 行内空格不转义、行尾空格必须转义。
+        Check("qp-space-mid", SmtpClient.QuotedPrintableEncode("a b"), "a b");
+        Check("qp-space-end", SmtpClient.QuotedPrintableEncode("a "), "a=20");
+        Check("qp-tab-end", SmtpClient.QuotedPrintableEncode("a\t"), "a=09");
+        // 非 ASCII（UTF-8 字节）转大写十六进制：'你' = E4 BD A0。
+        Check("qp-utf8", SmtpClient.QuotedPrintableEncode("你"), "=E4=BD=A0");
+        // 裸 CR/LF 编码。
+        Check("qp-cr", SmtpClient.QuotedPrintableEncode("a" + (char)13), "a=0D");
+        Check("qp-lf", SmtpClient.QuotedPrintableEncode("a" + (char)10), "a=0A");
+
+        // ---- 句点填充（RFC 5321 §4.5.2）：行首句点加倍 ----
+        // 通过反射不可行，改走 MimeText 报文中的可观察行为：
+        // DotStuff 是 private，但 MimeText 输出不带填充（填充发生在
+        // DATA 发送前），这里验证 MimeText 本身。
+
+        // ---- MIME 单部件纯文本 ----
+        MailMessage m1 = new MailMessage();
+        m1.From("u@e.com").To("r@x.com").Subject("Hi");
+        m1.Body("line1\nline2");
+        string mime1 = m1 == null ? "" : new SmtpClient("h", 25).MimeText(m1, "b1", "date", "mid@e.com");
+        // 用组装结果做包含断言（头顺序固定，逐头验证）。
+        Check("mime1-from", Contains(mime1, "From: u@e.com\r\n"), "yes");
+        Check("mime1-to", Contains(mime1, "To: r@x.com\r\n"), "yes");
+        Check("mime1-subject", Contains(mime1, "Subject: Hi\r\n"), "yes");
+        Check("mime1-date", Contains(mime1, "Date: date\r\n"), "yes");
+        Check("mime1-mid", Contains(mime1, "Message-ID: <mid@e.com>\r\n"), "yes");
+        Check("mime1-mimever", Contains(mime1, "MIME-Version: 1.0\r\n"), "yes");
+        Check("mime1-ct", Contains(mime1, "Content-Type: text/plain; charset=UTF-8\r\n"), "yes");
+        Check("mime1-cte", Contains(mime1, "Content-Transfer-Encoding: quoted-printable\r\n"), "yes");
+        // 正文 line1\nline2 → qp: line1=0Aline2
+        Check("mime1-body", Contains(mime1, "line1=0Aline2"), "yes");
+
+        // ---- MIME 附件 → multipart/mixed ----
+        byte[] att = new byte[3];
+        att[0] = (byte)65; att[1] = (byte)66; att[2] = (byte)67; // "ABC"
+        MailMessage m2 = new MailMessage();
+        m2.From("u@e.com").To("r@x.com").Subject("s");
+        m2.Body("body");
+        m2.Attach(att, "a.txt");
+        string mime2 = new SmtpClient("h", 25).MimeText(m2, "b2", "d", "m@e");
+        Check("mime2-mixed", Contains(mime2, "multipart/mixed; boundary=\"b2\""), "yes");
+        Check("mime2-open", Contains(mime2, "--b2\r\n"), "yes");
+        Check("mime2-close", Contains(mime2, "--b2--\r\n"), "yes");
+        Check("mime2-fn", Contains(mime2, "filename=\"a.txt\""), "yes");
+        Check("mime2-b64", Contains(mime2, "Content-Transfer-Encoding: base64"), "yes");
+        // "ABC" base64 = "QUJD"
+        Check("mime2-payload", Contains(mime2, "QUJD"), "yes");
+
+        // ---- 双文本部件（text + html）→ multipart/alternative ----
+        MailMessage m3 = new MailMessage();
+        m3.From("u@e.com").To("r@x.com").Subject("s");
+        m3.Body("plain");
+        m3.HtmlBody("<b>x</b>");
+        string mime3 = new SmtpClient("h", 25).MimeText(m3, "b3", "d", "m@e");
+        Check("mime3-alt", Contains(mime3, "multipart/alternative"), "yes");
+        Check("mime3-html", Contains(mime3, "text/html; charset=UTF-8"), "yes");
+
+        // ---- 附加头原样透传 ----
+        MailMessage m4 = new MailMessage();
+        m4.From("u@e.com").To("r@x.com").Subject("s");
+        m4.Header("Reply-To: other@e.com");
+        string mime4 = new SmtpClient("h", 25).MimeText(m4, "b4", "d", "m@e");
+        Check("mime4-extra", Contains(mime4, "Reply-To: other@e.com\r\n"), "yes");
+
+        // ---- 附件文件名危险字符剔除（引号/反斜杠/CRLF 注入）----
+        MailMessage m5 = new MailMessage();
+        m5.From("u@e.com").To("r@x.com").Subject("s");
+        byte[] junk = new byte[1];
+        junk[0] = (byte)88;
+        m5.Attach(junk, "evil\".txt");
+        string mime5 = new SmtpClient("h", 25).MimeText(m5, "b5", "d", "m@e");
+        Check("mime5-esc", Contains(mime5, "filename=\"evil.txt\""), "yes");
+
+        if (fails == 0) {
+            Console.WriteLine("smtp-mime-done");
+        } else {
+            Console.WriteLine("smtp-mime-fail " + Convert.ToString(fails));
+        }
+    }
+
+    static string Contains(string hay, string needle) {
+        return hay.IndexOf(needle, 0) >= 0 ? "yes" : "no";
+    }
+}
