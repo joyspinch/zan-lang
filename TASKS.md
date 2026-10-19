@@ -67,6 +67,30 @@
   另外 async 方法的返回类型 `Task<T>` 自举还不认识（`unknown type 'Task'`），
   只能先覆盖 `async void`。
 
+### [ ] A394 自举在**同步**上下文里遇到 `await` 不 fail-closed——生成读地址 0 的非法 IR
+
+- 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_capparam.zan`）：
+  ```zan
+  static void Main() {            // 没有 async 修饰，但函数体里有 await
+      A1(3);                       // A1 是 async void
+      await Task.Delay(80);
+      Console.WriteLine("done");
+  }
+  ```
+  - C 宿主：把 `Main` 当协程处理，程序正常跑完。
+  - 自举（HEAD 与修复后都一样）：`Main` 仍按**同步**方法生成，但 `await` 落到
+    `EmitAwait` 的非 async 分支，它把 await 的操作数当**协程帧指针**用：
+    `bitcast i8* 0 to i64*` → 读地址 0 的槽 5 → clang 直接报
+    `integer constant must have integer type`（链接失败）。
+- 根因：自举只认**显式** `async` 修饰的方法是协程；隐式 async（函数体里有
+  await 但没写 async）与「同步上下文里的 await」都没有被检查器拒绝。
+- 方向：两件事要分开做——(1) 检查器对「同步方法体里的 await」报诊断
+  （fail-closed，而不是生成坏 IR）；(2) 决定隐式 async Main 是否要支持
+  （C 宿主支持，自举目前要求显式 `async void Main()`）。
+- ⚠ 这条与 A393 无关：A393 修的是 **async 方法的调用点不启动协程**；
+  两者都在 async 路径上，但根因不同，修完都要重跑 `selfhost_fixed_point`
+  与差分门。
+
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，

@@ -259,6 +259,15 @@ links, runs the programs and compares stdout with the C host's golden file.
   - New gap tracked as `A393`: calling an `async void` method does not start a
     coroutine in the self-hosted backend — the body is dropped entirely, while
     the C host runs it.
+- An eleventh round (2026-10-20) made an **async call site start the
+  coroutine**. The ramp of an async method only allocates the frame — the body
+  runs from `$resume` — so a fire-and-forget call (`Work();`) had to hand the
+  frame to the cooperative scheduler (`zan_co_ready`) or the method body never
+  ran at all. The resume entry is read from the frame's slot 5, so this also
+  works through a dispatch. Only a *real* async call may be detached: the
+  value carries an `asyncCall` marker, because the degraded paths also carry
+  the `__task` type with the constant `0` as their value, and detaching that
+  reads address 0. The differential-gate case `async_void_call` pins it.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR

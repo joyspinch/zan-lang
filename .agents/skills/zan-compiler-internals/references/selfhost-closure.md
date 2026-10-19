@@ -307,3 +307,21 @@ kernel32、shell32、user32、advapi32、version）。
   这段窗口里，就可疑；重跑时**不要碰源码**。
 - 边界：真正的固定点破坏通常表现为"两代产物大小差几千字节且内容稳定可复现"；
   一次性的、随跑随变的大小差，先怀疑环境（竞态、并发 tier 重编 `zanc`）。
+
+## 20. async 方法的调用点：帧必须挂上调度器，否则方法体根本不执行
+
+- 动作：async 方法的 ramp **只分配帧并返回**（方法体从 `$resume` 跑）。调用点
+  在**语句位置**（fire-and-forget）必须把帧交给协作调度器：
+  `zan_co_ready(frame, resume)`。resume 入口从**帧的槽 5** 读（ramp 写在那儿），
+  不要按名字找 `<callee>$resume`（间接派发时根本找不到）。
+- 理由（2026-10-20 实测，用例 `tests/conformance/async_void_call.zan`）：自举原来
+  只 `call` 拿帧指针就丢掉 → 被调 async 方法**整个方法体不执行**
+  （C 宿主输出 `work` / `done`，自举只输出 `done`）。C 宿主在调用点做同一件事
+  （`irgen_call.c` 的 `emit_detach_async_call`）。
+- 连带：只有**真正的 async 调用**才能 detach——用 `ExprVal.asyncCall` 标记区分，
+  **别用「类型是 `__task`」**：降级路径（await 的操作数、还不认识的类型）也会带
+  `__task` 类型但值是常量 `0`，detach 它会生成 `bitcast i8* 0 to i64*`，
+  读地址 0 的槽 → clang 报 `integer constant must have integer type`。
+- 边界：`await` 路径自己管调度（`EmitAwait` 里已经 `zan_co_ready`），不要再
+  detach 一次；同步 `Main` 里调用 async 方法没有调度器在跑 → 方法体不执行
+  （与 C 宿主一致，别去"修"成会执行）。
