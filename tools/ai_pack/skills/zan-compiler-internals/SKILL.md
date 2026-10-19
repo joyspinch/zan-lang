@@ -10,6 +10,7 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 - 前端解析与语义绑定：[frontend-binder.md](references/frontend-binder.md)
 - LLVM 指令生成与向量优化：[irgen-llvm.md](references/irgen-llvm.md)
 - 运行时数据布局与 ARC 模型：[runtime-abi.md](references/runtime-abi.md)
+- 自举闭环不变量（src/selfhost 改动必读）：[selfhost-closure.md](references/selfhost-closure.md)
 
 ---
 

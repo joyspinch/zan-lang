@@ -23,41 +23,48 @@ if(NOT ZANC OR NOT SELFHOST_DIR OR NOT CLANG OR NOT GEN1 OR NOT GEN2 OR NOT G2LL
 endif()
 
 # The driver (main.zan) must come first so its Program.Main is the entry point.
-set(_srcs
-  ${SELFHOST_DIR}/main.zan
-  ${SELFHOST_DIR}/irgen.zan
-  ${SELFHOST_DIR}/irgen_async.zan
-  ${SELFHOST_DIR}/irgen_stmt.zan
-  ${SELFHOST_DIR}/irgen_expr.zan
-  ${SELFHOST_DIR}/checker.zan
-  ${SELFHOST_DIR}/binder.zan
-  ${SELFHOST_DIR}/diag.zan
-  ${SELFHOST_DIR}/parser.zan
-  ${SELFHOST_DIR}/jsongen.zan
-  ${SELFHOST_DIR}/attrgen.zan
-  ${SELFHOST_DIR}/dbgen.zan
-  ${SELFHOST_DIR}/lexer.zan
-  ${SELFHOST_DIR}/ngen.zan
-  ${SELFHOST_DIR}/ngen_macho.zan
-  ${SELFHOST_DIR}/../selfhost_runtime/ngen_obj.zan
-  ${SELFHOST_DIR}/ngen_x86.zan
-  ${SELFHOST_DIR}/../selfhost_runtime/ngen_host.zan
-  ${SELFHOST_DIR}/ngen_numeric.zan
-  ${SELFHOST_DIR}/ngen_guard.zan
-  ${SELFHOST_DIR}/ngen_string.zan
-  ${SELFHOST_DIR}/ngen_layout.zan
-  ${SELFHOST_DIR}/ngen_conversion.zan
-  ${SELFHOST_DIR}/ngen_delegate.zan
-  ${SELFHOST_DIR}/ngen_binding.zan
-  ${SELFHOST_DIR}/nio.zan
-  ${SELFHOST_DIR}/ast.zan
-  ${SELFHOST_DIR}/token.zan
-  ${SELFHOST_DIR}/ngen_async.zan
-  ${SELFHOST_DIR}/ngen_elf.zan
-  ${SELFHOST_DIR}/ngen_coff.zan
-  ${SELFHOST_DIR}/ngen_reflect.zan
-  ${SELFHOST_DIR}/lsp.zan
-  ${SELFHOST_DIR}/ngen_wasm.zan)
+# SELFHOST_SOURCES comes from scripts/selfhost_sources.txt (one canonical list
+# shared with scripts/bootstrap.*); the inline list below is the fallback for
+# direct `cmake -P` invocations that do not pass it.
+if(SELFHOST_SOURCES)
+  set(_srcs ${SELFHOST_SOURCES})
+else()
+  set(_srcs
+    ${SELFHOST_DIR}/main.zan
+    ${SELFHOST_DIR}/irgen.zan
+    ${SELFHOST_DIR}/irgen_async.zan
+    ${SELFHOST_DIR}/irgen_stmt.zan
+    ${SELFHOST_DIR}/irgen_expr.zan
+    ${SELFHOST_DIR}/checker.zan
+    ${SELFHOST_DIR}/binder.zan
+    ${SELFHOST_DIR}/diag.zan
+    ${SELFHOST_DIR}/parser.zan
+    ${SELFHOST_DIR}/jsongen.zan
+    ${SELFHOST_DIR}/attrgen.zan
+    ${SELFHOST_DIR}/dbgen.zan
+    ${SELFHOST_DIR}/lexer.zan
+    ${SELFHOST_DIR}/ngen.zan
+    ${SELFHOST_DIR}/ngen_macho.zan
+    ${SELFHOST_DIR}/../selfhost_runtime/ngen_obj.zan
+    ${SELFHOST_DIR}/ngen_x86.zan
+    ${SELFHOST_DIR}/../selfhost_runtime/ngen_host.zan
+    ${SELFHOST_DIR}/ngen_numeric.zan
+    ${SELFHOST_DIR}/ngen_guard.zan
+    ${SELFHOST_DIR}/ngen_string.zan
+    ${SELFHOST_DIR}/ngen_layout.zan
+    ${SELFHOST_DIR}/ngen_conversion.zan
+    ${SELFHOST_DIR}/ngen_delegate.zan
+    ${SELFHOST_DIR}/ngen_binding.zan
+    ${SELFHOST_DIR}/nio.zan
+    ${SELFHOST_DIR}/ast.zan
+    ${SELFHOST_DIR}/token.zan
+    ${SELFHOST_DIR}/ngen_async.zan
+    ${SELFHOST_DIR}/ngen_elf.zan
+    ${SELFHOST_DIR}/ngen_coff.zan
+    ${SELFHOST_DIR}/ngen_reflect.zan
+    ${SELFHOST_DIR}/lsp.zan
+    ${SELFHOST_DIR}/ngen_wasm.zan)
+endif()
 
 # ---- gen0 -> gen1 ----
 list(GET _srcs 0 _first)
@@ -85,7 +92,7 @@ endif()
 # ---- clang g2.ll -> gen2 ----
 file(REMOVE ${GEN2})
 execute_process(
-  COMMAND ${CLANG} ${G2LL} ${RT_OBJS} -o ${GEN2} ${STACK_ARGS}
+  COMMAND ${CLANG} ${G2LL} ${RT_OBJS} ${SYSLIBS} -o ${GEN2} ${STACK_ARGS}
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 if(NOT rc EQUAL 0)
   message(FATAL_ERROR "clang g2.ll -> gen2 failed (rc=${rc})\n${out}${err}")

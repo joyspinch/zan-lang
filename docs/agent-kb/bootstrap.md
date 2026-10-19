@@ -13,21 +13,20 @@ point (two successive self-compiles produce byte-identical output).
 | gen2 | gen1 compiling its own source to `g2.ll`, then linked by clang    | gen1 + clang |
 | gen3 | gen2 compiling the same source to `g3.ll`                         | gen2 |
 
-> **⚠️ 2026-08-08 状态：固定点已破（`TASKS.md` B6-SH1）。** gen1 → g2.ll 当前
-> 失败，根因是自举编译器没实现 `ref`/`out` **形参声明**（`dbgen.zan` 自
-> `e01975ee` 起用了 `ref int outKind`，1 个签名 + 2 处调用；把 `ref` 改写为
-> `out` 也失败——selfhost parser 只在调用实参位置认 `out`，形参声明完全不认
-> 修饰符）。另有独立缺口 "type 'Stopwatch' has no member 'Start'"。修复前
-> `selfhost_fixed_point` 允许红（smoke/standard 档不含它，full 档 `ctest -R
-> selfhost` 会红）。
+> **✅ 固定点已恢复（2026-10-20）。** 此前长期红的 `selfhost_fixed_point` 门
+> （2026-08-08 记为 `TASKS.md` B6-SH1：`ref`/`out` 形参解析缺口 + `Stopwatch.Start`
+> 缺口）已修复合拢：gen1 → g2.ll → gen2 → g3.ll 全链打通，**g2.ll 与 g3.ll
+> 逐字节相同**（15,815,207 字节，SHA256 相同）。恢复过程中修掉的是自举后端的
+> 一整类缺陷（ARC 临时值支配违规、手工发标签导致 phi 前驱错、delegate 调用
+> 签名错、写文件用文本模式导致 CRLF 差异、内联协程调度器与运行时重名），
+> 详见 `.agents/skills/zan-compiler-internals/references/selfhost-closure.md`。
 
 **The self-compilation fixed point holds when `g2.ll` and `g3.ll` are
 byte-identical.** At that point the compiler is a fixed point of itself: gen1
 and gen2 implement the same translation, so feeding the compiler through itself
-no longer changes the output. Historical verification: both were 2,106,150
-bytes (~2.0 MB) and `fc /b` / `cmp` reported no difference — this predates the
-B6-SH1 breakage above and no longer holds. (The exact size tracks the current
-sources; re-run the closure to confirm the two generations match.)
+no longer changes the output. Current verification: both are 15,815,207 bytes
+(~15.1 MB) with identical SHA256 — the size tracks the current sources, so
+re-run the closure to confirm the two generations still match.
 
 Note that gen1 (produced by the C host) and gen2 (produced by the self-hosted
 compiler) need not be byte-identical, because gen0 and gen1 are two different
@@ -53,8 +52,8 @@ may be absent; it is **not** the reference semantics.
 
 ## Architecture
 
-`src/selfhost/` (currently 14 files) mirrors the module structure of the C host
-in `src/compiler/`:
+`src/selfhost/` (32 files, plus 2 runtime shims under `src/selfhost_runtime/`)
+mirrors the module structure of the C host in `src/compiler/`:
 
 | File          | Role                                                       |
 |---------------|------------------------------------------------------------|
@@ -71,6 +70,10 @@ in `src/compiler/`:
 | `irgen_async.zan` | Irgen part: async/await CPS lowering (heap frames, resume steps) |
 | `jsongen.zan`  | Compile-time entity-mapper generation for `System.Json` (mirrors the C host pass) |
 | `dbgen.zan`    | Compile-time typed ORM query generation for `System.Data` (mirrors the C host pass) |
+| `attrgen.zan` | Compile-time attribute/route synthesis (mirrors the C host pass) |
+| `lsp.zan`     | Language-server surface used by the driver                    |
+| `nio.zan`     | Binary file output helper                                     |
+| `ngen*.zan`   | Cross-platform machine-code generator (x86/ARM, Mach-O/ELF/COFF/Wasm) |
 | `main.zan`    | Driver: read files, run the pipeline, write `.ll`          |
 
 ### Design choices dictated by the bootstrap subset
@@ -128,11 +131,11 @@ scripts\bootstrap.bat
 Each script runs the five steps in the table above and asserts `g2.ll` ==
 `g3.ll`.
 
-> **注意：脚本需同步。** `scripts/bootstrap.sh` / `scripts/bootstrap.bat` 目前只
-> 编译 **9 个**源文件（缺 `irgen_async.zan` / `irgen_expr.zan` / `irgen_stmt.zan` /
-> `jsongen.zan` / `dbgen.zan`），而规范清单（`tests/run_selfhost.cmake` 列 14 个
-> 源文件）已包含全部文件——按脚本当前清单无法成功闭环（gen1 缺文件，`g2.ll`
-> 不可能产出；叠加顶部 B6-SH1 的解析缺口）。
+> **源清单只有一份。** `scripts/selfhost_sources.txt` 是自举源清单的唯一真相；
+> `scripts/bootstrap.sh` / `scripts/bootstrap.bat` 与两个 ctest harness
+> （`tests/run_selfhost.cmake` / `tests/run_fixedpoint.cmake`）都从它读源文件。旧版脚本各自执点一份
+> 清单（bootstrap 那份还停在 9 个文件的老子集），新增自举源时闭环会静默少编一个文件，
+> 门红了很久也没人知道红在哪——这就是 2026-10 回归闭环时的第一个真正根因。
 
 ## Continuous integration
 
@@ -148,7 +151,7 @@ Where clang is available, the `selfhost_fixed_point` ctest additionally runs the
 **full closure** (`gen0 -> gen1 -> g2.ll -> clang -> gen2 -> g3.ll`) and asserts
 `g2.ll == g3.ll` byte-for-byte — the fixed-point gate. It is skipped
 automatically when clang is absent (`tests/run_fixedpoint.cmake`).
-**Currently red on HEAD** — see the B6-SH1 warning at the top of this file.
+**Green on HEAD** (verified 2026-10-20: `g2.ll == g3.ll`, 15,815,207 bytes).
 
 ## Known limitations / future work
 
@@ -167,14 +170,6 @@ automatically when clang is absent (`tests/run_fixedpoint.cmake`).
   present in both compilers: the C host transfers an in-flight +1 to the
   handler, the selfhost releases the exception through the catch-variable
   local on normal handler exit.
-- **`ref`/`out` parameter declarations.** The selfhost parser's `ParseParams`
-  only accepts `params` on formal parameters; `out`/`ref` modifiers are not
-  parsed there (call-site `out` is special-cased for the built-in `TryParse`
-  only). `dbgen.zan` needs `ref int outKind` — this is the root cause of the
-  broken self-compilation fixed point (B6-SH1).
-- **`Stopwatch.Start` member resolution.** gen1's binder does not resolve
-  `Stopwatch.Start` (`Stopwatch.zan:35`) — an independent stdlib-coverage gap
-  in the bootstrap compiler (B6-SH1).
 - **Diagnostics** are basic (limited positions, no recovery).
 - **No optimization**: the emitted IR is naive.
 

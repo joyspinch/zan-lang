@@ -22,7 +22,12 @@ if(NOT ZANC OR NOT SELFHOST_DIR OR NOT PROG OR NOT GEN1 OR NOT OUTLL)
 endif()
 
 # The driver (main.zan) must come first so its Program.Main is the entry point.
-set(_srcs
+# SELFHOST_SOURCES comes from scripts/selfhost_sources.txt (one canonical list
+# shared with scripts/bootstrap.*); the inline list below is the fallback.
+if(SELFHOST_SOURCES)
+  set(_srcs ${SELFHOST_SOURCES})
+else()
+  set(_srcs
   ${SELFHOST_DIR}/main.zan
   ${SELFHOST_DIR}/irgen.zan
   ${SELFHOST_DIR}/irgen_async.zan
@@ -57,6 +62,7 @@ set(_srcs
   ${SELFHOST_DIR}/ngen_reflect.zan
   ${SELFHOST_DIR}/lsp.zan
   ${SELFHOST_DIR}/ngen_wasm.zan)
+endif()
 
 # ---- Stage 1: build gen1 (the self-hosted compiler) with the C host ----
 list(GET _srcs 0 _first)
