@@ -171,6 +171,14 @@ partial class LspSession {
         QueueCommand(command);
     }
 
+    // 光标处可用的代码动作（Alt+Enter）：补/删/整理 using 等。
+    // codeAction 只需要文档与区间，不要求行号落在词上。
+    void CodeActionsAsync(string path, int line0, int col0, LspCodeActionHandler completed) {
+        LspCommand command = CreateCommand("textDocument/codeAction", path, line0, col0);
+        command.actions = completed;
+        QueueCommand(command);
+    }
+
     static void CopyResult(LspResult result, LspCommand command, LspPendingState state) {
         result.path = command.path;
         result.version = command.version;
@@ -206,6 +214,10 @@ partial class LspSession {
             result.symbols = new LspWorkspaceSymbolResult();
             LspSession.CopyResult(result.symbols, command, state);
             result.symbols.symbols = new List<LspWorkspaceSymbol>();
+        } else if (command.method == "textDocument/codeAction") {
+            result.actions = new LspCodeActionResult();
+            LspSession.CopyResult(result.actions, command, state);
+            result.actions.actions = new List<LspCodeAction>();
         }
         return result;
     }
@@ -321,6 +333,8 @@ partial class LspSession {
                 result.hover = Hover(command.path, command.line, command.col);
             } else if (command.method == "workspace/symbol") {
                 result.symbols.symbols = WorkspaceSymbols(command.name);
+            } else if (command.method == "textDocument/codeAction") {
+                result.actions.actions = CodeActions(command.path, command.line, command.col);
             }
             result.state = lastRequestState;
             if (result.state == LspPendingState.Ready) {
@@ -331,7 +345,8 @@ partial class LspSession {
                     || (result.method == "textDocument/completion" && (result.completions == null || result.completions.Count == 0))
                     || (result.method == "textDocument/signatureHelp" && result.signatureLabel.Length == 0)
                     || (result.method == "textDocument/hover" && result.hover.Length == 0)
-                    || (result.method == "workspace/symbol" && result.symbols.symbols.Count == 0);
+                    || (result.method == "workspace/symbol" && result.symbols.symbols.Count == 0)
+                    || (result.method == "textDocument/codeAction" && result.actions.actions.Count == 0);
                 if (empty) { result.state = LspPendingState.Empty; }
             }
             if (result.folding != null) { result.folding.state = result.state; }
@@ -339,6 +354,7 @@ partial class LspSession {
             if (result.references != null) { result.references.state = result.state; }
             if (result.rename != null) { result.rename.state = result.state; }
             if (result.symbols != null) { result.symbols.state = result.state; }
+            if (result.actions != null) { result.actions.state = result.state; }
             return result;
         } finally { activeCancellation = null; }
     }
@@ -349,9 +365,10 @@ partial class LspSession {
         LspReferencesHandler references = command.references;
         LspRenameHandler rename = command.rename;
         LspWorkspaceSymbolHandler symbols = command.symbols;
+        LspCodeActionHandler actions = command.actions;
         command.folding = null; command.definition = null;
         command.references = null; command.rename = null;
-        command.symbols = null;
+        command.symbols = null; command.actions = null;
         if (uiDispatcher != null) {
             uiDispatcher(() => {
                 if (stopping) { return; }
@@ -363,6 +380,7 @@ partial class LspSession {
                     if (result.references != null) { result.references.state = result.state; }
                     if (result.rename != null) { result.rename.state = result.state; }
                     if (result.symbols != null) { result.symbols.state = result.state; }
+                    if (result.actions != null) { result.actions.state = result.state; }
                 }
                 if (result.id > 0 && pending.ContainsKey(result.id)) {
                     LspPendingRequest request = pending[result.id];
@@ -379,6 +397,7 @@ partial class LspSession {
                 if (references != null) { references(result.references); }
                 if (rename != null) { rename(result.rename); }
                 if (symbols != null) { symbols(result.symbols); }
+                if (actions != null) { actions(result.actions); }
             });
         }
     }
@@ -723,6 +742,23 @@ partial class LspSession {
         string m = this.RequestWait("workspace/symbol", p.ToJson());
         if (m.Length == 0) { return outp; }
         return LspSession.ParseWorkspaceSymbols(m);
+    }
+
+    List<LspCodeAction> CodeActions(string path, int line0, int col0) {
+        if (background) { throw new Exception("Use CodeActionsAsync on the UI LSP facade."); }
+        List<LspCodeAction> outp = new List<LspCodeAction>();
+        JsonValue p = JsonValue.NewObject();
+        p.Put("textDocument", LspSession.UriObj(path).ToJson());
+        JsonValue range = JsonValue.NewObject();
+        range.Put("start", LspSession.PosObj(line0, col0).ToJson());
+        range.Put("end", LspSession.PosObj(line0, col0).ToJson());
+        p.Put("range", range);
+        JsonValue ctx = JsonValue.NewObject();
+        ctx.Put("diagnostics", JsonValue.NewArray());
+        p.Put("context", ctx);
+        string m = this.RequestWait("textDocument/codeAction", p.ToJson());
+        if (m.Length == 0) { return outp; }
+        return LspSession.ParseCodeActions(m);
     }
 
     List<string> FoldingRanges(string path) {

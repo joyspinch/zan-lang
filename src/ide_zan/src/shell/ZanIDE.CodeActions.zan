@@ -1,0 +1,90 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+// Alt+Enter 行内代码动作：向 zan-lsp 要光标处的 quickfix / source
+// 动作（补 using、删未用 using、整理 using），用标准库 ContextMenu
+// 在光标行弹出动作菜单，点选后把 workspace edit 应用回编辑器。
+// 应用走 LspSession.ParseWorkspaceEditEdit + ApplyTextEdits 同一条
+// 验证链（区间合法才动文本），先 SaveUndo 保证 Ctrl+Z 可回退。
+partial class ZanIDE {
+    void BeginCodeActions() {
+        if (designerMode || sceneMode || dbgState == 2) { return; }
+        int a = activeTab.Get();
+        if (a < 0 || a >= tabs.Count || editor == null
+                || editor.documentPath != tabs[a].path
+                || tabs[a].designDoc || tabs[a].path.StartsWith("@")) { return; }
+        LspSession session = lspSess;
+        if (session == null || !session.Alive()
+                || !ZanIDE.NavigationPathInRoot(tabs[a].path, root)) {
+            log.Add(ZanIDE.T("> Code actions: language server is not running.",
+                "> 代码动作：语言服务未运行。"));
+            app.RequestRedraw();
+            return;
+        }
+        string path = editor.documentPath;
+        int line = editor.CurLine();
+        int col = editor.CurCol();
+        string text = editor.GetText();
+        // 结果回来时文档与光标都没变才弹菜单（stale-result 守卫）。
+        session.CodeActionsAsync(path, line, col, delegate (LspCodeActionResult result) {
+            if (session != lspSess || editor == null
+                    || editor.documentPath != path
+                    || editor.GetText() != text
+                    || editor.CurLine() != line || editor.CurCol() != col
+                    || result == null || result.actions == null
+                    || result.actions.Count == 0) { return; }
+            if (result.state == LspPendingState.Empty
+                    || result.state == LspPendingState.Cancelled
+                    || result.state == LspPendingState.Error) { return; }
+            List<string> labels = new List<string>();
+            for (int i = 0; i < result.actions.Count; i = i + 1) {
+                labels.Add(result.actions[i].title);
+            }
+            codeActionHits = result.actions;
+            codeActionLabels = labels;
+            codeActionX = app.mouseX;
+            codeActionY = editor.LineBottomY(app, line);
+            codeActionPick = 0 - 2;
+            app.RequestRedraw();
+        });
+        app.RequestRedraw();
+    }
+
+    // 每帧调用：菜单打开时交给标准 ContextMenu 画并拿选择。
+    void RunCodeActionMenu(App app) {
+        if (codeActionPick == 0 || codeActionLabels == null) { return; }
+        int chosen = ContextMenu.Render(app, codeActionX, codeActionY, codeActionLabels);
+        if (chosen == -1) { return; }
+        if (chosen >= 0) { this.ApplyCodeAction(chosen); }
+        codeActionPick = 0;
+        codeActionLabels = null;
+        codeActionHits = null;
+        app.RequestRedraw();
+    }
+
+    // 应用第 `idx` 个动作：解析 edit、验证区间后写入当前编辑器。
+    void ApplyCodeAction(int idx) {
+        if (idx < 0 || idx >= codeActionHits.Count) { return; }
+        LspCodeAction action = codeActionHits[idx];
+        List<LspRenameEdit> edits = LspSession.ParseWorkspaceEditEdit(action.edit);
+        if (edits == null || edits.Count == 0) {
+            log.Add("> " + action.title + ": action has no edits."); return;
+        }
+        string path = editor.documentPath;
+        string text = editor.GetText();
+        LspEditApplication applied = LspSession.ApplyTextEdits(text, edits, path);
+        if (!applied.valid) {
+            log.Add("> " + action.title + ": invalid edit ranges."); return;
+        }
+        if (applied.text == text) { return; }
+        editor.SaveUndo();
+        editor.LoadText(applied.text);
+        int a = activeTab.Get();
+        if (a >= 0 && a < tabs.Count) { tabs[a].body = applied.text; }
+        if (lspSess != null && lspSess.Alive()) { lspSess.SyncDoc(path, applied.text); }
+        log.Add("> " + action.title);
+        app.RequestRedraw();
+    }
+}
