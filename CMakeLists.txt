@@ -2119,6 +2119,20 @@ add_test(NAME policy_conformance_goldens_present
     -P ${CMAKE_SOURCE_DIR}/tests/run_golden_guard.cmake)
 set_tests_properties(policy_conformance_goldens_present PROPERTIES TIMEOUT 60)
 
+# The compiler must not crash on this input -- and the defect was intermittent
+# (it only fired when the garbage pointer it dereferenced happened to be
+# readable), so one compile proves nothing: repeat it. The case exercises an
+# async call through an interface dispatch, which is the shape that used to
+# reach the bad LLVM C API call.
+add_test(NAME conformance_task_spawn_indirect_stability
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/task_spawn_indirect.zan
+    -DREPEATS=8
+    -P ${CMAKE_SOURCE_DIR}/tests/run_repeat_compile.cmake)
+set_tests_properties(conformance_task_spawn_indirect_stability PROPERTIES
+  RESOURCE_LOCK src_task_spawn_indirect TIMEOUT 300)
+
 # Doubling both live slots and waitpoints must not quadruple async IR.
 add_test(NAME conformance_async_ir_scaling
   COMMAND ${CMAKE_COMMAND}

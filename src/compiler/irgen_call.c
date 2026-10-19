@@ -4,9 +4,20 @@ static LLVMValueRef emit_detach_async_call(zan_irgen_t *g, LLVMValueRef sub,
     if (!sub || LLVMGetTypeKind(LLVMTypeOf(sub)) != LLVMPointerTypeKind)
         return NULL;
 
-    /* 直接调用：被调函数是具名符号，按 "<callee>$resume" 直接取 resume 入口。 */
+    /* 直接调用：被调函数是具名符号，按 "<callee>$resume" 直接取 resume 入口。
+     *
+     * 只有真正的调用指令才能取被调值：async 调用的返回值是协程帧指针
+     * （实测是 phi/load），不是 CallInst。
+     * LLVMGetCalledValue 只对 CallInst 有效——对别的值它会按 CallInst 的
+     * 内存布局去解读操作数数组，拿到的是垃圾指针；紧接着的
+     * LLVMGetValueName2 会解引用它，于是 zanc 间歇性访问冲突
+     * (0xC0000005)：崩不崩取决于那块内存当时是不是恰好可读。
+     *
+     * 这条按名字取 resume 的路径对 async 调用其实一直是死路（sub 永远
+     * 不是 CallInst，取到的名字是垃圾，LLVMGetNamedFunction 必然返回
+     * NULL），真正干活的是下面的 SELF_STEP 兜底。 */
     LLVMValueRef sub_resume = NULL;
-    LLVMValueRef callee = LLVMGetCalledValue(sub);
+    LLVMValueRef callee = LLVMIsACallInst(sub) ? LLVMGetCalledValue(sub) : NULL;
     if (callee) {
         size_t nl = 0;
         const char *cn = LLVMGetValueName2(callee, &nl);

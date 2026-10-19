@@ -55,6 +55,12 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
     和平台合法的文件名；启动成功只证明 exec/系统处理器被启动，不证明目标完成。
     为什么：反斜杠在 POSIX 是合法文件名字符，Windows 金样会误报；双 fork 只等
     中间子进程会把最终 exec 失败误报成功。交叉编译与目标实机运行分开报告。
+11. **新增 cmake 脚本的循环用 `foreach(... RANGE ...)`，不要用 `for(... RANGE ...)`**：
+    本仓库工具链是 CMake 4.x，`for()` 在脚本模式下不再解析（报 "Flow control
+    statements are not properly nested" 或 "Unknown CMake command for"），
+    `foreach(RANGE)` 在各版本都能用。
+    为什么：`for()` 的报错指向 `endforeach()`，看起来像"括号没配平"，实际是命令
+    本身不可用，排查方向完全会被带偏。
 58	
 ## 二、工程师认知与交互纪律（讲人话、重实效、拒绝机械报幕）
 

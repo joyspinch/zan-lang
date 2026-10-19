@@ -53,13 +53,14 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 6. **目标架构指令集特性基线（`tm_features`）**：
    - 动作：底层指令特性开关必须严格符合目标平台的 ABI 基线（如 Android x86_64 仅开启 SSE4.2，不开启 AVX2）。
    - 理由：防止高级指令在不支持的目标硬件运行时抛出 SIGILL 非法指令异常。
-7. **子协程 resume 入口在调用点必须"具名符号 + 帧头回退"双路可取**：
+7. **子协程 resume 入口在调用点必须能取到**：
    - 动作：任何在调用点需要子协程 resume 入口的下沉路径（`await` 挂起、
-     `Task.Spawn`/`Task.Run` 脱钩、语句级 fire-and-forget）都必须先按
-     `<callee>$resume` 查具名函数；查不到时（间接调用——接口/虚方法/委托分发，
-     被调入口不是静态符号）回退到从协程帧头 `ASYNC_FRAME_SELF_STEP` 槽加载；
-     两条都失败才允许放弃。
-   - 理由：间接调用按名字必然查不到 → `Task.Spawn` 静默返回 0 句柄、协程永不
+     `Task.Spawn`/`Task.Run` 脱钩、语句级 fire-and-forget）都必须能从协程帧头
+     `ASYNC_FRAME_SELF_STEP` 槽加载到本协程的 resume 入口；只有当被调值
+     **确实是指令**时才谈按 `<callee>$resume` 查具名函数（见本节第 8 条：
+     async 调用的返回值是帧指针，永远不是调用指令，按名字查这条路不成立）。
+   - 理由：间接调用（接口/虚方法/委托分发）按名字必然查不到 → `Task.Spawn`
+     静默返回 0 句柄、协程永不
      入调度器；而 `__zan_co_isdone` 对不在活协程表里的帧返回 1，于是
      `Task.IsDone` 报"已完成"，业务代码永远等不到副作用，症状与业务逻辑 bug
      无法区分。await 路径早有 SELF_STEP 回退（`irgen_expr.c` 间接 await 分支），
@@ -67,6 +68,31 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：回退只对协程帧指针有效；ramp 必然在任何调度之前把 resume 写进
      SELF_STEP，故加载安全。单实现者会被去虚拟化成直接调用从而掩盖该缺陷，
      回归用例必须声明 ≥2 个实现者以强制走间接分发。
+8. **LLVM C API 的取值函数必须先判 kind 再用**：
+   - 动作：`LLVMGetCalledValue` 只对 CallInst 有效，取被调值前必须先
+     `LLVMIsACallInst(sub)`；取操作数前必须确认索引落在
+     `LLVMGetNumOperands` 之内；聚合常量取元素用 `LLVMGetAggregateElement`，
+     不要用 `LLVMGetOperand`。
+   - 理由：这些 C API **不做任何边界检查**，按错布局解读就是越界读——读到
+     相邻堆内存，恰好可读时不崩、不可读时访问冲突，症状是"间歇性崩溃"，
+     定位成本极高。实例：async 调用的返回值是协程帧指针（phi/load），
+     从来不是 CallInst；按 CallInst 解读后紧跟的 `LLVMGetValueName2` 就去
+     解引用野指针。
+   - 边界：需要"从值反推被调符号"的路径（查 `<callee>$resume`）对 async
+     调用天然不成立——帧指针不是调用指令；resume 入口只能从帧头
+     `ASYNC_FRAME_SELF_STEP` 槽取（见本节第 7 条）。
+9. **间歇性缺陷的复现、定位与门禁纪律**：
+   - 动作：判定"偶发崩溃已修复"必须**重复运行**（≥8 次）而不是单次通过；
+     调试器下不复现通常说明堆布局参与了触发条件——改用 Debug 构建 +
+     调试堆复现（Windows 下 `cdb -hd`），再取栈；门禁要重复编译同一输入
+     N 次才拦得住回归。
+   - 理由：野指针类缺陷只在"被解引用的那块内存恰好可读"时发作，单次绿是
+     假绿；Release 构建的符号被内联打散，栈上没有可读帧名，只能靠 Debug
+     构建才拿得到行号。
+   - 边界：重复次数按实际发作率取（发作率 40% 时 8 次的漏检率 < 1%）；
+     cmake 脚本里对崩溃子进程拿到的 `RESULT_VARIABLE` 是描述串
+     （"Access violation"）而不是负数退出码，按形状判定才分得清"崩了"与
+     "编译报错"。
 
 ---
 

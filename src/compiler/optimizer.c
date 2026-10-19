@@ -260,20 +260,34 @@ zan_devirt_stats_t zan_opt_devirtualize(zan_irgen_t *g, zan_binder_t *binder) {
                                     LLVMValueRef idx_op = LLVMGetOperand(ptr, num_gep_ops - 1);
                                     if (LLVMIsAConstantInt(idx_op)) {
                                         unsigned long long slot = LLVMConstIntGetZExtValue(idx_op);
-                                        LLVMValueRef elem = LLVMGetOperand(init, (unsigned)slot);
-                                        while (elem && LLVMIsAConstantExpr(elem) && LLVMGetConstOpcode(elem) == LLVMBitCast) {
-                                            elem = LLVMGetOperand(elem, 0);
+                                        /* vtable 是聚合常量：先剥掉 bitcast 常量表达式
+                                         * （否则索引到的是 bitcast 的操作数，根本不是槽位），
+                                         * 再按操作数个数做边界检查。越界索引在 LLVM C API
+                                         * 里是未定义行为——读到的是相邻堆内存，拿到垃圾指针
+                                         * 后会被写进调用点。槽位号来自静态类型的虚方法序号，
+                                         * 表长来自动态类型的虚方法数，两者不一定相等。 */
+                                        LLVMValueRef agg = init;
+                                        while (agg && LLVMIsAConstantExpr(agg) &&
+                                               LLVMGetConstOpcode(agg) == LLVMBitCast) {
+                                            agg = LLVMGetOperand(agg, 0);
                                         }
-                                        if (elem && LLVMIsAFunction(elem)) {
-                                            unsigned num_call_ops = (unsigned)LLVMGetNumOperands(inst);
-                                            LLVMValueRef target = elem;
-                                            if (LLVMTypeOf(target) != LLVMTypeOf(callee)) {
-                                                LLVMBuilderRef b = g->builder;
-                                                LLVMPositionBuilderBefore(b, inst);
-                                                target = LLVMBuildBitCast(b, elem, LLVMTypeOf(callee), "devirt.fn");
+                                        unsigned agg_ops = agg ? (unsigned)LLVMGetNumOperands(agg) : 0;
+                                        if (agg && slot < agg_ops) {
+                                            LLVMValueRef elem = LLVMGetOperand(agg, (unsigned)slot);
+                                            while (elem && LLVMIsAConstantExpr(elem) && LLVMGetConstOpcode(elem) == LLVMBitCast) {
+                                                elem = LLVMGetOperand(elem, 0);
                                             }
-                                            LLVMSetOperand(inst, num_call_ops - 1, target);
-                                            stats.calls_devirtualized++;
+                                            if (elem && LLVMIsAFunction(elem)) {
+                                                unsigned num_call_ops = (unsigned)LLVMGetNumOperands(inst);
+                                                LLVMValueRef target = elem;
+                                                if (LLVMTypeOf(target) != LLVMTypeOf(callee)) {
+                                                    LLVMBuilderRef b = g->builder;
+                                                    LLVMPositionBuilderBefore(b, inst);
+                                                    target = LLVMBuildBitCast(b, elem, LLVMTypeOf(callee), "devirt.fn");
+                                                }
+                                                LLVMSetOperand(inst, num_call_ops - 1, target);
+                                                stats.calls_devirtualized++;
+                                            }
                                         }
                                     }
                                 }
