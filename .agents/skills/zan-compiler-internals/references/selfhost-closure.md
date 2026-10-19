@@ -270,8 +270,40 @@ kernel32、shell32、user32、advapi32、version）。
 - 连带：`CollectCapturedNames` 必须放在 **resume 函数的 `StartFn()` 之后**——
   `StartFn` 会把 `capNames` 清空，放在方法开头会被 ramp 的 `StartFn` 冲掉
   （症状：装箱没发生，变量槽还是 `alloca i64`）。
-- 边界（已知限制，见 `TASKS.md` A391）：async 方法的**参数**与 **foreach
-  元素变量**被捕获时仍按值捕获——它们的 spill 槽按"存值"设计，要改成
-  cell 指针得动 async 帧布局。async 的 foreach 元素变量尤其不能走同步的
-  `BoxLocal`：那会把 `locReg` 变成一个运行时 cell 指针，而 async 路径的
-  `GenIdent` 按"槽里存 cell 指针"来读，两边对不上 → 生成的 IR 直接坏掉。
+- 边界：**async 方法的参数与 foreach 元素变量按 C 宿主实测就是"按值"，别按 C# 猜**
+  （2026-10-20 实测，探针 `_scratch/sd/p_capparam.zan`）：
+  - **同步**方法：参数被闭包捕获是**按引用**（写参数，闭包可见，`s1=4`）；
+  - **async** 方法：参数被闭包捕获是**捕获时刻的值快照**（`f=4`）——C 宿主本身
+    就是按值，**不是** C# 的"参数只读 + 按引用捕获"；把 async 参数也装箱成 cell
+    反而会与 C 宿主**相反**（`f=101`）。
+  - async 的 **foreach 元素变量**被闭包捕获：C 宿主是**每次迭代独立**（`v=1,2,3`），
+    自举已一致，**跨 `await` 也一致**（用例 `tests/conformance/async_foreach_capture.zan`）。
+  - 推论：async 路径**不需要**为参数做 cell 装箱；`asyncCaps` 那套收集逻辑是多余的。
+
+## 18. 装箱 cell 的释放：释放的是 cell 里的值，不是 cell 指针
+
+- 动作：任何按 `locBox` 标记装箱的局部，其**释放路径**（`ReleaseLocalsFrom` 与
+  async 的 `$cleanup`）必须先把 **cell 指针**读出来、再从 cell 里读出**值**、
+  最后释放那个**值**；绝不能把 cell 指针本身当对象去 `zrelease`。
+- 理由（2026-10-20 实测，用例 `tests/conformance/async_boxed_local_release.zan`）：
+  装箱后局部变量的寄存器里存的是 **cell 指针**（8 字节的 malloc 块），
+  而原来的释放代码直接 `load lt, lt* locReg[i]` 再 `zrelease` —— 把一个堆块
+  当成对象去读引用计数（偏移 -16）并 free，**0xC0000005 访问违规**。
+  C 宿主输出 `v=7 / done`，修复前的自举直接崩。
+- 连带：判断"这个局部是不是装箱的"要用**装箱标记**（`locBox` / async 路径新增的
+  `asyncBoxIdx`），不要用"名字是否出现在捕获集合里"——后者在 async 路径上会
+  把没装箱的局部也当成装箱的。
+- 边界：cell 本身（malloc 块）没有释放，是**泄漏**不是**破坏**；泄漏可接受，
+  错释放不可接受。
+
+## 19. 固定点门红灯：先排除"门在跑，源码被改"的竞态
+
+- 动作：自举固定点门（`g2.ll == g3.ll`）报"不等"时，**先看被编译源文件的
+  mtime** 是否落在门的运行窗口内；命中就当作假红灯，**重跑一次**再下结论。
+- 理由（2026-10-20 实测）：门跑动的 2 分钟里我改了 `irgen.zan` / `irgen_async.zan`，
+  于是 gen1 用的是**旧**源码、gen2 用的是**新**源码，两代产物当然不等——红字是
+  竞态不是缺陷。差点把"gen1 丢了代码"当成根因，追查了两小时。
+- 判据：门的时间戳是"生成 g2.ll 的时刻"，源码 mtime 落在**门启动 ~ g2.ll 落盘**
+  这段窗口里，就可疑；重跑时**不要碰源码**。
+- 边界：真正的固定点破坏通常表现为"两代产物大小差几千字节且内容稳定可复现"；
+  一次性的、随跑随变的大小差，先怀疑环境（竞态、并发 tier 重编 `zanc`）。

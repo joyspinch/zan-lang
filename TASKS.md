@@ -49,22 +49,23 @@
 - ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
   差分门的 `diff_known_gaps.txt` 也要同步。
 
-### [ ] A391 自举 async 方法里被闭包捕获的**参数**与 **foreach 元素变量**仍按值捕获
+### [ ] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
-- 现象（2026-10-20 修完 async 局部变量装箱后剩下的边界）：
-  - async 方法的**参数**被闭包捕获时，闭包拿到的是**捕获时刻的值**（按值），
-    同步路径与 C 宿主都是按引用（写参数，闭包可见）。
-  - async 的 **foreach 元素变量**被闭包捕获时同样按值；同步路径还有
-    "每次迭代独立快照"（per-iteration）的语义，async 路径完全没有。
-- 根因：async 方法的**局部变量**改成装箱（cell 指针存在 spill 槽里，跨挂起
-  稳定）后，参数与 foreach 元素变量没有对应的槽形态：参数的值在 ramp 里进帧，
-  元素变量的槽是循环专用的三槽布局，两者的 spill 槽都按"存值"设计。
-- 方向：
-  1. 参数：在 ramp 里为被捕获的参数分配 cell（cell 里放参数值，帧里存 cell
-     指针），resume 时按 cell 指针重算 payload 指针——与局部变量同一形态；
-  2. foreach 元素变量：把循环的三槽布局扩成"元素变量的 cell 指针"，并补
-     per-iteration 快照（每次迭代新 cell）。
-- ⚠ 与 async 帧布局耦合（A385），改完必须重跑 `selfhost_fixed_point` 与差分门。
+- 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_asyncvoid.zan`）：
+  ```zan
+  static async void Main() { Work(); await Task.Delay(50); Console.WriteLine("done"); }
+  static async void Work()  { await Task.Delay(1);  Console.WriteLine("work"); }
+  ```
+  - C 宿主：`work` 然后 `done`——**方法体会执行**（async Main 的调度器在跑）。
+  - 自举：只有 `done`——**方法体被整个丢掉**，`Work` 当普通方法调用。
+  - 同步 `Main` 里调 async void 方法时，两边都不执行（C 宿主也没有调度器）。
+- 根因：自举后端在**调用点**没有区分 async 方法——没有生成"分配帧 + 挂起 +
+  调度"的启动序列，只有 async `Main` 自己是被特殊处理的（见 0f063c2e）。
+- 方向：调用点遇到 async 方法时，按 `GenAsyncMethod` 的 ramp 形态生成协程启动
+  （分配帧、填 resume/cleanup 指针、交给调度器），而不是直接 `call`。
+- ⚠ 与 async 帧布局耦合（A385），改完必须重跑 `selfhost_fixed_point` 与差分门；
+  另外 async 方法的返回类型 `Task<T>` 自举还不认识（`unknown type 'Task'`），
+  只能先覆盖 `async void`。
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 

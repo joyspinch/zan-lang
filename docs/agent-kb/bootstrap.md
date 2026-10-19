@@ -240,10 +240,33 @@ links, runs the programs and compares stdout with the C host's golden file.
   class-typed slot is bitcast, and an `object` slot now retains the class
   instance it holds — without that the temporary release at the end of the
   statement freed the object right after `object o = new Dog();`.
+- A tenth round (2026-10-20) closed two gaps and one false premise:
+  - `List<T>.Reserve` is now really lowered (`zlist_reserve` in the list
+    runtime, `EmitListMethod` dispatches it): the capacity grows to exactly
+    `n` when it is too small and stays put otherwise, and the call returns
+    `int 0` like the C host's.
+  - A local that a closure captured lives in a heap **cell**, and the release
+    path has to release the value **inside** the cell — releasing the cell
+    pointer itself treated a heap block as an object and crashed with
+    0xC0000005. The differential-gate case `async_boxed_local_release` pins it.
+  - The premise behind the old `A391` was wrong: the C host captures an
+    **async method's parameter** by value (a snapshot of the value at capture
+    time), while a *synchronous* method's parameter is captured by reference.
+    Boxing async parameters would have made the self-host disagree with the
+    C host, so that was dropped. The async `foreach` element variable was
+    already consistent, including across a suspension
+    (`async_foreach_capture`).
+  - New gap tracked as `A393`: calling an `async void` method does not start a
+    coroutine in the self-hosted backend — the body is dropped entirely, while
+    the C host runs it.
 - Note that `clang` does **not** run the LLVM verifier on `.ll` input, so invalid
   IR (e.g. a value used in a block it does not dominate) reaches the backend
   silently and shows up as an access violation. Keep the emitted IR
   self-consistent; see the skill reference for the rules.
+- When the **fixed-point** gate reports `g2.ll != g3.ll`, check the mtimes of
+  the compiled sources first: if they were touched while the gate was running,
+  the two generations were built from different sources and the red light is a
+  race, not a defect. Re-run without touching the sources.
 
 ## Known limitations / future work
 

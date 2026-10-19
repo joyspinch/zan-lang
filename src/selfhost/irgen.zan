@@ -72,6 +72,10 @@ partial class Irgen {
     public List<string> asyncSlotReg;
     public List<Node> asyncSlotTy;
     public List<int> asyncSlotIdx;
+    // indexes (into lnames) of the locals of the current async method that a
+    // closure captured: they live in a heap cell, so the cleanup function has
+    // to release the value INSIDE the cell, not the cell pointer
+    public List<int> asyncBoxIdx;
     public int asyncForeachBase;   // first frame slot of the foreach loop temps
     public int asyncForeachNext;   // next foreach temp slot to hand out
     public bool curAsyncThis;
@@ -1804,6 +1808,29 @@ partial class Irgen {
         H("  store i64 0, i64* %cptr");
         H("  ret void");
         H("}");
+        // zlist_reserve: make room for n elements up front (the C host's
+        // List<T>.Reserve). A no-op when the capacity is already big enough;
+        // otherwise the capacity becomes exactly n, like the C host.
+        H("define void @zlist_reserve(i8* %p, i64 %n) {");
+        H("entry:");
+        H("  %l = bitcast i8* %p to %zlist*");
+        H("  %capptr = getelementptr %zlist, %zlist* %l, i32 0, i32 1");
+        H("  %cap = load i64, i64* %capptr");
+        H("  %enough = icmp sge i64 %cap, %n");
+        H("  br i1 %enough, label %done, label %grow");
+        H("grow:");
+        H("  %dptr = getelementptr %zlist, %zlist* %l, i32 0, i32 2");
+        H("  %olddata = load i64*, i64** %dptr");
+        H("  %oldi8 = bitcast i64* %olddata to i8*");
+        H("  %bytes = mul i64 %n, 8");
+        H("  %newi8 = call i8* @realloc(i8* %oldi8, i64 %bytes)");
+        H("  %newdata = bitcast i8* %newi8 to i64*");
+        H("  store i64* %newdata, i64** %dptr");
+        H("  store i64 %n, i64* %capptr");
+        H("  br label %done");
+        H("done:");
+        H("  ret void");
+        H("}");
         // zlist_addrange: append every element of the source list. The count
         // is read once, so appending a list to itself copies the elements it
         // had when the call started (the C host reads the count the same way).
@@ -2111,8 +2138,20 @@ partial class Irgen {
             if (ArcManaged(locType[i])) {
                 string lt = MapType(locType[i]);
                 string t = NT();
-                L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
-                EmitArcRelease(t, locType[i]);
+                if (curAsync && locBox[i]) {
+                    // the local lives in a heap cell: the register holds the
+                    // CELL pointer, the cell holds the value -- release the
+                    // value, not the cell
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[i]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    L("  " + t + " = load " + lt + ", " + lt + "* " + p);
+                    EmitArcRelease(t, locType[i]);
+                } else {
+                    L("  " + t + " = load " + lt + ", " + lt + "* " + locReg[i]);
+                    EmitArcRelease(t, locType[i]);
+                }
             }
             i = i + 1;
         }
