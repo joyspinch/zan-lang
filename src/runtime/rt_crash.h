@@ -248,12 +248,36 @@ static void zan__crash_logpath(char *logpath, size_t cap, char *exe_dir) {
     strncat(logpath, "zan_crash.log", cap - strlen(logpath) - 1);
 }
 
+/* 崩溃兜底日志的大小上限。
+ * 日志随每次进程启动/退出各追加一行（run/exit），一次全量门禁能写进几千行、
+ * 几 MB，真崩的那条记录会淹没在噪声里。超过上限就把旧文件轮转成 <name>.1，
+ * 只保留最近一代：崩溃现场永远在当前文件里，历史不丢但有界。 */
+#define ZAN_CRASH_LOG_MAX_BYTES (1024 * 1024)
+
+/* 打开崩溃日志（追加模式），顺手做一次体积轮转。 */
+static FILE *zan__crash_open_log(const char *logpath) {
+    FILE *f = fopen(logpath, "ab");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long sz = ftell(f);
+        if (sz >= ZAN_CRASH_LOG_MAX_BYTES) {
+            fclose(f);
+            char old[MAX_PATH];
+            snprintf(old, sizeof old, "%s.1", logpath);
+            DeleteFileA(old);
+            MoveFileA(logpath, old);
+            f = fopen(logpath, "ab");
+        }
+    }
+    return f;
+}
+
 static void zan__crash_note(const char *what, const char *detail) {
     char logpath[MAX_PATH];
     char exe_dir[MAX_PATH];
     zan__crash_logpath(logpath, sizeof logpath, exe_dir);
-    FILE *f = fopen(logpath, "ab");
-    if (!f) f = fopen("zan_crash.log", "ab");
+    FILE *f = zan__crash_open_log(logpath);
+    if (!f) f = zan__crash_open_log("zan_crash.log");
     if (!f) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -446,8 +470,8 @@ static void zan__crash_write_record(EXCEPTION_POINTERS *ep,
     USHORT fn = 0;
     void *arc_freed_by = NULL;
 
-    FILE *f = fopen(logpath, "ab");
-    if (!f) f = fopen("zan_crash.log", "ab");
+    FILE *f = zan__crash_open_log(logpath);
+    if (!f) f = zan__crash_open_log("zan_crash.log");
     if (f) {
         SYSTEMTIME st;
         GetLocalTime(&st);

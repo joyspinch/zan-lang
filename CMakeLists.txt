@@ -870,6 +870,28 @@ endif()
 add_test(NAME runtime_sync COMMAND zanrt_sync_test)
 add_dependencies(zanc zanrt_sync_test)
 
+# Crash-log size cap: zan_crash.log grows a line per process start/exit, so a
+# full gate run writes megabytes into it and buries the real crash record.
+# zan__crash_open_log() rotates the file to <name>.1 once it passes the cap,
+# keeping exactly one generation. The logic is a static function inside
+# rt_crash.h, so the test includes that header directly.
+add_executable(zanrt_crash_log_test
+    tests/runtime/rt_crash_log_test.c
+)
+target_include_directories(zanrt_crash_log_test PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime)
+set_target_properties(zanrt_crash_log_test PROPERTIES
+    C_STANDARD 11
+    C_STANDARD_REQUIRED YES
+)
+if(MSVC)
+    target_compile_options(zanrt_crash_log_test PRIVATE /W0)
+else()
+    target_compile_options(zanrt_crash_log_test PRIVATE -Wno-unused-function)
+endif()
+add_test(NAME runtime_crash_log_rotation COMMAND zanrt_crash_log_test)
+set_tests_properties(runtime_crash_log_rotation PROPERTIES TIMEOUT 60)
+add_dependencies(zanc zanrt_crash_log_test)
+
 # DNS all-address resolution + binary CIDR classification for the
 # external-call transport: literals and localhost only, no public net.
 add_executable(zanrt_io_addr_test
