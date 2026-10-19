@@ -93,6 +93,21 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      cmake 脚本里对崩溃子进程拿到的 `RESULT_VARIABLE` 是描述串
      （"Access violation"）而不是负数退出码，按形状判定才分得清"崩了"与
      "编译报错"。
+10. **导出的 IR 只在编译器自己的目标特性下合法**：
+   - 动作：`zanc --emit-ir` 落出的 .ll 是给外部工具（llc/opt/lli）消费的，必须用
+     与编译器一致的目标特性去消费：编译器的 x86-64 档是 CPU `x86-64` + 特性
+     `+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi`
+     （`src/compiler/irgen_emit.c` 的 `zan_bind_target_layout` 建 TargetMachine 时
+     定的），llc 侧对应 `llc -mattr=+avx2`（`-mcpu=haswell` 等价）。
+   - 理由：编译器自己不受影响（TargetMachine 带着 AVX2），所以"zanc 能编过"**不能**
+     证明"导出的 IR 能编过"——两者用的目标档不同。llc 的默认 generic CPU 会把
+     256 位算子拆成 2×128 位，而函数里同时存在 `llvm.x86.avx2.pmovmskb` 这类
+     AVX2 内建函数时 256 位类型被判为合法、`<N x i1>` 却留在图里，
+     `SplitVectorOperand` 没有兜底 → fatal error
+     "Do not know how to split this operator's operand!"。
+   - 边界：函数级 `"target-cpu"`/`"target-features"` 属性在 LLVM 20 的 llc 上
+     **不参与**合法化，别指望写进 IR 就能免掉 `-mattr`；真要 IR 自洽，得让
+     Vector256 的降级路径不产生 256 位向量值（见 TASKS.md A388）。
 
 ---
 
@@ -162,4 +177,16 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 动作：同一个内建静态成员（`Task.Run` / `Task.Spawn` 这类）传不同形态的实参时，若 irgen 会走**不同的帧/所有权分支**，检查器就必须给不同的返回类型（无类型实参的"无结果类型" vs 带类型实参的 `Task<T>`）；检查器不得对内建调用的返回类型一律宽松放行（`type_error` 对一切可赋值），也不得把"结果类型"一律写成 `long`。
    - 理由：宽松放行会让"把无结果句柄当 `Task<T>` 用"一路通到 IR 与运行期，直到帧被释放两次才 abort；类型侧收口后，误用在编译期就被拒绝，运行期那条 double free 路径根本不可达。实例：`Task.Run(lambda)` 产出的是无结果 action 帧，把它声明成 `Task<int>` 去读 `.Result` 曾经是运行期 double free（已闭账，见 TASKS.md A380 的残留项）。
    - 边界：改检查器的定型前，先读 irgen 里同一调用的分支（哪个实参形态走 keep_result、哪个走 action 帧），两边必须对得上；类型说 A、代码生成做 B 是最难查的一类 bug。
+5. **内建成员表里的类型名不是可见符号，跨命名空间引用仍要显式 `using`**：
+   - 动作：`src/compiler/builtin_api.c` 的类型表（`BT("Aes", "Aes", ...)`）只服务于
+     **成员签名的类型定型**（`Aes.Encrypt` 的返回类型是 `Vector128`），不参与名字
+     解析；引用某个类必须让它的命名空间真正进入作用域（文件头的 `using`）。
+   - 理由：表里有 "Aes"（`System.Runtime.Intrinsics.X86.Aes` 硬件原语），但
+     Wechat SDK 里的 `Aes.DecryptBlockEcb`（`System.Security.Cryptography.Aes`，
+     在 Zan.Security 包里）报的是 "'Aes' is not a known variable, type, or
+     namespace"——**未知名**而不是"未知名成员"，极易误判成"编译器漏注册内建
+     类型"；实际只差一行 `using System.Security.Cryptography;`，同包的另一个
+     文件早就写了这一行。
+   - 边界：同名类分处不同命名空间时，先确认 import 的是哪一个；内建表的签名
+     按硬件原语那份算，名字解析归 `using`，两套机制不要互相推断。
 

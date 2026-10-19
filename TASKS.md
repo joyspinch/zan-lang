@@ -191,7 +191,7 @@
 - 方向：先定准绳（参考图实测外框高），再把脚本改成**从 `Spec` 取参**并补
   导航 30 号齿轮格，最后拿真 dump 跑绿；不要为了让它变绿去改脚本里的数字。
 
-### [ ] A388 `zanc --emit-ir` 输出的 IR 交给 LLVM 后端会被拒——`<N x i1>` 向量比较拆不开
+### [ ] A388 `zanc --emit-ir` 输出的 IR 交给 LLVM 后端会被拒——256 位向量路径在 generic CPU 下拆不开
 
 - 现象：`zanc <file> --emit-ir` 落出的 IR 直接喂给 LLVM 自带的 `llc` 会在
   `DAGTypeLegalizer::SplitVectorOperand` 处 fatal error：
@@ -199,21 +199,39 @@
   （停在哪一步：*Running pass 'X86 DAG->DAG Instruction Selection' on function
   '@MemoryExtensions_SequenceEqual'*）。复现：
   `zanc tests/conformance/task_spawn_indirect.zan --emit-ir --no-packages > t.ll`
-  然后 `llc -filetype=obj t.ll`（llc 连续 3/3 必崩，确定性）。
-- 根因：编译器把 `Vector256.Equals` 降成 `icmp eq <32 x i8>`，其结果类型是
-  `<32 x i1>`；X86 后端没有 `<32 x i1>` 这种类型，type legalizer 拆它时落到
-  `SplitVectorOperand` 的兜底分支 → 报错退出。
-- 为什么平时不炸：正常构建路径进后端前跑 `zan_opt_strip_unused`（globaldce），
-  没人引用的 stdlib 函数被剔掉，坏的向量比较随之消失；而 `--emit-ir` 分支
-  （`src/compiler/main.c` 的 `do_emit_ir`）**跳过 globaldce**，整份 stdlib 都留在
-  IR 里——包括死的 `MemoryExtensions.SequenceEqual`。
-- 方向（二选一，优先后者）：
-  (1) `--emit-ir` 也做一次 globaldce——但会改变 golden IR 的内容，需一并重生成
-      `tests/golden/expected/` 并复核 `async_skeleton.ir-contains` 之类的子串断言；
-  (2) 在 IRGen 侧把向量相等比较降成标量比较，不产生 `<N x i1>`（`Vector256.Equals`
-      的语义就是逐字节相等，标量化后由 LLVM 自己决定要不要重新向量化）。
-- ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器顺手把向量
-  比较标量化了，编译器自己产出的 IR 仍然过不了自己的后端。
+  然后 `llc -filetype=obj t.ll`（确定性必崩）。
+- **2026-10-20 实测更正（此前登记的根因只对了一半）**：
+  - 触发条件不是"`<32 x i1>` 本身"这么窄，而是**CPU 特性**。同一份 IR：
+    `llc -filetype=obj`（默认 generic CPU）崩；`llc -mattr=+avx2` /
+    `-mcpu=haswell` / `-mcpu=znver2` / `-mcpu=skylake-avx512` **全部通过**。
+  - 编译自己不受影响：`src/compiler/irgen_emit.c:3032` 建 TargetMachine 时 CPU 取
+    `x86-64`、特性取 `+sse3,...,+avx,+avx2,+fma,+bmi`，后端拿到的是 AVX2 档，
+    所以 zanc 产出的二进制是对的；坏的是**给外部工具消费的 .ll 文本**。
+  - 此前"正常构建靠 globaldce 删掉死的 stdlib 函数才不炸"的说法是错的：live
+    函数（`Program_Mask`，`Vector256.Equals` + `ExtractMostSignificantBits`）
+    单独抽出来喂 llc 同样崩，只是正常构建里它被 globaldce 顺手删掉了。
+  - 不可合法化的不止比较一处：把 `icmp eq <32 x i8>` 换成常量后仍崩，说明
+    `Vector256.Create` 的字节广播（`shufflevector <32 x i8> ..., zeroinitializer`
+    + bitcast 到 `<4 x i64>` + extractelement）同样不可拆。**凡是 256 位向量被
+    拆回标量的地方都中招**：generic CPU 下 X86 要把 256 位算子拆成 2×128 位，
+    而函数里同时存在 `llvm.x86.avx2.pmovmskb` 这类 AVX2 内建函数 → 256 位类型
+    被判为合法 → `<32 x i1>` 这类 i1 向量留在图里 → `SplitVectorOperand` 没有
+    兜底路径 → 报错。
+  - 试过但**不管用**的写法（别再试）：函数级属性
+    `attributes #0 = { "target-cpu"=... "target-features"=... }`（LLVM 20 的 llc
+    不拿它做合法化依据）、文本 IR 的 `module attributes`（语法不支持）、
+    `!llvm.module.flags` 里的 `target-features`。
+- 方向（按代价从低到高）：
+  (1) **让 .ll 自述目标特性**：在 `--emit-ir` 的输出里带上编译自己用的
+      `+sse3,...,+avx2,...`（哪怕只是注释或 stderr 提示），让消费方用
+      `llc -mattr=+avx2` 复现编译器的选择；不修根因但让产物可用。
+  (2) **重做 Vector256 的降级路径**：不要把 `<32 x i8>` 拆回标量——
+      广播、比较、掩码全在 `<4 x i64>` 上做（移位/掩码的 SWAR 逐字节比较，
+      不产生任何 i1 向量），让 IR 在 generic CPU 下也能合法化；这是治本但
+      触及 `src/compiler/irgen_expr.c` 的向量整段 lowering，风险高。
+  (3) 走 (1) 并把 (2) 拆成独立条目。
+- ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
+  冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
 ### [ ] A389 自举的 `struct` 是堆对象（引用语义），与 C 宿主的按值语义分歧
 

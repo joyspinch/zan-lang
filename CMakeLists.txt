@@ -2061,8 +2061,12 @@ foreach(_src ${_conf_srcs})
     # subdirectory (no loose files at the spec root): with the skin-pack
     # filter wrongly applied to every spec this spec walked to zero files
     # and the build failed with a false "matched no readable file".
+    # The embed root is "embedfx", not "assets": the case runs with the
+    # repo root as CWD, where a real assets/ (brand assets) exists, and
+    # Directory enumeration merges disk dirs with embedded ones on
+    # purpose -- "assets" would count both and fail the case.
     set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
   elseif(_name STREQUAL "static_publish_tls_stub")
     # The case pins the Windows static-publish stub: DllImport libraries
     # (here ssl/crypto) that resolve to no archive and no shared DLL are
@@ -2254,7 +2258,7 @@ foreach(_src ${_conf_srcs})
       "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_assets=assets")
   elseif(_name STREQUAL "file_embed_subdir")
     set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
   endif()
   add_test(NAME determinism_${_name}
     COMMAND ${CMAKE_COMMAND}
@@ -2368,7 +2372,7 @@ foreach(_src ${_conf_srcs})
     # Subdir-only embedded tree (see the conformance loop above): the
     # regression target of the skin-pack filter scope fix.
     set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   elseif(_name STREQUAL "arc_leak_site_label")
@@ -2445,7 +2449,7 @@ foreach(_src ${_conf_srcs})
     # Subdir-only embedded tree (see the conformance loop above): the
     # regression target of the skin-pack filter scope fix.
     set(_extra_args
-      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=assets")
+      "--embed;${CMAKE_SOURCE_DIR}/tests/conformance/embed_subdir_assets=embedfx")
   elseif(_needs_gui_driver)
     set(_extra_args "${_gui_driver_args}")
   else()

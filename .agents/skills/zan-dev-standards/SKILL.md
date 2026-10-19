@@ -352,6 +352,27 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
 - **trace 打点必须带绝对时刻，成对相对量串不成时间线**：`late_us` 只能回答"迟了几多"，回答不了"第几段路迟的"；push/fire/park/slept 各打点带 `zan_co_precise_us` 绝对值，一轮就能定位迟滞在停车原语还是派发路径。
 - **脚本批量改文件必须读原文→逐处断言命中→写回→复验大小**：`open(p,"w").write(变量.replace(...))` 里变量不是文件内容时写出 0 字节（本轮两个运行时源文件被截断，靠会话内 grep 证据+HEAD 重建）；写完 `len(...)` 不对就停，别继续跑。
 
+### 用例与环境解耦（内嵌资源、目录枚举与跨包引用）
+
+- **内嵌资源的目录枚举按设计合并磁盘与内嵌**：内嵌根下的目录列表是
+  「磁盘优先、内嵌补差」的并集（`stdlib/System/IO/Directory.zan` 的
+  `MergeEmbed` / `EmbedChildren`），单文件发布后 `views/` 之类照样能枚举。
+  所以**内嵌根名不能与运行目录里的真实目录同名**：conformance 用例的运行目录
+  默认是仓库根（`tests/run_case.cmake` 的 `WORKDIR=tests/..`），仓库根上有真实
+  的 `assets/`（品牌素材），拿 "assets" 当内嵌根会让 `Directory.GetDirectories`
+  数到 {brand, pack} 两个，断言 `Count == 1` 必红——而内嵌功能本身完全正确。
+  做法：内嵌根取一个运行目录里不可能出现的名字（本次取 `embedfx`），或者只
+  断言内嵌项本身、不对「内嵌+磁盘」的并集总数做等值断言。
+- **先分清「语义」和「断言」再决定改哪边**：目录枚举的合并是设计，测试里的
+  等值计数是假设。先确认用例量的到底是内嵌树还是并集，再决定是改测试还是改
+  运行时；把设计的语义改掉去迁就一条脆弱断言，是拿产品能力换测试绿灯。
+- **跨包引用类型必须显式 `using`，编译器不会替你想起来**：某个 SDK 包里
+  `Aes.DecryptBlockEcb` 报 "'Aes' is not a known variable, type, or namespace"，
+  缺的是 `using System.Security.Cryptography;`——内建成员表里登记过 "Aes"
+  只说明编译器知道这个类型的成员签名，不代表它在你的文件里可见。同包的
+  另一个文件早就写了那行 `using`，这类"同一个包里一半文件能编一半不能编"
+  的报错，先比 `using` 行再怀疑编译器。
+
 ### IDE 内部逻辑的无头探针验证配方（模板 platforms= 打磨沉淀）
 
 - **探针作 paths[0]，全量 IDE 源一起编**：zanc 只给首个输入发 Main（genrun.c
