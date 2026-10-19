@@ -401,4 +401,25 @@ kernel32、shell32、user32、advapi32、version）。
 - 边界：这条只管**类型映射**；`List<T>` 的槽位本来就是 i64（元素擦除、列表本身
   是 `i8*`），别把两套模型混起来。
 
+## 26. `await` 的操作数必须是协程帧；「必须拒绝」的程序要有门
+
+- 动作：自举的 await 降级读的是**协程帧的槽 5**（resume 入口），所以被 await
+  的操作数**必须是协程帧**。用 `ExprVal.asyncCall` 标记判断（async 方法的调用
+  才带这个标记），不是帧就报诊断，**不要**发 `bitcast i8* 0 to i64*`。
+  另外：async 方法里 **lambda 内部的 await** 要拒绝（lambda 不是协程，在协程里
+  跑同步 await 会重入调度器）。
+- 理由（2026-10-20 实测，探针 `_scratch/sd/p_await_sync.zan`）：
+  `await Task.Delay(80)` 在同步方法里 → `Task.Delay` 是 C 宿主的**内建**
+  （`builtin_api.c`），自举不认识 → 调用**静默降级成常量 0** → await 读 0 号地址
+  → clang 报 `integer constant must have integer type`（非法 IR）。
+- ⚠ **别把规则写成「同步方法里的 await 一律拒绝」**：同步方法里 await 一个
+  **async 方法**是合法的（C 宿主也接受）：自举的 `tests/selfhost/prog1.zan` 靠
+  `int av = await P.AsTwice(21);` 跑出 42——同步上下文会把被 await 的协程跑完
+  再取结果。判据是**操作数是不是帧**，不是**方法是不是 async**。
+- 门：差分门除了"能编且输出逐字一致"的用例，还多了一份 **reject 列表**
+  （`tests/selfhost/reject_cases.txt` + `tests/selfhost/reject/<name>.zan`）：
+  这些程序自举**必须拒绝**——非零退出**且不落 IR**。fail-closed 的边界要有门
+  守着，否则下一次重构就会把它悄悄放回去。
+
+
 

@@ -87,11 +87,23 @@
     `EmitAwait` 的非 async 分支，它把 await 的操作数当**协程帧指针**用：
     `bitcast i8* 0 to i64*` → 读地址 0 的槽 5 → clang 直接报
     `integer constant must have integer type`（链接失败）。
-- 根因：自举只认**显式** `async` 修饰的方法是协程；隐式 async（函数体里有
-  await 但没写 async）与「同步上下文里的 await」都没有被检查器拒绝。
-- 方向：两件事要分开做——(1) 检查器对「同步方法体里的 await」报诊断
-  （fail-closed，而不是生成坏 IR）；(2) 决定隐式 async Main 是否要支持
-  （C 宿主支持，自举目前要求显式 `async void Main()`）。
+- 根因：自举的 await 降级假设「被 await 的东西是**协程帧**」（读帧的槽 5 拿
+  resume 入口）。`Task.Delay` 是 C 宿主的**内建**（`builtin_api.c`），自举不认识
+  它 → 调用**静默降级成常量 0** → `bitcast i8* 0 to i64*` → 非法 IR。
+- 方向（**注意：原方向写错了**）：不是「同步方法里的 await 一律拒绝」——
+  **同步方法里 await 一个 async 方法是合法的**（C 宿主也接受，自举的
+  `tests/selfhost/prog1.zan` 就靠 `int av = await P.AsTwice(21);` 跑出 42：
+  同步上下文会把被 await 的协程跑完再取结果）。真正要 fail-closed 的是
+  **被 await 的操作数不是协程帧**。
+- ✅ 已修（2026-10-20）：`EmitAwait` 检查操作数的 `ExprVal.asyncCall` 标记——
+  不是协程帧就报诊断（"'await' expects an async call in the self-hosted
+  compiler"），不再生成非法 IR。配套：检查器拒绝 **async 方法里 lambda 内部的
+  await**（lambda 不是协程，在协程里跑同步 await 会重入调度器）。
+  回归门：差分门新增 **reject 列表**（`tests/selfhost/reject_cases.txt` +
+  `tests/selfhost/reject/`），这类"必须拒绝"的程序由门断言"非零退出且不落 IR"。
+- 遗留（另立）：自举不认识 C 宿主的内建方法（`Task.Delay` / `Task.Yield` /
+  `Math.*` …）时**静默返回 0**——这是"能力缺口必须 fail-closed"的另一处违反，
+  要单独做（要么给自举一份内建表，要么对认不出的调用报诊断）。
 - ⚠ 这条与 A393 无关：A393 修的是 **async 方法的调用点不启动协程**；
   两者都在 async 路径上，但根因不同，修完都要重跑 `selfhost_fixed_point`
   与差分门。

@@ -345,9 +345,61 @@ public class Checker {
             i = i + 1;
         }
         CheckStmt(m.d);
+        CheckAwaits(m);
         if (!curVoid && m.d != null && !DefinitelyReturns(m.d)) {
             diags.Error("not all code paths return a value in '" + m.sval + "'", m.line, m.col);
         }
+    }
+
+    // ---- await placement ----
+    // An `await` inside a lambda is not lowered: the lambda is a separate
+    // function, and in an async method the await would run the cooperative
+    // scheduler from inside a running coroutine (reentrant scheduler). The
+    // self-hosted backend has no async-lambda form, so report it.
+    //
+    // Note: an `await` in a *synchronous* method is fine -- the C host accepts
+    // it too (the awaited coroutine is driven to completion by the scheduler
+    // the self-hosted backend runs at that point). Only the *operand* has to
+    // be a coroutine frame; that is checked where the await is lowered.
+    void CheckAwaits(Node m) {
+        if (m.d == null) { return; }
+        if (!HasMod(m, MOD.Async())) { return; }
+        Node lam = FindAwaitInLambda(m.d);
+        if (lam != null) {
+            diags.Error("'await' inside a lambda is not lowered by the self-hosted compiler " +
+                "(a lambda is not a coroutine)", lam.line, lam.col);
+        }
+    }
+
+    // the first `await` anywhere in the expression tree
+    Node FindAwaitDeep(Node n) {
+        if (n == null) { return null; }
+        if (n.kind == AK.AwaitExpr()) { return n; }
+        Node r = FindAwaitDeep(n.a); if (r != null) { return r; }
+        r = FindAwaitDeep(n.b); if (r != null) { return r; }
+        r = FindAwaitDeep(n.c); if (r != null) { return r; }
+        r = FindAwaitDeep(n.d); if (r != null) { return r; }
+        int i = 0;
+        while (i < n.kids.Count) { r = FindAwaitDeep(n.kids[i]); if (r != null) { return r; } i = i + 1; }
+        return null;
+    }
+
+    // the first `await` that sits inside a lambda (a lambda never has a frame)
+    Node FindAwaitInLambda(Node n) {
+        if (n == null) { return null; }
+        if (n.kind == AK.AwaitExpr()) { return null; }
+        if (n.kind == AK.Lambda()) {
+            Node r = FindAwaitDeep(n.a); if (r != null) { return r; }
+            r = FindAwaitDeep(n.d); if (r != null) { return r; }
+            return null;
+        }
+        Node r = FindAwaitInLambda(n.a); if (r != null) { return r; }
+        r = FindAwaitInLambda(n.b); if (r != null) { return r; }
+        r = FindAwaitInLambda(n.c); if (r != null) { return r; }
+        r = FindAwaitInLambda(n.d); if (r != null) { return r; }
+        int i = 0;
+        while (i < n.kids.Count) { r = FindAwaitInLambda(n.kids[i]); if (r != null) { return r; } i = i + 1; }
+        return null;
     }
 
     // ---- control-flow: does a statement definitely return/throw? ----

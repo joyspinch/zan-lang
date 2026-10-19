@@ -2786,6 +2786,8 @@ if(SELFHOST_CLANG)
       -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/conformance
       -DCASES=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_cases.txt
       -DGAPS=${CMAKE_SOURCE_DIR}/tests/selfhost/diff_known_gaps.txt
+      -DREJECTS=${CMAKE_SOURCE_DIR}/tests/selfhost/reject_cases.txt
+      -DREJECT_DIR=${CMAKE_SOURCE_DIR}/tests/selfhost/reject
       "-DRTOBJS=${_shd_rt_objs}"
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)

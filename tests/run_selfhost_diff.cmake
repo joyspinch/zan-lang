@@ -12,10 +12,16 @@
 # not fail the gate -- they are the recorded self-host gaps, and a gap that
 # starts passing is reported as stale so the list gets pruned.
 #
+# A "reject" case is the mirror image: a program the self-hosted compiler
+# must refuse (non-zero exit, no IR written). It guards a fail-closed
+# boundary -- the C host may accept the same program, but the self-host must
+# report a diagnostic instead of emitting IR it cannot lower.
+#
 # Invoked as:
 #   cmake -DZANC=<zanc> -DSELFHOST_DIR=<src/selfhost> -DSELFHOST_SOURCES=<list> \
 #         -DGEN1=<exe> -DOUTDIR=<dir> -DCLANG=<clang> -DRTOBJS=<objs> \
 #         -DSYSLIBS=<libs> -DCASES=<cases.txt> -DGAPS=<gaps.txt> \
+#         [-DREJECTS=<reject_cases.txt> -DREJECT_DIR=<dir>] \
 #         [-DWORKDIR=<dir>] -P run_selfhost_diff.cmake
 
 cmake_policy(SET CMP0012 NEW)
@@ -93,6 +99,27 @@ endforeach()
 set(_failures 0)
 set(_gap_hits 0)
 set(_passed 0)
+set(_rejected 0)
+
+# ---- programs the self-host must reject ------------------------------------
+# A "reject" case is a program the self-hosted compiler must refuse: the exit
+# code has to be non-zero and no IR may be written. It guards a fail-closed
+# boundary -- the self-host must report a diagnostic instead of emitting IR it
+# cannot lower (the C host may accept the same program; that is fine).
+set(_rejects)
+if(REJECTS)
+  if(NOT EXISTS ${REJECTS})
+    message(FATAL_ERROR "run_selfhost_diff.cmake: the reject list '${REJECTS}' does not exist (pass an absolute path)")
+  endif()
+  file(STRINGS ${REJECTS} _reject_lines)
+  foreach(_r IN LISTS _reject_lines)
+    string(STRIP "${_r}" _r)
+    if(_r STREQUAL "" OR _r MATCHES "^#")
+      continue()
+    endif()
+    list(APPEND _rejects "${_r}")
+  endforeach()
+endif()
 
 foreach(_case IN LISTS _cases)
   set(_src "${CASE_DIR}/${_case}.zan")
@@ -164,7 +191,32 @@ foreach(_case IN LISTS _cases)
   endif()
 endforeach()
 
-message(STATUS "selfhost differential: ${_passed} passed, ${_gap_hits} known gaps, ${_failures} failures")
+foreach(_r IN LISTS _rejects)
+  set(_rsrc "${REJECT_DIR}/${_r}.zan")
+  if(NOT EXISTS ${_rsrc})
+    message(FATAL_ERROR "reject case source not found: ${_rsrc}")
+  endif()
+  set(_rll "${OUTDIR}/reject_${_r}.ll")
+  file(REMOVE ${_rll})
+  execute_process(
+    COMMAND ${GEN1} ${_rll} ${_rsrc}
+    WORKING_DIRECTORY ${WORKDIR}
+    RESULT_VARIABLE rej_rc
+    OUTPUT_VARIABLE rej_out
+    ERROR_VARIABLE rej_err)
+  if(rej_rc EQUAL 0)
+    math(EXPR _failures "${_failures} + 1")
+    message(SEND_ERROR "FAIL reject ${_r}: the self-hosted compiler accepted a program it must reject")
+  elseif(EXISTS ${_rll})
+    math(EXPR _failures "${_failures} + 1")
+    message(SEND_ERROR "FAIL reject ${_r}: the self-hosted compiler wrote IR for a program it must reject")
+  else()
+    math(EXPR _rejected "${_rejected} + 1")
+    message(STATUS "REJECT ${_r}: refused as expected")
+  endif()
+endforeach()
+
+message(STATUS "selfhost differential: ${_passed} passed, ${_gap_hits} known gaps, ${_rejected} rejected, ${_failures} failures")
 if(_failures GREATER 0)
   message(FATAL_ERROR "selfhost differential gate: ${_failures} case(s) disagree with the C host")
 endif()
