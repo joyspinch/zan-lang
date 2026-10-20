@@ -1273,3 +1273,59 @@
 - 方向：先做 **const 绑定**（赋值时合成一个 `Binding<T>` 实例，`constVal` 存
   值），再做 live 绑定（合成委托）。
 - 现状规避：自举产物里不要用 `Binding<T>` 字段。
+
+### [ ] A431 十九个控件没有 `Kind()`——设计器与序列化器按类型重建不了它们
+
+- 现象：`Control.Kind()` 的基类回退是 `"Control"`，而
+  `BoxContent` / `ChoiceGroup` / `Column` / `ContextMenu` / `Ellipsis` /
+  `FormBuilder` / `Layer` / `Menu` / `Message` / `Popover` / `Prompt` /
+  `QrEncoder` / `Ribbon` / `Scrollbar` / `ScrollView` / `Split` / `Table` /
+  `Tooltip` / `WidgetDelegates` 都没有覆写它。
+- 后果：`Kind()` 是"重建这个节点的稳定类型标签"（见 `ControlFactory`
+  与序列化器）。这十九个控件在序列化往返里只能以 `"Control"` 落盘，
+  重新加载时按类型分派就会走错分支或直接失败——"组件互嵌"在设计器
+  里因此不成立。
+- 方向：逐个补 `override string Kind()`，并在 `ControlFactory` 注册
+  对应的构造入口（注册表缺项时按 `Kind` 反查会失败，补 Kind 要与
+  注册一起做，不能只补一半）。
+- 边界：`HeavyControls` / `ControlBootstrap` 里已注册的重家族（图表、
+  设计器、CEF 等）走的是另一张表，补 Kind 时不要重复注册。
+
+### [ ] A432 样式解析仍有两类旁路——静态 helper 与显式 id 解析
+
+- 现象：本轮把控件里手写的 `Style.Of(app, ...)` 迁到了基类入口
+  （`Control.Box` / `ResolveStyleAs`），但仍有三类调用留在旧路上：
+  1. **静态 helper**：`Badge.WidthOf/Pill/Dot/CountAt`、
+     `Layer.DrawToast/DrawNotifyCard/DrawPopconfirm`、`Tag.*`、
+     `Typography.Heading`、`StyledText.FontPx` 等——它们没有 `this`，
+     拿不到控件自身的行内样式（`Bg()`/`Radius()`）与基类缓存。
+  2. **显式 id 解析**：`ListView` 的 `listrow`、`TreeView` 的 `row`、
+     `DockHost` 的 `docktab`、`SessionList` 的 `listrow` 用
+     `Style.Full(app, type, cls, "", state)` 显式传空 id——这是对的
+     （行不该继承父控件的 id），但走的是旧路径，不进缓存。
+  3. **借用外观**：`Scrollbar`/`Split`/`Tooltip`/`Popover` 等借用别的
+     类型的规则，本轮已迁到 `ResolveStyleAs`，但它们自己的
+     `StyleType()` 仍返回基类默认的 `"control"`。
+- 方向：静态 helper 改成"由调用方传入已解析的 StyleBox"或给它们一个
+  显式的解析参数（避免每个 helper 都自己解析一次）；显式 id 的行解析
+  走 `ResolveStyleAsAs` 的新变体（带 id 参数）；`StyleType()` 为
+  `"control"` 的控件各自覆写成本类型的真实选择器。
+- 关联：见 A429（排版组溢出）——那条是布局放不下，本条是样式解析
+  入口不统一。
+
+### [ ] A433 尺寸档还有几处不齐：switch 的档位不单调，textarea 只调字号
+
+- 现象：四档统一后仍有例外：
+  - `switch` 的 tiny/small/默认都是 24px（`switch.small` 的
+    `height: var(--height-tiny)`），只有 large 是 40——"small" 与
+    "tiny" 同高，档位不单调；
+  - `textarea` 的档位只调字号，高度随内容（多行盒按高度走档不合理，
+    但也没说清）；
+  - `avatar` 没有 tiny 档（它有显式直径字段，规则对未设置直径的默认
+    头像才生效）；
+  - `badge` 的默认高度 24（`--height-tiny`），tiny 档 16
+    （`--height-micro-tiny`），但代码兜底值过去写的是 18（已随本轮
+    改成 24）。
+- 方向：switch 改成 24/28/32/40 的单调阶梯（轨道尺寸同步），或在
+  规约里明确写"开关的高度档只作用于行高，轨道另算"；textarea 与
+  avatar 的例外写进 `docs/GUI_COMPONENT_AUTHORING.md`。
