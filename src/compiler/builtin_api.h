@@ -30,4 +30,10 @@ char zan_builtin_member_kind(const char *type, const char *name, int name_len);
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len);
 
+/* 取内建方法的形参类型名列表（签名的括号里，按逗号分隔）。
+ * 返回形参个数；out[] 里是各形参的类型名（"T" / "int" / "List<T>" …）。
+ * 非方法成员或无括号签名返回 0。 */
+int zan_builtin_member_params(const char *type, const char *name, int name_len,
+                              const char **out, int max_out);
+
 #endif /* ZAN_BUILTIN_API_H */

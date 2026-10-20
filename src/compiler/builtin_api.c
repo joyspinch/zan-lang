@@ -390,6 +390,69 @@ const zan_builtin_type_t *zan_builtin_find(const char *type) {
     return NULL;
 }
 
+/* 取内建方法的**形参类型列表**（签名的括号里，按逗号分隔）。
+ *
+ * 返回的每个元素是形参类型的名字（"T" / "int" / "List<T>" …）。形参名
+ * 不需要——调用方只要类型。
+ *
+ * 返回 NULL 表示：这个成员不是方法，或者签名里没有括号（无参方法）。
+ * 调用方拿到空列表（*count == 0）表示"无参方法"。
+ *
+ * 为什么要它：内建泛型（`List<T>.Add(T item)`）的形参类型是**类型参
+ * 数**，checker 要拿调用点的**类型实参**替换它，才能检查实参类型对不对。
+ * 没有这个接口，`List<int>.Add("字符串")` 就一路放行（类型实参根本没
+ * 被检查过），存进去再读出来是垃圾指针。
+ */
+int zan_builtin_member_params(const char *type, const char *name, int name_len,
+                              const char **out, int max_out) {
+    if (!out || max_out <= 0) return 0;
+    const zan_builtin_type_t *bt = zan_builtin_find(type);
+    if (!bt || !name || name_len <= 0) return 0;
+    for (int i = 0; i < bt->member_count; i++) {
+        if ((int)strlen(bt->members[i].name) != name_len ||
+            memcmp(bt->members[i].name, name, (size_t)name_len) != 0)
+            continue;
+        if (bt->members[i].kind != 'M') return 0;
+        const char *sig = bt->members[i].sig;
+        if (!sig) return 0;
+        const char *open = strchr(sig, '(');
+        if (!open) return 0;
+        const char *close = strchr(open, ')');
+        if (!close) return 0;
+        int n = 0;
+        const char *p = open + 1;
+        while (p < close) {
+            /* 跳到下一个形参类型的开头（跳过名字与修饰符）。可选参数写成
+             * "int start[, int length]"，方括号是标记，跳过。 */
+            while (p < close && (*p == ' ' || *p == ',' || *p == '[' ||
+                                 *p == ']')) p++;
+            const char *start = p;
+            while (p < close && *p != ',' && *p != ' ' && *p != '[' && *p != ']')
+                p++;
+            const char *end = p;
+            const char *last_space = NULL;
+            for (const char *q = start; q < end; q++)
+                if (*q == ' ') last_space = q;
+            const char *type_start = last_space ? last_space + 1 : start;
+            if (type_start < end) {
+                if (n < max_out) {
+                    static char buf[16][64];
+                    size_t len = (size_t)(end - type_start);
+                    if (len >= sizeof(buf[0])) len = sizeof(buf[0]) - 1;
+                    memcpy(buf[n], type_start, len);
+                    buf[n][len] = '\0';
+                    out[n] = buf[n];
+                }
+                n++;
+            }
+            while (p < close && *p != ',') p++;
+            if (p < close) p++;
+        }
+        return n;
+    }
+    return 0;
+}
+
 /* 获取内建成员的返回值类型名称（解析方法/属性签名中首个空格前的类型名） */
 const char *zan_builtin_member_result(const char *type, const char *name,
                                       int name_len) {
