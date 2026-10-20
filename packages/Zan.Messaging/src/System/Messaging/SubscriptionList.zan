@@ -1,0 +1,75 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Messaging;
+
+// 订阅表：一个通道的订阅者集合（按订阅顺序依次调用）。
+//
+// **为什么单独一个类**：通道的"投递委托"要在**通道的构造器里**定型（那时
+// 类型参数是具体的）。委托里如果捕获 `this`，就会形成"通道 → 委托 → 通道"
+// 的引用环（ARC 回收不掉）。改成捕获这个订阅表：通道 → 委托 → 订阅表，
+// 没有环。
+public class SubscriptionList<T> {
+    // 订阅者。
+    private List<Action<T>> handlers;
+    // 已退订的订阅编号。
+    private List<int> revoked;
+
+    public SubscriptionList() {
+        this.handlers = new List<Action<T>>();
+        this.revoked = new List<int>();
+    }
+
+    // 订阅（返回订阅编号，供退订用）。
+    public int Add(Action<T> handler) {
+        this.handlers.Add(handler);
+        return this.handlers.Count - 1;
+    }
+
+    // 退订（返回是否真的退订了；编号不存在或已退订都返回 false）。
+    public bool Revoke(int subscriptionId) {
+        if (subscriptionId < 0 || subscriptionId >= this.handlers.Count) { return false; }
+        for (int i = 0; i < this.revoked.Count; i = i + 1) {
+            if (this.revoked[i] == subscriptionId) { return false; }
+        }
+        this.revoked.Add(subscriptionId);
+        return true;
+    }
+
+    // 这个订阅编号是否已退订。
+    public bool IsRevoked(int subscriptionId) {
+        for (int i = 0; i < this.revoked.Count; i = i + 1) {
+            if (this.revoked[i] == subscriptionId) { return true; }
+        }
+        return false;
+    }
+
+    // 有效订阅者数量（已退订的不算）。
+    public int Count() {
+        int count = 0;
+        for (int i = 0; i < this.handlers.Count; i = i + 1) {
+            if (!this.IsRevoked(i)) { count = count + 1; }
+        }
+        return count;
+    }
+
+    // 广播：所有有效订阅者都收到（返回被调用的数量）。
+    public int Publish(T message) {
+        int called = 0;
+        for (int i = 0; i < this.handlers.Count; i = i + 1) {
+            if (this.IsRevoked(i)) { continue; }
+            this.handlers[i](message);
+            called = called + 1;
+        }
+        return called;
+    }
+
+    // 命令：只投给唯一一个有效订阅者（调用方要保证只有一个）。
+    public void PublishOne(T message) {
+        for (int i = 0; i < this.handlers.Count; i = i + 1) {
+            if (this.IsRevoked(i)) { continue; }
+            this.handlers[i](message);
+            return;
+        }
+    }
+}

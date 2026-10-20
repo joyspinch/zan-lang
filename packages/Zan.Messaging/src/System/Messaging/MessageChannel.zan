@@ -1,0 +1,101 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Messaging;
+
+// 消息通道基类：总线只认它，不认具体类型。
+//
+// **为什么是委托而不是虚方法**：Zan 里泛型类的**虚方法体拿不到类型参数**
+// ——`message is T` 经基类虚调用恒为 false（实测）。所以类型判定不能写在
+// 虚方法里，得由派生类在**构造器里**定型成委托（那时类型参数是具体的），
+// 基类只负责调用这个委托。委托存的是实例字段，所以每条通道各判各的。
+//
+// **这三个委托由派生类的构造器填好**，基类不碰类型信息。
+public class MessageChannelBase {
+    // 类型判定（派生类构造器定型）。
+    protected FuncT<object, bool> acceptsField;
+    // 投递（派生类构造器定型）。
+    protected Func<object, int> dispatchField;
+    // 订阅者计数（派生类构造器定型）。
+    protected Func<int> handlerCountField;
+
+    public MessageChannelBase() {
+        this.acceptsField = null;
+        this.dispatchField = null;
+        this.handlerCountField = null;
+    }
+
+    // 这条通道收不收这条消息（按消息的运行期类型判断）。
+    public bool Accepts(object message) {
+        if (this.acceptsField == null) { return false; }
+        return this.acceptsField(message);
+    }
+
+    // 把消息投给订阅者（返回被调用的订阅者数量）。
+    public int Dispatch(object message) {
+        if (this.dispatchField == null) { return 0; }
+        return this.dispatchField(message);
+    }
+
+    // 订阅者数量（已退订的不算）。
+    public int SubscriberCount() {
+        if (this.handlerCountField == null) { return 0; }
+        return this.handlerCountField();
+    }
+}
+
+// 消息通道：一类消息的订阅集合。
+//
+// **零配置可用**：`new MessageChannel<Order>()` → `Subscribe(...)` → `bus.Register(...)`。
+//
+// **显式建通道，而不是让总线按类型自动建**：Zan 没有运行期类型名（没有
+// `typeof` / `GetType().Name`），总线没法判断"这个类型是不是已经建过通道"
+// ——同一个类型建两个通道，消息就会被处理两遍。通道由使用者持有，一个类型
+// 一个通道，重复的问题就不存在了。
+//
+// **并发**：非线程安全（订阅与发布都是同一线程内的状态）。
+public class MessageChannel<T> : MessageChannelBase {
+    // 订阅表。
+    private SubscriptionList<T> subscriptions;
+
+    public MessageChannel() {
+        this.subscriptions = new SubscriptionList<T>();
+        // 捕获订阅表（不捕获 this —— 那会形成引用环）。
+        SubscriptionList<T> subs = this.subscriptions;
+        // 类型判定在这里"定型"：此刻 T 是具体的类型，`is T` 判得准。
+        this.acceptsField = (object m) => { return m is T; };
+        this.dispatchField = (object m) => { T typed = (T)m; return subs.Publish(typed); };
+        this.handlerCountField = () => { return subs.Count(); };
+    }
+
+    // 订阅（可多次订阅，按订阅顺序依次调用）；返回订阅编号，供退订用。
+    public int Subscribe(Action<T> handler) {
+        if (handler == null) {
+            throw new MessageException(MessageError.InvalidHandler, null,
+                "MessageChannel.Subscribe: the handler must not be null");
+        }
+        return this.subscriptions.Add(handler);
+    }
+
+    // 退订（返回是否真的退订了；编号不存在或已退订都返回 false）。
+    public bool Unsubscribe(int subscriptionId) {
+        return this.subscriptions.Revoke(subscriptionId);
+    }
+
+    // 广播：所有有效订阅者都收到（返回被调用的数量）。
+    public int Publish(T message) {
+        return this.subscriptions.Publish(message);
+    }
+
+    // 命令：恰好一个订阅者，否则报错。
+    public void Send(T command) {
+        int count = this.subscriptions.Count();
+        if (count != 1) {
+            throw new MessageException(
+                count == 0 ? MessageError.NoHandler : MessageError.TooManyHandlers,
+                null,
+                "MessageChannel.Send: expected exactly one handler, got " + count.ToString());
+        }
+        this.subscriptions.PublishOne(command);
+    }
+}

@@ -1,0 +1,60 @@
+using System;
+
+namespace System.Messaging;
+
+// 查询端点基类：总线只认它（接上中间件链），不碰类型信息。
+public class QueryEndpointBase {
+    // 所属总线（登记后才有；没有时 `Handle` 直接调用处理函数）。
+    public MessageBus Bus;
+
+    public QueryEndpointBase() {
+        this.Bus = null;
+    }
+}
+
+// 查询端点：一个"请求 → 结果"的处理者。
+//
+// **结果类型完整保留**：端点是泛型类（`QueryEndpoint<T, TResult>`），
+// 处理函数是 `FuncT<T, TResult>`，中间没有 `object` 擦除——所以结果可以是
+// 值类型（int、double、结构体），不会被装箱成空引用。
+//
+// **为什么不用总线统一发请求**：Zan 的 `object` 装不下值类型（显式装箱会崩，
+// 见 TASKS.md 记的编译器缺陷），而把结果擦成 `object` 再转回来这条路是不通的。
+// 端点由使用者持有，直接调 `Handle(query)` 拿结果，类型一路到底。
+//
+// **中间件照样生效**：端点登记到总线后，`Handle` 会先跑总线的中间件链，
+// 再落到真正的处理函数。
+//
+// **查询类型**：接了总线时查询会经过 `object` 传给中间件，所以查询类型要是
+// 引用类型（类）；没接总线时（`Bus` 为空）任意类型都可以。
+//
+// **并发**：非线程安全。
+public class QueryEndpoint<T, TResult> : QueryEndpointBase {
+    // 处理函数（由使用者赋值）。
+    public FuncT<T, TResult> Handler;
+
+    public QueryEndpoint() {
+        this.Handler = null;
+    }
+
+    // 处理一次查询。
+    public TResult Handle(T query) {
+        if (this.Handler == null) {
+            throw new MessageException(MessageError.NoHandler, null,
+                "QueryEndpoint.Handle: no handler is set");
+        }
+        FuncT<T, TResult> handler = this.Handler;
+        MessageBus bus = this.Bus;
+        if (bus == null) {
+            return handler(query);
+        }
+        // 结果用"数组盒"带出来：闭包捕获的是数组**引用**，写 box[0] 调用方
+        // 看得见（捕获普通局部变量只会拿到副本，见 skill 里的闭包教训）。
+        // 查询本身也装进盒子——闭包捕获泛型形参不稳。
+        TResult[] box = new TResult[1];
+        ValueHolder<T> queryBox = new ValueHolder<T>(query);
+        Action finalAction = () => { box[0] = handler(queryBox.Value); };
+        bus.RunPipeline(query, finalAction);
+        return box[0];
+    }
+}

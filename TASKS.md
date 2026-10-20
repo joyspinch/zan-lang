@@ -953,3 +953,132 @@
   编译命令 `zanc <file>.zan --auto-stdlib --package-project . -o out.exe`：
   不加 `using Gui.Backend;` 绑到 `System.Data.Window` 报错；加上即编过。
 - 关联：无（命名解析族，与 A430~A437 不同族）。
+
+### [ ] A447 泛型类的虚方法体拿不到类型参数——`is T` 经基类虚调用恒为 false
+
+- 现象（2026-10-21 落地 `Zan.Messaging` 时撞到）：`class Ch<T> : Base`，
+  `Base.Accepts(object)` 是虚方法，`Ch<T>` 覆写它并写 `return m is T;`：
+  - `Ch<Order> ch; ch.Accepts(new Order(1))`（**直接调用**）→ true ✅
+  - `Base b = ch; b.Accepts(new Order(1))`（**经基类引用虚调用**）→ **false** ❌
+  - 换成 `Ch<T>` 里的**非虚**方法（`Direct(object m) { return m is T; }`）→ 直接调用 true ✅
+  - 虚方法体里改成 `return this.AcceptsTyped(m);`（转交非虚方法）→ 仍 false ❌
+  - 同一现象在 `build/zanc.exe`（2026-10-21 01:13）与 `build/zanc5.exe`
+    （2026-10-20 23:00）上都在，与 HEAD 的「类级单态化」提交无关。
+- 根因（未定位到具体代码）：虚方法槽里取的是**擦除版**方法体，擦除版拿不到
+  类型实参 → `is T` 的 T 是擦除占位 → 判定恒假。类型信息只在**非虚**调用
+  路径上才具体。
+- 影响：**静默错值**——类型判定返回 false 而不是报错。凡是靠运行期类型分发的
+  库（消息总线、插件注册表、序列化分派）都会踩，且症状是"消息没人收 /
+  永远匹配不上"，极难定位。
+- 旁证：**方法组转委托也会抹掉 `is T`**——`FuncT<object,bool> f = chan.Accepts;`
+  （`chan` 是 `Chan<T>`）→ 恒 false；同一方法用 lambda 包一层
+  （`(object m) => { return chan.Accepts(m); }`）→ true。
+- 绕行（已落在 `Zan.Messaging`）：**类型判定在派生类构造器里定型成委托**
+  （`this.acceptsField = (object m) => { return m is T; };`），基类只调用
+  委托、不碰类型信息；总线只持有基类引用。
+- 方向（择一）：
+  1. 虚调用按**实例的具体类型**分派（对象头已有类型描述符 `__zan_desc_*`），
+     擦除版转调具体版；
+  2. 编译期诊断：泛型类的虚方法体里用类型参数做类型判定时报错，要求把判定
+     挪到非虚方法或构造器；
+  3. 明文化限制，并给检查器一条提示级诊断（当前是静默返回 false）。
+- 探针：`_scratch/msgprobe/p1.zan`（四种形态对照）、`p2.zan`（方法组 vs
+  lambda）、`p7.zan`（虚方法转交非虚方法）、`p8.zan`（构造器定型委托 ✅）。
+- 关联：A448、A449。
+
+### [ ] A448 泛型方法在包单元里、类型实参靠推断时不单态化——方法体里的类型判定恒假
+
+- 现象：`Zan.Messaging` 第一版把登记写成 `MessageBus.Register<T>(MessageChannel<T>
+  channel)`（泛型方法在**包单元**里），调用方在主单元：
+  - `bus.Register(orders)`（**推断** T）→ 消息投不出去（`Publish` 返回 0，
+    订阅者一次没被叫醒），**不报错**；
+  - `bus.Register<Order>(orders)`（**显式** T）→ 正常投递。
+- 隔离出的边界（同一批探针实测）：
+  - 同一编译单元内，静态 / 实例 / 用 `this` 的三种泛型方法，**推断与显式都
+    正确**（探针 `p9.zan`）；
+  - 同形状代码放进**包单元**后按推断调用就错（探针 `p6.zan`），显式就对
+    （探针 `p11.zan` 是同形状的单单元对照）；
+  - 跨编译单元（stdlib 的 `RandomExt.Pick<T>(List<T>)`）推断调用**结果正确**
+    ——但那个方法体里没有类型判定，擦除不影响结果（探针 `p10.zan`）。
+- 根因（未定位到具体代码）：推断出来的类型实参在"泛型方法在别的单元"时没有
+  触发**具体实例化**，调用退化成擦除版方法体——与 A418「泛型方法内
+  `new Foo<T,V>` 不发射变体 → 退化成擦除版」是同一族症状。
+- 影响：静默错值（判定恒假 → 消息没人收）。凡是"包里定义泛型方法、外面按
+  推断调用"的组合都会踩。
+- 方向（择一）：
+  1. 推断出的类型实参也要走 `discover_generic_insts` → 发射具体实例化；
+  2. 编译期诊断：跨单元调用且类型实参是推断出来的、方法体又用了类型参数 →
+     提示显式写 `<T>`；
+  3. **库里避开这个形状（本轮采用）**：把 API 设计成**非泛型**（基类持有委托），
+     类型判定在派生类构造器里定型。
+- 探针（最小复现，内容直接抄进本条，随时可重建）：
+  ```zan
+  // 包单元 lib.zan
+  namespace Demo;
+  public class Chan<T> {
+      public FuncT<object, bool> accepts;
+      public Chan() { this.accepts = (object m) => { return m is T; }; }
+  }
+  public class Api {
+      public FuncT<object, bool> Make<T>(Chan<T> c) {
+          Chan<T> local = c;
+          FuncT<object, bool> f = (object m) => { return local.accepts(m); };
+          return f;
+      }
+  }
+  ```
+  ```zan
+  // 主单元 main.zan
+  using System; using Demo;
+  public class Probe {
+      public static void Main() {
+          Api api = new Api();
+          Chan<Order> ch = new Chan<Order>();
+          Console.WriteLine("inferred: " + api.Make(ch)(new Order(1)).ToString());        // false
+          Console.WriteLine("explicit: " + api.Make<Order>(ch)(new Order(1)).ToString());  // true
+      }
+  }
+  public class Order { public int id; public Order(int id) { this.id = id; } }
+  ```
+- 关联：A447、A418。
+
+### [ ] A449 值类型 ↔ `object`：显式装箱崩进程，lambda 返回类型不兼容不报错
+
+- 现象（2026-10-21 落地 `Zan.Messaging` 时撞到，`build/zanc.exe` 01:13 实测）：
+  - **显式装箱直接崩进程**：`int v = 42; object boxed = (object)v;` → 程序
+    **当场 access violation**（退出码 `0xC0000005` / -1073741819），没有任何
+    诊断、没有消息；连"崩之前打印一行"都做不到。
+  - **lambda 返回类型与委托返回类型不兼容不报错**：
+    `FuncT<Order, object> f = (Order o) => o.id;` → **编译通过**；运行期
+    `f(new Order(7))` 返回**非 null 的垃圾指针**（int 值被当成对象指针，
+    `r == null` 为 false）；进程退出时 ARC 去回收这个假对象 → 再次
+    access violation。块形式 `(Order o) => { return o.id; }` 同样编译通过、
+    同样给垃圾（两种写法结果一致）。
+- 根因（未定位到具体代码）：Zan 目前没有值类型装箱设施（没有"把值写进带类型
+  描述符的堆对象"的路径），`object` 只能装引用；lambda 的返回类型与委托返回
+  类型不兼容时检查器也没拦。
+- 影响：任何"值类型进 `object`"的写法要么崩进程，要么静默拿到野指针。这是
+  `Zan.Messaging` 不能做"统一请求-响应 + 擦除结果"的直接原因——结果类型
+  必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
+- 方向（择一）：
+  1. 补装箱：值类型 → `object` 时分配一个带类型描述符的堆对象（与 A434 的
+     "按实例动态分派"同一方向）；
+  2. 编译期诊断：显式装箱值类型到 `object` 报错；lambda 返回类型与委托返回
+     类型不兼容一律报错（两种写法一致）。
+- 探针（最小复现，内容直接抄进本条，随时可重建）：
+  ```zan
+  using System;
+  using System.Collections.Generic;
+  class Order { public int id; public Order(int id) { this.id = id; } }
+  public class Probe {
+      public static void Main() {
+          FuncT<Order, object> f = (Order o) => o.id;     // 编译通过
+          object r = f(new Order(7));
+          Console.WriteLine("r is null: " + (r == null).ToString());   // false（是垃圾指针）
+          int v = 42;
+          object boxed = (object)v;                      // 这里直接 access violation
+          Console.WriteLine("after box");
+      }
+  }
+  ```
+- 关联：A434、A441~A446（同一族：`object` 没有值语义与类型描述符）。

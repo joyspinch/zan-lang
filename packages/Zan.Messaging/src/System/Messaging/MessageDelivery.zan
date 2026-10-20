@@ -1,0 +1,57 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Messaging;
+
+// 一次投递的执行体：把一条消息投给所有"接这条消息"的通道。
+//
+// **为什么单独一个类**：中间件链的最后一步是一个 `Action`（无参闭包），
+// 它要把"消息 + 通道表 + 计数"一起带进投递逻辑。闭包捕获 `this` 会被
+// 判成"this 逃逸"，所以这些状态装进一个普通类里，闭包只捕获它。
+public class MessageDelivery {
+    // 所属总线（错误处理走总线）。
+    private MessageBus bus;
+    // 通道表。
+    private List<MessageChannelBase> channels;
+    // 消息。
+    private MessageHolder holder;
+    // 各通道投出去的数量。
+    private List<int> counts;
+
+    public MessageDelivery(MessageBus bus, List<MessageChannelBase> channels, MessageHolder holder) {
+        this.bus = bus;
+        this.channels = channels;
+        this.holder = holder;
+        this.counts = new List<int>();
+    }
+
+    // 投递（返回被调用的订阅者数量）。
+    public int Run() {
+        for (int i = 0; i < this.channels.Count; i = i + 1) {
+            MessageChannelBase channel = this.channels[i];
+            if (!channel.Accepts(this.holder.Value)) { continue; }
+            if (this.bus.HasErrorHandler()) {
+                // 登记了错误处理器：订阅者的异常交给它，不往上抛。
+                try {
+                    this.counts.Add(channel.Dispatch(this.holder.Value));
+                } catch (Exception ex) {
+                    this.bus.ReportError(ex, this.holder.Value);
+                }
+            } else {
+                // 没登记：订阅者的异常原样抛出（总线里的异常多半是处理逻辑的
+                // bug，吞掉会让问题变成"消息莫名其妙没到"）。
+                this.counts.Add(channel.Dispatch(this.holder.Value));
+            }
+        }
+        return this.Delivered();
+    }
+
+    // 被调用的订阅者数量。
+    public int Delivered() {
+        int called = 0;
+        for (int i = 0; i < this.counts.Count; i = i + 1) {
+            called = called + this.counts[i];
+        }
+        return called;
+    }
+}

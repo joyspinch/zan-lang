@@ -1,0 +1,346 @@
+using System;
+using System.Collections.Generic;
+using System.Messaging;
+
+// 消息总线契约测试：类型分发、广播 / 命令语义、中间件链、错误路由、查询端点。
+//
+// 覆盖的判定点：
+//   - 类型分发：消息只投给类型匹配的通道，另一个类型的订阅者不会被叫醒；
+//   - 广播：同一通道的多个订阅者按订阅顺序都被叫醒，返回被调用次数；
+//   - 退订：退订后不再被叫醒，订阅者计数同步下降；
+//   - 命令：恰好一个订阅者才成功；零个报 NoHandler，多个报 TooManyHandlers；
+//   - 中间件：按登记顺序包裹投递、不调 next 就吞掉消息；
+//   - 错误路由：没登记错误处理器时订阅者异常原样抛出；登记后异常被包装成
+//     HandlerFailed 交给错误处理器，原异常在 InnerException 里；
+//   - 查询端点：值类型结果（int）完整保留、字符串结果正确、接了总线后
+//     中间件照样生效、没有处理函数时报 NoHandler；
+//   - 参数校验：null 通道 / null 中间件 / null 消息都报可区分的错误码。
+public class MessagingTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    public static void Run() {
+        TestRouting();
+        TestBroadcastOrder();
+        TestUnsubscribe();
+        TestCommand();
+        TestMiddleware();
+        TestErrorRouting();
+        TestQueryEndpoint();
+        TestValidation();
+
+        if (failures > 0) {
+            Console.WriteLine("MESSAGING TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL MESSAGING TESTS PASSED");
+        }
+    }
+
+    // ---- 类型分发 ----
+    private static void TestRouting() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> orders = new MessageChannel<Order>();
+        MessageChannel<Refund> refunds = new MessageChannel<Refund>();
+
+        List<string> seen = new List<string>();
+        orders.Subscribe((Order o) => { seen.Add("order:" + o.id.ToString()); });
+        refunds.Subscribe((Refund r) => { seen.Add("refund:" + r.id.ToString()); });
+
+        bus.Register(orders);
+        bus.Register(refunds);
+        Check("bus-channel-count", bus.ChannelCount() == 2);
+
+        int called = bus.Publish(new Order(1));
+        Check("publish-count-order", called == 1);
+        Check("publish-routed-to-order", seen.Count == 1 && seen[0] == "order:1");
+
+        called = bus.Publish(new Refund(2));
+        Check("publish-count-refund", called == 1);
+        Check("publish-routed-to-refund", seen.Count == 2 && seen[1] == "refund:2");
+
+        Check("bus-delivered-count", bus.DeliveredCount() == 2);
+
+        // 没有匹配通道时：不算错，就是没人收。
+        called = bus.Publish(new Note("hello"));
+        Check("publish-unmatched-count", called == 0);
+        Check("publish-unmatched-no-side-effect", seen.Count == 2);
+    }
+
+    // ---- 广播：多订阅者按顺序 ----
+    private static void TestBroadcastOrder() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> orders = new MessageChannel<Order>();
+        List<string> seen = new List<string>();
+        orders.Subscribe((Order o) => { seen.Add("first"); });
+        orders.Subscribe((Order o) => { seen.Add("second"); });
+        orders.Subscribe((Order o) => { seen.Add("third"); });
+        bus.Register(orders);
+
+        int called = bus.Publish(new Order(7));
+        Check("broadcast-count", called == 3);
+        Check("broadcast-order", seen.Count == 3 && seen[0] == "first" && seen[1] == "second" && seen[2] == "third");
+        Check("channel-subscriber-count", orders.SubscriberCount() == 3);
+    }
+
+    // ---- 退订 ----
+    private static void TestUnsubscribe() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> orders = new MessageChannel<Order>();
+        List<string> seen = new List<string>();
+        int id1 = orders.Subscribe((Order o) => { seen.Add("one"); });
+        orders.Subscribe((Order o) => { seen.Add("two"); });
+        bus.Register(orders);
+
+        Check("unsubscribe-ok", orders.Unsubscribe(id1));
+        Check("unsubscribe-twice-is-false", !orders.Unsubscribe(id1));
+        Check("unsubscribe-bad-id-is-false", !orders.Unsubscribe(99));
+
+        int called = bus.Publish(new Order(1));
+        Check("unsubscribe-count", called == 1);
+        Check("unsubscribe-skipped", seen.Count == 1 && seen[0] == "two");
+        Check("unsubscribe-subscriber-count", orders.SubscriberCount() == 1);
+    }
+
+    // ---- 命令语义 ----
+    private static void TestCommand() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> orders = new MessageChannel<Order>();
+        List<string> seen = new List<string>();
+        bus.Register(orders);
+
+        // 零个订阅者 -> NoHandler
+        string code = "";
+        try {
+            bus.Send(new Order(1));
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("command-no-handler", code == "NoHandler");
+
+        // 一个订阅者 -> 成功
+        orders.Subscribe((Order o) => { seen.Add("handled"); });
+        bus.Send(new Order(2));
+        Check("command-single-handler", seen.Count == 1 && seen[0] == "handled");
+
+        // 多个订阅者 -> TooManyHandlers
+        orders.Subscribe((Order o) => { seen.Add("second"); });
+        code = "";
+        try {
+            bus.Send(new Order(3));
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("command-too-many-handlers", code == "TooManyHandlers");
+    }
+
+    // ---- 中间件 ----
+    private static void TestMiddleware() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> orders = new MessageChannel<Order>();
+        List<string> trace = new List<string>();
+        List<string> seen = new List<string>();
+        orders.Subscribe((Order o) => { seen.Add("subscriber"); });
+        bus.Register(orders);
+
+        bus.Use((object m, Action next) => {
+            trace.Add("outer-before");
+            next();
+            trace.Add("outer-after");
+        });
+        bus.Use((object m, Action next) => {
+            trace.Add("inner-before");
+            next();
+            trace.Add("inner-after");
+        });
+        Check("bus-middleware-count", bus.MiddlewareCount() == 2);
+
+        int called = bus.Publish(new Order(1));
+        Check("middleware-delivers", called == 1 && seen.Count == 1);
+        Check("middleware-order",
+            trace.Count == 4 &&
+            trace[0] == "outer-before" && trace[1] == "inner-before" &&
+            trace[2] == "inner-after" && trace[3] == "outer-after");
+
+        // 不调 next 的中间件会吞掉消息
+        MessageBus swallow = new MessageBus();
+        MessageChannel<Order> swallowOrders = new MessageChannel<Order>();
+        List<string> swallowed = new List<string>();
+        swallowOrders.Subscribe((Order o) => { swallowed.Add("subscriber"); });
+        swallow.Register(swallowOrders);
+        swallow.Use((object m, Action next) => { });
+        int swallowedCount = swallow.Publish(new Order(2));
+        Check("middleware-swallows", swallowedCount == 0 && swallowed.Count == 0);
+    }
+
+    // ---- 错误路由 ----
+    private static void TestErrorRouting() {
+        // 没登记错误处理器：异常原样抛出
+        MessageBus bus = new MessageBus();
+        MessageChannel<Boom> booms = new MessageChannel<Boom>();
+        booms.Subscribe((Boom b) => { throw new Exception("boom"); });
+        bus.Register(booms);
+
+        bool threw = false;
+        try {
+            bus.Publish(new Boom(1));
+        } catch (Exception ex) {
+            threw = true;
+        }
+        Check("error-propagates-without-handler", threw);
+
+        // 登记了错误处理器：异常被包装成 HandlerFailed
+        MessageBus bus2 = new MessageBus();
+        MessageChannel<Boom> booms2 = new MessageChannel<Boom>();
+        booms2.Subscribe((Boom b) => { throw new Exception("boom"); });
+        bus2.Register(booms2);
+
+        List<Exception> errors = new List<Exception>();
+        List<bool> handled = new List<bool>();
+        bus2.OnError((Exception ex, object m) => {
+            errors.Add(ex);
+            handled.Add(true);
+        });
+        Check("bus-has-error-handler", bus2.HasErrorHandler());
+
+        bool threw2 = false;
+        int called2 = 0;
+        try {
+            called2 = bus2.Publish(new Boom(2));
+        } catch (Exception ex) {
+            threw2 = true;
+        }
+        Check("error-handler-swallows", !threw2);
+        Check("error-handler-called", errors.Count == 1);
+        if (errors.Count == 1) {
+            MessageException me = (MessageException)errors[0];
+            Check("error-code-handler-failed", me.error == MessageError.HandlerFailed);
+            Check("error-code-name", me.ErrorName() == "HandlerFailed");
+            Check("error-inner-exception", me.InnerException != null);
+            Check("error-inner-message", me.InnerException != null && me.InnerException.Message == "boom");
+        }
+        Check("error-handler-failed-delivery-not-counted", called2 == 0);
+    }
+
+    // ---- 查询端点 ----
+    private static void TestQueryEndpoint() {
+        // 值类型结果完整保留（没有总线时）
+        QueryEndpoint<Order, int> endpoint = new QueryEndpoint<Order, int>();
+        endpoint.Handler = (Order o) => { return o.id * 2; };
+        int value = endpoint.Handle(new Order(21));
+        Check("query-int-result", value == 42);
+
+        // 字符串结果
+        QueryEndpoint<Order, string> textEndpoint = new QueryEndpoint<Order, string>();
+        textEndpoint.Handler = (Order o) => { return "id=" + o.id.ToString(); };
+        string text = textEndpoint.Handle(new Order(7));
+        Check("query-string-result", text == "id=7");
+
+        // 接了总线：中间件照样生效，结果照样完整
+        MessageBus bus = new MessageBus();
+        List<string> trace = new List<string>();
+        bus.Use((object m, Action next) => {
+            trace.Add("middleware");
+            next();
+        });
+        QueryEndpoint<Order, int> busEndpoint = new QueryEndpoint<Order, int>();
+        busEndpoint.Handler = (Order o) => { return o.id + 1; };
+        bus.RegisterEndpoint(busEndpoint);
+        int busValue = busEndpoint.Handle(new Order(41));
+        Check("query-with-bus-result", busValue == 42);
+        Check("query-with-bus-middleware", trace.Count == 1 && trace[0] == "middleware");
+
+        // 没有处理函数 -> NoHandler
+        QueryEndpoint<Order, int> empty = new QueryEndpoint<Order, int>();
+        string code = "";
+        try {
+            empty.Handle(new Order(1));
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("query-no-handler", code == "NoHandler");
+    }
+
+    // ---- 参数校验 ----
+    private static void TestValidation() {
+        MessageBus bus = new MessageBus();
+        MessageChannel<Order> nullChannel = null;
+        string code = "";
+        try {
+            bus.Register(nullChannel);
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("register-null-channel", code == "InvalidHandler");
+
+        code = "";
+        try {
+            bus.Use(null);
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("use-null-middleware", code == "InvalidHandler");
+
+        code = "";
+        try {
+            bus.OnError(null);
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("onerror-null-handler", code == "InvalidHandler");
+
+        code = "";
+        try {
+            bus.Publish(null);
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("publish-null-message", code == "InvalidMessage");
+
+        code = "";
+        try {
+            bus.Send(null);
+        } catch (MessageException ex) {
+            code = ex.ErrorName();
+        }
+        Check("send-null-command", code == "InvalidMessage");
+
+        // 通道自己用（不经总线）
+        MessageChannel<Order> direct = new MessageChannel<Order>();
+        List<string> seen = new List<string>();
+        direct.Subscribe((Order o) => { seen.Add("direct"); });
+        Check("channel-direct-publish", direct.Publish(new Order(1)) == 1 && seen.Count == 1);
+    }
+}
+
+// 测试用的消息类型（都是引用类型）。
+public class Order {
+    public int id;
+    public Order(int id) { this.id = id; }
+}
+
+public class Refund {
+    public int id;
+    public Refund(int id) { this.id = id; }
+}
+
+public class Note {
+    public string text;
+    public Note(string text) { this.text = text; }
+}
+
+public class Boom {
+    public int id;
+    public Boom(int id) { this.id = id; }
+}
+
+public class MessagingTestsMain {
+    public static void Main() {
+        MessagingTests.Run();
+    }
+}

@@ -133,6 +133,28 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   where an object is required"）。具体实例化的基类（`class X : Base<Signup>`）
   正常；泛型类持有依赖型泛型**字段**（`class Base<T> { Inner<T> inner; }`）
   正常。要"泛型基类的成员"就用组合（字段），别用依赖型基类。
+* **泛型类的虚方法体拿不到类型参数**（实证，2026-10-21）：`class Ch<T> : Base`
+  里 `Base.Accepts(object)` 是虚方法、`Ch<T>` 覆写它并写 `return m is T;`——
+  **经基类引用虚调用恒为 false**（`Base b = ch; b.Accepts(o)`），直接调用
+  `ch.Accepts(o)` 才对；虚方法体里转交非虚方法也没用。**方法组转委托同样
+  抹掉 `is T`**（`FuncT<object,bool> f = chan.Accepts;` → 恒 false），用
+  lambda 包一层才恢复。类型判定要**定型成委托放在派生类构造器里**
+  （`this.acceptsField = (object m) => { return m is T; };`），基类只调委托；
+  或者把 API 设计成非泛型。
+* **泛型方法在另一个编译单元里、类型实参靠推断 → 不单态化**（实证，
+  2026-10-21）：库里定义的 `Register<T>(Chan<T>)`，外面按推断调用
+  （`bus.Register(ch)`）→ 方法体里的 `is T` 恒假（**静默不生效**：消息没人
+  收）；写显式 `bus.Register<Order>(ch)` 就对。同一形状放单一编译单元里推断
+  与显式都对。**跨单元调用泛型方法时，类型实参要显式写**。
+* **值类型装不进 `object`**（实证，2026-10-21）：`object boxed = (object)v;`
+  （v 是 int）→ **当场 access violation**（0xC0000005），没有诊断也没有消息。
+  lambda 返回类型与委托返回类型不兼容（`FuncT<Order,object> f = (Order o) =>
+  o.id;`）→ **编译期不报错**，运行期给非 null 的垃圾指针，进程退出时 ARC 去
+  回收它再崩一次。凡是 `object` 参与的地方只放**引用类型**；值类型结果要用
+  泛型端点一路保留。
+* **闭包捕获 `this` 会成引用环**（实证，2026-10-21）：把委托（闭包）存进自己
+  的字段、闭包又捕获 `this` → 环 → ARC 回收不掉（`--check-leaks` 报出）。
+  委托要捕获就捕获**独立的辅助对象**（如订阅表），别捕获宿主。
 * **`object.ToString()` 调不通**（实证，2026-10-21）：在 `object` 静态类型的
   接收者上调 `ToString()` 报 "this call could not be resolved to any callable"。
   用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进
