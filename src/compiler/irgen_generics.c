@@ -485,6 +485,20 @@ static int expr_yields_owned_rc_value(zan_irgen_t *g, zan_ast_node_t *e,
         if (ot && type_named(ot, "Dict", 4))
             return 1;
     }
+    if (e->kind == AST_UNARY && (e->unary.op == TK_MINUS || e->unary.op == TK_PLUS)) {
+        /* 一元运算符重载的结果同样是"拥有型临时值"：调用方（如赋值）要按
+           转移/释放处理，否则重载里 new 出来的对象会漏一条引用。 */
+        zan_type_t *ut = infer_expr_type(g, e->unary.operand, locals);
+        if (ut && (ut->kind == TYPE_CLASS || ut->kind == TYPE_STRUCT) && ut->sym) {
+            const char *opn = (e->unary.op == TK_MINUS) ? "op_sub" : "op_add";
+            zan_istr_t op_istr = { (char *)opn, (int)strlen(opn) };
+            zan_symbol_t *ms = get_method_sym(ut->sym, op_istr);
+            /* 一元重载：1 个形参（接收者即操作数）；2 个形参的是二元重载 */
+            if (ms && ms->decl && ms->decl->kind == AST_METHOD_DECL &&
+                ms->decl->method_decl.params.count == 1)
+                return 1;
+        }
+    }
     if (e->kind == AST_BINARY) {
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals)) {
             return 1;

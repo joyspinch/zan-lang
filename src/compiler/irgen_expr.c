@@ -4338,11 +4338,97 @@ static LLVMValueRef emit_nullable_binary(zan_irgen_t *g, zan_ast_node_t *expr,
 static LLVMValueRef emit_incdec_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                                      local_scope_t *locals, int is_prefix);
 
+/* 一元运算符重载：类/结构体上的 static `operator -` / `operator +`。
+ *
+ * 解析器把 `operator -` / `operator +` 统一命名成 op_sub / op_add，一元与
+ * 二元靠**形参个数**区分：重载是 static 的，形参 1 个是一元、2 个是二元。
+ * 因此这里的探针**不带实参**（arity 期望 0 个显式实参 + 1 个接收者）。
+ *
+ * 找不到重载时报一条人话诊断并返回 undef——不能落到内建整数算术去对结构体
+ * 指针做 sub（那是 LLVM 校验失败："Integer arithmetic operators only work
+ * with integral types"），更不能默默当 0。
+ *
+ * 返回 NULL 表示"操作数不是类/结构体"，交回内建算术路径。 */
+static LLVMValueRef emit_unary_op_overload(zan_irgen_t *g, zan_ast_node_t *expr,
+                                            local_scope_t *locals) {
+    zan_type_t *ot = infer_expr_type(g, expr->unary.operand, locals);
+    if (!ot || !ot->sym ||
+        (ot->kind != TYPE_CLASS && ot->kind != TYPE_STRUCT))
+        return NULL;
+
+    const char *op_name = (expr->unary.op == TK_MINUS) ? "op_sub" : "op_add";
+    const char *op_sign = (expr->unary.op == TK_MINUS) ? "-" : "+";
+    zan_istr_t op_istr = { (char *)op_name, (int)strlen(op_name) };
+
+    zan_ast_node_t *probe = zan_ast_new(g->arena, AST_CALL, expr->loc);
+    probe->call.callee = NULL;
+    zan_ast_list_init(&probe->call.args);
+    zan_ast_list_init(&probe->call.type_args);
+    /* 一元重载：探针不带显式实参 */
+    zan_symbol_t *op_sym = resolve_op_overload(g, ot->sym, op_istr, probe, locals);
+    if (!op_sym) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                      "type '%s' does not define a unary '%s' operator overload",
+                      ot->name.str ? ot->name.str : "<unknown>", op_sign);
+        return LLVMGetUndef(map_type(g, ot));
+    }
+    int fi = irgen_find_function(g, op_sym);
+    if (fi < 0) {
+        zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                      "unary '%s' operator overload of '%s' has no body to call",
+                      op_sign, ot->name.str ? ot->name.str : "<unknown>");
+        return LLVMGetUndef(map_type(g, ot));
+    }
+
+    /* 泛型方法的类型实参绑定要看到实参 → 探针补上操作数 */
+    zan_ast_list_push(&probe->call.args, expr->unary.operand, g->arena);
+
+    LLVMValueRef arg = emit_expr(g, expr->unary.operand, locals);
+    LLVMTypeRef recv_t = map_type(g, ot);
+    /* 接收者既可能是"值"，也可能是"槽位指针"（new 表达式返回的是槽位地址）：
+     * 按值传参会把指针塞进调用里，LLVM 校验直接失败。 */
+    if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMPointerTypeKind &&
+        LLVMGetTypeKind(recv_t) == LLVMStructTypeKind) {
+        arg = LLVMBuildLoad2(g->builder, recv_t, arg, "unop.recv");
+    }
+    bool op_is_static = (op_sym->modifiers & MOD_STATIC) != 0;
+    if (!op_is_static &&
+        LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMStructTypeKind) {
+        LLVMValueRef rslot = emit_entry_alloca(g, LLVMTypeOf(arg), "unop.recv");
+        LLVMBuildStore(g->builder, arg, rslot);
+        arg = rslot;
+    }
+    /* 泛型特化：重载方法走具体实例的变体 */
+    LLVMTypeRef mft = g->functions[fi].fn_type;
+    LLVMValueRef mfn = route_generic_method(g, ot, op_sym, g->functions[fi].fn,
+                                            mft, &mft);
+    zan_type_t *p1 = method_param_type_at(g, op_sym, 1, probe,
+                                          expr->unary.operand, locals);
+    bool op_generic = p1 && type_mentions_tp(p1);
+    if (p1) p1 = subst_type_param_deep(g, p1, ot);
+    if (p1 && !op_generic) {
+        LLVMTypeRef p1t = map_type(g, p1);
+        if (LLVMGetTypeKind(p1t) == LLVMStructTypeKind &&
+            LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMPointerTypeKind) {
+            arg = LLVMBuildLoad2(g->builder, p1t, arg, "unop.sval");
+        }
+        if (LLVMTypeOf(arg) != p1t)
+            arg = coerce_int_to(g, arg, p1t);
+    }
+    LLVMValueRef res = zan_call2(g->builder, mft, mfn, &arg, 1, "opcall");
+    emit_release_owned_call_temp(g, expr->unary.operand, arg, locals);
+    return res;
+}
+
 static LLVMValueRef emit_expr_unary(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
-        if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
-            return emit_incdec_expr(g, expr, locals, 1);
-        LLVMValueRef operand = emit_expr(g, expr->unary.operand, locals);
+    if (expr->unary.op == TK_PLUS_PLUS || expr->unary.op == TK_MINUS_MINUS)
+        return emit_incdec_expr(g, expr, locals, 1);
+    if (expr->unary.op == TK_MINUS || expr->unary.op == TK_PLUS) {
+        LLVMValueRef ov = emit_unary_op_overload(g, expr, locals);
+        if (ov) return ov;
+    }
+    LLVMValueRef operand = emit_expr(g, expr->unary.operand, locals);
         switch (expr->unary.op) {
         case TK_MINUS: {
             LLVMTypeRef t = LLVMTypeOf(operand);

@@ -2390,6 +2390,16 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         switch (expr->unary.op) {
         case TK_MINUS:
             if (type_is_numeric(operand)) return operand;
+            /* 一元运算符重载：类/结构体上的 static op_sub（1 个形参）。
+               重载存不存在由 irgen 判定，这里按二元路径的同一口径把类型
+               交给操作数类型（没有重载时 irgen 会报人话诊断）。 */
+            if (operand->kind == TYPE_CLASS || operand->kind == TYPE_STRUCT)
+                return operand;
+            return c->binder->type_error;
+        case TK_PLUS:
+            if (type_is_numeric(operand)) return operand;
+            if (operand->kind == TYPE_CLASS || operand->kind == TYPE_STRUCT)
+                return operand;
             return c->binder->type_error;
         case TK_BANG:
             return c->binder->type_bool;

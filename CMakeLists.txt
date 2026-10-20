@@ -1145,6 +1145,19 @@ add_test(NAME diag_ctor_missing_parameterless
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
 
+# A unary operator applied to a class/struct without a matching overload must
+# fail with a readable diagnostic. The old path fell into the built-in integer
+# arithmetic and subtracted two struct pointers, which the LLVM verifier
+# rejected with "Integer arithmetic operators only work with integral types".
+add_test(NAME diag_unary_operator_no_overload
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_operator_no_overload.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_operator_no_overload${_exe_ext}
+    "-DEXPECT_REGEX=does not define a unary '-' operator overload"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_operator_no_overload PROPERTIES TIMEOUT 60)
+
 # Mixed signed/unsigned comparison: the ulong-wins promotion would silently
 # reinterpret the signed operand (a negative long becomes a huge ulong), so
 # the operator is an error unless the signed side is a non-negative constant
