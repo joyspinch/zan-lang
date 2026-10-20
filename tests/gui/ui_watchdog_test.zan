@@ -1,0 +1,114 @@
+using System;
+using System.Threading;
+using Gui.Diagnostics;
+
+// UiWatchdog 回归：区间计时（Enter/Exit）只在超过阈值时报卡住，
+// 嵌套区间按栈结算；帧统计（FrameBegin/FrameEnd）计慢帧与最差帧；
+// 消息走 sink 时格式稳定（毫秒数随机器变，所以只断言结构）。
+// 这是"窗口未响应"自证工具的行为契约——它必须零误报（空闲不算卡），
+// 也必须能说清"卡在哪一步"。
+class Program {
+    static int fails;
+    static string captured = "";
+
+    static void EqInt(string what, long got, long want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + "" + got
+            + " want " + "" + want);
+    }
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void CheckBool(string what, bool value) {
+        if (value) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static bool StartsWith(string s, string prefix) {
+        if (s == null) { return false; }
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    static bool EndsWith(string s, string suffix) {
+        if (s == null) { return false; }
+        if (s.Length < suffix.Length) { return false; }
+        return s.Substring(s.Length - suffix.Length, suffix.Length) == suffix;
+    }
+
+    static void Main() {
+        fails = 0;
+        captured = "";
+        UiWatchdog.Reset();
+        UiWatchdog.SetStallThreshold(100);
+        UiWatchdog.SetSink(delegate (string msg) { captured = captured + msg + "\n"; });
+
+        // ① 快区间不报卡
+        UiWatchdog.Enter("fast");
+        int acc = 0;
+        for (int i = 0; i < 1000; i = i + 1) { acc = acc + i; }
+        UiWatchdog.Exit();
+        EqInt("fast region does not stall", UiWatchdog.StallCount(), 0);
+        EqInt("no region left open", UiWatchdog.Depth(), 0);
+        EqInt("acc sanity", acc, 499500);
+        EqStr("nothing emitted yet", captured, "");
+
+        // ② 慢区间报卡：阶段名与耗时
+        UiWatchdog.Enter("scan");
+        Thread.Sleep(150);
+        UiWatchdog.Exit();
+        EqInt("slow region stalls once", UiWatchdog.StallCount(), 1);
+        EqStr("stall stage reported", UiWatchdog.LastStallStage(), "scan");
+        if (UiWatchdog.LastStallMs() < 150) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL stall ms too small: " + "" + UiWatchdog.LastStallMs());
+        }
+        CheckBool("stall message prefix",
+            StartsWith(captured, "UIWATCHDOG stall stage=scan blocked="));
+        CheckBool("stall message suffix", EndsWith(captured, "ms\n"));
+        Console.WriteLine("stall-report-shape=ok");
+
+        // ③ 嵌套区间按栈结算：内层不卡就不报，外层卡了报外层名
+        UiWatchdog.Enter("outer");
+        UiWatchdog.Enter("inner");
+        UiWatchdog.Exit();
+        UiWatchdog.Exit();
+        EqInt("nested fast region does not stall", UiWatchdog.StallCount(), 1);
+        EqStr("last stage still the slow one", UiWatchdog.LastStallStage(), "scan");
+
+        // ④ 帧统计：帧数、慢帧、最差帧
+        long before = UiWatchdog.FrameCount();
+        UiWatchdog.FrameBegin();
+        Thread.Sleep(30);
+        UiWatchdog.FrameEnd();
+        EqInt("frame counted", UiWatchdog.FrameCount() - before, 1);
+        EqInt("slow frame counted", UiWatchdog.Slow16Count(), 1);
+        EqInt("no 100ms frame", UiWatchdog.Slow100Count(), 0);
+        if (UiWatchdog.WorstFrameUs() < 30000) {
+            fails = fails + 1;
+            Console.WriteLine("FAIL worst frame too small: " + "" + UiWatchdog.WorstFrameUs());
+        }
+        Console.WriteLine("frame-stats=ok");
+
+        // ⑤ 汇总行：结构固定，数字随机器变
+        captured = "";
+        UiWatchdog.PrintSummary();
+        CheckBool("summary prefix", StartsWith(captured, "UIWATCHDOG summary frames="));
+        CheckBool("summary carries stage",
+            captured.Contains("last_stage=scan"));
+        Console.WriteLine("summary-shape=ok");
+
+        // ⑥ 恢复默认出口
+        UiWatchdog.SetSink(null);
+        UiWatchdog.Reset();
+        EqInt("reset clears stats", UiWatchdog.StallCount(), 0);
+        EqInt("reset clears frames", UiWatchdog.FrameCount(), 0);
+        Console.WriteLine(fails == 0 ? "OK" : "FAILS " + "" + fails);
+    }
+}

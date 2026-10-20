@@ -3429,6 +3429,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_ui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  add_test(NAME conformance_gui_ui_watchdog
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ui_watchdog_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Diagnostics/UiWatchdog.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_ui_watchdog.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_ui_watchdog${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_datatable
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

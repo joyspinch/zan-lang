@@ -1,0 +1,150 @@
+using System;
+using System.Collections.Generic;
+
+namespace Gui.Diagnostics;
+// UI 线程"卡住"自证工具。Windows 判"未响应"= UI 线程 5 秒不泵
+// 消息，所以"卡顿"和"未响应"要分开查：
+//
+//   · FrameBegin/FrameEnd —— 回答"卡不卡"：统计慢帧（>16.7ms）与
+//     最差帧，渲染慢会在这里显形。
+//   · Enter/Exit —— 回答"卡在哪"：把可疑代码括起来，退出时若耗时
+//     超过阈值就把阶段名与耗时打出来。零误报：只有你自己括起来的
+//     区间才会被计时，空闲期不算卡。
+//
+// 用法（贴进自己的 GUI 程序）：
+//
+//     UiWatchdog.Enter("explorer-scan");
+//     ...                                  // 怀疑会卡住的那段
+//     UiWatchdog.Exit();
+//
+// 嵌套允许（栈语义）；第一遍把整帧括起来，第二遍再细分到每一步。
+// 输出格式固定，便于 grep：
+//
+//     UIWATCHDOG stall stage=explorer-scan blocked=5231ms
+//
+// 纯 System 实现，零 Gui 依赖，任何 Zan 程序都能用；不调用就没有
+// 任何行为。
+public class UiWatchdog {
+    // 判定"卡住"的阈值（毫秒）。默认 2000ms——Windows 判未响应是
+    // 5 秒，这里留出余量先报警。
+    static int stallMs = 2000;
+    // 进入区间时压的阶段名与起始时刻（栈语义，允许嵌套）。
+    static List<string> stages = new List<string>();
+    static List<long> startedUs = new List<long>();
+    // 最近一次卡住：阶段名、耗时、次数。
+    static string lastStallStage = "";
+    static int lastStallMs = 0;
+    static int stallCount = 0;
+    // 帧统计。
+    static long frameStartUs = 0;
+    static bool frameOpen = false;
+    static long frames = 0;
+    static long slow16 = 0;
+    static long slow100 = 0;
+    static long worstUs = 0;
+    // 消息出口：非空时消息交给它（测试/宿主自行接管），不再打控制台。
+    static ActionT<string> sink = null;
+
+    // 接管消息出口（传 null 恢复打控制台）。
+    public static void SetSink(ActionT<string> s) { sink = s; }
+
+    // 发一条消息：有 sink 走 sink，否则打控制台。
+    static void Emit(string msg) {
+        if (sink != null) { sink(msg); return; }
+        Console.WriteLine(msg);
+    }
+
+    // 调整"卡住"阈值（毫秒）。传 0 或负数忽略。
+    public static void SetStallThreshold(int ms) {
+        if (ms > 0) { stallMs = ms; }
+    }
+
+    // 当前阈值（毫秒）。
+    public static int StallThreshold() { return stallMs; }
+
+    // 开始一段可能被卡住的代码。name 是阶段名（会出现在报告里）。
+    public static void Enter(string name) {
+        stages.Add(name);
+        startedUs.Add(Stopwatch.GetMicroseconds());
+    }
+
+    // 结束一段：超过阈值就报出阶段名与耗时。
+    public static void Exit() {
+        if (stages.Count == 0) { return; }
+        int last = stages.Count - 1;
+        string name = stages[last];
+        long startUs = startedUs[last];
+        stages.RemoveAt(last);
+        startedUs.RemoveAt(last);
+        long us = Stopwatch.GetMicroseconds() - startUs;
+        int ms = (int)(us / 1000);
+        if (ms >= stallMs) {
+            lastStallStage = name;
+            lastStallMs = ms;
+            stallCount = stallCount + 1;
+            Emit("UIWATCHDOG stall stage=" + name
+                + " blocked=" + "" + ms + "ms");
+        }
+    }
+
+    // 当前是否还有未闭合的区间（忘了 Exit 时能看出来）。
+    public static int Depth() { return stages.Count; }
+
+    // 帧首调用：开始计时这一帧。
+    public static void FrameBegin() {
+        frameStartUs = Stopwatch.GetMicroseconds();
+        frameOpen = true;
+    }
+
+    // 帧尾调用：结算这一帧的耗时。
+    public static void FrameEnd() {
+        if (!frameOpen) { return; }
+        frameOpen = false;
+        long us = Stopwatch.GetMicroseconds() - frameStartUs;
+        frames = frames + 1;
+        if (us > 16700) { slow16 = slow16 + 1; }
+        if (us > 100000) { slow100 = slow100 + 1; }
+        if (us > worstUs) { worstUs = us; }
+    }
+
+    // 已统计的帧数。
+    public static long FrameCount() { return frames; }
+    // 超过一个 60Hz 帧预算（16.7ms）的帧数。
+    public static long Slow16Count() { return slow16; }
+    // 超过 100ms 的帧数（肉眼可见的卡顿）。
+    public static long Slow100Count() { return slow100; }
+    // 最差一帧（微秒）。
+    public static long WorstFrameUs() { return worstUs; }
+    // 最近一次卡住的阶段名（没有则为空串）。
+    public static string LastStallStage() { return lastStallStage; }
+    // 最近一次卡住的耗时（毫秒）。
+    public static int LastStallMs() { return lastStallMs; }
+    // 卡住的总次数。
+    public static int StallCount() { return stallCount; }
+
+    // 打一份汇总（一行，便于日志里 grep）。
+    public static void PrintSummary() {
+        Emit("UIWATCHDOG summary frames=" + "" + frames
+            + " slow16=" + "" + slow16
+            + " slow100=" + "" + slow100
+            + " worst_ms=" + "" + ((int)(worstUs / 1000))
+            + " stalls=" + "" + stallCount
+            + " last_stage=" + lastStallStage
+            + " last_ms=" + "" + lastStallMs);
+    }
+
+    // 清空统计（复测同一场景时用）。
+    public static void Reset() {
+        stages.Clear();
+        startedUs.Clear();
+        lastStallStage = "";
+        lastStallMs = 0;
+        stallCount = 0;
+        frameStartUs = 0;
+        frameOpen = false;
+        frames = 0;
+        slow16 = 0;
+        slow100 = 0;
+        worstUs = 0;
+    }
+}

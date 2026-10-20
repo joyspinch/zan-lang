@@ -14,6 +14,12 @@ programs compile as-is once the package is visible to zanc (project
   render, layout, text and tooling layers.
 - `Gui.Backend` — the Zan-side half of the native window shells (Win32/X11/
   Cocoa) whose native halves live in the compiler's `zan_gui` runtime driver.
+- `Gui.Diagnostics` — `UiWatchdog`, the "is it stuck, and where" tool for
+  GUI programs: `Enter(name)` / `Exit()` bracket the code you suspect
+  (it reports `UIWATCHDOG stall stage=<name> blocked=<ms>ms` only when the
+  bracket exceeds the threshold, so idle time is never misreported), and
+  `FrameBegin()` / `FrameEnd()` count slow frames (>16.7ms) and the worst
+  frame. Opt-in: nothing happens until you call it.
 
 Resources ride inside the package and zanc discovers them from package source
 roots (stdlib copies win if present):

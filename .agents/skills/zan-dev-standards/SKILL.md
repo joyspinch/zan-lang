@@ -769,6 +769,32 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   undefined reference，档案里符号明明都在）。适合"要在别人施工
   时量出自己改动的真实基线"的场景（撞名定性、A/B 对照），日常验证仍走工作树。
 
+### 帧预算与"未响应"的归因（GUI 性能排查）
+
+- **"卡顿"与"窗口未响应"必须分家，两者的责任方不同**。Windows 判未响应 =
+  UI 线程 5 秒不泵消息；渲染一帧十几毫秒，差两个数量级——**渲染慢只会掉帧，
+  不会造成未响应**。分家的判据是 phase 分解：`ZAN_FRAME_PROF=1` 让 App 把每帧
+  拆成 `bg/measure/arrange/tree/render/present` 写进 exe 同目录的
+  `zan_frame_perf.log`（`App.zan` 的 `PerfMark` 分段打点 + 像素计数；超预算的
+  单帧**单独记一行**，均值看不见卡顿）。六个 phase 都正常却仍"未响应"，就是
+  UI 线程上的同步阻塞（项目层）：该抓栈，而不是调渲染参数。库层每帧成本的
+  判据是 **slow16（>16.7ms 的帧数）而不是平均帧时**。
+  坑出处：实测 IDE 帧预算（CPU 后端、emerald 皮肤、固定夹具项目）稳态
+  slow16=0、worst 0~6ms，渲染根本不是"未响应"的原因；超标项全在
+  `tree_ms`（布局/命中树 12.5~17.6ms，预算 8）与像素量（restore/blend/grad
+  超 5~11 倍）——那是库层的 overdraw 与每帧重建命中树。
+- **自证工具：`Gui.Diagnostics.UiWatchdog`**（`packages/Zan.Gui/src/Gui/Diagnostics/`）。
+  `Enter(name)` / `Exit()` 把可疑代码括起来，退出时超过阈值（默认 2000ms）才报
+  `UIWATCHDOG stall stage=<name> blocked=<ms>ms`——**只有你自己括的区间才计时，
+  空闲期零误报**；`FrameBegin()` / `FrameEnd()` 统计慢帧与最差帧。排查顺序：
+  先整帧括一次（分清"渲染还是别的"），再细分到每一步（定位"卡在哪"）。
+- **门禁"跳过"不是"通过"：条件不满足时门禁必须响**。帧预算门在表面尺寸与
+  标定面不一致时输出 `FRAME_BUDGET_SKIPPED` 并**跳过全部毫秒断言**——本机
+  1920x1230 vs 标定 1942x1286，于是 tree_ms 超预算 2 倍、像素量超 11 倍这些
+  超标**从未被拦下**，门看起来一直是绿的。这类"条件不满足就跳过"的门禁要改成：
+  跳过时打警告并把差异写进结论（或按比例缩放预算），否则它只在标定机上生效。
+  坑出处：`tests/run_frame_budget.cmake` 的 surface 尺寸门。
+
 ## 四、经验沉淀纪律（skill 的准入标准）
 
 - 沉淀的是**通用可落地的规则**：动作 + 理由 + 适用边界。三样缺一的
