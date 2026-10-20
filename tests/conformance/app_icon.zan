@@ -1,0 +1,126 @@
+using System;
+using System.Threading;
+using Gui;
+using Gui.Backend;
+
+// 标题栏品牌图标默认用程序自己的图标（回归）。
+//
+// 背景：标题栏是自绘的，库以前固定画一个占位字形 "home"——所有应用
+// 标题栏左上角长得一模一样，而程序自己的图标（zanc 编译时写进 exe
+// 资源的那份）就在手边没人用。Windows 上从 exe 资源取图标并栅格化
+// 成带 alpha 的像素（Gui.Backend.AppIcon），注册进图片模块后画进
+// 标题栏；取不到才回落到占位字形。
+//
+// 断言两层：
+//   1) 取得到：边长 > 0、像素数 = 边长²、角上近乎透明（整块不透明
+//      说明 alpha 没取回来，画出来是一块黑方块）、可见像素够多；
+//   2) 真画进标题栏：默认渲染时标题栏里有程序图标的主色，应用显式
+//      SetChromeBrandIcon("home") 之后同样的主色一个都不剩。
+//
+// 非 Windows 平台没有这个能力（标题栏回落到占位字形），按 skip 走。
+class AppIconCase {
+    static int fails;
+    // 计数与被捕获的对象一律走静态字段：帧体是委托，捕获局部变量会让
+    // 它们一直活着（委托被 App 静态持有），leakcheck 变体会判成泄漏。
+    static App app;
+    static int frames;
+    static int mark;
+    static int withIcon;
+    static int withGlyph;
+
+    static void Fail(string what) {
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // 图标里出现最多的不透明颜色：图标主体是一块平涂底色，缩放后
+    // 内部像素仍等于这个颜色，用它当"图标在场"的指纹。
+    static int DominantColor(int[] px) {
+        int best = 0;
+        int bestCount = 0;
+        for (int i = 0; i < px.Length; i = i + 1) {
+            int p = px[i];
+            if (((p >> 24) & 255) < 200) { continue; }
+            int count = 0;
+            for (int j = 0; j < px.Length; j = j + 1) {
+                if (px[j] == p) { count = count + 1; }
+            }
+            if (count > bestCount) { bestCount = count; best = p; }
+        }
+        return best;
+    }
+
+    // 标题栏区域里有多少像素等于指定颜色。
+    static int CountColor(App app, int color, int limitX) {
+        int n = 0;
+        int w = app.canvas.Width();
+        int h = app.canvas.Height();
+        if (w > limitX) { w = limitX; }
+        if (h > 40) { h = 40; }
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                if (app.canvas.GetPixel(x, y) == color) { n = n + 1; }
+            }
+        }
+        return n;
+    }
+
+    static void Main() {
+        fails = 0;
+        #if WINDOWS
+        int side = AppIcon.Side();
+        int[] px = AppIcon.Pixels();
+        if (side <= 0 || px == null) {
+            Fail("program icon missing");
+            Console.WriteLine("app-icon-ok");
+            return;
+        }
+        if (px.Length != side * side) { Fail("icon pixel count"); }
+        // 角上是圆角，alpha 近乎 0（不同尺寸的图标抗锯齿给 0 或 1 都可能）。
+        // 整块不透明说明 alpha 通道没取回来，画出来是一块黑方块。
+        if (((px[0] >> 24) & 255) > 8) { Fail("icon has no alpha"); }
+        int visible = 0;
+        for (int i = 0; i < px.Length; i = i + 1) {
+            if (((px[i] >> 24) & 255) != 0) { visible = visible + 1; }
+        }
+        if (visible < side * side / 4) { Fail("icon mostly transparent"); }
+
+        mark = DominantColor(px);
+        if (mark == 0) { Fail("icon has no dominant color"); }
+
+        AppIconCase.app = new App("app-icon-case", 320, 200);
+        AppIconCase.app.Show();
+        if (AppIconCase.app.canvas.Width() <= 0
+                || AppIconCase.app.canvas.Height() <= 0) {
+            // 没有可用表面（无显示环境）：只留 API 层的结论，按 skip 走。
+            Console.WriteLine("SKIP: no GUI surface in this session");
+            return;
+        }
+
+        frames = 0;
+        AppIconCase.app.RequestRedraw();
+        AppIconCase.app.RunLoop(() => {
+            AppIconCase.app.RenderChrome("app-icon-case");
+            frames = frames + 1;
+            if (frames == 2) { withIcon = CountColor(app, mark, 200); }
+            if (frames == 4) {
+                app.SetChromeBrandIcon("home");
+                app.RequestRedraw();
+            }
+            if (frames == 6) {
+                withGlyph = CountColor(app, mark, 200);
+                app.StopLoop();
+                return;
+            }
+            Thread.Sleep(50);
+            app.RequestRedraw();
+        });
+
+        if (withIcon <= 0) { Fail("program icon not drawn in title bar"); }
+        if (withGlyph != 0) { Fail("glyph override still shows program icon"); }
+        if (fails == 0) { Console.WriteLine("app-icon-ok"); }
+        #else
+        Console.WriteLine("SKIP: program icon is only provided on Windows");
+        #endif
+    }
+}

@@ -108,6 +108,24 @@ public class Win32Shell {
     static extern int ReleaseDC(nint hwnd, nint dc);
     [DllImport("user32", EntryPoint = "GetSystemMetrics")]
     static extern int GetSystemMetrics(int index);
+    // ---- 程序图标（exe 内嵌图标）------------------------------------
+    // zanc 编译时把图标（--icon 指定的 .ico 或内置默认图标）写进
+    // Windows 资源（图标组 id=1）。这里从运行中的 exe 文件取回来：
+    // 大/小 HICON 给窗口类（任务栏、Alt+Tab），像素给自绘标题栏。
+    [DllImport("shell32", EntryPoint = "ExtractIconExW")]
+    static extern int ExtractIconExW(nint file, int index, nint large,
+                                     nint small, int count);
+    [DllImport("user32", EntryPoint = "GetIconInfo")]
+    static extern int GetIconInfo(nint hIcon, nint ii);
+    [DllImport("user32", EntryPoint = "DestroyIcon")]
+    static extern int DestroyIcon(nint hIcon);
+    [DllImport("user32", EntryPoint = "SendMessageW")]
+    static extern nint SendMessageW(nint hwnd, int msg, nint wp, nint lp);
+    [DllImport("gdi32", EntryPoint = "GetDIBits")]
+    static extern int GetDIBits(nint hdc, nint hbmp, int start, int lines,
+                                 nint bits, nint bmi, int usage);
+    [DllImport("gdi32", EntryPoint = "GetObjectW")]
+    static extern int GetObjectW(nint h, int size, nint buf);
     [DllImport("user32", EntryPoint = "MonitorFromWindow")]
     static extern nint MonitorFromWindow(nint hwnd, int flags);
     [DllImport("user32", EntryPoint = "GetMonitorInfoW")]
@@ -418,6 +436,9 @@ public class Win32Shell {
 
         Win32Shell.instance = Win32Shell.GetModuleHandleW(0);
         Win32Shell.className = Wide.Of("ZanGuiApp");
+        // 窗口类图标用程序自己的图标（zanc 写进 exe 资源的那份），
+        // 任务栏与 Alt+Tab 才会显示程序图标而不是系统占位图标。
+        Win32Shell.LoadAppIcon();
         nint wc = NativeMemory.Alloc(80);
         NativeMemory.Fill(wc, 0, 80);
         new Span<int>(wc, 1)[0] = 80;
@@ -427,12 +448,148 @@ public class Win32Shell {
         new Span<long>(wc + 8, 1)[0] =
             Win32Shell.zan_gui_guard_wndproc((nint)Win32Shell.OnMessage);
         new Span<long>(wc + 24, 1)[0] = Win32Shell.instance;
-        new Span<long>(wc + 32, 1)[0] = Win32Shell.LoadIconW(Win32Shell.instance, 1);
+        // hIcon：程序大图标（取不到退回系统默认应用图标）。
+        new Span<long>(wc + 32, 1)[0] = Win32Shell.appIconBig != 0
+            ? Win32Shell.appIconBig
+            : Win32Shell.LoadIconW(Win32Shell.instance, 1);
         new Span<long>(wc + 40, 1)[0] = Win32Shell.LoadCursorW(0, 32512);
         new Span<long>(wc + 64, 1)[0] = Win32Shell.className;
-        new Span<long>(wc + 72, 1)[0] = new Span<long>(wc + 32, 1)[0];
+        // hIconSm：小图标；没有小图标时退回大图标。
+        new Span<long>(wc + 72, 1)[0] = Win32Shell.appIconSmall != 0
+            ? Win32Shell.appIconSmall
+            : new Span<long>(wc + 32, 1)[0];
         Win32Shell.RegisterClassExW(wc);
         NativeMemory.Free(wc);
+    }
+
+    // ---- 程序图标 -----------------------------------------------------
+    //
+    // zanc 编译时把图标（--icon 指定的 .ico，或内置默认图标）写进
+    // Windows 资源，因此运行中的进程能取回"程序自己的图标"：
+    //   · appIconBig/appIconSmall —— 窗口类图标（任务栏、Alt+Tab）；
+    //   · appIconPixels/appIconSide —— 像素（0xAARRGGBB，顶行优先），
+    //     供自绘标题栏画程序图标。
+    // 取不到时全部保持 0，调用方回落到占位字形。
+    static nint appIconBig;
+    static nint appIconSmall;
+    static int[] appIconPixels;
+    static int appIconSide;
+    static bool appIconReady;
+
+    // 从 exe 文件取程序图标（图标组索引 0）。只取一次。
+    static void LoadAppIcon() {
+        if (Win32Shell.appIconReady) { return; }
+        Win32Shell.appIconReady = true;
+        string exe = Environment.ProcessPath;
+        if (exe == null || exe == "") { return; }
+        nint wpath = Wide.Of(exe);
+        nint slots = NativeMemory.Alloc(16);
+        try {
+            NativeMemory.Fill(slots, 0, 16);
+            // ExtractIconExW 的两个输出参数是 HICON*：各写一个句柄。
+            Win32Shell.ExtractIconExW(wpath, 0, slots, slots + 8, 1);
+            Win32Shell.appIconBig = new Span<long>(slots, 1)[0];
+            Win32Shell.appIconSmall = new Span<long>(slots + 8, 1)[0];
+        } finally {
+            NativeMemory.Free(slots);
+            Wide.Free(wpath);
+        }
+        if (Win32Shell.appIconBig == 0) { return; }
+        int[] px = Win32Shell.IconPixels(Win32Shell.appIconBig);
+        if (px == null) { return; }
+        Win32Shell.appIconPixels = px;
+        Win32Shell.appIconSide = Win32Shell.IconSide(px);
+    }
+
+    // HICON → ARGB 像素（0xAARRGGBB，顶行优先）。取不到返回 null。
+    //
+    // 走 GDI：GetIconInfo 拿颜色位图，GetDIBits 用 BITMAPV4 头
+    // （BI_BITFIELDS + alpha 掩码）才能把图标自带的透明通道取回来；
+    // 普通 32bpp BI_RGB 取回来的 alpha 全 0（图标会整块变透明）。
+    static int[] IconPixels(nint hIcon) {
+        // ICONINFO（x64）：fIcon@0 xHotspot@4 yHotspot@8 hbmMask@16
+        // hbmColor@24
+        nint ii = NativeMemory.Alloc(32);
+        nint bmp = NativeMemory.Alloc(32);
+        nint hdr = NativeMemory.Alloc(124);
+        nint bits = 0;
+        int[] result = null;
+        try {
+            NativeMemory.Fill(ii, 0, 32);
+            if (Win32Shell.GetIconInfo(hIcon, ii) == 0) { return null; }
+            nint hbmColor = new Span<long>(ii + 24, 1)[0];
+            if (hbmColor == 0) { return null; }
+            // BITMAP：bmType@0 bmWidth@4 bmHeight@8
+            NativeMemory.Fill(bmp, 0, 32);
+            if (Win32Shell.GetObjectW(hbmColor, 32, bmp) == 0) { return null; }
+            int w = new Span<int>(bmp + 4, 1)[0];
+            int h = new Span<int>(bmp + 8, 1)[0];
+            if (w <= 0 || h <= 0 || w > 512 || h > 512) { return null; }
+            // BITMAPV4HEADER（124 字节）
+            NativeMemory.Fill(hdr, 0, 124);
+            new Span<int>(hdr, 1)[0] = 124;          // bV4Size
+            new Span<int>(hdr + 4, 1)[0] = w;         // bV4Width
+            new Span<int>(hdr + 8, 1)[0] = 0 - h;    // bV4Height：负=顶行优先
+            // planes@12 / bitCount@14 各 16 位：1 与 32
+            new Span<int>(hdr + 12, 1)[0] = 1 | (32 << 16);
+            new Span<int>(hdr + 16, 1)[0] = 3;       // BI_BITFIELDS
+            new Span<int>(hdr + 40, 1)[0] = 0x00FF0000;   // red
+            new Span<int>(hdr + 44, 1)[0] = 0x0000FF00;   // green
+            new Span<int>(hdr + 48, 1)[0] = 0x000000FF;   // blue
+            new Span<int>(hdr + 52, 1)[0] = 0 - 16777216; // alpha 0xFF000000
+            int count = w * h;
+            bits = NativeMemory.Alloc(count * 4);
+            if (bits == 0) { return null; }
+            nint dc = Win32Shell.GetDC(0);
+            int lines = Win32Shell.GetDIBits(dc, hbmColor, 0, h, bits, hdr, 0);
+            Win32Shell.ReleaseDC(0, dc);
+            if (lines != h) { return null; }
+            // BGRA → ARGB；alpha 全 0 说明这份图标没有透明通道，
+            // 画出来是一块黑方块，宁可退回占位字形。
+            Span<byte> src = new Span<byte>(bits, count * 4);
+            int[] pixels = new int[count];
+            int visible = 0;
+            for (int i = 0; i < count; i = i + 1) {
+                int o = i * 4;
+                int a = src[o + 3];
+                int r = src[o + 2];
+                int g = src[o + 1];
+                int b = src[o];
+                pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
+                if (a != 0) { visible = visible + 1; }
+            }
+            if (visible == 0) { return null; }
+            result = pixels;
+            return result;
+        } finally {
+            if (bits != 0) { NativeMemory.Free(bits); }
+            NativeMemory.Free(ii);
+            NativeMemory.Free(bmp);
+            NativeMemory.Free(hdr);
+        }
+    }
+
+    // 方形像素数组的边长；不是正方形返回 0。
+    static int IconSide(int[] pixels) {
+        if (pixels == null) { return 0; }
+        int n = pixels.Length;
+        int side = 0;
+        for (int i = 1; i <= 256; i = i + 1) {
+            if (i * i == n) { side = i; break; }
+        }
+        return side;
+    }
+
+    // 程序图标像素（0xAARRGGBB，顶行优先）；没有图标返回 null。
+    static int[] AppIconPixels() {
+        Win32Shell.LoadAppIcon();
+        return Win32Shell.appIconPixels;
+    }
+
+    // 程序图标像素边长；没有图标返回 0。
+    static int AppIconSide() {
+        Win32Shell.LoadAppIcon();
+        return Win32Shell.appIconSide;
     }
 
     // 有 Shcore 时按显示器感知，否则按系统感知，
