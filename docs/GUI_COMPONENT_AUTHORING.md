@@ -85,7 +85,16 @@ StyleBox h = this.BoxState(app, Style.SHover());   // 悬停态
 
 // 借用别的组件的外观（部件、复用其它族）
 StyleBox o = this.ResolveStyleAs(app, "select", Class, Style.SNormal());
+
+// 部件表面的**基线**外观（列表行、滚动条轨道、弹层、分割线…）：
+// 不带本控件的 Class、不带 id、不套行内覆盖
+StyleBox r = this.BareBox(app, "listrow", Style.SNormal());
 ```
+
+三种入口的分工：`Box`/`BoxState` 解析**自己**的外观；`ResolveStyleAs` 借用
+**别的类型**的外观（带自己的 Class）；`BareBox` 取某个类型的**裸基线**
+——部件表面用它，因为套上本控件的 Class 会串味（列表写成 `.primary`
+就把每一行都染成主色），套行内覆盖同样不该发生。
 
 为什么不让直接调 `Style.Of(app, "button", ...)`：
 
