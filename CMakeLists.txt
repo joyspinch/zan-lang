@@ -1177,6 +1177,30 @@ add_test(NAME diag_unary_plus_no_overload
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_plus_no_overload PROPERTIES TIMEOUT 60)
 
+# A unary '-' / '~' on a string: the operand is neither numeric nor a type
+# with a matching overload. The checker used to return a bare `type_error`
+# sentinel -- which emits no diagnostic of its own -- so the error leaked
+# into irgen: `-s` built an integer subtraction on a string pointer (LLVM
+# verifier error) and `~s` took the compiler down with it (0xC0000005).
+add_test(NAME diag_unary_minus_string
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_minus_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_minus_string${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary '-' to 'string'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_minus_string PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_unary_tilde_string
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_tilde_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_tilde_string${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary '~' to 'string'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
+
+
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序
 # 带崩）；结构体则落进整数格式化分支，生成 %struct.T 传给 i64 形参的非法 IR
@@ -1198,6 +1222,57 @@ add_test(NAME diag_convert_tostring_struct
     "-DEXPECT_REGEX=cannot convert 'Pt' to a string"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_tostring_struct PROPERTIES TIMEOUT 60)
+
+# 泛型容器的**类型实参**必须真的被检查。
+#
+# 此前 `List<T>.Add(T item)` / `Box<T>.Set(T v)` / `Dict.Add(K,V)` 的形参
+# 类型是类型参数 T/K/V，checker 对"含类型参数的形参"一般放行。
+# 与是 `List<int>.Add("字符串")` 编译通过，运行时把字符串指针存进 int 列表，
+# 读出来是垃转指针——静默损捉，不是崩。
+#
+# 根因两条：
+#  - 内建泛型：List/Dict 没有 sym（成员签名在 builtin_api.c 的表里），
+#    call_arg_signature 拿不到签名 → 整条实参类型检查今过没被赏过。
+#  - 用户泛型类：call_arg_signature 看到 type_arg_count 非零就返回 NULL
+#    （恐泛型形参 T 匹配不上），实参检查被整段跳过。
+#
+# 修法：把形参类型按接收者的类型实参曲换（T → int）后，走同一套
+# checker_arg_type_mismatch。
+add_test(NAME diag_generic_list_add_wrong_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_list_add_wrong_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_list_add_wrong_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_list_add_wrong_type PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_generic_list_insert_wrong_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_list_insert_wrong_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_list_insert_wrong_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_list_insert_wrong_type PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_generic_user_class_wrong_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_user_class_wrong_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_user_class_wrong_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_user_class_wrong_type PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_generic_dict_wrong_value_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_dict_wrong_value_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_dict_wrong_value_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_generic_dict_wrong_value_type PROPERTIES TIMEOUT 60)
 
 # Math.* 的实参必须是数值。类实例此前被直接喂给 sitofp（指针转 double），
 # 生成 LLVM 校验失败的非法 IR，诊断信息对用户毫无意义。
@@ -3693,6 +3768,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_semantic_diag.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_semantic_diag${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  # 代码片段（snippet）回归：模板解析（$1 / ${1:默认值} / ${1|选项|} /
+  # $0 / 转义）、插入后光标落在第一个洞、洞里打字后 Tab 仍能跳到下一个洞、
+  # 最后一个洞之后 Tab 把光标放到模板末尾。
+  add_test(NAME conformance_gui_codeeditor_snippet
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_snippet_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_snippet.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_snippet${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_fold

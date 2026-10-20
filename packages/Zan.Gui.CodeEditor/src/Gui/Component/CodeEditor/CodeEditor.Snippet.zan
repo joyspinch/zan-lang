@@ -1,0 +1,244 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+
+namespace Gui.Component.CodeEditor;
+
+// CodeEditor 分部：代码片段（snippet）模式。
+//
+// 片段是"模板 + 一串洞"：插入模板后光标停在第一个洞，
+// Tab 依次跳到下一个洞（Visual Studio 的做法）。
+//
+// 洞的位置用链式推进算出来，不记死偏移：
+//   洞 i+1 的起点 = 洞 i 的终点 + 两者之间那段固定文本
+// 片段模式下用户只往洞里打字（洞之间的固定文本不动），
+// 所以只要盯住当前洞的终点，后面的洞就跟着走。
+partial class CodeEditor {
+    // 片段模式是否开启。
+    bool snipActive;
+    // 当前洞的下标。
+    int snipHoleIdx;
+    // 洞的总数。
+    int snipHoleCount;
+    // 每个洞的起点（绝对行/列，列是字节列）。
+    List<int> snipStartLine = new List<int>();
+    List<int> snipStartCol = new List<int>();
+    // 每个洞的终点（随用户编辑推移）。
+    List<int> snipEndLine = new List<int>();
+    List<int> snipEndCol = new List<int>();
+    // 每个洞之后的固定文本（跳到下一个洞时用来推进位置）。
+    List<string> snipSeg = new List<string>();
+    // 每个洞的默认文本（下一个洞的长度）。
+    List<string> snipDef = new List<string>();
+
+    // 片段模式是否开启（宿主可查询）。
+    public bool SnippetActive() { return snipActive; }
+
+    // (aL,aC) 是否严格在 (bL,bC) 之前。
+    public static bool SnipBefore(int aL, int aC, int bL, int bC) {
+        if (aL != bL) { return aL < bL; }
+        return aC < bC;
+    }
+
+    // 从 (line,col) 出发越过固定文本 seg 之后的落点。
+    // seg 里带换行时落点是新行上的列，否则是同一行的列偏移。
+    public static void SnipAdvance(int line, int col, string seg,
+                                   out int oline, out int ocol) {
+        int nl = 0;
+        int lastLen = 0;
+        int n = seg == null ? 0 : seg.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            if ((seg[i] & 255) == 10) { nl = nl + 1; lastLen = 0; }
+            else { lastLen = lastLen + 1; }
+        }
+        if (nl == 0) {
+            oline = line;
+            ocol = col + n;
+        } else {
+            oline = line + nl;
+            ocol = lastLen;
+        }
+    }
+
+    // 在 [startLine,startCol) - [endLine,endCol) 处插入片段模板，
+    // 插入后进入片段模式（光标落在第一个洞）。
+    void InsertSnippet(string body, int startLine, int startCol,
+                       int endLine, int endCol) {
+        SnipEnd();
+        if (body == null || body.Length == 0) { return; }
+        if (startLine < 0 || endLine < startLine || endLine >= lines.Count) { return; }
+        if (startCol < 0 || startCol > lines[startLine].Length) { return; }
+        if (endCol < 0 || endCol > lines[endLine].Length) { return; }
+        SnippetTemplate tpl = SnippetParser.Parse(body);
+        string text = tpl.text;
+        if (text.Length == 0) { return; }
+
+        List<string> ins = CodeEditor.SplitLines(text);
+        string left = Text.Left(lines[startLine], startCol);
+        string right = Text.Right(lines[endLine], endCol);
+        for (int line = endLine; line > startLine; line = line - 1) { lines.RemoveAt(line); }
+        lines[startLine] = left + ins[0];
+        for (int i = 1; i < ins.Count; i = i + 1) { lines.Insert(startLine + i, ins[i]); }
+        int lastLine = startLine + ins.Count - 1;
+        lines[lastLine] = lines[lastLine] + right;
+
+        int holeCount = tpl.holeStart.Count;
+        snipStartLine = new List<int>();
+        snipStartCol = new List<int>();
+        snipEndLine = new List<int>();
+        snipEndCol = new List<int>();
+        snipSeg = new List<string>();
+        snipDef = new List<string>();
+        snipHoleCount = holeCount;
+        snipHoleIdx = -1;
+
+        // 把模板里的字节偏移换算成文档里的绝对位置。
+        int line = startLine;
+        int col = startCol;
+        int o = 0;
+        for (int h = 0; h < holeCount; h = h + 1) {
+            while (o < tpl.holeStart[h]) {
+                if ((text[o] & 255) == 10) { line = line + 1; col = 0; }
+                else { col = col + 1; }
+                o = o + 1;
+            }
+            snipStartLine.Add(line);
+            snipStartCol.Add(col);
+            while (o < tpl.holeStart[h] + tpl.holeLen[h]) {
+                if ((text[o] & 255) == 10) { line = line + 1; col = 0; }
+                else { col = col + 1; }
+                o = o + 1;
+            }
+            snipEndLine.Add(line);
+            snipEndCol.Add(col);
+            int segStart = tpl.holeStart[h] + tpl.holeLen[h];
+            int segEnd = holeCount > h + 1 ? tpl.holeStart[h + 1] : text.Length;
+            snipSeg.Add(text.Substring(segStart, segEnd - segStart));
+            snipDef.Add(text.Substring(tpl.holeStart[h], tpl.holeLen[h]));
+        }
+
+        // 光标先落在插入内容的末尾，再由第一个洞接管。
+        curLine = lastLine;
+        curCol = lines[lastLine].Length - right.Length;
+        selActive = false;
+        if (holeCount > 0) {
+            snipHoleIdx = 0;
+            selAnchorLine = snipStartLine[0];
+            selAnchorCol = snipStartCol[0];
+            curLine = snipEndLine[0];
+            curCol = snipEndCol[0];
+            selActive = snipEndLine[0] != snipStartLine[0] || snipEndCol[0] != snipStartCol[0];
+            snipActive = true;
+        }
+    }
+
+    // 退出片段模式（保留当前光标位置）。
+    void SnipEnd() {
+        snipActive = false;
+        snipHoleIdx = -1;
+        snipHoleCount = 0;
+        snipStartLine = new List<int>();
+        snipStartCol = new List<int>();
+        snipEndLine = new List<int>();
+        snipEndCol = new List<int>();
+        snipSeg = new List<string>();
+        snipDef = new List<string>();
+    }
+
+    // 光标落在当前洞里时，洞的终点跟着光标走（用户在里面打字/退格）。
+    void SnipSyncEnd() {
+        if (!snipActive) { return; }
+        int h = snipHoleIdx;
+        if (h < 0 || h >= snipHoleCount) { return; }
+        if (CodeEditor.SnipBefore(curLine, curCol, snipStartLine[h], snipStartCol[h])) { return; }
+        if (CodeEditor.SnipBefore(snipEndLine[h], snipEndCol[h], curLine, curCol)) { return; }
+        snipEndLine[h] = curLine;
+        snipEndCol[h] = curCol;
+    }
+
+    // Tab：跳到下一个洞。没有下一个洞时把光标放到模板末尾并退出片段模式。
+    bool SnipNext() {
+        if (!snipActive) { return false; }
+        SnipSyncEnd();
+        int next = snipHoleIdx + 1;
+        if (next >= snipHoleCount) {
+            SnipGoEnd();
+            return false;
+        }
+        int line = 0;
+        int col = 0;
+        CodeEditor.SnipAdvance(snipEndLine[snipHoleIdx], snipEndCol[snipHoleIdx],
+            snipSeg[snipHoleIdx], out line, out col);
+        snipHoleIdx = next;
+        snipStartLine[next] = line;
+        snipStartCol[next] = col;
+        int eline = line;
+        int ecol = col;
+        string def = snipDef[next];
+        for (int i = 0; i < def.Length; i = i + 1) {
+            if ((def[i] & 255) == 10) { eline = eline + 1; ecol = 0; }
+            else { ecol = ecol + 1; }
+        }
+        snipEndLine[next] = eline;
+        snipEndCol[next] = ecol;
+        selAnchorLine = line;
+        selAnchorCol = col;
+        curLine = eline;
+        curCol = ecol;
+        selActive = eline != line || ecol != col;
+        acActive = false;
+        acDot = false;
+        acFilter = "";
+        return true;
+    }
+
+    // 片段结束：光标落到模板末尾（最后一个洞之后那段固定文本之后）。
+    void SnipGoEnd() {
+        if (!snipActive) { return; }
+        int h = snipHoleIdx;
+        if (h >= 0 && h < snipHoleCount) {
+            int line = 0;
+            int col = 0;
+            CodeEditor.SnipAdvance(snipEndLine[h], snipEndCol[h], snipSeg[h], out line, out col);
+            curLine = line;
+            curCol = col;
+        }
+        SnipEnd();
+        selActive = false;
+    }
+
+    // 编辑发生后同步当前洞。
+    // pL/pC 是编辑前的光标，qL/qC 是编辑后的光标；grew 表示是插入。
+    void SnipEdited(int pL, int pC, int qL, int qC, bool grew) {
+        if (!snipActive) { return; }
+        int h = snipHoleIdx;
+        if (h < 0 || h >= snipHoleCount) { return; }
+        int sL = snipStartLine[h];
+        int sC = snipStartCol[h];
+        int eL = snipEndLine[h];
+        int eC = snipEndCol[h];
+        bool inHole = !CodeEditor.SnipBefore(pL, pC, sL, sC)
+            && !CodeEditor.SnipBefore(eL, eC, pL, pC);
+        if (inHole) {
+            snipEndLine[h] = qL;
+            snipEndCol[h] = qC;
+            return;
+        }
+        // 编辑落在洞外：退格删掉了洞前的字符 → 洞整体左移一列。
+        if (!grew && pL == sL && pC == sC && sC > 0) {
+            snipStartCol[h] = sC - 1;
+            if (eL == sL) { snipEndCol[h] = eC - 1; }
+        }
+    }
+
+    // 选区被删除：洞里的文字没了，洞收缩到删除起点。
+    void SnipDeletedRange(int l, int c) {
+        if (!snipActive) { return; }
+        int h = snipHoleIdx;
+        if (h < 0 || h >= snipHoleCount) { return; }
+        snipStartLine[h] = l;
+        snipStartCol[h] = c;
+        snipEndLine[h] = l;
+        snipEndCol[h] = c;
+    }
+}

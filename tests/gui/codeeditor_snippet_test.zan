@@ -1,0 +1,146 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component;
+using Gui.Component.CodeEditor;
+
+// 代码片段（snippet）引擎的回归。片段 = 模板 + 一串洞：
+// 插入模板后光标落在第一个洞，Tab 依次跳到下一个洞（VS 的做法）。
+// 这里测三件事：
+//   ① 模板解析：$1 / ${1:默认值} / ${1|选项|} / $0 / 转义；
+//   ② 插入：模板文本进文档，光标落在第一个洞；
+//   ③ 跳洞：洞里打字后 Tab 仍然能跳到下一个洞（位置要跟着编辑走），
+//      最后一个洞之后 Tab 把光标放到模板末尾。
+class SnippetTest {
+    static int fails;
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got [" + got + "] want [" + want + "]");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void EqTrue(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void TestParse() {
+        SnippetTemplate t = SnippetParser.Parse("if ($1) {\n    $2\n}");
+        EqStr("plain holes expand to empty", t.text, "if () {\n    \n}");
+        EqInt("two holes", t.holeStart.Count, 2);
+        EqInt("hole default length", t.holeLen[0], 0);
+
+        SnippetTemplate d = SnippetParser.Parse("x ${1:foo} y");
+        EqStr("default text is kept", d.text, "x foo y");
+        EqInt("one hole", d.holeStart.Count, 1);
+        EqInt("default text length", d.holeLen[0], 3);
+
+        SnippetTemplate c = SnippetParser.Parse("x ${1|a,b|} y");
+        EqStr("first choice is the default", c.text, "x a y");
+
+        SnippetTemplate f = SnippetParser.Parse("a $0 b");
+        EqInt("final caret offset", f.finalOffset, 2);
+        EqInt("no holes for $0", f.holeStart.Count, 0);
+
+        SnippetTemplate e = SnippetParser.Parse("a \\$1 b");
+        EqStr("escaped dollar is literal", e.text, "a $1 b");
+        EqInt("escaped dollar is not a hole", e.holeStart.Count, 0);
+
+        // 同组号的镜像洞只留一个可跳转的洞。
+        SnippetTemplate m = SnippetParser.Parse("${1:x} and ${1:y}");
+        EqStr("mirror keeps its default text", m.text, "x and y");
+        EqInt("mirror shares one hole", m.holeStart.Count, 1);
+    }
+
+    static void TestInsert() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("");
+        e.InsertSnippet("for (int i = 0; i < $1; i = i + 1) {\n    $2\n}", 0, 0, 0, 0);
+        EqStr("template is inserted",
+            e.GetText(),
+            "for (int i = 0; i < ; i = i + 1) {\n    \n}");
+        EqTrue("snippet mode is on", e.SnippetActive());
+        EqInt("caret lands on the first hole", e.CurLine(), 0);
+        EqInt("caret column on the first hole", e.CurCol(), 20);
+    }
+
+    static void TestHoles() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("");
+        e.InsertSnippet("for (int i = 0; i < $1; i = i + 1) {\n    $2\n}", 0, 0, 0, 0);
+        // 在洞里打字（洞的终点要跟着走，后面的洞才跳得准）。
+        e.InsertStr("n");
+        EqStr("typed text lands in the hole",
+            e.GetText(),
+            "for (int i = 0; i < n; i = i + 1) {\n    \n}");
+        e.SnipNext();
+        EqInt("tab jumps to the second hole line", e.CurLine(), 1);
+        EqInt("tab jumps to the second hole column", e.CurCol(), 4);
+        e.InsertStr("body");
+        EqStr("second hole takes text",
+            e.GetText(),
+            "for (int i = 0; i < n; i = i + 1) {\n    body\n}");
+        // 最后一个洞之后：Tab 把光标放到模板末尾并退出片段模式。
+        e.SnipNext();
+        EqInt("caret leaves the snippet", e.CurLine(), 2);
+        EqInt("caret at the template end", e.CurCol(), 1);
+        EqTrue("snippet mode is off", !e.SnippetActive());
+    }
+
+    static void TestDefaultText() {
+        CodeEditor e = new CodeEditor();
+        e.LoadText("");
+        e.InsertSnippet("log(\"${1:message}\")", 0, 0, 0, 0);
+        EqStr("default text is inserted",
+            e.GetText(), "log(\"message\")");
+        EqInt("caret sits at the end of the default text", e.CurCol(), 12);
+        // 键入时先删掉选区（默认文字被选中），再插入新文字。
+        e.DeleteSelection();
+        e.InsertStr("hi");
+        EqStr("typing replaces the default text",
+            e.GetText(), "log(\"hi\")");
+    }
+
+    static void TestSemanticAccept() {
+        // 语言服务推来的片段候选：接受候选时按模板展开（不是当普通文本插入）。
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "snip.zan";
+        e.LoadText("if");
+        e.curCol = 2;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            CodeCompletionItem item = new CodeCompletionItem("if (snippet)", "S", "", "");
+            item.insertText = "if ($1) {\n    $2\n}";
+            item.isSnippet = true;
+            items.Add(item);
+            return items;
+        };
+        e.UpdateCompletion();
+        e.AcceptCompletion(true);
+        EqStr("semantic snippet expands into the buffer",
+            e.GetText(), "if () {\n    \n}");
+        EqTrue("snippet mode is on", e.SnippetActive());
+        EqInt("caret is on the first hole", e.CurCol(), 4);
+    }
+
+    static void Main() {
+        fails = 0;
+        TestParse();
+        TestInsert();
+        TestHoles();
+        TestDefaultText();
+        TestSemanticAccept();
+        if (fails == 0) { Console.WriteLine("SNIPPET PASS"); return; }
+        Console.WriteLine("SNIPPET FAIL " + Convert.ToString(fails));
+        Environment.Exit(1);
+    }
+}

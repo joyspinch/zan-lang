@@ -610,56 +610,36 @@ partial class CodeEditor {
         outk.Add("try"); kinds.Add("S");
     }
 
-    // 在光标处展开代码片段，替换触发词
-    // [acStart, curCol)。把光标放在主体中的 "$C$" 标记处。
+    // 在光标处展开内置代码片段，替换触发词 [acStart, curCol)。
+    // 模板用 $1/$2 标洞：光标落在第一个洞，Tab 依次跳到下一个洞
+    // （Visual Studio 的做法）。片段引擎在 CodeEditor.Snippet.zan。
     void ExpandSnippet(string name) {
-        List<string> body = new List<string>();
+        string tpl = "";
         if (name == "for") {
-            body.Add("for (int i = 0; i < $C$; i = i + 1) {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "for (int i = 0; i < $1; i = i + 1) {\n    $2\n}";
         } else if (name == "foreach") {
-            body.Add("foreach (var item in $C$) {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "foreach (var item in $1) {\n    $2\n}";
         } else if (name == "while") {
-            body.Add("while ($C$) {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "while ($1) {\n    $2\n}";
         } else if (name == "if") {
-            body.Add("if ($C$) {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "if ($1) {\n    $2\n}";
         } else if (name == "ifelse") {
-            body.Add("if ($C$) {");
-            body.Add("    ");
-            body.Add("} else {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "if ($1) {\n    $2\n} else {\n    $3\n}";
         } else if (name == "class") {
-            body.Add("class $C$ {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "class $1 {\n    $2\n}";
         } else if (name == "func") {
-            body.Add("void $C$() {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "void $1() {\n    $2\n}";
         } else if (name == "prop") {
-            body.Add("int $C$;");
+            tpl = "int $1;";
         } else if (name == "try") {
-            body.Add("try {");
-            body.Add("    $C$");
-            body.Add("} catch (Exception e) {");
-            body.Add("    ");
-            body.Add("}");
+            tpl = "try {\n    $1\n} catch (Exception e) {\n    $2\n}";
         } else {
             return;
         }
 
+        // 基准缩进 = 当前行前导空白；模板的后续行按它缩进。
         string curls = lines[curLine];
         string left = Text.Left(curls, acStart);
-        string right = Text.Right(curls, curCol);
-        // 基准缩进 = 当前行的前导空白。
         string indent = "";
         int p = 0;
         while (p < left.Length) {
@@ -667,34 +647,12 @@ partial class CodeEditor {
             if (ch == " ") { indent = indent + " "; p = p + 1; }
             else { break; }
         }
-
-        int caretLine = curLine;
-        int caretCol = acStart;
-        List<string> assembled = new List<string>();
-        int n = body.Count;
-        for (int bi = 0; bi < n; bi = bi + 1) {
-            string pre = indent;
-            if (bi == 0) { pre = left; }
-            string lineText = pre + body[bi];
-            if (bi == n - 1) { lineText = lineText + right; }
-            int mk = CodeEditor.Find(lineText, "$C$");
-            if (mk >= 0) {
-                caretLine = curLine + bi;
-                caretCol = mk;
-                lineText = Text.Left(lineText, mk) + Text.Right(lineText, mk + 3);
-            }
-            assembled.Add(lineText);
+        List<string> body = CodeEditor.SplitLines(tpl);
+        string expanded = body[0];
+        for (int i = 1; i < body.Count; i = i + 1) {
+            expanded = expanded + "\n" + indent + body[i];
         }
-
-        List<string> rebuilt = new List<string>();
-        int q = 0;
-        for (; q < curLine; q = q + 1) { rebuilt.Add(lines[q]); }
-        for (int ai = 0; ai < assembled.Count; ai = ai + 1) { rebuilt.Add(assembled[ai]); }
-        q = curLine + 1;
-        while (q < lines.Count) { rebuilt.Add(lines[q]); q = q + 1; }
-        lines = rebuilt;
-        curLine = caretLine;
-        curCol = caretCol;
+        InsertSnippet(expanded, curLine, acStart, curLine, curCol);
         acActive = false;
         acDot = false;
         acFilter = "";
@@ -1067,7 +1025,11 @@ partial class CodeEditor {
         } else if (code == 9) {
             EndUndoGroup();
             bool tabShift = Modifiers.HasShift(app.window.EventMods());
-            if (acActive) { AcceptCompletion(true); }
+            if (snipActive) {
+                // 片段模式：Tab 跳到下一个洞（补全弹窗在片段里不打扰用户）。
+                SnipNext();
+            }
+            else if (acActive) { AcceptCompletion(true); }
             else if (tabShift) {
                 if (selActive && selAnchorLine != curLine) { OutdentSelection(); }
                 else { OutdentCurrentLine(); }
@@ -1096,6 +1058,7 @@ partial class CodeEditor {
             refPopOpen = false;
             ClearExtraCarets();
             ctxOpen = false;
+            SnipEnd();
             app.RequestRedraw();
         } else if (code > 31) {
             string ch = Text.CharStr(code);
@@ -1179,7 +1142,11 @@ partial class CodeEditor {
                 if (carets.Count > 0) { McInsertStr(ch); }
                 else { InsertStr(ch); }
                 selActive = false;
-                if (ch == ".") {
+                if (snipActive) {
+                    // 片段的洞里不弹补全（Visual Studio 的做法）：
+                    // 补全弹窗会抢走 Tab，洞就跳不动了。
+                }
+                else if (ch == ".") {
                     DotCompletion();
                 } else {
                     UpdateCompletion();
@@ -1200,6 +1167,11 @@ partial class CodeEditor {
     // kind==4：导航 / 选择 / 多光标移动键。
     void HandleNavKey(App app) {
         int kc = app.window.EventKeyCode();
+        // 片段模式里移动光标 = 离开片段（VS：光标一动，片段即结束）。
+        if (snipActive && (kc == 37 || kc == 38 || kc == 39 || kc == 40
+            || kc == 33 || kc == 34 || kc == 35 || kc == 36)) {
+            SnipEnd();
+        }
         if (!(acActive && (kc == 38 || kc == 40))) { CancelSemanticCompletion(); }
         // 剪贴板与全选按虚拟键处理。只认控制字符（Ctrl+C = 3）在
         // 中文输入法开着、或键盘布局不产生控制字符时会整个丢掉，
