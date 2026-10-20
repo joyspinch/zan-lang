@@ -1119,3 +1119,17 @@
   改动**，并发改同一文件必然冲突（AGENTS.md 规则 11）。
 - 待办：等在途改动落地后，逐条核对自举后端的对应位置；每条补一条自举
   差分用例（宿主与自举对同一程序的输出必须一致）。
+
+### [ ] A427 `conformance_gui_css` 恒红——golden 没跟着 `bgActive` 颜色变更更新
+
+- 现象：`ctest -R conformance_gui_css` 失败，15 行 form 主题部件的
+  "选中/激活"底色对不上：期望 `-1184275`（0xFFEDEDED），实际
+  `-2104598`（0xFFDFE2EA）。
+- 根因：提交 `ad28ac00`（2026-10-16）把 `Theme.zan` 的 `bgActive` 从
+  0xFFEDEDED 改成 0xFFDFE2EA，没同步重生成 golden
+  `tests/conformance/gui_css.out`（该 golden 最后一次更新是 2026-09-15
+  的 `8c9486c4`）。所有由 `bgActive` 派生的 form 主题部件一起漂了。
+- 与运行时行为无关：改的是基准文件过期，不是主题算错。
+- 方向：重跑用例取实际输出覆盖 golden。**等在途的主题改动落地再做**
+  （`Style.zan`/`Skin.zan`/三张皮肤 CSS 同时在改，动效令牌也在动），
+  否则要重生成两次。
