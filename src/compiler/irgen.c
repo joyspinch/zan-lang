@@ -3555,7 +3555,8 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
 static bool class_has_virtual_methods(zan_symbol_t *sym) {
     for (int i = 0; i < sym->member_count; i++) {
         if (sym->members[i]->kind == SYM_METHOD &&
-            (sym->members[i]->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE))) {
+            (sym->members[i]->modifiers &
+             (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT))) {
             return true;
         }
     }
@@ -3573,7 +3574,7 @@ static int count_virtual_methods(zan_symbol_t *sym) {
     }
     for (int i = 0; i < sym->member_count; i++) {
         if (sym->members[i]->kind == SYM_METHOD &&
-            (sym->members[i]->modifiers & MOD_VIRTUAL) &&
+            (sym->members[i]->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
             !(sym->members[i]->modifiers & MOD_OVERRIDE)) {
             count++;
         }
@@ -3602,7 +3603,7 @@ static int get_virtual_method_index(zan_symbol_t *type_sym,
     for (int i = 0; i < type_sym->member_count; i++) {
         zan_symbol_t *m = type_sym->members[i];
         if (m->kind == SYM_METHOD &&
-            (m->modifiers & MOD_VIRTUAL) &&
+            (m->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
             !(m->modifiers & MOD_OVERRIDE)) {
             if (member_name_is(m, method_sym->name) &&
                 method_declared_param_count(m) == want) {

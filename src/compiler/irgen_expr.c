@@ -12496,6 +12496,10 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
         zan_type_t *dp = method_param_type(g, msym, j);
         if (!dp || !type_mentions_tp(dp)) continue;
         zan_type_t *at = infer_expr_type(g, aexpr, locals);
+        /* 具体化变体里，泛型类的类型实参已定：把实参类型里的类类型参数
+         * 换成实参，否则「类类型参数 → 方法类型参数」的绑定推不出来，
+         * 泛型方法会退化成擦除版（返回值是默认值，判定全错）。 */
+        if (at && g->cur_inst) at = subst_type_param_deep(g, at, g->cur_inst);
         if (at && !type_mentions_tp(at)) unify_method_tp(dp, at, tps, bind);
     }
 
@@ -12516,6 +12520,11 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
             zan_type_t *lpt = lp->param.type
                 ? zan_binder_resolve_type(g->binder, lp->param.type)
                 : sdp->delegate_param_types[k];
+            /* 外层泛型类的类型实参在这里已经定下来了：委托的形参类型
+             * 可能正是类的类型参数（FuncT<T,V>），不替换的话它永远算
+             * 「未定」，lambda 的返回类型就推不出来，方法类型参数绑不上。 */
+            if (lpt && g->cur_inst)
+                lpt = subst_type_param_deep(g, lpt, g->cur_inst);
             if (lpt && !type_mentions_tp(lpt)) {
                 if (lp->param.type)
                     unify_method_tp(dp->delegate_param_types[k], lpt, tps, bind);

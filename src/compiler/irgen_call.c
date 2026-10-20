@@ -609,6 +609,39 @@ static int emit_call_arg_eh_push(zan_irgen_t *g, zan_ast_node_t *arg,
     return 1;
 }
 
+/* 调用无法解析时的兜底返回值。
+ *
+ * 开放泛型场景（泛型类的擦除变体里，类型实参还没定下来）会走到这里：
+ * 诊断被有意压掉，但代码还得能编过。返回值必须与声明的返回类型一致——
+ * 早先这里固定返回 i32 0，于是调用点拿 i32 去和字符串指针比较，
+ * LLVM 校验直接报 "Both operands to ICmp instruction are not of the same
+ * type"，整份程序编不出来。这里按返回类型给同类型的默认值。 */
+static LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
+                                                 zan_ast_node_t *expr,
+                                                 local_scope_t *locals) {
+    LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
+    zan_type_t *rt = infer_expr_type(g, expr, locals);
+    if (!rt || rt->kind == TYPE_ERROR || rt->kind == TYPE_VOID) {
+        return LLVMConstInt(i32t, 0, 0);
+    }
+    LLVMTypeRef lt = map_type(g, rt);
+    switch (LLVMGetTypeKind(lt)) {
+    case LLVMPointerTypeKind:
+    case LLVMStructTypeKind:
+    case LLVMArrayTypeKind:
+    case LLVMVectorTypeKind:
+        return LLVMConstNull(lt);
+    case LLVMFloatTypeKind:
+        return LLVMConstReal(lt, 0.0f);
+    case LLVMDoubleTypeKind:
+        return LLVMConstReal(lt, 0.0);
+    case LLVMIntegerTypeKind:
+        return LLVMConstInt(lt, 0, 0);
+    default:
+        return LLVMConstInt(i32t, 0, 0);
+    }
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
@@ -5331,6 +5364,6 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                           "this call could not be resolved to any callable "
                           "(no method, delegate, operator or builtin matches)");
-        return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
+        return emit_unresolved_call_result(g, expr, locals);
     return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
 }

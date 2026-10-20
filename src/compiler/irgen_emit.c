@@ -1067,6 +1067,37 @@ static void own_written_param(zan_irgen_t *g, local_scope_t *locals,
     arc_own_local(g, locals);
 }
 
+/* 抽象方法（abstract）没有实现体，但它是虚表槽位的一员：派生类的
+ * override 要落进同一个槽位，基类这一格也得有个可调用的目标。
+ * 这里发射一个「未被覆盖就致命失败」的桩——正常路径永远走不到它，
+ * 真被调到说明派生类漏了覆盖（或者有人直接 new 了抽象类）。
+ *
+ * 桩用 zan_rt_fatal 而不是软告警：漏覆盖是编程错误，不能悄悄放过。 */
+static void emit_abstract_method_stub(zan_irgen_t *g, LLVMValueRef fn,
+                                      zan_symbol_t *type_sym,
+                                      zan_ast_node_t *member) {
+    LLVMBasicBlockRef bb =
+        LLVMAppendBasicBlockInContext(g->ctx, fn, "abstract.stub");
+    LLVMPositionBuilderAtEnd(g->builder, bb);
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "abstract method '%.*s.%.*s' was not overridden",
+             (int)type_sym->name.len, type_sym->name.str,
+             (int)member->method_decl.name.len, member->method_decl.name.str);
+
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef ft = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                                       (LLVMTypeRef[]){ i8ptr, i8ptr }, 2, 0);
+    LLVMValueRef fatal = LLVMGetNamedFunction(g->mod, "zan_rt_fatal");
+    if (!fatal) fatal = LLVMAddFunction(g->mod, "zan_rt_fatal", ft);
+    LLVMValueRef args[2] = { zan_irgen_intern_string(g, "abstract"),
+                              zan_irgen_intern_string(g, msg) };
+    zan_call2(g->builder, ft, fatal, args, 2, "");
+    /* zan_rt_fatal 不会返回；unreachable 让非 void 返回类型也合法。 */
+    LLVMBuildUnreachable(g->builder);
+}
+
 static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                                                  zan_ast_node_t *unit,
                                                  int *out_work_count) {
@@ -1249,7 +1280,13 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                 continue;
             }
 
-            if (!member->method_decl.body) continue;
+            /* abstract 方法没有实现体，但它要占一个虚表槽位：继续往下走，
+             * 生成函数与致命桩，而不是在这里跳过（跳过会让调用点落到
+             * "could not be resolved to any callable" 的兜底错误）。 */
+            bool is_abstract_method =
+                !member->method_decl.body &&
+                (member->method_decl.modifiers & MOD_ABSTRACT) != 0;
+            if (!member->method_decl.body && !is_abstract_method) continue;
 
             bool is_static = (!is_ctor || is_type_init) &&
                 (member->method_decl.modifiers & MOD_STATIC) != 0;
@@ -1308,7 +1345,8 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
                     : g->binder->type_void);
             if (cur_variant) ret_type = subst_type_param_deep(g, ret_type, cur_variant);
             LLVMTypeRef llvm_ret = map_type(g, ret_type);
-            bool is_async = !is_ctor && (member->method_decl.modifiers & MOD_ASYNC) != 0;
+            bool is_async = !is_ctor && !is_abstract_method &&
+                (member->method_decl.modifiers & MOD_ASYNC) != 0;
 
             LLVMTypeRef fn_type = NULL;
             LLVMValueRef fn = NULL;
@@ -1386,6 +1424,17 @@ static method_body_work_t *declare_user_methods(zan_irgen_t *g,
             if (!cur_variant && class_member_uses_tp(g, decl, member)) {
                 emit_tp_erased_stub(g, fn);
                 if (resume_fn) emit_tp_erased_stub(g, resume_fn);
+                free(param_types);
+                continue;
+            }
+
+            /* 抽象方法：函数与签名已经就位（调用点要靠它拿到函数类型），
+             * 补上致命桩后收工——没有实现体，不进方法体发射队列。 */
+            if (is_abstract_method) {
+                LLVMValueRef saved_fn = g->current_fn;
+                g->current_fn = fn;
+                emit_abstract_method_stub(g, fn, type_sym, member);
+                g->current_fn = saved_fn;
                 free(param_types);
                 continue;
             }

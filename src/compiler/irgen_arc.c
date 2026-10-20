@@ -1207,7 +1207,8 @@ static void collect_vslot_decls(zan_symbol_t *sym, zan_symbol_t **out, int *n, i
     for (int i = 0; i < sym->member_count; i++) {
         zan_symbol_t *m = sym->members[i];
         if (m->kind == SYM_METHOD &&
-            (m->modifiers & MOD_VIRTUAL) && !(m->modifiers & MOD_OVERRIDE)) {
+            (m->modifiers & (MOD_VIRTUAL | MOD_ABSTRACT)) &&
+            !(m->modifiers & MOD_OVERRIDE)) {
             if (*n < cap) out[(*n)++] = m;
         }
     }

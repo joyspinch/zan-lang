@@ -32,6 +32,19 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 4. **控制流可空守卫深度遍历**：
    - 动作：可空性静态分析（Nullability Check）必须穿透 `lock` 等复合控制流语句，同步扫描内部守卫与返回路径。
    - 理由：避免对受锁保护的合法空值判空分支产生假阳性诊断。
+5. **抽象方法的三条检查器规则**：
+   - 动作：抽象类不可实例化（`new` 报 "cannot instantiate abstract class 'X'"）；
+     具体类必须实现继承来的抽象方法（报 "non-abstract class 'X' does not
+     implement abstract method 'Y' inherited from 'Z'"）；抽象方法不得同时是
+     static / async；含抽象方法的类必须声明为 abstract。
+   - 理由：抽象方法没有方法体，调用点在编译期不拦截的话，运行期只能撞空
+     指针——而且是"某个分支才崩"的那种。检查器把错误提前到编译期，是抽象
+     方法唯一不依赖运行期兜底的保证。
+   - 边界：虚表槽位记账必须把 `MOD_ABSTRACT` 与 `MOD_VIRTUAL` 同等对待
+     （`irgen.c` 的 `class_has_virtual_methods` / `count_virtual_methods` /
+     `get_virtual_method_index`、`irgen_arc.c` 的 `collect_vslot_decls`、
+     `irgen_generics.c` 的 `emit_dispatch_call`）——漏一处，派生类的 override
+     会落到别的槽位上，虚分发静默走错方法。
 
 ---
 
@@ -122,6 +135,45 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：函数级 `"target-cpu"`/`"target-features"` 属性在 LLVM 20 的 llc 上
      **不参与**合法化，别指望写进 IR 就能免掉 `-mattr`；真要 IR 自洽，得让
      Vector256 的降级路径不产生 256 位向量值（见 TASKS.md A388）。
+12. **抽象方法要占虚表槽位，并配一个致命桩**：
+   - 动作：抽象方法必须与 virtual 方法一样参与虚表槽位记账（见第一节第 5 条
+     的四处），并为无实现体的抽象方法发射一个调用
+     `zan_rt_fatal("abstract", ...)` 后 `LLVMBuildUnreachable` 的桩函数；
+     `declare_user_methods` 里不能因为"没有方法体"就把抽象方法整个跳过
+     （跳过 = 虚表里那个槽是空的，虚分发跳到野地址）。
+   - 理由：漏实现的抽象方法必须**响亮地**失败，而不是悄悄调到相邻方法或
+     读空指针。
+   - 边界：抽象方法强制 `is_async = false`（async 抽象方法没有可生成的
+     协程帧）。
+13. **"调用解析不出来"的兜底必须按声明返回类型给默认值**：
+   - 动作：`emit_unresolved_call_result` 的兜底值要按被调方法的声明返回类型
+     给（指针/结构体 → null，浮点 → 0.0，整数 → 0），不能一律给 `i32 0`。
+   - 理由：兜底值要参与后续 IR 的类型校验，固定 `i32 0` 会让
+     `icmp eq i32 0, ptr %x` 这类比较直接触发 LLVM 校验失败
+     ("Both operands to ICmp instruction are not of the same type")，
+     编译期报错的位置离病因很远。
+   - 边界：兜底只保证**类型**正确，不保证**语义**——被丢弃的调用在 IR 里
+     根本不存在，运行期会静默取到默认值。排查"某个值莫名其妙是 0/null"
+     时，先看 IR 里这个 call 还在不在。
+14. **泛型基类的字段类型要按实例实参替换**：
+   - 动作：合并基类字段/属性到派生类成员表时，若基类是具体化实例
+     （`base_type->type_arg_count > 0`）且字段类型是类型参数，必须按实参
+     替换后再复制符号（`binder.c` 的 `binder_subst_type_param`）。
+   - 理由：不替换 → 继承来的方法在派生类上被发射成 `ret ptr null` 的空桩，
+     方法体整个消失（症状是"调用返回 null 且不报错"）。
+   - 边界：这条只管**字段类型**；泛型类作**基类**时的基类类型替换是另一处
+     缺口（见下一条）。
+15. **泛型的两处已知缺口（A418 / A419）**：
+   - 动作：写"泛型方法里按**方法级**类型参数实例化泛型类"（`new Foo<T,V>`，
+     V 是方法级类型参数）或"依赖型泛型基类"（`class V<T> : Plan<T>`）之前，
+     先知道这两条当前**不支持**：前者 `discover_generic_insts` 记不到 →
+     变体不发射 → 退化成擦除版、取值全是默认值（**静默失效**）；后者特化后
+     基类字段偏移错位 → 运行期空引用。
+   - 理由：这两类都是静默失效（不报错），比编译报错难查得多，且会诱使人
+     把"编译器不支持"误判成"自己代码写错"。
+   - 边界：可用的替代形态：类型实参留在**类级**（`class Base<T> { Inner<T>
+     inner; }` 正常）、具体实例化的基类（`class X : Base<Signup>` 正常）、
+     用 `FuncT<T,V>` 形参代替按 V 实例化。
 
 ---
 

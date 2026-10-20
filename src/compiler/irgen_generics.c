@@ -315,7 +315,7 @@ static LLVMValueRef emit_dispatch_call(zan_irgen_t *g, zan_symbol_t *static_sym,
         LLVMValueRef *call_args, int argc, const char *cn) {
     coerce_args_to_params(g, fn_type, call_args, argc);
     if (static_sym && method_sym &&
-        (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE)) &&
+        (method_sym->modifiers & (MOD_VIRTUAL | MOD_OVERRIDE | MOD_ABSTRACT)) &&
         class_has_virtual_methods(static_sym) && argc >= 1 && call_args[0] &&
         LLVMGetTypeKind(LLVMTypeOf(call_args[0])) == LLVMPointerTypeKind) {
 

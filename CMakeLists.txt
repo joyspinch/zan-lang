@@ -4837,7 +4837,9 @@ set(_new_diag_cases
   return_call_type_mismatch
   await_type_conversion
   ctor_interface_arg_mismatch
-  call_interface_arg_mismatch)
+  call_interface_arg_mismatch
+  abstract_not_implemented
+  abstract_instantiation)
 foreach(_case ${_new_diag_cases})
   if(_case STREQUAL cyclic_inheritance)
     set(_diag_regex "cyclic inheritance")
@@ -4870,6 +4872,10 @@ foreach(_case ${_new_diag_cases})
   elseif(_case STREQUAL interface_missing_method OR
          _case STREQUAL interface_bad_signature)
     set(_diag_regex "does not implement interface method")
+  elseif(_case STREQUAL abstract_not_implemented)
+    set(_diag_regex "does not implement abstract method")
+  elseif(_case STREQUAL abstract_instantiation)
+    set(_diag_regex "cannot instantiate abstract class")
   else()
     set(_diag_regex "narrowing conversion")
   endif()

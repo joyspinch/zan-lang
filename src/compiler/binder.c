@@ -35,6 +35,9 @@ static zan_symbol_t *make_symbol(zan_arena_t *arena, zan_sym_kind_t kind,
     return s;
 }
 
+/* 把类型参数替换成实例的类型实参（Base<string> 里的 T → string）。 */
+static zan_type_t *binder_subst_type_param(zan_type_t *t, zan_type_t *recv);
+
 static void symbol_add_member(zan_arena_t *arena, zan_symbol_t *parent, zan_symbol_t *child) {
     if (parent->member_count >= parent->member_cap) {
         int new_cap = parent->member_cap < 4 ? 4 : parent->member_cap * 2;
@@ -1212,10 +1215,25 @@ static void resolve_bases(zan_binder_t *b, zan_ast_node_t *type_node) {
                         b->arena, sizeof(zan_symbol_t *) * (size_t)total);
                     int mi = 0;
                     for (int bi = 0; bi < base_sym->member_count; bi++) {
-                        if (base_sym->members[bi]->kind == SYM_FIELD ||
-                            base_sym->members[bi]->kind == SYM_PROPERTY) {
-                            merged[mi++] = base_sym->members[bi];
+                        zan_symbol_t *bm = base_sym->members[bi];
+                        if (bm->kind != SYM_FIELD && bm->kind != SYM_PROPERTY)
+                            continue;
+                        /* 泛型基类的字段类型要按实参替换：Base<string>.value
+                         * 是 string，不是基类声明里的 T。否则派生类里
+                         * this.value 的类型是个悬空的类型参数，方法体里的
+                         * 成员访问解析不出来，整个方法退化成空桩。 */
+                        zan_symbol_t *copy = bm;
+                        zan_type_t *bt = type_sym->type->base_type;
+                        if (bt && bt->type_arg_count > 0 && bm->type &&
+                            bm->type->kind == TYPE_TYPE_PARAM) {
+                            zan_type_t *st = binder_subst_type_param(bm->type, bt);
+                            if (st && st != bm->type) {
+                                copy = make_symbol(b->arena, bm->kind, bm->name,
+                                                   st, bm->decl, bm->modifiers);
+                                copy->parent = type_sym;
+                            }
                         }
+                        merged[mi++] = copy;
                     }
                     for (int oi = 0; oi < type_sym->member_count; oi++) {
                         merged[mi++] = type_sym->members[oi];
@@ -1350,6 +1368,22 @@ static bool type_declares_method(zan_binder_t *b, zan_ast_node_t *type_node,
         if (method_signature_equal(b, m, wanted, NULL, NULL)) return true;
     }
     return false;
+}
+
+/* 把类型参数替换成实例的类型实参（Base<string> 里的 T → string）。 */
+static zan_type_t *binder_subst_type_param(zan_type_t *t, zan_type_t *recv) {
+    if (!t || t->kind != TYPE_TYPE_PARAM || !recv || !recv->sym) return t;
+    zan_ast_node_t *decl = recv->sym->decl;
+    if (!decl) return t;
+    zan_ast_list_t *tps = &decl->type_decl.type_params;
+    for (int i = 0; i < tps->count && i < recv->type_arg_count; i++) {
+        zan_ast_node_t *tp = tps->items[i];
+        if (tp->kind != AST_IDENTIFIER) continue;
+        if (tp->ident.name.len == t->name.len &&
+            memcmp(tp->ident.name.str, t->name.str, (size_t)t->name.len) == 0)
+            return recv->type_args[i];
+    }
+    return t;
 }
 
 static void inherit_default_methods(zan_binder_t *b, zan_ast_node_t *type_node,

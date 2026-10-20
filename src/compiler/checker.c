@@ -122,6 +122,8 @@ void zan_checker_init(zan_checker_t *c, zan_binder_t *binder,
     c->current_return_type = NULL;
 }
 
+static bool checker_class_is_abstract(zan_symbol_t *sym);
+
 static void no_runtime_reject(zan_checker_t *c, zan_loc_t loc, const char *what) {
     if (!c->in_no_runtime) return;
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
@@ -2807,6 +2809,12 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 type->kind != TYPE_ARRAY)
                 type = zan_binder_make_array_type(c->binder, type);
             check_generic_constraints(c, type, expr->loc);
+            if (type && type->kind == TYPE_CLASS && type->sym &&
+                checker_class_is_abstract(type->sym)) {
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                    "cannot instantiate abstract class '%.*s'",
+                    (int)type->name.len, type->name.str);
+            }
             check_ctor_available(c, type, expr);
         }
         /* new List<T>(src) 单参数拷贝构造函数类型推导 */
@@ -4139,6 +4147,122 @@ static bool checker_base_has_virtual_slot(zan_symbol_t *base_sym,
         name, arity, depth + 1);
 }
 
+/* 抽象类判定：声明带 abstract，或含抽象方法。
+ * 抽象类不能被实例化——它的抽象方法没有实现，new 出来的对象调下去
+ * 只会撞上编译器发的「未被覆盖」致命桩。 */
+static bool checker_class_is_abstract(zan_symbol_t *sym) {
+    if (!sym) return false;
+    if (sym->decl && sym->decl->kind == AST_CLASS_DECL &&
+        (sym->decl->type_decl.modifiers & MOD_ABSTRACT))
+        return true;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (m && m->kind == SYM_METHOD && (m->modifiers & MOD_ABSTRACT))
+            return true;
+    }
+    return false;
+}
+
+/* 本类（含继承来的）是否覆盖了某个抽象方法（按名字 + 参数个数匹配）。 */
+static bool checker_class_overrides(zan_symbol_t *sym, zan_istr_t name,
+                                    int arity, int depth) {
+    if (!sym || depth > 16) return false;
+    for (int i = 0; i < sym->member_count; i++) {
+        zan_symbol_t *m = sym->members[i];
+        if (!m || m->kind != SYM_METHOD) continue;
+        if (!(m->modifiers & MOD_OVERRIDE)) continue;
+        if (m->name.len == name.len &&
+            memcmp(m->name.str, name.str, (size_t)name.len) == 0 &&
+            checker_method_param_count(m) == arity)
+            return true;
+    }
+    if (sym->type && sym->type->base_type && sym->type->base_type->sym)
+        return checker_class_overrides(sym->type->base_type->sym, name, arity,
+                                       depth + 1);
+    return false;
+}
+
+/* 收集继承链上声明的全部抽象方法（连同声明它们的基类）。
+ * 一次性收集完再判定：逐层递归判定会把「中间那层抽象类」误当成
+ * 被检查对象——中间层本来就可以不实现。 */
+typedef struct {
+    zan_symbol_t *owner;   /* 声明该抽象方法的基类 */
+    zan_symbol_t *method;
+} checker_abstract_item_t;
+
+static void collect_base_abstract_methods(zan_symbol_t *sym,
+                                          checker_abstract_item_t *out,
+                                          int *n, int cap, int depth) {
+    if (!sym || depth > 16) return;
+    zan_symbol_t *base = (sym->type && sym->type->base_type)
+        ? sym->type->base_type->sym : NULL;
+    if (!base) return;
+    for (int i = 0; i < base->member_count; i++) {
+        zan_symbol_t *m = base->members[i];
+        if (!m || m->kind != SYM_METHOD) continue;
+        if (!(m->modifiers & MOD_ABSTRACT)) continue;
+        if (*n < cap) { out[*n].owner = base; out[*n].method = m; (*n)++; }
+    }
+    collect_base_abstract_methods(base, out, n, cap, depth + 1);
+}
+
+/* 收集继承链上尚未被本类覆盖的抽象方法，逐条报错。
+ * 只看「继承来的」抽象方法：本类自己声明的抽象方法由「本类必须也是
+ * abstract」那条规则管。 */
+static void check_abstract_implementations(zan_checker_t *c,
+                                           zan_symbol_t *sym) {
+    if (!sym) return;
+    checker_abstract_item_t items[128];
+    int n = 0;
+    collect_base_abstract_methods(sym, items, &n, 128, 0);
+    for (int i = 0; i < n; i++) {
+        zan_symbol_t *m = items[i].method;
+        zan_symbol_t *owner = items[i].owner;
+        if (checker_class_overrides(sym, m->name, checker_method_param_count(m), 0))
+            continue;
+        zan_diag_emit(c->diag, DIAG_ERROR,
+            m->decl ? m->decl->loc : (zan_loc_t){0, 0, 0},
+            "non-abstract class '%.*s' does not implement abstract method "
+            "'%.*s' inherited from '%.*s'",
+            (int)sym->name.len, sym->name.str,
+            (int)m->name.len, m->name.str,
+            (int)owner->name.len, owner->name.str);
+    }
+}
+
+/* 抽象成员的规则：抽象方法不能是 static / async；含抽象方法的类必须
+ * 声明为 abstract；具体类必须实现继承来的全部抽象方法。 */
+static void check_abstract_members(zan_checker_t *c, zan_ast_node_t *decl) {
+    zan_symbol_t *ts = c->current_type_sym;
+    if (!ts) return;
+    /* 类是否 abstract 以声明上的修饰符为准（符号表里的那份不总是同一个）。 */
+    bool cls_abstract = (decl->type_decl.modifiers & MOD_ABSTRACT) != 0;
+    bool has_abstract_method = false;
+    for (int j = 0; j < decl->type_decl.members.count; j++) {
+        zan_ast_node_t *member = decl->type_decl.members.items[j];
+        if (member->kind != AST_METHOD_DECL) continue;
+        if (!(member->method_decl.modifiers & MOD_ABSTRACT)) continue;
+        has_abstract_method = true;
+        if (member->method_decl.modifiers & MOD_STATIC) {
+            zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                "an abstract method cannot be static: '%.*s'",
+                (int)member->method_decl.name.len, member->method_decl.name.str);
+        }
+        if (member->method_decl.modifiers & MOD_ASYNC) {
+            zan_diag_emit(c->diag, DIAG_ERROR, member->loc,
+                "an abstract method cannot be async: '%.*s'",
+                (int)member->method_decl.name.len, member->method_decl.name.str);
+        }
+    }
+    if (has_abstract_method && !cls_abstract) {
+        zan_diag_emit(c->diag, DIAG_ERROR, decl->loc,
+            "class '%.*s' declares an abstract method and must be declared "
+            "'abstract'", (int)ts->name.len, ts->name.str);
+    }
+    if (!cls_abstract)
+        check_abstract_implementations(c, ts);
+}
+
 static void check_virtual_shadows_base(zan_checker_t *c, zan_ast_node_t *decl) {
     zan_symbol_t *ts = c->current_type_sym;
     if (!ts || !ts->type || !ts->type->base_type || !ts->type->base_type->sym)
@@ -4188,6 +4312,7 @@ void zan_checker_check(zan_checker_t *c, zan_ast_node_t *unit) {
         c->current_type_sym = zan_binder_lookup(c->binder, decl->type_decl.name);
         if (decl->kind == AST_CLASS_DECL) {
             check_virtual_shadows_base(c, decl);
+            check_abstract_members(c, decl);
         }
         for (int j = 0; j < decl->type_decl.members.count; j++) {
             zan_ast_node_t *member = decl->type_decl.members.items[j];
