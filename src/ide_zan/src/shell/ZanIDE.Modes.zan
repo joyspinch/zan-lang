@@ -1,0 +1,136 @@
+using System;
+using System.IO;
+using Gui;
+using Gui.Widget;
+
+// IDE 的工作模式：工具开发 / 游戏开发 / Agent。
+//
+// 三种工作流的操作差异很大——组件面板与属性检查器、场景与实体树、
+// 会话与任务流，各自主场不同。IDE 不做三套壳，而是**一套骨架 + 模式
+// 预设**：模式决定①停靠面板的显隐、②功能区的分组重心、③状态栏上
+// 当前模式的标识；文件类型（.html 设计稿 / 场景文件 / .zan 源码）仍然
+// 决定"这一帧画什么"——模式不取代它，只是给出默认工作面。
+partial class ZanIDE {
+
+    // 模式 id：0=工具 1=游戏 2=Agent。
+    static int ModeTool() { return 0; }
+    static int ModeGame() { return 1; }
+    static int ModeAgent() { return 2; }
+
+    // 模式名（界面用）。
+    static string ModeName(int mode) {
+        if (mode == ModeGame()) { return ZanIDE.T("Game", "游戏"); }
+        if (mode == ModeAgent()) { return ZanIDE.T("Agent", "Agent"); }
+        return ZanIDE.T("Tool", "工具");
+    }
+
+    // 状态栏上的长名：那一栏里还并排放着"设计器/Zan"这类编辑态标识，
+    // 短名并排会读成同一个东西（"设计器 | 工具"），加上"模式"二字
+    // 才分得清。
+    static string ModeLabel(int mode) {
+        return ZanIDE.ModeName(mode) + ZanIDE.T(" mode", "模式");
+    }
+
+    // 模式的机器名（落盘用）。
+    static string ModeKey(int mode) {
+        if (mode == ModeGame()) { return "game"; }
+        if (mode == ModeAgent()) { return "agent"; }
+        return "tool";
+    }
+
+    static int ModeFromKey(string key) {
+        if (key == "game") { return 1; }
+        if (key == "agent") { return 2; }
+        return 0;
+    }
+
+    // 模式落盘用独立小文件（与 dock 布局同款做法）：不与 editor.cfg
+    // 的主题/字体键互相覆盖——那两个键由设置对话框整份重写。
+    static string IdeModePath() { return ZanIDE.UserConfigDir() + "/ide-mode.txt"; }
+
+    static int ReadIdeMode() {
+        string f = ZanIDE.IdeModePath();
+        if (!File.Exists(f)) { return ZanIDE.ModeTool(); }
+        return ZanIDE.ModeFromKey(ZanIDE.TrimWs(File.ReadAllText(f)));
+    }
+
+    static void WriteIdeMode(int mode) {
+        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
+        File.WriteAllText(ZanIDE.IdeModePath(), ZanIDE.ModeKey(mode));
+    }
+
+    // IDE 自己注册的全部停靠面板 id（"editor" 是中央固定区，不参与
+    // 显隐）。模式预设在这张名单上做取舍。
+    static List<string> ModeAllPanels() {
+        List<string> ids = new List<string>{
+            "explorer", "structure", "stdlib", "toolbox", "tools",
+            "examples", "git", "props", "output", "errors", "terminal",
+            "help"};
+        return ids;
+    }
+
+    // 模式预设：这一模式下常驻的停靠面板。
+    List<string> ModePanels(int mode) {
+        List<string> ids = new List<string>();
+        ids.Add("explorer");
+        if (mode == ModeAgent()) {
+            // Agent：工程树（Agent 要知道改哪个文件）+ 产出、错误与
+            // 终端（构建与工具调用都落这里）。会话流占中央，Agent
+            // 模式下常驻。
+            ids.Add("output");
+            ids.Add("errors");
+            ids.Add("terminal");
+            return ids;
+        }
+        // 工具与游戏都要结构树：工具模式里是组件树，游戏模式里是
+        // 实体/场景树（StructurePanel 自己按 designerMode/sceneMode
+        // 换内容与标题）。
+        ids.Add("structure");
+        if (mode == ModeGame()) {
+            ids.Add("output");
+            ids.Add("errors");
+            ids.Add("terminal");
+            return ids;
+        }
+        // 工具模式：组件面板与属性检查器是主场。
+        ids.Add("toolbox");
+        ids.Add("props");
+        ids.Add("output");
+        ids.Add("errors");
+        return ids;
+    }
+
+    // 切换工作模式：按预设重排面板（不属于本模式的隐藏，属于的显示），
+    // 落盘并重绘。
+    //
+    // 只管显隐不管位置：面板停在哪一侧是用户自己调出来的，模式不该
+    // 替他挪——Show 会原位恢复它记住的家。
+    void ApplyIdeMode(int mode) {
+        if (mode < 0 || mode > 2) { mode = ZanIDE.ModeTool(); }
+        if (mode == ideMode) { return; }
+        ideMode = mode;
+        if (dock != null) {
+            List<string> want = this.ModePanels(mode);
+            List<string> all = ZanIDE.ModeAllPanels();
+            for (int i = 0; i < all.Count; i = i + 1) {
+                string id = all[i];
+                bool wantOn = want.Contains(id);
+                bool hidden = dock.IsHidden(id);
+                if (wantOn && hidden) { dock.Show(id); }
+                else if (!wantOn && !hidden) { dock.Close(id); }
+            }
+            // 收掉面板关闭的回执：模式切换是成批显隐，不是用户挨个
+            // 关面板，不该弹一串"面板已关闭"。
+            dock.TakeClosed();
+        }
+        ZanIDE.WriteIdeMode(mode);
+    }
+
+    // 功能区的模式按钮点到这里：应用预设 + 一句提示 + 重绘。
+    void SwitchIdeMode(int mode) {
+        if (mode == ideMode) { return; }
+        this.ApplyIdeMode(mode);
+        Layer.Msg(ZanIDE.T("Work mode: ", "工作模式：") + ZanIDE.ModeName(mode), 3);
+        app.RequestRedraw();
+    }
+}
