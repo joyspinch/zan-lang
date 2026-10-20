@@ -8,12 +8,21 @@ Zan 原生 2D 工厂自动化 + 塔防游戏：在外星荒原上开采铜铅石
 ## 运行
 
 ```bash
-# App.html 是 HUD 设计稿，必须与 .zan 一起显式列进编译输入；
-# 入口 .zan 放第一个（Main 从首个输入产出）；逻辑层来自包
-# packages/Zan.Game.Factory（using Game.Factory; 自动引入）
-build/zanc.exe templates/game/coreforge/src/main.zan templates/game/coreforge/src/App.html templates/game/coreforge/src/CoreforgeHud.zan templates/game/coreforge/src/ForgeInterface.zan templates/game/coreforge/src/ForgeRenderer.zan templates/game/coreforge/src/ForgeCamera.zan templates/game/coreforge/src/CoreforgeAutoTest.zan --auto-stdlib -o coreforge.exe
-cd templates/game/coreforge && ../../coreforge.exe   # 从模板目录运行，./skins 皮肤才解析得到
+# 构建 GUI 可执行文件（build/coreforge/Coreforge.exe）
+pwsh -File templates/game/coreforge/tools/build.ps1
+# 逻辑套件：无头跑 240 条断言（逻辑层在包 packages/Zan.Game.Factory 里）
+pwsh -File templates/game/coreforge/tools/test.ps1
 ```
+
+手动编译等价于（App.html 是 HUD 设计稿，必须与 .zan 一起显式列进编译输入；
+入口 .zan 放第一个，Main 从首个输入产出；逻辑层来自包
+packages/Zan.Game.Factory，`using Game.Factory;` 自动引入）：
+
+```bash
+build/zanc.exe templates/game/coreforge/src/main.zan templates/game/coreforge/src/App.html templates/game/coreforge/src/CoreforgeHud.zan templates/game/coreforge/src/ForgeInterface.zan templates/game/coreforge/src/ForgeRenderer.zan templates/game/coreforge/src/ForgeCamera.zan templates/game/coreforge/src/CoreforgeAutoTest.zan --auto-stdlib --package-project . -o coreforge.exe
+```
+
+运行要在**输出目录**里（`./skins` 皮肤才解析得到）。
 
 窗口 1280x860（逻辑尺寸，随 DPI 缩放），世界即时渲染、失焦不暂停。
 发布版用 `--publish --embed skins=skins` 把皮肤嵌进 exe，即可任意目录运行。

@@ -212,6 +212,24 @@ $profiles = @{
         Rule '[string]$OutDir = "client/assets"' "[string]`$OutDir = (Join-Path `$PSScriptRoot '../assets')"
         Rule 'python scripts/extract_legend_assets.py --client $ClientDir --out $OutDir' "python (Join-Path `$PSScriptRoot 'extract_assets.py') --client `$ClientDir --out `$OutDir"
     )
+    'coreforge' = @(
+        # 仓库根 → 项目根（client/ 的父目录）
+        Rule "`$repo = [IO.Path]::GetFullPath((Join-Path `$project '../../..'))" "`$repo = Split-Path -Parent `$project" 'client/*'
+        # 公共包还在 zan-lang 仓库的 packages/ 下（包是仓库的资产，不复制进项目），
+        # 所以包根走 $ZAN_HOME；项目根自己是没有 packages/ 的。
+        Rule "if (-not `$PackageProject) { `$PackageProject = `$repo }" "if (-not `$PackageProject) { if (`$env:ZAN_HOME) { `$PackageProject = `$env:ZAN_HOME } else { throw '需要 `$env:ZAN_HOME 指向 zan-lang 仓库（公共包在它的 packages/ 下）' } }" 'client/*'
+        # stdlib 同理：项目根没有 stdlib/，走 $env:ZAN_HOME
+        Rule "if (-not `$Stdlib -and (Test-Path (Join-Path `$repo 'stdlib'))) { `$Stdlib = Join-Path `$repo 'stdlib' }" "if (-not `$Stdlib -and `$env:ZAN_HOME) { `$Stdlib = Join-Path `$env:ZAN_HOME 'stdlib' }" 'client/*'
+        # 客户端用例目录：仓库的 tests/templates/coreforge → client/tests
+        Rule "`$tests = Join-Path `$repo 'client/tests'" "`$tests = Join-Path `$project 'tests'" 'client/*'
+        # verify.py：项目根 = parents[2]；界面壳在 client/src
+        Rule 'parents[3]' 'parents[2]' 'client/tests/*'
+        Rule 'TEMPLATE_SRC = ROOT / "templates" / "game" / "coreforge" / "src"' 'TEMPLATE_SRC = ROOT / "client" / "src"' 'client/tests/*'
+        Rule 'default=ROOT / "build" / ("zanc.exe" if os.name == "nt" else "zanc")' 'default=Path(os.environ.get("ZAN_HOME") or ROOT) / "build" / ("zanc.exe" if os.name == "nt" else "zanc")' 'client/tests/*'
+        # README 里的手动编译命令：编译器与包根都在 zan-lang 仓库
+        Rule 'build/zanc.exe client/src/main.zan' '$env:ZAN_HOME/build/zanc.exe client/src/main.zan' 'client/*'
+        Rule '--package-project . -o coreforge.exe' '--package-project $env:ZAN_HOME -o coreforge.exe' 'client/*'
+    )
 }
 $profile = $profiles[$templateName]
 if ($profile) { $rules += $profile }

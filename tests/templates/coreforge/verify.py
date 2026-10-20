@@ -15,10 +15,12 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 BUILD = ROOT / "build" / "coreforge-tests"
+# 包根：仓库内跑时就是仓库根；项目搬到仓库外后由 $ZAN_HOME / --package-project
+# 指回 zan-lang 仓库（公共包是仓库的资产，不复制进项目——复制就会分叉）。
+PACKAGE_ROOT = Path(os.environ.get("ZAN_HOME") or ROOT).resolve()
 # 逻辑层已抽成包 packages/Zan.Game.Factory（namespace Game.Factory）：
 # 测试源里一句 `using Game.Factory;` 就会把整个命名空间目录自动带进编译，
 # 因此这里只需喂测试源本身，不必逐个列举包内文件。
-PACKAGE_SRC = ROOT / "packages" / "Zan.Game.Factory" / "src" / "Game" / "Factory"
 TEMPLATE_SRC = ROOT / "templates" / "game" / "coreforge" / "src"
 # 模板目录里只剩"皮肤"（渲染/界面/入口），它们不进逻辑测试。
 GUI_MODULES = {
@@ -46,15 +48,18 @@ def run(command: list[str], timeout: int, log: Path) -> subprocess.CompletedProc
     return result
 
 
-def verify(compiler: Path, timeout: int) -> None:
+def verify(compiler: Path, timeout: int, package_root: Path) -> None:
     sources = [Path(__file__).with_name("logic.zan")]
     for path in [compiler, *sources]:
         if not path.is_file():
             raise RuntimeError(f"Required input is missing: {path}")
     # 包的命名空间目录必须存在且有源码：测试靠 `using Game.Factory;` 自动引入它。
-    package_files = sorted(PACKAGE_SRC.glob("*.zan"))
+    package_src = package_root / "packages" / "Zan.Game.Factory" / "src" / "Game" / "Factory"
+    package_files = sorted(package_src.glob("*.zan"))
     if not package_files:
-        raise RuntimeError(f"Package sources are missing: {PACKAGE_SRC}")
+        raise RuntimeError(
+            "Package sources are missing: %s（公共包住在 zan-lang 仓库的 packages/ 下："
+            "用 --package-project 或 $ZAN_HOME 指过去）" % package_src)
     # 模板目录里不该再有没归类的逻辑源码——它们属于包，不属于模板。
     extra = [path for path in TEMPLATE_SRC.rglob("*.zan") if path.name not in GUI_MODULES]
     if extra:
@@ -67,7 +72,9 @@ def verify(compiler: Path, timeout: int) -> None:
     executable.unlink(missing_ok=True)
     before = fingerprint(sources)
     started_ns = time.time_ns()
-    result = run([str(compiler), *(str(path) for path in sources), "--auto-stdlib", "-o", str(executable)], timeout, BUILD / "compile.log")
+    result = run([str(compiler), *(str(path) for path in sources), "--auto-stdlib",
+                  "--package-project", str(package_root), "-o", str(executable)],
+                 timeout, BUILD / "compile.log")
     diagnostics = result.stdout.decode("utf-8", errors="replace")
     if result.returncode != 0 or ERROR_TEXT.search(diagnostics):
         raise RuntimeError(f"Compilation failed (exit {result.returncode}); see {BUILD / 'compile.log'}")
@@ -93,9 +100,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=ROOT / "build" / ("zanc.exe" if os.name == "nt" else "zanc"))
     parser.add_argument("--timeout", type=int, default=240, help="Per-process timeout in seconds")
+    parser.add_argument("--package-project", type=Path, default=PACKAGE_ROOT,
+                        help="zan-lang 仓库根：公共包在它的 packages/ 下（默认取 $ZAN_HOME）")
     args = parser.parse_args()
     try:
-        verify(args.compiler.resolve(), args.timeout)
+        verify(args.compiler.resolve(), args.timeout, args.package_project.resolve())
     except (OSError, RuntimeError) as exc:
         print(f"COREFORGE_VERIFY_FAIL: {exc}", file=sys.stderr)
         return 1
