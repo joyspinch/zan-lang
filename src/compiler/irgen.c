@@ -2356,13 +2356,26 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
+        /* 读一次引用计数：既是 immortal 判定，也是 freed 守卫的输入。 */
+        LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
         if (g->arc_guard) {
-            LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
             emit_arc_freed_use_check(g, g->rt_retain, rc_now, obj,
                                      ZAN_ARC_FAULT_USE_OBJ,
                                      "retain through a stale reference (object "
                                      "was freed: missing retain when stored)");
         }
+        /* immortal 对象（字符串字面量等静态对象）的引用计数是哨兵值，不参与
+         * 计数，更不能写——静态对象在只读段，写它就是访问冲突。字面量存进
+         * object 槽时走的就是这条通用 retain。与 zan_rt_str_retain /
+         * zan_rt_release_dyn 的哨兵判定同口径。 */
+        LLVMValueRef is_immortal = zan_icmp(g->builder, LLVMIntEQ, rc_now,
+            LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "isimmortal");
+        LLVMBasicBlockRef imm_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "immortal");
+        LLVMBasicBlockRef add_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_retain, "add");
+        LLVMBuildCondBr(g->builder, is_immortal, imm_bb, add_bb);
+        LLVMPositionBuilderAtEnd(g->builder, imm_bb);
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, add_bb);
         LLVMValueRef rc_pre = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpAdd,
             rc_iptr, LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingMonotonic, 0);
         emit_arc_underflow_check(g, g->rt_retain, rc_pre, obj, NULL,
@@ -2405,13 +2418,24 @@ zan_status_t zan_irgen_init(zan_irgen_t *g, zan_arena_t *arena,
         LLVMValueRef rc_ptr = LLVMBuildGEP2(g->builder, LLVMInt8TypeInContext(g->ctx), obj, &neg16, 1, "rcptr");
         LLVMValueRef rc_iptr = LLVMBuildBitCast(g->builder, rc_ptr,
             LLVMPointerType(i64, 0), "rciptr");
+        /* 读一次引用计数：既是 immortal 判定，也是 freed 守卫的输入。 */
+        LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
         if (g->arc_guard) {
-            LLVMValueRef rc_now = LLVMBuildLoad2(g->builder, i64, rc_iptr, "rcnow");
             emit_arc_freed_use_check(g, g->rt_release, rc_now, obj,
                                      ZAN_ARC_FAULT_USE_OBJ,
                                      "release through a stale reference "
                                      "(object was already freed)");
         }
+        /* immortal 对象（字符串字面量等静态对象）不参与引用计数：既不减计数，
+         * 也不释放——静态对象在只读段，减计数同样是写只读段。 */
+        LLVMValueRef is_immortal = zan_icmp(g->builder, LLVMIntEQ, rc_now,
+            LLVMConstInt(i64, ZAN_STRING_SENTINEL_RC, 0), "isimmortal");
+        LLVMBasicBlockRef imm_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "immortal");
+        LLVMBasicBlockRef sub_bb = LLVMAppendBasicBlockInContext(g->ctx, g->rt_release, "sub");
+        LLVMBuildCondBr(g->builder, is_immortal, imm_bb, sub_bb);
+        LLVMPositionBuilderAtEnd(g->builder, imm_bb);
+        LLVMBuildBr(g->builder, ret_bb);
+        LLVMPositionBuilderAtEnd(g->builder, sub_bb);
         LLVMValueRef rc_old = LLVMBuildAtomicRMW(g->builder, LLVMAtomicRMWBinOpSub, rc_iptr,
             LLVMConstInt(i64, 1, 0), LLVMAtomicOrderingAcquireRelease, 0);
         {

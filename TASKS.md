@@ -603,9 +603,36 @@
   两条改动面。崩溃日志只记了 run/exit 行（`logged=0`），没留下栈。
 - 现象细分：`ternary_is_type` 在**打印任何一行之前**就崩；`cs_b05_pattern_var`
   打印了若干行后才崩——像是某个类型转换 / 模式匹配的运行期路径。
-- 方向：取栈再定位——用 Debug 构建 + 调试器（参考 zanc 间歇性崩溃那次的做法：
-  `cdb -hd` 开调试堆），先定位崩在哪个运行时函数，再判断是 ARC 生命周期、
-  装箱路径还是类型分派的问题；定位前不要猜。
+- ✅ 已修（2026-10-20）。取栈 + 最小探针定位到**同一条根因**，三条用例
+  都是被它带崩的：
+  - 崩溃日志（`<exe_dir>/zan_crash.log`）给出关键事实：`code=0xC0000005`
+    `access=write`，**写入目标落在 exe 映像的只读段**（`addr=exe+0x3A1B0`），
+    而寄存器里的对象指针是 `exe+0x3A1C0`（正好是目标 +16）——写的是
+    "对象前 16 字节的引用计数头"（`ZAN_OBJ_RC_OFF = -16`），对象本体却是
+    **映像里的静态数据**，不是堆对象。
+  - 最小探针二分：`object o = "hi";` 这一句就崩（`p1`）；换成
+    `string s = "hi";` 一切正常（`p3`）。三条用例的共同点正是
+    `object o = "字面量"`。
+  - 根因：字符串字面量是**编译期常量**，引用计数用哨兵值
+    `ZAN_STRING_SENTINEL_RC`（immortal，不参与计数）。运行时三条 ARC 路径
+    里，`zan_rt_str_retain`（irgen.c）与 `zan_rt_release_dyn`（irgen.c）都
+    判了哨兵，唯独**通用**的 `zan_rt_retain` / `zan_rt_release` 没判——
+    而"字面量存进 `object` 槽"走的正是通用 retain（静态类型是 object，
+    不是 string），于是对着只读段做原子加一 → 访问冲突。
+- 修法（`src/compiler/irgen.c`）：通用 `zan_rt_retain` / `zan_rt_release`
+  读一次引用计数，命中哨兵就跳过（与另外两条路径同口径）；堆对象与类实例
+  的计数路径不变。
+- 用例：新增 `tests/conformance/arc_immortal_object_slot.zan` 钉住"字面量进
+  object 槽不崩 + is/强转正常"，并反向锁住"堆字符串与类实例进 object 槽
+  仍走正常引用计数"。
+- 验证（A/B 举证，同一份用例源码）：
+  - 旧编译器 `build/zanc.exe` → exit `-1073741819`（0xC0000005，复现崩溃）；
+  - 修复后 zanc → exit 0、`failures=0`；
+  - 原三条用例（`ternary_is_type` / `cast_string_object` / `cs_b05_pattern_var`）
+    修复后逐行比对基准**完全一致**。
+  - 注：验证用的 zanc 是在 `_scratch/build_a412` 独立目录构建的——当时另一
+    会话正跑 conformance 整档（共用 `build/zanc.exe`），不换共享二进制以免
+    打断他们（仓库规则 8）。
 
 ### [ ] A413 自举：`Console.*` 只有一条 blanket catch——`Clear` 打印 "0"、`ReadLine` 返回垃圾
 
