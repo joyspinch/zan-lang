@@ -49,6 +49,7 @@ short, enforceable summary.
 | `packages/`     | Reusable packages (`Zan.*`): game engines, SDKs, data formats   |
 | `examples/`     | Curated, runnable example programs (each with its own README)   |
 | `templates/`    | Project templates used by the IDE "New Project" flow            |
+| 仓库外        | Large game projects live outside the repo (`D:/project/games/*`) |
 | `tests/`        | Version-controlled test suite                                   |
 | `docs/`         | Documentation                                                   |
 | `cmake/`, `scripts/` | Build system + maintained helper scripts                   |
@@ -223,6 +224,26 @@ positive, stated in the commit message.
     全线失败（查裸字段 `numIsInt` 判整数，解析出来的 JSON 数字带的是
     `numRaw` 文本），修好后 240 条断言才真正跑起来——被模板藏起来的
     腐化，进了包就会被迫面对。
+15. **大型游戏项目不进仓库，放仓库外的独立项目。** 产品级规模的游戏
+    （几十 MB 素材、上千文件、自带工具链与服务端）放 `D:/project/games/<名字>/`
+    这类仓库外目录，仓库只留 SDK、公共包与**示例级**模板。判据是体量与
+    产品化程度：`legend` 57MB/7219 文件、`wuwei` 15.6MB/414 文件——它们是
+    产品，不是"怎么做一个游戏"的示范；留在 `templates/` 里既拖慢仓库，
+    又会被 IDE 当成可新建的模板误导用户。
+    **一个游戏 = 一个项目目录**，内部按端分目录（`client/` `server/`），
+    跨端用例放项目顶层 `tests/`——两端各自分目录、好管理，跨端校验也有地方放。
+    搬迁用 `scripts/export_game_project.ps1`：复制模板 + 配套测试、改写所有
+    仓库路径引用、退掉模板身份（删 `template.manifest`、`{{NAME}}` 落实名）、
+    补 `PROJECT.md`、`git init` 出独立历史。仓库侧删除前先
+    `git tag archive/<名字>-<日期>` 留住版本，导出时用 `-SourceRef <标签>`
+    从标签取源（仓库里已经没有源目录了）。
+    搬出后**包依赖**要自己解决：包从 `<项目根>/packages/`、
+    `<项目根>/.zan-packages/`、全局 `%LOCALAPPDATA%\Zan\packages` 三处解析，
+    或编译时 `--package-project <zan-lang>`。坑出处：搬迁脚本的改写规则
+    必须用**单行**替换（多行块会因 CRLF/LF 差异对不上，规则静默不生效）；
+    模板自带的构建/测试脚本常常从没跑通过（wuwei 的 `build.ps1` 只枚举
+    `src/*.zan` 顶层，漏掉 `src/Model/` 下的源码，`test.ps1` 又漏带设计稿
+    导致 `Menu` 解析错位），搬迁正好逼它们面对——先修根因再搬。
 
 ## Build / dev quickstart
 

@@ -42,8 +42,14 @@ foreach ($suite in @('test_data.py', 'test_pack.py', 'test_prepare_assets.py')) 
 }
 
 # --- Headless model tests: compile against the game sources without main.zan.
-$sources = Get-ChildItem (Join-Path $project 'src/*.zan') -File |
-    Where-Object { $_.Name -ne 'main.zan' } | Sort-Object Name | ForEach-Object { $_.FullName }
+# 源要**递归**枚举：Model/ 下的表格读取与存档基座也是源码，漏了就编不过。
+# 但要**排除 GUI 接线**：WuweiApp*.zan 是 partial class 的 code-behind，
+# 它引用的控件字段由 App.html 生成——设计稿不进编译时，这些字段不存在，
+# `Menu` 会落到 stdlib 的 Gui.Widget.Menu，报 "no member 'visible'"。
+# 头less 用例只测模型层，不需要界面接线。
+$sources = Get-ChildItem (Join-Path $project 'src') -Recurse -File -Filter *.zan |
+    Where-Object { $_.Name -ne 'main.zan' -and $_.Name -notlike 'WuweiApp*' } |
+    Sort-Object FullName | ForEach-Object { $_.FullName }
 foreach ($case in @('model.zan', 'profiles.zan', 'security.zan')) {
     Invoke-Step $case {
         $stem = [IO.Path]::GetFileNameWithoutExtension($case)
@@ -53,6 +59,9 @@ foreach ($case in @('model.zan', 'profiles.zan', 'security.zan')) {
         # would fail them spuriously.
         $dataDir = Join-Path $repo "build/wuwei/tests/$stem-data"
         Remove-Item $dataDir -Recurse -Force -ErrorAction SilentlyContinue
+        # 不带设计稿：App.html 生成的 partial class 会把 GUI 宿主拉进无头用例
+        # （model.zan 在带设计稿时会以访问冲突退出）。GUI 接线文件已在 $sources
+        # 里排除，用例只测模型层。
         $zargs = @((Join-Path $tests $case)) + $sources + @('--auto-stdlib', '-o', $exe)
         if ($Stdlib) { $zargs += @('--stdlib-path', $Stdlib) }
         & $Compiler @zargs

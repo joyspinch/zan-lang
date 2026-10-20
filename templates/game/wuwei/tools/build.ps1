@@ -18,7 +18,12 @@ if (-not $Output) {
 }
 $Output = [IO.Path]::GetFullPath($Output)
 New-Item -ItemType Directory -Force $Output | Out-Null
-$sources = @(Get-ChildItem (Join-Path $project 'src/*.zan') -File | Sort-Object Name | ForEach-Object { $_.FullName })
+# 源必须**递归**枚举：Model/ 等子目录里的 .zan 同样是源码（App 的 slot 控件、
+# 表格读取、存档基座都在那儿）。只取 src 顶层会漏掉它们，编译报
+# undefined type 'CardActionSlot' 之类——门禁（gate_templates.ps1）本来就是
+# 递归收集的，所以这个坑只有模板自己的构建脚本会踩。
+$sources = @(Get-ChildItem (Join-Path $project 'src') -Recurse -File -Filter *.zan |
+    Sort-Object FullName | ForEach-Object { $_.FullName })
 # 设计稿排在整个源单最后：zanc 只把生成的 Main() 给第一个编译输入
 # （genrun.c 的 emitMain=paths[0]），而本游戏自管生命周期、main.zan
 # 里手写 Main —— App.html 绝不能当第一输入。

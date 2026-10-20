@@ -202,8 +202,9 @@
 
 ### [ ] A378 legend 导航带对齐校验脚本与 Spec 常量不一致，门已失效
 
-- `tests/templates/legend/test_navigation_layout.py` 是手跑的对齐检查器
-  （不参与 pytest 收集，需喂 `dump tree` 的 JSON），它硬编码的是旧模型：
+- `test_navigation_layout.py`（随 legend 独立项目搬出，现位于
+  `D:/project/games/legend/client/tests/test_navigation_layout.py`）是手跑的
+  对齐检查器（不参与 pytest 收集，需喂 `dump tree` 的 JSON），它硬编码的是旧模型：
   图标 **22×22**、瓦片高 **32**（导航 30 号 48）、inset 4、gap 4。
 - 当前 Spec 是 `NavIconW=Px(19)`、`NavIconH=Px(21)`、`NavTileH=Px(33)`
   （外框 32.7）、`Spec.Px(6)` 间隙；实测 dump（nav-0 瓦片 142×49、图标

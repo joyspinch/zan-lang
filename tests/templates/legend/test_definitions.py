@@ -17,6 +17,10 @@ sys.dont_write_bytecode = True
 
 ROOT = Path(__file__).resolve().parents[3]
 DATA = ROOT/'templates/game/legend/data'
+# 临时目录建在项目内 _scratch：独立项目（仓库外）没有仓库的 _scratch，
+# 这里自己建，别让 tempfile 因目录不存在而炸。
+SCRATCH = ROOT/'_scratch'
+SCRATCH.mkdir(parents=True, exist_ok=True)
 # The original data.dll snapshot lives with the server template that seeds from it
 # (server-legend). Keep this the only place the client tests reach across templates.
 DB = ROOT/'templates/server/server-legend/data/M2.DB'
@@ -76,7 +80,7 @@ class Definitions(unittest.TestCase):
                     self.assertEqual(int(row[key]), int(raw[row['id']].get('z'+field) or 0), (dest,row['id'],key))
 
     def test_db_roundtrip_feeds_enrich_identically(self):
-        with tempfile.TemporaryDirectory(dir=ROOT/'_scratch',prefix='legend-data-') as tmp:
+        with tempfile.TemporaryDirectory(dir=SCRATCH,prefix='legend-data-') as tmp:
             path=Path(tmp)/'data';shutil.copytree(DATA,path)
             export_reference(path/'reference')
             norm = lambda b: b.replace(b'\r\n', b'\n')
@@ -96,7 +100,7 @@ class Definitions(unittest.TestCase):
             ('inverted_monster_range', 'monsters', lambda rows: rows[0].update(attack_min='99999')),
         ]
         for name, target, mutate in mutations:
-            with self.subTest(case=name), tempfile.TemporaryDirectory(dir=ROOT/'_scratch',prefix='legend-invalid-') as tmp:
+            with self.subTest(case=name), tempfile.TemporaryDirectory(dir=SCRATCH,prefix='legend-invalid-') as tmp:
                 path=Path(tmp)/'data';shutil.copytree(DATA,path)
                 rows=module.read(path/f'{target}.csv');mutate(rows);module.write(path/f'{target}.csv',rows)
                 env=dict(os.environ,LEGEND_DATA_DIR=str(path),LEGEND_VALIDATE_ONLY='1')

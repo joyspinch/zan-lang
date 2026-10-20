@@ -11,7 +11,8 @@
 #
 # 用法示例：
 #   scripts\pack_game.ps1 -Project templates/game/snake              # 全默认
-#   scripts\pack_game.ps1 -Project templates/game/legend -SignKeyPem k.pem -KeepPlain
+#   scripts\pack_game.ps1 -Project D:/project/games/wuwei/client -SignKeyPem k.pem -KeepPlain
+#   （仓库外的大型游戏项目已搬出仓库，打包时直接指它的 client/ 目录）
 #
 # 密钥策略：
 #   -KeyHex 直接给 64 hex（复现/测试）；否则若 zrp.keys/<name>.share_[ab].hex

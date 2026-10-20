@@ -126,7 +126,7 @@ def test_template(category, name):
 
     entry = scaffold(src_dir, tgt_dir, is_gui)
 
-    # Special game code gen: coreforge, wuwei, trap-cat
+    # Special game code gen: coreforge, trap-cat
     if name == "coreforge":
         cf_hud = os.path.join(tgt_dir, "src/CoreforgeHud.zan")
         cf_html = os.path.join(tgt_dir, "src/App.html")
@@ -140,19 +140,6 @@ def test_template(category, name):
             if "sources" in rep and len(rep["sources"]) > 0:
                 txt = "namespace Coreforge;\n" + rep["sources"][0]["text"] + "\npartial class CoreforgeHud { public static Gui.Control Root() { return __BuildForm(); } }\n"
                 open(cf_hud, "w").write(txt)
-    elif name == "wuwei":
-        ww_app = os.path.join(tgt_dir, "src/WuweiApp.zan")
-        ww_html = os.path.join(tgt_dir, "src/App.html")
-        req = {"mode": "design", "files": [{"name": "WuweiApp.html", "text": open(ww_html).read(), "emitMain": False}]}
-        r_p = os.path.join(tgt_dir, "req.json")
-        rep_p = os.path.join(tgt_dir, "rep.json")
-        json.dump(req, open(r_p, "w"))
-        subprocess.run([ZANGEN, r_p, rep_p], capture_output=True)
-        if os.path.exists(rep_p):
-            rep = json.load(open(rep_p))
-            if "sources" in rep and len(rep["sources"]) > 0:
-                txt = "namespace Wuwei;\n" + rep["sources"][0]["text"] + "\npartial class WuweiApp { public static Gui.Control Root() { return __BuildForm(); } }\n"
-                open(ww_app, "w").write(txt)
     elif name == "trap-cat":
         tc_html = os.path.join(tgt_dir, "src/TrapCatHtml.zan")
         tc_h = os.path.join(tgt_dir, "src/TrapCat.html")

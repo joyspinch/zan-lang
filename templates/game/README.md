@@ -28,8 +28,21 @@ IDE 的"新建项目"按这个标签分组。
 | 益智解谜 Puzzle | [trap-cat](trap-cat/) | `Game.Board` | 围住神经猫：逐点封堵、撤销、最短路 AI |
 | 动作平台 Action | [platformer](platformer/) | `Game.Arcade2D` | 2D 横版平台：零分配循环、土狼时间、跳跃缓冲 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
-| 放置挂机 Idle | [legend](legend/) | `Game.Idle` + `Game.Arpg` | 传奇放置挂机：CSV 数据驱动、离线收益、存档 |
-| 角色扮演 RPG | [wuwei](wuwei/) | `Game.Arpg` | 无为修仙传：水墨修仙，HTML 设计稿 + 代码隐藏 |
+
+## 仓库外的大型游戏项目
+
+产品级的游戏（几十 MB 素材、上千文件、自带工具链与服务端）**不进模板位**——
+它们有自己的版本历史与发布节奏，放进仓库只会拖慢语言仓库、也会被 IDE 当成
+"可新建的模板"误导用户。当前已搬出的项目：
+
+| 项目 | 类型 | 说明 |
+|---|---|---|
+| `D:/project/games/legend` | 2.5D 动作 RPG + 配套服务端 | 传奇放置挂机：CSV 数据驱动、离线收益、存档；项目内 `client/` 与 `server/` 分目录，规则表单向同步 |
+| `D:/project/games/wuwei` | 数据驱动修仙 RPG | 无为修仙传：水墨修仙，HTML 设计稿 + 代码隐藏 |
+
+搬迁用 [`scripts/export_game_project.ps1`](../../scripts/export_game_project.ps1)
+（复制 + 改写仓库路径引用 + 退模板身份 + `git init`）。仓库里若还需要留一份
+"示例级"的同类玩法，就另做一个精简模板，而不是把产品级项目留在模板位。
 
 ## 引擎模块在哪
 
