@@ -1,0 +1,86 @@
+using System;
+using System.Json;
+using Gui;
+
+// 皮肤层必须认得主题令牌。
+//
+// 皮肤 CSS 在 Skin.Load 里是裸解析的（只看得到皮肤自己的 :root），
+// 于是 `var(--radius-medium)`、`var(--padding-large)`、`var(--anim-medium)`
+// 这类**主题度量**会展开成空串——整条声明随之消失：
+// `padding: 0 var(--padding-large)` 变成 `padding: 0`，按钮的水平内边距
+// 直接没了；`border-radius: var(--radius-medium)` 整条被丢掉。
+//
+// 契约（App.ApplyAppCss → Skin.SheetWithVars 负责兑现）：
+//   1) 按主题令牌解析时，皮肤规则里的主题度量必须有值；
+//   2) 皮肤自己的 `:root` 仍然胜出（同名时本地覆盖主题）；
+//   3) 时长令牌不带 px/dpx 尾巴——它是时间，不是长度。
+class SkinThemeVarsTest {
+    static int fails;
+
+    static void Chk(bool ok, string what) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static StyleBox Apply(StyleSheet sheet) {
+        StyleBox b = new StyleBox();
+        Style.ApplySheet(sheet, b, "button", "", "", Style.SNormal());
+        return b;
+    }
+
+    static void Main() {
+        Theme t = Theme.Light();
+        List<CssVarDecl> vars = Css.CollectVarDecls(Style.RootFromTheme(t));
+
+        // 1) 主题度量在皮肤规则里有值。
+        string css = "button {\n"
+            + "  border-radius: var(--radius-medium);\n"
+            + "  padding: 0 var(--padding-large);\n"
+            + "  transition: var(--anim-medium) ease-out;\n"
+            + "}\n";
+        StyleBox b = Apply(Css.ParseWithSources(css, vars, vars.Count));
+        Console.WriteLine("padding-large " + b.padL);
+        Console.WriteLine("radius-medium " + b.radius);
+        Console.WriteLine("transition-ms " + b.transitionMs);
+        Chk(b.padL == t.paddingLarge, "theme padding token resolves");
+        Chk(b.padT == 0, "padding shorthand keeps the literal side");
+        Chk(b.radius == t.borderRadiusMedium, "theme radius token resolves");
+        Chk(b.transitionMs == t.animMediumMs, "theme anim token resolves");
+
+        // 2) 皮肤自己的 :root 仍然胜出。
+        string own = ":root { --padding-large: 22; }\n"
+            + "button { padding: 0 var(--padding-large); }\n";
+        StyleBox ob = Apply(Css.ParseWithSources(own, vars, vars.Count));
+        Console.WriteLine("own root padding " + ob.padL);
+        Chk(ob.padL == 22, "skin :root overrides the theme");
+
+        // 3) 对照组：不给变量的裸解析（旧的皮肤加载路径）会丢掉引用。
+        StyleBox bb = Apply(Css.ParseWithSources(css, new List<CssVarDecl>(), 0));
+        Console.WriteLine("bare padding " + bb.padL);
+        Console.WriteLine("bare radius " + bb.radius);
+        Chk(bb.padL == 0, "bare parse loses the unresolved var");
+        Chk(bb.radius <= 0, "bare parse drops the unresolved declaration");
+
+        // 4) 生产路径：真皮肤包按主题令牌解析后，规则里的主题度量有值。
+        //    （工作目录是仓库根，皮肤包在 packages/Zan.Gui.Themes/skins。）
+        Skin sk = Skin.Load("darkgold");
+        Chk(sk.IsLoaded(), "darkgold skin pack found");
+        if (sk.IsLoaded()) {
+            StyleBox wb = Apply(sk.SheetWithVars(vars, vars.Count));
+            StyleBox nb = Apply(sk.sheet);
+            Console.WriteLine("skin padding " + wb.padL);
+            Console.WriteLine("skin radius " + wb.radius);
+            Console.WriteLine("skin bare padding " + nb.padL);
+            Chk(wb.padL == t.paddingLarge, "skin rule sees the theme padding token");
+            Chk(wb.radius == t.borderRadiusMedium, "skin rule sees the theme radius token");
+            Chk(nb.padL == 0, "the raw skin sheet still misses it");
+        }
+
+        if (fails == 0) {
+            Console.WriteLine("gui skin theme vars OK");
+        } else {
+            Console.WriteLine("gui skin theme vars FAILS " + fails);
+        }
+    }
+}
