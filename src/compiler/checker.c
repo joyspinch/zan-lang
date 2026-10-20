@@ -1437,7 +1437,17 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
         src == c->binder->type_void)
         return true;
     if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return true;
-    if (dst->kind == TYPE_OBJECT || src->kind == TYPE_OBJECT) return true;
+    if (dst->kind == TYPE_OBJECT) {
+        /* 值类型没有装箱设施：`(object)42` 只会把整数值当成对象指针
+         * （irgen 走 IntToPtr），调用方拿到野指针，进程退出时 ARC 去回收
+         * 这个假对象再崩一次（0xC0000005）。编译期就拦下来。
+         * 引用类型之间的转换照旧放行。 */
+        zan_type_t *sbase = src->kind == TYPE_NULLABLE
+                                ? checker_nullable_base(src) : src;
+        if (sbase && sbase->kind == TYPE_OBJECT) return true;
+        return checker_type_is_ref(sbase);
+    }
+    if (src->kind == TYPE_OBJECT) return true;
     if (dst->kind == TYPE_NINT || src->kind == TYPE_NINT) return true;
     if (dst->kind == TYPE_DELEGATE || src->kind == TYPE_DELEGATE) return true;
     if (checker_type_equal(dst, src)) return true;
@@ -1875,6 +1885,194 @@ static bool arg_is_spawn_callee(zan_ast_node_t *call) {
     if (n.len == 5 && memcmp(n.str, "Spawn", 5) == 0) return true;
     if (n.len == 3 && memcmp(n.str, "Run", 3) == 0) return true;
     return false;
+}
+
+/* 内建泛型容器的**形参类型** → 具体类型。
+ *
+ * 内建泛型（`List<T>` / `Dict<K,V>`）的成员签名写在 `builtin_api.c` 的
+ * 表里，形参类型是**类型参数名**（"T" / "K" / "V"）。要检查实参类型，
+ * 得先把 "T" 换成调用点的**类型实参**（`List<int>` 的 int）。
+ *
+ * 映射规则：`List<T>` 的 T → type_args[0]；`Dict<K,V>` 的 K → type_args[0]、
+ * V → type_args[1]。其余名字（"int" / "string" / …）按内建基本类型解析。
+ *
+ * 返回 NULL 表示"这个形参类型我管不了"（未知名字、非泛型容器）——调用
+ * 方放行，不报错。宁可漏检也不误报。
+ */
+static zan_type_t *checker_builtin_param_type(zan_checker_t *c,
+                                               zan_type_t *recv,
+                                               const char *name) {
+    if (!recv || !name || !name[0]) return NULL;
+    /* 泛型容器：先按类型实参替换 T/K/V。 */
+    if (recv->type_arg_count > 0) {
+        /* List<T> / Span<T> / Task<T>：T 是第 0 个实参。
+         * Dict<K,V>：K 是第 0 个，V 是第 1 个。 */
+        int slot = -1;
+        if (strcmp(name, "T") == 0) slot = 0;
+        else if (strcmp(name, "K") == 0) slot = 0;
+        else if (strcmp(name, "V") == 0) slot = 1;
+        if (slot >= 0) {
+            if (slot >= recv->type_arg_count) return NULL;
+            return recv->type_args[slot];
+        }
+    }
+    /* 非泛型的基本类型。 */
+    zan_binder_t *b = c->binder;
+    if (strcmp(name, "int") == 0) return b->type_int;
+    if (strcmp(name, "long") == 0) return b->type_long;
+    if (strcmp(name, "short") == 0) return b->type_int;
+    if (strcmp(name, "byte") == 0) return b->type_byte;
+    if (strcmp(name, "sbyte") == 0) return b->type_sbyte;
+    if (strcmp(name, "bool") == 0) return b->type_bool;
+    if (strcmp(name, "float") == 0) return b->type_float;
+    if (strcmp(name, "double") == 0) return b->type_double;
+    if (strcmp(name, "decimal") == 0) return b->type_decimal;
+    if (strcmp(name, "char") == 0) return b->type_char;
+    if (strcmp(name, "string") == 0) return b->type_string;
+    if (strcmp(name, "object") == 0) return b->type_object;
+    if (strcmp(name, "nint") == 0) return b->type_nint;
+    return NULL;
+}
+
+/* 检查**内建泛型**容器方法调用的实参类型。
+ *
+ * 缺口（修之前）：内建泛型（`List<T>` / `Dict<K,V>`）的成员**完全没有
+ * 类型检查**——`List<int>.Add("字符串")` 编译通过，运行时把字符串指针
+ * 存进 int 列表，读回来是垃圾指针（不是崩，是"看起来能用"的静默损坏）。
+ *
+ * 根因：`List` 没有 `sym`（成员来自 `builtin_api.c` 的表，不是源码
+ * 声明），所以 `call_arg_signature` 拿不到签名，`check_call_arg_type`
+ * 从没被调用过——内建泛型的方法调用**根本没进实参类型检查这条路**。
+ *
+ * 修法：把内建成员的形参类型从签名串里取出来，按接收者的**类型实参**
+ * 替换 T/K/V，然后走同一套 `checker_arg_type_mismatch`。
+ */
+/* 检查**用户泛型类**方法调用的实参类型。
+ *
+ * 法型参数是**本身**的型参\uff08Box<T> → Box<int> → T = int\uff09，
+ * 很多人会写成 `box.value = "x"`\uff08\u5b57\u6bb5代��\uff09——
+ * 但代入检查过不化结果\u3002
+ *
+ * 为何么会报错\uff1a\u2014\u2014当调用时 `call_arg_signature` 回 NULL\uff08像码按不到\u2014\u2014
+ * 有 type_arg_count 的收员\u55�直接返回\uff09\uff0c实参类型仍来没被检查\u3002
+ * 所以这这条路又故自己\u3002
+ */
+static void checker_user_generic_call_args(zan_checker_t *c,
+                                            zan_type_t *recv,
+                                            zan_istr_t name,
+                                            zan_ast_node_t *call,
+                                            zan_type_t **arg_types) {
+    if (!recv || !recv->sym || !recv->sym->decl) return;
+    zan_ast_node_t *decl = recv->sym->decl;
+    if (decl->kind != AST_CLASS_DECL && decl->kind != AST_STRUCT_DECL)
+        return;
+    zan_ast_list_t *tps = &decl->type_decl.type_params;
+    if (tps->count == 0 || tps->count != recv->type_arg_count) return;
+    /* 找到唯一个名字在当前类上的方法\uff08有参数\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\u2014\uff09\u3002 */
+    zan_symbol_t *sig = unique_named_method(recv->sym, name);
+    if (!sig || !sig->decl || sig->decl->kind != AST_METHOD_DECL) return;
+    if (sig->decl->method_decl.type_params.count) return;
+    zan_ast_list_t *ps = &sig->decl->method_decl.params;
+    int argc = call->call.args.count;
+    for (int i = 0; i < argc && i < ps->count; i++) {
+        zan_ast_node_t *arg = call->call.args.items[i];
+        if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+        if (!arg || arg->kind == AST_REF_ARG) continue;
+        zan_ast_node_t *p = ps->items[i];
+        if (!p || p->kind != AST_PARAM) continue;
+        zan_type_t *pt = zan_binder_resolve_type(c->binder, p->param.type);
+        if (!pt) continue;
+        /* 把当前类的类型实参替\u2014\u2014T → int\u3002 */
+        pt = zan_binder_subst_named(c->binder, pt, tps, recv->type_args);
+        zan_type_t *at = arg_types[i];
+        if (!at) continue;
+        if (arg->kind == AST_NULL_LITERAL) {
+            if (zan_null_arg_score(pt) < 0) {
+                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                              "cannot convert 'null' to '%s' in argument %d of "
+                              "'%.*s.%.*s': no implicit conversion",
+                              type_name(pt), i + 1, (int)recv->name.len,
+                              recv->name.str, (int)name.len, name.str);
+            }
+            continue;
+        }
+        if (!checker_arg_type_mismatch(c, pt, at)) {
+            bool pt_ref = checker_type_is_ref(pt) || pt->kind == TYPE_STRUCT;
+            bool at_ref = checker_type_is_ref(at) || at->kind == TYPE_STRUCT;
+            if (pt_ref == at_ref) continue;
+            if (checker_type_assignable(pt, at)) continue;
+            if (checker_has_user_conversion(c, pt, at)) continue;
+        }
+        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                      "cannot convert '%s' to '%s' in argument %d of "
+                      "'%.*s.%.*s': no implicit conversion",
+                      type_name(at), type_name(pt), i + 1, (int)recv->name.len,
+                      recv->name.str, (int)name.len, name.str);
+    }
+}
+
+static void check_builtin_generic_call_args(zan_checker_t *c,
+                                            zan_type_t *recv,
+                                            zan_istr_t name,
+                                            zan_ast_node_t *call,
+                                            zan_type_t **arg_types) {
+    if (!recv || !call || !call->call.callee) return;
+    if (recv->type_arg_count == 0) return;   /* 非泛型容器不管 */
+    /* 只有 List / Dict / Dictionary 这类内建泛型。 */
+    const char *bt = NULL;
+    if (recv->kind == TYPE_CLASS && recv->name.len == 4 &&
+        memcmp(recv->name.str, "List", 4) == 0) bt = "List";
+    else if (recv->kind == TYPE_CLASS && recv->name.len == 4 &&
+             memcmp(recv->name.str, "Dict", 4) == 0) bt = "Dict";
+    if (!bt) {
+        /* 用户泛型类\uff08Box<int>）\uff1a成员有 sym，但当调用时会因为
+         * “调用了一个同名方法”�%80�过不会报错——核心是调用时会备代替代的实参类型代入。
+         * 最好在这里也检查了\uff08解释型参数为\u2014\u2014\u4f20\u7ed9 checker_arg_type_mismatch\uff09\u3002 */
+        checker_user_generic_call_args(c, recv, name, call, arg_types);
+        return;
+    }
+
+    const char *params[8];
+    int np = zan_builtin_member_params(bt, name.str, (int)name.len, params, 8);
+    if (np <= 0) return;
+    int argc = call->call.args.count;
+    for (int i = 0; i < argc && i < np; i++) {
+        zan_ast_node_t *arg = call->call.args.items[i];
+        if (arg && arg->kind == AST_NAMED_ARG) arg = arg->named_arg.expr;
+        if (!arg || arg->kind == AST_REF_ARG) continue;
+        zan_type_t *at = arg_types[i];
+        if (!at) continue;
+        zan_type_t *pt = checker_builtin_param_type(c, recv, params[i]);
+        if (!pt) continue;
+        /* null 字面量按 irgen 的同一条规则处理。 */
+        if (arg->kind == AST_NULL_LITERAL) {
+            if (zan_null_arg_score(pt) < 0) {
+                zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                              "cannot convert 'null' to '%s' in argument %d of "
+                              "'%.*s.%.*s': no implicit conversion",
+                              type_name(pt), i + 1, (int)recv->name.len,
+                              recv->name.str, (int)name.len, name.str);
+            }
+            continue;
+        }
+        if (!checker_arg_type_mismatch(c, pt, at)) {
+            /* 值目是值类型、实参是引用类型＊
+             * checker_arg_type_mismatch 对"值目是值类型、实参是引用类型"这个结合放过＊
+             * 这里自己检查＊
+             * `List<int>.Add("字符串")` 本来会报错，过直接存过取出来是垃转指针。
+             * 支持的是“核心原则：“值目型和实参型变换的任何结合都这里跳过。 */
+            bool pt_ref = checker_type_is_ref(pt) || pt->kind == TYPE_STRUCT;
+            bool at_ref = checker_type_is_ref(at) || at->kind == TYPE_STRUCT;
+            if (pt_ref == at_ref) continue;
+            if (checker_type_assignable(pt, at)) continue;
+            if (checker_has_user_conversion(c, pt, at)) continue;
+        }
+        zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
+                      "cannot convert '%s' to '%s' in argument %d of "
+                      "'%.*s.%.*s': no implicit conversion",
+                      type_name(at), type_name(pt), i + 1, (int)recv->name.len,
+                      recv->name.str, (int)name.len, name.str);
+    }
 }
 
 static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
@@ -2559,6 +2757,14 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             }
             if (arg_sig && arg)
                 check_call_arg_type(c, arg_sig, i, arg, arg_type);
+        }
+        /* 内建泛型容器（List<T> / Dict<K,V>）的成员没有 sym，签名拼不到
+         * → 实参类型从来没被检查过。单独走一条路（见
+         * check_builtin_generic_call_args 的注释）。 */
+        if (recv && !arg_sig && expr->call.callee &&
+            expr->call.callee->kind == AST_MEMBER_ACCESS) {
+            check_builtin_generic_call_args(c, recv,
+                expr->call.callee->member.name, expr, arg_types);
         }
         if (callee_is_method && recv && recv->sym) {
             zan_symbol_t *typed = checker_find_method_typed(c, recv->sym,
@@ -3286,10 +3492,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *src = zan_checker_check_expr(c, expr->cast.expr);
         zan_type_t *dst = zan_binder_resolve_type(c->binder, expr->cast.type);
         if (!dst) return c->binder->type_error;
-        if (!checker_cast_is_valid(c, dst, src))
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "cannot convert '%s' to '%s': no such conversion",
-                          type_name(src), type_name(dst));
+        if (!checker_cast_is_valid(c, dst, src)) {
+            if (dst->kind == TYPE_OBJECT && !checker_type_is_ref(src))
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot convert '%s' to 'object': value types "
+                              "cannot be boxed (Zan has no boxing facility)",
+                              type_name(src));
+            else
+                zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                              "cannot convert '%s' to '%s': no such conversion",
+                              type_name(src), type_name(dst));
+        }
         return dst;
     }
 

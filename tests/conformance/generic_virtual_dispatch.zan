@@ -1,0 +1,130 @@
+using System;
+using System.Collections.Generic;
+
+// 泛型类的虚方法体必须拿得到具体类型实参。
+//
+// 覆盖的判定点：
+//   - 泛型类覆写基类虚方法、方法体里做 `o is T`：经**基类引用**虚调用时
+//     判定要成立（A447：整类共用一张 vtable 时槽位指向擦除版方法体，
+//     `is T` 恒为 false，消息永远匹配不上）；
+//   - 同一泛型类的两个实例化各有一张 vtable：Circle 实例不认 Square，
+//     Square 实例不认 Circle；
+//   - 泛型基类的**具体实例化** + 非泛型派生类：覆写与继承都要对；
+//   - 泛型类未覆写基类虚方法时，走基类实现；
+//   - 方法体里不用类型参数的虚方法（`Kind()`）照常工作；
+//   - 直接调用（非虚路径）本来就对，改完不能回退。
+public class GenericVirtualDispatchTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    public static void Run() {
+        TestGenericOverride();
+        TestTwoInstantiations();
+        TestConcreteGenericBase();
+        TestInheritedImpl();
+        TestDirectCall();
+
+        if (failures > 0) {
+            Console.WriteLine("GENERIC VIRTUAL DISPATCH TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL GENERIC VIRTUAL DISPATCH TESTS PASSED");
+        }
+    }
+
+    // 泛型类覆写基类虚方法，类型判定在虚调用里要成立
+    private static void TestGenericOverride() {
+        ShapeBase b = new Shape<Circle>();
+        Check("override-accepts-own-type", b.Accepts(new Circle(1)));
+        Check("override-rejects-other-type", !b.Accepts(new Square(1)));
+        Check("override-kind", b.Kind() == "shape");
+    }
+
+    // 同一泛型类的两个实例化：各有各的 vtable，互不串味
+    private static void TestTwoInstantiations() {
+        ShapeBase circles = new Shape<Circle>();
+        ShapeBase squares = new Shape<Square>();
+
+        Check("circle-accepts-circle", circles.Accepts(new Circle(1)));
+        Check("circle-rejects-square", !circles.Accepts(new Square(1)));
+        Check("square-accepts-square", squares.Accepts(new Square(1)));
+        Check("square-rejects-circle", !squares.Accepts(new Circle(1)));
+
+        // 同一段代码里的两个实例不能互相污染
+        List<bool> results = new List<bool>();
+        for (int i = 0; i < 2; i = i + 1) {
+            ShapeBase shape = i == 0 ? (ShapeBase)new Shape<Circle>() : (ShapeBase)new Shape<Square>();
+            results.Add(shape.Accepts(new Circle(1)));
+        }
+        Check("two-instances-independent", results.Count == 2 && results[0] && !results[1]);
+    }
+
+    // 泛型基类的具体实例化 + 非泛型派生类
+    private static void TestConcreteGenericBase() {
+        Base2<Circle> b = new Derived3();
+        Check("concrete-generic-base-accepts", b.Check(new Circle(1)));
+        Check("concrete-generic-base-rejects", !b.Check(new Square(1)));
+    }
+
+    // 泛型类没有覆写基类虚方法时，走基类实现
+    private static void TestInheritedImpl() {
+        ShapeBase b = new PlainShape();
+        Check("inherited-impl-kind", b.Kind() == "base");
+    }
+
+    // 直接调用路径（本来就对，不能回退）
+    private static void TestDirectCall() {
+        Shape<Circle> shape = new Shape<Circle>();
+        Check("direct-accepts", shape.Accepts(new Circle(1)));
+        Check("direct-rejects", !shape.Accepts(new Square(1)));
+    }
+}
+
+// ---- 测试用的类型 ----
+
+public class Circle {
+    public int r;
+    public Circle(int r) { this.r = r; }
+}
+
+public class Square {
+    public int s;
+    public Square(int s) { this.s = s; }
+}
+
+// 基类：虚方法
+public class ShapeBase {
+    public virtual bool Accepts(object o) { return false; }
+    public virtual string Kind() { return "base"; }
+}
+
+// 泛型派生：覆写 + 类型判定
+public class Shape<T> : ShapeBase {
+    public override bool Accepts(object o) { return o is T; }
+    public override string Kind() { return "shape"; }
+}
+
+// 泛型类不覆写基类虚方法
+public class PlainShape : ShapeBase {
+}
+
+// 泛型基类（用它的具体实例化）
+public class Base2<T> {
+    public virtual bool Check(object o) { return o is T; }
+}
+
+// 非泛型派生类（泛型基类的具体实例化）
+public class Derived3 : Base2<Circle> {
+    public override bool Check(object o) { return o is Circle; }
+}
+
+public class GenericVirtualDispatchTestsMain {
+    public static void Main() {
+        GenericVirtualDispatchTests.Run();
+    }
+}

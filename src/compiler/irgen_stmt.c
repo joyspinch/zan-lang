@@ -1602,9 +1602,15 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
 
     case AST_RETURN_STMT:
         if (stmt->ret.value) {
+            zan_type_t *rty = infer_expr_type(g, stmt->ret.value, locals);
             check_implicit_narrowing(g, g->current_fn_zan_ret_type,
-                infer_expr_type(g, stmt->ret.value, locals),
-                stmt->ret.value, "return");
+                rty, stmt->ret.value, "return");
+            /* lambda 体里的 return：委托返回类型与返回值类型必须兼容。
+             * 普通方法由 checker 负责，这里只补 lambda（checker 看不到
+             * lambda 的委托返回类型）。 */
+            if (g->lambda_depth > 0)
+                check_no_boxing_conversion(g, g->current_fn_zan_ret_type, rty,
+                                           stmt->ret.value, "lambda return");
         }
         if (g->current_async_frame) {
             LLVMValueRef ri = NULL, rv = NULL;

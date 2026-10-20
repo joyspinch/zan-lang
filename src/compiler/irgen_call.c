@@ -385,6 +385,12 @@ static int try_method_spec(zan_irgen_t *g, zan_symbol_t *msym,
         if (msym->decl->method_decl.params.items[j]->param.by_ref) return -1;
     zan_type_t *bind[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     infer_method_tp_bindings(g, msym, call, recv_expr, locals, bind);
+    zan_compile_trace("method spec %.*s.%.*s bindc=%d bind0=%d bind0args=%d",
+                      (int)(msym->parent ? msym->parent->name.len : 0),
+                      msym->parent ? msym->parent->name.str : "",
+                      (int)msym->name.len, msym->name.str, tps->count,
+                      bind[0] ? (int)bind[0]->kind : -1,
+                      bind[0] ? bind[0]->type_arg_count : -1);
     return get_or_create_method_spec(g, msym, bind, tps->count, owner_inst);
 }
 

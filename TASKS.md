@@ -1008,7 +1008,7 @@
   一致（按路径字典序），否则同一批文件的 decl 顺序会分叉。
 - 相关：A446（`pkg_sweep` 的假绿与目录输入）。
 
-### [ ] A447 泛型类的虚方法体拿不到类型参数——`is T` 经基类虚调用恒为 false
+### [x] A447 泛型类的虚方法体拿不到类型参数——`is T` 经基类虚调用恒为 false
 
 - 现象（2026-10-21 落地 `Zan.Messaging` 时撞到）：`class Ch<T> : Base`，
   `Base.Accepts(object)` 是虚方法，`Ch<T>` 覆写它并写 `return m is T;`：
@@ -1018,9 +1018,23 @@
   - 虚方法体里改成 `return this.AcceptsTyped(m);`（转交非虚方法）→ 仍 false ❌
   - 同一现象在 `build/zanc.exe`（2026-10-21 01:13）与 `build/zanc5.exe`
     （2026-10-20 23:00）上都在，与 HEAD 的「类级单态化」提交无关。
-- 根因（未定位到具体代码）：虚方法槽里取的是**擦除版**方法体，擦除版拿不到
-  类型实参 → `is T` 的 T 是擦除占位 → 判定恒假。类型信息只在**非虚**调用
-  路径上才具体。
+- 根因（2026-10-21 已定位并修复）：**整类只有一张共享 vtable**。IR 实锤——
+  `@__zan_vtable_Ch = linkonce_odr constant [1 x ptr] [ptr @Ch_Accepts]`，槽位
+  指向**擦除版**方法体；特化版 `@"Ch_Accepts$Order"`（体内 `is T` 判定正确）
+  已经发射出来，却没被挂到任何 vtable 上。`new Ch<Order>()` 写进对象头的也是
+  这张擦除表 → 经基类引用的虚调用拿到擦除体 → `is T` 被折成常量 false。
+- 修法（`src/compiler/irgen_arc.c` + `src/compiler/irgen_expr.c`）：**给泛型类
+  的每个实例化单独发一张 vtable**（`__zan_vtable_Ch$<token>`），槽位指向该实例
+  化的特化版方法体；`new` 表达式按实例化取表。改动面小、与既有的
+  `mangle_inst_suffix` 命名一致、虚调用点一行没动。
+  - 保守项：**特化版与擦除版的 LLVM 签名不一致时退回擦除版**（值类型类型实参会
+    改签名，按擦除签名发起的虚调用会误读返回值）。
+  - vtable 表**创建即填**（`get_vtable_global_inst` 内部填槽）：`emit_vtables`
+    在部分路径上早于方法体发射，晚创建会拿到全 null 的表。
+- 证据：判定器 `tests/conformance/generic_virtual_dispatch.zan`（4 条：覆写体
+  认自己的类型 / 圆认圆 / 方认方 / 两个实例互不干扰）。修复前 4 条全红，修复后
+  全绿（`ALL GENERIC VIRTUAL DISPATCH TESTS PASSED`）；arcguard arc-clean、
+  `--check-leaks` 无泄漏。
 - 影响：**静默错值**——类型判定返回 false 而不是报错。凡是靠运行期类型分发的
   库（消息总线、插件注册表、序列化分派）都会踩，且症状是"消息没人收 /
   永远匹配不上"，极难定位。
@@ -1029,13 +1043,8 @@
   （`(object m) => { return chan.Accepts(m); }`）→ true。
 - 绕行（已落在 `Zan.Messaging`）：**类型判定在派生类构造器里定型成委托**
   （`this.acceptsField = (object m) => { return m is T; };`），基类只调用
-  委托、不碰类型信息；总线只持有基类引用。
-- 方向（择一）：
-  1. 虚调用按**实例的具体类型**分派（对象头已有类型描述符 `__zan_desc_*`），
-     擦除版转调具体版；
-  2. 编译期诊断：泛型类的虚方法体里用类型参数做类型判定时报错，要求把判定
-     挪到非虚方法或构造器；
-  3. 明文化限制，并给检查器一条提示级诊断（当前是静默返回 false）。
+  委托、不碰类型信息；总线只持有基类引用。修复后这个绕行不再是必需的，但保留
+  也无害。
 - 探针（最小复现，内容直接抄进本条，随时可重建）：
   ```zan
   using System;
@@ -1062,63 +1071,80 @@
   → 恒 true。
 - 关联：A448、A449。
 
-### [ ] A448 泛型方法在包单元里、类型实参靠推断时不单态化——方法体里的类型判定恒假
+### [x] A448 泛型方法按推断调用时不单态化——方法体里的类型判定恒假
+
+> **2026-10-21 更正**：原标题写的是"在包单元里"，**不对**。真正的触发条件是
+> **调用目标是实例方法**（与跨单元无关）：单编译单元里同样复现。跨单元只是
+> 最初撞到它的场景。
 
 - 现象：`Zan.Messaging` 第一版把登记写成 `MessageBus.Register<T>(MessageChannel<T>
   channel)`（泛型方法在**包单元**里），调用方在主单元：
   - `bus.Register(orders)`（**推断** T）→ 消息投不出去（`Publish` 返回 0，
     订阅者一次没被叫醒），**不报错**；
   - `bus.Register<Order>(orders)`（**显式** T）→ 正常投递。
-- 隔离出的边界（同一批探针实测）：
-  - 同一编译单元内，静态 / 实例 / 用 `this` 的三种泛型方法，**推断与显式都
-    正确**（探针 `p9.zan`）；
-  - 同形状代码放进**包单元**后按推断调用就错（探针 `p6.zan`），显式就对
-    （探针 `p11.zan` 是同形状的单单元对照）；
+- 隔离出的边界（2026-10-21 复测更正）：
+  - **实例**泛型方法按推断调用 → 错（同单元、包单元都错）；
+  - **静态**泛型方法按推断调用 → 对（同单元、包单元都对）；
+  - 显式类型实参 → 永远对；
   - 跨编译单元（stdlib 的 `RandomExt.Pick<T>(List<T>)`）推断调用**结果正确**
-    ——但那个方法体里没有类型判定，擦除不影响结果（探针 `p10.zan`）。
-- 根因（未定位到具体代码）：推断出来的类型实参在"泛型方法在别的单元"时没有
-  触发**具体实例化**，调用退化成擦除版方法体——与 A418「泛型方法内
-  `new Foo<T,V>` 不发射变体 → 退化成擦除版」是同一族症状。
-- 影响：静默错值（判定恒假 → 消息没人收）。凡是"包里定义泛型方法、外面按
-  推断调用"的组合都会踩。
-- 方向（择一）：
-  1. 推断出的类型实参也要走 `discover_generic_insts` → 发射具体实例化；
-  2. 编译期诊断：跨单元调用且类型实参是推断出来的、方法体又用了类型参数 →
-     提示显式写 `<T>`；
-  3. **库里避开这个形状（本轮采用）**：把 API 设计成**非泛型**（基类持有委托），
-     类型判定在派生类构造器里定型。
+    ——但那个方法体里没有类型判定，擦除不影响结果。
+- 根因（2026-10-21 已定位并修复）：**形参与实参的映射差一位**。
+  `src/compiler/irgen_expr.c` 的 `infer_method_tp_bindings` 写的是
+  `int arg_base = recv_expr ? 1 : 0;`——只看"有没有接收者表达式"，于是把
+  **接收者当成了第 0 个实参**去和形参类型合一：
+  - 形参类型是 `Chan<T>`（类泛型），接收者类型是接收者类（`type_arg_count == 0`）
+    → `unify_method_tp` 的逐位合一一个类型实参都绑不上 → `bind[0]` 保持 NULL；
+  - `get_or_create_method_spec` 撞上 `if (!bind[i] || !type_is_concrete(bind[i]))
+    return -1;` → 返回 -1 → 调用**退化成擦除版方法体** → 体内 `is T` 被折成
+    常量 false。
+  - 发射端的口径本来是对的：`try_method_spec` 用
+    `recv_params = (recv_expr && m_static) ? 1 : 0`（**只有静态方法经实例表达式
+    调用时接收者才占第 0 个实参**），`emit_method_spec_call` 同口径。**只有
+    推断侧写错了**。
+  - 静态方法按推断调用之所以对：`recv_expr` 是 NULL → `arg_base == 0` → 映射正确。
+- 修法（`src/compiler/irgen_expr.c` 一行 + 注释）：`arg_base` 改成与发射端
+  同口径 `(recv_expr && m_static) ? 1 : 0`。
+- 证据：判定器 `tests/conformance/generic_method_inference.zan`（实例推断 /
+  实例显式 / 静态推断 / 静态显式 / 两次推断互不干扰）。修复前 2 条红
+  （"instance inferred type argument was lost"、"second inference was polluted"），
+  修复后全绿（`ALL GENERIC METHOD INFERENCE TESTS PASSED`）；arcguard arc-clean、
+  `--check-leaks` 无泄漏。回归：generic*/inherit*/lambda*/closure*/cast*/
+  object*/delegate*/func*/messaging* 共 55 条用例 **0 失败**。
+- 影响：静默错值（判定恒假 → 消息没人收）。凡是"实例泛型方法 + 按推断调用 +
+  方法体里用类型参数"的组合都会踩。
+- 遗留（**未修**，另立条目跟踪）：类型参数在 binder 里是**按名字、先到先得**注册
+  在**根作用域**的（`binder.c` 的 `register_type_param_list`），类级 `T` 与方法级
+  `T` 会互相顶掉；"同名 T 先注册谁"取决于**文件解析顺序**，同一份源码放主文件
+  还是放包里，绑定结果可能不同。修它要动绑定期所有类型解析，影响面远大于本条，
+  单独一条。
 - 探针（最小复现，内容直接抄进本条，随时可重建）：
   ```zan
-  // 包单元 lib.zan
-  namespace Demo;
-  public class Chan<T> {
-      public FuncT<object, bool> accepts;
-      public Chan() { this.accepts = (object m) => { return m is T; }; }
-  }
-  public class Api {
+  using System;
+  using System.Collections.Generic;
+  class Chan<T> { }
+  class Order { public int id; public Order(int id) { this.id = id; } }
+  class Api {
+      // 实例泛型方法：推断出来的 T 必须真的进到方法体
       public FuncT<object, bool> Make<T>(Chan<T> c) {
-          Chan<T> local = c;
-          FuncT<object, bool> f = (object m) => { return local.accepts(m); };
-          return f;
+          return (object m) => { return m is T; };
+      }
+      // 静态泛型方法：推断本来就是对的（对照）
+      public static FuncT<object, bool> MakeStatic<T>(Chan<T> c) {
+          return (object m) => { return m is T; };
       }
   }
-  ```
-  ```zan
-  // 主单元 main.zan
-  using System; using Demo;
   public class Probe {
       public static void Main() {
           Api api = new Api();
-          Chan<Order> ch = new Chan<Order>();
-          Console.WriteLine("inferred: " + api.Make(ch)(new Order(1)).ToString());        // false
-          Console.WriteLine("explicit: " + api.Make<Order>(ch)(new Order(1)).ToString());  // true
+          Console.WriteLine("inferred: " + api.Make(new Chan<Order>())(new Order(1)).ToString());        // false（修复前）
+          Console.WriteLine("explicit: " + api.Make<Order>(new Chan<Order>())(new Order(1)).ToString());  // true
+          Console.WriteLine("static:   " + Api.MakeStatic(new Chan<Order>())(new Order(1)).ToString());  // true
       }
   }
-  public class Order { public int id; public Order(int id) { this.id = id; } }
   ```
-- 关联：A447、A418。
+- 关联：A447、A418、A453（类型参数作用域分层，遗留项）。
 
-### [ ] A449 值类型 ↔ `object`：显式装箱崩进程，lambda 返回类型不兼容不报错
+### [x] A449 值类型 ↔ `object`：显式装箱崩进程，lambda 返回类型不兼容不报错
 
 - 现象（2026-10-21 落地 `Zan.Messaging` 时撞到，`build/zanc.exe` 01:13 实测）：
   - **显式装箱直接崩进程**：`int v = 42; object boxed = (object)v;` → 程序
@@ -1130,17 +1156,56 @@
     `r == null` 为 false）；进程退出时 ARC 去回收这个假对象 → 再次
     access violation。块形式 `(Order o) => { return o.id; }` 同样编译通过、
     同样给垃圾（两种写法结果一致）。
-- 根因（未定位到具体代码）：Zan 目前没有值类型装箱设施（没有"把值写进带类型
-  描述符的堆对象"的路径），`object` 只能装引用；lambda 的返回类型与委托返回
-  类型不兼容时检查器也没拦。
+- 根因（2026-10-21 已定位并修复）：两处，都是"没有装箱设施"却放行了。
+  1. **显式装箱**：checker 的 `checker_cast_is_valid` 对 `dst->kind == TYPE_OBJECT`
+     **无条件放行**；irgen 侧 `emit_expr_cast_expr` 遇到"整数 → 指针"就走
+     `LLVMBuildIntToPtr`——`42` 变成指针 `0x2A` 存进 `object`，之后任何一次
+     对象操作（ARC release 读头 / `is` 读 site 字）都在 `0x2A-16` 处读 →
+     **access violation**，全程无诊断。
+  2. **lambda 返回类型**：checker 的 `AST_LAMBDA` 分支**直接 `return type_error`**，
+     而 `type_error` 在 `checker_type_assignable` 里被当作"什么都行"
+     （`if (target->kind == TYPE_ERROR || value->kind == TYPE_ERROR) return true;`）
+     → 赋值检查静默通过；irgen 侧 lambda 的 LLVM 返回类型直接取委托的返回类型
+     （`object` → `i8*`），函数体里的 `o.id`（i32）在 return 处被 IntToPtr 转成
+     指针 → 运行期返回**非 null 的垃圾指针**，进程退出时 ARC 回收这个假对象
+     再崩一次。
+     - 附带发现：checker **根本没给 lambda 的形参建类型**（`AST_LAMBDA` 分支里
+       那个空的 `for` 循环是残留），也**不检查块形 lambda 的语句**
+       （`zan_checker_check_expr` 没有 `AST_BLOCK` 分支）——所以"在 checker 层
+       比对 lambda 体类型"这条路走不通，必须在 irgen 层做（那里委托返回类型
+       与体类型都精确已知）。
+- 修法（走方向 2：**编译期诊断**，不做真装箱）：
+  - `src/compiler/checker.c`：`checker_cast_is_valid` 里把
+    `dst->kind == TYPE_OBJECT` 收窄为"**来源必须是引用类型**"（可空类型按基类型
+    判）；值类型 → `object` 报 `cannot convert 'int' to 'object': value types
+    cannot be boxed (Zan has no boxing facility)`。
+  - `src/compiler/irgen_expr.c` / `irgen_expr_core.c`：新增
+    `check_no_boxing_conversion()`——目标类型是引用类型、来源是值类型（或反过来）
+    就报错；类型参数（泛型未实例化）放过，用户自定义 `op_implicit` 放过。
+  - `src/compiler/irgen_expr.c` 的 `emit_lambda_typed`：表达式体按
+    "委托返回类型 vs 体类型"比对。
+  - `src/compiler/irgen_stmt.c` 的 `AST_RETURN_STMT`：块形 lambda 的 `return`
+    走这条路（只在 `g->lambda_depth > 0` 时查——普通方法由 checker 负责，不重复报）。
+  - `src/compiler/irgen_expr.c` 的 `emit_expr_cast_expr`：**兜住泛型特化**——
+    `object Box<T>(T x) { return (object)x; }` 的来源是类型参数，checker 阶段
+    看不出来，放行；特化成 `Box<int>` 之后 `int` → `object` 由 irgen 拦下。
+  - 保留的口子：`object → 具体类` 的下转照旧放行（运行期检查）；`(T)(object)null`
+    这类"先转 object 再转 T"的写法不受影响（`null` 的类型就是 object）。
+- 证据（三个诊断用例，全部"修复前编译通过、修复后报错"）：
+  - `tests/diag/box_value_to_object.zan` → 显式装箱；
+  - `tests/diag/lambda_return_object.zan` → 表达式形 lambda（块形同样报错）；
+  - `tests/diag/box_generic_value_to_object.zan` → 泛型特化里的装箱。
+  - 诊断文案：`cannot convert 'int' to 'object': value types cannot be boxed
+    (Zan has no boxing facility)` / `cannot convert 'int' to 'object' in lambda
+    return: value types cannot be boxed into a reference type`。
 - 影响：任何"值类型进 `object`"的写法要么崩进程，要么静默拿到野指针。这是
   `Zan.Messaging` 不能做"统一请求-响应 + 擦除结果"的直接原因——结果类型
   必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
-- 方向（择一）：
-  1. 补装箱：值类型 → `object` 时分配一个带类型描述符的堆对象（与 A434 的
-     "按实例动态分派"同一方向）；
-  2. 编译期诊断：显式装箱值类型到 `object` 报错；lambda 返回类型与委托返回
-     类型不兼容一律报错（两种写法一致）。
+- 未做（**真装箱**，另立条目跟踪）：值类型 → `object` 时分配一个带类型描述符的
+  堆对象。可行路径已探明（`rt_alloc(16 + payload, site_id, name)` + 为该值类型
+  注册 site + 载荷写在头部之后；`is T` 的运行期检查读 site 字 → 查
+  `__zan_site_names_tbl`，天然可用；ARC 回收走 `__zan_site_dtor_tbl`），但要动
+  运行期内存布局、ARC 析构表、反射/`ToString`/序列化对装箱值的处理，是独立战线。
 - 探针（最小复现，内容直接抄进本条，随时可重建）：
   ```zan
   using System;
@@ -1148,13 +1213,58 @@
   class Order { public int id; public Order(int id) { this.id = id; } }
   public class Probe {
       public static void Main() {
-          FuncT<Order, object> f = (Order o) => o.id;     // 编译通过
+          FuncT<Order, object> f = (Order o) => o.id;     // 现在编译期报错
           object r = f(new Order(7));
-          Console.WriteLine("r is null: " + (r == null).ToString());   // false（是垃圾指针）
+          Console.WriteLine("r is null: " + (r == null).ToString());
           int v = 42;
-          object boxed = (object)v;                      // 这里直接 access violation
+          object boxed = (object)v;                      // 现在编译期报错
           Console.WriteLine("after box");
       }
   }
   ```
-- 关联：A434、A441~A446（同一族：`object` 没有值语义与类型描述符）。
+- 关联：A434、A441~A446（同一族：`object` 没有值语义与类型描述符）、A454。
+
+### [ ] A453 类型参数按名字全局注册——同名 `T` 先到先得，跨文件行为可能不同
+
+- 现象（2026-10-21 修 A448 时顺带查出，未修）：类型参数在 binder 里是**按名字、
+  先到先得**注册进**根作用域**的（`binder.c` 的 `register_type_param_list`：
+  `if (scope_find(b->current_scope, tp->ident.name)) continue;`）。于是：
+  - 根作用域里 `"T"` 只有**一个**，是第一个声明的类级/方法级类型参数；后续所有
+    `"T"` 都解析到它；
+  - `bind_members` 虽然把方法级类型参数注册进**类的作用域**，但 `scope_find` 沿
+    parent 链会先命中根作用域的同名 `"T"` → 方法级类型参数常常根本没被注册；
+  - 所有替换都是**按名字**匹配（`subst_method_tp` / `zan_binder_subst_named`），
+    名字撞了替换仍然生效，但**类型实参个数**一旦对不上，逐位合一就错位 →
+    绑不上 → 退化成擦除版。
+- 结构性后果：**文件解析顺序会改变结果**。所有源文件（主文件 + stdlib + 包）被
+  合并进同一个 AST、同一次编译（`main.c` 把各文件的 decl 依次 push 进同一个
+  `ast`），`register_type_params` 按合并后的 decl 顺序遍历 → "同名 T 先注册谁"
+  取决于**哪个文件先被解析** → 同一份源码放主文件里 vs 放进包里，绑定结果可以
+  不同。
+- 影响：目前没有独立的复现用例（A448 的真因是 `arg_base` 口径，已修），但这是
+  一颗定时炸弹：任何"两个类型参数同名"的代码（类级 `T` + 方法级 `T`，或两个类
+  各有 `T`）都可能踩到跨文件行为差异。
+- 方向：把**方法级类型参数注册进方法自己的作用域**，并让"同名但不同层"的类型
+  参数**按层隔离**（类级 `T` 与方法级 `T` 不再互相顶掉）。要动绑定期所有类型
+  解析（`binder_type_params_equiv`、`nsresolve.c`、`checker.c` 里按名字比较类型
+  参数的几处都要同步核对），影响面大，单独一条做。
+- 关联：A448（真因不在这里，但同族）、A418。
+
+### [ ] A454 真装箱：值类型 → `object` 的堆对象（带类型描述符）
+
+- 背景（2026-10-21 A449 的遗留）：A449 走的是**编译期诊断**路线——值类型装不进
+  `object`，编译期就报错。要让"值类型进 object"成为**可用**能力，需要补装箱
+  设施。
+- 可行路径（已探明，未实施）：
+  - `rt_alloc(16 + payload_size, site_id, site_name)` 分配带头部的堆对象，载荷写在
+    头部之后；
+  - 为该**值类型**注册一个 site（`reserve_arc_site` + 名字写进
+    `__zan_site_names_tbl`）——`is T` 的运行期检查读对象头 `-8` 处的 site 字 →
+    查名字表，**天然可用**；
+  - ARC 回收走 `__zan_site_dtor_tbl`（标量无托管字段 → 空析构即可）；
+  - 需要新增的只有"为值类型注册 site"+"写载荷"+"取回时按类型读载荷"三件事。
+- 要动的面：运行期内存布局、ARC 析构表、反射 / `ToString` / 序列化对装箱值的
+  处理。属于独立战线，不与编译器缺陷修复混提。
+- 影响：没有它，`object` 只能装引用——`Zan.Messaging` 的"统一请求-响应 + 擦除
+  结果"做不了，结果类型必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
+- 关联：A449、A434。

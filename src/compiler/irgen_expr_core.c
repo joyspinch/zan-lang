@@ -337,6 +337,70 @@ static void check_value_type_mismatch(zan_irgen_t *g, zan_type_t *dst, zan_type_
                   dst->name.str ? dst->name.str : "?", what);
 }
 
+/* 值类型 ↔ 引用类型：Zan 没有装箱设施，两侧不能隐式互转。
+ *
+ * 踩过的坑（A449）：`FuncT<Order, object> f = (Order o) => o.id;` 编译期一声
+ * 不吭，运行期把 int 值当对象指针（IntToPtr）返回，调用方拿到非 null 的野
+ * 指针，进程退出时 ARC 去回收这个假对象再崩一次（0xC0000005）。
+ * 委托返回类型与 lambda 体类型对不上时，必须在编译期拦下来。 */
+static bool irgen_type_is_value_kind(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_BOOL: case TYPE_BYTE: case TYPE_SBYTE:
+    case TYPE_SHORT: case TYPE_USHORT: case TYPE_INT: case TYPE_UINT:
+    case TYPE_LONG: case TYPE_ULONG: case TYPE_NINT:
+    case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_DECIMAL:
+    case TYPE_CHAR: case TYPE_ENUM: case TYPE_STRUCT:
+        return true;
+    case TYPE_NULLABLE:
+        return irgen_type_is_value_kind(t->element_type);
+    default:
+        return false;
+    }
+}
+
+static bool irgen_type_is_ref_kind(zan_type_t *t) {
+    if (!t) return false;
+    switch (t->kind) {
+    case TYPE_OBJECT: case TYPE_INTERFACE: case TYPE_STRING:
+    case TYPE_CLASS: case TYPE_ARRAY: case TYPE_DELEGATE: case TYPE_TASK:
+        return true;
+    case TYPE_NULLABLE:
+        return irgen_type_is_ref_kind(t->element_type);
+    default:
+        return false;
+    }
+}
+
+/* 目标类型是引用类型、来源是值类型（或反过来）时报错：没有装箱/拆箱路径，
+ * 硬转只会造出野指针。类型参数（泛型未实例化）一律放过。 */
+static void check_no_boxing_conversion(zan_irgen_t *g, zan_type_t *dst,
+                                       zan_type_t *src, zan_ast_node_t *at,
+                                       const char *what) {
+    if (!g || !g->diag || !at || !dst || !src) return;
+    if (dst->kind == src->kind) return;
+    if (dst->kind == TYPE_TYPE_PARAM || src->kind == TYPE_TYPE_PARAM) return;
+    if (dst->kind == TYPE_ERROR || src->kind == TYPE_ERROR) return;
+    if (dst->kind == TYPE_VOID || src->kind == TYPE_VOID) return;
+    if (find_user_conversion(g, src, dst, "op_implicit")) return;
+    bool dst_ref = irgen_type_is_ref_kind(dst);
+    bool src_ref = irgen_type_is_ref_kind(src);
+    if (dst_ref == src_ref) return;
+    if (dst_ref) {
+        zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+                      "cannot convert '%s' to '%s' in %s: value types cannot be "
+                      "boxed into a reference type",
+                      src->name.str ? src->name.str : "?",
+                      dst->name.str ? dst->name.str : "?", what);
+    } else {
+        zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
+                      "cannot convert '%s' to '%s' in %s: a reference type cannot "
+                      "be converted to a value type",
+                      src->name.str ? src->name.str : "?",
+                      dst->name.str ? dst->name.str : "?", what);
+    }
+}
+
 static int render_type_full(zan_type_t *t, char *buf, int cap) {
     if (!t || cap <= 1) return 0;
     int n = 0;

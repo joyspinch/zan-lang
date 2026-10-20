@@ -293,6 +293,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   变量（`Random r = this.random;`），lambda 里只用局部变量，警告消失。
 * **`int` 的十六进制字面量超过 0x7FFFFFFF 要 `unchecked`**：
   `unchecked((int)0x80000000)`；否则溢出编译报错。
+* **Zan 没有装箱：值类型装不进 `object`**（实证，2026-10-27）：`(object)42`
+  编译期报错 `cannot convert 'int' to 'object': value types cannot be boxed`。
+  `object` 只能装引用（类实例、字符串、数组、委托、接口）。要"擦除"一个
+  值类型的结果，就把类型一路保留在泛型里（`QueryEndpoint<T, TResult>`、
+  `FuncT<T, TResult>`），别指望 `object` 能兜住。
+* **lambda 的返回类型必须和委托的返回类型兼容**（实证，2026-10-27）：
+  `FuncT<Order, object> f = (Order o) => o.id;` 编译期报错
+  `cannot convert 'int' to 'object' in lambda return`——委托返回 `object` 时，
+  lambda 必须返回**引用类型**；表达式体和块体（`{ return o.id; }`）都会被拦。
+  反过来 `FuncT<Order, bool>` 配 `=> o.id` 正常。
+* **泛型类覆写虚方法时，类型参数在特化版里可用**（实证，2026-10-27）：
+  `class Ch<T> : Base` 覆写 `Base.Accepts(object)` 并写 `return m is T;`，
+  经基类引用的虚调用现在判定正确（每个实例化一张 vtable）。早年的绕行
+  "把类型判定挪进派生类构造器、定型成委托再交给基类调用" 现在**不必**了，
+  但保留也无害。
 
 ## 4. Edit
 

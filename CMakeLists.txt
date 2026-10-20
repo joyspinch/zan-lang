@@ -1177,7 +1177,6 @@ add_test(NAME diag_unary_plus_no_overload
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_plus_no_overload PROPERTIES TIMEOUT 60)
 
-
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序
 # 带崩）；结构体则落进整数格式化分支，生成 %struct.T 传给 i64 形参的非法 IR
@@ -2709,6 +2708,20 @@ add_test(NAME conformance_nsctx
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/beta.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split1.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split2.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/expected.out
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsctx${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+# ---- 导入作用域按文件隔离：同名类分处两个命名空间时，裸名只认**本文件**
+#      导入的那个（A438）。驱动层把各文件的 using 合并进同一个 compilation
+#      unit，修复前本文件的声明会继承别的文件的导入，裸名因此绑到别的包的
+#      同名类（Zan.DataFrame 的 System.Data.Window 抢走 Gui.Backend.Window）。
+#      歧义面的回归用例见 diag_ns_using_scope_leak。 ----
+add_test(NAME conformance_nsusing
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/beta.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsusing${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Library output: static archive + shared libraries (.dll/.so/.dylib) ----
@@ -5091,6 +5104,41 @@ add_test(NAME diag_index_write_wrong_type
     "-DEXPECT_REGEX=no .Bag. indexer accepts this assignment"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_index_write_wrong_type PROPERTIES TIMEOUT 60)
+
+# 值类型 ↔ object：Zan 没有装箱设施。
+# 显式装箱 `(object)42` 此前被 checker 无条件放行，irgen 把整数值 IntToPtr
+# 成对象指针——程序当场 access violation，退出时 ARC 再回收一次假对象。
+# 泛型版本（Box<T>）的来源是类型参数，checker 阶段看不出来，只能在特化
+# （irgen）阶段拦。
+add_test(NAME diag_box_value_to_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/box_value_to_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_box_value_to_object${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int' to 'object': value types cannot be boxed"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_box_value_to_object PROPERTIES TIMEOUT 60)
+add_test(NAME diag_box_generic_value_to_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/box_generic_value_to_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_box_generic_value_to_object${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int' to 'object': value types cannot be boxed"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_box_generic_value_to_object PROPERTIES TIMEOUT 60)
+
+# lambda 返回类型与委托返回类型不兼容必须报错。
+# checker 的 lambda 分支返回 type_error，而 type_error 在可赋值判定里被当作
+# 「什么都行」，于是 `(Order o) => o.id` 赋给 FuncT<Order, object> 静默通过；
+# 运行期把 int 值当对象指针返回，调用方拿到野指针。
+add_test(NAME diag_lambda_return_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_return_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_return_object${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int' to 'object' in lambda return"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_lambda_return_object PROPERTIES TIMEOUT 60)
 
 # Source-level type and interface regressions: reject malformed inheritance,
 # mixed comparisons, invalid reference/delegate assignments, local mismatches,

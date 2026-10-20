@@ -9147,16 +9147,21 @@ static LLVMValueRef emit_expr_new_expr(zan_irgen_t *g, zan_ast_node_t *expr,
                     }
                     zan_store_fit(g, LLVMConstNull(st), alloca);
 
+                    /* 查找并解析类的实例构造函数 */
+                    zan_type_t *new_inst = resolve_type_ctx(g, expr->new_expr.type);
+
                     if (sym->type->kind == TYPE_CLASS && class_has_virtual_methods(sym)) {
                         LLVMTypeRef i8ptr_vt = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-                        LLVMValueRef vtg = get_vtable_global(g, sym);
+                        /* 泛型类**每个实例化一张自己的 vtable**：整类共用一张表时，
+                         * 表里的槽位指向擦除版方法体，而擦除版拿不到类型实参，
+                         * 方法体里的 `m is T` 恒为 false——经基类引用做虚调用时
+                         * 判定恒错（静默）。实例化自己的表指向特化版方法体。 */
+                        LLVMValueRef vtg = get_vtable_global_inst(g, sym, new_inst);
                         LLVMValueRef vpf0 = LLVMBuildStructGEP2(g->builder, st, alloca, 0, "vpf.init");
                         zan_store_fit(g,
                             LLVMBuildBitCast(g->builder, vtg, i8ptr_vt, "vt.i8"), vpf0);
                     }
 
-                    /* 查找并解析类的实例构造函数 */
-                    zan_type_t *new_inst = resolve_type_ctx(g, expr->new_expr.type);
                     /* 对象初始化式字段赋值发射 */
                     int init_start = expr->new_expr.args.count;
                     while (init_start > 0) {
@@ -10567,6 +10572,16 @@ static LLVMValueRef emit_expr_cast_expr(zan_irgen_t *g, zan_ast_node_t *expr,
             if (st && find_user_conversion(g, st, tt, "op_explicit"))
                 return emit_user_conversion(g, st, tt, "op_explicit", val,
                                             expr->cast.expr, locals);
+            /* `(object)42`：值类型装不进 object。没有装箱设施时硬转只会把
+             * 整数值当成对象指针（下面走 IntToPtr），运行期拿野指针、退出
+             * 时 ARC 回收再崩。checker 已经拦了普通路径，这里兜住泛型特化
+             * （类型参数在 checker 阶段还看不出来）。 */
+            if (tt && tt->kind == TYPE_OBJECT && st &&
+                irgen_type_is_value_kind(st))
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                              "cannot convert '%s' to 'object': value types "
+                              "cannot be boxed (Zan has no boxing facility)",
+                              st->name.str ? st->name.str : "?");
         }
         if (llvm_is_nullable(src) && !llvm_is_nullable(target)) {
             emit_runtime_check(g,
@@ -12413,9 +12428,12 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             else LLVMBuildRet(g->builder, LLVMConstNull(ret_type));
         }
     } else if (expr->lambda.body) {
-        check_implicit_narrowing(g, rett,
-            infer_expr_type(g, expr->lambda.body, &lambda_locals),
-            expr->lambda.body, "return");
+        zan_type_t *bty = infer_expr_type(g, expr->lambda.body, &lambda_locals);
+        check_implicit_narrowing(g, rett, bty, expr->lambda.body, "return");
+        /* 委托返回类型与 lambda 体类型必须兼容：没有装箱设施时，返回一个
+         * 值类型给引用类型返回位的委托，运行期只会造出野指针。 */
+        check_no_boxing_conversion(g, rett, bty, expr->lambda.body,
+                                   "lambda return");
         LLVMValueRef result = emit_expr(g, expr->lambda.body, &lambda_locals);
         if (ret_void) {
             LLVMBuildRetVoid(g->builder);
@@ -12591,7 +12609,13 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
         bind[i] = resolve_type_ctx(g, call->call.type_args.items[i]);
 
     zan_ast_list_t *params = &msym->decl->method_decl.params;
-    int arg_base = recv_expr ? 1 : 0;
+    /* 形参与实参的映射口径必须和发射端一致（try_method_spec / emit_method_spec_call）：
+     * 只有「静态方法经实例表达式调用」时接收者才占第 0 个实参；实例方法的接收者是
+     * this，不是声明形参之一。早期这里写成 recv_expr ? 1 : 0，导致实例泛型方法
+     * 拿接收者去合一形参类型，真正的实参没参与绑定 → bind 为空 → 退化成擦除版
+     * → 形参里的 `is T` 被折成常量 false。 */
+    bool m_static = (msym->decl->method_decl.modifiers & MOD_STATIC) != 0;
+    int arg_base = (recv_expr && m_static) ? 1 : 0;
     for (int j = 0; j < params->count; j++) {
         zan_ast_node_t *aexpr = NULL;
         if (arg_base == 1 && j == 0) aexpr = recv_expr;
@@ -12601,6 +12625,9 @@ static void infer_method_tp_bindings(zan_irgen_t *g, zan_symbol_t *msym,
         zan_type_t *dp = method_param_type(g, msym, j);
         if (!dp || !type_mentions_tp(dp)) continue;
         zan_type_t *at = infer_expr_type(g, aexpr, locals);
+        zan_compile_trace("  tp param %d: dp_kind=%d dp_args=%d at_kind=%d at_args=%d",
+                          j, (int)dp->kind, dp->type_arg_count,
+                          at ? (int)at->kind : -1, at ? at->type_arg_count : -1);
         /* 具体化变体里，泛型类的类型实参已定：把实参类型里的类类型参数
          * 换成实参，否则「类类型参数 → 方法类型参数」的绑定推不出来，
          * 泛型方法会退化成擦除版（返回值是默认值，判定全错）。 */

@@ -1,0 +1,86 @@
+using System;
+
+// A448：泛型方法的类型实参按推断时，必须真的进到方法体。
+//
+// 缺陷：`infer_method_tp_bindings` 把「有没有接收者表达式」当成了
+// 「接收者是否占第 0 个实参」。实例方法的接收者是 this，不是声明形参
+// 之一，于是真正的实参根本没参与类型合一 → bind 为空 → 退化成擦除版
+// → 方法体里的 `is T` 被折成常量 false。
+//
+// 这里用「不经过虚调用」的形状判定，把类型实参的丢失单独钉死：
+// 虚调用那条线由 A447（泛型类每实例化一张 vtable）负责。
+
+class Order { public int id; public Order(int id) { this.id = id; } }
+class Other { public int x; public Other(int x) { this.x = x; } }
+
+class Probe {
+    // 实例泛型方法：类型实参靠推断
+    public FuncT<object, bool> Make<T>(Chan<T> chan) {
+        return (object m) => { return m is T; };
+    }
+
+    // 静态泛型方法：类型实参靠推断
+    public static FuncT<object, bool> MakeStatic<T>(Chan<T> chan) {
+        return (object m) => { return m is T; };
+    }
+}
+
+public class Program {
+    public static void Main() {
+        int fail = 0;
+        Probe probe = new Probe();
+
+        // 实例泛型方法 + 推断
+        FuncT<object, bool> inst = probe.Make(new Chan<Order>());
+        if (!inst(new Order(1))) {
+            Console.WriteLine("FAIL: instance inferred type argument was lost");
+            fail++;
+        }
+        if (inst(new Other(1))) {
+            Console.WriteLine("FAIL: instance inferred type argument leaked");
+            fail++;
+        }
+
+        // 实例泛型方法 + 显式类型实参
+        FuncT<object, bool> instExplicit = probe.Make<Order>(new Chan<Order>());
+        if (!instExplicit(new Order(1))) {
+            Console.WriteLine("FAIL: instance explicit type argument was lost");
+            fail++;
+        }
+
+        // 静态泛型方法 + 推断
+        FuncT<object, bool> stat = Probe.MakeStatic(new Chan<Order>());
+        if (!stat(new Order(1))) {
+            Console.WriteLine("FAIL: static inferred type argument was lost");
+            fail++;
+        }
+
+        // 静态泛型方法 + 显式类型实参
+        FuncT<object, bool> statExplicit = Probe.MakeStatic<Other>(new Chan<Other>());
+        if (!statExplicit(new Other(1))) {
+            Console.WriteLine("FAIL: static explicit type argument was lost");
+            fail++;
+        }
+
+        // 两次推断互不干扰
+        FuncT<object, bool> other = probe.Make(new Chan<Other>());
+        if (!other(new Other(2))) {
+            Console.WriteLine("FAIL: second inference was polluted");
+            fail++;
+        }
+        if (other(new Order(2))) {
+            Console.WriteLine("FAIL: second inference leaked the first type argument");
+            fail++;
+        }
+
+        if (fail == 0) {
+            Console.WriteLine("ALL GENERIC METHOD INFERENCE TESTS PASSED");
+        }
+    }
+}
+
+// 泛型容器：只当类型实参的载体，不参与虚调用
+class Chan<T> {
+    public int tag;
+    public Chan() { this.tag = 0; }
+}

@@ -6,6 +6,13 @@ static bool type_is_concrete(zan_type_t *t);
 static int type_is_binding(zan_type_t *t);
 static zan_type_t *subst_type_param_deep(zan_irgen_t *g, zan_type_t *t,
                                          zan_type_t *recv);
+/* 下面三个定义在文件后半段（泛型函数表 / 类型名编码 / 泛型类判定），
+ * vtable 那几处要用，先声明。 */
+static LLVMValueRef find_generic_fn(zan_irgen_t *g, zan_symbol_t *msym,
+                                    zan_type_t **args, int argc,
+                                    LLVMTypeRef *out_fn_type);
+static void mangle_inst_suffix(char *buf, size_t n, zan_type_t *inst);
+static bool is_user_generic_sym(zan_symbol_t *sym);
 
 static void emit_arc_retain(zan_irgen_t *g, LLVMValueRef v) {
     if (g->current_fn_no_runtime) return;
@@ -1230,6 +1237,102 @@ static LLVMValueRef get_vtable_global(zan_irgen_t *g, zan_symbol_t *sym) {
     return gv;
 }
 
+/* 从实例 inst 出发沿基类链找"声明该方法的类"在这次实例化里的具体类型
+ * （`class Ch<T> : Base<T>` 的 Base<Order>、`class Ch<T> : Base<List<T>>` 的
+ * Base<List<Order>>）。找不到返回 NULL。 */
+static zan_type_t *vtable_owner_inst(zan_irgen_t *g, zan_type_t *inst,
+                                     zan_symbol_t *want) {
+    zan_type_t *cur = inst;
+    for (int guard = 0; cur && guard < 16; guard++) {
+        if (cur->sym == want) return cur;
+        if (!cur->base_type) break;
+        cur = subst_type_param_deep(g, cur->base_type, cur);
+    }
+    return NULL;
+}
+
+/* 一个槽位该填哪个函数：声明类本身是泛型类时填**特化版**方法体，
+ * 否则填擦除版。签名对不上（类型实参是值类型时特化版的 LLVM 签名会变）
+ * 就退回擦除版——虚调用点按擦除签名发起调用，签名不一致会被误读。 */
+static LLVMValueRef vtable_slot_fn(zan_irgen_t *g, zan_symbol_t *impl,
+                                    zan_type_t *inst) {
+    if (!impl) return NULL;
+    LLVMValueRef erased = find_fn_for_sym(g, impl);
+    if (impl->parent && is_user_generic_sym(impl->parent)) {
+        zan_type_t *owner = vtable_owner_inst(g, inst, impl->parent);
+        if (owner && owner->type_arg_count > 0) {
+            LLVMTypeRef spec_ty = NULL;
+            LLVMValueRef spec = find_generic_fn(g, impl, owner->type_args,
+                                                owner->type_arg_count, &spec_ty);
+            LLVMTypeRef erased_ty = erased ? LLVMGlobalGetValueType(erased) : NULL;
+            if (spec && erased_ty && spec_ty == erased_ty) return spec;
+        }
+    }
+    return erased;
+}
+
+/* 泛型类的**每个实例化**都要有自己的 vtable。
+ *
+ * 整个类只有一张表（`__zan_vtable_Ch`）时，表里的槽位放的是**擦除版**方法体
+ * （`find_fn_for_sym` 拿到的那个）。擦除版拿不到类型实参，方法体里的
+ * `m is T` 恒为 false——于是经基类引用做虚调用时，泛型类的覆写方法判不中
+ * 消息类型（静默错值，不报错）。特化版方法体（`Ch_Accepts$Order`）明明
+ * 已经发射出来了，却没被挂进表里。
+ *
+ * 实例化自己的表里放特化版方法体，判定才对。 */
+static void fill_vtable_inst(zan_irgen_t *g, LLVMValueRef gv,
+                             zan_symbol_t *sym, zan_type_t *inst) {
+    if (!gv || !sym) return;
+    int n = count_virtual_methods(sym);
+    if (n < 1) return;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    zan_symbol_t **decls = (zan_symbol_t **)calloc((size_t)n,
+                                                   sizeof(zan_symbol_t *));
+    int nd = 0;
+    collect_vslot_decls(sym, decls, &nd, n);
+    LLVMValueRef *elems = (LLVMValueRef *)calloc((size_t)n, sizeof(LLVMValueRef));
+    for (int s = 0; s < n; s++) {
+        LLVMValueRef e = LLVMConstNull(i8ptr);
+        if (s < nd) {
+            zan_symbol_t *decl = decls[s];
+            int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
+            zan_symbol_t *impl = resolve_overload(sym, decl->name, arity, 0);
+            LLVMValueRef fn = vtable_slot_fn(g, impl, inst);
+            if (fn) e = LLVMConstBitCast(fn, i8ptr);
+        }
+        elems[s] = e;
+    }
+    LLVMSetInitializer(gv, LLVMConstArray(i8ptr, elems, (unsigned)n));
+    LLVMSetGlobalConstant(gv, 1);
+    free(elems);
+    free(decls);
+}
+
+static LLVMValueRef get_vtable_global_inst(zan_irgen_t *g, zan_symbol_t *sym,
+                                           zan_type_t *inst) {
+    if (!inst || !inst->sym || inst->sym != sym) return get_vtable_global(g, sym);
+    if (!is_user_generic_sym(sym) || inst->type_arg_count <= 0)
+        return get_vtable_global(g, sym);
+    char suffix[256];
+    mangle_inst_suffix(suffix, sizeof(suffix), inst);
+    if (!suffix[0]) return get_vtable_global(g, sym);
+    char name[384];
+    snprintf(name, sizeof(name), "__zan_vtable_%.*s%s",
+             (int)sym->name.len, sym->name.str, suffix);
+    LLVMValueRef gv = LLVMGetNamedGlobal(g->mod, name);
+    if (gv) return gv;
+    int n = count_virtual_methods(sym);
+    if (n < 1) n = 1;
+    LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
+    LLVMTypeRef at = LLVMArrayType(i8ptr, (unsigned)n);
+    gv = LLVMAddGlobal(g->mod, at, name);
+    LLVMSetInitializer(gv, LLVMConstNull(at));
+    zan_set_odr_comdat(g, gv, name);
+    /* 立刻填：特化方法体在函数声明阶段就有了，不必等方法体发射。 */
+    fill_vtable_inst(g, gv, sym, inst);
+    return gv;
+}
+
 static void emit_vtables(zan_irgen_t *g) {
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
     for (int i = 0; i < g->struct_type_count; i++) {
@@ -1248,7 +1351,7 @@ static void emit_vtables(zan_irgen_t *g) {
                 zan_symbol_t *decl = decls[s];
                 int arity = decl->decl ? decl->decl->method_decl.params.count : 0;
                 zan_symbol_t *impl = resolve_overload(sym, decl->name, arity, 0);
-                LLVMValueRef fn = find_fn_for_sym(g, impl);
+                LLVMValueRef fn = vtable_slot_fn(g, impl, NULL);
                 if (fn) e = LLVMConstBitCast(fn, i8ptr);
             }
             elems[s] = e;
@@ -1262,6 +1365,16 @@ static void emit_vtables(zan_irgen_t *g) {
         zan_set_odr_comdat(g, gv, name);
         free(elems);
         free(decls);
+    }
+    /* 泛型类的每个实例化一张自己的表：槽位指向特化版方法体，
+     * 虚调用经基类引用进来时，方法体里的类型判定才拿得到具体类型。
+     * 表在 `get_vtable_global_inst` 里创建即填（特化方法体在声明阶段
+     * 就有了），这里只保证"已发现但还没 new 出来"的实例化也有表。 */
+    for (int i = 0; i < g->generic_inst_count; i++) {
+        zan_type_t *inst = g->generic_insts[i].inst;
+        zan_symbol_t *sym = g->generic_insts[i].type_sym;
+        if (!inst || !sym || !class_has_virtual_methods(sym)) continue;
+        get_vtable_global_inst(g, sym, inst);
     }
 }
 

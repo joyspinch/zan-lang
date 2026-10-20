@@ -275,6 +275,48 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      结构体类型注册、调试信息、ARC 释放函数、反射都必须跟着它走；漏一处
      就又是一处错位。判定器：一条"基类字段在派生实例上的读写 + 基类方法 +
      接口分派"的用例，泄漏档与 arcguard 档同源覆盖。
+23. **泛型类的每个实例化必须有自己的 vtable**：
+   - 动作：泛型类不能只发一张共享 vtable。按实例实参生成
+     `__zan_vtable_<Class>$<token>`，槽位指向该实例化的**特化版**方法体；
+     `new` 表达式按实例化取表。表**创建即填**（虚表发射在部分路径上早于
+     方法体发射，晚填会拿到全 null 的表）。**特化版与擦除版的 LLVM 签名
+     不一致时退回擦除版**（值类型类型实参会改签名）。
+   - 理由：整类共享一张表时，槽位指向**擦除版**方法体 → 虚方法体里的 `is T`
+     拿不到类型实参 → 判定恒 false（**静默错值**，不报错）。特化版方法体早
+     就发射出来了，只是没被挂上——只看"方法体对不对"会误判成已修好。
+   - 边界：只管**虚调用槽**；非虚调用走类级实例化路由。判定器：一条覆盖
+     "覆写体认自己的类型 / 两个实例互不干扰"的用例。
+24. **形参↔实参映射口径：接收者不是第 0 个形参**：
+   - 动作：泛型方法的类型实参推断里，`arg_base` 必须与发射端同口径：
+     `(recv_expr && m_static) ? 1 : 0`——只有"静态方法经实例表达式调用"时
+     接收者才占第 0 个实参；**实例方法的接收者是 `this`**，不是声明形参
+     之一。`try_method_spec` / `emit_method_spec_call` 本来就是这个口径。
+   - 理由：写成 `recv_expr ? 1 : 0` 时，实例泛型方法拿**接收者**去和形参类型
+     合一（形参 `Chan<T>` vs 接收者类，类型实参数对不上 → 一个都绑不上）→
+     绑定保持空 → `get_or_create_method_spec` 的
+     `if (!bind[i] || !type_is_concrete(bind[i])) return -1` 拦下 → 调用退化成
+     **擦除版** → 体内 `is T` 折成常量 false（静默错值）。
+   - 边界：静态方法按推断调用本来就是对的（`recv_expr` 为 NULL）——别把"泛型
+     方法推断"整族当坏的，**实例/静态要分开看**；显式类型实参永远对。
+     判定器：一条覆盖"实例推断 / 实例显式 / 静态推断 / 静态显式 / 两次推断
+     互不干扰"的用例。
+25. **没有装箱设施：值类型↔引用类型的转换必须报错**：
+   - 动作：Zan **没有装箱**，`object` 只能装引用。值类型 → `object` 的三条
+     路径都要拦：① checker 的 `checker_cast_is_valid`（`dst->kind == TYPE_OBJECT`
+     时来源必须是引用类型）；② lambda 体类型 vs 委托返回类型
+     （`check_no_boxing_conversion`，表达式体在 `emit_lambda_typed`，块体的
+     `return` 在 return 语句发射处且只在 `g->lambda_depth > 0` 时查）；
+     ③ 泛型特化里的强转（`emit_expr_cast_expr`——checker 阶段类型参数还
+     看不出来）。
+   - 理由：没拦住就是 `LLVMBuildIntToPtr`——`42` 变成指针 `0x2A`，之后任何
+     对象操作（ARC release 读头 / `is` 读 site 字）都在 `0x2A-16` 处读 →
+     **当场 access violation**（0xC0000005），退出时 ARC 再回收一次假对象 →
+     二次崩。lambda 那条还会先给出一个"非 null 的垃圾指针"，更难查。
+   - 边界：checker **不给 lambda 形参建类型**，也**不检查块形 lambda 的语句**
+     （lambda 分支直接 `return type_error`；`zan_checker_check_expr` 没有
+     `AST_BLOCK` 分支）——所以 lambda 的返回类型检查只能在 irgen 做。
+     `object → 具体类` 的下转照旧放行；真装箱（分配带类型描述符的堆对象）是
+     独立战线。
 
 ---
 
