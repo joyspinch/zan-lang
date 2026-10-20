@@ -132,3 +132,69 @@ python assets/brand/tools/compose.py
 `assets/zan.ico`（编译进 zanc 的默认 exe 图标）与 `assets/zan_ios_icon.png`
 由 `postprocess.py` 从 image2 图标原图产出。吉祥物原图为 AI 生成
 （gpt-image-2），prompt 权威存档在 `tools/prompts.md`；成品即权威资产。
+
+## 7. 资源清单与来源
+
+下面这份清单按**仓库里实际存在的文件**列：像素尺寸读自 PNG 头（IHDR）与
+SVG `viewBox`，不是估算；"引入提交"是 `git log --diff-filter=A` 查到的首个
+入库提交。
+
+### 7.1 矢量源（手绘几何路径 · 唯一权威）
+
+| 文件 | 画布 | 用途 | 引入提交 |
+|------|------|------|----------|
+| `logo/zan-mark.svg` | 512×512 | 主图标：Volt 渐变砖 + 白兔 + 金色火花 | `3f90649c` |
+| `logo/zan-mark-mono.svg` | 512×512 | 单色墨版（浅底/单色印刷） | `3f90649c` |
+| `logo/zan-mark-white.svg` | 512×512 | 全白剪影（深底） | `3f90649c` |
+| `logo/zan-wordmark.svg` | 640×320 | "zan" 圆角几何字标（墨） | `3f90649c` |
+| `logo/zan-wordmark-white.svg` | 640×320 | 字标（白） | `3f90649c` |
+| `logo/zan-logo-horizontal.svg` | 985×512 | 横排组合 | `3f90649c` |
+| `logo/zan-logo-horizontal-dark.svg` | 985×512 | 横排组合（深底） | `3f90649c` |
+| `logo/zan-logo-vertical.svg` | 640×796 | 竖排组合 | `3f90649c` |
+| `mascot/zanzi-glyph.svg` | 256×256 | 头标 glyph（符号阶梯最低档） | `8a25e2aa` |
+
+### 7.2 位图（PNG · 三类来源）
+
+**① 由矢量渲染**（`tools/render_pngs.py`：Edge 无头渲染 → 抠洋红底 →
+PIL 降采样，透明底）：`logo/png/` 下 `zan-mark-16/32/48/64/128/256/512`、
+`zan-mark-mono-256/512`、`zan-mark-white-512`、`zan-wordmark-640`、
+`zan-wordmark-white-640`、`zan-logo-horizontal-985`、
+`zan-logo-horizontal-dark-985`、`zan-logo-vertical-640`，以及
+`mascot/png/zanzi-glyph-32/64/128/256`。这批**可由 SVG 完全再生**。
+
+**② 由 AI 生成原图加工**（`tools/postprocess.py`：绿幕抠底 + 切尺寸）：
+`mascot/` 下 `zanzi-hero` 672×1024、`zanzi-run` 903×949、
+`zanzi-sleep` 976×877、`zanzi-cheer` 736×1024、`zanzi-code` 801×1008、
+`zanzi-avatar` 512×512、`zanzi-avatar-round` 512×512。原型为 gpt-image-2
+的 1024×1024 绿幕原图，prompt 权威存档在 `tools/prompts.md`；脚本幂等。
+
+**③ 脚本合成**（`tools/compose.py`，需 PIL）：`banner/zan-banner.png`
+1500×500（GitHub 横幅）、`banner/zan-palette.png` 1600×1180（色板总览卡）。
+
+### 7.3 品牌派生物（不在本目录，但同源）
+
+| 文件 | 大小 | 来源 | 引入提交 |
+|------|------|------|----------|
+| `assets/zan.ico` | 105,903 B | `postprocess.py` 从图标原图产出 | `da453a10`（2026-07-06） |
+| `assets/zan_ios_icon.png` | 60,423 B | 同上，iOS 图标 | `0169e32d`（2026-10-16） |
+| `assets/zan.rc` | 18 B | Windows 资源脚本（`1 ICON "zan.ico"`） | `da453a10`（2026-07-06） |
+
+### 7.4 仓库内消费点
+
+| 资源 | 谁在用 |
+|------|--------|
+| `assets/zan.ico` | `CMakeLists.txt:62` 的 `ZAN_DEFAULT_ICON` → 编译进 zanc，所有 zanc 产出的 exe 默认图标；`scripts/build_ide.ps1:192`、`build_gallery.ps1:41`、`build_gallery_single.ps1:73`、`build_charts.ps1:49` 的 `--icon`；`src/ide_zan/src/services/ZanIDE.Scaffold.zan:496` 给新项目脚手架复制；`scripts/stage_dev_toolchain.ps1:192` 随 dev toolchain 分发；`scripts/publish_ide.ps1:176` 进发布包 |
+| `assets/zan_ios_icon.png` | `CMakeLists.txt:63` 的 `ZAN_DEFAULT_IOS_ICON` |
+| `assets/zan.rc` | Windows 资源编译 |
+| 本目录下的 logo/吉祥物/横幅位图 | **仓库内暂无程序消费点**（对外物料）；`zan-site/` 用的是站点自带的 `zan-site/assets/mark.svg`，没有引用本包 |
+
+### 7.5 来源可追溯性
+
+- 品牌体系整体：`3f90649c`（2026-09-23 "Zan VI 体系上线"）；头标与符号
+  阶梯：`8a25e2aa`（同日"吉祥物重塑……矢量母版+符号阶梯"）。
+- `tools/prompts.md`、`tools/postprocess.py` 随 `7c71ecec`（2026-10-20）
+  纳入版本控制——脚本与 prompt 存档都在仓内，重建链不依赖外部凭据。
+- 尺寸的约束力分两类：①③（SVG 渲染 / 脚本合成）由脚本固定；②（AI 原图
+  加工）取决于原图与裁切，换 prompt 重新生成后像素可能变化——下游按
+  **文件名与用途**引用，别按具体像素写死布局。
+
