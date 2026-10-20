@@ -1,0 +1,89 @@
+using System;
+using System.Collections.Generic;
+
+// 泛型类里的依赖型 List<T>（T 是类的类型参数）必须按实例替换元素类型。
+//
+// 回归背景：泛型类的 `this.field` 此前**不做**类型实参替换，字段声明里
+// 的 List<T> 停在类型参数上。于是元素类型判成"擦除的指针"——结构体元素
+// 写进去的是临时对象的地址，读回来是野指针（实测 0xC0000005 崩溃）。
+// 指针大小的元素（引用类型）恰好蒙对，所以这个缺陷此前没被发现。
+public struct Vec2 {
+    public double x;
+    public double y;
+}
+
+// 泛型类持有依赖型 List<T>。
+public class Box<T> {
+    public List<T> items;
+    public List<int> tags;
+
+    public Box() {
+        this.items = new List<T>();
+        this.tags = new List<int>();
+    }
+
+    public void Add(T value, int tag) {
+        this.items.Add(value);
+        this.tags.Add(tag);
+    }
+
+    public T At(int index) {
+        return this.items[index];
+    }
+
+    public int Count() {
+        return this.items.Count;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string label, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static void CheckEqInt(string label, int actual, int expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected " + expected + " got " + actual);
+        }
+    }
+
+    static void Main() {
+        // 结构体元素：写入后必须原样读回。
+        Box<Vec2> b = new Box<Vec2>();
+        Vec2 v = new Vec2();
+        v.x = 1.5;
+        v.y = 2.5;
+        b.Add(v, 7);
+        CheckEqInt("count", b.Count(), 1);
+        Vec2 got = b.At(0);
+        Check("struct element x round-trip", got.x == 1.5);
+        Check("struct element y round-trip", got.y == 2.5);
+        CheckEqInt("parallel list", b.tags[0], 7);
+
+        // 多元素、顺序稳定。
+        b.Add(v, 8);
+        Vec2 second = b.At(1);
+        Check("second element round-trip", second.x == 1.5);
+        CheckEqInt("second tag", b.tags[1], 8);
+
+        // 引用类型元素：同样走替换后的类型。
+        Box<string> s = new Box<string>();
+        s.Add("hello", 1);
+        Check("reference element round-trip", s.At(0) == "hello");
+
+        // 泛型类的实例方法里通过 this 取字段也要拿到替换后的类型。
+        CheckEqInt("count through method", b.Count(), 2);
+
+        if (failures == 0) {
+            Console.WriteLine("ALL GENERIC DEPENDENT LIST TESTS PASSED");
+        } else {
+            Console.WriteLine("GENERIC DEPENDENT LIST FAILURES: " + Convert.ToString(failures));
+        }
+    }
+}

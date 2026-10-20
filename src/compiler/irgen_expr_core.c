@@ -398,7 +398,16 @@ static zan_type_t *member_access_field_type(zan_irgen_t *g, local_scope_t *local
     if ((obj->kind == AST_THIS_EXPR || obj->kind == AST_BASE_EXPR) &&
         g && g->current_type_sym) {
         zan_symbol_t *fsym = get_field_sym(g->current_type_sym, member->member.name);
-        if (fsym) return fsym->type;
+        /* 泛型类的 `this.field` 必须按当前实例替换类型实参：字段声明
+         * 里的 List<T> 在 Box<Pos> 里是 List<Pos>。不替换的话元素类型
+         * 停在类型参数上——按值语义退化成"存指针"，结构体元素写进去
+         * 的是临时对象的地址，读回来就是野指针（实测 0xC0000005）。 */
+        if (fsym) {
+            zan_type_t *ft = fsym->type;
+            if (ft && g->cur_inst) ft = subst_type_param_deep(g, ft, g->cur_inst);
+            if (ft && ft->kind == TYPE_TYPE_PARAM) ft = concretize(g, ft);
+            return ft;
+        }
     }
     {
         zan_type_t *ot = infer_expr_type(g, obj, locals);
