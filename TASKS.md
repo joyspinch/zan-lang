@@ -8,6 +8,24 @@
 
 ## 未完成
 
+### [ ] A438 一元 `operator-` / `operator+` 重载在非整型上被误编译成指针减法
+
+- 现象：`struct Vec { public int X; public static Vec operator -(Vec v) { return new Vec(-v.X); } }`，
+  写 `-a` 时编译失败：
+  `LLVM verification failed in main: Integer arithmetic operators only work with integral types!`
+  `%neg = sub %struct.Vec zeroinitializer, %load`
+  —— irgen 把一元重载当成了**内建整数减法**，对对象指针做了 `sub`。
+- 复现：`_scratch/unary_neg_overload.zan`（最小探针，一元 `operator-`）。
+- 根因：二元 `operator+`/`-` 有专门的 irgen 路径（见 `tests/conformance/operator_overload.zan`），
+  但**一元**重载复用了内建算术的 codegen 路径，没有区分「整型内建一元负号」
+  与「用户定义的一元重载」。
+- 方向：irgen 对一元 `operator-`/`operator+` 走用户重载的调用路径（receiver 作为
+  显式实参），不落到内建整数算术；同时补 `tests/conformance/` 用例覆盖
+  一元 `operator-`、一元 `operator+`（若支持）。
+- 影响面：任何在非整型上做一元运算重载的用户代码都无法编译；移植类工作
+  （如 OpenBW 的定点数 `operator-`）被迫改写成方法调用，属于绕路。
+- 关联：与 `operator_overload.zan` / `operator_relational.zan` 同族（重载覆盖���）。
+
 ### [ ] A419 依赖型泛型基类（`class V<T> : Plan<T>`）特化后字段偏移错位——运行期空引用
 
 - 现象：`SignupValidator : Validator<Signup>`，而 `Validator<T> : Plan<T>`。
