@@ -1028,3 +1028,32 @@
   两侧必须用**同一句**诊断拒绝同一个程序，光"都拒绝"不算对齐。
 - 遗留：宿主认识 `ReadOnlySpan`，自举还不认识（仍报 undefined type）——自举
   后端没有这个类型的布局，等 irgen/ngen 支持了再放开。
+### [x] A424 Task 形状的槽位只收任务句柄——自举把裸值塞进 `Task<T>` 也不报
+
+- 现象：`Task<double> t = Half(5.0);` 宿主报 `cannot convert 'double' to 'Task'
+  in initializer: no implicit conversion`（位置指向类型名 8:9），**自举接受**
+  ——自举会把一个 double 当成任务句柄写进槽位。
+- 根因：自举的检查器（`checker.zan`）只镜像了宿主 `checker.c` 的
+  `checker_check_assignable` 里 Task 相关的**一半**——"无结果句柄塞进
+  `Task<T>`"那条做了，"Task 槽位只收句柄"这条更基本的没做。
+- ✅ 已修（2026-10-20）：`CheckTaskOnlyHandle`——目标形状是 Task 而值的类型
+  不是 Task 时，报宿主那句诊断（目标拼 **'Task'，不带类型实参**；null 放行）。
+  覆盖变量声明的初始化式与 return 语句两处；顺带把这两处的诊断位置从 0:0
+  改成**类型的行列**（宿主指类型名，而自举的变量声明节点本来不记位置）。
+- 宿主口径（六个探针实测）：
+  - `Task<double> t = Half(5.0)` → 拒（'double' to 'Task' in initializer）；
+  - `Task t = 5` → 拒（'int' to 'Task' in initializer）；
+  - `Task<int> t = null` → **接受**（null 句柄还是句柄）；
+  - `Task<int> t = plain`（plain 是无结果句柄）→ 拒**另一条**（'Task' to
+    'Task<int>' ... carries no result），位置同样是类型名；
+  - 非 async 的 `Task<int> Bad() { return 5; }` → 拒（in return statement）；
+  - `Take(5)`（把裸值传给 Task 形参）→ 宿主**接受**（它不对实参查这条规则），
+    自举也接受 ✓。
+- 教训：镜像一条规则时把它**周围的规则**列一遍——缺口往往就在旁边那条。
+- 验证：六个探针逐字对齐（措辞 + 行列 + 条数）；差分门 39 passed / 0 gaps /
+  10 rejected / 0 failures；固定点门 g2.ll == g3.ll（18308944 bytes）。新增两个
+  reject 用例（task_slot_raw_value / task_return_raw_value），两侧同一句。
+- 插曲：这一轮固定点门第一次跑挂在「gen0 → gen1 failed (rc=Access violation)」——
+  原因是**并行的会话在 13:36:57 重建了 `build\zanc.exe`**（对方在改
+  `src/compiler/irgen.c`），门禁正好跑到被替换掉的二进制上。单独重跑即绿。
+  教训照旧：门禁期间不要有别的构建（AGENTS.md 规则 8）。
