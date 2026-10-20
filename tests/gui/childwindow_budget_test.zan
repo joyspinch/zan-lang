@@ -1,0 +1,202 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using Gui;
+using Gui.Widget;
+
+// 子窗口渲染预算与耗时告警回归（A422）。
+//
+// 背景：子窗是在**主线程的主帧内同步渲染**的，单帧总时长 ≈ Σ(各子窗
+// 渲染)。子窗一多、或某个子窗内容重（大表格/长列表），单帧就能顶过
+// Windows 的 5 秒未响应阈值——进程其实一直在跑、只是没泵消息，外部
+// 看就是"未响应"。
+//
+// 用例断言两件事：
+//   1) 预算：单帧渲染耗时超过预算后，剩余的脏子窗被推迟到下一帧；
+//      并且从下一个子窗继续（轮转，不饿死后面的子窗）。预算为 0 时
+//      回到"每帧全画"的旧行为。
+//   2) 告警：单个子窗渲染超过阈值时报一行
+//      UIWATCHDOG stall stage=child-window blocked=<ms>ms title=<标题>，
+//      格式与 UiWatchdog 一致（同一套 grep 规则）。
+//
+// 断言一律用**每帧增量**：子窗收到自己的窗口事件时会就地渲染一次
+// （RouteEvent 的交互路径，不受预算约束——用户点的那扇窗必须立刻
+// 出画），那一次不计入本帧预算的账。
+class SlowBox : Control {
+    static int[] paints = new int[3];
+    int tag;
+    int sleepMs;
+
+    SlowBox(int t, int ms) {
+        tag = t;
+        sleepMs = ms;
+        this.InitControl("slowbox", 0);
+    }
+
+    override void OnMeasure(App app) {
+        prefW = app.Scale(60);
+        prefH = app.Scale(40);
+    }
+
+    override void OnPaint(App app) {
+        // 模拟"重子窗"：绘制本身就很慢，把主帧顶住。
+        Thread.Sleep(sleepMs);
+        paints[tag] = paints[tag] + 1;
+        app.canvas.FillRect(bx, by, bw, bh, 0xFF00FF00);
+    }
+}
+
+class BudgetChild : ChildWindow {
+    int tag;
+
+    BudgetChild(int t) { tag = t; }
+
+    override string Title() { return "budget-child-" + "" + tag; }
+    override int Width() { return 200; }
+    override int Height() { return 150; }
+
+    void OpenSlow(App parent, int sleepMs) {
+        this.OpenHost(parent);
+        SlowBox box = new SlowBox(this.tag, sleepMs);
+        Panel root = Panel.Column() { Children = { box } };
+        root.Pad(0);
+        this.SetRoot(root, null);
+        this.Wire();
+        host.RequestRedraw();
+    }
+}
+
+class ChildWindowBudgetTest {
+    static int fails;
+    static string captured = "";
+    static int[] snap = new int[3];
+    static int warnSnap = 0;
+
+    static void EqInt(string what, long got, long want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + "" + got
+            + " want " + "" + want);
+    }
+
+    static void CheckBool(string what, bool value) {
+        if (value) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static bool StartsWith(string s, string prefix) {
+        if (s == null) { return false; }
+        if (s.Length < prefix.Length) { return false; }
+        return s.Substring(0, prefix.Length) == prefix;
+    }
+
+    static bool Contains(string s, string part) {
+        if (s == null) { return false; }
+        return s.Contains(part);
+    }
+
+    // 取本帧基线（事件泵可能已经就地画过一次，那次不算预算的账）。
+    static void Snapshot() {
+        for (int i = 0; i < 3; i = i + 1) { snap[i] = SlowBox.paints[i]; }
+        warnSnap = ChildWindows.SlowRenderCount();
+    }
+
+    // 本帧画了几次第 i 个子窗。
+    static int Painted(int i) { return SlowBox.paints[i] - snap[i]; }
+
+    // 本帧新增了几条耗时告警。
+    static int NewWarnings() { return ChildWindows.SlowRenderCount() - warnSnap; }
+
+    // 把三个子窗都标脏（下一帧都要画）。
+    static void DirtyAll(BudgetChild a, BudgetChild b, BudgetChild c) {
+        a.RequestRedraw();
+        b.RequestRedraw();
+        c.RequestRedraw();
+    }
+
+    static void Main() {
+        fails = 0;
+        captured = "";
+
+        // 预算 1ms：一个子窗画 30ms 就把预算吃光，其余推迟。
+        ChildWindows.SetRenderBudgetMs(1);
+        ChildWindows.SetSlowRenderWarnMs(5);
+        ChildWindows.SetSlowRenderSink(delegate (string msg) {
+            captured = captured + msg + "\n";
+        });
+
+        App parent = new App("cw-budget-test", 100, 100);
+        parent.Show();
+
+        BudgetChild c0 = new BudgetChild(0);
+        c0.OpenSlow(parent, 30);
+        BudgetChild c1 = new BudgetChild(1);
+        c1.OpenSlow(parent, 30);
+        BudgetChild c2 = new BudgetChild(2);
+        c2.OpenSlow(parent, 30);
+
+        // ---- ① 预算：只画第一个，其余推迟 ----
+        // 顺序要紧：先泵事件（子窗收到自己的窗口事件时会就地渲染一次，
+        // 那是交互路径，不受预算约束），再标脏、再取基线——否则那次
+        // 就地渲染会把脏标记吃掉，本帧的预算账就串了。
+        parent.PumpGuarded();
+        DirtyAll(c0, c1, c2);
+        Snapshot();
+        ChildWindows.PumpAll();
+        EqInt("frame1 paints first child", Painted(0), 1);
+        EqInt("frame1 defers second child", Painted(1), 0);
+        EqInt("frame1 defers third child", Painted(2), 0);
+        EqInt("frame1 deferred count", ChildWindows.LastDeferredCount(), 2);
+
+        // ---- ② 轮转：第二帧轮到第二个子窗（不饿死后面的）----
+        parent.PumpGuarded();
+        DirtyAll(c0, c1, c2);
+        Snapshot();
+        ChildWindows.PumpAll();
+        EqInt("frame2 paints second child", Painted(1), 1);
+        EqInt("frame2 still defers third child", Painted(2), 0);
+        EqInt("frame2 does not repaint first child", Painted(0), 0);
+
+        // ---- ③ 第三帧轮到第三个 ----
+        parent.PumpGuarded();
+        DirtyAll(c0, c1, c2);
+        Snapshot();
+        ChildWindows.PumpAll();
+        EqInt("frame3 paints third child", Painted(2), 1);
+
+        // ---- ④ 耗时告警：每个画过的子窗都超了 5ms 阈值 ----
+        EqInt("one warning per rendered child", NewWarnings(), 1);
+        CheckBool("warning prefix",
+            StartsWith(captured, "UIWATCHDOG stall stage=child-window blocked="));
+        CheckBool("warning carries title",
+            Contains(captured, "title=budget-child-"));
+        CheckBool("warning reports ms", Contains(captured, "ms title="));
+        CheckBool("last render cost recorded",
+            ChildWindows.LastRenderMs() >= 5);
+
+        // ---- ⑤ 预算 0 = 不限：回到"每帧全画" ----
+        ChildWindows.SetRenderBudgetMs(0);
+        parent.PumpGuarded();
+        DirtyAll(c0, c1, c2);
+        Snapshot();
+        ChildWindows.PumpAll();
+        EqInt("unlimited budget paints first child", Painted(0), 1);
+        EqInt("unlimited budget paints second child", Painted(1), 1);
+        EqInt("unlimited budget paints third child", Painted(2), 1);
+        EqInt("nothing deferred when budget is unlimited",
+            ChildWindows.LastDeferredCount(), 0);
+
+        // ---- ⑥ 恢复默认出口与阈值 ----
+        ChildWindows.SetSlowRenderSink(null);
+        ChildWindows.SetSlowRenderWarnMs(0);
+        ChildWindows.SetRenderBudgetMs(50);
+        EqInt("warn threshold cleared", ChildWindows.SlowRenderWarnMs(), 0);
+        EqInt("budget restored", ChildWindows.RenderBudgetMs(), 50);
+
+        c0.Close();
+        c1.Close();
+        c2.Close();
+        Console.WriteLine(fails == 0 ? "OK" : "FAILS " + "" + fails);
+    }
+}

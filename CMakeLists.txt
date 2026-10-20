@@ -3257,6 +3257,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_childwindow_shape${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 子窗口渲染预算与耗时告警回归（A422）：子窗在主帧内同步渲染，单帧
+  # 总时长 ≈ Σ(各子窗渲染)，子窗一多就能把 UI 线程顶过 Windows 的
+  # 5 秒未响应阈值。用例断言预算用尽后剩余脏子窗被推迟到下一帧、
+  # 且从下一个子窗轮转（不饿死），以及超阈值时报出
+  # "UIWATCHDOG stall stage=child-window ..." 一行。
+  add_test(NAME conformance_gui_childwindow_budget
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/childwindow_budget_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_childwindow_budget.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_childwindow_budget${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # 关闭最大化按钮的窗口：双击标题栏与 SC_MAXIMIZE 必须断路（App
   # 把按钮状态登记给外壳 SetMaximizable）。NC 消息与系统命令是
   # Win32 概念，用例投递真实消息后同步泵掉，仅 Windows 注册。

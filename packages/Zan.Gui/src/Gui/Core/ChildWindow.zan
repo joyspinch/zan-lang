@@ -16,6 +16,10 @@ public class ChildWindow {
     bool destroyed;
     int idBase;
     Action renderCb;
+    // 本帧该子窗的渲染耗时（微秒）。没渲染（不脏）时为 0。
+    // ChildWindows 的单帧预算按它累计：超预算就把剩下的子窗留给
+    // 下一帧，别让子窗把主帧顶死。
+    long lastRenderUs = 0;
     // 绑定快照旁表：SyncFromNode 记录"模型侧确认的控件值"，
     // SyncChangedNode 据此判断用户是否编辑过。
     List<ChildBoundSnapshot> boundSnapshots;
@@ -904,7 +908,22 @@ public class ChildWindow {
     }
 
     void Render() {
+        this.lastRenderUs = 0;
         if (!this.NeedsRedraw()) { return; }
+        long t0 = Stopwatch.GetMicroseconds();
+        this.RenderContent();
+        long us = Stopwatch.GetMicroseconds() - t0;
+        this.lastRenderUs = us;
+        // 单个子窗就慢到能顶掉一帧（甚至几帧）时自己报出来：告警格式
+        // 与 UiWatchdog 一致，同一套 grep 规则就能捞出"谁把帧堵死了"。
+        ChildWindows.ReportRenderCost(this, (int)(us / 1000));
+    }
+
+    // 本帧该子窗的渲染耗时（微秒）。
+    long LastRenderUs() { return this.lastRenderUs; }
+
+    // 真正的绘制（Render 的计时包装之外的部分）。
+    void RenderContent() {
         int saved = WidgetId.SeqValue();
         WidgetId.SetSeq(idBase);
         if (renderCb != null) {

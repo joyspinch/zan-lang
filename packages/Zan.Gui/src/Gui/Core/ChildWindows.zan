@@ -22,6 +22,64 @@ public class ChildWindows {
     // 槽归应用 shell 注册的共享选择器所有（IDE 的 pathPicker）；这批
     // 由组件按需登记，数量不限。PumpAll/RouteEvent/Wants 统一照顾两处。
     static List<IModalWindow> pickers;
+    // 单帧内**子窗渲染**的总预算（毫秒）。0 = 不限。
+    //
+    // 为什么需要：子窗是在**主线程的主帧内同步渲染**的，单帧总时长
+    // ≈ Σ(各子窗渲染)。子窗一多、或某个子窗内容重（大表格/长列表），
+    // 单帧就能顶过 Windows 的 5 秒未响应阈值——进程其实一直在跑、
+    // 只是没泵消息，外部看就是"未响应"。预算用满就把剩下的脏子窗
+    // 留给下一帧：宁可晚一帧出画，也不能让 UI 线程在主帧里连续堵住
+    // 几秒。默认 50ms：正常规模（20 个子窗 × 4ms ≈ 80ms）会被削到
+    // 一帧 50ms，主窗口拿回自己的帧预算；单个重子窗仍可能超预算，
+    // 那种由耗时告警点名（见 ReportRenderCost）。
+    static int renderBudgetMs = 50;
+    // 单个子窗渲染的耗时告警阈值（毫秒）。0 = 不告警。
+    static int slowRenderWarnMs = 200;
+    // 告警出口：非空时消息交给它（测试/宿主自接管），不再打控制台。
+    static ActionT<string> slowSink = null;
+    // 轮转游标：预算用尽时从下一个子窗继续，保证没有子窗被饿死。
+    static int renderCursor = 0;
+    // 统计：最近一次子窗渲染耗时（毫秒）、超阈值告警次数、最近一帧
+    // 因预算用尽而推迟的子窗数。
+    static int lastRenderMs = 0;
+    static int slowRenderCount = 0;
+    static int lastDeferred = 0;
+
+    // 单帧子窗渲染总预算（毫秒）。0 = 不限（回退到"每帧全画"）。
+    public static void SetRenderBudgetMs(int ms) {
+        ChildWindows.renderBudgetMs = ms < 0 ? 0 : ms;
+    }
+    // 当前单帧子窗渲染预算（毫秒）。
+    public static int RenderBudgetMs() { return ChildWindows.renderBudgetMs; }
+    // 单个子窗渲染的耗时告警阈值（毫秒）。0 = 不告警。
+    public static void SetSlowRenderWarnMs(int ms) {
+        ChildWindows.slowRenderWarnMs = ms < 0 ? 0 : ms;
+    }
+    // 当前耗时告警阈值（毫秒）。
+    public static int SlowRenderWarnMs() { return ChildWindows.slowRenderWarnMs; }
+    // 接管告警出口（传 null 恢复打控制台）。
+    public static void SetSlowRenderSink(ActionT<string> s) { ChildWindows.slowSink = s; }
+    // 最近一次子窗渲染耗时（毫秒）。
+    public static int LastRenderMs() { return ChildWindows.lastRenderMs; }
+    // 超阈值告警累计次数。
+    public static int SlowRenderCount() { return ChildWindows.slowRenderCount; }
+    // 最近一帧因预算用尽而推迟的子窗数。
+    public static int LastDeferredCount() { return ChildWindows.lastDeferred; }
+
+    // 子窗渲染耗时记账 + 超阈值告警。告警格式与 UiWatchdog 一致，
+    // 同一套 grep 规则就能把"谁把帧堵死了"捞出来。
+    static void ReportRenderCost(ChildWindow w, int ms) {
+        ChildWindows.lastRenderMs = ms;
+        int warn = ChildWindows.slowRenderWarnMs;
+        if (warn <= 0 || ms < warn) { return; }
+        ChildWindows.slowRenderCount = ChildWindows.slowRenderCount + 1;
+        string title = "";
+        if (w != null) { title = w.Title(); }
+        string msg = "UIWATCHDOG stall stage=child-window blocked=" + "" + ms
+            + "ms title=" + title;
+        if (ChildWindows.slowSink != null) { ChildWindows.slowSink(msg); return; }
+        Console.WriteLine(msg);
+    }
 
     // 注册表（惰性创建）。
     static List<ChildWindow> All() {
@@ -215,9 +273,7 @@ public class ChildWindows {
     static void PumpAll() {
         int now = Window.GetTickMs();
         ChildWindows.TickDue(now);
-        foreach (ChildWindow w in ChildWindows.All()) {
-            if (w.IsOpen()) { w.Render(); }
-        }
+        ChildWindows.PumpChildren();
         if (ChildWindows.picker != null) {
             if (ChildWindows.picker.IsOpen() && ChildWindows.picker.NeedsRedraw()) {
                 ChildWindows.picker.RenderWindow();
@@ -233,6 +289,46 @@ public class ChildWindows {
         }
         ChildWindows.Prune();
         ChildWindows.PrunePickers();
+    }
+
+    // 渲染所有开着的子窗，但**单帧总时长受预算约束**：预算用尽就把
+    // 剩下的脏子窗留给下一帧（它们仍然是脏的，下一帧继续画），并从
+    // 下一个子窗起轮转，保证没有子窗被饿死。
+    //
+    // 预算只约束"这一帧画多少个子窗"，切不开单个子窗自己的渲染——
+    // 单个子窗就慢到 3 秒的情形由耗时告警点名（ReportRenderCost）。
+    static void PumpChildren() {
+        List<ChildWindow> all = ChildWindows.All();
+        int n = all.Count;
+        ChildWindows.lastDeferred = 0;
+        if (n == 0) { return; }
+        int start = ChildWindows.renderCursor;
+        if (start < 0 || start >= n) { start = 0; }
+        // 用 long 乘：毫秒→微秒的乘法在 int 里会溢出成一个负数，
+        // 负预算会被 `budgetUs > 0` 判成"不限"，把上限悄悄弄丢。
+        long budgetUs = (long)ChildWindows.renderBudgetMs * 1000;
+        long spentUs = 0;
+        bool deferred = false;
+        for (int k = 0; k < n; k = k + 1) {
+            int i = (start + k) % n;
+            ChildWindow w = all[i];
+            if (w == null || !w.IsOpen()) { continue; }
+            if (budgetUs > 0 && spentUs >= budgetUs) {
+                // 预算用尽：剩下的子窗留给下一帧，从当前这个接着画。
+                ChildWindows.renderCursor = i;
+                int left = 0;
+                for (int j = k; j < n; j = j + 1) {
+                    ChildWindow rest = all[(start + j) % n];
+                    if (rest != null && rest.IsOpen()) { left = left + 1; }
+                }
+                ChildWindows.lastDeferred = left;
+                deferred = true;
+                break;
+            }
+            w.Render();
+            spentUs = spentUs + w.LastRenderUs();
+        }
+        if (!deferred) { ChildWindows.renderCursor = 0; }
     }
 
     // deadline).

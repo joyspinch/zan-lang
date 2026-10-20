@@ -910,7 +910,7 @@
   返回值"。用例 `tests/conformance/lambda_value_return.zan`（进了差分门）。
 - 教训：**"措辞不同"先查更早的层**——宿主报专属诊断、自举报泛化诊断时，先
   确认自举是不是在更早的检查里就拒了它。
-### [ ] A422 子窗口在**主帧内同步**渲染且无时间预算——子窗一多整帧被拖住，Windows 判未响应
+### [x] A422 子窗口在**主帧内同步**渲染且无时间预算——子窗一多整帧被拖住，Windows 判未响应
 
 - 现象：桌面应用"很多子窗口都未响应"。实测一个多窗口应用（oneplus）在 20 个
   子窗全开时帧耗时随子窗数**线性增长**；旧基线（写于旧产物、旧探针格式）显示
@@ -932,3 +932,55 @@
   别让一个重子窗独占整帧；② 每个子窗渲染计时，超阈值打一行告警（哪个窗口、
   多久），让"未响应"自带证据而不是靠猜；③ 子窗内容重时走局部重绘，别每帧
   全量 Measure/Render。
+- ✅ 已修（2026-10-20）：① `ChildWindows` 新增**单帧子窗渲染总预算**
+  （`SetRenderBudgetMs`，默认 50ms，0=不限）+ **轮转游标**（预算用尽从下一个
+  子窗接着画，推迟不饿死——实测 25 帧内每个子窗至少被画到 2 次）；② `ChildWindow.Render`
+  拆成"计时包装 + 实际绘制"，单个子窗超阈值（`SetSlowRenderWarnMs`，默认 200ms）
+  报 `UIWATCHDOG stall stage=child-window blocked=<ms>ms title=<标题>`，出口可由
+  `SetSlowRenderSink` 接管。实测 20 个重子窗（每个绘制 30ms+）：单帧从 **1468ms
+  降到 66ms**，17 个推迟。
+- 边界（随修复一起记）：预算只约束"空闲泵"这条路径——子窗收到**自己的窗口
+  事件**时会就地渲染一次（交互路径：用户点的那扇窗必须立刻出画），不在预算内；
+  预算也切不开**单个**子窗自己的渲染，单窗就慢到秒级时靠耗时告警点名。
+- 回归：`tests/gui/childwindow_budget_test.zan`（预算推迟/轮转公平/告警格式/
+  预算 0 回退旧行为）+ `tests/conformance/gui_childwindow_budget.out`，
+  ctest `conformance_gui_childwindow_budget` 通过；`conformance_gui_childwindow_shape`
+  / `conformance_gui_form_dynamic` / `conformance_gui_html_runtime` /
+  `conformance_gui_html_runtime_cjk` / `conformance_gui_upload` 一并复跑无回归。
+### [x] A423 自举的类型诊断措辞/位置和宿主对不上——"unknown type" vs "undefined type"，位置停在 0:0
+
+- 现象：`Undefined x = null;` 宿主报 `undefined type 'Undefined'` 并指向类型名
+  （6:9），自举报 `unknown type 'Undefined'` 且**位置 0:0**（类型节点没记位
+  置）。泛型实参个数更是各说各话：宿主
+  `using the generic type 'List' requires 1 type arguments (got 2)`，自举是自造
+  的 `Task takes at most one type argument`；基类同理（宿主
+  `undefined base type 'X'`，自举 `unknown base type 'X'`）。
+- 根因：自举的类型解析（`src/selfhost/checker.zan` 的 `CheckType`）是照着
+  "能判出类型名就行"写的，没照宿主 `binder.c` 的 `binder_resolve_type` 三步
+  （找基类型 → 查实参个数 → 逐个解析实参）走；`parser.zan` 的 `ParseType`
+  也没把类型名的行列记进类型节点。
+- ✅ 已修（2026-10-20）：
+  1. `parser.zan`：`ParseType` / `ParseTypeNoArray` 记下类型名自己的行列，
+     `ParseClass` 另记基类名的行列（`ast.zan` 的 `Node` 加
+     `baseLine`/`baseCol`）；`new` 表达式与 `out T x` 的合成类型节点也补位置。
+  2. `checker.zan`：`CheckType` 拆成 `TypeDiags`（照宿主三步走，只收集诊断
+     不直接报），措辞换成宿主原文：`undefined type 'X'` /
+     `using the generic type 'X' requires N type arguments (got M)` /
+     `the non-generic type 'X' cannot be used with type arguments` /
+     `undefined base type 'X'`。
+  3. **签名类型报两遍**：宿主把方法签名（返回类型 + 参数类型）解析两遍
+     （binder 一遍、checker 在方法作用域里再一遍），同一个坏签名会报两条诊断；
+     自举照抄（`CheckSignatureType`）。
+- 实参个数的三档口径（宿主 `binder.c`）：内建泛型 List/Span/ReadOnlySpan/Task
+  收 1 个、Dict/Dictionary 收 2 个；用户泛型类/结构/接口按声明的类型参数个数
+  （**可以是 0**，此时措辞是 "requires 0 type arguments"）；枚举与具名委托是
+  "the non-generic type" 那一档。**Func/Action 不查个数**——宿主在作用域查找
+  之前就把它们当内建委托类型（标准库里 `delegate TResult Func<TResult>();`
+  的声明被遮住）；自举照做时踩过一次：一度把 `Func<int,int>` 判成
+  "requires 1 type arguments (got 2)"，差分门里两个闭包用例当场炸掉。
+- 验证：11 个探针逐字对齐（措辞 + 行列 + 报告条数）；差分门 37 passed /
+  **0 gaps** / 7 rejected / 0 failures；固定点门 g2.ll == g3.ll（18292974
+  bytes）。差分门的 reject 用例新增第三段（`name|||自举子串|||宿主子串`）：
+  两侧必须用**同一句**诊断拒绝同一个程序，光"都拒绝"不算对齐。
+- 遗留：宿主认识 `ReadOnlySpan`，自举还不认识（仍报 undefined type）——自举
+  后端没有这个类型的布局，等 irgen/ngen 支持了再放开。
