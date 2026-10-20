@@ -190,4 +190,17 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      文件早就写了这一行。
    - 边界：同名类分处不同命名空间时，先确认 import 的是哪一个；内建表的签名
      按硬件原语那份算，名字解析归 `using`，两套机制不要互相推断。
+6. **把成员收窄成 private 之前，先按"族"核对公开面**：
+   - 动作：可见性规范化（批量补显式修饰符）收窄成员时，判定基准是
+     **同族成员**（同一类里其它同角色成员）＋**用例的静态直调**；凡是用例以
+     `Cls.Member(...)` 形式直接调用、且该成员是自足工具（不依赖外部状态）的，
+     就是公开面的一部分，应保持 public。
+   - 理由：规范化曾把 38 个这类成员收成 private，**22 条 conformance 用例直接
+     编译失败**——红灯藏在编译错误里，看起来像"用例坏了"，其实是公开面被误收。
+     铁证：`WechatReply.Text` 被收窄而同族 `Image`/`NewsItem`/`News`/`Build`
+     全是 public；`MySqlConnection.readBinValue` 被收窄而
+     `MySqlSyncConnection.readBinValue` 本来就是 public（无修饰符=public）。
+   - 边界：默认可见性是 public（无修饰符即 public），显式 `private` 才是收窄——
+     规范化的目的是让可见性**显式可读**，不是顺手收紧 API；收窄前先问"这条成员
+     有没有对外服务的义务"，而不是"它原来有没有 public 关键字"。
 

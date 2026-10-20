@@ -516,3 +516,46 @@
   `@zan_rt_dbl_str` 再包成托管串），`ToCStr` 与 `Console.WriteLine` 的
   double 分支都改走它；`builtin_surface` 用例里 `acos=1.5707963267948966`
   与宿主逐字一致。
+
+### [ ] A408 HTTP/2 帧 API 在仓库里根本不存在——三个类型一个都找不到
+
+- 现象：`conformance_http2_frame_test` 与 `conformance_protocol_audit_harden`
+  的 http2 段编译失败，报 `cannot resolve member 'REFUSED_STREAM'` /
+  `'CANCEL'`，并最终 `error: code generation failed`。
+- 事实：全仓 grep（stdlib + packages + tests）**找不到** `Http2Frame`、
+  `Http2Error`、`Http2FrameType` 任何一个类型的定义——用例引用的是尚不存在的
+  API，不是"被收窄"（与 A39x 系列的可见性误伤不同类）。
+- 方向：(1) 实现 HTTP/2 帧编解码最小集（帧头 9 字节 + RST_STREAM 构造 +
+  帧类型枚举 + 错误码枚举）并让两个用例引用它；(2) 若判定 HTTP/2 不在本期范围，
+  把两处用例的 http2 段摘掉并把帧 API 登记为未实现（与 A381 的清单同口径）。
+- ⚠ 不要用"给用例补个桩类型"绕过：那是让用例测一个假实现。
+
+### [ ] A409 X509 证书匹配"无 SAN 时回退 CN"与用例口径不符
+
+- 现象：`conformance_x509_certificate` 其余 20+ 项检查全绿，只有一项红：
+  `FAIL Fallback to CN when no SAN`（程序 exit=1，failures=1）。
+- 事实：用例钉的是"证书没有 SAN DNS 时回退到 Subject CN 匹配主机名"；现代
+  实现按 RFC 6125 已经**不再回退 CN**（浏览器也早已弃用），所以这条差异是
+  **规范口径变化**而非实现 bug。
+- 方向：(1) 实现 CN 回退（并写清是兼容旧证书的宽松路径）；(2) 认定 RFC 6125
+  口径正确，改用例 + `docs/STDLIB.md` 记明"不回退 CN"；倾向 (2)——安全语义
+  上不回退才是对的，但要让口径在文档与用例里一致。
+
+### [ ] A410 MVC 菜单有条目的 icon 解析为空
+
+- 现象：`conformance_web_menu_attrs` 输出与基准差两处：期望
+  `icon=mdi:antenna`，实际 `icon=-`（文章 `/admin/menuposts`、首页 `/menuhome`
+  两条），其余字段（active/路径/标题）都对。
+- 方向：查菜单元数据 → 图标名映射这条链路（`MenuBuilder` / 菜单元数据的
+  icon 字段来源），定位为什么这两条的 icon 落空而"账号"那条正常。
+
+### [ ] A411 `conformance_clipboard_roundtrip` 在无交互窗口站点的会话里恒红
+
+- 现象：用例输出 `clip-ok: 0`（`bad != 0`），其余 19 条全绿。
+- 根因：**环境**——本会话没有交互窗口站点的剪贴板，实测 PowerShell
+  `Set-Clipboard` 返回成功但 `Get-Clipboard` 读回空串；用例第一步
+  `Clipboard.GetText()` 之后的每一次读写都落在同一个坏剪贴板上。
+  注意同批的 `conformance_clipboard_uri_roundtrip` 是绿的——它只测
+  `FileUri`/`PathFromUri` 编解码，不真碰剪贴板。
+- 方向：用例前置判定剪贴板可用（不可用就跳过并打印 skip 理由），否则在
+  CI/agent/无桌面会话的机器上恒红；真要在无头环境测，得走可注入的剪贴板后端。
