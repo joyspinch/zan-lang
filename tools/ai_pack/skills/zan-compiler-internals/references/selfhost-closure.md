@@ -1350,6 +1350,52 @@ kernel32、shell32、user32、advapi32、version）。
   访问不报错，自举就不能报；报了就等于比宿主更严，把宿主接受的程序拒了。
 - 边界：这套解决的是**方法级**。泛型**类**的方法体仍然是共享的一份，类自己的
   类型参数在体里拿不到具体实参（`this.item` 里的 `item` 还是 `T`）——那要类级
-  单态化（宿主 `irgen_generics.c` 的 `generic_insts` + `find_generic_fn`）。自举的
-  **ngen 后端**已经有一版类级单态化（`ngen.zan` 的 `SpecRegister` /
-  `SpecRegisterClass` / `RegisterInstCls`），要搬到 LLVM 后端可以照它设计。
+  单态化，见 §69。自举的 **ngen 后端**已经有一版类级单态化（`ngen.zan` 的
+  `SpecRegister` / `SpecRegisterClass` / `RegisterInstCls`），搬到 LLVM 后端就是
+  照它设计的。
+
+## 69. 类级单态化：类的类型参数要从**接收者的静态类型**里绑出来
+
+- 坑（实测）：泛型**类**的方法体是共享的一份**擦除体** → 体里
+  `this.item` 的类型还是 `T`（不是 `string`），方法级单态化管不着（它只绑方法
+  自己的类型参数）。宿主是连**类的类型参数**一起单态化（`irgen_generics.c` 的
+  `generic_insts` + `find_generic_fn`）→ 每个实例化一份方法体。
+- 做法（`irgen_expr.zan` 的 `EmitInstanceCall`）：接收者静态类型带了具体类型实参
+  （`Pool<string>` 的 kids 数量 == 类的类型参数数量）时，把**类的类型参数**绑成
+  这些实参，与方法自身的类型参数**合并成一次克隆**（不是两次——两次会克隆出两个
+  体，符号还会撞）。克隆体的 `this` 静态类型 = 具体实例化（`Pool<string>`）→
+  体里的字段读回才有真实值类型。
+- 坑（实测）：克隆体和普通体在同一个队列里，符号名是
+  `Owner_Method__SP<tag>`。类级和方法级若参数列表相同 → 同一 tag → 抢同一符号
+  → **先注册的体赢**，后面所有调用点都打到错的体上。修法：tag 加前缀区分类级
+  （`"I"`）与方法级（`""`）。
+- 坑（实测）：`this` 的静态类型不是 `curClass`，而是"当前发射的方法的
+  接收者类型"。引入 `CurThisTy()`（`curThisTy` 字段，默认 `MkType(curClass)`），
+  克隆体发射期间由 drain 循环设成 `specThis[sp]`（**保存/恢复**，否则后续普通
+  方法会继承克隆体的 `this` 类型）。
+- 边界：类级克隆只对**本类自己声明**的方法做（`owner == clsName`）。继承来的方法
+  （基类没有类型参数）不需要克隆；**虚方法不克隆**——vtable 指向未特化的定义，
+  克隆体不会被虚调用到，克隆了是死代码。
+- 门禁：`generic_param_shape_overload` / `generic_field_33` 由 DIFF 转 MATCH。
+
+## 70. async 方法的函数类型**恒**返回协程帧指针（`async void` 也不例外）
+
+- 坑（实测）：`MethodFnTypeThis` 用**声明的**返回类型 → `async void`
+  的函数类型是 `void (%Pool*)`，而**定义**返回的是协程帧 `i8*` → vtable 项与定义
+  的类型不一致；而且 await 拿不到帧指针 → "this operand is not lowered as a
+  coroutine frame"。
+- 口径：async 方法的函数**恒**返回 `i8*`（帧指针），与声明的返回类型无关；
+  `async int` 的结果在帧里，不在返回值里。
+- 连带坑：`EmitVirtualCall` 里 async 判断必须**在** void 分支之前，否则虚调用
+  `async void` 方法时帧指针被吞掉。
+- 门禁：`async_interface` 用例（async void 经接口虚调用）。
+
+## 71. 泛型类型作形参类型：parser 的"定形"前瞻要扫平衡尖括号
+
+- 坑（实测）：`using (ConcurrentDictionary<string, int> cd = ...)` 报
+  "syntax error: unexpected ','"。`LooksLikeTypedParam` 的前瞻只认 `ident ident`，
+  遇到 `Name<...> name` 就判成表达式 → 把 `Name<` 当比较表达式解析 → 在 `,` 上炸。
+- 做法：前瞻里跳过**平衡的**尖括号组（`<` / `>` / `>>` 一起计数），再看后面是不是
+  标识符。表达式 `a < b` 会跑出角括号组 → 找不到名字 → 仍读作表达式。
+- 通用教训：凡是"扫两个 token 判断形状"的前瞻，遇到**带参数的语法**都要扩；否则
+  新语法一加就误判（这类坑在自举里反复出现：泛型类型参数、类型实参、where 子句）。

@@ -15,7 +15,7 @@ partial class Irgen {
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
         if (k == AK.StringLit()) { return GenStr(e.sval); }
         if (k == AK.NullLit()) { return new ExprVal("null", MkType("object")); }
-        if (k == AK.ThisExpr()) { return new ExprVal("%this", MkType(curClass)); }
+        if (k == AK.ThisExpr()) { return new ExprVal("%this", CurThisTy()); }
         if (k == AK.Ident()) { return GenIdent(e); }
         if (k == AK.Unary()) { return GenUnary(e); }
         if (k == AK.PostfixUnary()) { return GenPostfix(e); }
@@ -47,6 +47,14 @@ partial class Irgen {
         return new ExprVal("0", MkType("int"));
     }
 
+    // The receiver's static type in the method being emitted: the concrete
+    // instantiation for a specialized clone of a generic class
+    // (`Pool<string>`), the class itself otherwise.
+    Node CurThisTy() {
+        if (curThisTy != null) { return curThisTy; }
+        return MkType(curClass);
+    }
+
     ExprVal GenIdent(Node e) {
         int li = LocalIdx(e.sval);
         if (li >= 0) {
@@ -72,7 +80,7 @@ partial class Irgen {
         if (curHasThis) {
             Node cls = binder.FindType(curClass);
             if (cls != null && FieldIndex(cls, e.sval) >= 0) {
-                return LoadField("%this", MkType(curClass), e.sval);
+                return LoadField("%this", CurThisTy(), e.sval);
             }
             if (cls != null) {
                 Node g = FindMethodUp(cls, "get_" + e.sval);
@@ -85,7 +93,7 @@ partial class Irgen {
                         sc.line = e.line; sc.col = e.col;
                         return EmitStaticCall(curClass, "get_" + e.sval, sc);
                     }
-                    ExprVal recv = new ExprVal("%this", MkType(curClass));
+                    ExprVal recv = new ExprVal("%this", CurThisTy());
                     return EmitInstanceCall(recv, curClass, "get_" + e.sval, new Node(AK.Call()));
                 }
             }
@@ -1391,7 +1399,7 @@ partial class Irgen {
                     StoreField("%this", curClass, lhs.sval, v);
                     return;
                 }
-                if (cls != null && EmitPropSet("%this", MkType(curClass), lhs.sval, v)) { return; }
+                if (cls != null && EmitPropSet("%this", CurThisTy(), lhs.sval, v)) { return; }
             }
             if (curClass != "") {
                 Node scls = binder.FindType(curClass);
@@ -3295,7 +3303,7 @@ partial class Irgen {
     ExprVal ThisReceiver() {
         int li = LocalIdx("this");
         if (li >= 0) { return GenIdent(MkIdent("this")); }
-        return new ExprVal("%this", MkType(curClass));
+        return new ExprVal("%this", CurThisTy());
     }
 
     // copy delegate parameter/return types onto a lambda's params + return slot
@@ -4412,7 +4420,7 @@ partial class Irgen {
                 Node cls = binder.FindType(curClass);
                 Node bm = FindMethodUp(cls, name);
                 if (bm != null && !IsStatic(bm)) {
-                    ExprVal recv = new ExprVal("%this", MkType(curClass));
+                    ExprVal recv = new ExprVal("%this", CurThisTy());
                     return EmitInstanceCall(recv, curClass, name, e);
                 }
                 // delegate-typed field invoked without `this.`
@@ -5156,7 +5164,18 @@ partial class Irgen {
     // encoding both the concrete type arguments and the declared param shapes
     // (so same-name overloads specialize to distinct symbols)
     string SpecTag(Node m, List<string> mtps, List<string> tns, List<Node> trs) {
+        return SpecTagP(m, mtps, tns, trs, "");
+    }
+
+    // The same tag, with a prefix that separates the two kinds of
+    // specialization: a method's own type parameters ("" ) and a generic
+    // CLASS's type parameters ("I"). Without the prefix a class-level clone
+    // and a method-level clone of the same method with the same argument
+    // would claim one symbol -- and the first registered body would win
+    // every call site.
+    string SpecTagP(Node m, List<string> mtps, List<string> tns, List<Node> trs, string prefix) {
         StringBuilder sb = new StringBuilder();
+        sb.Append(prefix);
         int i = 0;
         while (i < mtps.Count) {
             int hit = IndexOfStr(tns, mtps[i]);
@@ -5178,6 +5197,14 @@ partial class Irgen {
     // queue (once) a specialized clone of `m` under owner and return the
     // specialized symbol; the drain loop in Gen emits the bodies
     string SpecQueue(string owner, Node m, List<string> tns, List<Node> trs, string tag) {
+        return SpecQueueTy(owner, m, tns, trs, tag, null);
+    }
+
+    // The same, with the receiver's static type of the clone: a clone of a
+    // generic class's method carries the concrete instantiation
+    // (`Pool<string>`), so a field read inside it resolves the real value
+    // type instead of the erased one.
+    string SpecQueueTy(string owner, Node m, List<string> tns, List<Node> trs, string tag, Node thisTy) {
         string sname = m.sval + "__SP" + tag;
         string sym = owner + "_" + sname;
         if (IndexOfStr(specSyms, sym) < 0) {
@@ -5187,6 +5214,7 @@ partial class Irgen {
             clone.sval = sname;
             specMs.Add(clone);
             specClss.Add(binder.FindType(owner));
+            specThis.Add(thisTy);
         }
         return sym;
     }
@@ -5310,17 +5338,43 @@ partial class Irgen {
         // concrete type arguments gets a specialized body, so the body sees
         // the concrete types (`c.Name()` where `c` is `T` becomes a call on
         // the concrete class) and the call's result keeps its real type.
+        //
+        // CLASS-level monomorphization: a method of a generic class, called
+        // on a receiver whose static type carries the concrete type
+        // arguments (`Pool<string>`), gets a specialized body too -- the
+        // class's own type parameters are bound to those arguments, so a
+        // field read inside the body (`this.item`) has the real value type.
         bool spec = false;
         List<string> stns = new List<string>();
         List<Node> strs = new List<Node>();
         if (m != null && CanSpecialize(m)) {
             List<string> mtps = TParams(m);
+            List<string> ctps = TParams(cls);
+            bool clsSpec = false;
+            // only a method declared by the generic class ITSELF: an
+            // inherited one lives in a base class that has no type
+            // parameters, and a virtual one is dispatched through the
+            // vtable (which points at the unspecialized definition)
+            if (ctps.Count > 0 && owner == clsName && recv.ty != null
+                && recv.ty.kids.Count == ctps.Count) {
+                int ci = 0;
+                while (ci < ctps.Count) {
+                    stns.Add(ctps[ci]); strs.Add(recv.ty.kids[ci]);
+                    ci = ci + 1;
+                }
+                clsSpec = true;
+            }
             if (mtps.Count > 0) {
                 if (!BindTypeArgs(m, e, mtps, stns, strs)) {
                     BindFromArgs(m, e, 0, mtps, stns, strs);
                 }
-                string tag = SpecTag(m, mtps, stns, strs);
-                if (tag != "") { sym = SpecQueue(owner, m, stns, strs, tag); spec = true; }
+            }
+            if (clsSpec || mtps.Count > 0) {
+                string tag = SpecTagP(m, mtps, stns, strs, clsSpec ? "I" : "");
+                if (tag != "") {
+                    sym = SpecQueueTy(owner, m, stns, strs, tag, clsSpec ? recv.ty : null);
+                    spec = true;
+                }
             }
         }
         string thisOp = recv.op;
@@ -5342,7 +5396,9 @@ partial class Irgen {
             if (spec) { pty = SubstTP(pty, stns, strs); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
                 && aargs[i].kind == AK.OutArg()) {
-                if (i > 0) { args = args + ", "; }
+                // the receiver is always the first argument, so the
+                // separator is needed even for the first declared parameter
+                args = args + ", ";
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
                 else { addr = RefPlacePtr(aargs[i].a, pty); }
@@ -5376,6 +5432,13 @@ partial class Irgen {
         string clsName = cls.sval;
         int slot = VSlotIndexM(cls, m);
         string rt = MapType(m.type);
+        // an async method returns the coroutine FRAME, not the declared
+        // result -- `async void` included: the ramp hands back the frame
+        // pointer and the await needs it. The void branch below must not
+        // swallow the call, or the frame is lost and the await refuses the
+        // operand ("this operand is not lowered as a coroutine frame").
+        bool isAsyncCall = IsAsync(m);
+        if (isAsyncCall) { rt = "i8*"; }
         string vtp = NT();
         L("  " + vtp + " = getelementptr %" + clsName + ", %" + clsName + "* " + recv.op + ", i32 0, i32 0");
         string vt = NT();
@@ -5415,7 +5478,7 @@ partial class Irgen {
         // returns the frame pointer. The await has to know that the operand
         // is a frame -- without the marker it refuses the call ("this operand
         // is not lowered as a coroutine frame").
-        if (IsAsync(m)) {
+        if (isAsyncCall) {
             Node tt = MkType("__task"); tt.a = m.type;
             return AsyncFrame(t, tt);
         }
