@@ -711,3 +711,17 @@
 - ✅ 已修（2026-10-20）：宿主两处都修好；受影响的 golden 重生成并逐行看过
   （`lang_fixes`、`list_wide_struct_elements` 的 bool 行从 "1"/"0" 变
   "true"/"false"）。
+### [ ] A415 自举：内建的**属性**（Console 颜色/标题）不降级
+
+- 现象（2026-10-20 能力矩阵实测）：`Console.ForegroundColor` /
+  `Console.BackgroundColor` / `Console.Title` 在内建表里是属性（`'P'`），
+  自举**不降级**——能力矩阵把它们归到"内建属性"一栏。
+- 根因：自举的 `GenMember` / `StoreTo` 只认**调用**与**字段/属性 setter**，
+  没有内建属性这条路径。
+- 方向：照宿主的口径补——读＝读模块级颜色槽（缺省前景 7 / 背景 0）；
+  写＝存 `color & 15` 并发 `ESC[<code>m`（`(idx<8?30:90)+4*b0+2*b1+b2`，
+  背景 +10）；`Console.Title` **只可写**（`ESC]0;<title> BEL`），宿主没有
+  getter，读它在宿主那边就是编译错误。
+- ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `ConsoleColorGet` /
+  `ConsoleColorSet` / `ConsoleTitleSet`，`GenMember`（读）与 `StoreTo`（写）
+  两处都挂了；用例 `tests/conformance/console_color.zan` 钉住（字节逐字一致）。

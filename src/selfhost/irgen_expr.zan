@@ -1128,6 +1128,12 @@ partial class Irgen {
             return;
         }
         if (lhs.kind == AK.MemberAccess()) {
+            // Console.ForegroundColor / Console.BackgroundColor / Console.Title
+            // are built-in properties: the assignment emits the escape (and
+            // updates the color slot) instead of storing into a field.
+            if (IsConsoleProp(lhs, "ForegroundColor")) { ConsoleColorSet(v, false); return; }
+            if (IsConsoleProp(lhs, "BackgroundColor")) { ConsoleColorSet(v, true); return; }
+            if (IsConsoleProp(lhs, "Title")) { ConsoleTitleSet(v); return; }
             if (lhs.a.kind == AK.Ident() && LocalIdx(lhs.a.sval) < 0) {
                 Node tc = binder.FindType(lhs.a.sval);
                 if (tc != null && FindStaticField(tc, lhs.sval) != null) {
@@ -1472,6 +1478,73 @@ partial class Irgen {
     //
     // Returns null when the member is not a Console builtin (the caller
     // then reports it).
+    // ---- Console.ForegroundColor / Console.BackgroundColor / Console.Title ----
+    // The C host keeps the current console color in two module-level slots
+    // and emits the ANSI sequence on assignment (irgen_expr.c:
+    // console_color_slot / emit_console_color / emit_console_title).
+    // Console.Title is write-only: the host has no getter for it (reading it
+    // is a compile error there), so only the assignment is lowered.
+    bool IsConsoleProp(Node e, string name) {
+        if (e == null || e.kind != AK.MemberAccess()) { return false; }
+        if (e.a == null || e.a.kind != AK.Ident()) { return false; }
+        if (e.a.sval != "Console") { return false; }
+        if (LocalIdx("Console") >= 0) { return false; }
+        return e.sval == name;
+    }
+    // the two color slots and the two escape formats
+    void EnsureConsoleSlots() {
+        if (conSlots) { return; }
+        conSlots = true;
+        H("@__zan_console_fg = private global i64 7");
+        H("@__zan_console_bg = private global i64 0");
+        H("@.fmt.ansi = private unnamed_addr constant [6 x i8] c\"\\1B[%dm\\00\"");
+        H("@.fmt.osc = private unnamed_addr constant [8 x i8] c\"\\1B]0;%s\\07\\00\"");
+    }
+    ExprVal ConsoleColorGet(bool isBg) {
+        EnsureConsoleSlots();
+        string g = isBg ? "@__zan_console_bg" : "@__zan_console_fg";
+        string t = NT();
+        L("  " + t + " = load i64, i64* " + g);
+        return new ExprVal(t, MkType("int"));
+    }
+    // Console.ForegroundColor = c / Console.BackgroundColor = c: the slot
+    // keeps the color index (color & 15) and the escape carries the ANSI
+    // code -- (idx < 8 ? 30 : 90) + 4*b0 + 2*b1 + b2 (the host's table),
+    // plus 10 for the background.
+    void ConsoleColorSet(ExprVal v, bool isBg) {
+        EnsureConsoleSlots();
+        string g = isBg ? "@__zan_console_bg" : "@__zan_console_fg";
+        string idx = NT();
+        L("  " + idx + " = and i64 " + v.op + ", 15");
+        L("  store i64 " + idx + ", i64* " + g);
+        string b0 = NT(); L("  " + b0 + " = and i64 " + idx + ", 1");
+        string sh1 = NT(); L("  " + sh1 + " = lshr i64 " + idx + ", 1");
+        string b1 = NT(); L("  " + b1 + " = and i64 " + sh1 + ", 1");
+        string sh2 = NT(); L("  " + sh2 + " = lshr i64 " + idx + ", 2");
+        string b2 = NT(); L("  " + b2 + " = and i64 " + sh2 + ", 1");
+        string m0 = NT(); L("  " + m0 + " = mul i64 " + b0 + ", 4");
+        string m1 = NT(); L("  " + m1 + " = mul i64 " + b1 + ", 2");
+        string lo = NT(); L("  " + lo + " = add i64 " + m0 + ", " + m1);
+        string lo2 = NT(); L("  " + lo2 + " = add i64 " + lo + ", " + b2);
+        string lt8 = NT(); L("  " + lt8 + " = icmp ult i64 " + idx + ", 8");
+        string bsel = NT(); L("  " + bsel + " = select i1 " + lt8 + ", i64 30, i64 90");
+        string code = NT(); L("  " + code + " = add i64 " + bsel + ", " + lo2);
+        if (isBg) {
+            string c2 = NT(); L("  " + c2 + " = add i64 " + code + ", 10");
+            code = c2;
+        }
+        string c32 = NT(); L("  " + c32 + " = trunc i64 " + code + " to i32");
+        string gp = NT();
+        L("  " + gp + " = getelementptr inbounds [6 x i8], [6 x i8]* @.fmt.ansi, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i32 " + c32 + ")");
+    }
+    // Console.Title = s: the OSC sequence "\033]0;<title>\a"
+    void ConsoleTitleSet(ExprVal v) {
+        EnsureConsoleSlots();
+        string gp = NT();
+        L("  " + gp + " = getelementptr inbounds [8 x i8], [8 x i8]* @.fmt.osc, i64 0, i64 0");
+        L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + v.op + ")");
+    }
     ExprVal GenConsoleCall(string mname, Node e) {
         int argc = e.kids.Count;
         // ---- Console.Write / WriteLine / PrintLine ----
@@ -1612,6 +1685,12 @@ partial class Irgen {
     }
     ExprVal GenMember(Node e) {
         if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0) {
+            // Console.ForegroundColor / Console.BackgroundColor: the current
+            // color, kept in a module-level slot by the C host.
+            if (e.a.sval == "Console") {
+                if (e.sval == "ForegroundColor") { return ConsoleColorGet(false); }
+                if (e.sval == "BackgroundColor") { return ConsoleColorGet(true); }
+            }
             Node tc = binder.FindType(e.a.sval);
             // Vector128/256 static members (Zero, AllBitsSet) are values, not
             // storage — lower them inline instead of loading a static field

@@ -65,13 +65,14 @@ stdout 逐字相同）。
 | `ReadLine` | `fgets` + 把精确长度回写字符串头（换行留在值里） |
 | `Read` | `getchar` |
 | `ReadKey` | Windows `_getch`，其它平台 `getchar`（可选的 `intercept` 参数按宿主口径忽略） |
+| `ForegroundColor` / `BackgroundColor` | 读＝模块级颜色槽（缺省前景 7 / 背景 0）；写＝更新槽（`color & 15`）并发出 `ESC[<code>m`（码表：`(idx<8?30:90)+4*b0+2*b1+b2`，背景再 +10） |
+| `Title` | 只可写：发 `ESC]0;<title> BEL`（宿主没有 getter，读它在宿主那边就是编译错误） |
 
 还差：
 
 - `Task`：`Delay`（同步上下文里）、`Yield`、`WhenAll`、`WhenAny`、`IsDone`、
   `Cancel`、`IsCancellationRequested`、`JoinNew` / `JoinBind` / `JoinWait` /
   `JoinCancel`——这些要走协程帧与调度器，见 TASKS.md 的 A385。
-- `Console` 的颜色/标题**属性**：`ForegroundColor` / `BackgroundColor` / `Title`。
 
 > 上表说的是**自举的 IR 后端**（`irgen*.zan`，差分门考的就是它）。**ngen 后端**
 > （`ngen*.zan`，直接发机器码）只降级了 `Console.Write` / `WriteLine` /

@@ -534,3 +534,20 @@ kernel32、shell32、user32、advapi32、version）。
   golden 要**重生成并逐行看**，确认变的是"该变的那几行"。
 - 边界：宿主改的是**核心推断函数**时，影响面比看上去大——至少把整个
   conformance 集跑一遍，别只看自己碰过的那两个用例。
+## 32. 内建的**属性**也要降级：读＝读模块级槽，写＝发转义序列
+
+- 动作：`Console.ForegroundColor` / `Console.BackgroundColor` 这类内建**属性**
+  不是"调用"，是**读/写一个模块级槽**（C 宿主 `irgen_expr.c` 的
+  `console_color_slot` / `emit_console_color`）：
+  - 读＝load 槽（缺省前景 7 / 背景 0）；
+  - 写＝存 `color & 15`，并发 `ESC[<code>m`；码表是
+    `(idx<8?30:90) + 4*b0 + 2*b1 + b2`（b0..b2 是 idx 的低三位），
+    背景再 +10。
+  - `Console.Title` **只可写**：`ESC]0;<title> BEL`；宿主没有 getter——
+    读它在宿主那边就是编译错误（`cannot resolve member 'Title'`），
+    自举也别给它编一个 getter。
+- 理由（2026-10-20 差分门实测）：属性在内建表里是 `'P'`，能力矩阵把它归到
+  "内建属性"一栏（自举不降级）。矩阵**看不出**属性该是"读槽"还是"发转义"——
+  得先用 C 宿主跑探针，把字节（`ESC[36m`、`ESC]0;…BEL`）量出来再写。
+- 边界：属性赋值走的是 `StoreTo`（不是 `GenAssign`），读取走的是 `GenMember`
+  ——两处都要挂，别只改一处（只改一处会变成"写进去了、读不出来"）。
