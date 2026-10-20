@@ -982,8 +982,30 @@
   2. 编译期诊断：泛型类的虚方法体里用类型参数做类型判定时报错，要求把判定
      挪到非虚方法或构造器；
   3. 明文化限制，并给检查器一条提示级诊断（当前是静默返回 false）。
-- 探针：`_scratch/msgprobe/p1.zan`（四种形态对照）、`p2.zan`（方法组 vs
-  lambda）、`p7.zan`（虚方法转交非虚方法）、`p8.zan`（构造器定型委托 ✅）。
+- 探针（最小复现，内容直接抄进本条，随时可重建）：
+  ```zan
+  using System;
+  using System.Collections.Generic;
+  class Order { public int id; public Order(int id) { this.id = id; } }
+  class Base {
+      public virtual bool Accepts(object m) { return false; }
+  }
+  class Ch<T> : Base {
+      public override bool Accepts(object m) { return m is T; }   // 虚方法体里用 T
+      public bool Direct(object m) { return m is T; }              // 非虚方法
+  }
+  public class Probe {
+      public static void Main() {
+          Ch<Order> ch = new Ch<Order>();
+          Base b = ch;
+          Console.WriteLine("direct: " + ch.Direct(new Order(1)).ToString());  // true
+          Console.WriteLine("virtual: " + b.Accepts(new Order(1)).ToString()); // false
+      }
+  }
+  ```
+  方法组那一支（同一文件加两行即可复现）：`FuncT<object, bool> f = ch.Accepts;`
+  → 调用恒 false；改成 `FuncT<object, bool> f = (object m) => { return ch.Accepts(m); };`
+  → 恒 true。
 - 关联：A448、A449。
 
 ### [ ] A448 泛型方法在包单元里、类型实参靠推断时不单态化——方法体里的类型判定恒假
