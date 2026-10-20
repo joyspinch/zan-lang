@@ -8,6 +8,7 @@ Game.Zgm
 
 Game.Board ----+
 Game.Cards ----+--> Game.Foundation
+Game.Data ----+
 Game.Arcade2D -+
 
 Game.Idle (idle/incremental mechanics: offline rewards, wallet, state machine)
@@ -38,10 +39,15 @@ compact deck-building battle runtime, and Chinese-style hand-shape rules
 (`ComboType` / `Combo` / `ComboRuleSet` / `ComboRules`: recognise, compare and
 enumerate the legal replies for single/pair/triple/straight/bomb hands).
 
+`Game.Data` provides the table-driven data layer: CSV tables into rows with an
+id index (`DataTable` / `DataRow`), a column-spec validator (`TableSchema` /
+`TableColumn`) and strict numeric parsing (`DataValues`). It owns the loading
+and validation only — which columns exist, what they mean and their legal
+ranges stay with the game that ships the table.
+
 `Game.Arcade2D` provides geometry, collision queries, animation state, pooled
 entities and path following for tower defense, auto-battlers and lightweight
 arcade simulations.
-
 `Game.Idle` provides the mechanics of idle/incremental games: offline reward
 settlement, wallet slots and costs, floating text items, and the core state
 machine (`IdleState` / `IdleBuilding` — click power, cost multiplier curve,

@@ -1,0 +1,113 @@
+using System;
+using System.Collections.Generic;
+using System.Csv;
+using System.IO;
+
+namespace Game.Data;
+
+// 一张数值表：CSV 文本 → 行集合 + id 索引。
+//
+// 包只做"表结构"这一层：读文件、去 BOM、按 CSV 切列、给每行建 id 索引、
+// 校验列数与 id 唯一性。**表里有哪些列、每列什么含义、取值范围多大，
+// 是游戏自己的事**——那部分留在项目里（用 TableSchema 描述）。
+//
+// 换游戏还成立吗？成立：任何"策划用 Excel 改数值、游戏读表"的玩法都
+// 需要同一套加载与校验，所以它进包而不是留在某个项目里。
+public class DataTable {
+    // 表来源（文件路径或逻辑名）：错误信息靠它定位。
+    string name = "";
+    // 表头列名（校验表结构用）。
+    List<string> header = new List<string>();
+    List<DataRow> rows = new List<DataRow>();
+    Dictionary<string, DataRow> index = new Dictionary<string, DataRow>();
+
+    public string Name { get { return name; } }
+    // 表头列名。
+    public List<string> Header() { return this.header; }
+    // 行数。
+    public int Count() { return this.rows.Count; }
+    // 第 index 行（按文件顺序）。
+    public DataRow RowAt(int index) { return this.rows[index]; }
+    // 全部行（只读语义：调用方别改顺序）。
+    public List<DataRow> Rows() { return this.rows; }
+
+    // 按 id 找行：找不到返回 null。
+    public DataRow Find(string id) {
+        if (id == null || !this.index.ContainsKey(id)) { return null; }
+        return this.index[id];
+    }
+
+    // 按 id 找行：找不到抛异常（关键 id 建议用这个）。
+    public DataRow Get(string id) {
+        DataRow row = this.Find(id);
+        if (row == null) { throw new Exception(this.name + ": unknown id " + id); }
+        return row;
+    }
+
+    // 全部行的 name 列。
+    public string[] Names() {
+        string[] result = new string[this.rows.Count];
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            result[i] = this.rows[i].Name;
+        }
+        return result;
+    }
+
+    // 从文件读表（UTF-8 CSV，首行是表头）。
+    public static DataTable Load(string path) {
+        if (!File.Exists(path)) { throw new Exception("Table file missing: " + path); }
+        return DataTable.Parse(File.ReadAllText(path), path);
+    }
+
+    // 解析 CSV 文本成表。source 是错误信息里的来源名。
+    //
+    // 校验口径：表头不能有重复/空列名；每行列数必须与表头一致；
+    // 有 "id" 列时 id 不能为空且不能重复。
+    public static DataTable Parse(string text, string source) {
+        if (text == null) { throw new Exception(source + ": empty table"); }
+        // 去 UTF-8 BOM：Excel 另存的 CSV 常带 BOM，不去会让第一列名变成
+        // "﻿id"，于是每张表都"缺 id 列"。
+        if (text.Length > 0 && text.Substring(0, 1) == "﻿") {
+            text = text.Substring(1, text.Length - 1);
+        }
+        CsvTable parsed;
+        try { parsed = Csv.Parse(text); }
+        catch (Exception error) { throw new Exception(source + ": malformed CSV (" + error.Message + ")"); }
+        if (parsed.RowCount() < 1) { throw new Exception(source + ": empty table"); }
+
+        List<string> header = parsed.Header();
+        for (int i = 0; i < header.Count; i = i + 1) {
+            if (header[i] == "") { throw new Exception(source + ": empty header column " + Convert.ToString(i + 1)); }
+            for (int j = i + 1; j < header.Count; j = j + 1) {
+                if (header[i] == header[j]) {
+                    throw new Exception(source + ": duplicate header column " + header[i]);
+                }
+            }
+        }
+
+        DataTable table = new DataTable();
+        table.name = source;
+        table.header = header;
+        List<List<string>> dataRows = parsed.Rows();
+        for (int r = 0; r < dataRows.Count; r = r + 1) {
+            List<string> values = dataRows[r];
+            string place = source + ": row " + Convert.ToString(r + 2);
+            if (values.Count != header.Count) {
+                throw new Exception(place + ": column count mismatch");
+            }
+            DataRow row = new DataRow();
+            row.SetLocation(place);
+            for (int c = 0; c < header.Count; c = c + 1) { row.Set(header[c], values[c]); }
+            if (row.Has("id")) {
+                string id = row.Text("id");
+                if (id == "") { throw new Exception(place + ": empty id"); }
+                if (table.index.ContainsKey(id)) { throw new Exception(place + ": duplicate id " + id); }
+                row.SetId(id);
+                table.index.Add(id, row);
+            }
+            if (row.Has("name")) { row.SetName(row.Text("name")); }
+            table.rows.Add(row);
+        }
+        return table;
+    }
+}

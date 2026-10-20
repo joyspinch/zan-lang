@@ -1,0 +1,108 @@
+using System;
+using System.Collections.Generic;
+using Game.Data;
+
+namespace Tests.GameDataTable;
+
+// 数值表加载器（Game.Data）的行为金标：
+// 解析、BOM、id 索引、列数/重复列/重复 id 的报错口径、列规格校验、
+// 严格整数解析。
+class Program {
+    // 打印一条断言结果。
+    static void Check(bool ok, string label) {
+        Console.WriteLine((ok ? "OK " : "FAIL ") + label);
+    }
+
+    // 跑一段会抛异常的代码，返回错误信息；没抛则返回空串。
+    static string ErrorOf(Action fn) {
+        try {
+            fn();
+            return "";
+        }
+        catch (Exception error) {
+            return error.Message;
+        }
+    }
+
+    // 断言错误信息包含某段文字。
+    static void CheckError(Action fn, string needle, string label) {
+        string message = ErrorOf(fn);
+        Check(message.Contains(needle), label + " <- " + message);
+    }
+
+    static int Main() {
+        // ---- 解析 ----
+        // 带 BOM（Excel 另存的 CSV 常带）。
+        string csv = "﻿id,name,hp,rate\n"
+            + "1,剑,12,0.5\n"
+            + "2,盾,8,1\n";
+        DataTable table = DataTable.Parse(csv, "items.csv");
+        Check(table.Count() == 2, "count=2");
+        Check(table.Header().Count == 4, "header=4");
+        Check(table.Get("1").Name == "剑", "id1 name");
+        Check(table.Get("1").Id == "1", "id1 id");
+        Check(table.Get("2").Int("hp") == 8, "id2 hp");
+        Check(table.Get("1").Num("rate") == 0.5, "id1 rate");
+        Check(table.Get("1").Text("missing") == "", "missing column is empty");
+        Check(table.Get("1").Has("hp"), "has hp");
+        Check(!table.Get("1").Has("nope"), "has nope");
+        Check(table.Find("9") == null, "unknown id null");
+        Check(table.Names().Length == 2, "names=2");
+        Check(table.RowAt(0).Location.Contains("row 2"), "row location");
+
+        // ---- 报错口径 ----
+        CheckError(() => { DataTable.Parse("id,name\n1,a\n1,b\n", "dup.csv"); },
+            "duplicate id", "duplicate id");
+        CheckError(() => { DataTable.Parse("id,name\n1,a,extra\n", "cols.csv"); },
+            "column count mismatch", "column count mismatch");
+        CheckError(() => { DataTable.Parse("id,name,id\n1,a,2\n", "dupcol.csv"); },
+            "duplicate header column", "duplicate header");
+        CheckError(() => { DataTable.Parse("id,name\n", "empty.csv"); },
+            "empty table", "empty table");
+        CheckError(() => { DataTable.Load("no/such/table.csv"); },
+            "Table file missing", "missing file");
+
+        // ---- 列规格 ----
+        TableSchema schema = TableSchema.Parse("id:int:1:999,name,hp:int:1:9999,rate:num:0:1");
+        Check(schema.Count() == 4, "schema columns=4");
+        Check(schema.KeyAt(0) == "id", "schema first is id");
+        schema.ValidateHeader(table.Header(), "items.csv");
+        Check(true, "schema header ok");
+        CheckError(() => { schema.ValidateHeader(new List<string> { "id", "name" }, "items.csv"); },
+            "schema column count mismatch", "schema header count");
+        CheckError(() => { schema.ValidateHeader(new List<string> { "id", "name", "hp", "xxx" }, "items.csv"); },
+            "missing column rate", "schema missing column");
+        CheckError(() => { TableSchema.Parse("name,id"); },
+            "First schema column must be id", "schema first must be id");
+        CheckError(() => { TableSchema.Parse("id:str"); },
+            "Unknown column type", "schema unknown type");
+
+        // 行校验：合法行通过，越界/非整数/空值都报错。
+        schema.ValidateRow(table.Get("1"), "items.csv");
+        Check(true, "schema row ok");
+        DataTable bad = DataTable.Parse("id,name,hp,rate\n1,x,99999,0.5\n", "bad.csv");
+        CheckError(() => { schema.ValidateRow(bad.Get("1"), "bad.csv"); },
+            "out of range", "row out of range");
+        DataTable bad2 = DataTable.Parse("id,name,hp,rate\n1,x,12.5,0.5\n", "bad2.csv");
+        CheckError(() => { schema.ValidateRow(bad2.Get("1"), "bad2.csv"); },
+            "invalid integer", "row invalid integer");
+        DataTable bad3 = DataTable.Parse("id,name,hp,rate\n1,,12,0.5\n", "bad3.csv");
+        CheckError(() => { schema.ValidateRow(bad3.Get("1"), "bad3.csv"); },
+            "empty value", "row empty value");
+
+        // ---- 严格整数 ----
+        Check(DataValues.ParseInt("42", "ctx") == 42, "parse int");
+        Check(DataValues.ParseInt("-42", "ctx") == -42, "parse negative int");
+        CheckError(() => { DataValues.ParseInt("", "ctx"); },
+            "empty integer", "parse empty int");
+        CheckError(() => { DataValues.ParseInt("12.5", "ctx"); },
+            "invalid integer", "parse fractional int");
+        CheckError(() => { DataValues.ParseInt("99999999999", "ctx"); },
+            "integer overflow", "parse overflow int");
+        CheckError(() => { DataValues.ParseDouble("abc", "ctx"); },
+            "invalid number", "parse bad double");
+        Check(DataValues.ParseDouble("0.25", "ctx") == 0.25, "parse double");
+
+        return 0;
+    }
+}
