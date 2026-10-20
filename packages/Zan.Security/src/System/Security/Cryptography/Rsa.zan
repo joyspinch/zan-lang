@@ -223,26 +223,59 @@ public class Rsa {
         return di;
     }
 
-    // 将 SHA-256(msg) 按 EMSA-PKCS1-v1_5 编码为 k 字节
-    private static byte[] emsaPkcs1Sha256(string msg, int mLen, int k) {
-        byte[] h = Sha256.Hash(msg, mLen);
-        byte[] di = sha256DigestInfo();
-        int tLen = 19 + 32;
+    // SHA-1 的 DigestInfo 前缀（RFC 8017 §9.2 注 1）
+    private static byte[] sha1DigestInfo() {
+        byte[] di = new byte[15];
+        di[0]=48; di[1]=33; di[2]=48; di[3]=9; di[4]=6; di[5]=5; di[6]=43;
+        di[7]=14; di[8]=3; di[9]=2; di[10]=26; di[11]=5; di[12]=0; di[13]=4; di[14]=20;
+        return di;
+    }
+
+    // SHA-384 的 DigestInfo 前缀（RFC 8017 §9.2 注 1）
+    private static byte[] sha384DigestInfo() {
+        byte[] di = new byte[19];
+        di[0]=48; di[1]=65; di[2]=48; di[3]=13; di[4]=6; di[5]=9; di[6]=96;
+        di[7]=134; di[8]=72; di[9]=1; di[10]=101; di[11]=3; di[12]=4; di[13]=2;
+        di[14]=2; di[15]=5; di[16]=0; di[17]=4; di[18]=48;
+        return di;
+    }
+
+    // SHA-512 的 DigestInfo 前缀（RFC 8017 §9.2 注 1）
+    private static byte[] sha512DigestInfo() {
+        byte[] di = new byte[19];
+        di[0]=48; di[1]=81; di[2]=48; di[3]=13; di[4]=6; di[5]=9; di[6]=96;
+        di[7]=134; di[8]=72; di[9]=1; di[10]=101; di[11]=3; di[12]=4; di[13]=2;
+        di[14]=3; di[15]=5; di[16]=0; di[17]=4; di[18]=64;
+        return di;
+    }
+
+    // 将摘要与 DigestInfo 前缀按 EMSA-PKCS1-v1_5 编码为 k 字节
+    // （0x00 || 0x01 || PS || 0x00 || DigestInfo || H）。
+    private static byte[] emsaPkcs1Digest(byte[] h, byte[] di, int k) {
+        if (h == null || di == null || k <= 0) { return null; }
+        int tLen = di.Length + h.Length;
+        if (k < tLen + 11) { return null; }
         byte[] em = new byte[k];
         em[0] = 0; em[1] = 1;
         int psLen = k - tLen - 3;
         int i = 0;
         for (; i < psLen; i = i + 1) { em[2 + i] = 255; }
         em[2 + psLen] = 0;
-        i = 0; while (i < 19) { em[3 + psLen + i] = di[i] & 255; i = i + 1; }
-        i = 0; while (i < 32) { em[3 + psLen + 19 + i] = h[i] & 255; i = i + 1; }
+        i = 0; while (i < di.Length) { em[3 + psLen + i] = di[i] & 255; i = i + 1; }
+        i = 0; while (i < h.Length) { em[3 + psLen + di.Length + i] = h[i] & 255; i = i + 1; }
         return em;
+    }
+
+    // 将 SHA-256(msg) 按 EMSA-PKCS1-v1_5 编码为 k 字节
+    private static byte[] emsaPkcs1Sha256(string msg, int mLen, int k) {
+        return emsaPkcs1Digest(Sha256.Hash(msg, mLen), sha256DigestInfo(), k);
     }
 
     // 对 SHA-256(msg) 计算 RSASSA-PKCS1-v1_5 签名。返回
     // k 字节的签名（k = 模数字节数）。
     public static byte[] SignPkcs1Sha256(string msg, int mLen, string n, int k, string d, int dLen) {
         byte[] em = emsaPkcs1Sha256(msg, mLen, k);
+        if (em == null) { return null; }
         return ModExp(em, k, n, k, d, dLen);
     }
 
@@ -257,6 +290,7 @@ public class Rsa {
                                      string dq, int dqLen,
                                      string qinv, int qinvLen) {
         byte[] em = emsaPkcs1Sha256(msg, mLen, k);
+        if (em == null) { return null; }
         if (pLen > 0 && qLen > 0 && dpLen > 0 && dqLen > 0 && qinvLen > 0) {
             byte[] outb = new byte[k];
             long r = NativeMemory.RsaCrtModPow(em, (long)k,
@@ -332,7 +366,42 @@ public class Rsa {
     // 校验 RSASSA-PKCS1-v1_5 SHA-256 签名。
     public static bool VerifyPkcs1Sha256(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
         byte[] em2 = ModExp(sig, k, n, k, e, eLen);
+        if (em2 == null) { return false; }
         byte[] em = emsaPkcs1Sha256(msg, mLen, k);
+        if (em == null) { return false; }
+        int diff = 0;
+        for (int i = 0; i < k; i = i + 1) { diff = diff | ((em[i] & 255) ^ (em2[i] & 255)); }
+        return diff == 0;
+    }
+
+    // 校验 RSASSA-PKCS1-v1_5 SHA-1 签名。
+    public static bool VerifyPkcs1Sha1(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
+        byte[] em2 = ModExp(sig, k, n, k, e, eLen);
+        if (em2 == null) { return false; }
+        byte[] em = emsaPkcs1Digest(Sha1.Hash(msg, mLen), sha1DigestInfo(), k);
+        if (em == null) { return false; }
+        int diff = 0;
+        for (int i = 0; i < k; i = i + 1) { diff = diff | ((em[i] & 255) ^ (em2[i] & 255)); }
+        return diff == 0;
+    }
+
+    // 校验 RSASSA-PKCS1-v1_5 SHA-384 签名。
+    public static bool VerifyPkcs1Sha384(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
+        byte[] em2 = ModExp(sig, k, n, k, e, eLen);
+        if (em2 == null) { return false; }
+        byte[] em = emsaPkcs1Digest(Sha384.Hash(msg, mLen), sha384DigestInfo(), k);
+        if (em == null) { return false; }
+        int diff = 0;
+        for (int i = 0; i < k; i = i + 1) { diff = diff | ((em[i] & 255) ^ (em2[i] & 255)); }
+        return diff == 0;
+    }
+
+    // 校验 RSASSA-PKCS1-v1_5 SHA-512 签名。
+    public static bool VerifyPkcs1Sha512(string msg, int mLen, string sig, string n, int k, string e, int eLen) {
+        byte[] em2 = ModExp(sig, k, n, k, e, eLen);
+        if (em2 == null) { return false; }
+        byte[] em = emsaPkcs1Digest(Sha512.Hash(msg, mLen), sha512DigestInfo(), k);
+        if (em == null) { return false; }
         int diff = 0;
         for (int i = 0; i < k; i = i + 1) { diff = diff | ((em[i] & 255) ^ (em2[i] & 255)); }
         return diff == 0;

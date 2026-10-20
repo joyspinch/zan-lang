@@ -538,6 +538,7 @@ public class X509Certificate {
     byte[] ecX;
     byte[] ecY;
     bool sigIsEcdsa;
+    int sigAlg;
     int issuerNameStart;
     int issuerNameLen;
     int subjectNameStart;
@@ -611,35 +612,77 @@ public class X509Certificate {
         return len == 3 && (d[start] & 255) == a && (d[start + 1] & 255) == b && (d[start + 2] & 255) == c;
     }
 
-    private static bool SigAlgorithm(byte[] d, int bound, List<int> p, List<int> isEcdsa) {
+    // 证书签名算法标识。tbsCertificate.signature 与外层
+    // signatureAlgorithm 必须逐字一致（RFC 5280 §4.1.1.2）。
+    static int SigAlgSha1Rsa = 1;
+    static int SigAlgSha256Rsa = 2;
+    static int SigAlgSha384Rsa = 3;
+    static int SigAlgSha512Rsa = 4;
+    static int SigAlgEcdsaSha1 = 5;
+    static int SigAlgEcdsaSha256 = 6;
+    static int SigAlgEcdsaSha384 = 7;
+    static int SigAlgEcdsaSha512 = 8;
+
+    // 解析 AlgorithmIdentifier 并返回签名算法标识（0 = 不支持）。
+    // RSA PKCS#1 v1.5 系列（1.2.840.113549.1.1.{5,11,12,13}）带 NULL 参数；
+    // ECDSA 系列（1.2.840.10045.4.1 与 1.2.840.10045.4.3.{2,3,4}）参数
+    // 应缺省，部分实证书带 NULL，同样接受。
+    private static bool SigAlgorithm(byte[] d, int bound, List<int> p, List<int> algOut) {
         int end = Tlv(d, bound, p, 48);
         if (end < 0) { return false; }
         int oidEnd = Tlv(d, end, p, 6);
         if (oidEnd < 0) { return false; }
-        if (oidEnd - p[0] == 9) {
-            byte[] oid = new byte[] { 42, 134, 72, 134, 247, 13, 1, 1, 11 };
-            for (int i = 0; i < 9; i = i + 1) {
-                if ((d[p[0] + i] & 255) != (oid[i] & 255)) { return false; }
-            }
-            p[0] = oidEnd;
-            int nullEnd = Tlv(d, end, p, 5);
-            if (nullEnd != end || nullEnd != p[0]) { return false; }
-            isEcdsa[0] = 0;
-            p[0] = end;
-            return true;
-        }
-        if (oidEnd - p[0] == 8) {
-            byte[] oid = new byte[] { 42, 134, 72, 206, 61, 4, 3, 2 };
+        int oidLen = oidEnd - p[0];
+        int alg = 0;
+        if (oidLen == 9) {
+            // 1.2.840.113549.1.1.x：sha1/sha256/sha384/sha512WithRSAEncryption
+            byte[] oid = new byte[] { 42, 134, 72, 134, 247, 13, 1, 1, 0 };
             for (int i = 0; i < 8; i = i + 1) {
                 if ((d[p[0] + i] & 255) != (oid[i] & 255)) { return false; }
             }
+            int tail = d[p[0] + 8] & 255;
+            if (tail == 5) { alg = SigAlgSha1Rsa; }
+            else if (tail == 11) { alg = SigAlgSha256Rsa; }
+            else if (tail == 12) { alg = SigAlgSha384Rsa; }
+            else if (tail == 13) { alg = SigAlgSha512Rsa; }
+            else { return false; }
             p[0] = oidEnd;
-            if (p[0] != end) { return false; }
-            isEcdsa[0] = 1;
-            p[0] = end;
-            return true;
+            int nullEnd = Tlv(d, end, p, 5);
+            if (nullEnd != end || nullEnd != p[0]) { return false; }
+        } else if (oidLen == 8) {
+            // 1.2.840.10045.4.3.x：ecdsa-with-SHA256/SHA384/SHA512
+            byte[] oid = new byte[] { 42, 134, 72, 206, 61, 4, 3, 0 };
+            for (int i = 0; i < 7; i = i + 1) {
+                if ((d[p[0] + i] & 255) != (oid[i] & 255)) { return false; }
+            }
+            int tail = d[p[0] + 7] & 255;
+            if (tail == 2) { alg = SigAlgEcdsaSha256; }
+            else if (tail == 3) { alg = SigAlgEcdsaSha384; }
+            else if (tail == 4) { alg = SigAlgEcdsaSha512; }
+            else { return false; }
+            p[0] = oidEnd;
+            if (p[0] != end) {
+                int nullEnd = Tlv(d, end, p, 5);
+                if (nullEnd != end || nullEnd != p[0]) { return false; }
+            }
+        } else if (oidLen == 7) {
+            // 1.2.840.10045.4.1：ecdsa-with-SHA1
+            byte[] oid = new byte[] { 42, 134, 72, 206, 61, 4, 1 };
+            for (int i = 0; i < 7; i = i + 1) {
+                if ((d[p[0] + i] & 255) != (oid[i] & 255)) { return false; }
+            }
+            alg = SigAlgEcdsaSha1;
+            p[0] = oidEnd;
+            if (p[0] != end) {
+                int nullEnd = Tlv(d, end, p, 5);
+                if (nullEnd != end || nullEnd != p[0]) { return false; }
+            }
+        } else {
+            return false;
         }
-        return false;
+        algOut[0] = alg;
+        p[0] = end;
+        return true;
     }
 
     public static X509Certificate ParseForTls(byte[] der, int len) {
@@ -664,7 +707,9 @@ public class X509Certificate {
         p[0] = serialEnd;
         List<int> sigAlg = new List<int>(); sigAlg.Add(0);
         if (!SigAlgorithm(der, tbsEnd, p, sigAlg)) { return null; }
-        cert.sigIsEcdsa = sigAlg[0] == 1;
+        cert.sigAlg = sigAlg[0];
+        cert.sigIsEcdsa = cert.sigAlg == SigAlgEcdsaSha1 || cert.sigAlg == SigAlgEcdsaSha256
+            || cert.sigAlg == SigAlgEcdsaSha384 || cert.sigAlg == SigAlgEcdsaSha512;
         cert.issuerNameStart = p[0];
         int nameEnd = Tlv(der, tbsEnd, p, 48);
         if (nameEnd < 0) { return null; }
@@ -849,10 +894,8 @@ public class X509Certificate {
             p[0] = itemEnd;
         }
         p[0] = tbsEnd;
-        List<int> outerAlg = new List<int>(); outerAlg.Add(-1);
-        int wantAlg = 0;
-        if (cert.sigIsEcdsa) { wantAlg = 1; }
-        if (!SigAlgorithm(der, certEnd, p, outerAlg) || outerAlg[0] != wantAlg) { return null; }
+        List<int> outerAlg = new List<int>(); outerAlg.Add(0);
+        if (!SigAlgorithm(der, certEnd, p, outerAlg) || outerAlg[0] != cert.sigAlg) { return null; }
         int sigEnd = Tlv(der, certEnd, p, 3);
         if (sigEnd != certEnd || sigEnd - p[0] < 2 || (der[p[0]] & 255) != 0) { return null; }
         cert.signature = new byte[sigEnd - p[0] - 1];
@@ -897,14 +940,30 @@ public class X509Certificate {
         for (int i = 0; i < this.issuerNameLen; i = i + 1) {
             if ((this.rawDer[this.issuerNameStart + i] & 255) != (issuerCert.rawDer[issuerCert.subjectNameStart + i] & 255)) { return false; }
         }
-        if (this.sigIsEcdsa) {
+        if (this.sigAlg == SigAlgEcdsaSha256) {
             if (!issuerCert.hasEcKey) { return false; }
             return Ecdsa.VerifySha256(this.tbs.ToStr(0, this.tbs.Length), this.tbs.Length,
                 this.signature, this.signature.Length, issuerCert.ecX, issuerCert.ecY);
         }
         if (issuerCert.rsaN == null || this.signature.Length != issuerCert.rsaNLen) { return false; }
-        return Rsa.VerifyPkcs1Sha256(this.tbs, this.tbs.Length, this.signature,
-            issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+        if (this.sigAlg == SigAlgSha256Rsa) {
+            return Rsa.VerifyPkcs1Sha256(this.tbs, this.tbs.Length, this.signature,
+                issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+        }
+        if (this.sigAlg == SigAlgSha384Rsa) {
+            return Rsa.VerifyPkcs1Sha384(this.tbs, this.tbs.Length, this.signature,
+                issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+        }
+        if (this.sigAlg == SigAlgSha512Rsa) {
+            return Rsa.VerifyPkcs1Sha512(this.tbs, this.tbs.Length, this.signature,
+                issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+        }
+        if (this.sigAlg == SigAlgSha1Rsa) {
+            return Rsa.VerifyPkcs1Sha1(this.tbs, this.tbs.Length, this.signature,
+                issuerCert.rsaN, issuerCert.rsaNLen, issuerCert.rsaE, issuerCert.rsaELen);
+        }
+        // ECDSA-SHA1/384/512 尚无对应验签原语，一律拒绝（闭锁）。
+        return false;
     }
 
     public bool VerifyHandshakeSignature(byte[] data, byte[] sig) {

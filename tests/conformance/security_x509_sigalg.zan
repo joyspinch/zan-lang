@@ -1,0 +1,67 @@
+using System;
+using System.IO;
+using System.Security.Cryptography;
+
+// 证书签名算法覆盖面回归：修复前 X509Certificate.SigAlgorithm 只认
+// sha256WithRSA 与 ecdsa-with-SHA256，遇到 sha384WithRSA / sha1WithRSA
+// 直接返回 NULL，整条链在验证之前就断（真实触发：阿里云 dysmsapi
+// 实发的 GlobalSign 链含 sha384RSA 交叉签与 sha1RSA 真根）。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    // 阿里云 dysmsapi.aliyuncs.com 服务器原样下发的 4 张证书：
+    //   c0 叶子 CN=aliyuncs.com（EC P-256 公钥，sha256RSA 签名）
+    //   c1 中间 CA CN=GlobalSign GCC R46 OV TLS CA 2025（sha256RSA）
+    //   c2 交叉签 CN=GlobalSign Root R46（sha384RSA）← 修复前解析 NULL
+    //   c3 真根 CN=GlobalSign Root CA（sha1RSA 自签）← 修复前解析 NULL
+    static string AssetDir = "tests/conformance/assets/x509sig/";
+
+    static string Msg448 = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+        + "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+
+    static X509Certificate Load(string name) {
+        byte[] der = File.ReadAllBytes(AssetDir + name);
+        return X509Certificate.ParseForTls(der, der.Length);
+    }
+
+    static void TestSha384Vectors() {
+        Check(Hex.Encode(Sha384.Hash("abc", 3))
+            == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed"
+            + "8086072ba1e7cc2358baeca134c825a7", "sha384 of \"abc\"");
+        Check(Hex.Encode(Sha384.Hash("", 0))
+            == "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da"
+            + "274edebfe76f65fbd51ad2f14898b95b", "sha384 of empty message");
+        Check(Hex.Encode(Sha384.Hash(Msg448, Msg448.Length))
+            == "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712"
+            + "fcc7c71a557e2db966c3e9fa91746039", "sha384 of 448-bit message");
+    }
+
+    static void TestParseChain() {
+        X509Certificate c0 = Load("c0.der");
+        X509Certificate c1 = Load("c1.der");
+        X509Certificate c2 = Load("c2.der");
+        X509Certificate c3 = Load("c3.der");
+        Check(c0 != null && c1 != null && c2 != null && c3 != null,
+            "aliyun chain: all four certificates parse");
+        if (c0 == null || c1 == null || c2 == null || c3 == null) { return; }
+        Check(c0.SigIsEcdsa() == false, "leaf carries EC key but RSA signature");
+        Check(c0.HasEcKey(), "leaf public key is EC P-256");
+        Check(c0.VerifySignedBy(c1), "leaf verifies under intermediate (sha256RSA)");
+        Check(c1.VerifySignedBy(c2), "intermediate verifies under cross-cert (sha256RSA)");
+        Check(c2.VerifySignedBy(c3), "cross-cert verifies under root (sha384RSA)");
+        Check(c3.VerifySignedBy(c3), "root self-signature verifies (sha1RSA)");
+        Check(!c2.VerifySignedBy(c1), "cross-cert refuses verification under a differently named issuer");
+    }
+
+    static int Main() {
+        TestSha384Vectors();
+        TestParseChain();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+}
