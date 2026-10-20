@@ -1,0 +1,312 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Validation;
+
+// 校验引擎：规则链 + 错误聚合。
+//
+// T 是被校验对象的类型。每条规则在声明时就用取值器把"取哪个属
+// 性"固化下来（`s => s.userName`），运行期不做任何反射——属性改
+// 名在编译期就报错，跑得快，也没有反射带来的裁剪风险。
+//
+// 两种用法：
+//
+// 1) 继承出专用校验器：
+//    public class SignupValidator : ValidationPlan<Signup> {
+//        public SignupValidator() {
+//            this.NotEmpty("userName", s => s.userName, "is required");
+//            this.RangeInt("age", s => s.age, 18, 150, "must be adult");
+//        }
+//    }
+//    ValidationResult r = new SignupValidator().Validate(signup);
+//
+// 2) 直接当规则集用（可跨校验器复用）：
+//    ValidationPlan<Signup> plan = new ValidationPlan<Signup>();
+//    plan.NotEmpty("userName", s => s.userName, "is required");
+//
+// 规则按声明顺序执行，失败项按同样顺序聚合；上下文要求首错即停
+// 时在第一条失败后中断。
+public class ValidationPlan<T> {
+    // 规则链。每条规则返回 null 表示通过，返回非 null 的结果表示
+    // 失败（结果里可以有多条失败项，嵌套校验用）。
+    public List<FuncT<T, ValidationResult>> rules;
+
+    public ValidationPlan() {
+        this.rules = new List<FuncT<T, ValidationResult>>();
+    }
+
+    // 规则条数。
+    public int RuleCount() {
+        return this.rules.Count;
+    }
+
+    // 追加一条自定义规则：返回 null 表示通过。返回非 null 结果时
+    // 其中的失败项会被聚合进总结果（属性名前缀照上下文处理）。
+    public void AddRule(FuncT<T, ValidationResult> rule) {
+        if (rule != null) { this.rules.Add(rule); }
+    }
+
+    /* ---------- 文本规则 ---------- */
+
+    // 非空：null 或空串算失败。
+    public void NotEmpty(string property, FuncT<T, string> getter, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (ValidationText.IsEmpty(v)) {
+                outp = ValidationResult.One(property, message, "NotEmpty", v);
+            }
+            return outp;
+        });
+    }
+
+    // 必填：null、空串或纯空白算失败。
+    public void Required(string property, FuncT<T, string> getter, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (ValidationText.IsBlank(v)) {
+                outp = ValidationResult.One(property, message, "Required", v);
+            }
+            return outp;
+        });
+    }
+
+    // 长度上限（字节数）。
+    public void MaxLength(string property, FuncT<T, string> getter, int max, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && v.Length > max) {
+                outp = ValidationResult.One(property, message, "MaxLength", v);
+            }
+            return outp;
+        });
+    }
+
+    // 长度下限（字节数）。
+    public void MinLength(string property, FuncT<T, string> getter, int min, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && v.Length < min) {
+                outp = ValidationResult.One(property, message, "MinLength", v);
+            }
+            return outp;
+        });
+    }
+
+    // 长度区间（闭区间，字节数）。
+    public void LengthBetween(string property, FuncT<T, string> getter, int min, int max, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && (v.Length < min || v.Length > max)) {
+                outp = ValidationResult.One(property, message, "LengthBetween", v);
+            }
+            return outp;
+        });
+    }
+
+    // 包含子串。
+    public void Contains(string property, FuncT<T, string> getter, string needle, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && needle != null && !v.Contains(needle)) {
+                outp = ValidationResult.One(property, message, "Contains", v);
+            }
+            return outp;
+        });
+    }
+
+    // 以指定文本开头。
+    public void StartsWith(string property, FuncT<T, string> getter, string prefix, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && prefix != null && !v.StartsWith(prefix)) {
+                outp = ValidationResult.One(property, message, "StartsWith", v);
+            }
+            return outp;
+        });
+    }
+
+    // 以指定文本结尾。
+    public void EndsWith(string property, FuncT<T, string> getter, string suffix, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && suffix != null && !v.EndsWith(suffix)) {
+                outp = ValidationResult.One(property, message, "EndsWith", v);
+            }
+            return outp;
+        });
+    }
+
+    // 通配符匹配（`*` 任意长度，`?` 单字节）。见 ValidationText。
+    public void Matches(string property, FuncT<T, string> getter, string pattern, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && !ValidationText.Matches(v, pattern)) {
+                outp = ValidationResult.One(property, message, "Matches", v);
+            }
+            return outp;
+        });
+    }
+
+    // 等于指定文本（按内容比较）。
+    public void EqualText(string property, FuncT<T, string> getter, string expected, string message) {
+        this.AddRule(s => {
+            string v = getter(s);
+            ValidationResult outp = null;
+            if (v != null && expected != null && v != expected) {
+                outp = ValidationResult.One(property, message, "EqualText", v);
+            }
+            return outp;
+        });
+    }
+
+    /* ---------- 数值规则 ---------- */
+
+    // 整数区间（闭区间）。
+    public void RangeInt(string property, FuncT<T, int> getter, int min, int max, string message) {
+        this.AddRule(s => {
+            int v = getter(s);
+            ValidationResult outp = null;
+            if (v < min || v > max) {
+                outp = ValidationResult.One(property, message, "RangeInt", "" + v);
+            }
+            return outp;
+        });
+    }
+
+    // 整数下限（闭）。
+    public void GreaterThanInt(string property, FuncT<T, int> getter, int min, string message) {
+        this.AddRule(s => {
+            int v = getter(s);
+            ValidationResult outp = null;
+            if (v < min) {
+                outp = ValidationResult.One(property, message, "GreaterThanInt", "" + v);
+            }
+            return outp;
+        });
+    }
+
+    // 整数上限（闭）。
+    public void LessThanInt(string property, FuncT<T, int> getter, int max, string message) {
+        this.AddRule(s => {
+            int v = getter(s);
+            ValidationResult outp = null;
+            if (v > max) {
+                outp = ValidationResult.One(property, message, "LessThanInt", "" + v);
+            }
+            return outp;
+        });
+    }
+
+    // 浮点区间（闭区间）。
+    public void RangeDouble(string property, FuncT<T, double> getter, double min, double max, string message) {
+        this.AddRule(s => {
+            double v = getter(s);
+            ValidationResult outp = null;
+            if (v < min || v > max) {
+                outp = ValidationResult.One(property, message, "RangeDouble", "" + v);
+            }
+            return outp;
+        });
+    }
+
+    /* ---------- 布尔规则 ---------- */
+
+    // 必须为真。
+    public void True(string property, FuncT<T, bool> getter, string message) {
+        this.AddRule(s => {
+            bool v = getter(s);
+            ValidationResult outp = null;
+            if (!v) {
+                outp = ValidationResult.One(property, message, "True", "");
+            }
+            return outp;
+        });
+    }
+
+    /* ---------- 任意规则 ---------- */
+
+    // 任意断言：谓词拿到整个对象，property 只是失败项的属性名。
+    // 跨字段规则用它（`s => s.start < s.end`）。
+    public void Must(string property, FuncT<T, bool> predicate, string message) {
+        this.AddRule(s => {
+            bool ok = predicate(s);
+            ValidationResult outp = null;
+            if (!ok) {
+                outp = ValidationResult.One(property, message, "Must", "");
+            }
+            return outp;
+        });
+    }
+
+    // 嵌套校验：child 拿到子对象的校验结果，失败项的属性名会带上
+    // 本属性做前缀（"address.city"）。
+    public void Nested(string property, FuncT<T, ValidationResult> child) {
+        this.AddRule(s => {
+            ValidationResult cr = child(s);
+            ValidationResult outp = null;
+            if (cr != null && cr.ErrorCount > 0) {
+                outp = new ValidationResult();
+                for (int i = 0; i < cr.failures.Count; i = i + 1) {
+                    ValidationFailure f = cr.failures[i];
+                    outp.Add(new ValidationFailure(property + "." + f.property, f.message, f.code, f.attemptedValue));
+                }
+            }
+            return outp;
+        });
+    }
+
+    /* ---------- 执行 ---------- */
+
+    // 执行校验，聚合全部失败。
+    public ValidationResult Validate(T instance) {
+        return this.ValidateWith(instance, new ValidationContext());
+    }
+
+    // 带上下文的校验：上下文决定是否首错即停、失败项属性名前缀。
+    public ValidationResult ValidateWith(T instance, ValidationContext context) {
+        ValidationResult result = new ValidationResult();
+        if (context == null) { context = new ValidationContext(); }
+        for (int i = 0; i < this.rules.Count; i = i + 1) {
+            FuncT<T, ValidationResult> rule = this.rules[i];
+            ValidationResult r = rule(instance);
+            if (r != null && r.ErrorCount > 0) {
+                this.Merge(result, r, context.propertyPrefix);
+                if (context.stopOnFirstFailure) { break; }
+            }
+        }
+        return result;
+    }
+
+    // 只问通过与否。
+    public bool IsValid(T instance) {
+        return this.Validate(instance).IsValid;
+    }
+
+    // 校验不通过就抛 ValidationException。
+    public void ValidateOrThrow(T instance) {
+        ValidationResult result = this.Validate(instance);
+        if (!result.IsValid) { throw new ValidationException(result); }
+    }
+
+    // 把来源结果的失败项并进目标结果，并按需加属性名前缀。
+    public void Merge(ValidationResult target, ValidationResult source, string prefix) {
+        if (target == null || source == null) { return; }
+        for (int i = 0; i < source.failures.Count; i = i + 1) {
+            ValidationFailure f = source.failures[i];
+            if (prefix != null && prefix.Length > 0) {
+                target.Add(new ValidationFailure(prefix + "." + f.property, f.message, f.code, f.attemptedValue));
+            } else {
+                target.Add(f);
+            }
+        }
+    }
+}

@@ -106,6 +106,39 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `Vector3.Add(new Vector3(...), ...)` codegen 失败）。已在 zan 编译器侧收口。
   写新代码时若又遇到「结构体值莫名其妙变全零 / codegen 报 Call parameter type
   does not match」，先怀疑这条链路，别改用户代码绕开。
+* **泛型实例化：类型实参在 `new` 处必须是具体类型**（实证，2026-10-21）：
+  具体类里写 `new Foo<Bar>()` 没问题；泛型类里写 `new Inner<T>()`（T 是**类级**
+  类型参数）也没问题——`Base<Signup>` 实例化时 T 就具体化了。但**泛型方法内**
+  `new Foo<T, V>`（V 是**方法级**类型参数）不行：变体不会被编译器记录 →
+  不发射 → 调用退化成擦除版 → 取值一律 null/false/0，**不报错不抛异常**，
+  规则静默失效。设计时把类型实参留在类级，或改用 `FuncT<T, V>` 形参而不是
+  按 V 实例化泛型类。
+* **依赖型泛型基类会算错字段偏移**（实证，2026-10-21）：`class Validator<T> :
+  Plan<T>` 能编译，但特化出的 `Validator<Signup>` 读基类字段的偏移是错的——
+  基类构造里字段还是好的，继承来的方法里再读就成了 null（"null reference
+  where an object is required"）。具体实例化的基类（`class X : Base<Signup>`）
+  正常；泛型类持有依赖型泛型**字段**（`class Base<T> { Inner<T> inner; }`）
+  正常。要"泛型基类的成员"就用组合（字段），别用依赖型基类。
+* **`object.ToString()` 调不通**（实证，2026-10-21）：在 `object` 静态类型的
+  接收者上调 `ToString()` 报 "this call could not be resolved to any callable"。
+  用 `is` + 强转（`if (v is string) { string t = (string)v; }`）。装箱进
+  `List<object>` 的**值类型**在 `is` 下不认（探针里装箱 int 不匹配 `is int`），
+  别把值类型存进 `object` 再取回来。
+* **计算属性可写**：`public bool IsValid { get { return ...; } }`（只有 getter
+  形态）；`List<T>.Count`、`Dictionary<K,V>` 的 `Count`/`Keys`/`Values` 也是属性。
+* **`string` 内建成员很全**：`Length`（字节数）、`Substring`、`IndexOf`、
+  `LastIndexOf`、`Contains`、`StartsWith`、`EndsWith`、`Replace`、`Trim`、
+  `ToUpper`、`ToLower`、`Split`（→ `List<string>`）、`Equals`；`==` 按内容比较。
+  `Dictionary<K,V>`（也可写 `Dict<K,V>`）有 `Add`/`Remove`/`Clear`/
+  `ContainsKey`/`TryGetValue`。
+* **lambda 一半返回 null 时**：先把局部变量按显式类型声明好再返回
+  （`ValidationResult outp = null; ... return outp;`）——`return null;` 与
+  `return value;` 并列时，返回类型推断可能挑中 null 那支。
+* **链式调用上的空安全会被拦**：`result.FirstFailure().property` 报
+  "'FirstFailure' can return null; accessing 'property' …"。先存进局部变量判空
+  再用（`?.` 亦可）。
+* **基类构造的调用语法是 `: base(expr)`**（写在构造签名后），不是体内的
+  `super(...)`；派生类构造会隐式调用基类的无参构造。
 
 ## 4. Edit
 

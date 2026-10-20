@@ -8,6 +8,48 @@
 
 ## 未完成
 
+### [ ] A418 泛型方法内实例化泛型类（`new Foo<T,V>`，V 是方法级类型参数）——变体不发射，规则静默失效
+
+- 现象：`AbstractValidator<T>.Rule<V>(string property, FuncT<T,V> getter)` 里
+  `new RuleBuilder<T,V>(...)`；`RuleBuilder<Signup,string>` 这类别实例化在
+  AST 扫描期不可见（V 是**方法级**类型参数），`discover_generic_insts`
+  （`src/compiler/irgen_generics.c`）不记录它 → 变体不发射 → 调用退化为
+  擦除版 → 运行期取值器返回默认值（null/false/0），所有规则**静默不生效**
+  （不报错、不抛异常，最难查的一类）。
+- 证据：IR 里只有 `RuleBuilder_*`（擦除版），没有 `RuleBuilder$Signup$string`。
+- 已排除的形态（都能用）：内联 `is string` 判定；泛型类的**实例方法**
+  （`Ops<V>.IsEmpty` ✓）；用户在具体类里显式 `new` 的具体实例化
+  （`new Plan<Signup>()` ✓）；泛型类持有依赖型泛型**字段**
+  （`class Base<T> { Inner<T> inner; }` + `new Inner<T>()` ✓）。
+  方法级类型实参的绑定推断本批已修（`infer_method_tp_bindings`），
+  但那只解决"推得出 T"，不解决"变体不发射"。
+- 方向：让发射期按需注册并发射**依赖方法级类型参数**的泛型类变体——
+  要么在 checker 阶段把方法级类型实参具体化后再做实例化扫描，要么在
+  `discover_generic_insts` 之外增加"按需实例化"通道。
+- 现状规避：`Zan.Validation` 改用 `ValidationPlan<T>`（只用**类级**类型
+  参数）+ 取值器闭包表达规则，API 形态见
+  `packages/Zan.Validation/README.md`；这不是临时绕路——属性取值器本来就是
+  FluentValidation 的形态——但"泛型方法内 `new 泛型类<类参数, 方法参数>`"
+  本身仍是编译器缺口。
+
+### [ ] A419 依赖型泛型基类（`class V<T> : Plan<T>`）特化后字段偏移错位——运行期空引用
+
+- 现象：`SignupValidator : Validator<Signup>`，而 `Validator<T> : Plan<T>`。
+  构造 `SignupValidator` 时崩：基类构造里 `this.properties` / `this.checks`
+  看着是好的（计数 0），但紧接着在 `Plan<T>.Add` 里读 `this.properties`
+  得到 null →
+  `runtime error: null reference where an object is required (member access)`。
+- 根因：泛型类的**基类类型**在特化时没有把类型实参替换进去（基类仍是
+  `Plan<T>` 而不是 `Plan<Signup>`），派生类里看到的字段偏移与基类方法里
+  算出的偏移不一致——同一份数据在两个地方被解释成两个东西。
+- 已排除的形态（都能用）：具体实例化的基类（`class X : Base<Signup>` ✓，
+  含继承来的方法体）；泛型类持有依赖型泛型**字段**（`Base<T>` 里的
+  `Inner<T> inner`）✓。
+- 方向：泛型类特化时同步替换基类类型实参（复用 `subst_type_param_deep`），
+  并让基类字段偏移按替换后的类型重算。
+- 现状规避：`Zan.Validation` 让用户直接继承 `ValidationPlan<T>`
+  （`ValidationPlan<T>` 自身无基类），不套一层 `AbstractValidator<T>`。
+
 ### [ ] A392 自举的运行期类型判定看不见接口与容器
 
 - 现象（2026-10-20 修完 A384 后的边界）：自举后端现在能给对象判定类身份

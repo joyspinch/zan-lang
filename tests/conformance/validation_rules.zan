@@ -1,0 +1,237 @@
+using System;
+using System.Collections.Generic;
+using System.Validation;
+
+// 被校验的模型。
+public class Signup {
+    public string userName;
+    public string email;
+    public int age;
+    public string start;
+    public string end;
+    public Signup() {
+        this.userName = "";
+        this.email = "";
+        this.age = 0;
+        this.start = "";
+        this.end = "";
+    }
+}
+
+public class Address {
+    public string city;
+    public Address() { this.city = ""; }
+}
+
+// 嵌套对象的校验器。
+public class AddressValidator : ValidationPlan<Address> {
+    public AddressValidator() {
+        this.NotEmpty("city", a => a.city, "is required");
+    }
+}
+
+// 专用校验器：继承 ValidationPlan<T>。
+public class SignupValidator : ValidationPlan<Signup> {
+    public SignupValidator() {
+        this.NotEmpty("userName", s => s.userName, "is required");
+        this.Required("email", s => s.email, "is required");
+        this.MaxLength("userName", s => s.userName, 16, "is too long");
+        this.MinLength("userName", s => s.userName, 3, "is too short");
+        this.Contains("email", s => s.email, "@", "must contain @");
+        this.StartsWith("email", s => s.email, "a", "must start with a");
+        this.EndsWith("email", s => s.email, ".com", "must end with .com");
+        this.Matches("email", s => s.email, "*@*.com", "must look like an email");
+        this.RangeInt("age", s => s.age, 18, 150, "must be 18..150");
+        this.GreaterThanInt("age", s => s.age, 17, "must be adult");
+        this.LessThanInt("age", s => s.age, 151, "must be under 151");
+        this.Must("age", s => s.start < s.end, "start must precede end");
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string label, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static void CheckEq(string label, string actual, string expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected [" + expected + "] got [" + actual + "]");
+        }
+    }
+
+    static void CheckEqInt(string label, int actual, int expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected " + expected + " got " + actual);
+        }
+    }
+
+    // 取第一条失败项；没有时返回占位项（让断言能安全读字段）。
+    static ValidationFailure FirstOf(ValidationResult r) {
+        ValidationFailure f = r.FirstFailure();
+        if (f == null) {
+            return new ValidationFailure("", "", "", "");
+        }
+        return f;
+    }
+
+    static void Main() {
+        SignupValidator v = new SignupValidator();
+
+        // 全空对象：多条规则同时失败。
+        Signup s = new Signup();
+        ValidationResult r = v.Validate(s);
+        Check("empty is invalid", !r.IsValid);
+        Check("empty has errors", r.HasError);
+        CheckEqInt("empty error count", r.ErrorCount, 10);
+        CheckEq("first error property", FirstOf(r).property, "userName");
+        CheckEq("first error code", FirstOf(r).code, "NotEmpty");
+        CheckEq("first error message", r.FirstError(), "is required");
+
+        // 通过的对象：所有规则都满足。
+        Signup ok = new Signup();
+        ok.userName = "alice";
+        ok.email = "alice@example.com";
+        ok.age = 30;
+        ok.start = "a";
+        ok.end = "z";
+        ValidationResult r2 = v.Validate(ok);
+        Check("good is valid", r2.IsValid);
+        CheckEqInt("good error count", r2.ErrorCount, 0);
+        Check("good has no first failure", r2.FirstFailure() == null);
+        CheckEq("good text", r2.ToText(), "valid");
+
+        // 逐条规则：只让一条失败。
+        Signup t = new Signup();
+        t.userName = "alice";
+        t.email = "alice@example.com";
+        t.age = 30;
+        t.start = "a";
+        t.end = "z";
+        t.userName = "";
+        ValidationResult r3 = v.Validate(t);
+        CheckEqInt("blank name error count", r3.ErrorCount, 2);
+        CheckEq("blank name code", FirstOf(r3).code, "NotEmpty");
+
+        t.userName = "al";
+        ValidationResult r4 = v.Validate(t);
+        CheckEqInt("short name error count", r4.ErrorCount, 1);
+        CheckEq("short name code", FirstOf(r4).code, "MinLength");
+
+        t.userName = "averyveryverylongusername";
+        ValidationResult r5 = v.Validate(t);
+        CheckEqInt("long name error count", r5.ErrorCount, 1);
+        CheckEq("long name code", FirstOf(r5).code, "MaxLength");
+
+        t.userName = "alice";
+        t.email = "aliceexample.com";
+        ValidationResult r6 = v.Validate(t);
+        CheckEqInt("bad email error count", r6.ErrorCount, 2);
+        CheckEq("bad email code", FirstOf(r6).code, "Contains");
+
+        t.email = "alice@example.com";
+        t.age = 10;
+        ValidationResult r7 = v.Validate(t);
+        CheckEqInt("bad age error count", r7.ErrorCount, 2);
+        CheckEq("bad age code", FirstOf(r7).code, "RangeInt");
+
+        t.age = 30;
+        t.start = "z";
+        t.end = "a";
+        ValidationResult r8 = v.Validate(t);
+        CheckEqInt("bad range error count", r8.ErrorCount, 1);
+        CheckEq("bad range code", FirstOf(r8).code, "Must");
+
+        // 按属性筛失败项。
+        Signup bad = new Signup();
+        ValidationResult r9 = v.Validate(bad);
+        CheckEqInt("errors for userName", r9.ErrorsFor("userName").Count, 2);
+        CheckEqInt("errors for missing property", r9.ErrorsFor("nope").Count, 0);
+
+        // 字典视图：属性 → 首条消息。
+        Dictionary<string, string> map = r9.ToDictionary();
+        CheckEqInt("dictionary size", map.Count, 3);
+        CheckEq("dictionary userName", map["userName"], "is required");
+
+        // 文本视图。
+        string text = r9.ToText();
+        Check("text has userName", text.Contains("userName: is required"));
+        Check("text is multiline", text.Contains("\n"));
+
+        // JSON 视图。
+        string json = r9.ToJson();
+        Check("json is object", json.StartsWith("{"));
+        Check("json has valid flag", json.Contains("\"valid\":false"));
+        Check("json has property", json.Contains("\"property\":\"userName\""));
+        Check("json has code", json.Contains("\"code\":\"NotEmpty\""));
+
+        // 首错即停。
+        ValidationContext fast = new ValidationContext().FailFast();
+        ValidationResult r10 = v.ValidateWith(bad, fast);
+        CheckEqInt("failfast error count", r10.ErrorCount, 1);
+
+        // 属性名前缀。
+        ValidationContext prefixed = new ValidationContext().WithPrefix("signup");
+        ValidationResult r11 = v.ValidateWith(bad, prefixed);
+        CheckEq("prefixed property", FirstOf(r11).property, "signup.userName");
+
+        // 抛异常。
+        bool threw = false;
+        try {
+            v.ValidateOrThrow(bad);
+        } catch (ValidationException ex) {
+            threw = true;
+            Check("exception carries result", ex.result != null);
+            CheckEqInt("exception result count", ex.result.ErrorCount, 10);
+        }
+        Check("invalid throws", threw);
+
+        bool threwOk = false;
+        try {
+            v.ValidateOrThrow(ok);
+        } catch (ValidationException ex2) {
+            threwOk = true;
+        }
+        Check("valid does not throw", !threwOk);
+
+        // 规则集可以独立于校验器使用。
+        ValidationPlan<Signup> plan = new ValidationPlan<Signup>();
+        plan.NotEmpty("userName", x => x.userName, "is required");
+        plan.RangeInt("age", x => x.age, 18, 150, "must be adult");
+        CheckEqInt("standalone rule count", plan.RuleCount(), 2);
+        Signup s2 = new Signup();
+        ValidationResult r12 = plan.Validate(s2);
+        CheckEqInt("standalone error count", r12.ErrorCount, 2);
+        ValidationResult r13 = Validation.Validate(plan, s2);
+        CheckEqInt("facade error count", r13.ErrorCount, 2);
+
+        // 嵌套校验：子对象的失败项带上父属性前缀。
+        ValidationPlan<Signup> nested = new ValidationPlan<Signup>();
+        AddressValidator av = new AddressValidator();
+        nested.Nested("address", x => av.Validate(new Address()));
+        ValidationResult r14 = nested.Validate(s2);
+        CheckEqInt("nested error count", r14.ErrorCount, 1);
+        CheckEq("nested property", FirstOf(r14).property, "address.city");
+
+        // 通配匹配原语。
+        Check("wildcard star", ValidationText.Matches("alice@example.com", "*@*.com"));
+        Check("wildcard question", ValidationText.Matches("abc", "a?c"));
+        Check("wildcard no match", !ValidationText.Matches("alice", "*@*"));
+        Check("wildcard empty", ValidationText.Matches("", "*"));
+        Check("text is empty", ValidationText.IsEmpty(""));
+        Check("text is blank", ValidationText.IsBlank("   "));
+        Check("text is not blank", !ValidationText.IsBlank(" x "));
+
+        if (failures == 0) {
+            Console.WriteLine("ALL VALIDATION RULES TESTS PASSED");
+        } else {
+            Console.WriteLine("VALIDATION FAILURES: " + Convert.ToString(failures));
+        }
+    }
+}

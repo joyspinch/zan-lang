@@ -60,6 +60,36 @@
 **未覆盖**：定点数 / 大数（decimal 已在 `System.Decimal`，128 位定点）、
 复数、凸包/几何算法（`Zan.Game` 的 `Arcade2D`/`Collision2D` 已覆盖 2D 几何检测）。
 
+### 1.3 校验层：`Zan.Validation`
+
+新包 `packages/Zan.Validation`，命名空间 `System.Validation`（不进 stdlib——
+校验是可选能力，不是语言底座；`Zan.Web` 的 `Validator` 保持原样不动）。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `ValidationPlan.zan` | `ValidationPlan<T>` | 引擎：规则链 + 错误聚合；文本/数值/布尔/任意/嵌套五类规则 |
+| `ValidationResult.zan` | `ValidationResult` | 失败项列表、字典视图、文本视图、JSON 视图（走 `JsonValue`） |
+| `ValidationFailure.zan` | `ValidationFailure` | property / message / code / attemptedValue |
+| `ValidationContext.zan` | `ValidationContext` | 首错即停、属性名前缀 |
+| `ValidationException.zan` | `ValidationException` | 校验失败即抛，携带原始结果 |
+| `ValidationText.zan` | `ValidationText` | 空/空白判定 + 通配符匹配（`*` / `?`，不引正则） |
+| `Validation.zan` | `Validation` | 门面：Ok / Ensure / Validate |
+
+**绑定方式**：规则在**声明时**用取值器把"取哪个属性"固化（`s => s.userName`），
+运行期零反射——属性改名在编译期就报错。这比路线图里设想的"`Gen*` 生成绑定"
+更直接：`Gen*` 是给"从字段名反查类型"用的，而校验需要的只是"从属性到值"的
+一个 lambda，编译器本来就检查它的类型。
+
+**形态被编译器逼了一把**：原设计是 C# 风格的 `Rule<V>(...).NotEmpty().MaxLength()`
+（方法级类型参数 V）。当前编译器不支持"泛型方法内 `new 泛型类<类参数, 方法参数>`"
+（变体不发射，规则静默失效，见 `TASKS.md` A418），也不支持依赖型泛型基类
+（`class V<T> : Plan<T>`，字段偏移错位，见 A419）。因此规则形态收敛为
+**类级类型参数 + 取值器闭包**：`ValidationPlan<T>` 既是引擎也是基类，用户
+直接继承它（不再多包一层 `AbstractValidator<T>`）。
+
+conformance：`validation_rules`（规则触发、错误聚合顺序、首错即停、属性名前缀、
+嵌套前缀、异常、三种错误视图、通配匹配）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -70,7 +100,7 @@
 |---|---|---|---|---|
 | `Zan.Math` | MathNet.Numerics | 3,772 | ✅ 已并入 `stdlib/System/Numerics`（`MathUtil`/`Quaternion`/`Noise`/`RandomExt`/`Spline`，不新建平行包，见 §1.2） | — |
 | `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | 压缩只在 AppUpdate 零散使用；无通用 deflate/lz4/zstd | 1–2 周 |
-| `Zan.Validation` | FluentValidation | 9,765 | 只有 `Zan.Web.Validator`；缺规则链/错误聚合，**用 `Gen*` 生成绑定，不用运行时反射** | 2 周 |
+| `Zan.Validation` | FluentValidation | 9,765 | ✅ 已落地 `packages/Zan.Validation`（`System.Validation`，规则链 + 错误聚合，编译期绑定取值器、运行期零反射，见 §1.3） | — |
 | `Zan.Logging` | Serilog / NLog | 8,051 / 6,550 | ✅ 已在 `System.Diagnostics` 内落地（见 §1） | — |
 
 ### 第 1 层 · 中间件
@@ -137,7 +167,7 @@
 
 ## 6. 落地顺序
 
-**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` → `Zan.Cli`
+**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli`
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
