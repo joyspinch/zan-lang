@@ -33,16 +33,26 @@ def key_bg(im: Image.Image) -> Image.Image:
         b_ok = Image.eval(bb, lambda p: 255 if p < 170 else 0)
         m = ImageChops_mul(greenish, r_ok, b_ok)
     elif r < 70 and g < 70 and b < 70:
-        # black card: flood-fill the dark region reachable from the border
-        # (the white die-cut border keeps the fill out of the character)
-        dark = ((arr[..., 0] < 80) & (arr[..., 1] < 80)
-                & (arr[..., 2] < 80)).astype(np.uint8) * 255
+        # black card: flood-fill the dark region reachable from the border.
+        # The threshold must swallow the whole bg->sticker blend ring (lum
+        # up to ~160) — that ring is exactly what shows as a dark fringe on
+        # light backgrounds.  The white die-cut border keeps the fill out
+        # of the character; deep erosion then shaves whatever ring pixels
+        # survived above the threshold.
+        lum = (arr[..., 0] * 0.3 + arr[..., 1] * 0.6 + arr[..., 2] * 0.1)
+        dark = (lum < 160).astype(np.uint8) * 255
         m = Image.fromarray(dark, "L")
         pad = Image.new("L", (m.width + 2, m.height + 2), 255)
         pad.paste(m, (1, 1))
         ImageDraw.floodfill(pad, (0, 0), 128, thresh=0)
         m = pad.crop((1, 1, m.width + 1, m.height + 1)).point(
             lambda p: 255 if p == 128 else 0)
+        alpha = m.point(lambda p: 0 if p == 255 else 255)
+        alpha = alpha.filter(ImageFilter.MinFilter(5)).filter(
+            ImageFilter.MinFilter(5))
+        out = im.convert("RGBA")
+        out.putalpha(alpha)
+        return drop_specks(out)
     else:
         print(f"  unknown backdrop median rgb=({r:.0f},{g:.0f},{b:.0f}) — SKIP",
               flush=True)
@@ -109,6 +119,10 @@ def crop_margin(im: Image.Image, pad: int) -> Image.Image:
 # ---- mascots: transparent PNG, cropped to silhouette ----
 for name in ["hero", "run", "sleep", "cheer", "code", "battle"]:
     src = RAW / f"{name}.png"
+    if not src.exists():
+        print(f"{name}: no raw master — keeping committed zanzi-{name}.png",
+              flush=True)
+        continue
     im = key_bg(Image.open(src))
     n = sum(1 for p in im.getchannel("A").getdata() if p == 0)
     if n < im.width * im.height * 0.2:

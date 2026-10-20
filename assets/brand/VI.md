@@ -172,11 +172,11 @@ PIL 降采样，透明底）：`logo/png/` 下 `zan-mark-16/32/48/64/128/256/512
 
 **② 由 AI 生成原图加工**（`tools/postprocess.py`：绿幕/黑卡自适应抠底 +
 连通域去噪点 + 切尺寸）：`mascot/` 下 `zanzi-hero` 691×1024、`zanzi-run`
-960×965、`zanzi-sleep` 919×910、`zanzi-cheer` 794×1024、`zanzi-code`
-862×1024、`zanzi-battle` 813×1024、`zanzi-avatar` 512×512、
+904×918、`zanzi-sleep` 851×828、`zanzi-cheer` 814×1024、`zanzi-code`
+864×1024、`zanzi-battle` 813×1024、`zanzi-avatar` 512×512、
 `zanzi-avatar-round` 512×512。原型为 gpt-image-2 的 1024×1024 原图
-（绿幕或黑卡底由生成批次决定，抠底自动识别），prompt 权威存档在
-`tools/prompts.md`；脚本幂等。
+（背景颜色由生成批次决定：绿幕或黑卡，抠底自动识别；黑卡底已用
+硬性绿幕措辞重生成规避），prompt 权威存档在 `tools/prompts.md`；脚本幂等。
 
 **③ 脚本合成**（`tools/compose.py`，需 PIL）：`banner/zan-banner.png`
 1500×500（GitHub 横幅）、`banner/zan-palette.png` 1600×1180（色板总览卡）。

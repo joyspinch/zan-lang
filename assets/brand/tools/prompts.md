@@ -69,10 +69,18 @@ shadow.
 
 ## 踩坑记录
 
+- **API 会随机无视绿幕指令返纯黑卡**（一批六张里四张黑）。重生成时把绿幕
+  要求提到 prompt 最前并用硬性措辞（PROFESSIONAL CHROMA-KEY GREEN SCREEN /
+  Absolutely NO black background…），四张全部返绿。抠底脚本保留黑卡泛洪
+  路径兜底：阈值必须盖住 bg→贴纸的过渡环（亮度到 ~160），否则白边外留
+  一圈黑毛边（实测踩过：黑毛边在浅底上一眼可见，用户直接打回）。
 - 输出永远是**不透明 RGB**：透明底靠绿幕 + PIL 色度抠底（`postprocess.py`
-  的 `key_green`），阈值 `g>150 且 r<170 且 b<170` + 两轮 MinFilter 腐蚀去
+  的 `key_bg`），绿幕路径 `g>150 且 r<170 且 b<170` + 两轮 MinFilter 腐蚀去
   绿边。贴纸白边 + 深棕描边把角色包了一圈，绿幕才敢用全图色度判断而不
   是只清边缘。
+- 生成图绿底上会落**白色噪点斑块**（辉光渗出），色度键看不见——
+  `drop_specks` 按连通域面积清（<600px 的孤岛连同羽化晕一起删；无人机、
+  速度拖尾这类大件保留）。
 - 首版 prompt 写 `flat vector / flat cel shading`，生成结果太扁没肉感
   （用户反馈「没肉感、立体一点圆润一点」）——改成 `plump pear-shaped body,
   plush-toy softness, soft volumetric shading, everything round and squishy`
