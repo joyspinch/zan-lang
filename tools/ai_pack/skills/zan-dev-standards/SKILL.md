@@ -681,11 +681,25 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   对 IDE 不成立：IDE 就是第一个 App）：ZAN_UI_SCRIPT 给脚本、ZAN_UI_OUT 给
   输出目录，`keydown 65 3` / `keyup 65 3` 就是 Ctrl+Shift+A（mods 位：Ctrl=1
   Shift=2 Alt=4，keycode 用 Windows 虚拟键码；Ctrl+Shift+字母不产生控制
-  字符，所以走按键抬起事件那条通道）。三条配套坑：① 注入的坐标是**客户区**
+  字符，所以走按键抬起事件那条通道；该通道必须带上修饰键状态，否则
+  组合键退化成裸键）。三条配套坑：① 注入的坐标是**客户区**
   像素，而画布 dump 的起点在自绘标题栏下方（+48px），点功能区页签要 +48；
   ② `dump pixels` 的 ZPX1 头部 24 字节（x,y,w,h,bpp 五个 u32 从偏移 4 起，
   w 在 12、h 在 16），像素是内存序 B,G,R,A，转图用现成脚本别手写；③ 脚本
   路径只传裸文件名，点击后至少等 1~2 秒再 dump。
+- **改组合键行为必须走真实键盘验收，合成事件会掩盖"修饰键根本没送到
+  上层"**：UiDriver / `InjectEvent` 的合成事件自带 mods 位，真机上的
+  修饰键却是 Windows 消息带来的，两条路径不等价。Windows 键盘后端曾把
+  WM_CHAR 与 WM_KEYUP 的修饰键固定记成 0，于是 IDE 一批组合键在真机上
+  是坏的：Ctrl+Space（弹补全）、Shift+F12（查找引用）、Shift+F8、
+  Ctrl+Shift+F/R/A/S、Ctrl+Alt+F、编辑器的 Shift+Tab 反缩进，全退化成
+  裸键——而它们此前只被合成事件验证过，一直没暴露。
+  **验收方法**：写一个探针窗口（Gui 后端），用 SendKeys 发真键，把每个
+  键盘事件的 kind/code/mods 打出来（kind 4=按下、5=抬起、6=字符；code 是
+  Windows 虚拟键码；mods 位 Ctrl=1 Shift=2 Alt=4），对着它看修饰键落在
+  哪个事件上、值对不对。仓库内仓库自带的 `scripts\key_event_probe.ps1`
+  就是这个探针（`-Combos "+{F12};^{ }"`）。
+  坑出处：Windows 键盘修饰键丢失导致 IDE 组合键集体失效（2026-10）。
 
 ### GUI 保留树事件路径的真实点击验证（事件门控验证沉淀）
 
