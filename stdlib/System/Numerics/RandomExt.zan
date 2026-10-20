@@ -1,0 +1,158 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Numerics;
+
+// 确定性伪随机数生成器（xorshift64*）。
+//
+// 与 <c>System.Random</c> 的差别：
+//   * 64 位状态 + xorshift64* 输出，<see cref="NextDouble"/> 具备完整 53 位精度
+//     （<c>System.Random.NextDouble</c> 的精度只有 1e-6）；
+//   * 直接提供正态 / 指数 / 伯努利分布与带权抽样，游戏与模拟开箱可用；
+//   * 同种子必然同序列——可复现、可回放（conformance 的 determinism 孪生依赖此性质）。
+//
+// ⚠ 非加密安全：xorshift 的内部状态可由少量输出反推，密钥、令牌、会话随机数
+// 等安全敏感场景必须使用 <c>System.RandomNumberGenerator</c>（操作系统 CSPRNG）。
+public class RandomExt {
+    // xorshift64* 状态。恒不为 0。
+    private long state;
+
+    // 用显式种子创建生成器（可复现）。seed 为 0 时自动替换为非零常量。
+    public RandomExt(long seed) {
+        this.state = seed != 0L ? seed : 0x2545F4914F6CDD1DL;
+    }
+
+    // 用显式种子创建生成器（可复现）的静态便捷入口。
+    public static RandomExt Seeded(long seed) {
+        return new RandomExt(seed);
+    }
+
+    // 当前状态快照（便于存档/回放）。写入请用 <see cref="Restore"/>。
+    public long State {
+        get { return this.state; }
+    }
+
+    // 恢复先前快照的状态。
+    public void Restore(long savedState) {
+        this.state = savedState != 0L ? savedState : 0x2545F4914F6CDD1DL;
+    }
+
+    // 逻辑右移（对有符号 long 补零；xorshift 要求逻辑移位）。
+    private static long Lsr(long value, int bits) {
+        return (value >> bits) & ((1L << (64 - bits)) - 1L);
+    }
+
+    // 推进状态并返回 64 位原始输出。
+    public long NextRaw() {
+        long x = this.state;
+        x = x ^ Lsr(x, 12);
+        x = x ^ (x << 25);
+        x = x ^ Lsr(x, 27);
+        this.state = x;
+        return x * 2685821657736338717L;
+    }
+
+    // [0.0, 1.0) 区间的双精度随机数（53 位有效精度）。
+    public double NextDouble() {
+        long bits = this.NextRaw();
+        return (double)Lsr(bits, 11) / 9007199254740992.0;
+    }
+
+    // [min, max) 区间的双精度随机数。
+    public double NextRange(double min, double max) {
+        return min + (max - min) * this.NextDouble();
+    }
+
+    // [minInclusive, maxExclusive) 区间的整数。区间非法时返回 min。
+    public int NextInt(int minInclusive, int maxExclusive) {
+        long span = (long)maxExclusive - (long)minInclusive;
+        if (span <= 0L) { return minInclusive; }
+        long r = Lsr(this.NextRaw(), 1) % span;
+        return (int)((long)minInclusive + r);
+    }
+
+    // 等概率布尔值。
+    public bool NextBool() {
+        return (Lsr(this.NextRaw(), 1) & 1L) == 1L;
+    }
+
+    // 以给定概率返回 true。probability ≤ 0 恒为 false，≥ 1 恒为 true。
+    public bool NextBool(double probability) {
+        if (probability <= 0.0) { return false; }
+        if (probability >= 1.0) { return true; }
+        return this.NextDouble() < probability;
+    }
+
+    // 正态分布（Box–Muller 变换）。stdDev ≤ 0 时退化为常数 mean。
+    public double NextNormal(double mean, double stdDev) {
+        if (stdDev <= 0.0) { return mean; }
+        double u1 = this.NextDouble();
+        if (u1 < 1e-12) { u1 = 1e-12; }
+        double u2 = this.NextDouble();
+        double radius = Math.Sqrt(-2.0 * MathUtil.Log(u1));
+        double theta = 2.0 * MathUtil.Pi * u2;
+        return mean + stdDev * radius * Math.Cos(theta);
+    }
+
+    // 指数分布，rate 为速率参数（均值 = 1/rate）。rate ≤ 0 时返回 0。
+    public double NextExponential(double rate) {
+        if (rate <= 0.0) { return 0.0; }
+        double u = this.NextDouble();
+        return -MathUtil.Log(1.0 - u) / rate;
+    }
+
+    // 从列表中等概率取一个元素。列表为空时抛出 InvalidOperationException。
+    public T Pick<T>(List<T> items) {
+        if (items == null || items.Count == 0) {
+            throw new InvalidOperationException("RandomExt.Pick: the collection is empty");
+        }
+        int index = this.NextInt(0, items.Count);
+        return items[index];
+    }
+
+    // 按权重取一个元素。权重需非负且与元素数量一致；总权重为 0 时抛出异常。
+    public T WeightedPick<T>(List<T> items, List<double> weights) {
+        if (items == null || items.Count == 0) {
+            throw new InvalidOperationException("RandomExt.WeightedPick: the collection is empty");
+        }
+        if (weights == null || weights.Count != items.Count) {
+            throw new ArgumentException("RandomExt.WeightedPick: weights must match the item count");
+        }
+        double total = 0.0;
+        for (int i = 0; i < weights.Count; i++) {
+            double w = weights[i];
+            if (w > 0.0) { total = total + w; }
+        }
+        if (total <= 0.0) {
+            throw new InvalidOperationException("RandomExt.WeightedPick: the total weight is zero");
+        }
+        double r = this.NextDouble() * total;
+        double acc = 0.0;
+        for (int i = 0; i < items.Count; i++) {
+            double w = weights[i];
+            if (w > 0.0) { acc = acc + w; }
+            if (r < acc) { return items[i]; }
+        }
+        return items[items.Count - 1];
+    }
+
+    // 原地洗牌（Fisher–Yates）。列表为空时不做任何事。
+    public void Shuffle<T>(List<T> items) {
+        if (items == null || items.Count < 2) { return; }
+        for (int i = items.Count - 1; i > 0; i--) {
+            int j = this.NextInt(0, i + 1);
+            T tmp = items[i];
+            items[i] = items[j];
+            items[j] = tmp;
+        }
+    }
+
+    // 返回洗牌后的新列表，原列表不变。
+    public List<T> Shuffled<T>(List<T> items) {
+        List<T> copy = new List<T>();
+        if (!items) { return copy; }
+        copy.AddRange(items);
+        this.Shuffle<T>(copy);
+        return copy;
+    }
+}

@@ -238,10 +238,36 @@ static double Sqrt(double value);
 static double Round(double value);
 static double Floor(double value);
 static double Ceiling(double value);
+static double Sin(double value);
+static double Cos(double value);
+static double Tan(double value);
+static double Atan(double value);
+static double Atan2(double y, double x);
+static double Asin(double value);
+static double Acos(double value);
 ```
 
-There are no `PI`/`E` constants, no trigonometry (`Sin`/`Cos`/`Tan`), no
-logarithms (`Log`/`Log2`/`Log10`), no `Clamp`, and no generic `Min`/`Max`.
+There are no `PI`/`E` constants, no logarithms (`Log`/`Log2`/`Log10`), no
+`Clamp`, and no generic `Min`/`Max`. The trigonometry family is available, but
+`Math.PI` is **not** — use `System.Numerics.MathUtil.Pi` instead.
+
+### 3.2b System.Numerics（数值层扩展）
+
+`System.Numerics` lives in `stdlib/System/Numerics/`. The geometry types are
+`float` (so they convert to/from the matrix types without precision loss);
+scalar and sampling helpers are `double` (the built-in `Math` is `double` too,
+and game-side math in this repository is `double`-dominant).
+
+| File | Type | What it gives you |
+|---|---|---|
+| `Vector2/3/4.zan` | `float` struct | Existing geometry primitives (`Add`/`Subtract`/`Dot`/`Cross`/`Normalize`/`Lerp`/…). **No operators** — `a + b` does not compile; use the static methods. |
+| `Matrix4x4.zan` | `float` struct | `Identity`/`CreateTranslation`/`CreateScale`/`Multiply`/`Transpose`/`Transform` (row-vector convention: `Transform(v, m)` is `v * m`). |
+| `BitOperations.zan` | — | `PopCount`/`LeadingZeroCount`/`TrailingZeroCount`/`RotateLeft`/`ReverseEndianness`/`Log2`/… |
+| `MathUtil.zan` | `double` | `Pi`/`Tau`/`E`/`DegToRad`/`RadToDeg`/`Epsilon`, `Clamp`/`Clamp01`/`ClampInt`, `Lerp`/`LerpUnclamped`/`InverseLerp`/`Remap`, `SmoothStep`/`SmootherStep`, `Sign`, `Approximately`, `Wrap`/`PingPong`, `MoveTowards`, `DeltaAngle`/`LerpAngle`, `DegreesToRadians`/`RadiansToDegrees`, `Step`, `Hermite`, `RoundTo`, and **`Log`/`Exp`** (the built-in `Math` has neither). |
+| `Quaternion.zan` | `float` struct | `Identity`/`FromAxisAngle`/`FromEuler(Degrees|Radians)`/`ToEuler(Degrees|Radians)`/`Multiply`/`Rotate`/`Slerp`/`Lerp`/`Angle`/`Normalize`/`Inverse`/`Conjugate`/`ToMatrix`/`LookRotation`. `q1*q2` means "apply `q2` first"; euler order is YXZ; angle arguments always carry a `Degrees`/`Radians` suffix. `Matrix4x4.Transform(v, q.ToMatrix())` equals `Quaternion.Rotate(v, q)`. |
+| `Noise.zan` | `double` class | Seeded, reproducible: `Value2D`/`Value3D`/`Perlin2D`/`Perlin3D`/`Fbm2D`/`Ridged2D`. Values stay in `[-1, 1]`. |
+| `RandomExt.zan` | `double` class | xorshift64\* PRNG: `NextDouble`/`NextRange`/`NextInt`/`NextBool`/`NextNormal`/`NextExponential`, plus `Pick<T>`/`WeightedPick<T>`/`Shuffle<T>`/`Shuffled<T>`. Same seed ⇒ same sequence. Not cryptographically safe (use `System.RandomNumberGenerator`). |
+| `Spline.zan` | `float` class | Catmull-Rom (`Evaluate`), cubic Bezier (`EvaluateBezier`), Hermite (`EvaluateHermite`), `ApproximateLength`, `Resample` (uniform arc length). Control points are `List<Vector3>`. |
 
 ### 3.3 System.Collections.List<T>
 

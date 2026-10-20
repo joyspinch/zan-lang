@@ -1,0 +1,215 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Numerics;
+
+// 确定性程序化噪声。
+//
+// 同一 seed 必然产生同一序列（可复现、可回放），不同 seed 产生不同噪声。
+// 组成：
+//   * <see cref="Value2D"/> / <see cref="Value3D"/>：网格点随机值 + 平滑插值的值噪声；
+//   * <see cref="Perlin2D"/> / <see cref="Perlin3D"/>：梯度插值的 Perlin 噪声；
+//   * <see cref="Fbm2D"/>：多倍频叠加的分形布朗运动；
+//   * <see cref="Ridged2D"/>：脊状变体（适合山脊、云、裂纹）。
+//
+// 噪声值域为 [-1, 1]（Perlin 系列的理论上界略小于 1）。
+public class Noise {
+    // 置换表：前 256 项为 0..255 的一个排列，后 256 项复制前 256 项，
+    // 便于用 & 255 做无缝索引。
+    private List<int> perm = new List<int>();
+
+    // 构造种子（可复现）。
+    public long seed;
+
+    public Noise(long seed) {
+        this.seed = seed;
+        RandomExt rng = RandomExt.Seeded(seed);
+        for (int i = 0; i < 256; i++) {
+            this.perm.Add(i);
+        }
+        rng.Shuffle<int>(this.perm);
+        for (int i = 0; i < 256; i++) {
+            this.perm.Add(this.perm[i]);
+        }
+    }
+
+    // 五次淡入淡出（Perlin 原版）：一阶、二阶导在格点处为 0，消除格点瑕疵。
+    private static double Fade(double t) {
+        return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    }
+
+    private static double Lerp(double a, double b, double t) {
+        return a + (b - a) * t;
+    }
+
+    // 二维梯度（8 个方向）。
+    private static double Grad2(int hash, double x, double y) {
+        int h = hash & 7;
+        if (h == 0) { return x + y; }
+        if (h == 1) { return -x + y; }
+        if (h == 2) { return x - y; }
+        if (h == 3) { return -x - y; }
+        if (h == 4) { return x; }
+        if (h == 5) { return -x; }
+        if (h == 6) { return y; }
+        return -y;
+    }
+
+    // 三维梯度（12 个方向）。
+    private static double Grad3(int hash, double x, double y, double z) {
+        int h = hash & 15;
+        double u = h < 8 ? x : y;
+        double v = h < 4 ? y : (h == 12 || h == 14 ? x : z);
+        double r = ((h & 1) == 0) ? u : -u;
+        double s = ((h & 2) == 0) ? v : -v;
+        return r + s;
+    }
+
+    // 二维格点哈希，返回 [-1, 1] 的值。
+    private double Hash2(int x, int y) {
+        int h = this.perm[(this.perm[x & 255] + (y & 255)) & 255];
+        return (double)h / 127.5 - 1.0;
+    }
+
+    // 三维格点哈希，返回 [-1, 1] 的值。
+    private double Hash3(int x, int y, int z) {
+        int h = this.perm[(this.perm[(this.perm[x & 255] + (y & 255)) & 255] + (z & 255)) & 255];
+        return (double)h / 127.5 - 1.0;
+    }
+
+    // 二维值噪声。
+    public double Value2D(double x, double y) {
+        double fx = Math.Floor(x);
+        double fy = Math.Floor(y);
+        int xi = (int)fx;
+        int yi = (int)fy;
+        double u = Noise.Fade(x - fx);
+        double v = Noise.Fade(y - fy);
+        double a = this.Hash2(xi, yi);
+        double b = this.Hash2(xi + 1, yi);
+        double c = this.Hash2(xi, yi + 1);
+        double d = this.Hash2(xi + 1, yi + 1);
+        return Noise.Lerp(Noise.Lerp(a, b, u), Noise.Lerp(c, d, u), v);
+    }
+
+    // 三维值噪声。
+    public double Value3D(double x, double y, double z) {
+        double fx = Math.Floor(x);
+        double fy = Math.Floor(y);
+        double fz = Math.Floor(z);
+        int xi = (int)fx;
+        int yi = (int)fy;
+        int zi = (int)fz;
+        double u = Noise.Fade(x - fx);
+        double v = Noise.Fade(y - fy);
+        double w = Noise.Fade(z - fz);
+        double a000 = this.Hash3(xi, yi, zi);
+        double a100 = this.Hash3(xi + 1, yi, zi);
+        double a010 = this.Hash3(xi, yi + 1, zi);
+        double a110 = this.Hash3(xi + 1, yi + 1, zi);
+        double a001 = this.Hash3(xi, yi, zi + 1);
+        double a101 = this.Hash3(xi + 1, yi, zi + 1);
+        double a011 = this.Hash3(xi, yi + 1, zi + 1);
+        double a111 = this.Hash3(xi + 1, yi + 1, zi + 1);
+        double x00 = Noise.Lerp(a000, a100, u);
+        double x10 = Noise.Lerp(a010, a110, u);
+        double x01 = Noise.Lerp(a001, a101, u);
+        double x11 = Noise.Lerp(a011, a111, u);
+        return Noise.Lerp(Noise.Lerp(x00, x10, v), Noise.Lerp(x01, x11, v), w);
+    }
+
+    // 二维 Perlin 噪声。
+    public double Perlin2D(double x, double y) {
+        double fx = Math.Floor(x);
+        double fy = Math.Floor(y);
+        int xi = (int)fx;
+        int yi = (int)fy;
+        double xf = x - fx;
+        double yf = y - fy;
+        double u = Noise.Fade(xf);
+        double v = Noise.Fade(yf);
+        int X = xi & 255;
+        int Y = yi & 255;
+        int a = this.perm[X] + Y;
+        int b = this.perm[X + 1] + Y;
+        double x1 = Noise.Lerp(
+            Noise.Grad2(this.perm[a], xf, yf),
+            Noise.Grad2(this.perm[b], xf - 1.0, yf), u);
+        double x2 = Noise.Lerp(
+            Noise.Grad2(this.perm[a + 1], xf, yf - 1.0),
+            Noise.Grad2(this.perm[b + 1], xf - 1.0, yf - 1.0), u);
+        return Noise.Lerp(x1, x2, v);
+    }
+
+    // 三维 Perlin 噪声。
+    public double Perlin3D(double x, double y, double z) {
+        double fx = Math.Floor(x);
+        double fy = Math.Floor(y);
+        double fz = Math.Floor(z);
+        int xi = (int)fx;
+        int yi = (int)fy;
+        int zi = (int)fz;
+        double xf = x - fx;
+        double yf = y - fy;
+        double zf = z - fz;
+        double u = Noise.Fade(xf);
+        double v = Noise.Fade(yf);
+        double w = Noise.Fade(zf);
+        int X = xi & 255;
+        int Y = yi & 255;
+        int Z = zi & 255;
+        int a = this.perm[X] + Y;
+        int aa = this.perm[a] + Z;
+        int ab = this.perm[a + 1] + Z;
+        int b = this.perm[X + 1] + Y;
+        int ba = this.perm[b] + Z;
+        int bb = this.perm[b + 1] + Z;
+        double x1 = Noise.Lerp(
+            Noise.Lerp(Noise.Grad3(this.perm[aa], xf, yf, zf),
+                       Noise.Grad3(this.perm[ba], xf - 1.0, yf, zf), u),
+            Noise.Lerp(Noise.Grad3(this.perm[ab], xf, yf - 1.0, zf),
+                       Noise.Grad3(this.perm[bb], xf - 1.0, yf - 1.0, zf), u), v);
+        double x2 = Noise.Lerp(
+            Noise.Lerp(Noise.Grad3(this.perm[aa + 1], xf, yf, zf - 1.0),
+                       Noise.Grad3(this.perm[ba + 1], xf - 1.0, yf, zf - 1.0), u),
+            Noise.Lerp(Noise.Grad3(this.perm[ab + 1], xf, yf - 1.0, zf - 1.0),
+                       Noise.Grad3(this.perm[bb + 1], xf - 1.0, yf - 1.0, zf - 1.0), u), v);
+        return Noise.Lerp(x1, x2, w);
+    }
+
+    // 分形布朗运动：多个倍频的 Perlin 噪声叠加。
+    // persistence 控制振幅衰减（常用 0.5），lacunarity 控制频率倍增（常用 2.0）。
+    public double Fbm2D(double x, double y, int octaves, double persistence, double lacunarity) {
+        int n = octaves < 1 ? 1 : octaves;
+        double total = 0.0;
+        double amplitude = 1.0;
+        double frequency = 1.0;
+        double maxValue = 0.0;
+        for (int i = 0; i < n; i++) {
+            total = total + this.Perlin2D(x * frequency, y * frequency) * amplitude;
+            maxValue = maxValue + amplitude;
+            amplitude = amplitude * persistence;
+            frequency = frequency * lacunarity;
+        }
+        if (maxValue <= 0.0) { return 0.0; }
+        return total / maxValue;
+    }
+
+    // 脊状噪声：1-|n| 平方后叠加，形成山脊 / 裂纹状的锐利结构。
+    public double Ridged2D(double x, double y, int octaves, double persistence, double lacunarity) {
+        int n = octaves < 1 ? 1 : octaves;
+        double total = 0.0;
+        double amplitude = 1.0;
+        double frequency = 1.0;
+        double maxValue = 0.0;
+        for (int i = 0; i < n; i++) {
+            double v = 1.0 - Math.Abs(this.Perlin2D(x * frequency, y * frequency));
+            total = total + v * v * amplitude;
+            maxValue = maxValue + amplitude;
+            amplitude = amplitude * persistence;
+            frequency = frequency * lacunarity;
+        }
+        if (maxValue <= 0.0) { return 0.0; }
+        return total / maxValue;
+    }
+}

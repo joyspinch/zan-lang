@@ -1,0 +1,241 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Numerics;
+
+// 样条曲线：控制点序列上的插值与等弧长重采样。
+//
+// 控制点用 <c>Vector3</c>（与几何层同为 float），参数 t ∈ [0,1] 在控制点上均匀分布。
+// 提供的插值方式：
+//   * <see cref="Evaluate"/>：Catmull-Rom（默认，过控制点且切线连续）；
+//   * <see cref="EvaluateBezier"/>：三次贝塞尔（把全部控制点当作一条曲线的控制顶点）；
+//   * <see cref="EvaluateHermite"/>：Hermite（需显式给出每个控制点的切线）。
+//
+// 另有 <see cref="ApproximateLength"/>（近似弧长）与 <see cref="Resample"/>（等弧长重采样），
+// 后者用于「沿路径匀速移动」这类需求。
+public class Spline {
+    private List<Vector3> points = new List<Vector3>();
+
+    public Spline() {
+    }
+
+    // 用一组控制点构造（复制一份，不持有外部列表）。
+    public Spline(List<Vector3> controlPoints) {
+        if (controlPoints != null) {
+            this.points.AddRange(controlPoints);
+        }
+    }
+
+    // 控制点数量。
+    public int Count {
+        get { return this.points.Count; }
+    }
+
+    // 追加一个控制点。
+    public void Add(Vector3 point) {
+        this.points.Add(point);
+    }
+
+    // 追加一组控制点。
+    public void AddRange(List<Vector3> controlPoints) {
+        if (controlPoints != null) {
+            this.points.AddRange(controlPoints);
+        }
+    }
+
+    // 清空控制点。
+    public void Clear() {
+        this.points.Clear();
+    }
+
+    // 读取指定控制点。
+    public Vector3 PointAt(int index) {
+        return this.points[index];
+    }
+
+    // 取控制点，越界时钳制到端点（端点外推用端点值，保证首尾精确）。
+    private Vector3 At(int index) {
+        int n = this.points.Count;
+        if (index < 0) { return this.points[0]; }
+        if (index > n - 1) { return this.points[n - 1]; }
+        return this.points[index];
+    }
+
+    // Catmull-Rom 插值：曲线穿过全部控制点，端点处切线取自相邻段。
+    public Vector3 Evaluate(float t) {
+        int n = this.points.Count;
+        if (n == 0) { return Vector3.Zero; }
+        if (n == 1) { return this.points[0]; }
+        double tt = (double)t;
+        if (tt < 0.0) { tt = 0.0; }
+        if (tt > 1.0) { tt = 1.0; }
+        double seg = tt * (double)(n - 1);
+        int i = (int)Math.Floor(seg);
+        if (i > n - 2) { i = n - 2; }
+        if (i < 0) { i = 0; }
+        double f = seg - (double)i;
+
+        Vector3 c0 = this.At(i - 1);
+        Vector3 c1 = this.At(i);
+        Vector3 c2 = this.At(i + 1);
+        Vector3 c3 = this.At(i + 2);
+        double p0x = (double)c0.X;
+        double p0y = (double)c0.Y;
+        double p0z = (double)c0.Z;
+        double p1x = (double)c1.X;
+        double p1y = (double)c1.Y;
+        double p1z = (double)c1.Z;
+        double p2x = (double)c2.X;
+        double p2y = (double)c2.Y;
+        double p2z = (double)c2.Z;
+        double p3x = (double)c3.X;
+        double p3y = (double)c3.Y;
+        double p3z = (double)c3.Z;
+
+        double f2 = f * f;
+        double f3 = f2 * f;
+        // q(f) = 0.5 * (2p1 + (-p0+p2)f + (2p0-5p1+4p2-p3)f² + (-p0+3p1-3p2+p3)f³)
+        double h0 = 0.5 * (2.0 * p1x + (-p0x + p2x) * f
+                     + (2.0 * p0x - 5.0 * p1x + 4.0 * p2x - p3x) * f2
+                     + (-p0x + 3.0 * p1x - 3.0 * p2x + p3x) * f3);
+        double h1 = 0.5 * (2.0 * p1y + (-p0y + p2y) * f
+                     + (2.0 * p0y - 5.0 * p1y + 4.0 * p2y - p3y) * f2
+                     + (-p0y + 3.0 * p1y - 3.0 * p2y + p3y) * f3);
+        double h2 = 0.5 * (2.0 * p1z + (-p0z + p2z) * f
+                     + (2.0 * p0z - 5.0 * p1z + 4.0 * p2z - p3z) * f2
+                     + (-p0z + 3.0 * p1z - 3.0 * p2z + p3z) * f3);
+        return new Vector3((float)h0, (float)h1, (float)h2);
+    }
+
+    // 三次贝塞尔插值：把全部控制点当作一条 n 阶贝塞尔曲线的控制顶点。
+    public Vector3 EvaluateBezier(float t) {
+        int n = this.points.Count;
+        if (n == 0) { return Vector3.Zero; }
+        if (n == 1) { return this.points[0]; }
+        double tt = (double)t;
+        if (tt < 0.0) { tt = 0.0; }
+        if (tt > 1.0) { tt = 1.0; }
+        int degree = n - 1;
+        double oneMinus = 1.0 - tt;
+        double binom = 1.0;
+        double bx = 0.0;
+        double by = 0.0;
+        double bz = 0.0;
+        for (int i = 0; i <= degree; i++) {
+            double weight = binom * Math.Pow(oneMinus, (double)(degree - i)) * Math.Pow(tt, (double)i);
+            Vector3 p = this.points[i];
+            bx = bx + weight * (double)p.X;
+            by = by + weight * (double)p.Y;
+            bz = bz + weight * (double)p.Z;
+            if (i < degree) {
+                binom = binom * (double)(degree - i) / (double)(i + 1);
+            }
+        }
+        return new Vector3((float)bx, (float)by, (float)bz);
+    }
+
+    // Hermite 插值：tangents 给出每个控制点的切线（每单位 t 的变化量）。
+    public Vector3 EvaluateHermite(float t, List<Vector3> tangents) {
+        int n = this.points.Count;
+        if (n == 0) { return Vector3.Zero; }
+        if (n == 1) { return this.points[0]; }
+        if (tangents == null || tangents.Count != n) {
+            throw new ArgumentException("Spline.EvaluateHermite: one tangent per control point is required");
+        }
+        double tt = (double)t;
+        if (tt < 0.0) { tt = 0.0; }
+        if (tt > 1.0) { tt = 1.0; }
+        double seg = tt * (double)(n - 1);
+        int i = (int)Math.Floor(seg);
+        if (i > n - 2) { i = n - 2; }
+        if (i < 0) { i = 0; }
+        double f = seg - (double)i;
+
+        double f2 = f * f;
+        double f3 = f2 * f;
+        double h00 = 2.0 * f3 - 3.0 * f2 + 1.0;
+        double h10 = f3 - 2.0 * f2 + f;
+        double h01 = -2.0 * f3 + 3.0 * f2;
+        double h11 = f3 - f2;
+
+        Vector3 p1 = this.At(i);
+        Vector3 p2 = this.At(i + 1);
+        Vector3 m1 = tangents[i];
+        Vector3 m2 = tangents[i + 1];
+        double x = h00 * (double)p1.X + h10 * (double)m1.X + h01 * (double)p2.X + h11 * (double)m2.X;
+        double y = h00 * (double)p1.Y + h10 * (double)m1.Y + h01 * (double)p2.Y + h11 * (double)m2.Y;
+        double z = h00 * (double)p1.Z + h10 * (double)m1.Z + h01 * (double)p2.Z + h11 * (double)m2.Z;
+        return new Vector3((float)x, (float)y, (float)z);
+    }
+
+    // 近似弧长：沿线取 samples 段折线求和。samples < 2 时按 2 处理。
+    public float ApproximateLength(int samples) {
+        int n = this.points.Count;
+        if (n < 2) { return 0.0f; }
+        int steps = samples < 2 ? 2 : samples;
+        double total = 0.0;
+        Vector3 prev = this.Evaluate(0.0f);
+        for (int i = 1; i <= steps; i++) {
+            float t = (float)i / (float)steps;
+            Vector3 cur = this.Evaluate(t);
+            total = total + (double)Vector3.Distance(prev, cur);
+            prev = cur;
+        }
+        return (float)total;
+    }
+
+    // 等弧长重采样：沿曲线按弧长均匀取 count 个点（首尾必取）。
+    public List<Vector3> Resample(int count) {
+        List<Vector3> result = new List<Vector3>();
+        int n = this.points.Count;
+        if (count <= 0 || n == 0) { return result; }
+        if (n == 1) {
+            for (int i = 0; i < count; i++) { result.Add(this.points[0]); }
+            return result;
+        }
+        if (count == 1) {
+            result.Add(this.Evaluate(0.5f));
+            return result;
+        }
+        int steps = count * 8;
+        List<double> cumulative = new List<double>();
+        List<Vector3> samples = new List<Vector3>();
+        double total = 0.0;
+        Vector3 prev = this.Evaluate(0.0f);
+        samples.Add(prev);
+        cumulative.Add(0.0);
+        for (int i = 1; i <= steps; i++) {
+            float t = (float)i / (float)steps;
+            Vector3 cur = this.Evaluate(t);
+            total = total + (double)Vector3.Distance(prev, cur);
+            samples.Add(cur);
+            cumulative.Add(total);
+            prev = cur;
+        }
+        for (int i = 0; i < count; i++) {
+            double target = total * (double)i / (double)(count - 1);
+            int lo = 0;
+            int hi = steps;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (cumulative[mid] < target) { lo = mid + 1; } else { hi = mid; }
+            }
+            if (lo > 0 && lo <= steps) {
+                double c0 = cumulative[lo - 1];
+                double c1 = cumulative[lo];
+                double span = c1 - c0;
+                double frac = span > 0.0 ? (target - c0) / span : 0.0;
+                Vector3 p0 = samples[lo - 1];
+                Vector3 p1 = samples[lo];
+                result.Add(new Vector3(
+                    (float)((double)p0.X + ((double)p1.X - (double)p0.X) * frac),
+                    (float)((double)p0.Y + ((double)p1.Y - (double)p0.Y) * frac),
+                    (float)((double)p0.Z + ((double)p1.Z - (double)p0.Z) * frac)
+                ));
+            } else {
+                result.Add(this.Evaluate(0.0f));
+            }
+        }
+        return result;
+    }
+}

@@ -34,6 +34,32 @@
 
 **注册表是实例级而非静态**——这不是风格偏好，是被编译器逼出来的（见 §7）。
 
+### 1.2 数值层：`Zan.Math` 并入 `System.Numerics`
+
+**不新建平行包**：`System.Numerics` 已有 `Vector2/3/4`、`Matrix4x4`、`BitOperations`，
+数学层天然属于它。落在 `stdlib/System/Numerics/`：
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `MathUtil.zan` | `double` 标量 | Clamp / Lerp / InverseLerp / Remap / SmoothStep / SmootherStep / Sign / Approximately / Wrap / PingPong / MoveTowards / DeltaAngle / LerpAngle / 角度换算 / Hermite / Step / RoundTo，以及 **Log / Exp**（编译器内建 `Math` 没有这两项，此处纯实现） |
+| `Quaternion.zan` | `float`（与 Vector/Matrix 同型） | FromAxisAngle / FromEuler(Degrees/Radians) / ToEuler(Degrees/Radians) / Multiply / Rotate / Slerp / Lerp / Angle / Normalize / Inverse / ToMatrix / LookRotation |
+| `Noise.zan` | `double` | Value2D/3D、Perlin2D/3D、Fbm2D、Ridged2D；同种子必然同序列 |
+| `RandomExt.zan` | `double` | xorshift64\* 确定性 PRNG、NextDouble/Range/IntRange、Normal / Exponential / Bernoulli、`Pick<T>` / `WeightedPick<T>` / `Shuffle<T>` |
+| `Spline.zan` | `float`（控制点 `List<Vector3>`） | Catmull-Rom / Bezier / Hermite 求值、近似弧长、等弧长重采样 |
+
+**类型分工**（有实测依据，不是随手选的）：几何面用 `float`——与既有
+`Vector2/3/4`、`Matrix4x4` 同型，可直接互转；标量与采样面用 `double`——本仓库
+游戏层数学以 `double` 为主导（`packages/Zan.Game` 中 double 出现 986 次 vs float 24 次），
+而内建 `Math` 的成员一律返回 `double`。
+
+**约定**：`Quaternion` 的乘法 `q1*q2` 表示「先施加 q2 再施加 q1」，欧拉角为 YXZ 序，
+角度参数一律显式带 `Degrees` / `Radians` 后缀以消歧义；`Quaternion.ToMatrix()` 与
+`Matrix4x4` 的存储/行向量约定一致，故 `Matrix4x4.Transform(v, q.ToMatrix())`
+与 `Quaternion.Rotate(v, q)` 结果相同（conformance 已断言）。
+
+**未覆盖**：定点数 / 大数（decimal 已在 `System.Decimal`，128 位定点）、
+复数、凸包/几何算法（`Zan.Game` 的 `Arcade2D`/`Collision2D` 已覆盖 2D 几何检测）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -42,7 +68,7 @@
 
 | 建议包 | C# 参考 | ★ | 补什么（实测缺口） | 工期 |
 |---|---|---|---|---|
-| `Zan.Math` | MathNet.Numerics | 3,772 | stdlib 只有 Vector2/3/4 + Matrix4x4；缺四元数、样条、噪声、随机分布、定点/大数 | 2–3 周 |
+| `Zan.Math` | MathNet.Numerics | 3,772 | ✅ 已并入 `stdlib/System/Numerics`（`MathUtil`/`Quaternion`/`Noise`/`RandomExt`/`Spline`，不新建平行包，见 §1.2） | — |
 | `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | 压缩只在 AppUpdate 零散使用；无通用 deflate/lz4/zstd | 1–2 周 |
 | `Zan.Validation` | FluentValidation | 9,765 | 只有 `Zan.Web.Validator`；缺规则链/错误聚合，**用 `Gen*` 生成绑定，不用运行时反射** | 2 周 |
 | `Zan.Logging` | Serilog / NLog | 8,051 / 6,550 | ✅ 已在 `System.Diagnostics` 内落地（见 §1） | — |
@@ -111,7 +137,7 @@
 
 ## 6. 落地顺序
 
-**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` → `Zan.Validation` → `Zan.Cli`
+**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` → `Zan.Cli`
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`

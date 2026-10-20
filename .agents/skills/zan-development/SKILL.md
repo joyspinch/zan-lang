@@ -23,6 +23,13 @@ the symbol index exist to replace — and reading the same window twice is worse
 still: a tool result stays true until you change it, so use the one you have
 instead of asking again.
 
+* **搜不到 ≠ 不存在**：`src/compiler/irgen_*.c` 其实是 `#include` 进 `irgen.c`
+  的同一翻译单元（便于共用 `static` 辅助函数），文件里带 NUL 字节，
+  ripgrep 系工具会当二进制**整文件跳过**（只提示 "stopped searching binary
+  file"）。搜编译器内部实现时改用 `Select-String -Path <glob>`（PowerShell）
+  或 `grep -a`。另外 `irgen_call.c` 里的 `AddRange` / `Reserve` 等 List 内建
+  降级都在 `irgen_call.c`，不在 `irgen.c`。
+
 ## 2. Look up every API you are about to call
 
 ```
@@ -89,6 +96,18 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `Activity.Current` 同理，靠 `Stop()` 显式清空。所以：**常驻可变状态放实例**
   （使用者持有，生命周期跟着走），别放包级 static；确需进程级单例就提供
   显式清空入口。证据与影响面见 `docs/ECOSYSTEM_ROADMAP.md` §7。
+* **值结构体没有运算符**（实证，2026-10-20）：`System.Numerics.Vector3` 只有
+  `Add`/`Subtract`/`Multiply`/`Dot`/`Cross` 等静态方法，**没有 `+ - *` 运算符**
+  ——写数学库必须逐分量展开（`new Vector3(a.X*b, a.Y*b, a.Z*b)`），
+  写 `a * 2.0f` 会在 codegen 阶段炸成 "Both operands to a binary operator are
+  not of the same type"。同理结构体字段不可用运算符表达式赋值。
+* **`new T(...)` 的值语义有坑**（实证，2026-10-20）：结构体构造临时对象在
+  表达式层面是**地址**，传给按值形参 / 存进集合槽位 / 赋给结构体字段时，
+  编译器需要按值取出——这条链路历史上没归一（`List<Vector3>.AddRange` 元素全 0、
+  `Vector3.Add(new Vector3(...), ...)` codegen 失败）。已在 irgen 收口
+  （`coerce_struct_value` / `coerce_args_to_params`）。写新代码时若又遇到
+  「结构体值莫名其妙变全零 / codegen 报 Call parameter type does not match」，
+  先怀疑这条链路，别改用户代码绕开。
 
 ## 4. Edit
 
@@ -140,6 +159,13 @@ the change.
 同一源文件手编失败"的假绿。多会话并行的仓库里，凡结论依赖"刚改过的东西
 过没过"，必须手编直跑（`build/zanc.exe <case>.zan --auto-stdlib -o
 _scratch/x.exe && _scratch/x.exe`）当真值，ctest 只当台账。
+
+**同一个 OUT_EXE 连跑多个用例 = 比对的是上一个用例的程序**（实证）：手工调
+`tests/run_case.cmake` 批量回归时，若多个用例共用 `-DOUT_EXE=<同一个路径>`，
+up-to-date check 只看「产物比 SRC 新」——SRC 更旧就**直接复用上一个用例编出来的
+exe**，于是 A 用例的输出被拿去和 B 用例的 golden 比，报出与 A 毫无关系的
+"output mismatch"。每个用例必须用**各自的 exe 路径**（ctest 里是
+`conf_<name>.exe`，天然唯一），并且批量跑之前先把旧 exe 删掉。
 
 **stdout 抓不到 ≠ 程序没输出**（实证，Windows）：Zan 程序在**有控制台**时
 直接写控制台，PowerShell 的 `> file` 与 `$out = & exe` 都抓不到——重定向

@@ -1,0 +1,302 @@
+using System;
+
+namespace System.Numerics;
+
+// 四元数——与既有的 Vector2/3/4、Matrix4x4 同为 <c>float</c>，可直接互转而不引入精度损失。
+//
+// 约定（务必与 <see cref="Quaternion.ToMatrix"/> 一致）：
+//   * 乘法 <c>q1 * q2</c> 表示「先施加 q2，再施加 q1」；
+//   * <see cref="Quaternion.Rotate"/> 施加的是右手系主动旋转；
+//   * 欧拉角采用 YXZ 序（先 roll(Z)，再 pitch(X)，最后 yaw(Y)），
+//     角度参数一律显式带单位（Degrees / Radians），避免歧义。
+public struct Quaternion {
+    public float X;
+    public float Y;
+    public float Z;
+    public float W;
+
+    public Quaternion(float x, float y, float z, float w) {
+        this.X = x;
+        this.Y = y;
+        this.Z = z;
+        this.W = w;
+    }
+
+    // 单位四元数（不旋转）。
+    public static Quaternion Identity {
+        get { return new Quaternion(0.0f, 0.0f, 0.0f, 1.0f); }
+    }
+
+    // 绕 axis 旋转 angle 弧度。axis 会被归一化。
+    public static Quaternion FromAxisAngle(Vector3 axis, float angle) {
+        Vector3 n = Vector3.Normalize(axis);
+        float half = angle * 0.5f;
+        float s = (float)Math.Sin((double)half);
+        return new Quaternion(n.X * s, n.Y * s, n.Z * s, (float)Math.Cos((double)half));
+    }
+
+    // 由欧拉角（度）构造：pitch 绕 X、yaw 绕 Y、roll 绕 Z，YXZ 序。
+    public static Quaternion FromEulerDegrees(float pitch, float yaw, float roll) {
+        return Quaternion.FromEulerRadians(
+            (float)MathUtil.DegreesToRadians((double)pitch),
+            (float)MathUtil.DegreesToRadians((double)yaw),
+            (float)MathUtil.DegreesToRadians((double)roll)
+        );
+    }
+
+    // 由欧拉角（弧度）构造：pitch 绕 X、yaw 绕 Y、roll 绕 Z，YXZ 序。
+    public static Quaternion FromEulerRadians(float pitch, float yaw, float roll) {
+        Quaternion qRoll = Quaternion.FromAxisAngle(new Vector3(0.0f, 0.0f, 1.0f), roll);
+        Quaternion qPitch = Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), pitch);
+        Quaternion qYaw = Quaternion.FromAxisAngle(new Vector3(0.0f, 1.0f, 0.0f), yaw);
+        return Quaternion.Multiply(qYaw, Quaternion.Multiply(qPitch, qRoll));
+    }
+
+    // 拆回欧拉角（度）：返回 (pitch, yaw, roll)。
+    public Vector3 ToEulerDegrees() {
+        Vector3 r = this.ToEulerRadians();
+        return new Vector3(
+            (float)MathUtil.RadiansToDegrees((double)r.X),
+            (float)MathUtil.RadiansToDegrees((double)r.Y),
+            (float)MathUtil.RadiansToDegrees((double)r.Z)
+        );
+    }
+
+    // 拆回欧拉角（弧度）：返回 (pitch, yaw, roll)。
+    public Vector3 ToEulerRadians() {
+        float x = this.X;
+        float y = this.Y;
+        float z = this.Z;
+        float w = this.W;
+
+        double sinPitch = 2.0 * ((double)w * (double)x - (double)y * (double)z);
+        if (sinPitch > 1.0) { sinPitch = 1.0; }
+        if (sinPitch < -1.0) { sinPitch = -1.0; }
+        double pitch = Math.Asin(sinPitch);
+
+        double yaw = Math.Atan2(
+            2.0 * ((double)x * (double)z + (double)y * (double)w),
+            1.0 - 2.0 * ((double)x * (double)x + (double)y * (double)y)
+        );
+
+        double roll = Math.Atan2(
+            2.0 * ((double)x * (double)y + (double)z * (double)w),
+            1.0 - 2.0 * ((double)x * (double)x + (double)z * (double)z)
+        );
+
+        return new Vector3((float)pitch, (float)yaw, (float)roll);
+    }
+
+    // 四元数乘法：a * b 表示「先施加 b，再施加 a」。
+    public static Quaternion Multiply(Quaternion a, Quaternion b) {
+        return new Quaternion(
+            a.W * b.X + a.X * b.W + a.Y * b.Z - a.Z * b.Y,
+            a.W * b.Y - a.X * b.Z + a.Y * b.W + a.Z * b.X,
+            a.W * b.Z + a.X * b.Y - a.Y * b.X + a.Z * b.W,
+            a.W * b.W - a.X * b.X - a.Y * b.Y - a.Z * b.Z
+        );
+    }
+
+    // 用四元数旋转一个向量。
+    //
+    // 展开式：v' = v + 2w(u×v) + 2u×(u×v)，其中 u 为四元数的向量部分。
+    // Vector3 未定义运算符，故逐分量展开。
+    public static Vector3 Rotate(Vector3 point, Quaternion rotation) {
+        Vector3 u = new Vector3(rotation.X, rotation.Y, rotation.Z);
+        Vector3 c1 = Vector3.Cross(u, point);
+        Vector3 t = new Vector3(c1.X * 2.0f, c1.Y * 2.0f, c1.Z * 2.0f);
+        Vector3 c2 = Vector3.Cross(u, t);
+        return new Vector3(
+            point.X + c2.X + t.X * rotation.W,
+            point.Y + c2.Y + t.Y * rotation.W,
+            point.Z + c2.Z + t.Z * rotation.W
+        );
+    }
+
+    // 绕 forward 方向构造朝向（+Z 轴指向 forward），up 给出参考上方向。
+    public static Quaternion LookRotation(Vector3 forward, Vector3 up) {
+        Vector3 f = Vector3.Normalize(forward);
+        if (f.X == 0.0f && f.Y == 0.0f && f.Z == 0.0f) {
+            return Quaternion.Identity;
+        }
+        Vector3 right = Vector3.Normalize(Vector3.Cross(up, f));
+        if (right.X == 0.0f && right.Y == 0.0f && right.Z == 0.0f) {
+            // up 与 forward 平行：换一个不共线的参考轴。
+            Vector3 fallback = new Vector3(0.0f, 0.0f, 1.0f);
+            if (Math.Abs(f.Z) > 0.9f) {
+                fallback = new Vector3(1.0f, 0.0f, 0.0f);
+            }
+            right = Vector3.Normalize(Vector3.Cross(fallback, f));
+        }
+        Vector3 realUp = Vector3.Cross(f, right);
+
+        // 旋转矩阵（列向量基：right / realUp / f）。
+        double r00 = (double)right.X;
+        double r01 = (double)realUp.X;
+        double r02 = (double)f.X;
+        double r10 = (double)right.Y;
+        double r11 = (double)realUp.Y;
+        double r12 = (double)f.Y;
+        double r20 = (double)right.Z;
+        double r21 = (double)realUp.Z;
+        double r22 = (double)f.Z;
+
+        double trace = r00 + r11 + r22;
+        double qx;
+        double qy;
+        double qz;
+        double qw;
+        if (trace > 0.0) {
+            double s = Math.Sqrt(trace + 1.0) * 2.0;
+            qw = 0.25 * s;
+            qx = (r21 - r12) / s;
+            qy = (r02 - r20) / s;
+            qz = (r10 - r01) / s;
+        } else if (r00 > r11 && r00 > r22) {
+            double s = Math.Sqrt(1.0 + r00 - r11 - r22) * 2.0;
+            qw = (r21 - r12) / s;
+            qx = 0.25 * s;
+            qy = (r01 + r10) / s;
+            qz = (r02 + r20) / s;
+        } else if (r11 > r22) {
+            double s = Math.Sqrt(1.0 + r11 - r00 - r22) * 2.0;
+            qw = (r02 - r20) / s;
+            qx = (r01 + r10) / s;
+            qy = 0.25 * s;
+            qz = (r12 + r21) / s;
+        } else {
+            double s = Math.Sqrt(1.0 + r22 - r00 - r11) * 2.0;
+            qw = (r10 - r01) / s;
+            qx = (r02 + r20) / s;
+            qy = (r12 + r21) / s;
+            qz = 0.25 * s;
+        }
+        return new Quaternion((float)qx, (float)qy, (float)qz, (float)qw);
+    }
+
+    // 转换为 4x4 旋转矩阵。
+    //
+    // 存储约定与 <see cref="Matrix4x4"/> 一致（行优先存储、行向量数学），
+    // 因此 <c>Matrix4x4.Transform(v, q.ToMatrix())</c> 与 <see cref="Rotate"/> 结果相同。
+    public Matrix4x4 ToMatrix() {
+        float x = this.X;
+        float y = this.Y;
+        float z = this.Z;
+        float w = this.W;
+        Matrix4x4 m = new Matrix4x4();
+        m.M11 = 1.0f - 2.0f * (y * y + z * z);
+        m.M12 = 2.0f * (x * y + z * w);
+        m.M13 = 2.0f * (x * z - y * w);
+        m.M21 = 2.0f * (x * y - z * w);
+        m.M22 = 1.0f - 2.0f * (x * x + z * z);
+        m.M23 = 2.0f * (y * z + x * w);
+        m.M31 = 2.0f * (x * z + y * w);
+        m.M32 = 2.0f * (y * z - x * w);
+        m.M33 = 1.0f - 2.0f * (x * x + y * y);
+        m.M14 = 0.0f;
+        m.M24 = 0.0f;
+        m.M34 = 0.0f;
+        m.M41 = 0.0f;
+        m.M42 = 0.0f;
+        m.M43 = 0.0f;
+        m.M44 = 1.0f;
+        return m;
+    }
+
+    // 点积。
+    public static float Dot(Quaternion a, Quaternion b) {
+        return a.X * b.X + a.Y * b.Y + a.Z * b.Z + a.W * b.W;
+    }
+
+    // 模长（平方）。
+    public static float LengthSquared(Quaternion q) {
+        return q.X * q.X + q.Y * q.Y + q.Z * q.Z + q.W * q.W;
+    }
+
+    // 模长。
+    public static float Length(Quaternion q) {
+        return (float)Math.Sqrt((double)Quaternion.LengthSquared(q));
+    }
+
+    // 归一化。零四元数返回 <see cref="Identity"/>。
+    public static Quaternion Normalize(Quaternion q) {
+        float len = Quaternion.Length(q);
+        if (len > 0.00001f) {
+            float inv = 1.0f / len;
+            return new Quaternion(q.X * inv, q.Y * inv, q.Z * inv, q.W * inv);
+        }
+        return Quaternion.Identity;
+    }
+
+    // 共轭（单位四元数的逆）。
+    public static Quaternion Conjugate(Quaternion q) {
+        return new Quaternion(-q.X, -q.Y, -q.Z, q.W);
+    }
+
+    // 求逆。非单位四元数同样适用。
+    public static Quaternion Inverse(Quaternion q) {
+        float lenSq = Quaternion.LengthSquared(q);
+        if (lenSq < 0.0000001f) {
+            return Quaternion.Identity;
+        }
+        float inv = 1.0f / lenSq;
+        return new Quaternion(-q.X * inv, -q.Y * inv, -q.Z * inv, q.W * inv);
+    }
+
+    // 取反（等价于绕同一轴反向旋转）。
+    public static Quaternion Negate(Quaternion q) {
+        return new Quaternion(-q.X, -q.Y, -q.Z, -q.W);
+    }
+
+    // 两个四元数之间的夹角（度）。
+    public static float Angle(Quaternion a, Quaternion b) {
+        float dot = Math.Abs(Quaternion.Dot(a, b));
+        if (dot > 1.0f) { dot = 1.0f; }
+        return (float)MathUtil.RadiansToDegrees(2.0 * Math.Acos((double)dot));
+    }
+
+    // 球面线性插值：沿最短弧插值，t 会被限制在 [0, 1]。
+    public static Quaternion Slerp(Quaternion a, Quaternion b, float t) {
+        float dot = Quaternion.Dot(a, b);
+        if (dot < 0.0f) {
+            b = Quaternion.Negate(b);
+            dot = -dot;
+        }
+        if (dot > 0.9995f) {
+            return Quaternion.Normalize(Quaternion.Lerp(a, b, t));
+        }
+        double theta0 = Math.Acos((double)dot);
+        double theta = theta0 * (double)t;
+        double sinTheta0 = Math.Sin(theta0);
+        double s0 = Math.Cos(theta) - (double)dot * Math.Sin(theta) / sinTheta0;
+        double s1 = Math.Sin(theta) / sinTheta0;
+        return new Quaternion(
+            (float)(s0 * (double)a.X + s1 * (double)b.X),
+            (float)(s0 * (double)a.Y + s1 * (double)b.Y),
+            (float)(s0 * (double)a.Z + s1 * (double)b.Z),
+            (float)(s0 * (double)a.W + s1 * (double)b.W)
+        );
+    }
+
+    // 线性插值（不做球面处理），t 会被限制在 [0, 1]。
+    public static Quaternion Lerp(Quaternion a, Quaternion b, float t) {
+        float k = t;
+        if (k < 0.0f) { k = 0.0f; }
+        if (k > 1.0f) { k = 1.0f; }
+        return Quaternion.Normalize(new Quaternion(
+            a.X + (b.X - a.X) * k,
+            a.Y + (b.Y - a.Y) * k,
+            a.Z + (b.Z - a.Z) * k,
+            a.W + (b.W - a.W) * k
+        ));
+    }
+
+    public bool Equals(Quaternion other) {
+        return this.X == other.X && this.Y == other.Y && this.Z == other.Z && this.W == other.W;
+    }
+
+    public override string ToString() {
+        return "<" + this.X.ToString() + ", " + this.Y.ToString() + ", "
+             + this.Z.ToString() + ", " + this.W.ToString() + ">";
+    }
+}
