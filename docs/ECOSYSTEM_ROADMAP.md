@@ -834,6 +834,9 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `IRetriever.zan` | 同上 | `IRetriever`：检索的**统一契约**（同步 + 协程两版检索、取原文、失败原因） |
 | `IIndexWriter.zan` | 同上 | `IIndexWriter`：写入的统一契约（**后端分配 id**，返回 id 列表） |
 | `VectorStoreWriter.zan` | 同上 | `VectorStoreWriter`：内存档的写入适配器（把 `VectorStore` 包成 `IIndexWriter`） |
+| `IReranker.zan` | 同上 | `IReranker`：**重排**的统一契约（检索之后的第二道精排） |
+| `ApiReranker.zan` | 同上 | `ApiReranker`：调 `/v1/rerank` 的 cross-encoder 服务（Jina / Cohere 等） |
+| `LlmReranker.zan` | 同上 | `LlmReranker`：用通用大模型逐条打分（行号协议，不需要专用重排模型） |
 | `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
 | `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
@@ -948,9 +951,42 @@ conformance `ai_rag` 在本进程内起**真的 HTTP 服务**当假 AI 端点
 （embedding + 补全）与**真的 TCP 服务**当远端 ZanDb，跑同一个 `Rag`
 管线接三个后端，断言三者的**引用原文、顺序、分数、上下文逐项相等**。
 
-**已知边界**：无重排（cross-encoder 重排那一层）、远端档每次操作一次
-网络往返（`ZanDbClient` 每次 `SendAsync` 新建连接，**无连接池化、无
-批量检索**）、无 Tool calling、无会话记忆、无评估与可观测、无流式的
+**重排层**（补记）：双路检索解决的是**召回**，RRF 只看排名不看分数，
+所以捞进来的 top-k 里常混着"词面沾边但语义不对"的块。重排用更强的
+模型给"查询-文档对"逐对打分，精度显著高于召回，但慢且贵。
+
+所以形态是**宽召回 + 窄精排**：`Rag` 召回 `recallK` 条（默认 topK 的
+下界 20），重排后取 topK 进提示词。`Rag.SetReranker(reranker, recallK)`
+装上。
+
+三个设计决定：
+
+- **接口放在这一层**（`IReranker`）：重排有三种实现——重排 API（跨编码
+  器托管在服务商）、本地 cross-encoder、LLM 打分。输入输出形态一致
+  （查询 + 候选文本 → 分数），上层不关心用的是哪种。本包实现了前两种
+  的接口形态（API 版 + LLM 版），**本地模型的绑定留给调用方**。
+- **重排失败要降级，不能拖垮问答**：重排是**增强**不是必需。失败时用
+  未重排的候选继续，失败原因记在 `Rag.rerankError`（与 `lastError` 分
+  开——一个是"问答失败了"，一个是"问答成功但没重排"）。
+- **分数不归一化、不写进 `RetrieverHit.score`**：重排分数的量纲由服务
+  决定（0~1 或无上界 logit），与 RRF 分数不同量纲，混在一起下游没法
+  比。重排的相对次序由**顺序**表达；`RetrieverHit.score` 仍是 RRF 分
+  数（表示"被召回时的强度"）。
+
+`LlmReranker` 用**行号协议**而不是 JSON：模型吐 JSON 的失败率不低
+（多一个引号就废一次调用），行号协议容忍格式噪声。解析**容错**——只
+认能解析出的行，认不出的**跳过**（不猜、不硬套）；少几条候选参与重排
+比整批报废强。
+
+conformance `ai_rerank` 在本进程内起**真的 HTTP 服务**当假重排/假 LLM
+端点，验：按 `index` 归位（不靠数组顺序）、分批时下标映射回全局、
+LLM 行号协议的容错解析、**重排真的换了顺序**（配一条"不装重排器"的
+对照用例证明顺序变化是重排造成的）、**重排失败降级但问答仍成功**。
+
+**已知边界**：远端档每次操作一次网络往返（`ZanDbClient` 每次
+`SendAsync` 新建连接，**无连接池化、无批量检索**——重排要逐条取候选
+文本，这段是主要开销）、重排层**没有本地 cross-encoder 的绑定**（接口
+留好了位置）、无 Tool calling、无会话记忆、无评估与可观测、无流式的
 **背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
 （要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
 私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调 embedding 服务**

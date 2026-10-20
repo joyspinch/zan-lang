@@ -1,0 +1,201 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 重排器的 **LLM 版**——让通用大模型给"查询-候选"逐对打分。
+//
+// ## 什么时候用
+//
+// 不需要专用重排模型时（不想额外部署 cross-encoder、或者已经在用某
+// 个大模型了）。**比 API 版慢得多也贵得多**——N 条候选就是 N 次推理
+// （除非服务商支持批处理）。
+//
+// 所以本类**默认把候选分批**（一批一次调用，让模型一次给多条的分数），
+// 而不是一条一次调用。
+//
+// ## 让模型怎么答
+//
+// 用**行号协议**：把候选编成带编号的清单，让模型只回编号与分数，
+// 再解析回来。不用 JSON——模型吐 JSON 的失败率不低（多一个引号就废
+// 一次调用），而行号协议容忍格式噪声。
+//
+// 解析是**容错的**：只认能解析出的行，认不出的**跳过**（不猜、不
+// 硬套）。少几条候选参与重排，比整批报废强。
+//
+// ## 分数
+//
+// 模型给的分数**量纲不定**（可能是 0~10、0~1、任意实数）。本包
+// **不归一化**——只用排名（RRF 那套）。
+
+public class LlmReranker : IReranker {
+    // 客户端。
+    private AiClient client;
+
+    // 一批多少条候选。
+    private int batchSize;
+
+    // 温度（重排要确定性，用 0）。
+    private double temperature;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public LlmReranker(AiClient client) {
+        this.client = client;
+        this.batchSize = 10;
+        this.temperature = 0.0;
+        this.lastError = "";
+    }
+
+    // 一批多少条候选（默认 10）。
+    public void SetBatchSize(int n) {
+        if (n < 1) { n = 1; }
+        this.batchSize = n;
+    }
+
+    // 温度（默认 0——重排要确定性）。
+    public void SetTemperature(double t) {
+        this.temperature = t;
+    }
+
+    // 重排。
+    public async List<RerankHit> Rerank(string query, List<string> documents,
+    int topN) {
+        this.lastError = "";
+        List<RerankHit> outp = new List<RerankHit>();
+        if (this.client == null) { this.lastError = "没有客户端"; return null; }
+        if (documents == null || documents.Count == 0) { return outp; }
+        if (query == null || query.Length == 0) {
+            this.lastError = "查询为空";
+            return null;
+        }
+        int total = documents.Count;
+        int start = 0;
+        while (start < total) {
+            int take = this.batchSize;
+            if (start + take > total) { take = total - start; }
+            List<string> batch = new List<string>();
+            for (int i = 0; i < take; i = i + 1) {
+                string d = documents[start + i];
+                batch.Add(d == null ? "" : d);
+            }
+            List<string[]> messages = new List<string[]>();
+            messages.Add(new string[] { "system", LlmReranker.SystemPrompt() });
+            messages.Add(new string[] { "user",
+            LlmReranker.UserPrompt(query, batch) });
+            string reply = await this.client.CompleteMessages(messages,
+            this.temperature, "");
+            if (reply == null) {
+                this.lastError = "重排调用失败：" + this.client.lastError;
+                return null;
+            }
+            List<RerankHit> part = LlmReranker.ParseReply(reply, start);
+            for (int i = 0; i < part.Count; i = i + 1) { outp.Add(part[i]); }
+            start = start + take;
+        }
+        LlmReranker.SortByScore(outp);
+        if (topN > 0 && outp.Count > topN) {
+            List<RerankHit> trimmed = new List<RerankHit>();
+            for (int i = 0; i < topN; i = i + 1) { trimmed.Add(outp[i]); }
+            return trimmed;
+        }
+        return outp;
+    }
+
+    // 上一次失败的原因。
+    public string LastError() { return this.lastError; }
+
+    // 系统提示词。
+    static string SystemPrompt() {
+        return "你是检索重排器。给每条候选文档打一个相关性分数（0 到 10，"
+        + "10 = 完全回答了查询，0 = 无关）。只输出编号与分数，每行一条，"
+        + "格式：编号 空格 分数。不要输出其它内容。";
+    }
+
+    // 用户提示词（带编号的候选清单）。
+    static string UserPrompt(string query, List<string> documents) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("查询：");
+        sb.Append(query);
+        sb.Append("\n\n候选：\n");
+        for (int i = 0; i < documents.Count; i = i + 1) {
+            sb.Append(Convert.ToString(i + 1));
+            sb.Append(". ");
+            sb.Append(documents[i]);
+            sb.Append("\n");
+        }
+        sb.Append("\n按上面的格式给每条打分。");
+        return sb.ToString();
+    }
+
+    // 解析模型的回复（容错：认不出的行跳过）。
+    //
+    // baseIndex 是本批在原始候选数组里的起始下标（批内编号从 1 起）。
+    static List<RerankHit> ParseReply(string reply, int baseIndex) {
+        List<RerankHit> outp = new List<RerankHit>();
+        if (reply == null) { return outp; }
+        List<string> lines = reply.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.Length == 0) { continue; }
+            // 取第一段数字（编号）与后面的数字（分数）。
+            int sp = -1;
+            for (int k = 0; k < line.Length; k = k + 1) {
+                int c = line[k] & 255;
+                if (c == 32 || c == 9 || c == 58 || c == 44) { sp = k; break; }
+            }
+            if (sp <= 0) { continue; }
+            int idx = 0;
+            bool ok = true;
+            for (int k = 0; k < sp; k = k + 1) {
+                int c = line[k] & 255;
+                if (c < 48 || c > 57) { ok = false; break; }
+                idx = idx * 10 + (c - 48);
+            }
+            if (!ok || idx < 1) { continue; }
+            // 分数：编号之后第一个数字（含小数点）。
+            double score = 0.0;
+            bool got = false;
+            int k = sp;
+            while (k < line.Length) {
+                int c = line[k] & 255;
+                if (c == 46 || (c >= 48 && c <= 57)) {
+                    string num = "";
+                    while (k < line.Length) {
+                        int d = line[k] & 255;
+                        if (d == 46 || (d >= 48 && d <= 57)) {
+                            num = num + line.Substring(k, 1);
+                            k = k + 1;
+                        } else { break; }
+                    }
+                    score = num.ToDouble();
+                    got = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if (!got) { continue; }
+            // 批内编号（1 起）→ 全局下标（0 起）。
+            outp.Add(new RerankHit(baseIndex + idx - 1, score));
+        }
+        return outp;
+    }
+
+    // 分数降序；同分按原下标升序（确定性）。
+    static void SortByScore(List<RerankHit> hits) {
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            for (int j = i + 1; j < hits.Count; j = j + 1) {
+                RerankHit x = hits[i];
+                RerankHit y = hits[j];
+                bool swap = false;
+                if (y.score > x.score) { swap = true; }
+                else if (y.score == x.score && y.index < x.index) { swap = true; }
+                if (swap) {
+                    hits[i] = y;
+                    hits[j] = x;
+                }
+            }
+        }
+    }
+}

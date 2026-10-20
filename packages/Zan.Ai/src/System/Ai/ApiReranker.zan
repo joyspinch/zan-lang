@@ -1,0 +1,187 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Net.Http;
+
+namespace System.Ai;
+
+// 重排器的**API 版**——调 `/v1/rerank` 端点（cross-encoder 模型托管在
+// 服务商那边）。
+//
+// ## 协议
+//
+// 请求（OpenAI 兼容风格，Jina / Cohere 等用同一形态）：
+//
+//   {"model": "...", "query": "查询", "documents": ["候选1", "候选2"],
+//    "top_n": 5}
+//
+// 响应：
+//
+//   {"results": [{"index": 0, "relevance_score": 0.93}, ...],
+//    "usage": {"total_tokens": 123}}
+//
+// **响应里带 `index`（候选下标）**——不靠数组顺序归位（与嵌入响应的
+// 规矩一致：协议给了 index 就按 index，靠顺序就是错位 bug 的来源）。
+//
+// ## 分数
+//
+// `relevance_score` 的量纲由服务决定（有的 0~1，有的是无上界 logit）。
+// 本包**不归一化**它——归一化会引入"这次候选集变了分数就变"的耦合，
+// 而调用方真正要的是**排名**。要融合就用 RRF（只看排名不看分数）。
+
+public class ApiReranker : IReranker {
+    // 客户端（用它的 baseUrl / apiKey / model 与出网预算）。
+    private AiClient client;
+
+    // 候选条数的分批大小（单批超过这个数就分批送）。
+    private int batchSize;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public ApiReranker(AiClient client) {
+        this.client = client;
+        this.batchSize = 64;
+        this.lastError = "";
+    }
+
+    // 单批候选条数（默认 64）。
+    //
+    // 太大：请求体超限、或服务端超时；太小：往返次数多。64 是个稳妥
+    // 的起点，实际按候选长度与服务商限制调。
+    public void SetBatchSize(int n) {
+        if (n < 1) { n = 1; }
+        this.batchSize = n;
+    }
+
+    // 重排。
+    public async List<RerankHit> Rerank(string query, List<string> documents,
+    int topN) {
+        this.lastError = "";
+        List<RerankHit> outp = new List<RerankHit>();
+        if (this.client == null) { this.lastError = "没有客户端"; return null; }
+        if (documents == null || documents.Count == 0) { return outp; }
+        if (query == null || query.Length == 0) {
+            this.lastError = "查询为空";
+            return null;
+        }
+        AiEndpoint ep = AiEndpoint.Parse(this.client.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.client.config.baseUrl;
+            return null;
+        }
+        if (this.client.config.model.Length == 0) {
+            this.lastError = "没有指定重排模型";
+            return null;
+        }
+
+        // 分批送（候选多时单请求会超限/超时）。
+        int total = documents.Count;
+        int start = 0;
+        while (start < total) {
+            int take = this.batchSize;
+            if (start + take > total) { take = total - start; }
+            JsonValue batch = JsonValue.NewArray();
+            for (int i = 0; i < take; i = i + 1) {
+                string d = documents[start + i];
+                batch.AppendStr(d == null ? "" : d);
+            }
+            JsonValue body = JsonValue.NewObject();
+            body.PutStr("model", this.client.config.model);
+            body.PutStr("query", query);
+            body.Put("documents", batch);
+            body.PutInt("top_n", take);
+            body.PutBool("return_documents", false);
+
+            string raw = await this.client.PostJson(ep, "/rerank", body);
+            if (raw == null) {
+                this.lastError = "重排服务调用失败：" + this.client.lastError;
+                return null;
+            }
+            List<RerankHit> part = this.Parse(raw, start);
+            if (part == null) {
+                return null;
+            }
+            for (int i = 0; i < part.Count; i = i + 1) { outp.Add(part[i]); }
+            start = start + take;
+        }
+
+        // 全局按分数降序（分批后要重排——批内有序不代表批间有序）。
+        ApiReranker.SortByScore(outp);
+        if (topN > 0 && outp.Count > topN) {
+            List<RerankHit> trimmed = new List<RerankHit>();
+            for (int i = 0; i < topN; i = i + 1) { trimmed.Add(outp[i]); }
+            return trimmed;
+        }
+        return outp;
+    }
+
+    // 上一次失败的原因。
+    public string LastError() { return this.lastError; }
+
+    // 解析重排响应（公开是为了能单独测——归位、错误提取全在这里）。
+    //
+    // baseIndex 是本批在**原始候选数组**里的起始下标——分批时要把下标
+    // 映射回全局位置。
+    public List<RerankHit> Parse(string raw, int baseIndex) {
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            this.lastError = "重排服务返回的内容无法解析";
+            return null;
+        }
+        if (root == null) {
+            this.lastError = "重排服务返回的内容无法解析";
+            return null;
+        }
+        // 服务商的错误体（{"error": {...}}）——取出可读原因。
+        JsonValue err = root.Get("error");
+        if (err != null && err.IsObject()) {
+            JsonValue msg = err.Get("message");
+            if (msg != null && msg.IsString()) {
+                this.lastError = msg.AsString("重排服务返回错误");
+            } else {
+                this.lastError = "重排服务返回错误";
+            }
+            return null;
+        }
+        JsonValue results = root.Get("results");
+        if (results == null || !results.IsArray()) {
+            this.lastError = "重排服务没有返回结果";
+            return null;
+        }
+        List<RerankHit> outp = new List<RerankHit>();
+        for (int i = 0; i < results.Count(); i = i + 1) {
+            JsonValue one = results.At(i);
+            if (one == null) { continue; }
+            JsonValue idxVal = one.Get("index");
+            // 按 index 归位（不靠数组顺序）。
+            int at = baseIndex + (idxVal == null ? i : (int)idxVal.AsDouble((double)i));
+            double score = 0.0;
+            JsonValue sc = one.Get("relevance_score");
+            if (sc == null) { sc = one.Get("score"); }
+            if (sc != null) { score = sc.AsDouble(0.0); }
+            outp.Add(new RerankHit(at, score));
+        }
+        return outp;
+    }
+
+    // 分数降序；同分按**原下标升序**（保证确定性——同分的顺序不能
+    // 取决于引擎的排序稳定性）。
+    static void SortByScore(List<RerankHit> hits) {
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            for (int j = i + 1; j < hits.Count; j = j + 1) {
+                RerankHit x = hits[i];
+                RerankHit y = hits[j];
+                bool swap = false;
+                if (y.score > x.score) { swap = true; }
+                else if (y.score == x.score && y.index < x.index) { swap = true; }
+                if (swap) {
+                    hits[i] = y;
+                    hits[j] = x;
+                }
+            }
+        }
+    }
+}

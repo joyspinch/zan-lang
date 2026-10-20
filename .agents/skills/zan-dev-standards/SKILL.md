@@ -244,7 +244,10 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   另 `StringBuilder.Append` 返回 void，`sb.Append(x).ToString` 链式
   取值编译不过，必须拆两条语句；
   ③ async 方法同一表达式里 await 前不得再求值带副作用的调用
-  （`this.Ctx.path` 要先赋局部变量），编译期强制。
+  （`this.Ctx.path` 要先赋局部变量），编译期强制；
+  ④ **不支持嵌套类**：类里面不能再声明类。实体类型一个文件一个类
+  （同包约定：`Game.Kit.BlitSourceEntry`、`Game.Data.TableColumn` 都是
+  独立文件）。想在同一处看全就放同一命名空间的不同文件，跨文件引用。
 - **语言事实第四则（全站假死排查踩出）**：`virtual` 在派生类
   里是**新开槽位**（隐藏基类实现），不是覆盖——挂接框架钩子必须写
   `override`。AppController 曾把 `OnBeforeAsync/OnAfterAsync` 声明成
@@ -519,7 +522,49 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   户端，所以按端点规范化串做键缓存），并给客户端加 `Close()` 关掉
   全部。坑出处：`Zan.Ai` 的 `AiClient` 每次 `PostJson` 新建 `HttpClient`
   且从不关 → leakcheck 报"每个请求一个 TcpClient 泄漏"。**同款代码在
-  `Zan.Mvc/Framework/Ai` 里也有**（同一个坑，两处）。
+  `Zan.Mvc` 的 AI 模块里也有**（同一个坑，两处）。
+
+- **增强层失败要降级，不能拖垮主流程**：像重排这种"锦上添花"的层，
+  失败时**降级继续**（用未增强的结果），而不是让整个请求失败。降级的
+  失败原因要**单独记**（`rerankError`），与主流程的 `lastError` 分开
+  ——两者语义不同："主流程失败了" vs "主流程成功了但没增强"。降级时
+  还要**把结果裁回主流程期望的规模**（宽召回 50 条 → 降级后取 topK），
+  否则降级路径会把宽候选集直接塞进提示词。
+  坑出处：重排降级后忘了裁剪，20 条候选全进了提示词。
+
+- **不同来源的分数不能混**：重排服务的分数（0~1 或无上界 logit，各家
+  不同）与 RRF 分数**不同量纲**。要融合就用 **RRF**（只看排名不看分
+  数，量纲免疫）；要用原始分数就**各自存各自的字段**，别塞进同一个
+  字段——混在一起下游没法比，而且"看起来能用"。
+  重排改变了顺序，就让**顺序**表达重排的结论。
+
+- **重排后文本必须跟着命中一起重排**：顺序变了之后**不能按位置取文本**
+  ——位置变了，文本和命中就对不上，而且**不报错**，只是答案里混进了
+  别的块（错位 bug 最常见也最难发现的形态）。要按 **id** 找回对应文本。
+
+- **让模型打分用行号协议，不用 JSON**：模型吐 JSON 的失败率不低（多一
+  个引号就废一次调用）。让模型回"编号 空格 分数"再解析，容忍格式噪
+  音。解析要**容错**：只认能解析出的行，认不出的**跳过**（不猜、不硬
+  套）——少几条参与打分比整批报废强。
+  坑出处：`LlmReranker` 用行号协议，conformance 专门验"部分行解析不
+  出来时其余仍可用"。
+
+- **Zan 里 `base` 是保留字**：不能当参数名（编译报 "expected ')'"）。
+  坑出处：写分批解析时把参数起名 `base`。
+
+- **起 HTTP 服务的用例：`Stop()` 之后要等在途连接收尾**：
+  `server.Stop()` 只停监听，**已在服务中的连接还在跑**——不等就退出，
+  leakcheck 会报连接、请求、缓冲区一串泄漏（`Socket`/`HttpRequest`/
+  `ByteBuffer`/`TcpListener`/`CancellationToken` …）。标准收尾：
+  `Stop()` 之后 `for (int w = 0; w < 20; w = w + 1) { await Task.Delay(10); }`。
+  另一个要点：起服务用 `Task.Spawn(server.Start())`（`Start()` 是
+  `async void`，直接调会立刻返回，端口还没监听起来）。
+  坑出处：重排 conformance 起初 `ai.Start()` 后直接跑、`Stop()` 后直接
+  退，leakcheck 报 13 个对象泄漏、arcguard 报 `null reference`。
+
+- **Zan 里 `string.Split` 返回 `List<string>`**，不是 `string[]`（写
+  `string[] lines = s.Split("\n")` 编译不过）。`List<string>` 有
+  `.Count`（不是 `.Length`）。
 
 - **列存的缺失值用掩码位表达，不用哨兵值**（坑出处：`Zan.DataFrame` 补
   缺失值处理）：列存是强类型的 `List<long>`/`List<double>`/`List<string>`，
@@ -579,6 +624,13 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   `Window` 就绑不到 `Gui.Backend.Window` 了。**对策：用到的类型一律显式
   import 它自己的命名空间**（`using Gui.Backend;`），别指望 `using Gui;`
   顺带带出子命名空间——这跟上一条是同一个病的两面。
+- **同名类在"全局命名空间 + using 包"时直接撞车（undefined type，不是绑错）**：
+  项目里原本有个全局类 `DataRow`，迁移到包时又 `using Game.Data;` 引入包里
+  同名的 `DataRow`，裸名 `DataRow` 就有两个候选，编译器**绑不了**，报
+  undefined type（不是"绑到另一个"）。**对策：迁移到包时把项目自研的同名类
+  删掉**，别留"适配层"——适配层同样会撞。坑出处：legend 客户端迁 Game.Data
+  时，自研的 `Models/DataRow.zan` + `using Game.Data;` 报 127 个 undefined
+  type，删掉自研类、改用包里的类型后一次过。
 - **红灯先按层归因，编译错误会掩盖运行期行为**：一条 conformance 用例可能同时
   有编译期错误与运行期行为差异；先把编译错误清掉再重跑看运行期输出——本轮 22 条
   "编译失败"清掉可见性误伤后，有 3 条露出真正的运行期缺陷（X509 的 CN 回退口径、
@@ -653,11 +705,24 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   对 IDE 不成立：IDE 就是第一个 App）：ZAN_UI_SCRIPT 给脚本、ZAN_UI_OUT 给
   输出目录，`keydown 65 3` / `keyup 65 3` 就是 Ctrl+Shift+A（mods 位：Ctrl=1
   Shift=2 Alt=4，keycode 用 Windows 虚拟键码；Ctrl+Shift+字母不产生控制
-  字符，所以走按键抬起事件那条通道）。三条配套坑：① 注入的坐标是**客户区**
+  字符，所以走按键抬起事件那条通道；该通道必须带上修饰键状态，否则
+  组合键退化成裸键）。三条配套坑：① 注入的坐标是**客户区**
   像素，而画布 dump 的起点在自绘标题栏下方（+48px），点功能区页签要 +48；
   ② `dump pixels` 的 ZPX1 用现成 `scripts/zpx2png.py` 转，别手写（头部
   24 字节：x,y,w,h,bpp 五个 u32 从偏移 4 起，w 在 12、h 在 16）；③ 脚本
   路径只传裸文件名，点击后至少等 1~2 秒再 dump。
+- **改组合键行为必须走真实键盘验收，合成事件会掩盖"修饰键根本没送到
+  上层"**：UiDriver / `InjectEvent` 的合成事件自带 mods 位，真机上的
+  修饰键却是 Windows 消息带来的，两条路径不等价。Windows 键盘后端曾把
+  WM_CHAR 与 WM_KEYUP 的修饰键固定记成 0，于是 IDE 一批组合键在真机上
+  是坏的：Ctrl+Space（弹补全）、Shift+F12（查找引用）、Shift+F8、
+  Ctrl+Shift+F/R/A/S、Ctrl+Alt+F、编辑器的 Shift+Tab 反缩进，全退化成
+  裸键——而它们此前只被合成事件验证过，一直没暴露。
+  **验收方法**：`scripts\key_event_probe.ps1 -Combos "+{F12};^{ }"`
+  编译一个探针窗口、用 SendKeys 发真键，把每个键盘事件的 kind/code/mods
+  打出来（kind 4=按下、5=抬起、6=字符；code 是 Windows 虚拟键码；mods 位
+  Ctrl=1 Shift=2 Alt=4），对着它看修饰键落在哪个事件上、值对不对。
+  坑出处：Windows 键盘修饰键丢失导致 IDE 组合键集体失效（2026-10）。
 
 ### GUI 保留树事件路径的真实点击验证（事件门控验证沉淀）
 

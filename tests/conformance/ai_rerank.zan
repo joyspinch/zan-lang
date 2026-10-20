@@ -1,0 +1,487 @@
+// 重排层（`IReranker`）——检索之后的第二道精排。
+//
+// 覆盖：
+// - **宽召回 + 窄精排**：`Rag` 装上重排器后，召回条数变宽（recallK），
+//   但进提示词的仍是 topK 条。
+// - **重排真的换了顺序**：构造一个"词面沾边但语义不对"的候选，让重排
+//   把对的块排到前面，断言**引用顺序变了**且**文本与命中没有错位**
+//   （这是这类代码最常见的 bug：顺序变了，文本还按位置取）。
+// - **重排失败要降级，不能拖垮问答**：重排器返回失败时，问答仍然成功，
+//   答案用未重排的候选，失败原因记在 `rerankError` 里。
+// - **API 版**：响应按 `index` 归位（不靠数组顺序——协议给了 index
+//   就按 index）；分批时下标要映射回全局；分数降序 + 同分按原下标
+//   升序（确定性）。
+// - **LLM 版**：用行号协议，解析容错（认不出的行跳过，不整批报废）。
+//
+// 用例**在本进程内起一个真的 HTTP 服务**当假重排/假 LLM 端点。
+using System;
+using System.Ai;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+
+namespace Conf;
+
+class Prog {
+    // 假端点的端口。
+    static int PORT = 19891;
+
+    // 令牌。
+    static string TOKEN = "ai-rerank-conformance-token-2026";
+
+    // 假端点的行为开关（用静态字段，子类/静态方法都能改）。
+    static int mode;
+
+    // 0 = 正常重排（按"文档含关键词"给分）
+    // 1 = 返回错误体
+    // 2 = 故意打乱 results 数组顺序（验按 index 归位）
+    // 3 = 坏 JSON
+    // 4 = LLM 打分（行号协议）
+    // 5 = LLM 回格式噪声（部分行解析不出来）
+
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    static string F(double v) {
+        return Convert.ToString(Math.Round(v * 1000000.0) / 1000000.0);
+    }
+
+    // 假端点：/v1/rerank 与 /v1/chat/completions。
+    static async HttpResponse Handle(HttpRequest req) {
+        HttpResponse res = new HttpResponse();
+        res.statusCode = 200;
+        res.statusText = "OK";
+        res.contentType = "application/json";
+        res.keepAlive = true;
+        if (req.path.IndexOf("/embeddings") >= 0) {
+            res.body = Prog.EmbedBody(req.body);
+            return res;
+        }
+        if (req.path.IndexOf("/rerank") >= 0) {
+            res.body = Prog.RerankBody(req.body);
+            return res;
+        }
+        res.body = Prog.ChatBody(req.body);
+        return res;
+    }
+
+    // 造嵌入响应：第 0 条给 (1,0)，其余给 (0,1)。
+    static string EmbedBody(string body) {
+        JsonValue root = JsonValue.Parse(body);
+        JsonValue input = root.Get("input");
+        int n = input == null ? 0 : input.Count();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"data\":[");
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"index\":");
+            sb.Append(Convert.ToString(i));
+            sb.Append(",\"embedding\":[");
+            sb.Append(i == 0 ? "1.0" : "0.0");
+            sb.Append(",");
+            sb.Append(i == 0 ? "0.0" : "1.0");
+            sb.Append("]}");
+        }
+        sb.Append("],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+        return sb.ToString();
+    }
+
+    // 造重排响应。
+    static string RerankBody(string body) {
+        if (Prog.mode == 1) {
+            return "{\"error\":{\"message\":\"重排服务不可用\",\"code\":503}}";
+        }
+        if (Prog.mode == 3) { return "{不是 JSON"; }
+        // 从请求里取出 documents 与 query。
+        JsonValue root = JsonValue.Parse(body);
+        JsonValue docs = root.Get("documents");
+        string query = root.Str("query", "");
+        int n = docs == null ? 0 : docs.Count();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"results\":[");
+        // 打分规则：文档含"最佳"标记的给高分，否则低分。
+        //
+        // 用固定标记词（不是查询词）——查询词在两条候选里都出现，
+        // 分不出高低，测不出"重排真的换了顺序"。
+        List<int> order = new List<int>();
+        for (int i = 0; i < n; i = i + 1) {
+            string d = docs.At(i).AsString("");
+            double score = d.IndexOf("最佳") >= 0 ? 0.9 : 0.1;
+            order.Add(i);
+            sb.Append("{\"index\":");
+            sb.Append(Convert.ToString(i));
+            sb.Append(",\"relevance_score\":");
+            sb.Append(Convert.ToString(score));
+            sb.Append("}");
+            if (i < n - 1) { sb.Append(","); }
+        }
+        if (Prog.mode == 2 && n >= 2) {
+            // 打乱顺序（第一个与第二个交换）——验按 index 归位而不是靠
+            // 数组顺序。
+            string all = sb.ToString();
+            int p1 = all.IndexOf("{\"index\":0");
+            int p2 = all.IndexOf("{\"index\":1");
+            int p1end = all.IndexOf("}", p1) + 1;
+            int p2end = all.IndexOf("}", p2) + 1;
+            string s1 = all.Substring(p1, p1end - p1);
+            string s2 = all.Substring(p2, p2end - p2);
+            string swapped = all.Substring(0, p1) + s2 + all.Substring(p1end, p2 - p1end)
+            + s1 + all.Substring(p2end);
+            sb = new StringBuilder();
+            sb.Append(swapped);
+        }
+        sb.Append("],\"usage\":{\"total_tokens\":10}}");
+        return sb.ToString();
+    }
+
+    // 造补全响应（LLM 打分模式）。
+    static string ChatBody(string body) {
+        if (Prog.mode == 4) {
+            // 行号协议：给每条打分（第 1 条高分）。
+            JsonValue root = JsonValue.Parse(body);
+            JsonValue msgs = root.Get("messages");
+            string user = "";
+            if (msgs != null && msgs.Count() > 0) {
+                JsonValue last = msgs.At(msgs.Count() - 1);
+                user = last.Str("content", "");
+            }
+            int count = Prog.CountNumbered(user);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 1; i <= count; i = i + 1) {
+                if (i > 1) { sb.Append("\n"); }
+                sb.Append(Convert.ToString(i));
+                sb.Append(" ");
+                // 第一条 9 分，其余 1 分。
+                sb.Append(i == 1 ? "9" : "1");
+            }
+            return "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\""
+            + Prog.Escape(sb.ToString()) + "\"}}]}";
+        }
+        if (Prog.mode == 5) {
+            // 格式噪声：只有一行能解析，其余是垃圾。
+            return "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":"
+            + "\"好的，这是我的评分：\\n1 9\\n（无法解析的一行）\\n2 1\\n结束\"}}]}";
+        }
+        // 普通补全：回显上下文标记。
+        string marker = "";
+        int at = body.IndexOf("资料：");
+        if (at >= 0) {
+            int end = body.IndexOf("问题：", at);
+            if (end > at) { marker = body.Substring(at, end - at); }
+        }
+        return "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\""
+        + Prog.Escape(marker) + "\"}}]}";
+    }
+
+    // 数出候选清单里的条目数（数 "N. " 行首）。
+    static int CountNumbered(string user) {
+        int count = 0;
+        int at = 0;
+        while (at < user.Length) {
+            int nl = user.IndexOf("\n", at);
+            string line = nl < 0 ? user.Substring(at) : user.Substring(at, nl - at);
+            int dot = line.IndexOf(". ");
+            if (dot > 0) {
+                bool allDigit = true;
+                for (int i = 0; i < dot; i = i + 1) {
+                    int c = line[i] & 255;
+                    if (c < 48 || c > 57) { allDigit = false; break; }
+                }
+                if (allDigit) { count = count + 1; }
+            }
+            if (nl < 0) { break; }
+            at = nl + 1;
+        }
+        return count;
+    }
+
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { sb.Append("\\r"); }
+            else { sb.Append(c); }
+        }
+        return sb.ToString();
+    }
+
+    static AiClient MakeClient(string model) {
+        AiConfig cfg = new AiConfig("http://127.0.0.1:" + Convert.ToString(Prog.PORT),
+        "fake-key", model);
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 8000;
+        cfg.maxAttempts = 1;
+        return new AiClient(cfg);
+    }
+
+    // 造一个带固定向量的内存档。
+    static void MakeStore(VectorStore vs, string[] texts) {
+        // 第 0 条与查询同向（1,0），其余正交（0,1）。
+        for (int i = 0; i < texts.Count; i = i + 1) {
+            List<double> v = new List<double>();
+            if (i == 0) { v.Add(1.0); v.Add(0.0); }
+            else { v.Add(0.0); v.Add(1.0); }
+            vs.Add(i, v, texts[i], "");
+        }
+    }
+
+    static int Run() {
+        int bad = 0;
+        Directory.CreateDirectory("_scratch");
+
+        HttpServer ai = new HttpServer("127.0.0.1", PORT);
+        ai.OnRequest(Prog.Handle);
+        Task.Spawn(ai.Start());
+        await Task.Delay(100);
+
+        // ---- 1. API 版重排：按 index 归位 ----
+        {
+            Prog.mode = 2;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            ApiReranker rr = new ApiReranker(client);
+            List<string> docs = new List<string>();
+            docs.Add("最佳 手机 电池 续航");
+            docs.Add("别的 东西");
+            List<RerankHit> hits = await rr.Rerank("手机", docs, 0);
+            if (hits == null) {
+                Console.WriteLine("rerank failed: " + rr.LastError());
+                bad = bad + 1;
+            } else {
+                if (hits.Count != 2) { bad = bad + 1; }
+                // 命中的那条（index 0）分数高，且 index 归位正确。
+                if (hits[0].index != 0) { bad = bad + 1; }
+                if (hits[1].index != 1) { bad = bad + 1; }
+                if (hits[0].score != 0.9) { bad = bad + 1; }
+                if (hits[1].score != 0.1) { bad = bad + 1; }
+                Console.WriteLine("api hits=" + Convert.ToString(hits.Count)
+                + " idx0=" + Convert.ToString(hits[0].index)
+                + " score=" + Prog.F(hits[0].score));
+            }
+            client.Close();
+        }
+
+        // ---- 2. API 版重排：错误体要给出可读原因 ----
+        {
+            Prog.mode = 1;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            ApiReranker rr = new ApiReranker(client);
+            List<string> docs = new List<string>();
+            docs.Add("x");
+            List<RerankHit> hits = await rr.Rerank("q", docs, 0);
+            if (hits != null) { bad = bad + 1; }
+            if (rr.LastError().IndexOf("重排服务不可用") < 0) {
+                Console.WriteLine("err=" + rr.LastError());
+                bad = bad + 1;
+            }
+            client.Close();
+        }
+
+        // ---- 3. API 版重排：坏 JSON ----
+        {
+            Prog.mode = 3;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            ApiReranker rr = new ApiReranker(client);
+            List<string> docs = new List<string>();
+            docs.Add("x");
+            List<RerankHit> hits = await rr.Rerank("q", docs, 0);
+            if (hits != null) { bad = bad + 1; }
+            if (rr.LastError().Length == 0) { bad = bad + 1; }
+            client.Close();
+        }
+
+        // ---- 4. API 版重排：分批时下标映射回全局 ----
+        {
+            Prog.mode = 0;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            ApiReranker rr = new ApiReranker(client);
+            rr.SetBatchSize(2);
+            List<string> docs = new List<string>();
+            for (int i = 0; i < 5; i = i + 1) {
+                docs.Add(i == 3 ? "最佳 命中" : "无关");
+            }
+            List<RerankHit> hits = await rr.Rerank("标记词", docs, 0);
+            if (hits == null) { bad = bad + 1; }
+            else {
+                if (hits.Count != 5) { bad = bad + 1; }
+                // 命中的那条是全局下标 3，不是批内下标。
+                if (hits[0].index != 3) { bad = bad + 1; }
+                Console.WriteLine("batch top idx=" + Convert.ToString(hits[0].index));
+            }
+            client.Close();
+        }
+
+        // ---- 5. LLM 版重排：行号协议 ----
+        {
+            Prog.mode = 4;
+            AiClient client = Prog.MakeClient("fake-llm");
+            LlmReranker rr = new LlmReranker(client);
+            List<string> docs = new List<string>();
+            docs.Add("甲");
+            docs.Add("乙");
+            docs.Add("丙");
+            List<RerankHit> hits = await rr.Rerank("q", docs, 0);
+            if (hits == null) { bad = bad + 1; }
+            else {
+                if (hits.Count != 3) { bad = bad + 1; }
+                if (hits[0].index != 0) { bad = bad + 1; }
+                if (hits[0].score != 9.0) { bad = bad + 1; }
+                // 后两条同分 1 分 → 按原下标升序（确定性）。
+                if (hits[1].index != 1 || hits[2].index != 2) { bad = bad + 1; }
+                Console.WriteLine("llm hits=" + Convert.ToString(hits.Count)
+                + " top=" + Convert.ToString(hits[0].index));
+            }
+            client.Close();
+        }
+
+        // ---- 6. LLM 版重排：解析容错（只认能解析的行）----
+        {
+            Prog.mode = 5;
+            AiClient client = Prog.MakeClient("fake-llm");
+            LlmReranker rr = new LlmReranker(client);
+            List<string> docs = new List<string>();
+            docs.Add("甲");
+            docs.Add("乙");
+            List<RerankHit> hits = await rr.Rerank("q", docs, 0);
+            if (hits == null) { bad = bad + 1; }
+            else {
+                // 只解析出 "1 9" 与 "2 1" 两行。
+                if (hits.Count != 2) { bad = bad + 1; }
+                if (hits[0].index != 0 || hits[0].score != 9.0) { bad = bad + 1; }
+                if (hits[1].index != 1 || hits[1].score != 1.0) { bad = bad + 1; }
+                Console.WriteLine("llm noisy=" + Convert.ToString(hits.Count));
+            }
+            client.Close();
+        }
+
+        // ---- 7. Rag 装重排：宽召回 + 窄精排 + 顺序真的变了 ----
+        {
+            Prog.mode = 0;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            // 0 号与查询同向（召回时排第一），但内容不含"最佳"标记。
+            // 1 号与查询正交（向量路排后面），但内容含"最佳"标记。
+            // 所以：**召回的顺序与重排的顺序相反**——重排必须换顺序。
+            Prog.MakeStore(vs, new string[] { "手机 电池 续航 长", "最佳 手机 壳 便宜" });
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            rag.SetTopK(1);
+            ApiReranker rr = new ApiReranker(client);
+            rag.SetReranker(rr, 20);
+
+            RagAnswer ans = await rag.Ask("手机");
+            if (ans == null) {
+                Console.WriteLine("ask failed: " + rag.lastError);
+                bad = bad + 1;
+            } else {
+                if (ans.citations.Count != 1) { bad = bad + 1; }
+                // **重排把 1 号选进来了**（向量路排第一的那条反而没进）。
+                if (ans.citations[0].text != "最佳 手机 壳 便宜") {
+                    Console.WriteLine("reranked text=" + ans.citations[0].text);
+                    bad = bad + 1;
+                }
+                // **文本与命中必须一致**（不错位）——上下文里必须就是
+                // 引用指向的那条。
+                if (ans.context.IndexOf(ans.citations[0].text) < 0) {
+                    bad = bad + 1;
+                }
+                Console.WriteLine("reranked cite=" + ans.citations[0].text);
+            }
+            client.Close();
+        }
+
+        // ---- 7b. 同样的库，不装重排器 → 顺序相反（证明 7 的顺序变化
+        //          是重排造成的，不是巧合）----
+        {
+            Prog.mode = 0;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Prog.MakeStore(vs, new string[] { "手机 电池 续航 长", "最佳 手机 壳 便宜" });
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            rag.SetTopK(1);
+            RagAnswer ans = await rag.Ask("手机");
+            if (ans == null) { bad = bad + 1; }
+            else {
+                if (ans.citations[0].text != "手机 电池 续航 长") {
+                    Console.WriteLine("no-rerank text=" + ans.citations[0].text);
+                    bad = bad + 1;
+                }
+                Console.WriteLine("no-rerank cite=" + ans.citations[0].text);
+            }
+            client.Close();
+        }
+
+        // ---- 8. 重排失败要降级，问答仍然成功 ----
+        {
+            Prog.mode = 1;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Prog.MakeStore(vs, new string[] { "手机 电池", "别的 东西" });
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            rag.SetTopK(1);
+            ApiReranker rr = new ApiReranker(client);
+            rag.SetReranker(rr, 20);
+
+            RagAnswer ans = await rag.Ask("手机");
+            if (ans == null) {
+                Console.WriteLine("ask should still succeed: " + rag.lastError);
+                bad = bad + 1;
+            } else {
+                if (ans.citations.Count != 1) { bad = bad + 1; }
+                // 降级后用的是未重排的候选（0 号）。
+                if (ans.citations[0].text != "手机 电池") { bad = bad + 1; }
+                // 失败原因要留下（调用方能看出这次没重排）。
+                if (rag.rerankError.Length == 0) { bad = bad + 1; }
+                Console.WriteLine("degraded=" + ans.citations[0].text
+                + " err=" + rag.rerankError);
+            }
+            client.Close();
+        }
+
+        // ---- 9. 没装重排器时行为不变 ----
+        {
+            Prog.mode = 0;
+            AiClient client = Prog.MakeClient("fake-rerank");
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Prog.MakeStore(vs, new string[] { "手机 电池", "别的 东西" });
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            rag.SetTopK(1);
+            RagAnswer ans = await rag.Ask("手机");
+            if (ans == null) { bad = bad + 1; }
+            else {
+                if (ans.citations[0].text != "手机 电池") { bad = bad + 1; }
+                if (rag.rerankError.Length != 0) { bad = bad + 1; }
+            }
+            client.Close();
+        }
+
+        ai.Stop();
+        // 等在途连接收尾（与 http_bytes_redirect 同款）——不等的话
+        // leakcheck 会报连接与缓冲区泄漏。
+        for (int w = 0; w < 20; w = w + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("ai-rerank-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

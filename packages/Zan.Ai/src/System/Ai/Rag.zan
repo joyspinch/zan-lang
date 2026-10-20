@@ -48,6 +48,9 @@ public class Rag {
     // 写入器（后端无关）。
     private IIndexWriter writer;
 
+    // 重排器（可为 null —— 不重排）。
+    private IReranker reranker;
+
     // 分块参数。
     private int chunkChars;
     private int chunkOverlap;
@@ -55,21 +58,30 @@ public class Rag {
     // 提示词模板。
     private string template;
 
-    // 检索条数。
+    // 检索条数（进提示词的条数）。
     private int topK;
+
+    // 召回条数（重排前的候选池大小）。
+    private int recallK;
 
     // 上一次失败的原因。
     public string lastError;
+
+    // 上一次**重排**失败的原因（重排失败不影响问答成功——降级继续）。
+    public string rerankError;
 
     public Rag(AiClient client, IRetriever retriever, IIndexWriter writer) {
         this.client = client;
         this.retriever = retriever;
         this.writer = writer;
+        this.reranker = null;
         this.chunkChars = 800;
         this.chunkOverlap = 120;
         this.topK = 4;
+        this.recallK = 0;
         this.template = Rag.DefaultTemplate();
         this.lastError = "";
+        this.rerankError = "";
     }
 
     // 分块参数（字节；中文一字 3 字节，800 字节约 260 字）。
@@ -82,6 +94,27 @@ public class Rag {
     public void SetTopK(int k) {
         if (k < 1) { k = 1; }
         this.topK = k;
+    }
+
+    // 装重排器（宽召回 + 窄精排）。
+    //
+    // recallK 是**重排前**的候选池大小（默认 topK 的 5 倍，最低 20）。
+    // 召回要宽（别把对的漏掉），精排要窄（只留最相关的几条进提示词）。
+    //
+    // 为什么不设成 topK 的固定倍数：候选太宽，重排要打很多分（慢且贵）；
+    // 太窄又漏。所以让调用方按自己的候选质量调。
+    public void SetReranker(IReranker reranker, int recallK) {
+        this.reranker = reranker;
+        this.recallK = recallK;
+    }
+
+    // 召回条数（重排前的候选池大小）。
+    private int RecallK() {
+        if (this.reranker == null) { return this.topK; }
+        int want = this.recallK;
+        if (want < this.topK) { want = this.topK; }
+        if (want < 20) { want = 20; }
+        return want;
     }
 
     // 提示词模板（`{{context}}` 与 `{{question}}` 是占位符）。
@@ -154,20 +187,62 @@ public class Rag {
         }
 
         // 2) 混合检索（协程版——远端后端只能这么走）。
+        //
+        // 召回条数：有重排就取宽（recallK），没重排就取 topK。
+        int want = this.RecallK();
         List<RetrieverHit> hits = await this.retriever.SearchAsync(qemb.At(0),
-        question, this.topK);
+        question, want);
         if (hits.Count == 0) {
             this.lastError = "没有检索到相关资料";
             return null;
         }
 
-        // 3) 拼上下文。
+        // 3) 取回候选原文（重排要文本，引用也要）。
+        List<string> texts = new List<string>();
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            texts.Add(await this.retriever.TextOfAsync(hits[i].id));
+        }
+
+        // 4) 重排（可选）。
+        //
+        // **重排失败就降级继续**（用未重排的候选）——重排是**增强**不是
+        // 必需，让它拖垮整个问答是本末倒置。失败原因记在
+        // `rerankError` 里，调用方能看出这次没重排。
+        this.rerankError = "";
+        if (this.reranker != null && hits.Count > 1) {
+            List<RerankHit> ranked = await this.reranker.Rerank(question, texts,
+            0);
+            if (ranked == null || ranked.Count == 0) {
+                this.rerankError = "重排失败（已降级为不重排）："
+                + this.reranker.LastError();
+                // 降级：按**召回时的顺序**取前 topK 条。
+                hits = Rag.Take(hits, this.topK);
+                texts = Rag.TakeTexts(texts, this.topK);
+            } else {
+                List<RetrieverHit> reordered = Rag.ApplyRerank(hits, ranked,
+                this.topK);
+                // 文本跟着命中一起重排——**不能按位置取**（位置变了，
+                // 文本和命中就对不上了，这是这类代码最常见的错位 bug）。
+                List<string> reorderedTexts = new List<string>();
+                for (int i = 0; i < reordered.Count; i = i + 1) {
+                    reorderedTexts.Add(Rag.TextOfHit(texts, hits, reordered[i]));
+                }
+                hits = reordered;
+                texts = reorderedTexts;
+            }
+        } else {
+            // 没有重排器（或只有一条候选）→ 直接取前 topK。
+            hits = Rag.Take(hits, this.topK);
+            texts = Rag.TakeTexts(texts, this.topK);
+        }
+
+        // 5) 拼上下文。
         RagAnswer answer = new RagAnswer();
         answer.question = question;
         StringBuilder ctx = new StringBuilder();
         for (int i = 0; i < hits.Count; i = i + 1) {
             int id = hits[i].id;
-            string text = await this.retriever.TextOfAsync(id);
+            string text = texts[i];
             RagCitation cite = new RagCitation();
             cite.id = id;
             cite.text = text;
@@ -180,7 +255,7 @@ public class Rag {
         }
         answer.context = ctx.ToString();
 
-        // 4) 拼提示词 → 调补全。
+        // 6) 拼提示词 → 调补全。
         string prompt = this.template;
         prompt = Rag.ReplaceToken(prompt, "{{context}}", answer.context);
         prompt = Rag.ReplaceToken(prompt, "{{question}}", question);
@@ -191,6 +266,72 @@ public class Rag {
         }
         answer.text = reply;
         return answer;
+    }
+
+    // 取前 n 条。
+    static List<RetrieverHit> Take(List<RetrieverHit> hits, int n) {
+        if (n <= 0 || hits.Count <= n) { return hits; }
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        for (int i = 0; i < n; i = i + 1) { outp.Add(hits[i]); }
+        return outp;
+    }
+
+    // 取前 n 条文本。
+    static List<string> TakeTexts(List<string> texts, int n) {
+        if (n <= 0 || texts.Count <= n) { return texts; }
+        List<string> outp = new List<string>();
+        for (int i = 0; i < n; i = i + 1) { outp.Add(texts[i]); }
+        return outp;
+    }
+
+    // 按 id 在原候选里找对应的文本。
+    //
+    // 重排后顺序变了，文本要按**id**找回，不能按位置取——按位置取是
+    // 这类代码最常见的错位 bug（顺序一变，文本和命中就对不上，而且
+    // 不报错，只是答案里混进了别的块）。
+    static string TextOfHit(List<string> texts, List<RetrieverHit> original,
+    RetrieverHit hit) {
+        for (int i = 0; i < original.Count; i = i + 1) {
+            if (original[i] == hit) {
+                if (i < texts.Count) { return texts[i]; }
+                return "";
+            }
+        }
+        return "";
+    }
+
+    // 把重排结果套回命中列表，并截到 topK。
+    //
+    // ranked 里的 `index` 是**原命中列表里的下标**——重排服务只看得到
+    // 文本，看不到 id，所以映射靠下标。
+    //
+    // **重排后的分数不写进 `RetrieverHit.score`**：重排分数的量纲由
+    // 服务决定（0~1 或无上界 logit），与 RRF 分数不同量纲，混在一起
+    // 下游没法比。命中的 `score` 仍是 RRF 分数（表示"被召回时的强度"），
+    // 重排的相对次序由**顺序**表达。
+    static List<RetrieverHit> ApplyRerank(List<RetrieverHit> hits,
+    List<RerankHit> ranked, int topK) {
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        for (int i = 0; i < ranked.Count; i = i + 1) {
+            int at = ranked[i].index;
+            if (at < 0 || at >= hits.Count) { continue; }
+            outp.Add(hits[at]);
+        }
+        // 重排漏掉的候选（模型没给全部打分）**追加在后面**——丢掉它们
+        // 等于扔掉召回阶段找到的东西。
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            bool seen = false;
+            for (int j = 0; j < outp.Count; j = j + 1) {
+                if (outp[j] == hits[i]) { seen = true; break; }
+            }
+            if (!seen) { outp.Add(hits[i]); }
+        }
+        if (topK > 0 && outp.Count > topK) {
+            List<RetrieverHit> trimmed = new List<RetrieverHit>();
+            for (int i = 0; i < topK; i = i + 1) { trimmed.Add(outp[i]); }
+            return trimmed;
+        }
+        return outp;
     }
 
     // 占位符替换（全部替换，不只第一个）。

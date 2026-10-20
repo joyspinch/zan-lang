@@ -196,7 +196,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **右 trim 用 `StringExtensions.TrimEnd`**（`s.TrimEnd()`）：内建 `Trim()`
   只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
 * **保留字坑**：`out`、`fixed` 不能作变量名（编译器报 "expected ';'，
-  got 'fixed'" 这类看着莫名其妙的错）。
+  got 'fixed'" 这类看着莫名其妙的错）。**`base` 也是保留字**——不能当
+  参数名（报 "expected ')'" / "expected type"，像签名写坏了）。写"分批
+  解析"这类代码时容易撞上，起名用 `baseIndex` 之类。
 * **泛型容器的两条现状**（实证，2026-10-21）：
   - 泛型类里的 `List<T>`（T 是类级类型参数）**装结构体元素**现在可用了：
     元素类型会按实例替换，写入读回原样（`Zan.Game.Ecs` 的组件池就靠它）。

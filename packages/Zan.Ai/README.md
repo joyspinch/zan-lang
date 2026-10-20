@@ -34,6 +34,10 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   都能直接接进来）
 - `System.Ai` — `IRetriever` / `IIndexWriter`（检索与写入的统一契约，
   让 `Rag` 不绑定具体后端）
+- `System.Ai` — `IReranker`（重排的统一契约）+ `ApiReranker`（调
+  `/v1/rerank` 的 cross-encoder 服务）+ `LlmReranker`（用通用大模型
+  逐条打分）
+- `System.Ai` — `RerankHit`（重排结果：候选下标 + 分数）
 - `System.Ai` — `VectorStoreWriter`（内存档的写入适配器，把
   `VectorStore` 包成 `IIndexWriter` 契约）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
@@ -130,6 +134,49 @@ double sim = AiEmbedding.Cosine(vecs.At(0), queryVector);
 实体都是 `RetrieverHit`。conformance 里有一条断言专门盯这个——三个
 后端对同一批数据给出**完全相同的融合分数**（0.032787），所以从内存
 切到本地、再切到远端，检索结果不会悄悄变样。
+
+## 重排层：宽召回 + 窄精排
+
+双路检索解决的是**召回**（把可能相关的捞进来），但 RRF 只看排名不看
+分数，捞进来的 top-k 里常混着"词面沾边但语义不对"的块。**重排**用
+更强的模型给"查询-文档对"逐对打分（cross-encoder 同时看两边，比双塔
+各自编码再比精度高），但慢且贵。
+
+所以标准形态是**宽召回 + 窄精排**——先便宜地捞 50~100 条，再精排成
+top-5~10 进提示词：
+
+```zan
+// 重排器：调 /v1/rerank 的 cross-encoder 服务
+AiClient rr = new AiClient("https://api.jina.ai/v1", "jina_...", "jina-reranker-v2");
+ApiReranker reranker = new ApiReranker(rr);
+
+rag.SetTopK(4);                  // 进提示词的是 4 条
+rag.SetReranker(reranker, 50);   // 重排前召回 50 条
+```
+
+**重排失败会降级，不会让问答失败**——重排是**增强**不是必需。降级时
+用未重排的候选，失败原因在 `rag.rerankError`：
+
+```zan
+RagAnswer a = await rag.Ask("退款要多久？");
+if (a != null && rag.rerankError.Length > 0) {
+    Console.WriteLine("这次没重排（降级）：" + rag.rerankError);
+}
+```
+
+没有专用重排模型时，用 `LlmReranker` 让通用大模型打分（用行号协议
+而不是 JSON——模型吐 JSON 的失败率不低，而行号协议容忍格式噪声）：
+
+```zan
+LlmReranker reranker = new LlmReranker(client);
+reranker.SetBatchSize(10);
+rag.SetReranker(reranker, 50);
+```
+
+**分数的量纲由重排服务决定**（有的 0~1，有的是无上界 logit），所以本包
+**不归一化**它，也**不把它写进 `RetrieverHit.score`**（那是 RRF 分数，
+不同量纲，混在一起下游没法比）。重排的相对次序由**顺序**表达；要融合
+就用 RRF 那套（只看排名不看分数）。
 
 本地档的用法：
 
@@ -239,8 +286,12 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 
 ## 已知边界
 
-- 无重排层（cross-encoder 二次排序）、无 Tool calling、无会话记忆、
-  无评估与可观测——这些是后续的档位。
+- 重排层只接 **API 版**（`/v1/rerank`）与 **LLM 版**（通用大模型打分），
+  **没有本地 cross-encoder 的绑定**（要自己接推理引擎）；`IReranker`
+  接口留好了位置。
+- 重排的**候选文本要从库里逐条取**——远端档目前是 N 次网络往返
+  （`ZanDbClient` 没有批量取文档），候选池大时这一段是主要开销。
+- 无 Tool calling、无会话记忆、无评估与可观测——这些是后续的档位。
 - 远端档的**同步接口会报错**（`Search` / `TextOf`）——阻塞等待网络会
   停掉 worker 的事件循环，把并发限制在 worker 数量上。这是有意的：
   静默阻塞会伪装成"能用"，实际把并发能力废掉了。远端档一律用
