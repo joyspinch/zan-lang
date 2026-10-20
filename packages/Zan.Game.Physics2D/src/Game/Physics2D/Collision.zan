@@ -1,0 +1,368 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Physics2D;
+
+// 窄相检测：算出两个形状的接触流形（法线、接触点、分离量）。
+//
+// 三条硬约束：
+//   - **只支持凸多边形**：SAT 需要凸性，凹多边形直接不检测。
+//   - **推测接触（speculative margin）**：分离量在 margin 以内也算接触，
+//     约束里把接近速度限制为 gap/dt——高速物体在"还没撞上"时就被拦住，
+//     这是本包的连续碰撞手段（不做 TOI 扫掠，但常规速度不穿墙）。
+//   - **确定性**：同一对形状的输入产出逐位相同的结果（无随机、无哈希序）。
+//
+// 法线约定：流形法线从 A 指向 B；求解器把 B 沿 +法线推、A 沿 -法线推，
+// 于是"法线"始终是**分离方向**——形状互相嵌进去时，法线取能把两者
+// 分开的那个方向（内含情形见 CirclePolygon 的注释）。
+public static class Collision {
+    // 圆 vs 圆。
+    public static Manifold CircleCircle(
+        CircleShape a,
+        Vec2 pa,
+        CircleShape b,
+        Vec2 pb,
+        double margin
+    ) {
+        Manifold manifold = new Manifold();
+        Vec2 delta = pb - pa;
+        double dist = delta.Length();
+        double radiusSum = a.radius + b.radius;
+        if (dist > radiusSum + margin) { return manifold; }
+        Vec2 normal;
+        if (dist > 0.000000000001) {
+            normal = delta / dist;
+        } else {
+            normal = new Vec2(1.0, 0.0);
+        }
+        manifold.normal = normal;
+        manifold.AddPoint(pa + normal * a.radius, dist - radiusSum);
+        return manifold;
+    }
+
+    // 多边形 vs 圆。
+    //
+    // 法线取**多边形 → 圆**：圆在多边形外时，法线由最近点指向圆心；
+    // 圆心落在多边形内部时，法线取该面的外法线（把圆沿它推出去）。
+    // 两种情形下分离量都是"沿法线的表面间隙"：外离时为正（还有多远碰上），
+    // 内含时为负（重叠多深）。
+    public static Manifold CirclePolygon(
+        PolygonShape polygon,
+        Vec2 pp,
+        double angle,
+        CircleShape circle,
+        Vec2 cp,
+        double margin
+    ) {
+        Manifold manifold = new Manifold();
+        int n = polygon.vertices.Count;
+        if (n == 0) { return manifold; }
+
+        List<Vec2> verts = new List<Vec2>();
+        List<Vec2> norms = new List<Vec2>();
+        for (int i = 0; i < n; i = i + 1) {
+            verts.Add(pp + polygon.vertices[i].Rotated(angle));
+            norms.Add(polygon.normals[i].Rotated(angle));
+        }
+
+        // 分离量最大的面（圆心离哪张面最远）。
+        int bestIndex = 0;
+        double bestSeparation = -1.0e300;
+        for (int i = 0; i < n; i = i + 1) {
+            double s = norms[i].Dot(cp - verts[i]);
+            if (s > bestSeparation) {
+                bestSeparation = s;
+                bestIndex = i;
+            }
+        }
+        if (bestSeparation > circle.radius + margin) { return manifold; }
+
+        if (bestSeparation > 0.0) {
+            // 圆心在多边形外：取该面线段上离圆心最近的点。
+            Vec2 a0 = verts[bestIndex];
+            Vec2 a1 = verts[(bestIndex + 1) % n];
+            Vec2 closest = Collision.ClosestPointOnSegment(cp, a0, a1);
+            Vec2 toCircle = cp - closest;
+            double dist = toCircle.Length();
+            if (dist > circle.radius + margin) { return manifold; }
+            Vec2 normal;
+            if (dist > 0.000000000001) {
+                normal = toCircle / dist;
+            } else {
+                normal = norms[bestIndex];
+            }
+            manifold.normal = normal;
+            manifold.AddPoint(closest, dist - circle.radius);
+            return manifold;
+        }
+
+        // 圆心在多边形内：沿分离量最大的面往外推。
+        Vec2 faceNormal = norms[bestIndex];
+        Vec2 onFace = cp - faceNormal * bestSeparation;
+        manifold.normal = faceNormal;
+        manifold.AddPoint(onFace, -bestSeparation - circle.radius);
+        return manifold;
+    }
+
+    // 多边形 vs 多边形（SAT + 入射面裁剪）。
+    public static Manifold PolygonPolygon(
+        PolygonShape a,
+        Vec2 pa,
+        double aa,
+        PolygonShape b,
+        Vec2 pb,
+        double ab,
+        double margin
+    ) {
+        Manifold manifold = new Manifold();
+        int na = a.vertices.Count;
+        int nb = b.vertices.Count;
+        if (na < 3 || nb < 3) { return manifold; }
+
+        List<Vec2> av = new List<Vec2>();
+        List<Vec2> an = new List<Vec2>();
+        for (int i = 0; i < na; i = i + 1) {
+            av.Add(pa + a.vertices[i].Rotated(aa));
+            an.Add(a.normals[i].Rotated(aa));
+        }
+        List<Vec2> bv = new List<Vec2>();
+        List<Vec2> bn = new List<Vec2>();
+        for (int i = 0; i < nb; i = i + 1) {
+            bv.Add(pb + b.vertices[i].Rotated(ab));
+            bn.Add(b.normals[i].Rotated(ab));
+        }
+
+        // SAT：两个方向各自的最大分离量（正 = 分离，负 = 侵入）。
+        int edgeA = 0;
+        double separationA = Collision.FindMaxSeparation(av, an, bv, bn, out edgeA);
+        int edgeB = 0;
+        double separationB = Collision.FindMaxSeparation(bv, bn, av, an, out edgeB);
+        double best = separationA >= separationB ? separationA : separationB;
+        // 推测距离内仍然建接触——高速物体靠这个不被穿透。
+        if (best > margin) { return manifold; }
+
+        // 参考面：分离量大的那个多边形（穿透最浅的那根轴）。
+        bool flip;
+        List<Vec2> refVerts;
+        List<Vec2> refNorms;
+        List<Vec2> incVerts;
+        List<Vec2> incNorms;
+        int refEdge;
+        if (separationA >= separationB) {
+            flip = false;
+            refVerts = av;
+            refNorms = an;
+            incVerts = bv;
+            incNorms = bn;
+            refEdge = edgeA;
+        } else {
+            flip = true;
+            refVerts = bv;
+            refNorms = bn;
+            incVerts = av;
+            incNorms = an;
+            refEdge = edgeB;
+        }
+        Vec2 refNormal = refNorms[refEdge];
+        Vec2 v1 = refVerts[refEdge];
+        Vec2 v2 = refVerts[(refEdge + 1) % refVerts.Count];
+
+        int incEdge = Collision.FindIncidentEdge(incNorms, refNormal);
+        Vec2 inc0 = incVerts[incEdge];
+        Vec2 inc1 = incVerts[(incEdge + 1) % incVerts.Count];
+
+        // 把入射边裁到参考面在切向上的跨度内（带状裁剪）。
+        Vec2 tangent = refNormal.Perpendicular() * -1.0;
+        double lo = tangent.Dot(v1);
+        double hi = tangent.Dot(v2);
+        if (lo > hi) { double swap = lo; lo = hi; hi = swap; }
+        double t0 = 0.0;
+        double t1 = 0.0;
+        int clipped = Collision.ClipSegmentToBand(inc0, inc1, tangent, lo, hi, out t0, out t1);
+        if (clipped == 0) {
+            // 入射边整个落在参考面跨度之外（角对角接触）：退化成单点接触。
+            return Collision.SpeculativeFallback(manifold, inc0, inc1, refNormal, flip, v1);
+        }
+
+        // 接触点取入射点与其在参考面上的投影的中点（对称，位置求解更稳）。
+        Vec2 clip0 = inc0 + (inc1 - inc0) * t0;
+        double separation1 = refNormal.Dot(clip0 - v1);
+        Vec2 facePoint1 = clip0 - refNormal * separation1;
+        manifold.AddPoint((clip0 + facePoint1) * 0.5, separation1);
+
+        if (clipped == 2) {
+            Vec2 clip1 = inc0 + (inc1 - inc0) * t1;
+            double separation2 = refNormal.Dot(clip1 - v1);
+            Vec2 facePoint2 = clip1 - refNormal * separation2;
+            manifold.AddPoint((clip1 + facePoint2) * 0.5, separation2);
+        }
+
+        // 法线永远从 A 指向 B。
+        manifold.normal = flip ? refNormal * -1.0 : refNormal;
+        return manifold;
+    }
+
+    // 通用入口：按形状类型分派。
+    public static Manifold Collide(
+        Shape a,
+        Vec2 pa,
+        double aa,
+        Shape b,
+        Vec2 pb,
+        double ab,
+        double margin
+    ) {
+        if (a is CircleShape && b is CircleShape) {
+            return Collision.CircleCircle((CircleShape)a, pa, (CircleShape)b, pb, margin);
+        }
+        if (a is CircleShape) {
+            // CirclePolygon 给的是"多边形 → 圆"，翻成"A（圆）→ B"。
+            Manifold manifold = Collision.CirclePolygon(
+                (PolygonShape)b, pb, ab, (CircleShape)a, pa, margin
+            );
+            manifold.normal = manifold.normal * -1.0;
+            return manifold;
+        }
+        if (b is CircleShape) {
+            return Collision.CirclePolygon(
+                (PolygonShape)a, pa, aa, (CircleShape)b, pb, margin
+            );
+        }
+        return Collision.PolygonPolygon(
+            (PolygonShape)a, pa, aa, (PolygonShape)b, pb, ab, margin
+        );
+    }
+
+    // 两个形状是否相交（不考虑推测距离）。
+    public static bool Overlap(
+        Shape a,
+        Vec2 pa,
+        double aa,
+        Shape b,
+        Vec2 pb,
+        double ab
+    ) {
+        Manifold manifold = Collision.Collide(a, pa, aa, b, pb, ab, 0.0);
+        return manifold.pointCount > 0;
+    }
+
+    // 线段上离点最近的点。
+    public static Vec2 ClosestPointOnSegment(Vec2 point, Vec2 a, Vec2 b) {
+        Vec2 ab = b - a;
+        double lenSq = ab.LengthSquared();
+        if (lenSq <= 0.000000000001) { return a; }
+        double t = (point - a).Dot(ab) / lenSq;
+        if (t < 0.0) { t = 0.0; }
+        if (t > 1.0) { t = 1.0; }
+        return a + ab * t;
+    }
+
+    // SAT 分离量：沿 poly1 的每个面法线，量 poly2 在该轴上的"最浅点"
+    // （顶点投影的最小值），再取所有面里的最大值。
+    //
+    // 正值 = poly2 完全在 poly1 之外（沿该轴分离），负值 = 侵入。
+    // 必须取顶点投影的**最小**值——用最大值会把"有一个角伸出去"误判成分离，
+    // 旋转多边形的重叠就检测不出来。
+    private static double FindMaxSeparation(
+        List<Vec2> verts1,
+        List<Vec2> norms1,
+        List<Vec2> verts2,
+        List<Vec2> norms2,
+        out int bestEdge
+    ) {
+        int count1 = verts1.Count;
+        int count2 = verts2.Count;
+        double maxSeparation = -1.0e300;
+        int edge = 0;
+        for (int i = 0; i < count1; i = i + 1) {
+            Vec2 axis = norms1[i];
+            Vec2 origin = verts1[i];
+            double deepest = 1.0e300;
+            for (int j = 0; j < count2; j = j + 1) {
+                double s = axis.Dot(verts2[j] - origin);
+                if (s < deepest) { deepest = s; }
+            }
+            if (deepest > maxSeparation) {
+                maxSeparation = deepest;
+                edge = i;
+            }
+        }
+        bestEdge = edge;
+        return maxSeparation;
+    }
+
+    // 找出法线与参考面法线最反向的那条边（入射面）。
+    private static int FindIncidentEdge(List<Vec2> incNorms, Vec2 refNormal) {
+        int count = incNorms.Count;
+        int index = 0;
+        double minDot = 1.0e300;
+        for (int i = 0; i < count; i = i + 1) {
+            double d = incNorms[i].Dot(refNormal);
+            if (d < minDot) {
+                minDot = d;
+                index = i;
+            }
+        }
+        return index;
+    }
+
+    // 把线段裁到切向投影落在 [lo, hi] 的带状区间里。
+    // 返回保留的点数（0 / 1 / 2），t0 / t1 是线段参数（0..1）的保留区间。
+    private static int ClipSegmentToBand(
+        Vec2 w0,
+        Vec2 w1,
+        Vec2 tangent,
+        double lo,
+        double hi,
+        out double t0,
+        out double t1
+    ) {
+        t0 = 0.0;
+        t1 = 0.0;
+        double f0 = tangent.Dot(w0);
+        double f1 = tangent.Dot(w1);
+        double span = f1 - f0;
+        if (span > -0.000000000001 && span < 0.000000000001) {
+            // 与切向垂直：整段要么都在带内，要么都不在。
+            if (f0 >= lo && f0 <= hi) {
+                t0 = 0.0;
+                t1 = 1.0;
+                return 2;
+            }
+            return 0;
+        }
+        double a = (lo - f0) / span;
+        double b = (hi - f0) / span;
+        if (a > b) { double swap = a; a = b; b = swap; }
+        if (a < 0.0) { a = 0.0; }
+        if (b > 1.0) { b = 1.0; }
+        if (a > b) { return 0; }
+        t0 = a;
+        t1 = b;
+        if (b - a < 0.000000000001) { return 1; }
+        return 2;
+    }
+
+    // 裁剪失败时的退路：拿入射面离参考面最近的那个点做单点接触。
+    private static Manifold SpeculativeFallback(
+        Manifold manifold,
+        Vec2 p0,
+        Vec2 p1,
+        Vec2 refNormal,
+        bool flip,
+        Vec2 refOrigin
+    ) {
+        double s0 = refNormal.Dot(p0 - refOrigin);
+        double s1 = refNormal.Dot(p1 - refOrigin);
+        Vec2 point = p0;
+        double separation = s0;
+        if (s1 < s0) {
+            point = p1;
+            separation = s1;
+        }
+        Vec2 facePoint = point - refNormal * separation;
+        manifold.normal = flip ? refNormal * -1.0 : refNormal;
+        manifold.AddPoint((point + facePoint) * 0.5, separation);
+        return manifold;
+    }
+}

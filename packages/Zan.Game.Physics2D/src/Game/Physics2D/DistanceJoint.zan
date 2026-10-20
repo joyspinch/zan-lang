@@ -1,0 +1,137 @@
+using System;
+
+namespace Game.Physics2D;
+
+// 距离关节：把两个刚体上的两个锚点保持固定距离。
+//
+// 两种模式：
+//   - **刚性**（frequency = 0）：用冲量把两点距离钉死，长度误差立刻被
+//     消掉；沿轴向的相对速度被完全约束，垂直方向自由。
+//   - **弹簧**（frequency > 0）：按频率与阻尼比给两个锚点施加成对弹力，
+//     软约束有明确的物理含义（Hz 与阻尼比），比"裸 stiffness"好调。
+public class DistanceJoint : Joint {
+    // 锚点（局部坐标）。
+    public Vec2 localAnchorA;
+    public Vec2 localAnchorB;
+    // 目标长度。
+    public double length;
+    // 软约束频率（Hz）；0 表示刚性。
+    public double frequency;
+    // 软约束阻尼比（1 = 临界阻尼）。
+    public double dampingRatio;
+    // 累积冲量（诊断用）。
+    public double impulse;
+
+    private Vec2 rA;
+    private Vec2 rB;
+    private Vec2 axis;
+    private double axialMass;
+
+    public DistanceJoint(
+        RigidBody bodyA,
+        RigidBody bodyB,
+        Vec2 worldAnchorA,
+        Vec2 worldAnchorB,
+        double length
+    ) : base(bodyA, bodyB) {
+        this.localAnchorA = bodyA.ToLocal(worldAnchorA);
+        this.localAnchorB = bodyB.ToLocal(worldAnchorB);
+        this.length = length;
+        this.frequency = 0.0;
+        this.dampingRatio = 0.7;
+        this.impulse = 0.0;
+        this.rA = new Vec2(0.0, 0.0);
+        this.rB = new Vec2(0.0, 0.0);
+        this.axis = new Vec2(1.0, 0.0);
+        this.axialMass = 0.0;
+    }
+
+    // 弹簧模式：在两个锚点施加成对弹力。
+    public override void ApplyForces(double h) {
+        if (this.frequency <= 0.0) { return; }
+        if (this.bodyA.invMass <= 0.0 && this.bodyB.invMass <= 0.0) { return; }
+        Vec2 pA = this.bodyA.ToWorld(this.localAnchorA);
+        Vec2 pB = this.bodyB.ToWorld(this.localAnchorB);
+        Vec2 delta = pB - pA;
+        double len = delta.Length();
+        if (len < 0.000000000001) { return; }
+        Vec2 dir = delta / len;
+
+        // 约化质量（两个都是静态体时跳过）。
+        double invSum = this.bodyA.invMass + this.bodyB.invMass;
+        if (invSum <= 0.0) { return; }
+        double reducedMass = 1.0 / invSum;
+        double omega = 2.0 * Math.PI * this.frequency;
+        double stiffness = reducedMass * omega * omega;
+        double damping = 2.0 * this.dampingRatio * omega * reducedMass;
+
+        double stretch = len - this.length;
+        Vec2 relative = this.bodyB.VelocityAt(pB) - this.bodyA.VelocityAt(pA);
+        double along = relative.Dot(dir);
+        double force = -stiffness * stretch - damping * along;
+        Vec2 impulseVec = dir * force;
+        this.bodyA.ApplyForceAtPoint(impulseVec.x, impulseVec.y, pA);
+        this.bodyB.ApplyForceAtPoint(-impulseVec.x, -impulseVec.y, pB);
+    }
+
+    public override void Prepare(double h) {
+        Vec2 pA = this.bodyA.ToWorld(this.localAnchorA);
+        Vec2 pB = this.bodyB.ToWorld(this.localAnchorB);
+        this.rA = pA - this.bodyA.position;
+        this.rB = pB - this.bodyB.position;
+        Vec2 delta = pB - pA;
+        double len = delta.Length();
+        if (len < 0.000000000001) {
+            this.axis = new Vec2(1.0, 0.0);
+        } else {
+            this.axis = delta / len;
+        }
+        double crA = this.rA.Cross(this.axis);
+        double crB = this.rB.Cross(this.axis);
+        double k = this.bodyA.invMass + this.bodyB.invMass
+            + this.bodyA.invInertia * crA * crA
+            + this.bodyB.invInertia * crB * crB;
+        this.axialMass = k > 0.0 ? 1.0 / k : 0.0;
+    }
+
+    public override void SolveVelocity(double h) {
+        // 弹簧模式不用冲量约束（力已经够了）。
+        if (this.frequency > 0.0) { return; }
+        Vec2 pA = this.bodyA.ToWorld(this.localAnchorA);
+        Vec2 pB = this.bodyB.ToWorld(this.localAnchorB);
+        Vec2 dv = this.bodyB.VelocityAt(pB) - this.bodyA.VelocityAt(pA);
+        double along = dv.Dot(this.axis);
+        double lambda = -this.axialMass * along;
+        this.impulse = this.impulse + lambda;
+        Vec2 impulseVec = this.axis * lambda;
+        this.bodyA.velocity = this.bodyA.velocity - impulseVec * this.bodyA.invMass;
+        this.bodyA.angularVelocity = this.bodyA.angularVelocity
+            - this.bodyA.invInertia * this.rA.Cross(impulseVec);
+        this.bodyB.velocity = this.bodyB.velocity + impulseVec * this.bodyB.invMass;
+        this.bodyB.angularVelocity = this.bodyB.angularVelocity
+            + this.bodyB.invInertia * this.rB.Cross(impulseVec);
+    }
+
+    public override void SolvePosition(double h, double baumgarte) {
+        if (this.frequency > 0.0) { return; }
+        Vec2 pA = this.bodyA.ToWorld(this.localAnchorA);
+        Vec2 pB = this.bodyB.ToWorld(this.localAnchorB);
+        double len = (pB - pA).Length();
+        double error = len - this.length;
+        if (error < -0.0001 || error > 0.0001) {
+            // 位置误差用伪速度修：沿轴向把误差摊掉。
+            Vec2 axis = this.axis;
+            Vec2 dv = this.bodyB.PseudoVelocityAt(pB) - this.bodyA.PseudoVelocityAt(pA);
+            double along = dv.Dot(axis);
+            double target = -baumgarte * error / h;
+            double lambda = this.axialMass * (target - along);
+            Vec2 impulseVec = axis * lambda;
+            this.bodyA.pseudoVelocity = this.bodyA.pseudoVelocity - impulseVec * this.bodyA.invMass;
+            this.bodyA.pseudoAngularVelocity = this.bodyA.pseudoAngularVelocity
+                - this.bodyA.invInertia * this.rA.Cross(impulseVec);
+            this.bodyB.pseudoVelocity = this.bodyB.pseudoVelocity + impulseVec * this.bodyB.invMass;
+            this.bodyB.pseudoAngularVelocity = this.bodyB.pseudoAngularVelocity
+                + this.bodyB.invInertia * this.rB.Cross(impulseVec);
+        }
+    }
+}

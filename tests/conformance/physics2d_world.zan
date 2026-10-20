@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+using Game.Physics2D;
+
+// Physics2D 契约测试：几何、窄相、动力学、关节、确定性与穿透修正。
+//
+// 断言用容差比较（浮点模拟不可能逐位相等），golden 只锁定"全过"这行——
+// 这样阈值调整不会连带改 golden。
+public class Physics2DTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 一块静态地面：宽 20、高 1，顶面在 y = 0。
+    private static RigidBody AddGround(PhysicsWorld world) {
+        PolygonShape ground = PolygonShape.Box(10.0, 0.5);
+        return world.AddBody(RigidBody.Static(ground, new Vec2(0.0, -0.5), 0.0));
+    }
+
+    // 流形里最深的分离量（负值 = 侵入深度）。
+    private static double MinSeparation(Manifold manifold) {
+        double min = 0.0;
+        for (int i = 0; i < manifold.points.Count; i = i + 1) {
+            double s = manifold.points[i].separation;
+            if (i == 0 || s < min) { min = s; }
+        }
+        return min;
+    }
+
+    /* ---------- 自由落体：积分器与重力 ---------- */
+    private static void TestFreeFall() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        CircleShape ball = new CircleShape(0.5);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(ball, new Vec2(0.0, 5.0), 1.0));
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckNear("freefall velocity", body.velocity.y, -10.0, 0.001);
+        // 半隐式欧拉：y = y0 - g·dt²·n(n+1)/2
+        CheckNear("freefall position", body.position.y, 5.0 - 10.0 * 60.0 * 61.0 / 7200.0, 0.01);
+    }
+
+    /* ---------- 落地静止：不穿透、不抖动 ---------- */
+    private static void TestRestOnGround() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        AddGround(world);
+        CircleShape ball = new CircleShape(0.5);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(ball, new Vec2(0.0, 5.0), 1.0));
+        for (int i = 0; i < 180; i = i + 1) { world.Step(1.0 / 60.0); }
+        // 球心停在地面顶面 + 半径（允许 slop 量级的容差）
+        CheckNear("rest height", body.position.y, 0.5, 0.02);
+        CheckNear("rest velocity", body.velocity.y, 0.0, 0.05);
+        Check("rest contact kept", world.ContactCount() >= 1);
+    }
+
+    /* ---------- 弹性：反弹高度约为落下高度的四分之一 ---------- */
+    private static void TestRestitution() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        AddGround(world);
+        CircleShape ball = new CircleShape(0.5);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(ball, new Vec2(0.0, 4.0), 1.0));
+        body.restitution = 0.5;
+        double apex = 0.0;
+        double restHeight = 0.5;
+        bool bounced = false;
+        for (int i = 0; i < 300; i = i + 1) {
+            world.Step(1.0 / 60.0);
+            // 弹起之后才开始记录顶点（起始高度不算）
+            if (!bounced) {
+                if (body.velocity.y > 0.0 && body.position.y < restHeight + 1.0) {
+                    bounced = true;
+                }
+                continue;
+            }
+            if (body.position.y > apex) { apex = body.position.y; }
+        }
+        Check("restitution bounced", bounced);
+        // 理想弹性：h_bounce = e² · h_drop = 0.25 × 3.5 = 0.875
+        CheckNear("restitution apex", apex, restHeight + 0.875, 0.25);
+    }
+
+    /* ---------- 摩擦：同样的初速，摩擦大的一方明显减速 ---------- */
+    private static double SlideDistance(double friction) {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        AddGround(world);
+        PolygonShape box = PolygonShape.Box(0.5, 0.5);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(box, new Vec2(0.0, 0.5), 1.0));
+        body.friction = friction;
+        body.velocity = new Vec2(10.0, 0.0);
+        double start = body.position.x;
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        return body.position.x - start;
+    }
+
+    private static void TestFriction() {
+        double slippery = SlideDistance(0.0);
+        double gripped = SlideDistance(0.5);
+        Check("frictionless slides", slippery > 9.0);
+        Check("friction slows down", gripped < slippery - 1.0);
+    }
+
+    /* ---------- 窄相：旋转多边形的 SAT ---------- */
+    private static void TestNarrowPhase() {
+        PolygonShape a = PolygonShape.Box(1.0, 1.0);
+        PolygonShape b = PolygonShape.Box(1.0, 1.0);
+        // 两个盒子明显分开
+        Manifold apart = Collision.Collide(a, new Vec2(0.0, 0.0), 0.0,
+            b, new Vec2(10.0, 0.0), 0.0, 0.0);
+        Check("separated shapes have no contact", apart.pointCount == 0);
+        // 旋转 45° 后重叠：法线沿 x 轴，穿透深度为 2 - 2·cos45°
+        Manifold hit = Collision.Collide(a, new Vec2(0.0, 0.0), 0.0,
+            b, new Vec2(1.6, 0.0), 0.7853981633974483, 0.0);
+        Check("rotated overlap detected", hit.pointCount >= 1);
+        CheckNear("overlap normal x", hit.normal.x, 1.0, 0.001);
+        CheckNear("overlap normal y", hit.normal.y, 0.0, 0.001);
+        // 沿最佳轴（x）的侵入深度：B 最左顶点 x = 1.6 - √2
+        CheckNear("overlap penetration", MinSeparation(hit),
+            -(1.0 - (1.6 - 1.4142135623730951)), 0.02);
+        // 圆与多边形
+        CircleShape circle = new CircleShape(0.5);
+        Manifold circleHit = Collision.Collide(circle, new Vec2(0.0, 1.2), 0.0,
+            a, new Vec2(0.0, 0.0), 0.0, 0.0);
+        Check("circle polygon contact", circleHit.pointCount >= 1);
+        // 圆心离顶面 0.2，半径 0.5 → 侵入 0.3
+        CheckNear("circle polygon separation", MinSeparation(circleHit), -0.3, 0.02);
+    }
+
+    /* ---------- 穿透修正：陷进地面的球被推出来 ---------- */
+    private static void TestPenetrationRecovery() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, 0.0);
+        AddGround(world);
+        CircleShape ball = new CircleShape(0.5);
+        // 球心在地面顶面下方 0.3 —— 已经陷进去
+        RigidBody body = world.AddBody(RigidBody.Dynamic(ball, new Vec2(0.0, -0.3), 1.0));
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckNear("penetration pushed out", body.position.y, 0.5, 0.05);
+    }
+
+    /* ---------- 铰链：摆锤，锚点距离保持不变 ---------- */
+    private static void TestRevoluteJoint() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        PolygonShape anchor = PolygonShape.Box(0.2, 0.2);
+        world.AddBody(RigidBody.Static(anchor, new Vec2(0.0, 0.0), 0.0));
+        // 摆锤偏在枢轴右侧，枢轴在球的左上角 —— 初始不平衡，会摆下来
+        CircleShape bob = new CircleShape(0.3);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(bob, new Vec2(2.3, 0.0), 1.0));
+        Vec2 pivot = new Vec2(2.0, 0.0);
+        world.AddJoint(new RevoluteJoint(world.bodies[0], body, pivot));
+        double minDistance = 1000.0;
+        double maxDistance = 0.0;
+        double startY = body.position.y;
+        for (int i = 0; i < 120; i = i + 1) {
+            world.Step(1.0 / 60.0);
+            double d = (body.position - pivot).Length();
+            if (d < minDistance) { minDistance = d; }
+            if (d > maxDistance) { maxDistance = d; }
+        }
+        // 铰链把摆锤钉在枢点上：球心到枢点的距离恒为半径
+        CheckNear("joint keeps distance", minDistance, 0.3, 0.01);
+        CheckNear("joint keeps distance max", maxDistance, 0.3, 0.01);
+        Check("pendulum swung down", body.position.y < startY - 0.2);
+    }
+
+    /* ---------- 距离关节：刚性距离保持 ---------- */
+    private static void TestDistanceJoint() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, 0.0);
+        CircleShape a = new CircleShape(0.2);
+        CircleShape b = new CircleShape(0.2);
+        RigidBody bodyA = world.AddBody(RigidBody.Dynamic(a, new Vec2(0.0, 0.0), 1.0));
+        RigidBody bodyB = world.AddBody(RigidBody.Dynamic(b, new Vec2(3.0, 0.0), 1.0));
+        bodyB.velocity = new Vec2(-5.0, 0.0);
+        world.AddJoint(new DistanceJoint(bodyA, bodyB, new Vec2(0.0, 0.0),
+            new Vec2(3.0, 0.0), 3.0));
+        double minDistance = 1000.0;
+        double maxDistance = 0.0;
+        for (int i = 0; i < 120; i = i + 1) {
+            world.Step(1.0 / 60.0);
+            double d = (bodyB.position - bodyA.position).Length();
+            if (d < minDistance) { minDistance = d; }
+            if (d > maxDistance) { maxDistance = d; }
+        }
+        CheckNear("distance joint lower bound", minDistance, 3.0, 0.02);
+        CheckNear("distance joint upper bound", maxDistance, 3.0, 0.02);
+    }
+
+    /* ---------- 确定性：同一场景跑两遍必须完全一致 ---------- */
+    private static string Scenario() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec2(0.0, -10.0);
+        AddGround(world);
+        CircleShape ball = new CircleShape(0.4);
+        RigidBody body = world.AddBody(RigidBody.Dynamic(ball, new Vec2(0.3, 3.0), 1.0));
+        body.restitution = 0.3;
+        body.friction = 0.4;
+        PolygonShape box = PolygonShape.Box(0.5, 0.5);
+        RigidBody other = world.AddBody(RigidBody.Dynamic(box, new Vec2(1.5, 2.0), 1.0));
+        other.angle = 0.3;
+        List<string> outp = new List<string>();
+        for (int i = 0; i < 120; i = i + 1) {
+            world.Step(1.0 / 60.0);
+            outp.Add(i.ToString() + ":" + body.position.x.ToString() + ","
+                + body.position.y.ToString() + "," + other.position.x.ToString() + ","
+                + other.position.y.ToString() + "," + other.angle.ToString());
+        }
+        string joined = "";
+        for (int i = 0; i < outp.Count; i = i + 1) { joined = joined + outp[i] + "\n"; }
+        return joined;
+    }
+
+    private static void TestDeterminism() {
+        string first = Scenario();
+        string second = Scenario();
+        Check("deterministic replay", first == second);
+        Check("scenario produced output", first.Length > 0);
+    }
+
+    // 凹多边形必须被拒绝：SAT 没有唯一分离轴，静默给错分离量比报错更糟。
+    private static void TestConcaveRejected() {
+        List<Vec2> concave = new List<Vec2>();
+        concave.Add(new Vec2(0.0, 0.0));
+        concave.Add(new Vec2(2.0, 0.0));
+        concave.Add(new Vec2(1.0, 1.0));
+        concave.Add(new Vec2(2.0, 2.0));
+        concave.Add(new Vec2(0.0, 2.0));
+
+        bool rejected = false;
+        try {
+            PolygonShape bad = new PolygonShape(concave);
+        } catch (Exception ex) {
+            rejected = true;
+        }
+        Check("concave polygon rejected", rejected);
+    }
+
+    public static void Main() {
+        TestFreeFall();
+        TestRestOnGround();
+        TestRestitution();
+        TestFriction();
+        TestNarrowPhase();
+        TestPenetrationRecovery();
+        TestRevoluteJoint();
+        TestDistanceJoint();
+        TestConcaveRejected();
+        TestDeterminism();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL PHYSICS2D TESTS PASSED");
+        } else {
+            Console.WriteLine("PHYSICS2D FAILURES: " + failures.ToString());
+        }
+    }
+}

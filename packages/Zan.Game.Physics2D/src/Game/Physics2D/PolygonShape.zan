@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Physics2D;
+
+// 凸多边形：顶点在**质心系**里（构造时自动平移），逆时针绕序。
+//
+// 质心系的好处是刚体的 position 直接就是形状质心——转动惯量、质量、力矩
+// 全部绕同一个点算，不用再记一个"形状原点到质心"的偏移。
+public class PolygonShape : Shape {
+    // 局部顶点（质心为原点，逆时针）。
+    public List<Vec2> vertices;
+    // 每条边的外法线：normals[i] 对应边 vertices[i] → vertices[i+1]。
+    public List<Vec2> normals;
+    // 构造时原始顶点的质心（相对调用方给的原点）——保留给需要还原原点的场合。
+    public Vec2 centroidOffset;
+
+    public PolygonShape(List<Vec2> points) {
+        this.vertices = new List<Vec2>();
+        this.normals = new List<Vec2>();
+        this.density = 1.0;
+        this.centroidOffset = new Vec2(0.0, 0.0);
+        if (points == null || points.Count < 3) { return; }
+
+        // 统一绕序：面积法算出的有向面积为负说明是顺时针，翻转成逆时针。
+        List<Vec2> pts = new List<Vec2>();
+        double signed = 0.0;
+        for (int i = 0; i < points.Count; i = i + 1) {
+            Vec2 a = points[i];
+            Vec2 b = points[(i + 1) % points.Count];
+            signed = signed + a.Cross(b);
+        }
+        if (signed < 0.0) {
+            for (int i = points.Count - 1; i >= 0; i = i - 1) {
+                pts.Add(points[i]);
+            }
+        } else {
+            for (int i = 0; i < points.Count; i = i + 1) {
+                pts.Add(points[i]);
+            }
+        }
+
+        // 凸性检查：SAT 需要凸性。绕序已统一成逆时针，此时若任一顶点出现
+        // "右转"（转向叉积为负），多边形是凹的——凹多边形没有唯一分离轴，
+        // SAT 的结果没有意义。直接拒绝，不静默给出错误的分离量。
+        if (!PolygonShape.IsConvex(pts)) {
+            throw new ArgumentException("PolygonShape: polygon must be convex");
+        }
+
+        // 平移到质心系。
+        Vec2 centroid = PolygonShape.ComputeCentroid(pts);
+        this.centroidOffset = centroid;
+        for (int i = 0; i < pts.Count; i = i + 1) {
+            this.vertices.Add(pts[i] - centroid);
+        }
+
+        // 外法线：逆时针多边形的边 (a→b) 外法线是边的右法线 (dy, -dx)。
+        int n = this.vertices.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            Vec2 a = this.vertices[i];
+            Vec2 b = this.vertices[(i + 1) % n];
+            Vec2 edge = b - a;
+            this.normals.Add(new Vec2(edge.y, -edge.x).Normalized());
+        }
+    }
+
+    // 凸性判定：输入已是逆时针绕序，所有顶点都必须"左转"（转向叉积 >= 0）。
+    // 共线顶点（叉积 = 0）不算凹——退化边允许存在。
+    private static bool IsConvex(List<Vec2> pts) {
+        int n = pts.Count;
+        if (n < 3) { return true; }
+        for (int i = 0; i < n; i = i + 1) {
+            Vec2 a = pts[i];
+            Vec2 b = pts[(i + 1) % n];
+            Vec2 c = pts[(i + 2) % n];
+            Vec2 e1 = b - a;
+            Vec2 e2 = c - b;
+            double la = e1.Length();
+            double lb = e2.Length();
+            if (la < 1e-12 || lb < 1e-12) { continue; }
+            // 转向角的正弦：右转（负）= 凹。
+            double sin = e1.Cross(e2) / (la * lb);
+            if (sin < -1e-9) { return false; }
+        }
+        return true;
+    }
+
+    // 轴对齐盒（半宽 halfWidth、半高 halfHeight）。
+    public static PolygonShape Box(double halfWidth, double halfHeight) {
+        List<Vec2> pts = new List<Vec2>();
+        pts.Add(new Vec2(-halfWidth, -halfHeight));
+        pts.Add(new Vec2(halfWidth, -halfHeight));
+        pts.Add(new Vec2(halfWidth, halfHeight));
+        pts.Add(new Vec2(-halfWidth, halfHeight));
+        return new PolygonShape(pts);
+    }
+
+    // 顶点的质心（面积加权）。
+    private static Vec2 ComputeCentroid(List<Vec2> pts) {
+        double area2 = 0.0;
+        Vec2 acc = new Vec2(0.0, 0.0);
+        int n = pts.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            Vec2 a = pts[i];
+            Vec2 b = pts[(i + 1) % n];
+            double cr = a.Cross(b);
+            area2 = area2 + cr;
+            acc = acc + (a + b) * cr;
+        }
+        if (area2 == 0.0) { return new Vec2(0.0, 0.0); }
+        return acc * (1.0 / (3.0 * area2));
+    }
+
+    public override double Area() {
+        double area2 = 0.0;
+        int n = this.vertices.Count;
+        for (int i = 0; i < n; i = i + 1) {
+            area2 = area2 + this.vertices[i].Cross(this.vertices[(i + 1) % n]);
+        }
+        return Math.Abs(area2) * 0.5;
+    }
+
+    public override Vec2 Centroid() {
+        return new Vec2(0.0, 0.0);
+    }
+
+    public override double InertiaPerMass() {
+        int n = this.vertices.Count;
+        if (n < 3) { return 0.0; }
+        double area = this.Area();
+        if (area <= 0.0) { return 0.0; }
+        double sum = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            Vec2 a = this.vertices[i];
+            Vec2 b = this.vertices[(i + 1) % n];
+            sum = sum + a.Cross(b) * (a.Dot(a) + a.Dot(b) + b.Dot(b));
+        }
+        return sum / (12.0 * area);
+    }
+
+    public override Aabb ComputeAabb(Vec2 center, double angle) {
+        int n = this.vertices.Count;
+        if (n == 0) { return Aabb.FromCenter(center, 0.0); }
+        Vec2 first = center + this.vertices[0].Rotated(angle);
+        double minX = first.x;
+        double minY = first.y;
+        double maxX = first.x;
+        double maxY = first.y;
+        for (int i = 1; i < n; i = i + 1) {
+            Vec2 p = center + this.vertices[i].Rotated(angle);
+            if (p.x < minX) { minX = p.x; }
+            if (p.y < minY) { minY = p.y; }
+            if (p.x > maxX) { maxX = p.x; }
+            if (p.y > maxY) { maxY = p.y; }
+        }
+        return new Aabb(minX, minY, maxX, maxY);
+    }
+
+    public override Vec2 Support(Vec2 dir, Vec2 center, double angle) {
+        int n = this.vertices.Count;
+        if (n == 0) { return center; }
+        Vec2 best = center + this.vertices[0].Rotated(angle);
+        double bestDot = dir.Dot(best - center);
+        for (int i = 1; i < n; i = i + 1) {
+            Vec2 p = center + this.vertices[i].Rotated(angle);
+            double d = dir.Dot(p - center);
+            if (d > bestDot) {
+                bestDot = d;
+                best = p;
+            }
+        }
+        return best;
+    }
+}

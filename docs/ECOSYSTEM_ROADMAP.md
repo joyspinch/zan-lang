@@ -157,6 +157,59 @@ OOP 实体基类**不动**——它是"一个对象一个实体"的写法，与 
 conformance：`ecs_world`（组件读写、延迟销毁与清理、分组顺序、禁用系统、
 查询命中、值/引用组件语义、确定性重放）。
 
+### 1.6 2D 物理：`Zan.Game.Physics2D`
+
+新包 `packages/Zan.Game.Physics2D`，命名空间 `Game.Physics2D`。补上 §3 里
+标着的最大缺口：几何检测已有（`Arcade2D/Collision2D`），缺的是**动力学层**。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Vec2.zan` | `Vec2` | 值语义向量（struct），运算符重载 `+ - * / == !=`，`Dot/Cross/Perpendicular/Rotated/Normalized/Length/DistanceTo` |
+| `Aabb.zan` | `Aabb` | 包围盒（struct），`Overlaps/Contains/Center/Perimeter/Expand` |
+| `Shape.zan` | `Shape` | 抽象形状基类：`Radius/Mass/InertiaPerMass/ComputeAabb` |
+| `CircleShape.zan` | `CircleShape` | 圆（面积 πr²，`InertiaPerMass = ½r²`） |
+| `PolygonShape.zan` | `PolygonShape` | 凸多边形（自动纠正顺/逆时针，外法线取边的右法线 `(dy,-dx)`，`InertiaPerMass = Σ cross·(…) /(12A)`） |
+| `RigidBody.zan` | `RigidBody` | 质量/转动惯量、位置/角度/速度/角速度、`ToWorld/ToLocal/VelocityAt/PseudoVelocityAt`、`ApplyForceAtPoint`（带力矩） |
+| `Manifold.zan` | `ContactPoint` / `Manifold` | 接触点集合：法线 A→B、接触点数、接触点列表 |
+| `Collision.zan` | — | 窄相：`CircleCircle` / `CirclePolygon` / `PolygonPolygon`（SAT）、通用分派 `Collide` |
+| `Contact.zan` | `Contact` | 常驻接触对象 + 热启动（`AdoptImpulses`）、材料组合（摩擦取几何平均、弹性取 max） |
+| `Joint.zan` | `Joint` | 抽象关节：`ApplyForces/Prepare/SolveVelocity/SolvePosition` |
+| `DistanceJoint.zan` | `DistanceJoint` | 刚性定距；`frequency > 0` 时按 Hz + 阻尼比退化为弹簧 |
+| `RevoluteJoint.zan` | `RevoluteJoint` | 2×2 有效质量矩阵的点约束 |
+| `PhysicsWorld.zan` | `PhysicsWorld` | 宽相（按 minX 插入排序的扫掠剪枝）+ 窄相 + 顺序冲量求解（法线 + 库仑摩擦、热启动、8 次速度迭代）+ 分离冲量位置修正 + 子步 |
+
+**五条硬取舍**：
+
+1. **只支持凸多边形**：凹多边形在 SAT 下没有唯一分离轴，直接拒绝（不静默
+   给错结果）。
+2. **无 TOI 扫掠，用推测接触顶替**：分离量落在 `speculativeMargin` 内也建接触，
+   求解器把接近速度限制为 `gap/dt`——高速物体不再一步穿墙，但**极高速仍可能穿
+   薄壁**（README 已写明边界）。
+3. **穿透修正走分离冲量（伪速度）**，不往真实速度里注入能量：位置修正不应让
+   物体弹开。
+4. **接触点用类而不是 struct**：`List<T>` 取结构体元素是**副本**，累积冲量无处
+   写回。这与 `Zan.Game.Ecs` 里泛型类值类型字段的坑是同源的。
+5. **确定性优先**：无随机数、接触/关节顺序固定、迭代次数固定——回放与 lockstep
+   的前提。
+
+**落地时踩出的编译器缺陷（均已修）**：
+
+| 缺陷 | 症状 | 修处 |
+|---|---|---|
+| 运算符重载不参与类型推导 | `this.value * s + this.value` 被推成整数加法，LLVM 报 "Integer arithmetic operators only work with integral types" | `irgen_expr_core.c` 的 `infer_expr_type` / `AST_BINARY` 分支解析 `op_*` 并回其返回类型 |
+| 运算符实参按指针传 | `new 结构体(...)` 作运算符实参时，接收者/第二实参是指针槽位 → "Call parameter type does not match function signature" | `irgen_expr.c` 运算符调用路径：期望 struct 而实参是 ptr 时补 `LLVMBuildLoad2` |
+| 跨编译单元 struct 字段布局降级 | 类字段声明在另一个文件时，字段类型被降级成 `i8*` → 布局整体错位 → **静默内存损坏**（实测 `v 3,0.25` 把 y 读成相邻 double） | `irgen.c` 的 `map_type`：`TYPE_STRUCT`/`TYPE_CLASS` 未注册时按「有 decl 则注册」再取（class 取指针、struct 取值） |
+| `register_struct_type` 递归后条目错位 | 递归注册触发 `g->struct_types` realloc 搬家，事后用 `&g->struct_types[count-1]` 取到的是**别的类型**的条目 → 类型混淆 → **间歇性 0xC0000005**（ecs_world 10 次编译崩 1 次） | 登记后立刻记 `int my_index = g->struct_type_count - 1;`，递归后按 `my_index` 取条目 |
+
+后两条的回归用例：`tests/conformance/struct_field_layout/`（结构体文件排在用户
+文件之后，正好命中旧缺陷的文件序）。
+
+conformance：`physics2d_world`（自由落体积分、落地静止、弹性反弹、库仑摩擦、
+旋转多边形 SAT、穿透修正、铰链摆锤、定距关节、确定性重放）。
+
+**已知边界**：只支持凸多边形；无 TOI 扫掠；角-角接触按单点近似；无 sleeping、
+无 CCD。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -200,7 +253,7 @@ conformance：`ecs_world`（组件读写、延迟销毁与清理、分组顺序�
 | 建议包 | C# 参考 | ★ | 现状 → 缺口 | 工期 |
 |---|---|---|---|---|
 | `Zan.Game.Ecs` | DefaultEcs / Unity ml-agents | 榜外 / 19,771 | ✅ 已落地 `packages/Zan.Game.Ecs`（`Game.Ecs`：类型化组件池 + 延迟销毁 + 分组系统调度 + 稳定序查询，见 §1.5） | — |
-| `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | **几何检测已有**（`Arcade2D/Collision2D` + `AdvancedCollision2D`：射线、AABB、分离轴粗筛）→ 缺**动力学层**：积分器、约束/关节、旋转体（OBB/多边形 SAT）、连续碰撞、穿透修正 | 3–4 周 |
+| `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | ✅ 已落地 `packages/Zan.Game.Physics2D`（`Game.Physics2D`：值语义向量 + 凸多边形/圆窄相 + 顺序冲量动力学 + 距离/旋转关节，见 §1.6） | — |
 | `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | 只有棋盘 `GridPathfinder` + 塔防 `FlowField` → A*/JPS、导航网格、路径平滑 | 2–3 周 |
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | 有 `AssetPipeline` + `PackedAssets` → glTF 导入、骨骼/动画切片、图集、字体与 shader | 3–5 周 |
@@ -235,7 +288,7 @@ conformance：`ecs_world`（组件读写、延迟销毁与清理、分组顺序�
 ## 6. 落地顺序
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
-**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
+**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 

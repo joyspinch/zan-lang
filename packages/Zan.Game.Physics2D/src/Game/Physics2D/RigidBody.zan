@@ -1,0 +1,158 @@
+using System;
+
+namespace Game.Physics2D;
+
+// 刚体：位置、朝向、速度与质量属性。
+//
+// 约定：
+//   - position 永远是**形状质心**的世界坐标（多边形形状已把顶点平移到
+//     质心系，圆心在原点）。
+//   - angle 用弧度，逆时针为正。
+//   - 静态体（isStatic）质量无穷：invMass / invInertia 都是 0，求解时
+//     不会被推动，但会挡住别人。
+public class RigidBody {
+    // 世界内唯一 id（由 PhysicsWorld 分配）。
+    public int id;
+    // 形状（局部几何）。
+    public Shape shape;
+    // 质心世界坐标。
+    public Vec2 position;
+    // 朝向（弧度）。
+    public double angle;
+    // 线速度（单位/秒）。
+    public Vec2 velocity;
+    // 角速度（弧度/秒）。
+    public double angularVelocity;
+    // 本步累积的力与力矩（每步末清零）。
+    public Vec2 force;
+    public double torque;
+    // 质量属性。
+    public double mass;
+    public double inertia;
+    public double invMass;
+    public double invInertia;
+    // 材质。
+    public double restitution;
+    public double friction;
+    // 是否为静态体。
+    public bool isStatic;
+    // 是否锁死旋转（转动惯量按 0 算）。
+    public bool fixedRotation;
+    // 阻尼（每秒比例：v /= 1 + damping·dt）。
+    public double linearDamping;
+    public double angularDamping;
+    // 分离冲量用的伪速度（位置修正阶段专用，不进入真实速度）。
+    public Vec2 pseudoVelocity;
+    public double pseudoAngularVelocity;
+
+    public RigidBody(Shape shape, Vec2 position, double angle) {
+        this.id = 0;
+        this.shape = shape;
+        this.position = position;
+        this.angle = angle;
+        this.velocity = new Vec2(0.0, 0.0);
+        this.angularVelocity = 0.0;
+        this.force = new Vec2(0.0, 0.0);
+        this.torque = 0.0;
+        this.mass = 0.0;
+        this.inertia = 0.0;
+        this.invMass = 0.0;
+        this.invInertia = 0.0;
+        this.restitution = 0.0;
+        this.friction = 0.2;
+        this.isStatic = true;
+        this.fixedRotation = false;
+        this.linearDamping = 0.0;
+        this.angularDamping = 0.0;
+        this.pseudoVelocity = new Vec2(0.0, 0.0);
+        this.pseudoAngularVelocity = 0.0;
+        this.RecomputeMass();
+    }
+
+    // 动态体：按形状面密度 density 算质量与转动惯量。
+    public static RigidBody Dynamic(Shape shape, Vec2 position, double density) {
+        RigidBody body = new RigidBody(shape, position, 0.0);
+        body.isStatic = false;
+        body.shape.density = density;
+        body.RecomputeMass();
+        return body;
+    }
+
+    // 动态体：指定朝向。
+    public static RigidBody Dynamic(Shape shape, Vec2 position, double angle, double density) {
+        RigidBody body = RigidBody.Dynamic(shape, position, density);
+        body.angle = angle;
+        return body;
+    }
+
+    // 静态体：不被推动，只挡路。
+    public static RigidBody Static(Shape shape, Vec2 position, double angle) {
+        RigidBody body = new RigidBody(shape, position, angle);
+        body.isStatic = true;
+        body.RecomputeMass();
+        return body;
+    }
+
+    // 重新按形状与密度算质量 / 转动惯量（改了 density 或 fixedRotation 后调用）。
+    public void RecomputeMass() {
+        if (this.isStatic) {
+            this.mass = 0.0;
+            this.inertia = 0.0;
+            this.invMass = 0.0;
+            this.invInertia = 0.0;
+            return;
+        }
+        double area = this.shape.Area();
+        this.mass = area * this.shape.density;
+        this.inertia = this.mass * this.shape.InertiaPerMass();
+        if (this.fixedRotation) {
+            this.inertia = 0.0;
+        }
+        this.invMass = this.mass > 0.0 ? 1.0 / this.mass : 0.0;
+        this.invInertia = this.inertia > 0.0 ? 1.0 / this.inertia : 0.0;
+    }
+
+    // 施加力（累积到本步末）。
+    public void ApplyForce(double fx, double fy) {
+        this.force = this.force + new Vec2(fx, fy);
+    }
+
+    // 施加力矩（累积到本步末）。
+    public void ApplyTorque(double value) {
+        this.torque = this.torque + value;
+    }
+
+    // 在世界点施加力（同时产生绕质心的力矩）。
+    public void ApplyForceAtPoint(double fx, double fy, Vec2 worldPoint) {
+        this.force = this.force + new Vec2(fx, fy);
+        Vec2 r = worldPoint - this.position;
+        this.torque = this.torque + r.Cross(new Vec2(fx, fy));
+    }
+
+    // 局部点 → 世界点。
+    public Vec2 ToWorld(Vec2 localPoint) {
+        return this.position + localPoint.Rotated(this.angle);
+    }
+
+    // 世界点 → 局部点。
+    public Vec2 ToLocal(Vec2 worldPoint) {
+        return (worldPoint - this.position).Rotated(-this.angle);
+    }
+
+    // 世界点处的速度（含旋转贡献）。
+    public Vec2 VelocityAt(Vec2 worldPoint) {
+        Vec2 r = worldPoint - this.position;
+        return this.velocity + r.Perpendicular() * this.angularVelocity;
+    }
+
+    // 世界点处的伪速度（位置修正阶段用）。
+    public Vec2 PseudoVelocityAt(Vec2 worldPoint) {
+        Vec2 r = worldPoint - this.position;
+        return this.pseudoVelocity + r.Perpendicular() * this.pseudoAngularVelocity;
+    }
+
+    // 当前包围盒。
+    public Aabb ComputeAabb() {
+        return this.shape.ComputeAabb(this.position, this.angle);
+    }
+}

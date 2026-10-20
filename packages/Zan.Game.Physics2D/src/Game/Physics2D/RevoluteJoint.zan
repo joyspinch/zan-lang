@@ -1,0 +1,97 @@
+using System;
+
+namespace Game.Physics2D;
+
+// 铰链关节（pin）：把两个刚体上的同一点钉在一起，只约束平移，不约束
+// 相对旋转——摆、轮子、开门都靠它。
+//
+// 求解用 2×2 有效质量矩阵：把两个锚点的相对速度归零，一次解出 x/y 两个
+// 方向的冲量。
+public class RevoluteJoint : Joint {
+    // 锚点（局部坐标）。
+    public Vec2 localAnchorA;
+    public Vec2 localAnchorB;
+    // 累积冲量（诊断用）。
+    public Vec2 impulse;
+
+    private Vec2 rA;
+    private Vec2 rB;
+    // 2×2 有效质量矩阵的分量。
+    private double m11;
+    private double m12;
+    private double m22;
+
+    public RevoluteJoint(
+        RigidBody bodyA,
+        RigidBody bodyB,
+        Vec2 worldAnchor
+    ) : base(bodyA, bodyB) {
+        this.localAnchorA = bodyA.ToLocal(worldAnchor);
+        this.localAnchorB = bodyB.ToLocal(worldAnchor);
+        this.impulse = new Vec2(0.0, 0.0);
+        this.rA = new Vec2(0.0, 0.0);
+        this.rB = new Vec2(0.0, 0.0);
+        this.m11 = 0.0;
+        this.m12 = 0.0;
+        this.m22 = 0.0;
+    }
+
+    public override void Prepare(double h) {
+        this.rA = this.bodyA.ToWorld(this.localAnchorA) - this.bodyA.position;
+        this.rB = this.bodyB.ToWorld(this.localAnchorB) - this.bodyB.position;
+        double mA = this.bodyA.invMass;
+        double mB = this.bodyB.invMass;
+        double iA = this.bodyA.invInertia;
+        double iB = this.bodyB.invInertia;
+        this.m11 = mA + mB + iA * this.rA.y * this.rA.y + iB * this.rB.y * this.rB.y;
+        this.m12 = -iA * this.rA.x * this.rA.y - iB * this.rB.x * this.rB.y;
+        this.m22 = mA + mB + iA * this.rA.x * this.rA.x + iB * this.rB.x * this.rB.x;
+    }
+
+    public override void SolveVelocity(double h) {
+        Vec2 pA = this.bodyA.position + this.rA;
+        Vec2 pB = this.bodyB.position + this.rB;
+        Vec2 dv = this.bodyB.VelocityAt(pB) - this.bodyA.VelocityAt(pA);
+        // 约束是"相对速度归零"：λ = -K⁻¹·dv。
+        Vec2 lambda = this.SolveMatrix(dv * -1.0);
+        this.impulse = this.impulse + lambda;
+        this.ApplyImpulse(lambda);
+    }
+
+    public override void SolvePosition(double h, double baumgarte) {
+        Vec2 pA = this.bodyA.position + this.rA;
+        Vec2 pB = this.bodyB.position + this.rB;
+        Vec2 error = pB - pA;
+        if (error.LengthSquared() < 0.0000000001) { return; }
+        Vec2 dv = this.bodyB.PseudoVelocityAt(pB) - this.bodyA.PseudoVelocityAt(pA);
+        // 目标伪速度：把两点的位置误差按 baumgarte 系数摊回。
+        Vec2 target = error * (-baumgarte / h);
+        Vec2 lambda = this.SolveMatrix(target - dv);
+        this.bodyA.pseudoVelocity = this.bodyA.pseudoVelocity - lambda * this.bodyA.invMass;
+        this.bodyA.pseudoAngularVelocity = this.bodyA.pseudoAngularVelocity
+            - this.bodyA.invInertia * this.rA.Cross(lambda);
+        this.bodyB.pseudoVelocity = this.bodyB.pseudoVelocity + lambda * this.bodyB.invMass;
+        this.bodyB.pseudoAngularVelocity = this.bodyB.pseudoAngularVelocity
+            + this.bodyB.invInertia * this.rB.Cross(lambda);
+    }
+
+    // 解 2×2 方程 K·λ = v，K 是有效质量矩阵。
+    private Vec2 SolveMatrix(Vec2 v) {
+        double det = this.m11 * this.m22 - this.m12 * this.m12;
+        if (det == 0.0) { return new Vec2(0.0, 0.0); }
+        double invDet = 1.0 / det;
+        return new Vec2(
+            (this.m22 * v.x - this.m12 * v.y) * invDet,
+            (this.m11 * v.y - this.m12 * v.x) * invDet
+        );
+    }
+
+    private void ApplyImpulse(Vec2 lambda) {
+        this.bodyA.velocity = this.bodyA.velocity - lambda * this.bodyA.invMass;
+        this.bodyA.angularVelocity = this.bodyA.angularVelocity
+            - this.bodyA.invInertia * this.rA.Cross(lambda);
+        this.bodyB.velocity = this.bodyB.velocity + lambda * this.bodyB.invMass;
+        this.bodyB.angularVelocity = this.bodyB.angularVelocity
+            + this.bodyB.invInertia * this.rB.Cross(lambda);
+    }
+}

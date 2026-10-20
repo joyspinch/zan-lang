@@ -166,6 +166,20 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **包级泛型委托可以自己声明**：`public delegate void EcsEach3<T1,T2,T3>(T1 a,
   T2 b, T3 c);` 合法，可作方法参数（依赖型实例化 `EcsEach3<int, T, U>` 也能用），
   写 ECS/事件这类"带类型参数的回调"不必绕开泛型。
+* **运算符重载可用，标量只能在右**（实证，2026-10-22）：值类型写
+  `public static V operator +(V a, V b)` 合法（同名同参的一组 `+ - * /`）。
+  混合标量时**只能标量在右**：`v * 2.0` 合法，`2.0 * v` 编译器报
+  "cannot apply operator to 'double' and 'V'"——语言限制，别绕。
+* **`List<T>` 取结构体元素是副本**（实证，2026-10-22）：`list[i].field = x`
+  改的是**副本**，不写回原元素。要就地累积（接触冲量、缓冲池槽位这类）就用
+  **类**元素（`List<ContactPoint>`），别用 struct。同理 `List<T>` 没有
+  `Sort` / `Remove(T)`，只有 `Count/Add/Reserve/AddRange/Insert/RemoveAt/
+  Clear/Contains/IndexOf/LastIndexOf/Reverse/ToArray`。
+* **结构体跨文件的字段布局曾被降级成指针**（实证，2026-10-22）：类的字段类型
+  声明在**另一个文件**时，旧编译器把字段类型降级成 `i8*` → 布局整体错位 →
+  **静默内存损坏**（值是错的，不是崩）。已修（`irgen.c` 的 `map_type`）。
+  判定器 `tests/conformance/struct_field_layout/`——新写"跨文件共享结构体"的
+  代码时先跑它，别自己判字段偏移。
 
 ## 4. Edit
 
