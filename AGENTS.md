@@ -219,7 +219,8 @@ positive, stated in the commit message.
     示范，公共库散在模板里会被每个项目各抄一份，修复无法回流。
     动手前先查 `packages/` 是否已有同类模块（复用优先，规则 10）；
     抽包时把配套的无头测试一起搬过去（包的测试跑在包上，不是跑在某个
-    模板上）。坑出处：`templates/game/coreforge` 曾在模板里长出 261KB 的
+    模板上）。坑出处：`coreforge`（现为仓库外项目 `D:/project/games/coreforge`）
+    曾在模板里长出 261KB 的
     工厂自动化引擎，抽出为 `Zan.Game.Factory` 时顺带发现它的存档读回
     全线失败（查裸字段 `numIsInt` 判整数，解析出来的 JSON 数字带的是
     `numRaw` 文本），修好后 240 条断言才真正跑起来——被模板藏起来的

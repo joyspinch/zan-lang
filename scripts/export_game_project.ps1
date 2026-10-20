@@ -129,7 +129,12 @@ if ($SourceRef) {
 
 $source = Join-Path $sourceBase (Norm "templates/$Template")
 $testSource = Join-Path $sourceBase (Norm $testRel)
-if (-not (Test-Path $source)) { Fail "模板目录不存在：$source" }
+if (-not (Test-Path $source)) {
+    # 模板搬出仓库后仓库里已无源目录：提示用打标签的旧提交取源
+    $tags = & git -C $repo tag --list "archive/*$templateName*" 2>$null
+    $hint = if ($tags) { "该模板已搬出仓库，可用标签取源：-SourceRef " + ($tags | Select-Object -Last 1) } else { '' }
+    Fail "模板目录不存在：$source$hint"
+}
 
 $target = [IO.Path]::GetFullPath($Target).TrimEnd('\', '/')
 if ($target -eq $source) { Fail '目标与源相同' }

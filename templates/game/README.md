@@ -24,7 +24,6 @@ IDE 的"新建项目"按这个标签分组。
 | 卡牌 Card | [ddz](ddz/) | `Game.Cards` | 斗地主：叫地主、组合出牌、牌面动画 |
 | 卡牌 Card | [roguelike](roguelike/) | `Game.Cards` + `Game.Foundation` | 肉鸽爬塔：种子决定地图/敌人/奖励三选一 |
 | 策略塔防 Strategy | [rts](rts/) | `Game.Tactics` | 即时战术：流场寻路 + RVO 群体避障 + 小地图 |
-| 策略塔防 Strategy | [coreforge](coreforge/) | `Zan.Game.Factory` + `Game.Core` | 炉心边境：传送带工厂自动化 + 20 波塔防（逻辑层已抽成包） |
 | 益智解谜 Puzzle | [trap-cat](trap-cat/) | `Game.Board` | 围住神经猫：逐点封堵、撤销、最短路 AI |
 | 动作平台 Action | [platformer](platformer/) | `Game.Arcade2D` | 2D 横版平台：零分配循环、土狼时间、跳跃缓冲 |
 | 放置挂机 Idle | [idle](idle/) | `Game.Idle` | 放置矿工：Gui + SpriteBatch + 弹性反馈 |
@@ -39,6 +38,7 @@ IDE 的"新建项目"按这个标签分组。
 |---|---|---|
 | `D:/project/games/legend` | 2.5D 动作 RPG + 配套服务端 | 传奇放置挂机：CSV 数据驱动、离线收益、存档；项目内 `client/` 与 `server/` 分目录，规则表单向同步 |
 | `D:/project/games/wuwei` | 数据驱动修仙 RPG | 无为修仙传：水墨修仙，HTML 设计稿 + 代码隐藏 |
+| `D:/project/games/coreforge` | 工厂自动化 + 塔防 | 炉心边境：传送带物流 + 熔炼链 + 20 波塔防；逻辑层在仓库的 `Zan.Game.Factory` 包里（项目通过 `$env:ZAN_HOME` 吃仓库的公共包） |
 
 搬迁用 [`scripts/export_game_project.ps1`](../../scripts/export_game_project.ps1)
 （复制 + 改写仓库路径引用 + 退模板身份 + `git init`）。仓库里若还需要留一份
@@ -66,7 +66,7 @@ IDE 的"新建项目"按这个标签分组。
 - **模板 = 一个游戏怎么做**：玩法规则、界面、入口、资源。
 - **包 = 一类游戏共用的机制**：与具体玩法/美术无关的通用子系统。
   已经抽出去的：`Zan.Game.Factory`（工厂自动化 + 塔防的物流/配方/科技/波次/存档，
-  模板 `coreforge` 只剩渲染与 HUD）。
+  实例在仓库外的 `D:/project/games/coreforge`，那边只剩渲染与 HUD）。
 
 判断口径：**这段代码换个游戏还成立吗？** 成立 → 进包；只对这个游戏成立 → 留模板。
 

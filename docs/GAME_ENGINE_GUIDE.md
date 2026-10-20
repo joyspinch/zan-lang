@@ -227,7 +227,6 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 | `templates/game/roguelike` | 肉鸽卡牌构筑 (杀戮尖塔 / 肉鸽) | 种子决定地图与奖励三选一 + 三区牌堆 + 能量回合结算 |
 | `templates/game/ddz` | 策略卡牌 (斗地主) | 牌型识别 + AI 对手 + 牌面动画 |
 | `templates/game/rts` | 即时战略 (RTS / 红警 / 魔兽) | `FlowField` 宏观寻路 + `RvoSimulator` 群体避障 + 小地图雷达 + 框选移动 |
-| `templates/game/coreforge` | 工厂自动化塔防 (Mindustry / 异星工厂) | 传送带物流 + 熔炼链 + 多波次塔防（逻辑层已抽为 `Zan.Game.Factory` 包） |
 | `templates/game/idle` | 放置挂机 (暗黑挂机 / 放置骑士) | `OfflineRewardCalculator` 离线收益 + `SquashAndStretch` 弹性反馈 + `FloatingText` 飘字池 |
 
 **仓库外的大型游戏项目**（产品级规模，模板位装不下，也该有自己的版本历史）：
@@ -236,6 +235,7 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 |---|---|---|
 | `D:/project/games/legend` | 2.5D 动作 RPG (传奇 / 暗黑) + 配套服务端 | 八方向朝向 + 5方向镜像 + 纸娃娃图层排序 + 怪物巡逻 + 掉落物散射；客户端与服务端同项目，规则表单向同步 |
 | `D:/project/games/wuwei` | 数据驱动修仙 RPG | HTML 设计稿投影 + 境界成长 + 炼制 + 转生 + 本地存档 |
+| `D:/project/games/coreforge` | 工厂自动化塔防 (Mindustry / 异星工厂) | 传送带物流 + 熔炼链 + 20 波塔防；逻辑层在仓库的 `Zan.Game.Factory` 包里，项目通过 `$env:ZAN_HOME` 吃仓库的公共包 |
 
 导出与回填用 [`scripts/export_game_project.ps1`](../scripts/export_game_project.ps1)：
 它把模板连同测试套件复制到仓库外、改写所有仓库路径引用、退掉模板身份

@@ -126,21 +126,10 @@ def test_template(category, name):
 
     entry = scaffold(src_dir, tgt_dir, is_gui)
 
-    # Special game code gen: coreforge, trap-cat
-    if name == "coreforge":
-        cf_hud = os.path.join(tgt_dir, "src/CoreforgeHud.zan")
-        cf_html = os.path.join(tgt_dir, "src/App.html")
-        req = {"mode": "design", "files": [{"name": "CoreforgeHud.html", "text": open(cf_html).read(), "emitMain": False}]}
-        r_p = os.path.join(tgt_dir, "req.json")
-        rep_p = os.path.join(tgt_dir, "rep.json")
-        json.dump(req, open(r_p, "w"))
-        subprocess.run([ZANGEN, r_p, rep_p], capture_output=True)
-        if os.path.exists(rep_p):
-            rep = json.load(open(rep_p))
-            if "sources" in rep and len(rep["sources"]) > 0:
-                txt = "namespace Coreforge;\n" + rep["sources"][0]["text"] + "\npartial class CoreforgeHud { public static Gui.Control Root() { return __BuildForm(); } }\n"
-                open(cf_hud, "w").write(txt)
-    elif name == "trap-cat":
+    # Special game code gen: trap-cat
+    # （coreforge 已搬出仓库，不再作为模板参与这条流水线；
+    #   它现在是 D:/project/games/coreforge，自带 tools/build.ps1 与 tools/test.ps1）
+    if name == "trap-cat":
         tc_html = os.path.join(tgt_dir, "src/TrapCatHtml.zan")
         tc_h = os.path.join(tgt_dir, "src/TrapCat.html")
         req = {"mode": "design", "files": [{"name": "TrapCat.html", "text": open(tc_h).read(), "emitMain": False}]}

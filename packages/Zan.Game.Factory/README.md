@@ -6,8 +6,9 @@
 传送带怎么送、配方怎么耗电、科技树怎么解锁、敌人一波波怎么来、存档怎么兼容旧版本。
 这些规则与美术无关，因此沉在包里，模板只负责把它画出来。
 
-配套模板：[`templates/game/coreforge`](../../templates/game/coreforge)（炉心边境）——
-那是这套引擎的一个完整实例（渲染 + HUD + 入口都留在模板里）。
+配套项目：[`D:/project/games/coreforge`](../../../../project/games/coreforge)（炉心边境）——
+那是这套引擎的一个完整实例（渲染 + HUD + 入口都在那个仓库外的独立项目里）。
+本包留在语言仓库里继续演进——它是公共机制，不是某个游戏的私产。
 
 ## 文件
 
@@ -66,5 +67,14 @@ if (ForgeSave.Save(world, "save.json")) {
 
 ## 测试
 
-`tests/templates/coreforge/verify.py` 编译本包 + 测试源并跑无头逻辑套件
-（240 条断言，覆盖物流、配方、流体、科技、存档、战斗、波次、种子确定性）。
+无头逻辑套件（240 条断言，覆盖物流、配方、流体、科技、存档、战斗、波次、种子确定性）
+随项目一起搬到了 `D:/project/games/coreforge/client/tests/verify.py`——它编译本包 +
+测试源来跑：
+
+```powershell
+$env:ZAN_HOME = 'D:/project/zan-lang'      # 公共包在本仓库的 packages/ 下
+pwsh -File D:/project/games/coreforge/client/tools/test.ps1
+```
+
+搬出前的仓库内位置在 `archive/coreforge-2026-10-20` 标签上，需要时用
+`scripts/export_game_project.ps1 -SourceRef archive/coreforge-2026-10-20` 取回。

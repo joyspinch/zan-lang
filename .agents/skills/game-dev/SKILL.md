@@ -656,7 +656,7 @@ Post 调用核对编码，别信二手注释。
     吞掉后只表现为读档返回 null，极难定位。
   - 正确写法：`value.IsNumber() && value.IsInt()`（`IsInt()` 会按
     `numRaw` 文本判断是否纯整数），取值走 `AsLong` / `AsInt`。
-  - 坑出处：`Zan.Game.Factory` 的存档往返（`templates/game/coreforge`
+  - 坑出处：`Zan.Game.Factory` 的存档往返（`D:/project/games/coreforge`，
     抽出前的 `ForgeSave`）就是这样坏的——抽出成包、把无头测试修好后，
     240 条断言才第一次真正跑起来。
 
