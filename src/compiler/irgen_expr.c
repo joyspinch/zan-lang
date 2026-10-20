@@ -5151,6 +5151,9 @@ binding_lowered:
                            type_contains_collection_rc(g, fs->type, 0)) {
                     emit_struct_field_capture(g, fs->type, gv, right,
                                               expr->binary.right, locals);
+                } else if (fs->type && fs->type->kind == TYPE_STRUCT) {
+                    /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                    zan_store_fit(g, coerce_struct_value(g, right, fs->type), gv);
                 } else {
                     LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                               : LLVMInt64TypeInContext(g->ctx);
@@ -5203,6 +5206,9 @@ binding_lowered:
                             /* 结构体字段按值整体赋值 */
                             emit_struct_field_capture(g, fst, fptr, right,
                                                       expr->binary.right, locals);
+                        } else if (fst && fst->kind == TYPE_STRUCT) {
+                            /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                            zan_store_fit(g, coerce_struct_value(g, right, fst), fptr);
                         } else {
                             zan_store_fit(g, right, fptr);
                         }
@@ -5812,6 +5818,9 @@ binding_lowered:
                                    type_contains_collection_rc(g, fs->type, 0)) {
                             emit_struct_field_capture(g, fs->type, gv, right,
                                                       expr->binary.right, locals);
+                        } else if (fs->type && fs->type->kind == TYPE_STRUCT) {
+                            /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                            zan_store_fit(g, coerce_struct_value(g, right, fs->type), gv);
                         } else {
                             LLVMTypeRef ft = fs->type ? map_type(g, fs->type)
                                                       : LLVMInt64TypeInContext(g->ctx);
@@ -5848,6 +5857,9 @@ binding_lowered:
                                        type_contains_collection_rc(g, aft, 0)) {
                                 emit_struct_field_capture(g, aft, fptr, right,
                                                           expr->binary.right, locals);
+                            } else if (aft && aft->kind == TYPE_STRUCT) {
+                                /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                                zan_store_fit(g, coerce_struct_value(g, right, aft), fptr);
                             } else {
                                 zan_store_fit(g, right, fptr);
                             }
@@ -5890,6 +5902,9 @@ binding_lowered:
                                                type_contains_collection_rc(g, gft, 0)) {
                                         emit_struct_field_capture(g, gft, fptr, right,
                                                                   expr->binary.right, locals);
+                                    } else if (gft && gft->kind == TYPE_STRUCT) {
+                                        /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                                        zan_store_fit(g, coerce_struct_value(g, right, gft), fptr);
                                     } else {
                                         zan_store_fit(g, right, fptr);
                                     }
@@ -5923,6 +5938,9 @@ binding_lowered:
                                            type_contains_collection_rc(g, gft, 0)) {
                                     emit_struct_field_capture(g, gft, fptr, right,
                                                               expr->binary.right, locals);
+                                } else if (gft && gft->kind == TYPE_STRUCT) {
+                                    /* 值结构体字段按值整体赋值（实参可能是构造临时对象的地址） */
+                                    zan_store_fit(g, coerce_struct_value(g, right, gft), fptr);
                                 } else {
                                     zan_store_fit(g, right, fptr);
                                 }

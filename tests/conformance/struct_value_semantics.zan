@@ -1,0 +1,84 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace ConformanceTests;
+
+// 值结构体的按值语义：构造临时对象（new T(...)）在表达式层面是「地址」，
+// 传给按值形参 / 存进集合槽位 / 赋给结构体字段时都必须按值取出。
+// 这条链路历史上没归一：调用点会传出指针（codegen 校验失败），
+// 集合槽里会存进指针（读出来全零）。用例覆盖四类按值消费点。
+class Program {
+    static int failures = 0;
+
+    static void Check(bool ok, string name) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + name);
+        }
+    }
+
+    class Box {
+        public Vector3 value;
+    }
+
+    static Vector3 Identity(Vector3 v) {
+        return v;
+    }
+
+    static Vector3 Make() {
+        return new Vector3(11.0f, 12.0f, 13.0f);
+    }
+
+    static void Main() {
+        // 1. 构造临时对象作为按值实参
+        Vector3 passed = Identity(new Vector3(1.0f, 2.0f, 3.0f));
+        Check(passed.X == 1.0f && passed.Y == 2.0f && passed.Z == 3.0f,
+              "struct temp as by-value argument");
+
+        // 2. 构造临时对象作为返回值
+        Vector3 returned = Make();
+        Check(returned.X == 11.0f && returned.Y == 12.0f && returned.Z == 13.0f,
+              "struct temp as return value");
+
+        // 3. 构造临时对象赋给结构体字段
+        Box box = new Box();
+        box.value = new Vector3(4.0f, 5.0f, 6.0f);
+        Check(box.value.X == 4.0f && box.value.Y == 5.0f && box.value.Z == 6.0f,
+              "struct temp assigned to field");
+
+        // 4. 构造临时对象存入集合槽位
+        List<Vector3> list = new List<Vector3>();
+        list.Add(new Vector3(7.0f, 8.0f, 9.0f));
+        list.Add(new Vector3(10.0f, 11.0f, 12.0f));
+        Check(list.Count == 2, "struct list count");
+        Check(list[0].X == 7.0f && list[0].Y == 8.0f && list[0].Z == 9.0f,
+              "struct temp stored in list");
+        Check(list[1].X == 10.0f && list[1].Y == 11.0f && list[1].Z == 12.0f,
+              "second struct temp stored in list");
+
+        // 5. 集合整体拷贝（AddRange 走槽位搬运）
+        List<Vector3> copy = new List<Vector3>();
+        copy.AddRange(list);
+        Check(copy.Count == 2, "AddRange count");
+        Check(copy[0].X == 7.0f && copy[0].Y == 8.0f && copy[0].Z == 9.0f,
+              "AddRange copies struct element");
+        Check(copy[1].X == 10.0f && copy[1].Y == 11.0f && copy[1].Z == 12.0f,
+              "AddRange copies second struct element");
+
+        // 6. 变量实参与临时对象实参混用
+        Vector3 variable = new Vector3(20.0f, 21.0f, 22.0f);
+        Vector3 mixed = Vector3.Add(variable, new Vector3(1.0f, 1.0f, 1.0f));
+        Check(mixed.X == 21.0f && mixed.Y == 22.0f && mixed.Z == 23.0f,
+              "mixed variable and temporary argument");
+
+        // 7. 局部变量赋值
+        Vector3 local = new Vector3(30.0f, 31.0f, 32.0f);
+        Check(local.X == 30.0f && local.Y == 31.0f && local.Z == 32.0f,
+              "struct temp in local initializer");
+
+        if (failures == 0) {
+            Console.WriteLine("ALL STRUCT VALUE SEMANTICS TESTS PASSED");
+        }
+    }
+}

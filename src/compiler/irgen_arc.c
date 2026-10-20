@@ -362,6 +362,22 @@ static LLVMValueRef load_dict_value_words(zan_irgen_t *g, LLVMValueRef raw) {
     return LLVMBuildLoad2(g->builder, i64, words_ptr, "dvw");
 }
 
+/* 结构体按值语义归整。
+ *
+ * 表达式若是构造临时对象（new T(...)），emit_expr 返回的是该临时对象的
+ * 地址（指针）；而按值消费方（集合槽位、结构体字段、函数实参）需要的是
+ * 结构体值。变量实参则已是按值取出的结构体——两种形态不一致会让按值
+ * 位置存进指针、读出来是垃圾。这里按声明类型统一归整：声明类型是值结构体
+ * 且实参是指针时，先按值取出。 */
+static LLVMValueRef coerce_struct_value(zan_irgen_t *g, LLVMValueRef v,
+                                        zan_type_t *t) {
+    if (!v || !t || t->kind != TYPE_STRUCT) return v;
+    LLVMTypeRef st = map_type(g, t);
+    if (!st || LLVMGetTypeKind(st) != LLVMStructTypeKind) return v;
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return v;
+    return LLVMBuildLoad2(g->builder, st, v, "struct.sval");
+}
+
 static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                                        LLVMTypeRef slot_ty, LLVMValueRef slot_ptr,
                                        LLVMValueRef value,
@@ -369,6 +385,8 @@ static void emit_collection_slot_store(zan_irgen_t *g, zan_type_t *elem_type,
                                        int overwrite_old) {
     LLVMTypeRef elem_llvm = elem_type ? map_type(g, elem_type) : slot_ty;
     LLVMTypeKind elem_kind = LLVMGetTypeKind(elem_llvm);
+    /* 结构体元素按值存槽：实参是构造临时对象时先按值取出 */
+    value = coerce_struct_value(g, value, elem_type);
     LLVMValueRef old = NULL;
     if (overwrite_old) {
         old = elem_kind == LLVMStructTypeKind
@@ -1298,6 +1316,22 @@ static LLVMValueRef emit_boundary_coerce(zan_irgen_t *g, LLVMValueRef v,
     return v;
 }
 
+/* 结构体按值传参的实参规整。
+ *
+ * 被调方按值接收结构体形参（形参 LLVM 类型即结构体类型），而调用点的实参
+ * 表达式是构造临时对象时，emit_expr 返回的是该临时对象的地址（指针）。
+ * 变量实参则返回已按值取出的结构体。两种形态不一致会让调用点传出指针，
+ * 与被调方签名不符（LLVM 校验失败：Call parameter type does not match）。
+ * 这里统一按形参类型判定：形参是结构体、实参是指针时，先按值取出再传递。
+ * `ref` / `out` 形参的 LLVM 类型是指针，不走这条路径。 */
+static LLVMValueRef coerce_struct_value_arg(zan_irgen_t *g, LLVMValueRef v,
+                                             LLVMTypeRef param_ty) {
+    if (!v || !param_ty) return v;
+    if (LLVMGetTypeKind(param_ty) != LLVMStructTypeKind) return v;
+    if (LLVMGetTypeKind(LLVMTypeOf(v)) != LLVMPointerTypeKind) return v;
+    return LLVMBuildLoad2(g->builder, param_ty, v, "arg.sval");
+}
+
 static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
                                   LLVMValueRef *call_args, int argc) {
     unsigned npt = LLVMCountParamTypes(fn_type);
@@ -1307,8 +1341,10 @@ static void coerce_args_to_params(zan_irgen_t *g, LLVMTypeRef fn_type,
                                              sizeof(LLVMTypeRef));
     if (npt > 0) LLVMGetParamTypes(fn_type, pts);
     int n = (argc < (int)npt) ? argc : (int)npt;
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+        call_args[i] = coerce_struct_value_arg(g, call_args[i], pts[i]);
         call_args[i] = emit_boundary_coerce(g, call_args[i], pts[i]);
+    }
     free(pts);
     for (int i = (int)npt; va && i < argc; i++) {
         LLVMValueRef v = call_args[i];

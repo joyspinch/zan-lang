@@ -94,7 +94,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      cmake 脚本里对崩溃子进程拿到的 `RESULT_VARIABLE` 是描述串
      （"Access violation"）而不是负数退出码，按形状判定才分得清"崩了"与
      "编译报错"。
-10. **导出的 IR 只在编译器自己的目标特性下合法**：
+10. **结构体按值语义的两种形态必须归一**：
+   - 动作：结构体实参/元素在调用点与集合槽位处，若发射出的值是**指针**
+     （`new T(...)` 构造临时对象即如此：构造器写入 sret 槽，表达式值是该槽地址），
+     而消费方按**值**接收（形参 LLVM 类型是结构体类型、集合槽是结构体槽），
+     必须先按值取出（`LLVMBuildLoad2`）再传/再存。已收口在
+     `irgen_arc.c` 的 `coerce_struct_value` / `coerce_args_to_params`。
+   - 理由：变量实参走的是「load 出结构体值」，构造临时对象走的是「槽地址」，
+     两种形态不一致 → 调用点传出指针（LLVM 校验直接失败：
+     `Call parameter type does not match function signature`），
+     或集合槽里存进指针、读出来是全零（`List<Vector3>.Add` 后读回全零）。
+     根因在 irgen，不在用户代码——不能要求用户绕开 `new T(...)`。
+   - 边界：`ref` / `out` 形参的 LLVM 类型是指针，**不**走这条路径；
+     类（引用类型）同样不走。
+11. **导出的 IR 只在编译器自己的目标特性下合法**：
    - 动作：`zanc --emit-ir` 落出的 .ll 是给外部工具（llc/opt/lli）消费的，必须用
      与编译器一致的目标特性去消费：编译器的 x86-64 档是 CPU `x86-64` + 特性
      `+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi`
