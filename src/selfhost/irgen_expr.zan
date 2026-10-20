@@ -1077,6 +1077,8 @@ partial class Irgen {
                     return;
                 }
                 v = StrSlotConv(lty, v);
+                // a struct is a value: the variable gets its own copy
+                if (NeedsStructCopy(lty, v)) { v = StructCopyTemp(v, lty); }
                 string lt = MapType(lty);
                 if (curAsync && locBox[li]) {
                     // the local lives in a heap cell: write through the cell
@@ -1153,12 +1155,12 @@ partial class Irgen {
             ExprVal obj = GenExpr(lhs.a);
             ExprVal idx = GenExpr(lhs.b);
             if (IsListType(obj.ty)) {
-                string sv = ToSlot(v, ListElem(obj.ty));
+                string sv = StructElemSlot(v, ListElem(obj.ty));
                 L("  call void @zlist_set(i8* " + obj.op + ", i64 " + idx.op + ", i64 " + sv + ")");
                 return;
             }
             if (IsDictType(obj.ty)) {
-                string sv = ToSlot(v, DictVal(obj.ty));
+                string sv = StructElemSlot(v, DictVal(obj.ty));
                 L("  call void @zdict_set(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ", i64 " + sv + ")");
                 return;
             }
@@ -1196,6 +1198,12 @@ partial class Irgen {
             // array of i64 slots; pointer/double values are packed into the slot
             string p = NT();
             L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+            // a struct element is a value: the array holds its own copy
+            if (IsStructTy(v.ty)) {
+                ExprVal c = CopyStructValue(v);
+                L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p);
+                return;
+            }
             if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
             L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
             return;
@@ -1234,10 +1242,14 @@ partial class Irgen {
         L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
         // erased field: pack the value into an i64 slot
         if (IsErasedType(fty)) {
+            // a struct value is copied: the field holds its own instance
+            if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
             string sv = ToSlot(v, v.ty);
             L("  store i64 " + sv + ", i64* " + p);
             return;
         }
+        // a struct field is a value: the field gets its own copy
+        if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
         string ft = MapType(fty);
         ExprVal src = StrSlotConv(fty, v);
         if (ArcManaged(fty) && !WeakTy(fty)) {
@@ -1949,7 +1961,7 @@ partial class Irgen {
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[jn]);
-                    string sv = ToSlot(iv, et);
+                    string sv = StructElemSlot(iv, et);
                     string ep = NT();
                     L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 2));
                     L("  store i64 " + sv + ", i64* " + ep);
@@ -1968,7 +1980,7 @@ partial class Irgen {
                 int j = 0;
                 while (j < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[j]);
-                    string sv = ToSlot(iv, ListElem(ty));
+                    string sv = StructElemSlot(iv, ListElem(ty));
                     L("  call void @zlist_add(i8* " + t + ", i64 " + sv + ")");
                     j = j + 1;
                 }
@@ -1988,7 +2000,7 @@ partial class Irgen {
                     if (item.kids.Count >= 2) {
                         ExprVal key = GenExpr(item.kids[0]);
                         ExprVal val = GenExpr(item.kids[1]);
-                        string sv = ToSlot(val, DictVal(ty));
+                        string sv = StructElemSlot(val, DictVal(ty));
                         L("  call void @zdict_set(i8* " + t + ", i8* " + DictKeyOp(key) + ", i64 " + sv + ")");
                     }
                     j = j + 1;
@@ -2022,6 +2034,8 @@ partial class Irgen {
         L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
         string obj = NT();
         L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+        // a struct-typed field points at a nested instance: allocate it
+        InitNestedFields(obj, cls);
         if (IsPolyClass(cls)) {
             List<string> vslots = new List<string>();
             CollectVSlots(cls, vslots);
@@ -2972,7 +2986,8 @@ partial class Irgen {
                     ExprVal cv;
                     if (caps[c] == "this") { cv = ThisReceiver(); }
                     else { cv = GenExpr(MkIdent(caps[c])); }
-                    packed = ToSlot(cv, capTy[c]);
+                    // a captured struct is a value: the closure keeps its own copy
+                    packed = StructElemSlot(cv, capTy[c]);
                 }
                 L("  store i64 " + packed + ", i64* " + slot);
                 c = c + 1;
@@ -3889,6 +3904,8 @@ partial class Irgen {
 
     // build a call argument for a (possibly erased) parameter type
     string CallArg(ExprVal av, Node pty) {
+        // a struct parameter is a value: the callee gets its own copy
+        if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
         ExprVal src = StrSlotConv(pty, av);
         return Coerce(src, MapType(pty));
@@ -4647,7 +4664,7 @@ partial class Irgen {
     ExprVal EmitListMethod(ExprVal recv, string name, Node e) {
         if (name == "Add") {
             ExprVal v = GenExpr(e.kids[0]);
-            string sv = ToSlot(v, ListElem(recv.ty));
+            string sv = StructElemSlot(v, ListElem(recv.ty));
             L("  call void @zlist_add(i8* " + recv.op + ", i64 " + sv + ")");
             return new ExprVal("0", MkType("void"));
         }
@@ -4728,7 +4745,7 @@ partial class Irgen {
         if (name == "Insert" && e.kids.Count == 2) {
             ExprVal idx = GenExpr(e.kids[0]);
             ExprVal v = GenExpr(e.kids[1]);
-            string sv = ToSlot(v, ListElem(recv.ty));
+            string sv = StructElemSlot(v, ListElem(recv.ty));
             L("  call void @zlist_insert(i8* " + recv.op + ", i64 " + idx.op + ", i64 " + sv + ")");
             return new ExprVal("0", MkType("void"));
         }
@@ -4865,7 +4882,7 @@ partial class Irgen {
         if (name == "Add" || name == "set_Item") {
             ExprVal key = GenExpr(e.kids[0]);
             ExprVal val = GenExpr(e.kids[1]);
-            string sv = ToSlot(val, DictVal(recv.ty));
+            string sv = StructElemSlot(val, DictVal(recv.ty));
             L("  call void @zdict_set(i8* " + recv.op + ", i8* " + DictKeyOp(key) + ", i64 " + sv + ")");
             return new ExprVal("0", MkType("void"));
         }

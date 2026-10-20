@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+namespace Zan;
+
+// Irgen part: struct value semantics.
+//
+// This backend has no aggregate values: a struct instance is a heap object
+// (%Name*) and every mention of it is a pointer. The C host passes structs by
+// value, so every place where the host copies a struct has to copy it here
+// too:
+//   - assignment to a variable or to a field
+//   - passing an argument
+//   - storing into a container element (List / Dictionary / array)
+// A struct-typed field holds a pointer to a nested instance, so the copy is
+// deep for struct fields and shallow (retain) for class fields -- the same
+// split the host's by-value copy makes.
+partial class Irgen {
+    // true when `t` names a struct type (an instance is a heap object here)
+    bool IsStructTy(Node t) {
+        if (t == null) { return false; }
+        if (t.ival >= 1) { return false; }
+        if (IsErasedType(t)) { return false; }
+        // the hardware vectors are declared as structs but are first-class
+        // values here: they have no heap layout and no instance to copy
+        if (t.sval == "Vector128" || t.sval == "Vector256") { return false; }
+        Node d = binder.FindType(t.sval);
+        if (d == null) { return false; }
+        return d.kind == AK.StructDecl();
+    }
+
+    // does a value of type `slotTy` have to be copied when it is stored into
+    // a slot of that type? An erased slot (a type parameter) takes the copy
+    // only when the value's own type says so.
+    bool NeedsStructCopy(Node slotTy, ExprVal v) {
+        if (IsStructTy(slotTy)) { return true; }
+        if (slotTy != null && IsErasedType(slotTy) && v != null) { return IsStructTy(v.ty); }
+        return false;
+    }
+
+    // allocate a zeroed struct instance; returns the object pointer
+    string AllocStructObj(string cn) {
+        string szp = NT();
+        L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+        string szi = NT();
+        L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+        string raw = NT();
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        string obj = NT();
+        L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+        return obj;
+    }
+
+    // A struct-typed field holds a pointer to a nested instance. Every
+    // instance therefore needs its nested instances allocated (zeroed) --
+    // otherwise writing a nested field dereferences a null pointer.
+    void InitNestedFields(string obj, Node decl) {
+        if (decl == null) { return; }
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(decl, names, types);
+        int fb = FieldBase(decl);
+        int i = 0;
+        while (i < types.Count) {
+            if (IsStructTy(types[i])) {
+                string cn = types[i].sval;
+                string sub = AllocStructObj(cn);
+                string lt = MapType(types[i]);
+                string p = NT();
+                L("  " + p + " = getelementptr %" + decl.sval + ", %" + decl.sval + "* " + obj + ", i32 0, i32 " + (fb + i));
+                L("  store " + lt + " " + sub + ", " + lt + "* " + p);
+                Node ndecl = binder.FindType(cn);
+                InitNestedFields(sub, ndecl);
+            }
+            i = i + 1;
+        }
+    }
+
+    // Copy the contents of the struct instance `src` into the instance `dst`.
+    // Class fields are shared with the source (the copy retains them), struct
+    // fields are copied recursively.
+    void CopyStructInto(string dst, string src, Node decl) {
+        if (decl == null) { return; }
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(decl, names, types);
+        string cn = decl.sval;
+        int fb = FieldBase(decl);
+        int i = 0;
+        while (i < types.Count) {
+            Node fty = types[i];
+            int idx = fb + i;
+            string sp = NT();
+            L("  " + sp + " = getelementptr %" + cn + ", %" + cn + "* " + src + ", i32 0, i32 " + idx);
+            string dp = NT();
+            L("  " + dp + " = getelementptr %" + cn + ", %" + cn + "* " + dst + ", i32 0, i32 " + idx);
+            if (IsStructTy(fty)) {
+                string slt = MapType(fty);
+                string sv = NT();
+                L("  " + sv + " = load " + slt + ", " + slt + "* " + sp);
+                string dv = NT();
+                L("  " + dv + " = load " + slt + ", " + slt + "* " + dp);
+                // A null source field has nothing to copy: read the (zeroed)
+                // destination instead. That keeps the copy branch-free -- a
+                // branch here would have to duplicate the nested copy.
+                string isnull = NT();
+                L("  " + isnull + " = icmp eq " + slt + " " + sv + ", null");
+                string safe = NT();
+                L("  " + safe + " = select i1 " + isnull + ", " + slt + " " + dv + ", " + slt + " " + sv);
+                Node ndecl = binder.FindType(fty.sval);
+                CopyStructInto(dv, safe, ndecl);
+            } else {
+                string lt = MapType(fty);
+                string sv = NT();
+                L("  " + sv + " = load " + lt + ", " + lt + "* " + sp);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + dp);
+                // a class field is shared with the source: the copy holds a
+                // reference of its own
+                if (ArcManaged(fty) && !WeakTy(fty)) { EmitArcRetain(sv, fty); }
+            }
+            i = i + 1;
+        }
+    }
+
+    // Copy a struct value: a fresh instance carrying the same contents.
+    ExprVal CopyStructValue(ExprVal v) {
+        if (!IsStructTy(v.ty)) { return v; }
+        string cn = v.ty.sval;
+        Node decl = binder.FindType(cn);
+        if (decl == null) { return v; }
+        string dst = AllocStructObj(cn);
+        InitNestedFields(dst, decl);
+        if (v.op != "null") { CopyStructInto(dst, v.op, decl); }
+        return new ExprVal(dst, v.ty);
+    }
+
+    // A value that is stored into a slot the caller keeps: the copy is a
+    // temporary -- the slot's own retain keeps it alive until the end of the
+    // statement, the temporary release drops that extra reference.
+    ExprVal StructCopyTemp(ExprVal v, Node slotTy) {
+        ExprVal c = CopyStructValue(v);
+        Node t = slotTy;
+        if (t == null || IsErasedType(t)) { t = v.ty; }
+        AddTemp(c.op, t);
+        return c;
+    }
+
+    // A value that is stored into a container element: the container owns the
+    // element, so the copy's ownership passes to the container (no temporary
+    // release -- the container's destructor releases it).
+    string StructElemSlot(ExprVal v, Node elemTy) {
+        if (IsStructTy(elemTy)) {
+            ExprVal c = CopyStructValue(v);
+            return ToSlot(c, elemTy);
+        }
+        return ToSlot(v, elemTy);
+    }
+}
