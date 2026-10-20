@@ -366,6 +366,49 @@ conformance `audio_dsp`（缓冲的峰值/RMS/直流/归一化/限幅/淡入淡�
 （纯离线处理）；重采样无抗混叠滤波；变调用 OLA 不做波形相似度对齐
 （轻微"金属味"）；IIR 滤波有启动暂态（断言要看稳态段）。
 
+### 1.11 程序化生成：`Zan.Game.Procgen`
+
+新包 `packages/Zan.Game.Procgen`，命名空间 `Game.Procgen`。补上"关卡怎么来"这一段：
+WFC（波函数坍缩）拼图关卡、按接口标签横向拼接子关卡、房间-走廊地牢布局。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `WfcTile.zan` | `WfcTile` / `WfcDir` / `WfcDirs` | 瓦片 + 四方向允许列表（null = 不限制）；方向工具（取反 / 偏移） |
+| `WfcTileSet.zan` | `WfcTileSet` | 瓦片集 + 有向邻接规则 + 权重；`Validate()` 拒绝不对称规则与未知瓦片 |
+| `WfcSolver.zan` | `WfcSolver` | WFC 求解器：最低熵坍缩 + 队列传播 + 矛盾定位 |
+| `LevelStitcher.zan` | `LevelStitcher` / `Chunk` / `Stitched` | 按出口标签横向拼接子关卡（拼不出时返回 `error` 而不是抛异常） |
+| `RoomCorridorGenerator.zan` | `RoomCorridorGenerator` / `Rect` | 房间撒点 + MST 连通 + 额外回路 + 补墙 |
+| `Rng.zan` | `Rng` | 带种子的确定性随机源（取 LCG 高位） |
+
+**六条硬取舍**：
+
+1. **域不用位掩码**：每格一个 `List<int>`。Zan 的 `long` 不支持 `<<`，做不了
+   64 位掩码；位掩码方案还会把瓦片数**封顶在 64**。列表求交是 O(n)，
+   但 WFC 网格通常几百格、瓦片几十个，不是瓶颈。
+2. **规则是有向的**：`A` 的右边可以是 `B`，`B` 的右边不一定是 `A`
+   ——单向箭头、单向门都需要这种不对称。
+3. **不对称规则在构造期就报错**：违反"A 的 dir 允许 B ⇒ B 的反方向允许 A"的
+   规则**永远无解**（传播时两边互相排除）。报错比在求解中途抛矛盾好得多。
+4. **传播的判据是"交集比当前域小"**，不是"允许集比当前域小"。后者在
+   "邻居域已缩到 1、允许集有 3"时会误判成有变化并重新入队，两个相邻格
+   互相触发、**无限乒乓死循环**（实测挂死，判据修正后 4 格全坍缩）。
+5. **房间连通用最小生成树**（朴素 Prim）而不是"随机连最近"：后者产生长短
+   不一的走廊和大量绕路。树化后另挖**额外回路**（默认房间数 / 4）——
+   回路只加地板、不拆地板，连通性不会被破坏；纯树关卡让玩家频繁原路返回。
+6. **拼接失败返回 `error` 而不是抛异常**："这批素材拼不出来"是正常情况，
+   调用方要决定是换一批还是降级。WFC 的矛盾则是**求解失败**，返回 `false`
+   并给出 `conflict` / `conflictCell` 定位。
+
+conformance `procgen_wfc`（WFC 求解与全坍缩、邻接规则成立、同 seed 同结果、
+不同 seed 不同结果、不对称规则拒绝、重复 id 拒绝、未知瓦片拒绝、拼接的
+标签匹配 / 宽度累加 / 顺序 / 拼不出报错 / 空输入报错、房间不重叠与墙紧贴
+地板、确定性、洪水填充验证全连通、额外回路只加地板且保持连通）。
+
+**已知边界**：WFC 只有最小熵启发式，没有**回溯**（矛盾即失败，不重试别的
+坍缩顺序）；无"边界/接缝规则"（首尾行的专用瓦片）；无多样本生成
+（同 seed 只能出一张图，想换一张得换 seed）；房间走廊只有 L 形（先横后竖，
+不拐第二种形状）；拼接只支持横向一行，且各块高度不等时下方补空。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -418,7 +461,7 @@ conformance `audio_dsp`（缓冲的峰值/RMS/直流/归一化/限幅/淡入淡�
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | 有 clip 播放器/纸娃娃/3D 轨 → 蒙皮、状态机混合、IK | 4–6 周 |
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
-| `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | 无 → WFC 算法可直接复刻（纯 C#、数学自洽）、关卡拼接 | 2 周 |
+| `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
 | `Zan.Game.Debug` | ImGui.NET | 榜外 | 无 → 帧剖析覆盖层、实体检查器、内存精灵缓存可视化 | 2–3 周 |
 | `Zan.Game.Common` | — | — | 13 套模板重复代码（每套自带 Particle/Profile/Popup/存档）→ 公共基座：存档、飘字、血条、背包格、冷却条、小地图 | 2–3 周 |
 | `Zan.Game.Profiler` | LiteMonitor / LibreHardwareMonitor | 6,682 / 9,236 | prof 走廊只打 stdout → 帧预算分析器、分配热点、硬件指标面板 | 2 周 |
@@ -445,7 +488,7 @@ conformance `audio_dsp`（缓冲的峰值/RMS/直流/归一化/限幅/淡入淡�
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
-**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` → `Zan.Game.Common`
+**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

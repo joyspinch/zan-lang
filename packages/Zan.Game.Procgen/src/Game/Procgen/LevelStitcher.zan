@@ -1,0 +1,135 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Procgen;
+
+// 关卡拼接：把多块子地图按"接口瓦片"缝成一张完整地图。
+//
+// 玩法：每块子地图有若干**接口**（左上、右上、左下、右下），
+// 每个接口上写着一个"出口标签"（比如 "road"）。两块地图能缝在一起，
+// 当且仅当它们相邻的接口标签相同。
+//
+// 拼法：横向排成一行（也可以按任意顺序排），从最左块开始，
+// 每次向右挑一块能接上的（标签匹配且没被用过）。接不上就报失败。
+//
+// 确定性：挑选顺序固定（按候选列表顺序），同 seed → 同一张图。
+public class LevelStitcher {
+    // 一块子地图。
+    public class Chunk {
+        // 子地图 id。
+        public string id;
+        // 宽（格）。
+        public int width;
+        // 高（格）。
+        public int height;
+        // 瓦片数据（行优先，index = y * width + x）。
+        public int[] tiles;
+        // 四个接口的出口标签（null = 该方向没有接口）。
+        public string[] exits;
+
+        public Chunk(string id, int width, int height, int[] tiles, string[] exits) {
+            this.id = id != null ? id : "";
+            this.width = width;
+            this.height = height;
+            this.tiles = tiles;
+            this.exits = exits;
+        }
+    }
+
+    // 拼好的地图。
+    public class Stitched {
+        // 总宽。
+        public int width;
+        // 总高。
+        public int height;
+        // 瓦片数据（行优先）。
+        public int[] tiles;
+        // 用了哪些子地图（按顺序）。
+        public List<string> order;
+        // 失败原因（成功时为空）。
+        public string error;
+
+        public Stitched() {
+            this.width = 0;
+            this.height = 0;
+            this.tiles = null;
+            this.order = new List<string>();
+            this.error = "";
+        }
+    }
+
+    // 横向拼接。
+    //
+    // 失败返回带 error 的结果（不抛异常——"这批素材拼不出来"是
+    // 正常情况，调用方要决定是换一批还是降级）。
+    public static Stitched StitchHorizontal(List<Chunk> chunks) {
+        Stitched result = new Stitched();
+        if (chunks == null || chunks.Count == 0) {
+            result.error = "no chunks";
+            return result;
+        }
+        // 起始块：第一个。
+        List<bool> used = new List<bool>();
+        for (int i = 0; i < chunks.Count; i = i + 1) { used.Add(false); }
+
+        List<Chunk> order = new List<Chunk>();
+        Chunk current = chunks[0];
+        used[0] = true;
+        order.Add(current);
+
+        while (order.Count < chunks.Count) {
+            // 当前块的右出口标签。
+            string need = current.exits != null && current.exits.Length > 1
+                ? current.exits[1] : null;
+            if (need == null) {
+                result.error = "chunk '" + current.id + "' has no right exit";
+                return result;
+            }
+            int pick = -1;
+            for (int i = 0; i < chunks.Count; i = i + 1) {
+                if (used[i]) { continue; }
+                Chunk c = chunks[i];
+                if (c.exits == null || c.exits.Length < 1) { continue; }
+                if (c.exits[0] != need) { continue; }
+                pick = i;
+                break;
+            }
+            if (pick < 0) {
+                result.error = "no chunk connects to exit '" + need + "'";
+                return result;
+            }
+            used[pick] = true;
+            current = chunks[pick];
+            order.Add(current);
+        }
+
+        // 拼接：各块高度取最大，短块下方补"空"。
+        int totalWidth = 0;
+        int maxHeight = 0;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            totalWidth = totalWidth + order[i].width;
+            if (order[i].height > maxHeight) { maxHeight = order[i].height; }
+        }
+        result.width = totalWidth;
+        result.height = maxHeight;
+        result.tiles = new int[totalWidth * maxHeight];
+        for (int i = 0; i < result.tiles.Length; i = i + 1) { result.tiles[i] = -1; }
+
+        int xOffset = 0;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            Chunk c = order[i];
+            for (int y = 0; y < c.height; y = y + 1) {
+                for (int x = 0; x < c.width; x = x + 1) {
+                    int src = y * c.width + x;
+                    if (src >= c.tiles.Length) { continue; }
+                    int dst = y * (totalWidth) + (xOffset + x);
+                    if (dst < 0 || dst >= result.tiles.Length) { continue; }
+                    result.tiles[dst] = c.tiles[src];
+                }
+            }
+            xOffset = xOffset + c.width;
+            result.order.Add(c.id);
+        }
+        return result;
+    }
+}

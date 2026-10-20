@@ -1,0 +1,355 @@
+using System;
+using System.Collections.Generic;
+using Game.Procgen;
+
+// 程序化生成契约测试：WFC 求解、规则校验、关卡拼接、房间走廊生成。
+//
+// 覆盖的判定点：
+//   - WFC：求解成功、全部坍缩、邻接规则成立、确定性、矛盾检测；
+//   - 规则：重复 id 拒绝、不对称规则拒绝、未知瓦片拒绝；
+//   - 拼接：接口标签匹配、拼不出时报错、宽度累加；
+//   - 房间：房间不重叠、走廊连通、墙体包围、确定性。
+//
+// golden 只锁定"全过"那行。
+public class ProcgenTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    /* ---------- WFC ---------- */
+
+    // 造一个"全部互连"的瓦片集（任何瓦片都能挨着任何瓦片）。
+    private static WfcTileSet FreeTiles() {
+        WfcTileSet ts = new WfcTileSet();
+        ts.Add(0, "wall");
+        ts.Add(1, "floor");
+        ts.Add(2, "grass");
+        List<int> all = new List<int>();
+        all.Add(0);
+        all.Add(1);
+        all.Add(2);
+        for (int id = 0; id < 3; id = id + 1) {
+            for (int d = 0; d < 4; d = d + 1) {
+                ts.Allow(id, d, all);
+            }
+        }
+        return ts;
+    }
+
+    // 造一个"只允许同类相邻"的瓦片集（wall 挨 wall，floor 挨 floor）。
+    private static WfcTileSet SameOnlyTiles() {
+        WfcTileSet ts = new WfcTileSet();
+        ts.Add(0, "wall");
+        ts.Add(1, "floor");
+        List<int> wallOnly = new List<int>();
+        wallOnly.Add(0);
+        List<int> floorOnly = new List<int>();
+        floorOnly.Add(1);
+        for (int d = 0; d < 4; d = d + 1) {
+            ts.Allow(0, d, wallOnly);
+            ts.Allow(1, d, floorOnly);
+        }
+        return ts;
+    }
+
+    private static void TestWfcSolve() {
+        WfcTileSet ts = FreeTiles();
+        ts.Validate();
+        WfcSolver s = new WfcSolver(ts, 8, 8, 1234L);
+        Check("wfc-solve-ok", s.Solve());
+        CheckEq("wfc-all-collapsed", s.CollapsedCount(), 64L);
+        // 每格都应定死成一个合法瓦片
+        bool allSet = true;
+        for (int y = 0; y < 8; y = y + 1) {
+            for (int x = 0; x < 8; x = x + 1) {
+                int t = s.TileAt(x, y);
+                if (t < 0 || t > 2) { allSet = false; }
+            }
+        }
+        Check("wfc-all-tiles-valid", allSet);
+        CheckEq("wfc-result-length", s.Result().Length, 64L);
+    }
+
+    private static void TestWfcRulesHold() {
+        // 同类相邻的规则下，任意相邻两格必须是同类瓦片。
+        WfcTileSet ts = SameOnlyTiles();
+        ts.Validate();
+        WfcSolver s = new WfcSolver(ts, 8, 8, 99L);
+        Check("wfc-rules-solve-ok", s.Solve());
+        bool holds = true;
+        for (int y = 0; y < 8; y = y + 1) {
+            for (int x = 0; x < 8; x = x + 1) {
+                int t = s.TileAt(x, y);
+                if (x + 1 < 8 && s.TileAt(x + 1, y) != t) { holds = false; }
+                if (y + 1 < 8 && s.TileAt(x, y + 1) != t) { holds = false; }
+            }
+        }
+        Check("wfc-adjacency-rules-hold", holds);
+    }
+
+    private static void TestWfcDeterminism() {
+        WfcTileSet ts = FreeTiles();
+        WfcSolver a = new WfcSolver(ts, 6, 6, 777L);
+        WfcSolver b = new WfcSolver(ts, 6, 6, 777L);
+        a.Solve();
+        b.Solve();
+        int[] ra = a.Result();
+        int[] rb = b.Result();
+        bool same = true;
+        for (int i = 0; i < ra.Length; i = i + 1) {
+            if (ra[i] != rb[i]) { same = false; break; }
+        }
+        Check("wfc-deterministic", same);
+
+        // 不同种子 → 不同结果（否则随机源没生效）
+        WfcSolver c = new WfcSolver(ts, 6, 6, 778L);
+        c.Solve();
+        int[] rc = c.Result();
+        bool differs = false;
+        for (int i = 0; i < ra.Length; i = i + 1) {
+            if (ra[i] != rc[i]) { differs = true; break; }
+        }
+        Check("wfc-seed-matters", differs);
+    }
+
+    private static void TestWfcContradiction() {
+        // 矛盾规则：tile0 的右边允许 tile1，但 tile1 的左边**不允许**
+        // tile0（只允许它自己）——这种规则永远解不出来（两边互相排除），
+        // 构造期就该被 Validate 拒绝，而不是求解到一半才抛矛盾。
+        WfcTileSet bad = new WfcTileSet();
+        bad.Add(0, "a");
+        bad.Add(1, "b");
+        List<int> onlyB = new List<int>();
+        onlyB.Add(1);
+        bad.Allow(0, 1, onlyB);   // a 的右边允许 b
+        bad.Allow(1, 3, onlyB);   // b 的左边只允许 b —— 不允许 a
+        bool threw = false;
+        try {
+            bad.Validate();
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("wfc-asymmetric-rejected", threw);
+    }
+
+    private static void TestWfcValidation() {
+        // 重复 id
+        WfcTileSet dup = new WfcTileSet();
+        dup.Add(0, "x");
+        bool threw = false;
+        try {
+            dup.Add(0, "y");
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("wfc-duplicate-id-rejected", threw);
+
+        // 允许了不存在的瓦片
+        WfcTileSet unk = new WfcTileSet();
+        unk.Add(0, "x");
+        List<int> ghost = new List<int>();
+        ghost.Add(99);
+        unk.Allow(0, 0, ghost);
+        threw = false;
+        try {
+            unk.Validate();
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("wfc-unknown-tile-rejected", threw);
+    }
+
+    /* ---------- 关卡拼接 ---------- */
+
+    private static LevelStitcher.Chunk MakeChunk(string id, int w, int h, int tile, string leftExit, string rightExit) {
+        int[] tiles = new int[w * h];
+        for (int i = 0; i < tiles.Length; i = i + 1) { tiles[i] = tile; }
+        string[] exits = new string[4];
+        exits[0] = leftExit;
+        exits[1] = rightExit;
+        return new LevelStitcher.Chunk(id, w, h, tiles, exits);
+    }
+
+    private static void TestStitcher() {
+        List<LevelStitcher.Chunk> chunks = new List<LevelStitcher.Chunk>();
+        chunks.Add(MakeChunk("a", 2, 2, 1, null, "road"));
+        chunks.Add(MakeChunk("b", 3, 2, 2, "road", "road"));
+        chunks.Add(MakeChunk("c", 2, 2, 3, "road", null));
+        LevelStitcher.Stitched st = LevelStitcher.StitchHorizontal(chunks);
+        CheckEq("stitch-error-empty", st.error.Length, 0L);
+        CheckEq("stitch-width", st.width, 7L);
+        CheckEq("stitch-height", st.height, 2L);
+        CheckEq("stitch-tiles", st.tiles.Length, 14L);
+        CheckEq("stitch-order", st.order.Count, 3L);
+        // 第一块是 a
+        Check("stitch-first-is-a", st.order[0] == "a");
+        // 瓦片按顺序铺开：a 的 2 列是 1，b 的 3 列是 2，c 的 2 列是 3
+        CheckEq("stitch-tile-a0", st.tiles[0], 1L);
+        CheckEq("stitch-tile-b0", st.tiles[2], 2L);
+        CheckEq("stitch-tile-c0", st.tiles[5], 3L);
+
+        // 拼不出：b 的左接口是 "road"，但没有块的右接口是 "road" 之后接得上
+        List<LevelStitcher.Chunk> bad = new List<LevelStitcher.Chunk>();
+        bad.Add(MakeChunk("x", 2, 2, 1, null, "rail"));
+        bad.Add(MakeChunk("y", 2, 2, 2, "road", null));
+        LevelStitcher.Stitched st2 = LevelStitcher.StitchHorizontal(bad);
+        Check("stitch-unconnectable-errors", st2.error.Length > 0);
+
+        // 空输入
+        LevelStitcher.Stitched st3 = LevelStitcher.StitchHorizontal(new List<LevelStitcher.Chunk>());
+        Check("stitch-empty-errors", st3.error.Length > 0);
+    }
+
+    /* ---------- 房间走廊 ---------- */
+
+    private static void TestRooms() {
+        RoomCorridorGenerator gen = new RoomCorridorGenerator(1, 2, 0);
+        int[] grid = gen.Generate(40, 30, 6, 4, 400, 2024L);
+        CheckEq("rooms-grid-size", grid.Length, 1200L);
+
+        // 至少要有地板
+        int floors = 0;
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            if (grid[i] == 1) { floors = floors + 1; }
+        }
+        Check("rooms-has-floor", floors > 0);
+
+        // 墙必须紧贴地板（不能有"空"格与地板相邻）
+        bool wallAdjacent = true;
+        for (int y = 1; y < 29; y = y + 1) {
+            for (int x = 1; x < 39; x = x + 1) {
+                int i = y * 40 + x;
+                if (grid[i] != 0) { continue; }
+                bool nearFloor = grid[i - 1] == 1 || grid[i + 1] == 1
+                    || grid[i - 40] == 1 || grid[i + 40] == 1;
+                if (nearFloor) { wallAdjacent = false; }
+            }
+        }
+        Check("rooms-walls-adjacent-to-floor", wallAdjacent);
+
+        // 确定性：同 seed 两次结果一致
+        int[] grid2 = gen.Generate(40, 30, 6, 4, 400, 2024L);
+        bool same = true;
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            if (grid[i] != grid2[i]) { same = false; break; }
+        }
+        Check("rooms-deterministic", same);
+
+        // 不同 seed → 不同结果
+        int[] grid3 = gen.Generate(40, 30, 6, 4, 400, 2025L);
+        bool differs = false;
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            if (grid[i] != grid3[i]) { differs = true; break; }
+        }
+        Check("rooms-seed-matters", differs);
+    }
+
+    private static void TestRoomConnectivity() {
+        // 所有房间必须通过走廊连成一体：从第一个地板格做洪水填充，
+        // 应当能到达全部地板格。
+        RoomCorridorGenerator gen = new RoomCorridorGenerator(1, 2, 0);
+        int w = 40;
+        int h = 30;
+        int[] grid = gen.Generate(w, h, 6, 4, 400, 31337L);
+
+        Check("rooms-has-start", CountFloor(grid) > 0);
+        Check("rooms-all-connected", AllConnected(grid, w, h));
+    }
+
+    // 额外回路：只加地板、不拆地板，所以开着回路的地板格数
+    // 一定不小于关掉回路时的数量；而且连通性必须保持。
+    private static void TestRoomLoops() {
+        RoomCorridorGenerator plain = new RoomCorridorGenerator(1, 2, 0);
+        plain.extraLoopCount = 0;
+        int[] g0 = plain.Generate(40, 30, 6, 4, 400, 2024L);
+
+        RoomCorridorGenerator looped = new RoomCorridorGenerator(1, 2, 0);
+        looped.extraLoopCount = 3;
+        int[] g1 = looped.Generate(40, 30, 6, 4, 400, 2024L);
+
+        int f0 = CountFloor(g0);
+        int f1 = CountFloor(g1);
+        Check("rooms-loops-never-remove-floor", f1 >= f0);
+        Check("rooms-loops-add-floor", f1 > f0);
+        Check("rooms-loops-keep-connected", AllConnected(g1, 40, 30));
+    }
+
+    // 数地板格。
+    private static int CountFloor(int[] grid) {
+        int floors = 0;
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            if (grid[i] == 1) { floors = floors + 1; }
+        }
+        return floors;
+    }
+
+    // 从第一个地板格洪水填充，看能不能到达全部地板格。
+    private static bool AllConnected(int[] grid, int w, int h) {
+        int start = -1;
+        for (int i = 0; i < grid.Length; i = i + 1) {
+            if (grid[i] == 1) { start = i; break; }
+        }
+        if (start < 0) { return false; }
+
+        List<bool> seen = new List<bool>();
+        for (int i = 0; i < grid.Length; i = i + 1) { seen.Add(false); }
+        List<int> stack = new List<int>();
+        stack.Add(start);
+        seen[start] = true;
+        int reached = 0;
+        while (stack.Count > 0) {
+            int cur = stack[stack.Count - 1];
+            stack.RemoveAt(stack.Count - 1);
+            reached = reached + 1;
+            int cx = cur % w;
+            int cy = cur / w;
+            for (int d = 0; d < 4; d = d + 1) {
+                int nx = cx + WfcDirs.Dx(d);
+                int ny = cy + WfcDirs.Dy(d);
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) { continue; }
+                int ni = ny * w + nx;
+                if (seen[ni] || grid[ni] != 1) { continue; }
+                seen[ni] = true;
+                stack.Add(ni);
+            }
+        }
+        return reached == CountFloor(grid);
+    }
+
+    public static void Run() {
+        TestWfcSolve();
+        TestWfcRulesHold();
+        TestWfcDeterminism();
+        TestWfcContradiction();
+        TestWfcValidation();
+        TestStitcher();
+        TestRooms();
+        TestRoomConnectivity();
+        TestRoomLoops();
+
+        if (failures > 0) {
+            Console.WriteLine("PROCGEN TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL PROCGEN TESTS PASSED");
+        }
+    }
+}
+
+public class ProcgenTestsMain {
+    public static void Main() {
+        ProcgenTests.Run();
+    }
+}

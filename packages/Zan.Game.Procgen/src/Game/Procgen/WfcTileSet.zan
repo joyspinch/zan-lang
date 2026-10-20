@@ -1,0 +1,133 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Procgen;
+
+// 瓦片集：瓦片 + 邻接规则 + 权重。
+//
+// 规则表达成"某瓦片的某方向允许哪些瓦片"（允许列表为 null = 不限制）。
+// 这是**有向**的：单向门、单向箭头都需要。
+//
+// 构造时做**一致性校验**：A 的右边允许 B，但 B 的左边不允许 A ——
+// 这种规则永远解不出来（传播时互相排除）。构造期就报错，
+// 不留到求解时变成"莫名其妙的矛盾"。
+public class WfcTileSet {
+    // 瓦片（按加入顺序）。
+    private List<WfcTile> tiles;
+    // 瓦片 id → 索引。
+    private Dictionary<int, int> index;
+    // 权重（与 tiles 同序）。
+    private List<int> weights;
+
+    public WfcTileSet() {
+        this.tiles = new List<WfcTile>();
+        this.index = new Dictionary<int, int>();
+        this.weights = new List<int>();
+    }
+
+    // 加一个瓦片（权重默认 1）。id 重复时抛 ArgumentException。
+    public WfcTileSet Add(int id, string name, int weight) {
+        if (this.index.ContainsKey(id)) {
+            throw new ArgumentException("duplicate wfc tile id: " + id.ToString());
+        }
+        WfcTile t = new WfcTile(id, name);
+        this.tiles.Add(t);
+        this.weights.Add(weight > 0 ? weight : 1);
+        this.index[id] = this.tiles.Count - 1;
+        return this;
+    }
+
+    // 加一个瓦片（权重 1）。
+    public WfcTileSet Add(int id, string name) {
+        return this.Add(id, name, 1);
+    }
+
+    // 设定"from 瓦片的 dir 方向允许的瓦片"。
+    // allow 为 null = 该方向不限制。
+    public WfcTileSet Allow(int from, int dir, List<int> allow) {
+        WfcTile t = this.ById(from);
+        if (t == null) {
+            throw new ArgumentException("unknown wfc tile id: " + from.ToString());
+        }
+        t.SetAllow(dir, allow);
+        return this;
+    }
+
+    // 瓦片数。
+    public int Count() {
+        return this.tiles.Count;
+    }
+
+    // 按索引取瓦片。
+    public WfcTile Get(int i) {
+        if (i < 0 || i >= this.tiles.Count) { return null; }
+        return this.tiles[i];
+    }
+
+    // 按 id 取瓦片。
+    public WfcTile ById(int id) {
+        int idx = -1;
+        if (!this.index.TryGetValue(id, out idx)) { return null; }
+        if (idx < 0 || idx >= this.tiles.Count) { return null; }
+        return this.tiles[idx];
+    }
+
+    // 瓦片权重。
+    public int WeightOf(int id) {
+        int idx = -1;
+        if (!this.index.TryGetValue(id, out idx)) { return 1; }
+        if (idx < 0 || idx >= this.weights.Count) { return 1; }
+        return this.weights[idx];
+    }
+
+    // 校验规则的一致性：若 A 的 dir 方向允许 B，则 B 的反方向必须
+    // 允许 A（除非有一方写的是"不限制"）。
+    //
+    // 违反这一点的规则**永远无解**（传播时两边互相排除）——报错比
+    // 在求解中途抛矛盾好得多。
+    public void Validate() {
+        for (int i = 0; i < this.tiles.Count; i = i + 1) {
+            WfcTile a = this.tiles[i];
+            for (int dir = 0; dir < 4; dir = dir + 1) {
+                List<int> allowed = a.AllowAt(dir);
+                if (allowed == null) { continue; }
+                int back = WfcDirs.Opposite(dir);
+                for (int j = 0; j < allowed.Count; j = j + 1) {
+                    WfcTile b = this.ById(allowed[j]);
+                    if (b == null) {
+                        throw new ArgumentException("tile " + a.id.ToString()
+                            + " allows unknown tile " + allowed[j].ToString());
+                    }
+                    List<int> bAllowed = b.AllowAt(back);
+                    if (bAllowed == null) { continue; }
+                    if (!bAllowed.Contains(a.id)) {
+                        throw new ArgumentException("asymmetric rule: tile "
+                            + a.id.ToString() + " dir " + dir.ToString()
+                            + " allows " + b.id.ToString()
+                            + ", but " + b.id.ToString() + " dir " + back.ToString()
+                            + " does not allow " + a.id.ToString());
+                    }
+                }
+            }
+        }
+    }
+
+    // 按权重挑一个瓦片 id（供外部做随机取样，如资源点分布）。
+    public int PickWeighted(Rng rng) {
+        if (this.tiles.Count == 0) { return -1; }
+        int total = 0;
+        for (int i = 0; i < this.weights.Count; i = i + 1) {
+            total = total + this.weights[i];
+        }
+        if (total <= 0) {
+            return this.tiles[rng.RangeInt(0, this.tiles.Count - 1)].id;
+        }
+        int roll = rng.RangeInt(1, total);
+        int acc = 0;
+        for (int i = 0; i < this.tiles.Count; i = i + 1) {
+            acc = acc + this.weights[i];
+            if (roll <= acc) { return this.tiles[i].id; }
+        }
+        return this.tiles[this.tiles.Count - 1].id;
+    }
+}

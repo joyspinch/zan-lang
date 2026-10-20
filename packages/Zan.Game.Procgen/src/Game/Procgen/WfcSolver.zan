@@ -1,0 +1,265 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Procgen;
+
+// 波函数坍缩（WFC）求解器。
+//
+// **算法**：每个格子持有"还可能的瓦片集合"。反复做两件事：
+//   1. **坍缩**：挑一个熵最低（候选最少）的格子，把它定死成一个瓦片；
+//   2. **传播**：把定死的结果按邻接规则往四周扩散，缩小邻居的候选集。
+// 候选集变空 = 矛盾（这个拼图规则无解）。
+//
+// **域的表示**：每格一个 `List<int>`（候选瓦片 id），**不用位掩码**——
+// Zan 的 `long` 不支持 `<<`，做不了 64 位掩码。列表表示的代价是
+// 求交是 O(n)，但 WFC 的网格通常几百格、瓦片几十个，实测不是瓶颈；
+// 换来的是**没有瓦片数上限**，位掩码方案 64 个就封顶了。
+//
+// **确定性**：坍缩时用带种子的随机源选瓦片，同 seed + 同规则 → 同一张图
+// （可回放）。传播顺序固定（按格子索引），不依赖哈希遍历顺序。
+//
+// **不变量**：任何时刻，若某格候选集为空，该格与邻居的规则已被违反；
+// 求解器在**坍缩前**检查矛盾并返回失败，不产出半成品。
+public class WfcSolver {
+    // 瓦片集。
+    private WfcTileSet tiles;
+    // 宽。
+    private int width;
+    // 高。
+    private int height;
+    // 每格的候选瓦片 id（index = y * width + x）。
+    private List<List<int>> domains;
+    // 随机源。
+    private Rng rng;
+    // 已坍缩的格子数。
+    private int collapsedCount;
+    // 矛盾信息（失败时给出）。
+    public string conflict;
+    // 失败格子的索引（-1 = 无）。
+    public int conflictCell;
+
+    public WfcSolver(WfcTileSet tiles, int width, int height, long seed) {
+        this.tiles = tiles;
+        this.width = width > 0 ? width : 1;
+        this.height = height > 0 ? height : 1;
+        this.rng = new Rng(seed);
+        this.domains = new List<List<int>>();
+        this.collapsedCount = 0;
+        this.conflict = "";
+        this.conflictCell = -1;
+    }
+
+    // 宽。
+    public int Width() { return this.width; }
+
+    // 高。
+    public int Height() { return this.height; }
+
+    // 已坍缩的格子数。
+    public int CollapsedCount() { return this.collapsedCount; }
+
+    // 格子 (x, y) 的最终瓦片 id；未坍缩时返回 -1。
+    public int TileAt(int x, int y) {
+        List<int> d = this.DomainOf(x, y);
+        if (d == null || d.Count != 1) { return -1; }
+        return d[0];
+    }
+
+    // 整张图的瓦片 id（行优先）；未坍缩的格子是 -1。
+    public int[] Result() {
+        int[] outArr = new int[this.width * this.height];
+        for (int i = 0; i < outArr.Length; i = i + 1) {
+            List<int> d = this.domains[i];
+            outArr[i] = (d.Count == 1) ? d[0] : -1;
+        }
+        return outArr;
+    }
+
+    // 某格的候选集（返回内部列表，**只读**）。
+    public List<int> DomainOf(int x, int y) {
+        if (x < 0 || y < 0 || x >= this.width || y >= this.height) { return null; }
+        return this.domains[y * this.width + x];
+    }
+
+    // 求解。成功返回 true；矛盾返回 false（看 conflict / conflictCell）。
+    public bool Solve() {
+        this.conflict = "";
+        this.conflictCell = -1;
+        this.collapsedCount = 0;
+        this.InitDomains();
+
+        while (true) {
+            // 传播把矛盾带出来就先判失败。
+            int cell = this.PickLowestEntropy();
+            if (cell < 0) {
+                // 没有可坍缩的格子了 = 全部坍缩 = 成功。
+                return true;
+            }
+            List<int> dom = this.domains[cell];
+            // 候选为 0：矛盾。
+            if (dom.Count == 0) {
+                this.MarkConflict(cell);
+                return false;
+            }
+            // 候选为 1：已经定死了（传播收缩的结果），不用再掷骰子。
+            if (dom.Count > 1) {
+                int chosen = this.PickWeighted(dom);
+                List<int> single = new List<int>();
+                single.Add(chosen);
+                this.domains[cell] = single;
+                this.collapsedCount = this.collapsedCount + 1;
+            }
+            if (!this.Propagate(cell)) {
+                return false;
+            }
+        }
+    }
+
+    // 初始化：每格候选 = 全部瓦片（后续由边界规则与传播收紧）。
+    private void InitDomains() {
+        this.domains = new List<List<int>>();
+        List<int> all = new List<int>();
+        for (int t = 0; t < this.tiles.Count(); t = t + 1) {
+            WfcTile tile = this.tiles.Get(t);
+            if (tile != null) { all.Add(tile.id); }
+        }
+        for (int i = 0; i < this.width * this.height; i = i + 1) {
+            List<int> d = new List<int>();
+            for (int j = 0; j < all.Count; j = j + 1) {
+                d.Add(all[j]);
+            }
+            this.domains.Add(d);
+        }
+    }
+
+    // 挑熵最低的格子（候选数最少且 > 1）；没有则返回 -1。
+    //
+    // 平局时取**索引最小**的——保证确定性（不依赖遍历顺序的偶然性）。
+    private int PickLowestEntropy() {
+        int best = -1;
+        int bestCount = 0;
+        for (int i = 0; i < this.domains.Count; i = i + 1) {
+            int c = this.domains[i].Count;
+            if (c <= 1) { continue; }
+            if (best < 0 || c < bestCount) {
+                best = i;
+                bestCount = c;
+            }
+        }
+        return best;
+    }
+
+    // 按权重挑一个瓦片。
+    //
+    // 权重取自 `WfcTile.weight`（默认 1）。全零权重时退化为均匀随机，
+    // **不能**因为权重和为 0 而崩或死循环。
+    private int PickWeighted(List<int> candidates) {
+        int total = 0;
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            total = total + this.tiles.WeightOf(candidates[i]);
+        }
+        if (total <= 0) {
+            int idx = this.rng.RangeInt(0, candidates.Count - 1);
+            return candidates[idx];
+        }
+        int roll = this.rng.RangeInt(1, total);
+        int acc = 0;
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            acc = acc + this.tiles.WeightOf(candidates[i]);
+            if (roll <= acc) { return candidates[i]; }
+        }
+        return candidates[candidates.Count - 1];
+    }
+
+    // 从一个已坍缩的格子出发做传播。
+    //
+    // 队列驱动的约束传播：每确定一格，就把它的四个邻居的候选集
+    // 按"我这边的瓦片允许什么"收紧；邻居的候选变了，邻居就成了
+    // 新的传播源。
+    private bool Propagate(int startCell) {
+        List<int> queue = new List<int>();
+        List<bool> inQueue = new List<bool>();
+        for (int i = 0; i < this.domains.Count; i = i + 1) { inQueue.Add(false); }
+        queue.Add(startCell);
+        inQueue[startCell] = true;
+
+        while (queue.Count > 0) {
+            int cell = queue[0];
+            queue.RemoveAt(0);
+            inQueue[cell] = false;
+            int cx = cell % this.width;
+            int cy = cell / this.width;
+
+            for (int dir = 0; dir < 4; dir = dir + 1) {
+                int nx = cx + WfcDirs.Dx(dir);
+                int ny = cy + WfcDirs.Dy(dir);
+                if (nx < 0 || ny < 0 || nx >= this.width || ny >= this.height) { continue; }
+                int ncell = ny * this.width + nx;
+                int ndir = WfcDirs.Opposite(dir);
+
+                List<int> ndom = this.domains[ncell];
+                List<int> allowed = this.AllowedBy(this.domains[cell], dir);
+                // 求交。
+                List<int> next = new List<int>();
+                for (int i = 0; i < ndom.Count; i = i + 1) {
+                    if (allowed.Contains(ndom[i])) { next.Add(ndom[i]); }
+                }
+                // **判据是"交集比当前域小"**，不是"允许集比当前域小"。
+                //
+                // 后者会死循环：邻居域已缩到 1 个、允许集有 3 个时，
+                // 允许集更大（3 != 1）但不构成收紧——交集仍是 1 个。
+                // 若据此判定"有变化"并重新入队，两个相邻格会互相
+                // 触发、无限乒乓。
+                if (next.Count == ndom.Count) {
+                    // 域没变小：不需要传播。
+                    continue;
+                }
+                this.domains[ncell] = next;
+                if (next.Count == 0) {
+                    this.MarkConflict(ncell);
+                    return false;
+                }
+                if (!inQueue[ncell]) {
+                    queue.Add(ncell);
+                    inQueue[ncell] = true;
+                }
+            }
+        }
+        return true;
+    }
+
+    // 某个格子的候选集在 dir 方向上允许的瓦片集合。
+    //
+    // 语义：邻居（在 dir 方向）的瓦片 B，要满足"我这边的瓦片 A 允许
+    // B 作为它的 dir 邻居"。因为 A 自己还没定死，所以取**所有候选 A
+    // 的允许集合的并集**。
+    private List<int> AllowedBy(List<int> candidates, int dir) {
+        List<int> result = new List<int>();
+        for (int i = 0; i < candidates.Count; i = i + 1) {
+            WfcTile t = this.tiles.ById(candidates[i]);
+            if (t == null) { continue; }
+            List<int> a = t.AllowAt(dir);
+            if (a == null) {
+                // 不限制 = 全部允许。
+                for (int j = 0; j < this.tiles.Count(); j = j + 1) {
+                    WfcTile any = this.tiles.Get(j);
+                    if (any == null) { continue; }
+                    if (!result.Contains(any.id)) { result.Add(any.id); }
+                }
+                continue;
+            }
+            for (int j = 0; j < a.Count; j = j + 1) {
+                if (!result.Contains(a[j])) { result.Add(a[j]); }
+            }
+        }
+        return result;
+    }
+
+    // 标记矛盾。
+    private void MarkConflict(int cell) {
+        this.conflictCell = cell;
+        int cx = cell % this.width;
+        int cy = cell / this.width;
+        this.conflict = "wfc contradiction at (" + cx.ToString() + "," + cy.ToString() + ")";
+    }
+}

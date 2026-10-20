@@ -50,6 +50,17 @@ did: 4 blind compile-run-probe rounds (v3→v6) guessing at the culprit. Instead
    pointer on first use. Check the real return type in the stdlib source
    before debugging anything downstream.
 
+### 跑可能挂死的 exe：必须带超时保护
+
+- 前台 `& exe` 一旦撞上死循环就**永久挂住会话**，而且看不到任何输出
+  （stdio 缓冲在进程被杀时全丢，连已经打印的 PASS 行都不剩）。
+- Windows 上包一层超时保护再跑：`Start-Process -PassThru -RedirectStandardOutput
+  <file>` → `WaitForExit(ms)` → 超时则 `Kill()`。这样挂死只花掉一次超时，
+  而不是把整个会话拖死。
+- 实例：WFC 求解器的传播循环判据写错（拿"允许集大小"当"是否收紧"的
+  判据），相邻两格无限乒乓，exe 永不退出。换成"交集比当前域小"之后
+  正常坍缩——先怀疑**循环的重入判据**，再怀疑算法本身。
+
 ## 3. Memory / ARC
 
 ```
