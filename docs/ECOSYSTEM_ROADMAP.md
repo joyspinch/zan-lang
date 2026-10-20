@@ -840,6 +840,10 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `Conversation.zan` | 同上 | `Conversation`：**会话记忆**——多轮对话的历史 + 按轮裁剪 + 落盘往返 |
 | `Models/AiMessage.zan` | 同上 | `AiMessage`：一条消息（角色 + 内容）的实体 |
 | `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
+| `ToolAgent.zan` | 同上 | `ToolAgent`：**工具调用循环**——模型要调工具 → 执行 → 结果按 `tool_call_id` 回传 → 模型接着答；一轮多个工具全执行、上限可配、每步出事件 |
+| `ToolRegistry.zan` | 同上 | `ToolRegistry`：工具名 → 实现的**白名单**（没注册的名字一律拒绝执行，模型幻觉出的工具名回错误结果而不是崩） |
+| `Models/AiTool*.zan` | `src/System/Ai/Models/` | `AiTool`（声明）/ `AiToolCall`（模型的一次调用）/ `AiToolResult`（执行结果）/ `AiToolTurn`（一轮的解析结果） |
+| `Models/ToolEvent.zan` | 同上 | `ToolEvent`：工具调用的**可观测**实体（工具 / 最终答复 / 上限 / 错误） |
 | `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
 **六条硬取舍**：
@@ -866,6 +870,26 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 `AiChunk.start/end` 与 `string.Substring` 同口径（字节），切分点必须
 落在字符边界上（劈开多字节字符会产出替换字符，块内容就脏了）。
 
+**工具调用：检索是"模型想查数据库"的特例**。`ToolAgent` 把它泛化成
+任意工具——查订单、查天气、算账。模型返回「工具名 + 参数」，程序按名
+字从 `ToolRegistry` 找回实现执行，把结果按 `tool_call_id` **原样**回传，
+模型看着结果接着答。三条硬取舍：
+
+1. **注册表是白名单**：没注册的名字一律拒绝执行，返回错误结果（不崩），
+   模型自己会纠正幻觉出的工具名。
+2. **工具失败不是对话失败**：执行失败变成一条 `tool` 消息回给模型，
+   不是抛异常——模型还有机会换个参数重试。
+3. **同步工具不必写成 async**：注册表有两条路径（`Register` 走 async
+   委托、`RegisterSync` 走同步委托）。不碰 IO 的工具不该被迫写成
+   async——async 委托是 async-only 的，同步实现塞不进去。
+
+**这里踩到一个编译器缺陷**：`await` 的目标分异步（值是子协程帧）与普通
+（值就是普通值）两类，判错就是读野指针——普通值往往也是 i8 指针（字符
+串就是），与子协程帧同型。async 方法此前一律被当普通值，`await` 一个
+async 方法拿到空结果。判定补齐了六种形态（Task/ValueTask 类型、async
+方法、async 委托的三种位置、接口方法、类名静态接收者）。详见
+`.agents/skills/zan-compiler-internals` 第 42 条。
+
 conformance `ai_pipeline`（端点解析的 host/port/path/本地端点与五类
 非法地址：没 scheme、带 userinfo、带 fragment、空 host、非法端口；
 token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数、原文
@@ -877,6 +901,14 @@ token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数
 入库/检索/**导出导入往返后检索结果不变**、维度不符报错；**RRF 融合
 的精确分数**（两路都命中 = 1/(k+r1) + 1/(k+r2)，只命中一路 = 单项）
 与融合顺序的稳定性；占位符替换（全替换而非只替第一个））。
+
+conformance `ai_tools`（工具调用循环：单工具一轮、**一轮多个工具全执行**、
+结果按 `tool_call_id` 原样回传、**同步工具**也能注册并执行、工具失败
+回给模型而不是抛异常、循环上限生效、不存在的工具回错误结果不崩、
+坏参数 JSON 回错误结果；事件流里能看到每一步）。
+
+conformance `async_await_sync_delegate`（`await` 一个**同步委托**拿到的是
+委托的返回值，不是子协程帧——判错就是静默读野指针）。
 
 **检索为什么是混合 + RRF**（§1.20 补记）：
 
@@ -1022,7 +1054,7 @@ conformance `ai_memory` 在本进程内起**真的 HTTP 服务**当假 AI 端点
 `SendAsync` 新建连接，**无连接池化、无批量检索**——重排要逐条取候选
 文本，这段是主要开销）、重排层**没有本地 cross-encoder 的绑定**（接口
 留好了位置）、会话记忆是**进程内**的（没有内置落盘/多端同步，`ToJson`/
-`FromJson` 给了钩子，存哪儿调用方自己定）、无 Tool calling、无评估与
+`FromJson` 给了钩子，存哪儿调用方自己定）、无评估与
 可观测、无流式的
 **背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
 （要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
@@ -1118,6 +1150,53 @@ conformance `messaging_bus`（类型分发 / 广播顺序 / 退订 / 命令语�
 
 ---
 
+### 1.22 对象映射：`Zan.Mapping`
+
+新包 `packages/Zan.Mapping`，命名空间 `System.Mapping`。补 AutoMapper（10,188★）/
+Mapster（5,182★）那一档，但**只做显式映射**：运行期逐成员规则 + 生成期按约定
+配对生成源码，**不做反射式自动映射**。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `MapProfile.zan` | `MapProfile<TSource, TTarget>` | 门面：目标工厂（必填）+ 链式 `Member` + `Map` / `TryMap` / `MapList` / `TryMapList` + 规则计数与名字 |
+| `MapRule.zan` | `MapRule<TSource, TTarget>` | 一条成员规则：`Name` + `Apply`（`(源, 目标) → 新目标`） |
+| `ValueConverter.zan` | `ValueConverter<TSource, TTarget>` | 值转换器：`Apply`（失败抛）/ `TryConvert`（不抛） |
+| `MappingSpec.zan` | `MappingSpec` / `MappingMember` | 生成规格：源/目标类型、类名、命名空间、成员对（源路径 → 目标成员名） |
+| `GenMapping.zan` | `GenMapping` | 生成器：`Emit` / `TryEmit` / `TryEmitFromEntities` / `MatchByConvention` / `UnmatchedByConvention` |
+| `MappingError.zan` / `MappingException.zan` / `MappingResult.zan` | — | 可区分错误码 + 异常 + 不抛的结果对象 |
+
+**六条硬取舍**：
+
+1. **不做运行期反射式自动映射**。AutoMapper 的"按约定自动映射"靠运行期反射，
+   而 Zan 没有反射（没有 `typeof`、没有成员枚举）——自动匹配只能放在**生成期**：
+   读 `zanc --gen-meta` 导出的实体元数据，按约定配对成员，生成**普通 Zan 源码**。
+   生成物是编译期常量：没有反射、没有装箱、没有运行期开销，"约定悄悄变了"也不
+   会发生（生成物进版本库，diff 得出来）。
+2. **运行期与生成期是两条互补的路**。要"每条规则单独写、单独报错"的复杂映射用
+   `MapProfile`；要"几十个 DTO 一次性对齐"的机械映射用 `GenMapping` 生成代码后
+   直接用。两条路产出同样的显式代码。
+3. **规则交还新值而不是就地改**。`(源, 目标) → 新目标` 让类目标与**结构体目标**
+   都对——结构体是值语义，就地改会改在副本上（改完丢掉）。
+4. **目标工厂必填**。Zan 不能 `new T()`（类型参数实例化得到 null，静默错值），
+   目标对象由调用方造，"用哪个构造器"也是调用方的事。
+5. **错误可区分**。错误码区分"源是 null"/"成员规则抛了"/"值转换失败"/"工厂没给"/
+   "档案没有规则"，并带**成员名**；两条出口——`Map` 抛 `MappingException`，
+   `TryMap` 返回 `MappingResult`。
+6. **约定只覆盖能确定的那部分，配不上的如实报出**。同名同类型直拷；扁平化
+   （`customer.name` → `customerName`）。类型对不上、需要显式转换的**不猜、不静默
+   跳过**——`UnmatchedByConvention` 把它们列出来，由人决定。
+
+conformance `mapping_profile`（链式注册 / 成员名列表 / 类目标 / 列表映射 /
+源为 null / 成员规则失败归因 / 抛与不抛两条路 / 值转换器 / 结构体目标）与
+`mapping_gen`（两条约定 / 配不上的报出 / 生成源码形状 / 目标没有无参构造器
+时报错 / 非法规格抛 `InvalidSpec`）。ARC 守卫干净，`--check-leaks` 无泄漏。
+
+**已知边界**：没有运行期反射式自动映射；运行期拿不到类型名（配对靠生成期
+元数据）；生成器按**名字**配对，同名类型族会让配对挑花眼；结构体目标要求规则
+交还新值；档案非线程安全；没有嵌套映射 / 集合映射 / 循环引用检测。
+
+---
+
 ## 2. 通用生态包（按依赖顺序）
 
 ### 第 0 层 · 底座（其它包都依赖它）
@@ -1133,7 +1212,7 @@ conformance `messaging_bus`（类型分发 / 广播顺序 / 退订 / 命令语�
 
 | 建议包 | C# 参考 | ★ | 补什么 | 工期 |
 |---|---|---|---|---|
-| `Zan.Mapping` | AutoMapper / Mapster | 10,188 / 5,182 | 全仓 0 命中。做「显式映射函数 + `Gen*` 生成」，**不做反射式自动映射** | 2 周 |
+| `Zan.Mapping` | AutoMapper / Mapster | 10,188 / 5,182 | ✅ 已落地 `packages/Zan.Mapping`（`System.Mapping`：运行期 `MapProfile` 显式成员规则 + 生成期 `GenMapping` 按约定配对生成源码（**无反射**）+ 可区分错误码与成员归因，见 §1.22） | — |
 | `Zan.Messaging` | MassTransit | 7,809 | ✅ 已落地 `packages/Zan.Messaging`（`System.Messaging`：类型化通道 + 广播 / 命令语义 + 请求-响应端点（结果类型完整保留）+ 中间件管道 + 可区分错误码，无反射，见 §1.21） | — |
 | `Zan.Cli` | Spectre.Console / Terminal.Gui | 11,666 / 11,279 | ✅ 已落地 `packages/Zan.Cli`（`System.Cli`：ANSI 样式 / 宽字符对齐表格 / 进度条 / 交互提示，见 §1.4） | — |
 | `Zan.Jobs` | Hangfire / Quartz.NET | 10,151 / 7,096 | 只有 `Zan.Hosting/Cron.zan` 定时触发；缺持久化任务队列、重试退避、任务存储 | 2–3 周 |
@@ -1197,7 +1276,7 @@ conformance `messaging_bus`（类型分发 / 广播顺序 / 退订 / 命令语�
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
-**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` → `Zan.Jobs` → `Zan.Bench`
+**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` → `Zan.Bench`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 
