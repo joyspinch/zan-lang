@@ -1319,3 +1319,37 @@ kernel32、shell32、user32、advapi32、version）。
   别把"字段读对了"当成"泛型全对了"。
 - 门禁：`tests/conformance/generic_field_value_type.zan`——把 `SubstRecvTy` 短路
   成直接返回声明类型，用例会立刻变红。
+
+## 68. 泛型方法单态化：显式类型实参要一路带进克隆体；约束是模板体唯一的线索
+
+- 坑（实测）：自举有方法级单态化的骨架（`SpecQueue` / `CloneSubst`
+  / `SpecTag`），但**实例调用**（`EmitInstanceCall`）根本没走这条路——只有扩展
+  方法（`EmitExtensionCall`）和静态调用（`EmitStaticCall`）接了。于是
+  `p.Describe<Conn>(c)` 选中的是**擦除**的方法体：体里的 `c` 类型是 `T`，成员
+  查不到 → "call to 'c.Name' is not supported"（用例 `generic_instance_method`）。
+- 做法：实例调用也走 `SpecQueue`——把方法自己的类型参数绑出来（**显式类型实参
+  优先**，其次从实参类型推断），算 tag，克隆一份具体化的方法体，调用点指向克隆
+  的符号。静态调用也改成显式类型实参优先。
+- 坑（实测）：`CloneSubst` 之前**只替换节点的 `type` 槽，不替换类型
+  名**。类型节点（`AK.TypeRef`）的名字在 `sval` 里 → 克隆体里的显式类型实参还是
+  `T`，嵌套调用（`Both<T>` 里的 `this.Describe<T>(c)`）于是又落回擦除形态。修法：
+  `CloneSubst` 对 `AK.TypeRef` 节点改走 `SubstTP`（按 `sval` + `kids` 重建类型
+  节点）。`SubstTP` 的数组分支还要保住 `op`（可空标记）与行列号。
+- 坑（实测）：**擦除形态的方法体里，类型参数上的成员访问不能报错**。
+  宿主对类型参数做成员访问是**静默**的——`checker.c` 的成员检查只对 class /
+  struct / interface 报 "has no member"，因为泛型体只是**模板**：真正的成员访问
+  发生在单态化之后的体里。自举原来报 "is not supported by the self-hosted
+  compiler yet" → 把宿主接受的程序拒了。修法：接收者类型是擦除类型参数时，
+  模板体返回该擦除类型的零值（不报错）；单态化克隆体干真活。
+- 坑（实测）：`where T : IConn` 这样的**约束**原来被 parser 直接丢弃
+  （`SkipWhereClauses`）。约束是模板体里唯一的"接收者能干什么"的线索：丢掉它，
+  `T` 上的成员就只能等单态化，而**类**的方法体没有单态化。修法：约束存进类型
+  参数节点（`b` 槽），IR 期按**当前作用域**查（方法自己的类型参数遮蔽类的——
+  `curMethodNode`），接口约束走虚调用、类约束走直接调用 / 字段偏移。
+- 口径补充：**宿主是规格**这条在"能力缺口"上也要用——宿主对类型参数上的成员
+  访问不报错，自举就不能报；报了就等于比宿主更严，把宿主接受的程序拒了。
+- 边界：这套解决的是**方法级**。泛型**类**的方法体仍然是共享的一份，类自己的
+  类型参数在体里拿不到具体实参（`this.item` 里的 `item` 还是 `T`）——那要类级
+  单态化（宿主 `irgen_generics.c` 的 `generic_insts` + `find_generic_fn`）。自举的
+  **ngen 后端**已经有一版类级单态化（`ngen.zan` 的 `SpecRegister` /
+  `SpecRegisterClass` / `RegisterInstCls`），要搬到 LLVM 后端可以照它设计。

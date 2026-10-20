@@ -2218,6 +2218,28 @@ partial class Irgen {
         // The member is not a field, not a property and not a known builtin
         // member of the receiver's type. Fail closed: a silent 0 would hand
         // the program wrong answers without a word.
+        //
+        // A RECEIVER WHOSE TYPE IS A TYPE PARAMETER is the exception: the C
+        // host is silent there too (its member check only reports for class /
+        // struct / interface types), because the generic body is a TEMPLATE
+        // -- the real member access happens in the monomorphized body, where
+        // the type argument is concrete. Here the template slot just yields
+        // a zero of the erased type; the monomorphized clone does the work.
+        //
+        // With a CONSTRAINT (`where T : Conn`) the template still knows the
+        // member: the erased slot holds the object pointer, and the field
+        // sits at the constraint class's offset.
+        if (IsErasedType(obj.ty)) {
+            Node ct = TypeParamConstraint(obj.ty.sval);
+            if (ct != null) {
+                Node ccls = ClassOf(ct);
+                if (ccls != null && FieldIndex(ccls, e.sval) >= 0) {
+                    ExprVal r = FromSlot(obj.op, ct);
+                    return LoadField(r.op, ct, e.sval);
+                }
+            }
+            return new ExprVal("0", obj.ty);
+        }
         diags.Error("member '" + e.sval + "' of type '"
             + (obj.ty != null ? obj.ty.sval : "?")
             + "' is not supported by the self-hosted compiler yet", e.line, e.col);
@@ -4345,6 +4367,30 @@ partial class Irgen {
             // The receiver's type is not one the self-host can call methods
             // on. Fail closed: a silent 0 would hand the program wrong
             // answers without a word.
+            //
+            // A RECEIVER WHOSE TYPE IS A TYPE PARAMETER is the exception:
+            // the C host is silent there too -- the generic body is a
+            // template, and the real call happens in the monomorphized body
+            // where the type argument is concrete.
+            //
+            // With a CONSTRAINT (`where T : IConn`) the template still knows
+            // what the receiver offers: the call goes through the
+            // constraint's member table -- an interface method is a virtual
+            // call, a class method a direct one.
+            if (IsErasedType(recv.ty)) {
+                Node ct = TypeParamConstraint(recv.ty.sval);
+                if (ct != null) {
+                    Node ccls = ClassOf(ct);
+                    if (ccls != null && FindMethodUp(ccls, mname) != null) {
+                        ExprVal r = FromSlot(recv.op, ct);
+                        if (HasMod(ccls, MOD.Iface())) {
+                            return EmitVirtualCall(r, ccls, mname, FindMethodUp(ccls, mname), e);
+                        }
+                        return EmitInstanceCall(r, ct.sval, mname, e);
+                    }
+                }
+                return new ExprVal("0", recv.ty);
+            }
             diags.Error("call to '" + CallLabel(obj, mname)
                 + "' is not supported by the self-hosted compiler yet", e.line, e.col);
             return new ExprVal("0", MkType("int"));
@@ -4796,7 +4842,10 @@ partial class Irgen {
         if (m != null && CanSpecialize(m)) {
             List<string> mtps = TParams(m);
             if (mtps.Count > 0) {
-                BindFromArgs(m, e, 0, mtps, stns, strs);
+                // the explicit type arguments win over the inferred ones
+                if (!BindTypeArgs(m, e, mtps, stns, strs)) {
+                    BindFromArgs(m, e, 0, mtps, stns, strs);
+                }
                 string tag = SpecTag(m, mtps, stns, strs);
                 if (tag != "") { sym = SpecQueue(clsName, m, stns, strs, tag); spec = true; }
             }
@@ -5000,6 +5049,8 @@ partial class Irgen {
             if (se == null) { return t; }
             se.ival = t.ival;
             se.sval2 = t.sval2;
+            se.op = t.op;
+            se.line = t.line; se.col = t.col; se.mods = t.mods;
             return se;
         }
         if (t.kids.Count == 0) {
@@ -5012,6 +5063,33 @@ partial class Irgen {
         int i = 0;
         while (i < t.kids.Count) { n.Add(SubstTP(t.kids[i], names, reps)); i = i + 1; }
         return n;
+    }
+
+    // The type parameter node named `name` declared by `owner` (a class or a
+    // method declaration)
+    Node FindTypeParamNode(Node owner, string name) {
+        if (owner == null) { return null; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            Node k = owner.kids[i];
+            if (k.kind == AK.TypeParam() && k.sval == name) { return k; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // The constraint of a type parameter, looked up in the CURRENT scope: the
+    // method's own type parameters shadow the class's. Returns null when the
+    // parameter is unconstrained (or is not a parameter of this scope at all).
+    Node TypeParamConstraint(string name) {
+        Node c = FindTypeParamNode(curMethodNode, name);
+        if (c != null) { return c.b; }
+        Node cls = binder.FindType(curClass);
+        if (cls != null) {
+            c = FindTypeParamNode(cls, name);
+            if (c != null) { return c.b; }
+        }
+        return null;
     }
 
     // The concrete type of a member whose declared type mentions the
@@ -5034,6 +5112,17 @@ partial class Irgen {
     // concrete bindings so the specialized body lowers with concrete types
     Node CloneSubst(Node n, List<string> tns, List<Node> trs) {
         if (n == null) { return null; }
+        // a TYPE node carries its name in `sval` -- substituting it is what
+        // makes an explicit type argument concrete inside the clone
+        // (`this.Describe<T>(c)` in a `Describe<Conn>` clone must call
+        // `Describe<Conn>`, not `Describe<T>`)
+        if (n.kind == AK.TypeRef()) {
+            Node sub = SubstTP(n, tns, trs);
+            if (sub == null) { return null; }
+            sub.line = n.line; sub.col = n.col; sub.mods = n.mods;
+            sub.type = SubstTP(n.type, tns, trs);
+            return sub;
+        }
         Node c = new Node(n.kind);
         c.op = n.op; c.ival = n.ival; c.sval = n.sval; c.sval2 = n.sval2;
         c.mods = n.mods; c.line = n.line; c.col = n.col;
@@ -5045,6 +5134,22 @@ partial class Irgen {
         int i = 0;
         while (i < n.kids.Count) { c.Add(CloneSubst(n.kids[i], tns, trs)); i = i + 1; }
         return c;
+    }
+
+    // Bind a generic method's type parameters from the call's EXPLICIT type
+    // arguments (`M<int>(x)`). Returns false when the call carries none (or
+    // the count does not match the candidate), so the caller can fall back
+    // to inferring them from the argument types.
+    bool BindTypeArgs(Node m, Node e, List<string> mtps, List<string> names, List<Node> reps) {
+        Node targs = ExplicitTypeArgs(e);
+        if (targs == null) { return false; }
+        if (targs.kids.Count != mtps.Count) { return false; }
+        int i = 0;
+        while (i < mtps.Count) {
+            if (IndexOfStr(names, mtps[i]) < 0) { names.Add(mtps[i]); reps.Add(targs.kids[i]); }
+            i = i + 1;
+        }
+        return true;
     }
 
     // "" when the binding is incomplete or still generic; otherwise a tag
@@ -5201,6 +5306,23 @@ partial class Irgen {
         if (m != null) { owner = DeclOwnerOf(cls, m); }
         string sym = owner + "_" + name;
         if (m != null) { sym = MethodSym(owner, m); }
+        // method-level monomorphization: a generic method called with
+        // concrete type arguments gets a specialized body, so the body sees
+        // the concrete types (`c.Name()` where `c` is `T` becomes a call on
+        // the concrete class) and the call's result keeps its real type.
+        bool spec = false;
+        List<string> stns = new List<string>();
+        List<Node> strs = new List<Node>();
+        if (m != null && CanSpecialize(m)) {
+            List<string> mtps = TParams(m);
+            if (mtps.Count > 0) {
+                if (!BindTypeArgs(m, e, mtps, stns, strs)) {
+                    BindFromArgs(m, e, 0, mtps, stns, strs);
+                }
+                string tag = SpecTag(m, mtps, stns, strs);
+                if (tag != "") { sym = SpecQueue(owner, m, stns, strs, tag); spec = true; }
+            }
+        }
         string thisOp = recv.op;
         if (owner != clsName) {
             string bc = NT();
@@ -5209,6 +5331,7 @@ partial class Irgen {
         }
         string rt = "i64";
         if (m != null) { rt = MapType(m.type); }
+        if (spec) { rt = MapType(SubstTP(m.type, stns, strs)); }
         bool isAsyncCall = (m != null && IsAsync(m));
         if (isAsyncCall) { rt = "i8*"; }
         string args = "%" + owner + "* " + thisOp;
@@ -5216,6 +5339,7 @@ partial class Irgen {
         int i = 0;
         while (i < aargs.Count) {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
+            if (spec) { pty = SubstTP(pty, stns, strs); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
                 && aargs[i].kind == AK.OutArg()) {
                 if (i > 0) { args = args + ", "; }
@@ -5237,6 +5361,11 @@ partial class Irgen {
         string t = NT();
         L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         if (isAsyncCall) { Node tt = MkType("__task"); tt.a = m.type; return AsyncFrame(t, tt); }
+        if (spec) {
+            Node srt = SubstTP(m.type, stns, strs);
+            AddTemp(t, srt);
+            return new ExprVal(t, srt);
+        }
         if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);

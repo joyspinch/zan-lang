@@ -1833,7 +1833,7 @@ public class Parser {
             }
             while (Eat(TK.Comma())) { SkipType(); }
         }
-        SkipWhereClauses();
+        ParseWhereClauses(cls);
         Expect(TK.LBrace());
         while (!At(TK.RBrace()) && !At(TK.Eof())) {
             Node m = ParseMember(cls.sval);
@@ -1894,7 +1894,7 @@ public class Parser {
             // extra interfaces may be generic (`IEnumerable<int>, ...`)
             while (Eat(TK.Comma())) { SkipType(); }
         }
-        SkipWhereClauses();
+        ParseWhereClauses(cls);
         Expect(TK.LBrace());
         Node prevCls = curClsNode;
         curClsNode = cls;
@@ -1907,16 +1907,53 @@ public class Parser {
         return cls;
     }
 
-    // Generic constraint clauses `where T : C1, C2 ...`. Generics are erased in
-    // this compiler, so constraints are parsed and discarded; skip each clause
-    // up to the body opener (`{`/`=>`/`;`) or the next `where`.
-    void SkipWhereClauses() {
+    // Generic constraint clauses `where T : C1, C2 ...`. The constraint is
+    // KEPT, not discarded: a member of a type parameter is resolved THROUGH
+    // it (`c.Name()` where `T : IConn` is a call on the interface), so the
+    // erased body of a generic method still knows what the receiver offers.
+    void ParseWhereClauses(Node owner) {
         while (At(TK.Ident()) && Cur().text == "where") {
             Next();
             while (!At(TK.LBrace()) && !At(TK.Arrow()) && !At(TK.Semicolon()) && !At(TK.Eof())
                    && !(At(TK.Ident()) && Cur().text == "where")) {
+                // `T : C1, C2` -- a type parameter and its constraint list
+                if (At(TK.Ident()) && K1() == TK.Colon()) {
+                    string tn = Next().text;
+                    Next(); // ':'
+                    while (true) {
+                        if (At(TK.Ident())) {
+                            string cn = Next().text;
+                            // `class` / `struct` / `new()` carry no member
+                            // table -- they are not interface constraints
+                            if (cn != "class" && cn != "struct" && cn != "new") {
+                                Node ct = new Node(AK.TypeRef());
+                                ct.sval = cn;
+                                ct.line = Cur().line;
+                                ct.col = Cur().col;
+                                AttachConstraint(owner, tn, ct);
+                            }
+                        } else { Next(); }
+                        if (!Eat(TK.Comma())) { break; }
+                        // a new type parameter starts here (`where T : I, U : J`)
+                        if (At(TK.Ident()) && K1() == TK.Colon()) { break; }
+                    }
+                    continue;
+                }
                 Next();
             }
+        }
+    }
+
+    // Attach a constraint to the type parameter `name` declared by `owner`
+    // (a class or a method declaration). The constraint lives in the type
+    // parameter node's `b` slot.
+    void AttachConstraint(Node owner, string name, Node ct) {
+        if (owner == null) { return; }
+        int i = 0;
+        while (i < owner.kids.Count) {
+            Node k = owner.kids[i];
+            if (k.kind == AK.TypeParam() && k.sval == name) { k.b = ct; return; }
+            i = i + 1;
         }
     }
 
@@ -2088,7 +2125,7 @@ public class Parser {
             member.kind = AK.MethodDecl();
             member.attrWeb = mWeb;
             ParseParams(member);
-            SkipWhereClauses();
+            ParseWhereClauses(member);
             // expression-bodied method:  T Name(...) => expr;
             if (At(TK.Arrow())) {
                 Next();
@@ -2628,7 +2665,7 @@ public class Parser {
             Expect(TK.Greater());
         }
         ParseParams(m);
-        SkipWhereClauses();
+        ParseWhereClauses(m);
         // expression body:  T Name(...) => expr;
         if (At(TK.Arrow())) {
             Next();
