@@ -80,7 +80,7 @@
 - 现状规避：`Zan.Validation` 让用户直接继承 `ValidationPlan<T>`
   （`ValidationPlan<T>` 自身无基类），不套一层 `AbstractValidator<T>`。
 
-### [ ] A392 自举的运行期类型判定看不见接口与容器
+### [x] A392 自举的运行期类型判定看不见接口与容器
 
 - 现象（2026-10-20 修完 A384 后的边界）：自举后端现在能给对象判定类身份
   （对象头里的类标识槽，见
@@ -90,11 +90,23 @@
     「某类实现了某接口」→ `x is IFoo` 恒为假（vtable 时代也如此，不是回归）。
   - **容器**：`List<T>` / `Dictionary<K,V>` / `StringBuilder` 的类标识槽是 0
     → `o is List<int>` 恒为假（C 宿主能判）。
-- 方向：接口要在基类链之外另建「实现关系表」；容器要给每个实例写自己的
-  tid（泛型实例化按元素类型分别记）。两者都要先决定**类型名怎么写进对象头**
-  （自举现在只存 tid 全局的地址，没有类型名）。
-- ⚠ 泛型容器的 tid 要按元素类型分别发射，工作量不小；先确认差分门是否
-  需要这两种判定再动手。
+- ✅ 已修（2026-10-20）：
+  - **接口**：自举的 parser 把接口表示成带 `MOD.Iface()` 的类声明
+    （`parser.zan` 的 `ParseInterface`），于是「实现了某接口」就是基类链上的
+    一环，`IsSubclassName` 沿链就能看见 → `x is IFoo` 由类标识判定。
+  - **容器**：容器也是堆对象，也该有类标识。`irgen.zan` 新增
+    `ContainerTidName` / `IsContainerType` / `ContainerCid` /
+    `EmitContainerTids`：给 `List` / `Dict` / `StringBuilder` 各发一个
+    `@__tid_*` 全局（用户类占了同名就让位），容器运行时的 `zalloc` 把这个
+    tid 的地址写进类标识槽；`is` 判定与 switch 模式的类型测试在遇到容器名
+    时走运行期类标识比较。
+  - **口径**：宿主的运行期身份**不含元素类型**——`List<int>` 的实例
+    `is List<string>` 也为真，`Dictionary` 与 `Dict` 是同一个类型 → 一类容器
+    一个 tid 就够，不必按元素类型分别发射（原方向里的这条顾虑不成立）。
+  - 用例 `tests/conformance/runtime_type_test.zan` 钉住（11 项判定，含空值
+    与跨类型），差分门收录该用例。
+- 边界：容器判定只看**类**，不看泛型实参（与宿主一致）；`object` 槽里的
+  容器与源类互判为假；空容器判为假（宿主也是假）。
 
 ### [ ] A385 自举协程帧布局与 C 宿主的 `zan.co.header` 不一致——自举产出的程序用不了发行版 mt 运行时
 
