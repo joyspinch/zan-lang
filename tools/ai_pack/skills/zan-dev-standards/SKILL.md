@@ -752,10 +752,16 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   看不见卡顿）。六个 phase 都正常却仍"未响应"，就是 UI 线程上的同步阻塞
   （项目层）：该抓栈，而不是调渲染参数。库层每帧成本的判据是 **slow16
   （>16.7ms 的帧数）而不是平均帧时**。
-  坑出处：实测一个 IDE 的帧预算（CPU 后端、固定皮肤与固定夹具项目）稳态
-  slow16=0、worst 0~6ms，渲染根本不是"未响应"的原因；超标项全在
-  `tree_ms`（布局/命中树 12.5~17.6ms，预算 8）与像素量（restore/blend/grad
-  超 5~11 倍）——那是库层的 overdraw 与每帧重建命中树。
+  坑出处：实测一个 IDE 的帧预算（CPU 后端、固定皮肤与固定夹具项目）共
+  95 批 2850 帧，**只有 1 帧**超过 16.7ms，就是首帧 195ms（其中 ribbon
+  107ms、玻璃模糊 2274kpx、全量混合 2885kpx）——离"未响应"的 5 秒差 25 倍，
+  渲染**结构上不可能**造成未响应。**别把门禁口径当稳态均值读**：
+  帧预算脚本的 `tree_ms`/`render_ms`/像素量取的是**最差批次**（`_max_tree`
+  一类聚合），不是均值——同一份日志里 tree_ms 中位只有 4ms、最差批次
+  12ms，"稳态 12.5~17.6ms 超预算 2 倍"这种读法会把布局误判成病根。
+  看稳态要看 30 帧批次的分布（中位 + 慢帧计数），判卡顿看 slow16，判尖刺
+  看日志里的 `spike whole_ms=...` 行（它带 `top=`/`mark=`/`scope=`，直接
+  指出是哪棵子树、哪个标记最贵）。
 - **自证工具：`Gui.Diagnostics.UiWatchdog`**（GUI 包的 `src/Gui/Diagnostics/`）。
   `Enter(name)` / `Exit()` 把可疑代码括起来，退出时超过阈值（默认 2000ms）才报
   `UIWATCHDOG stall stage=<name> blocked=<ms>ms`——**只有你自己括的区间才计时，
