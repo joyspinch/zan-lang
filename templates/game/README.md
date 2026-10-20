@@ -43,7 +43,7 @@ IDE 的"新建项目"按这个标签分组。
 | `Game.Board` | 网格、回合、命令校验、快照 | 棋类、解谜 |
 | `Game.Cards` | 牌目录、三区牌堆、战斗结算、演播队列 | 斗地主、肉鸽 |
 | `Game.Tactics` | 流场寻路、RVO 避障、炮塔、波次、弹道池 | 塔防、RTS |
-| `Game.Idle` | 大数、飘字池、离线收益、钱包 | 放置 |
+| `Game.Idle` | 大数、飘字池、离线收益、钱包、放置状态机（IdleState/IdleBuilding） | 放置 |
 | `Game.Arpg` | 地图、战斗、装备、成长、存档、服务器 | 传奇、无为 |
 
 `packages/Zan.Game/src/Game/README.md` 有模块全景图。

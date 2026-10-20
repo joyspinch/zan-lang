@@ -10,6 +10,8 @@ Game.Board ----+
 Game.Cards ----+--> Game.Foundation
 Game.Arcade2D -+
 
+Game.Idle (idle/incremental mechanics: offline rewards, wallet, state machine)
+
 Game.Factory (separate package: Zan.Game.Factory)
 ```
 
@@ -34,6 +36,12 @@ a compact deck-building battle runtime.
 `Game.Arcade2D` provides geometry, collision queries, animation state, pooled
 entities and path following for tower defense, auto-battlers and lightweight
 arcade simulations.
+
+`Game.Idle` provides the mechanics of idle/incremental games: offline reward
+settlement, wallet slots and costs, floating text items, and the core state
+machine (`IdleState` / `IdleBuilding` — click power, cost multiplier curve,
+per-second output, fixed-step accrual). The catalog of what the player builds
+stays with the game; only the rules that hold for every idle game live here.
 
 `Game.Zgm` is ZanGameMaker's typed component model and renderer-neutral runtime
 based on the capabilities described by the published DM3 documentation. It

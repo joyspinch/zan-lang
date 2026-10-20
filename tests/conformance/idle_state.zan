@@ -1,0 +1,109 @@
+using System;
+using System.Collections.Generic;
+using Game.Idle;
+
+// 放置挂机状态机契约测试：Game.Idle.IdleState / IdleBuilding 的机制数值。
+//
+// 这些数字是"放置挂机"玩法的地基：点击产出、升级成本曲线（1.15 倍率）、
+// 每秒产出、定步结算。数值一变，玩法手感就变——所以逐条锁死。
+public class IdleStateTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNum(string name, double actual, double expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static List<IdleBuilding> Catalog() {
+        List<IdleBuilding> list = new List<IdleBuilding>();
+        list.Add(new IdleBuilding(0, "机械鹤嘴锄", "强化基础挖掘动力 (+1/s)", 15, 1));
+        list.Add(new IdleBuilding(1, "蒸汽矿井", "自动化深层矿石提取 (+8/s)", 100, 8));
+        list.Add(new IdleBuilding(2, "熔岩钻头", "穿透玄武岩层地心挖掘 (+45/s)", 1100, 45));
+        list.Add(new IdleBuilding(3, "地热精炼厂", "利用地核能源加速提纯 (+260/s)", 12000, 260));
+        list.Add(new IdleBuilding(4, "量子对撞机", "直接合成纯净暗金矿 (+1800/s)", 130000, 1800));
+        list.Add(new IdleBuilding(5, "戴森球采矿站", "恒星级自动化采矿矩阵 (+14000/s)", 1400000, 14000));
+        return list;
+    }
+
+    public static void Main() {
+        IdleState s = new IdleState(Catalog());
+
+        // 初始态
+        CheckNum("initial gold", s.Gold, 0.0);
+        CheckNum("initial earned", s.TotalEarned, 0.0);
+        CheckNum("initial clicks", s.Clicks, 0);
+        CheckNum("initial dps", s.TotalDps, 0.0);
+        Check("initial click power", s.ClickPower == 1);
+        Check("catalog size", s.Buildings.Count == 6);
+
+        // 手动开采
+        long gain = s.Mine();
+        Check("mine gain is base power", gain == 1);
+        CheckNum("mine gold", s.Gold, 1.0);
+        CheckNum("mine earned", s.TotalEarned, 1.0);
+        CheckNum("mine clicks", s.Clicks, 1);
+
+        // 升级门槛：15 金
+        IdleBuilding first = s.Buildings[0];
+        CheckNum("level0 cost", (double)first.Cost, 15.0);
+        Check("cannot afford yet", !s.CanAfford(first));
+        Check("upgrade rejected", !s.UpgradeBuilding(0));
+        s.AddGold(13.0);
+        CheckNum("gold at 14", s.Gold, 14.0);
+        Check("cannot afford at 14", !s.CanAfford(first));
+        Check("upgrade rejected at 14", !s.UpgradeBuilding(0));
+        s.AddGold(1.0);
+        CheckNum("gold after add", s.Gold, 15.0);
+        Check("can afford now", s.CanAfford(first));
+        Check("upgrade accepted", s.UpgradeBuilding(0));
+
+        // 升级后：等级 1、涨价 15%、产出 1/s、点击力 +2
+        Check("level is 1", first.Level == 1);
+        CheckNum("cost after upgrade", (double)first.Cost, 17.0);   // 15 * 1.15 = 17.25 → 17
+        Check("dps after upgrade", first.Dps == 1);
+        Check("click power after upgrade", s.ClickPower == 3);      // 1 + 1*2
+        CheckNum("total dps after upgrade", s.TotalDps, 1.0);
+        CheckNum("gold after upgrade", s.Gold, 0.0);
+        CheckNum("earned after upgrade", s.TotalEarned, 15.0);      // 1（开采）+ 14（入账）
+
+        // 定步推进：1 dps × 0.5 秒 = 0.5 金
+        s.Tick(0.5);
+        CheckNum("tick gold", s.Gold, 0.5);
+        CheckNum("tick earned", s.TotalEarned, 15.5);
+        s.Tick(0.0);
+        CheckNum("zero tick does nothing", s.Gold, 0.5);
+
+        // 越界与负数索引
+        Check("upgrade out of range", !s.UpgradeBuilding(99));
+        Check("upgrade negative", !s.UpgradeBuilding(-1));
+
+        // 非正收益不入账
+        s.AddGold(0.0);
+        s.AddGold(-5.0);
+        CheckNum("non positive gain ignored", s.Gold, 0.5);
+
+        // 再升一级：成本 15 * 1.15^2 = 19.8375 → 19
+        s.AddGold(19.0);
+        Check("afford second level", s.UpgradeBuilding(0));
+        Check("level is 2", first.Level == 2);
+        CheckNum("cost at level 2", (double)first.Cost, 19.0);
+        Check("dps at level 2", first.Dps == 2);
+        Check("click power at level 2", s.ClickPower == 5);          // 1 + 2*2
+
+        if (failures == 0) {
+            Console.WriteLine("ALL IDLE STATE TESTS PASSED");
+        } else {
+            Console.WriteLine("IDLE STATE FAILURES: " + failures.ToString());
+        }
+    }
+}
