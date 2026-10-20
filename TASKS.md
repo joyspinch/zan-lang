@@ -668,46 +668,49 @@
   值），再做 live 绑定（合成委托）。
 - 现状规避：自举产物里不要用 `Binding<T>` 字段。
 
-### [ ] A435 十九个控件没有 `Kind()`——设计器与序列化器按类型重建不了它们
+### [~] A435 控件的 `Kind()` 与"kind 名单"三处副本要对得上
 
-- 现象：`Control.Kind()` 的基类回退是 `"Control"`，而
-  `BoxContent` / `ChoiceGroup` / `Column` / `ContextMenu` / `Ellipsis` /
-  `FormBuilder` / `Layer` / `Menu` / `Message` / `Popover` / `Prompt` /
-  `QrEncoder` / `Ribbon` / `Scrollbar` / `ScrollView` / `Split` / `Table` /
-  `Tooltip` / `WidgetDelegates` 都没有覆写它。
-- 后果：`Kind()` 是"重建这个节点的稳定类型标签"（见 `ControlFactory`
-  与序列化器）。这十九个控件在序列化往返里只能以 `"Control"` 落盘，
-  重新加载时按类型分派就会走错分支或直接失败——"组件互嵌"在设计器
-  里因此不成立。
-- 方向：逐个补 `override string Kind()`，并在 `ControlFactory` 注册
-  对应的构造入口（注册表缺项时按 `Kind` 反查会失败，补 Kind 要与
-  注册一起做，不能只补一半）。
-- 边界：`HeavyControls` / `ControlBootstrap` 里已注册的重家族（图表、
-  设计器、CEF 等）走的是另一张表，补 Kind 时不要重复注册。
+- 现象（2026-10-20 实测更正）：先前记的"十九个控件没有 `Kind()`"不是
+  主要问题——那十九个（`BoxContent` / `ChoiceGroup` / `Column` /
+  `ContextMenu` / `Ellipsis` / `FormBuilder` / `Layer` / `Menu` /
+  `Message` / `Popover` / `Prompt` / `QrEncoder` / `Ribbon` / `Scrollbar` /
+  `ScrollView` / `Split` / `Table` / `Tooltip` / `WidgetDelegates`）是
+  设计器与代码内部件，设计稿里的 kind 由设计器模型给
+  （`FormField.KindForType`），不依赖 `Control.Kind()`。真正对不上的是
+  **声明了 `Kind()` 却在名单外**的控件：`ButtonGroup` / `Center` /
+  `Field` / `IconView` / `ListItem` / `RadioButton` / `RichText` /
+  `StyledText` / `Typography` / `Wizard` / `GraphView` / `BandGrid` /
+  `PropertyGrid`。
+- 后果：编译期限定名单（`GenForm`）不认这些 kind → 生成代码发裸名，
+  用户项目的同名全局类压过 stdlib（探针实证）；反向也一样——注册表里有
+  而编译期不认的 kind（`Row` / `Spacer` / `FormGroup` / `FormItem` /
+  `Modal` / `Drawer`）同样发裸名。
+- **已修**（2026-10-20）：两处名单补齐——12 个库控件 + 6 个容器件进编译期
+  名单；`Field` 进不可实例化名单（它是设计器的字段记录，没有零参构造，
+  `new FormField()` 编译不过）。门禁：`scripts/component_audit.py` 的 R1
+  规则（注册表 ↔ 编译期名单 ↔ 控件 `Kind()` 三处对齐）。
+- 剩余：运行期按 kind 重建仍不支持那 12 个库控件（注册表会把它们拖进
+  每个宿主，不注册是刻意的）；代码搭的树导出设计稿后能生成代码，但
+  `Serialize` / `Html` 克隆会丢掉它们——真需要时再逐个开注册。
 
-### [ ] A436 样式解析仍有两类旁路——静态 helper 与显式 id 解析
+### [~] A436 样式解析的旁路：实例方法已清零，只剩静态 helper
 
-- 现象：本轮把控件里手写的 `Style.Of(app, ...)` 迁到了基类入口
-  （`Control.Box` / `ResolveStyleAs`），但仍有三类调用留在旧路上：
-  1. **静态 helper**：`Badge.WidthOf/Pill/Dot/CountAt`、
-     `Layer.DrawToast/DrawNotifyCard/DrawPopconfirm`、`Tag.*`、
-     `Typography.Heading`、`StyledText.FontPx` 等——它们没有 `this`，
-     拿不到控件自身的行内样式（`Bg()`/`Radius()`）与基类缓存。
-  2. **显式 id 解析**：`ListView` 的 `listrow`、`TreeView` 的 `row`、
-     `DockHost` 的 `docktab`、`SessionList` 的 `listrow` 用
-     `Style.Full(app, type, cls, "", state)` 显式传空 id——这是对的
-     （行不该继承父控件的 id），但走的是旧路径，不进缓存。
-  3. **借用外观**：`Scrollbar`/`Split`/`Tooltip`/`Popover` 等借用别的
-     类型的规则，本轮已迁到 `ResolveStyleAs`，但它们自己的
-     `StyleType()` 仍返回基类默认的 `"control"`。
-- 方向：静态 helper 改成"由调用方传入已解析的 StyleBox"或给它们一个
-  显式的解析参数（避免每个 helper 都自己解析一次）；显式 id 的行解析
-  走 `ResolveStyleAsAs` 的新变体（带 id 参数）；`StyleType()` 为
-  `"control"` 的控件各自覆写成本类型的真实选择器。
+- 现象：控件里手写的 `Style.Of(app, ...)` 已迁到基类入口
+  （`Control.Box` / `BoxState` / `ResolveStyleAs`）。
+- **已修**（2026-10-20）：剩下的 20 处**实例方法**直调（列表行、树行、
+  滚动条轨道、弹层、分割线、停靠面板、虚拟列表根面…）收进新基类入口
+  `Control.BareBox(app, type, state)`——部件表面的"裸基线"外观：不带本
+  控件的 Class、不带 id、不套行内覆盖（套上会串味：列表写成 `.primary`
+  就把每一行都染成主色）。门禁：`component_audit.py` 的 R4 规则
+  （实例方法不得直调 `Style.Of` / `Style.Full`）。
+- 剩余（不算违规）：**静态 helper**（`Badge.WidthOf/Pill/Dot/CountAt`、
+  `Layer.DrawToast/...`、`Tag.*`、`Typography.Heading`、`StyledText.FontPx`）
+  ——它们没有 `this`，解析的是显式的（类型, 类）组合（类由调用方传入），
+  行内样式与控件缓存本来就与它们无关。
 - 关联：见 A429（排版组溢出）——那条是布局放不下，本条是样式解析
   入口不统一。
 
-### [ ] A437 尺寸档还有几处不齐：switch 的档位不单调，textarea 只调字号
+### [x] A437 尺寸档还有几处不齐：switch 的档位不单调，textarea 只调字号
 
 - 现象：四档统一后仍有例外：
   - `switch` 的 tiny/small/默认都是 24px（`switch.small` 的
@@ -720,9 +723,13 @@
   - `badge` 的默认高度 24（`--height-tiny`），tiny 档 16
     （`--height-micro-tiny`），但代码兜底值过去写的是 18（已随本轮
     改成 24）。
-- 方向：switch 改成 24/28/32/40 的单调阶梯（轨道尺寸同步），或在
-  规约里明确写"开关的高度档只作用于行高，轨道另算"；textarea 与
-  avatar 的例外写进 `docs/GUI_COMPONENT_AUTHORING.md`。
+- **已修**（2026-10-20）：`switch.small` 改走 `--height-small`（28），
+  阶梯变 24/28/32/40 单调，轨道尺寸不变（tiny 24x14 / small 30x16 /
+  默认 40x24 / large 56x32）。`textarea` / `avatar` 两个例外写进
+  `docs/GUI_COMPONENT_AUTHORING.md` 的尺寸档一节——是刻意的，不是漏做：
+  textarea 档位只调字号、高度随内容（多行盒按固定高度分档会截断输入）；
+  avatar 尺寸由显式直径字段决定，档位只作用于没设直径的默认头像，
+  且没有比 `--font-size-tiny` 更小的字号令牌可用。
 
 ### [ ] A434 泛型类的类型参数字段在**擦除上下文**里读到的是内联值的头 8 字节
 
