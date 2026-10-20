@@ -191,6 +191,43 @@ partial class CodeEditor {
         return 0 - 1;
     }
 
+    // 候选分层的种类权重（VS 口径）。MatchScore 的量纲是 1000（子序列
+    // 匹配）到 4000（精确前缀），这里给每一层留出足够宽的带宽，使层内
+    // 匹配质量的差异不会跨层翻转顺序：
+    //   局部变量/参数 > 属性 > 字段 > 方法 > 枚举 > 类型 > 关键字 > 代码片段。
+    // 从周边文本扫来的裸词（"W"）落到最底——它只是"刚写过的名字"，
+    // 不是作用域里的符号，不该压过工程自己的成员。
+    // 此前所有候选共用一个分数，排序退化成"收集顺序说了算"，
+    // 结果是片段与关键字永远排在工程符号前面，还把项目符号挤出
+    // 弹窗的前 80 条。
+    public static int KindWeight(string kind) {
+        if (kind == "V") { return 6000; }
+        if (kind == "P") { return 5000; }
+        if (kind == "F") { return 4800; }
+        if (kind == "M") { return 4600; }
+        if (kind == "E") { return 4400; }
+        if (kind == "T") { return 4200; }
+        if (kind == "K") { return 4000; }
+        if (kind == "S") { return 3800; }
+        if (kind == "W") { return 0; }
+        return 3000;
+    }
+
+    // 种类的整数序号。与 KindWeight 的分层一一对应，排序时按序号
+    // 比较种类（字符串比较在几千项的候选上慢一个量级）。
+    public static int KindIndex(string kind) {
+        if (kind == "V") { return 0; }
+        if (kind == "M") { return 1; }
+        if (kind == "P") { return 2; }
+        if (kind == "F") { return 3; }
+        if (kind == "E") { return 4; }
+        if (kind == "T") { return 5; }
+        if (kind == "K") { return 6; }
+        if (kind == "S") { return 7; }
+        if (kind == "W") { return 8; }
+        return 9;
+    }
+
     // `pfx` 拼出 `cand` 的大写字母（加首字符）时返回 true：
     // `rdal` 和 `RAL` 都能匹配 `ReadAllLines`。
     public static bool HumpMatch(string cand, string pfx) {
@@ -273,6 +310,51 @@ partial class CodeEditor {
         for (int k = 0; k < ti.Count; k = k + 1) {
             items.Add(ti[k]);
             scores.Add(ts[k]);
+        }
+    }
+
+    // 带种类配额的有界插入排序：每个种类最多 `quota` 个名额，
+    // 超出名额的项只有比该种类里最差的一项更好时才顶替它。
+    // 浏览模式（Ctrl+Space，没有前缀）下工程里的成员可能有上千个，
+    // 不分配额的话类型与代码片段会被整个挤出列表——列表里只剩
+    // 成员，一个类型名都找不到。VS 的列表是各类型混排的。
+    // 输入前缀时不用这个：那时用户要的就是匹配度最高的那一批。
+    public static void SortCandidatesByScoreTopKinds(List<CeCandidateItem> items,
+                                        List<int> scores, int limit, int quota) {
+        int count = items.Count < scores.Count ? items.Count : scores.Count;
+        List<CeCandidateItem> wi = new List<CeCandidateItem>();
+        List<int> ws = new List<int>();
+        for (int i = 0; i < count; i = i + 1) {
+            int kind = items[i].kindIdx;
+            int sc = scores[i];
+            int kindCount = 0;
+            int worst = 0 - 1;
+            int worstScore = 0;
+            for (int j = 0; j < wi.Count; j = j + 1) {
+                if (wi[j].kindIdx != kind) { continue; }
+                kindCount = kindCount + 1;
+                if (worst < 0 || ws[j] < worstScore) { worst = j; worstScore = ws[j]; }
+            }
+            if (quota > 0 && kindCount >= quota) {
+                if (worst < 0 || sc <= worstScore) { continue; }
+                wi.RemoveAt(worst);
+                ws.RemoveAt(worst);
+            }
+            // 插入位置：分数降序，同分保持收集顺序。
+            int pos = wi.Count;
+            while (pos > 0 && ws[pos - 1] < sc) { pos = pos - 1; }
+            wi.Insert(pos, items[i]);
+            ws.Insert(pos, sc);
+            if (wi.Count > limit) {
+                wi.RemoveAt(wi.Count - 1);
+                ws.RemoveAt(wi.Count - 1);
+            }
+        }
+        items.Clear();
+        scores.Clear();
+        for (int k = 0; k < wi.Count; k = k + 1) {
+            items.Add(wi[k]);
+            scores.Add(ws[k]);
         }
     }
 
@@ -398,7 +480,9 @@ partial class CodeEditor {
             CeCandidateItem candidate = new CeCandidateItem(item.label, kind);
             candidate.semantic = item;
             acAllCandidates.Add(candidate);
-            scores.Add(score + 1000);
+            // 语义项同样按种类分层，并整体领先本地候选 1000 分：
+            // 它带着类型推导与参数详情，同一类里应当先于本地启发式项。
+            scores.Add(score + CodeEditor.KindWeight(kind) + 1000);
         }
         return true;
     }
@@ -406,7 +490,7 @@ partial class CodeEditor {
     // 重算补全候选：点号模式按已输前缀过滤完整成员列表；常规模式
     // 收集光标前的字词前缀，把基础候选表（特性上下文只给
     // DllImport/StructLayout）与周边词按匹配度打分合并，排序后截断
-    // 前 60 条再套种类过滤。无候选时收起弹窗。
+    // 再套种类过滤。无候选时收起弹窗。
     void UpdateCompletion() {
         CancelSemanticCompletion();
         CaptureCompletionSource();
@@ -443,7 +527,7 @@ partial class CodeEditor {
                 if (sc >= 0) {
                     taken[mName] = true;
                     acAllCandidates.Add(new CeCandidateItem(mName, CodeEditor.MemberKind(mName)));
-                    dscores.Add(sc + 500); // 兜底候选项
+                    dscores.Add(sc + CodeEditor.KindWeight(CodeEditor.MemberKind(mName)) + 500); // 兜底候选项
                 }
             }
 
@@ -487,7 +571,14 @@ partial class CodeEditor {
         if (acAllCandidates.Count == 0) { acActive = false; return; }
         // 排序后保留最优的少数：按收集顺序截断会
         // 在明显候选项扫描较晚时将其丢弃。
-        CodeEditor.SortCandidatesByScoreTop(acAllCandidates, scores, 80);
+        // 没有前缀时是"浏览作用域里有什么"——按种类分配名额，让列表
+        // 里各类型混排（否则上千个成员会把类型挤没）；带前缀时按
+        // 匹配度给最好的那批，不限名额。
+        if (pfx.Length == 0) {
+            CodeEditor.SortCandidatesByScoreTopKinds(acAllCandidates, scores, 200, 40);
+        } else {
+            CodeEditor.SortCandidatesByScoreTop(acAllCandidates, scores, 200);
+        }
         acSel = 0;
         ApplyKindFilter();
     }
@@ -502,7 +593,7 @@ partial class CodeEditor {
             if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
                 taken.Add(w, true);
                 acAllCandidates.Add(new CeCandidateItem(w, cands[i].kind));
-                scores.Add(sc);
+                scores.Add(sc + CodeEditor.KindWeight(cands[i].kind));
             }
         }
     }
@@ -517,7 +608,7 @@ partial class CodeEditor {
             if (w != pfx && sc >= 0 && !taken.ContainsKey(w)) {
                 taken.Add(w, true);
                 acAllCandidates.Add(new CeCandidateItem(w, defKind));
-                scores.Add(sc);
+                scores.Add(sc + CodeEditor.KindWeight(defKind));
             }
         }
     }
@@ -534,7 +625,7 @@ partial class CodeEditor {
                 string k = defKind;
                 if (kinds != null && i < kinds.Count) { k = kinds[i]; }
                 acAllCandidates.Add(new CeCandidateItem(w, k));
-                scores.Add(sc);
+                scores.Add(sc + CodeEditor.KindWeight(k));
             }
         }
     }
@@ -553,10 +644,16 @@ partial class CodeEditor {
         if (cbCandidates != null && cbGen == candBaseGen) { return; }
         List<string> items = new List<string>();
         List<string> kinds = new List<string>();
+        // 收集顺序决定同分候选的先后（排序是稳定的）：项目符号先于
+        // 标准库，标准库先于关键字与代码片段——工程自己的东西比
+        // 通用词更该出现在前面。
+        // 代码片段必须排在关键字之前：同名时"片段"标签决定 Tab
+        // 是否展开模板（见 AcceptCompletion），调换会让 for/if 失去
+        // 模板展开能力。
+        AddProjectCandidates(items, kinds);
+        AddStdlibCandidates(items, kinds);
         CodeEditor.SnippetListK(items, kinds);
         CodeEditor.KeywordListK(items, kinds);
-        AddStdlibCandidates(items, kinds);
-        AddProjectCandidates(items, kinds);
         cbCandidates = new List<CeCompletionCandidate>();
         for (int i = 0; i < items.Count && i < kinds.Count; i = i + 1) {
             cbCandidates.Add(new CeCompletionCandidate(items[i], kinds[i]));

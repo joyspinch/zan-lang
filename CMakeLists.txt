@@ -3606,6 +3606,19 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_lsp${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 补全候选分层回归（弹窗顶部只剩 for/if/class/try，工程符号被挤出
+  # 前 80 条）：按 VS 口径分层——局部变量/参数 > 属性 > 字段 > 方法 >
+  # 枚举 > 类型 > 关键字 > 代码片段，裸词沉底；工程符号必须排在片段与
+  # 关键字之前，语义(LSP)候选同样按种类分层。
+  add_test(NAME conformance_gui_codeeditor_completion_order
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_completion_order_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_completion_order.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_completion_order${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_codeeditor_fold
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

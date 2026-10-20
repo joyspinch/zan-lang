@@ -1,0 +1,138 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component;
+
+// 补全候选分层回归（VS 口径）。此前所有候选共用一个分数，排序退化成
+// "收集顺序说了算"：代码片段与关键字永远排在工程符号前面，而且
+// 因为候选表里关键字有一百多个，前 80 条的名额被它们占满，工程里
+// 自己的类型与成员直接被挤出弹窗（弹窗顶部只剩 for/if/class/try）。
+// 现在按种类分层：局部变量/参数 > 属性 > 字段 > 方法 > 枚举 > 类型 >
+// 关键字 > 代码片段，而从周边文本扫来的裸词沉到最底。
+class CompletionOrderTest {
+    static int fails;
+
+    static void Fail(string what) {
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void EqTrue(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static int IndexOf(List<string> items, string name) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i] == name) { return i; }
+        }
+        return -1;
+    }
+
+    // 一个"工程"：一个类型带一个成员。工程符号必须排在关键字与
+    // 代码片段前面，且不能因为前 80 条的名额被关键字占满而消失。
+    // SetProjectFiles 收的是"每个文件一整份源码"，不是行。
+    static CodeEditor MakeProjectEditor() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "proj.zan";
+        List<string> files = new List<string>();
+        files.Add("class Settings {\n    func Save() {\n    }\n}");
+        e.SetProjectFiles(files);
+        e.LoadText("x");
+        e.curCol = 0;
+        return e;
+    }
+
+    // ① 种类权重本身必须严格分层。
+    static void TestKindWeight() {
+        EqTrue("V outranks P", CodeEditor.KindWeight("V") > CodeEditor.KindWeight("P"));
+        EqTrue("P outranks F", CodeEditor.KindWeight("P") > CodeEditor.KindWeight("F"));
+        EqTrue("F outranks M", CodeEditor.KindWeight("F") > CodeEditor.KindWeight("M"));
+        EqTrue("M outranks E", CodeEditor.KindWeight("M") > CodeEditor.KindWeight("E"));
+        EqTrue("E outranks T", CodeEditor.KindWeight("E") > CodeEditor.KindWeight("T"));
+        EqTrue("T outranks K", CodeEditor.KindWeight("T") > CodeEditor.KindWeight("K"));
+        EqTrue("K outranks S", CodeEditor.KindWeight("K") > CodeEditor.KindWeight("S"));
+        EqTrue("S outranks W", CodeEditor.KindWeight("S") > CodeEditor.KindWeight("W"));
+        EqTrue("unknown kind is neutral", CodeEditor.KindWeight("D") > 0
+            && CodeEditor.KindWeight("D") < CodeEditor.KindWeight("K"));
+    }
+
+    // ② 空前缀（Ctrl+Space）时，工程符号必须在片段/关键字之前，
+    //    而且不能被前 80 条的名额挤掉。
+    static void TestProjectSymbolsLead() {
+        CodeEditor e = MakeProjectEditor();
+        e.ForceCompletion();
+        EqTrue("forced popup opened", e.acActive);
+        int iType = IndexOf(e.acItems, "Settings");
+        int iMember = IndexOf(e.acItems, "Save");
+        int iSnippet = IndexOf(e.acItems, "for");
+        int iKeyword = IndexOf(e.acItems, "using");
+        EqTrue("project type survives truncation", iType >= 0);
+        EqTrue("project member survives truncation", iMember >= 0);
+        EqTrue("snippet still offered", iSnippet >= 0);
+        EqTrue("keyword still offered", iKeyword >= 0);
+        EqTrue("project member before snippet", iMember >= 0 && iSnippet >= 0 && iMember < iSnippet);
+        EqTrue("project type before snippet", iType >= 0 && iSnippet >= 0 && iType < iSnippet);
+        EqTrue("project type before keyword", iType >= 0 && iKeyword >= 0 && iType < iKeyword);
+        EqTrue("popup leads with a project symbol", iMember == 0 || iType == 0);
+    }
+
+    // ③ 裸词（周边文本里刚写过的名字）沉到工程符号之下。
+    static void TestBareWordsSink() {
+        CodeEditor e = MakeProjectEditor();
+        e.LoadText("Settings scratchword");
+        e.curCol = 10; // 光标在 "scratchword" 的 "s" 之后，前缀是 "s"
+        e.UpdateCompletion();
+        EqTrue("word popup opened", e.acActive);
+        int iType = IndexOf(e.acItems, "Settings");
+        int iWord = IndexOf(e.acItems, "scratchword");
+        EqTrue("project type matched prefix", iType >= 0);
+        EqTrue("bare word matched prefix", iWord >= 0);
+        EqTrue("bare word sinks below project symbol",
+            iType >= 0 && iWord >= 0 && iType < iWord);
+    }
+
+    // ④ 语义(LSP)候选同样按种类分层：局部变量 > 类型 > 关键字。
+    static void TestSemanticKindOrder() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "lsp.zan";
+        e.LoadText("x");
+        e.curCol = 0;
+        e.externalCompletion = (string path, int line, int col) => {
+            List<CodeCompletionItem> items = new List<CodeCompletionItem>();
+            items.Add(new CodeCompletionItem("for", "K", "", ""));
+            items.Add(new CodeCompletionItem("Widget", "T", "", ""));
+            items.Add(new CodeCompletionItem("localCount", "V", "", ""));
+            return items;
+        };
+        e.ForceCompletion();
+        EqTrue("semantic popup opened", e.acActive);
+        int iVar = IndexOf(e.acItems, "localCount");
+        int iType = IndexOf(e.acItems, "Widget");
+        int iKeyword = IndexOf(e.acItems, "for");
+        EqTrue("semantic variable listed", iVar >= 0);
+        EqTrue("semantic type listed", iType >= 0);
+        EqTrue("semantic keyword listed", iKeyword >= 0);
+        EqTrue("semantic variable before type", iVar >= 0 && iType >= 0 && iVar < iType);
+        EqTrue("semantic type before keyword", iType >= 0 && iKeyword >= 0 && iType < iKeyword);
+    }
+
+    static void Main() {
+        fails = 0;
+        TestKindWeight();
+        TestProjectSymbolsLead();
+        TestBareWordsSink();
+        TestSemanticKindOrder();
+        if (fails == 0) { Console.WriteLine("COMPLORDER PASS"); return; }
+        Console.WriteLine("COMPLORDER FAIL " + Convert.ToString(fails));
+        Environment.Exit(1);
+    }
+}
