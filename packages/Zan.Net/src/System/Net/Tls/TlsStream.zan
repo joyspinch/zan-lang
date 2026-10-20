@@ -272,6 +272,31 @@ public class TlsStream : IDisposable {
 
     // 接收解密后的应用字节（最多 max）。正常关闭或出错时返回空串。
     async string RecvAsync(int max) {
+        return await this.RecvAppDataAsync(max);
+    }
+
+    // 带总时限的接收：整个读取过程共享一个绝对截止时间（不按块续期）。
+    // 上游永久挂起时截止时间一到，HttpDeadline 清扫器会挂断套接字，
+    // 阻塞中的读被唤醒成 0 字节，读取循环自然结束并返回空串——
+    // 调用方不会因对端沉默而永远等下去。
+    // timeoutMs <= 0 表示不设时限，等价于无超时重载。
+    public async string RecvAsync(int max, int timeoutMs) {
+        if (timeoutMs <= 0) { return await this.RecvAsync(max); }
+        if (!this.open || this.engine == null || max <= 0) { return ""; }
+        // 武装令牌复用 this.watch：Close() 里的 Disarm 因此仍能兜住
+        // 读协程被异常展开、来不及走 finally 的情况。
+        this.watch = HttpDeadline.Arm(this.sock, timeoutMs);
+        try {
+            return await this.RecvAppDataAsync(max);
+        } finally {
+            HttpDeadline.Disarm(this.watch);
+            this.watch = null;
+        }
+    }
+
+    // 读取解密后的应用字节直到有数据或连接结束。
+    // 有无超时两个重载共用这一份循环，避免两条路径在语义上分叉。
+    async string RecvAppDataAsync(int max) {
         if (!this.open || this.engine == null || max <= 0) { return ""; }
         int want = max;
         if (want > SCRATCH) { want = SCRATCH; }
