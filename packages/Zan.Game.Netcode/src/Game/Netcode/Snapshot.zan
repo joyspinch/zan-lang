@@ -1,0 +1,143 @@
+using System;
+
+namespace Game.Netcode;
+
+// 快照：某一逻辑帧**执行前**的世界状态（不透明字节）+ 帧号 + 校验和。
+//
+// **快照存的是字节而不是字段**：回滚层不该知道游戏的状态长什么样
+// （实体位置？血量？棋盘？）。游戏自己把状态编码成字节（Capture），
+// 回滚层只负责按帧号存取、算校验和、恢复（Restore）。这样 rollback
+// 机制能服务任何游戏，而不需要为每个游戏写一份快照代码。
+//
+// **代价**：状态字节数必须**恒定**（Capture 的输出长度每次一样）——
+// 环形缓冲按固定槽位分配就是这个前提。状态大小会变的游戏（背包格数
+// 随进度增长）需要自己把"变化部分"归一化，或者用变长编码 + 单独的
+// 长度表。
+//
+// **并发**：非线程安全，回滚会话在主循环里推进。
+public class Snapshot {
+    // 帧号（-1 = 空槽）。
+    public int frameIndex;
+    // 状态字节。
+    public byte[] data;
+    // 状态字节数。
+    public int dataLength;
+    // 校验和。
+    public int checksum;
+    // 该槽位是否有效。
+    public bool valid;
+
+    public Snapshot() {
+        this.frameIndex = -1;
+        this.data = null;
+        this.dataLength = 0;
+        this.checksum = 0;
+        this.valid = false;
+    }
+}
+
+// 快照环形缓冲：按帧号存取最近 N 帧的状态。
+//
+// **环形而不是队列**：rollback 需要**随机访问**任意历史帧（回滚到第
+// F 帧就要取第 F 帧的快照），队列只能顺序弹出。环形缓冲按
+// `frameIndex % capacity` 定位，槽位里存帧号做校验——帧号不匹配说明
+// 该槽已被更新的帧覆盖了，返回空而不是给你一份错的快照。
+//
+// **零稳态分配**：槽位与字节数组都在构造时一次性分配好，存快照只做
+// 字节拷贝，回滚热路径不产生垃圾。
+public class SnapshotBuffer {
+    // 帧号（-1 = 空）。
+    private int[] frames;
+    // 每槽的状态字节。
+    private byte[][] slots;
+    // 每槽的有效长度。
+    private int[] lengths;
+    // 每槽的校验和。
+    private int[] checksums;
+    // 每槽是否有效。
+    private bool[] valid;
+    // 容量。
+    private int capacity;
+    // 单帧状态字节数。
+    private int stateSize;
+
+    // capacity：保留多少帧；stateSize：单帧状态字节数。
+    public SnapshotBuffer(int capacity, int stateSize) {
+        int cap = capacity > 1 ? capacity : 2;
+        int size = stateSize > 0 ? stateSize : 1;
+        this.capacity = cap;
+        this.stateSize = size;
+        this.frames = new int[cap];
+        this.slots = new byte[cap][];
+        this.lengths = new int[cap];
+        this.checksums = new int[cap];
+        this.valid = new bool[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            this.frames[i] = -1;
+            this.slots[i] = new byte[size];
+            this.lengths[i] = 0;
+            this.checksums[i] = 0;
+            this.valid[i] = false;
+        }
+    }
+
+    // 容量（保留帧数）。
+    public int Capacity() { return this.capacity; }
+
+    // 单帧状态字节数。
+    public int StateSize() { return this.stateSize; }
+
+    // 存一份快照（拷贝 stateSize 字节）。
+    public void Store(int frameIndex, byte[] data) {
+        if (frameIndex < 0 || data == null) { return; }
+        int slot = frameIndex % this.capacity;
+        byte[] dst = this.slots[slot];
+        int n = this.stateSize < data.Length ? this.stateSize : data.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            dst[i] = data[i];
+        }
+        this.lengths[slot] = n;
+        this.checksums[slot] = Checksum.Of(dst, n);
+        this.frames[slot] = frameIndex;
+        this.valid[slot] = true;
+    }
+
+    // 该帧的快照是否还在（没被更晚的帧覆盖）。
+    public bool Has(int frameIndex) {
+        if (frameIndex < 0) { return false; }
+        int slot = frameIndex % this.capacity;
+        return this.valid[slot] && this.frames[slot] == frameIndex;
+    }
+
+    // 该帧快照的校验和（不在则返回 -1）。
+    public int ChecksumOf(int frameIndex) {
+        if (!this.Has(frameIndex)) { return -1; }
+        return this.checksums[frameIndex % this.capacity];
+    }
+
+    // 把该帧的快照拷进 dest（dest 长度需 >= StateSize()）。
+    //
+    // 返回 false 表示该帧已被覆盖——调用方必须据此中止回滚（拿一份
+    // 别的帧的状态去恢复，会把世界改成另一个样子，比不回滚更糟）。
+    public bool CopyInto(int frameIndex, byte[] dest) {
+        if (!this.Has(frameIndex) || dest == null) { return false; }
+        int slot = frameIndex % this.capacity;
+        byte[] src = this.slots[slot];
+        int n = this.lengths[slot];
+        if (n > dest.Length) { n = dest.Length; }
+        for (int i = 0; i < n; i = i + 1) {
+            dest[i] = src[i];
+        }
+        return true;
+    }
+
+    // 清空。
+    public void Clear() {
+        for (int i = 0; i < this.capacity; i = i + 1) {
+            this.frames[i] = -1;
+            this.lengths[i] = 0;
+            this.checksums[i] = 0;
+            this.valid[i] = false;
+        }
+    }
+}

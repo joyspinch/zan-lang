@@ -1,0 +1,305 @@
+using System;
+using Game.Netcode;
+
+// 测试用世界：两个位置 + 血量 + 步数，全部用定点整数（跨平台确定）。
+//
+// 状态用 4 个 int = 16 字节，**长度恒定**——这是回滚快照的前提
+// （环形槽位按固定字节数分配）。
+public class TestWorld {
+    public int localX;
+    public int remoteX;
+    public int hp;
+    public int steps;
+
+    public TestWorld() {
+        this.localX = 0;
+        this.remoteX = 0;
+        this.hp = 100;
+        this.steps = 0;
+    }
+
+    // 本帧输入：inputs[0] = 本地，inputs[1] = 远端。
+    public void Step(int frame, int[] inputs) {
+        this.localX = this.localX + inputs[0];
+        this.remoteX = this.remoteX + inputs[1];
+        this.steps = this.steps + 1;
+    }
+
+    public int Size() { return 16; }
+
+    public void Capture(byte[] buf) {
+        NetcodeTests.WriteInt(buf, 0, this.localX);
+        NetcodeTests.WriteInt(buf, 4, this.remoteX);
+        NetcodeTests.WriteInt(buf, 8, this.hp);
+        NetcodeTests.WriteInt(buf, 12, this.steps);
+    }
+
+    public void Restore(byte[] buf) {
+        this.localX = NetcodeTests.ReadInt(buf, 0);
+        this.remoteX = NetcodeTests.ReadInt(buf, 4);
+        this.hp = NetcodeTests.ReadInt(buf, 8);
+        this.steps = NetcodeTests.ReadInt(buf, 12);
+    }
+}
+
+// 回滚 / 快照同步 / 延迟补偿的契约测试。
+//
+// 覆盖的判定点：
+//   - 校验和：确定性、字节敏感、空输入；
+//   - 快照缓冲：存取、帧号校验、覆盖后旧帧不可用、越界取回失败；
+//   - 输入帧：权威值只接受一次、确认状态、预测标记；
+//   - 回滚会话：预测推进、远端输入到达后回滚重放、重放结果与权威一致、
+//     预测错计数、快照被覆盖时回滚失败并明说、提前到达的输入不算预测错；
+//   - 分叉检测：校验和不符计一次 desync；
+//   - 延迟补偿：位置历史存取、回溯帧钳制、回溯取位置。
+//
+// golden 只锁定"全过"那行。
+public class NetcodeTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 定长整数编码（4 字节小端）。
+    public static void WriteInt(byte[] buf, int off, int v) {
+        buf[off] = (byte)(v & 255);
+        buf[off + 1] = (byte)((v >> 8) & 255);
+        buf[off + 2] = (byte)((v >> 16) & 255);
+        buf[off + 3] = (byte)((v >> 24) & 255);
+    }
+
+    public static int ReadInt(byte[] buf, int off) {
+        int a = (int)(buf[off] & 255);
+        int b = (int)(buf[off + 1] & 255);
+        int c = (int)(buf[off + 2] & 255);
+        int d = (int)(buf[off + 3] & 255);
+        return a + (b << 8) + (c << 16) + (d << 24);
+    }
+
+    /* ---------- 校验和 ---------- */
+
+    private static void TestChecksum() {
+        byte[] a = new byte[4];
+        byte[] b = new byte[4];
+        NetcodeTests.WriteInt(a, 0, 1234);
+        NetcodeTests.WriteInt(b, 0, 1234);
+        NetcodeTests.WriteInt(b, 0, 1235);
+
+        int ca = Checksum.Of(a);
+        int cb = Checksum.Of(b);
+        Check("checksum-deterministic", Checksum.Of(a) == ca);
+        Check("checksum-byte-sensitive", ca != cb);
+        Check("checksum-nonneg", ca >= 0);
+        CheckEq("checksum-empty", Checksum.Of(null, 0), 0L);
+        Check("checksum-combine-deterministic",
+              Checksum.Combine(ca, cb) == Checksum.Combine(ca, cb));
+    }
+
+    /* ---------- 快照缓冲 ---------- */
+
+    private static void TestSnapshotBuffer() {
+        SnapshotBuffer buf = new SnapshotBuffer(4, 8);
+        byte[] data = new byte[8];
+        NetcodeTests.WriteInt(data, 0, 42);
+        buf.Store(0, data);
+        Check("snap-has", buf.Has(0));
+        CheckEq("snap-checksum-nonneg", buf.ChecksumOf(0), Checksum.Of(data));
+
+        byte[] outBuf = new byte[8];
+        Check("snap-copy", buf.CopyInto(0, outBuf));
+        CheckEq("snap-copy-value", NetcodeTests.ReadInt(outBuf, 0), 42L);
+
+        // 覆盖：帧 4 占用帧 0 的槽位
+        buf.Store(4, data);
+        Check("snap-old-overwritten", !buf.Has(0));
+        Check("snap-new-present", buf.Has(4));
+        Check("snap-copy-overwritten-fails", !buf.CopyInto(0, outBuf));
+
+        // 帧号不匹配的槽位不算有效
+        Check("snap-missing-frame", !buf.Has(2));
+        CheckEq("snap-missing-checksum", buf.ChecksumOf(2), -1L);
+    }
+
+    /* ---------- 输入帧 ---------- */
+
+    private static void TestInputFrame() {
+        InputFrame f = new InputFrame(3, 2);
+        Check("input-not-confirmed", !f.confirmed);
+        Check("input-has-prediction", f.HasPrediction());
+        Check("input-set-first", f.SetAuthoritative(0, 5));
+        Check("input-set-dup", !f.SetAuthoritative(0, 6));
+        CheckEq("input-value", f.InputOf(0), 5L);
+        Check("input-still-prediction", f.HasPrediction());
+        Check("input-set-second", f.SetAuthoritative(1, 7));
+        Check("input-confirmed", f.confirmed);
+        Check("input-no-prediction", !f.HasPrediction());
+
+        // 预测值不覆盖权威值
+        f.SetPredicted(0, 99);
+        CheckEq("input-predicted-no-clobber", f.InputOf(0), 5L);
+    }
+
+    /* ---------- 回滚会话 ---------- */
+
+    private static void TestRollback() {
+        TestWorld world = new TestWorld();
+        RollbackSession session = new RollbackSession(2, 16,
+            () => world.Size(),
+            (byte[] buf) => { world.Capture(buf); },
+            (byte[] buf) => { world.Restore(buf); },
+            (int frame, int[] inputs) => { world.Step(frame, inputs); });
+
+        CheckEq("rb-frame-before-start", session.CurrentFrame(), -1L);
+
+        // 两帧都用预测的远端输入 0 推进
+        session.Advance(5);
+        session.Advance(3);
+        CheckEq("rb-frame-after-2", session.CurrentFrame(), 1L);
+        CheckEq("rb-local-x", world.localX, 8L);
+        CheckEq("rb-remote-x-predicted", world.remoteX, 0L);
+        Check("rb-needs-resim", !session.NeedsResimulation());
+
+        // 远端 frame 0 的真值到了：与预测不同 → 预测错，要回滚
+        Check("rb-submit-remote", session.SubmitRemoteInput(0, 1, 7));
+        CheckEq("rb-mispredictions", session.MispredictionCount(), 1L);
+        Check("rb-needs-resim-now", session.NeedsResimulation());
+        CheckEq("rb-pending-frame", session.PendingResimFrame(), 0L);
+
+        // 回滚重放：frame 0 用真值 7；frame 1 的远端输入仍未到，
+        // 预测基线取"该帧之前最近的权威输入"= frame 0 的 7 → 7 + 7 = 14
+        int replayed = session.Resimulate();
+        CheckEq("rb-replayed-frames", replayed, 2L);
+        CheckEq("rb-local-x-after-resim", world.localX, 8L);
+        CheckEq("rb-remote-x-after-resim", world.remoteX, 14L);
+        Check("rb-no-resim-needed", !session.NeedsResimulation());
+        CheckEq("rb-mispredictions-after", session.MispredictionCount(), 1L);
+
+        // 重复提交同一帧同一玩家的输入不算数
+        Check("rb-duplicate-submit", !session.SubmitRemoteInput(0, 1, 7));
+
+        // 远端提前到达（帧还没开始）→ 不算预测错
+        RollbackSession s2 = new RollbackSession(2, 16,
+            () => world.Size(),
+            (byte[] buf) => { world.Capture(buf); },
+            (byte[] buf) => { world.Restore(buf); },
+            (int frame, int[] inputs) => { world.Step(frame, inputs); });
+        Check("rb-early-submit", s2.SubmitRemoteInput(3, 1, 11));
+        CheckEq("rb-early-no-misprediction", s2.MispredictionCount(), 0L);
+        Check("rb-early-no-resim", !s2.NeedsResimulation());
+        // 推进到那一帧时直接用真值（不再是预测）
+        s2.Advance(1);
+        s2.Advance(1);
+        s2.Advance(1);
+        s2.Advance(1);
+        Check("rb-early-authoritative", s2.IsAuthoritative(3, 1));
+        CheckEq("rb-early-input-value", s2.InputOf(3, 1), 11L);
+    }
+
+    private static void TestRollbackFailsWhenSnapshotLost() {
+        TestWorld world = new TestWorld();
+        // 容量 4：推进 10 帧后，最早的快照已被覆盖
+        RollbackSession session = new RollbackSession(2, 4,
+            () => world.Size(),
+            (byte[] buf) => { world.Capture(buf); },
+            (byte[] buf) => { world.Restore(buf); },
+            (int frame, int[] inputs) => { world.Step(frame, inputs); });
+        for (int i = 0; i < 10; i = i + 1) {
+            session.Advance(1);
+        }
+        // 迟到的远端输入指向一个已被覆盖的帧 → 回滚必须明说失败
+        session.SubmitRemoteInput(0, 1, 9);
+        Check("rb-lost-needs-resim", session.NeedsResimulation());
+        CheckEq("rb-lost-resim-fails", session.Resimulate(), -1L);
+    }
+
+    private static void TestDesyncDetection() {
+        TestWorld world = new TestWorld();
+        RollbackSession session = new RollbackSession(2, 16,
+            () => world.Size(),
+            (byte[] buf) => { world.Capture(buf); },
+            (byte[] buf) => { world.Restore(buf); },
+            (int frame, int[] inputs) => { world.Step(frame, inputs); });
+        session.Advance(4);
+        int mine = session.ChecksumOf(0);
+        Check("desync-known-frame", mine >= 0);
+        Check("desync-match", session.VerifyChecksum(0, mine));
+        CheckEq("desync-count-clean", session.DesyncCount(), 0L);
+        Check("desync-mismatch", !session.VerifyChecksum(0, mine + 1));
+        CheckEq("desync-count", session.DesyncCount(), 1L);
+        // 未知帧不能核对
+        Check("desync-unknown-frame", !session.VerifyChecksum(999, mine));
+    }
+
+    /* ---------- 延迟补偿 ---------- */
+
+    private static void TestLagCompensation() {
+        PositionHistory history = new PositionHistory(8, 16);
+        for (int f = 100; f < 106; f = f + 1) {
+            history.Capture(f, 7, f * 1.0, f * 2.0);
+        }
+        CheckEq("lag-oldest", history.OldestFrame(), 100L);
+        CheckEq("lag-newest", history.NewestFrame(), 105L);
+        CheckEq("lag-entity-count", history.EntityCountAt(103), 1L);
+
+        NetPoint p = new NetPoint();
+        Check("lag-lookup", history.Lookup(103, 7, p));
+        CheckEq("lag-lookup-x", (long)p.x, 103L);
+        CheckEq("lag-lookup-y", (long)p.y, 206L);
+        Check("lag-lookup-missing-entity", !history.Lookup(103, 9, p));
+        Check("lag-lookup-missing-frame", !history.Lookup(99, 7, p));
+
+        // 同一帧同实体重复记录 = 更新位置
+        history.Capture(103, 7, 999.0, 888.0);
+        Check("lag-update", history.Lookup(103, 7, p));
+        CheckEq("lag-update-x", (long)p.x, 999L);
+
+        LagCompensation comp = new LagCompensation(history, 10);
+        // 客户端帧比服务器当前帧更晚 → 钳到服务器当前帧
+        CheckEq("lag-clamp-future", comp.ResolveRewindFrame(200, 105), 105L);
+        // 太早 → 钳到回溯窗口边缘
+        CheckEq("lag-clamp-window", comp.ResolveRewindFrame(10, 105), 95L);
+        // 窗口内 → 原样
+        CheckEq("lag-inside-window", comp.ResolveRewindFrame(100, 105), 100L);
+        Check("lag-rewindable", comp.IsRewindable(103));
+        Check("lag-not-rewindable", !comp.IsRewindable(50));
+
+        NetPoint q = new NetPoint();
+        Check("lag-rewind", comp.Rewind(103, 7, q));
+        CheckEq("lag-rewind-x", (long)q.x, 999L);
+        Check("lag-rewind-miss", !comp.Rewind(103, 42, q));
+    }
+
+    public static void Run() {
+        TestChecksum();
+        TestSnapshotBuffer();
+        TestInputFrame();
+        TestRollback();
+        TestRollbackFailsWhenSnapshotLost();
+        TestDesyncDetection();
+        TestLagCompensation();
+
+        if (failures > 0) {
+            Console.WriteLine("NETCODE TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL NETCODE TESTS PASSED");
+        }
+    }
+}
+
+public class NetcodeTestsMain {
+    public static void Main() {
+        NetcodeTests.Run();
+    }
+}

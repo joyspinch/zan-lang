@@ -1,0 +1,57 @@
+using System;
+
+namespace Game.Netcode;
+
+// 确定性校验和（FNV-1a 32 位）。
+//
+// **它是干什么的**：rollback / 快照同步里，两端各自跑同一条逻辑帧，
+// 跑着跑着可能因为某个浮点运算、某个容器遍历顺序而分叉。分叉了要能
+// **发现**，否则玩家看到的是"我这边好好的，他那边人穿墙了"。
+// 做法是：每帧算一次状态校验和，双方比对；不一致就说明已经分叉。
+//
+// **为什么不用哈希表**：哈希表的迭代顺序不保证（键类型不同、插入顺序
+// 不同都会变），拿它算校验和 = 每次结果可能不同 = 永远在报"分叉"。
+// FNV-1a 是纯字节运算，任何平台上同样的字节得到同样的值。
+//
+// **为什么截到 31 位**：int 是 32 位有符号数，校验和落到最高位时在不同
+// 平台上比较/打印的呈现不同。截到 31 位换来一个非负、可直接打印、
+// 可按字典序比较的值——检测分叉不需要区分 0x7FFFFFFF 和 0xFFFFFFFF。
+public class Checksum {
+    // FNV-1a 偏移基（32 位）。
+    private static long Offset() { return 2166136261L; }
+
+    // FNV-1a 质数（32 位）。
+    private static long Prime() { return 16777619L; }
+
+    // 32 位掩码。
+    private static long Mask() { return 4294967295L; }
+
+    // 字节序列的校验和（返回 0..2^31-1 的非负值）。
+    //
+    // data 为 null 或 length <= 0 时返回 0——空状态是合法的起始状态，
+    // 不能因为它抛异常。
+    public static int Of(byte[] data, int length) {
+        if (data == null || length <= 0) { return 0; }
+        long h = Checksum.Offset();
+        int n = length < data.Length ? length : data.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            long b = (long)(data[i] & 255);
+            h = (h ^ b) & Checksum.Mask();
+            h = (h * Checksum.Prime()) & Checksum.Mask();
+        }
+        return (int)(h & 2147483647L);
+    }
+
+    // 整个字节数组的校验和。
+    public static int Of(byte[] data) {
+        if (data == null) { return 0; }
+        return Checksum.Of(data, data.Length);
+    }
+
+    // 合并两个校验和（用于"状态 + 附加信息"的组合校验）。
+    public static int Combine(int a, int b) {
+        long h = ((long)a & Checksum.Mask()) ^ (((long)b & Checksum.Mask()) * Checksum.Prime());
+        h = h & Checksum.Mask();
+        return (int)(h & 2147483647L);
+    }
+}

@@ -1,0 +1,203 @@
+using System;
+
+namespace Game.Netcode;
+
+// 一个二维位置（延迟补偿的输出载体）。
+//
+// **为什么不用返回值**：回溯查询在射击判定这类热路径上，每次调用分配
+// 一个对象会给 GC 添乱。调用方复用自己的 `NetPoint`，由回溯填进去。
+public class NetPoint {
+    public double x;
+    public double y;
+
+    public NetPoint() {
+        this.x = 0.0;
+        this.y = 0.0;
+    }
+
+    public NetPoint(double x, double y) {
+        this.x = x;
+        this.y = y;
+    }
+}
+
+// 位置历史：按帧号记录各实体的位置（服务器侧用）。
+//
+// **它回答什么问题**：客户端在 T 时刻开的枪，子弹到达服务器时是
+// T + 延迟。那时目标的真实位置已经变了——但客户端瞄准的是**它当时
+// 看到的位置**。服务器要判"这一枪打中了吗"，就必须回到客户端看到
+// 那一刻的世界去判定，这就是延迟补偿。
+//
+// **按帧存而不是按实体存**：回溯是"回到某一帧，问某个实体在哪"，
+// 按帧组织正好对上这个问法；按实体存则要先知道帧号再散着找。
+//
+// **环形缓冲**：只保留最近 N 帧——回溯窗口本来就有限（见
+// `LagCompensation.maxRewindFrames`），更早的帧没有意义。
+public class PositionHistory {
+    // 每槽的帧号（-1 = 空）。
+    private int[] frames;
+    // 每槽的实体 id。
+    private int[][] entityIds;
+    // 每槽的 x。
+    private double[][] xs;
+    // 每槽的 y。
+    private double[][] ys;
+    // 每槽记录了几个实体。
+    private int[] counts;
+    // 容量（保留帧数）。
+    private int capacity;
+    // 单帧最多记多少实体。
+    private int maxEntities;
+
+    public PositionHistory(int capacity, int maxEntities) {
+        int cap = capacity > 1 ? capacity : 2;
+        int ents = maxEntities > 0 ? maxEntities : 1;
+        this.capacity = cap;
+        this.maxEntities = ents;
+        this.frames = new int[cap];
+        this.entityIds = new int[cap][];
+        this.xs = new double[cap][];
+        this.ys = new double[cap][];
+        this.counts = new int[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            this.frames[i] = -1;
+            this.entityIds[i] = new int[ents];
+            this.xs[i] = new double[ents];
+            this.ys[i] = new double[ents];
+            this.counts[i] = 0;
+        }
+    }
+
+    // 容量（保留帧数）。
+    public int Capacity() { return this.capacity; }
+
+    // 记录一个实体在某帧的位置（同帧同实体重复记录 = 更新位置）。
+    public void Capture(int frameIndex, int entityId, double x, double y) {
+        if (frameIndex < 0) { return; }
+        int slot = frameIndex % this.capacity;
+        if (this.frames[slot] != frameIndex) {
+            // 新帧占用该槽：清空旧记录。
+            this.frames[slot] = frameIndex;
+            this.counts[slot] = 0;
+        }
+        int n = this.counts[slot];
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.entityIds[slot][i] == entityId) {
+                this.xs[slot][i] = x;
+                this.ys[slot][i] = y;
+                return;
+            }
+        }
+        if (n >= this.maxEntities) { return; }
+        this.entityIds[slot][n] = entityId;
+        this.xs[slot][n] = x;
+        this.ys[slot][n] = y;
+        this.counts[slot] = n + 1;
+    }
+
+    // 查询某帧某实体的位置。找到返回 true 并填进 outPos；没有返回 false。
+    public bool Lookup(int frameIndex, int entityId, NetPoint outPos) {
+        if (frameIndex < 0 || outPos == null) { return false; }
+        int slot = frameIndex % this.capacity;
+        if (this.frames[slot] != frameIndex) { return false; }
+        int n = this.counts[slot];
+        for (int i = 0; i < n; i = i + 1) {
+            if (this.entityIds[slot][i] == entityId) {
+                outPos.x = this.xs[slot][i];
+                outPos.y = this.ys[slot][i];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 该帧记录了几个实体。
+    public int EntityCountAt(int frameIndex) {
+        if (frameIndex < 0) { return 0; }
+        int slot = frameIndex % this.capacity;
+        if (this.frames[slot] != frameIndex) { return 0; }
+        return this.counts[slot];
+    }
+
+    // 缓冲区里最旧的一帧（-1 = 空）。
+    public int OldestFrame() {
+        int oldest = -1;
+        for (int i = 0; i < this.capacity; i = i + 1) {
+            if (this.frames[i] < 0) { continue; }
+            if (oldest < 0 || this.frames[i] < oldest) { oldest = this.frames[i]; }
+        }
+        return oldest;
+    }
+
+    // 缓冲区里最新的一帧（-1 = 空）。
+    public int NewestFrame() {
+        int newest = -1;
+        for (int i = 0; i < this.capacity; i = i + 1) {
+            if (this.frames[i] < 0) { continue; }
+            if (this.frames[i] > newest) { newest = this.frames[i]; }
+        }
+        return newest;
+    }
+
+    // 清空。
+    public void Clear() {
+        for (int i = 0; i < this.capacity; i = i + 1) {
+            this.frames[i] = -1;
+            this.counts[i] = 0;
+        }
+    }
+}
+
+// 延迟补偿器：决定回溯到哪一帧，并取出那一帧的位置。
+//
+// **两条硬取舍**：
+//
+// 1. **回溯窗口有上限**：`maxRewindFrames` 限制最多往回看多少帧。
+//    不限制的话，一个延迟 10 秒的客户端可以让服务器回到 10 秒前判定
+//    命中——那时的世界早就不是现在的世界了（技能已经放完、门已经关）。
+//    窗口外的请求一律钳到窗口边缘，并让调用方知道（返回的帧号可比较）。
+// 2. **只回溯、不改写历史**：补偿是**判定时**的一次查询，不修改服务器
+//    世界的当前状态。改写历史会让"回溯过的判定"污染后续帧。
+public class LagCompensation {
+    // 位置历史。
+    private PositionHistory history;
+    // 最多回溯多少帧。
+    public int maxRewindFrames;
+
+    public LagCompensation(PositionHistory history, int maxRewindFrames) {
+        this.history = history;
+        this.maxRewindFrames = maxRewindFrames > 0 ? maxRewindFrames : 1;
+    }
+
+    // 位置历史。
+    public PositionHistory History() { return this.history; }
+
+    // 解析应该回溯到哪一帧。
+    //
+    // clientFrame：客户端声称的射击帧；serverFrame：服务器当前帧。
+    //
+    // 规则：不能超过服务器当前帧（未来的帧没有历史），也不能早于回溯
+    // 窗口边缘（太老的帧不在缓冲里，强行回溯等于乱判）。
+    public int ResolveRewindFrame(int clientFrame, int serverFrame) {
+        int target = clientFrame;
+        if (target > serverFrame) { target = serverFrame; }
+        int floorFrame = serverFrame - this.maxRewindFrames;
+        if (target < floorFrame) { target = floorFrame; }
+        if (target < 0) { target = 0; }
+        return target;
+    }
+
+    // 某帧是否还在位置历史里（还在才可能回溯）。
+    public bool IsRewindable(int frameIndex) {
+        if (this.history == null) { return false; }
+        if (frameIndex < this.history.OldestFrame()) { return false; }
+        if (frameIndex > this.history.NewestFrame()) { return false; }
+        return true;
+    }
+
+    // 回溯取位置：查不到返回 false（调用方按"打空"处理，不做补偿）。
+    public bool Rewind(int frameIndex, int entityId, NetPoint outPos) {
+        if (this.history == null) { return false; }
+        return this.history.Lookup(frameIndex, entityId, outPos);
+    }
+}

@@ -134,6 +134,13 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **lambda 一半返回 null 时**：先把局部变量按显式类型声明好再返回
   （`ValidationResult outp = null; ... return outp;`）——`return null;` 与
   `return value;` 并列时，返回类型推断可能挑中 null 那支。
+* **lambda 可以隐式转成自定义委托，且能捕获闭包**（实证，2026-10-23）：
+  自声明 `public delegate void CaptureFn(byte[] buf);` 之后，
+  `(byte[] buf) => { world.Capture(buf); }` 可以直接当参数传，**带花括号
+  的块体也支持**（不只是单表达式 `x => x`），闭包捕获局部对象同样成立。
+  所以"把游戏逻辑以回调方式交给库"不需要绕开委托去写静态单例——
+  委托 + 闭包就能把状态带进去（静态字段持有 rc 对象会在退出期泄漏，
+  闭包是局部变量、随会话一起释放）。
 * **链式调用上的空安全会被拦**：`result.FirstFailure().property` 报
   "'FirstFailure' can return null; accessing 'property' …"。先存进局部变量判空
   再用（`?.` 亦可）。

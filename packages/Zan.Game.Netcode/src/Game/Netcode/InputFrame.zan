@@ -1,0 +1,136 @@
+using System;
+
+namespace Game.Netcode;
+
+// 一帧的输入：每个玩家本帧的输入值 + 该值是**权威**还是**预测**。
+//
+// **为什么要标权威/预测**：rollback 的全部麻烦都来自"本地已经跑了，
+// 远端输入还没到"。没到时只能预测（沿用上一次输入），到了之后才知道
+// 猜对没有。两种输入混在一起就分不清"这一帧要不要回滚"。
+//
+// **预测值不写进 authoritative**：预测值可以被远端的真值推翻；权威值
+// 到了就是最终结果。
+public class InputFrame {
+    // 帧号。
+    public int frameIndex;
+    // 每个玩家本帧的输入（长度 = 玩家数）。
+    public int[] inputs;
+    // 每个玩家的输入是否已收到权威值。
+    public bool[] authoritative;
+    // 本帧是否全部输入都已确认。
+    public bool confirmed;
+
+    public InputFrame(int frameIndex, int playerCount) {
+        int n = playerCount > 0 ? playerCount : 1;
+        this.frameIndex = frameIndex;
+        this.inputs = new int[n];
+        this.authoritative = new bool[n];
+        this.confirmed = false;
+    }
+
+    // 玩家数。
+    public int PlayerCount() { return this.inputs.Length; }
+
+    // 取某玩家的输入值。
+    public int InputOf(int playerId) {
+        if (playerId < 0 || playerId >= this.inputs.Length) { return 0; }
+        return this.inputs[playerId];
+    }
+
+    // 某玩家的输入是否已是权威值。
+    public bool IsAuthoritative(int playerId) {
+        if (playerId < 0 || playerId >= this.authoritative.Length) { return false; }
+        return this.authoritative[playerId];
+    }
+
+    // 设置某玩家的权威输入。返回 true 表示这是首次收到（重复提交返回
+    // false——同帧同玩家的输入只应有一个权威值）。
+    public bool SetAuthoritative(int playerId, int input) {
+        if (playerId < 0 || playerId >= this.inputs.Length) { return false; }
+        if (this.authoritative[playerId]) { return false; }
+        this.inputs[playerId] = input;
+        this.authoritative[playerId] = true;
+        this.confirmed = this.AllConfirmed();
+        return true;
+    }
+
+    // 填入预测值（不覆盖已有权威值）。
+    public void SetPredicted(int playerId, int input) {
+        if (playerId < 0 || playerId >= this.inputs.Length) { return; }
+        if (this.authoritative[playerId]) { return; }
+        this.inputs[playerId] = input;
+    }
+
+    // 是否所有玩家的输入都已是权威值。
+    public bool AllConfirmed() {
+        for (int i = 0; i < this.authoritative.Length; i = i + 1) {
+            if (!this.authoritative[i]) { return false; }
+        }
+        return true;
+    }
+
+    // 本帧是否含有预测值（含有就意味着"这一帧可能是猜的"）。
+    public bool HasPrediction() {
+        for (int i = 0; i < this.authoritative.Length; i = i + 1) {
+            if (!this.authoritative[i]) { return true; }
+        }
+        return false;
+    }
+}
+
+// 输入历史：按帧号保存最近 N 帧的输入。
+//
+// **环形 + 帧号校验**：与快照缓冲同构。要回滚到第 F 帧就得知道第 F 帧
+// 的输入（当时用的是预测还是权威），所以输入也要能随机访问。
+public class InputHistory {
+    // 环形槽位。
+    private InputFrame[] frames;
+    // 容量。
+    private int capacity;
+    // 玩家数。
+    private int playerCount;
+
+    public InputHistory(int capacity, int playerCount) {
+        int cap = capacity > 1 ? capacity : 2;
+        int players = playerCount > 0 ? playerCount : 1;
+        this.capacity = cap;
+        this.playerCount = players;
+        this.frames = new InputFrame[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            this.frames[i] = null;
+        }
+    }
+
+    // 容量。
+    public int Capacity() { return this.capacity; }
+
+    // 取该帧的输入记录；没有就新建一个（空的）。
+    public InputFrame GetOrCreate(int frameIndex) {
+        if (frameIndex < 0) { return null; }
+        int slot = frameIndex % this.capacity;
+        InputFrame f = this.frames[slot];
+        if (f != null && f.frameIndex == frameIndex) { return f; }
+        InputFrame fresh = new InputFrame(frameIndex, this.playerCount);
+        this.frames[slot] = fresh;
+        return fresh;
+    }
+
+    // 取该帧的输入记录；没有（或已被覆盖）返回 null。
+    public InputFrame Get(int frameIndex) {
+        if (frameIndex < 0) { return null; }
+        int slot = frameIndex % this.capacity;
+        InputFrame f = this.frames[slot];
+        if (f == null || f.frameIndex != frameIndex) { return null; }
+        return f;
+    }
+
+    // 该帧的输入记录是否还在。
+    public bool Has(int frameIndex) { return this.Get(frameIndex) != null; }
+
+    // 清空。
+    public void Clear() {
+        for (int i = 0; i < this.capacity; i = i + 1) {
+            this.frames[i] = null;
+        }
+    }
+}

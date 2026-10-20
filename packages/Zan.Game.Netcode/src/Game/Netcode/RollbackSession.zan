@@ -1,0 +1,323 @@
+using System;
+
+namespace Game.Netcode;
+
+// 状态字节数回调：游戏状态编码成多少字节。
+public delegate int CaptureSizeFn();
+
+// 状态捕获回调：把当前世界状态写进给定的字节缓冲。
+public delegate void CaptureFn(byte[] buf);
+
+// 状态恢复回调：按字节缓冲还原世界状态。
+public delegate void RestoreFn(byte[] buf);
+
+// 逻辑帧推进回调：游戏应用本帧输入，推进一帧。
+//
+// inputs 是**本帧各玩家的输入值**（长度 = 玩家数），回滚层保证里面是
+// "已确认的权威值 + 必要的预测值"。数组是会话内部持有的那一份，
+// 引擎应当**只读**——改它会污染回滚重放。
+public delegate void StepFn(int frameIndex, int[] inputs);
+
+// 回滚会话（Rollback Netcode 会话）。
+//
+// **它解决什么**：lockstep 要求所有客户端**同时**推进——任何一方网络卡顿，
+// 所有人一起等。rollback（回滚预测）让本地**不等远端**：
+//
+// 1. 本地输入立即生效，立刻推进一帧，屏幕上马上有反应；
+// 2. 远端输入还没到 → 该玩家的输入用**上一次的值预测**；
+// 3. 远端输入到了 → 如果和预测的不一样，说明从那一帧起算错了：
+//    **回滚**到那一帧的状态，**重放**到当前帧（用真实输入重算）。
+//
+// 代价是"预测错了要重算"，换来的是"本地零延迟响应"。这是格斗/射击/
+// 多人 ARPG 的标准做法（GGPO / Overwatch 的 rollback）。
+//
+// **三条硬取舍**：
+//
+// 1. **状态用不透明字节**：回滚层不知道游戏状态长什么样。游戏自己
+//    Capture / Restore，回滚层只按帧号存取 + 算校验和。代价是状态字节数
+//    必须恒定（环形槽位按固定长度分配）。
+// 2. **预测只用"沿用上次输入"**：不做方向外推、不做位置预测。简单、
+//    不会引入"预测出来的怪动作"，代价是远端输入来得越晚、猜错率越高
+//    （每次猜错都要重放）。这是可以换的策略点，但换错方向比猜错更糟。
+// 3. **回滚失败要明说**：快照或输入被环形缓冲覆盖时，返回 -1 而不是
+//    悄悄用错的状态继续跑——拿别的帧的状态恢复会把世界改成另一个样子，
+//    比不同步更难查。
+//
+// **并发**：非线程安全，回滚在主循环里推进；网络线程只负责投递输入。
+public class RollbackSession {
+    // 玩家数（含本地）。
+    private int playerCount;
+    // 本地玩家 id。
+    private int localPlayerId;
+    // 输入历史。
+    private InputHistory inputs;
+    // 快照缓冲。
+    private SnapshotBuffer snapshots;
+    // 捕获暂存（存快照前的世界状态）。
+    private byte[] scratch;
+    // 校验和暂存（帧执行后的世界状态）。
+    private byte[] checksumScratch;
+    // 回调。
+    private CaptureSizeFn sizeFn;
+    private CaptureFn captureFn;
+    private RestoreFn restoreFn;
+    private StepFn stepFn;
+    // 已推进到的帧号（-1 = 还没开始）。
+    private int currentFrame;
+    // 最早需要重放的帧（-1 = 无）。
+    private int pendingResim;
+    // 每个玩家最后一次收到的权威输入（预测用）。
+    private int[] lastKnown;
+    // 每帧执行后的状态校验和（环形）。
+    private int[] checksumValues;
+    private int[] checksumFrames;
+    private bool[] checksumValid;
+    private int checksumCapacity;
+    // 预测错的次数。
+    private int mispredictions;
+    // 检出分叉的次数。
+    private int desyncs;
+
+    // playerCount：玩家数；historyCapacity：保留多少帧历史；
+    // sizeFn / captureFn / restoreFn / stepFn：游戏侧回调。
+    public RollbackSession(int playerCount, int historyCapacity, CaptureSizeFn sizeFn,
+                           CaptureFn captureFn, RestoreFn restoreFn, StepFn stepFn) {
+        int players = playerCount > 0 ? playerCount : 1;
+        int cap = historyCapacity > 1 ? historyCapacity : 8;
+        this.playerCount = players;
+        this.localPlayerId = 0;
+        this.sizeFn = sizeFn;
+        this.captureFn = captureFn;
+        this.restoreFn = restoreFn;
+        this.stepFn = stepFn;
+        int size = 1;
+        if (sizeFn != null) {
+            size = sizeFn();
+            if (size <= 0) { size = 1; }
+        }
+        this.scratch = new byte[size];
+        this.checksumScratch = new byte[size];
+        this.inputs = new InputHistory(cap, players);
+        this.snapshots = new SnapshotBuffer(cap, size);
+        this.currentFrame = -1;
+        this.pendingResim = -1;
+        this.lastKnown = new int[players];
+        this.checksumCapacity = cap;
+        this.checksumValues = new int[cap];
+        this.checksumFrames = new int[cap];
+        this.checksumValid = new bool[cap];
+        for (int i = 0; i < cap; i = i + 1) {
+            this.checksumFrames[i] = -1;
+            this.checksumValid[i] = false;
+        }
+        this.mispredictions = 0;
+        this.desyncs = 0;
+    }
+
+    // 已推进到的帧号（-1 = 还没开始）。
+    public int CurrentFrame() { return this.currentFrame; }
+
+    // 玩家数。
+    public int PlayerCount() { return this.playerCount; }
+
+    // 预测错的次数。
+    public int MispredictionCount() { return this.mispredictions; }
+
+    // 检出分叉的次数。
+    public int DesyncCount() { return this.desyncs; }
+
+    // 某帧某玩家的输入值（帧不存在返回 0）。
+    public int InputOf(int frameIndex, int playerId) {
+        InputFrame rec = this.inputs.Get(frameIndex);
+        if (rec == null) { return 0; }
+        return rec.InputOf(playerId);
+    }
+
+    // 某帧某玩家的输入是否已是权威值。
+    public bool IsAuthoritative(int frameIndex, int playerId) {
+        InputFrame rec = this.inputs.Get(frameIndex);
+        if (rec == null) { return false; }
+        return rec.IsAuthoritative(playerId);
+    }
+
+    // 推进一帧：本地输入立即生效，远端输入用预测值补齐。
+    //
+    // 返回推进到的帧号。
+    public int Advance(int localInput) {
+        int frame = this.currentFrame + 1;
+        InputFrame rec = this.inputs.GetOrCreate(frame);
+        if (rec == null) { return this.currentFrame; }
+
+        // 本地输入立刻权威。
+        rec.SetAuthoritative(this.localPlayerId, localInput);
+        this.lastKnown[this.localPlayerId] = localInput;
+
+        // 其余玩家：已有权威值就用；没有就预测（取该帧之前最近的权威输入）。
+        for (int p = 0; p < this.playerCount; p = p + 1) {
+            if (p == this.localPlayerId) { continue; }
+            if (rec.IsAuthoritative(p)) {
+                // 该帧的权威输入（多半是提前到达的）现在进入"过去"，
+                // 后续帧的预测基线随之更新。
+                this.lastKnown[p] = rec.InputOf(p);
+                continue;
+            }
+            rec.SetPredicted(p, this.PredictInput(frame, p));
+        }
+
+        // 存本帧**执行前**的状态（回滚到这里）。
+        if (this.captureFn != null) {
+            this.captureFn(this.scratch);
+            this.snapshots.Store(frame, this.scratch);
+        }
+
+        // 推进游戏逻辑。
+        if (this.stepFn != null) {
+            this.stepFn(frame, rec.inputs);
+        }
+
+        // 记本帧执行后的状态校验和（分叉检测用）。
+        this.CaptureChecksum(frame);
+
+        this.currentFrame = frame;
+        return frame;
+    }
+
+    // 提交远端输入。
+    //
+    // - 帧还没开始（超前到达）→ 记下来，等推进到那一帧时直接用（不算预测）；
+    // - 帧已经开始（迟到的权威值）→ 若与当时用的预测值不同，则记一次
+    //   预测错，并标记需要从该帧起重放。
+    //
+    // 返回 true 表示这次提交被采纳。
+    public bool SubmitRemoteInput(int frameIndex, int playerId, int input) {
+        if (frameIndex < 0) { return false; }
+        if (playerId < 0 || playerId >= this.playerCount) { return false; }
+        if (playerId == this.localPlayerId) { return false; }
+
+        InputFrame rec = this.inputs.GetOrCreate(frameIndex);
+        if (rec == null) { return false; }
+        if (rec.IsAuthoritative(playerId)) { return false; }
+
+        bool wasPrediction = frameIndex <= this.currentFrame;
+        int old = rec.InputOf(playerId);
+        rec.SetAuthoritative(playerId, input);
+        if (wasPrediction) {
+            // 只有**过去**帧的权威值能当预测基线：提前到达的未来帧
+            // 不能用来预测更早的帧。
+            this.lastKnown[playerId] = input;
+        }
+
+        if (wasPrediction && old != input) {
+            // 猜错了：从这一帧起世界算错了，要回滚重放。
+            this.mispredictions = this.mispredictions + 1;
+            if (this.pendingResim < 0 || frameIndex < this.pendingResim) {
+                this.pendingResim = frameIndex;
+            }
+        }
+        return true;
+    }
+
+    // 是否需要回滚重放。
+    public bool NeedsResimulation() { return this.pendingResim >= 0; }
+
+    // 需要重放的起始帧（-1 = 无）。
+    public int PendingResimFrame() { return this.pendingResim; }
+
+    // 回滚重放：恢复最早被污染帧的状态，用权威输入重算到当前帧。
+    //
+    // 返回重放的帧数；0 = 没有要重放的；-1 = 回滚失败（快照或输入已被
+    // 环形缓冲覆盖），调用方需要做一次硬同步。
+    public int Resimulate() {
+        if (this.pendingResim < 0) { return 0; }
+        int start = this.pendingResim;
+
+        if (!this.snapshots.CopyInto(start, this.scratch)) {
+            // 快照没了：不能拿别的帧的状态硬恢复。
+            this.pendingResim = -1;
+            return -1;
+        }
+        if (this.restoreFn != null) {
+            this.restoreFn(this.scratch);
+        }
+
+        int replayed = 0;
+        for (int f = start; f <= this.currentFrame; f = f + 1) {
+            InputFrame rec = this.inputs.Get(f);
+            if (rec == null) {
+                // 输入记录没了：这段没法重算。
+                this.pendingResim = -1;
+                return -1;
+            }
+            // 仍未确认的玩家继续用预测值（与 Advance 的规则一致）。
+            for (int p = 0; p < this.playerCount; p = p + 1) {
+                if (p == this.localPlayerId) { continue; }
+                if (rec.IsAuthoritative(p)) { continue; }
+                rec.SetPredicted(p, this.PredictInput(f, p));
+            }
+            if (this.stepFn != null) {
+                this.stepFn(f, rec.inputs);
+            }
+            this.CaptureChecksum(f);
+            replayed = replayed + 1;
+        }
+        this.pendingResim = -1;
+        return replayed;
+    }
+
+    // 当前状态的校验和（现算）。
+    public int StateChecksum() {
+        if (this.captureFn == null) { return 0; }
+        this.captureFn(this.checksumScratch);
+        return Checksum.Of(this.checksumScratch);
+    }
+
+    // 核对某一帧的状态校验和。
+    //
+    // 与远端给的校验和不同 → 说明两端已经分叉，计一次 desync 并返回 false。
+    public bool VerifyChecksum(int frameIndex, int remoteChecksum) {
+        int mine = this.ChecksumOf(frameIndex);
+        if (mine < 0) { return false; }
+        if (mine != remoteChecksum) {
+            this.desyncs = this.desyncs + 1;
+            return false;
+        }
+        return true;
+    }
+
+    // 某帧执行后的状态校验和（不在则返回 -1）。
+    public int ChecksumOf(int frameIndex) {
+        if (frameIndex < 0) { return -1; }
+        int slot = frameIndex % this.checksumCapacity;
+        if (!this.checksumValid[slot] || this.checksumFrames[slot] != frameIndex) { return -1; }
+        return this.checksumValues[slot];
+    }
+
+    // 捕获本帧执行后的状态并记校验和。
+    private void CaptureChecksum(int frameIndex) {
+        if (this.captureFn == null) { return; }
+        this.captureFn(this.checksumScratch);
+        int slot = frameIndex % this.checksumCapacity;
+        this.checksumValues[slot] = Checksum.Of(this.checksumScratch);
+        this.checksumFrames[slot] = frameIndex;
+        this.checksumValid[slot] = true;
+    }
+
+    // 预测某帧某玩家的输入：取**该帧之前最近的权威输入**（"沿用上次输入"）。
+    //
+    // 为什么不能直接用"最近收到的那个值"：远端输入可能**提前**到达
+    // （第 5 帧的输入先到了），拿它去预测第 2 帧就是拿未来当过去——
+    // 第 2 帧真实的输入很可能和第 5 帧无关。
+    //
+    // 往前找的窗口是输入历史的容量（更早的帧已被环形缓冲覆盖）。
+    // 一帧都没有时退回 lastKnown（通常是 0）。
+    private int PredictInput(int frameIndex, int playerId) {
+        int floorFrame = frameIndex - this.inputs.Capacity();
+        if (floorFrame < 0) { floorFrame = 0; }
+        for (int f = frameIndex - 1; f >= floorFrame; f = f - 1) {
+            InputFrame rec = this.inputs.Get(f);
+            if (rec == null) { continue; }
+            if (rec.IsAuthoritative(playerId)) { return rec.InputOf(playerId); }
+        }
+        return this.lastKnown[playerId];
+    }
+}

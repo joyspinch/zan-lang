@@ -452,6 +452,46 @@ conformance `game_common`（存档往返/默认值/格式不符拒绝/损坏拒�
 （一个实例一个文件）；背包不支持装备位/权重/排序；小地图只做投影与剔除，
 绘制归渲染层；飘字只有垂直上升（横向漂移自己设 `vx`）。
 
+### 1.13 回滚网络同步：`Zan.Game.Netcode`
+
+新包 `packages/Zan.Game.Netcode`，命名空间 `Game.Netcode`。补上 `Game.Net`
+（lockstep + 回放）缺的另一半：**快照同步、rollback 预测、延迟补偿**。
+lockstep 要求所有客户端同时推进（一方卡顿全员等），rollback 让本地不等远端。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Checksum.zan` | `Checksum` | 确定性 FNV-1a 校验和（31 位非负），用于分叉检测 |
+| `Snapshot.zan` | `Snapshot` / `SnapshotBuffer` | 世界状态快照 + 按帧号存取的环形缓冲（覆盖检测） |
+| `InputFrame.zan` | `InputFrame` / `InputHistory` | 逐帧输入 + 权威/预测标记 + 环形历史 |
+| `RollbackSession.zan` | `RollbackSession` | 回滚会话：`Advance` / `SubmitRemoteInput` / `Resimulate` / `VerifyChecksum` |
+| `LagCompensation.zan` | `PositionHistory` / `LagCompensation` / `NetPoint` | 服务器侧按帧位置历史 + 回溯钳制 + 取位置 |
+
+**六条硬取舍**：
+
+1. **状态用不透明字节**：回滚层不知道游戏状态长什么样，游戏自己
+   `Capture` / `Restore` 成字节。代价是状态字节数**必须恒定**。
+2. **预测只用"沿用上次输入"**：不做方向外推——简单、不会引入"预测出来的
+   怪动作"，代价是猜错率随延迟上升。
+3. **预测基线是"该帧之前最近的权威输入"**，不是"最近收到的那个值"：远端
+   输入可能提前到达（第 5 帧先到），拿它预测第 2 帧就是拿未来当过去。
+4. **回滚失败要明说**（`Resimulate()` 返回 -1）：快照或输入被环形缓冲覆盖
+   时，拿别的帧的状态恢复会把世界改成另一个样子，比不同步更难查。
+5. **校验和用 FNV-1a 而不是哈希表**：哈希表迭代顺序不保证，拿它算校验和
+   = 永远在报"分叉"。截到 31 位避开 int 最高位的跨平台呈现差异。
+6. **延迟补偿只回溯、不改写历史**：补偿是判定时的一次查询；改写历史会让
+   "回溯过的判定"污染后续帧。回溯窗口有上限（延迟 10 秒的客户端不能让
+   服务器回到 10 秒前判命中）。
+
+conformance `netcode_rollback`（校验和确定性与字节敏感性与空输入、快照缓冲
+存取与帧号校验与覆盖后旧帧不可用与越界取回失败、输入帧权威值只接受一次与
+确认状态与预测标记、回滚会话的预测推进与回滚重放与重放结果与权威一致与
+预测错计数与快照丢失时回滚失败并明说与提前到达输入不算预测错、分叉检测、
+延迟补偿的位置历史与回溯钳制与取位置）。
+
+**已知边界**：无网络传输层（归 `Zan.Net`）；无输入延迟（input delay）；
+状态字节数必须恒定；回滚窗口 = 环形缓冲容量；延迟补偿只回溯位置，不回溯
+完整世界（技能范围等复杂判定要自行扩展历史）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -500,7 +540,7 @@ conformance `game_common`（存档往返/默认值/格式不符拒绝/损坏拒�
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | ✅ 已落地 `packages/Zan.Game.Pathfinding`（`Game.Pathfinding`：加权 A* + 跳跃点搜索 + 视线拉直 + 导航网格漏斗平滑，见 §1.7） | — |
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | ✅ 已落地 `packages/Zan.Game.Assets`（`Game.Assets`：声明式清单 + 依赖图 + 引用计数加载 + 确定性 LRU 预算淘汰 + 资源组，见 §1.9） | — |
 | `Zan.Game.Audio` | NAudio | 6,249 | ✅ 已落地 `packages/Zan.Game.Audio`（`Game.Audio`：采样缓冲 + 波形合成 + ADSR 包络 + 双二阶滤波 + 混音 + 变调 + 纯 Zan WAV 读写，见 §1.10） | — |
-| `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | 已有 lockstep + 回放 → 快照同步、rollback 预测、延迟补偿 | 4–6 周 |
+| `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | ✅ 已落地 `packages/Zan.Game.Netcode`（`Game.Netcode`：确定性校验和 + 快照环形缓冲 + 逐帧输入预测 + 回滚重放会话（含分叉检测）+ 服务器侧延迟补偿，见 §1.13）；已有 lockstep + 回放 → 二者并列（lockstep 适合 RTS 同频，rollback 适合格斗/射击跟手） | — |
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | 有 clip 播放器/纸娃娃/3D 轨 → 蒙皮、状态机混合、IK | 4–6 周 |
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
@@ -532,7 +572,7 @@ conformance `game_common`（存档往返/默认值/格式不符拒绝/损坏拒�
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
-**第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
+**第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 
