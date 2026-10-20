@@ -68,19 +68,20 @@ foreach ($k in $baseline.Keys) {
     if ($stillOver -notcontains $k) { $gone += $k }
 }
 
-# 5) spacing/size discipline: the product shell's stylesheets must not
-# sprinkle raw pixels for padding/margin/gap/radius/font-size. The single
-# source of truth is Space/Radius/WidgetSize (packages/Zan.Gui/src/Gui/
-# Styling), surfaced as CSS tokens; scripts/spacing_audit.py is the gate.
-$spacingAudit = Join-Path $PSScriptRoot "spacing_audit.py"
-if (Test-Path -LiteralPath $spacingAudit) {
+# 5) spacing/size/motion discipline: the product shell's stylesheets must
+# not sprinkle raw pixels for padding/margin/gap/radius/font-size, nor raw
+# millisecond counts for transition durations. The single source of truth
+# is Space/Radius/WidgetSize/Motion (packages/Zan.Gui/src/Gui/Styling),
+# surfaced as CSS tokens; scripts/style_audit.py is the gate.
+$styleAudit = Join-Path $PSScriptRoot "style_audit.py"
+if (Test-Path -LiteralPath $styleAudit) {
     $py = (Get-Command python -ErrorAction SilentlyContinue)
     if ($py) {
-        $auditOut = & python $spacingAudit 2>&1
+        $auditOut = & python $styleAudit 2>&1
         $auditCode = $LASTEXITCODE
-        $auditOut | ForEach-Object { Write-Output ("SPACING " + $_) }
+        $auditOut | ForEach-Object { Write-Output ("STYLE " + $_) }
         if ($auditCode -ne 0) {
-            Write-Output "STRUCTURE_FAILED spacing audit"
+            Write-Output "STRUCTURE_FAILED style audit"
             exit 1
         }
     }

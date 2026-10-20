@@ -42,7 +42,7 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
 
 ## 三条尺寸阶梯(硬规则)
 
-**唯一真源**是 `Gui/Styling/{Space,Radius,WidgetSize}.zan` 三个常量文件：
+**唯一真源**是 `Gui/Styling/{Space,Radius,WidgetSize,Motion}.zan` 四个常量文件：
 `Theme` 的默认度量从它们取值，`Style.RootFromTheme` 把同一组数导成
 `:root` 变量，皮肤可整体改值——**永远不要写死数字**。
 
@@ -82,6 +82,15 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
 **尺寸 ≠ 间距**:width/height 这类控件几何(指示器 12px、滑块点 10px、
 图片 300×220)不套间距阶梯——阶梯管的是"留白",几何管的是"形状"。
 但**留白类属性**(padding/margin/gap/border-radius)只准写令牌。
+
+**动效三档**(响应反馈的时长,`Motion`):`var(--anim-fast/medium/slow)`
+= 100/200/300ms——fast 是悬停/按下这类即时反馈,medium 是展开收起、淡入
+淡出这类状态过渡,slow 是强调性入场。皮肤写 `transition` 只准引用这三个
+令牌,不要写 `180ms`/`220ms`:各皮肤各写各的毫秒数,同一个动作在不同皮肤
+里速度不一样,手感就散了。时长是**时间不是长度**,不随 DPI/密度缩放。
+氛围/装饰性循环(`animation: glow 2600ms` 这类背景呼吸、轮播间隔)不
+受这三档约束——它的节奏由内容决定,挤进同一把尺子会丢掉"这个皮肤就是
+慢吞吞"这层性格。
 
 ## 组件排列整齐与行高间距一致性铁律（美观基本原则）
 
@@ -1293,8 +1302,9 @@ ScreenToClient 与应用鼠标坐标同帧对照,不用注入式 SetCursorPos
   像素级改动参照 `tests/conformance/conformance_gui_chart_symbol` 加离屏回归。
 - 新增内置皮肤:在 `stdlib/Gui/skins/<name>/skin.css` 建包即可自动发现
   (可选 `banner.png` 预览图)。
-- 留白(间距/圆角/字号)守门:`scripts\spacing_audit.py` 扫描
+- 留白(间距/圆角/字号)与动效时长守门:`scripts\style_audit.py` 扫描
   `packages/Zan.Gui/src/Gui/skins/base.css` 与 `src/ide_zan/assets/ide.css`
   的留白类属性,出现阶梯外的裸像素即失败(控件几何 width/height 只报不
-  失败);已挂进 `scripts\check_structure.ps1`,提交前跑它。皮肤包用
+  失败);`transition`/`animation-duration` 只准用 `--anim-*` 令牌,写裸
+  毫秒数同样失败;已挂进 `scripts\check_structure.ps1`,提交前跑它。皮肤包用
   `--all` 一并查(只报不算失败)。
