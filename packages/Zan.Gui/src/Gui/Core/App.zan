@@ -4234,13 +4234,48 @@ public class App {
 
     Action closeRequest;
     bool closePending;
+    // 关闭拦截器：收到「请求关闭」时先问它，返回 true 表示同意关闭，
+    // false 表示否决（窗口继续留着，事件循环不退出）。
+    // 未注册时行为与从前一致：直接停循环退出。
+    Func<bool> closeGuard;
 
     public void OnCloseRequest(Action handler) {
         closeRequest = handler;
         closePending = false;
     }
 
+    // 注册关闭拦截器。handler 在「请求关闭」时于 UI 线程被调用，
+    // 返回 true = 同意关闭（随后照常停循环退出），false = 否决关闭
+    // （窗口与事件循环都继续存在）。
+    //
+    // 跨平台语义一致：
+    //   * macOS/X11 的原生层本来就只投递关闭事件、不销毁窗口；
+    //   * Windows 的窗口过程在收到 WM_CLOSE 时先投递事件、由本层
+    //     决定是否真的销毁（见 Win32Shell 的 WM_CLOSE 分支）。
+    // 因此 handler 里弹模态确认框是安全的：窗口此刻还活着。
+    public void OnCloseGuard(Func<bool> handler) {
+        closeGuard = handler;
+        if (handler != null) {
+            // 登记后，Windows 的 WM_CLOSE 只投递事件、不当场销毁窗口；
+            // macOS/X11 的原生层本来就是这样。子窗口不受影响。
+            this.window.SetCloseIntercept(true);
+        }
+    }
+
+    // 「请求关闭」：先问拦截器，再按既有语义收尾。
+    // 同意 → 通知 closeRequest（一次性）并停循环退出；
+    // 否决 → 什么都不做，窗口继续存在。
     bool HandleCloseRequest() {
+        if (this.closeGuard != null) {
+            if (!this.closeGuard()) { return true; }
+            // 同意关闭：Windows 上窗口此刻还活着（WM_CLOSE 被拦下
+            // 没销毁），这里显式销毁它，让窗口真正消失。
+            this.window.Destroy();
+            // 同意过就别再问第二次：销毁之后事件循环的下一次等待会
+            // 报「窗口没了」（result < 0），那条路同样走到这里，
+            // 再弹一次确认框就成了「点了确定又问一遍」。
+            this.closeGuard = null;
+        }
         if (closeRequest == null) {
             this.StopLoop();
             return false;

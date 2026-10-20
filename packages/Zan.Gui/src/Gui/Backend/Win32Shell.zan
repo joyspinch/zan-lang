@@ -278,6 +278,15 @@ public class Win32Shell {
     static nint className;
     static nint mainHwnd;
     static nint eventHwnd;
+    // 关窗拦截的窗口句柄：登记后，这个窗口收到 WM_CLOSE 时只投递
+    // kind-8 事件、**不**销毁窗口，等 App 层同意（App.OnCloseGuard
+    // 的处理器返回 true）再由 App 调 Destroy 真关掉；否决则窗口
+    // 继续存在。
+    //
+    // 只登记一个窗口：主窗口。子窗口（对话框/文件选择器）不受影响，
+    // 它们的关闭流程仍按原样走（见 ChildWindow.ApplyEvent 的
+    // kind-8 分支与 FilePicker 的 ApplyEvent）。
+    static nint closeInterceptHwnd;
     // Post 当前发布的事件所属的窗口。
     static nint evHwnd;
 
@@ -969,6 +978,22 @@ public class Win32Shell {
             if (!Win32Shell.ResizableOf(hwnd)) { return 0; }
             if (!Win32Shell.MaximizableOf(hwnd)
                 && !Win32Shell.IsMaximized(hwnd)) { return 0; }
+        } else if (msg == 16) {                    // WM_CLOSE
+            // 关闭请求。此前本消息无人接管，落 DefWindowProcW 会当场
+            // DestroyWindow——等 App 收到通知时窗口已经没了，应用就
+            // 再也无法「问一句再关」（弹确认框、取消后继续用）。
+            //
+            // 开了拦截（App.OnCloseGuard）时改为：投递 kind-8 事件、
+            // **不**销毁窗口，等 App 明确同意后再由 App 调 Destroy。
+            // 这与 macOS/X11 的原生层一致：那两边本来就只投递关闭
+            // 事件、不销毁窗口（gui_runtime_mac.m 的 windowShouldClose:
+            // 返回 NO；X11 的 ClientMessage 分支只 evq_push）。
+            //
+            // 没开拦截时行为与从前完全一致：照旧交给 DefWindowProcW。
+            if (hwnd == Win32Shell.closeInterceptHwnd) {
+                Win32Shell.Post(hwnd, 8, 0, 0, 0, 0, 0);
+                return 0;
+            }
         } else if (msg == 0x0112) {                // WM_SYSCOMMAND
             int cmd = ((int)wp) & 0xFFF0;
             if (!Win32Shell.ResizableOf(hwnd) && cmd == 0xF000) {
@@ -1785,6 +1810,14 @@ public class Win32Shell {
     // kind-8 事件，是否真正销毁由应用决定（见 Destroy）。
     static void CloseWindow(nint hwnd) {
         Win32Shell.PostMessageW(hwnd, 16, 0, 0);   // WM_CLOSE
+    }
+
+    // 开/关关窗拦截。开了以后 WM_CLOSE 不再当场销毁窗口：窗口过程
+    // 只投递 kind-8 事件，等应用同意后再调 Destroy 关掉。
+    // 没开时 WM_CLOSE 照旧交给 DefWindowProcW 当场销毁。
+    // hwnd = 0 表示关掉拦截。
+    static void SetCloseIntercept(nint hwnd, bool on) {
+        Win32Shell.closeInterceptHwnd = on ? hwnd : 0;
     }
 
     // 彻底拆除窗口：清理标题按钮/工具窗口登记，释放光栅化器与
