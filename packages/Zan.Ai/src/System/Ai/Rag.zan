@@ -1,0 +1,234 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Ai;
+
+// RAG 编排：文档 → 分块 → 向量化 → 索引 → 检索 → 拼提示词 → 生成。
+//
+// ## 这层是"组装线"
+// Zan 的 AI 侧零件本来就齐（分词器、BM25、HNSW 索引、HttpClient），
+// 缺的是把它们串起来的这条链。本类就是那条链。
+//
+// ## 两种用法
+//
+// 1）**在线模式**（`Ask`）：每次问答都调 embedding 服务 + 补全服务。
+//    文档已经在库里，查询要现算查询向量。
+// 2）**离线索引模式**（`Index`）：先把文档切块、向量化、入库；查询时
+//    只调 embedding + 补全。文档多的场景用这个（embedding 比补全便宜，
+//    但没必要为同一份文档反复付费）。
+//
+// ## 引用溯源
+//
+// `RagAnswer` 带 `citations`（命中的块 + 原文 + 分数）。这是 RAG 与
+// "把整个文档塞进提示词"的关键差别——**答案能指回原文**。
+//
+// ## 失败语义
+//
+// 与 `AiClient` 一致：**失败用返回值不用异常**。`Ask` 返回 null 时，
+// `lastError` 有可读原因（embedding 失败 / 补全失败 / 检索无结果…）。
+
+public class Rag {
+    // 客户端（调 embedding 与补全）。
+    private AiClient client;
+
+    // 检索器。
+    private Retriever retriever;
+
+    // 分块参数。
+    private int chunkChars;
+    private int chunkOverlap;
+
+    // 提示词模板。
+    private string template;
+
+    // 检索条数。
+    private int topK;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public Rag(AiClient client, Retriever retriever) {
+        this.client = client;
+        this.retriever = retriever;
+        this.chunkChars = 800;
+        this.chunkOverlap = 120;
+        this.topK = 4;
+        this.template = Rag.DefaultTemplate();
+        this.lastError = "";
+    }
+
+    // 分块参数（字节；中文一字 3 字节，800 字节约 260 字）。
+    public void SetChunking(int maxChars, int overlap) {
+        this.chunkChars = maxChars;
+        this.chunkOverlap = overlap;
+    }
+
+    // 检索条数。
+    public void SetTopK(int k) {
+        if (k < 1) { k = 1; }
+        this.topK = k;
+    }
+
+    // 提示词模板（`{{context}}` 与 `{{question}}` 是占位符）。
+    public void SetTemplate(string t) {
+        this.template = t == null ? Rag.DefaultTemplate() : t;
+    }
+
+    // 默认提示词模板。
+    //
+    // 要求模型**只依据资料回答**、资料不足时明说——不这么要求，模型会
+    // 用自己的先验知识编答案（幻觉），而用户分不清哪些是资料里的。
+    public static string DefaultTemplate() {
+        return "请只依据下面的资料回答问题。资料里没有的信息，直接说"
+        + "「资料中未提及」，不要用你自己的知识补全。\n\n"
+        + "资料：\n{{context}}\n\n问题：{{question}}\n\n回答：";
+    }
+
+    // 离线索引：把文档切块并向量化入库。
+    //
+    // 向量库与 BM25 索引由 `retriever` 背后的 `VectorStore` 与
+    // `Bm25Index` 承载——本方法只负责产出块与向量并写进去。
+    //
+    // 返回入库的块数；失败返回 -1（原因在 lastError）。
+    //
+    // 注意：id 必须与 `Retriever` 用的两个索引**一致**——所以本方法
+    // 统一用块序号当 id，两路都按这个 id 写。
+    public async int Index(VectorStore store, Bm25Index keyword, string document) {
+        this.lastError = "";
+        if (store == null) { this.lastError = "没有向量库"; return -1; }
+        List<AiChunk> chunks = Chunking.Recursive(document, this.chunkChars,
+        this.chunkOverlap);
+        if (chunks.Count == 0) { this.lastError = "文档为空"; return -1; }
+
+        // 向量化。
+        List<string> texts = new List<string>();
+        for (int i = 0; i < chunks.Count; i = i + 1) {
+            texts.Add(chunks[i].text);
+        }
+        AiEmbedding emb = await Embeddings.EmbedChunks(this.client, chunks, true);
+        if (emb == null) {
+            this.lastError = "向量化失败：" + this.client.lastError;
+            return -1;
+        }
+        // 入库（id = 块序号，两路统一）。
+        for (int i = 0; i < chunks.Count; i = i + 1) {
+            store.Add(i, emb.At(i), chunks[i].text, "");
+            if (keyword != null) {
+                keyword.Add(i, chunks[i].text);
+            }
+        }
+        return chunks.Count;
+    }
+
+    // 在线问答：检索 → 拼提示词 → 调补全。
+    //
+    // 返回答案（含引用）；失败返回 null（原因在 lastError）。
+    public async RagAnswer Ask(string question, VectorStore store) {
+        this.lastError = "";
+        if (this.client == null) { this.lastError = "没有客户端"; return null; }
+        if (store == null) { this.lastError = "没有向量库"; return null; }
+        if (question == null || question.Length == 0) {
+            this.lastError = "问题为空";
+            return null;
+        }
+
+        // 1) 查询向量（现算）。
+        List<string> one = new List<string>();
+        one.Add(question);
+        AiEmbedding qemb = await Embeddings.Embed(this.client, one, true);
+        if (qemb == null) {
+            this.lastError = "查询向量化失败：" + this.client.lastError;
+            return null;
+        }
+
+        // 2) 混合检索。
+        List<RetrieverHit> hits = this.retriever.Search(qemb.At(0), question,
+        this.topK);
+        if (hits.Count == 0) {
+            this.lastError = "没有检索到相关资料";
+            return null;
+        }
+
+        // 3) 拼上下文。
+        RagAnswer answer = new RagAnswer();
+        answer.question = question;
+        StringBuilder ctx = new StringBuilder();
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            int id = hits[i].id;
+            string text = store.TextOf(id);
+            RagCitation cite = new RagCitation();
+            cite.id = id;
+            cite.text = text;
+            cite.score = hits[i].score;
+            cite.vectorRank = hits[i].vectorRank;
+            cite.bm25Rank = hits[i].bm25Rank;
+            answer.citations.Add(cite);
+            if (i > 0) { ctx.Append("\n---\n"); }
+            ctx.Append(text);
+        }
+        answer.context = ctx.ToString();
+
+        // 4) 拼提示词 → 调补全。
+        string prompt = this.template;
+        prompt = Rag.ReplaceToken(prompt, "{{context}}", answer.context);
+        prompt = Rag.ReplaceToken(prompt, "{{question}}", question);
+        string reply = await this.client.Complete("", prompt);
+        if (reply == null) {
+            this.lastError = "生成失败：" + this.client.lastError;
+            return null;
+        }
+        answer.text = reply;
+        return answer;
+    }
+
+    // 占位符替换（全部替换，不只第一个）。
+    public static string ReplaceToken(string text, string token, string value) {
+        if (text == null || token == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        int at = 0;
+        while (true) {
+            int hit = text.IndexOf(token, at);
+            if (hit < 0) { break; }
+            sb.Append(text.Substring(at, hit - at));
+            sb.Append(value == null ? "" : value);
+            at = hit + token.Length;
+        }
+        sb.Append(text.Substring(at));
+        return sb.ToString();
+    }
+}
+
+// 一次问答的结果（答案 + 引用）。
+public class RagAnswer {
+    public string question;
+
+    // 生成的答案。
+    public string text;
+
+    // 拼进提示词的上下文（命中块的拼接）。
+    public string context;
+
+    // 引用（命中的块 + 原文 + 分数）。
+    public List<RagCitation> citations;
+
+    public RagAnswer() {
+        this.question = "";
+        this.text = "";
+        this.context = "";
+        this.citations = new List<RagCitation>();
+    }
+}
+
+// 一条引用（命中的块）。
+public class RagCitation {
+    public int id;
+    public string text;
+
+    // RRF 融合分数。
+    public double score;
+
+    // 两路的原始名次（0 = 该路没命中）。
+    public int vectorRank;
+    public int bm25Rank;
+}

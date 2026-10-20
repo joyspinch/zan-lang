@@ -1,0 +1,171 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Text;
+
+namespace System.Ai;
+
+// 检索器：混合检索（向量语义 + BM25 字面）+ RRF 融合。
+//
+// ## 为什么是混合
+//
+// 纯向量检索**认不出专有名词**——"iPhone 15" 和 "iPhone 14" 的向量
+// 几乎一样，但 BM25 能精确区分。纯 BM25 **认不出同义表达**——"怎么退款"
+// 检索不到"退钱流程"。两者互补，混合检索在实践中稳定优于单一路线。
+//
+// ## 为什么是 RRF 而不是分数加权
+//
+// 向量的距离（1 - cos_sim，范围 0~2）和 BM25 的分数（无上界）**不在
+// 同一个量纲**，加权求和需要先归一化，而归一化方式（min-max？z-score？
+// 按查询内分布？）每种都有坑，且对查询敏感。
+//
+// RRF（Reciprocal Rank Fusion）只看**排名**不看分数：
+//
+//     score(d) = Σ 1 / (k + rank_i(d))
+//
+// k 是平滑常数（默认 60，取自原论文）。它对量纲完全免疫——不需要任何
+// 归一化，也不需要两张表的分数可比。代价是丢掉了分数的绝对信息
+// （"第一名比第二名强多少"），但排序结果通常比归一化加权更稳。
+//
+// 本包**同时保留两路原始排名**（`vectorRank` / `bm25Rank`），
+// 需要自己加权时可以用。
+
+public class Retriever {
+    // 向量库（可为 null —— 只做字面检索）。
+    private VectorStore vectors;
+
+    // BM25 索引（可为 null —— 只做语义检索）。
+    private Bm25Index keyword;
+
+    // RRF 平滑常数。
+    private int rrfK;
+
+    // 每路各取多少候选（进入融合的池子大小）。
+    private int candidatePool;
+
+    public Retriever(VectorStore vectors, Bm25Index keyword) {
+        this.vectors = vectors;
+        this.keyword = keyword;
+        this.rrfK = 60;
+        this.candidatePool = 50;
+    }
+
+    // RRF 平滑常数（k 越大，头部名次的优势越小；默认 60）。
+    public void SetRrfK(int k) {
+        if (k < 1) { k = 1; }
+        this.rrfK = k;
+    }
+
+    // 候选池大小（每路取多少条进融合；默认 50）。
+    public void SetCandidatePool(int n) {
+        if (n < 1) { n = 1; }
+        this.candidatePool = n;
+    }
+
+    // 混合检索。
+    //
+    // queryVector 可为 null（则只做字面检索）；queryText 可为空串
+    // （则只做语义检索）。
+    //
+    // 返回按 RRF 分数降序排好的命中（分数相同时按 id 升序——保证确定性）。
+    public List<RetrieverHit> Search(List<double> queryVector, string queryText,
+    int k) {
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (k < 1) { return outp; }
+
+        // --- 第一路：向量 ---
+        List<VectorHit> vHits = new List<VectorHit>();
+        if (this.vectors != null && queryVector != null) {
+            vHits = this.vectors.Search(queryVector, this.candidatePool);
+        }
+
+        // --- 第二路：BM25 ---
+        List<Bm25Hit> bHits = new List<Bm25Hit>();
+        if (this.keyword != null && queryText != null && queryText.Length > 0) {
+            bHits = this.keyword.SearchTop(queryText, this.candidatePool);
+        }
+
+        // --- RRF 融合 ---
+        // 累积表：id → (两路排名, RRF 分数, 原始分数)
+        Dictionary<int, RetrieverHit> acc = new Dictionary<int, RetrieverHit>();
+        for (int i = 0; i < vHits.Count; i = i + 1) {
+            int id = vHits[i].id;
+            int rank = i + 1;   // 1 起
+            RetrieverHit h = RetrieverHit.Of(id);
+            h.vectorRank = rank;
+            h.vectorDistance = vHits[i].distance;
+            h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
+            acc[id] = h;
+        }
+        for (int i = 0; i < bHits.Count; i = i + 1) {
+            int id = bHits[i].id;
+            int rank = i + 1;
+            RetrieverHit h = RetrieverHit.Of(id);
+            if (acc.ContainsKey(id)) {
+                h = acc[id];
+            }
+            h.bm25Rank = rank;
+            h.bm25Score = bHits[i].score;
+            h.score = h.score + 1.0 / ((double)this.rrfK + (double)rank);
+            acc[id] = h;
+        }
+
+        // --- 取出并排序 ---
+        List<int> ids = new List<int>();
+        List<int> keys = acc.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) { ids.Add(keys[i]); }
+        // 分数降序，同分按 id 升序（确定性）。
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            for (int j = i + 1; j < ids.Count; j = j + 1) {
+                int a = ids[i];
+                int b = ids[j];
+                bool swap = false;
+                double sa = acc[a].score;
+                double sb = acc[b].score;
+                if (sb > sa) { swap = true; }
+                else if (sb == sa && b < a) { swap = true; }
+                if (swap) {
+                    ids[i] = b;
+                    ids[j] = a;
+                }
+            }
+        }
+        int limit = k < ids.Count ? k : ids.Count;
+        for (int i = 0; i < limit; i = i + 1) {
+            outp.Add(acc[ids[i]]);
+        }
+        return outp;
+    }
+
+    // 只做向量检索（不融合）——需要原始距离时用。
+    public List<RetrieverHit> SearchVector(List<double> queryVector, int k) {
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.vectors == null || queryVector == null) { return outp; }
+        List<VectorHit> hits = this.vectors.Search(queryVector, k);
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            RetrieverHit h = RetrieverHit.Of(hits[i].id);
+            h.vectorRank = i + 1;
+            h.vectorDistance = hits[i].distance;
+            h.score = 1.0 / ((double)this.rrfK + (double)(i + 1));
+            outp.Add(h);
+        }
+        return outp;
+    }
+
+    // 只做字面检索（不融合）。
+    public List<RetrieverHit> SearchKeyword(string queryText, int k) {
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.keyword == null || queryText == null || queryText.Length == 0) {
+            return outp;
+        }
+        List<Bm25Hit> hits = this.keyword.SearchTop(queryText, k);
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            RetrieverHit h = RetrieverHit.Of(hits[i].id);
+            h.bm25Rank = i + 1;
+            h.bm25Score = hits[i].score;
+            h.score = 1.0 / ((double)this.rrfK + (double)(i + 1));
+            outp.Add(h);
+        }
+        return outp;
+    }
+}

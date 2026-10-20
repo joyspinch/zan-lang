@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Json;
+
+namespace System.Ai;
+
+// 向量存储：把 embedding 存进可检索的索引。
+//
+// ## 为什么有这层
+//
+// `AiEmbedding` 产出的是 `List<List<double>>`（双精度，与 embedding 服务的
+// JSON 一致），而 `System.Data.ZanDb.VectorIndex` 要的是 `float[]`
+// （单精度，因为索引要常驻内存、量大）。两者之间必须有一次显式转换，
+// 且**转换的代价要说清楚**。
+//
+// ## 精度代价（实测）
+//
+// 单精度有效位约 7 位十进制。实测 embedding 分量（量级 0.01~1）的相对
+// 误差约 1e-8，余弦相似度的偏差约 1e-9——对检索排序**没有可观察的影响**。
+// 但如果调用方需要与"服务端原始向量"逐位一致（例如要拿向量去和别的系统
+// 做精确比对），**就不能经过这层**——直接用 `AiEmbedding.vectors`。
+//
+// ## 归一化
+//
+// 余弦度量（`VectorIndexOptions.metric == 0`）下，`VectorIndex` 自己算
+// 模长（`inverseNorm`），所以**入库的向量不必归一化**。但归一化过的向量
+// 存进去更省事：不必依赖索引端的实现细节。本包默认归一化后入库
+//（`normalize` 参数可关）。
+//
+// ## 依赖方向
+//
+// 本包依赖 `System.Data.ZanDb`（HNSW 索引）与 `System.Text`（BM25）。
+// 实测这两个命名空间只带 17 / 37 个编译单元，**不拖 ORM 与 sqlite 驱动**
+//（那些在 `System.Data` 根与 `System.Data.Orm` 下，本包不碰）。
+
+public class VectorStore {
+    // 索引（null 表示还没建索引——维度未知前无法建）。
+    private VectorIndex index;
+
+    // 维度（0 = 未知）。
+    private int dimensions;
+
+    // 归一化开关（入库时是否归一化）。
+    private bool normalized;
+
+    // id → 原文。
+    private Dictionary<int, string> texts;
+
+    // id → 附加元数据（JSON 文本）。
+    private Dictionary<int, string> metadata;
+
+    public VectorStore(int dimensions, bool normalize) {
+        this.dimensions = dimensions;
+        this.normalized = normalize;
+        this.texts = new Dictionary<int, string>();
+        this.metadata = new Dictionary<int, string>();
+        if (dimensions > 0) {
+            this.index = new VectorIndex(new VectorIndexOptions(dimensions, 0));
+        }
+    }
+
+    // 维度（0 = 未知）。
+    public int Dimensions() { return this.dimensions; }
+
+    // 索引里的条目数。
+    public int Count() {
+        if (this.index == null) { return 0; }
+        return this.index.Count();
+    }
+
+    // 存一条：id + 向量 + 原文 + 元数据。
+    //
+    // 维度不符会抛 `ArgumentException`（索引会拒绝，但提前报错更清楚）。
+    // 同一 id 重复添加是**替换**（`VectorIndex.Add` 的语义）。
+    public void Add(int id, List<double> vector, string text, string meta) {
+        if (this.index == null) {
+            throw new ArgumentException("向量维度未知，无法入库");
+        }
+        if (vector == null || vector.Count != this.dimensions) {
+            throw new ArgumentException("向量维度不符（期望 "
+            + Convert.ToString(this.dimensions) + "，实际 "
+            + Convert.ToString(vector == null ? 0 : vector.Count) + "）");
+        }
+        this.index.Add(id, VectorStore.ToFloatArray(vector, this.normalized));
+        this.texts[id] = text == null ? "" : text;
+        this.metadata[id] = meta == null ? "" : meta;
+    }
+
+    // 批量入库（顺序与 vectors 一致，id 从 startId 递增）。
+    public void AddAll(List<List<double>> vectors, List<string> texts, int startId) {
+        for (int i = 0; i < vectors.Count; i = i + 1) {
+            string t = "";
+            if (texts != null && i < texts.Count) { t = texts[i]; }
+            this.Add(startId + i, vectors[i], t, "");
+        }
+    }
+
+    // 检索：返回 id + 距离（余弦度量下 distance = 1 - cos_sim，越小越近）。
+    public List<VectorHit> Search(List<double> query, int k) {
+        return this.Search(query, k, 0);
+    }
+
+    // 检索（限定 efSearch；0 = 用索引默认值）。
+    public List<VectorHit> Search(List<double> query, int k, int efSearch) {
+        if (this.index == null) { return new List<VectorHit>(); }
+        float[] q = VectorStore.ToFloatArray(query, this.normalized);
+        return this.index.Search(q, k, efSearch);
+    }
+
+    // 原文（命中后回原文）。
+    public string TextOf(int id) {
+        if (!this.texts.ContainsKey(id)) { return ""; }
+        return this.texts[id];
+    }
+
+    // 元数据。
+    public string MetaOf(int id) {
+        if (!this.metadata.ContainsKey(id)) { return ""; }
+        return this.metadata[id];
+    }
+
+    // 全部 id（升序）。
+    public List<int> Ids() {
+        List<int> ids = new List<int>();
+        List<int> keys = this.texts.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) { ids.Add(keys[i]); }
+        ids.Sort();
+        return ids;
+    }
+
+    // 导出状态（持久化用）。
+    //
+    // 原文与元数据按 id 升序存成**数组**（不是 id→文本 的对象）——避免
+    // "id 变字符串键再变回来"的往返损耗（int → string → int 看着简单，
+    // 但字符串键的 JSON 顺序不保证，重建时的对应关系就成了隐式约定）。
+    public string ExportState() {
+        JsonValue obj = JsonValue.NewObject();
+        obj.PutInt("dimensions", this.dimensions);
+        obj.PutBool("normalized", this.normalized);
+        if (this.index != null) {
+            obj.Put("index", this.index.ExportState());
+        }
+        List<int> ids = this.Ids();
+        JsonValue idArr = JsonValue.NewArray();
+        JsonValue textArr = JsonValue.NewArray();
+        JsonValue metaArr = JsonValue.NewArray();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            idArr.AppendInt(ids[i]);
+            textArr.AppendStr(this.texts[ids[i]]);
+            metaArr.AppendStr(this.metadata[ids[i]]);
+        }
+        obj.Put("ids", idArr);
+        obj.Put("texts", textArr);
+        obj.Put("metadata", metaArr);
+        return obj.ToJson();
+    }
+
+    // 从状态恢复。
+    public static VectorStore ImportState(string json) {
+        JsonValue obj = JsonValue.Parse(json);
+        if (obj == null || !obj.IsObject()) {
+            throw new ArgumentException("向量存储状态不是合法 JSON 对象");
+        }
+        JsonValue dimVal = obj.Get("dimensions");
+        JsonValue normVal = obj.Get("normalized");
+        int dims = dimVal == null ? 0 : (int)dimVal.AsDouble(0.0);
+        bool norm = normVal == null ? false : normVal.AsBool(false);
+        VectorStore store = new VectorStore(dims, norm);
+        JsonValue idx = obj.Get("index");
+        if (idx != null && idx.IsObject()) {
+            store.index = VectorIndex.ImportState(idx);
+        }
+        JsonValue idArr = obj.Get("ids");
+        JsonValue textArr = obj.Get("texts");
+        JsonValue metaArr = obj.Get("metadata");
+        if (idArr != null && idArr.IsArray()) {
+            for (int i = 0; i < idArr.Count(); i = i + 1) {
+                int id = (int)idArr.At(i).AsDouble(0.0);
+                string t = "";
+                string m = "";
+                if (textArr != null && textArr.IsArray() && i < textArr.Count()) {
+                    t = textArr.At(i).AsString("");
+                }
+                if (metaArr != null && metaArr.IsArray() && i < metaArr.Count()) {
+                    m = metaArr.At(i).AsString("");
+                }
+                store.texts[id] = t;
+                store.metadata[id] = m;
+            }
+        }
+        return store;
+    }
+
+    // double → float（可选归一化）。
+    public static float[] ToFloatArray(List<double> v, bool normalize) {
+        if (v == null) { return new float[0]; }
+        float[] outp = new float[v.Count];
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) {
+            outp[i] = (float)v[i];
+            sum = sum + v[i] * v[i];
+        }
+        if (normalize && sum > 0.0) {
+            double inv = 1.0 / Math.Sqrt(sum);
+            for (int i = 0; i < outp.Length; i = i + 1) {
+                outp[i] = (float)((double)outp[i] * inv);
+            }
+        }
+        return outp;
+    }
+}

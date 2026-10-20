@@ -827,7 +827,10 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `Embeddings.zan` | 同上 | `Embeddings`：OpenAI 兼容 `/v1/embeddings`、批量、归一化、**按 index 归位**、维度校验 |
 | `Chunking.zan` | 同上 | `Chunking`：递归字符分割 / token 窗口 / 句子 / 段落，四种策略 |
 | `AiEndpoint.zan` | 同上 | `AiEndpoint`：base URL → scheme/host/port/path；本地端点识别 |
-| `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` |
+| `VectorStore.zan` | 同上 | `VectorStore`：`AiEmbedding`（double）→ `VectorIndex`（float）适配、入库/检索/导出导入往返 |
+| `Retriever.zan` | 同上 | `Retriever`：混合检索（向量 + BM25）+ **RRF 融合**；保留两路原始排名与分数 |
+| `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
+| `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
 **六条硬取舍**：
 
@@ -860,13 +863,40 @@ token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数
 的步长 = 窗口 - 重叠；嵌入响应的按 index 归位、归一化后模长为 1、
 维度不一致报错、少返回向量报错、服务端错误提取、坏 JSON 不炸；
 余弦相似度的正交/同向/维度不等/零向量；用量的 total 与成本核算；
-客户端在连不上/地址非法/没模型三种情况下的失败语义）。
+客户端在连不上/地址非法/没模型三种情况下的失败语义；向量存储的
+入库/检索/**导出导入往返后检索结果不变**、维度不符报错；**RRF 融合
+的精确分数**（两路都命中 = 1/(k+r1) + 1/(k+r2)，只命中一路 = 单项）
+与融合顺序的稳定性；占位符替换（全替换而非只替第一个））。
 
-**已知边界**：无 RAG 编排（检索→重排→拼提示词→生成）、无向量库
-客户端（只产出向量，存储与检索要靠 `Zan.Data` 的 `VectorIndex` 自接）、
-无 Tool calling、无会话记忆、无评估与可观测、无流式的**背压**（回调
-返回 false 只能停在这一帧之后）、无 Token 精确计数（要接厂商
-tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家私有协议）。
+**检索为什么是混合 + RRF**（§1.20 补记）：
+
+- **混合**：纯向量检索认不出专有名词（"iPhone 15" 与 "iPhone 14"
+  的向量几乎一样），纯 BM25 认不出同义表达（"怎么退款" 检索不到
+  "退钱流程"）。两者互补。
+- **RRF 而不是分数加权**：向量的距离（1 - cos_sim，0~2）与 BM25 的
+  分数（无上界）**不在同一量纲**，加权求和必须先归一化，而归一化
+  方式（min-max？z-score？按查询内分布？）每种都有坑且对查询敏感。
+  RRF 只看**排名**不看分数（`score(d) = Σ 1/(k + rank_i(d))`，k=60
+  取自原论文），对量纲完全免疫。两路的原始排名与原始分数都保留在
+  `RetrieverHit` 上，要自己加权时可用。
+
+**依赖方向的实测**：`System.Ai → System.Data.ZanDb`（HNSW 索引）+
+`System.Text`（BM25）。实测这两个命名空间只带 17 / 37 个编译单元，
+**不拖 ORM 与 sqlite 驱动**（那些在 `System.Data` 根与
+`System.Data.Orm` 下，本包不碰）——这正是用子命名空间而不是包根
+的好处。
+
+**`double` → `float` 的精度代价（实测）**：单精度有效位约 7 位十进制。
+embedding 分量（量级 0.01~1）相对误差约 1e-8，余弦相似度偏差约
+1e-9——对检索排序**没有可观察的影响**。但需要与服务端原始向量逐位
+一致时（跨系统精确比对）**不能经过这层**，直接用 `AiEmbedding.vectors`。
+
+**已知边界**：无重排（cross-encoder 重排那一层）、无向量库的并发写
+与增量删除、无 Tool calling、无会话记忆、无评估与可观测、无流式的
+**背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
+（要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
+私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调 embedding 服务**
+（没有本地离线 embedding 模型）。
 
 ---
 

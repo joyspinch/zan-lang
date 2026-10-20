@@ -20,17 +20,50 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   句子 / 段落）
 - `System.Ai` — `AiEndpoint`（base URL → scheme/host/port/path；
   本地端点识别）
+- `System.Ai` — `VectorStore`（向量存储：embedding → `VectorIndex`
+  适配、入库/检索、导出导入往返）
+- `System.Ai` — `Retriever`（混合检索：向量语义 + BM25 字面，RRF 融合）
+- `System.Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
+  生成；答案带引用溯源）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
-  `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding`
+  `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit`
 
 ## 快速上手
 
 ```zan
+using System;
 using System.Ai;
+using System.Text;
 
 AiConfig cfg = new AiConfig("https://api.deepseek.com/v1", "sk-...", "deepseek-chat");
 AiClient client = new AiClient(cfg);
 
+// ---- 建库（离线索引）----
+VectorStore store = new VectorStore(1024, true);   // 维度按你的 embedding 模型
+Bm25Index keyword = new Bm25Index(new TextTokenizer());
+
+Rag rag = new Rag(client, new Retriever(store, keyword));
+rag.SetChunking(800, 120);
+int chunks = await rag.Index(store, keyword, documentText);
+Console.WriteLine("入库块数=" + chunks);
+
+// ---- 问答（在线）----
+RagAnswer answer = await rag.Ask("退款要多久？", store);
+if (answer == null) {
+    Console.WriteLine(rag.lastError);
+} else {
+    Console.WriteLine(answer.text);
+    for (int i = 0; i < answer.citations.Count; i = i + 1) {
+        // 引用能指回原文——这是 RAG 与"整篇塞进提示词"的本质差别
+        RagCitation c = answer.citations[i];
+        Console.WriteLine("[" + c.id + "] " + c.text);
+    }
+}
+```
+
+不想要 RAG 这层编排时，三个零件也能单独用：
+
+```zan
 // 1) 文档分块（带原文偏移，检索到后可还原上下文）
 List<AiChunk> chunks = Chunking.Recursive(doc, 800, 120);
 Console.WriteLine("块数=" + chunks.Count + " 首块偏移=" + chunks[0].start);
@@ -41,17 +74,13 @@ Console.WriteLine("维度=" + vecs.dimensions);
 
 // 3) 余弦检索（配合 Zan.Data 的 VectorIndex 存储）
 double sim = AiEmbedding.Cosine(vecs.At(0), queryVector);
-
-// 4) 补全
-string answer = await client.Complete("你是助手", "问题");
-if (answer == null) { Console.WriteLine(client.lastError); }
 ```
 
 ## 设计要点
 
-- **实体化，不用平行数组**：向量、分块、请求/响应都是具名实体
-  （`AiEmbedding`/`AiChunk`/`AiUsage`），不靠下标对齐。跨边界传输的
-  JSON 尽早解析成实体。
+- **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
+  实体（`AiEmbedding`/`AiChunk`/`AiUsage`/`RetrieverHit`），不靠下标
+  对齐。跨边界传输的 JSON 尽早解析成实体。
 - **失败用返回值不用异常**：网络失败是常态（超时、断网、5xx），
   `Complete` 返回 `null` + `client.lastError` 给出可读原因。
 - **4xx 不重试；POST 补全默认不重试**（`maxAttempts` 默认 1）：
@@ -69,9 +98,18 @@ if (answer == null) { Console.WriteLine(client.lastError); }
 - **偏移单位是字节不是字符**：Zan 的 `string` 是 UTF-8 字节序列，
   `AiChunk.start/end` 与 `string.Substring` 同口径。切分点落在字符
   边界上（劈开多字节字符会产出替换字符）。
+- **混合检索 + RRF 融合**：纯向量认不出专有名词，纯 BM25 认不出同义
+  表达。RRF 只看排名不看分数（`Σ 1/(k+rank)`），对量纲免疫——向量距离
+  与 BM25 分数本来就不在同一量纲，加权求和必须先归一化，而每种归一化
+  方式都有坑。两路的原始排名与分数都保留在 `RetrieverHit` 上。
 - **端点解析不带白名单**：白名单是 Web 框架的出网策略
   （`Zan.Mvc` 的 `AiEndpointPolicy`），本包是通用库，调用方自己决定
   连哪里。
+- **`double` → `float` 的精度代价**：向量存储用 `VectorIndex` 的
+  `float[]`（单精度，因为索引要常驻内存、量大）。实测 embedding 分量
+  相对误差约 1e-8、余弦偏差约 1e-9，对检索排序没有可观察影响；但要
+  与服务端原始向量逐位一致时**别经过这层**，直接用
+  `AiEmbedding.vectors`。
 
 ## 消费者
 

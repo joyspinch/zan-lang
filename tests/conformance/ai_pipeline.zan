@@ -1,16 +1,18 @@
-// AI 应用管线（System.Ai）：统一 LLM 客户端 + 嵌入 + 文档分块。
+// AI 应用管线（System.Ai）：客户端 + 嵌入 + 分块 + 向量存储 + 混合检索
+// + RAG 编排。
 //
-// 覆盖：端点解析（scheme/host/port/path/本地端点/非法地址）；
-// token 估算的单一��径（CJK 与 ASCII）；文档分块的四种策略（递归/窗口/
-// 句子/段落）与**原文偏移可还原**；窗口的滑动步长；嵌入响应的解析
-// （按 index 归位、维度不一致报错、缺向量报错、错误提取）；余弦
-// 相似度；用量与成本核算；客户端在无网络时的失败语义（不抛异常、
-// 错误信息可读）。
+// 覆盖：端点解析；token 估算的单一��径；四种分块策略与**原文偏移可
+// 还原**；窗口的滑动步长；嵌入响应的解析（按 index 归位、维度不一致
+// 报错、缺向量报错、错误提取）；余弦相似度；用量与成本核算；客户端
+// 在无网络时的失败语义；向量存储的入库/检索/导出导入往返；**RRF 融合
+// 的精确分数**；占位符替换。
 //
-// 本用例**不打网络**——嵌入响应解析是独立函数，直接喂 JSON 字符串；
-// 客户端只验证"连不上时返回 null + lastError 有内容"。
+// 本用例**不打网络**——嵌入响应解析、检索、融合都是独立函数，直接喂
+// 数据；客户端只验证"连不上时返回 null + lastError 有内容"。
 using System;
 using System.Ai;
+using System.Data.ZanDb;
+using System.Text;
 
 namespace Conf;
 
@@ -50,11 +52,9 @@ class Prog {
             if (ep.Local()) { bad = bad + 1; }
         }
 
-        // 尾部斜杠要去掉。
         AiEndpoint epSlash = AiEndpoint.Parse("https://api.openai.com/v1/");
         if (epSlash == null || epSlash.Path() != "/v1") { bad = bad + 1; }
 
-        // 本地端点（http + 非默认端口）。
         AiEndpoint epLocal = AiEndpoint.Parse("http://127.0.0.1:11434/v1");
         if (epLocal == null) { bad = bad + 1; }
         else {
@@ -109,24 +109,20 @@ class Prog {
             + sents[i].tokens + " " + sents[i].text);
             if (sents[i].index != i) { bad = bad + 1; }
         }
-        // 偏移能还原原文（引用溯源的基础）。
         if (sents.Count == 3) {
             string back = doc.Substring(sents[0].start,
             sents[2].end - sents[0].start);
             if (back != doc) { bad = bad + 1; }
         }
 
-        // 句末标点后的收束引号归入本句。
         List<AiChunk> quoted = Chunking.Sentences("他说「好。」然后走了。");
         Console.WriteLine("quoted=" + quoted.Count);
         if (quoted.Count != 2) { bad = bad + 1; }
 
-        // 英文句号也切。
         List<AiChunk> enSents = Chunking.Sentences("Hello there. Bye now.");
         Console.WriteLine("en sentences=" + enSents.Count);
         if (enSents.Count != 2) { bad = bad + 1; }
 
-        // 无句末标点的尾巴也要成块（不丢内容）。
         List<AiChunk> tail = Chunking.Sentences("有句子。尾巴没有标点");
         Console.WriteLine("tail=" + tail.Count);
         if (tail.Count != 2) { bad = bad + 1; }
@@ -138,6 +134,7 @@ class Prog {
         if (paras.Count != 3) { bad = bad + 1; }
         if (paras.Count == 3) {
             if (paras[0].text != "A段") { bad = bad + 1; }
+            // 偏移是**字节**（"A段"=4 字节 + "\n\n"=2 → B段 从 6 开始）。
             if (paras[1].start != 6) { bad = bad + 1; }
             if (paras[2].text != "C段") { bad = bad + 1; }
         }
@@ -151,7 +148,6 @@ class Prog {
             + (rec[i].end - rec[i].start) + " " + rec[i].text);
             if (rec[i].end - rec[i].start > 30) { bad = bad + 1; }
         }
-        // 无重叠时拼接应还原原文（不丢内容）。
         if (Chunking.Join(rec, "") != many) { bad = bad + 1; }
 
         // 无分隔符的纯文本按字符边界硬切（不劈开多字节字符）。
@@ -159,7 +155,6 @@ class Prog {
         Console.WriteLine("cjk chunks=" + cjk.Count);
         if (cjk.Count != 4) { bad = bad + 1; }
         for (int i = 0; i < cjk.Count; i = i + 1) {
-            // 每块都应是完整字符（无替换字符 U+FFFD）。
             if (cjk[i].text.IndexOf("�") >= 0) { bad = bad + 1; }
         }
         if (Chunking.Join(cjk, "") != "一二三四五六七八九十") { bad = bad + 1; }
@@ -173,7 +168,6 @@ class Prog {
             + sw[i].start + "," + sw[i].end + ") tok="
             + sw[i].tokens + " " + sw[i].text);
         }
-        // 窗口 4 token / 重叠 1 token → 步长 3 token = 12 字节。
         if (sw.Count != 4) { bad = bad + 1; }
         if (sw.Count == 4) {
             if (sw[0].start != 0 || sw[0].end != 16) { bad = bad + 1; }
@@ -202,7 +196,6 @@ class Prog {
                 if (emb.At(0)[0] != 1.0 || emb.At(0)[1] != 0.0) { bad = bad + 1; }
                 if (emb.At(1)[0] != 0.0 || emb.At(1)[1] != 1.0) { bad = bad + 1; }
             }
-            // 服务端给了 usage → 标成非估算。
             if (emb.usage.estimated) { bad = bad + 1; }
             if (emb.usage.promptTokens != 5) { bad = bad + 1; }
         }
@@ -237,7 +230,7 @@ class Prog {
         if (errEmb != null) { bad = bad + 1; }
         if (client.lastError != "invalid api key") { bad = bad + 1; }
 
-        // 坏 JSON → 报错。
+        // 坏 JSON → 报错（不炸）。
         AiEmbedding badJson = Embeddings.ParseResponse(client, "not json", 1, false);
         if (badJson != null) { bad = bad + 1; }
 
@@ -252,11 +245,9 @@ class Prog {
         + " cos same=" + F(AiEmbedding.Cosine(a, same), 6));
         if (Math.Abs(AiEmbedding.Cosine(a, b)) > 1e-9) { bad = bad + 1; }
         if (Math.Abs(AiEmbedding.Cosine(a, same) - 1.0) > 1e-9) { bad = bad + 1; }
-        // 维度不等 → 0.0（不抛）。
         List<double> short3 = new List<double>();
         short3.Add(1.0); short3.Add(2.0); short3.Add(3.0);
         if (AiEmbedding.Cosine(a, short3) != 0.0) { bad = bad + 1; }
-        // 零向量 → 0.0（不是 NaN）。
         List<double> zero = new List<double>();
         zero.Add(0.0); zero.Add(0.0);
         if (AiEmbedding.Cosine(a, zero) != 0.0) { bad = bad + 1; }
@@ -264,17 +255,14 @@ class Prog {
         // ---- 9. 用量与成本 ----
         AiUsage usage = new AiUsage(1000, 500, true);
         if (usage.totalTokens != 1500) { bad = bad + 1; }
-        // 单价：输入 3 美元/百万，输出 15 美元/百万。
         AiPricing pricing = new AiPricing("test", 3.0, 15.0);
         double cost = usage.Cost(pricing);
         Console.WriteLine("cost=" + F(cost, 8));
         // 1000/1e6*3 + 500/1e6*15 = 0.003 + 0.0075 = 0.0105
         if (Math.Abs(cost - 0.0105) > 1e-9) { bad = bad + 1; }
-        // 没有单价表 → 0.0（不内置会过期的价格）。
         if (usage.Cost(null) != 0.0) { bad = bad + 1; }
 
         // ---- 10. 客户端：连不上时的失败语义 ----
-        // 用一个必然连不通的地址（127.0.0.1:9，丢弃端口），短超时。
         AiConfig cfg = new AiConfig("http://127.0.0.1:9/v1", "sk-test", "test-model");
         cfg.connectTimeoutMs = 300;
         cfg.readTimeoutMs = 300;
@@ -287,14 +275,12 @@ class Prog {
         if (reply != null) { bad = bad + 1; }
         if (dead.lastError.Length == 0) { bad = bad + 1; }
 
-        // 非法 base URL → 立即失败（不发请求）。
         AiConfig badCfg = new AiConfig("not-a-url", "k", "m");
         AiClient badClient = new AiClient(badCfg);
         string badReply = await badClient.Complete("sys", "hello");
         if (badReply != null) { bad = bad + 1; }
         if (badClient.lastError != "服务地址不合法: not-a-url") { bad = bad + 1; }
 
-        // 没有模型 → 立即失败。
         AiConfig noModel = new AiConfig("https://h/v1", "k", "");
         AiClient nm = new AiClient(noModel);
         string nmReply = await nm.Complete("sys", "hello");
@@ -309,6 +295,120 @@ class Prog {
         Console.WriteLine("messages=" + msgJson);
         if (msgJson.IndexOf("\"role\":\"system\"") < 0) { bad = bad + 1; }
         if (msgJson.IndexOf("\"content\":\"问题\"") < 0) { bad = bad + 1; }
+
+        // ---- 12. 向量存储：入库 / 检索 / 导出导入往返 ----
+        VectorStore store = new VectorStore(2, true);
+        List<double> s0 = new List<double>(); s0.Add(1.0); s0.Add(0.0);
+        List<double> s1 = new List<double>(); s1.Add(0.0); s1.Add(1.0);
+        List<double> s2 = new List<double>(); s2.Add(0.7); s2.Add(0.7);
+        store.Add(0, s0, "苹果手机", "m0");
+        store.Add(1, s1, "香蕉牛奶", "m1");
+        store.Add(2, s2, "苹果牛奶", "m2");
+        Console.WriteLine("store count=" + store.Count()
+        + " dims=" + store.Dimensions());
+        if (store.Count() != 3) { bad = bad + 1; }
+        if (store.TextOf(0) != "苹果手机") { bad = bad + 1; }
+        if (store.MetaOf(1) != "m1") { bad = bad + 1; }
+
+        // 维度不符必须报错。
+        int threw = 0;
+        try {
+            List<double> wrong = new List<double>(); wrong.Add(1.0);
+            store.Add(9, wrong, "x", "");
+        } catch (Exception e) {
+            threw = threw + 1;
+        }
+        Console.WriteLine("wrong dim threw=" + threw);
+        if (threw != 1) { bad = bad + 1; }
+
+        // 检索：查询向量 = s0 方向，最近的应是 id=0。
+        List<double> q = new List<double>(); q.Add(1.0); q.Add(0.0);
+        List<VectorHit> hits = store.Search(q, 3);
+        for (int i = 0; i < hits.Count; i = i + 1) {
+            Console.WriteLine("  hit id=" + hits[i].id + " dist="
+            + F(hits[i].distance, 6));
+        }
+        if (hits.Count != 3) { bad = bad + 1; }
+        if (hits.Count == 3) {
+            if (hits[0].id != 0) { bad = bad + 1; }
+            if (Math.Abs(hits[0].distance) > 1e-6) { bad = bad + 1; }
+        }
+
+        // 导出 → 导入 → 检索仍然对（往返无损）。
+        string state = store.ExportState();
+        VectorStore store2 = VectorStore.ImportState(state);
+        Console.WriteLine("restored count=" + store2.Count()
+        + " dims=" + store2.Dimensions());
+        if (store2.Count() != 3) { bad = bad + 1; }
+        if (store2.Dimensions() != 2) { bad = bad + 1; }
+        if (store2.TextOf(0) != "苹果手机") { bad = bad + 1; }
+        if (store2.MetaOf(2) != "m2") { bad = bad + 1; }
+        List<VectorHit> hits2 = store2.Search(q, 1);
+        if (hits2.Count != 1 || hits2[0].id != 0) { bad = bad + 1; }
+
+        // ---- 13. 混合检索 + RRF 融合 ----
+        Bm25Index bm = new Bm25Index(new TextTokenizer());
+        bm.Add(0, "苹果手机");
+        bm.Add(1, "香蕉牛奶");
+        bm.Add(2, "苹果牛奶");
+        Retriever ret = new Retriever(store, bm);
+
+        // 向量路：最近的是 id=0。
+        List<RetrieverHit> vh = ret.SearchVector(q, 3);
+        Console.WriteLine("vector hits=" + vh.Count);
+        for (int i = 0; i < vh.Count; i = i + 1) {
+            Console.WriteLine("  v id=" + vh[i].id + " rank=" + vh[i].vectorRank
+            + " dist=" + F(vh[i].vectorDistance, 6));
+        }
+        if (vh.Count != 3) { bad = bad + 1; }
+        if (vh.Count == 3 && vh[0].id != 0) { bad = bad + 1; }
+
+        // 字面路："苹果" 命中 id=0 与 id=2。
+        List<RetrieverHit> bh = ret.SearchKeyword("苹果", 3);
+        Console.WriteLine("keyword hits=" + bh.Count);
+        for (int i = 0; i < bh.Count; i = i + 1) {
+            Console.WriteLine("  b id=" + bh[i].id + " rank=" + bh[i].bm25Rank);
+        }
+        if (bh.Count != 2) { bad = bad + 1; }
+
+        // 融合：两路都命中的排前面，RRF 分数 = 1/(k+rank) 之和。
+        List<RetrieverHit> fh = ret.Search(q, "苹果", 3);
+        Console.WriteLine("fused hits=" + fh.Count);
+        for (int i = 0; i < fh.Count; i = i + 1) {
+            Console.WriteLine("  f id=" + fh[i].id + " vrank=" + fh[i].vectorRank
+            + " brank=" + fh[i].bm25Rank + " rrf=" + F(fh[i].score, 6)
+            + " both=" + fh[i].BothHit());
+        }
+        if (fh.Count != 3) { bad = bad + 1; }
+        if (fh.Count == 3) {
+            if (fh[0].id != 0) { bad = bad + 1; }
+            if (fh[0].vectorRank != 1 || fh[0].bm25Rank != 1) { bad = bad + 1; }
+            // RRF(k=60)：id0 = 2/(60+1) = 0.032787
+            if (Math.Abs(fh[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+            // 只命中一路的 id1：1/(60+3) = 0.015873
+            if (fh[2].id != 1) { bad = bad + 1; }
+            if (fh[2].bm25Rank != 0) { bad = bad + 1; }
+            if (Math.Abs(fh[2].score - 1.0 / 63.0) > 1e-9) { bad = bad + 1; }
+        }
+
+        // 融合的顺序必须稳定（同分按 id 升序）。
+        List<RetrieverHit> fh2 = ret.Search(q, "苹果", 3);
+        if (fh2.Count == fh.Count) {
+            for (int i = 0; i < fh2.Count; i = i + 1) {
+                if (fh2[i].id != fh[i].id) { bad = bad + 1; }
+            }
+        }
+
+        // ---- 14. 占位符替换（全部替换）----
+        Console.WriteLine("replace=" + Rag.ReplaceToken("A{{x}}B{{x}}C", "{{x}}", "-"));
+        if (Rag.ReplaceToken("A{{x}}B{{x}}C", "{{x}}", "-") != "A-B-C") { bad = bad + 1; }
+        if (Rag.ReplaceToken("没有占位符", "{{x}}", "-") != "没有占位符") { bad = bad + 1; }
+        if (Rag.ReplaceToken("", "{{x}}", "-") != "") { bad = bad + 1; }
+
+        // 默认模板必须含两个占位符。
+        string dtpl = Rag.DefaultTemplate();
+        if (dtpl.IndexOf("{{context}}") < 0) { bad = bad + 1; }
+        if (dtpl.IndexOf("{{question}}") < 0) { bad = bad + 1; }
 
         Console.WriteLine("ai-pipeline-ok: " + (bad == 0 ? 1 : 0));
         return bad == 0 ? 0 : 1;
