@@ -1,0 +1,45 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 索引写入的**统一契约**——让 `Rag.Index` 不绑定具体后端。
+//
+// ## 为什么与 `IRetriever` 分开
+//
+// 读与写的约束不一样：
+//
+// - **读**有同步与协程两版（远端后端只能协程读）。
+// - **写**永远是协程（远端写是一次网络往返）。内存与本地后端没有 IO
+//   等待，协程版直接转发同步实现即可。
+//
+// 所以写侧只需要协程版本，接口更小。
+//
+// ## id 由谁分配
+//
+// **由后端分配**——这是关键差异：
+//
+// - 内存档（`VectorStore`）的 id 由调用方给（`startId + i`）。
+// - 数据库档（`ZanDb`）的 id 由**服务端**分配（`Collection.NextId`），
+//   数据库自己保证 id 唯一与单调。
+//
+// 如果让调用方分配 id，数据库档就得"先查最大 id 再 +1"——那是竞态
+// （两个进程同时写会撞 id）。所以**写契约返回后端分配的 id**，让
+// `Rag.Index` 把块与 id 对上。
+//
+// ## 失败语义
+//
+// 失败用返回值不用异常：本包一致。返回 -1 表示失败（原因在
+// `LastError`），返回 >= 0 表示写入的条数。
+
+public interface IIndexWriter {
+    // 批量写入（正文 + 向量 + 元数据），返回**后端分配的 id 列表**。
+    //
+    // texts / vectors / metas 三者等长；metas 可为 null（当无元数据）。
+    // 失败返回 null（原因在 `LastError`）。
+    async List<int> Write(List<string> texts, List<List<double>> vectors,
+    List<string> metas);
+
+    // 上一次失败的原因（成功时为空串）。
+    string LastError();
+}

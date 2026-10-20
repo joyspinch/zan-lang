@@ -1,0 +1,64 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 检索器的**统一契约**——让 `Rag` 编排层不绑定具体后端。
+//
+// ## 为什么需要这层
+//
+// 检索有三个后端：内存（`Retriever`）、本地持久化（`ZanDbRetriever`）、
+// 远端（`RemoteZanDbRetriever`）。它们的存储与并发模型完全不同，但
+// **检索语义完全一致**（同一 RRF 公式、同一 `RetrieverHit` 实体）。
+//
+// `Rag` 如果只认内存档，接本地/远端档就得绕开编排层自己拼提示词——
+// 那就等于没有编排层。所以抽一层契约。
+//
+// ## 契约的三件事
+//
+// 1. **检索**（同步 + 协程两版）：给定查询向量与查询文本，返回命中。
+//    为什么同步也要：本地档（文件 + 内存索引）**没有 IO 等待**，同步
+//    调用更直白；远端档必须用协程版（阻塞会把 worker 的事件循环停掉）。
+//    同步版在远端档上应当**明确报错**，而不是悄悄阻塞——那会伪装成
+//    "能用"，实际把并发能力废掉了。
+// 2. **取原文**：按命中 id 读回块的正文（引用溯源要它）。
+// 3. **失败原因**：检索失败时给出可读原因（`lastError`）。
+//
+// ## 为什么不用"传函数"而用接口
+//
+// 传委托（`delegate`）也能做到，但：接口能**同时**声明同步与协程
+// 两套方法（委托做不到——一个委托只有一个签名），而远端档**必须**
+// 走协程路径。
+//
+// ## 失败语义
+//
+// 与本包一致：**失败用返回值不用异常**。检索无结果返回空列表（不是
+// null），失败原因在 `lastError`。
+
+public interface IRetriever {
+    // 混合检索（同步版）。
+    //
+    // 只做本地检索的后端实现它；远端后端**应当报错**（阻塞会停掉
+    // worker 的事件循环，把并发限制在 worker 数量上）。
+    //
+    // 返回按 RRF 分数降序排好的命中；无结果返回空列表。
+    List<RetrieverHit> Search(List<double> queryVector, string queryText,
+    int k);
+
+    // 混合检索（协程版）。
+    //
+    // 所有后端都要实现——远端档必须走这条路径。
+    async List<RetrieverHit> SearchAsync(List<double> queryVector,
+    string queryText, int k);
+
+    // 按命中 id 取回原文（引用溯源用）。
+    //
+    // 取不到返回空串（不是 null）。
+    string TextOf(int id);
+
+    // 按命中 id 取回原文（协程版）。
+    async string TextOfAsync(int id);
+
+    // 上一次失败的原因（成功时为空串）。
+    string LastError();
+}

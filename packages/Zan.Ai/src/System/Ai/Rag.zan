@@ -18,6 +18,16 @@ namespace System.Ai;
 //    只调 embedding + 补全。文档多的场景用这个（embedding 比补全便宜，
 //    但没必要为同一份文档反复付费）。
 //
+// ## 后端无关
+//
+// 检索与写入都走**接口**（`IRetriever` / `IIndexWriter`），所以内存档、
+// 本地持久化档、远端档都能直接接进编排层——三档的检索语义一致
+// （同一 RRF 公式、同一命中实体），换后端不改变答案。
+//
+// 写侧**必须**与读侧配套：检索器要能取回命中的原文（引用溯源要它），
+// 写入器要能写进同一个库。所以 `Rag` 要求两者来自**同一个后端**——
+// 这不是限制，是正确性要求（写进 A 库、从 B 库读，是配错了）。
+//
 // ## 引用溯源
 //
 // `RagAnswer` 带 `citations`（命中的块 + 原文 + 分数）。这是 RAG 与
@@ -32,8 +42,11 @@ public class Rag {
     // 客户端（调 embedding 与补全）。
     private AiClient client;
 
-    // 检索器。
-    private Retriever retriever;
+    // 检索器（后端无关）。
+    private IRetriever retriever;
+
+    // 写入器（后端无关）。
+    private IIndexWriter writer;
 
     // 分块参数。
     private int chunkChars;
@@ -48,9 +61,10 @@ public class Rag {
     // 上一次失败的原因。
     public string lastError;
 
-    public Rag(AiClient client, Retriever retriever) {
+    public Rag(AiClient client, IRetriever retriever, IIndexWriter writer) {
         this.client = client;
         this.retriever = retriever;
+        this.writer = writer;
         this.chunkChars = 800;
         this.chunkOverlap = 120;
         this.topK = 4;
@@ -87,16 +101,14 @@ public class Rag {
 
     // 离线索引：把文档切块并向量化入库。
     //
-    // 向量库与 BM25 索引由 `retriever` 背后的 `VectorStore` 与
-    // `Bm25Index` 承载——本方法只负责产出块与向量并写进去。
-    //
     // 返回入库的块数；失败返回 -1（原因在 lastError）。
     //
-    // 注意：id 必须与 `Retriever` 用的两个索引**一致**——所以本方法
-    // 统一用块序号当 id，两路都按这个 id 写。
-    public async int Index(VectorStore store, Bm25Index keyword, string document) {
+    // **id 由后端分配**（`IIndexWriter.Write` 返回）——数据库档的 id 是
+    // 服务端在事务内发的，调用方给的 id 会撞车（两个进程同时写）。
+    public async int Index(string document) {
         this.lastError = "";
-        if (store == null) { this.lastError = "没有向量库"; return -1; }
+        if (this.writer == null) { this.lastError = "没有写入器"; return -1; }
+        if (this.client == null) { this.lastError = "没有客户端"; return -1; }
         List<AiChunk> chunks = Chunking.Recursive(document, this.chunkChars,
         this.chunkOverlap);
         if (chunks.Count == 0) { this.lastError = "文档为空"; return -1; }
@@ -111,23 +123,22 @@ public class Rag {
             this.lastError = "向量化失败：" + this.client.lastError;
             return -1;
         }
-        // 入库（id = 块序号，两路统一）。
-        for (int i = 0; i < chunks.Count; i = i + 1) {
-            store.Add(i, emb.At(i), chunks[i].text, "");
-            if (keyword != null) {
-                keyword.Add(i, chunks[i].text);
-            }
+        // 入库（id 由后端分配）。
+        List<int> ids = await this.writer.Write(texts, emb.vectors, null);
+        if (ids == null) {
+            this.lastError = "入库失败：" + this.writer.LastError();
+            return -1;
         }
-        return chunks.Count;
+        return ids.Count;
     }
 
     // 在线问答：检索 → 拼提示词 → 调补全。
     //
     // 返回答案（含引用）；失败返回 null（原因在 lastError）。
-    public async RagAnswer Ask(string question, VectorStore store) {
+    public async RagAnswer Ask(string question) {
         this.lastError = "";
         if (this.client == null) { this.lastError = "没有客户端"; return null; }
-        if (store == null) { this.lastError = "没有向量库"; return null; }
+        if (this.retriever == null) { this.lastError = "没有检索器"; return null; }
         if (question == null || question.Length == 0) {
             this.lastError = "问题为空";
             return null;
@@ -142,9 +153,9 @@ public class Rag {
             return null;
         }
 
-        // 2) 混合检索。
-        List<RetrieverHit> hits = this.retriever.Search(qemb.At(0), question,
-        this.topK);
+        // 2) 混合检索（协程版——远端后端只能这么走）。
+        List<RetrieverHit> hits = await this.retriever.SearchAsync(qemb.At(0),
+        question, this.topK);
         if (hits.Count == 0) {
             this.lastError = "没有检索到相关资料";
             return null;
@@ -156,7 +167,7 @@ public class Rag {
         StringBuilder ctx = new StringBuilder();
         for (int i = 0; i < hits.Count; i = i + 1) {
             int id = hits[i].id;
-            string text = store.TextOf(id);
+            string text = await this.retriever.TextOfAsync(id);
             RagCitation cite = new RagCitation();
             cite.id = id;
             cite.text = text;

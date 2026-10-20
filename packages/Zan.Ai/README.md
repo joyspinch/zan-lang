@@ -30,7 +30,12 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   另一台机器的 `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议。
   **多机部署用这个**）
 - `System.Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
-  生成；答案带引用溯源）
+  生成；答案带引用溯源。**后端无关**：检索与写入都走接口，三档后端
+  都能直接接进来）
+- `System.Ai` — `IRetriever` / `IIndexWriter`（检索与写入的统一契约，
+  让 `Rag` 不绑定具体后端）
+- `System.Ai` — `VectorStoreWriter`（内存档的写入适配器，把
+  `VectorStore` 包成 `IIndexWriter` 契约）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
   `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit`
 
@@ -45,16 +50,19 @@ AiConfig cfg = new AiConfig("https://api.deepseek.com/v1", "sk-...", "deepseek-c
 AiClient client = new AiClient(cfg);
 
 // ---- 建库（离线索引）----
+// 检索器与写入器来自**同一个后端**（写进 A 库、从 B 库读是配错了）。
 VectorStore store = new VectorStore(1024, true);   // 维度按你的 embedding 模型
 Bm25Index keyword = new Bm25Index(new TextTokenizer());
+Retriever retriever = new Retriever(store, keyword);
+VectorStoreWriter writer = new VectorStoreWriter(store, keyword);
 
-Rag rag = new Rag(client, new Retriever(store, keyword));
+Rag rag = new Rag(client, retriever, writer);
 rag.SetChunking(800, 120);
-int chunks = await rag.Index(store, keyword, documentText);
+int chunks = await rag.Index(documentText);
 Console.WriteLine("入库块数=" + chunks);
 
 // ---- 问答（在线）----
-RagAnswer answer = await rag.Ask("退款要多久？", store);
+RagAnswer answer = await rag.Ask("退款要多久？");
 if (answer == null) {
     Console.WriteLine(rag.lastError);
 } else {
@@ -66,6 +74,26 @@ if (answer == null) {
     }
 }
 ```
+
+**换后端只改两行**——`Rag` 的代码一行不动：
+
+```zan
+// 本地持久化
+ZanDatabase db = ZanDatabase.Open("docs.zz", ZanStore.DUR_SYNC);
+ZanDbRetriever store = new ZanDbRetriever(db, "docs", 1024);
+store.EnsureIndexes();
+Rag rag = new Rag(client, store, store);       // 检索器与写入器是同一个
+
+// 远端（多机共享）
+ZanDbClient dbc = new ZanDbClient("10.0.0.5", 19740, token, "my-app");
+RemoteZanDbRetriever store = new RemoteZanDbRetriever(dbc, "docs", 1024);
+await store.EnsureIndexesAsync("init-1");
+Rag rag = new Rag(client, store, store);
+```
+
+三档后端的**检索语义完全一致**（同一 RRF 公式、同一命中实体），所以
+换后端**不改变答案**——conformance 里有一条断言专门盯这个：三个后端
+跑同一条 `Rag` 管线，引用原文、顺序、分数、上下文**逐项相等**。
 
 不想要 RAG 这层编排时，三个零件也能单独用：
 
@@ -157,6 +185,23 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
   实体（`AiEmbedding`/`AiChunk`/`AiUsage`/`RetrieverHit`），不靠下标
   对齐。跨边界传输的 JSON 尽早解析成实体。
+- **编排层与存储后端解耦**：检索走 `IRetriever`、写入走
+  `IIndexWriter`。三档后端（内存/本地/远端）实现同一对接口，所以
+  `Rag` 的代码一行不用改就能换后端——换后端**不改变答案**（conformance
+  断言三个后端的引用原文、顺序、分数、上下文逐项相等）。
+- **写侧 id 由后端分配**：数据库档的 id 是服务端在事务内发的
+  （`Collection.NextId`）。让调用方给 id 就得"先查最大 id 再 +1"——
+  那是竞态（两个进程同时写会撞 id）。所以 `IIndexWriter.Write` 返回
+  后端分配的 id 列表。
+- **远端后端的同步接口明确报错**：阻塞等待网络会停掉 worker 的事件
+  循环，把并发限制在 worker 数量上。静默阻塞会伪装成"能用"，实际把
+  并发能力废掉了——所以远端档的 `Search` / `TextOf` 直接抛异常，
+  与 `Zan.Data` 的协程化 MySQL 驱动同款。
+- **`AiClient` 按端点复用 `HttpClient`**：每次请求新建 `HttpClient`
+  等于每次丢掉连接池里的 keep-alive 连接——连接被服务端留着，客户端
+  这边已经把它丢了。实测：每次新建且不关，leakcheck 报"每个请求一个
+  TcpClient 泄漏"。连接池是按 host/port 建的，所以按端点规范化串
+  （`AiEndpoint.Canonical`）做键缓存；`AiClient.Close()` 关掉全部。
 - **失败用返回值不用异常**：网络失败是常态（超时、断网、5xx），
   `Complete` 返回 `null` + `client.lastError` 给出可读原因。
 - **4xx 不重试；POST 补全默认不重试**（`maxAttempts` 默认 1）：
@@ -196,12 +241,13 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 
 - 无重排层（cross-encoder 二次排序）、无 Tool calling、无会话记忆、
   无评估与可观测——这些是后续的档位。
+- 远端档的**同步接口会报错**（`Search` / `TextOf`）——阻塞等待网络会
+  停掉 worker 的事件循环，把并发限制在 worker 数量上。这是有意的：
+  静默阻塞会伪装成"能用"，实际把并发能力废掉了。远端档一律用
+  `SearchAsync` / `TextOfAsync`。
 - 远端档每次操作一次网络往返，**没有连接池化、没有批量检索**
   （`ZanDbClient` 每次 `SendAsync` 新建连接）。高 QPS 场景要在调用方
   做批量与缓存。
-- `Rag` 编排层目前只接**内存档**的检索器（`Rag(client, Retriever)`）；
-  接本地/远端档要自己把检索结果喂进提示词——`Rag` 还没有后端无关的
-  检索器接口。
 - Embeddings 只支持 OpenAI 兼容的 `/v1/embeddings` 协议（DeepSeek、
   OpenAI、Ollama、vLLM、LM Studio 等都兼容这个协议）；不做各厂商
   的私有嵌入协议。

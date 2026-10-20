@@ -41,7 +41,7 @@ namespace System.Ai;
 // 所以 `AddAll` 用 `BatchAsync` 一次事务写一批，且 request id 由调用方
 // 传入（或自动生成一个带序号前缀的）——**重试时用同一个 id** 才幂等。
 
-public class RemoteZanDbRetriever {
+public class RemoteZanDbRetriever : IRetriever, IIndexWriter {
     // 远端客户端。
     private ZanDbClient client;
 
@@ -63,6 +63,9 @@ public class RemoteZanDbRetriever {
     // 归一化开关（入库与查询都按同一口径）。
     private bool normalized;
 
+    // 向量检索的候选宽度（efSearch）。
+    private int efSearch;
+
     // 写请求 id 的自增序号（拼进 request id，保证唯一）。
     private long requestSeq;
 
@@ -78,6 +81,7 @@ public class RemoteZanDbRetriever {
         this.metaField = "meta";
         this.dimensions = dimensions;
         this.normalized = true;
+        this.efSearch = 64;
         this.requestSeq = 0;
         this.lastError = "";
     }
@@ -92,6 +96,12 @@ public class RemoteZanDbRetriever {
     // 归一化开关（入库与查询同口径；改了必须重建索引）。
     public void SetNormalized(bool on) {
         this.normalized = on;
+    }
+
+    // 向量检索的候选宽度（efSearch；默认 64）。
+    public void SetEfSearch(int ef) {
+        if (ef < 1) { ef = 1; }
+        this.efSearch = ef;
     }
 
     // 建索引（文本 + 向量）。**必须在写文档之前调用**。
@@ -161,34 +171,62 @@ public class RemoteZanDbRetriever {
         }
     }
 
-    // 批量写块（一次事务）。
+    // 批量写块（一次事务），返回写入条数。
     //
     // 用 `BatchAsync` 而不是逐条 `InsertAsync`——一次往返一次事务，
     // 逐条是 N 次往返 N 个事务。
+    //
+    // 要服务端分配的 id 用 `Write`（`IIndexWriter` 契约）。
     public async int AddAllAsync(List<string> texts, List<List<double>> vectors,
     string requestId) {
+        List<int> ids = await this.WriteAsync(texts, vectors, null, requestId);
+        return ids == null ? 0 : ids.Count;
+    }
+
+    // ===== IIndexWriter =====
+
+    // 批量写入，返回**服务端分配的 id 列表**。
+    //
+    // 批量子操作各自返回自己的 id（服务端的 `insert` 返回 `NextId`），
+    // 所以这里按顺序收集——不能像本地档那样用"first + i"推算。
+    public async List<int> Write(List<string> texts, List<List<double>> vectors,
+    List<string> metas) {
+        // request id 要在重试循环**外面**取——所以这里自动派生一个。
+        // 调用方要控制幂等语义就用 `WriteAsync`（显式传 request id）。
+        return await this.WriteAsync(texts, vectors, metas,
+        this.NextRequestId("w"));
+    }
+
+    // 批量写入（显式 request id；重试时用同一个 id 才幂等）。
+    public async List<int> WriteAsync(List<string> texts,
+    List<List<double>> vectors, List<string> metas, string requestId) {
         this.lastError = "";
-        if (this.client == null) { this.lastError = "没有客户端"; return 0; }
-        if (texts == null || vectors == null) { this.lastError = "参数为空"; return 0; }
+        List<int> outp = new List<int>();
+        if (this.client == null) { this.lastError = "没有客户端"; return null; }
+        if (texts == null || vectors == null) { this.lastError = "参数为空"; return null; }
         if (texts.Count != vectors.Count) {
             this.lastError = "文本与向量数量不一致";
-            return 0;
+            return null;
         }
         if (texts.Count > ZanDbProtocol.MAX_BATCH) {
             this.lastError = "批量写超过上限 " + Convert.ToString(ZanDbProtocol.MAX_BATCH);
-            return 0;
+            return null;
         }
         try {
             JsonValue ops = JsonValue.NewArray();
             for (int i = 0; i < texts.Count; i = i + 1) {
                 if (vectors[i] == null || vectors[i].Count != this.dimensions) {
                     this.lastError = "第 " + Convert.ToString(i) + " 个向量维度不符";
-                    return 0;
+                    return null;
                 }
                 JsonValue doc = JsonValue.NewObject();
                 doc.PutStr(this.textField, texts[i] == null ? "" : texts[i]);
                 doc.Put(this.vectorField, RemoteZanDbRetriever.ToJsonArray(
                 vectors[i], this.normalized));
+                if (metas != null && i < metas.Count && metas[i] != null
+                && metas[i].Length > 0) {
+                    doc.PutStr(this.metaField, metas[i]);
+                }
                 JsonValue op = JsonValue.NewObject();
                 op.PutStr("action", "insert");
                 // 批量子操作**各自带 collection**（服务端 Validate 要求
@@ -200,20 +238,27 @@ public class RemoteZanDbRetriever {
             JsonValue r = await this.client.BatchAsync(ops, requestId);
             if (!RemoteZanDbRetriever.Ok(r)) {
                 this.lastError = RemoteZanDbRetriever.ErrorText(r);
-                return 0;
+                return null;
             }
-            return texts.Count;
+            JsonValue results = ZanDbProtocol.Member(r, "result");
+            for (int i = 0; i < results.Count(); i = i + 1) {
+                outp.Add(results.At(i).AsInt(0));
+            }
+            return outp;
         } catch (Exception e) {
             this.lastError = "批量写入失败：" + e.Message;
-            return 0;
+            return null;
         }
     }
 
-    // 混合检索（向量 + 字面，RRF 融合）。
+    // 上一次失败的原因。
+    public string LastError() { return this.lastError; }
+
+    // 混合检索（向量 + 字面，RRF 融合），指定候选宽度。
     //
     // queryVector 可为 null（则只做字面检索）；queryText 可为空串
     // （则只做语义检索）。
-    public async List<RetrieverHit> SearchAsync(List<double> queryVector,
+    public async List<RetrieverHit> SearchHybridAsync(List<double> queryVector,
     string queryText, int k, int efSearch) {
         this.lastError = "";
         List<RetrieverHit> outp = new List<RetrieverHit>();
@@ -336,6 +381,32 @@ public class RemoteZanDbRetriever {
         if (doc == null || doc.IsNull()) { return ""; }
         JsonValue v = doc.Get(this.textField);
         return v == null ? "" : v.AsString("");
+    }
+
+    // ===== IRetriever =====
+
+    // 混合检索（用 `SetEfSearch` 设的候选宽度）。
+    public async List<RetrieverHit> SearchAsync(List<double> queryVector,
+    string queryText, int k) {
+        return await this.SearchHybridAsync(queryVector, queryText, k,
+        this.efSearch);
+    }
+
+    // 同步检索——**远端档不可用**。
+    //
+    // 阻塞等待网络会把 worker 的事件循环停掉，把并发限制在 worker 数量
+    // 上。所以这里**明确报错**而不是悄悄阻塞——后者会伪装成"能用"，
+    // 实际把并发能力废掉了。与 `MySqlConnection` 的同步接口同款。
+    public List<RetrieverHit> Search(List<double> queryVector,
+    string queryText, int k) {
+        throw new InvalidOperationException(
+        "远端检索必须用协程版 SearchAsync：同步等待网络会停掉事件循环。");
+    }
+
+    // 同步取原文——同 `Search`，不可用。
+    public string TextOf(int id) {
+        throw new InvalidOperationException(
+        "远端检索必须用协程版 TextOfAsync：同步等待网络会停掉事件循环。");
     }
 
     // 读回某个文档的元数据。

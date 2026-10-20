@@ -1,0 +1,86 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 内存档的写入适配器——把 `VectorStore`（自己分配 id 的内存索引）包成
+// `IIndexWriter` 契约。
+//
+// ## 为什么需要它
+//
+// `VectorStore.Add` 的 id 由**调用方**给（`startId + i`），而数据库档
+// 的 id 由**服务端**分配。`IIndexWriter` 契约统一成"后端分配 id"，
+// 所以内存档需要一个适配器来自己管 id 分配。
+//
+// ## id 分配
+//
+// 维护一个自增计数器。**先看库里已有的最大 id 再接着发**——否则适配器
+// 重建后（`new` 一个新的适配器接着用同一个 `VectorStore`）会从 1
+// 开始发，与已有 id 撞车（`VectorIndex.Add` 的语义是**替换**同名 id，
+// 撞了就静默覆盖掉别人的块）。
+//
+// 这个"查最大值再发"的竞态只存在于内存档——内存档本来就是**单写者**
+// 场景（没有锁、并发写会撕裂图结构）。数据库档没这个问题，因为 id 由
+// 服务端在事务内分配。
+
+public class VectorStoreWriter : IIndexWriter {
+    // 向量库。
+    private VectorStore store;
+
+    // BM25 索引（可为 null——只做语义检索）。
+    private Bm25Index keyword;
+
+    // 下一个要发的 id。
+    private int nextId;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public VectorStoreWriter(VectorStore store, Bm25Index keyword) {
+        this.store = store;
+        this.keyword = keyword;
+        this.nextId = 1;
+        this.lastError = "";
+        // 接着库里已有的最大 id 发（不撞车）。
+        List<int> ids = store.Ids();
+        for (int i = 0; i < ids.Count; i = i + 1) {
+            if (ids[i] >= this.nextId) { this.nextId = ids[i] + 1; }
+        }
+    }
+
+    // 批量写入，返回分配的 id 列表。
+    public async List<int> Write(List<string> texts, List<List<double>> vectors,
+    List<string> metas) {
+        this.lastError = "";
+        List<int> outp = new List<int>();
+        if (this.store == null) { this.lastError = "没有向量库"; return null; }
+        if (texts == null || vectors == null) { this.lastError = "参数为空"; return null; }
+        if (texts.Count != vectors.Count) {
+            this.lastError = "文本与向量数量不一致";
+            return null;
+        }
+        for (int i = 0; i < texts.Count; i = i + 1) {
+            string text = texts[i] == null ? "" : texts[i];
+            string meta = "";
+            if (metas != null && i < metas.Count && metas[i] != null) {
+                meta = metas[i];
+            }
+            int id = this.nextId;
+            try {
+                this.store.Add(id, vectors[i], text, meta);
+            } catch (Exception e) {
+                // `VectorStore.Add` 维度不符会抛 `ArgumentException`——
+                // 契约是"失败用返回值"，所以接住并转成返回值。
+                this.lastError = "写入失败：" + e.Message;
+                return null;
+            }
+            if (this.keyword != null) { this.keyword.Add(id, text); }
+            this.nextId = id + 1;
+            outp.Add(id);
+        }
+        return outp;
+    }
+
+    // 上一次失败的原因。
+    public string LastError() { return this.lastError; }
+}

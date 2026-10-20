@@ -36,12 +36,39 @@ namespace System.Ai;
 // `Stream` 用 SSE 逐块推给回调。回调返回 false 表示**调用方主动停止**
 // （客户端断开），此时不再继续读流。
 
-public class AiClient {
+public class AiClient : IDisposable {
     public AiConfig config;
+
+    // 端点 → HttpClient（**按端点复用**，不是每次请求新建）。
+    //
+    // 为什么不每次新建：`HttpClient` 内部有连接池，每次新建等于每次
+    // 丢掉池子里的 keep-alive 连接——连接被服务端留着，客户端这边却
+    // 已经把它丢了。实测：每次请求新建 `HttpClient` 且不关，leakcheck
+    // 报"10 个 TcpClient / HttpRequest / ByteBuffer 泄漏"（每个请求一个）。
+    //
+    // 为什么不全局共用一个 `HttpClient`：连接池是**按 host/port 建的**，
+    // 换端点就得换客户端。所以按端点规范化串（`AiEndpoint.Canonical`）
+    // 做键，一个端点一个客户端。
+    private Dictionary<string, HttpClient> clients;
 
     public AiClient(AiConfig config) {
         this.config = config == null ? new AiConfig("", "", "") : config;
+        this.clients = new Dictionary<string, HttpClient>();
     }
+
+    // 关闭所有出网连接（进程退出前或长寿命客户端空闲时调用）。
+    //
+    // 不关的话，池子里的 keep-alive 连接会一直挂着到进程退出——服务端
+    // 那边也是（半开连接）。
+    public void Close() {
+        List<string> keys = this.clients.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            this.clients[keys[i]].Close();
+        }
+        this.clients.Clear();
+    }
+
+    public void Dispose() { this.Close(); }
 
     // 构造（直接给三元组）。
     public AiClient(string baseUrl, string apiKey, string model) {
@@ -231,17 +258,7 @@ public class AiClient {
             }
             HttpClient http = null;
             try {
-                if (ep.Tls()) {
-                    http = HttpClient.CreateHttps(ep.Host(), ep.Port());
-                } else {
-                    http = new HttpClient(ep.Host(), ep.Port());
-                }
-                http.SetCallPolicy(this.Policy(ep));
-                http.SetHeader("Content-Type", "application/json");
-                http.SetHeader("Accept", "application/json");
-                if (this.config.apiKey.Length > 0) {
-                    http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
-                }
+                http = this.Client(ep);
                 HttpResponse resp = await http.SendAsync("POST", ep.Path() + path, payload);
                 int status = resp.statusCode;
                 string bodyText = resp.body;
@@ -260,6 +277,29 @@ public class AiClient {
         }
         this.lastError = lastReason;
         return null;
+    }
+
+    // 取（或建）该端点的 `HttpClient`。
+    //
+    // 同一个端点复用同一个客户端，连接池才能生效；换端点就换客户端
+    // （池是按 host/port 建的）。
+    private HttpClient Client(AiEndpoint ep) {
+        string key = ep.Canonical();
+        if (this.clients.ContainsKey(key)) { return this.clients[key]; }
+        HttpClient http = null;
+        if (ep.Tls()) {
+            http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+        } else {
+            http = new HttpClient(ep.Host(), ep.Port());
+        }
+        http.SetCallPolicy(this.Policy(ep));
+        http.SetHeader("Content-Type", "application/json");
+        http.SetHeader("Accept", "application/json");
+        if (this.config.apiKey.Length > 0) {
+            http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
+        }
+        this.clients[key] = http;
+        return http;
     }
 
     // 出网预算。响应与请求体都有上限，超限的响应不会进内存。

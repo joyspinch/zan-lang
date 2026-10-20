@@ -42,7 +42,7 @@ namespace System.Ai;
 // 分数（内存版 `RetrieverHit` 有）。要用原始分数就分两路查
 // `SearchText` / `SearchVector` 自己合并。
 
-public class ZanDbRetriever {
+public class ZanDbRetriever : IRetriever, IIndexWriter {
     // 数据库。
     private ZanDatabase db;
 
@@ -64,6 +64,9 @@ public class ZanDbRetriever {
     // 归一化开关（入库与查询都按同一口径）。
     private bool normalized;
 
+    // 向量检索的候选宽度（efSearch）。
+    private int efSearch;
+
     // 上一次失败的原因。
     public string lastError;
 
@@ -75,6 +78,7 @@ public class ZanDbRetriever {
         this.metaField = "meta";
         this.dimensions = dimensions;
         this.normalized = true;
+        this.efSearch = 64;
         this.lastError = "";
     }
 
@@ -88,6 +92,14 @@ public class ZanDbRetriever {
     // 归一化开关（入库与查询同口径；改了必须重建索引）。
     public void SetNormalized(bool on) {
         this.normalized = on;
+    }
+
+    // 向量检索的候选宽度（efSearch；默认 64）。
+    //
+    // 调大 → 召回更全、延迟更高；调小 → 快但可能漏。HNSW 的标准取舍。
+    public void SetEfSearch(int ef) {
+        if (ef < 1) { ef = 1; }
+        this.efSearch = ef;
     }
 
     // 建索引（文本 + 向量）。**必须在写文档之前调用**。
@@ -199,6 +211,75 @@ public class ZanDbRetriever {
             this.lastError = "检索失败：" + e.Message;
             return outp;
         }
+    }
+
+    // ===== IIndexWriter =====
+
+    // 批量写入，返回**服务端分配的 id 列表**。
+    //
+    // id 由数据库分配（`Collection.NextId`）——不是调用方给的。调用方
+    // 给 id 就得"先查最大 id 再 +1"，那是竞态（两个进程同时写会撞 id）。
+    public async List<int> Write(List<string> texts, List<List<double>> vectors,
+    List<string> metas) {
+        this.lastError = "";
+        List<int> outp = new List<int>();
+        if (this.db == null) { this.lastError = "没有数据库"; return null; }
+        if (texts == null || vectors == null) { this.lastError = "参数为空"; return null; }
+        if (texts.Count != vectors.Count) {
+            this.lastError = "文本与向量数量不一致";
+            return null;
+        }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            List<JsonValue> docs = new List<JsonValue>();
+            for (int i = 0; i < texts.Count; i = i + 1) {
+                if (vectors[i] == null || vectors[i].Count != this.dimensions) {
+                    this.lastError = "第 " + Convert.ToString(i) + " 个向量维度不符";
+                    return null;
+                }
+                JsonValue doc = JsonValue.NewObject();
+                doc.PutStr(this.textField, texts[i] == null ? "" : texts[i]);
+                doc.Put(this.vectorField, ZanDbRetriever.ToJsonArray(vectors[i],
+                this.normalized));
+                if (metas != null && i < metas.Count && metas[i] != null
+                && metas[i].Length > 0) {
+                    doc.PutStr(this.metaField, metas[i]);
+                }
+                docs.Add(doc);
+            }
+            // `InsertBulk` 返回**第一个** id，后续是连续的（first + i）。
+            int first = cols.InsertBulk(docs);
+            for (int i = 0; i < docs.Count; i = i + 1) { outp.Add(first + i); }
+            return outp;
+        } catch (Exception e) {
+            this.lastError = "批量写入失败：" + e.Message;
+            return null;
+        }
+    }
+
+    // ===== IRetriever =====
+
+    // 检索失败的原因。
+    public string LastError() { return this.lastError; }
+
+    // 混合检索（用 `SetEfSearch` 设的候选宽度）。
+    //
+    // 这是 `IRetriever` 的签名——`Rag` 编排层只认这一个。
+    public List<RetrieverHit> Search(List<double> queryVector, string queryText,
+    int k) {
+        return this.Search(queryVector, queryText, k, this.efSearch);
+    }
+
+    // 协程版检索——本地档是文件 + 内存索引，**没有 IO 等待**，直接转发
+    // 同步实现（与 `MySqlSyncConnection` 的 `*Async` 转发同款）。
+    public async List<RetrieverHit> SearchAsync(List<double> queryVector,
+    string queryText, int k) {
+        return this.Search(queryVector, queryText, k, this.efSearch);
+    }
+
+    // 协程版取原文——同上，直接转发。
+    public async string TextOfAsync(int id) {
+        return this.TextOf(id);
     }
 
     // 分两路查（要两路的原始排名与分数时用）。

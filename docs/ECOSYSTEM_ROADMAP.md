@@ -831,6 +831,9 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `Retriever.zan` | 同上 | `Retriever`：**内存**混合检索（向量 + BM25）+ **RRF 融合**；保留两路原始排名与分数 |
 | `ZanDbRetriever.zan` | 同上 | `ZanDbRetriever`：**本地持久化**混合检索——文档与索引存 `ZanDb`（事务 + journal + 检查点），走原生 `Collection.SearchHybrid` |
 | `RemoteZanDbRetriever.zan` | 同上 | `RemoteZanDbRetriever`：**远端**混合检索——文档与索引在另一台机器的 `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议 |
+| `IRetriever.zan` | 同上 | `IRetriever`：检索的**统一契约**（同步 + 协程两版检索、取原文、失败原因） |
+| `IIndexWriter.zan` | 同上 | `IIndexWriter`：写入的统一契约（**后端分配 id**，返回 id 列表） |
+| `VectorStoreWriter.zan` | 同上 | `VectorStoreWriter`：内存档的写入适配器（把 `VectorStore` 包成 `IIndexWriter`） |
 | `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
 | `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
@@ -926,11 +929,29 @@ embedding 分量（量级 0.01~1）相对误差约 1e-8，余弦相似度偏差�
 1e-9——对检索排序**没有可观察的影响**。但需要与服务端原始向量逐位
 一致时（跨系统精确比对）**不能经过这层**，直接用 `AiEmbedding.vectors`。
 
+**编排层与存储后端解耦**（补记）：`Rag` 原来只认内存档的 `Retriever`
+（签名写死），接本地/远端档就得绕开编排层自己拼提示词——那等于没有
+编排层。现在抽出两个契约：
+
+- `IRetriever`：**同步 + 协程两版**检索、取原文、失败原因。为什么两
+  版：本地档（文件 + 内存索引）没有 IO 等待，同步更直白；远端档**必须**
+  走协程（阻塞会停掉 worker 的事件循环，把并发限制在 worker 数量上）。
+- `IIndexWriter`：批量写入，**id 由后端分配**。数据库档的 id 是服务端
+  在事务内发的（`Collection.NextId`）；让调用方给 id 就得"先查最大 id
+  再 +1"——那是竞态（两个进程同时写会撞 id）。
+
+远端档的**同步接口明确报错**（`Search` / `TextOf` 抛异常），与
+`Zan.Data` 的协程化 MySQL 驱动同款——静默阻塞会伪装成"能用"，实际把
+并发能力废掉了。
+
+conformance `ai_rag` 在本进程内起**真的 HTTP 服务**当假 AI 端点
+（embedding + 补全）与**真的 TCP 服务**当远端 ZanDb，跑同一个 `Rag`
+管线接三个后端，断言三者的**引用原文、顺序、分数、上下文逐项相等**。
+
 **已知边界**：无重排（cross-encoder 重排那一层）、远端档每次操作一次
 网络往返（`ZanDbClient` 每次 `SendAsync` 新建连接，**无连接池化、无
-批量检索**）、`Rag` 编排层目前只接**内存档**的检索器（还没有后端无关
-的检索器接口）、无 Tool calling、无会话记忆、无评估与可观测、无流式
-的**背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
+批量检索**）、无 Tool calling、无会话记忆、无评估与可观测、无流式的
+**背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
 （要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
 私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调 embedding 服务**
 （没有本地离线 embedding 模型）。

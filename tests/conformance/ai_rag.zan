@@ -1,0 +1,406 @@
+// RAG 编排层的后端无关化：`Rag` 的检索与写入都走接口
+// （`IRetriever` / `IIndexWriter`），所以内存档、本地持久化档、远端档
+// 都能直接接进编排层。
+//
+// 覆盖：
+// - **同一个 `Rag` 编排接三个不同后端**，走完 索引 → 问答 全流程，
+//   三者的答案、引用、上下文**完全一致**（换后端不改变行为）。
+// - **引用溯源**：答案带命中块 id、原文、两路排名。
+// - **写侧 id 由后端分配**（不是调用方给——数据库档的 id 是服务端在
+//   事务内发的，调用方给的会撞车）。
+// - 远端档的**同步接口必须报错**（阻塞网络会停掉事件循环，把并发
+//   限制在 worker 数量上）——静默阻塞会伪装成"能用"。
+// - 失败语义：检索无结果 / 空文档 / 写失败都返回 null + 可读原因。
+//
+// 用例**在本进程内起一个真的 HTTP 服务**当假 AI 端点（embedding 与
+// 补全），以及一个**真的 TCP 服务**当远端 ZanDb。
+using System;
+using System.Ai;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+
+namespace Conf;
+
+class Prog {
+    // 假 AI 端点的端口。
+    static int AI_PORT = 19881;
+
+    // 远端数据库的端口。
+    static int DB_PORT = 19882;
+
+    // 令牌。
+    static string TOKEN = "ai-rag-conformance-token-2026";
+
+    // 上一次嵌入请求收到的文本数（用来生成对应数量的向量）。
+    static int lastEmbedCount;
+
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 定点打印。
+    static string F(double v) {
+        return Convert.ToString(Math.Round(v * 1000000.0) / 1000000.0);
+    }
+
+    static void Clean(string path) {
+        File.Delete(path);
+        File.Delete(path + ".lock");
+        File.Delete(path + ".m0");
+        File.Delete(path + ".m1");
+        for (int i = 0; i < 100; i = i + 1) {
+            File.Delete(path + ".s" + Convert.ToString(i));
+        }
+    }
+
+    // 假 AI 端点：/v1/embeddings 与 /v1/chat/completions。
+    static async HttpResponse Handle(HttpRequest req) {
+        HttpResponse res = new HttpResponse();
+        res.statusCode = 200;
+        res.statusText = "OK";
+        res.contentType = "application/json";
+        res.keepAlive = true;
+        if (req.path.IndexOf("/embeddings") >= 0) {
+            // 从请求体里数出输入条数（按 "input" 数组的元素数）。
+            int n = Prog.CountInputs(req.body);
+            Prog.lastEmbedCount = n;
+            StringBuilder sb = new StringBuilder();
+            sb.Append("{\"data\":[");
+            for (int i = 0; i < n; i = i + 1) {
+                if (i > 0) { sb.Append(","); }
+                // 交替给两个方向，好让"语义相近"可预期。
+                double a = (i % 2 == 0) ? 1.0 : 0.0;
+                double b = (i % 2 == 0) ? 0.0 : 1.0;
+                sb.Append("{\"index\":");
+                sb.Append(Convert.ToString(i));
+                sb.Append(",\"embedding\":[");
+                sb.Append(Convert.ToString(a));
+                sb.Append(",");
+                sb.Append(Convert.ToString(b));
+                sb.Append("]}");
+            }
+            sb.Append("],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+            res.body = sb.ToString();
+            return res;
+        }
+        // 补全：把提示词回显，好让用例能验证上下文确实拼进去了。
+        string marker = "";
+        if (req.body != null) {
+            int at = req.body.IndexOf("资料：");
+            if (at >= 0) {
+                int end = req.body.IndexOf("问题：", at);
+                if (end > at) { marker = req.body.Substring(at, end - at); }
+            }
+        }
+        res.body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\""
+        + Prog.Escape(marker) + "\"}}]}";
+        return res;
+    }
+
+    // JSON 字符串转义（只处理用例里出现的几种）。
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { sb.Append("\\r"); }
+            else { sb.Append(c); }
+        }
+        return sb.ToString();
+    }
+
+    // 数出 "input" 数组的元素个数（不解析完整 JSON——用例里的请求体
+    // 格式是已知的，数引号分隔的顶层元素就够）。
+    static int CountInputs(string body) {
+        if (body == null) { return 0; }
+        int at = body.IndexOf("\"input\":");
+        if (at < 0) { return 0; }
+        int open = body.IndexOf("[", at);
+        if (open < 0) { return 0; }
+        int depth = 0;
+        bool inStr = false;
+        int commas = 0;
+        int items = 0;
+        bool sawAny = false;
+        for (int i = open; i < body.Length; i = i + 1) {
+            string c = body.Substring(i, 1);
+            if (c == "\\" && inStr) { i = i + 1; continue; }
+            if (c == "\"") { inStr = !inStr; if (!inStr) { sawAny = true; } continue; }
+            if (inStr) { continue; }
+            if (c == "[") { depth = depth + 1; continue; }
+            if (c == "]") { depth = depth - 1; if (depth == 0) { break; } continue; }
+            if (c == "," && depth == 1) { commas = commas + 1; }
+        }
+        if (!sawAny) { return 0; }
+        items = commas + 1;
+        return items;
+    }
+
+    // 造一个指向假 AI 端点的客户端。
+    static AiClient MakeClient() {
+        AiConfig cfg = new AiConfig("http://127.0.0.1:" + Convert.ToString(Prog.AI_PORT),
+        "fake-key", "fake-model");
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 8000;
+        cfg.maxAttempts = 1;
+        return new AiClient(cfg);
+    }
+
+    // 跑一遍"索引 → 问答"，返回关键结果供比对。
+    static RagAnswer RunPipeline(IRetriever retriever, IIndexWriter writer,
+    string doc, string question) {
+        AiClient client = Prog.MakeClient();
+        Rag rag = new Rag(client, retriever, writer);
+        rag.SetChunking(200, 20);
+        rag.SetTopK(2);
+        int indexed = await rag.Index(doc);
+        if (indexed <= 0) {
+            Console.WriteLine("index failed: " + rag.lastError);
+            client.Close();
+            return null;
+        }
+        RagAnswer ans = await rag.Ask(question);
+        // **必须 Close()**：客户端的连接池里留着 keep-alive 连接，不关的
+        // 话服务端那边也是半开连接 → leakcheck 报泄漏。
+        client.Close();
+        if (ans == null) {
+            Console.WriteLine("ask failed: " + rag.lastError);
+            return null;
+        }
+        return ans;
+    }
+
+    // 答案的归一化描述（用于跨后端比对）。
+    static string Digest(RagAnswer a) {
+        if (a == null) { return "null"; }
+        StringBuilder sb = new StringBuilder();
+        sb.Append("cites=");
+        sb.Append(Convert.ToString(a.citations.Count));
+        for (int i = 0; i < a.citations.Count; i = i + 1) {
+            sb.Append("|");
+            sb.Append(Convert.ToString(a.citations[i].id));
+            sb.Append(":");
+            sb.Append(a.citations[i].text);
+            sb.Append(":");
+            sb.Append(Prog.F(a.citations[i].score));
+        }
+        sb.Append(" ctx=");
+        sb.Append(a.context);
+        sb.Append(" ans=");
+        sb.Append(a.text);
+        return sb.ToString();
+    }
+
+    static int Run() {
+        int bad = 0;
+        Directory.CreateDirectory("_scratch");
+
+        // 起假 AI 端点。
+        HttpServer ai = new HttpServer("127.0.0.1", AI_PORT);
+        ai.OnRequest(Prog.Handle);
+        ai.Start();
+
+        // 起远端数据库。
+        string dbPath = "_scratch/ai_rag_remote.zdb";
+        Clean(dbPath);
+        ZanDbServerOptions opts = new ZanDbServerOptions();
+        opts.path = dbPath;
+        opts.token = TOKEN;
+        opts.host = "127.0.0.1";
+        opts.port = DB_PORT;
+        ZanDbServer server = new ZanDbServer(opts);
+        server.Start();
+        Task.Run(() => { server.RunAsync(); });
+
+        string doc = "苹果 手机 很好用 电池 续航 长";
+        string question = "手机";
+
+        // ---- 1. 内存档 ----
+        RagAnswer memAns = null;
+        {
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Retriever r = new Retriever(vs, bm);
+            VectorStoreWriter w = new VectorStoreWriter(vs, bm);
+            memAns = Prog.RunPipeline(r, w, doc, question);
+            if (memAns == null) { bad = bad + 1; }
+        }
+
+        // ---- 2. 本地持久化档 ----
+        RagAnswer localAns = null;
+        {
+            string localPath = "_scratch/ai_rag_local.zdb";
+            Clean(localPath);
+            ZanDatabase db = ZanDatabase.Open(localPath, ZanStore.DUR_SYNC);
+            ZanDbRetriever r = new ZanDbRetriever(db, "docs", 2);
+            r.SetNormalized(true);
+            r.EnsureIndexes();
+            localAns = Prog.RunPipeline(r, r, doc, question);
+            if (localAns == null) { bad = bad + 1; }
+            r.Close();
+            Clean(localPath);
+        }
+
+        // ---- 3. 远端档 ----
+        RagAnswer remoteAns = null;
+        {
+            ZanDbClient client = new ZanDbClient("127.0.0.1", DB_PORT, TOKEN, "rag");
+            RemoteZanDbRetriever r = new RemoteZanDbRetriever(client, "docs", 2);
+            r.SetNormalized(true);
+            bool indexed = await r.EnsureIndexesAsync("rag-idx");
+            if (!indexed) {
+                Console.WriteLine("remote index failed: " + r.lastError);
+                bad = bad + 1;
+            }
+            remoteAns = Prog.RunPipeline(r, r, doc, question);
+            if (remoteAns == null) { bad = bad + 1; }
+            // 远端档的**同步接口必须报错**（阻塞网络会停掉事件循环）。
+            bool threw = false;
+            try {
+                r.Search(new List<double>(), question, 2);
+            } catch (Exception e) {
+                threw = true;
+            }
+            if (!threw) { bad = bad + 1; }
+            bool textThrew = false;
+            try {
+                r.TextOf(1);
+            } catch (Exception e) {
+                textThrew = true;
+            }
+            if (!textThrew) { bad = bad + 1; }
+            client.Close();
+        }
+
+        // ---- 4. 三后端结果必须一致 ----
+        //
+        // 引用 id 可以不同（id 由后端分配，起点不一样），但**引用的
+        // 原文、顺序、分数**必须一致。
+        if (memAns != null && localAns != null && remoteAns != null) {
+            string m = Prog.Digest(memAns);
+            string l = Prog.Digest(localAns);
+            string rm = Prog.Digest(remoteAns);
+            Console.WriteLine("mem=" + m);
+            Console.WriteLine("local=" + l);
+            Console.WriteLine("remote=" + rm);
+            // 分数与原文逐项比对（id 除外）。
+            if (memAns.citations.Count != localAns.citations.Count
+            || memAns.citations.Count != remoteAns.citations.Count) {
+                bad = bad + 1;
+            } else {
+                for (int i = 0; i < memAns.citations.Count; i = i + 1) {
+                    if (memAns.citations[i].text != localAns.citations[i].text
+                    || memAns.citations[i].text != remoteAns.citations[i].text) {
+                        bad = bad + 1;
+                    }
+                    if (Math.Abs(memAns.citations[i].score
+                    - localAns.citations[i].score) > 1e-12
+                    || Math.Abs(memAns.citations[i].score
+                    - remoteAns.citations[i].score) > 1e-12) {
+                        bad = bad + 1;
+                    }
+                }
+                if (memAns.context != localAns.context
+                || memAns.context != remoteAns.context) {
+                    bad = bad + 1;
+                }
+            }
+        } else {
+            bad = bad + 1;
+        }
+
+        // ---- 5. 引用溯源细节 ----
+        if (memAns != null) {
+            Console.WriteLine("cites=" + Convert.ToString(memAns.citations.Count));
+            if (memAns.citations.Count == 0) { bad = bad + 1; }
+            for (int i = 0; i < memAns.citations.Count; i = i + 1) {
+                if (memAns.citations[i].text.Length == 0) { bad = bad + 1; }
+                if (memAns.citations[i].score <= 0.0) { bad = bad + 1; }
+            }
+            // 上下文里必须有资料标记（证明模板拼对了）。
+            if (memAns.context.IndexOf("苹果") < 0) { bad = bad + 1; }
+        }
+
+        // ---- 6. 失败语义 ----
+        {
+            // 空文档 → 索引失败。
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Retriever r = new Retriever(vs, bm);
+            VectorStoreWriter w = new VectorStoreWriter(vs, bm);
+            AiClient c1 = Prog.MakeClient();
+            Rag rag = new Rag(c1, r, w);
+            int n = await rag.Index("");
+            if (n != -1) { bad = bad + 1; }
+            if (rag.lastError.Length == 0) { bad = bad + 1; }
+            // 空问题 → 问答失败。
+            RagAnswer a = await rag.Ask("");
+            if (a != null) { bad = bad + 1; }
+            if (rag.lastError.Length == 0) { bad = bad + 1; }
+            c1.Close();
+            // 没检索到东西 → 问答失败（可读原因）。
+            AiClient c2 = Prog.MakeClient();
+            Rag rag2 = new Rag(c2, r, w);
+            RagAnswer a2 = await rag2.Ask("完全不相关的问题");
+            if (a2 != null) { bad = bad + 1; }
+            if (rag2.lastError.Length == 0) { bad = bad + 1; }
+            c2.Close();
+        }
+
+        // ---- 7. 写侧 id 由后端分配且不撞车 ----
+        {
+            // 内存档：连写两次，id 必须继续往上走（不撞车）。
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            VectorStoreWriter w = new VectorStoreWriter(vs, bm);
+            List<string> texts = new List<string>();
+            texts.Add("一");
+            texts.Add("二");
+            List<List<double>> vs2 = new List<List<double>>();
+            List<double> a = new List<double>();
+            a.Add(1.0);
+            a.Add(0.0);
+            List<double> b = new List<double>();
+            b.Add(0.0);
+            b.Add(1.0);
+            vs2.Add(a);
+            vs2.Add(b);
+            List<int> ids1 = await w.Write(texts, vs2, null);
+            if (ids1 == null || ids1.Count != 2) { bad = bad + 1; }
+            List<int> ids2 = await w.Write(texts, vs2, null);
+            if (ids2 == null || ids2.Count != 2) { bad = bad + 1; }
+            if (ids1 != null && ids2 != null) {
+                if (ids2[0] <= ids1[1]) { bad = bad + 1; }
+                Console.WriteLine("ids1=" + Convert.ToString(ids1[0]) + ","
+                + Convert.ToString(ids1[1]) + " ids2=" + Convert.ToString(ids2[0]));
+            }
+            // 维度不符 → 写失败（不抛异常）。
+            List<List<double>> wrong = new List<List<double>>();
+            List<double> bad1 = new List<double>();
+            bad1.Add(1.0);
+            wrong.Add(bad1);
+            List<int> badIds = await w.Write(texts, wrong, null);
+            if (badIds != null) { bad = bad + 1; }
+            if (w.LastError().Length == 0) { bad = bad + 1; }
+        }
+
+        ai.Stop();
+        // **必须 await StopAsync()**（否则 leakcheck 报泄漏）。
+        await server.StopAsync();
+        Clean(dbPath);
+
+        Console.WriteLine("ai-rag-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}
