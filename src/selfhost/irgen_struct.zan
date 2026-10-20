@@ -75,6 +75,64 @@ partial class Irgen {
         }
     }
 
+    // A struct instance constructor: a zeroed instance whose struct-typed
+    // fields get their own nested instances (the same shape AllocStructObj
+    // builds, but as a module-level function so the array fill can call it).
+    void EmitStructNewObj(Node decl) {
+        string cn = decl.sval;
+        H("define i8* @" + cn + "_newobj() {");
+        H("  %szp = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+        H("  %szi = ptrtoint %" + cn + "* %szp to i64");
+        H("  %raw = call i8* @zalloc(i64 %szi, i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        H("  %obj = bitcast i8* %raw to %" + cn + "*");
+        List<string> names = new List<string>();
+        List<Node> types = new List<Node>();
+        CollectFields(decl, names, types);
+        int fb = FieldBase(decl);
+        int i = 0;
+        int seq = 0;
+        while (i < types.Count) {
+            Node fty = types[i];
+            if (IsStructTy(fty)) {
+                string slt = MapType(fty);
+                H("  %nf" + seq + " = getelementptr %" + cn + ", %" + cn + "* %obj, i32 0, i32 " + (fb + i));
+                H("  %ns" + seq + " = call i8* @" + fty.sval + "_newobj()");
+                H("  %nb" + seq + " = bitcast i8* %ns" + seq + " to " + slt);
+                H("  store " + slt + " %nb" + seq + ", " + slt + "* %nf" + seq);
+                seq = seq + 1;
+            }
+            i = i + 1;
+        }
+        H("  ret i8* %raw");
+        H("}");
+    }
+
+    // Fill the slots of an array whose element type is a struct with default
+    // instances. The C host keeps a struct element inline in the array, so
+    // its zeroed array already holds `n` default instances; here a struct
+    // instance is a heap object, so every slot needs an instance of its own
+    // (a null slot would fault on the first field access).
+    void EmitStructArrInit(Node decl) {
+        string cn = decl.sval;
+        H("define void @" + cn + "_initarr(i64* %arr, i64 %n) {");
+        H("entry:");
+        H("  br label %loop");
+        H("loop:");
+        H("  %i = phi i64 [ 0, %entry ], [ %i2, %body ]");
+        H("  %c = icmp ult i64 %i, %n");
+        H("  br i1 %c, label %body, label %done");
+        H("body:");
+        H("  %slot = getelementptr i64, i64* %arr, i64 %i");
+        H("  %obj = call i8* @" + cn + "_newobj()");
+        H("  %pi = ptrtoint i8* %obj to i64");
+        H("  store i64 %pi, i64* %slot");
+        H("  %i2 = add i64 %i, 1");
+        H("  br label %loop");
+        H("done:");
+        H("  ret void");
+        H("}");
+    }
+
     // Copy the contents of the struct instance `src` into the instance `dst`.
     // Class fields are shared with the source (the copy retains them), struct
     // fields are copied recursively.
