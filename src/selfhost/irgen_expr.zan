@@ -192,6 +192,7 @@ partial class Irgen {
         if (op == TK.Pipe()) { return "or"; }
         if (op == TK.LessLess()) { return "shl"; }
         if (op == TK.GreaterGreater()) { return "ashr"; }
+        if (op == TK.GreaterGreaterGreater()) { return "lshr"; }
         return "";
     }
     string CmpOp(int op) {
@@ -507,7 +508,19 @@ partial class Irgen {
                 else if (op == TK.GreaterGreater()) { ar = "lshr"; }
             }
             string t = NT();
-            L("  " + t + " = " + ar + " i64 " + a.op + ", " + b.op);
+            // the shift count is masked to the width of the left operand (the
+            // C host's mask_shift_count): 31 for a 32-bit type, 63 for a
+            // 64-bit one. An unmasked count is poison in LLVM.
+            string bs = b.op;
+            if (op == TK.LessLess() || op == TK.GreaterGreater() || op == TK.GreaterGreaterGreater()) {
+                int mbits = 63;
+                int ab = IntBits(a.ty);
+                if (ab > 0 && ab < 64) { mbits = ab - 1; }
+                string m = NT();
+                L("  " + m + " = and i64 " + bs + ", " + mbits);
+                bs = m;
+            }
+            L("  " + t + " = " + ar + " i64 " + a.op + ", " + bs);
             if (uns) { return new ExprVal(t, MkType("ulong")); }
             return new ExprVal(t, MkType("int"));
         }
@@ -1272,8 +1285,19 @@ partial class Irgen {
         if (e.op == TK.CaretEq()) { opn = "xor"; }
         if (e.op == TK.LessLessEq()) { opn = "shl"; }
         if (e.op == TK.GreaterGreaterEq()) { opn = "ashr"; }
+        if (e.op == TK.GreaterGreaterGreaterEq()) { opn = "lshr"; }
         string t = NT();
-        L("  " + t + " = " + opn + " i64 " + cur.op + ", " + r.op);
+        string rs = r.op;
+        if (e.op == TK.LessLessEq() || e.op == TK.GreaterGreaterEq() || e.op == TK.GreaterGreaterGreaterEq()) {
+            // the shift count is masked to the width of the left operand
+            int mbits = 63;
+            int cb = IntBits(cur.ty);
+            if (cb > 0 && cb < 64) { mbits = cb - 1; }
+            string m = NT();
+            L("  " + m + " = and i64 " + rs + ", " + mbits);
+            rs = m;
+        }
+        L("  " + t + " = " + opn + " i64 " + cur.op + ", " + rs);
         ExprVal nv = new ExprVal(t, MkType("int"));
         StoreTo(e.a, nv);
         return nv;
@@ -1292,6 +1316,7 @@ partial class Irgen {
                 if (!convApplied) { v = StrSlotConv(lty, v); }
                 // a struct is a value: the variable gets its own copy
                 if (NeedsStructCopy(lty, v)) { v = StructCopyTemp(v, lty); }
+                v = NarrowToDeclared(v, lty);
                 string lt = MapType(lty);
                 if (curAsync && locBox[li]) {
                     // the local lives in a heap cell: write through the cell
@@ -1518,6 +1543,7 @@ partial class Irgen {
         if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
         string ft = MapType(fty);
         ExprVal src = StrSlotConv(fty, v);
+        src = NarrowToDeclared(src, fty);
         if (ArcManaged(fty) && !WeakTy(fty)) {
             string old = NT();
             L("  " + old + " = load " + ft + ", " + ft + "* " + p);
@@ -2514,6 +2540,52 @@ partial class Irgen {
         }
         // remaining numeric casts are all i64 in this model; just retag
         return new ExprVal(v.op, tgt);
+    }
+
+    // ---- integer width at typed locations ----
+    // The C host keeps an integer value in a 64-bit slot, but a value that
+    // enters a *typed location* (a variable, a field, an argument, a return
+    // value) is narrowed to that type's width: `int z = unchecked(x + 1)`
+    // wraps to -2147483648 exactly like the host's 32-bit int arithmetic,
+    // while the same expression printed directly stays 64-bit.
+    int IntBits(Node t) {
+        if (t == null) { return 0; }
+        string n = t.sval;
+        if (n == "int" || n == "uint") { return 32; }
+        if (n == "short" || n == "ushort" || n == "char") { return 16; }
+        if (n == "byte" || n == "sbyte") { return 8; }
+        if (n == "bool") { return 8; }
+        return 0;
+    }
+
+    // An unsigned integer type widens back with zero-extension, a signed one
+    // with sign-extension.
+    bool IntUnsigned(Node t) {
+        if (t == null) { return false; }
+        string n = t.sval;
+        return n == "uint" || n == "ushort" || n == "byte" || n == "char";
+    }
+
+    // Narrow an integer carrier to the declared type's width. Only plain
+    // integer carriers are narrowed: a pointer, a double, a boxed nullable,
+    // an erased type parameter or an array slot keeps its value.
+    ExprVal NarrowToDeclared(ExprVal v, Node declTy) {
+        int bits = IntBits(declTy);
+        if (bits == 0 || v == null || v.ty == null) { return v; }
+        if (declTy.ival >= 1) { return v; }
+        if (IsNullableValue(declTy)) { return v; }
+        if (IsErasedType(declTy) || IsErasedType(v.ty)) { return v; }
+        if (MapType(v.ty) != "i64") { return v; }
+        string t1 = NT();
+        L("  " + t1 + " = trunc i64 " + v.op + " to i" + bits);
+        string t2 = NT();
+        if (IntUnsigned(declTy)) {
+            L("  " + t2 + " = zext i" + bits + " " + t1 + " to i64");
+        }
+        else {
+            L("  " + t2 + " = sext i" + bits + " " + t1 + " to i64");
+        }
+        return new ExprVal(t2, declTy);
     }
 
     // switch expression:  subj switch { pat => e, _ => e }. Constant patterns
@@ -4387,6 +4459,7 @@ partial class Irgen {
         if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
         ExprVal src = StrSlotConv(pty, av);
+        src = NarrowToDeclared(src, pty);
         return Coerce(src, MapType(pty));
     }
 
