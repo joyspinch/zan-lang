@@ -57,23 +57,6 @@
 - ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮无法同一次
   提交落地，等窗口。
 
-### [ ] A446 `packages/Zan.Sdk.Wechat` 引用了不存在的枚举 `WechatMpMediaType`
-
-- 现象（2026-10-21 全包扫描实测）：`packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Mp/
-  WechatMpMediaSpecialApi.zan:12` 与 `.../Models/Mp/WechatMpSpecialProtocol.zan:10`
-  都把 `WechatMpMediaType` 当类型用，但**全仓没有任何地方声明它**
-  （`rg "enum WechatMpMediaType"` 零命中）。编译这两个文件报
-  "undefined type 'WechatMpMediaType'"。
-- 影响：该包整体编译不过；同包的其它文件也引用不到这个类型。
-- 之前没被发现的原因：`scripts/pkg_sweep.ps1` 把文件列表直接摊在命令行上，
-  `Zan.Sdk.Wechat` 有 5618 个文件 → 超出 Windows 命令行长度上限 → **进程根本没
-  起来**，而脚本报错文本里没有 ": error"，于是被判成 **green**——一个从未被编译
-  的包看起来是健康的。脚本已改用**目录输入**（编译器自己递归展开 `*.zan`，
-  命令行恒长）并把"启动失败"判成 RED（见同批提交），但这条枚举缺失仍待补。
-- 方向：按微信素材管理接口的取值补一个枚举（image / voice / video / thumb 等），
-  或把这两处的类型换成包内已有的实际类型——需要按微信 API 文档核对语义，
-  属于包内容工作，不在本轮编译器修复范围内。
-
 ### [ ] A445 自举后端 `Math.*` / `Convert.ToInt32` / `Convert.ToDouble` 与 C 宿主同款缺陷
 
 - 现象（2026-10-21 随 C 宿主的类型守卫一并查实）：
