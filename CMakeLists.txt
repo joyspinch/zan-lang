@@ -2724,6 +2724,20 @@ add_test(NAME conformance_nsusing
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsusing${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# 导入作用域不能互相泄漏：同一次编译里别的文件导入了某个命名空间，
+# 不等于本文件也导入了它。本文件没有导入任何含 Badge 的命名空间，
+# 裸名 Badge 落在歧义上必须报错，而不是被别的文件的 using 悄悄解析掉
+# （A438：修复前本文件会继承全工程的 using，裸名绑到别的包的同名类）。
+add_test(NAME diag_ns_using_scope_leak
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak_one.zan;${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak_two.zan"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ns_using_scope_leak${_exe_ext}
+    "-DEXPECT_REGEX=ambiguous type .Badge.; qualify it with its namespace"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_ns_using_scope_leak PROPERTIES TIMEOUT 60)
+
 # ---- Library output: static archive + shared libraries (.dll/.so/.dylib) ----
 # A library has no entry point, so these bypass the compile-run-compare GLOB:
 # the artifact is validated by format magic (and, on Windows, a consumer that

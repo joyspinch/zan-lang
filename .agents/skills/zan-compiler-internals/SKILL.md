@@ -76,6 +76,26 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      不能等到运行期变成 0。`object` / `T?` 形参接得住 null。
      实例：`Arg.Text(null)` 与 `Overloads.Of(null)` 两条曾同时走错
      （`tests/conformance/null_overload_resolution.zan` 钉住正解）。
+8. **裸名的导入作用域按文件隔离，歧义必须显式化**：
+   - 动作：声明（class/struct/interface/enum）可见的 `using` 集合只能是
+     **它自己那个文件**的导入——`nsresolve.c` 的 `zan_nsresolve_stamp` 要给每个
+     文件**快照**一份自己的 using 列表（`snapshot_usings`），不许把多个文件的
+     using 合并成一个列表再把指针存进每个声明。裸名类型解析顺序固定为
+     当前命名空间 → 祖先命名空间 → 本文件 `using` → 成员命中消歧 →
+     歧义诊断；同名类型多于一个时，**按被访问的成员筛候选**（唯一命中就用它），
+     仍然多命中就报 `ambiguous type 'X'; qualify it with its namespace`。
+   - 理由：驱动层（`main.c`）把所有编译输入——用户文件 + 各包源码——的 using
+     合并进同一个 compilation unit 的 `usings` 列表，而声明里存的是**列表指针**：
+     合并后每个文件的声明都看得见全工程的 using，于是"别的包文件 import 了什么"
+     决定了本文件的裸名绑到哪个类。`Window` 在 `Gui.Backend` /
+     `System.Data` / `System.Automation` 三处同名，Zan.DataFrame 新增
+     `System.Data.Window` 之后，仓库外 5 个项目（breakout / goldminer /
+     gomoku / weiqi / xiangqi）集体编不过——症状是"加一行 using 就编不过"。
+   - 边界：成员命中消歧只看**声明**了该成员的候选（`decl_has_member`），命中
+     零个就不猜（交给后续诊断），命中多个才报歧义；显式 `using Ns;` 命中的候选
+     永远优先于成员命中。回归用例：`tests/conformance/nsusing/`（同名类分处两个
+     命名空间，裸名按本文件 using 解析）+ `tests/diag/ns_using_scope_leak.zan`
+     （本文件没导入 → 必须报歧义）。
 
 ---
 

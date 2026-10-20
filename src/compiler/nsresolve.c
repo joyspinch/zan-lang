@@ -89,14 +89,34 @@ static void stamp_decl_context(zan_ast_node_t *d, zan_istr_t ns,
     }
 }
 
+/* 本文件 using 列表的快照。
+ *
+ * 驱动层（main.c）会把所有编译输入——用户文件 + 各包源码——的 using 声明
+ * 合并进同一个 compilation unit 的 usings 列表。decl 里存的是"列表指针"，
+ * 所以第一个文件的声明会看到全工程的 using：某个包文件里的 `using
+ * System.Data;` 会让用户的裸名 `Window` 绑到 System.Data.Window，而不是
+ * 自己 import 的那个（A438）。快照把每个文件的可见导入钉死在自己身上。 */
+static zan_ast_list_t *snapshot_usings(zan_ast_node_t *unit, zan_arena_t *arena) {
+    zan_ast_list_t *src = &unit->comp_unit.usings;
+    if (src->count == 0) return src;
+    zan_ast_list_t *snap =
+        (zan_ast_list_t *)zan_arena_alloc(arena, sizeof(zan_ast_list_t));
+    if (!snap) return src;
+    zan_ast_list_init(snap);
+    for (int i = 0; i < src->count; i++)
+        zan_ast_list_push(snap, src->items[i], arena);
+    return snap;
+}
+
 void zan_nsresolve_stamp(zan_ast_node_t *unit, zan_arena_t *arena) {
     if (!unit || unit->kind != AST_COMPILATION_UNIT) return;
     zan_istr_t ns = {0};
     if (unit->comp_unit.ns && unit->comp_unit.ns->kind == AST_NAMESPACE_DECL)
         ns = flatten_qname(unit->comp_unit.ns->namespace_decl.name, arena);
+    zan_ast_list_t *usings = snapshot_usings(unit, arena);
     for (int i = 0; i < unit->comp_unit.decls.count; i++) {
         zan_ast_node_t *d = unit->comp_unit.decls.items[i];
-        stamp_decl_context(d, ns, &unit->comp_unit.usings, arena);
+        stamp_decl_context(d, ns, usings, arena);
     }
 }
 
@@ -427,15 +447,62 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     }
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
-    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R)) {
+    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R) && c->diag) {
         zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
                       "ambiguous type '%.*s'; qualify it with its namespace",
                       (int)R.len, R.str);
     }
 }
 
+/* 类型声明里有没有同名成员（静态成员与实例成员都算——只用于给裸名消歧，
+ * 不参与可见性/重载判定）。 */
+static bool decl_has_member(const zan_ast_node_t *d, zan_istr_t name) {
+    if (!d || name.len == 0) return false;
+    if (d->kind != AST_CLASS_DECL && d->kind != AST_STRUCT_DECL &&
+        d->kind != AST_INTERFACE_DECL && d->kind != AST_ENUM_DECL)
+        return false;
+    zan_ast_list_t *ms = &d->type_decl.members;
+    for (int i = 0; i < ms->count; i++) {
+        zan_ast_node_t *m = ms->items[i];
+        if (!m) continue;
+        zan_istr_t mn = {0};
+        switch (m->kind) {
+        case AST_METHOD_DECL: mn = m->method_decl.name; break;
+        case AST_FIELD_DECL:
+        case AST_PROPERTY_DECL: mn = m->field_decl.name; break;
+        case AST_ENUM_MEMBER: mn = m->enum_member.name; break;
+        default: break;
+        }
+        if (mn.len == name.len && mn.str &&
+            memcmp(mn.str, name.str, (size_t)name.len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* 裸名消歧：同名类型不止一个时，用被访问的成员挑唯一命中那个
+ * （"Color Color" 的思路）。命中唯一 → 用它；命中零个或多个 → 不猜，
+ * 留给后面的诊断说话。 */
+static nr_type_t *pick_by_member(nr_ctx_t *c, zan_istr_t simple,
+                                  zan_istr_t member, int *hits_out) {
+    nr_type_t *hit = NULL;
+    int hit_idx = -1;
+    int hits = 0;
+    for (int node = c->by_simple.buckets[nr_hash(simple) & c->by_simple.mask];
+         node >= 0; node = c->by_simple.chains[node].next) {
+        int idx = c->by_simple.chains[node].idx;
+        if (!ns_istr_eq(c->items[idx].simple, simple)) continue;
+        if (!decl_has_member(c->items[idx].decl, member)) continue;
+        if (!hit || idx < hit_idx) { hit = &c->items[idx]; hit_idx = idx; }
+        hits++;
+    }
+    if (hits_out) *hits_out = hits;
+    return hits == 1 ? hit : NULL;
+}
+
 static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
-                                    zan_istr_t ctx_ns, zan_ast_list_t *usings) {
+                                    zan_istr_t ctx_ns, zan_ast_list_t *usings,
+                                    zan_istr_t member) {
     zan_istr_t R = id->ident.name;
     if (R.len == 0 || shadow_has(&c->shadow, R)) return;
 
@@ -468,6 +535,18 @@ static void resolve_static_receiver(nr_ctx_t *c, zan_ast_node_t *id,
         }
     }
     if (!t) t = find_full(c, R);
+    /* 名字被多个命名空间占用（System.Data.Window / System.Automation.Window /
+     * Gui.Backend.Window）时，裸名 + 成员访问按"谁声明了这个成员"消歧：
+     * 命中唯一就用它；命中多个 → 报歧义（和类型位置的诊断同一口径）；
+     * 命中零个 → 不猜，交给后面的诊断。 */
+    if (!t && member.len) {
+        int hits = 0;
+        t = pick_by_member(c, R, member, &hits);
+        if (!t && hits > 1 && c->diag)
+            zan_diag_emit(c->diag, DIAG_ERROR, id->loc,
+                          "ambiguous type '%.*s'; qualify it with its namespace",
+                          (int)R.len, R.str);
+    }
     if (t) {
         id->ident.name = t->final;
         if (c->refs) zan_refs_add(c->refs, t->final, c->arena);
@@ -817,7 +896,8 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
 
     case AST_MEMBER_ACCESS:
         if (n->member.object && n->member.object->kind == AST_IDENTIFIER)
-            resolve_static_receiver(c, n->member.object, ns, usings);
+            resolve_static_receiver(c, n->member.object, ns, usings,
+                                    n->member.name);
         else if (n->member.object && n->member.object->kind == AST_MEMBER_ACCESS)
             resolve_qualified_receiver(c, n->member.object);
         nr_walk(c, n->member.object, ns, usings);

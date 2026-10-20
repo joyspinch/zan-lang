@@ -8,6 +8,25 @@
 
 ## 未完成
 
+### [ ] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
+
+- 现象（2026-10-21 修 A438 时查实）：C 宿主 `src/compiler/nsresolve.c` 有完整的
+  命名空间解析层（`resolve_ref` / `resolve_static_receiver`，按当前命名空间 →
+  祖先命名空间 → 本文件 `using` → 歧义诊断的顺序解析裸名）；自举后端
+  `src/selfhost/binder.zan:68` 的 `FindType(name)` 只是**按简单名线性扫一遍**
+  `types` 列表，命中第一个就返回——既没有命名空间概念，也没有 `using` 概念。
+- 影响：自举后端编译多包同名类（`Window`、`Marker` 这类）时，谁赢取决于
+  **声明顺序**，不是导入关系；C 宿主修好的"按成员命中消歧 / 报歧义"在自举
+  侧没有对应物，两后端对同一份源码可能给出不同绑定。
+- 方向：自举侧补最小一层——按"声明所在命名空间 + 本文件 `using`"过滤候选，
+  多命中时报与 C 宿主同款 `ambiguous type 'X'; qualify it with its namespace`。
+  注意自举侧的文件模型与 C 宿主不同（`src/selfhost/parser.zan:1656` 的
+  `ParseUsing` 已经把 using 存进 AST，但 binder 还没消费它）。
+- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮不碰；
+  A438 的 C 宿主修复已单独落地（见提交正文），两后端行为要等差分门能看见
+  这类用例后再对齐。
+- 关联：A438（已修，结论在 git 历史）。
+
 ### [ ] A452 一元运算路径的 `type_error` 哨兵不发诊断——`-s` 落到 LLVM 校验失败，`~s` 把编译器打崩
 
 - 现象（2026-10-21 实测，探针见 `_scratch/probe_unary_types.ps1`）：
@@ -56,6 +75,23 @@
   静默恒等。
 - ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮无法同一次
   提交落地，等窗口。
+
+### [ ] A446 `packages/Zan.Sdk.Wechat` 引用了不存在的枚举 `WechatMpMediaType`
+
+- 现象（2026-10-21 全包扫描实测）：`packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Mp/
+  WechatMpMediaSpecialApi.zan:12` 与 `.../Models/Mp/WechatMpSpecialProtocol.zan:10`
+  都把 `WechatMpMediaType` 当类型用，但**全仓没有任何地方声明它**
+  （`rg "enum WechatMpMediaType"` 零命中）。编译这两个文件报
+  "undefined type 'WechatMpMediaType'"。
+- 影响：该包整体编译不过；同包的其它文件也引用不到这个类型。
+- 之前没被发现的原因：`scripts/pkg_sweep.ps1` 把文件列表直接摊在命令行上，
+  `Zan.Sdk.Wechat` 有 5618 个文件 → 超出 Windows 命令行长度上限 → **进程根本没
+  起来**，而脚本报错文本里没有 ": error"，于是被判成 **green**——一个从未被编译
+  的包看起来是健康的。脚本已改用**目录输入**（编译器自己递归展开 `*.zan`，
+  命令行恒长）并把"启动失败"判成 RED（见同批提交），但这条枚举缺失仍待补。
+- 方向：按微信素材管理接口的取值补一个枚举（image / voice / video / thumb 等），
+  或把这两处的类型换成包内已有的实际类型——需要按微信 API 文档核对语义，
+  属于包内容工作，不在本轮编译器修复范围内。
 
 ### [ ] A445 自举后端 `Math.*` / `Convert.ToInt32` / `Convert.ToDouble` 与 C 宿主同款缺陷
 
@@ -934,45 +970,6 @@
   3. **明文化限制**：文档写清"类型参数字段不可在擦除上下文访问"，并给检查器
      一条提示级诊断（当前是静默读错值）。
 - 关联：A421（同一族：泛型实例化模型与类型实参的来源）。
-### [ ] A438 裸名 `Window` 会绑到错的类——`Gui.Backend.Window` 与 `System.Data.Window` 同名
-
-- 现象：给一个已经能编过的文件加一行 `using Game.Cards;`（引包）之后，
-  文件里的 `Window.GetTickMs()` 立刻编不过：
-  `unresolved call 'Window.GetTickMs': 'Window' is not a known variable, type, or namespace (is the class imported and registered in the stdlib map?)`。
-  单写 `using System; using Gui;` 的探针文件则把 `Window` 绑到
-  `System.Data.System_Data_Window`（Zan.DataFrame 里的另一个 Window），
-  报 "type 'System.Data.System_Data_Window' has no member 'GetTickMs'"。
-- 根因（未定位到具体代码，先记现象）：裸名解析没有"歧义"概念。
-  `Window` 在 `Gui.Backend`（Zan.Gui）、`System.Data`（Zan.DataFrame）、
-  `System.Automation`（Zan.Desktop）三处都有同名 public 类；而
-  `using Gui;` 这类导入会把子命名空间的类型也算进候选，于是候选集随
-  import 集变化，谁赢取决于解析顺序。之前 `Window.GetTickMs()` 能编过
-  是**兜底命中**（检查器在内建成员表里找到了同名成员），不是真绑到了
-  `Gui.Backend.Window`——irgen 需要类符号时就会露馅。
-- 影响：凡是"同一文件既用 `Window.GetTickMs()` 又 import 别的包命名空间"
-  的程序都会中招。游戏项目普遍用 `Window.GetTickMs()`，所以不是边角。
-- 方向（择一）：
-  1. 裸名多候选时按"成员命中"择优：调用 `X.M` 时先筛出声明了 M 的候选类，
-     唯一命中就用它；仍然多命中才报歧义。
-  2. 显式歧义诊断：裸名命中多个类就报"X 有多个候选（A.B.X / C.D.X）"，
-     要求显式 `using` 或全限定名——比静默绑错强。
-  3. 收窄 `using X;` 的导入面：只导入 X 直属的类型，不含子命名空间
-     （`using Gui;` 不再自动带出 `Gui.Backend`），歧义面自然变小。
-- 现状绕行（已落在 ddz 项目里）：用到 `Window` 的文件显式写
-  `using Gui.Backend;`（仓库里的 trap-cat 模板本来就这么写）。
-- 探针（最小复现，内容直接抄进本条，随时可重建）：
-  ```zan
-  using System;
-  using Gui;
-  public class ProbeWindow {
-      static int Tick() { return Window.GetTickMs(); }
-      static void Main() { Console.WriteLine("tick=" + Convert.ToString(ProbeWindow.Tick())); }
-  }
-  ```
-  编译命令 `zanc <file>.zan --auto-stdlib --package-project . -o out.exe`：
-  不加 `using Gui.Backend;` 绑到 `System.Data.Window` 报错；加上即编过。
-- 关联：无（命名解析族，与 A430~A437 不同族）。
-
 ### [ ] A450 自举驱动的命令行是 C 宿主的子集——不收目录、也没有 `@响应文件`
 
 - 现象（2026-10-21 给 C 宿主加目录输入时查实）：C 宿主 `zanc` 现在接受

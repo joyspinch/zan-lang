@@ -648,14 +648,19 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   只说明编译器知道这个类型的成员签名，不代表它在你的文件里可见。同包的
   另一个文件早就写了那行 `using`，这类"同一个包里一半文件能编一半不能编"
   的报错，先比 `using` 行再怀疑编译器。
-- **同名类跨命名空间时，裸名会绑到"另一个"类**：`Window` 在 `Gui.Backend`、
-  `System.Data`、`System.Automation` 三处都有 public 类。给一个本来能编过的
-  文件加一行 `using 别的包;`，里面的 `Window.GetTickMs()` 就会突然编不过
-  （"not a known variable, type, or namespace"），或绑到 `System.Data.Window`
-  报 "has no member 'GetTickMs'"。坑出处：ddz 加上 `using Game.Cards;` 后
-  `Window` 就绑不到 `Gui.Backend.Window` 了。**对策：用到的类型一律显式
-  import 它自己的命名空间**（`using Gui.Backend;`），别指望 `using Gui;`
-  顺带带出子命名空间——这跟上一条是同一个病的两面。
+- **同名类跨命名空间时，裸名按"成员命中"消歧，落在歧义上要显式限定**：编译器
+  解析裸名的顺序是 当前命名空间 → 祖先命名空间 → **本文件**的 `using` →
+  成员命中消歧 → 歧义诊断。同名类型多于一个时，`X.M` 这种成员访问先用"谁声明了
+  M"筛候选，唯一命中就用它（`Window.GetTickMs()` 命中 `Gui.Backend.Window`）；
+  仍然多命中就报 `ambiguous type 'X'; qualify it with its namespace`，这时只能
+  写全限定名或调整 import。
+  **导入按文件隔离**：别的文件 import 了什么跟你无关（修复前编译器把全工程的
+  using 合并成一个列表，任何文件都能被别人的 import 改掉绑定——A438，已修，
+  结论在 git 历史）。
+  对策不变但**理由变了**：用到哪个命名空间的类型就显式 import 哪个，既让歧义面
+  变小也让意图清楚；但不要再把它当绕行手段——编译器已经不串味了。
+  坑出处：ddz 加上 `using Game.Cards;` 后 `Window` 绑不到 `Gui.Backend.Window`
+  （当时 DataFrame 的 `System.Data.Window` 抢走了裸名，5 个仓库外项目集体编不过）。
 - **同名类在"全局命名空间 + using 包"时直接撞车（undefined type，不是绑错）**：
   项目里原本有个全局类 `DataRow`，迁移到包时又 `using Game.Data;` 引入包里
   同名的 `DataRow`，裸名 `DataRow` 就有两个候选，编译器**绑不了**，报
