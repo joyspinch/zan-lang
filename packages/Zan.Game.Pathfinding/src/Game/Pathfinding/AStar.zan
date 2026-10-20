@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Pathfinding;
+
+// A* 选项。
+public class AStarOptions {
+    // 是否允许对角移动。
+    public bool allowDiagonal;
+    // 是否允许"切角"（对角移动时只要求目标格可通行，不要求两个正交邻格
+    // 都可通行）。默认 false——贴着障碍对角穿过去是大多数 bug 的来源。
+    public bool allowCornerCutting;
+    // 启发式权重：1.0 = 标准 A*（最优）；> 1 更快但路径可能不是最优。
+    public double heuristicWeight;
+    // 均匀代价模型：对角一步也按 1.0 计（八方向同价）。JPS 用的就是这个
+    // 模型；代价地图非均匀时用它与 JPS 的结果直接对比。
+    public bool uniformStepCost;
+    // 展开节点上限（0 = 不限）。防止在超大图上卡死。
+    public int maxExpansions;
+
+    public AStarOptions() {
+        this.allowDiagonal = true;
+        this.allowCornerCutting = false;
+        this.heuristicWeight = 1.0;
+        this.uniformStepCost = false;
+        this.maxExpansions = 0;
+    }
+}
+
+// A*：网格上的最短路（欧氏代价模型——对角一步算 √2 倍）。
+//
+// 代价 = 进入目标格的代价 × 步距（对角 √2，两端格代价取均值）。
+// 启发式用八分距离（octile）/ 曼哈顿距离，乘以网格最小代价保持可采纳。
+public class AStar {
+    // 前 4 个是正交，后 4 个是对角。
+    private static int[] s_dx = new int[8] { 0, 1, 0, -1, 1, 1, -1, -1 };
+    private static int[] s_dy = new int[8] { 1, 0, -1, 0, 1, -1, 1, -1 };
+
+    public static CellPath Find(GridMap map, GridPoint start, GridPoint goal, AStarOptions options) {
+        CellPath empty = new CellPath();
+        if (map == null) { return empty; }
+        if (!map.IsWalkable(start.x, start.y)) { return empty; }
+        if (!map.IsWalkable(goal.x, goal.y)) { return empty; }
+
+        int total = map.width * map.height;
+        double[] g = new double[total];
+        for (int i = 0; i < total; i = i + 1) { g[i] = 1e300; }
+        int[] cameFrom = new int[total];
+        for (int i = 0; i < total; i = i + 1) { cameFrom[i] = -1; }
+        bool[] closed = new bool[total];
+        double[] closedCost = new double[total];
+        for (int i = 0; i < total; i = i + 1) { closedCost[i] = 1e300; }
+
+        double minCost = map.MinCost();
+        int startIndex = map.Index(start.x, start.y);
+        int goalIndex = map.Index(goal.x, goal.y);
+        g[startIndex] = 0.0;
+        cameFrom[startIndex] = startIndex;
+
+        OpenHeap open = new OpenHeap(64);
+        open.Push(startIndex, AStar.Heuristic(map, start, goal, options) * options.heuristicWeight,
+                  AStar.Heuristic(map, start, goal, options));
+
+        int expansions = 0;
+        while (!open.IsEmpty()) {
+            int current = open.Pop();
+            if (closed[current] && g[current] >= closedCost[current] - 0.000000000001) {
+                continue;
+            }
+            closed[current] = true;
+            closedCost[current] = g[current];
+            expansions = expansions + 1;
+
+            if (current == goalIndex) {
+                CellPath found = AStar.Reconstruct(cameFrom, current, map.width);
+                found.expandedNodes = expansions;
+                return found;
+            }
+
+            if (options.maxExpansions > 0 && expansions > options.maxExpansions) {
+                break;
+            }
+
+            int cx = current % map.width;
+            int cy = current / map.width;
+            for (int d = 0; d < 8; d = d + 1) {
+                bool diagonal = d >= 4;
+                if (diagonal && !options.allowDiagonal) { continue; }
+                int nx = cx + AStar.s_dx[d];
+                int ny = cy + AStar.s_dy[d];
+                if (!map.IsWalkable(nx, ny)) { continue; }
+                if (diagonal && !options.allowCornerCutting) {
+                    if (!map.IsWalkable(cx + AStar.s_dx[d], cy)) { continue; }
+                    if (!map.IsWalkable(cx, cy + AStar.s_dy[d])) { continue; }
+                }
+
+                double step = CellPath.StepCost(map, new GridPoint(cx, cy), new GridPoint(nx, ny),
+                                                options.uniformStepCost);
+                double next = g[current] + step;
+                int nextIndex = map.Index(nx, ny);
+                if (next < g[nextIndex] - 0.000000000001) {
+                    g[nextIndex] = next;
+                    cameFrom[nextIndex] = current;
+                    double h = AStar.Heuristic(map, new GridPoint(nx, ny), goal, options);
+                    open.Push(nextIndex, next + h * options.heuristicWeight, h);
+                }
+            }
+        }
+        return empty;
+    }
+
+    // 启发式：八分距离（允许对角）或曼哈顿距离（只走正交），乘最小代价。
+    // 均匀代价模型下八方向同价，改用切比雪夫距离（max(dx, dy)）。
+    public static double Heuristic(GridMap map, GridPoint from, GridPoint to, AStarOptions options) {
+        int dx = from.x - to.x;
+        if (dx < 0) { dx = -dx; }
+        int dy = from.y - to.y;
+        if (dy < 0) { dy = -dy; }
+        double distance;
+        if (options.uniformStepCost) {
+            distance = dx > dy ? dx : dy;
+        } else if (options.allowDiagonal) {
+            int min = dx < dy ? dx : dy;
+            int max = dx > dy ? dx : dy;
+            distance = max + (1.4142135623730951 - 1.0) * min;
+        } else {
+            distance = dx + dy;
+        }
+        return distance * map.MinCost();
+    }
+
+    // 回溯路径（含起点与终点）。
+    private static CellPath Reconstruct(int[] cameFrom, int goalIndex, int width) {
+        CellPath reversed = new CellPath();
+        int cursor = goalIndex;
+        int guard = 0;
+        while (guard < cameFrom.Length + 2) {
+            reversed.Add(new GridPoint(cursor % width, cursor / width));
+            if (cameFrom[cursor] == cursor) { break; }
+            cursor = cameFrom[cursor];
+            guard = guard + 1;
+        }
+        CellPath path = new CellPath();
+        for (int i = reversed.Count() - 1; i >= 0; i = i - 1) {
+            path.Add(reversed.Get(i));
+        }
+        return path;
+    }
+}

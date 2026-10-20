@@ -1,0 +1,371 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Pathfinding;
+
+// 导航网格的一个凸矩形（格子对齐）。
+public class NavRect {
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public Point2 center;
+
+    public NavRect(int x, int y, int w, int h) {
+        this.x = x;
+        this.y = y;
+        this.w = w;
+        this.h = h;
+        this.center = new Point2(x + w * 0.5, y + h * 0.5);
+    }
+
+    public override string ToString() {
+        return "NavRect(" + this.x.ToString() + "," + this.y.ToString()
+            + " " + this.w.ToString() + "x" + this.h.ToString() + ")";
+    }
+}
+
+// 门（portal）：两块相邻矩形之间的公共边（未定向，路径构建时再定左右）。
+public class NavPortal {
+    public Point2 p;
+    public Point2 q;
+
+    public NavPortal(Point2 p, Point2 q) {
+        this.p = p;
+        this.q = q;
+    }
+}
+
+// 导航网格：把可通行区域切成凸矩形，用"门"连成图，A* 找多边形序列，
+// 再用漏斗（funnel）算法求走廊内的最短折线。
+//
+// 与"A* + 逐格路径"相比：多边形层的路径是**连续**的（不需要贴着格子
+// 中心走），对单位移动更友好；走廊的拐点由漏斗算法给出，比逐格折角少。
+//
+// 分解方式：贪心最大矩形（从每格向右扩宽、再向下扩高）。结果确定，
+// 同样的地图必然得到同样的矩形集合（回放 / 锁步的前提）。
+public class NavMesh {
+    private GridMap map;
+    private List<NavRect> rects;
+    private List<List<int>> neighbors;
+    private List<List<NavPortal>> portals;
+    private int[] cellRect;
+
+    private NavMesh() {
+        this.rects = new List<NavRect>();
+        this.neighbors = new List<List<int>>();
+        this.portals = new List<List<NavPortal>>();
+    }
+
+    public int RectCount() { return this.rects.Count; }
+    public NavRect Rectangle(int index) { return this.rects[index]; }
+
+    // 从通行网格构建导航网格。
+    public static NavMesh Build(GridMap map) {
+        NavMesh mesh = new NavMesh();
+        mesh.map = map;
+        mesh.cellRect = new int[map.width * map.height];
+        for (int i = 0; i < mesh.cellRect.Length; i = i + 1) { mesh.cellRect[i] = -1; }
+
+        // 贪心最大矩形分解。
+        bool[] assigned = new bool[map.width * map.height];
+        for (int i = 0; i < assigned.Length; i = i + 1) { assigned[i] = false; }
+        for (int y = 0; y < map.height; y = y + 1) {
+            for (int x = 0; x < map.width; x = x + 1) {
+                int index = y * map.width + x;
+                if (assigned[index] || !map.IsWalkable(x, y)) { continue; }
+
+                int rw = 1;
+                while (x + rw < map.width) {
+                    int probe = y * map.width + (x + rw);
+                    if (assigned[probe] || !map.IsWalkable(x + rw, y)) { break; }
+                    rw = rw + 1;
+                }
+                int rh = 1;
+                bool grow = true;
+                while (grow && y + rh < map.height) {
+                    for (int i = 0; i < rw; i = i + 1) {
+                        int probe = (y + rh) * map.width + (x + i);
+                        if (assigned[probe] || !map.IsWalkable(x + i, y + rh)) {
+                            grow = false;
+                            break;
+                        }
+                    }
+                    if (grow) { rh = rh + 1; }
+                }
+                for (int j = 0; j < rh; j = j + 1) {
+                    for (int i = 0; i < rw; i = i + 1) {
+                        int cell = (y + j) * map.width + (x + i);
+                        assigned[cell] = true;
+                        mesh.cellRect[cell] = mesh.rects.Count;
+                    }
+                }
+                mesh.rects.Add(new NavRect(x, y, rw, rh));
+            }
+        }
+
+        // 邻接与门：沿每块矩形的四条边找邻居。
+        for (int i = 0; i < mesh.rects.Count; i = i + 1) {
+            mesh.neighbors.Add(new List<int>());
+            mesh.portals.Add(new List<NavPortal>());
+            NavRect r = mesh.rects[i];
+
+            // 右边（x = r.x + r.w）
+            int edgeX = r.x + r.w;
+            for (int y = r.y; y < r.y + r.h; y = y + 1) {
+                if (edgeX >= map.width) { break; }
+                int neighbor = mesh.cellRect[y * map.width + edgeX];
+                if (neighbor < 0 || neighbor == i) { continue; }
+                if (mesh.neighbors[i].Contains(neighbor)) { continue; }
+                NavRect n = mesh.rects[neighbor];
+                int y0 = r.y > n.y ? r.y : n.y;
+                int y1 = (r.y + r.h) < (n.y + n.h) ? (r.y + r.h) : (n.y + n.h);
+                if (y1 <= y0) { continue; }
+                mesh.neighbors[i].Add(neighbor);
+                mesh.portals[i].Add(new NavPortal(
+                    new Point2(edgeX, y0), new Point2(edgeX, y1)));
+            }
+
+            // 左边（x = r.x - 1）
+            if (r.x - 1 >= 0) {
+                int leftX = r.x - 1;
+                for (int y = r.y; y < r.y + r.h; y = y + 1) {
+                    int neighbor = mesh.cellRect[y * map.width + leftX];
+                    if (neighbor < 0 || neighbor == i) { continue; }
+                    if (mesh.neighbors[i].Contains(neighbor)) { continue; }
+                    NavRect n = mesh.rects[neighbor];
+                    int y0 = r.y > n.y ? r.y : n.y;
+                    int y1 = (r.y + r.h) < (n.y + n.h) ? (r.y + r.h) : (n.y + n.h);
+                    if (y1 <= y0) { continue; }
+                    mesh.neighbors[i].Add(neighbor);
+                    mesh.portals[i].Add(new NavPortal(
+                        new Point2(leftX + 1, y0), new Point2(leftX + 1, y1)));
+                }
+            }
+
+            // 上边（y = r.y + r.h）
+            int edgeY = r.y + r.h;
+            for (int x = r.x; x < r.x + r.w; x = x + 1) {
+                if (edgeY >= map.height) { break; }
+                int neighbor = mesh.cellRect[edgeY * map.width + x];
+                if (neighbor < 0 || neighbor == i) { continue; }
+                if (mesh.neighbors[i].Contains(neighbor)) { continue; }
+                NavRect n = mesh.rects[neighbor];
+                int x0 = r.x > n.x ? r.x : n.x;
+                int x1 = (r.x + r.w) < (n.x + n.w) ? (r.x + r.w) : (n.x + n.w);
+                if (x1 <= x0) { continue; }
+                mesh.neighbors[i].Add(neighbor);
+                mesh.portals[i].Add(new NavPortal(
+                    new Point2(x0, edgeY), new Point2(x1, edgeY)));
+            }
+
+            // 下边（y = r.y - 1）
+            if (r.y - 1 >= 0) {
+                int downY = r.y - 1;
+                for (int x = r.x; x < r.x + r.w; x = x + 1) {
+                    int neighbor = mesh.cellRect[downY * map.width + x];
+                    if (neighbor < 0 || neighbor == i) { continue; }
+                    if (mesh.neighbors[i].Contains(neighbor)) { continue; }
+                    NavRect n = mesh.rects[neighbor];
+                    int x0 = r.x > n.x ? r.x : n.x;
+                    int x1 = (r.x + r.w) < (n.x + n.w) ? (r.x + r.w) : (n.x + n.w);
+                    if (x1 <= x0) { continue; }
+                    mesh.neighbors[i].Add(neighbor);
+                    mesh.portals[i].Add(new NavPortal(
+                        new Point2(x0, downY + 1), new Point2(x1, downY + 1)));
+                }
+            }
+        }
+        return mesh;
+    }
+
+    // 找到一条从 start 到 goal 的平滑折线（世界坐标）。不可达时返回空表。
+    public List<Point2> FindPath(Point2 start, Point2 goal) {
+        List<Point2> empty = new List<Point2>();
+        if (this.map == null) { return empty; }
+        int sx = (int)Math.Floor(start.x);
+        int sy = (int)Math.Floor(start.y);
+        int gx = (int)Math.Floor(goal.x);
+        int gy = (int)Math.Floor(goal.y);
+        if (!this.map.IsWalkable(sx, sy) || !this.map.IsWalkable(gx, gy)) { return empty; }
+
+        int startRect = this.cellRect[sy * this.map.width + sx];
+        int goalRect = this.cellRect[gy * this.map.width + gx];
+        if (startRect < 0 || goalRect < 0) { return empty; }
+
+        List<int> route = this.FindRectRoute(startRect, goalRect);
+        if (route.Count == 0) { return empty; }
+
+        // 门序列：起点（退化门）→ 相邻矩形之间的门 → 终点（退化门）。
+        List<NavPortal> oriented = new List<NavPortal>();
+        for (int i = 1; i < route.Count; i = i + 1) {
+            int from = route[i - 1];
+            int to = route[i];
+            NavPortal portal = this.PortalBetween(from, to);
+            if (portal == null) { return empty; }
+            Point2 direction = this.rects[to].center - this.rects[from].center;
+            Point2 left;
+            Point2 right;
+            if (NavMesh.Cross(direction, portal.p, portal.q) > 0.0) {
+                left = portal.q;
+                right = portal.p;
+            } else {
+                left = portal.p;
+                right = portal.q;
+            }
+            oriented.Add(new NavPortal(left, right));
+        }
+        return NavMesh.Funnel(start, goal, oriented);
+    }
+
+    // 多边形层 A*。
+    private List<int> FindRectRoute(int startRect, int goalRect) {
+        List<int> route = new List<int>();
+        int count = this.rects.Count;
+        if (count == 0) { return route; }
+        double[] g = new double[count];
+        for (int i = 0; i < count; i = i + 1) { g[i] = 1e300; }
+        int[] cameFrom = new int[count];
+        for (int i = 0; i < count; i = i + 1) { cameFrom[i] = -1; }
+        bool[] closed = new bool[count];
+
+        g[startRect] = 0.0;
+        cameFrom[startRect] = startRect;
+        OpenHeap open = new OpenHeap(64);
+        double startH = this.rects[startRect].center.DistanceTo(this.rects[goalRect].center);
+        open.Push(startRect, startH, startH);
+
+        while (!open.IsEmpty()) {
+            int current = open.Pop();
+            if (closed[current]) { continue; }
+            closed[current] = true;
+            if (current == goalRect) {
+                int cursor = goalRect;
+                int guard = 0;
+                while (guard < count + 2) {
+                    route.Add(cursor);
+                    if (cameFrom[cursor] == cursor) { break; }
+                    cursor = cameFrom[cursor];
+                    guard = guard + 1;
+                }
+                // 反转
+                List<int> reversed = new List<int>();
+                for (int i = route.Count - 1; i >= 0; i = i - 1) {
+                    reversed.Add(route[i]);
+                }
+                return reversed;
+            }
+            List<int> adjacent = this.neighbors[current];
+            for (int i = 0; i < adjacent.Count; i = i + 1) {
+                int next = adjacent[i];
+                if (closed[next]) { continue; }
+                double step = this.rects[current].center.DistanceTo(this.rects[next].center);
+                double candidate = g[current] + step;
+                if (candidate < g[next] - 0.000000000001) {
+                    g[next] = candidate;
+                    cameFrom[next] = current;
+                    double h = this.rects[next].center.DistanceTo(this.rects[goalRect].center);
+                    open.Push(next, candidate + h, h);
+                }
+            }
+        }
+        return route;
+    }
+
+    // 两块相邻矩形之间的门。
+    private NavPortal PortalBetween(int from, int to) {
+        List<int> adjacent = this.neighbors[from];
+        for (int i = 0; i < adjacent.Count; i = i + 1) {
+            if (adjacent[i] == to) { return this.portals[from][i]; }
+        }
+        return null;
+    }
+
+    // 叉积：(b - a) × (c - a)；> 0 表示 c 在 a→b 的左侧。
+    public static double Cross(Point2 a, Point2 b, Point2 c) {
+        return (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+    }
+
+    // 漏斗算法：在门序列围成的走廊里求最短折线。
+    //
+    // 约定：每个门的 `p` 是**左**端点（相对行进方向），`q` 是右端点。
+    // 漏斗由两条射线围成：左射线 apex→left、右射线 apex→right。
+    // 新的门端点把射线"收紧"时，如果收过了对面射线，漏斗被掐断——掐断处
+    // 的顶点就是路径拐点，输出它并以它为新顶点重扫。
+    public static List<Point2> Funnel(Point2 start, Point2 goal, List<NavPortal> oriented) {
+        List<Point2> waypoints = new List<Point2>();
+        waypoints.Add(start);
+        if (oriented.Count == 0) {
+            waypoints.Add(goal);
+            return waypoints;
+        }
+
+        // 终点作为一个退化门（左右端点都是终点）。
+        List<NavPortal> portals = new List<NavPortal>();
+        for (int i = 0; i < oriented.Count; i = i + 1) {
+            portals.Add(oriented[i]);
+        }
+        portals.Add(new NavPortal(goal, goal));
+
+        Point2 apex = start;
+        Point2 left = start;
+        Point2 right = start;
+        int apexIndex = 0;
+        int leftIndex = 0;
+        int rightIndex = 0;
+
+        int i = 0;
+        while (i < portals.Count) {
+            Point2 portalLeft = portals[i].p;
+            Point2 portalRight = portals[i].q;
+
+            // 右边界收紧：新右端点跑到当前右射线内侧（或线上）。
+            if (NavMesh.Cross(apex, right, portalRight) >= 0.0) {
+                if (apex == right || NavMesh.Cross(apex, left, portalRight) < 0.0) {
+                    right = portalRight;
+                    rightIndex = i;
+                } else {
+                    // 右边界越过了左边界——左顶点是拐点。
+                    NavMesh.PushWaypoint(waypoints, left);
+                    apex = left;
+                    apexIndex = leftIndex;
+                    left = apex;
+                    right = apex;
+                    leftIndex = apexIndex;
+                    rightIndex = apexIndex;
+                    i = apexIndex;
+                    continue;
+                }
+            }
+            // 左边界收紧：新左端点跑到当前左射线内侧（或线上）。
+            if (NavMesh.Cross(apex, left, portalLeft) <= 0.0) {
+                if (apex == left || NavMesh.Cross(apex, right, portalLeft) > 0.0) {
+                    left = portalLeft;
+                    leftIndex = i;
+                } else {
+                    // 左边界越过了右边界——右顶点是拐点。
+                    NavMesh.PushWaypoint(waypoints, right);
+                    apex = right;
+                    apexIndex = rightIndex;
+                    left = apex;
+                    right = apex;
+                    leftIndex = apexIndex;
+                    rightIndex = apexIndex;
+                    i = apexIndex;
+                    continue;
+                }
+            }
+            i = i + 1;
+        }
+
+        NavMesh.PushWaypoint(waypoints, goal);
+        return waypoints;
+    }
+
+    // 追加拐点（跳过与上一个点重合的重复点）。
+    private static void PushWaypoint(List<Point2> waypoints, Point2 point) {
+        int count = waypoints.Count;
+        if (count > 0 && waypoints[count - 1] == point) { return; }
+        waypoints.Add(point);
+    }
+}

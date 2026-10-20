@@ -1,0 +1,279 @@
+using System;
+using System.Collections.Generic;
+using Game.Pathfinding;
+
+// 寻路契约测试：A*、JPS、路径平滑、导航网格。
+//
+// 断言用容差比较（浮点模拟不可能逐位相等），golden 只锁定"全过"这行。
+public class PathfindingTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 路径是否合法：每格可通行，且相邻两格只差一步。
+    private static bool IsValidPath(GridMap map, CellPath path) {
+        if (path.IsEmpty()) { return false; }
+        for (int i = 0; i < path.Count(); i = i + 1) {
+            GridPoint p = path.Get(i);
+            if (!map.IsWalkable(p.x, p.y)) { return false; }
+            if (i > 0) {
+                GridPoint prev = path.Get(i - 1);
+                int dx = p.x - prev.x;
+                int dy = p.y - prev.y;
+                if (dx < -1 || dx > 1 || dy < -1 || dy > 1) { return false; }
+                if (dx == 0 && dy == 0) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // 拉直后的路径：相邻两点之间必须**视线可达**（拉直不能穿墙），
+    // 且每个拐点都落在可通行格上。
+    private static bool IsValidSmoothedPath(GridMap map, CellPath path) {
+        if (path.IsEmpty()) { return false; }
+        for (int i = 0; i < path.Count(); i = i + 1) {
+            GridPoint p = path.Get(i);
+            if (!map.IsWalkable(p.x, p.y)) { return false; }
+            if (i > 0 && !PathSmoother.HasLineOfSight(map, path.Get(i - 1), p)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // 路径是否经过某一行的某一格（用于"必须从缺口绕过去"的断言）。
+    private static bool PathTouchesRow(CellPath path, int y) {
+        for (int i = 0; i < path.Count(); i = i + 1) {
+            if (path.Get(i).y == y) { return true; }
+        }
+        return false;
+    }
+
+    private static string PathText(CellPath path) {
+        string text = "";
+        for (int i = 0; i < path.Count(); i = i + 1) {
+            text = text + path.Get(i).ToString() + ";";
+        }
+        return text;
+    }
+
+    private static double PolylineLength(List<Point2> points) {
+        double total = 0.0;
+        for (int i = 1; i < points.Count; i = i + 1) {
+            total = total + points[i - 1].DistanceTo(points[i]);
+        }
+        return total;
+    }
+
+    /* ---------- 空旷网格：A* 的基本形状与代价 ---------- */
+    private static void TestAStarOpenGrid() {
+        bool[] cells = new bool[25];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        GridMap map = GridMap.FromWalkable(cells, 5, 5);
+
+        AStarOptions options = new AStarOptions();
+        CellPath path = AStar.Find(map, new GridPoint(0, 0), new GridPoint(4, 4), options);
+        Check("open grid path found", !path.IsEmpty());
+        Check("open grid path valid", IsValidPath(map, path));
+        // 对角 4 步：5 个点。
+        Check("open grid point count", path.Count() == 5);
+        // 代价 = 4 * √2。
+        CheckNear("open grid cost", path.TotalCost(map), 4.0 * 1.4142135623730951, 0.0001);
+    }
+
+    /* ---------- 墙：路径必须绕行，不能穿墙 ---------- */
+    private static GridMap BuildWallMap() {
+        // 12 x 3：x = 6 在 y = 0、1 上是墙，只有 y = 2 留了缺口。
+        bool[] cells = new bool[36];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        cells[0 * 12 + 6] = false;
+        cells[1 * 12 + 6] = false;
+        return GridMap.FromWalkable(cells, 12, 3);
+    }
+
+    private static void TestAStarAvoidsWall() {
+        GridMap map = BuildWallMap();
+        AStarOptions options = new AStarOptions();
+        CellPath path = AStar.Find(map, new GridPoint(0, 0), new GridPoint(11, 0), options);
+        Check("wall path found", !path.IsEmpty());
+        Check("wall path valid", IsValidPath(map, path));
+        Check("wall path uses gap row", PathTouchesRow(path, 2));
+    }
+
+    /* ---------- 代价地形：贵的区域要被绕开 ---------- */
+    private static void TestWeightedTerrain() {
+        // 7 x 3：中间三列的上下两行代价 10，最下面一行便宜 → 路径走底行。
+        double[] costs = new double[21];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 1.0; }
+        for (int y = 0; y <= 1; y = y + 1) {
+            for (int x = 2; x <= 4; x = x + 1) {
+                costs[y * 7 + x] = 10.0;
+            }
+        }
+        GridMap map = GridMap.FromCosts(costs, 7, 3);
+        AStarOptions options = new AStarOptions();
+        CellPath path = AStar.Find(map, new GridPoint(0, 1), new GridPoint(6, 1), options);
+        Check("weighted path found", !path.IsEmpty());
+        Check("weighted path valid", IsValidPath(map, path));
+        Check("weighted path avoids expensive cells", PathTouchesRow(path, 2));
+        // 便宜的绕行代价远小于穿贵区（穿贵区至少 3 步 × 10）。
+        Check("weighted path cheaper", path.TotalCost(map) < 15.0);
+    }
+
+    /* ---------- JPS 与 A* 结果一致，但展开节点更少 ---------- */
+    private static void TestJpsMatchesAStar() {
+        int w = 32;
+        int h = 32;
+        bool[] cells = new bool[w * h];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        GridMap map = GridMap.FromWalkable(cells, w, h);
+
+        AStarOptions options = new AStarOptions();
+        options.uniformStepCost = true;
+        CellPath astar = AStar.Find(map, new GridPoint(0, 0), new GridPoint(31, 31), options);
+        CellPath jps = Jps.Find(map, new GridPoint(0, 0), new GridPoint(31, 31));
+
+        Check("jps path found", !jps.IsEmpty());
+        Check("jps path valid", IsValidPath(map, jps));
+        Check("jps length equals astar", jps.Count() == astar.Count());
+        Check("jps expands fewer nodes", jps.expandedNodes < astar.expandedNodes);
+    }
+
+    /* ---------- JPS 在有障碍的地图上仍是最优 ---------- */
+    private static void TestJpsWithObstacles() {
+        int w = 24;
+        int h = 24;
+        bool[] cells = new bool[w * h];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        // 两道带缺口的墙。
+        for (int y = 0; y < h; y = y + 1) {
+            if (y != 5) { cells[y * w + 8] = false; }
+            if (y != 17) { cells[y * w + 15] = false; }
+        }
+        GridMap map = GridMap.FromWalkable(cells, w, h);
+
+        AStarOptions options = new AStarOptions();
+        options.uniformStepCost = true;
+        CellPath astar = AStar.Find(map, new GridPoint(0, 0), new GridPoint(23, 23), options);
+        CellPath jps = Jps.Find(map, new GridPoint(0, 0), new GridPoint(23, 23));
+
+        Check("jps obstacle path found", !jps.IsEmpty());
+        Check("jps obstacle path valid", IsValidPath(map, jps));
+        Check("jps obstacle length equals astar", jps.Count() == astar.Count());
+    }
+
+    /* ---------- 不可达 ---------- */
+    private static void TestUnreachable() {
+        bool[] cells = new bool[16];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        // 整列墙：左右不连通。
+        for (int y = 0; y < 4; y = y + 1) { cells[y * 4 + 2] = false; }
+        GridMap map = GridMap.FromWalkable(cells, 4, 4);
+
+        AStarOptions options = new AStarOptions();
+        CellPath path = AStar.Find(map, new GridPoint(0, 0), new GridPoint(3, 3), options);
+        Check("unreachable path empty", path.IsEmpty());
+        Check("unreachable jps empty", Jps.Find(map, new GridPoint(0, 0), new GridPoint(3, 3)).IsEmpty());
+    }
+
+    /* ---------- 确定性：同一查询两次结果一致 ---------- */
+    private static void TestDeterminism() {
+        int w = 20;
+        int h = 20;
+        bool[] cells = new bool[w * h];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        for (int y = 0; y < h; y = y + 1) {
+            if (y % 5 != 0) { cells[y * w + 10] = false; }
+        }
+        GridMap map = GridMap.FromWalkable(cells, w, h);
+
+        AStarOptions options = new AStarOptions();
+        CellPath first = AStar.Find(map, new GridPoint(0, 0), new GridPoint(19, 19), options);
+        CellPath second = AStar.Find(map, new GridPoint(0, 0), new GridPoint(19, 19), options);
+        Check("deterministic astar", PathText(first) == PathText(second));
+
+        CellPath jpsFirst = Jps.Find(map, new GridPoint(0, 0), new GridPoint(19, 19));
+        CellPath jpsSecond = Jps.Find(map, new GridPoint(0, 0), new GridPoint(19, 19));
+        Check("deterministic jps", PathText(jpsFirst) == PathText(jpsSecond));
+    }
+
+    /* ---------- 视线拉直 ---------- */
+    private static void TestSmoothing() {
+        bool[] cells = new bool[100];
+        for (int i = 0; i < cells.Length; i = i + 1) { cells[i] = true; }
+        GridMap map = GridMap.FromWalkable(cells, 10, 10);
+
+        AStarOptions options = new AStarOptions();
+        CellPath raw = AStar.Find(map, new GridPoint(0, 0), new GridPoint(9, 9), options);
+        Check("raw path has steps", raw.Count() == 10);
+
+        CellPath smoothed = PathSmoother.Smooth(map, raw);
+        Check("smoothed path shorter", smoothed.Count() < raw.Count());
+        Check("smoothed path valid", IsValidSmoothedPath(map, smoothed));
+        Check("smoothed keeps endpoints",
+              smoothed.Get(0) == raw.Get(0) && smoothed.Get(smoothed.Count() - 1) == raw.Get(raw.Count() - 1));
+    }
+
+    /* ---------- 导航网格 + 漏斗 ---------- */
+    private static void TestNavMesh() {
+        GridMap map = BuildWallMap();
+        NavMesh mesh = NavMesh.Build(map);
+        Check("navmesh built", mesh.RectCount() > 0);
+
+        Point2 start = new Point2(0.5, 0.5);
+        Point2 goal = new Point2(11.5, 0.5);
+        List<Point2> path = mesh.FindPath(start, goal);
+        Check("navmesh path found", path.Count >= 2);
+        Check("navmesh path endpoints",
+              path.Count >= 2 && path[0] == start && path[path.Count - 1] == goal);
+
+        // 必须从缺口（x ≈ 6 那一行的 y = 2 带）穿过去。
+        bool throughGap = false;
+        for (int i = 0; i < path.Count; i = i + 1) {
+            Point2 p = path[i];
+            if (p.x > 4.5 && p.x < 7.5 && p.y > 1.5) { throughGap = true; }
+        }
+        Check("navmesh path uses gap", throughGap);
+
+        // 漏斗求出的折线应当不比逐格路径更长（它切角）。
+        AStarOptions options = new AStarOptions();
+        CellPath grid = AStar.Find(map, new GridPoint(0, 0), new GridPoint(11, 0), options);
+        double gridLength = grid.GeometricLength(map);
+        double navLength = PolylineLength(path);
+        Check("navmesh path not longer", navLength <= gridLength + 0.0001);
+        Check("navmesh path compact", path.Count <= 6);
+    }
+
+    public static void Main() {
+        TestAStarOpenGrid();
+        TestAStarAvoidsWall();
+        TestWeightedTerrain();
+        TestJpsMatchesAStar();
+        TestJpsWithObstacles();
+        TestUnreachable();
+        TestDeterminism();
+        TestSmoothing();
+        TestNavMesh();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL PATHFINDING TESTS PASSED");
+        } else {
+            Console.WriteLine("PATHFINDING FAILURES: " + failures.ToString());
+        }
+    }
+}

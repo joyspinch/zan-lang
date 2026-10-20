@@ -180,6 +180,10 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   **静默内存损坏**（值是错的，不是崩）。已修（`irgen.c` 的 `map_type`）。
   判定器 `tests/conformance/struct_field_layout/`——新写"跨文件共享结构体"的
   代码时先跑它，别自己判字段偏移。
+* **`List<T>.Count` 是属性，不是方法**（实证，2026-10-22）：写 `list.Count()`
+  编译器直接报 "'List<T>.Count' is a property, not a method: drop the '()'"。
+  `Dictionary` / `Queue` 的 `Count` 同理。自己封装的类（`CellPath.Count()`）
+  才是方法——**别把两者的写法混用**。
 
 ## 4. Edit
 

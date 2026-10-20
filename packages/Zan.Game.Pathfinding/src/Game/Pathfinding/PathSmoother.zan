@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Pathfinding;
+
+// 路径平滑：把格子路径里"可以直连"的中间点去掉（string pulling）。
+//
+// 只做**视线拉直**：两个点之间若没有障碍隔断，就直接连起来。折线因此
+// 变成"拐点最少"的形状，而不是逐格锯齿。视线检查是严格的——不切角，
+// 对角穿过时两个正交邻格都必须可通行。
+public class PathSmoother {
+    // 两点之间是否没有障碍隔断（严格模式，不切角）。
+    public static bool HasLineOfSight(GridMap map, GridPoint a, GridPoint b) {
+        if (!map.IsWalkable(a.x, a.y) || !map.IsWalkable(b.x, b.y)) { return false; }
+        if (a.x == b.x && a.y == b.y) { return true; }
+
+        double x0 = a.x + 0.5;
+        double y0 = a.y + 0.5;
+        double x1 = b.x + 0.5;
+        double y1 = b.y + 0.5;
+        double dx = x1 - x0;
+        double dy = y1 - y0;
+
+        int stepX = 0;
+        int stepY = 0;
+        if (dx > 0.0) { stepX = 1; }
+        else if (dx < 0.0) { stepX = -1; }
+        if (dy > 0.0) { stepY = 1; }
+        else if (dy < 0.0) { stepY = -1; }
+
+        double tMaxX = 1e300;
+        double tMaxY = 1e300;
+        double tDeltaX = 1e300;
+        double tDeltaY = 1e300;
+        if (stepX != 0) {
+            double boundary = x0;
+            if (stepX > 0) { boundary = (double)(a.x + 1) - x0; }
+            else { boundary = x0 - (double)a.x; }
+            tMaxX = boundary / Math.Abs(dx);
+            tDeltaX = 1.0 / Math.Abs(dx);
+        }
+        if (stepY != 0) {
+            double boundary = y0;
+            if (stepY > 0) { boundary = (double)(a.y + 1) - y0; }
+            else { boundary = y0 - (double)a.y; }
+            tMaxY = boundary / Math.Abs(dy);
+            tDeltaY = 1.0 / Math.Abs(dy);
+        }
+
+        int cx = a.x;
+        int cy = a.y;
+        int guard = 0;
+        while (guard < 1000000) {
+            guard = guard + 1;
+            if (tMaxX < tMaxY - 0.000000000001) {
+                cx = cx + stepX;
+                tMaxX = tMaxX + tDeltaX;
+            } else if (tMaxY < tMaxX - 0.000000000001) {
+                cy = cy + stepY;
+                tMaxY = tMaxY + tDeltaY;
+            } else {
+                // 同时跨过格角：严格模式要求两个正交邻格都可通行（不切角）。
+                if (stepX != 0 && stepY != 0) {
+                    if (!map.IsWalkable(cx + stepX, cy)) { return false; }
+                    if (!map.IsWalkable(cx, cy + stepY)) { return false; }
+                }
+                cx = cx + stepX;
+                cy = cy + stepY;
+                tMaxX = tMaxX + tDeltaX;
+                tMaxY = tMaxY + tDeltaY;
+            }
+            if (!map.IsWalkable(cx, cy)) { return false; }
+            if (cx == b.x && cy == b.y) { return true; }
+        }
+        return false;
+    }
+
+    // 拉直：贪心地保留"能直连到最远"的点。
+    public static CellPath Smooth(GridMap map, CellPath path) {
+        CellPath result = new CellPath();
+        if (path == null) { return result; }
+        int count = path.Count();
+        if (count == 0) { return result; }
+        result.Add(path.Get(0));
+        if (count == 1) { return result; }
+
+        int anchor = 0;
+        while (anchor < count - 1) {
+            int best = anchor + 1;
+            for (int j = count - 1; j > anchor; j = j - 1) {
+                if (PathSmoother.HasLineOfSight(map, path.Get(anchor), path.Get(j))) {
+                    best = j;
+                    break;
+                }
+            }
+            result.Add(path.Get(best));
+            anchor = best;
+        }
+        result.expandedNodes = path.expandedNodes;
+        return result;
+    }
+}

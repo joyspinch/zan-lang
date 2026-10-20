@@ -210,6 +210,44 @@ conformance：`physics2d_world`（自由落体积分、落地静止、弹性反�
 **已知边界**：只支持凸多边形；无 TOI 扫掠；角-角接触按单点近似；无 sleeping、
 无 CCD。
 
+### 1.7 寻路：`Zan.Game.Pathfinding`
+
+新包 `packages/Zan.Game.Pathfinding`，命名空间 `Game.Pathfinding`。补上 §3
+里标着的缺口：仓库里已有棋盘 BFS（`Game.Board.GridPathfinder`）与塔防流场
+（`Game.Tactics.FlowField`），缺的是**加权**寻路与**连续坐标**路径。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Point2.zan` | `Point2` | 值语义二维点（struct），运算符与 `Length/DistanceTo/Lerp/Normalized` |
+| `GridMap.zan` | `GridPoint` / `GridMap` | 通行 + 每格代价；`FromBlocked` / `FromWalkable` / `FromCosts`；格子中心 ↔ 世界坐标 |
+| `CellPath.zan` | `CellPath` | 格子路径（点序列 + 总代价 + 几何长度 + 展开节点数） |
+| `OpenHeap.zan` | `OpenHeap` | 开放表用的最小堆（优先级 + 平局键） |
+| `AStar.zan` | `AStarOptions` / `AStar` | 加权 A*：欧氏代价（对角 √2）、八分距离启发式、可调权重、展开上限 |
+| `Jps.zan` | `Jps` | 跳跃点搜索：均匀代价 + 不切角，展开节点比 A* 少一个数量级 |
+| `PathSmoother.zan` | `PathSmoother` | 视线拉直（string pulling），严格不切角 |
+| `NavMesh.zan` | `NavRect` / `NavPortal` / `NavMesh` | 贪心最大矩形分解 + 门图 A* + 漏斗（funnel）平滑折线 |
+| `Pathfinding.zan` | `Pathfinding` | 门面：`FindPath` / `FindPathJps` / `FindNavPath` |
+
+**五条硬取舍**：
+
+1. **确定性**：开放表是自带的二叉堆，优先级相同时按次级键（h）再按入堆
+   顺序打破平局——同一对起终点必然给出同一条路径（回放 / 锁步的前提）。
+2. **JPS 只在均匀代价网格上成立**：非均匀代价时 `Jps.Find` **自动退回
+   A***——JPS 的剪枝规则在非均匀代价下不成立，硬用会给出次优路径。
+3. **JPS 不切角**：对角移动与跳跃扫描都要求两个正交邻格可通行。
+4. **导航网格用贪心最大矩形分解**，不做多边形裁剪：结果确定、实现简单，
+   代价是矩形数比理论最优多。
+5. **漏斗的"左/右"按行进方向定**：门的两个端点谁在左由"本矩形中心 →
+   下一矩形中心"的方向决定——用固定方向会在急转弯走廊里把左右定反，
+   路径会贴着走廊边缘走。
+
+conformance：`pathfinding_grid`（A* 代价与形状、绕墙、加权地形、JPS 与
+A* 路径长度一致且展开节点更少、不可达、确定性、拉直不穿墙、导航网格路径
+必经缺口）。
+
+**已知边界**：导航网格路径贴矩形边界走（无单位半径）；JPS 在狭长走廊上
+可能比 A* 慢；无动态障碍（改地图要重建）；无多层导航。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -255,7 +293,7 @@ conformance：`physics2d_world`（自由落体积分、落地静止、弹性反�
 | `Zan.Game.Ecs` | DefaultEcs / Unity ml-agents | 榜外 / 19,771 | ✅ 已落地 `packages/Zan.Game.Ecs`（`Game.Ecs`：类型化组件池 + 延迟销毁 + 分组系统调度 + 稳定序查询，见 §1.5） | — |
 | `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | ✅ 已落地 `packages/Zan.Game.Physics2D`（`Game.Physics2D`：值语义向量 + 凸多边形/圆窄相 + 顺序冲量动力学 + 距离/旋转关节，见 §1.6） | — |
 | `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
-| `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | 只有棋盘 `GridPathfinder` + 塔防 `FlowField` → A*/JPS、导航网格、路径平滑 | 2–3 周 |
+| `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | ✅ 已落地 `packages/Zan.Game.Pathfinding`（`Game.Pathfinding`：加权 A* + 跳跃点搜索 + 视线拉直 + 导航网格漏斗平滑，见 §1.7） | — |
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | 有 `AssetPipeline` + `PackedAssets` → glTF 导入、骨骼/动画切片、图集、字体与 shader | 3–5 周 |
 | `Zan.Game.Audio` | NAudio | 6,249 | 有 `AudioBus`/`SpatialAudio2D`/`Desktop/Audio`，无 mp3/ogg 解码与流式播放 | 2–3 周 |
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | 已有 lockstep + 回放 → 快照同步、rollback 预测、延迟补偿 | 4–6 周 |
@@ -288,7 +326,7 @@ conformance：`physics2d_world`（自由落体积分、落地静止、弹性反�
 ## 6. 落地顺序
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
-**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
+**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 

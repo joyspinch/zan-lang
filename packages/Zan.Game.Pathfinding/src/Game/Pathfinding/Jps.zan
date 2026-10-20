@@ -1,0 +1,274 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Pathfinding;
+
+// 跳跃结果（实现细节）：找到的跳跃点坐标、步数与是否找到。
+public class JpsJumpResult {
+    public int x;
+    public int y;
+    public int steps;
+    public bool found;
+
+    public JpsJumpResult() {
+        this.x = 0;
+        this.y = 0;
+        this.steps = 0;
+        this.found = false;
+    }
+}
+
+// 跳跃点搜索（JPS，Harabor & Grastien）。
+//
+// 前提：
+//   - **均匀代价**网格：八方向同价（每步 1.0）。非均匀代价网格上
+//     Find 自动退回 A*（JPS 的剪枝规则只在均匀代价下成立）。
+//   - **不切角**：对角移动要求两个正交邻格都可通行。
+//
+// 优势：空旷区域上展开的节点数比 A* 少一个数量级（大地图上尤其明显）。
+// 代价：跳跃扫描本身是 O(窄走廊长度)，极端形状下比 A* 慢。
+public class Jps {
+    private static int[] s_dx = new int[8] { 0, 1, 0, -1, 1, 1, -1, -1 };
+    private static int[] s_dy = new int[8] { 1, 0, -1, 0, 1, -1, 1, -1 };
+
+    public static CellPath Find(GridMap map, GridPoint start, GridPoint goal) {
+        if (map == null) { return new CellPath(); }
+        if (!map.IsUniformCost()) {
+            AStarOptions fallback = new AStarOptions();
+            fallback.uniformStepCost = true;
+            return AStar.Find(map, start, goal, fallback);
+        }
+        CellPath empty = new CellPath();
+        if (!map.IsWalkable(start.x, start.y)) { return empty; }
+        if (!map.IsWalkable(goal.x, goal.y)) { return empty; }
+
+        int width = map.width;
+        int total = width * map.height;
+        double[] g = new double[total];
+        for (int i = 0; i < total; i = i + 1) { g[i] = 1e300; }
+        int[] cameFrom = new int[total];
+        for (int i = 0; i < total; i = i + 1) { cameFrom[i] = -1; }
+        bool[] closed = new bool[total];
+
+        int startIndex = map.Index(start.x, start.y);
+        int goalIndex = map.Index(goal.x, goal.y);
+        g[startIndex] = 0.0;
+        cameFrom[startIndex] = startIndex;
+
+        OpenHeap open = new OpenHeap(64);
+        double startH = Jps.Chebyshev(start, goal);
+        open.Push(startIndex, startH, startH);
+
+        int expansions = 0;
+        while (!open.IsEmpty()) {
+            int current = open.Pop();
+            if (closed[current]) { continue; }
+            closed[current] = true;
+            expansions = expansions + 1;
+
+            if (current == goalIndex) {
+                CellPath path = Jps.Reconstruct(cameFrom, current, width);
+                path.expandedNodes = expansions;
+                return path;
+            }
+
+            int cx = current % width;
+            int cy = current / width;
+            for (int d = 0; d < 8; d = d + 1) {
+                int dx = Jps.s_dx[d];
+                int dy = Jps.s_dy[d];
+                bool diagonal = dx != 0 && dy != 0;
+
+                int nx = cx + dx;
+                int ny = cy + dy;
+                if (!map.IsWalkable(nx, ny)) { continue; }
+                if (diagonal) {
+                    if (!map.IsWalkable(cx + dx, cy)) { continue; }
+                    if (!map.IsWalkable(cx, cy + dy)) { continue; }
+                }
+
+                JpsJumpResult jump = Jps.Jump(map, cx, cy, dx, dy, goal.x, goal.y);
+                if (!jump.found) { continue; }
+                int nextIndex = map.Index(jump.x, jump.y);
+                if (closed[nextIndex]) { continue; }
+
+                double next = g[current] + jump.steps;
+                if (next < g[nextIndex] - 0.000000000001) {
+                    g[nextIndex] = next;
+                    cameFrom[nextIndex] = current;
+                    double h = Jps.Chebyshev(new GridPoint(jump.x, jump.y), goal);
+                    open.Push(nextIndex, next + h, h);
+                }
+            }
+        }
+        return empty;
+    }
+
+    // 切比雪夫距离：均匀代价八方向模型下的可采纳启发式。
+    public static double Chebyshev(GridPoint from, GridPoint to) {
+        int dx = from.x - to.x;
+        if (dx < 0) { dx = -dx; }
+        int dy = from.y - to.y;
+        if (dy < 0) { dy = -dy; }
+        if (dx > dy) { return dx; }
+        return dy;
+    }
+
+    // 沿方向 (dx, dy) 从 (x, y) 跳跃，返回第一个跳跃点。
+    private static JpsJumpResult Jump(GridMap map, int x, int y, int dx, int dy,
+                                       int goalX, int goalY) {
+        if (dx != 0 && dy != 0) {
+            return Jps.JumpDiagonal(map, x, y, dx, dy, goalX, goalY);
+        }
+        return Jps.JumpCardinal(map, x + dx, y + dy, dx, dy, goalX, goalY);
+    }
+
+    // 正交方向扫描：**从 firstX/firstY 开始**逐格推进，遇到目标格或
+    // "被迫转向"的格子即停。
+    //
+    // "被迫转向"的判据用的是扫描方向上的**前一格**：侧边格子可通行、
+    // 但它斜后方被挡住——想走到侧边格子就必须经过当前格子。
+    // firstX/firstY 必须是扫描路径上的第一格（调用方决定"前一格"是谁）。
+    private static JpsJumpResult JumpCardinal(GridMap map, int firstX, int firstY, int dx, int dy,
+                                               int goalX, int goalY) {
+        JpsJumpResult result = new JpsJumpResult();
+        int cx = firstX;
+        int cy = firstY;
+        int steps = 1;
+        while (map.IsWalkable(cx, cy)) {
+            if (cx == goalX && cy == goalY) {
+                result.found = true;
+                result.x = cx;
+                result.y = cy;
+                result.steps = steps;
+                return result;
+            }
+            if (Jps.HasForcedNeighbor(map, cx, cy, dx, dy)) {
+                result.found = true;
+                result.x = cx;
+                result.y = cy;
+                result.steps = steps;
+                return result;
+            }
+            cx = cx + dx;
+            cy = cy + dy;
+            steps = steps + 1;
+        }
+        return result;
+    }
+
+    // 对角方向扫描：除了"被迫转向"，还要看正交续接方向上有没有跳跃点
+    // （有的话当前对角格就是跳跃点——路径必须在这里转）。
+    //
+    // 对角步不许切角：两个正交垫脚格都必须可通行，否则扫描到此为止。
+    private static JpsJumpResult JumpDiagonal(GridMap map, int x, int y, int dx, int dy,
+                                               int goalX, int goalY) {
+        JpsJumpResult result = new JpsJumpResult();
+        int cx = x + dx;
+        int cy = y + dy;
+        int steps = 1;
+        while (map.IsWalkable(cx, cy)) {
+            if (cx == goalX && cy == goalY) {
+                result.found = true;
+                result.x = cx;
+                result.y = cy;
+                result.steps = steps;
+                return result;
+            }
+            if (Jps.HasDiagonalForcedNeighbor(map, cx, cy, dx, dy)) {
+                result.found = true;
+                result.x = cx;
+                result.y = cy;
+                result.steps = steps;
+                return result;
+            }
+            // 自然邻居递归：正交续接方向上若还有跳跃点，当前对角格就是跳跃点。
+            if (map.IsWalkable(cx + dx, cy)) {
+                JpsJumpResult sub = Jps.JumpCardinal(map, cx + dx, cy, dx, 0, goalX, goalY);
+                if (sub.found) {
+                    result.found = true;
+                    result.x = cx;
+                    result.y = cy;
+                    result.steps = steps;
+                    return result;
+                }
+            }
+            if (map.IsWalkable(cx, cy + dy)) {
+                JpsJumpResult sub = Jps.JumpCardinal(map, cx, cy + dy, 0, dy, goalX, goalY);
+                if (sub.found) {
+                    result.found = true;
+                    result.x = cx;
+                    result.y = cy;
+                    result.steps = steps;
+                    return result;
+                }
+            }
+            // 下一对角步不许切角。
+            if (!map.IsWalkable(cx + dx, cy) || !map.IsWalkable(cx, cy + dy)) {
+                return result;
+            }
+            cx = cx + dx;
+            cy = cy + dy;
+            steps = steps + 1;
+        }
+        return result;
+    }
+
+    // 正交扫描的"被迫转向"：侧边格子可通行、但它斜后方被挡住——想走到侧边
+    // 格子就必须经过当前格子。
+    private static bool HasForcedNeighbor(GridMap map, int x, int y, int dx, int dy) {
+        if (dx != 0) {
+            if (map.IsWalkable(x, y + 1) && !map.IsWalkable(x - dx, y + 1)) { return true; }
+            if (map.IsWalkable(x, y - 1) && !map.IsWalkable(x - dx, y - 1)) { return true; }
+        } else {
+            if (map.IsWalkable(x + 1, y) && !map.IsWalkable(x + 1, y - dy)) { return true; }
+            if (map.IsWalkable(x - 1, y) && !map.IsWalkable(x - 1, y - dy)) { return true; }
+        }
+        return false;
+    }
+
+    // 对角扫描的"被迫转向"：外侧对角格可通行、但正交垫脚格被挡住。
+    private static bool HasDiagonalForcedNeighbor(GridMap map, int x, int y, int dx, int dy) {
+        if (map.IsWalkable(x - dx, y + dy) && !map.IsWalkable(x - dx, y)) { return true; }
+        if (map.IsWalkable(x + dx, y - dy) && !map.IsWalkable(x, y - dy)) { return true; }
+        return false;
+    }
+
+    // 回溯跳跃点序列并把每段直线展开成逐格路径。
+    private static CellPath Reconstruct(int[] cameFrom, int goalIndex, int width) {
+        List<GridPoint> jumps = new List<GridPoint>();
+        int cursor = goalIndex;
+        int guard = 0;
+        while (guard < cameFrom.Length + 2) {
+            jumps.Add(new GridPoint(cursor % width, cursor / width));
+            if (cameFrom[cursor] == cursor) { break; }
+            cursor = cameFrom[cursor];
+            guard = guard + 1;
+        }
+
+        CellPath path = new CellPath();
+        for (int i = jumps.Count - 1; i >= 0; i = i - 1) {
+            GridPoint target = jumps[i];
+            if (path.Count() == 0) {
+                path.Add(target);
+                continue;
+            }
+            GridPoint from = path.Get(path.Count() - 1);
+            int stepX = 0;
+            int stepY = 0;
+            if (target.x > from.x) { stepX = 1; }
+            else if (target.x < from.x) { stepX = -1; }
+            if (target.y > from.y) { stepY = 1; }
+            else if (target.y < from.y) { stepY = -1; }
+            int cx = from.x + stepX;
+            int cy = from.y + stepY;
+            path.Add(new GridPoint(cx, cy));
+            while (cx != target.x || cy != target.y) {
+                cx = cx + stepX;
+                cy = cy + stepY;
+                path.Add(new GridPoint(cx, cy));
+            }
+        }
+        return path;
+    }
+}
