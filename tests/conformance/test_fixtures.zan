@@ -1,0 +1,269 @@
+using System;
+using System.Collections.Generic;
+using System.Test.Fixtures;
+
+// 假数据生成契约测试：随机源、语义化数据、集合、装配器。
+//
+// 覆盖的判定点：
+//   - 随机源：区间边界、字符串长度、UUID 形态（版本位 / 变体位）、十六进制、
+//     字节数、日期时间区间、时长、空集合取样报错；
+//   - 确定性：同种子同序列、不同种子不同序列；
+//   - 语义化数据：邮箱含 @ 与域名、URL 以 https 开头、姓名非空、地址含街道、
+//     电话是保留测试号段、颜色是 #rrggbb、版本号三段、卡号是保留测试段；
+//   - 集合：随机长度、生成器收到下标、唯一性确实唯一、取尽报错、分块、抽样；
+//   - 装配器：登记后取值稳定（同一键两次取同一个值）、未登记的键报错、
+//     自定义生成器只跑一次、键名清单。
+public class FixtureTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    public static void Run() {
+        TestRandom();
+        TestDeterminism();
+        TestText();
+        TestCollection();
+        TestBuilder();
+
+        if (failures > 0) {
+            Console.WriteLine("FIXTURE TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL FIXTURE TESTS PASSED");
+        }
+    }
+
+    // ---- 随机源 ----
+    private static void TestRandom() {
+        FixtureRandom r = new FixtureRandom(20240101L);
+
+        // 区间：结果恒在 [min, max)。
+        bool inRange = true;
+        for (int i = 0; i < 200; i = i + 1) {
+            int v = r.Int(10, 20);
+            if (v < 10 || v >= 20) { inRange = false; }
+        }
+        Check("random-int-in-range", inRange);
+
+        // 反向区间不炸（返回下界）。
+        Check("random-int-reversed-range", r.Int(5, 5) == 5);
+
+        // 字符串长度在界内。
+        bool lenOk = true;
+        for (int i = 0; i < 50; i = i + 1) {
+            string s = r.String(4, 8);
+            if (s.Length < 4 || s.Length > 8) { lenOk = false; }
+        }
+        Check("random-string-length", lenOk);
+
+        // 纯字母串只含小写字母。
+        bool alphaOk = true;
+        string alpha = r.Alpha(20, 20);
+        for (int i = 0; i < alpha.Length; i = i + 1) {
+            int c = alpha[i];
+            if (c < 97 || c > 122) { alphaOk = false; }
+        }
+        Check("random-alpha-charset", alphaOk);
+
+        // 数字串长度精确。
+        Check("random-digits-length", r.Digits(6).Length == 6);
+
+        // 十六进制串只含 0-9a-f。
+        bool hexOk = true;
+        string hex = r.Hex(16);
+        for (int i = 0; i < hex.Length; i = i + 1) {
+            int c = hex[i];
+            bool digit = c >= 48 && c <= 57;
+            bool lower = c >= 97 && c <= 102;
+            if (!digit && !lower) { hexOk = false; }
+        }
+        Check("random-hex-charset", hexOk);
+
+        // UUID 形态：36 字符、第三段首字符是 4、第四段首字符是 8/9/a/b。
+        string uuid = r.Uuid();
+        bool uuidOk = uuid.Length == 36
+            && uuid[14] == 52   // '4'
+            && (uuid[19] == 56 || uuid[19] == 57 || uuid[19] == 97 || uuid[19] == 98);
+        Check("random-uuid-shape", uuidOk);
+
+        // 字节数精确。
+        Check("random-bytes-length", r.Bytes(9).Length == 9);
+
+        // 日期落在区间内。
+        DateTime d = r.DateTime(2000, 2001);
+        Check("random-datetime-range", d.Year() >= 2000 && d.Year() <= 2001);
+
+        // 时长落在区间内。
+        TimeSpan span = r.TimeSpan(5, 10);
+        Check("random-timespan-range", span.TotalSeconds() >= 5 && span.TotalSeconds() <= 10);
+
+        // 空集合取样报错（错误可区分）。
+        bool threw = false;
+        try {
+            r.Pick<string>(new string[0]);
+        } catch (FixtureException e) {
+            threw = e.error == FixtureError.InvalidArgument;
+        }
+        Check("random-pick-empty-throws", threw);
+    }
+
+    // ---- 确定性 ----
+    private static void TestDeterminism() {
+        FixtureRandom a = new FixtureRandom(4242L);
+        FixtureRandom b = new FixtureRandom(4242L);
+        bool same = true;
+        for (int i = 0; i < 50; i = i + 1) {
+            if (a.Int() != b.Int()) { same = false; }
+        }
+        Check("determinism-same-seed", same);
+
+        FixtureRandom c = new FixtureRandom(4243L);
+        FixtureRandom d = new FixtureRandom(4244L);
+        bool differ = false;
+        for (int i = 0; i < 50; i = i + 1) {
+            if (c.Int() != d.Int()) { differ = true; }
+        }
+        Check("determinism-different-seed", differ);
+    }
+
+    // ---- 语义化数据 ----
+    private static void TestText() {
+        FixtureText t = new FixtureText(new FixtureRandom(31337L));
+
+        string email = t.Email();
+        Check("text-email-shape", email.Contains("@") && email.Contains("."));
+
+        string url = t.Url();
+        Check("text-url-shape", url.StartsWith("https://"));
+
+        Check("text-name-not-empty", t.FullName().Length > 0);
+
+        string address = t.StreetAddress();
+        Check("text-address-shape", address.Contains(" "));
+
+        // 电话是保留测试号段（+1-555-…）。
+        Check("text-phone-test-range", t.PhoneNumber().StartsWith("+1-555-"));
+
+        // 颜色是 #rrggbb。
+        string color = t.ColorHex();
+        Check("text-color-shape", color.Length == 7 && color[0] == 35);
+
+        // 版本号三段。
+        string version = t.SemanticVersion();
+        Check("text-version-shape", version.Split(".").Count == 3);
+
+        // 卡号是保留测试段开头。
+        Check("text-card-test-range", t.CreditCardNumber().StartsWith("4242"));
+    }
+
+    // ---- 集合 ----
+    private static void TestCollection() {
+        FixtureCollection c = new FixtureCollection(new FixtureRandom(555L));
+
+        // 长度精确、生成器收到下标。
+        List<int> nums = c.Of<int>(5, i => i * 3);
+        bool indexed = nums.Count == 5;
+        for (int i = 0; i < nums.Count; i = i + 1) {
+            if (nums[i] != i * 3) { indexed = false; }
+        }
+        Check("collection-of-indexed", indexed);
+
+        // 数组形态。
+        int[] arr = c.Array<int>(3, i => i + 1);
+        Check("collection-array-length", arr.Length == 3 && arr[2] == 3);
+
+        // 字典键值。
+        Dictionary<string, int> map = c.Map<int>(2, i => i * 5);
+        Check("collection-map", map.Count == 2 && map["k1"] == 5);
+
+        // 唯一值确实唯一。
+        List<string> uniq = c.UniqueStrings(20);
+        bool distinct = uniq.Count == 20;
+        for (int i = 0; i < uniq.Count && distinct; i = i + 1) {
+            for (int j = i + 1; j < uniq.Count; j = j + 1) {
+                if (uniq[i] == uniq[j]) { distinct = false; break; }
+            }
+        }
+        Check("collection-unique-distinct", distinct);
+
+        // 取尽仍重复 → 报错（不返回重复值）。
+        bool threw = false;
+        try {
+            c.Unique<int>(5, i => 1);
+        } catch (FixtureException e) {
+            threw = e.error == FixtureError.ConstraintViolated;
+        }
+        Check("collection-unique-exhausted-throws", threw);
+
+        // 分块：最后一块可能更短。
+        List<List<int>> chunks = c.Chunks(nums, 2);
+        Check("collection-chunks", chunks.Count == 3 && chunks[0].Count == 2 && chunks[2].Count == 1);
+
+        // 抽样不重复。
+        List<int> sample = c.Sample(nums, 3);
+        bool sampleOk = sample.Count == 3;
+        for (int i = 0; i < sample.Count && sampleOk; i = i + 1) {
+            for (int j = i + 1; j < sample.Count; j = j + 1) {
+                if (sample[i] == sample[j]) { sampleOk = false; break; }
+            }
+        }
+        Check("collection-sample-distinct", sampleOk);
+    }
+
+    // ---- 装配器 ----
+    private static void TestBuilder() {
+        FixtureBuilder fb = new FixtureBuilder(new FixtureRandom(909L));
+        fb.WithString("name").WithInt("age", 18, 60).WithBool("active")
+          .WithEmail("mail").WithUuid("id").WithDouble("score", 0.0, 100.0);
+
+        // 同一键两次取到同一个值。
+        Check("builder-stable-value", fb.String("name") == fb.String("name"));
+
+        // 类型隔离：int 键不能用 string 取。
+        bool threw = false;
+        try {
+            fb.String("age");
+        } catch (FixtureException e) {
+            threw = e.error == FixtureError.KeyNotRegistered;
+        }
+        Check("builder-wrong-type-throws", threw);
+
+        // 未登记的键报错。
+        threw = false;
+        try {
+            fb.Int("missing");
+        } catch (FixtureException e) {
+            threw = e.error == FixtureError.KeyNotRegistered;
+        }
+        Check("builder-missing-key-throws", threw);
+
+        // 自定义生成器只跑一次。
+        int calls = 0;
+        FixtureBuilder fb2 = new FixtureBuilder(new FixtureRandom(1L));
+        fb2.WithCustom("token", () => {
+            calls = calls + 1;
+            return "tok-" + calls.ToString();
+        });
+        string token = fb2.String("token");
+        string token2 = fb2.String("token");
+        Check("builder-custom-once", calls == 1 && token == token2);
+
+        // 键名清单。
+        Check("builder-keys", fb.Keys().Count == 6);
+
+        // 登记区间生效。
+        FixtureBuilder fb3 = new FixtureBuilder(new FixtureRandom(2L));
+        fb3.WithInt("n", 5, 6);
+        Check("builder-range", fb3.Int("n") == 5);
+    }
+}
+
+public class FixtureTestsMain {
+    public static void Main() {
+        FixtureTests.Run();
+    }
+}

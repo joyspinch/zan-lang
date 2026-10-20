@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace System.Test.Fixtures;
+
+// 假数据随机源（门面层）。
+//
+// **确定性**：同一个种子必然给出同一串数据。`new FixtureRandom()` 用当前时刻
+// 做种子（每次都不一样），`new FixtureRandom(seed)` / `FixtureRandom.Seeded(seed)`
+// 固定种子——需要可复现的失败样本时用后者，把种子记进测试名里。
+//
+// **零配置可用**：`new FixtureRandom()` 直接就有 int / double / 字符串 / 字节 /
+// 日期等全套生成器，不用先注册什么。
+//
+// **底层用 `RandomExt`**（xorshift64*）：53 位精度、可快照状态、同种子同序列。
+// 非加密安全——假数据本来也不该拿来当密钥。
+//
+// **并发**：非线程安全（内部有状态）。要并行就每个线程各建一个。
+public class FixtureRandom {
+    private RandomExt rng;
+    private long seed;
+
+    // 用当前时刻做种子（每次创建都不一样）。
+    public FixtureRandom() {
+        this.seed = DateTime.UtcNow().ToUnixMilliseconds();
+        this.rng = new RandomExt(this.seed);
+    }
+
+    // 固定种子（可复现）。seed 为 0 时 `RandomExt` 会换成非零常量。
+    public FixtureRandom(long seed) {
+        this.seed = seed;
+        this.rng = new RandomExt(seed);
+    }
+
+    // 固定种子的静态便捷入口。
+    public static FixtureRandom Seeded(long seed) {
+        return new FixtureRandom(seed);
+    }
+
+    // 本实例的种子（记进失败样本里就能复现）。
+    public long Seed { get { return this.seed; } }
+
+    // 底层随机源（需要分布（正态 / 指数）或加权抽样时直接用）。
+    public RandomExt Source { get { return this.rng; } }
+
+    // [min, max) 区间的整数。
+    public int Int(int minInclusive, int maxExclusive) {
+        return this.rng.NextInt(minInclusive, maxExclusive);
+    }
+
+    // 非负整数（0 .. int.MaxValue）。
+    public int Int() {
+        return this.rng.NextInt(0, 2147483647);
+    }
+
+    // [min, max) 区间的长整数。
+    public long Long(long minInclusive, long maxExclusive) {
+        long span = maxExclusive - minInclusive;
+        if (span <= 0L) { return minInclusive; }
+        double d = this.rng.NextDouble();
+        return minInclusive + (long)(d * (double)span);
+    }
+
+    // [min, max) 区间的双精度数。
+    public double Double(double min, double max) {
+        if (max <= min) { return min; }
+        return min + (max - min) * this.rng.NextDouble();
+    }
+
+    // [0.0, 1.0) 区间的双精度数。
+    public double Double() {
+        return this.rng.NextDouble();
+    }
+
+    // [min, max) 区间的单精度数。
+    public float Float(float min, float max) {
+        if (max <= min) { return min; }
+        return min + (max - min) * (float)this.rng.NextDouble();
+    }
+
+    // [0.0, 1.0) 区间的单精度数。
+    public float Float() {
+        return (float)this.rng.NextDouble();
+    }
+
+    // 等概率布尔值。
+    public bool Bool() {
+        return this.rng.NextBool();
+    }
+
+    // 以给定概率为 true。
+    public bool Bool(double probability) {
+        return this.rng.NextBool(probability);
+    }
+
+    // 以给定概率为 true（Chance 是 Bool 的别名，读起来更顺）。
+    public bool Chance(double probability) {
+        return this.rng.NextBool(probability);
+    }
+
+    // 随机单字符（ASCII 可打印区）。
+    //
+    // **返回字符串而不是 char**：Zan 没有 char 类型（字符串是 UTF-8 字节串），
+    // 单字符就是长度为 1 的字符串。
+    public string Char() {
+        return this.PickChar(FixtureRandom.Printable());
+    }
+
+    // 长度在 [minLength, maxLength] 的随机字符串（可打印 ASCII）。
+    public string String(int minLength, int maxLength) {
+        int lo = minLength < 0 ? 0 : minLength;
+        int hi = maxLength < lo ? lo : maxLength;
+        int len = this.Int(lo, hi + 1);
+        return this.Chars(FixtureRandom.Printable(), len);
+    }
+
+    // 长度在 [8, 16] 的随机字符串。
+    public string String() {
+        return this.String(8, 16);
+    }
+
+    // 只含小写字母的字符串。
+    public string Alpha(int minLength, int maxLength) {
+        int lo = minLength < 0 ? 0 : minLength;
+        int hi = maxLength < lo ? lo : maxLength;
+        return this.Chars(FixtureRandom.LowerLetters(), this.Int(lo, hi + 1));
+    }
+
+    // 只含小写字母与数字的字符串。
+    public string Alphanumeric(int minLength, int maxLength) {
+        int lo = minLength < 0 ? 0 : minLength;
+        int hi = maxLength < lo ? lo : maxLength;
+        return this.Chars(FixtureRandom.LowerLetters() + FixtureRandom.Digits(), this.Int(lo, hi + 1));
+    }
+
+    // 恰好 count 位的数字串。
+    public string Digits(int count) {
+        if (count <= 0) { return ""; }
+        return this.Chars(FixtureRandom.Digits(), count);
+    }
+
+    // 恰好 length 位的十六进制串（小写）。
+    public string Hex(int length) {
+        if (length <= 0) { return ""; }
+        return this.Chars("0123456789abcdef", length);
+    }
+
+    // 确定性 UUID 文本（8-4-4-4-12）。
+    //
+    // **不用 `Guid.NewV4()`**：那走操作系统随机源，不可复现——同一批测试两次
+    // 跑出来的样本不一致，失败样本就复现不了。
+    public string Uuid() {
+        byte[] b = new byte[16];
+        for (int i = 0; i < 16; i = i + 1) {
+            b[i] = (byte)this.Int(0, 256);
+        }
+        // 摆正版本位（4）与变体位（10xx）：随机字节直接拼出来的串过不了
+        // 严格的 UUID 校验（第三段首字符必须是 4、第四段首字符必须是 8/9/a/b）。
+        b[6] = (byte)((b[6] & 0x0F) | 0x40);
+        b[8] = (byte)((b[8] & 0x3F) | 0x80);
+        return Guid.Format(b);
+    }
+
+    // [minYear, maxYear] 之间的随机时刻（UTC）。
+    public DateTime DateTime(int minYear, int maxYear) {
+        if (maxYear <= minYear) { maxYear = minYear + 1; }
+        int year = this.Int(minYear, maxYear);
+        int month = this.Int(1, 13);
+        int day = this.Int(1, 29);
+        return DateTime.FromParts(year, month, day, this.Int(0, 24), this.Int(0, 60), this.Int(0, 60));
+    }
+
+    // 两个时刻之间的随机时刻（UTC）。
+    public DateTime DateTimeBetween(DateTime from, DateTime to) {
+        long lo = from.ToUnixMilliseconds();
+        long hi = to.ToUnixMilliseconds();
+        if (hi <= lo) { return from; }
+        long ms = lo + (long)(this.rng.NextDouble() * (double)(hi - lo));
+        return DateTime.FromUnixMilliseconds(ms);
+    }
+
+    // [minSeconds, maxSeconds] 之间的随机时长。
+    public TimeSpan TimeSpan(int minSeconds, int maxSeconds) {
+        int lo = minSeconds < 0 ? 0 : minSeconds;
+        int hi = maxSeconds < lo ? lo : maxSeconds;
+        return TimeSpan.FromSeconds(this.Int(lo, hi + 1));
+    }
+
+    // count 个随机字节。
+    public byte[] Bytes(int count) {
+        if (count <= 0) { return new byte[0]; }
+        byte[] b = new byte[count];
+        for (int i = 0; i < count; i = i + 1) {
+            b[i] = (byte)this.Int(0, 256);
+        }
+        return b;
+    }
+
+    // 从数组里等概率取一个（数组为空返回 default 值）。
+    public T Pick<T>(T[] items) {
+        if (items == null || items.Length == 0) {
+            throw new FixtureException(FixtureError.InvalidArgument, "",
+                "FixtureRandom.Pick: the array is empty");
+        }
+        return items[this.Int(0, items.Length)];
+    }
+
+    // 从列表里等概率取一个。
+    public T Pick<T>(List<T> items) {
+        if (items == null || items.Count == 0) {
+            throw new FixtureException(FixtureError.InvalidArgument, "",
+                "FixtureRandom.Pick: the list is empty");
+        }
+        return items[this.Int(0, items.Count)];
+    }
+
+    // 原地洗牌（Fisher–Yates）。
+    public void Shuffle<T>(List<T> items) {
+        this.rng.Shuffle<T>(items);
+    }
+
+    // 洗牌后的新列表（原列表不变）。
+    public List<T> Shuffled<T>(List<T> items) {
+        return this.rng.Shuffled<T>(items);
+    }
+
+    // 从字符集里取一个字符。
+    private string PickChar(string charset) {
+        return charset.Substring(this.Int(0, charset.Length), 1);
+    }
+
+    // 按字符集生成 count 个字符。
+    private string Chars(string charset, int count) {
+        string outp = "";
+        for (int i = 0; i < count; i = i + 1) {
+            outp = outp + this.PickChar(charset);
+        }
+        return outp;
+    }
+
+    // 可打印 ASCII 字符集。
+    private static string Printable() {
+        return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    }
+
+    // 小写字母表。
+    private static string LowerLetters() {
+        return "abcdefghijklmnopqrstuvwxyz";
+    }
+
+    // 数字表。
+    private static string Digits() {
+        return "0123456789";
+    }
+}

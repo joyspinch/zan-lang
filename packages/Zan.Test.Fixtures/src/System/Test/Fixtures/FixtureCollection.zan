@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test.Fixtures;
+
+// 集合假数据（能力层）：随机长度、随机内容的列表 / 数组 / 字典，以及唯一性。
+//
+// **唯一性有上限**：唯一值靠"重试到不重复为止"实现，重试次数有上限
+// （默认 1000）。空间被取尽时**抛异常**而不是悄悄返回一个重复值——重复的
+// "唯一"字段会让测试以莫名其妙的方式失败（去重逻辑、去重后计数不符）。
+//
+// **并发**：非线程安全。
+public class FixtureCollection {
+    private FixtureRandom random;
+
+    public FixtureCollection(FixtureRandom random) {
+        this.random = random != null ? random : new FixtureRandom();
+    }
+
+    // 随机取 count 个生成器产出的值（生成器收到下标）。
+    public List<T> Of<T>(int count, FuncT<int, T> generator) {
+        List<T> items = new List<T>();
+        if (count <= 0 || generator == null) { return items; }
+        for (int i = 0; i < count; i = i + 1) {
+            items.Add(generator(i));
+        }
+        return items;
+    }
+
+    // 随机取 count 个生成器产出的值（数组形态）。
+    public T[] Array<T>(int count, FuncT<int, T> generator) {
+        List<T> items = this.Of<T>(count, generator);
+        return items.ToArray();
+    }
+
+    // 随机个数的字符串列表。
+    public List<string> Strings(int count) {
+        FixtureRandom r = this.random;
+        return this.Of<string>(count, i => r.String());
+    }
+
+    // 随机个数的整数列表。
+    public List<int> Ints(int count) {
+        FixtureRandom r = this.random;
+        return this.Of<int>(count, i => r.Int());
+    }
+
+    // 随机个数的字典（键是 `k0`、`k1`……，值由生成器给出）。
+    public Dictionary<string, T> Map<T>(int count, FuncT<int, T> generator) {
+        Dictionary<string, T> map = new Dictionary<string, T>();
+        if (count <= 0 || generator == null) { return map; }
+        for (int i = 0; i < count; i = i + 1) {
+            map.Add("k" + i.ToString(), generator(i));
+        }
+        return map;
+    }
+
+    // 互不相同的值（重试上限 maxAttempts；取尽仍重复则抛异常）。
+    //
+    // 去重走 `HashSet<T>`：它的相等规则是"值类型按值、字符串按内容、其他引用
+    // 类型按身份"，正好是测试数据想要的那套——同名不同实例算两个，名字相同
+    // 算同一个。
+    public List<T> Unique<T>(int count, FuncT<int, T> generator) {
+        List<T> items = new List<T>();
+        if (count <= 0 || generator == null) { return items; }
+        int maxAttempts = count * 1000;
+        if (maxAttempts < 1000) { maxAttempts = 1000; }
+        HashSet<T> seen = new HashSet<T>();
+        int attempts = 0;
+        while (items.Count < count) {
+            if (attempts >= maxAttempts) {
+                throw new FixtureException(FixtureError.ConstraintViolated, "",
+                    "FixtureCollection.Unique: could not produce " + count.ToString() +
+                    " distinct values within " + maxAttempts.ToString() + " attempts");
+            }
+            attempts = attempts + 1;
+            T value = generator(attempts);
+            if (seen.Add(value)) { items.Add(value); }
+        }
+        return items;
+    }
+
+    // 互不相同的字符串（唯一用户名 / 唯一 id 的常用形态）。
+    public List<string> UniqueStrings(int count) {
+        FixtureRandom r = this.random;
+        return this.Unique<string>(count, i => r.Uuid());
+    }
+
+    // 把列表切成固定大小的块（最后一块可能更短）。
+    public List<List<T>> Chunks<T>(List<T> items, int size) {
+        List<List<T>> chunks = new List<List<T>>();
+        if (items == null || size <= 0) { return chunks; }
+        int i = 0;
+        while (i < items.Count) {
+            int take = size;
+            if (i + take > items.Count) { take = items.Count - i; }
+            List<T> chunk = new List<T>();
+            for (int j = 0; j < take; j = j + 1) {
+                chunk.Add(items[i + j]);
+            }
+            chunks.Add(chunk);
+            i = i + take;
+        }
+        return chunks;
+    }
+
+    // 从列表里不重复地抽 count 个（不足时返回全部）。
+    public List<T> Sample<T>(List<T> items, int count) {
+        List<T> picked = new List<T>();
+        if (items == null || count <= 0) { return picked; }
+        List<T> pool = new List<T>();
+        pool.AddRange(items);
+        this.random.Shuffle<T>(pool);
+        int take = count < pool.Count ? count : pool.Count;
+        for (int i = 0; i < take; i = i + 1) {
+            picked.Add(pool[i]);
+        }
+        return picked;
+    }
+}

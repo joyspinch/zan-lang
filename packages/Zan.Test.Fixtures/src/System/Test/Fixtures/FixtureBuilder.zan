@@ -1,0 +1,211 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test.Fixtures;
+
+// 对象装配的取值器（门面层）。
+//
+// **Zan 没有反射**，所以对象图不能像 AutoFixture 那样"扫一遍类型自动填
+// 字段"。本类提供另一半：**按名字取值**——先登记"这个键该长什么样"，再由
+// 调用方显式装配：
+//
+// ```zan
+// FixtureBuilder fb = new FixtureBuilder(new FixtureRandom(42));
+// fb.WithString("name").WithInt("age", 18, 60).WithEmail("mail");
+// User u = new User();
+// u.name = fb.String("name");
+// u.age = fb.Int("age");
+// u.mail = fb.String("mail");
+// ```
+//
+// **同一个键永远取到同一个值**：登记时就把值定下来（不是每次取值时现生成），
+// 免得同一个字段在两个地方（对象 + 断言）拿到不同的数据。
+//
+// **取值未登记的键会抛 `FixtureException`**（错误码 `KeyNotRegistered`），
+// 而不是现编一个值——"忘了登记"和"登记了但名字打错"都当场暴露。
+//
+// **并发**：非线程安全。
+public class FixtureBuilder {
+    private FixtureRandom random;
+    private FixtureText text;
+    private Dictionary<string, string> strings;
+    private Dictionary<string, int> ints;
+    private Dictionary<string, double> doubles;
+    private Dictionary<string, bool> bools;
+    private Dictionary<string, DateTime> dateTimes;
+
+    public FixtureBuilder(FixtureRandom random) {
+        this.random = random != null ? random : new FixtureRandom();
+        this.text = new FixtureText(this.random);
+        this.strings = new Dictionary<string, string>();
+        this.ints = new Dictionary<string, int>();
+        this.doubles = new Dictionary<string, double>();
+        this.bools = new Dictionary<string, bool>();
+        this.dateTimes = new Dictionary<string, DateTime>();
+    }
+
+    // 底层随机源（要自己造更复杂的数据时用）。
+    public FixtureRandom Random { get { return this.random; } }
+
+    // 语义化数据入口（人名 / 邮箱 / 句子……）。
+    public FixtureText Text { get { return this.text; } }
+
+    // 登记一个随机字符串（8..16 位）。
+    public FixtureBuilder WithString(string key) {
+        return this.WithString(key, 8, 16);
+    }
+
+    // 登记一个指定长度的随机字符串。
+    public FixtureBuilder WithString(string key, int minLength, int maxLength) {
+        this.RequireKey(key);
+        if (!this.strings.ContainsKey(key)) {
+            this.strings.Add(key, this.random.String(minLength, maxLength));
+        }
+        return this;
+    }
+
+    // 登记一个自定义字符串（生成器只跑一次，之后取值都拿这个值）。
+    public FixtureBuilder WithCustom(string key, Func<string> generator) {
+        this.RequireKey(key);
+        if (generator == null) {
+            throw new FixtureException(FixtureError.InvalidArgument, key,
+                "FixtureBuilder.WithCustom: the generator must not be null");
+        }
+        if (!this.strings.ContainsKey(key)) {
+            this.strings.Add(key, generator());
+        }
+        return this;
+    }
+
+    // 登记一个随机整数。
+    public FixtureBuilder WithInt(string key, int minInclusive, int maxExclusive) {
+        this.RequireKey(key);
+        if (!this.ints.ContainsKey(key)) {
+            this.ints.Add(key, this.random.Int(minInclusive, maxExclusive));
+        }
+        return this;
+    }
+
+    // 登记一个随机双精度数。
+    public FixtureBuilder WithDouble(string key, double min, double max) {
+        this.RequireKey(key);
+        if (!this.doubles.ContainsKey(key)) {
+            this.doubles.Add(key, this.random.Double(min, max));
+        }
+        return this;
+    }
+
+    // 登记一个随机布尔值。
+    public FixtureBuilder WithBool(string key) {
+        this.RequireKey(key);
+        if (!this.bools.ContainsKey(key)) {
+            this.bools.Add(key, this.random.Bool());
+        }
+        return this;
+    }
+
+    // 登记一个随机时刻。
+    public FixtureBuilder WithDateTime(string key, int minYear, int maxYear) {
+        this.RequireKey(key);
+        if (!this.dateTimes.ContainsKey(key)) {
+            this.dateTimes.Add(key, this.random.DateTime(minYear, maxYear));
+        }
+        return this;
+    }
+
+    // 登记一个邮箱。
+    public FixtureBuilder WithEmail(string key) {
+        this.RequireKey(key);
+        if (!this.strings.ContainsKey(key)) {
+            this.strings.Add(key, this.text.Email());
+        }
+        return this;
+    }
+
+    // 登记一个姓名。
+    public FixtureBuilder WithFullName(string key) {
+        this.RequireKey(key);
+        if (!this.strings.ContainsKey(key)) {
+            this.strings.Add(key, this.text.FullName());
+        }
+        return this;
+    }
+
+    // 登记一个 UUID。
+    public FixtureBuilder WithUuid(string key) {
+        this.RequireKey(key);
+        if (!this.strings.ContainsKey(key)) {
+            this.strings.Add(key, this.random.Uuid());
+        }
+        return this;
+    }
+
+    // 取字符串（没登记过就抛异常）。
+    public string String(string key) {
+        string v;
+        if (!this.strings.TryGetValue(key, out v)) {
+            throw new FixtureException(FixtureError.KeyNotRegistered, key,
+                "FixtureBuilder: no string registered for key '" + key + "'");
+        }
+        return v;
+    }
+
+    // 取整数（没登记过就抛异常）。
+    public int Int(string key) {
+        int v;
+        if (!this.ints.TryGetValue(key, out v)) {
+            throw new FixtureException(FixtureError.KeyNotRegistered, key,
+                "FixtureBuilder: no int registered for key '" + key + "'");
+        }
+        return v;
+    }
+
+    // 取双精度数（没登记过就抛异常）。
+    public double Double(string key) {
+        double v;
+        if (!this.doubles.TryGetValue(key, out v)) {
+            throw new FixtureException(FixtureError.KeyNotRegistered, key,
+                "FixtureBuilder: no double registered for key '" + key + "'");
+        }
+        return v;
+    }
+
+    // 取布尔值（没登记过就抛异常）。
+    public bool Bool(string key) {
+        bool v;
+        if (!this.bools.TryGetValue(key, out v)) {
+            throw new FixtureException(FixtureError.KeyNotRegistered, key,
+                "FixtureBuilder: no bool registered for key '" + key + "'");
+        }
+        return v;
+    }
+
+    // 取时刻（没登记过就抛异常）。
+    public DateTime DateTime(string key) {
+        DateTime v;
+        if (!this.dateTimes.TryGetValue(key, out v)) {
+            throw new FixtureException(FixtureError.KeyNotRegistered, key,
+                "FixtureBuilder: no datetime registered for key '" + key + "'");
+        }
+        return v;
+    }
+
+    // 已登记的键名。
+    public List<string> Keys() {
+        List<string> keys = new List<string>();
+        foreach (string k in this.strings.Keys) { keys.Add(k); }
+        foreach (string k in this.ints.Keys) { keys.Add(k); }
+        foreach (string k in this.doubles.Keys) { keys.Add(k); }
+        foreach (string k in this.bools.Keys) { keys.Add(k); }
+        foreach (string k in this.dateTimes.Keys) { keys.Add(k); }
+        return keys;
+    }
+
+    // 键名不能为空。
+    private void RequireKey(string key) {
+        if (key == null || key == "") {
+            throw new FixtureException(FixtureError.InvalidArgument, key,
+                "FixtureBuilder: the key must not be empty");
+        }
+    }
+}

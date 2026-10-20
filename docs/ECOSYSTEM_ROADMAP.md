@@ -631,6 +631,62 @@ conformance `animation_pipeline`（变换的单位性 / 组合顺序 / 父级缩
 （状态机是单层 + 交叉淡化）；IK 只有两骨；蒙皮是 LBS（不做 Dual Quaternion，
 极端弯曲处会体积塌陷）；无 DCC 导入器（片段与网格由外部工具导出成数据）。
 
+### 1.17 假数据生成：`Zan.Test.Fixtures`
+
+新包 `packages/Zan.Test.Fixtures`，命名空间 `System.Test.Fixtures`。补 Bogus
+（9,747★）/ AutoFixture（3,539★）那一档：**能造出"像真的"的测试数据**。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `FixtureRandom.zan` | `FixtureRandom` | 种子化随机源：int / long / double / float / bool / 字符串 / 字母串 / 数字串 / 十六进制 / 字节 / UUID / 日期时间 / 时长 / 抽样 / 洗牌 |
+| `FixtureText.zan` | `FixtureText` | 语义化数据：姓名 / 登录名 / 邮箱 / 域名 / URL / 电话 / 地址 / 城市 / 国家 / 邮编 / 公司 / 句子 / 段落 / slug / 颜色 / 版本号 / 卡号 |
+| `FixtureCollection.zan` | `FixtureCollection` | 集合假数据：定长生成 / 数组 / 字典 / 唯一值 / 分块 / 抽样 |
+| `FixtureBuilder.zan` | `FixtureBuilder` | 显式装配的取值器：按键登记 + 取值（同一键恒等） |
+| `FixtureException.zan` | `FixtureException` / `FixtureError` | 未登记键 / 约束取尽 / 参数非法（可区分） |
+
+**五条硬取舍**：
+
+1. **无反射，对象图必须显式装配**。AutoFixture 靠反射扫字段自动填，Zan 没有
+   反射——本包提供另一半：**按名字取值**。登记 `fb.WithInt("age", 18, 60)`，
+   再由调用方 `u.age = fb.Int("age")` 一行行装配。装配显式，但每个字段的
+   来源都看得见（比反射自动填更可控）。
+2. **登记时就把值定下来**，不是取值时现生成：同一键两次取到同一个值，
+   免得"对象里的字段"与"断言里的期望值"对不上。
+3. **未登记的键当场报错**（`FixtureError.KeyNotRegistered`），不现编一个值
+   ——"忘了登记"和"名字打错"都当场暴露。
+4. **唯一值有重试上限，取尽报错**，不返回重复值。重复的"唯一"字段会让
+   测试以莫名其妙的方式失败。
+5. **不生成"看起来能用"的敏感数据**：卡号走保留测试段（4242…）、电话走保留
+   测试号段（+1-555-…）；UUID 自己拼字节并摆正版本位与变体位（过得了严格
+   的 UUID 校验），但不用操作系统的随机源——**同一种子必须给出同一批数据**，
+   否则失败样本复现不了。
+
+conformance `test_fixtures`（随机源的区间边界与反向区间、字符串长度、字母 /
+十六进制字符集、UUID 形态、字节数、日期与时长区间、空集合取样报错；同种子
+同序列与异种子异序列；邮箱 / URL / 地址 / 电话 / 颜色 / 版本号 / 卡号的形态；
+集合的定长生成与下标传递、数组与字典、唯一性、取尽报错、分块、抽样不重复；
+装配器的取值稳定、类型隔离、未登记键报错、自定义生成器只跑一次、键名清单、
+登记区间生效）。
+
+**已知边界**：无反射式自动装配；无属性 / 字段级的"忽略"规则；无日期序列
+（工作日 / 节假日）；词表是内联小表而非多语言语料库；不保证跨语言一致
+（同一字段在不同 locale 下没有对应词表）。
+
+### 1.18 压缩：已由 `Zan.IO` 覆盖，不新建平行包
+
+原 §2 里 `Zan.Compression` 记的缺口（"压缩只在 AppUpdate 零散使用；无通用
+deflate/lz4/zstd"）**已经过期**：`packages/Zan.IO/src/System/IO/Compression/`
+里有纯 Zan 实现的 RFC1951 `Deflate`、`Lz4Block` / `Lz4Frame`、`GZip`、
+`BZip2`、`Zip` / `ZipWriter`、`Tar`、`Crc32`，与任何标准实现互通
+（conformance `lz4_roundtrip` / `compression_archive_lifecycle` /
+`zip_deflate_bounds` 在跑）。
+
+按 `Zan.Math` 的先例（并入 `stdlib/System/Numerics`，不另开包），**压缩不再
+单开 `Zan.Compression`**：同一个能力有两个家只会让人不知道该用哪个。
+
+剩下的真空白只有 **zstd**：它的熵编码（FSE + Huffman）解码器体量大，
+编码器可以先做"仅 raw block"的合法子集，但收益有限，暂缓。
+
 ---
 
 ### 1.17 表级变换：`Zan.DataFrame` 补齐 pandas 的 reshape 家族
@@ -700,7 +756,7 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | 建议包 | C# 参考 | ★ | 补什么（实测缺口） | 工期 |
 |---|---|---|---|---|
 | `Zan.Math` | MathNet.Numerics | 3,772 | ✅ 已并入 `stdlib/System/Numerics`（`MathUtil`/`Quaternion`/`Noise`/`RandomExt`/`Spline`，不新建平行包，见 §1.2） | — |
-| `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | 压缩只在 AppUpdate 零散使用；无通用 deflate/lz4/zstd | 1–2 周 |
+| `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | ✅ 已在 `packages/Zan.IO` 的 `System.IO.Compression` 内落地（纯 Zan：RFC1951 Deflate / LZ4 block+frame / GZip / BZip2 / Zip / Tar / Crc32，**不新建平行包**，见 §1.18）；剩下的真空白只有 **zstd**（熵编码解码器体量大，暂缓） | — |
 | `Zan.Validation` | FluentValidation | 9,765 | ✅ 已落地 `packages/Zan.Validation`（`System.Validation`，规则链 + 错误聚合，编译期绑定取值器、运行期零反射，见 §1.3） | — |
 | `Zan.Logging` | Serilog / NLog | 8,051 / 6,550 | ✅ 已在 `System.Diagnostics` 内落地（见 §1） | — |
 
@@ -720,7 +776,7 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `Zan.Pdf` | QuestPDF | 14,205 | **当前最大空白**：全仓唯一 "pdf" 命中是 HttpClient 的 MIME 映射；无排版/字体/表格引擎 |
 | `Zan.Ssh` | SSH.NET | 4,385 | SSH 客户端、SFTP、密钥管理 |
 | `Zan.Barcode` | ZXing.Net | 榜外 | 条码/二维码编解码（补全 Gui 侧扫码） |
-| `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | 假数据生成、对象图构造、断言助手 |
+| `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |
 | `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
 | `Zan.Bench` | BenchmarkDotNet | 11,512 | 基准测试（ARC 无 GC，分配量统计比 .NET 更该做） |
 

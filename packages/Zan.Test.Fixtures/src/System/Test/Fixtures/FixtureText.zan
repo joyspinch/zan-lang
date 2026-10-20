@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test.Fixtures;
+
+// 语义化假数据（门面层）：人名、邮箱、地址、公司、句子、颜色……
+//
+// **为什么单独一层**：Bogus / AutoFixture 的价值不在"随机数"，而在"随机出来
+// 的东西像真的"——邮箱有 @、域名有后缀、电话是号码、地址有街道和门牌。测试
+// 里造一个 `test@test.com` 当邮箱，格式化与校验的分支就永远走不到。
+//
+// **数据表是内联的小词表**：不是英语母语语料的复刻，够测试用即可。词表放成
+// 静态数组会在进程退出时留下一份不释放的 rc 集合（见路线图 §7 的已知缺陷），
+// 所以这里改成每次调用现造数组——测试数据生成不在热路径上。
+//
+// **不生成"看起来能用的"敏感数据**：信用卡号用保留的测试卡号段，手机号用
+// 保留的测试号段，免得假数据被误当成真数据发出去。
+//
+// **并发**：非线程安全（复用同一个随机源）。
+public class FixtureText {
+    private FixtureRandom random;
+
+    public FixtureText(FixtureRandom random) {
+        this.random = random != null ? random : new FixtureRandom();
+    }
+
+    // 名。
+    public string FirstName() {
+        return this.random.Pick<string>(FixtureText.FirstNames());
+    }
+
+    // 姓。
+    public string LastName() {
+        return this.random.Pick<string>(FixtureText.LastNames());
+    }
+
+    // 姓名（姓 + 名）。
+    public string FullName() {
+        return this.LastName() + this.FirstName();
+    }
+
+    // 登录名（小写字母与数字，5..12 位）。
+    public string UserName() {
+        return this.random.Alphanumeric(5, 12).ToLowerAscii();
+    }
+
+    // 邮箱（`名.姓@域名` 形态）。
+    public string Email() {
+        return this.UserName() + "@" + this.Domain();
+    }
+
+    // 域名（`词.后缀` 形态）。
+    public string Domain() {
+        return this.random.Alphanumeric(4, 10).ToLowerAscii() + "." + this.random.Pick<string>(FixtureText.Tlds());
+    }
+
+    // URL（https）。
+    public string Url() {
+        return "https://" + this.Domain() + "/" + this.Slug();
+    }
+
+    // 国际电话号码（保留测试号段 + 假号）。
+    public string PhoneNumber() {
+        return "+1-555-" + this.random.Digits(3) + "-" + this.random.Digits(4);
+    }
+
+    // 街道地址。
+    public string StreetAddress() {
+        return this.random.Int(1, 999).ToString() + " " + this.random.Pick<string>(FixtureText.Streets()) + " St";
+    }
+
+    // 城市。
+    public string City() {
+        return this.random.Pick<string>(FixtureText.Cities());
+    }
+
+    // 国家。
+    public string Country() {
+        return this.random.Pick<string>(FixtureText.Countries());
+    }
+
+    // 邮政编码（5 位数字）。
+    public string ZipCode() {
+        return this.random.Digits(5);
+    }
+
+    // 公司名。
+    public string Company() {
+        return this.random.Pick<string>(FixtureText.CompanyWords()) + " " +
+            this.random.Pick<string>(FixtureText.CompanySuffixes());
+    }
+
+    // 一个句子（3..12 个词，带句号）。
+    public string Sentence() {
+        int count = this.random.Int(3, 13);
+        string text = this.Words(count);
+        return text + ".";
+    }
+
+    // 一段话（若干句子）。
+    public string Paragraph(int sentences) {
+        if (sentences <= 0) { return ""; }
+        string text = "";
+        for (int i = 0; i < sentences; i = i + 1) {
+            text = text + this.Sentence() + " ";
+        }
+        return text.TrimEnd();
+    }
+
+    // 若干个词（空格分隔）。
+    public string Words(int count) {
+        string text = "";
+        for (int i = 0; i < count; i = i + 1) {
+            if (i > 0) { text = text + " "; }
+            text = text + this.random.Pick<string>(FixtureText.WordList());
+        }
+        return text;
+    }
+
+    // URL 友好的短标识（kebab-case）。
+    public string Slug() {
+        int count = this.random.Int(2, 5);
+        string text = "";
+        for (int i = 0; i < count; i = i + 1) {
+            if (i > 0) { text = text + "-"; }
+            text = text + this.random.Pick<string>(FixtureText.WordList());
+        }
+        return text.ToLowerAscii();
+    }
+
+    // 十六进制颜色（`#rrggbb`）。
+    public string ColorHex() {
+        return "#" + this.random.Hex(6);
+    }
+
+    // 语义化版本号（`1.2.3`）。
+    public string SemanticVersion() {
+        return this.random.Int(0, 5).ToString() + "." +
+            this.random.Int(0, 20).ToString() + "." +
+            this.random.Int(0, 30).ToString();
+    }
+
+    // 信用卡号（**保留的测试卡号段**，不生成可真实扣款的号）。
+    //
+    // 4242 开头是支付网关公开的测试卡号段；这里再拼 12 位随机数字，够跑
+    // Luhn 校验与长度校验，但不会撞上真实卡号。
+    public string CreditCardNumber() {
+        string digits = "4242";
+        for (int i = 0; i < 12; i = i + 1) {
+            digits = digits + this.random.Digits(1);
+        }
+        return digits;
+    }
+
+    // 名词表。
+    private static string[] WordList() {
+        return new string[] {
+            "data", "network", "signal", "buffer", "kernel", "module", "packet",
+            "router", "server", "client", "token", "cache", "stream", "record",
+            "engine", "bridge", "worker", "queue", "index", "graph"
+        };
+    }
+
+    // 名（中文）。
+    private static string[] FirstNames() {
+        return new string[] {
+            "伟", "芳", "娜", "秀英", "敏", "静", "丽", "强", "磊", "洋",
+            "艳", "勇", "军", "杰", "娟", "涛", "明", "超", "秀兰", "霞"
+        };
+    }
+
+    // 姓（中文）。
+    private static string[] LastNames() {
+        return new string[] {
+            "王", "李", "张", "刘", "陈", "杨", "黄", "赵", "吴", "周",
+            "徐", "孙", "马", "朱", "胡", "郭", "何", "高", "林", "罗"
+        };
+    }
+
+    // 城市。
+    private static string[] Cities() {
+        return new string[] {
+            "北京", "上海", "广州", "深圳", "杭州", "成都", "武汉", "西安",
+            "南京", "重庆", "天津", "苏州", "青岛", "长沙", "郑州"
+        };
+    }
+
+    // 国家。
+    private static string[] Countries() {
+        return new string[] {
+            "中国", "日本", "韩国", "美国", "德国", "法国", "英国", "加拿大",
+            "澳大利亚", "新加坡"
+        };
+    }
+
+    // 街道名。
+    private static string[] Streets() {
+        return new string[] {
+            "Main", "Oak", "Pine", "Maple", "Cedar", "Elm", "Sunset", "Highland",
+            "River", "Lake"
+        };
+    }
+
+    // 公司名用词。
+    private static string[] CompanyWords() {
+        return new string[] {
+            "Blue", "Silver", "North", "Quantum", "Iron", "Vertex", "Lumen",
+            "Orbit", "Summit", "Cobalt"
+        };
+    }
+
+    // 公司后缀。
+    private static string[] CompanySuffixes() {
+        return new string[] { "Labs", "Systems", "Works", "Group", "Technologies", "Dynamics" };
+    }
+
+    // 顶级域名。
+    private static string[] Tlds() {
+        return new string[] { "com", "net", "org", "io", "dev", "example" };
+    }
+}
