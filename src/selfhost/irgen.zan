@@ -484,6 +484,39 @@ partial class Irgen {
             L("  " + r + " = select i1 " + isnull + ", i64 -1, i64 " + rel);
             return new ExprVal(r, MkType("int"));
         }
+        if (m == "FindNotAnyOf" && argc == 4) {
+            // FindNotAnyOf(p, off, rejectSet, n): the offset of the first byte
+            // that is NOT in the reject set; -1 when the whole window is made
+            // of rejected bytes (the C host's strcspn lowering).
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal off = GenExpr(e.kids[1]);
+            ExprVal setv = GenExpr(e.kids[2]);
+            ExprVal n = GenExpr(e.kids[3]);
+            if (!ExternSeen("strcspn")) { externDecls.Add("strcspn"); H("declare i64 @strcspn(i8*, i8*)"); }
+            string run = NT();
+            L("  " + run + " = call i64 @strcspn(i8* " + NmAddr(p, off.op) + ", i8* " + setv.op + ")");
+            string clean = NT();
+            L("  " + clean + " = icmp uge i64 " + run + ", " + n.op);
+            string r = NT();
+            L("  " + r + " = select i1 " + clean + ", i64 -1, i64 " + run);
+            return new ExprVal(r, MkType("int"));
+        }
+        if (m == "ScanNotAnyOf" && argc == 4) {
+            // ScanNotAnyOf(p, off, acceptSet, n): the length of the leading run
+            // of bytes that ARE in the accept set, capped at n.
+            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal off = GenExpr(e.kids[1]);
+            ExprVal setv = GenExpr(e.kids[2]);
+            ExprVal n = GenExpr(e.kids[3]);
+            if (!ExternSeen("strspn")) { externDecls.Add("strspn"); H("declare i64 @strspn(i8*, i8*)"); }
+            string run = NT();
+            L("  " + run + " = call i64 @strspn(i8* " + NmAddr(p, off.op) + ", i8* " + setv.op + ")");
+            string over = NT();
+            L("  " + over + " = icmp ugt i64 " + run + ", " + n.op);
+            string r = NT();
+            L("  " + r + " = select i1 " + over + ", i64 " + n.op + ", i64 " + run);
+            return new ExprVal(r, MkType("int"));
+        }
         if (m == "Base64Encode" && argc == 2) {
             // Base64Encode(ptr, size) -> heap string (length = ((len+2)/3)*4 + 1)
             ExprVal p = GenExpr(e.kids[0]);
@@ -1234,8 +1267,17 @@ partial class Irgen {
         return IsPolyClass(BaseClassOf(cls));
     }
 
-    // field slot offset: 1 when a vtable pointer occupies slot 0
-    int FieldBase(Node cls) { if (IsPolyClass(cls)) { return 1; } return 0; }
+    // field slot offset: 1 when a vtable pointer occupies slot 0.
+    //
+    // 类**一律**留这个槽（结构体是值类型，没有）：继承链上只要有一处
+    // 偏移不一致，字段就会错位——以前 vptr 槽只在"本类或祖先多态"时才留，
+    // 于是 Base（无接口无虚方法）与 Derived : Base, IFace（有 vptr）
+    // 给同一个字段两套下标，基类构造器把字段写进了派生对象的 vptr 槽。
+    int FieldBase(Node cls) {
+        if (cls == null) { return 0; }
+        if (cls.kind == AK.StructDecl()) { return 0; }
+        return 1;
+    }
 
     // weak fields are non-owning back-references: never retained or released.
     bool WeakTy(Node t) { if (t == null) { return false; } int b = t.mods / 1024; return b - (b / 2) * 2 == 1; }
@@ -1686,7 +1728,8 @@ partial class Irgen {
         CollectFields(cls, names, types);
         string s = "%" + cls.sval + " = type { ";
         int cnt = 0;
-        if (IsPolyClass(cls)) { s = s + "i8*"; cnt = 1; }
+        // 类一律留 vptr 槽（见 FieldBase）：继承链上的字段偏移必须一致。
+        if (cls.kind != AK.StructDecl()) { s = s + "i8*"; cnt = 1; }
         int i = 0;
         while (i < types.Count) {
             if (cnt > 0) { s = s + ", "; }

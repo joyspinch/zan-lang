@@ -1410,11 +1410,22 @@ partial class Irgen {
             if (IsConsoleProp(lhs, "ForegroundColor")) { ConsoleColorSet(v, false); return; }
             if (IsConsoleProp(lhs, "BackgroundColor")) { ConsoleColorSet(v, true); return; }
             if (IsConsoleProp(lhs, "Title")) { ConsoleTitleSet(v); return; }
-            if (lhs.a.kind == AK.Ident() && LocalIdx(lhs.a.sval) < 0) {
+            if (lhs.a.kind == AK.Ident() && LocalIdx(lhs.a.sval) < 0 && !ShadowsTypeName(lhs.a.sval)) {
                 Node tc = binder.FindType(lhs.a.sval);
-                if (tc != null && FindStaticField(tc, lhs.sval) != null) {
-                    StoreStaticField(tc, lhs.sval, v);
-                    return;
+                if (tc != null) {
+                    if (FindStaticField(tc, lhs.sval) != null) {
+                        StoreStaticField(tc, lhs.sval, v);
+                        return;
+                    }
+                    // a static property written through its class name:
+                    // `A.StatMixed = 9` -- the parser turns the property into a
+                    // `set_StatMixed` accessor, so this is a static call with no
+                    // receiver.
+                    Node sm = FindMethodUp(tc, "set_" + lhs.sval);
+                    if (sm != null && HasMod(sm, MOD.Static())) {
+                        EmitPropSet("", MkType(tc.sval), lhs.sval, v);
+                        return;
+                    }
                 }
             }
             ExprVal obj = GenExpr(lhs.a);
@@ -2529,6 +2540,11 @@ partial class Irgen {
                 if (it.kind == AK.Assignment() && it.a != null
                     && it.a.kind == AK.Ident()) {
                     ExprVal fv = GenExpr(it.b);
+                    // A property in the initializer goes through its setter:
+                    // `new A { Mixed = 50 }` calls `set_Mixed(50)`. Storing it
+                    // as a field wrote into a field slot that does not exist
+                    // (index -1 -> invalid IR).
+                    if (EmitPropSet(obj, ty, it.a.sval, fv)) { j = j + 1; continue; }
                     StoreField(obj, cn, it.a.sval, fv);
                 }
                 j = j + 1;
@@ -3540,10 +3556,12 @@ partial class Irgen {
         CollectCapturedNames(lam.d, capNames);
         CollectCapturedNames(lam.a, capNames);
         curRet = MapType(retTy);
-        // a closure that captured the receiver sees the class again: its
-        // fields and instance methods resolve through `%this`
-        if (capThis) { curClass = sClass; curHasThis = true; }
-        else { curClass = ""; curHasThis = false; }
+        // The closure still belongs to the enclosing class: a bare STATIC
+        // call (`CaptureSafe(exe, args)`) and a bare static field/property
+        // resolve against it even when the receiver was not captured.
+        // Only the INSTANCE context (`%this`) needs the capture.
+        curClass = sClass;
+        curHasThis = capThis;
         brkTarget = 0; contTarget = 0;
 
         string sig = "define " + curRet + " " + fname + "(i8* %env";
@@ -5531,6 +5549,10 @@ partial class Irgen {
             ExprVal search = GenExpr(e.kids[0]);
             return EmitListIndexOf(recv, ListElem(recv.ty), search, true);
         }
+        if (name == "LastIndexOf" && e.kids.Count == 1) {
+            ExprVal search = GenExpr(e.kids[0]);
+            return EmitListLastIndexOf(recv, ListElem(recv.ty), search);
+        }
         // an unknown List method must not compile into a call that does
         // nothing: the program would silently get wrong answers
         diags.Error("List method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
@@ -5585,9 +5607,49 @@ partial class Irgen {
         return new ExprVal(r, MkType("int"));
     }
 
+    // List<T>.LastIndexOf(value): the same walk as IndexOf, but from the end
+    // of the list backwards -- the last match wins.
+    ExprVal EmitListLastIndexOf(ExprVal recv, Node elemTy, ExprVal search) {
+        string res = NT();
+        EA(res, "i64");
+        L("  store i64 -1, i64* " + res);
+        string idx = NT();
+        EA(idx, "i64");
+        string cnt = NT();
+        L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+        string ci = NT();
+        L("  " + ci + " = sub i64 " + cnt + ", 1");
+        L("  store i64 " + ci + ", i64* " + idx);
+        int lc = NL(); int lb = NL(); int lfound = NL(); int lstep = NL(); int lend = NL();
+        L("  br label %L" + lc);
+        Label(lc);
+        string i0 = NT();
+        L("  " + i0 + " = load i64, i64* " + idx);
+        string c = NT();
+        L("  " + c + " = icmp slt i64 " + i0 + ", 0");
+        L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+        Label(lb);
+        string raw = NT();
+        L("  " + raw + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + i0 + ")");
+        ExprVal ev = FromSlot(raw, elemTy);
+        string eq = EmitElemEq(ev, search, elemTy);
+        L("  br i1 " + eq + ", label %L" + lfound + ", label %L" + lstep);
+        Label(lstep);
+        string ni = NT();
+        L("  " + ni + " = sub i64 " + i0 + ", 1");
+        L("  store i64 " + ni + ", i64* " + idx);
+        L("  br label %L" + lc);
+        Label(lfound);
+        L("  store i64 " + i0 + ", i64* " + res);
+        L("  br label %L" + lend);
+        Label(lend);
+        string r = NT();
+        L("  " + r + " = load i64, i64* " + res);
+        return new ExprVal(r, MkType("int"));
+    }
+
     // typed equality of two list elements; returns an i1
-    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {
-        if (elemTy != null) {
+    string EmitElemEq(ExprVal a, ExprVal b, Node elemTy) {        if (elemTy != null) {
             Node ca = ClassOf(elemTy);
             if (ca != null) {
                 Node m = binder.FindMethod(ca, "op_eq");
@@ -5676,6 +5738,48 @@ partial class Irgen {
             string t = NT();
             L("  " + t + " = call i64 @zdict_count(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("int"));
+        }
+        if (name == "TryGetValue" && e.kids.Count == 2) {
+            // Dictionary<K,V>.TryGetValue(key, out value): the value is written
+            // into the caller's slot and the call reports whether the key was
+            // there. The C host's emit (irgen_call.c) leaves the out slot
+            // UNTOUCHED on a miss -- so the store is behind the hit branch.
+            Node oarg = e.kids[1];
+            if (oarg == null || oarg.kind != AK.OutArg()) {
+                diags.Error("dictionary method 'TryGetValue' needs an out argument", e.line, e.col);
+                return new ExprVal("0", MkType("bool"));
+            }
+            ExprVal key = GenExpr(e.kids[0]);
+            string kstr = DictKeyOp(key);
+            Node vty = DictVal(recv.ty);
+            string kidx = NT();
+            L("  " + kidx + " = call i64 @zdict_index(i8* " + recv.op + ", i8* " + kstr + ")");
+            string hit = NT();
+            L("  " + hit + " = icmp sge i64 " + kidx + ", 0");
+            string slot = NT();
+            L("  " + slot + " = call i64 @zdict_get(i8* " + recv.op + ", i8* " + kstr + ")");
+            ExprVal val = FromSlot(slot, vty);
+            int lhit = NL(); int lmiss = NL(); int ldone = NL();
+            L("  br i1 " + hit + ", label %L" + lhit + ", label %L" + lmiss);
+            Label(lhit);
+            if (oarg.type != null) {
+                // `out T v`: a fresh local the caller sees afterwards
+                string addr = NewOutLocal(oarg);
+                string lt = MapType(oarg.type);
+                string sv = Coerce(val, lt);
+                L("  store " + lt + " " + sv + ", " + lt + "* " + addr);
+                EmitArcRetain(sv, oarg.type);
+            } else {
+                // `out place`: the value lands in the caller's own slot
+                StoreTo(oarg.a, val);
+            }
+            L("  br label %L" + ldone);
+            Label(lmiss);
+            L("  br label %L" + ldone);
+            Label(ldone);
+            string z = NT();
+            L("  " + z + " = zext i1 " + hit + " to i64");
+            return new ExprVal(z, MkType("bool"));
         }
         if (name == "Clear" && e.kids.Count == 0) {
             L("  call void @zdict_clear(i8* " + recv.op + ")");

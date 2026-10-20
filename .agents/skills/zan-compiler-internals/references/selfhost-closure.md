@@ -1246,3 +1246,56 @@ kernel32、shell32、user32、advapi32、version）。
   - LLVM 的函数类型在**值位置**不能加括号：`bitcast i64 (i8*, i8*)* @f to
     i8*` 合法，`bitcast (i64 (i8*, i8*)*) @f to i8*` 报 "expected type"
     （括号形式只在实参位置合法）。
+
+## 65. 泛型重载：符号要带类型参数，显式类型实参要参与打分
+
+- 坑（2026-10-20 实测）：自举 IR 后端的 `MethodSym`（`src/selfhost/irgen_stmt.zan`）
+  只按"类名_方法名_形参类型标签"拼符号，**不带方法自己的类型参数**。于是
+  `class Box { async string GetAsync(string k); async T GetAsync<T>(string k); }`
+  的两个重载撞成同一个 `Box_GetAsync___string` —— LLVM 报 "invalid
+  redefinition of function"，程序一个输出都没有（用例
+  `generic_overload_type_arity`）。宿主是按实参单态化后拼
+  `mangle_inst_suffix`（`src/compiler/irgen_emit.c`），自举擦除版要对齐的
+  是"泛型与非泛型不能同名"。
+- 做法：`MethodSym` 在重载符号里追加方法自身的类型参数标记（泛型重载变成
+  `Box_GetAsync___T_string`），两个重载不再撞名。
+- 坑（2026-10-20 实测）：**显式类型实参在 parser 里被 `StripTypeArgs` 丢掉了**，
+  只留在 call 节点的 `d` 槽里（`__typeargs` 容器，kids 是 TypeRef）。重载解析
+  此前完全不看它 → `b.Pick<User>(u)` 选中非泛型的 `Pick(string)`，返回值类型
+  都不对（宿主选泛型那个）。
+- 做法：`ScoreCand` 里按显式类型实参的个数与候选的类型参数个数匹配与否计分
+  （匹配 +8、不匹配 -8），让 `M<int>(x)` 稳定落到泛型重载上。
+- 边界：显式类型实参与重载打分只是"选对函数"，**不等于按实参单态化**——
+  泛型重载的返回类型仍是擦除的 i64 槽，异步泛型方法（`async T GetAsync<T>`）
+  的协程帧与 await 降级也还没做，别把"能选中"当成"能用"。
+
+## 66. 宿主没有的诊断要删；调用要能推断类型；闭包要保留类上下文
+
+- 坑（2026-10-21 实测）：自举检查器有两条宿主**根本没有**的诊断：
+  - "cannot return a value from a void method" / "must return a value"
+    —— 宿主 grep `src/compiler` 找不到这两条；`static void Main() { ...;
+    return 0; }` 是宿主编译并运行的正常程序，自举却整份拒收（用例
+    `member_index_store_valid`）。
+  - "ambiguous call to overloaded 'X'" —— 宿主从不报歧义，它按自己的最佳
+    匹配规则选一个。自举一报就把宿主接受的程序拒了（`Sha1.Hash` 等）。
+- 口径（§60 的延续）：**宿主是规格**。自举多出来的诊断 = 自举拒收宿主接受
+  的程序，一律删掉；重载打平时取第一个最佳候选，不报错。
+- 连带（要让打分有意义）：**调用表达式的返回类型要能推出来**。此前
+  `ArgTypeNode` 不认 `Call` → `Sha1.Hash(b.Data(), b.Len())` 的实参类型全是
+  "未知" → 所有重载同分 → 判成歧义。补上 Call 的返回类型推断后，
+  `Hash(byte[], int)` 才压过 `Hash(string, int)`。
+- 坑（2026-10-21 实测）：**闭包里裸调的静态方法会丢掉类名**。自举在发射
+  lambda 体时把 `curClass` 清空（"没捕获 this 就没有类上下文"），于是
+  `CaptureSafe(exe, args)` 变成 `EmitStaticCall("", ...)` → 符号
+  `_CaptureSafe`（无类前缀）、返回类型退化成 i64 → 链接期 "use of undefined
+  value '@_CaptureSafe'"（用例 `log_structured`）。
+  正确做法：**类上下文与接收者上下文是两回事**——`curClass` 始终保留，
+  只有 `curHasThis` 随捕获走。静态字段/属性/方法在闭包里照样可解析。
+- 坑（2026-10-21 实测）：**对象初始化器里的属性要走 setter**。
+  `new A { Mixed = 50 }`（`Mixed` 是带访问器的属性）此前一律当字段存 →
+  字段下标 -1 → "invalid getelementptr indices"；自动属性（`{ get; set; }`）
+  在自举里是**后备字段**（没有访问器方法），仍走字段存。
+- 补齐的内建（宿主有、自举没有）：`Dictionary<K,V>.TryGetValue(key, out v)`
+  （命中才写 out 槽——宿主未命中时**不碰** out 槽）、`List<T>.LastIndexOf`、
+  `NativeMemory.FindNotAnyOf` / `ScanNotAnyOf`（strcspn / strspn）。
+- 门禁：每修一条，配一个 conformance 用例进 `tests/selfhost/diff_cases.txt`。

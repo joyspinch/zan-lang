@@ -29,14 +29,6 @@ public class Checker {
 
     Node curClass;              // type declaration whose body is being checked
     Node curRet;                // return type of the current method (null=void)
-    bool curVoid;               // is the current method void / a constructor
-    // Is the current return type known well enough to police the `return`
-    // statements? A method's is; a lambda body's is not (the lambda returns
-    // *its own* value, and the self-hosted checker does not type a lambda
-    // from its context -- checking the lambda body against the enclosing
-    // method's return type produced false positives: the C host compiles
-    // `Func<int> f = delegate () { return 5; };` inside a void method).
-    bool curRetKnown;
     bool curStatic;             // is the current method static
     int infCount;
     int loopDepth;              // enclosing loop/switch nesting
@@ -45,7 +37,7 @@ public class Checker {
 
     public Checker(Binder b, Diags d) {
         binder = b; diags = d; curClass = null; curRet = null;
-        curVoid = true; curStatic = false; loopDepth = 0; curRetKnown = true;
+        curStatic = false; loopDepth = 0;
         scopeName = new List<string>(); scopeType = new List<Node>();
     }
 
@@ -542,8 +534,6 @@ public class Checker {
             bodyRet = TaskElemTy(bodyRet);
         }
         curRet = bodyRet;
-        curVoid = ctor || bodyRet == null || bodyRet.sval == "void";
-        curRetKnown = true;
         curStatic = !ctor && HasMod(m, MOD.Static());
         int i = 0;
         while (i < m.kids.Count) {
@@ -673,14 +663,12 @@ public class Checker {
         if (k == AK.ExprStmt()) { CheckExpr(n.a); return; }
         if (k == AK.ReturnStmt()) {
             CheckExpr(n.a);
-            if (curRetKnown) {
-                if (n.a != null && curVoid) {
-                    diags.Error("cannot return a value from a void method", n.line, n.col);
-                }
-                if (n.a == null && !curVoid) {
-                    diags.Error("must return a value", n.line, n.col);
-                }
-            }
+            // The C host has NEITHER "cannot return a value from a void method"
+            // NOR "must return a value" (grep src/compiler: no such
+            // diagnostic). `static void Main() { ...; return 0; }` is a
+            // program the host compiles and runs; the self-host checker
+            // used to refuse it, so the check is gone -- the host is the
+            // spec.
             if (n.a != null && curRet != null) {
                 Node rv = InferType(n.a);
                 CheckTaskNoResult(curRet, rv, "return statement", n.line, n.col);
@@ -888,15 +876,12 @@ public class Checker {
             // return type of a lambda is not known here (the self-hosted
             // checker does not type a lambda from its context), so the
             // `return` statements inside its body are not policed against the
-            // enclosing method. Checking them there reported false positives
-            // -- "cannot return a value from a void method" for
-            // `Func<int> f = delegate () { return 5; };` inside a void method,
-            // a program the C host compiles and runs.
-            bool saveVoid = curVoid; Node saveRet = curRet; bool saveKnown = curRetKnown;
-            curVoid = false; curRet = null; curRetKnown = false;
+            // enclosing method.
+            Node saveRet = curRet;
+            curRet = null;
             CheckExpr(n.a);
             CheckStmt(n.d);
-            curVoid = saveVoid; curRet = saveRet; curRetKnown = saveKnown;
+            curRet = saveRet;
             ScopeTrim(mark);
             return;
         }
