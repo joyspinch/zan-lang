@@ -1670,6 +1670,13 @@ partial class Irgen {
         if (IsErasedType(fty)) {
             // a struct value is copied: the field holds its own instance
             if (NeedsStructCopy(fty, v)) { v = StructCopyTemp(v, fty); }
+            // The field owns the reference it holds. In the erased body the
+            // value's type is a type parameter (nothing to retain); in a
+            // SPECIALIZED clone the concrete type is known -- without the
+            // retain the field would keep a borrowed pointer, the caller's
+            // temporary would be released and the field would dangle (the
+            // next read was a use-after-free).
+            if (ArcManaged(v.ty) && !WeakTy(fty)) { EmitArcRetain(v.op, v.ty); }
             string sv = ToSlot(v, v.ty);
             L("  store i64 " + sv + ", i64* " + p);
             return;
@@ -2585,10 +2592,24 @@ partial class Irgen {
             Node ctor = ResolveCtor(cls, e);
             if (ctor != null) {
                 List<Node> cargs = OrderArgs(ctor, e);
+                // A generic class's constructor sees the CONCRETE type
+                // arguments: a delegate-typed parameter (`LabelOf<T>`) must
+                // carry them, or the lambda handed in gets an erased
+                // parameter type and its body silently does nothing.
+                List<string> ctps = TParams(cls);
+                bool ctorSpec = (ctps.Count > 0 && ty != null && ty.ival == 0
+                    && ty.kids.Count == ctps.Count);
                 string args = "%" + cn + "* " + obj;
                 int i = 0;
                 while (i < cargs.Count) {
                     Node pty = CtorParamType(ctor, i);
+                    // The argument is INFERRED with the concrete type (a
+                    // delegate-typed parameter carries the class's type
+                    // arguments, so a lambda gets a real parameter type),
+                    // but the CALL keeps the erased shape: the constructor
+                    // body is shared, so it takes the value in a slot.
+                    Node epty = pty;
+                    if (ctorSpec) { epty = SubstTP(pty, ctps, ty.kids); }
                     if (IsRefParam(ctor, i) && cargs[i] != null
                         && cargs[i].kind == AK.OutArg()) {
                         string addr;
@@ -2598,7 +2619,7 @@ partial class Irgen {
                         i = i + 1;
                         continue;
                     }
-                    ExprVal av = GenArgExpr(cargs[i], pty);
+                    ExprVal av = GenArgExpr(cargs[i], epty);
                     args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
                     i = i + 1;
                 }
