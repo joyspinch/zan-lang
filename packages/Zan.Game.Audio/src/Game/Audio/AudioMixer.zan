@@ -1,0 +1,91 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Audio;
+
+// 混音器：把多个音频缓冲混到一条总线。
+//
+// **不分配中间缓冲**：混音直接写进目标缓冲，多路输入按顺序叠加。
+// 削波（clipping）在最后统一做一次——每路先各自限幅会让总和仍然超，
+// 逐路限幅等于把失真分摊到各路，听感是"每路都闷"而不是"总和超了"。
+//
+// 增益单位是线性倍数（1.0 = 不变），不是 dB。
+public class AudioMixer {
+    // 采样率。
+    public int sampleRate;
+    // 声道数。
+    public int channels;
+    // 目标缓冲（混音写这里）。
+    public AudioBuffer output;
+    // 削波阈值（超过就限幅到它）。
+    public double clipThreshold;
+    // 是否已发生削波（统计用）。
+    public bool clipped;
+
+    public AudioMixer(int sampleRate, int channels, int frames) {
+        this.sampleRate = sampleRate > 0 ? sampleRate : 44100;
+        this.channels = channels > 0 ? channels : 1;
+        this.output = new AudioBuffer(this.sampleRate, this.channels, frames);
+        this.clipThreshold = 1.0;
+        this.clipped = false;
+    }
+
+    // 目标缓冲。
+    public AudioBuffer Output() {
+        return this.output;
+    }
+
+    // 清空目标缓冲。
+    public void Clear() {
+        for (int i = 0; i < this.output.count; i = i + 1) {
+            this.output.samples[i] = 0.0;
+        }
+        this.clipped = false;
+    }
+
+    // 混入一路（从 offset 帧开始）。
+    //
+    // 采样率或声道数不匹配时**原样不动并返回 false**——宁可这一路
+    // 不进，也不做隐式重采样（重采样会改变时长与音高，
+    // 调用方多半没意识到）。
+    public bool Mix(AudioBuffer src, double gain, int offsetFrames) {
+        if (src == null) { return false; }
+        if (src.sampleRate != this.sampleRate) { return false; }
+        if (src.channels != this.channels) { return false; }
+        if (offsetFrames < 0) { offsetFrames = 0; }
+        int start = offsetFrames * this.channels;
+        for (int i = 0; i < src.count; i = i + 1) {
+            int idx = start + i;
+            if (idx >= this.output.count) { break; }
+            this.output.samples[idx] = this.output.samples[idx] + src.samples[i] * gain;
+        }
+        return true;
+    }
+
+    // 混入一路（从头开始）。
+    public bool Mix(AudioBuffer src, double gain) {
+        return this.Mix(src, gain, 0);
+    }
+
+    // 限幅到阈值。
+    public void Clip() {
+        double t = this.clipThreshold;
+        for (int i = 0; i < this.output.count; i = i + 1) {
+            double v = this.output.samples[i];
+            if (v > t) {
+                this.output.samples[i] = t;
+                this.clipped = true;
+            } else if (v < -t) {
+                this.output.samples[i] = -t;
+                this.clipped = true;
+            }
+        }
+    }
+
+    // 混完并限幅（一步到位）。
+    public AudioBuffer MixAndClip(AudioBuffer src, double gain) {
+        this.Mix(src, gain, 0);
+        this.Clip();
+        return this.output;
+    }
+}

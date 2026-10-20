@@ -1,0 +1,152 @@
+using System;
+
+namespace Game.Audio;
+
+// 双二阶（biquad）滤波器：标准 RBJ 音频 EQ 公式。
+//
+// **二阶**（12 dB/oct）比一阶陡得多，做低通去噪、高通切掉隆隆声、
+// 陷波挖工频嗡声都靠它。系数按 RBJ cookbook 算，Q 与增益一起定形。
+//
+// 状态按**声道独立**：滤波器的记忆是"上一个样本"，立体声左右
+// 各自记自己的——共用一份状态会让右声道被左声道的历史污染。
+public class BiquadFilter {
+    // 滤波器类型。
+    public FilterKind kind;
+    // 中心频率（Hz）。
+    public double frequency;
+    // 品质因数（带通/峰化时决定带宽）。
+    public double q;
+    // 增益（dB，峰化用）。
+    public double gainDb;
+    // 采样率。
+    public int sampleRate;
+
+    // 差分系数。
+    private double b0;
+    private double b1;
+    private double b2;
+    private double a1;
+    private double a2;
+    // 每声道的状态。
+    private double[] x1;
+    private double[] x2;
+    private double[] y1;
+    private double[] y2;
+    // 声道数。
+    private int channels;
+
+    public BiquadFilter(FilterKind kind, double frequency, double q, int sampleRate, int channels) {
+        this.kind = kind;
+        this.frequency = frequency;
+        this.q = q > 0.0001 ? q : 0.7071;
+        this.gainDb = 0.0;
+        this.sampleRate = sampleRate > 0 ? sampleRate : 44100;
+        this.channels = channels > 0 ? channels : 1;
+        this.x1 = new double[this.channels];
+        this.x2 = new double[this.channels];
+        this.y1 = new double[this.channels];
+        this.y2 = new double[this.channels];
+        this.UpdateCoefficients();
+    }
+
+    // 设定中心频率。
+    public void SetFrequency(double frequency) {
+        this.frequency = frequency;
+        this.UpdateCoefficients();
+    }
+
+    // 设定品质因数。
+    public void SetQ(double q) {
+        this.q = q > 0.0001 ? q : 0.7071;
+        this.UpdateCoefficients();
+    }
+
+    // 设定峰化增益（dB）。
+    public void SetGainDb(double gainDb) {
+        this.gainDb = gainDb;
+        this.UpdateCoefficients();
+    }
+
+    // 重算系数（RBJ cookbook）。
+    private void UpdateCoefficients() {
+        double fs = (double)this.sampleRate;
+        double f0 = this.frequency;
+        double nyquist = fs * 0.5;
+        if (f0 < 1.0) { f0 = 1.0; }
+        if (f0 > nyquist * 0.99) { f0 = nyquist * 0.99; }
+        double w0 = 2.0 * Math.PI * f0 / fs;
+        double cw = Math.Cos(w0);
+        double sw = Math.Sin(w0);
+        double alpha = sw / (2.0 * this.q);
+        double a0 = 1.0 + alpha;
+
+        if (this.kind == FilterKind.LowPass) {
+            double b = (1.0 - cw) * 0.5;
+            this.b0 = b / a0;
+            this.b1 = (1.0 - cw) / a0;
+            this.b2 = this.b0;
+            this.a1 = (-2.0 * cw) / a0;
+            this.a2 = (1.0 - alpha) / a0;
+        } else if (this.kind == FilterKind.HighPass) {
+            double b = (1.0 + cw) * 0.5;
+            this.b0 = b / a0;
+            this.b1 = -(1.0 + cw) / a0;
+            this.b2 = this.b0;
+            this.a1 = (-2.0 * cw) / a0;
+            this.a2 = (1.0 - alpha) / a0;
+        } else if (this.kind == FilterKind.BandPass) {
+            this.b0 = alpha / a0;
+            this.b1 = 0.0;
+            this.b2 = -alpha / a0;
+            this.a1 = (-2.0 * cw) / a0;
+            this.a2 = (1.0 - alpha) / a0;
+        } else if (this.kind == FilterKind.Notch) {
+            this.b0 = 1.0 / a0;
+            this.b1 = (-2.0 * cw) / a0;
+            this.b2 = 1.0 / a0;
+            this.a1 = (-2.0 * cw) / a0;
+            this.a2 = (1.0 - alpha) / a0;
+        } else {
+            // Peaking
+            double A = Math.Pow(10.0, this.gainDb / 40.0);
+            this.b0 = (1.0 + alpha * A) / a0;
+            this.b1 = (-2.0 * cw) / a0;
+            this.b2 = (1.0 - alpha * A) / a0;
+            this.a1 = (-2.0 * cw) / a0;
+            this.a2 = (1.0 - alpha) / a0;
+        }
+    }
+
+    // 重置状态。
+    public void Reset() {
+        for (int i = 0; i < this.channels; i = i + 1) {
+            this.x1[i] = 0.0;
+            this.x2[i] = 0.0;
+            this.y1[i] = 0.0;
+            this.y2[i] = 0.0;
+        }
+    }
+
+    // 处理一帧（ch 声道）的样本。
+    public double Process(int ch, double input) {
+        if (ch < 0 || ch >= this.channels) { return input; }
+        double result = this.b0 * input + this.b1 * this.x1[ch] + this.b2 * this.x2[ch]
+            - this.a1 * this.y1[ch] - this.a2 * this.y2[ch];
+        this.x2[ch] = this.x1[ch];
+        this.x1[ch] = input;
+        this.y2[ch] = this.y1[ch];
+        this.y1[ch] = result;
+        return result;
+    }
+
+    // 就地处理整个缓冲。
+    public void ProcessBuffer(AudioBuffer buf) {
+        if (buf == null) { return; }
+        for (int f = 0; f < buf.frames; f = f + 1) {
+            for (int c = 0; c < buf.channels; c = c + 1) {
+                int idx = f * buf.channels + c;
+                buf.samples[idx] = this.Process(c, buf.samples[idx]);
+            }
+        }
+    }
+}

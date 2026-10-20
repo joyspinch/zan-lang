@@ -1,0 +1,273 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Audio;
+
+// WAV 读写（纯 Zan，不依赖原生音频栈）。
+//
+// 为什么需要它：原生层（`System.Media.AudioClip`）只给"播出来"，
+// 不给"拿到样本"。而资源处理（响度归一、变调、切片、离线混音）
+// 都要在纯 Zan 侧看到采样数据。
+//
+// 支持：PCM 8/16/24/32 位整数 + 32 位浮点；WAVE_FORMAT_EXTENSIBLE
+// 按其有效位/容器位解析。多声道按交错存放。
+public class Wav {
+    // 读一个 WAV 文件。
+    public static AudioBuffer ReadFile(string path) {
+        byte[] data = System.IO.File.ReadAllBytes(path);
+        return ReadBytes(data);
+    }
+
+    // 从字节读一个 WAV。
+    public static AudioBuffer ReadBytes(byte[] data) {
+        if (data == null || data.Length < 44) { return null; }
+        // RIFF 头
+        if (!Matches(data, 0, "RIFF")) { return null; }
+        if (!Matches(data, 8, "WAVE")) { return null; }
+
+        int sampleRate = 0;
+        int channels = 0;
+        int bitsPerSample = 0;
+        int format = 0;
+        bool isFloat = false;
+        int dataOffset = -1;
+        int dataLength = 0;
+
+        // 遍历 chunk
+        int pos = 12;
+        while (pos + 8 <= data.Length) {
+            string id = Str(data, pos, 4);
+            int size = ReadI32(data, pos + 4);
+            int body = pos + 8;
+            if (size < 0) { break; }
+            if (id == "fmt ") {
+                if (body + 16 > data.Length) { break; }
+                format = ReadU16(data, body);
+                channels = ReadU16(data, body + 2);
+                sampleRate = ReadI32(data, body + 4);
+                bitsPerSample = ReadU16(data, body + 14);
+                // WAVE_FORMAT_EXTENSIBLE (0xFFFE)：有效位在 body+18，
+                // 子格式 GUID 的头两字节在 body+24。
+                if (format == 0xFFFE && body + 26 <= data.Length) {
+                    int validBits = ReadU16(data, body + 18);
+                    if (validBits > 0) { bitsPerSample = validBits; }
+                    int sub = ReadU16(data, body + 24);
+                    if (sub == 3) { isFloat = true; }
+                } else if (format == 3) {
+                    // 标准 IEEE float（wFormatTag == 3）：**不是** EXTENSIBLE。
+                    // 漏掉这一支会把浮点采样当 int32 读——数值全错
+                    // （0.5 读成 0.4921875 那种），且不报错。
+                    isFloat = true;
+                } else if (format != 1) {
+                    // 其余格式（ADPCM、µ-law 等）不支持，明确拒绝。
+                    return null;
+                }
+            } else if (id == "data") {
+                dataOffset = body;
+                dataLength = size;
+                // data chunk 后面还有 chunk 时，size 可能是 0xFFFFFFFF
+                // （流式写法），此时取剩余全部。
+                if (size == 0xFFFFFFFF || body + size > data.Length) {
+                    dataLength = data.Length - body;
+                }
+            }
+            pos = body + size;
+            // chunk 按偶数字节对齐
+            if ((size & 1) != 0) { pos = pos + 1; }
+        }
+
+        if (dataOffset < 0 || channels <= 0 || sampleRate <= 0) { return null; }
+        if (dataLength <= 0) { return null; }
+
+        int bytesPerSample = bitsPerSample / 8;
+        if (bytesPerSample <= 0) { return null; }
+        int frameBytes = bytesPerSample * channels;
+        int frames = dataLength / frameBytes;
+        if (frames <= 0) { return null; }
+
+        AudioBuffer buf = new AudioBuffer(sampleRate, channels, frames);
+        int idx = 0;
+        for (int f = 0; f < frames; f = f + 1) {
+            for (int c = 0; c < channels; c = c + 1) {
+                int off = dataOffset + (f * channels + c) * bytesPerSample;
+                double v = 0.0;
+                if (isFloat && bytesPerSample == 4) {
+                    v = ReadF32(data, off);
+                } else if (bytesPerSample == 1) {
+                    // 8 位 PCM 是无符号，0 = -1.0
+                    v = ((double)data[off] - 128.0) / 128.0;
+                } else if (bytesPerSample == 2) {
+                    v = (double)ReadI16(data, off) / 32768.0;
+                } else if (bytesPerSample == 3) {
+                    int b0 = data[off];
+                    int b1 = data[off + 1];
+                    int b2 = data[off + 2];
+                    int val = b0 | (b1 << 8) | (b2 << 16);
+                    if ((val & 0x800000) != 0) { val = val - 0x1000000; }
+                    v = (double)val / 8388608.0;
+                } else if (bytesPerSample == 4) {
+                    v = (double)ReadI32(data, off) / 2147483648.0;
+                }
+                buf.samples[idx] = v;
+                idx = idx + 1;
+            }
+        }
+        return buf;
+    }
+
+    // 把缓冲导出成 16 位 PCM 的 WAV 字节。
+    public static byte[] WriteBytes16(AudioBuffer buf) {
+        if (buf == null) { return null; }
+        int dataSize = buf.count * 2;
+        int riffSize = 36 + dataSize;
+        byte[] outBytes = new byte[44 + dataSize];
+        // "RIFF"
+        outBytes[0] = 82; outBytes[1] = 73; outBytes[2] = 70; outBytes[3] = 70;
+        WriteI32(outBytes, 4, riffSize);
+        // "WAVE"
+        outBytes[8] = 87; outBytes[9] = 65; outBytes[10] = 86; outBytes[11] = 69;
+        // "fmt "
+        outBytes[12] = 102; outBytes[13] = 109; outBytes[14] = 116; outBytes[15] = 32;
+        WriteI32(outBytes, 16, 16);
+        WriteU16(outBytes, 20, 1);            // PCM
+        WriteU16(outBytes, 22, buf.channels);
+        WriteI32(outBytes, 24, buf.sampleRate);
+        WriteI32(outBytes, 28, buf.sampleRate * buf.channels * 2);  // byte rate
+        WriteU16(outBytes, 32, (int)(buf.channels * 2));          // block align
+        WriteU16(outBytes, 34, 16);           // bits per sample
+        // "data"
+        outBytes[36] = 100; outBytes[37] = 97; outBytes[38] = 116; outBytes[39] = 97;
+        WriteI32(outBytes, 40, dataSize);
+        for (int i = 0; i < buf.count; i = i + 1) {
+            double v = buf.samples[i];
+            if (v > 1.0) { v = 1.0; }
+            if (v < -1.0) { v = -1.0; }
+            int s = (int)(v * 32767.0);
+            WriteI16(outBytes, 44 + i * 2, s);
+        }
+        return outBytes;
+    }
+
+    // 把缓冲导出成 32 位浮点 PCM 的 WAV 字节。
+    public static byte[] WriteBytesFloat32(AudioBuffer buf) {
+        if (buf == null) { return null; }
+        int dataSize = buf.count * 4;
+        int riffSize = 36 + dataSize;
+        byte[] outBytes = new byte[44 + dataSize];
+        outBytes[0] = 82; outBytes[1] = 73; outBytes[2] = 70; outBytes[3] = 70;
+        WriteI32(outBytes, 4, riffSize);
+        outBytes[8] = 87; outBytes[9] = 65; outBytes[10] = 86; outBytes[11] = 69;
+        outBytes[12] = 102; outBytes[13] = 109; outBytes[14] = 116; outBytes[15] = 32;
+        WriteI32(outBytes, 16, 16);
+        WriteU16(outBytes, 20, 3);            // IEEE float
+        WriteU16(outBytes, 22, buf.channels);
+        WriteI32(outBytes, 24, buf.sampleRate);
+        WriteI32(outBytes, 28, buf.sampleRate * buf.channels * 4);
+        WriteU16(outBytes, 32, (int)(buf.channels * 4));
+        WriteU16(outBytes, 34, 32);
+        outBytes[36] = 100; outBytes[37] = 97; outBytes[38] = 116; outBytes[39] = 97;
+        WriteI32(outBytes, 40, dataSize);
+        for (int i = 0; i < buf.count; i = i + 1) {
+            WriteF32(outBytes, 44 + i * 4, buf.samples[i]);
+        }
+        return outBytes;
+    }
+
+    /* ---------- 字节读写小工具 ---------- */
+
+    private static bool Matches(byte[] d, int off, string s) {
+        if (off + s.Length > d.Length) { return false; }
+        for (int i = 0; i < s.Length; i = i + 1) {
+            if (d[off + i] != (byte)s[i]) { return false; }
+        }
+        return true;
+    }
+
+    private static string Str(byte[] d, int off, int len) {
+        if (off + len > d.Length) { return ""; }
+        string s = "";
+        for (int i = 0; i < len; i = i + 1) {
+            s = s + ((char)d[off + i]);
+        }
+        return s;
+    }
+
+    private static int ReadU16(byte[] d, int off) {
+        if (off + 1 >= d.Length) { return 0; }
+        return d[off] | (d[off + 1] << 8);
+    }
+
+    private static int ReadI16(byte[] d, int off) {
+        int v = ReadU16(d, off);
+        if ((v & 0x8000) != 0) { return v - 0x10000; }
+        return v;
+    }
+
+    private static int ReadI32(byte[] d, int off) {
+        if (off + 3 >= d.Length) { return 0; }
+        int v = d[off] | (d[off + 1] << 8) | (d[off + 2] << 16) | (d[off + 3] << 24);
+        return v;
+    }
+
+    private static double ReadF32(byte[] d, int off) {
+        if (off + 3 >= d.Length) { return 0.0; }
+        int bits = d[off] | (d[off + 1] << 8) | (d[off + 2] << 16) | (d[off + 3] << 24);
+        // 位型 → double（IEEE 754 单精度）
+        int sign = (bits >> 31) & 1;
+        int exp = (bits >> 23) & 0xFF;
+        int mant = bits & 0x7FFFFF;
+        double value = 0.0;
+        if (exp == 0) {
+            value = (double)mant * Math.Pow(2.0, -149.0);
+        } else if (exp == 255) {
+            value = mant == 0 ? double.PositiveInfinity : double.NaN;
+        } else {
+            value = (1.0 + (double)mant / 8388608.0) * Math.Pow(2.0, (double)(exp - 127));
+        }
+        if (sign != 0) { value = -value; }
+        return value;
+    }
+
+    private static void WriteU16(byte[] d, int off, int v) {
+        d[off] = (byte)(v & 0xFF);
+        d[off + 1] = (byte)((v >> 8) & 0xFF);
+    }
+
+    private static void WriteI16(byte[] d, int off, int v) {
+        WriteU16(d, off, v & 0xFFFF);
+    }
+
+    private static void WriteI32(byte[] d, int off, int v) {
+        d[off] = (byte)(v & 0xFF);
+        d[off + 1] = (byte)((v >> 8) & 0xFF);
+        d[off + 2] = (byte)((v >> 16) & 0xFF);
+        d[off + 3] = (byte)((v >> 24) & 0xFF);
+    }
+
+    private static void WriteF32(byte[] d, int off, double v) {
+        int bits = DoubleToFloatBits(v);
+        WriteI32(d, off, bits);
+    }
+
+    // double → IEEE 754 单精度位型。
+    private static int DoubleToFloatBits(double value) {
+        if (value != value) { return 0x7FC00000; }          // NaN
+        double maxFloat = 3.4028234663852886e+38;
+        if (value > maxFloat) { return 0x7F800000; }        // +Inf
+        if (value < -maxFloat) { return 0xFF800000; }       // -Inf
+        double sign = value < 0.0 ? 1.0 : 0.0;
+        double v = value < 0.0 ? -value : value;
+        if (v == 0.0) { return (int)(sign * 0x80000000); }
+        int exp = 0;
+        while (v >= 2.0) { v = v / 2.0; exp = exp + 1; }
+        while (v < 1.0) { v = v * 2.0; exp = exp - 1; }
+        if (exp > 127) { return (int)((sign * 0x80000000) + 0x7F800000); }
+        if (exp < -126) { return (int)(sign * 0x80000000); }
+        int mant = (int)((v - 1.0) * 8388608.0);
+        if (mant > 8388607) { mant = 8388607; }
+        if (mant < 0) { mant = 0; }
+        int bits = ((exp + 127) << 23) | mant;
+        if (sign != 0.0) { bits = bits | unchecked((int)0x80000000); }
+        return bits;
+    }
+}

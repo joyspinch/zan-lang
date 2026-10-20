@@ -1,0 +1,158 @@
+using System;
+
+namespace Game.Audio;
+
+// ADSR 包络：攻击 / 衰减 / 保持 / 释放。
+//
+// 乐音合成的标准包络形状：
+//   - **Attack**（0 → 1）：起音时间；
+//   - **Decay**（1 → sustain）：衰减到保持电平；
+//   - **Sustain**（保持电平，通常 < 1）；
+//   - **Release**（当前电平 → 0）：松手后的尾音。
+//
+// 状态机（`EnvelopeStage`）显式建模，不用"当前时间 vs 阶段时间"倒推
+// ——倒推在改参数（跳段）时会算出负时长，行为不可预测。
+//
+// **确定性**：状态只跟 `Next()` 的调用次数有关，没有墙上时钟，
+// 同一串调用必然同一串包络值（可回放）。
+public enum EnvelopeStage {
+    // 空闲（未起音）。
+    Idle = 0,
+    // 攻击段。
+    Attack = 1,
+    // 衰减段。
+    Decay = 2,
+    // 保持段。
+    Sustain = 3,
+    // 释放段。
+    Release = 4,
+}
+
+// ADSR 包络生成器。
+public class AdsrEnvelope {
+    // 攻击段时长（秒）。
+    public double attackSeconds;
+    // 衰减段时长（秒）。
+    public double decaySeconds;
+    // 保持电平（[0, 1]）。
+    public double sustainLevel;
+    // 释放段时长（秒）。
+    public double releaseSeconds;
+    // 采样率。
+    public int sampleRate;
+
+    // 当前阶段。
+    private EnvelopeStage stage;
+    // 当前电平。
+    private double level;
+    // 当前阶段已过的采样数。
+    private int stageSamples;
+    // 释放时的起始电平（从当前电平滑到 0，不是从 1）。
+    private double releaseFrom;
+
+    public AdsrEnvelope(int sampleRate) {
+        this.sampleRate = sampleRate > 0 ? sampleRate : 44100;
+        this.attackSeconds = 0.01;
+        this.decaySeconds = 0.1;
+        this.sustainLevel = 0.7;
+        this.releaseSeconds = 0.2;
+        this.stage = EnvelopeStage.Idle;
+        this.level = 0.0;
+        this.stageSamples = 0;
+        this.releaseFrom = 0.0;
+    }
+
+    // 当前阶段。
+    public EnvelopeStage Stage() {
+        return this.stage;
+    }
+
+    // 当前电平。
+    public double Level() {
+        return this.level;
+    }
+
+    // 是否已结束（释放段走完）。
+    public bool IsFinished() {
+        return this.stage == EnvelopeStage.Idle;
+    }
+
+    // 起音（从 0 开始）。
+    public void Trigger() {
+        this.stage = EnvelopeStage.Attack;
+        this.stageSamples = 0;
+        this.level = 0.0;
+    }
+
+    // 释放（从当前电平滑到 0）。
+    public void Release() {
+        if (this.stage == EnvelopeStage.Idle) { return; }
+        this.stage = EnvelopeStage.Release;
+        this.stageSamples = 0;
+        this.releaseFrom = this.level;
+    }
+
+    // 立刻停（电平归零，阶段回到 Idle）。
+    public void Reset() {
+        this.stage = EnvelopeStage.Idle;
+        this.stageSamples = 0;
+        this.level = 0.0;
+        this.releaseFrom = 0.0;
+    }
+
+    // 取下一个包络值。
+    public double Next() {
+        if (this.stage == EnvelopeStage.Idle) {
+            this.level = 0.0;
+            return 0.0;
+        }
+        this.stageSamples = this.stageSamples + 1;
+        if (this.stage == EnvelopeStage.Attack) {
+            int total = this.Samples(this.attackSeconds);
+            if (total <= 0) {
+                this.level = 1.0;
+                this.stage = EnvelopeStage.Sustain;
+            } else if (this.stageSamples >= total) {
+                this.level = 1.0;
+                this.stage = EnvelopeStage.Decay;
+                this.stageSamples = 0;
+            } else {
+                this.level = (double)this.stageSamples / (double)total;
+            }
+        } else if (this.stage == EnvelopeStage.Decay) {
+            int total = this.Samples(this.decaySeconds);
+            if (total <= 0) {
+                this.level = this.sustainLevel;
+                this.stage = EnvelopeStage.Sustain;
+            } else if (this.stageSamples >= total) {
+                this.level = this.sustainLevel;
+                this.stage = EnvelopeStage.Sustain;
+            } else {
+                double t = (double)this.stageSamples / (double)total;
+                this.level = 1.0 + (this.sustainLevel - 1.0) * t;
+            }
+        } else if (this.stage == EnvelopeStage.Sustain) {
+            this.level = this.sustainLevel;
+        } else {
+            int total = this.Samples(this.releaseSeconds);
+            if (total <= 0) {
+                this.level = 0.0;
+                this.stage = EnvelopeStage.Idle;
+            } else if (this.stageSamples >= total) {
+                this.level = 0.0;
+                this.stage = EnvelopeStage.Idle;
+            } else {
+                double t = (double)this.stageSamples / (double)total;
+                this.level = this.releaseFrom * (1.0 - t);
+            }
+        }
+        return this.level;
+    }
+
+    // 秒 → 采样数。
+    private int Samples(double seconds) {
+        if (seconds <= 0.0) { return 0; }
+        int n = (int)(seconds * (double)this.sampleRate);
+        return n > 0 ? n : 1;
+    }
+}

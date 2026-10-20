@@ -1,0 +1,170 @@
+using System;
+
+namespace Game.Audio;
+
+// 音效合成器：用振荡器 + ADSR + 滤波合成一段音频。
+//
+// 这是**程序化音效**的最小可用集合：游戏里大量短音效（激光、拾取、
+// 命中、UI 点击）不需要美术出素材，参数化合成更快也更小。
+//
+// 频率包络（`freqEndHz`）单独提供：把频率从起始滑到结束，
+// 就能做出"上扫"（激光）和"下扫"（坠落）这类效果——
+// 只调振幅包络做不出这个。
+//
+// **确定性**：噪声用带种子的 LCG，同 seed 同参数 → 同一段音频。
+public class SynthOptions {
+    // 波形。
+    public Waveform waveform;
+    // 起始频率（Hz）。
+    public double startHz;
+    // 结束频率（Hz）；与起始相同则频率恒定。
+    public double endHz;
+    // 时长（秒，不含释放段）。
+    public double durationSeconds;
+    // 采样率。
+    public int sampleRate;
+    // 声道数。
+    public int channels;
+    // 峰值增益（线性）。
+    public double gain;
+    // 噪声种子。
+    public long seed;
+    // 包络参数。
+    public AdsrEnvelope envelope;
+    // 滤波（null = 不滤波）。
+    public BiquadFilter filter;
+
+    public SynthOptions() {
+        this.waveform = Waveform.Sine;
+        this.startHz = 440.0;
+        this.endHz = 440.0;
+        this.durationSeconds = 0.5;
+        this.sampleRate = 44100;
+        this.channels = 1;
+        this.gain = 0.5;
+        this.seed = 12345L;
+        this.envelope = new AdsrEnvelope(44100);
+        this.filter = null;
+    }
+
+    // 链式设置起始频率。
+    public SynthOptions WithFrequency(double hz) {
+        this.startHz = hz;
+        this.endHz = hz;
+        return this;
+    }
+
+    // 链式设置频率滑移。
+    public SynthOptions WithSweep(double from, double to) {
+        this.startHz = from;
+        this.endHz = to;
+        return this;
+    }
+
+    // 链式设置波形。
+    public SynthOptions WithWaveform(Waveform w) {
+        this.waveform = w;
+        return this;
+    }
+
+    // 链式设置时长（秒）。
+    public SynthOptions WithDuration(double seconds) {
+        this.durationSeconds = seconds;
+        return this;
+    }
+
+    // 链式设置采样率与声道数。
+    public SynthOptions WithFormat(int sampleRate, int channels) {
+        this.sampleRate = sampleRate > 0 ? sampleRate : 44100;
+        this.channels = channels > 0 ? channels : 1;
+        this.envelope = new AdsrEnvelope(this.sampleRate);
+        return this;
+    }
+
+    // 链式设置峰值增益。
+    public SynthOptions WithGain(double gain) {
+        this.gain = gain;
+        return this;
+    }
+
+    // 链式设置种子。
+    public SynthOptions WithSeed(long seed) {
+        this.seed = seed;
+        return this;
+    }
+
+    // 链式设置包络。
+    public SynthOptions WithEnvelope(double attack, double decay, double sustain, double release) {
+        this.envelope.attackSeconds = attack;
+        this.envelope.decaySeconds = decay;
+        this.envelope.sustainLevel = sustain;
+        this.envelope.releaseSeconds = release;
+        return this;
+    }
+}
+
+// 合成器（无状态入口，参数在 SynthOptions 里）。
+public class Synth {
+    // 合成一段音频。
+    public static AudioBuffer Render(SynthOptions options) {
+        if (options == null) { return AudioBuffer.Empty(44100, 1); }
+        int sr = options.sampleRate > 0 ? options.sampleRate : 44100;
+        int ch = options.channels > 0 ? options.channels : 1;
+        int frames = (int)(options.durationSeconds * (double)sr);
+        if (frames < 0) { frames = 0; }
+        AudioBuffer buf = new AudioBuffer(sr, ch, frames);
+
+        Oscillator osc = new Oscillator(options.waveform, options.startHz, sr, options.seed);
+        AdsrEnvelope env = options.envelope;
+        if (env == null) { env = new AdsrEnvelope(sr); }
+        env.sampleRate = sr;
+        env.Trigger();
+
+        BiquadFilter filter = options.filter;
+        if (filter != null) {
+            filter.Reset();
+        }
+
+        // 频率滑移：每样本按进度插值（线性，dB 域不做——线性频率
+        // 滑移听感更自然，且实现简单）。
+        double startHz = options.startHz;
+        double endHz = options.endHz;
+        bool sweep = startHz != endHz;
+
+        for (int f = 0; f < frames; f = f + 1) {
+            if (sweep && frames > 1) {
+                double t = (double)f / (double)(frames - 1);
+                double hz = startHz + (endHz - startHz) * t;
+                osc.SetFrequency(hz, sr);
+            }
+            double e = env.Next();
+            for (int c = 0; c < ch; c = c + 1) {
+                // 单声道源：每声道各取一个样本（噪声波形因此左右不相关，
+                // 立体声宽度更大；正弦则相同）。
+                double v = osc.Next() * e * options.gain;
+                if (filter != null) {
+                    v = filter.Process(c, v);
+                }
+                buf.SetFrame(f, c, v);
+            }
+        }
+        // 释放段：包络从当前电平滑到 0。
+        int releaseFrames = (int)(env.releaseSeconds * (double)sr);
+        if (releaseFrames > 0) {
+            AudioBuffer tail = new AudioBuffer(sr, ch, releaseFrames);
+            env.Release();
+            for (int f = 0; f < releaseFrames; f = f + 1) {
+                double e = env.Next();
+                for (int c = 0; c < ch; c = c + 1) {
+                    double v = osc.Next() * e * options.gain;
+                    if (filter != null) {
+                        v = filter.Process(c, v);
+                    }
+                    tail.SetFrame(f, c, v);
+                }
+            }
+            buf.Append(tail);
+        }
+        return buf;
+    }
+}

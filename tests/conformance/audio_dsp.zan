@@ -1,0 +1,400 @@
+using System;
+using System.Collections.Generic;
+using Game.Audio;
+
+// 音频处理层契约测试：缓冲、合成、包络、滤波、混音、变调、WAV 往返。
+//
+// 覆盖的判定点：
+//   - 缓冲：峰值 / RMS / 直流、归一化、限幅、淡入淡出、拼接；
+//   - 振荡器：波形形状、相位累加不漂移、噪声确定性；
+//   - 包络：四段状态机、提前释放、结束后归零；
+//   - 滤波：低通压高频、高通压低频、陷波挖频率；
+//   - 混音：叠加、增益、削波、格式不匹配时不动；
+//   - 变调：重采样比例正确、变调后时长不变；
+//   - WAV：16 位与浮点写读的往返。
+//
+// 浮点断言用容差比较（合成与滤波不可能逐位相等），
+// golden 只锁定"全过"那行。
+public class AudioTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    /* ---------- 缓冲 ---------- */
+
+    private static void TestBuffer() {
+        AudioBuffer b = new AudioBuffer(44100, 2, 100);
+        CheckEq("buf-frames", b.FrameCount(), 100L);
+        CheckEq("buf-count", b.count, 200L);
+        CheckNear("buf-duration", b.DurationMs(), 100.0 * 1000.0 / 44100.0, 0.0001);
+
+        b.SetFrame(0, 0, 0.5);
+        b.SetFrame(0, 1, -0.5);
+        b.SetFrame(1, 0, 0.25);
+        CheckNear("buf-peak", b.Peak(), 0.5, 0.000001);
+        Check("buf-rms-positive", b.Rms() > 0.0);
+
+        // 直流分量
+        AudioBuffer dc = new AudioBuffer(44100, 1, 10);
+        for (int i = 0; i < 10; i = i + 1) { dc.SetFrame(i, 0, 0.5); }
+        CheckNear("buf-dc-offset", dc.DcOffset(), 0.5, 0.000001);
+        dc.RemoveDcOffset();
+        CheckNear("buf-dc-removed", dc.DcOffset(), 0.0, 0.000001);
+
+        // 归一化
+        AudioBuffer q = new AudioBuffer(44100, 1, 10);
+        q.SetFrame(0, 0, 0.25);
+        q.Normalize(1.0);
+        CheckNear("buf-normalized", q.Peak(), 1.0, 0.000001);
+
+        // 限幅
+        AudioBuffer c = new AudioBuffer(44100, 1, 4);
+        c.SetFrame(0, 0, 2.0);
+        c.SetFrame(1, 0, -3.0);
+        c.Clamp();
+        CheckNear("buf-clamp-high", c.GetFrame(0, 0), 1.0, 0.000001);
+        CheckNear("buf-clamp-low", c.GetFrame(1, 0), -1.0, 0.000001);
+
+        // 淡入淡出
+        AudioBuffer f = new AudioBuffer(44100, 1, 10);
+        for (int i = 0; i < 10; i = i + 1) { f.SetFrame(i, 0, 1.0); }
+        f.FadeIn(5);
+        f.FadeOut(5);
+        CheckNear("buf-fadein-start", f.GetFrame(0, 0), 0.0, 0.000001);
+        Check("buf-fadein-middle", f.GetFrame(2, 0) > 0.0 && f.GetFrame(2, 0) < 1.0);
+        CheckNear("buf-fadein-full", f.GetFrame(5, 0), 1.0, 0.000001);
+        CheckNear("buf-fadeout-end", f.GetFrame(9, 0), 0.2, 0.000001);
+
+        // 拼接
+        AudioBuffer p1 = new AudioBuffer(44100, 1, 4);
+        AudioBuffer p2 = new AudioBuffer(44100, 1, 6);
+        Check("buf-append-ok", p1.Append(p2));
+        CheckEq("buf-append-frames", p1.FrameCount(), 10L);
+
+        // 采样率/声道不匹配时拼接应失败且不动
+        AudioBuffer p3 = new AudioBuffer(22050, 1, 4);
+        Check("buf-append-mismatch-rejected", !p1.Append(p3));
+        CheckEq("buf-append-mismatch-unchanged", p1.FrameCount(), 10L);
+    }
+
+    /* ---------- 振荡器 ---------- */
+
+    private static void TestOscillator() {
+        // 440 Hz @ 44100 → 相位增量 1/100
+        Oscillator o = new Oscillator(Waveform.Sine, 440.0, 44100, 1L);
+        CheckNear("osc-inc", o.PhaseIncrement(), 440.0 / 44100.0, 0.0000001);
+
+        // 一个完整周期后相位回到 0
+        Oscillator o2 = new Oscillator(Waveform.Sine, 44100.0, 44100, 1L);
+        for (int i = 0; i < 100; i = i + 1) { o2.Next(); }
+        CheckNear("osc-phase-wraps", o2.Phase(), 0.0, 0.0001);
+
+        // 方波：相位 < 0.5 → +1
+        // 频率取采样率的一半（相位增量 0.5），别取等于采样率——
+        // 那时相位每次都归零，方波恒为 +1，测不出翻转。
+        Oscillator sq = new Oscillator(Waveform.Square, 22050.0, 44100, 1L);
+        CheckNear("osc-square-first", sq.Next(), 1.0, 0.000001);
+        Oscillator sq2 = new Oscillator(Waveform.Square, 22050.0, 44100, 1L);
+        sq2.Next();
+        CheckNear("osc-square-second", sq2.Next(), -1.0, 0.000001);
+
+        // 锯齿：相位 0 → -1
+        Oscillator saw = new Oscillator(Waveform.Saw, 44100.0, 44100, 1L);
+        CheckNear("osc-saw-first", saw.Next(), -1.0, 0.000001);
+
+        // 噪声确定性：同 seed 同序列
+        Oscillator n1 = new Oscillator(Waveform.Noise, 1000.0, 44100, 42L);
+        Oscillator n2 = new Oscillator(Waveform.Noise, 1000.0, 44100, 42L);
+        bool same = true;
+        for (int i = 0; i < 20; i = i + 1) {
+            double a = n1.Next();
+            double b = n2.Next();
+            if (a != b) { same = false; }
+        }
+        Check("osc-noise-deterministic", same);
+
+        // 噪声取值在 [-1, 1)
+        Oscillator n3 = new Oscillator(Waveform.Noise, 1000.0, 44100, 7L);
+        bool inRange = true;
+        for (int i = 0; i < 100; i = i + 1) {
+            double v = n3.Next();
+            if (v < -1.0 || v >= 1.0) { inRange = false; }
+        }
+        Check("osc-noise-range", inRange);
+    }
+
+    /* ---------- ADSR 包络 ---------- */
+
+    private static void TestEnvelope() {
+        AdsrEnvelope e = new AdsrEnvelope(1000);
+        e.attackSeconds = 0.1;   // 100 样本
+        e.decaySeconds = 0.1;    // 100 样本
+        e.sustainLevel = 0.5;
+        e.releaseSeconds = 0.1;  // 100 样本
+        e.Trigger();
+
+        Check("env-stage-attack", e.Stage() == EnvelopeStage.Attack);
+        double v1 = e.Next();
+        Check("env-attack-rising", v1 > 0.0 && v1 <= 1.0);
+        for (int i = 0; i < 99; i = i + 1) { e.Next(); }
+        Check("env-stage-decay", e.Stage() == EnvelopeStage.Decay);
+        for (int i = 0; i < 100; i = i + 1) { e.Next(); }
+        Check("env-stage-sustain", e.Stage() == EnvelopeStage.Sustain);
+        CheckNear("env-sustain-level", e.Level(), 0.5, 0.000001);
+
+        // 提前释放：从当前电平滑到 0
+        e.Release();
+        Check("env-stage-release", e.Stage() == EnvelopeStage.Release);
+        for (int i = 0; i < 100; i = i + 1) { e.Next(); }
+        Check("env-stage-idle-after-release", e.Stage() == EnvelopeStage.Idle);
+        CheckNear("env-zero-after-release", e.Level(), 0.0, 0.000001);
+        Check("env-finished", e.IsFinished());
+        CheckNear("env-zero-when-idle", e.Next(), 0.0, 0.000001);
+    }
+
+    /* ---------- 滤波 ---------- */
+
+    private static void TestFilters() {
+        // 低通：1 kHz 正弦过 200 Hz 低通，幅度应显著下降
+        AudioBuffer hi = new AudioBuffer(44100, 1, 4410);
+        Oscillator o = new Oscillator(Waveform.Sine, 1000.0, 44100, 1L);
+        for (int i = 0; i < hi.frames; i = i + 1) { hi.SetFrame(i, 0, o.Next()); }
+        double before = hi.Peak();
+        BiquadFilter lp = new BiquadFilter(FilterKind.LowPass, 200.0, 0.7071, 44100, 1);
+        lp.ProcessBuffer(hi);
+        double after = hi.Peak();
+        Check("filter-lowpass-attenuates", after < before * 0.5);
+
+        // 高通：1 kHz 正弦过 4 kHz 高通，幅度应下降
+        AudioBuffer hi2 = new AudioBuffer(44100, 1, 4410);
+        Oscillator o2 = new Oscillator(Waveform.Sine, 1000.0, 44100, 1L);
+        for (int i = 0; i < hi2.frames; i = i + 1) { hi2.SetFrame(i, 0, o2.Next()); }
+        double before2 = hi2.Peak();
+        BiquadFilter hp = new BiquadFilter(FilterKind.HighPass, 4000.0, 0.7071, 44100, 1);
+        hp.ProcessBuffer(hi2);
+        Check("filter-highpass-attenuates", hi2.Peak() < before2 * 0.5);
+
+        // 陷波：1 kHz 正弦过 1 kHz 陷波，稳态幅度应大幅下降。
+        //
+        // 断言**稳态段**而不是全缓冲：IIR 滤波器从零状态启动有暂态
+        // （前几百帧的振铃），那是滤波器的固有行为，不是缺陷。
+        // 拿全缓冲峰值断言会把暂态算进去，得到误导性的结论。
+        AudioBuffer notchBuf = new AudioBuffer(44100, 1, 4410);
+        Oscillator o3 = new Oscillator(Waveform.Sine, 1000.0, 44100, 1L);
+        for (int i = 0; i < notchBuf.frames; i = i + 1) { notchBuf.SetFrame(i, 0, o3.Next()); }
+        double before3 = notchBuf.Peak();
+        BiquadFilter notch = new BiquadFilter(FilterKind.Notch, 1000.0, 4.0, 44100, 1);
+        notch.ProcessBuffer(notchBuf);
+        double steady = 0.0;
+        for (int i = 500; i < notchBuf.frames; i = i + 1) {
+            double v = notchBuf.GetFrame(i, 0);
+            if (v < 0.0) { v = -v; }
+            if (v > steady) { steady = v; }
+        }
+        Check("filter-notch-rejects", steady < before3 * 0.2);
+
+        // 一阶低通：常数输入最终收敛到该常数
+        OnePoleFilter op = new OnePoleFilter(FilterKind.LowPass, 1000.0, 44100);
+        double last = 0.0;
+        for (int i = 0; i < 5000; i = i + 1) { last = op.Process(1.0); }
+        CheckNear("filter-onepole-dc-gain", last, 1.0, 0.01);
+
+        // 一阶高通：常数输入最终收敛到 0
+        OnePoleFilter op2 = new OnePoleFilter(FilterKind.HighPass, 1000.0, 44100);
+        double last2 = 0.0;
+        for (int i = 0; i < 5000; i = i + 1) { last2 = op2.Process(1.0); }
+        CheckNear("filter-onepole-hp-dc", last2, 0.0, 0.01);
+    }
+
+    /* ---------- 混音 ---------- */
+
+    private static void TestMixer() {
+        AudioMixer m = new AudioMixer(44100, 1, 100);
+        AudioBuffer a = new AudioBuffer(44100, 1, 100);
+        AudioBuffer b = new AudioBuffer(44100, 1, 100);
+        for (int i = 0; i < 100; i = i + 1) {
+            a.SetFrame(i, 0, 0.5);
+            b.SetFrame(i, 0, 0.25);
+        }
+        Check("mix-ok", m.Mix(a, 1.0));
+        Check("mix-ok-2", m.Mix(b, 1.0));
+        CheckNear("mix-sum", m.Output().GetFrame(0, 0), 0.75, 0.000001);
+
+        // 增益
+        AudioMixer m2 = new AudioMixer(44100, 1, 100);
+        m2.Mix(a, 0.5);
+        CheckNear("mix-gain", m2.Output().GetFrame(0, 0), 0.25, 0.000001);
+
+        // 削波：混合后**超过**阈值才削
+        AudioMixer m3 = new AudioMixer(44100, 1, 10);
+        m3.Mix(a, 3.0);
+        m3.Clip();
+        CheckNear("mix-clipped", m3.Output().GetFrame(0, 0), 1.0, 0.000001);
+        Check("mix-clipped-flag", m3.clipped);
+
+        // 恰好等于阈值不算削波（0.5 * 2.0 = 1.0，不大于阈值）
+        AudioMixer m3b = new AudioMixer(44100, 1, 10);
+        m3b.Mix(a, 2.0);
+        m3b.Clip();
+        CheckNear("mix-at-threshold-value", m3b.Output().GetFrame(0, 0), 1.0, 0.000001);
+        Check("mix-at-threshold-not-flagged", !m3b.clipped);
+
+        // 格式不匹配 → 拒绝且不动
+        AudioMixer m4 = new AudioMixer(44100, 1, 100);
+        AudioBuffer wrong = new AudioBuffer(22050, 1, 100);
+        Check("mix-mismatch-rejected", !m4.Mix(wrong, 1.0));
+        CheckNear("mix-mismatch-unchanged", m4.Output().GetFrame(0, 0), 0.0, 0.000001);
+    }
+
+    /* ---------- 合成 ---------- */
+
+    private static void TestSynth() {
+        SynthOptions o = new SynthOptions();
+        o.WithWaveform(Waveform.Sine).WithFrequency(440.0).WithDuration(0.1);
+        o.WithFormat(44100, 1).WithGain(0.5);
+        o.WithEnvelope(0.01, 0.02, 0.5, 0.05);
+        AudioBuffer s = Synth.Render(o);
+        // 主体 0.1s + 释放段 0.05s
+        Check("synth-frames-positive", s.FrameCount() > 4410);
+        Check("synth-peak-in-range", s.Peak() <= 0.5001);
+        Check("synth-not-silent", s.Peak() > 0.001);
+
+        // 确定性：同参数两次渲染结果一致
+        AudioBuffer s2 = Synth.Render(o);
+        bool same = s2.FrameCount() == s.FrameCount();
+        if (same) {
+            for (int i = 0; i < s.count; i = i + 1) {
+                if (s.samples[i] != s2.samples[i]) { same = false; break; }
+            }
+        }
+        Check("synth-deterministic", same);
+
+        // 扫频：起止频率不同 → 频率确实在变
+        SynthOptions sweep = new SynthOptions();
+        sweep.WithSweep(200.0, 2000.0).WithDuration(0.2).WithFormat(44100, 1);
+        sweep.WithEnvelope(0.0, 0.0, 1.0, 0.0);
+        AudioBuffer sw = Synth.Render(sweep);
+        Check("synth-sweep-frames", sw.FrameCount() > 8000);
+    }
+
+    /* ---------- 变调 ---------- */
+
+    private static void TestPitchShift() {
+        // 重采样：ratio 2 → 帧数减半
+        AudioBuffer src = new AudioBuffer(44100, 1, 1000);
+        for (int i = 0; i < 1000; i = i + 1) { src.SetFrame(i, 0, (double)i / 1000.0); }
+        AudioBuffer half = PitchShift.Resample(src, 2.0);
+        AudioBuffer double2 = PitchShift.Resample(src, 0.5);
+        AudioBuffer shifted = PitchShift.Shift(src, 5.0);
+        AudioBuffer conv = PitchShift.ConvertSampleRate(src, 22050);
+        if (half == null || double2 == null || shifted == null || conv == null) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL pitch-null-result");
+            return;
+        }
+        CheckEq("pitch-resample-frames", half.FrameCount(), 500L);
+        CheckEq("pitch-resample-frames-2", double2.FrameCount(), 2000L);
+        CheckEq("pitch-shift-keeps-length", shifted.FrameCount(), src.FrameCount());
+        // 变调结果与原结果不同（确实变了）
+        bool differs = false;
+        for (int i = 0; i < src.count && i < shifted.count; i = i + 1) {
+            if (Math.Abs(src.samples[i] - shifted.samples[i]) > 0.000001) {
+                differs = true;
+                break;
+            }
+        }
+        Check("pitch-shift-changes-audio", differs);
+        CheckEq("pitch-convert-rate", conv.sampleRate, 22050L);
+        CheckEq("pitch-convert-frames", conv.FrameCount(), 500L);
+    }
+
+    /* ---------- WAV ---------- */
+
+    private static void TestWav() {
+        AudioBuffer b = new AudioBuffer(44100, 2, 100);
+        for (int f = 0; f < 100; f = f + 1) {
+            b.SetFrame(f, 0, 0.5);
+            b.SetFrame(f, 1, -0.5);
+        }
+
+        // 16 位往返
+        byte[] w16 = Wav.WriteBytes16(b);
+        Check("wav-16-not-null", w16 != null);
+        // count = frames * channels = 200 个样本，每个 2 字节 + 44 字节头
+        CheckEq("wav-16-size", w16.Length, 44 + 200 * 2);
+        AudioBuffer back16 = Wav.ReadBytes(w16);
+        Check("wav-16-read-not-null", back16 != null);
+        if (back16 != null) {
+            CheckEq("wav-16-frames", back16.FrameCount(), 100L);
+            CheckEq("wav-16-channels", back16.channels, 2L);
+            CheckEq("wav-16-rate", back16.sampleRate, 44100L);
+            // 0.5 → 16383 → 读回 16383/32768 = 0.49997
+            CheckNear("wav-16-sample", back16.GetFrame(0, 0), 0.5, 0.0001);
+            CheckNear("wav-16-sample-neg", back16.GetFrame(0, 1), -0.5, 0.0001);
+        }
+
+        // 浮点往返（应精确）
+        byte[] wf = Wav.WriteBytesFloat32(b);
+        Check("wav-f32-not-null", wf != null);
+        AudioBuffer backF = Wav.ReadBytes(wf);
+        Check("wav-f32-read-not-null", backF != null);
+        if (backF != null) {
+            CheckEq("wav-f32-frames", backF.FrameCount(), 100L);
+            CheckNear("wav-f32-sample", backF.GetFrame(0, 0), 0.5, 0.0000001);
+            CheckNear("wav-f32-sample-neg", backF.GetFrame(0, 1), -0.5, 0.0000001);
+        }
+
+        // 非法输入返回 null 而不是崩
+        Check("wav-bad-null", Wav.ReadBytes(null) == null);
+        byte[] junk = new byte[100];
+        for (int i = 0; i < 100; i = i + 1) { junk[i] = 65; }
+        Check("wav-bad-junk-null", Wav.ReadBytes(junk) == null);
+        Check("wav-short-null", Wav.ReadBytes(new byte[4]) == null);
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    public static void Run() {
+        TestBuffer();
+        TestOscillator();
+        TestEnvelope();
+        TestFilters();
+        TestMixer();
+        TestSynth();
+        TestPitchShift();
+        TestWav();
+
+        if (failures > 0) {
+            Console.WriteLine("AUDIO TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL AUDIO TESTS PASSED");
+        }
+    }
+}
+
+public class AudioTestsMain {
+    public static void Main() {
+        AudioTests.Run();
+    }
+}

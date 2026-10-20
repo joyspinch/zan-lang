@@ -323,6 +323,49 @@ LRU 顺序、pinned 保护、依赖阻塞淘汰、级联回退、资源组、文
 **已知边界**：无异步 / 流式加载；无内容哈希与热更比对；淘汰只按真实字节数；
 资源组是清单层面的划分（按 id 前缀），不携带运行期状态。
 
+### 1.10 音频处理：`Zan.Game.Audio`
+
+新包 `packages/Zan.Game.Audio`，命名空间 `Game.Audio`。补上原生音频栈
+（`System.Media`：WAV/OGG 解码 → 声卡）**够不着**的那一半：原生层给的是
+"播出来"，**不给"拿到样本"**。而响度归一、变调、切片、离线混音、程序化生成
+音效，全都要在纯 Zan 侧看到采样数据。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `AudioBuffer.zan` | `AudioBuffer` | 采样缓冲（double 存储）：峰值 / RMS / 直流、归一化、限幅、淡入淡出、拼接 |
+| `Oscillator.zan` | `Oscillator` / `Waveform` | 相位累加振荡器：正弦 / 锯齿 / 方波 / 三角 / 噪声 |
+| `AdsrEnvelope.zan` | `AdsrEnvelope` / `EnvelopeStage` | ADSR 包络状态机（攻击 / 衰减 / 保持 / 释放） |
+| `BiquadFilter.zan` | `BiquadFilter` / `FilterKind` | 二阶滤波（RBJ 公式）：低通 / 高通 / 带通 / 陷波 / 峰化 |
+| `OnePoleFilter.zan` | `OnePoleFilter` | 一阶 RC 滤波（6 dB/oct，无相位失真） |
+| `AudioMixer.zan` | `AudioMixer` | 多路混音 + 统一削波 |
+| `Synth.zan` | `Synth` / `SynthOptions` | 参数化音效合成（含频率扫频） |
+| `PitchShift.zan` | `PitchShift` | 重采样 / 变调不变速（OLA）/ 采样率转换 |
+| `Wav.zan` | `Wav` | 纯 Zan WAV 读写（PCM 8/16/24/32 + IEEE float） |
+| `Rng.zan` | `Rng` | 带种子的确定性随机源（取 LCG 高位） |
+
+**六条硬取舍**：
+
+1. **内部统一 double**：样本存 `double[]`（归一化到 [-1, 1]），只在导出时
+   量化回目标位深。混音乘增益、滤波要累加，int 会中途溢出 / 截断。
+2. **相位累加而非每样本求 sin**：`sin(2*pi*f*t)` 在大时间偏移时丢精度，
+   且每样本一次三角函数太慢；累加相位的精度只跟增量有关。
+3. **噪声取 LCG 高位**：低位周期极短，直接用会出现可见的带状分布
+   （合成噪声听起来有"音调"）。
+4. **ADSR 是显式状态机**：不用"当前时间 vs 阶段时间"倒推——改参数
+   （跳段）时会算出负时长，行为不可预测。
+5. **滤波状态按声道独立**：共用一份状态会让右声道被左声道的历史污染。
+6. **等功率交叉淡化**（sqrt）而不是线性：线性叠加时中间掉能量
+   （两路 0.5 → 0.25），听起来有"空洞"。
+
+conformance `audio_dsp`（缓冲的峰值/RMS/直流/归一化/限幅/淡入淡出/拼接、
+振荡器波形与相位归一与噪声确定性、包络四段状态机与提前释放、滤波的低通/
+高通/陷波与一阶直流增益、混音叠加/增益/削波/格式拒绝、合成确定性与频率
+扫频、变调时长不变与重采样比例、WAV 16 位与浮点往返与非法输入拒绝）。
+
+**已知边界**：无 MP3 解码（OGG 由原生层 stb_vorbis 负责）；无流式播放
+（纯离线处理）；重采样无抗混叠滤波；变调用 OLA 不做波形相似度对齐
+（轻微"金属味"）；IIR 滤波有启动暂态（断言要看稳态段）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -370,7 +413,7 @@ LRU 顺序、pinned 保护、依赖阻塞淘汰、级联回退、资源组、文
 | `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | ✅ 已落地 `packages/Zan.Game.Pathfinding`（`Game.Pathfinding`：加权 A* + 跳跃点搜索 + 视线拉直 + 导航网格漏斗平滑，见 §1.7） | — |
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | ✅ 已落地 `packages/Zan.Game.Assets`（`Game.Assets`：声明式清单 + 依赖图 + 引用计数加载 + 确定性 LRU 预算淘汰 + 资源组，见 §1.9） | — |
-| `Zan.Game.Audio` | NAudio | 6,249 | 有 `AudioBus`/`SpatialAudio2D`/`Desktop/Audio`，无 mp3/ogg 解码与流式播放 | 2–3 周 |
+| `Zan.Game.Audio` | NAudio | 6,249 | ✅ 已落地 `packages/Zan.Game.Audio`（`Game.Audio`：采样缓冲 + 波形合成 + ADSR 包络 + 双二阶滤波 + 混音 + 变调 + 纯 Zan WAV 读写，见 §1.10） | — |
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | 已有 lockstep + 回放 → 快照同步、rollback 预测、延迟补偿 | 4–6 周 |
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | 有 clip 播放器/纸娃娃/3D 轨 → 蒙皮、状态机混合、IK | 4–6 周 |
@@ -402,7 +445,7 @@ LRU 顺序、pinned 保护、依赖阻塞淘汰、级联回退、资源组、文
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
-**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
+**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

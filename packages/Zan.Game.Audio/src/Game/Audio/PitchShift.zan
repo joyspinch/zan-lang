@@ -1,0 +1,129 @@
+using System;
+
+namespace Game.Audio;
+
+// 变调与重采样。
+//
+// **变速不变调**（重采样 + 回放速率补偿）与 **变调不变速**
+// （WSOLA 式重叠相加）是两件不同的事：
+//   - 简单重采样：改采样率读 → 音高与速度**同时**变（像磁带加速）。
+//   - 音高不变速：把波形"挪"而不是"拉"（重叠相加 + 波形相似度对齐），
+//     代价是实现复杂、会有轻微的"金属味"伪影。
+//
+// 这里两个都给，但**明确区分**：简单版是线性插值重采样，
+// 音高独立版用重叠相加（OLA），不做波形相似度对齐（会有伪影，
+// 但对游戏音效够用）。
+public class PitchShift {
+    // 线性插值重采样：把缓冲按 ratio 缩放（ratio > 1 = 变短变高）。
+    //
+    // 线性插值够用吗：对低频内容够（人声/音效的主要能量在中低频），
+    // 对高频会有混叠（aliasing）。**不做抗混叠滤波**——
+    // 那需要先低通再插值，代价是全缓冲拷贝。
+    // 采样率不变、只想改播放速度的场景用它。
+    public static AudioBuffer Resample(AudioBuffer src, double ratio) {
+        if (src == null) { return null; }
+        if (ratio <= 0.0001) { return src; }
+        int outFrames = (int)((double)src.frames / ratio);
+        if (outFrames < 1) { outFrames = 1; }
+        AudioBuffer result = new AudioBuffer(src.sampleRate, src.channels, outFrames);
+        double step = 1.0 / ratio;
+        for (int f = 0; f < outFrames; f = f + 1) {
+            double srcPos = (double)f * step;
+            int i0 = (int)srcPos;
+            int i1 = i0 + 1;
+            double frac = srcPos - (double)i0;
+            for (int c = 0; c < src.channels; c = c + 1) {
+                double v0 = src.GetFrame(i0, c);
+                double v1 = src.GetFrame(i1, c);
+                result.SetFrame(f, c, v0 + (v1 - v0) * frac);
+            }
+        }
+        return result;
+    }
+
+    // 变调不变速：重叠相加（OLA）。
+    //
+    // 做法：把输出分成固定长度的"合成帧"，每帧从前一帧的源里
+    // 偏移 `semitones` 对应的距离取一段，两段**交叉淡化**后叠加。
+    // 偏移量变了但每帧长度不变 → 音高变、时长不变。
+    //
+    // 交叉淡化用等功率（sqrt）而不是线性——线性淡入淡出在叠加时
+    // 中间会掉能量（两路都是 0.5 → 0.25），听起来有"空洞"。
+    public static AudioBuffer Shift(AudioBuffer src, double semitones) {
+        if (src == null) { return null; }
+        if (semitones == 0.0) { return src; }
+        // 半音 → 频率比 → 采样偏移比
+        double ratio = Math.Pow(2.0, semitones / 12.0);
+        // 合成帧长自适应：短素材用小帧（但仍 ≥ 2 帧），
+        // 保证**任何长度都走 OLA**——退化成重采样会连带改变时长，
+        // 违背"变调不变速"的契约。
+        int frameLen = 1024;
+        if (frameLen > src.frames / 2) {
+            frameLen = src.frames / 2;
+        }
+        if (frameLen < 2) {
+            // 素材只有 1 帧以下：无法做时域叠加，返回原样。
+            return src;
+        }
+        int hop = frameLen / 2;
+        if (hop < 1) { hop = 1; }
+        // 源读取步进：每合成一帧前进 hop / ratio
+        double srcStep = (double)hop / ratio;
+        int outFrames = src.frames;
+        AudioBuffer result = new AudioBuffer(src.sampleRate, src.channels, outFrames);
+        for (int i = 0; i < result.count; i = i + 1) { result.samples[i] = 0.0; }
+
+        int outPos = 0;
+        double srcPos = 0.0;
+        while (outPos + frameLen <= outFrames) {
+            int srcStart = (int)srcPos;
+            // 窗口：前半段淡出、后半段淡入（等功率）
+            for (int f = 0; f < frameLen; f = f + 1) {
+                double w = 0.0;
+                if (f < hop) {
+                    w = 1.0 - (double)f / (double)hop;
+                } else {
+                    w = (double)(f - hop) / (double)hop;
+                }
+                // 等功率：w 与 sqrt(1-w^2) 配对
+                double wFade = w;
+                double wCross = Math.Sqrt(1.0 - w * w);
+                double gain = f < hop ? wFade : wCross;
+                for (int c = 0; c < src.channels; c = c + 1) {
+                    double v = src.GetFrame(srcStart + f, c);
+                    int idx = (outPos + f) * src.channels + c;
+                    if (idx < result.count) {
+                        result.samples[idx] = result.samples[idx] + v * gain;
+                    }
+                }
+            }
+            outPos = outPos + hop;
+            srcPos = srcPos + srcStep;
+        }
+        return result;
+    }
+
+    // 采样率转换（保持时长，音高随之改变——这是"真实"的重采样）。
+    public static AudioBuffer ConvertSampleRate(AudioBuffer src, int newSampleRate) {
+        if (src == null) { return null; }
+        if (newSampleRate <= 0 || newSampleRate == src.sampleRate) { return src; }
+        // 步进 = 源率/目标率：降采样时每个输出样本要跨过多个源样本。
+        double step = (double)src.sampleRate / (double)newSampleRate;
+        // 输出帧数 = 源帧数 / 步进（降采样 → 变短，采样率与时长一致）。
+        int outFrames = (int)((double)src.frames / step);
+        if (outFrames < 1) { outFrames = 1; }
+        AudioBuffer result = new AudioBuffer(newSampleRate, src.channels, outFrames);
+        for (int f = 0; f < outFrames; f = f + 1) {
+            double srcPos = (double)f * step;
+            int i0 = (int)srcPos;
+            int i1 = i0 + 1;
+            double frac = srcPos - (double)i0;
+            for (int c = 0; c < src.channels; c = c + 1) {
+                double v0 = src.GetFrame(i0, c);
+                double v1 = src.GetFrame(i1, c);
+                result.SetFrame(f, c, v0 + (v1 - v0) * frac);
+            }
+        }
+        return result;
+    }
+}

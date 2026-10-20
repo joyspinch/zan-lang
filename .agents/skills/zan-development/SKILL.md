@@ -203,6 +203,14 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `JsonException`、`NotSupportedException`、`TimeoutException` 等。
   **没有** `DirectoryNotFoundException` / `UnauthorizedAccessException`——
   写 catch 子句前先确认类型存在，否则编译报 "undefined type"。
+* **`out` 是保留字**（实证，2026-10-22）：局部变量不能叫 `out`
+  （报 "expected variable name"）。`Math`、`String` 这类**大写标识符
+  按类型/命名空间解析**——`Math.PI` 在表达式里能用，但 `Math.PI.ToString()`
+  会报 "'PI' is not a known variable, type, or namespace"。
+* **`double` 没有 `IsNaN` / `IsInfinity`**（实证，2026-10-22）：用
+  `v != v` 判 NaN、用阈值比较判无穷（`v > 3.4028234663852886e+38`）。
+* **`int` 的十六进制字面量超过 0x7FFFFFFF 要 `unchecked`**：
+  `unchecked((int)0x80000000)`；否则溢出编译报错。
 
 ## 4. Edit
 

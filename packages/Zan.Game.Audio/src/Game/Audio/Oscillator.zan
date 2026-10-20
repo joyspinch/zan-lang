@@ -1,0 +1,95 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Audio;
+
+// 波形：合成用的振荡器形状。
+public enum Waveform {
+    // 正弦。
+    Sine = 0,
+    // 锯齿（-1 → 1 线性上升）。
+    Saw = 1,
+    // 方波。
+    Square = 2,
+    // 三角。
+    Triangle = 3,
+    // 白噪声（确定性伪随机，见 Rng）。
+    Noise = 4,
+}
+
+// 相位累加振荡器：给定频率与采样率，生成指定波形。
+//
+// **相位累加**而不是每样本算 `sin(2*pi*f*t)`——后者在大时间偏移时
+// 丢精度（t 大了以后相位算不准），且每样本一次三角函数太慢。
+// 累加相位再取小数部分，精度只跟增量有关，与已播时长无关。
+//
+// 噪声用带种子的 LCG 取**高位**（低位周期太短，会出现可见的带状分布），
+// 同一 seed + 同一调用序列 → 同一串噪声（可回放）。
+public class Oscillator {
+    // 当前相位（[0, 1)）。
+    private double phase;
+    // 相位增量（每样本）。
+    private double phaseInc;
+    // 波形。
+    private Waveform waveform;
+    // 噪声源。
+    private Rng rng;
+    // 是否已经初始化（决定噪声用哪个 seed）。
+    private bool seeded;
+
+    public Oscillator(Waveform waveform, double frequency, int sampleRate, long seed) {
+        this.waveform = waveform;
+        this.phase = 0.0;
+        this.rng = new Rng(seed);
+        this.seeded = true;
+        this.SetFrequency(frequency, sampleRate);
+    }
+
+    // 设定频率与采样率。
+    public void SetFrequency(double frequency, int sampleRate) {
+        if (sampleRate <= 0) { sampleRate = 44100; }
+        double f = frequency;
+        if (f < 0.0) { f = 0.0; }
+        this.phaseInc = f / (double)sampleRate;
+    }
+
+    // 当前相位增量。
+    public double PhaseIncrement() {
+        return this.phaseInc;
+    }
+
+    // 相位（[0, 1)）。
+    public double Phase() {
+        return this.phase;
+    }
+
+    // 重置相位与噪声序列。
+    public void Reset(long seed) {
+        this.phase = 0.0;
+        this.rng = new Rng(seed);
+        this.seeded = true;
+    }
+
+    // 取下一个样本（值域 [-1, 1]）。
+    public double Next() {
+        double v = 0.0;
+        if (this.waveform == Waveform.Sine) {
+            v = Math.Sin(this.phase * 2.0 * Math.PI);
+        } else if (this.waveform == Waveform.Saw) {
+            v = this.phase * 2.0 - 1.0;
+        } else if (this.waveform == Waveform.Square) {
+            v = this.phase < 0.5 ? 1.0 : -1.0;
+        } else if (this.waveform == Waveform.Triangle) {
+            v = this.phase < 0.5
+                ? (this.phase * 4.0 - 1.0)
+                : (3.0 - this.phase * 4.0);
+        } else {
+            v = this.rng.Unit() * 2.0 - 1.0;
+        }
+        this.phase = this.phase + this.phaseInc;
+        // 相位归一到 [0, 1)：一次减去足够多的整数倍，精度损失最小。
+        while (this.phase >= 1.0) { this.phase = this.phase - 1.0; }
+        while (this.phase < 0.0) { this.phase = this.phase + 1.0; }
+        return v;
+    }
+}

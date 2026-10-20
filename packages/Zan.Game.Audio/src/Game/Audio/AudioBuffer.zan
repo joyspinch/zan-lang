@@ -1,0 +1,199 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Audio;
+
+// 采样格式。
+public enum SampleFormat {
+    // 8 位无符号 PCM。
+    U8 = 0,
+    // 16 位有符号 PCM（CD 音质，最常见）。
+    S16 = 1,
+    // 24 位有符号 PCM。
+    S24 = 2,
+    // 32 位有符号 PCM。
+    S32 = 3,
+    // 32 位浮点 PCM。
+    F32 = 4,
+}
+
+// 音频缓冲区：一段交错的 PCM 采样。
+//
+// **交错**（左右声道交替）而不是每声道一个数组——这是文件与硬件的
+// 布局，转换只做一次；游戏里要做逐帧处理，交错布局要走"每 N 个
+// 采样取一个"的步进，比平面布局慢。
+//
+// 内部统一用 **double** 存放样本（[-1, 1] 归一化）——混音要乘增益、
+// 滤波要累加，int 会在中途溢出/截断；只在**导出**时才量化回
+// 目标位深。
+public class AudioBuffer {
+    // 采样率（Hz）。
+    public int sampleRate;
+    // 声道数（1 单声道，2 立体声）。
+    public int channels;
+    // 样本数（每声道的帧数）。
+    public int frames;
+    // 交错后的样本总量 = frames * channels。
+    public int count;
+    // 样本值（归一化到 [-1, 1]）。
+    public double[] samples;
+
+    public AudioBuffer(int sampleRate, int channels, int frames) {
+        this.sampleRate = sampleRate > 0 ? sampleRate : 44100;
+        this.channels = channels > 0 ? channels : 1;
+        this.frames = frames > 0 ? frames : 0;
+        this.count = this.frames * this.channels;
+        this.samples = new double[this.count];
+    }
+
+    // 空缓冲（零长度）。
+    public static AudioBuffer Empty(int sampleRate, int channels) {
+        return new AudioBuffer(sampleRate, channels, 0);
+    }
+
+    // 时长（毫秒）。
+    public double DurationMs() {
+        if (this.sampleRate <= 0) { return 0.0; }
+        return (double)this.frames * 1000.0 / (double)this.sampleRate;
+    }
+
+    // 样本数（每声道）。
+    public int FrameCount() {
+        return this.frames;
+    }
+
+    // 读一个样本（越界返回 0）。
+    public double Get(int index) {
+        if (index < 0 || index >= this.count) { return 0.0; }
+        return this.samples[index];
+    }
+
+    // 写一个样本（越界忽略）。
+    public void Set(int index, double value) {
+        if (index < 0 || index >= this.count) { return; }
+        this.samples[index] = value;
+    }
+
+    // 读一帧的第 ch 声道。
+    public double GetFrame(int frame, int ch) {
+        if (frame < 0 || frame >= this.frames) { return 0.0; }
+        if (ch < 0 || ch >= this.channels) { return 0.0; }
+        return this.samples[frame * this.channels + ch];
+    }
+
+    // 写一帧的第 ch 声道。
+    public void SetFrame(int frame, int ch, double value) {
+        if (frame < 0 || frame >= this.frames) { return; }
+        if (ch < 0 || ch >= this.channels) { return; }
+        this.samples[frame * this.channels + ch] = value;
+    }
+
+    // 峰值（绝对值最大）。空缓冲返回 0。
+    public double Peak() {
+        double p = 0.0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            double v = this.samples[i];
+            if (v < 0.0) { v = -v; }
+            if (v > p) { p = v; }
+        }
+        return p;
+    }
+
+    // RMS（均方根）。空缓冲返回 0。
+    public double Rms() {
+        if (this.count <= 0) { return 0.0; }
+        double sum = 0.0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            double v = this.samples[i];
+            sum = sum + v * v;
+        }
+        return Math.Sqrt(sum / (double)this.count);
+    }
+
+    // 直流偏移（样本均值）。理想信号是 0；偏得离谱说明有直流分量。
+    public double DcOffset() {
+        if (this.count <= 0) { return 0.0; }
+        double sum = 0.0;
+        for (int i = 0; i < this.count; i = i + 1) {
+            sum = sum + this.samples[i];
+        }
+        return sum / (double)this.count;
+    }
+
+    // 全部乘以增益。
+    public void ApplyGain(double gain) {
+        for (int i = 0; i < this.count; i = i + 1) {
+            this.samples[i] = this.samples[i] * gain;
+        }
+    }
+
+    // 限幅到 [-1, 1]。
+    public void Clamp() {
+        for (int i = 0; i < this.count; i = i + 1) {
+            double v = this.samples[i];
+            if (v > 1.0) { this.samples[i] = 1.0; }
+            else if (v < -1.0) { this.samples[i] = -1.0; }
+        }
+    }
+
+    // 去掉直流分量（减去均值）。
+    public void RemoveDcOffset() {
+        double dc = this.DcOffset();
+        if (dc == 0.0) { return; }
+        for (int i = 0; i < this.count; i = i + 1) {
+            this.samples[i] = this.samples[i] - dc;
+        }
+    }
+
+    // 归一化到给定峰值。目标 <= 0 或本来就是静音时原样返回。
+    public void Normalize(double targetPeak) {
+        if (targetPeak <= 0.0) { return; }
+        double p = this.Peak();
+        if (p <= 0.000000000001) { return; }
+        this.ApplyGain(targetPeak / p);
+    }
+
+    // 淡入（线性斜坡，fadeInFrames 帧）。
+    public void FadeIn(int fadeInFrames) {
+        if (fadeInFrames <= 0) { return; }
+        int n = fadeInFrames;
+        if (n > this.frames) { n = this.frames; }
+        for (int f = 0; f < n; f = f + 1) {
+            double g = (double)f / (double)n;
+            for (int c = 0; c < this.channels; c = c + 1) {
+                int idx = f * this.channels + c;
+                this.samples[idx] = this.samples[idx] * g;
+            }
+        }
+    }
+
+    // 淡出（线性斜坡，最后 fadeOutFrames 帧）。
+    public void FadeOut(int fadeOutFrames) {
+        if (fadeOutFrames <= 0) { return; }
+        int n = fadeOutFrames;
+        if (n > this.frames) { n = this.frames; }
+        int start = this.frames - n;
+        for (int f = 0; f < n; f = f + 1) {
+            double g = 1.0 - (double)f / (double)n;
+            for (int c = 0; c < this.channels; c = c + 1) {
+                int idx = (start + f) * this.channels + c;
+                this.samples[idx] = this.samples[idx] * g;
+            }
+        }
+    }
+
+    // 追加另一个缓冲（要求采样率与声道数一致，否则原样不动）。
+    public bool Append(AudioBuffer other) {
+        if (other == null) { return false; }
+        if (other.sampleRate != this.sampleRate) { return false; }
+        if (other.channels != this.channels) { return false; }
+        int newCount = this.count + other.count;
+        double[] merged = new double[newCount];
+        for (int i = 0; i < this.count; i = i + 1) { merged[i] = this.samples[i]; }
+        for (int i = 0; i < other.count; i = i + 1) { merged[this.count + i] = other.samples[i]; }
+        this.samples = merged;
+        this.count = newCount;
+        this.frames = this.frames + other.frames;
+        return true;
+    }
+}
