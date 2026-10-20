@@ -1,0 +1,84 @@
+using System;
+using System.Net.Http;
+
+namespace System.Oss;
+
+/// <summary>对象存储一次操作的回执。ok=false 时 error 给出人可读原因
+/// （凭证不对、桶不存在、对象不存在、网络故障等），statusCode 保留原始
+/// HTTP 状态；Get 的正文在 body 里。</summary>
+public class OssResult {
+    /// <summary>是否成功（HTTP 2xx）。</summary>
+    public bool ok;
+    /// <summary>HTTP 状态码（0 = 请求未发出）。</summary>
+    public int statusCode;
+    /// <summary>失败原因（成功时为空串）。</summary>
+    public string error;
+    /// <summary>对象 ETag（服务端返回时才有）。</summary>
+    public string etag;
+    /// <summary>响应正文（Get 填充）。</summary>
+    public byte[] body;
+    /// <summary>响应正文长度。</summary>
+    public int bodyLength;
+
+    public OssResult() {
+        this.ok = false;
+        this.statusCode = 0;
+        this.error = "";
+        this.etag = "";
+        this.body = null;
+        this.bodyLength = 0;
+    }
+
+    /// <summary>正文按文本读出（二进制内容会失真，仅用于错误信息）。</summary>
+    public string BodyText() {
+        if (this.body == null || this.bodyLength <= 0) { return ""; }
+        return this.body.ToStr(0, this.bodyLength);
+    }
+
+    /// <summary>构造一个失败回执（请求没发出去的场景）。</summary>
+    public static OssResult Fail(string message) {
+        OssResult r = new OssResult();
+        r.error = message == null ? "" : message;
+        return r;
+    }
+
+    /// <summary>把 HTTP 响应折成回执：2xx 记成功，失败时截取正文前 300 字当原因。</summary>
+    public static OssResult Of(HttpResponse resp) {
+        OssResult r = new OssResult();
+        if (resp == null) {
+            r.error = "无响应";
+            return r;
+        }
+        r.statusCode = resp.statusCode;
+        r.ok = resp.statusCode >= 200 && resp.statusCode < 300;
+        r.etag = OssResult.HeaderOf(resp.headers, "etag");
+        if (resp.bodyBytes != null && resp.bodyBytesLen > 0) {
+            r.body = resp.bodyBytes;
+            r.bodyLength = resp.bodyBytesLen;
+        } else if (resp.body != null && resp.body.Length > 0) {
+            r.body = resp.body.ToBytes();
+            r.bodyLength = resp.body.Length;
+        }
+        if (!r.ok) {
+            string text = r.BodyText();
+            if (text.Length > 300) { text = text.Substring(0, 300); }
+            r.error = text.Length > 0 ? text : ("HTTP " + Convert.ToString(resp.statusCode));
+        }
+        return r;
+    }
+
+    /// <summary>从响应头里取指定名字的头值（大小写不敏感），没有返回空串。</summary>
+    public static string HeaderOf(List<string> headers, string name) {
+        if (headers == null || name == null) { return ""; }
+        string want = name.ToLower();
+        for (int i = 0; i < headers.Count; i = i + 1) {
+            string h = headers[i] == null ? "" : headers[i];
+            int colon = h.IndexOf(":");
+            if (colon <= 0) { continue; }
+            if (h.Substring(0, colon).Trim().ToLower() == want) {
+                return h.Substring(colon + 1).Trim();
+            }
+        }
+        return "";
+    }
+}

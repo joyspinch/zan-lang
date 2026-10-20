@@ -1,0 +1,177 @@
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Oss;
+using System.Text;
+
+/// <summary>对象存储 SDK 回归：三家签名的固定向量（对过 Node crypto 的独立
+/// 实现）+ 客户端对本地假 OSS 服务的 put/get/head/delete 往返。
+/// 签名算法错一位就是 403，所以向量必须逐字钉死。</summary>
+class Program {
+    static int failures = 0;
+    static string lastAuthorization = "";
+    static string lastPath = "";
+    static Dictionary<string, string> store = new Dictionary<string, string>();
+
+    static void Check(bool ok, string name) {
+        if (ok) { Console.WriteLine("ok " + name); }
+        else { Console.WriteLine("FAIL " + name); failures = failures + 1; }
+    }
+
+    // 指定状态码的响应（默认构造是 200）。
+    static HttpResponse Status(int code, string text) {
+        HttpResponse r = new HttpResponse();
+        r.statusCode = code;
+        r.statusText = text;
+        r.body = "";
+        return r;
+    }
+
+    // 本地假 OSS：够用即可——只实现对象级 PUT/GET/HEAD/DELETE 与桶级 GET。
+    static async HttpResponse FakeOss(HttpRequest req) {
+        lastAuthorization = req.authorization == null ? "" : req.authorization;
+        lastPath = req.path == null ? "" : req.path;
+        if (req.method == "GET" && (lastPath == "/" || lastPath.EndsWith("/bucket/"))) {
+            return HttpResponse.Ok("");
+        }
+        string key = lastPath;
+        if (key.StartsWith("/bucket/")) { key = key.Substring(8); }
+        if (req.method == "PUT") {
+            store[key] = req.body == null ? "" : req.body;
+            return Status(200, "OK");
+        }
+        if (req.method == "GET" || req.method == "HEAD") {
+            if (!store.ContainsKey(key)) {
+                return Status(404, "Not Found");
+            }
+            if (req.method == "HEAD") { return Status(200, "OK"); }
+            return HttpResponse.Ok(store[key]);
+        }
+        if (req.method == "DELETE") {
+            store.Remove(key);
+            return Status(204, "No Content");
+        }
+        return Status(400, "Bad Request");
+    }
+
+    static void TestSigners() {
+        string date = OssSigner.GmtDate(1792486400L);
+        Check(date == "Tue, 20 Oct 2026 08:53:20 GMT", "gmt date format");
+        Check(OssSigner.Rfc3986("a b/c~d_e.f-g") == "a%20b%2Fc~d_e.f-g", "rfc3986 encoding");
+        Check(OssSigner.Rfc3986("阿里") == "%E9%98%BF%E9%87%8C", "rfc3986 utf-8 bytes");
+
+        string sts = AliyunOssSigner.StringToSign("PUT", "", "image/png", date, "/bucket/a/b.png");
+        Check(sts == "PUT\n\nimage/png\nTue, 20 Oct 2026 08:53:20 GMT\n/bucket/a/b.png",
+            "aliyun string to sign");
+        Check(AliyunOssSigner.Sign("secret", sts) == "jmWyf7g6xFkDiuCH+DjF/ZedEhQ=",
+            "aliyun oss v1 signature");
+        Check(AliyunOssSigner.Authorization("ak", "secret", "PUT", "image/png", date, "bucket", "a/b.png")
+            == "OSS ak:jmWyf7g6xFkDiuCH+DjF/ZedEhQ=", "aliyun authorization header");
+
+        string keyTime = TencentCosSigner.KeyTime(1792486400L, 900);
+        Check(keyTime == "1792486400;1792487300", "cos key time window");
+        Check(TencentCosSigner.HttpString("PUT", "a/b.png") == "put\n/a/b.png\n\n\n",
+            "cos http string");
+        Check(TencentCosSigner.StringToSign(keyTime, TencentCosSigner.HttpString("PUT", "a/b.png"))
+            == "sha1\n1792486400;1792487300\nf59e64f0228783343ddaf4f619505dc57264e24d\n",
+            "cos string to sign");
+        Check(TencentCosSigner.Sign("secret", keyTime, TencentCosSigner.HttpString("PUT", "a/b.png"))
+            == "f980abf76f150ea53d95386c21caca69089b01fd", "cos signature");
+
+        string amz = OssSigner.AmzDate(1792486400L);
+        string emptyHash = OssSigner.Sha256Hex("");
+        Check(amz == "20261020T085320Z", "amz date format");
+        Check(emptyHash == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "sha256 of empty payload");
+        string canonical = S3Signer.CanonicalRequest("PUT", "/bucket/a%20b.png", "",
+            "host:example.com\nx-amz-content-sha256:" + emptyHash + "\nx-amz-date:" + amz + "\n",
+            "host;x-amz-content-sha256;x-amz-date", emptyHash);
+        string scope = S3Signer.Scope(OssSigner.AmzDateOnly(1792486400L), "us-east-1", "s3");
+        Check(scope == "20261020/us-east-1/s3/aws4_request", "s3 credential scope");
+        Check(S3Signer.StringToSign(amz, scope, canonical)
+            == "AWS4-HMAC-SHA256\n20261020T085320Z\n20261020/us-east-1/s3/aws4_request\n"
+            + "468c4ca6212a0c2f4a3b8aa2a25588f278b84f1b108c341c2850a87924d7306c",
+            "s3 string to sign");
+        byte[] signingKey = S3Signer.SigningKey("secret", OssSigner.AmzDateOnly(1792486400L), "us-east-1", "s3");
+        Check(OssSigner.Hex(signingKey)
+            == "dc97a92d0f5e4547acb414d7bc4768970962adbef044af598d9339dfc9ae9446",
+            "s3 derived signing key");
+        Check(S3Signer.Signature(signingKey, S3Signer.StringToSign(amz, scope, canonical))
+            == "f38ffca6f9e96568f18f3ac0a2c7c19ac555682cc6bb623126a6ea8eead3fe71",
+            "s3 sigv4 signature");
+    }
+
+    static void TestConfig() {
+        OssConfig cfg = new OssConfig();
+        cfg.endpoint = "http://127.0.0.1:28777";
+        Check(cfg.Parse(), "endpoint parses");
+        Check(cfg.endpointHost == "127.0.0.1" && cfg.endpointPort == 28777 && !cfg.endpointTls,
+            "endpoint host/port/tls");
+        cfg.basePath = "/ai/generated/";
+        Check(cfg.ObjectKey("x/y.png") == "ai/generated/x/y.png", "object key with base path");
+        Check(OssClient.Create(cfg) == null, "unknown driver yields no client");
+        cfg.driver = "aliyun_oss";
+        Check(OssClient.Create(cfg) != null, "aliyun client created");
+        cfg.driver = "tencent_cos";
+        Check(OssClient.Create(cfg) != null, "cos client created");
+        cfg.driver = "s3";
+        Check(OssClient.Create(cfg) != null, "s3 client created");
+    }
+
+    static async int Run() {
+        TestSigners();
+        TestConfig();
+
+        HttpServer server = new HttpServer("127.0.0.1", 28917);
+        server.OnRequest(FakeOss);
+        server.Start();
+        await Task.Delay(150);
+
+        OssConfig cfg = new OssConfig();
+        cfg.driver = "aliyun_oss";
+        cfg.endpoint = "http://127.0.0.1:28917";
+        cfg.bucket = "bucket";
+        cfg.accessKey = "ak";
+        cfg.secretKey = "secret";
+        cfg.pathStyle = true;
+        cfg.timeoutMs = 8000;
+        cfg.callPolicy = ExternalCallPolicy.Default().AllowLoopback().AllowLocalHttp();
+        OssClient client = OssClient.Create(cfg);
+        if (client == null) {
+            Check(false, "client built for known driver");
+            return 0;
+        }
+
+        OssResult put = await client.Put("a/b.txt", "hello-oss".ToBytes(), "text/plain");
+        Check(put.ok, "put object");
+        Check(lastPath == "/bucket/a/b.txt", "put path carries bucket prefix");
+        Check(lastAuthorization.StartsWith("OSS ak:"), "put signed with OSS scheme");
+
+        OssResult fetched = await client.Get("a/b.txt");
+        Check(fetched.ok && fetched.BodyText() == "hello-oss", "get object round trip");
+
+        OssResult head = await client.Head("a/b.txt");
+        Check(head.ok, "head object exists");
+        OssResult miss = await client.Head("a/none.txt");
+        Check(!miss.ok, "head missing object fails");
+
+        OssResult del = await client.Delete("a/b.txt");
+        Check(del.ok, "delete object");
+        OssResult gone = await client.Get("a/b.txt");
+        Check(!gone.ok, "get after delete fails");
+
+        string checked = await client.Check();
+        Check(checked == "", "bucket check passes against live endpoint");
+
+        server.Stop();
+        server.Dispose();
+        Socket.Cleanup();
+        Console.WriteLine("failures=" + Convert.ToString(failures));
+        return 0;
+    }
+
+    static void Main() {
+        int r = await Run();
+    }
+}

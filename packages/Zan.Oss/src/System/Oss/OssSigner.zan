@@ -1,0 +1,109 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace System.Oss;
+
+/// <summary>对象存储签名的公共原语：RFC 3986 百分号编码、HMAC-SHA1/SHA256、
+/// Base64/十六进制、两种日期格式。单独成实体，是为了签名算法能脱离网络
+/// 单独编译、离线对账。</summary>
+public class OssSigner {
+    static string HexDigits = "0123456789ABCDEF";
+
+    /// <summary>RFC 3986 百分号编码：除 A-Z a-z 0-9 与 - _ . ~ 外全部转义，
+    /// 空格转 %20（不是 +）。</summary>
+    public static string Rfc3986(string s) {
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int c = s[i] & 255;
+            if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+                || c == 45 || c == 95 || c == 46 || c == 126) {
+                sb.Append(s.Substring(i, 1));
+                continue;
+            }
+            sb.Append("%");
+            sb.Append(OssSigner.HexByte(c));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>单字节转两位大写十六进制。</summary>
+    public static string HexByte(int v) {
+        return OssSigner.HexDigits.Substring((v >> 4) & 15, 1)
+            + OssSigner.HexDigits.Substring(v & 15, 1);
+    }
+
+    /// <summary>HMAC-SHA1。</summary>
+    public static byte[] HmacSha1(string key, string msg) {
+        if (key == null || msg == null) { return null; }
+        return Hmac.Compute(1, key, key.Length, msg, msg.Length);
+    }
+
+    /// <summary>HMAC-SHA256。</summary>
+    public static byte[] HmacSha256(string key, string msg) {
+        if (key == null || msg == null) { return null; }
+        return Hmac.Compute(0, key, key.Length, msg, msg.Length);
+    }
+
+    /// <summary>HMAC-SHA256，密钥是二进制（如 S3 派生密钥链的中间结果）。
+    /// 密钥按字节原样参与运算，不做字符解释。</summary>
+    public static byte[] HmacSha256Bytes(byte[] key, string msg) {
+        if (key == null || msg == null) { return null; }
+        string k = key.ToStr(0, key.Length);
+        return Hmac.Compute(0, k, k.Length, msg, msg.Length);
+    }
+
+    /// <summary>Base64 编码。</summary>
+    public static string Base64(byte[] data) {
+        if (data == null) { return ""; }
+        return Base64.Encode(data, data.Length);
+    }
+
+    /// <summary>小写十六进制。</summary>
+    public static string Hex(byte[] data) {
+        if (data == null) { return ""; }
+        return Hex.Encode(data, data.Length);
+    }
+
+    /// <summary>SHA-256 摘要的小写十六进制（32 字节 → 64 字符）。</summary>
+    public static string Sha256Hex(string data) {
+        if (data == null) { return ""; }
+        byte[] h = Sha256.Hash(data, data.Length);
+        if (h == null) { return ""; }
+        return Hex.Encode(h, 32);
+    }
+
+    /// <summary>HTTP Date 头格式：Tue, 20 Oct 2026 08:00:00 GMT。</summary>
+    public static string GmtDate(long unixSeconds) {
+        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
+        string[] days = new string[] { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+        string[] months = new string[] { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        return days[t.DayOfWeek()] + ", " + OssSigner.Pad2(t.Day()) + " " + months[t.Month() - 1]
+            + " " + Convert.ToString(t.Year()) + " " + OssSigner.Pad2(t.Hour())
+            + ":" + OssSigner.Pad2(t.Minute()) + ":" + OssSigner.Pad2(t.Second()) + " GMT";
+    }
+
+    /// <summary>AMZ 格式：20261020T080000Z。</summary>
+    public static string AmzDate(long unixSeconds) {
+        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
+        return OssSigner.AmzDateOnly(unixSeconds) + "T" + OssSigner.Pad2(t.Hour())
+            + OssSigner.Pad2(t.Minute()) + OssSigner.Pad2(t.Second()) + "Z";
+    }
+
+    /// <summary>AMZ 日期：20261020。</summary>
+    public static string AmzDateOnly(long unixSeconds) {
+        DateTime t = DateTime.FromUnixSeconds(unixSeconds);
+        return Convert.ToString(t.Year()) + OssSigner.Pad2(t.Month())
+            + OssSigner.Pad2(t.Day());
+    }
+
+    /// <summary>补零到两位。</summary>
+    public static string Pad2(int v) {
+        if (v < 0) { v = 0; }
+        if (v > 99) { v = 99; }
+        if (v < 10) { return "0" + Convert.ToString(v); }
+        return Convert.ToString(v);
+    }
+}

@@ -1,0 +1,165 @@
+using System;
+using System.Net.Http;
+using System.Net.Http.Client;
+
+namespace System.Oss;
+
+/// <summary>对象存储客户端基类。统一 put / get / head / delete / 流式落盘 /
+/// 凭证体检；协议差异（主机、路径、签名与必需头）由子类覆写。
+///
+/// 用法：OssConfig → OssClient.Create(cfg) → Put/Get/Head/Delete/GetToFile。
+/// 每个操作自带鉴权，不依赖调用方拼 URL。</summary>
+public class OssClient {
+    /// <summary>连接参数。</summary>
+    public OssConfig config;
+
+    public OssClient(OssConfig cfg) {
+        this.config = cfg;
+        // 端点只在 config 上给了 URL 时才需要解析；自己解析一次，调用方
+        // 不必记得调 Parse()。
+        if (this.config.endpointHost.Length == 0) { this.config.Parse(); }
+    }
+
+    /// <summary>按 driver 造客户端。driver 不认识返回 null。
+    /// 认得：aliyun_oss / aliyun / oss、tencent_cos / cos、s3 / minio。</summary>
+    public static OssClient Create(OssConfig cfg) {
+        if (cfg == null) { return null; }
+        string d = cfg.driver == null ? "" : cfg.driver.ToLower();
+        if (d == "aliyun_oss" || d == "aliyun" || d == "oss") { return new AliyunOssClient(cfg); }
+        if (d == "tencent_cos" || d == "cos") { return new TencentCosClient(cfg); }
+        if (d == "s3" || d == "s3_compatible" || d == "minio") { return new S3Client(cfg); }
+        return null;
+    }
+
+    // —— 子类覆写：协议差异全在这几处 ——
+
+    /// <summary>提供方名（用于日志与错误信息）。</summary>
+    public virtual string ProviderName() { return this.config.driver; }
+
+    /// <summary>请求主机（虚拟主机风格时含桶名前缀）。</summary>
+    public virtual string HostName() { return this.config.endpointHost; }
+
+    /// <summary>对象请求路径（以 '/' 开头）。参数是拼好 basePath 的完整键。</summary>
+    public virtual string RequestPath(string key) { return "/" + key; }
+
+    /// <summary>桶级请求路径（凭证体检用）。</summary>
+    public virtual string BucketRequestPath() { return "/"; }
+
+    /// <summary>按协议签名并写好必需的头（Authorization、日期、哈希等）。
+    /// 参数里的 key 是拼好 basePath 的完整键。</summary>
+    public virtual void SignRequest(HttpClient http, string method, string key,
+                                     string contentType, byte[] body, long now) { }
+
+    /// <summary>对象的公网直链（空串 = 该提供方不给直链）。参数是完整键。</summary>
+    public virtual string PublicUrlFor(string fullKey) { return ""; }
+
+    /// <summary>对象的公网直链。basePath 前缀在这里拼上。</summary>
+    public string PublicUrl(string key) { return this.PublicUrlFor(this.config.ObjectKey(key)); }
+
+    // —— 通用操作 ——
+
+    /// <summary>建一个连到该端点的 HTTP 客户端。端点没解析出来返回 null。</summary>
+    public HttpClient NewClient() {
+        if (this.config.endpointHost.Length == 0) { return null; }
+        HttpClient http;
+        if (this.config.endpointTls) {
+            http = HttpClient.CreateHttps(this.HostName(), this.config.endpointPort);
+        } else {
+            http = new HttpClient(this.HostName(), this.config.endpointPort);
+        }
+        http.SetTimeout(this.config.timeoutMs);
+        if (this.config.callPolicy != null) { http.SetCallPolicy(this.config.callPolicy); }
+        return http;
+    }
+
+    /// <summary>写入一个对象。</summary>
+    public async OssResult Put(string key, byte[] body, string contentType) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        if (body == null) { body = new byte[0]; }
+        string ct = contentType == null || contentType.Length == 0 ? "application/octet-stream" : contentType;
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        this.SignRequest(http, "PUT", objKey, ct, body, now);
+        http.SetHeader("Content-Type", ct);
+        HttpResponse resp = await http.SendBytesAsync("PUT", this.RequestPath(objKey), body, body.Length);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>读取一个对象，正文在结果 body 里。</summary>
+    public async OssResult Get(string key) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        this.SignRequest(http, "GET", objKey, "", null, now);
+        HttpResponse resp = await http.SendBytesAsync("GET", this.RequestPath(objKey), new byte[0], 0);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>只查对象元信息（HEAD）。200 = 存在，404 = 不存在。</summary>
+    public async OssResult Head(string key) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        this.SignRequest(http, "HEAD", objKey, "", null, now);
+        HttpResponse resp = await http.SendBytesAsync("HEAD", this.RequestPath(objKey), new byte[0], 0);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>删除一个对象。</summary>
+    public async OssResult Delete(string key) {
+        OssResult r = new OssResult();
+        if (key == null || key.Length == 0) { r.error = "对象键为空"; return r; }
+        HttpClient http = this.NewClient();
+        if (http == null) { r.error = "端点配置无效"; return r; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        this.SignRequest(http, "DELETE", objKey, "", null, now);
+        HttpResponse resp = await http.SendBytesAsync("DELETE", this.RequestPath(objKey), new byte[0], 0);
+        return OssResult.Of(resp);
+    }
+
+    /// <summary>流式下载到本地文件。先 HEAD 校验状态——直接落盘会把 404 的
+    /// 错误正文当素材存下来，事后只表现为"图片坏了"。</summary>
+    public async OssResult GetToFile(string key, string localPath) {
+        OssResult head = await this.Head(key);
+        if (!head.ok) { return head; }
+        HttpClient http = this.NewClient();
+        if (http == null) { return OssResult.Fail("端点配置无效"); }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        string objKey = this.config.ObjectKey(key);
+        this.SignRequest(http, "GET", objKey, "", null, now);
+        string progress = localPath + ".progress";
+        int got = await http.DownloadRangeToFileAsync(this.RequestPath(objKey), localPath, progress);
+        try { File.Delete(progress); } catch (Exception) { }
+        if (got <= 0) { return OssResult.Fail("下载失败（未取得内容）"); }
+        OssResult r = new OssResult();
+        r.ok = true;
+        r.statusCode = 200;
+        return r;
+    }
+
+    /// <summary>凭证体检：发一次桶级签名请求。返回错误文本（空串 = 通过）。</summary>
+    public async string Check() {
+        if (this.config.accessKey.Length == 0 || this.config.secretKey.Length == 0) {
+            return "访问凭证未配置";
+        }
+        HttpClient http = this.NewClient();
+        if (http == null) { return "端点配置无效"; }
+        long now = DateTime.UtcNow().ToUnixSeconds();
+        this.SignRequest(http, "GET", "", "", null, now);
+        HttpResponse resp = await http.SendAsync("GET", this.BucketRequestPath(), "");
+        if (resp.statusCode == 200) { return ""; }
+        if (resp.statusCode == 403) { return "凭证校验失败（403），检查访问密钥对"; }
+        if (resp.statusCode == 404) { return "桶不存在（404），检查桶名与区域"; }
+        return "HTTP " + Convert.ToString(resp.statusCode);
+    }
+}

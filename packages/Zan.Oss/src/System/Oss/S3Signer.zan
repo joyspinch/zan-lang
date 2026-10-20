@@ -1,0 +1,94 @@
+using System;
+using System.Text;
+
+namespace System.Oss;
+
+/// <summary>AWS Signature Version 4（S3 协议）：AWS S3、MinIO、以及各家云
+/// 的 S3 兼容网关都走这套签名。</summary>
+public class S3Signer {
+    /// <summary>凭据范围：日期/区域/服务/aws4_request。</summary>
+    public static string Scope(string dateOnly, string region, string service) {
+        return dateOnly + "/" + region + "/" + service + "/aws4_request";
+    }
+
+    /// <summary>规范化 URI：逐段 RFC3986 编码，保留 '/' 分隔。</summary>
+    public static string CanonicalUri(string path) {
+        if (path == null || path.Length == 0) { return "/"; }
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (i < path.Length) {
+            int slash = path.IndexOf("/", i);
+            string seg = slash < 0 ? path.Substring(i) : path.Substring(i, slash - i);
+            if (seg.Length > 0) {
+                if (sb.Length > 0) { sb.Append("/"); }
+                sb.Append(OssSigner.Rfc3986(seg));
+            }
+            if (slash < 0) { break; }
+            sb.Append("/");
+            i = slash + 1;
+        }
+        string s = sb.ToString();
+        if (s.Length == 0) { return "/"; }
+        return s;
+    }
+
+    /// <summary>规范化查询串。入参是按名字排好序的 "name=value" 列表（值未编码）；
+    /// 编码在此处做（RFC3986）。</summary>
+    public static string CanonicalQuery(List<string> pairs) {
+        if (pairs == null || pairs.Count == 0) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < pairs.Count; i = i + 1) {
+            string p = pairs[i];
+            if (p == null || p.Length == 0) { continue; }
+            int eq = p.IndexOf("=");
+            string name = eq < 0 ? p : p.Substring(0, eq);
+            string value = eq < 0 ? "" : p.Substring(eq + 1);
+            if (sb.Length > 0) { sb.Append("&"); }
+            sb.Append(OssSigner.Rfc3986(name));
+            sb.Append("=");
+            sb.Append(OssSigner.Rfc3986(value));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>规范化请求。canonicalHeaders 每行以 '\n' 结尾（AWS 规范如此），
+    /// 与 signedHeaders 之间因此有一个空行。</summary>
+    public static string CanonicalRequest(string method, string uri, string query,
+                                          string canonicalHeaders, string signedHeaders,
+                                          string payloadHash) {
+        return method + "\n" + uri + "\n" + query + "\n" + canonicalHeaders + "\n"
+            + signedHeaders + "\n" + payloadHash;
+    }
+
+    /// <summary>待签串：算法 + 时间 + 范围 + 规范化请求的 SHA-256。</summary>
+    public static string StringToSign(string amzDate, string scope, string canonicalRequest) {
+        return "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n"
+            + OssSigner.Sha256Hex(canonicalRequest);
+    }
+
+    /// <summary>派生签名密钥：HMAC 链（日期→区域→服务→aws4_request）。</summary>
+    public static byte[] SigningKey(string secretKey, string dateOnly, string region, string service) {
+        byte[] kDate = OssSigner.HmacSha256("AWS4" + secretKey, dateOnly);
+        if (kDate == null) { return null; }
+        byte[] kRegion = OssSigner.HmacSha256Bytes(kDate, region);
+        if (kRegion == null) { return null; }
+        byte[] kService = OssSigner.HmacSha256Bytes(kRegion, service);
+        if (kService == null) { return null; }
+        return OssSigner.HmacSha256Bytes(kService, "aws4_request");
+    }
+
+    /// <summary>最终签名（小写十六进制）。</summary>
+    public static string Signature(byte[] signingKey, string stringToSign) {
+        if (signingKey == null || stringToSign == null) { return ""; }
+        byte[] sig = OssSigner.HmacSha256Bytes(signingKey, stringToSign);
+        if (sig == null) { return ""; }
+        return OssSigner.Hex(sig);
+    }
+
+    /// <summary>Authorization 头值。</summary>
+    public static string Authorization(string accessKey, string scope, string signedHeaders,
+                                       string signature) {
+        return "AWS4-HMAC-SHA256 Credential=" + (accessKey == null ? "" : accessKey) + "/" + scope
+            + ", SignedHeaders=" + signedHeaders + ", Signature=" + signature;
+    }
+}

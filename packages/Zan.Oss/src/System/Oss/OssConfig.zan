@@ -1,0 +1,104 @@
+using System;
+using System.Net;
+
+namespace System.Oss;
+
+/// <summary>对象存储连接参数。driver 决定协议与签名方式：
+/// aliyun_oss（阿里云 OSS，V1 签名）、tencent_cos（腾讯云 COS，XML API 签名）、
+/// s3（AWS SigV4，兼容 S3 的任意实现：AWS S3、MinIO、各云 S3 网关）。</summary>
+public class OssConfig {
+    /// <summary>驱动名：aliyun_oss / tencent_cos / s3。</summary>
+    public string driver;
+    /// <summary>端点（http:// 或 https:// 开头，可含端口）。空 = 由提供方按 bucket+region 推导。</summary>
+    public string endpoint;
+    /// <summary>区域：阿里云 oss-cn-hangzhou、腾讯云 ap-guangzhou、S3 us-east-1。</summary>
+    public string region;
+    /// <summary>桶名。</summary>
+    public string bucket;
+    /// <summary>对象键前缀（可空）。</summary>
+    public string basePath;
+    /// <summary>访问密钥 ID。</summary>
+    public string accessKey;
+    /// <summary>访问密钥。</summary>
+    public string secretKey;
+    /// <summary>单次请求超时（毫秒）。</summary>
+    public int timeoutMs;
+    /// <summary>S3 风格：true = path style（MinIO 常用），false = 虚拟主机风格（AWS 默认）。</summary>
+    public bool pathStyle;
+    /// <summary>解析后的端点主机（Parse 之后有效）。</summary>
+    public string endpointHost;
+    /// <summary>解析后的端点端口（Parse 之后有效）。</summary>
+    public int endpointPort;
+    /// <summary>端点是否走 TLS（Parse 之后有效）。</summary>
+    public bool endpointTls;
+    /// <summary>外呼策略（可空）。默认策略禁止连回环地址——自测或内网 OSS
+    /// 端点需要显式 AllowLoopback()。</summary>
+    public ExternalCallPolicy callPolicy;
+
+    public OssConfig() {
+        this.driver = "";
+        this.endpoint = "";
+        this.region = "";
+        this.bucket = "";
+        this.basePath = "";
+        this.accessKey = "";
+        this.secretKey = "";
+        this.timeoutMs = 30000;
+        this.pathStyle = false;
+        this.endpointHost = "";
+        this.endpointPort = 0;
+        this.endpointTls = true;
+        this.callPolicy = null;
+    }
+
+    /// <summary>解析端点。返回 false = 端点为空或格式不合法。
+    /// 端点不带 scheme 时按 TLS 处理（对象存储默认 https）。</summary>
+    public bool Parse() {
+        string url = this.endpoint == null ? "" : this.endpoint.Trim();
+        if (url.Length == 0) { return false; }
+        bool tls = true;
+        if (url.StartsWith("https://")) { url = url.Substring(8); }
+        else if (url.StartsWith("http://")) { url = url.Substring(7); tls = false; }
+        else if (url.StartsWith("//")) { url = url.Substring(2); }
+        int slash = url.IndexOf("/");
+        string hostPort = slash >= 0 ? url.Substring(0, slash) : url;
+        if (hostPort.Length == 0) { return false; }
+        int port = tls ? 443 : 80;
+        int colon = -1;
+        for (int i = hostPort.Length - 1; i >= 0; i = i - 1) {
+            int c = hostPort[i] & 255;
+            if (c == 58) { colon = i; break; }
+            if (c < 48 || c > 57) { break; }
+        }
+        if (colon > 0 && colon < hostPort.Length - 1) {
+            int p = 0;
+            bool digits = true;
+            for (int i = colon + 1; i < hostPort.Length; i = i + 1) {
+                int c = hostPort[i] & 255;
+                if (c < 48 || c > 57) { digits = false; break; }
+                p = p * 10 + (c - 48);
+            }
+            if (digits && p > 0 && p < 65536) {
+                port = p;
+                hostPort = hostPort.Substring(0, colon);
+            }
+        }
+        if (hostPort.Length == 0) { return false; }
+        this.endpointHost = hostPort;
+        this.endpointPort = port;
+        this.endpointTls = tls;
+        return true;
+    }
+
+    /// <summary>对象键 = basePath 前缀 + 相对键（去掉两侧多余的斜杠）。</summary>
+    public string ObjectKey(string key) {
+        string prefix = this.basePath == null ? "" : this.basePath.Trim();
+        while (prefix.StartsWith("/")) { prefix = prefix.Substring(1); }
+        while (prefix.EndsWith("/")) { prefix = prefix.Substring(0, prefix.Length - 1); }
+        string k = key == null ? "" : key;
+        while (k.StartsWith("/")) { k = k.Substring(1); }
+        if (prefix.Length == 0) { return k; }
+        if (k.Length == 0) { return prefix; }
+        return prefix + "/" + k;
+    }
+}

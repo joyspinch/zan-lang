@@ -1,0 +1,82 @@
+using System;
+using System.Net.Http;
+
+namespace System.Oss;
+
+/// <summary>S3 兼容存储客户端（AWS Signature Version 4）：AWS S3、MinIO、
+/// 以及各家云的 S3 兼容网关。
+/// pathStyle=true 时走 https://端点/桶名/键（MinIO 默认），否则走虚拟主机风格。</summary>
+public class S3Client : OssClient {
+    public S3Client(OssConfig cfg) : base(cfg) {
+        if (this.config.region == null || this.config.region.Length == 0) {
+            this.config.region = "us-east-1";
+        }
+    }
+
+    public override string ProviderName() { return "s3"; }
+
+    public override string HostName() {
+        if (this.config.pathStyle) { return this.config.endpointHost; }
+        return this.config.bucket + "." + this.config.endpointHost;
+    }
+
+    public override string RequestPath(string key) {
+        if (this.config.pathStyle) {
+            if (key == null || key.Length == 0) { return "/" + this.config.bucket + "/"; }
+            return "/" + this.config.bucket + "/" + key;
+        }
+        if (key == null || key.Length == 0) { return "/"; }
+        return "/" + key;
+    }
+
+    public override string BucketRequestPath() {
+        if (this.config.pathStyle) { return "/" + this.config.bucket + "/"; }
+        return "/";
+    }
+
+    /// <summary>签名用的 Host 头值：非默认端口要带端口号，否则与服务端
+    /// 实际收到的 Host 不一致，签名必挂。</summary>
+    public string SignedHost() {
+        string h = this.HostName();
+        int defPort = this.config.endpointTls ? 443 : 80;
+        if (this.config.endpointPort == defPort) { return h; }
+        return h + ":" + Convert.ToString(this.config.endpointPort);
+    }
+
+    public override void SignRequest(HttpClient http, string method, string key,
+                                     string contentType, byte[] body, long now) {
+        string amzDate = OssSigner.AmzDate(now);
+        string dateOnly = OssSigner.AmzDateOnly(now);
+        string payloadHash = S3Client.PayloadHash(method, body);
+        string signedHost = this.SignedHost();
+        string canonicalHeaders = "host:" + signedHost + "\n"
+            + "x-amz-content-sha256:" + payloadHash + "\n"
+            + "x-amz-date:" + amzDate + "\n";
+        string signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+        string canonicalUri = S3Signer.CanonicalUri(this.RequestPath(key));
+        string canonicalRequest = S3Signer.CanonicalRequest(method, canonicalUri, "",
+            canonicalHeaders, signedHeaders, payloadHash);
+        string scope = S3Signer.Scope(dateOnly, this.config.region, "s3");
+        string stringToSign = S3Signer.StringToSign(amzDate, scope, canonicalRequest);
+        byte[] signingKey = S3Signer.SigningKey(this.config.secretKey, dateOnly, this.config.region, "s3");
+        string signature = S3Signer.Signature(signingKey, stringToSign);
+        http.SetHeader("x-amz-date", amzDate);
+        http.SetHeader("x-amz-content-sha256", payloadHash);
+        http.SetHeader("Authorization",
+            S3Signer.Authorization(this.config.accessKey, scope, signedHeaders, signature));
+    }
+
+    /// <summary>负载哈希：PUT 用正文实哈希，其余用空正文哈希。</summary>
+    public static string PayloadHash(string method, byte[] body) {
+        if (method == "PUT" && body != null && body.Length > 0) {
+            return OssSigner.Sha256Hex(body.ToStr(0, body.Length));
+        }
+        return OssSigner.Sha256Hex("");
+    }
+
+    public override string PublicUrlFor(string fullKey) {
+        if (fullKey == null || fullKey.Length == 0) { return ""; }
+        string scheme = this.config.endpointTls ? "https://" : "http://";
+        return scheme + this.HostName() + "/" + fullKey;
+    }
+}

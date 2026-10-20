@@ -1,0 +1,52 @@
+using System;
+using System.Security.Cryptography;
+
+namespace System.Oss;
+
+/// <summary>腾讯云 COS XML API 签名（q-sign-algorithm=sha1）。签名字符串
+/// q-sign-algorithm=q-ak=q-sign-time=q-key-time=q-header-list=q-url-param-list=q-signature。</summary>
+public class TencentCosSigner {
+    /// <summary>HttpString = 小写方法 + "\n/" + 键 + "\n" + 参数 + "\n" + 头 + "\n"。
+    /// 本实现用于无查询参数、无签名头的对象级请求。</summary>
+    public static string HttpString(string verb, string key) {
+        return verb.ToLower() + "\n/" + (key == null ? "" : key) + "\n\n\n";
+    }
+
+    /// <summary>待签串：sha1\nkeyTime\nHex(SHA1(HttpString))\n。</summary>
+    public static string StringToSign(string keyTime, string httpString) {
+        byte[] h = Sha1Hash(httpString);
+        return "sha1\n" + keyTime + "\n" + OssSigner.Hex(h) + "\n";
+    }
+
+    /// <summary>签名字符串：Hex(HMAC-SHA1(Hex(HMAC-SHA1(密钥, keyTime)), 待签串))。</summary>
+    public static string Sign(string secretKey, string keyTime, string httpString) {
+        byte[] signKeyRaw = OssSigner.HmacSha1(secretKey, keyTime);
+        if (signKeyRaw == null) { return ""; }
+        string signKey = OssSigner.Hex(signKeyRaw);
+        string sts = TencentCosSigner.StringToSign(keyTime, httpString);
+        byte[] sig = OssSigner.HmacSha1(signKey, sts);
+        if (sig == null) { return ""; }
+        return OssSigner.Hex(sig);
+    }
+
+    /// <summary>一步算出 Authorization 头值。keyTime 形如 "起始;结束"（秒级时间戳）。</summary>
+    public static string Authorization(string accessKey, string secretKey, string verb,
+                                       string key, string keyTime) {
+        string httpString = TencentCosSigner.HttpString(verb, key);
+        string sig = TencentCosSigner.Sign(secretKey, keyTime, httpString);
+        return "q-sign-algorithm=sha1&q-ak=" + (accessKey == null ? "" : accessKey)
+            + "&q-sign-time=" + keyTime + "&q-key-time=" + keyTime
+            + "&q-header-list=&q-url-param-list=&q-signature=" + sig;
+    }
+
+    /// <summary>签名有效期窗口（秒）：返回 "起始;结束"。</summary>
+    public static string KeyTime(long nowSeconds, int expireSeconds) {
+        if (expireSeconds <= 0) { expireSeconds = 900; }
+        return Convert.ToString(nowSeconds) + ";" + Convert.ToString(nowSeconds + expireSeconds);
+    }
+
+    static byte[] Sha1Hash(string data) {
+        if (data == null) { return null; }
+        return Sha1.Hash(data, data.Length);
+    }
+}
