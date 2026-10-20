@@ -3055,6 +3055,31 @@ static zan_type_t *field_type_here(zan_irgen_t *g, zan_type_t *t) {
     return t;
 }
 
+/* 字段的真实类型：把声明处的类型参数按**接收者实例**替换（含嵌套泛型实参）。
+ *
+ * 泛型类的类型参数字段是**按值内联**存在槽位里的（generic_field_slot 按已知
+ * 实例的最大 ABI 尺寸把槽位加宽成 [N x i64]）。写路径按当前实例替换类型实参，
+ * 写进去的是内联值；读路径若按擦除形态读，就会把内联值的前 8 字节当成指针
+ * 解引用——实测 16 字节结构体直接 0xC0000005。
+ *
+ * recv 为 NULL 时退回当前实例；recv 是擦除形态（泛型类的 this、泛型参数化
+ * 类型）且就是当前类时，才用当前实例兜底——别的泛型类的擦除形态不能拿当前
+ * 实例的实参去替换，否则会替错类。 */
+static zan_type_t *field_type_at(zan_irgen_t *g, zan_symbol_t *fsym,
+                                 zan_type_t *recv) {
+    if (!fsym || !fsym->type) return NULL;
+    zan_type_t *t = fsym->type;
+    if (recv) {
+        zan_type_t *nt = subst_type_param_deep(g, t, recv);
+        if (nt != t) return nt;
+        if (g->cur_inst && recv->sym == g->current_type_sym)
+            return subst_type_param_deep(g, t, g->cur_inst);
+        return t;
+    }
+    if (g->cur_inst) t = subst_type_param_deep(g, t, g->cur_inst);
+    return t;
+}
+
 #define ZAN_NULLABLE_PREFIX "zan.nullable."
 
 static LLVMValueRef coerce_int_to(zan_irgen_t *g, LLVMValueRef v, LLVMTypeRef target);

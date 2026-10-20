@@ -4736,8 +4736,9 @@ static void emit_console_title(zan_irgen_t *g, LLVMValueRef s) {
 /* 字段写入操作所需处理的真实存储类型推导 */
 static zan_type_t *field_store_type(zan_irgen_t *g, zan_symbol_t *fsym,
                                     zan_type_t *recv) {
-    if (!fsym || !fsym->type) return NULL;
-    return concretize(g, subst_type_param(fsym->type, recv));
+    zan_type_t *t = field_type_at(g, fsym, recv);
+    if (!t) return NULL;
+    return concretize(g, t);
 }
 
 static zan_symbol_t *field_sym_for_decl(zan_symbol_t *type_sym,
@@ -7059,7 +7060,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             LLVMValueRef field_ptr = emit_field_ptr(g, type_sym, st, struct_ptr, fi, "fld");
                             zan_symbol_t *fsym = get_field_sym(type_sym, expr->member.name);
                             zan_type_t *fty = fsym
-                                ? subst_type_param(fsym->type, local->type)
+                                ? field_type_at(g, fsym, local->type)
                                 : NULL;
                             LLVMTypeRef field_type = fty ? map_type(g, fty)
                                 : LLVMInt64TypeInContext(g->ctx);
@@ -7102,7 +7103,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                             LLVMValueRef field_ptr = emit_field_ptr(g, cls, st,
                                 sptr, fi, "gfld");
                             zan_type_t *fty = gpsym
-                                ? subst_type_param(gpsym->type, et) : NULL;
+                                ? field_type_at(g, gpsym, et) : NULL;
                             LLVMTypeRef ft = fty ? map_type(g, fty)
                                 : LLVMInt64TypeInContext(g->ctx);
                             LLVMValueRef gfv0 =
@@ -7133,7 +7134,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
                         zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                         if (fsym) {
-                            zan_type_t *ct = subst_type_param(fsym->type, rct);
+                            zan_type_t *ct = field_type_at(g, fsym, rct);
                             if (ct != fsym->type)
                                 sfv = emit_boundary_coerce(g, sfv, map_type(g, ct));
                         }
@@ -7144,7 +7145,7 @@ static LLVMValueRef emit_expr_member_access(zan_irgen_t *g, zan_ast_node_t *expr
                         zan_symbol_t *fsym = get_field_sym(cls, expr->member.name);
                         zan_type_t *rct = infer_expr_type(g, expr->member.object, locals);
                         zan_type_t *fty = fsym
-                            ? subst_type_param(fsym->type, rct) : NULL;
+                            ? field_type_at(g, fsym, rct) : NULL;
                         LLVMTypeRef ft = fty ? map_type(g, fty)
                                              : LLVMInt64TypeInContext(g->ctx);
                         LLVMValueRef gfv0 =
