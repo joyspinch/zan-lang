@@ -832,6 +832,81 @@ static int skip_project_dir(const char *name) {
     return 0;
 }
 
+/* ---- 目录输入：递归展开 .zan 源文件 ------------------------------------
+ *
+ * 动机：Windows 命令行长度上限约 32K 字符。一个 5618 文件的包把路径摊在
+ * 命令行上，CreateProcess 直接起不来（"文件名或扩展名太长"）——而调用方
+ * 往往只看到输出里没有 error，就当成编译过了，于是一个**从没被编译过**的
+ * 包看起来是健康的（scripts/pkg_sweep.ps1 曾长期这样误报）。
+ *
+ * 把"编译一个目录"做成编译器的一等公民之后：
+ *  - 命令行长度与项目规模解耦（大包一个路径就够，不再需要 @响应文件）；
+ *  - 枚举规则只此一份（跳过哪些目录、要不要递归、什么顺序），脚本 / IDE /
+ *    CI 不会各自实现一遍而各自漂移。
+ *
+ * 展开结果按路径字典序排序：目录遍历的原始顺序在 Windows 上不确定，而
+ * 输入顺序会影响合并单元里 decl 的先后——可复现构建与差分门都要求稳定。
+ */
+static int zan_path_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static bool zan_path_is_directory(const char *path) {
+#ifdef _WIN32
+    return zan_utf8_is_directory(path) != 0;
+#else
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+#endif
+}
+
+static void zan_collect_dir_sources(const char *dir, const char ***files,
+                                    int *count, int *cap) {
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (fd.cFileName[0] == '.' || skip_project_dir(fd.cFileName)) continue;
+            zan_collect_dir_sources(path, files, count, cap);
+        } else {
+            size_t nlen = strlen(fd.cFileName);
+            if (nlen < 5 || strcmp(fd.cFileName + nlen - 4, ".zan") != 0) continue;
+            add_stdlib_input(files, count, cap, path);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (S_ISLNK(st.st_mode)) continue;
+            if (e->d_name[0] == '.' || skip_project_dir(e->d_name)) continue;
+            zan_collect_dir_sources(path, files, count, cap);
+        } else if (S_ISREG(st.st_mode)) {
+            size_t nlen = strlen(e->d_name);
+            if (nlen < 5 || strcmp(e->d_name + nlen - 4, ".zan") != 0) continue;
+            add_stdlib_input(files, count, cap, path);
+        }
+    }
+    closedir(d);
+#endif
+}
+
 static void scan_project_namespaces(const char *root) {
 #ifdef _WIN32
     char pattern[1024];
@@ -4565,7 +4640,22 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "error: too many -D defines (max %d)\n", ZAN_MAX_PP_DEFINES);
                    return 1; }
         } else if (argv[i][0] != '-') {
-            input_files_push(&input_files, &input_count, &input_cap, argv[i]);
+            /* 位置参数可以是源文件，也可以是目录：目录递归展开成 .zan 列表。
+               命令行长度因此与项目规模解耦（见 zan_collect_dir_sources）。 */
+            if (zan_path_is_directory(argv[i])) {
+                int before = input_count;
+                zan_collect_dir_sources(argv[i], &input_files, &input_count,
+                                        &input_cap);
+                if (input_count == before) {
+                    fprintf(stderr,
+                            "error: no .zan source files under '%s'\n", argv[i]);
+                    return 1;
+                }
+                qsort(input_files + before, (size_t)(input_count - before),
+                      sizeof(*input_files), zan_path_cmp);
+            } else {
+                input_files_push(&input_files, &input_count, &input_cap, argv[i]);
+            }
         } else {
             fprintf(stderr, "unknown option: %s\n", argv[i]);
             return 1;

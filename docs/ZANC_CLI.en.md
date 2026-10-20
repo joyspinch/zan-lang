@@ -17,7 +17,7 @@ build/zanc <entry and source files...> [options] -o <output>
 ```
 
 - No manual `.o` assembly or explicit linker steps needed; no `-I`/`-l` flags required (standard library namespaces are pulled in on-demand, and corresponding native drivers are linked automatically).
-- **Inputs are a file set, not a project folder**: `zanc` compiles only the `.zan` files listed on the command line (plus auto-resolved stdlib/package sources). In multi-file projects, specify all `src/**/*.zan` files explicitly.
+- **Inputs are a file set, not a project folder**: `zanc` compiles only the `.zan` files listed on the command line (plus auto-resolved stdlib/package sources). In multi-file projects, specify all `src/**/*.zan` files explicitly -- **or hand it a directory** (`zanc src -o app.exe`), and the compiler expands `*.zan` recursively itself.
 - Flags fall into five categories: Output mode (`-o`, `--emit-lib`, `--publish`), Standard library (`--auto-stdlib`, `--stdlib-path`, `--no-packages`), Target platform (`--target`, `--emit-apk`, `--emit-ipa`), Native linking (`-L`, `--driver-dir`, `--link-lib`), and Diagnostics (`--emit-ir`, `-g`, `--dump-*`).
 
 ---
@@ -29,6 +29,10 @@ build/zanc <entry and source files...> [options] -o <output>
 ```bash
 # Compile and run (auto pulls stdlib, default debug optimization -O0)
 build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
+
+# Multi-file project: hand the directory to the compiler (expands *.zan
+# recursively, sorted by path; the command line stays constant-length)
+build/zanc src -o _scratch/app.exe
 
 # Multi-file project: explicitly list all sources (Git Bash / Unix shell)
 build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
@@ -44,10 +48,11 @@ build/zanc src/main.zan --publish -o app.exe
 build/zanc probe.zan -o probe.exe && probe.exe
 
 # Windowed GUI app: Windows automatically infers windows subsystem (no black console window)
-build/zanc $(find src -name '*.zan' | tr '\n' ' ') -o app.exe
+build/zanc src -o app.exe
 
 # Design file entry (.html/.zan declarative UI): design file MUST be the first argument
-build/zanc src/MyApp.html $(find src -name '*.zan' | sort | tr '\n' ' ') -o app.exe
+# (directory expansion only collects .zan -- pass the design file explicitly)
+build/zanc src/MyApp.html src -o app.exe
 ```
 
 ### 1.3 Cross-Compilation & Mobile
@@ -153,6 +158,7 @@ Debug builds (`-g`) automatically enable leak detection and ARC quarantine (`--c
 | `--time`, `-q`, `--quiet` | Timing breakdown / quiet mode |
 | `-D<name>[=value]` | Preprocessor definition |
 | `@<file>` | Response file: read CLI arguments from file (newline/space separated) |
+| (positional, a directory) | `zanc <dir> ...`: a **directory** is expanded recursively into `*.zan` inputs (sorted by path; `.`-prefixed and `build/bin/obj/dist/out/vendor/node_modules` directories are skipped) -- the preferred form for large projects, since the command line no longer grows with the file count; a directory without any `.zan` fails with "no .zan source files under '...'". Only `.zan` files are collected: a design file (`.html`) must be passed explicitly and must be the first argument (`zanc src/MyApp.html src -o app.exe`) |
 | `-v, --version`, `-h, --help` | Print version / usage help |
 
 ---

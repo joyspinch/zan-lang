@@ -19,8 +19,8 @@
 - 之前没被发现的原因：`scripts/pkg_sweep.ps1` 把文件列表直接摊在命令行上，
   `Zan.Sdk.Wechat` 有 5618 个文件 → 超出 Windows 命令行长度上限 → **进程根本没
   起来**，而脚本报错文本里没有 ": error"，于是被判成 **green**——一个从未被编译
-  的包看起来是健康的。脚本已改用 `@argfile` 并把"启动失败"判成 RED（见同批
-  提交），但这条枚举缺失仍待补。
+  的包看起来是健康的。脚本已改用**目录输入**（编译器自己递归展开 `*.zan`，
+  命令行恒长）并把"启动失败"判成 RED（见同批提交），但这条枚举缺失仍待补。
 - 方向：按微信素材管理接口的取值补一个枚举（image / voice / video / thumb 等），
   或把这两处的类型换成包内已有的实际类型——需要按微信 API 文档核对语义，
   属于包内容工作，不在本轮编译器修复范围内。
@@ -953,6 +953,24 @@
   编译命令 `zanc <file>.zan --auto-stdlib --package-project . -o out.exe`：
   不加 `using Gui.Backend;` 绑到 `System.Data.Window` 报错；加上即编过。
 - 关联：无（命名解析族，与 A430~A437 不同族）。
+
+### [ ] A450 自举驱动的命令行是 C 宿主的子集——不收目录、也没有 `@响应文件`
+
+- 现象（2026-10-21 给 C 宿主加目录输入时查实）：C 宿主 `zanc` 现在接受
+  **目录**（递归展开 `*.zan`）与 `@响应文件`；自举的驱动 `src/selfhost/main.zan`
+  只认 `zanc <output.ll> <input.zan> [more.zan ...]`——没有目录输入，没有
+  `@file`，也没有 `--auto-stdlib` / `-o` 这些旗标。
+- 影响：用自举编译器编大项目时，文件列表同样只能摊在命令行上，同样会撞
+  Windows 命令行长度上限。本轮没有一并改自举侧：改 `src/selfhost/main.zan`
+  要重编自举编译器并重跑整个差分门（`tests/selfhost/diff_cases.txt`，200+ 用例，
+  每个一次 gen1 编译 + 链接 + 两遍运行），代价远超这项便利的价值。
+- 方向：在自举驱动里补同样的目录展开（`Directory.GetFiles` /
+  `Directory.GetDirectories` / `Directory.ExistsOnDisk` / `Directory.IsSymlink`
+  都已在 stdlib 里就位）与 `@file` 展开，与 C 宿主对齐。
+- ⚠ 本轮只改 C 宿主 → 两个后端的**命令行面**有差异（**程序输出**无差异，
+  差分门仍绿）。自举侧与 C 宿主同改时要注意：目录展开的顺序必须与 C 宿主
+  一致（按路径字典序），否则同一批文件的 decl 顺序会分叉。
+- 相关：A446（`pkg_sweep` 的假绿与目录输入）。
 
 ### [ ] A447 泛型类的虚方法体拿不到类型参数——`is T` 经基类虚调用恒为 false
 

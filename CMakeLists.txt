@@ -2650,6 +2650,22 @@ add_test(NAME conformance_argfile
     -P ${CMAKE_SOURCE_DIR}/tests/run_argfile.cmake)
 set_tests_properties(conformance_argfile PROPERTIES TIMEOUT 120)
 
+# ---- Directory input: `zanc <dir>` compiles every .zan under the tree.
+# A project with thousands of source files cannot be passed on the command
+# line (Windows caps it at ~32K characters and the process then never starts,
+# silently -- the failure text carries no compiler diagnostic). Letting the
+# compiler walk the tree keeps the command line constant-length and leaves the
+# enumeration rule in exactly one place instead of one copy per caller. ----
+add_test(NAME conformance_dir_input
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DDIR=${CMAKE_SOURCE_DIR}/tests/conformance/multifile
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_dir_input${_exe_ext}
+    -DEMPTYDIR=${CMAKE_BINARY_DIR}/conf_dir_input_empty
+    -P ${CMAKE_SOURCE_DIR}/tests/run_dir_input.cmake)
+set_tests_properties(conformance_dir_input PROPERTIES TIMEOUT 120)
+
 # ---- Namespace collisions: two namespaces declaring the same simple names,
 #      including static calls through them (see nsresolve.c). ----
 add_test(NAME conformance_nsdup

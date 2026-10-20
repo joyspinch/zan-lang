@@ -21,7 +21,8 @@ build/zanc <入口和源文件...> [options] -o <输出>
 
 - 不需要先编 .o 再链接；也不用指定 -I/-l（stdlib 默认自动按需拉入，原生驱动按拉入面自动带出）。
 - **输入是"文件集合"而不是"工程"**：zanc 只编译命令行上列出的 .zan（加上
-  按需拉入的 stdlib/包命名空间）。多文件项目要把 `src/**/*.zan` 全部列上。
+  按需拉入的 stdlib/包命名空间）。多文件项目要把 `src/**/*.zan` 全部列上——
+  或者**直接给目录**（`zanc src -o app.exe`），编译器自己递归展开 `*.zan`。
 - 参数分五类：输出形态（-o/--emit-lib/--publish）、标准库控制
   （默认自动拉入；--no-stdlib/--stdlib-path）、目标平台（--target/--emit-apk）、
   原生链接（-L/--driver-dir/--link-lib）、诊断（--emit-ir/-g/--dump-*）。
@@ -33,6 +34,9 @@ build/zanc <入口和源文件...> [options] -o <输出>
 ```bash
 # 编译 + 运行（默认自动拉入标准库，调试默认档 O0）
 build/zanc src/main.zan -o _scratch/app.exe && _scratch/app.exe
+
+# 多文件项目：把目录交给编译器（递归展开 *.zan，按路径排序，命令行恒长）
+build/zanc src -o _scratch/app.exe
 
 # 多文件项目：显式列出全部源（Git Bash）
 build/zanc $(find src -name '*.zan' | sort | tr '\n' ' ') -o _scratch/app.exe
@@ -48,11 +52,12 @@ build/zanc src/main.zan --publish -o app.exe
 build/zanc probe.zan -o probe.exe && probe.exe
 
 # 带窗口的 GUI 程序：Windows 上自动推断 windows 子系统（无黑框终端，无需手动指定 --subsystem）
-build/zanc $(find src -name '*.zan' | tr '\n' ' ') -o app.exe
+build/zanc src -o app.exe
 
 # 设计稿入口（.html/.zan 声明式 UI）：**设计稿必须是命令行第一个参数**，
 # zanc 从第一份设计文档合成 Main 与控件字段，自动推断 windows 子系统
-build/zanc src/MyApp.html $(find src -name '*.zan' | sort | tr '\n' ' ') -o app.exe
+# （目录展开只收 .zan，设计稿要显式给）
+build/zanc src/MyApp.html src -o app.exe
 ```
 
 ### 1.3 交叉编译与移动端
@@ -180,6 +185,7 @@ trace 的事件序为准，不要顺着报表的站点名硬找。
 | `--time` / `-q` / `--quiet` | 阶段计时 / 静默进度行 |
 | `-D<name>[=v]` | 预处理符号 |
 | `@<file>` | 响应文件：从文件读更多参数（一行一个或空白分隔，带空格路径用引号）——**超长命令行/含空格路径用它** |
+| （位置参数，目录） | `zanc <dir> ...`：**目录**递归展开成 `*.zan` 输入（按路径排序，跳过 `.` 前缀与 `build/bin/obj/dist/out/vendor/node_modules` 等目录）——大项目首选，命令行长度与文件数无关；目录里没有 `.zan` 报 "no .zan source files under '...'"。**只收 `.zan`**：设计稿（`.html`）要显式给、且放第一个参数（`zanc src/MyApp.html src -o app.exe`） |
 | `--version/-v`、`--help/-h` | 版本 / 帮助 |
 
 ## 3. 交叉编译目标（--list-targets）
@@ -279,8 +285,11 @@ full 会把 CPU 打满几十分钟，**只在用户明确要求或发布门槛�
 6. **测试与构建互斥**（§5 纪律）。
 7. **新用例要重新 configure** 才进 ctest（§5）。
 8. **金样 CRLF**（§5）。
-9. **超长命令行用 @file**（§2）：Windows 命令行长度上限下，IDE 发布通道
-   就是这么做的；含空格路径加引号。
+9. **超长命令行用 @file 或目录输入**（§2）：Windows 命令行长度上限下，IDE 发布通道
+   就是这么做的；含空格路径加引号。**大项目更推荐目录输入**
+   （`zanc src -o app.exe`）：编译器自己展开，命令行恒长，枚举规则也只有一份。
+   注意"起不来"是静默的——命令行超限时进程根本不启动，报错文本里没有任何
+   编译诊断，调用方只看"输出里没有 error"就会误判成编译成功。
 10. **`--publish` 驱动装运失败是静默的**。装运循环逐文件拷贝失败无任何
    输出，聚合警告把原因误报为 "no runtime library found / add a
    manifest"。真踩案例：目标目录里有从该目录启动、还没退出的程序
