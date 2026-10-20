@@ -1295,3 +1295,27 @@ kernel32、shell32、user32、advapi32、version）。
   （命中才写 out 槽——宿主未命中时**不碰** out 槽）、`List<T>.LastIndexOf`、
   `NativeMemory.FindNotAnyOf` / `ScanNotAnyOf`（strcspn / strspn）。
 - 门禁：每修一条，配一个 conformance 用例进 `tests/selfhost/diff_cases.txt`。
+
+## 67. 泛型字段：存储形状按声明类型，值类型按接收者的具体实参
+
+- 坑（实测）：自举把泛型类的类型参数擦除成 i64 槽之后，**字段读回
+  来的值类型也跟着丢了**：`Box<double>.values` 的声明类型是 `List<T>`，读出来
+  仍是 `List<T>`（元素类型 T 依旧擦除）→ 元素被当成 i64 槽读 → 打印出位模式
+  而不是 double（用例 `generic_field_value_type`）。
+- 口径：宿主 `generic_field_slot` 取各实例化的**最大槽宽**（= 8 字节），所以
+  两边的**存储布局**本来就一致；差的是**使用点的值类型**——宿主按接收者的具体
+  类型实参替换，自举原先直接丢。
+- 做法：`LoadField` 把两件事分开：声明类型 `fty` 决定**存储形状**（擦除时仍是
+  i64），接收者静态类型 `recvTy` 决定**值类型**——`SubstRecvTy(fty, recvTy)`
+  用接收者类型里的具体类型实参，替换字段声明里提到的类级类型参数；擦除字段
+  用 `FromSlot(t, vty)` 还原。
+- 连带坑（实测）：`SubstTP` 之前**丢掉了数组的秩**——`T[]` 替换成
+  实参后变成裸元素类型（`T[]` → `int` 而不是 `int[]`），字段存的数组指针和读出
+  的元素类型对不上。数组类型节点用 `ival` 记秩、`sval` 记元素类型名，替换时只
+  换元素、保留 `ival`/`sval2`。
+- 边界：这套只解决**使用点**的值类型。泛型**类的方法体**是共享的（擦除），方法
+  体里的 `this.item` 拿不到具体实参——那要类级单态化（宿主
+  `irgen_generics.c` 的 `generic_insts` + `find_generic_fn`），自举还没有。
+  别把"字段读对了"当成"泛型全对了"。
+- 门禁：`tests/conformance/generic_field_value_type.zan`——把 `SubstRecvTy` 短路
+  成直接返回声明类型，用例会立刻变红。

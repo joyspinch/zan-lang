@@ -130,14 +130,19 @@ partial class Irgen {
         Node cls = binder.FindType(clsName);
         int idx = FieldIndex(cls, field);
         Node fty = FieldType(cls, field);
+        // the concrete type of the field, when the receiver's static type
+        // carries the class's type arguments (`Box<double>.values` is a
+        // `List<double>`): the storage keeps the erased shape, the VALUE
+        // gets its real type back
+        Node vty = SubstRecvTy(fty, recvTy);
         string ft = MapType(fty);
         string p = NT();
         L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
         string t = NT();
         L("  " + t + " = load " + ft + ", " + ft + "* " + p);
         // erased field: storage is i64; unpack to the concrete type when known
-        if (IsErasedType(fty)) { return FromSlot(t, ConcreteTP(fty, recvTy)); }
-        return new ExprVal(t, fty);
+        if (IsErasedType(fty)) { return FromSlot(t, vty); }
+        return new ExprVal(t, vty);
     }
 
     ExprVal GenUnary(Node e) {
@@ -4985,16 +4990,43 @@ partial class Irgen {
 
     Node SubstTP(Node t, List<string> names, List<Node> reps) {
         if (t == null) { return null; }
+        if (t.ival >= 1) {
+            // an array type keeps its RANK: `T[]` must stay an array after
+            // the substitution (the element type substitutes, the levels do
+            // not) -- dropping the rank turned `T[]` into a bare element.
+            Node el = new Node(AK.TypeRef());
+            el.sval = t.sval;
+            Node se = SubstTP(el, names, reps);
+            if (se == null) { return t; }
+            se.ival = t.ival;
+            se.sval2 = t.sval2;
+            return se;
+        }
         if (t.kids.Count == 0) {
             int hit = IndexOfStr(names, t.sval);
             if (hit >= 0) { return reps[hit]; }
             return t;
         }
         Node n = new Node(t.kind);
-        n.sval = t.sval;
+        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
         int i = 0;
         while (i < t.kids.Count) { n.Add(SubstTP(t.kids[i], names, reps)); i = i + 1; }
         return n;
+    }
+
+    // The concrete type of a member whose declared type mentions the
+    // enclosing class's type parameters: `Box<double>.values` is
+    // `List<double>`, not `List<T>`. The self-hosted backend erases the
+    // type parameters, but the RECEIVER's static type still carries the
+    // concrete arguments -- use them so the value keeps its real type (the
+    // element of a `List<double>` is a double, not an opaque slot).
+    Node SubstRecvTy(Node fty, Node recvTy) {
+        if (fty == null || recvTy == null) { return fty; }
+        Node cls = binder.FindType(recvTy.sval);
+        if (cls == null) { return fty; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || recvTy.kids.Count == 0) { return fty; }
+        return SubstTP(fty, tps, recvTy.kids);
     }
 
     // ---- method-level monomorphization ----
