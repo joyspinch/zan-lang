@@ -90,22 +90,38 @@
 - 现状（A379 已闭）：`Task.Run(lambda)` 的句柄被检查器定型成"无结果任务"，
   把 lambda 句柄当 `Task<T>` 用去读 `.Result`/`.Wait()` 会在**编译期**被拒绝
   （`tests/diag/task_run_action_result_type.zan`），那条运行期 double free 路径
-  因此不可达。
-- 但运行时本身仍没有防御层：帧若真被释放两次，`__zan_co_frame_free`
-  （`src/runtime/rt_io.c:4164`）的幂等守卫读帧首 8 字节的 `CO_DEAD` 位，而小对象
-  分配器回收时把用户块首 8 字节写成 freelist 指针（`src/runtime/rt_mem.c:447`），
-  守卫读到的已是垃圾 → 二次释放直接 abort（`double free of block`）。
-- 方向（二选一）：
-  - **a. 活协程表仲裁**：`zan_co_live_del(frame)` 改成返回"本次是否真的摘掉了
-    这个帧"，谁摘掉谁负责 free，后到的 reap 看到"已摘"直接返回。活协程表本来
-    就是帧的注册表（`src/runtime/rt_timer.c:956`，带墓碑），天然适合当所有权仲裁。
-  - **b. 守卫位搬家**：把 DEAD 标记挪到分配器不回写的槽位（帧首 8 字节不能用）。
-    但帧释放后那块内存会被复用，标记会变成别的对象的垃圾 → 只能把"误判为已死"
-    的代价从 abort 降成泄漏，不彻底。
+  因此不可达。**当前没有可从用户代码复现的触发路径**（5 种探针形状都试过）。
+- **2026-10-20 复核更正（原登记的前提只对了一半）**：
+  - **默认路径根本没有守卫**。`src/compiler/irgen.c:1128 zan_emit_frame_free`：
+    只有 `g->external_async_executor`（即 `--async-workers`）才调运行时的
+    `__zan_co_frame_free`（`src/runtime/rt_io.c:4164`，在 `#ifdef ZAN_CO_DRIVER`
+    段里，用帧首 8 字节的 `CO_DEAD` 位做幂等守卫）；**默认的进程内协程驱动
+    走的是裸 `free(frame)`**（同文件 1134 行），连守卫都没有。
+  - 即便有守卫也不可靠：小对象分配器回收时把用户块首 8 字节写成 freelist
+    指针（`src/runtime/rt_mem.c:448`），守卫读到的已是垃圾 → 二次释放直接
+    abort（`double free of block`）。
+  - **原方向 a（活协程表仲裁）与当前协议不符**：活协程表里**摘掉**帧的是协程
+    自己的完成路径（`__zan_co_untrack` → `zan_co_live_del`），而**释放**帧的是
+    读结果的一方（读完 `.Result` 后 `zan_emit_frame_free`）。"谁摘掉谁负责 free"
+    会在读者读结果之前就把帧释放掉 → UAF。仲裁必须是**独立于活协程表的所有权
+    凭据**，不能拿活协程表当仲裁器。
+- 方向（二选一，都要求 **C 后端与自举后端同一次改动**）：
+  - **a. 所有权句柄**：每个帧配一个稳定的句柄单元（帧指针 + released 标志），
+    所有释放点走 `handle_release()`，天然 exactly-once。代价：每帧多一次分配，
+    句柄本身要么泄漏、要么再加一层引用计数。
+  - **b. 隔离的帧分配器**：帧由运行时分配，释放后进隔离区（地址不还给通用分配
+    器）→ `CO_DEAD` 位不被覆盖 → 第二次释放读到 DEAD → 直接返回。代价：内存
+    延迟回收。
+  - **不要用"指针 → 已释放集合"**：地址复用后无法区分陈旧指针与新帧——要么跳过
+    一次合法释放（泄漏），要么释放一个活帧（内存损坏）。指针身份本身不够。
 - 连带：`__zan_co_isdone` 在帧已被完成路径释放后仍会读它的 DONE 字段（先查活
   协程表、再读帧字段，中间有窗口）——4 字节 UAF 读，通常不炸但语义不严。
-- ⚠ 改 `src/runtime/rt_io.c` / `rt_timer.c` 会动到自举固定点的 gen2 运行时包
-  （`zanrt_sh_*`），改完必须重跑 `selfhost_fixed_point`。
+- ⚠ 为什么不能只改 C 侧：自举后端发的是同一套协议
+  （`src/selfhost/irgen_async.zan:667/673/680/686/1037/1195/1645/2028/2035`
+  都是 `call void @__zan_co_frame_free`），帧布局也各写一份；固定点门比的是
+  两个后端的产物，单改 C 侧会让 `selfhost_fixed_point` 直接不绿。另外
+  `toolchain/*/zanrt_io.o`（各平台预编译运行时）要跟着重出，非本机平台
+  重建不了。
 
 ### [ ] A381 SPEC 的"尚未实现"清单 7 项一项没动
 
@@ -137,6 +153,26 @@
 - 方向：诊断编号是**破坏性变更**（所有诊断文本与编号都要定版，且影响 golden
   诊断输出），先定编号规范与兼容策略；`--warn-level` 与 `#pragma warning`
   跟在编号之后做。
+
+- **编号规范（2026-10-20 定版，照此实现）**：
+  - 形态：`[E123]` / `[W123]`，**编号 + 级别前缀 + 3 位十进制**；`E` = 错误、
+    `W` = 警告。编号在同一个前缀内**只增不减、注销后不复用**。
+  - 编号粒度：**一条诊断一处**（同一个语义点只编一次号），不按"每个报错函数"
+    编号——否则同一条语义换个函数就换号，工具无法按号抑制。
+  - 分段：0001–0999 语法/词法，1000–1999 名字/绑定，2000–2999 类型与约束，
+    3000–3999 代码生成与后端，4000–4999 互操作与运行时契约；告警沿用同一
+    段位（`W` 前缀独立计数）。
+  - 文本格式：`[E1234] 源文件(行,列): 原有诊断文本`——**原有文本一字不改**，
+    编号只加前缀；这样工具按号匹配、人类读文本都不受影响。
+  - 兼容策略：编号**只加不改**：已发布的诊断文本不改写，只在前面加编号；golden
+    诊断文件（`tests/diag/*.out`）随编号一次性重生成并入库，之后编号变更
+    必须走"新增编号"而不是"复用编号"。
+  - 落地次序：① 编号规范 + 全量编号表（`docs/DIAGNOSTIC_CODES.md`）+ 诊断
+    文本加前缀 + golden 重生成；② `--warn-level`（按级别/编号前缀过滤）；
+    ③ `#pragma warning`（源码内局部调级/禁用）；④ `Marshal`（与编号无关，
+    可并行）。
+- ⚠ 跨后端约束：自举后端自己发诊断（`src/selfhost/*.zan`），编号表要**两个
+  后端同一次落地**，否则固定点门/差分门会不绿；所以这条不能只改 C 侧。
 
 ### [ ] A383 图表引擎整代语义差：官方 470 个 option 键里 278 个（59%）从不读取
 
@@ -184,8 +220,9 @@
 - 方向：先定准绳（参考图实测外框高），再把脚本改成**从 `Spec` 取参**并补
   导航 30 号齿轮格，最后拿真 dump 跑绿；不要为了让它变绿去改脚本里的数字。
 
-### [ ] A388 `zanc --emit-ir` 输出的 IR 交给 LLVM 后端会被拒——256 位向量路径在 generic CPU 下拆不开
+### [ ] A439 `--emit-ir` 的 IR 在 generic CPU 下仍无法合法化——Vector256 降级路径要重做
 
+- 这是 A388 的**治本部分**（A388 的"让 .ll 自述目标特性"那半已做，见下）。
 - 现象：`zanc <file> --emit-ir` 落出的 IR 直接喂给 LLVM 自带的 `llc` 会在
   `DAGTypeLegalizer::SplitVectorOperand` 处 fatal error：
   `LLVM ERROR: Do not know how to split this operator's operand!`
@@ -197,9 +234,11 @@
   - 触发条件不是"`<32 x i1>` 本身"这么窄，而是**CPU 特性**。同一份 IR：
     `llc -filetype=obj`（默认 generic CPU）崩；`llc -mattr=+avx2` /
     `-mcpu=haswell` / `-mcpu=znver2` / `-mcpu=skylake-avx512` **全部通过**。
-  - 编译自己不受影响：`src/compiler/irgen_emit.c:3032` 建 TargetMachine 时 CPU 取
-    `x86-64`、特性取 `+sse3,...,+avx,+avx2,+fma,+bmi`，后端拿到的是 AVX2 档，
-    所以 zanc 产出的二进制是对的；坏的是**给外部工具消费的 .ll 文本**。
+  - 编译自己不受影响：`src/compiler/irgen_emit.c` 的 `zan_bind_target_layout`
+    建 TargetMachine 时 CPU 取 `x86-64`、特性取
+    `+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi`，后端拿到
+    的是 AVX2 档，所以 zanc 产出的二进制是对的；坏的是**给外部工具消费的 .ll
+    文本**。
   - 此前"正常构建靠 globaldce 删掉死的 stdlib 函数才不炸"的说法是错的：live
     函数（`Program_Mask`，`Vector256.Equals` + `ExtractMostSignificantBits`）
     单独抽出来喂 llc 同样崩，只是正常构建里它被 globaldce 顺手删掉了。
@@ -214,15 +253,18 @@
     `attributes #0 = { "target-cpu"=... "target-features"=... }`（LLVM 20 的 llc
     不拿它做合法化依据）、文本 IR 的 `module attributes`（语法不支持）、
     `!llvm.module.flags` 里的 `target-features`。
-- 方向（按代价从低到高）：
-  (1) **让 .ll 自述目标特性**：在 `--emit-ir` 的输出里带上编译自己用的
-      `+sse3,...,+avx2,...`（哪怕只是注释或 stderr 提示），让消费方用
-      `llc -mattr=+avx2` 复现编译器的选择；不修根因但让产物可用。
-  (2) **重做 Vector256 的降级路径**：不要把 `<32 x i8>` 拆回标量——
-      广播、比较、掩码全在 `<4 x i64>` 上做（移位/掩码的 SWAR 逐字节比较，
-      不产生任何 i1 向量），让 IR 在 generic CPU 下也能合法化；这是治本但
-      触及 `src/compiler/irgen_expr.c` 的向量整段 lowering，风险高。
-  (3) 走 (1) 并把 (2) 拆成独立条目。
+- ✅ 已做（A388 的低成本那半，2026-10-20）：`--emit-ir` 的产物**自述目标特性**
+  ——IR 头部注释 `; zanc-target-cpu:` / `; zanc-target-features:`，stderr 同时
+  打印对应的 `llc` 命令行。实测：按提示的
+  `llc -mcpu=x86-64 -mattr=+sse3,...,+bmi -filetype=obj` **通过**（出 210KB
+  目标文件），不带特性的 generic `llc` 仍崩。文档见 `docs/ZANC_CLI.md` §1.5。
+  这让产物**可用**，但没让 IR 在 generic CPU 下合法化——治本仍是本条。
+- 方向：**重做 Vector256 的降级路径**——不要把 `<32 x i8>` 拆回标量，广播、
+  比较、掩码全在 `<4 x i64>` 上做（移位/掩码的 SWAR 逐字节比较，不产生任何
+  i1 向量），让 IR 在 generic CPU 下也能合法化；触及
+  `src/compiler/irgen_expr.c` 的向量整段 lowering，风险高。
+  ⚠ 自举后端也有一份向量 lowering（`src/selfhost/irgen_expr.zan`），两个后端
+  要同一次改，否则固定点门不绿。
 - ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
   冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
