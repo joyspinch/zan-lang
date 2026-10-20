@@ -8,6 +8,35 @@
 
 ## 未完成
 
+### [ ] A462 泛型里 `new T()` 静默返回 null——类型参数不能实例化
+
+- 现象（2026-10-21 落地 `Zan.Mapping` 时撞到，`build/zanc_a447.exe` 实测）：
+  ```zan
+  class Maker<T> {
+      public T Make() {
+          T t = new T();     // 编译通过，运行期得到 null
+          return t;
+      }
+  }
+  Maker<Box> mk = new Maker<Box>();
+  Box b = mk.Make();       // b == null
+  b.v = 7;                 // null 引用 -> access violation（0xC0000005）
+  ```
+  编译期**没有任何诊断**：`new T()` 在泛型方法体里被当成合法的构造调用，
+  运行期却交出 null（静默错值），随后第一次成员访问就崩进程。
+- 根因（待查）：类型参数在 irgen 侧没有可用的构造入口——`new T()` 落到
+  `emit_new_expr` 的类型参数分支时既没报错也没生成构造调用，只是把"未初始化
+  的引用"（null）返回了。
+- 影响：任何"由类型参数造目标对象"的写法都踩雷。这也是 `Zan.Mapping` 的
+  `MapProfile` **目标工厂必填**的直接原因（目标对象由调用方造，用哪个构造器
+  也是调用方的事）——不是库的偏好，是语言当前的能力边界。
+- 方向（择一）：
+  1. **编译期诊断**：类型参数不能 `new` → 报 `cannot instantiate a type parameter`，
+     语义最诚实，改动面最小。
+  2. **约束式构造**：给泛型类加"必须有无参构造器"的约束，约束满足时按真实构造
+     器发射（需要检查器 / 绑定器支持泛型约束，见 `generic_constraints` 用例）。
+- 关联：A449（装箱）；泛型约束的现状见 `tests/conformance/generic_constraints.zan`。
+
 ### [ ] A456 一元 `!` 不检查操作数类型——`!s`（字符串）静默通过
 
 - 现象（2026-10-21 修 A452 时实测）：`string s = "x"; Console.WriteLine(!s);`

@@ -1,0 +1,397 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace System.Mapping;
+
+// **能力层**：映射代码生成器——把"映什么"变成**显式**的映射函数源码。
+//
+// ## 为什么在生成期而不是运行期
+//
+// AutoMapper 的"按约定自动映射"靠运行期反射：运行期得知道目标类型有哪些
+// 成员。Zan 没有反射（没有 `typeof`、没有成员枚举），所以自动匹配只能放在
+// **生成期**：读编译期导出的实体元数据（`zanc --gen-meta out.json` 导出的
+// JSON），按约定配对成员，生成一段**普通 Zan 源码**。
+//
+// 生成物是编译期常量：没有反射、没有装箱、没有运行期开销，也没有"约定
+// 悄悄变了"的可能（生成物进版本库，diff 得出来）。
+//
+// ## 约定（AutoMapper 同源的那部分）
+//
+// 1. **同名同类型**：源与目标都有 `code: string` → 直接拷。
+// 2. **扁平化**：目标有 `customerName`，源有 `customer.name` → 拷嵌套成员
+//    （一级字段名与二级字段名拼起来大小写无关地相等即命中）。
+// 3. 配不上的**如实报出来**，不猜、不静默跳过。
+//
+// ## 实体元数据格式
+//
+// `zanc --gen-meta out.json` 导出的 JSON：
+// ```json
+// { "classes": [ { "name": "Order", "ns": "Demo", "kind": "class",
+//                   "fields": [ { "name": "code", "type": "string",
+//                                 "static": false, "private": false } ],
+//                   "ctors": [ { "params": [] } ] } ] }
+// ```
+// 字段可见性取自 `private` / `protected`（默认 public）——不可写的字段不参与
+// 配对。
+public class GenMapping {
+    // 按规格生成映射源码；规格不合法抛 `MappingException`（`InvalidSpec`）。
+    public static string Emit(MappingSpec spec) {
+        string code = "";
+        string error = "";
+        if (!TryEmit(spec, out code, out error)) {
+            throw new MappingException(MappingError.InvalidSpec, error);
+        }
+        return code;
+    }
+
+    // 按规格生成映射源码：不抛的版本（失败返回 false，原因在 `error`）。
+    public static bool TryEmit(MappingSpec spec, out string code, out string error) {
+        code = "";
+        error = "";
+        if (spec == null) { error = "spec is null"; return false; }
+        string srcType = spec.SourceType != null ? spec.SourceType : "";
+        string dstType = spec.TargetType != null ? spec.TargetType : "";
+        if (!IsIdentifier(srcType)) {
+            error = "source type '" + srcType + "' is not a valid type name";
+            return false;
+        }
+        if (!IsIdentifier(dstType)) {
+            error = "target type '" + dstType + "' is not a valid type name";
+            return false;
+        }
+        string cls = spec.ClassName != null && spec.ClassName != ""
+            ? spec.ClassName : srcType + "Mapper";
+        if (!IsIdentifier(cls)) {
+            error = "class name '" + cls + "' is not a valid identifier";
+            return false;
+        }
+        string nsName = spec.NamespaceName != null ? spec.NamespaceName : "";
+        if (nsName != "" && !IsNamespace(nsName)) {
+            error = "namespace '" + nsName + "' is not valid";
+            return false;
+        }
+        for (int i = 0; i < spec.Members.Count; i = i + 1) {
+            MappingMember mem = spec.Members[i];
+            string from = mem.From != null ? mem.From : "";
+            string to = mem.To != null ? mem.To : "";
+            if (!IsMemberPath(from)) {
+                error = "source member path '" + from + "' is not valid";
+                return false;
+            }
+            if (!IsIdentifier(to)) {
+                error = "target member '" + to + "' is not a valid identifier";
+                return false;
+            }
+        }
+        List<string> usings = new List<string>();
+        for (int i = 0; i < spec.Usings.Count; i = i + 1) {
+            string u = spec.Usings[i];
+            if (u != "" && !IsNamespace(u)) {
+                error = "using '" + u + "' is not a valid namespace";
+                return false;
+            }
+            usings.Add(u);
+        }
+        code = BuildSource(nsName, cls, srcType, dstType, spec.Members,
+                           spec.WithListMap, usings);
+        return true;
+    }
+
+    // 按实体元数据 + 约定生成映射源码：不抛的版本。
+    //
+    // `nsName` 空串 = 放在全局命名空间；`className` 空串 = 「源类型名 + Mapper」。
+    public static bool TryEmitFromEntities(JsonValue entities, string sourceType,
+                                           string targetType, string className,
+                                           string nsName, bool withListMap,
+                                           out string code, out string error) {
+        code = "";
+        error = "";
+        ConventionMatch m = Match(entities, sourceType, targetType);
+        if (m.Error != "") { error = m.Error; return false; }
+        MappingSpec spec = new MappingSpec();
+        spec.SourceType = sourceType;
+        spec.TargetType = targetType;
+        spec.ClassName = className != null && className != ""
+            ? className : sourceType + "Mapper";
+        spec.NamespaceName = nsName != null ? nsName : "";
+        spec.WithListMap = withListMap;
+        for (int i = 0; i < m.Members.Count; i = i + 1) {
+            spec.Members.Add(m.Members[i]);
+        }
+        string srcNs = ClassNamespace(entities, sourceType);
+        string dstNs = ClassNamespace(entities, targetType);
+        if (srcNs != "" && srcNs != spec.NamespaceName) { spec.Usings.Add(srcNs); }
+        if (dstNs != "" && dstNs != spec.NamespaceName && dstNs != srcNs) {
+            spec.Usings.Add(dstNs);
+        }
+        return TryEmit(spec, out code, out error);
+    }
+
+    // 按约定配对出的成员对（源路径 → 目标成员名）。
+    public static List<MappingMember> MatchByConvention(JsonValue entities,
+                                                        string sourceType,
+                                                        string targetType) {
+        return Match(entities, sourceType, targetType).Members;
+    }
+
+    // 按约定**配不上**的目标成员名（如类型不同、需要显式转换的）。
+    public static List<string> UnmatchedByConvention(JsonValue entities,
+                                                     string sourceType,
+                                                     string targetType) {
+        return Match(entities, sourceType, targetType).Unmatched;
+    }
+
+    // ---- 内部实现 ----
+
+    // 约定配对的结果（配上的 + 配不上的）。
+    private class ConventionMatch {
+        public List<MappingMember> Members = new List<MappingMember>();
+        public List<string> Unmatched = new List<string>();
+        public string Error = "";
+    }
+
+    private static ConventionMatch Match(JsonValue entities, string sourceType,
+                                         string targetType) {
+        ConventionMatch m = new ConventionMatch();
+        JsonValue sc = FindClass(entities, sourceType);
+        JsonValue tc = FindClass(entities, targetType);
+        if (sc == null) {
+            m.Error = "source type '" + sourceType + "' is not in the entity metadata";
+            return m;
+        }
+        if (tc == null) {
+            m.Error = "target type '" + targetType + "' is not in the entity metadata";
+            return m;
+        }
+        if (!HasParameterlessCtor(tc)) {
+            m.Error = "target type '" + targetType +
+                      "' has no parameterless constructor (the generated code uses new " +
+                      targetType + "())";
+            return m;
+        }
+        List<JsonValue> sfields = WritableFields(sc);
+        List<JsonValue> tfields = WritableFields(tc);
+        for (int i = 0; i < tfields.Count; i = i + 1) {
+            JsonValue tf = tfields[i];
+            string tname = JsonStr(tf.Get("name"), "");
+            string ttype = JsonStr(tf.Get("type"), "");
+            if (tname == "") { continue; }
+            string from = "";
+            // 约定一：同名同类型
+            for (int j = 0; j < sfields.Count; j = j + 1) {
+                JsonValue sf = sfields[j];
+                string sname = JsonStr(sf.Get("name"), "");
+                string stype = JsonStr(sf.Get("type"), "");
+                if (sname == tname && TypeEq(stype, ttype)) { from = sname; break; }
+            }
+            // 约定二：扁平化（一级字段 + 它的字段 == 目标名）
+            if (from == "") {
+                for (int j = 0; j < sfields.Count && from == ""; j = j + 1) {
+                    JsonValue sf = sfields[j];
+                    string sname = JsonStr(sf.Get("name"), "");
+                    string stype = JsonStr(sf.Get("type"), "");
+                    if (sname == "") { continue; }
+                    JsonValue sub = FindClass(entities, stype);
+                    if (sub == null) { continue; }
+                    List<JsonValue> subfields = WritableFields(sub);
+                    for (int k = 0; k < subfields.Count; k = k + 1) {
+                        JsonValue bf = subfields[k];
+                        string bname = JsonStr(bf.Get("name"), "");
+                        string btype = JsonStr(bf.Get("type"), "");
+                        if (bname == "") { continue; }
+                        if (EqIgnoreCase(sname + bname, tname) && TypeEq(btype, ttype)) {
+                            from = sname + "." + bname;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (from == "") { m.Unmatched.Add(tname); continue; }
+            m.Members.Add(new MappingMember(from, tname));
+        }
+        return m;
+    }
+
+    // 拼出最终的映射源码。
+    private static string BuildSource(string nsName, string className,
+                                      string srcType, string dstType,
+                                      List<MappingMember> members,
+                                      bool withListMap, List<string> usings) {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("// <auto-generated>\n");
+        sb.Append("// 由 System.Mapping.GenMapping 生成——重新生成会覆盖，勿手改。\n");
+        sb.Append("// 源类型：" + srcType + "    目标类型：" + dstType + "\n");
+        sb.Append("\n");
+        sb.Append("using System;\n");
+        if (withListMap) { sb.Append("using System.Collections.Generic;\n"); }
+        for (int i = 0; i < usings.Count; i = i + 1) {
+            string u = usings[i];
+            if (u == "" || u == nsName) { continue; }
+            sb.Append("using " + u + ";\n");
+        }
+        sb.Append("\n");
+        if (nsName != "") { sb.Append("namespace " + nsName + ";\n\n"); }
+        sb.Append("public static class " + className + " {\n");
+        sb.Append("    // 把 " + srcType + " 映射成 " + dstType +
+                  "（显式字段拷贝，无反射）。\n");
+        sb.Append("    public static " + dstType + " Map(" + srcType + " src) {\n");
+        sb.Append("        " + dstType + " dst = new " + dstType + "();\n");
+        for (int i = 0; i < members.Count; i = i + 1) {
+            MappingMember mem = members[i];
+            sb.Append("        dst." + mem.To + " = src." + mem.From + ";\n");
+        }
+        sb.Append("        return dst;\n");
+        sb.Append("    }\n");
+        if (withListMap) {
+            sb.Append("\n");
+            sb.Append("    // 列表映射：逐个元素走 Map。\n");
+            sb.Append("    public static List<" + dstType + "> MapList(List<" +
+                      srcType + "> src) {\n");
+            sb.Append("        List<" + dstType + "> outv = new List<" + dstType + ">();\n");
+            sb.Append("        for (int i = 0; i < src.Count; i = i + 1) {\n");
+            sb.Append("            outv.Add(Map(src[i]));\n");
+            sb.Append("        }\n");
+            sb.Append("        return outv;\n");
+            sb.Append("    }\n");
+        }
+        sb.Append("}\n");
+        return sb.ToString();
+    }
+
+    // 在实体元数据里找类（按名字）。
+    private static JsonValue FindClass(JsonValue entities, string typeName) {
+        if (entities == null || typeName == "") { return null; }
+        JsonValue classes = entities.Get("classes");
+        if (classes == null || !classes.IsArray()) { return null; }
+        for (int i = 0; i < classes.Count(); i = i + 1) {
+            JsonValue c = classes.At(i);
+            if (c == null) { continue; }
+            if (JsonStr(c.Get("name"), "") == typeName) { return c; }
+        }
+        return null;
+    }
+
+    // 类所在命名空间（找不到返回空串）。
+    private static string ClassNamespace(JsonValue entities, string typeName) {
+        JsonValue c = FindClass(entities, typeName);
+        if (c == null) { return ""; }
+        return JsonStr(c.Get("ns"), "");
+    }
+
+    // 可写的字段（跳过 static / private / protected）。
+    private static List<JsonValue> WritableFields(JsonValue cls) {
+        List<JsonValue> outv = new List<JsonValue>();
+        if (cls == null) { return outv; }
+        JsonValue fields = cls.Get("fields");
+        if (fields == null || !fields.IsArray()) { return outv; }
+        for (int i = 0; i < fields.Count(); i = i + 1) {
+            JsonValue f = fields.At(i);
+            if (f == null) { continue; }
+            if (JsonBool(f.Get("static"), false)) { continue; }
+            if (JsonBool(f.Get("private"), false)) { continue; }
+            if (JsonBool(f.Get("protected"), false)) { continue; }
+            outv.Add(f);
+        }
+        return outv;
+    }
+
+    // 目标类型有没有无参构造器（没有显式构造器 = 有隐式无参构造器）。
+    private static bool HasParameterlessCtor(JsonValue cls) {
+        if (cls == null) { return false; }
+        JsonValue ctors = cls.Get("ctors");
+        if (ctors == null || !ctors.IsArray() || ctors.Count() == 0) { return true; }
+        for (int i = 0; i < ctors.Count(); i = i + 1) {
+            JsonValue c = ctors.At(i);
+            if (c == null) { continue; }
+            JsonValue ps = c.Get("params");
+            if (ps == null || !ps.IsArray() || ps.Count() == 0) { return true; }
+        }
+        return false;
+    }
+
+    // 类型名比较（大小写无关——Zan 的内建类型名都是小写，类名首字母大写）。
+    private static bool TypeEq(string a, string b) {
+        if (a == null || b == null) { return false; }
+        return a.ToLower() == b.ToLower();
+    }
+
+    private static bool EqIgnoreCase(string a, string b) {
+        if (a == null || b == null) { return false; }
+        return a.ToLower() == b.ToLower();
+    }
+
+    private static string JsonStr(JsonValue v, string dflt) {
+        if (v == null) { return dflt; }
+        if (v.IsString()) { return v.strVal; }
+        return dflt;
+    }
+
+    private static bool JsonBool(JsonValue v, bool dflt) {
+        if (v == null) { return dflt; }
+        if (v.IsBool()) { return v.boolVal; }
+        return dflt;
+    }
+
+    // 标识符校验：首字符是字母或下划线，其余是字母 / 数字 / 下划线。
+    // （Zan 没有 char 类型，字符串下标取的是**字节**，所以按字节值判。）
+    private static bool IsIdentifier(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        int b0 = s[0];
+        if (!IsIdentStart(b0)) { return false; }
+        for (int i = 1; i < s.Length; i = i + 1) {
+            int b = s[i];
+            if (!IsIdentStart(b) && !IsDigit(b)) { return false; }
+        }
+        return true;
+    }
+
+    // 成员路径：点分的标识符（`customer.name`）。
+    private static bool IsMemberPath(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        List<string> parts = SplitPath(s);
+        if (parts.Count == 0) { return false; }
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (!IsIdentifier(parts[i])) { return false; }
+        }
+        return true;
+    }
+
+    // 命名空间：点分的标识符。
+    private static bool IsNamespace(string s) {
+        if (s == null || s.Length == 0) { return false; }
+        List<string> parts = SplitPath(s);
+        if (parts.Count == 0) { return false; }
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (!IsIdentifier(parts[i])) { return false; }
+        }
+        return true;
+    }
+
+    private static List<string> SplitPath(string s) {
+        List<string> parts = new List<string>();
+        string cur = "";
+        for (int i = 0; i < s.Length; i = i + 1) {
+            int b = s[i];
+            if (b == 46) {
+                parts.Add(cur);
+                cur = "";
+                continue;
+            }
+            cur = cur + s.Substring(i, 1);
+        }
+        parts.Add(cur);
+        return parts;
+    }
+
+    private static bool IsIdentStart(int b) {
+        if (b >= 65 && b <= 90) { return true; }
+        if (b >= 97 && b <= 122) { return true; }
+        if (b == 95) { return true; }
+        return false;
+    }
+
+    private static bool IsDigit(int b) {
+        return b >= 48 && b <= 57;
+    }
+}

@@ -613,17 +613,26 @@ static LLVMValueRef emit_delegate_call(zan_irgen_t *g,
                                        LLVMValueRef fn_ptr,
                                        zan_ast_node_t *call,
                                        local_scope_t *locals) {
-    int pc = delegate_type->delegate_param_count;
+    /* 泛型实例里委托的形参/返回类型可能是类型参数（如泛型类的 `Func<TTarget>`
+     * 字段）。调用点必须按当前实例把类型参数换成实参再发射：按擦除形态发射
+     * 会与实际委托（lambda）的签名对不上——结构体返回会被读成野指针。 */
+    zan_type_t *dt = delegate_type;
+    if (g->cur_inst && delegate_type &&
+        delegate_type->kind == TYPE_DELEGATE) {
+        zan_type_t *subst = subst_type_param_deep(g, delegate_type, g->cur_inst);
+        if (subst) dt = subst;
+    }
+    int pc = dt->delegate_param_count;
     LLVMTypeRef *param_types = (LLVMTypeRef *)calloc(
         (size_t)(pc > 0 ? pc : 1), sizeof(LLVMTypeRef));
     for (int k = 0; k < pc; k++) {
         param_types[k] = map_type(
-            g, delegate_type->delegate_param_types[k]);
+            g, dt->delegate_param_types[k]);
     }
-    LLVMTypeRef ret = delegate_type->delegate_is_async
+    LLVMTypeRef ret = dt->delegate_is_async
         ? LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0)
-        : (delegate_type->delegate_ret_type
-            ? map_type(g, delegate_type->delegate_ret_type)
+        : (dt->delegate_ret_type
+            ? map_type(g, dt->delegate_ret_type)
             : LLVMVoidTypeInContext(g->ctx));
     LLVMTypeRef fn_type = LLVMFunctionType(
         ret, param_types, (unsigned)pc, 0);
@@ -634,6 +643,8 @@ static LLVMValueRef emit_delegate_call(zan_irgen_t *g,
         call_args[k] = emit_expr(
             g, call->call.args.items[k], locals);
         if (k < pc) {
+            call_args[k] = coerce_struct_value_arg(
+                g, call_args[k], param_types[k]);
             call_args[k] = emit_boundary_coerce(
                 g, call_args[k], param_types[k]);
         }
@@ -822,7 +833,9 @@ static void emit_release_owned_locals_except(zan_irgen_t *g, local_scope_t *loca
                                              local_var_t *keep) {
     if (!locals) return;
     LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
-    for (int i = 0; i < locals->count; i++) {
+    /* 逆序弹出：eh_slot 标记是压栈（arc_own_local）时入栈的，弹出必须按
+     * 相反顺序，否则弹掉的是别的局部变量的标记，标记错位滞留栈上。 */
+    for (int i = locals->count - 1; i >= 0; i--) {
         pop_eh_slot(g, &locals->vars[i]);
         if (keep && &locals->vars[i] == keep) continue;
         if (locals->vars[i].obj_rc_flag) {

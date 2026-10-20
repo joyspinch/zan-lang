@@ -3929,6 +3929,36 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
             return pcmp;
         }
 
+        /* 值类型与 null 的比较：泛型形参 T 在特化成结构体/数值等值类型后，
+         * 值永远不可能为 null，直接比较会生成「聚合值 vs 空指针」的非法 IR
+         * （LLVM 校验失败：Both operands to ICmp instruction are not of the
+         * same type）。这里按「值类型不是 null」折叠成常量。 */
+        if ((expr->binary.op == TK_EQ_EQ || expr->binary.op == TK_BANG_EQ) &&
+            !both_ptr) {
+            bool l_null = LLVMGetTypeKind(LLVMTypeOf(left)) == LLVMPointerTypeKind &&
+                          LLVMIsNull(left);
+            bool r_null = LLVMGetTypeKind(LLVMTypeOf(right)) == LLVMPointerTypeKind &&
+                          LLVMIsNull(right);
+            if (l_null != r_null) {
+                LLVMValueRef val = l_null ? right : left;
+                LLVMTypeRef vt = LLVMTypeOf(val);
+                LLVMTypeKind vk = LLVMGetTypeKind(vt);
+                bool value_kind = vk == LLVMStructTypeKind ||
+                                  vk == LLVMIntegerTypeKind ||
+                                  vk == LLVMDoubleTypeKind ||
+                                  vk == LLVMFloatTypeKind;
+                /* 可空值类型走 zan.nullable.* 聚合体，其「是否为 null」由
+                 * has-value 标记决定，不能按值类型折叠 */
+                if (value_kind &&
+                    !(vk == LLVMStructTypeKind && llvm_is_nullable(vt))) {
+                    emit_release_owned_call_temp(g, expr->binary.left, left, locals);
+                    emit_release_owned_call_temp(g, expr->binary.right, right, locals);
+                    return LLVMConstInt(LLVMInt1TypeInContext(g->ctx),
+                                        expr->binary.op == TK_BANG_EQ ? 1 : 0, 0);
+                }
+            }
+        }
+
         return emit_binary_op_values(g, expr, left, right, locals);
 }
 
@@ -12540,6 +12570,14 @@ static LLVMValueRef emit_lambda_typed(zan_irgen_t *g, zan_ast_node_t *expr,
             if (is_rc_managed_type(rett) &&
                 !expr_yields_owned_rc_value(g, expr->lambda.body, &lambda_locals)) {
                 emit_rc_retain_for_type(g, rett, result);
+            }
+            /* 表达式体 Lambda 返回结构体：表达式求值得到的是结构体对象的
+             * 地址，与「按值返回」的签名不符（LLVM 校验失败：Function return
+             * type does not match operand type of return inst）。这里按值取出。
+             * 可空聚合体（zan.nullable.*）不是这种形态，跳过。 */
+            if (LLVMGetTypeKind(ret_type) == LLVMStructTypeKind &&
+                !llvm_is_nullable(ret_type)) {
+                result = coerce_struct_value_arg(g, result, ret_type);
             }
             result = emit_boundary_coerce(g, result, ret_type);
             LLVMBuildRet(g->builder, result);

@@ -304,6 +304,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `class Ch<T> : Base` 覆写 `Base.Accepts(object)` 并写 `return m is T;`，
   经基类引用的虚调用现在判定正确（每个实例化一张 vtable）。早年的绕行
   "把类型判定挪进派生类构造器、定型成委托再交给基类调用" 现在**不必**了，
+* **`default(T)`、顶层函数、`List<T>.At()` 都不存在**（实证，2026-10-28）：
+  `default(int)` 报 "unexpected token 'default' in expression"；文件级
+  函数报 "expected type declaration (class, struct, interface, enum, or
+  delegate)"；`list.At(0)` 报 "'List<T>' has no member 'At'"（只有下标
+  `list[0]`）。要"默认零值"就显式写 `int x = 0;`。
+* **泛型里 `new T()` 静默返回 null**（实证，2026-10-28）：`class Box<T> { public
+  T Make() { return new T(); } }` —— **编译期零诊断、运行期返回 null**（实测
+  `Box<string>.Make()` 得到 null）。编译器不检查 T 有没有无参构造器，也不
+  报"无法实例化类型参数"。凡是泛型工厂/容器要造 T，一律要求调用方传
+  **工厂委托**（`FuncT<TTarget>`），调用点再判空兜底。
+  （已登记 TASKS.md A462，尚未修。）
+* **结构体是值语义，成员赋值改的是副本**（实证，2026-10-28）：`Pt q = h.P;
+  q.X = 99;` 之后 `h.P.X` 仍是原值——`q` 是副本。凡是"变换/映射/原地更新"
+  类 API，签名必须**交还新值**（`FuncT<TSource, TTarget, TTarget>`），就地
+  改成员改的是副本、调用方看不到。（`Zan.Mapping` 的成员规则按这条设计。）
   但保留也无害。
 
 ## 4. Edit

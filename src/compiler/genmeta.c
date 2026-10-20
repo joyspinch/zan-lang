@@ -864,6 +864,14 @@ static void gm_export_type(zan_ast_node_t *decl, json_value *classes) {
                                            : ""));
                 json_obj_set(f, "static", json_new_bool(
                     (m->field_decl.modifiers & MOD_STATIC) != 0));
+                /* 字段可见性：默认是 public（Zan 里不写修饰符即可外部访问），
+                 * 但显式 private/protected 的字段外部碰不到——代码生成器
+                 * （System.Mapping.GenMapping 按字段名配对并写赋值）需要据此
+                 * 跳过不可写的字段，否则生成的代码编译不过。 */
+                json_obj_set(f, "private", json_new_bool(
+                    (m->field_decl.modifiers & MOD_PRIVATE) != 0));
+                json_obj_set(f, "protected", json_new_bool(
+                    (m->field_decl.modifiers & MOD_PROTECTED) != 0));
                 json_obj_set(f, "file", json_new_num((double)m->loc.file_id));
                 json_obj_set(f, "line", json_new_num((double)m->loc.line));
                 json_obj_set(f, "col", json_new_num((double)m->loc.col));

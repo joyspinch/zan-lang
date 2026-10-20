@@ -1677,8 +1677,13 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
                 val = LLVMBuildLoad2(g->builder, LLVMTypeOf(val), v_slot,
                                      "ret.fin");
             }
-            emit_release_owned_locals(g, locals);
+            /* 退出顺序：先释放 catch 捕获的异常对象，再释放局部变量。
+             * 被捕获的异常还压在异常临时栈顶（catch 进入时压入），若先弹局部
+             * 变量的 eh_slot，弹出的是异常而不是该局部变量的槽位标记——标记滞留
+             * 栈上，栈深与标记错位；后续展开会拿滞留标记再释放一次同一对象，
+             * 变成对已释放内存的二次释放（访问冲突）。 */
             emit_release_active_catch_excs(g, 0);
+            emit_release_owned_locals(g, locals);
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             LLVMTypeRef val_t = LLVMTypeOf(val);
             if (val_t != fn_ret) {
@@ -1725,8 +1730,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             emit_pending_finallys(g, locals, 0, false);
             if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                 break;
-            emit_release_owned_locals(g, locals);
+            /* 同上：catch 异常先出栈，局部变量后出栈 */
             emit_release_active_catch_excs(g, 0);
+            emit_release_owned_locals(g, locals);
             LLVMTypeRef fn_ret = g->current_fn_ret_type;
             if (g->current_fn_is_main) emit_release_static_rc_fields(g, NULL);
             emit_eh_disarm_from(g, 0);
@@ -1903,8 +1909,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             emit_pending_finallys(g, locals, g->finally_loop_base, false);
             if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                 break;
-            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
+            /* 同上：catch 异常先出栈，局部变量后出栈 */
             emit_release_active_catch_excs(g, g->loop_catch_base);
+            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_eh_disarm_from(g, g->eh_armed_loop_base);
             emit_pending_scope_exit(g, g->pending.break_scope, false);
             LLVMBuildBr(g->builder, g->break_target);
@@ -1916,8 +1923,9 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             emit_pending_finallys(g, locals, g->finally_loop_base, false);
             if (LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder)))
                 break;
-            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
+            /* 同上：catch 异常先出栈，局部变量后出栈 */
             emit_release_active_catch_excs(g, g->loop_catch_base);
+            emit_release_owned_locals_range(g, locals, g->loop_locals_base);
             emit_eh_disarm_from(g, g->eh_armed_loop_base);
             emit_pending_scope_exit(g, g->pending.continue_scope, false);
             LLVMBuildBr(g->builder, g->continue_target);
@@ -3333,10 +3341,11 @@ static void emit_stmt(zan_irgen_t *g, zan_ast_node_t *stmt, local_scope_t *local
             }
             emit_pending_finallys(g, locals, g->goto_labels[li].fin_depth, false);
             if (!LLVMGetBasicBlockTerminator(LLVMGetInsertBlock(g->builder))) {
-                emit_release_owned_locals_range(
-                    g, locals, g->goto_labels[li].locals_base);
+                /* 同上：catch 异常先出栈，局部变量后出栈 */
                 emit_release_active_catch_excs(
                     g, g->goto_labels[li].catch_base);
+                emit_release_owned_locals_range(
+                    g, locals, g->goto_labels[li].locals_base);
                 emit_eh_disarm_from(g, g->goto_labels[li].eh_armed_base);
                 emit_pending_scope_exit(g, g->goto_labels[li].pending_scope, false);
                 LLVMBuildBr(g->builder, bb);

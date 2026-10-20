@@ -1,0 +1,147 @@
+using System;
+using System.Collections.Generic;
+using System.Mapping;
+
+// 运行期映射档案：显式成员规则 / 错误归因 / 值转换器 / 结构体目标。
+class Order {
+    public string code;
+    public int amount;
+    public string customerName;
+}
+
+class OrderDto {
+    public string code;
+    public int amount;
+    public string customerName;
+}
+
+// 结构体目标：值语义——规则必须"交还新值"（就地改会改在副本上）。
+struct Point {
+    public int x;
+    public int y;
+}
+
+struct PointDto {
+    public int x;
+    public int y;
+}
+
+public class Program {
+    public static void Main() {
+        int fail = 0;
+
+        MapProfile<Order, OrderDto> p = new MapProfile<Order, OrderDto>(() => new OrderDto());
+        MapProfile<Order, OrderDto> chained = p.Member("code", (Order s, OrderDto d) => {
+            d.code = s.code; return d;
+        });
+        chained.Member("amount", (Order s, OrderDto d) => {
+            d.amount = s.amount; return d;
+        });
+        chained.Member("customerName", (Order s, OrderDto d) => {
+            d.customerName = s.customerName; return d;
+        });
+
+        if (chained.RuleCount != 3) {
+            Console.WriteLine("FAIL rule count: " + chained.RuleCount.ToString());
+            fail = fail + 1;
+        }
+        List<string> names = chained.MemberNames();
+        if (names.Count != 3 || names[0] != "code" || names[2] != "customerName") {
+            Console.WriteLine("FAIL member names");
+            fail = fail + 1;
+        }
+
+        Order o = new Order();
+        o.code = "A-1";
+        o.amount = 7;
+        o.customerName = "张三";
+        OrderDto d = p.Map(o);
+        if (d.code != "A-1" || d.amount != 7 || d.customerName != "张三") {
+            Console.WriteLine("FAIL map: " + d.code + "/" + d.amount.ToString() +
+                              "/" + d.customerName);
+            fail = fail + 1;
+        }
+
+        // 列表映射
+        List<Order> src = new List<Order>();
+        src.Add(o);
+        src.Add(o);
+        List<OrderDto> mapped = p.MapList(src);
+        if (mapped.Count != 2 || mapped[1].code != "A-1") {
+            Console.WriteLine("FAIL map list: n=" + mapped.Count.ToString());
+            fail = fail + 1;
+        }
+
+        // 源为 null
+        MappingResult<OrderDto> nullRes = p.TryMap(null);
+        if (!nullRes.IsError || nullRes.Error != MappingError.SourceNull) {
+            Console.WriteLine("FAIL null source");
+            fail = fail + 1;
+        }
+
+        // 成员规则失败：错误码 + 成员名（不抛的那条路）
+        MapProfile<Order, OrderDto> bad = new MapProfile<Order, OrderDto>(() => new OrderDto());
+        bad.Member("code", (Order s, OrderDto t) => { t.code = s.code; return t; });
+        bad.Member("boom", (Order s, OrderDto t) => { throw new Exception("kaboom"); });
+        MappingResult<OrderDto> badRes = bad.TryMap(o);
+        if (!badRes.IsError || badRes.Error != MappingError.MemberFailed ||
+            badRes.Member != "boom") {
+            Console.WriteLine("FAIL member failure attribution");
+            fail = fail + 1;
+        }
+
+        // 成员规则失败：抛的那条路
+        bool caught = false;
+        try {
+            bad.Map(o);
+        } catch (MappingException e) {
+            caught = e.error == MappingError.MemberFailed && e.member == "boom";
+        }
+        if (!caught) {
+            Console.WriteLine("FAIL member failure exception");
+            fail = fail + 1;
+        }
+
+        // 值转换器：成功 / 失败抛 / 失败不抛
+        ValueConverter<int, string> toText = new ValueConverter<int, string>(
+            "int2text", (int v) => v.ToString());
+        if (toText.Apply(42) != "42") {
+            Console.WriteLine("FAIL converter apply");
+            fail = fail + 1;
+        }
+        ValueConverter<int, string> broken = new ValueConverter<int, string>(
+            "int2text", (int v) => { throw new Exception("nope"); });
+        string convOut = "";
+        if (broken.TryConvert(1, out convOut)) {
+            Console.WriteLine("FAIL converter try should fail");
+            fail = fail + 1;
+        }
+        bool convCaught = false;
+        try {
+            broken.Apply(1);
+        } catch (MappingException e) {
+            convCaught = e.error == MappingError.ConvertFailed && e.member == "int2text";
+        }
+        if (!convCaught) {
+            Console.WriteLine("FAIL converter exception");
+            fail = fail + 1;
+        }
+
+        // 结构体目标：值语义，规则交还新值
+        MapProfile<Point, PointDto> sp = new MapProfile<Point, PointDto>(() => new PointDto());
+        sp.Member("x", (Point s, PointDto t) => { t.x = s.x; t.y = s.y; return t; });
+        Point pt = new Point();
+        pt.x = 3;
+        pt.y = 4;
+        PointDto pd = sp.Map(pt);
+        if (pd.x != 3 || pd.y != 4) {
+            Console.WriteLine("FAIL struct target: " + pd.x.ToString() + "," +
+                              pd.y.ToString());
+            fail = fail + 1;
+        }
+
+        if (fail == 0) {
+            Console.WriteLine("ALL MAPPING PROFILE TESTS PASSED");
+        }
+    }
+}

@@ -1,0 +1,78 @@
+using System;
+
+// A460：catch 里 `return` 时，被捕获的异常对象的清理被跳过。
+//
+// 缺陷：catch 进入时把异常对象压进「异常临时栈」（栈顶），退出时必须先把它
+// 弹出来。原实现先释放局部变量（弹 eh_slot 标记）、再释放 catch 异常，顺序
+// 反了——弹 eh_slot 标记弹掉的是**栈顶的异常**而不是该局部变量的标记：
+// 局部变量的标记滞留栈上，栈深与标记错位；后续异常展开会拿滞留标记把同一
+// 对象再释放一次 → 对已释放内存二次释放 → 访问冲突（0xC0000005）。
+//
+// 这个形状很常见：泛型方法里 catch 住成员规则的异常、返回错误结果，
+// 上层再把错误抛出去。
+
+class Res<T> {
+    public bool Flag;
+    public string Name;
+    public Res() { this.Name = "res"; }
+}
+
+class Prof<TS, TT> {
+    private FuncT2<TS, TT, TT> one;
+    public void Member(FuncT2<TS, TT, TT> fn) { this.one = fn; }
+
+    public TT Map(TS src, TT t) {
+        Res<TT> r = this.TryMap(src, t);
+        if (r.Flag) {
+            throw new Exception("mapped failed");
+        }
+        return t;
+    }
+
+    public Res<TT> TryMap(TS src, TT t) {
+        Res<TT> res = new Res<TT>();
+        try {
+            t = this.one(src, t);
+        } catch (Exception e) {
+            res.Flag = true;
+            return res;
+        }
+        return res;
+    }
+}
+
+public class Program {
+    public static void Main() {
+        int fail = 0;
+
+        Prof<int, int> p = new Prof<int, int>();
+        p.Member((int s, int d) => { throw new Exception("kaboom"); });
+
+        bool caught = false;
+        try {
+            p.Map(1, 2);
+        } catch (Exception e) {
+            caught = e.Message == "mapped failed";
+        }
+        if (!caught) {
+            Console.WriteLine("FAIL: catch-return path did not surface the error");
+            fail++;
+        }
+
+        // 第二次异常：展开时会把上一轮滞留的标记再释放一次（修复前在这里崩）
+        bool caught2 = false;
+        try {
+            p.Map(3, 4);
+        } catch (Exception e) {
+            caught2 = e.Message == "mapped failed";
+        }
+        if (!caught2) {
+            Console.WriteLine("FAIL: second catch-return path did not surface the error");
+            fail++;
+        }
+
+        if (fail == 0) {
+            Console.WriteLine("ALL CATCH RETURN RELEASE TESTS PASSED");
+        }
+    }
+}

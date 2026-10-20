@@ -1,0 +1,152 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Mapping;
+
+// 生成期映射：按约定配对成员 → 生成**显式**映射源码。
+//
+// 这里不编译生成物（判定器里没有编译器），只钉住「配对结果」与
+// 「生成源码的形状」：约定一（同名同类型）、约定二（扁平化）、
+// 配不上的如实报出、非法规格报错。
+public class Program {
+    // zanc --gen-meta 导出的实体元数据形状（裁剪版）。
+    private const string Entities = @"{
+      ""version"": 1,
+      ""classes"": [
+        { ""name"": ""Order"", ""ns"": ""Demo"", ""kind"": ""class"",
+          ""fields"": [
+            { ""name"": ""code"", ""type"": ""string"", ""static"": false, ""private"": false },
+            { ""name"": ""amount"", ""type"": ""int"", ""static"": false, ""private"": false },
+            { ""name"": ""customer"", ""type"": ""Customer"", ""static"": false, ""private"": false },
+            { ""name"": ""note"", ""type"": ""string"", ""static"": false, ""private"": false },
+            { ""name"": ""secret"", ""type"": ""string"", ""static"": false, ""private"": true }
+          ],
+          ""ctors"": [ { ""params"": [] } ] },
+        { ""name"": ""Customer"", ""ns"": ""Demo"", ""kind"": ""class"",
+          ""fields"": [
+            { ""name"": ""name"", ""type"": ""string"", ""static"": false, ""private"": false },
+            { ""name"": ""email"", ""type"": ""string"", ""static"": false, ""private"": false }
+          ],
+          ""ctors"": [ { ""params"": [] } ] },
+        { ""name"": ""OrderDto"", ""ns"": ""Demo"", ""kind"": ""class"",
+          ""fields"": [
+            { ""name"": ""code"", ""type"": ""string"", ""static"": false, ""private"": false },
+            { ""name"": ""amount"", ""type"": ""int"", ""static"": false, ""private"": false },
+            { ""name"": ""customerName"", ""type"": ""string"", ""static"": false, ""private"": false },
+            { ""name"": ""noteText"", ""type"": ""string"", ""static"": false, ""private"": false }
+          ],
+          ""ctors"": [ { ""params"": [] } ] },
+        { ""name"": ""NoCtor"", ""ns"": ""Demo"", ""kind"": ""class"",
+          ""fields"": [ { ""name"": ""x"", ""type"": ""int"", ""static"": false, ""private"": false } ],
+          ""ctors"": [ { ""params"": [ { ""name"": ""x"", ""type"": ""int"" } ] } ] }
+      ]
+    }";
+
+    public static void Main() {
+        int fail = 0;
+        JsonValue entities = JsonSerializer.Deserialize(Entities);
+
+        // 约定配对：同名同类型 + 扁平化
+        List<MappingMember> matched = GenMapping.MatchByConvention(entities, "Order", "OrderDto");
+        if (matched.Count != 3) {
+            Console.WriteLine("FAIL: matched count = " + matched.Count.ToString());
+            fail++;
+        } else {
+            if (matched[0].From != "code" || matched[0].To != "code") {
+                Console.WriteLine("FAIL: same-name pair");
+                fail++;
+            }
+            if (matched[1].From != "amount" || matched[1].To != "amount") {
+                Console.WriteLine("FAIL: same-type pair");
+                fail++;
+            }
+            if (matched[2].From != "customer.name" || matched[2].To != "customerName") {
+                Console.WriteLine("FAIL: flattened pair: " + matched[2].From);
+                fail++;
+            }
+        }
+
+        // 配不上的：noteText 类型对不上（源里是 note:string，类型相同但名字不同，
+        // 扁平化也配不上）——如实报出，不静默跳过
+        List<string> unmatched = GenMapping.UnmatchedByConvention(entities, "Order", "OrderDto");
+        if (unmatched.Count != 1 || unmatched[0] != "noteText") {
+            Console.WriteLine("FAIL: unmatched = " + unmatched.Count.ToString());
+            fail++;
+        }
+
+        // 生成源码：显式字段拷贝，没有反射
+        string code = "";
+        string error = "";
+        bool ok = GenMapping.TryEmitFromEntities(entities, "Order", "OrderDto", "OrderMapper",
+                                                "Demo", true, out code, out error);
+        if (!ok) {
+            Console.WriteLine("FAIL: emit failed: " + error);
+            fail++;
+        } else {
+            if (code.IndexOf("dst.code = src.code;") < 0) {
+                Console.WriteLine("FAIL: generated code misses the code copy");
+                fail++;
+            }
+            if (code.IndexOf("dst.customerName = src.customer.name;") < 0) {
+                Console.WriteLine("FAIL: generated code misses the flattened copy");
+                fail++;
+            }
+            if (code.IndexOf("public static OrderDto Map(Order src)") < 0) {
+                Console.WriteLine("FAIL: generated code misses the Map signature");
+                fail++;
+            }
+            if (code.IndexOf("List<OrderDto> MapList(List<Order> src)") < 0) {
+                Console.WriteLine("FAIL: generated code misses the MapList signature");
+                fail++;
+            }
+            if (code.IndexOf("noteText") >= 0) {
+                Console.WriteLine("FAIL: generated code copies an unmatched member");
+                fail++;
+            }
+            if (code.IndexOf("secret") >= 0) {
+                Console.WriteLine("FAIL: generated code touches a private field");
+                fail++;
+            }
+        }
+
+        // 目标类型没有无参构造器 → 报错，不生成编译不过的代码
+        bool bad = GenMapping.TryEmitFromEntities(entities, "Order", "NoCtor", "", "", false,
+                                                  out code, out error);
+        if (bad) {
+            Console.WriteLine("FAIL: a target without a parameterless ctor was accepted");
+            fail++;
+        }
+        if (error.IndexOf("parameterless") < 0) {
+            Console.WriteLine("FAIL: unexpected error text: " + error);
+            fail++;
+        }
+
+        // 源类型不在元数据里 → 报错
+        bool missing = GenMapping.TryEmitFromEntities(entities, "Nope", "OrderDto", "", "",
+                                                      false, out code, out error);
+        if (missing) {
+            Console.WriteLine("FAIL: an unknown source type was accepted");
+            fail++;
+        }
+
+        // 非法规格：Emit 抛 MappingException（错误码 InvalidSpec）
+        MappingSpec bad_spec = new MappingSpec();
+        bad_spec.SourceType = "Order";
+        bad_spec.TargetType = "OrderDto";
+        bad_spec.Members.Add(new MappingMember("code", "not an identifier"));
+        bool threw = false;
+        try {
+            GenMapping.Emit(bad_spec);
+        } catch (MappingException e) {
+            threw = e.error == MappingError.InvalidSpec;
+        }
+        if (!threw) {
+            Console.WriteLine("FAIL: an invalid spec did not raise InvalidSpec");
+            fail++;
+        }
+
+        if (fail == 0) {
+            Console.WriteLine("ALL MAPPING GEN TESTS PASSED");
+        }
+    }
+}
