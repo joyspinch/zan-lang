@@ -819,3 +819,19 @@
 - 剩下：parser 侧的改写（`ValueTask` 拼写、接口声明补 `async` 标记）与它配套
   的后端标记（ngen 路径）——要动 ngen，而 ngen 路径没有差分门覆盖，先给它补
   一条最小回归门再动，不能盲改。
+### [x] A418 自举的程序入口没初始化协程调度器——宿主在 `emit_main` 里调 `zan_co_sched_init`
+
+- 现象：宿主在程序入口调 `zan_co_sched_init`（`src/compiler/irgen_emit.c:132`），
+  自举的 `GenMainWrapper` 没有这一句。
+- ⚠ 查清了一件容易搞错的事：自举产物里的 `zan_co_sched_init` 是**自举自己发的
+  弱符号**（`irgen_async.zan` 的 `EmitAsyncPumpReady`），而自举运行时对象
+  （`build/zanrt_shd_rt_io.obj` 等）**没有 `zan_co_*` 强符号**（`llvm-nm
+  --defined-only` 查过），所以在自举侧这句调用今天只重置自举自己的调度器状态
+  ——**结构对齐，不是行为修复**。压测佐证：同一个探针（`p_task6`）在有/无这行
+  时输出逐字相同（各 200 次、0 挂起）。
+- ✅ 已修（2026-10-20）：`irgen_async.zan` 的 `GenMainWrapper` 补上这一句，注释
+  写清两种链接情形。差分门 33 passed / 1 gap / 4 rejected / 0 failures；固定点
+  门 g2.ll == g3.ll（18084544 bytes）。
+- 真正生效的时机：等 A385（帧布局对齐 `zan_co_fhdr`）后链接完整运行时，强符号
+  胜出，这句才真的装上 timer ready hook（`src/runtime/rt_io.c:4242`），把延迟帧
+  重新入队而不是在定时器线程上直接恢复（`src/runtime/rt_timer.c:729`）。
