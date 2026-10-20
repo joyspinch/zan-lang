@@ -2098,6 +2098,7 @@ public class Parser {
                 blk.Add(ret);
                 member.d = blk;
                 Expect(TK.Semicolon());
+                DesugarAsyncTaskReturn(member);
                 return member;
             }
             if (At(TK.LBrace())) { member.d = ParseBlock(); }
@@ -2109,6 +2110,7 @@ public class Parser {
             } else if (entry != "") {
                 member.sval2 = entry;
             }
+            DesugarAsyncTaskReturn(member);
             return member;
         }
         // property:  T Name { get; set; } | { get {..} set {..} } | => expr;
@@ -2130,6 +2132,33 @@ public class Parser {
         }
         Expect(TK.Semicolon());
         return member;
+    }
+
+    // The C host's parser (src/compiler/parser.c: desugar_async_task_method)
+    // does two rewrites for a method whose return type is Task/ValueTask:
+    //   * `async` or no body -> the method is an async method (the async
+    //     marker is added even when the keyword is missing -- an interface
+    //     method without a body is an async method too), and the task-shaped
+    //     return type carries the result;
+    //   * the name "ValueTask" -> "Task" (the host's binder does not know
+    //     "ValueTask" at all -- only "Task" -- so the name must not reach
+    //     it).
+    // The self-hosted parser does the same two rewrites, so an async method
+    // looks the same to the checker and to both backends. The async marker
+    // matters for a call through an interface: the call site decides "this
+    // is a coroutine call" from the *declared* method, and an interface
+    // method has no body -- without the marker the await would refuse the
+    // call ("this operand is not lowered as a coroutine frame").
+    void DesugarAsyncTaskReturn(Node m) {
+        if (m == null || m.type == null) { return; }
+        bool isTask = m.type.sval == "Task" || m.type.sval == "ValueTask";
+        if (!isTask) { return; }
+        bool isAsyncM = HasModBit(m.mods, MOD.Async());
+        // a plain method (not async, with a body): the host leaves the name
+        // alone, and its binder reports "undefined type 'ValueTask'"
+        if (!isAsyncM && m.d != null) { return; }
+        if (!isAsyncM) { m.mods = m.mods + MOD.Async(); }
+        if (m.type.sval == "ValueTask") { m.type.sval = "Task"; }
     }
 
     Node ParseConversionOperator(int mods) {

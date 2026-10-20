@@ -822,7 +822,7 @@
   `task_run_action_handle`（宿主能跑、自举还没有 Task API 的降级），按
   **已知缺口**记账而不是假装通过。
 
-### [ ] A417 自举的 parser 缺宿主的 `desugar_async_task_method`——`ValueTask` 拼写与接口的 Task 形状没被改写
+### [x] A417 自举的 parser 缺宿主的 `desugar_async_task_method`——`ValueTask` 拼写与接口的 Task 形状没被改写
 
 - 现象：宿主在**解析期**就把 async 方法的返回类型改写掉
   （`src/compiler/parser.c:3375` `desugar_async_task_method`）：
@@ -846,9 +846,27 @@
      double 槽里成了指针，clang 直接拒（`'%t8' defined with type 'ptr' but
      expected 'double'`）。用例 `tests/conformance/async_task_result.zan`
      钉住（进了差分门）。
-- 剩下：parser 侧的改写（`ValueTask` 拼写、接口声明补 `async` 标记）与它配套
-  的后端标记（ngen 路径）——要动 ngen，而 ngen 路径没有差分门覆盖，先给它补
-  一条最小回归门再动，不能盲改。
+- ✅ 已修（2026-10-20）：自举的 parser 补上这一步的**可观察部分**，但不照抄
+  宿主的改写方式：
+  1. `ValueTask` → `Task`（只对 async 或无方法体的方法；普通方法照旧报
+     "undefined type 'ValueTask'"，与宿主逐字一致）；
+  2. 给"无方法体 + Task 形状返回类型"的方法补 `MOD.Async()` 标记（接口/抽象
+     声明也是 async 方法，宿主就是这么判的：`body == NULL` 也算）。
+  **不改写返回类型**（宿主改成元素类型并用 `is_task_return` 标记传给后端）：
+  自举的检查器与 IR 后端本来就按"声明类型是 Task 形状"取元素类型
+  （`TaskElemTy` / `AsyncElemTyOf`），改写返回类型会把调用点的类型也一起改，
+  动静更大。保留类型名还顺带保住了 ngen——`IsTaskShapedRetNg` 靠类型名认
+  形状，不用换成看标记。
+  3. IR 后端补一处：`EmitVirtualCall`（接口/虚方法调用）原来不标 async 调用，
+     await 会拒收这个操作数（"this operand is not lowered as a coroutine
+     frame"）；现在与非虚的 `EmitInstanceCall` 一样标帧指针。
+- 用例：`tests/conformance/async_valuetask.zan`（宿主与自举都输出 q=49）与
+  `tests/conformance/async_interface_task.zan`（都输出 v=7），都进了差分门；
+  反例 `tests/selfhost/reject/valuetask_not_async.zan` 钉住 "undefined type
+  'ValueTask'"（两侧同一句）。
+- 验证：差分门 39 passed / 0 gaps / 8 rejected / 0 failures；固定点门
+  g2.ll == g3.ll（18300740 bytes）。ngen 路径只做了**冒烟**（能编出非空 .obj、
+  没崩），它没有差分门覆盖，接口 + async 的组合在 ngen 侧仍未验证。
 ### [x] A418 自举的程序入口没初始化协程调度器——宿主在 `emit_main` 里调 `zan_co_sched_init`
 
 - 现象：宿主在程序入口调 `zan_co_sched_init`（`src/compiler/irgen_emit.c:132`），

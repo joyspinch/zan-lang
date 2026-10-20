@@ -694,3 +694,29 @@ kernel32、shell32、user32、advapi32、version）。
 - 探针法：先把同一批程序在**宿主**上跑一遍，拿到"措辞 + 行列 + 条数"三样
   基准真值，再照着改自举——只盯着措辞改会漏掉位置和条数，**这三条一起
   才叫逐字一致**。
+
+## 38. async 形状在**解析期**就定形：ValueTask 与"没方法体的 Task 返回类型"
+
+- 坑（2026-10-20 实测）：自举的 parser 不做宿主那步定形，于是两个形状对不上：
+  1. `async ValueTask<int>`：宿主在 `desugar_async_task_method` 里把它改写掉，
+     `ValueTask` 这个名字**从来不需要进 binder**（宿主的 binder 只认 `Task`）；
+     自举不认这个名字 → 报 "undefined type 'ValueTask'"。
+  2. **接口上的 `Task<int> GetAsync();`**（没有方法体）：宿主也把它当 async
+     方法（`body == NULL` 也算，补 async 标记），于是经接口调用拿到的是协程
+     帧；自举没补 → 调用点不认为这是协程调用 → await 报 "this operand is not
+     lowered as a coroutine frame"。
+- 做法（自举的取舍：**不改写返回类型**，只做两件事）：
+  - `ValueTask` → `Task`（仅限 async 或无方法体的方法；普通方法照旧报
+    "undefined type 'ValueTask'"，与宿主逐字一致）；
+  - 给"无方法体 + Task 形状返回类型"的方法补 `MOD.Async()` 标记。
+  保留 `Task<T>` 这个声明类型（不像宿主那样改写成元素类型），因为自举的检查器
+  与后端已经按"声明类型是 Task 形状"取元素类型（`TaskElemTy` / `AsyncElemTyOf`），
+  改写反而要把**调用点**的类型也一起改（宿主为此专门有 `is_task_return` 标记）。
+  **保留类型名还顺带保住了 ngen**：`IsTaskShapedRetNg` 靠类型名认形状，不必
+  换成看标记。
+- 坑：**虚调用（接口/虚方法）也可能是协程调用**。自举的 `EmitVirtualCall`
+  原来只按普通调用发射，返回值不标 `asyncCall` → await 拒收。非虚的 async
+  调用走 `EmitInstanceCall`，那里有 `AsyncFrame(...)` 标帧指针；虚调用要补
+  同样的标记（帧指针 + `__task` 伪类型）。
+- 探针法：这类形状**必须**两侧都跑同一个程序对拍——"宿主能编译运行、自举
+  报错"这种分歧只看编译日志容易漏。
