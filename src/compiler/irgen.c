@@ -333,6 +333,7 @@ static void di_declare_var(zan_irgen_t *g, zan_istr_t name, LLVMValueRef storage
 #define ZAN_DI_ATE_UTF       0x10u
 
 static bool class_has_virtual_methods(zan_symbol_t *sym);
+static int class_vptr_offset(zan_symbol_t *sym);
 static bool field_member_is_static(zan_symbol_t *m);
 static unsigned long abi_size_of(LLVMTypeRef t);
 static unsigned long abi_align_of(LLVMTypeRef t);
@@ -575,7 +576,7 @@ static LLVMMetadataRef di_class_composite(zan_irgen_t *g, zan_type_t *t,
     rec->building = 1;
 
     int nslots = e->field_count;
-    int vptr = class_has_virtual_methods(sym) ? 1 : 0;
+    int vptr = class_vptr_offset(sym);
     LLVMMetadataRef *members =
         (LLVMMetadataRef *)calloc((size_t)(nslots > 0 ? nslots : 1),
                                   sizeof(LLVMMetadataRef));
@@ -3270,8 +3271,28 @@ static LLVMValueRef promote_loaded(zan_irgen_t *g, LLVMValueRef v,
 
 
 static bool class_has_virtual_methods(zan_symbol_t *sym);
+static bool decl_is_explicit_layout(zan_symbol_t *sym);
+
+/* 类布局里的 vptr 槽：类一律在 0 号槽留一个指针位。
+ *
+ * 为什么要"一律"：继承链上只要有一处不一致，同一个字段就会有两套下标。
+ * 以前 vptr 槽只在"本类或祖先有多态"时才留，于是
+ *     Base（无接口、无虚方法 → 无 vptr）
+ *     Derived : Base, IFace（实现了接口 → 有 vptr）
+ * 两条布局里 Base 的字段一个在下标 0、一个在下标 1：基类构造器把字段写
+ * 进了派生对象的 vptr 槽，基类方法读到的也是错位的槽位——派生类一继承
+ * 基类就坏（字段读到垃圾，ARC 释放也漏掉基类字段）。
+ *
+ * 类一律留这个槽之后，"这条链上有没有多态"就不再影响字段偏移：基类与
+ * 派生类对同一批字段给出同一个下标，跨模块（包的基类 + 应用的派生类）
+ * 也对得上。结构体是值类型，没有 vptr 槽；显式布局类型自己给偏移，
+ * 同样不留。
+ */
 static int class_vptr_offset(zan_symbol_t *sym) {
-    return class_has_virtual_methods(sym) ? 1 : 0;
+    if (!sym) return 0;
+    if (sym->kind == SYM_STRUCT) return 0;
+    if (decl_is_explicit_layout(sym)) return 0;
+    return 1;
 }
 
 static LLVMTypeRef get_struct_llvm_type(zan_irgen_t *g, zan_symbol_t *sym) {
@@ -3529,7 +3550,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
             !field_member_is_static(sym->members[i])) field_count++;
     }
 
-    int vptr = class_has_virtual_methods(sym) ? 1 : 0;
+    int vptr = class_vptr_offset(sym);
     LLVMTypeRef *field_types = (LLVMTypeRef *)calloc((size_t)(field_count + vptr), sizeof(LLVMTypeRef));
     int fi = 0;
     if (vptr) {
@@ -3558,7 +3579,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
                                                    sizeof(unsigned long));
     unsigned long size = 0, align = 1;
     int slot = vptr;
-    if (vptr) {
+    if (class_has_virtual_methods(sym)) {
         zan_diag_emit(g->diag, DIAG_ERROR, sym->decl ? sym->decl->loc : zan_loc(0, 0, 0, 0),
                       "explicit-layout type '%.*s' cannot have virtual methods",
                       (int)sym->name.len, sym->name.str);

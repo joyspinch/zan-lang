@@ -59,6 +59,23 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `Widget.Tooltip.Flush` 这类嵌套访问会被误杀。回归用例：
      `tests/diag/qualified_name_wrong_namespace.zan`（必须编译失败）+
      `tests/conformance/qualified_name_namespace.zan`（合法限定名仍能解析）。
+7. **重载分解只有一处规则：checker 与 irgen 必须共用**：
+   - 动作：重载候选的打分与取舍规则抽到**共享**位置
+     （`src/compiler/binder.c` 的 `zan_null_arg_score`），checker
+     （`checker_find_method_typed`）与 irgen（`irgen_expr_core.c` 的
+     `concrete_arg_score`）都调它；null 字面量只能绑到引用类型/可空类型
+     形参，值类型形参判为不兼容。
+   - 理由：两侧各自分解一次、规则还不一致时，**静默走错重载**：
+     `Arg.Text(null)`（Text 有 int/long/double/bool/string 五个重载）以前会
+     走到 `Text(int)`——checker 侧按 null 的静态类型（object）打分、irgen 侧
+     对 null 推断不出类型一律给 0 分，于是"第一个重载"（值类型）赢了，null
+     被当成 0 传下去。调用点看不出任何异常，断言却永远对不上。
+   - 边界：null 的静态类型是 `object`（`checker.c` 的 `AST_NULL_LITERAL`
+     分支），所以判据是"**形参能不能接住 null**"，不是实参的静态类型；
+     值类型形参接 null 必须在编译期报错（`tests/diag/null_to_value_type.zan`），
+     不能等到运行期变成 0。`object` / `T?` 形参接得住 null。
+     实例：`Arg.Text(null)` 与 `Overloads.Of(null)` 两条曾同时走错
+     （`tests/conformance/null_overload_resolution.zan` 钉住正解）。
 
 ---
 
@@ -249,6 +266,23 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      份代码 10 次编译崩 1 次）。
    - 边界：任何"先记下元素指针、递归之后再解引用"的写法都要复查；**间歇性**
      崩溃（同样输入时好时坏）优先怀疑缓存/表条目的生命周期，而不是随机性。
+22. **类布局的 vptr 槽必须整条继承链统一**：
+   - 动作：`class_vptr_offset`（`src/compiler/irgen.c`）对**所有类**一律返回
+     1（0 号槽留指针位），结构体返回 0，显式布局类型自己给偏移也不留；
+     虚表仍然只在"本类或祖先多态"时才发（`class_has_virtual_methods`），
+     但**布局**不再看多态。自举侧同步：`src/selfhost/irgen.zan` 的
+     `FieldBase` 与 `EmitStruct` 同样按"类一律留槽"改。
+   - 理由：vptr 槽以前只在多态类里留，于是 `Base`（无接口无虚方法）与
+     `Derived : Base, IFace`（实现了接口）给**同一个字段**两套下标
+     （0 vs 1）：基类构造器把字段写进了派生对象的 vptr 槽，派生类读到的
+     却是垃圾（实测 `d.count=-724564432`），ARC 释放也漏掉基类那份字段
+     （泄漏报告指向基类的 `new`）。派生类一继承基类就坏。
+   - 边界：字段下标只能有一个来源（`get_field_index` / `class_vptr_offset`），
+     结构体类型注册（`register_struct_type`）、调试信息、ARC 释放函数
+     （`irgen_arc.c`）、反射（`irgen_reflect.c`）都必须跟着它走；漏一处
+     就又是一处错位。判定器：`tests/conformance/inherit_interface_layout.zan`
+     （基类字段在派生实例上的读写 + 基类方法 + 接口分派），泄漏档与
+     arcguard 档同源覆盖。
 
 ---
 
