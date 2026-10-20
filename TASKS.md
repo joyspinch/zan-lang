@@ -46,6 +46,28 @@
   对齐），然后自举就可以只保留"弱回退"、让发行版运行时接管——那才是与 C 宿主
   同构的终局。改动面：`irgen_async.zan` 的 `GenAsyncMethod` 全部槽位下标、
   `EmitAsyncComplete`/`EmitAwait`/`__zan_async_unwind` 的字段访问、以及帧的分配大小。
+- 布局对照（2026-10-20 实测，权威在 `src/compiler/irgen_expr_core.c:36-48` 的
+  `ASYNC_FRAME_*` 枚举 + `irgen.c:2224-2236` 的 `co_hdr_fields`）：
+  | 下标 | 字段 | 类型 | 偏移 |
+  |---|---|---|---|
+  | 0 | `SCHED` | i64 | 0 |
+  | 1 | `SCHED_STEP` | ptr | 8 |
+  | 2 | `STATE` | i32 | 16 |
+  | 3 | `DONE` | i32 | 20 |
+  | 4 | `AWAITER` | ptr | 24 |
+  | 5 | `AWAITER_STEP` | ptr | 32 |
+  | 6 | `RESULT` | i64 | 40 |
+  | 7 | `CLEANUP` | ptr | 48 |
+  | 8 | `HCOUNT` | i32 | 56 |
+  | 9 | `SELF_STEP` | ptr | 64 |
+  | 10 | `EXC` | i64 | 72 |
+  | 11 | `EXC_TID` | i32 | 80 |
+  ……共 16 个字段（`co_hdr_fields`），之后才是 this/参数/局部/子任务槽。
+  运行时把这套布局**写死**了：`src/runtime/rt_timer.c:1021` 的
+  `JOIN_OFF_DONE = 12 + sizeof(void*)`（=20）配两条 `_Static_assert` 钉住
+  `state`/`done` 的偏移——帧布局一动，运行时与后端必须同时改。
+  自举的帧现在是**扁平 i64 数组**（头 8 槽），要改成同构的 struct，槽位访问
+  全部从 `getelementptr i64` 换成 `getelementptr %struct`。
 - ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
   差分门的 `diff_known_gaps.txt` 也要同步。
 
@@ -517,7 +539,7 @@
   double 分支都改走它；`builtin_surface` 用例里 `acos=1.5707963267948966`
   与宿主逐字一致。
 
-### [ ] A408 HTTP/2 帧 API 在仓库里根本不存在——三个类型一个都找不到
+### [x] A408 HTTP/2 帧 API 在仓库里根本不存在——三个类型一个都找不到
 
 - 现象：`conformance_http2_frame_test` 与 `conformance_protocol_audit_harden`
   的 http2 段编译失败，报 `cannot resolve member 'REFUSED_STREAM'` /
@@ -529,6 +551,21 @@
   帧类型枚举 + 错误码枚举）并让两个用例引用它；(2) 若判定 HTTP/2 不在本期范围，
   把两处用例的 http2 段摘掉并把帧 API 登记为未实现（与 A381 的清单同口径）。
 - ⚠ 不要用"给用例补个桩类型"绕过：那是让用例测一个假实现。
+- ✅ 已修（2026-10-20）。复查发现登记时的结论**已经过期**：帧编解码其实早就
+  落地了（`packages/Zan.Net/src/System/Net/Http/Http2Frame.zan` +
+  `Models/Http2FrameType.zan`、`Models/Http2Flags.zan`、`Models/Http2Settings.zan`），
+  真正缺的是**错误码类型**——`Models/Http2Error.zan` 这个文件存在，**但文件
+  是空的**（只有 `using System;` + `namespace System.Net.Http;`），类型从没被
+  写出来；连带 `Http2Flags.zan` 末尾还挂着一句本该属于它的注释
+  （"HTTP/2 标准错误码（RFC 7540 §7）"）——清理机械模板注释那轮把这段内容
+  冲掉了，只剩壳。
+- 修法：按 RFC 9113 §7 补齐 `Http2Error`（14 个错误码常量，NO_ERROR=0x0 …
+  HTTP_1_1_REQUIRED=0xd），并把 `Http2Flags.zan` 末尾的错位注释删掉。
+  不是给用例补桩——`RST_STREAM`/`GOAWAY` 帧本来就按 RFC 编码错误码，这里补的
+  是缺失的标准常量表。
+- 验证：`zanc` 单独编译两条用例后逐行比对基准**完全一致**
+  （`http2_frame_test` → `HTTP/2 framing test passed!`；
+  `protocol_audit_harden` → `ALL_PROTOCOL_AUDIT_OK`）。
 
 ### [x] A409 X509 证书匹配"无 SAN 时回退 CN"与用例口径不符
 
