@@ -26,6 +26,17 @@ Common ones:
   null (or `?.`) before using it.
 * unknown member → the API does not exist as written: `zan_api_search` it.
 
+### `out` parameters: the call site must spell `out`, and don't overload on them
+
+* A method with an `out` parameter must be called as `f(a, out b)`. Calling
+  `f(a, b)` passes by value: the write-back lands on a temporary and the
+  program faults **at the call expression** — the callee's body never runs,
+  so the stack trace points at the caller, not at the real culprit.
+* **Do not overload a method on the presence of `out`.** Zan overload
+  resolution with `out` parameters is unreliable. Give the variant a distinct
+  name instead (`IsBlocked` / `IsBlockedWithUnit`) rather than relying on
+  overload resolution to pick the right one.
+
 ## 2. Runtime behaviour
 
 Build and run it: `run_command("build/app")`. Print state at the boundary you
