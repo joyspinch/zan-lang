@@ -1,0 +1,195 @@
+using System;
+using Game.Pathfinding;
+
+// 距离场（DistanceField）与索引堆（IndexedHeap）契约测试。
+//
+// DistanceField 的代价语义是"离开一格的代价"：路径代价 = 沿途各格（不含终点）的代价。
+// 这里把语义锁死——它与工厂自动化的敌军寻路（离开代价 = 该格建筑血量加权）同源，
+// 换成"进入代价"会改变最优树的平局取舍。
+public class FlowFieldTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static bool IsFinite(double value) {
+        return value < double.PositiveInfinity;
+    }
+
+    // 从任意格沿 nextCell 走，能不能走到源格。
+    private static bool WalkReachesSource(DistanceField field, int x, int y, int sourceIndex) {
+        int index = field.Index(x, y);
+        int steps = 0;
+        while (index != sourceIndex) {
+            int next = field.nextCell[index];
+            if (next < 0) { return false; }
+            index = next;
+            steps = steps + 1;
+            if (steps > field.width * field.height + 4) { return false; }
+        }
+        return true;
+    }
+
+    /* ---------- 空旷网格：距离 = 离开代价累加 ---------- */
+    private static void TestOpenGrid() {
+        // 4 x 3 全通，每格离开代价 10，源在左上角。
+        double[] costs = new double[12];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 10.0; }
+        DistanceField field = new DistanceField(4, 3);
+        field.Compute(costs, 0);
+
+        Check("open distance to source", field.DistanceAt(0, 0) == 0.0);
+        // 曼哈顿距离 3 步 → 离开代价 10 × 3 = 30（不含终点那一格）。
+        CheckNear("open distance", field.DistanceAt(3, 0), 30.0, 0.0001);
+        CheckNear("open distance row", field.DistanceAt(0, 2), 20.0, 0.0001);
+        Check("open next step", field.NextAt(1, 0) == field.Index(0, 0));
+        Check("open walk reaches source", WalkReachesSource(field, 3, 2, 0));
+    }
+
+    /* ---------- 离开代价语义：距离不含终点那一格 ---------- */
+    private static void TestLeaveCostSemantics() {
+        // 一行三格，源在右端 (2,0)；离开代价 5 / 1 / 1。
+        double[] costs = new double[3];
+        costs[0] = 5.0; costs[1] = 1.0; costs[2] = 1.0;
+        DistanceField field = new DistanceField(3, 1);
+        field.Compute(costs, 2);
+
+        Check("leave source distance zero", field.DistanceAt(2, 0) == 0.0);
+        // (1,0) 由 (2,0) 走来，付的是**离开** (2,0) 的代价 1。
+        CheckNear("leave cost of source cell", field.DistanceAt(1, 0), 1.0, 0.0001);
+        // (0,0) 再付离开 (1,0) 的代价 1，合计 2——终点 (0,0) 自己的 5 不计入。
+        CheckNear("leave cost excludes target", field.DistanceAt(0, 0), 2.0, 0.0001);
+    }
+
+    /* ---------- 墙：不可通行格被绕开 ---------- */
+    private static void TestWalls() {
+        // 5 x 1：中间 (2,0) 是墙，源在左端。
+        double[] costs = new double[5];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 1.0; }
+        costs[2] = -1.0;
+        DistanceField field = new DistanceField(5, 1);
+        field.Compute(costs, 0);
+
+        Check("wall blocks", !field.IsReachable(2, 0));
+        Check("wall blocks distance", !IsFinite(field.DistanceAt(2, 0)));
+        Check("wall blocks next", field.NextAt(2, 0) == -1);
+        Check("wall cuts the row", !field.IsReachable(3, 0));
+        Check("wall does not block near side", field.IsReachable(1, 0));
+    }
+
+    /* ---------- 绕行：贵的格子要被绕开 ---------- */
+    private static void TestExpensiveDetour() {
+        // 3 x 3：只有正中间那格代价 100，源在右下角。
+        double[] costs = new double[9];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 1.0; }
+        costs[4] = 100.0;
+        DistanceField field = new DistanceField(3, 3);
+        field.Compute(costs, 8);
+
+        // 从 (0,0) 到源：沿左边两列绕 4 步 = 4；穿中间那格要付 100。
+        CheckNear("expensive detour distance", field.DistanceAt(0, 0), 4.0, 0.0001);
+        // 两条等价路线（经 (1,0) 或 (0,1)）代价相同，平局按格号小者在前——
+        // 确定性由"键相同比格号"的排序规则保证。
+        Check("expensive detour next", field.NextAt(0, 0) == field.Index(1, 0));
+        Check("expensive walk reaches source", WalkReachesSource(field, 0, 0, 8));
+    }
+
+    /* ---------- 源被围死：其余格都不可达 ---------- */
+    private static void TestSourceWalledIn() {
+        double[] costs = new double[9];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 1.0; }
+        // 源在 (1,1)，四邻全封。
+        costs[1] = -1.0; costs[3] = -1.0; costs[5] = -1.0; costs[7] = -1.0;
+        DistanceField field = new DistanceField(3, 3);
+        field.Compute(costs, 4);
+
+        Check("walled source itself", field.DistanceAt(1, 1) == 0.0);
+        Check("walled source isolates", !field.IsReachable(0, 0));
+        Check("walled source isolates far", !field.IsReachable(2, 2));
+    }
+
+    /* ---------- 确定性：同一输入两次结果一致 ---------- */
+    private static void TestDeterminism() {
+        int w = 12;
+        int h = 12;
+        double[] costs = new double[w * h];
+        for (int i = 0; i < costs.Length; i = i + 1) { costs[i] = 1.0 + (i % 7); }
+        for (int y = 0; y < h; y = y + 1) {
+            if (y % 4 != 0) { costs[y * w + 5] = -1.0; }
+        }
+        DistanceField first = new DistanceField(w, h);
+        DistanceField second = new DistanceField(w, h);
+        first.Compute(costs, 0);
+        second.Compute(costs, 0);
+
+        bool same = true;
+        for (int i = 0; i < first.nextCell.Length; i = i + 1) {
+            if (first.nextCell[i] != second.nextCell[i]) { same = false; }
+            if (first.distance[i] != second.distance[i]) { same = false; }
+        }
+        Check("deterministic field", same);
+    }
+
+    /* ---------- 索引堆：decrease-key 后仍按键序弹出 ---------- */
+    private static void TestIndexedHeap() {
+        IndexedHeap heap = new IndexedHeap(8);
+        heap.Push(3, 30.0);
+        heap.Push(1, 10.0);
+        heap.Push(2, 20.0);
+        Check("heap not empty", !heap.IsEmpty());
+        Check("heap count", heap.Count() == 3);
+
+        // 把 3 的键降到 5 → 它应该第一个弹出。
+        heap.DecreaseKey(3, 5.0);
+        Check("heap decrease key pops first", heap.Pop() == 3);
+        Check("heap second", heap.Pop() == 1);
+        Check("heap third", heap.Pop() == 2);
+        Check("heap drained", heap.IsEmpty());
+
+        // 键相同按元素序号定序：小序号在前。
+        IndexedHeap tie = new IndexedHeap(8);
+        tie.Push(7, 1.0);
+        tie.Push(4, 1.0);
+        tie.Push(5, 1.0);
+        Check("heap tie order 1", tie.Pop() == 4);
+        Check("heap tie order 2", tie.Pop() == 5);
+        Check("heap tie order 3", tie.Pop() == 7);
+
+        // 弹出即定型：之后再给更小的键也不该回到堆里。
+        IndexedHeap settled = new IndexedHeap(8);
+        settled.Push(1, 10.0);
+        settled.Pop();
+        settled.Push(1, 1.0);
+        Check("heap settled stays out", settled.IsEmpty());
+    }
+
+    public static void Main() {
+        TestOpenGrid();
+        TestLeaveCostSemantics();
+        TestWalls();
+        TestExpensiveDetour();
+        TestSourceWalledIn();
+        TestDeterminism();
+        TestIndexedHeap();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL FLOWFIELD TESTS PASSED");
+        } else {
+            Console.WriteLine("FLOWFIELD FAILURES: " + failures.ToString());
+        }
+    }
+}

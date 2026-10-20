@@ -1,7 +1,7 @@
 # Game.Pathfinding
 
-`Game.Pathfinding` 是网格寻路层：加权 A*、跳跃点搜索（JPS）、视线拉直与
-导航网格（漏斗平滑）。
+`Game.Pathfinding` 是网格寻路层：加权 A*、跳跃点搜索（JPS）、视线拉直、
+导航网格（漏斗平滑）与**加权距离场**。
 
 它与仓库里已有的两处寻路是**互补**而不是重复：
 
@@ -19,7 +19,41 @@
 | 跳跃点搜索 | `Jps.Find(map, start, goal)` | 均匀代价网格上比 A* 少一个数量级的展开节点 |
 | 视线拉直 | `PathSmoother.Smooth(map, path)` | 去掉可以直连的中间点（严格不切角） |
 | 导航网格 | `NavMesh.Build(map)` + `FindPath(start, goal)` | 凸矩形分解 + 门图 A* + 漏斗平滑折线 |
+| 加权距离场 | `DistanceField.Compute(costs, source)` | 一次 Dijkstra 算出全图梯度：每格的最短代价 + 朝源一步的指针 |
+| 索引堆 | `IndexedHeap` | 带 decrease-key 的最小堆（Dijkstra 松弛用；`OpenHeap` 是惰性入堆那一版） |
 | 门面 | `Pathfinding.FindPath` / `FindPathJps` / `FindNavPath` | 常用组合的一行调用 |
+
+## 距离场（DistanceField）
+
+一群单位共享同一个目的地时（塔防怪群、工厂自动化的敌军、割草的小怪），
+每人各跑一次 A* 是 N 倍浪费。距离场算一次全图梯度，个体 O(1) 查表就知道往哪走。
+
+```zan
+using Game.Pathfinding;
+
+// costs[i] = 离开第 i 格的代价；负数表示不可通行（岩/水/墙）。
+double[] costs = new double[width * height];
+// ...按玩法填代价...
+
+DistanceField field = new DistanceField(width, height);
+field.Compute(costs, sourceIndex);
+
+// 每格查表：下一格朝源走一步；DistanceAt 给到源的累计代价。
+int next = field.NextAt(cellX, cellY);
+```
+
+代价语义是**离开一格**的代价：路径代价 = 沿途各格（不含终点）的代价之和。
+"离开"而不是"进入"，是因为离开代价天然表达"挤在一格上的单位互相拖累"
+（巷口窄、门只有一格宽）——工厂自动化里敌军宁可绕远也不钻建筑就靠这一项加权。
+
+与 `Game.Tactics.FlowField` 的分工：
+
+| | `DistanceField`（本包） | `Game.Tactics.FlowField` |
+|---|---|---|
+| 目标 | **最优代价**（加权最短路） | 大致方向（不保证最优） |
+| 输出 | 每格的距离 + 下一格指针 | 每格的方向向量 |
+| 算法 | Dijkstra（decrease-key 堆） | 波前扩散 + 八邻取优 |
+| 适合 | 少量共享目标的加权决策（敌军绕建筑） | 千万单位只要个朝向（红警怪群） |
 
 ## 用法
 
@@ -49,6 +83,7 @@ List<Point2> polyline = Pathfinding.FindNavPath(mesh, new Point2(0.5, 0.5), new 
   运行时字典。
 - **确定性**：开放表是自带的二叉堆，优先级相同时按次级键（h）再按入堆
   顺序打破平局；同样的地图与起终点必然给出同一条路径（回放 / 锁步的前提）。
+  距离场的堆按"键相同比格号"定序，同一份输入必然给出同一棵最短路径树。
 - **JPS 只在均匀代价网格上成立**：非均匀代价时 `Jps.Find` 自动退回 A*——
   JPS 的剪枝规则在非均匀代价下不成立，硬用会给出次优路径。
 - **JPS 不切角**：对角移动要求两个正交邻格都可通行，跳跃扫描同样遵守。
@@ -66,6 +101,9 @@ List<Point2> polyline = Pathfinding.FindNavPath(mesh, new Point2(0.5, 0.5), new 
 
 ## 契约测试
 
-`tests/conformance/pathfinding_grid.zan` 覆盖：A* 的代价与形状、绕墙、
-加权地形、JPS 与 A* 的路径长度一致且展开节点更少、不可达、确定性、
-视线拉直不穿墙、导航网格路径必经缺口。
+- `tests/conformance/pathfinding_grid.zan`：A* 的代价与形状、绕墙、
+  加权地形、JPS 与 A* 的路径长度一致且展开节点更少、不可达、确定性、
+  视线拉直不穿墙、导航网格路径必经缺口。
+- `tests/conformance/pathfinding_flowfield.zan`：距离场的离开代价语义、
+  墙阻断、加权绕行、源被围死、确定性，以及索引堆的 decrease-key、
+  平局定序与"弹出即定型"。

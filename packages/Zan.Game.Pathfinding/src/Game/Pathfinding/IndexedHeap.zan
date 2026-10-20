@@ -1,0 +1,159 @@
+namespace Game.Pathfinding;
+
+// 索引最小堆：元素是 0..N-1 的整数（当作"格号"），键是 double，支持 decrease-key。
+//
+// 与 OpenHeap 的分工：
+//   - OpenHeap：惰性入堆——同一节点可以重复入堆，弹出时靠"键已陈旧"丢弃。
+//     A* / JPS 用这种写法最省事。
+//   - IndexedHeap：每个元素在堆里至多出现一次，键变小时就地降位（decrease-key），
+//     不产生陈旧条目。Dijkstra 这类"距离松弛"算法用它：松弛次数是 O(边数)，
+//     惰性入堆会让堆长到 O(边数)，decrease-key 把堆稳在 O(格数)。
+//
+// 排序规则：先比键；键相同比元素序号（小在前）。所以同一张图、同一份输入，
+// 展开顺序是确定的——回放 / 锁步的前提。
+public class IndexedHeap {
+    private int[] items;
+    private double[] keys;
+    // 元素 → 堆内下标。-1 = 从未入堆；-2 = 已弹出（已定型，不再参与松弛）。
+    private int[] positions;
+    private int count;
+
+    public IndexedHeap(int capacity) {
+        if (capacity < 16) { capacity = 16; }
+        this.items = new int[capacity];
+        this.keys = new double[capacity];
+        this.positions = new int[capacity];
+        for (int i = 0; i < this.positions.Length; i = i + 1) { this.positions[i] = -1; }
+        this.count = 0;
+    }
+
+    public bool IsEmpty() { return this.count == 0; }
+    public int Count() { return this.count; }
+
+    // 元素是否还在堆里。
+    public bool Contains(int item) {
+        if (item < 0 || item >= this.positions.Length) { return false; }
+        return this.positions[item] >= 0;
+    }
+
+    // 元素的当前键；不在堆里返回 0。
+    public double KeyOf(int item) {
+        if (item < 0 || item >= this.positions.Length) { return 0.0; }
+        int at = this.positions[item];
+        if (at < 0) { return 0.0; }
+        return this.keys[at];
+    }
+
+    // 入堆。已在堆里等价于 decrease-key；已弹出（定型）的元素忽略。
+    public void Push(int item, double key) {
+        if (item < 0) { return; }
+        this.EnsureItem(item);
+        int at = this.positions[item];
+        if (at == -2) { return; }
+        if (at < 0) {
+            this.EnsureRoom();
+            at = this.count;
+            this.count = this.count + 1;
+            this.items[at] = item;
+            this.keys[at] = key;
+            this.positions[item] = at;
+        } else {
+            if (key >= this.keys[at]) { return; }
+            this.keys[at] = key;
+        }
+        this.SiftUp(at);
+    }
+
+    // 键变小则降位。键不变大——Dijkstra 的距离只减不增。
+    public void DecreaseKey(int item, double key) {
+        if (item < 0 || item >= this.positions.Length) { return; }
+        int at = this.positions[item];
+        if (at == -2) { return; }
+        if (at < 0) { this.Push(item, key); return; }
+        if (key < this.keys[at]) {
+            this.keys[at] = key;
+            this.SiftUp(at);
+        }
+    }
+
+    // 弹出最小键的元素。弹出即定型：之后再收到更小的键也不重新入堆。
+    public int Pop() {
+        int result = this.items[0];
+        this.positions[result] = -2;
+        this.count = this.count - 1;
+        if (this.count > 0) {
+            int last = this.count;
+            this.items[0] = this.items[last];
+            this.keys[0] = this.keys[last];
+            this.positions[this.items[0]] = 0;
+            this.SiftDown(0);
+        }
+        return result;
+    }
+
+    // 堆内下标 a 是否排在 b 前面：先比键，再比元素序号。
+    private bool Less(int a, int b) {
+        if (this.keys[a] != this.keys[b]) { return this.keys[a] < this.keys[b]; }
+        return this.items[a] < this.items[b];
+    }
+
+    // 交换两个堆槽的元素与键，并同步 positions——漏掉 positions 会让
+    // decrease-key 落到别人的槽上（键改了、元素没改）。
+    private void Swap(int a, int b) {
+        int ea = this.items[a];
+        int eb = this.items[b];
+        this.items[a] = eb;
+        this.items[b] = ea;
+        this.positions[ea] = b;
+        this.positions[eb] = a;
+        double k = this.keys[a];
+        this.keys[a] = this.keys[b];
+        this.keys[b] = k;
+    }
+
+    private void SiftUp(int i) {
+        while (i > 0) {
+            int parent = (i - 1) / 2;
+            if (!this.Less(i, parent)) { break; }
+            this.Swap(i, parent);
+            i = parent;
+        }
+    }
+
+    private void SiftDown(int i) {
+        int n = this.count;
+        while (2 * i + 1 < n) {
+            int left = 2 * i + 1;
+            int right = 2 * i + 2;
+            int smallest = left;
+            if (right < n && this.Less(right, left)) { smallest = right; }
+            if (!this.Less(smallest, i)) { break; }
+            this.Swap(smallest, i);
+            i = smallest;
+        }
+    }
+
+    // 元素编号超出当前容量时扩 positions（新槽位标记为"从未入堆"）。
+    private void EnsureItem(int item) {
+        if (item < this.positions.Length) { return; }
+        int size = this.positions.Length * 2;
+        if (size <= item) { size = item + 1; }
+        int[] grown = new int[size];
+        for (int i = 0; i < this.positions.Length; i = i + 1) { grown[i] = this.positions[i]; }
+        for (int i = this.positions.Length; i < size; i = i + 1) { grown[i] = -1; }
+        this.positions = grown;
+    }
+
+    private void EnsureRoom() {
+        if (this.count < this.items.Length) { return; }
+        int size = this.items.Length * 2;
+        int[] newItems = new int[size];
+        double[] newKeys = new double[size];
+        for (int i = 0; i < this.count; i = i + 1) {
+            newItems[i] = this.items[i];
+            newKeys[i] = this.keys[i];
+        }
+        this.items = newItems;
+        this.keys = newKeys;
+    }
+}

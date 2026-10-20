@@ -1,0 +1,106 @@
+using System;
+
+namespace Game.Pathfinding;
+
+// 加权距离场（distance field）：以一个源格为起点，对整张网格跑一次 Dijkstra，
+// 一次算出每格的"到源最短代价"和"朝源走一步的下一格"。
+//
+// 什么时候用它：
+//   - 一群单位共享同一个目的地（塔防怪群、工厂自动化的敌军、割草游戏的小怪）——
+//     每人各跑一次 A* 是 N 倍浪费；距离场算一次，个体 O(1) 查表就行。
+//   - 需要"每个格子都知道该往哪走"的全局梯度（单位调度、迷雾、热度图）。
+//
+// 什么时候不用它：
+//   - 起终点各不相同、数量不多的查询 → 用 AStar.Find（按需搜，摊销更省）。
+//   - 只需要一个大致方向、不在乎最优代价 → 用 Game.Tactics.FlowField
+//     （波前扩散 + 向量场，千万单位只读方向向量，不查表求最优）。
+//
+// 代价模型：costs[i] 是**离开**第 i 格的通行代价，负数表示不可通行。
+// 路径代价 = 沿途各格（不含终点）的代价之和。
+// 选"离开"而不是"进入"：离开代价天然表达"挤在一格上的单位互相拖累"
+// （巷口窄、门只有一格宽），工厂自动化里敌军宁可绕远也不钻建筑就靠这一项加权。
+//
+// 邻接固定四向（四邻接）。要对角移动请用 AStar（GridMap + AStarOptions）。
+public class DistanceField {
+    public int width;
+    public int height;
+    // 到源的累计代价；不可达为 double.PositiveInfinity。
+    public double[] distance;
+    // 朝源走一步的下一格；-1 = 不可达或已在源上。
+    public int[] nextCell;
+
+    private static int[] s_dx = new int[4] { 0, 1, 0, -1 };
+    private static int[] s_dy = new int[4] { -1, 0, 1, 0 };
+
+    public DistanceField(int width, int height) {
+        this.width = width > 0 ? width : 1;
+        this.height = height > 0 ? height : 1;
+        int total = this.width * this.height;
+        this.distance = new double[total];
+        this.nextCell = new int[total];
+        this.Clear();
+    }
+
+    public int Index(int x, int y) { return y * this.width + x; }
+
+    public bool IsInside(int x, int y) {
+        return x >= 0 && x < this.width && y >= 0 && y < this.height;
+    }
+
+    // 全部复位为"不可达"。
+    public void Clear() {
+        int total = this.width * this.height;
+        for (int i = 0; i < total; i = i + 1) {
+            this.distance[i] = double.PositiveInfinity;
+            this.nextCell[i] = -1;
+        }
+    }
+
+    // 以 sourceIndex 为源重算整张网格。
+    // costs[i] = 离开第 i 格的代价；负数表示不可通行（会被当成墙）。
+    public void Compute(double[] costs, int sourceIndex) {
+        this.Clear();
+        int total = this.width * this.height;
+        if (sourceIndex < 0 || sourceIndex >= total) { return; }
+        IndexedHeap heap = new IndexedHeap(total);
+        this.distance[sourceIndex] = 0.0;
+        heap.Push(sourceIndex, 0.0);
+        while (!heap.IsEmpty()) {
+            int cell = heap.Pop();
+            double leaveCost = costs[cell];
+            if (leaveCost < 0.0) { continue; }
+            // 离开本格的代价：走到任一邻格都先付本格的代价。
+            double next = this.distance[cell] + leaveCost;
+            int cx = cell % this.width;
+            int cy = cell / this.width;
+            for (int d = 0; d < 4; d = d + 1) {
+                int nx = cx + DistanceField.s_dx[d];
+                int ny = cy + DistanceField.s_dy[d];
+                if (!this.IsInside(nx, ny)) { continue; }
+                int neighbor = ny * this.width + nx;
+                if (costs[neighbor] < 0.0) { continue; }
+                if (next >= this.distance[neighbor]) { continue; }
+                this.distance[neighbor] = next;
+                this.nextCell[neighbor] = cell;
+                heap.Push(neighbor, next);
+            }
+        }
+    }
+
+    // 到达 (x, y) 的最短代价；不可达返回正无穷。
+    public double DistanceAt(int x, int y) {
+        if (!this.IsInside(x, y)) { return double.PositiveInfinity; }
+        return this.distance[this.Index(x, y)];
+    }
+
+    // 朝源走一步的下一格；-1 = 不可达或已在源上。
+    public int NextAt(int x, int y) {
+        if (!this.IsInside(x, y)) { return -1; }
+        return this.nextCell[this.Index(x, y)];
+    }
+
+    public bool IsReachable(int x, int y) {
+        if (!this.IsInside(x, y)) { return false; }
+        return this.distance[this.Index(x, y)] < double.PositiveInfinity;
+    }
+}

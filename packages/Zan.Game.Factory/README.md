@@ -24,6 +24,17 @@
 | `ForgeSave.zan` | 版本化存档（v1..v5 兼容）与校验 |
 | `BlockDef.zan` `RecipeDef.zan` `TechDef.zan` `WaveDef.zan` `EnemyDef.zan` `Stock.zan` … | 静态定义与库存结构 |
 
+## 依赖
+
+| 依赖 | 用在哪 |
+|---|---|
+| `Game.Core` | 空间哈希（`SpatialHash2D`）——索敌去重 |
+| `Game.Pathfinding` | `DistanceField`——敌军到炉心的加权距离场（离开代价 = 该格建筑血量加权） |
+
+寻路本身**不在本包实现**：`Zan.Game.Pathfinding` 的距离场是通用件（共享目标的
+加权梯度），这里只负责把"岩/水不可通行、建筑可通行但代价高"翻译成代价数组。
+改寻路语义去改公共包，别在这里再手搓一份堆。
+
 ## 用法
 
 ```zan

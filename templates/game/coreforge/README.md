@@ -105,7 +105,7 @@ cd templates/game/coreforge && ../../coreforge.exe   # 从模板目录运行，.
 | `ForgeWorld.zan` / `ForgeGrid.zan` / `ForgeMap.zan` | 世界状态、网格、地图生成 |
 | `ForgeCatalog.zan` | 目录数据（方块/配方/科技/波次/敌人） |
 | `ForgeFactory.zan` | 生产模拟：钻头/传送带/熔炉/装配机/电力/液体/无人机组装 |
-| `ForgeCombat.zan` | 寻路、波次生成（难度缩放 + 预告公式）、敌人、炮塔/棱镜射击、支援三塔、无人机 AI、敌巢、击杀特效与屏震 |
+| `ForgeCombat.zan` | 寻路（调用 `Game.Pathfinding` 的加权距离场，不自研堆）、波次生成（难度缩放 + 预告公式）、敌人、炮塔/棱镜射击、支援三塔、无人机 AI、敌巢、击杀特效与屏震 |
 | `ForgeSimulation.zan` | 固定步长模拟入口（Factory/Combat 编排 + 事件队列） |
 | `ForgeSave.zan` | JSON 存档/读档（v5 含难度与护盾值，兼容 v1–v4 旧档） |
 
@@ -116,7 +116,7 @@ cd templates/game/coreforge && ../../coreforge.exe   # 从模板目录运行，.
 | `App.html` | HUD 设计稿（GenForm 编译成 partial class CoreforgeHud 的类型化字段） |
 | `ForgeRenderer.zan` | 相机 + 世界渲染（地形/建筑/物品/敌人/粒子，全部程序化绘制） |
 | `ForgeInterface.zan` | HUD code-behind：事件接线 + 每帧回写 + 世界输入遮蔽 + 小地图/波次预告条/边缘预警 |
-| `Model/ForgeCamera.zan` | 相机状态（缩放/震动/视口换算） |
+| `ForgeCamera.zan` | 相机状态（缩放/震动/视口换算） |
 | `main.zan` | 自有主循环：事件泵 → 固定步长模拟 → 世界直绘 → 控件树叠加 |
 | `CoreforgeAutoTest.zan` | `COREFORGE_AUTOTEST=1` 交互自测（走真实 Input 与 form.Call 路径） |
 

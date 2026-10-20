@@ -1,5 +1,6 @@
 using System;
 using Game.Core;
+using Game.Pathfinding;
 
 namespace Game.Factory;
 
@@ -9,11 +10,9 @@ public class ForgeCombat {
     int[] candidates;
     int[] seen;
     int querySequence;
-    int[] distance;
-    int[] nextCell;
-    int[] heap;
-    int[] heapPosition;
-    int heapCount;
+    // 敌军寻路：到炉心的加权距离场 + 每格的离开代价（公共寻路件，见 Zan.Game.Pathfinding）。
+    DistanceField paths;
+    double[] pathCosts;
     bool allowOffGrid;
 
     static int FirstWaveTicks() { return 3500; }
@@ -29,7 +28,6 @@ public class ForgeCombat {
     static int PoweredCooldown() { return 30; }
     static int CooledCooldown() { return 22; }
     static int OffGridCooldown() { return 90; }
-    static int Unreachable() { return 1000000000; }
     static int BlastRadius() { return 1800; }  // 臼炮溅射半径（世界单位，1.8 格）
     static int ScatterDamage() { return 16; }
     static int ScatterCooldown() { return 16; }
@@ -72,8 +70,8 @@ public class ForgeCombat {
     ForgeCombat(ForgeWorld state) {
         world = state;
         int total = world.width * world.height;
-        distance = new int[total]; nextCell = new int[total];
-        heap = new int[total]; heapPosition = new int[total];
+        paths = new DistanceField(world.width, world.height);
+        pathCosts = new double[total];
         seen = new int[world.enemies.Length];
         enemyHash = SpatialHash2D.Create(ForgeCombat.HashCellSize(), world.enemies.Length);
         // 空间哈希分桶查询去重：确保目标实体 ID 唯一。
@@ -107,65 +105,13 @@ public class ForgeCombat {
         return 30 + world.catalog.blocks[(int)b.kind].hp / 12;
     }
 
-    bool Before(int a, int b) {
-        if (distance[a] == distance[b]) { return a < b; }
-        return distance[a] < distance[b];
-    }
-
-    void HeapOffer(int cell) {
-        int at = heapPosition[cell];
-        if (at == -2) { return; }
-        if (at < 0) {
-            at = heapCount; heapCount = heapCount + 1;
-            heap[at] = cell; heapPosition[cell] = at;
-        }
-        while (at > 0) {
-            int parent = (at - 1) / 2;
-            int other = heap[parent];
-            if (!Before(cell, other)) { break; }
-            heap[at] = other; heapPosition[other] = at;
-            at = parent;
-        }
-        heap[at] = cell; heapPosition[cell] = at;
-    }
-
-    int HeapPop() {
-        int result = heap[0];
-        heapCount = heapCount - 1;
-        heapPosition[result] = -2;
-        if (heapCount == 0) { return result; }
-        int cell = heap[heapCount];
-        int at = 0;
-        while (at * 2 + 1 < heapCount) {
-            int child = at * 2 + 1;
-            if (child + 1 < heapCount && Before(heap[child + 1], heap[child])) { child = child + 1; }
-            int other = heap[child];
-            if (!Before(other, cell)) { break; }
-            heap[at] = other; heapPosition[other] = at;
-            at = child;
-        }
-        heap[at] = cell; heapPosition[cell] = at;
-        return result;
-    }
-
+    // 重建到炉心的加权距离场。
+    // 地形（岩/水）不可通行；建筑可通行但代价高——敌军宁可绕远也不钻建筑。
     void RebuildPaths() {
-        for (int i = 0; i < distance.Length; i = i + 1) {
-            distance[i] = ForgeCombat.Unreachable(); nextCell[i] = -1; heapPosition[i] = -1;
+        for (int i = 0; i < pathCosts.Length; i = i + 1) {
+            pathCosts[i] = TerrainOpen(i) ? (double)EntryCost(i) : -1.0;
         }
-        heapCount = 0;
-        distance[world.coreCell] = 0;
-        HeapOffer(world.coreCell);
-        while (heapCount > 0) {
-            int cell = HeapPop();
-            int cost = distance[cell] + EntryCost(cell);
-            for (int d = 0; d < 4; d = d + 1) {
-                int neighbor = world.Neighbor(cell, d);
-                if (neighbor < 0 || !TerrainOpen(neighbor) || cost >= distance[neighbor]) { continue; }
-                distance[neighbor] = cost;
-                nextCell[neighbor] = cell;
-                HeapOffer(neighbor);
-            }
-        }
+        paths.Compute(pathCosts, world.coreCell);
         world.pathsDirty = false;
     }
 
@@ -391,7 +337,7 @@ public class ForgeCombat {
                 e.y = e.y + (int)((double)dy * (double)step / length);
                 continue;
             }
-            int target = nextCell[cell];
+            int target = paths.NextAt(cell % world.width, cell / world.width);
             if (target < 0) { continue; }
             int centerX = ForgeGrid.Center(cell % world.width);
             int centerY = ForgeGrid.Center(cell / world.width);
