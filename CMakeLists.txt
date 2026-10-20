@@ -3124,6 +3124,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_uidriver_label_click${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # Ribbon 溢出菜单回归：条带放不下时右端出现「»」，放不下的命令收进
+  # 菜单（以前直接被裁掉——命令还在，却点不着；设计器排版组 17 个图标
+  # 塞进 324px 工具条时右半就是这下场）。断言"画出来的 + 进菜单的 =
+  # 命令总数"（没有命令凭空消失）、画出来的都整落在可用宽度内（不画
+  # 半个按钮）、宽条带没有溢出、按语义名点「»」渲染返回 OverflowRequest。
+  add_test(NAME conformance_gui_ribbon_overflow
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ribbon_overflow_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_ribbon_overflow.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_ribbon_overflow${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # ChatView 气泡模式回归（桌面 IM 客户端实机反馈“消息乱码、滚动条方向
   # 反了、已读标记看不见”）：(1) bscr 的语义是“离底部多少像素”，滚轮
   # 向上=看更旧=离底部更远=加；写成减号时向上滚被钳在 0，界面纹丝

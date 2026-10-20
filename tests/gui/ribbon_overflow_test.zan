@@ -1,0 +1,114 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// Ribbon 溢出菜单回归：条带放不下时，右端出现「»」，放不下的
+// 命令收进菜单（以前是直接被裁掉——命令还在，却点不着）。
+// 三件事：
+//   ① 窄条带：溢出清单非空，且"画在条带上的 + 进菜单的"= 命令
+//      总数（没有命令凭空消失），画出来的都整整齐齐落在可用宽度
+//      内（不画半个按钮）；
+//   ② 宽条带：没有溢出；
+//   ③ 按语义名点「»」→ 渲染返回 OverflowRequest（宿主据此开菜单）。
+class RibbonOverflowTest {
+    static int fails;
+    static App app;
+    static List<RibbonGroup> groups;
+    static int renderW;
+    static int seenHit;
+    static int totalCmds;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got "
+            + Convert.ToString(got) + " want " + Convert.ToString(want));
+    }
+
+    static void EqTrue(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // 命令规模照着设计器排版组来：17 个图标格 + 2 个大命令
+    // （那条工具条只有 324px，右半就是被裁掉的那批）。
+    static void Build() {
+        groups = new List<RibbonGroup>();
+        RibbonGroup ga = new RibbonGroup("Layout");
+        for (int i = 0; i < 17; i = i + 1) {
+            ga.Add(RibbonItem.Tile("align-left", "Tile " + Convert.ToString(i)));
+        }
+        groups.Add(ga);
+        RibbonGroup gb = new RibbonGroup("Run");
+        gb.Add(RibbonItem.Large("play", "Run"));
+        gb.Add(RibbonItem.Large("bug", "Debug"));
+        groups.Add(gb);
+        totalCmds = 19;
+    }
+
+    static void Body() {
+        int h = Ribbon.RenderGroups(app, 0, 0, renderW, groups);
+        // 只记"有返回"的那一帧：命中之后下一帧又回到 -1。
+        if (h != 0 - 1) { seenHit = h; }
+    }
+
+    static void Frame() {
+        app.PumpGuarded();
+        app.FrameGuarded(RibbonOverflowTest.Body);
+    }
+
+    static void Main() {
+        fails = 0;
+        seenHit = 0 - 1;
+        app = new App("ribbon-overflow", 1200, 320);
+        app.Show();
+        Build();
+
+        // ① 窄条带（设计器工具条的宽度）。
+        renderW = 320;
+        Frame();
+        Frame();
+        List<RibbonSlot> over = Ribbon.LastOverflow();
+        EqTrue("narrow ribbon overflows", over.Count > 0);
+        RibbonLayout lay = Ribbon.LastLayout();
+        int visible = 0;
+        int overN = 0;
+        for (int i = 0; i < lay.slots.Count; i = i + 1) {
+            RibbonSlot s = lay.slots[i];
+            if (s.overflow) {
+                overN = overN + 1;
+                continue;
+            }
+            visible = visible + 1;
+            EqTrue("visible slot inside width", s.x + s.w <= renderW);
+        }
+        EqInt("no command lost", visible + overN, totalCmds);
+        EqInt("overflow list matches slots", over.Count, overN);
+        EqTrue("overflow button placed", Ribbon.LastOverflowButton().width > 0);
+
+        // ② 宽条带：装得下就没有溢出。
+        renderW = 1100;
+        Frame();
+        Frame();
+        EqInt("wide ribbon has no overflow", Ribbon.LastOverflow().Count, 0);
+
+        // ③ 按语义名点「»」→ 渲染报溢出请求。
+        renderW = 320;
+        Frame();
+        UiDriver.app = app;
+        UiDriver.resultsPath = "build/ribbon_overflow_results.log";
+        UiDriver.probes = new List<UiProbe>();
+        if (File.Exists(UiDriver.resultsPath)) {
+            File.Delete(UiDriver.resultsPath);
+        }
+        bool ok = UiDriver.Exec("clickid @ribbon-more");
+        EqInt("exec @ribbon-more accepted", ok ? 1 : 0, 1);
+        for (int i = 0; i < 4; i = i + 1) { Frame(); }
+        EqInt("overflow requested", seenHit, Ribbon.OverflowRequest);
+        File.Delete(UiDriver.resultsPath);
+
+        Console.WriteLine(fails == 0 ? "RIBBONOVF PASS"
+            : "RIBBONOVF FAIL " + Convert.ToString(fails));
+    }
+}

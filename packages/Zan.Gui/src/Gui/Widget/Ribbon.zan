@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using Gui;
 
 namespace Gui.Widget;
@@ -10,6 +11,38 @@ namespace Gui.Widget;
 //
 // if (cmd == 0) { ... }
 public class Ribbon {
+    // 渲染返回这个值 = 用户点了条带右端的「»」溢出按钮
+    //（宿主据此把放不下的命令开成菜单）。
+    public const int OverflowRequest = 0 - 2;
+
+    // 上一帧排不下的命令（宿主开菜单时读它）。
+    static List<RibbonSlot> lastOverflow = new List<RibbonSlot>();
+    // 上一帧「»」按钮的位置（菜单开在它下面）。
+    static Rect lastOverflowBtn = new Rect(0, 0, 0, 0);
+    // 上一帧的排布结果（含每条命令的落位与是否进了溢出菜单）。
+    static RibbonLayout lastLayout = new RibbonLayout();
+    // 溢出菜单开着：此时不再给「»」按钮挂提示气泡——气泡画在
+    // 菜单上方，会盖住菜单的第一项。
+    static bool overflowMenuOpen;
+
+    // 告诉功能区"溢出菜单开着"（宿主开/关菜单时各调一次）。
+    public static void SetOverflowMenuOpen(bool on) { overflowMenuOpen = on; }
+
+    // 上一帧排不下的命令（按落位顺序）。
+    public static List<RibbonSlot> LastOverflow() { return lastOverflow; }
+
+    // 上一帧「»」按钮的位置（没有溢出时是空矩形）。
+    public static Rect LastOverflowButton() { return lastOverflowBtn; }
+
+    // 上一帧的排布结果（宿主要自己算位置时用）。
+    public static RibbonLayout LastLayout() { return lastLayout; }
+
+    // 溢出按钮的宽度（条带右端给它留位）。
+    static int OverflowButtonW(App app) { return app.Scale(28); }
+
+    // 组件文案跟随宿主 UI 语言。
+    static string T(string en, string zh) { return Lang.Tr(en, zh); }
+
     // 功能区条带的默认高度。
     static int Height(App app) {
         return app.Scale(72);
@@ -257,12 +290,20 @@ public class Ribbon {
         return smallW;
     }
 
-    // 条带排完所有分组需要多宽（和 Band 里的列游标算法一致，
-    // 只量不画）。`fit` 描述降级后的排布：收成图标格的组按方钮
-    // 宽度算，被丢掉的命令不占位。
-    static int BandWidthFit(App app, List<RibbonGroup> groups, int bh,
-                            int rows, RibbonFit fit) {
+    // ------------------------------------------------------------------
+    // 排布引擎：一次算出每个命令的落位。测量宽度、绘制、判定
+    // "放不下"（进溢出菜单）三处读同一份结果——以前宽度是另
+    // 算一遍的，于是"量出来放得下、画出来被裁"这种错只有画
+    // 的那处看得出来。
+    // ------------------------------------------------------------------
+
+    // 排一次条带。落位是相对坐标（x 相对条带左沿，y 相对内容
+    // 顶）；`fit` 描述降级后的排布：收成图标格的组按方钮宽度
+    // 算，被丢掉的命令不占位。
+    static RibbonLayout Layout(App app, List<RibbonGroup> groups, int bh,
+                              int rows, RibbonFit fit) {
         Theme t = app.theme;
+        RibbonLayout lay = new RibbonLayout();
         if (rows < 1) { rows = 1; }
         int titleH = app.Scale(16);
         int contentH = bh - titleH - t.paddingSmall * 2;
@@ -274,6 +315,7 @@ public class Ribbon {
             RibbonGroup grp = groups[g];
             bool cp = fit.compact.Count > g ? fit.compact[g] : false;
             int smallW = Ribbon.SmallColW(app, grp, cp);
+            int groupStartX = cx;
             int sIdx = 0;
             int curKind = 0 - 1;
             int curW = 0;
@@ -281,31 +323,63 @@ public class Ribbon {
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 RibbonItem it = grp.items[j];
                 bool gone = fit.dropped.Count > flat ? fit.dropped[flat] : false;
+                int myFlat = flat;
                 flat = flat + 1;
                 if (gone) { continue; }
                 kept = kept + 1;
                 int kind = 0;
-                if (it.tile || (cp && it.small)) { kind = 2; }
+                bool asTile = it.tile || (cp && it.small);
+                if (asTile) { kind = 2; }
                 else if (it.small) { kind = 1; }
-                if (kind != curKind && sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
+                if (kind != curKind && sIdx % rows != 0) {
+                    cx = cx + curW;
+                    sIdx = 0;
+                }
                 curKind = kind;
+                RibbonSlot s = new RibbonSlot();
+                s.flat = myFlat;
+                s.group = g;
+                s.item = j;
+                s.cmd = it;
+                s.kind = kind;
                 if (kind == 0) {
                     if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
-                    cx = cx + app.Scale(64);
+                    s.x = cx;
+                    s.y = 0;
+                    s.w = app.Scale(64);
+                    s.h = contentH;
+                    cx = cx + s.w;
                 } else {
                     int colW = smallW;
                     if (kind == 2) { colW = tileW; }
                     curW = colW;
+                    s.x = cx;
+                    s.y = (sIdx % rows) * rowH;
+                    s.w = colW;
+                    s.h = rowH;
                     sIdx = sIdx + 1;
                     if (sIdx % rows == 0) { cx = cx + colW; }
                 }
+                lay.slots.Add(s);
             }
             // 整组被丢空：连标题和分隔线都不画（空壳更难看）。
             if (kept == 0) { continue; }
             if (sIdx % rows != 0) { cx = cx + curW; }
+            RibbonGroupBox box = new RibbonGroupBox();
+            box.group = g;
+            box.startX = groupStartX;
+            box.endX = cx;
+            lay.boxes.Add(box);
             cx = cx + t.paddingSmall * 2 + 1;
         }
-        return cx + t.paddingSmall;
+        lay.width = cx + t.paddingSmall;
+        return lay;
+    }
+
+    // 条带排完所有分组需要多宽（排满时的宽度）。
+    static int BandWidthFit(App app, List<RibbonGroup> groups, int bh,
+                            int rows, RibbonFit fit) {
+        return Ribbon.Layout(app, groups, bh, rows, fit).width;
     }
 
     // 不降级时的条带宽度（宿主用来量右端还剩多少空位）。
@@ -457,98 +531,105 @@ public class Ribbon {
         // 还放不下就丢掉右边的低价值命令，而不是把半个命令画在
         // 条带边上。降级只写进本帧的排布视图，不改宿主的命令对象。
         RibbonFit fit = Ribbon.Fit(app, groups, bh, rows, w);
+        RibbonLayout lay = Ribbon.Layout(app, groups, bh, rows, fit);
+        int limit = w;
+        if (lay.width > w) {
+            // 还是放不下：右端给「»」按钮留个位，再降级一次——
+            // 收得下的收进菜单，收不下的才留在溢出清单里。
+            limit = w - Ribbon.OverflowButtonW(app);
+            fit = Ribbon.Fit(app, groups, bh, rows, limit);
+            lay = Ribbon.Layout(app, groups, bh, rows, fit);
+        }
+        // 落位超出可用宽度的命令进溢出菜单（条带上不画，也不可点）。
+        List<RibbonSlot> over = new List<RibbonSlot>();
+        for (int i = 0; i < lay.slots.Count; i = i + 1) {
+            RibbonSlot s = lay.slots[i];
+            if (s.x + s.w > limit) {
+                s.overflow = true;
+                over.Add(s);
+            }
+        }
+        Ribbon.lastOverflow = over;
+        Ribbon.lastOverflowBtn = new Rect(0, 0, 0, 0);
+        Ribbon.lastLayout = lay;
         c.PushClip(x, by, w, bh);
 
         int titleH = app.Scale(16);
         int contentTop = by + t.paddingSmall;
-        int contentH = bh - titleH - t.paddingSmall * 2;
-
-        int cx = x + t.paddingSmall;
         int gap = app.Scale(4);
         Ribbon.tipBaseY = by + bh;
         int clicked = 0 - 1;
-        int baseIdx = 0;
-        int flat = 0;
-        for (int g = 0; g < groups.Count; g = g + 1) {
-            RibbonGroup grp = groups[g];
-            int groupStartX = cx;
-            // 该组是否降级成图标格（宽度不够时从右往左逐组降）。
-            bool cp = fit.compact.Count > g ? fit.compact[g] : false;
-
-            // 三种排布共用一套列游标：小命令是 rows 行的
-            // 标签行列，图标格是 rows 行的方钮列（一列可以
-            // 排好几个），大命令独占整列。换种排布时先把
-            // 没排满的那一列收掉，免得两种宽度叠在一起。
-            int sIdx = 0;
-            int curKind = 0 - 1;
-            int curW = 0;
-            int rowH = contentH / rows;
-            int tileW = rowH;
-            // 一组里的小命令用同一个列宽（组内最宽的
-            // 标签决定），这样每列的图标和文字都对齐，
-            // 长标签也不会被邻列压住。
-            int smallW = Ribbon.SmallColW(app, grp, cp);
-            int kept = 0;
-            for (int j = 0; j < grp.items.Count; j = j + 1) {
-                RibbonItem it = grp.items[j];
-                int id = firstId + baseIdx + j;
-                // 被降级丢弃的命令：不画、不占位、不可点（点击索引
-                // 仍按原序号，宿主那份动作表不用改）。
-                bool gone = fit.dropped.Count > flat ? fit.dropped[flat] : false;
-                flat = flat + 1;
-                if (gone) { continue; }
-                kept = kept + 1;
-                int kind = 0;
-                bool asTile = it.tile || (cp && it.small);
-                if (asTile) { kind = 2; }
-                else if (it.small) { kind = 1; }
-                if (kind != curKind && sIdx % rows != 0) {
-                    cx = cx + curW;
-                    sIdx = 0;
-                }
-                curKind = kind;
-                if (kind == 0) {
-                    if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
-                    int lw = app.Scale(64);
-                    Ribbon.PaintItem(app, id, it, cx, contentTop + gap / 2,
-                        lw - gap, contentH - gap, false, false, hoverStyle,
-                        activeStyle, textStyle, mutedStyle, accentStyle,
-                        accentHoverStyle, disabledStyle);
-                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
-                    cx = cx + lw;
-                } else {
-                    int colW = smallW;
-                    if (kind == 2) { colW = tileW; }
-                    curW = colW;
-                    int ry = contentTop + (sIdx % rows) * rowH;
-                    Ribbon.PaintItem(app, id, it, cx, ry + gap / 2,
-                        colW - gap, rowH - gap, asTile, true, hoverStyle,
-                        activeStyle, textStyle, mutedStyle, accentStyle,
-                        accentHoverStyle, disabledStyle);
-                    if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
-                    sIdx = sIdx + 1;
-                    if (sIdx % rows == 0) { cx = cx + colW; }
-                }
+        int si = 0;
+        for (int bi = 0; bi < lay.boxes.Count; bi = bi + 1) {
+            RibbonGroupBox box = lay.boxes[bi];
+            RibbonGroup grp = groups[box.group];
+            int visibleEnd = box.startX;
+            int visible = 0;
+            // 这一组里放得下的命令（落位是排布引擎算好的，
+            // 这里只照着画）。
+            while (si < lay.slots.Count && lay.slots[si].group == box.group) {
+                RibbonSlot s = lay.slots[si];
+                si = si + 1;
+                if (s.overflow) { continue; }
+                int id = firstId + s.flat;
+                Ribbon.PaintItem(app, id, s.cmd, x + s.x,
+                    contentTop + s.y + gap / 2, s.w - gap, s.h - gap,
+                    s.kind == 2, s.kind != 0, hoverStyle, activeStyle,
+                    textStyle, mutedStyle, accentStyle, accentHoverStyle,
+                    disabledStyle);
+                if (Ribbon.ItemClicked(app, id, s.cmd)) { clicked = s.flat; }
+                visibleEnd = s.x + s.w;
+                visible = visible + 1;
             }
-            // 整组被丢空：标题和分隔线都不画（空壳更难看）。
-            if (kept == 0) {
-                baseIdx = baseIdx + grp.items.Count;
-                continue;
-            }
-            if (sIdx % rows != 0) { cx = cx + curW; }
+            // 整组都进了溢出菜单：标题和分隔线都不画。
+            if (visible == 0) { continue; }
 
             // 组标题 + 尾部分隔线
-            c.DrawTextCentered(groupStartX, by + bh - titleH - t.paddingTiny,
-                cx - groupStartX, titleH, grp.title, mutedStyle.FgOr(0),
+            c.DrawTextCentered(x + box.startX, by + bh - titleH - t.paddingTiny,
+                visibleEnd - box.startX, titleH, grp.title, mutedStyle.FgOr(0),
                 mutedStyle.FontOr(Style.FontFallback(app, "small")));
-            cx = cx + t.paddingSmall;
-            c.FillRect(cx, by + t.paddingSmall, 1, bh - t.paddingSmall * 2,
+            int divX = x + visibleEnd + t.paddingSmall;
+            c.FillRect(divX, by + t.paddingSmall, 1, bh - t.paddingSmall * 2,
                        dividerStyle.BgOr(0));
-            cx = cx + t.paddingSmall + 1;
-
-            baseIdx = baseIdx + grp.items.Count;
         }
         c.PopClip();
+
+        // 溢出按钮：条带放不下的命令从这里进菜单。
+        if (over.Count > 0) {
+            int bw = Ribbon.OverflowButtonW(app);
+            int bbh = app.Scale(24);
+            int bx = x + w - bw;
+            int byy = by + (bh - bbh) / 2;
+            int id = app.focus.AllocId();
+            int hv = Ui.HoverLevelMsIn(app, id, 0, bx, byy, bw, bbh);
+            int pv = Ui.PressLevelMsIn(app, id, 0, bx, byy, bw, bbh);
+            if (hv > 0) {
+                c.FillRoundRect(bx, byy, bw, bbh, t.borderRadiusSmall,
+                                App.ScaleAlpha(hoverStyle.BgOr(0), hv));
+            }
+            if (pv > 0) {
+                c.FillRoundRect(bx, byy, bw, bbh, t.borderRadiusSmall,
+                                App.ScaleAlpha(activeStyle.BgOr(0), pv));
+            }
+            int color = App.LerpColor(textStyle.FgOr(0), accentStyle.FgOr(0), hv);
+            int isz = t.iconSizeSmall;
+            c.DrawGlyphIn("more", bx + (bw - isz) / 2, byy + (bbh - isz) / 2,
+                isz, isz, isz, color);
+            app.hitTester.RegisterRectL(id, bx, byy, bw, bbh, 0, "ribbon-more");
+            Ribbon.lastOverflowBtn = new Rect(bx, byy, bw, bbh);
+            bool btnClicked = app.ClickAvailable() && app.ClickTarget() == id;
+            // 菜单开着时不挂提示气泡（会盖住菜单第一项）；点开的那
+            // 一帧也不挂（菜单正好从按钮下方展开）。
+            if (!overflowMenuOpen && !btnClicked
+                && (hv >= 900 || Ui.HoldTipIn(app, id, bx, byy, bw, bbh))) {
+                Tooltip.Request(bx + bw / 2, by + bh,
+                    Ribbon.T("More commands", "更多命令"), Tooltip.Bottom(),
+                    app.Scale(260));
+            }
+            if (btnClicked) {
+                clicked = Ribbon.OverflowRequest;
+            }
+        }
         return clicked;
     }
 
