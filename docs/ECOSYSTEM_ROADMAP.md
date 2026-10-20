@@ -827,8 +827,9 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `Embeddings.zan` | 同上 | `Embeddings`：OpenAI 兼容 `/v1/embeddings`、批量、归一化、**按 index 归位**、维度校验 |
 | `Chunking.zan` | 同上 | `Chunking`：递归字符分割 / token 窗口 / 句子 / 段落，四种策略 |
 | `AiEndpoint.zan` | 同上 | `AiEndpoint`：base URL → scheme/host/port/path；本地端点识别 |
-| `VectorStore.zan` | 同上 | `VectorStore`：`AiEmbedding`（double）→ `VectorIndex`（float）适配、入库/检索/导出导入往返 |
-| `Retriever.zan` | 同上 | `Retriever`：混合检索（向量 + BM25）+ **RRF 融合**；保留两路原始排名与分数 |
+| `VectorStore.zan` | 同上 | `VectorStore`：**内存**向量存储（`AiEmbedding` double → `VectorIndex` float 适配、入库/检索/导出导入往返） |
+| `Retriever.zan` | 同上 | `Retriever`：**内存**混合检索（向量 + BM25）+ **RRF 融合**；保留两路原始排名与分数 |
+| `ZanDbRetriever.zan` | 同上 | `ZanDbRetriever`：**持久化**混合检索——文档与索引存 `ZanDb`（事务 + journal + 检查点），走原生 `Collection.SearchHybrid` |
 | `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
 | `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
@@ -886,17 +887,79 @@ token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数
 `System.Data.Orm` 下，本包不碰）——这正是用子命名空间而不是包根
 的好处。
 
+**向量库是 ZanDb 支持的**（实测，非推测）：`Collection.EnsureVectorIndex`
+（HNSW 建索引）、`SearchVector` / `SearchVectorExact`、
+`SearchHybrid`（混合检索）、`RebuildSearchIndexes`（从源文档重建）、
+检查点与世代机制——`Zan.Data` 的 README 与 conformance
+`zandb_search.zan` 都在维护这套契约。
+
+**并发怎么解（实测结论）**：`VectorIndex.Add` 会改 `chunks`/`nodes`/
+`idSlots` 三个共享结构且**没有锁**——并发写会撕裂图结构（不是"结果
+不准"，是内存结构损坏）。ZanDb 那侧由 `AsyncRwLock` 串行化写
+（`InsertAsync`/`UpdateAsync`/`FindByIdAsync`/`UpdateAtomic`），索引
+变更走 **journal + 检查点**，文档写入与索引更新落在同一事务，不会
+出现"文档写进去了但索引没更新"。
+
+所以分工是：**`VectorStore`/`Retriever` 是内存档（小规模、单写者、
+一次性脚本、测试夹具），`ZanDbRetriever` 是生产档**。两者语义一致
+（同一 RRF 公式 k=60，同一个 `RetrieverHit` 实体），conformance 里
+有一条断言专门盯这个——两个后端对同一批数据给出**完全相同的融合
+分数**（0.032787），所以从内存切到持久化，检索结果不会悄悄变样。
+
 **`double` → `float` 的精度代价（实测）**：单精度有效位约 7 位十进制。
 embedding 分量（量级 0.01~1）相对误差约 1e-8，余弦相似度偏差约
 1e-9——对检索排序**没有可观察的影响**。但需要与服务端原始向量逐位
 一致时（跨系统精确比对）**不能经过这层**，直接用 `AiEmbedding.vectors`。
 
-**已知边界**：无重排（cross-encoder 重排那一层）、无向量库的并发写
-与增量删除、无 Tool calling、无会话记忆、无评估与可观测、无流式的
-**背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
-（要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
-私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调 embedding 服务**
-（没有本地离线 embedding 模型）。
+**已知边界**：无重排（cross-encoder 重排那一层）、`ZanDbRetriever`
+走的是**进程内**的 `ZanDb`（本地文件，多机共享要靠 `ZanDbServer`
+的远端协议，本包尚未封装）、无 Tool calling、无会话记忆、无评估与
+可观测、无流式的**背压**（回调返回 false 只能停在这一帧之后）、无
+Token 精确计数（要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容
+协议（不做各家私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调
+embedding 服务**（没有本地离线 embedding 模型）。
+
+### 1.21 缺失值处理：`Zan.DataFrame`
+
+**缺口**：`Zan.DataFrame` 的列存是强类型的 `List<long>` /
+`List<double>` / `List<string>`——格子里**总有值**，所以"这行没填"与
+"这行填了 0"**分不开**。这不是少一个函数的问题，是列存缺一个表达
+"没有值"的位置。
+
+**取舍：掩码位，不是哨兵值**。`0` 与 `""` 都是合法值，拿 `0` 当缺失
+的哨兵，会把"这行没填"和"这行填了 0"混为一谈——而这两者的处理方
+式常常相反（前者该 drop，后者该保留）。pandas 的 `NaN` 之所以好使，
+是因为 double 有专门的 NaN 位；Zan 的列存是强类型的，没有 NaN 语义，
+所以用**独立的布尔掩码**（`DataCol.missing`，与值列表等长）表达
+"缺失"这件事本身。掩码为空 = 该列无缺失（常见情形，不占额外内存）。
+
+| 文件 | 内容 |
+|---|---|
+| `Models/DataCol.zan` | `missing` 掩码 + `IsMissing`/`MarkMissing`/`ClearMissing`/`MissingCount`；`Append`/`PutStr` 与掩码同步（**写值清标记，空串置标记**） |
+| `DataFrame.zan` | `InferKind` 空字段不参与类型推断（否则 `1,,3` 被推成 Str）；`AddRow`/`AddColumn` 的新格是缺失不是 0；`Aggregate` **跳过缺失**；`CastColumn`（转列类型，缺失标记原样保留）；`ToCsv` 缺失格写空字段 |
+| `Missing.zan` | `IsNaN`/`NotNaN`/`Mask`/`ValidMask`/`NaNCountInRow`/`NaNCount`/`ValidCount`/`TotalNaNCount`；`DropNa`（any/all/subset）；`FillNa`（常量）/ `FillNaByColumn`（逐列）/ `FillNaStat`（均值/中位数） |
+
+**CSV 约定**：空字段 → Int/Float 列的**缺失**（不是 0）；Str 列的空
+字段仍是空串（Str 列没有独立的缺失态，这是类型系统的直接后果）；整列
+全空 → 推断为 Str。
+
+**聚合语义**：缺失**不参与**聚合（求和/均值/最值跳过，而不是当 0）。
+全列无有效值时返回 0.0（沿用本包"空集返回 0"的约定）而不是 NaN——
+NaN 会顺着下游的平均再平均，污染出一片垃圾。要区分"没有有效值"与
+"有效值恰好是 0"，用 `ValidCount`。
+
+**升型而不是截断**：往 Int 列填均值 1.5 会截成 1，**静默算错**。
+`FillNaStat` 遇到带小数的填充值先把列**升成 Float**（`CastColumn`），
+再填。同一坑在上一批的窗口均值上就踩过一次（`PutDouble` 往 Int 列
+写会 `(long)v`）——这次把它变成类型系统层面的显式升型。
+
+conformance `missing_values`（66 条断言）：CSV 空字段 → 缺失、空字段
+不参与类型推断、整列全空 → Str；**填 0 与缺失必须可区分**（`0`/`""`/`5`
+三格的求和是 5 不是 10，均值是 2.5 不是 1.67）；聚合跳过缺失（和=3、
+均值=1.5、Count 仍按行数）；`DropNa` 的 any/all/subset 与非法 how/列名
+报错；`FillNa` 常量/逐列/均值/中位数、Int 列自动升 Float、全列无有效
+值时不填；写入即"有值"（写值清标记、空串置标记）；CSV 往返保持缺失；
+`AddRow`/`AddColumn` 的新格是缺失；掩码随 `Filter`/`Copy` 传播。
 
 ---
 

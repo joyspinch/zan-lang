@@ -16,6 +16,9 @@ Zan.Data 共存。
   `Pivot`（透视表/交叉表）、`Merge`（内/左/右/外/交叉连接 + 多键）、
   `Window`（滑动窗口/指数加权/差分/有效性掩码）、
   `Resample`（秒/分/时/日/周/月重采样）、`Freq` 枚举
+- `System.Data` — `Missing`（缺失值：`IsNaN`/`NotNaN`/`Mask`/`ValidMask`/
+  `NaNCount`/`ValidCount`、`DropNa`、`FillNa`/`FillNaByColumn`/
+  `FillNaStat`）——列存的"缺失"由独立的布尔掩码表达，详见下文
 
 ## 快速上手
 
@@ -131,9 +134,46 @@ DataFrame ma = Window.Rolling(daily, "v", 7, Agg.Avg);   // 结果列 v_rolling
   返回（Int 列求和内部走 long 累加避免精度损失）。
 - 数值形态识别是严格的（可选符号 + 数字 [+ 小数部分] [+ 指数]），
   带 BOM/空白/千分位的字段按文本列处理。
-- 无多级索引（`MultiIndex`）与缺失值处理（`fillna`/`dropna`/
-  `interpolate`——列存没有 null 标记位，是另一个量级的改动）。
+- 无多级索引（`MultiIndex`）与插值（`interpolate`——缺失值处理见下）。
 - `Aggregate` 只认固定的 5 个算子（`Agg`），没有 `groupby().agg()`
   那样的自定义聚合字典。
 - `Concat` 按第一张表的列名对齐，不做重命名；`Resample` 无升采样与
   时间偏移（`asfreq`/`offset`）。
+
+## 缺失值
+
+列存是强类型的 `List<long>` / `List<double>` / `List<string>`——格子里
+**总有值**，所以"这行没填"与"这行填了 0"分不开。本包用**独立的布尔
+掩码**（`DataCol.missing`，与值列表等长）表达"缺失"，不用哨兵值。
+
+**为什么不用 `0` 当哨兵**：`0` 与 `""` 都是合法值。拿 `0` 当缺失的
+哨兵，会把"这行没填"和"这行填了 0"混为一谈——而这两者的处理方式
+常常相反（前者该 drop，后者该保留）。pandas 的 `NaN` 之所以好使，
+是因为 double 有专门的 NaN 位；Zan 的列存是强类型的，没有 NaN 语义。
+
+```zan
+using System.Data;
+
+DataFrame df = DataFrame.FromCsv("a,b\r\n1,\r\n2,5\r\n");   // b 第一行是空的
+
+Missing.NaNCount(df, "b");        // 1
+Missing.IsNaN(df, 0, "b");        // true
+Missing.DropNa(df, "any");        // 丢含缺失的行
+Missing.FillNa(df, "0", "b");     // 填 0
+Missing.FillNaStat(df, "mean", "b");  // 填均值（Int 列自动升 Float）
+```
+
+- **CSV 约定**：空字段 → Int/Float 列的**缺失**（不是 0）；Str 列的空
+  字段仍是空串（Str 列没有独立的缺失态）；整列全空 → 推断为 Str。
+  空字段**不参与类型推断**——否则 `1,,3` 会被推成 Str，数字列退化成
+  文本列。
+- **聚合跳过缺失**：求和/均值/最值只看有效格。全列无有效值时返回
+  0.0（不是 NaN——NaN 会顺着下游的平均再平均，污染出一片垃圾）。要
+  区分"没有有效值"与"有效值恰好是 0"，用 `Missing.ValidCount`。
+- **写入即"有值"**：`SetInt`/`SetFloat`/`SetStr` 写非空值会清掉缺失
+  标记；写空串到 Int/Float 列会**重新**置为缺失（与 CSV 装载同口径）。
+- **升型而不是截断**：往 Int 列填均值 1.5 会截成 1，静默算错。
+  `FillNaStat` 遇到带小数的填充值先把列**升成 Float**（`CastColumn`），
+  再填。
+- **新行/新列的格子是缺失不是 0**：`AddRow` 与 `AddColumn` 造出来的
+  数值格标记为缺失——"这格没填"与"这格填了 0"是两回事。

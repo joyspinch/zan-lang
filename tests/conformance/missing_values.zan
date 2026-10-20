@@ -1,0 +1,237 @@
+// 缺失值处理：Zan.DataFrame 的 isna / dropna / fillna。
+//
+// 核心命题：**"这行没填"与"这行填了 0"必须能区分**。列存是强类型的
+// long/double/string，没有 NaN 位，所以缺失由独立的掩码位表达，而不是
+// 拿 0 当哨兵。
+//
+// 覆盖：CSV 空字段 → 缺失（Int/Float 列）、空字段不参与类型推断、
+// 整列全空 → Str；掩码与值的往返（写值清标记、空串置标记）；聚合跳过
+// 缺失（求和/均值/最值/计数）；dropna 的 any/all/subset；fillna 的常量
+// /逐列/均值/中位数；fillna 后缺失清零；CSV 往返保持缺失；**填 0 的
+// 行与缺失的行在求和与均值上可区分**。
+using System;
+using System.Data;
+
+namespace Conf;
+
+class Prog {
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    static string F(double v) {
+        return Convert.ToString(Math.Round(v * 100.0) / 100.0);
+    }
+
+    static int Run() {
+        int bad = 0;
+
+        // ---- 1. CSV 空字段 → 缺失；空字段不参与类型推断 ----
+        DataFrame df = DataFrame.FromCsv("a,b,c\r\n1,,3\r\n2,5,\r\n,7,9\r\n");
+        Console.WriteLine("rows=" + df.Rows() + " cols=" + df.ColCount());
+        Console.WriteLine("kind a=" + df.Kind("a") + " b=" + df.Kind("b")
+        + " c=" + df.Kind("c"));
+        // b/c 各有一个空字段，但类型仍推断为 Int（Int=1）——空格子是
+        // "缺失"，不是"不像整数"。
+        if (df.Kind("a") != ColKind.Int) { bad = bad + 1; }
+        if (df.Kind("b") != ColKind.Int) { bad = bad + 1; }
+        if (df.Kind("c") != ColKind.Int) { bad = bad + 1; }
+
+        Console.WriteLine("missing a=" + Missing.NaNCount(df, "a")
+        + " b=" + Missing.NaNCount(df, "b")
+        + " c=" + Missing.NaNCount(df, "c"));
+        if (Missing.NaNCount(df, "a") != 1) { bad = bad + 1; }
+        if (Missing.NaNCount(df, "b") != 1) { bad = bad + 1; }
+        if (Missing.NaNCount(df, "c") != 1) { bad = bad + 1; }
+        if (Missing.TotalNaNCount(df) != 3) { bad = bad + 1; }
+        if (Missing.ValidCount(df, "a") != 2) { bad = bad + 1; }
+
+        // 掩码逐行正确。
+        List<bool> mb = Missing.Mask(df, "b");
+        Console.WriteLine("mask b=" + mb[0] + mb[1] + mb[2]);
+        if (!mb[0] || mb[1] || mb[2]) { bad = bad + 1; }
+        List<bool> vb = Missing.ValidMask(df, "b");
+        if (vb[0] || !vb[1] || !vb[2]) { bad = bad + 1; }
+        // 第 3 行 a 与 c 都缺。
+        if (Missing.NaNCountInRow(df, 0) != 1) { bad = bad + 1; }
+        if (Missing.NaNCountInRow(df, 1) != 1) { bad = bad + 1; }
+        if (Missing.NaNCountInRow(df, 2) != 1) { bad = bad + 1; }
+
+        // ---- 2. 聚合跳过缺失（不把缺失当 0）----
+        // a 的值是 1、2、缺失 → 和=3、均值=1.5（不是 1.0）
+        Console.WriteLine("sum a=" + F(df.Sum(df.AllRows(), "a"))
+        + " avg a=" + F(df.Avg(df.AllRows(), "a")));
+        if (Math.Abs(df.Sum(df.AllRows(), "a") - 3.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(df.Avg(df.AllRows(), "a") - 1.5) > 1e-9) { bad = bad + 1; }
+        // Count 按行数（不是有效值数）。
+        if (df.Aggregate(df.AllRows(), "a", Agg.Count) != 3.0) { bad = bad + 1; }
+        // Max/Min 跳过缺失。
+        if (Math.Abs(df.Max(df.AllRows(), "a") - 2.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(df.Min(df.AllRows(), "a") - 1.0) > 1e-9) { bad = bad + 1; }
+
+        // ---- 3. 关键命题：填 0 与缺失必须能区分 ----
+        DataFrame mixed = DataFrame.FromCsv("v\r\n0\r\n\r\n5\r\n");
+        Console.WriteLine("mixed kind=" + mixed.Kind("v")
+        + " missing=" + Missing.NaNCount(mixed, "v")
+        + " sum=" + F(mixed.Sum(mixed.AllRows(), "v"))
+        + " avg=" + F(mixed.Avg(mixed.AllRows(), "v")));
+        if (mixed.Kind("v") != ColKind.Int) { bad = bad + 1; }
+        // 三格里：0、缺失、5 —— 只有一格缺失。
+        if (Missing.NaNCount(mixed, "v") != 1) { bad = bad + 1; }
+        // 和 = 0 + 5 = 5（不是 0 + 0 + 5，也不是 0 + 5 + 5）
+        if (Math.Abs(mixed.Sum(mixed.AllRows(), "v") - 5.0) > 1e-9) { bad = bad + 1; }
+        // 均值 = 5/2 = 2.5（有效值 2 个，不是 3 个）
+        if (Math.Abs(mixed.Avg(mixed.AllRows(), "v") - 2.5) > 1e-9) { bad = bad + 1; }
+        // 第 0 行的 0 不是缺失。
+        if (Missing.IsNaN(mixed, 0, "v")) { bad = bad + 1; }
+        if (!Missing.NotNaN(mixed, 0, "v")) { bad = bad + 1; }
+        if (!Missing.IsNaN(mixed, 1, "v")) { bad = bad + 1; }
+
+        // ---- 4. dropna ----
+        // any：任一列缺失就丢 —— 3 行都有缺失 → 0 行。
+        DataFrame dAny = Missing.DropNa(df, "any");
+        Console.WriteLine("dropna any rows=" + dAny.Rows());
+        if (dAny.Rows() != 0) { bad = bad + 1; }
+        // all：所有列都缺失才丢 —— 没有这样的行 → 3 行。
+        DataFrame dAll = Missing.DropNa(df, "all");
+        Console.WriteLine("dropna all rows=" + dAll.Rows());
+        if (dAll.Rows() != 3) { bad = bad + 1; }
+        // subset：只看 b —— 只有第 1 行缺 b → 剩 2 行。
+        DataFrame dB = Missing.DropNa(df, "any", "b");
+        Console.WriteLine("dropna b rows=" + dB.Rows());
+        if (dB.Rows() != 2) { bad = bad + 1; }
+        // 保留的两行在**别的列**仍有缺失（subset 只约束 b 的判定，不清别列的缺失）。
+        if (Missing.TotalNaNCount(dB) != 2) { bad = bad + 1; }
+        if (Missing.NaNCount(dB, "b") != 0) { bad = bad + 1; }
+        // subset 只看 c —— 丢的是第 2 行。
+        DataFrame dC = Missing.DropNa(df, "any", "c");
+        if (dC.Rows() != 2) { bad = bad + 1; }
+        // 非法 how 必须报错。
+        int threw = 0;
+        try { Missing.DropNa(df, "maybe"); } catch (Exception e) { threw = threw + 1; }
+        if (threw != 1) { bad = bad + 1; }
+        // 非法列名必须报错。
+        threw = 0;
+        try { Missing.DropNa(df, "any", "nope"); } catch (Exception e) { threw = threw + 1; }
+        if (threw != 1) { bad = bad + 1; }
+
+        // ---- 5. fillna（常量）----
+        DataFrame f0 = Missing.FillNa(df, "0", "a", "b");
+        Console.WriteLine("fillna a missing=" + Missing.NaNCount(f0, "a")
+        + " b missing=" + Missing.NaNCount(f0, "b")
+        + " c missing=" + Missing.NaNCount(f0, "c"));
+        if (Missing.NaNCount(f0, "a") != 0) { bad = bad + 1; }
+        if (Missing.NaNCount(f0, "b") != 0) { bad = bad + 1; }
+        // c 不在 subset 里 → 仍然缺失。
+        if (Missing.NaNCount(f0, "c") != 1) { bad = bad + 1; }
+        // 填 0 之后求和 = 1 + 2 + 0 = 3（缺失补了 0）
+        Console.WriteLine("fillna sum a=" + F(f0.Sum(f0.AllRows(), "a")));
+        if (Math.Abs(f0.Sum(f0.AllRows(), "a") - 3.0) > 1e-9) { bad = bad + 1; }
+        // 原表不受影响。
+        if (Missing.NaNCount(df, "a") != 1) { bad = bad + 1; }
+
+        // 填非零值。
+        DataFrame f9 = Missing.FillNa(df, "9", "a");
+        if (Math.Abs(f9.Sum(f9.AllRows(), "a") - 12.0) > 1e-9) { bad = bad + 1; }
+        if (Missing.NaNCount(f9, "a") != 0) { bad = bad + 1; }
+
+        // ---- 6. fillna（逐列）----
+        Dictionary<string, string> perCol = new Dictionary<string, string>();
+        perCol["a"] = "5";
+        perCol["b"] = "7";
+        DataFrame fPer = Missing.FillNaByColumn(df, perCol);
+        Console.WriteLine("fillna by col a=" + F(fPer.Sum(fPer.AllRows(), "a"))
+        + " b=" + F(fPer.Sum(fPer.AllRows(), "b")));
+        if (Math.Abs(fPer.Sum(fPer.AllRows(), "a") - 8.0) > 1e-9) { bad = bad + 1; }
+        // b 的有效值是 5、7（第一行缺）→ 填 7 后 = 5+7+7 = 19
+        if (Math.Abs(fPer.Sum(fPer.AllRows(), "b") - 19.0) > 1e-9) { bad = bad + 1; }
+        // c 没有给值 → 仍然缺失。
+        if (Missing.NaNCount(fPer, "c") != 1) { bad = bad + 1; }
+
+        // ---- 7. fillna（统计量）----
+        // a 的有效值是 1、2 → 均值 1.5，中位数 1.5
+        DataFrame fMean = Missing.FillNaStat(df, "mean", "a");
+        Console.WriteLine("fillna mean sum a=" + F(fMean.Sum(fMean.AllRows(), "a"))
+        + " kind=" + fMean.Kind("a"));
+        if (Math.Abs(fMean.Sum(fMean.AllRows(), "a") - 4.5) > 1e-9) { bad = bad + 1; }
+        if (Missing.NaNCount(fMean, "a") != 0) { bad = bad + 1; }
+        // **Int 列装不下 1.5 → 必须升成 Float**（截断成 1 会静默算错）。
+        if (fMean.Kind("a") != ColKind.Float) { bad = bad + 1; }
+        DataFrame fMed = Missing.FillNaStat(df, "median", "a");
+        if (Math.Abs(fMed.Sum(fMed.AllRows(), "a") - 4.5) > 1e-9) { bad = bad + 1; }
+        if (fMed.Kind("a") != ColKind.Float) { bad = bad + 1; }
+        // 整数统计量不需要升型（b 的均值 = 6.0，是整数）。
+        DataFrame fInt = Missing.FillNaStat(df, "mean", "c");
+        if (fInt.Kind("c") != ColKind.Int) { bad = bad + 1; }
+        // 全列无有效值 → 不填（保持缺失，不拿 0 冒充数据）。
+        DataFrame allNa = DataFrame.FromCsv("z\r\n\r\n\r\n");
+        // 全空列推断为 Str —— Str 列的"缺失"就是空串，没有独立缺失态。
+        if (allNa.Kind("z") != ColKind.Str) { bad = bad + 1; }
+        DataFrame fAll = Missing.FillNaStat(allNa, "mean", "z");
+        if (Missing.NaNCount(fAll, "z") != 0) { bad = bad + 1; }
+        // 非法 method 必须报错。
+        threw = 0;
+        try { Missing.FillNaStat(df, "mode", "a"); } catch (Exception e) { threw = threw + 1; }
+        if (threw != 1) { bad = bad + 1; }
+
+        // ---- 8. 写入即"有值"：标记被清掉 ----
+        DataFrame w = DataFrame.FromCsv("k\r\n\r\n2\r\n");
+        if (Missing.NaNCount(w, "k") != 1) { bad = bad + 1; }
+        w.SetInt(0, "k", 7);
+        if (Missing.NaNCount(w, "k") != 0) { bad = bad + 1; }
+        if (w.GetInt(0, "k") != 7) { bad = bad + 1; }
+        // 写空串到 Int 列 → 重新变成缺失。
+        w.SetStr(0, "k", "");
+        if (Missing.NaNCount(w, "k") != 1) { bad = bad + 1; }
+
+        // ---- 9. CSV 往返保持缺失 ----
+        string csv = df.ToCsv();
+        Console.WriteLine("csv=[" + csv.Replace("\r\n", "|") + "]");
+        // 缺失格写成空字段（不是 "0"）。
+        if (csv.IndexOf("1,,3") < 0) { bad = bad + 1; }
+        DataFrame rt = DataFrame.FromCsv(csv);
+        if (Missing.NaNCount(rt, "b") != 1) { bad = bad + 1; }
+        if (Missing.NaNCount(rt, "a") != 1) { bad = bad + 1; }
+        if (rt.Kind("b") != ColKind.Int) { bad = bad + 1; }
+
+        // ---- 10. 整列全空 → Str ----
+        DataFrame blank = DataFrame.FromCsv("s,t\r\n,1\r\n,2\r\n");
+        Console.WriteLine("blank kind s=" + blank.Kind("s") + " t=" + blank.Kind("t"));
+        if (blank.Kind("s") != ColKind.Str) { bad = bad + 1; }
+        if (blank.Kind("t") != ColKind.Int) { bad = bad + 1; }
+
+        // ---- 11. 新建行/新列的格子是缺失（不是 0）----
+        DataFrame built = DataFrame.New();
+        built.AddColumn("num", ColKind.Int);
+        built.AddColumn("name", ColKind.Str);
+        built.AddStrRow("7", "abc");
+        built.AddStrRow("", "def");
+        Console.WriteLine("built missing num=" + Missing.NaNCount(built, "num"));
+        if (Missing.NaNCount(built, "num") != 1) { bad = bad + 1; }
+        // AddColumn 时新建的列对已有行也是缺失。
+        DataFrame built2 = DataFrame.FromCsv("x\r\n1\r\n2\r\n");
+        built2.AddColumn("y", ColKind.Int);
+        if (Missing.NaNCount(built2, "y") != 2) { bad = bad + 1; }
+        // AddRow 后未填的格子也是缺失。
+        DataFrame built3 = DataFrame.FromCsv("x\r\n1\r\n");
+        built3.AddRow();
+        if (Missing.NaNCount(built3, "x") != 1) { bad = bad + 1; }
+
+        // ---- 12. 掩码随 Filter / Copy / SortBy 传播 ----
+        DataFrame f2 = df.Filter((int r) => r < 2);
+        if (Missing.TotalNaNCount(f2) != 2) { bad = bad + 1; }
+        DataFrame cp = df.Copy();
+        if (Missing.TotalNaNCount(cp) != 3) { bad = bad + 1; }
+        // Copy 出来的表改掩码不影响原表。
+        cp.SetInt(1, "a", 99);
+        if (Missing.NaNCount(df, "a") != 1) { bad = bad + 1; }
+
+        Console.WriteLine("missing-values-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

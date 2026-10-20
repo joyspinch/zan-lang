@@ -20,9 +20,12 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   句子 / 段落）
 - `System.Ai` — `AiEndpoint`（base URL → scheme/host/port/path；
   本地端点识别）
-- `System.Ai` — `VectorStore`（向量存储：embedding → `VectorIndex`
-  适配、入库/检索、导出导入往返）
-- `System.Ai` — `Retriever`（混合检索：向量语义 + BM25 字面，RRF 融合）
+- `System.Ai` — `VectorStore`（**内存**向量存储：embedding →
+  `VectorIndex` 适配、入库/检索、导出导入往返）
+- `System.Ai` — `Retriever`（**内存**混合检索：向量语义 + BM25 字面，
+  RRF 融合）
+- `System.Ai` — `ZanDbRetriever`（**持久化**混合检索：文档与索引存在
+  `ZanDb` 里，走事务 + 检查点 + 原生混合检索。**生产路径用这个**）
 - `System.Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
   生成；答案带引用溯源）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
@@ -76,6 +79,50 @@ Console.WriteLine("维度=" + vecs.dimensions);
 double sim = AiEmbedding.Cosine(vecs.At(0), queryVector);
 ```
 
+## 内存版 vs 持久化版：怎么选
+
+| | `VectorStore` + `Retriever`（内存） | `ZanDbRetriever`（持久化） |
+|---|---|---|
+| 存储 | 进程内存 | `ZanDb` collection（有检查点与世代） |
+| 并发写 | **不支持** | 支持（`AsyncRwLock` + 事务 + journal） |
+| 崩溃恢复 | 无（索引全丢） | 有（重开即恢复，`RebuildSearchIndexes` 可重建） |
+| 文档与索引一致性 | 手动维护 | 同一事务，不会脱节 |
+| 适合 | 小规模、单写者、一次性脚本、测试夹具 | 生产路径 |
+
+**为什么内存版不能并发写**：`VectorIndex.Add` 会改 `chunks`/`nodes`/
+`idSlots` 三个共享结构且**没有锁**——并发写会撕裂 HNSW 图（不是"结果
+不准"，是内存结构损坏）。ZanDb 那侧由 `AsyncRwLock` 串行化写、并
+通过 **journal + 检查点**让索引变更与文档写入落在同一事务里。
+
+两者**语义一致**：用同一个 RRF 公式（k=60）融合，命中实体都是
+`RetrieverHit`。conformance 里有一条断言专门盯这个——两个后端对同一
+批数据给出**完全相同的融合分数**（0.032787），所以从内存切到持久化，
+检索结果不会悄悄变样。
+
+持久化版的用法：
+
+```zan
+using System.Data.ZanDb;
+
+ZanDatabase db = ZanDatabase.Open("docs.zz", ZanStore.DUR_SYNC);
+ZanDbRetriever store = new ZanDbRetriever(db, "docs", 1024);  // 维度按模型
+store.SetNormalized(true);
+store.EnsureIndexes();                     // 先建索引再写数据
+
+// 一篇文档一个块：正文进 BM25，向量进 HNSW
+store.AddAll(texts, vectors);              // 批量写（一次事务）
+
+// 混合检索
+List<RetrieverHit> hits = store.Search(queryVector, "退款", 5, 64);
+for (int i = 0; i < hits.Count; i = i + 1) {
+    Console.WriteLine("[" + hits[i].id + "] " + store.TextOf(hits[i].id));
+}
+
+// 要两路的原始排名与分数时用 SearchSplit
+List<RetrieverHit> split = store.SearchSplit(queryVector, "退款", 5, 64);
+// split[i].vectorRank / bm25Rank / vectorDistance / bm25Score
+```
+
 ## 设计要点
 
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
@@ -118,10 +165,10 @@ double sim = AiEmbedding.Cosine(vecs.At(0), queryVector);
 
 ## 已知边界
 
-- 无 RAG 编排（检索→重排→拼提示词→生成的全链条）、无向量库客户端
-  （只有本包内的 `Embeddings` 产出向量，存与检索要靠 `Zan.Data` 的
-  `VectorIndex` 自己接）、无 Tool calling、无会话记忆、无评估与
-  可观测——这些是后续的档位。
+- 无重排层（cross-encoder 二次排序）、无 Tool calling、无会话记忆、
+  无评估与可观测——这些是后续的档位。
+- `ZanDbRetriever` 走的是**进程内**的 `ZanDb`（本地文件）。要做多机
+  共享，得用 `ZanDbClient` / `ZanDbServer` 的远端协议，本包尚未封装。
 - Embeddings 只支持 OpenAI 兼容的 `/v1/embeddings` 协议（DeepSeek、
   OpenAI、Ollama、vLLM、LM Studio 等都兼容这个协议）；不做各厂商
   的私有嵌入协议。

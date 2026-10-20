@@ -12,6 +12,7 @@
 using System;
 using System.Ai;
 using System.Data.ZanDb;
+using System.IO;
 using System.Text;
 
 namespace Conf;
@@ -410,7 +411,137 @@ class Prog {
         if (dtpl.IndexOf("{{context}}") < 0) { bad = bad + 1; }
         if (dtpl.IndexOf("{{question}}") < 0) { bad = bad + 1; }
 
+        // ---- 15. 持久化检索器（ZanDb 后端）：与内存版语义一致 ----
+        //
+        // 内存版 `Retriever` 自己拼 HNSW + BM25；持久化版
+        // `ZanDbRetriever` 走 ZanDb 的原生混合检索。两者的融合公式
+        // 必须相同（RRF，k=60）——否则从内存切到持久化，检索结果会
+        // 悄悄变样。
+        string dbPath = "_scratch/ai_pipeline_zdb.zz";
+        AiTest.CleanDb(dbPath);
+        {
+            ZanDatabase db = ZanDatabase.Open(dbPath, ZanStore.DUR_SYNC);
+            ZanDbRetriever zr = new ZanDbRetriever(db, "docs", 2);
+            zr.SetNormalized(false);
+            if (!zr.EnsureIndexes()) { bad = bad + 1; }
+            Console.WriteLine("zdb indexes ok=" + (zr.lastError.Length == 0 ? 1 : 0));
+
+            List<string> ztexts = new List<string>();
+            ztexts.Add("苹果 手机");
+            ztexts.Add("香蕉 牛奶");
+            ztexts.Add("退款 流程");
+            List<List<double>> zvecs = new List<List<double>>();
+            zvecs.Add(AiTest.V(1.0, 0.0));
+            zvecs.Add(AiTest.V(0.0, 1.0));
+            zvecs.Add(AiTest.V(0.7, 0.7));
+            int added = zr.AddAll(ztexts, zvecs);
+            Console.WriteLine("zdb added=" + added + " count=" + zr.Count());
+            if (added != 3) { bad = bad + 1; }
+            if (zr.Count() != 3) { bad = bad + 1; }
+
+            // 混合检索：向量路 + 字面路。
+            List<RetrieverHit> zh = zr.Search(AiTest.V(1.0, 0.0), "手机", 3, 64);
+            Console.WriteLine("zdb hits=" + zh.Count);
+            if (zh.Count != 3) { bad = bad + 1; }
+            // 最相关的应当是"苹果 手机"（两路都命中）。
+            if (zh.Count > 0 && zh[0].id != 1) { bad = bad + 1; }
+            // RRF 分数：两路都命中 = 1/61 + 1/61 = 0.032787
+            if (zh.Count > 0) {
+                Console.WriteLine("zdb score0=" + F(zh[0].score, 6));
+                if (Math.Abs(zh[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+            }
+
+            // 分两路查：带原始排名与分数。
+            List<RetrieverHit> zs = zr.SearchSplit(AiTest.V(1.0, 0.0), "手机", 3, 64);
+            Console.WriteLine("zdb split=" + zs.Count);
+            if (zs.Count != 3) { bad = bad + 1; }
+            if (zs.Count > 0) {
+                Console.WriteLine("zdb split0 vr=" + zs[0].vectorRank
+                + " br=" + zs[0].bm25Rank + " both=" + zs[0].BothHit());
+                if (zs[0].vectorRank != 1) { bad = bad + 1; }
+                if (zs[0].bm25Rank != 1) { bad = bad + 1; }
+                if (!zs[0].BothHit()) { bad = bad + 1; }
+                // 分数与 Search 的融合分数应当一致。
+                if (Math.Abs(zs[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+            }
+
+            // 维度不符必须被拒（入库前拦住，不让错维度污染索引）。
+            List<double> wrong = new List<double>();
+            wrong.Add(1.0);
+            wrong.Add(2.0);
+            wrong.Add(3.0);
+            if (zr.Add("错的", wrong, "") != -1) { bad = bad + 1; }
+            if (zr.lastError.Length == 0) { bad = bad + 1; }
+            if (zr.Count() != 3) { bad = bad + 1; }
+
+            // 单条写入 + 元数据读回。
+            int one = zr.Add("手机 维修", AiTest.V(0.9, 0.1), "src=a");
+            if (one < 0) { bad = bad + 1; }
+            if (zr.TextOf(one) != "手机 维修") { bad = bad + 1; }
+            if (zr.MetaOf(one) != "src=a") { bad = bad + 1; }
+            zr.Close();
+        }
+
+        // 重开：索引与数据都还在（持久化 + 检查点）。
+        {
+            ZanDatabase db = ZanDatabase.Open(dbPath);
+            ZanDbRetriever zr = new ZanDbRetriever(db, "docs", 2);
+            zr.SetNormalized(false);
+            if (zr.Count() != 4) { bad = bad + 1; }
+            List<RetrieverHit> zh = zr.Search(AiTest.V(1.0, 0.0), "手机", 3, 64);
+            if (zh.Count == 0) { bad = bad + 1; }
+            zr.Close();
+            db.Close();
+            AiTest.CleanDb(dbPath);
+        }
+
+        // 内存版与持久化版的**融合分数必须一致**（同一公式）。
+        {
+            VectorStore vs = new VectorStore(2, false);
+            Bm25Index bm = new Bm25Index();
+            Retriever mem = new Retriever(vs, bm);
+            List<List<double>> mvecs = new List<List<double>>();
+            mvecs.Add(AiTest.V(1.0, 0.0));
+            mvecs.Add(AiTest.V(0.0, 1.0));
+            mvecs.Add(AiTest.V(0.7, 0.7));
+            List<string> mtexts = new List<string>();
+            mtexts.Add("苹果 手机");
+            mtexts.Add("香蕉 牛奶");
+            mtexts.Add("退款 流程");
+            vs.AddAll(mvecs, mtexts, 1);
+            for (int i = 0; i < mtexts.Count; i = i + 1) { bm.Add(i + 1, mtexts[i]); }
+            List<RetrieverHit> mh = mem.Search(AiTest.V(1.0, 0.0), "手机", 3);
+            if (mh.Count != 3) { bad = bad + 1; }
+            if (mh.Count > 0) {
+                Console.WriteLine("mem score0=" + F(mh[0].score, 6)
+                + " zdb score0=" + F(2.0 / 61.0, 6));
+                if (Math.Abs(mh[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+            }
+        }
+
         Console.WriteLine("ai-pipeline-ok: " + (bad == 0 ? 1 : 0));
         return bad == 0 ? 0 : 1;
+    }
+}
+
+// 测试辅助。
+class AiTest {
+    // 二维向量。
+    static List<double> V(double a, double b) {
+        List<double> l = new List<double>();
+        l.Add(a);
+        l.Add(b);
+        return l;
+    }
+
+    // 清掉数据库文件（含锁与段文件）。
+    static void CleanDb(string path) {
+        File.Delete(path);
+        File.Delete(path + ".lock");
+        File.Delete(path + ".m0");
+        File.Delete(path + ".m1");
+        for (int i = 0; i < 100; i = i + 1) {
+            File.Delete(path + ".s" + Convert.ToString(i));
+        }
     }
 }

@@ -1,0 +1,344 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Json;
+using System.Text;
+
+namespace System.Ai;
+
+// 检索器的**持久化后端**：把文档存进 ZanDb，检索走 ZanDb 的原生混合
+// 检索（`Collection.SearchHybrid`）。
+//
+// ## 为什么不是自己拼索引
+//
+// `System.Ai.Retriever`（内存版）自己维护 HNSW 索引 + BM25 索引，
+// 适合小规模、无并发写的场景（单机工具、一次性脚本、测试夹具）。
+//
+// 但**生产路径应该用这一层**：
+//
+// - **并发**：`VectorIndex.Add` 会改 `chunks`/`nodes`/`idSlots` 三个共享
+//   结构，**没有锁**。并发写会撕裂图结构（不是"结果不准"，是内存结构
+//   损坏）。内存版 `Retriever` 只能单写者。
+// - **持久化**：内存版的索引在进程退出就没了；ZanDb 的索引有检查点、
+//   世代（generation）机制，崩溃后能重建。
+// - **一致性**：ZanDb 的索引变更走**事务 + journal + 检查点**——写文档
+//   和索引更新是同一个事务，不会出现"文档写进去了但索引没更新"。
+//
+// ## 存储模型
+//
+// 一个 collection，一篇文档一个块：
+//
+// - 字段 `text`：块的正文（进 BM25 全文索引）
+// - 字段 `embedding`：块的向量（进 HNSW 向量索引）
+// - 字段 `meta`：可选的 JSON 元数据（来源、页码、标题…）
+//
+// ## 与内存版的关系
+//
+// 两者**语义一致**：都用 RRF（k=60）融合向量路与字面路，命中实体都是
+// `RetrieverHit`。ZanDb 的 `CollectionSearch.Hybrid` 用的就是同一个
+// 公式（`1/(61+i)`）。所以从内存版切到持久化版，检索结果应当一致。
+//
+// 但注意：ZanDb 的 `HybridHit` **只带融合分数**，不带两路的原始排名与
+// 分数（内存版 `RetrieverHit` 有）。要用原始分数就分两路查
+// `SearchText` / `SearchVector` 自己合并。
+
+public class ZanDbRetriever {
+    // 数据库。
+    private ZanDatabase db;
+
+    // collection 名。
+    private string collection;
+
+    // 正文字段名。
+    private string textField;
+
+    // 向量字段名。
+    private string vectorField;
+
+    // 元数据字段名。
+    private string metaField;
+
+    // 维度。
+    private int dimensions;
+
+    // 归一化开关（入库与查询都按同一口径）。
+    private bool normalized;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public ZanDbRetriever(ZanDatabase db, string collection, int dimensions) {
+        this.db = db;
+        this.collection = collection;
+        this.textField = "text";
+        this.vectorField = "embedding";
+        this.metaField = "meta";
+        this.dimensions = dimensions;
+        this.normalized = true;
+        this.lastError = "";
+    }
+
+    // 字段名（正文 / 向量 / 元数据）。
+    public void SetFields(string text, string vector, string meta) {
+        this.textField = text;
+        this.vectorField = vector;
+        this.metaField = meta;
+    }
+
+    // 归一化开关（入库与查询同口径；改了必须重建索引）。
+    public void SetNormalized(bool on) {
+        this.normalized = on;
+    }
+
+    // 建索引（文本 + 向量）。**必须在写文档之前调用**。
+    //
+    // 失败返回 false（原因在 lastError）。
+    public bool EnsureIndexes() {
+        this.lastError = "";
+        if (this.db == null) { this.lastError = "没有数据库"; return false; }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            cols.EnsureFullTextIndex(this.textField);
+            cols.EnsureVectorIndex(this.vectorField,
+            new VectorIndexOptions(this.dimensions, 0));
+            return true;
+        } catch (Exception e) {
+            this.lastError = "建索引失败：" + e.Message;
+            return false;
+        }
+    }
+
+    // 写一个块（正文 + 向量 + 元数据），返回文档 id；失败返回 -1。
+    //
+    // 维度不符会被 ZanDb 拒绝（"vector dimensions do not match index"）——
+    // 这正是想要的：入库前就拦住，不要让错维度污染索引。
+    public int Add(string text, List<double> vector, string meta) {
+        this.lastError = "";
+        if (this.db == null) { this.lastError = "没有数据库"; return -1; }
+        if (vector == null || vector.Count != this.dimensions) {
+            this.lastError = "向量维度不符（期望 " + Convert.ToString(this.dimensions)
+            + "，实际 " + Convert.ToString(vector == null ? 0 : vector.Count) + "）";
+            return -1;
+        }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            JsonValue doc = JsonValue.NewObject();
+            doc.PutStr(this.textField, text == null ? "" : text);
+            doc.Put(this.vectorField, ZanDbRetriever.ToJsonArray(vector, this.normalized));
+            if (meta != null && meta.Length > 0) {
+                doc.PutStr(this.metaField, meta);
+            }
+            return cols.Insert(doc);
+        } catch (Exception e) {
+            this.lastError = "写入失败：" + e.Message;
+            return -1;
+        }
+    }
+
+    // 批量写块。
+    //
+    // 用 `InsertBulk`（一次事务写一批）而不是逐条 `Insert`——批量的
+    // 事务开销是常数的，逐条是 N 倍。
+    public int AddAll(List<string> texts, List<List<double>> vectors) {
+        this.lastError = "";
+        if (this.db == null) { this.lastError = "没有数据库"; return -1; }
+        if (texts == null || vectors == null) { this.lastError = "参数为空"; return -1; }
+        if (texts.Count != vectors.Count) {
+            this.lastError = "文本与向量数量不一致";
+            return -1;
+        }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            List<JsonValue> docs = new List<JsonValue>();
+            for (int i = 0; i < texts.Count; i = i + 1) {
+                if (vectors[i] == null || vectors[i].Count != this.dimensions) {
+                    this.lastError = "第 " + Convert.ToString(i) + " 个向量维度不符";
+                    return -1;
+                }
+                JsonValue doc = JsonValue.NewObject();
+                doc.PutStr(this.textField, texts[i] == null ? "" : texts[i]);
+                doc.Put(this.vectorField, ZanDbRetriever.ToJsonArray(vectors[i],
+                this.normalized));
+                docs.Add(doc);
+            }
+            cols.InsertBulk(docs);
+            return docs.Count;
+        } catch (Exception e) {
+            this.lastError = "批量写入失败：" + e.Message;
+            return -1;
+        }
+    }
+
+    // 混合检索（向量 + 字面，RRF 融合）。
+    //
+    // queryVector 可为 null（则只做字面检索）；queryText 可为空串
+    // （则只做语义检索）。
+    //
+    // 返回命中（id 是 ZanDb 的文档 id）；失败返回空列表（原因在
+    // lastError）。
+    public List<RetrieverHit> Search(List<double> queryVector, string queryText,
+    int k, int efSearch) {
+        this.lastError = "";
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.db == null) { this.lastError = "没有数据库"; return outp; }
+        if (k < 1) { return outp; }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            float[] q = queryVector == null ? null
+            : ZanDbRetriever.ToFloatArray(queryVector, this.normalized);
+            List<HybridHit> hits = cols.SearchHybrid(this.textField,
+            queryText == null ? "" : queryText, this.vectorField, q, k,
+            efSearch);
+            for (int i = 0; i < hits.Count; i = i + 1) {
+                RetrieverHit h = RetrieverHit.Of(hits[i].id);
+                h.score = hits[i].score;
+                outp.Add(h);
+            }
+            return outp;
+        } catch (Exception e) {
+            this.lastError = "检索失败：" + e.Message;
+            return outp;
+        }
+    }
+
+    // 分两路查（要两路的原始排名与分数时用）。
+    //
+    // 返回的每个命中带 vectorRank / bm25Rank / vectorDistance / bm25Score
+    // ——与内存版 `Retriever` 的命中实体同构。
+    public List<RetrieverHit> SearchSplit(List<double> queryVector,
+    string queryText, int k, int efSearch) {
+        this.lastError = "";
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.db == null) { this.lastError = "没有数据库"; return outp; }
+        try {
+            Collection cols = this.db.GetCollection(this.collection);
+            Dictionary<int, RetrieverHit> acc = new Dictionary<int, RetrieverHit>();
+            if (queryText != null && queryText.Length > 0) {
+                List<Bm25Hit> b = cols.SearchText(this.textField, queryText, k);
+                for (int i = 0; i < b.Count; i = i + 1) {
+                    RetrieverHit h = RetrieverHit.Of(b[i].id);
+                    h.bm25Rank = i + 1;
+                    h.bm25Score = b[i].score;
+                    acc[b[i].id] = h;
+                }
+            }
+            if (queryVector != null) {
+                float[] q = ZanDbRetriever.ToFloatArray(queryVector, this.normalized);
+                List<VectorHit> v = cols.SearchVector(this.vectorField, q, k,
+                efSearch);
+                for (int i = 0; i < v.Count; i = i + 1) {
+                    RetrieverHit h = RetrieverHit.Of(v[i].id);
+                    if (acc.ContainsKey(v[i].id)) { h = acc[v[i].id]; }
+                    h.vectorRank = i + 1;
+                    h.vectorDistance = v[i].distance;
+                    acc[v[i].id] = h;
+                }
+            }
+            List<int> ids = acc.Keys;
+            for (int i = 0; i < ids.Count; i = i + 1) { outp.Add(acc[ids[i]]); }
+            // 按 RRF 融合分数降序、同分按 id 升序（确定性）。
+            //
+            // 自己算 RRF（1/(k+rank)，k=60）——ZanDb 的 `SearchHybrid`
+            // 会算融合分数，但它**不返回两路的原始排名**，要原始数据就
+            // 分两路查自己合。公式与 `CollectionSearch.Hybrid` 一致
+            // （那边是 1/(61+i)，i 从 0 起，等价于 1/(60+rank)）。
+            for (int i = 0; i < outp.Count; i = i + 1) {
+                RetrieverHit h = outp[i];
+                double s = 0.0;
+                if (h.vectorRank > 0) { s = s + 1.0 / (60.0 + (double)h.vectorRank); }
+                if (h.bm25Rank > 0) { s = s + 1.0 / (60.0 + (double)h.bm25Rank); }
+                h.score = s;
+            }
+            for (int i = 0; i < outp.Count; i = i + 1) {
+                for (int j = i + 1; j < outp.Count; j = j + 1) {
+                    RetrieverHit x = outp[i];
+                    RetrieverHit y = outp[j];
+                    bool swap = false;
+                    if (y.score > x.score) { swap = true; }
+                    else if (y.score == x.score && y.id < x.id) { swap = true; }
+                    if (swap) {
+                        outp[i] = y;
+                        outp[j] = x;
+                    }
+                }
+            }
+            int limit = k < outp.Count ? k : outp.Count;
+            List<RetrieverHit> trimmed = new List<RetrieverHit>();
+            for (int i = 0; i < limit; i = i + 1) { trimmed.Add(outp[i]); }
+            return trimmed;
+        } catch (Exception e) {
+            this.lastError = "检索失败：" + e.Message;
+            return outp;
+        }
+    }
+
+    // 读回某个文档的正文。
+    public string TextOf(int id) {
+        if (this.db == null) { return ""; }
+        Collection cols = this.db.GetCollection(this.collection);
+        JsonValue doc = cols.FindById(id);
+        if (doc == null) { return ""; }
+        JsonValue v = doc.Get(this.textField);
+        return v == null ? "" : v.AsString("");
+    }
+
+    // 读回某个文档的元数据。
+    public string MetaOf(int id) {
+        if (this.db == null) { return ""; }
+        Collection cols = this.db.GetCollection(this.collection);
+        JsonValue doc = cols.FindById(id);
+        if (doc == null) { return ""; }
+        JsonValue v = doc.Get(this.metaField);
+        return v == null ? "" : v.AsString("");
+    }
+
+    // 文档数。
+    public int Count() {
+        if (this.db == null) { return 0; }
+        Collection cols = this.db.GetCollection(this.collection);
+        return cols.Count();
+    }
+
+    // 关闭数据库。
+    public void Close() {
+        if (this.db != null) {
+            this.db.Close();
+            this.db = null;
+        }
+    }
+
+    // double → JSON 数组（可选归一化）。
+    public static JsonValue ToJsonArray(List<double> v, bool normalize) {
+        JsonValue arr = JsonValue.NewArray();
+        if (v == null) { return arr; }
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) { sum = sum + v[i] * v[i]; }
+        double inv = 1.0;
+        if (normalize && sum > 0.0) { inv = 1.0 / Math.Sqrt(sum); }
+        for (int i = 0; i < v.Count; i = i + 1) {
+            arr.Append(JsonValue.NewDouble(v[i] * inv));
+        }
+        return arr;
+    }
+
+    // double → float（可选归一化）。
+    //
+    // 与内存版 `VectorStore.ToFloatArray` 同口径——两边的检索结果应当
+    // 一致（单精度截断的误差约 1e-8，不影响排序）。
+    public static float[] ToFloatArray(List<double> v, bool normalize) {
+        if (v == null) { return new float[0]; }
+        float[] outp = new float[v.Count];
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) {
+            outp[i] = (float)v[i];
+            sum = sum + v[i] * v[i];
+        }
+        if (normalize && sum > 0.0) {
+            double inv = 1.0 / Math.Sqrt(sum);
+            for (int i = 0; i < outp.Length; i = i + 1) {
+                outp[i] = (float)((double)outp[i] * inv);
+            }
+        }
+        return outp;
+    }
+}

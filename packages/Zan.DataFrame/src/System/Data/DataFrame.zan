@@ -44,18 +44,26 @@ public class DataFrame {
 
     // 第 at 列（0 起）的整列类型推断：全部像整数 → Int；
     // 全部像数值（整数或小数/指数形式）→ Float；否则 Str。
+    //
+    // **空字段不算"不像整数"**：空格子是"缺失"，不参与类型推断——
+    // 否则 `1,,3` 会被推成 Str，数字列退化成文本列。
+    // 整列全空 → Str（空串在 Int/Float 语境下无意义）。
     public static int InferKind(CsvTable t, int at) {
         List<List<string>> rows = t.Rows();
         bool allInt = true;
         bool allNum = true;
+        bool anyValue = false;
         for (int r = 0; r < rows.Count; r = r + 1) {
             List<string> row = rows[r];
             string v = at < row.Count ? row[at] : "";
+            if (v.Length == 0) { continue; }
+            anyValue = true;
             bool isInt = DataFrame.LooksInt(v);
             if (!isInt) { allInt = false; }
             if (!isInt && !DataFrame.LooksFloat(v)) { allNum = false; }
             if (!allNum) { break; }
         }
+        if (!anyValue) { return ColKind.Str; }
         if (allInt) { return ColKind.Int; }
         if (allNum) { return ColKind.Float; }
         return ColKind.Str;
@@ -105,12 +113,15 @@ public class DataFrame {
 
     // 加一列（ColKind 值）；新列以默认值补齐到当前行数。
     // 名字重复时本层不拦截（ColIndex 命中第一列）。
+    //
+    // 新列对已有行**没有值** → Int/Float 列的那些格子标记为**缺失**
+    // （不是 0）。"这列在这行没填"与"这行填了 0"是两回事。
     public DataFrame AddColumn(string name, int kind) {
         DataCol c = DataCol.Create(name, kind);
         for (int r = 0; r < this.rowCount; r = r + 1) {
             if (kind == ColKind.Str) { c.Append(""); }
-            else if (kind == ColKind.Int) { c.AppendLong(0); }
-            else { c.AppendDouble(0.0); }
+            else if (kind == ColKind.Int) { c.AppendLong(0); c.MarkMissing(r); }
+            else { c.AppendDouble(0.0); c.MarkMissing(r); }
         }
         this.cols.Add(c);
         return this;
@@ -147,14 +158,17 @@ public class DataFrame {
     }
 
     // 追加一个空行，返回其行号。
+    //
+    // Int/Float 列的新格标记为**缺失**（不是 0）——空行就是"没填"。
+    // 随后 `SetInt`/`SetFloat`/`SetStr` 写入的值会清掉缺失标记。
     public int AddRow() {
         int row = this.rowCount;
         this.rowCount = this.rowCount + 1;
         for (int c = 0; c < this.cols.Count; c = c + 1) {
             int kind = this.cols[c].Kind();
             if (kind == ColKind.Str) { this.cols[c].Append(""); }
-            else if (kind == ColKind.Int) { this.cols[c].AppendLong(0); }
-            else { this.cols[c].AppendDouble(0.0); }
+            else if (kind == ColKind.Int) { this.cols[c].AppendLong(0); this.cols[c].MarkMissing(row); }
+            else { this.cols[c].AppendDouble(0.0); this.cols[c].MarkMissing(row); }
         }
         return row;
     }
@@ -182,6 +196,42 @@ public class DataFrame {
             throw new InvalidOperationException("DataFrame 没有列: " + name);
         }
         return this.cols[at];
+    }
+
+    // 把某列转成新类型（**就地改**，返回本表便于链式调用）。
+    //
+    // 值按 GetDouble/GetStr 口径转换，**缺失标记原样保留**（转类型不该
+    // 改变"有没有值"这件事）。
+    //
+    // 为什么需要它：往 Int 列填小数时不能截断——1.5 填进 Int 列会变成
+    // 1，静默算错。所以要填小数先把列**升成 Float**。
+    //
+    // Str → 数值列时，空串算缺失（与 CSV 装载同口径）；非空但不是数值的
+    // 文本按 Convert.ToDouble 的解析结果（解析不了得 0.0，与本包其它
+    // 跨类型访问一致）。
+    public DataFrame CastColumn(string name, int kind) {
+        int at = this.ColIndex(name);
+        if (at < 0) {
+            throw new InvalidOperationException("DataFrame 没有列: " + name);
+        }
+        DataCol old = this.cols[at];
+        if (old.Kind() == kind) { return this; }
+        DataCol c = DataCol.Create(old.Name(), kind);
+        for (int r = 0; r < old.Count(); r = r + 1) {
+            bool miss = old.IsMissing(r);
+            if (kind == ColKind.Str) {
+                c.Append(old.GetStr(r));
+            } else if (kind == ColKind.Int) {
+                if (miss) { c.AppendLong(0); c.MarkMissing(r); }
+                else { c.AppendLong(old.GetLong(r)); }
+            } else {
+                if (miss) { c.AppendDouble(0.0); c.MarkMissing(r); }
+                else { c.AppendDouble(old.GetDouble(r)); }
+            }
+            if (miss) { c.MarkMissing(r); }
+        }
+        this.cols[at] = c;
+        return this;
     }
 
     // 读单元格为文本。
@@ -323,7 +373,7 @@ public class DataFrame {
 
     // 归并排序（稳定）：对 idx[lo, hi) 排序，tmp 为工作缓冲。
     public static void MergeSort(List<int> idx, List<int> tmp, int lo, int hi,
-                          RowCmpFn cmp) {
+    RowCmpFn cmp) {
         if (hi - lo < 2) { return; }
         int mid = lo + (hi - lo) / 2;
         DataFrame.MergeSort(idx, tmp, lo, mid, cmp);
@@ -366,34 +416,39 @@ public class DataFrame {
     // 对行号集合按列聚合，返回 double（Count 即行数）。
     // Int 列先累 long 求和避免精度损失；Str 列按数值解析。
     // 空集合：Sum/Count 得 0，Avg/Min/Max 得 0。
+    // 行号集合按列聚合。
+    //
+    // **缺失值不参与聚合**（跳过，而不是当 0）：求和/均值/最值都只看
+    // 有效格。`Agg.Count` 仍按行数算（要看有效值个数用
+    // `Missing.ValidCount`）。
+    //
+    // 全部格子都缺失时返回 0.0（沿用本包"空集返回 0"的约定）——不是
+    // NaN：NaN 会顺着下游的平均再平均，污染出一片垃圾。
     public double Aggregate(List<int> rows, string col, int op) {
         if (op == Agg.Count) { return (double)rows.Count; }
         DataCol c = this.ColOrThrow(col);
         if (rows.Count == 0) { return 0.0; }
-        if (op == Agg.Sum && c.Kind() == ColKind.Int) {
-            long s = 0;
-            for (int i = 0; i < rows.Count; i = i + 1) {
-                s = s + c.ints[rows[i]];
-            }
-            return (double)s;
-        }
+        // 收集有效值（缺失的跳过）。
+        int valid = 0;
         double sum = 0.0;
-        double low = c.GetDouble(rows[0]);
+        double low = 0.0;
+        double high = 0.0;
         for (int i = 0; i < rows.Count; i = i + 1) {
-            double v = c.GetDouble(rows[i]);
-            sum = sum + v;
-            if (v < low) { low = v; }
-        }
-        if (op == Agg.Sum) { return sum; }
-        if (op == Agg.Avg) { return sum / (double)rows.Count; }
-        if (op == Agg.Max) {
-            double hi = c.GetDouble(rows[0]);
-            for (int i = 0; i < rows.Count; i = i + 1) {
-                double v = c.GetDouble(rows[i]);
-                if (v > hi) { hi = v; }
+            int r = rows[i];
+            if (c.IsMissing(r)) { continue; }
+            double v = c.GetDouble(r);
+            if (valid == 0) { low = v; high = v; }
+            else {
+                if (v < low) { low = v; }
+                if (v > high) { high = v; }
             }
-            return hi;
+            sum = sum + v;
+            valid = valid + 1;
         }
+        if (valid == 0) { return 0.0; }
+        if (op == Agg.Sum) { return sum; }
+        if (op == Agg.Avg) { return sum / (double)valid; }
+        if (op == Agg.Max) { return high; }
         return low;
     }
 
@@ -467,6 +522,8 @@ public class DataFrame {
 
     // 写出 CSV 文本：表头一行加数据行（CRLF 行尾），
     // 需要引号的字段按 Csv.Escape 处理。往返 Parse(ToCsv()) 等价。
+    //
+    // **缺失格写成空字段**（不是 "0"）——往返后仍是缺失。
     public string ToCsv() {
         StringBuilder sb = new StringBuilder();
         List<string> fields = new List<string>();
@@ -478,7 +535,8 @@ public class DataFrame {
         for (int r = 0; r < this.rowCount; r = r + 1) {
             fields.Clear();
             for (int c = 0; c < this.cols.Count; c = c + 1) {
-                fields.Add(this.cols[c].GetStr(r));
+                if (this.cols[c].IsMissing(r)) { fields.Add(""); }
+                else { fields.Add(this.cols[c].GetStr(r)); }
             }
             sb.Append(Csv.RowToText(fields));
             sb.Append("\r\n");

@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Data;
+
+// 缺失值处理：isna / notna / dropna / fillna。
+//
+// ## 缺失是怎么表达的
+//
+// 列存没有"空单元格"这个概念——每列是强类型的 `List<long>` /
+// `List<double>` / `List<string>`，格子里总有值。所以"缺失"由
+// `DataCol.missing`（与值列表等长的布尔掩码）表达。
+//
+// **为什么不用哨兵值**：`0` 与 `""` 都是合法值。拿 `0` 当缺失的哨兵，
+// 会把"这行没填"和"这行填了 0"混为一谈——而这两者的处理方式常常相反
+// （前者该 drop，后者该保留）。pandas 用 `NaN` 之所以可行，是因为
+// double 有专门的 NaN 位；Zan 的列存是强类型的，没有 NaN 语义。
+//
+// **代价**：每列多一个 `List<bool>`。掩码为空的列 = 无缺失（常见情形），
+// 不占额外内存。
+//
+// ## CSV 的约定
+//
+// - **空字段 → 缺失**（Int/Float 列）。`1,,3` 的中间格是"没填"，
+//   不是"填了 0"。
+// - **空字段 → 空串**（Str 列）。Str 列没有"缺失"与"空串"的区别
+//   （都是长度 0 的字符串），这是类型系统的直接后果，不是取舍。
+// - **整列全空 → 推断为 Str**。空串在 Int/Float 语境下无意义。
+//
+// ## 聚合语义
+//
+// **缺失值不参与聚合**：求和/均值/最值跳过缺失格，而不是当成 0。
+// 这一点与 pandas 一致，但与"缺失当 0"直觉相反——所以
+// `Aggregate` 系列都改成跳过缺失，`Count` 另给 `CountNonMissing`
+// 显式计数。
+//
+// **空集返回 0.0**（沿用本包既有约定）：缺失值全被跳过时，平均值没有
+// 定义，返回 0.0 而不是 NaN——NaN 会顺着下游的平均再平均，污染出一
+// 片垃圾。要区分"没有有效值"与"有效值恰好是 0"，用
+// `ValidCount(col)`。
+
+public class Missing {
+    // 该单元格是否缺失。
+    public static bool IsNaN(DataFrame df, int row, string col) {
+        return df.ColOrThrow(col).IsMissing(row);
+    }
+
+    // 该单元格是否有值。
+    public static bool NotNaN(DataFrame df, int row, string col) {
+        return !df.ColOrThrow(col).IsMissing(row);
+    }
+
+    // 整列的缺失掩码（true = 缺失）。
+    public static List<bool> Mask(DataFrame df, string col) {
+        DataCol c = df.ColOrThrow(col);
+        List<bool> outp = new List<bool>();
+        for (int r = 0; r < df.Rows(); r = r + 1) { outp.Add(c.IsMissing(r)); }
+        return outp;
+    }
+
+    // 整列的有效（不缺失）掩码。
+    public static List<bool> ValidMask(DataFrame df, string col) {
+        DataCol c = df.ColOrThrow(col);
+        List<bool> outp = new List<bool>();
+        for (int r = 0; r < df.Rows(); r = r + 1) { outp.Add(!c.IsMissing(r)); }
+        return outp;
+    }
+
+    // 一行里缺失的列数。
+    public static int NaNCountInRow(DataFrame df, int row) {
+        int n = 0;
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            if (df.cols[c].IsMissing(row)) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 丢掉含缺失的行。
+    //
+    // how = "any"：任一列缺失就丢（pandas 默认）。
+    // how = "all"：所有列都缺失才丢。
+    // subset 为空 = 全部列；给了列名就只看这些列。
+    //
+    // 返回新表（原表不动）。
+    public static DataFrame DropNa(DataFrame df, string how, params string[] subset) {
+        if (how != "any" && how != "all") {
+            throw new ArgumentException("dropna 的 how 只能是 \"any\" 或 \"all\"");
+        }
+        // 判定用哪些列。
+        List<int> cols = Missing.ResolveCols(df, subset);
+        DataFrame outDf = new DataFrame();
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            outDf.cols.Add(DataCol.Create(df.cols[c].Name(), df.cols[c].Kind()));
+        }
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            int missingCount = 0;
+            for (int i = 0; i < cols.Count; i = i + 1) {
+                if (df.cols[cols[i]].IsMissing(r)) { missingCount = missingCount + 1; }
+            }
+            bool drop = how == "any" ? (missingCount > 0) : (missingCount == cols.Count);
+            if (drop) { continue; }
+            for (int c = 0; c < df.ColCount(); c = c + 1) {
+                outDf.cols[c].AppendFrom(df.cols[c], r);
+            }
+            outDf.rowCount = outDf.rowCount + 1;
+        }
+        return outDf;
+    }
+
+    // 丢掉含缺失的行（默认 any、全部列）。
+    public static DataFrame DropNa(DataFrame df) {
+        return Missing.DropNa(df, "any");
+    }
+
+    // 填充缺失值。
+    //
+    // value 是**字符串**（与本包的 GetStr/SetStr 口径一致）：数字列的
+    // 填充值也走字符串→列类型的转换路径（"0"、"3.5"）。
+    // 只填 Int/Float 列（Str 列的"缺失"就是空串，没有独立的缺失态）。
+    //
+    // 返回新表（原表不动）。
+    public static DataFrame FillNa(DataFrame df, string value, params string[] subset) {
+        List<int> cols = Missing.ResolveCols(df, subset);
+        DataFrame outDf = df.Copy();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            int c = cols[i];
+            int kind = outDf.cols[c].Kind();
+            if (kind == ColKind.Str) { continue; }
+            for (int r = 0; r < outDf.Rows(); r = r + 1) {
+                if (outDf.cols[c].IsMissing(r)) {
+                    outDf.cols[c].PutStr(r, value);
+                }
+            }
+        }
+        return outDf;
+    }
+
+    // 用每列自己的填充值填充。
+    //
+    // values 是"列名 → 填充值"的映射（用 Dictionary 而不是平行数组：
+    // 加列时不用同步维护索引关系）。
+    public static DataFrame FillNaByColumn(DataFrame df,
+    Dictionary<string, string> values) {
+        DataFrame outDf = df.Copy();
+        List<string> names = df.Names();
+        for (int i = 0; i < names.Count; i = i + 1) {
+            string name = names[i];
+            if (!values.ContainsKey(name)) { continue; }
+            int c = df.ColIndex(name);
+            int kind = outDf.cols[c].Kind();
+            if (kind == ColKind.Str) { continue; }
+            for (int r = 0; r < outDf.Rows(); r = r + 1) {
+                if (outDf.cols[c].IsMissing(r)) {
+                    outDf.cols[c].PutStr(r, values[name]);
+                }
+            }
+        }
+        return outDf;
+    }
+
+    // 用**列均值/中位数**填充缺失（数值列）。
+    //
+    // method = "mean" | "median"。统计只算有效值（缺失不参与）。
+    //
+    // **Int 列会升成 Float**（当填充值带小数时）：均值 1.5 填进 Int 列
+    // 会被截成 1，静默算错——所以先升类型再填。
+    //
+    // 全列无有效值时不动该列（没有可填的基准）——返回的表里那些格子
+    // 仍然是缺失，不会被填成 0 冒充数据。
+    public static DataFrame FillNaStat(DataFrame df, string method,
+    params string[] subset) {
+        List<int> cols = Missing.ResolveCols(df, subset);
+        DataFrame outDf = df.Copy();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            int c = cols[i];
+            int kind = outDf.cols[c].Kind();
+            if (kind == ColKind.Str) { continue; }
+            List<double> valid = new List<double>();
+            for (int r = 0; r < df.Rows(); r = r + 1) {
+                if (!df.cols[c].IsMissing(r)) { valid.Add(df.cols[c].GetDouble(r)); }
+            }
+            if (valid.Count == 0) { continue; }
+            double fill;
+            if (method == "median") {
+                fill = Stats.Median(valid);
+            } else if (method == "mean") {
+                fill = Stats.Mean(valid);
+            } else {
+                throw new ArgumentException("fillna 的 method 只能是 \"mean\" 或 \"median\"");
+            }
+            // Int 列装不下小数 → 升成 Float（截断会静默算错）。
+            if (kind == ColKind.Int && fill != Math.Floor(fill)) {
+                outDf.CastColumn(outDf.cols[c].Name(), ColKind.Float);
+                c = outDf.ColIndex(outDf.cols[c].Name());
+                kind = ColKind.Float;
+            }
+            for (int r = 0; r < outDf.Rows(); r = r + 1) {
+                if (outDf.cols[c].IsMissing(r)) {
+                    outDf.cols[c].PutDouble(r, fill);
+                }
+            }
+        }
+        return outDf;
+    }
+
+    // 某列的有效值个数（不缺失的格子数）。
+    public static int ValidCount(DataFrame df, string col) {
+        DataCol c = df.ColOrThrow(col);
+        return df.Rows() - c.MissingCount();
+    }
+
+    // 某列的缺失值个数。
+    public static int NaNCount(DataFrame df, string col) {
+        return df.ColOrThrow(col).MissingCount();
+    }
+
+    // 整表缺失格子总数。
+    public static int TotalNaNCount(DataFrame df) {
+        int n = 0;
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            n = n + df.cols[c].MissingCount();
+        }
+        return n;
+    }
+
+    // 解析列集合：空 = 全部列；给了就校验存在。
+    private static List<int> ResolveCols(DataFrame df, string[] subset) {
+        List<int> cols = new List<int>();
+        if (subset == null || subset.Length == 0) {
+            for (int c = 0; c < df.ColCount(); c = c + 1) { cols.Add(c); }
+            return cols;
+        }
+        for (int i = 0; i < subset.Length; i = i + 1) {
+            int at = df.ColIndex(subset[i]);
+            if (at < 0) {
+                throw new ArgumentException("列不存在: " + subset[i]);
+            }
+            cols.Add(at);
+        }
+        return cols;
+    }
+}

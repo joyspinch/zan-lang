@@ -13,6 +13,17 @@ public class DataCol {
     public List<long> ints;
     // Float 列的存储。
     public List<double> nums;
+    // 缺失标记位：与值列表等长，true = 该单元格缺失。
+    //
+    // **为什么用掩码而不是哨兵值**：`0` 与 `""` 都是合法值。用 `0` 当
+    // "缺失"的哨兵，会把"这行没填"和"这行填了 0"混为一谈——而这两种
+    // 情况的处理方式往往相反（前者要 dropna，后者要保留）。pandas 的
+    // `NaN` 之所以好使，是因为 double 有专门的 NaN 位；Zan 的列存是
+    // 强类型的 long/double/string，没有 NaN 语义，所以用**独立的
+    // 掩码位**表达"缺失"这件事本身。
+    //
+    // 掩码为空列表 = 该列无缺失（常见情形，省一份内存）。
+    public List<bool> missing;
 
     public static DataCol Create(string colName, int colKind) {
         DataCol c = new DataCol();
@@ -21,6 +32,7 @@ public class DataCol {
         if (colKind == ColKind.Str) { c.text = new List<string>(); }
         else if (colKind == ColKind.Int) { c.ints = new List<long>(); }
         else { c.nums = new List<double>(); }
+        c.missing = new List<bool>();
         return c;
     }
 
@@ -32,12 +44,61 @@ public class DataCol {
         return this.nums.Count;
     }
 
+    // 该单元格是否缺失。
+    //
+    // 掩码为空 = 整列无缺失（快路径）；掩码比值列表短 = 尾部的格子
+    // 视为不缺失（掩码按需增长，见 MarkMissing）。
+    public bool IsMissing(int row) {
+        if (row >= this.missing.Count) { return false; }
+        return this.missing[row];
+    }
+
+    // 标记某单元格缺失（值仍在存储里，读出来是占位值——所以**读之前
+    // 一定要先判 IsMissing**）。
+    //
+    // 掩码**按需增长**：标记第 row 格时把掩码补齐到 row+1（中间补
+    // false）。不能只在"掩码为空"时补齐——那样追加第二个缺失格时
+    // 掩码不会跟着长，越界。
+    public void MarkMissing(int row) {
+        while (this.missing.Count <= row) {
+            this.missing.Add(false);
+        }
+        this.missing[row] = true;
+    }
+
+    // 取消缺失标记。
+    public void ClearMissing(int row) {
+        if (row >= this.missing.Count) { return; }
+        this.missing[row] = false;
+    }
+
+    // 本列缺失的单元格数。
+    public int MissingCount() {
+        if (this.missing.Count == 0) { return 0; }
+        int n = 0;
+        int limit = this.missing.Count;
+        int total = this.Count();
+        if (total < limit) { limit = total; }
+        for (int i = 0; i < limit; i = i + 1) {
+            if (this.missing[i]) { n = n + 1; }
+        }
+        return n;
+    }
+
     // 追加一个单元格，值按本列类型转换（跨类型写入按
     // GetStr/SetStr 的转换语义）。
+    //
+    // 空串追加到 Int/Float 列会被标记为**缺失**（而不是 0）——CSV 里
+    // 留空的数字格就是"没填"，不是"填了 0"。这跟 pandas 的行为一致。
     public void Append(string v) {
         if (this.kind == ColKind.Str) { this.text.Add(v); }
-        else if (this.kind == ColKind.Int) { this.ints.Add(v.ToInt64()); }
-        else { this.nums.Add(Convert.ToDouble(v)); }
+        else if (this.kind == ColKind.Int) {
+            this.ints.Add(v.ToInt64());
+            if (v.Length == 0) { this.MarkMissing(this.ints.Count - 1); }
+        } else {
+            this.nums.Add(Convert.ToDouble(v));
+            if (v.Length == 0) { this.MarkMissing(this.nums.Count - 1); }
+        }
     }
 
     public void AppendLong(long v) {
@@ -61,29 +122,52 @@ public class DataCol {
     }
 
     // 追加同类型列在 srcRow 行的值（要求两列 kind 相同）。
+    // 缺失标记一并复制。
     public void AppendFrom(DataCol src, int srcRow) {
         if (this.kind == ColKind.Str) { this.text.Add(src.text[srcRow]); }
         else if (this.kind == ColKind.Int) { this.ints.Add(src.ints[srcRow]); }
         else { this.nums.Add(src.nums[srcRow]); }
+        if (src.IsMissing(srcRow)) { this.MarkMissing(this.Count() - 1); }
     }
 
     // 覆盖 row 行（必须已存在）。
+    //
+    // **写入即"有值"**：写空串到 Int/Float 列会标记为缺失（与 Append
+    // 同口径）；写非空值则清掉缺失标记——否则会出现"值是 3 但标记
+    // 仍然缺失"的自相矛盾状态。
     public void PutStr(int row, string v) {
-        if (this.kind == ColKind.Str) { this.text[row] = v; }
-        else if (this.kind == ColKind.Int) { this.ints[row] = v.ToInt64(); }
-        else { this.nums[row] = Convert.ToDouble(v); }
+        if (this.kind == ColKind.Str) {
+            this.text[row] = v;
+            this.ClearMissing(row);
+        } else if (this.kind == ColKind.Int) {
+            this.ints[row] = v.ToInt64();
+            if (v.Length == 0) { this.MarkMissing(row); } else { this.ClearMissing(row); }
+        } else {
+            this.nums[row] = Convert.ToDouble(v);
+            if (v.Length == 0) { this.MarkMissing(row); } else { this.ClearMissing(row); }
+        }
     }
 
     public void PutLong(int row, long v) {
-        if (this.kind == ColKind.Str) { this.text[row] = Convert.ToString(v); }
-        else if (this.kind == ColKind.Int) { this.ints[row] = v; }
-        else { this.nums[row] = (double)v; }
+        if (this.kind == ColKind.Str) {
+            this.text[row] = Convert.ToString(v);
+        } else if (this.kind == ColKind.Int) {
+            this.ints[row] = v;
+        } else {
+            this.nums[row] = (double)v;
+        }
+        this.ClearMissing(row);
     }
 
     public void PutDouble(int row, double v) {
-        if (this.kind == ColKind.Str) { this.text[row] = Convert.ToString(v); }
-        else if (this.kind == ColKind.Int) { this.ints[row] = (long)v; }
-        else { this.nums[row] = v; }
+        if (this.kind == ColKind.Str) {
+            this.text[row] = Convert.ToString(v);
+        } else if (this.kind == ColKind.Int) {
+            this.ints[row] = (long)v;
+        } else {
+            this.nums[row] = v;
+        }
+        this.ClearMissing(row);
     }
 
     public string GetStr(int row) {
@@ -107,13 +191,13 @@ public class DataCol {
 
 // 列式内存表：DataFrame 的最小核心。
 // for (int i = 0; i < gs.Count; i = i + 1) {
-// }
-// 设计要点：
-// - 列存：每列一个类型化列表（long/double/string），CSV 装载时
-// 按整列内容做类型推断；空列推断为 Str。
-// - 跨类型访问自动转换：Int 列 GetStr 得十进制文本，Float 列
-// GetLong 截断；double ↔ 文本走最短往返格式，往返无损。
-// - Filter/SortBy 返回新表；GroupBy 返回的行号组属于原表，
-// 配合 Aggregate 系列使用。
-// - Join 为内连接哈希实现：右表键列不进结果，其余右表列与左表
-// 撞名时加 "_1" 后缀。
+    // }
+    // 设计要点：
+    // - 列存：每列一个类型化列表（long/double/string），CSV 装载时
+    // 按整列内容做类型推断；空列推断为 Str。
+    // - 跨类型访问自动转换：Int 列 GetStr 得十进制文本，Float 列
+    // GetLong 截断；double ↔ 文本走最短往返格式，往返无损。
+    // - Filter/SortBy 返回新表；GroupBy 返回的行号组属于原表，
+    // 配合 Aggregate 系列使用。
+    // - Join 为内连接哈希实现：右表键列不进结果，其余右表列与左表
+    // 撞名时加 "_1" 后缀。
