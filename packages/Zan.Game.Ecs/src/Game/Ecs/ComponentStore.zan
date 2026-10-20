@@ -1,0 +1,108 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Ecs;
+
+// 组件池：一种组件的所有实例，按实体 id 存放。
+//
+// 设计取舍：
+//   - **零反射**：池是泛型类，元素类型在编译期定死，没有"按类型名查
+//     组件"的运行时字典（要那种东西得靠 Gen* 生成代码）。
+//   - **槽位顺序遍历**：实体 id 与值并置在两个平行数组里，按槽位遍历
+//     是连续内存访问；实体 id 只在需要反查时才用。
+//   - **顺序稳定**：删除用顺序搬移（不是 swap-remove），槽位顺序不
+//     变——同种子同操作序列必然同结果，回放与锁步要的就是这个。
+//   - **值类型按值**：结构体组件取出来是副本，改完要 Set 写回；引用
+//     类型组件取出来就是对象本身，直接改。
+public class ComponentStore<T> {
+    // 槽位 → 实体 id。
+    private List<int> entityIds;
+    // 槽位 → 组件值。
+    private List<T> values;
+    // 实体 id → 槽位。
+    private Dictionary<int, int> index;
+    // 缺失实体时返回的零值（单元素盒子：值类型字段不能直接放在泛型
+    // 类里，泛型类的字段布局不随实例特化）。
+    private List<T> zeroBox;
+
+    // 构造组件池。zeroValue 是"实体没有该组件"时 Get 返回的值。
+    public ComponentStore(T zeroValue) {
+        this.entityIds = new List<int>();
+        this.values = new List<T>();
+        this.index = new Dictionary<int, int>();
+        this.zeroBox = new List<T>();
+        this.zeroBox.Add(zeroValue);
+    }
+
+    // 槽位数（组件实例数）。
+    public int SlotCount() {
+        return this.entityIds.Count;
+    }
+
+    // 槽位上的实体 id；越界返回 -1。
+    public int EntityAt(int slot) {
+        if (slot < 0 || slot >= this.entityIds.Count) { return 0 - 1; }
+        return this.entityIds[slot];
+    }
+
+    // 实体是否有该组件。
+    public bool Has(int entity) {
+        return this.index.ContainsKey(entity);
+    }
+
+    // 取组件；实体没有该组件时返回构造时给的零值。
+    public T Get(int entity) {
+        if (!this.index.ContainsKey(entity)) { return this.zeroBox[0]; }
+        return this.values[this.index[entity]];
+    }
+
+    // 取组件；没有该组件时写出参为零值并返回 false。
+    public bool TryGet(int entity, out T value) {
+        if (!this.index.ContainsKey(entity)) {
+            value = this.zeroBox[0];
+            return false;
+        }
+        value = this.values[this.index[entity]];
+        return true;
+    }
+
+    // 写组件（已有则覆盖，否则追加到末尾）。
+    public void Set(int entity, T value) {
+        if (this.index.ContainsKey(entity)) {
+            this.values[this.index[entity]] = value;
+            return;
+        }
+        this.entityIds.Add(entity);
+        this.values.Add(value);
+        this.index[entity] = this.entityIds.Count - 1;
+    }
+
+    // 删组件；返回是否真的删掉了。
+    public bool Remove(int entity) {
+        if (!this.index.ContainsKey(entity)) { return false; }
+        int slot = this.index[entity];
+        this.entityIds.RemoveAt(slot);
+        this.values.RemoveAt(slot);
+        this.index.Remove(entity);
+        for (int i = slot; i < this.entityIds.Count; i = i + 1) {
+            this.index[this.entityIds[i]] = i;
+        }
+        return true;
+    }
+
+    // 清空。
+    public void Clear() {
+        this.entityIds.Clear();
+        this.values.Clear();
+        this.index.Clear();
+    }
+
+    // 把本池挂到世界上：实体销毁时自动清掉它的组件。
+    //
+    // 池**不持有**世界的引用——只让世界持有回调，否则 world → 回调 →
+    // 池 → world 成了 ARC 环，两边都释放不掉。
+    public void Bind(World world) {
+        if (world == null) { return; }
+        world.AddCleanup(e => this.Remove(e));
+    }
+}

@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using Game.Ecs;
+
+// 位置组件（值类型：按值存取，改完要写回）。
+public struct Position {
+    public double x;
+    public double y;
+}
+
+// 速度组件（值类型）。
+public struct Velocity {
+    public double x;
+    public double y;
+}
+
+// 血量组件（引用类型：取出来就是对象，直接改）。
+public class Health {
+    public int hp;
+    public int maxHp;
+    public Health(int hp, int maxHp) {
+        this.hp = hp;
+        this.maxHp = maxHp;
+    }
+}
+
+// 移动系统：位置 += 速度 * dt。
+public class MoveSystem : System {
+    public ComponentStore<Position> positions;
+    public ComponentStore<Velocity> velocities;
+
+    public MoveSystem(ComponentStore<Position> positions,
+                      ComponentStore<Velocity> velocities) {
+        this.positions = positions;
+        this.velocities = velocities;
+        this.name = "move";
+    }
+
+    public override void Update(World world, double dt) {
+        for (int i = 0; i < this.positions.SlotCount(); i = i + 1) {
+            int entity = this.positions.EntityAt(i);
+            if (!this.velocities.Has(entity)) { continue; }
+            Position p = this.positions.Get(entity);
+            Velocity v = this.velocities.Get(entity);
+            p.x = p.x + v.x * dt;
+            p.y = p.y + v.y * dt;
+            this.positions.Set(entity, p);
+        }
+    }
+}
+
+// 受伤系统：血量归零就销毁实体。
+public class DamageSystem : System {
+    public ComponentStore<Health> health;
+    public int killed;
+
+    public DamageSystem(ComponentStore<Health> health) {
+        this.health = health;
+        this.name = "damage";
+        this.killed = 0;
+    }
+
+    public override void Update(World world, double dt) {
+        for (int i = 0; i < this.health.SlotCount(); i = i + 1) {
+            int entity = this.health.EntityAt(i);
+            Health h = this.health.Get(entity);
+            if (h.hp > 0) { continue; }
+            this.killed = this.killed + 1;
+            world.DestroyEntity(entity);
+        }
+    }
+}
+
+// 记录调用顺序的系统（验证分组与顺序）。
+public class TraceSystem : System {
+    public List<string> log;
+    public string tag;
+
+    public TraceSystem(List<string> log, string tag) {
+        this.log = log;
+        this.tag = tag;
+        this.name = tag;
+    }
+
+    public override void Update(World world, double dt) {
+        this.log.Add(this.tag);
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string label, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static void CheckEq(string label, string actual, string expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected [" + expected + "] got [" + actual + "]");
+        }
+    }
+
+    static void CheckEqInt(string label, int actual, int expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected " + expected + " got " + actual);
+        }
+    }
+
+    static void Main() {
+        World world = new World();
+        ComponentStore<Position> positions = new ComponentStore<Position>(new Position());
+        ComponentStore<Velocity> velocities = new ComponentStore<Velocity>(new Velocity());
+        ComponentStore<Health> health = new ComponentStore<Health>(null);
+        positions.Bind(world);
+        velocities.Bind(world);
+        health.Bind(world);
+
+        // 三个实体：两个会动，一个会死。
+        int a = world.CreateEntity();
+        int b = world.CreateEntity();
+        int c = world.CreateEntity();
+        CheckEqInt("entity count", world.EntityCount(), 3);
+        Check("entity alive", world.IsAlive(a));
+
+        Position pa = new Position();
+        pa.x = 10.0;
+        pa.y = 20.0;
+        positions.Set(a, pa);
+        Velocity va = new Velocity();
+        va.x = 1.0;
+        va.y = 2.0;
+        velocities.Set(a, va);
+
+        Position pb = new Position();
+        pb.x = 0.0;
+        pb.y = 0.0;
+        positions.Set(b, pb);
+        Velocity vb = new Velocity();
+        vb.x = -1.0;
+        vb.y = 0.0;
+        velocities.Set(b, vb);
+
+        health.Set(c, new Health(0, 10));
+
+        // 只挂移动系统，先跑一帧。
+        MoveSystem move = new MoveSystem(positions, velocities);
+        world.AddSystem(move);
+        world.Update(0.5);
+
+        Position moved = positions.Get(a);
+        Check("position moved x", moved.x == 10.5);
+        Check("position moved y", moved.y == 21.0);
+        Position movedB = positions.Get(b);
+        Check("position moved b", movedB.x == -0.5);
+        CheckEqInt("slots", positions.SlotCount(), 2);
+
+        // 没有速度的实体不参与移动。
+        int d = world.CreateEntity();
+        Position pd = new Position();
+        pd.x = 5.0;
+        positions.Set(d, pd);
+        world.Update(0.5);
+        Check("no velocity means no move", positions.Get(d).x == 5.0);
+
+        // 延迟销毁：销毁请求在帧末生效。
+        DamageSystem damage = new DamageSystem(health);
+        world.AddSystem(damage);
+        Check("entity alive before update", world.IsAlive(c));
+        world.Update(0.5);
+        Check("entity dead after update", !world.IsAlive(c));
+        CheckEqInt("damage counted", damage.killed, 1);
+        Check("component cleaned up", !health.Has(c));
+        CheckEqInt("entity count after destroy", world.EntityCount(), 3);
+        CheckEqInt("destroyed last frame", world.DestroyedLastFrame(), 1);
+
+        // 重复销毁同一实体：只有第一次生效。
+        int dup = world.CreateEntity();
+        Check("first destroy accepted", world.DestroyEntity(dup));
+        Check("second destroy rejected", !world.DestroyEntity(dup));
+        world.Update(0.1);
+        CheckEqInt("destroyed counted once", world.DestroyedLastFrame(), 1);
+        Check("dup entity gone", !world.IsAlive(dup));
+
+        // 引用类型组件：取出来就是对象，直接改。
+        int e = world.CreateEntity();
+        Health h = new Health(5, 10);
+        health.Set(e, h);
+        Health got = health.Get(e);
+        got.hp = 3;
+        Check("reference component mutated in place", health.Get(e).hp == 3);
+
+        // 缺失组件返回零值。
+        Check("missing component is zero", health.Get(99999) == null);
+        Check("missing position is zero", positions.Get(99999).x == 0.0);
+
+        // TryGet。
+        Health maybe = null;
+        Check("tryget hit", health.TryGet(e, out maybe));
+        Check("tryget value", maybe != null && maybe.hp == 3);
+        Health missing = null;
+        Check("tryget miss", !health.TryGet(99999, out missing));
+
+        /* ---------- 分组与顺序 ---------- */
+        World w2 = new World();
+        List<string> log = new List<string>();
+        w2.AddSystemTo(EcsGroup.PostUpdate, new TraceSystem(log, "post"));
+        w2.AddSystemTo(EcsGroup.PreUpdate, new TraceSystem(log, "pre1"));
+        w2.AddSystem(new TraceSystem(log, "update"));
+        w2.AddSystemTo(EcsGroup.PreUpdate, new TraceSystem(log, "pre2"));
+        w2.Update(0.016);
+        CheckEqInt("trace length", log.Count, 4);
+        CheckEq("trace order", log[0] + "," + log[1] + "," + log[2] + "," + log[3],
+                "pre1,pre2,update,post");
+
+        // 禁用的系统不参与更新。
+        World w3 = new World();
+        List<string> log3 = new List<string>();
+        TraceSystem off = new TraceSystem(log3, "off");
+        off.enabled = false;
+        w3.AddSystem(off);
+        w3.AddSystem(new TraceSystem(log3, "on"));
+        w3.Update(0.016);
+        CheckEqInt("disabled system skipped", log3.Count, 1);
+        CheckEq("only enabled ran", log3[0], "on");
+
+        /* ---------- 查询 ---------- */
+        ComponentStore<Position> qp = new ComponentStore<Position>(new Position());
+        ComponentStore<Velocity> qv = new ComponentStore<Velocity>(new Velocity());
+        Query2<Position, Velocity> q = new Query2<Position, Velocity>(qp, qv);
+        CheckEqInt("query count empty", q.Count(), 0);
+        qp.Set(1, new Position());
+        qp.Set(2, new Position());
+        qv.Set(2, new Velocity());
+        CheckEqInt("query count", q.Count(), 1);
+        int hitEntity = 0;
+        int hitX = 0;
+        q.Each((entity, p, v) => {
+            hitEntity = entity;
+            hitX = (int)p.x;
+        });
+        CheckEqInt("query hit entity", hitEntity, 2);
+
+        Query1<Position> q1 = new Query1<Position>(qp);
+        CheckEqInt("query1 count", q1.Count(), 2);
+        int sum = 0;
+        q1.EachValue((entity, p) => { sum = sum + (int)p.x; });
+        CheckEqInt("query1 sum", sum, 0);
+
+        /* ---------- 确定性：同样的操作序列必须给出同样的结果 ---------- */
+        string run1 = EcsScenario.Run();
+        string run2 = EcsScenario.Run();
+        CheckEq("deterministic replay", run1, run2);
+        Check("scenario produced output", run1.Length > 0);
+
+        if (failures == 0) {
+            Console.WriteLine("ALL ECS TESTS PASSED");
+        } else {
+            Console.WriteLine("ECS FAILURES: " + Convert.ToString(failures));
+        }
+    }
+}
+
+// 确定性场景：固定操作序列，跑两遍必须一模一样。
+public class EcsScenario {
+    public static string Run() {
+        World world = new World();
+        ComponentStore<Position> positions = new ComponentStore<Position>(new Position());
+        ComponentStore<Velocity> velocities = new ComponentStore<Velocity>(new Velocity());
+        positions.Bind(world);
+        velocities.Bind(world);
+        world.AddSystem(new MoveSystem(positions, velocities));
+
+        List<string> outp = new List<string>();
+        for (int i = 0; i < 5; i = i + 1) {
+            int e = world.CreateEntity();
+            Position p = new Position();
+            p.x = (double)i;
+            positions.Set(e, p);
+            Velocity v = new Velocity();
+            v.x = 0.5;
+            velocities.Set(e, v);
+            if (i == 3) { world.DestroyEntity(e); }
+            world.Update(0.1);
+            for (int s = 0; s < positions.SlotCount(); s = s + 1) {
+                Position cur = positions.Get(positions.EntityAt(s));
+                outp.Add(positions.EntityAt(s) + ":" + Convert.ToString(cur.x));
+            }
+        }
+        string text = "";
+        for (int i = 0; i < outp.Count; i = i + 1) {
+            if (i > 0) { text = text + " "; }
+            text = text + outp[i];
+        }
+        return text;
+    }
+}

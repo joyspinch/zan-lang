@@ -156,6 +156,16 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
 * **保留字坑**：`out`、`fixed` 不能作变量名（编译器报 "expected ';'，
   got 'fixed'" 这类看着莫名其妙的错）。
+* **泛型容器的两条现状**（实证，2026-10-21）：
+  - 泛型类里的 `List<T>`（T 是类级类型参数）**装结构体元素**现在可用了：
+    元素类型会按实例替换，写入读回原样（`Zan.Game.Ecs` 的组件池就靠它）。
+  - 但**泛型类不能持有值类型字段**（`class Box<T> { T value; }`）：字段布局
+    不随实例特化，写入会超出槽位 → 堆损坏、读回是垃圾。要在泛型类里放值
+    类型，就放进 `List<T>`（或让泛型类只持有引用类型字段）。详见
+    `TASKS.md` A421。
+* **包级泛型委托可以自己声明**：`public delegate void EcsEach3<T1,T2,T3>(T1 a,
+  T2 b, T3 c);` 合法，可作方法参数（依赖型实例化 `EcsEach3<int, T, U>` 也能用），
+  写 ECS/事件这类"带类型参数的回调"不必绕开泛型。
 
 ## 4. Edit
 

@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Ecs;
+
+// 世界：实体生命周期 + 系统调度。
+//
+// 实体 id 是单调递增的 int（不复用）：旧 id 永远不会指向新实体，
+// 悬垂引用无从发生——省掉"世代号"那套把戏，代价是 id 会一直涨
+// （int 够跑 21 亿次创建，够用）。
+//
+// 销毁是**延迟**的：DestroyEntity 只打标记，真正的清理在帧末
+// （Update 之后）统一做。系统正在遍历组件时销毁实体是常态——
+// 立即删会改坏正在遍历的槽位。
+public class World {
+    // 活着的实体 id（创建顺序）。
+    private List<int> entities;
+    // 实体 id → 在 entities 里的槽位（存活判定走这里，O(1)）。
+    private Dictionary<int, int> entityIndex;
+    // 本帧请求销毁的实体 id。
+    private List<int> pendingDestroy;
+    // 已注册的系统（按加入顺序）。
+    private List<System> systems;
+    // 实体销毁时的清理回调（每个组件池注册一个）。
+    private List<ActionT<int>> cleanups;
+    // 下一个实体 id。
+    private int nextId;
+    // 本帧已销毁的实体数（统计用）。
+    private int destroyedLastFrame;
+
+    public World() {
+        this.entities = new List<int>();
+        this.entityIndex = new Dictionary<int, int>();
+        this.pendingDestroy = new List<int>();
+        this.systems = new List<System>();
+        this.cleanups = new List<ActionT<int>>();
+        this.nextId = 1;
+        this.destroyedLastFrame = 0;
+    }
+
+    /* ---------- 实体 ---------- */
+
+    // 新建实体，返回它的 id。
+    public int CreateEntity() {
+        int id = this.nextId;
+        this.nextId = this.nextId + 1;
+        this.entityIndex[id] = this.entities.Count;
+        this.entities.Add(id);
+        return id;
+    }
+
+    // 实体是否还活着。
+    public bool IsAlive(int entity) {
+        return this.entityIndex.ContainsKey(entity);
+    }
+
+    // 活着的实体数。
+    public int EntityCount() {
+        return this.entities.Count;
+    }
+
+    // 活着的实体 id 列表（只读视图：不要改）。
+    public List<int> Entities() {
+        return this.entities;
+    }
+
+    // 请求销毁实体。真正的清理在帧末统一做。
+    // 重复销毁同一实体只有第一次生效。
+    public bool DestroyEntity(int entity) {
+        if (!this.IsAlive(entity)) { return false; }
+        for (int i = 0; i < this.pendingDestroy.Count; i = i + 1) {
+            if (this.pendingDestroy[i] == entity) { return false; }
+        }
+        this.pendingDestroy.Add(entity);
+        return true;
+    }
+
+    // 立即执行待销毁的清理（不等帧末）。
+    public void Flush() {
+        if (this.pendingDestroy.Count == 0) { return; }
+        for (int i = 0; i < this.pendingDestroy.Count; i = i + 1) {
+            int entity = this.pendingDestroy[i];
+            for (int c = 0; c < this.cleanups.Count; c = c + 1) {
+                this.cleanups[c](entity);
+            }
+        }
+        this.destroyedLastFrame = this.pendingDestroy.Count;
+        this.RemoveDestroyedEntities();
+    }
+
+    // 把待销毁的实体从活实体表里摘掉（原地改，保持创建顺序）。
+    public void RemoveDestroyedEntities() {
+        if (this.pendingDestroy.Count == 0) { return; }
+        for (int d = this.pendingDestroy.Count - 1; d >= 0; d = d - 1) {
+            int dead = this.pendingDestroy[d];
+            for (int i = this.entities.Count - 1; i >= 0; i = i - 1) {
+                if (this.entities[i] == dead) {
+                    this.entities.RemoveAt(i);
+                    break;
+                }
+            }
+        }
+        // 槽位整体前移，重建索引。
+        this.entityIndex.Clear();
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            this.entityIndex[this.entities[i]] = i;
+        }
+        this.pendingDestroy.Clear();
+    }
+
+    /* ---------- 系统 ---------- */
+
+    // 加一个系统（默认 Update 组）。
+    public void AddSystem(System system) {
+        if (system == null) { return; }
+        this.systems.Add(system);
+    }
+
+    // 把系统放进指定更新组。
+    public void AddSystemTo(EcsGroup group, System system) {
+        if (system == null) { return; }
+        system.group = group;
+        this.systems.Add(system);
+    }
+
+    // 系统数量。
+    public int SystemCount() {
+        return this.systems.Count;
+    }
+
+    // 取系统（按加入顺序）。
+    public System SystemAt(int index) {
+        if (index < 0 || index >= this.systems.Count) { return null; }
+        return this.systems[index];
+    }
+
+    // 跑一帧：按 PreUpdate → Update → PostUpdate 的顺序更新系统，
+    // 帧末统一清理被销毁的实体。
+    public void Update(double dt) {
+        this.RunGroup(EcsGroup.PreUpdate, dt);
+        this.RunGroup(EcsGroup.Update, dt);
+        this.RunGroup(EcsGroup.PostUpdate, dt);
+        this.Flush();
+    }
+
+    // 跑一个更新组里的系统（按加入顺序）。
+    public void RunGroup(EcsGroup group, double dt) {
+        for (int i = 0; i < this.systems.Count; i = i + 1) {
+            System s = this.systems[i];
+            if (!s.enabled) { continue; }
+            if (s.group != group) { continue; }
+            s.Update(this, dt);
+        }
+    }
+
+    /* ---------- 清理回调 ---------- */
+
+    // 注册实体销毁时的清理回调（组件池用 Bind 自动注册）。
+    public void AddCleanup(ActionT<int> cleanup) {
+        if (cleanup == null) { return; }
+        this.cleanups.Add(cleanup);
+    }
+
+    // 上一帧销毁的实体数。
+    public int DestroyedLastFrame() {
+        return this.destroyedLastFrame;
+    }
+}

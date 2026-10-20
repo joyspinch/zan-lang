@@ -120,6 +120,43 @@ TTY 语义的应用显式 `Cli.EnableColor(false)`。
 conformance：`cli_output`（转义序列、作用域样式、显示宽度、补齐截断、三种
 表格边框、CJK 表格等宽、进度条、提示解析与提示文本）。
 
+### 1.5 游戏 ECS：`Zan.Game.Ecs`
+
+新包 `packages/Zan.Game.Ecs`，命名空间 `Game.Ecs`（游戏包布局：
+`packages/Zan.Game.<Module>/src/Game/<Module>/`）。`Game/Core/Entity.zan` 的
+OOP 实体基类**不动**——它是"一个对象一个实体"的写法，与 ECS 是两种范式，
+并存即可，不必强拆。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `ComponentStore.zan` | `ComponentStore<T>` | 组件池：实体 id ↔ 槽位 ↔ 值，删除保序 |
+| `World.zan` | `World` | 实体生命周期、延迟销毁、清理回调、系统调度 |
+| `System.zan` | `System` | 系统基类（抽象 `Update`） |
+| `EcsGroup.zan` | `EcsGroup` | `PreUpdate` / `Update` / `PostUpdate` |
+| `Query.zan` | `Query1<T>` / `Query2<T,U>` | 类型化查询与遍历回调 |
+
+**三条硬取舍**：
+
+1. **零反射**：组件池是泛型类，元素类型编译期定死；没有"按类型名查组件"的
+   运行时字典（要那种得靠 `Gen*` 生成代码）。
+2. **稳定序**：删除用顺序搬移而非 swap-remove，槽位顺序不变——同种子同操作
+   序列必然同结果（本仓库有 lockstep 与回放，确定性是硬需求）。
+3. **延迟销毁**：`DestroyEntity` 只打标记，帧末统一清理。系统遍历组件途中
+   销毁实体是常态，立即删会改坏正在遍历的槽位。
+
+**落地时踩出的编译器缺陷（已修）**：泛型类的 `this.field` 不做类型实参替换，
+字段声明里的 `List<T>` 停在类型参数上 → 元素类型判成擦除指针 → 结构体元素
+写进去的是临时对象地址，读回即野指针（0xC0000005）。指针大小的元素恰好蒙对，
+所以此前没人发现。修在 `irgen_expr_core.c` 的 `member_access_field_type`，
+回归用例 `generic_dependent_list`。
+
+**已知边界**：泛型类**不能持有值类型字段**（字段布局不随实例特化），组件池
+因此把"缺失实体的零值"放进单元素 `List<T>` 盒子。编译器侧修法见
+`TASKS.md` A421。
+
+conformance：`ecs_world`（组件读写、延迟销毁与清理、分组顺序、禁用系统、
+查询命中、值/引用组件语义、确定性重放）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -162,7 +199,7 @@ conformance：`cli_output`（转义序列、作用域样式、显示宽度、补
 
 | 建议包 | C# 参考 | ★ | 现状 → 缺口 | 工期 |
 |---|---|---|---|---|
-| `Zan.Game.Ecs` | DefaultEcs / Unity ml-agents | 榜外 / 19,771 | `Game/Core/Entity.zan` 是 OOP 实体 → 组件池 + system 调度 + 结构化遍历 | 3–4 周 |
+| `Zan.Game.Ecs` | DefaultEcs / Unity ml-agents | 榜外 / 19,771 | ✅ 已落地 `packages/Zan.Game.Ecs`（`Game.Ecs`：类型化组件池 + 延迟销毁 + 分组系统调度 + 稳定序查询，见 §1.5） | — |
 | `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | **几何检测已有**（`Arcade2D/Collision2D` + `AdvancedCollision2D`：射线、AABB、分离轴粗筛）→ 缺**动力学层**：积分器、约束/关节、旋转体（OBB/多边形 SAT）、连续碰撞、穿透修正 | 3–4 周 |
 | `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | 只有棋盘 `GridPathfinder` + 塔防 `FlowField` → A*/JPS、导航网格、路径平滑 | 2–3 周 |
@@ -198,7 +235,7 @@ conformance：`cli_output`（转义序列、作用域样式、显示宽度、补
 ## 6. 落地顺序
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
-**第 2 批（游戏纵深）**：`Zan.Game.Ecs` → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
+**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
