@@ -1,0 +1,231 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 对话记忆——多轮对话的历史。
+//
+// ## 为什么需要这一层
+//
+// 一次 `Rag.Ask` 是**无状态**的：每次都只带当前问题。多轮对话里模型
+// 记不住上一轮说了什么，于是要每轮重发全部历史——历史放不下时就得
+// 裁，裁哪几条又得想清楚。这一层就是管这件事。
+//
+// ## 三条设计决定
+//
+// ### 1) 按**轮**裁，不按**条**裁
+//
+// 一轮 = 一次用户提问 + 一次模型回答。**成对**的。裁到一半（一半提
+// 问没回答，或一半回答没提问）上下文就是断的——模型看到"我上一轮问
+// 了什么"却没有"我上一轮得到什么"，容易重复提问、答非所问。所以裁
+// 剪以**轮**为单位：超预算就整轮丢掉，从最老的一轮开始丢。
+//
+// ### 2) 预算按 token 算，不按条数算
+//
+// 条数不反映长度（一条 10 字和一条 2000 字差 200 倍）。用
+// `Chunking.EstimateTokens`（与 `AiClient.EstimateTokens` 同一把尺子）
+// 估 token，超预算就丢最老的轮。
+//
+// ### 3) **系统提示不参与裁剪**
+//
+// 系统提示（人设、规则、格式要求）不是"历史"，它是**当前指令**——
+// 裁掉了模型就变了个人格/忘了规矩。裁剪只动 system 之后的部分。
+//
+// ## 状态放哪
+//
+// 瞬时（进程内、随用随丢）就够：`Conversation` 持一份 `List<AiMessage>`。
+// 要跨进程/跨重启留存，调用方自己把它序列化落盘——本包不预设存储
+// 后端（那会绑死部署形态）。落盘用 `JsonValue`（`AiMessage` 的字段
+// 少，直接手写 JSON 序列化/反序列化就够，不必引反射式序列化器）。
+
+public class Conversation {
+    // 历史消息（**按时间顺序**）。
+    private List<AiMessage> messages;
+
+    // token 预算（历史部分的预算；系统提示不占）。
+    private int budgetTokens;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public Conversation() {
+        this.messages = new List<AiMessage>();
+        this.budgetTokens = 2000;
+        this.lastError = "";
+    }
+
+    // token 预算（默认 2000）。
+    //
+    // 0 或负数表示**不限制**（历史全留）——调试时有用，但线上要设，
+    // 否则长对话会把提示词撑爆（钱和延迟都爆）。
+    public void SetBudgetTokens(int tokens) {
+        this.budgetTokens = tokens;
+    }
+
+    // 当前预算。
+    public int BudgetTokens() { return this.budgetTokens; }
+
+    // 历史条数。
+    public int Count() { return this.messages.Count; }
+
+    // 全部历史（按时间顺序）。
+    public List<AiMessage> Messages() { return this.messages; }
+
+    // 加一条消息。
+    public void Add(AiMessage message) {
+        if (message == null) { return; }
+        this.messages.Add(message);
+        this.Trim();
+    }
+
+    // 加一条用户消息。
+    public void AddUser(string content) {
+        this.Add(AiMessage.User(content));
+    }
+
+    // 加一条助手消息。
+    public void AddAssistant(string content) {
+        this.Add(AiMessage.Assistant(content));
+    }
+
+    // 清空历史。
+    public void Clear() { this.messages.Clear(); }
+
+    // 历史占用的 token（估算）。
+    public int UsedTokens() {
+        int sum = 0;
+        for (int i = 0; i < this.messages.Count; i = i + 1) {
+            sum = sum + Chunking.EstimateTokens(this.messages[i].content);
+        }
+        return sum;
+    }
+
+    // 裁剪到预算内。
+    //
+    // **按轮裁**：一轮 = 一条用户消息 + 紧跟的助手消息（成对）。裁到
+    // 一半（一半提问没回答，或一半回答没提问）上下文就是断的——模型
+    // 看到"我上一轮问了什么"却没有"我上一轮得到什么"，容易重复提问、
+    // 答非所问。所以裁剪以**轮**为单位。
+    //
+    // 两条边界规则：
+    //
+    // 1. **当前轮不裁**：最后一条还没有助手回答的用户消息（正在进行的
+    //    那一轮）必须保留——裁了就丢了当前提问。
+    // 2. **至少留最新的一轮**：没有进行中的轮时，至少保住最新那次问答。
+    //    预算小到装不下一轮时，宁可超预算也不把历史清空（有历史总比
+    //    没历史好，调用方该调大预算而不是得到一个空壳）。
+    //
+    // 系统提示**不动**（它是当前指令，不是历史）。
+    void Trim() {
+        if (this.budgetTokens <= 0) { return; }
+        if (this.UsedTokens() <= this.budgetTokens) { return; }
+        int count = this.messages.Count;
+
+        // 1) 找"进行中的轮"：最后一条**后面没有助手消息**的用户消息。
+        int pending = -1;
+        for (int i = count - 1; i >= 0; i = i - 1) {
+            if (!this.messages[i].IsUser()) { continue; }
+            bool answered = false;
+            for (int j = i + 1; j < count; j = j + 1) {
+                if (this.messages[j].IsAssistant()) { answered = true; break; }
+            }
+            if (!answered) { pending = i; }
+            break;
+        }
+        // 可裁区域 = 进行中的轮之前（或全部，若没有进行中的轮）。
+        int regionEnd = pending >= 0 ? pending : count;
+
+        // 2) 收集完整轮的起点（**从新到旧**）：一轮的起点是它的用户
+        //    消息的位置。
+        List<int> starts = new List<int>();
+        int i = regionEnd - 1;
+        while (i >= 0) {
+            int j = i;
+            while (j >= 0 && !this.messages[j].IsUser()) { j = j - 1; }
+            if (j < 0) { break; }
+            starts.Add(j);
+            i = j - 1;
+        }
+
+        // 3) 从最老的轮开始整轮丢，丢到不超预算为止。
+        int total = this.UsedTokens();
+        int dropCount = 0;
+        for (int k = starts.Count - 1; k >= 0; k = k - 1) {
+            if (total <= this.budgetTokens) { break; }
+            int start = starts[k];
+            int end = k == 0 ? regionEnd - 1 : starts[k - 1] - 1;
+            for (int j = start; j <= end; j = j + 1) {
+                total = total - Chunking.EstimateTokens(this.messages[j].content);
+            }
+            dropCount = end + 1;
+        }
+
+        // 4) 下限：不能把可裁区域全丢了。
+        //
+        //    有进行中的轮 → 它受保护，dropCount 不能超过 regionEnd。
+        //    没有进行中的轮 → 至少留住最新那一轮（starts[0]）。
+        int maxDrop = regionEnd;
+        if (pending < 0 && starts.Count > 0) { maxDrop = starts[0]; }
+        if (dropCount > maxDrop) { dropCount = maxDrop; }
+
+        if (dropCount > 0) {
+            // 从最前面逐条删（`List` 没有 `RemoveRange`）。
+            for (int k = 0; k < dropCount; k = k + 1) {
+                this.messages.RemoveAt(0);
+            }
+        }
+    }
+
+    // 拼成给补全服务用的消息列表。
+    //
+    // systemPrompt 非空时**放在最前面**（且不受裁剪影响——它每轮都要
+    // 带上）。它不写进 `messages`（那是历史，不是当前指令）。
+    public List<AiMessage> Build(string systemPrompt) {
+        List<AiMessage> outp = new List<AiMessage>();
+        if (systemPrompt != null && systemPrompt.Length > 0) {
+            outp.Add(AiMessage.System(systemPrompt));
+        }
+        for (int i = 0; i < this.messages.Count; i = i + 1) {
+            outp.Add(this.messages[i]);
+        }
+        return outp;
+    }
+
+    // 导出成 JSON（落盘用）。
+    public string ToJson() {
+        System.Json.JsonValue arr = System.Json.JsonValue.NewArray();
+        for (int i = 0; i < this.messages.Count; i = i + 1) {
+            System.Json.JsonValue m = System.Json.JsonValue.NewObject();
+            m.PutStr("role", this.messages[i].role);
+            m.PutStr("content", this.messages[i].content);
+            arr.Append(m);
+        }
+        return arr.ToJson();
+    }
+
+    // 从 JSON 恢复（落盘读回用）。
+    //
+    // 坏 JSON → 返回 false，原因在 lastError。
+    public bool FromJson(string json) {
+        this.messages.Clear();
+        if (json == null || json.Length == 0) { return true; }
+        System.Json.JsonValue root = null;
+        try {
+            root = System.Json.JsonValue.Parse(json);
+        } catch (Exception e) {
+            this.lastError = "会话内容无法解析";
+            return false;
+        }
+        if (root == null || !root.IsArray()) {
+            this.lastError = "会话内容格式不对";
+            return false;
+        }
+        for (int i = 0; i < root.Count(); i = i + 1) {
+            System.Json.JsonValue m = root.At(i);
+            if (m == null) { continue; }
+            this.messages.Add(new AiMessage(m.Str("role", "user"),
+            m.Str("content", "")));
+        }
+        return true;
+    }
+}

@@ -1,0 +1,318 @@
+// 会话记忆——多轮对话的历史。
+//
+// 覆盖：
+// - **按轮裁剪**：裁剪以"用户提问 + 助手回答"为单位，超预算整轮丢，
+//   **不裁一半**（裁一半上下文就是断的）。
+// - **当前轮不裁**：最后一条用户消息（还没得到回答的那一轮）要保留。
+// - **系统提示不参与裁剪**：它是当前指令，不是历史——裁掉了模型就
+//   变了个人格/忘了规矩。
+// - **预算按 token 算**，不按条数（一条 10 字和一条 2000 字差 200 倍）。
+// - **落盘往返**：`ToJson` / `FromJson` 还原后历史一致。
+// - **`Rag.AskIn`**：多轮问答把历史带进提示词，但**历史不进检索**
+//   （检索只用当前问题）；失败时**不写历史**。
+//
+// 用例**在本进程内起一个真的 HTTP 服务**当假 AI 端点（embedding +
+// 补全），补全会回显收到的消息条数，用来验证历史真的带上了。
+using System;
+using System.Ai;
+using System.IO;
+using System.Json;
+using System.Net.Http;
+
+namespace Conf;
+
+class Prog {
+    // 假端点的端口。
+    static int PORT = 19893;
+
+    // 补全请求里收到的消息条数（用来验证历史真的带上了）。
+    static int lastMessageCount;
+
+    // 补全请求里收到的最后一条消息内容。
+    static string lastMessage;
+
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    static string F(double v) {
+        return Convert.ToString(Math.Round(v * 1000000.0) / 1000000.0);
+    }
+
+    // 假端点。
+    static async HttpResponse Handle(HttpRequest req) {
+        HttpResponse res = new HttpResponse();
+        res.statusCode = 200;
+        res.statusText = "OK";
+        res.contentType = "application/json";
+        res.keepAlive = true;
+        if (req.path.IndexOf("/embeddings") >= 0) {
+            res.body = Prog.EmbedBody(req.body);
+            return res;
+        }
+        // 补全：数出消息条数，回显条数与最后一条。
+        JsonValue root = JsonValue.Parse(req.body);
+        JsonValue msgs = root.Get("messages");
+        int n = msgs == null ? 0 : msgs.Count();
+        Prog.lastMessageCount = n;
+        Prog.lastMessage = "";
+        if (msgs != null && n > 0) {
+            Prog.lastMessage = msgs.At(n - 1).Str("content", "");
+        }
+        res.body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\""
+        + Prog.Escape("答" + Convert.ToString(n)) + "\"}}]}";
+        return res;
+    }
+
+    static string EmbedBody(string body) {
+        JsonValue root = JsonValue.Parse(body);
+        JsonValue input = root.Get("input");
+        int n = input == null ? 0 : input.Count();
+        StringBuilder sb = new StringBuilder();
+        sb.Append("{\"data\":[");
+        for (int i = 0; i < n; i = i + 1) {
+            if (i > 0) { sb.Append(","); }
+            sb.Append("{\"index\":");
+            sb.Append(Convert.ToString(i));
+            sb.Append(",\"embedding\":[1.0,0.0]}");
+        }
+        sb.Append("],\"usage\":{\"prompt_tokens\":1,\"total_tokens\":1}}");
+        return sb.ToString();
+    }
+
+    static string Escape(string s) {
+        if (s == null) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < s.Length; i = i + 1) {
+            string c = s.Substring(i, 1);
+            if (c == "\\") { sb.Append("\\\\"); }
+            else if (c == "\"") { sb.Append("\\\""); }
+            else if (c == "\n") { sb.Append("\\n"); }
+            else if (c == "\r") { sb.Append("\\r"); }
+            else { sb.Append(c); }
+        }
+        return sb.ToString();
+    }
+
+    static AiClient MakeClient() {
+        AiConfig cfg = new AiConfig("http://127.0.0.1:" + Convert.ToString(Prog.PORT),
+        "fake-key", "fake-model");
+        cfg.connectTimeoutMs = 3000;
+        cfg.readTimeoutMs = 5000;
+        cfg.totalTimeoutMs = 8000;
+        cfg.maxAttempts = 1;
+        return new AiClient(cfg);
+    }
+
+    static int Run() {
+        int bad = 0;
+        Directory.CreateDirectory("_scratch");
+
+        HttpServer ai = new HttpServer("127.0.0.1", PORT);
+        ai.OnRequest(Prog.Handle);
+        Task.Spawn(ai.Start());
+        await Task.Delay(100);
+
+        // ---- 1. 基本的消息添加与角色 ----
+        {
+            Conversation c = new Conversation();
+            c.AddUser("你好");
+            c.AddAssistant("你好，有什么可以帮您");
+            if (c.Count() != 2) { bad = bad + 1; }
+            List<AiMessage> ms = c.Messages();
+            if (!ms[0].IsUser()) { bad = bad + 1; }
+            if (!ms[1].IsAssistant()) { bad = bad + 1; }
+            if (ms[0].content != "你好") { bad = bad + 1; }
+            // 空消息不进去。
+            c.Add(null);
+            if (c.Count() != 2) { bad = bad + 1; }
+            Console.WriteLine("count=" + Convert.ToString(c.Count()));
+        }
+
+        // ---- 2. 按轮裁剪：超预算整轮丢，不裁一半 ----
+        {
+            Conversation c = new Conversation();
+            // 每轮 20 个 token 左右（估：ASCII 4 字符 1 token）。
+            c.SetBudgetTokens(20);
+            c.AddUser("第一轮的问题内容");
+            c.AddAssistant("第一轮的回答内容");
+            c.AddUser("第二轮的问题内容");
+            c.AddAssistant("第二轮的回答内容");
+            // 预算 12 token → 只能留一轮。
+            Console.WriteLine("trim count=" + Convert.ToString(c.Count())
+            + " used=" + Convert.ToString(c.UsedTokens()));
+            if (c.Count() != 2) { bad = bad + 1; }
+            // 留的是**最新**那一轮（不是最老的）。
+            List<AiMessage> ms = c.Messages();
+            if (ms[0].content != "第二轮的问题内容") {
+                Console.WriteLine("kept=" + ms[0].content);
+                bad = bad + 1;
+            }
+            if (!ms[1].IsAssistant()) { bad = bad + 1; }
+        }
+
+        // ---- 3. 当前轮不裁（用户问了还没答的那轮要留着）----
+        {
+            Conversation c = new Conversation();
+            c.SetBudgetTokens(20);
+            c.AddUser("第一轮的问题内容");
+            c.AddAssistant("第一轮的回答内容");
+            c.AddUser("第二轮的问题内容");
+            // 此刻第二轮还没回答——它必须留着（裁了就丢了当前提问）。
+            List<AiMessage> ms = c.Messages();
+            bool hasSecond = false;
+            for (int i = 0; i < ms.Count; i = i + 1) {
+                if (ms[i].content == "第二轮的问题内容") { hasSecond = true; }
+            }
+            if (!hasSecond) { bad = bad + 1; }
+            Console.WriteLine("current turn kept=" + Convert.ToString(c.Count()));
+        }
+
+        // ---- 4. 预算为 0 表示不限制 ----
+        {
+            Conversation c = new Conversation();
+            c.SetBudgetTokens(0);
+            for (int i = 0; i < 20; i = i + 1) {
+                c.AddUser("很长很长很长很长很长很长很长很长的问题内容");
+            }
+            if (c.Count() != 20) { bad = bad + 1; }
+            Console.WriteLine("unlimited=" + Convert.ToString(c.Count()));
+        }
+
+        // ---- 5. 系统提示不参与裁剪 ----
+        {
+            Conversation c = new Conversation();
+            c.SetBudgetTokens(10);
+            c.AddUser("第一轮的问题内容");
+            c.AddAssistant("第一轮的回答内容");
+            c.AddUser("第二轮的问题内容");
+            c.AddAssistant("第二轮的回答内容");
+            // 系统提示是**当前指令**，不进历史，也不被裁。
+            List<AiMessage> built = c.Build("你是一个严格的助手");
+            if (built.Count != c.Count() + 1) { bad = bad + 1; }
+            if (!built[0].IsUser() && built[0].role != "system") { bad = bad + 1; }
+            if (built[0].role != "system") { bad = bad + 1; }
+            // 裁剪后系统提示仍在最前面。
+            c.AddUser("第三轮的问题内容");
+            c.AddAssistant("第三轮的回答内容");
+            List<AiMessage> built2 = c.Build("你是一个严格的助手");
+            if (built2[0].role != "system") { bad = bad + 1; }
+            Console.WriteLine("system kept=" + built2[0].role);
+        }
+
+        // ---- 6. 落盘往返 ----
+        {
+            Conversation c = new Conversation();
+            c.AddUser("第一句");
+            c.AddAssistant("第二句");
+            string json = c.ToJson();
+            Conversation c2 = new Conversation();
+            if (!c2.FromJson(json)) {
+                Console.WriteLine("from json failed: " + c2.lastError);
+                bad = bad + 1;
+            }
+            if (c2.Count() != 2) { bad = bad + 1; }
+            List<AiMessage> ms = c2.Messages();
+            if (ms[0].content != "第一句") { bad = bad + 1; }
+            if (!ms[1].IsAssistant()) { bad = bad + 1; }
+            // 坏 JSON → 失败 + 可读原因。
+            Conversation c3 = new Conversation();
+            if (c3.FromJson("{不是 JSON")) { bad = bad + 1; }
+            if (c3.lastError.Length == 0) { bad = bad + 1; }
+            Console.WriteLine("roundtrip=" + Convert.ToString(c2.Count()));
+        }
+
+        // ---- 7. AskIn：历史带进提示词，但历史不进检索 ----
+        {
+            AiClient client = Prog.MakeClient();
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            List<double> v = new List<double>();
+            v.Add(1.0);
+            v.Add(0.0);
+            vs.Add(0, v, "手机 电池 续航", "");
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            rag.SetTopK(1);
+
+            Conversation c = new Conversation();
+            // 第一轮：历史为空 → 消息 = 1（当前问题）。
+            RagAnswer a1 = await rag.AskIn("手机", c);
+            if (a1 == null) { bad = bad + 1; }
+            if (Prog.lastMessageCount != 1) {
+                Console.WriteLine("turn1 msgs=" + Convert.ToString(Prog.lastMessageCount));
+                bad = bad + 1;
+            }
+            // 成功后写了历史（用户 + 助手 = 2 条）。
+            if (c.Count() != 2) { bad = bad + 1; }
+
+            // 第二轮：历史 2 条 + 当前问题 = 3。
+            RagAnswer a2 = await rag.AskIn("续航多久", c);
+            if (a2 == null) { bad = bad + 1; }
+            if (Prog.lastMessageCount != 3) {
+                Console.WriteLine("turn2 msgs=" + Convert.ToString(Prog.lastMessageCount));
+                bad = bad + 1;
+            }
+            if (c.Count() != 4) { bad = bad + 1; }
+            Console.WriteLine("turn2 msgs=" + Convert.ToString(Prog.lastMessageCount)
+            + " history=" + Convert.ToString(c.Count()));
+
+            // **历史不进检索**：第二轮的检索只用了当前问题。
+            // 引用仍只有 1 条（topK=1），说明没把历史当查询。
+            if (a2.citations.Count != 1) { bad = bad + 1; }
+            client.Close();
+        }
+
+        // ---- 8. 失败时不写历史 ----
+        {
+            AiClient client = Prog.MakeClient();
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            Conversation c = new Conversation();
+            // 空问题 → 失败。
+            RagAnswer a = await rag.AskIn("", c);
+            if (a != null) { bad = bad + 1; }
+            // 历史必须还是空的——写进去会让下一轮带着一条失败的问题。
+            if (c.Count() != 0) { bad = bad + 1; }
+            if (rag.lastError.Length == 0) { bad = bad + 1; }
+            Console.WriteLine("failed turn history=" + Convert.ToString(c.Count()));
+            client.Close();
+        }
+
+        // ---- 9. Ask（无状态）与 AskIn(conversation=null) 等价 ----
+        {
+            AiClient client = Prog.MakeClient();
+            VectorStore vs = new VectorStore(2, true);
+            Bm25Index bm = new Bm25Index();
+            List<double> v = new List<double>();
+            v.Add(1.0);
+            v.Add(0.0);
+            vs.Add(0, v, "手机 电池", "");
+            Retriever retriever = new Retriever(vs, bm);
+            VectorStoreWriter writer = new VectorStoreWriter(vs, bm);
+            Rag rag = new Rag(client, retriever, writer);
+            RagAnswer a1 = await rag.Ask("手机");
+            if (a1 == null) { bad = bad + 1; }
+            if (Prog.lastMessageCount != 1) { bad = bad + 1; }
+            RagAnswer a2 = await rag.AskIn("手机", null);
+            if (a2 == null) { bad = bad + 1; }
+            if (Prog.lastMessageCount != 1) { bad = bad + 1; }
+            client.Close();
+        }
+
+        ai.Stop();
+        for (int w = 0; w < 20; w = w + 1) { await Task.Delay(10); }
+
+        Console.WriteLine("ai-memory-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

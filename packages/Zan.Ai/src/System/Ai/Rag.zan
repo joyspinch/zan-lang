@@ -168,7 +168,24 @@ public class Rag {
     // 在线问答：检索 → 拼提示词 → 调补全。
     //
     // 返回答案（含引用）；失败返回 null（原因在 lastError）。
+    //
+    // 这是**无状态**的一问一答。要多轮对话用 `AskIn`（带历史）。
     public async RagAnswer Ask(string question) {
+        return await this.AskIn(question, null);
+    }
+
+    // 多轮问答：带历史。
+    //
+    // conversation 为 null 时等价于 `Ask`（无状态）。
+    //
+    // **历史不进检索**——检索只用当前问题（历史里的旧问题对当前问题
+    // 没有帮助，混进去会拉偏召回）。历史只进**提示词**。
+    //
+    // 成功返回答案（含引用）；失败返回 null（原因在 lastError）。
+    //
+    // 失败时**不写历史**——写进去会让下一轮带着一条失败的问题，模型
+    // 以为自己问过而没得到答案。
+    public async RagAnswer AskIn(string question, Conversation conversation) {
         this.lastError = "";
         if (this.client == null) { this.lastError = "没有客户端"; return null; }
         if (this.retriever == null) { this.lastError = "没有检索器"; return null; }
@@ -259,12 +276,29 @@ public class Rag {
         string prompt = this.template;
         prompt = Rag.ReplaceToken(prompt, "{{context}}", answer.context);
         prompt = Rag.ReplaceToken(prompt, "{{question}}", question);
-        string reply = await this.client.Complete("", prompt);
+        string reply = "";
+        if (conversation == null) {
+            reply = await this.client.Complete("", prompt);
+        } else {
+            // 带历史：历史 + 当前问题（当前问题作为最后一条 user 消息）。
+            List<AiMessage> msgs = conversation.Build("");
+            msgs.Add(AiMessage.User(prompt));
+            reply = await this.client.CompleteMessages(msgs, 0.0, "");
+        }
         if (reply == null) {
             this.lastError = "生成失败：" + this.client.lastError;
             return null;
         }
         answer.text = reply;
+
+        // 7) 写历史（成功才写）。
+        //
+        // 写的顺序是"用户问 → 助手答"——**一轮成对**，这样
+        // `Conversation` 的按轮裁剪才对得上。
+        if (conversation != null) {
+            conversation.AddUser(prompt);
+            conversation.AddAssistant(reply);
+        }
         return answer;
     }
 
