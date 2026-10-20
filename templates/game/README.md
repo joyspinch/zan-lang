@@ -67,8 +67,40 @@ IDE 的"新建项目"按这个标签分组。
 - **包 = 一类游戏共用的机制**：与具体玩法/美术无关的通用子系统。
   已经抽出去的：`Zan.Game.Factory`（工厂自动化 + 塔防的物流/配方/科技/波次/存档，
   实例在仓库外的 `D:/project/games/coreforge`，那边只剩渲染与 HUD）。
+- **共享美术层 = 跨模板通用的资源**：[`assets/game/`](../../assets/game/style.md)
+  放色板、绘制规则、可平铺纹理与 UI 底板；通用纹理**拷贝**进各模板自己的
+  `assets/`，拷贝是复制不是引用——这样每个模板项目仍然独立自包含、可单独发布。
 
 判断口径：**这段代码换个游戏还成立吗？** 成立 → 进包；只对这个游戏成立 → 留模板。
+
+## 共享什么，不共享什么（硬约束）
+
+**共享的是机制与通用资源；不共享模板本身。**
+
+- ✅ 共享：`packages/` 里的通用机制、`assets/game/` 里的色板/纹理/UI 底板、
+  `scripts/gen_game_art.ps1` 的统一风格串。
+- ❌ 不共享：**不存在"公共模板"**。每个模板是**独立项目**：自己的 `src/`、
+  自己的 `assets/`、自己的入口与玩法。模板之间不许互相引用文件，
+  `templates/` 下也不许出现 `_common` / `base` / `shared` 这类公共骨架目录。
+
+为什么：模板是"怎么做一个游戏"的示范，被当成公共骨架后，每个项目都要改一遍
+公共代码，改动互相打架，修复也无法回流。要复用就抽包（`packages/`），
+项目里 `using` 调包，而不是"复制公共模板再改"。
+
+这两条由门禁自动检查（`scripts/check_game_templates.py`，已接进
+`scripts/gate_templates.ps1`）：
+
+1. **资源引用完整性** —— 源码里写死的 `assets/xxx.png` 必须存在，
+   否则运行时静默退化成色块；
+2. **模板独立性** —— 模板之间无交叉引用、无公共模板目录；
+3. **素材不是色块** —— 唯一颜色数 / 尺寸 / 体积下限。
+
+## 美术基线
+
+美术规范、色板与共享纹理在 [`assets/game/style.md`](../../assets/game/style.md)。
+新素材用共享风格串生成（`scripts/gen_game_art.ps1` 默认自动带上），
+这样不同品类的插画也成一套，但**素材本身仍是各模板自己的**——
+不共用同一张图，不做公共美术模板。
 
 ## 加一个游戏模板
 
@@ -77,4 +109,6 @@ IDE 的"新建项目"按这个标签分组。
 2. `template.manifest` 必填 `name` / `category` / `category.zh` / `type` / `entry` /
    `order`；`category` 用已有品类标签，别自造近义分类
 3. `README.md` 写清玩法、编译命令、源码分工与扩展点
-4. 跑门禁：`scripts/gate_templates.ps1 -Filter game/<名字>`
+4. 素材：按 `assets/game/style.md` 的规则生成真美术（不是色块），
+   放自己的 `assets/`；通用纹理从 `assets/game/textures/` 拷一份进来
+5. 跑门禁：`scripts/gate_templates.ps1 -Filter game/<名字>`

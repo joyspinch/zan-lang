@@ -185,4 +185,18 @@ else {
     Write-Output ("templates={0}  failed={1}" -f $rows.Count, $failed)
 }
 
+# ---- 素材与独立性检查 ----------------------------------------------------
+# 编译过了不代表画面能看：源码引用的资源可能不存在（运行时静默变色块），
+# 素材本身可能是纯色块，模板之间也可能互相引用（那就不是独立项目）。
+$checker = Join-Path $Root 'scripts/check_game_templates.py'
+if (Get-Command python -ErrorAction SilentlyContinue) {
+    $checkOut = & python $checker 2>&1
+    $checkExit = $LASTEXITCODE
+    $checkOut | ForEach-Object { Write-Output $_ }
+    if ($checkExit -ne 0) { $failed++ }
+}
+else {
+    Write-Output 'NOTE: python not found - skipped game template art checks'
+}
+
 if ($failed -gt 0) { exit 1 } else { exit 0 }
