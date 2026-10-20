@@ -409,6 +409,49 @@ conformance `procgen_wfc`（WFC 求解与全坍缩、邻接规则成立、同 se
 （同 seed 只能出一张图，想换一张得换 seed）；房间走廊只有 L 形（先横后竖，
 不拐第二种形状）；拼接只支持横向一行，且各块高度不等时下方补空。
 
+### 1.12 游戏公共基座：`Zan.Game.Common`
+
+新包 `packages/Zan.Game.Common`，命名空间 `Game.Common`。补上 16 套游戏模板
+之间反复重写的那部分：**存档**、**飘字**、**血条**、**冷却条**、**背包格**、
+**小地图**。每个模板都自带一份 `Profile`（手搓 key=value 文本解析）、一份
+`Popup`（裸字段的飘字）、自己的背包格与冷却逻辑——换个游戏抄一遍，抄出三种
+口径。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `ProfileStore.zan` | `ProfileStore` | 键值型存档：JSON + format 版本标记 + 原子替换 + `.bak` 备份恢复 |
+| `FloatText.zan` | `FloatText` / `FloatTextLayer` | 飘字：上升 + 淡出，池化复用，容量硬上限 |
+| `HealthBar.zan` | `HealthBar` | 血条：真实值 + 掉血残影（滞后追赶），回血立即跟随 |
+| `Cooldown.zan` | `Cooldown` | 冷却条：剩余比例口径统一 + 充能（可连按） |
+| `Inventory.zan` | `InventorySlot` / `Inventory` | 背包格：堆叠规则（先堆叠后开格）+ JSON 往返 |
+| `Minimap.zan` | `Minimap` / `MinimapEntity` / `MinimapLayer` | 小地图：世界→像素投影 + 视口剔除 + 帧内标记复用 |
+
+**六条硬取舍**：
+
+1. **模型与渲染分离**：本包只产出数据，不碰 Gui / SpriteBatch——所以这些
+   逻辑能无头跑、能被 conformance 逐条断言、能换任何渲染后端（与
+   `Zan.Game.Particles` 同一原则）。
+2. **存档损坏不毁档**：读不出来就返回 `false` + 原因，内存不清空、磁盘不删；
+   写盘先写 `.tmp`、读回校验通过才顶替正式文件，替换前留 `.bak`。玩家可能
+   手动抢救，程序无权替他销毁。
+3. **版本标记拒绝加载**：旧档不该被新代码悄悄按新语义改写（"high=100" 在
+   新版本可能是别的意思）。
+4. **血条只在受伤方向留残影**：回血立即跟随——血条慢慢往上爬看着像掉血。
+5. **冷却条口径只有一个**：`Ratio()` 是剩余比例（1 = 刚按下，0 = 就绪），
+   UI 不用再猜方向；`Progress()` = 1 - `Ratio()`。
+6. **容量硬上限 + 满了不新增**：飘字层与标记层满了就丢弃并计数
+   （`DroppedCount()`）——静默吞掉会让"飘字偶尔不出现"这类 bug 查不出来。
+
+conformance `game_common`（存档往返/默认值/格式不符拒绝/损坏拒绝/原文件保留/
+原子替换不留 .tmp/备份恢复、飘字生成上升淡出过期回收池复用池满丢弃、血条
+比例与夹取与残影滞后追赶与回血立即跟随、冷却条口径与充能与冷却中不可触发与
+瞬发不耗充能、背包先堆叠后开格与满包剩余与取出清空与 JSON 往返与坏档不改
+背包、小地图映射与视口剔除与全图模式与帧内复用）。
+
+**已知边界**：无加密存档（明文 JSON，防篡改需自行套一层）；无多槽位管理
+（一个实例一个文件）；背包不支持装备位/权重/排序；小地图只做投影与剔除，
+绘制归渲染层；飘字只有垂直上升（横向漂移自己设 `vx`）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -463,7 +506,7 @@ conformance `procgen_wfc`（WFC 求解与全坍缩、邻接规则成立、同 se
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
 | `Zan.Game.Debug` | ImGui.NET | 榜外 | 无 → 帧剖析覆盖层、实体检查器、内存精灵缓存可视化 | 2–3 周 |
-| `Zan.Game.Common` | — | — | 13 套模板重复代码（每套自带 Particle/Profile/Popup/存档）→ 公共基座：存档、飘字、血条、背包格、冷却条、小地图 | 2–3 周 |
+| `Zan.Game.Common` | — | — | ✅ 已落地 `packages/Zan.Game.Common`（`Game.Common`：版本化存档 + 飘字 + 血条残影 + 冷却条充能 + 背包堆叠 + 小地图投影，见 §1.12） | — |
 | `Zan.Game.Profiler` | LiteMonitor / LibreHardwareMonitor | 6,682 / 9,236 | prof 走廊只打 stdout → 帧预算分析器、分配热点、硬件指标面板 | 2 周 |
 
 ---
@@ -488,7 +531,7 @@ conformance `procgen_wfc`（WFC 求解与全坍缩、邻接规则成立、同 se
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
-**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common`
+**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

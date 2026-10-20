@@ -1,0 +1,113 @@
+using System;
+
+namespace Game.Common;
+
+// 冷却条模型：技能/道具的冷却计时 + 充能。
+//
+// **它替代什么**：模板里每个带冷却的技能都自己写一遍"剩余时间、
+// 剩余比例、能不能放"。抄一遍就有三种口径：有的用"已过比例"、
+// 有的用"剩余比例"，UI 拿错方向会画出反向的扇形。
+//
+// **口径只有一个**：
+//
+// - `Ratio()` = **剩余**比例（1 = 刚按下，0 = 就绪）。UI 画扇形遮罩
+//   或进度条都按这个来：遮罩从满到空。
+// - `Progress()` = 已过比例（0 = 刚按下，1 = 就绪）。= 1 - Ratio()。
+//
+// **充能（charges）**：默认 1（普通冷却）。> 1 时表示"可以连按几次"：
+// 每次 `Start()` 消耗一次充能并（重）启计时器；计时器归零时充能一次性
+// 回满。`Ready()` 要求"计时器已归零 **且** 还有充能"——所以冷却中的
+// 按钮不会因为"还剩一次充能"而提前亮起来。
+//
+// **零时长技能**：`duration <= 0` 时 `Start()` 直接成功且**不消耗充能**
+// （瞬发技能不该被冷却锁住）。
+//
+// **并发**：非线程安全，模型只在主循环里推进。
+public class Cooldown {
+    // 单次冷却时长（秒）。
+    public double duration;
+    // 剩余时间（秒）。
+    public double remaining;
+    // 剩余充能数。
+    public int charges;
+    // 充能上限。
+    public int maxCharges;
+
+    public Cooldown(double duration) {
+        this.duration = duration > 0.0 ? duration : 0.0;
+        this.remaining = 0.0;
+        this.maxCharges = 1;
+        this.charges = 1;
+    }
+
+    // 设置充能上限（链式），并**把当前充能补满**。
+    //
+    // 为什么补满：充能数是"现在能按几次"，上限是"最多能有几次"。改上限
+    // 却让当前充能少于上限，玩家会看到"明明设了 3 次却只能按 1 次"——
+    // 上限是配置，充能是运行时状态，改配置不该把运行时状态扣掉。
+    public Cooldown WithCharges(int n) {
+        this.maxCharges = n > 0 ? n : 1;
+        this.charges = this.maxCharges;
+        return this;
+    }
+
+    // 是否可以释放。
+    public bool Ready() {
+        return this.remaining <= 0.0 && this.charges > 0;
+    }
+
+    // 触发冷却。成功返回 true；没有充能时返回 false（状态不变）。
+    public bool Start() {
+        if (this.duration <= 0.0) {
+            // 瞬发技能：不消耗充能，直接可用。
+            this.remaining = 0.0;
+            return true;
+        }
+        if (this.charges <= 0) { return false; }
+        this.charges = this.charges - 1;
+        this.remaining = this.duration;
+        return true;
+    }
+
+    // 推进一帧。计时器归零时充能回满。
+    public void Step(double dt) {
+        if (dt <= 0.0) { return; }
+        if (this.remaining <= 0.0) {
+            // 空闲时把充能补满（Step 可能在 Start 之前被调用）。
+            this.charges = this.maxCharges;
+            return;
+        }
+        this.remaining = this.remaining - dt;
+        if (this.remaining <= 0.0) {
+            this.remaining = 0.0;
+            this.charges = this.maxCharges;
+        }
+    }
+
+    // 剩余时间（秒）。
+    public double Remaining() { return this.remaining; }
+
+    // 剩余比例（1 = 刚触发，0 = 就绪）。UI 按这个画遮罩。
+    public double Ratio() {
+        if (this.duration <= 0.0) { return 0.0; }
+        double r = this.remaining / this.duration;
+        if (r < 0.0) { return 0.0; }
+        if (r > 1.0) { return 1.0; }
+        return r;
+    }
+
+    // 已过比例（0 = 刚触发，1 = 就绪）。
+    public double Progress() { return 1.0 - this.Ratio(); }
+
+    // 重置：计时器归零、充能回满。
+    public void Reset() {
+        this.remaining = 0.0;
+        this.charges = this.maxCharges;
+    }
+
+    // 改冷却时长（链式）。不改当前剩余时间。
+    public Cooldown WithDuration(double d) {
+        this.duration = d > 0.0 ? d : 0.0;
+        return this;
+    }
+}

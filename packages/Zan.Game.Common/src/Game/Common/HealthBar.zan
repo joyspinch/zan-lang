@@ -1,0 +1,130 @@
+using System;
+
+namespace Game.Common;
+
+// 血条模型：当前血量 + **掉血缓冲**（白色残影条）。
+//
+// **它替代什么**：模板里每个 RPG/塔防都自己写一遍"当前血量、显示血量、
+// 血量掉下去时白色条慢慢追上来"。这套逻辑抄一遍就有三种写法，最容易
+// 出错的是"白色条比红条长"（残影没追平就消失）或"回血时白条也慢半拍"。
+//
+// **两条硬取舍**：
+//
+// 1. **受伤才有滞后，回血立即跟随**：`display` 只在 `display > current`
+//    （刚挨打）时按 `lagRate` 每秒追赶；一旦 `current` 超过 `display`
+//    （回血），显示值立刻跳到当前值。回血还慢慢爬，看着像掉血。
+// 2. **比例以 max 为分母**：`Ratio()` 与 `DisplayRatio()` 用同一个分母，
+//    满血时两者都必须是 1。血量上限变化时两者一起夹取，不会出现
+//    "上限改了但残影还挂在旧分母上"。
+//
+// **并发**：非线程安全，模型只在主循环里推进。
+public class HealthBar {
+    // 血量上限。
+    public double max;
+    // 真实血量。
+    public double current;
+    // 显示血量（残影）。
+    public double display;
+    // 残影追赶速度（点/秒）。<= 0 表示立即跟随。
+    public double lagRate;
+
+    // 初始满血。
+    public HealthBar(double max) {
+        this.max = max > 0.0 ? max : 1.0;
+        this.current = this.max;
+        this.display = this.max;
+        this.lagRate = 0.0;
+    }
+
+    // 设置残影追赶速度（链式）。<= 0 表示立即跟随。
+    public HealthBar WithLag(double rate) {
+        this.lagRate = rate;
+        return this;
+    }
+
+    // 改血量上限。血量按比例保留还是夹取？
+    //
+    // **夹取**：上限调小（升级失败、debuff）时血量不会超过新上限；
+    // 上限调大时血量保持不变（不是按比例补满）——"升级加 20 点上限"
+    // 与"升级回满"是两种不同的游戏设计，库不该替用户选。
+    public void SetMax(double m) {
+        if (m <= 0.0) { return; }
+        this.max = m;
+        if (this.current > this.max) { this.current = this.max; }
+        if (this.display > this.max) { this.display = this.max; }
+    }
+
+    // 直接设血量（夹到 [0, max]）。
+    //
+    // 回血方向（current 上升）**不产生残影**：显示值立刻跟随。
+    // 挨打方向（current 下降）才留残影——那是"刚掉了多少"的视觉提示。
+    public void SetValue(double v) {
+        if (v < 0.0) { v = 0.0; }
+        if (v > this.max) { v = this.max; }
+        this.current = v;
+        if (this.display <= this.current) { this.display = this.current; }
+    }
+
+    // 扣血。返回实际扣掉的量（已按 0 夹取）。
+    public double Damage(double amount) {
+        if (amount <= 0.0) { return 0.0; }
+        double before = this.current;
+        this.current = this.current - amount;
+        if (this.current < 0.0) { this.current = 0.0; }
+        return before - this.current;
+    }
+
+    // 回血。返回实际回上的量（已按 max 夹取）。
+    //
+    // 回血**立即反映到显示值**：没有残影。血条慢慢往上爬看着像掉血。
+    public double Heal(double amount) {
+        if (amount <= 0.0) { return 0.0; }
+        double before = this.current;
+        this.current = this.current + amount;
+        if (this.current > this.max) { this.current = this.max; }
+        if (this.display <= this.current) { this.display = this.current; }
+        return this.current - before;
+    }
+
+    // 推进一帧：残影追赶。
+    public void Step(double dt) {
+        if (dt <= 0.0) { return; }
+        if (this.display <= this.current) {
+            // 没在挨打（或刚回血）：显示值立刻跟随，不留残影。
+            this.display = this.current;
+            return;
+        }
+        if (this.lagRate <= 0.0) {
+            this.display = this.current;
+            return;
+        }
+        this.display = this.display - this.lagRate * dt;
+        if (this.display < this.current) { this.display = this.current; }
+    }
+
+    // 真实血量比例（0..1）。
+    public double Ratio() {
+        if (this.max <= 0.0) { return 0.0; }
+        double r = this.current / this.max;
+        if (r < 0.0) { return 0.0; }
+        if (r > 1.0) { return 1.0; }
+        return r;
+    }
+
+    // 显示血量比例（0..1），残影未追平时小于 Ratio。
+    public double DisplayRatio() {
+        if (this.max <= 0.0) { return 0.0; }
+        double r = this.display / this.max;
+        if (r < 0.0) { return 0.0; }
+        if (r > 1.0) { return 1.0; }
+        return r;
+    }
+
+    // 残影是否还在（显示值高于真实值）。
+    public bool IsGhosting() {
+        return this.display > this.current;
+    }
+
+    // 是否已空血。
+    public bool IsDead() { return this.current <= 0.0; }
+}

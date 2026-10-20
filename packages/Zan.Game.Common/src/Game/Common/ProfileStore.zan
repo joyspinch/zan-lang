@@ -1,0 +1,300 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace Game.Common;
+
+// 存档基座：键值型 profile 的读写。
+//
+// **它替代什么**：13 套游戏模板各写了一份自己的 Profile——手搓
+// `key=value` 文本解析、手搓默认值、手搓写盘，换个游戏再抄一遍。
+// 这里给一份统一基座，模板只留"这个游戏记什么"。
+//
+// **四条硬取舍**：
+//
+// 1. **JSON 持久化，走 JsonValue**：不拼字符串。存档里有引号、换行、
+//    中文、emoji 时，手拼的转义一定会错。
+// 2. **带 format 版本标记**：版本不符 → 拒绝加载。旧档不该被新代码
+//    悄悄按新语义改写（"high=100" 在旧版本是最高分，在新版本可能是别的
+//    意思，静默改写的代价远大于拒绝加载）。
+// 3. **损坏即拒绝，且不动原文件**：读不出来就返回 false + 原因，
+//    内存里的值保持原样（不清空），磁盘上的文件也不删——玩家可能
+//    手动抢救，程序无权替他销毁。
+// 4. **原子替换 + 留备份**：先写 `.tmp`，读回校验通过才替换正式文件；
+//    替换前把旧档挪到 `.bak`。写盘中途断电不会毁掉原档。
+//
+// **失败可区分**：`Save()` / `Load()` 返回 bool，`LastError()` 给原因
+// （空串 = 没出错）。
+//
+// **并发**：非线程安全，面向游戏主循环。跨线程共享由调用方加锁
+// （锁的粒度该由调用方决定，库不替他猜）。
+public class ProfileStore {
+    // 存档格式标记。
+    public static string Format() { return "zan-profile-1"; }
+
+    // 存档文件路径。
+    private string path;
+    // 当前内存中的键值对象（始终是 JSON object）。
+    private JsonValue values;
+    // 最近一次失败的说明（空串 = 没失败）。
+    private string lastError;
+
+    // 默认档：路径 "zan_profile.json"。
+    public ProfileStore() {
+        this.path = "zan_profile.json";
+        this.values = JsonValue.NewObject();
+        this.lastError = "";
+    }
+
+    public ProfileStore(string path) {
+        this.path = path != null && path.Length > 0 ? path : "zan_profile.json";
+        this.values = JsonValue.NewObject();
+        this.lastError = "";
+    }
+
+    // 换路径（链式）。
+    public ProfileStore WithPath(string p) {
+        if (p != null && p.Length > 0) { this.path = p; }
+        return this;
+    }
+
+    // 当前路径。
+    public string Path() { return this.path; }
+
+    // 最近一次失败原因（空串 = 没失败）。
+    public string LastError() { return this.lastError; }
+
+    // 磁盘上是否已有存档文件。
+    public bool Exists() { return File.Exists(this.path); }
+
+    // 键数量。
+    public int Count() { return this.values.Count(); }
+
+    // 全部键（按写入顺序）。
+    public List<string> Keys() {
+        List<string> outList = new List<string>();
+        int n = this.values.Count();
+        for (int i = 0; i < n; i = i + 1) {
+            outList.Add(this.values.KeyAt(i));
+        }
+        return outList;
+    }
+
+    // 是否有这个键。
+    public bool Has(string key) { return this.values.Has(key); }
+
+    // 删一个键（不存在时返回 false）。
+    public bool Remove(string key) { return this.values.Remove(key); }
+
+    // 清空全部键（不动磁盘）。
+    public void Clear() { this.values = JsonValue.NewObject(); }
+
+    /* ---------- 取值：缺失或类型不符一律回落到默认值 ---------- */
+
+    public string GetString(string key, string dflt) { return this.values.Str(key, dflt); }
+    public int GetInt(string key, int dflt) { return this.values.Int(key, dflt); }
+    public long GetLong(string key, long dflt) { return this.values.Long(key, dflt); }
+    public double GetDouble(string key, double dflt) { return this.values.Double(key, dflt); }
+    public bool GetBool(string key, bool dflt) { return this.values.Bool(key, dflt); }
+
+    /* ---------- 写值（链式） ---------- */
+
+    //
+    // **覆盖语义用 `Set` 而不是 `Put`**：`JsonValue.Put` 是**追加**语义
+    // ——同一个 key 写两次会变成两个成员，而读取时**首键胜**（后写的
+    // 读不出来）。`PutStr` / `PutInt` / `PutBool` / `PutDouble` 走的都是
+    // `Put`。profile 是"更新同一个键"的场景，必须用 `Set`（已存在则替换）。
+    public ProfileStore SetString(string key, string v) {
+        this.values.Set(key, JsonValue.NewStr(v));
+        return this;
+    }
+    public ProfileStore SetInt(string key, int v) {
+        this.values.Set(key, JsonValue.NewInt((long)v));
+        return this;
+    }
+    public ProfileStore SetLong(string key, long v) {
+        this.values.Set(key, JsonValue.NewInt(v));
+        return this;
+    }
+    public ProfileStore SetDouble(string key, double v) {
+        this.values.Set(key, JsonValue.NewDouble(v));
+        return this;
+    }
+    public ProfileStore SetBool(string key, bool v) {
+        this.values.Set(key, JsonValue.NewBool(v));
+        return this;
+    }
+
+    /* ---------- 存盘 ---------- */
+
+    // 写盘。成功返回 true；失败返回 false 并保留原档（LastError 有原因）。
+    //
+    // 顺序：序列化 → 写 .tmp → 读回校验 → 旧档挪成 .bak → .tmp 顶替。
+    // 任何一步失败都不会留下半个正式档。
+    public bool Save() {
+        this.lastError = "";
+        string text = "";
+        try {
+            JsonValue root = JsonValue.NewObject();
+            root.Set("format", JsonValue.NewStr(ProfileStore.Format()));
+            root.Set("values", this.values);
+            text = root.ToJson();
+        } catch (Exception ex) {
+            this.lastError = "存档序列化失败。";
+            return false;
+        }
+
+        string tmp = this.path + ".tmp";
+        try {
+            File.WriteAllText(tmp, text);
+        } catch (Exception ex) {
+            this.lastError = "存档写入失败：请检查目录权限与路径。";
+            return false;
+        }
+
+        // 读回校验：写出去的东西必须能读回来，否则不替换正式档。
+        string back = "";
+        try {
+            back = File.ReadAllText(tmp);
+        } catch (Exception ex) {
+            this.DropTmp(tmp);
+            this.lastError = "存档写入后无法读回，已保留原档。";
+            return false;
+        }
+        JsonValue check = null;
+        try {
+            check = JsonValue.Parse(back);
+        } catch (Exception ex) {
+            check = null;
+        }
+        if (check == null || !check.IsObject()) {
+            this.DropTmp(tmp);
+            this.lastError = "存档写入校验失败，已保留原档。";
+            return false;
+        }
+
+        // 旧档留一份 .bak（备份失败不致命——正式档还没被动过）。
+        if (File.Exists(this.path)) {
+            try {
+                File.Move(this.path, this.path + ".bak");
+            } catch (Exception ex) {
+                // 备份失败：继续顶替，下面的替换失败仍会回滚不到旧档，
+                // 但此时原档还在（Move 失败说明没动过）。
+            }
+        }
+
+        try {
+            File.Move(tmp, this.path);
+        } catch (Exception ex) {
+            // 顶替失败：把 .bak 挪回原位。
+            if (File.Exists(this.path + ".bak")) {
+                try { File.Move(this.path + ".bak", this.path); } catch (Exception ex2) { }
+            }
+            this.lastError = "存档替换失败：原档已保留。";
+            return false;
+        }
+        return true;
+    }
+
+    /* ---------- 读档 ---------- */
+
+    // 读档。成功返回 true。
+    //
+    // - 文件不存在 → 返回 true（全新档，不是错误），内存保持当前值。
+    // - 文件损坏 / 格式不符 → 返回 false，**内存不清空、磁盘不删**，
+    //   由调用方决定是提示玩家还是回退到 .bak。
+    public bool Load() {
+        this.lastError = "";
+        if (!File.Exists(this.path)) { return true; }
+
+        string text = "";
+        try {
+            text = File.ReadAllText(this.path);
+        } catch (Exception ex) {
+            this.lastError = "存档读取失败：文件被占用或无权限。";
+            return false;
+        }
+
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(text);
+        } catch (Exception ex) {
+            root = null;
+        }
+        if (root == null || !root.IsObject()) {
+            this.lastError = "存档内容损坏：已保留原文件，未做覆盖。";
+            return false;
+        }
+
+        JsonValue fmt = root.Get("format");
+        if (fmt == null || !fmt.IsString() || fmt.AsString("") != ProfileStore.Format()) {
+            this.lastError = "存档格式不受支持：已保留原文件，未做覆盖。";
+            return false;
+        }
+
+        JsonValue vals = root.Get("values");
+        if (vals == null || !vals.IsObject()) {
+            this.lastError = "存档内容损坏：已保留原文件，未做覆盖。";
+            return false;
+        }
+
+        this.values = vals;
+        return true;
+    }
+
+    // 从 .bak 备份恢复。成功返回 true。
+    //
+    // 备份不存在 → false + 原因。恢复成功后正式档被 .bak 内容替换
+    // （.bak 本身保留，方便再恢复一次）。
+    public bool RestoreBackup() {
+        this.lastError = "";
+        string bak = this.path + ".bak";
+        if (!File.Exists(bak)) {
+            this.lastError = "没有可用的备份存档。";
+            return false;
+        }
+        string text = "";
+        try {
+            text = File.ReadAllText(bak);
+        } catch (Exception ex) {
+            this.lastError = "备份存档读取失败。";
+            return false;
+        }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(text);
+        } catch (Exception ex) {
+            root = null;
+        }
+        if (root == null || !root.IsObject()) {
+            this.lastError = "备份存档内容损坏。";
+            return false;
+        }
+        JsonValue fmt = root.Get("format");
+        if (fmt == null || !fmt.IsString() || fmt.AsString("") != ProfileStore.Format()) {
+            this.lastError = "备份存档格式不受支持。";
+            return false;
+        }
+        JsonValue vals = root.Get("values");
+        if (vals == null || !vals.IsObject()) {
+            this.lastError = "备份存档内容损坏。";
+            return false;
+        }
+        this.values = vals;
+        try {
+            File.WriteAllText(this.path, text);
+        } catch (Exception ex) {
+            this.lastError = "备份恢复写回失败：内存已恢复，磁盘未更新。";
+            return false;
+        }
+        return true;
+    }
+
+    // 删掉半成品 .tmp（失败也不影响主流程）。
+    private void DropTmp(string tmp) {
+        try {
+            if (File.Exists(tmp)) { File.Delete(tmp); }
+        } catch (Exception ex) { }
+    }
+}

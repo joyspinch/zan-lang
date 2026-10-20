@@ -426,6 +426,12 @@ State the command you ran and what it printed. Separate "compiled", "ran" and
   （如 extra["columns"] 数组重排）会留下重复键，之后所有 Get 都读到
   旧值，表现为"明明写进去了、读回来还是旧的"。Put 只用于确认首次
   创建的键。
+  **坑在类型化助手**：`PutStr` / `PutInt` / `PutBool` / `PutDouble` 内部
+  走的都是 `Put`，所以它们**同样不能用来更新已有键**——写第二遍就多一个
+  同名成员，而读取首键胜，于是"设进去的值读回来还是第一次那个"。
+  要覆盖就写 `obj.Set(key, JsonValue.NewStr(v))`（自己拼 `JsonValue.NewXxx`）。
+  实测（`Zan.Game.Common` 的 profile 存档）：`SetInt("gen", 1)` 后
+  `SetInt("gen", 2)`，存盘读回得到 1——换成 `Set` 才对。
 * Steam 等 64 位 ID 的 JSON 约定是**字符串形态**（"76561197960287930"），
   且个别字段文档写数字、线上回字符串（如 AuthenticateUserTicket 的
   `result:"OK"`）——解析层两种形态都要接住。

@@ -1,0 +1,367 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Game.Common;
+
+// 游戏公共基座契约测试：存档 / 飘字 / 血条 / 冷却条 / 背包格 / 小地图。
+//
+// 覆盖的判定点：
+//   - 存档：往返、默认值、格式不符拒绝、损坏拒绝、原文件保留、
+//     原子替换不留 .tmp、备份与恢复；
+//   - 飘字：生成/上升/淡出/过期回收/池满丢弃/池复用；
+//   - 血条：比例、掉血夹取、回血夹取、掉血残影滞后与追赶、回血立即跟随；
+//   - 冷却条：口径（剩余比例）、充能、冷却中不可触发、瞬发不耗充能；
+//   - 背包：先堆叠后开格、满包剩余、取出与清空、JSON 往返、坏档不改背包；
+//   - 小地图：世界→像素映射、视口剔除、全图模式、帧内复用。
+//
+// golden 只锁定"全过"那行。
+public class GameCommonTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double eps) {
+        double d = actual - expected;
+        if (d < 0.0) { d = -d; }
+        if (d > eps) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static string dir = "_scratch/game_common_test";
+    private static string savePath = "_scratch/game_common_test/profile.json";
+
+    /* ---------- 存档 ---------- */
+
+    private static void TestProfileRoundTrip() {
+        ProfileStore store = new ProfileStore(savePath);
+        store.SetInt("high", 1234);
+        store.SetString("name", "张三");
+        store.SetBool("win", true);
+        store.SetDouble("rate", 0.75);
+        Check("profile-save-ok", store.Save());
+        CheckEq("profile-save-no-error", store.LastError().Length, 0L);
+        Check("profile-file-exists", File.Exists(savePath));
+        // 原子替换不留半成品
+        Check("profile-no-tmp-left", !File.Exists(savePath + ".tmp"));
+
+        ProfileStore loaded = new ProfileStore(savePath);
+        Check("profile-load-ok", loaded.Load());
+        CheckEq("profile-load-no-error", loaded.LastError().Length, 0L);
+        CheckEq("profile-int", loaded.GetInt("high", 0), 1234L);
+        Check("profile-string", loaded.GetString("name", "") == "张三");
+        Check("profile-bool", loaded.GetBool("win", false));
+        CheckNear("profile-double", loaded.GetDouble("rate", 0.0), 0.75, 0.0001);
+        // 缺失键回落默认值（不是 0 / 空串）
+        CheckEq("profile-missing-int", loaded.GetInt("nope", 42), 42L);
+        Check("profile-missing-string", loaded.GetString("nope", "dflt") == "dflt");
+        Check("profile-has", loaded.Has("high"));
+        Check("profile-not-has", !loaded.Has("nope"));
+        CheckEq("profile-count", loaded.Count(), 4L);
+        CheckEq("profile-keys", loaded.Keys().Count, 4L);
+    }
+
+    private static void TestProfileRejects() {
+        // 格式不符：拒绝加载，且不动原文件
+        File.WriteAllText(savePath, "{\"format\":\"someone-else-9\",\"values\":{}}");
+        ProfileStore bad = new ProfileStore(savePath);
+        Check("profile-bad-format-rejected", !bad.Load());
+        Check("profile-bad-format-error", bad.LastError().Length > 0);
+        Check("profile-bad-format-file-kept", File.Exists(savePath));
+
+        // 内容损坏：拒绝加载，且不动原文件
+        File.WriteAllText(savePath, "{ this is not json");
+        ProfileStore broken = new ProfileStore(savePath);
+        Check("profile-broken-rejected", !broken.Load());
+        Check("profile-broken-error", broken.LastError().Length > 0);
+        Check("profile-broken-file-kept", File.Exists(savePath));
+
+        // 拒绝时不把内存清空
+        ProfileStore keep = new ProfileStore(savePath);
+        keep.SetInt("v", 7);
+        Check("profile-reject-keeps-memory", !keep.Load());
+        CheckEq("profile-reject-keeps-value", keep.GetInt("v", 0), 7L);
+
+        // 缺文件不算错误（全新档）
+        ProfileStore fresh = new ProfileStore("_scratch/game_common_test/missing.json");
+        Check("profile-missing-ok", fresh.Load());
+        CheckEq("profile-missing-no-error", fresh.LastError().Length, 0L);
+    }
+
+    private static void TestProfileBackup() {
+        ProfileStore store = new ProfileStore(savePath);
+        store.SetInt("gen", 1);
+        Check("profile-gen1-save", store.Save());
+        store.SetInt("gen", 2);
+        Check("profile-gen2-save", store.Save());
+        Check("profile-backup-exists", File.Exists(savePath + ".bak"));
+
+        ProfileStore loaded = new ProfileStore(savePath);
+        loaded.Load();
+        CheckEq("profile-current-gen", loaded.GetInt("gen", 0), 2L);
+
+        // 备份里是上一代
+        ProfileStore restored = new ProfileStore(savePath);
+        Check("profile-restore-ok", restored.RestoreBackup());
+        CheckEq("profile-restored-gen", restored.GetInt("gen", 0), 1L);
+        CheckEq("profile-restore-no-error", restored.LastError().Length, 0L);
+    }
+
+    /* ---------- 飘字 ---------- */
+
+    private static void TestFloatText() {
+        FloatTextLayer layer = new FloatTextLayer(4);
+        FloatText t = layer.SpawnDamage("-12", 100.0, 200.0);
+        Check("float-spawn-ok", t != null);
+        Check("float-active", t.active);
+        CheckEq("float-alpha-full", (long)(t.Alpha() * 100.0), 100L);
+
+        // 上升：vy 为负 → y 变小
+        layer.Step(0.1);
+        Check("float-rises", t.y < 200.0);
+        Check("float-alpha-decays", t.Alpha() < 1.0);
+
+        // 过期回收
+        layer.Step(1.0);
+        Check("float-expired", !t.active);
+        CheckEq("float-active-count", layer.ActiveCount(), 0L);
+
+        // 池复用：过期后再生成，复用同一个对象
+        FloatText again = layer.SpawnHeal("+3", 0.0, 0.0);
+        Check("float-reuse-same-object", again == t);
+
+        // 池满：丢弃并计数
+        FloatTextLayer small = new FloatTextLayer(2);
+        Check("float-cap1", small.SpawnGold("1", 0.0, 0.0) != null);
+        Check("float-cap2", small.SpawnGold("2", 0.0, 0.0) != null);
+        Check("float-cap3-null", small.SpawnGold("3", 0.0, 0.0) == null);
+        CheckEq("float-dropped-count", small.DroppedCount(), 1L);
+    }
+
+    /* ---------- 血条 ---------- */
+
+    private static void TestHealthBar() {
+        HealthBar bar = new HealthBar(100.0).WithLag(50.0);
+        CheckNear("hp-full-ratio", bar.Ratio(), 1.0, 0.0001);
+        CheckNear("hp-full-display", bar.DisplayRatio(), 1.0, 0.0001);
+        Check("hp-not-ghosting", !bar.IsGhosting());
+
+        CheckNear("hp-damage-amount", bar.Damage(30.0), 30.0, 0.0001);
+        CheckNear("hp-ratio-after-damage", bar.Ratio(), 0.7, 0.0001);
+        Check("hp-ghosting", bar.IsGhosting());
+        // 残影还没追：显示比例 > 真实比例
+        Check("hp-display-lags", bar.DisplayRatio() > bar.Ratio());
+
+        // 追赶：每秒 50 点
+        bar.Step(0.2);
+        CheckNear("hp-display-chased", bar.DisplayRatio(), 0.9, 0.0001);
+        bar.Step(10.0);
+        CheckNear("hp-display-catches-up", bar.DisplayRatio(), 0.7, 0.0001);
+        Check("hp-ghost-cleared", !bar.IsGhosting());
+
+        // 回血立即跟随（不留残影）
+        bar.Heal(10.0);
+        CheckNear("hp-heal-ratio", bar.Ratio(), 0.8, 0.0001);
+        CheckNear("hp-heal-display-immediate", bar.DisplayRatio(), 0.8, 0.0001);
+        Check("hp-heal-no-ghost", !bar.IsGhosting());
+
+        // 夹取：扣血不过 0，回血不过上限
+        bar.Damage(1000.0);
+        CheckNear("hp-clamp-zero", bar.Ratio(), 0.0, 0.0001);
+        Check("hp-dead", bar.IsDead());
+        bar.Heal(1000.0);
+        CheckNear("hp-clamp-max", bar.Ratio(), 1.0, 0.0001);
+
+        // 上限变化时当前值被夹取
+        HealthBar bar2 = new HealthBar(100.0);
+        bar2.SetValue(80.0);
+        bar2.SetMax(50.0);
+        CheckNear("hp-setmax-clamps", bar2.Ratio(), 1.0, 0.0001);
+    }
+
+    /* ---------- 冷却条 ---------- */
+
+    private static void TestCooldown() {
+        Cooldown cd = new Cooldown(10.0);
+        Check("cd-ready-initially", cd.Ready());
+        Check("cd-start-ok", cd.Start());
+        Check("cd-not-ready", !cd.Ready());
+        CheckNear("cd-ratio-full", cd.Ratio(), 1.0, 0.0001);
+        CheckNear("cd-progress-zero", cd.Progress(), 0.0, 0.0001);
+
+        cd.Step(4.0);
+        CheckNear("cd-ratio-half", cd.Ratio(), 0.6, 0.0001);
+        CheckNear("cd-progress-half", cd.Progress(), 0.4, 0.0001);
+        Check("cd-blocked-while-running", !cd.Start());
+
+        cd.Step(10.0);
+        Check("cd-ready-again", cd.Ready());
+        CheckNear("cd-ratio-zero", cd.Ratio(), 0.0, 0.0001);
+        CheckNear("cd-progress-full", cd.Progress(), 1.0, 0.0001);
+
+        // 充能：可连按两次
+        Cooldown charged = new Cooldown(5.0).WithCharges(2);
+        Check("cd-charge-start1", charged.Start());
+        Check("cd-charge-start2", charged.Start());
+        Check("cd-charge-start3-fails", !charged.Start());
+        charged.Step(5.0);
+        Check("cd-charge-restored", charged.Ready());
+
+        // 瞬发：不消耗充能
+        Cooldown instant = new Cooldown(0.0).WithCharges(1);
+        Check("cd-instant-start", instant.Start());
+        Check("cd-instant-still-ready", instant.Ready());
+
+        // 重置
+        Cooldown reset = new Cooldown(8.0);
+        reset.Start();
+        reset.Reset();
+        Check("cd-reset-ready", reset.Ready());
+    }
+
+    /* ---------- 背包格 ---------- */
+
+    private static void TestInventory() {
+        Inventory inv = new Inventory(4);
+        CheckEq("inv-capacity", inv.Capacity(), 4L);
+        CheckEq("inv-empty-slots", inv.UsedSlots(), 0L);
+
+        // 先堆叠后开格：5 个、上限 3 → 3 + 2
+        CheckEq("inv-add-all", inv.Add("potion", 5, 3), 0L);
+        CheckEq("inv-total", inv.TotalOf("potion"), 5L);
+        CheckEq("inv-used-slots", inv.UsedSlots(), 2L);
+        InventorySlot slot0 = inv.SlotAt(0);
+        InventorySlot slot1 = inv.SlotAt(1);
+        Check("inv-slot0-not-null", slot0 != null);
+        Check("inv-slot1-not-null", slot1 != null);
+        if (slot0 != null) { CheckEq("inv-slot0-count", slot0.count, 3L); }
+        if (slot1 != null) { CheckEq("inv-slot1-count", slot1.count, 2L); }
+        Check("inv-has", inv.Has("potion", 5));
+        Check("inv-not-has", !inv.Has("potion", 6));
+
+        // 满包：还能装 1（槽 1 未满）+ 3 + 3 = 7，剩下 2 装不下
+        CheckEq("inv-full-leftover", inv.Add("potion", 9, 3), 2L);
+        CheckEq("inv-total-after-full", inv.TotalOf("potion"), 12L);
+
+        // 取出：部分取出
+        CheckEq("inv-remove-partial", inv.Remove("potion", 4), 4L);
+        CheckEq("inv-total-after-remove", inv.TotalOf("potion"), 8L);
+        // 取空后槽位变空（id 一并清掉）
+        inv.Remove("potion", 100);
+        CheckEq("inv-total-after-drain", inv.TotalOf("potion"), 0L);
+        CheckEq("inv-slots-freed", inv.UsedSlots(), 0L);
+        InventorySlot drained = inv.SlotAt(0);
+        Check("inv-slot0-not-null-2", drained != null);
+        if (drained != null) {
+            Check("inv-slot-cleared", drained.IsEmpty());
+            Check("inv-slot-id-cleared", drained.itemId.Length == 0);
+        }
+
+        // JSON 往返
+        Inventory inv2 = new Inventory(4);
+        inv2.Add("sword", 1, 1);
+        inv2.Add("coin", 30, 10);
+        string json = inv2.ToJson();
+        Inventory inv3 = new Inventory(4);
+        Check("inv-json-load", inv3.FromJson(json));
+        CheckEq("inv-json-sword", inv3.TotalOf("sword"), 1L);
+        CheckEq("inv-json-coin", inv3.TotalOf("coin"), 30L);
+        // 1 把剑（独占一格）+ 30 枚币（上限 10 → 3 堆）= 4 格
+        CheckEq("inv-json-slots", inv3.UsedSlots(), 4L);
+
+        // 坏档不改动背包
+        Inventory inv4 = new Inventory(4);
+        inv4.Add("gem", 2, 2);
+        Check("inv-bad-json-rejected", !inv4.FromJson("{not json"));
+        CheckEq("inv-bad-json-keeps", inv4.TotalOf("gem"), 2L);
+        Check("inv-bad-shape-rejected", !inv4.FromJson("{\"id\":\"x\"}"));
+        CheckEq("inv-bad-shape-keeps", inv4.TotalOf("gem"), 2L);
+    }
+
+    /* ---------- 小地图 ---------- */
+
+    private static void TestMinimap() {
+        // 视口跟随：中心 (500,500)，视口 200x100，映射到 100x50 像素
+        Minimap map = new Minimap(1000.0, 1000.0, 100.0, 50.0);
+        map.WithView(500.0, 500.0, 200.0, 100.0);
+        CheckNear("mm-mapx-left", map.MapX(400.0), 0.0, 0.0001);
+        CheckNear("mm-mapx-right", map.MapX(600.0), 100.0, 0.0001);
+        CheckNear("mm-mapy-top", map.MapY(450.0), 0.0, 0.0001);
+        CheckNear("mm-mapy-bottom", map.MapY(550.0), 50.0, 0.0001);
+        Check("mm-inside", map.Contains(500.0, 500.0));
+        Check("mm-outside-left", !map.Contains(399.0, 500.0));
+        Check("mm-outside-top", !map.Contains(500.0, 449.0));
+        CheckNear("mm-scale", map.Scale(), 0.5, 0.0001);
+
+        // 全图模式：视口尺寸 0 → 看整个世界
+        Minimap full = new Minimap(1000.0, 800.0, 200.0, 160.0);
+        CheckNear("mm-full-mapx", full.MapX(0.0), 0.0, 0.0001);
+        CheckNear("mm-full-mapx-end", full.MapX(1000.0), 200.0, 0.0001);
+        CheckNear("mm-full-mapy-end", full.MapY(800.0), 160.0, 0.0001);
+        Check("mm-full-contains", full.Contains(999.0, 799.0));
+        Check("mm-full-excludes", !full.Contains(1001.0, 100.0));
+
+        // 标记层：帧内复用 + 视口剔除
+        MinimapLayer layer = new MinimapLayer(map, 8);
+        layer.BeginFrame();
+        layer.Add(500.0, 500.0, 1);
+        layer.Add(100.0, 100.0, 1);
+        CheckEq("mm-visible-count", layer.VisibleCount(), 1L);
+        // 下一帧：只刷一个点，另一个旧标记自动不可见
+        layer.BeginFrame();
+        layer.Add(500.0, 500.0, 1);
+        CheckEq("mm-visible-next-frame", layer.VisibleCount(), 1L);
+        CheckEq("mm-count-stable", layer.Count(), 2L);
+
+        // 池满丢弃并计数
+        MinimapLayer tiny = new MinimapLayer(map, 1);
+        Check("mm-cap1", tiny.Add(1.0, 1.0, 0) != null);
+        Check("mm-cap2-null", tiny.Add(2.0, 2.0, 0) == null);
+        CheckEq("mm-dropped", tiny.DroppedCount(), 1L);
+    }
+
+    public static void Run() {
+        Directory.CreateDirectoryRecursive(dir);
+
+        TestProfileRoundTrip();
+        TestProfileRejects();
+        TestProfileBackup();
+        TestFloatText();
+        TestHealthBar();
+        TestCooldown();
+        TestInventory();
+        TestMinimap();
+
+        // 清理临时存档
+        if (File.Exists(savePath)) { File.Delete(savePath); }
+        if (File.Exists(savePath + ".bak")) { File.Delete(savePath + ".bak"); }
+        if (File.Exists(savePath + ".tmp")) { File.Delete(savePath + ".tmp"); }
+
+        if (failures > 0) {
+            Console.WriteLine("GAME COMMON TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL GAME COMMON TESTS PASSED");
+        }
+    }
+}
+
+public class GameCommonTestsMain {
+    public static void Main() {
+        GameCommonTests.Run();
+    }
+}

@@ -1,0 +1,210 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Common;
+
+// 飘字（伤害数字 / 治疗 / 金币 / 连击提示）。
+//
+// **它替代什么**：模板里 breakout、snake 各写了一份 `Popup`（x/y/text/
+// bornAt/rgb 的裸字段），goldminer 又写了一份 `FloatText`——三份同一件事，
+// 连"文字往上飘多久、怎么淡出"都没统一，各写各的。
+//
+// **这里给的是模型，不碰渲染**：飘字的数据（位置、剩余时间、颜色、缩放）
+// 由本类维护，渲染层（SpriteBatch / Gui Label）自己拿去画。这样飘字逻辑
+// 能无头跑、能被 conformance 断言，也能换任何渲染后端。
+//
+// **坐标系**：屏幕坐标，y 向下。上升速度取负值（vy = -60 表示每秒往上
+// 飘 60 像素）。
+//
+// **并发**：非线程安全，模型只在主循环里推进。
+public class FloatText {
+    // 是否活跃（池里可复用）。
+    public bool active;
+    // 文本内容。
+    public string text;
+    // 世界/屏幕坐标。
+    public double x;
+    public double y;
+    // 速度（px/s）。
+    public double vx;
+    public double vy;
+    // 剩余生命（秒）与总生命（秒）。
+    public double life;
+    public double maxLife;
+    // 缩放（1 = 标准字号）。
+    public double scale;
+    // 颜色（0-255）。
+    public int r;
+    public int g;
+    public int b;
+
+    public FloatText() {
+        this.active = false;
+        this.text = "";
+        this.x = 0.0;
+        this.y = 0.0;
+        this.vx = 0.0;
+        this.vy = 0.0;
+        this.life = 0.0;
+        this.maxLife = 1.0;
+        this.scale = 1.0;
+        this.r = 255;
+        this.g = 255;
+        this.b = 255;
+    }
+
+    // 已经存在多久（秒）。
+    public double Age() { return this.maxLife - this.life; }
+
+    // 剩余比例（1 = 刚出现，0 = 消失）。渲染层拿它做透明度。
+    public double Alpha() {
+        if (this.maxLife <= 0.0) { return 0.0; }
+        double a = this.life / this.maxLife;
+        if (a < 0.0) { return 0.0; }
+        if (a > 1.0) { return 1.0; }
+        return a;
+    }
+
+    // 推进一帧。返回 false 表示已过期（该回收了）。
+    public bool Step(double dt) {
+        if (!this.active) { return false; }
+        this.life = this.life - dt;
+        if (this.life <= 0.0) {
+            this.life = 0.0;
+            this.active = false;
+            return false;
+        }
+        this.x = this.x + this.vx * dt;
+        this.y = this.y + this.vy * dt;
+        return true;
+    }
+}
+
+// 飘字层：管理一批飘字的生命周期。
+//
+// **容量硬上限 + 满了不发射**：飘字是"打击反馈"，一帧内刷出几百个既
+// 没人看得见，又把池撑爆。池满时 `Spawn` 返回 null 并记一次丢弃
+// （`DroppedCount()`）——静默吞掉会让"飘字不出现"这种 bug 查不出来。
+//
+// **池内复用**：过期飘字不销毁，下一次 Spawn 直接改字段重用。稳定态
+// 零分配。
+public class FloatTextLayer {
+    // 池（容量固定）。
+    private List<FloatText> pool;
+    // 容量上限。
+    private int capacity;
+    // 当前活跃数。
+    private int activeCount;
+    // 因为池满被丢弃的次数。
+    private int dropped;
+
+    // 默认容量 64。
+    public FloatTextLayer() {
+        this.capacity = 64;
+        this.pool = new List<FloatText>();
+        this.activeCount = 0;
+        this.dropped = 0;
+    }
+
+    public FloatTextLayer(int capacity) {
+        this.capacity = capacity > 0 ? capacity : 1;
+        this.pool = new List<FloatText>();
+        this.activeCount = 0;
+        this.dropped = 0;
+    }
+
+    // 容量上限。
+    public int Capacity() { return this.capacity; }
+
+    // 当前活跃飘字数。
+    public int ActiveCount() { return this.activeCount; }
+
+    // 因池满被丢弃的次数。
+    public int DroppedCount() { return this.dropped; }
+
+    // 第 i 个池位（按创建顺序，不是按活跃顺序）。
+    public FloatText At(int i) {
+        if (i < 0 || i >= this.pool.Count) { return null; }
+        return this.pool[i];
+    }
+
+    // 清空所有飘字（不销毁池）。
+    public void Clear() {
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            FloatText t = this.pool[i];
+            if (t != null) { t.active = false; }
+        }
+        this.activeCount = 0;
+    }
+
+    // 生成一条飘字。池满返回 null。
+    //
+    // duration：存在时长（秒）；rise：上升速度（px/s，负值向上）；
+    // scale：缩放；r/g/b：颜色。
+    public FloatText Spawn(string text, double x, double y, double duration,
+                           double rise, double scale, int r, int g, int b) {
+        FloatText slot = null;
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            FloatText t = this.pool[i];
+            if (t != null && !t.active) { slot = t; break; }
+        }
+        if (slot == null) {
+            if (this.pool.Count >= this.capacity) {
+                this.dropped = this.dropped + 1;
+                return null;
+            }
+            slot = new FloatText();
+            this.pool.Add(slot);
+        }
+
+        slot.active = true;
+        slot.text = text != null ? text : "";
+        slot.x = x;
+        slot.y = y;
+        slot.vx = 0.0;
+        slot.vy = rise;
+        slot.maxLife = duration > 0.0 ? duration : 0.9;
+        slot.life = slot.maxLife;
+        slot.scale = scale > 0.0 ? scale : 1.0;
+        slot.r = r;
+        slot.g = g;
+        slot.b = b;
+        this.activeCount = this.activeCount + 1;
+        return slot;
+    }
+
+    // 伤害飘字（白字红边用红色打底）。
+    public FloatText SpawnDamage(string text, double x, double y) {
+        return this.Spawn(text, x, y, 0.9, -60.0, 1.0, 235, 70, 70);
+    }
+
+    // 治疗飘字（绿色）。
+    public FloatText SpawnHeal(string text, double x, double y) {
+        return this.Spawn(text, x, y, 0.9, -60.0, 1.0, 90, 220, 120);
+    }
+
+    // 金币飘字（金色）。
+    public FloatText SpawnGold(string text, double x, double y) {
+        return this.Spawn(text, x, y, 1.1, -45.0, 1.1, 250, 205, 90);
+    }
+
+    // 连击提示（更大更慢）。
+    public FloatText SpawnCombo(string text, double x, double y) {
+        return this.Spawn(text, x, y, 1.4, -35.0, 1.6, 255, 170, 60);
+    }
+
+    // 推进所有飘字一帧，过期的回收进池。
+    public void Step(double dt) {
+        if (dt <= 0.0) { return; }
+        int alive = 0;
+        for (int i = 0; i < this.pool.Count; i = i + 1) {
+            FloatText t = this.pool[i];
+            if (t == null) { continue; }
+            if (!t.active) { continue; }
+            if (t.Step(dt)) {
+                alive = alive + 1;
+            }
+        }
+        this.activeCount = alive;
+    }
+}
