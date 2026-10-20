@@ -1,0 +1,302 @@
+using System;
+namespace Zan;
+
+// Binding<T> assignment sugar for the IR backend (mirrors the C host's
+// emit_binding_value): assigning a non-Binding expression to a
+// Binding<T>-typed slot wraps it in a fresh Binding object instead of
+// storing a raw T where the slot's readers expect {target, getter, setter,
+// live, constVal, version}. A field lvalue on the right (`input.data =
+// user.name`, including a bare own-class field name meaning `this.field`)
+// builds a LIVE binding around a synthesized accessor pair; any other
+// expression builds a const binding holding its value. `b = null` and a
+// Binding-typed RHS fall through to the plain store (clear / share).
+//
+// The accessors reuse the delegate slice's invoke ABI (the env pointer
+// first, then the declared arguments): one shared function per (class,
+// field, direction). The erased type parameter travels in an i64 slot, so
+// the accessors move the field word through that slot (ptrtoint /
+// inttoptr for a pointer, bitcast for a double).
+partial class Irgen {
+    List<string> bindAccKeys;   // "<cls>#<field>#g|s"
+    List<string> bindAccFns;    // the emitted function name
+
+    void InitBinding() {
+        if (bindAccKeys != null) { return; }
+        bindAccKeys = new List<string>();
+        bindAccFns = new List<string>();
+    }
+
+    // Is this a Binding<T> instantiation?
+    bool IsBindingTy(Node t) {
+        if (t == null) { return false; }
+        if (t.sval != "Binding" && t.sval != "System.Binding") { return false; }
+        return t.kids.Count == 1;
+    }
+
+    // The element type T of a Binding<T>.
+    Node BindingElemTy(Node t) {
+        if (t == null || t.kids.Count == 0) { return null; }
+        return t.kids[0];
+    }
+
+    // The Binding class declaration (null when the program has no Binding).
+    Node BindingClass() { return binder.FindType("Binding"); }
+
+    // The LLVM type of a Binding field: the erased type parameter travels in
+    // an i64 slot, everything else in its own type.
+    string BindingFieldLt(Node bcls, string name) {
+        Node t = FieldType(bcls, name);
+        if (t == null) { return "i64"; }
+        List<string> tps = TParams(bcls);
+        int i = 0;
+        while (i < tps.Count) { if (tps[i] == t.sval) { return "i64"; } i = i + 1; }
+        return MapType(t);
+    }
+
+    // The static type of an assignment target: a local, a field of the
+    // enclosing class or a field of the receiver's class.
+    Node SlotTypeOf(Node lhs) {
+        if (lhs == null) { return null; }
+        if (lhs.kind == AK.Ident()) {
+            int li = LocalIdx(lhs.sval);
+            if (li >= 0) { return locType[li]; }
+            if (curClass != "") {
+                Node cls = binder.FindType(curClass);
+                if (cls != null) { return FieldType(cls, lhs.sval); }
+            }
+            return null;
+        }
+        if (lhs.kind == AK.MemberAccess()) {
+            Node cls = ClassOf(ArgTypeNode(lhs.a));
+            if (cls != null) { return FieldType(cls, lhs.sval); }
+            return null;
+        }
+        return null;
+    }
+
+    // Does this expression materialize an object that dies at statement end?
+    // A live binding's target is a NON-OWNING reference (cycle avoidance),
+    // so a receiver that yields an owned temp would dangle once the
+    // statement ends -- such a binding degrades to a const snapshot (the C
+    // host's owned-receiver check).
+    bool YieldsOwnedTemp(Node e) {
+        if (e == null) { return false; }
+        int k = e.kind;
+        if (k == AK.Call() || k == AK.NewExpr()
+                || k == AK.AwaitExpr() || k == AK.CallInit()) { return true; }
+        if (k == AK.Conditional()) {
+            return YieldsOwnedTemp(e.b) || YieldsOwnedTemp(e.c);
+        }
+        if (k == AK.Index()) {
+            if (YieldsOwnedTemp(e.a)) { return true; }
+            Node oc = ClassOf(ArgTypeNode(e.a));
+            if (oc != null && FindMethodUp(oc, "op_index") != null) { return true; }
+            return false;
+        }
+        if (k == AK.MemberAccess()) {
+            if (YieldsOwnedTemp(e.a)) { return true; }
+            Node oc = ClassOf(ArgTypeNode(e.a));
+            if (oc == null) { return false; }
+            // a field slot is borrowed; a property read materializes a value
+            if (FieldType(oc, e.sval) != null) { return false; }
+            return FindMethodUp(oc, "get_" + e.sval) != null;
+        }
+        return false;
+    }
+
+    // Build the Binding object for `rhs` when the slot's type is
+    // Binding<T>. Null when the plain store applies (a null literal clears
+    // the slot, a Binding-typed right-hand side is shared as it is).
+    ExprVal GenBindingValue(Node rhs, Node slotTy) {
+        if (rhs == null) { return null; }
+        if (!IsBindingTy(slotTy)) { return null; }
+        if (rhs.kind == AK.NullLit()) { return null; }          // b = null
+        if (IsBindingTy(ArgTypeNode(rhs))) { return null; }     // share, don't wrap
+        Node bcls = BindingClass();
+        if (bcls == null) { return null; }
+        // a bare field name inside its own class means `this.<field>`
+        Node src = rhs;
+        if (rhs.kind == AK.Ident() && LocalIdx(rhs.sval) < 0 && curClass != "") {
+            Node own = binder.FindType(curClass);
+            if (own != null && FieldIndex(own, rhs.sval) >= 0) {
+                Node ma = new Node(AK.MemberAccess());
+                ma.a = new Node(AK.ThisExpr());
+                ma.sval = rhs.sval;
+                ma.line = rhs.line; ma.col = rhs.col;
+                src = ma;
+            }
+        }
+        Node elem = BindingElemTy(slotTy);
+        // the live case: an instance field lvalue whose declared type is T
+        Node fcls = null;
+        if (src.kind == AK.MemberAccess()) {
+            Node c = ClassOf(ArgTypeNode(src.a));
+            if (c != null && FieldIndex(c, src.sval) >= 0) {
+                Node fty = FieldType(c, src.sval);
+                if (fty != null && elem != null && TypeTag(fty) == TypeTag(elem)) {
+                    fcls = c;
+                }
+            }
+        }
+        if (fcls != null && YieldsOwnedTemp(src.a)) { fcls = null; }
+        if (fcls == null) { return GenConstBinding(src, elem, bcls); }
+        return GenLiveBinding(src, fcls, bcls);
+    }
+
+    // A live binding: the target object plus the accessor pair that reads
+    // and writes the bound field.
+    ExprVal GenLiveBinding(Node src, Node fcls, Node bcls) {
+        ExprVal recv = GenExpr(src.a);
+        ExprVal obj = NewBindingObject(bcls);
+        // the target is a NON-OWNING reference: a strong one would keep the
+        // model alive through the binding (a model <-> view cycle)
+        string tgt = ToI8Ptr(recv.op, MapType(recv.ty));
+        StoreBindingField(obj, bcls, "target", tgt);
+        // the accessor pair: the getter reads the field, the setter writes it
+        string gfn = BindingAccFn(fcls, src.sval, false);
+        string sfn = BindingAccFn(fcls, src.sval, true);
+        StoreBindingField(obj, bcls, "getter", AccDelegate(gfn, "i64 (i8*, i8*)*"));
+        StoreBindingField(obj, bcls, "setter", AccDelegate(sfn, "void (i8*, i8*, i64)*"));
+        StoreBindingField(obj, bcls, "live", "1");
+        return obj;
+    }
+
+    // A const binding: the value itself, the live flag stays 0.
+    ExprVal GenConstBinding(Node src, Node elem, Node bcls) {
+        ExprVal v = GenExpr(src);
+        ExprVal obj = NewBindingObject(bcls);
+        // a managed value in the erased slot: the binding holds its own
+        // reference (the slot is a plain i64, nothing else would)
+        if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
+        StoreBindingField(obj, bcls, "constVal", ToSlot(v, elem));
+        return obj;
+    }
+
+    // A fresh Binding object (the class's own layout, zeroed by zalloc).
+    ExprVal NewBindingObject(Node bcls) {
+        Node bt = new Node(AK.TypeRef());
+        bt.sval = bcls.sval;
+        Node ne = new Node(AK.NewExpr());
+        ne.type = bt;
+        return GenNew(ne);
+    }
+
+    // Store a value into one of the Binding object's fields.
+    void StoreBindingField(ExprVal obj, Node bcls, string name, string val) {
+        int idx = FieldIndex(bcls, name);
+        string lt = BindingFieldLt(bcls, name);
+        string p = NT();
+        L("  " + p + " = getelementptr %" + bcls.sval + ", %" + bcls.sval + "* " + obj.op + ", i32 0, i32 " + idx);
+        L("  store " + lt + " " + val + ", " + lt + "* " + p);
+    }
+
+    // The delegate closure around an accessor function: { fn, env } with an
+    // empty env slot (the accessor reads the field off the target).
+    string AccDelegate(string fn, string fnType) {
+        string clo = NT();
+        L("  " + clo + " = call i8* @malloc(i64 16)");
+        string clop = NT();
+        L("  " + clop + " = bitcast i8* " + clo + " to i8**");
+        string fni8 = NT();
+        // the function type is NOT parenthesized here: a parenthesized
+        // function type is only a typed value in an argument position
+        L("  " + fni8 + " = bitcast " + fnType + " @" + fn + " to i8*");
+        L("  store i8* " + fni8 + ", i8** " + clop);
+        string clop1 = NT();
+        L("  " + clop1 + " = getelementptr i8*, i8** " + clop + ", i64 1");
+        L("  store i8* null, i8** " + clop1);
+        return TagClosure(clo);
+    }
+
+    // The accessor function for a live binding of `cls.field`; one shared
+    // function per (class, field, direction).
+    string BindingAccFn(Node cls, string field, bool isSet) {
+        InitBinding();
+        string key = cls.sval + "#" + field + (isSet ? "#s" : "#g");
+        int i = 0;
+        while (i < bindAccKeys.Count) {
+            if (bindAccKeys[i] == key) { return bindAccFns[i]; }
+            i = i + 1;
+        }
+        string fn = "__zbind_" + (isSet ? "set" : "get") + "_" + bindAccKeys.Count;
+        bindAccKeys.Add(key);
+        bindAccFns.Add(fn);
+        EmitBindingAcc(cls, field, isSet, fn);
+        return fn;
+    }
+
+    // Emit the accessor function: the delegate invoke ABI (the env pointer
+    // first, then the declared arguments), the field word moved through the
+    // erased i64 slot.
+    void EmitBindingAcc(Node cls, string field, bool isSet, string fn) {
+        int idx = FieldIndex(cls, field);
+        Node fty = FieldType(cls, field);
+        string ft = MapType(fty);
+        string cname = cls.sval;
+        // the accessor is a function of its own: swap the body buffer
+        StringBuilder savedBody = body;
+        StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
+        int sTmp = tmp; int sLbl = lbl; bool sTerm = term; string sCurLbl = curLbl;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
+        tmp = 0; lbl = 0; term = false; curLbl = "entry";
+        if (isSet) { L("define void @" + fn + "(i8* %env, i8* %target, i64 %v) {"); }
+        else { L("define i64 @" + fn + "(i8* %env, i8* %target) {"); }
+        L("entry:");
+        string obj = NT();
+        L("  " + obj + " = bitcast i8* %target to %" + cname + "*");
+        string fp = NT();
+        L("  " + fp + " = getelementptr %" + cname + ", %" + cname + "* " + obj + ", i32 0, i32 " + idx);
+        if (isSet) {
+            L("  store " + ft + " " + SlotToField("%v", ft) + ", " + ft + "* " + fp);
+            L("  ret void");
+        } else {
+            string lv = NT();
+            L("  " + lv + " = load " + ft + ", " + ft + "* " + fp);
+            L("  ret i64 " + FieldToSlot(lv, ft));
+        }
+        L("}");
+        deferred.Append(body.ToString());
+        body = savedBody; entryAllocas = sEa; eaActive = sEaAct;
+        tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
+    }
+
+    // The erased (i64) slot value of a concrete field value.
+    string FieldToSlot(string v, string ft) {
+        if (ft == "i64") { return v; }
+        if (ft == "double") {
+            string t = NT();
+            L("  " + t + " = bitcast double " + v + " to i64");
+            return t;
+        }
+        if (IsPtrLL(ft)) {
+            string t = NT();
+            L("  " + t + " = ptrtoint " + ft + " " + v + " to i64");
+            return t;
+        }
+        return v;
+    }
+
+    // The concrete field value of an erased (i64) slot value.
+    string SlotToField(string v, string ft) {
+        if (ft == "i64") { return v; }
+        if (ft == "double") {
+            string t = NT();
+            L("  " + t + " = bitcast i64 " + v + " to double");
+            return t;
+        }
+        if (IsPtrLL(ft)) {
+            string t = NT();
+            L("  " + t + " = inttoptr i64 " + v + " to " + ft);
+            return t;
+        }
+        return v;
+    }
+
+    // A pointer value as the i8* the object-typed slots use.
+    string ToI8Ptr(string v, string vt) {
+        if (vt == "i8*") { return v; }
+        string t = NT();
+        L("  " + t + " = bitcast " + vt + " " + v + " to i8*");
+        return t;
+    }
+}

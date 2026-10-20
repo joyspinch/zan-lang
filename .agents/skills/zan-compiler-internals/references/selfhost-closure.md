@@ -1211,3 +1211,38 @@ kernel32、shell32、user32、advapi32、version）。
     否则虚调用和定义对不上；
   - 自举的数组元素一律是 8 字节槽，`out arr[i]` 只能给"槽形状"的元素
     （byte/char 除外），否则要 fail-closed 而不是发出语义不同的地址。
+
+## 64. `Binding<T>` 的槽位赋值糖：IR 后端要自己造 Binding 对象
+
+- 坑（实测）：自举把 `input.data = u.name;`（`data` 是 `Binding<string>` 字段）
+  当成普通赋值，把字符串指针 bitcast 成 `%Binding*` 存进槽位——后面
+  `Binding_Get` 拿到的是野指针，程序一个输出都没有（5 个 binding 用例全
+  DIFF）。
+- 口径（宿主 `src/compiler/irgen_expr.c` 的 `emit_binding_value`）：赋给
+  `Binding<T>` 槽的**非 Binding 表达式**要包成一个新建的 Binding 对象
+  {target, getter, setter, live, constVal, version}：
+  - 右值是**字段左值**（`obj.field`，含类内裸字段名 = `this.field`）→
+    **活绑定**：target = 接收者（**非持有**的弱引用，否则 model<->view 成环
+    泄漏）、getter/setter = 合成的访问器函数对、live = 1；
+  - 其他表达式 → **常量绑定**：constVal = 值快照、live = 0；
+  - `b = null` → 普通存储（清空）；右值本身是 Binding → 普通存储（共享）；
+  - 接收者是"语句结束就死"的 owned 临时（`f().field`）→ 降级为常量绑定
+    （活绑定的 target 是弱引用，临时死了 target 就悬空）。
+- 做法（IR 后端）：
+  - 访问器函数按委托 ABI 发射（env 在前）：`i64 @get(i8* env, i8* target)`
+    与 `void @set(i8* env, i8* target, i64 v)`，字段字经 i64 槽搬运
+    （指针 ptrtoint/inttoptr，double bitcast）；
+  - 委托值是**带 tag 的闭包记录** `{fn, env}`（env 槽为空），不是裸函数
+    指针——裸指针走委托调用的"无 env"分支，形参个数对不上；
+  - 擦除的类型参数住在 i64 槽里，所以 get/set 的签名都是 i64；
+  - 声明路径（`Binding<string> s = m.name;`）与字段初始化器路径要走同一
+    套糖，只有赋值路径做是不够的。
+- 连带：
+  - **类型参数不能当类解析**：方法形参上的 `T` 只活在声明类的作用域里，
+    不能被单元里同名的用户类劫持（宿主用 SYM_PARAM 修的）。自举里
+    `WrapImplicitCtorArg` 会把 `num.Set(v)` 的 int 实参包成 `new T(v)`——
+    用户恰好有个 `class T` 时就发出坏 IR。修法：擦除的类型参数不做隐式
+    构造器转换。
+  - LLVM 的函数类型在**值位置**不能加括号：`bitcast i64 (i8*, i8*)* @f to
+    i8*` 合法，`bitcast (i64 (i8*, i8*)*) @f to i8*` 报 "expected type"
+    （括号形式只在实参位置合法）。
