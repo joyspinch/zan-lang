@@ -1,0 +1,184 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component;
+using Gui.Component.CodeEditor;
+
+// IDE 侧诊断并入错误列表（VS 的 Error List 同时收"上一次构建"与
+// "IDE 实时分析"两类来源）。
+//
+// 改造前的错误列表只有上一次构建的编译诊断：构建成功一次，上一轮的错误
+// 就全没了；打字时冒出来的语法错更是根本进不来。语言服务的实时诊断已经
+// 进了编辑器（出错字符下面画波浪线），这里把它们同时灌进错误列表，
+// 顺带把设计期错误（设计/场景文档解析失败）也收进来——错误列表因此
+// 变成"当前工程所有已知问题的清单"，而不只是"上次构建的日志"。
+partial class ZanIDE {
+    // 按文档路径存放的 IDE 侧诊断：语言服务实时诊断 + 设计期错误。
+    Dict<string, List<DiagnosticRecord>> ideDiags = new Dict<string, List<DiagnosticRecord>>();
+    // 内容版本号：诊断一变就 +1，合并缓存据此判断是否过期。
+    int ideDiagVersion;
+    // 合并结果缓存（错误列表每帧取一次，不能每帧重建）。
+    List<DiagnosticRecord> ideErrMerged;
+    int ideErrMergedVersion = 0 - 1;
+    int ideErrMergedBuildCount = 0 - 1;
+
+    // 语言服务推送的实时诊断入库：同一路径的旧诊断整体替换，
+    // 空诊断表示"这份文档现在没问题"，该路径的记录随之清掉。
+    void SetIdeDiagnostics(string path, List<Diagnostic> diags) {
+        if (path == null || path.Length == 0) { return; }
+        List<DiagnosticRecord> recs = new List<DiagnosticRecord>();
+        if (diags != null) {
+            for (int i = 0; i < diags.Count; i = i + 1) {
+                Diagnostic d = diags[i];
+                if (d == null) { continue; }
+                // 诊断的行号是 0 基，错误列表按 1 基显示（与构建日志一致）。
+                recs.Add(new DiagnosticRecord(path, Convert.ToString(d.line + 1), d.msg));
+            }
+        }
+        if (recs.Count == 0) {
+            if (ideDiags.ContainsKey(path)) { ideDiags.Remove(path); }
+        } else {
+            ideDiags[path] = recs;
+        }
+        ideDiagVersion = ideDiagVersion + 1;
+    }
+
+    // 设计期错误入库（没有行号；同一路径只留一条最新的）。
+    void SetIdeError(string path, string msg) {
+        if (path == null || path.Length == 0 || msg == null || msg.Length == 0) { return; }
+        List<DiagnosticRecord> recs = new List<DiagnosticRecord>();
+        recs.Add(new DiagnosticRecord(path, "", msg));
+        ideDiags[path] = recs;
+        ideDiagVersion = ideDiagVersion + 1;
+    }
+
+    // 清掉某条路径的 IDE 侧诊断（文档恢复正常时用）。
+    void ClearIdeDiagnostics(string path) {
+        if (path == null || path.Length == 0) { return; }
+        if (!ideDiags.ContainsKey(path)) { return; }
+        ideDiags.Remove(path);
+        ideDiagVersion = ideDiagVersion + 1;
+    }
+
+    // 错误列表的最终内容：IDE 侧诊断在前，构建诊断在后。
+    List<DiagnosticRecord> MergedErrors(List<DiagnosticRecord> build) {
+        int buildCount = build == null ? 0 : build.Count;
+        if (ideErrMerged != null && ideErrMergedVersion == ideDiagVersion
+            && ideErrMergedBuildCount == buildCount) { return ideErrMerged; }
+        List<DiagnosticRecord> merged = ZanIDE.MergeDiagLists(ideDiags, build, root);
+        ideErrMerged = merged;
+        ideErrMergedVersion = ideDiagVersion;
+        ideErrMergedBuildCount = buildCount;
+        return merged;
+    }
+
+    // 合并两个来源的诊断并按 (文件, 行, 消息) 去重——同一处错误常常
+    // 两个来源都报（构建日志一条 + 语言服务实时一条）。
+    // 静态实现：无头探针可以直接验证，不必起 IDE。
+    static List<DiagnosticRecord> MergeDiagLists(
+            Dict<string, List<DiagnosticRecord>> ide,
+            List<DiagnosticRecord> build, string root) {
+        List<DiagnosticRecord> merged = new List<DiagnosticRecord>();
+        List<string> keys = new List<string>();
+        // IDE 侧诊断先收齐，按 (归一化路径, 行号) 排序：错误列表的次序
+        // 要稳定，不能跟着字典的哈希序或路径分隔符的写法走。
+        List<DiagnosticRecord> ideAll = new List<DiagnosticRecord>();
+        if (ide != null) {
+            List<string> paths = ide.Keys;
+            for (int i = 0; i < paths.Count; i = i + 1) {
+                List<DiagnosticRecord> recs = ide[paths[i]];
+                if (recs == null) { continue; }
+                for (int j = 0; j < recs.Count; j = j + 1) { ideAll.Add(recs[j]); }
+            }
+        }
+        ZanIDE.SortDiagRecords(ideAll);
+        for (int i = 0; i < ideAll.Count; i = i + 1) {
+            string k = ZanIDE.DiagKey(ideAll[i], root);
+            if (ZanIDE.DiagHasKey(keys, k)) { continue; }
+            keys.Add(k);
+            merged.Add(ideAll[i]);
+        }
+        if (build != null) {
+            for (int i = 0; i < build.Count; i = i + 1) {
+                string k = ZanIDE.DiagKey(build[i], root);
+                if (ZanIDE.DiagHasKey(keys, k)) { continue; }
+                keys.Add(k);
+                merged.Add(build[i]);
+            }
+        }
+        return merged;
+    }
+
+    // 按 (归一化路径, 行号, 消息) 排诊断（插入排序，条目数是几十级）。
+    static void SortDiagRecords(List<DiagnosticRecord> recs) {
+        for (int i = 1; i < recs.Count; i = i + 1) {
+            DiagnosticRecord cur = recs[i];
+            int j = i - 1;
+            // 把排在 cur 之后的条目依次往后挪（条件是"别人比 cur 大"）。
+            while (j >= 0 && ZanIDE.DiagRecAfter(recs[j], cur)) {
+                recs[j + 1] = recs[j];
+                j = j - 1;
+            }
+            recs[j + 1] = cur;
+        }
+    }
+
+    // cur 是否排在 other 之后。行号按数值比——字符串比会让 "10" 排在
+    // "9" 前面（错误列表的行号是十进制文本）。
+    static bool DiagRecAfter(DiagnosticRecord cur, DiagnosticRecord other) {
+        string cp = ZanIDE.NormSlashes(cur.path == null ? "" : cur.path);
+        string op = ZanIDE.NormSlashes(other.path == null ? "" : other.path);
+        int c = ZanIDE.CmpBytes(cp, op);
+        if (c != 0) { return c > 0; }
+        int cn = ZanIDE.ParseInt(cur.line == null ? "" : cur.line);
+        int on = ZanIDE.ParseInt(other.line == null ? "" : other.line);
+        if (cn != on) { return cn > on; }
+        string cm = cur.msg == null ? "" : cur.msg;
+        string om = other.msg == null ? "" : other.msg;
+        return ZanIDE.CmpBytes(cm, om) > 0;
+    }
+
+    // 两个字符串按字节比较（负数/0/正数）。
+    static int CmpBytes(string a, string b) {
+        if (a == null) { a = ""; }
+        if (b == null) { b = ""; }
+        int n = a.Length < b.Length ? a.Length : b.Length;
+        for (int i = 0; i < n; i = i + 1) {
+            int x = a[i] & 255;
+            int y = b[i] & 255;
+            if (x != y) { return x < y ? 0 - 1 : 1; }
+        }
+        if (a.Length == b.Length) { return 0; }
+        return a.Length < b.Length ? 0 - 1 : 1;
+    }
+
+    // 去重键：解析后的文件路径 + 行 + 消息。路径按大小写不敏感比较，
+    // 构建日志给的是相对路径、语言服务给的是绝对路径，先统一到同一份
+    // （分隔符也统一成 "/"，否则同一个文件会有两种写法各留一条）。
+    static string DiagKey(DiagnosticRecord r, string root) {
+        if (r == null) { return ""; }
+        string p = r.path == null ? "" : r.path;
+        string resolved = ZanIDE.ResolveDiagPath(root, p);
+        if (resolved == "") {
+            // 定位不到文件时也要把相对路径挂到工程根下，否则同一处错误
+            // 会以"相对写法"和"绝对写法"各留一条。
+            if (root != null && root != "" && p != "" && !Path.IsPathRooted(p)) {
+                resolved = root + "/" + p;
+            } else {
+                resolved = p;
+            }
+        }
+        resolved = ZanIDE.NormSlashes(resolved).ToLower();
+        string line = r.line == null ? "" : r.line;
+        string msg = r.msg == null ? "" : r.msg;
+        return resolved + "|" + line + "|" + msg;
+    }
+
+    // 去重键表里是否已有这个键。
+    static bool DiagHasKey(List<string> keys, string v) {
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (keys[i] == v) { return true; }
+        }
+        return false;
+    }
+}
