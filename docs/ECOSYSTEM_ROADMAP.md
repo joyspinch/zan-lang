@@ -687,6 +687,57 @@ deflate/lz4/zstd"）**已经过期**：`packages/Zan.IO/src/System/IO/Compressio
 剩下的真空白只有 **zstd**：它的熵编码（FSE + Huffman）解码器体量大，
 编码器可以先做"仅 raw block"的合法子集，但收益有限，暂缓。
 
+### 1.19 PDF 生成：`Zan.Pdf`
+
+新包 `packages/Zan.Pdf`，命名空间 `System.Pdf`。补 QuestPDF（14,205★）那一档的
+**生成**侧：把数据排成页、写出去。原 §2 记的"全仓唯一 pdf 命中是 HttpClient 的
+MIME 映射"确实是空白——没有任何排版 / 字体 / 表格引擎。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `PdfDocument.zan` | `PdfDocument` | 文档：加页 / 取页 / 序列化 / 存盘 + 标题 / 作者 / 主题 / 关键词元数据 |
+| `PdfPage.zan` | `PdfPage` | 页面：画线 / 矩形（填充·描边·两者）/ 文本（盒内对齐）+ 文本测量 |
+| `PdfPageSize.zan` | `PdfPageSize` | A4 / Letter / Legal / 自定义（单位：点） |
+| `PdfFont.zan` | `PdfFont` / `PdfMetrics` | 标准 14 字体（Helvetica / Times / Courier × 常规粗体）+ 每字符宽度表 + 上伸下伸与行高 |
+| `PdfColor.zan` | `PdfColor` | RGB 颜色：黑 / 白 / 灰 / 0-255 / 十六进制 / 混合 |
+| `PdfTable.zan` | `PdfTable` / `PdfColumn` | 表格：列宽 / 对齐 / 内边距 / 表头 / 边框 / 行高按内容撑开 / 绘制 |
+| `PdfGraphics.zan` | `PdfGraphics` / `PdfGraphicsKind` | 绘图指令原语（线 / 矩形 / 文本） |
+| `PdfWriter.zan` | `PdfWriter` | PDF 1.4 写出器：Catalog / Pages / Page / 内容流 / 五个字体对象 / xref / trailer |
+| `PdfBuffer.zan` | `PdfBuffer` | 字节缓冲 + 不依赖 locale 的定点数字格式化 |
+| `PdfException.zan` | `PdfException` / `PdfError` | 参数非法 / 字符编不出来 / 文档状态不对（可区分） |
+
+**六条硬取舍**：
+
+1. **只用标准 14 字体，不嵌字体**。这几种字体是阅读器自带的：文档小、没有
+   授权问题、任何阅读器都能开。代价是没有 CJK——标准 14 字体没有汉字字形。
+2. **编不出来的字符当场报错**（`PdfError.UnencodableCharacter`），不写出一份
+   显示成方框或干脆打不开的文档。PDF 这种格式"要么全对要么全错"，半个可用的
+   文档比报错糟糕得多。
+3. **坐标用左上角原点、y 向下**，翻成 PDF 的左下角原点只在一处做（写内容流
+   时 `H - y`）。排版代码按 HTML 画布的直觉写。
+4. **不自动分配列宽**：列宽显式给。自动分配要么按内容比例（长文本的列被挤成
+   一条），要么等分（表格布局引擎要的是"我说了算"）。
+5. **数字不用 `Convert.ToString`**：不同 locale 的小数点与千分位不同，写进
+   PDF 会让阅读器解析出错误的坐标；包内自写定点格式化（最多三位小数）。
+6. **只生成不解析**：本包不是 PDF 阅读器。读 PDF 的文本与表格是另一件事
+   （内容流解析 + 字体映射）。
+
+conformance `pdf_document`（文件头 / 文件尾、startxref 指向的确实是 xref 表、
+**每条 xref 记录指向的确实是 `<对象号> 0 obj`**、对象号与页树一致；Catalog /
+Pages / Page / Font 对象、MediaBox、文本操作符序列、颜色操作符、坐标翻转；
+括号与反斜杠的 PDF 字面量转义；标准 14 字体的宽度 / 上伸 / 行高；表格的列宽
+累加、总高、绘制高度与测量一致、单元格数校验；错误路径：无页文档、编不出来
+的字符、非法页尺寸、越界取页）。
+
+**外部验证**：生成的样例文档用 **pypdf** 与 **pymupdf** 两个独立实现解析通过
+（页数、元数据、文本抽取、表格单元格、右对齐与居中的坐标全部正确），并渲染
+出位图人工复核过版面。
+
+**已知边界**：没有中文 / CJK（要中文得嵌 TrueType 子集 + 编码表）；不解析
+PDF；没有图片（XObject）；内容流不压缩（可后续接 `System.IO.Compression.Deflate`）；
+没有加密 / 签名 / 附件 / 书签 / XMP；表格没有合并单元格与跨页表头重复；只支持
+Type1 简单字体与 WinAnsiEncoding。
+
 ---
 
 ### 1.19 表级变换：`Zan.DataFrame` 补齐 pandas 的 reshape 家族
@@ -843,7 +894,7 @@ tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家私有协�
 
 | 建议包 | C# 参考 | ★ | 补什么 |
 |---|---|---|---|
-| `Zan.Pdf` | QuestPDF | 14,205 | **当前最大空白**：全仓唯一 "pdf" 命中是 HttpClient 的 MIME 映射；无排版/字体/表格引擎 |
+| `Zan.Pdf` | QuestPDF | 14,205 | ✅ 已落地 `packages/Zan.Pdf`（`System.Pdf`：页面 + 线 / 矩形 / 文本 + 标准 14 字体度量 + 表格 + PDF 1.4 写出器（xref / 元数据 / WinAnsi），不嵌字体，见 §1.19） | — |
 | `Zan.Ssh` | SSH.NET | 4,385 | SSH 客户端、SFTP、密钥管理 |
 | `Zan.Barcode` | ZXing.Net | 榜外 | 条码/二维码编解码（补全 Gui 侧扫码） |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |

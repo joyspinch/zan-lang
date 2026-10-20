@@ -1,0 +1,274 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Pdf;
+
+// PDF 写出器（能力层）：把文档翻译成 PDF 1.4 字节流。
+//
+// **结构**：Catalog → Pages → 每页的 Page 对象 + 内容流；五个标准 14 字体
+// 对象由所有页共享（字体是全局资源，不必每页一份）。
+//
+// **坐标翻转换只做一次**：页面用左上角原点、y 向下；PDF 用左下角原点、
+// y 向上。翻在写内容流时做（`H - y`），其余地方都按页面的坐标想。
+//
+// **文本只走 ASCII 与 Latin-1**：标准 14 字体没有 CJK 字形。要中文得嵌
+// 字体（TrueType 子集 + 编码表），那是另一件事——本包遇到编不出来的字符
+// **当场报错**，不写出一份读者打不开或显示成方框的文档。
+public static class PdfWriter {
+    // 写出整个文档。
+    public static byte[] Write(PdfDocument doc) {
+        if (doc == null) {
+            throw new PdfException(PdfError.InvalidArgument, "PdfWriter.Write: the document must not be null");
+        }
+        int pageCount = doc.PageCount();
+        if (pageCount == 0) {
+            throw new PdfException(PdfError.InvalidState, "PdfWriter.Write: the document has no pages");
+        }
+
+        int catalogObj = 1;
+        int pagesObj = 2;
+        int infoObj = 3;
+        int firstFontObj = 4;
+        int fontCount = 5;
+        int next = firstFontObj + fontCount;
+
+        List<int> pageObjs = new List<int>();
+        List<int> contentObjs = new List<int>();
+        for (int i = 0; i < pageCount; i = i + 1) {
+            pageObjs.Add(next);
+            contentObjs.Add(next + 1);
+            next = next + 2;
+        }
+        int totalObjs = next - 1;
+
+        PdfBuffer buf = new PdfBuffer();
+        List<int> offsets = new List<int>();
+        for (int i = 0; i < totalObjs; i = i + 1) { offsets.Add(0); }
+
+        // 文件头 + 二进制标记（让阅读器认出这是二进制传输而非文本）。
+        buf.Ascii("%PDF-1.4\n");
+        buf.Raw(37); buf.Raw(226); buf.Raw(227); buf.Raw(207); buf.Raw(211);
+        buf.Ascii("\n");
+
+        // Catalog。
+        offsets[catalogObj - 1] = buf.Length();
+        buf.Ascii("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        // Pages 树。
+        offsets[pagesObj - 1] = buf.Length();
+        string kids = "";
+        for (int i = 0; i < pageCount; i = i + 1) {
+            if (i > 0) { kids = kids + " "; }
+            kids = kids + pageObjs[i].ToString() + " 0 R";
+        }
+        buf.Ascii("2 0 obj\n<< /Type /Pages /Kids [" + kids + "] /Count " +
+            pageCount.ToString() + " >>\nendobj\n");
+
+        // 文档信息。
+        offsets[infoObj - 1] = buf.Length();
+        buf.Ascii("3 0 obj\n" + PdfWriter.InfoBody(doc) + "\nendobj\n");
+
+        // 五个标准 14 字体。
+        string[] baseFonts = new string[] {
+            "Helvetica", "Helvetica-Bold", "Times-Roman", "Times-Bold", "Courier"
+        };
+        for (int i = 0; i < fontCount; i = i + 1) {
+            int objNum = firstFontObj + i;
+            offsets[objNum - 1] = buf.Length();
+            buf.Ascii(objNum.ToString() + " 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /" +
+                baseFonts[i] + " /Encoding /WinAnsiEncoding >>\nendobj\n");
+        }
+
+        // 每页：Page 对象 + 内容流。
+        for (int i = 0; i < pageCount; i = i + 1) {
+            PdfPage page = doc.Page(i);
+            string content = PdfWriter.ContentOf(page);
+
+            int pageObj = pageObjs[i];
+            offsets[pageObj - 1] = buf.Length();
+            string resources = "<< /Font << /F1 4 0 R /F2 5 0 R /F3 6 0 R /F4 7 0 R /F5 8 0 R >> >>";
+            buf.Ascii(pageObj.ToString() + " 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " +
+                PdfBuffer.Format(page.Size.Width) + " " + PdfBuffer.Format(page.Size.Height) + "] /Resources " +
+                resources + " /Contents " + contentObjs[i].ToString() + " 0 R >>\nendobj\n");
+
+            int contentObj = contentObjs[i];
+            offsets[contentObj - 1] = buf.Length();
+            buf.Ascii(contentObj.ToString() + " 0 obj\n<< /Length " +
+                content.Length.ToString() + " >>\nstream\n" + content + "endstream\nendobj\n");
+        }
+
+        // 交叉引用表。
+        int xrefOffset = buf.Length();
+        buf.Ascii("xref\n0 " + (totalObjs + 1).ToString() + "\n");
+        buf.Ascii("0000000000 65535 f \n");
+        for (int i = 0; i < totalObjs; i = i + 1) {
+            buf.Ascii(PdfWriter.Pad10(offsets[i]) + " 00000 n \n");
+        }
+        buf.Ascii("trailer\n<< /Size " + (totalObjs + 1).ToString() + " /Root 1 0 R /Info 3 0 R >>\n");
+        buf.Ascii("startxref\n" + xrefOffset.ToString() + "\n%%EOF\n");
+
+        return buf.ToArray();
+    }
+
+    // 文档信息字典。
+    private static string InfoBody(PdfDocument doc) {
+        string body = "<< /Producer (Zan.Pdf)";
+        body = body + PdfWriter.InfoEntry("/Title", doc.Title);
+        body = body + PdfWriter.InfoEntry("/Author", doc.Author);
+        body = body + PdfWriter.InfoEntry("/Subject", doc.Subject);
+        body = body + PdfWriter.InfoEntry("/Keywords", doc.Keywords);
+        body = body + PdfWriter.InfoEntry("/Creator", doc.Creator);
+        return body + " >>";
+    }
+
+    // 一个信息字段（空值不写）。
+    private static string InfoEntry(string key, string value) {
+        if (value == null || value.Length == 0) { return ""; }
+        return " " + key + " (" + PdfWriter.EscapeText(value) + ")";
+    }
+
+    // 页面内容流（PDF 操作符）。
+    private static string ContentOf(PdfPage page) {
+        string content = "";
+        double height = page.Size.Height;
+        for (int i = 0; i < page.GraphicsCount(); i = i + 1) {
+            PdfGraphics g = page.At(i);
+            if (g == null) { continue; }
+            if (g.Kind == PdfGraphicsKind.Line) {
+                content = content + PdfBuffer.Format(g.LineWidth) + " w\n";
+                content = content + PdfWriter.ColorOp(g.StrokeColor, "RG");
+                content = content + PdfBuffer.Format(g.X1) + " " + PdfBuffer.Format(height - g.Y1) + " m\n";
+                content = content + PdfBuffer.Format(g.X2) + " " + PdfBuffer.Format(height - g.Y2) + " l\n";
+                content = content + "S\n";
+            } else if (g.Kind == PdfGraphicsKind.RectFill) {
+                content = content + PdfWriter.ColorOp(g.Color, "rg");
+                content = content + PdfWriter.RectOp(g, height) + "f\n";
+            } else if (g.Kind == PdfGraphicsKind.RectStroke) {
+                content = content + PdfBuffer.Format(g.LineWidth) + " w\n";
+                content = content + PdfWriter.ColorOp(g.StrokeColor, "RG");
+                content = content + PdfWriter.RectOp(g, height) + "S\n";
+            } else if (g.Kind == PdfGraphicsKind.RectFillStroke) {
+                content = content + PdfBuffer.Format(g.LineWidth) + " w\n";
+                content = content + PdfWriter.ColorOp(g.Color, "rg");
+                content = content + PdfWriter.ColorOp(g.StrokeColor, "RG");
+                content = content + PdfWriter.RectOp(g, height) + "B\n";
+            } else if (g.Kind == PdfGraphicsKind.Text) {
+                content = content + PdfWriter.TextOps(g, height);
+            }
+        }
+        return content;
+    }
+
+    // 颜色操作符。
+    private static string ColorOp(PdfColor color, string op) {
+        return PdfBuffer.Format(color.R) + " " + PdfBuffer.Format(color.G) + " " +
+            PdfBuffer.Format(color.B) + " " + op + "\n";
+    }
+
+    // 矩形操作符（PDF 的矩形用左下角）。
+    private static string RectOp(PdfGraphics g, double pageHeight) {
+        return PdfBuffer.Format(g.X) + " " + PdfBuffer.Format(pageHeight - g.Y - g.H) + " " +
+            PdfBuffer.Format(g.W) + " " + PdfBuffer.Format(g.H) + " re\n";
+    }
+
+    // 文本操作符（多行拆成多个定位）。
+    private static string TextOps(PdfGraphics g, double pageHeight) {
+        string content = "";
+        List<string> lines = PdfWriter.SplitLines(g.Text);
+        double lineHeight = g.Font.LineHeight(g.FontSize);
+        double ascent = g.Font.AscentAt(g.FontSize);
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i];
+            double width = g.Font.Measure(line, g.FontSize);
+            double x = g.X;
+            if (g.Align == PdfTextAlign.Center) {
+                x = g.X + (g.W - width) / 2.0;
+            } else if (g.Align == PdfTextAlign.Right) {
+                x = g.X + g.W - width;
+            }
+            double top = g.Y + i * lineHeight;
+            double baseline = pageHeight - (top + ascent);
+            content = content + "BT\n";
+            content = content + "/" + g.Font.ResourceName + " " + PdfBuffer.Format(g.FontSize) + " Tf\n";
+            content = content + PdfWriter.ColorOp(g.Color, "rg");
+            content = content + "1 0 0 1 " + PdfBuffer.Format(x) + " " + PdfBuffer.Format(baseline) + " Tm\n";
+            content = content + "(" + PdfWriter.EscapeText(line) + ") Tj\n";
+            content = content + "ET\n";
+        }
+        return content;
+    }
+
+    // 按行拆文本。
+    private static List<string> SplitLines(string text) {
+        List<string> lines = new List<string>();
+        if (text == null) { return lines; }
+        int start = 0;
+        for (int i = 0; i < text.Length; i = i + 1) {
+            if (text[i] == 10) {
+                lines.Add(text.Substring(start, i - start));
+                start = i + 1;
+            }
+        }
+        lines.Add(text.Substring(start, text.Length - start));
+        return lines;
+    }
+
+    // 转义 PDF 字面量字符串里的特殊字符。
+    //
+    // `\`、`(`、`)` 必须转义；非 ASCII 走八进制转义（WinAnsi 的高位区）。
+    // 编码不出来的字符（控制字符、0x7F..0x9F）当场报错——写出去只会得到
+    // 一份显示成方框或直接打不开的文档。
+    public static string EscapeText(string text) {
+        if (text == null) { return ""; }
+        string outp = "";
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i];
+            if (c == 92) {
+                outp = outp + "\\\\";
+            } else if (c == 40) {
+                outp = outp + "\\(";
+            } else if (c == 41) {
+                outp = outp + "\\)";
+            } else if (c >= 32 && c <= 126) {
+                outp = outp + PdfWriter.Printable().Substring(c - 32, 1);
+            } else if (c >= 160 && c <= 255) {
+                outp = outp + "\\" + PdfWriter.Octal(c);
+            } else {
+                throw new PdfException(PdfError.UnencodableCharacter,
+                    "PdfWriter: the character 0x" + c.ToString() +
+                    " cannot be encoded with the standard 14 fonts");
+            }
+        }
+        return outp;
+    }
+
+    // 三位八进制。
+    private static string Octal(int value) {
+        int v = value;
+        string s = "";
+        for (int i = 0; i < 3; i = i + 1) {
+            int digit = v % 8;
+            s = PdfWriter.OctalDigits().Substring(digit, 1) + s;
+            v = v / 8;
+        }
+        return s;
+    }
+
+    // 可打印 ASCII 表（码位 32..126 依次排列）。
+    private static string Printable() {
+        return " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+            "[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    }
+
+    // 八进制数字表。
+    private static string OctalDigits() {
+        return "01234567";
+    }
+
+    // 左侧补零到十位（xref 偏移量要求定长）。
+    private static string Pad10(int value) {
+        string s = value.ToString();
+        while (s.Length < 10) { s = "0" + s; }
+        return s;
+    }
+}

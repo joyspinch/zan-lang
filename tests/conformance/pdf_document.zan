@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Pdf;
+
+// PDF 生成契约测试：文档结构、交叉引用表、内容流、字体度量、表格、错误路径。
+//
+// 覆盖的判定点：
+//   - 结构：文件头 / 文件尾、startxref 指向的确实是 xref 表、每条 xref 记录
+//     指向的确实是 "N 0 obj"、对象号连续、页树列出所有页；
+//   - 内容：Catalog / Pages / Page / Font 对象、MediaBox、文本操作符序列、
+//     颜色操作符、坐标翻转（页面 y 向下 → PDF y 向上）；
+//   - 转义：括号与反斜杠的 PDF 字面量转义；
+//   - 度量：标准 14 字体宽度与行高（表格排版靠它）；
+//   - 表格：列宽累加、总高、单元格数不符报错；
+//   - 错误路径：无页文档、编不出来的字符、非法页尺寸、空路径。
+public class PdfTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    // 字节序列是否在指定位置匹配。
+    private static bool At(byte[] data, int offset, string expected) {
+        if (offset < 0 || offset + expected.Length > data.Length) { return false; }
+        for (int i = 0; i < expected.Length; i = i + 1) {
+            if (data[offset + i] != expected[i]) { return false; }
+        }
+        return true;
+    }
+
+    // 找子串位置（找不到返回 -1）。
+    private static int Find(byte[] data, string needle, int from) {
+        int n = needle.Length;
+        if (n == 0) { return -1; }
+        for (int i = from; i + n <= data.Length; i = i + 1) {
+            bool hit = true;
+            for (int k = 0; k < n; k = k + 1) {
+                if (data[i + k] != needle[k]) { hit = false; break; }
+            }
+            if (hit) { return i; }
+        }
+        return -1;
+    }
+
+    // 解析十进制数字（从位置开始）。
+    private static int ReadInt(byte[] data, int offset) {
+        int value = 0;
+        int i = offset;
+        while (i < data.Length) {
+            int c = data[i];
+            if (c < 48 || c > 57) { break; }
+            value = value * 10 + (c - 48);
+            i = i + 1;
+        }
+        return value;
+    }
+
+    public static void Run() {
+        TestStructure();
+        TestContent();
+        TestEscaping();
+        TestMetrics();
+        TestTable();
+        TestErrors();
+
+        if (failures > 0) {
+            Console.WriteLine("PDF TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL PDF TESTS PASSED");
+        }
+    }
+
+    // ---- 文档结构 ----
+    private static void TestStructure() {
+        PdfDocument doc = new PdfDocument();
+        doc.Title = "Title (with) parens";
+        doc.Author = "Zan";
+        doc.AddPage();
+        doc.AddPage();
+
+        byte[] data = doc.Build();
+        Check("pdf-header", At(data, 0, "%PDF-1.4"));
+        Check("pdf-trailer-eof", At(data, data.Length - 6, "%%EOF\n"));
+
+        // startxref 指向的必须是 xref 表。
+        int sx = Find(data, "startxref\n", 0);
+        Check("pdf-startxref-present", sx > 0);
+        int xrefOffset = ReadInt(data, sx + 10);
+        Check("pdf-startxref-points-at-xref", At(data, xrefOffset, "xref\n"));
+
+        // 交叉引用表的每条记录都要指向 "<对象号> 0 obj"。
+        int xrefLine = Find(data, "xref\n", xrefOffset);
+        Check("pdf-xref-count", xrefLine > 0);
+        int countLine = xrefLine + 5;                 // "0 <数量>" 那一行
+        int objCount = ReadInt(data, countLine + 2);
+        // 1 Catalog + 1 Pages + 1 Info + 5 字体 + 2*(页+流) = 12，加自由项 1 → 13。
+        Check("pdf-object-count", objCount == 13);
+
+        int entry = Find(data, "\n", countLine) + 1;   // 第一条 xref 记录
+        entry = entry + 20;                           // 跳过第 0 条（自由项）
+        bool allPoint = true;
+        for (int obj = 1; obj < objCount; obj = obj + 1) {
+            int offset = ReadInt(data, entry);
+            if (!At(data, offset, obj.ToString() + " 0 obj")) { allPoint = false; }
+            entry = entry + 20;
+        }
+        Check("pdf-xref-entries-point-at-objects", allPoint);
+
+        // 页树列出两页。
+        string text = Encoding.UTF8.GetString(data);
+        Check("pdf-kids-list", text.Contains("/Kids [9 0 R 11 0 R]"));
+        Check("pdf-page-count-key", text.Contains("/Count 2"));
+    }
+
+    // ---- 内容流 ----
+    private static void TestContent() {
+        PdfDocument doc = new PdfDocument();
+        PdfPage page = doc.AddPage();
+        page.DrawText(50, 50, "Hello", PdfFont.Helvetica(), 12, PdfColor.Black);
+        page.DrawLine(10, 20, 100, 20, PdfColor.FromRgb(255, 0, 0), 2.0);
+        page.DrawRect(10, 30, 50, 20, PdfColor.FromRgb(0, 0, 255));
+
+        string text = Encoding.UTF8.GetString(doc.Build());
+        Check("pdf-catalog", text.Contains("/Type /Catalog"));
+        Check("pdf-pages-node", text.Contains("/Type /Pages"));
+        Check("pdf-page-node", text.Contains("/Type /Page"));
+        Check("pdf-font-node", text.Contains("/Type /Font"));
+        Check("pdf-basefont", text.Contains("/BaseFont /Helvetica"));
+        Check("pdf-encoding", text.Contains("/Encoding /WinAnsiEncoding"));
+        Check("pdf-mediabox-a4", text.Contains("/MediaBox [0 0 595.28 841.89]"));
+        Check("pdf-text-block", text.Contains("BT\n") && text.Contains(") Tj\n") && text.Contains("ET\n"));
+        Check("pdf-text-operator", text.Contains("/F1 12 Tf"));
+        Check("pdf-fill-color", text.Contains("0 0 0 rg"));
+        Check("pdf-stroke-color", text.Contains("1 0 0 RG"));
+        Check("pdf-line-width", text.Contains("2 w"));
+        Check("pdf-rect", text.Contains(" re"));
+
+        // 坐标翻转：页面 y 向下，PDF y 向上 —— y=50 的文字基线在 841.89 - 50 - 上伸。
+        // Helvetica 的上伸是 718/1000 em，12pt → 8.616 点。
+        Check("pdf-coord-flip", text.Contains("1 0 0 1 50 783.274 Tm"));
+
+        // 页面尺寸可自定义。
+        PdfDocument doc2 = new PdfDocument();
+        doc2.AddPage(PdfPageSize.Letter());
+        string text2 = Encoding.UTF8.GetString(doc2.Build());
+        Check("pdf-mediabox-letter", text2.Contains("/MediaBox [0 0 612 792]"));
+    }
+
+    // ---- 文本转义 ----
+    private static void TestEscaping() {
+        PdfDocument doc = new PdfDocument();
+        PdfPage page = doc.AddPage();
+        page.DrawText(10, 10, "A (B) C\\D", PdfFont.Courier(), 10, PdfColor.Black);
+        string text = Encoding.UTF8.GetString(doc.Build());
+        Check("pdf-escape-parens", text.Contains("(A \\(B\\) C\\\\D)"));
+    }
+
+    // ---- 字体度量 ----
+    private static void TestMetrics() {
+        PdfFont helv = PdfFont.Helvetica();
+        // H722 + e556 + l222 + l222 + o556 = 2278 → 2278 * 12 / 1000 = 27.336。
+        Check("pdf-metric-helvetica", Math.Abs(helv.Measure("Hello", 12.0) - 27.336) < 0.0001);
+
+        // Courier 等宽：每个字符 600 → 5 * 600 * 10 / 1000 = 30。
+        PdfFont courier = PdfFont.Courier();
+        Check("pdf-metric-courier", Math.Abs(courier.Measure("Hello", 10.0) - 30.0) < 0.0001);
+        Check("pdf-metric-monospace-flag", courier.Monospace && !helv.Monospace);
+
+        // 上伸 / 下伸 / 行高。
+        Check("pdf-metric-ascent", Math.Abs(helv.AscentAt(12.0) - 8.616) < 0.0001);
+        Check("pdf-metric-line-height", helv.LineHeight(12.0) > helv.AscentAt(12.0));
+    }
+
+    // ---- 表格 ----
+    private static void TestTable() {
+        PdfTable table = new PdfTable();
+        table.AddColumn("Name", 150).AddColumn("Qty", 60, PdfTextAlign.Right);
+        table.AddRow(new List<string> { "Widget", "3" });
+        table.AddRow(new List<string> { "Gadget", "12" });
+
+        Check("pdf-table-width", Math.Abs(table.TotalWidth() - 210.0) < 0.0001);
+
+        // 一行的高度 = 行高 + 上下内边距（padding 默认 4）。
+        double rowHeight = 12.0 * 0.925 + 8.0;
+        double expected = rowHeight * 3.0;
+        Check("pdf-table-height", Math.Abs(table.MeasureHeight() - expected) < 0.01);
+
+        // 画到页面上占的高度与量出来的一致。
+        PdfDocument doc = new PdfDocument();
+        PdfPage page = doc.AddPage();
+        double drawn = table.Draw(page, 40, 100);
+        Check("pdf-table-draw-height", Math.Abs(drawn - expected) < 0.01);
+
+        // 单元格数与列数不符 → 报错。
+        bool threw = false;
+        try {
+            table.AddRow(new List<string> { "only one" });
+        } catch (PdfException e) {
+            threw = e.error == PdfError.InvalidArgument;
+        }
+        Check("pdf-table-cell-count-checked", threw);
+    }
+
+    // ---- 错误路径 ----
+    private static void TestErrors() {
+        // 没有页的文档不能构建。
+        bool threw = false;
+        try {
+            new PdfDocument().Build();
+        } catch (PdfException e) {
+            threw = e.error == PdfError.InvalidState;
+        }
+        Check("pdf-empty-document-rejected", threw);
+
+        // 标准 14 字体编不出来的字符 → 报错（不写出一份坏文档）。
+        threw = false;
+        try {
+            PdfDocument doc = new PdfDocument();
+            PdfPage page = doc.AddPage();
+            page.DrawText(10, 10, "中文", PdfFont.Helvetica(), 12, PdfColor.Black);
+            doc.Build();
+        } catch (PdfException e) {
+            threw = e.error == PdfError.UnencodableCharacter;
+        }
+        Check("pdf-unencodable-character-rejected", threw);
+
+        // 非法页尺寸。
+        threw = false;
+        try {
+            new PdfPageSize(-1, 100);
+        } catch (PdfException e) {
+            threw = e.error == PdfError.InvalidArgument;
+        }
+        Check("pdf-invalid-page-size-rejected", threw);
+
+        // 越界取页。
+        threw = false;
+        try {
+            new PdfDocument().Page(0);
+        } catch (PdfException e) {
+            threw = e.error == PdfError.InvalidArgument;
+        }
+        Check("pdf-page-index-checked", threw);
+    }
+}
+
+public class PdfTestsMain {
+    public static void Main() {
+        PdfTests.Run();
+    }
+}

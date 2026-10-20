@@ -1,0 +1,223 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Pdf;
+
+// 表格的一列。
+public class PdfColumn {
+    // 表头文字。
+    public string Header;
+    // 列宽（点）。
+    public double Width;
+    // 单元格内文字的对齐方式。
+    public PdfTextAlign Align;
+
+    public PdfColumn(string header, double width, PdfTextAlign align) {
+        this.Header = header != null ? header : "";
+        this.Width = width;
+        this.Align = align;
+    }
+}
+
+// 表格：列 + 行，画到页面上。
+//
+// **宽度自己定，不自动分配**：列宽是显式给的（`AddColumn("名称", 200)`）——
+// 自动分配要么按内容比例（长文本的列反而挤成一条），要么按等分（表格布局
+// 引擎真正要的是"我说了算"）。
+//
+// **行高按内容算**：单元格里换行的文本会把行撑高，行高取各单元格的最大值。
+//
+// **并发**：非线程安全。
+public class PdfTable {
+    private List<PdfColumn> columns;
+    private List<List<string>> rows;
+    private double padding;
+    private double fontSize;
+    private double headerFontSize;
+    private PdfFont font;
+    private PdfFont headerFont;
+    private PdfColor borderColor;
+    private double borderWidth;
+
+    public PdfTable() {
+        this.columns = new List<PdfColumn>();
+        this.rows = new List<List<string>>();
+        this.padding = 4.0;
+        this.fontSize = 10.0;
+        this.headerFontSize = 10.0;
+        this.font = PdfFont.Helvetica();
+        this.headerFont = PdfFont.HelveticaBold();
+        this.borderColor = PdfColor.Black;
+        this.borderWidth = 0.5;
+    }
+
+    // 加一列（左对齐）。
+    public PdfTable AddColumn(string header, double width) {
+        return this.AddColumn(header, width, PdfTextAlign.Left);
+    }
+
+    // 加一列（指定对齐）。
+    public PdfTable AddColumn(string header, double width, PdfTextAlign align) {
+        if (width <= 0.0) {
+            throw new PdfException(PdfError.InvalidArgument,
+                "PdfTable.AddColumn: the column width must be positive");
+        }
+        this.columns.Add(new PdfColumn(header, width, align));
+        return this;
+    }
+
+    // 加一行（单元格个数必须与列数一致）。
+    public PdfTable AddRow(List<string> cells) {
+        if (cells == null) {
+            throw new PdfException(PdfError.InvalidArgument, "PdfTable.AddRow: the cells must not be null");
+        }
+        if (cells.Count != this.columns.Count) {
+            throw new PdfException(PdfError.InvalidArgument,
+                "PdfTable.AddRow: expected " + this.columns.Count.ToString() +
+                " cells, got " + cells.Count.ToString());
+        }
+        this.rows.Add(cells);
+        return this;
+    }
+
+    // 加一行（数组形态）。
+    public PdfTable AddRow(string[] cells) {
+        List<string> list = new List<string>();
+        if (cells != null) {
+            for (int i = 0; i < cells.Length; i = i + 1) {
+                list.Add(cells[i]);
+            }
+        }
+        return this.AddRow(list);
+    }
+
+    // 单元格内边距（点）。
+    public PdfTable WithPadding(double value) {
+        this.padding = value;
+        return this;
+    }
+
+    // 正文字号（点）。
+    public PdfTable WithFontSize(double value) {
+        this.fontSize = value;
+        return this;
+    }
+
+    // 表格字体。
+    public PdfTable WithFont(PdfFont value) {
+        if (value == null) {
+            throw new PdfException(PdfError.InvalidArgument, "PdfTable.WithFont: the font must not be null");
+        }
+        this.font = value;
+        return this;
+    }
+
+    // 边框颜色与线宽（线宽 <= 0 表示不画边框）。
+    public PdfTable WithBorder(PdfColor color, double width) {
+        this.borderColor = color;
+        this.borderWidth = width;
+        return this;
+    }
+
+    // 表格总宽（点）。
+    public double TotalWidth() {
+        double total = 0.0;
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            total = total + this.columns[i].Width;
+        }
+        return total;
+    }
+
+    // 表格总高（点）：表头 + 所有行。
+    public double MeasureHeight() {
+        double total = 0.0;
+        if (this.columns.Count > 0) {
+            total = total + this.RowHeight(this.HeaderCells(), this.headerFont, this.headerFontSize);
+        }
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            total = total + this.RowHeight(this.rows[i], this.font, this.fontSize);
+        }
+        return total;
+    }
+
+    // 把表格画到页面上（返回表格占用的高度）。
+    public double Draw(PdfPage page, double x, double y) {
+        if (page == null) {
+            throw new PdfException(PdfError.InvalidArgument, "PdfTable.Draw: the page must not be null");
+        }
+        double cursorY = y;
+
+        // 表头。
+        if (this.columns.Count > 0) {
+            List<string> headerCells = this.HeaderCells();
+            double rowHeight = this.RowHeight(headerCells, this.headerFont, this.headerFontSize);
+            this.DrawRow(page, headerCells, x, cursorY, rowHeight, this.headerFont, this.headerFontSize);
+            cursorY = cursorY + rowHeight;
+            if (this.borderWidth > 0.0) {
+                this.DrawLine(page, x, cursorY, x + this.TotalWidth(), cursorY);
+            }
+        }
+
+        // 数据行。
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            List<string> cells = this.rows[i];
+            double rowHeight = this.RowHeight(cells, this.font, this.fontSize);
+            this.DrawRow(page, cells, x, cursorY, rowHeight, this.font, this.fontSize);
+            cursorY = cursorY + rowHeight;
+            if (this.borderWidth > 0.0) {
+                this.DrawLine(page, x, cursorY, x + this.TotalWidth(), cursorY);
+            }
+        }
+
+        // 竖线（列边界）。
+        if (this.borderWidth > 0.0) {
+            double colX = x;
+            for (int i = 0; i < this.columns.Count; i = i + 1) {
+                this.DrawLine(page, colX, y, colX, cursorY);
+                colX = colX + this.columns[i].Width;
+            }
+            this.DrawLine(page, colX, y, colX, cursorY);
+        }
+
+        return cursorY - y;
+    }
+
+    // 表头单元格。
+    private List<string> HeaderCells() {
+        List<string> cells = new List<string>();
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            cells.Add(this.columns[i].Header);
+        }
+        return cells;
+    }
+
+    // 一行的高度（取各单元格最大值）。
+    private double RowHeight(List<string> cells, PdfFont rowFont, double rowFontSize) {
+        double max = 0.0;
+        for (int i = 0; i < cells.Count; i = i + 1) {
+            string text = cells[i] != null ? cells[i] : "";
+            double height = rowFont.LineHeight(rowFontSize) * PdfPage.CountLines(text) + this.padding * 2.0;
+            if (height > max) { max = height; }
+        }
+        return max;
+    }
+
+    // 画一行（文字）。
+    private void DrawRow(PdfPage page, List<string> cells, double x, double y,
+                         double rowHeight, PdfFont rowFont, double rowFontSize) {
+        double colX = x;
+        for (int i = 0; i < this.columns.Count; i = i + 1) {
+            PdfColumn column = this.columns[i];
+            string text = i < cells.Count && cells[i] != null ? cells[i] : "";
+            double innerWidth = column.Width - this.padding * 2.0;
+            page.DrawTextInBox(colX + this.padding, y + this.padding, innerWidth, text,
+                column.Align, rowFont, rowFontSize, PdfColor.Black);
+            colX = colX + column.Width;
+        }
+    }
+
+    // 画一条边框线。
+    private void DrawLine(PdfPage page, double x1, double y1, double x2, double y2) {
+        page.DrawLine(x1, y1, x2, y2, this.borderColor, this.borderWidth);
+    }
+}
