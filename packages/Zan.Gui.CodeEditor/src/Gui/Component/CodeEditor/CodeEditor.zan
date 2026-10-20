@@ -160,6 +160,10 @@ partial class CodeEditor {
     // （以设置诊断时的缓冲区长度 cErrStamp 跟踪）。
     List<Diagnostic> compErrors;
     int cErrStamp;
+    // 语言服务（LSP）推送的语义诊断，按文档路径存放：打字即报
+    // （诊断带精确区间，渲染时在出错字符下画波浪线），换标签页
+    // 回来诊断还在。
+    Dict<string, List<Diagnostic>> semDiags;
     // CompilerDiagStale 的每帧记忆：-1 未知、0 有效、1 过期。
     // 过期测试要遍历整个缓冲区，而每个可见行都会查询它，
     // 因此大文件上每帧只算一次答案，
@@ -693,6 +697,46 @@ partial class CodeEditor {
         } else {
             fixes = new List<QuickFix>();
         }
+    }
+
+    // 设置某个文档的语义诊断（语言服务推送）。诊断带精确区间，
+    // 渲染时在出错的那几个字符下面画波浪线（VS 的做法）。
+    // 空诊断表示"这份文档现在没有错误"，直接清掉该路径的记录。
+    void SetSemanticDiagnostics(string path, List<Diagnostic> diagnostics) {
+        if (path.Length == 0) { return; }
+        if (semDiags == null) { semDiags = new Dict<string, List<Diagnostic>>(); }
+        if (diagnostics == null || diagnostics.Count == 0) {
+            if (semDiags.ContainsKey(path)) { semDiags.Remove(path); }
+            return;
+        }
+        semDiags[path] = diagnostics;
+    }
+
+    // 当前文档在指定行上的语义诊断条数（不做逐帧分配：渲染每个
+    // 可见行都要问一次，分配列表会拖慢每帧）。
+    int SemanticDiagCount(int line) {
+        if (semDiags == null || documentPath.Length == 0) { return 0; }
+        if (!semDiags.ContainsKey(documentPath)) { return 0; }
+        List<Diagnostic> all = semDiags[documentPath];
+        int n = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].line == line) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 该行第 `idx` 条语义诊断（越界返回 null）。
+    Diagnostic SemanticDiagAt(int line, int idx) {
+        if (semDiags == null || documentPath.Length == 0) { return null; }
+        if (!semDiags.ContainsKey(documentPath)) { return null; }
+        List<Diagnostic> all = semDiags[documentPath];
+        int n = 0;
+        for (int i = 0; i < all.Count; i = i + 1) {
+            if (all[i].line != line) { continue; }
+            if (n == idx) { return all[i]; }
+            n = n + 1;
+        }
+        return null;
     }
 
     // 设置编译器诊断后缓冲区一旦变化即返回 true，

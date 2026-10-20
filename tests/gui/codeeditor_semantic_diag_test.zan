@@ -1,0 +1,99 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Component;
+
+// 语言服务推送的语义诊断（打字即报）的回归。诊断带精确区间，
+// 编辑器靠它在出错的那几个字符下面画波浪线（VS 的做法）。
+// 四件事：
+//   ① 诊断按文档路径存放：换一份文档就看不到上一份的诊断；
+//   ② 同一行上的多条诊断能逐条取到（带区间的、不带区间的都要）；
+//   ③ 空诊断 = "这份文档现在没有错误"，该路径的记录被清掉；
+//   ④ 区间与严重级原样带出来（波浪线靠它们定位与配色）。
+class SemanticDiagTest {
+    static int fails;
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void EqTrue(string what, bool cond) {
+        if (cond) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static List<Diagnostic> TwoDiags() {
+        List<Diagnostic> diags = new List<Diagnostic>();
+        diags.Add(new Diagnostic(2, 4, 9, 1, "expected ';'"));
+        diags.Add(new Diagnostic(2, 0, 0, 2, "unused variable"));
+        diags.Add(new Diagnostic(5, 0, 0, 1, "missing brace"));
+        return diags;
+    }
+
+    static void TestPerPath() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "a.zan";
+        e.LoadText("line0\nline1\nline2\nline3\nline4\nline5");
+        e.SetSemanticDiagnostics("a.zan", TwoDiags());
+        EqInt("two diagnostics on line 2", e.SemanticDiagCount(2), 2);
+        EqInt("one diagnostic on line 5", e.SemanticDiagCount(5), 1);
+        EqInt("no diagnostics on line 0", e.SemanticDiagCount(0), 0);
+
+        // 换一份文档：上一份的诊断不能串过来。
+        e.documentPath = "b.zan";
+        EqInt("other document has none", e.SemanticDiagCount(2), 0);
+        e.documentPath = "a.zan";
+        EqInt("back to first document", e.SemanticDiagCount(2), 2);
+    }
+
+    static void TestDetails() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "a.zan";
+        e.LoadText("line0\nline1\nline2");
+        e.SetSemanticDiagnostics("a.zan", TwoDiags());
+        Diagnostic first = e.SemanticDiagAt(2, 0);
+        EqTrue("first diagnostic exists", first != null);
+        if (first != null) {
+            EqInt("diagnostic line", first.line, 2);
+            EqInt("diagnostic start column", first.startCol, 4);
+            EqInt("diagnostic end column", first.endCol, 9);
+            EqInt("diagnostic severity", first.severity, 1);
+            EqTrue("diagnostic has range", first.HasRange());
+            EqInt("severity slot of error", first.SeveritySlot(), 0);
+        }
+        Diagnostic second = e.SemanticDiagAt(2, 1);
+        EqTrue("second diagnostic exists", second != null);
+        if (second != null) {
+            EqInt("warning severity", second.severity, 2);
+            EqInt("severity slot of warning", second.SeveritySlot(), 1);
+            EqTrue("no range means whole line", !second.HasRange());
+        }
+        EqTrue("out of range index returns null", e.SemanticDiagAt(2, 9) == null);
+        EqTrue("unknown line returns null", e.SemanticDiagAt(99, 0) == null);
+    }
+
+    static void TestClear() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "a.zan";
+        e.LoadText("line0\nline1\nline2");
+        e.SetSemanticDiagnostics("a.zan", TwoDiags());
+        EqInt("diagnostics stored", e.SemanticDiagCount(2), 2);
+        e.SetSemanticDiagnostics("a.zan", new List<Diagnostic>());
+        EqInt("empty diagnostics clear the document", e.SemanticDiagCount(2), 0);
+        EqInt("other lines cleared too", e.SemanticDiagCount(5), 0);
+    }
+
+    static void Main() {
+        fails = 0;
+        TestPerPath();
+        TestDetails();
+        TestClear();
+        if (fails == 0) { Console.WriteLine("SEMDIAG PASS"); return; }
+        Console.WriteLine("SEMDIAG FAIL " + Convert.ToString(fails));
+        Environment.Exit(1);
+    }
+}

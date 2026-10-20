@@ -3683,6 +3683,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_completion_order${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 语言服务推送的语义诊断（打字即报）回归：诊断按文档路径存放，
+  # 换文档不串诊断；同一行多条诊断可逐条取到；空诊断清空该文档；
+  # 区间与严重级原样带出（编辑器靠它们画波浪线）。
+  add_test(NAME conformance_gui_codeeditor_semantic_diag
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_semantic_diag_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_semantic_diag.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_semantic_diag${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_codeeditor_fold
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

@@ -1,0 +1,73 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using Gui.Component.CodeEditor;
+
+// 语言服务的诊断通道（打字即报）。
+//
+// 服务端在输入停顿 200ms 后把这一份文档的词法/语法错误用
+// textDocument/publishDiagnostics 通知推过来——这份能力服务端一直
+// 有，客户端此前整条丢弃（通知没有 id，被当成"无主响应"扔掉），
+// 于是 IDE 里"打字即报"始终没有实现，只能等 Run/Build 才见错误。
+//
+// 链路：工作线程的连接收到通知 → 解析成编辑器要的诊断 →
+// 转 UI 线程 → IDE 存进编辑器 → 编辑器在出错字符下面画波浪线。
+partial class LspSession {
+    // 诊断的出口：IDE 在这里接。
+    LspDiagnosticsHandler onDiagnostics;
+
+    // 把工作线程里那条连接的诊断出口接到本会话的 UI 出口上。
+    void WireConnectionDiagnostics(LspSession connection) {
+        if (connection == null) { return; }
+        LspSession owner = this;
+        connection.onDiagnostics = (string uri, List<Diagnostic> diagnostics) => {
+            owner.DeliverDiagnostics(uri, diagnostics);
+        };
+    }
+
+    // 工作线程收到诊断 → 转到 UI 线程 → 交给 IDE。
+    void DeliverDiagnostics(string uri, List<Diagnostic> diagnostics) {
+        if (uiDispatcher == null) { return; }
+        string path = LspSession.UriToPath(uri);
+        uiDispatcher(() => {
+            if (stopping) { return; }
+            if (onDiagnostics != null) { onDiagnostics(path, diagnostics); }
+        });
+    }
+
+    // 解析 textDocument/publishDiagnostics 的 params。
+    // LSP 的列是 UTF-16 码元，要换成编辑器的字节列，否则含中文的行
+    // 波浪线会画偏（补全候选"无声消失"的老问题同源）。
+    // 没有区间的诊断退化成整行（startCol = endCol）。
+    static List<Diagnostic> ParsePublishDiagnostics(JsonValue params, List<string> lines) {
+        List<Diagnostic> diags = new List<Diagnostic>();
+        if (params == null || !params.IsObject()) { return diags; }
+        JsonValue arr = params.Get("diagnostics");
+        if (arr == null || !arr.IsArray()) { return diags; }
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue d = arr.At(i);
+            if (d == null || !d.IsObject()) { continue; }
+            int line = 0;
+            int startCol = 0;
+            int endCol = 0;
+            JsonValue range = d.Get("range");
+            if (range != null && range.IsObject()) {
+                JsonValue start = range.Get("start");
+                JsonValue end = range.Get("end");
+                if (start != null && start.IsObject()) {
+                    line = start.Int("line", 0);
+                    int sc = start.Int("character", 0);
+                    int ec = end != null && end.IsObject() ? end.Int("character", sc) : sc;
+                    string src = "";
+                    if (lines != null && line >= 0 && line < lines.Count) { src = lines[line]; }
+                    startCol = LspSession.Utf16ColumnToByte(src, sc);
+                    endCol = LspSession.Utf16ColumnToByte(src, ec);
+                }
+            }
+            int severity = d.Int("severity", 1);
+            string message = d.Str("message", "");
+            diags.Add(new Diagnostic(line, startCol, endCol, severity, message));
+        }
+        return diags;
+    }
+}

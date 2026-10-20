@@ -7,6 +7,7 @@ using System.Threading;
 using System.Collections.Generic;
 using Platform;
 using System.Net.Sockets;
+using Gui.Component.CodeEditor;
 
 partial class LspSession {
     // ---- transport ----
@@ -202,7 +203,14 @@ partial class LspSession {
         try { root = JsonValue.ParseLenient(message); } catch (Exception) { return; }
         if (root == null || !root.IsObject()) { return; }
         JsonValue id = root.Get("id");
-                if (id == null || !id.IsInt() || !pending.ContainsKey(id.AsInt(-1))) { return; }
+        if (id == null || !id.IsInt()) {
+            // 服务器主动推送的通知（没有 id，带 method）。此前这里
+            // 直接 return，诊断推送（textDocument/publishDiagnostics）
+            // 就被整条扔掉了。
+            this.DispatchNotification(root);
+            return;
+        }
+                if (!pending.ContainsKey(id.AsInt(-1))) { return; }
         LspPendingRequest request = pending[id.AsInt(-1)];
         pending.Remove(request.id);
         if (Stopwatch.GetMilliseconds() >= request.deadline) {
@@ -240,6 +248,26 @@ partial class LspSession {
             if (request.hover.Length == 0) { request.state = LspPendingState.Empty; }
         }
         RefreshEditor(request);
+    }
+
+    // 服务器主动推送的通知（没有 id）。目前只有诊断：
+    // textDocument/publishDiagnostics —— 服务端在输入停顿后把这一份
+    // 文档的词法/语法错误推过来。
+    void DispatchNotification(JsonValue root) {
+        JsonValue method = root.Get("method");
+        if (method == null || !method.IsString()) { return; }
+        if (method.AsString("") != "textDocument/publishDiagnostics") { return; }
+        JsonValue params = root.Get("params");
+        if (params == null || !params.IsObject()) { return; }
+        JsonValue uri = params.Get("uri");
+        if (uri == null || !uri.IsString()) { return; }
+        string key = uri.AsString("");
+        List<string> lines = null;
+        if (documents != null && documents.ContainsKey(key)) {
+            lines = documents[key].lines;
+        }
+        List<Diagnostic> diags = LspSession.ParsePublishDiagnostics(params, lines);
+        if (onDiagnostics != null) { onDiagnostics(key, diags); }
     }
 
     void Poll() {

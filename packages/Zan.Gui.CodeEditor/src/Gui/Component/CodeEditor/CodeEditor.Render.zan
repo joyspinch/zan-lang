@@ -444,6 +444,24 @@ partial class CodeEditor {
         c.DrawRoundRect(x1, rowY + 1, x2 - x1, lineH - 2, 2, color, 1);
     }
 
+    // 波浪下划线（VS 的诊断波浪线）：在 [x0, x1) 内画一段段上下起伏
+    // 的短笔。`step` 是笔高（像素），每一段的宽度是它的两倍。
+    public static void DrawSquiggle(Canvas c, int x0, int x1, int y, int color, int step) {
+        if (x1 <= x0) { return; }
+        int h = step;
+        if (h < 1) { h = 1; }
+        int seg = h * 2;
+        int x = x0;
+        bool down = false;
+        while (x < x1) {
+            int w = seg;
+            if (x + w > x1) { w = x1 - x; }
+            c.FillRect(x, down ? y + h : y, w, h, color);
+            down = !down;
+            x = x + w;
+        }
+    }
+
     // 诊断列表里 `line` 行的消息（无则 ""）。
     public static string DiagMsg(List<Diagnostic> ds, int line) {
         for (int i = 0; i < ds.Count; i = i + 1) {
@@ -1317,7 +1335,9 @@ partial class CodeEditor {
 
                 bool isCompilerErr = HasCompilerErr(ln);
                 bool isLocalErr = LocalDiagnosticMessage(ln).Length > 0;
-                bool hasErr = isCompilerErr || isLocalErr;
+                // 语言服务推送的语义诊断（打字即报）。
+                int semCount = SemanticDiagCount(ln);
+                bool hasErr = isCompilerErr || isLocalErr || semCount > 0;
 
                 if (hasErr) {
                     c.FillRect(area.x + gutterW + 1, rowY, lineContentW, lineH, 0x18FF4444);
@@ -1375,6 +1395,30 @@ partial class CodeEditor {
                 } else if (isLocalErr) {
                     c.FillRect(textX, rowY + lineH - scale2,
                         Canvas.MeasureText(text, fontSize), scale2, pal.errorDim);
+                }
+
+                // 语义诊断的波浪线（VS 的做法）：画在出错的那几个字符
+                // 下面，错误红、警告黄。诊断没有区间时退化成整行一条。
+                for (int sd = 0; sd < semCount; sd = sd + 1) {
+                    Diagnostic sdiag = SemanticDiagAt(ln, sd);
+                    if (sdiag == null) { continue; }
+                    int slot = sdiag.SeveritySlot();
+                    int scol = pal.error;
+                    if (slot == 1) { scol = pal.warn; }
+                    else if (slot == 2) { scol = pal.accent; }
+                    int sx0 = textX;
+                    int sx1 = textX + Canvas.MeasureText(text, fontSize);
+                    if (sdiag.HasRange()) {
+                        int sc = sdiag.startCol;
+                        int ec = sdiag.endCol;
+                        if (sc < 0) { sc = 0; }
+                        if (ec > text.Length) { ec = text.Length; }
+                        if (ec <= sc) { ec = sc + 1; }
+                        sx0 = textX + Canvas.MeasureText(Text.Left(text, sc), fontSize);
+                        sx1 = textX + Canvas.MeasureText(Text.Left(text, ec), fontSize);
+                    }
+                    CodeEditor.DrawSquiggle(c, sx0, sx1,
+                        rowY + lineH - scale2 - scale2, scol, scale2);
                 }
 
                 CeHlLine hl = GetHl(ln, text, t, defaultText);
@@ -1471,9 +1515,16 @@ partial class CodeEditor {
                 // 显示光标行或鼠标悬停行的错误原因。编译器诊断具有权威优先权；
                 int rightBoundX = area.x + area.width - rightStripW;
                 bool isHovered = (app.mouseX >= textX && app.mouseX < rightBoundX && app.mouseY >= rowY && app.mouseY < rowY + lineH);
-                bool shouldShowErr = isCompilerErr || isLocalErr;
+                bool shouldShowErr = isCompilerErr || isLocalErr || semCount > 0;
                 if (shouldShowErr && (ln == curLine || isHovered)) {
-                    string errMsg = isCompilerErr ? CompilerErrMsg(ln) : LocalDiagnosticMessage(ln);
+                    // 编译器诊断具有权威优先权；没有它时用语言服务
+                    // 推送的语义诊断，再退到本地语法诊断。
+                    string errMsg = "";
+                    if (isCompilerErr) { errMsg = CompilerErrMsg(ln); }
+                    else if (semCount > 0) {
+                        Diagnostic sdiag = SemanticDiagAt(ln, 0);
+                        if (sdiag != null) { errMsg = sdiag.msg; }
+                    }
                     if (errMsg.Length == 0 && isLocalErr) { errMsg = LocalDiagnosticMessage(ln); }
                     if (errMsg.Length > 0) {
                         int errPad = app.Scale(6);
