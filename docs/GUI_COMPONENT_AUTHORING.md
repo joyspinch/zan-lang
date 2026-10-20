@@ -53,10 +53,24 @@ Control.SizeClass("tiny")   // → "tiny"
 - **medium ≡ 默认档**：没有 `.medium` 规则的组件，medium 档就是它的
   默认外观。因此不要为了"凑齐四档"给每个组件硬写 `.medium` 规则——
   写了反而会盖掉皮肤在基础规则里给的高度。
-- 控件用 `Binding<string> Size` 暴露尺寸档（Naive UI 的 `size` prop）。
-  控件作者在 `OnMeasure`/`OnPaint` 里调一次 `this.AddClass(this.SizeCls())`
-  即可；未支持尺寸档的控件**不要**提供 `Size` 字段（避免"设了不生效"
-  的假接口）。
+- 控件用 `Binding<string> Size` 暴露尺寸档（Naive UI 的 `size` prop），
+  三个动作就够了：
+
+  ```zan
+  Binding<string> Size;                            // 字段
+  override Binding<string> SizeOf() { return Size; } // 设计器发现它
+  ps.Add(this.SizeProp());                          // 属性行
+  this.ApplySizeClass();                            // 解析前落到 class
+  ```
+
+  `ApplySizeClass()` 是基类的统一入口：**档位互斥**——挂新档前先把
+  `Class` 里其它档位去掉，所以 `Class = "small"` 与 `Size = "large"`
+  同时存在时是 large 说了算；**medium 是默认档，不覆盖**用户在
+  `Class` 里写的档位（`Class = "primary small"` 这种既有写法不能被
+  静默改成 medium 档）。控件在解析样式前调用它、解析后把 `Class`
+  还原，档位因此只是"这一帧的排布"，不污染作者写下的 `Class`。
+- 未支持尺寸档的控件**不要**提供 `Size` 字段（避免"设了不生效"的
+  假接口）。支持档位就必须把四档的 CSS 规则补齐。
 
 ---
 
@@ -185,6 +199,8 @@ panel.With(a).With(b);
 - `scripts/style_audit.py`：间距/动效令牌化检查（挂在
   `scripts/check_structure.ps1`）。
 - `tests/conformance/gui_size_tiers.*`：尺寸档与圆角的度量表。
+- `tests/conformance/gui_size_prop.*`：尺寸档作为控件通用能力的契约
+  （四档生效 / 档位互斥 / 默认档不覆盖 class）。
 - `tests/conformance/gui_style_box.*`：样式解析统一入口的契约
   （与老路径等价 / 行内样式生效 / 类进缓存键）。
 - `tests/conformance/gui_skin_theme_vars.*`：皮肤层必须认得主题令牌。

@@ -90,7 +90,8 @@
    回写统一在编辑汇聚点（如 `Edited()`）调用 `data.Set(...)`。
    冲突解法（谁是真相）必须在控件头注释写明。
 4. **命名表**：同一语义角色全库同名——主值绑定 `data`；尺寸档 `Binding<string> Size`
-   （`"small"`/`"medium"`/`"large"`）；标签/文案 `text`。禁止大小写漂移
+   （`"tiny"`/`"small"`/`"medium"`/`"large"`，四档与 CSS 的同名 class 一一对应，
+   `medium` 是默认档）；标签/文案 `text`。禁止大小写漂移
    （`Value`/`value`/`data` 混指一物属违规）。
 5. **每控件绑定通道声明**：Widget 类头注释必须有一段"绑定通道"说明
    （通道字段、方向、真相归属），照 `SelectBox.zan` 头注释样式。
