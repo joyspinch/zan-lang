@@ -1004,11 +1004,23 @@ partial class Irgen {
         return false;
     }
 
+    // The element width of a byte-array-like value: a byte[]/sbyte[] stores
+    // one byte per element, a char[] keeps the 8-byte slot (a char is a
+    // code point, not a byte). A value whose static type is unknown counts
+    // as a byte[].
+    int ByteArrElemSize(ExprVal v) {
+        if (v.ty == null) { return 1; }
+        Node et = ArrElemOf(v.ty);
+        if (et == null) { return 1; }
+        return ArrElemSize(et);
+    }
+
     // byte[] -> string: pack the byte elements into a managed string. The
     // self-hosted array stores one element per 8-byte slot, so the bytes are
     // copied into a fresh buffer; the C host's view shares the array instead
     // (TASKS A390).
     ExprVal ByteArrToStr(ExprVal v) {
+        int esz = ByteArrElemSize(v);
         string ap = NT();
         L("  " + ap + " = bitcast i8* " + v.op + " to i64*");
         string lenp = NT();
@@ -1029,12 +1041,23 @@ partial class Irgen {
         L("  " + c + " = icmp uge i64 " + ci + ", " + len);
         L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
         Label(lb);
-        string ep = NT();
-        L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + ci);
-        string raw = NT();
-        L("  " + raw + " = load i64, i64* " + ep);
-        string b = NT();
-        L("  " + b + " = trunc i64 " + raw + " to i8");
+        string b = "";
+        if (esz == 1) {
+            // a byte array stores one byte per element
+            string eb = NT();
+            L("  " + eb + " = getelementptr i8, i8* " + v.op + ", i64 " + ci);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + eb);
+            b = bv;
+        } else {
+            string ep = NT();
+            L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + ci);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + ep);
+            string bb = NT();
+            L("  " + bb + " = trunc i64 " + raw + " to i8");
+            b = bb;
+        }
         string dp = NT();
         L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
         L("  store i8 " + b + ", i8* " + dp);
@@ -1048,12 +1071,12 @@ partial class Irgen {
 
     // string -> byte[]: the C host's bridge primitive (irgen_expr.c
     // emit_bytes_call) allocates an array of the string's exact length and
-    // copies the bytes over. The self-hosted array keeps one element per
-    // 8-byte slot, so the bytes are written into their slots one by one.
+    // copies the bytes over. The self-hosted byte array stores one byte per
+    // element, so the buffer is a plain byte run.
     ExprVal StrToBytes(ExprVal s) {
         string len = StrLen(s.op);
         string bytes = NT();
-        L("  " + bytes + " = mul i64 " + len + ", 8");
+        L("  " + bytes + " = add i64 " + len + ", 0");
         string tot = NT();
         L("  " + tot + " = add i64 " + bytes + ", 16");
         string raw = NT();
@@ -1081,11 +1104,11 @@ partial class Irgen {
         L("  " + sp + " = getelementptr i8, i8* " + s.op + ", i64 " + ci);
         string bv = NT();
         L("  " + bv + " = load i8, i8* " + sp);
-        string b64 = NT();
-        L("  " + b64 + " = zext i8 " + bv + " to i64");
+        string ab = NT();
+        L("  " + ab + " = bitcast i64* " + arr + " to i8*");
         string ap = NT();
-        L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
-        L("  store i64 " + b64 + ", i64* " + ap);
+        L("  " + ap + " = getelementptr i8, i8* " + ab + ", i64 " + ci);
+        L("  store i8 " + bv + ", i8* " + ap);
         string ni = NT();
         L("  " + ni + " = add i64 " + ci + ", 1");
         L("  store i64 " + ni + ", i64* " + idx);
@@ -1101,6 +1124,7 @@ partial class Irgen {
     // (irgen_expr.c emit_bytes_call). The self-hosted array keeps one byte
     // per 8-byte slot, so the bytes are packed into a fresh buffer.
     ExprVal ByteArrWindowToStr(ExprVal a, Node e) {
+        int esz = ByteArrElemSize(a);
         string ap = NT();
         L("  " + ap + " = bitcast i8* " + a.op + " to i64*");
         string lenp = NT();
@@ -1150,12 +1174,22 @@ partial class Irgen {
         Label(lb);
         string si = NT();
         L("  " + si + " = add i64 " + ci + ", " + off);
-        string ep = NT();
-        L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + si);
-        string raw = NT();
-        L("  " + raw + " = load i64, i64* " + ep);
-        string b = NT();
-        L("  " + b + " = trunc i64 " + raw + " to i8");
+        string b = "";
+        if (esz == 1) {
+            string eb = NT();
+            L("  " + eb + " = getelementptr i8, i8* " + a.op + ", i64 " + si);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + eb);
+            b = bv;
+        } else {
+            string ep = NT();
+            L("  " + ep + " = getelementptr i64, i64* " + ap + ", i64 " + si);
+            string raw = NT();
+            L("  " + raw + " = load i64, i64* " + ep);
+            string bb = NT();
+            L("  " + bb + " = trunc i64 " + raw + " to i8");
+            b = bb;
+        }
         string dp = NT();
         L("  " + dp + " = getelementptr i8, i8* " + dst + ", i64 " + ci);
         L("  store i8 " + b + ", i8* " + dp);
@@ -1513,7 +1547,22 @@ partial class Irgen {
                 return;
             }
             // array of i64 slots; pointer/double values are packed into the slot
+            Node elemTy = ArrElemOf(obj.ty);
+            int esz = ArrElemSize(elemTy);
             string p = NT();
+            if (esz == 1) {
+                // a byte array: one byte per element
+                string ab = NT();
+                L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+                L("  " + p + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
+                if (IsStructTy(v.ty)) {
+                    ExprVal c = CopyStructValue(v);
+                    ArrElemStore(p, 1, ToI64(c.op, MapType(c.ty)));
+                    return;
+                }
+                ArrElemStore(p, 1, ToI64(v.op, MapType(v.ty)));
+                return;
+            }
             L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
             // a struct element is a value: the array holds its own copy
             if (IsStructTy(v.ty)) {
@@ -2408,6 +2457,20 @@ partial class Irgen {
             return new ExprVal("0", MkType("int"));
         }
         string p2 = NT();
+        Node elemTy2 = ArrElemOf(obj.ty);
+        int esz2 = ArrElemSize(elemTy2);
+        if (esz2 == 1) {
+            // a byte array: one byte per element
+            string ab = NT();
+            L("  " + ab + " = bitcast i64* " + obj.op + " to i8*");
+            L("  " + p2 + " = getelementptr i8, i8* " + ab + ", i64 " + idx.op);
+            string bv = NT();
+            L("  " + bv + " = load i8, i8* " + p2);
+            string z = NT();
+            L("  " + z + " = zext i8 " + bv + " to i64");
+            if (elemTy2 != null) { return FromSlot(z, elemTy2); }
+            return new ExprVal(z, MkType("int"));
+        }
         L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
         string v = NT();
         L("  " + v + " = load i64, i64* " + p2);
@@ -2432,7 +2495,8 @@ partial class Irgen {
             return new ExprVal(baseOp, ty);
         }
         if (e.ival == 1) {
-            // array new: T[n] as i64* (n zeroed slots after an i64 length header)
+            // array new: T[n] as i64* (the elements follow the i64 length
+            // header; a byte-sized element type takes one byte per element)
             ExprVal nsz = new ExprVal("0", MkType("int"));
             bool init = e.kids.Count > 0;
             if (e.b != null) { nsz = GenExpr(e.b); }
@@ -2441,8 +2505,14 @@ partial class Irgen {
                 // is the number of initializer expressions
                 nsz = new ExprVal("" + e.kids.Count, MkType("int"));
             }
+            // the array type of the result: the element name with the rank
+            // (the declared type of `new T[n]` does not carry the rank yet)
+            Node at = MkType(ty.sval); at.ival = 1 + e.op;
+            Node elemTy = ArrElemOf(at);
+            int esz = ArrElemSize(elemTy);
             string bytes = NT();
-            L("  " + bytes + " = mul i64 " + nsz.op + ", 8");
+            if (esz == 1) { L("  " + bytes + " = add i64 " + nsz.op + ", 0"); }
+            else { L("  " + bytes + " = mul i64 " + nsz.op + ", 8"); }
             string tot = NT();
             // the array header is [class id][length] -- the same 24-byte
             // shape as an object header, so the runtime type test can read
@@ -2458,19 +2528,28 @@ partial class Irgen {
             string arr = NT();
             L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
             if (init) {
-                Node et = MkType(ty.sval);
+                Node et = elemTy;
+                if (et == null) { et = MkType(ty.sval); }
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[jn]);
                     string sv = StructElemSlot(iv, et);
-                    string ep = NT();
-                    L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 2));
-                    L("  store i64 " + sv + ", i64* " + ep);
+                    if (esz == 1) {
+                        string ab = NT();
+                        L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+                        string ep = NT();
+                        L("  " + ep + " = getelementptr i8, i8* " + ab + ", i64 " + jn);
+                        ArrElemStore(ep, 1, sv);
+                    } else {
+                        string ep = NT();
+                        L("  " + ep + " = getelementptr i64, i64* " + hdr + ", i64 " + (jn + 2));
+                        L("  store i64 " + sv + ", i64* " + ep);
+                    }
                     jn = jn + 1;
                 }
             }
-            Node at = MkType(ty.sval); at.ival = 1 + e.op;
-            return new ExprVal(arr, at);
+            Node at2 = at;
+            return new ExprVal(arr, at2);
         }
         if (IsListType(ty)) {
             string t = NT();
@@ -4741,6 +4820,77 @@ partial class Irgen {
         et.sval2 = t.sval2;
         return et;
     }
+
+    // The element type of an array-typed value. The array type comes in two
+    // shapes: a resolved one (the element name in `sval`, the rank in
+    // `ival`) and a declared one ("byte[]" with a rank of 0) -- both have to
+    // answer the element type, and the element of a jagged array keeps the
+    // remaining rank.
+    Node ArrElemOf(Node t) {
+        if (t == null) { return null; }
+        string en = t.sval;
+        if (en.EndsWith("[]")) {
+            Node et = MkType(en.Substring(0, en.Length - 2));
+            if (t.ival >= 1) { et.ival = t.ival - 1; }
+            return et;
+        }
+        if (t.ival >= 1) { return ArrayElemType(t); }
+        return null;
+    }
+
+    // The width of one array element in the self-hosted layout. The
+    // byte-sized element types are stored one per byte: the standard
+    // library hands a byte[] to the runtime as a raw buffer (Base64, the
+    // digest kernels, the protocol codecs), so a byte array has to be a
+    // byte array -- one byte per element, not one byte per 8-byte slot.
+    // Every other element type keeps an 8-byte slot.
+    int ArrElemSize(Node elemTy) {
+        if (elemTy == null) { return 8; }
+        if (elemTy.ival >= 1) { return 8; }
+        string n = elemTy.sval;
+        if (n == "byte" || n == "sbyte") { return 1; }
+        return 8;
+    }
+
+    // The address of element `idx` of an array (the array value points at
+    // the first element).
+    string ArrElemAddr(string arrOp, string idxOp, int esz) {
+        if (esz == 1) {
+            string b = NT();
+            L("  " + b + " = bitcast i64* " + arrOp + " to i8*");
+            string p = NT();
+            L("  " + p + " = getelementptr i8, i8* " + b + ", i64 " + idxOp);
+            return p;
+        }
+        string p = NT();
+        L("  " + p + " = getelementptr i64, i64* " + arrOp + ", i64 " + idxOp);
+        return p;
+    }
+
+    // The element value of an array slot, read at the element's own width.
+    string ArrElemLoad(string addr, int esz) {
+        if (esz == 1) {
+            string v = NT();
+            L("  " + v + " = load i8, i8* " + addr);
+            string z = NT();
+            L("  " + z + " = zext i8 " + v + " to i64");
+            return z;
+        }
+        string v = NT();
+        L("  " + v + " = load i64, i64* " + addr);
+        return v;
+    }
+
+    // Store an element value at the element's own width.
+    void ArrElemStore(string addr, int esz, string val) {
+        if (esz == 1) {
+            string b = NT();
+            L("  " + b + " = trunc i64 " + val + " to i8");
+            L("  store i8 " + b + ", i8* " + addr);
+            return;
+        }
+        L("  store i64 " + val + ", i64* " + addr);
+    }
     // `out T name` at the call site: the callee writes through the address of
     // a fresh local, which stays visible to the caller afterwards (the C
     // host's emit_ref_arg declaration form).
@@ -5887,13 +6037,16 @@ partial class Irgen {
         }
         if (name == "ToArray" && e.kids.Count == 0) {
             // List<T>.ToArray(): copy the slots into a fresh array. The
-            // self-hosted list keeps one element per 8-byte slot, exactly
-            // like the self-hosted array, so the slots are copied as they
-            // are.
+            // self-hosted list keeps one element per 8-byte slot; a byte
+            // array takes one byte per element, so the slots are narrowed
+            // on the way in.
             string cnt = NT();
             L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+            Node elemTy = ListElem(recv.ty);
+            int esz = ArrElemSize(elemTy);
             string bytes = NT();
-            L("  " + bytes + " = mul i64 " + cnt + ", 8");
+            if (esz == 1) { L("  " + bytes + " = add i64 " + cnt + ", 0"); }
+            else { L("  " + bytes + " = mul i64 " + cnt + ", 8"); }
             string tot = NT();
             L("  " + tot + " = add i64 " + bytes + ", 16");
             string raw = NT();
@@ -5919,9 +6072,17 @@ partial class Irgen {
             Label(lb);
             string slot = NT();
             L("  " + slot + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
-            string ap = NT();
-            L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
-            L("  store i64 " + slot + ", i64* " + ap);
+            if (esz == 1) {
+                string ab = NT();
+                L("  " + ab + " = bitcast i64* " + arr + " to i8*");
+                string ap = NT();
+                L("  " + ap + " = getelementptr i8, i8* " + ab + ", i64 " + ci);
+                ArrElemStore(ap, 1, slot);
+            } else {
+                string ap = NT();
+                L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
+                L("  store i64 " + slot + ", i64* " + ap);
+            }
             string ni = NT();
             L("  " + ni + " = add i64 " + ci + ", 1");
             L("  store i64 " + ni + ", i64* " + idx);
