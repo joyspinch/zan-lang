@@ -578,6 +578,60 @@ conformance `analytics_bridge`（统计的已知值核对与边界语义、
 区间分箱；`ToDataset` 的 Str 列不隐式转数值（列建错类型不会被静默
 修正）。
 
+### 1.16 三维动画运行时：`Zan.Game.Animation`
+
+新包 `packages/Zan.Game.Animation`，命名空间 `Game.Animation`。补 §3 里记的
+那一档缺口：**蒙皮 + 状态机混合 + IK**——3D 角色真正能动起来的那三件事
+（仓内原有的 `AnimPlayer` 走 2D 帧表、`Animation3DTrack` 只有加权轨道、
+`PaperdollRenderer` 只能换贴图）。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Transform3D.zan` | `Transform3D` | TRS 变换：组合 / 求逆 / 世界↔局部反解 / 点与方向变换 |
+| `AnimMath.zan` | `AnimMath` | float 标量工具（钳位 / 插值 / 归一化）+ **确定性球面插值** |
+| `Bone.zan` | `Bone` | 骨骼：名字 / 父下标 / 绑定姿势 / 局部姿势 / 世界姿势 |
+| `Skeleton.zan` | `Skeleton` | 骨架：加骨（父在子前）/ 绑定姿势 / 世界姿势递推 / 蒙皮矩阵 |
+| `AnimationTrack.zan` | `AnimationTrack` | 单骨三通道关键帧（位移 / 旋转 / 缩放）+ 采样 |
+| `AnimationClip.zan` | `AnimationClip` | 片段：按骨名索引的轨道 + 采样到骨架 + 时长自动跟随 |
+| `PoseBuffer.zan` | `PoseBuffer` | 姿势缓冲 + 交叉淡化混合（旋转走球面插值） |
+| `AnimationPlayer.zan` | `AnimationPlayer` | 播放器：推进 / 循环 / 变速 / 播完停止 |
+| `AnimationState.zan` / `AnimationTransition.zan` / `AnimationStateMachine.zan` | 状态机 | 状态 / 转移（浮点·布尔·触发器）/ 参数驱动 + 交叉淡化 |
+| `SkinMesh.zan` | `SkinMesh` | 四槽权重蒙皮网格 + 权重归一 |
+| `TwoBoneIk.zan` | `TwoBoneIk` | 两骨解析 IK（余弦定理 + 极向量）+ 朝向构造 |
+| `AnimationException.zan` | `AnimationException` | 越界 / 重名 / 顺序错 / 几何退化一律当场报错 |
+
+**六条硬取舍**：
+
+1. **纯变换，不碰矩阵**。`System.Numerics` 的 `Matrix4x4` 缺通用求逆与四元数
+   构造，拿它做蒙皮得自己补一整套矩阵层；本包改走 TRS 路线，组合与求逆在
+   `Transform3D` 里闭合。代价：TRS 在"父级非等比缩放 + 子级带旋转"时无法
+   精确分解（缩放与旋转不可交换，业界通病），骨骼缩放建议等比。
+2. **球面插值自己写一遍**（`AnimMath.Slerp`）。两个朝向正好差 180° 时四元数
+   点积为 0，"往哪边转"本该任意，但系统库按 `dot < 0` 取反——一个 -4e-8 的
+   浮点噪声就能决定人物朝**反**方向转身，同一份动画在不同机器上插值方向
+   相反。本包固定"按目标自身的轴走"，结果与平台无关。
+3. **姿势按骨名索引**（片段里），不按下标：动画资产来自 DCC 工具，那里的
+   引用单位是骨骼名。
+4. **片段只描述动的部分**：某骨没有轨道时采样回落到它的绑定姿势，不是单位
+   变换。
+5. **状态机自持参数**：浮点 / 布尔参数与一次性触发器都在状态机里，转移条件
+   由参数驱动，调用方不必另建一层条件系统。
+6. **IK 是解析解**：两骨 IK 用余弦定理一次算完；够不着时把距离钳到边界
+   （手臂伸直指向目标），不炸不抖。
+
+conformance `animation_pipeline`（变换的单位性 / 组合顺序 / 父级缩放对子级位移
+的影响 / 求逆回代 / 方向不含平移；骨架的重名与越界报错 / 世界姿势递推 / 绑定
+姿势重置 / 世界姿势反解局部姿势；蒙皮的绑定姿势不动点 / 位移精确落位 / 旋转
+保半径；片段的关键帧插值 / 时长自动延长 / 无轨道回落绑定姿势 / 越界钳位 /
+球面插值 / 180° 插值方向确定 / 乱序关键帧报错 / 姿势缓冲长度校验；播放器的
+推进 / 循环回绕 / 变速 / 播完停止；状态机的浮点与布尔参数触发 / 触发器一次性 /
+交叉淡化的权重曲线 / 未知状态报错；蒙皮网格的权重混合与归一；两骨 IK 的末端
+命中目标 / 骨长不变 / 够不着时朝向不歪）。
+
+**已知边界**：无曲线缓动（缓动要在导入阶段烘进关键帧）；无动画层与遮罩
+（状态机是单层 + 交叉淡化）；IK 只有两骨；蒙皮是 LBS（不做 Dual Quaternion，
+极端弯曲处会体积塌陷）；无 DCC 导入器（片段与网格由外部工具导出成数据）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -628,7 +682,7 @@ conformance `analytics_bridge`（统计的已知值核对与边界语义、
 | `Zan.Game.Audio` | NAudio | 6,249 | ✅ 已落地 `packages/Zan.Game.Audio`（`Game.Audio`：采样缓冲 + 波形合成 + ADSR 包络 + 双二阶滤波 + 混音 + 变调 + 纯 Zan WAV 读写，见 §1.10） | — |
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | ✅ 已落地 `packages/Zan.Game.Netcode`（`Game.Netcode`：确定性校验和 + 快照环形缓冲 + 逐帧输入预测 + 回滚重放会话（含分叉检测）+ 服务器侧延迟补偿，见 §1.13）；已有 lockstep + 回放 → 二者并列（lockstep 适合 RTS 同频，rollback 适合格斗/射击跟手） | — |
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
-| `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | 有 clip 播放器/纸娃娃/3D 轨 → 蒙皮、状态机混合、IK | 4–6 周 |
+| `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | ✅ 已落地 `packages/Zan.Game.Animation`（`Game.Animation`：TRS 变换 + 骨骼层级 + 线性混合蒙皮 + 关键帧片段 + 播放器 + 状态机交叉淡化 + 两骨解析 IK，见 §1.16） | — |
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
 | `Zan.Game.Debug` | ImGui.NET | 榜外 | 无 → 帧剖析覆盖层、实体检查器、内存精灵缓存可视化 | 2–3 周 |
@@ -658,7 +712,7 @@ conformance `analytics_bridge`（统计的已知值核对与边界语义、
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
-**第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
+**第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

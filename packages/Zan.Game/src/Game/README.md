@@ -18,6 +18,7 @@ Game.Factory (separate package: Zan.Game.Factory)
 Sibling packages built on the same base: `Zan.Game.Ecs` (entity-component-system),
 `Zan.Game.Physics2D` (rigid bodies, joints), `Zan.Game.Pathfinding` (A*, JPS, navmesh),
 `Zan.Game.Particles`, `Zan.Game.Procgen` (WFC), `Zan.Game.Assets`, `Zan.Game.Audio`,
+`Zan.Game.Animation` (3D skeletons, skinning, clips, state machine, two-bone IK),
 `Zan.Game.Factory` (factory-automation + tower-defense simulation, no GUI).
 
 All game modules are platform-neutral: windowing, input and rendering live in

@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 动作片段：一组骨骼轨道在时间上的展开。
+//
+// **轨道按骨骼名索引**，不按下标——动画资产来自 DCC 工具（Blender /
+// Maya / Mixamo），那里的引用单位是骨骼名；绑到骨架上时再按名字对上。
+//
+// **时长自动跟随关键帧**：`AddPositionKey` / `AddRotationKey` /
+// `AddScaleKey` 会把片段时长推到最晚的那个关键帧；直接改 `AnimationTrack`
+// 的关键帧则需要自己调 `RecomputeDuration()`。
+//
+// **采样语义**：某根骨骼在片段里没有轨道时，用它的**绑定姿势**兜底——
+// 动作片段只描述"动的部分"，不动的那部分应当保持原样。
+//
+// **并发**：非线程安全。
+public class AnimationClip {
+    // 片段名。
+    public string Name;
+    // 片段时长（秒）。
+    public float Duration;
+
+    private Dictionary<string, AnimationTrack> tracks;
+    // 轨道名（保序，便于稳定遍历与调试）。
+    private List<string> order;
+
+    public AnimationClip(string name, float duration) {
+        this.Name = name != null ? name : "";
+        this.Duration = duration;
+        this.tracks = new Dictionary<string, AnimationTrack>();
+        this.order = new List<string>();
+    }
+
+    // 轨道数量。
+    public int TrackCount() { return this.order.Count; }
+
+    // 取轨道（没有返回 null）。
+    public AnimationTrack Track(string boneName) {
+        if (boneName == null) { return null; }
+        AnimationTrack t;
+        if (!this.tracks.TryGetValue(boneName, out t)) { return null; }
+        return t;
+    }
+
+    // 取（或建）某根骨骼的轨道。重复取同一条轨道不会新建。
+    public AnimationTrack AddTrack(string boneName) {
+        if (boneName == null || boneName == "") {
+            throw new AnimationException("track bone name must not be empty");
+        }
+        AnimationTrack existing = this.Track(boneName);
+        if (existing != null) { return existing; }
+        AnimationTrack t = new AnimationTrack(boneName);
+        this.tracks.Add(boneName, t);
+        this.order.Add(boneName);
+        return t;
+    }
+
+    // 追加一个位移关键帧（自动延长片段时长）。
+    public void AddPositionKey(string boneName, float time, Vector3 value) {
+        this.AddTrack(boneName).AddPosition(time, value);
+        this.ExtendDuration(time);
+    }
+
+    // 追加一个旋转关键帧（自动延长片段时长）。
+    public void AddRotationKey(string boneName, float time, Quaternion value) {
+        this.AddTrack(boneName).AddRotation(time, value);
+        this.ExtendDuration(time);
+    }
+
+    // 追加一个缩放关键帧（自动延长片段时长）。
+    public void AddScaleKey(string boneName, float time, Vector3 value) {
+        this.AddTrack(boneName).AddScale(time, value);
+        this.ExtendDuration(time);
+    }
+
+    // 按轨道重算片段时长（直接改过 `AnimationTrack` 之后调用）。
+    public void RecomputeDuration() {
+        float end = 0.0f;
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            AnimationTrack t = this.tracks[this.order[i]];
+            end = AnimMath.Max(end, t.EndTime());
+        }
+        this.Duration = end;
+    }
+
+    // 采样整个骨架：把每根骨骼的姿势写进 `poses`。
+    //
+    // `poses` 的长度必须等于骨架骨骼数；不等直接抛异常——长度不对时写进去
+    // 的姿势会张冠李戴，症状是"某些骨乱飞"。
+    public void SampleTo(Skeleton skeleton, float time, PoseBuffer poses) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        if (poses == null || poses.Count() != skeleton.Count()) {
+            throw new AnimationException(
+                "pose buffer size must match bone count: expected " + skeleton.Count().ToString());
+        }
+        for (int i = 0; i < skeleton.Count(); i = i + 1) {
+            Bone b = skeleton.At(i);
+            if (b == null) {
+                throw new AnimationException("bone index out of range: " + i.ToString());
+            }
+            AnimationTrack t = this.Track(b.Name);
+            Transform3D pose;
+            if (t == null) {
+                pose = b.BindPose;
+            } else {
+                pose = t.Sample(time, b.BindPose);
+            }
+            poses.Set(i, pose);
+        }
+    }
+
+    // 把采样结果写进骨架（便捷方法）。
+    public void ApplyTo(Skeleton skeleton, float time, PoseBuffer poses) {
+        this.SampleTo(skeleton, time, poses);
+        for (int i = 0; i < skeleton.Count(); i = i + 1) {
+            skeleton.SetLocalPose(i, poses.At(i));
+        }
+    }
+
+    // 片段时长往后推（不缩）。
+    private void ExtendDuration(float time) {
+        if (time > this.Duration) { this.Duration = time; }
+    }
+}

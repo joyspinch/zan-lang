@@ -1,0 +1,118 @@
+using System;
+using System.Numerics;
+
+namespace Game.Animation;
+// 标量小工具（门面层）。
+//
+// **为什么自己一套**：编译器内建的 `Math` 一律吃 `double`，而动画管线全程
+// 用 `float`（与 `Vector3` / `Quaternion` 一致）。每处都写一次
+// `(float)Math.Sqrt((double)v)` 又长又容易漏掉钳位，这里收口。
+//
+// **约定**：本类的钳位一律"闭区间"，超范围返回边界值而不是抛错——
+// 动画里越界的采样时间、插值权重都是正常输入，不该炸。
+public static class AnimMath {
+    // 绝对值。
+    public static float Abs(float v) {
+        if (v < 0.0f) { return -v; }
+        return v;
+    }
+
+    // 较大值。
+    public static float Max(float a, float b) {
+        if (a > b) { return a; }
+        return b;
+    }
+
+    // 较小值。
+    public static float Min(float a, float b) {
+        if (a < b) { return a; }
+        return b;
+    }
+
+    // 钳到 [lo, hi]。
+    public static float Clamp(float v, float lo, float hi) {
+        if (v < lo) { return lo; }
+        if (v > hi) { return hi; }
+        return v;
+    }
+
+    // 钳到 [0, 1]。
+    public static float Clamp01(float v) {
+        return AnimMath.Clamp(v, 0.0f, 1.0f);
+    }
+
+    // 平方根（负数按 0 处理，不产生 NaN）。
+    public static float Sqrt(float v) {
+        if (v <= 0.0f) { return 0.0f; }
+        return (float)Math.Sqrt((double)v);
+    }
+
+    // 反余弦（入参先钳到 [-1, 1]，避免浮点误差导致 NaN）。
+    public static float Acos(float v) {
+        return (float)Math.Acos((double)AnimMath.Clamp(v, -1.0f, 1.0f));
+    }
+
+    // 二参数反正切。
+    public static float Atan2(float y, float x) {
+        return (float)Math.Atan2((double)y, (double)x);
+    }
+
+    // 线性插值（t 钳到 [0, 1]）。
+    public static float Lerp(float a, float b, float t) {
+        return a + (b - a) * AnimMath.Clamp01(t);
+    }
+
+    // 近似相等（绝对容差）。
+    public static bool Approximately(float a, float b, float tolerance) {
+        return AnimMath.Abs(a - b) <= tolerance;
+    }
+
+    // 角度转弧度。
+    public static float DegreesToRadians(float degrees) {
+        return degrees * 3.14159265358979323846f / 180.0f;
+    }
+
+    // 归一化（长度过小按单位向量处理）。
+    public static Vector3 Normalize(Vector3 v) {
+        float len = v.Length();
+        if (len <= 0.00001f) { return Vector3.Zero; }
+        return new Vector3(v.X / len, v.Y / len, v.Z / len);
+    }
+
+    // 四元数球面插值（比 `Quaternion.Slerp` 多一条**确定性**规则）。
+    //
+    // **为什么不用系统库的**：两个朝向正好差 180° 时，四元数点积是 0，
+    // "往哪边转"本来是任意的；但点积是浮点数，系统库按 `dot < 0` 取反，
+    // 于是一个 -4e-8 的噪声就能决定人物朝反方向转身——同一份动画在不同
+    // 机器上插值方向相反。
+    //
+    // 这里的规则：点积落在 ±1e-6 内（正好 180°）时，一律按 b 自身的轴走，
+    // 结果与平台无关。差 180° 以内的正常插值仍然走最短弧。
+    public static Quaternion Slerp(Quaternion a, Quaternion b, float t) {
+        float k = AnimMath.Clamp01(t);
+        float dot = Quaternion.Dot(a, b);
+        if (dot < 0.0f) {
+            if (dot > -0.000001f) {
+                // 正好 180°：方向任意，固定按 b 自身的轴（结果确定）。
+                dot = 0.0f;
+            } else {
+                b = Quaternion.Negate(b);
+                dot = -dot;
+            }
+        }
+        if (dot > 0.9995f) {
+            // 几乎同向：线性插值后归一化即可（避免除以接近 0 的 sin）。
+            return Quaternion.Normalize(Quaternion.Lerp(a, b, k));
+        }
+        double theta0 = Math.Acos((double)dot);
+        double theta = theta0 * (double)k;
+        double sinTheta0 = Math.Sin(theta0);
+        double s0 = Math.Cos(theta) - (double)dot * Math.Sin(theta) / sinTheta0;
+        double s1 = Math.Sin(theta) / sinTheta0;
+        return new Quaternion(
+            (float)((double)a.X * s0 + (double)b.X * s1),
+            (float)((double)a.Y * s0 + (double)b.Y * s1),
+            (float)((double)a.Z * s0 + (double)b.Z * s1),
+            (float)((double)a.W * s0 + (double)b.W * s1));
+    }
+}

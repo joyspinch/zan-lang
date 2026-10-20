@@ -1,0 +1,245 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 骨架：一棵骨骼树。
+//
+// **零配置可用**：`new Skeleton()` 就能加骨、设姿势；姿势递推、蒙皮矩阵、
+// 查找都在库里消化，调用方只管喂数据。
+//
+// **约定**：骨骼按"父在子前"的顺序加入——`AddBone` 会在父骨骼还不存在时
+// 直接报错（错误可区分，不静默挂到根上），因为层级顺序错乱会让世界姿势
+// 递推少算一截，症状是"某根骨飘了"，很难查。
+//
+// **绑定姿势**是蒙皮的分母：蒙皮矩阵 = 当前世界姿势 × 绑定世界姿势的逆。
+// 绑定姿势改了必须让骨架重算（`SetBindPose` 会自动标脏），否则蒙皮会把
+// 顶点送回旧姿势——症状是"改了模型但蒙皮没变"。
+//
+// **并发**：非线程安全（骨架是逐帧写、逐帧读的单一所有者状态）。
+public class Skeleton {
+    // 骨骼表（父在子前）。
+    private List<Bone> bones;
+    // 名字 → 下标。
+    private Dictionary<string, int> index;
+    // 绑定姿势的世界变换（与骨骼表同序）。
+    private List<Transform3D> bindWorlds;
+    // 绑定姿势世界变换的逆（蒙皮用；与骨骼表同序）。
+    private List<Transform3D> bindInverses;
+    // 世界姿势是否已是最新（姿势写脏时置 false）。
+    private bool worldDirty;
+    // 绑定姿势缓存是否过期。
+    private bool bindDirty;
+
+    public Skeleton() {
+        this.bones = new List<Bone>();
+        this.index = new Dictionary<string, int>();
+        this.bindWorlds = new List<Transform3D>();
+        this.bindInverses = new List<Transform3D>();
+        this.worldDirty = true;
+        this.bindDirty = true;
+    }
+
+    // 骨骼数量。
+    public int Count() { return this.bones.Count; }
+
+    // 取骨骼（越界返回 null）。
+    public Bone At(int i) {
+        if (i < 0 || i >= this.bones.Count) { return null; }
+        return this.bones[i];
+    }
+
+    // 按名字取骨骼（没有返回 null）。
+    public Bone Find(string name) {
+        if (name == null) { return null; }
+        int i;
+        if (!this.index.TryGetValue(name, out i)) { return null; }
+        return this.bones[i];
+    }
+
+    // 按名字取骨骼下标（没有返回 -1）。
+    public int IndexOf(string name) {
+        if (name == null) { return -1; }
+        int i;
+        if (!this.index.TryGetValue(name, out i)) { return -1; }
+        return i;
+    }
+
+    // 加一根骨骼（父在子前；父下标越界抛 `AnimationException`）。
+    public Bone AddBone(string name, int parentIndex) {
+        if (name == null || name == "") {
+            throw new AnimationException("bone name must not be empty");
+        }
+        if (this.index.ContainsKey(name)) {
+            throw new AnimationException("duplicate bone name: " + name);
+        }
+        if (parentIndex < -1 || parentIndex >= this.bones.Count) {
+            throw new AnimationException("parent bone index out of range: " + parentIndex.ToString());
+        }
+        Bone b = new Bone(name, parentIndex);
+        this.bones.Add(b);
+        this.bindWorlds.Add(Transform3D.Identity);
+        this.bindInverses.Add(Transform3D.Identity);
+        this.index.Add(name, this.bones.Count - 1);
+        this.worldDirty = true;
+        this.bindDirty = true;
+        return b;
+    }
+
+    // 加一根骨骼并直接设好绑定姿势（链式：加完就能返回骨骼继续设）。
+    //
+    // 局部姿势同步设成绑定姿势——新建好的骨架应当就停在绑定姿势上，
+    // 否则"加了模型但没播动作"时角色是散架的。
+    public Bone AddBone(string name, int parentIndex, Transform3D bindPose) {
+        Bone b = this.AddBone(name, parentIndex);
+        b.BindPose = bindPose;
+        b.LocalPose = bindPose;
+        return b;
+    }
+
+    // 设置某根骨骼的绑定姿势（会自动让蒙皮缓存失效）。
+    public void SetBindPose(int boneIndex, Transform3D pose) {
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        b.BindPose = pose;
+        this.bindDirty = true;
+    }
+
+    // 取绑定姿势（局部，相对父骨骼）。
+    public Transform3D BindPose(int boneIndex) {
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        return b.BindPose;
+    }
+
+    // 取绑定姿势的世界变换（相对骨架根）。
+    public Transform3D BindWorldPose(int boneIndex) {
+        this.EnsureBind();
+        if (boneIndex < 0 || boneIndex >= this.bones.Count) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        return this.bindWorlds[boneIndex];
+    }
+
+    // 把所有骨骼的局部姿势重置成绑定姿势。
+    public void ResetToBindPose() {
+        for (int i = 0; i < this.bones.Count; i = i + 1) {
+            this.bones[i].LocalPose = this.bones[i].BindPose;
+        }
+        this.worldDirty = true;
+    }
+
+    // 设定某根骨骼的局部姿势（写后标脏，避免每帧重复递推）。
+    public void SetLocalPose(int boneIndex, Transform3D pose) {
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        b.LocalPose = pose;
+        this.worldDirty = true;
+    }
+
+    // 取某根骨骼的局部姿势。
+    public Transform3D LocalPose(int boneIndex) {
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        return b.LocalPose;
+    }
+
+    // 递推世界姿势（父在子前，一次线性扫描）。
+    public void ComputeWorldPoses() {
+        for (int i = 0; i < this.bones.Count; i = i + 1) {
+            Bone b = this.bones[i];
+            if (b.ParentIndex < 0) {
+                b.WorldPose = b.LocalPose;
+            } else {
+                Bone parent = this.bones[b.ParentIndex];
+                b.WorldPose = Transform3D.Compose(parent.WorldPose, b.LocalPose);
+            }
+        }
+        this.worldDirty = false;
+    }
+
+    // 世界姿势（必要时先递推一次）。
+    public Transform3D WorldPose(int boneIndex) {
+        if (this.worldDirty) { this.ComputeWorldPoses(); }
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        return b.WorldPose;
+    }
+
+    // 世界位置（必要时先递推一次）。
+    public Vector3 WorldPosition(int boneIndex) {
+        return this.WorldPose(boneIndex).Position;
+    }
+
+    // 直接设定某根骨骼的**世界**姿势：内部反解出局部姿势写回去。
+    //
+    // IK 与"把某根骨挪到某个点"用这个；直接写局部姿势做不到"世界坐标对齐"。
+    public void SetWorldPose(int boneIndex, Transform3D worldPose) {
+        Bone b = this.At(boneIndex);
+        if (b == null) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        if (this.worldDirty) { this.ComputeWorldPoses(); }
+        Transform3D parentWorld = Transform3D.Identity;
+        if (b.ParentIndex >= 0) {
+            parentWorld = this.bones[b.ParentIndex].WorldPose;
+        }
+        b.LocalPose = Transform3D.LocalFromWorld(parentWorld, worldPose);
+        this.worldDirty = true;
+    }
+
+    // 重算绑定姿势的世界变换与其逆（蒙皮的分母）。
+    public void RefreshBind() {
+        for (int i = 0; i < this.bones.Count; i = i + 1) {
+            Bone b = this.bones[i];
+            if (b.ParentIndex < 0) {
+                this.bindWorlds[i] = b.BindPose;
+            } else {
+                this.bindWorlds[i] = Transform3D.Compose(this.bindWorlds[b.ParentIndex], b.BindPose);
+            }
+            this.bindInverses[i] = this.bindWorlds[i].Inverse();
+        }
+        this.bindDirty = false;
+    }
+
+    // 兼容名：语义与 `RefreshBind` 相同（缓存绑定姿势的逆变换）。
+    public void CacheBindInv() {
+        this.RefreshBind();
+    }
+
+    // 蒙皮矩阵：骨骼当前世界姿势 × 绑定姿势的逆（把绑定姿势的顶点送进
+    // 当前姿势）。
+    public Transform3D SkinMatrix(int boneIndex) {
+        if (boneIndex < 0 || boneIndex >= this.bones.Count) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        this.EnsureBind();
+        if (this.worldDirty) { this.ComputeWorldPoses(); }
+        return Transform3D.Compose(this.bones[boneIndex].WorldPose, this.bindInverses[boneIndex]);
+    }
+
+    // 绑定姿势的逆变换（蒙皮用）。
+    public Transform3D BindInverse(int boneIndex) {
+        this.EnsureBind();
+        if (boneIndex < 0 || boneIndex >= this.bones.Count) {
+            throw new AnimationException("bone index out of range: " + boneIndex.ToString());
+        }
+        return this.bindInverses[boneIndex];
+    }
+
+    // 绑定缓存过期时重算。
+    private void EnsureBind() {
+        if (this.bindDirty) { this.RefreshBind(); }
+    }
+}

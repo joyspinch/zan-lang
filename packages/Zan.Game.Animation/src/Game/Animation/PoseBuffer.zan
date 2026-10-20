@@ -1,0 +1,71 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 姿势缓冲：一组骨骼姿势的容器，带混合工具。
+//
+// **为什么要有它**：交叉淡化要同时持有"上一段动作的姿势"和"当前动作的姿势"
+// 两份数据，再按权重混成一份。到处 new `List<Transform3D>` 会让每帧都有
+// 分配（帧率抖动），缓冲复用就是为这个。
+//
+// **混合语义**：位移与缩放线性插值，旋转走球面插值（沿最短弧）——
+// 旋转用线性插值会在两帧之间"缩一下"，看起来像抽搐。
+//
+// **并发**：非线程安全。
+public class PoseBuffer {
+    private List<Transform3D> poses;
+
+    public PoseBuffer(int boneCount) {
+        this.poses = new List<Transform3D>();
+        this.EnsureSize(boneCount);
+    }
+
+    // 调整容量（多退少补；缩小会丢掉超出部分的姿势）。
+    public void EnsureSize(int boneCount) {
+        while (this.poses.Count < boneCount) {
+            this.poses.Add(Transform3D.Identity);
+        }
+        while (this.poses.Count > boneCount) {
+            this.poses.RemoveAt(this.poses.Count - 1);
+        }
+    }
+
+    // 姿势数量。
+    public int Count() { return this.poses.Count; }
+
+    // 取姿势。
+    public Transform3D At(int index) { return this.poses[index]; }
+
+    // 写姿势。
+    public void Set(int index, Transform3D pose) { this.poses[index] = pose; }
+
+    // 整体覆盖。
+    public void CopyFrom(List<Transform3D> source) {
+        this.EnsureSize(source.Count);
+        for (int i = 0; i < source.Count; i = i + 1) {
+            this.poses[i] = source[i];
+        }
+    }
+
+    // 单个姿势的混合（t = 0 取 a，t = 1 取 b）。
+    public static Transform3D Blend(Transform3D a, Transform3D b, float t) {
+        float k = AnimMath.Clamp01(t);
+        return new Transform3D(
+            Vector3.Lerp(a.Position, b.Position, k),
+            AnimMath.Slerp(a.Rotation, b.Rotation, k),
+            Vector3.Lerp(a.Scale, b.Scale, k));
+    }
+
+    // 两个缓冲按权重混合进目标缓冲（目标长度取三者最小）。
+    public static void BlendInto(PoseBuffer target, PoseBuffer a, PoseBuffer b, float t) {
+        int n = target.Count();
+        if (a.Count() < n) { n = a.Count(); }
+        if (b.Count() < n) { n = b.Count(); }
+        float k = AnimMath.Clamp01(t);
+        for (int i = 0; i < n; i = i + 1) {
+            target.Set(i, PoseBuffer.Blend(a.At(i), b.At(i), k));
+        }
+    }
+}

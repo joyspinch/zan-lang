@@ -1,0 +1,107 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Animation;
+
+// 播放器：把时间推成姿势。
+//
+// **零配置可用**：`new AnimationPlayer(skeleton)` → `Play(clip)` → 每帧
+// `Update(dt)`。采样缓冲由播放器持有（复用，不每帧分配）。
+//
+// **时间语义**：
+//   - `Speed` 可为负（倒放）；
+//   - 循环片段走完一圈回到 0；不循环的片段走到末尾就停（`IsPlaying` 变 false），
+//     时间停在末尾——不循环的动作不该"播完又从头来"。
+//
+// **并发**：非线程安全（与骨架同属主循环状态）。
+public class AnimationPlayer {
+    private Skeleton skeleton;
+    private AnimationClip clip;
+    private float time;
+    private float speed;
+    private bool playing;
+    private bool loop;
+    // 采样缓冲（复用，避免每帧分配）。
+    private PoseBuffer poses;
+
+    public AnimationPlayer(Skeleton skeleton) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        this.skeleton = skeleton;
+        this.clip = null;
+        this.time = 0.0f;
+        this.speed = 1.0f;
+        this.playing = false;
+        this.loop = true;
+        this.poses = new PoseBuffer(skeleton.Count());
+    }
+
+    // 当前片段（没有时为 null）。
+    public AnimationClip Clip { get { return this.clip; } set { this.clip = value; } }
+    // 当前时间（秒）。
+    public float Time { get { return this.time; } set { this.time = value; } }
+    // 播放速度（负数倒放）。
+    public float Speed { get { return this.speed; } set { this.speed = value; } }
+    // 是否在播。
+    public bool IsPlaying { get { return this.playing; } set { this.playing = value; } }
+    // 是否循环。
+    public bool Loop { get { return this.loop; } set { this.loop = value; } }
+
+    // 播放一个片段（时间归零，立刻生效）。
+    public void Play(AnimationClip newClip) {
+        this.clip = newClip;
+        this.time = 0.0f;
+        this.playing = newClip != null;
+        if (this.playing) { this.ApplyNow(); }
+    }
+
+    // 停（时间保留）。
+    public void Stop() {
+        this.playing = false;
+    }
+
+    // 推进时间并把姿势写进骨架。
+    public void Update(float deltaSeconds) {
+        if (!this.playing || this.clip == null) { return; }
+        this.time = this.time + deltaSeconds * this.speed;
+        this.ClampTime();
+        this.ApplyNow();
+    }
+
+    // 按当前时间重新采样一次（不推进时间）。
+    public void ApplyNow() {
+        if (this.clip == null) { return; }
+        this.EnsurePoses();
+        this.clip.ApplyTo(this.skeleton, this.time, this.poses);
+    }
+
+    // 推进一帧（可取负数：倒放）。
+    private void ClampTime() {
+        float duration = this.clip.Duration;
+        if (duration <= 0.0f) {
+            this.time = 0.0f;
+            this.playing = false;
+            return;
+        }
+        if (this.loop) {
+            this.time = this.time % duration;
+            if (this.time < 0.0f) { this.time = this.time + duration; }
+            return;
+        }
+        if (this.time >= duration) {
+            this.time = duration;
+            this.playing = false;
+            return;
+        }
+        if (this.time <= 0.0f) {
+            this.time = 0.0f;
+            this.playing = false;
+        }
+    }
+
+    // 采样缓冲与骨架骨骼数对齐。
+    private void EnsurePoses() {
+        this.poses.EnsureSize(this.skeleton.Count());
+    }
+}

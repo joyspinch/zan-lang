@@ -1,0 +1,283 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Animation;
+
+// 状态机：状态 + 转移 + 参数。
+//
+// **零配置可用**：`new AnimationStateMachine()` → `AddState` / `AddTransition`
+// → 每帧 `Update(skeleton, dt)`。参数、转移、淡化都由库里消化。
+//
+// **一帧内做的事**（顺序固定）：
+//   1. 看当前状态有没有满足条件的转移 → 有就起淡化；
+//   2. 推进当前（与正在淡出的上一段）的时间；
+//   3. 采样姿势：淡出中就把两段姿势按权重混合，否则直接用当前段；
+//   4. 把姿势写回骨架的局部姿势。
+//
+// **淡化的权重**：淡出刚开始时权重是 0（完全还是旧动作），淡完是 1。
+//
+// **并发**：非线程安全。
+public class AnimationStateMachine {
+    // 状态表。
+    private Dictionary<string, AnimationState> states;
+    // 状态名（保序）。
+    private List<string> stateOrder;
+    // 转移表。
+    private List<AnimationTransition> transitions;
+    // 浮点参数。
+    private Dictionary<string, float> floatParams;
+    // 布尔参数。
+    private Dictionary<string, bool> boolParams;
+    // 待消费的触发器。
+    private List<string> pendingTriggers;
+
+    private string currentStateName;
+    private string previousStateName;
+    private float currentTime;
+    private float previousTime;
+    private bool fading;
+    private float fadeElapsed;
+    private float fadeDuration;
+
+    // 姿势缓冲（复用）。
+    private PoseBuffer currentBuffer;
+    private PoseBuffer previousBuffer;
+    private PoseBuffer blendBuffer;
+
+    public AnimationStateMachine() {
+        this.states = new Dictionary<string, AnimationState>();
+        this.stateOrder = new List<string>();
+        this.transitions = new List<AnimationTransition>();
+        this.floatParams = new Dictionary<string, float>();
+        this.boolParams = new Dictionary<string, bool>();
+        this.pendingTriggers = new List<string>();
+        this.currentStateName = "";
+        this.previousStateName = "";
+        this.currentTime = 0.0f;
+        this.previousTime = 0.0f;
+        this.fading = false;
+        this.fadeElapsed = 0.0f;
+        this.fadeDuration = 0.0f;
+        this.currentBuffer = new PoseBuffer(0);
+        this.previousBuffer = new PoseBuffer(0);
+        this.blendBuffer = new PoseBuffer(0);
+    }
+
+    // 当前状态名（没有进入任何状态时为空串）。
+    public string CurrentStateName() { return this.currentStateName; }
+    // 淡出中的上一状态名（没有时为空串）。
+    public string PreviousStateName() { return this.previousStateName; }
+    // 是否正在交叉淡化。
+    public bool IsFading() { return this.fading; }
+    // 当前状态已播放的时间（秒）。
+    public float CurrentTime() { return this.currentTime; }
+    // 状态数量。
+    public int StateCount() { return this.stateOrder.Count; }
+    // 转移数量。
+    public int TransitionCount() { return this.transitions.Count; }
+
+    // 加一个状态（同名会覆盖旧状态）。
+    public AnimationState AddState(string name, AnimationClip clip) {
+        if (name == null || name == "") {
+            throw new AnimationException("state name must not be empty");
+        }
+        AnimationState existing = this.State(name);
+        if (existing != null) {
+            existing.Clip = clip;
+            return existing;
+        }
+        AnimationState s = new AnimationState(name, clip);
+        this.states.Add(name, s);
+        this.stateOrder.Add(name);
+        return s;
+    }
+
+    // 取状态（没有返回 null）。
+    public AnimationState State(string name) {
+        if (name == null) { return null; }
+        AnimationState s;
+        if (!this.states.TryGetValue(name, out s)) { return null; }
+        return s;
+    }
+
+    // 加一条转移（起点 / 终点必须是已存在的状态）。
+    public void AddTransition(AnimationTransition transition) {
+        if (transition == null) {
+            throw new AnimationException("transition must not be null");
+        }
+        if (this.State(transition.From) == null) {
+            throw new AnimationException("transition source state does not exist: " + transition.From);
+        }
+        if (this.State(transition.To) == null) {
+            throw new AnimationException("transition target state does not exist: " + transition.To);
+        }
+        this.transitions.Add(transition);
+    }
+
+    // 直接切到某个状态（硬切，时间归零）。
+    public void SetState(string name) {
+        if (this.State(name) == null) {
+            throw new AnimationException("state does not exist: " + name);
+        }
+        this.currentStateName = name;
+        this.previousStateName = "";
+        this.currentTime = 0.0f;
+        this.previousTime = 0.0f;
+        this.fading = false;
+        this.fadeElapsed = 0.0f;
+        this.fadeDuration = 0.0f;
+    }
+
+    // 设浮点参数。
+    public void SetFloat(string name, float value) {
+        if (name == null || name == "") { return; }
+        this.floatParams[name] = value;
+    }
+
+    // 设布尔参数。
+    public void SetBool(string name, bool value) {
+        if (name == null || name == "") { return; }
+        this.boolParams[name] = value;
+    }
+
+    // 打一个触发器（一次性；被匹配的转移消费掉才消失）。
+    public void Trigger(string name) {
+        if (name == null || name == "") { return; }
+        this.pendingTriggers.Add(name);
+    }
+
+    // 取浮点参数（没有则 0）。
+    public float GetFloat(string name) {
+        if (name == null) { return 0.0f; }
+        float v;
+        if (!this.floatParams.TryGetValue(name, out v)) { return 0.0f; }
+        return v;
+    }
+
+    // 取布尔参数（没有则 false）。
+    public bool GetBool(string name) {
+        if (name == null) { return false; }
+        bool v;
+        if (!this.boolParams.TryGetValue(name, out v)) { return false; }
+        return v;
+    }
+
+    // 推进一帧：评估转移、推进时间、采样姿势、写回骨架。
+    public void Update(Skeleton skeleton, float dt) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        if (this.currentStateName == "") { return; }
+
+        this.EvaluateTransitions();
+
+        AnimationState current = this.State(this.currentStateName);
+        this.currentTime = this.Advance(current, this.currentTime, dt);
+
+        if (this.fading) {
+            AnimationState previous = this.State(this.previousStateName);
+            this.previousTime = this.Advance(previous, this.previousTime, dt);
+        }
+
+        this.ApplyPoses(skeleton, current);
+
+        if (this.fading) {
+            this.fadeElapsed = this.fadeElapsed + dt;
+            if (this.fadeElapsed >= this.fadeDuration) {
+                this.fading = false;
+                this.previousStateName = "";
+                this.fadeDuration = 0.0f;
+            }
+        }
+    }
+
+    // 看当前状态有没有满足条件的转移。
+    private void EvaluateTransitions() {
+        if (this.fading) { return; }
+        for (int i = 0; i < this.transitions.Count; i = i + 1) {
+            AnimationTransition t = this.transitions[i];
+            if (t.From != this.currentStateName) { continue; }
+            if (!this.ConditionMet(t)) { continue; }
+            this.BeginFade(t);
+            return;
+        }
+    }
+
+    // 转移条件是否满足（触发器在这里被消费）。
+    private bool ConditionMet(AnimationTransition t) {
+        if (t.Kind == AnimationTransitionKind.Float) {
+            return this.GetFloat(t.Parameter) >= t.Threshold;
+        }
+        if (t.Kind == AnimationTransitionKind.Bool) {
+            return this.GetBool(t.Parameter);
+        }
+        // 触发器：命中就消费掉（一次性）。
+        int index = this.pendingTriggers.IndexOf(t.Parameter);
+        if (index < 0) { return false; }
+        this.pendingTriggers.RemoveAt(index);
+        return true;
+    }
+
+    // 起一次交叉淡化。
+    private void BeginFade(AnimationTransition t) {
+        this.previousStateName = this.currentStateName;
+        this.previousTime = this.currentTime;
+        this.currentStateName = t.To;
+        this.currentTime = 0.0f;
+        this.fading = t.Duration > 0.0f;
+        this.fadeElapsed = 0.0f;
+        this.fadeDuration = t.Duration;
+    }
+
+    // 推进某个状态的时间（按状态的循环 / 速度设置）。
+    private float Advance(AnimationState state, float time, float dt) {
+        if (state == null || state.Clip == null) { return time; }
+        float duration = state.Clip.Duration;
+        if (duration <= 0.0f) { return 0.0f; }
+        float next = time + dt * state.Speed;
+        if (state.Loop) {
+            next = next % duration;
+            if (next < 0.0f) { next = next + duration; }
+            return next;
+        }
+        if (next >= duration) { return duration; }
+        if (next <= 0.0f) { return 0.0f; }
+        return next;
+    }
+
+    // 采样姿势并写回骨架。
+    private void ApplyPoses(Skeleton skeleton, AnimationState current) {
+        int boneCount = skeleton.Count();
+        this.currentBuffer.EnsureSize(boneCount);
+        this.previousBuffer.EnsureSize(boneCount);
+        this.blendBuffer.EnsureSize(boneCount);
+
+        if (current == null || current.Clip == null) { return; }
+        current.Clip.SampleTo(skeleton, this.currentTime, this.currentBuffer);
+
+        if (!this.fading) {
+            for (int i = 0; i < boneCount; i = i + 1) {
+                skeleton.SetLocalPose(i, this.currentBuffer.At(i));
+            }
+            return;
+        }
+
+        AnimationState previous = this.State(this.previousStateName);
+        if (previous == null || previous.Clip == null) {
+            for (int i = 0; i < boneCount; i = i + 1) {
+                skeleton.SetLocalPose(i, this.currentBuffer.At(i));
+            }
+            return;
+        }
+        previous.Clip.SampleTo(skeleton, this.previousTime, this.previousBuffer);
+
+        float weight = 0.0f;
+        if (this.fadeDuration > 0.0f) {
+            weight = AnimMath.Clamp01(this.fadeElapsed / this.fadeDuration);
+        }
+        PoseBuffer.BlendInto(this.blendBuffer, this.previousBuffer, this.currentBuffer, weight);
+        for (int i = 0; i < boneCount; i = i + 1) {
+            skeleton.SetLocalPose(i, this.blendBuffer.At(i));
+        }
+    }
+}

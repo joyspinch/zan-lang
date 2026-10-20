@@ -1,0 +1,117 @@
+using System;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 变换原语：平移 + 旋转 + 缩放，值语义。
+//
+// **为什么自己一套**：3D 动画每根骨骼每帧都要算一次变换，必须无分配、可组合。
+// 系统库给了 `Vector3` / `Quaternion`（向量与四元数的运算），这里只补"把
+// 三者当一个整体"的组合与求逆——骨骼的局部姿势与世界姿势之间的换算，全
+// 靠这两个函数。
+//
+// **变换约定**（全包统一，别混用别的约定）：
+//   - 点：  p' = R * (S * p) + T      （先缩放，再旋转，最后平移）
+//   - 方向：d' = R * (S * d)          （方向不含平移）
+//   - 组合：`Compose(parent, child)` = 先施加 child，再施加 parent
+//     （即骨骼层级里"子变换先作用、父变换后作用"的实际顺序）。
+//
+// **已知边界**：TRS 三件套在"父级非等比缩放 + 子级带旋转"时无法精确分解
+// （缩放与旋转不可交换，业界通病）。骨骼缩放请用等比缩放；确有需要时
+// 在自己的渲染层用矩阵承接。
+public struct Transform3D {
+    // 平移。
+    public Vector3 Position;
+    // 旋转。
+    public Quaternion Rotation;
+    // 缩放。
+    public Vector3 Scale;
+
+    public Transform3D(Vector3 position, Quaternion rotation, Vector3 scale) {
+        this.Position = position;
+        this.Rotation = rotation;
+        this.Scale = scale;
+    }
+
+    // 单位变换（无位移、无旋转、单位缩放）。
+    public static Transform3D Identity {
+        get { return new Transform3D(Vector3.Zero, Quaternion.Identity, Vector3.One); }
+    }
+
+    // 组合：先施加 child，再施加 parent。
+    //
+    // 平移分量要带上父级缩放：父级作用在子级的结果上时，父级的缩放先吃掉
+    // 子级的位移（p → R_p * (S_p * (…)) + T_p），漏掉这一项会让"父级缩放
+    // ≠ 1"时子骨骼整体偏移。
+    public static Transform3D Compose(Transform3D parent, Transform3D child) {
+        Vector3 scale = new Vector3(
+            parent.Scale.X * child.Scale.X,
+            parent.Scale.Y * child.Scale.Y,
+            parent.Scale.Z * child.Scale.Z);
+        Vector3 position = Vector3.Add(
+            Quaternion.Rotate(Vector3.Multiply(parent.Scale, child.Position), parent.Rotation),
+            parent.Position);
+        Quaternion rotation = Quaternion.Multiply(parent.Rotation, child.Rotation);
+        return new Transform3D(position, rotation, scale);
+    }
+
+    // 求逆变换。
+    //
+    // 逆变换满足 p = S⁻¹ * (R⁻¹ * (p' - T))，所以逆的平移分量是
+    // -S⁻¹ * (R⁻¹ * T)——少了逆缩放这一项，回代就会缩放两次。
+    public Transform3D Inverse() {
+        Vector3 invScale = new Vector3(
+            SafeReciprocal(this.Scale.X),
+            SafeReciprocal(this.Scale.Y),
+            SafeReciprocal(this.Scale.Z));
+        Quaternion invRot = Quaternion.Inverse(this.Rotation);
+        Vector3 rotated = Quaternion.Rotate(this.Position, invRot);
+        Vector3 invPos = new Vector3(
+            -invScale.X * rotated.X,
+            -invScale.Y * rotated.Y,
+            -invScale.Z * rotated.Z);
+        return new Transform3D(invPos, invRot, invScale);
+    }
+
+    // 由「父级世界变换 + 期望的世界变换」反解出局部变换。
+    //
+    // 父级为 `Transform3D.Identity`（根骨骼）时，结果就是世界变换本身。
+    // 与 `Inverse()` 分开：求逆针对的是"同一个变换"，这里针对的是"两个
+    // 变换之间的差"，公式不同（差要用世界平移相减，不能整体求逆）。
+    public static Transform3D LocalFromWorld(Transform3D parentWorld, Transform3D world) {
+        Vector3 invScale = new Vector3(
+            SafeReciprocal(parentWorld.Scale.X),
+            SafeReciprocal(parentWorld.Scale.Y),
+            SafeReciprocal(parentWorld.Scale.Z));
+        Quaternion invRot = Quaternion.Inverse(parentWorld.Rotation);
+        Vector3 delta = Vector3.Subtract(world.Position, parentWorld.Position);
+        Vector3 localPos = Vector3.Multiply(invScale, Quaternion.Rotate(delta, invRot));
+        Vector3 localScale = Vector3.Multiply(invScale, world.Scale);
+        Quaternion localRot = Quaternion.Multiply(invRot, world.Rotation);
+        return new Transform3D(localPos, localRot, localScale);
+    }
+
+    // 变换点（含缩放与平移）。
+    public Vector3 TransformPoint(Vector3 point) {
+        Vector3 scaled = new Vector3(
+            point.X * this.Scale.X,
+            point.Y * this.Scale.Y,
+            point.Z * this.Scale.Z);
+        return Vector3.Add(Quaternion.Rotate(scaled, this.Rotation), this.Position);
+    }
+
+    // 变换方向（只旋转与缩放，不含平移）。
+    public Vector3 TransformDirection(Vector3 direction) {
+        Vector3 scaled = new Vector3(
+            direction.X * this.Scale.X,
+            direction.Y * this.Scale.Y,
+            direction.Z * this.Scale.Z);
+        return Quaternion.Rotate(scaled, this.Rotation);
+    }
+
+    // 缩放分量为 0 时求逆会得到无穷，这里钳成 1（退化但不炸）。
+    private static float SafeReciprocal(float v) {
+        if (v == 0.0f) { return 1.0f; }
+        return 1.0f / v;
+    }
+}

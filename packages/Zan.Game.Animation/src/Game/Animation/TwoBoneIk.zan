@@ -1,0 +1,172 @@
+using System;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 两骨解析 IK（余弦定理 + 极向量）。
+//
+// **解的是什么**：给定根骨位置、末端目标点、极向量（决定弯曲平面的朝向），
+// 求出中间骨应该待的世界位置与朝向。解析解——一次算完，不用迭代收敛，
+// 也不像 CCD 那样"迭代次数不够就差一点"。
+//
+// **轴向约定**：骨骼局部 **+Y** 指向骨骼末端（见 `Bone`）。本求解器据此
+// 把中间骨的 +Y 对准目标方向。
+//
+// **几何**：中间骨的位置同时满足两个球面约束
+//   - 距根骨 `upperLength`（上臂长度）；
+//   - 距目标点 `lowerLength`（前臂长度）。
+// 两球面的交线是一个圆，用极向量在圆上选点即可（余弦定理求投影距离，
+// 勾股求半径）。
+//
+// **够不着时**：目标超出可达范围（`upper + lower`）时把距离钳到边界，
+// 手臂伸直指向目标——不炸、不抖动。
+//
+// **并发**：非线程安全（会改写骨架姿势）。
+public static class TwoBoneIk {
+    // 解析求解中间骨的世界位置。
+    //
+    // root / target / pole 都是世界坐标；pole 用来选弯曲平面（一般是角色
+    // 的正前方）。
+    public static Vector3 SolveMidPosition(Vector3 root, Vector3 target, Vector3 pole,
+                                           float upperLength, float lowerLength) {
+        if (upperLength <= 0.0f) { upperLength = 0.0001f; }
+        if (lowerLength <= 0.0f) { lowerLength = 0.0001f; }
+
+        Vector3 toTarget = Vector3.Subtract(target, root);
+        float dist = toTarget.Length();
+        Vector3 dir;
+        if (dist <= 0.00001f) {
+            // 目标与根骨重合：方向无定义，退化成沿 +Y 伸出去。
+            dir = new Vector3(0.0f, 1.0f, 0.0f);
+            dist = 0.00001f;
+        } else {
+            dir = new Vector3(toTarget.X / dist, toTarget.Y / dist, toTarget.Z / dist);
+        }
+
+        // 可达范围：够不着就钳到边界（手臂伸直）。
+        float reach = upperLength + lowerLength;
+        float inner = AnimMath.Abs(upperLength - lowerLength) + 0.0001f;
+        float d = AnimMath.Clamp(dist, inner, reach);
+
+        // 极向量在垂直于 dir 的平面上的分量（弯曲平面的方向）。
+        Vector3 perp = TwoBoneIk.PerpendicularComponent(Vector3.Subtract(pole, root), dir);
+
+        // 余弦定理：投影距离 a 与半径 h。
+        float a = (d * d + upperLength * upperLength - lowerLength * lowerLength) / (2.0f * d);
+        float hSq = upperLength * upperLength - a * a;
+        if (hSq < 0.0f) { hSq = 0.0f; }
+        float h = AnimMath.Sqrt(hSq);
+
+        Vector3 midpoint = new Vector3(
+            root.X + dir.X * a,
+            root.Y + dir.Y * a,
+            root.Z + dir.Z * a);
+        return new Vector3(
+            midpoint.X + perp.X * h,
+            midpoint.Y + perp.Y * h,
+            midpoint.Z + perp.Z * h);
+    }
+
+    // 在骨架上解算：把中间骨摆到目标上。
+    //
+    // rootBone / midBone / tipBone 给出三根骨：根骨（肩）、中间骨（肘）、
+    // 末端骨（手）。两段长度取当前姿势里的实际距离，所以改模型后不用重配
+    // 参数。`tipBone` 必须是 `midBone` 的后代，否则末端不会跟着动。
+    //
+    // 返回 false 表示几何退化（长度为 0 / 骨骼下标越界），姿势保持原样。
+    public static bool Solve(Skeleton skeleton, int rootBone, int midBone, int tipBone,
+                             Vector3 target, Vector3 pole) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        if (skeleton.At(rootBone) == null || skeleton.At(midBone) == null || skeleton.At(tipBone) == null) {
+            throw new AnimationException("bone index out of range");
+        }
+
+        skeleton.ComputeWorldPoses();
+        Vector3 pRoot = skeleton.WorldPosition(rootBone);
+        Vector3 pMid = skeleton.WorldPosition(midBone);
+        Vector3 pTip = skeleton.WorldPosition(tipBone);
+
+        float upper = Vector3.Distance(pRoot, pMid);
+        float lower = Vector3.Distance(pMid, pTip);
+        if (upper <= 0.0001f || lower <= 0.0001f) { return false; }
+
+        Vector3 mid = TwoBoneIk.SolveMidPosition(pRoot, target, pole, upper, lower);
+
+        // 骨骼朝向：局部 +Y 指向目标；弯曲平面由极向量定。
+        Vector3 dir = Vector3.Subtract(target, mid);
+        if (dir.Length() <= 0.00001f) {
+            dir = Vector3.Subtract(pTip, pMid);
+        }
+        dir = AnimMath.Normalize(dir);
+
+        Vector3 rootDir = AnimMath.Normalize(Vector3.Subtract(target, pRoot));
+        Vector3 perp = TwoBoneIk.PerpendicularComponent(Vector3.Subtract(pole, pRoot), rootDir);
+        Vector3 planeNormal = AnimMath.Normalize(Vector3.Cross(rootDir, perp));
+
+        Quaternion rotation = TwoBoneIk.RotationFromDirection(dir, planeNormal);
+        Transform3D world = skeleton.WorldPose(midBone);
+        skeleton.SetWorldPose(midBone, new Transform3D(mid, rotation, world.Scale));
+        return true;
+    }
+
+    // 构造一个旋转：局部 +Y 指向 `direction`，且局部 X 轴落在
+    // `planeNormal` 与 `direction` 张成的平面里。
+    //
+    // 做法是"最短弧对齐 + 绕轴扭转"：先把 +Y 转到目标方向，再绕目标方向
+    // 转一个角度把 X 轴带进弯曲平面。比"从矩阵反解四元数"少一层数值误差。
+    public static Quaternion RotationFromDirection(Vector3 direction, Vector3 planeNormal) {
+        Vector3 y = AnimMath.Normalize(direction);
+        if (y.Length() <= 0.0f) { return Quaternion.Identity; }
+
+        // 目标 X 轴：垂直于 y，且由平面法线决定朝向。
+        Vector3 x = AnimMath.Normalize(Vector3.Cross(planeNormal, y));
+        if (x.Length() <= 0.0f) {
+            x = new Vector3(1.0f, 0.0f, 0.0f);
+        }
+
+        // 第一步：把 +Y 转到 y（最短弧）。
+        Vector3 up = new Vector3(0.0f, 1.0f, 0.0f);
+        float d = Vector3.Dot(up, y);
+        Quaternion align;
+        if (d > 0.999999f) {
+            align = Quaternion.Identity;
+        } else if (d < -0.999999f) {
+            // 目标正好是 -Y：绕任意垂直轴转半圈。
+            align = Quaternion.FromAxisAngle(new Vector3(1.0f, 0.0f, 0.0f), 3.14159265f);
+        } else {
+            Vector3 axis = AnimMath.Normalize(Vector3.Cross(up, y));
+            align = Quaternion.FromAxisAngle(axis, AnimMath.Acos(d));
+        }
+
+        // 第二步：绕 y 扭转，把 X 轴带进目标平面。
+        Vector3 x1 = Quaternion.Rotate(new Vector3(1.0f, 0.0f, 0.0f), align);
+        float cosPhi = Vector3.Dot(x1, x);
+        float sinPhi = Vector3.Dot(Vector3.Cross(x1, x), y);
+        float phi = AnimMath.Atan2(sinPhi, cosPhi);
+        Quaternion twist = Quaternion.FromAxisAngle(y, phi);
+
+        // 先 align 再 twist。
+        return Quaternion.Multiply(twist, align);
+    }
+
+    // 向量在垂直于 `axis` 的平面上的分量（归一化）。
+    private static Vector3 PerpendicularComponent(Vector3 v, Vector3 axis) {
+        float along = Vector3.Dot(v, axis);
+        Vector3 perp = new Vector3(
+            v.X - axis.X * along,
+            v.Y - axis.Y * along,
+            v.Z - axis.Z * along);
+        Vector3 n = AnimMath.Normalize(perp);
+        if (n.Length() <= 0.0f) {
+            // 极向量与主方向共线：随便取一个垂直方向（保证结果确定）。
+            Vector3 fallback = Vector3.Cross(axis, new Vector3(0.0f, 0.0f, 1.0f));
+            if (fallback.Length() <= 0.00001f) {
+                fallback = Vector3.Cross(axis, new Vector3(1.0f, 0.0f, 0.0f));
+            }
+            return AnimMath.Normalize(fallback);
+        }
+        return n;
+    }
+}

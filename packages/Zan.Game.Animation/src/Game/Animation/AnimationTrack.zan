@@ -1,0 +1,130 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 一根骨骼上的动作轨道：位移 / 旋转 / 缩放三条通道，各自一串关键帧。
+//
+// **为什么按通道分开存**：三条通道的关键帧数量与时间点通常不一样（位移常常
+// 只有两三个关键帧，旋转有一整串）。混在一条道里就得用"这一帧没这个通道"
+// 的哨兵值去表达，采样时反而更绕。
+//
+// **关键帧时间必须递增**：追加时若时间倒退直接抛异常——乱序的关键帧表在
+// 采样时会取到错误的区间，症状是"动作偶尔抽搐"，极难定位。
+//
+// **并发**：非线程安全。
+public class AnimationTrack {
+    // 轨道对应的骨骼名。
+    public string BoneName;
+
+    private List<float> positionTimes;
+    private List<Vector3> positionValues;
+    private List<float> rotationTimes;
+    private List<Quaternion> rotationValues;
+    private List<float> scaleTimes;
+    private List<Vector3> scaleValues;
+
+    public AnimationTrack(string boneName) {
+        this.BoneName = boneName != null ? boneName : "";
+        this.positionTimes = new List<float>();
+        this.positionValues = new List<Vector3>();
+        this.rotationTimes = new List<float>();
+        this.rotationValues = new List<Quaternion>();
+        this.scaleTimes = new List<float>();
+        this.scaleValues = new List<Vector3>();
+    }
+
+    // 三条通道的关键帧总数。
+    public int KeyCount() {
+        return this.positionTimes.Count + this.rotationTimes.Count + this.scaleTimes.Count;
+    }
+
+    // 位移通道是否有关键帧。
+    public bool HasPosition() { return this.positionTimes.Count > 0; }
+    // 旋转通道是否有关键帧。
+    public bool HasRotation() { return this.rotationTimes.Count > 0; }
+    // 缩放通道是否有关键帧。
+    public bool HasScale() { return this.scaleTimes.Count > 0; }
+
+    // 末尾关键帧的时间（三条通道取最大；没有关键帧返回 0）。
+    public float EndTime() {
+        float end = 0.0f;
+        if (this.positionTimes.Count > 0) { end = AnimMath.Max(end, this.positionTimes[this.positionTimes.Count - 1]); }
+        if (this.rotationTimes.Count > 0) { end = AnimMath.Max(end, this.rotationTimes[this.rotationTimes.Count - 1]); }
+        if (this.scaleTimes.Count > 0) { end = AnimMath.Max(end, this.scaleTimes[this.scaleTimes.Count - 1]); }
+        return end;
+    }
+
+    // 追加一个位移关键帧。
+    public void AddPosition(float time, Vector3 value) {
+        this.CheckMonotonic(this.positionTimes, time, "position");
+        this.positionTimes.Add(time);
+        this.positionValues.Add(value);
+    }
+
+    // 追加一个旋转关键帧。
+    public void AddRotation(float time, Quaternion value) {
+        this.CheckMonotonic(this.rotationTimes, time, "rotation");
+        this.rotationTimes.Add(time);
+        this.rotationValues.Add(value);
+    }
+
+    // 追加一个缩放关键帧。
+    public void AddScale(float time, Vector3 value) {
+        this.CheckMonotonic(this.scaleTimes, time, "scale");
+        this.scaleTimes.Add(time);
+        this.scaleValues.Add(value);
+    }
+
+    // 采样：某条通道没有关键帧时用 fallback 的对应分量兜底。
+    public Transform3D Sample(float time, Transform3D fallback) {
+        Vector3 position = fallback.Position;
+        if (this.positionTimes.Count > 0) {
+            position = SampleVector3(this.positionTimes, this.positionValues, time);
+        }
+        Quaternion rotation = fallback.Rotation;
+        if (this.rotationTimes.Count > 0) {
+            rotation = SampleQuaternion(this.rotationTimes, this.rotationValues, time);
+        }
+        Vector3 scale = fallback.Scale;
+        if (this.scaleTimes.Count > 0) {
+            scale = SampleVector3(this.scaleTimes, this.scaleValues, time);
+        }
+        return new Transform3D(position, rotation, scale);
+    }
+
+    // 时间必须递增（等于上一个也允许——重复时间点取后者）。
+    private void CheckMonotonic(List<float> times, float time, string channel) {
+        if (times.Count > 0 && time < times[times.Count - 1]) {
+            throw new AnimationException(
+                "keyframe time must not go backwards on channel '" + channel + "': " + time.ToString());
+        }
+    }
+
+    // 向量通道采样（线性插值；两端取边界值）。
+    private static Vector3 SampleVector3(List<float> times, List<Vector3> values, float time) {
+        if (time <= times[0]) { return values[0]; }
+        int last = times.Count - 1;
+        if (time >= times[last]) { return values[last]; }
+        int i = 0;
+        while (i < last && times[i + 1] <= time) { i = i + 1; }
+        float span = times[i + 1] - times[i];
+        float t = 0.0f;
+        if (span > 0.0f) { t = (time - times[i]) / span; }
+        return Vector3.Lerp(values[i], values[i + 1], t);
+    }
+
+    // 旋转通道采样（球面插值；两端取边界值）。
+    private static Quaternion SampleQuaternion(List<float> times, List<Quaternion> values, float time) {
+        if (time <= times[0]) { return values[0]; }
+        int last = times.Count - 1;
+        if (time >= times[last]) { return values[last]; }
+        int i = 0;
+        while (i < last && times[i + 1] <= time) { i = i + 1; }
+        float span = times[i + 1] - times[i];
+        float t = 0.0f;
+        if (span > 0.0f) { t = (time - times[i]) / span; }
+        return AnimMath.Slerp(values[i], values[i + 1], t);
+    }
+}

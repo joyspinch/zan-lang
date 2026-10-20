@@ -1,0 +1,141 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+
+namespace Game.Animation;
+
+// 蒙皮网格：带骨骼权重的一组顶点。
+//
+// **线性混合蒙皮（LBS）**：一个顶点可以同时受多根骨骼影响，最终位置是各
+// 骨骼蒙皮矩阵作用结果的加权和。权重不必手工归一——蒙皮时按权重总和归一，
+// 免得"忘了归一"直接让模型缩小。
+//
+// **影响槽固定 4 个**：与主流引擎一致；超过 4 根骨骼同时影响一个顶点的
+// 收益极低，代价是每顶点多存数据。
+//
+// **顶点坐标是绑定姿势下的坐标**（模型空间），蒙皮后才变成当前姿势下的
+// 位置——这是蒙皮矩阵的定义（绑定姿势的逆 × 当前姿势）。
+//
+// **并发**：非线程安全。
+public class SkinMesh {
+    // 每个顶点的影响槽数。
+    public static int InfluenceSlots() { return 4; }
+
+    private List<Vector3> vertices;
+    // 每顶点 4 个骨骼下标（权重为 0 的槽填 0）。
+    private List<int> boneIndices;
+    // 每顶点 4 个权重。
+    private List<float> boneWeights;
+
+    public SkinMesh() {
+        this.vertices = new List<Vector3>();
+        this.boneIndices = new List<int>();
+        this.boneWeights = new List<float>();
+    }
+
+    // 顶点数。
+    public int VertexCount() { return this.vertices.Count; }
+
+    // 取顶点（绑定姿势下的位置）。
+    public Vector3 Vertex(int index) {
+        if (index < 0 || index >= this.vertices.Count) {
+            throw new AnimationException("vertex index out of range: " + index.ToString());
+        }
+        return this.vertices[index];
+    }
+
+    // 加一个只受一根骨骼影响的顶点。
+    public void AddVertex(Vector3 position, int boneIndex, float weight) {
+        this.AddVertexInfluenced(position, boneIndex, weight, 0, 0.0f);
+    }
+
+    // 加一个受两根骨骼影响的顶点。
+    public void AddVertexInfluenced(Vector3 position, int bone0, float weight0, int bone1, float weight1) {
+        this.vertices.Add(position);
+        this.boneIndices.Add(bone0);
+        this.boneIndices.Add(bone1);
+        this.boneIndices.Add(0);
+        this.boneIndices.Add(0);
+        this.boneWeights.Add(weight0);
+        this.boneWeights.Add(weight1);
+        this.boneWeights.Add(0.0f);
+        this.boneWeights.Add(0.0f);
+    }
+
+    // 设置某个顶点的某个影响槽（槽号 0..3）。
+    public void SetInfluence(int vertexIndex, int slot, int boneIndex, float weight) {
+        if (vertexIndex < 0 || vertexIndex >= this.vertices.Count) {
+            throw new AnimationException("vertex index out of range: " + vertexIndex.ToString());
+        }
+        if (slot < 0 || slot >= SkinMesh.InfluenceSlots()) {
+            throw new AnimationException("influence slot out of range: " + slot.ToString());
+        }
+        int baseIndex = vertexIndex * SkinMesh.InfluenceSlots();
+        this.boneIndices[baseIndex + slot] = boneIndex;
+        this.boneWeights[baseIndex + slot] = weight;
+    }
+
+    // 某顶点某影响槽的骨骼下标。
+    public int BoneIndex(int vertexIndex, int slot) {
+        int baseIndex = vertexIndex * SkinMesh.InfluenceSlots() + slot;
+        if (baseIndex < 0 || baseIndex >= this.boneIndices.Count) {
+            throw new AnimationException("influence slot out of range");
+        }
+        return this.boneIndices[baseIndex];
+    }
+
+    // 某顶点某影响槽的权重。
+    public float Weight(int vertexIndex, int slot) {
+        int baseIndex = vertexIndex * SkinMesh.InfluenceSlots() + slot;
+        if (baseIndex < 0 || baseIndex >= this.boneWeights.Count) {
+            throw new AnimationException("influence slot out of range");
+        }
+        return this.boneWeights[baseIndex];
+    }
+
+    // 把所有顶点的权重就地归一（权重和为 0 的顶点保持原样）。
+    public void NormalizeWeights() {
+        for (int v = 0; v < this.vertices.Count; v = v + 1) {
+            float total = 0.0f;
+            for (int s = 0; s < SkinMesh.InfluenceSlots(); s = s + 1) {
+                total = total + this.Weight(v, s);
+            }
+            if (total <= 0.0f) { continue; }
+            for (int s = 0; s < SkinMesh.InfluenceSlots(); s = s + 1) {
+                this.boneWeights[v * SkinMesh.InfluenceSlots() + s] = this.Weight(v, s) / total;
+            }
+        }
+    }
+
+    // 蒙皮单个顶点（当前姿势下的位置）。
+    public Vector3 SkinVertex(Skeleton skeleton, int vertexIndex) {
+        if (skeleton == null) {
+            throw new AnimationException("skeleton must not be null");
+        }
+        if (vertexIndex < 0 || vertexIndex >= this.vertices.Count) {
+            throw new AnimationException("vertex index out of range: " + vertexIndex.ToString());
+        }
+        Vector3 v = this.vertices[vertexIndex];
+        Vector3 sum = Vector3.Zero;
+        float total = 0.0f;
+        for (int s = 0; s < SkinMesh.InfluenceSlots(); s = s + 1) {
+            float w = this.Weight(vertexIndex, s);
+            if (w <= 0.0f) { continue; }
+            int bone = this.BoneIndex(vertexIndex, s);
+            Transform3D m = skeleton.SkinMatrix(bone);
+            sum = Vector3.Add(sum, Vector3.Multiply(m.TransformPoint(v), w));
+            total = total + w;
+        }
+        if (total <= 0.0f) { return v; }
+        return Vector3.Multiply(sum, 1.0f / total);
+    }
+
+    // 蒙皮整个网格（返回当前姿势下的顶点位置）。
+    public List<Vector3> Skin(Skeleton skeleton) {
+        List<Vector3> result = new List<Vector3>();
+        for (int i = 0; i < this.vertices.Count; i = i + 1) {
+            result.Add(this.SkinVertex(skeleton, i));
+        }
+        return result;
+    }
+}

@@ -1,0 +1,388 @@
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using Game.Animation;
+
+// 3D 动画管线契约测试：变换、骨架、蒙皮、动作片段、播放器、状态机、两骨 IK。
+//
+// 覆盖的判定点：
+//   - 变换：单位变换、组合顺序、父级缩放对子级位移的影响、求逆回代、
+//     方向变换不含平移；
+//   - 骨架：父在子前的约束、重名 / 越界报错、世界姿势递推、绑定姿势重置、
+//     世界姿势反解局部姿势；
+//   - 蒙皮：绑定姿势下顶点不动、位移后的顶点精确落位、旋转保持半径；
+//   - 片段：关键帧采样、时长自动延长、无轨道骨骼回落到绑定姿势、乱序关键帧报错；
+//   - 播放器：推进 / 循环 / 变速 / 播完停止；
+//   - 状态机：浮点参数触发、交叉淡化的权重曲线、触发器一次性；
+//   - 蒙皮网格：双骨权重混合、权重归一；
+//   - 两骨 IK：末端精确落到目标、骨长不变、够不着时朝向不歪。
+public class AnimationTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static bool Near(float a, float b) {
+        return AnimMath.Approximately(a, b, 0.001f);
+    }
+
+    private static bool NearVec(Vector3 v, float x, float y, float z) {
+        return Near(v.X, x) && Near(v.Y, y) && Near(v.Z, z);
+    }
+
+    private static Vector3 V(float x, float y, float z) {
+        return new Vector3(x, y, z);
+    }
+
+    private static Transform3D T(Vector3 pos) {
+        return new Transform3D(pos, Quaternion.Identity, Vector3.One);
+    }
+
+    // 三骨骨架：root → arm → fore，各段长 1，骨骼沿 +Y。
+    private static Skeleton MakeRig() {
+        Skeleton s = new Skeleton();
+        s.AddBone("root", -1);
+        s.AddBone("arm", 0, T(V(0.0f, 1.0f, 0.0f)));
+        s.AddBone("fore", 1, T(V(0.0f, 1.0f, 0.0f)));
+        return s;
+    }
+
+    public static void Run() {
+        TestTransform();
+        TestSkeleton();
+        TestSkinning();
+        TestClip();
+        TestPlayer();
+        TestStateMachine();
+        TestSkinMesh();
+        TestIk();
+
+        if (failures > 0) {
+            Console.WriteLine("ANIMATION TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL ANIMATION TESTS PASSED");
+        }
+    }
+
+    // ---- 变换 ----
+    private static void TestTransform() {
+        Transform3D id = Transform3D.Identity;
+        Check("transform-identity-point", NearVec(id.TransformPoint(V(1.0f, 2.0f, 3.0f)), 1.0f, 2.0f, 3.0f));
+
+        // 组合顺序：先子后父 —— 子位移 (0,1,0)，父位移 (1,0,0) → (1,1,0)。
+        Transform3D parent = T(V(1.0f, 0.0f, 0.0f));
+        Transform3D child = T(V(0.0f, 1.0f, 0.0f));
+        Transform3D composed = Transform3D.Compose(parent, child);
+        Check("transform-compose-order", NearVec(composed.Position, 1.0f, 1.0f, 0.0f));
+
+        // 父级缩放要吃掉子级位移：父 (scale 2, pos (1,0,0)) + 子 (0,1,0) → (1,2,0)。
+        Transform3D scaledParent = new Transform3D(V(1.0f, 0.0f, 0.0f), Quaternion.Identity, V(2.0f, 2.0f, 2.0f));
+        Transform3D scaled = Transform3D.Compose(scaledParent, child);
+        Check("transform-compose-parent-scale", NearVec(scaled.Position, 1.0f, 2.0f, 0.0f));
+
+        // 求逆回代：逆再复合应回到原变换。
+        Transform3D inv = composed.Inverse();
+        Transform3D back = Transform3D.Compose(inv, composed);
+        Check("transform-inverse-roundtrip", NearVec(back.Position, 0.0f, 0.0f, 0.0f));
+
+        // 方向变换不含平移。
+        Check("transform-direction-no-translation", NearVec(parent.TransformDirection(V(0.0f, 1.0f, 0.0f)), 0.0f, 1.0f, 0.0f));
+
+        // 缩放过的变换求逆后回代点位置。
+        Transform3D scaledRot = new Transform3D(V(2.0f, 0.0f, 0.0f), Quaternion.Identity, V(2.0f, 2.0f, 2.0f));
+        Vector3 probe = V(1.0f, 0.0f, 0.0f);
+        Vector3 there = scaledRot.TransformPoint(probe);
+        Vector3 backPoint = scaledRot.Inverse().TransformPoint(there);
+        Check("transform-inverse-point", NearVec(backPoint, 1.0f, 0.0f, 0.0f));
+    }
+
+    // ---- 骨架 ----
+    private static void TestSkeleton() {
+        Skeleton s = MakeRig();
+
+        bool threw = false;
+        try {
+            s.AddBone("arm", 0);
+        } catch (AnimationException) {
+            threw = true;
+        }
+        Check("skeleton-duplicate-name-rejected", threw);
+
+        threw = false;
+        try {
+            s.AddBone("bad", 99);
+        } catch (AnimationException) {
+            threw = true;
+        }
+        Check("skeleton-bad-parent-rejected", threw);
+
+        Check("skeleton-find", s.Find("fore") != null && s.Find("nope") == null);
+        Check("skeleton-index-of", s.IndexOf("arm") == 1 && s.IndexOf("nope") == -1);
+
+        // 世界姿势递推：root(0) → arm(0,1,0) → fore(0,2,0)。
+        Check("skeleton-world-pose", NearVec(s.WorldPosition(2), 0.0f, 2.0f, 0.0f));
+
+        // 局部姿势写回去，世界姿势跟着变。
+        s.SetLocalPose(1, T(V(0.0f, 3.0f, 0.0f)));
+        Check("skeleton-set-local-pose", NearVec(s.WorldPosition(2), 0.0f, 4.0f, 0.0f));
+
+        // 重置回绑定姿势。
+        s.ResetToBindPose();
+        Check("skeleton-reset-bind-pose", NearVec(s.WorldPosition(2), 0.0f, 2.0f, 0.0f));
+
+        // 世界姿势反解：把 arm 放到世界 (0,5,0)，局部应是 (0,5,0)（父级在原点）。
+        s.SetWorldPose(1, T(V(0.0f, 5.0f, 0.0f)));
+        Check("skeleton-set-world-pose", NearVec(s.LocalPose(1).Position, 0.0f, 5.0f, 0.0f));
+        Check("skeleton-set-world-pose-world", NearVec(s.WorldPosition(1), 0.0f, 5.0f, 0.0f));
+    }
+
+    // ---- 蒙皮 ----
+    private static void TestSkinning() {
+        Skeleton s = MakeRig();
+        s.CacheBindInv();
+
+        SkinMesh mesh = new SkinMesh();
+        mesh.AddVertex(V(1.0f, 2.0f, 0.0f), 2, 1.0f);
+
+        // 绑定姿势下蒙皮不动顶点。
+        List<Vector3> rest = mesh.Skin(s);
+        Check("skin-bind-pose-identity", NearVec(rest[0], 1.0f, 2.0f, 0.0f));
+
+        // 把 arm 抬高 1 → fore 的蒙皮矩阵整体上移 1。
+        s.SetLocalPose(1, T(V(0.0f, 2.0f, 0.0f)));
+        List<Vector3> moved = mesh.Skin(s);
+        Check("skin-translation", NearVec(moved[0], 1.0f, 3.0f, 0.0f));
+
+        // 绕 Y 转 90°：y 分量不变，xz 半径不变。
+        s.SetLocalPose(1, new Transform3D(V(0.0f, 2.0f, 0.0f),
+            Quaternion.FromAxisAngle(Vector3.UnitY, 1.5707963f), Vector3.One));
+        List<Vector3> rotated = mesh.Skin(s);
+        float radius = AnimMath.Sqrt(rotated[0].X * rotated[0].X + rotated[0].Z * rotated[0].Z);
+        Check("skin-rotation-radius", Near(rotated[0].Y, 3.0f) && Near(radius, 1.0f));
+    }
+
+    // ---- 动作片段 ----
+    private static void TestClip() {
+        Skeleton s = MakeRig();
+        AnimationClip clip = new AnimationClip("walk", 0.0f);
+        clip.AddPositionKey("root", 0.0f, V(0.0f, 0.0f, 0.0f));
+        clip.AddPositionKey("root", 1.0f, V(2.0f, 0.0f, 0.0f));
+        Check("clip-duration-extends", Near(clip.Duration, 1.0f));
+
+        PoseBuffer buf = new PoseBuffer(s.Count());
+        clip.SampleTo(s, 0.5f, buf);
+        Check("clip-sample-lerp", NearVec(buf.At(0).Position, 1.0f, 0.0f, 0.0f));
+
+        // 没有轨道的骨骼回落到绑定姿势。
+        Check("clip-fallback-bind-pose", NearVec(buf.At(1).Position, 0.0f, 1.0f, 0.0f));
+
+        // 超出末尾取末尾值。
+        clip.SampleTo(s, 5.0f, buf);
+        Check("clip-clamp-past-end", NearVec(buf.At(0).Position, 2.0f, 0.0f, 0.0f));
+
+        // 旋转通道按球面插值：0° → 90° 绕 Y，中点是 45°。
+        AnimationClip rot = new AnimationClip("turn", 1.0f);
+        rot.AddRotationKey("root", 0.0f, Quaternion.Identity);
+        rot.AddRotationKey("root", 1.0f, Quaternion.FromAxisAngle(Vector3.UnitY, 1.5707963f));
+        PoseBuffer rbuf = new PoseBuffer(s.Count());
+        rot.SampleTo(s, 0.5f, rbuf);
+        Vector3 expected = Quaternion.Rotate(V(1.0f, 0.0f, 0.0f), Quaternion.FromAxisAngle(Vector3.UnitY, 0.7853982f));
+        Vector3 actual = Quaternion.Rotate(V(1.0f, 0.0f, 0.0f), rbuf.At(0).Rotation);
+        Check("clip-rotation-slerp", NearVec(actual, expected.X, expected.Y, expected.Z));
+
+        // 正好差 180° 时插值方向必须确定：按目标自身的轴走，不能被浮点噪声
+        // 翻到反方向（否则人物会朝反方向转身）。
+        AnimationClip half = new AnimationClip("half", 1.0f);
+        half.AddRotationKey("root", 0.0f, Quaternion.Identity);
+        half.AddRotationKey("root", 1.0f, Quaternion.FromAxisAngle(Vector3.UnitY, 3.14159265f));
+        PoseBuffer hbuf = new PoseBuffer(s.Count());
+        half.SampleTo(s, 0.5f, hbuf);
+        Vector3 halfExpected = Quaternion.Rotate(V(1.0f, 0.0f, 0.0f), Quaternion.FromAxisAngle(Vector3.UnitY, 1.5707963f));
+        Vector3 halfActual = Quaternion.Rotate(V(1.0f, 0.0f, 0.0f), hbuf.At(0).Rotation);
+        Check("clip-rotation-180-deterministic", NearVec(halfActual, halfExpected.X, halfExpected.Y, halfExpected.Z));
+
+        // 乱序关键帧报错。
+        bool threw = false;
+        try {
+            clip.AddPositionKey("root", 0.2f, V(0.0f, 0.0f, 0.0f));
+        } catch (AnimationException) {
+            threw = true;
+        }
+        Check("clip-key-order-rejected", threw);
+
+        // 姿势缓冲长度与骨骼数不符时报错。
+        threw = false;
+        try {
+            clip.SampleTo(s, 0.0f, new PoseBuffer(1));
+        } catch (AnimationException) {
+            threw = true;
+        }
+        Check("clip-pose-size-checked", threw);
+    }
+
+    // ---- 播放器 ----
+    private static void TestPlayer() {
+        Skeleton s = MakeRig();
+        AnimationClip clip = new AnimationClip("move", 1.0f);
+        clip.AddPositionKey("root", 0.0f, V(0.0f, 0.0f, 0.0f));
+        clip.AddPositionKey("root", 1.0f, V(10.0f, 0.0f, 0.0f));
+
+        AnimationPlayer player = new AnimationPlayer(s);
+        player.Play(clip);
+        player.Update(0.25f);
+        Check("player-time", Near(player.Time, 0.25f));
+        Check("player-applies-pose", NearVec(s.WorldPosition(0), 2.5f, 0.0f, 0.0f));
+
+        // 循环：走完一圈回到 0。
+        player.Update(1.0f);
+        Check("player-loop-wrap", Near(player.Time, 0.25f) && player.IsPlaying);
+
+        // 变速。
+        player.Speed = 2.0f;
+        player.Update(0.25f);
+        Check("player-speed", Near(player.Time, 0.75f));
+
+        // 不循环：播完停在末尾并停止。
+        player.Loop = false;
+        player.Time = 0.9f;
+        player.Update(0.5f);
+        Check("player-stops-at-end", Near(player.Time, 1.0f) && !player.IsPlaying);
+    }
+
+    // ---- 状态机 ----
+    private static void TestStateMachine() {
+        Skeleton s = MakeRig();
+
+        AnimationClip holdA = new AnimationClip("holdA", 1.0f);
+        holdA.AddPositionKey("root", 0.0f, V(10.0f, 0.0f, 0.0f));
+        holdA.AddPositionKey("root", 1.0f, V(10.0f, 0.0f, 0.0f));
+        AnimationClip holdB = new AnimationClip("holdB", 1.0f);
+        holdB.AddPositionKey("root", 0.0f, V(0.0f, 0.0f, 0.0f));
+        holdB.AddPositionKey("root", 1.0f, V(0.0f, 0.0f, 0.0f));
+
+        AnimationStateMachine sm = new AnimationStateMachine();
+        sm.AddState("a", holdA);
+        sm.AddState("b", holdB);
+        sm.AddTransition(AnimationTransition.OnFloat("a", "b", "speed", 1.0f, 1.0f));
+        sm.SetState("a");
+
+        // 参数没到阈值：不转移。
+        sm.SetFloat("speed", 0.5f);
+        sm.Update(s, 0.1f);
+        Check("statemachine-no-transition", sm.CurrentStateName() == "a" && !sm.IsFading());
+
+        // 参数到阈值：转移并开始淡化。
+        sm.SetFloat("speed", 2.0f);
+        sm.Update(s, 0.5f);
+        Check("statemachine-transition", sm.CurrentStateName() == "b" && sm.IsFading());
+        Check("statemachine-fade-start", NearVec(s.WorldPosition(0), 10.0f, 0.0f, 0.0f));
+
+        // 淡化中点：两段姿势各占一半。
+        sm.Update(s, 0.5f);
+        Check("statemachine-fade-mid", NearVec(s.WorldPosition(0), 5.0f, 0.0f, 0.0f));
+
+        // 淡化结束：完全落在新状态上。
+        sm.Update(s, 0.5f);
+        Check("statemachine-fade-end", !sm.IsFading() && NearVec(s.WorldPosition(0), 0.0f, 0.0f, 0.0f));
+
+        // 触发器是一次性的。
+        AnimationStateMachine sm2 = new AnimationStateMachine();
+        sm2.AddState("a", holdA);
+        sm2.AddState("b", holdB);
+        sm2.AddTransition(AnimationTransition.OnTrigger("a", "b", "hit", 0.0f));
+        sm2.SetState("a");
+        sm2.Trigger("hit");
+        sm2.Update(s, 0.1f);
+        Check("statemachine-trigger", sm2.CurrentStateName() == "b");
+
+        sm2.SetState("a");
+        sm2.Update(s, 0.1f);
+        Check("statemachine-trigger-consumed", sm2.CurrentStateName() == "a");
+
+        // 布尔参数触发。
+        AnimationStateMachine sm3 = new AnimationStateMachine();
+        sm3.AddState("a", holdA);
+        sm3.AddState("b", holdB);
+        sm3.AddTransition(AnimationTransition.OnBool("a", "b", "open", 0.0f));
+        sm3.SetState("a");
+        sm3.SetBool("open", true);
+        sm3.Update(s, 0.1f);
+        Check("statemachine-bool-param", sm3.CurrentStateName() == "b");
+
+        // 指向不存在状态的转移报错。
+        bool threw = false;
+        try {
+            sm3.AddTransition(AnimationTransition.OnBool("a", "ghost", "open", 0.0f));
+        } catch (AnimationException) {
+            threw = true;
+        }
+        Check("statemachine-unknown-state-rejected", threw);
+    }
+
+    // ---- 蒙皮网格权重 ----
+    private static void TestSkinMesh() {
+        Skeleton s = MakeRig();
+        s.CacheBindInv();
+
+        SkinMesh mesh = new SkinMesh();
+        mesh.AddVertexInfluenced(V(1.0f, 2.0f, 0.0f), 1, 0.75f, 2, 0.25f);
+        List<Vector3> skinned = mesh.Skin(s);
+
+        // 两骨都在绑定姿势上 → 顶点不动（权重和为 1）。
+        Check("skinmesh-weighted-rest", NearVec(skinned[0], 1.0f, 2.0f, 0.0f));
+
+        // 权重未归一（3:1）也要得到同样的结果——蒙皮时按总和归一。
+        SkinMesh raw = new SkinMesh();
+        raw.AddVertexInfluenced(V(1.0f, 2.0f, 0.0f), 1, 3.0f, 2, 1.0f);
+        List<Vector3> rawSkinned = raw.Skin(s);
+        Check("skinmesh-weight-normalized", NearVec(rawSkinned[0], 1.0f, 2.0f, 0.0f));
+
+        // 归一后权重确实是 0.75 / 0.25。
+        raw.NormalizeWeights();
+        Check("skinmesh-normalize-weights", Near(raw.Weight(0, 0), 0.75f) && Near(raw.Weight(0, 1), 0.25f));
+    }
+
+    // ---- 两骨 IK ----
+    private static void TestIk() {
+        Skeleton s = MakeRig();
+        s.AddBone("tip", 2, T(V(0.0f, 1.0f, 0.0f)));
+
+        Vector3 target = V(1.0f, 1.0f, 0.0f);
+        Vector3 pole = V(0.0f, 0.0f, 1.0f);
+        bool ok = TwoBoneIk.Solve(s, 0, 1, 2, target, pole);
+        Check("ik-solved", ok);
+
+        // 末端（fore）精确落在目标上。
+        Vector3 end = s.WorldPosition(2);
+        Check("ik-end-effector-hits-target", NearVec(end, target.X, target.Y, target.Z));
+
+        // 两段骨长不变。
+        float upper = Vector3.Distance(s.WorldPosition(0), s.WorldPosition(1));
+        float lower = Vector3.Distance(s.WorldPosition(1), s.WorldPosition(2));
+        Check("ik-bone-lengths-kept", Near(upper, 1.0f) && Near(lower, 1.0f));
+
+        // 够不着：手臂伸直指向目标，方向不歪。
+        Skeleton far = MakeRig();
+        far.AddBone("tip", 2, T(V(0.0f, 1.0f, 0.0f)));
+        Vector3 farTarget = V(0.0f, 10.0f, 0.0f);
+        TwoBoneIk.Solve(far, 0, 1, 2, farTarget, pole);
+        Vector3 mid = far.WorldPosition(1);
+        Vector3 tip = far.WorldPosition(2);
+        Vector3 toTip = Vector3.Subtract(tip, mid);
+        Vector3 want = Vector3.Subtract(farTarget, mid);
+        Vector3 cross = Vector3.Cross(AnimMath.Normalize(toTip), AnimMath.Normalize(want));
+        Check("ik-unreachable-points-at-target",
+            AnimMath.Normalize(toTip).Length() > 0.0f
+            && AnimMath.Normalize(cross).Length() < 0.01f);
+    }
+}
+
+public class AnimationTestsMain {
+    public static void Main() {
+        AnimationTests.Run();
+    }
+}
