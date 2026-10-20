@@ -308,7 +308,7 @@ App.html + 游戏自己的皮肤。坑与定式，每条都是踩过才成立的
 
 IGuiHostLoop.Event 的 kind 编码与 Win32Shell/App 控件分发是同一套：
 **1=鼠标移动、2=鼠标按下、3=鼠标释放、4=键按下、5=键抬起**。GuiHost
-接口注释曾把 1/2 写反，六个游戏模板照错文档编码——鼠标移动被当点击、
+接口注释曾把 1/2 写反，六个游戏（当时是仓库内模板）照错文档编码——鼠标移动被当点击、
 真实点击被忽略："无输入自动放钩"类缺陷就来自（一次游离
 WM_MOUSEMOVE 就放一钩），gomoku/ddz 真机鼠标操作等于乱落子/乱选牌。
 修的是文档 + 同批修模板。键盘 keycode = Windows VK
@@ -372,7 +372,8 @@ Post 调用核对编码，别信二手注释。
 
 ## SceneRouter/HtmlScene 迁移定式（menu/play/over 三场景；范式模板在 templates/gui/gui-scene-router）
 
-批次实证（breakout/snake/gomoku/weiqi/xiangqi/ddz/goldminer，2026-10）：
+批次实证（breakout/snake/gomoku/weiqi/xiangqi/ddz/goldminer，2026-10；
+这批当时是仓库内模板，现已搬出仓库，独立项目在 D:/project/games/ 下）：
 
 - **引擎类只留仿真**：删 `host`/`scene` 字段与 OnKey/Render 分发；**Create
   里 `g.c = h.App.canvas` 必须删**——Register 阶段 App 还是 null，留着
@@ -438,6 +439,7 @@ Post 调用核对编码，别信二手注释。
   present——症状是壳 chrome/标题正常、游戏场景全黑只剩 Clear 色，
   logcat 无任何错误、循环照跑。定式：Render 每帧把传入参数同步给
   游戏对象（`this.g.c = c;`），别在 Start 抓。坑出处：goldminer
+  （现为仓库外项目 D:/project/games/goldminer）
   APK 黑屏，探针逐段排除（v1 参数画全亮 → v2 复刻 goldminer 原语
   全亮）才定位到画布身份，不是图元/字体/资产问题。
 - **视口适配（StageViewport 契约，零黑边）**：GuiHost.Run 每帧在

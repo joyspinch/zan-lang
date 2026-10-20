@@ -225,7 +225,6 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 | 模板路径 | 游戏类型 | 核心集成引擎特性 |
 |---|---|---|
 | `templates/game/roguelike` | 肉鸽卡牌构筑 (杀戮尖塔 / 肉鸽) | 种子决定地图与奖励三选一 + 三区牌堆 + 能量回合结算 |
-| `templates/game/ddz` | 策略卡牌 (斗地主) | 牌型识别 + AI 对手 + 牌面动画 |
 | `templates/game/rts` | 即时战略 (RTS / 红警 / 魔兽) | `FlowField` 宏观寻路 + `RvoSimulator` 群体避障 + 小地图雷达 + 框选移动 |
 | `templates/game/idle` | 放置挂机 (暗黑挂机 / 放置骑士) | `OfflineRewardCalculator` 离线收益 + `SquashAndStretch` 弹性反馈 + `FloatingText` 飘字池 |
 
@@ -236,12 +235,19 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 | `D:/project/games/legend` | 2.5D 动作 RPG (传奇 / 暗黑) + 配套服务端 | 八方向朝向 + 5方向镜像 + 纸娃娃图层排序 + 怪物巡逻 + 掉落物散射；客户端与服务端同项目，规则表单向同步 |
 | `D:/project/games/wuwei` | 数据驱动修仙 RPG | HTML 设计稿投影 + 境界成长 + 炼制 + 转生 + 本地存档 |
 | `D:/project/games/coreforge` | 工厂自动化塔防 (Mindustry / 异星工厂) | 传送带物流 + 熔炼链 + 20 波塔防；逻辑层在仓库的 `Zan.Game.Factory` 包里，项目通过 `$env:ZAN_HOME` 吃仓库的公共包 |
+| `D:/project/games/xiangqi` | 中国象棋 | 极小化 AI + 合法着提示 + 将帅警告（素材约 9MB） |
+| `D:/project/games/weiqi` | 围棋 | 19 路 + 目数评估 AI + 提子动画 + 打劫规则 |
+| `D:/project/games/gomoku` | 五子棋 | 15×15 + 启发式 AI + 悬停预览 + 连珠高亮 |
+| `D:/project/games/ddz` | 斗地主 | 叫地主 + 牌型组合出牌 + 牌面动画（单机对两家 AI） |
+| `D:/project/games/goldminer` | 黄金矿工 | 摆钩抓金 + 连击 FEVER + 收线/拆弹 QTE + TNT 连锁 |
+| `D:/project/games/breakout` | 打砖块 | 发光砖块 + 道具掉落 + 多球乱斗 |
 
 导出与回填用 [`scripts/export_game_project.ps1`](../scripts/export_game_project.ps1)：
 它把模板连同测试套件复制到仓库外、改写所有仓库路径引用、退掉模板身份
 （删 manifest、`{{NAME}}` 落实名）、补一份 `PROJECT.md`，并可 `git init` 出独立历史。
-搬出前的版本留在 `archive/game-legend-2026-10-20` 与 `archive/game-wuwei-2026-10-20`
-两个标签上；仓库里已没有源目录，需要重新导出时用 `-SourceRef <标签>` 从标签取源。
+搬出前的版本留在 `archive/<名字>-<日期>` 标签上（如 `archive/game-legend-2026-10-20`、
+`archive/coreforge-2026-10-20`、`archive/xiangqi-2026-10-20`）；
+仓库里已没有源目录，需要重新导出时用 `-SourceRef <标签>` 从标签取源。
 
 完整矩阵（含棋类、街机、平台、益智各品类）见
 [`templates/game/README.md`](../templates/game/README.md)——那里按品类列了每个

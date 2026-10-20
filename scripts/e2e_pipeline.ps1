@@ -5,7 +5,7 @@
 # root:
 #   powershell -ExecutionPolicy Bypass -File scripts\e2e_pipeline.ps1
 # Narrow to a subset while iterating (wildcards allowed):
-#   powershell -ExecutionPolicy Bypass -File scripts\e2e_pipeline.ps1 -Only goldminer
+#   powershell -ExecutionPolicy Bypass -File scripts\e2e_pipeline.ps1 -Only snake
 #   ... -Only "gui-web*"
 param([string]$Only = "")
 $ErrorActionPreference = "Continue"

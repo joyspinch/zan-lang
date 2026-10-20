@@ -14,14 +14,8 @@ IDE 的"新建项目"按这个标签分组。
 
 | 品类 | 模板 | 引擎模块 | 说明 |
 |------|------|----------|------|
-| 街机 Arcade | [breakout](breakout/) | `Game.Arcade2D` | 打砖块：发光砖块、道具掉落、多球 |
 | 街机 Arcade | [snake](snake/) | `Game.Arcade2D` | 无限画布贪吃蛇竞技场 + AI 蛇 |
-| 街机 Arcade | [goldminer](goldminer/) | `Game.Arcade2D` | 黄金矿工：摆钩抓金、连锁与 QTE |
 | 街机 Arcade | [pin-circle](pin-circle/) | `Game.Arcade2D` | 见缝插针：旋转插针、变速与反向回合 |
-| 棋类 Board | [gomoku](gomoku/) | `Game.Board` | 15×15 五子棋：启发式 AI、悬停预览、胜利高亮 |
-| 棋类 Board | [weiqi](weiqi/) | `Game.Board` | 19×19 围棋：目数评估 AI、提子动画、打劫 |
-| 棋类 Board | [xiangqi](xiangqi/) | `Game.Board` | 中国象棋：极小化 AI、合法着提示、将帅警告 |
-| 卡牌 Card | [ddz](ddz/) | `Game.Cards` | 斗地主：叫地主、组合出牌、牌面动画 |
 | 卡牌 Card | [roguelike](roguelike/) | `Game.Cards` + `Game.Foundation` | 肉鸽爬塔：种子决定地图/敌人/奖励三选一 |
 | 策略塔防 Strategy | [rts](rts/) | `Game.Tactics` | 即时战术：流场寻路 + RVO 群体避障 + 小地图 |
 | 益智解谜 Puzzle | [trap-cat](trap-cat/) | `Game.Board` | 围住神经猫：逐点封堵、撤销、最短路 AI |
@@ -39,6 +33,12 @@ IDE 的"新建项目"按这个标签分组。
 | `D:/project/games/legend` | 2.5D 动作 RPG + 配套服务端 | 传奇放置挂机：CSV 数据驱动、离线收益、存档；项目内 `client/` 与 `server/` 分目录，规则表单向同步 |
 | `D:/project/games/wuwei` | 数据驱动修仙 RPG | 无为修仙传：水墨修仙，HTML 设计稿 + 代码隐藏 |
 | `D:/project/games/coreforge` | 工厂自动化 + 塔防 | 炉心边境：传送带物流 + 熔炼链 + 20 波塔防；逻辑层在仓库的 `Zan.Game.Factory` 包里（项目通过 `$env:ZAN_HOME` 吃仓库的公共包） |
+| `D:/project/games/xiangqi` | 中国象棋 | 极小化 AI、合法着提示、将帅警告；素材约 9MB |
+| `D:/project/games/weiqi` | 围棋 | 19 路、目数评估 AI、提子动画、打劫 |
+| `D:/project/games/gomoku` | 五子棋 | 15×15、启发式 AI、悬停预览、连珠高亮 |
+| `D:/project/games/ddz` | 斗地主 | 叫地主、牌型组合出牌、牌面动画，与两家 AI 对战 |
+| `D:/project/games/goldminer` | 黄金矿工 | 摆钩抓金、连击 FEVER、收线/拆弹 QTE、TNT 连锁 |
+| `D:/project/games/breakout` | 打砖块 | 发光砖块、道具掉落、多球乱斗 |
 
 搬迁用 [`scripts/export_game_project.ps1`](../../scripts/export_game_project.ps1)
 （复制 + 改写仓库路径引用 + 退模板身份 + `git init`）。仓库里若还需要留一份

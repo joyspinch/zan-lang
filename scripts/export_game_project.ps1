@@ -406,9 +406,9 @@ $archiveNote = ''
 if ($movedOut) {
     $tag = (& git -C $repo tag --list "archive/*$templateName*" 2>$null | Select-Object -Last 1)
     $archiveNote = if ($tag) {
-        "> 该模板已搬出语言仓库（体量超出示例级模板位），历史版本在 ``$tag`` 标签上。`n> 公共包（Game.Kit / Game.Foundation.Gui / Gui）仍由 zan-lang 仓库提供。"
+        "`n> 该模板已搬出语言仓库（体量超出示例级模板位），历史版本在 ``$tag`` 标签上。`n> 公共包（Game.Kit / Game.Foundation.Gui / Gui）仍由 zan-lang 仓库提供。"
     }
-    else { '> 该模板已搬出语言仓库。' }
+    else { "`n> 该模板已搬出语言仓库。" }
 }
 
 $projectDoc = @'
@@ -420,7 +420,6 @@ $projectDoc = @'
 ## 目录
 
 {{TREE}}
-
 {{ARCHIVENOTE}}
 所有命令都在**项目根**下执行（路径一律相对项目根）。
 
@@ -453,13 +452,14 @@ Copy-Item -Recurse <zan-lang>/packages/<Name> packages/<Name>
 {{SERVERSECTION}}
 '@
 $projectDoc = $projectDoc.Replace('{{TREE}}', ($treeLines -join "`n")).
-    Replace('{{ARCHIVENOTE}}', $archiveNote).
     Replace('{{TESTCMDS}}', ($testCmds -join "`n")).
     Replace('{{SERVERSECTION}}', $serverSection).
     Replace('{{NAME}}', $templateName).
     Replace('{{TEMPLATE}}', $Template).
     Replace('{{DATE}}', (Get-Date -Format 'yyyy-MM-dd')).
     Replace('{{SERVER}}', $SiblingAlias)
+# 归档注记：为空时连同占位行一起去掉，别留空行
+$projectDoc = [regex]::Replace($projectDoc, '\{\{ARCHIVENOTE\}\}\r?\n', $(if ($archiveNote) { $archiveNote + "`n" } else { '' }))
 [IO.File]::WriteAllText((Join-Path $target 'PROJECT.md'), $projectDoc, [Text.UTF8Encoding]::new($false))
 
 # 独立项目自己的 .gitignore：构建产物与临时目录不进版本库

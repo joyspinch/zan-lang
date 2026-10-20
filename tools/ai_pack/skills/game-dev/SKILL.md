@@ -372,7 +372,8 @@ Post 调用核对编码，别信二手注释。
 
 ## Zan 游戏模板迁 SceneRouter/HtmlScene 定式（menu/play/over 三场景）
 
-批次实证（打砖块/贪吃蛇/五子棋/围棋/象棋/斗地主/黄金矿工七个模板，2026-10）：
+批次实证（打砖块/贪吃蛇/五子棋/围棋/象棋/斗地主/黄金矿工七个游戏，2026-10；
+这批当时是仓库内模板，现已搬出仓库作为独立项目）：
 
 - **引擎类只留仿真**：删 `host`/`scene` 字段与 OnKey/Render 分发；**Create
   里 `g.c = h.App.canvas` 必须删**——Register 阶段 App 还是 null，留着
