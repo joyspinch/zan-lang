@@ -30,3 +30,22 @@
   Lambda 表达式和局部函数捕获外部局部变量时，捕获的是变量的存储单元（Cell），以便在闭包内外实现共享修改。对闭包对象的保活必须遵循引用计数协议。
 - **可空分析穿透复合控制流**：
   在进行可空性检查（Nullability Check）和空值守卫扫描时，静态分析必须穿透 `lock` 等同步块语句，同时核验锁体内外表达式与返回语句，避免误报合法的空值守卫逻辑。
+## 5. 前端模糊测试的 harness 纪律
+
+- **harness 必须和被测程序一样预留大栈**：编译 fuzz harness 时带上与 `zanc`
+  一致的栈预留（Windows MSVC 目标：`-Xlinker /STACK:33554432`；GNU ld：
+  `-Wl,--stack,33554432`）。
+  - 坑出处：不带时 harness 用的是进程默认 1MB 栈，**约 50 层括号嵌套就爆栈**，
+    1560 个变异体里 23 个报 stack-overflow，看着像编译器有内存缺陷；实际上解析器
+    有 `ZAN_PARSER_MAX_EXPR_DEPTH=512` 守卫（`src/compiler/parser.c:1573`），
+    真 `zanc` 上同样的输入报的是 "expression nesting too deep (max 512)"。
+  - 判定：肇事输入原样喂给真 `zanc`——真程序给诊断而 harness 崩，是 harness 的
+    栈配置问题；真 `zanc` 也崩才是产品缺陷。
+- **先拿 artifact 再下结论**：libFuzzer 把肇事输入写在 `-artifact_prefix` 指定的
+  目录；先拿那个文件单点复现，再判断是产品缺陷还是 harness 假阳性。
+- **Windows 下 ASan 是动态库**：`clang_rt.asan_dynamic-<arch>.dll` 必须与宿主架构
+  一致（x64 机器拷 aarch64 的会得到 0xC0000135 DLL 找不到），并放在 harness
+  可执行文件旁边或加入 PATH。
+- 现成入口：`tests/fuzz/fuzz_frontend.c`（libFuzzer 入口，覆盖
+  lexer/parser/nsresolve/binder/checker）+ `scripts/fuzz_frontend.ps1`
+  （编译 + 播种语料 + 跑 + 收集 artifact）。

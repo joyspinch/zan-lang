@@ -8,6 +8,45 @@
 
 ## 未完成
 
+### [ ] A441 布尔值→字符串的渲染有三条口径：`true` / `1` / `x1`
+
+- 现象（2026-10-20 探针 `_scratch/bool_str.zan`，C 宿主 `build/zanc.exe` 实测）：
+  ```zan
+  bool b = true;
+  Console.WriteLine(b);                 // true
+  Console.WriteLine(b.ToString());      // true
+  Console.WriteLine(Convert.ToString(b)); // 1    ← 不一致
+  Console.WriteLine("x" + b);           // x1    ← 不一致
+  Console.WriteLine($"{b}");            // true
+  ```
+  同一个 `bool`，三条路径给出三种字符串。
+- 根因：**没有统一的「bool→字符串」内建**，每条路径各写各的：
+  - `src/compiler/irgen_call.c:1878-1924`：`Convert.ToString(x)` 的编译器内建特判
+    里**没有 bool 分支**——bool 落到末尾的 `emit_itoa_into`，按整数格式化 → `"1"`。
+  - `src/compiler/irgen_generics.c:2439-2491` `emit_to_cstr_of`（字符串拼接用的
+    取串路径）：同样没有 bool 分支，落到 `emit_to_cstr_u` → 整数格式化 → `"1"`。
+  - `src/compiler/irgen_call.c:1074-1081`（`Console.WriteLine`）与
+    `src/compiler/irgen_expr.c:6453-6461`（插值）：**有** bool 分支 →
+    `select "true"/"false"`。
+  - 自举后端同病：`src/selfhost/irgen_expr.zan:933-956` `ToCStr` 没有 bool 分支
+    → `"1"`；但同文件 `4273-4274` 的标量 `ToString` 有 bool 分支 → `"true"`。
+    所以**两个后端当前输出一致**（都是 "1"），差分门是绿的——这不是后端分歧，
+    是两边各自都有的语义缺口。
+- 影响：`Convert.ToString(b)` 与 `"x" + b` 拿到的不是 `"true"`；按字符串比对、
+  落库、拼消息的代码会踩坑，而且**同一个值在不同上下文里长得不一样**。
+- 方向：统一到 **`true` / `false`**（与已有的 `ToString()` / `Console.WriteLine`
+  口径一致）。C 宿主侧已有现成的 bool→串内建
+  `emit_value_as_cstr`（`src/compiler/irgen_generics.c:2022-2038`，内部已做
+  `select "true"/"false"`），照它补分支即可：
+  1. `src/compiler/irgen_call.c:1878` 的 `Convert.ToString` 特判：加 bool 分支，
+     复用 `emit_value_as_cstr` 的 `select "true"/"false"` 写法。
+  2. `src/compiler/irgen_generics.c:2439` `emit_to_cstr_of`：加 bool 分支
+     （拼接路径），可用 `expr_is_bool(g, ast, locals)` 判型。
+  3. 自举后端 `src/selfhost/irgen_expr.zan:933` `ToCStr`：加同样的 bool 分支。
+- ⚠ 3 步必须**同一次提交**落地：只改 C 宿主会让差分门
+  （`tests/selfhost/diff_cases.txt`）打红——两个后端当前都输出 "1"，改一边就分叉。
+- 影响面：改完要 grep 全部用 `Convert.ToString(<bool>)` / `<bool>` 参与拼接的
+  用例与 golden（现有 golden 已把 "1" 固化在部分用例里）。
 ### [ ] A440 一元 `+` 表达式根本解析不了——`+x` 报 "unexpected token '+'"
 
 - 现象：`+a`（一元正号）在**解析期**就被拒：`unexpected token '+' in expression`；
