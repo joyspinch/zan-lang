@@ -1,24 +1,27 @@
-# Image2 生成 Prompt 存档（兔子 VI）
+# Image2 生成 Prompt 存档（科技兔 VI）
 
 吉祥物与图标原图由 gpt-image-2 一次性生成（1024×1024，纯色绿幕底，
 `#00FF00`），本文件是可复现的权威 prompt。抠底/切尺寸/ico 由
 `postprocess.py` 完成；矢量源（SVG）为手绘几何版，与生成图同一套
 图案规则，两者共同构成权威资产。
 
-## 角色卡（五姿态共用前缀）
+## 角色卡（六姿态共用前缀）
 
 ```text
-Zanzi the bunny: a chubby chibi baby rabbit with an adorably plump pear-shaped
-body, squishy round belly, chubby cheeks and fat round thighs, covered in round
-fluffy cream-white fur (body color #FFF6E8), two long upright ears with soft
-pastel-pink inner ears (#FFB3C7), huge round glossy dark-brown eyes, a tiny
-pink triangle nose, round pink blush cheeks, a cozy cobalt-blue scarf (#2B5CFF)
-tied around the neck with the knot on its right side, and a tiny round powder-
-puff tail in electric blue (#2B5CFF).
+Zanzi the tech bunny: a chubby chibi baby rabbit with an adorably plump
+pear-shaped body, squishy round belly, chubby cheeks and fat round thighs,
+covered in round fluffy cream-white fur (body color #FFF6E8), two long
+upright ears with soft pastel-pink inner ears (#FFB3C7), huge round glossy
+dark-brown eyes, a tiny pink triangle nose, round pink blush cheeks, a cozy
+cobalt-blue scarf (#2B5CFF) tied around the neck with the knot on its right
+side, a tiny round powder-puff tail in electric blue (#2B5CFF), and chunky
+futuristic AR goggles with a soft cyan glow (#45E6FF) pushed up on its
+forehead.
 Cute kawaii chibi sticker illustration, plush-toy softness, soft volumetric
 shading with gentle gradients and glossy highlights, everything round and
-squishy, no flat areas, bold dark-brown outline around the character, clean
-white die-cut sticker border.
+squishy, futuristic tech props with a soft cyan glow, clean uncluttered
+sci-fi accents, bold dark-brown outline around the character, clean white
+die-cut sticker border.
 ```
 
 姿态后缀（加在角色卡后）：
@@ -26,14 +29,20 @@ white die-cut sticker border.
 - hero：`Pose: standing upright, waving one front paw in a friendly hello,
   happy open-mouth smile, ears perked up, full body visible.`
 - run：`Pose: sprinting to the right at full speed, body leaning forward,
-  ears streaming back in the wind, determined joyful grin, full body visible.`
-- sleep：`Pose: curled up peacefully asleep, eyes closed, ears folded down
-  softly, gentle smile, fluffy tail tucked, full body visible.`
-- cheer：`Pose: jumping in joy with both front paws raised high, eyes
-  sparkling, big open-mouth cheer, a few small golden four-pointed sparkle
-  stars floating around, full body visible.`
-- code：`Pose: sitting and typing on a tiny silver laptop resting on the
-  ground in front of it, focused happy expression, ears perked up, full body
+  ears streaming back in the wind, determined joyful grin, a faint cyan
+  holographic speed streak trailing behind, full body visible.`
+- sleep：`Pose: curled up peacefully asleep, eyes closed, AR goggles pushed
+  up on the forehead, ears folded down softly, gentle smile, fluffy tail
+  tucked, full body visible.`
+- cheer：`Pose: jumping in joy holding up a tiny retro game controller with
+  one paw, eyes sparkling, big open-mouth cheer, a few small golden
+  four-pointed sparkle stars floating around, full body visible.`
+- code：`Pose: sitting and typing on a floating holographic keyboard glowing
+  soft cyan, a tiny friendly holographic drone buddy hovering beside it,
+  focused happy expression, ears perked up, full body visible.`
+- battle：`Pose: brave battle stance with a chunky glowing cyan energy
+  gauntlet on one front paw and a small round energy shield floating on the
+  other arm, determined confident smile, ears standing tall, full body
   visible.`
 
 全部以 `Isolated and centered on a solid pure chroma-key green background
@@ -55,6 +64,9 @@ area of the tile. Clean modern design, no text, no letters, no border, no
 shadow.
 ```
 
+图标保持几何简笔（兔头 + 火花），**不戴护目镜**——mark 是最小可识别单元，
+科技叙事由吉祥物承担；16px 下护目镜必然糊成一团。
+
 ## 踩坑记录
 
 - 输出永远是**不透明 RGB**：透明底靠绿幕 + PIL 色度抠底（`postprocess.py`
@@ -65,3 +77,7 @@ shadow.
   （用户反馈「没肉感、立体一点圆润一点」）——改成 `plump pear-shaped body,
   plush-toy softness, soft volumetric shading, everything round and squishy`
   才出想要的圆胖质感。**风格词决定体积感，角色卡决定一致性**，两段都要。
+- 第二轮用户定位「卡哇伊科技兔：全平台编程、智能体、软件、游戏、能打能战」
+  ——科技感走**道具**（护目镜/全息键盘/无人机/能量臂铠）而不是改身体：
+  身体保持奶油白毛绒，科技件一律 Glow 青辉光小件。把科技感写进体型或
+  换主色调会毁掉贴纸萌系的一致性。

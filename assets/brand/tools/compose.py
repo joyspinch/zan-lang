@@ -79,6 +79,7 @@ swatches = [
     ("Volt Deep",    "#2141E6", "Gradient / Hover", VOLT_DEEP),
     ("Zan Sky",      "#7DA2FF", "Tint · 浅底",     SKY),
     ("Zan Spark",    "#FFC838", "Accent · 点缀",   SPARK),
+    ("Zan Glow",     "#45E6FF", "Tech · 科技辉光", (69, 230, 255)),
     ("Zan Blush",    "#FFB3C7", "Accent 2 · 耳尖", (255, 179, 199)),
     ("Zan Cream",    "#FFF6E8", "Surface · 毛色",  (255, 246, 232)),
     ("Zan Ink",      "#0F1428", "Text / Dark bg",  INK),
@@ -108,7 +109,7 @@ for i, (name, hexc, rgb) in enumerate(sem):
     cd.text((x + 22, y + 54), hexc.upper(), font=font("consola.ttf", 24), fill=(255, 255, 255))
 
 # mascot strip at the bottom, below the semantic row
-strip_names = ["zanzi-run", "zanzi-sleep", "zanzi-cheer", "zanzi-code"]
+strip_names = ["zanzi-run", "zanzi-battle", "zanzi-sleep", "zanzi-cheer", "zanzi-code"]
 strip_x = PW - 90
 strip_y = PH - 36 - 160
 for n in reversed(strip_names):
