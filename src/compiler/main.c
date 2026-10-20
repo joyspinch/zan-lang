@@ -5428,6 +5428,17 @@ int main(int argc, char **argv) {
             free(source);
             return 1;
         }
+        /* 提示消费方：这份 IR 依赖编译时选定的目标特性，generic CPU 下
+           256 位向量路径无法合法化（项目台账 A388）。 */
+        if (irgen.target_cpu[0]) {
+            fprintf(stderr,
+                    "zanc: --emit-ir 输出的 IR 依赖目标特性 cpu=%s features=%s\n"
+                    "zanc: 消费方请用同样的特性，例如 llc -mcpu=%s -mattr=%s -filetype=obj out.ll\n",
+                    irgen.target_cpu,
+                    irgen.target_features[0] ? irgen.target_features : "(default)",
+                    irgen.target_cpu,
+                    irgen.target_features[0] ? irgen.target_features : "+sse2");
+        }
     } else {
         char cross_archives[ZAN_MAX_USED_DRIVERS][1200];
         int cross_archive_count = 0;

@@ -94,6 +94,18 @@ build/zanc probe.zan --auto-stdlib --dump-ast          # 看语法树（--dump-t
 build/zanc probe.zan --auto-stdlib --time              # 各阶段耗时
 ```
 
+`--emit-ir` 落出的 IR **自述目标特性**（头部注释 `; zanc-target-cpu:` /
+`; zanc-target-features:`），stderr 同时打印对应的 `llc` 命令行。消费方必须
+用同样的特性，否则 256 位向量路径在 generic CPU 下无法合法化
+（`LLVM ERROR: Do not know how to split this operator's operand!`）：
+
+```bash
+llc -mcpu=x86-64 -mattr=+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi \
+    -filetype=obj ir.ll -o ir.o
+```
+
+（治本——让 IR 在 generic CPU 下也能合法化——尚未做，见项目台账 A438。）
+
 调试构建（`-g`）自动开启泄漏检测与 ARC 检疫（等于 `--check-leaks
 --arc-guard`），程序退出时报告未释放对象并隔离悬垂指针。
 IDE 的 F5 调试使用 `-g --arc-guard --check-leaks --strict-runtime`；项目的

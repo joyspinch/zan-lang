@@ -2787,20 +2787,51 @@ done:
 
 zan_status_t zan_irgen_write_ir(zan_irgen_t *g, const char *path) {
     char *ir = LLVMPrintModuleToString(g->mod);
+    char *owned = NULL;   /* 自述头 + IR 的拼接缓冲（malloc 释放） */
+    /* 产物自述目标特性：编译器自己用 AVX2 档后端出码，但 .ll 文本里没有这层
+       信息，消费方（llc 等）按 generic CPU 处理时 256 位向量路径拆不开
+       （SplitVectorOperand fatal error，见项目台账 A388）。把 CPU/特性写进
+       IR 头部，消费方照抄即可复现编译器的选择。 */
+    char header[768];
+    int hn = 0;
+    if (g->target_cpu[0]) {
+        hn = snprintf(header, sizeof(header),
+                      "; zanc-target-cpu: %s\n"
+                      "; zanc-target-features: %s\n"
+                      "; zanc: 消费本 IR 必须用同样的目标特性，例如\n"
+                      "; zanc:   llc -mcpu=%s -mattr=%s -filetype=obj out.ll\n"
+                      "; zanc: generic CPU 下 256 位向量路径无法合法化（台账 A388）。\n",
+                      g->target_cpu,
+                      g->target_features[0] ? g->target_features : "(default)",
+                      g->target_cpu,
+                      g->target_features[0] ? g->target_features : "+sse2");
+        if (hn < 0) hn = 0;
+        if ((size_t)hn > sizeof(header)) hn = (int)sizeof(header);
+    }
+    if (hn > 0) {
+        owned = (char *)malloc((size_t)hn + strlen(ir) + 1);
+        if (owned) {
+            memcpy(owned, header, (size_t)hn);
+            strcpy(owned + hn, ir);
+        }
+    }
+    const char *text = owned ? owned : ir;
+    zan_status_t rc = ZAN_OK;
     if (!path) {
-        int rc = fputs(ir, stdout);
-        LLVMDisposeMessage(ir);
-        return rc < 0 ? ZAN_ERROR : ZAN_OK;
+        if (fputs(text, stdout) < 0) rc = ZAN_ERROR;
+    } else {
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            rc = ZAN_ERROR;
+        } else {
+            bool ok = (fputs(text, f) >= 0);
+            if (fclose(f) != 0) ok = false;
+            if (!ok) rc = ZAN_ERROR;
+        }
     }
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        LLVMDisposeMessage(ir);
-        return ZAN_ERROR;
-    }
-    bool ok = (fputs(ir, f) >= 0);
-    if (fclose(f) != 0) ok = false;
+    if (owned) free(owned);
     LLVMDisposeMessage(ir);
-    return ok ? ZAN_OK : ZAN_ERROR;
+    return rc;
 }
 
 int zan_irgen_stub_extern_lib(zan_irgen_t *g, const char *lib, int lib_len) {
@@ -3091,6 +3122,10 @@ static zan_status_t zan_bind_target_layout(zan_irgen_t *g,
     }
     LLVMCodeGenOptLevel cg = g->fast_codegen ? LLVMCodeGenLevelNone
                                              : LLVMCodeGenLevelDefault;
+    /* 记下后端选用的 CPU/特性：--emit-ir 的产物要靠它自述目标特性，
+       否则消费方（llc 等）用 generic CPU 拿到 256 位向量路径会合法化失败。 */
+    snprintf(g->target_cpu, sizeof(g->target_cpu), "%s", tm_cpu);
+    snprintf(g->target_features, sizeof(g->target_features), "%s", tm_features);
     LLVMTargetMachineRef tm = LLVMCreateTargetMachine(
         target, triple, tm_cpu, tm_features,
         cg, LLVMRelocPIC, LLVMCodeModelDefault);

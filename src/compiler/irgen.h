@@ -599,6 +599,9 @@ struct zan_irgen {
     LLVMValueRef eh_state_fields[8];
 
     char target_triple[128];
+    /* 后端选用的 CPU/特性（--emit-ir 的产物要靠它自述，见 zan_irgen_write_ir） */
+    char target_cpu[64];
+    char target_features[192];
     bool target_is_windows;
     bool target_is_macos;     /* Darwin 平台 stdio 流导出符号适配 */
     bool target_is_ios;       /* iOS 平台生命周期与 UIKit 代理适配 */

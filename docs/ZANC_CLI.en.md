@@ -81,6 +81,20 @@ build/zanc probe.zan --auto-stdlib --dump-ast          # Inspect AST (--dump-tok
 build/zanc probe.zan --auto-stdlib --time              # Compilation stage timings
 ```
 
+The IR produced by `--emit-ir` **describes its own target features** (header
+comments `; zanc-target-cpu:` / `; zanc-target-features:`), and the matching
+`llc` command line is printed to stderr. Consumers must use the same features,
+otherwise the 256-bit vector path cannot be legalized on a generic CPU
+(`LLVM ERROR: Do not know how to split this operator's operand!`):
+
+```bash
+llc -mcpu=x86-64 -mattr=+sse3,+ssse3,+sse4.1,+sse4.2,+crc32,+aes,+avx,+avx2,+fma,+bmi \
+    -filetype=obj ir.ll -o ir.o
+```
+
+(The root fix — making the IR legalizable on a generic CPU — is not done yet;
+see ledger entry A438.)
+
 Debug builds (`-g`) automatically enable leak detection and ARC quarantine (`--check-leaks --arc-guard`). Set `ZAN_ARC_TRACE=1` when running the resulting executable to print real-time ARC events (alloc/retain/release with addresses and call sites).
 
 ---
