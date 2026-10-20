@@ -166,6 +166,17 @@ links, runs the programs and compares stdout with the C host's golden file.
 - Cases that still differ live in `tests/selfhost/diff_known_gaps.txt`: they are
   reported (so the gap stays visible) but do not fail the gate. Delete a line
   there once the gap is closed and the gate starts holding that case.
+- The `selfhost_shipped_runtime` ctest (`tests/run_selfhost_mt.cmake`) covers
+  the other half: a self-hosted program is linked against the **shipped**
+  multi-worker runtime (`toolchain/win-x64/zanrt_io_mt.o` — the objects a
+  published win-x64 program gets) instead of the self-host's own weak
+  cooperative scheduler, and its stdout must still match the host's. The
+  shipped `zan_co_ready`/`zan_co_sched_init` are strong symbols, so they win
+  over the self-host's weak fallback: the frames really are driven by the
+  shipped scheduler, with its timer ready hook. This is what pins the
+  coroutine frame header (`TASKS.md` A385). It is registered on Windows only
+  (the shipped objects are a MinGW build, so the link needs `ld.lld` and the
+  bundled `mingw/lib`).
 - The gate found three silent errors on its first run (2026-10-20): `foreach`
   only handled `List<T>` and silently dropped arrays and string arrays, an empty
   `case` section did not fall through into the next section, and `x is null`
@@ -279,22 +290,18 @@ links, runs the programs and compares stdout with the C host's golden file.
 
 ## Known limitations / future work
 
-- **The self-hosted coroutine frame layout differs from the C host's
-  `zan.co.header`.** The C host's frames are driven by the shipped runtime
-  (`zanrt_io_mt.o`), which reads the frame header as a `zan_co_fhdr`; the
-  self-hosted backend uses its own layout and therefore ships its own (weak)
-  cooperative scheduler. A program compiled by the self-host can therefore not
-  be linked against the shipped multi-threaded runtime for async work. Tracked in
-  `TASKS.md` (A385).
-- **Runtime class identity is missing in the self-hosted IR backend.** The C host
-  decides `x is T` from the allocation site's id plus an ancestor-name table
-  (`__zan_site_tynames`); the self-hosted backend stamps no per-object class id
-  at all (its object header is `[-16]=rc, [-8]=dtor` and its strings are
-  `malloc`ed blocks with a length header, but they carry no class tag). A switch
-  pattern over an `object`-typed scrutinee
-  (`case Dog d`, `case string s`) therefore cannot be decided at runtime: the
-  self-hosted compiler now **refuses to compile it** with an explicit diagnostic
-  instead of silently never matching. Tracked in `TASKS.md`.
+- **The self-hosted coroutine frame is a flat `i64` array, while the C host's
+  frame is a mixed-width struct.** The *slot numbering* is aligned with the
+  host (`0=sched 1=sched_step 2=state 3=done …`, the `ASYNC_FRAME_*` order),
+  and the two slots the shipped runtime touches (`sched`'s CO_* bits and
+  `pending`) are handed over to it, so a self-hosted program links the shipped
+  multi-worker runtime (`zanrt_io_mt.o`) and prints what the host prints — the
+  `selfhost_shipped_runtime` ctest pins that. What still differs is the
+  *representation* below the header: the host packs `state`/`done` as two
+  `i32`s (so `done` sits at offset 20), the self-host keeps them in 8-byte
+  slots (`done` at offset 24). The runtime's join path reads `done` at the
+  host's offset, so it does not apply to self-hosted frames — the self-host
+  lowers `Task.WhenAll`/Join itself. Tracked in `TASKS.md` (A385).
 - **Two closure-capture edges are still by value inside async methods.** In
   synchronous code a local that a closure captures lives in a heap cell and the
   closure holds the cell, so the closure observes later writes (C# semantics);
@@ -305,15 +312,16 @@ links, runs the programs and compares stdout with the C host's golden file.
   has no per-iteration snapshot in the async path). Tracked in `TASKS.md`
   (A391) with the differential-gate case
   `tests/conformance/closure_capture_async.zan`.
-- **`struct` is a heap object (reference semantics) in the self-hosted
-  compiler, while the C host copies it by value.** A `struct` that is
-  assigned, passed as an argument or pushed into a `List<T>` shares one heap
-  object in the self-hosted build, so a write through any alias is visible
-  everywhere; the C host copies the value (C# `struct` semantics). Measured
-  2026-10-20 on the same program: after `list.Add(p); p.x = 99;` the
-  self-hosted build prints `list[0].x` as `99` and the C host as `1`; a
-  by-value parameter write and a plain `P3 r = q;` assignment behave the
-  same way. Tracked in `TASKS.md` (A389).
+- **`struct` is still a heap object in the self-hosted compiler, but it now has
+  the C host's *value semantics*.** The representation is unchanged (one heap
+  block behind a pointer); what changed is that every boundary where the host
+  copies the value now copies the contents: assignment, argument passing,
+  `List<T>`/`T[]` insertion, `Dictionary` values, collection initializers and
+  closure captures. Nested `struct` fields are copied deeply, `class` fields are
+  shared (as in the host). A *method receiver* is deliberately **not** copied —
+  `v.Bump()` changes the caller's `v`, exactly like the host. The
+  differential-gate case `tests/conformance/struct_value_copy.zan` (8 shapes)
+  pins it. Tracked in `TASKS.md` (A389).
 - **Language coverage.** The self-hosted compiler covers substantially more of
   the language than the subset its own sources are written in — including
   classes with inheritance and virtual dispatch, interfaces, `List<T>`/

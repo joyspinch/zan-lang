@@ -108,7 +108,7 @@
 - 边界：容器判定只看**类**，不看泛型实参（与宿主一致）；`object` 槽里的
   容器与源类互判为假；空容器判为假（宿主也是假）。
 
-### [ ] A385 自举协程帧布局与 C 宿主的 `zan.co.header` 不一致——自举产出的程序用不了发行版 mt 运行时
+### [x] A385 自举协程帧布局与 C 宿主的 `zan.co.header` 不一致——自举产出的程序用不了发行版 mt 运行时
 
 - 现象（2026-10-20 差分门实测）：自举产出的 `.ll` 链接发行版协程运行时
   （`toolchain/win-x64/zanrt_io_mt.o`，即 `rt_io.c -DZAN_CO_DRIVER` 的产物）会跑飞：
@@ -116,44 +116,33 @@
   读 `h->sched`、`h->pending`），而自举的帧首 8 字节是**状态机 state**、次 8 字节是
   **done 标志**——运行时会去改这两个字段，状态机随即错乱。
 - 根因：两套帧布局各写各的：
-  - C 宿主：`zan.co.header`（state/done/awaiter/awaiter_step/result/exc/exc_tid/
-    exc_own/hcount/sched/pending…），运行时按这个布局接管帧；
-  - 自举 IR 后端（`src/selfhost/irgen_async.zan` 的 `GenAsyncMethod`）：自定义布局
+  - C 宿主：`zan.co.header`（`ASYNC_FRAME_*` 枚举：sched/pending/state/done/
+    awaiter/…/hcount/self_step），运行时按这个布局接管帧；
+  - 自举 IR 后端（`src/selfhost/irgen_async.zan`）：自定义布局
     `[0]=state [1]=done [2]=awaiter [3]=awaiter_step [4]=result [5]=own_resume
      [6]=cleanup [7]=hcount`，之后才是 this/参数/局部/子任务槽。
   两边都不认识对方的帧。
-- 现状处理：自举后端**自带一套完整的弱协程运行时**（`EmitAsyncRuntime`：
-  就绪队列 + 定时器表 + 泵），差分门链接集里不放 `rt_co.c`/mt 运行时，让这套弱实现
-  整体生效（`tests/run_selfhost_diff.cmake` 的链接集说明）。自举产出的程序因此
-  **不能**与发行版 mt 运行时混用（异步路径会跑飞），非异步路径无影响。
-- 方向：把自举的帧布局改成 C 宿主的 `zan.co.header`（字段顺序、类型、异常槽都要
-  对齐），然后自举就可以只保留"弱回退"、让发行版运行时接管——那才是与 C 宿主
-  同构的终局。改动面：`irgen_async.zan` 的 `GenAsyncMethod` 全部槽位下标、
-  `EmitAsyncComplete`/`EmitAwait`/`__zan_async_unwind` 的字段访问、以及帧的分配大小。
-- 布局对照（2026-10-20 实测，权威在 `src/compiler/irgen_expr_core.c:36-48` 的
-  `ASYNC_FRAME_*` 枚举 + `irgen.c:2224-2236` 的 `co_hdr_fields`）：
-  | 下标 | 字段 | 类型 | 偏移 |
-  |---|---|---|---|
-  | 0 | `SCHED` | i64 | 0 |
-  | 1 | `SCHED_STEP` | ptr | 8 |
-  | 2 | `STATE` | i32 | 16 |
-  | 3 | `DONE` | i32 | 20 |
-  | 4 | `AWAITER` | ptr | 24 |
-  | 5 | `AWAITER_STEP` | ptr | 32 |
-  | 6 | `RESULT` | i64 | 40 |
-  | 7 | `CLEANUP` | ptr | 48 |
-  | 8 | `HCOUNT` | i32 | 56 |
-  | 9 | `SELF_STEP` | ptr | 64 |
-  | 10 | `EXC` | i64 | 72 |
-  | 11 | `EXC_TID` | i32 | 80 |
-  ……共 16 个字段（`co_hdr_fields`），之后才是 this/参数/局部/子任务槽。
-  运行时把这套布局**写死**了：`src/runtime/rt_timer.c:1021` 的
-  `JOIN_OFF_DONE = 12 + sizeof(void*)`（=20）配两条 `_Static_assert` 钉住
-  `state`/`done` 的偏移——帧布局一动，运行时与后端必须同时改。
-  自举的帧现在是**扁平 i64 数组**（头 8 槽），要改成同构的 struct，槽位访问
-  全部从 `getelementptr i64` 换成 `getelementptr %struct`。
-- ⚠ 帧布局一变，自举固定点的 gen2/g3 必须重跑（`ctest -R '^selfhost_fixed_point$'`），
-  差分门的 `diff_known_gaps.txt` 也要同步。
+- ✅ 已修（2026-10-20）：帧仍是**扁平 i64 数组**（不改成宿主那种混合宽度的结构体），
+  但头部**槽位编号**改成宿主的 `ASYNC_FRAME_*` 顺序：
+  `0=sched 1=sched_step 2=state 3=done 4=awaiter 5=awaiter_step 6=result
+   7=cleanup 8=hcount 9=own_resume`——运行时只碰 slot0（CO_* 位）与 slot1
+  （pending step），这两槽**让给**运行时，自举从 slot2 起（原 slot5 的
+  `own_resume` 随之变成 9，调用点读它的地方同步改）。
+  - 帧释放改走 `__zan_co_frame_free`（宿主语义：先标 CO_DEAD 再 free），
+    9 处直接 `free(frame)` 全部改掉；自举保留 weak 回退，发行版的强符号压过它。
+  - action 帧的委托槽 8→10，头部 8→10 槽，分配 72→88 字节，清零范围同步。
+  - 槽位重编号必须**单遍**替换：逐槽循环会级联（5→9 之后原本就是 9 的又变 10）。
+- 验证：新增门 `selfhost_shipped_runtime`（`tests/run_selfhost_mt.cmake` +
+  `tests/selfhost/mt/async_timer.zan`）——自举产物用 **MinGW 目标**编译 IR
+  （`clang --target=x86_64-w64-windows-gnu`）+ `ld.lld -m i386pep` 链**发行版**
+  mt 运行时（`toolchain/win-x64/*.o` + 捆绑 `mingw/lib`），输出与宿主逐字一致
+  （`a=45` / `b=190` / `s=zane`）。发行版的 `zan_co_ready`/`zan_co_sched_init`
+  是强符号，压过自举的 weak 回退 → 帧真的被发行版的多 worker 调度器驱动，
+  定时器的 ready hook 也是运行时的。差分门 41 passed / 0 gaps / 0 failures，
+  固定点 g2==g3（18,405,662 字节）。
+- 残留：宿主的 `state`/`done` 是两个 i32（`done` 在偏移 20），自举的扁平数组把
+  `done` 放在偏移 24——运行时的 join 路径（`rt_timer.c` 的 `JOIN_OFF_DONE`）
+  **不适用于自举帧**；自举自己降级 `Task.WhenAll`/Join，不走那条路。
 
 ### [ ] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 

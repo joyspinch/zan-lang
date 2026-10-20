@@ -812,3 +812,35 @@ kernel32、shell32、user32、advapi32、version）。
 - 坑：类型测试的口径要**连空值一起量**：宿主里空的容器判为**假**（不是
   "静态类型相同即真"）——所以容器必须走运行期判定，不能走静态类型的捷径。
 - 门禁：用例 `runtime_type_test.zan`（11 项判定）与差分门一起钉住。
+
+## 43. 帧头要跟**运行时的调度器头**对齐：对齐的是槽位编号，不是结构体
+
+- 坑（实测）：自举的协程帧是**扁平 i64 数组**，头部自定义编号
+  （0=state 1=done 2=awaiter …），而发行版 mt 运行时把帧首当 `zan_co_fhdr`
+  读写（`rt_io.c` 的 `co_hdr()`：slot0 = `sched` 的 CO_* 位，slot1 = pending
+  step）——运行时去改自举的 state/done，状态机当场错乱，程序跑飞。
+- 教训：**跨后端共享的内存布局，编号必须跟对方走**。运行时只碰两个槽，
+  但那两槽必须**让给**运行时，哪怕自举用不上。
+- 做法：帧仍是扁平 i64 数组（不改成宿主那种混合宽度的结构体），但头部编号
+  改成宿主的 `ASYNC_FRAME_*` 顺序：0=sched 1=sched_step 2=state 3=done
+  4=awaiter 5=awaiter_step 6=result 7=cleanup 8=hcount 9=own_resume，
+  自举从 slot2 起；`own_resume` 原本在 slot5，调用点读它的地方同步改成 9。
+- 坑：**重编号必须单遍**。逐槽循环替换会级联（把 5 改成 9 之后，后面原本
+  就是 9 的又变成 10）。要一次 `MatchEvaluator` 映射全部槽号。
+- 坑：帧的**释放**也必须走运行时：直接 `free(frame)` 绕过运行时的 CO_DEAD
+  标记，调度器还会去跑已释放的帧。改成调 `__zan_co_frame_free`（宿主语义：
+  先标 CO_DEAD 再 free），自举保留 weak 回退（发行版的是强符号，压过回退）。
+- 坑：帧的大小与清零范围跟着头部走（8 槽 → 10 槽，72 → 88 字节；action
+  帧的委托槽 8 → 10）。
+- 坑：链发行版运行时要用 **MinGW 目标**：`clang --target=x86_64-w64-windows-gnu`
+  编译 IR + `ld.lld -m i386pep` + 捆绑的 `mingw/lib`；用 MSVC 链会报
+  `__mingw_fprintf` 之类未解析（发行版的 `.o` 是 MinGW 构建）。
+- 残留：宿主的 `done` 是 i32、在偏移 20（`state`/`done` 两个 i32 挤在一个
+  8 字节里），自举的扁平数组把它放在偏移 24——所以运行时的 join 路径
+  （`rt_timer.c` 的 `JOIN_OFF_DONE`）**不适用于自举帧**；自举自己降级
+  `Task.WhenAll`/Join，不走那条路。
+- 门禁：新增 `selfhost_shipped_runtime`（`tests/run_selfhost_mt.cmake` +
+  `tests/selfhost/mt/`）——自举产物链**发行版** mt 运行时
+  （`toolchain/win-x64/zanrt_io_mt.o`），输出与宿主逐字一致。发行版的
+  `zan_co_ready`/`zan_co_sched_init` 是强符号，压过自举的 weak 回退：帧真的
+  被发行版的多 worker 调度器驱动，定时器的 ready hook 也是运行时的。

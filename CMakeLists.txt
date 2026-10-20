@@ -2826,6 +2826,39 @@ if(SELFHOST_CLANG)
       "-DSYSLIBS=${_sh_syslibs}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_diff.cmake)
   set_tests_properties(selfhost_diff PROPERTIES TIMEOUT 1800)
+  # ---- Self-hosting: a self-hosted program must run on the SHIPPED runtime ----
+  # The differential gate above links the self-host's own weak coroutine
+  # runtime; the shipped multi-worker runtime (zanrt_io_mt.o) instead drives
+  # the frames the C host laid out. The self-host's frames now start with the
+  # same scheduler header (zan_co_fhdr: the CO_* bits and the pending step),
+  # so a self-hosted program can be linked against the shipped runtime and
+  # still print exactly what the host prints. Windows only: the shipped
+  # objects are a MinGW build and the link needs ld.lld.
+  if(WIN32)
+    find_program(SELFHOST_LLD NAMES ld.lld.exe ld.lld lld.exe lld
+        HINTS "${LLVM_TOOLS_BINARY_DIR}" "${LLVM_DIR}/../../../bin")
+    set(_sh_mt_rt "${CMAKE_SOURCE_DIR}/toolchain/win-x64")
+    set(_sh_mt_lib "${_sh_mt_rt}/mingw/lib")
+    if(SELFHOST_LLD AND EXISTS "${_sh_mt_rt}/zanrt_io_mt.o"
+       AND EXISTS "${_sh_mt_lib}/crt2.o")
+      add_test(NAME selfhost_shipped_runtime
+        COMMAND ${CMAKE_COMMAND}
+          -DZANC=$<TARGET_FILE:zanc>
+          -DSELFHOST_DIR=${CMAKE_SOURCE_DIR}/src/selfhost
+          "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+          -DCLANG=${SELFHOST_CLANG}
+          -DLLD=${SELFHOST_LLD}
+          -DGEN1=${CMAKE_BINARY_DIR}/selfhost_mt_gen1${_exe_ext}
+          -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_mt
+          -DRUNTIME_DIR=${_sh_mt_rt}
+          -DMINGW_LIB=${_sh_mt_lib}
+          -DCASE_DIR=${CMAKE_SOURCE_DIR}/tests/selfhost/mt
+          -DCASES=${CMAKE_SOURCE_DIR}/tests/selfhost/mt/cases.txt
+          -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_mt.cmake)
+      set_tests_properties(selfhost_shipped_runtime PROPERTIES TIMEOUT 900)
+    endif()
+  endif()
+
 endif()
 
 # ---- Gui conformance: headless layout/text math (needs the zan_gui lib) ----

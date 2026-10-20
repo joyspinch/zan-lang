@@ -6,10 +6,14 @@ namespace Zan;
 // await A-normal-form normalization.
 partial class Irgen {
     // ===== async / await CPS lowering =====
-    // Uniform heap frame is a flat i64 array. Fixed header (all i64):
-    //   0=state 1=done 2=awaiter 3=awaiter_step 4=result 5=own_resume
-    //   6=cleanup 7=hcount
-    // then (for instance methods) the receiver, then params, then
+    // Uniform heap frame is a flat i64 array. The header is the C host's
+    // numbering, so the released runtime can drive a self-hosted frame
+    // (zan_co_fhdr: the CO_* bits and the pending step come first):
+    //   0=sched 1=sched_step 2=state 3=done 4=awaiter 5=awaiter_step
+    //   6=result 7=cleanup 8=hcount 9=own_resume
+    // `sched` and `sched_step` belong to the scheduler (the runtime writes
+    // the CO_* bits and the pending step there); the self-host leaves them
+    // zero. Then (for instance methods) the receiver, then params, then
     // frame-resident locals, then one sub-task slot per await point.
     // `cleanup` is a void(i8*) fn releasing every owned slot and freeing the
     // frame; `hcount` counts this frame's armed try handlers. Both drive
@@ -57,7 +61,7 @@ partial class Irgen {
     // only allocates the frame -- the body runs from $resume. Hand the frame
     // to the cooperative scheduler, or the body never runs at all (the C host
     // does the same at the call site, irgen_call.c emit_detach_async_call).
-    // The resume entry is read from the frame's slot 5 (the ramp wrote it
+    // The resume entry is read from the frame's slot 9 (the ramp wrote it
     // there), so this also works when the callee was reached through a
     // dispatch instead of a named symbol.
     void EmitAsyncDetach(ExprVal v) {
@@ -65,7 +69,7 @@ partial class Irgen {
         string subv = v.op;
         string subh = NT();
         L("  " + subh + " = bitcast i8* " + subv + " to i64*");
-        string orp = FrameGep(subh, 5);
+        string orp = FrameGep(subh, 9);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
@@ -88,9 +92,9 @@ partial class Irgen {
             i = i + 1;
         }
     }
-    // adjust this frame's armed-try-handler count (header slot 7)
+    // adjust this frame's armed-try-handler count (header slot 8)
     void EmitAsyncHcAdd(int d) {
-        string p = FrameGep("%ff", 7);
+        string p = FrameGep("%ff", 8);
         string v = NT();
         L("  " + v + " = load i64, i64* " + p);
         string v1 = NT();
@@ -417,7 +421,7 @@ partial class Irgen {
         if (cn == "Task" && mn == "Delay") {
             string ms = ArgI64(callExpr.kids[0]);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_co_delay(i64 " + ms + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             L("  ret void");
             L("resume_" + st + ":");
@@ -429,7 +433,7 @@ partial class Irgen {
             // event-driven wait: the frame is re-readied by zan_gate_signal
             string gh = ArgI64(callExpr.kids[0]);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_gate_park(i64 " + gh + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             L("  ret void");
             L("resume_" + st + ":");
@@ -441,7 +445,7 @@ partial class Irgen {
             string fd = ArgI64(callExpr.kids[0]);
             string interest = "1"; if (mn == "WriteReady") { interest = "2"; }
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_wait_co(i64 " + fd + ", i32 " + interest + ", i8* %fp, void(i8*)* @" + curResumeSym + ")");
             L("  ret void");
             L("resume_" + st + ":");
@@ -458,22 +462,22 @@ partial class Irgen {
             }
             string lenv = ArgI64(callExpr.kids[2]);
             string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
-            string outn = FrameGep("%ff", 4);
+            string outn = FrameGep("%ff", 6);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_recv_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
-            string rs = FrameGep("%ff", 4);
+            string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
             return new ExprVal(rv, MkType("int"));
         }
         if (mn == "RecvToOv") {
             // recv with a deadline: same shape as RecvOv plus the timeout --
             // the reactor races the recv against the deadline and delivers
-            // the byte count (0 = peer close) or -1 (timeout) into slot 4.
+            // the byte count (0 = peer close) or -1 (timeout) into slot 6.
             string fd = ArgI64(callExpr.kids[0]);
             ExprVal bufv = GenExpr(callExpr.kids[1]);
             string buf = bufv.op;
@@ -483,29 +487,29 @@ partial class Irgen {
             string lenv = ArgI64(callExpr.kids[2]);
             string len32 = NT(); L("  " + len32 + " = trunc i64 " + lenv + " to i32");
             string tmo = ArgI64(callExpr.kids[3]);
-            string outn = FrameGep("%ff", 4);
+            string outn = FrameGep("%ff", 6);
             EmitAsyncSaveSlots();
-            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+            L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
             L("  call void @zan_io_recv_to_co(i64 " + fd + ", i8* " + buf + ", i32 " + len32 + ", i64 " + tmo + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outn + ")");
             L("  ret void");
             L("resume_" + st + ":");
             term = false; curLbl = "resume_" + st;
             EmitAsyncReloadSlots();
-            string rs = FrameGep("%ff", 4);
+            string rs = FrameGep("%ff", 6);
             string rv = NT(); L("  " + rv + " = load i64, i64* " + rs);
             return new ExprVal(rv, MkType("int"));
         }
         // AcceptOv
         string fd2 = ArgI64(callExpr.kids[0]);
-        string outfd = FrameGep("%ff", 4);
+        string outfd = FrameGep("%ff", 6);
         EmitAsyncSaveSlots();
-        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 0));
+        L("  store i64 " + st + ", i64* " + FrameGep("%ff", 2));
         L("  call void @zan_io_accept_co(i64 " + fd2 + ", i8* %fp, void(i8*)* @" + curResumeSym + ", i64* " + outfd + ")");
         L("  ret void");
         L("resume_" + st + ":");
         term = false; curLbl = "resume_" + st;
         EmitAsyncReloadSlots();
-        string rs2 = FrameGep("%ff", 4);
+        string rs2 = FrameGep("%ff", 6);
         string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
         return new ExprVal(rv2, MkType("int"));
     }
@@ -524,7 +528,7 @@ partial class Irgen {
         if (curAsync && IsSocketIntrinsic(callExpr)) { return EmitSocketIntrinsic(callExpr); }
         ExprVal sub = GenExpr(callExpr);
         // The awaited operand has to be a coroutine frame: the lowering reads
-        // the frame's slot 5 (the resume entry) and hands the frame to the
+        // the frame's slot 9 (the resume entry) and hands the frame to the
         // scheduler. An operand that is not a frame (an unknown call, a task
         // handle, a plain value) has no such slot -- reading it produced
         // `bitcast i8* 0 to i64*` and clang rejected the IR outright. Report
@@ -548,7 +552,7 @@ partial class Irgen {
         string subv = sub.op;
         string subh = NT();
         L("  " + subh + " = bitcast i8* " + subv + " to i64*");
-        string orp = FrameGep(subh, 5);
+        string orp = FrameGep(subh, 9);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         if (curAsync) {
@@ -558,14 +562,14 @@ partial class Irgen {
             string subi = NT(); L("  " + subi + " = ptrtoint i8* " + subv + " to i64");
             L("  store i64 " + subi + ", i64* " + ssp);
             string selfi = NT(); L("  " + selfi + " = ptrtoint i8* %fp to i64");
-            string awp = FrameGep(subh, 2);
+            string awp = FrameGep(subh, 4);
             L("  store i64 " + selfi + ", i64* " + awp);
             string stepi = NT(); L("  " + stepi + " = ptrtoint void(i8*)* @" + curResumeSym + " to i64");
-            string awsp = FrameGep(subh, 3);
+            string awsp = FrameGep(subh, 5);
             L("  store i64 " + stepi + ", i64* " + awsp);
             L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
             EmitAsyncSaveSlots();
-            string stp = FrameGep("%ff", 0);
+            string stp = FrameGep("%ff", 2);
             L("  store i64 " + st + ", i64* " + stp);
             L("  ret void");
             L("resume_" + st + ":");
@@ -577,26 +581,26 @@ partial class Irgen {
             string fv = NT(); L("  " + fv + " = inttoptr i64 " + subi2 + " to i8*");
             string lt = MapType(resTy);
             if (lt == "void") {
-                L("  call void @free(i8* " + fv + ")");
+                L("  call void @__zan_co_frame_free(i8* " + fv + ")");
                 return new ExprVal("0", MkType("int"));
             }
-            string rp = FrameGep(subh2, 4);
+            string rp = FrameGep(subh2, 6);
             string resi = NT(); L("  " + resi + " = load i64, i64* " + rp);
             string rvv = FromI64(resi, lt);
-            L("  call void @free(i8* " + fv + ")");
+            L("  call void @__zan_co_frame_free(i8* " + fv + ")");
             return new ExprVal(rvv, resTy);
         }
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
         L("  call void @zan_co_sched_run()");
         string lt2 = MapType(resTy);
         if (lt2 == "void") {
-            L("  call void @free(i8* " + subv + ")");
+            L("  call void @__zan_co_frame_free(i8* " + subv + ")");
             return new ExprVal("0", MkType("int"));
         }
-        string rp2 = FrameGep(subh, 4);
+        string rp2 = FrameGep(subh, 6);
         string resi2 = NT(); L("  " + resi2 + " = load i64, i64* " + rp2);
         string rvv2 = FromI64(resi2, lt2);
-        L("  call void @free(i8* " + subv + ")");
+        L("  call void @__zan_co_frame_free(i8* " + subv + ")");
         return new ExprVal(rvv2, resTy);
     }
     // Release the frame's owned refs (params + locals via ReleaseLocalsFrom, and
@@ -610,20 +614,20 @@ partial class Irgen {
     // Terminal completion: write result, mark done, wake the awaiter, return.
     // Caller must have already run EmitAsyncEpilogue and ensured a +1 result.
     void EmitAsyncComplete(string resi) {
-        string rp = FrameGep("%ff", 4);
+        string rp = FrameGep("%ff", 6);
         L("  store i64 " + resi + ", i64* " + rp);
-        string dp = FrameGep("%ff", 1);
+        string dp = FrameGep("%ff", 3);
         L("  store i64 1, i64* " + dp);
-        string sp = FrameGep("%ff", 0);
+        string sp = FrameGep("%ff", 2);
         L("  store i64 -1, i64* " + sp);
-        string awp = FrameGep("%ff", 2);
+        string awp = FrameGep("%ff", 4);
         string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
         string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
         string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
         int lw = NL(); int lr = NL();
         L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
         Label(lw);
-        string asp = FrameGep("%ff", 3);
+        string asp = FrameGep("%ff", 5);
         string asi = NT(); L("  " + asi + " = load i64, i64* " + asp);
         string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
@@ -754,7 +758,7 @@ partial class Irgen {
         List<Node> ltypes = new List<Node>();
         if (m.d != null) { PrescanAsyncLocals(m.d, lnames, ltypes); }
         int awaitCount = 0; if (m.d != null) { awaitCount = CountAwaits(m.d); }
-        int header = 8;
+        int header = 10;
         int thisSlot = header;
         int paramBase = header + thisExtra;
         int localBase = paramBase + pn.Count;
@@ -801,10 +805,10 @@ partial class Irgen {
         // the completion epilogue releases locals that the executed path may
         // never have assigned, and sub-task slots are read on resume.
         while (h < nfields) { L("  store i64 0, i64* " + FrameGep("%ff", h)); h = h + 1; }
-        string orp = FrameGep("%ff", 5);
+        string orp = FrameGep("%ff", 9);
         string ori = NT(); L("  " + ori + " = ptrtoint void(i8*)* @" + resumeSym + " to i64");
         L("  store i64 " + ori + ", i64* " + orp);
-        string clp = FrameGep("%ff", 6);
+        string clp = FrameGep("%ff", 7);
         string cli = NT(); L("  " + cli + " = ptrtoint void(i8*)* @" + sym + "$cleanup to i64");
         L("  store i64 " + cli + ", i64* " + clp);
         if (!stat) {
@@ -886,7 +890,7 @@ partial class Irgen {
             j = j + 1;
         }
         string st = NT();
-        L("  " + st + " = load i64, i64* " + FrameGep("%ff", 0));
+        L("  " + st + " = load i64, i64* " + FrameGep("%ff", 2));
         string sw = "  switch i64 " + st + ", label %co.start [ i64 0, label %co.start";
         int a2 = 1;
         while (a2 <= awaitCount) { sw = sw + " i64 " + a2 + ", label %resume_" + a2; a2 = a2 + 1; }
@@ -946,7 +950,7 @@ partial class Irgen {
             }
             j = j + 1;
         }
-        L("  call void @free(i8* %fp)");
+        L("  call void @__zan_co_frame_free(i8* %fp)");
         L("  ret void");
         L("}");
     }
@@ -996,17 +1000,17 @@ partial class Irgen {
         H("  br i1 %nn, label %body, label %done");
         H("body:");
         H("  %hf = bitcast i8* %cur to i64*");
-        H("  %hcp = getelementptr i64, i64* %hf, i64 7");
+        H("  %hcp = getelementptr i64, i64* %hf, i64 8");
         H("  %hc = load i64, i64* %hcp");
         H("  %armed = icmp sgt i64 %hc, 0");
         H("  br i1 %armed, label %done, label %clean");
         H("clean:");
-        H("  %awp = getelementptr i64, i64* %hf, i64 2");
+        H("  %awp = getelementptr i64, i64* %hf, i64 4");
         H("  %awi = load i64, i64* %awp");
         H("  %aw = inttoptr i64 %awi to i8*");
         H("  %det = icmp eq i8* %aw, %cur");
         H("  %nxt = select i1 %det, i8* null, i8* %aw");
-        H("  %clp = getelementptr i64, i64* %hf, i64 6");
+        H("  %clp = getelementptr i64, i64* %hf, i64 7");
         H("  %cli = load i64, i64* %clp");
         H("  %cl = inttoptr i64 %cli to void(i8*)*");
         H("  %has = icmp ne void(i8*)* %cl, null");
@@ -1104,7 +1108,16 @@ partial class Irgen {
         H("}");
         H("define internal void @__zan_co_reap(i8* %f) {");
         H("entry:");
-        H("  call void @free(i8* %f)");
+        H("  call void @__zan_co_frame_free(i8* %f)");
+        H("  ret void");
+        H("}");
+        // Releasing a coroutine frame goes through the runtime's protocol:
+        // the shipped runtime marks the frame dead (CO_DEAD) before freeing
+        // it, so its scheduler never touches a freed frame header. The weak
+        // fallback (no shipped runtime linked) frees it directly.
+        H("define weak void @__zan_co_frame_free(i8* %p) {");
+        H("entry:");
+        H("  call void @free(i8* %p)");
         H("  ret void");
         H("}");
         H("define weak void @zan_co_ready(i8* %frame, void(i8*)* %step) {");
@@ -1278,7 +1291,7 @@ partial class Irgen {
     // ===== Task 句柄的内建族（Task.Run / Spawn / Wait / Result / IsCompleted）=====
     //
     // 自举把任务句柄族降级到**自己**的帧布局上（文件头的扁平 i64 帧）：句柄
-    // 就是帧指针，done 标志在槽 1，结果在槽 4。宿主做的是同一件事，只是帧头
+    // 就是帧指针，done 标志在槽 3，结果在槽 6。宿主做的是同一件事，只是帧头
     // 布局不同（src/compiler/irgen_expr_core.c 的 emit_task_member：先跑
     // test/pump 循环等完成，再读结果并回收）——两边一致的是**可观察行为**，
     // 不是字节。
@@ -1296,7 +1309,7 @@ partial class Irgen {
     // 等帧跑完：泵协作调度器直到 done 标志置位（宿主的 tk.test/tk.pump 循环）
     void EmitTaskWait(string fp) {
         string fph = TaskFrameHeader(fp);
-        string dp = FrameGep(fph, 1);
+        string dp = FrameGep(fph, 3);
         int lt = NL(); int lw = NL(); int ld = NL();
         L("  br label %L" + lt);
         term = true;
@@ -1313,7 +1326,7 @@ partial class Irgen {
     // 帧的 done 标志（i64 的 0/1）
     string TaskDoneValue(string fp) {
         string fph = TaskFrameHeader(fp);
-        string dp = FrameGep(fph, 1);
+        string dp = FrameGep(fph, 3);
         string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
         string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
         string r = NT(); L("  " + r + " = zext i1 " + c + " to i64");
@@ -1363,9 +1376,9 @@ partial class Irgen {
         brkTarget = 0; contTarget = 0;
         stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
 
-        // %fp 是 action 帧：槽 8 存委托（带闭包标签的指针）
+        // %fp 是 action 帧：槽 10 存委托（带闭包标签的指针）
         string fph = NT(); L("  " + fph + " = bitcast i8* %fp to i64*");
-        string dlgp = FrameGep(fph, 8);
+        string dlgp = FrameGep(fph, 10);
         string dlgi = NT(); L("  " + dlgi + " = load i64, i64* " + dlgp);
         string dlg = NT();
         L("  " + dlg + " = inttoptr i64 " + dlgi + " to i8*");
@@ -1393,19 +1406,19 @@ partial class Irgen {
         L("  br label %L" + lFin);
         Label(lFin);
         // done = 1，state = -1
-        string dp = FrameGep(fph, 1);
+        string dp = FrameGep(fph, 3);
         L("  store i64 1, i64* " + dp);
-        string sp = FrameGep(fph, 0);
+        string sp = FrameGep(fph, 2);
         L("  store i64 -1, i64* " + sp);
-        // 唤醒等待者（槽 2/3）——与 EmitAsyncComplete 同一套协议
-        string awp = FrameGep(fph, 2);
+        // 唤醒等待者（槽 4/5）——与 EmitAsyncComplete 同一套协议
+        string awp = FrameGep(fph, 4);
         string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
         string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
         string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
         int lw = NL(); int lr = NL();
         L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
         Label(lw);
-        string asp = FrameGep(fph, 3);
+        string asp = FrameGep(fph, 5);
         string asi = NT(); L("  " + asi + " = load i64, i64* " + asp);
         string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
@@ -1432,21 +1445,21 @@ partial class Irgen {
         return fname;
     }
 
-    // action 帧：跑一个委托、没有结果的任务帧。槽 8 存委托。
+    // action 帧：跑一个委托、没有结果的任务帧。槽 10 存委托。
     // 帧不释放：宿主靠运行时的活跃帧登记表回收，自举没有那个登记表，而
     // 句柄在任务完成后还要能读 done 标志（IsCompleted）——提前释放就是
-    // 读已释放内存。代价是每个 action 帧泄漏 72 字节（不是 ARC 对象，
+    // 读已释放内存。代价是每个 action 帧泄漏 88 字节（不是 ARC 对象，
     // 泄漏检查看不见）。
     ExprVal EmitTaskActionFrame(ExprVal dlg) {
         string raw = NT();
-        L("  " + raw + " = call i8* @malloc(i64 72)");
+        L("  " + raw + " = call i8* @malloc(i64 88)");
         string fph = NT(); L("  " + fph + " = bitcast i8* " + raw + " to i64*");
         int i = 0;
-        while (i < 8) {
+        while (i < 11) {
             L("  store i64 0, i64* " + FrameGep(fph, i));
             i = i + 1;
         }
-        string dlgp = FrameGep(fph, 8);
+        string dlgp = FrameGep(fph, 10);
         string dlgv = NT(); L("  " + dlgv + " = ptrtoint i8* " + dlg.op + " to i64");
         L("  store i64 " + dlgv + ", i64* " + dlgp);
         string step = EmitTaskActionStep();
@@ -1462,12 +1475,12 @@ partial class Irgen {
         string fph = NT(); L("  " + fph + " = bitcast i8* " + subv + " to i64*");
         if (selfReap) {
             string selfi = NT(); L("  " + selfi + " = ptrtoint i8* " + subv + " to i64");
-            L("  store i64 " + selfi + ", i64* " + FrameGep(fph, 2));
+            L("  store i64 " + selfi + ", i64* " + FrameGep(fph, 4));
             string reapi = NT(); L("  " + reapi + " = ptrtoint void(i8*)* @__zan_co_reap to i64");
-            L("  store i64 " + reapi + ", i64* " + FrameGep(fph, 3));
+            L("  store i64 " + reapi + ", i64* " + FrameGep(fph, 5));
         }
-        // 帧的槽 5 是自己的 resume 入口（ramp 写的）
-        string orp = FrameGep(fph, 5);
+        // 帧的槽 9 是自己的 resume 入口（ramp 写的）
+        string orp = FrameGep(fph, 9);
         string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
         string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
         L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
@@ -1541,11 +1554,11 @@ partial class Irgen {
             }
             EmitTaskWait(fp);
             string fph = TaskFrameHeader(fp);
-            string rp = FrameGep(fph, 4);
+            string rp = FrameGep(fph, 6);
             string resi = NT(); L("  " + resi + " = load i64, i64* " + rp);
             string rvv = FromI64(resi, MapType(elem));
             // 帧由读者回收（宿主: co_reap）
-            L("  call void @free(i8* " + fp + ")");
+            L("  call void @__zan_co_frame_free(i8* " + fp + ")");
             return new ExprVal(rvv, elem);
         }
         diags.Error("member '" + mname + "' of type 'Task' is not supported by the self-hosted "
@@ -1566,7 +1579,7 @@ partial class Irgen {
             fp = h.op;
         }
         string fph = TaskFrameHeader(fp);
-        string dp = FrameGep(fph, 1);
+        string dp = FrameGep(fph, 3);
         string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
         string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
         int lYes = NL(); int lNo = NL(); int lZero = NL(); int lJoin = NL();
@@ -1854,14 +1867,14 @@ partial class Irgen {
                 // The awaiter owns the frame: release it once the coroutine
                 // is done. An exception unwinds the frame through its own
                 // cleanup (which frees it), so this path is completion only.
-                L("  call void @free(i8* " + fr + ")");
+                L("  call void @__zan_co_frame_free(i8* " + fr + ")");
                 L("  ret i32 0");
             } else {
                 // read the result before the frame is released
                 string fh = NT(); L("  " + fh + " = bitcast i8* " + fr + " to i64*");
-                string rp = FrameGep(fh, 4);
+                string rp = FrameGep(fh, 6);
                 string ri = NT(); L("  " + ri + " = load i64, i64* " + rp);
-                L("  call void @free(i8* " + fr + ")");
+                L("  call void @__zan_co_frame_free(i8* " + fr + ")");
                 L("  ret i32 (trunc i64 " + ri + " to i32)");
             }
         } else {
