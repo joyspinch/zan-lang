@@ -29,7 +29,9 @@ the same pattern the shipped `templates/game/*` use.
 state, semantic input and scene lifecycle.
 
 `Game.Board` provides cloneable grids, pathfinding, turns, validated commands,
-snapshots and replay logs for board games, tactics and puzzle games.
+snapshots and replay logs for board games, tactics and puzzle games, plus a
+generic alpha-beta AI search (`BoardSearch` + `ISearchGame`) that plugs into
+any game exposing moves/apply/undo/evaluate.
 
 `Game.Cards` provides card catalogs, runtime instances, deterministic zones, a
 compact deck-building battle runtime, and Chinese-style hand-shape rules

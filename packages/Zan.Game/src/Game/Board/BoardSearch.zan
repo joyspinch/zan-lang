@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Board;
+
+// 棋类 AI 的 alpha-beta 搜索（negamax 写法）。
+//
+// 特点：
+//   - **迭代加深**：深度 1、2、3…逐层加深，每层拿到更好的着法；时间预算内
+//     被打断时保留**已完成**那层的着法，不会返回半层的烂结果。
+//   - **时间预算**：WithTimeLimit(ms) 按墙钟（Stopwatch）掐表；超时后搜索
+//     立刻收手，但**始终把落下的子撤干净**——游戏局面不会被搜索搞脏。
+//   - **走法排序**：WithMoveOrder(fn) 让好着法先搜，剪枝效率差着数量级
+//     （这是棋类 AI 最值钱的一个旋钮）。
+//   - **可观测**：Nodes（访问节点数）、CompletedDepth（实际完成深度）、
+//     LastScore（最佳着法的分数），做 AI 强度与耗时调参用。
+//
+// 分数口径：Evaluate() 从**当前行棋方**视角给分（正数 = 我方占优），
+// negamax 在换边时取反，所以"我方优势"始终是正数。终局分数由游戏自己给
+// （赢 +1000000、输 -1000000 之类）；无着可走且非终局时按判负处理。
+public class BoardSearch {
+    // 最大搜索深度（迭代加深的上限）。
+    public int MaxDepth;
+    // 时间预算（毫秒）；0 = 不限。
+    public int TimeLimitMs;
+    // 本次搜索访问的节点数。
+    public long Nodes;
+    // 实际完成的深度（超时中断时是最后一层**完成**的深度）。
+    public int CompletedDepth;
+    // 最佳着法（BestMove 的返回值也是它）；无着可走为 -1。
+    public int Best;
+    // 最佳着法对应的分数（当前行棋方视角）。
+    public int LastScore;
+
+    BoardMoveOrderFn orderFn;
+    Stopwatch clock;
+    bool aborted;
+    int rootBest;
+
+    public BoardSearch(int maxDepth) {
+        this.MaxDepth = maxDepth;
+        this.TimeLimitMs = 0;
+        this.Nodes = 0;
+        this.CompletedDepth = 0;
+        this.Best = -1;
+        this.LastScore = 0;
+        this.orderFn = null;
+    }
+
+    // 设置时间预算（毫秒）并返回自身（链式）。
+    public BoardSearch WithTimeLimit(int milliseconds) {
+        this.TimeLimitMs = milliseconds;
+        return this;
+    }
+
+    // 设置走法排序函数并返回自身（链式）；不设则按游戏给出的顺序搜。
+    public BoardSearch WithMoveOrder(BoardMoveOrderFn fn) {
+        this.orderFn = fn;
+        return this;
+    }
+
+    // 搜索最佳着法：无可走子时返回 -1。搜索期间会改动并复原游戏局面。
+    public int BestMove(ISearchGame game) {
+        List<int> moves = game.GenerateMoves();
+        if (moves.Count == 0) {
+            // 无着可走：要么终局（分数由游戏给），要么按判负处理。
+            this.LastScore = game.Evaluate();
+            this.Best = -1;
+            return -1;
+        }
+        this.Nodes = 0;
+        this.CompletedDepth = 0;
+        this.LastScore = 0;
+        this.aborted = false;
+        this.Best = moves[0];
+        this.clock = new Stopwatch();
+        this.clock.Start();
+        for (int depth = 1; depth <= this.MaxDepth; depth = depth + 1) {
+            int score = this.RootSearch(game, depth, moves);
+            if (this.aborted) { break; }
+            this.CompletedDepth = depth;
+            this.LastScore = score;
+        }
+        this.clock.Stop();
+        return this.Best;
+    }
+
+    // 只算分数、不出着法（调试与评估局面用）。
+    public int Score(ISearchGame game) {
+        this.BestMove(game);
+        return this.LastScore;
+    }
+
+    // 根层搜索：逐个着法试，返回最佳分数并记下最佳着法。
+    int RootSearch(ISearchGame game, int depth, List<int> moves) {
+        if (this.orderFn != null) { BoardSearch.SortByScore(moves, this.orderFn); }
+        int alpha = -BoardSearch.Inf();
+        int best = -BoardSearch.Inf();
+        this.rootBest = moves[0];
+        for (int i = 0; i < moves.Count; i = i + 1) {
+            game.ApplyMove(moves[i]);
+            int score = -this.Negamax(game, depth - 1, -BoardSearch.Inf(), -alpha);
+            game.UndoMove();
+            if (this.aborted) { return 0; }
+            if (score > best) {
+                best = score;
+                this.rootBest = moves[i];
+            }
+            if (best > alpha) { alpha = best; }
+        }
+        this.Best = this.rootBest;
+        return best;
+    }
+
+    // negamax：轮到对手时把分数取反。
+    int Negamax(ISearchGame game, int depth, int alpha, int beta) {
+        this.Nodes = this.Nodes + 1;
+        // 每 128 个节点查一次时间——够细又不至于每次都读时钟。
+        if ((this.Nodes & 127) == 0 && this.TimedOut()) {
+            this.aborted = true;
+            return 0;
+        }
+        if (depth <= 0 || game.IsTerminal()) { return game.Evaluate(); }
+        List<int> moves = game.GenerateMoves();
+        if (moves.Count == 0) { return -BoardSearch.Mate(); }
+        if (this.orderFn != null) { BoardSearch.SortByScore(moves, this.orderFn); }
+        int best = -BoardSearch.Inf();
+        for (int i = 0; i < moves.Count; i = i + 1) {
+            game.ApplyMove(moves[i]);
+            int score = -this.Negamax(game, depth - 1, -beta, -alpha);
+            game.UndoMove();
+            // 撤销一定在返回前做完：超时中断也不会把局面留在半步上。
+            if (this.aborted) { return 0; }
+            if (score > best) { best = score; }
+            if (best > alpha) { alpha = best; }
+            if (alpha >= beta) { break; }
+        }
+        return best;
+    }
+
+    // 是否超出时间预算。
+    public bool TimedOut() {
+        if (this.TimeLimitMs <= 0) { return false; }
+        if (this.clock == null) { return false; }
+        return this.clock.ElapsedMilliseconds() > (double)this.TimeLimitMs;
+    }
+
+    // 终局分数量级：游戏给 ±1000000 级别的胜负分即可。
+    public static int Mate() { return 1000000; }
+    // 搜索窗口的无穷大。
+    public static int Inf() { return 1000000000; }
+
+    // 按启发式分数给着法排序（大的先搜）。插入排序：着法数不大，且稳定。
+    static void SortByScore(List<int> moves, BoardMoveOrderFn fn) {
+        int n = moves.Count;
+        if (n < 2) { return; }
+        int[] scores = new int[n];
+        for (int i = 0; i < n; i = i + 1) { scores[i] = fn(moves[i]); }
+        for (int i = 1; i < n; i = i + 1) {
+            int mv = moves[i];
+            int sc = scores[i];
+            int j = i - 1;
+            while (j >= 0 && scores[j] < sc) {
+                moves[j + 1] = moves[j];
+                scores[j + 1] = scores[j];
+                j = j - 1;
+            }
+            moves[j + 1] = mv;
+            scores[j + 1] = sc;
+        }
+    }
+}

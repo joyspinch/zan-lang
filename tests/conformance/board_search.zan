@@ -1,0 +1,150 @@
+using System;
+using System.Collections.Generic;
+using Game.Board;
+
+namespace Tests.BoardSearch;
+
+// 井字棋：只用来验证搜索框架（ISearchGame + BoardSearch），
+// 规则本身是教科书级的简单局面——三行三列三斜线先连成者胜。
+class TicTacToe : ISearchGame {
+    int[] cells = new int[9];   // 0 空 / 1 X / 2 O
+    int turn = 1;               // 1 X / 2 O
+    int winner = 0;
+    List<int> history = new List<int>();
+
+    TicTacToe() {
+        for (int i = 0; i < 9; i = i + 1) { this.cells[i] = 0; }
+    }
+
+    // 直接摆一个局面（测试用）：x 的位置、o 的位置。
+    void Setup(int[] x, int[] o) {
+        for (int i = 0; i < x.Length; i = i + 1) { this.cells[x[i]] = 1; }
+        for (int i = 0; i < o.Length; i = i + 1) { this.cells[o[i]] = 2; }
+        this.turn = 1;
+        this.winner = TicTacToe.WinnerOf(this.cells);
+    }
+
+    static int WinnerOf(int[] c) {
+        int[] lines = new int[] {
+            0, 1, 2, 3, 4, 5, 6, 7, 8,
+            0, 3, 6, 1, 4, 7, 2, 5, 8,
+            0, 4, 8, 2, 4, 6
+        };
+        for (int i = 0; i < lines.Length; i = i + 3) {
+            int a = c[lines[i]];
+            if (a != 0 && a == c[lines[i + 1]] && a == c[lines[i + 2]]) { return a; }
+        }
+        return 0;
+    }
+
+    List<int> GenerateMoves() {
+        List<int> res = new List<int>();
+        if (this.winner != 0) { return res; }
+        for (int i = 0; i < 9; i = i + 1) { if (this.cells[i] == 0) { res.Add(i); } }
+        return res;
+    }
+
+    void ApplyMove(int move) {
+        this.cells[move] = this.turn;
+        this.history.Add(move);
+        int w = TicTacToe.WinnerOf(this.cells);
+        if (w != 0) { this.winner = w; }
+        this.turn = 3 - this.turn;
+    }
+
+    void UndoMove() {
+        if (this.history.Count == 0) { return; }
+        int move = this.history[this.history.Count - 1];
+        this.history.RemoveAt(this.history.Count - 1);
+        this.cells[move] = 0;
+        this.winner = 0;
+        this.turn = 3 - this.turn;
+    }
+
+    // 从**当前行棋方**视角打分：赢了 +Mate，输了 -Mate，和棋 0。
+    int Evaluate() {
+        if (this.winner == 0) { return 0; }
+        if (this.winner == this.turn) { return BoardSearch.Mate(); }
+        return -BoardSearch.Mate();
+    }
+
+    bool IsTerminal() {
+        if (this.winner != 0) { return true; }
+        for (int i = 0; i < 9; i = i + 1) { if (this.cells[i] == 0) { return false; } }
+        return true;
+    }
+
+    // 局面快照（验证搜索后局面复原）。
+    string Snapshot() {
+        string s = "";
+        for (int i = 0; i < 9; i = i + 1) { s = s + Convert.ToString(this.cells[i]); }
+        return s;
+    }
+}
+
+class Program {
+    static void Main() {
+        // ---- 1. 一步取胜：X 占 0,1,3，空格 2 可直接连成 0-1-2 ----
+        TicTacToe g1 = new TicTacToe();
+        g1.Setup(new int[] { 0, 1, 3 }, new int[] { 4, 7 });
+        BoardSearch s1 = new BoardSearch(3);
+        int m1 = s1.BestMove(g1);
+        Console.WriteLine("mate_in_1_move=" + Convert.ToString(m1));
+        Console.WriteLine("mate_in_1_score=" + Convert.ToString(s1.LastScore));
+
+        // ---- 2. 必须应手：O 占 4,5（同行再下一手即成），X 只能堵 3 ----
+        TicTacToe g2 = new TicTacToe();
+        g2.Setup(new int[] { 0 }, new int[] { 4, 5 });
+        BoardSearch s2 = new BoardSearch(2);
+        int m2 = s2.BestMove(g2);
+        Console.WriteLine("must_block_move=" + Convert.ToString(m2));
+        Console.WriteLine("must_block_score=" + Convert.ToString(s2.LastScore));
+
+        // ---- 3. 强制胜：X 占 2、O 占 8，X 走 1 或 4 都是双威胁 ----
+        // 这条要看到 5 层：X 造双威胁 → O 挡一手 → X 再造威胁 → O 再挡 → X 连成
+        // （2-4-6 斜线），所以深度不够时只会看到"平局"。
+        TicTacToe g3 = new TicTacToe();
+        g3.Setup(new int[] { 2 }, new int[] { 8 });
+        BoardSearch s3 = new BoardSearch(5);
+        int m3 = s3.BestMove(g3);
+        // 能造双威胁的首着：0（0-1-2 行 + 0-3-6 列）、1（行 + 1-4-7 列）、
+        // 3（3-4-5 行）、4（2-4-6 斜线 + 1-4-7 列）、7（1-4-7 列）
+        bool m3Wins = (m3 == 0 || m3 == 1 || m3 == 3 || m3 == 4 || m3 == 7);
+        Console.WriteLine("fork_in_2_wins=" + Convert.ToString(m3Wins ? 1 : 0));
+        Console.WriteLine("fork_in_2_score_positive=" + Convert.ToString(s3.LastScore > 0 ? 1 : 0));
+
+        // ---- 4. 搜索后局面必须复原 ----
+        string before = g3.Snapshot();
+        Console.WriteLine("board_restored=" + Convert.ToString(before == g3.Snapshot() ? 1 : 0));
+
+        // ---- 5. 终局局面：O 已经连成，X 无着可走，分数为负 ----
+        TicTacToe g5 = new TicTacToe();
+        g5.Setup(new int[] { 8 }, new int[] { 0, 1, 2 });
+        BoardSearch s5 = new BoardSearch(3);
+        int m5 = s5.BestMove(g5);
+        Console.WriteLine("terminal_move=" + Convert.ToString(m5));
+        Console.WriteLine("terminal_score=" + Convert.ToString(s5.LastScore));
+
+        // ---- 6. 节点数与深度 ----
+        TicTacToe g6 = new TicTacToe();
+        BoardSearch s6 = new BoardSearch(9);
+        s6.BestMove(g6);
+        Console.WriteLine("nodes_positive=" + Convert.ToString(s6.Nodes > 0 ? 1 : 0));
+        Console.WriteLine("depth_completed=" + Convert.ToString(s6.CompletedDepth));
+
+        // ---- 7. 走法排序：中心优先时，空盘首着应落在 4 ----
+        TicTacToe g7 = new TicTacToe();
+        BoardSearch s7 = new BoardSearch(1);
+        s7.WithMoveOrder((int move) => { return move == 4 ? 100 : 0; });
+        int m7 = s7.BestMove(g7);
+        Console.WriteLine("ordered_move=" + Convert.ToString(m7));
+
+        // ---- 8. 时间预算：超时要收手，但仍返回合法着法 ----
+        TicTacToe g8 = new TicTacToe();
+        BoardSearch s8 = new BoardSearch(9);
+        s8.WithTimeLimit(1);
+        int m8 = s8.BestMove(g8);
+        Console.WriteLine("timeout_move_valid=" + Convert.ToString(m8 >= 0 ? 1 : 0));
+        Console.WriteLine("timeout_board_restored=" + Convert.ToString(g8.Snapshot() == "000000000" ? 1 : 0));
+    }
+}

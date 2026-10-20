@@ -11,3 +11,38 @@
 Game-specific legality and win conditions implement `IBoardRules`. Hidden
 information should be projected into player-specific views by the application
 or server rather than stored in a client-visible board.
+
+## AI search (alpha-beta)
+
+`BoardSearch` runs a negamax alpha-beta search over any game that implements
+`ISearchGame` — five actions (generate moves, apply, undo, evaluate, terminal)
+and nothing else about the board:
+
+```zan
+using Game.Board;
+
+class MyGame : ISearchGame {
+    List<int> GenerateMoves() { ... }
+    void ApplyMove(int move) { ... }
+    void UndoMove() { ... }
+    int Evaluate() { ... }   // from the side to move's view
+    bool IsTerminal() { ... }
+}
+
+BoardSearch ai = new BoardSearch(4)
+    .WithTimeLimit(300)                                  // ms budget
+    .WithMoveOrder((int move) => Heuristic(move));        // good moves first
+int best = ai.BestMove(game);
+```
+
+- `Evaluate()` is scored **from the side to move** (positive = good for the
+  player about to move); negamax negates it when the turn switches, so a win
+  is always `+Mate` / `-Mate` (`BoardSearch.Mate()` = 1000000).
+- Iterative deepening: depths 1, 2, 3… If the time budget runs out mid-depth
+  the search keeps the move from the last **completed** depth.
+- The search always undoes what it applied, so the game state is unchanged
+  after `BestMove` — including when it aborts on the time budget.
+- `Nodes`, `CompletedDepth` and `LastScore` are exposed for tuning.
+- Move ordering is the biggest lever: search the most promising moves first
+  and the beta cut-off prunes far more branches.
+
