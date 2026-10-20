@@ -63,6 +63,11 @@ partial class Irgen {
     public int brkTarget;
     public int contTarget;
     public List<string> tparamNames;
+    // the class whose scope the types being mapped are written in. A method's
+    // OWN declared types live in the DECLARING class's scope, where a type
+    // parameter shadows a user type of the same name; "" means "the class
+    // being emitted".
+    public string typeScopeCls;
     // the method declaration being emitted: its own type parameters (and
     // their constraints) shadow the class's, so the constraint lookup is
     // scope-correct
@@ -76,6 +81,24 @@ partial class Irgen {
     public List<Node> specMs;
     public List<Node> specClss;
     public List<string> specSyms;
+    // the try statements we are lexically inside of, innermost last. Each
+    // entry carries the try's finally body (null when it has none) and
+    // whether its EH frame is still pushed. A `return` (or a break/continue)
+    // that leaves the try region must run the finally bodies on this stack --
+    // the C host does, and skipping them leaves a lock held (a
+    // `try { return x; } finally { Unlock(); }` would deadlock the next
+    // Lock forever).
+    public List<Node> finBodies;
+    public List<int> finLive;
+    public List<int> finActive;
+    // the type binding of the last class-level specialization (the indexer
+    // and property paths use it to map the clone's own types)
+    public List<string> csNames;
+    public List<Node> csReps;
+    // the finally-stack depth at the entry of the innermost loop: a
+    // break/continue runs only the finallys opened inside that loop
+    public int brkFinBase;
+    public int contFinBase;
     // the receiver's static type of each specialized clone (the concrete
     // instantiation of the class, when the clone specializes a generic class)
     public List<Node> specThis;
@@ -137,12 +160,20 @@ partial class Irgen {
         curLbl = "entry";
         brkTarget = 0; contTarget = 0;
         tparamNames = new List<string>();
+        typeScopeCls = "";
         curMethodNode = null;
         curThisTy = null;
         specMs = new List<Node>();
         specClss = new List<Node>();
         specThis = new List<Node>();
         specSyms = new List<string>();
+        finBodies = new List<Node>();
+        finLive = new List<int>();
+        finActive = new List<int>();
+        csNames = new List<string>();
+        csReps = new List<Node>();
+        brkFinBase = 0;
+        contFinBase = 0;
         stmtTemps = new List<string>();
         stmtTempTypes = new List<Node>();
         loopScopeBase = 0;
@@ -239,9 +270,64 @@ partial class Irgen {
     bool IsErasedType(Node t) {
         if (t == null) { return false; }
         if (t.ival >= 1) { return false; }
+        if (!IsTypeParamName(t.sval)) { return false; }
+        // A type parameter shadows a user type of the same name -- but only
+        // inside the scope that DECLARES it. `class T` next to `Binding<T>`:
+        // inside Binding's body `T` is the parameter, everywhere else it is
+        // the user class. Erasing it everywhere turned the user class into an
+        // i64 slot and the program stored a pointer into it.
+        string scope = typeScopeCls;
+        if (scope == "") { scope = curClass; }
+        if (IsTypeParamOf(scope, t.sval)) { return true; }
+        if (curMethodNode != null && IsTypeParamOf(curMethodNode, t.sval)) { return true; }
+        // a user type with that name: outside the declaring scope the name
+        // refers to the user type, not to the parameter
+        if (binder.FindType(t.sval) != null) { return false; }
+        return true;
+    }
+
+    // is the name a type parameter of that class (or of that method)?
+    bool IsTypeParamOf(Node owner, string name) {
+        if (owner == null) { return false; }
         int i = 0;
-        while (i < tparamNames.Count) { if (tparamNames[i] == t.sval) { return true; } i = i + 1; }
+        while (i < owner.kids.Count) {
+            Node k = owner.kids[i];
+            if (k.kind == AK.TypeParam() && k.sval == name) { return true; }
+            i = i + 1;
+        }
         return false;
+    }
+
+    bool IsTypeParamOf(string clsName, string name) {
+        if (clsName == "") { return false; }
+        return IsTypeParamOf(binder.FindType(clsName), name);
+    }
+
+    // is the name a type parameter somewhere in the program?
+    bool IsTypeParamName(string name) {
+        int i = 0;
+        while (i < tparamNames.Count) { if (tparamNames[i] == name) { return true; } i = i + 1; }
+        return false;
+    }
+
+    // Map a type that was written in ANOTHER class's scope (a method's own
+    // declared types): there a type parameter shadows a user type of the
+    // same name, so the erasure decision must use that class's scope.
+    string MapTypeDecl(Node t, string declCls) {
+        string saved = typeScopeCls;
+        typeScopeCls = declCls;
+        string r = MapType(t);
+        typeScopeCls = saved;
+        return r;
+    }
+
+    // the same, for the erasure test
+    bool IsErasedTypeDecl(Node t, string declCls) {
+        string saved = typeScopeCls;
+        typeScopeCls = declCls;
+        bool r = IsErasedType(t);
+        typeScopeCls = saved;
+        return r;
     }
 
     List<string> TParams(Node cls) {
@@ -1341,10 +1427,14 @@ partial class Irgen {
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
         Node fty = sf.type;
+        // the field's type is written in the OWNING class's scope
+        string savedScope = typeScopeCls;
+        typeScopeCls = owner;
         string lt = MapType(fty);
         string g = "@__zan_sf_" + owner + "_" + name;
         string t = NT();
         L("  " + t + " = load " + lt + ", " + lt + "* " + g);
+        typeScopeCls = savedScope;
         return new ExprVal(t, fty);
     }
     void StoreStaticField(Node cls, string name, ExprVal v) {
@@ -1352,10 +1442,14 @@ partial class Irgen {
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
         Node fty = sf.type;
+        // the field's type is written in the OWNING class's scope
+        string savedScope = typeScopeCls;
+        typeScopeCls = owner;
         string lt = MapType(fty);
         string g = "@__zan_sf_" + owner + "_" + name;
         if (IsNullableValue(fty)) {
             L("  store i8* " + BoxFor(v, fty) + ", i8** " + g);
+            typeScopeCls = savedScope;
             return;
         }
         if (ArcManaged(fty)) {
@@ -1365,11 +1459,13 @@ partial class Irgen {
             L("  store " + lt + " " + sv + ", " + lt + "* " + g);
             EmitArcRetain(sv, fty);
             EmitArcRelease(old, fty);
+            typeScopeCls = savedScope;
             return;
         }
         string sv = Coerce(v, lt);
         L("  store " + lt + " " + sv + ", " + lt + "* " + g);
         EmitArcRetainStore(sv, fty, v.ty);
+        typeScopeCls = savedScope;
     }
     // Emit an internal global for each static field declared in `cls`.
     void EmitStaticGlobals(Node cls) {
@@ -1377,7 +1473,11 @@ partial class Irgen {
         while (i < cls.kids.Count) {
             Node m = cls.kids[i];
             if (m.kind == AK.FieldDecl() && IsStatic(m)) {
+                // the field's type is written in THIS class's scope
+                string savedScope = typeScopeCls;
+                typeScopeCls = cls.sval;
                 string lt = MapType(m.type);
+                typeScopeCls = savedScope;
                 H("@__zan_sf_" + cls.sval + "_" + m.sval + " = internal global " + lt + " zeroinitializer");
             }
             i = i + 1;
@@ -1754,7 +1854,13 @@ partial class Irgen {
         int i = 0;
         while (i < types.Count) {
             if (cnt > 0) { s = s + ", "; }
+            // the field's type is written in THIS class's scope: a type
+            // parameter of the class erases there (a user type of the same
+            // name does not)
+            string savedScope = typeScopeCls;
+            typeScopeCls = cls.sval;
             s = s + MapType(types[i]);
+            typeScopeCls = savedScope;
             cnt = cnt + 1;
             i = i + 1;
         }
@@ -2410,6 +2516,11 @@ partial class Irgen {
         int fb = FieldBase(cls);
         int i = 0;
         int seq = 0;
+        // the field types are written in THIS class's scope: a type parameter
+        // of the class erases there (an i64 slot, not an ARC-managed
+        // pointer -- releasing it would corrupt the slot)
+        string savedScope = typeScopeCls;
+        typeScopeCls = cls.sval;
         while (i < names.Count) {
             if (ArcManaged(types[i]) && !WeakTy(types[i])) {
                 int idx = fb + i;
@@ -2429,6 +2540,7 @@ partial class Irgen {
             }
             i = i + 1;
         }
+        typeScopeCls = savedScope;
         H("  ret void");
         H("}");
     }

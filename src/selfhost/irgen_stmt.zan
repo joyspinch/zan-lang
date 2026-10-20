@@ -45,6 +45,10 @@ partial class Irgen {
                 ExprVal v = GenExpr(s.a);
                 if (curRet == "void") {
                     EmitTempReleases();
+                    // the finallys of the try statements this return leaves
+                    // run BEFORE the locals are released: they may use them
+                    EmitExitFins(0);
+                    if (term) { return; }
                     ReleaseLocalsFrom(0);
                     L("  ret void");
                 } else {
@@ -56,10 +60,14 @@ partial class Irgen {
                     // conversion produces a value of the *target* type
                     EmitArcRetain(rv, src.ty);
                     EmitTempReleases();
+                    EmitExitFins(0);
+                    if (term) { return; }
                     ReleaseLocalsFrom(0);
                     L("  ret " + curRet + " " + rv);
                 }
             } else {
+                EmitExitFins(0);
+                if (term) { return; }
                 ReleaseLocalsFrom(0);
                 L("  ret void");
             }
@@ -81,9 +89,20 @@ partial class Irgen {
         } else if (k == AK.ThrowStmt()) {
             GenThrow(s);
         } else if (k == AK.BreakStmt()) {
-            if (brkTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + brkTarget); term = true; }
+            if (brkTarget > 0) {
+                // the finallys opened inside the loop run before the break
+                EmitExitFins(brkFinBase);
+                if (term) { return; }
+                ReleaseLocalsFrom(loopScopeBase);
+                L("  br label %L" + brkTarget); term = true;
+            }
         } else if (k == AK.ContinueStmt()) {
-            if (contTarget > 0) { ReleaseLocalsFrom(loopScopeBase); L("  br label %L" + contTarget); term = true; }
+            if (contTarget > 0) {
+                EmitExitFins(contFinBase);
+                if (term) { return; }
+                ReleaseLocalsFrom(loopScopeBase);
+                L("  br label %L" + contTarget); term = true;
+            }
         } else if (k == AK.GotoStmt()) {
             int gid = LabelId(s.sval);
             L("  br label %L" + gid);
@@ -944,8 +963,10 @@ partial class Irgen {
     void GenWhile(Node s) {
         int lc = NL(); int lb = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = lc;
+        brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
@@ -956,14 +977,17 @@ partial class Irgen {
         if (!term) { L("  br label %L" + lc); }
         Label(lend);
         brkTarget = sb; contTarget = sc;
+        brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
     }
 
     void GenDoWhile(Node s) {
         int lb = NL(); int lc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = lc;
+        brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
         L("  br label %L" + lb);
         Label(lb);
@@ -976,6 +1000,7 @@ partial class Irgen {
         }
         Label(lend);
         brkTarget = sb; contTarget = sc;
+        brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
     }
 
@@ -988,8 +1013,10 @@ partial class Irgen {
         while (fi < locName.Count) { locIter[fi] = true; fi = fi + 1; }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
+        brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
@@ -1009,6 +1036,7 @@ partial class Irgen {
         ReleaseLocalsFrom(forScope);
         TrimLocals(forScope);
         brkTarget = sb; contTarget = sc;
+        brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
     }
 
@@ -1192,8 +1220,10 @@ partial class Irgen {
         if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
+        brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
@@ -1280,6 +1310,7 @@ partial class Irgen {
         ReleaseLocalsFrom(feScope);
         TrimLocals(feScope);
         brkTarget = sb; contTarget = sc;
+        brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
     }
 
@@ -1337,8 +1368,10 @@ partial class Irgen {
         if (ArcManaged(elemTy)) { L("  store " + elt + " null, " + elt + "* " + ereg); }
         int lc = NL(); int lb = NL(); int linc = NL(); int lend = NL();
         int sb = brkTarget; int sc = contTarget;
+        int sbf = brkFinBase; int scf = contFinBase;
         int sls = loopScopeBase;
         brkTarget = lend; contTarget = linc;
+        brkFinBase = finBodies.Count; contFinBase = finBodies.Count;
         loopScopeBase = locName.Count;
         L("  br label %L" + lc);
         Label(lc);
@@ -1377,6 +1410,7 @@ partial class Irgen {
         ReleaseLocalsFrom(feScope);
         TrimLocals(feScope);
         brkTarget = sb; contTarget = sc;
+        brkFinBase = sbf; contFinBase = scf;
         loopScopeBase = sls;
         return true;
     }
@@ -1434,6 +1468,47 @@ partial class Irgen {
         L("  store i64 " + sp1 + ", i64* @__exc_sp");
     }
 
+    // Run the finally bodies this exit path leaves, innermost first, and pop
+    // the EH frames of the try statements it leaves. A `return` inside a try
+    // body (or a catch clause) MUST run the finally before it returns: the C
+    // host does, and skipping it leaves whatever the finally releases
+    // (a mutex, a file handle) held forever -- the next Lock on it
+    // deadlocks.
+    //
+    // `from` is the index of the innermost finally the exit path leaves: a
+    // break/continue out of a loop runs only the finallys opened INSIDE that
+    // loop, a return runs all of them.
+    void EmitExitFins(int from) {
+        if (finBodies.Count <= from) { return; }
+        // the liveness flags are per-path: the pops below belong to this
+        // path only, so the flags are restored afterwards
+        List<int> saved = new List<int>();
+        int i = 0;
+        while (i < finBodies.Count) { saved.Add(finLive[i]); i = i + 1; }
+        i = finBodies.Count - 1;
+        while (i >= from) {
+            // the try's EH frame goes first: a throw from the finally body
+            // must reach the handler of the NEXT outer try
+            if (finLive[i] == 1) { EmitExcPop(); finLive[i] = 0; }
+            if (finBodies[i] != null && !FinIsActive(i)) {
+                finActive.Add(i);
+                GenStmt(finBodies[i]);
+                finActive.RemoveAt(finActive.Count - 1);
+                // a finally that returns ends the whole exit path
+                if (term) { break; }
+            }
+            i = i - 1;
+        }
+        i = 0;
+        while (i < finBodies.Count) { finLive[i] = saved[i]; i = i + 1; }
+    }
+
+    bool FinIsActive(int i) {
+        int k = 0;
+        while (k < finActive.Count) { if (finActive[k] == i) { return true; } k = k + 1; }
+        return false;
+    }
+
     // try { } catch (T e) { } finally { }  — setjmp/longjmp based
     void GenTry(Node s) {
         // the jmp_buf lives in a global array slot (not a stack alloca): in a
@@ -1468,16 +1543,32 @@ partial class Irgen {
         L("  " + c + " = icmp ne i32 " + r + ", 0");
         int ltry = NL(); int lcatch = NL(); int lend = NL();
         L("  br i1 " + c + ", label %L" + lcatch + ", label %L" + ltry);
+        // the try joins the finally stack: a `return` (or a break/continue)
+        // that leaves the try region must run its finally body, exactly like
+        // the C host. The entry lives until the whole try is emitted, so the
+        // catch clauses see it too.
+        int mark = finBodies.Count;
+        finBodies.Add(s.c);
+        finLive.Add(1);
         Label(ltry);
         GenStmt(s.a);
         if (!term) {
             EmitExcPop();
             if (curAsync) { EmitAsyncHcAdd(-1); }
-            if (s.c != null) { GenStmt(s.c); }
+            // the try's own frame is gone: the finally entry must not pop it
+            // a second time
+            finLive[mark] = 0;
+            if (s.c != null) {
+                finActive.Add(mark);
+                GenStmt(s.c);
+                finActive.RemoveAt(finActive.Count - 1);
+            }
             if (!term) { L("  br label %L" + lend); }
         }
         term = false;
         Label(lcatch);
+        // the throw popped this try's EH frame on its way here
+        finLive[mark] = 0;
         if (curAsync) {
             // disarm, then reload frame-resident locals: if the throw crossed
             // a suspension this invocation's stack allocas are stale -- the
@@ -1590,7 +1681,9 @@ partial class Irgen {
             L("  store i8* " + ev0 + ", i8** " + sv2);
             string td0 = NT(); L("  " + td0 + " = load i8*, i8** @__exc_tid");
             L("  store i8* " + td0 + ", i8** " + st2);
+            finActive.Add(mark);
             GenStmt(s.c);
+            finActive.RemoveAt(finActive.Count - 1);
             string ev1 = NT(); L("  " + ev1 + " = load i8*, i8** " + sv2);
             L("  store i8* " + ev1 + ", i8** @__exc_val");
             string td1 = NT(); L("  " + td1 + " = load i8*, i8** " + st2);
@@ -1608,5 +1701,10 @@ partial class Irgen {
         }
         Label(lend);
         term = false;
+        // the try leaves the finally stack
+        if (finBodies.Count > mark) {
+            finBodies.RemoveAt(finBodies.Count - 1);
+            finLive.RemoveAt(finLive.Count - 1);
+        }
     }
 }

@@ -1525,6 +1525,40 @@ partial class Irgen {
         }
     }
 
+    // The class-level specialized symbol of `m` (a method of a generic class)
+    // when the receiver's static type carries the concrete type arguments.
+    // The indexer and property paths need it as much as a plain call does:
+    // the erased body converts its key with the WRONG format (a `TKey` slot
+    // read as a number) and writes the value into a slot of the wrong width.
+    // Returns "" when no specialization applies; the binding it used is
+    // left in csNames/csReps.
+    string ClassSpecSym(string owner, Node m, Node recvTy) {
+        csNames = new List<string>();
+        csReps = new List<Node>();
+        if (m == null || recvTy == null) { return ""; }
+        Node cls = binder.FindType(owner);
+        if (cls == null) { return ""; }
+        List<string> ctps = TParams(cls);
+        if (ctps.Count == 0) { return ""; }
+        if (recvTy.kids.Count != ctps.Count) { return ""; }
+        // a method with its own type parameters needs those bound too --
+        // the plain call path does that; here we only specialize the
+        // class-level ones
+        if (TParams(m).Count > 0) { return ""; }
+        int i = 0;
+        while (i < ctps.Count) {
+            csNames.Add(ctps[i]);
+            csReps.Add(recvTy.kids[i]);
+            i = i + 1;
+        }
+        List<Node> ctypes = new List<Node>();
+        i = 0;
+        while (i < csReps.Count) { ctypes.Add(csReps[i]); i = i + 1; }
+        string tag = SpecTagC(m, ctypes, new List<string>(), csNames, csReps, "I");
+        if (tag == "") { return ""; }
+        return SpecQueueTy(owner, m, csNames, csReps, tag, recvTy);
+    }
+
     // The indexer read: `obj[idx]` -> Owner_op_index(obj, idx).
     ExprVal EmitIndexCall(ExprVal obj, Node m, ExprVal idx) {
         Node cls = ClassOf(obj.ty);
@@ -1536,11 +1570,25 @@ partial class Irgen {
             L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
             thisOp = bc;
         }
+        // a generic class's indexer gets a specialized body: the key and the
+        // value keep their concrete types
+        string sym = MethodSym(owner, m);
+        string rtm = MapTypeDecl(m.type, owner);
+        string p0m = MapTypeDecl(ParamTypeNode(m, 0), owner);
+        Node rty = m.type;
         Node p0 = ParamTypeNode(m, 0);
+        string ss = ClassSpecSym(owner, m, obj.ty);
+        if (ss != "") {
+            sym = ss;
+            rty = SubstTP(m.type, csNames, csReps);
+            p0 = SubstTP(p0, csNames, csReps);
+            rtm = MapType(rty);
+            p0m = MapType(p0);
+        }
         string t = NT();
-        L("  " + t + " = call " + MapType(m.type) + " @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
-            + ", " + MapType(p0) + " " + CallArg(idx, p0) + ")");
-        return new ExprVal(t, m.type);
+        L("  " + t + " = call " + rtm + " @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + p0m + " " + CallArg(idx, p0) + ")");
+        return new ExprVal(t, rty);
     }
 
     // The indexer write: `obj[idx] = v` -> Owner_op_index_set(obj, idx, v).
@@ -1554,11 +1602,22 @@ partial class Irgen {
             L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
             thisOp = bc;
         }
+        string sym = MethodSym(owner, m);
         Node p0 = ParamTypeNode(m, 0);
         Node p1 = ParamTypeNode(m, 1);
-        L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
-            + ", " + MapType(p0) + " " + CallArg(idx, p0)
-            + ", " + MapType(p1) + " " + CallArg(v, p1) + ")");
+        string p0m = MapTypeDecl(p0, owner);
+        string p1m = MapTypeDecl(p1, owner);
+        string ss = ClassSpecSym(owner, m, obj.ty);
+        if (ss != "") {
+            sym = ss;
+            p0 = SubstTP(p0, csNames, csReps);
+            p1 = SubstTP(p1, csNames, csReps);
+            p0m = MapType(p0);
+            p1m = MapType(p1);
+        }
+        L("  call void @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + p0m + " " + CallArg(idx, p0)
+            + ", " + p1m + " " + CallArg(v, p1) + ")");
     }
 
     // obj.Name = v  ->  Owner_set_Name(obj, v). Returns false if no setter.
@@ -1582,8 +1641,18 @@ partial class Irgen {
             L("  " + bc + " = bitcast %" + clsName + "* " + objOp + " to %" + owner + "*");
             thisOp = bc;
         }
-        L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
-            + ", " + MapType(pty) + " " + CallArg(v, pty) + ")");
+        // a generic class's property setter gets a specialized body: the
+        // value keeps its concrete type
+        string sym = MethodSym(owner, m);
+        string ptym = MapTypeDecl(pty, owner);
+        string ss = ClassSpecSym(owner, m, recvTy);
+        if (ss != "") {
+            sym = ss;
+            pty = SubstTP(pty, csNames, csReps);
+            ptym = MapType(pty);
+        }
+        L("  call void @" + sym + "(%" + owner + "* " + thisOp
+            + ", " + ptym + " " + CallArg(v, pty) + ")");
         return true;
     }
 
@@ -4858,9 +4927,11 @@ partial class Irgen {
                 if (tag != "") { sym = SpecQueue(clsName, m, stns, strs, tag); spec = true; }
             }
         }
+        string declCls = clsName;
+        if (m != null) { declCls = DeclOwnerOf(cls, m); }
         string rt = "i64";
-        if (m != null) { rt = MapType(m.type); }
-        if (spec) { rt = MapType(SubstTP(m.type, stns, strs)); }
+        if (m != null) { rt = MapTypeDecl(m.type, declCls); }
+        if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), declCls); }
         bool isAsyncCall = (m != null && IsAsync(m));
         if (isAsyncCall) { rt = "i8*"; }
         string args = "";
@@ -4876,7 +4947,7 @@ partial class Irgen {
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
                 else { addr = RefPlacePtr(aargs[i].a, pty); }
-                args = args + MapType(pty) + "* " + addr;
+                args = args + MapTypeDecl(pty, declCls) + "* " + addr;
                 i = i + 1;
                 continue;
             }
@@ -4892,7 +4963,7 @@ partial class Irgen {
                 L("  " + fp + " = load i8*, i8** " + cp);
                 args = args + "i8* " + fp;
             } else {
-                args = args + MapType(pty) + " " + CallArg(av, pty);
+                args = args + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty);
             }
             i = i + 1;
         }
@@ -5045,6 +5116,22 @@ partial class Irgen {
         }
     }
 
+    // A deep copy of a type node. A substitution must never hand back the
+    // ORIGINAL AST node: the concrete type argument is shared with the call
+    // site, and stamping the array rank onto it (the array branch of
+    // `SubstTP`) turned every `int` in the program into an array type --
+    // the program then compared pointers as integers and the IR stopped
+    // verifying.
+    Node CopyType(Node t) {
+        if (t == null) { return null; }
+        Node n = new Node(t.kind);
+        n.sval = t.sval; n.op = t.op; n.ival = t.ival; n.sval2 = t.sval2;
+        n.mods = t.mods; n.line = t.line; n.col = t.col;
+        int i = 0;
+        while (i < t.kids.Count) { n.Add(CopyType(t.kids[i])); i = i + 1; }
+        return n;
+    }
+
     Node SubstTP(Node t, List<string> names, List<Node> reps) {
         if (t == null) { return null; }
         if (t.ival >= 1) {
@@ -5063,7 +5150,10 @@ partial class Irgen {
         }
         if (t.kids.Count == 0) {
             int hit = IndexOfStr(names, t.sval);
-            if (hit >= 0) { return reps[hit]; }
+            // a COPY, not the original node: the substitution writes the
+            // array rank onto its result, and the original belongs to the
+            // caller's AST
+            if (hit >= 0) { return CopyType(reps[hit]); }
             return t;
         }
         Node n = new Node(t.kind);
@@ -5127,14 +5217,19 @@ partial class Irgen {
         if (n.kind == AK.TypeRef()) {
             Node sub = SubstTP(n, tns, trs);
             if (sub == null) { return null; }
-            sub.line = n.line; sub.col = n.col; sub.mods = n.mods;
-            sub.type = SubstTP(n.type, tns, trs);
-            return sub;
+            // a copy: stamping the position on the substituted node would
+            // write through to the caller's AST when the substitution did
+            // not replace anything
+            Node r = CopyType(sub);
+            if (r == null) { return null; }
+            r.line = n.line; r.col = n.col; r.mods = n.mods;
+            r.type = CopyType(SubstTP(n.type, tns, trs));
+            return r;
         }
         Node c = new Node(n.kind);
         c.op = n.op; c.ival = n.ival; c.sval = n.sval; c.sval2 = n.sval2;
         c.mods = n.mods; c.line = n.line; c.col = n.col;
-        c.type = SubstTP(n.type, tns, trs);
+        c.type = CopyType(SubstTP(n.type, tns, trs));
         c.a = CloneSubst(n.a, tns, trs);
         c.b = CloneSubst(n.b, tns, trs);
         c.c = CloneSubst(n.c, tns, trs);
@@ -5174,9 +5269,26 @@ partial class Irgen {
     // would claim one symbol -- and the first registered body would win
     // every call site.
     string SpecTagP(Node m, List<string> mtps, List<string> tns, List<Node> trs, string prefix) {
+        return SpecTagC(m, new List<Node>(), mtps, tns, trs, prefix);
+    }
+
+    // The tag of a class-level clone: it ALSO encodes the class's concrete
+    // type arguments (`ctypes`, taken positionally from the receiver's
+    // static type). Without that part two instantiations of the same generic
+    // class (`Stack<int>` and `Stack<string>`) would claim ONE symbol --
+    // and the first registered body would win every call site, so a
+    // `Stack<string>` call would run the `Stack<int>` body.
+    string SpecTagC(Node m, List<Node> ctypes, List<string> mtps, List<string> tns, List<Node> trs, string prefix) {
         StringBuilder sb = new StringBuilder();
         sb.Append(prefix);
         int i = 0;
+        while (i < ctypes.Count) {
+            if (ctypes[i] == null || MentionsTypeParam(ctypes[i])) { return ""; }
+            sb.Append("_");
+            sb.Append(TypeTag(ctypes[i]));
+            i = i + 1;
+        }
+        i = 0;
         while (i < mtps.Count) {
             int hit = IndexOfStr(tns, mtps[i]);
             if (hit < 0) { return ""; }
@@ -5347,6 +5459,11 @@ partial class Irgen {
         bool spec = false;
         List<string> stns = new List<string>();
         List<Node> strs = new List<Node>();
+        // the CLASS's own type arguments, kept apart from the method's: the
+        // tag is built from both, and a method type parameter may shadow a
+        // class one (same name) -- the two must not be looked up in the
+        // same list
+        List<Node> ctypes = new List<Node>();
         if (m != null && CanSpecialize(m)) {
             List<string> mtps = TParams(m);
             List<string> ctps = TParams(cls);
@@ -5360,6 +5477,7 @@ partial class Irgen {
                 int ci = 0;
                 while (ci < ctps.Count) {
                     stns.Add(ctps[ci]); strs.Add(recv.ty.kids[ci]);
+                    ctypes.Add(recv.ty.kids[ci]);
                     ci = ci + 1;
                 }
                 clsSpec = true;
@@ -5370,7 +5488,7 @@ partial class Irgen {
                 }
             }
             if (clsSpec || mtps.Count > 0) {
-                string tag = SpecTagP(m, mtps, stns, strs, clsSpec ? "I" : "");
+                string tag = SpecTagC(m, ctypes, mtps, stns, strs, clsSpec ? "I" : "");
                 if (tag != "") {
                     sym = SpecQueueTy(owner, m, stns, strs, tag, clsSpec ? recv.ty : null);
                     spec = true;
@@ -5384,8 +5502,8 @@ partial class Irgen {
             thisOp = bc;
         }
         string rt = "i64";
-        if (m != null) { rt = MapType(m.type); }
-        if (spec) { rt = MapType(SubstTP(m.type, stns, strs)); }
+        if (m != null) { rt = MapTypeDecl(m.type, owner); }
+        if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), owner); }
         bool isAsyncCall = (m != null && IsAsync(m));
         if (isAsyncCall) { rt = "i8*"; }
         string args = "%" + owner + "* " + thisOp;
@@ -5402,12 +5520,12 @@ partial class Irgen {
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
                 else { addr = RefPlacePtr(aargs[i].a, pty); }
-                args = args + MapType(pty) + "* " + addr;
+                args = args + MapTypeDecl(pty, owner) + "* " + addr;
                 i = i + 1;
                 continue;
             }
             ExprVal av = GenArgExpr(aargs[i], pty);
-            args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
+            args = args + ", " + MapTypeDecl(pty, owner) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
@@ -5422,7 +5540,7 @@ partial class Irgen {
             AddTemp(t, srt);
             return new ExprVal(t, srt);
         }
-        if (m != null && IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        if (m != null && IsErasedTypeDecl(m.type, owner)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         Node retTy = MkType("int"); if (m != null) { retTy = m.type; }
         AddTemp(t, retTy);
         return new ExprVal(t, retTy);
@@ -5431,7 +5549,8 @@ partial class Irgen {
     ExprVal EmitVirtualCall(ExprVal recv, Node cls, string name, Node m, Node e) {
         string clsName = cls.sval;
         int slot = VSlotIndexM(cls, m);
-        string rt = MapType(m.type);
+        string declCls = DeclOwnerOf(cls, m);
+        string rt = MapTypeDecl(m.type, declCls);
         // an async method returns the coroutine FRAME, not the declared
         // result -- `async void` included: the ramp hands back the frame
         // pointer and the await needs it. The void branch below must not
@@ -5460,12 +5579,12 @@ partial class Irgen {
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
                 else { addr = RefPlacePtr(aargs[i].a, pty); }
-                args = args + ", " + MapType(pty) + "* " + addr;
+                args = args + ", " + MapTypeDecl(pty, declCls) + "* " + addr;
                 i = i + 1;
                 continue;
             }
             ExprVal av = GenArgExpr(aargs[i], pty);
-            args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
+            args = args + ", " + MapTypeDecl(pty, declCls) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
@@ -5482,7 +5601,7 @@ partial class Irgen {
             Node tt = MkType("__task"); tt.a = m.type;
             return AsyncFrame(t, tt);
         }
-        if (IsErasedType(m.type)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
+        if (IsErasedTypeDecl(m.type, declCls)) { return FromSlot(t, ConcreteTP(m.type, recv.ty)); }
         AddTemp(t, m.type);
         return new ExprVal(t, m.type);
     }
