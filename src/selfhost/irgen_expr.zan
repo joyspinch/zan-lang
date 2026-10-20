@@ -1750,6 +1750,11 @@ partial class Irgen {
             }
         }
         ExprVal obj = GenExpr(e.a);
+        // Task 句柄的属性形态：`t.Result` / `t.IsCompleted`（不带括号的成员
+        // 访问；`t.Wait()` 走调用路径）。
+        if (obj.ty != null && obj.ty.sval == "Task") {
+            return EmitTaskMemberCall(obj, e.sval, e);
+        }
         if (IsNullableValue(obj.ty) && e.sval == "HasValue") {
             string t = NT();
             L("  " + t + " = icmp ne i8* " + obj.op + ", null");
@@ -3397,20 +3402,11 @@ partial class Irgen {
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()) {
             string cn = callee.a.sval;
             string mn = callee.sval;
-            if (cn == "Task" && mn == "Spawn" && e.kids.Count == 1) {
-                usesAsync = true;
-                ExprVal sub = GenExpr(e.kids[0]);
-                string subv = sub.op;
-                string subh = NT(); L("  " + subh + " = bitcast i8* " + subv + " to i64*");
-                string selfi = NT(); L("  " + selfi + " = ptrtoint i8* " + subv + " to i64");
-                L("  store i64 " + selfi + ", i64* " + FrameGep(subh, 2));
-                string reapi = NT(); L("  " + reapi + " = ptrtoint void(i8*)* @__zan_co_reap to i64");
-                L("  store i64 " + reapi + ", i64* " + FrameGep(subh, 3));
-                string orp = FrameGep(subh, 5);
-                string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
-                string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
-                L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
-                return new ExprVal("0", MkType("int"));
+            if (cn == "Task" && (mn == "Run" || mn == "Spawn") && e.kids.Count == 1) {
+                return EmitTaskRunCall(e, mn == "Spawn");
+            }
+            if (cn == "Task" && mn == "IsDone" && e.kids.Count == 1) {
+                return EmitTaskIsDone(e);
             }
             if (cn == "Environment" && mn == "ArgCount") {
                 string a = NT(); L("  " + a + " = load i32, i32* @__zan_argc");
@@ -3744,6 +3740,10 @@ partial class Irgen {
                     return new ExprVal(r, MkType("string"));
                 }
                 return new ExprVal(ToCStr(recv), MkType("string"));
+            }
+            // Task 句柄上的成员：Wait / Result / IsCompleted
+            if (recv.ty != null && recv.ty.sval == "Task") {
+                return EmitTaskMemberCall(recv, mname, e);
             }
             // builtin in-place List.Reverse wins over the copying extension
             if (IsListType(recv.ty) && mname == "Reverse" && e.kids.Count == 0) {

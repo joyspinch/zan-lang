@@ -612,3 +612,50 @@ kernel32、shell32、user32、advapi32、version）。
   没查清就写"修好了"，等于把**空转**记成修复。
 - 推论：差分门通过 ≠ 这条路径真的被走过。判"修好"要看**行为差分**，不是看
   门绿；同一个探针在有/无这行时输出**逐字相同**，就说明这行当前是空转。
+
+## 35. 降级到**自己**的布局：行为对齐即可，字节不必对齐
+
+- 动作：自举实现任务句柄族（`Task.Run` / `Task.Spawn` / `t.Wait()` /
+  `t.Result` / `t.IsCompleted` / `Task.IsDone`）时，**没有**去对齐宿主的
+  `zan_co_fhdr` 帧头（A385），而是降级到自举**自己**的扁平 i64 帧上：句柄
+  = 帧指针，done 标志 = 槽 1，结果 = 槽 4。宿主是同一套协议、另一套字节
+  （`irgen_expr_core.c` 的 `emit_task_member`：test/pump 循环 → 读结果 →
+  回收）。差分门比的是 **stdout 逐字**，不是帧布局——所以"布局没对齐"从来不
+  是"降级做不了"的理由，只有**行为**对齐才是。
+- 坑一：**完成即释放 = 句柄读的是已释放内存**。句柄在任务完成后还要能读
+  done 标志（`t.IsCompleted`），所以 action 帧不能在完成路径里释放。宿主靠
+  运行时的**活跃帧登记表**（`zan_co_live_add/has`）回收，自举没有 → 只能
+  不释放（每个 action 帧泄漏 72 字节；不是 ARC 对象，泄漏检查看不见）。
+  要根治就得在自举侧也做一份活跃帧登记表。
+- 坑二：**自举没有工作线程池**。宿主的 `Task.Run` 把任务丢给工作线程，主
+  线程只等；自举的调度器是**单线程协作式**的，任务只在主线程泵调度器时
+  前进。于是 `while (Task.IsDone(h) == 0) {}` 这种忙等在自举侧永远推不动：
+  `IsDone` 读到"还没完"就必须**给调度器一次机会**（泵一次再读），否则是死
+  循环。这是自举与宿主唯一的语义偏差，遇到"宿主能跑、自举卡住"先查这条。
+- 坑三：**属性形态与调用形态是两条路**。`t.Wait()` 是调用，`t.Result` /
+  `t.IsCompleted` 是**不带括号的成员访问**——只挂调用路径会漏掉一半，症状是
+  "member 'Result' of type 'Task' is not supported"。挂的时候两处都要挂
+  （`GenCall` 与 `GenMember`）。
+- 顺带：显式函数类型里**不能带形参名**。`call void (i8* %env) %fp(...)` 是
+  非法 IR（clang: "argument name invalid in function type"），要写
+  `call void (i8*) %fp(i8* %env)`——类型里只留类型，名字只留在实参上。
+
+## 36. lambda 返回的是**自己**的值：返回类型未知时不要查 `return`
+
+- 坑（2026-10-20 实测）：自举的检查器把 **lambda 的函数体**按**外层方法**的
+  返回类型查 `return`——于是在 void 方法里写
+  `Func<int> f = delegate () { return 5; };` 被报成
+  "cannot return a value from a void method"，而 C 宿主**编译并运行**这个程序
+  （输出 5）。这是**假阳性**：lambda 返回的是它自己的值，跟外层方法无关。
+- 做法：lambda 的返回类型在自举侧**不知道**（检查器不从上下文给 lambda 定
+  型），所以函数体里的 `return` **不查**（既不查"void 方法不能返回值"，也不
+  查"必须返回值"）。实现上给检查器加一个 `curRetKnown` 标志：方法体为
+  true，lambda 体为 false。
+- 为什么值得单独记：这条假阳性会**挡掉**别的诊断对齐——`Task.Run(delegate ()
+  { return 5; })` 在宿主侧报的是 Task.Run 专属的那条（"Task.Run delegate
+  must be a parameterless void body (an Action); pass an async call for
+  results"），自举侧却先被这条泛化诊断拦下，措辞对不上。**上游的检查器
+  假阳性会掩盖下游的诊断对齐**，差分门看到的"措辞不同"往往根子在更早的
+  一层。
+- 教训：**"措辞不同"先查更早的层**。同一个程序，宿主报专属诊断、自举报泛化
+  诊断时，先确认自举是不是在更早的检查里就拒了它。

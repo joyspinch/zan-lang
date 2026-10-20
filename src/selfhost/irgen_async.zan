@@ -1275,6 +1275,317 @@ partial class Irgen {
         H("}");
     }
 
+    // ===== Task 句柄的内建族（Task.Run / Spawn / Wait / Result / IsCompleted）=====
+    //
+    // 自举把任务句柄族降级到**自己**的帧布局上（文件头的扁平 i64 帧）：句柄
+    // 就是帧指针，done 标志在槽 1，结果在槽 4。宿主做的是同一件事，只是帧头
+    // 布局不同（src/compiler/irgen_expr_core.c 的 emit_task_member：先跑
+    // test/pump 循环等完成，再读结果并回收）——两边一致的是**可观察行为**，
+    // 不是字节。
+    //
+    // 句柄以 i8*（帧指针）流动：`long h = task` 用 ptrtoint 打包，
+    // `Task.IsDone(h)` 用 inttoptr 拆包——与宿主对 i64 句柄的往返一致。
+
+    // 帧的 i64* 视图
+    string TaskFrameHeader(string fp) {
+        string p = NT();
+        L("  " + p + " = bitcast i8* " + fp + " to i64*");
+        return p;
+    }
+
+    // 等帧跑完：泵协作调度器直到 done 标志置位（宿主的 tk.test/tk.pump 循环）
+    void EmitTaskWait(string fp) {
+        string fph = TaskFrameHeader(fp);
+        string dp = FrameGep(fph, 1);
+        int lt = NL(); int lw = NL(); int ld = NL();
+        L("  br label %L" + lt);
+        term = true;
+        Label(lt);
+        string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
+        string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
+        L("  br i1 " + c + ", label %L" + ld + ", label %L" + lw);
+        Label(lw);
+        L("  call void @zan_co_sched_run()");
+        L("  br label %L" + lt);
+        Label(ld);
+    }
+
+    // 帧的 done 标志（i64 的 0/1）
+    string TaskDoneValue(string fp) {
+        string fph = TaskFrameHeader(fp);
+        string dp = FrameGep(fph, 1);
+        string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
+        string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
+        string r = NT(); L("  " + r + " = zext i1 " + c + " to i64");
+        return r;
+    }
+
+    // lambda 体里有没有带值的 return（宿主: lambda_body_has_value_return）
+    bool TaskLambdaHasValueReturn(Node n) {
+        if (n == null) { return false; }
+        if (n.kind == AK.ReturnStmt()) { return n.a != null; }
+        if (n.kind == AK.Lambda()) { return false; }
+        if (TaskLambdaHasValueReturn(n.a) || TaskLambdaHasValueReturn(n.b)
+            || TaskLambdaHasValueReturn(n.c) || TaskLambdaHasValueReturn(n.d)) { return true; }
+        int i = 0;
+        while (i < n.kids.Count) {
+            if (TaskLambdaHasValueReturn(n.kids[i])) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // action 帧的 step 函数：跑委托，然后置 done。按调用点各生成一份（像
+    // lambda 那样），因为委托的函数类型只有调用点知道。宿主用的是一份共享
+    // 的 step（它的委托形状被固定成 Action），这里按调用点特化，行为一致。
+    string EmitTaskActionStep() {
+        int id = lamCount; lamCount = lamCount + 1;
+        string fname = "@__task_action_step_" + id;
+        // 保存外层函数的状态
+        StringBuilder savedBody = body;
+        int sTmp = tmp; int sLbl = lbl; bool sTerm = term; string sCurLbl = curLbl;
+        string sRet = curRet; Node sRetTy = curRetTy; string sClass = curClass; bool sHasThis = curHasThis;
+        List<string> sLocName = locName; List<Node> sLocType = locType;
+        List<string> sLocReg = locReg; int sLocSeq = locSeq;
+        List<bool> sLocBox = locBox; List<bool> sLocIter = locIter; List<string> sLocCell = locCell;
+        List<string> sCapNames = capNames;
+        int sBrk = brkTarget; int sCont = contTarget; int sLoopScope = loopScopeBase;
+        List<string> svT = stmtTemps; List<Node> svTT = stmtTempTypes;
+        StringBuilder sEa = entryAllocas; bool sEaAct = eaActive;
+        bool sAsync = curAsync;
+        body = new StringBuilder();
+        entryAllocas = new StringBuilder(); eaActive = true;
+        tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
+        locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
+        locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        capNames = new List<string>();
+        curRet = "void"; curRetTy = MkType("void"); curClass = ""; curHasThis = false;
+        brkTarget = 0; contTarget = 0;
+        stmtTemps = new List<string>(); stmtTempTypes = new List<Node>();
+
+        // %fp 是 action 帧：槽 8 存委托（带闭包标签的指针）
+        string fph = NT(); L("  " + fph + " = bitcast i8* %fp to i64*");
+        string dlgp = FrameGep(fph, 8);
+        string dlgi = NT(); L("  " + dlgi + " = load i64, i64* " + dlgp);
+        string dlg = NT();
+        L("  " + dlg + " = inttoptr i64 " + dlgi + " to i8*");
+        string iv = NT(); L("  " + iv + " = ptrtoint i8* " + dlg + " to i64");
+        string bit = NT(); L("  " + bit + " = and i64 " + iv + ", 1");
+        string isClo = NT(); L("  " + isClo + " = icmp ne i64 " + bit + ", 0");
+        int lClo = NL(); int lBare = NL(); int lFin = NL();
+        L("  br i1 " + isClo + ", label %L" + lClo + ", label %L" + lBare);
+        Label(lClo);
+        // 闭包：记录 { fn, env }，调用时把 env 作为第一个实参
+        string uv = NT(); L("  " + uv + " = and i64 " + iv + ", -2");
+        string rec = NT(); L("  " + rec + " = inttoptr i64 " + uv + " to i8*");
+        string clop = NT(); L("  " + clop + " = bitcast i8* " + rec + " to i8**");
+        string fni8 = NT(); L("  " + fni8 + " = load i8*, i8** " + clop);
+        string envp = NT(); L("  " + envp + " = getelementptr i8*, i8** " + clop + ", i64 1");
+        string env = NT(); L("  " + env + " = load i8*, i8** " + envp);
+        string fpc = NT(); L("  " + fpc + " = bitcast i8* " + fni8 + " to void (i8*)*");
+        L("  call void (i8*) " + fpc + "(i8* " + env + ")");
+        L("  br label %L" + lFin);
+        Label(lBare);
+        // 裸函数指针：没有 env 槽
+        string fnb = NT(); L("  " + fnb + " = inttoptr i64 " + iv + " to i8*");
+        string fpb = NT(); L("  " + fpb + " = bitcast i8* " + fnb + " to void ()*");
+        L("  call void () " + fpb + "()");
+        L("  br label %L" + lFin);
+        Label(lFin);
+        // done = 1，state = -1
+        string dp = FrameGep(fph, 1);
+        L("  store i64 1, i64* " + dp);
+        string sp = FrameGep(fph, 0);
+        L("  store i64 -1, i64* " + sp);
+        // 唤醒等待者（槽 2/3）——与 EmitAsyncComplete 同一套协议
+        string awp = FrameGep(fph, 2);
+        string awi = NT(); L("  " + awi + " = load i64, i64* " + awp);
+        string aw = NT(); L("  " + aw + " = inttoptr i64 " + awi + " to i8*");
+        string has = NT(); L("  " + has + " = icmp ne i8* " + aw + ", null");
+        int lw = NL(); int lr = NL();
+        L("  br i1 " + has + ", label %L" + lw + ", label %L" + lr);
+        Label(lw);
+        string asp = FrameGep(fph, 3);
+        string asi = NT(); L("  " + asi + " = load i64, i64* " + asp);
+        string asfn = NT(); L("  " + asfn + " = inttoptr i64 " + asi + " to void(i8*)*");
+        L("  call void @zan_co_ready(i8* " + aw + ", void(i8*)* " + asfn + ")");
+        L("  br label %L" + lr);
+        Label(lr);
+        L("  ret void");
+
+        deferred.Append("define internal void " + fname + "(i8* %fp) {\n");
+        deferred.Append("entry:\n");
+        deferred.Append(entryAllocas.ToString());
+        deferred.Append(body.ToString());
+        deferred.Append("}\n");
+
+        // 恢复外层函数的状态
+        body = savedBody;
+        tmp = sTmp; lbl = sLbl; term = sTerm; curLbl = sCurLbl;
+        curRet = sRet; curRetTy = sRetTy; curClass = sClass; curHasThis = sHasThis;
+        locName = sLocName; locType = sLocType; locReg = sLocReg; locSeq = sLocSeq;
+        locBox = sLocBox; locIter = sLocIter; locCell = sLocCell; capNames = sCapNames;
+        brkTarget = sBrk; contTarget = sCont; loopScopeBase = sLoopScope;
+        stmtTemps = svT; stmtTempTypes = svTT;
+        entryAllocas = sEa; eaActive = sEaAct;
+        curAsync = sAsync;
+        return fname;
+    }
+
+    // action 帧：跑一个委托、没有结果的任务帧。槽 8 存委托。
+    // 帧不释放：宿主靠运行时的活跃帧登记表回收，自举没有那个登记表，而
+    // 句柄在任务完成后还要能读 done 标志（IsCompleted）——提前释放就是
+    // 读已释放内存。代价是每个 action 帧泄漏 72 字节（不是 ARC 对象，
+    // 泄漏检查看不见）。
+    ExprVal EmitTaskActionFrame(ExprVal dlg) {
+        string raw = NT();
+        L("  " + raw + " = call i8* @malloc(i64 72)");
+        string fph = NT(); L("  " + fph + " = bitcast i8* " + raw + " to i64*");
+        int i = 0;
+        while (i < 8) {
+            L("  store i64 0, i64* " + FrameGep(fph, i));
+            i = i + 1;
+        }
+        string dlgp = FrameGep(fph, 8);
+        string dlgv = NT(); L("  " + dlgv + " = ptrtoint i8* " + dlg.op + " to i64");
+        L("  store i64 " + dlgv + ", i64* " + dlgp);
+        string step = EmitTaskActionStep();
+        L("  call void @zan_co_ready(i8* " + raw + ", void(i8*)* " + step + ")");
+        return new ExprVal(raw, MkType("Task"));
+    }
+
+    // 把一个 async 调用的帧交给调度器。selfReap=true 时帧自己回收自己
+    // （宿主: emit_detach_async_call 把 AWAITER 设成自己、AWAITER_STEP 设成
+    // 回收函数）；Task.Run 的带结果形态不设——结果由读者（.Result）取走。
+    void EmitTaskReadyFrame(ExprVal sub, bool selfReap) {
+        string subv = sub.op;
+        string fph = NT(); L("  " + fph + " = bitcast i8* " + subv + " to i64*");
+        if (selfReap) {
+            string selfi = NT(); L("  " + selfi + " = ptrtoint i8* " + subv + " to i64");
+            L("  store i64 " + selfi + ", i64* " + FrameGep(fph, 2));
+            string reapi = NT(); L("  " + reapi + " = ptrtoint void(i8*)* @__zan_co_reap to i64");
+            L("  store i64 " + reapi + ", i64* " + FrameGep(fph, 3));
+        }
+        // 帧的槽 5 是自己的 resume 入口（ramp 写的）
+        string orp = FrameGep(fph, 5);
+        string ori = NT(); L("  " + ori + " = load i64, i64* " + orp);
+        string orfn = NT(); L("  " + orfn + " = inttoptr i64 " + ori + " to void(i8*)*");
+        L("  call void @zan_co_ready(i8* " + subv + ", void(i8*)* " + orfn + ")");
+    }
+
+    // Task.Run(arg) / Task.Spawn(arg)
+    ExprVal EmitTaskRunCall(Node e, bool spawn) {
+        usesAsync = true;
+        Node arg = e.kids[0];
+        // 委托形态：宿主把 lambda 固定成 Action 形状（无参、无结果），自举
+        // 同样把 lambda 的返回类型按 void 处理。
+        bool isLam = (arg.kind == AK.Lambda());
+        Node savedTy = null;
+        if (isLam) {
+            if (arg.kids.Count != 0 || TaskLambdaHasValueReturn(arg.d)
+                || TaskLambdaHasValueReturn(arg.a)) {
+                diags.Error("Task.Run delegate must be a parameterless void body (an Action); " +
+                    "pass an async call for results", arg.line, arg.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            savedTy = arg.type;
+            arg.type = MkType("void");
+        }
+        ExprVal av = GenExpr(arg);
+        if (isLam && savedTy != null) { arg.type = savedTy; }
+        // 委托形态：没有结果的任务
+        if (av.ty != null && IsDelegate(av.ty)) {
+            if (DelegParams(av.ty).Count != 0) {
+                diags.Error("Task.Run delegate must take no parameters", arg.line, arg.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            Node rt = DelegRet(av.ty);
+            if (rt == null || rt.sval != "void") {
+                diags.Error("Task.Run delegate must be a parameterless void body (an Action); " +
+                    "pass an async call for results", arg.line, arg.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            return EmitTaskActionFrame(av);
+        }
+        // async 调用形态：调用的帧就是任务帧
+        if (!av.asyncCall) {
+            diags.Error("call to '" + (spawn ? "Task.Spawn" : "Task.Run")
+                + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
+        EmitTaskReadyFrame(av, spawn);
+        Node hty = MkType("Task");
+        if (!spawn && av.ty != null && av.ty.a != null) {
+            Node elem = AsyncElemTyOf(av.ty.a);
+            if (elem != null && elem.sval != "void") { hty.Add(elem); }
+        }
+        return new ExprVal(av.op, hty);
+    }
+
+    // 句柄上的成员：Wait / Result / IsCompleted
+    ExprVal EmitTaskMemberCall(ExprVal recv, string mname, Node e) {
+        string fp = recv.op;
+        if (mname == "Wait") {
+            EmitTaskWait(fp);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (mname == "IsCompleted") {
+            return new ExprVal(TaskDoneValue(fp), MkType("int"));
+        }
+        if (mname == "Result") {
+            Node elem = null;
+            if (recv.ty != null && recv.ty.kids.Count == 1) { elem = recv.ty.kids[0]; }
+            if (elem == null) {
+                diags.Error("Task.Result requires a Task<T> value", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            EmitTaskWait(fp);
+            string fph = TaskFrameHeader(fp);
+            string rp = FrameGep(fph, 4);
+            string resi = NT(); L("  " + resi + " = load i64, i64* " + rp);
+            string rvv = FromI64(resi, MapType(elem));
+            // 帧由读者回收（宿主: co_reap）
+            L("  call void @free(i8* " + fp + ")");
+            return new ExprVal(rvv, elem);
+        }
+        diags.Error("member '" + mname + "' of type 'Task' is not supported by the self-hosted "
+            + "compiler yet", e.line, e.col);
+        return new ExprVal("0", MkType("int"));
+    }
+
+    // Task.IsDone(handle)：裸句柄是否已经跑完。
+    // 自举没有宿主那样的工作线程池：任务只在**主线程泵调度器**时前进，
+    // 所以这里在读到「还没完」时给调度器一次机会——否则
+    // `while (Task.IsDone(h) == 0) {}` 这种忙等永远推不动。
+    ExprVal EmitTaskIsDone(Node e) {
+        ExprVal h = GenExpr(e.kids[0]);
+        string fp;
+        if (MapType(h.ty) == "i64") {
+            fp = NT(); L("  " + fp + " = inttoptr i64 " + h.op + " to i8*");
+        } else {
+            fp = h.op;
+        }
+        string fph = TaskFrameHeader(fp);
+        string dp = FrameGep(fph, 1);
+        string dn = NT(); L("  " + dn + " = load i64, i64* " + dp);
+        string c = NT(); L("  " + c + " = icmp ne i64 " + dn + ", 0");
+        int lYes = NL(); int lNo = NL(); int lZero = NL(); int lJoin = NL();
+        L("  br i1 " + c + ", label %L" + lYes + ", label %L" + lNo);
+        Label(lNo);
+        L("  call void @zan_co_sched_run()");
+        string dn2 = NT(); L("  " + dn2 + " = load i64, i64* " + dp);
+        string c2 = NT(); L("  " + c2 + " = icmp ne i64 " + dn2 + ", 0");
+        L("  br i1 " + c2 + ", label %L" + lYes + ", label %L" + lZero);
+        Label(lZero);
+        L("  br label %L" + lJoin);
+        Label(lYes);
+        L("  br label %L" + lJoin);
+        Label(lJoin);
+        string r = NT();
+        L("  " + r + " = phi i64 [ 0, %L" + lZero + " ], [ 1, %L" + lYes + " ]");
+        return new ExprVal(r, MkType("int"));
+    }
+
     void GenMethod(Node cls, Node m, bool ctor) {
         // hardware vectors: every static body (Zero/AllBitsSet getters etc.)
         // is lowered at the call site by GenBuiltinStatic — no function bodies

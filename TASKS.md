@@ -850,3 +850,48 @@
 - 真正生效的时机：等 A385（帧布局对齐 `zan_co_fhdr`）后链接完整运行时，强符号
   胜出，这句才真的装上 timer ready hook（`src/runtime/rt_io.c:4242`），把延迟帧
   重新入队而不是在定时器线程上直接恢复（`src/runtime/rt_timer.c:729`）。
+### [x] A419 自举没有任务句柄族的**降级**——差分门最后一个已知缺口
+
+- 现象：`task_run_action_handle` 是差分门里唯一的已知缺口——自举认得句柄的
+  **形状**（A416），但 `Task.Run` / `Task.Spawn` / `t.Wait()` / `t.Result` /
+  `t.IsCompleted` / `Task.IsDone` 六个入口一律报 "not supported by the
+  self-hosted compiler yet"，只能按已知缺口记账。
+- ✅ 已修（2026-10-20）：`irgen_async.zan` 新增任务句柄族（`EmitTaskRunCall`
+  / `EmitTaskMemberCall` / `EmitTaskIsDone` / `EmitTaskActionFrame` /
+  `EmitTaskActionStep`），`irgen_expr.zan` 两处挂接——`GenCall`（静态
+  `Task.Run` / `Task.Spawn` / `Task.IsDone`）与 `GenMember`（**不带括号**的
+  `t.Result` / `t.IsCompleted`；`t.Wait()` 是调用，走另一条路）。
+- 降级落在**自举自己的帧布局**上，**没有**去对齐 A385 的宿主帧头：句柄=帧
+  指针，done 标志=槽 1，结果=槽 4。宿主是同一套协议、另一套字节
+  （`src/compiler/irgen_expr_core.c` 的 `emit_task_member`：test/pump 循环 →
+  读结果 → 回收）。差分门比的是 stdout 逐字，不是帧布局——所以"布局没对齐"
+  从来不是"降级做不了"的理由。
+- 三个坑（细节见 skill `zan-compiler-internals/references/selfhost-closure.md`
+  §35）：
+  1. **action 帧不能在完成时释放**：句柄在任务完成后还要能读 done 标志，
+     提前释放就是读已释放内存。宿主靠运行时的活跃帧登记表回收，自举没有 →
+     action 帧不释放（每个泄漏 72 字节；不是 ARC 对象，泄漏检查看不见）。
+  2. **`Task.IsDone` 要给调度器一次机会**：自举没有宿主那样的工作线程池，
+     任务只在主线程泵调度器时前进；读到"还没完"就泵一次再读，否则
+     `while (Task.IsDone(h) == 0) {}` 这种忙等永远推不动。这是自举与宿主
+     唯一的语义偏差。
+  3. **句柄当 long 用**：`long h = Task.Run(Cube(5))` 走 ptrtoint、
+     `Task.IsDone(h)` 走 inttoptr——与宿主对 i64 句柄的往返一致。
+- 验证：`tests/conformance/task_run_action_handle.zan` 宿主与自举输出**逐字
+  相同**（7 行全中）；差分门 35 passed / **0 gaps** / 4 rejected / 0 failures；
+  固定点门 g2.ll == g3.ll（18266528 bytes）。
+### [x] A420 自举的检查器把 lambda 的函数体按**外层方法**的返回类型查 `return`
+
+- 现象：void 方法里写 `Func<int> f = delegate () { return 5; };`，宿主编译并
+  运行（输出 5），自举却报 "cannot return a value from a void method"——
+  **假阳性**：lambda 返回的是它自己的值，跟外层方法无关。
+- 连带影响：这条假阳性会**挡掉**别的诊断对齐——`Task.Run(delegate () { return
+  5; })` 在宿主侧报的是 Task.Run 专属的那条（"Task.Run delegate must be a
+  parameterless void body (an Action); pass an async call for results"），
+  自举侧却先被这条泛化诊断拦下，措辞对不上。
+- ✅ 已修（2026-10-20）：`checker.zan` 加 `curRetKnown` 标志——方法体为 true，
+  lambda 体为 false（lambda 的返回类型在自举侧**不知道**：检查器不从上下文
+  给 lambda 定型），函数体里的 `return` 不查"void 不能返回值"也不查"必须
+  返回值"。用例 `tests/conformance/lambda_value_return.zan`（进了差分门）。
+- 教训：**"措辞不同"先查更早的层**——宿主报专属诊断、自举报泛化诊断时，先
+  确认自举是不是在更早的检查里就拒了它。
