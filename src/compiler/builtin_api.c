@@ -67,6 +67,8 @@ static const zan_builtin_member_t members_console[] = {
     { "ForegroundColor", 'P', "ConsoleColor ForegroundColor" },
     { "BackgroundColor", 'P', "ConsoleColor BackgroundColor" },
     { "Title",           'P', "string Title" },
+    { "IsOutputRedirected", 'M', "bool IsOutputRedirected()" },
+    { "IsTerminal",      'M', "bool IsTerminal()" },
 };
 
 static const zan_builtin_member_t members_math[] = {

@@ -1276,6 +1276,35 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
         }
 
+        /* Console.IsOutputRedirected() / Console.IsTerminal()
+         *
+         * 问 libc "stdout 是不是终端"。直接发 libc 的 isatty 调用——**不新增
+         * 运行时导出符号**：各平台的预编译运行时目标在非目标平台上重建不了，
+         * 新增导出符号会让交叉目标全部失效。 */
+        if (!zan_type_defines(g, "Console", "IsOutputRedirected") &&
+            !zan_type_defines(g, "Console", "IsTerminal") &&
+            (is_call_to(expr, "Console", "IsOutputRedirected") ||
+             is_call_to(expr, "Console", "IsTerminal"))) {
+            bool want_terminal = is_call_to(expr, "Console", "IsTerminal");
+            LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);
+            LLVMValueRef flag;
+            if (g->target_is_wasm) {
+                /* wasm 没有终端概念：stdout 永远不是终端（= 已重定向） */
+                flag = LLVMConstInt(i32, want_terminal ? 0 : 1, 0);
+            } else {
+                const char *fname = g->target_is_windows ? "_isatty" : "isatty";
+                LLVMTypeRef fty = LLVMFunctionType(i32, (LLVMTypeRef[]){ i32 }, 1, 0);
+                LLVMValueRef fn = get_libc_fn(g, fname, fty);
+                LLVMValueRef fd = LLVMConstInt(i32, 1, 0);   /* stdout */
+                LLVMValueRef r = zan_call2(g->builder, fty, fn, &fd, 1, "isatty");
+                flag = want_terminal
+                    ? zan_icmp(g->builder, LLVMIntNE, r, LLVMConstInt(i32, 0, 0), "tty")
+                    : zan_icmp(g->builder, LLVMIntEQ, r, LLVMConstInt(i32, 0, 0), "redir");
+            }
+            return LLVMBuildZExt(g->builder, flag,
+                                 LLVMInt64TypeInContext(g->ctx), "tty64");
+        }
+
         /* NativeMemory 底层离堆内存操作原语与 CRC32 等系统调用封装 */
         {
             LLVMValueRef nm_out = NULL;

@@ -8,21 +8,6 @@
 
 ## 未完成
 
-### [ ] A420 运行时没有 TTY 判定（isatty）——CLI 判不出"输出被重定向到文件"
-
-- 现象：`Zan.Cli` 的颜色策略只能看环境变量（`ZAN_CLI_COLOR` / `NO_COLOR` /
-  `TERM=dumb`），判不出 stdout 是不是终端——`prog > out.txt` 会把 ANSI 序列
-  写进文件，日志被转义符污染。全仓搜不到 `isatty`（编译器内建表、运行时
-  都没有）。
-- 方向：给内建表加成员（`Console.IsOutputRedirected` / `Console.IsTerminal`），
-  底层按平台判 `isatty(_fileno(stdout))`（Windows 侧是 `_isatty`）。
-- 边界（这条决定了实现方式）：新增**运行时导出符号**要同步各平台的预编译
-  目标（`toolchain/{macos,ios,wasm32}/**/*.o` 是仓库里的预编译产物，Windows
-  上重建不了）——所以实现要么放在编译器侧（`irgen_builtins.c` 直接发
-  `isatty` 调用），要么只用 libc 已有符号、不新增运行时导出。
-- 现状：`Zan.Cli` 用环境变量策略兜底，并提供 `Cli.EnableColor(bool)` 让
-  应用显式关色；文档里写明了这个限制。
-
 ### [ ] A418 泛型方法内实例化泛型类（`new Foo<T,V>`，V 是方法级类型参数）——变体不发射，规则静默失效
 
 - 现象：`AbstractValidator<T>.Rule<V>(string property, FuncT<T,V> getter)` 里
