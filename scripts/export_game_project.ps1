@@ -236,8 +236,26 @@ $profiles = @{
         Rule '--package-project . -o coreforge.exe' '--package-project $env:ZAN_HOME -o coreforge.exe' 'client/*'
     )
 }
+# 素材型棋牌/街机模板（xiangqi/gomoku/weiqi/ddz/goldminer/breakout）：
+# 结构一致（assets/ + src/ + tools/），工具脚本与包根改写规则共用一套。
+$assetGames = @('xiangqi', 'gomoku', 'weiqi', 'ddz', 'goldminer', 'breakout')
+$assetGameRules = @(
+    # 仓库根 → 项目根（client/ 的父目录）
+    Rule "`$repo = [IO.Path]::GetFullPath((Join-Path `$project '../../..'))" "`$repo = Split-Path -Parent `$project" 'client/*'
+    # 公共包在 zan-lang 仓库的 packages/ 下（包是仓库的资产，不复制进项目），
+    # 所以包根走 $ZAN_HOME；项目根自己是没有 packages/ 的。
+    Rule "if (-not `$PackageProject) { `$PackageProject = `$repo }" "if (-not `$PackageProject) { if (`$env:ZAN_HOME) { `$PackageProject = `$env:ZAN_HOME } else { throw '需要 `$env:ZAN_HOME 指向 zan-lang 仓库（公共包在它的 packages/ 下）' } }" 'client/*'
+    # stdlib 同理：项目根没有 stdlib/，走 $ZAN_HOME
+    Rule "if (-not `$Stdlib -and (Test-Path (Join-Path `$repo 'stdlib'))) { `$Stdlib = Join-Path `$repo 'stdlib' }" "if (-not `$Stdlib -and `$env:ZAN_HOME) { `$Stdlib = Join-Path `$env:ZAN_HOME 'stdlib' }" 'client/*'
+    # README 里的手动编译命令：编译器与包根都在 zan-lang 仓库
+    # （通用规则已把 templates/game/<名字>/ 改写成 client/，这里接着改命令本身）
+    Rule 'build/zanc.exe client/src/main.zan --auto-stdlib --package-project . -o ' '$env:ZAN_HOME/build/zanc.exe client/src/main.zan --auto-stdlib --package-project $env:ZAN_HOME -o ' 'client/*'
+    Rule 'build/zanc.exe client/src/main.zan --auto-stdlib --package-project . --publish' '$env:ZAN_HOME/build/zanc.exe client/src/main.zan --auto-stdlib --package-project $env:ZAN_HOME --publish' 'client/*'
+)
+
 $profile = $profiles[$templateName]
 if ($profile) { $rules += $profile }
+if ($assetGames -contains $templateName) { $rules += $assetGameRules }
 
 $textExtensions = @('.ps1', '.py', '.zan', '.md', '.json', '.proj', '.manifest', '.css',
     '.html', '.txt', '.js', '.yml', '.yaml', '.toml', '.cfg', '.ini', '.bat', '.cmd', '.sh')
@@ -382,6 +400,17 @@ python {{SERVER}}/tools/sync_rules.py --check    # 只校验漂移
 '@
 }
 
+# 模板已搬出仓库时（源目录只剩在 git 标签里）：在 PROJECT.md 里说明历史版本在哪
+$movedOut = -not (Test-Path (Join-Path $repo (Norm "templates/$Template")))
+$archiveNote = ''
+if ($movedOut) {
+    $tag = (& git -C $repo tag --list "archive/*$templateName*" 2>$null | Select-Object -Last 1)
+    $archiveNote = if ($tag) {
+        "> 该模板已搬出语言仓库（体量超出示例级模板位），历史版本在 ``$tag`` 标签上。`n> 公共包（Game.Kit / Game.Foundation.Gui / Gui）仍由 zan-lang 仓库提供。"
+    }
+    else { '> 该模板已搬出语言仓库。' }
+}
+
 $projectDoc = @'
 # {{NAME}} —— 独立项目
 
@@ -392,6 +421,7 @@ $projectDoc = @'
 
 {{TREE}}
 
+{{ARCHIVENOTE}}
 所有命令都在**项目根**下执行（路径一律相对项目根）。
 
 ## 编译
@@ -423,6 +453,7 @@ Copy-Item -Recurse <zan-lang>/packages/<Name> packages/<Name>
 {{SERVERSECTION}}
 '@
 $projectDoc = $projectDoc.Replace('{{TREE}}', ($treeLines -join "`n")).
+    Replace('{{ARCHIVENOTE}}', $archiveNote).
     Replace('{{TESTCMDS}}', ($testCmds -join "`n")).
     Replace('{{SERVERSECTION}}', $serverSection).
     Replace('{{NAME}}', $templateName).

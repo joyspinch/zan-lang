@@ -23,10 +23,7 @@ zan Gold Miner — 黄金矿工（模板版）
 手机上玩
 --------
 ```bash
-build/zanc templates/game/goldminer/src/main.zan templates/game/goldminer/src/Game.zan \
-  --auto-stdlib \
-  --publish --target android-arm64 --emit-apk goldminer.apk \
-  --apk-package com.example.goldminer --apk-label 黄金矿工
+pwsh -File templates/game/goldminer/tools/build.ps1 -ZancArgs '--publish','--target','android-arm64','--emit-apk','goldminer.apk','--apk-package','com.example.goldminer','--apk-label','黄金矿工'
 ```
 `--publish` 会把 assets/ 内嵌进 libmain.so（磁盘优先、内嵌兜底的加载
 逻辑不变），APK 直装手机即可；横竖屏都能玩——设计分辨率 960×720 经
@@ -48,16 +45,14 @@ GuiHost 版（Game.Foundation.Gui）：窗口/事件/呈现由 packages/Zan.Gui/
 
 构建
 ----
-仓库根编译（产物 build/goldminer.exe，运行所需 DLL 自动落在
-同目录）。assets/ 不需要任何编译指令：只要代码引用了内嵌读取
-API（File.EmbedExists 等），zanc 检测到源文件旁的 assets/ 目录
-就把整个目录自动内嵌进 exe（资源名 "assets/<文件>"，与代码里的
-查找路径一致）：
+根目录下（公共包在 zan-lang 仓库的 packages/ 下，编译要带 --package-project）：
 
-    build\zanc.exe templates\game\goldminer\src\main.zan ^
-                   templates\game\goldminer\src\Game.zan ^
-                   --auto-stdlib ^
-                   -o build\goldminer.exe
+    pwsh -File templates/game/goldminer/tools/build.ps1
+
+产物在 build/goldminer/，运行所需 DLL 与 assets/ 一并落在同目录。
+手动编译（同样在根目录下）：
+
+    build/zanc.exe templates/game/goldminer/src/main.zan --auto-stdlib --package-project . -o build/goldminer/GoldMiner.exe
 
 独立 exe 发布（单文件、免第三方 DLL、双击无控制台窗口）
 ------------------------------------------------
@@ -65,11 +60,7 @@ API（File.EmbedExists 等），zanc 检测到源文件旁的 assets/ 目录
 子系统（不弹控制台）；`--subsystem windows` 必须显式给，zanc 命令行
 默认 console 子系统（IDE 会对 GUI 项目自动加，CLI 不探测）：
 
-    build\zanc.exe templates\game\goldminer\src\main.zan ^
-                   templates\game\goldminer\src\Game.zan ^
-                   --auto-stdlib ^
-                   --publish --link-mode static --subsystem windows ^
-                   -o dist\goldminer\goldminer.exe
+    build/zanc.exe templates/game/goldminer/src/main.zan --auto-stdlib --package-project . --publish --link-mode static --subsystem windows -o build/goldminer/GoldMiner.exe
 
 素材
 ----
@@ -89,6 +80,6 @@ IDE「新建项目」复制本模板后 assets/ 与 src/ 同级，同样自动�
 ----
 - src/main.zan    入口 + 场景渲染/输入/兜底 HUD/无头自测
                   （MINER_SIM=1 平衡仿真，不建窗口）
-- src/Game.zan    核心玩法：摆钩、抓取、物品表、连击/QTE/炸弹、关卡与存档
+- src/World.zan    核心玩法：摆钩、抓取、物品表、连击/QTE/炸弹、关卡与存档
 - zan.proj        IDE 项目文件（IDE「新建项目 → 游戏」可直接套用）
 - template.manifest 模板清单（IDE 新建项目对话框展示）
