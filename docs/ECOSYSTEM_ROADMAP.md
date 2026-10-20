@@ -248,6 +248,39 @@ A* 路径长度一致且展开节点更少、不可达、确定性、拉直不�
 **已知边界**：导航网格路径贴矩形边界走（无单位半径）；JPS 在狭长走廊上
 可能比 A* 慢；无动态障碍（改地图要重建）；无多层导航。
 
+### 1.8 粒子：`Zan.Game.Particles`
+
+新包 `packages/Zan.Game.Particles`，命名空间 `Game.Particles`。收敛 13 套
+游戏模板各自实现的粒子（`templates/game/*/src/.../Particle.zan` + idle 模板的
+`ParticleSystem.zan`）。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Particle.zan` | `Particle` | 位置/速度/旋转/寿命/尺寸/颜色；`CurrentSize()` / `CurrentColor()` |
+| `Emitter.zan` | `EmitterConfig` / `Emitter` | 速率 + 突发发射；扇形角度、速度/寿命/尺寸区间、起止色、位置噪声漂移 |
+| `Curve.zan` | `Curve` | 关键帧曲线（线性 / smoothstep），驱动尺寸、透明度等 |
+| `Noise.zan` | `Noise` / `Rng` | 确定性值噪声（2D + 分形）与带种子的随机源 |
+| `ParticleSystem.zan` | `ParticleSystem` | 对象池 + 半隐式欧拉积分 + 回收；容量硬上限 |
+
+**五条硬取舍**：
+
+1. **引擎无关**：不依赖 `Gui` / `SpriteBatch`，只产出粒子数据——包可无头
+   跑、可在 conformance 里断言，渲染由调用方做。
+2. **对象池**：粒子用完回收复用，运行期不分配；容量是硬上限（满了就不再
+   发射），内存占用有界。
+3. **确定性**：随机源带种子、噪声是纯函数（同一坐标永远同一值）——回放 /
+   锁步可复现。随机数取 LCG 的**高位**：低位周期太短，会出现可见带状分布。
+4. **半隐式欧拉**（先速度后位置）：粒子多时比显式欧拉稳，代价是对连续解
+   有系统性偏差（自由落体 0.5 秒得 -12.9167 而不是 -12.5）。
+5. **有序移除**：渲染顺序 = 出生顺序，叠加混合的视觉结果稳定。
+
+conformance：`particles_system`（速率发射、突发发射、寿命回收、重力与阻力
+积分、容量上限与对象池、确定性、曲线求值与钳位、噪声确定性与范围、曲线
+驱动的尺寸与颜色插值）。
+
+**已知边界**：无 GPU 粒子（渲染侧自行批量提交）；无粒子碰撞；噪声是值噪声
+不是梯度噪声（做不了流体）；池不跨系统共享。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -297,7 +330,7 @@ A* 路径长度一致且展开节点更少、不可达、确定性、拉直不�
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | 有 `AssetPipeline` + `PackedAssets` → glTF 导入、骨骼/动画切片、图集、字体与 shader | 3–5 周 |
 | `Zan.Game.Audio` | NAudio | 6,249 | 有 `AudioBus`/`SpatialAudio2D`/`Desktop/Audio`，无 mp3/ogg 解码与流式播放 | 2–3 周 |
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | 已有 lockstep + 回放 → 快照同步、rollback 预测、延迟补偿 | 4–6 周 |
-| `Zan.Game.Particles` | MonoGame.Extended | 榜外 | 13 套模板各自实现粒子（idle 模板自带 `ParticleSystem.zan`）→ 统一发射器、曲线/噪声驱动、GPU 粒子 | 2–3 周 |
+| `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | 有 clip 播放器/纸娃娃/3D 轨 → 蒙皮、状态机混合、IK | 4–6 周 |
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | 无 → WFC 算法可直接复刻（纯 C#、数学自洽）、关卡拼接 | 2 周 |
@@ -326,7 +359,7 @@ A* 路径长度一致且展开节点更少、不可达、确定性、拉直不�
 ## 6. 落地顺序
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
-**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles`
+**第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 

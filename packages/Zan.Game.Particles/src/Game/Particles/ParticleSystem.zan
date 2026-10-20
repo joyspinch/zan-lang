@@ -1,0 +1,133 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Particles;
+
+// 粒子系统：发射器 + 对象池 + 积分。
+//
+// 设计取舍：
+//   - **引擎无关**：本包不碰 Gui / SpriteBatch，只产出粒子数据；渲染由
+//     调用方做（包可无头跑、可测）。
+//   - **对象池**：粒子用完回收复用，运行期不分配——粒子多的场景 GC 抖动
+//     是帧率杀手。容量是硬上限：满了就不再发射（不无限涨内存）。
+//   - **确定性**：随机源带种子，噪声是纯函数；同样的种子 + 同样的调用
+//     序列 → 同样的粒子状态（回放 / 锁步的前提）。
+//   - **有序移除**：死亡的粒子按顺序移除，渲染顺序 = 出生顺序（叠加混合
+//     的视觉结果稳定）。
+public class ParticleSystem {
+    // 活跃粒子（按出生顺序）。
+    public List<Particle> particles;
+    // 发射器。
+    public List<Emitter> emitters;
+    // 重力（单位/秒²）。
+    public double gravityX;
+    public double gravityY;
+    // 带种子的随机源与噪声源。
+    public Rng rng;
+    public Noise noise;
+    // 粒子上限（硬上限）。
+    public int capacity;
+    // 累计发射数（统计用）。
+    public int spawnedTotal;
+
+    private List<Particle> pool;
+
+    public ParticleSystem(int capacity, long seed) {
+        this.particles = new List<Particle>();
+        this.emitters = new List<Emitter>();
+        this.pool = new List<Particle>();
+        this.gravityX = 0.0;
+        this.gravityY = 0.0;
+        this.rng = new Rng(seed);
+        this.noise = new Noise(seed + 1);
+        this.capacity = capacity;
+        this.spawnedTotal = 0;
+    }
+
+    public void AddEmitter(Emitter emitter) {
+        if (emitter != null) { this.emitters.Add(emitter); }
+    }
+
+    public int Count() { return this.particles.Count; }
+    public Particle Get(int index) { return this.particles[index]; }
+
+    // 取一个粒子（从池里复用；池空且已达容量上限时返回 null）。
+    public Particle Acquire() {
+        int pooled = this.pool.Count;
+        if (pooled > 0) {
+            Particle p = this.pool[pooled - 1];
+            this.pool.RemoveAt(pooled - 1);
+            return p;
+        }
+        if (this.particles.Count >= this.capacity) { return null; }
+        Particle created = new Particle();
+        return created;
+    }
+
+    // 归还一个粒子到池（死亡时调用）。
+    public void Release(Particle p) {
+        if (p == null) { return; }
+        p.active = false;
+        p.Reset();
+        this.pool.Add(p);
+    }
+
+    public void Add(Particle p) {
+        if (p == null) { return; }
+        this.particles.Add(p);
+        this.spawnedTotal = this.spawnedTotal + 1;
+    }
+
+    // 推进一帧：先发射，再积分，最后回收过期粒子。
+    public void Update(double dt) {
+        for (int i = 0; i < this.emitters.Count; i = i + 1) {
+            this.emitters[i].Update(this, dt);
+        }
+
+        int index = 0;
+        while (index < this.particles.Count) {
+            Particle p = this.particles[index];
+            p.age = p.age + dt;
+            if (p.age >= p.lifetime) {
+                this.particles.RemoveAt(index);
+                this.Release(p);
+                continue;
+            }
+
+            p.vx = p.vx + this.gravityX * p.gravityScale * dt;
+            p.vy = p.vy + this.gravityY * p.gravityScale * dt;
+
+            if (p.drag > 0.0) {
+                double damp = 1.0 - p.drag * dt;
+                if (damp < 0.0) { damp = 0.0; }
+                p.vx = p.vx * damp;
+                p.vy = p.vy * damp;
+            }
+
+            if (p.noiseAmplitude > 0.0) {
+                double nx = this.noise.Sample(p.x * p.noiseFrequency + p.noiseOffset,
+                                             p.y * p.noiseFrequency);
+                double ny = this.noise.Sample(p.y * p.noiseFrequency - p.noiseOffset,
+                                             p.x * p.noiseFrequency + 17.0);
+                p.vx = p.vx + nx * p.noiseAmplitude * dt;
+                p.vy = p.vy + ny * p.noiseAmplitude * dt;
+            }
+
+            p.x = p.x + p.vx * dt;
+            p.y = p.y + p.vy * dt;
+            p.rotation = p.rotation + p.angularVelocity * dt;
+            index = index + 1;
+        }
+    }
+
+    // 清空所有粒子（回池）。
+    public void Clear() {
+        for (int i = 0; i < this.particles.Count; i = i + 1) {
+            this.Release(this.particles[i]);
+        }
+        this.particles.Clear();
+    }
+
+    // 池里空闲粒子的个数（统计用）。
+    public int PooledCount() { return this.pool.Count; }
+}

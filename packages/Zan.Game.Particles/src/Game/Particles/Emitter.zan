@@ -1,0 +1,159 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Particles;
+
+// 发射器参数：一份配置描述"发什么粒子"。
+//
+// 角度用**度**：0 = +x 方向，逆时针为正；spreadDeg 是扇形半角。
+public class EmitterConfig {
+    // 每秒发射个数（<= 0 = 不按速率发射，只响应 Trigger）。
+    public double rate;
+    // Trigger() 时一次发多少个。
+    public int burst;
+    // 寿命区间（秒）。
+    public double lifetimeMin;
+    public double lifetimeMax;
+    // 初速度区间（单位/秒）。
+    public double speedMin;
+    public double speedMax;
+    // 方向与扇形半角（度）。
+    public double angleDeg;
+    public double spreadDeg;
+    // 尺寸区间。
+    public double sizeMin;
+    public double sizeMax;
+    // 初始旋转与角速度区间。
+    public double rotationMin;
+    public double rotationMax;
+    public double angularMin;
+    public double angularMax;
+    // 起止颜色（ARGB），按寿命比例插值。
+    public int colorStart;
+    public int colorEnd;
+    // 尺寸曲线（可空）：非空时按寿命比例取曲线值 × 基础尺寸。
+    public Curve sizeCurve;
+    // 阻力（每秒比例）与重力缩放。
+    public double drag;
+    public double gravityScale;
+    // 噪声湍流：振幅与频率（0 = 无湍流）。
+    public double noiseAmplitude;
+    public double noiseFrequency;
+    // 发射位置的噪声漂移：振幅与频率（0 = 位置固定）。
+    public double positionNoiseAmplitude;
+    public double positionNoiseFrequency;
+    // 渲染用的精灵句柄（由调用方解释；-1 = 未指定）。
+    public int sprite;
+
+    public EmitterConfig() {
+        this.rate = 0.0;
+        this.burst = 0;
+        this.lifetimeMin = 1.0;
+        this.lifetimeMax = 1.0;
+        this.speedMin = 0.0;
+        this.speedMax = 0.0;
+        this.angleDeg = 0.0;
+        this.spreadDeg = 45.0;
+        this.sizeMin = 8.0;
+        this.sizeMax = 8.0;
+        this.rotationMin = 0.0;
+        this.rotationMax = 0.0;
+        this.angularMin = 0.0;
+        this.angularMax = 0.0;
+        this.colorStart = 0xFFFFFFFF;
+        this.colorEnd = 0xFFFFFFFF;
+        this.sizeCurve = null;
+        this.drag = 0.0;
+        this.gravityScale = 1.0;
+        this.noiseAmplitude = 0.0;
+        this.noiseFrequency = 0.0;
+        this.positionNoiseAmplitude = 0.0;
+        this.positionNoiseFrequency = 0.0;
+        this.sprite = -1;
+    }
+}
+
+// 发射器：按配置产生粒子。
+//
+// 发射器的位置也可以被噪声驱动（风、火焰的摆动）——位置噪声只影响
+// **发射点**，不改变粒子自身的运动。
+public class Emitter {
+    public EmitterConfig config;
+    public double x;
+    public double y;
+    // 是否持续发射。
+    public bool emitting;
+    // 速率累积（不足 1 的余量留到下一帧）。
+    public double accumulator;
+    // 发射器自身的时间（位置噪声的采样时钟）。
+    public double time;
+
+    public Emitter(EmitterConfig config) {
+        this.config = config;
+        this.x = 0.0;
+        this.y = 0.0;
+        this.emitting = false;
+        this.accumulator = 0.0;
+        this.time = 0.0;
+    }
+
+    // 立刻发一批（burst 个）。
+    public void Trigger(ParticleSystem system) {
+        if (system == null || this.config == null) { return; }
+        for (int i = 0; i < this.config.burst; i = i + 1) {
+            this.Spawn(system);
+        }
+    }
+
+    // 按速率推进发射。
+    public void Update(ParticleSystem system, double dt) {
+        if (system == null || this.config == null) { return; }
+        this.time = this.time + dt;
+        if (!this.emitting || this.config.rate <= 0.0) { return; }
+        this.accumulator = this.accumulator + this.config.rate * dt;
+        int guard = 0;
+        while (this.accumulator >= 1.0 && guard < 10000) {
+            this.accumulator = this.accumulator - 1.0;
+            this.Spawn(system);
+            guard = guard + 1;
+        }
+    }
+
+    // 发射一个粒子。
+    public void Spawn(ParticleSystem system) {
+        if (system == null || this.config == null) { return; }
+        Particle p = system.Acquire();
+        if (p == null) { return; }
+        EmitterConfig c = this.config;
+
+        double angle = (c.angleDeg + system.rng.Range(-c.spreadDeg, c.spreadDeg)) * 0.017453292519943295;
+        double speed = system.rng.Range(c.speedMin, c.speedMax);
+        double offsetX = 0.0;
+        double offsetY = 0.0;
+        if (c.positionNoiseAmplitude > 0.0) {
+            offsetX = system.noise.Sample(this.time * c.positionNoiseFrequency, 0.0) * c.positionNoiseAmplitude;
+            offsetY = system.noise.Sample(0.0, this.time * c.positionNoiseFrequency) * c.positionNoiseAmplitude;
+        }
+
+        p.x = this.x + offsetX;
+        p.y = this.y + offsetY;
+        p.vx = Math.Cos(angle) * speed;
+        p.vy = Math.Sin(angle) * speed;
+        p.rotation = system.rng.Range(c.rotationMin, c.rotationMax);
+        p.angularVelocity = system.rng.Range(c.angularMin, c.angularMax);
+        p.age = 0.0;
+        p.lifetime = system.rng.Range(c.lifetimeMin, c.lifetimeMax);
+        p.baseSize = system.rng.Range(c.sizeMin, c.sizeMax);
+        p.sizeCurve = c.sizeCurve;
+        p.colorStart = c.colorStart;
+        p.colorEnd = c.colorEnd;
+        p.drag = c.drag;
+        p.gravityScale = c.gravityScale;
+        p.noiseAmplitude = c.noiseAmplitude;
+        p.noiseFrequency = c.noiseFrequency;
+        p.noiseOffset = system.rng.Range(0.0, 1000.0);
+        p.sprite = c.sprite;
+        p.active = true;
+        system.Add(p);
+    }
+}

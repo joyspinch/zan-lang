@@ -1,0 +1,271 @@
+using System;
+using System.Collections.Generic;
+using Game.Particles;
+
+// 粒子系统契约测试：发射、寿命、积分、对象池、曲线、噪声、确定性。
+//
+// 断言用容差比较（浮点模拟不可能逐位相等），golden 只锁定"全过"这行。
+public class ParticleTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 全部粒子的状态串（用于确定性对比）。
+    private static string StateText(ParticleSystem system) {
+        string text = "";
+        for (int i = 0; i < system.Count(); i = i + 1) {
+            Particle p = system.Get(i);
+            text = text + p.x.ToString() + "," + p.y.ToString() + ","
+                + p.vx.ToString() + "," + p.vy.ToString() + ","
+                + p.age.ToString() + ";";
+        }
+        return text;
+    }
+
+    // 造一个只按速率发射的发射器。
+    private static Emitter RateEmitter(double rate, double lifetime) {
+        EmitterConfig config = new EmitterConfig();
+        config.rate = rate;
+        config.burst = 0;
+        config.lifetimeMin = lifetime;
+        config.lifetimeMax = lifetime;
+        config.speedMin = 10.0;
+        config.speedMax = 10.0;
+        config.spreadDeg = 0.0;
+        Emitter emitter = new Emitter(config);
+        emitter.emitting = true;
+        return emitter;
+    }
+
+    /* ---------- 按速率发射 ---------- */
+    private static void TestRateEmission() {
+        ParticleSystem system = new ParticleSystem(1000, 1234);
+        system.AddEmitter(RateEmitter(10.0, 5.0));
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        // 一秒 × 10 个/秒 = 10 个（±1 容忍步进误差）。
+        Check("rate emission count", system.Count() >= 9 && system.Count() <= 11);
+    }
+
+    /* ---------- 突发发射 ---------- */
+    private static void TestBurst() {
+        ParticleSystem system = new ParticleSystem(1000, 99);
+        EmitterConfig config = new EmitterConfig();
+        config.burst = 5;
+        config.lifetimeMin = 1.0;
+        config.lifetimeMax = 1.0;
+        Emitter emitter = new Emitter(config);
+        emitter.Trigger(system);
+        Check("burst count", system.Count() == 5);
+    }
+
+    /* ---------- 寿命到期回收 ---------- */
+    private static void TestLifetime() {
+        ParticleSystem system = new ParticleSystem(1000, 7);
+        Emitter emitter = RateEmitter(20.0, 0.5);
+        system.AddEmitter(emitter);
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        // 稳态：存活数 ≈ 速率 × 寿命 = 20 × 0.5 = 10（不会无限增长）。
+        Check("lifetime steady state", system.Count() >= 5 && system.Count() <= 15);
+        Check("pool keeps recycled particles", system.PooledCount() > 0);
+
+        // 停止发射 → 再跑一秒，全部到期回收。
+        emitter.emitting = false;
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        Check("lifetime expiry", system.Count() == 0);
+    }
+
+    /* ---------- 重力积分 ---------- */
+    private static void TestGravity() {
+        ParticleSystem system = new ParticleSystem(10, 3);
+        system.gravityY = -100.0;
+        EmitterConfig config = new EmitterConfig();
+        config.burst = 1;
+        config.lifetimeMin = 5.0;
+        config.lifetimeMax = 5.0;
+        config.speedMin = 0.0;
+        config.speedMax = 0.0;
+        Emitter emitter = new Emitter(config);
+        emitter.Trigger(system);
+        for (int i = 0; i < 30; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        // 半秒自由落体。积分器是**半隐式欧拉**（先更新速度再更新位置），
+        // 离散结果 y = g·dt²·n(n+1)/2 = -100 · (1/3600) · 465 = -12.9167。
+        CheckNear("gravity integration", system.Get(0).y, -12.9166666, 0.01);
+        CheckNear("gravity velocity", system.Get(0).vy, -50.0, 0.01);
+    }
+
+    /* ---------- 阻力 ---------- */
+    private static void TestDrag() {
+        ParticleSystem system = new ParticleSystem(10, 4);
+        EmitterConfig config = new EmitterConfig();
+        config.burst = 1;
+        config.lifetimeMin = 5.0;
+        config.lifetimeMax = 5.0;
+        config.speedMin = 100.0;
+        config.speedMax = 100.0;
+        config.spreadDeg = 0.0;
+        config.drag = 1.0;
+        Emitter emitter = new Emitter(config);
+        emitter.Trigger(system);
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        // 阻力 1.0/秒（半隐式：每步 v *= (1 - drag·dt)）：
+        // v = 100 · (1 - 1/60)^60 ≈ 36.48。
+        CheckNear("drag decay", system.Get(0).vx, 36.483, 0.05);
+    }
+
+    /* ---------- 容量上限与对象池 ---------- */
+    private static void TestCapacityAndPool() {
+        ParticleSystem system = new ParticleSystem(10, 5);
+        Emitter emitter = RateEmitter(500.0, 0.2);
+        system.AddEmitter(emitter);
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        Check("capacity bound", system.Count() <= 10);
+        Check("pool bounded by capacity", system.PooledCount() <= 10);
+
+        // 停止发射 → 全部到期回收，粒子回到池里。
+        emitter.emitting = false;
+        for (int i = 0; i < 120; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        Check("all recycled", system.Count() == 0);
+        Check("pool holds recycled particles", system.PooledCount() > 0);
+    }
+
+    /* ---------- 确定性 ---------- */
+    private static void TestDeterminism() {
+        ParticleSystem first = new ParticleSystem(200, 20261022);
+        ParticleSystem second = new ParticleSystem(200, 20261022);
+        EmitterConfig config = new EmitterConfig();
+        config.rate = 30.0;
+        config.burst = 3;
+        config.lifetimeMin = 0.4;
+        config.lifetimeMax = 1.2;
+        config.speedMin = 10.0;
+        config.speedMax = 90.0;
+        config.spreadDeg = 180.0;
+        config.noiseAmplitude = 30.0;
+        config.noiseFrequency = 0.05;
+        Emitter a = new Emitter(config);
+        Emitter b = new Emitter(config);
+        a.emitting = true;
+        b.emitting = true;
+        first.AddEmitter(a);
+        second.AddEmitter(b);
+        for (int i = 0; i < 120; i = i + 1) {
+            first.Update(1.0 / 60.0);
+            second.Update(1.0 / 60.0);
+        }
+        Check("deterministic particles", StateText(first) == StateText(second));
+    }
+
+    /* ---------- 曲线 ---------- */
+    private static void TestCurve() {
+        Curve curve = new Curve();
+        curve.AddKey(0.0, 0.0);
+        curve.AddKey(0.5, 1.0);
+        curve.AddKey(1.0, 0.0);
+        CheckNear("curve start", curve.Evaluate(0.0), 0.0, 0.0001);
+        CheckNear("curve midpoint", curve.Evaluate(0.5), 1.0, 0.0001);
+        CheckNear("curve end", curve.Evaluate(1.0), 0.0, 0.0001);
+        CheckNear("curve clamp below", curve.Evaluate(-1.0), 0.0, 0.0001);
+        CheckNear("curve clamp above", curve.Evaluate(2.0), 0.0, 0.0001);
+        CheckNear("curve linear mid", curve.Evaluate(0.25), 0.5, 0.0001);
+        // 乱序关键帧被忽略。
+        curve.AddKey(0.2, 5.0);
+        Check("curve key count", curve.Count() == 3);
+    }
+
+    /* ---------- 噪声 ---------- */
+    private static void TestNoise() {
+        Noise noise = new Noise(42);
+        double a = noise.Sample(1.25, 3.5);
+        double b = noise.Sample(1.25, 3.5);
+        CheckNear("noise deterministic", a, b, 0.0);
+        Check("noise in range", a >= -1.0 && a <= 1.0);
+        bool varies = false;
+        for (int i = 0; i < 20; i = i + 1) {
+            double v = noise.Sample(i * 0.37, i * 0.11);
+            if (v > 1.0 || v < -1.0) { varies = true; }
+            if (v != a) { varies = true; }
+        }
+        Check("noise varies", varies);
+    }
+
+    /* ---------- 曲线驱动的尺寸与颜色插值 ---------- */
+    private static void TestDrivenAppearance() {
+        ParticleSystem system = new ParticleSystem(10, 11);
+        Curve sizeCurve = new Curve();
+        sizeCurve.AddKey(0.0, 1.0);
+        sizeCurve.AddKey(1.0, 0.25);
+        EmitterConfig config = new EmitterConfig();
+        config.burst = 1;
+        config.lifetimeMin = 2.0;
+        config.lifetimeMax = 2.0;
+        config.sizeMin = 100.0;
+        config.sizeMax = 100.0;
+        config.colorStart = 0xFFFFFFFF;
+        config.colorEnd = 0xFF000000;
+        config.sizeCurve = sizeCurve;
+        Emitter emitter = new Emitter(config);
+        emitter.Trigger(system);
+
+        Particle p = system.Get(0);
+        CheckNear("size at birth", p.CurrentSize(), 100.0, 0.01);
+        Check("color at birth", p.CurrentColor() == 0xFFFFFFFF);
+        for (int i = 0; i < 60; i = i + 1) {
+            system.Update(1.0 / 60.0);
+        }
+        // 半程：尺寸 62.5，颜色通道插值到一半。
+        CheckNear("size at half life", p.CurrentSize(), 62.5, 0.5);
+        int mid = p.CurrentColor();
+        int midAlpha = (mid >> 24) & 255;
+        int midRed = (mid >> 16) & 255;
+        Check("color alpha interpolated", midAlpha == 255);
+        Check("color red interpolated", midRed > 100 && midRed < 160);
+    }
+
+    public static void Main() {
+        TestRateEmission();
+        TestBurst();
+        TestLifetime();
+        TestGravity();
+        TestDrag();
+        TestCapacityAndPool();
+        TestDeterminism();
+        TestCurve();
+        TestNoise();
+        TestDrivenAppearance();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL PARTICLES TESTS PASSED");
+        } else {
+            Console.WriteLine("PARTICLES FAILURES: " + failures.ToString());
+        }
+    }
+}

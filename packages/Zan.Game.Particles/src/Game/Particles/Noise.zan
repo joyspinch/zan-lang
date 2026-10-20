@@ -1,0 +1,87 @@
+using System;
+
+namespace Game.Particles;
+
+// 带种子的随机源（确定性）。
+//
+// 用 `Random.Seeded` 的 LCG，但取**高位**做随机数：LCG 的低位周期极短，
+// 直接用低位会出现可见的带状分布。种子固定 → 序列固定 → 回放/锁步可复现。
+public class Rng {
+    public Random random;
+
+    public Rng(long seed) {
+        this.random = Random.Seeded(seed);
+    }
+
+    // [0, 1) 均匀分布。
+    public double Unit() {
+        long bits = (this.random.NextRaw() >> 11) & 4503599627370495;
+        return (double)bits / 9007199254740992.0;
+    }
+
+    // [min, max) 均匀分布。
+    public double Range(double min, double max) {
+        if (max <= min) { return min; }
+        return min + (max - min) * this.Unit();
+    }
+
+    // [min, max] 闭区间整数。
+    public int RangeInt(int min, int max) {
+        if (max <= min) { return min; }
+        return min + this.random.NextBelow(max - min + 1);
+    }
+}
+
+// 值噪声（2D，确定性）：粒子湍流、发射器漂移、风的形状。
+//
+// 用整数哈希 + smoothstep 插值——没有梯度表、没有状态、同一坐标永远同一
+// 值（可回放）。范围 [-1, 1]。
+public class Noise {
+    public long seed;
+
+    public Noise(long seed) {
+        this.seed = seed;
+    }
+
+    // 整数格点的哈希值（[-1, 1]）。
+    private double Hash(int x, int y) {
+        long h = (long)x * 374761393 + (long)y * 668265263 + this.seed * 1442695040888963407;
+        h = (h ^ (h >> 13)) * 1274126177;
+        h = h ^ (h >> 16);
+        long bits = h & 16777215;
+        return (double)bits / 16777215.0 * 2.0 - 1.0;
+    }
+
+    // 采样（双线性 + smoothstep 插值）。
+    public double Sample(double x, double y) {
+        int x0 = (int)Math.Floor(x);
+        int y0 = (int)Math.Floor(y);
+        double fx = x - (double)x0;
+        double fy = y - (double)y0;
+        double u = fx * fx * (3.0 - 2.0 * fx);
+        double v = fy * fy * (3.0 - 2.0 * fy);
+        double n00 = this.Hash(x0, y0);
+        double n10 = this.Hash(x0 + 1, y0);
+        double n01 = this.Hash(x0, y0 + 1);
+        double n11 = this.Hash(x0 + 1, y0 + 1);
+        double nx0 = n00 + (n10 - n00) * u;
+        double nx1 = n01 + (n11 - n01) * u;
+        return nx0 + (nx1 - nx0) * v;
+    }
+
+    // 分形叠加（多倍频），返回 [-1, 1]。
+    public double SampleFractal(double x, double y, int octaves) {
+        double total = 0.0;
+        double amplitude = 1.0;
+        double frequency = 1.0;
+        double norm = 0.0;
+        for (int i = 0; i < octaves; i = i + 1) {
+            total = total + this.Sample(x * frequency, y * frequency) * amplitude;
+            norm = norm + amplitude;
+            amplitude = amplitude * 0.5;
+            frequency = frequency * 2.0;
+        }
+        if (norm <= 0.0) { return 0.0; }
+        return total / norm;
+    }
+}
