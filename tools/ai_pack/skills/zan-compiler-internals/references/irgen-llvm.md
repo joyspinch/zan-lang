@@ -148,3 +148,45 @@
   里没有声明 `ToString`，`src/compiler/builtin_api.c` 的 `members_convert` 里
   也没有（IDE 符号索引 `zanc --emit-symbols` 因此补全不出 `Convert.ToString`）。
   公开面该住在 stdlib，别住在编译器里。
+## 9. 内建数值 / 文本特判同样必须先判静态类型——`sitofp` 与 `atoi` 一样会咬人
+
+- **数值特判不能"先转再问"**：`Math.Sqrt/Sin/Cos/Tan/Log/Exp/Atan/Asin/Acos/
+  Abs/Max/Min/Pow/Floor/Ceiling/Round` 这族内建在 C 宿主里是"把实参转成
+  double 再调 libm"。若转换发生在类型判定**之前**，类实例（LLVM 层是
+  `i8*`）会被喂给 `sitofp i64` → 造出 `sitofp i64 i8*` → **LLVM 校验失败**
+  （"LLVM verification failed"），用户拿到的是一句完全看不懂的话。
+  - 坑出处：2026-10-21 实测 `Math.Sqrt(<类实例>)` 就是 "LLVM verification
+    failed"；`Math.Max(<类实例>, 1)` 同样炸——**双参特判尤其危险**：两个参数
+    必须**分别**判，写成 `!(isInt(a) && isInt(b))` 会让"一个指针 + 一个整数"
+    整条溜过去。
+- **文本解析型内建只接受字符串**：`int.Parse` / `double.Parse` / `long.Parse`
+  / `...TryParse` 的实参必须是 `string`；传类实例时旧路径会拿对象的
+  **首字节**当 C 文本去 `strtoll`（扫描很短所以不越界，但**静默返回 0**——
+  比崩溃更难查）。`Convert.ToInt32/ToInt64/ToInt/ToDouble` 接受字符串**或**
+  数值，判定口径不同，要写成**两个独立谓词**
+  （`type_is_text_arg` / `type_is_textual_or_numeric`），不要复制成两份
+  类型清单。
+- **诊断文案里的 `%s` 必须配字符串指针**：`zan_diag_emit` 走 printf 语义，
+  写 `'%s'` 却传 `(int)name.len` 会让 printf 把**长度当指针**解引用 →
+  访问冲突（0xC0000005）。带长度的字符串一律用 `'%.*s'` + `(int)len, ptr`。
+  - 坑出处：2026-10-21 自己写 `Convert.ToDouble` 诊断时踩到：`%s` 配 int 长度，
+    编译器自己崩在诊断打印上。
+- **跨后端必须同改**：`src/selfhost/irgen_expr.zan` 的 `ToDbl` /
+  `GenMathCall` / `Convert.*` 是同一套逻辑的 Zan 实现，同样的输入会造同样的
+  非法 IR（`ToDbl` 也走 `sitofp i64`，`Convert.ToInt32` 无条件
+  `call i64 @atoi(i8* <ptr>)` → 运行期读对象字节当文本）。守卫要落在
+  **分派入口**（`ToDbl`、`Convert.*`），不要只补某一个分支。
+
+## 10. 源文件里的裸 NUL 字节会让 ripgrep 静默跳过整个文件
+
+- **症状**：搜索某个函数时，ripgrep 对该文件返回 **0 命中**，或只吐一句
+  "binary file matches" 而不给行号与上下文——看起来像"这个函数根本不存在"。
+  根因是文件里混进了**裸 NUL（0x00）字节**，多半是手写注释时把 `\0`
+  写成了真字节。
+  - 坑出处：2026-10-21 在 `src/compiler/irgen_call.c` 的注释
+    「无 \0 范围内的切片」里写进了真 NUL，ripgrep 随即把整个
+    `irgen_call.c` 当二进制跳过——"这个守卫写在哪个文件"直接落空，
+    一度让人以为守卫不存在。
+- **动作**：注释里要写 NUL 就写**转义** `\0`（两个字符），不要写真字节；
+  怀疑文件被当二进制时用 `rg -a` / `grep -a` 复核；写完源码后顺手扫一遍
+  裸 NUL 再提交。

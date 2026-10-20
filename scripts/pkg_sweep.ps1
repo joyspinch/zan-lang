@@ -29,9 +29,21 @@ Set-Content -Path $report -Value ""
 foreach ($pkg in Get-ChildItem -Directory packages) {
     $files = Get-ChildItem -Recurse -Filter *.zan $pkg.FullName | Sort-Object FullName
     if (-not $files) { Add-Content $report "$($pkg.Name): NO_SOURCES"; continue }
-    $log = (& $zancPath $entry @($files.FullName) --auto-stdlib `
+    # Windows caps the command line at ~32K. The big SDK packages blow past it
+    # and the process then never starts -- the script used to read that
+    # "file name too long" text as "no : error" and report the package as
+    # GREEN, i.e. a package that was never compiled at all looked healthy.
+    # Feed the file list through an @argfile, and treat a failed spawn as RED.
+    $argFile = "_scratch\sweep_args.txt"
+    $argText = ($files.FullName | ForEach-Object { '"' + $_ + '"' }) -join "`n"
+    [IO.File]::WriteAllText($argFile, $argText, (New-Object System.Text.UTF8Encoding($false)))
+    $log = (& $zancPath $entry "@$argFile" --auto-stdlib `
         -o "_scratch\sweep_pkg.exe" 2>&1 | Out-String) -replace "$esc\[[0-9;]*m", ""
-    if ($log -match ": error") {
+    if ($log -match "failed to run" -or $log -match "文件名或扩展名太长") {
+        Add-Content $report "$($pkg.Name): RED (spawn failed, $($files.Count) files)"
+        ($log -split "`n" | Where-Object { $_ -match "failed to run|文件名或扩展名太长" } |
+            Select-Object -First 3) | Add-Content $report
+    } elseif ($log -match ": error") {
         Add-Content $report "$($pkg.Name): RED ($($files.Count) files)"
         ($log -split "`n" | Where-Object { $_ -match ": error" } |
             Select-Object -First 5) | Add-Content $report

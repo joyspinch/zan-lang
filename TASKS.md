@@ -8,6 +8,47 @@
 
 ## 未完成
 
+### [ ] A446 `packages/Zan.Sdk.Wechat` 引用了不存在的枚举 `WechatMpMediaType`
+
+- 现象（2026-10-21 全包扫描实测）：`packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Mp/
+  WechatMpMediaSpecialApi.zan:12` 与 `.../Models/Mp/WechatMpSpecialProtocol.zan:10`
+  都把 `WechatMpMediaType` 当类型用，但**全仓没有任何地方声明它**
+  （`rg "enum WechatMpMediaType"` 零命中）。编译这两个文件报
+  "undefined type 'WechatMpMediaType'"。
+- 影响：该包整体编译不过；同包的其它文件也引用不到这个类型。
+- 之前没被发现的原因：`scripts/pkg_sweep.ps1` 把文件列表直接摊在命令行上，
+  `Zan.Sdk.Wechat` 有 5618 个文件 → 超出 Windows 命令行长度上限 → **进程根本没
+  起来**，而脚本报错文本里没有 ": error"，于是被判成 **green**——一个从未被编译
+  的包看起来是健康的。脚本已改用 `@argfile` 并把"启动失败"判成 RED（见同批
+  提交），但这条枚举缺失仍待补。
+- 方向：按微信素材管理接口的取值补一个枚举（image / voice / video / thumb 等），
+  或把这两处的类型换成包内已有的实际类型——需要按微信 API 文档核对语义，
+  属于包内容工作，不在本轮编译器修复范围内。
+
+### [ ] A445 自举后端 `Math.*` / `Convert.ToInt32` / `Convert.ToDouble` 与 C 宿主同款缺陷
+
+- 现象（2026-10-21 随 C 宿主的类型守卫一并查实）：
+  - `src/selfhost/irgen_expr.zan:3884` `ToDbl`：实参不是 double 就一律
+    `sitofp i64 <v> to double`。类实例是**指针** → 造出 `sitofp i64 i8*`，
+    LLVM 校验失败（非法 IR）。`GenMathCall`（同文件 `:3897`）的所有分支
+    （Sin/Cos/Tan/Log/Exp/Atan/Asin/Acos/Sqrt、Pow/Atan2、Floor/Ceiling、
+    Abs、Max/Min）都走 `ToDbl` → `Math.Sqrt(<类实例>)` 在自举后端同样是非法 IR。
+  - 同文件 `:4094` `Convert.ToDouble`：实参既不是 string 也不是 double 时，
+    同样落到 `sitofp i64 <v> to double` → 同款非法 IR。
+  - 同文件 `:4107` `Convert.ToInt32` / `ToInt`：无条件
+    `call i64 @atoi(i8* <a.op>)` —— 类实例的**对象指针**被当成 C 字符串交给
+    `atoi`，运行期读对象字节当文本，静默得到 0（与 C 宿主修复前
+    `strtoll` 读对象首字节同款）。
+- 影响：同一份源码，C 宿主现在给人话诊断，自举后端仍是编译期 LLVM 校验失败
+  或运行期读对象内存。差分门（`tests/selfhost/diff_cases.txt`）目前是绿的——
+  现有用例没有覆盖"给 Math/Convert 喂类实例"。
+- 方向：与 C 宿主同款守卫，按**静态类型**分流：类 / 结构体 / 数组 / 委托 →
+  报与宿主一致的诊断；字符串 / 数值走原有路径。守卫要落在 `ToDbl` 与
+  `Convert.*` 的**分派入口**，不要只补 `GenMathCall` 的某一个分支。
+- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一个会话在途修改，本轮无法同一次
+  提交落地，等窗口。
+- 相关：A443（`Math` / `Convert` 公开面缺失）、A444（`Convert.ToString(object)` 残留）。
+
 ### [ ] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
 
 - 现象：A4xx 那条修复（`Convert.ToString` 按静态类型分流）把类 / 结构体 /
@@ -28,6 +69,10 @@
   2. 或者把 `Convert.ToString` 正式声明进 stdlib（A443），按实参类型分派，
      `object` 重载走上面的通用 ToString。
 - ⚠ 两条都跨后端（C 宿主 + 自举后端），且 1 还要动运行时（对象头类型 id）。
+- 同族残留（2026-10-21 记）：`Convert.ToInt32/ToInt64/ToInt/ToDouble` 与
+  `int.Parse` 系列的类型守卫同样**放行 `object`**——`object` 装类实例时，
+  这些内建仍会把对象指针当 C 文本去 `strtoll`/`strtod` 解析，静默得到 0。
+  与本条同源：object 没有通用 ToString / 值语义就没法正确分流。
 ### [ ] A442 自举后端 `Convert.ToString(<引用类型>)` 输出指针地址——与 C 宿主的诊断不一致
 
 - 现象（2026-10-20 随 A441 一并查实）：C 宿主已改成对引用类型 fail-closed
@@ -65,6 +110,12 @@
     让路（该守卫已经在了）；
   - IDE 补全随之补齐；
   - bool 的渲染口径（A441）也能在 stdlib 里一次定死。
+- 同族：**`Math` 也是编译器自造的**。`src/compiler/builtin_api.c:74-82` 的
+  `members_math` 声明了 Abs/Max/Min/Pow/Sqrt/Round/Floor/Ceiling 等成员，
+  但 `stdlib/` 下**根本没有 `Math.zan`**（`stdlib/System/` 里只有 Convert.zan，
+  且它也没有 ToString/ToInt32/ToDouble）。所以 IDE 补全同样补不出 `Math.*`。
+  治本时应把 `Math` 与 `Convert` 一起声明进 stdlib，让公开面住在 stdlib、
+  类型定型与重载解析走常规路径，编译器内建特判随之退化为兜底。
 - ⚠ 跨后端：自举后端 `src/selfhost/irgen_expr.zan:4036` 的 `Convert.ToString`
   特判是**无条件拦截**的（不像 Console 那样有 `LocalIdx("Console") < 0` 守卫），
   必须同时加上守卫，否则自举侧不会调用 stdlib 方法。两端要同一次落地。

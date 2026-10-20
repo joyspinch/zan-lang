@@ -657,7 +657,7 @@ static LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
    放行 object 的代价是它仍按 C 字符串读：里面装的是字符串时结果正确，装
    的是类实例时仍会越界读；治本要等 object 的通用 ToString 或把
    Convert.ToString 声明进 stdlib（A443），两边一起做。 */
-static bool type_is_stringifiable(zan_type_t *t) {
+static bool type_is_textual_or_numeric(zan_type_t *t) {
     if (!t) return true;
     switch (t->kind) {
     case TYPE_STRING: case TYPE_CHAR: case TYPE_ENUM: case TYPE_BOOL:
@@ -667,12 +667,53 @@ static bool type_is_stringifiable(zan_type_t *t) {
     case TYPE_ERROR: case TYPE_TYPE_PARAM: case TYPE_OBJECT:
         return true;
     case TYPE_NULLABLE:
-        return t->element_type ? type_is_stringifiable(t->element_type) : true;
+        return t->element_type ? type_is_textual_or_numeric(t->element_type) : true;
     default:
         return false;
     }
 }
 
+/* 纯文本解析型内建（int.Parse / double.Parse / TryParse）的实参必须是字符串。
+   指针一路走到 strtoll/strtod 就是把对象的字节当文本读；数值实参更糟——
+   strtoll 收 i8*，传 i64 进去直接生成非法 IR（LLVM 校验失败）。 */
+static bool type_is_text_arg(zan_type_t *t) {
+    if (!t) return true;
+    switch (t->kind) {
+    case TYPE_STRING: case TYPE_OBJECT: case TYPE_ERROR: case TYPE_TYPE_PARAM:
+        return true;
+    case TYPE_NULLABLE:
+        return t->element_type ? type_is_text_arg(t->element_type) : true;
+    default:
+        return false;
+    }
+}
+
+/* Math.* 的实参必须是数值。指针/结构体落进 SIToFP 会生成非法 IR——LLVM 校验
+   失败（"Call parameter type does not match function signature"），编译直接
+   死在代码生成阶段，用户看到的是内部错误而不是人话诊断。 */
+static bool math_arg_is_numeric(LLVMValueRef v) {
+    LLVMTypeKind k = LLVMGetTypeKind(LLVMTypeOf(v));
+    return k == LLVMIntegerTypeKind || k == LLVMDoubleTypeKind ||
+           k == LLVMFloatTypeKind;
+}
+
+/* 数值实参统一成 double（int 走 sitofp，float 走 fpext）。 */
+static LLVMValueRef math_arg_to_double(zan_irgen_t *g, LLVMValueRef v) {
+    LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
+    LLVMTypeKind k = LLVMGetTypeKind(LLVMTypeOf(v));
+    if (k == LLVMFloatTypeKind) return LLVMBuildFPExt(g->builder, v, dbl, "ext");
+    if (k == LLVMIntegerTypeKind) return LLVMBuildSIToFP(g->builder, v, dbl, "tofp");
+    return v;
+}
+
+/* 不是数值就报人话诊断（fail-closed），返回 false 让调用方回一个 0 值。 */
+static bool math_require_numeric(zan_irgen_t *g, zan_ast_node_t *expr,
+                                  LLVMValueRef v, const char *name) {
+    if (math_arg_is_numeric(v)) return true;
+    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                  "Math.%s requires an int or floating-point argument", name);
+    return false;
+}
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
@@ -1410,11 +1451,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Sqrt") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-            if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind) {
-                arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
-            } else if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMDoubleTypeKind) {
-                arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
-            }
+            if (!math_require_numeric(g, expr, arg, "Sqrt"))
+                return LLVMConstReal(dbl, 0.0);
+            arg = math_arg_to_double(g, arg);
             LLVMValueRef sqrt_fn = LLVMGetNamedFunction(g->mod, "sqrt");
             if (!sqrt_fn) {
                 LLVMTypeRef sqrt_args[] = { dbl };
@@ -1435,11 +1474,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     is_call_to(expr, "Math", math1[mi]) && expr->call.args.count == 1) {
                     LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                     LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
-                    if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind) {
-                        arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
-                    } else if (LLVMGetTypeKind(LLVMTypeOf(arg)) != LLVMDoubleTypeKind) {
-                        arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
-                    }
+                    if (!math_require_numeric(g, expr, arg, math1[mi]))
+                        return LLVMConstReal(dbl, 0.0);
+                    arg = math_arg_to_double(g, arg);
                     LLVMTypeRef fty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
                     LLVMValueRef fn = LLVMGetNamedFunction(g->mod, math1[mi + 1]);
                     if (!fn) fn = LLVMAddFunction(g->mod, math1[mi + 1], fty);
@@ -1453,14 +1490,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef y_v = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef x_v = emit_expr(g, expr->call.args.items[1], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(y_v)) == LLVMIntegerTypeKind)
-                y_v = LLVMBuildSIToFP(g->builder, y_v, dbl, "tofp");
-            else if (LLVMGetTypeKind(LLVMTypeOf(y_v)) == LLVMFloatTypeKind)
-                y_v = LLVMBuildFPExt(g->builder, y_v, dbl, "ext");
-            if (LLVMGetTypeKind(LLVMTypeOf(x_v)) == LLVMIntegerTypeKind)
-                x_v = LLVMBuildSIToFP(g->builder, x_v, dbl, "tofp");
-            else if (LLVMGetTypeKind(LLVMTypeOf(x_v)) == LLVMFloatTypeKind)
-                x_v = LLVMBuildFPExt(g->builder, x_v, dbl, "ext");
+            if (!math_require_numeric(g, expr, y_v, "Atan2") ||
+                !math_require_numeric(g, expr, x_v, "Atan2"))
+                return LLVMConstReal(dbl, 0.0);
+            y_v = math_arg_to_double(g, y_v);
+            x_v = math_arg_to_double(g, x_v);
             LLVMValueRef atan2_fn = LLVMGetNamedFunction(g->mod, "atan2");
             if (!atan2_fn) {
                 LLVMTypeRef atan2_args[] = { dbl, dbl };
@@ -1477,14 +1511,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Abs") && expr->call.args.count == 1) {
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
             LLVMTypeRef arg_type = LLVMTypeOf(arg);
-            if (LLVMGetTypeKind(arg_type) != LLVMIntegerTypeKind &&
-                LLVMGetTypeKind(arg_type) != LLVMDoubleTypeKind &&
-                LLVMGetTypeKind(arg_type) != LLVMFloatTypeKind) {
-                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
-                              "Math.Abs requires an int or floating-point "
-                              "argument");
+            if (!math_require_numeric(g, expr, arg, "Abs"))
                 return LLVMConstInt(LLVMInt32TypeInContext(g->ctx), 0, 0);
-            }
             if (LLVMGetTypeKind(arg_type) == LLVMDoubleTypeKind ||
                 LLVMGetTypeKind(arg_type) == LLVMFloatTypeKind) {
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
@@ -1517,8 +1545,10 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeKind kb = LLVMGetTypeKind(LLVMTypeOf(b));
             int fa = (ka == LLVMDoubleTypeKind || ka == LLVMFloatTypeKind);
             int fb = (kb == LLVMDoubleTypeKind || kb == LLVMFloatTypeKind);
-            if (!fa && !fb &&
-                ka != LLVMIntegerTypeKind && kb != LLVMIntegerTypeKind) {
+            /* 守卫要逐个参数判：原来的写法是 "ka != Int && kb != Int"，
+               遇到「一个指针 + 一个整数」就不报错了，pointer 随后被
+               sitofp 成 double——生成非法 IR，编译死在代码生成阶段。 */
+            if (!math_arg_is_numeric(a) || !math_arg_is_numeric(b)) {
                 zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
                               "Math.%s requires numeric arguments",
                               want_max ? "Max" : "Min");
@@ -1561,10 +1591,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef base_v = emit_expr(g, expr->call.args.items[0], locals);
             LLVMValueRef exp_v = emit_expr(g, expr->call.args.items[1], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(base_v)) == LLVMIntegerTypeKind)
-                base_v = LLVMBuildSIToFP(g->builder, base_v, dbl, "tofp");
-            if (LLVMGetTypeKind(LLVMTypeOf(exp_v)) == LLVMIntegerTypeKind)
-                exp_v = LLVMBuildSIToFP(g->builder, exp_v, dbl, "tofp");
+            if (!math_require_numeric(g, expr, base_v, "Pow") ||
+                !math_require_numeric(g, expr, exp_v, "Pow"))
+                return LLVMConstReal(dbl, 0.0);
+            base_v = math_arg_to_double(g, base_v);
+            exp_v = math_arg_to_double(g, exp_v);
             LLVMValueRef pow_fn = LLVMGetNamedFunction(g->mod, "pow");
             if (!pow_fn) {
                 LLVMTypeRef pow_args[] = { dbl, dbl };
@@ -1580,8 +1611,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Floor") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind)
-                arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
+            if (!math_require_numeric(g, expr, arg, "Floor"))
+                return LLVMConstReal(dbl, 0.0);
+            arg = math_arg_to_double(g, arg);
             LLVMValueRef floor_fn = LLVMGetNamedFunction(g->mod, "floor");
             if (!floor_fn) {
                 LLVMTypeRef floor_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
@@ -1595,8 +1627,9 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             is_call_to(expr, "Math", "Ceiling") && expr->call.args.count == 1) {
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind)
-                arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
+            if (!math_require_numeric(g, expr, arg, "Ceiling"))
+                return LLVMConstReal(dbl, 0.0);
+            arg = math_arg_to_double(g, arg);
             LLVMValueRef ceil_fn = LLVMGetNamedFunction(g->mod, "ceil");
             if (!ceil_fn) {
                 LLVMTypeRef ceil_type = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
@@ -1613,17 +1646,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMTypeRef d1_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl }, 1, 0);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMIntegerTypeKind)
-                arg = LLVMBuildSIToFP(g->builder, arg, dbl, "tofp");
-            else if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMFloatTypeKind)
-                arg = LLVMBuildFPExt(g->builder, arg, dbl, "ext");
+            if (!math_require_numeric(g, expr, arg, "Round"))
+                return LLVMConstReal(dbl, 0.0);
+            arg = math_arg_to_double(g, arg);
             LLVMValueRef round_fn = get_libc_fn(g, "round", d1_ty);
             if (expr->call.args.count == 1)
                 return zan_call2(g->builder, d1_ty, round_fn, &arg, 1, "round");
             /* digits: round(x * 10^d) / 10^d */
             LLVMValueRef digits = emit_expr(g, expr->call.args.items[1], locals);
-            if (LLVMGetTypeKind(LLVMTypeOf(digits)) == LLVMIntegerTypeKind)
-                digits = LLVMBuildSIToFP(g->builder, digits, dbl, "dtofp");
+            if (!math_require_numeric(g, expr, digits, "Round"))
+                return LLVMConstReal(dbl, 0.0);
+            digits = math_arg_to_double(g, digits);
             LLVMTypeRef d2_ty = LLVMFunctionType(dbl, (LLVMTypeRef[]){ dbl, dbl }, 2, 0);
             LLVMValueRef pow_fn = get_libc_fn(g, "pow", d2_ty);
             LLVMValueRef scale = zan_call2(g->builder, d2_ty, pow_fn,
@@ -1639,6 +1672,15 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
             LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
             LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
+            zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+            if (!type_is_textual_or_numeric(at)) {
+                zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                              "Convert.ToDouble: cannot convert '%.*s' to a "
+                              "number -- pass a string or a numeric value",
+                              at && at->name.len ? (int)at->name.len : 6,
+                              at && at->name.len ? at->name.str : "<value>");
+                return LLVMConstReal(dbl, 0.0);
+            }
             LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
             if (ak == LLVMPointerTypeKind) {
                 LLVMTypeRef strtod_ty = LLVMFunctionType(dbl,
@@ -1680,6 +1722,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
+                zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+                if (!type_is_text_arg(at)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                                  "%.*s.Parse requires a string argument",
+                                  (int)rn.len, rn.str);
+                    return int_recv ? LLVMConstInt(i64, 0, 0)
+                                    : LLVMConstReal(dbl, 0.0);
+                }
                 LLVMValueRef r;
                 if (int_recv) {
                     LLVMTypeRef strtoll_ty = LLVMFunctionType(i64,
@@ -1709,6 +1759,13 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                 LLVMTypeRef dbl = LLVMDoubleTypeInContext(g->ctx);
                 LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
                 LLVMValueRef s = emit_expr(g, expr->call.args.items[0], locals);
+                zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+                if (!type_is_text_arg(at)) {
+                    zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                                  "%.*s.TryParse requires a string argument",
+                                  (int)rn.len, rn.str);
+                    return LLVMConstInt(LLVMInt1TypeInContext(g->ctx), 0, 0);
+                }
                 LLVMValueRef outp = emit_expr(g, expr->call.args.items[1], locals);
                 LLVMValueRef endp = emit_entry_alloca(g, i8ptr, "endp");
                 LLVMBuildStore(g->builder, LLVMConstNull(i8ptr), endp);
@@ -1881,6 +1938,17 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         expr->call.args.count == 1) {
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
+                        zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+                        if (!type_is_textual_or_numeric(at)) {
+                            zan_diag_emit(g->diag, DIAG_ERROR, expr->loc,
+                                          "Convert.%.*s: cannot convert '%.*s' "
+                                          "to a number -- pass a string or a "
+                                          "numeric value",
+                                          (int)method_name.len, method_name.str,
+                                          at && at->name.len ? (int)at->name.len : 6,
+                                          at && at->name.len ? at->name.str : "<value>");
+                            return LLVMConstInt(i64t, 0, 0);
+                        }
                         LLVMTypeKind ak = LLVMGetTypeKind(LLVMTypeOf(arg));
                         LLVMValueRef parsed;
                         if (ak == LLVMPointerTypeKind) {
@@ -1913,7 +1981,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                         zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
-                        if (!type_is_stringifiable(at)) {
+                        if (!type_is_textual_or_numeric(at)) {
                             char tname[128];
                             if (at->kind == TYPE_ARRAY && at->element_type &&
                                 at->element_type->name.len) {
@@ -2066,7 +2134,7 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     memcpy_fn, mcargs, 3, "");
                 LLVMValueRef endp = LLVMBuildGEP2(g->builder, i8, buf, &slen, 1, "endp");
                 LLVMBuildStore(g->builder, LLVMConstInt(i8, 0, 0), endp);
-                /* 无   范围内的切片：slen 为切片结果字符串长度 */
+                /* 无 \0 范围内的切片：slen 为切片结果字符串长度 */
                 emit_string_len_set(g, buf, slen);
                 LLVMBuildBr(g->builder, bb_join);
 

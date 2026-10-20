@@ -1179,6 +1179,68 @@ add_test(NAME diag_convert_tostring_struct
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_tostring_struct PROPERTIES TIMEOUT 60)
 
+# Math.* 的实参必须是数值。类实例此前被直接喂给 sitofp（指针转 double），
+# 生成 LLVM 校验失败的非法 IR，诊断信息对用户毫无意义。
+add_test(NAME diag_math_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/math_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_math_object${_exe_ext}
+    "-DEXPECT_REGEX=Math.Sqrt requires an int or floating-point argument"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_math_object PROPERTIES TIMEOUT 60)
+
+# Math.Max/Min 是双参特判：必须逐个参数判类型，一个类实例 + 一个整数
+# 此前会一路混过去。
+add_test(NAME diag_math_max_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/math_max_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_math_max_object${_exe_ext}
+    "-DEXPECT_REGEX=Math.Max requires numeric arguments"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_math_max_object PROPERTIES TIMEOUT 60)
+
+# Convert.ToInt32/ToInt64/ToInt 的实参必须有字符串或数值形态；类实例此前
+# 被当成 C 字符串文本去解析（strtoll 读对象首字节），静默返回 0。
+add_test(NAME diag_convert_tonumber_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tonumber_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tonumber_object${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'Box' to a number"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_convert_tonumber_object PROPERTIES TIMEOUT 60)
+
+# Convert.ToDouble 是另一条诊断分支（zan_rt_dbl_parse）。
+add_test(NAME diag_convert_todouble_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_todouble_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_todouble_object${_exe_ext}
+    "-DEXPECT_REGEX=Convert.ToDouble: cannot convert 'Box' to a number"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_convert_todouble_object PROPERTIES TIMEOUT 60)
+
+# 文本解析型内建（int.Parse / double.Parse ...）只接受字符串。
+add_test(NAME diag_parse_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/parse_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_parse_object${_exe_ext}
+    "-DEXPECT_REGEX=int.Parse requires a string argument"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_parse_object PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_tryparse_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/tryparse_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_tryparse_object${_exe_ext}
+    "-DEXPECT_REGEX=int.TryParse requires a string argument"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_tryparse_object PROPERTIES TIMEOUT 60)
+
 # Mixed signed/unsigned comparison: the ulong-wins promotion would silently
 # reinterpret the signed operand (a negative long becomes a huge ulong), so
 # the operator is an error unless the signed side is a non-negative constant
