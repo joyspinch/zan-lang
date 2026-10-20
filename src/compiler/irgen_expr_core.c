@@ -1887,6 +1887,47 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
     case AST_BINARY:
         if (e->binary.op == TK_PLUS && is_string_expr(g, e, locals))
             return g->binder->type_string;
+        /* 运算符重载：先解析重载方法并返回它的返回类型。
+         *
+         * 不做这一步的话，`a * s + b`（重载结果再参与下一次运算）这种
+         * 表达式的类型推不出来——左操作数是"结构体 × 标量"，左右类型
+         * 不同 kinds，下面的数值分支会返回 NULL；上层拿不到类型就跳过
+         * 重载分派，代码生成退化成整数加法，LLVM 校验直接失败
+         * （"Integer arithmetic operators only work with integral types"）。 */
+        {
+            const char *op_name = NULL;
+            switch (e->binary.op) {
+            case TK_PLUS:       op_name = "op_add"; break;
+            case TK_MINUS:      op_name = "op_sub"; break;
+            case TK_STAR:       op_name = "op_mul"; break;
+            case TK_SLASH:      op_name = "op_div"; break;
+            case TK_PERCENT:    op_name = "op_mod"; break;
+            case TK_EQ_EQ:      op_name = "op_eq"; break;
+            case TK_BANG_EQ:    op_name = "op_neq"; break;
+            case TK_LESS:       op_name = "op_lt"; break;
+            case TK_GREATER:    op_name = "op_gt"; break;
+            case TK_LESS_EQ:    op_name = "op_le"; break;
+            case TK_GREATER_EQ: op_name = "op_ge"; break;
+            default: break;
+            }
+            if (op_name) {
+                zan_type_t *lt = infer_expr_type(g, e->binary.left, locals);
+                if (lt && lt->sym &&
+                    (lt->kind == TYPE_CLASS || lt->kind == TYPE_STRUCT)) {
+                    zan_istr_t op_istr = { (char *)op_name, (int)strlen(op_name) };
+                    zan_ast_node_t *op_probe = zan_ast_new(g->arena, AST_CALL,
+                                                           e->loc);
+                    op_probe->call.callee = NULL;
+                    zan_ast_list_init(&op_probe->call.args);
+                    zan_ast_list_init(&op_probe->call.type_args);
+                    zan_ast_list_push(&op_probe->call.args, e->binary.right,
+                                      g->arena);
+                    zan_symbol_t *op = resolve_op_overload(g, lt->sym, op_istr,
+                                                           op_probe, locals);
+                    if (op) return op->type;
+                }
+            }
+        }
         switch (e->binary.op) {
         case TK_PLUS: case TK_MINUS: case TK_STAR: case TK_SLASH:
         case TK_PERCENT: case TK_AMP: case TK_PIPE: case TK_CARET:

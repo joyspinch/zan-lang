@@ -192,6 +192,49 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      定位成本极高。
    - 边界：替代形态——把值类型放进 `List<T>`（元素类型走已替换的路径），
      或让泛型类只持有引用类型字段。
+18. **运算符重载必须参与类型推导**：
+   - 动作：`infer_expr_type`（`src/compiler/irgen_expr_core.c`）的 `AST_BINARY`
+     分支，在走数值运算前先查有没有对应的 `op_*` 重载（`op_add` / `op_sub` /
+     `op_mul` / `op_div` / `op_mod` / `op_eq` / `op_neq` / `op_lt` / `op_gt` /
+     `op_le` / `op_ge`），查到就返回该方法的**返回类型**。
+   - 理由：推导返回 NULL → 重载分派被跳过 → 代码生成退化成**整数加法**，
+     LLVM 报 "Integer arithmetic operators only work with integral types"。
+     症状离病因很远：报的是加法不合法，真实问题是重载根本没被调用。
+   - 边界：运算符结果**再参与下一次运算**时最容易踩（`a * b + a`：第一
+     次的结果类型是 NULL，第二次运算就彻底失去类型信息）——推导必须能
+     链式传递。
+19. **运算符调用的实参形态要按期望类型归一化**：
+   - 动作：运算符调用路径（`src/compiler/irgen_expr.c`）拿接收者与第二个
+     实参时，若参数类型是 struct 而实参是指针槽位（`new 结构体(...)` 的
+     返回值），补一次 `LLVMBuildLoad2`；常规调用走 `coerce_args_to_params`，
+     运算符路径**不能假设**已经走过。
+   - 理由：否则报 "Call parameter type does not match function signature"，
+     而用户写的就是最普通的 `a + b`。
+   - 边界：标量与结构体的混合重载**只能标量在右**（`v * 2.0` 合法，
+     `2.0 * v` 编译器直接报 "cannot apply operator to 'double' and 'V'"）——
+     这是语言限制，不是缺陷，不要靠改编译器放宽。
+20. **跨编译单元的 struct 字段布局必须按需注册后取值**：
+   - 动作：`map_type`（`src/compiler/irgen.c`）的 `TYPE_STRUCT` / `TYPE_CLASS`
+     分支，在该类型尚未注册时按「有 `decl` 则先 `register_struct_type`」
+     再取字段类型——class 取**指针**，struct 取**值**；`map_tuple_struct`
+     的兜底分支同规则（原来写成 `if (!type->sym->decl)`，条件写反：有
+     声明、成员已绑定、能算布局时反而不注册）。
+   - 理由：漏注册 → 字段类型退化成 `i8*` → 类的字段布局整体错位 →
+     **静默内存损坏**（实测 `v 3,0.25` 把结构体的 y 读成了相邻的 double，
+     编译与运行都无报错）。这类缺陷比崩溃更难查：值是错的，不是没有。
+   - 边界：判定器是**跨文件**用例——结构体定义文件必须排在引用它的用户文件
+     **之后**编译，才命中旧的文件序缺陷（见
+     `tests/conformance/struct_field_layout/`）。
+21. **结构体类型注册表的条目指针在递归注册后失效**：
+   - 动作：`register_struct_type` 登记完自己就立刻记下
+     `int my_index = g->struct_type_count - 1;`，递归注册**之后**再用
+     `&g->struct_types[my_index]` 取条目取字段数据。
+   - 理由：递归注册会 realloc `g->struct_types`（数组搬家），事后用
+     `&g->struct_types[g->struct_type_count - 1]` 取到的是**别的类型**的
+     条目 → 字段数据互相覆盖 → 类型混淆 → **间歇性 0xC0000005**（同一
+     份代码 10 次编译崩 1 次）。
+   - 边界：任何"先记下元素指针、递归之后再解引用"的写法都要复查；**间歇性**
+     崩溃（同样输入时好时坏）优先怀疑缓存/表条目的生命周期，而不是随机性。
 
 ---
 

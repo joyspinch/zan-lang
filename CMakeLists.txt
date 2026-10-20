@@ -2478,6 +2478,21 @@ add_test(NAME conformance_multifile
     -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+# ---- Cross-file struct field layout: a class field whose type is a struct
+#      declared in another compilation unit must keep the by-value layout.
+#      The compiler used to fall back to an i8* for such a field (the struct
+#      type was not registered yet), which shifted every following field --
+#      silent memory corruption, no diagnostic. The struct lives in a file
+#      compiled AFTER the user, which is the order that used to break. ----
+add_test(NAME conformance_struct_field_layout
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/main.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/types.zan"
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/expected.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_struct_field_layout${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 # ---- nsresolve enclosing-namespace resolution: a bare name in Gui.Sub
 #      binds to Gui.App by the ancestor walk and KEEPS that binding when a
 #      global-scope App joins the compile and both Apps get collision-
@@ -2689,7 +2704,6 @@ add_test(NAME selfhost_ngen_smoke
     -DBAD_TYPE_PROG=${CMAKE_SOURCE_DIR}/tests/selfhost/ngen/bad_type.zan
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_ngen.cmake)
 set_tests_properties(selfhost_ngen_smoke PROPERTIES TIMEOUT 600)
-
 
 # ---- Self-hosting fixed point: full gen0->gen1->gen2->gen3 closure, asserting
 #      g2.ll == g3.ll byte-for-byte. Requires clang to link the emitted IR, so

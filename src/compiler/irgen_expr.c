@@ -3725,6 +3725,19 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                 /* 非静态运算符绑定隐式 this 接收者 */
                                 bool op_is_static =
                                     (op_sym->modifiers & MOD_STATIC) != 0;
+                                /* 接收者与实参既可能是"值"，也可能是"槽位指针"
+                                 * （new 结构体表达式返回的是槽位地址）。常规调用
+                                 * 走 coerce_args_to_params 会补这次加载，运算符
+                                 * 路径没有——按值传参就会把指针塞进调用里，
+                                 * LLVM 校验直接失败（Call parameter type does
+                                 * not match function signature）。 */
+                                LLVMTypeRef recv_t = map_type(g, ltype);
+                                if (LLVMGetTypeKind(LLVMTypeOf(cargs[0])) ==
+                                        LLVMPointerTypeKind &&
+                                    LLVMGetTypeKind(recv_t) == LLVMStructTypeKind) {
+                                    cargs[0] = LLVMBuildLoad2(g->builder, recv_t,
+                                                              cargs[0], "op.recv");
+                                }
                                 if (!op_is_static &&
                                     LLVMGetTypeKind(LLVMTypeOf(cargs[0])) == LLVMStructTypeKind) {
                                     LLVMValueRef rslot = emit_entry_alloca(g,
@@ -3742,6 +3755,11 @@ static LLVMValueRef emit_expr_binary(zan_irgen_t *g, zan_ast_node_t *expr,
                                 if (p1) p1 = subst_type_param_deep(g, p1, ltype);
                                 if (p1 && !op_generic) {
                                     LLVMTypeRef p1t = map_type(g, p1);
+                                    if (LLVMGetTypeKind(p1t) == LLVMStructTypeKind &&
+                                        LLVMGetTypeKind(LLVMTypeOf(cargs[1])) == LLVMPointerTypeKind) {
+                                        cargs[1] = LLVMBuildLoad2(g->builder, p1t,
+                                                                  cargs[1], "op.sval");
+                                    }
                                     if (LLVMTypeOf(cargs[1]) != p1t)
                                         cargs[1] = coerce_int_to(g, cargs[1], p1t);
                                 }

@@ -3123,7 +3123,11 @@ static LLVMTypeRef map_tuple_struct(zan_irgen_t *g, zan_type_t *type) {
             return g->struct_types[i].llvm_type;
         }
     }
-    if (!type->sym->decl) register_struct_type(g, type->sym);
+    /* 有声明才有成员信息、才能算布局——此时必须把结构体类型注册进去。
+     * 条件写反过（`if (!type->sym->decl)`）：有声明时反而不注册，字段类型
+     * 降级成 i8*，类的字段布局随即错位——跨文件引用结构体（包里另一个
+     * 文件声明的 struct）必现，表现为字段读到相邻字段的值。 */
+    if (type->sym->decl) register_struct_type(g, type->sym);
     for (int i = 0; i < g->struct_type_count; i++) {
         if (g->struct_types[i].sym == type->sym) {
             return g->struct_types[i].llvm_type;
@@ -3200,6 +3204,19 @@ static LLVMTypeRef map_type(zan_irgen_t *g, zan_type_t *type) {
                     return LLVMPointerType(g->struct_types[i].llvm_type, 0);
                 }
                 return g->struct_types[i].llvm_type;
+            }
+        }
+        /* 还没注册：有声明才有成员信息、才能算布局——先注册再取。
+         * 类取指针（引用语义），结构体取值（值语义）。 */
+        if (type->sym && type->sym->decl) {
+            register_struct_type(g, type->sym);
+            for (int i = 0; i < g->struct_type_count; i++) {
+                if (g->struct_types[i].sym == type->sym) {
+                    if (type->kind == TYPE_CLASS) {
+                        return LLVMPointerType(g->struct_types[i].llvm_type, 0);
+                    }
+                    return g->struct_types[i].llvm_type;
+                }
             }
         }
         return map_tuple_struct(g, type);
@@ -3475,6 +3492,10 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
     g->struct_types[g->struct_type_count].sym = sym;
     g->struct_types[g->struct_type_count].llvm_type = st;
     g->struct_type_count++;
+    /* 本结构体在表里的下标：下面算字段类型时可能**递归**注册别的结构体，
+     * 那会让 g->struct_types 扩容搬家——事后不能再用"最后一个"当下标，
+     * 也不能缓存 &g->struct_types[...] 指针（那是野指针）。 */
+    int my_index = g->struct_type_count - 1;
 
     int field_count = 0;
     for (int i = 0; i < sym->member_count; i++) {
@@ -3498,7 +3519,7 @@ static void register_struct_type(zan_irgen_t *g, zan_symbol_t *sym) {
         }
     }
 
-    struct zan_struct_type_entry *entry = &g->struct_types[g->struct_type_count - 1];
+    struct zan_struct_type_entry *entry = &g->struct_types[my_index];
     entry->field_count = field_count + vptr;
     entry->field_llvm = field_types;
     entry->explicit_layout = decl_is_explicit_layout(sym);
