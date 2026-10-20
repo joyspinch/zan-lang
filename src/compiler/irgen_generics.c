@@ -9,16 +9,30 @@ static zan_type_t *method_ret_type_at(zan_irgen_t *g, zan_symbol_t *msym,
                                       zan_ast_node_t *recv_expr,
                                       local_scope_t *locals);
 
-static void collect_inst_type(zan_irgen_t *g, zan_type_t *t) {
-    if (!t) return;
+static void collect_inst_type_depth(zan_irgen_t *g, zan_type_t *t, int depth) {
+    if (!t || depth > 16) return;
     if (g->collect_inst_ctx && !type_is_concrete(t))
         t = subst_type_param_deep(g, t, g->collect_inst_ctx);
     if (!t) return;
     add_generic_inst(g, t);
+    /* 泛型类的**基类实例**也要注册：class Validator<T> : Plan<T> 实例化成
+     * Validator<Signup> 时，基类实例是 Plan<Signup>。不注册就没有
+     * Plan<Signup> 的方法变体，调用退化成擦除版——基类方法里读
+     * `this.properties` 拿到的是擦除槽位的指针，与派生类看到的字段不是
+     * 同一个东西（实测运行期 0xC0000005）。 */
+    if (t->base_type && t->base_type->sym && t->base_type->sym != t->sym) {
+        zan_type_t *binst = subst_type_param_deep(g, t->base_type, t);
+        if (binst && binst != t->base_type)
+            collect_inst_type_depth(g, binst, depth + 1);
+    }
     if (t->kind == TYPE_ARRAY || t->kind == TYPE_NULLABLE)
-        collect_inst_type(g, t->element_type);
+        collect_inst_type_depth(g, t->element_type, depth + 1);
     for (int i = 0; i < t->type_arg_count; i++)
-        collect_inst_type(g, t->type_args[i]);
+        collect_inst_type_depth(g, t->type_args[i], depth + 1);
+}
+
+static void collect_inst_type(zan_irgen_t *g, zan_type_t *t) {
+    collect_inst_type_depth(g, t, 0);
 }
 
 static void collect_inst_typeref(zan_irgen_t *g, zan_ast_node_t *tref) {

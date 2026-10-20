@@ -26,24 +26,6 @@
   （如 OpenBW 的定点数 `operator-`）被迫改写成方法调用，属于绕路。
 - 关联：与 `operator_overload.zan` / `operator_relational.zan` 同族（重载覆盖���）。
 
-### [ ] A419 依赖型泛型基类（`class V<T> : Plan<T>`）特化后字段偏移错位——运行期空引用
-
-- 现象：`SignupValidator : Validator<Signup>`，而 `Validator<T> : Plan<T>`。
-  构造 `SignupValidator` 时崩：基类构造里 `this.properties` / `this.checks`
-  看着是好的（计数 0），但紧接着在 `Plan<T>.Add` 里读 `this.properties`
-  得到 null →
-  `runtime error: null reference where an object is required (member access)`。
-- 根因：泛型类的**基类类型**在特化时没有把类型实参替换进去（基类仍是
-  `Plan<T>` 而不是 `Plan<Signup>`），派生类里看到的字段偏移与基类方法里
-  算出的偏移不一致——同一份数据在两个地方被解释成两个东西。
-- 已排除的形态（都能用）：具体实例化的基类（`class X : Base<Signup>` ✓，
-  含继承来的方法体）；泛型类持有依赖型泛型**字段**（`Base<T>` 里的
-  `Inner<T> inner`）✓。
-- 方向：泛型类特化时同步替换基类类型实参（复用 `subst_type_param_deep`），
-  并让基类字段偏移按替换后的类型重算。
-- 现状规避：`Zan.Validation` 让用户直接继承 `ValidationPlan<T>`
-  （`ValidationPlan<T>` 自身无基类），不套一层 `AbstractValidator<T>`。
-
 ### [ ] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
 - 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_asyncvoid.zan`）：
