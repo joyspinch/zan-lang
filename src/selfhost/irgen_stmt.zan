@@ -529,12 +529,66 @@ partial class Irgen {
         return null;
     }
 
-    // Select the constructor for `new C(args)`: with a single ctor the
-    // behaviour is unchanged (arity is not consulted, so default-argument
-    // calls still resolve); with several overloads, keep those whose arity
-    // admits the call (trailing defaults fill the gap) and pick the best
-    // argument-type match. `exclude` rules a ctor out (a `: this(...)`
-    // chain must not retarget itself). Returns null when nothing fits.
+    // The number of arguments a constructor needs at least: the parameters
+    // without a default (a `params` array is not one of them).
+    int CtorArityMin(Node ctor) {
+        int n = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param() && p.op != 1 && p.b == null) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The number of arguments a constructor takes at most (-1: a `params`
+    // array takes any number of them).
+    int CtorArityMax(Node ctor) {
+        int n = 0; bool variadic = false; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                n = n + 1;
+                if (p.op == 1) { variadic = true; }
+            }
+            i = i + 1;
+        }
+        if (variadic) { return -1; }
+        return n;
+    }
+
+    // The C host's checker accepts a constructor when the argument count is
+    // within its arity range (a `params` array takes any number).
+    bool CtorArityFits(Node ctor, int argc) {
+        if (argc < CtorArityMin(ctor)) { return false; }
+        int hi = CtorArityMax(ctor);
+        if (hi >= 0 && argc > hi) { return false; }
+        return true;
+    }
+
+    // The C host's code generator matches a constructor by its parameter
+    // count and fills the omitted trailing parameters with their defaults:
+    // a constructor fits when the arguments do not outnumber its parameters
+    // and every parameter left over has a default. A `params` array does not
+    // fit that way -- the host refuses such a call in code generation.
+    bool CtorFitsStrict(Node ctor, int argc) {
+        int seen = 0; int i = 0;
+        while (i < ctor.kids.Count) {
+            Node p = ctor.kids[i];
+            if (p.kind == AK.Param()) {
+                if (seen >= argc && p.b == null) { return false; }
+                seen = seen + 1;
+            }
+            i = i + 1;
+        }
+        return argc <= seen;
+    }
+
+    // Select the constructor for `new C(args)`: a constructor fits when the
+    // argument count fits its parameters (the omitted trailing ones have
+    // defaults); with several fitting overloads the argument types pick the
+    // best one. `exclude` rules a ctor out (a `: this(...)` chain must not
+    // retarget itself). Returns null when nothing fits.
     Node ResolveCtorEx(Node cls, Node e, Node exclude) {
         if (cls == null) { return null; }
         List<Node> cands = new List<Node>();
@@ -544,18 +598,11 @@ partial class Irgen {
             i = i + 1;
         }
         if (cands.Count == 0) { return null; }
-        if (cands.Count == 1) { return cands[0]; }
         int argc = e.kids.Count;
         List<Node> fit = new List<Node>();
         i = 0;
         while (i < cands.Count) {
-            Node m = cands[i];
-            int tot = 0; int req = 0; int j = 0;
-            while (j < m.kids.Count) {
-                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } }
-                j = j + 1;
-            }
-            if (argc >= req && argc <= tot) { fit.Add(m); }
+            if (CtorFitsStrict(cands[i], argc)) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count == 0) { return null; }

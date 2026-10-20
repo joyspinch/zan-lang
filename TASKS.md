@@ -1132,8 +1132,9 @@
     基类的一参重载）。**已修**。
   - `overload_inherited_arity.zan`：`Strip.Add(b)`（b 是 Bag）取成了派生类
     的 `Add(string)` → 无限递归 → **栈溢出**（0xC00000FD）。**已修**。
-  - `indexer_overload.zan` / `cs_b12_conv_operator.zan`：索引器重载与转换
-    运算符重载都落到"按名字取第一个"→ 非法 IR。**未修**。
+  - `cs_b12_conv_operator.zan`：转换运算符重载落到"按名字取第一个"→ 非法
+    IR。**未修**。索引器本体（单个 `this[...]`）已修（见 A431），**多重**
+    索引器重载仍未修。
   - `generic_param_shape_overload.zan`：`Item<T>.val` 读回的是**擦除槽的裸
     指针**（打印出地址而不是 "one"）——这是 A421 的泛型字段布局，不是重载
     分派。**未修**（见 A421）。
@@ -1161,8 +1162,8 @@
   - 用例进差分门：`operator_overload` / `struct_operators` /
     `operator_relational` / `overload_resolution` /
     `overload_inherited_arity` / `overload_same_arity_return`。
-- 剩余（未修）：索引器重载（`op_index`）、转换运算符（`op_implicit` /
-  `op_explicit`）、泛型实参形状那一族（属 A421）。
+- 剩余（未修）：**多重**索引器重载（`op_index` 按实参类型选，见 A431）、
+  转换运算符（`op_implicit` / `op_explicit`）、泛型实参形状那一族（属 A421）。
 ### [ ] A429 设计器"排版"组 17 个图标格塞进 324px 工具条——右半命令被裁且不可达
 
 - 现象：设计器工具条的"排版"组是 17 个纯图标格（6 对齐 + 2 分布 + 2 间隙 +
@@ -1191,3 +1192,34 @@
 - 方向：降级到底后把剩余命令收进组末尾的 "»" 弹出菜单（Office 式）。
 - 现状规避：暂无。
 
+### [ ] A431 自举的字段初始化器与构造器语义和宿主对不上——顺序错、基类构造器多调一次
+
+- 现象（2026-10-20 实测；探针 `_scratch/sd/p_fldord.zan`、`p_fldord2.zan`、
+  `p_basector.zan`）：
+  - 宿主 `new Derived()`（Derived 与 Base 都有构造器）打印
+    "base field → base ctor → derived field → derived ctor"；自举打印
+    "derived field → base field → base ctor → derived ctor"。
+  - 宿主 `new D0()`（D0 **没有**构造器，基类 B1 有）只跑基类与派生类的字段
+    初始化器，**不调用** B1 的构造器；自举多调了一次 "B1 ctor"。
+  - 宿主 `new D3()`（基类只有 `B2(int)`，没有无参构造器）仍然跑基类的字段
+    初始化器；自举把基类字段丢成 0。
+- 根因：自举把字段初始化器塞进"隐式构造器"里，顺序是**派生类优先**，而且
+  派生类没有构造器时**照样调基类构造器**。宿主根本没有隐式构造器这个函数：
+  找不到构造器时字段初始化器在**分配点**发（`irgen_expr.c` 的
+  `emit_implicit_field_initializers`），基类链的顺序是"基类在前"。
+- ✅ 已修（2026-10-20，本轮）：
+  - 字段初始化器改成助手函数 `@__zan_finits_<Class>`：发**整条链**（基类在前），
+    在"分配点找不到构造器"与"派生构造器没调到基类构造器"两种情形调用；
+  - 构造器顺序改成宿主口径：基类构造器 → 基类链字段初始化器（**仅当**基类
+    构造器没被调用）→ 本类字段初始化器 → 构造器体；`: this(...)` 的构造器
+    不发任何字段初始化器（全交给被链接的那个构造器）；
+  - 基类构造器按**参数个数**选（参数个数为 0 的那个），不再"取第一个构造器"；
+  - 构造器的实参个数改成**严格**（与宿主后端同口径：省略的尾部参数用默认值
+    补齐），并按宿主的两套措辞报错（检查器一套、后端一套）。
+  - 用例进差分门：`field_decl_initializers` / `constructor_chaining` /
+    `cs_b09_indexer`（索引器本体）。
+- 剩余（未修）：
+  - `objinit_ctor_field_overwrite.zan`：对象初始化器（`new C { f = v }`）覆盖
+    构造器写过的 RC 字段时，自举**崩**（0xC0000005）。与本轮改动无关——改动
+    前后该用例生成的 IR 完全一致（无 `@__zan_finits_*`），属既有问题。
+  - **多重**索引器重载（`this[int]` 与 `this[string]`）按实参类型选：见 A428。

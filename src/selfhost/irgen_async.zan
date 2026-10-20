@@ -1802,30 +1802,48 @@ partial class Irgen {
             EmitArcRetain("%p" + j, pt[j]);
             j = j + 1;
         }
-        // chain to another ctor of the same class via `: this(args)` (it
-        // owns the base chain), or to the base constructor via `: base(args)`
-        // / implicitly (base fields are a layout prefix)
-        Node thisTarget = null;
-        if (m.c != null) { thisTarget = ResolveCtorEx(cls, m.c, m); }
-        if (thisTarget != null) {
-            string targs = "%" + cls.sval + "* %this";
-            int k = 0;
-            while (k < m.c.kids.Count) {
-                Node tpty = CtorParamType(thisTarget, k);
-                ExprVal av = GenArgExpr(m.c.kids[k], tpty);
-                targs = targs + ", " + MapType(tpty) + " " + CallArg(av, tpty);
-                k = k + 1;
+        // Constructor chaining and the field initializers (C# order):
+        //   * `: this(...)` hands the whole job to the target constructor of
+        //     the same class: it runs the field initializers and the base
+        //     chain, so this constructor runs neither;
+        //   * otherwise the base constructor runs first (it runs the base
+        //     class' own field initializers), then this class' field
+        //     initializers, then the constructor body. When no base
+        //     constructor is called the base chain's field initializers run
+        //     here instead -- before this class' own.
+        if (m.c != null) {
+            Node thisTarget = ResolveCtorEx(cls, m.c, m);
+            if (thisTarget != null) {
+                string targs = "%" + cls.sval + "* %this";
+                int k = 0;
+                while (k < m.c.kids.Count) {
+                    Node tpty = CtorParamType(thisTarget, k);
+                    ExprVal av = GenArgExpr(m.c.kids[k], tpty);
+                    targs = targs + ", " + MapType(tpty) + " " + CallArg(av, tpty);
+                    k = k + 1;
+                }
+                L("  call void @" + CtorSym(cls.sval, thisTarget) + "(" + targs + ")");
+            } else {
+                diags.Error("no matching this constructor with "
+                    + m.c.kids.Count + " argument(s)", m.line, m.col);
             }
-            L("  call void @" + CtorSym(cls.sval, thisTarget) + "(" + targs + ")");
-        } else if (m.c != null) {
-            diags.Error("no matching 'this' constructor with "
-                + m.c.kids.Count + " argument(s)", m.line, m.col);
         } else {
             Node bcls = BaseClassOf(cls);
+            bool baseCalled = false;
             if (bcls != null) {
-                Node bctor = binder.FindCtor(bcls);
-                if (bctor != null && m.b != null) { bctor = ResolveCtor(bcls, m.b); }
-                if (bctor != null && (m.b != null || CtorParamCount(bctor) == 0)) {
+                // `: base(args)` picks the base constructor by its arguments;
+                // without it the parameterless one is taken
+                Node bctor = null;
+                if (m.b != null) {
+                    bctor = ResolveCtor(bcls, m.b);
+                    if (bctor == null) {
+                        diags.Error("no matching base constructor with "
+                            + m.b.kids.Count + " argument(s)", m.line, m.col);
+                    }
+                } else {
+                    bctor = binder.FindCtorArity(bcls, 0);
+                }
+                if (bctor != null) {
                     string bthis = NT();
                     L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
                     string bargs = "%" + bcls.sval + "* " + bthis;
@@ -1839,14 +1857,45 @@ partial class Irgen {
                         }
                     }
                     L("  call void @" + CtorSym(bcls.sval, bctor) + "(" + bargs + ")");
+                    baseCalled = true;
                 }
             }
+            if (!baseCalled && bcls != null && HasChainFieldInits(bcls)) {
+                // no base constructor ran: the base chain's field
+                // initializers run here, before this class' own
+                string bthis = NT();
+                L("  " + bthis + " = bitcast %" + cls.sval + "* %this to %" + bcls.sval + "*");
+                L("  call void @" + FieldInitsSym(bcls) + "(%" + bcls.sval + "* " + bthis + ")");
+            }
+            EmitFieldInits(cls, "%this");
         }
         if (m.d != null) { GenStmt(m.d); }
         if (!term) {
             ReleaseLocalsFrom(0);
             L("  ret void");
         }
+        L("}");
+        obody.Append(entryAllocas.ToString());
+        obody.Append(body.ToString());
+        body = obody; entryAllocas = oea; eaActive = oact;
+    }
+
+    // The field initializer helper of `cls`: it runs the instance field
+    // initializers of the whole inheritance chain, root first. It stands in
+    // for the implicit parameterless constructor: the allocation site calls
+    // it when no constructor matches, and a derived constructor calls the
+    // base class' helper when the base constructor was not called.
+    void GenFieldInitsFn(Node cls) {
+        StartFn();
+        curClass = cls.sval;
+        curRet = "void";
+        curHasThis = true;
+        L("define void @" + FieldInitsSym(cls) + "(%" + cls.sval + "* %this) {");
+        L("entry:");
+        StringBuilder obody = body; StringBuilder oea = entryAllocas; bool oact = eaActive;
+        body = new StringBuilder(); entryAllocas = new StringBuilder(); eaActive = true;
+        EmitChainFieldInits(cls, "%this", cls.sval);
+        if (!term) { L("  ret void"); }
         L("}");
         obody.Append(entryAllocas.ToString());
         obody.Append(body.ToString());

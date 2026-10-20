@@ -3136,6 +3136,64 @@ partial class Irgen {
             else if (m.kind == AK.CtorDecl()) { GenCtor(cls, m); }
             i = i + 1;
         }
+        // A class whose inheritance chain declares instance field initializers
+        // gets a helper function that runs them. It is called from the
+        // allocation site when no constructor matches, and from a derived
+        // constructor when the base constructor was not called (the base
+        // constructor would have run them itself).
+        if (HasChainFieldInits(cls)) { GenFieldInitsFn(cls); }
+    }
+
+    // True when `cls` or one of its base classes declares an instance field
+    // initializer: the initializers of the whole chain run together, the base
+    // class ones first (C# order).
+    bool HasChainFieldInits(Node cls) {
+        if (cls == null) { return false; }
+        if (HasChainFieldInits(BaseClassOf(cls))) { return true; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m) && m.b != null) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // The LLVM symbol of the field initializer helper of `cls`.
+    string FieldInitsSym(Node cls) { return "__zan_finits_" + cls.sval; }
+
+    // The instance field initializers of `cls` (declaration order): C# runs
+    // them at the start of the constructor, before the constructor body.
+    void EmitFieldInits(Node cls, string thisOp) {
+        if (cls == null) { return; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m) && m.b != null) {
+                ExprVal v = GenExpr(m.b);
+                StoreField(thisOp, cls.sval, m.sval, v);
+            }
+            i = i + 1;
+        }
+    }
+
+    // The instance field initializers of the whole inheritance chain, root
+    // first (C# order): the base class initializers run before the derived
+    // ones. `thisOp` points at the most derived object; it is bitcast to the
+    // layout of every base class on the way down (the base fields are the
+    // layout prefix of the derived struct).
+    void EmitChainFieldInits(Node cls, string thisOp, string thisTy) {
+        if (cls == null) { return; }
+        Node b = BaseClassOf(cls);
+        if (b != null) {
+            string bop = thisOp;
+            if (b.sval != thisTy) {
+                bop = NT();
+                L("  " + bop + " = bitcast %" + thisTy + "* " + thisOp + " to %" + b.sval + "*");
+            }
+            EmitChainFieldInits(b, bop, b.sval);
+        }
+        EmitFieldInits(cls, thisOp);
     }
 
     bool IsStatic(Node m) { return (m.mods / MOD.Static()) - ((m.mods / MOD.Static()) / 2) * 2 == 1; }

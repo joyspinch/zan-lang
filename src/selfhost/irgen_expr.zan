@@ -1311,6 +1311,18 @@ partial class Irgen {
                 L("  store i8 " + sb + ", i8* " + sp);
                 return;
             }
+            // A user class indexer: `obj[idx] = v` -> Owner_op_index_set(...).
+            // Without this the store went into the array path and wrote the
+            // value into the object's own header (class id / refcount).
+            Node ocls = null;
+            if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
+            if (ocls != null) {
+                Node m = FindMethodUp(ocls, "op_index_set");
+                if (m != null) { EmitIndexSet(obj, m, idx, v); return; }
+                diags.Error("indexing a value of type '" + obj.ty.sval
+                    + "' is not supported by the self-hosted compiler yet", lhs.line, lhs.col);
+                return;
+            }
             // array of i64 slots; pointer/double values are packed into the slot
             string p = NT();
             L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
@@ -1324,6 +1336,42 @@ partial class Irgen {
             L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
             return;
         }
+    }
+
+    // The indexer read: `obj[idx]` -> Owner_op_index(obj, idx).
+    ExprVal EmitIndexCall(ExprVal obj, Node m, ExprVal idx) {
+        Node cls = ClassOf(obj.ty);
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = obj.ty.sval; }
+        string thisOp = obj.op;
+        if (owner != obj.ty.sval) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        Node p0 = ParamTypeNode(m, 0);
+        string t = NT();
+        L("  " + t + " = call " + MapType(m.type) + " @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
+            + ", " + MapType(p0) + " " + CallArg(idx, p0) + ")");
+        return new ExprVal(t, m.type);
+    }
+
+    // The indexer write: `obj[idx] = v` -> Owner_op_index_set(obj, idx, v).
+    void EmitIndexSet(ExprVal obj, Node m, ExprVal idx, ExprVal v) {
+        Node cls = ClassOf(obj.ty);
+        string owner = DeclOwnerOf(cls, m);
+        if (owner == "") { owner = obj.ty.sval; }
+        string thisOp = obj.op;
+        if (owner != obj.ty.sval) {
+            string bc = NT();
+            L("  " + bc + " = bitcast %" + obj.ty.sval + "* " + obj.op + " to %" + owner + "*");
+            thisOp = bc;
+        }
+        Node p0 = ParamTypeNode(m, 0);
+        Node p1 = ParamTypeNode(m, 1);
+        L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
+            + ", " + MapType(p0) + " " + CallArg(idx, p0)
+            + ", " + MapType(p1) + " " + CallArg(v, p1) + ")");
     }
 
     // obj.Name = v  ->  Owner_set_Name(obj, v). Returns false if no setter.
@@ -2024,6 +2072,22 @@ partial class Irgen {
             L("  " + slot + " = call i64 @zdict_get(i8* " + obj.op + ", i8* " + DictKeyOp(idx) + ")");
             return FromSlot(slot, DictVal(obj.ty));
         }
+        // A user class indexer: the parser desugars `this[int i]` into an
+        // `op_index` method (and `op_index_set` for the setter). Call it --
+        // treating the object as an array read a slot out of the object
+        // header and answered with a garbage pointer (and the setter wrote
+        // into the header: the class id / refcount!).
+        // An array of user types (`Vec[]`) carries the element name in sval
+        // and the levels in ival -- it must stay on the array path.
+        Node ocls = null;
+        if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
+        if (ocls != null) {
+            Node m = FindMethodUp(ocls, "op_index");
+            if (m != null) { return EmitIndexCall(obj, m, idx); }
+            diags.Error("indexing a value of type '" + obj.ty.sval
+                + "' is not supported by the self-hosted compiler yet", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
         string p2 = NT();
         L("  " + p2 + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
         string v = NT();
@@ -2161,25 +2225,67 @@ partial class Irgen {
             L("  " + vtp0 + " = getelementptr %" + cn + ", %" + cn + "* " + obj + ", i32 0, i32 0");
             L("  store i8* bitcast ([" + vslots.Count + " x i8*]* @" + cn + "_vtable to i8*), i8** " + vtp0);
         }
-        // call ctor if present. With an object initializer (ival == 2) the kids
-        // are `Field = value` pairs, not ctor args, so only a parameterless ctor
-        // is invoked and the field stores follow. Overloads resolve by arity
-        // fit plus argument-type score; defaults fill omitted trailing args.
-        Node ctor = binder.FindCtor(cls);
-        if (ctor != null && e.ival != 2) { ctor = ResolveCtor(cls, e); }
-        if (ctor != null && e.ival != 2) {
-            List<Node> cargs = OrderArgs(ctor, e);
-            string args = "%" + cn + "* " + obj;
-            int i = 0;
-            while (i < cargs.Count) {
-                Node pty = CtorParamType(ctor, i);
-                ExprVal av = GenArgExpr(cargs[i], pty);
-                args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
-                i = i + 1;
+        // The constructor: with an object initializer (ival == 2) the kids are
+        // `Field = value` pairs, not ctor args, so only a parameterless ctor
+        // is invoked and the field stores follow. Otherwise the arguments
+        // pick the overload (arity fit plus argument-type score; defaults
+        // fill omitted trailing args). When no constructor matches, the
+        // instance field initializers run at the allocation site -- that is
+        // what the implicit parameterless constructor of the C host does.
+        if (e.ival == 2) {
+            Node pctor = binder.FindCtorArity(cls, 0);
+            if (pctor != null) {
+                L("  call void @" + CtorSym(cn, pctor) + "(%" + cn + "* " + obj + ")");
             }
-            L("  call void @" + CtorSym(cn, ctor) + "(" + args + ")");
-        } else if (ctor != null && e.ival == 2 && CtorParamCount(ctor) == 0) {
-            L("  call void @" + CtorSym(cn, ctor) + "(%" + cn + "* " + obj + ")");
+            else if (HasChainFieldInits(cls)) {
+                L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+            }
+        }
+        else {
+            Node ctor = ResolveCtor(cls, e);
+            if (ctor != null) {
+                List<Node> cargs = OrderArgs(ctor, e);
+                string args = "%" + cn + "* " + obj;
+                int i = 0;
+                while (i < cargs.Count) {
+                    Node pty = CtorParamType(ctor, i);
+                    ExprVal av = GenArgExpr(cargs[i], pty);
+                    args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
+                    i = i + 1;
+                }
+                L("  call void @" + CtorSym(cn, ctor) + "(" + args + ")");
+            }
+            else {
+                int argc = e.kids.Count;
+                // The C host's checker accepts the call when a constructor's
+                // arity range covers the arguments; its code generator matches
+                // the parameter count exactly. A `params` array is the one
+                // case the checker lets through and the code generator
+                // refuses.
+                bool checkerOk = false;
+                int i = 0;
+                while (i < cls.kids.Count) {
+                    if (cls.kids[i].kind == AK.CtorDecl()
+                        && CtorArityFits(cls.kids[i], argc)) { checkerOk = true; }
+                    i = i + 1;
+                }
+                if (checkerOk) {
+                    diags.Error("no constructor of '" + cn + "' accepts " + argc
+                        + (argc == 1 ? " argument" : " arguments"), e.line, e.col);
+                }
+                else if (binder.FindCtor(cls) != null) {
+                    diags.Error("no constructor of '" + cn + "' takes " + argc
+                        + " argument(s); a class that declares constructors has no implicit parameterless one",
+                        e.line, e.col);
+                }
+                else if (argc > 0) {
+                    diags.Error("no constructor of '" + cn + "' accepts " + argc
+                        + " arguments", e.line, e.col);
+                }
+                if (HasChainFieldInits(cls)) {
+                    L("  call void @" + FieldInitsSym(cls) + "(%" + cn + "* " + obj + ")");
+                }
+            }
         }
         // object initializer: store each `Field = value` into the instance
         if (e.ival == 2) {

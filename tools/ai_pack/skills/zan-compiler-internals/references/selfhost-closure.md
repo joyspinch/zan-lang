@@ -897,3 +897,63 @@ kernel32、shell32、user32、advapi32、version）。
   从**外层方法的形参**取（`AwaitArgType`）。
 - 门禁：`overload_resolution` / `overload_inherited_arity` /
   `overload_same_arity_return` 进差分门（逐字一致）。
+## 46. 字段初始化器与构造器：**分配点**才是它们的家，顺序按基类链
+
+- 坑（实测）：自举把字段初始化器塞进"隐式构造器"里，于是两处都错：
+  1. **顺序**：自举是"派生类字段 → 基类字段 → 基类构造器 → 派生类构造器"，
+     宿主是"**基类字段 → 基类构造器 → 派生类字段 → 派生类构造器**"
+     （基类字段初始化器在基类构造器**内部**跑，因为基类构造器先被调用）；
+  2. **基类构造器被多调了一次**：宿主在 `new D()`（D 没有自己的构造器）时
+     **不调用**基类构造器——只在**分配点**发整条链的字段初始化器。
+- 宿主口径（`irgen_emit.c` 构造器发射 + `irgen_expr.c` 的
+  `emit_implicit_field_initializers`）：
+  - 构造器 C：先调基类构造器（`: base(args)` 按实参选，没有就选**参数个数
+    为 0** 的那个），再发 C 自己的字段初始化器，最后构造器体；
+  - `: this(...)` 的构造器**什么都不发**，全交给被链接的那个构造器；
+  - **基类构造器没被调用**时（C 没有可用的基类构造器），基类链的字段初始化器
+    在 C 的构造器里发，**仍然在 C 自己的字段初始化器之前**；
+  - `new C(...)` **找不到构造器**时：字段初始化器在**分配点**发（整条链，
+    基类在前），基类构造器**不调用**。
+- 做法（自举）：宿主没有"隐式构造器"这个函数，字段初始化器直接在分配点发；
+  自举的 `this` 硬绑在字面量 `%this` 上，分配点没有 `%this`，于是用一个
+  助手函数 `@__zan_finits_<Class>` 代替（它内部发整条链，基类在前）。
+  分配点找不到构造器 → 调这个助手；派生构造器没调到基类构造器 → 调**基类**
+  的助手。
+- 坑：**基类构造器要按参数个数选**（"参数个数为 0 的那个"），不是"取第一个
+  构造器"——基类声明了 `B(int)` 和 `B()` 时，取第一个会取到 `B(int)`，
+  于是基类构造器**根本没被调用**（基类的字段初始化器也跟着丢了）。
+- 坑：**构造器的实参个数要严格**。宿主有两套规则、两套措辞：
+  - 后端（`find_ctor`）：参数个数必须**正好**等于实参个数（省略的尾部参数
+    用默认值补齐后再匹配一次）；`params` 数组**匹配不上** →
+    "no constructor of 'C' accepts 3 arguments"；
+  - 检查器（`checker.c` 的 `ctor_arity`）：实参个数落在 [最少必需, 最多] 内
+    就行，`params` 数组上界是 -1（任意个数）→ 检查器放行、后端拒绝。
+  - 检查器拒绝时的措辞是另一条："no constructor of 'C' takes 1 argument(s);
+    a class that declares constructors has no implicit parameterless one"。
+  - 类**一个构造器都没声明**时，检查器的措辞是 "no constructor of 'C'
+    accepts N arguments"（复数恒定）。
+- 坑：**字段初始化器不能编码成 `Assignment` 节点**。自举的 `GenAssign` 靠
+  `op == TK.Eq()` 区分纯赋值与复合赋值；合成节点忘了设 `op` → 走复合赋值分支
+  → 生成 `add i64 %t6, %t7` 这种非法 IR。字段初始化器要**单独发射**
+  （`EmitFieldInits`），不要塞进语句列表。
+- 坑：跨类 `bitcast` 的类型**必须带 `%` 前缀**（`bitcast %Derived* %this to
+  %Base*`）——漏了前缀 clang 报 "expected type"，且报错行看着像类型名写错了。
+- 门禁：`field_decl_initializers` / `constructor_chaining` 进差分门（逐字一致）。
+
+## 47. 索引器：走 parser 合成的 `op_index` / `op_index_set`
+
+- 坑（实测）：自举的 `GenIndex` 只认数组和内建容器，用户类写 `obj[i]` 直接
+  报错；`obj[i] = v` 更是落进"字段赋值"分支，**静默写错地方**。
+- 做法：parser 已经把 `this[int i] { get {...} set {...} }` 合成成两个方法
+  `op_index` / `op_index_set`，自举照着调即可（读取调 `op_index`，赋值调
+  `op_index_set`）。没有索引器的类型**必须 fail-closed** 报错，不能默默按
+  字段/下标处理。
+- 坑：判"是不是用户类"不能只看 `ClassOf(obj.ty)`——`Vec[]` 的
+  `ty.sval` 是元素类型名（"Vec"）、`ty.ival` 是 1，会被误判成类。加
+  `obj.ty.ival == 0` 守卫，数组才走数组路径（踩了之后 `struct_value_copy`
+  用例从 MATCH 变成 BAD-IR）。
+- 残留：**多个索引器重载**（`this[int]` 与 `this[string]`）还没按实参类型
+  选，`FindMethodUp` 只取第一个 → 走错重载。用例
+  `tests/conformance/indexer_overload.zan` 仍与宿主不一致。
+- 门禁：`cs_b09_indexer` 进差分门（逐字一致）。
+
