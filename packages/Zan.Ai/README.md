@@ -39,7 +39,13 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   逐条打分）
 - `System.Ai` — `RerankHit`（重排结果：候选下标 + 分数）
 - `System.Ai` — `Conversation`（会话记忆：多轮对话的历史 + 按轮裁剪）
-- `System.Ai` — `AiMessage`（一条消息：角色 + 内容）
+- `System.Ai` — `AiMessage`（一条消息：角色 + 内容 + 工具调用 + 工具结果）
+- `System.Ai` — `ToolRegistry`（工具注册表：名字 → 委托、工具声明的
+  JSON、上限）
+- `System.Ai` — `ToolAgent`（工具调用循环：模型要调工具 → 执行 →
+  结果回传 → 再问，直到给出答案）
+- `System.Ai` — `AiTool` / `AiToolCall` / `AiToolResult` / `AiToolTurn`
+  / `ToolEvent`（工具调用的实体：声明、调用、结果、回合、事件）
 - `System.Ai` — `VectorStoreWriter`（内存档的写入适配器，把
   `VectorStore` 包成 `IIndexWriter` 契约）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
@@ -261,11 +267,82 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 - **同一个请求重试要用同一个 id**——这才是幂等：网络超时后重试不会
   写重。所以 `NextRequestId` 要在重试循环**外面**取一次。
 
+## 工具调用：让模型调外部函数
+
+检索是"模型想查数据库"的特例。工具调用把它**泛化**成任意工具：查订单、
+查天气、算账、翻数据库——都由模型自己决定要不要调、调什么、参数是什么。
+
+```zan
+// 工具的实现：拿到参数 JSON，返回结果文本
+public delegate string AiToolFn(JsonValue args);
+
+// 声明与实现是分开的：声明发给模型，实现留在本地
+AiTool orderTool = new AiTool("查订单",
+    "按订单号查订单的当前状态与物流进度",
+    OrderIdSchema());
+ToolRegistry reg = new ToolRegistry();
+reg.RegisterSync(orderTool, QueryOrder); // QueryOrder 是具名方法
+reg.SetMaxCalls(6);                     // 循环上限
+
+ToolAgent agent = new ToolAgent(client, reg);
+List<AiMessage> history = await agent.Run(questions);
+```
+
+**委托必须用具名方法**（Zan 没有 lambda）。
+
+**同步实现和异步实现走不同的注册入口**：
+
+| 实现 | 委托类型 | 注册方法 |
+|---|---|---|
+| 异步（碰 IO：查库、调 HTTP、读文件） | `public async delegate string AiToolFn(JsonValue args);` | `reg.Register(tool, fn)` |
+| 同步（不碰 IO：算一下、查内存字典） | `public delegate string AiToolSyncFn(JsonValue args);` | `reg.RegisterSync(tool, fn)` |
+
+不是重载，是**两个名字**——同名重载会先选中异步那版，方法组转换的
+诊断要到 irgen 阶段才报，位置离病因太远。
+
+工具要不要用异步版，看它**碰不碰 IO**：同步实现会停掉事件循环，把并发
+限制在 worker 数量上（与远端检索器的同步接口同款理由）。
+
+`Run` 的返回值是**完整的消息列表**——含 assistant 的工具调用消息和
+`tool` 结果消息，可以直接接着用（`Conversation` 接着它做多轮）。
+
+### 五个必须做对的地方
+
+1. **工具结果必须带调用 id**：服务方靠 `tool_call_id` 把结果和调用对上。
+   丢了 id，模型那边就没有对应结果——它会一直等，或者当成没调过而编
+   一个答案。
+2. **一轮可能有多个工具调用**：模型可以一轮里请求三个。三个都要执行、
+   三个都要回传，**不能只处理第一个**。
+3. **循环必须有上限**：模型可能反复调同一个工具（参数改一点再调）。
+   没有上限就是无限烧钱。超上限时**停下**并把已得的结果交给调用方
+   （而不是硬撑到超时）——`lastError` 记原因，事件里有一条 `limit`。
+4. **工具失败要回给模型，不是抛异常**：模型看到"参数 x 不存在"能自己
+   纠正；看不到它只会编答案。异常会把整个循环打断——一次工具的小错
+   不该毁掉整轮对话。所以**只有网络失败才是对话失败**。
+5. **每一步都要看得见**：一轮对话可能调了五轮工具、烧了不少钱。
+   `ToolAgent.Events()` 给出每一步（调了什么、返回了什么、是不是
+   错误），不只在结束时给一个结果。
+
+### 失败语义
+
+与 `AiClient` 一致：**失败用返回值不用异常**。`Run` 返回 null 时原因在
+`lastError`。
+
+工具的返回值默认是纯文本。要回结构化数据，让工具自己把 JSON 塞进
+文本里——**别把 `JsonValue` 直接当工具返回值**（那是跨边界的裸结构，
+调用方还得再解析一次）。
+
 ## 设计要点
 
 - **实体化，不用平行数组**：向量、分块、请求/响应、检索命中都是具名
   实体（`AiEmbedding`/`AiChunk`/`AiUsage`/`RetrieverHit`），不靠下标
   对齐。跨边界传输的 JSON 尽早解析成实体。
+- **工具调用失败不等于对话失败**：工具失败会变成一条 `tool` 消息回给
+  模型，模型自己纠正。只有**网络失败**（发不出请求）才是对话失败。
+  一次工具的小错不该毁掉整轮对话。
+- **循环有上限，超限就停**：模型可能反复调同一个工具（参数改一点再
+  调）。没有上限就是无限烧钱。超限时把已得的结果交给调用方，不硬撑
+  到超时。
 - **编排层与存储后端解耦**：检索走 `IRetriever`、写入走
   `IIndexWriter`。三档后端（内存/本地/远端）实现同一对接口，所以
   `Rag` 的代码一行不用改就能换后端——换后端**不改变答案**（conformance
@@ -338,7 +415,14 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 - 会话记忆是**进程内**的（`Conversation` 持一份 `List<AiMessage>`），没有
   内置落盘/多端同步——`ToJson`/`FromJson` 给了钩子，存哪儿调用方自己
   定（那会绑死部署形态）。
-- 无 Tool calling、无评估与可观测——这些是后续的档位。
+- 工具调用只接 **OpenAI 兼容的 tool-calling 协议**（`tools` 声明 +
+  `tool_calls` 响应）；不做各厂商的私有函数调用协议（Anthropic 的
+  `tool_use`、Gemini 的 `functionDeclarations` 等）。
+- 工具返回值是**纯文本**（不传结构化 JSON 给模型）——省一次解析，但
+  模型要用结构化结果时得自己从文本里读。
+- 工具是**同步或异步的单个委托**——不支持"需要确认才执行"这类多步
+  人工介入的流程。
+- 无评估与可观测——这是后续的档位。
 - 远端档的**同步接口会报错**（`Search` / `TextOf`）——阻塞等待网络会
   停掉 worker 的事件循环，把并发限制在 worker 数量上。这是有意的：
   静默阻塞会伪装成"能用"，实际把并发能力废掉了。远端档一律用

@@ -1,0 +1,214 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace System.Ai;
+
+// 工具的**实现**——真正干活的那部分。
+//
+// ## 为什么实现是异步的
+//
+// 工具要做什么？查数据库、调另一个 HTTP 服务、读文件——**全是 IO**。
+// 同步实现会停掉事件循环，把并发限制在 worker 数量上（与远端检索器
+// 的同步接口同款理由）。所以实现统一是异步的。
+//
+// ## 参数校验的责任在**实现**这一侧
+//
+// 服务方给的参数**不可信**：可能不是合法 JSON，可能带 schema 里没有
+// 的字段，可能缺必填字段。实现要自己校验，不要假设"模型给的就是对的"。
+//
+// 校验失败**不要抛异常**——回一个错误结果给模型（`AiToolResult.IsError`
+// 为 true），让它看到错误并自己纠正。抛异常会把整个循环打断。
+
+// 工具实现：吃一份参数 JSON，吐一份结果。
+public async delegate string AiToolFn(JsonValue args);
+
+// **同步**的工具实现。
+//
+// 为什么要有同步这一版：工具要做的事**大多数不碰 IO**（算一下、查个内存
+// 里的字典、格式化一段文字）。强迫它们写成 `async` 只是让每个实现多一
+// 个 `await` 的噪声，而且同步实现根本不能赋给异步委托（编译器直接
+// 报"cannot convert non-async method to async delegate"）。
+//
+// 什么时候该用异步版：工具要碰 IO（查数据库、调 HTTP、读文件）——
+// 同步实现会停掉事件循环，把并发限制在 worker 数量上。
+public delegate string AiToolSyncFn(JsonValue args);
+
+// 一个工具的**实现**（声明 + 代码）。
+public class AiToolImpl {
+    // 声明（发给服务方）。
+    public AiTool tool;
+
+    // 实现（异步版）。
+    public AiToolFn fn;
+
+    // 实现（同步版）。两者只有一个非 null。
+    public AiToolSyncFn syncFn;
+
+    public AiToolImpl() {
+        this.tool = null;
+        this.fn = null;
+        this.syncFn = null;
+    }
+
+    public AiToolImpl(AiTool tool, AiToolFn fn) {
+        this.tool = tool;
+        this.fn = fn;
+        this.syncFn = null;
+    }
+
+    // 同步实现的构造器**另起一个名字**——不是重载：同名重载会先选中
+    // 异步那版（实参类型都是委托，异步那版先被找到），于是同步实现被
+    // 塞进 `fn` 字段，`syncFn` 是 null——分支判空判错了，后面的调用
+    // 走进 null 的委托。
+    public static AiToolImpl ForSync(AiTool tool, AiToolSyncFn fn) {
+        AiToolImpl impl = new AiToolImpl();
+        impl.tool = tool;
+        impl.fn = null;
+        impl.syncFn = fn;
+        return impl;
+    }
+
+    // 工具名。
+    public string Name() { return this.tool == null ? "" : this.tool.name; }
+}
+
+// 工具注册表——名字到实现的映射。
+//
+// ## 为什么是注册表而不是直接传函数
+//
+// 模型返回的是**工具名 + 参数**，程序要按名字找回实现。一个字典就够，
+// 而且注册表能做**事前的白名单**：没注册的名字一律拒绝执行（模型
+// 可能幻觉出一个不存在的工具名，或者被提示注入诱导去调别的）。
+//
+// ## 名字是模型给的，所以名字要严
+//
+// 名字匹配**精确**（不做大小写折叠、不做前缀匹配）——宽松匹配等于给
+// 模型开了模糊匹配的门。
+
+public class ToolRegistry {
+    // 名字 → 实现。
+    private Dictionary<string, AiToolImpl> tools;
+
+    // 一次对话里最多允许几轮工具调用（防死循环）。
+    private int maxCalls;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public ToolRegistry() {
+        this.tools = new Dictionary<string, AiToolImpl>();
+        this.maxCalls = 8;
+        this.lastError = "";
+    }
+
+    // 注册一个工具（**异步**实现）。
+    public void Register(AiTool tool, AiToolFn fn) {
+        if (tool == null || tool.name == null || tool.name.Length == 0) {
+            this.lastError = "工具名不能为空";
+            return;
+        }
+        if (fn == null) {
+            this.lastError = "工具没有实现：" + tool.name;
+            return;
+        }
+        this.tools[tool.name] = new AiToolImpl(tool, fn);
+    }
+
+    // 注册一个工具（**同步**实现）。
+    //
+    // 同步实现不能赋给异步委托，编译器不让它们互换——所以同步版走
+    // **另一个名字**（不是重载：同名重载会先选中异步那版，方法组转换
+    // 才在 irgen 阶段报错，诊断离病因太远）。
+    //
+    // 什么时候用哪个：工具不碰 IO 用同步（少一层 await 噪声）；要查
+    // 数据库 / 调 HTTP / 读文件用异步（同步实现会停掉事件循环，把
+    // 并发限制在 worker 数量上）。
+    public void RegisterSync(AiTool tool, AiToolSyncFn fn) {
+        if (tool == null || tool.name == null || tool.name.Length == 0) {
+            this.lastError = "工具名不能为空";
+            return;
+        }
+        if (fn == null) {
+            this.lastError = "工具没有实现：" + tool.name;
+            return;
+        }
+        this.tools[tool.name] = AiToolImpl.ForSync(tool, fn);
+    }
+
+    // 有没有这个工具。
+    public bool Has(string name) {
+        return name != null && this.tools.ContainsKey(name);
+    }
+
+    // 工具个数。
+    public int Count() { return this.tools.Count; }
+
+    // 一次对话里最多允许几轮工具调用（默认 8）。
+    //
+    // 上限不是"防恶意"（调用方自己定的），是**防死循环**：模型可能反
+    // 复调同一个工具（参数改一点再调），没有上限就是无限烧钱。
+    public void SetMaxCalls(int n) {
+        if (n < 1) { n = 1; }
+        this.maxCalls = n;
+    }
+
+    // 当前上限。
+    public int MaxCalls() { return this.maxCalls; }
+
+    // 工具声明列表（发给服务方）。
+    public List<AiTool> Declarations() {
+        List<AiTool> outp = new List<AiTool>();
+        List<string> keys = this.tools.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            outp.Add(this.tools[keys[i]].tool);
+        }
+        return outp;
+    }
+
+    // 工具声明的 JSON 数组（发给服务方）。
+    public string DeclarationsJson() {
+        JsonValue arr = JsonValue.NewArray();
+        List<AiTool> decls = this.Declarations();
+        for (int i = 0; i < decls.Count; i = i + 1) {
+            arr.Append(decls[i].ToJson());
+        }
+        return arr.ToJson();
+    }
+
+    // 按名字执行一次调用。
+    //
+    // 找不到工具 → 返回错误结果（不是异常）：模型可能幻觉出一个不存
+    // 在的工具名，把它当错误回给模型，它会自己纠正。
+    //
+    // 参数解析失败 → 同样回错误结果。
+    public async AiToolResult Call(AiToolCall call) {
+        this.lastError = "";
+        if (call == null) {
+            return AiToolResult.Error("", "空的工具调用");
+        }
+        if (!this.tools.ContainsKey(call.name)) {
+            this.lastError = "没有这个工具：" + call.name;
+            return AiToolResult.Error(call.id, this.lastError);
+        }
+        JsonValue args = call.ParseArgs();
+        if (args == null) {
+            this.lastError = "工具参数不是合法 JSON：" + call.name;
+            return AiToolResult.Error(call.id, this.lastError);
+        }
+        AiToolImpl impl = this.tools[call.name];
+        string outp = "";
+        if (impl.syncFn != null) {
+            outp = impl.syncFn(args);
+        } else {
+            outp = await impl.fn(args);
+        }
+        if (outp == null) {
+            // 实现返回 null = 失败。原因取实现的 lastError（实现自己
+            // 记的），没有就用通用文案。
+            this.lastError = "工具执行失败：" + call.name;
+            return AiToolResult.Error(call.id, this.lastError);
+        }
+        return AiToolResult.Ok(call.id, outp);
+    }
+}

@@ -155,6 +155,95 @@ public class AiClient : IDisposable {
         return msg.Str("content", "");
     }
 
+    // ------------------------------------------------------------------
+    // 带工具的补全
+    // ------------------------------------------------------------------
+
+    // 补全（带工具）。返回这一轮的结果——模型可能给了答案，也可能
+    // 请求调工具。
+    //
+    // toolsJson 是工具声明的 JSON 数组（`ToolRegistry.DeclarationsJson`
+    // 给）。为空串表示不带工具。
+    //
+    // 返回 null 表示调用失败（原因在 lastError）。
+    public async AiToolTurn CompleteWithTools(List<AiMessage> messages,
+            string toolsJson, double temperature) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", false);
+        body.PutJson("messages", AiClient.MessagesJson(messages));
+        if (toolsJson != null && toolsJson.Length > 0) {
+            body.PutJson("tools", toolsJson);
+            // 让模型在需要时自己决定不调（有些服务方默认不许不调）。
+            body.PutStr("tool_choice", "auto");
+        }
+
+        string raw = await this.PostJson(ep, "/chat/completions", body);
+        if (raw == null) { return null; }
+        AiToolTurn turn = AiClient.ParseToolTurn(raw);
+        if (turn == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        this.CaptureUsage(JsonValue.Parse(raw));
+        return turn;
+    }
+
+    // 解析带工具的响应（公开是为了能单独测——归位、错误提取全在这里）。
+    //
+    // 坏 JSON → 返回 null。
+    public static AiToolTurn ParseToolTurn(string raw) {
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            return null;
+        }
+        if (root == null) { return null; }
+        string errMsg = AiClient.ErrorMessage(root);
+        if (errMsg.Length > 0) { return null; }
+        JsonValue choices = root.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            return null;
+        }
+        JsonValue choice = choices.At(0);
+        if (choice == null) { return null; }
+        JsonValue msg = choice.Get("message");
+        if (msg == null) { return null; }
+
+        AiToolTurn turn = new AiToolTurn();
+        turn.content = msg.Str("content", "");
+        turn.finishReason = choice.Str("finish_reason", "");
+        // 工具调用：按 index 归位（不靠数组顺序）。
+        JsonValue calls = msg.Get("tool_calls");
+        if (calls != null && calls.IsArray()) {
+            for (int i = 0; i < calls.Count(); i = i + 1) {
+                JsonValue one = calls.At(i);
+                if (one == null) { continue; }
+                string id = one.Str("id", "");
+                JsonValue fn = one.Get("function");
+                if (fn == null) { continue; }
+                string name = fn.Str("name", "");
+                string args = fn.Str("arguments", "");
+                turn.toolCalls.Add(new AiToolCall(id, name, args));
+            }
+        }
+        return turn;
+    }
+
     // 补全并返回用量（成本核算用）。
     public async AiUsage CompleteWithUsage(string systemPrompt, string userPrompt) {
         string r = await this.Complete(systemPrompt, userPrompt);
@@ -326,12 +415,40 @@ public class AiClient : IDisposable {
     public static string MessagesJson(List<AiMessage> messages) {
         JsonValue arr = JsonValue.NewArray();
         for (int i = 0; i < messages.Count; i = i + 1) {
-            JsonValue m = JsonValue.NewObject();
-            m.PutStr("role", messages[i].role);
-            m.PutStr("content", messages[i].content);
-            arr.Append(m);
+            arr.Append(AiClient.MessageJson(messages[i]));
         }
         return arr.ToJson();
+    }
+
+    // 单条消息的 JSON。
+    //
+    // 三种形态（见 `AiMessage` 的说明）：
+    // - system / user：role + content
+    // - assistant：role + content + tool_calls（可空）
+    // - tool：role + content + tool_call_id
+    public static JsonValue MessageJson(AiMessage msg) {
+        JsonValue m = JsonValue.NewObject();
+        m.PutStr("role", msg.role);
+        m.PutStr("content", msg.content);
+        if (msg.IsTool() && msg.toolCallId.Length > 0) {
+            m.PutStr("tool_call_id", msg.toolCallId);
+        }
+        if (msg.IsAssistant() && msg.toolCalls.Count > 0) {
+            JsonValue calls = JsonValue.NewArray();
+            for (int i = 0; i < msg.toolCalls.Count; i = i + 1) {
+                AiToolCall c = msg.toolCalls[i];
+                JsonValue fn = JsonValue.NewObject();
+                fn.PutStr("name", c.name);
+                fn.PutStr("arguments", c.arguments);
+                JsonValue call = JsonValue.NewObject();
+                call.PutStr("id", c.id);
+                call.PutStr("type", "function");
+                call.Put("function", fn);
+                calls.Append(call);
+            }
+            m.Put("tool_calls", calls);
+        }
+        return m;
     }
 
     // 估算 token 数（启发式）。

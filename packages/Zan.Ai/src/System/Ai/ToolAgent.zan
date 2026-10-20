@@ -1,0 +1,162 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ai;
+
+// 工具调用循环（agent loop）——模型与工具之间的往返。
+//
+// ## 这层在做什么
+//
+// 一次"带工具的对话"是这么跑的：
+//
+// 1. 把消息（+ 工具声明）发给模型；
+// 2. 模型要么直接给答案（**结束**），要么请求调若干工具；
+// 3. 执行那些工具，把结果**按调用 id 原样带回**；
+// 4. 回到第 1 步。
+//
+// 这就是全部。麻烦的全在细节里。
+//
+// ## 五个必须做对的地方
+//
+// ### 1) 工具结果必须带**调用 id**
+//
+// 服务方靠 `tool_call_id` 把结果和调用对上。丢了 id，模型那边就没有对
+// 应的结果——它会一直等，或者当成没调过而编一个答案。
+//
+// ### 2) 一次可能有**多个**工具调用
+//
+// 模型可以一轮里请求三个工具。三个都要执行、三个都要回传。**不能只
+// 处理第一个**。
+//
+// ### 3) 循环必须有**上限**
+//
+// 模型可能反复调同一个工具（参数改一点再调）。没有上限就是无限烧钱。
+// `ToolRegistry.SetMaxCalls` 定上限，超了就**停下**并把已得的结果交给
+// 调用方（而不是硬撑到超时）。
+//
+// ### 4) 工具失败要**回给模型**，不是抛异常
+//
+// 模型看到"参数 x 不存在"能自己纠正；看不到它只会编答案。异常会把整
+// 个循环打断——一次工具的小错不该毁掉整轮对话。
+//
+// ### 5) 循环里的每一步都要能**看得见**
+//
+// 一轮对话可能调了五轮工具、烧了不少钱。调用方要能看到每一步（调了
+// 什么、返回了什么、用了多少轮）。所以本类给**事件回调**，不是只在
+// 结束时给一个结果。
+//
+// ## 失败语义
+//
+// 与 `AiClient` 一致：**失败用返回值不用异常**。`Run` 返回 null 时原因
+// 在 `lastError`。
+//
+// 但有一处例外：**工具执行失败不是对话失败**。工具失败会变成一条
+// `tool` 消息回给模型，模型自己纠正。只有**网络失败**（发不出请求）
+// 才是对话失败。
+
+public class ToolAgent {
+    // 客户端。
+    private AiClient client;
+
+    // 工具注册表。
+    private ToolRegistry registry;
+
+    // 温度。
+    private double temperature;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    // 循环中发生的事件（每一步一条）。
+    private List<ToolEvent> events;
+
+    public ToolAgent(AiClient client, ToolRegistry registry) {
+        this.client = client;
+        this.registry = registry;
+        this.temperature = 0.0;
+        this.lastError = "";
+        this.events = new List<ToolEvent>();
+    }
+
+    // 温度（默认 0——工具调用要确定性）。
+    public void SetTemperature(double t) {
+        this.temperature = t;
+    }
+
+    // 事件列表（每一步一条）。
+    public List<ToolEvent> Events() { return this.events; }
+
+    // 跑一轮带工具的对话。
+    //
+    // messages 是**初始消息**（会被复制，不改调用方的）。返回值是最终
+    // 消息列表（含 assistant 的工具调用消息与 tool 结果消息）。
+    //
+    // 返回 null 表示调用失败（原因在 lastError）。
+    public async List<AiMessage> Run(List<AiMessage> messages) {
+        this.lastError = "";
+        this.events.Clear();
+        if (this.client == null) { this.lastError = "没有客户端"; return null; }
+        if (this.registry == null) { this.lastError = "没有工具注册表"; return null; }
+        if (messages == null) { this.lastError = "没有消息"; return null; }
+
+        // 复制一份（不改调用方的列表）。
+        List<AiMessage> history = new List<AiMessage>();
+        for (int i = 0; i < messages.Count; i = i + 1) {
+            history.Add(messages[i]);
+        }
+        string toolsJson = this.registry.DeclarationsJson();
+
+        int maxCalls = this.registry.MaxCalls();
+        int used = 0;
+        while (true) {
+            // 1) 发给模型。
+            AiToolTurn turn = await this.client.CompleteWithTools(history,
+            toolsJson, this.temperature);
+            if (turn == null) {
+                this.lastError = "调用 AI 服务失败：" + this.client.lastError;
+                return null;
+            }
+
+            // 2) 模型没要调工具 → 结束。
+            if (!turn.WantsTools()) {
+                AiMessage final = AiMessage.Assistant(turn.content);
+                history.Add(final);
+                ToolEvent ev = new ToolEvent();
+                ev.kind = "final";
+                ev.text = turn.content;
+                this.events.Add(ev);
+                return history;
+            }
+
+            // 3) 超上限 → 停（把已得结果交给调用方，别硬撑）。
+            if (used >= maxCalls) {
+                this.lastError = "工具调用次数超过上限（" + Convert.ToString(maxCalls)
+                + "）";
+                AiMessage final = AiMessage.Assistant(turn.content);
+                history.Add(final);
+                ToolEvent ev = new ToolEvent();
+                ev.kind = "limit";
+                ev.text = this.lastError;
+                this.events.Add(ev);
+                return history;
+            }
+
+            // 4) 执行工具（**一轮可能有多个**）。
+            AiMessage callMsg = AiMessage.AssistantCalls(turn.toolCalls);
+            history.Add(callMsg);
+            for (int i = 0; i < turn.toolCalls.Count; i = i + 1) {
+                AiToolCall call = turn.toolCalls[i];
+                used = used + 1;
+                AiToolResult res = await this.registry.Call(call);
+                ToolEvent ev = new ToolEvent();
+                ev.kind = "tool";
+                ev.name = call.name;
+                ev.text = res.content;
+                ev.isError = res.isError;
+                this.events.Add(ev);
+                // 结果**按 id 原样带回**（服务方靠它对齐）。
+                history.Add(AiMessage.Tool(res.id, res.content));
+            }
+        }
+    }
+}

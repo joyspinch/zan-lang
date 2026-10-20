@@ -9828,6 +9828,95 @@ static LLVMValueRef emit_await_blocking_extern(zan_irgen_t *g,
     return coerce_await_result(g, expr, raw, locals);
 }
 
+/* await 的目标是不是**异步**的。
+ *
+ * await 的目标分两类：
+ *  - **异步目标**——它的值是"子协程帧"，结果要从帧里抽出来；
+ *  - **普通目标**——它的值就是"普通值"，await 只是把它原样带过去。
+ *
+ * 所以要判断"这调用是不是 async"。判定有几种：
+ *  - **Task / ValueTask 类型**——能直接接住；
+ *  - **async 方法**——调用目标原型是"双反"；
+ *  - **async 委托**——调用的对象（或被调者本身）是 async 委托。
+ *
+ * 判错的后果是读野指针：普通值往往也是 i8 指针（字符串就是），与子
+ * 协程帧的指针同型，被当成帧去读就会读出面元指针——静默的垃圾值，
+ * 不报错。
+ */
+static bool await_target_is_async(zan_irgen_t *g, zan_ast_node_t *expr,
+                                  local_scope_t *locals) {
+    if (!expr) return false;
+    zan_type_t *ty = concretize(g, infer_expr_type(g, expr, locals));
+    if (ty) {
+        if (ty->kind == TYPE_TASK) return true;
+        if (ty->name.str && ty->name.len >= 4 &&
+            memcmp(ty->name.str, "Task", 4) == 0) return true;
+        if (ty->name.str && ty->name.len >= 9 &&
+            memcmp(ty->name.str, "ValueTask", 9) == 0) return true;
+    }
+    if (expr->kind != AST_CALL || !expr->call.callee) return false;
+    zan_ast_node_t *callee = expr->call.callee;
+    /* 被调者本身就是委托（局部变量、字段、下标元素都算）——
+     * `await shutdownHooks[i]()`。委托类型自带 async 标记。 */
+    if (callee->kind != AST_MEMBER_ACCESS) {
+        zan_type_t *callee_ty = infer_expr_type(g, callee, locals);
+        if (callee_ty && callee_ty->kind == TYPE_DELEGATE)
+            return callee_ty->delegate_is_async;
+    }
+    if (callee->kind == AST_MEMBER_ACCESS) {
+        zan_type_t *obj_ty = infer_expr_type(g, callee->member.object, locals);
+        /* async 委托：调用的对象是 async 委托。 */
+        if (obj_ty && obj_ty->kind == TYPE_DELEGATE && obj_ty->delegate_is_async)
+            return true;
+        /* 字段本身是 async 委托：`await this.recv(buf, n)`。 */
+        zan_type_t *field_ty = member_access_field_type(g, locals, callee);
+        if (field_ty && field_ty->kind == TYPE_DELEGATE)
+            return field_ty->delegate_is_async;
+        if (obj_ty) {
+            zan_symbol_t *ts = obj_ty->sym ? obj_ty->sym
+                : expr_class_sym(g, callee->member.object, locals);
+            if (ts) {
+                /* 接口方法：签名在接口上声明，async 标记也在那儿。 */
+                if (ts->kind == SYM_INTERFACE) {
+                    zan_symbol_t *im = resolve_iface_overload(ts,
+                        callee->member.name, expr->call.args.count,
+                        expr->call.type_args.count);
+                    if (im && im->decl && im->decl->kind == AST_METHOD_DECL)
+                        return (im->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+                }
+                zan_symbol_t *msym = resolve_overload_typed(g, ts,
+                    callee->member.name, expr, locals);
+                if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
+                    return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+            }
+        } else {
+            /* 静态接收者写的是**类名**（`Socket.SendStringAsync(...)`）——
+             * 类名不是值，infer 给不出类型，要按名字查符号。 */
+            zan_symbol_t *cs = callee->member.object->kind == AST_IDENTIFIER
+                ? zan_binder_lookup(g->binder, callee->member.object->ident.name)
+                : NULL;
+            if (cs && (cs->kind == SYM_CLASS || cs->kind == SYM_STRUCT)) {
+                zan_symbol_t *msym = resolve_overload_typed(g, cs,
+                    callee->member.name, expr, locals);
+                if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
+                    return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+            }
+        }
+    } else if (callee->kind == AST_IDENTIFIER) {
+        /* 局部变量装的委托：`await driver(this, method, path, body)`。 */
+        local_var_t *lv = local_find(locals, callee->ident.name);
+        if (lv && lv->type && lv->type->kind == TYPE_DELEGATE)
+            return lv->type->delegate_is_async;
+        if (g->current_type_sym) {
+            zan_symbol_t *msym = resolve_overload_typed(g, g->current_type_sym,
+                callee->ident.name, expr, locals);
+            if (msym && msym->decl && msym->decl->kind == AST_METHOD_DECL)
+                return (msym->decl->method_decl.modifiers & MOD_ASYNC) != 0;
+        }
+    }
+    return false;
+}
+
 static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         /* await Task.Yield(): 协作式让出控制权并将当前协程帧重新入队 */
@@ -10228,6 +10317,15 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
         LLVMValueRef aw_tmp_mark = LLVMBuildLoad2(g->builder,
             LLVMInt32TypeInContext(g->ctx), get_eh_tmp_top_global(g),
             "aw.tmpmark");
+        /* await 一个**非异步**的值：原样返回，不进协程帧那套。
+         *
+         * 例如 `await someSyncDelegate()`——同步委托的返回值是**非异步**的，
+         * 它不是子协程帧，所以应认作普通值。判错就是读野指针：普通值
+         * 往往也是 i8 指针（字符串就是），与子协程帧的指针同型，被当成
+         * 帧去读就会读出面元指针——静默的垃圾值，不报错。 */
+        if (!await_target_is_async(g, expr->await_expr.expr, locals)) {
+            return emit_expr(g, expr->await_expr.expr, locals);
+        }
         LLVMValueRef sub = emit_expr(g, expr->await_expr.expr, locals);
         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
         LLVMTypeRef i32 = LLVMInt32TypeInContext(g->ctx);

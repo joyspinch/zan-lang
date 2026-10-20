@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace System.Ai;
 
@@ -6,35 +7,61 @@ namespace System.Ai;
 //
 // ## 为什么是实体而不是两个平行数组
 //
-// 一条消息有**两个字段**（角色 + 内容）。用 `List<string[]>` 装就是
-// "靠下标对齐的平行数组"——`messages[i][0]` 是角色、`messages[i][1]`
-// 是内容，谁也不知道哪个是哪个，而且**长度不受检查**（写成三个元素的
-// 数组编译器不报错，运行时读到越界才炸）。所以用实体。
+// 一条消息有**几个字段**（角色 + 内容，加上工具调用时的调用列表与
+// 关联 id）。用 `List<string[]>` 装就是"靠下标对齐的平行数组"——
+// `messages[i][0]` 是角色、`messages[i][1]` 是内容，谁也不知道哪个是
+// 哪个，而且**长度不受检查**（写成三个元素的数组编译器不报错，运行时
+// 读到越界才炸）。所以用实体。
 //
 // ## 角色
 //
-// 用字符串而不是枚举：OpenAI 协议的角色是**开放**的（`system` /
+// 用字符串而不是枚举：OpenAI 兼容协议的角色是**开放**的（`system` /
 // `user` / `assistant` / `tool` / `function` / 各家自定义），枚举会
-// 把协议锁死。约定俗成的三个：
+// 把协议锁死。约定俗成的：
 //
 // - `system`：系统提示（人设、规则、格式要求）
 // - `user`：用户说的
 // - `assistant`：模型说的
+// - `tool`：工具执行结果（`toolCallId` 指向是哪次调用）
+//
+// ## 三种消息形态
+//
+// 一条消息按角色带不同的额外字段：
+//
+// | 角色 | 额外字段 |
+// |---|---|
+// | system / user | 无 |
+// | assistant | `toolCalls`（它请求了哪些工具调用） |
+// | tool | `toolCallId`（这是哪次调用的结果）+ `content`（结果文本） |
+//
+// 同一段代码里三种形态混着走，所以**字段都在实体上**（不用就空着），
+// 而不是拆成三个不同的类——那样调用方得先判类型再转换。
+
 public class AiMessage {
-    // 角色（system / user / assistant / …）。
+    // 角色（system / user / assistant / tool / …）。
     public string role;
 
     // 内容。
     public string content;
 
+    // assistant 消息请求的工具调用（空 = 没调）。
+    public List<AiToolCall> toolCalls;
+
+    // tool 消息：这是哪次调用的结果（对应 assistant 里的 toolCalls[i].id）。
+    public string toolCallId;
+
     public AiMessage() {
         this.role = "user";
         this.content = "";
+        this.toolCalls = new List<AiToolCall>();
+        this.toolCallId = "";
     }
 
     public AiMessage(string role, string content) {
         this.role = role == null ? "user" : role;
         this.content = content == null ? "" : content;
+        this.toolCalls = new List<AiToolCall>();
+        this.toolCallId = "";
     }
 
     // 系统消息。
@@ -47,9 +74,29 @@ public class AiMessage {
         return new AiMessage("user", content);
     }
 
-    // 助手消息。
+    // 助手消息（纯文本）。
     public static AiMessage Assistant(string content) {
         return new AiMessage("assistant", content);
+    }
+
+    // 助手消息（请求了工具调用）。
+    //
+    // content 通常是空串——模型发起调用时一般还没有正文。
+    public static AiMessage AssistantCalls(List<AiToolCall> calls) {
+        AiMessage m = new AiMessage("assistant", "");
+        if (calls != null) {
+            for (int i = 0; i < calls.Count; i = i + 1) {
+                m.toolCalls.Add(calls[i]);
+            }
+        }
+        return m;
+    }
+
+    // 工具结果消息。
+    public static AiMessage Tool(string toolCallId, string content) {
+        AiMessage m = new AiMessage("tool", content);
+        m.toolCallId = toolCallId == null ? "" : toolCallId;
+        return m;
     }
 
     // 是不是用户消息。
@@ -57,4 +104,7 @@ public class AiMessage {
 
     // 是不是助手消息。
     public bool IsAssistant() { return this.role == "assistant"; }
+
+    // 是不是工具结果消息。
+    public bool IsTool() { return this.role == "tool"; }
 }
