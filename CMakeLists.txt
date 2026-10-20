@@ -1200,6 +1200,29 @@ add_test(NAME diag_unary_tilde_string
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
 
+# A unary '-' / '~' on a string: the operand is neither numeric nor a type
+# with a matching overload. The checker used to return a bare `type_error`
+# sentinel -- which emits no diagnostic of its own -- so the error leaked
+# into irgen: `-s` built an integer subtraction on a string pointer (LLVM
+# verifier error) and `~s` took the compiler down with it (0xC0000005).
+add_test(NAME diag_unary_minus_string
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_minus_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_minus_string${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary '-' to 'string'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_minus_string PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_unary_tilde_string
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_tilde_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_tilde_string${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary '~' to 'string'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
+
 
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序

@@ -997,6 +997,23 @@ static bool type_is_integral(zan_type_t *t) {
     }
 }
 
+/* 一元运算符的操作数必须能降级成算术：数值（或类/结构体上的重载路径）之外的
+   一切都要报人话诊断。
+   原来的写法只 `return c->binder->type_error` —— 而这个哨兵**本身不发诊断**，
+   错误就一路漏进 irgen：`-"x"` 造出对字符串指针的整数减法（LLVM 校验失败：
+   "Integer arithmetic operators only work with integral types"），`~"x"` 更是
+   在发射非法 IR 的过程中把编译器自己打崩（0xC0000005）。
+   二元路径早就有 "cannot apply operator to 'X' and 'Y'"（同一条口径：数值与
+   char 之外一律拒），一元这边补齐。 */
+static void check_unary_operand_type(zan_checker_t *c, zan_ast_node_t *expr,
+                                     zan_type_t *operand, char sign) {
+    if (!operand) return;
+    /* type_error 已经有别的诊断在报；类型参数会在实例化时被具体类型替换。 */
+    if (operand->kind == TYPE_ERROR || operand->kind == TYPE_TYPE_PARAM) return;
+    zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                  "cannot apply unary '%c' to '%s'", sign, type_name(operand));
+}
+
 static zan_type_t *promote_numeric(zan_binder_t *b, zan_type_t *a, zan_type_t *b_type) {
     if (!a || !b_type) return b->type_error;
     bool a_dec = (a->kind == TYPE_DECIMAL);
@@ -1950,11 +1967,11 @@ static zan_type_t *checker_builtin_param_type(zan_checker_t *c,
 /* 检查**用户泛型类**方法调用的实参类型。
  *
  * 法型参数是**本身**的型参\uff08Box<T> → Box<int> → T = int\uff09，
- * 很多人会写成 `box.value = "x"`\uff08\u5b57\u6bb5代��\uff09——
+ * 很多人会写成 `box.value = "x"`\uff08\u5b57\u6bb5代��\uff09——
  * 但代入检查过不化结果\u3002
  *
  * 为何么会报错\uff1a\u2014\u2014当调用时 `call_arg_signature` 回 NULL\uff08像码按不到\u2014\u2014
- * 有 type_arg_count 的收员\u55�直接返回\uff09\uff0c实参类型仍来没被检查\u3002
+ * 有 type_arg_count 的收员\u55�直接返回\uff09\uff0c实参类型仍来没被检查\u3002
  * 所以这这条路又故自己\u3002
  */
 static void checker_user_generic_call_args(zan_checker_t *c,
@@ -2026,7 +2043,7 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
              memcmp(recv->name.str, "Dict", 4) == 0) bt = "Dict";
     if (!bt) {
         /* 用户泛型类\uff08Box<int>）\uff1a成员有 sym，但当调用时会因为
-         * “调用了一个同名方法”�%80�过不会报错——核心是调用时会备代替代的实参类型代入。
+         * “调用了一个同名方法”�%80�过不会报错——核心是调用时会备代替代的实参类型代入。
          * 最好在这里也检查了\uff08解释型参数为\u2014\u2014\u4f20\u7ed9 checker_arg_type_mismatch\uff09\u3002 */
         checker_user_generic_call_args(c, recv, name, call, arg_types);
         return;
@@ -2645,22 +2662,27 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
         zan_type_t *operand = zan_checker_check_expr(c, expr->unary.operand);
         switch (expr->unary.op) {
         case TK_MINUS:
-            if (type_is_numeric(operand)) return operand;
+            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR)
+                return operand;
             /* 一元运算符重载：类/结构体上的 static op_sub（1 个形参）。
                重载存不存在由 irgen 判定，这里按二元路径的同一口径把类型
                交给操作数类型（没有重载时 irgen 会报人话诊断）。 */
             if (operand->kind == TYPE_CLASS || operand->kind == TYPE_STRUCT)
                 return operand;
+            check_unary_operand_type(c, expr, operand, '-');
             return c->binder->type_error;
         case TK_PLUS:
-            if (type_is_numeric(operand)) return operand;
+            if (type_is_numeric(operand) || operand->kind == TYPE_CHAR)
+                return operand;
             if (operand->kind == TYPE_CLASS || operand->kind == TYPE_STRUCT)
                 return operand;
+            check_unary_operand_type(c, expr, operand, '+');
             return c->binder->type_error;
         case TK_BANG:
             return c->binder->type_bool;
         case TK_TILDE:
             if (type_is_integral(operand)) return operand;
+            check_unary_operand_type(c, expr, operand, '~');
             return c->binder->type_error;
         case TK_PLUS_PLUS: case TK_MINUS_MINUS:
             check_readonly_incdec(c, expr);

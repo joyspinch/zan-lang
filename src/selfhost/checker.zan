@@ -376,6 +376,49 @@ public class Checker {
             + ": no implicit conversion", line, col);
     }
 
+    // ---- unary operators: the operand has to be arithmetic ----
+    // The C host (src/compiler/checker.c AST_UNARY) rejects every operand
+    // that is neither numeric nor a class/struct with "cannot apply unary
+    // '-' to 'string'". The self-host lowers a unary minus as
+    // `sub i64 0, <v>` -- on a string pointer that is invalid IR, and on
+    // `~` it takes the compiler down with it (0xC0000005).
+    // The two name sets mirror the host's type_is_numeric / type_is_integral
+    // (char counts as arithmetic here, exactly as in the host's binary
+    // promotion). Only *primitive* operands are judged: a user type, a type
+    // parameter or an unknown name may still be arithmetic after
+    // substitution, and reporting on it would be a guess.
+    bool IsNumericTypeName(string n) {
+        return n == "int" || n == "long" || n == "byte" || n == "short" ||
+               n == "sbyte" || n == "ushort" || n == "uint" || n == "ulong" ||
+               n == "float" || n == "double" || n == "decimal" || n == "nint" ||
+               n == "char";
+    }
+    bool IsIntegralTypeName(string n) {
+        return n == "int" || n == "long" || n == "byte" || n == "short" ||
+               n == "sbyte" || n == "ushort" || n == "uint" || n == "ulong" ||
+               n == "nint";
+    }
+    void CheckUnaryOperand(Node n) {
+        if (n.op == TK.Bang()) { return; }
+        string sign = "";
+        bool integral = false;
+        if (n.op == TK.Minus()) { sign = "-"; }
+        else if (n.op == TK.Plus()) { sign = "+"; }
+        else if (n.op == TK.Tilde()) { sign = "~"; integral = true; }
+        else { return; }
+        Node t = InferType(n.a);
+        if (t == null) { return; }
+        string ty = t.sval;
+        if (ty == "" || ty == "var") { return; }
+        if (!binder.IsPrimitive(ty)) { return; }   // user type / type param / unknown
+        if (integral) { if (IsIntegralTypeName(ty)) { return; } }
+        else { if (IsNumericTypeName(ty)) { return; } }
+        int line = n.line;
+        int col = n.col;
+        if (line == 0 && n.a != null) { line = n.a.line; col = n.a.col; }
+        diags.Error("cannot apply unary '" + sign + "' to '" + ty + "'", line, col);
+    }
+
     // The number of type arguments a built-in generic takes, mirroring the
     // C host's binder (src/compiler/binder.c): List, Span, ReadOnlySpan and
     // Task take one, Dict and Dictionary take two. -1 = not a built-in
@@ -816,7 +859,8 @@ public class Checker {
             }
             return;
         }
-        if (k == AK.Unary() || k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
+        if (k == AK.Unary()) { CheckExpr(n.a); CheckUnaryOperand(n); return; }
+        if (k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
         if (k == AK.Index()) { CheckExpr(n.a); CheckExpr(n.b); return; }
         if (k == AK.CallInit()) { CheckCallInitItems(n); return; }
         if (k == AK.NewExpr()) {
