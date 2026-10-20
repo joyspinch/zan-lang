@@ -1133,8 +1133,8 @@
   - `overload_inherited_arity.zan`：`Strip.Add(b)`（b 是 Bag）取成了派生类
     的 `Add(string)` → 无限递归 → **栈溢出**（0xC00000FD）。**已修**。
   - `cs_b12_conv_operator.zan`：转换运算符重载落到"按名字取第一个"→ 非法
-    IR。**未修**。索引器本体（单个 `this[...]`）已修（见 A431），**多重**
-    索引器重载仍未修。
+    IR。**已修**（2026-10-20，见 A432）。索引器本体（单个 `this[...]`）与
+    **多重**索引器重载也都已修（见 A431 / A432）。
   - `generic_param_shape_overload.zan`：`Item<T>.val` 读回的是**擦除槽的裸
     指针**（打印出地址而不是 "one"）——这是 A421 的泛型字段布局，不是重载
     分派。**未修**（见 A421）。
@@ -1162,8 +1162,7 @@
   - 用例进差分门：`operator_overload` / `struct_operators` /
     `operator_relational` / `overload_resolution` /
     `overload_inherited_arity` / `overload_same_arity_return`。
-- 剩余（未修）：**多重**索引器重载（`op_index` 按实参类型选，见 A431）、
-  转换运算符（`op_implicit` / `op_explicit`）、泛型实参形状那一族（属 A421）。
+- 剩余（未修）：泛型实参形状那一族（属 A421）。
 ### [ ] A429 设计器"排版"组 17 个图标格塞进 324px 工具条——右半命令被裁且不可达
 
 - 现象：设计器工具条的"排版"组是 17 个纯图标格（6 对齐 + 2 分布 + 2 间隙 +
@@ -1219,7 +1218,58 @@
   - 用例进差分门：`field_decl_initializers` / `constructor_chaining` /
     `cs_b09_indexer`（索引器本体）。
 - 剩余（未修）：
-  - `objinit_ctor_field_overwrite.zan`：对象初始化器（`new C { f = v }`）覆盖
-    构造器写过的 RC 字段时，自举**崩**（0xC0000005）。与本轮改动无关——改动
-    前后该用例生成的 IR 完全一致（无 `@__zan_finits_*`），属既有问题。
-  - **多重**索引器重载（`this[int]` 与 `this[string]`）按实参类型选：见 A428。
+  - `objinit_ctor_field_overwrite.zan`：自举**崩**（0xC0000005）。根因**不是**
+    对象初始化器，而是宿主那条 "`Binding<T>` 槽位赋值" 的原语降解（见 A432）——
+    把 `title = seed`（string）塞进 `Binding<string>` 字段时，宿主会合成一个
+    Binding 对象，自举直接把字符串指针写进去，随后 `title.Get()` 把它当
+    Binding 解引用 → 崩。与本轮的改动无关：改动前后该用例生成的 IR 完全
+    一致（无 `@__zan_finits_*`）。
+  - **多重**索引器重载已修（见 A432）。
+
+### [ ] A432 自举缺两样：多重索引器按实参类型选、用户自定义转换运算符
+
+- 现象（2026-10-20 实测）：
+  - `indexer_overload.zan`：一个类上两个索引器（`this[int]` 与
+    `this[string]`）时，自举按**名字**取第一个 → `b["k"]` 走到了 int 那个
+    重载。**已修**。
+  - `cs_b12_conv_operator.zan`：`implicit`/`explicit operator T(S)` 自举
+    完全没有这个概念——`double d = f;` 把 struct 指针直接塞进 double 槽位。
+    **已修**。
+- 根因：
+  - 索引器：自举用 `FindMethodUp`（按名字取第一个），没有"按实参类型选"的
+    路径（运算符重载那条路 §44 修好了，索引器没走那条路）。
+  - 转换运算符：自举的转换点（变量初始化 / 赋值 / 实参 / return / 强制转换）
+    各自做"内建转换"，没有"用户定义转换"这一层。
+- ✅ 已修（2026-10-20，本轮）：
+  - 索引器：候选集来自整条类链（派生索引器只遮蔽**签名相同**的基类索引器），
+    按下标实参类型打分（写入口按下标与值两个实参打分）。
+  - 转换运算符：一次查找（源类型优先、再目标类型；静态方法、恰好一个参数、
+    返回目标类型、参数是源类型）+ 五个转换点（变量初始化 / 赋值 / 实参 /
+    return / 强制转换；只有强制转换允许 `op_explicit`）。
+  - 转换之后的值类型要跟着走：return 的 ARC 记账原来用**源**类型 → 转换后
+    值已是目标类型，记账要改成转换后的类型。
+  - 用例进差分门：`indexer_overload` / `cs_b12_conv_operator`。
+- 关联：`objinit_ctor_field_overwrite.zan` 的崩溃不是对象初始化器的问题，而是
+  宿主那条 "`Binding<T>` 槽位赋值" 原语（赋给 `Binding<T>` 槽位时合成一个
+  Binding 对象；赋字段左值时合成 live 绑定）自举没有——见 A433。
+
+### [ ] A433 宿主有 `Binding<T>` 双向绑定原语降解，自举没有——赋给 `Binding<T>` 槽位的值没被包成 Binding
+
+- 现象（2026-10-20 实测，`objinit_ctor_field_overwrite.zan`）：自举**崩**
+  （0xC0000005）。看起来像"对象初始化器覆盖 RC 字段"的锅，其实不是——
+  把该用例里的对象初始化器去掉（`new Card()`），自举照样崩。
+- 根因：`Binding<T>` 是**泛型类**，字段 `Binding<string> title` 的槽位在自举
+  里是"一个指针"。宿主有一条专门的原语降解：往 `Binding<T>` 槽位赋值时，
+  - 赋的是**字段左值** → 合成一个 **live 绑定**（getter/setter 委托指向那个
+    字段，读走 getter、写回 setter）；
+  - 赋的是**其它表达式** → 合成一个 **const 绑定**（`constVal` 存该值）。
+  宿主实现见 `irgen_expr.c` 的 `type_is_binding` / `emit_binding_value` /
+  `emit_binding_acc_delegate`；检查器侧 `checker.c` 允许把 `T` 直接赋给
+  `Binding<T>` 槽位。
+  自举没有这一层：`title = seed`（seed 是 string）把**字符串指针**直接写进
+  那个槽位，随后 `title.Get()` 把它当 Binding 解引用 → 崩。
+- 关联：A421（泛型类字段布局）——live 绑定要合成 `BindGet<T>`/`BindSet<T>`
+  委托（泛型委托的签名特化），与泛型实例化模型是同一件事。
+- 方向：先做 **const 绑定**（赋值时合成一个 `Binding<T>` 实例，`constVal` 存
+  值），再做 live 绑定（合成委托）。
+- 现状规避：自举产物里不要用 `Binding<T>` 字段。

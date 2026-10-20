@@ -952,8 +952,37 @@ kernel32、shell32、user32、advapi32、version）。
   `ty.sval` 是元素类型名（"Vec"）、`ty.ival` 是 1，会被误判成类。加
   `obj.ty.ival == 0` 守卫，数组才走数组路径（踩了之后 `struct_value_copy`
   用例从 MATCH 变成 BAD-IR）。
-- 残留：**多个索引器重载**（`this[int]` 与 `this[string]`）还没按实参类型
-  选，`FindMethodUp` 只取第一个 → 走错重载。用例
-  `tests/conformance/indexer_overload.zan` 仍与宿主不一致。
-- 门禁：`cs_b09_indexer` 进差分门（逐字一致）。
+- 坑：**多个索引器重载要按实参类型选**（`this[int]` 与 `this[string]`）。
+  按名字取第一个（`FindMethodUp`）会走到错的那个重载。做法与 §45 相同：
+  候选集来自整条类链（派生索引器只遮蔽**签名相同**的基类索引器），按下标
+  实参类型打分（`OpArgScore`），写入口按下标与值两个实参打分。
+- 门禁：`cs_b09_indexer` / `indexer_overload` 进差分门（逐字一致）。
+
+## 48. 用户自定义转换运算符：一处查找，五个转换点
+
+- 坑（实测）：自举完全没有 `implicit`/`explicit operator T(S)` 的概念——
+  `double d = f;` 把 struct 指针**直接**塞进 double 槽位，程序读到垃圾。
+- 宿主口径（`irgen_expr.c` 的 `find_user_conversion` / `find_conversion_method`）：
+  转换运算符是**一个静态方法**，名字 `op_implicit` / `op_explicit`，**恰好一个
+  参数**，**返回目标类型**、**参数是源类型**；先在**源类型**里找，再在**目标
+  类型**里找（所以 `implicit operator double(Feet)` 与
+  `implicit operator Fahrenheit(double)` 两种写法都成立）。
+- 做法：一次查找（`FindUserConv`）+ 五个调用点：
+  | 转换点 | 宿主位置 | 允许的运算符 |
+  |---|---|---|
+  | 变量声明的初始化式 | `irgen_stmt.c` | `op_implicit` |
+  | 赋值 | `irgen_expr.c` | `op_implicit` |
+  | 实参 | `irgen_expr.c` | `op_implicit` |
+  | return | `irgen_stmt.c` | `op_implicit` |
+  | 强制转换 `(T)x` | `irgen_expr.c` | `op_implicit` + `op_explicit` |
+- 坑：**转换之后的类型要跟着值走**。return 路径的 ARC 记账原来用**源**类型
+  （`v.ty`），转换后值已经是目标类型 → `bitcast %Feet* <double>` 这种非法
+  IR。记账要用**转换后**的类型。
+- 坑：转换运算符的**参数是 struct 时，实参要按值拷贝**（C# 语义：运算符收到
+  的是副本）。自举的 struct 是堆对象，这个拷贝由 `CallArg` 的
+  `NeedsStructCopy` 路径自动完成——**不要**在转换点自己再拷一次。
+- 坑：自举源码本身受宿主检查器约束（`ClassOf` 可能返回 null → 直接取
+  `.sval` 会被宿主拒绝编译）。写自举代码时按宿主的空值规则来。
+- 门禁：`cs_b12_conv_operator` 进差分门（逐字一致）。
+
 

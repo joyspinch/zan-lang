@@ -634,6 +634,102 @@ partial class Irgen {
         return pick;
     }
 
+    // The indexer overload that fits the index (and value) argument types.
+    // The host resolves the indexers by argument type -- `b["k"]` must reach
+    // the string indexer -- so a name-only lookup picks the wrong one. The
+    // candidates are the whole class chain: a derived indexer hides a base
+    // one only when the signatures match.
+    Node SelectIndexer(Node cls, string mn, Node at0, Node at1) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == mn && !HasSameSig(cands, m)) { cands.Add(m); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int best = -1000000;
+        Node pick = cands[0];
+        int i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int s = OpArgScore(ParamTypeNode(m, 0), at0);
+            if (at1 != null) { s = s + OpArgScore(ParamTypeNode(m, 1), at1); }
+            if (s > best) { best = s; pick = m; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // Two type references name the same type.
+    bool SameTypeTag(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        return TypeTag(a) == TypeTag(b);
+    }
+
+    // The user-defined conversion that turns a value of type `from` into one
+    // of type `to`: a static method named `opName` with exactly one
+    // parameter, returning the target type. The host looks in the source
+    // type first, then in the target type (`irgen_expr.c`:
+    // `find_user_conversion` / `find_conversion_method`).
+    Node FindUserConv(Node fromTy, Node toTy, string opName) {
+        if (fromTy == null || toTy == null) { return null; }
+        Node fc = ClassOf(fromTy);
+        if (fc != null) {
+            Node m = ConvMethodIn(fc, fromTy, toTy, opName);
+            if (m != null) { convOwner = fc.sval; return m; }
+        }
+        Node tc = ClassOf(toTy);
+        if (tc != null) {
+            Node m = ConvMethodIn(tc, fromTy, toTy, opName);
+            if (m != null) { convOwner = tc.sval; return m; }
+        }
+        return null;
+    }
+
+    // The conversion operator `opName` declared by `cls` itself.
+    Node ConvMethodIn(Node cls, Node fromTy, Node toTy, string opName) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == opName && IsStatic(m)
+                && m.kids.Count == 1 && m.kids[0].kind == AK.Param()
+                && SameTypeTag(m.type, toTy)
+                && SameTypeTag(m.kids[0].type, fromTy)) { return m; }
+            i = i + 1;
+        }
+        return null;
+    }
+
+    // Apply the user-defined conversion that turns `v` into a value of type
+    // `targetTy`. An implicit conversion only uses `op_implicit`; a cast
+    // (`explicitOk`) may also use `op_explicit`. Returns `v` unchanged when
+    // no operator applies -- `convApplied` tells the caller which it was.
+    ExprVal ApplyUserConv(Node targetTy, ExprVal v, bool explicitOk) {
+        convApplied = false;
+        if (v.ty == null || targetTy == null) { return v; }
+        if (SameTypeTag(v.ty, targetTy)) { return v; }
+        Node m = FindUserConv(v.ty, targetTy, "op_implicit");
+        if (m == null && explicitOk) { m = FindUserConv(v.ty, targetTy, "op_explicit"); }
+        if (m == null) { return v; }
+        Node p0 = m.kids[0].type;
+        string t = NT();
+        L("  " + t + " = call " + MapType(m.type) + " @" + MethodSym(convOwner, m)
+            + "(" + MapType(p0) + " " + CallArg(v, p0) + ")");
+        convApplied = true;
+        return new ExprVal(t, m.type);
+    }
+
     // How well an operator parameter type fits an operand type: an exact
     // match wins, then the host's implicit widening order (int -> long ->
     // float/double), a mismatch only loses.
@@ -1192,7 +1288,8 @@ partial class Irgen {
                     L("  store i8* " + BoxFor(v, lty) + ", i8** " + locReg[li]);
                     return;
                 }
-                v = StrSlotConv(lty, v);
+                v = ApplyUserConv(lty, v, false);
+                if (!convApplied) { v = StrSlotConv(lty, v); }
                 // a struct is a value: the variable gets its own copy
                 if (NeedsStructCopy(lty, v)) { v = StructCopyTemp(v, lty); }
                 string lt = MapType(lty);
@@ -1264,6 +1361,11 @@ partial class Irgen {
             Node ocls = binder.FindType(cn);
             if (ocls != null && FieldIndex(ocls, lhs.sval) < 0
                 && EmitPropSet(obj.op, obj.ty, lhs.sval, v)) { return; }
+            if (ocls != null) {
+                // a user-defined implicit conversion applies to the field
+                v = ApplyUserConv(FieldType(ocls, lhs.sval), v, false);
+                if (!convApplied) { v = StrSlotConv(FieldType(ocls, lhs.sval), v); }
+            }
             StoreField(obj.op, cn, lhs.sval, v);
             return;
         }
@@ -1317,7 +1419,7 @@ partial class Irgen {
             Node ocls = null;
             if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
             if (ocls != null) {
-                Node m = FindMethodUp(ocls, "op_index_set");
+                Node m = SelectIndexer(ocls, "op_index_set", OperandType(lhs.b, idx), v.ty);
                 if (m != null) { EmitIndexSet(obj, m, idx, v); return; }
                 diags.Error("indexing a value of type '" + obj.ty.sval
                     + "' is not supported by the self-hosted compiler yet", lhs.line, lhs.col);
@@ -2082,7 +2184,7 @@ partial class Irgen {
         Node ocls = null;
         if (obj.ty != null && obj.ty.ival == 0) { ocls = ClassOf(obj.ty); }
         if (ocls != null) {
-            Node m = FindMethodUp(ocls, "op_index");
+            Node m = SelectIndexer(ocls, "op_index", OperandType(e.b, idx), null);
             if (m != null) { return EmitIndexCall(obj, m, idx); }
             diags.Error("indexing a value of type '" + obj.ty.sval
                 + "' is not supported by the self-hosted compiler yet", e.line, e.col);
@@ -2330,6 +2432,9 @@ partial class Irgen {
     ExprVal GenCast(Node e) {
         ExprVal v = GenExpr(e.b);
         Node tgt = e.type;
+        // a user-defined conversion operator wins over the built-in cast
+        ExprVal uc = ApplyUserConv(tgt, v, true);
+        if (convApplied) { return uc; }
         bool toD = IsDbl(tgt);
         bool fromD = IsDbl(v.ty);
         // int -> double
@@ -4138,6 +4243,8 @@ partial class Irgen {
 
     // build a call argument for a (possibly erased) parameter type
     string CallArg(ExprVal av, Node pty) {
+        // a user-defined implicit conversion applies to the argument
+        av = ApplyUserConv(pty, av, false);
         // a struct parameter is a value: the callee gets its own copy
         if (NeedsStructCopy(pty, av)) { av = StructCopyTemp(av, pty); }
         if (IsErasedType(pty)) { return ToSlot(av, av.ty); }
