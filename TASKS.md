@@ -8,6 +8,64 @@
 
 ## 未完成
 
+### [ ] A456 一元 `!` 不检查操作数类型——`!s`（字符串）静默通过
+
+- 现象（2026-10-21 修 A452 时实测）：`string s = "x"; Console.WriteLine(!s);`
+  → rc=0 **静默通过**（`!` 一律返回 bool）。二元侧 `&&` / `||` 是查类型的
+  （"cannot apply logical operator to 'X' and 'Y': both operands must be bool"），
+  一元 `!` 这边没查。
+- 与 A452 的区别：`!` 打在字符串上生成的是 `icmp eq i64 <指针>, 0`——**合法
+  IR**，只是语义荒唐（拿指针和 0 比）；A452 那些是**非法 IR / 编译器崩溃**。
+  所以它没有跟着 A452 一起改。
+- 影响：写 `!someString` 得到一个恒为 false 的 bool，不报错也不提示。
+- 方向：与 A452 同款守卫——`!` 的操作数必须是 bool。但这一条**影响面比 A452
+  大**：`!0` / `!someInt` 这种 C 风格写法在仓库里可能存在（C# 里本来就该
+  报错），改之前要全包扫描 + 差分门确认没有存量代码踩坑。
+- ⚠ 与 A452 同属"检查器放行"这一族；修的时候两个后端同一次落地。
+
+### [ ] A457 类型身份按**名字**比较——限定名退化后的裸名与被 mangle 的真类型对不上
+
+- 现象（2026-10-21 修 A438 后编译 `examples/security_guard` 实测）：
+  `card.OnMouseDown(onMouseDownCard)` 报
+  `cannot convert 'Action' to 'System_Action' in argument 1 of 'OnMouseDown'`。
+  最小复现（两文件，各自都写了 `using System;`，与跨文件导入无关）：
+  ```zan
+  // p1.zan
+  using System;
+  public class P1 { public static void Hook(Action a) { } }
+  // p2.zan
+  using System;
+  using Gui;
+  public class P2 {
+      public static void Main() {
+          Gui.Action x = () => { };
+          P1.Hook(x);
+      }
+  }
+  ```
+  编译 `zanc p1.zan p2.zan --auto-stdlib --package-project .` → 同样报错。
+- 根因：`Gui.Action` **并不存在**（Gui 命名空间下没有 `Action` 委托），限定名
+  解析失败后退化成"取最后一段猜"（`nsresolve.c` 的 `resolve_ref` dotted 分支，
+  见 `zan-compiler-internals` 第 6 条），裸名 `Action` 交给 binder 软匹配到
+  `System.Action`；但真类型因为与 `System.Linq.Action` 同名而被 mangle 成
+  `System_Action`。于是**同一个类型**在参数位是 `System_Action`、在实参位是
+  `Action`，检查器按**名字**比类型（`checker.c` 的 `checker_type_equal` 走名字，
+  不比符号）→ 误判成两种类型。
+- 与 A438 的关系：**不是** A438 修复引入的——上面这个最小复现里两个文件都显式
+  写了 `using System;`，与"跨文件导入隔离"无关；限定名退化与 mangle 后按名字
+  比较这两条路径都没被 A438 的修复动过。A438 只让这类问题**更容易暴露**
+  （裸名不再被别的文件的导入抢走后，剩下的名字对不上的问题就显形了）。
+- 影响：`examples/security_guard` 这类用"不存在的限定名"写回调的地方直接编不过；
+  该示例不在任何 ctest 门禁里，所以一直没被发现。
+- 方向（择一）：
+  1. **类型相等按符号比**：检查器比较两个类型时用符号（`sym`）而不是显示名，
+     名字只是诊断用的字符串——这是根上的修法。
+  2. **限定名退化时同步改名**：退化到裸名后，把类型引用重写成目标类型的
+     mangle 名（`System_Action`），让两处名字一致。
+  3. 示例侧改成 `System.Action`（不存在的限定名本来就不该写）——只治这一处，
+     编译器仍然会骗人。
+- 关联：A438（裸名与同名类族）。
+
 ### [ ] A455 自举后端没有命名空间/`using` 解析层——裸名按"第一个同名类型"命中
 
 - 现象（2026-10-21 修 A438 时查实）：C 宿主 `src/compiler/nsresolve.c` 有完整的
@@ -26,34 +84,6 @@
   A438 的 C 宿主修复已单独落地（见提交正文），两后端行为要等差分门能看见
   这类用例后再对齐。
 - 关联：A438（已修，结论在 git 历史）。
-
-### [ ] A452 一元运算路径的 `type_error` 哨兵不发诊断——`-s` 落到 LLVM 校验失败，`~s` 把编译器打崩
-
-- 现象（2026-10-21 实测，探针见 `_scratch/probe_unary_types.ps1`）：
-  - `string s = "x"; Console.WriteLine(-s);` → rc=1，报的是
-    `LLVM verification failed in main: Integer arithmetic operators only work with
-    integral types!`——不是人话诊断，用户完全看不出是自己写错了。
-  - `string s = "x"; Console.WriteLine(~s);` → **编译器自己崩**（退出码
-    0xC0000005 访问冲突）。
-  - `string s = "x"; Console.WriteLine(+s);` → rc=0 **静默通过**（恒等，输出字符串）。
-  - 用**不含**本轮改动的共享 `build/zanc.exe` 复测 `~s` 同样崩 → **既有缺陷，
-    不是本轮引入**。
-- 根因：`src/compiler/checker.c:2446-2474` 的 `AST_UNARY` 分支对非数值操作数
-  只 `return c->binder->type_error`，而这个哨兵**本身不发诊断**，调用点也没补
-  "invalid operand type" → 错误一路漏进 irgen：
-  - `-s` → 对字符串指针做整数减法 → LLVM 校验失败；
-  - `~s` → 对字符串指针做 xor → 生成非法 IR 的过程中就把编译器打崩；
-  - `+s` → `src/compiler/irgen_expr.c:4452` `case TK_PLUS: return operand;`
-    恒等 → 静默通过。
-- 影响：写错一个一元运算符，用户拿到的是"编译器崩了"或 LLVM 内部报错，而不是
-  "cannot apply unary '-' to 'string'"。
-- 方向：checker's `AST_UNARY` 分支对非数值 / 非类结构体操作数**就地发诊断**
-  （`zan_diag_emit`），不要只返回 `type_error` 哨兵。自举侧 `src/selfhost/
-  checker.zan:250-253` 同样无条件 `return InferType(e.a)`，且 `GenUnary` 对
-  字符串会生成 `sub i64 0, <指针>` / `xor i64 <指针>, -1` → 两边都要补守卫，
-  否则差分门分叉。
-- ⚠ 跨后端语义改动，必须同一次提交落地两边的守卫；`src/selfhost/irgen_expr.zan`
-  此刻正被另一会话在途修改，改 checker 侧不碰它可以先做，但要重跑差分门。
 
 ### [ ] A451 自举后端没有一元运算符重载派发——同一份源码两个后端语义不同
 
