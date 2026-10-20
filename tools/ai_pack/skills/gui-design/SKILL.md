@@ -1013,6 +1013,14 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
     `pagination { height: 20; font-size: 12; }` 即可），不要回去自绘、也不要在
     每个使用处补坐标。
 
+12. **图片类子项要声明宽高,否则被交叉轴 stretch 拉满整行**：行/列容器的默认
+    `align-items` 是 stretch，子项**没在样式里声明宽高**就按容器交叉轴铺满。
+    `Prefer(w,h)` 只钉住测量尺寸，不阻止拉伸——要按声明尺寸摆它，得用内联
+    CSS：`img.SetProp("style", "width: 88px; height: 88px;")`，或给容器
+    `AlignStart()`。为什么：stretch 判定读的是 `StyleDeclaresWidth/Height`
+    （样式表里有没有 width/height 声明），`Prefer` 不算；实测标题图被拉成
+    1920 宽的一条横幅，卡面图同理。
+
 这两道闸门随工具链走:安装版 SDK 是发布时刻的冻结副本——早于对应闸门合入
 的安装里没有它们,环境变量静默无效(skill 跑在工具链前面时先查工具链日期,
 如安装目录 zanc.exe/stdlib 的时间戳)。正确动作是升级工具链后用内建闸门;

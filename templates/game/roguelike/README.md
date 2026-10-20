@@ -19,7 +19,37 @@ zan Roguelike Deckbuilder — 肉鸽爬塔（模板版）
 
 编译
 ----
-    zanc src/main.zan --auto-stdlib -o roguelike.exe
+`zanc` **不会自动带上同目录的其它 .zan**，多文件模板要把源文件一次列全：
+
+    zanc src/main.zan src/Program.zan src/CardLibrary.zan src/MapNode.zan src/RunState.zan \
+        --auto-stdlib -o roguelike.exe
+
+在仓库里（带仓库内的包）：
+
+    zanc templates/game/roguelike/src/main.zan templates/game/roguelike/src/Program.zan \
+        templates/game/roguelike/src/CardLibrary.zan templates/game/roguelike/src/MapNode.zan \
+        templates/game/roguelike/src/RunState.zan --auto-stdlib --package-project . -o roguelike.exe
+
+美术素材
+--------
+`assets/` 下是四张暗黑奇幻风格的图（统一调子，分类共享）：
+
+| 文件 | 用途 |
+|------|------|
+| `assets/cards/attack.png` | 攻击牌卡面（打击 / 重击 / 汲取） |
+| `assets/cards/skill.png` | 技能牌卡面（防御 / 破甲 / 治疗 / 疾风） |
+| `assets/cards/power.png` | 能力牌卡面（蓄力 / 狂怒） |
+| `assets/title.png` | 主菜单标题图 |
+
+接线只有三步，模板不碰绘制：
+
+1. `CardLibrary` 给每条 `CardDefinition` 挂 `SetArt("assets/cards/xxx.png")`；
+2. `Program.ArtPath()` 用 `Game.Kit.Assets.Find` 定位文件（以 exe 目录为锚向上找 4 级）；
+3. `Program.SizedImage()` 建 `Gui.Widget.Image` 控件，**用内联 CSS 声明宽高**——
+   行/列容器的默认 `align-items` 是 stretch，没声明宽高的图片会被拉满整行
+   （标题图曾被拉成 1920 宽的一条）。
+
+**找不到素材就当没有美术**：定位失败返回空串，界面退回纯文字牌，游戏照常能玩。
 
 源码分工
 --------
