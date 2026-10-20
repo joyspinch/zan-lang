@@ -96,6 +96,10 @@ partial class Irgen {
         // rejects the common case (an undeclared identifier) before the
         // backend runs, so getting here means the two disagree -- say so
         // instead of answering 0.
+        if (IsBuiltinClassName(e.sval)) {
+            diags.Error("'" + e.sval + "' is a built-in type and cannot be used as a value", e.line, e.col);
+            return new ExprVal("0", MkType("int"));
+        }
         diags.Error("unresolved identifier '" + e.sval
             + "' in the self-hosted compiler", e.line, e.col);
         return new ExprVal("0", MkType("int"));
@@ -563,21 +567,30 @@ partial class Irgen {
         return false;
     }
 
+    // A double as text, in the C host's format: the runtime's zan_rt_dbl_str
+    // writes the shortest form that round-trips (the C host's
+    // Console.WriteLine / Convert.ToString go through the same writer).
+    // "%g" would print only six digits and disagree with the host.
+    ExprVal DblToStr(string dval) {
+        if (!ExternSeen("zan_rt_dbl_str")) {
+            externDecls.Add("zan_rt_dbl_str");
+            H("declare void @zan_rt_dbl_str(i8*, i64, double)");
+        }
+        string buf = NT();
+        L("  " + buf + " = call i8* @malloc(i64 64)");
+        L("  call void @zan_rt_dbl_str(i8* " + buf + ", i64 64, double " + dval + ")");
+        string s = NT();
+        L("  " + s + " = call i8* @zstr_of(i8* " + buf + ")");
+        L("  call void @free(i8* " + buf + ")");
+        return new ExprVal(s, MkType("string"));
+    }
+
     // coerce a value to i8* string form (numbers via snprintf)
     string ToCStr(ExprVal v) {
         if (IsStr(v.ty)) { return v.op; }
-        // double -> string (via snprintf "%g")
+        // double -> string (the runtime's shortest round-trip form)
         if (IsDbl(v.ty)) {
-            string dneed = NT();
-            L("  " + dneed + " = call i32 (i8*, i64, i8*, ...) @snprintf(i8* null, i64 0, i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
-            string dneed64 = NT();
-            L("  " + dneed64 + " = sext i32 " + dneed + " to i64");
-            string dbsz = NT();
-            L("  " + dbsz + " = add i64 " + dneed64 + ", 1");
-            string dbuf = NT();
-            L("  " + dbuf + " = call i8* @malloc(i64 " + dbsz + ")");
-            L("  call i32 (i8*, i64, i8*, ...) @snprintf(i8* " + dbuf + ", i64 " + dbsz + ", i8* getelementptr inbounds ([3 x i8], [3 x i8]* @.fmt.gn, i64 0, i64 0), double " + v.op + ")");
-            return WrapManaged(dbuf);
+            return DblToStr(v.op).op;
         }
         // integer -> string ("%llu" for ulong so the high bit prints unsigned)
         string ifmt = "@.fmt.nn";
@@ -2942,6 +2955,111 @@ partial class Irgen {
         return mname;
     }
 
+    // the value as a double (an int argument is converted, like the C host)
+    string ToDbl(ExprVal v) {
+        if (IsDbl(v.ty)) { return v.op; }
+        string c = NT();
+        L("  " + c + " = sitofp i64 " + v.op + " to double");
+        return c;
+    }
+
+    // Math.<fn>(...) -> the libm call the C host lowers (irgen_call.c):
+    // the one-argument family (sin/cos/tan/log/exp/atan/asin/acos/sqrt),
+    // Pow/Atan2, Floor/Ceiling, Abs, and Max/Min. Max/Min keep the argument
+    // type (int in -> int out) and are NaN-aware, exactly like the host's
+    // select-based lowering. Returns null for a name that is not a Math
+    // intrinsic (the caller then reports it).
+    ExprVal GenMathCall(string name, Node e) {
+        int argc = e.kids.Count;
+        string f1 = "";
+        if (name == "Sin") { f1 = "sin"; }
+        else if (name == "Cos") { f1 = "cos"; }
+        else if (name == "Tan") { f1 = "tan"; }
+        else if (name == "Log") { f1 = "log"; }
+        else if (name == "Exp") { f1 = "exp"; }
+        else if (name == "Atan") { f1 = "atan"; }
+        else if (name == "Asin") { f1 = "asin"; }
+        else if (name == "Acos") { f1 = "acos"; }
+        else if (name == "Sqrt") { f1 = "sqrt"; }
+        if (f1 != "" && argc == 1) {
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = ToDbl(a);
+            if (!ExternSeen(f1)) { externDecls.Add(f1); H("declare double @" + f1 + "(double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + f1 + "(double " + av + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if ((name == "Pow" || name == "Atan2") && argc == 2) {
+            string fn = "pow";
+            if (name == "Atan2") { fn = "atan2"; }
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            string av = ToDbl(a);
+            string bv = ToDbl(b);
+            if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double, double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + fn + "(double " + av + ", double " + bv + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if ((name == "Floor" || name == "Ceiling") && argc == 1) {
+            string fn = "floor";
+            if (name == "Ceiling") { fn = "ceil"; }
+            ExprVal a = GenExpr(e.kids[0]);
+            string av = ToDbl(a);
+            if (!ExternSeen(fn)) { externDecls.Add(fn); H("declare double @" + fn + "(double)"); }
+            string r = NT();
+            L("  " + r + " = call double @" + fn + "(double " + av + ")");
+            return new ExprVal(r, MkType("double"));
+        }
+        if (name == "Abs" && argc == 1) {
+            ExprVal a = GenExpr(e.kids[0]);
+            if (IsDbl(a.ty)) {
+                if (!ExternSeen("fabs")) { externDecls.Add("fabs"); H("declare double @fabs(double)"); }
+                string r = NT();
+                L("  " + r + " = call double @fabs(double " + a.op + ")");
+                return new ExprVal(r, MkType("double"));
+            }
+            // integer abs: (x ^ (x >> 63)) - (x >> 63)
+            string sh = NT();
+            L("  " + sh + " = ashr i64 " + a.op + ", 63");
+            string xr = NT();
+            L("  " + xr + " = xor i64 " + a.op + ", " + sh);
+            string r = NT();
+            L("  " + r + " = sub i64 " + xr + ", " + sh);
+            return new ExprVal(r, MkType("int"));
+        }
+        if ((name == "Max" || name == "Min") && argc == 2) {
+            ExprVal a = GenExpr(e.kids[0]);
+            ExprVal b = GenExpr(e.kids[1]);
+            bool dbl = IsDbl(a.ty) || IsDbl(b.ty);
+            if (dbl) {
+                string av = ToDbl(a);
+                string bv = ToDbl(b);
+                string an = NT();
+                L("  " + an + " = fcmp uno double " + av + ", " + av);
+                string bn = NT();
+                L("  " + bn + " = fcmp uno double " + bv + ", " + bv);
+                string c = NT();
+                if (name == "Max") { L("  " + c + " = fcmp ogt double " + av + ", " + bv); }
+                else { L("  " + c + " = fcmp olt double " + av + ", " + bv); }
+                string picked = NT();
+                L("  " + picked + " = select i1 " + c + ", double " + av + ", double " + bv);
+                string fb = NT();
+                L("  " + fb + " = select i1 " + bn + ", double " + bv + ", double " + picked);
+                string r = NT();
+                L("  " + r + " = select i1 " + an + ", double " + av + ", double " + fb);
+                return new ExprVal(r, MkType("double"));
+            }
+            string c = NT();
+            if (name == "Max") { L("  " + c + " = icmp sgt i64 " + a.op + ", " + b.op); }
+            else { L("  " + c + " = icmp slt i64 " + a.op + ", " + b.op); }
+            string r = NT();
+            L("  " + r + " = select i1 " + c + ", i64 " + a.op + ", i64 " + b.op);
+            return new ExprVal(r, MkType("int"));
+        }
+        return null;
+    }
+
     // ---- calls ----
     ExprVal GenCall(Node e) {
         Node callee = e.a;
@@ -3053,11 +3171,13 @@ partial class Irgen {
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
                 L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + arg.op + ")");
             } else if (has && IsDbl(arg.ty)) {
-                string fg = "@.fmt.gn"; int fl = 3;
-                if (nl) { fg = "@.fmt.gnl"; fl = 4; }
+                // a double prints in the host's shortest round-trip form
+                ExprVal ds = DblToStr(arg.op);
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
                 string gp = NT();
                 L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
-                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", double " + arg.op + ")");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + ds.op + ")");
             } else {
                 string fg = "@.fmt.nn"; int fl = 5;
                 if (nl) { fg = "@.fmt.nl"; fl = 6; }
@@ -3209,6 +3329,14 @@ partial class Irgen {
             string res = NT();
             L("  " + res + " = fdiv double " + rr + ", " + sc);
             return new ExprVal(res, MkType("double"));
+        }
+        // Math.<fn>(...) -> the libm call the C host lowers (irgen_call.c).
+        // Round has its own branch above (it takes an optional digit count).
+        if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
+            && callee.a.sval == "Math" && LocalIdx("Math") < 0 && binder.FindType("Math") == null
+            && callee.sval != "Round") {
+            ExprVal mv = GenMathCall(callee.sval, e);
+            if (mv != null) { return mv; }
         }
         // string.IsNullOrEmpty / string.Join / string.Format statics
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
@@ -4067,6 +4195,37 @@ partial class Irgen {
             L("  call i8* @memcpy(i8* " + buf + ", i8* " + srcp + ", i64 " + lenOp + ")");
             return new ExprVal(buf, MkType("string"));
         }
+        if (name == "Equals" && e.kids.Count == 1) {
+            // the C host compares the *exact* lengths and bytes
+            // (irgen_call.c -> __zan_str_ocmp), not the C-visible prefix
+            ExprVal o = GenExpr(e.kids[0]);
+            if (recv.op == "null" || o.op == "null") {
+                // a null operand is never equal to a non-null one
+                string c = NT();
+                L("  " + c + " = icmp eq i8* " + recv.op + ", " + o.op);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+            if (!ExternSeen("memcmp")) { externDecls.Add("memcmp"); H("declare i32 @memcmp(i8*, i8*, i64)"); }
+            string la = StrLen(recv.op);
+            string lb = StrLen(o.op);
+            string lt = NT();
+            L("  " + lt + " = icmp slt i64 " + la + ", " + lb);
+            string m = NT();
+            L("  " + m + " = select i1 " + lt + ", i64 " + la + ", i64 " + lb);
+            string mc = NT();
+            L("  " + mc + " = call i32 @memcmp(i8* " + recv.op + ", i8* " + o.op + ", i64 " + m + ")");
+            string mz = NT();
+            L("  " + mz + " = icmp eq i32 " + mc + ", 0");
+            string lz = NT();
+            L("  " + lz + " = icmp eq i64 " + la + ", " + lb);
+            string both = NT();
+            L("  " + both + " = and i1 " + mz + ", " + lz);
+            string z = NT();
+            L("  " + z + " = zext i1 " + both + " to i64");
+            return new ExprVal(z, MkType("bool"));
+        }
         if (name == "Contains" && e.kids.Count == 1) {
             ExprVal sub = GenExpr(e.kids[0]);
             DeclStrstr();
@@ -4192,6 +4351,55 @@ partial class Irgen {
         if (name == "Clear") {
             L("  call void @zlist_clear(i8* " + recv.op + ")");
             return new ExprVal("0", MkType("void"));
+        }
+        if (name == "ToArray" && e.kids.Count == 0) {
+            // List<T>.ToArray(): copy the slots into a fresh array. The
+            // self-hosted list keeps one element per 8-byte slot, exactly
+            // like the self-hosted array, so the slots are copied as they
+            // are.
+            string cnt = NT();
+            L("  " + cnt + " = call i64 @zlist_count(i8* " + recv.op + ")");
+            string bytes = NT();
+            L("  " + bytes + " = mul i64 " + cnt + ", 8");
+            string tot = NT();
+            L("  " + tot + " = add i64 " + bytes + ", 16");
+            string raw = NT();
+            L("  " + raw + " = call i8* @calloc(i64 1, i64 " + tot + ")");
+            string hdr = NT();
+            L("  " + hdr + " = bitcast i8* " + raw + " to i64*");
+            string lenp = NT();
+            L("  " + lenp + " = getelementptr i64, i64* " + hdr + ", i64 1");
+            L("  store i64 " + cnt + ", i64* " + lenp);
+            string arr = NT();
+            L("  " + arr + " = getelementptr i64, i64* " + hdr + ", i64 2");
+            string idx = NT();
+            EA(idx, "i64");
+            L("  store i64 0, i64* " + idx);
+            int lc = NL(); int lb = NL(); int lend = NL();
+            L("  br label %L" + lc);
+            Label(lc);
+            string ci = NT();
+            L("  " + ci + " = load i64, i64* " + idx);
+            string c = NT();
+            L("  " + c + " = icmp uge i64 " + ci + ", " + cnt);
+            L("  br i1 " + c + ", label %L" + lend + ", label %L" + lb);
+            Label(lb);
+            string slot = NT();
+            L("  " + slot + " = call i64 @zlist_get(i8* " + recv.op + ", i64 " + ci + ")");
+            string ap = NT();
+            L("  " + ap + " = getelementptr i64, i64* " + arr + ", i64 " + ci);
+            L("  store i64 " + slot + ", i64* " + ap);
+            string ni = NT();
+            L("  " + ni + " = add i64 " + ci + ", 1");
+            L("  store i64 " + ni + ", i64* " + idx);
+            L("  br label %L" + lc);
+            Label(lend);
+            Node et = ListElem(recv.ty);
+            Node at = new Node(AK.TypeRef());
+            at.sval = et.sval;
+            at.ival = 1;
+            at.kids = et.kids;
+            return new ExprVal(arr, at);
         }
         if (name == "AddRange" && e.kids.Count == 1) {
             ExprVal other = GenExpr(e.kids[0]);
@@ -4365,6 +4573,10 @@ partial class Irgen {
             L("  " + t + " = call i64 @zdict_count(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("int"));
         }
+        if (name == "Clear" && e.kids.Count == 0) {
+            L("  call void @zdict_clear(i8* " + recv.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
         // An unknown dictionary method must not degrade into a constant 0:
         // the program would silently get wrong answers.
         diags.Error("dictionary method '" + name + "' is not supported by the self-hosted compiler yet", e.line, e.col);
@@ -4394,6 +4606,15 @@ partial class Irgen {
             string t = NT();
             L("  " + t + " = call i8* @zsb_tostring(i8* " + recv.op + ")");
             return new ExprVal(t, MkType("string"));
+        }
+        if (name == "Clear" && e.kids.Count == 0) {
+            // the builder keeps its buffer; only the count goes back to zero
+            string bp = NT();
+            L("  " + bp + " = bitcast i8* " + recv.op + " to %zsb*");
+            string cp = NT();
+            L("  " + cp + " = getelementptr %zsb, %zsb* " + bp + ", i32 0, i32 0");
+            L("  store i64 0, i64* " + cp);
+            return new ExprVal("0", MkType("void"));
         }
         // An unknown string-builder method must not degrade into "the
         // receiver itself": the program would silently get wrong answers.

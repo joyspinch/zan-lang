@@ -467,5 +467,26 @@ kernel32、shell32、user32、advapi32、version）。
 - 边界：`FindMethodUp` / `FindStaticField` / `CollectFields` 都会走**基类链**，
   所以继承来的字段、静态字段、静态属性都能找到；别在自举里另写一套查找。
 
+## 29. 内建表的能力要**量**出来；double 的文本格式要用运行时的最短往返
+
+- 动作：
+  - 宿主把一批 API 声明成**内建**（`src/compiler/builtin_api.c` 的
+    `builtin_types[]` / `members_*[]`），自举后端要么自己降级、要么报诊断。
+    "哪些能降级"必须**测量**：`scripts/selfhost_builtin_sweep.ps1` 按内建表
+    自动生成探针（参数类型从签名取，只编译不运行），矩阵落在
+    `docs/selfhost-builtins.md`。新增内建不用改脚本。
+  - double→文本要用运行时的 `zan_rt_dbl_str`（**最短往返**格式，
+    `src/runtime/rt_timer.c`），**不要**用 `printf("%g")`——那是六位有效数字，
+    与宿主不一致。
+- 理由（2026-10-20 实测）：`Convert.ToString(Math.Acos(0.0))` 宿主给
+  `1.5707963267948966`，自举给 `1.5708`——凡是打印 double 的程序，输出都不同。
+  而"自举到底缺哪些内建"在 A401 之前**没人知道**，只能撞。
+- 边界：能力矩阵只测"能不能编译"；**行为**是否一致由差分门断言（同一程序
+  两边 stdout 逐字相同）。新降级的内建都要配 conformance 用例并进
+  `tests/selfhost/diff_cases.txt`。
+- 连带：`SeedExternBuiltins`（`irgen.zan`）要跟模块头部的 `declare` 列表
+  **同步**——头里声明了 `memmove`/`memset`/`memcmp` 而种子表里没有时，
+  后面再声明一次就是 "invalid redefinition of function"。
+
 
 

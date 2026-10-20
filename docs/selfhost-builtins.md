@@ -1,0 +1,63 @@
+# 自举编译器对 C 宿主内建表的能力矩阵
+
+自举编译器（`src/selfhost/`）是语言语义的权威实现，C 宿主（`src/compiler/`）
+只为引导 gen1 而存。宿主把一批 API 声明成**内建**（`src/compiler/builtin_api.c`
+的 `builtin_types[]` / `members_*[]` 表），自举后端要么自己降级这些调用，要么
+**报诊断拒绝**（fail-closed）——绝不静默返回 0。
+
+本文记录自举目前能降到哪一步、还差哪一步，以及怎么重新测。
+
+## 怎么测
+
+```bash
+# 1) 先编出 gen1（C 宿主编自举源）
+cmake --build build --target zanrt_selfhost_diff_bundle
+# 2) 扫一遍内建表：每个成员生成一个探针程序，只编译不运行
+scripts\selfhost_builtin_sweep.ps1 -Gen1 build\selfhost_diff_gen1.exe
+# 报告落在 build\selfhost_builtin_matrix.txt
+```
+
+脚本按内建表**自动生成**探针（参数类型从签名里取，值只要能过类型检查即可），
+所以新增内建不用改脚本。分类看自举的诊断：
+
+| 诊断 | 含义 |
+|---|---|
+| 无诊断 | 自举能降级这个成员 |
+| `not supported by the self-hosted compiler yet` | **缺口**：自举还没实现 |
+| `is a built-in type and cannot be used as a value` | 内建**属性**（如 `Console.Title`），自举不降级 |
+| 其它 | 探针本身写错了（不是自举的缺口） |
+
+## 现状（2026-10-20）
+
+已能降级：
+
+- `Math`：`Abs` / `Max` / `Min` / `Pow` / `Sqrt` / `Floor` / `Ceiling` / `Round` /
+  `Sin` / `Cos` / `Tan` / `Atan` / `Atan2` / `Asin` / `Acos`
+- `string`：`Length` / `Substring` / `IndexOf` / `LastIndexOf` / `Contains` /
+  `StartsWith` / `EndsWith` / `Replace` / `Trim` / `ToUpper` / `ToLower` /
+  `Split` / `Equals` / `ToString`
+- `String`：`Format` / `Join` / `IsNullOrEmpty` / `CompareOrdinal`
+- `List<T>`：`Count` / `Reserve` / `Add` / `AddRange` / `Insert` / `RemoveAt` /
+  `Clear` / `Contains` / `IndexOf` / `Reverse` / `ToArray`
+- `Dictionary<K,V>`：`Count` / `Keys` / `Values` / `Add` / `Remove` / `Clear` /
+  `ContainsKey`
+- `StringBuilder`：`Append` / `AppendLine` / `Clear` / `Length` / `ToString`
+- `File` / `Directory` / `Path` / `Environment` / `Convert` / `Console`（除颜色
+  属性外）/ `BitOperations` / `NativeMemory`（41 个成员）
+- 三个**编译器内建**（不是标准库方法，标准库自己就在用）：
+  `String.CompareOrdinal` → `strcmp`、`string.ToBytes()` → `byte[]`、
+  `byte[].ToStr(off,len)` → `string`
+
+还差：
+
+- `Task`：`Delay`（同步上下文里）、`Yield`、`WhenAll`、`WhenAny`、`IsDone`、
+  `Cancel`、`IsCancellationRequested`、`JoinNew` / `JoinBind` / `JoinWait` /
+  `JoinCancel`——这些要走协程帧与调度器，见 TASKS.md 的 A385。
+- `Console` 的颜色/标题**属性**：`ForegroundColor` / `BackgroundColor` / `Title`。
+
+## 为什么差分门是唯一权威
+
+能力矩阵只测"能不能编译"。**行为**是否与宿主一致由差分门断言
+（`tests/run_selfhost_diff.cmake`）：同一个程序，宿主编一遍、自举编一遍，
+两边 stdout 逐字相同才算过。新降级的内建都要配一个 conformance 用例
+（`tests/conformance/<name>.zan` + `.out`）并进 `tests/selfhost/diff_cases.txt`。

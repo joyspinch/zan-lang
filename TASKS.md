@@ -454,7 +454,6 @@
   差分门里 `value_enumerable` / `linq_query` 两个用例从"编不过"变回通过。
 
 ### [ ] A404 自举：认不出的**标识符**与**成员**仍静默返回 0
-
 - 现象：`GenIdent` 末尾 `return new ExprVal("0", MkType("int"))`、
   `GenMember` 末尾同样。也就是 `int x = undefinedName;` 在自举里是 `x = 0`，
   `obj.NoSuchField` 也是 0。
@@ -484,3 +483,36 @@
 - ✅ 已修（2026-10-20）：`GenMember` 的静态分支加一条"找静态 `get_<name>`"
   （`FindMethodUp` 会走基类链）；用例 `tests/conformance/static_property.zan`
   钉住（自举与 C 宿主逐字一致）。
+
+### [ ] A406 自举：内建表的能力没测过——先量出来，再按矩阵补齐
+
+- 现象（2026-10-20）：C 宿主把一批 API 声明成**内建**
+  （`src/compiler/builtin_api.c` 的 `builtin_types[]` / `members_*[]`），
+  自举后端要么自己降级、要么报诊断拒绝——但"哪些能降级"**从来没量过**，
+  全靠撞。A401 之后更明显：不支持的调用会报诊断，可诊断只会告诉你
+  "不支持"，不告诉你**一共还差多少**。
+- 方向：写一个按内建表**自动生成探针**的测量脚本（参数类型从签名取，
+  只编译不运行），把结果落成能力矩阵文档；然后按矩阵分组补齐。
+- ✅ 已修（2026-10-20）：
+  - 测量脚本 `scripts/selfhost_builtin_sweep.ps1`，矩阵文档
+    `docs/selfhost-builtins.md`。
+  - 按矩阵补齐了一批：`Math` 全家（14 个）、`string.Equals`、
+    `List<T>.ToArray`、`Dictionary.Clear`、`StringBuilder.Clear`；
+    用例 `tests/conformance/builtin_surface.zan` 钉住（逐字一致）。
+  - 剩下的缺口记在文档里：`Task.*`（要协程帧，见 A385）与 `Console` 的
+    颜色/标题属性。
+
+### [ ] A407 自举：double 的**文本格式**与宿主不一致（`%g` vs 最短往返）
+
+- 现象（2026-10-20 探针实测）：`Convert.ToString(Math.Acos(0.0))`
+  - C 宿主：`1.5707963267948966`
+  - 自举：`1.5708`
+  根因：自举用 `printf("%g")`（六位有效数字），宿主用运行时的
+  `zan_rt_dbl_str`（**最短往返**格式，`src/runtime/rt_timer.c`）。
+  凡是打印 double 的程序，自举与宿主的输出都不一样。
+- 方向：自举的 double→文本改走运行时的 `zan_rt_dbl_str`（跟宿主同一份
+  格式代码），`Console.WriteLine(double)` 与 `ToCStr(double)` 两处都要改。
+- ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `DblToStr`（调
+  `@zan_rt_dbl_str` 再包成托管串），`ToCStr` 与 `Console.WriteLine` 的
+  double 分支都改走它；`builtin_surface` 用例里 `acos=1.5707963267948966`
+  与宿主逐字一致。
