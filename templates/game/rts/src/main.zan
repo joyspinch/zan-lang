@@ -1,15 +1,23 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Gui;
 using Gui.Widget;
 using Gui.Rendering;
 using Game.Tactics;
 using Game.Core;
+using Game.Kit;
 
 public class Program {
     Form form;
     App app;
     BattlefieldView view;
+
+    // 美术素材：盘上找不到就退回矢量绘制（assets/ 会被 zanc 自动内嵌进 exe）
+    string bgPath;
+    string infantryPath;
+    string tankPath;
+    string minerPath;
 
     // 引擎系统
     FlowField flowField;
@@ -48,6 +56,12 @@ public class Program {
         form = Form.CreateDark("红警与星际 · 即时战略引擎 (Zan RTS Engine)", 1024, 700);
         app = form.GetApp();
         app.UseSkin("dark");
+
+        // 素材：assets/ 会被 zanc 自动内嵌进 exe，运行时盘上优先
+        this.bgPath = Program.FindAsset("assets/bg_field.jpg");
+        this.infantryPath = Program.FindAsset("assets/unit_infantry.png");
+        this.tankPath = Program.FindAsset("assets/unit_tank.png");
+        this.minerPath = Program.FindAsset("assets/unit_miner.png");
         Canvas.SetBackend(1);  // GL 硬件加速后端
 
         // 初始化流场与 RVO 避障器
@@ -90,11 +104,13 @@ public class Program {
     }
 
     void SpawnInitialArmies() {
-        // 在左侧基地生成蓝方兵团
+        // 在左侧基地生成蓝方兵团。
+        // 间距要大于单位直径（步兵 18、坦克 32），否则编队糊成一块——
+        // 这是贴图版和矢量版的共同要求：矢量圆小，贴图大，占位一样。
         for (int i = 0; i < 40; i = i + 1) {
             int uType = (i % 6 == 0) ? 1 : 0;  // 少量坦克，大量步兵
-            double sx = 60.0 + (double)((i % 8) * 28);
-            double sy = 120.0 + (double)((i / 8) * 32);
+            double sx = 60.0 + (double)((i % 8) * 40);
+            double sy = 120.0 + (double)((i / 8) * 44);
             RtsUnit u = RtsUnit.Create(i + 1, uType, 0, sx, sy);
             int slot = rvoSim.AddAgent(sx, sy, u.Radius, u.Speed);
             u.RvoSlot = slot;
@@ -232,9 +248,27 @@ public class Program {
         }
     }
 
+    // 素材定位：盘上找不到就返回 null（调用方走矢量兜底）。
+    static string FindAsset(string rel) {
+        string p = Assets.Find(rel);
+        if (p == null || !File.Exists(p)) { return null; }
+        return p;
+    }
+
+    // 单位类型 → 精灵图（没有素材返回 null）。
+    string SpriteOf(int type) {
+        if (type == 1) { return this.tankPath; }
+        if (type == 2) { return this.minerPath; }
+        return this.infantryPath;
+    }
+
     void RenderBattlefield(Canvas c, int bx, int by, int bw, int bh) {
-        // 1. 地面底色
-        c.FillRect(bx, by, bw, bh, 0xFF141E28);
+        // 1. 地面：优先贴美术底图，没有素材才退回纯色
+        if (this.bgPath != null) {
+            CDraw.BlitImage(c, this.bgPath, bx, by, bw, bh);
+        } else {
+            c.FillRect(bx, by, bw, bh, 0xFF141E28);
+        }
 
         // 2. 绘制网格背景
         int cols = bw / cellSize;
@@ -247,11 +281,12 @@ public class Program {
         }
 
         // 3. 绘制中央不可通行悬崖峡谷障碍
+        // 压在美术底图上时用半透明暗色 + 描边，读作"裂谷"而不是灰贴片
         int midCol = cols / 2;
         int canyonX = bx + midCol * cellSize;
         for (int r = 0; r < rows; r = r + 1) {
             if (r < 7 || r > 12) {
-                c.FillRect(canyonX, by + r * cellSize, cellSize * 2, cellSize, 0xFF374151);
+                c.FillRect(canyonX, by + r * cellSize, cellSize * 2, cellSize, 0xD90A1220);
                 c.DrawRect(canyonX, by + r * cellSize, cellSize * 2, cellSize, 0xFF4B5563, 1);
             }
         }
@@ -276,8 +311,17 @@ public class Program {
                 c.DrawCircle(ux, uy, r + 4, 0xAA22C55E, 1);
             }
 
-            // 单位本体
-            if (u.Type == 1) {
+            // 阵营环：贴图本身没有配色，敌我用环区分
+            int teamColor = u.Team == 0 ? 0xAA60A5FA : 0xAAF87171;
+            c.DrawCircle(ux, uy, r + 1, teamColor, 1);
+
+            // 单位本体：优先画精灵图
+            string sprite = this.SpriteOf(u.Type);
+            if (sprite != null) {
+                // 精灵按单位直径画：再放大就会在编队里互相压叠
+                int size = r * 2;
+                CDraw.BlitImage(c, sprite, ux - size / 2, uy - size / 2, size, size);
+            } else if (u.Type == 1) {
                 // 坦克：矩形底盘 + 炮塔
                 c.FillRect(ux - r, uy - r, r * 2, r * 2, 0xFF1E3A8A);
                 c.DrawRect(ux - r, uy - r, r * 2, r * 2, 0xFF3B82F6, 2);
