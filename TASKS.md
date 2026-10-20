@@ -559,3 +559,18 @@
   `FileUri`/`PathFromUri` 编解码，不真碰剪贴板。
 - 方向：用例前置判定剪贴板可用（不可用就跳过并打印 skip 理由），否则在
   CI/agent/无桌面会话的机器上恒红；真要在无头环境测，得走可注入的剪贴板后端。
+
+### [ ] A412 三条 conformance 用例运行期 Access violation（崩溃，不是断言失败）
+
+- 现象：`conformance_ternary_is_type`、`conformance_cast_string_object`、
+  `conformance_cs_b05_pattern_var` 三条程序退出码 1，报 `program exited with
+  Access violation`（0xC0000005）——是**崩溃**，不是断言失败。
+- 已排除的可能：不是编译器改动带出来的。把 `src/compiler/optimizer.c` 的去虚拟化
+  边界检查临时换回 `789642b0^` 的版本、重建 zanc 后，三条**仍然同样崩**；且这三个
+  程序全文没有 `Task.` / `async` / `await`，够不到 Task 句柄定型与 async resume
+  两条改动面。崩溃日志只记了 run/exit 行（`logged=0`），没留下栈。
+- 现象细分：`ternary_is_type` 在**打印任何一行之前**就崩；`cs_b05_pattern_var`
+  打印了若干行后才崩——像是某个类型转换 / 模式匹配的运行期路径。
+- 方向：取栈再定位——用 Debug 构建 + 调试器（参考 zanc 间歇性崩溃那次的做法：
+  `cdb -hd` 开调试堆），先定位崩在哪个运行时函数，再判断是 ARC 生命周期、
+  装箱路径还是类型分派的问题；定位前不要猜。
