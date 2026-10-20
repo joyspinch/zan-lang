@@ -205,11 +205,17 @@ public class Program {
             if (c == "\n" || ei == en) {
                 if (ecur.Length > 0 && ecur.Substring(0, 1) != ".") {
                     string root = store + "/" + ecur;
-                    if (Directory.ListNames(root + "/src/" + seg0 + "/*") != "") {
+                    if (Directory.ListNames(root + "/src/" + seg0 + "/*") != ""
+                        || Directory.Exists(root + "/src")) {
                         int f0 = d.files.Count;
                         PiGlobDir(d, root + "/src/" + d.subdir);
                         PiGlobDir(d, root + "/stdlib/" + d.subdir);
                         PiGlobDir(d, root + "/" + d.subdir);
+                        // the package sources that DECLARE this namespace (or
+                        // one of its descendants) join the pull as well -- the
+                        // physical layout of a package says nothing about the
+                        // namespace it provides
+                        PiGlobPkgNs(d, d.subdir);
                         if (d.files.Count == f0 && seg0 == "ZanWeb") {
                             if (d.subdir == "ZanWeb" || d.subdir == "ZanWeb/Web") {
                                 PiGlobFiles(d, root + "/src/ZanWeb/Framework");
@@ -281,6 +287,100 @@ public class Program {
         PiGlobStore(d, pkgProjectRoot + "/.zan-packages");
         PiGlobStore(d, pkgExeStore);
         PiGlobStore(d, pkgGlobalStore);
+    }
+
+    // ---- package sources keyed by their DECLARED namespace ----
+    //
+    // The C host indexes the package sources by the namespace each file
+    // declares and ignores the physical layout (zan_pkg_source_index): a
+    // namespace reaches the files that declare it and -- when the namespace
+    // does not exist in the standard library -- the files that declare one
+    // of its descendants. The self-hosted pull-in walked the package
+    // directories instead, so a type declared in a nested directory
+    // (`Gui/Styling/Models/ThemeMetricsSnapshot.zan`, namespace
+    // `Gui.Styling.Models`) was never reached from `using Gui;` and the
+    // type came out undefined.
+    static List<PiFile> pkgNsIdx;   // the package sources, keyed by their declared namespace
+    static bool pkgNsIdxBuilt;
+
+    // The namespace a package file declares, in the 'A/B/C' subdir form.
+    // (PiProbeNs below does the probing.)
+
+    // collect every package source under `dir`, with its declared namespace
+    static void PiPkgIdxAdd(string dir) {
+        if (dir == null || dir.Length == 0) { return; }
+        string names = Directory.ListNames(dir + "/*");
+        if (names == null || names.Length == 0) { return; }
+        List<string> parts = names.Split("\n");
+        int i = 0;
+        while (i < parts.Count) {
+            string nm = parts[i];
+            nm = nm.Trim();
+            if (nm != "" && nm.Substring(0, 1) != ".") {
+                string full = dir + "/" + nm;
+                if (nm.EndsWith(".zan")) {
+                    PiFile pf = new PiFile(full);
+                    pf.ns = PiProbeNs(full);
+                    pkgNsIdx.Add(pf);
+                } else {
+                    PiPkgIdxAdd(full);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // the package sources that declare `want` (and, when the namespace is
+    // not a standard library one, its descendants)
+    static void PiGlobPkgNs(PiDir d, string want) {
+        PiPkgIdxEnsure();
+        bool hierarchical = !Directory.Exists(stdlibRoot + "/" + want);
+        int i = 0;
+        while (i < pkgNsIdx.Count) {
+            PiFile f = pkgNsIdx[i];
+            string ns = f.ns;
+            if (ns != null && ns != "") {
+                bool hit = ns == want;
+                if (!hit && hierarchical && ns.Length > want.Length && ns.StartsWith(want)
+                    && ns[want.Length] == '/') {
+                    hit = true;
+                }
+                if (hit && !PiDirHasFile(d, f.path)) {
+                    d.files.Add(new PiFile(f.path));
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    // index every package source once (the C host builds the same index
+    // once and answers every namespace query from it)
+    static void PiPkgIdxEnsure() {
+        if (pkgNsIdxBuilt) { return; }
+        pkgNsIdxBuilt = true;
+        pkgNsIdx = new List<PiFile>();
+        PiPkgIdxStore(pkgProjectRoot + "/packages");
+        PiPkgIdxStore(pkgProjectRoot + "/.zan-packages");
+        PiPkgIdxStore(pkgExeStore);
+        PiPkgIdxStore(pkgGlobalStore);
+    }
+
+    static void PiPkgIdxStore(string store) {
+        if (store == null || store.Length == 0) { return; }
+        string ents = Directory.ListNames(store + "/*");
+        if (ents == null || ents.Length == 0) { return; }
+        List<string> parts = ents.Split("\n");
+        int i = 0;
+        while (i < parts.Count) {
+            string nm = parts[i];
+            nm = nm.Trim();
+            if (nm != "" && nm.Substring(0, 1) != ".") {
+                string root = store + "/" + nm;
+                PiPkgIdxAdd(root + "/src");
+                PiPkgIdxAdd(root + "/stdlib");
+            }
+            i = i + 1;
+        }
     }
 
     // ---- demand-driven pull-in state ----
