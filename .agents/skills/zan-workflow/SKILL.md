@@ -30,7 +30,9 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
   的 `git commit`。为什么：commit 提交的是整个索引，不是"我刚 add 的那几个"——
   共享工作树上其他会话已 `git add` 的在途文件会被一起卷进一个不相干信息的
   提交（实测发生过：一个功能提交把另一会话暂存的十几个 stdlib/IDE 文件
-  全带上了）。发现混入且**确认 HEAD 仍是自己的提交**时：`git reset --soft HEAD~1`
+  全带上了）。**`-F <message文件>` 形式同样危险**——它是"提交整个索引"，
+  不是"提交我 add 的"；带文件名的提交信息更容易让人以为已经限定了范围。
+  发现混入且**确认 HEAD 仍是自己的提交**时：`git reset --soft HEAD~1`
   后按路径重交，他人暂存内容原样保留在索引里。
 - **`reset --soft HEAD~1` 前必须重新核对 `git log -1` 是不是自己的提交**：
   并发会话随时可能在你"发现混入"和"动手拆提交"之间往 main 上再落一个提交
@@ -42,6 +44,27 @@ description: 版本提交与任务管理规范——提交信息格式（scope: 
   即恢复原状——软重置只动 ref，不碰索引和工作树，别人的在途文件毫发无损。
   判定口诀：拆提交前先 `git log -1 --format=%h` 对哈希；哈希不是自己的就
   千万别 reset，改走 `git revert` 自己那部分或与对方会话确认。
+- **污染的提交已经推送出去时，用 plumbing 重建 + `--force-with-lease` 强推**：
+  此时 `reset --soft` 会拆掉别人叠在上面的提交（见上条），不能硬来。配方
+  （全程不动工作树与真实索引，别人的暂存状态毫发无损）：
+  ① 临时索引 `GIT_INDEX_FILE=<scratch>/idx`；`git read-tree <父提交>` 后
+  `git add -- <自己的路径>`、`git write-tree` → `git commit-tree <tree> -p <父> -F <msg>`
+  得到纯净提交；② 别人的提交用 `git merge-tree --write-tree --merge-base=<父>
+  <纯净提交> <对方提交>` 得到合并树（不需要工作树，也不会把对方"顺带改的"
+  文件算进你的提交——**注意 merge-tree 会把对方提交里相对父提交的所有改动
+  都算进去**，要剔除就得自己用 `git update-index --cacheinfo` 定点回填
+  父提交版本）；③ `git commit-tree <合并树> -p <纯净提交> -F <对方原信息>`
+  → `git update-ref refs/heads/main <新提交> <旧提交>`（CAS，失败说明期间有人
+  动过 main，重来）；④ `git push --force-with-lease=refs/heads/main:<旧提交>`
+  强推。坑出处（Procgen 包提交实测）：功能提交把另一会话暂存的 30 个文件卷
+  进来，对方随后又在上面落了一个提交并推送；`reset --soft HEAD~1` 拆掉了
+  对方的提交，最后按上述配方重建两条提交并强推修正，远端与本地归零。
+- **PowerShell 里 `git diff --name-only` 的每行可能带 `\r`**：路径原样传给
+  后续 git 命令会报 `fatal: Not a valid object name <路径>`——**且不中断
+  脚本**（git 的 stderr 无缓冲、stdout 有缓冲，输出顺序还会骗人，看起来像
+  另一个命令报的错）。路径一律先 `-replace "`r",""` 再用；批量循环里逐条
+  校验 `$LASTEXITCODE` 与"预期成功条数"，否则会静默地一个都没改（实测
+  30 个文件全被判成"不存在"而全被删出索引）。
 - **同文件两方都改时，路径限定 add 仍会卷入对方 hunk——按 blob 定点暂存**：
   `git add <路径>` 是整文件粒度，对方在同一文件里未提交的 hunk 会一起进索引。
   配方：工作树保持双方叠加不动，取 `git cat-file -p <父提交>:<路径>`（原始
