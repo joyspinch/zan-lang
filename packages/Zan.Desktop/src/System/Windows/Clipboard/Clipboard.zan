@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 #if MACOS
 using System.Json;
 #endif
@@ -67,6 +68,54 @@ public class Clipboard {
     [DllImport("shell32", EntryPoint = "DragFinish")]
     private static extern void WinDragFinish(nint hdrop);
     #endif
+
+    // ---- 争用重试（Windows 剪贴板是全局独占资源）--------------------
+    //
+    // OpenClipboard 在剪贴板被别人占着时**直接失败**，而争用是**瞬时**
+    // 的：别的应用复制/粘贴、剪贴板管理器轮询、输入法取词，都可能正好
+    // 占着。Windows 官方的用法就是重试若干次再放弃。
+    //
+    // 独占是**按窗口句柄**判的（实测）：持有者挂真实窗口（资源管理器/
+    // IDE/输入法都是这样）时，别人的 OpenClipboard(NULL) 会被拒；两边都
+    // 传 NULL 则互不排斥。所以"造争用"来验证重试时，持有方必须挂真实
+    // 窗口句柄——两边都传 NULL 是撞不上的。
+    //
+    // 不重试的代价是实打实的：一次"写-读"往返要开关剪贴板十几次，
+    // 撞上一次就整条失败——用户看到的是"复制偶尔没反应"，测试看到的
+    // 是"用例偶发红"（本仓库的 conformance_clipboard_roundtrip 就这样
+    // 在别的进程复制东西时红过）。
+    //
+    // 退避：10ms 一拍、最多 30 拍（合计 ~300ms）。超过这个窗口还拿不到，
+    // 就认为剪贴板真的不可用（无交互窗口站点的会话、剪贴板服务被关），
+    // 按老路返回失败/空串。
+    private static int openAttempts = 30;
+    private static int openRetryMs = 10;
+
+    // 打开剪贴板；被别的进程占着就退避重试。成功返回 1（调用方负责
+    // CloseClipboard），彻底拿不到返回 0。
+    private static int WinOpenClipboardRetry() {
+        for (int i = 0; i < Clipboard.openAttempts; i = i + 1) {
+            if (Clipboard.WinOpenClipboard(0) != 0) { return 1; }
+            Thread.Sleep(Clipboard.openRetryMs);
+        }
+        return 0;
+    }
+
+    // 当前会话是否有可用的剪贴板（能打开就说明有）。
+    //
+    // 无交互窗口站点的会话（服务/CI/部分 agent 环境）没有剪贴板：那里
+    // 的读写只会拿到空串，调用方分不清"内容为空"和"根本没有剪贴板"。
+    // 这个探针把两者分开——"真去读剪贴板"的操作可以据此跳过，而不是
+    // 把环境缺失误报成功能坏了。
+    public static bool IsAvailable() {
+        #if WINDOWS
+        if (Clipboard.WinOpenClipboardRetry() == 0) { return false; }
+        Clipboard.WinCloseClipboard();
+        return true;
+        #else
+        return Clipboard.PosixTool() != Clipboard.ToolNone();
+        #endif
+    }
 
     // ---- POSIX 后端（Wayland / X11 / macOS 的剪贴板工具）--------------
 
@@ -311,7 +360,7 @@ public class Clipboard {
     public static string GetText() {
         #if WINDOWS
         if (Clipboard.WinIsClipboardFormatAvailable(13) == 0) { return ""; }
-        if (Clipboard.WinOpenClipboard(0) == 0) { return ""; }
+        if (Clipboard.WinOpenClipboardRetry() == 0) { return ""; }
         nint handle = Clipboard.WinGetClipboardData(13);
         string s = "";
         if (handle != 0) {
@@ -348,7 +397,7 @@ public class Clipboard {
         } finally {
             Wide.Free(wide);
         }
-        if (Clipboard.WinOpenClipboard(0) == 0) {
+        if (Clipboard.WinOpenClipboardRetry() == 0) {
             Clipboard.WinGlobalFree(mem);
             return false;
         }
@@ -369,7 +418,7 @@ public class Clipboard {
     // 清空剪贴板。
     public static void Clear() {
         #if WINDOWS
-        if (Clipboard.WinOpenClipboard(0) != 0) {
+        if (Clipboard.WinOpenClipboardRetry() != 0) {
             Clipboard.WinEmptyClipboard();
             Clipboard.WinCloseClipboard();
         }
@@ -425,7 +474,7 @@ public class Clipboard {
         }
         new Span<ushort>(dst + offset, 1)[0] = 0;   // 末尾的双 NUL
         Clipboard.WinGlobalUnlock(mem);
-        if (Clipboard.WinOpenClipboard(0) == 0) {
+        if (Clipboard.WinOpenClipboardRetry() == 0) {
             Clipboard.WinGlobalFree(mem);
             return false;
         }
@@ -456,7 +505,7 @@ public class Clipboard {
         List<string> list = new List<string>();
         #if WINDOWS
         if (Clipboard.WinIsClipboardFormatAvailable(15) == 0) { return list; }
-        if (Clipboard.WinOpenClipboard(0) == 0) { return list; }
+        if (Clipboard.WinOpenClipboardRetry() == 0) { return list; }
         try {
             nint hdrop = Clipboard.WinGetClipboardData(15);
             if (hdrop != 0) {
@@ -497,7 +546,7 @@ public class Clipboard {
     public static List<int> Formats() {
         List<int> list = new List<int>();
         #if WINDOWS
-        if (Clipboard.WinOpenClipboard(0) == 0) { return list; }
+        if (Clipboard.WinOpenClipboardRetry() == 0) { return list; }
         int fmt = 0;
         bool done = false;
         while (!done) {

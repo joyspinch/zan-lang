@@ -690,16 +690,42 @@
   - 验证：`zanc tests/conformance/web_menu_attrs.zan --auto-stdlib` 编译后逐行
     比对基准**完全一致**（exit=0）。
 
-### [ ] A411 `conformance_clipboard_roundtrip` 在无交互窗口站点的会话里恒红
+### [x] A411 `conformance_clipboard_roundtrip` 在无交互窗口站点的会话里恒红
 
 - 现象：用例输出 `clip-ok: 0`（`bad != 0`），其余 19 条全绿。
-- 根因：**环境**——本会话没有交互窗口站点的剪贴板，实测 PowerShell
-  `Set-Clipboard` 返回成功但 `Get-Clipboard` 读回空串；用例第一步
-  `Clipboard.GetText()` 之后的每一次读写都落在同一个坏剪贴板上。
-  注意同批的 `conformance_clipboard_uri_roundtrip` 是绿的——它只测
-  `FileUri`/`PathFromUri` 编解码，不真碰剪贴板。
-- 方向：用例前置判定剪贴板可用（不可用就跳过并打印 skip 理由），否则在
-  CI/agent/无桌面会话的机器上恒红；真要在无头环境测，得走可注入的剪贴板后端。
+- 原登记的根因（**已推翻**）："**环境**——本会话没有交互窗口站点的剪贴板，
+  实测 PowerShell `Set-Clipboard` 返回成功但 `Get-Clipboard` 读回空串"。**这条
+  读数被误读了**：同一会话后来实测剪贴板完全可用（写入读回一致、SessionId=1、
+  12 个交互窗口），8 条剪贴板用例全绿。"写成功、读回空"不是"没有剪贴板"的
+  证据，而是**争用**的签名——剪贴板是全局独占资源，两个进程同时开会被拒，
+  撞上争用时"写"抢到了、"读"没抢到。
+- 真实根因：**库层没有退避重试**。`Clipboard` 的 `OpenClipboard` 失败就直接
+  返回空串/失败（`GetText`/`SetText`/`GetFiles`/`SetFiles`/`Clear`/`Formats`
+  六个点全是这样），而一次"写-读"往返要开关剪贴板十几次，撞上一次整条就红。
+  另外 Windows 的独占是**按窗口句柄**判的：持有者挂真实窗口（资源管理器/
+  IDE/输入法都是这样）时别人的 `OpenClipboard(NULL)` 会被拒；两边都传 NULL
+  则互不排斥——这正是"看起来偶发"的来源。
+- ✅ 已修（2026-10-20）：
+  1. `packages/Zan.Desktop/src/System/Windows/Clipboard/Clipboard.zan`：
+     新增 `WinOpenClipboardRetry()`（退避 10ms × 30 拍，合计 ~300ms），六个
+     `OpenClipboard` 调用点全部改走它；新增公开的 `Clipboard.IsAvailable()`
+     探针（能打开就说明有剪贴板），把"没有剪贴板"和"内容为空"分开。
+  2. `tests/run_case.cmake`：新增 **skip 约定**——用例只输出一行
+     `SKIP: <理由>` 且退出 0 时，harness 报 SKIPPED 而不是失败（环境缺资源
+     不该算被测代码的错）。
+  3. `tests/conformance/clipboard_roundtrip.zan`：先 `IsAvailable()` 判定，
+     不具备就打印 skip 理由跳过（原来在无头机器上恒红）。
+- 新增回归：`tests/conformance/clipboard_contention.zan`（+ `.out`）——起一个
+  子进程用**真实窗口句柄**占住剪贴板，父进程在它占着的时候 SetText +
+  GetText 必须成功；用例自带前提自证（裸 `OpenClipboard` 必须失败，否则
+  说明没真占住，按 skip 走而不算通过）。**实测能抓住缺陷**：把重试次数临时
+  降到 1（≈不重试）时用例输出 `clip-contention-ok: 0`（红），恢复 30 后
+  5/5 绿。
+- 验证：ctest `-R clipboard` **12/12 全绿**（conformance / determinism /
+  leakcheck / arcguard × contention / roundtrip / uri_roundtrip）。
+- 教训：**"读不到"要先分清是哪一种**——能力探针（能打开就是有）比"读一次
+  看是不是空"可靠；把一次争用当成"环境缺失"登记成环境问题，会让真缺陷一直
+  躺在"环境问题"里没人修。
 
 ### [x] A412 三条 conformance 用例运行期 Access violation（崩溃，不是断言失败）
 

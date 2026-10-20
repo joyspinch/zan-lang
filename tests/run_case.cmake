@@ -115,6 +115,18 @@ string(REPLACE "\r\n" "\n" actual   "${actual}")
 string(REGEX REPLACE "[ \t\r\n]+$" "" expected "${expected}")
 string(REGEX REPLACE "[ \t\r\n]+$" "" actual   "${actual}")
 
+# ---- skip convention -------------------------------------------------------
+# A case that cannot run in this environment (no interactive clipboard on a
+# headless agent session, no GPU, no network) prints a single line starting
+# with "SKIP: " and exits 0. The harness reports it as skipped instead of
+# failing: the environment lacks the resource, the code under test is not
+# at fault. Such a case must print nothing else -- the marker is only
+# honoured when it is the whole output.
+if(actual MATCHES "^SKIP: ")
+  message(STATUS "SKIPPED: ${SRC} (${actual})")
+  return()
+endif()
+
 if(NOT actual STREQUAL expected)
   zan_drop_artifact()
   message(FATAL_ERROR

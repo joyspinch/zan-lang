@@ -1,0 +1,115 @@
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Threading;
+using System.Windows.Clipboard;
+
+namespace Conf;
+
+// 剪贴板争用回归（Windows 后端）。
+//
+// 剪贴板是**全局独占**资源：别的进程开着时 OpenClipboard 直接失败。
+// 争用是**瞬时**的——别的应用复制/粘贴、剪贴板管理器轮询、输入法取词，
+// 都会正好占着。一次"写-读"往返要开关剪贴板十几次，撞上一次整条就红。
+// 所以实现必须退避重试，不能一次失败就返回空串/失败。
+//
+// 用例：起一个子进程占住剪贴板（子进程用 marker 文件报告"已占住"），
+// 父进程在它占着的时候 SetText + GetText——必须成功。没有退避重试时
+// 这里必然失败（OpenClipboard 直接返回 0）。
+//
+// 判定要求子进程**确实报"已占住"**：占不住（拿不到剪贴板）时本用例
+// 证明不了任何事，按 skip 走，不能算通过。
+class Prog {
+    #if WINDOWS
+    [DllImport("user32", EntryPoint = "OpenClipboard")]
+    static extern int HoldOpen(nint hwnd);
+    [DllImport("user32", EntryPoint = "CloseClipboard")]
+    static extern int HoldClose();
+    [DllImport("kernel32", EntryPoint = "GetConsoleWindow")]
+    static extern nint GetConsoleWindow();
+    [DllImport("user32", EntryPoint = "GetDesktopWindow")]
+    static extern nint GetDesktopWindow();
+    #endif
+
+    // 等 marker 文件出现**且内容写完**（只看存在会读到半截的空文件）。
+    static string WaitForMarker(string path, int timeoutMs) {
+        long until = Stopwatch.GetMilliseconds() + timeoutMs;
+        while (Stopwatch.GetMilliseconds() < until) {
+            if (File.Exists(path)) {
+                string text = File.ReadAllText(path);
+                if (text.Length > 0) { return text; }
+            }
+            Thread.Sleep(5);
+        }
+        return "";
+    }
+
+    static void Main() {
+        #if WINDOWS
+        // ---- 子进程模式：占住剪贴板一段时间 ----
+        if (Environment.ArgCount() > 1 && Environment.ArgAt(0) == "--hold") {
+            string marker = Environment.ArgAt(1);
+            int holdMs = Convert.ToInt32(Environment.ArgAt(2));
+            // 用**真实窗口句柄**占住剪贴板：两边都传 NULL 时，Windows 判
+            // "同一个窗口"而放行，别的进程照样能开——只有持有者挂真实
+            // 窗口（资源管理器/IDE/输入法都是这样）才会真的互斥。
+            nint owner = GetDesktopWindow();
+            if (HoldOpen(owner) != 0) {
+                File.WriteAllText(marker, "held");
+                Thread.Sleep(holdMs);
+                HoldClose();
+            } else {
+                File.WriteAllText(marker, "failed");
+            }
+            Environment.Exit(0);
+        }
+
+        // ---- 父进程：子进程占着的时候读写剪贴板 ----
+        if (!Clipboard.IsAvailable()) {
+            Console.WriteLine("SKIP: no interactive clipboard in this session");
+            return;
+        }
+        int bad = 0;
+        string original = Clipboard.GetText();
+        bool hadText = Clipboard.HasText();
+        string marker = Path.Combine(Environment.ExeDir(),
+                                     "clipboard-contention-holder.txt");
+        File.Delete(marker);
+        List<string> args = new List<string>();
+        args.Add("--hold");
+        args.Add(marker);
+        args.Add(Convert.ToString(400));
+        string self = Environment.ProcessPath;
+        bool started = Process.StartDetachedSafe(self, args) == 0;
+        string state = started ? Prog.WaitForMarker(marker, 5000) : "";
+        if (state != "held") {
+            // 没占住（子进程没起来 / 拿不到剪贴板）：本用例证明不了任何事。
+            Console.WriteLine("SKIP: could not hold the clipboard for contention"
+                + " (state=" + state + ")");
+            if (File.Exists(marker)) { File.Delete(marker); }
+            return;
+        }
+        // 前提自证：此刻剪贴板必须**真的被锁住**（裸 OpenClipboard 失败）。
+        // 锁不住说明子进程已经放开（或压根没独占），下面的重试就没被考到。
+        if (HoldOpen(0) != 0) {
+            HoldClose();
+            Console.WriteLine("SKIP: clipboard was not locked by the holder");
+            if (File.Exists(marker)) { File.Delete(marker); }
+            return;
+        }
+        // 子进程正占着剪贴板：靠退避重试必须能拿到。
+        string unique = "zan-clip-contention-" + Convert.ToString(ProcessList.SelfPid());
+        if (!Clipboard.SetText(unique)) { bad = bad + 1; }
+        if (Clipboard.GetText() != unique) { bad = bad + 1; }
+        // 收尾：等子进程放开、还原原内容、清 marker。
+        Thread.Sleep(500);
+        if (File.Exists(marker)) { File.Delete(marker); }
+        if (hadText) { Clipboard.SetText(original); } else { Clipboard.Clear(); }
+        Console.WriteLine("clip-contention-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        #else
+        // POSIX 侧剪贴板没有"独占打开"这回事（wl-copy/xclip 各自持有
+        // 选区），争用退避无从谈起——这条只约束 Windows 后端。
+        Console.WriteLine("SKIP: clipboard contention is a Windows-only concern");
+        #endif
+    }
+}
