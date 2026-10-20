@@ -81,6 +81,28 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ② 游戏 UI 本质即 GUI 皮肤化：游戏世界视口（`GameViewport`）作为 GUI 控件树中的内容节点，上层 HUD、背包、血条、技能栏直接复用标准 GUI 控件（`Button`/`ProgressBar`/`Panel`/`Flex`），视觉差异纯粹通过 CSS 类、主题贴图与九宫格边框（Border-Image）实现；
   ③ 实体强类型与 Enum 规范：高频渲染、设计器文档模型与动作分发全面采用强类型实体（如 `SceneActionBinding`、`FieldPositionMode`、`SceneAnchor`）替代动态弱类型字典或通用 `JsonValue` 解包，彻底根除高频帧循环中的哈希查找与堆内存浪费；`JsonValue` 仅作为磁盘持久化边缘的序列化载体。
 - **stdlib/Gui 界面禁止自绘**，全部用标准库控件与布局原语完成。
+- **GUI 控件的样式解析与类型身份只有一条路**：
+  ① **样式解析走基类入口**：控件解析自己的外观用 `Control.Box(app)` /
+     `BoxState(app, state)`；借用别的类型的外观用
+     `ResolveStyleAs(app, type, cls, state)`；**部件表面**（列表行、树行、
+     滚动条轨道、弹层、分割线）用 `BareBox(app, type, state)` 取**裸基线**
+     ——裸基线不带本控件的 Class、不带 id、不套行内覆盖：套上会串味
+     （列表写成 `.primary` 就把每一行都染成主色）。控件实例方法里直调
+     `Style.Of` / `Style.Full` 一律算违规（门禁：组件契约审计脚本的
+     R4 规则）；静态 helper 没有 `this`，解析显式的（类型, 类）组合
+     不算违规。
+  ② **内联 style（`SetProp("style", ...)`）分两半**：视觉键（背景/颜色/
+     圆角）在**解析时重放**进样式盒，控件上不留第二份副本——替换原文后
+     旧值不留残影；布局键（width/height/pad/gap）**必须即时落控件**——
+     样式盒里的 width 只影响画出来的那张面，撑不开控件的槽位，漏了这一段
+     就是"写了等于没写"（坑出处：内联通道改成"解析时重放"时把布局键
+     一起丢了，`style="width:88px"` 失效，回归用例 `gui_field_style` 变红）。
+  ③ **控件的 kind 名单三处副本要对得上**：运行期重建注册表
+     （`ControlBootstrap.Names` + 各族 bootstrap）、编译期限定名单
+     （`GenForm.IsStdWidgetKind` / `IsHmiKind`）、控件自己声明的 `Kind()`。
+     少一处就出两种症状：按 kind 重建拿到 null，或生成代码发裸名、用户
+     项目的同名全局类压过 stdlib（坑出处：`Row`/`Spacer`/`FormGroup`/
+     `FormItem`/`Modal`/`Drawer` 在注册表里却不在编译期名单）。
 - **窗口程序开发铁律：UI 线程专职渲染与事件派发，业务/IO/计算绝对异步解耦非阻塞**：
   ① **职责唯一性约束**：UI 线程（主事件消息泵）核心使命是保持 60/120Hz 丝滑响应，只负责系统输入事件分发与界面排版绘制（Layout -> Paint -> Present），单次事件或帧处理耗时红线严禁超过 2ms；
   ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；
