@@ -533,6 +533,51 @@ conformance `test_mocks`（实参规范化含 null 归一、六种匹配器、�
 double 相等依赖格式化一致；`Sequence<T>` 用完重复末值；`TaskStub.Pending`
 会留下挂起协程。
 
+### 1.15 描述统计与图表桥：`Zan.DataFrame` + `Zan.Gui.Charts`
+
+**不新建平行包**：统计是对"一列数值"的加工，列是 `DataFrame` 的原生概念；
+绘图侧已有 `Zan.Gui.Charts`（164 文件，ECharts 全套）。两个已有包各扩一层，
+中间不夹新包。
+
+**缺口（实测）**：`Zan.DataFrame` 5 个文件 20 个方法，只有
+`Filter`/`SortBy`/`GroupBy`+`Aggregate`(4 op)/`Join`(单键内连接)；
+`Zan.Gui.Charts` 的数据入口是 `ChartJsonDataset`（`JsonValue` 源），
+与 `DataFrame` 之间**没有桥**——"算出统计结果"和"画成图"分属两个世界，
+中间要手写 source 数组 + 类目轴 + 系列数据。两端都有，中间断了。
+
+| 文件 | 位置 | 内容 |
+|---|---|---|
+| `Stats.zan` | `packages/Zan.DataFrame/src/System/Data/` | `Stats`：Mean / Median / Percentile（线性插值）/ Min / Max / Range / Variance / SampleVariance / StdDev / SampleStdDev / Skewness / Kurtosis / Correlation / SortedCopy |
+| `DataFrame.Stats.zan` | 同上 | `DataFrameStats`：列 → 数值序列 → 统计；`Column` 做唯一的类型转换点（Int/Float 直取，Str 按 strtod 前缀） |
+| `ChartBridge.zan` | `packages/Zan.Gui.Charts/src/Gui/Component/Chart/` | `ChartBridge`：`ToDataset`（DataFrame → `ChartJsonDataset`，首行表头）/ `CategorySeries` / `CategoryAxis` / `ValueSeries` / `GroupedSeries`（一表多系列，分组保序）/ `AddSeries` / `AddGrouped`（挂到 `ChartOption`） |
+
+**四条硬取舍**：
+
+1. **依赖方向是 `Gui.Component.Chart → System.Data`，不是反过来**。
+   实测：图表侧多带 `System.Data` 只多 19 个编译单元（337 → 356），
+   反过来让 `System.Data` 依赖图表要多带 297 个——数据层不该知道图表
+   存在。
+2. **桥直接填 `series.data`，不走 dataset 自动绑定**。ECharts 的
+   dataset→series 绑定发生在 option **解析期**（`ChartOption.FromJsonValue`），
+   程序化构造的 `ChartOption` 不走那条路。桥填的是渲染器真正读的
+   `cs.data`。
+3. **统计的边界语义显式定死**：空集返回 0.0（不抛——聚合查询里空组很
+   常见）；常量序列的偏度/峰度返回 0 而非 NaN（NaN 会污染下游图表）；
+   分位数用线性插值（与 numpy 默认一致）。
+4. **数值走 `ChartData.Numeric`（double）不走整数道**。整数道会把小数
+   抹平（`SeriesFrac` 判定为假），小数项在系列里有专门的定点通道。
+
+conformance `analytics_bridge`（统计的已知值核对与边界语义、
+`SortedCopy` 不改入参、相关系数的正/负/常量三种情形、DataFrame 统计
+入口与缺列语义、DataFrame → dataset 的表头形态与行号表、DataFrame →
+系列/类目轴、一表多系列的分组保序、小数不被截断、option 组合与已有
+类目轴不覆盖、缺列抛异常、空表桥接不崩）。
+
+**已知边界**：无透视表/多级索引/时序重采样/滑动窗口/缺失值处理
+（pandas 的重头戏，见 §2 待补）；`GroupedSeries` 只做等值分组，不做
+区间分箱；`ToDataset` 的 Str 列不隐式转数值（列建错类型不会被静默
+修正）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）

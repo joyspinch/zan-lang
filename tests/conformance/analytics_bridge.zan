@@ -1,0 +1,240 @@
+// 描述统计（System.Data.Stats）+ DataFrame 统计入口 + 图表桥
+// （Gui.Component.Chart.ChartBridge）。
+//
+// 覆盖：均值/中位数/分位（线性插值）/方差/标准差/样本方差/偏度/
+// 峰度/相关系数/极差；空集与单元素集的边界语义；DataFrame 列到数值
+// 的转换规则；DataFrame → ChartJsonDataset 的表头形态与行号表；
+// DataFrame → 系列/类目轴；一表多系列的分组保序；小数不被截断；
+// 缺列抛异常。
+using System;
+using System.Data;
+using Gui.Component.Chart;
+
+namespace Conf;
+
+class Prog {
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 定点打印：避免 double 的最短往返格式在不同平台漂移。
+    static string F(double v, int digits) {
+        double scale = 1.0;
+        for (int i = 0; i < digits; i = i + 1) { scale = scale * 10.0; }
+        double r = Math.Round(v * scale) / scale;
+        if (r == 0.0) { r = 0.0; }  // 消 -0
+        return Convert.ToString(r);
+    }
+
+    static int Run() {
+        int bad = 0;
+
+        // ---- 1. 基础统计 ----
+        List<double> xs = new List<double>();
+        xs.Add(2.0); xs.Add(4.0); xs.Add(4.0); xs.Add(4.0);
+        xs.Add(5.0); xs.Add(5.0); xs.Add(7.0); xs.Add(9.0);
+        Console.WriteLine("mean=" + F(Stats.Mean(xs), 6));
+        Console.WriteLine("median=" + F(Stats.Median(xs), 6));
+        Console.WriteLine("p0=" + F(Stats.Percentile(xs, 0.0), 6));
+        Console.WriteLine("p25=" + F(Stats.Percentile(xs, 0.25), 6));
+        Console.WriteLine("p50=" + F(Stats.Percentile(xs, 0.5), 6));
+        Console.WriteLine("p75=" + F(Stats.Percentile(xs, 0.75), 6));
+        Console.WriteLine("p100=" + F(Stats.Percentile(xs, 1.0), 6));
+        Console.WriteLine("var=" + F(Stats.Variance(xs), 6));
+        Console.WriteLine("svar=" + F(Stats.SampleVariance(xs), 6));
+        Console.WriteLine("std=" + F(Stats.StdDev(xs), 6));
+        Console.WriteLine("sstd=" + F(Stats.SampleStdDev(xs), 6));
+        Console.WriteLine("min=" + F(Stats.Min(xs), 6) + " max=" + F(Stats.Max(xs), 6)
+        + " range=" + F(Stats.Range(xs), 6));
+
+        // 已知值核对：均值 5；中位数 4.5（偶数个取中间两值平均）。
+        if (Math.Abs(Stats.Mean(xs) - 5.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(Stats.Median(xs) - 4.5) > 1e-9) { bad = bad + 1; }
+        // 总体方差 4；样本方差 32/7。
+        if (Math.Abs(Stats.Variance(xs) - 4.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(Stats.SampleVariance(xs) - 32.0 / 7.0) > 1e-9) { bad = bad + 1; }
+        // p25 线性插值：位置 0.25×7 = 1.75 → 4 + (4-4)×0.75 = 4。
+        if (Math.Abs(Stats.Percentile(xs, 0.25) - 4.0) > 1e-9) { bad = bad + 1; }
+        // p75：位置 0.75×7 = 5.25 → 5 + (7-5)×0.25 = 5.5。
+        if (Math.Abs(Stats.Percentile(xs, 0.75) - 5.5) > 1e-9) { bad = bad + 1; }
+
+        // ---- 2. 边界：空集 / 单元素 / 常量列 ----
+        List<double> empty = new List<double>();
+        Console.WriteLine("empty mean=" + F(Stats.Mean(empty), 6)
+        + " median=" + F(Stats.Median(empty), 6)
+        + " std=" + F(Stats.StdDev(empty), 6)
+        + " var=" + F(Stats.Variance(empty), 6)
+        + " p50=" + F(Stats.Percentile(empty, 0.5), 6));
+        List<double> one = new List<double>();
+        one.Add(3.5);
+        Console.WriteLine("one mean=" + F(Stats.Mean(one), 6)
+        + " median=" + F(Stats.Median(one), 6)
+        + " std=" + F(Stats.StdDev(one), 6)
+        + " svar=" + F(Stats.SampleVariance(one), 6));
+        List<double> same = new List<double>();
+        same.Add(2.0); same.Add(2.0); same.Add(2.0);
+        Console.WriteLine("same std=" + F(Stats.StdDev(same), 6)
+        + " skew=" + F(Stats.Skewness(same), 6)
+        + " kurt=" + F(Stats.Kurtosis(same), 6));
+        if (Stats.Mean(empty) != 0.0) { bad = bad + 1; }
+        if (Stats.StdDev(empty) != 0.0) { bad = bad + 1; }
+        if (Math.Abs(Stats.Mean(one) - 3.5) > 1e-9) { bad = bad + 1; }
+        if (Stats.StdDev(one) != 0.0) { bad = bad + 1; }
+        // 常量序列：偏度/峰度无定义，返回 0 而不是 NaN（NaN 会污染下游图表）。
+        if (Stats.Skewness(same) != 0.0) { bad = bad + 1; }
+        if (Stats.Kurtosis(same) != 0.0) { bad = bad + 1; }
+
+        // ---- 3. 偏度 / 峰度 / 相关系数 ----
+        // 对称分布偏度为 0。
+        List<double> sym = new List<double>();
+        sym.Add(1.0); sym.Add(2.0); sym.Add(3.0); sym.Add(4.0); sym.Add(5.0);
+        Console.WriteLine("sym skew=" + F(Stats.Skewness(sym), 6));
+        if (Math.Abs(Stats.Skewness(sym)) > 1e-9) { bad = bad + 1; }
+        // 完全正相关 → 1；完全负相关 → -1；常量序列 → 0。
+        List<double> a = new List<double>();
+        List<double> b = new List<double>();
+        List<double> c = new List<double>();
+        a.Add(1.0); a.Add(2.0); a.Add(3.0);
+        b.Add(2.0); b.Add(4.0); b.Add(6.0);
+        c.Add(5.0); c.Add(5.0); c.Add(5.0);
+        Console.WriteLine("corr+=" + F(Stats.Correlation(a, b), 6)
+        + " corr-=" + F(Stats.Correlation(a, c), 6)
+        + " corrSelf=" + F(Stats.Correlation(a, a), 6));
+        if (Math.Abs(Stats.Correlation(a, b) - 1.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(Stats.Correlation(a, a) - 1.0) > 1e-9) { bad = bad + 1; }
+        if (Stats.Correlation(a, c) != 0.0) { bad = bad + 1; }
+
+        // ---- 4. SortedCopy 不改动入参 ----
+        List<double> orig = new List<double>();
+        orig.Add(3.0); orig.Add(1.0); orig.Add(2.0);
+        List<double> sorted = Stats.SortedCopy(orig);
+        Console.WriteLine("sorted=" + F(sorted[0], 6) + "," + F(sorted[1], 6)
+        + "," + F(sorted[2], 6) + " orig0=" + F(orig[0], 6));
+        if (orig[0] != 3.0) { bad = bad + 1; }
+        if (sorted[0] != 1.0 || sorted[2] != 3.0) { bad = bad + 1; }
+
+        // ---- 5. DataFrame 统计入口 ----
+        DataFrame df = DataFrame.FromCsv(
+        "city,sales,group\n"
+        + "a,10,x\n"
+        + "b,20,y\n"
+        + "c,15,x\n");
+        Console.WriteLine("df rows=" + df.Rows() + " cols=" + df.ColCount());
+        Console.WriteLine("df mean=" + F(DataFrameStats.Mean(df, "sales"), 6)
+        + " median=" + F(DataFrameStats.Median(df, "sales"), 6)
+        + " p50=" + F(DataFrameStats.Percentile(df, "sales", 0.5), 6)
+        + " std=" + F(DataFrameStats.StdDev(df, "sales"), 6)
+        + " min=" + F(DataFrameStats.Min(df, "sales"), 6)
+        + " max=" + F(DataFrameStats.Max(df, "sales"), 6)
+        + " range=" + F(DataFrameStats.Range(df, "sales"), 6));
+        if (Math.Abs(DataFrameStats.Mean(df, "sales") - 15.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(DataFrameStats.Median(df, "sales") - 15.0) > 1e-9) { bad = bad + 1; }
+        // 缺列：统计入口返回 0（不抛）——聚合查询里空列是常见情况。
+        Console.WriteLine("df missing mean=" + F(DataFrameStats.Mean(df, "nope"), 6));
+        if (DataFrameStats.Mean(df, "nope") != 0.0) { bad = bad + 1; }
+
+        // ---- 6. DataFrame → ChartJsonDataset ----
+        ChartJsonDataset ds = ChartBridge.ToDataset(df, "d");
+        Console.WriteLine("ds hdr=" + ds.HdrRows() + " rows=" + ds.RowCount()
+        + " width=" + ds.Width() + " noHdr=" + (ds.noHdr ? "1" : "0"));
+        Console.WriteLine("ds h0=" + ds.Header(0) + " h1=" + ds.Header(1) + " h2=" + ds.Header(2));
+        Console.WriteLine("ds num(0,1)=" + F(ds.Num(0, 1), 6)
+        + " num(1,1)=" + F(ds.Num(1, 1), 6)
+        + " num(2,1)=" + F(ds.Num(2, 1), 6));
+        Console.WriteLine("ds text(0,0)=" + ds.Text(0, 0) + " text(2,0)=" + ds.Text(2, 0));
+        // 表头行占 1 行，数据行 3 行。
+        if (ds.HdrRows() != 1) { bad = bad + 1; }
+        if (ds.RowCount() != 3) { bad = bad + 1; }
+        if (ds.Width() != 3) { bad = bad + 1; }
+        if (ds.noHdr) { bad = bad + 1; }
+        if (ds.Header(0) != "city" || ds.Header(1) != "sales") { bad = bad + 1; }
+        if (Math.Abs(ds.Num(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+        if (ds.Text(0, 0) != "a") { bad = bad + 1; }
+
+        // ---- 7. DataFrame → 系列 + 类目轴 ----
+        ChartSeries cs = ChartBridge.CategorySeries(df, "S", "city", "sales", ChartType.Bar);
+        Console.WriteLine("series name=" + cs.name + " n=" + cs.data.Count);
+        for (int i = 0; i < cs.data.Count; i = i + 1) {
+            Console.WriteLine("  item " + i + " val=" + cs.data[i].val
+            + " nm=" + cs.data[i].name);
+        }
+        if (cs.data.Count != 3) { bad = bad + 1; }
+        if (cs.data[0].name != "a" || cs.data[0].val != 10) { bad = bad + 1; }
+        if (cs.data[2].name != "c" || cs.data[2].val != 15) { bad = bad + 1; }
+
+        ChartAxis ax = ChartBridge.CategoryAxis(df, "city");
+        Console.WriteLine("axis n=" + ax.categories.Count
+        + " c0=" + ax.categories[0] + " c1=" + ax.categories[1]
+        + " c2=" + ax.categories[2]);
+        if (ax.categories.Count != 3) { bad = bad + 1; }
+        if (ax.categories[0] != "a" || ax.categories[2] != "c") { bad = bad + 1; }
+
+        // ---- 8. 一表多系列（分组保序）----
+        List<ChartSeries> gs = ChartBridge.GroupedSeries(df, "group", "city", "sales", ChartType.Bar);
+        Console.WriteLine("grouped n=" + gs.Count);
+        for (int i = 0; i < gs.Count; i = i + 1) {
+            Console.WriteLine("  s" + i + " name=" + gs[i].name + " n=" + gs[i].data.Count);
+            for (int j = 0; j < gs[i].data.Count; j = j + 1) {
+                Console.WriteLine("    nm=" + gs[i].data[j].name
+                + " val=" + gs[i].data[j].val);
+            }
+        }
+        // 分组按首次出现顺序：x 先出现（行 0），y 后（行 1）。
+        if (gs.Count != 2) { bad = bad + 1; }
+        if (gs[0].name != "x" || gs[1].name != "y") { bad = bad + 1; }
+        if (gs[0].data.Count != 2 || gs[1].data.Count != 1) { bad = bad + 1; }
+
+        // ---- 9. 小数不被截断 ----
+        DataFrame dfr = DataFrame.FromCsv("k,v\na,10.5\nb,20.25\n");
+        ChartSeries sr = ChartBridge.CategorySeries(dfr, "R", "k", "v", ChartType.Line);
+        Console.WriteLine("frac number0=" + F(sr.data[0].number, 6)
+        + " number1=" + F(sr.data[1].number, 6)
+        + " frac=" + (sr.SeriesFrac(0) ? "1" : "0"));
+        if (Math.Abs(sr.data[0].number - 10.5) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(sr.data[1].number - 20.25) > 1e-9) { bad = bad + 1; }
+        if (!sr.SeriesFrac(0)) { bad = bad + 1; }
+
+        // ---- 10. option 组合 ----
+        ChartOption opt = new ChartOption();
+        ChartBridge.AddGrouped(opt, df, "group", "city", "sales", ChartType.Bar);
+        Console.WriteLine("opt series=" + opt.series.Count
+        + " xaxes=" + opt.xAxes.Count + " yaxes=" + opt.yAxes.Count
+        + " xcat0=" + opt.xAxes[0].categories[0]);
+        if (opt.series.Count != 2) { bad = bad + 1; }
+        if (opt.xAxes.Count != 1 || opt.yAxes.Count != 1) { bad = bad + 1; }
+        if (opt.xAxes[0].categories[0] != "a") { bad = bad + 1; }
+
+        // 已有类目轴时不覆盖。
+        ChartOption opt2 = new ChartOption();
+        opt2.xAxes.Add(ChartAxis.Category(new List<string>()));
+        ChartBridge.AddGrouped(opt2, df, "group", "city", "sales", ChartType.Bar);
+        Console.WriteLine("opt2 xaxes=" + opt2.xAxes.Count
+        + " xcat0n=" + opt2.xAxes[0].categories.Count);
+        if (opt2.xAxes.Count != 1) { bad = bad + 1; }
+        if (opt2.xAxes[0].categories.Count != 0) { bad = bad + 1; }
+
+        // ---- 11. 缺列抛异常 ----
+        int threw = 0;
+        try {
+            ChartBridge.CategorySeries(df, "S", "nope", "sales", ChartType.Bar);
+        } catch (Exception e) {
+            threw = 1;
+            Console.WriteLine("missing col: " + e.ToString());
+        }
+        if (threw != 1) { bad = bad + 1; }
+
+        // 空表桥接不崩。
+        DataFrame emptyDf = DataFrame.New();
+        ChartJsonDataset eds = ChartBridge.ToDataset(emptyDf, "e");
+        Console.WriteLine("empty ds rows=" + eds.RowCount() + " width=" + eds.Width());
+        if (eds.RowCount() != 0) { bad = bad + 1; }
+
+        Console.WriteLine("analytics-bridge-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

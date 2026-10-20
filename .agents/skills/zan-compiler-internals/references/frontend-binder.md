@@ -30,7 +30,39 @@
   Lambda 表达式和局部函数捕获外部局部变量时，捕获的是变量的存储单元（Cell），以便在闭包内外实现共享修改。对闭包对象的保活必须遵循引用计数协议。
 - **可空分析穿透复合控制流**：
   在进行可空性检查（Nullability Check）和空值守卫扫描时，静态分析必须穿透 `lock` 等同步块语句，同时核验锁体内外表达式与返回语句，避免误报合法的空值守卫逻辑。
-## 5. 前端模糊测试的 harness 纪律
+## 5. 命名空间解析与包依赖（nsresolve）
+
+- **只有 `using` 能解析包内类型，限定名不行**：
+  同一命名空间树在 `stdlib/` 与 `packages/` 下各有提供者时，
+  `System.Data.DataFrame`（限定名）报 `undefined type`，
+  `using System.Data;` 后写 `DataFrame` 才行。
+  但 `stdlib/` 下的限定名**可以**用（`System.Text.StringBuilder` 正常）。
+  - 坑出处：写包间桥接时误以为限定名能省掉 `using`，结果编译不过，
+    一度以为桥必须放在使用方包里。
+  - 动作：跨包引用一律用 `using`，别赌限定名。
+- **`using <命名空间>;` 是"整棵命名空间树"级加载，不是按文件**：
+  `using System.Data;` 会把 `Zan.Data`（12 个顶层文件，含
+  `DbValues` → `System.Data.Orm` → `System.Data.Sqlite`）与
+  `Zan.DataFrame` 一起拉进来。编译单元数会从 12 涨到 33。
+  - 注意这只是**源码**被拉进来（`SqliteConnector` 这类类型可解析）；
+    原生驱动（`sqlite3`）是 `--publish` 时按 `driver.manifest` 打包的，
+    普通编译不链。
+  - 判定依赖代价的方法：拿"只用某命名空间"的最小程序编译，看
+    `Compiled N files` 的 N。
+- **依赖方向要用编译单元数定量，不能凭直觉**：
+  实测 `Gui.Component.Chart` 依赖 `System.Data` 只多 19 个单元
+  （337 → 356）；反向让 `System.Data` 依赖图表要多 297 个。
+  - 判定：把桥放在**消费方**包（图表侧），让基础包不感知上层。
+- **同一命名空间树可被多个包提供**：`using System.Data;` 同时命中
+  `Zan.Data` 与 `Zan.DataFrame`，类型名冲突会在 checker 期报
+  `undefined type`（不是重载歧义）。新增类型前要确认该命名空间下
+  其它包没有同名类。
+- **`ZANPKG_MISSING namespace=...` 是警告不是错误**：
+  缺 `System/Text/Json`、`Gui/Styling` 等子命名空间时仍能编译通过
+  （子命名空间按需加载），但对应能力不可用。看到这行要确认
+  缺的是不是自己依赖的能力。
+
+## 6. 前端模糊测试的 harness 纪律
 
 - **harness 必须和被测程序一样预留大栈**：编译 fuzz harness 时带上与 `zanc`
   一致的栈预留（Windows MSVC 目标：`-Xlinker /STACK:33554432`；GNU ld：

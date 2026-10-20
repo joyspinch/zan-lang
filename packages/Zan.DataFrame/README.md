@@ -10,6 +10,8 @@ Zan.Data 共存。
 - `System.Data` — `DataFrame`（列存 + 查询原语）、`DataCol`、
   `RowGroup`、`ColKind`/`Agg` 枚举（CSV 的 `Csv`/`CsvTable` 已迁至
   `packages/Zan.Csv` 的 `System.Csv`）
+- `System.Data` — `Stats`（描述统计：均值/中位数/分位/方差/标准差/
+  偏度/峰度/相关系数）、`DataFrameStats`（按列名取统计的入口）
 
 ## 快速上手
 
@@ -42,12 +44,36 @@ string text = big.ToCsv();                          // 往返无损
   撞名时加 `_1` 后缀。
 - **GroupBy**：返回的 `RowGroup` 持原表行号，配 `Sum/Avg/Min/Max/
   Count`（`Aggregate`）使用；组按键首次出现顺序排列。
+- **描述统计**（`Stats`）：吃 `List<double>`（已解析的数值列），
+  不自己认列类型——列到数值的转换由 `DataFrameStats.Column` 统一做
+  （Int/Float 直取，Str 按 strtod 前缀），转换点只有一处。
+  边界语义：空集返回 0.0（聚合查询里空组很常见，不抛）；常量序列的
+  偏度/峰度返回 0 而非 NaN（NaN 会污染下游图表）；分位数用线性插值
+  （与 numpy 默认一致）。
+
+## 快速上手（统计）
+
+```zan
+using System.Data;
+
+DataFrame sales = DataFrame.FromCsv(File.ReadAllText("sales.csv"));
+double med  = DataFrameStats.Median(sales, "price");       // 中位数
+double p90  = DataFrameStats.Percentile(sales, "price", 0.9);
+double std  = DataFrameStats.StdDev(sales, "price");
+double corr = DataFrameStats.Correlation(sales, "qty", "price");
+
+// 也可直接吃数值序列（不经过 DataFrame）：
+List<double> xs = new List<double>();
+xs.Add(2.0); xs.Add(4.0); xs.Add(9.0);
+double m = Stats.Median(xs);
+```
 
 ## 消费者
 
 - `packages/Zan.Desktop` 的 `TaskScheduler.ParseCsv`（schtasks
   CSV 输出行解析，经 `Zan.Csv` 的 `Csv.ParseRow`）
 - 需要表格数据解析的任何程序（报表、日志归并、数据导出）
+- `packages/Zan.Gui.Charts` 的 `ChartBridge`（DataFrame → 图表数据）
 
 ## 已知边界
 
@@ -56,3 +82,5 @@ string text = big.ToCsv();                          // 往返无损
   long 累加避免精度损失）。
 - 数值形态识别是严格的（可选符号 + 数字 [+ 小数部分] [+ 指数]），
   带 BOM/空白/千分位的字段按文本列处理。
+- 无透视表/多级索引/时序重采样/滑动窗口/缺失值处理——统计只覆盖
+  "单列数值的集中趋势与离散度"，表级变换尚未落地。

@@ -1,0 +1,201 @@
+using System;
+
+namespace System.Data;
+
+// 描述统计：单列数值的集中趋势与离散度。
+//
+// 为什么放在这里而不是新起一个包：统计是对"一列数值"的加工，列是
+// DataFrame 的原生概念；独立包会让调用方为了算个中位数先把表搬过去。
+// 绘图侧（ChartBridge）在 Zan.Gui.Charts，两边共用同一列语义。
+//
+// 全部函数吃 List<double>（已解析好的数值列），不自己认列类型——
+// 列到数值的转换由调用方按 ColKind 决定（Int/Float 直接取，
+// Str 列要不要解析是调用方的判断，不是统计的判断）。
+//
+// 空集与单元素集的语义：空集返回 0.0（不抛异常——聚合类查询里空组很常见，
+// 抛异常会让 GroupBy+Agg 的调用方到处写 try）；单元素集的方差/标准差
+// 为 0.0（无离散度）。分位数用线性插值（与 numpy 默认一致）。
+
+public class Stats {
+    // 算术平均。空集返回 0.0。
+    public static double Mean(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        double sum = 0.0;
+        for (int i = 0; i < xs.Count; i = i + 1) { sum = sum + xs[i]; }
+        return sum / (double)xs.Count;
+    }
+
+    // 中位数。偶数个取中间两值的平均（插值），奇数个取正中值。
+    // 空集返回 0.0。
+    public static double Median(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        List<double> s = Stats.SortedCopy(xs);
+        int n = s.Count;
+        int mid = n / 2;
+        if (n % 2 == 1) { return s[mid]; }
+        return (s[mid - 1] + s[mid]) / 2.0;
+    }
+
+    // 分位数（q ∈ [0,1]）。线性插值法：位置 = q × (n-1)，
+    // 取两侧整数下标并按小数部分加权。q 越界按 0 / 1 夹取。
+    // 空集返回 0.0。
+    public static double Percentile(List<double> xs, double q) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        if (q <= 0.0) { return Stats.Min(xs); }
+        if (q >= 1.0) { return Stats.Max(xs); }
+        List<double> s = Stats.SortedCopy(xs);
+        double pos = q * (double)(s.Count - 1);
+        int lo = (int)pos;                    // 向下取整（pos ≥ 0）
+        int hi = lo + 1;
+        if (hi >= s.Count) { return s[lo]; }
+        double frac = pos - (double)lo;
+        return s[lo] + (s[hi] - s[lo]) * frac;
+    }
+
+    // 最小值。空集返回 0.0。
+    public static double Min(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        double lo = xs[0];
+        for (int i = 1; i < xs.Count; i = i + 1) {
+            if (xs[i] < lo) { lo = xs[i]; }
+        }
+        return lo;
+    }
+
+    // 最大值。空集返回 0.0。
+    public static double Max(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        double hi = xs[0];
+        for (int i = 1; i < xs.Count; i = i + 1) {
+            if (xs[i] > hi) { hi = xs[i]; }
+        }
+        return hi;
+    }
+
+    // 极差（max - min）。空集返回 0.0。
+    public static double Range(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        return Stats.Max(xs) - Stats.Min(xs);
+    }
+
+    // 总体方差（除以 n）。空集返回 0.0；单元素集为 0.0。
+    public static double Variance(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        double m = Stats.Mean(xs);
+        double acc = 0.0;
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            double d = xs[i] - m;
+            acc = acc + d * d;
+        }
+        return acc / (double)xs.Count;
+    }
+
+    // 样本方差（除以 n-1，n < 2 时为 0.0）。与总体方差的区别只在
+    // 分母——做无偏估计时用这个。
+    public static double SampleVariance(List<double> xs) {
+        if (xs == null || xs.Count < 2) { return 0.0; }
+        double m = Stats.Mean(xs);
+        double acc = 0.0;
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            double d = xs[i] - m;
+            acc = acc + d * d;
+        }
+        return acc / (double)(xs.Count - 1);
+    }
+
+    // 标准差（总体方差的平方根）。空集返回 0.0。
+    public static double StdDev(List<double> xs) {
+        if (xs == null || xs.Count == 0) { return 0.0; }
+        return Math.Sqrt(Stats.Variance(xs));
+    }
+
+    // 样本标准差（样本方差的平方根）。空集/单元素集返回 0.0。
+    public static double SampleStdDev(List<double> xs) {
+        if (xs == null || xs.Count < 2) { return 0.0; }
+        return Math.Sqrt(Stats.SampleVariance(xs));
+    }
+
+    // 偏度（Fisher-Pearson 标准化三阶矩）。空集或样本方差为 0
+    // （所有值相同）时返回 0.0——分布退化，偏度无定义但返回 0
+    // 比返回 NaN 更安全（NaN 会污染下游图表）。
+    public static double Skewness(List<double> xs) {
+        if (xs == null || xs.Count < 3) { return 0.0; }
+        double m = Stats.Mean(xs);
+        double v = Stats.Variance(xs);
+        if (v <= 0.0) { return 0.0; }
+        double acc = 0.0;
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            double d = xs[i] - m;
+            acc = acc + d * d * d;
+        }
+        double m3 = acc / (double)xs.Count;
+        return m3 / (v * Math.Sqrt(v));
+    }
+
+    // 峰度（超额峰度：四阶矩 / 方差² 减 3，正态分布为 0）。
+    // 空集或方差为 0 时返回 0.0。
+    public static double Kurtosis(List<double> xs) {
+        if (xs == null || xs.Count < 4) { return 0.0; }
+        double m = Stats.Mean(xs);
+        double v = Stats.Variance(xs);
+        if (v <= 0.0) { return 0.0; }
+        double acc = 0.0;
+        for (int i = 0; i < xs.Count; i = i + 1) {
+            double d = xs[i] - m;
+            acc = acc + d * d * d * d;
+        }
+        double m4 = acc / (double)xs.Count;
+        return m4 / (v * v) - 3.0;
+    }
+
+    // 两个变量的皮尔逊相关系数。样本数 < 2 或任一方方差为 0
+    // （常量序列）时返回 0.0——相关性对常量序列无定义。
+    public static double Correlation(List<double> xs, List<double> ys) {
+        if (xs == null || ys == null) { return 0.0; }
+        int n = xs.Count < ys.Count ? xs.Count : ys.Count;
+        if (n < 2) { return 0.0; }
+        double mx = Stats.MeanOfN(xs, n);
+        double my = Stats.MeanOfN(ys, n);
+        double sxy = 0.0;
+        double sxx = 0.0;
+        double syy = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            double dx = xs[i] - mx;
+            double dy = ys[i] - my;
+            sxy = sxy + dx * dy;
+            sxx = sxx + dx * dx;
+            syy = syy + dy * dy;
+        }
+        if (sxx <= 0.0 || syy <= 0.0) { return 0.0; }
+        return sxy / (Math.Sqrt(sxx) * Math.Sqrt(syy));
+    }
+
+    // 前 n 项之和（Top-N 场景用）。n <= 0 返回 0.0。
+    public static double Sum(List<double> xs, int n) {
+        if (xs == null || n <= 0) { return 0.0; }
+        int take = n < xs.Count ? n : xs.Count;
+        double acc = 0.0;
+        for (int i = 0; i < take; i = i + 1) { acc = acc + xs[i]; }
+        return acc;
+    }
+
+    // 排序后的副本（不改动入参）。升序。
+    public static List<double> SortedCopy(List<double> xs) {
+        List<double> s = new List<double>();
+        if (xs == null) { return s; }
+        for (int i = 0; i < xs.Count; i = i + 1) { s.Add(xs[i]); }
+        s.Sort((double a, double b) => {
+            if (a < b) { return 0 - 1; }
+            if (a > b) { return 1; }
+            return 0;
+        });
+        return s;
+    }
+
+    // 前 n 项均值（只看入参的前 n 个，不排序）。
+    private static double MeanOfN(List<double> xs, int n) {
+        double acc = 0.0;
+        for (int i = 0; i < n; i = i + 1) { acc = acc + xs[i]; }
+        return acc / (double)n;
+    }
+}

@@ -80,3 +80,48 @@ chart.SetTheme("macarons"); // 或 "dark", "shine", "blue", "echarts6" 等
 // 亦支持全局切换当前图表皮肤主题
 ChartSkin.SetCurrent("echarts6");
 ```
+
+### 4. 从表格数据出图（`ChartBridge`）
+
+`ChartBridge` 把 `System.Data` 的 `DataFrame`（列存表格）接到图表上，
+省掉"手写 source 数组 + 类目轴 + 系列数据"这一段。
+
+```zan
+using System;
+using System.Data;
+using Gui.Component.Chart;
+
+DataFrame df = DataFrame.FromCsv(File.ReadAllText("sales.csv"));
+// 表头：city,sales,group
+
+// 单系列柱状图
+ChartOption opt = new ChartOption();
+opt.title = "各城市销售额";
+ChartBridge.AddSeries(opt, df, "销售额", "city", "sales", ChartType.Bar);
+
+// 一表多系列（group 列的每个取值一条系列，按首次出现顺序）
+ChartOption opt2 = new ChartOption();
+ChartBridge.AddGrouped(opt2, df, "group", "city", "sales", ChartType.Bar);
+
+// 也可以只要中间产物，自己装配
+ChartSeries s = ChartBridge.CategorySeries(df, "销售额", "city", "sales", ChartType.Bar);
+ChartAxis ax = ChartBridge.CategoryAxis(df, "city");
+opt.series.Add(s);
+opt.xAxes.Add(ax);
+opt.yAxes.Add(ChartAxis.Value());
+
+// 需要 ECharts dataset 语义（transform / encode）时
+ChartJsonDataset ds = ChartBridge.ToDataset(df, "sales");
+opt.datasets.Add(ds);
+```
+
+**要点**：
+
+- 依赖方向是 `Gui.Component.Chart → System.Data`（反向会让数据层多带
+  297 个编译单元）。
+- 桥直接填 `series.data`——ECharts 的 dataset→series 自动绑定发生在
+  option **解析期**，程序化构造的 `ChartOption` 不走那条路。
+- 数值走 `double` 通道，小数不被截断（整数道会抹平小数项）。
+- 列名写错抛 `InvalidOperationException`（静默产出空图比报错难查）。
+- 描述统计在 `Zan.DataFrame` 的 `Stats`/`DataFrameStats`，配套用例见
+  `tests/conformance/analytics_bridge.zan`。

@@ -1,0 +1,210 @@
+using System;
+using System.Data;
+using System.Json;
+using Gui.Component.Chart;
+
+namespace Gui.Component.Chart;
+
+// DataFrame → 图表的桥。
+//
+// 为什么需要它：Zan.Gui.Charts 的数据入口是 ChartJsonDataset
+// （JsonValue 源 + 行号表），而表格数据的自然形态是 System.Data 的
+// DataFrame（列存）。此前两者之间没有桥——"算出统计结果"和"画成图"
+// 分属两个世界，中间要手写一遍 source 数组 + 类别轴 + 系列数据。
+//
+// 本桥提供两条路：
+// 1. Dataset 形态：DataFrame → ChartJsonDataset（source 首行是表头）。
+//    供需要 ECharts 语义（transform / encode / 多系列同表）的场合。
+// 2. 系列形态（推荐）：DataFrame → 直接可渲染的 ChartSeries +
+//    类目轴。这是主流用法——一份表、若干数值列、每列一个系列。
+//
+// 为什么不用 dataset 绑定来自动出系列：ECharts 的 dataset→series 绑定
+// 发生在 option 解析期（ChartOption.FromJsonValue），程序化构造的
+// ChartOption 不走那条路，系列数据得自己填。桥直接填 series.data，
+// 走的是渲染器真正读的那条路。
+//
+// 依赖方向：Gui.Component.Chart → System.Data。反向不成立——
+// System.Data 是数据层，不该知道图表存在（实测代价：反过来多带
+// 297 个编译单元）。
+
+public class ChartBridge {
+    // ---- Dataset 形态 ----
+
+    // DataFrame → ChartJsonDataset。
+    //
+    // source 的首行是表头行（列名），其后每行一个数据行——这正是
+    // ChartJsonDataset 的常规形态（HdrRows() 返回 1）。rows 是
+    // 全部行号（含表头行），与 ChartOption 的解析产物同构。
+    //
+    // 列的取值：Int 列取整数，Float 列取浮点，Str 列取文本。文本
+    // 里的数字不做隐式转换（调用方要数值就该先把列建对）。
+    public static ChartJsonDataset ToDataset(DataFrame df, string id) {
+        ChartJsonDataset ds = new ChartJsonDataset();
+        ds.id = id == null ? "" : id;
+        ds.rows = new List<int>();
+        JsonValue src = JsonValue.NewArray();
+        if (df == null) { ds.source = src; return ds; }
+
+        int ncols = df.ColCount();
+        int nrows = df.Rows();
+
+        // 表头行。
+        JsonValue head = JsonValue.NewArray();
+        List<string> names = df.Names();
+        for (int c = 0; c < ncols; c = c + 1) { head.AppendStr(names[c]); }
+        src.Append(head);
+
+        // 数据行。
+        for (int r = 0; r < nrows; r = r + 1) {
+            JsonValue row = JsonValue.NewArray();
+            for (int c = 0; c < ncols; c = c + 1) {
+                int kind = df.cols[c].Kind();
+                if (kind == ColKind.Int) { row.AppendInt(df.GetInt(r, c)); }
+                else if (kind == ColKind.Float) { row.AppendDouble(df.GetFloat(r, c)); }
+                else { row.AppendStr(df.GetStr(r, c)); }
+            }
+            src.Append(row);
+        }
+        ds.source = src;
+        for (int i = 0; i < src.Count(); i = i + 1) { ds.rows.Add(i); }
+        // 首行是表头（列名是字符串、数据行同列是数值）——显式置 false，
+        // 不让 HeaderEvidence 去猜（它对"首列全是文本"的表会误判成
+        // 无表头形态，那种表是类目表而不是观测表）。
+        ds.noHdr = false;
+        return ds;
+    }
+
+    // DataFrame → ChartJsonDataset（数据集 id 缺省 "dataset"）。
+    public static ChartJsonDataset ToDataset(DataFrame df) {
+        return ChartBridge.ToDataset(df, "dataset");
+    }
+
+    // ---- 系列形态（推荐路径）----
+
+    // 分类系列：一份表 + 一个类目列 + 一个数值列 → 一条系列。
+    //
+    // catCol 是类目轴的来源（每一行的标签），valCol 是数值。
+    // 两个列名任一不存在时抛 InvalidOperationException（列名写错
+    // 静默产出空图比报错难查得多）。
+    //
+    // 数值走 double（ChartData.Numeric），小数不被截断——系列渲染
+    // 对小数项有专门的定点道（SeriesFrac），整数道会把它抹平。
+    public static ChartSeries CategorySeries(DataFrame df, string name,
+    string catCol, string valCol, ChartType type) {
+        ChartBridge.RequireCol(df, catCol);
+        ChartBridge.RequireCol(df, valCol);
+        int catAt = df.ColIndex(catCol);
+        int valAt = df.ColIndex(valCol);
+        List<ChartData> items = new List<ChartData>();
+        int n = df.Rows();
+        for (int r = 0; r < n; r = r + 1) {
+            items.Add(ChartData.NamedNumber(df.GetFloat(r, valAt),
+            df.GetStr(r, catAt)));
+        }
+        return ChartSeries.Named(name, type, items);
+    }
+
+    // 分类系列的类目轴（与 CategorySeries 配对使用）。
+    // 类目取自 catCol 的文本值。
+    public static ChartAxis CategoryAxis(DataFrame df, string catCol) {
+        ChartBridge.RequireCol(df, catCol);
+        int at = df.ColIndex(catCol);
+        List<string> cats = new List<string>();
+        int n = df.Rows();
+        for (int r = 0; r < n; r = r + 1) { cats.Add(df.GetStr(r, at)); }
+        return ChartAxis.Category(cats);
+    }
+
+    // 数值系列（无类目，只有数值）：每个系列一个数值列。
+    // 适合散点/雷达这类"每个系列一条曲线"的场合。
+    public static ChartSeries ValueSeries(DataFrame df, string name,
+    string valCol, ChartType type) {
+        ChartBridge.RequireCol(df, valCol);
+        int valAt = df.ColIndex(valCol);
+        List<ChartData> items = new List<ChartData>();
+        int n = df.Rows();
+        for (int r = 0; r < n; r = r + 1) {
+            items.Add(ChartData.Numeric(df.GetFloat(r, valAt)));
+        }
+        return ChartSeries.Named(name, type, items);
+    }
+
+    // ---- 组合 ----
+
+    // 一表多系列：classCol 的每个不同取值一条系列，valCol 是数值，
+    // catCol 是类目。系列名取 classCol 的取值，系列按 classCol
+    // 首次出现顺序排列。
+    //
+    // 这是"分组柱状图"的直接形态——GroupBy 的结果不用手抄。
+    public static List<ChartSeries> GroupedSeries(DataFrame df,
+    string classCol, string catCol, string valCol, ChartType type) {
+        ChartBridge.RequireCol(df, classCol);
+        ChartBridge.RequireCol(df, catCol);
+        ChartBridge.RequireCol(df, valCol);
+        int clsAt = df.ColIndex(classCol);
+        int catAt = df.ColIndex(catCol);
+        int valAt = df.ColIndex(valCol);
+        // 分组保序：先记首次出现顺序，再按组收集行号。
+        List<string> order = new List<string>();
+        Dictionary<string, List<int>> groups = new Dictionary<string, List<int>>();
+        int n = df.Rows();
+        for (int r = 0; r < n; r = r + 1) {
+            string k = df.GetStr(r, clsAt);
+            if (!groups.ContainsKey(k)) {
+                groups[k] = new List<int>();
+                order.Add(k);
+            }
+            groups[k].Add(r);
+        }
+        List<ChartSeries> outp = new List<ChartSeries>();
+        for (int g = 0; g < order.Count; g = g + 1) {
+            string k = order[g];
+            List<int> rows = groups[k];
+            List<ChartData> items = new List<ChartData>();
+            for (int i = 0; i < rows.Count; i = i + 1) {
+                int r = rows[i];
+                items.Add(ChartData.NamedNumber(df.GetFloat(r, valAt),
+                df.GetStr(r, catAt)));
+            }
+            outp.Add(ChartSeries.Named(k, type, items));
+        }
+        return outp;
+    }
+
+    // 把"一表多系列"的结果挂到 option 上，并补上类目轴与数值轴。
+    // 已有类目轴时不覆盖（调用方可能自己设过）。
+    public static ChartOption AddGrouped(ChartOption opt, DataFrame df,
+    string classCol, string catCol, string valCol, ChartType type) {
+        if (opt == null) { return null; }
+        List<ChartSeries> series = ChartBridge.GroupedSeries(df,
+        classCol, catCol, valCol, type);
+        for (int i = 0; i < series.Count; i = i + 1) { opt.series.Add(series[i]); }
+        if (opt.xAxes.Count == 0) {
+            opt.xAxes.Add(ChartBridge.CategoryAxis(df, catCol));
+        }
+        if (opt.yAxes.Count == 0) { opt.yAxes.Add(ChartAxis.Value()); }
+        return opt;
+    }
+
+    // 单系列挂载（最常见的"一列数据画一张图"）。
+    public static ChartOption AddSeries(ChartOption opt, DataFrame df,
+    string name, string catCol, string valCol, ChartType type) {
+        if (opt == null) { return null; }
+        opt.series.Add(ChartBridge.CategorySeries(df, name, catCol, valCol, type));
+        if (opt.xAxes.Count == 0) {
+            opt.xAxes.Add(ChartBridge.CategoryAxis(df, catCol));
+        }
+        if (opt.yAxes.Count == 0) { opt.yAxes.Add(ChartAxis.Value()); }
+        return opt;
+    }
+
+    // 列存在性守卫：抛带列名的异常。
+    private static void RequireCol(DataFrame df, string col) {
+        if (df == null) {
+            throw new InvalidOperationException("ChartBridge: 表为 null");
+        }
+        if (df.ColIndex(col) < 0) {
+            throw new InvalidOperationException("ChartBridge 没有列: " + col);
+        }
+    }
+}
