@@ -186,12 +186,16 @@ partial class Irgen {
 
     // Best-effort static result type of an awaited call (the callee's declared
     // return type). Null when unresolvable; the temp then defaults to int.
+    // The callee is resolved the way the CALL SITE resolves it -- by argument
+    // type -- not "the first method with that name": with two overloads the
+    // by-name pick hands the awaited temp the other overload's return type
+    // (a class pointer where a string belongs -> invalid IR).
     Node AwaitCallTy(Node cls, Node m, Node callExpr) {
         if (callExpr == null || callExpr.kind != AK.Call()) { return null; }
         Node callee = callExpr.a;
         if (callee == null) { return null; }
         if (callee.kind == AK.Ident()) {
-            Node mm = FindMethodUp(cls, callee.sval);
+            Node mm = AwaitTarget(cls, callee.sval, m, callExpr, false);
             if (mm != null) { return mm.type; }
             return null;
         }
@@ -199,14 +203,14 @@ partial class Irgen {
             Node r = callee.a;
             if (r == null) { return null; }
             if (r.kind == AK.ThisExpr()) {
-                Node mt = FindMethodUp(cls, callee.sval);
+                Node mt = AwaitTarget(cls, callee.sval, m, callExpr, false);
                 if (mt != null) { return mt.type; }
                 return null;
             }
             if (r.kind == AK.Ident()) {
                 Node rc = binder.FindType(r.sval);
                 if (rc != null) {
-                    Node ms = FindMethodUp(rc, callee.sval);
+                    Node ms = AwaitTarget(rc, callee.sval, m, callExpr, true);
                     if (ms != null) { return ms.type; }
                     return null;
                 }
@@ -214,13 +218,92 @@ partial class Irgen {
                 if (vt != null) {
                     Node rc2 = binder.FindType(vt.sval);
                     if (rc2 != null) {
-                        Node mi = FindMethodUp(rc2, callee.sval);
+                        Node mi = AwaitTarget(rc2, callee.sval, m, callExpr, true);
                         if (mi != null) { return mi.type; }
                     }
                 }
             }
         }
         return null;
+    }
+
+    // The overload an awaited call resolves to: every candidate named `name`
+    // in `cls` and its bases, filtered by the argument count and scored by
+    // the argument types -- the call site's rule.
+    Node AwaitTarget(Node cls, string name, Node m, Node callExpr, bool wantStatic) {
+        if (cls == null) { return null; }
+        List<Node> cands = new List<Node>();
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node mm = c.kids[i];
+                if (mm.kind == AK.MethodDecl() && mm.sval == name) { cands.Add(mm); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        if (cands.Count == 0) { return null; }
+        int argc = callExpr.kids.Count;
+        List<Node> fit = new List<Node>();
+        int i = 0;
+        while (i < cands.Count) {
+            if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) { return cands[0]; }
+        if (fit.Count == 1) { return fit[0]; }
+        int best = -1000000;
+        Node pick = fit[0];
+        i = 0;
+        while (i < fit.Count) {
+            int s = AwaitScore(fit[i], m, callExpr, argc, wantStatic);
+            if (s > best) { best = s; pick = fit[i]; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // Score an overload candidate for an awaited call (the call site's
+    // scoring, with the argument types taken from the enclosing method's
+    // parameters -- the body's locals do not exist yet at this point).
+    int AwaitScore(Node cand, Node m, Node callExpr, int argc, bool wantStatic) {
+        int score = 0;
+        if (IsStatic(cand) == wantStatic) { score = score + 1; }
+        int a = 0;
+        while (a < argc) {
+            Node pt = ParamTypeNode(cand, a);
+            Node aty = AwaitArgType(m, callExpr.kids[a]);
+            if (aty != null) {
+                string at = TypeTag(aty);
+                if (at != "") {
+                    if (at == TypeTag(pt)) { score = score + 4; }
+                    else if (MentionsTypeParam(pt)) { score = score + 2; }
+                    else { score = score - 1; }
+                }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+
+    // The type of an argument expression, as far as it is knowable while the
+    // await is normalized: the body's locals do not exist yet, so an
+    // identifier argument is typed from the enclosing method's parameters.
+    Node AwaitArgType(Node m, Node arg) {
+        if (arg == null) { return null; }
+        if (arg.kind == AK.Ident() && m != null) {
+            int i = 0;
+            while (i < m.kids.Count) {
+                Node p = m.kids[i];
+                if (p.kind == AK.Param() && p.sval == arg.sval) { return p.type; }
+                i = i + 1;
+            }
+        }
+        return ArgTypeNode(arg);
     }
 
     Node MakeAwaitTemp(Node cls, Node m, Node aw, List<Node> pre) {

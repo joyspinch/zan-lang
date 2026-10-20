@@ -1124,32 +1124,42 @@
     （`%t48 defined with type 'ptr' but expected 'i64'`）；`w + 2.5` 取了
     **int** 重载，把 `2.5` 当 i64 实参传（`floating point constant invalid
     for type`）。**已修**。
-  - `overload_same_arity_return.zan`：`await OnMessage(message)` 取了
-    `OnMessage(MessageHandler)` 而不是 `OnMessage(string)` → await 的结果
-    是个对象指针，被塞进 `printf` 的 i64 形参 → 非法 IR。**未修**。
+  - `overload_same_arity_return.zan`：`await OnMessage(message)` 的 await
+    临时量取成了**另一个重载**的返回类型（类指针塞进 `printf` 的 i64 形参
+    → 非法 IR）。**已修**。
   - `overload_resolution.zan`：`Derived.Widen(1)` 取了派生类的两参重载，
-    报 "missing required argument for parameter 'b' of 'Widen'"（**fail-closed**，
-    至少没编出错的东西；宿主选的是基类的一参重载）。**未修**。
+    报 "missing required argument for parameter 'b' of 'Widen'"（宿主选的是
+    基类的一参重载）。**已修**。
+  - `overload_inherited_arity.zan`：`Strip.Add(b)`（b 是 Bag）取成了派生类
+    的 `Add(string)` → 无限递归 → **栈溢出**（0xC00000FD）。**已修**。
   - `indexer_overload.zan` / `cs_b12_conv_operator.zan`：索引器重载与转换
     运算符重载都落到"按名字取第一个"→ 非法 IR。**未修**。
-  - `generic_param_shape_overload.zan` / `overload_inherited_arity.zan`：
-    输出与宿主不一致（泛型实参形状 / 继承来的重载）。**未修**。
-- 根因：自举的运算符分派 `TryOpOverload` 用 `binder.FindMethod(cls, name)`
-  ——**按名字取第一个**，完全不看实参类型；普通调用那侧 `ResolveMethod`
-  只在同名候选 ≥2 时才按实参类型打分，单候选时连**实参个数**都不看，
-  派生类遮蔽基类重载时也不往基类找。
-- ✅ 已修（2026-10-20，运算符那一半）：
-  - 运算符路径改成"先在类链里找**声明类**（定义在基类时调用要指向基类的
-    符号），再按**实参类型**选重载"；打分口径照宿主：精确匹配 4 分，
-    int→long 3 分，int→double 2 分，已知不匹配 -1 分。
-  - 调用发**带 mangling 的符号**（`MethodSym`）：原来固定发 `Owner_op_add`，
-    多个重载之间会撞名（定义侧带后缀、调用侧不带 → 链接不上）。
-  - `%=` 补进复合赋值的重载分支（原来只有 `+= -= *= /=`）。
-  - int 字面量的**后缀**参与选型（`7L` → long，宿主同口径：
-    `checker.c` 的 `AST_INT_LITERAL` / `lit_suffix`）。
-  - 顺带修：struct 的 `==`/`!=` 改为**按值**比较（原来是指针同一性，
-    两个相等的 struct 值被判为不等）。用例 `operator_overload` /
-    `struct_operators` / `operator_relational` 进差分门，逐字一致。
-- 剩余（未修）：普通方法调用的重载分派仍有按名字取的路径
-  （单候选不看实参个数、派生类不往基类找、异步调用/索引器/转换运算符各
-  走各的路径），泛型实参形状那部分也没对齐宿主。
+  - `generic_param_shape_overload.zan`：`Item<T>.val` 读回的是**擦除槽的裸
+    指针**（打印出地址而不是 "one"）——这是 A421 的泛型字段布局，不是重载
+    分派。**未修**（见 A421）。
+- 根因：自举有**三条**"按名字取成员"的路：
+  1. 运算符分派 `TryOpOverload`（`binder.FindMethod`）；
+  2. 普通调用 `ResolveMethod`（单候选时连**实参个数**都不看，派生类遮蔽
+     基类重载时也不往基类找）；
+  3. `await` 的被调方法 `AwaitCallTy`（`FindMethodUp`）——await 临时量的
+     **类型**取自它，于是类型和真正调用的那个重载对不上。
+- ✅ 已修（2026-10-20，提交 `93529a7c` + 本轮）：
+  - 运算符路径：先在类链里找**声明类**，再按**实参类型**选重载（精确匹配
+    4、int→long 3、int→double 2、已知不匹配 -1），发 `MethodSym(声明类, m)`
+    （带 mangling 的符号，原来固定发 `Owner_op_add` → 多重重载会撞名）。
+  - `%=` 补进复合赋值的重载分支；int 字面量的**后缀**参与选型（`7L` →
+    long，宿主同口径）。
+  - 普通调用：候选集改成**整条类链**（派生类的重载只遮蔽**签名相同**的
+    基类重载——`Strip.Add(string)` 不遮蔽 `Bag.Add(Bag)`），先按**实参个数**
+    过滤，再按实参类型打分；实参个数一个都不合适时**沿基类链**继续找。
+  - 调用的符号改用**声明类**（`DeclOwnerOf`）：继承来的重载定义在基类名下，
+    调用却指向派生类 → 符号不存在。
+  - `await` 的被调方法改成同样的"类链候选 + 个数过滤 + 按实参类型打分"
+    （参数类型从**外层方法的形参**取——归一化 await 时方法体还没生成，
+    局部变量还不存在）。
+  - 顺带修：struct 的 `==`/`!=` 改为**按值**比较（原来是指针同一性）。
+  - 用例进差分门：`operator_overload` / `struct_operators` /
+    `operator_relational` / `overload_resolution` /
+    `overload_inherited_arity` / `overload_same_arity_return`。
+- 剩余（未修）：索引器重载（`op_index`）、转换运算符（`op_implicit` /
+  `op_explicit`）、泛型实参形状那一族（属 A421）。

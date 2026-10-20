@@ -211,6 +211,54 @@ partial class Irgen {
         return "";
     }
 
+    // The class that declares the method `m` (walking the chain from `cls`).
+    // The symbol of a call has to name the DECLARING class: an overload
+    // inherited from a base is defined under the base's name, and a name-only
+    // lookup would point the call at the derived class (no such symbol).
+    string DeclOwnerOf(Node cls, Node m) {
+        if (cls == null || m == null) { return ""; }
+        string tags = ParamTags(m);
+        Node c = cls;
+        while (c != null) {
+            Node f = FindMethodSig(c, m.sval, tags);
+            if (f != null) { return c.sval; }
+            c = BaseClassOf(c);
+        }
+        return cls.sval;
+    }
+
+    // Is a method with the same parameter signature already in the list? A
+    // derived member hides a base member with the same signature, so the base
+    // one is not a separate candidate.
+    bool HasSameSig(List<Node> cands, Node m) {
+        string tags = ParamTags(m);
+        int i = 0;
+        while (i < cands.Count) {
+            if (ParamTags(cands[i]) == tags) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Does the method accept this many positional arguments? A `params` tail
+    // array takes the arguments the fixed parameters do not.
+    bool AcceptsArity(Node m, int argc) {        if (m == null) { return false; }
+        int tot = 0; int req = 0; int j = 0;
+        Node lastP = null;
+        while (j < m.kids.Count) {
+            if (m.kids[j].kind == AK.Param()) {
+                tot = tot + 1;
+                if (m.kids[j].b == null) { req = req + 1; }
+                lastP = m.kids[j];
+            }
+            j = j + 1;
+        }
+        bool vparams = lastP != null && lastP.op == 1;
+        if (argc >= req && argc <= tot) { return true; }
+        if (vparams && argc >= req - 1) { return true; }
+        return false;
+    }
+
     // Number of methods named `name` declared directly in `cls`.
     int MethodCount(Node cls, string name) {
         if (cls == null) { return 0; }
@@ -418,29 +466,32 @@ partial class Irgen {
     // candidate set or a tie is a diagnostic.
     Node ResolveMethod(Node cls, string name, Node e, bool wantStatic) {
         if (cls == null) { return null; }
+        // The candidates are the class's own overloads PLUS the inherited ones:
+        // C# resolves a call over the whole hierarchy, and a derived member
+        // hides a base one only when the SIGNATURES match (`Strip.Add(string)`
+        // does not hide `Bag.Add(Bag)` -- a call with a Bag argument still
+        // reaches the base's overload). A base overload with the same
+        // signature is hidden, so it is not a candidate.
         List<Node> cands = new List<Node>();
-        int i = 0;
-        while (i < cls.kids.Count) {
-            Node m = cls.kids[i];
-            if (m.kind == AK.MethodDecl() && m.sval == name) { cands.Add(m); }
-            i = i + 1;
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && !HasSameSig(cands, m)) { cands.Add(m); }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
         }
         if (cands.Count == 0) { return null; }
-        if (cands.Count == 1) { return cands[0]; }
         int argc = e.kids.Count;
         List<Node> fit = new List<Node>();
-        i = 0;
+        int i = 0;
         while (i < cands.Count) {
-            Node m = cands[i];
-            int tot = 0; int req = 0; int j = 0;
-            Node lastP = null;
-            while (j < m.kids.Count) {
-                if (m.kids[j].kind == AK.Param()) { tot = tot + 1; if (m.kids[j].b == null) { req = req + 1; } lastP = m.kids[j]; }
-                j = j + 1;
-            }
-            bool vparams = lastP != null && lastP.op == 1;
-            if (argc >= req && argc <= tot) { fit.Add(m); }
-            else if (vparams && argc >= req - 1) { fit.Add(m); }
+            if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count == 0) {

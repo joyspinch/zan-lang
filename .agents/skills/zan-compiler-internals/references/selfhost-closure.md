@@ -876,3 +876,27 @@ kernel32、shell32、user32、advapi32、version）。
   路径本来就在用）。
 - 门禁：`operator_overload` / `struct_operators` / `operator_relational`
   进差分门（逐字一致）。
+
+## 45. 重载候选要来自**整条类链**；派生类只遮蔽**签名相同**的那个
+
+- 坑（实测）：自举的普通调用只拿**本类**的重载当候选，派生类声明了同名
+  重载就再也看不见基类的：
+  - `Derived.Widen(1)` 取了派生类的两参重载 → "missing required argument
+    for parameter 'b'"（宿主选的是基类的一参重载）；
+  - `Strip.Add(b)`（b 是 Bag）取成了 `Strip.Add(string)` → **无限递归 →
+    栈溢出**（0xC00000FD）——调用进了自己。
+- 教训：C# 的重载解析覆盖**整个继承链**；派生成员只遮蔽**签名相同**的基类
+  成员。`Strip.Add(string)` 不遮蔽 `Bag.Add(Bag)`。
+- 做法：候选集 = 本类 + 整条基类链（同名**同签名**的基类重载按"遮蔽"剔除）；
+  再按**实参个数**过滤（`AcceptsArity`：默认参数不算必填，`params` 尾巴
+  数组吃剩下的实参）；最后按实参类型打分。
+- 坑：**调用的符号要指向声明类**。继承来的重载定义在**基类**名下，调用却
+  按派生类拼符号 → 符号不存在（旧代码用 `MethodOwner(cls, name)`，那是
+  **按名字**找声明类，重载一多就找错；要用"按签名"找：`DeclOwnerOf`）。
+- 坑：`await` 的被调方法**也要**按实参类型解析。`AwaitCallTy` 原来用
+  `FindMethodUp`（按名字）→ await 临时量的**类型**取成了另一个重载的返回
+  类型（类指针塞进 `printf` 的 i64 形参 → 非法 IR）。
+- 坑：归一化 await 时**方法体还没生成**，局部变量还不存在——实参的类型要
+  从**外层方法的形参**取（`AwaitArgType`）。
+- 门禁：`overload_resolution` / `overload_inherited_arity` /
+  `overload_same_arity_return` 进差分门（逐字一致）。
