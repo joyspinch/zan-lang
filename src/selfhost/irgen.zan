@@ -1343,28 +1343,53 @@ partial class Irgen {
         }
     }
 
-    int FieldIndex(Node cls, string name) {
+    // The number of instance fields the class chain below `cls` contributes
+    // to its layout (the base fields come first).
+    int BaseFieldCount(Node cls) {
+        if (cls == null) { return 0; }
         List<string> names = new List<string>();
         List<Node> types = new List<Node>();
         CollectFields(cls, names, types);
-        int i = 0;
-        while (i < names.Count) {
-            if (names[i] == name) { return FieldBase(cls) + i; }
-            i = i + 1;
-        }
-        return -1;
+        return names.Count;
     }
 
-    Node FieldType(Node cls, string name) {
-        List<string> names = new List<string>();
-        List<Node> types = new List<Node>();
-        CollectFields(cls, names, types);
+    // The position of `name` in the flattened field layout of `cls` (base
+    // fields first). The **most derived** declaration wins: a derived field
+    // hides a base field of the same name, and both keep their own slot.
+    int FieldPos(Node cls, string name) {
+        if (cls == null) { return -1; }
+        int bcount = BaseFieldCount(BaseClassOf(cls));
+        int seen = 0;
         int i = 0;
-        while (i < names.Count) {
-            if (names[i] == name) { return types[i]; }
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m)) {
+                if (m.sval == name) { return bcount + seen; }
+                seen = seen + 1;
+            }
             i = i + 1;
         }
-        return null;
+        return FieldPos(BaseClassOf(cls), name);
+    }
+
+    int FieldIndex(Node cls, string name) {
+        if (cls == null) { return -1; }
+        int p = FieldPos(cls, name);
+        if (p < 0) { return -1; }
+        return FieldBase(cls) + p;
+    }
+
+    // The type of the most derived declaration of the field `name`: a derived
+    // field may hide a base field of the same name with a different type.
+    Node FieldType(Node cls, string name) {
+        if (cls == null) { return null; }
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.FieldDecl() && !IsStatic(m) && m.sval == name) { return m.type; }
+            i = i + 1;
+        }
+        return FieldType(BaseClassOf(cls), name);
     }
 
     // ---- locals ----
@@ -1812,6 +1837,34 @@ partial class Irgen {
         H("  %cptr = getelementptr %zlist, %zlist* %l, i32 0, i32 0");
         H("  %c = load i64, i64* %cptr");
         H("  ret i64 %c");
+        H("}");
+        // `new List<T>(src)`: copy the source list's elements into the new
+        // list. The elements are added through zlist_add, so a list that owns
+        // its elements retains the copies (the C host's list_copy lowering
+        // retains them the same way).
+        H("define void @zlist_copy(i8* %dp, i8* %sp) {");
+        H("entry:");
+        H("  %sl = bitcast i8* %sp to %zlist*");
+        H("  %scptr = getelementptr %zlist, %zlist* %sl, i32 0, i32 0");
+        H("  %count = load i64, i64* %scptr");
+        H("  %sdptr = getelementptr %zlist, %zlist* %sl, i32 0, i32 2");
+        H("  %sdata = load i64*, i64** %sdptr");
+        H("  %ia = alloca i64");
+        H("  store i64 0, i64* %ia");
+        H("  br label %cond");
+        H("cond:");
+        H("  %iv = load i64, i64* %ia");
+        H("  %more = icmp slt i64 %iv, %count");
+        H("  br i1 %more, label %body, label %done");
+        H("body:");
+        H("  %sslot = getelementptr i64, i64* %sdata, i64 %iv");
+        H("  %v = load i64, i64* %sslot");
+        H("  call void @zlist_add(i8* %dp, i64 %v)");
+        H("  %ni = add i64 %iv, 1");
+        H("  store i64 %ni, i64* %ia");
+        H("  br label %cond");
+        H("done:");
+        H("  ret void");
         H("}");
         H("define void @zlist_removeat(i8* %p, i64 %i) {");
         H("entry:");

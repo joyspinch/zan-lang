@@ -989,4 +989,62 @@ kernel32、shell32、user32、advapi32、version）。
   `.sval` 会被宿主拒绝编译）。写自举代码时按宿主的空值规则来。
 - 门禁：`cs_b12_conv_operator` 进差分门（逐字一致）。
 
+## 49. 字段遮蔽：名字查找最派生优先，两个槽位都留
+
+- 坑（实测）：自举的 `FieldIndex`/`FieldType` 扫的是**扁平化后的字段表**
+  （`CollectFields`，基类在前），名字命中**第一个**就返回 → 派生类遮蔽基类
+  同名字段时，读到的是**基类**的槽位。宿主 `get_field_index` 扫的是成员表
+  （基类成员在前、派生成员在后），**取最后一个命中** → 派生优先。
+- 做法：拆成 `BaseFieldCount`（基类链的字段数）+ `FieldPos`（本类字段在扁平
+  表里的位置，本类字段先找，找不到再递归基类）+ `FieldIndex`/`FieldType`。
+  派生字段遮蔽基类字段时**两个槽位都保留**（扁平表里各占一个），只是**名字
+  解析**指向派生那个。
+- 坑：扁平表是"基类在前"，所以派生字段的位置 = 基类链字段数 + 本类内的序号；
+  写错顺序会让派生字段和基类字段**写进同一个槽**（互相覆盖）。
+- 门禁：`field_hiding` 进差分门（逐字一致）。
+
+## 50. op_call 协议：裸调用的接收者是类类型局部变量
+
+- 坑（实测）：`E(args)`（E 是类类型的局部变量）自举的 IR 路径直接报
+  "call expression is not supported"；ngen 路径早就有这个协议，IR 路径漏了
+  → 同一份源码两个后端行为不一致（差分门抓到 `cs_b_opcall_params` 生成
+  `call i64 @Prog_sc(i64 1.0, i64 2.5)` 这种非法 IR）。
+- 宿主口径：`E(args)` 走**被调用对象协议**——E 的类声明了静态 `op_call` 就调
+  `Cls.op_call(E, args...)`（E 作为**显式第一个实参**），声明了实例
+  `op_call` 就调 `E.op_call(args...)`。
+- 做法：**改写成普通调用**再走既有路径（重载选择、params 打包、实参转换全都
+  复用），不要自己拼实参。
+- 门禁：`cs_b_opcall_params` 进差分门（逐字一致）。
+
+## 51. 隐式构造器转换：标量实参 → 类类型形参
+
+- 坑（实测）：宿主允许 `TakeBool(false)`（形参是类 `Box`，类有 `Box(bool)`
+  构造器）；自举的 IR 路径直接把 bool 塞进 `%Box*` 槽位 → 运行时
+  0xC0000005 访问冲突，**一个输出都没有**（stdout 缓冲区随崩溃一起丢）。
+  ngen 路径有这条协议，IR 路径漏了。
+- 宿主口径（`irgen_expr.c` 的 `is_implicit_ctor_source` / `implicit_ctor_for_arg`
+  / `wrap_implicit_ctor_arg`）：源类型是**标量/枚举**（bool/sbyte/byte/short/
+  ushort/int/uint/long/ulong/nint/char/enum），目标类型是**类**，且该类有
+  **匹配的一参构造器** → 实参改写成 `new Target(arg)`；没有匹配构造器 →
+  后端报 "cannot convert 'X' to 'Y' in argument: no matching constructor"
+  （检查器放行、后端拒绝，所以措辞是后端这一条）。
+- 做法：改写成 `new Target(arg)` 后交给既有的 `new` 管线（分配、构造器、
+  字段初始化器、ARC 记账全都对）。自举 IR 路径的落点：`GenArgExpr`（所有
+  实参的公共入口）。
+- 门禁：`implicit_ctor_argument` 进差分门（逐字一致）。
+
+## 52. `new List<T>(src)`：拷贝构造 vs 集合初始化式
+
+- 坑（实测）：自举的 `new List<T>(...)` 只认 `ival == 2` 的**集合初始化式**
+  （`new List<T>{...}`），带括号的实参被**默默丢掉** → `new List<int>(src)`
+  得到空表，随后 `cp[0] = 100` 越界 → 0xC0000005。
+- 宿主口径（`irgen_expr.c` 的 `list_copy`）：**一个**实参且它是 `List<...>`
+  → **拷贝构造**（逐元素复制，新表拥有自己的引用）；其它实参 → 集合初始化式
+  （`new List<int>(5)` 得到 1 个元素 5 的表，`new List<int>(1,2,3)` 得到 3 个
+  元素的表）。
+- 做法：自举的运行时有 `zlist_new`/`zlist_add`，补一个 `zlist_copy(dst, src)`
+  （逐元素 `zlist_add`，元素归新表所有时照常 retain——和宿主拷贝路径的
+  retain 语义一致）。
+- 门禁：`list_copy_ctor` 进差分门（逐字一致）。
+
 
