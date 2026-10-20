@@ -1092,7 +1092,7 @@
   返回 ABI 不支持），所以这条门只覆盖不依赖标准库的形状；接口 + async 的
   组合在 ngen 侧仍只能冒烟（能编出 .obj），没有行为对拍。
 
-### [ ] A426 自举后端（`src/selfhost/`）尚未核对 C 宿主本轮修掉的 4 处缺陷
+### [x] A426 自举后端（`src/selfhost/`）尚未核对 C 宿主本轮修掉的 4 处缺陷
 
 - 背景：2026-10-22 落地 `Zan.Game.Physics2D` 时，在 **C 宿主编译器**
   （`src/compiler/*`）修掉 4 个"静默失效"缺陷（提交 `b6dbf4a9`）：
@@ -1101,10 +1101,55 @@
   3. 跨编译单元的 struct 字段布局降级成 `i8*`（`map_type` /
      `map_tuple_struct` 的条件写反）；
   4. `register_struct_type` 的条目指针在递归注册后失效（realloc 搬家）。
-- 现状：自举后端（`src/selfhost/irgen_expr.zan` 等，Zan 源码实现）**没有**
-  在本轮同步这 4 处修复。同一份 Zan 程序在 C 宿主能编过、在自举后端可能
-  仍然退化（重载被跳过 → 整数加法；字段布局错位 → 静默内存损坏）。
-- 为什么没在本轮做：`src/selfhost/irgen_expr.zan` 当时有**另一会话的在途
-  改动**，并发改同一文件必然冲突（AGENTS.md 规则 11）。
-- 待办：等在途改动落地后，逐条核对自举后端的对应位置；每条补一条自举
-  差分用例（宿主与自举对同一程序的输出必须一致）。
+- ✅ 已核对（2026-10-20，探针 `_scratch/sd/p_opover.zan` + 语料扫描）：
+  - 第 1 条（运算符重载参与类型推导）：自举侧**等价**——自举的运算符分派
+    发生在代码生成期（`TryOpOverload`），checker 的 `ArgTypeNode` 对
+    "左右操作数类型不同 kinds" 返回左操作数类型，够用。探针实测
+    `a * 3 + b`（重载结果再参与下一次重载）宿主与自举逐字一致。
+  - 第 2 条（运算符的 struct 实参按指针传）：自举侧**天然成立**——自举的
+    struct 一律是 `%Name*`（堆对象指针），传参就是传指针。探针实测
+    `new Pt() + p` 逐字一致。
+  - 第 3、4 条：**在自举后端没有对应面**（结构上不可能发生）。自举的
+    struct/class 一律映射成 `%Name*`，没有"结构体值 + 字段偏移"这套布局；
+    `EmitStruct` 只发一个带字段类型的 named type，字段槽偏移在运行期算。
+    宿主那两类缺陷（字段类型降级成 `i8*` → 布局错位；注册表条目 realloc
+    失效）在自举这边没有可退化的路径。
+- ⚠ 核对时挖出**另一批**真缺口：自举的重载分派**按名字取**，不按实参类型
+  ——见 A428（本轮已修运算符那一半，通用调用那一半仍开着）。
+
+### [ ] A428 自举的重载分派**按名字取**，不按实参类型——多个同名重载会选错方法
+
+- 现象（2026-10-20 语料扫描实测，`tests/conformance/`）：
+  - `operator_overload.zan`：`v %= 3` 没走重载，类指针被喂给 `srem`
+    （`%t48 defined with type 'ptr' but expected 'i64'`）；`w + 2.5` 取了
+    **int** 重载，把 `2.5` 当 i64 实参传（`floating point constant invalid
+    for type`）。**已修**。
+  - `overload_same_arity_return.zan`：`await OnMessage(message)` 取了
+    `OnMessage(MessageHandler)` 而不是 `OnMessage(string)` → await 的结果
+    是个对象指针，被塞进 `printf` 的 i64 形参 → 非法 IR。**未修**。
+  - `overload_resolution.zan`：`Derived.Widen(1)` 取了派生类的两参重载，
+    报 "missing required argument for parameter 'b' of 'Widen'"（**fail-closed**，
+    至少没编出错的东西；宿主选的是基类的一参重载）。**未修**。
+  - `indexer_overload.zan` / `cs_b12_conv_operator.zan`：索引器重载与转换
+    运算符重载都落到"按名字取第一个"→ 非法 IR。**未修**。
+  - `generic_param_shape_overload.zan` / `overload_inherited_arity.zan`：
+    输出与宿主不一致（泛型实参形状 / 继承来的重载）。**未修**。
+- 根因：自举的运算符分派 `TryOpOverload` 用 `binder.FindMethod(cls, name)`
+  ——**按名字取第一个**，完全不看实参类型；普通调用那侧 `ResolveMethod`
+  只在同名候选 ≥2 时才按实参类型打分，单候选时连**实参个数**都不看，
+  派生类遮蔽基类重载时也不往基类找。
+- ✅ 已修（2026-10-20，运算符那一半）：
+  - 运算符路径改成"先在类链里找**声明类**（定义在基类时调用要指向基类的
+    符号），再按**实参类型**选重载"；打分口径照宿主：精确匹配 4 分，
+    int→long 3 分，int→double 2 分，已知不匹配 -1 分。
+  - 调用发**带 mangling 的符号**（`MethodSym`）：原来固定发 `Owner_op_add`，
+    多个重载之间会撞名（定义侧带后缀、调用侧不带 → 链接不上）。
+  - `%=` 补进复合赋值的重载分支（原来只有 `+= -= *= /=`）。
+  - int 字面量的**后缀**参与选型（`7L` → long，宿主同口径：
+    `checker.c` 的 `AST_INT_LITERAL` / `lit_suffix`）。
+  - 顺带修：struct 的 `==`/`!=` 改为**按值**比较（原来是指针同一性，
+    两个相等的 struct 值被判为不等）。用例 `operator_overload` /
+    `struct_operators` / `operator_relational` 进差分门，逐字一致。
+- 剩余（未修）：普通方法调用的重载分派仍有按名字取的路径
+  （单候选不看实参个数、派生类不往基类找、异步调用/索引器/转换运算符各
+  走各的路径），泛型实参形状那部分也没对齐宿主。

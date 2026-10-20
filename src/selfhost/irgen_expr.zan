@@ -399,7 +399,7 @@ partial class Irgen {
         // unsigned type through so results print with %llu.
         bool uns = IsUlong(a.ty) || IsUlong(b.ty);
         // user-defined operator overloading takes precedence for class operands
-        ExprVal ov = TryOpOverload(op, a, b);
+        ExprVal ov = TryOpOverload(op, a, b, e.a, e.b);
         if (ov != null) { return ov; }
         // floating-point arithmetic/comparison (string `+` concatenation wins)
         if ((IsDbl(a.ty) || IsDbl(b.ty)) && !(IsStr(a.ty) || IsStr(b.ty))) {
@@ -439,6 +439,21 @@ partial class Irgen {
                 L("  " + c + " = icmp " + cc + " i32 " + r + ", 0");
                 string z = NT();
                 L("  " + z + " = zext i1 " + c + " to i64");
+                return new ExprVal(z, MkType("bool"));
+            }
+            // a struct without operator== compares by VALUE (C# struct
+            // semantics): the self-host's struct is a heap object, so pointer
+            // identity would call two equal values "not equal".
+            Node sa = ClassOf(a.ty);
+            if (sa != null && sa.kind == AK.StructDecl() && b.ty != null && b.ty.sval == a.ty.sval) {
+                string c = EmitStructEq(a, b, a.ty);
+                string z = NT();
+                L("  " + z + " = zext i1 " + c + " to i64");
+                if (op == TK.BangEq()) {
+                    string n = NT();
+                    L("  " + n + " = xor i64 " + z + ", 1");
+                    return new ExprVal(n, MkType("bool"));
+                }
                 return new ExprVal(z, MkType("bool"));
             }
             // reference identity: compare pointer operands as pointers, not i64
@@ -536,29 +551,126 @@ partial class Irgen {
 
     // Dispatch a binary op to a static operator method on either operand's
     // class, e.g. a + b -> @Vec_op_add(Vec, Vec). Returns null when none.
-    ExprVal TryOpOverload(int op, ExprVal a, ExprVal b) {
+    // `an`/`bn` are the operand expressions: an int literal's type depends
+    // on its suffix (the host types `7L` as long), and the overload choice
+    // depends on it.
+    ExprVal TryOpOverload(int op, ExprVal a, ExprVal b, Node an, Node bn) {
         string mn = OpName(op);
         if (mn == "") { return null; }
-        string owner = "";
-        Node m = null;
+        Node ownerCls = null;
         Node ca = ClassOf(a.ty);
-        if (ca != null) { m = binder.FindMethod(ca, mn); if (m != null) { owner = a.ty.sval; } }
-        if (m == null) {
+        if (ca != null && OpDeclClass(ca, mn) != null) { ownerCls = ca; }
+        if (ownerCls == null) {
             Node cb = ClassOf(b.ty);
-            if (cb != null) { m = binder.FindMethod(cb, mn); if (m != null) { owner = b.ty.sval; } }
+            if (cb != null && OpDeclClass(cb, mn) != null) { ownerCls = cb; }
         }
+        if (ownerCls == null) { return null; }
+        // the operator may be declared by a base class: the call must name
+        // the declaring class (that is where the definition is emitted).
+        Node declCls = OpDeclClass(ownerCls, mn);
+        if (declCls == null) { return null; }
+        Node m = SelectOpOverload(declCls, mn, OperandType(an, a), OperandType(bn, b));
         if (m == null) { return null; }
+        string owner = declCls.sval;
         Node p0 = ParamTypeNode(m, 0);
         Node p1 = ParamTypeNode(m, 1);
         string args = MapType(p0) + " " + CallArg(a, p0) + ", " + MapType(p1) + " " + CallArg(b, p1);
         string rt = MapType(m.type);
+        // an overloaded operator needs the mangled symbol -- `Owner_op_add`
+        // would not exist (and the plain name would collide between the
+        // overloads).
+        string sym = MethodSym(owner, m);
         if (rt == "void") {
-            L("  call void @" + owner + "_" + mn + "(" + args + ")");
+            L("  call void @" + sym + "(" + args + ")");
             return new ExprVal("0", MkType("void"));
         }
         string t = NT();
-        L("  " + t + " = call " + rt + " @" + owner + "_" + mn + "(" + args + ")");
+        L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
         return new ExprVal(t, m.type);
+    }
+
+    // The class that declares the operator `mn`, searched up the base chain
+    // of `cls`; null when neither the class nor its bases declares it.
+    Node OpDeclClass(Node cls, string mn) {
+        Node c = cls;
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == mn) { return c; }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        return null;
+    }
+
+    // The operator overload that fits the operand types. The host resolves
+    // op_* by argument type as well (`v + 2.5` must reach the double
+    // overload, `v + 7L` the long one), so a name-only lookup picks the wrong
+    // overload -- and the call it emits does not even type-check.
+    Node SelectOpOverload(Node cls, string mn, Node at0, Node at1) {
+        List<Node> cands = new List<Node>();
+        int i = 0;
+        while (i < cls.kids.Count) {
+            Node m = cls.kids[i];
+            if (m.kind == AK.MethodDecl() && m.sval == mn) { cands.Add(m); }
+            i = i + 1;
+        }
+        if (cands.Count == 0) { return null; }
+        if (cands.Count == 1) { return cands[0]; }
+        int best = -1000000;
+        Node pick = cands[0];
+        i = 0;
+        while (i < cands.Count) {
+            Node m = cands[i];
+            int s = OpArgScore(ParamTypeNode(m, 0), at0) + OpArgScore(ParamTypeNode(m, 1), at1);
+            if (s > best) { best = s; pick = m; }
+            i = i + 1;
+        }
+        return pick;
+    }
+
+    // How well an operator parameter type fits an operand type: an exact
+    // match wins, then the host's implicit widening order (int -> long ->
+    // float/double), a mismatch only loses.
+    int OpArgScore(Node pt, Node at) {
+        if (pt == null || at == null) { return 0; }
+        string p = TypeTag(pt);
+        string a = TypeTag(at);
+        if (p == a) { return 4; }
+        if (p == "object") { return 1; }
+        if (a == "int" || a == "short" || a == "byte" || a == "sbyte"
+            || a == "char" || a == "ushort" || a == "uint") {
+            if (p == "long" || p == "ulong") { return 3; }
+            if (p == "float" || p == "double") { return 2; }
+            return -1;
+        }
+        if (a == "long" || a == "ulong") {
+            if (p == "float" || p == "double") { return 2; }
+            return -1;
+        }
+        if (a == "float") {
+            if (p == "double") { return 1; }
+            return -1;
+        }
+        return -1;
+    }
+
+    // The operand's static type, with the int-literal suffix honoured: the
+    // host types `7L` as long (checker.c: AST_INT_LITERAL / lit_suffix), so
+    // `v + 7L` reaches the long overload. The value's own type is always int
+    // in the self-host, so the AST node is needed for the refinement.
+    Node OperandType(Node ast, ExprVal v) {
+        if (ast != null && ast.kind == AK.IntLit()) {
+            if (ast.suffix == 1) { return MkType("long"); }
+            if (ast.suffix == 2) { return MkType("uint"); }
+            if (ast.suffix == 3) { return MkType("ulong"); }
+        }
+        return v.ty;
     }
 
     bool ExprIsStr(Node e) {
@@ -1024,8 +1136,12 @@ partial class Irgen {
             if (e.op == TK.MinusEq()) { bop = TK.Minus(); }
             if (e.op == TK.StarEq()) { bop = TK.Star(); }
             if (e.op == TK.SlashEq()) { bop = TK.Slash(); }
+            // %= must be here too: without it a class operand falls through to
+            // the integer path below and the class pointer is fed to `srem`
+            // ("%t48 defined with type 'ptr' but expected 'i64'").
+            if (e.op == TK.PercentEq()) { bop = TK.Percent(); }
             if (bop != 0) {
-                ExprVal ov = TryOpOverload(bop, cur, r);
+                ExprVal ov = TryOpOverload(bop, cur, r, e.a, e.b);
                 if (ov != null) {
                     StoreTo(e.a, ov);
                     return ov;
@@ -4830,7 +4946,7 @@ partial class Irgen {
             if (ca != null) {
                 Node m = binder.FindMethod(ca, "op_eq");
                 if (m != null) {
-                    ExprVal r = TryOpOverload(TK.EqEq(), a, b);
+                    ExprVal r = TryOpOverload(TK.EqEq(), a, b, null, null);
                     if (r != null) {
                         string c = NT();
                         L("  " + c + " = icmp ne i64 " + r.op + ", 0");

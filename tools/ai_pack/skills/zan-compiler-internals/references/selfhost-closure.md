@@ -841,3 +841,35 @@ kernel32、shell32、user32、advapi32、version）。
   （`zanrt_io_mt.o` + 捆绑 `mingw/lib`），输出与宿主逐字一致。发行版的
   `zan_co_ready`/`zan_co_sched_init` 是强符号，压过自举的 weak 回退：帧真的
   被发行版的多 worker 调度器驱动，定时器的 ready hook 也是运行时的。
+
+## 44. 重载分派要按**实参类型**选，不能按名字取
+
+- 坑（实测）：自举的运算符分派用 `binder.FindMethod(cls, name)`——**按名字
+  取第一个**。三个后果：
+  1. 同名重载取错：`v + 2.5` 取了 int 重载，把 `2.5` 当 i64 实参传
+     （`floating point constant invalid for type`）；
+  2. 调用发的是**未 mangle 的符号** `Owner_op_add`，而定义侧带后缀
+     （`MethodSym`）→ 链接不上；
+  3. 运算符在**基类**声明时，调用指向操作数的静态类而不是声明类 → 符号
+     根本不存在。
+- 教训：重载分派的依据是**实参类型**（宿主口径），名字只是候选集；任何
+  "按名字取成员"的地方都要再问一句"取的是哪一个重载"。
+- 做法：先在类链里找**声明类**（类 → 基类，第一个声明该 `op_*` 的类），
+  再在声明类里收齐全部同名候选，按实参类型打分：精确匹配 4 分、
+  int→long 3 分、int→double 2 分、已知不匹配 -1 分；最后发
+  `MethodSym(声明类, m)`。
+- 坑：**调用侧的符号必须与定义侧一致**。定义侧 `GenMethod` 用
+  `MethodSym(cls.sval, m)`（声明类 + mangling），调用侧自己拼
+  `Owner_op_add` 就对不上（多重重载还会撞名）。
+- 坑：字面量的**类型带后缀**（`7L` 是 long，不是 int）。自举里字面量的值
+  类型一律 int，选型要用 AST 节点的 `suffix`（与宿主 `checker.c` 的
+  `AST_INT_LITERAL` / `lit_suffix` 同口径）。
+- 坑：复合赋值要**逐个**对齐运算符家族。`%=` 漏了 → 类指针被喂给 `srem`
+  （`'%t48' defined with type 'ptr' but expected 'i64'`）。宿主把
+  `+ - * / %` 映射到 `op_add/op_sub/op_mul/op_div/op_mod`（那张表在
+  `irgen_expr_core.c` 的 `infer_expr_type`），自举的 `OpName` 要与之一致。
+- 教训：**struct 的相等按值**。自举的 struct 是堆对象，指针同一性会把两个
+  相等的值判为不等；没有 `op_eq` 时逐字段比（`EmitStructEq`，列表元素那条
+  路径本来就在用）。
+- 门禁：`operator_overload` / `struct_operators` / `operator_relational`
+  进差分门（逐字一致）。
