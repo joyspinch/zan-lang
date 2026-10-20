@@ -71,6 +71,12 @@ Control.SizeClass("tiny")   // → "tiny"
   还原，档位因此只是"这一帧的排布"，不污染作者写下的 `Class`。
 - 未支持尺寸档的控件**不要**提供 `Size` 字段（避免"设了不生效"的
   假接口）。支持档位就必须把四档的 CSS 规则补齐。
+- 两个刻意的例外（档位只管一部分，不是漏做）：
+  - `textarea` 的档位只调**字号**，高度随内容走——多行盒按固定高度分档
+    会截断用户输入。
+  - `avatar` 的尺寸由显式直径字段决定，档位规则只作用于没设直径的
+    默认头像（`avatar.small` / `avatar.large` 改字号，`avatar.tiny`
+    没有更小的字号令牌可用）。
 
 ---
 
@@ -207,6 +213,11 @@ panel.With(a).With(b);
 
 - `scripts/style_audit.py`：间距/动效令牌化检查（挂在
   `scripts/check_structure.ps1`）。
+- `scripts/component_audit.py`：组件契约检查（同样挂在
+  `scripts/check_structure.ps1`）——kind 名单三处副本对齐
+  （运行期注册表 ↔ 编译期限定名单 ↔ 控件自己的 `Kind()`）、
+  `Size` 字段与 `SizeOf()` 配套、支持档位的控件四档 CSS 齐全、
+  实例方法不直调 `Style.Of` / `Style.Full`。
 - `tests/conformance/gui_size_tiers.*`：尺寸档与圆角的度量表。
 - `tests/conformance/gui_size_prop.*`：尺寸档作为控件通用能力的契约
   （四档生效 / 档位互斥 / 默认档不覆盖 class）。

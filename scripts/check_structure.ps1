@@ -87,6 +87,23 @@ if (Test-Path -LiteralPath $styleAudit) {
     }
 }
 
+# 6) component contract: the control-kind roster (runtime registry vs
+# compile-time list vs each control's own Kind()) and the style-resolution
+# entry points must line up. scripts/component_audit.py is the gate.
+$componentAudit = Join-Path $PSScriptRoot "component_audit.py"
+if (Test-Path -LiteralPath $componentAudit) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if ($py) {
+        $auditOut = & python $componentAudit 2>&1
+        $auditCode = $LASTEXITCODE
+        $auditOut | ForEach-Object { Write-Output ("COMPONENT " + $_) }
+        if ($auditCode -ne 0) {
+            Write-Output "STRUCTURE_FAILED component audit"
+            exit 1
+        }
+    }
+}
+
 foreach ($e in $errors) { Write-Output ("STRUCTURE_ERROR " + $e) }
 Write-Output ("[oversize] " + $stillOver.Count + " baselined file(s) still to split")
 if ($gone.Count -gt 0) {
