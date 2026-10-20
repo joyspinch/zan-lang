@@ -584,3 +584,10 @@ kernel32、shell32、user32、advapi32、version）。
   self-hosted compiler yet"（fail-closed），差分门里对应用例记在
   `tests/selfhost/diff_known_gaps.txt`（**已知缺口**），不要为了"全绿"把它
   悄悄放过，也不要假装通过。
+- 补充（同一批实测）：`async Task<T>` 这个**返回类型**的形状也要拆包——await
+  出来的值是**元素类型**（T），不是句柄。宿主在解析期改写（parser 的
+  `desugar_async_task_method`），自举拆晚了：检查器那一半漏了时，double 结果
+  落到 double 槽里成了指针（clang 拒 IR：`'%t8' defined with type 'ptr' but
+  expected 'double'`），而整数/字符串靠 inttoptr/ptrtoint 的**位往返碰巧**对
+  ——这类"碰巧对"最危险：差分门不收这个形状就没人知道。教训：**类型形状要按
+  元素拆，不按名字认**。

@@ -763,8 +763,17 @@
   「这个方法原本是 Task 形状」传给后端——自举的 ngen 后端现在靠**类型名**
   认 Task 形状（`ngen_async.zan` 的 `IsTaskShapedRetNg`），改写返回类型
   后必须换成看标记，否则接口的 Task 形状识别会失效。
-- ⚠ 本轮只做了检查器侧的一半（`checker.zan` 的 `CheckMethod` 对 async +
-  Task 形状返回类型改用元素类型当**方法体**的返回类型），够把 stdlib 里
-  `async Task SleepAsync` 的假阳性（`not all code paths return a value`）
-  消掉；parser 侧的改写与其配套的后端标记留到下一轮——它要动 ngen 路径，
-  而 ngen 路径没有差分门覆盖，不能盲改。
+- ⚠ 本轮做了两半：
+  1. **检查器侧**（`checker.zan` 的 `CheckMethod` 对 async + Task 形状返回
+     类型改用元素类型当**方法体**的返回类型），够把 stdlib 里
+     `async Task SleepAsync` 的假阳性（`not all code paths return a value`）
+     消掉；
+  2. **IR 后端侧**（`irgen_async.zan` 的 `AsyncElemTyOf`：await 的结果类型
+     取元素类型，`Task` → `void`）——原来 await 的结果类型是**句柄**类型，
+     整数与字符串靠 inttoptr/ptrtotr 的位往返**碰巧**对，double 结果就落到
+     double 槽里成了指针，clang 直接拒（`'%t8' defined with type 'ptr' but
+     expected 'double'`）。用例 `tests/conformance/async_task_result.zan`
+     钉住（进了差分门）。
+- 剩下：parser 侧的改写（`ValueTask` 拼写、接口声明补 `async` 标记）与它配套
+  的后端标记（ngen 路径）——要动 ngen，而 ngen 路径没有差分门覆盖，先给它补
+  一条最小回归门再动，不能盲改。

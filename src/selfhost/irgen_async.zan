@@ -509,6 +509,16 @@ partial class Irgen {
         string rv2 = NT(); L("  " + rv2 + " = load i64, i64* " + rs2);
         return new ExprVal(rv2, MkType("int"));
     }
+    // The result type of an awaited call: `Task<T>` -> T, a bare `Task` ->
+    // void (no result). A declared return type spelled `Task<T>` is the C#
+    // spelling of an async method -- the awaited value is the element.
+    Node AsyncElemTyOf(Node rt) {
+        if (rt == null) { return null; }
+        if (rt.sval != "Task") { return rt; }
+        if (rt.kids.Count == 1) { return rt.kids[0]; }
+        return MkType("void");
+    }
+
     // Lower `await <callExpr>`; returns the awaited result (+1 owned if ARC).
     ExprVal EmitAwait(Node callExpr) {
         if (curAsync && IsSocketIntrinsic(callExpr)) { return EmitSocketIntrinsic(callExpr); }
@@ -526,6 +536,15 @@ partial class Irgen {
         }
         Node resTy = MkType("int");
         if (sub.ty != null && sub.ty.a != null) { resTy = sub.ty.a; }
+        // A Task-shaped return (`async Task<T>`) carries the RESULT, not a
+        // handle: the awaited value has the element type. The C host's
+        // parser rewrites the declared return type the same way
+        // (desugar_async_task_method); without the unwrap the awaited value
+        // was typed as the handle -- the inttoptr/ptrtoint round trip kept
+        // the bits for pointers and integers, but a double result came out as
+        // a pointer and the store into the double slot was invalid IR
+        // (clang: "'%t8' defined with type 'ptr' but expected 'double'").
+        resTy = AsyncElemTyOf(resTy);
         string subv = sub.op;
         string subh = NT();
         L("  " + subh + " = bitcast i8* " + subv + " to i64*");

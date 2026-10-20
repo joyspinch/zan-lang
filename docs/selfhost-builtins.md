@@ -98,6 +98,14 @@ lambda/Action carries no result; declare 'Task' (not 'Task<T>') and wait with .W
 运行期直接 abort（宿主 `checker.c` 的注释与
 `tests/diag/task_run_action_result_type.zan` 是同一个理由）。
 
+**Task 形状的 async 返回类型**（`async Task<T> Foo()`）带的是**结果**，不是
+句柄：await 出来的值是**元素类型**。宿主在解析期就把声明的返回类型改写掉
+（`parser.c` 的 `desugar_async_task_method`：`async Task<int>` → `int`、
+`async Task` → `void`），自举在检查器与 IR 后端两处分别补了同一口径
+（检查器用元素类型判「所有路径都返回值」，后端取元素类型作为 await 的结果
+类型）。不拆包的后果很隐蔽：整数与字符串靠位往返**碰巧**对，double 结果落到
+double 槽里就成了指针，clang 直接拒 IR。
+
 **形状认识 ≠ 能降级**：自举还没有 `Task.Run` / `Task.Spawn` / `t.Wait()` /
 `t.Result` / `t.IsCompleted` / `Task.IsDone` 的**实现**——它们一律报
 "not supported by the self-hosted compiler yet"（fail-closed）。差分门里
