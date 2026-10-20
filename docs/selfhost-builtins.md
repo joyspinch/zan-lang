@@ -106,11 +106,19 @@ lambda/Action carries no result; declare 'Task' (not 'Task<T>') and wait with .W
 类型）。不拆包的后果很隐蔽：整数与字符串靠位往返**碰巧**对，double 结果落到
 double 槽里就成了指针，clang 直接拒 IR。
 
-**形状认识 ≠ 能降级**：自举还没有 `Task.Run` / `Task.Spawn` / `t.Wait()` /
-`t.Result` / `t.IsCompleted` / `Task.IsDone` 的**实现**——它们一律报
-"not supported by the self-hosted compiler yet"（fail-closed）。差分门里
-`task_run_action_handle` 按**已知缺口**记账
-（`tests/selfhost/diff_known_gaps.txt`），等 A385 的帧布局对齐后再销账。
+**形状认识 ≠ 能降级**这条边界现在只剩剩下的成员：任务句柄族
+（`Task.Run` / `Task.Spawn` / `t.Wait()` / `t.Result` / `t.IsCompleted` /
+`Task.IsDone`）已经降级，差分门里 `task_run_action_handle` 是**通过**而不是
+记账缺口（`tests/selfhost/diff_known_gaps.txt` 现在是空的）；还没降级的是
+`Task.Cancel` / `Task.WhenAll` / `Task.WhenAny` / `Task.Join*` /
+`Task.Yield` / `Task.IsCancellationRequested`，它们一律报
+"not supported by the self-hosted compiler yet"（fail-closed，不给错答案）。
+
+降级用的是**自举自己的帧布局**（句柄 = 帧指针，完成位/结果位各占一槽），
+没有对齐宿主 A385 的帧头——差分门比的是 stdout 逐字，不是帧字节，所以这条
+不算缺口。唯一已知的语义偏差：`Task.IsDone` 读到「还没完」时自举会让调度器
+跑一次（自举没有工作线程池，否则 `while (Task.IsDone(h) == 0) { }` 会死
+循环），宿主则直接查标志位。
 
 > 上表说的是**自举的 IR 后端**（`irgen*.zan`，差分门考的就是它）。**ngen 后端**
 > （`ngen*.zan`，直接发机器码）只降级了 `Console.Write` / `WriteLine` /
@@ -123,3 +131,8 @@ double 槽里就成了指针，clang 直接拒 IR。
 （`tests/run_selfhost_diff.cmake`）：同一个程序，宿主编一遍、自举编一遍，
 两边 stdout 逐字相同才算过。新降级的内建都要配一个 conformance 用例
 （`tests/conformance/<name>.zan` + `.out`）并进 `tests/selfhost/diff_cases.txt`。
+
+**诊断**的对齐由 reject 用例断言：`tests/selfhost/reject_cases.txt` 的一行
+可以带三段（`名字|||自举子串|||宿主子串`），第三段非空时门禁还会拿 **C 宿主**
+编同一个程序，要求**两侧用同一句诊断拒绝它**——光"都拒绝"不算对齐，措辞
+和位置都得逐字一致（措辞见宿主 `binder.c` 的 `binder_resolve_type`）。

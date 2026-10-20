@@ -365,10 +365,43 @@ public class Checker {
             + "declare 'Task' (not 'Task<T>') and wait with .Wait()", line, col);
     }
 
-    // A type node resolves if its base name is known. Generic args are checked
-    // recursively.
-    void CheckType(Node t) {
-        if (t == null) { return; }
+    // The number of type arguments a built-in generic takes, mirroring the
+    // C host's binder (src/compiler/binder.c): List, Span, ReadOnlySpan and
+    // Task take one, Dict and Dictionary take two. -1 = not a built-in
+    // generic (the host accepts any argument count for those silently).
+    int BuiltinGenericArity(string name) {
+        if (name == "List") { return 1; }
+        if (name == "Span") { return 1; }
+        if (name == "ReadOnlySpan") { return 1; }
+        if (name == "Task") { return 1; }
+        if (name == "Dict") { return 2; }
+        if (name == "Dictionary") { return 2; }
+        return -1;
+    }
+
+    // The number of type parameters a declared class/struct/enum declares
+    // (its own type parameters, not its methods').
+    int DeclTypeParamCount(Node decl) {
+        if (decl == null) { return 0; }
+        int n = 0;
+        int i = 0;
+        while (i < decl.kids.Count) {
+            if (decl.kids[i].kind == AK.TypeParam()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // Resolve one type reference the way the C host's binder does
+    // (src/compiler/binder.c: binder_resolve_type): find the base type,
+    // check the type-argument count, then resolve each argument. The
+    // diagnostics are collected instead of emitted so the caller can decide
+    // how often each one is reported -- the host resolves a method
+    // signature's types twice (the binder, then the checker in the method's
+    // own scope) and so reports a bad signature type twice.
+    List<Diag> TypeDiags(Node t) {
+        List<Diag> res = new List<Diag>();
+        if (t == null) { return res; }
         string name = t.sval;
         bool ok = binder.IsPrimitive(name);
         if (!ok) { ok = binder.IsBuiltinGeneric(name); }
@@ -376,13 +409,78 @@ public class Checker {
         if (!ok) { ok = binder.IsDelegateName(name); }
         if (!ok) { ok = name == "TypeInfo"; }   // builtin reflection handle
         if (!ok) { ok = name == "Task"; }        // builtin task handle (Task / Task<T>)
-        if (!ok) { if (binder.FindType(name) != null) { ok = true; } }
-        if (name == "Task" && binder.FindType(name) == null && t.kids.Count > 1) {
-            diags.Error("Task takes at most one type argument", t.line, t.col);
+        if (!ok) { ok = binder.FindType(name) != null; }
+        if (!ok) {
+            // the host stops here: an unresolved base type is not resolved
+            // any further, so its type arguments are never looked at
+            res.Add(new Diag("undefined type '" + name + "'", t.line, t.col, false));
+            return res;
         }
-        if (!ok) { diags.Error("unknown type '" + name + "'", t.line, t.col); }
+        // The type-argument count. The C host distinguishes three cases: a
+        // built-in generic (List/Span/ReadOnlySpan/Task take one argument,
+        // Dict/Dictionary take two), a declared class/struct/interface (as
+        // many arguments as it declares type parameters) and anything else
+        // that carries a declaration (an enum, a named delegate -- "the
+        // non-generic type 'X' cannot be used with type arguments").
+        int expected = BuiltinGenericArity(name);
+        bool plain = false;
+        if (expected < 0) {
+            Node decl = binder.FindType(name);
+            if (decl != null) {
+                if (decl.kind == AK.EnumDecl()) { plain = true; expected = 0; }
+                else { expected = DeclTypeParamCount(decl); }
+            } else {
+                Node ddel = binder.FindDelegate(name);
+                // Func and Action are built-in delegate types in the C host
+                // (src/compiler/binder.c resolves them before the scope
+                // lookup, so the stdlib's own declaration is shadowed): the
+                // host accepts any argument count for them.
+                if (ddel != null && name != "Func" && name != "Action") {
+                    expected = DeclTypeParamCount(ddel);
+                    if (expected == 0) { plain = true; }
+                }
+            }
+        }
+        if (t.kids.Count > 0) {
+            if (plain) {
+                res.Add(new Diag("the non-generic type '" + name
+                    + "' cannot be used with type arguments", t.line, t.col, false));
+                return res;
+            }
+            if (expected >= 0 && t.kids.Count != expected) {
+                res.Add(new Diag("using the generic type '" + name + "' requires "
+                    + expected + " type arguments (got " + t.kids.Count + ")",
+                    t.line, t.col, false));
+                return res;
+            }
+        }
         int i = 0;
-        while (i < t.kids.Count) { CheckType(t.kids[i]); i = i + 1; }
+        while (i < t.kids.Count) {
+            List<Diag> sub = TypeDiags(t.kids[i]);
+            int j = 0;
+            while (j < sub.Count) { res.Add(sub[j]); j = j + 1; }
+            i = i + 1;
+        }
+        return res;
+    }
+
+    // Report a type reference's diagnostics once.
+    void CheckType(Node t) {
+        List<Diag> ds = TypeDiags(t);
+        int i = 0;
+        while (i < ds.Count) { diags.Add(ds[i]); i = i + 1; }
+    }
+
+    // Report a method signature's type diagnostics twice: the C host
+    // resolves a method's return and parameter types in the binder and then
+    // again in the checker (each in its own scope), so a bad signature type
+    // is reported by both passes. The self-hosted checker mirrors that.
+    void CheckSignatureType(Node t) {
+        List<Diag> ds = TypeDiags(t);
+        int i = 0;
+        while (i < ds.Count) { diags.Add(ds[i]); i = i + 1; }
+        i = 0;
+        while (i < ds.Count) { diags.Add(ds[i]); i = i + 1; }
     }
 
     public void Check(Node unit) {
@@ -398,7 +496,7 @@ public class Checker {
         curClass = cls;
         if (cls.sval2 != "") {
             if (binder.FindType(cls.sval2) == null) {
-                diags.Error("unknown base type '" + cls.sval2 + "'", cls.line, cls.col);
+                diags.Error("undefined base type '" + cls.sval2 + "'", cls.baseLine, cls.baseCol);
             }
         }
         int i = 0;
@@ -413,7 +511,7 @@ public class Checker {
     }
 
     void CheckMethod(Node m, bool ctor) {
-        if (m.type != null) { CheckType(m.type); }
+        if (m.type != null) { CheckSignatureType(m.type); }
         scopeName = new List<string>(); scopeType = new List<Node>();
         loopDepth = 0;
         // An async method with a Task-shaped return type returns its RESULT,
@@ -432,7 +530,7 @@ public class Checker {
         while (i < m.kids.Count) {
             Node p = m.kids[i];
             if (p.kind == AK.Param()) {
-                CheckType(p.type);
+                CheckSignatureType(p.type);
                 if (ScopeHas(p.sval)) {
                     diags.Error("duplicate parameter '" + p.sval + "'", p.line, p.col);
                 }

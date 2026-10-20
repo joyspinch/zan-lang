@@ -198,7 +198,9 @@ endforeach()
 
 foreach(_r IN LISTS _rejects)
   # `name|||expected substring` pins the diagnostic; a bare `name` only asks
-  # for a refusal.
+  # for a refusal. A third field (`name|||self|||host`) additionally pins the
+  # C host's diagnostic: both compilers must refuse the program with the same
+  # wording.
   string(REPLACE "|||" ";" _rparts "${_r}")
   list(LENGTH _rparts _rnp)
   list(GET _rparts 0 _rname)
@@ -236,6 +238,35 @@ foreach(_r IN LISTS _rejects)
   else()
     math(EXPR _rejected "${_rejected} + 1")
     message(STATUS "REJECT ${_rname}: refused as expected")
+  endif()
+
+  # An optional third field pins the C host's diagnostic too:
+  # `name|||self-host substring|||host substring`. Such a case asserts that
+  # both compilers refuse the program with the *same wording* -- the
+  # self-host may not answer a program the host rejects with a diagnostic of
+  # its own.
+  if(_rnp GREATER 2)
+    list(GET _rparts 2 _rhost)
+    set(_rhexe "${OUTDIR}/reject_${_rname}_host.exe")
+    file(REMOVE ${_rhexe})
+    execute_process(
+      COMMAND ${ZANC} ${_rsrc} --auto-stdlib -o ${_rhexe}
+      WORKING_DIRECTORY ${WORKDIR}
+      RESULT_VARIABLE host_rc
+      OUTPUT_VARIABLE host_out
+      ERROR_VARIABLE host_err)
+    if(host_rc EQUAL 0)
+      math(EXPR _failures "${_failures} + 1")
+      message(SEND_ERROR "FAIL reject ${_rname}: the C host accepted the program the self-host must reject")
+    else()
+      string(FIND "${host_out}${host_err}" "${_rhost}" _rhost_hit)
+      if(_rhost_hit EQUAL -1)
+        math(EXPR _failures "${_failures} + 1")
+        message(SEND_ERROR "FAIL reject ${_rname}: the C host's diagnostic does not contain '${_rhost}' -- the two compilers do not agree on the wording")
+      else()
+        message(STATUS "REJECT ${_rname}: the C host refuses it with the same wording")
+      endif()
+    endif()
   endif()
 endforeach()
 
