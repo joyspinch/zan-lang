@@ -1,0 +1,213 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Cards;
+
+// 牌型识别与比较：中式卡牌（斗地主系）的一手牌是什么、能不能压过
+// 桌面上的一手牌、手牌里有哪些能出的牌型。
+//
+// 三件事的分工：
+//   Classify   —— 一手牌 → 牌型（不合法则 None）
+//   Beats      —— 两手牌比大小（王炸 > 炸弹 > 同型比点数）
+//   Candidates —— 从手牌枚举所有能压过桌面牌型的出法（AI 选牌的基础）
+//
+// 全程只认"点数"（int），不认花色与实例 id：游戏按 Combo.Ranks()
+// 反查自己的牌即可，包不接管牌库。
+public class ComboRules {
+    // 识别一手牌（默认规则集）。
+    public static Combo Classify(List<int> ranks) {
+        return ComboRules.ClassifyWith(ranks, ComboRuleSet.Default());
+    }
+
+    // 识别一手牌（指定规则集）。ranks 为空或含越界点数时返回 None。
+    public static Combo ClassifyWith(List<int> ranks, ComboRuleSet rules) {
+        Combo none = Combo.None();
+        if (ranks == null || rules == null) { return none; }
+        int n = ranks.Count;
+        if (n == 0) { return none; }
+        int[] cnt = ComboRules.Counts(ranks, rules.RankCount());
+        if (cnt == null) { return none; }
+
+        // 单张
+        if (n == 1) { return Combo.Of(ComboType.Single(), ranks[0], 0, ranks); }
+        // 王炸（两张王）
+        if (n == 2 && cnt[rules.RocketLow()] == 1 && cnt[rules.RocketHigh()] == 1) {
+            return Combo.Of(ComboType.Rocket(), rules.RocketHigh(), 0, ranks);
+        }
+        // 同点张数：四张优先，其次三张、对子
+        int trip = -1; int quad = -1; int pairRank = -1; int distinct = 0;
+        for (int v = 0; v < rules.RankCount(); v = v + 1) {
+            if (cnt[v] > 0) { distinct = distinct + 1; }
+            if (cnt[v] >= rules.BombSize()) { quad = v; }
+            else if (cnt[v] == 3) { trip = v; }
+            else if (cnt[v] == 2) { pairRank = v; }
+        }
+        // 对子
+        if (n == 2) {
+            if (cnt[ranks[0]] == 2) { return Combo.Of(ComboType.Pair(), ranks[0], 0, ranks); }
+            return none;
+        }
+        // 三张
+        if (n == 3 && trip >= 0) { return Combo.Of(ComboType.Triple(), trip, 0, ranks); }
+        // 四张：炸弹优先，其次三带一。
+        // 三张/四张都不在这里提前收口——规则集允许 3 张或 4 张顺子时
+        // （跑得快一类玩法），点数互不相同的一手要留给后面的顺子判定。
+        if (n == 4) {
+            if (quad >= 0) { return Combo.Of(ComboType.Bomb(), quad, 0, ranks); }
+            if (trip >= 0) { return Combo.Of(ComboType.TripleWithOne(), trip, 0, ranks); }
+        }
+        // 三带二
+        if (n == 5 && trip >= 0 && pairRank >= 0) {
+            return Combo.Of(ComboType.TripleWithPair(), trip, 0, ranks);
+        }
+        // 顺子：点数互不相同、全在顺子点数区间内、且连续
+        if (n >= rules.StraightMin() && n <= rules.StraightMax() && distinct == n) {
+            int lo = -1; int hi = -1; bool ok = true;
+            for (int v = 0; v < rules.RankCount(); v = v + 1) {
+                if (cnt[v] == 0) { continue; }
+                if (v < rules.StraightLow() || v > rules.StraightHigh()) { ok = false; }
+                if (lo < 0) { lo = v; }
+                hi = v;
+            }
+            if (ok && hi - lo + 1 == n) { return Combo.Of(ComboType.Straight(), hi, n, ranks); }
+            return none;
+        }
+        // 连对：每个点数各两张、点数在顺子区间内、且连续
+        if (n >= rules.PairStraightMin() * 2 && n % 2 == 0) {
+            int lo = -1; int hi = -1; bool ok = true;
+            for (int v = 0; v < rules.RankCount(); v = v + 1) {
+                if (cnt[v] == 0) { continue; }
+                if (cnt[v] != 2 || v < rules.StraightLow() || v > rules.StraightHigh()) { ok = false; }
+                if (lo < 0) { lo = v; }
+                hi = v;
+            }
+            if (ok && (hi - lo + 1) * 2 == n) { return Combo.Of(ComboType.PairStraight(), hi, n / 2, ranks); }
+        }
+        return none;
+    }
+
+    // a 能否压过 b。桌面为空（None）时任何合法牌型都能出。
+    public static bool Beats(Combo a, Combo b) {
+        if (a == null || a.IsNone()) { return false; }
+        if (b == null || b.IsNone()) { return true; }
+        if (a.Type() == ComboType.Rocket()) { return true; }
+        if (b.Type() == ComboType.Rocket()) { return false; }
+        if (a.Type() == ComboType.Bomb() && b.Type() != ComboType.Bomb()) { return true; }
+        if (b.Type() == ComboType.Bomb() && a.Type() != ComboType.Bomb()) { return false; }
+        if (a.Type() != b.Type()) { return false; }
+        if ((a.Type() == ComboType.Straight() || a.Type() == ComboType.PairStraight())
+            && a.Length() != b.Length()) { return false; }
+        return a.Key() > b.Key();
+    }
+
+    // 从手牌枚举所有能压过 table 的出法（默认规则集）。
+    public static List<Combo> Candidates(List<int> hand, Combo table) {
+        return ComboRules.CandidatesWith(hand, table, ComboRuleSet.Default());
+    }
+
+    // 从手牌枚举所有能压过 table 的出法（指定规则集）。
+    //
+    // 枚举的是"牌型全集"而不是"某一手牌的所有子集"：同点三张能拆成
+    // 三带一 / 三带二（配不同的带牌），顺子/连对按连续区间枚举。
+    // 桌面上没有牌（None）时返回所有可出的牌型。
+    public static List<Combo> CandidatesWith(List<int> hand, Combo table, ComboRuleSet rules) {
+        List<Combo> res = new List<Combo>();
+        if (hand == null || rules == null) { return res; }
+        int[] cnt = ComboRules.Counts(hand, rules.RankCount());
+        if (cnt == null) { return res; }
+
+        // 同点组合：单张 / 对子 / 三张 / 三带一 / 三带二 / 炸弹
+        for (int v = 0; v < rules.RankCount(); v = v + 1) {
+            if (cnt[v] >= 1) { ComboRules.Add(res, ComboRules.Repeat(v, 1), table, rules); }
+            if (cnt[v] >= 2) { ComboRules.Add(res, ComboRules.Repeat(v, 2), table, rules); }
+            if (cnt[v] >= 3) {
+                ComboRules.Add(res, ComboRules.Repeat(v, 3), table, rules);
+                for (int kick = 0; kick < rules.RankCount(); kick = kick + 1) {
+                    if (kick == v || cnt[kick] < 1) { continue; }
+                    List<int> one = ComboRules.Repeat(v, 3);
+                    one.Add(kick);
+                    ComboRules.Add(res, one, table, rules);
+                }
+                for (int kick = 0; kick < rules.RankCount(); kick = kick + 1) {
+                    if (kick == v || cnt[kick] < 2) { continue; }
+                    List<int> two = ComboRules.Repeat(v, 3);
+                    two.Add(kick);
+                    two.Add(kick);
+                    ComboRules.Add(res, two, table, rules);
+                }
+            }
+            if (cnt[v] >= rules.BombSize()) {
+                ComboRules.Add(res, ComboRules.Repeat(v, rules.BombSize()), table, rules);
+            }
+        }
+        // 王炸
+        if (cnt[rules.RocketLow()] > 0 && cnt[rules.RocketHigh()] > 0) {
+            List<int> rocket = new List<int>();
+            rocket.Add(rules.RocketLow());
+            rocket.Add(rules.RocketHigh());
+            ComboRules.Add(res, rocket, table, rules);
+        }
+        // 顺子
+        for (int len = rules.StraightMin(); len <= rules.StraightMax(); len = len + 1) {
+            for (int lo = rules.StraightLow(); lo + len - 1 <= rules.StraightHigh(); lo = lo + 1) {
+                bool ok = true;
+                for (int k = 0; k < len; k = k + 1) {
+                    if (cnt[lo + k] < 1) { ok = false; k = len; }
+                }
+                if (!ok) { continue; }
+                ComboRules.Add(res, ComboRules.Range(lo, lo + len - 1), table, rules);
+            }
+        }
+        // 连对
+        int maxPairs = rules.StraightHigh() - rules.StraightLow() + 1;
+        for (int pairs = rules.PairStraightMin(); pairs <= maxPairs; pairs = pairs + 1) {
+            for (int lo = rules.StraightLow(); lo + pairs - 1 <= rules.StraightHigh(); lo = lo + 1) {
+                bool ok = true;
+                for (int k = 0; k < pairs; k = k + 1) {
+                    if (cnt[lo + k] < 2) { ok = false; k = pairs; }
+                }
+                if (!ok) { continue; }
+                List<int> seq = new List<int>();
+                for (int k = 0; k < pairs; k = k + 1) {
+                    seq.Add(lo + k);
+                    seq.Add(lo + k);
+                }
+                ComboRules.Add(res, seq, table, rules);
+            }
+        }
+        return res;
+    }
+
+    // 识别牌型并按"能否压过 table"过滤，合法才收进结果。
+    static void Add(List<Combo> res, List<int> ranks, Combo table, ComboRuleSet rules) {
+        Combo c = ComboRules.ClassifyWith(ranks, rules);
+        if (c.IsNone()) { return; }
+        if (!ComboRules.Beats(c, table)) { return; }
+        res.Add(c);
+    }
+
+    // 统计各点数张数；点数越界返回 null（非法手牌）。
+    static int[] Counts(List<int> ranks, int rankCount) {
+        int[] cnt = new int[rankCount];
+        for (int i = 0; i < ranks.Count; i = i + 1) {
+            int v = ranks[i];
+            if (v < 0 || v >= rankCount) { return null; }
+            cnt[v] = cnt[v] + 1;
+        }
+        return cnt;
+    }
+
+    // 生成 count 个相同点数的列表。
+    static List<int> Repeat(int rank, int count) {
+        List<int> res = new List<int>();
+        for (int i = 0; i < count; i = i + 1) { res.Add(rank); }
+        return res;
+    }
+
+    // 生成 [lo, hi] 的连续升序点数列表。
+    static List<int> Range(int lo, int hi) {
+        List<int> res = new List<int>();
+        for (int v = lo; v <= hi; v = v + 1) { res.Add(v); }
+        return res;
+    }
+}
