@@ -3411,6 +3411,24 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_fold${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  add_test(NAME conformance_gui_codeeditor_ctxmenu
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
+  add_test(NAME conformance_gui_codeeditor_ctxmenu_ui
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_ui_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu_ui.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_ui${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_datatable
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

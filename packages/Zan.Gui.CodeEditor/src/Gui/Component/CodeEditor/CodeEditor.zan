@@ -271,6 +271,8 @@ partial class CodeEditor {
     int ctxX;
     int ctxY;
     string ctxCmd;          // 宿主 IDE 必须处理的命令（"find"/"gotoline"）
+    // 宿主追加的右键菜单项（action 落在宿主段 >= 100）。
+    List<ContextMenuItem> hostCtxItems;
 
     // ---- 外观（字体 + 语法颜色），由宿主经 ApplyTheme 设置 ----
     // edFont 是代码字号；0 表示"使用 UI 主题的中等字号"。
@@ -479,6 +481,7 @@ partial class CodeEditor {
         this.ctxX = 0;
         this.ctxY = 0;
         this.ctxCmd = "";
+        this.hostCtxItems = new List<ContextMenuItem>();
     }
 
     // 按 '\n' 把字符串拆分为行（去除 '\r'）。实现移至
@@ -1649,6 +1652,30 @@ partial class CodeEditor {
         return cmd;
     }
 
+    // 宿主追加右键菜单项：action 落在宿主段（>= 100），
+    // cmd 是宿主命令名。控件只负责摆菜单与回吐命令，不认识
+    // 具体命令语义——格式化/重命名/代码动作都由宿主落地。
+    void SetHostCtxItems(List<ContextMenuItem> items) {
+        if (items == null) {
+            this.hostCtxItems = new List<ContextMenuItem>();
+            return;
+        }
+        this.hostCtxItems = items;
+    }
+
+    // 宿主段动作 id → 命令名；没有对应项时返回空串。
+    string HostCtxCmd(int act) {
+        if (hostCtxItems == null) { return ""; }
+        for (int i = 0; i < hostCtxItems.Count; i = i + 1) {
+            if (hostCtxItems[i].action == act) { return hostCtxItems[i].cmd; }
+        }
+        return "";
+    }
+
+    // 最近一次右键点击位置：宿主弹层（代码动作菜单）的锚点。
+    int CtxAnchorX() { return ctxX; }
+    int CtxAnchorY() { return ctxY; }
+
     // 本地化标签：键式查找（System.Globalization.Lang），英文原文
     // 作键、内置中文为缺省串；语言包未加载时回退缺省串。
     public static string T(string en, string zh) {
@@ -1662,6 +1689,9 @@ partial class CodeEditor {
             new ContextMenuItem(CodeEditor.T("Copy", "复制"), "Ctrl+C", 2),
             new ContextMenuItem(CodeEditor.T("Paste", "粘贴"), "Ctrl+V", 3),
             new ContextMenuItem(CodeEditor.T("Delete", "删除"), "Del", 4),
+            new ContextMenuItem("", "", 0),
+            new ContextMenuItem(CodeEditor.T("Undo", "撤销"), "Ctrl+Z", 15),
+            new ContextMenuItem(CodeEditor.T("Redo", "重做"), "Ctrl+Y", 16),
             new ContextMenuItem("", "", 0),
             new ContextMenuItem(CodeEditor.T("Select All", "全选"), "Ctrl+A", 5),
             new ContextMenuItem("", "", 0),
@@ -1680,8 +1710,37 @@ partial class CodeEditor {
         return items;
     }
 
+    // 组装当前右键菜单：基础项 + 快速修复项 + 宿主项。
+    // 宿主项排在最后（宿主能力是 IDE 层的增值项），前面用
+    // 一条分隔行隔开。
+    List<ContextMenuItem> BuildCtxMenuItems() {
+        List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
+        // 快速修复：光标所在行使用了
+        // 未导入命名空间的 stdlib 类型时，提示插入缺失的 `using`。
+        string qfNs = QuickFixNs();
+        if (qfNs.Length > 0) {
+            menuItems.Insert(0, new ContextMenuItem("", "", 0));
+            menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
+        }
+        if (hostCtxItems != null && hostCtxItems.Count > 0) {
+            menuItems.Add(new ContextMenuItem("", "", 0));
+            for (int hi = 0; hi < hostCtxItems.Count; hi = hi + 1) {
+                menuItems.Add(hostCtxItems[hi]);
+            }
+        }
+        return menuItems;
+    }
+
     // 按 id 执行右键菜单动作（见 BuildCtxMenu）。
     void RunCtxAction(App app, int act) {
+        this.DispatchCtxAction(act);
+        if (app != null) { app.RequestRedraw(); }
+    }
+
+    // 派发右键菜单动作：控件内行为直接执行，宿主命令写进
+    // ctxCmd（宿主经 TakeCommand() 取走）。与 RunCtxAction
+    // 同一条路径，只是没有窗口上下文时也能用。
+    void DispatchCtxAction(int act) {
         if (act == 1) { CutSelection(); CheckErrors(); }
         else if (act == 2) { CopySelection(); }
         else if (act == 3) { PasteClipboard(); CheckErrors(); UpdateCompletion(); }
@@ -1696,9 +1755,14 @@ partial class CodeEditor {
         else if (act == 12) { ctxCmd = "findrefs"; }
         else if (act == 13) { AddCaretAbove(); }
         else if (act == 14) { AddCaretBelow(); }
+        else if (act == 15) { Undo(); CheckErrors(); }
+        else if (act == 16) { Redo(); CheckErrors(); }
         else if (act == 20) { ApplyQuickFix(); }
+        else if (act >= 100) {
+            string hc = HostCtxCmd(act);
+            if (hc.Length > 0) { ctxCmd = hc; }
+        }
         ctxOpen = false;
-        app.RequestRedraw();
     }
 
     // 右键菜单当前是否打开。
@@ -1716,14 +1780,7 @@ partial class CodeEditor {
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         if (lineH < 1) { lineH = 1; }
 
-        List<ContextMenuItem> menuItems = CodeEditor.BuildCtxMenu();
-        // 快速修复：光标所在行使用了
-        // 未导入命名空间的 stdlib 类型时，提示插入缺失的 `using`。
-        string qfNs = QuickFixNs();
-        if (qfNs.Length > 0) {
-            menuItems.Insert(0, new ContextMenuItem("", "", 0));
-            menuItems.Insert(0, new ContextMenuItem(CodeEditor.T("Add using ", "添加 using ") + qfNs + ";", "Ctrl+.", 20));
-        }
+        List<ContextMenuItem> menuItems = this.BuildCtxMenuItems();
         int itemH = lineH;
         int sepH = app.Scale(7);
         int mW = app.Scale(150);

@@ -1,0 +1,101 @@
+using System;
+using System.Collections.Generic;
+using Gui.Component.CodeEditor;
+
+namespace CodeEditorCtxMenuTest;
+
+// 代码编辑区右键菜单回归：三件事——
+// ①基础菜单项的完整动作序列（撤销/重做进菜单，既有项不丢）；
+// ②宿主段（action >= 100）经 SetHostCtxItems 注入后排在菜单
+// 末尾、前一条是分隔行，命令名可查（HostCtxCmd）；
+// ③动作派发：撤销/重做改文本，宿主项把命令名交给
+// TakeCommand() 回吐（取一次即清空）。
+class Program {
+    static int fails;
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void CheckBool(string what, bool value) {
+        if (value) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static int ActionIndex(List<ContextMenuItem> items, int action) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == action) { return i; }
+        }
+        return -1;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        // ---- ① 基础菜单动作序列 ----
+        List<int> want = new List<int>();
+        want.Add(1); want.Add(2); want.Add(3); want.Add(4); want.Add(0);
+        want.Add(15); want.Add(16); want.Add(0);
+        want.Add(5); want.Add(0);
+        want.Add(6); want.Add(7); want.Add(8); want.Add(0);
+        want.Add(13); want.Add(14); want.Add(0);
+        want.Add(11); want.Add(12); want.Add(0);
+        want.Add(9); want.Add(10);
+        List<ContextMenuItem> baseItems = CodeEditor.BuildCtxMenu();
+        EqInt("base item count", baseItems.Count, want.Count);
+        for (int i = 0; i < want.Count; i = i + 1) {
+            if (i >= baseItems.Count) { break; }
+            EqInt("base action[" + Convert.ToString(i) + "]", baseItems[i].action, want[i]);
+        }
+        CheckBool("undo item present", ActionIndex(baseItems, 15) >= 0);
+        CheckBool("redo item present", ActionIndex(baseItems, 16) >= 0);
+        CheckBool("undo before redo", ActionIndex(baseItems, 15) < ActionIndex(baseItems, 16));
+
+        // ---- ② 宿主项注入 ----
+        CodeEditor e = new CodeEditor();
+        e.LoadText("alpha\nbeta");
+        ContextMenuItem host = new ContextMenuItem("Format Document", "Shift+Alt+F", 100);
+        host.cmd = "format";
+        List<ContextMenuItem> hostItems = new List<ContextMenuItem>();
+        hostItems.Add(host);
+        e.SetHostCtxItems(hostItems);
+        EqStr("host cmd lookup", e.HostCtxCmd(100), "format");
+        EqStr("unknown host cmd", e.HostCtxCmd(999), "");
+
+        List<ContextMenuItem> all = e.BuildCtxMenuItems();
+        int hostIdx = ActionIndex(all, 100);
+        EqInt("host item is last", hostIdx, all.Count - 1);
+        EqInt("separator before host items", all[all.Count - 2].action, 0);
+
+        // ---- ③ 动作派发 ----
+        e.DispatchCtxAction(100);
+        EqStr("host command returned", e.TakeCommand(), "format");
+        EqStr("command taken once", e.TakeCommand(), "");
+
+        e.LoadText("one");
+        e.SaveUndo();
+        e.LoadText("two");
+        e.DispatchCtxAction(15);
+        EqStr("undo restores text", e.GetText(), "one");
+        e.DispatchCtxAction(16);
+        EqStr("redo reapplies text", e.GetText(), "two");
+
+        // 右键锚点：宿主弹层用得到点击位置。
+        e.ctxX = 42;
+        e.ctxY = 17;
+        EqInt("anchor x", e.CtxAnchorX(), 42);
+        EqInt("anchor y", e.CtxAnchorY(), 17);
+
+        Console.WriteLine(fails == 0 ? "OK" : "FAILS " + Convert.ToString(fails));
+    }
+}

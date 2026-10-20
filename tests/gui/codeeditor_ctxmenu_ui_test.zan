@@ -1,0 +1,118 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CodeEditor;
+
+// 代码编辑区右键菜单的实机回归（无头 UiDriver）：真事件
+// 管线里右键是否真弹出菜单、菜单里有没有撤销/重做与宿主项、
+// 点宿主项是否把命令名交给宿主（TakeCommand）并关闭菜单。
+//
+// 事件节拍：UiDriver 一次 click 注入 move+press+release 三个
+// 事件，一帧只消费一个，所以每次注入后要多喂几帧，press 与
+// release 才会分别落到帧里（少喂一帧只会看到按下，菜单点不中）。
+class CodeEditorCtxMenuUiTest {
+    static int fails;
+    static App app;
+    static CodeEditor ed;
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void Body() {
+        ed.Render(app, new Rect(40, 60, 640, 400));
+        // 宿主必须调控件的菜单渲染（IDE 在帧末也这么做）：
+        // 菜单的绘制与点击命中都在这里。
+        ed.RenderCtxMenu(app);
+    }
+
+    static void Frame() {
+        app.PumpGuarded();
+        app.FrameGuarded(CodeEditorCtxMenuUiTest.Body);
+    }
+
+    static void Frames(int n) {
+        for (int i = 0; i < n; i = i + 1) { Frame(); }
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("ctxmenu-ui", 1200, 900);
+        app.Show();
+        app.RequestAnimationFrame(16);
+
+        ed = new CodeEditor();
+        ed.documentPath = "probe.zan";
+        ed.LoadText("class Program {\n    static void Main() { }\n}\n");
+        // 宿主段：模拟 IDE 注入"格式化文档"。
+        List<ContextMenuItem> hosts = new List<ContextMenuItem>();
+        ContextMenuItem h = new ContextMenuItem("Format Document", "Shift+Alt+F", 100);
+        h.cmd = "format";
+        hosts.Add(h);
+        ed.SetHostCtxItems(hosts);
+
+        Frames(2);
+
+        // 驱动白盒最小初始化（与 uidriver_label_click_test 同一套）。
+        UiDriver.app = app;
+        UiDriver.resultsPath = "build/ctxmenu_ui_results.log";
+        UiDriver.probes = new List<UiProbe>();
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+
+        // ---- 右键弹出菜单 ----
+        bool ok = UiDriver.Exec("rclick 120 120");
+        EqInt("rclick accepted", ok ? 1 : 0, 1);
+        Frames(5);
+        EqInt("menu open after right click", ed.CtxMenuOpen() ? 1 : 0, 1);
+
+        // ---- 菜单内容：撤销/重做 + 宿主项 ----
+        List<ContextMenuItem> items = ed.BuildCtxMenuItems();
+        int hostIdx = -1;
+        bool hasUndo = false;
+        bool hasRedo = false;
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == 15) { hasUndo = true; }
+            if (items[i].action == 16) { hasRedo = true; }
+            if (items[i].action == 100) { hostIdx = i; }
+        }
+        EqInt("undo in menu", hasUndo ? 1 : 0, 1);
+        EqInt("redo in menu", hasRedo ? 1 : 0, 1);
+        EqInt("host item is last", hostIdx, items.Count - 1);
+        EqInt("separator before host items", items[items.Count - 2].action, 0);
+
+        // ---- 点宿主项：命令回吐给宿主，菜单关闭 ----
+        int fontSize = Style.FontFallback(app, "medium");
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        int sepH = app.Scale(7);
+        int mH = app.Scale(6);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == 0) { mH = mH + sepH; } else { mH = mH + lineH; }
+        }
+        int mY = ed.CtxAnchorY();
+        if (mY + mH > app.canvas.Height()) { mY = app.canvas.Height() - mH - app.Scale(4); }
+        if (mY < app.titlebarH) { mY = app.titlebarH; }
+        int y = mY + app.Scale(3);
+        for (int i = 0; i < hostIdx; i = i + 1) {
+            if (items[i].action == 0) { y = y + sepH; } else { y = y + lineH; }
+        }
+        int x = ed.CtxAnchorX() + 10;
+        bool ok2 = UiDriver.Exec("click " + Convert.ToString(x) + " " + Convert.ToString(y));
+        EqInt("click accepted", ok2 ? 1 : 0, 1);
+        Frames(5);
+        EqStr("host command returned", ed.TakeCommand(), "format");
+        EqInt("menu closed after click", ed.CtxMenuOpen() ? 1 : 0, 0);
+
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+        Console.WriteLine(fails == 0 ? "OK" : "FAILS " + Convert.ToString(fails));
+    }
+}
