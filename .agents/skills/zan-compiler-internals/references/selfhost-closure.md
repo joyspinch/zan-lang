@@ -1081,4 +1081,44 @@ kernel32、shell32、user32、advapi32、version）。
   否则 LLVM 里越界的移位计数是 poison（宿主的 `mask_shift_count` 同口径）。
 - 门禁：`ushr_operator` 进差分门（逐字一致）。
 
+## 55. 静态构造器：`static C() { ... }`
+
+- 坑（实测）：自举把静态构造器当**实例**构造器发射（带 `%this` 形参），
+  它于是永远不被调用 → 类里的静态字段停在初值（`Registry.doubled` 是 0
+  而不是 6）。
+- 宿主口径（实测，探针 `p_sctor` / `p_sctor2`）：
+  - 静态构造器**在程序入口就跑**（早于 Main），按**声明顺序**；
+  - 每个类内部：**先**静态字段初始化器，**再**静态构造器；
+  - 静态构造器**不是**实例构造器：不参与 `new C(...)` 的重载集（宿主把
+    `static C()` 和 `C()` 判成"重复构造器"）。
+- 做法：`GenStaticCtor` 发一个 `@<Class>_sctor()`（无接收者），`EmitStaticInits`
+  在该类的静态字段初始化器之后调用它；`FindCtor` / `FindCtorArity` /
+  `CtorDeclCount` / `ResolveCtorEx` 都要**跳过**静态构造器（否则
+  `new C()` 会挑中它，或者符号名撞车）。
+
+## 56. 表达式里的简单名：局部 > 字段 > 类型
+
+- 坑（实测）：类 `Emitter` 有字段 `Collapse`，另有类 `Collapse`：
+  `Collapse.Add("x")` 被当成**静态调用** `Collapse.Add` → 字段里的列表没收
+  到元素（`Count()` 是 0 而不是 2）。
+- 宿主口径：表达式里的简单名按**最内层声明**绑定——局部变量、然后是外层类
+  的字段、最后才是类型名。字段与类型同名时，**字段赢**。
+- 做法：`ShadowsTypeName(name)`（当前类有同名的实例字段或静态字段）→ 静态
+  接收者的两条入口都要让路：`GenMember` 的类型接收者分支、`GenCall` 的
+  `Cls.Method(...)` 分支。
+
+## 57. null 字符串：软失败读零页
+
+- 坑（实测）：自举的 `zstr_len` 直接读 `-8` 处的头 → 空指针崩溃；字符串
+  下标更是直接 GEP+load → 0xC0000005，**整个程序一个输出都没有**（stdout
+  缓冲区随崩溃一起丢，看起来像"用例没输出"）。
+- 宿主口径：null 字符串是**运行期软错误**——带源位置报告一句，然后**换到
+  scratch 页继续执行**：长度探针答 0，下标读出 NUL（打印出来是空行）。
+- 做法：`zstr_len` 先判 null → 答 0；字符串下标把基址与下标都 select 成
+  零页（`@.zeropage`）与 0 → 读出 NUL。
+- 坑：自举的 IR 路径**没有运行期报告通道**（报告只在编译期），所以这条
+  用例的 stderr 与宿主不同（stdout 一致）。
+- 门禁：`static_constructor` / `static_object_fields` /
+  `field_shadows_type` / `null_string_index` 进差分门（逐字一致）。
+
 

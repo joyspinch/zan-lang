@@ -1192,6 +1192,14 @@ partial class Irgen {
         }
     }
 
+    // `new object()`: a bare heap object with no fields. It only needs a
+    // destructor -- the ARC runtime frees the storage.
+    void EmitObjectRuntime() {
+        H("define void @__zan_object_dtor(i8* %p) {");
+        H("  ret void");
+        H("}");
+    }
+
     // ---- inheritance / virtual dispatch helpers ----
     Node BaseClassOf(Node cls) {
         if (cls == null) { return null; }
@@ -1337,6 +1345,16 @@ partial class Irgen {
                         }
                     }
                     j = j + 1;
+                }
+                // the class's static constructor runs after its static field
+                // initializers (the C host's order)
+                int k = 0;
+                while (k < d.kids.Count) {
+                    Node cm = d.kids[k];
+                    if (cm.kind == AK.CtorDecl() && IsStatic(cm)) {
+                        L("  call void @" + StaticCtorSym(d.sval) + "()");
+                    }
+                    k = k + 1;
                 }
             }
             i = i + 1;
@@ -1587,6 +1605,9 @@ partial class Irgen {
         H("@.msg.exnil = private unnamed_addr constant [13 x i8] c\"(no message)\\00\"");
         H("@.msg.rderr = private unnamed_addr constant [18 x i8] c\"cannot read file\\0A\\00\"");
         H("@.msg.wrerr = private unnamed_addr constant [19 x i8] c\"cannot write file\\0A\\00\"");
+        // a zero page: a null string reads from it instead of crashing (the
+        // C host switches a null base to a scratch page and keeps running)
+        H("@.zeropage = private unnamed_addr constant [16 x i8] zeroinitializer");
         EmitArcRuntime();
         EmitListRuntime();
         EmitSbRuntime();
@@ -1596,6 +1617,7 @@ partial class Irgen {
         // the built-in containers carry a class id, so the runtime type test
         // can recognise them
         EmitContainerTids();
+        EmitObjectRuntime();
         // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
@@ -2373,6 +2395,14 @@ partial class Irgen {
         H("}");
         H("define i64 @zstr_len(i8* %p) {");
         H("entry:");
+        // a null string is a soft runtime error in the C host: it reports and
+        // answers 0 (the program keeps running). The self-host has no
+        // runtime report channel here, so it answers 0 as well.
+        H("  %isnull = icmp eq i8* %p, null");
+        H("  br i1 %isnull, label %nullstr, label %probe");
+        H("nullstr:");
+        H("  ret i64 0");
+        H("probe:");
         H("  %mp = getelementptr i8, i8* %p, i64 -8");
         H("  %m = load i64, i64* %mp");
         H("  %ok = icmp eq i64 %m, 1515082580");
@@ -3191,7 +3221,12 @@ partial class Irgen {
                 }
                 else if (!IsAbstract(m)) { GenMethod(cls, m, false); }
             }
-            else if (m.kind == AK.CtorDecl()) { GenCtor(cls, m); }
+            else if (m.kind == AK.CtorDecl()) {
+                // a static constructor is not an instance constructor: it has
+                // no receiver and runs once at program entry
+                if (IsStatic(m)) { GenStaticCtor(cls, m); }
+                else { GenCtor(cls, m); }
+            }
             i = i + 1;
         }
         // A class whose inheritance chain declares instance field initializers

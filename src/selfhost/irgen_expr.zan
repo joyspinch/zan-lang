@@ -1989,8 +1989,20 @@ partial class Irgen {
         }
         return null;
     }
+    // A simple name in an expression binds to the innermost declaration: a
+    // local, then a field of the enclosing class, and only then a type. A
+    // field named like a type shadows that type -- `Collapse.Add(...)` with
+    // a `Collapse` field is a call on the field, not on the class.
+    bool ShadowsTypeName(string name) {
+        if (curClass == "") { return false; }
+        Node cls = binder.FindType(curClass);
+        if (cls == null) { return false; }
+        if (FieldIndex(cls, name) >= 0) { return true; }
+        return FindStaticField(cls, name) != null;
+    }
+
     ExprVal GenMember(Node e) {
-        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0) {
+        if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
             // Console.ForegroundColor / Console.BackgroundColor: the current
             // color, kept in a module-level slot by the C host.
             if (e.a.sval == "Console") {
@@ -2159,8 +2171,19 @@ partial class Irgen {
         ExprVal obj = GenExpr(e.a);
         ExprVal idx = GenExpr(e.b);
         if (IsStr(obj.ty)) {
+            // a null string is a soft runtime error in the C host: it reports
+            // and reads a scratch page, so the program keeps running and the
+            // element reads as NUL. The self-host switches to a zero page.
+            string isn = NT();
+            L("  " + isn + " = icmp eq i8* " + obj.op + ", null");
+            string zp = NT();
+            L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
+            string bstr = NT();
+            L("  " + bstr + " = select i1 " + isn + ", i8* " + zp + ", i8* " + obj.op);
+            string sidx = NT();
+            L("  " + sidx + " = select i1 " + isn + ", i64 0, i64 " + idx.op);
             string p = NT();
-            L("  " + p + " = getelementptr i8, i8* " + obj.op + ", i64 " + idx.op);
+            L("  " + p + " = getelementptr i8, i8* " + bstr + ", i64 " + sidx);
             string ch = NT();
             L("  " + ch + " = load i8, i8* " + p);
             string z = NT();
@@ -2357,6 +2380,14 @@ partial class Irgen {
         // constant paths — no heap allocation, no dtor
         if (cn == "Vector128" || cn == "Vector256") {
             return new ExprVal("zeroinitializer", ty);
+        }
+        if (cn == "object") {
+            // `new object()`: a bare heap object with no fields (the C host's
+            // builtin object class). It is a real instance -- `o != null` holds.
+            string oraw = NT();
+            L("  " + oraw + " = call i8* @zalloc(i64 8, i8* bitcast (void (i8*)* @__zan_object_dtor to i8*), i8* null)");
+            AddTemp(oraw, ty);
+            return new ExprVal(oraw, ty);
         }
         Node cls = binder.FindType(cn);
         if (cls == null) { return new ExprVal("null", ty); }
@@ -4149,7 +4180,8 @@ partial class Irgen {
             Node obj = callee.a;
             string mname = callee.sval;
             // static call: ClassName.Method(...)
-            if (obj.kind == AK.Ident() && binder.FindType(obj.sval) != null && LocalIdx(obj.sval) < 0) {
+            if (obj.kind == AK.Ident() && binder.FindType(obj.sval) != null
+                && LocalIdx(obj.sval) < 0 && !ShadowsTypeName(obj.sval)) {
                 Node stc = binder.FindType(obj.sval);
                 // delegate-typed static field invoked as Cls.f(args)
                 if (FindMethodUp(stc, mname) == null) {
