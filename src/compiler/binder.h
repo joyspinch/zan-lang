@@ -161,4 +161,8 @@ zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
 
+/* null 字面量实参 → 形参类型的匹配分。<0 表示不兼容（null 绑不上去）。
+ * checker 与 irgen 两侧的重载分解共用这一条规则。 */
+int zan_null_arg_score(zan_type_t *pt);
+
 #endif /* ZAN_BINDER_H */

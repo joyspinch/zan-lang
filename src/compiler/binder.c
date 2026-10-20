@@ -731,6 +731,35 @@ static bool type_is_value_kind(zan_type_t *t) {
     }
 }
 
+/* null 字面量实参 → 形参类型的匹配分。<0 表示不兼容（null 绑不上去）。
+ *
+ * 踩过的坑：`Arg.Text(null)`——Text 有 int/long/double/bool/string 五个重载——
+ * 以前会走到 `Text(int)`：null 被当成 0 传下去，调用点看不出任何异常，
+ * 断言却永远对不上。根因是**两侧各自分解一次**：checker 的打分把 null 的
+ * 静态类型（object）当成"可赋值给引用类型"，而 irgen 的 `concrete_arg_score`
+ * 对 null 实参推断不出类型、一律给 0 分，于是**第一个**重载（值类型）被选中。
+ *
+ * 现在两侧共用这一条规则：
+ *   - null 只能绑到接得住 null 的形参（引用类型 / 可空类型），
+ *   - object 最不具体（1 分），具体引用类型与可空类型同分（3 分），
+ *   - 值类型形参接不住 null（-1，判为不兼容）。
+ */
+int zan_null_arg_score(zan_type_t *pt) {
+    if (!pt) return 0;
+    switch (pt->kind) {
+    case TYPE_OBJECT:
+        return 1;
+    case TYPE_NULLABLE:
+    case TYPE_STRING: case TYPE_CLASS: case TYPE_INTERFACE: case TYPE_ARRAY:
+    case TYPE_DELEGATE: case TYPE_TASK:
+        return 3;
+    case TYPE_TYPE_PARAM:
+        return 0;   /* 泛型形参：既可能装值也可能装引用，不在此处判决 */
+    default:
+        return -1;  /* 值类型形参接不住 null */
+    }
+}
+
 zan_type_t *zan_binder_make_nullable_type(zan_binder_t *b, zan_type_t *elem) {
     if (!elem || elem == b->type_error || elem->kind == TYPE_NULLABLE ||
         !type_is_value_kind(elem))

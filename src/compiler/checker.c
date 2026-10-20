@@ -1606,6 +1606,30 @@ static zan_symbol_t *checker_find_method_call(zan_symbol_t *type_sym,
     return fallback;
 }
 
+/* 同一个实参上的"null 绑不上值类型形参"只报一次：唯一方法路径
+ * （check_call_arg_type）与重载路径（checker_find_method_typed）会撞上
+ * 同一处，报两遍只是噪音。 */
+static bool checker_report_null_arg_mismatch(zan_checker_t *c,
+                                             zan_ast_node_t *arg,
+                                             zan_type_t *pt, int index,
+                                             zan_istr_t sig_name) {
+    if (!arg || !pt) return false;
+    zan_loc_t loc = arg->loc;
+    if (c->has_null_arg_reported &&
+        c->null_arg_reported.file_id == loc.file_id &&
+        c->null_arg_reported.line == loc.line &&
+        c->null_arg_reported.col == loc.col &&
+        c->null_arg_reported.offset == loc.offset)
+        return false;
+    c->has_null_arg_reported = true;
+    c->null_arg_reported = loc;
+    zan_diag_emit(c->diag, DIAG_ERROR, loc,
+                  "cannot convert 'null' to '%s' in argument %d of '%.*s': "
+                  "null cannot be assigned to a value type",
+                  type_name(pt), index + 1, (int)sig_name.len, sig_name.str);
+    return true;
+}
+
 static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_symbol_t *type_sym,
                                                 zan_istr_t name,
@@ -1613,6 +1637,9 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                                                 zan_type_t **args) {
     zan_symbol_t *best = NULL;
     int best_score = -1;
+    /* null 实参把候选判死的现场：留一份用于报错（见函数末尾）。 */
+    zan_type_t *null_bad_type = NULL;
+    int null_bad_index = -1;
     int argc = call->call.args.count;
     int type_arg_count = call->call.type_args.count;
     for (zan_symbol_t *s = type_sym; s;
@@ -1641,6 +1668,21 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 if (!pt || !at || pt->kind == TYPE_ERROR ||
                     at->kind == TYPE_ERROR || pt->kind == TYPE_TYPE_PARAM ||
                     at->kind == TYPE_TYPE_PARAM) continue;
+                /* null 字面量：只能绑到接得住 null 的形参（与 irgen 同一条
+                 * 规则，见 zan_null_arg_score）。 */
+                if (arg->kind == AST_NULL_LITERAL) {
+                    int ns = zan_null_arg_score(pt);
+                    if (ns < 0) {
+                        if (!null_bad_type) {
+                            null_bad_type = pt;
+                            null_bad_index = j;
+                        }
+                        compatible = false;
+                        break;
+                    }
+                    score += ns;
+                    continue;
+                }
                 if (checker_type_equal(pt, at)) { score += 4; continue; }
                 if (checker_type_assignable(pt, at)) { score += 1; continue; }
                 if (checker_has_user_conversion(c, pt, at)) continue;
@@ -1655,6 +1697,16 @@ static zan_symbol_t *checker_find_method_typed(zan_checker_t *c,
                 best_score = score;
             }
         }
+    }
+    if (!best && null_bad_type) {
+        /* 没有任何重载接得住这个 null：报错，不要退回"第一个同名方法"，
+         * 否则 null 又会被悄悄当成值类型实参传下去。 */
+        zan_ast_node_t *bad_arg =
+            (null_bad_index >= 0 && null_bad_index < argc)
+                ? call->call.args.items[null_bad_index] : NULL;
+        checker_report_null_arg_mismatch(c, bad_arg, null_bad_type,
+                                         null_bad_index, name);
+        return NULL;
     }
     return best ? best : checker_find_method_call(type_sym, name, argc, type_arg_count);
 }
@@ -1838,6 +1890,12 @@ static void check_call_arg_type(zan_checker_t *c, zan_symbol_t *sig, int index,
                           "'%.*s': a void call has no result",
                           index + 1, (int)sig->name.len, sig->name.str);
         }
+        return;
+    }
+    /* null 字面量绑不上值类型形参（唯一方法时没有重载可选，必须在这里
+     * 报错：以前它会一路走到 irgen，被当成 0 传下去）。 */
+    if (arg && arg->kind == AST_NULL_LITERAL && zan_null_arg_score(pt) < 0) {
+        checker_report_null_arg_mismatch(c, arg, pt, index, sig->name);
         return;
     }
     if (!checker_arg_type_mismatch(c, pt, arg_type)) return;

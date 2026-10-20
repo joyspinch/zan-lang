@@ -1313,6 +1313,19 @@ add_test(NAME diag_ctor_arg_count
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_arg_count PROPERTIES TIMEOUT 60)
 
+# A null literal cannot be bound to a value-type parameter: the checker used
+# to let it through (or silently pick the value-type overload), and the null
+# then travelled to the callee as 0 -- the call site looked fine while every
+# assertion downstream disagreed.
+add_test(NAME diag_null_to_value_type
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_to_value_type.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_to_value_type${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'null' to 'int'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_null_to_value_type PROPERTIES TIMEOUT 60)
+
 # Regression (A277): the bare-name extern call path overflowed a 16-entry
 # parameter-type array with 17+ parameters, surfacing as a bogus LLVM
 # verification error. It must now reach the linker (which reports the missing
