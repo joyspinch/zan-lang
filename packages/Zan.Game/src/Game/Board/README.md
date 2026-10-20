@@ -46,3 +46,32 @@ int best = ai.BestMove(game);
 - Move ordering is the biggest lever: search the most promising moves first
   and the beta cut-off prunes far more branches.
 
+### Mate scores: put the distance in, or the search takes the slow mate
+
+The package's terminal score is a flat `±Mate` — it says *who* won, not *how
+fast*. A search that can mate in one move and also mate in three therefore
+sees both as equally good, and the tie is broken by move order, not by
+distance. Games that care about speed (endgame drills, puzzles, any "mate
+now" rule) should carry the distance in the score themselves:
+
+```zan
+// Mate sooner = higher score. plies = plies applied since the search root.
+if (!myGeneralAlive) { return -(BoardSearch.Mate() - plies); }   // I lost
+if (!theirGeneralAlive) { return BoardSearch.Mate() - plies; }   // I won
+```
+
+Two things follow from that:
+
+- The game should own the terminal decision, including the "no legal moves"
+  case. `BoardSearch` treats a move-less position as `-Mate` with no distance
+  term, so if the game reports that case through `IsTerminal()` instead, every
+  mate goes through `Evaluate()` and the score scale stays consistent.
+- Games whose "no legal moves" *is* a loss (Chinese chess: no legal move means
+  checkmate, there is no stalemate rule) must say so in `IsTerminal()`; the
+  search has no other way to see it.
+
+The Xiangqi project (`D:/project/games/xiangqi`, `client/src/XqSearch.zan`) is
+the worked example: its adapter owns the terminal decision, carries the
+distance-to-mate term, and caches the legal-move list so the terminal check
+costs no extra search work.
+
