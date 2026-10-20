@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Text;
 using System.Threading;
 #if LINUX
@@ -117,11 +118,20 @@ public class TrayIcon {
     static int trayThreadId;
     // 已加载图标的 HICON 缓存。
     static nint trayIcon;
+    // 当前图标是否由我们创建（需要 DestroyIcon）。系统共享图标
+    // （IDI_APPLICATION）不算——它是系统资源，销毁会误伤；程序图标
+    // 由 trayAppIcon 单独销毁。
+    static int trayIconOwned;
+    // 从当前 exe 提取的程序图标（自己创建，退出时销毁）。
+    static nint trayAppIcon;
+    // 图标来源（诊断用）："path" = 指定文件，"app" = 程序自身图标，
+    // "system" = 系统默认图标。
+    static string trayIconSource;
     // 托盘线程启动失败标志（Add 据此放弃等待）。
     static int threadFailed;
     // "TaskbarCreated" 广播消息 id（Explorer 重启时重见图标）。
     static int taskbarCreatedMsg;
-    // 待加载的 .ico 路径（"" 用默认应用图标）。
+    // 待加载的 .ico 路径（"" 用程序自身的图标）。
     static string trayIconPath;
     // 持有委托引用，防止窗口过程被回收。
     static TrayWndProcFn wndProc;
@@ -171,7 +181,11 @@ public class TrayIcon {
         if (TrayIcon.trayHwnd != 0) { return false; }
         TrayIcon.userCb = cb;
         TrayIcon.trayIconPath = iconPath;
+        TrayIcon.trayIconSource = "";
         TrayIcon.threadFailed = 0;
+        // 图标在调用线程上装好：HICON 不绑定线程，但这样 Add() 返回时
+        // 图标与来源都已经就绪（托盘线程里的加载只是兜底）。
+        TrayIcon.LoadIcon();
         Thread.Start(TrayIcon.TrayThreadEntry);
         int waited = 0;
         while (TrayIcon.trayHwnd == 0 && TrayIcon.threadFailed == 0 && waited < 2000) {
@@ -188,16 +202,20 @@ public class TrayIcon {
         #endif
     }
 
-    // 添加托盘图标。`iconPath` 是 .ico 文件（"" 使用默认
-    // 应用图标）。`tooltip` 是悬停文本。图标
-    // 成功显示后返回 true。若已添加过图标（需先移除）
+    // 添加托盘图标。`iconPath` 是 .ico 文件（"" 使用**程序自身的
+    // 图标**——从当前 exe 提取，zanc 生成的 exe 内嵌 assets/zan.ico，
+    // 用户用 --icon 指定的图标也在这里生效）。`tooltip` 是悬停文本。
+    // 图标成功显示后返回 true。若已添加过图标（需先移除）
     // 或原生调用失败，则返回 false。
     public static bool Add(string iconPath, string tooltip, TrayIconCallback cb) {
         #if WINDOWS
         if (TrayIcon.trayHwnd != 0) { return false; }
         TrayIcon.userCb = cb;
         TrayIcon.trayIconPath = iconPath;
+        TrayIcon.trayIconSource = "";
         TrayIcon.threadFailed = 0;
+        // 图标在调用线程上装好（理由同 AddAsync）。
+        TrayIcon.LoadIcon();
         Thread.Start(TrayIcon.TrayThreadEntry);
         for (int waited = 0; TrayIcon.trayHwnd == 0 && TrayIcon.threadFailed == 0 && waited < 500; waited = waited + 1) {
             Thread.Sleep(1);
@@ -348,6 +366,20 @@ public class TrayIcon {
         if (TrayIcon.posixLive != 0) { TrayIcon.NativeSetMenu(""); }
         #else
         return;
+        #endif
+    }
+
+    // 当前托盘图标的来源（诊断用）：
+    //   "path"   —— 用了 Add 传入的 .ico 文件；
+    //   "app"    —— 程序自身的图标（从当前 exe 提取，默认行为）；
+    //   "system" —— 系统默认应用图标（exe 里没有图标资源时的兜底）；
+    //   ""       —— 还没添加图标，或当前平台不支持（Linux/macOS 走原生后端）。
+    public static string IconSource() {
+        #if WINDOWS
+        if (TrayIcon.trayIconSource == null) { return ""; }
+        return TrayIcon.trayIconSource;
+        #else
+        return "";
         #endif
     }
 
@@ -502,10 +534,7 @@ public class TrayIcon {
             NativeMemory.Free(msg);
         }
         TrayIcon.Notify(2 /* NIM_DELETE */);
-        if (TrayIcon.trayIcon != 0) {
-            TrayIcon.WinDestroyIcon(TrayIcon.trayIcon);
-            TrayIcon.trayIcon = 0;
-        }
+        TrayIcon.DestroyIcons();
         TrayIcon.WinDestroyWindow(hwnd);
         TrayIcon.trayHwnd = 0;
     }
@@ -519,20 +548,61 @@ public class TrayIcon {
     }
 
     // 只加载一次图标：给定 `trayIconPath`（.ico 文件）时从文件加载，
-    // 否则加载默认应用图标。句柄缓存在
-    // trayIcon 中，并在线程清理时销毁。
+    // 否则用**程序自身的图标**（从当前 exe 提取），再兜底到系统默认
+    // 应用图标。句柄缓存在 trayIcon 中，并在线程清理时销毁。
     private static void LoadIcon() {
         if (TrayIcon.trayIcon != 0) { return; }
         nint icon = 0;
+        int owned = 0;
         if (TrayIcon.trayIconPath != "") {
             nint wpath = Wide.Of(TrayIcon.trayIconPath);
             icon = TrayIcon.WinLoadImageW(0, wpath, 1, 0, 0, 0x50);
             Wide.Free(wpath);
+            if (icon != 0) {
+                owned = 1;
+                TrayIcon.trayIconSource = "path";
+            }
         }
         if (icon == 0) {
+            // 默认：程序自身的图标（zanc 生成的 exe 内嵌了 assets/zan.ico，
+            // 用户也可以用 --icon 换成自己的——这里取到的就是它）。
+            icon = TrayIcon.LoadAppIcon();
+            if (icon != 0) { TrayIcon.trayIconSource = "app"; }
+        }
+        if (icon == 0) {
+            // 兜底：系统默认应用图标（共享资源，不能销毁）。
             icon = TrayIcon.WinLoadIconW(0, (nint)32512);   // IDI_APPLICATION
+            owned = 0;
+            TrayIcon.trayIconSource = "system";
         }
         TrayIcon.trayIcon = icon;
+        TrayIcon.trayIconOwned = owned;
+    }
+
+    // 从当前 exe 取程序图标（托盘的尺寸就是 16px，取小图标正好）。
+    // 复用 stdlib 的 FileInfoEx.Icon（SHGetFileInfo 取文件自带图标），
+    // 不自己再写一遍 ExtractIconEx。取不到返回 0。
+    private static nint LoadAppIcon() {
+        if (TrayIcon.trayAppIcon != 0) { return TrayIcon.trayAppIcon; }
+        string exe = Environment.ProcessPath;
+        if (exe == null || exe == "") { return 0; }
+        nint icon = FileInfoEx.Icon(exe);
+        if (icon == 0) { return 0; }
+        TrayIcon.trayAppIcon = icon;
+        return icon;
+    }
+
+    // 销毁图标句柄：自己创建的要销毁（.ico 文件加载的、程序图标），
+    // 系统共享图标（IDI_APPLICATION）不能销毁。
+    private static void DestroyIcons() {
+        nint used = TrayIcon.trayIcon;
+        int owned = TrayIcon.trayIconOwned;
+        nint appIcon = TrayIcon.trayAppIcon;
+        TrayIcon.trayIcon = 0;
+        TrayIcon.trayIconOwned = 0;
+        TrayIcon.trayAppIcon = 0;
+        if (owned != 0 && used != 0) { TrayIcon.WinDestroyIcon(used); }
+        if (appIcon != 0) { TrayIcon.WinDestroyIcon(appIcon); }
     }
 
     // 请求 NOTIFYICON_VERSION_4 行为（气泡通知回调等）。
@@ -570,8 +640,8 @@ public class TrayIcon {
         new Span<int>(data + 24, 1)[0] = 0x8000;  // uCallbackMessage (WM_APP)
         nint icon = TrayIcon.trayIcon;
         if (icon == 0) {
+            // 托盘线程还没装好图标：先用系统默认图标顶上（共享资源，不缓存）。
             icon = TrayIcon.WinLoadIconW(0, (nint)32512);   // IDI_APPLICATION
-            TrayIcon.trayIcon = icon;
         }
         new Span<long>(data + 32, 1)[0] = icon;   // hIcon
         TrayIcon.PutWide(data + 40, tooltip, 128);

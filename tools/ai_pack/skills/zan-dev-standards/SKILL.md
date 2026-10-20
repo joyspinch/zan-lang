@@ -86,6 +86,20 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   ② **严禁同步阻塞反模式**：严禁在 UI 线程直接执行网络通信（HTTP/WebSocket）、磁盘文件大读写、数据库 SQL 执行、大 JSON/XML 解析、图像解码、重 CPU 计算或同步 `Sleep`；
   ③ **架构解耦三段式**：立即响应反馈（UI 立即置灰/挂起 Loading，<1ms 放行） -> 后台非阻塞执行（Worker/Thread/Task.Run，纯内存隔离，严禁直接读写 UI 控件） -> `App.Post` 封送回传（唤醒消息泵，在 UI 线程统一排空回调回填数据并触发 `needsRedraw`）；
   ④ **生命周期与协同取消**：后台作业必须挂接 `CancellationToken` 或取消标志，窗口关闭或请求作废时即刻终止，杜绝野回调污染。
+- **Win32 资源所有权必须分开记账，程序默认图标取自身 exe**：
+  ① **系统共享图标不能销毁**：`LoadIcon(0, IDI_APPLICATION)` 这类是系统资源，
+     `DestroyIcon` 它等于销毁别人的东西；而 `LoadImage`（从 .ico 文件加载）、
+     `ExtractIconEx` / `SHGetFileInfo`（取文件自带图标）得到的图标**由调用方
+     负责 `DestroyIcon`**；
+  ② 全局句柄（托盘图标、窗口图标）用"**谁创建谁销毁 + 显式 owned 标记**"
+     记账，退出路径统一回收：凭感觉无条件销毁会误杀系统资源，漏销毁则每
+     进程泄漏 GDI 对象；
+  ③ **默认图标取程序自身的 exe**（`Environment.ProcessPath` + stdlib 的
+     `FileInfoEx.Icon`），不要退回系统通用图标——编译器生成的 exe 内嵌了
+     默认图标资源，用户用 `--icon` 指定的图标也走同一条路，托盘/窗口因此
+     显示的就是程序自己的图标；
+  ④ 异步初始化的全局资源（如托盘图标在专用线程上装载）必须在**调用方
+     返回前就绪**（在调用线程上装载），否则调用方读到的是半初始化状态。
 - 组件写法与同目录既有组件保持一致：命名、事件命名、state 管理同构。
 - 注释只写代码看不出来的约束与"为什么"；不复述代码、不写日期流水、
   不写"本轮修改了什么"。
