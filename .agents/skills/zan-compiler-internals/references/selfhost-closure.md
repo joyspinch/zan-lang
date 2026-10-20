@@ -1491,3 +1491,22 @@ kernel32、shell32、user32、advapi32、version）。
      克隆体里的 `Stat<T>.s` 经类型实参替换后指向该实例化的全局。
   5. 克隆体里的**裸**静态字段（不带 `Stat<...>` 限定）要用"当前克隆的实例化"
      定位存储：克隆的接收者静态类型（`curThisTy`）就带着实参。
+## 76. 无类型的 lambda 参数在推断 body 类型时要换成委托的形参类型
+
+- 坑（2026-10-21 实测）：`us.MinBy(u => u.name)`（`MinBy<T, R>(this List<T>, Sel<T, R>)`）
+  在自举里把方法类型参数 **R 绑成了 `var`**：克隆体的符号名是
+  `Ext_MinBy__SP_double_var_List.T_Sel.T.R`——`var` 是 parser 给**无类型**
+  lambda 参数写的占位类型（`parser.zan` 的 `ParseLambda`：`p.type =
+  MkTypeRef("var")`）。
+  后果是克隆体里 `R mk` 成了**指针槽**，而 `k < mk` 按整数比较 →
+  `icmp slt i64 %t51, %t52`（`%t51` 是 `i8*`）→ **坏 IR**（用例
+  `generics_uniform_repr`）。
+- 根因：`LambdaBodyType` 只在形参类型为 **null** 时才用委托的形参类型；
+  parser 给的是 `"var"`（不是 null）→ 形参类型保持 `var` → body 的类型
+  （`u.name`）推不出来 → 类型参数绑成 `var`。
+- 做法：把 `"var"` 和 `null` 一样看待——无类型的 lambda 参数取委托的形参
+  类型（`dps[pi]`）。绑上之后 `u => u.name` 的 body 类型是 `string`、
+  `u => u.score` 是 `double`、`x => x`（`List<double>`）是 `double`，
+  R 绑到真正的类型，克隆体里的 `R mk` 才是 double/string 而不是指针。
+- 通用教训：**"没写类型"和"类型未知"在 AST 里是两种表示**（null vs
+  `"var"`），凡是"没有就用上下文补"的地方，两种都要认。
