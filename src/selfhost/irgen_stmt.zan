@@ -704,6 +704,24 @@ partial class Irgen {
         return ty + ")*";
     }
 
+    // Allocate zeroed storage for a value struct (a struct is a heap object
+    // in the self-hosted backend): the object pointer is returned, the nested
+    // struct fields get their own instances.
+    string AllocZeroStruct(Node ty, Node sd) {
+        string cn = ty.sval;
+        string szp = NT();
+        L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
+        string szi = NT();
+        L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
+        string raw = NT();
+        L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
+        string obj = NT();
+        L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
+        // a struct-typed field points at a nested instance: allocate it
+        InitNestedFields(obj, sd);
+        return obj;
+    }
+
     void GenVarDecl(Node s) {
         if (curAsync) {
             int pli = LocalIdx(s.sval);
@@ -729,6 +747,30 @@ partial class Irgen {
                         string sv0 = Coerce(iv0, plt0);
                         L("  store " + plt0 + " " + sv0 + ", " + plt0 + "* " + preg0);
                         EmitArcRetain(sv0, pty0);
+                    }
+                } else {
+                    // No initializer: a value struct still needs its zeroed
+                    // storage (the sync path allocates it below) -- without it
+                    // the local keeps the garbage of the frame slot and the
+                    // first field write goes to a wild address.
+                    Node sd0 = binder.FindType(pty0.sval);
+                    if (sd0 != null && sd0.kind == AK.StructDecl() && pty0.ival == 0 && !IsNullable(pty0)) {
+                        if (curAsync && locBox[pli]) {
+                            // the local lives in a heap cell: the cell holds
+                            // the struct instance
+                            string c = NT();
+                            L("  " + c + " = call i8* @malloc(i64 " + TypeSizeBytes(plt0) + ")");
+                            string p = NT();
+                            L("  " + p + " = bitcast i8* " + c + " to " + plt0 + "*");
+                            string obj0 = AllocZeroStruct(pty0, sd0);
+                            L("  store " + plt0 + " " + obj0 + ", " + plt0 + "* " + p);
+                            L("  store i8* " + c + ", i8** " + preg0);
+                        } else {
+                            string obj0 = AllocZeroStruct(pty0, sd0);
+                            L("  store " + plt0 + " " + obj0 + ", " + plt0 + "* " + preg0);
+                        }
+                    } else if (ArcManaged(pty0)) {
+                        L("  store " + plt0 + " null, " + plt0 + "* " + preg0);
                     }
                 }
                 return;
@@ -770,17 +812,7 @@ partial class Irgen {
             if (sd != null && sd.kind == AK.StructDecl() && ty.ival == 0 && !IsNullable(ty)) {
                 // value struct default-initialised: allocate zeroed storage so
                 // field accesses operate on real memory (calloc zeroes fields).
-                string cn = ty.sval;
-                string szp = NT();
-                L("  " + szp + " = getelementptr %" + cn + ", %" + cn + "* null, i32 1");
-                string szi = NT();
-                L("  " + szi + " = ptrtoint %" + cn + "* " + szp + " to i64");
-                string raw = NT();
-                L("  " + raw + " = call i8* @zalloc(i64 " + szi + ", i8* bitcast (void (i8*)* @" + cn + "_dtor to i8*), i8* bitcast (i8** @__tid_" + cn + " to i8*))");
-                string obj = NT();
-                L("  " + obj + " = bitcast i8* " + raw + " to %" + cn + "*");
-                // a struct-typed field points at a nested instance: allocate it
-                InitNestedFields(obj, sd);
+                string obj = AllocZeroStruct(ty, sd);
                 L("  store " + lt + " " + obj + ", " + lt + "* " + reg);
             } else if (ArcManaged(ty)) {
                 L("  store " + lt + " null, " + lt + "* " + reg);
