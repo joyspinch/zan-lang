@@ -23,7 +23,8 @@ public class OssConfig {
     public string secretKey;
     /// <summary>单次请求超时（毫秒）。</summary>
     public int timeoutMs;
-    /// <summary>S3 风格：true = path style（MinIO 常用），false = 虚拟主机风格（AWS 默认）。</summary>
+    /// <summary>S3 风格：true = path style（MinIO 常用），false = 虚拟主机风格（AWS 默认）。
+    /// 端点里写了 {bucket} 占位时强制虚拟主机风格，此字段被忽略。</summary>
     public bool pathStyle;
     /// <summary>解析后的端点主机（Parse 之后有效）。</summary>
     public string endpointHost;
@@ -31,6 +32,9 @@ public class OssConfig {
     public int endpointPort;
     /// <summary>端点是否走 TLS（Parse 之后有效）。</summary>
     public bool endpointTls;
+    /// <summary>端点主机里是否带 {bucket} 占位（Parse 时已替换成桶名）。
+    /// 带占位 = 虚拟主机风格，客户端不再自己拼桶名前缀。</summary>
+    public bool hostHasBucket;
     /// <summary>外呼策略（可空）。默认策略禁止连回环地址——自测或内网 OSS
     /// 端点需要显式 AllowLoopback()。</summary>
     public ExternalCallPolicy callPolicy;
@@ -48,6 +52,7 @@ public class OssConfig {
         this.endpointHost = "";
         this.endpointPort = 0;
         this.endpointTls = true;
+        this.hostHasBucket = false;
         this.callPolicy = null;
     }
 
@@ -84,10 +89,41 @@ public class OssConfig {
             }
         }
         if (hostPort.Length == 0) { return false; }
+        // 端点里带 {bucket} 占位 = 用户指定了完整的桶主机：替换占位，
+        // 并按虚拟主机风格走（客户端不再自己拼桶名前缀）。
+        if (hostPort.Contains("{bucket}")) {
+            hostPort = OssConfig.Substitute(hostPort, "{bucket}", this.bucket);
+            this.hostHasBucket = true;
+            this.pathStyle = false;
+        }
         this.endpointHost = hostPort;
         this.endpointPort = port;
         this.endpointTls = tls;
         return true;
+    }
+
+    /// <summary>端点串里是否带 {bucket} 占位。
+    /// 带占位 = 端点写的是完整桶主机（虚拟主机风格）；
+    /// 不带占位 = 端点写的是服务主机（路径风格，桶名进请求路径）。</summary>
+    public static bool HasBucketPlaceholder(string endpoint) {
+        if (endpoint == null) { return false; }
+        return endpoint.Contains("{bucket}");
+    }
+
+    /// <summary>是否走虚拟主机风格（桶名在主机名里，请求路径不带桶前缀）。</summary>
+    public bool VirtualHost() { return this.hostHasBucket || !this.pathStyle; }
+
+    /// <summary>请求路径是否需要桶名前缀：只有路径风格才需要。
+    /// 端点带 {bucket} 占位时强制虚拟主机风格，这里一律不加前缀。</summary>
+    public bool UsesBucketPrefix() { return this.pathStyle && !this.hostHasBucket; }
+
+    /// <summary>把字符串里的第一处占位替换成实际值。</summary>
+    public static string Substitute(string s, string token, string value) {
+        if (s == null || token == null) { return s; }
+        int at = s.IndexOf(token);
+        if (at < 0) { return s; }
+        return s.Substring(0, at) + (value == null ? "" : value)
+            + s.Substring(at + token.Length);
     }
 
     /// <summary>对象键 = basePath 前缀 + 相对键（去掉两侧多余的斜杠）。</summary>

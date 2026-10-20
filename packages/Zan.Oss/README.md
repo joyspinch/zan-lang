@@ -45,8 +45,23 @@ string direct = client.PublicUrl("a/b.png");
 | driver | 端点 | 风格 | 签名 |
 |---|---|---|---|
 | aliyun_oss | `https://oss-cn-hangzhou.aliyuncs.com` | `pathStyle=true` 走 `端点/桶/键`；否则 `桶.端点/键` | OSS V1（HMAC-SHA1），头 `Authorization: OSS ak:sig` |
-| tencent_cos | 留空则 `桶.cos.区域.myqcloud.com`；可写 `{bucket}` 占位 | 虚拟主机 | XML API（`q-sign-algorithm=sha1`） |
+| tencent_cos | 留空则 `桶.cos.区域.myqcloud.com`；可写 `{bucket}` 占位 | 虚拟主机（端点不含桶名时走路径风格 `端点/桶/键`） | XML API（`q-sign-algorithm=sha1`） |
 | s3 | `https://s3.amazonaws.com` / `https://minio.local:9000` | `pathStyle=true` 走路径风格 | AWS SigV4（HMAC-SHA256 派生密钥链） |
+
+### 端点里的 `{bucket}` 占位
+
+端点串里写 `{bucket}` = 你自己指定了完整桶主机，SDK 解析时把它替换成桶名，
+并强制走**虚拟主机风格**（请求路径里不再带桶前缀）：
+
+```zan
+cfg.endpoint = "https://{bucket}.s3.us-east-1.amazonaws.com";  // → mybucket.s3.us-east-1.amazonaws.com
+```
+
+端点串里**不带**占位 = 你给的是服务主机，走**路径风格**（桶名进请求路径，
+签名路径与请求路径一致）。端点留空时由提供方按 `桶名 + 区域` 推导（虚拟主机风格）。
+
+判定入口：`OssConfig.HasBucketPlaceholder(endpoint)`、`cfg.VirtualHost()`、
+`cfg.UsesBucketPrefix()`。
 
 ## 约定与边界
 
