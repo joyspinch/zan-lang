@@ -1,0 +1,337 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Assets;
+
+// 资源存储：按清单加载资源，追踪引用与依赖，按预算淘汰。
+//
+// 设计取舍：
+//   - **清单与来源分离**：清单是数据，来源是 IAssetProvider。
+//     同一份清单能配文件 / 内存 / 打包文件，测试用内存来源，
+//     发布用文件来源，调用代码一行不改。
+//   - **依赖是图的属性，不是引用次数**：depCount 恒等于
+//     "有多少个**已驻留**的资源依赖我"。资源驻留时对依赖 +1，
+//     被回收时 -1。把它跟 acquire 次数混在一起，
+//     就会出现"资源提前被回收"或"永远回收不掉"。
+//   - **引用与驻留分离**：Release 只把 refCount 减一，资源
+//     仍然驻留（缓存），由预算淘汰回收。这样"用完立刻释放"
+//     不会导致下一次使用重新读盘。
+//   - **确定性淘汰**：按 LRU（单调序号 lastUse，不用墙上时钟），
+//     同一串操作必然同一结果——回放 / 锁步需要这个。
+//   - **pinned 不参与淘汰**：关卡常驻资源用。
+//   - **非线程安全**：单线程游戏主循环用。要跨线程由调用方加锁
+//     （Store 不自带锁——锁的粒度该由调用方决定）。
+public class AssetStore {
+    // 清单。
+    private AssetManifest manifest;
+    // 来源（按顺序试，第一个能读出来的胜出）。
+    private List<IAssetProvider> providers;
+    // id → 运行时条目。
+    private Dictionary<string, AssetEntryState> states;
+    // 使用序号（单调递增，做 LRU 时间戳）。
+    private long useCounter;
+    // 状态建立序号（同 lastUse 时的定序依据）。
+    private long seqCounter;
+    // 内存预算（字节）。0 = 不限。
+    private long budgetBytes;
+    // 当前已驻留的总字节数。
+    private long loadedBytes;
+    // 统计：真正读了来源的次数。
+    private long loadCount;
+    // 统计：Acquire 命中（已驻留，直接返回）的次数。
+    private long hitCount;
+    // 统计：回收次数。
+    private long evictCount;
+    // 统计：失败次数（读不到、id 不存在、引用计数下溢）。
+    private long failCount;
+
+    public AssetStore(AssetManifest manifest) {
+        this.manifest = manifest != null ? manifest : new AssetManifest();
+        this.providers = new List<IAssetProvider>();
+        this.states = new Dictionary<string, AssetEntryState>();
+        this.useCounter = 0L;
+        this.seqCounter = 0L;
+        this.budgetBytes = 0L;
+        this.loadedBytes = 0L;
+        this.loadCount = 0L;
+        this.hitCount = 0L;
+        this.evictCount = 0L;
+        this.failCount = 0L;
+    }
+
+    // 追加一个来源（按加入顺序试）。
+    public AssetStore AddProvider(IAssetProvider provider) {
+        if (provider != null) {
+            this.providers.Add(provider);
+        }
+        return this;
+    }
+
+    // 链式设置内存预算（字节）。0 = 不限。
+    public AssetStore WithBudget(long bytes) {
+        this.budgetBytes = bytes > 0L ? bytes : 0L;
+        return this;
+    }
+
+    // 内存预算。
+    public long Budget() {
+        return this.budgetBytes;
+    }
+
+    // 清单。
+    public AssetManifest Manifest() {
+        return this.manifest;
+    }
+
+    /* ---------- 加载与引用 ---------- */
+
+    // 获取资源内容：必要时加载（含依赖），并 +1 外部引用。
+    //
+    // 加载失败抛 AssetException：
+    //   - id 不在清单里 → NotFound
+    //   - 来源读不出字节 → ReadFailed
+    //   - 依赖读不出来 → DependencyFailed
+    public byte[] Acquire(string id) {
+        if (id == null || id == "") {
+            throw new AssetException(AssetError.NotFound, id, "asset id is empty");
+        }
+        if (!this.manifest.Contains(id)) {
+            this.failCount = this.failCount + 1L;
+            throw new AssetException(AssetError.NotFound, id, "asset not in manifest: " + id);
+        }
+        AssetEntryState st = this.StateOf(id);
+        bool wasLoaded = st.loaded;
+        if (!st.loaded) {
+            this.EnsureResident(id);
+        }
+        st.refCount = st.refCount + 1;
+        this.Touch(st);
+        if (wasLoaded) {
+            this.hitCount = this.hitCount + 1L;
+        }
+        return st.data;
+    }
+
+    // 释放一次外部引用。
+    //
+    // **只减引用，不立刻回收**——资源仍驻留（缓存），
+    // 由预算淘汰回收。理由：用完立刻扔掉会让下一次使用重新读盘；
+    // 内存回收交给预算（这是显式、可预测的策略）。
+    public void Release(string id) {
+        if (id == null) { return; }
+        if (!this.states.ContainsKey(id)) { return; }
+        AssetEntryState st = this.states[id];
+        if (st.refCount <= 0) {
+            this.failCount = this.failCount + 1L;
+            throw new AssetException(AssetError.Underflow, id, "release without acquire: " + id);
+        }
+        st.refCount = st.refCount - 1;
+    }
+
+    // 钉住 / 解钉（钉住的不参与淘汰）。
+    public void Pin(string id) {
+        if (!this.states.ContainsKey(id)) { return; }
+        this.states[id].pinned = true;
+    }
+
+    public void Unpin(string id) {
+        if (!this.states.ContainsKey(id)) { return; }
+        this.states[id].pinned = false;
+    }
+
+    // 是否已驻留（字节在内存里）。
+    public bool IsLoaded(string id) {
+        if (!this.states.ContainsKey(id)) { return false; }
+        return this.states[id].loaded;
+    }
+
+    // 外部引用计数。
+    public int RefCount(string id) {
+        if (!this.states.ContainsKey(id)) { return 0; }
+        return this.states[id].refCount;
+    }
+
+    // 依赖计数（被多少个已驻留资源依赖）。
+    public int DepCount(string id) {
+        if (!this.states.ContainsKey(id)) { return 0; }
+        return this.states[id].depCount;
+    }
+
+    // 已驻留总字节数。
+    public long LoadedBytes() {
+        return this.loadedBytes;
+    }
+
+    // 已驻留资源数。
+    public int LoadedCount() {
+        int n = 0;
+        List<string> keys = this.states.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            if (this.states[keys[i]].loaded) { n = n + 1; }
+        }
+        return n;
+    }
+
+    /* ---------- 统计 ---------- */
+
+    public long LoadCount() { return this.loadCount; }
+    public long HitCount() { return this.hitCount; }
+    public long EvictCount() { return this.evictCount; }
+    public long FailCount() { return this.failCount; }
+
+    /* ---------- 内部 ---------- */
+
+    // 取（或建）运行时条目。
+    private AssetEntryState StateOf(string id) {
+        if (this.states.ContainsKey(id)) {
+            return this.states[id];
+        }
+        AssetEntry e = this.manifest.Get(id);
+        this.seqCounter = this.seqCounter + 1L;
+        AssetKind kind = AssetKind.Unknown;
+        string path = "";
+        if (e != null) {
+            kind = e.kind;
+            path = e.path;
+        }
+        AssetEntryState st = new AssetEntryState(id, kind, path, this.seqCounter);
+        this.states[id] = st;
+        return st;
+    }
+
+    // 让资源（及其依赖）驻留。
+    //
+    // 依赖先驻留，然后依赖的 depCount +1——因为"本资源驻留"
+    // 这件事本身构成了对依赖的持有。本资源被回收时对应 -1。
+    private void EnsureResident(string id) {
+        AssetEntryState st = this.StateOf(id);
+        if (st.loaded) { return; }
+        AssetEntry e = this.manifest.Get(id);
+        if (e != null) {
+            for (int i = 0; i < e.depends.Count; i = i + 1) {
+                string dep = e.depends[i];
+                this.EnsureResident(dep);
+                AssetEntryState dst = this.StateOf(dep);
+                if (dst.loaded) {
+                    dst.depCount = dst.depCount + 1;
+                }
+            }
+        }
+        this.LoadBytes(st);
+    }
+
+    // 真正从来源读字节。
+    private void LoadBytes(AssetEntryState st) {
+        byte[] data = null;
+        bool got = false;
+        for (int i = 0; i < this.providers.Count; i = i + 1) {
+            byte[] tmp = null;
+            if (this.providers[i].TryRead(st.path, out tmp)) {
+                data = tmp;
+                got = true;
+                break;
+            }
+        }
+        if (!got) {
+            this.failCount = this.failCount + 1L;
+            throw new AssetException(AssetError.ReadFailed, st.id, "cannot read asset: " + st.path);
+        }
+        st.data = data;
+        st.size = data != null ? (long)data.Length : 0L;
+        st.loaded = true;
+        this.loadedBytes = this.loadedBytes + st.size;
+        this.loadCount = this.loadCount + 1L;
+        this.Touch(st);
+    }
+
+    // 打上"最近使用"标记。
+    private void Touch(AssetEntryState st) {
+        this.useCounter = this.useCounter + 1L;
+        st.lastUse = this.useCounter;
+    }
+
+    // 回收一个资源（释放字节，解除它对依赖的持有）。
+    //
+    // 被它持有的依赖 depCount -1。降到 0 的依赖变成"闲置"，
+    // 但**这里不自动回收**——单次回收不该把一串共享资源都拽下去。
+    // 后续由 TrimIdle / EnforceBudget 的循环按 LRU 逐个回收
+    // （那个循环会重新挑victim，所以级联最终会发生，
+    //  但每一步都只回收一个，顺序可预测）。
+    private void Unload(AssetEntryState st) {
+        if (!st.loaded) { return; }
+        st.loaded = false;
+        st.data = null;
+        this.loadedBytes = this.loadedBytes - st.size;
+        st.size = 0L;
+        this.evictCount = this.evictCount + 1L;
+        AssetEntry e = this.manifest.Get(st.id);
+        if (e != null) {
+            for (int i = 0; i < e.depends.Count; i = i + 1) {
+                string dep = e.depends[i];
+                if (!this.states.ContainsKey(dep)) { continue; }
+                AssetEntryState dst = this.states[dep];
+                if (dst.depCount > 0) {
+                    dst.depCount = dst.depCount - 1;
+                }
+            }
+        }
+    }
+
+    // 资源是否可被回收：没人用、没被依赖、没钉住。
+    public bool IsEvictable(string id) {
+        if (!this.states.ContainsKey(id)) { return false; }
+        AssetEntryState st = this.states[id];
+        if (!st.loaded) { return false; }
+        if (st.pinned) { return false; }
+        if (st.refCount > 0) { return false; }
+        if (st.depCount > 0) { return false; }
+        return true;
+    }
+
+    // 按预算淘汰：把闲置资源按 LRU 顺序回收，直到总量回到预算内
+    // 或没有可回收的了（全部被引用 / 依赖 / 钉住时停手——
+    // 超预算比偷偷回收正在用的资源安全）。
+    public int EnforceBudget() {
+        if (this.budgetBytes <= 0L) { return 0; }
+        int evicted = 0;
+        while (this.loadedBytes > this.budgetBytes) {
+            AssetEntryState victim = this.PickVictim();
+            if (victim == null) { break; }
+            this.Unload(victim);
+            evicted = evicted + 1;
+        }
+        return evicted;
+    }
+
+    // 回收全部闲置资源（不看预算）。返回回收数量。
+    public int TrimIdle() {
+        int evicted = 0;
+        // 循环直到没有可回收的：回收一个可能让另一个变成闲置的
+        // （依赖它的资源被回收后，依赖者自己的 depCount 也降了）。
+        while (true) {
+            AssetEntryState victim = this.PickVictim();
+            if (victim == null) { break; }
+            this.Unload(victim);
+            evicted = evicted + 1;
+        }
+        return evicted;
+    }
+
+    // 选淘汰对象：闲置（无引用、无依赖、未钉住）且最久没用的。
+    // 同 lastUse 时按状态建立序号定序——保证确定性。
+    private AssetEntryState PickVictim() {
+        AssetEntryState best = null;
+        List<string> keys = this.states.Keys;
+        for (int i = 0; i < keys.Count; i = i + 1) {
+            AssetEntryState st = this.states[keys[i]];
+            if (!st.loaded) { continue; }
+            if (st.pinned) { continue; }
+            if (st.refCount > 0) { continue; }
+            if (st.depCount > 0) { continue; }
+            if (best == null) { best = st; continue; }
+            if (st.lastUse < best.lastUse) { best = st; continue; }
+            if (st.lastUse == best.lastUse && st.seq < best.seq) { best = st; }
+        }
+        return best;
+    }
+}

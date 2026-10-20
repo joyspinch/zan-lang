@@ -281,6 +281,48 @@ conformance：`particles_system`（速率发射、突发发射、寿命回收、
 **已知边界**：无 GPU 粒子（渲染侧自行批量提交）；无粒子碰撞；噪声是值噪声
 不是梯度噪声（做不了流体）；池不跨系统共享。
 
+### 1.9 资源运行时：`Zan.Game.Assets`
+
+新包 `packages/Zan.Game.Assets`，命名空间 `Game.Assets`。补上 `Game.Kit.PackedAssets`
+（只读加密资源包）与 `Game.Tools.AssetPipeline`（离线元数据生成）之间缺的那一层：
+**运行期的资源生命周期管理**。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `AssetKind.zan` | `AssetKind` / `AssetKinds` | 资源种类枚举 + 名称映射（名字不认识时**当场拒绝**，不静默降级） |
+| `AssetEntry.zan` | `AssetEntry` | 清单条目：id / kind / path / depends / size |
+| `AssetManifest.zan` | `AssetManifest` | 清单：`Declare` / `Add` / `Get` / `Validate` / `TopoOrder` / `ToJson` / `FromJson` |
+| `IAssetProvider.zan` | `IAssetProvider` | 来源契约：`TryRead(path, out data)` / `Exists` |
+| `FileAssetProvider.zan` | `FileAssetProvider` | 文件系统来源（相对 root 解析） |
+| `MemoryAssetProvider.zan` | `MemoryAssetProvider` | 内存来源（测试 / 内嵌 / 网络注入） |
+| `AssetEntryState.zan` | `AssetEntryState` | 运行时条目：refCount / depCount / pinned / lastUse |
+| `AssetStore.zan` | `AssetStore` | `Acquire` / `Release` / `Pin` / `EnforceBudget` / `TrimIdle` |
+| `AssetLoader.zan` | `AssetLoader` / `AssetDecoder<T>` | 按强类型解码字节（零反射） |
+| `AssetGroup.zan` | `AssetGroup` | 按 id 前缀分组，整组加载 / 释放 |
+| `AssetException.zan` | `AssetError` / `AssetException` | 可区分的错误码 |
+
+**六条硬取舍**：
+
+1. **清单与来源分离**：清单是纯数据（可 JSON 往返），来源决定字节从哪来。
+   同一份清单能配文件（开发）/ 打包文件（发布）/ 内存（测试），调用代码不改。
+2. **依赖是图的属性，不是引用次数**：`depCount` 恒等于"有多少个**已驻留**的资源
+   依赖我"。混进 acquire 次数必然导致"提前回收"或"永远不回收"二选一。
+3. **引用与驻留分离**：`Release` 只减引用，资源仍驻留（缓存），由预算回收。
+   用完立刻扔掉会让下次使用重新读盘。
+4. **确定性淘汰**：LRU 用单调序号（`lastUse`），**不用墙上时钟**——回放 / 锁步
+   需要"同一串操作同一结果"。
+5. **超预算时宁可超着**：全部资源被引用 / 依赖 / 钉住时淘汰停手，偷偷回收
+   正在用的资源比超预算危险。
+6. **零反射 + 非线程安全**：解码器按具体类型注册（`AssetDecoder<T>` 委托）；
+   面向单线程主循环，跨线程由调用方加锁（锁粒度该由调用方决定）。
+
+conformance：`assets_store`（清单 JSON 往返、重复 id / 悬空依赖 / 环依赖 / 未知
+kind 拒绝、依赖自动拉取、depCount 图语义、引用计数累加与下溢报错、预算淘汰、
+LRU 顺序、pinned 保护、依赖阻塞淘汰、级联回退、资源组、文件来源缺失处理、拓扑序）。
+
+**已知边界**：无异步 / 流式加载；无内容哈希与热更比对；淘汰只按真实字节数；
+资源组是清单层面的划分（按 id 前缀），不携带运行期状态。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -327,7 +369,7 @@ conformance：`particles_system`（速率发射、突发发射、寿命回收、
 | `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | ✅ 已落地 `packages/Zan.Game.Physics2D`（`Game.Physics2D`：值语义向量 + 凸多边形/圆窄相 + 顺序冲量动力学 + 距离/旋转关节，见 §1.6） | — |
 | `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | ✅ 已落地 `packages/Zan.Game.Pathfinding`（`Game.Pathfinding`：加权 A* + 跳跃点搜索 + 视线拉直 + 导航网格漏斗平滑，见 §1.7） | — |
-| `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | 有 `AssetPipeline` + `PackedAssets` → glTF 导入、骨骼/动画切片、图集、字体与 shader | 3–5 周 |
+| `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | ✅ 已落地 `packages/Zan.Game.Assets`（`Game.Assets`：声明式清单 + 依赖图 + 引用计数加载 + 确定性 LRU 预算淘汰 + 资源组，见 §1.9） | — |
 | `Zan.Game.Audio` | NAudio | 6,249 | 有 `AudioBus`/`SpatialAudio2D`/`Desktop/Audio`，无 mp3/ogg 解码与流式播放 | 2–3 周 |
 | `Zan.Game.Netcode` | Mirror / LiteNetLib | 6,366 / 3,632 | 已有 lockstep + 回放 → 快照同步、rollback 预测、延迟补偿 | 4–6 周 |
 | `Zan.Game.Particles` | MonoGame.Extended | 榜外 | ✅ 已落地 `packages/Zan.Game.Particles`（`Game.Particles`：对象池 + 速率/突发发射器 + 曲线驱动 + 确定性噪声湍流，见 §1.8） | — |
@@ -360,7 +402,7 @@ conformance：`particles_system`（速率发射、突发发射、寿命回收、
 
 **第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
-**第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
+**第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

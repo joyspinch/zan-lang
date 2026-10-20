@@ -1,0 +1,224 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Game.Assets;
+
+// 资源清单：一组 AssetEntry，按 id 索引。
+//
+// 清单是**纯数据**（可从 JSON 读出、可写回 JSON），不含加载行为。
+// 依赖图在清单层就校验：悬空依赖、循环依赖在构造时就报，
+// 不留到运行期加载到一半才炸。
+public class AssetManifest {
+    private List<AssetEntry> entries;
+    private Dictionary<string, AssetEntry> byId;
+
+    public AssetManifest() {
+        this.entries = new List<AssetEntry>();
+        this.byId = new Dictionary<string, AssetEntry>();
+    }
+
+    // 条目数。
+    public int Count() {
+        return this.entries.Count;
+    }
+
+    // 按 id 取条目；没有返回 null。
+    public AssetEntry Get(string id) {
+        if (id == null) { return null; }
+        if (!this.byId.ContainsKey(id)) { return null; }
+        return this.byId[id];
+    }
+
+    // 按 id 取条目；没有时写出参 null 并返回 false。
+    public bool TryGet(string id, out AssetEntry entry) {
+        if (id != null && this.byId.ContainsKey(id)) {
+            entry = this.byId[id];
+            return true;
+        }
+        entry = null;
+        return false;
+    }
+
+    // 是否收录了某个 id。
+    public bool Contains(string id) {
+        return id != null && this.byId.ContainsKey(id);
+    }
+
+    // 全部条目（按加入顺序）。
+    public List<AssetEntry> Entries() {
+        return this.entries;
+    }
+
+    // 追加一条。id 重复时抛 ArgumentException——清单里两条同 id
+    // 意味着"同一个资源有两个来源"，加载时只能挑一条，
+    // 那就是"加载到哪条全看顺序"的随机行为。
+    public AssetManifest Add(AssetEntry entry) {
+        if (entry == null) { throw new ArgumentException("asset entry is null"); }
+        if (entry.id == "") { throw new ArgumentException("asset entry has empty id"); }
+        if (this.byId.ContainsKey(entry.id)) {
+            throw new ArgumentException("duplicate asset id: " + entry.id);
+        }
+        this.entries.Add(entry);
+        this.byId[entry.id] = entry;
+        return this;
+    }
+
+    // 便捷构造：加一条资源并返回它（便于链式）。
+    public AssetEntry Declare(string id, AssetKind kind, string path) {
+        AssetEntry e = new AssetEntry(id, kind, path);
+        this.Add(e);
+        return e;
+    }
+
+    // 校验依赖图：依赖必须存在，且不得成环。
+    // 失败抛 ArgumentException，消息里带上具体的 id。
+    public void Validate() {
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            AssetEntry e = this.entries[i];
+            for (int d = 0; d < e.depends.Count; d = d + 1) {
+                string dep = e.depends[d];
+                if (!this.byId.ContainsKey(dep)) {
+                    throw new ArgumentException("asset '" + e.id + "' depends on missing asset '" + dep + "'");
+                }
+            }
+        }
+        // 环检测：每个 id 三态（未访问/在栈上/已完成），DFS 撞到
+        // "在栈上"就是环。
+        Dictionary<string, int> state = new Dictionary<string, int>();
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            this.Visit(this.entries[i].id, state, new List<string>());
+        }
+    }
+
+    // DFS 环检测。
+    private void Visit(string id, Dictionary<string, int> state, List<string> stack) {
+        int st = 0;
+        if (state.ContainsKey(id)) { st = state[id]; }
+        if (st == 2) { return; }
+        if (st == 1) {
+            string cycle = "";
+            for (int i = 0; i < stack.Count; i = i + 1) {
+                if (i > 0) { cycle = cycle + " -> "; }
+                cycle = cycle + stack[i];
+            }
+            cycle = cycle + " -> " + id;
+            throw new ArgumentException("asset dependency cycle: " + cycle);
+        }
+        state[id] = 1;
+        stack.Add(id);
+        AssetEntry e = this.Get(id);
+        if (e != null) {
+            for (int i = 0; i < e.depends.Count; i = i + 1) {
+                this.Visit(e.depends[i], state, stack);
+            }
+        }
+        stack.RemoveAt(stack.Count - 1);
+        state[id] = 2;
+    }
+
+    // 拓扑序：依赖在前，依赖者在后。清单无环时一定有解。
+    // 同一层内按 id 的加入顺序（稳定）。
+    public List<string> TopoOrder() {
+        this.Validate();
+        List<string> order = new List<string>();
+        Dictionary<string, int> mark = new Dictionary<string, int>();
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            this.TopoVisit(this.entries[i].id, mark, order);
+        }
+        return order;
+    }
+
+    private void TopoVisit(string id, Dictionary<string, int> mark, List<string> order) {
+        int m = 0;
+        if (mark.ContainsKey(id)) { m = mark[id]; }
+        if (m == 1) { return; }
+        if (m == 2) { return; }
+        mark[id] = 1;
+        AssetEntry e = this.Get(id);
+        if (e != null) {
+            for (int i = 0; i < e.depends.Count; i = i + 1) {
+                this.TopoVisit(e.depends[i], mark, order);
+            }
+        }
+        mark[id] = 2;
+        order.Add(id);
+    }
+
+    // 导出 JSON（供打包工具 / 热更 diff 用）。
+    public string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            AssetEntry e = this.entries[i];
+            JsonValue o = JsonValue.NewObject();
+            o.PutStr("id", e.id);
+            o.PutStr("kind", AssetKinds.Name(e.kind));
+            o.PutStr("path", e.path);
+            if (e.depends.Count > 0) {
+                JsonValue deps = JsonValue.NewArray();
+                for (int d = 0; d < e.depends.Count; d = d + 1) {
+                    deps.AppendStr(e.depends[d]);
+                }
+                o.Put("depends", deps);
+            }
+            if (e.size > 0L) {
+                o.PutInt("size", e.size);
+            }
+            arr.Append(o);
+        }
+        root.Put("assets", arr);
+        return root.ToJson();
+    }
+
+    // 从 JSON 读清单。格式：
+    //   { "assets": [ { "id": "...", "kind": "Texture", "path": "...",
+    //                   "depends": ["..."], "size": 123 } ] }
+    // 字段缺失按默认值处理（kind 缺省 Unknown，depends 缺省空）。
+    public static AssetManifest FromJson(string json) {
+        if (json == null || json == "") {
+            throw new ArgumentException("manifest json is empty");
+        }
+        JsonValue root = JsonValue.Parse(json);
+        if (!root.IsObject()) {
+            throw new ArgumentException("manifest json root must be an object");
+        }
+        if (!root.Has("assets")) {
+            throw new ArgumentException("manifest json has no 'assets' array");
+        }
+        JsonValue arr = root.Get("assets");
+        if (arr == null || !arr.IsArray()) {
+            throw new ArgumentException("manifest 'assets' must be an array");
+        }
+        AssetManifest m = new AssetManifest();
+        for (int i = 0; i < arr.Count(); i = i + 1) {
+            JsonValue o = arr.At(i);
+            if (o == null || !o.IsObject()) {
+                throw new ArgumentException("manifest asset #" + i.ToString() + " is not an object");
+            }
+            string id = "";
+            JsonValue jid = o.Get("id");
+            if (jid != null) { id = jid.AsString(""); }
+            string kindName = "Unknown";
+            JsonValue jkind = o.Get("kind");
+            if (jkind != null) { kindName = jkind.AsString("Unknown"); }
+            string path = "";
+            JsonValue jpath = o.Get("path");
+            if (jpath != null) { path = jpath.AsString(""); }
+            AssetEntry e = new AssetEntry(id, AssetKinds.Parse(kindName), path);
+            JsonValue jsize = o.Get("size");
+            if (jsize != null) {
+                e.size = jsize.AsLong(0L);
+            }
+            JsonValue deps = o.Get("depends");
+            if (deps != null && deps.IsArray()) {
+                for (int d = 0; d < deps.Count(); d = d + 1) {
+                    JsonValue jd = deps.At(d);
+                    if (jd != null) { e.Depends(jd.AsString("")); }
+                }
+            }
+            m.Add(e);
+        }
+        return m;
+    }
+}

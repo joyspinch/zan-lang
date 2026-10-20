@@ -1,0 +1,398 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Game.Assets;
+
+// 资源系统契约测试：清单、依赖图、引用计数、预算淘汰、资源组。
+//
+// 覆盖的判定点：
+//   - 清单：JSON 往返、重复 id 拒绝、悬空依赖拒绝、环依赖拒绝；
+//   - 依赖图：Acquire 自动拉依赖、depCount 是图的属性、拓扑序；
+//   - 引用计数：重复 Acquire 计数累加、Release 归零、underflow 报错；
+//   - 预算淘汰：LRU 顺序确定、被引用/被依赖/被钉住的不淘汰、
+//     超预算时先淘汰最久没用的；
+//   - 资源组：按前缀分组、整组加载/释放。
+//
+// golden 只锁定"全过"那行——中间的数字断言都在上面。
+public class AssetTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    // 造一份带依赖的清单：
+    //   tex/a  (无依赖)
+    //   tex/b  依赖 tex/a
+    //   scene   依赖 tex/a + tex/b
+    //   audio/x (无依赖)
+    private static AssetManifest BuildManifest() {
+        AssetManifest m = new AssetManifest();
+        m.Declare("tex/a", AssetKind.Texture, "a.png");
+        m.Declare("tex/b", AssetKind.Texture, "b.png").Depends("tex/a");
+        m.Declare("scene", AssetKind.Scene, "scene.bin").Depends("tex/a").Depends("tex/b");
+        m.Declare("audio/x", AssetKind.Audio, "x.wav");
+        return m;
+    }
+
+    // 造一个内存来源：内容长度按名字定，内容是名字本身。
+    private static MemoryAssetProvider BuildProvider() {
+        MemoryAssetProvider p = new MemoryAssetProvider();
+        p.PutText("a.png", "AAAA");
+        p.PutText("b.png", "BB");
+        p.PutText("scene.bin", "SCENE");
+        p.PutText("x.wav", "WAV");
+        return p;
+    }
+
+    private static AssetStore BuildStore(AssetManifest m, long budget) {
+        AssetStore s = new AssetStore(m);
+        s.AddProvider(BuildProvider());
+        if (budget > 0L) {
+            s.WithBudget(budget);
+        }
+        return s;
+    }
+
+    /* ---------- 清单 ---------- */
+
+    private static void TestManifestJson() {
+        AssetManifest m = BuildManifest();
+        string json = m.ToJson();
+        AssetManifest back = AssetManifest.FromJson(json);
+        CheckEq("manifest-roundtrip-count", back.Count(), 4L);
+        Check("manifest-roundtrip-has-scene", back.Contains("scene"));
+        AssetEntry e = back.Get("tex/b");
+        Check("manifest-roundtrip-dep", e != null && e.depends.Count == 1
+            && e.depends[0] == "tex/a");
+        Check("manifest-roundtrip-kind", e != null && e.kind == AssetKind.Texture);
+
+        // 重复 id 拒绝
+        bool threw = false;
+        try {
+            m.Declare("tex/a", AssetKind.Texture, "dup.png");
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("manifest-duplicate-id-rejected", threw);
+
+        // 悬空依赖拒绝
+        AssetManifest bad = new AssetManifest();
+        bad.Declare("x", AssetKind.Data, "x.bin").Depends("nope");
+        threw = false;
+        try {
+            bad.Validate();
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("manifest-missing-dep-rejected", threw);
+
+        // 环依赖拒绝
+        AssetManifest cyc = new AssetManifest();
+        cyc.Declare("a", AssetKind.Data, "a").Depends("b");
+        cyc.Declare("b", AssetKind.Data, "b").Depends("a");
+        threw = false;
+        try {
+            cyc.Validate();
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("manifest-cycle-rejected", threw);
+
+        // 未知 kind 拒绝（不静默降级）
+        threw = false;
+        try {
+            AssetKinds.Parse("Bogus");
+        } catch (ArgumentException) {
+            threw = true;
+        }
+        Check("manifest-unknown-kind-rejected", threw);
+    }
+
+    /* ---------- 依赖图 ---------- */
+
+    private static void TestDependencies() {
+        AssetManifest m = BuildManifest();
+        AssetStore s = BuildStore(m, 0L);
+
+        // Acquire scene 会自动拉 tex/a 与 tex/b
+        byte[] data = s.Acquire("scene");
+        Check("dep-scene-content", data != null && data.Length == 5);
+        Check("dep-scene-loaded", s.IsLoaded("scene"));
+        Check("dep-tex-a-loaded", s.IsLoaded("tex/a"));
+        Check("dep-tex-b-loaded", s.IsLoaded("tex/b"));
+        Check("dep-unrelated-not-loaded", !s.IsLoaded("audio/x"));
+
+        // depCount 是图的属性：scene 依赖 tex/a，tex/b 也依赖 tex/a
+        // → tex/a 被两个已驻留资源依赖
+        CheckEq("dep-tex-a-depcount", s.DepCount("tex/a"), 2L);
+        CheckEq("dep-tex-b-depcount", s.DepCount("tex/b"), 1L);
+        CheckEq("dep-scene-depcount", s.DepCount("scene"), 0L);
+
+        // 外部引用只有 scene 一个
+        CheckEq("dep-scene-refcount", s.RefCount("scene"), 1L);
+        CheckEq("dep-tex-a-refcount", s.RefCount("tex/a"), 0L);
+
+        // 加载计数 = 3（scene + tex/a + tex/b）
+        CheckEq("dep-load-count", s.LoadCount(), 3L);
+
+        // 重复 Acquire 命中（不重新读）
+        s.Acquire("scene");
+        CheckEq("dep-hit-count", s.HitCount(), 1L);
+        CheckEq("dep-refcount-after-2x", s.RefCount("scene"), 2L);
+        CheckEq("dep-load-count-after-2x", s.LoadCount(), 3L);
+
+        // 驻留字节数 = 5(scene) + 4(a) + 2(b)
+        CheckEq("dep-loaded-bytes", s.LoadedBytes(), 11L);
+    }
+
+    /* ---------- 引用计数与释放 ---------- */
+
+    private static void TestRefCount() {
+        AssetManifest m = BuildManifest();
+        AssetStore s = BuildStore(m, 0L);
+
+        s.Acquire("tex/a");
+        s.Acquire("tex/a");
+        CheckEq("ref-two-acquires", s.RefCount("tex/a"), 2L);
+
+        s.Release("tex/a");
+        CheckEq("ref-after-one-release", s.RefCount("tex/a"), 1L);
+        // Release 只减引用，资源仍驻留（缓存语义）
+        Check("ref-still-resident-after-release", s.IsLoaded("tex/a"));
+
+        s.Release("tex/a");
+        CheckEq("ref-after-two-releases", s.RefCount("tex/a"), 0L);
+        Check("ref-resident-until-trimmed", s.IsLoaded("tex/a"));
+
+        // underflow：没 acquire 就 release
+        bool threw = false;
+        try {
+            s.Release("tex/a");
+        } catch (AssetException e) {
+            threw = e.error == AssetError.Underflow;
+        }
+        Check("ref-underflow-throws", threw);
+
+        // 缺失资源：NotFound
+        threw = false;
+        try {
+            s.Acquire("nope");
+        } catch (AssetException e) {
+            threw = e.error == AssetError.NotFound;
+        }
+        Check("ref-notfound-throws", threw);
+        // 失败计数：1 次 not found + 1 次 underflow
+        CheckEq("ref-fail-count", s.FailCount(), 2L);
+    }
+
+    /* ---------- 预算淘汰 ---------- */
+
+    private static void TestBudget() {
+        AssetManifest m = BuildManifest();
+        // 预算 5 字节：a(4) + b(2) = 6 装不下，淘汰后必须回到预算内。
+        AssetStore s = BuildStore(m, 5L);
+        CheckEq("budget-set", s.Budget(), 5L);
+
+        s.Acquire("tex/a");
+        s.Acquire("tex/b");
+        CheckEq("budget-loaded-after-two", s.LoadedBytes(), 6L);
+
+        // 引用中的资源不淘汰
+        int evicted = s.EnforceBudget();
+        CheckEq("budget-nothing-evicted-while-referenced", evicted, 0L);
+        Check("budget-tex-a-kept", s.IsLoaded("tex/a"));
+
+        // 释放引用后仍驻留（缓存语义），但变成可淘汰。
+        // 注意：tex/b 依赖 tex/a，所以 tex/a 此刻仍被依赖着，不可淘汰；
+        // tex/b 无人依赖，可淘汰。
+        s.Release("tex/a");
+        s.Release("tex/b");
+        Check("budget-released-still-loaded", s.IsLoaded("tex/a"));
+        Check("budget-tex-b-evictable-after-release", s.IsEvictable("tex/b"));
+        Check("budget-tex-a-blocked-by-dependency", !s.IsEvictable("tex/a"));
+
+        // 超预算（6 > 5）→ 淘汰闲置的 tex/b；它一走，tex/a 的依赖计数归零，
+        // 但字节数已回到预算内，循环停下（tex/a 仍驻留，等下一次淘汰）。
+        evicted = s.EnforceBudget();
+        CheckEq("budget-evicted-one", evicted, 1L);
+        Check("budget-tex-b-evicted", !s.IsLoaded("tex/b"));
+        Check("budget-tex-a-still-loaded", s.IsLoaded("tex/a"));
+        Check("budget-under-budget-after", s.LoadedBytes() <= 5L);
+        Check("budget-tex-a-depcount-drained", s.DepCount("tex/a") == 0);
+    }
+
+    private static void TestBudgetLru() {
+        // 三个互不依赖的资源，各 4 字节，预算 8 → 必须淘汰一个。
+        AssetManifest m = new AssetManifest();
+        m.Declare("r1", AssetKind.Data, "r1");
+        m.Declare("r2", AssetKind.Data, "r2");
+        m.Declare("r3", AssetKind.Data, "r3");
+        MemoryAssetProvider p = new MemoryAssetProvider();
+        p.PutText("r1", "1111");
+        p.PutText("r2", "2222");
+        p.PutText("r3", "3333");
+        AssetStore s = new AssetStore(m);
+        s.AddProvider(p);
+        s.WithBudget(8L);
+
+        s.Acquire("r1");
+        s.Acquire("r2");
+        s.Acquire("r3");
+        CheckEq("lru-loaded-bytes", s.LoadedBytes(), 12L);
+        s.Release("r1");
+        s.Release("r2");
+        s.Release("r3");
+
+        // LRU：r1 最久没用 → 先被淘汰
+        int evicted = s.EnforceBudget();
+        CheckEq("lru-evicted-one", evicted, 1L);
+        Check("lru-r1-evicted", !s.IsLoaded("r1"));
+        Check("lru-r2-kept", s.IsLoaded("r2"));
+        Check("lru-r3-kept", s.IsLoaded("r3"));
+    }
+
+    private static void TestBudgetPinned() {
+        AssetManifest m = BuildManifest();
+        AssetStore s = BuildStore(m, 0L);
+        s.Acquire("tex/a");
+        s.Acquire("tex/b");
+        s.Release("tex/a");
+        s.Release("tex/b");
+        s.Pin("tex/a");
+        Check("pinned-not-evictable", !s.IsEvictable("tex/a"));
+        int evicted = s.TrimIdle();
+        Check("pinned-survives-trim", s.IsLoaded("tex/a"));
+        Check("pinned-other-evicted", !s.IsLoaded("tex/b"));
+        Check("pinned-evict-count", evicted >= 1);
+    }
+
+    private static void TestDepBlocksEviction() {
+        AssetManifest m = BuildManifest();
+        AssetStore s = BuildStore(m, 0L);
+        // 只加载 scene（它依赖 tex/a、tex/b）
+        s.Acquire("scene");
+        s.Release("scene");
+        // scene 现在没人用，可淘汰；tex/a、tex/b 被 scene 依赖着
+        Check("depblock-scene-evictable", s.IsEvictable("scene"));
+        Check("depblock-tex-a-not-evictable", !s.IsEvictable("tex/a"));
+        Check("depblock-tex-b-not-evictable", !s.IsEvictable("tex/b"));
+
+        // 钉住 scene → 它不被回收 → 它依赖的 tex/a、tex/b 也留着
+        // （依赖计数 > 0 就不可回收，哪怕它们自己没人引用）。
+        s.Pin("scene");
+        s.TrimIdle();
+        Check("depblock-pinned-scene-kept", s.IsLoaded("scene"));
+        Check("depblock-tex-a-kept-by-dep", s.IsLoaded("tex/a"));
+        Check("depblock-tex-b-kept-by-dep", s.IsLoaded("tex/b"));
+        Check("depblock-tex-a-depcount-held", s.DepCount("tex/a") == 2);
+
+        // 解钉 scene → 空闲回收按 LRU 逐个进行，依赖随之级联回退：
+        // scene 先走，tex/b 的依赖计数归零后轮到它，最后是 tex/a。
+        s.Unpin("scene");
+        s.TrimIdle();
+        Check("depblock-scene-gone", !s.IsLoaded("scene"));
+        Check("depblock-tex-a-depcount-zero", s.DepCount("tex/a") == 0);
+        Check("depblock-tex-a-cascade-gone", !s.IsLoaded("tex/a"));
+        Check("depblock-tex-b-cascade-gone", !s.IsLoaded("tex/b"));
+        Check("depblock-nothing-left", s.LoadedBytes() == 0L);
+    }
+
+    /* ---------- 资源组 ---------- */
+
+    private static void TestGroups() {
+        AssetManifest m = BuildManifest();
+        AssetStore s = BuildStore(m, 0L);
+
+        AssetGroup g = AssetGroup.FromPrefix(m, "tex", "tex/");
+        CheckEq("group-count", g.Count(), 2L);
+        Check("group-name", g.Name() == "tex");
+
+        int loaded = g.LoadAll(s);
+        CheckEq("group-loaded", loaded, 2L);
+        Check("group-tex-a-loaded", s.IsLoaded("tex/a"));
+        Check("group-tex-b-loaded", s.IsLoaded("tex/b"));
+        // 加载 tex/b 会拉它的依赖 tex/a（已加载）
+        CheckEq("group-tex-a-refcount", s.RefCount("tex/a"), 1L);
+        CheckEq("group-tex-b-refcount", s.RefCount("tex/b"), 1L);
+
+        int released = g.ReleaseAll(s);
+        CheckEq("group-released", released, 2L);
+        CheckEq("group-tex-a-refcount-after", s.RefCount("tex/a"), 0L);
+        CheckEq("group-tex-b-refcount-after", s.RefCount("tex/b"), 0L);
+    }
+
+    /* ---------- 文件来源 ---------- */
+
+    private static void TestFileProvider() {
+        FileAssetProvider p = new FileAssetProvider("tests/conformance");
+        // 该目录存在但里面没有这个文件 → 读不到
+        byte[] data = null;
+        bool got = p.TryRead("definitely-not-here.bin", out data);
+        Check("fileprov-missing-returns-false", !got);
+        Check("fileprov-missing-data-null", data == null);
+        Check("fileprov-exists-false", !p.Exists("definitely-not-here.bin"));
+
+        // 用本用例自己的源文件当资源（它在仓库里必然存在）
+        FileAssetProvider p2 = new FileAssetProvider("tests/conformance");
+        Check("fileprov-exists-real", p2.Exists("assets_store.zan"));
+        byte[] real = null;
+        bool ok = p2.TryRead("assets_store.zan", out real);
+        Check("fileprov-read-real", ok && real != null && real.Length > 0);
+    }
+
+    /* ---------- 拓扑序 ---------- */
+
+    private static void TestTopoOrder() {
+        AssetManifest m = BuildManifest();
+        List<string> order = m.TopoOrder();
+        CheckEq("topo-count", order.Count, 4L);
+        // 依赖必须在依赖者之前
+        int ia = -1;
+        int ib = -1;
+        int isc = -1;
+        for (int i = 0; i < order.Count; i = i + 1) {
+            if (order[i] == "tex/a") { ia = i; }
+            if (order[i] == "tex/b") { ib = i; }
+            if (order[i] == "scene") { isc = i; }
+        }
+        Check("topo-a-before-b", ia >= 0 && ib >= 0 && ia < ib);
+        Check("topo-b-before-scene", ib >= 0 && isc >= 0 && ib < isc);
+    }
+
+    public static void Run() {
+        TestManifestJson();
+        TestDependencies();
+        TestRefCount();
+        TestBudget();
+        TestBudgetLru();
+        TestBudgetPinned();
+        TestDepBlocksEviction();
+        TestGroups();
+        TestFileProvider();
+        TestTopoOrder();
+
+        if (failures > 0) {
+            Console.WriteLine("ASSET TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL ASSET TESTS PASSED");
+        }
+    }
+}
+
+public class AssetTestsMain {
+    public static void Main() {
+        AssetTests.Run();
+    }
+}

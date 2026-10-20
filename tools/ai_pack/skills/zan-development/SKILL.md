@@ -182,6 +182,25 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   编译器直接报 "'List<T>.Count' is a property, not a method: drop the '()'"。
   `Dictionary` / `Queue` 的 `Count` 同理。自己封装的类（`CellPath.Count()`）
   才是方法——**别把两者的写法混用**。
+* **空安全是编译期硬检查**（实证，2026-10-22）：`JsonValue.Get(key)`、
+  `List.First()` 等标为"可返回 null"的调用，其结果**直接取成员**会被编译器
+  拦下（"'Get' can return null; accessing 'IsArray' on its result faults at
+  runtime"）。定式：先存进局部变量判空再用，或用 `?.`。
+  ——**`Has(key)` 判断过也不算数**，编译器不据此消解 null。
+* **异常有两级继承**（实证，2026-10-22）：`class SubEx : BaseEx`，`BaseEx :
+  Exception` 合法，`catch (BaseEx)` 能接住子类抛的实例。
+* **接口可以带 `out` 参数**（实证，2026-10-22）：`interface I { bool TryGet(string
+  k, out byte[] v); }` 合法，实现类与经接口类型的调用点都正常。
+  接口类型可作字段、参数；实现类可显式赋给接口类型变量。
+* **字节数组没有区间切片**（实证，2026-10-22）：`raw[1..3]` 语法不存在
+  （报 "expected ']', got '..'"）。要切片就新建数组循环拷贝。
+  `byte[].ToStr(0, len)` 给出字节的字符串视图（可含 NUL），反向用
+  `Encoding.UTF8.GetBytes(text)`。
+* **stdlib 的异常类型比想象中少**（实证，2026-10-22）：只有 `ArgumentException`、
+  `InvalidOperationException`、`IOException`（`FileNotFoundException` 继承它）、
+  `JsonException`、`NotSupportedException`、`TimeoutException` 等。
+  **没有** `DirectoryNotFoundException` / `UnauthorizedAccessException`——
+  写 catch 子句前先确认类型存在，否则编译报 "undefined type"。
 
 ## 4. Edit
 
