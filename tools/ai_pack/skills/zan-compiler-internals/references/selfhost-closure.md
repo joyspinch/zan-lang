@@ -1180,3 +1180,30 @@ kernel32、shell32、user32、advapi32、version）。
   放进 cell 里）。托管引用类型（类）没有初始化器时存 null。
 - 连带：帧槽里的垃圾值不是"未定义但无害"——它会变成野指针，症状是整个
   程序无输出，看起来像"用例没跑"。
+
+## 63. by-ref（`ref`/`out`）形参：传的是地址，引用归调用方
+
+- 坑（实测）：自举 IR 后端只认 `ival == 1` 的 place 形式，而 parser 只给
+  `ref x` 置了这个标记——`out x` 落到默认分支，被发成 `%Box* null` 当实参，
+  而被调方的形参是 `%Box** %p0`：**类型不匹配**。clang 对 `.ll` 默认不跑
+  verifier，这种错配会静默通过，运行期解引用空指针 → 0xC0000005，一个输出
+  都没有（用例 `out_param_field`）。
+- 宿主口径（宿主 `emit_ref_arg`）：
+  - `out T name`（**声明**形式）：新建一个零初始化的槽，登记为局部，传地址；
+  - `out x` / `ref x`（**place** 形式）：传该 place 的地址（局部 alloca、
+    字段地址、元素地址）；
+  - 被调方的形参类型是 `map_type(pt)*`——**指向调用方槽位**的指针。
+- 做法：用**节点形状**区分两种形式（`a != null` 是 place，`type != null` 是
+  声明），不要靠 `ival`；调用点对 `AK.OutArg()` 统一按"传地址"处理。
+- 关键纪律：**by-ref 形参的引用归调用方**。被调方读/写这个槽，但**不能在
+  作用域退出时释放它**（宿主的 `local_owns_arc()` 对 `byref_slot` 返回 0）。
+  自举原来把它当普通局部，退出时多 `zrelease` 一次 → 调用方的引用被多释放
+  一次 → use-after-free。
+- 连带：
+  - 字段地址是 `getelementptr %Cls, %Cls* obj, i32 0, i32 i`，类型是
+    `%Cls*`，而 place 要的是 `<字段类型>*`——必须补一次
+    `bitcast %Cls* %p to i64*`，否则 clang 报 "invalid cast opcode"；
+  - 虚表槽的函数指针类型（`MethodFnTypeThis`）也要给 by-ref 形参加 `*`，
+    否则虚调用和定义对不上；
+  - 自举的数组元素一律是 8 字节槽，`out arr[i]` 只能给"槽形状"的元素
+    （byte/char 除外），否则要 fail-closed 而不是发出语义不同的地址。

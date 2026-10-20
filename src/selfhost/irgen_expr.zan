@@ -2467,6 +2467,15 @@ partial class Irgen {
                 int i = 0;
                 while (i < cargs.Count) {
                     Node pty = CtorParamType(ctor, i);
+                    if (IsRefParam(ctor, i) && cargs[i] != null
+                        && cargs[i].kind == AK.OutArg()) {
+                        string addr;
+                        if (cargs[i].type != null) { addr = NewOutLocal(cargs[i]); }
+                        else { addr = RefPlacePtr(cargs[i].a, pty); }
+                        args = args + ", " + MapType(pty) + "* " + addr;
+                        i = i + 1;
+                        continue;
+                    }
                     ExprVal av = GenArgExpr(cargs[i], pty);
                     args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
                     i = i + 1;
@@ -3518,6 +3527,7 @@ partial class Irgen {
         tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
         locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        locRef = new List<bool>();
         // a closure inside this lambda may capture the lambda's own locals
         capNames = new List<string>();
         CollectCapturedNames(lam.d, capNames);
@@ -4087,7 +4097,10 @@ partial class Irgen {
                     outp = AddLocal(oa.sval, oty);
                     EA(outp, MapType(oty));
                 } else {
-                    int li = LocalIdx(oa.sval);
+                    // the place form (`out v`): the name lives in the place
+                    string onm = oa.sval;
+                    if (onm == "" && oa.a != null && oa.a.kind == AK.Ident()) { onm = oa.a.sval; }
+                    int li = LocalIdx(onm);
                     if (li >= 0) { oty = locType[li]; outp = locReg[li]; }
                 }
                 string endp = NT();
@@ -4440,22 +4453,130 @@ partial class Irgen {
         return false;
     }
 
-    // Address of a by-ref argument place. Bootstrap subset: only a plain
-    // local variable is supported (`ref x`); managed types are rejected
-    // because by-ref write-back needs the caller's byref_slot ARC discipline.
-    string RefPlacePtr(Node place) {
-        if (place != null && place.kind == AK.Ident()) {
+    // The address of a by-ref argument place. `ref x` / `out x` at the call
+    // site hand the callee the ADDRESS of the place, so the callee reads and
+    // writes the caller's own storage (the C host's emit_ref_arg). The
+    // address has the type of the place's slot (`<mapped type>*`), which is
+    // exactly what the callee's by-ref parameter expects.
+    string RefPlacePtr(Node place, Node pty) {
+        if (place == null) {
+            diags.Error("ref/out argument must be a variable, a field, or an element", 0, 0);
+            return "null";
+        }
+        string lt = MapType(pty);
+        if (place.kind == AK.Ident()) {
             int li = LocalIdx(place.sval);
             if (li >= 0) {
-                if (ArcManaged(locType[li])) {
-                    diags.Error("ref/out argument '" + place.sval
-                        + "' must be a value type (bootstrap subset)", place.line, place.col);
-                    return "null";
+                if (curAsync && locBox[li]) {
+                    // the local lives in a heap cell: the cell IS its storage
+                    string c = NT();
+                    L("  " + c + " = load i8*, i8** " + locReg[li]);
+                    string p = NT();
+                    L("  " + p + " = bitcast i8* " + c + " to " + lt + "*");
+                    return p;
                 }
                 return locReg[li];
             }
+            if (curClass != "") {
+                Node scls = binder.FindType(curClass);
+                if (scls != null && FindStaticField(scls, place.sval) != null) {
+                    return "@__zan_sf_" + StaticFieldOwner(scls, place.sval) + "_" + place.sval;
+                }
+                // this.field
+                if (curHasThis) {
+                    Node cls = binder.FindType(curClass);
+                    if (cls != null && FieldIndex(cls, place.sval) >= 0) {
+                        Node fty = FieldType(cls, place.sval);
+                        return FieldPlacePtr("%this", curClass, place.sval, fty, lt);
+                    }
+                }
+            }
+            diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+            return "null";
         }
-        diags.Error("ref/out argument must be a local variable (bootstrap subset)", place.line, place.col);
+        if (place.kind == AK.MemberAccess()) {
+            // obj.field: the address of the field itself
+            ExprVal obj = GenExpr(place.a);
+            string cn = obj.ty.sval;
+            Node ocls = binder.FindType(cn);
+            if (ocls == null || FieldIndex(ocls, place.sval) < 0) {
+                diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+                return "null";
+            }
+            Node fty = FieldType(ocls, place.sval);
+            return FieldPlacePtr(obj.op, cn, place.sval, fty, lt);
+        }
+        if (place.kind == AK.Index()) {
+            // arr[i]: the address of the element. The self-hosted backend keeps
+            // every array element in an 8-byte slot, so only the slot-shaped
+            // elements can be handed out by address.
+            ExprVal obj = GenExpr(place.a);
+            ExprVal idx = GenExpr(place.b);
+            Node et = ArrayElemType(obj.ty);
+            if (et == null || MapType(et) != "i64" || IsByteArr(obj.ty)) {
+                diags.Error("ref/out of an array element is not supported by the self-hosted compiler yet", place.line, place.col);
+                return "null";
+            }
+            string p = NT();
+            L("  " + p + " = getelementptr i64, i64* " + obj.op + ", i64 " + idx.op);
+            return p;
+        }
+        diags.Error("ref/out argument must be a variable, a field, or an element", place.line, place.col);
+        return "null";
+    }
+
+    // The address of a class field, typed as the place the caller expects
+    // (`<field type>*`).
+    string FieldPtr(string objOp, string clsName, string field, string wantLt) {
+        Node cls = binder.FindType(clsName);
+        int idx = FieldIndex(cls, field);
+        string p = NT();
+        L("  " + p + " = getelementptr %" + clsName + ", %" + clsName + "* " + objOp + ", i32 0, i32 " + idx);
+        if (wantLt == "%" + clsName + "*") { return p; }
+        // the GEP yields the struct-typed address; the place wants the
+        // field's own type
+        string b = NT();
+        L("  " + b + " = bitcast %" + clsName + "* " + p + " to " + wantLt);
+        return b;
+    }
+
+    // The address of a field place, typed as the by-ref parameter's slot.
+    string FieldPlacePtr(string objOp, string clsName, string field, Node fty, string wantLt) {
+        string ad = FieldPtr(objOp, clsName, field, MapType(fty) + "*");
+        if (MapType(fty) == wantLt) { return ad; }
+        string b = NT();
+        L("  " + b + " = bitcast " + MapType(fty) + "* " + ad + " to " + wantLt + "*");
+        return b;
+    }
+
+    // The element type of an array-typed expression (null when it is not an
+    // array).
+    Node ArrayElemType(Node t) {
+        if (t == null || t.ival < 1) { return null; }
+        Node et = new Node(AK.TypeRef());
+        et.sval = t.sval;
+        et.ival = t.ival - 1;
+        et.op = t.op;
+        et.sval2 = t.sval2;
+        return et;
+    }
+    // `out T name` at the call site: the callee writes through the address of
+    // a fresh local, which stays visible to the caller afterwards (the C
+    // host's emit_ref_arg declaration form).
+    string NewOutLocal(Node oa) {
+        Node ty = oa.type;
+        string lt = MapType(ty);
+        string reg = AddLocal(oa.sval, ty);
+        EA(reg, lt);
+        L("  store " + lt + " " + ZeroConst(lt) + ", " + lt + "* " + reg);
+        return reg;
+    }
+
+    // The zero value of a lowered type.
+    string ZeroConst(string lt) {
+        if (lt == "i64") { return "0"; }
+        if (lt == "double") { return "0.0"; }
+        if (lt.Length > 0 && lt.Substring(0, 1) == "<") { return "zeroinitializer"; }
         return "null";
     }
 
@@ -4659,9 +4780,12 @@ partial class Irgen {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (spec) { pty = SubstTP(pty, stns, strs); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
-                && aargs[i].kind == AK.OutArg() && aargs[i].ival == 1) {
+                && aargs[i].kind == AK.OutArg()) {
                 if (i > 0) { args = args + ", "; }
-                args = args + MapType(pty) + "* " + RefPlacePtr(aargs[i].a);
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                args = args + MapType(pty) + "* " + addr;
                 i = i + 1;
                 continue;
             }
@@ -4776,7 +4900,7 @@ partial class Irgen {
                                 Node pt2 = null;
                                 if (pi < dps.Count) { pt2 = dps[pi]; }
                                 locName.Add(arg.kids[j].sval); locType.Add(pt2); locReg.Add("");
-                                locBox.Add(false); locIter.Add(false); locCell.Add("");
+                                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
                                 pi = pi + 1;
                             }
                             j = j + 1;
@@ -4786,6 +4910,7 @@ partial class Irgen {
                             locName.RemoveAt(locName.Count - 1);
                             locType.RemoveAt(locType.Count - 1);
                             locReg.RemoveAt(locReg.Count - 1);
+                            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
                         }
                         if (lrt != null) {
                             if (TypeTag(lrt) == TypeTag(drt)) { score = score + 8; }
@@ -4910,7 +5035,7 @@ partial class Irgen {
                 Node pt2 = lam.kids[j].type;
                 if (pt2 == null && pi < dps.Count) { pt2 = dps[pi]; }
                 locName.Add(lam.kids[j].sval); locType.Add(pt2); locReg.Add("");
-                locBox.Add(false); locIter.Add(false); locCell.Add("");
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
                 pi = pi + 1;
             }
             j = j + 1;
@@ -4920,6 +5045,7 @@ partial class Irgen {
             locName.RemoveAt(locName.Count - 1);
             locType.RemoveAt(locType.Count - 1);
             locReg.RemoveAt(locReg.Count - 1);
+            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
         }
         return lrt;
     }
@@ -5030,9 +5156,12 @@ partial class Irgen {
         while (i < aargs.Count) {
             Node pty = MkType("int"); if (m != null) { pty = ParamTypeNode(m, i); }
             if (m != null && IsRefParam(m, i) && aargs[i] != null
-                && aargs[i].kind == AK.OutArg() && aargs[i].ival == 1) {
+                && aargs[i].kind == AK.OutArg()) {
                 if (i > 0) { args = args + ", "; }
-                args = args + MapType(pty) + "* " + RefPlacePtr(aargs[i].a);
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                args = args + MapType(pty) + "* " + addr;
                 i = i + 1;
                 continue;
             }
@@ -5074,6 +5203,14 @@ partial class Irgen {
         int i = 0;
         while (i < aargs.Count) {
             Node pty = ParamTypeNode(m, i);
+            if (IsRefParam(m, i) && aargs[i] != null && aargs[i].kind == AK.OutArg()) {
+                string addr;
+                if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
+                else { addr = RefPlacePtr(aargs[i].a, pty); }
+                args = args + ", " + MapType(pty) + "* " + addr;
+                i = i + 1;
+                continue;
+            }
             ExprVal av = GenArgExpr(aargs[i], pty);
             args = args + ", " + MapType(pty) + " " + CallArg(av, pty);
             i = i + 1;

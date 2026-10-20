@@ -45,6 +45,10 @@ partial class Irgen {
     public List<bool> locBox;
     public List<bool> locIter;
     public List<string> locCell;
+    // a by-ref (`ref`/`out`) parameter: the local's register is the ADDRESS
+    // of the caller's storage, so reads/writes go through it and the
+    // reference stays the caller's (the callee never releases it)
+    public List<bool> locRef;
     // names a closure inside the current function may capture: a local with
     // one of these names has to live in a cell
     public List<string> capNames;
@@ -112,6 +116,7 @@ partial class Irgen {
         locBox = new List<bool>();
         locIter = new List<bool>();
         locCell = new List<string>();
+        locRef = new List<bool>();
         capNames = new List<string>();
         locSeq = 0;
         qdotSeq = 0;
@@ -1416,7 +1421,7 @@ partial class Irgen {
         locSeq = locSeq + 1;
         string r = "%v." + name + "." + locSeq;
         locName.Add(name); locType.Add(ty); locReg.Add(r);
-        locBox.Add(false); locIter.Add(false); locCell.Add("");
+        locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
         return r;
     }
     string RegOf(string name) { int i = LocalIdx(name); if (i < 0) { return "%v." + name; } return locReg[i]; }
@@ -2227,6 +2232,9 @@ partial class Irgen {
     void EmitLocalReleases() {
         int i = 0;
         while (i < locName.Count) {
+            // a by-ref parameter's reference belongs to the CALLER's slot:
+            // releasing it here would drop the caller's own reference
+            if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
             if (ArcManaged(locType[i])) {
                 string lt = MapType(locType[i]);
                 string t = NT();
@@ -2283,6 +2291,8 @@ partial class Irgen {
         while (i < locName.Count) {
             // __qdot temps hold a borrowed `?.` receiver: not owned, never released
             if (locName[i].Length >= 6 && locName[i].Substring(0, 6) == "__qdot") { i = i + 1; continue; }
+            // a by-ref parameter's reference belongs to the CALLER's slot
+            if (i < locRef.Count && locRef[i]) { i = i + 1; continue; }
             if (ArcManaged(locType[i])) {
                 string lt = MapType(locType[i]);
                 string t = NT();
@@ -2312,14 +2322,16 @@ partial class Irgen {
         List<bool> nb = new List<bool>();
         List<bool> ni = new List<bool>();
         List<string> nc = new List<string>();
+        List<bool> nref = new List<bool>();
         int i = 0;
         while (i < to) {
             nn.Add(locName[i]); nt.Add(locType[i]); nr.Add(locReg[i]);
             nb.Add(locBox[i]); ni.Add(locIter[i]); nc.Add(locCell[i]);
+            if (i < locRef.Count) { nref.Add(locRef[i]); } else { nref.Add(false); }
             i = i + 1;
         }
         locName = nn; locType = nt; locReg = nr;
-        locBox = nb; locIter = ni; locCell = nc;
+        locBox = nb; locIter = ni; locCell = nc; locRef = nref;
     }
 
     // per-class destructor: release every ARC-managed field, then return (the
@@ -3301,6 +3313,7 @@ partial class Irgen {
         locBox = new List<bool>();
         locIter = new List<bool>();
         locCell = new List<string>();
+        locRef = new List<bool>();
         capNames = new List<string>();
         locSeq = 0;
         stmtTemps = new List<string>();

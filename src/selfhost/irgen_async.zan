@@ -835,7 +835,16 @@ partial class Irgen {
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            if (p.kind == AK.Param()) {
+                if (p.ival == 1) {
+                    // a by-ref parameter: the async frame copies the
+                    // parameters by value, so the callee could not write
+                    // back into the caller's slot -- refuse instead of
+                    // silently lowering a by-value parameter
+                    diags.Error("a ref/out parameter in an async method is not supported by the self-hosted compiler yet", p.line, p.col);
+                }
+                pn.Add(p.sval); pt.Add(p.type);
+            }
             i = i + 1;
         }
         List<string> lnames = new List<string>();
@@ -1455,6 +1464,7 @@ partial class Irgen {
         tmp = 0; lbl = 0; term = false; curLbl = "entry"; curAsync = false;
         locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>(); locSeq = 0;
         locBox = new List<bool>(); locIter = new List<bool>(); locCell = new List<string>();
+        locRef = new List<bool>();
         capNames = new List<string>();
         curRet = "void"; curRetTy = MkType("void"); curClass = ""; curHasThis = false;
         brkTarget = 0; contTarget = 0;
@@ -1732,10 +1742,10 @@ partial class Irgen {
             if (pr[j] == 1) {
                 // `ref`/`out` value-type parameter: the incoming pointer IS the
                 // storage slot, so reads/writes go through to the caller's
-                // variable (mirrors irgen_emit.c). Managed types are rejected
-                // at the call site (no byref ARC here).
+                // variable (mirrors irgen_emit.c). The reference stays the
+                // caller's: the callee never releases it.
                 locName.Add(pn[j]); locType.Add(pt[j]); locReg.Add("%p" + j);
-                locBox.Add(false); locIter.Add(false); locCell.Add("");
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(true);
                 j = j + 1;
                 continue;
             }
@@ -1774,15 +1784,17 @@ partial class Irgen {
         string sig = "define void @" + CtorSym(cls.sval, m) + "(%" + cls.sval + "* %this";
         List<string> pn = new List<string>();
         List<Node> pt = new List<Node>();
+        List<int> pr = new List<int>();
         int i = 0;
         while (i < m.kids.Count) {
             Node p = m.kids[i];
-            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); }
+            if (p.kind == AK.Param()) { pn.Add(p.sval); pt.Add(p.type); pr.Add(p.ival); }
             i = i + 1;
         }
         int j = 0;
         while (j < pn.Count) {
-            sig = sig + ", " + MapType(pt[j]) + " %p" + j;
+            if (pr[j] == 1) { sig = sig + ", " + MapType(pt[j]) + "* %p" + j; }
+            else { sig = sig + ", " + MapType(pt[j]) + " %p" + j; }
             j = j + 1;
         }
         sig = sig + ") {";
@@ -1793,6 +1805,14 @@ partial class Irgen {
         j = 0;
         while (j < pn.Count) {
             string lt = MapType(pt[j]);
+            if (pr[j] == 1) {
+                // a by-ref parameter: the incoming pointer IS the caller's
+                // storage slot -- the reference stays the caller's
+                locName.Add(pn[j]); locType.Add(pt[j]); locReg.Add("%p" + j);
+                locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(true);
+                j = j + 1;
+                continue;
+            }
             string preg = AddLocal(pn[j], pt[j]);
             if (ShouldBox(pn[j])) {
                 preg = BoxLocal(locName.Count - 1);
