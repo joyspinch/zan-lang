@@ -79,3 +79,22 @@
   `Plan_Count$string`。回归用例：conformance 里的"泛型基类值类型字段"用例
   （非泛型派生类 / 泛型派生类 / 基类具体实例共存 三条路径）。
 - **深度上限**：基类成环（理论上不该出现）用深度上限 16 兜住，递归不会无限展开。
+
+## 6. `--emit-ir` 的产物必须自述目标特性
+
+- **编译器的后端档位 ≠ 消费方的默认档位**：编译器建 TargetMachine 时选的
+  CPU/特性（如 x86-64 + sse3…avx2/fma/bmi）是**编译期**决定的；把
+  `--emit-ir` 落出的 .ll 文本交给外部工具（llc 等）时，消费方默认按
+  generic CPU 处理 → 图里残留的宽向量类型（256 位）拆不开 → 后端 fatal
+  error。**zanc 自己出的二进制是对的，坏的是给外部消费的 .ll 文本。**
+- **IR 里没有这层信息**：文本 IR 不带 target-cpu/target-features，函数级
+  `attributes` 与 module flags 在 LLVM 20 的 llc 上都不作为合法化依据。
+- **落地形态**：IR 头部写注释自述（`; zanc-target-cpu:` /
+  `; zanc-target-features:` + 消费方该用的后端命令行），同时往 stderr 打
+  同一条提示。实测：按提示带 `-mcpu/-mattr` 消费同一份 .ll 即通过，不带
+  仍 fatal error。
+- **别用"先跑一遍 opt 优化再喂后端"绕过**：优化器会把死函数和冗余结构一起
+  干掉才让后端过，编译器自己产出的 IR 仍然过不了自己的后端——那是掩盖，
+  不是修复。
+- **坑出处**：2026-10-20 实测（256 位向量路径在 generic CPU 下触发
+  `Do not know how to split this operator's operand!`）。
