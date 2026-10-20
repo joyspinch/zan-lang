@@ -12,6 +12,10 @@ Zan.Data 共存。
   `packages/Zan.Csv` 的 `System.Csv`）
 - `System.Data` — `Stats`（描述统计：均值/中位数/分位/方差/标准差/
   偏度/峰度/相关系数）、`DataFrameStats`（按列名取统计的入口）
+- `System.Data` — `Reshape`（选列/算列/去重/拼接/宽转长/长转宽/转置）、
+  `Pivot`（透视表/交叉表）、`Merge`（内/左/右/外/交叉连接 + 多键）、
+  `Window`（滑动窗口/指数加权/差分/有效性掩码）、
+  `Resample`（秒/分/时/日/周/月重采样）、`Freq` 枚举
 
 ## 快速上手
 
@@ -68,6 +72,52 @@ xs.Add(2.0); xs.Add(4.0); xs.Add(9.0);
 double m = Stats.Median(xs);
 ```
 
+## 快速上手（表级变换）
+
+```zan
+using System.Data;
+
+// 选列 + 算列（不改入参，返回新表）
+DataFrame proj = Reshape.Select(sales, "city", "qty");
+DataFrame calc = Reshape.WithColumn(sales, "qty2", ColKind.Int,
+    (int row) => sales.GetFloat(row, "qty") * 2.0);
+
+// 宽转长 → 透视 → 直接给图表
+List<string> ids = new List<string>(); ids.Add("city");
+List<string> vals = new List<string>(); vals.Add("qty");
+DataFrame long = Reshape.Melt(sales, ids, vals);
+DataFrame wide = Pivot.PivotTable(long, "city", "variable", "qty", Agg.Sum);
+
+// 连接（多键 / 外连接）
+List<string> lk = new List<string>(); lk.Add("city"); lk.Add("date");
+DataFrame merged = Merge.MergeTables(left, right, lk, lk, MergeKind.Outer);
+
+// 时序：日聚合 + 7 日移动平均
+DataFrame daily = Resample.ResampleBy(series, "t", "v", Freq.Day, Agg.Sum);
+DataFrame ma = Window.Rolling(daily, "v", 7, Agg.Avg);   // 结果列 v_rolling
+```
+
+## 设计要点（表级变换）
+
+- **全部返回新表，不改入参**。行序有明确规则（各函数注释里写明），
+  因为确定性的行序是 golden 对比的前提。
+- **窗口结果写进新列**（Float 型），不覆盖输入列——输入列可能是
+  Int 型，覆盖会把小数截断（窗口均值 16.67 被抹成 16）。默认列名
+  `<列名>_rolling` / `<列名>_ewm` / `<列名>_diff`。
+- **"算不出的行"不写 NaN**。Zan 没有 NaN 字面量（`0.0/0.0` 能造出
+  NaN，但它穿过格式化与图表链路会渲染成平台相关的文本，还会污染
+  下游平均），所以本包用"不写值 + 有效性掩码"表达。`minPeriods` 默认 1
+  （窗口不满也出值），显式给 >1 时不足样本的行不写值，要判哪些行真算得出用
+  `RollingValid` 拿有效性掩码。
+- **重采样的空桶不产生行**（不是补 0）——补 0 会让"这段时间没数据"
+  和"这段时间销量为 0"混为一谈。桶边界左闭右开，周桶起点是周一
+  00:00（以 Unix 纪元对齐，时区无关）。
+- **外连接的键从右表补齐**：右表键列不进结果（与 `Join` 一致），
+  但右表独有行的左表键列取右表的值。
+- **枚举是顶层类型**：`Freq`/`Agg`/`ColKind`/`MergeKind` 都在
+  `namespace System.Data`——`Resample.Freq.Second` 这样的嵌套枚举
+  编译器解析不了。
+
 ## 消费者
 
 - `packages/Zan.Desktop` 的 `TaskScheduler.ParseCsv`（schtasks
@@ -77,10 +127,13 @@ double m = Stats.Median(xs);
 
 ## 已知边界
 
-- 无 Parquet/Excel 等二进制格式（Xlsx 见 `Zan.Data`）；无宽表
-  （wide/reshape）操作；聚合以 double 返回（Int 列求和内部走
-  long 累加避免精度损失）。
+- 无 Parquet/Excel 等二进制格式（Xlsx 见 `Zan.Data`）；聚合以 double
+  返回（Int 列求和内部走 long 累加避免精度损失）。
 - 数值形态识别是严格的（可选符号 + 数字 [+ 小数部分] [+ 指数]），
   带 BOM/空白/千分位的字段按文本列处理。
-- 无透视表/多级索引/时序重采样/滑动窗口/缺失值处理——统计只覆盖
-  "单列数值的集中趋势与离散度"，表级变换尚未落地。
+- 无多级索引（`MultiIndex`）与缺失值处理（`fillna`/`dropna`/
+  `interpolate`——列存没有 null 标记位，是另一个量级的改动）。
+- `Aggregate` 只认固定的 5 个算子（`Agg`），没有 `groupby().agg()`
+  那样的自定义聚合字典。
+- `Concat` 按第一张表的列名对齐，不做重命名；`Resample` 无升采样与
+  时间偏移（`asfreq`/`offset`）。

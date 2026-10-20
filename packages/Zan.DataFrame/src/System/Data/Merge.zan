@@ -1,0 +1,210 @@
+using System;
+
+namespace System.Data;
+
+// 表连接：左/右/外/交叉，以及多键。
+//
+// 与已有 Join（单键内连接）的关系：Join 保留为薄壳，语义与
+// Merge(..., Inner, 单键) 相同。多键与其它连接类型在这里补齐。
+//
+// 连接类型用枚举 MergeKind 表达——不传裸 int，避免调用方记
+// "0 是内连接还是左连接"。
+
+public enum MergeKind {
+    Inner,
+    Left,
+    Right,
+    Outer,
+    Cross
+}
+
+public class Merge {
+    // 多键连接：leftKeys[i] 对 rightKeys[i]（等值条件，全部成立才匹配）。
+    // kind 决定保留哪边的行：
+    // - Inner：只保留两边都匹配上的行
+    // - Left ：保留左表全部行，右表没匹配上的补空值
+    // - Right：保留右表全部行，左表没匹配上的补空值
+    // - Outer：两边都保留（各自没匹配上的补空值）
+    //
+    // 结果列：左表全部列 + 右表除键列外的列；右表列与左表撞名时
+    // 加 "_1" 后缀（与 Join 一致）。
+    //
+    // 多键匹配是"任意一行匹配任意一行"（各自可能有多个同键行），
+    // 所以结果是匹配行的笛卡尔积——与 pandas 的多键 merge 语义一致。
+    public static DataFrame MergeTables(DataFrame left, DataFrame right,
+            List<string> leftKeys, List<string> rightKeys, int kind) {
+        if (left == null || right == null) {
+            throw new InvalidOperationException("Merge: 表为 null");
+        }
+        if (leftKeys.Count != rightKeys.Count) {
+            throw new InvalidOperationException("Merge: 左右键数不等");
+        }
+        if (leftKeys.Count == 0) {
+            throw new InvalidOperationException("Merge: 至少要一个键");
+        }
+        List<int> lAt = new List<int>();
+        List<int> rAt = new List<int>();
+        for (int i = 0; i < leftKeys.Count; i = i + 1) {
+            int la = left.ColIndex(leftKeys[i]);
+            if (la < 0) {
+                throw new InvalidOperationException("Merge 左表没有列: " + leftKeys[i]);
+            }
+            int ra = right.ColIndex(rightKeys[i]);
+            if (ra < 0) {
+                throw new InvalidOperationException("Merge 右表没有列: " + rightKeys[i]);
+            }
+            lAt.Add(la);
+            rAt.Add(ra);
+        }
+
+        // 右表按键分组。
+        Dictionary<string, List<int>> rmap = new Dictionary<string, List<int>>();
+        for (int r = 0; r < right.Rows(); r = r + 1) {
+            string k = Merge.RowKey(right, r, rAt);
+            if (!rmap.ContainsKey(k)) { rmap[k] = new List<int>(); }
+            rmap[k].Add(r);
+        }
+
+        // 结果列：左表全部列 + 右表除键列外的列。
+        //
+        // **键列的去留与补齐**：右表键列一律不进结果（与既有 Join
+        // 一致，避免同一列出现两次）。但右连接/外连接时右表可能有
+        // 左表匹配不上的行——那条行的键值只在右表。右表独有行进结果
+        // 时，左表的键列要**从右表补齐**（pandas 外连接的键合并
+        // 语义），否则那条行的键是空的，认不出它是什么。
+        DataFrame outp = new DataFrame();
+        List<int> rightOutCols = new List<int>();
+        for (int c = 0; c < left.ColCount(); c = c + 1) {
+            outp.cols.Add(DataCol.Create(left.cols[c].Name(), left.cols[c].Kind()));
+        }
+        for (int c = 0; c < right.ColCount(); c = c + 1) {
+            bool isKey = false;
+            for (int i = 0; i < rAt.Count; i = i + 1) {
+                if (rAt[i] == c) { isKey = true; break; }
+            }
+            if (isKey) { continue; }
+            string name = right.cols[c].Name();
+            if (left.ColIndex(name) >= 0) { name = name + "_1"; }
+            outp.cols.Add(DataCol.Create(name, right.cols[c].Kind()));
+            rightOutCols.Add(c);
+        }
+
+        bool keepLeft = kind == MergeKind.Left || kind == MergeKind.Outer;
+        bool keepRight = kind == MergeKind.Right || kind == MergeKind.Outer;
+        List<bool> rightMatched = new List<bool>();
+        for (int r = 0; r < right.Rows(); r = r + 1) { rightMatched.Add(false); }
+
+        for (int l = 0; l < left.Rows(); l = l + 1) {
+            string k = Merge.RowKey(left, l, lAt);
+            List<int> matches = new List<int>();
+            if (rmap.ContainsKey(k)) { matches = rmap[k]; }
+            if (matches.Count == 0) {
+                if (keepLeft) {
+                    // 左行保留（键与左表的值都在），右边补空。
+                    Merge.AppendRow(outp, left, l, right, 0 - 1, rightOutCols,
+                        lAt, rAt);
+                }
+                continue;
+            }
+            for (int m = 0; m < matches.Count; m = m + 1) {
+                Merge.AppendRow(outp, left, l, right, matches[m], rightOutCols,
+                    lAt, rAt);
+                rightMatched[matches[m]] = true;
+            }
+        }
+
+        // 右表没匹配上的行（Right / Outer 时补进来，左边补空——键列
+        // 从右表补齐，见 AppendRow）。
+        if (keepRight) {
+            for (int r = 0; r < right.Rows(); r = r + 1) {
+                if (!rightMatched[r]) {
+                    Merge.AppendRow(outp, left, 0 - 1, right, r, rightOutCols,
+                        lAt, rAt);
+                }
+            }
+        }
+        return outp;
+    }
+
+    // 单键连接（leftKeys/rightKeys 各一个）。
+    public static DataFrame MergeTables(DataFrame left, DataFrame right,
+            string leftKey, string rightKey, int kind) {
+        List<string> lk = new List<string>();
+        lk.Add(leftKey);
+        List<string> rk = new List<string>();
+        rk.Add(rightKey);
+        return Merge.MergeTables(left, right, lk, rk, kind);
+    }
+
+    // 交叉连接：左右两表的笛卡尔积。左表每行 × 右表每行。
+    // 右表的**全部**列都进结果（没有键列被排除）。
+    public static DataFrame Cross(DataFrame left, DataFrame right) {
+        if (left == null || right == null) {
+            throw new InvalidOperationException("Cross: 表为 null");
+        }
+        DataFrame outp = new DataFrame();
+        List<int> rightOutCols = new List<int>();
+        for (int c = 0; c < left.ColCount(); c = c + 1) {
+            outp.cols.Add(DataCol.Create(left.cols[c].Name(), left.cols[c].Kind()));
+        }
+        for (int c = 0; c < right.ColCount(); c = c + 1) {
+            string name = right.cols[c].Name();
+            if (left.ColIndex(name) >= 0) { name = name + "_1"; }
+            outp.cols.Add(DataCol.Create(name, right.cols[c].Kind()));
+            rightOutCols.Add(c);
+        }
+        for (int l = 0; l < left.Rows(); l = l + 1) {
+            for (int r = 0; r < right.Rows(); r = r + 1) {
+                Merge.AppendRow(outp, left, l, right, r, rightOutCols,
+                    new List<int>(), new List<int>());
+            }
+        }
+        return outp;
+    }
+
+    // 输出一行：左表行（行号为 -1 表示全空）+ 右表非键列。
+    //
+    // 左行缺失时，左表的**键列**从右表对应键列补齐（多键时逐个补），
+    // 其余左列补空——外连接时右表独有的行也要能认出它的键。
+    private static void AppendRow(DataFrame outp, DataFrame left, int lRow,
+            DataFrame right, int rRow, List<int> rightOutCols,
+            List<int> lAt, List<int> rAt) {
+        for (int c = 0; c < left.ColCount(); c = c + 1) {
+            if (lRow >= 0) {
+                outp.cols[c].AppendFrom(left.cols[c], lRow);
+                continue;
+            }
+            // 左行缺失：键列从右表补，其余补空。
+            bool isKeyCol = false;
+            for (int i = 0; i < lAt.Count; i = i + 1) {
+                if (lAt[i] == c) { isKeyCol = true; break; }
+            }
+            if (isKeyCol && rRow >= 0) {
+                for (int i = 0; i < lAt.Count; i = i + 1) {
+                    if (lAt[i] == c) {
+                        outp.cols[c].AppendFrom(right.cols[rAt[i]], rRow);
+                        break;
+                    }
+                }
+            } else {
+                outp.cols[c].Append("");
+            }
+        }
+        for (int i = 0; i < rightOutCols.Count; i = i + 1) {
+            int c = rightOutCols[i];
+            if (rRow < 0) { outp.cols[left.ColCount() + i].Append(""); }
+            else { outp.cols[left.ColCount() + i].AppendFrom(right.cols[c], rRow); }
+        }
+        outp.rowCount = outp.rowCount + 1;
+    }
+
+    // 行键：按给定列组拼出唯一键（列值用 \u0001 分隔）。
+    private static string RowKey(DataFrame df, int row, List<int> cols) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (i > 0) { sb.Append("\u0001"); }
+            sb.Append(df.cols[cols[i]].GetStr(row));
+        }
+        return sb.ToString();
+    }
+}

@@ -1,0 +1,289 @@
+using System;
+
+namespace System.Data;
+
+// 表级变换：行列的重排、拆分与拼接。
+//
+// 这些是 pandas 的 reshape 家族（melt / stack / unstack / drop_duplicates
+// / concat / transpose）。它们只改"表长什么样"，不改"值是什么"——
+// 值的加工是 Stats 与聚合的活。
+//
+// 全部函数返回**新表**，不改入参（与 Filter/SortBy/Join 的语义一致）。
+// 行序有明确规则（各函数注释里写明），因为确定性的行序是 golden
+// 对比的前提。
+
+public class Reshape {
+    // 选列：按给定列名取子表，列序按参数顺序。缺列抛异常。
+    public static DataFrame Select(DataFrame df, params string[] names) {
+        if (df == null) { throw new InvalidOperationException("Select: 表为 null"); }
+        DataFrame outp = new DataFrame();
+        List<int> srcCols = new List<int>();
+        for (int i = 0; i < names.Length; i = i + 1) {
+            int at = df.ColIndex(names[i]);
+            if (at < 0) {
+                throw new InvalidOperationException("Select 没有列: " + names[i]);
+            }
+            srcCols.Add(at);
+            outp.cols.Add(DataCol.Create(df.cols[at].Name(), df.cols[at].Kind()));
+        }
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            for (int c = 0; c < srcCols.Count; c = c + 1) {
+                outp.cols[c].AppendFrom(df.cols[srcCols[c]], r);
+            }
+            outp.rowCount = outp.rowCount + 1;
+        }
+        return outp;
+    }
+
+    // 计算列：在原表上加一列计算值（逐行）。
+    // colName 是新列名，kind 是新列类型，fn 接收行号返回该行的值。
+    // 同名列已存在时**替换**该列的值（不是加第二列）——加第二列会让
+    // ColIndex 命中第一列，值写错地方。
+    public static DataFrame WithColumn(DataFrame df, string colName, int kind,
+            RowValueFn fn) {
+        if (df == null) { throw new InvalidOperationException("WithColumn: 表为 null"); }
+        DataFrame outp = df.Copy();
+        int at = outp.ColIndex(colName);
+        if (at < 0) {
+            outp.AddColumn(colName, kind);
+            at = outp.ColIndex(colName);
+        }
+        for (int r = 0; r < outp.Rows(); r = r + 1) {
+            double v = fn(r);
+            if (outp.cols[at].Kind() == ColKind.Str) {
+                outp.cols[at].PutStr(r, Convert.ToString(v));
+            } else if (outp.cols[at].Kind() == ColKind.Int) {
+                outp.cols[at].PutLong(r, (long)v);
+            } else {
+                outp.cols[at].PutDouble(r, v);
+            }
+        }
+        return outp;
+    }
+
+    // 文本计算列：值由 fn 返回的字符串决定。
+    public static DataFrame WithTextColumn(DataFrame df, string colName,
+            RowTextFn fn) {
+        if (df == null) { throw new InvalidOperationException("WithTextColumn: 表为 null"); }
+        DataFrame outp = df.Copy();
+        int at = outp.ColIndex(colName);
+        if (at < 0) {
+            outp.AddColumn(colName, ColKind.Str);
+            at = outp.ColIndex(colName);
+        }
+        for (int r = 0; r < outp.Rows(); r = r + 1) {
+            outp.cols[at].PutStr(r, fn(r));
+        }
+        return outp;
+    }
+
+    // 丢弃重复行：按 keepCols 指定的列判重（不指定则按全部列）。
+    // 保留**首次**出现的行，行序保持原序。
+    public static DataFrame DropDuplicates(DataFrame df, params string[] keepCols) {
+        if (df == null) { throw new InvalidOperationException("DropDuplicates: 表为 null"); }
+        List<int> keyCols = new List<int>();
+        if (keepCols.Length == 0) {
+            for (int c = 0; c < df.ColCount(); c = c + 1) { keyCols.Add(c); }
+        } else {
+            for (int i = 0; i < keepCols.Length; i = i + 1) {
+                int at = df.ColIndex(keepCols[i]);
+                if (at < 0) {
+                    throw new InvalidOperationException("DropDuplicates 没有列: " + keepCols[i]);
+                }
+                keyCols.Add(at);
+            }
+        }
+        DataFrame outp = new DataFrame();
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            outp.cols.Add(DataCol.Create(df.cols[c].Name(), df.cols[c].Kind()));
+        }
+        Dictionary<string, bool> seen = new Dictionary<string, bool>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string key = Reshape.RowKey(df, r, keyCols);
+            if (seen.ContainsKey(key)) { continue; }
+            seen[key] = true;
+            for (int c = 0; c < df.ColCount(); c = c + 1) {
+                outp.cols[c].AppendFrom(df.cols[c], r);
+            }
+            outp.rowCount = outp.rowCount + 1;
+        }
+        return outp;
+    }
+
+    // 纵向拼接：把多张表上下摞起来。列按**第一张表的列序**；
+    // 后续表缺列的格子填空值（Str 空串 / 数值 0），多余的列丢弃。
+    // 列名不同时不做重命名（要重命名先各自 Select）。
+    public static DataFrame Concat(List<DataFrame> parts) {
+        if (parts == null || parts.Count == 0) { return new DataFrame(); }
+        DataFrame first = parts[0];
+        DataFrame outp = new DataFrame();
+        for (int c = 0; c < first.ColCount(); c = c + 1) {
+            outp.cols.Add(DataCol.Create(first.cols[c].Name(), first.cols[c].Kind()));
+        }
+        for (int p = 0; p < parts.Count; p = p + 1) {
+            DataFrame df = parts[p];
+            for (int r = 0; r < df.Rows(); r = r + 1) {
+                for (int c = 0; c < outp.ColCount(); c = c + 1) {
+                    string name = outp.cols[c].Name();
+                    int src = df.ColIndex(name);
+                    if (src < 0) {
+                        outp.cols[c].Append("");   // Append 按列类型转换
+                    } else {
+                        outp.cols[c].AppendFrom(df.cols[src], r);
+                    }
+                }
+                outp.rowCount = outp.rowCount + 1;
+            }
+        }
+        return outp;
+    }
+
+    // 纵向拼接两张表。
+    public static DataFrame Concat(DataFrame a, DataFrame b) {
+        List<DataFrame> parts = new List<DataFrame>();
+        parts.Add(a);
+        parts.Add(b);
+        return Reshape.Concat(parts);
+    }
+
+    // 宽转长（melt）：把若干"值列"压成一列 value，配一列 idVar 的
+    // 重复值与一列 variable 取列名。
+    //
+    // 例：列 (city, sales, profit) + idVars=("city",) + valueVars=
+    // ("sales","profit") → 长表 (city, variable, value)。
+    //
+    // 行序：按原行序，每行内按 valueVars 的参数序。
+    public static DataFrame Melt(DataFrame df, List<string> idVars,
+            List<string> valueVars) {
+        if (df == null) { throw new InvalidOperationException("Melt: 表为 null"); }
+        DataFrame outp = new DataFrame();
+        for (int i = 0; i < idVars.Count; i = i + 1) {
+            DataCol c = df.ColOrThrow(idVars[i]);
+            outp.cols.Add(DataCol.Create(c.Name(), c.Kind()));
+        }
+        outp.cols.Add(DataCol.Create("variable", ColKind.Str));
+        outp.cols.Add(DataCol.Create("value", ColKind.Float));
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            for (int v = 0; v < valueVars.Count; v = v + 1) {
+                int src = df.ColIndex(valueVars[v]);
+                if (src < 0) {
+                    throw new InvalidOperationException("Melt 没有列: " + valueVars[v]);
+                }
+                for (int i = 0; i < idVars.Count; i = i + 1) {
+                    outp.cols[i].AppendFrom(df.cols[df.ColIndex(idVars[i])], r);
+                }
+                outp.cols[idVars.Count].Append(valueVars[v]);
+                outp.cols[idVars.Count + 1].AppendDouble(df.cols[src].GetDouble(r));
+                outp.rowCount = outp.rowCount + 1;
+            }
+        }
+        return outp;
+    }
+
+    // 长转宽（unstack）：把 valueVar 按 keyVar 展开成多列。
+    //
+    // 例：长表 (city, product, sales) → 每 product 一列：
+    // (city, product_A, product_B)。
+    //
+    // 列名用 "列名_键值" 拼接（键值本身作为列名会与其它列撞名，
+    // 拼上来源列名才唯一可辨）。列序：键值按首次出现顺序。
+    // 缺组合的格子填空值（数值 0）。
+    public static DataFrame Unstack(DataFrame df, string keyVar, string valueVar) {
+        if (df == null) { throw new InvalidOperationException("Unstack: 表为 null"); }
+        int keyAt = df.ColIndex(keyVar);
+        if (keyAt < 0) { throw new InvalidOperationException("Unstack 没有列: " + keyVar); }
+        int valAt = df.ColIndex(valueVar);
+        if (valAt < 0) { throw new InvalidOperationException("Unstack 没有列: " + valueVar); }
+
+        // 其余列当作 id 列（长转宽的"行标识"）。
+        List<int> idCols = new List<int>();
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            if (c != keyAt && c != valAt) { idCols.Add(c); }
+        }
+        // 键值 → 输出列下标。
+        List<string> keyValues = new List<string>();
+        Dictionary<string, int> keyColAt = new Dictionary<string, int>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string k = df.cols[keyAt].GetStr(r);
+            if (!keyColAt.ContainsKey(k)) {
+                keyColAt[k] = keyValues.Count;
+                keyValues.Add(k);
+            }
+        }
+
+        DataFrame outp = new DataFrame();
+        for (int i = 0; i < idCols.Count; i = i + 1) {
+            outp.cols.Add(DataCol.Create(df.cols[idCols[i]].Name(), df.cols[idCols[i]].Kind()));
+        }
+        for (int k = 0; k < keyValues.Count; k = k + 1) {
+            outp.cols.Add(DataCol.Create(keyVar + "_" + keyValues[k], ColKind.Float));
+        }
+
+        // id 组合 → 输出行号；同一 id 组合的多行按行序填进不同键列。
+        Dictionary<string, int> rowAt = new Dictionary<string, int>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string idKey = Reshape.RowKey(df, r, idCols);
+            int outRow = 0 - 1;
+            if (rowAt.ContainsKey(idKey)) {
+                outRow = rowAt[idKey];
+            } else {
+                outRow = outp.Rows();
+                outp.AddRow();
+                for (int i = 0; i < idCols.Count; i = i + 1) {
+                    outp.cols[i].PutStr(outRow, df.cols[idCols[i]].GetStr(r));
+                }
+                rowAt[idKey] = outRow;
+            }
+            int kc = keyColAt[df.cols[keyAt].GetStr(r)];
+            outp.cols[idCols.Count + kc].PutDouble(outRow, df.cols[valAt].GetDouble(r));
+        }
+        return outp;
+    }
+
+    // 转置：行变列。列名取自原表第一列的值（没有第一列时用
+    // "c0","c1",...）。原表的列名丢失（转置后它们成了行）。
+    public static DataFrame Transpose(DataFrame df) {
+        if (df == null) { throw new InvalidOperationException("Transpose: 表为 null"); }
+        DataFrame outp = new DataFrame();
+        // 输出表的列 = 原表的行数（或 1 列，原表无行）。
+        int outCols = df.Rows();
+        if (outCols < 1) { outCols = 1; }
+        List<string> outNames = new List<string>();
+        for (int r = 0; r < outCols; r = r + 1) {
+            if (df.ColCount() > 0) { outNames.Add(df.GetStr(r, 0)); }
+            else { outNames.Add("c" + Convert.ToString(r)); }
+        }
+        for (int i = 0; i < outNames.Count; i = i + 1) {
+            outp.cols.Add(DataCol.Create(outNames[i], ColKind.Str));
+        }
+        // 输出表的行 = 原表的列数。
+        for (int c = 0; c < df.ColCount(); c = c + 1) {
+            int row = outp.AddRow();
+            for (int r = 0; r < outCols; r = r + 1) {
+                if (r < df.Rows()) {
+                    outp.cols[r].PutStr(row, df.GetStr(r, c));
+                } else {
+                    outp.cols[r].PutStr(row, "");
+                }
+            }
+        }
+        return outp;
+    }
+
+    // 行键：按给定列组拼出唯一键（列值用 \u0001 分隔，避免歧义）。
+    // 值取 GetStr 形态（跨类型统一）。
+    private static string RowKey(DataFrame df, int row, List<int> cols) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < cols.Count; i = i + 1) {
+            if (i > 0) { sb.Append("\u0001"); }
+            sb.Append(df.cols[cols[i]].GetStr(row));
+        }
+        return sb.ToString();
+    }
+}
+
+// 计算列的逐行取值（行号 → double）。
+public delegate double RowValueFn(int row);
+
+// 计算列的逐行取值（行号 → 文本）。
+public delegate string RowTextFn(int row);

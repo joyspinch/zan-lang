@@ -1,0 +1,425 @@
+// 表级变换：Reshape（select/with-column/dedup/concat/melt/unstack/
+// transpose）、Pivot（透视表/交叉表）、Merge（内/左/右/外/交叉/多键）、
+// Window（rolling/ewm/diff/有效性掩码）、Resample（日/周/月重采样）。
+//
+// 覆盖：行序与列序的确定性、缺列抛异常、缺组合填空值而非造行、
+// 多键连接、一表多系列的笛卡尔积语义、窗口不满窗的取值规则、
+// 时区无关的桶边界（Unix 秒对齐）、空桶不产生行。
+using System;
+using System.Data;
+
+namespace Conf;
+
+class Prog {
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 定点打印：避免 double 的最短往返格式在不同平台漂移。
+    static string F(double v, int digits) {
+        double scale = 1.0;
+        for (int i = 0; i < digits; i = i + 1) { scale = scale * 10.0; }
+        double r = Math.Round(v * scale) / scale;
+        if (r == 0.0) { r = 0.0; }  // 消 -0
+        return Convert.ToString(r);
+    }
+
+    static int Run() {
+        int bad = 0;
+
+        // ---- 1. Select：列序按参数序，不按原表序 ----
+        DataFrame df = DataFrame.FromCsv(
+        "city,sales,profit,group\n"
+        + "a,10,1,x\n"
+        + "b,20,2,y\n"
+        + "c,15,3,x\n");
+        DataFrame sel = Reshape.Select(df, "profit", "city");
+        Console.WriteLine("select cols=" + sel.ColCount() + " rows=" + sel.Rows()
+        + " c0=" + sel.GetStr(0, 0) + " c1=" + sel.GetStr(0, 1)
+        + " c2=" + sel.GetStr(2, 1));
+        if (sel.ColCount() != 2 || sel.Rows() != 3) { bad = bad + 1; }
+        if (sel.GetStr(0, 0) != "1") { bad = bad + 1; }
+        if (sel.GetStr(0, 1) != "a") { bad = bad + 1; }
+        if (sel.GetStr(2, 1) != "c") { bad = bad + 1; }
+        // 选列不改原表。
+        if (df.ColCount() != 4) { bad = bad + 1; }
+
+        // 缺列抛异常。
+        int threw = 0;
+        try {
+            Reshape.Select(df, "nope");
+        } catch (Exception e) {
+            threw = 1;
+        }
+        if (threw != 1) { bad = bad + 1; }
+
+        // ---- 2. WithColumn：计算列 + 原表不受影响 ----
+        DataFrame wc = Reshape.WithColumn(df, "sales2", ColKind.Int,
+        (int r) => df.GetFloat(r, "sales") * 2.0);
+        Console.WriteLine("withcol v0=" + wc.GetInt(0, "sales2")
+        + " v1=" + wc.GetInt(1, "sales2") + " v2=" + wc.GetInt(2, "sales2")
+        + " origcols=" + df.ColCount());
+        if (wc.GetInt(0, "sales2") != 20) { bad = bad + 1; }
+        if (wc.GetInt(1, "sales2") != 40) { bad = bad + 1; }
+        if (wc.GetInt(2, "sales2") != 30) { bad = bad + 1; }
+        if (df.ColCount() != 4) { bad = bad + 1; }
+        // 同名列替换而非加第二列。
+        DataFrame wc2 = Reshape.WithColumn(df, "sales", ColKind.Int,
+        (int r) => 7.0);
+        Console.WriteLine("replace cols=" + wc2.ColCount() + " v0=" + wc2.GetInt(0, "sales"));
+        if (wc2.ColCount() != 4) { bad = bad + 1; }
+        if (wc2.GetInt(0, "sales") != 7) { bad = bad + 1; }
+
+        // ---- 3. DropDuplicates：按指定列判重，保留首次 ----
+        DataFrame dd = Reshape.DropDuplicates(df, "group");
+        Console.WriteLine("dedup rows=" + dd.Rows()
+        + " g0=" + dd.GetStr(0, "group") + " g1=" + dd.GetStr(1, "group")
+        + " city0=" + dd.GetStr(0, "city") + " city1=" + dd.GetStr(1, "city"));
+        if (dd.Rows() != 2) { bad = bad + 1; }
+        if (dd.GetStr(0, "group") != "x" || dd.GetStr(1, "group") != "y") { bad = bad + 1; }
+        // 保留首次出现的那行（a 不是 c）。
+        if (dd.GetStr(0, "city") != "a" || dd.GetStr(1, "city") != "b") { bad = bad + 1; }
+        // 不指定列则按全部列判重（本表无完全重复行 → 不变）。
+        DataFrame ddAll = Reshape.DropDuplicates(df);
+        Console.WriteLine("dedupAll rows=" + ddAll.Rows());
+        if (ddAll.Rows() != 3) { bad = bad + 1; }
+
+        // ---- 4. Concat：上下摞 ----
+        DataFrame cat = Reshape.Concat(df, df);
+        Console.WriteLine("concat rows=" + cat.Rows() + " cols=" + cat.ColCount()
+        + " r0=" + cat.GetStr(0, "city") + " r3=" + cat.GetStr(3, "city")
+        + " r5=" + cat.GetStr(5, "city"));
+        if (cat.Rows() != 6 || cat.ColCount() != 4) { bad = bad + 1; }
+        if (cat.GetStr(3, "city") != "a") { bad = bad + 1; }
+        if (cat.GetStr(5, "city") != "c") { bad = bad + 1; }
+
+        // 列名不同的表拼接：按第一张表的列名对齐，缺列填空。
+        // Int 列的"空"是 0（列存没有 null，Append 按列类型转换），
+        // Str 列的"空"是空串。
+        DataFrame other = DataFrame.FromCsv("city,sales\nz,99\n");
+        DataFrame cat2 = Reshape.Concat(df, other);
+        Console.WriteLine("concat2 rows=" + cat2.Rows() + " cols=" + cat2.ColCount()
+        + " last_city=" + cat2.GetStr(3, "city")
+        + " last_profit=" + F(cat2.GetFloat(3, "profit"), 6));
+        if (cat2.Rows() != 4) { bad = bad + 1; }
+        if (cat2.GetStr(3, "city") != "z") { bad = bad + 1; }
+        if (cat2.GetFloat(3, "profit") != 0.0) { bad = bad + 1; }
+
+        // ---- 5. Melt：宽转长 ----
+        List<string> ids = new List<string>();
+        ids.Add("city");
+        List<string> vals = new List<string>();
+        vals.Add("sales");
+        vals.Add("profit");
+        DataFrame ml = Reshape.Melt(df, ids, vals);
+        Console.WriteLine("melt rows=" + ml.Rows() + " cols=" + ml.ColCount());
+        for (int i = 0; i < ml.Rows(); i = i + 1) {
+            Console.WriteLine("  " + ml.GetStr(i, "city") + " " + ml.GetStr(i, "variable")
+            + " " + F(ml.GetFloat(i, "value"), 6));
+        }
+        // 3 行 × 2 值列 = 6 行；行内按 valueVars 序。
+        if (ml.Rows() != 6) { bad = bad + 1; }
+        if (ml.GetStr(0, "variable") != "sales") { bad = bad + 1; }
+        if (ml.GetStr(1, "variable") != "profit") { bad = bad + 1; }
+        if (Math.Abs(ml.GetFloat(0, "value") - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(ml.GetFloat(1, "value") - 1.0) > 1e-9) { bad = bad + 1; }
+
+        // ---- 6. Unstack：长转宽 ----
+        DataFrame us = Reshape.Unstack(ml, "variable", "value");
+        Console.WriteLine("unstack rows=" + us.Rows() + " cols=" + us.ColCount()
+        + " c0=" + us.GetStr(0, 0) + " c1=" + us.GetStr(0, 1)
+        + " c2=" + us.GetStr(0, 2));
+        if (us.Rows() != 3) { bad = bad + 1; }
+        if (us.ColCount() != 3) { bad = bad + 1; }
+        if (us.GetStr(0, 0) != "a") { bad = bad + 1; }
+        if (Math.Abs(us.GetFloat(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(us.GetFloat(0, 2) - 1.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(us.GetFloat(2, 1) - 15.0) > 1e-9) { bad = bad + 1; }
+
+        // ---- 7. Transpose ----
+        // Transpose \u540e\uff1a\u5217 = \u539f\u8868\u7684\u884c\uff08\u5217\u540d\u53d6\u81ea\u539f\u8868\u7b2c\u4e00\u5217\u7684\u503c\uff09\uff0c
+        // \u884c = \u539f\u8868\u7684\u5217\u3002sel \u662f (profit, city) \u4e24\u5217\u4e09\u884c\uff1a
+        // \u539f\u8868\u7b2c\u4e00\u5217\u662f profit\uff0c\u503c "1"/"2"/"3" \u2192 \u8f6c\u7f6e\u540e\u5217\u540d\u5373\u8fd9\u4e09\u4e2a\uff1b
+        // \u8f6c\u7f6e\u540e\u7684\u7b2c\u4e00\u884c\u662f\u539f\u8868\u7b2c\u4e00\u5217\uff08profit\uff09\uff0c\u7b2c\u4e8c\u884c\u662f city\u3002
+        DataFrame tp = Reshape.Transpose(sel);
+        Console.WriteLine("transpose rows=" + tp.Rows() + " cols=" + tp.ColCount()
+        + " c0=" + tp.GetStr(0, 0) + " c1=" + tp.GetStr(0, 1)
+        + " c2=" + tp.GetStr(0, 2));
+        if (tp.Rows() != 2 || tp.ColCount() != 3) { bad = bad + 1; }
+        if (tp.GetStr(0, 0) != "1") { bad = bad + 1; }
+        if (tp.GetStr(0, 1) != "2") { bad = bad + 1; }
+        if (tp.GetStr(1, 0) != "a") { bad = bad + 1; }
+
+        // ---- 8. 透视表 ----
+        DataFrame pv = DataFrame.FromCsv(
+        "city,product,sales\n"
+        + "a,x,10\n"
+        + "a,y,5\n"
+        + "b,x,20\n"
+        + "b,y,7\n");
+        DataFrame pivot = Pivot.PivotTable(pv, "city", "product", "sales", Agg.Sum);
+        Console.WriteLine("pivot rows=" + pivot.Rows() + " cols=" + pivot.ColCount()
+        + " names=" + pivot.Names()[1] + "/" + pivot.Names()[2]);
+        for (int r = 0; r < pivot.Rows(); r = r + 1) {
+            Console.WriteLine("  " + pivot.GetStr(r, 0) + " "
+            + F(pivot.GetFloat(r, 1), 6) + " " + F(pivot.GetFloat(r, 2), 6));
+        }
+        if (pivot.Rows() != 2 || pivot.ColCount() != 3) { bad = bad + 1; }
+        if (Math.Abs(pivot.GetFloat(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot.GetFloat(0, 2) - 5.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot.GetFloat(1, 1) - 20.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot.GetFloat(1, 2) - 7.0) > 1e-9) { bad = bad + 1; }
+
+        // 缺组合不造列：只有出现过的列标签才有列。
+        DataFrame pv2 = DataFrame.FromCsv("city,product,sales\na,x,10\nb,x,20\n");
+        DataFrame pivot2 = Pivot.PivotTable(pv2, "city", "product", "sales", Agg.Sum);
+        Console.WriteLine("pivot2 rows=" + pivot2.Rows() + " cols=" + pivot2.ColCount());
+        if (pivot2.ColCount() != 2) { bad = bad + 1; }
+        if (Math.Abs(pivot2.GetFloat(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+
+        // 缺组合填 0（行标签存在但列标签缺失时，那一格是 0）。
+        DataFrame pv2b = DataFrame.FromCsv("city,product,sales\na,x,10\na,y,3\nb,x,20\n");
+        DataFrame pivot2b = Pivot.PivotTable(pv2b, "city", "product", "sales", Agg.Sum);
+        Console.WriteLine("pivot2b cols=" + pivot2b.ColCount()
+        + " a_x=" + F(pivot2b.GetFloat(0, 1), 6)
+        + " a_y=" + F(pivot2b.GetFloat(0, 2), 6)
+        + " b_x=" + F(pivot2b.GetFloat(1, 1), 6)
+        + " b_y=" + F(pivot2b.GetFloat(1, 2), 6));
+        if (pivot2b.ColCount() != 3) { bad = bad + 1; }
+        if (Math.Abs(pivot2b.GetFloat(1, 2)) > 1e-9) { bad = bad + 1; }
+
+        // 多值列。
+        // 输出列序是**列标签优先**（x 的所有值列，再 y 的所有值列）：
+        // x_sales, x_profit, y_sales, y_profit。
+        DataFrame pv2c = DataFrame.FromCsv(
+        "city,product,sales,profit\na,x,10,1\na,y,5,2\nb,x,20,3\nb,y,7,4\n");
+        List<string> twoVals = new List<string>();
+        twoVals.Add("sales");
+        twoVals.Add("profit");
+        DataFrame pivot3 = Pivot.PivotTable(pv2c, "city", "product", twoVals, Agg.Sum);
+        Console.WriteLine("pivot3 cols=" + pivot3.ColCount()
+        + " c1=" + pivot3.Names()[1] + " c2=" + pivot3.Names()[2]
+        + " c3=" + pivot3.Names()[3] + " c4=" + pivot3.Names()[4]
+        + " a=[" + F(pivot3.GetFloat(0, 1), 6) + "," + F(pivot3.GetFloat(0, 2), 6)
+        + "," + F(pivot3.GetFloat(0, 3), 6) + "," + F(pivot3.GetFloat(0, 4), 6) + "]");
+        if (pivot3.ColCount() != 5) { bad = bad + 1; }
+        if (Math.Abs(pivot3.GetFloat(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot3.GetFloat(0, 2) - 1.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot3.GetFloat(0, 3) - 5.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(pivot3.GetFloat(0, 4) - 2.0) > 1e-9) { bad = bad + 1; }
+
+        // ---- 9. 交叉表 ----
+        DataFrame ct = Pivot.Crosstab(pv, "city", "product");
+        Console.WriteLine("crosstab rows=" + ct.Rows() + " cols=" + ct.ColCount()
+        + " a_x=" + ct.GetInt(0, 1) + " a_y=" + ct.GetInt(0, 2)
+        + " b_x=" + ct.GetInt(1, 1) + " b_y=" + ct.GetInt(1, 2));
+        if (ct.GetInt(0, 1) != 1 || ct.GetInt(1, 2) != 1) { bad = bad + 1; }
+        // 计数 > 1 的情形。
+        DataFrame pv3 = DataFrame.FromCsv("city,product\na,x\na,x\nb,y\n");
+        DataFrame ct2 = Pivot.Crosstab(pv3, "city", "product");
+        Console.WriteLine("ct2 a_x=" + ct2.GetInt(0, 1));
+        if (ct2.GetInt(0, 1) != 2) { bad = bad + 1; }
+
+        // ---- 10. Merge：内/左/外/右 ----
+        DataFrame l = DataFrame.FromCsv("k,v\n1,a\n2,b\n3,c\n");
+        DataFrame r = DataFrame.FromCsv("k,w\n2,x\n3,y\n4,z\n");
+        DataFrame inner = Merge.MergeTables(l, r, "k", "k", MergeKind.Inner);
+        Console.WriteLine("inner rows=" + inner.Rows() + " cols=" + inner.ColCount()
+        + " k0=" + inner.GetStr(0, 0) + " k1=" + inner.GetStr(1, 0)
+        + " w0=" + inner.GetStr(0, 2) + " w1=" + inner.GetStr(1, 2));
+        if (inner.Rows() != 2 || inner.ColCount() != 3) { bad = bad + 1; }
+        if (inner.GetStr(0, 0) != "2" || inner.GetStr(1, 0) != "3") { bad = bad + 1; }
+        if (inner.GetStr(0, 2) != "x") { bad = bad + 1; }
+
+        DataFrame left = Merge.MergeTables(l, r, "k", "k", MergeKind.Left);
+        Console.WriteLine("left rows=" + left.Rows()
+        + " k0=" + left.GetStr(0, 0) + " w0=[" + left.GetStr(0, 2) + "]"
+        + " k1=" + left.GetStr(1, 0) + " w1=" + left.GetStr(1, 2)
+        + " k2=" + left.GetStr(2, 0) + " w2=" + left.GetStr(2, 2));
+        if (left.Rows() != 3) { bad = bad + 1; }
+        // 左表全部行保留（含键），右边没匹配上的补空串。
+        if (left.GetStr(0, 0) != "1") { bad = bad + 1; }
+        if (left.GetStr(0, 2) != "") { bad = bad + 1; }
+        if (left.GetStr(1, 0) != "2" || left.GetStr(1, 2) != "x") { bad = bad + 1; }
+        if (left.GetStr(2, 0) != "3" || left.GetStr(2, 2) != "y") { bad = bad + 1; }
+
+        DataFrame outer = Merge.MergeTables(l, r, "k", "k", MergeKind.Outer);
+        Console.WriteLine("outer rows=" + outer.Rows()
+        + " k3=" + outer.GetStr(3, 0) + " v3=[" + outer.GetStr(3, 1) + "]"
+        + " w3=" + outer.GetStr(3, 2));
+        if (outer.Rows() != 4) { bad = bad + 1; }
+        // 右表没匹配上的行也保留（左边补空）。
+        if (outer.GetStr(3, 0) != "4") { bad = bad + 1; }
+        if (outer.GetStr(3, 1) != "") { bad = bad + 1; }
+        if (outer.GetStr(3, 2) != "z") { bad = bad + 1; }
+
+        DataFrame right = Merge.MergeTables(l, r, "k", "k", MergeKind.Right);
+        Console.WriteLine("right rows=" + right.Rows() + " k0=" + right.GetStr(0, 0));
+        if (right.Rows() != 3) { bad = bad + 1; }
+        if (right.GetStr(0, 0) != "2") { bad = bad + 1; }
+
+        // 交叉连接：笛卡尔积。
+        DataFrame cross = Merge.Cross(l, r);
+        Console.WriteLine("cross rows=" + cross.Rows() + " cols=" + cross.ColCount());
+        if (cross.Rows() != 9) { bad = bad + 1; }
+        if (cross.ColCount() != 4) { bad = bad + 1; }
+
+        // ---- 11. Merge：多键 ----
+        DataFrame ml2 = DataFrame.FromCsv("k1,k2,v\na,1,p\na,2,q\nb,1,r\n");
+        DataFrame mr2 = DataFrame.FromCsv("k1,k2,w\na,1,x\na,2,y\nc,1,z\n");
+        List<string> lk2 = new List<string>();
+        lk2.Add("k1");
+        lk2.Add("k2");
+        List<string> rk2 = new List<string>();
+        rk2.Add("k1");
+        rk2.Add("k2");
+        DataFrame m2 = Merge.MergeTables(ml2, mr2, lk2, rk2, MergeKind.Inner);
+        Console.WriteLine("multikey rows=" + m2.Rows() + " v0=" + m2.GetStr(0, 2)
+        + " v1=" + m2.GetStr(1, 2));
+        if (m2.Rows() != 2) { bad = bad + 1; }
+        if (m2.GetStr(0, 2) != "p" || m2.GetStr(1, 2) != "q") { bad = bad + 1; }
+
+        // ---- 12. Window：rolling ----
+        // 结果写进新列（Float），不覆盖输入列——输入列是 Int 型，
+        // 覆盖会把小数截断。
+        // 结果写进新列（Float），不覆盖输入列——输入列是 Int 型，
+        // 覆盖会把小数截断。
+        // 结果写进新列（Float），不覆盖输入列——输入列是 Int 型，
+        // 覆盖会把小数截断。
+        // 结果写进新列（Float），不覆盖输入列——输入列是 Int 型，
+        // 覆盖会把小数截断。
+        DataFrame seq = DataFrame.FromCsv("i,v\n1,10\n2,20\n3,30\n4,40\n5,50\n");
+        DataFrame roll = Window.Rolling(seq, "v", 3, Agg.Avg);
+        Console.WriteLine("rolling avg:");
+        for (int i = 0; i < roll.Rows(); i = i + 1) {
+            Console.WriteLine("  " + i + "=" + F(roll.GetFloat(i, "v_rolling"), 6));
+        }
+        // 窗口不满时用现有行算（minPeriods 默认 1）：前两行是自身。
+        if (Math.Abs(roll.GetFloat(0, "v_rolling") - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(roll.GetFloat(1, "v_rolling") - 15.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(roll.GetFloat(2, "v_rolling") - 20.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(roll.GetFloat(3, "v_rolling") - 30.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(roll.GetFloat(4, "v_rolling") - 40.0) > 1e-9) { bad = bad + 1; }
+        // 输入列没被改（还是整数原值）。
+        if (roll.GetInt(0, "v") != 10) { bad = bad + 1; }
+        if (roll.ColCount() != 3) { bad = bad + 1; }
+
+        // minPeriods=3：不满窗的行不写值（新列里是 0）。
+        DataFrame roll3 = Window.Rolling(seq, "v", 3, Agg.Avg, 3);
+        Console.WriteLine("rolling mp3 r0=" + F(roll3.GetFloat(0, "v_rolling"), 6)
+        + " r1=" + F(roll3.GetFloat(1, "v_rolling"), 6)
+        + " r2=" + F(roll3.GetFloat(2, "v_rolling"), 6));
+        if (roll3.GetFloat(0, "v_rolling") != 0.0) { bad = bad + 1; }
+        if (roll3.GetFloat(1, "v_rolling") != 0.0) { bad = bad + 1; }
+        if (Math.Abs(roll3.GetFloat(2, "v_rolling") - 20.0) > 1e-9) { bad = bad + 1; }
+
+        // 有效性掩码。
+        List<bool> mask = Window.RollingValid(seq, "v", 3, 3);
+        Console.WriteLine("mask:");
+        for (int i = 0; i < mask.Count; i = i + 1) {
+            Console.WriteLine("  " + i + "=" + (mask[i] ? "1" : "0"));
+        }
+        if (mask.Count != 5) { bad = bad + 1; }
+        if (mask[0] || mask[1]) { bad = bad + 1; }
+        if (!mask[2] || !mask[4]) { bad = bad + 1; }
+
+        // ---- 13. Window：ewm ----
+        DataFrame ewm = Window.Ewm(seq, "v", 0.5);
+        Console.WriteLine("ewm adjust:");
+        for (int i = 0; i < ewm.Rows(); i = i + 1) {
+            Console.WriteLine("  " + i + "=" + F(ewm.GetFloat(i, "v_ewm"), 6));
+        }
+        // 归一化加权均值：y0=10；y1 = (20+0.5·10)/(1+0.5) = 25/1.5
+        if (Math.Abs(ewm.GetFloat(0, "v_ewm") - 10.0) > 1e-6) { bad = bad + 1; }
+        if (Math.Abs(ewm.GetFloat(1, "v_ewm") - 25.0 / 1.5) > 1e-6) { bad = bad + 1; }
+        // 不归一化递推：y1 = 0.5·20 + 0.5·10 = 15
+        DataFrame ewm2 = Window.Ewm(seq, "v", 0.5, false);
+        Console.WriteLine("ewm noadjust r0=" + F(ewm2.GetFloat(0, "v_ewm"), 6)
+        + " r1=" + F(ewm2.GetFloat(1, "v_ewm"), 6));
+        if (Math.Abs(ewm2.GetFloat(1, "v_ewm") - 15.0) > 1e-6) { bad = bad + 1; }
+
+        // alpha 越界抛异常。
+        threw = 0;
+        try {
+            Window.Ewm(seq, "v", 0.0);
+        } catch (Exception e) {
+            threw = 1;
+        }
+        if (threw != 1) { bad = bad + 1; }
+
+        // ---- 14. Window：diff ----
+        DataFrame diff = Window.Diff(seq, "v", 1);
+        Console.WriteLine("diff r0=" + F(diff.GetFloat(0, "v_diff"), 6)
+        + " r1=" + F(diff.GetFloat(1, "v_diff"), 6)
+        + " r4=" + F(diff.GetFloat(4, "v_diff"), 6));
+        // 首行无参照，不写值。
+        if (diff.GetFloat(0, "v_diff") != 0.0) { bad = bad + 1; }
+        if (Math.Abs(diff.GetFloat(1, "v_diff") - 10.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(diff.GetFloat(4, "v_diff") - 10.0) > 1e-9) { bad = bad + 1; }
+
+        // ---- 15. Resample：日桶 ----
+        long d0 = (long)DateTime.DaysFromCivil(2024, 1, 1) * 86400L;
+        DataFrame ts = DataFrame.New();
+        ts.AddColumn("t", ColKind.Int);
+        ts.AddColumn("v", ColKind.Float);
+        ts.AddFloatRow((double)d0, 1.0);
+        ts.AddFloatRow((double)(d0 + 3600L), 2.0);
+        ts.AddFloatRow((double)(d0 + 86400L), 3.0);
+        ts.AddFloatRow((double)(d0 + 86400L + 3600L), 4.0);
+        DataFrame byDay = Resample.ResampleBy(ts, "t", "v", Freq.Day, Agg.Sum);
+        Console.WriteLine("byDay rows=" + byDay.Rows()
+        + " t0=" + byDay.GetInt(0, 0) + " v0=" + F(byDay.GetFloat(0, 1), 6)
+        + " t1=" + byDay.GetInt(1, 0) + " v1=" + F(byDay.GetFloat(1, 1), 6));
+        if (byDay.Rows() != 2) { bad = bad + 1; }
+        if (byDay.GetInt(0, 0) != d0) { bad = bad + 1; }
+        if (Math.Abs(byDay.GetFloat(0, 1) - 3.0) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(byDay.GetFloat(1, 1) - 7.0) > 1e-9) { bad = bad + 1; }
+
+        // 空桶不产生行（不补 0）。
+        DataFrame ts2 = DataFrame.New();
+        ts2.AddColumn("t", ColKind.Int);
+        ts2.AddColumn("v", ColKind.Float);
+        ts2.AddFloatRow((double)d0, 1.0);
+        ts2.AddFloatRow((double)(d0 + 3L * 86400L), 5.0);
+        DataFrame byDay2 = Resample.ResampleBy(ts2, "t", "v", Freq.Day, Agg.Sum);
+        Console.WriteLine("byDay2 rows=" + byDay2.Rows()
+        + " t0=" + byDay2.GetInt(0, 0) + " t1=" + byDay2.GetInt(1, 0));
+        if (byDay2.Rows() != 2) { bad = bad + 1; }
+        if (byDay2.GetInt(1, 0) != d0 + 3L * 86400L) { bad = bad + 1; }
+
+        // 月桶。
+        DataFrame byMonth = Resample.ResampleBy(ts, "t", "v", Freq.Month, Agg.Sum);
+        Console.WriteLine("byMonth rows=" + byMonth.Rows()
+        + " t0=" + byMonth.GetInt(0, 0) + " v0=" + F(byMonth.GetFloat(0, 1), 6));
+        if (byMonth.Rows() != 1) { bad = bad + 1; }
+        if (Math.Abs(byMonth.GetFloat(0, 1) - 10.0) > 1e-9) { bad = bad + 1; }
+
+        // 周桶起点是周一 00:00。
+        long wed = (long)DateTime.DaysFromCivil(2024, 1, 3) * 86400L;   // 2024-01-03 是周三
+        long weekStart = Resample.BucketStart(wed, Freq.Week);
+        Console.WriteLine("weekStart=" + weekStart + " expect=" + ((long)DateTime.DaysFromCivil(2024, 1, 1) * 86400L));
+        if (weekStart != (long)DateTime.DaysFromCivil(2024, 1, 1) * 86400L) { bad = bad + 1; }
+
+        // 小时桶。
+        long hourBucket = Resample.BucketStart(d0 + 3600L * 13L + 17L, Freq.Hour);
+        Console.WriteLine("hourBucket=" + hourBucket + " expect=" + (d0 + 3600L * 13L));
+        if (hourBucket != d0 + 3600L * 13L) { bad = bad + 1; }
+
+        // 星期几（1970-01-01 是周四=4；2024-01-01 是周一=1）。
+        Console.WriteLine("dow epoch=" + Resample.DayOfWeek(0L)
+        + " dow2024=" + Resample.DayOfWeek((long)DateTime.DaysFromCivil(2024, 1, 1)));
+        if (Resample.DayOfWeek(0L) != 4) { bad = bad + 1; }
+        if (Resample.DayOfWeek((long)DateTime.DaysFromCivil(2024, 1, 1)) != 1) { bad = bad + 1; }
+        if (bad == 0) {
+            Console.WriteLine("table-transform-ok: 1");
+        } else {
+            Console.WriteLine("table-transform-ok: 0");
+        }
+        return 0;
+    }
+}

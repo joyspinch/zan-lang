@@ -72,6 +72,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * No C#-style collection initializers: `string[] xs = { "a", "b" };` fails
   to parse (`unexpected token '{'`). Build a `List<string>` with `Add`
   calls instead. （test-probe compile)
+* **Enums must be top-level** — `class Foo { public enum Bar { A } }` then
+  `Foo.Bar.A` fails with `cannot resolve member 'Bar'`. Declare the enum
+  at namespace scope (repo convention: one file per enum, e.g.
+  `Models/Agg.zan`, `Models/ColKind.zan`) and use the bare name.
+* **There is no NaN constant, but NaN is producible and detectable** —
+  `0.0/0.0` yields NaN and `v != v` detects it（`double` has no
+  `IsNaN`/`IsInfinity`; use `v != v` and a threshold for infinities）.
+  Still, don't use NaN as the "not computable" marker in a data table:
+  it renders platform-specifically through `Convert.ToString` and poisons
+  any downstream average. Leave the value unwritten and expose a separate
+  **validity mask**（a `List<bool>` parallel to the row indices）instead.
+* **Column stores truncate on type mismatch** — `DataCol.PutDouble` on an
+  `Int` column casts to `long`（16.67 → 16）. When a computed result is
+  fractional, write it to a **new Float column**, never over an integer
+  source column. （`Zan.DataFrame` window functions）
 * `new T[N]` is zero-initialized — a non-zero sentinel needs an explicit
   constructor pass. Every slot reads `0` right after allocation; if an
   incremental `Clear` only resets slots it has recorded (dirty buckets,

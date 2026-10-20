@@ -1,0 +1,215 @@
+using System;
+
+namespace System.Data;
+
+// 窗口函数：滑动窗口（rolling）与指数加权（ewm）。
+//
+// 与聚合的区别：聚合把一整组行压成一个数，窗口函数给**每一行**
+// 一个"以我为末尾的窗口"的统计值。序列型数据的特征工程全靠它
+// （平滑、去噪、滞后、变化率）。
+//
+// 输入是按行序排列的序列（表或纯数值列表）。窗口按**行**计数，
+// 不看时间间隔——真要按时间窗口（"过去 7 天"）得先自己造一列
+// 偏移量，那属于 Resample 的事。
+//
+// **关于"算不出的行"**：Zan 没有 NaN 字面量（`0.0/0.0` 能造出 NaN，
+// 但它穿过格式化与图表链路会渲染成平台相关的文本，还会污染下游平
+// 均），所以"算不出"不用 NaN 表达。本包的规则是：
+// - 结果**写进新列**（Float 类型），不覆盖输入列——输入列可能是
+//   Int 型，覆盖会把小数截断（窗口均值 16.67 会被抹成 16）。
+// - minPeriods 默认 1 → 每行都算得出，**没有算不出的行**（窗口不满
+//   时用现有的那几行算）。这是默认，因为"每行都有值"最省心。
+// - 显式给 minPeriods > 1 时，不足样本的行**不写值**（新列里保持
+//   默认 0.0）。想知道哪些行真算得出，用 RollingValid 拿有效性掩码。
+//
+// 差分（Diff）同理：前 periods 行没有参照，不写值。
+
+public class Window {
+    // 滑动窗口聚合：对每行取以它为末尾的 window 行窗口，算聚合值。
+    //
+    // window 是窗口**行数**（含当前行）。window < 1 视为 1。
+    // minPeriods 是窗口内至少要有多少个样本才输出；默认 1（窗口
+    // 不满也出值，用现有的行算）。minPeriods > window 时按 window
+    // 算。
+    //
+    // agg 取 Agg 值（Sum/Avg/Min/Max/Count）。输出与输入同长，
+    // 样本不足（仅当 minPeriods > 1）的行保留原值。
+    //
+    // **结果写进新列**（outCol，Float 类型），不覆盖输入列——输入列
+    // 可能是 Int 型，覆盖会把小数截断（窗口均值 16.67 会变成 16）。
+    // outCol 传空串时用输入列名加 "_rolling" 后缀。
+    public static DataFrame Rolling(DataFrame df, string valueCol, int window,
+            int agg, int minPeriods, string outCol) {
+        if (df == null) { throw new InvalidOperationException("Rolling: 表为 null"); }
+        int at = df.ColIndex(valueCol);
+        if (at < 0) { throw new InvalidOperationException("Rolling 没有列: " + valueCol); }
+        if (window < 1) { window = 1; }
+        int need = minPeriods < 1 ? 1 : minPeriods;
+        if (need > window) { need = window; }
+
+        DataFrame outp = df.Copy();
+        string name = outCol == null || outCol.Length == 0
+            ? valueCol + "_rolling" : outCol;
+        int outAt = outp.ColIndex(name);
+        if (outAt < 0) {
+            outp.AddColumn(name, ColKind.Float);
+            outAt = outp.ColIndex(name);
+        }
+        int n = df.Rows();
+        List<int> windowRows = new List<int>();
+        for (int r = 0; r < n; r = r + 1) {
+            int lo = r - window + 1;
+            if (lo < 0) { lo = 0; }
+            windowRows.Clear();
+            for (int i = lo; i <= r; i = i + 1) { windowRows.Add(i); }
+            if (windowRows.Count < need) { continue; }
+            double v = df.Aggregate(windowRows, valueCol, agg);
+            outp.cols[outAt].PutDouble(r, v);
+        }
+        return outp;
+    }
+
+    // 滑动窗口聚合（minPeriods 默认 1：窗口不满也出值；结果列默认
+    // "<列名>_rolling"）。
+    public static DataFrame Rolling(DataFrame df, string valueCol, int window,
+            int agg) {
+        return Window.Rolling(df, valueCol, window, agg, 1, "");
+    }
+
+    // 滑动窗口聚合（minPeriods 默认 1；结果列默认 "<列名>_rolling"）。
+    public static DataFrame Rolling(DataFrame df, string valueCol, int window,
+            int agg, int minPeriods) {
+        return Window.Rolling(df, valueCol, window, agg, minPeriods, "");
+    }
+
+    // 滑动窗口的有效性掩码：第 r 位为 true 表示该行的窗口样本数
+    // 达到了 minPeriods（即 Rolling 真的算出了值）。
+    //
+    // 掩码与行号一一对应，长度 = 行数。minPeriods 的默认与
+    // Rolling 一致（1 → 全 true）。
+    public static List<bool> RollingValid(DataFrame df, string valueCol,
+            int window, int minPeriods) {
+        List<bool> mask = new List<bool>();
+        if (df == null) { return mask; }
+        int at = df.ColIndex(valueCol);
+        if (at < 0) { throw new InvalidOperationException("RollingValid 没有列: " + valueCol); }
+        if (window < 1) { window = 1; }
+        int need = minPeriods < 1 ? 1 : minPeriods;
+        if (need > window) { need = window; }
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            int lo = r - window + 1;
+            if (lo < 0) { lo = 0; }
+            int count = r - lo + 1;
+            mask.Add(count >= need);
+        }
+        return mask;
+    }
+
+    // 滑动窗口的有效性掩码（minPeriods 默认 1）。
+    public static List<bool> RollingValid(DataFrame df, string valueCol,
+            int window) {
+        return Window.RollingValid(df, valueCol, window, 1);
+    }
+
+    // 指数加权移动平均（ewm）：y[t] = α·x[t] + (1-α)·y[t-1]。
+    //
+    // alpha 是平滑系数（0 < α ≤ 1）：越大越贴近期值。
+    // adjust=true 时分母按权重和归一（pandas 的 ewm(adjust=True)
+    // 语义，起始段不会被系统性拉低）；adjust=false 时就是递推式。
+    //
+    // adjust=true 的递推形式（与逐项加权求和同构）：
+    //   num[t] = x[t] + (1-α)·num[t-1]
+    //   w[t]   = 1    + (1-α)·w[t-1]
+    //   y[t]   = num[t] / w[t]
+    // 首行总是有值（权重和为 1）。
+    //
+    // 结果写进新列（outCol，Float 类型）；outCol 传空串时用
+    // "<列名>_ewm"。
+    public static DataFrame Ewm(DataFrame df, string valueCol, double alpha,
+            bool adjust, string outCol) {
+        if (df == null) { throw new InvalidOperationException("Ewm: 表为 null"); }
+        int at = df.ColIndex(valueCol);
+        if (at < 0) { throw new InvalidOperationException("Ewm 没有列: " + valueCol); }
+        if (alpha <= 0.0 || alpha > 1.0) {
+            throw new InvalidOperationException("Ewm: alpha 必须在 (0,1]");
+        }
+        DataFrame outp = df.Copy();
+        string name = outCol == null || outCol.Length == 0
+            ? valueCol + "_ewm" : outCol;
+        int outAt = outp.ColIndex(name);
+        if (outAt < 0) {
+            outp.AddColumn(name, ColKind.Float);
+            outAt = outp.ColIndex(name);
+        }
+        int n = df.Rows();
+        double decay = 1.0 - alpha;
+        if (adjust) {
+            // 归一化：分子/权重和——即加权均值。
+            double num = 0.0;
+            double w = 0.0;
+            for (int r = 0; r < n; r = r + 1) {
+                double x = df.cols[at].GetDouble(r);
+                num = x + decay * num;
+                w = 1.0 + decay * w;
+                outp.cols[outAt].PutDouble(r, num / w);
+            }
+            return outp;
+        }
+        // 不归一化：直接递推 y = α·x + (1-α)·y。
+        // **首行播种为 x[0]**（不是从 0 递推）——从 0 起会让首行变成
+        // α·x[0]（alpha=0.5 时 10 变 5），那不是"指数加权"而是
+        // "从零爬升"。pandas 的 ewm(adjust=False) 也是首行取原值。
+        if (n > 0) {
+            double first = df.cols[at].GetDouble(0);
+            outp.cols[outAt].PutDouble(0, first);
+            double y = first;
+            for (int r = 1; r < n; r = r + 1) {
+                double x = df.cols[at].GetDouble(r);
+                y = alpha * x + decay * y;
+                outp.cols[outAt].PutDouble(r, y);
+            }
+        }
+        return outp;
+    }
+
+    // 指数加权移动平均（默认 adjust=true；结果列 "<列名>_ewm"）。
+    public static DataFrame Ewm(DataFrame df, string valueCol, double alpha) {
+        return Window.Ewm(df, valueCol, alpha, true, "");
+    }
+
+    // 指数加权移动平均（结果列 "<列名>_ewm"）。
+    public static DataFrame Ewm(DataFrame df, string valueCol, double alpha,
+            bool adjust) {
+        return Window.Ewm(df, valueCol, alpha, adjust, "");
+    }
+
+    // 差分：x[t] - x[t-periods]。前 periods 行没有参照，不写值。
+    // 结果写进新列（outCol，Float 类型）；空串时用 "<列名>_diff"。
+    public static DataFrame Diff(DataFrame df, string valueCol, int periods,
+            string outCol) {
+        if (df == null) { throw new InvalidOperationException("Diff: 表为 null"); }
+        int at = df.ColIndex(valueCol);
+        if (at < 0) { throw new InvalidOperationException("Diff 没有列: " + valueCol); }
+        if (periods < 1) { periods = 1; }
+        DataFrame outp = df.Copy();
+        string name = outCol == null || outCol.Length == 0
+            ? valueCol + "_diff" : outCol;
+        int outAt = outp.ColIndex(name);
+        if (outAt < 0) {
+            outp.AddColumn(name, ColKind.Float);
+            outAt = outp.ColIndex(name);
+        }
+        for (int r = 0; r < outp.Rows(); r = r + 1) {
+            if (r < periods) { continue; }
+            double cur = df.cols[at].GetDouble(r);
+            double prev = df.cols[at].GetDouble(r - periods);
+            outp.cols[outAt].PutDouble(r, cur - prev);
+        }
+        return outp;
+    }
+
+    // 差分（结果列 "<列名>_diff"）。
+    public static DataFrame Diff(DataFrame df, string valueCol, int periods) {
+        return Window.Diff(df, valueCol, periods, "");
+    }
+}

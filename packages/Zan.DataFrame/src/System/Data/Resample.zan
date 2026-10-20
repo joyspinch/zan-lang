@@ -1,0 +1,128 @@
+using System;
+
+namespace System.Data;
+
+// 时序重采样：把不等间隔的时间序列聚合成等间隔的桶。
+//
+// 时间列用 **Unix 秒**（long）——这是最通用且无歧义的形式：日期
+// 列、口径不同的其它来源都能先转成秒再进来。字符串日期要自己先
+// 转（DateTime.ParseDate 只认 "YYYY-MM-DD"，FromParts 可造全量）。
+//
+// 桶边界：**左闭右开**（[start, end)），与 pandas 的 resample 语义
+// 一致。桶标签是该桶的**起始时刻**（unix 秒）。
+//
+// 空桶：**不产生行**（不是补 0）。补 0 会让"这段时间没数据"和
+// "这段时间销量为 0"混为一谈——这在时序上是最容易出错的地方。
+
+public class Resample {
+    // 按频率重采样：timeCol 是 unix 秒列，valueCol 是数值列，
+    // agg 是聚合算子。
+    //
+    // 输出表：time（桶起始 unix 秒）+ value（聚合结果）。
+    // 行序按桶起始时刻升序。
+    //
+    // 桶边界（左闭右开）：
+    // - Second/Minute/Hour/Day：从 Unix 纪元对齐的固定间隔
+    // - Week：以周一 00:00 为起点（Unix 纪元 1970-01-01 是周四，
+    //   所以第一周的起点要往前退到上一个周一）
+    // - Month：自然月边界
+    public static DataFrame ResampleBy(DataFrame df, string timeCol,
+            string valueCol, int freq, int agg) {
+        if (df == null) { throw new InvalidOperationException("ResampleBy: 表为 null"); }
+        int tAt = df.ColIndex(timeCol);
+        if (tAt < 0) { throw new InvalidOperationException("ResampleBy 没有列: " + timeCol); }
+        int vAt = df.ColIndex(valueCol);
+        if (vAt < 0) { throw new InvalidOperationException("ResampleBy 没有列: " + valueCol); }
+
+        // 桶起始 → 该桶的行号。
+        Dictionary<long, List<int>> buckets = new Dictionary<long, List<int>>();
+        List<long> order = new List<long>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            long t = df.cols[tAt].GetLong(r);
+            long b = Resample.BucketStart(t, freq);
+            if (!buckets.ContainsKey(b)) {
+                buckets[b] = new List<int>();
+                order.Add(b);
+            }
+            buckets[b].Add(r);
+        }
+        // 桶按时间升序（输入未必有序）。
+        order.Sort((long a, long b) => {
+            if (a < b) { return 0 - 1; }
+            if (a > b) { return 1; }
+            return 0;
+        });
+
+        DataFrame outp = new DataFrame();
+        outp.cols.Add(DataCol.Create(timeCol, ColKind.Int));
+        outp.cols.Add(DataCol.Create(valueCol, ColKind.Float));
+        for (int i = 0; i < order.Count; i = i + 1) {
+            long b = order[i];
+            List<int> rows = buckets[b];
+            int row = outp.AddRow();
+            outp.cols[0].PutLong(row, b);
+            outp.cols[1].PutDouble(row, df.Aggregate(rows, valueCol, agg));
+        }
+        return outp;
+    }
+
+    // 桶起始时刻（unix 秒）。
+    public static long BucketStart(long t, int freq) {
+        if (freq == Freq.Second) { return t; }
+        if (freq == Freq.Minute) { return Resample.FloorDiv(t, 60L) * 60L; }
+        if (freq == Freq.Hour) { return Resample.FloorDiv(t, 3600L) * 3600L; }
+        if (freq == Freq.Day) { return Resample.FloorDiv(t, 86400L) * 86400L; }
+        if (freq == Freq.Week) {
+            long day = Resample.FloorDiv(t, 86400L);
+            // 1970-01-01 是周四（dayOfWeek=4，周一=1）：把纪元推到
+            // 当周的周一。day - (dayOfWeek-1) 即本周一的天序。
+            int dow = Resample.DayOfWeek(day);
+            long monday = day - (dow - 1);
+            return monday * 86400L;
+        }
+        // Month：自然月起点。
+        int year = 0;
+        int month = 0;
+        int day = 0;
+        DateTime.CivilFromDays((int)Resample.FloorDiv(t, 86400L), out year, out month, out day);
+        return (long)DateTime.DaysFromCivil(year, month, 1) * 86400L;
+    }
+
+    // 桶的结束时刻（不含，unix 秒）——用于知道桶覆盖多长时间。
+    public static long BucketEnd(long start, int freq) {
+        if (freq == Freq.Second) { return start + 1L; }
+        if (freq == Freq.Minute) { return start + 60L; }
+        if (freq == Freq.Hour) { return start + 3600L; }
+        if (freq == Freq.Day) { return start + 86400L; }
+        if (freq == Freq.Week) { return start + 7L * 86400L; }
+        int year = 0;
+        int month = 0;
+        int day = 0;
+        DateTime.CivilFromDays((int)Resample.FloorDiv(start, 86400L), out year, out month, out day);
+        int ny = year;
+        int nm = month + 1;
+        if (nm > 12) { nm = 1; ny = year + 1; }
+        return (long)DateTime.DaysFromCivil(ny, nm, 1) * 86400L;
+    }
+
+    // 天序的星期几（周一=1 … 周日=7）。1970-01-01 是周四=4。
+    public static int DayOfWeek(long days) {
+        // 纪元是周四=4：day 0 → 4，(4 + days - 1) mod 7 归一到 1..7。
+        long w = Resample.FloorMod(days + 3L, 7L);   // days=0 → 3
+        return (int)w + 1;                          // → 4
+    }
+
+    // 向下取整除法（负数也向下——C 的整数除法是向零截断）。
+    private static long FloorDiv(long a, long b) {
+        long q = a / b;
+        if ((a % b != 0) && ((a < 0) != (b < 0))) { q = q - 1; }
+        return q;
+    }
+
+    // 非负取模。
+    private static long FloorMod(long a, long b) {
+        long m = a % b;
+        if (m < 0) { m = m + b; }
+        return m;
+    }
+}

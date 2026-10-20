@@ -1,0 +1,149 @@
+using System;
+
+namespace System.Data;
+
+// 透视表与交叉表。
+//
+// 透视（pivot）把"长表"转成"宽表"：行标签 × 列标签 → 单元格值。
+// 交叉表（crosstab）是它的特例——只数个数，不算聚合。
+//
+// 与 Unstack 的区别：Unstack 是一列 key 展开成多列（每列一个值列），
+// 透视是"行标签 + 列标签"两维交叉，值列可以是多个。
+//
+// 行序与列序都按**首次出现顺序**（不是排序）——与 GroupBy 的
+// "组按键首次出现顺序"一致，读者能对照原表核。
+
+public class Pivot {
+    // 透视表：index 为行标签列，columns 为列标签列，values 为值列
+    // （可多列，按参数顺序），agg 为聚合算子（Agg 值）。
+    //
+    // 输出表：行标签列 + 每个（列标签 × 值列）一列，列名形如
+    // "列标签值_值列名"（拼接而非单用标签——单用会与行标签列撞名）。
+    // 缺组合的单元格填聚合的"空集"值（Count 得 0，其余得 0.0）。
+    //
+    // 行列标签的取值按首次出现顺序排列。
+    public static DataFrame PivotTable(DataFrame df, string indexCol,
+            string columnsCol, List<string> valueCols, int agg) {
+        if (df == null) { throw new InvalidOperationException("PivotTable: 表为 null"); }
+        int idxAt = df.ColIndex(indexCol);
+        if (idxAt < 0) { throw new InvalidOperationException("PivotTable 没有列: " + indexCol); }
+        int colAt = df.ColIndex(columnsCol);
+        if (colAt < 0) { throw new InvalidOperationException("PivotTable 没有列: " + columnsCol); }
+        List<int> valAt = new List<int>();
+        for (int i = 0; i < valueCols.Count; i = i + 1) {
+            int at = df.ColIndex(valueCols[i]);
+            if (at < 0) {
+                throw new InvalidOperationException("PivotTable 没有列: " + valueCols[i]);
+            }
+            valAt.Add(at);
+        }
+
+        // 行标签值 / 列标签值的首次出现顺序。
+        List<string> indexValues = new List<string>();
+        Dictionary<string, bool> indexSeen = new Dictionary<string, bool>();
+        List<string> columnValues = new List<string>();
+        Dictionary<string, bool> colSeen = new Dictionary<string, bool>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string iv = df.cols[idxAt].GetStr(r);
+            if (!indexSeen.ContainsKey(iv)) { indexSeen[iv] = true; indexValues.Add(iv); }
+            string cv = df.cols[colAt].GetStr(r);
+            if (!colSeen.ContainsKey(cv)) { colSeen[cv] = true; columnValues.Add(cv); }
+        }
+
+        // 每个（行标签, 列标签）组合的行号集合。
+        // 键只含行标签与列标签——值列不进键（一个单元格是"行×列"的
+        // 一组观测，多个值列各自聚合同一组行）。
+        Dictionary<string, List<int>> cells = new Dictionary<string, List<int>>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string k = Pivot.CellKey(df.cols[idxAt].GetStr(r),
+                df.cols[colAt].GetStr(r));
+            if (!cells.ContainsKey(k)) { cells[k] = new List<int>(); }
+            cells[k].Add(r);
+        }
+
+        DataFrame outp = new DataFrame();
+        outp.cols.Add(DataCol.Create(indexCol, df.cols[idxAt].Kind()));
+        for (int c = 0; c < columnValues.Count; c = c + 1) {
+            for (int v = 0; v < valAt.Count; v = v + 1) {
+                outp.cols.Add(DataCol.Create(columnValues[c] + "_"
+                    + df.cols[valAt[v]].Name(), ColKind.Float));
+            }
+        }
+        for (int i = 0; i < indexValues.Count; i = i + 1) {
+            int row = outp.AddRow();
+            outp.cols[0].PutStr(row, indexValues[i]);
+            for (int c = 0; c < columnValues.Count; c = c + 1) {
+                for (int v = 0; v < valAt.Count; v = v + 1) {
+                    string k = Pivot.CellKey(indexValues[i], columnValues[c]);
+                    double val = 0.0;
+                    if (cells.ContainsKey(k)) {
+                        val = df.Aggregate(cells[k], df.cols[valAt[v]].Name(), agg);
+                    }
+                    outp.cols[1 + c * valAt.Count + v].PutDouble(row, val);
+                }
+            }
+        }
+        return outp;
+    }
+
+    // 透视表（单值列）。
+    public static DataFrame PivotTable(DataFrame df, string indexCol,
+            string columnsCol, string valueCol, int agg) {
+        List<string> vals = new List<string>();
+        vals.Add(valueCol);
+        return Pivot.PivotTable(df, indexCol, columnsCol, vals, agg);
+    }
+
+    // 交叉表：行标签 × 列标签，单元格是**出现次数**。
+    //
+    // 这是 PivotTable 的 agg=Count 特例，但输出列名不带值列后缀
+    // （"列标签"本身），且只有一行标签维度。
+    public static DataFrame Crosstab(DataFrame df, string indexCol,
+            string columnsCol) {
+        if (df == null) { throw new InvalidOperationException("Crosstab: 表为 null"); }
+        int idxAt = df.ColIndex(indexCol);
+        if (idxAt < 0) { throw new InvalidOperationException("Crosstab 没有列: " + indexCol); }
+        int colAt = df.ColIndex(columnsCol);
+        if (colAt < 0) { throw new InvalidOperationException("Crosstab 没有列: " + columnsCol); }
+
+        List<string> indexValues = new List<string>();
+        Dictionary<string, bool> indexSeen = new Dictionary<string, bool>();
+        List<string> columnValues = new List<string>();
+        Dictionary<string, bool> colSeen = new Dictionary<string, bool>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string iv = df.cols[idxAt].GetStr(r);
+            if (!indexSeen.ContainsKey(iv)) { indexSeen[iv] = true; indexValues.Add(iv); }
+            string cv = df.cols[colAt].GetStr(r);
+            if (!colSeen.ContainsKey(cv)) { colSeen[cv] = true; columnValues.Add(cv); }
+        }
+
+        Dictionary<string, int> counts = new Dictionary<string, int>();
+        for (int r = 0; r < df.Rows(); r = r + 1) {
+            string k = Pivot.CellKey(df.cols[idxAt].GetStr(r), df.cols[colAt].GetStr(r));
+            if (counts.ContainsKey(k)) { counts[k] = counts[k] + 1; }
+            else { counts[k] = 1; }
+        }
+
+        DataFrame outp = new DataFrame();
+        outp.cols.Add(DataCol.Create(indexCol, df.cols[idxAt].Kind()));
+        for (int c = 0; c < columnValues.Count; c = c + 1) {
+            outp.cols.Add(DataCol.Create(columnValues[c], ColKind.Int));
+        }
+        for (int i = 0; i < indexValues.Count; i = i + 1) {
+            int row = outp.AddRow();
+            outp.cols[0].PutStr(row, indexValues[i]);
+            for (int c = 0; c < columnValues.Count; c = c + 1) {
+                string k = Pivot.CellKey(indexValues[i], columnValues[c]);
+                int n = 0;
+                if (counts.ContainsKey(k)) { n = counts[k]; }
+                outp.cols[1 + c].PutLong(row, n);
+            }
+        }
+        return outp;
+    }
+
+    // 单元格键：行标签 \u0001 列标签。
+    private static string CellKey(string indexValue, string columnValue) {
+        return indexValue + "\u0001" + columnValue;
+    }
+}
