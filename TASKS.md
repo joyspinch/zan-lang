@@ -8,6 +8,26 @@
 
 ## 未完成
 
+### [ ] A444 `Convert.ToString(object)` 仍按 C 字符串读——object 里装类实例时依然越界读
+
+- 现象：A4xx 那条修复（`Convert.ToString` 按静态类型分流）把类 / 结构体 /
+  数组 / 委托都改成 fail-closed 诊断，但 **`object` 只能放行**：
+  - `object` 是带标签的引用，编译期看不出里面装的是字符串还是类实例；
+  - `object` 上**连通用 `ToString()` 都调不通**——`obj.ToString()` 报
+    "this call could not be resolved to any callable"（builtin 成员表里
+    `object` 列了 ToString，但那条调用链没有可发射的实现）。
+  - 放行的代价：object 里装字符串时结果正确（老行为），装**类实例**时
+    仍然拿 strlen 去量对象指针 → 越界读 + 内存信息泄露（与 A4xx 修掉的那条
+    同款）。仓库里 `packages/Zan.Data/src/System/Data/Redis/RedisClient.zan`
+    的 `SerializeObject(object obj)` 兜底就是这条路径。
+- 影响：越界读可达（Redis 序列化兜底）；另外 object 装类实例时输出无意义。
+- 方向（两条，都是大改）：
+  1. 给内建 `object` 一个**通用 ToString**（运行期按对象头的类型 id 分派到
+     真正的 ToString 方法；字符串负载直接拷贝）——顺带解决 `obj.ToString()`
+     现在调不通的问题；
+  2. 或者把 `Convert.ToString` 正式声明进 stdlib（A443），按实参类型分派，
+     `object` 重载走上面的通用 ToString。
+- ⚠ 两条都跨后端（C 宿主 + 自举后端），且 1 还要动运行时（对象头类型 id）。
 ### [ ] A442 自举后端 `Convert.ToString(<引用类型>)` 输出指针地址——与 C 宿主的诊断不一致
 
 - 现象（2026-10-20 随 A441 一并查实）：C 宿主已改成对引用类型 fail-closed

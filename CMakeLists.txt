@@ -1157,6 +1157,27 @@ add_test(NAME diag_unary_operator_no_overload
     "-DEXPECT_REGEX=does not define a unary '-' operator overload"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_operator_no_overload PROPERTIES TIMEOUT 60)
+# Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
+# 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序
+# 带崩）；结构体则落进整数格式化分支，生成 %struct.T 传给 i64 形参的非法 IR
+# （LLVM 校验失败）。
+add_test(NAME diag_convert_tostring_object
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tostring_object.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tostring_object${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'Box' to a string"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_convert_tostring_object PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_convert_tostring_struct
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tostring_struct.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tostring_struct${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'Pt' to a string"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_convert_tostring_struct PROPERTIES TIMEOUT 60)
 
 # Mixed signed/unsigned comparison: the ulong-wins promotion would silently
 # reinterpret the signed operand (a negative long becomes a huge ulong), so

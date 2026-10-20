@@ -119,3 +119,32 @@
   表里登记。**
 - **坑出处**：2026-10-20 修一元 `operator -` 重载被误编译成指针减法时踩到：
   重载调通了但漏一条引用——二元路径在拥有型临时值表里有登记，一元没有。
+## 8. 内建转换特判必须按静态类型分流：「指针」不等于「字符串」
+
+- **只有 `string` 能当 C 字符串读**：编译器内建的转换/格式化特判
+  （`Convert.ToString` 等）里，"实参是指针" **不等于** "实参是字符串"。类实例、
+  数组、委托、`object` 在 LLVM 层都是 `i8*`，跟 `string` 长得一模一样，只能靠
+  **静态类型**（`infer_expr_type`）区分。
+  - 坑出处：2026-10-20 实测 `Convert.ToString(<类实例>)` 会拿 `strlen` 去量
+    对象指针——对象头里的指针字节被当成文本，一路扫到进程映像里的某个 0 字节
+    为止：程序打印出了进程里的符号名（`PostQueuedCompletionStatus`），并以
+    0x80000003 崩掉。**这是越界读 + 内存信息泄露**，不是"输出不好看"。
+- **结构体不能落进整数格式化分支**：`Convert.ToString(<结构体>)` 此前落进
+  `emit_itoa_into`，生成 `call i64 @__zan_itoa64(ptr %s, %struct.Pt %v, i32 0)`
+  ——形参类型不匹配，LLVM 校验失败（"Call parameter type does not match function
+  signature"），编译直接死在代码生成阶段。
+- **动作**：内建转换/格式化特判一律先取实参的**静态类型**再分流：`string` →
+  拷贝；数值 → 格式化；**类 / 结构体 / 数组 / 委托 → 报人话诊断
+  （fail-closed）**，不要"猜一个能编译的路径"。
+- **只在能证明类型不对时才拦**：静态类型推不出来（类型参数、泛型实例化等）
+  时允许退回旧路径——否则 `Convert.ToString(T)` 这类泛型代码会被误伤。
+- **`object` 是特例，只能放行**：它是带标签的引用，编译期看不出里面装的是
+  字符串还是类实例；而 `object` 上**连通用 `ToString()` 都调不通**
+  （"this call could not be resolved to any callable"），所以没有正确的
+  实现可选。放行 `object` 的代价是它仍按 C 字符串读：里面装的是字符串时
+  结果正确，装的是类实例时仍会越界读。治本要等 `object` 的通用 `ToString`
+  或把 `Convert.ToString` 声明进 stdlib（见 TASKS.md A443 / A444）。
+- **配套事实**：这类内建特判是**编译器自造的接口**——`stdlib/System/Convert.zan`
+  里没有声明 `ToString`，`src/compiler/builtin_api.c` 的 `members_convert` 里
+  也没有（IDE 符号索引 `zanc --emit-symbols` 因此补全不出 `Convert.ToString`）。
+  公开面该住在 stdlib，别住在编译器里。

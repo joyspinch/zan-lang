@@ -642,6 +642,37 @@ static LLVMValueRef emit_unresolved_call_result(zan_irgen_t *g,
     }
 }
 
+/* Convert.ToString 这条内建只接受"真正有字符串形态"的值。类实例 / 数组 /
+   委托 / object / 结构体都不行：
+     - 把指针当 C 字符串读是**越界读**——读的是对象头里的指针字节，一路扫到
+       进程映像里的某个 0 字节为止（实测打印出过进程里的符号名，并把程序
+       带崩，0x80000003）；
+     - 结构体落进 itoa 分支则生成 %struct.T 传给 i64 形参的非法 IR，LLVM
+       校验直接失败（"Call parameter type does not match function signature"）。
+   白名单与检查器的 type_is_concatable 同源；这里多放行三项"推不出来"的
+   情形：错误类型（不追加二次报错）、类型参数（泛型实例化后才确定具体
+   类型，此时按旧的宽松路径走，不要误伤泛型代码）、object（带标签的引用，
+   编译期看不出里面装的是字符串还是类实例——object 上连通用 ToString() 都
+   调不通，见 TASKS.md A444）。
+   放行 object 的代价是它仍按 C 字符串读：里面装的是字符串时结果正确，装
+   的是类实例时仍会越界读；治本要等 object 的通用 ToString 或把
+   Convert.ToString 声明进 stdlib（A443），两边一起做。 */
+static bool type_is_stringifiable(zan_type_t *t) {
+    if (!t) return true;
+    switch (t->kind) {
+    case TYPE_STRING: case TYPE_CHAR: case TYPE_ENUM: case TYPE_BOOL:
+    case TYPE_BYTE: case TYPE_SHORT: case TYPE_INT: case TYPE_LONG:
+    case TYPE_SBYTE: case TYPE_USHORT: case TYPE_UINT: case TYPE_ULONG:
+    case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_DECIMAL: case TYPE_NINT:
+    case TYPE_ERROR: case TYPE_TYPE_PARAM: case TYPE_OBJECT:
+        return true;
+    case TYPE_NULLABLE:
+        return t->element_type ? type_is_stringifiable(t->element_type) : true;
+    default:
+        return false;
+    }
+}
+
 static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
         local_scope_t *locals) {
         if (expr->call.callee && expr->call.callee->kind == AST_IDENTIFIER &&
@@ -1881,6 +1912,27 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMValueRef arg = emit_expr(g, expr->call.args.items[0], locals);
                         LLVMTypeRef i8ptr = LLVMPointerType(LLVMInt8TypeInContext(g->ctx), 0);
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
+                        zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
+                        if (!type_is_stringifiable(at)) {
+                            char tname[128];
+                            if (at->kind == TYPE_ARRAY && at->element_type &&
+                                at->element_type->name.len) {
+                                snprintf(tname, sizeof(tname), "%.*s[]",
+                                         (int)at->element_type->name.len,
+                                         at->element_type->name.str);
+                            } else if (at->name.len) {
+                                snprintf(tname, sizeof(tname), "%.*s",
+                                         (int)at->name.len, at->name.str);
+                            } else {
+                                snprintf(tname, sizeof(tname), "<value>");
+                            }
+                            zan_diag_emit(g->diag, DIAG_ERROR,
+                                expr->call.args.items[0]->loc,
+                                "Convert.ToString: cannot convert '%s' to a "
+                                "string -- call .ToString() on the value instead",
+                                tname);
+                            return LLVMConstNull(i8ptr);
+                        }
                         if (LLVMGetTypeKind(LLVMTypeOf(arg)) == LLVMPointerTypeKind) {
                             LLVMTypeRef strlen_ty = LLVMFunctionType(i64,
                                 (LLVMTypeRef[]){ i8ptr }, 1, 0);
