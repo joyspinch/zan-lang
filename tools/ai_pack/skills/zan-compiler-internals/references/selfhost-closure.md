@@ -1118,3 +1118,17 @@ kernel32、shell32、user32、advapi32、version）。
   `field_shadows_type` / `null_string_index` 进差分门（逐字一致）。
 
 
+
+## 58. NativeMemory.Find：命中位置从**基址**量，不是从窗口起点
+
+- 坑（实测）：自举的 `NativeMemory.Find(p, off, b, n)` 把窗口偏移算了两遍
+  ——`rel = hit - p` 之后又 `+ off`，于是 `Find(p, 3, 122, 2)` 返回 6 而不是
+  3，`ByteBuffer.IndexOfByte(4, 10)` 返回 11 而不是 7（"从偏移续找"整体
+  错位）。
+- 宿主口径：`Find` 的返回值是**相对基址 p 的绝对下标**（`at - p`），窗口
+  偏移已经包含在 memchr 的起始地址里，**不能再加一次**。
+- 做法：自举 IR 后端的 `Find` 内建只保留 `rel = at - base0`，
+  `base0` 是 p（不带 off）。
+- 连带：`ByteBuffer.IndexOfByte(from, b)` 是 `Find(data, from, b, len-from)`，
+  所以同一个错位会让"续找/最后一个/越界起点"三类断言一起挂。
+- 门禁：`bytebuffer_indexof` 进差分门（逐字一致）。
