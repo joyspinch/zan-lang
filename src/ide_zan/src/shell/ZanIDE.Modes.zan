@@ -3,65 +3,97 @@ using System.IO;
 using Gui;
 using Gui.Widget;
 
-// IDE 的工作模式：工具开发 / 游戏开发 / Agent。
+// IDE 的工作面由两个**正交**的维度决定：
 //
-// 三种工作流的操作差异很大——组件面板与属性检查器、场景与实体树、
-// 会话与任务流，各自主场不同。IDE 不做三套壳，而是**一套骨架 + 模式
-// 预设**：模式决定①停靠面板的显隐、②功能区的分组重心、③状态栏上
-// 当前模式的标识；文件类型（.html 设计稿 / 场景文件 / .zan 源码）仍然
-// 决定"这一帧画什么"——模式不取代它，只是给出默认工作面。
+// ① 项目种类（工具 / 游戏）——由创建或打开的工程类型**自动判定**，
+//    用户不手选。它只决定默认停靠面板的摆法：工具工程以组件面板与
+//    属性检查器为主场，游戏工程以场景树、素材与帧循环为主场。
+// ② Agent——右侧那扇会话面板的显隐，一键切换，与项目种类并存：
+//    工具工程也能开 Agent，游戏工程也能开 Agent。
+//
+// 文件类型（.html 设计稿 / 场景文件 / .zan 源码）仍然决定"这一帧画
+// 什么"——项目种类不取代它，只是给出默认工作面。
 partial class ZanIDE {
 
-    // 模式 id：0=工具 1=游戏 2=Agent。
-    static int ModeTool() { return 0; }
-    static int ModeGame() { return 1; }
-    static int ModeAgent() { return 2; }
+    // ---- 维度一：项目种类 ----
 
-    // 模式名（界面用）。
-    static string ModeName(int mode) {
-        if (mode == ModeGame()) { return ZanIDE.T("Game", "游戏"); }
-        if (mode == ModeAgent()) { return ZanIDE.T("Agent", "Agent"); }
+    static int KindTool() { return 0; }
+    static int KindGame() { return 1; }
+
+    static string KindName(int kind) {
+        if (kind == KindGame()) { return ZanIDE.T("Game", "游戏"); }
         return ZanIDE.T("Tool", "工具");
     }
 
     // 状态栏上的长名：那一栏里还并排放着"设计器/Zan"这类编辑态标识，
-    // 短名并排会读成同一个东西（"设计器 | 工具"），加上"模式"二字
+    // 短名并排会读成同一个东西（"设计器 | 工具"），带上"项目"二字
     // 才分得清。
-    static string ModeLabel(int mode) {
-        return ZanIDE.ModeName(mode) + ZanIDE.T(" mode", "模式");
+    static string KindLabel(int kind) {
+        if (kind == KindGame()) { return ZanIDE.T("Game project", "游戏项目"); }
+        return ZanIDE.T("Tool project", "工具项目");
     }
 
-    // 模式的机器名（落盘用）。
-    static string ModeKey(int mode) {
-        if (mode == ModeGame()) { return "game"; }
-        if (mode == ModeAgent()) { return "agent"; }
-        return "tool";
+    // 项目种类判定链：zan.proj 的 kind 键优先（新建工程时按模板的
+    // 能力写进去），缺失时回退启发式——老工程没有这个键，不能因为
+    // 没标记就一律当成工具工程。
+    static int DetectProjectKind(string root) {
+        if (root == "") { return ZanIDE.KindTool(); }
+        string k = ZanIDE.ProjField(root, "kind");
+        if (k == "game") { return ZanIDE.KindGame(); }
+        if (k == "tool") { return ZanIDE.KindTool(); }
+        return ZanIDE.HeuristicProjectKind(root, 128);
     }
 
-    static int ModeFromKey(string key) {
-        if (key == "game") { return 1; }
-        if (key == "agent") { return 2; }
-        return 0;
-    }
-
-    // 模式落盘用独立小文件（与 dock 布局同款做法）：不与 editor.cfg
-    // 的主题/字体键互相覆盖——那两个键由设置对话框整份重写。
-    static string IdeModePath() { return ZanIDE.UserConfigDir() + "/ide-mode.txt"; }
-
-    static int ReadIdeMode() {
-        string f = ZanIDE.IdeModePath();
-        if (!File.Exists(f)) { return ZanIDE.ModeTool(); }
-        return ZanIDE.ModeFromKey(ZanIDE.TrimWs(File.ReadAllText(f)));
-    }
-
-    static void WriteIdeMode(int mode) {
-        Directory.CreateDirectoryRecursive(ZanIDE.UserConfigDir());
-        File.WriteAllText(ZanIDE.IdeModePath(), ZanIDE.ModeKey(mode));
+    // 启发式：源码里引了游戏命名空间（using Game.），或工程里有场景
+    // 设计稿（.html 带 data-zan-scene）→ 游戏工程；否则工具工程。
+    //
+    // 扫描有上限：工程动辄几千个文件，全读一遍会把打开工程的那一帧
+    // 卡住；读到第一个证据就够判定了。
+    static int HeuristicProjectKind(string root, int budget) {
+        if (!Directory.Exists(root)) { return ZanIDE.KindTool(); }
+        List<string> queue = new List<string>();
+        queue.Add(root);
+        int scanned = 0;
+        while (queue.Count > 0 && scanned < budget) {
+            string d = queue[0];
+            queue.RemoveAt(0);
+            List<string> files = Directory.GetFiles(d);
+            for (int i = 0; i < files.Count; i = i + 1) {
+                string f = files[i];
+                bool isZan = ZanIDE.EndsWith(f, ".zan");
+                bool isHtml = ZanIDE.EndsWith(f, ".html") || ZanIDE.EndsWith(f, ".htm");
+                if (!isZan && !isHtml) { continue; }
+                scanned = scanned + 1;
+                if (scanned > budget) { break; }
+                string body = "";
+                bool read = true;
+                try { body = File.ReadAllText(f); } catch (Exception e) { read = false; }
+                if (!read) { continue; }
+                if (isZan && (ZanIDE.Has(body, "using Game.")
+                        || ZanIDE.Has(body, "use Game."))) {
+                    return ZanIDE.KindGame();
+                }
+                if (isHtml && body.IndexOf("data-zan-scene") >= 0) {
+                    return ZanIDE.KindGame();
+                }
+            }
+            List<string> subs = new List<string>();
+            try { subs = Directory.GetDirectories(d); } catch (Exception e) { subs = new List<string>(); }
+            for (int i = 0; i < subs.Count; i = i + 1) {
+                string sn = Path.GetFileName(subs[i]);
+                // 生成目录里没有工程自己的源码，扫到只会拖慢判定。
+                if (sn == "build" || sn == "publish" || sn == "assets"
+                    || sn == ".zan-packages" || sn == "node_modules") { continue; }
+                queue.Add(subs[i]);
+            }
+        }
+        return ZanIDE.KindTool();
     }
 
     // IDE 自己注册的全部停靠面板 id（"editor" 是中央固定区，不参与
-    // 显隐）。模式预设在这张名单上做取舍。
-    static List<string> ModeAllPanels() {
+    // 显隐）。项目种类在这张名单上做取舍——"agent" 不在名单里：
+    // Agent 与项目种类正交，不该被工程种类的预设收走。
+    static List<string> KindAllPanels() {
         List<string> ids = new List<string>{
             "explorer", "structure", "stdlib", "toolbox", "tools",
             "examples", "git", "props", "output", "errors", "terminal",
@@ -69,30 +101,18 @@ partial class ZanIDE {
         return ids;
     }
 
-    // 模式预设：这一模式下常驻的停靠面板。
-    List<string> ModePanels(int mode) {
+    // 项目种类的默认工作面：工具工程以组件面板与属性检查器为主场，
+    // 游戏工程以场景树、素材与帧循环为主场。
+    List<string> KindPanels(int kind) {
         List<string> ids = new List<string>();
         ids.Add("explorer");
-        if (mode == ModeAgent()) {
-            // Agent：工程树（Agent 要知道改哪个文件）+ 产出、错误与
-            // 终端（构建与工具调用都落这里）。会话流占中央，Agent
-            // 模式下常驻。
-            ids.Add("output");
-            ids.Add("errors");
-            ids.Add("terminal");
-            return ids;
-        }
-        // 工具与游戏都要结构树：工具模式里是组件树，游戏模式里是
-        // 实体/场景树（StructurePanel 自己按 designerMode/sceneMode
-        // 换内容与标题）。
         ids.Add("structure");
-        if (mode == ModeGame()) {
+        if (kind == KindGame()) {
             ids.Add("output");
             ids.Add("errors");
             ids.Add("terminal");
             return ids;
         }
-        // 工具模式：组件面板与属性检查器是主场。
         ids.Add("toolbox");
         ids.Add("props");
         ids.Add("output");
@@ -100,37 +120,68 @@ partial class ZanIDE {
         return ids;
     }
 
-    // 切换工作模式：按预设重排面板（不属于本模式的隐藏，属于的显示），
-    // 落盘并重绘。
+    // 应用项目种类的默认工作面：按预设重排面板（不属于本种类的隐藏，
+    // 属于的显示）。
     //
-    // 只管显隐不管位置：面板停在哪一侧是用户自己调出来的，模式不该
+    // 只管显隐不管位置：面板停在哪一侧是用户自己调出来的，IDE 不该
     // 替他挪——Show 会原位恢复它记住的家。
-    void ApplyIdeMode(int mode) {
-        if (mode < 0 || mode > 2) { mode = ZanIDE.ModeTool(); }
-        if (mode == ideMode) { return; }
-        ideMode = mode;
-        if (dock != null) {
-            List<string> want = this.ModePanels(mode);
-            List<string> all = ZanIDE.ModeAllPanels();
-            for (int i = 0; i < all.Count; i = i + 1) {
-                string id = all[i];
-                bool wantOn = want.Contains(id);
-                bool hidden = dock.IsHidden(id);
-                if (wantOn && hidden) { dock.Show(id); }
-                else if (!wantOn && !hidden) { dock.Close(id); }
-            }
-            // 收掉面板关闭的回执：模式切换是成批显隐，不是用户挨个
-            // 关面板，不该弹一串"面板已关闭"。
-            dock.TakeClosed();
+    void ApplyProjectKind(int kind) {
+        if (kind < 0 || kind > 1) { kind = ZanIDE.KindTool(); }
+        projKind = kind;
+        if (dock == null) { return; }
+        List<string> want = this.KindPanels(kind);
+        List<string> all = ZanIDE.KindAllPanels();
+        for (int i = 0; i < all.Count; i = i + 1) {
+            string id = all[i];
+            bool wantOn = want.Contains(id);
+            bool hidden = dock.IsHidden(id);
+            if (wantOn && hidden) { dock.Show(id); }
+            else if (!wantOn && !hidden) { dock.Close(id); }
         }
-        ZanIDE.WriteIdeMode(mode);
+        // 收掉面板关闭的回执：这是成批显隐，不是用户挨个关面板，
+        // 不该弹一串"面板已关闭"。
+        dock.TakeClosed();
     }
 
-    // 功能区的模式按钮点到这里：应用预设 + 一句提示 + 重绘。
-    void SwitchIdeMode(int mode) {
-        if (mode == ideMode) { return; }
-        this.ApplyIdeMode(mode);
-        Layer.Msg(ZanIDE.T("Work mode: ", "工作模式：") + ZanIDE.ModeName(mode), 3);
+    // ---- 维度二：Agent ----
+
+    // Agent 面板开着没有。它没有单独的状态文件：面板显隐本来就在
+    // 停靠布局文件（dock.cfg）里，Agent 面板也在那张表上。
+    //
+    // 判据是"看得见"而不是"没关掉"：面板在停靠列里是一个页签，
+    // 同一时刻只显示其中一个——页签没被选中时它就是关着的。
+    bool AgentOn() {
+        return dock != null && dock.Visible("agent");
+    }
+
+    // 一键切换 Agent：面板拉出来 / 收回去。
+    //
+    // 同一块控件树不能画两遍：小赞还在独立窗口里的时候先把窗口收掉
+    // （反过来的互斥在 AiAssistantWindow.ToggleFromRibbon 里）。
+    void ToggleAgent() {
+        if (dock == null) { return; }
+        if (this.AgentOn()) {
+            dock.Close("agent");
+        } else {
+            if (aiWin != null && aiWin.IsOpen()) {
+                aiWin.Close();
+                aiWin = null;
+            }
+            dock.Show("agent");
+        }
+        dock.TakeClosed();
         app.RequestRedraw();
+    }
+
+    // 状态栏上的工作面标识：项目种类 + Agent 开着没有。
+    string WorkFaceLabel() {
+        string s = "";
+        if (haveProject) {
+            s = ZanIDE.KindLabel(projKind);
+        } else {
+            s = ZanIDE.T("No project", "未打开项目");
+        }
+        if (this.AgentOn()) { s = s + " · Agent"; }
+        return s;
     }
 }
