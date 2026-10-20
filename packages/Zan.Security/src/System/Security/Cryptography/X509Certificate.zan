@@ -132,6 +132,31 @@ public class X509Certificate {
         return StrEqualsIgnoreCase(patternCanon, hostCanon);
     }
 
+    // CN 回退匹配：CN 是 X.509 的通用名字段，RFC 5280 允许任意字符串，
+    // 实践中常见 "Zan Test CA" 这类带空格的标识符——它不是 DNS 名，
+    // 套用 LDH 域名规范化会把它判否，等于让"CN 回退"对多数真实证书失效。
+    // 主流实现（Go crypto/x509、Java HostnameChecker、OpenSSL）在 CN 不是
+    // 合法主机名模式时退化为标识符精确比对，而不是拒绝；这里按形态分两路：
+    //   1) CN 与 host 都是合法 LDH 域名形态 → 走通配/单级匹配（MatchPattern）
+    //   2) 否则 → 大小写不敏感的精确比对（不套用 DNS 规范化）
+    private static bool MatchCommonName(string cn, string host) {
+        if (cn == null || host == null || cn.Length == 0 || host.Length == 0) { return false; }
+        for (int j = 0; j < cn.Length; j = j + 1) { if ((cn[j] & 255) == 0) { return false; } }
+        for (int j = 0; j < host.Length; j = j + 1) { if ((host[j] & 255) == 0) { return false; } }
+        if (cn.IndexOf("*") >= 0) {
+            // 通配 CN：只按 DNS 模式匹配，host 必须是合法域名才谈得上通配
+            if (X509Certificate.DnsCanonical(host) == null) { return false; }
+            return X509Certificate.MatchPattern(cn, host);
+        }
+        string cnCanon = X509Certificate.DnsCanonical(cn);
+        string hostCanon = X509Certificate.DnsCanonical(host);
+        if (cnCanon != null && hostCanon != null) {
+            return X509Certificate.StrEqualsIgnoreCase(cnCanon, hostCanon);
+        }
+        // CN 不是域名形态（带空格等）：只认精确标识符，不做通配展开
+        return X509Certificate.StrEqualsIgnoreCase(cn, host);
+    }
+
     // iPAddress SAN 条目转规范文本：IPv4 点分十进制，IPv6 采用 RFC 5952
     // 式压缩小写十六进制。两侧（证书 SAN 与主机字面量）比较前都走同一
     // 规范形，文本相等即地址字节相等，压缩/大小写/前导零差异不再误判。
@@ -373,8 +398,8 @@ public class X509Certificate {
         return X509Certificate.IpSanText(v4, 0, 4);
     }
 
-    // 依据 RFC 6125 标准验证给定的主机名（域名或 IP 字面量）是否匹配该证书。
-    // 优先匹配 SAN（dNSName / iPAddress）；若无 SAN 则回退至 Subject CN。
+    // 依据 RFC 6125 / RFC 9525 验证给定的主机名（域名或 IP 字面量）是否匹配该证书。
+    // 优先匹配 SAN（dNSName / iPAddress）；仅当证书不含 dNSName 条目时才回退至 Subject CN。
     bool VerifyHost(string host) {
         if (host == null || host.Length == 0) { return false; }
         for (int j = 0; j < host.Length; j = j + 1) { if ((host[j] & 255) == 0) { return false; } }
@@ -412,17 +437,20 @@ public class X509Certificate {
             return false;
         }
 
-        // 域名匹配：RFC 6125 规定若证书存在 SAN dNSName，禁止降级回退到 CN
-        if (this.hasSan || (this.dnsNames != null && this.dnsNames.Count > 0)) {
+        // 域名匹配：RFC 6125 §6.4.4 规定"证书含 SAN 的 DNS-ID 条目时"禁止降级回退到 CN。
+        // 判据是 dNSName 条目而非 SAN 扩展本身是否存在——SAN 里只放 email/URI 等
+        // 非 DNS 条目时，CN 仍是合法的回退来源（与 Go crypto/x509、Java
+        // HostnameChecker 的主流行为一致）。
+        if (this.dnsNames != null && this.dnsNames.Count > 0) {
             for (int i = 0; i < this.dnsNames.Count; i = i + 1) {
                 if (MatchPattern(this.dnsNames[i], host)) { return true; }
             }
             return false;
         }
 
-        // 无 SAN 扩展时回退至 Subject CN
+        // 无 dNSName 条目时回退至 Subject CN
         if (this.subjectCN != null && this.subjectCN.Length > 0) {
-            return MatchPattern(this.subjectCN, host);
+            return MatchCommonName(this.subjectCN, host);
         }
 
         return false;
@@ -522,7 +550,6 @@ public class X509Certificate {
     bool serverAuth;
     bool hasKeyUsage;
     bool hasEku;
-    bool hasSan;
     long notBefore;
     long notAfter;
 
@@ -788,7 +815,6 @@ public class X509Certificate {
                 cert.digitalSignature = (flags & 128) != 0;
                 cert.keyCertSign = (flags & 4) != 0;
             } else if (Oid(der, oidAt, oidLen, 85, 29, 17)) {
-                cert.hasSan = true;
                 int generalEnd = Tlv(der, octEnd, p, 48);
                 if (generalEnd != octEnd) { return null; }
                 while (p[0] < generalEnd) {

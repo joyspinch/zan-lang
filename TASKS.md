@@ -530,24 +530,56 @@
   把两处用例的 http2 段摘掉并把帧 API 登记为未实现（与 A381 的清单同口径）。
 - ⚠ 不要用"给用例补个桩类型"绕过：那是让用例测一个假实现。
 
-### [ ] A409 X509 证书匹配"无 SAN 时回退 CN"与用例口径不符
+### [x] A409 X509 证书匹配"无 SAN 时回退 CN"与用例口径不符
 
 - 现象：`conformance_x509_certificate` 其余 20+ 项检查全绿，只有一项红：
   `FAIL Fallback to CN when no SAN`（程序 exit=1，failures=1）。
-- 事实：用例钉的是"证书没有 SAN DNS 时回退到 Subject CN 匹配主机名"；现代
-  实现按 RFC 6125 已经**不再回退 CN**（浏览器也早已弃用），所以这条差异是
-  **规范口径变化**而非实现 bug。
-- 方向：(1) 实现 CN 回退（并写清是兼容旧证书的宽松路径）；(2) 认定 RFC 6125
-  口径正确，改用例 + `docs/STDLIB.md` 记明"不回退 CN"；倾向 (2)——安全语义
-  上不回退才是对的，但要让口径在文档与用例里一致。
+- ✅ 已修（2026-10-20）。先前的登记判断有误（当时写成"现代实现不再回退 CN，
+  应改用例"），实测定位后按**主流口径**改实现，两处根因：
+  1. **CN 匹配被当成 DNS 名**：CA 证书（`CA_CERT`）实测扩展只有
+     2.5.29.14/2.5.29.35/2.5.29.19，**根本没有 SAN**；它的 CN 是
+     `Zan Test CA`——带空格的**标识符**，不是 DNS 名。`MatchPattern` 对 host
+     套了 LDH 域名规范化（`DnsCanonical`），空格直接判否，于是"CN 回退"对
+     真实证书形同虚设——而文件自己的注释写的是"若无 SAN 则回退至 Subject CN"，
+     实现与自带文档矛盾。
+  2. **降级禁令的判据用错**：代码用 `hasSan`（SAN 扩展是否存在）判断"禁止回退
+     CN"，但 RFC 6125 §6.4.4 的判据是"SAN 里**含 dNSName 条目**"；扩展里只放
+     email/URI 时 CN 仍是合法回退来源。
+- 修法（对齐 Go `crypto/x509`、Java `HostnameChecker`、OpenSSL 的主流行为）：
+  - `X509Certificate.VerifyHost` 的门控改成"有 dNSName 条目才禁回退"；
+  - 新增私有 `MatchCommonName`：CN 与 host 都是合法 LDH 域名形态才走通配/单级
+    匹配，否则退化为**大小写不敏感的精确标识符比对**（Go 的 `matchExactly`/
+    Java 的 `equalsIgnoreCase` 同款），不再套 DNS 规范化；
+  - 删掉因此不再需要的 `hasSan` 字段。
+- 用例：新证书 `SAN_NO_DNS`（SAN 扩展只含 email 条目）钉住"无 dNSName 条目时
+  允许 CN 回退"，`tests/conformance/x509_certificate.zan` 增 5 条断言 +
+  基准同步。验证：`zanc tests/conformance/x509_certificate.zan --auto-stdlib`
+  编译后逐行比对基准**完全一致**（exit=0，failures=0）。
 
-### [ ] A410 MVC 菜单有条目的 icon 解析为空
+### [x] A410 MVC 菜单有条目的 icon 解析为空
 
 - 现象：`conformance_web_menu_attrs` 输出与基准差两处：期望
   `icon=mdi:antenna`，实际 `icon=-`（文章 `/admin/menuposts`、首页 `/menuhome`
   两条），其余字段（active/路径/标题）都对。
-- 方向：查菜单元数据 → 图标名映射这条链路（`MenuBuilder` / 菜单元数据的
-  icon 字段来源），定位为什么这两条的 icon 落空而"账号"那条正常。
+- 根因：`5b2bf946`（纯"文件规范化"重构）把带构造参数的专用 `CustomAttribute`
+  换成通用名值对 `CustomAttribute(name, value)` 时，丢掉了 `Icon` 的构造默认值
+  `mdi:antenna`（见 `a085f541:stdlib/System/Web/Attributes.zan:94`）。通用名值对
+  特性按 key 存值，没有"某个 key 的默认值"这个位置 → 没写 `Icon` 的菜单项
+  `r.meta.Get("Icon")` 返回空串。基准自 `a085f541` 起就期望 `mdi:antenna`，
+  从那次重构起一直红。
+- ✅ 已修（2026-10-20）：
+  - `MenuBuilder` 加 `public static string defaultIcon = "mdi:antenna"`，并在
+    `ForUser` 里对空 icon 兜底（`MenuBuilder` 是 icon 的唯一消费方，缺省归位
+    到这一层最合适）；显式写了 `Icon` 的条目不受影响。
+  - 顺带查出**另一处**独立差异（与 icon 无关）：匿名用户看到 0 条菜单而不是基准
+    的 1 条。根因是 10-09 的 fail-closed 策略（`GenRoute`：未声明
+    `Authorization` 的端点一律要求登录）让"隐式公开"的 `MenuHomeController`
+    对匿名隐身，而基准仍期望匿名可见——用例没跟上这次有意的安全策略改动。
+    修法是让用例把意图**显式**写出来（`[Custom(Authorization =
+    CustomAuthorization.None, IsMenu = true)]`），基准保持不动（匿名仍应看到
+    首页这条公开菜单项），而不是把基准改成"匿名 0 条"。
+  - 验证：`zanc tests/conformance/web_menu_attrs.zan --auto-stdlib` 编译后逐行
+    比对基准**完全一致**（exit=0）。
 
 ### [ ] A411 `conformance_clipboard_roundtrip` 在无交互窗口站点的会话里恒红
 
