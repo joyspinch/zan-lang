@@ -166,8 +166,10 @@ public class Checker {
         if (name == "") { return true; }
         if (name == "value") { return true; }
         if (ScopeHas(name)) { return true; }
-        if (FieldUp(curClass, name) != null) { return true; }
-        if (MethodUp(curClass, name) != null) { return true; }
+        // a bare name may be a field, a method or a property (the parser
+        // desugars a property into get_Name / set_Name accessors): the C
+        // host resolves all three against the enclosing type
+        if (HasMember(curClass, name)) { return true; }
         if (binder.IsPrimitive(name)) { return true; }
         if (binder.IsBuiltinGeneric(name)) { return true; }
         if (binder.IsTypeParam(name)) { return true; }
@@ -230,6 +232,9 @@ public class Checker {
             if (si >= 0) { return scopeType[si]; }
             Node f = FieldUp(curClass, e.sval);
             if (f != null) { return f.type; }
+            // a bare property name reads through its getter accessor
+            Node g = MethodUp(curClass, "get_" + e.sval);
+            if (g != null) { return g.type; }
             return null;
         }
         if (k == AK.CastExpr()) { return e.type; }
@@ -554,9 +559,12 @@ public class Checker {
         }
         CheckStmt(m.d);
         CheckAwaits(m);
-        if (!curVoid && m.d != null && !DefinitelyReturns(m.d)) {
-            diags.Error("not all code paths return a value in '" + m.sval + "'", m.line, m.col);
-        }
+        // The C host has no "not all code paths return a value" diagnostic:
+        // a method whose body falls through is legal there (the body may end
+        // in a `lock`/`fixed`/`using` block the checker does not model, and
+        // the irgen emits the default return for the fall-through path).
+        // Reporting it here made the self-host refuse programs the host
+        // accepts -- the host is the spec, so the check is gone.
     }
 
     // ---- await placement ----
@@ -608,55 +616,6 @@ public class Checker {
         int i = 0;
         while (i < n.kids.Count) { r = FindAwaitInLambda(n.kids[i]); if (r != null) { return r; } i = i + 1; }
         return null;
-    }
-
-    // ---- control-flow: does a statement definitely return/throw? ----
-    // Over-approximates "returns" (favours reporting nothing) so a real
-    // fall-through is caught without flagging exhaustive constructs.
-    bool IsTrueLit(Node e) { return e != null && e.kind == AK.BoolLit() && e.ival == 1; }
-
-    bool HasBreak(Node n) {
-        if (n == null) { return false; }
-        int k = n.kind;
-        if (k == AK.BreakStmt()) { return true; }
-        // nested loops / switch capture their own breaks
-        if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.ForStmt() || k == AK.ForeachStmt() || k == AK.SwitchStmt()) { return false; }
-        if (HasBreak(n.a) || HasBreak(n.b) || HasBreak(n.c) || HasBreak(n.d)) { return true; }
-        int i = 0;
-        while (i < n.kids.Count) { if (HasBreak(n.kids[i])) { return true; } i = i + 1; }
-        return false;
-    }
-
-    bool DefinitelyReturns(Node n) {
-        if (n == null) { return false; }
-        int k = n.kind;
-        if (k == AK.ReturnStmt() || k == AK.ThrowStmt()) { return true; }
-        if (k == AK.Block()) {
-            if (n.kids.Count == 0) { return false; }
-            return DefinitelyReturns(n.kids[n.kids.Count - 1]);
-        }
-        if (k == AK.IfStmt()) {
-            return n.c != null && DefinitelyReturns(n.b) && DefinitelyReturns(n.c);
-        }
-        if (k == AK.WhileStmt()) { return IsTrueLit(n.a) && !HasBreak(n.b); }
-        if (k == AK.DoWhileStmt()) { return IsTrueLit(n.a) && !HasBreak(n.b); }
-        if (k == AK.SwitchStmt()) {
-            bool hasDefault = false;
-            int i = 0;
-            while (i < n.kids.Count) {
-                Node c = n.kids[i];
-                if (c.a == null) { hasDefault = true; }
-                if (!DefinitelyReturns(c.b)) { return false; }
-                i = i + 1;
-            }
-            return hasDefault;
-        }
-        if (k == AK.TryStmt()) {
-            if (DefinitelyReturns(n.c)) { return true; }
-            if (n.b == null) { return DefinitelyReturns(n.a); }
-            return DefinitelyReturns(n.a) && DefinitelyReturns(n.b.a);
-        }
-        return false;
     }
 
     // ---- statements ----

@@ -74,15 +74,35 @@ partial class Irgen {
             if (cls != null && FieldIndex(cls, e.sval) >= 0) {
                 return LoadField("%this", MkType(curClass), e.sval);
             }
-            if (cls != null && FindMethodUp(cls, "get_" + e.sval) != null) {
-                ExprVal recv = new ExprVal("%this", MkType(curClass));
-                return EmitInstanceCall(recv, curClass, "get_" + e.sval, new Node(AK.Call()));
+            if (cls != null) {
+                Node g = FindMethodUp(cls, "get_" + e.sval);
+                if (g != null) {
+                    // a static property is read through a static call (no
+                    // receiver): a bare `ReadOnly` inside the class means
+                    // `ReadOnly.get_ReadOnly()`
+                    if (HasMod(g, MOD.Static())) {
+                        Node sc = new Node(AK.Call());
+                        sc.line = e.line; sc.col = e.col;
+                        return EmitStaticCall(curClass, "get_" + e.sval, sc);
+                    }
+                    ExprVal recv = new ExprVal("%this", MkType(curClass));
+                    return EmitInstanceCall(recv, curClass, "get_" + e.sval, new Node(AK.Call()));
+                }
             }
         }
         if (curClass != "") {
             Node scls = binder.FindType(curClass);
             if (scls != null && FindStaticField(scls, e.sval) != null) {
                 return LoadStaticField(scls, e.sval);
+            }
+            // a static property read from a static method
+            if (scls != null) {
+                Node sg = FindMethodUp(scls, "get_" + e.sval);
+                if (sg != null && HasMod(sg, MOD.Static())) {
+                    Node sc = new Node(AK.Call());
+                    sc.line = e.line; sc.col = e.col;
+                    return EmitStaticCall(curClass, "get_" + e.sval, sc);
+                }
             }
             // bare static method group used as a delegate value
             if (scls != null) {
@@ -377,8 +397,11 @@ partial class Irgen {
                 ExprVal ov = GenExpr(other);
                 string ot = MapType(ov.ty);
                 string cc = "eq"; if (op == TK.BangEq()) { cc = "ne"; }
+                // an erased type parameter travels in an i64 slot: it is
+                // compared against 0, not against the null pointer
+                string nul = "null"; if (!IsPtrLL(ot)) { nul = "0"; }
                 string c = NT();
-                L("  " + c + " = icmp " + cc + " " + ot + " " + ov.op + ", null");
+                L("  " + c + " = icmp " + cc + " " + ot + " " + ov.op + ", " + nul);
                 string z = NT();
                 L("  " + z + " = zext i1 " + c + " to i64");
                 return new ExprVal(z, MkType("bool"));
@@ -1364,6 +1387,12 @@ partial class Irgen {
                     StoreStaticField(scls, lhs.sval, v);
                     return;
                 }
+                // a static property write from a static method
+                if (scls != null) {
+                    Node sm = FindMethodUp(scls, "set_" + lhs.sval);
+                    if (sm != null && HasMod(sm, MOD.Static())
+                        && EmitPropSet("", MkType(curClass), lhs.sval, v)) { return; }
+                }
             }
             return;
         }
@@ -1509,13 +1538,19 @@ partial class Irgen {
         if (m == null) { return false; }
         string owner = MethodOwner(cls, "set_" + name);
         if (owner == "") { owner = clsName; }
+        Node pty = ParamTypeNode(m, 0);
+        // a static property setter takes no receiver: `Custom = 40` inside
+        // the class means `Custom.set_Custom(40)`
+        if (HasMod(m, MOD.Static())) {
+            L("  call void @" + MethodSym(owner, m) + "(" + MapType(pty) + " " + CallArg(v, pty) + ")");
+            return true;
+        }
         string thisOp = objOp;
         if (owner != clsName) {
             string bc = NT();
             L("  " + bc + " = bitcast %" + clsName + "* " + objOp + " to %" + owner + "*");
             thisOp = bc;
         }
-        Node pty = ParamTypeNode(m, 0);
         L("  call void @" + MethodSym(owner, m) + "(%" + owner + "* " + thisOp
             + ", " + MapType(pty) + " " + CallArg(v, pty) + ")");
         return true;
@@ -2764,8 +2799,12 @@ partial class Irgen {
 
     // null test on a reference value -> i64 0/1
     string EmitNonNullVal(ExprVal obj) {
+        string ot = MapType(obj.ty);
+        // an erased type parameter travels in an i64 slot (see the null
+        // comparison in GenBinary): it is compared against 0
+        string nul = "null"; if (!IsPtrLL(ot)) { nul = "0"; }
         string t = NT();
-        L("  " + t + " = icmp ne " + MapType(obj.ty) + " " + obj.op + ", null");
+        L("  " + t + " = icmp ne " + ot + " " + obj.op + ", " + nul);
         string z = NT();
         L("  " + z + " = zext i1 " + t + " to i64");
         return z;

@@ -1136,3 +1136,39 @@ kernel32、shell32、user32、advapi32、version）。
 - 连带：`ByteBuffer.IndexOfByte(from, b)` 是 `Find(data, from, b, len-from)`，
   所以同一个错位会让"续找/最后一个/越界起点"三类断言一起挂。
 - 门禁：`bytebuffer_indexof` 进差分门（逐字一致）。
+## 59. 擦除的类类型参数：null 比较比的是 0，不是 null 指针
+
+- 坑（实测）：自举把泛型类的类型参数擦除成 **i64 槽**，于是
+  `val == null`（`val: T`）发出来的是 `icmp eq i64 %t1, null` —— LLVM 直接
+  报 "null must be a pointer type"，链接都到不了（用例
+  `generic_type_param_null_check` BAD-IR）。
+- 宿主口径：宿主按实参把 `Binding<T>`/`Container<T>` 单态化，槽位是指针，
+  比的是 null；自举的槽是 i64（指针的 ptrtoint 值），**0 就是 null**。
+- 做法：`GenBinary` 的 null 比较与 `EmitNonNullVal` 都按值的 LLVM 类型选
+  零：`IsPtrLL(ty)` 为真才用 `null`，否则用 `0`。
+- 连带：同一个错位也会出现在 `x is null`（那里早就按类型分叉了）。
+
+## 60. 自举检查器不得比宿主更严：宿主没有的诊断要删掉
+
+- 坑（实测）：自举检查器有一条 "not all code paths return a value in 'X'"
+  ——**宿主根本没有这条诊断**（`src/compiler/checker.c` 里搜不到）。于是
+  方法体以 `lock (this) { ... }` 收尾的正常程序（packages 里的连接池就是
+  这么写的）被自举判成错误，整个 packages 用例编译不过。
+- 口径：**宿主是规格**。自举检查器多出来的诊断 = 自举拒收宿主接受 programs
+  = 行为不一致；这种"更严"不是安全网，是偏差。
+- 做法：删掉那条诊断（连同只服务于它的 `DefinitelyReturns`/`HasBreak`/
+  `IsTrueLit`）。自举 irgen 在方法尾部本来就会补默认返回（`ret i64 0` /
+  `ret <ptr> null`），IR 不会缺返回块。
+
+## 61. 裸名：类里的字段 / 属性（实例与静态）
+
+- 坑（实测）：类里写 `Value = 100;`（`Value` 是带 `get/set` 访问器的属性）
+  被自举检查器判成 "undefined identifier 'Value'" —— 属性在 parser 里被
+  降解成 `get_Value`/`set_Value` 两个方法，检查器的名字表里没有它。
+- 宿主口径：表达式里的裸名按**最内层声明**绑定——局部、然后是外层类的
+  字段/属性、最后才是类型名（属性与字段同等）。
+- 做法：检查器的 `KnownValue` 走 `HasMember`（字段 + 方法 + `get_`/`set_`
+  访问器）；`InferType` 对裸名再查一次 getter 的返回类型。
+- 连带（自举侧）：裸名读属性走 `get_X`，裸名写属性走 `set_X`；**静态属性
+  的访问器没有接收者**，必须发静态调用（`Owner_set_X(v)`），不能按实例
+  调用发（`Owner_set_X(%this, v)`）——发错就是"把 this 当参数传"的坏 IR。
