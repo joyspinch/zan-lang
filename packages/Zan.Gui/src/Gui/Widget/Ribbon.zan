@@ -238,7 +238,8 @@ public class Ribbon {
     // `rows` 是一列里堆叠多少个小命令。
     // 一组小命令的列宽：组内最宽的标签说了算，这样每列的
     // 图标和文字都对齐，长标签也不会被邻列压住。
-    static int SmallColW(App app, RibbonGroup grp) {
+    // `compact` 为真时该组的小命令全收成图标格，不再占标签宽度。
+    static int SmallColW(App app, RibbonGroup grp, bool compact) {
         Theme t = app.theme;
         StyleBox textStyle = Style.Part(app, "ribbon", "item", "",
                                         "", "", Style.SNormal());
@@ -247,6 +248,7 @@ public class Ribbon {
         for (int m = 0; m < grp.items.Count; m = m + 1) {
             RibbonItem mi = grp.items[m];
             if (mi.tile || !mi.small) { continue; }
+            if (compact) { continue; }
             int mw = Canvas.MeasureText(mi.label, fontSize)
                 + t.iconSizeSmall + app.Scale(22);
             if (mi.menu) { mw = mw + app.Scale(10); }
@@ -256,8 +258,10 @@ public class Ribbon {
     }
 
     // 条带排完所有分组需要多宽（和 Band 里的列游标算法一致，
-    // 只量不画）。宿主给的宽度不够时据此收缩排布。
-    static int BandWidth(App app, List<RibbonGroup> groups, int bh, int rows) {
+    // 只量不画）。`fit` 描述降级后的排布：收成图标格的组按方钮
+    // 宽度算，被丢掉的命令不占位。
+    static int BandWidthFit(App app, List<RibbonGroup> groups, int bh,
+                            int rows, RibbonFit fit) {
         Theme t = app.theme;
         if (rows < 1) { rows = 1; }
         int titleH = app.Scale(16);
@@ -265,16 +269,23 @@ public class Ribbon {
         int rowH = contentH / rows;
         int tileW = rowH;
         int cx = t.paddingSmall;
+        int flat = 0;
         for (int g = 0; g < groups.Count; g = g + 1) {
             RibbonGroup grp = groups[g];
-            int smallW = Ribbon.SmallColW(app, grp);
+            bool cp = fit.compact.Count > g ? fit.compact[g] : false;
+            int smallW = Ribbon.SmallColW(app, grp, cp);
             int sIdx = 0;
             int curKind = 0 - 1;
             int curW = 0;
+            int kept = 0;
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 RibbonItem it = grp.items[j];
+                bool gone = fit.dropped.Count > flat ? fit.dropped[flat] : false;
+                flat = flat + 1;
+                if (gone) { continue; }
+                kept = kept + 1;
                 int kind = 0;
-                if (it.tile) { kind = 2; }
+                if (it.tile || (cp && it.small)) { kind = 2; }
                 else if (it.small) { kind = 1; }
                 if (kind != curKind && sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
                 curKind = kind;
@@ -289,10 +300,128 @@ public class Ribbon {
                     if (sIdx % rows == 0) { cx = cx + colW; }
                 }
             }
+            // 整组被丢空：连标题和分隔线都不画（空壳更难看）。
+            if (kept == 0) { continue; }
             if (sIdx % rows != 0) { cx = cx + curW; }
             cx = cx + t.paddingSmall * 2 + 1;
         }
         return cx + t.paddingSmall;
+    }
+
+    // 不降级时的条带宽度（宿主用来量右端还剩多少空位）。
+    static int BandWidth(App app, List<RibbonGroup> groups, int bh, int rows) {
+        return Ribbon.BandWidthFit(app, groups, bh, rows, Ribbon.FitNone(groups));
+    }
+
+    // 降级排布下的实际条带宽度（宿主量位置要用这个，否则会
+    // 按未降级的宽度算，文字压在图标上）。
+    static int BandWidthFitted(App app, List<RibbonGroup> groups, int bh,
+                               int rows, int w) {
+        return Ribbon.BandWidthFit(app, groups, bh, rows,
+            Ribbon.Fit(app, groups, bh, rows, w));
+    }
+
+    // 该组里还有带文字的小命令吗（没有就别降级它）。
+    static bool HasLabeledSmall(RibbonGroup grp) {
+        for (int m = 0; m < grp.items.Count; m = m + 1) {
+            RibbonItem mi = grp.items[m];
+            if (mi.small && !mi.tile) { return true; }
+        }
+        return false;
+    }
+
+    // 跨组的第 n 个命令（按全局序号取；越界返回 null）。
+    static RibbonItem ItemAt(List<RibbonGroup> groups, int flat) {
+        int n = 0;
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            RibbonGroup grp = groups[g];
+            for (int j = 0; j < grp.items.Count; j = j + 1) {
+                if (n == flat) { return grp.items[j]; }
+                n = n + 1;
+            }
+        }
+        return null;
+    }
+
+    // 第 g 组第一个命令的全局序号。
+    static int GroupStart(List<RibbonGroup> groups, int g) {
+        int n = 0;
+        int i = 0;
+        while (i < g && i < groups.Count) {
+            n = n + groups[i].items.Count;
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // 该组降级后还剩几个命令（没被丢掉的）。
+    static int VisibleCount(RibbonGroup grp, int start, RibbonFit fit) {
+        int n = 0;
+        for (int j = 0; j < grp.items.Count; j = j + 1) {
+            bool gone = fit.dropped.Count > start + j ? fit.dropped[start + j] : false;
+            if (!gone) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 空降级表（不收图标格、不丢命令）。
+    static RibbonFit FitNone(List<RibbonGroup> groups) {
+        RibbonFit fit = new RibbonFit();
+        int g = 0;
+        while (g < groups.Count) {
+            fit.compact.Add(false);
+            RibbonGroup grp = groups[g];
+            int j = 0;
+            while (j < grp.items.Count) { fit.dropped.Add(false); j = j + 1; }
+            g = g + 1;
+        }
+        return fit;
+    }
+
+    // 宽度不够时怎么降级。
+    //
+    // 过去是"一刀切"：所有带文字的小命令同时变成图标格——哪怕
+    // 左边那几组本来放得下，整条带子也退化成一排认不出的图标；
+    // 而且降级直接改宿主的 RibbonItem（`tile = true`），命令对象
+    // 是共享的，窄过一次就再也回不去。
+    //
+    // 现在**从右边的组往左**逐组处理，每组两步：
+    //   一、丢掉该组的低价值命令（命令自己标了 optional，在别处
+    //     都有入口）——宁可少几个按钮，也别把半个命令画在边上；
+    //   二、还放不下，再把该组带文字的小命令收成图标格（标签退
+    //     到提示气泡里）。
+    // 右边的组处理完还放不下，才动更左边的组——左边是主操作区，
+    // 它的文字标签最后才让位。整组被丢空时整组不画（空组带个
+    // 标题和分隔线反而更难看）。
+    //
+    // 降级只落在本帧的排布视图里（宿主命令对象不动，窗口拉宽就
+    // 恢复文字标签）。
+    static RibbonFit Fit(App app, List<RibbonGroup> groups, int bh,
+                         int rows, int w) {
+        RibbonFit fit = Ribbon.FitNone(groups);
+        int need = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+        int gi = groups.Count - 1;
+        while (gi >= 0 && need > w) {
+            RibbonGroup grp = groups[gi];
+            int start = Ribbon.GroupStart(groups, gi);
+            // 一、丢该组的低价值命令（从该组最右的一条往前找）。
+            int idx = start + grp.items.Count - 1;
+            while (idx >= start && need > w) {
+                RibbonItem it = Ribbon.ItemAt(groups, idx);
+                if (it != null && it.optional) {
+                    fit.dropped[idx] = true;
+                    need = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+                }
+                idx = idx - 1;
+            }
+            // 二、还放不下：该组带文字的小命令收成图标格。
+            if (need > w && Ribbon.HasLabeledSmall(grp)) {
+                fit.compact[gi] = true;
+                need = Ribbon.BandWidthFit(app, groups, bh, rows, fit);
+            }
+            gi = gi - 1;
+        }
+        return fit;
     }
 
     // 分组条带本体，标签式和无标签式功能区共用；
@@ -323,18 +452,11 @@ public class Ribbon {
         c.FillRect(x, by, w, bh, surfaceStyle.BgOr(0));
         c.FillRect(x, by + bh - 1, w, 1, dividerStyle.BgOr(0));
 
-        // 宿主给的宽度放不下时先把带文字的命令收成纯图标格
-        // （标签退到提示气泡里），再不够就裁掉——命令绝不
-        // 画到条带外面去。
-        if (Ribbon.BandWidth(app, groups, bh, rows) > w) {
-            for (int cg = 0; cg < groups.Count; cg = cg + 1) {
-                RibbonGroup cgrp = groups[cg];
-                for (int ci = 0; ci < cgrp.items.Count; ci = ci + 1) {
-                    RibbonItem cit = cgrp.items[ci];
-                    if (cit.small && !cit.tile) { cit.tile = true; }
-                }
-            }
-        }
+        // 宿主给的宽度放不下时降级排布：从右边的组开始逐组收成
+        // 纯图标格（标签退到提示气泡里），左边的主操作区保留文字；
+        // 还放不下就丢掉右边的低价值命令，而不是把半个命令画在
+        // 条带边上。降级只写进本帧的排布视图，不改宿主的命令对象。
+        RibbonFit fit = Ribbon.Fit(app, groups, bh, rows, w);
         c.PushClip(x, by, w, bh);
 
         int titleH = app.Scale(16);
@@ -346,9 +468,12 @@ public class Ribbon {
         Ribbon.tipBaseY = by + bh;
         int clicked = 0 - 1;
         int baseIdx = 0;
+        int flat = 0;
         for (int g = 0; g < groups.Count; g = g + 1) {
             RibbonGroup grp = groups[g];
             int groupStartX = cx;
+            // 该组是否降级成图标格（宽度不够时从右往左逐组降）。
+            bool cp = fit.compact.Count > g ? fit.compact[g] : false;
 
             // 三种排布共用一套列游标：小命令是 rows 行的
             // 标签行列，图标格是 rows 行的方钮列（一列可以
@@ -362,12 +487,20 @@ public class Ribbon {
             // 一组里的小命令用同一个列宽（组内最宽的
             // 标签决定），这样每列的图标和文字都对齐，
             // 长标签也不会被邻列压住。
-            int smallW = Ribbon.SmallColW(app, grp);
+            int smallW = Ribbon.SmallColW(app, grp, cp);
+            int kept = 0;
             for (int j = 0; j < grp.items.Count; j = j + 1) {
                 RibbonItem it = grp.items[j];
                 int id = firstId + baseIdx + j;
+                // 被降级丢弃的命令：不画、不占位、不可点（点击索引
+                // 仍按原序号，宿主那份动作表不用改）。
+                bool gone = fit.dropped.Count > flat ? fit.dropped[flat] : false;
+                flat = flat + 1;
+                if (gone) { continue; }
+                kept = kept + 1;
                 int kind = 0;
-                if (it.tile) { kind = 2; }
+                bool asTile = it.tile || (cp && it.small);
+                if (asTile) { kind = 2; }
                 else if (it.small) { kind = 1; }
                 if (kind != curKind && sIdx % rows != 0) {
                     cx = cx + curW;
@@ -378,9 +511,9 @@ public class Ribbon {
                     if (sIdx % rows != 0) { cx = cx + curW; sIdx = 0; }
                     int lw = app.Scale(64);
                     Ribbon.PaintItem(app, id, it, cx, contentTop + gap / 2,
-                        lw - gap, contentH - gap, false, hoverStyle, activeStyle,
-                        textStyle, mutedStyle, accentStyle, accentHoverStyle,
-                        disabledStyle);
+                        lw - gap, contentH - gap, false, false, hoverStyle,
+                        activeStyle, textStyle, mutedStyle, accentStyle,
+                        accentHoverStyle, disabledStyle);
                     if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
                     cx = cx + lw;
                 } else {
@@ -389,13 +522,18 @@ public class Ribbon {
                     curW = colW;
                     int ry = contentTop + (sIdx % rows) * rowH;
                     Ribbon.PaintItem(app, id, it, cx, ry + gap / 2,
-                        colW - gap, rowH - gap, true, hoverStyle, activeStyle,
-                        textStyle, mutedStyle, accentStyle, accentHoverStyle,
-                        disabledStyle);
+                        colW - gap, rowH - gap, asTile, true, hoverStyle,
+                        activeStyle, textStyle, mutedStyle, accentStyle,
+                        accentHoverStyle, disabledStyle);
                     if (Ribbon.ItemClicked(app, id, it)) { clicked = baseIdx + j; }
                     sIdx = sIdx + 1;
                     if (sIdx % rows == 0) { cx = cx + colW; }
                 }
+            }
+            // 整组被丢空：标题和分隔线都不画（空壳更难看）。
+            if (kept == 0) {
+                baseIdx = baseIdx + grp.items.Count;
+                continue;
             }
             if (sIdx % rows != 0) { cx = cx + curW; }
 
@@ -415,12 +553,13 @@ public class Ribbon {
     }
 
     // 绘制单个命令项（大 / 小行 / 纯图标格三种形态），
-    // 处理悬停/按下淡变与悬停提示。
+    // 处理悬停/按下淡变与悬停提示。`asTile` 为真时按纯图标格
+    // 画（降级后的形态，与命令自身的 tile 标记无关）。
     static void PaintItem(App app, int id, RibbonItem it, int x, int y, int w, int h,
-                          bool small, StyleBox hoverStyle, StyleBox activeStyle,
-                          StyleBox textStyle, StyleBox mutedStyle,
-                          StyleBox accentStyle, StyleBox accentHoverStyle,
-                          StyleBox disabledStyle) {
+                          bool asTile, bool small, StyleBox hoverStyle,
+                          StyleBox activeStyle, StyleBox textStyle,
+                          StyleBox mutedStyle, StyleBox accentStyle,
+                          StyleBox accentHoverStyle, StyleBox disabledStyle) {
         Canvas c = app.canvas;
         Theme t = app.theme;
         int fontSize = textStyle.FontOr(Style.FontFallback(app, "small"));
@@ -453,7 +592,7 @@ public class Ribbon {
         }
         if (!it.enabled) { color = disabledStyle.FgOr(0); }
 
-        if (it.tile) {
+        if (asTile) {
             int isz = t.iconSizeSmall;
             int aw = 0;
             if (it.menu) { aw = app.Scale(8); }

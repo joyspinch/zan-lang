@@ -1,0 +1,93 @@
+using System;
+using Gui;
+using Gui.Widget;
+
+// 功能区在宽度不够时怎么降级（Ribbon.Fit 的契约）：
+//   1) 宽度够：命令原样——不降级、不丢；
+//   2) 不够时**先丢右边的低价值命令**（命令自己标了 optional），
+//      仍然不够才把带文字的小命令收成图标格——右边���组先收，
+//      左边（主操作区）的文字标签最后才让位；
+//   3) 降级只落在本帧的排布视图里：宿主给的命令对象不被改
+//      （"窄过一次就再也回不去"的老毛病不许复现）；
+//   4) 被丢的命令不占位——条带宽度会真的变小。
+class RibbonFitTest {
+    static int fails;
+
+    static void Chk(bool ok, string what) {
+        if (ok) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Say(string key, bool v) {
+        Console.WriteLine(key + " " + (v ? "yes" : "no"));
+    }
+
+    // 文件组（一个大命令 + 两个带文字的小命令）、运行组（两个大
+    // 命令）、应用组（一个普通命令 + 一个低价值命令）。
+    static List<RibbonGroup> Groups() {
+        List<RibbonGroup> groups = new List<RibbonGroup>();
+        RibbonGroup file = new RibbonGroup("File");
+        file.Add(RibbonItem.Large("plus", "Project"));
+        file.Add(RibbonItem.Small("file", "New"));
+        file.Add(RibbonItem.Small("folder", "Open"));
+        groups.Add(file);
+        RibbonGroup run = new RibbonGroup("Run");
+        run.Add(RibbonItem.Large("play", "Run"));
+        run.Add(RibbonItem.Large("bug", "Debug"));
+        groups.Add(run);
+        RibbonGroup shell = new RibbonGroup("App");
+        shell.Add(RibbonItem.Large("settings", "Settings"));
+        shell.Add(RibbonItem.Large("info", "Help").SetOptional());
+        groups.Add(shell);
+        return groups;
+    }
+
+    static void Main() {
+        App app = App.CreateOffscreen("ribbon fit", 900, 300);
+        int bh = 96;
+        List<RibbonGroup> groups = Groups();
+        int full = Ribbon.BandWidth(app, groups, bh, 3);
+        // 跨组的命令序号：文件 0-2、运行 3-4、应用 5-6（6 是低价值命令）。
+        int optIdx = 6;
+
+        // 1) 宽度够：原样。
+        RibbonFit wide = Ribbon.Fit(app, groups, bh, 3, full);
+        bool wideOk = Ribbon.BandWidthFit(app, groups, bh, 3, wide) <= full
+            && !wide.compact[0] && !wide.dropped[optIdx];
+        Say("wide-untouched", wideOk);
+        Chk(wideOk, "wide band keeps every command as it is");
+
+        // 2) 低价值命令先退场：只丢它就放得下的宽度里，不该再
+        //    动小命令的标签。
+        RibbonFit onlyDrop = Ribbon.FitNone(groups);
+        onlyDrop.dropped[optIdx] = true;
+        int afterDrop = Ribbon.BandWidthFit(app, groups, bh, 3, onlyDrop);
+        RibbonFit at = Ribbon.Fit(app, groups, bh, 3, afterDrop);
+        bool dropFirst = at.dropped[optIdx] && !at.compact[0];
+        Say("optional-first", dropFirst);
+        Chk(dropFirst, "optional command retreats before labels do");
+
+        // 3) 还是放不下：小命令收成图标格。
+        RibbonFit tight = Ribbon.Fit(app, groups, bh, 3, afterDrop - 60);
+        bool compacted = tight.compact[0];
+        Say("labels-compacted", compacted);
+        Chk(compacted, "labeled small commands compact when it still does not fit");
+
+        // 4) 降级不改宿主的命令对象。
+        bool untouched = !groups[0].items[1].tile && !groups[0].items[2].tile;
+        Say("host-untouched", untouched);
+        Chk(untouched, "host command objects are never mutated");
+
+        // 5) 被丢的命令不占位。
+        bool freed = Ribbon.BandWidthFit(app, groups, bh, 3, tight) < full;
+        Say("width-freed", freed);
+        Chk(freed, "dropped commands stop taking space");
+
+        if (fails == 0) {
+            Console.WriteLine("gui ribbon fit OK");
+        } else {
+            Console.WriteLine("gui ribbon fit FAILS " + Convert.ToString(fails));
+        }
+    }
+}
