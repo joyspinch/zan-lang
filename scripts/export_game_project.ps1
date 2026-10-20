@@ -100,10 +100,15 @@ if ($SourceRef) {
     $archiveRoot = Join-Path ([IO.Path]::GetTempPath()) ("zan-export-" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $archiveRoot | Out-Null
     $archivePaths = @("templates/$Template")
-    if (Test-Path (Join-Path $repo (Norm $testRel))) { $archivePaths += $testRel }
-    foreach ($sibling in $SiblingPaths) { $archivePaths += $sibling }
-    foreach ($top in $TopTests) { $archivePaths += $top }
-    foreach ($extra in ($ExtraFiles -split ';' | Where-Object { $_ -ne '' })) { $archivePaths += ($extra -split '=', 2)[0] }
+    # 候选路径按**标签里有没有**来定，不能只看当前工作树：模板搬出仓库后
+    # 工作树里已经没有源目录，但标签里还带着配套测试与兄弟目录。
+    $candidates = @($testRel) + $SiblingPaths + $TopTests +
+        @($ExtraFiles -split ';' | Where-Object { $_ -ne '' } | ForEach-Object { ($_ -split '=', 2)[0] })
+    foreach ($p in $candidates) {
+        $entry = & git ls-tree $SourceRef -- $p 2>$null
+        if ($entry) { $archivePaths += $p }
+        else { Write-Host "   标签 $SourceRef 里没有 $p（跳过）" }
+    }
     Push-Location $repo
     try {
         $zip = Join-Path $archiveRoot 'src.zip'
@@ -313,6 +318,41 @@ if (Test-Path $serverDir) { Retire-Template $serverDir "$templateName-server" }
 # 用**单引号** here-string（不做插值）写死文案，再用占位符回填：
 # 双引号 here-string 里 markdown 代码围栏的第三个反引号会转义换行，
 # 把收尾的 "@ 吞进字符串——解析器报 "missing the terminator" 就是这个坑。
+# 文案按**实际导出了什么**拼：没有服务端就别写服务端，没有跨端用例也别写
+# 跨端用例——照抄模板会让读文档的人以为少了东西。
+$treeLines = @('    {{NAME}}/')
+$treeLines += '      client/      客户端：src/ assets/ data/ tools/'
+if (Test-Path (Join-Path $clientDir 'tests')) {
+    $treeLines += '                   客户端用例在 client/tests/'
+}
+if (Test-Path $serverDir) {
+    $treeLines += "      $SiblingAlias/  服务端：源码、规则表副本、服务端工具"
+}
+if (Test-Path $topTestDir) {
+    $treeLines += '      tests/       跨端用例（同时读客户端与服务端）'
+}
+$testCmds = @()
+if (Test-Path (Join-Path $clientDir 'tools/test.ps1')) {
+    $testCmds += 'pwsh -File client/tools/test.ps1     # 客户端用例'
+}
+if (Test-Path $topTestDir) {
+    $testCmds += 'python tests/test_rules_sync.py      # 跨端用例（规则表同步）'
+}
+$serverSection = ''
+if (Test-Path $serverDir) {
+    $serverSection = @'
+
+## 服务端
+
+服务端规则表由客户端数据单向同步：
+
+```powershell
+python {{SERVER}}/tools/sync_rules.py            # 同步
+python {{SERVER}}/tools/sync_rules.py --check    # 只校验漂移
+```
+'@
+}
+
 $projectDoc = @'
 # {{NAME}} —— 独立项目
 
@@ -321,10 +361,7 @@ $projectDoc = @'
 
 ## 目录
 
-    {{NAME}}/
-      client/      客户端：src/ assets/ data/ tools/，客户端用例在 client/tests/
-      {{SERVER}}/  服务端：源码、规则表副本、服务端工具
-      tests/       跨端用例（同时读客户端与服务端）
+{{TREE}}
 
 所有命令都在**项目根**下执行（路径一律相对项目根）。
 
@@ -352,20 +389,14 @@ Copy-Item -Recurse <zan-lang>/packages/<Name> packages/<Name>
 ## 测试
 
 ```powershell
-pwsh -File client/tools/test.ps1     # 客户端用例（Python 回归 + 无头模型用例）
-python tests/test_rules_sync.py      # 跨端用例（规则表同步）
+{{TESTCMDS}}
 ```
-
-## 服务端
-
-服务端规则表由客户端数据单向同步：
-
-```powershell
-python {{SERVER}}/tools/sync_rules.py            # 同步
-python {{SERVER}}/tools/sync_rules.py --check    # 只校验漂移
-```
+{{SERVERSECTION}}
 '@
-$projectDoc = $projectDoc.Replace('{{NAME}}', $templateName).
+$projectDoc = $projectDoc.Replace('{{TREE}}', ($treeLines -join "`n")).
+    Replace('{{TESTCMDS}}', ($testCmds -join "`n")).
+    Replace('{{SERVERSECTION}}', $serverSection).
+    Replace('{{NAME}}', $templateName).
     Replace('{{TEMPLATE}}', $Template).
     Replace('{{DATE}}', (Get-Date -Format 'yyyy-MM-dd')).
     Replace('{{SERVER}}', $SiblingAlias)
