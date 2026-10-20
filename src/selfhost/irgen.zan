@@ -479,6 +479,96 @@ partial class Irgen {
         H("}");
     }
 
+    // The NativeMemory digest intrinsic (the C host's emit_nm_digest): the
+    // hardware kernel writes the raw digest into a scratch buffer; the value
+    // is a string of those raw bytes, or null when the kernel is unavailable.
+    ExprVal NmDigest(Node e, string kernel, int dlen) {
+        ExprVal p = GenExpr(e.kids[0]);
+        ExprVal len = GenExpr(e.kids[1]);
+        // a negative length would underflow the digest buffer: clamp it
+        string neg = NT();
+        L("  " + neg + " = icmp slt i64 " + len.op + ", 0");
+        string clen = NT();
+        L("  " + clen + " = select i1 " + neg + ", i64 0, i64 " + len.op);
+        string buf = NT();
+        L("  " + buf + " = alloca [" + dlen + " x i8], align 8");
+        if (!ExternSeen(kernel)) {
+            externDecls.Add(kernel);
+            H("declare i64 @" + kernel + "(i8*, i64, i8*)");
+        }
+        string st = NT();
+        L("  " + st + " = call i64 @" + kernel + "(i8* " + NmAddr(p, "0")
+          + ", i64 " + clen + ", i8* " + buf + ")");
+        string ok = NT();
+        L("  " + ok + " = icmp sge i64 " + st + ", 0");
+        int lHas = NL(); int lNone = NL(); int lDone = NL();
+        L("  br i1 " + ok + ", label %L" + lHas + ", label %L" + lNone);
+        Label(lHas);
+        string s = NT();
+        L("  " + s + " = call i8* @zstr_new(i64 " + dlen + ")");
+        L("  call void @memcpy(i8* " + s + ", i8* " + buf + ", i64 " + dlen + ")");
+        L("  br label %L" + lDone);
+        Label(lNone);
+        L("  br label %L" + lDone);
+        Label(lDone);
+        string r = NT();
+        L("  " + r + " = phi i8* [ " + s + ", %L" + lHas + " ], [ null, %L" + lNone + " ]");
+        return new ExprVal(r, MkType("string"));
+    }
+
+    // ---- NativeMemory runtime helpers ----
+    // The C host lowers these intrinsics to calls into the zan_hw_* runtime
+    // helpers (src/compiler/irgen_expr.c); the argument list below is already
+    // in the runtime's own parameter order, which differs from the order the
+    // Zan-level method declares its arguments in.
+    // Build the argument list of a call. LLVM's text form wants every
+    // argument as a typed value ("i8* %p", "i64 16", "i32 %t5"); the bare
+    // values come from the lowering, their types from the runtime signature.
+    string NmArgs(string ptypes, List<string> args) {
+        string a = "";
+        int i = 0;
+        int p = 0;
+        while (i < args.Count) {
+            string ty = "";
+            int k = p;
+            while (k < ptypes.Length) {
+                if (ptypes[k] == ',') { break; }
+                if (ptypes[k] != ' ') { ty = ty + ptypes[k]; }
+                k = k + 1;
+            }
+            if (i > 0) { a = a + ", "; }
+            a = a + ty + " " + args[i];
+            p = k + 1;
+            i = i + 1;
+        }
+        return a;
+    }
+
+    ExprVal NmCall(string sym, string retTy, string ptypes, List<string> args, string zanTy) {
+        if (!ExternSeen(sym)) {
+            externDecls.Add(sym);
+            H("declare " + retTy + " @" + sym + "(" + ptypes + ")");
+        }
+        string r = NT();
+        L("  " + r + " = call " + retTy + " @" + sym + "(" + NmArgs(ptypes, args) + ")");
+        return new ExprVal(r, MkType(zanTy));
+    }
+
+    void NmCallVoid(string sym, string ptypes, List<string> args) {
+        if (!ExternSeen(sym)) {
+            externDecls.Add(sym);
+            H("declare void @" + sym + "(" + ptypes + ")");
+        }
+        L("  call void @" + sym + "(" + NmArgs(ptypes, args) + ")");
+    }
+
+    // an integer argument narrowed to the 32-bit slot the runtime expects
+    string NmI32(ExprVal v) {
+        string r = NT();
+        L("  " + r + " = trunc i64 " + v.op + " to i32");
+        return r;
+    }
+
     // Lower a NativeMemory.<Method>(...) call inline, mirroring the C host.
     // Returns null when the call is not a recognised intrinsic.
     ExprVal GenNativeMemory(Node callee, Node e) {
@@ -636,6 +726,17 @@ partial class Irgen {
             L("  " + r + " = select i1 " + over + ", i64 " + n.op + ", i64 " + run);
             return new ExprVal(r, MkType("int"));
         }
+        if ((m == "Sha256" || m == "Sha1" || m == "Sha512" || m == "Sm3") && argc == 2) {
+            // the digest intrinsics: the C host's emit_nm_digest. The kernel
+            // writes the RAW digest bytes into a scratch buffer; on success
+            // the value is a string of those bytes, on failure (the hardware
+            // kernel is unavailable) it is null.
+            string kern = "zan_hw_sha256"; int dlen = 32;
+            if (m == "Sha1") { kern = "zan_hw_sha1"; dlen = 20; }
+            else if (m == "Sha512") { kern = "zan_hw_sha512"; dlen = 64; }
+            else if (m == "Sm3") { kern = "zan_hw_sm3"; dlen = 32; }
+            return NmDigest(e, kern, dlen);
+        }
         if (m == "Base64Encode" && argc == 2) {
             // Base64Encode(ptr, size) -> heap string (length = ((len+2)/3)*4 + 1)
             ExprVal p = GenExpr(e.kids[0]);
@@ -673,6 +774,223 @@ partial class Irgen {
             string w = NT();
             L("  " + w + " = call i64 @zan_hw_base64_decode(i8* " + NmAddr(src, "0") + ", i64 " + size.op + ", i8* " + NmAddr(dst, "0") + ")");
             return new ExprVal(w, MkType("int"));
+        }
+        if (m == "AesCbcEncrypt" && argc == 6) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]); ExprVal key = GenExpr(e.kids[3]);
+            ExprVal keybits = GenExpr(e.kids[4]); ExprVal iv = GenExpr(e.kids[5]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(src, "0")); a.Add(size.op); a.Add(NmAddr(key, "0"));
+            a.Add(NmI32(keybits)); a.Add(NmAddr(iv, "0")); a.Add(NmAddr(dst, "0"));
+            return NmCall("zan_hw_aes_cbc_encrypt", "i64", "i8*, i64, i8*, i32, i8*, i8*", a, "long");
+        }
+        if (m == "AesCbcDecrypt" && argc == 6) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]); ExprVal key = GenExpr(e.kids[3]);
+            ExprVal keybits = GenExpr(e.kids[4]); ExprVal iv = GenExpr(e.kids[5]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(src, "0")); a.Add(size.op); a.Add(NmAddr(key, "0"));
+            a.Add(NmI32(keybits)); a.Add(NmAddr(iv, "0")); a.Add(NmAddr(dst, "0"));
+            return NmCall("zan_hw_aes_cbc_decrypt", "i64", "i8*, i64, i8*, i32, i8*, i8*", a, "long");
+        }
+        if (m == "AesEcbBlock" && argc == 4) {
+            ExprVal key = GenExpr(e.kids[0]); ExprVal keybits = GenExpr(e.kids[1]);
+            ExprVal in16 = GenExpr(e.kids[2]); ExprVal out16 = GenExpr(e.kids[3]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(key, "0")); a.Add(NmI32(keybits));
+            a.Add(NmAddr(in16, "0")); a.Add(NmAddr(out16, "0"));
+            return NmCall("zan_hw_aes_ecb_block", "i64", "i8*, i32, i8*, i8*", a, "long");
+        }
+        if (m == "AesCtrCrypt" && argc == 6) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]); ExprVal key = GenExpr(e.kids[3]);
+            ExprVal keybits = GenExpr(e.kids[4]); ExprVal counter = GenExpr(e.kids[5]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(src, "0")); a.Add(size.op); a.Add(NmAddr(key, "0"));
+            a.Add(NmI32(keybits)); a.Add(NmAddr(counter, "0")); a.Add(NmAddr(dst, "0"));
+            return NmCall("zan_hw_aes_ctr_crypt", "i64", "i8*, i64, i8*, i32, i8*, i8*", a, "long");
+        }
+        if (m == "AesGcmEncrypt" && argc == 9) {
+            ExprVal key = GenExpr(e.kids[0]); ExprVal keybits = GenExpr(e.kids[1]);
+            ExprVal iv = GenExpr(e.kids[2]); ExprVal aad = GenExpr(e.kids[3]);
+            ExprVal aadLen = GenExpr(e.kids[4]); ExprVal inBuf = GenExpr(e.kids[5]);
+            ExprVal inLen = GenExpr(e.kids[6]); ExprVal outBuf = GenExpr(e.kids[7]);
+            ExprVal tag16 = GenExpr(e.kids[8]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(key, "0")); a.Add(NmI32(keybits)); a.Add(NmAddr(iv, "0"));
+            a.Add(NmAddr(aad, "0")); a.Add(aadLen.op); a.Add(NmAddr(inBuf, "0"));
+            a.Add(inLen.op); a.Add(NmAddr(outBuf, "0")); a.Add(NmAddr(tag16, "0"));
+            return NmCall("zan_hw_aes_gcm_encrypt", "i64", "i8*, i32, i8*, i8*, i64, i8*, i64, i8*, i8*", a, "long");
+        }
+        if (m == "AesGcmDecrypt" && argc == 9) {
+            ExprVal key = GenExpr(e.kids[0]); ExprVal keybits = GenExpr(e.kids[1]);
+            ExprVal iv = GenExpr(e.kids[2]); ExprVal aad = GenExpr(e.kids[3]);
+            ExprVal aadLen = GenExpr(e.kids[4]); ExprVal inBuf = GenExpr(e.kids[5]);
+            ExprVal inLen = GenExpr(e.kids[6]); ExprVal tag16 = GenExpr(e.kids[7]);
+            ExprVal outBuf = GenExpr(e.kids[8]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(key, "0")); a.Add(NmI32(keybits)); a.Add(NmAddr(iv, "0"));
+            a.Add(NmAddr(aad, "0")); a.Add(aadLen.op); a.Add(NmAddr(inBuf, "0"));
+            a.Add(inLen.op); a.Add(NmAddr(tag16, "0")); a.Add(NmAddr(outBuf, "0"));
+            return NmCall("zan_hw_aes_gcm_decrypt", "i64", "i8*, i32, i8*, i8*, i64, i8*, i64, i8*, i8*", a, "long");
+        }
+        if (m == "AesGcmInit" && argc == 4) {
+            ExprVal ctxBuf = GenExpr(e.kids[0]); ExprVal ctxLen = GenExpr(e.kids[1]);
+            ExprVal key = GenExpr(e.kids[2]); ExprVal keybits = GenExpr(e.kids[3]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(ctxBuf, "0")); a.Add(ctxLen.op);
+            a.Add(NmAddr(key, "0")); a.Add(NmI32(keybits));
+            return NmCall("zan_hw_aes_gcm_init", "i64", "i8*, i64, i8*, i32", a, "long");
+        }
+        if (m == "AesGcmEncryptCtx" && argc == 8) {
+            ExprVal ctxBuf = GenExpr(e.kids[0]); ExprVal iv = GenExpr(e.kids[1]);
+            ExprVal aad = GenExpr(e.kids[2]); ExprVal aadLen = GenExpr(e.kids[3]);
+            ExprVal inBuf = GenExpr(e.kids[4]); ExprVal inLen = GenExpr(e.kids[5]);
+            ExprVal outBuf = GenExpr(e.kids[6]); ExprVal tag16 = GenExpr(e.kids[7]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(ctxBuf, "0")); a.Add(NmAddr(iv, "0")); a.Add(NmAddr(aad, "0"));
+            a.Add(aadLen.op); a.Add(NmAddr(inBuf, "0")); a.Add(inLen.op);
+            a.Add(NmAddr(outBuf, "0")); a.Add(NmAddr(tag16, "0"));
+            return NmCall("zan_hw_aes_gcm_encrypt_ctx", "i64", "i8*, i8*, i8*, i64, i8*, i64, i8*, i8*", a, "long");
+        }
+        if (m == "AesGcmDecryptCtx" && argc == 8) {
+            ExprVal ctxBuf = GenExpr(e.kids[0]); ExprVal iv = GenExpr(e.kids[1]);
+            ExprVal aad = GenExpr(e.kids[2]); ExprVal aadLen = GenExpr(e.kids[3]);
+            ExprVal inBuf = GenExpr(e.kids[4]); ExprVal inLen = GenExpr(e.kids[5]);
+            ExprVal tag16 = GenExpr(e.kids[6]); ExprVal outBuf = GenExpr(e.kids[7]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(ctxBuf, "0")); a.Add(NmAddr(iv, "0")); a.Add(NmAddr(aad, "0"));
+            a.Add(aadLen.op); a.Add(NmAddr(inBuf, "0")); a.Add(inLen.op);
+            a.Add(NmAddr(tag16, "0")); a.Add(NmAddr(outBuf, "0"));
+            return NmCall("zan_hw_aes_gcm_decrypt_ctx", "i64", "i8*, i8*, i8*, i64, i8*, i64, i8*, i8*", a, "long");
+        }
+        if (m == "GhashBlock" && argc == 3) {
+            ExprVal h = GenExpr(e.kids[0]); ExprVal x = GenExpr(e.kids[1]);
+            ExprVal y = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(h, "0")); a.Add(NmAddr(x, "0")); a.Add(NmAddr(y, "0"));
+            return NmCall("zan_hw_ghash_block", "i64", "i8*, i8*, i8*", a, "long");
+        }
+        if (m == "GhashUpdate" && argc == 4) {
+            ExprVal h = GenExpr(e.kids[0]); ExprVal data = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]); ExprVal y = GenExpr(e.kids[3]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(h, "0")); a.Add(NmAddr(data, "0"));
+            a.Add(len.op); a.Add(NmAddr(y, "0"));
+            return NmCall("zan_hw_ghash_update", "i64", "i8*, i8*, i64, i8*", a, "long");
+        }
+        if (m == "RsaModPow" && argc == 7) {
+            ExprVal basev = GenExpr(e.kids[0]); ExprVal bLen = GenExpr(e.kids[1]);
+            ExprVal expVal = GenExpr(e.kids[2]); ExprVal eLen = GenExpr(e.kids[3]);
+            ExprVal modv = GenExpr(e.kids[4]); ExprVal mLen = GenExpr(e.kids[5]);
+            ExprVal outBuf = GenExpr(e.kids[6]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(basev, "0")); a.Add(bLen.op); a.Add(NmAddr(expVal, "0"));
+            a.Add(eLen.op); a.Add(NmAddr(modv, "0")); a.Add(mLen.op); a.Add(NmAddr(outBuf, "0"));
+            return NmCall("zan_hw_rsa_mod_pow", "i64", "i8*, i64, i8*, i64, i8*, i64, i8*", a, "long");
+        }
+        if (m == "RsaCrtModPow" && argc == 14) {
+            ExprVal msg = GenExpr(e.kids[0]); ExprVal mLen = GenExpr(e.kids[1]);
+            ExprVal p = GenExpr(e.kids[2]); ExprVal pLen = GenExpr(e.kids[3]);
+            ExprVal q = GenExpr(e.kids[4]); ExprVal qLen = GenExpr(e.kids[5]);
+            ExprVal dp = GenExpr(e.kids[6]); ExprVal dpLen = GenExpr(e.kids[7]);
+            ExprVal dq = GenExpr(e.kids[8]); ExprVal dqLen = GenExpr(e.kids[9]);
+            ExprVal qinv = GenExpr(e.kids[10]); ExprVal qinvLen = GenExpr(e.kids[11]);
+            ExprVal outBuf = GenExpr(e.kids[12]); ExprVal outLen = GenExpr(e.kids[13]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(msg, "0")); a.Add(mLen.op); a.Add(NmAddr(p, "0")); a.Add(pLen.op);
+            a.Add(NmAddr(q, "0")); a.Add(qLen.op); a.Add(NmAddr(dp, "0")); a.Add(dpLen.op);
+            a.Add(NmAddr(dq, "0")); a.Add(dqLen.op); a.Add(NmAddr(qinv, "0")); a.Add(qinvLen.op);
+            a.Add(NmAddr(outBuf, "0")); a.Add(outLen.op);
+            return NmCall("zan_hw_rsa_crt", "i64", "i8*, i64, i8*, i64, i8*, i64, i8*, i64, i8*, i64, i8*, i64, i8*, i64", a, "long");
+        }
+        if (m == "X25519" && argc == 3) {
+            ExprVal scalar = GenExpr(e.kids[0]); ExprVal point = GenExpr(e.kids[1]);
+            ExprVal outBuf = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(scalar, "0")); a.Add(NmAddr(point, "0")); a.Add(NmAddr(outBuf, "0"));
+            return NmCall("zan_hw_x25519", "i64", "i8*, i8*, i8*", a, "long");
+        }
+        if (m == "Sm4CbcEncrypt" && argc == 5) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]); ExprVal key = GenExpr(e.kids[3]);
+            ExprVal iv = GenExpr(e.kids[4]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(src, "0")); a.Add(size.op); a.Add(NmAddr(key, "0"));
+            a.Add(NmAddr(iv, "0")); a.Add(NmAddr(dst, "0"));
+            return NmCall("zan_hw_sm4_cbc_encrypt", "i64", "i8*, i64, i8*, i8*, i8*", a, "long");
+        }
+        if (m == "Sm4CbcDecrypt" && argc == 5) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal size = GenExpr(e.kids[2]); ExprVal key = GenExpr(e.kids[3]);
+            ExprVal iv = GenExpr(e.kids[4]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(src, "0")); a.Add(size.op); a.Add(NmAddr(key, "0"));
+            a.Add(NmAddr(iv, "0")); a.Add(NmAddr(dst, "0"));
+            return NmCall("zan_hw_sm4_cbc_decrypt", "i64", "i8*, i64, i8*, i8*, i8*", a, "long");
+        }
+        if (m == "JsonSkipWhitespace" && argc == 3) {
+            ExprVal ptr = GenExpr(e.kids[0]); ExprVal pos = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(ptr, "0")); a.Add(pos.op); a.Add(len.op);
+            return NmCall("zan_hw_json_skip_whitespace", "i64", "i8*, i64, i64", a, "long");
+        }
+        if (m == "JsonScanString" && argc == 3) {
+            ExprVal ptr = GenExpr(e.kids[0]); ExprVal pos = GenExpr(e.kids[1]);
+            ExprVal len = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(ptr, "0")); a.Add(pos.op); a.Add(len.op);
+            return NmCall("zan_hw_json_scan_string", "i64", "i8*, i64, i64", a, "long");
+        }
+        if (m == "Load64" && argc == 2) {
+            // an unaligned 8-byte scalar load
+            ExprVal p = GenExpr(e.kids[0]); ExprVal off = GenExpr(e.kids[1]);
+            string ap = NT();
+            L("  " + ap + " = bitcast i8* " + NmAddr(p, off.op) + " to i64*");
+            string r = NT();
+            L("  " + r + " = load i64, i64* " + ap + ", align 1");
+            return new ExprVal(r, MkType("long"));
+        }
+        if (m == "AsI64" && argc == 1) {
+            // the bit pattern of a double, reinterpreted as a long
+            ExprVal v = GenExpr(e.kids[0]);
+            string r = NT();
+            L("  " + r + " = bitcast " + MapType(v.ty) + " " + v.op + " to i64");
+            return new ExprVal(r, MkType("long"));
+        }
+        if (m == "AsF64" && argc == 1) {
+            ExprVal v = GenExpr(e.kids[0]);
+            string r = NT();
+            L("  " + r + " = bitcast i64 " + v.op + " to double");
+            return new ExprVal(r, MkType("double"));
+        }
+        if (m == "ScanNotByte" && argc == 4) {
+            // ScanNotByte(p, off, b, n): the length of the leading run of
+            // bytes that are NOT b, capped at n -- the C host scans with strspn
+            // over a two-byte {b, 0} set.
+            ExprVal p = GenExpr(e.kids[0]); ExprVal off = GenExpr(e.kids[1]);
+            ExprVal b = GenExpr(e.kids[2]); ExprVal n = GenExpr(e.kids[3]);
+            if (!ExternSeen("strspn")) { externDecls.Add("strspn"); H("declare i64 @strspn(i8*, i8*)"); }
+            string b8 = NT();
+            L("  " + b8 + " = trunc i64 " + b.op + " to i8");
+            string acc = NT();
+            EA(acc, "[2 x i8]");
+            string p0 = NT();
+            L("  " + p0 + " = getelementptr [2 x i8], [2 x i8]* " + acc + ", i64 0, i64 0");
+            L("  store i8 " + b8 + ", i8* " + p0);
+            string p1 = NT();
+            L("  " + p1 + " = getelementptr [2 x i8], [2 x i8]* " + acc + ", i64 0, i64 1");
+            L("  store i8 0, i8* " + p1);
+            string accb = NT();
+            L("  " + accb + " = bitcast [2 x i8]* " + acc + " to i8*");
+            string run = NT();
+            L("  " + run + " = call i64 @strspn(i8* " + NmAddr(p, off.op) + ", i8* " + accb + ")");
+            string over = NT();
+            L("  " + over + " = icmp ugt i64 " + run + ", " + n.op);
+            string r = NT();
+            L("  " + r + " = select i1 " + over + ", i64 " + n.op + ", i64 " + run);
+            return new ExprVal(r, MkType("int"));
         }
         return null;
     }
@@ -844,11 +1162,173 @@ partial class Irgen {
         return new ExprVal(r, MkType("Vector128"));
     }
 
+    // The CRC32C step over N bytes (the C host's crc32c_step_fn): the
+    // self-hosted IR has to stay portable -- its consumer compiles it with a
+    // generic CPU, where the SSE4.2 instruction cannot be selected -- so the
+    // step is computed from the CRC32C table instead of the hardware opcode.
+    void EmitCrc32CStep(int nbytes) {
+        string name = "__zan_crc32c_step" + Convert.ToString(nbytes);
+        if (ExternSeen(name)) { return; }
+        EmitCrc32CHelper();
+        externDecls.Add(name);
+        bool wide = nbytes == 8;
+        string rt = wide ? "i64" : "i32";
+        string dt = nbytes == 1 ? "i8" : (nbytes == 2 ? "i16" : (nbytes == 4 ? "i32" : "i64"));
+        H("define internal " + rt + " @" + name + "(" + rt + " %crc, " + dt + " %data) {");
+        H("entry:");
+        // the crc is a 32-bit value; the data is read little-endian, byte by
+        // byte (the CRC32C reflected form)
+        // an instruction operand may not be a parenthesised expression, so
+        // every shifted byte goes through its own SSA name
+        string c = "%c0";
+        if (wide) { H("  %c0 = trunc i64 %crc to i32"); }
+        else { H("  %c0 = add i32 %crc, 0"); }
+        string d = "%d64";
+        if (dt == "i64") { H("  %d64 = add i64 %data, 0"); }
+        else { H("  %d64 = zext " + dt + " %data to i64"); }
+        int k = 0;
+        while (k < nbytes) {
+            string sfx = Convert.ToString(k);
+            if (k > 0) {
+                H("  %sr" + sfx + " = lshr i64 %d64, " + Convert.ToString(8 * k));
+                H("  %b" + sfx + " = and i64 %sr" + sfx + ", 255");
+            } else {
+                H("  %b" + sfx + " = and i64 %d64, 255");
+            }
+            H("  %b" + sfx + "32 = trunc i64 %b" + sfx + " to i32");
+            H("  %x" + sfx + " = xor i32 %c" + Convert.ToString(k) + ", %b" + sfx + "32");
+            H("  %ti" + sfx + " = and i32 %x" + sfx + ", 255");
+            H("  %ti" + sfx + "64 = zext i32 %ti" + sfx + " to i64");
+            H("  %ep" + sfx + " = getelementptr [256 x i32], [256 x i32]* @__zan_crc32c_table, i64 0, i64 %ti" + sfx + "64");
+            H("  %te" + sfx + " = load i32, i32* %ep" + sfx);
+            H("  %sh" + sfx + " = lshr i32 %c" + Convert.ToString(k) + ", 8");
+            H("  %c" + Convert.ToString(k + 1) + " = xor i32 %te" + sfx + ", %sh" + sfx);
+            k = k + 1;
+        }
+        if (wide) {
+            H("  %fin = zext i32 %c" + Convert.ToString(nbytes) + " to i64");
+            H("  ret i64 %fin");
+        } else {
+            H("  ret i32 %c" + Convert.ToString(nbytes));
+        }
+        H("}");
+    }
+
+    // The SSE4.2 CRC32 instruction (the C host's emit_sse42_call): the width
+    // follows the argument types -- a 64-bit datum runs the 64-bit step, a
+    // 16/8/32-bit datum the matching narrower step.
+    ExprVal Sse42Crc32(Node e) {
+        ExprVal cv = GenExpr(e.kids[0]);
+        ExprVal dv = GenExpr(e.kids[1]);
+        Node t0 = ArgTypeNode(e.kids[0]);
+        Node t1 = ArgTypeNode(e.kids[1]);
+        bool t0long = t0 != null && (t0.sval == "long" || t0.sval == "ulong");
+        bool t1long = t1 != null && (t1.sval == "long" || t1.sval == "ulong");
+        bool t1short = t1 != null && (t1.sval == "short" || t1.sval == "ushort" || t1.sval == "char");
+        bool t1byte = t1 != null && (t1.sval == "byte" || t1.sval == "sbyte");
+        if (t0long) {
+            EmitCrc32CStep(8);
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_crc32c_step8(i64 " + cv.op + ", i64 " + dv.op + ")");
+            return new ExprVal(r, MkType("ulong"));
+        }
+        string c32 = NT();
+        L("  " + c32 + " = trunc i64 " + cv.op + " to i32");
+        if (t1long) {
+            // a 64-bit datum with a 32-bit crc: the step truncates the crc to
+            // 32 bits anyway, so the result is the same 32-bit value
+            EmitCrc32CStep(8);
+            string c64 = NT();
+            L("  " + c64 + " = sext i32 " + c32 + " to i64");
+            string r = NT();
+            L("  " + r + " = call i64 @__zan_crc32c_step8(i64 " + c64 + ", i64 " + dv.op + ")");
+            return new ExprVal(r, MkType("uint"));
+        }
+        if (t1short) {
+            EmitCrc32CStep(2);
+            string d16 = NT();
+            L("  " + d16 + " = trunc i64 " + dv.op + " to i16");
+            string r32 = NT();
+            L("  " + r32 + " = call i32 @__zan_crc32c_step2(i32 " + c32 + ", i16 " + d16 + ")");
+            string rz = NT();
+            L("  " + rz + " = zext i32 " + r32 + " to i64");
+            return new ExprVal(rz, MkType("uint"));
+        }
+        if (t1byte) {
+            EmitCrc32CStep(1);
+            string d8 = NT();
+            L("  " + d8 + " = trunc i64 " + dv.op + " to i8");
+            string r32 = NT();
+            L("  " + r32 + " = call i32 @__zan_crc32c_step1(i32 " + c32 + ", i8 " + d8 + ")");
+            string rz = NT();
+            L("  " + rz + " = zext i32 " + r32 + " to i64");
+            return new ExprVal(rz, MkType("uint"));
+        }
+        EmitCrc32CStep(4);
+        string d32 = NT();
+        L("  " + d32 + " = trunc i64 " + dv.op + " to i32");
+        string r32 = NT();
+        L("  " + r32 + " = call i32 @__zan_crc32c_step4(i32 " + c32 + ", i32 " + d32 + ")");
+        string rz = NT();
+        L("  " + rz + " = zext i32 " + r32 + " to i64");
+        return new ExprVal(rz, MkType("uint"));
+    }
+
+    // The PixelOps raster primitives (the C host's emit_pixel_ops_call):
+    // they route to the zan_hw_pixel_* runtime helpers.
+    ExprVal GenPixelOps(string m, Node e) {
+        int argc = e.kids.Count;
+        if (m == "BlendOver" && argc == 3) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal count = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src, "0")); a.Add(count.op);
+            NmCallVoid("zan_hw_pixel_blend_over", "i8*, i8*, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "SwapRB" && argc == 3) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src = GenExpr(e.kids[1]);
+            ExprVal count = GenExpr(e.kids[2]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src, "0")); a.Add(count.op);
+            NmCallVoid("zan_hw_pixel_swap_rb", "i8*, i8*, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "FillRect" && argc == 7) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal dstStride = GenExpr(e.kids[1]);
+            ExprVal x = GenExpr(e.kids[2]); ExprVal y = GenExpr(e.kids[3]);
+            ExprVal w = GenExpr(e.kids[4]); ExprVal h = GenExpr(e.kids[5]);
+            ExprVal color = GenExpr(e.kids[6]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(dstStride.op); a.Add(x.op); a.Add(y.op);
+            a.Add(w.op); a.Add(h.op); a.Add(NmI32(color));
+            NmCallVoid("zan_hw_pixel_fill_rect", "i8*, i64, i64, i64, i64, i64, i32", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        if (m == "ResampleBilinearRow" && argc == 7) {
+            ExprVal dst = GenExpr(e.kids[0]); ExprVal src0 = GenExpr(e.kids[1]);
+            ExprVal src1 = GenExpr(e.kids[2]); ExprVal xIdx = GenExpr(e.kids[3]);
+            ExprVal xWt = GenExpr(e.kids[4]); ExprVal wy = GenExpr(e.kids[5]);
+            ExprVal width = GenExpr(e.kids[6]);
+            List<string> a = new List<string>();
+            a.Add(NmAddr(dst, "0")); a.Add(NmAddr(src0, "0")); a.Add(NmAddr(src1, "0"));
+            a.Add(NmAddr(xIdx, "0")); a.Add(NmAddr(xWt, "0")); a.Add(NmI32(wy)); a.Add(width.op);
+            NmCallVoid("zan_hw_pixel_resample_bilinear_row", "i8*, i8*, i8*, i8*, i8*, i32, i64", a);
+            return new ExprVal("0", MkType("void"));
+        }
+        return null;
+    }
+
     // Dispatch a static call on a builtin type to its inline lowering.
     // Returns null when the method is not a recognised builtin (caller falls
     // through to the ordinary static-call path).
     ExprVal GenBuiltinStatic(string cls, string m, Node e) {
         int argc = e.kids.Count;
+        if (cls == "PixelOps") {
+            ExprVal pv = GenPixelOps(m, e);
+            if (pv != null) { return pv; }
+        }
+        if (cls == "Sse42" && m == "Crc32" && argc == 2) { return Sse42Crc32(e); }
         if (cls == "Vector128" || cls == "Vector256") {
             int bits = cls == "Vector128" ? 128 : 256;
             string rty = bits == 128 ? "Vector128" : "Vector256";
@@ -3581,14 +4061,16 @@ partial class Irgen {
                     // to zan_hw_* in the C runtime).
                     bool lowered = false;
                     if (cls.sval == "Vector128" || cls.sval == "Vector256" || cls.sval == "BitOperations"
-                        || cls.sval == "Sse2" || cls.sval == "Aes") {
+                        || cls.sval == "Sse2" || cls.sval == "Sse42" || cls.sval == "Aes"
+                        || cls.sval == "PixelOps") {
                         lowered = true;
                     } else if (cls.sval == "NativeMemory") {
                         string nm = ExternName(m);
                         if (nm == "Alloc" || nm == "Free" || nm == "Copy" || nm == "Fill"
                             || nm == "Compare" || nm == "GetString" || nm == "PutString"
                             || nm == "Crc32" || nm == "Crc32C" || nm == "Crc32CUpdate"
-                            || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode") {
+                            || nm == "Find" || nm == "Base64Encode" || nm == "Base64Decode"
+                            || nm == "Sha256" || nm == "Sha1" || nm == "Sha512" || nm == "Sm3") {
                             lowered = true;
                         }
                     }

@@ -1510,3 +1510,32 @@ kernel32、shell32、user32、advapi32、version）。
   R 绑到真正的类型，克隆体里的 `R mk` 才是 double/string 而不是指针。
 - 通用教训：**"没写类型"和"类型未知"在 AST 里是两种表示**（null vs
   `"var"`），凡是"没有就用上下文补"的地方，两种都要认。
+## 77. 硬件内建要复刻宿主的降级表；自举 IR 不能用目标特性 intrinsic
+
+- 坑（2026-10-21 实测）：自举把 `NativeMemory.AesCbcEncrypt` 这类硬件内建
+  当成普通 extern 方法，符号按驼峰拼成 `@zan_hw_AesCbcEncrypt` → 链接期
+  LNK2019（运行时导出的是小写下划线 `zan_hw_aes_cbc_encrypt`）。
+- 根因：**宿主不是在 extern 声明层改符号名**，而是在调用点把整张硬件内建表
+  **内联降级**成对 `zan_hw_*` 的直接调用（`src/compiler/irgen_expr.c` 的
+  `emit_native_memory_call` / `emit_pixel_ops_call`）：每个方法的**参数顺序按
+  运行时签名重排**（`AesCbcEncrypt(dst,src,size,key,keybits,iv)` 在运行时的
+  顺序是 `src,size,key,keybits,iv,dst`），`keybits` 还要收窄成 i32。
+  所以自举不能"声明 extern 再按声明序调用"，必须照抄这张表。
+- 做法：自举侧建三个助手——`NmCall`/`NmCallVoid` 发调用，`NmI32` 把整数实参
+  收窄到 i32；参数值是裸的，**类型由运行时签名串给出**，按签名逐个拼成
+  typed value。覆盖清单：AES（CBC/ECB/CTR/GCM）、GHASH、RSA（ModPow/CRT）、
+  X25519、SM4、JSON 扫描、Base64、摘要（SHA1/256/512、SM3）、Load64/AsI64/
+  AsF64、ScanNotByte，以及 PixelOps 的 BlendOver/SwapRB/FillRect/
+  ResampleBilinearRow。
+- 坑（LLVM 文本 IR 语法，实测）：call 的实参**必须**是 typed value
+  （`i8* %p`、`i64 16`、`i32 %t5`），裸 SSA 名或裸常量都报
+  "expected value token"；指令操作数**不能**是括号表达式
+  （`and i64 (lshr i64 %d64, 8), 255` 非法），要拆成单独的 SSA 名；
+  同类型的 `bitcast` 也非法（用 `add x, 0` 代替）。
+- 坑（可移植性，实测）：自举产出的 .ll 由 sweep 用 **generic CPU** 的 clang
+  编译；宿主自己出码带 `-mcpu/-mattr` 所以不受限。于是自举 IR **不能**用
+  需要目标特性的 intrinsic——`llvm.x86.sse42.crc32.*` 在 generic CPU 下
+  "Cannot select"。`Sse42.Crc32` 改成查表 CRC32C 的软件实现（逐字节、
+  小端），语义与硬件指令一致。
+- 通用教训：**宿主是规格**——自举要复刻的是宿主的**降级表**（符号名 + 参数
+  顺序 + 类型宽度 + 可移植实现），不是"能编译过"就行。
