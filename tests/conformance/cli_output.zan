@@ -1,0 +1,221 @@
+using System;
+using System.Collections.Generic;
+using System.Cli;
+
+// 按脚本喂输入的读取器：用来测交互提示（不依赖真实终端）。
+public class ScriptedReader {
+    public List<string> lines;
+    public int index;
+
+    public ScriptedReader() {
+        this.lines = new List<string>();
+        this.index = 0;
+    }
+
+    public void Push(string line) {
+        this.lines.Add(line);
+    }
+
+    public string Next() {
+        if (this.index >= this.lines.Count) { return null; }
+        string s = this.lines[this.index];
+        this.index = this.index + 1;
+        return s;
+    }
+}
+
+class Program {
+    static int failures = 0;
+
+    static void Check(string label, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label);
+        }
+    }
+
+    static void CheckEq(string label, string actual, string expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected [" + expected + "] got [" + actual + "]");
+        }
+    }
+
+    static void CheckEqInt(string label, int actual, int expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL: " + label + " expected " + expected + " got " + actual);
+        }
+    }
+
+    static void Main() {
+        /* ---------- ANSI 原语 ---------- */
+        Ansi.SetEnabled(true);
+        CheckEq("sgr", Ansi.Sgr("1"), "\x1b[1m");
+        CheckEq("reset", Ansi.Reset(), "\x1b[0m");
+        CheckEq("fg red", Ansi.Fg(1), "\x1b[31m");
+        CheckEq("fg bright red", Ansi.Fg(9), "\x1b[91m");
+        CheckEq("fg green", Ansi.Fg(2), "\x1b[32m");
+        CheckEq("bg red", Ansi.Bg(1), "\x1b[41m");
+        CheckEq("bg bright blue", Ansi.Bg(12), "\x1b[104m");
+        CheckEq("fg 256", Ansi.Fg256(200), "\x1b[38;5;200m");
+        CheckEq("bg 256", Ansi.Bg256(3), "\x1b[48;5;3m");
+        CheckEq("fg rgb", Ansi.FgRgb(1, 2, 3), "\x1b[38;2;1;2;3m");
+        CheckEq("bg rgb", Ansi.BgRgb(255, 128, 0), "\x1b[48;2;255;128;0m");
+        CheckEqInt("clamp", Ansi.Clamp(300), 255);
+        CheckEqInt("clamp low", Ansi.Clamp(-5), 0);
+
+        /* ---------- 样式：作用域内上色，套完复位 ---------- */
+        CheckEq("style applies", Style.Red().Apply("x"), "\x1b[31mx\x1b[0m");
+        CheckEq("style chains", Style.Bold().AddFg(2).Apply("x"), "\x1b[1m\x1b[32mx\x1b[0m");
+        CheckEq("style rgb", Style.Fg(0).AddFgRgb(10, 20, 30).Apply("x"), "\x1b[30m\x1b[38;2;10;20;30mx\x1b[0m");
+        Ansi.SetEnabled(false);
+        CheckEq("style off", Style.Red().Apply("x"), "x");
+        CheckEq("style off empty", Style.Bold().Apply(""), "");
+        Ansi.SetEnabled(true);
+        Check("color on", Ansi.Enabled());
+
+        /* ---------- 显示宽度 ---------- */
+        CheckEqInt("width ascii", TextWidth.Width("abc"), 3);
+        CheckEqInt("width empty", TextWidth.Width(""), 0);
+        CheckEqInt("width cjk", TextWidth.Width("中文"), 4);
+        CheckEqInt("width mixed", TextWidth.Width("中文abc"), 7);
+        CheckEqInt("width combining", TextWidth.Width("a\u0301"), 1);
+        CheckEqInt("width emoji", TextWidth.Width("😀"), 2);
+        CheckEqInt("rune narrow", TextWidth.RuneWidth(97), 1);
+        CheckEqInt("rune wide", TextWidth.RuneWidth(0x4E2D), 2);
+        CheckEqInt("rune zero", TextWidth.RuneWidth(0x0301), 0);
+        Check("wide detected", TextWidth.IsWide(0x4E2D));
+        Check("narrow not wide", !TextWidth.IsWide(97));
+
+        /* ---------- 补齐与截断 ---------- */
+        CheckEq("pad left", TextWidth.Pad("ab", 5, 0), "ab   ");
+        CheckEq("pad right", TextWidth.Pad("ab", 5, 2), "   ab");
+        CheckEq("pad center", TextWidth.Pad("ab", 6, 1), "  ab  ");
+        CheckEq("pad cjk", TextWidth.Pad("中", 5, 0), "中   ");
+        CheckEq("pad overlong", TextWidth.Pad("abcdef", 3, 0), "abcdef");
+        CheckEq("truncate", TextWidth.Truncate("中文测试abc", 5), "中文…");
+        CheckEq("truncate short", TextWidth.Truncate("ab", 5), "ab");
+        CheckEq("truncate zero", TextWidth.Truncate("abc", 0), "");
+
+        /* ---------- 表格 ---------- */
+        Table t = new Table();
+        t.AddColumn("name", 0).AddColumn("age", 2);
+        t.AddRow("alice", "30");
+        t.AddRow("bob", "7");
+        string expectedUnicode =
+            "┌───────┬─────┐\n" +
+            "│ name  │ age │\n" +
+            "├───────┼─────┤\n" +
+            "│ alice │  30 │\n" +
+            "│ bob   │   7 │\n" +
+            "└───────┴─────┘\n";
+        CheckEq("table unicode", t.Render(), expectedUnicode);
+
+        string expectedAscii =
+            "+-------+-----+\n" +
+            "| name  | age |\n" +
+            "+-------+-----+\n" +
+            "| alice |  30 |\n" +
+            "| bob   |   7 |\n" +
+            "+-------+-----+\n";
+        CheckEq("table ascii", t.AsciiBorder().Render(), expectedAscii);
+
+        string expectedNone =
+            "name   age\n" +
+            "alice   30\n" +
+            "bob      7\n";
+        CheckEq("table no border", t.NoBorder().Render(), expectedNone);
+
+        // 宽字符表格：每一行的显示宽度必须一致。
+        Table cjk = new Table();
+        cjk.AddColumn("名字", 0).AddColumn("城市", 0);
+        cjk.AddRow("爱丽丝", "北京");
+        cjk.AddRow("bob", "上海");
+        string rendered = cjk.Render();
+        List<string> lines = rendered.Split("\n");
+        int firstWidth = TextWidth.Width(lines[0]);
+        bool sameWidth = true;
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            if (lines[i].Length == 0) { continue; }
+            if (TextWidth.Width(lines[i]) != firstWidth) { sameWidth = false; }
+        }
+        Check("cjk table rows share width", sameWidth);
+        CheckEqInt("cjk table width", firstWidth, 17);
+
+        // 固定列宽。
+        Table fixedTable = new Table();
+        fixedTable.AddColumn("id", 0);
+        fixedTable.columns[0].width = 6;
+        fixedTable.AddRow("7");
+        Check("fixed width column", fixedTable.Render().Contains("│ 7      │"));
+
+        /* ---------- 进度条 ---------- */
+        ProgressBar pb = new ProgressBar(10);
+        CheckEq("progress half", pb.Render(0.5), "[█████░░░░░] 50%");
+        CheckEq("progress zero", pb.Render(0.0), "[░░░░░░░░░░] 0%");
+        CheckEq("progress full", pb.Render(1.0), "[██████████] 100%");
+        CheckEq("progress clamp high", pb.Render(2.0), "[██████████] 100%");
+        CheckEq("progress clamp low", pb.Render(-1.0), "[░░░░░░░░░░] 0%");
+        CheckEq("progress ascii", pb.AsciiBar().RenderCount(3, 4), "[########--] 75%");
+        CheckEq("progress count zero", new ProgressBar(10).RenderCount(1, 0), "[░░░░░░░░░░] 0%");
+
+        /* ---------- 交互提示 ---------- */
+        // 提示语写进 log（不写控制台），提示文本与解析结果都可断言。
+        List<string> log = new List<string>();
+
+        ScriptedReader r1 = new ScriptedReader();
+        r1.Push("bob");
+        CheckEq("prompt text", Prompt.TextTo(s => log.Add(s), "名字", "alice", () => r1.Next()), "bob");
+        CheckEq("prompt text label", log[0], "名字 [alice]: ");
+
+        ScriptedReader r2 = new ScriptedReader();
+        r2.Push("");
+        CheckEq("prompt text default", Prompt.TextTo(s => log.Add(s), "名字", "alice", () => r2.Next()), "alice");
+
+        ScriptedReader r3 = new ScriptedReader();
+        r3.Push("y");
+        Check("prompt confirm yes", Prompt.ConfirmTo(s => log.Add(s), "继续", false, () => r3.Next()));
+
+        ScriptedReader r4 = new ScriptedReader();
+        r4.Push("n");
+        Check("prompt confirm no", !Prompt.ConfirmTo(s => log.Add(s), "继续", true, () => r4.Next()));
+
+        ScriptedReader r5 = new ScriptedReader();
+        r5.Push("");
+        Check("prompt confirm default", Prompt.ConfirmTo(s => log.Add(s), "继续", true, () => r5.Next()));
+
+        List<string> options = new List<string>();
+        options.Add("第一项");
+        options.Add("第二项");
+
+        ScriptedReader r6 = new ScriptedReader();
+        r6.Push("2");
+        CheckEqInt("prompt select", Prompt.SelectTo(s => log.Add(s), "选一个", options, () => r6.Next()), 1);
+
+        // 无效输入要重新问；读到 EOF 返回 -1。
+        ScriptedReader r7 = new ScriptedReader();
+        r7.Push("99");
+        r7.Push("1");
+        CheckEqInt("prompt select retry", Prompt.SelectTo(s => log.Add(s), "选一个", options, () => r7.Next()), 0);
+
+        ScriptedReader r8 = new ScriptedReader();
+        CheckEqInt("prompt select eof", Prompt.SelectTo(s => log.Add(s), "选一个", options, () => r8.Next()), -1);
+
+        // 提示语本身：选项列表与重问提示。
+        bool sawOptions = false;
+        bool sawRetry = false;
+        for (int i = 0; i < log.Count; i = i + 1) {
+            if (log[i] == "  1) 第一项\n") { sawOptions = true; }
+            if (log[i] == "无效的选项，请重新输入\n") { sawRetry = true; }
+        }
+        Check("prompt lists options", sawOptions);
+        Check("prompt reports invalid choice", sawRetry);
+
+        if (failures == 0) {
+            Console.WriteLine("ALL CLI TESTS PASSED");
+        } else {
+            Console.WriteLine("CLI FAILURES: " + Convert.ToString(failures));
+        }
+    }
+}

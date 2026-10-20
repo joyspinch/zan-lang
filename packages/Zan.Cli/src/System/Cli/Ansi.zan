@@ -1,0 +1,109 @@
+using System;
+
+namespace System.Cli;
+
+// ANSI/VT 转义序列原语。
+//
+// 只负责"生成序列"，不负责"写终端"——渲染结果是纯字符串，调用方决定
+// 写到哪里（控制台、文件、测试断言）。这是本包能被 conformance 逐字节
+// 断言的前提：同一个 Style 在任何地方都渲染出同样的字节。
+//
+// 颜色开关是进程级的：Enabled() 首次调用时按环境判定，之后可显式覆盖。
+// 判定顺序：ZAN_CLI_COLOR（never/always）> NO_COLOR > TERM=dumb。
+//
+// 注意：运行时没有 isatty 探测能力（见 TASKS.md），所以"auto"策略
+// 判不出"输出被重定向到文件"这种情况——需要严格 TTY 语义的应用要
+// 自己显式调 EnableColor(false)。
+public class Ansi {
+    // 颜色开关：0 = 未判定，1 = 开，2 = 关。
+    public static int colorMode = 0;
+
+    // ESC[ 前缀。
+    public static string Esc() {
+        return "\x1b[";
+    }
+
+    // 通用 SGR 序列：Sgr("1") → "\x1b[1m"。
+    public static string Sgr(string params) {
+        return "\x1b[" + params + "m";
+    }
+
+    public static string Reset() { return "\x1b[0m"; }
+    public static string Bold() { return "\x1b[1m"; }
+    public static string Dim() { return "\x1b[2m"; }
+    public static string Italic() { return "\x1b[3m"; }
+    public static string Underline() { return "\x1b[4m"; }
+    public static string Blink() { return "\x1b[5m"; }
+    public static string Reverse() { return "\x1b[7m"; }
+    public static string Strikethrough() { return "\x1b[9m"; }
+
+    // 前景色：0..7 基本色 → 30..37；8..15 亮色 → 90..97。
+    public static string Fg(int color) {
+        int c = color & 15;
+        if (c < 8) { return Sgr("" + (30 + c)); }
+        return Sgr("" + (90 + (c - 8)));
+    }
+
+    // 背景色：0..7 → 40..47；8..15 → 100..107。
+    public static string Bg(int color) {
+        int c = color & 15;
+        if (c < 8) { return Sgr("" + (40 + c)); }
+        return Sgr("" + (100 + (c - 8)));
+    }
+
+    // 256 色前景：38;5;N。
+    public static string Fg256(int index) {
+        return Sgr("38;5;" + (index & 255));
+    }
+
+    // 256 色背景：48;5;N。
+    public static string Bg256(int index) {
+        return Sgr("48;5;" + (index & 255));
+    }
+
+    // 真彩色前景：38;2;R;G;B。
+    public static string FgRgb(int r, int g, int b) {
+        return Sgr("38;2;" + Ansi.Clamp(r) + ";" + Ansi.Clamp(g) + ";" + Ansi.Clamp(b));
+    }
+
+    // 真彩色背景：48;2;R;G;B。
+    public static string BgRgb(int r, int g, int b) {
+        return Sgr("48;2;" + Ansi.Clamp(r) + ";" + Ansi.Clamp(g) + ";" + Ansi.Clamp(b));
+    }
+
+    // 把颜色分量夹进 [0,255]。
+    public static int Clamp(int value) {
+        if (value < 0) { return 0; }
+        if (value > 255) { return 255; }
+        return value;
+    }
+
+    // 颜色是否启用（首次调用时按环境判定）。
+    public static bool Enabled() {
+        if (Ansi.colorMode == 0) {
+            Ansi.colorMode = Ansi.DetectEnabled() ? 1 : 2;
+        }
+        return Ansi.colorMode == 1;
+    }
+
+    // 显式开关颜色。
+    public static void SetEnabled(bool on) {
+        Ansi.colorMode = on ? 1 : 2;
+    }
+
+    // 回到"按环境判定"的状态（测试用）。
+    public static void ResetMode() {
+        Ansi.colorMode = 0;
+    }
+
+    // 环境判定：ZAN_CLI_COLOR > NO_COLOR > TERM=dumb。
+    public static bool DetectEnabled() {
+        string mode = Environment.GetEnvironmentVariable("ZAN_CLI_COLOR");
+        if (mode == "never" || mode == "off" || mode == "0") { return false; }
+        if (mode == "always" || mode == "on" || mode == "1") { return true; }
+        // NO_COLOR 标准：变量存在且非空时禁用颜色。
+        if (Environment.GetEnvironmentVariable("NO_COLOR") != "") { return false; }
+        if (Environment.GetEnvironmentVariable("TERM") == "dumb") { return false; }
+        return true;
+    }
+}

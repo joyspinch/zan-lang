@@ -1,0 +1,169 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Cli;
+
+// 表格的一列。align：0 = 左，1 = 中，2 = 右。width：0 = 按内容自适应。
+public class TableColumn {
+    public string title;
+    public int align;
+    public int width;
+
+    public TableColumn(string title, int align) {
+        this.title = title == null ? "" : title;
+        this.align = align;
+        this.width = 0;
+    }
+}
+
+// 终端表格。
+//
+// 对齐按**显示宽度**算（TextWidth），不是字节数：中文表头与中文单元格
+// 在等宽终端里必须和 ASCII 列对齐。列宽自适应（取表头与所有单元格的
+// 最大显示宽度），也可以用 TableColumn.width 钉死。
+//
+// 三种边框：无（0）/ ASCII（1）/ Unicode（2）。Unicode 边框用的是制表
+// 字符，在 East Asian Width 里是"歧义宽度"——极少数按 CJK 宽度渲染的
+// 终端会把它当两列，需要绝对确定的场合用 ASCII 边框。
+public class Table {
+    public List<TableColumn> columns;
+    public List<List<string>> rows;
+    // 0 = 无边框，1 = ASCII，2 = Unicode。
+    public int border;
+
+    public Table() {
+        this.columns = new List<TableColumn>();
+        this.rows = new List<List<string>>();
+        this.border = 2;
+    }
+
+    // 加一列（链式）。
+    public Table AddColumn(string title, int align) {
+        this.columns.Add(new TableColumn(title, align));
+        return this;
+    }
+
+    // 加一行（链式）。单元格数可以少于列数（缺的按空处理）。
+    public Table AddRow(params string[] cells) {
+        List<string> row = new List<string>();
+        if (cells != null) {
+            for (int i = 0; i < cells.Length; i = i + 1) { row.Add(cells[i]); }
+        }
+        this.rows.Add(row);
+        return this;
+    }
+
+    // 切到 ASCII 边框。
+    public Table AsciiBorder() {
+        this.border = 1;
+        return this;
+    }
+
+    // 切到 Unicode 边框（默认）。
+    public Table UnicodeBorder() {
+        this.border = 2;
+        return this;
+    }
+
+    // 去掉边框。
+    public Table NoBorder() {
+        this.border = 0;
+        return this;
+    }
+
+    // 渲染成表格文本（末尾带换行）。
+    public string Render() {
+        int n = this.columns.Count;
+        if (n == 0) { return ""; }
+        int[] widths = new int[n];
+        for (int c = 0; c < n; c = c + 1) {
+            TableColumn col = this.columns[c];
+            int w = TextWidth.Width(col.title);
+            for (int r = 0; r < this.rows.Count; r = r + 1) {
+                List<string> row = this.rows[r];
+                if (c < row.Count) {
+                    int cw = TextWidth.Width(row[c]);
+                    if (cw > w) { w = cw; }
+                }
+            }
+            if (col.width > 0) { w = col.width; }
+            widths[c] = w;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (this.border == 2) {
+            this.AppendRule(sb, widths, "┌", "┬", "┐", "─");
+        } else if (this.border == 1) {
+            this.AppendRule(sb, widths, "+", "+", "+", "-");
+        }
+
+        // 表头
+        List<string> head = new List<string>();
+        for (int c = 0; c < n; c = c + 1) { head.Add(this.columns[c].title); }
+        this.AppendRow(sb, widths, head);
+        if (this.border != 0) {
+            if (this.border == 2) {
+                this.AppendRule(sb, widths, "├", "┼", "┤", "─");
+            } else {
+                this.AppendRule(sb, widths, "+", "+", "+", "-");
+            }
+        }
+
+        // 数据行
+        for (int r = 0; r < this.rows.Count; r = r + 1) {
+            this.AppendRow(sb, widths, this.rows[r]);
+        }
+
+        if (this.border != 0) {
+            if (this.border == 2) {
+                this.AppendRule(sb, widths, "└", "┴", "┘", "─");
+            } else {
+                this.AppendRule(sb, widths, "+", "+", "+", "-");
+            }
+        }
+        return sb.ToString();
+    }
+
+    // 画一条横线。
+    public void AppendRule(StringBuilder sb, int[] widths, string left, string mid,
+                           string right, string fill) {
+        sb.Append(left);
+        for (int c = 0; c < widths.Length; c = c + 1) {
+            if (c > 0) { sb.Append(mid); }
+            for (int k = 0; k < widths[c] + 2; k = k + 1) { sb.Append(fill); }
+        }
+        sb.Append(right);
+        sb.Append("\n");
+    }
+
+    // 画一行单元格。
+    public void AppendRow(StringBuilder sb, int[] widths, List<string> cells) {
+        string vbar = this.VerticalBar();
+        string row = "";
+        for (int c = 0; c < widths.Length; c = c + 1) {
+            if (this.border != 0) { row = row + vbar; }
+            string text = "";
+            int align = 0;
+            if (c < this.columns.Count) { align = this.columns[c].align; }
+            if (cells != null && c < cells.Count) { text = cells[c]; }
+            if (this.border != 0) { row = row + " "; }
+            row = row + TextWidth.Pad(text, widths[c], align);
+            if (this.border != 0) { row = row + " "; }
+            if (this.border == 0 && c + 1 < widths.Length) { row = row + "  "; }
+        }
+        if (this.border != 0) {
+            sb.Append(row);
+            sb.Append(vbar);
+        } else {
+            // 无边框模式：行尾不留看不见的空白（对齐仍按列宽算）。
+            sb.Append(row.TrimEnd());
+        }
+        sb.Append("\n");
+    }
+
+    // 竖线字符（按边框风格）。
+    public string VerticalBar() {
+        if (this.border == 2) { return "│"; }
+        return "|";
+    }
+}

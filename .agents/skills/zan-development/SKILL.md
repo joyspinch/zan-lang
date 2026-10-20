@@ -141,6 +141,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   再用（`?.` 亦可）。
 * **基类构造的调用语法是 `: base(expr)`**（写在构造签名后），不是体内的
   `super(...)`；派生类构造会隐式调用基类的无参构造。
+* **字符字面量只认单字节，非 ASCII 走码点数值**（实证，2026-10-21）：
+  `'中'` 报 "unterminated character literal"（只取到 0xb8）；要按码点比较
+  写数值常量（`0x4E2D`）。字符串字面量里的转义支持 `\xNNNN` 与 `\uNNNN`
+  （各 4 位十六进制），**没有 `\U`**——代理对（emoji）写不了转义，只能把
+  字符直接写进源文件。
+* **用户类可以声明 `params T[]` 尾参**（实证，2026-10-21）：`public void
+  AddRow(params string[] cells)` 合法，调用处多出来的实参自动打包成数组。
+* **按码点遍历字符串**：用 `Encoding.DecodeCodePoint(s, byteIndex, cpOut)`
+  （返回消耗的字节数，`cpOut[0]` 是码点），别自己解 UTF-8。`string.Length`
+  是**字节数**，不是字符数也不是显示宽度——显示宽度（中文 2 列、组合记号
+  0 列）要另算，见 `Zan.Cli` 的 `TextWidth`。
+* **右trim 用 `StringExtensions.TrimEnd`**（`s.TrimEnd()`）：内建 `Trim()`
+  只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
+* **保留字坑**：`out`、`fixed` 不能作变量名（编译器报 "expected ';'，
+  got 'fixed'" 这类看着莫名其妙的错）。
 
 ## 4. Edit
 

@@ -90,6 +90,36 @@
 conformance：`validation_rules`（规则触发、错误聚合顺序、首错即停、属性名前缀、
 嵌套前缀、异常、三种错误视图、通配匹配）。
 
+### 1.4 终端输出层：`Zan.Cli`
+
+新包 `packages/Zan.Cli`，命名空间 `System.Cli`（不进 stdlib——终端输出是
+应用层能力，语言底座不该带 ANSI 依赖）。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Ansi.zan` | `Ansi` | SGR 原语、16/256/真彩色、颜色开关策略（`ZAN_CLI_COLOR` / `NO_COLOR` / `TERM=dumb`） |
+| `TextWidth.zan` | `TextWidth` | 显示宽度：宽字符（2 列）/ 零宽（0 列）判定、补齐、截断 |
+| `Style.zan` | `Style` | 作用域样式：套完立即复位（与 `Console.ForegroundColor` 的粘性语义相反） |
+| `Table.zan` | `Table` / `TableColumn` | 表格：Unicode / ASCII / 无边框，列宽按显示宽度自适应或钉死 |
+| `Progress.zan` | `ProgressBar` / `Progress` | 进度条：纯渲染 + 写同一行 |
+| `Prompt.zan` | `Prompt` | 文本 / 确认 / 单选提示，读取器与输出 sink 均可注入 |
+| `Cli.zan` | `Cli` | 门面：Success / Error / Warning / Info / Header / Rule / Table |
+
+**渲染是纯函数**——所有输出先渲染成字符串，由调用方决定写到哪里。这让
+conformance 能逐字节比对（含表格边框、进度条字符、提示文本），也让"同一段
+代码在控制台与文件里产出同样的字节"成为可依赖的性质。
+
+**宽字符对齐**是这层的主要价值：`string.Length` 是字节数，中文是双宽字符、
+组合记号是零宽字符，表格按字节数对齐会歪。`TextWidth` 按 East Asian
+Width 的 Wide/Fullwidth 与零宽规则算显示宽度，表格、进度条、截断统一走它。
+
+**已知缺口**：运行时没有 `isatty` 探测（全仓无 TTY 判定），所以颜色策略
+判不出"输出被重定向到文件"。默认策略是"环境变量优先，其余开启"；需要严格
+TTY 语义的应用显式 `Cli.EnableColor(false)`。
+
+conformance：`cli_output`（转义序列、作用域样式、显示宽度、补齐截断、三种
+表格边框、CJK 表格等宽、进度条、提示解析与提示文本）。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -109,7 +139,7 @@ conformance：`validation_rules`（规则触发、错误聚合顺序、首错即
 |---|---|---|---|---|
 | `Zan.Mapping` | AutoMapper / Mapster | 10,188 / 5,182 | 全仓 0 命中。做「显式映射函数 + `Gen*` 生成」，**不做反射式自动映射** | 2 周 |
 | `Zan.Messaging` | MassTransit | 7,809 | 进程内发布/订阅、请求-响应、管道中间件 | 1–2 周 |
-| `Zan.Cli` | Spectre.Console / Terminal.Gui | 11,666 / 11,279 | 全仓无 `\x1b` 转义处理：ANSI 颜色、表格/进度条/交互提示、宽字符对齐 | 2–3 周 |
+| `Zan.Cli` | Spectre.Console / Terminal.Gui | 11,666 / 11,279 | ✅ 已落地 `packages/Zan.Cli`（`System.Cli`：ANSI 样式 / 宽字符对齐表格 / 进度条 / 交互提示，见 §1.4） | — |
 | `Zan.Jobs` | Hangfire / Quartz.NET | 10,151 / 7,096 | 只有 `Zan.Hosting/Cron.zan` 定时触发；缺持久化任务队列、重试退避、任务存储 | 2–3 周 |
 
 ### 第 2 层 · 领域
@@ -167,7 +197,7 @@ conformance：`validation_rules`（规则触发、错误聚合顺序、首错即
 
 ## 6. 落地顺序
 
-**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli`
+**第 1 批（生态骨架）**：`Zan.Logging` ✅ → `Zan.Math` ✅ → `Zan.Validation` ✅ → `Zan.Cli` ✅
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` → `Zan.Game.Physics2D` → `Zan.Game.Pathfinding` → `Zan.Game.Particles`
 **第 3 批（内容生产）**：`Zan.Game.Assets` → `Zan.Game.Audio` → `Zan.Game.Procgen` → `Zan.Game.Common`
 **第 4 批（重型）**：`Zan.Game.Netcode` → `Zan.Game.Animation` → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
