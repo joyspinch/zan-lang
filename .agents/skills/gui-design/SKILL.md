@@ -372,6 +372,19 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
 - **铁律:控件自己负责绘制,使用处只配置**(实例化→配属性→喂数据→摆位置)。
   禁止在使用处用 Canvas 原语重画已有控件——组件修好后示例还在按旧画法显示,
   就会"组件是对的,demo 是错的"。
+- **组件的命名空间必须与它所在的目录一致**(BandGrid 教训):`Gui/Component/`
+  下的控件一律 `namespace Gui.Component`;编译器里 `QualifyKind` 出现
+  "Gui.BandGrid" 这类特判(类名与目录不一致)就是没归位的信号。Gui 根命名
+  空间留给控件基类本身,组件一律在 Gui.Component 下——用户项目里出现同名
+  全局类时不会压过 stdlib 真身(限定名按命名空间解析,不按最后一段猜)。
+  迁名的连带面通常很小:解析器会沿命名空间链向上找
+  (`Gui.Component.DataTable` → `Gui.Component` → `Gui`),同族包里直接写
+  `BandGrid` 不用补 using;只有命名空间与目标无关的地方(如独立命名空间
+  `DataTableTest`)才要补 `using Gui.Component;`。
+- **宿主面板有专属入口时,不要在通用开关列表里再列一遍**(停靠面板教训):
+  同一个面板既出现在功能区的「工作面」大按钮里、又出现在 dock 自动生成的
+  「面板」开关列表里,用户会犯迷糊该点哪个。DockHost 给了 `SetNoSwitch`:
+  面板声明"不进通用开关列表",入口只留显眼的那一处。
 - 觉得某控件"不精美"→ 修 `stdlib/Gui/Widget/` 或 `skins/base.css` 里的规则,
   让所有使用处一起变好;新皮肤值写进皮肤包的 `:root`,不散落。
 - **新增 Gui 类先查重名**:历史上有在 `Gui.Component` 下新增
