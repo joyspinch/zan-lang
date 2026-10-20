@@ -101,7 +101,8 @@ partial class Irgen {
         if (curClass != "") {
             Node scls = binder.FindType(curClass);
             if (scls != null && FindStaticField(scls, e.sval) != null) {
-                return LoadStaticField(scls, e.sval);
+                string sown = StaticFieldOwner(scls, e.sval);
+                return LoadStaticField(scls, e.sval, CurInstFor(sown));
             }
             // a static property read from a static method
             if (scls != null) {
@@ -1404,7 +1405,8 @@ partial class Irgen {
             if (curClass != "") {
                 Node scls = binder.FindType(curClass);
                 if (scls != null && FindStaticField(scls, lhs.sval) != null) {
-                    StoreStaticField(scls, lhs.sval, v);
+                    string sown = StaticFieldOwner(scls, lhs.sval);
+                    StoreStaticField(scls, lhs.sval, v, CurInstFor(sown));
                     return;
                 }
                 // a static property write from a static method
@@ -1427,7 +1429,7 @@ partial class Irgen {
                 Node tc = binder.FindType(lhs.a.sval);
                 if (tc != null) {
                     if (FindStaticField(tc, lhs.sval) != null) {
-                        StoreStaticField(tc, lhs.sval, v);
+                        StoreStaticField(tc, lhs.sval, v, ConcreteInstArgs(lhs, tc.sval));
                         return;
                     }
                     // a static property written through its class name:
@@ -2174,7 +2176,9 @@ partial class Irgen {
                 }
             }
             if (tc != null && FindStaticField(tc, e.sval) != null) {
-                return LoadStaticField(tc, e.sval);
+                // `Stat<int>.s`: the static storage belongs to that one
+                // instantiation of the generic class
+                return LoadStaticField(tc, e.sval, ConcreteInstArgs(e, tc.sval));
             }
             // static property: Cls.Prop -> Cls.get_Prop(). The parser turns a
             // property into a getter method, so the property is a static
@@ -4654,7 +4658,8 @@ partial class Irgen {
             if (curClass != "") {
                 Node scls = binder.FindType(curClass);
                 if (scls != null && FindStaticField(scls, place.sval) != null) {
-                    return "@__zan_sf_" + StaticFieldOwner(scls, place.sval) + "_" + place.sval;
+                    string sown = StaticFieldOwner(scls, place.sval);
+                    return StaticGlobal(sown, place.sval, CurInstFor(sown));
                 }
                 // this.field
                 if (curHasThis) {
@@ -4937,15 +4942,49 @@ partial class Irgen {
         bool spec = false;
         List<string> stns = new List<string>();
         List<Node> strs = new List<Node>();
+        // CLASS-level monomorphization: a static method of a generic class,
+        // called on a concrete instantiation (`Stat<int>.Bump()`), gets a
+        // specialized body -- the class's type parameters are bound to that
+        // instantiation, so `Stat<T>.s` inside it names the instantiation's
+        // OWN static storage (the C host mangles the static names per
+        // instantiation).
+        List<Node> ctypes = new List<Node>();
+        bool clsSpec = false;
         if (m != null && CanSpecialize(m)) {
             List<string> mtps = TParams(m);
+            List<string> ctps = TParams(cls);
+            // the callee carries the explicit instantiation (`Stat<int>.Bump()`)
+            List<Node> iargs = null;
+            if (e != null && e.a != null && e.a.kind == AK.MemberAccess()) {
+                iargs = ConcreteInstArgs(e.a, clsName);
+            }
+            // only a method declared by the generic class ITSELF: an
+            // inherited one lives in a base class that has no type parameters
+            if (ctps.Count > 0 && DeclOwnerOf(cls, m) == clsName && iargs != null) {
+                int ci = 0;
+                while (ci < ctps.Count) {
+                    stns.Add(ctps[ci]); strs.Add(iargs[ci]); ctypes.Add(iargs[ci]);
+                    ci = ci + 1;
+                }
+                clsSpec = true;
+            }
             if (mtps.Count > 0) {
                 // the explicit type arguments win over the inferred ones
                 if (!BindTypeArgs(m, e, mtps, stns, strs)) {
                     BindFromArgs(m, e, 0, mtps, stns, strs);
                 }
-                string tag = SpecTag(m, mtps, stns, strs);
-                if (tag != "") { sym = SpecQueue(clsName, m, stns, strs, tag); spec = true; }
+            }
+            if (clsSpec || mtps.Count > 0) {
+                string tag = SpecTagC(m, ctypes, mtps, stns, strs, clsSpec ? "I" : "");
+                if (tag != "") {
+                    // a static clone has no receiver: the instantiation rides
+                    // along as the clone's receiver type, so the static fields
+                    // it touches resolve to that instantiation's storage
+                    Node ity = null;
+                    if (clsSpec) { ity = InstType(clsName, iargs); }
+                    sym = SpecQueueTy(clsName, m, stns, strs, tag, ity);
+                    spec = true;
+                }
             }
         }
         string declCls = clsName;

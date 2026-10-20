@@ -102,6 +102,19 @@ partial class Irgen {
     // the receiver's static type of each specialized clone (the concrete
     // instantiation of the class, when the clone specializes a generic class)
     public List<Node> specThis;
+    // the instantiations of generic classes the program uses: the class name
+    // and the container of its concrete type arguments. A generic class's
+    // static storage exists PER INSTANTIATION (the C host mangles the static
+    // names with the instantiation suffix), so the backend has to know every
+    // instantiation before it emits the globals and the static initializers.
+    public List<string> instClasses;
+    public List<Node> instConts;
+    public List<string> instKeys;
+    // the class instantiation of the method being emitted: a specialized clone
+    // of a generic class (`Stat<int>`) carries its concrete type arguments, so
+    // a bare static field inside it names that instantiation's own storage
+    public List<Node> curInstArgs;
+    public string curInstCls;
     public StringBuilder deferred; // hoisted lambda function definitions
     public StringBuilder entryAllocas; // per-function allocas hoisted to entry
     public bool eaActive;
@@ -167,6 +180,11 @@ partial class Irgen {
         specClss = new List<Node>();
         specThis = new List<Node>();
         specSyms = new List<string>();
+        instClasses = new List<string>();
+        instConts = new List<Node>();
+        instKeys = new List<string>();
+        curInstArgs = new List<Node>();
+        curInstCls = "";
         finBodies = new List<Node>();
         finLive = new List<int>();
         finActive = new List<int>();
@@ -1422,7 +1440,120 @@ partial class Irgen {
         }
         return "";
     }
-    ExprVal LoadStaticField(Node cls, string name) {
+    // ---- generic class instantiations ----
+    // The type arguments of a generic-qualified member access (`Stat<int>.s`):
+    // the parser keeps them on the access's `d` slot.
+    List<Node> InstArgsOf(Node access) {
+        if (access == null || access.d == null) { return null; }
+        if (access.d.kind != AK.TypeRef() || access.d.sval != "__typeargs") { return null; }
+        return access.d.kids;
+    }
+
+    // The same, but only when the class is generic and every argument is
+    // concrete: an open instantiation (`Stat<T>`) has no own storage.
+    List<Node> ConcreteInstArgs(Node access, string clsName) {
+        List<Node> a = InstArgsOf(access);
+        if (a == null || a.Count == 0) { return null; }
+        Node cls = binder.FindType(clsName);
+        if (cls == null) { return null; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || a.Count != tps.Count) { return null; }
+        int i = 0;
+        while (i < a.Count) {
+            if (a[i] == null || MentionsTypeParam(a[i])) { return null; }
+            i = i + 1;
+        }
+        return a;
+    }
+
+    // The suffix that tells one instantiation's storage from another's
+    // (`int`, `double`, `string__int`, ...).
+    string InstTag(List<Node> args) {
+        if (args == null || args.Count == 0) { return ""; }
+        string s = "";
+        int i = 0;
+        while (i < args.Count) {
+            if (i > 0) { s = s + "__"; }
+            s = s + TypeTag(args[i]);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    // The global that holds a static field. A generic class's static field has
+    // one global per instantiation (the C host mangles the name with the
+    // instantiation suffix); an ordinary class has exactly one.
+    string StaticGlobal(string owner, string name, List<Node> args) {
+        string g = "@__zan_sf_" + owner;
+        string tag = InstTag(args);
+        if (tag != "") { g = g + "_" + tag; }
+        return g + "_" + name;
+    }
+
+    // The type of an instantiation (`Stat<int>`): the class name with the
+    // concrete type arguments.
+    Node InstType(string clsName, List<Node> args) {
+        Node t = new Node(AK.TypeRef());
+        t.sval = clsName;
+        int i = 0;
+        while (i < args.Count) { t.Add(args[i]); i = i + 1; }
+        return t;
+    }
+
+    // Every instantiation of a generic class the program uses. The C host does
+    // the same before emitting (`discover_generic_insts`): a generic class's
+    // static storage exists per instantiation, so the backend has to know them
+    // all before it emits the globals and the static initializers.
+    void DiscoverInsts(Node unit) {
+        CollectInsts(unit);
+    }
+
+    void CollectInsts(Node n) {
+        if (n == null) { return; }
+        if (n.kind == AK.TypeRef()) {
+            if (n.sval != "__typeargs" && n.kids.Count > 0) { AddInst(n.sval, n.kids); }
+        }
+        if (n.kind == AK.MemberAccess() && n.a != null && n.a.kind == AK.Ident()) {
+            List<Node> a = ConcreteInstArgs(n, n.a.sval);
+            if (a != null) { AddInst(n.a.sval, a); }
+        }
+        CollectInsts(n.a); CollectInsts(n.b); CollectInsts(n.c); CollectInsts(n.d);
+        CollectInsts(n.type);
+        int i = 0;
+        while (i < n.kids.Count) { CollectInsts(n.kids[i]); i = i + 1; }
+    }
+
+    void AddInst(string clsName, List<Node> args) {
+        Node cls = binder.FindType(clsName);
+        if (cls == null) { return; }
+        List<string> tps = TParams(cls);
+        if (tps.Count == 0 || args.Count != tps.Count) { return; }
+        int i = 0;
+        while (i < args.Count) {
+            if (args[i] == null || MentionsTypeParam(args[i])) { return; }
+            i = i + 1;
+        }
+        string key = clsName + "|" + InstTag(args);
+        if (IndexOfStr(instKeys, key) >= 0) { return; }
+        instKeys.Add(key);
+        instClasses.Add(clsName);
+        Node cont = new Node(AK.TypeRef());
+        cont.sval = "__typeargs";
+        int j = 0;
+        while (j < args.Count) { cont.Add(args[j]); j = j + 1; }
+        instConts.Add(cont);
+    }
+
+    // The instantiation that applies to a static field of `owner` accessed
+    // without an explicit qualifier (inside the class): the current
+    // instantiation when the owner is the class being specialized.
+    List<Node> CurInstFor(string owner) {
+        if (curInstCls == "" || curInstCls != owner) { return null; }
+        if (curInstArgs == null || curInstArgs.Count == 0) { return null; }
+        return curInstArgs;
+    }
+
+    ExprVal LoadStaticField(Node cls, string name, List<Node> args) {
         string owner = StaticFieldOwner(cls, name);
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
@@ -1430,14 +1561,17 @@ partial class Irgen {
         // the field's type is written in the OWNING class's scope
         string savedScope = typeScopeCls;
         typeScopeCls = owner;
+        // the storage shape does NOT depend on the instantiation: the C host
+        // keeps the field's DECLARED type for every variant (`map_type(
+        // fsym->type)`) and mangles only the NAME
         string lt = MapType(fty);
-        string g = "@__zan_sf_" + owner + "_" + name;
+        string g = StaticGlobal(owner, name, args);
         string t = NT();
         L("  " + t + " = load " + lt + ", " + lt + "* " + g);
         typeScopeCls = savedScope;
         return new ExprVal(t, fty);
     }
-    void StoreStaticField(Node cls, string name, ExprVal v) {
+    void StoreStaticField(Node cls, string name, ExprVal v, List<Node> args) {
         string owner = StaticFieldOwner(cls, name);
         Node sf = FindStaticField(cls, name);
         if (sf == null) { throw new Exception("unknown static field " + owner + "." + name); }
@@ -1446,7 +1580,7 @@ partial class Irgen {
         string savedScope = typeScopeCls;
         typeScopeCls = owner;
         string lt = MapType(fty);
-        string g = "@__zan_sf_" + owner + "_" + name;
+        string g = StaticGlobal(owner, name, args);
         if (IsNullableValue(fty)) {
             L("  store i8* " + BoxFor(v, fty) + ", i8** " + g);
             typeScopeCls = savedScope;
@@ -1479,6 +1613,22 @@ partial class Irgen {
                 string lt = MapType(m.type);
                 typeScopeCls = savedScope;
                 H("@__zan_sf_" + cls.sval + "_" + m.sval + " = internal global " + lt + " zeroinitializer");
+                // a generic class's static field has ONE global per
+                // instantiation: the storage is not shared (`Stat<int>.s`
+                // and `Stat<double>.s` are different cells)
+                int k = 0;
+                while (k < instClasses.Count) {
+                    if (instClasses[k] == cls.sval) {
+                        List<Node> args = instConts[k].kids;
+                        string sc2 = typeScopeCls;
+                        typeScopeCls = cls.sval;
+                        string lt2 = MapType(m.type);
+                        typeScopeCls = sc2;
+                        H(StaticGlobal(cls.sval, m.sval, args)
+                          + " = internal global " + lt2 + " zeroinitializer");
+                    }
+                    k = k + 1;
+                }
             }
             i = i + 1;
         }
@@ -1491,37 +1641,59 @@ partial class Irgen {
             if (d.kind == AK.ClassDecl() || d.kind == AK.StructDecl()) {
                 curClass = d.sval; curHasThis = false;
                 locName = new List<string>(); locType = new List<Node>(); locReg = new List<string>();
-                int j = 0;
-                while (j < d.kids.Count) {
-                    Node m = d.kids[j];
-                    if (m.kind == AK.FieldDecl() && IsStatic(m) && m.b != null) {
-                        ExprVal iv = GenExpr(m.b);
-                        Node fty = m.type;
-                        string lt = MapType(fty);
-                        string g = "@__zan_sf_" + d.sval + "_" + m.sval;
-                        if (IsNullableValue(fty)) {
-                            L("  store i8* " + BoxFor(iv, fty) + ", i8** " + g);
-                        } else {
-                            string sv = Coerce(iv, lt);
-                            L("  store " + lt + " " + sv + ", " + lt + "* " + g);
-                            EmitArcRetainStore(sv, fty, iv.ty);
-                        }
+                // a generic class's static storage is per instantiation: the
+                // erased cell never exists (the C host emits the variants
+                // only), so the initializers run once per instantiation
+                if (TParams(d).Count == 0) { EmitStaticFieldInits(d, null); }
+                int k = 0;
+                while (k < instClasses.Count) {
+                    if (instClasses[k] == d.sval) {
+                        EmitStaticFieldInits(d, instConts[k].kids);
                     }
-                    j = j + 1;
+                    k = k + 1;
                 }
                 // the class's static constructor runs after its static field
                 // initializers (the C host's order)
-                int k = 0;
-                while (k < d.kids.Count) {
-                    Node cm = d.kids[k];
+                int j = 0;
+                while (j < d.kids.Count) {
+                    Node cm = d.kids[j];
                     if (cm.kind == AK.CtorDecl() && IsStatic(cm)) {
                         L("  call void @" + StaticCtorSym(d.sval) + "()");
                     }
-                    k = k + 1;
+                    j = j + 1;
                 }
             }
             i = i + 1;
         }
+    }
+
+    // The static field initializers of a class: for the erased storage, or for
+    // one instantiation's own cells.
+    void EmitStaticFieldInits(Node d, List<Node> args) {
+        List<Node> sargs = curInstArgs; string scls = curInstCls;
+        curInstArgs = args; curInstCls = d.sval;
+        int j = 0;
+        while (j < d.kids.Count) {
+            Node m = d.kids[j];
+            if (m.kind == AK.FieldDecl() && IsStatic(m) && m.b != null) {
+                ExprVal iv = GenExpr(m.b);
+                Node fty = m.type;
+                string savedScope = typeScopeCls;
+                typeScopeCls = d.sval;
+                string lt = MapType(fty);
+                typeScopeCls = savedScope;
+                string g = StaticGlobal(d.sval, m.sval, args);
+                if (IsNullableValue(fty)) {
+                    L("  store i8* " + BoxFor(iv, fty) + ", i8** " + g);
+                } else {
+                    string sv = Coerce(iv, lt);
+                    L("  store " + lt + " " + sv + ", " + lt + "* " + g);
+                    EmitArcRetainStore(sv, fty, iv.ty);
+                }
+            }
+            j = j + 1;
+        }
+        curInstArgs = sargs; curInstCls = scls;
     }
 
     // The number of instance fields the class chain below `cls` contributes
@@ -1781,6 +1953,11 @@ partial class Irgen {
         // can recognise them
         EmitContainerTids();
         EmitObjectRuntime();
+        // the instantiations of the generic classes the program uses: a
+        // generic class's static storage exists per instantiation, so they
+        // have to be known before the globals and the static initializers
+        // are emitted
+        DiscoverInsts(unit);
         // struct type decls first
         int i = 0;
         while (i < unit.kids.Count) {
@@ -1821,9 +1998,18 @@ partial class Irgen {
             // class it specializes (`Pool<string>`), so a field read inside it
             // resolves the real value type
             Node pthis = curThisTy;
+            List<Node> pargs = curInstArgs; string pcls = curInstCls;
             curThisTy = specThis[sp];
+            // the clone's class instantiation: its static storage is the one
+            // of that instantiation (`Stat<int>.s` is not `Stat<double>.s`)
+            curInstArgs = new List<Node>(); curInstCls = "";
+            if (curThisTy != null && curThisTy.kids.Count > 0) {
+                curInstArgs = curThisTy.kids;
+                curInstCls = curThisTy.sval;
+            }
             GenMethod(specClss[sp], specMs[sp], false);
             curThisTy = pthis;
+            curInstArgs = pargs; curInstCls = pcls;
             sp = sp + 1;
         }
         // The coroutine runtime is emitted unconditionally, not only when the
