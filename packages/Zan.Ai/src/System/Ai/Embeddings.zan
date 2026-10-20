@@ -1,0 +1,188 @@
+using System;
+using System.Json;
+using System.Net.Http;
+
+namespace System.Ai;
+
+// 向量化（embeddings）。
+//
+// 协议：**OpenAI 兼容的 `/v1/embeddings`**。这一个协议覆盖了几乎所有
+// 主流服务——OpenAI、DeepSeek、Ollama、vLLM、LM Studio、阿里云
+// 百炼的兼容模式等都用它。不做各厂商的私有嵌入协议（那是碎片化
+// 的根源，收益不抵成本）。
+//
+// 请求体：
+//   {"model": "...", "input": ["文本1", "文本2"]}
+//
+// 响应体：
+//   {"data": [{"embedding": [0.1, ...], "index": 0}, ...],
+//    "usage": {"prompt_tokens": 12, "total_tokens": 12}}
+//
+// 两条实现要点：
+// 1. **响应的 data 顺序不保证与请求一致**——协议里有 `index` 字段，
+//    本包**按 index 归位**，不靠数组顺序（靠顺序是典型的错位 bug
+//    来源：某个网关重排了数组，向量就全对不上号了）。
+// 2. **维度校验**：所有向量必须同维，否则下游的余弦相似度算不了。
+//    维度不一致直接报错，不做"截断到最短"这种和稀泥的处理。
+
+public class Embeddings {
+    // 一次向量化：把一组文本变成一组向量。
+    //
+    // texts 是输入文本（可以为空串——有些服务允许，但本包不替服务
+    // 做判断）。normalize 为 true 时把向量归一化到单位长度（余弦
+    // 检索时省掉每次的模长计算）。
+    //
+    // 失败返回 null（原因在 client.lastError）。
+    public static async AiEmbedding Embed(AiClient client, List<string> texts,
+    bool normalize) {
+        if (client == null) { return null; }
+        if (texts == null || texts.Count == 0) {
+            return new AiEmbedding(new List<List<double>>(), 0, new AiUsage());
+        }
+        AiEndpoint ep = AiEndpoint.Parse(client.config.baseUrl);
+        if (ep == null) {
+            client.lastError = "服务地址不合法: " + client.config.baseUrl;
+            return null;
+        }
+        if (client.config.model.Length == 0) {
+            client.lastError = "没有指定嵌入模型";
+            return null;
+        }
+
+        JsonValue arr = JsonValue.NewArray();
+        int promptChars = 0;
+        for (int i = 0; i < texts.Count; i = i + 1) {
+            string t = texts[i] == null ? "" : texts[i];
+            arr.AppendStr(t);
+            promptChars = promptChars + t.Length;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", client.config.model);
+        body.PutJson("input", arr.ToJson());
+
+        string raw = await client.PostJson(ep, "/embeddings", body);
+        if (raw == null) { return null; }
+        return Embeddings.ParseResponse(client, raw, texts.Count, normalize);
+    }
+
+    // 解析嵌入服务的响应（**可独立测试**——这是本包最该被测的地方：
+    // 归位、维度校验、错误提取全在��里）。
+    //
+    // expected 是本次请求的输入条数。返回 null 表示响应不可用，
+    // 原因在 client.lastError。
+    //
+    // 两条硬规则：
+    // 1. **按 index 归位**，不靠数组顺序（某个网关重排了数组，靠顺序
+    //    就是全部错位）。
+    // 2. **维度必须一致**——不一致直接报错，不做"截断到最短"那种
+    //    和稀泥的处理（截断会让相似度算出来是错的，且错得很隐蔽）。
+    public static AiEmbedding ParseResponse(AiClient client, string raw,
+    int expected, bool normalize) {
+        // JsonValue.Parse 对坏 JSON **抛异常**（不是返回 null）——
+        // 解析外部响应必须兜住，否则一个畸形响应就把调用方炸了。
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            client.lastError = "嵌入服务返回的内容无法解析";
+            return null;
+        }
+        if (root == null) {
+            client.lastError = "嵌入服务返回的内容无法解析";
+            return null;
+        }
+        string errMsg = AiClient.ErrorMessage(root);
+        if (errMsg.Length > 0) {
+            client.lastError = errMsg;
+            return null;
+        }
+        JsonValue data = root.Get("data");
+        if (data == null || !data.IsArray() || data.Count() == 0) {
+            client.lastError = "嵌入服务没有返回向量";
+            return null;
+        }
+
+        // 按 index 归位（不靠数组顺序）。
+        List<List<double>> slots = new List<List<double>>();
+        for (int i = 0; i < expected; i = i + 1) {
+            slots.Add(null);
+        }
+        int dims = 0;
+        for (int i = 0; i < data.Count(); i = i + 1) {
+            JsonValue one = data.At(i);
+            if (one == null) { continue; }
+            JsonValue idxVal = one.Get("index");
+            int at = idxVal == null ? i : (int)idxVal.AsDouble((double)i);
+            if (at < 0 || at >= slots.Count) { continue; }
+            JsonValue vec = one.Get("embedding");
+            if (vec == null || !vec.IsArray()) { continue; }
+            List<double> v = new List<double>();
+            for (int k = 0; k < vec.Count(); k = k + 1) {
+                v.Add(vec.At(k).AsDouble(0.0));
+            }
+            if (dims == 0) { dims = v.Count; }
+            else if (v.Count != dims) {
+                client.lastError = "嵌入服务返回的向量维度不一致（"
+                + Convert.ToString(dims) + " vs " + Convert.ToString(v.Count) + "）";
+                return null;
+            }
+            slots[at] = v;
+        }
+        // 有槽位没填上 → 响应不完整。
+        for (int i = 0; i < slots.Count; i = i + 1) {
+            if (slots[i] == null) {
+                client.lastError = "嵌入服务没有返回第 " + Convert.ToString(i)
+                + " 个向量";
+                return null;
+            }
+        }
+        if (normalize) {
+            for (int i = 0; i < slots.Count; i = i + 1) {
+                Embeddings.Normalize(slots[i]);
+            }
+        }
+        return new AiEmbedding(slots, dims, Embeddings.Usage(root));
+    }
+
+    // 从响应里取用量（服务端给了就用服务端的，否则用估算）。
+    private static AiUsage Usage(JsonValue root) {
+        JsonValue u = root.Get("usage");
+        if (u == null || !u.IsObject()) { return new AiUsage(); }
+        JsonValue pt = u.Get("prompt_tokens");
+        JsonValue tt = u.Get("total_tokens");
+        int p = pt == null ? 0 : (int)pt.AsDouble(0.0);
+        int t = tt == null ? 0 : (int)tt.AsDouble(0.0);
+        if (p <= 0 && t <= 0) { return new AiUsage(); }
+        return new AiUsage(p, t, false);
+    }
+
+    // 向量化（不归一化）。
+    public static async AiEmbedding Embed(AiClient client, List<string> texts) {
+        return await Embeddings.Embed(client, texts, false);
+    }
+
+    // 向量化一组块（分块 → 向量），块的顺序与向量顺序一一对应。
+    public static async AiEmbedding EmbedChunks(AiClient client,
+    List<AiChunk> chunks, bool normalize) {
+        if (chunks == null) { return null; }
+        List<string> texts = new List<string>();
+        for (int i = 0; i < chunks.Count; i = i + 1) {
+            texts.Add(chunks[i].text);
+        }
+        return await Embeddings.Embed(client, texts, normalize);
+    }
+
+    // 就地归一化到单位长度。零向量保持零（除零会得 NaN）。
+    public static void Normalize(List<double> v) {
+        if (v == null || v.Count == 0) { return; }
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) {
+            sum = sum + v[i] * v[i];
+        }
+        if (sum <= 0.0) { return; }
+        double inv = 1.0 / Math.Sqrt(sum);
+        for (int i = 0; i < v.Count; i = i + 1) {
+            v[i] = v[i] * inv;
+        }
+    }
+}

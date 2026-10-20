@@ -1,0 +1,316 @@
+// AI 应用管线（System.Ai）：统一 LLM 客户端 + 嵌入 + 文档分块。
+//
+// 覆盖：端点解析（scheme/host/port/path/本地端点/非法地址）；
+// token 估算的单一��径（CJK 与 ASCII）；文档分块的四种策略（递归/窗口/
+// 句子/段落）与**原文偏移可还原**；窗口的滑动步长；嵌入响应的解析
+// （按 index 归位、维度不一致报错、缺向量报错、错误提取）；余弦
+// 相似度；用量与成本核算；客户端在无网络时的失败语义（不抛异常、
+// 错误信息可读）。
+//
+// 本用例**不打网络**——嵌入响应解析是独立函数，直接喂 JSON 字符串；
+// 客户端只验证"连不上时返回 null + lastError 有内容"。
+using System;
+using System.Ai;
+
+namespace Conf;
+
+class Prog {
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 定点打印（避免 double 最短往返格式在平台间漂移）。
+    static string F(double v, int digits) {
+        double scale = 1.0;
+        for (int i = 0; i < digits; i = i + 1) { scale = scale * 10.0; }
+        double r = Math.Round(v * scale) / scale;
+        if (r == 0.0) { r = 0.0; }
+        return Convert.ToString(r);
+    }
+
+    static int Run() {
+        int bad = 0;
+
+        // ---- 1. 端点解析 ----
+        AiEndpoint ep = AiEndpoint.Parse("https://api.deepseek.com/v1");
+        if (ep == null) { bad = bad + 1; }
+        else {
+            Console.WriteLine("ep host=" + ep.Host() + " port=" + ep.Port()
+            + " path=" + ep.Path() + " tls=" + ep.Tls()
+            + " local=" + ep.Local());
+            if (ep.Host() != "api.deepseek.com") { bad = bad + 1; }
+            if (ep.Port() != 443) { bad = bad + 1; }
+            if (ep.Path() != "/v1") { bad = bad + 1; }
+            if (!ep.Tls()) { bad = bad + 1; }
+            if (ep.Local()) { bad = bad + 1; }
+        }
+
+        // 尾部斜杠要去掉。
+        AiEndpoint epSlash = AiEndpoint.Parse("https://api.openai.com/v1/");
+        if (epSlash == null || epSlash.Path() != "/v1") { bad = bad + 1; }
+
+        // 本地端点（http + 非默认端口）。
+        AiEndpoint epLocal = AiEndpoint.Parse("http://127.0.0.1:11434/v1");
+        if (epLocal == null) { bad = bad + 1; }
+        else {
+            Console.WriteLine("local host=" + epLocal.Host() + " port="
+            + epLocal.Port() + " local=" + epLocal.Local());
+            if (epLocal.Port() != 11434) { bad = bad + 1; }
+            if (!epLocal.Local()) { bad = bad + 1; }
+            if (epLocal.Tls()) { bad = bad + 1; }
+        }
+
+        // 非法地址：没 scheme、带 userinfo、带 fragment、空 host。
+        if (AiEndpoint.Parse("ftp://x/v1") != null) { bad = bad + 1; }
+        if (AiEndpoint.Parse("http://u:p@h/v1") != null) { bad = bad + 1; }
+        if (AiEndpoint.Parse("https://h/v1#frag") != null) { bad = bad + 1; }
+        if (AiEndpoint.Parse("") != null) { bad = bad + 1; }
+        if (AiEndpoint.Parse("https:///v1") != null) { bad = bad + 1; }
+        Console.WriteLine("bad urls rejected");
+
+        // 非法端口回落到默认（不猜端口）。
+        AiEndpoint epPort = AiEndpoint.Parse("https://h:notaport/v1");
+        if (epPort == null || epPort.Port() != 443) { bad = bad + 1; }
+
+        // ---- 2. token 估算（单一口径）----
+        // 10 个汉字 = 10 token（1 字 1 token）。
+        int cn = AiClient.EstimateTokens("第一段讲的是向量化。");
+        Console.WriteLine("tokens cn=" + cn);
+        if (cn != 10) { bad = bad + 1; }
+
+        // 36 个 ASCII = 9 token（4 字符 1 token，向上取整）。
+        int en = AiClient.EstimateTokens("abcdefghijklmnopqrstuvwxyzabcdefghij");
+        Console.WriteLine("tokens en=" + en);
+        if (en != 9) { bad = bad + 1; }
+
+        // 两处口径必须一致（切块说每块 4 token，估算也得是 4）。
+        List<AiChunk> win = Chunking.TokenWindow("abcdefghijklmnop", 4, 0);
+        if (win.Count != 1) { bad = bad + 1; }
+        else {
+            Console.WriteLine("win tokens=" + win[0].tokens);
+            if (win[0].tokens != 4) { bad = bad + 1; }
+            if (AiClient.EstimateTokens(win[0].text) != win[0].tokens) { bad = bad + 1; }
+        }
+        if (AiClient.EstimateTokens("") != 0) { bad = bad + 1; }
+
+        // ---- 3. 分块：句子（偏移可还原）----
+        string doc = "第一段讲的是向量化。第二段讲的是检索。第三段讲的是重排。";
+        List<AiChunk> sents = Chunking.Sentences(doc);
+        Console.WriteLine("sentences=" + sents.Count);
+        if (sents.Count != 3) { bad = bad + 1; }
+        for (int i = 0; i < sents.Count; i = i + 1) {
+            Console.WriteLine("  s[" + sents[i].index + "] ["
+            + sents[i].start + "," + sents[i].end + ") tok="
+            + sents[i].tokens + " " + sents[i].text);
+            if (sents[i].index != i) { bad = bad + 1; }
+        }
+        // 偏移能还原原文（引用溯源的基础）。
+        if (sents.Count == 3) {
+            string back = doc.Substring(sents[0].start,
+            sents[2].end - sents[0].start);
+            if (back != doc) { bad = bad + 1; }
+        }
+
+        // 句末标点后的收束引号归入本句。
+        List<AiChunk> quoted = Chunking.Sentences("他说「好。」然后走了。");
+        Console.WriteLine("quoted=" + quoted.Count);
+        if (quoted.Count != 2) { bad = bad + 1; }
+
+        // 英文句号也切。
+        List<AiChunk> enSents = Chunking.Sentences("Hello there. Bye now.");
+        Console.WriteLine("en sentences=" + enSents.Count);
+        if (enSents.Count != 2) { bad = bad + 1; }
+
+        // 无句末标点的尾巴也要成块（不丢内容）。
+        List<AiChunk> tail = Chunking.Sentences("有句子。尾巴没有标点");
+        Console.WriteLine("tail=" + tail.Count);
+        if (tail.Count != 2) { bad = bad + 1; }
+
+        // ---- 4. 分块：段落 ----
+        string para = "A段\n\nB段\n\nC段";
+        List<AiChunk> paras = Chunking.Paragraphs(para);
+        Console.WriteLine("paragraphs=" + paras.Count);
+        if (paras.Count != 3) { bad = bad + 1; }
+        if (paras.Count == 3) {
+            if (paras[0].text != "A段") { bad = bad + 1; }
+            if (paras[1].start != 6) { bad = bad + 1; }
+            if (paras[2].text != "C段") { bad = bad + 1; }
+        }
+
+        // ---- 5. 分块：递归（合并 + 不丢内容）----
+        string many = "短句一。短句二。短句三。短句四。短句五。短句六。";
+        List<AiChunk> rec = Chunking.Recursive(many, 30, 0);
+        Console.WriteLine("recursive=" + rec.Count);
+        for (int i = 0; i < rec.Count; i = i + 1) {
+            Console.WriteLine("  r[" + rec[i].index + "] len="
+            + (rec[i].end - rec[i].start) + " " + rec[i].text);
+            if (rec[i].end - rec[i].start > 30) { bad = bad + 1; }
+        }
+        // 无重叠时拼接应还原原文（不丢内容）。
+        if (Chunking.Join(rec, "") != many) { bad = bad + 1; }
+
+        // 无分隔符的纯文本按字符边界硬切（不劈开多字节字符）。
+        List<AiChunk> cjk = Chunking.Recursive("一二三四五六七八九十", 9, 0);
+        Console.WriteLine("cjk chunks=" + cjk.Count);
+        if (cjk.Count != 4) { bad = bad + 1; }
+        for (int i = 0; i < cjk.Count; i = i + 1) {
+            // 每块都应是完整字符（无替换字符 U+FFFD）。
+            if (cjk[i].text.IndexOf("�") >= 0) { bad = bad + 1; }
+        }
+        if (Chunking.Join(cjk, "") != "一二三四五六七八九十") { bad = bad + 1; }
+
+        // ---- 6. 分块：token 窗口（滑动步长 = 窗口 - 重叠）----
+        string slide = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnop";
+        List<AiChunk> sw = Chunking.TokenWindow(slide, 4, 1);
+        Console.WriteLine("slide windows=" + sw.Count);
+        for (int i = 0; i < sw.Count; i = i + 1) {
+            Console.WriteLine("  w[" + sw[i].index + "] ["
+            + sw[i].start + "," + sw[i].end + ") tok="
+            + sw[i].tokens + " " + sw[i].text);
+        }
+        // 窗口 4 token / 重叠 1 token → 步长 3 token = 12 字节。
+        if (sw.Count != 4) { bad = bad + 1; }
+        if (sw.Count == 4) {
+            if (sw[0].start != 0 || sw[0].end != 16) { bad = bad + 1; }
+            if (sw[1].start != 12) { bad = bad + 1; }
+            if (sw[3].end != slide.Length) { bad = bad + 1; }
+        }
+
+        // ---- 7. 嵌入响应解析 ----
+        AiClient client = new AiClient("https://api.deepseek.com/v1", "sk-test", "test-embed");
+
+        // 正常响应：按 index 归位（这里故意让数组顺序与 index 反着）。
+        string okJson = "{\"data\":[{\"index\":1,\"embedding\":[0.0,1.0]},"
+        + "{\"index\":0,\"embedding\":[1.0,0.0]}],"
+        + "\"usage\":{\"prompt_tokens\":5,\"total_tokens\":5}}";
+        AiEmbedding emb = Embeddings.ParseResponse(client, okJson, 2, false);
+        if (emb == null) {
+            Console.WriteLine("parse ok failed: " + client.lastError);
+            bad = bad + 1;
+        } else {
+            Console.WriteLine("emb dims=" + emb.dimensions + " count=" + emb.Count());
+            if (emb.dimensions != 2) { bad = bad + 1; }
+            if (emb.Count() != 2) { bad = bad + 1; }
+            // index 0 的向量必须是 [1,0]（不是 [0,1]）——归位生效。
+            if (emb.At(0).Count != 2) { bad = bad + 1; }
+            else {
+                if (emb.At(0)[0] != 1.0 || emb.At(0)[1] != 0.0) { bad = bad + 1; }
+                if (emb.At(1)[0] != 0.0 || emb.At(1)[1] != 1.0) { bad = bad + 1; }
+            }
+            // 服务端给了 usage → 标成非估算。
+            if (emb.usage.estimated) { bad = bad + 1; }
+            if (emb.usage.promptTokens != 5) { bad = bad + 1; }
+        }
+
+        // 归一化：向量变单位长。
+        AiEmbedding norm = Embeddings.ParseResponse(client, okJson, 2, true);
+        if (norm == null) { bad = bad + 1; }
+        else {
+            double len = Math.Sqrt(norm.At(0)[0] * norm.At(0)[0]
+            + norm.At(0)[1] * norm.At(0)[1]);
+            Console.WriteLine("norm len=" + F(len, 6));
+            if (Math.Abs(len - 1.0) > 1e-9) { bad = bad + 1; }
+        }
+
+        // 维度不一致 → 报错（不截断和稀泥）。
+        string badDim = "{\"data\":[{\"index\":0,\"embedding\":[1.0,0.0]},"
+        + "{\"index\":1,\"embedding\":[1.0,0.0,0.0]}]}";
+        AiEmbedding dimBad = Embeddings.ParseResponse(client, badDim, 2, false);
+        Console.WriteLine("dim mismatch rejected? " + (dimBad == null));
+        if (dimBad != null) { bad = bad + 1; }
+
+        // 少返回了一个向量 → 报错。
+        string missing = "{\"data\":[{\"index\":0,\"embedding\":[1.0,0.0]}]}";
+        AiEmbedding miss = Embeddings.ParseResponse(client, missing, 2, false);
+        Console.WriteLine("missing rejected? " + (miss == null));
+        if (miss != null) { bad = bad + 1; }
+
+        // 服务端错误 → lastError 有内容。
+        string errJson = "{\"error\":{\"message\":\"invalid api key\"}}";
+        AiEmbedding errEmb = Embeddings.ParseResponse(client, errJson, 1, false);
+        Console.WriteLine("err=" + client.lastError);
+        if (errEmb != null) { bad = bad + 1; }
+        if (client.lastError != "invalid api key") { bad = bad + 1; }
+
+        // 坏 JSON → 报错。
+        AiEmbedding badJson = Embeddings.ParseResponse(client, "not json", 1, false);
+        if (badJson != null) { bad = bad + 1; }
+
+        // ---- 8. 余弦相似度 ----
+        List<double> a = new List<double>();
+        a.Add(1.0); a.Add(0.0);
+        List<double> b = new List<double>();
+        b.Add(0.0); b.Add(1.0);
+        List<double> same = new List<double>();
+        same.Add(2.0); same.Add(0.0);
+        Console.WriteLine("cos perp=" + F(AiEmbedding.Cosine(a, b), 6)
+        + " cos same=" + F(AiEmbedding.Cosine(a, same), 6));
+        if (Math.Abs(AiEmbedding.Cosine(a, b)) > 1e-9) { bad = bad + 1; }
+        if (Math.Abs(AiEmbedding.Cosine(a, same) - 1.0) > 1e-9) { bad = bad + 1; }
+        // 维度不等 → 0.0（不抛）。
+        List<double> short3 = new List<double>();
+        short3.Add(1.0); short3.Add(2.0); short3.Add(3.0);
+        if (AiEmbedding.Cosine(a, short3) != 0.0) { bad = bad + 1; }
+        // 零向量 → 0.0（不是 NaN）。
+        List<double> zero = new List<double>();
+        zero.Add(0.0); zero.Add(0.0);
+        if (AiEmbedding.Cosine(a, zero) != 0.0) { bad = bad + 1; }
+
+        // ---- 9. 用量与成本 ----
+        AiUsage usage = new AiUsage(1000, 500, true);
+        if (usage.totalTokens != 1500) { bad = bad + 1; }
+        // 单价：输入 3 美元/百万，输出 15 美元/百万。
+        AiPricing pricing = new AiPricing("test", 3.0, 15.0);
+        double cost = usage.Cost(pricing);
+        Console.WriteLine("cost=" + F(cost, 8));
+        // 1000/1e6*3 + 500/1e6*15 = 0.003 + 0.0075 = 0.0105
+        if (Math.Abs(cost - 0.0105) > 1e-9) { bad = bad + 1; }
+        // 没有单价表 → 0.0（不内置会过期的价格）。
+        if (usage.Cost(null) != 0.0) { bad = bad + 1; }
+
+        // ---- 10. 客户端：连不上时的失败语义 ----
+        // 用一个必然连不通的地址（127.0.0.1:9，丢弃端口），短超时。
+        AiConfig cfg = new AiConfig("http://127.0.0.1:9/v1", "sk-test", "test-model");
+        cfg.connectTimeoutMs = 300;
+        cfg.readTimeoutMs = 300;
+        cfg.totalTimeoutMs = 800;
+        cfg.maxAttempts = 1;
+        AiClient dead = new AiClient(cfg);
+        string reply = await dead.Complete("sys", "hello");
+        Console.WriteLine("dead reply null? " + (reply == null));
+        Console.WriteLine("dead err has text? " + (dead.lastError.Length > 0));
+        if (reply != null) { bad = bad + 1; }
+        if (dead.lastError.Length == 0) { bad = bad + 1; }
+
+        // 非法 base URL → 立即失败（不发请求）。
+        AiConfig badCfg = new AiConfig("not-a-url", "k", "m");
+        AiClient badClient = new AiClient(badCfg);
+        string badReply = await badClient.Complete("sys", "hello");
+        if (badReply != null) { bad = bad + 1; }
+        if (badClient.lastError != "服务地址不合法: not-a-url") { bad = bad + 1; }
+
+        // 没有模型 → 立即失败。
+        AiConfig noModel = new AiConfig("https://h/v1", "k", "");
+        AiClient nm = new AiClient(noModel);
+        string nmReply = await nm.Complete("sys", "hello");
+        if (nmReply != null) { bad = bad + 1; }
+        if (nm.lastError != "没有指定模型") { bad = bad + 1; }
+
+        // ---- 11. 消息 JSON ----
+        List<string[]> msgs = new List<string[]>();
+        msgs.Add(new string[] { "system", "你是助手" });
+        msgs.Add(new string[] { "user", "问题" });
+        string msgJson = AiClient.MessagesJson(msgs);
+        Console.WriteLine("messages=" + msgJson);
+        if (msgJson.IndexOf("\"role\":\"system\"") < 0) { bad = bad + 1; }
+        if (msgJson.IndexOf("\"content\":\"问题\"") < 0) { bad = bad + 1; }
+
+        Console.WriteLine("ai-pipeline-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

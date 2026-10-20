@@ -1,0 +1,358 @@
+using System;
+using System.Json;
+using System.Net.External;
+using System.Net.Http;
+using System.Net.Http.Client;
+using System.Text;
+
+namespace System.Ai;
+
+// 统一 LLM 客户端。
+//
+// 职责：把"调一个大模型"这件事封成一个可复用的调用——多厂商端点、
+// 超时预算、重试、流式/非流式、Token 计数与成本核算。
+//
+// **不依赖任何 Web 框架**（这是与 `Zan.Mvc/Framework/Ai` 的根本区别：
+// 那个绑在 `HttpContext` 与 `Settings` 上，只能在 Web 应用里用）。
+//
+// ## 重试策略
+//
+// 只对**网络错误**与 **5xx** 重试。4xx 是请求本身的问题（key 错、
+// 参数错、额度不足），重试没有意义只会浪费配额。
+//
+// **POST 补全默认不重试**（`maxAttempts` 默认 1）：补全没有幂等键，
+// 重试可能重复计费。需要重试的只读调用（embeddings）可以自己把
+// `maxAttempts` 调大。
+//
+// ## Token 计数
+//
+// `EstimateTokens` 是**启发式估算**，不是厂商 tokenizer 的真值。多数
+// 厂商的响应里带 usage，但各家字段名与语义不一致（有的单列 reasoning
+// token、有的单列 cached token），统一口径反而对不上。所以本包一律
+// 用估算，并用 `AiUsage.estimated` 标出来。
+//
+// ## 流式
+//
+// `Stream` 用 SSE 逐块推给回调。回调返回 false 表示**调用方主动停止**
+// （客户端断开），此时不再继续读流。
+
+public class AiClient {
+    public AiConfig config;
+
+    public AiClient(AiConfig config) {
+        this.config = config == null ? new AiConfig("", "", "") : config;
+    }
+
+    // 构造（直接给三元组）。
+    public AiClient(string baseUrl, string apiKey, string model) {
+        this.config = new AiConfig(baseUrl, apiKey, model);
+    }
+
+    // ------------------------------------------------------------------
+    // 非流式补全
+    // ------------------------------------------------------------------
+
+    // 补全（单条消息）。systemPrompt 可为空串。
+    //
+    // 失败返回 null（错误原因在 LastError 里）——调用方要么检查 null，
+    // 要么读 LastError 看原因。不用异常：网络失败是常态（超时、
+    // 断网、服务端 5xx），用返回值比抛异常顺手。
+    public async string Complete(string systemPrompt, string userPrompt) {
+        List<string[]> msgs = new List<string[]>();
+        if (systemPrompt != null && systemPrompt.Length > 0) {
+            msgs.Add(new string[] { "system", systemPrompt });
+        }
+        msgs.Add(new string[] { "user", userPrompt == null ? "" : userPrompt });
+        return await this.CompleteMessages(msgs, 0.0, "");
+    }
+
+    // 补全（多轮消息）。messages 是 {role, content} 的列表。
+    //
+    // temperature < 0 表示用服务端的默认值（不传该字段）。
+    // stop 非空时作为停止序列（服务端支持才有效果）。
+    public async string CompleteMessages(List<string[]> messages, double temperature,
+    string stop) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        if (this.config.model.Length == 0) {
+            this.lastError = "没有指定模型";
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        if (stop != null && stop.Length > 0) {
+            body.PutStr("stop", stop);
+        }
+        body.PutBool("stream", false);
+        body.PutJson("messages", AiClient.MessagesJson(messages));
+
+        string raw = await this.PostJson(ep, "/chat/completions", body);
+        if (raw == null) { return null; }
+        // JsonValue.Parse 对坏 JSON **抛异常**（不是返回 null）——
+        // 解析外部响应必须兜住。
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        if (root == null) {
+            this.lastError = "AI 服务返回的内容无法解析";
+            return null;
+        }
+        string errMsg = AiClient.ErrorMessage(root);
+        if (errMsg.Length > 0) {
+            this.lastError = errMsg;
+            return null;
+        }
+        JsonValue choices = root.Get("choices");
+        if (choices == null || !choices.IsArray() || choices.Count() == 0) {
+            this.lastError = "AI 服务没有返回回答";
+            return null;
+        }
+        JsonValue msg = choices.At(0).Get("message");
+        if (msg == null) {
+            this.lastError = "AI 服务没有返回回答";
+            return null;
+        }
+        // 记下用量（若服务端口径一致就用服务端的，否则保持估算）。
+        this.CaptureUsage(root);
+        return msg.Str("content", "");
+    }
+
+    // 补全并返回用量（成本核算用）。
+    public async AiUsage CompleteWithUsage(string systemPrompt, string userPrompt) {
+        string r = await this.Complete(systemPrompt, userPrompt);
+        if (r == null) { return new AiUsage(); }
+        return this.lastUsage;
+    }
+
+    // ------------------------------------------------------------------
+    // 流式补全
+    // ------------------------------------------------------------------
+
+    // 流式补全：逐块把增量文本推给 onDelta。
+    //
+    // onDelta 返回 false 表示调用方要停止（客户端断开）——此时不再
+    // 继续读流，直接返回已收到的全文。
+    //
+    // 返回完整文本（把所有增量拼起来）。
+    public async string Stream(List<string[]> messages, double temperature,
+    AiDeltaFn onDelta) {
+        this.lastError = "";
+        AiEndpoint ep = AiEndpoint.Parse(this.config.baseUrl);
+        if (ep == null) {
+            this.lastError = "服务地址不合法: " + this.config.baseUrl;
+            return null;
+        }
+        JsonValue body = JsonValue.NewObject();
+        body.PutStr("model", this.config.model);
+        if (temperature >= 0.0) {
+            body.PutDouble("temperature", temperature);
+        }
+        body.PutBool("stream", true);
+        body.PutJson("messages", AiClient.MessagesJson(messages));
+
+        StringBuilder sb = new StringBuilder();
+        string raw = await this.PostJson(ep, "/chat/completions", body);
+        if (raw == null) { return null; }
+        // SSE 帧：每行一条 "data: {...}"，以 "[DONE]" 结束。
+        // 按行切用 IndexOf 手工做（Zan 的 string 没有 Split）。
+        string pending = "";
+        int at = 0;
+        while (at < raw.Length) {
+            int nl = raw.IndexOf("\n", at);
+            string line;
+            if (nl < 0) {
+                line = raw.Substring(at);
+                at = raw.Length;
+            } else {
+                line = raw.Substring(at, nl - at);
+                at = nl + 1;
+            }
+            line = line.Trim();
+            if (line.Length == 0) { continue; }
+            if (!line.StartsWith("data:")) { continue; }
+            string payload = line.Substring(5).Trim();
+            if (payload == "[DONE]") { break; }
+            JsonValue frame = null;
+            try {
+                frame = JsonValue.Parse(payload);
+            } catch (Exception e) {
+                continue;   // 坏帧跳过，不让整条流断掉
+            }
+            if (frame == null) { continue; }
+            JsonValue choices = frame.Get("choices");
+            if (choices == null || !choices.IsArray() || choices.Count() == 0) { continue; }
+            JsonValue delta = choices.At(0).Get("delta");
+            if (delta == null) { continue; }
+            string piece = delta.Str("content", "");
+            if (piece.Length == 0) { continue; }
+            sb.Append(piece);
+            if (onDelta != null) {
+                if (!onDelta(piece)) { break; }
+            }
+        }
+        return sb.ToString();
+    }
+
+    // ------------------------------------------------------------------
+    // 内部：HTTP
+    // ------------------------------------------------------------------
+
+    // 发起一次 POST（带重试）。失败返回 null，原因在 lastError。
+    //
+    // public 是因为 `Embeddings` 也用它（同一套出网预算与重试策略
+    // 不该写两遍）。包内调用不会绕过 lastError 的约定。
+    public async string PostJson(AiEndpoint ep, string path, JsonValue body) {
+        string payload = body.ToJson();
+        if (payload.Length > this.config.requestLimitBytes) {
+            this.lastError = "请求体超过上限（"
+            + Convert.ToString(this.config.requestLimitBytes) + " 字节）";
+            return null;
+        }
+        int attempts = this.config.maxAttempts;
+        if (attempts < 1) { attempts = 1; }
+        string lastReason = "";
+        for (int attempt = 0; attempt < attempts; attempt = attempt + 1) {
+            if (attempt > 0) {
+                // 指数退避：100ms / 200ms / 400ms …（上限 2 秒）。
+                int wait = 100 * (1 << (attempt - 1));
+                if (wait > 2000) { wait = 2000; }
+                await Task.Delay(wait);
+            }
+            HttpClient http = null;
+            try {
+                if (ep.Tls()) {
+                    http = HttpClient.CreateHttps(ep.Host(), ep.Port());
+                } else {
+                    http = new HttpClient(ep.Host(), ep.Port());
+                }
+                http.SetCallPolicy(this.Policy(ep));
+                http.SetHeader("Content-Type", "application/json");
+                http.SetHeader("Accept", "application/json");
+                if (this.config.apiKey.Length > 0) {
+                    http.SetHeader("Authorization", "Bearer " + this.config.apiKey);
+                }
+                HttpResponse resp = await http.SendAsync("POST", ep.Path() + path, payload);
+                int status = resp.statusCode;
+                string bodyText = resp.body;
+                if (status >= 200 && status < 300) {
+                    return bodyText;
+                }
+                // 4xx 不重试（请求本身有问题）。
+                if (status < 500) {
+                    this.lastError = AiClient.HttpErrorMessage(status, bodyText);
+                    return null;
+                }
+                lastReason = "AI 服务返回 " + Convert.ToString(status);
+            } catch (Exception e) {
+                lastReason = "请求 AI 服务失败：" + e.Message;
+            }
+        }
+        this.lastError = lastReason;
+        return null;
+    }
+
+    // 出网预算。响应与请求体都有上限，超限的响应不会进内存。
+    private ExternalCallPolicy Policy(AiEndpoint ep) {
+        ExternalCallPolicy p = ExternalCallPolicy.Default()
+        .ConnectTimeout(this.config.connectTimeoutMs)
+        .ReadTimeout(this.config.readTimeoutMs)
+        .TotalTimeout(this.config.totalTimeoutMs)
+        .RequestLimit(this.config.requestLimitBytes)
+        .ResponseLimit(this.config.responseLimitBytes)
+        .ErrorLimit(128 * 1024)
+        .Redirects(0)
+        .RetryNetwork(false)
+        .RetryAttempts(0);
+        if (ep.Local()) { p.AllowLocalHttp(); }
+        return p;
+    }
+
+    // ------------------------------------------------------------------
+    // 静态辅助
+    // ------------------------------------------------------------------
+
+    // 消息列表 → JSON 数组文本。
+    public static string MessagesJson(List<string[]> messages) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < messages.Count; i = i + 1) {
+            JsonValue m = JsonValue.NewObject();
+            m.PutStr("role", messages[i][0]);
+            m.PutStr("content", messages[i][1]);
+            arr.Append(m);
+        }
+        return arr.ToJson();
+    }
+
+    // 估算 token 数（启发式）。
+    //
+    // CJK 字符约 1 token，其余约 4 字符 1 token。这是各厂商 tokenizer
+    // 的经验区间，不是真值——精确计数要接厂商的 tokenizer。
+    //
+    // 与 `Chunking.EstimateTokens` 是**同一把尺子**（`Chunking.TokenCost`
+    // 的 4 倍刻度）——两处口径不一致会让"切出来说每块 100 token，
+    // 一算却是 25"。
+    public static int EstimateTokens(string text) {
+        return Chunking.EstimateTokens(text);
+    }
+
+    // 从响应里取错误信息（OpenAI 兼容格式：error.message）。
+    // 不是错误返回空串。
+    public static string ErrorMessage(JsonValue root) {
+        if (root == null) { return ""; }
+        JsonValue err = root.Get("error");
+        if (err == null || !err.IsObject()) { return ""; }
+        return err.Str("message", "AI 服务返回错误");
+    }
+
+    // 从 HTTP 响应里提错误文案（4xx 时的解释）。
+    private static string HttpErrorMessage(int status, string body) {
+        string detail = "";
+        if (body != null && body.Length > 0) {
+            JsonValue root = null;
+            try {
+                root = JsonValue.Parse(body);
+            } catch (Exception e) {
+                root = null;
+            }
+            if (root != null) {
+                detail = AiClient.ErrorMessage(root);
+            }
+        }
+        if (detail.Length == 0) {
+            detail = "AI 服务返回 " + Convert.ToString(status);
+        }
+        return detail;
+    }
+
+    // 记录用量：服务端口径与本包一致就用服务端的，否则保持估算。
+    private void CaptureUsage(JsonValue root) {
+        JsonValue usage = root.Get("usage");
+        if (usage == null || !usage.IsObject()) { return; }
+        JsonValue pt = usage.Get("prompt_tokens");
+        JsonValue ct = usage.Get("completion_tokens");
+        if (pt == null && ct == null) { return; }
+        int p = pt == null ? 0 : (int)pt.AsDouble(0.0);
+        int c = ct == null ? 0 : (int)ct.AsDouble(0.0);
+        if (p <= 0 && c <= 0) { return; }
+        this.lastUsage = new AiUsage(p, c, false);
+    }
+
+    // 上一次失败的原因（成功时为空串）。
+    public string lastError;
+    // 上一次调用的用量。
+    public AiUsage lastUsage;
+}
+
+// 流式增量回调：返回 false 表示停止。
+public delegate bool AiDeltaFn(string delta);

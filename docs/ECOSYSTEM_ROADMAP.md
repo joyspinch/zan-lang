@@ -574,7 +574,7 @@ conformance `analytics_bridge`（统计的已知值核对与边界语义、
 类目轴不覆盖、缺列抛异常、空表桥接不崩）。
 
 **已知边界**：无多级索引与缺失值处理（多级索引与缺失值是表级变换的
-另一块，见 §1.17 末尾）；`GroupedSeries` 只做等值分组，不做区间分箱；
+另一块，见 §1.19 末尾）；`GroupedSeries` 只做等值分组，不做区间分箱；
 `ToDataset` 的 Str 列不隐式转数值（列建错类型不会被静默修正）。
 
 ### 1.16 三维动画运行时：`Zan.Game.Animation`
@@ -689,7 +689,7 @@ deflate/lz4/zstd"）**已经过期**：`packages/Zan.IO/src/System/IO/Compressio
 
 ---
 
-### 1.17 表级变换：`Zan.DataFrame` 补齐 pandas 的 reshape 家族
+### 1.19 表级变换：`Zan.DataFrame` 补齐 pandas 的 reshape 家族
 
 **不新建平行包**：表级变换（选列/算列/去重/拼接/宽转长/长转宽/透视/连接/
 窗口/重采样）全部是 `DataFrame` 的操作，与 §1.15 的统计同属一个包。
@@ -746,6 +746,76 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 无 `groupby().agg()` 的自定义聚合字典（`Aggregate` 只认固定的 5 个算子）、
 无 `Concat` 的列名对齐重命名、无 `Resample` 的升采样与时间偏移
 （`asfreq`/`offset`）、无区间分箱（`GroupedSeries` 只做等值分组）。
+
+---
+
+### 1.20 AI 应用管线：`Zan.Ai`
+
+**新建独立包**（`packages/Zan.Ai`，命名空间 `System.Ai`）。理由：
+`Zan.Mvc/Framework/Ai` 那 7 个文件是 Web 框架内的一小块，绑死在
+`HttpContext` 与 `Settings` 上——桌面/游戏/CLI 场景用不了。AI 管线
+是跨场景的通用能力，该独立成包（依赖方向：`System.Ai → System.Net`，
+反过来不可能）。
+
+**缺口（实测）**：Zan 的 AI 侧**零件全有、组装线没有**——
+
+| 环节 | 已有 | 缺 |
+|---|---|---|
+| 分词 | `Zan.Text/TextTokenizer`（含 CJK 判定） | 文档分块 |
+| 全文检索 | `Zan.Text/Bm25Index` | — |
+| 向量索引 | `Zan.Data/ZanDb/VectorIndex`（HNSW） | 向量**生产**（embedding 客户端） |
+| LLM 调用 | `Zan.Mvc/Ai`（绑死在 Web 框架） | 独立可复用的客户端 |
+| 端点解析 | `Zan.Mvc/Ai/AiEndpoint` | 通用版 |
+
+即"文档 → 分块 → 向量化 → 检索 → 拼提示词 → 生成"这条链，
+前半段（分块、向量化）没有可复用的实现。
+
+| 文件 | 位置 | 内容 |
+|---|---|---|
+| `AiClient.zan` | `packages/Zan.Ai/src/System/Ai/` | `AiClient`：非流式/流式补全、重试、超时预算、Token 计数、`lastError` 失败语义 |
+| `Embeddings.zan` | 同上 | `Embeddings`：OpenAI 兼容 `/v1/embeddings`、批量、归一化、**按 index 归位**、维度校验 |
+| `Chunking.zan` | 同上 | `Chunking`：递归字符分割 / token 窗口 / 句子 / 段落，四种策略 |
+| `AiEndpoint.zan` | 同上 | `AiEndpoint`：base URL → scheme/host/port/path；本地端点识别 |
+| `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` |
+
+**六条硬取舍**：
+
+1. **失败用返回值不用异常**：网络失败是常态（超时、断网、5xx），
+   `Complete` 返回 null + `client.lastError` 有可读原因，比抛异常顺手。
+2. **4xx 不重试，POST 补全默认不重试**（`maxAttempts` 默认 1）：补全
+   没有幂等键，重试可能重复计费。5xx 与网络错误才重试（指数退避，
+   上限 2 秒）。
+3. **嵌入响应按 `index` 归位，不靠数组顺序**：协议里有 `index` 字段，
+   靠顺序是典型的错位 bug 来源（某个网关重排了数组，向量就全对不上
+   号）。维度不一致直接报错，**不截断和稀泥**（截断会让相似度算错
+   且错得隐蔽）。
+4. **token 估算单一口径**：`Chunking.TokenCost`（4 倍刻度：CJK 4、
+   ASCII 1、其它 2）与 `AiClient.EstimateTokens` 是同一把尺子。
+   两处口径不一致是这类库里最常见的 bug——切出来说"每块 100 token"，
+   一算却是 25。**成本是估算**，`AiUsage.estimated` 标出来。
+5. **不内置模型价格**：价格会变，内置就是内置一份会过期的谎言。
+   `AiPricing` 由调用方传。
+6. **`JsonValue.Parse` 对坏 JSON 抛异常**（不是返回 null），所以所有
+   解析外部响应的路径都兜了 try/catch——一个畸形响应不该把调用方炸了。
+
+**偏移单位是字节不是字符**：Zan 的 `string` 是 UTF-8 字节序列，
+`AiChunk.start/end` 与 `string.Substring` 同口径（字节），切分点必须
+落在字符边界上（劈开多字节字符会产出替换字符，块内容就脏了）。
+
+conformance `ai_pipeline`（端点解析的 host/port/path/本地端点与五类
+非法地址：没 scheme、带 userinfo、带 fragment、空 host、非法端口；
+token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数、原文
+偏移可还原、**无分隔符时按字符边界硬切不产生替换字符**、滑动窗口
+的步长 = 窗口 - 重叠；嵌入响应的按 index 归位、归一化后模长为 1、
+维度不一致报错、少返回向量报错、服务端错误提取、坏 JSON 不炸；
+余弦相似度的正交/同向/维度不等/零向量；用量的 total 与成本核算；
+客户端在连不上/地址非法/没模型三种情况下的失败语义）。
+
+**已知边界**：无 RAG 编排（检索→重排→拼提示词→生成）、无向量库
+客户端（只产出向量，存储与检索要靠 `Zan.Data` 的 `VectorIndex` 自接）、
+无 Tool calling、无会话记忆、无评估与可观测、无流式的**背压**（回调
+返回 false 只能停在这一帧之后）、无 Token 精确计数（要接厂商
+tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家私有协议）。
 
 ---
 

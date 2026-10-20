@@ -1,0 +1,394 @@
+using System;
+using System.Text;
+
+namespace System.Ai;
+
+// 文档分块。
+//
+// 分块是 RAG 的第一道关口：块太大则检索不精准（召回一堆无关内容），
+// 块太小则上下文断裂（检索到了但接不上话）。四种策略：
+//
+// - Recursive：按分隔符递归切（段落 → 句子 → 词 → 字符），**不跨
+//   语义边界**地切，块大小尽量接近目标。
+// - TokenWindow：按 token 窗口切，块之间有重叠。
+// - Sentence：按句子切（保语义完整，大小不均）。
+// - Paragraph：按空行分段（保结构，大小很不均）。
+//
+// 三条通用规则：
+// 1. **块有原文偏移**（`AiChunk.start/end`）——检索到的块要能还原回
+//    原文上下文，引用溯源全靠它。
+// 2. **不丢内容**：所有块覆盖原文（可以有重叠，但不该有空洞）。
+// 3. **空块不产生**（切完为空白的段直接跳过，不产出空文本块）。
+//
+// **偏移单位是字节不是字符**：Zan 的 `string` 是 UTF-8 字节序列，
+// `s.Length` 与索引都是字节。所以本包的 `start/end` 是字节偏移，
+// 与 `string.Substring` 的口径一致。切分点必须落在字符边界上——
+// 本包的所有切分都经过 `Encoding.DecodeCodePoint` 扫描，保证不会
+// 把一个多字节字符劈成两半（劈开会产出替换字符，块内容就脏了）。
+//
+// **token 估算的单一口径**：本包所有 token 数都用 `TokenCost`
+// （4 倍整数的刻度：CJK 4、ASCII 1、其它 2，除以 4 得 token 数）。
+// `Chunking.TokenWindow` 的窗口与 `AiClient.EstimateTokens` 的计数
+// 用的是同一把尺子——两处口径不一致是这类库里最常见的 bug 来源
+// （切出来说"每块 100 token"，一算却是 25）。
+
+public class Chunking {
+    // ------------------------------------------------------------------
+    // token 估算（单一口径）
+    // ------------------------------------------------------------------
+
+    // 一个字符的 token 成本（**4 倍刻度**的整数）。
+    //
+    // CJK 字符 4（即 1 token——绝大多数中文分词器的经验值）；ASCII
+    // 1（即 ¼ token——英文 BPE 的典型压缩比，4 字符 1 token）；其它
+    // 多字节字符 2（折中）。
+    //
+    // **成本与字节长度是两回事**：一个汉字 3 字节但成本 4；一个 ASCII
+    // 字符 1 字节成本 1。调用方要用字节长度推进游标（`AdvanceOne`），
+    // 不要拿返回值当长度用——把"3 字节 × 4"当成成本会让中文的 token
+    // 数虚高 3 倍。
+    public static int TokenCost(string text, int at, int[] scalar) {
+        if (at < 0 || at >= text.Length) { return 0; }
+        int used = Encoding.DecodeCodePoint(text, at, scalar);
+        int cp = scalar[0];
+        if (cp < 128) { return 1; }             // ASCII：1 刻度
+        if (Chunking.IsCjk(cp)) { return 4; }   // CJK：4 刻度（1 token）
+        return 2;                              // 其它：2 刻度
+    }
+
+    // 全文的 token 数（4 倍刻度除以 4，向上取整）。
+    public static int EstimateTokens(string text) {
+        if (text == null || text.Length == 0) { return 0; }
+        int[] scalar = new int[1];
+        int sum = 0;
+        int i = 0;
+        while (i < text.Length) {
+            sum = sum + Chunking.TokenCost(text, i, scalar);
+            i = i + Chunking.AdvanceOne(text, i, scalar);
+        }
+        return (sum + 3) / 4;
+    }
+
+    // 从 at 起的那个字符占多少字节（推进游标用）。
+    public static int AdvanceOne(string text, int at, int[] scalar) {
+        int used = Encoding.DecodeCodePoint(text, at, scalar);
+        if (used <= 0) { return 1; }
+        return used;
+    }
+
+    // 是否 CJK 码点（与 `System.Text.TextTokenizer.IsCjk` 同口径：
+    // 汉字与标点区）。判定用码点，不用字节——字节判 CJK 会把
+    // UTF-8 的后续字节误当独立字符。
+    public static bool IsCjk(int cp) {
+        return cp == 12295 || (cp >= 13312 && cp <= 19903)
+        || (cp >= 19968 && cp <= 40959) || (cp >= 63744 && cp <= 64255)
+        || (cp >= 131072 && cp <= 195103) || (cp >= 196608 && cp <= 205743);
+    }
+
+    // 句末标点判定（码点级）。
+    public static bool IsSentenceEnd(int cp) {
+        return cp == 12290 || cp == 65281 || cp == 65311        // 。！？
+        || cp == 46 || cp == 33 || cp == 63;               // . ! ?
+    }
+
+    // 句子收尾（跟在句末标点后的收束字符）。
+    public static bool IsSentenceClose(int cp) {
+        return cp == 41 || cp == 93 || cp == 34 || cp == 39     // ) ] " '
+        || cp == 12309 || cp == 12291 || cp == 12290;       // 』」』
+    }
+
+    // ------------------------------------------------------------------
+    // 递归字符分割
+    // ------------------------------------------------------------------
+
+    // 递归字符分割：按分隔符逐层降级，直到单段能塞进 maxChars。
+    //
+    // 分隔符优先级：段落（\n\n）→ 单换行（\n）→ 中文句末标点
+    // （。！？）→ 英文句末标点（.!?）→ 中英文逗号（，,）→ 空格 →
+    // 字符。
+    //
+    // maxChars 的单位是**字节**（与 string.Length 一致）。中文文档
+    // 一个字 3 字节，所以 800 字节大约是 260 个汉字。
+    //
+    // overlap 是相邻块的重叠字节数（按块尾回退）。0 表示不重叠。
+    // overlap >= maxChars 时被压到 maxChars - 1（否则块会原地踏步）。
+    //
+    // 返回的块按原文顺序，start/end 是字节偏移。
+    public static List<AiChunk> Recursive(string text, int maxChars, int overlap) {
+        List<AiChunk> outp = new List<AiChunk>();
+        if (text == null || text.Length == 0) { return outp; }
+        if (maxChars < 1) { maxChars = 1; }
+        if (overlap < 0) { overlap = 0; }
+        if (overlap >= maxChars) { overlap = maxChars - 1; }
+
+        // 1) 切成小段（可能很小，比如每句一段）。
+        List<int[]> pieces = new List<int[]>();
+        Chunking.CutRecursive(text, 0, text.Length, maxChars, pieces);
+
+        // 2) 合并相邻小段（合并后不超 maxChars 才合），得到"块边界"。
+        List<int[]> blocks = new List<int[]>();
+        int i = 0;
+        while (i < pieces.Count) {
+            int curStart = pieces[i][0];
+            int curEnd = pieces[i][1];
+            i = i + 1;
+            while (i < pieces.Count) {
+                int ps = pieces[i][0];
+                int pe = pieces[i][1];
+                // 合并要连贯（ps <= curEnd），且合起来不超上限。
+                if (ps > curEnd) { break; }
+                if (pe - curStart > maxChars) { break; }
+                curEnd = pe;
+                i = i + 1;
+            }
+            blocks.Add(new int[] { curStart, curEnd });
+        }
+
+        // 3) 加重叠后产出。重叠靠"把起点往回拉"实现。
+        int index = 0;
+        int b = 0;
+        while (b < blocks.Count) {
+            int start = blocks[b][0];
+            int end = blocks[b][1];
+            if (b > 0 && overlap > 0) {
+                int back = end - overlap;
+                int aligned = Chunking.BackToCharBoundary(text, back);
+                if (aligned > blocks[b][0]) { start = aligned; }
+            }
+            string body = text.Substring(start, end - start);
+            if (body.Trim().Length > 0) {
+                outp.Add(new AiChunk(body, start, end, index,
+                Chunking.EstimateTokens(body)));
+                index = index + 1;
+            }
+            b = b + 1;
+        }
+        return outp;
+    }
+
+    // 递归切分：把 [lo, hi) 切成不超过 maxChars 的若干段。
+    private static void CutRecursive(string text, int lo, int hi, int maxChars,
+    List<int[]> pieces) {
+        int len = hi - lo;
+        if (len <= 0) { return; }
+        if (len <= maxChars) {
+            pieces.Add(new int[] { lo, hi });
+            return;
+        }
+        // 找最优先的分隔符；找到就在那里切，否则按字符边界硬切。
+        string[] seps = new string[] { "\n\n", "\n", "。", "！", "？", ".", "!",
+        "?", "，", ",", " " };
+        for (int s = 0; s < seps.Length; s = s + 1) {
+            string sep = seps[s];
+            int cut = text.IndexOf(sep, lo);
+            if (cut < 0 || cut >= hi) { continue; }
+            // 分隔符归前一段（保标点）。
+            int segEnd = cut + sep.Length;
+            if (segEnd > hi) { segEnd = hi; }
+            if (segEnd - lo > 0) {
+                Chunking.CutRecursive(text, lo, segEnd, maxChars, pieces);
+            }
+            Chunking.CutRecursive(text, segEnd, hi, maxChars, pieces);
+            return;
+        }
+        // 没有任何分隔符：按 maxChars 硬切（切点落在字符边界上）。
+        int at = lo + maxChars;
+        at = Chunking.ForwardToCharBoundary(text, at);
+        if (at <= lo) { at = Chunking.AdvanceOne(text, lo, new int[1]); }
+        pieces.Add(new int[] { lo, at });
+        Chunking.CutRecursive(text, at, hi, maxChars, pieces);
+    }
+
+    // ------------------------------------------------------------------
+    // token 窗口
+    // ------------------------------------------------------------------
+
+    // 按 token 窗口切：每块最多 windowTokens 个 token，相邻块重叠
+    // overlapTokens 个 token。
+    //
+    // token 数用 `TokenCost` 的同一把尺子（见类注释），所以
+    // `AiChunk.tokens` 与窗口大小是对得上的。
+    //
+    // 步长 = window - overlap（不是 window）——这是滑动窗口的定义：
+    // 相邻两块共享 overlap 个 token。
+    public static List<AiChunk> TokenWindow(string text, int windowTokens,
+    int overlapTokens) {
+        List<AiChunk> outp = new List<AiChunk>();
+        if (text == null || text.Length == 0) { return outp; }
+        if (windowTokens < 1) { windowTokens = 1; }
+        if (overlapTokens < 0) { overlapTokens = 0; }
+        if (overlapTokens >= windowTokens) { overlapTokens = windowTokens - 1; }
+
+        int windowCost = windowTokens * 4;
+        int overlapCost = overlapTokens * 4;
+
+        int lo = 0;
+        int index = 0;
+        int[] scalar = new int[1];
+        while (lo < text.Length) {
+            int hi = Chunking.AdvanceCost(text, lo, windowCost, scalar);
+            string body = text.Substring(lo, hi - lo);
+            if (body.Trim().Length > 0) {
+                outp.Add(new AiChunk(body, lo, hi, index,
+                Chunking.EstimateTokens(body)));
+                index = index + 1;
+            }
+            if (hi >= text.Length) { break; }
+            // 下一块起点：回退 overlapCost 的成本量。
+            int next = Chunking.RetreatCost(text, hi, overlapCost, scalar);
+            if (next <= lo) { next = hi; }
+            lo = next;
+        }
+        return outp;
+    }
+
+    // 从 lo 起，往前推进至多 cost 的成本量，返回结束位置（字节）。
+    private static int AdvanceCost(string text, int lo, int cost, int[] scalar) {
+        int used = 0;
+        int i = lo;
+        while (i < text.Length) {
+            int w = Chunking.TokenCost(text, i, scalar);
+            if (used + w > cost && i > lo) { break; }
+            used = used + w;
+            i = i + Chunking.AdvanceOne(text, i, scalar);
+        }
+        return i;
+    }
+
+    // 从 hi 往回退至多 cost 的成本量，返回新起点（字节）。
+    private static int RetreatCost(string text, int hi, int cost, int[] scalar) {
+        if (cost <= 0) { return hi; }
+        int used = 0;
+        int i = hi;
+        while (i > 0) {
+            int prev = Chunking.PrevCharStart(text, i);
+            int w = Chunking.TokenCost(text, prev, scalar);
+            if (used + w > cost) { break; }
+            used = used + w;
+            i = prev;
+        }
+        return i;
+    }
+
+    // 前一个字符的起始字节位置。
+    private static int PrevCharStart(string text, int at) {
+        int i = at - 1;
+        while (i > 0) {
+            int c = text[i] & 255;
+            if ((c & 192) != 128) { return i; }   // 不是续字节 → 字符起点
+            i = i - 1;
+        }
+        return 0;
+    }
+
+    // ------------------------------------------------------------------
+    // 句子 / 段落
+    // ------------------------------------------------------------------
+
+    // 按句子切：块大小不均，但每块都是完整句子（保语义）。
+    //
+    // 句末标点（。！？.!?）后算一句边界；紧跟的收束字符（引号/括号）
+    // 归入本句。
+    public static List<AiChunk> Sentences(string text) {
+        List<AiChunk> outp = new List<AiChunk>();
+        if (text == null || text.Length == 0) { return outp; }
+        int start = 0;
+        int index = 0;
+        int i = 0;
+        int[] scalar = new int[1];
+        while (i < text.Length) {
+            int used = Encoding.DecodeCodePoint(text, i, scalar);
+            int cp = scalar[0];
+            if (Chunking.IsSentenceEnd(cp)) {
+                int end = i + used;
+                // 吞掉紧跟的收束字符。
+                while (end < text.Length) {
+                    int u2 = Encoding.DecodeCodePoint(text, end, scalar);
+                    if (!Chunking.IsSentenceClose(scalar[0])) { break; }
+                    end = end + u2;
+                }
+                string body = text.Substring(start, end - start);
+                if (body.Trim().Length > 0) {
+                    outp.Add(new AiChunk(body, start, end, index,
+                    Chunking.EstimateTokens(body)));
+                    index = index + 1;
+                }
+                start = end;
+                i = end;
+                continue;
+            }
+            i = i + used;
+        }
+        // 尾巴（没有句末标点的残余）。
+        if (start < text.Length) {
+            string body = text.Substring(start, text.Length - start);
+            if (body.Trim().Length > 0) {
+                outp.Add(new AiChunk(body, start, text.Length, index,
+                Chunking.EstimateTokens(body)));
+            }
+        }
+        return outp;
+    }
+
+    // 按段落切（空行分段）。块大小很不均，但保结构。
+    public static List<AiChunk> Paragraphs(string text) {
+        List<AiChunk> outp = new List<AiChunk>();
+        if (text == null || text.Length == 0) { return outp; }
+        int index = 0;
+        int lo = 0;
+        while (lo < text.Length) {
+            // 找下一个空行（\n\n 或 \r\n\r\n）。
+            int gap = text.IndexOf("\n\n", lo);
+            int gapLen = 2;
+            if (gap < 0) {
+                gap = text.IndexOf("\r\n\r\n", lo);
+                gapLen = 4;
+            }
+            int hi = gap < 0 ? text.Length : gap;
+            string body = text.Substring(lo, hi - lo);
+            if (body.Trim().Length > 0) {
+                outp.Add(new AiChunk(body, lo, hi, index,
+                Chunking.EstimateTokens(body)));
+                index = index + 1;
+            }
+            if (gap < 0) { break; }
+            lo = gap + gapLen;
+        }
+        return outp;
+    }
+
+    // 把块拼回一段文本（用给定分隔符）——用于调试与"还原原文"。
+    public static string Join(List<AiChunk> chunks, string sep) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < chunks.Count; i = i + 1) {
+            if (i > 0) { sb.Append(sep); }
+            sb.Append(chunks[i].text);
+        }
+        return sb.ToString();
+    }
+
+    // 从 at 往前退到字符边界（at 可能是字符中间的字节位置）。
+    private static int BackToCharBoundary(string text, int at) {
+        if (at <= 0) { return 0; }
+        if (at >= text.Length) { at = text.Length; }
+        int i = at;
+        while (i > 0) {
+            int c = text[i] & 255;
+            if ((c & 192) != 128) { return i; }
+            i = i - 1;
+        }
+        return 0;
+    }
+
+    // 从 at 往前推到下一个字符边界（at 可能是字符中间的字节位置）。
+    private static int ForwardToCharBoundary(string text, int at) {
+        if (at >= text.Length) { return text.Length; }
+        int i = at;
+        while (i < text.Length) {
+            int c = text[i] & 255;
+            if ((c & 192) != 128) { return i; }
+            i = i + 1;
+        }
+        return text.Length;
+    }
+}

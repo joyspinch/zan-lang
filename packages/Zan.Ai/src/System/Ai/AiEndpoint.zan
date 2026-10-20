@@ -1,0 +1,96 @@
+using System;
+
+namespace System.Ai;
+
+// AI 服务端点：把 base URL 拆成 scheme/host/port/path。
+//
+// 与 `Zan.Mvc` 的 `ZanWeb.Ai.AiEndpoint` 同构但**不带白名单**——
+// 白名单是 Web 框架的出网策略（`AiEndpointPolicy`），本包是通用库，
+// 由调用方自己决定允许连哪里。本包只做**解析**与**本地端点识别**。
+public class AiEndpoint {
+    public string host;
+    public int port;
+    public string path;
+    public bool tls;
+
+    public string Host() { return this.host; }
+    public int Port() { return this.port; }
+    public string Path() { return this.path; }
+    public bool Tls() { return this.tls; }
+
+    // 是否本地端点（127.0.0.1 / localhost）——本地模型服务（Ollama
+    // 之类）不需要云端那套出网预算，但也意味着**不受出网策略保护**，
+    // 调用方要自己确认 base URL 是可信的。
+    public bool Local() {
+        return this.host == "127.0.0.1" || this.host == "localhost"
+        || this.host == "::1";
+    }
+
+    // 规范化 URL（scheme + authority + path）。
+    public string Canonical() {
+        string scheme = this.tls ? "https://" : "http://";
+        string authority = this.host;
+        if ((this.tls && this.port != 443) || (!this.tls && this.port != 80)) {
+            authority = authority + ":" + Convert.ToString(this.port);
+        }
+        return scheme + authority + this.path;
+    }
+
+    // 解析 base URL。失败返回 null。
+    //
+    // 失败的情形：没有 scheme、host 为空、路径里有 userinfo（@）或
+    // fragment（#）——这两者能骗过朴素的字符串拼接（把凭据或片段
+    // 拼进请求行）。
+    public static AiEndpoint Parse(string url) {
+        if (url == null) { return null; }
+        AiEndpoint e = new AiEndpoint();
+        string rest = url;
+        e.tls = true;
+        e.port = 443;
+        if (rest.StartsWith("https://")) {
+            rest = rest.Substring(8);
+        } else if (rest.StartsWith("http://")) {
+            rest = rest.Substring(7);
+            e.tls = false;
+            e.port = 80;
+        } else {
+            return null;
+        }
+        int hash = rest.IndexOf("#");
+        if (hash >= 0) { return null; }
+        int slash = rest.IndexOf("/");
+        string hostPort = rest;
+        e.path = "";
+        if (slash >= 0) {
+            hostPort = rest.Substring(0, slash);
+            e.path = rest.Substring(slash);
+        }
+        while (e.path.Length > 0 && e.path.EndsWith("/")) {
+            e.path = e.path.Substring(0, e.path.Length - 1);
+        }
+        // userinfo（"user:pass@host"）不合法——凭据要走 header，不进 URL。
+        if (hostPort.IndexOf("@") >= 0) { return null; }
+        int colon = hostPort.IndexOf(":");
+        if (colon > 0) {
+            e.host = hostPort.Substring(0, colon);
+            string portText = hostPort.Substring(colon + 1);
+            e.port = AiEndpoint.ParsePort(portText, e.port);
+        } else {
+            e.host = hostPort;
+        }
+        if (e.host.Length == 0) { return null; }
+        return e;
+    }
+
+    // 端口解析：全数字才认，否则用默认值。
+    private static int ParsePort(string text, int dflt) {
+        if (text.Length == 0) { return dflt; }
+        for (int i = 0; i < text.Length; i = i + 1) {
+            int c = text[i] & 255;
+            if (c < 48 || c > 57) { return dflt; }
+        }
+        long p = text.ToInt64();
+        if (p < 1 || p > 65535) { return dflt; }
+        return (int)p;
+    }
+}

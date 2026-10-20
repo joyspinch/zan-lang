@@ -231,10 +231,31 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   会报 "'PI' is not a known variable, type, or namespace"。
 * **`double` 没有 `IsNaN` / `IsInfinity`**（实证，2026-10-22）：用
   `v != v` 判 NaN、用阈值比较判无穷（`v > 3.4028234663852886e+38`）。
-* **Zan 没有 `char` 类型，stdlib 也没有 `StringBuilder`**（实证，2026-10-23）：
-  字符串是 UTF-8 字节串，"单字符"就是长度为 1 的字符串；`s[i]` 返回**字节**
-  （int）不是字符。`string.Split` 的分隔符是 **string**（`s.Split(".")`；写
-  `s.Split('.')` 编译不过），按字符拆用 `s.ToCharList()`，拼串用 `+`。
+* **Zan 没有 `char` 类型**（实证，2026-10-23）：字符串是 UTF-8 字节串，
+  "单字符"就是长度为 1 的字符串；`s[i]` 返回**字节**（int）不是字符。
+  `string.Split` 的分隔符是 **string**（`s.Split(".")`；写 `s.Split('.')`
+  编译不过），**返回 `List<string>`**（不是 `string[]`），按字符拆用
+  `s.ToCharList()`，拼串用 `+`。
+* **`StringBuilder` 是编译器内建的**（实证，2026-10-26 复核修正）：
+  `src/compiler/builtin_api.c` 的 `BT("StringBuilder", ...)`——它**不是
+  stdlib 源码**，但 `using System.Text;` 后可以直接用
+  （`Append`/`AppendLine`/`ToString`/`Clear`）。stdlib 源码里搜不到
+  `class StringBuilder` 不代表它不存在——**内建类型要用
+  `src/compiler/builtin_api.c` 核实，别只看 stdlib 目录**。
+  （`List<T>` 与 `Dictionary<K,V>` 同理，都是内建。）
+* **`JsonValue.Parse` 对坏 JSON 抛异常，不是返回 null**（实证，2026-10-26）：
+  畸形 JSON 抛 `JsonException`（"Malformed JSON at position N"）。
+  解析**外部输入**（网络响应、用户文件）必须自己兜 try/catch——
+  以为它返回 null 而直接 `if (root == null)` 判断的代码，遇到畸形响应
+  会把异常抛给调用方。`JsonValue.ParseLenient` 是不抛的版本（返回
+  已解析的部分）。
+* **包的命名空间按目录推导，`using` 要写到最深的那层**（实证，2026-10-26）：
+  `packages/Zan.Net/src/System/Net/Http/Client/HttpClient.zan` 声明的是
+  `namespace System.Net.Http.Client;`——`HttpClient` **不在**
+  `System.Net.Http` 里，`using System.Net.Http;` 拿不到它，必须
+  `using System.Net.Http.Client;`（`System.Net.Http` 里放的是
+  `HttpResponse`/`HttpRequest`）。判定方法：grep 目标类型所在文件的
+  `^namespace` 行，别按目录名猜。
 * **泛型方法从数组实参推不出类型参数**（实证，2026-10-23）：
   `Pick(arr)`（`arr` 是 `string[]`）报 "could not be resolved to any callable"，
   必须显式 `Pick<string>(arr)`；`List<T>` 实参则能推断（`rng.Pick(list)` 正常）。
