@@ -114,8 +114,14 @@ if ($SourceRef) {
         $zip = Join-Path $archiveRoot 'src.zip'
         & git archive --format=zip -o $zip $SourceRef -- $archivePaths | Out-Null
         if ($LASTEXITCODE -ne 0) { Fail "git archive 失败（ref=$SourceRef）" }
-        Expand-Archive -Path $zip -DestinationPath (Join-Path $archiveRoot 'unz') -Force
-        $sourceBase = Join-Path $archiveRoot 'unz'
+        $unz = Join-Path $archiveRoot 'unz'
+        New-Item -ItemType Directory -Force -Path $unz | Out-Null
+        # tar（Windows 10+ 自带 bsdtar）比 Expand-Archive 快一个量级：legend
+        # 那种七千多个小文件，Expand-Archive 要跑十几分钟，tar 几十秒。
+        $tar = Get-Command tar -ErrorAction SilentlyContinue
+        if ($tar) { & tar -xf $zip -C $unz }
+        else { Expand-Archive -Path $zip -DestinationPath $unz -Force }
+        $sourceBase = $unz
         Write-Host "   源来自 git 归档：$SourceRef"
     }
     finally { Pop-Location }
@@ -436,3 +442,8 @@ Write-Host "  1) cd $target"
 Write-Host "  2) `$env:ZAN_HOME = 'D:/project/zan-lang'"
 Write-Host "  3) pwsh -File client/tools/build.ps1"
 Write-Host "  4) pwsh -File client/tools/test.ps1"
+
+# 归档临时目录用完就清（legend 那种体量能占几百 MB）
+if ($archiveRoot -and (Test-Path $archiveRoot)) {
+    Remove-Item $archiveRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
