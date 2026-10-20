@@ -1,0 +1,422 @@
+using System;
+using System.Collections.Generic;
+using System.Data.ZanDb;
+using System.Json;
+
+namespace System.Ai;
+
+// 检索器的**远端**后端：文档与索引放在另一台机器的 `ZanDbServer` 上，
+// 通过 `ZanDbClient` 的 TCP 协议访问。
+//
+// ## 为什么需要这一层
+//
+// `ZanDbRetriever`（本地档）用的是进程内 `ZanDb`——数据在本地文件里。
+// 多机部署（多个应用实例共用一份知识库、向量索引集中管理）时，数据
+// 必须放到一台主机上，各实例通过网络访问。那台主机跑 `ZanDbServer`，
+// 客户端走 `ZanDbClient`。
+//
+// `ZanDb` 的远端协议**本来就有**向量检索与混合检索
+// （`search_vector` / `search_hybrid` / `search_text`），缺的只是
+// `Zan.Ai` 侧的一层封装——把 `List<double>` 查询向量、两路融合、
+// 引用溯源这几件事接起来。
+//
+// ## 与另两个后端的语义一致性
+//
+// 三个后端（内存 `Retriever`、本地 `ZanDbRetriever`、远端
+// `ZanDbRetriever`）**语义一致**：
+//
+// - 用同一个 RRF 公式（k=60）融合向量路与字面路
+// - 返回同一个命中实体 `RetrieverHit`
+// - 归一化口径一致（`SetNormalized` 决定入库与查询都归一化）
+//
+// 所以从任一后端切到另一后端，检索结果不会悄悄变样。
+//
+// ## 写请求的幂等
+//
+// 远端写入必须带**显式的 request id**（`ZanDbClient` 的写路径要求），
+// 服务端按 id 去重——网络超时后重试不会写重。这是远端档比本地档多
+// 的一层保证：本地写入要么成功要么失败，远端写入可能"成功了但响应
+// 丢了"。
+//
+// 所以 `AddAll` 用 `BatchAsync` 一次事务写一批，且 request id 由调用方
+// 传入（或自动生成一个带序号前缀的）——**重试时用同一个 id** 才幂等。
+
+public class RemoteZanDbRetriever {
+    // 远端客户端。
+    private ZanDbClient client;
+
+    // collection 名。
+    private string collection;
+
+    // 正文字段名。
+    private string textField;
+
+    // 向量字段名。
+    private string vectorField;
+
+    // 元数据字段名。
+    private string metaField;
+
+    // 维度。
+    private int dimensions;
+
+    // 归一化开关（入库与查询都按同一口径）。
+    private bool normalized;
+
+    // 写请求 id 的自增序号（拼进 request id，保证唯一）。
+    private long requestSeq;
+
+    // 上一次失败的原因。
+    public string lastError;
+
+    public RemoteZanDbRetriever(ZanDbClient client, string collection,
+    int dimensions) {
+        this.client = client;
+        this.collection = collection;
+        this.textField = "text";
+        this.vectorField = "embedding";
+        this.metaField = "meta";
+        this.dimensions = dimensions;
+        this.normalized = true;
+        this.requestSeq = 0;
+        this.lastError = "";
+    }
+
+    // 字段名（正文 / 向量 / 元数据）。
+    public void SetFields(string text, string vector, string meta) {
+        this.textField = text;
+        this.vectorField = vector;
+        this.metaField = meta;
+    }
+
+    // 归一化开关（入库与查询同口径；改了必须重建索引）。
+    public void SetNormalized(bool on) {
+        this.normalized = on;
+    }
+
+    // 建索引（文本 + 向量）。**必须在写文档之前调用**。
+    //
+    // 失败返回 false（原因在 lastError）。
+    //
+    // requestId 是**这次建索引操作**的基名——内部派生出两个 id
+    // （`-text` 与 `-vector`）。**不能两个请求共用一个 id**：服务端按
+    // id 绑定请求指纹，同一个 id 配不同的请求体会被判 `id_conflict`
+    // （实测：两次 ensure 共用一个 id，第二次直接被拒）。
+    public async bool EnsureIndexesAsync(string requestId) {
+        this.lastError = "";
+        if (this.client == null) { this.lastError = "没有客户端"; return false; }
+        string baseId = requestId == null || requestId.Length == 0 ? "idx" : requestId;
+        try {
+            JsonValue r1 = await this.client.EnsureFullTextIndexAsync(
+            this.collection, this.textField, baseId + "-text");
+            if (!RemoteZanDbRetriever.Ok(r1)) {
+                this.lastError = RemoteZanDbRetriever.ErrorText(r1);
+                return false;
+            }
+            JsonValue r2 = await this.client.EnsureVectorIndexAsync(
+            this.collection, this.vectorField,
+            new VectorIndexOptions(this.dimensions, 0), baseId + "-vector");
+            if (!RemoteZanDbRetriever.Ok(r2)) {
+                this.lastError = RemoteZanDbRetriever.ErrorText(r2);
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            this.lastError = "建索引失败：" + e.Message;
+            return false;
+        }
+    }
+
+    // 写一个块（正文 + 向量 + 元数据），返回文档 id；失败返回 -1。
+    //
+    // requestId 必须**每次写入唯一**，且**重试时用同一个**（幂等）。
+    public async int AddAsync(string text, List<double> vector, string meta,
+    string requestId) {
+        this.lastError = "";
+        if (this.client == null) { this.lastError = "没有客户端"; return -1; }
+        if (vector == null || vector.Count != this.dimensions) {
+            this.lastError = "向量维度不符（期望 " + Convert.ToString(this.dimensions)
+            + "，实际 " + Convert.ToString(vector == null ? 0 : vector.Count) + "）";
+            return -1;
+        }
+        try {
+            JsonValue doc = JsonValue.NewObject();
+            doc.PutStr(this.textField, text == null ? "" : text);
+            doc.Put(this.vectorField, RemoteZanDbRetriever.ToJsonArray(vector,
+            this.normalized));
+            if (meta != null && meta.Length > 0) {
+                doc.PutStr(this.metaField, meta);
+            }
+            JsonValue r = await this.client.InsertAsync(this.collection, doc,
+            requestId);
+            if (!RemoteZanDbRetriever.Ok(r)) {
+                this.lastError = RemoteZanDbRetriever.ErrorText(r);
+                return -1;
+            }
+            JsonValue result = ZanDbProtocol.Member(r, "result");
+            return result.AsInt(0 - 1);
+        } catch (Exception e) {
+            this.lastError = "写入失败：" + e.Message;
+            return -1;
+        }
+    }
+
+    // 批量写块（一次事务）。
+    //
+    // 用 `BatchAsync` 而不是逐条 `InsertAsync`——一次往返一次事务，
+    // 逐条是 N 次往返 N 个事务。
+    public async int AddAllAsync(List<string> texts, List<List<double>> vectors,
+    string requestId) {
+        this.lastError = "";
+        if (this.client == null) { this.lastError = "没有客户端"; return 0; }
+        if (texts == null || vectors == null) { this.lastError = "参数为空"; return 0; }
+        if (texts.Count != vectors.Count) {
+            this.lastError = "文本与向量数量不一致";
+            return 0;
+        }
+        if (texts.Count > ZanDbProtocol.MAX_BATCH) {
+            this.lastError = "批量写超过上限 " + Convert.ToString(ZanDbProtocol.MAX_BATCH);
+            return 0;
+        }
+        try {
+            JsonValue ops = JsonValue.NewArray();
+            for (int i = 0; i < texts.Count; i = i + 1) {
+                if (vectors[i] == null || vectors[i].Count != this.dimensions) {
+                    this.lastError = "第 " + Convert.ToString(i) + " 个向量维度不符";
+                    return 0;
+                }
+                JsonValue doc = JsonValue.NewObject();
+                doc.PutStr(this.textField, texts[i] == null ? "" : texts[i]);
+                doc.Put(this.vectorField, RemoteZanDbRetriever.ToJsonArray(
+                vectors[i], this.normalized));
+                JsonValue op = JsonValue.NewObject();
+                op.PutStr("action", "insert");
+                // 批量子操作**各自带 collection**（服务端 Validate 要求
+                // 每个 batch step 都是完整的写操作）。
+                op.PutStr("collection", this.collection);
+                op.Put("document", doc);
+                ops.Append(op);
+            }
+            JsonValue r = await this.client.BatchAsync(ops, requestId);
+            if (!RemoteZanDbRetriever.Ok(r)) {
+                this.lastError = RemoteZanDbRetriever.ErrorText(r);
+                return 0;
+            }
+            return texts.Count;
+        } catch (Exception e) {
+            this.lastError = "批量写入失败：" + e.Message;
+            return 0;
+        }
+    }
+
+    // 混合检索（向量 + 字面，RRF 融合）。
+    //
+    // queryVector 可为 null（则只做字面检索）；queryText 可为空串
+    // （则只做语义检索）。
+    public async List<RetrieverHit> SearchAsync(List<double> queryVector,
+    string queryText, int k, int efSearch) {
+        this.lastError = "";
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.client == null) { this.lastError = "没有客户端"; return outp; }
+        if (k < 1) { return outp; }
+        try {
+            float[] q = queryVector == null ? new float[0]
+            : RemoteZanDbRetriever.ToFloatArray(queryVector, this.normalized);
+            JsonValue r = await this.client.SearchHybridAsync(this.collection,
+            this.textField, queryText == null ? "" : queryText,
+            this.vectorField, q, k, efSearch);
+            if (!RemoteZanDbRetriever.Ok(r)) {
+                this.lastError = RemoteZanDbRetriever.ErrorText(r);
+                return outp;
+            }
+            JsonValue hits = ZanDbProtocol.Member(r, "result");
+            for (int i = 0; i < hits.Count(); i = i + 1) {
+                JsonValue hit = hits.At(i);
+                RetrieverHit h = RetrieverHit.Of(
+                ZanDbProtocol.Member(hit, "id").AsInt(0));
+                h.score = ZanDbProtocol.Member(hit, "score").AsDouble(0.0);
+                outp.Add(h);
+            }
+            return outp;
+        } catch (Exception e) {
+            this.lastError = "检索失败：" + e.Message;
+            return outp;
+        }
+    }
+
+    // 分两路查（要两路的原始排名与分数时用）。
+    //
+    // 返回的每个命中带 vectorRank / bm25Rank / vectorDistance / bm25Score
+    // ——与另两个后端的命中实体同构。
+    public async List<RetrieverHit> SearchSplitAsync(List<double> queryVector,
+    string queryText, int k, int efSearch) {
+        this.lastError = "";
+        List<RetrieverHit> outp = new List<RetrieverHit>();
+        if (this.client == null) { this.lastError = "没有客户端"; return outp; }
+        try {
+            Dictionary<int, RetrieverHit> acc = new Dictionary<int, RetrieverHit>();
+            if (queryText != null && queryText.Length > 0) {
+                JsonValue rb = await this.client.SearchTextAsync(this.collection,
+                this.textField, queryText, k);
+                if (!RemoteZanDbRetriever.Ok(rb)) {
+                    this.lastError = RemoteZanDbRetriever.ErrorText(rb);
+                    return outp;
+                }
+                JsonValue bh = ZanDbProtocol.Member(rb, "result");
+                for (int i = 0; i < bh.Count(); i = i + 1) {
+                    JsonValue hit = bh.At(i);
+                    int id = ZanDbProtocol.Member(hit, "id").AsInt(0);
+                    RetrieverHit h = RetrieverHit.Of(id);
+                    h.bm25Rank = i + 1;
+                    h.bm25Score = ZanDbProtocol.Member(hit, "score").AsDouble(0.0);
+                    acc[id] = h;
+                }
+            }
+            if (queryVector != null) {
+                float[] q = RemoteZanDbRetriever.ToFloatArray(queryVector,
+                this.normalized);
+                JsonValue rv = await this.client.SearchVectorAsync(this.collection,
+                this.vectorField, q, k, efSearch);
+                if (!RemoteZanDbRetriever.Ok(rv)) {
+                    this.lastError = RemoteZanDbRetriever.ErrorText(rv);
+                    return outp;
+                }
+                JsonValue vh = ZanDbProtocol.Member(rv, "result");
+                for (int i = 0; i < vh.Count(); i = i + 1) {
+                    JsonValue hit = vh.At(i);
+                    int id = ZanDbProtocol.Member(hit, "id").AsInt(0);
+                    RetrieverHit h = RetrieverHit.Of(id);
+                    if (acc.ContainsKey(id)) { h = acc[id]; }
+                    h.vectorRank = i + 1;
+                    h.vectorDistance = ZanDbProtocol.Member(hit, "distance").AsDouble(0.0);
+                    acc[id] = h;
+                }
+            }
+            List<int> ids = acc.Keys;
+            for (int i = 0; i < ids.Count; i = i + 1) { outp.Add(acc[ids[i]]); }
+            // 自己算 RRF（1/(k+rank)，k=60）——远端协议的 `search_hybrid`
+            // 会算融合分数，但它**不返回两路的原始排名**，要原始数据就
+            // 分两路查自己合。公式与另两个后端一致。
+            for (int i = 0; i < outp.Count; i = i + 1) {
+                RetrieverHit h = outp[i];
+                double s = 0.0;
+                if (h.vectorRank > 0) { s = s + 1.0 / (60.0 + (double)h.vectorRank); }
+                if (h.bm25Rank > 0) { s = s + 1.0 / (60.0 + (double)h.bm25Rank); }
+                h.score = s;
+            }
+            for (int i = 0; i < outp.Count; i = i + 1) {
+                for (int j = i + 1; j < outp.Count; j = j + 1) {
+                    RetrieverHit x = outp[i];
+                    RetrieverHit y = outp[j];
+                    bool swap = false;
+                    if (y.score > x.score) { swap = true; }
+                    else if (y.score == x.score && y.id < x.id) { swap = true; }
+                    if (swap) {
+                        outp[i] = y;
+                        outp[j] = x;
+                    }
+                }
+            }
+            int limit = k < outp.Count ? k : outp.Count;
+            List<RetrieverHit> trimmed = new List<RetrieverHit>();
+            for (int i = 0; i < limit; i = i + 1) { trimmed.Add(outp[i]); }
+            return trimmed;
+        } catch (Exception e) {
+            this.lastError = "检索失败：" + e.Message;
+            return outp;
+        }
+    }
+
+    // 读回某个文档的正文。
+    public async string TextOfAsync(int id) {
+        if (this.client == null) { return ""; }
+        JsonValue r = await this.client.GetAsync(this.collection, id);
+        if (!RemoteZanDbRetriever.Ok(r)) { return ""; }
+        JsonValue doc = ZanDbProtocol.Member(r, "result");
+        if (doc == null || doc.IsNull()) { return ""; }
+        JsonValue v = doc.Get(this.textField);
+        return v == null ? "" : v.AsString("");
+    }
+
+    // 读回某个文档的元数据。
+    public async string MetaOfAsync(int id) {
+        if (this.client == null) { return ""; }
+        JsonValue r = await this.client.GetAsync(this.collection, id);
+        if (!RemoteZanDbRetriever.Ok(r)) { return ""; }
+        JsonValue doc = ZanDbProtocol.Member(r, "result");
+        if (doc == null || doc.IsNull()) { return ""; }
+        JsonValue v = doc.Get(this.metaField);
+        return v == null ? "" : v.AsString("");
+    }
+
+    // 生成一个写请求 id。
+    //
+    // **一个 id 只能配一个请求**（服务端按 id 绑定请求指纹，同 id 不同
+    // 请求体会被判 `id_conflict`）。所以：
+    //
+    // - 不同请求 → 不同 id
+    // - **同一个请求重试 → 同一个 id**（这才是幂等：服务端按 id 去重，
+    //   网络超时后重试不会写重）
+    //
+    // 所以这个方法要由调用方在重试循环**外面**取一次，而不是每次重试都调。
+    public string NextRequestId(string prefix) {
+        this.requestSeq = this.requestSeq + 1;
+        if (prefix == null || prefix.Length == 0) { prefix = "w"; }
+        return prefix + "-" + Convert.ToString(this.requestSeq);
+    }
+
+    // 关闭客户端。
+    public void Close() {
+        if (this.client != null) {
+            this.client.Close();
+            this.client = null;
+        }
+    }
+
+    // 响应是否成功。
+    private static bool Ok(JsonValue response) {
+        return ZanDbProtocol.Member(response, "ok").AsBool(false);
+    }
+
+    // 错误原因（服务端错误码 + 消息；网络异常在调用处兜）。
+    private static string ErrorText(JsonValue response) {
+        JsonValue err = ZanDbProtocol.Member(response, "error");
+        if (err == null) { return "未知错误"; }
+        string code = ZanDbProtocol.Member(err, "code").AsString("error");
+        string msg = ZanDbProtocol.Member(err, "message").AsString("");
+        if (msg.Length == 0) { return code; }
+        return code + ": " + msg;
+    }
+
+    // double → JSON 数组（可选归一化）。
+    public static JsonValue ToJsonArray(List<double> v, bool normalize) {
+        JsonValue arr = JsonValue.NewArray();
+        if (v == null) { return arr; }
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) { sum = sum + v[i] * v[i]; }
+        double inv = 1.0;
+        if (normalize && sum > 0.0) { inv = 1.0 / Math.Sqrt(sum); }
+        for (int i = 0; i < v.Count; i = i + 1) {
+            arr.Append(JsonValue.NewDouble(v[i] * inv));
+        }
+        return arr;
+    }
+
+    // double → float（可选归一化）。
+    public static float[] ToFloatArray(List<double> v, bool normalize) {
+        if (v == null) { return new float[0]; }
+        float[] outp = new float[v.Count];
+        double sum = 0.0;
+        for (int i = 0; i < v.Count; i = i + 1) {
+            outp[i] = (float)v[i];
+            sum = sum + v[i] * v[i];
+        }
+        if (normalize && sum > 0.0) {
+            double inv = 1.0 / Math.Sqrt(sum);
+            for (int i = 0; i < outp.Length; i = i + 1) {
+                outp[i] = (float)((double)outp[i] * inv);
+            }
+        }
+        return outp;
+    }
+}

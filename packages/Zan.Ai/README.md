@@ -26,6 +26,9 @@ HNSW 向量索引、`Zan.Net` 的 `HttpClient`），但没有把它们串成"文
   RRF 融合）
 - `System.Ai` — `ZanDbRetriever`（**持久化**混合检索：文档与索引存在
   `ZanDb` 里，走事务 + 检查点 + 原生混合检索。**生产路径用这个**）
+- `System.Ai` — `RemoteZanDbRetriever`（**远端**混合检索：文档与索引在
+  另一台机器的 `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议。
+  **多机部署用这个**）
 - `System.Ai` — `Rag`（编排：分块 → 向量化 → 入库 → 检索 → 拼提示词 →
   生成；答案带引用溯源）
 - `System.Ai` — 实体（`src/System/Ai/Models/`）：`AiConfig` /
@@ -79,27 +82,28 @@ Console.WriteLine("维度=" + vecs.dimensions);
 double sim = AiEmbedding.Cosine(vecs.At(0), queryVector);
 ```
 
-## 内存版 vs 持久化版：怎么选
+## 三档后端：怎么选
 
-| | `VectorStore` + `Retriever`（内存） | `ZanDbRetriever`（持久化） |
-|---|---|---|
-| 存储 | 进程内存 | `ZanDb` collection（有检查点与世代） |
-| 并发写 | **不支持** | 支持（`AsyncRwLock` + 事务 + journal） |
-| 崩溃恢复 | 无（索引全丢） | 有（重开即恢复，`RebuildSearchIndexes` 可重建） |
-| 文档与索引一致性 | 手动维护 | 同一事务，不会脱节 |
-| 适合 | 小规模、单写者、一次性脚本、测试夹具 | 生产路径 |
+| | `VectorStore` + `Retriever`（内存） | `ZanDbRetriever`（本地） | `RemoteZanDbRetriever`（远端） |
+|---|---|---|---|
+| 存储 | 进程内存 | `ZanDb` collection（本地文件） | 远端 `ZanDbServer` |
+| 并发写 | **不支持** | 支持（`AsyncRwLock` + 事务 + journal） | 支持（服务端的锁） |
+| 崩溃恢复 | 无（索引全丢） | 有（重开即恢复，`RebuildSearchIndexes` 可重建） | 有（服务端负责） |
+| 文档与索引一致性 | 手动维护 | 同一事务，不会脱节 | 同一事务（服务端） |
+| 网络往返 | 无 | 无 | 每次操作一次往返 |
+| 适合 | 小规模、单写者、一次性脚本、测试夹具 | 单机生产 | 多机共享一份知识库 |
 
 **为什么内存版不能并发写**：`VectorIndex.Add` 会改 `chunks`/`nodes`/
 `idSlots` 三个共享结构且**没有锁**——并发写会撕裂 HNSW 图（不是"结果
 不准"，是内存结构损坏）。ZanDb 那侧由 `AsyncRwLock` 串行化写、并
 通过 **journal + 检查点**让索引变更与文档写入落在同一事务里。
 
-两者**语义一致**：用同一个 RRF 公式（k=60）融合，命中实体都是
-`RetrieverHit`。conformance 里有一条断言专门盯这个——两个后端对同一
-批数据给出**完全相同的融合分数**（0.032787），所以从内存切到持久化，
-检索结果不会悄悄变样。
+**三档语义一致**：用同一个 RRF 公式（k=60）融合向量路与字面路，命中
+实体都是 `RetrieverHit`。conformance 里有一条断言专门盯这个——三个
+后端对同一批数据给出**完全相同的融合分数**（0.032787），所以从内存
+切到本地、再切到远端，检索结果不会悄悄变样。
 
-持久化版的用法：
+本地档的用法：
 
 ```zan
 using System.Data.ZanDb;
@@ -122,6 +126,31 @@ for (int i = 0; i < hits.Count; i = i + 1) {
 List<RetrieverHit> split = store.SearchSplit(queryVector, "退款", 5, 64);
 // split[i].vectorRank / bm25Rank / vectorDistance / bm25Score
 ```
+
+远端档的用法（服务端跑 `ZanDbServer`，客户端跑 `ZanDbClient`）：
+
+```zan
+using System.Data.ZanDb;
+
+ZanDbClient client = new ZanDbClient("10.0.0.5", 19740, token, "my-app");
+RemoteZanDbRetriever store = new RemoteZanDbRetriever(client, "docs", 1024);
+store.SetNormalized(true);
+await store.EnsureIndexesAsync("init-1");  // 两个 ensure 内部派生出两个 id
+
+await store.AddAllAsync(texts, vectors, "batch-1");
+
+List<RetrieverHit> hits = await store.SearchAsync(queryVector, "退款", 5, 64);
+for (int i = 0; i < hits.Count; i = i + 1) {
+    Console.WriteLine("[" + hits[i].id + "] " + await store.TextOfAsync(hits[i].id));
+}
+```
+
+**远端写入的 request id 语义**（服务端按 id 绑定请求指纹）：
+- **一个 id 只能配一个请求**——同一个 id 配不同请求体会被判
+  `id_conflict`（不是静默覆盖，也不是当成两次独立写入）。所以
+  `EnsureIndexesAsync` 内部给文本索引和向量索引派生了两个 id。
+- **同一个请求重试要用同一个 id**——这才是幂等：网络超时后重试不会
+  写重。所以 `NextRequestId` 要在重试循环**外面**取一次。
 
 ## 设计要点
 
@@ -167,8 +196,12 @@ List<RetrieverHit> split = store.SearchSplit(queryVector, "退款", 5, 64);
 
 - 无重排层（cross-encoder 二次排序）、无 Tool calling、无会话记忆、
   无评估与可观测——这些是后续的档位。
-- `ZanDbRetriever` 走的是**进程内**的 `ZanDb`（本地文件）。要做多机
-  共享，得用 `ZanDbClient` / `ZanDbServer` 的远端协议，本包尚未封装。
+- 远端档每次操作一次网络往返，**没有连接池化、没有批量检索**
+  （`ZanDbClient` 每次 `SendAsync` 新建连接）。高 QPS 场景要在调用方
+  做批量与缓存。
+- `Rag` 编排层目前只接**内存档**的检索器（`Rag(client, Retriever)`）；
+  接本地/远端档要自己把检索结果喂进提示词——`Rag` 还没有后端无关的
+  检索器接口。
 - Embeddings 只支持 OpenAI 兼容的 `/v1/embeddings` 协议（DeepSeek、
   OpenAI、Ollama、vLLM、LM Studio 等都兼容这个协议）；不做各厂商
   的私有嵌入协议。

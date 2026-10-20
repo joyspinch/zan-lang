@@ -468,6 +468,32 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   RRF（k=60）、都返回同一个命中实体，但**光"看起来一样"不够**——conformance
   要有一条断言比两边的融合分数**逐位相等**（实测 0.032787）。否则从内存切
   到持久化，检索结果会悄悄变样，而没人会发现。
+  ⑫ **远端写的 request id：一个 id 只能配一个请求，重试才复用它**：
+  服务端按 id **绑定请求指纹**——同一个 id 配不同的请求体会被判
+  `id_conflict`（不是静默覆盖，也不是当成两次独立写入）。所以：
+  ① 一次操作里有多个不同请求时**各自派生 id**（实测：建文本索引与向量
+  索引共用一个 id，第二次被拒 `id_conflict`，连带向量索引没建成、检索
+  报"search index does not exist"——**错误信息指向症状而不是根因**，
+  排查时先看第一个失败的请求）；② 同一个请求**重试时用同一个 id**，
+  这才是幂等（服务端按 id 去重，网络超时后重试不会写重）——所以 id 要
+  在重试循环**外面**取一次。
+
+- **远端协议封装：解析响应要看信封结构，不看结果字段**：远端响应是
+  `{v, id, ok, revision, result|error}` 的信封，`result` 才是载荷，
+  `error` 是 `{code, message}`。判成功要读 `ok` 而不是看 `result` 存不
+  在——**失败时 `result` 也可能有值**（比如空数组），只看 `result != null`
+  会把失败当成功。
+- **起服务端的用例必须 await 停止方法，否则 leakcheck 报泄漏**：
+  `RequestStop()` 只是**请求**停止（置标志）；`await StopAsync()` 才会
+  停监听、排空在途连接、关掉数据库。少 await 一步，退出时一堆对象仍
+  可达 → leakcheck 报几百个对象泄漏，而**直接跑程序是过的**（只有
+  leakcheck 变体带 `--check-leaks` 才看得见）。坑出处：远端检索器
+  conformance 用 `RequestStop()` 收尾，leakcheck 变体报"515 object(s)
+  still reachable"，换成 `await StopAsync()` 即净。
+- **leakcheck 变体的失败要重跑一次再下结论**：并行跑时可能撞端口或
+  撞 Windows 的 AV 短暂占文件（`STATUS_SHARING_VIOLATION`），表现是
+  "单跑绿、并行红"。但**别用它当借口**——先看泄漏报告里点名的分配点
+  （`file.zan:LINE`），那才是根因。
 
 - **列存的缺失值用掩码位表达，不用哨兵值**（坑出处：`Zan.DataFrame` 补
   缺失值处理）：列存是强类型的 `List<long>`/`List<double>`/`List<string>`，

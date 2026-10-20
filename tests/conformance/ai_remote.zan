@@ -1,0 +1,220 @@
+// 远端检索器（`Zan.Ai/RemoteZanDbRetriever`）：文档与索引在另一台机器的
+// `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议。
+//
+// 覆盖：建索引（**两个 ensure 不能共用一个 request id**——服务端按 id
+// 绑定请求指纹，同 id 不同请求体会被判 id_conflict）、批量写、混合
+// 检索、分两路检索、引用读回、维度不符拒绝、**与本地档/内存档的融合
+// 分数逐位相等**（三后端语义一致，切后端不改变检索结果）。
+//
+// 本用例**在本进程内起一个真的 TCP 服务**（ZanDbServer + 客户端走真实
+// 套接字），所以验的是网络路径而不是进程内捷径。
+using System;
+using System.Ai;
+using System.Data.ZanDb;
+using System.IO;
+using System.Json;
+
+namespace Conf;
+
+class Prog {
+    // 端口（挑一个不常见的，避免与其它 conformance 撞）。
+    static int PORT = 19872;
+
+    // 令牌（服务端要求 16..512 字节）。
+    static string TOKEN = "ai-remote-conformance-token-2026";
+
+    static int Main() {
+        try {
+            return Prog.Run();
+        } catch (Exception e) {
+            Console.WriteLine("threw: " + e.ToString());
+            return 1;
+        }
+    }
+
+    // 定点打印（避免 double 最短往返格式在平台间漂移）。
+    static string F(double v) {
+        return Convert.ToString(Math.Round(v * 1000000.0) / 1000000.0);
+    }
+
+    static void Clean(string path) {
+        File.Delete(path);
+        File.Delete(path + ".lock");
+        File.Delete(path + ".m0");
+        File.Delete(path + ".m1");
+        for (int i = 0; i < 100; i = i + 1) {
+            File.Delete(path + ".s" + Convert.ToString(i));
+        }
+    }
+
+    static List<double> V(double a, double b) {
+        List<double> l = new List<double>();
+        l.Add(a);
+        l.Add(b);
+        return l;
+    }
+
+    static List<string> Texts() {
+        List<string> t = new List<string>();
+        t.Add("苹果 手机");
+        t.Add("香蕉 牛奶");
+        t.Add("退款 流程");
+        return t;
+    }
+
+    static List<List<double>> Vecs() {
+        List<List<double>> v = new List<List<double>>();
+        v.Add(V(1.0, 0.0));
+        v.Add(V(0.0, 1.0));
+        v.Add(V(0.7, 0.7));
+        return v;
+    }
+
+    static int Run() {
+        int bad = 0;
+        string path = "_scratch/ai_remote.zdb";
+        Directory.CreateDirectory("_scratch");
+        Clean(path);
+
+        // 起服务端（真实 TCP 监听）。
+        ZanDbServerOptions opts = new ZanDbServerOptions();
+        opts.path = path;
+        opts.token = TOKEN;
+        opts.host = "127.0.0.1";
+        opts.port = PORT;
+        ZanDbServer server = new ZanDbServer(opts);
+        server.Start();
+        Task.Run(() => { server.RunAsync(); });
+
+        List<RetrieverHit> remoteHits = new List<RetrieverHit>();
+        List<RetrieverHit> remoteSplit = new List<RetrieverHit>();
+
+        {
+            ZanDbClient client = new ZanDbClient("127.0.0.1", PORT, TOKEN, "ai");
+            RemoteZanDbRetriever r = new RemoteZanDbRetriever(client, "docs", 2);
+            r.SetNormalized(false);
+
+            // ---- 1. 建索引 ----
+            //
+            // 文本索引与向量索引是**两个不同的请求**，必须用两个不同的
+            // request id——服务端按 id 绑定请求指纹，同 id 不同请求体会
+            // 被判 id_conflict（实测踩过）。
+            bool indexed = await r.EnsureIndexesAsync("w-idx");
+            Console.WriteLine("indexed=" + indexed + " err=" + r.lastError);
+            if (!indexed) { bad = bad + 1; }
+
+            // ---- 2. 批量写 ----
+            int added = await r.AddAllAsync(Prog.Texts(), Prog.Vecs(), "w-batch-1");
+            Console.WriteLine("added=" + added + " err=" + r.lastError);
+            if (added != 3) { bad = bad + 1; }
+            if (r.lastError.Length > 0) { bad = bad + 1; }
+
+            // ---- 3. 混合检索 ----
+            remoteHits = await r.SearchAsync(V(1.0, 0.0), "手机", 3, 64);
+            Console.WriteLine("hits=" + remoteHits.Count + " err=" + r.lastError);
+            if (remoteHits.Count != 3) { bad = bad + 1; }
+            if (remoteHits.Count > 0) {
+                Console.WriteLine("score0=" + F(remoteHits[0].score));
+                // 两路都命中 = 1/61 + 1/61
+                if (Math.Abs(remoteHits[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+                if (remoteHits[0].id != 1) { bad = bad + 1; }
+            }
+
+            // ---- 4. 分两路检索 ----
+            remoteSplit = await r.SearchSplitAsync(V(1.0, 0.0), "手机", 3, 64);
+            Console.WriteLine("split=" + remoteSplit.Count);
+            if (remoteSplit.Count != 3) { bad = bad + 1; }
+            if (remoteSplit.Count > 0) {
+                Console.WriteLine("split0 vr=" + remoteSplit[0].vectorRank
+                + " br=" + remoteSplit[0].bm25Rank
+                + " both=" + remoteSplit[0].BothHit());
+                if (remoteSplit[0].vectorRank != 1) { bad = bad + 1; }
+                if (remoteSplit[0].bm25Rank != 1) { bad = bad + 1; }
+                if (!remoteSplit[0].BothHit()) { bad = bad + 1; }
+                if (Math.Abs(remoteSplit[0].score - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+            }
+
+            // ---- 5. 引用读回 ----
+            if (remoteHits.Count > 0) {
+                string text = await r.TextOfAsync(remoteHits[0].id);
+                Console.WriteLine("text0=" + text);
+                if (text != "苹果 手机") { bad = bad + 1; }
+            }
+            // 不存在的 id 返回空串而不是崩。
+            string missing = await r.TextOfAsync(9999);
+            if (missing.Length != 0) { bad = bad + 1; }
+
+            // ---- 6. 维度不符必须被拒（写入前就拦）----
+            List<double> wrong = new List<double>();
+            wrong.Add(1.0);
+            wrong.Add(2.0);
+            wrong.Add(3.0);
+            int rejected = await r.AddAsync("错的", wrong, "w-wrong", "w-wrong");
+            Console.WriteLine("wrong dim=" + rejected + " err=" + r.lastError);
+            if (rejected != -1) { bad = bad + 1; }
+            if (r.lastError.Length == 0) { bad = bad + 1; }
+
+            // ---- 7. request id 语义 ----
+            //
+            // 同一个 id 配不同请求体 → 服务端判 id_conflict（不是静默
+            // 覆盖，也不是当成两次独立写入）。
+            string id = r.NextRequestId("seq");
+            Console.WriteLine("reqid=" + id);
+            if (id.Length == 0) { bad = bad + 1; }
+            // 两个不同 id 必须不同。
+            string id2 = r.NextRequestId("seq");
+            if (id == id2) { bad = bad + 1; }
+
+            client.Close();
+        }
+
+        // ---- 8. 三后端的融合分数必须逐位相等 ----
+        //
+        // 内存档（`Retriever`）、本地档（`ZanDbRetriever`）、远端档
+        // （`RemoteZanDbRetriever`）—— 同一批数据、同一个查询，融合
+        // 分数必须一模一样。否则从内存切到远端，检索结果会悄悄变样。
+        double localScore = 0.0;
+        {
+            string localPath = "_scratch/ai_remote_local.zdb";
+            Clean(localPath);
+            ZanDatabase db = ZanDatabase.Open(localPath, ZanStore.DUR_SYNC);
+            ZanDbRetriever lr = new ZanDbRetriever(db, "docs", 2);
+            lr.SetNormalized(false);
+            lr.EnsureIndexes();
+            lr.AddAll(Prog.Texts(), Prog.Vecs());
+            List<RetrieverHit> lh = lr.Search(V(1.0, 0.0), "手机", 3, 64);
+            if (lh.Count == 0) { bad = bad + 1; }
+            if (lh.Count > 0) { localScore = lh[0].score; }
+            lr.Close();
+            Clean(localPath);
+        }
+        double memScore = 0.0;
+        {
+            VectorStore vs = new VectorStore(2, false);
+            Bm25Index bm = new Bm25Index();
+            Retriever mr = new Retriever(vs, bm);
+            vs.AddAll(Prog.Vecs(), Prog.Texts(), 1);
+            for (int i = 0; i < Prog.Texts().Count; i = i + 1) {
+                bm.Add(i + 1, Prog.Texts()[i]);
+            }
+            List<RetrieverHit> mh = mr.Search(V(1.0, 0.0), "手机", 3);
+            if (mh.Count == 0) { bad = bad + 1; }
+            if (mh.Count > 0) { memScore = mh[0].score; }
+        }
+        double remoteScore = remoteHits.Count > 0 ? remoteHits[0].score : 0.0;
+        Console.WriteLine("scores mem=" + F(memScore) + " local=" + F(localScore)
+        + " remote=" + F(remoteScore));
+        if (Math.Abs(memScore - localScore) > 1e-12) { bad = bad + 1; }
+        if (Math.Abs(memScore - remoteScore) > 1e-12) { bad = bad + 1; }
+        if (Math.Abs(remoteScore - 2.0 / 61.0) > 1e-9) { bad = bad + 1; }
+
+        // **必须 await StopAsync()**（不能只用 RequestStop）——前者会
+        // 停监听、排空在途连接、关掉数据库；后者只是请求停止，连接与
+        // 库都还开着，退出时一堆对象仍可达 → leakcheck 报泄漏。
+        await server.StopAsync();
+        Clean(path);
+
+        Console.WriteLine("ai-remote-ok: " + (bad == 0 ? 1 : 0));
+        return bad == 0 ? 0 : 1;
+    }
+}

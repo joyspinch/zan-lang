@@ -829,7 +829,8 @@ conformance `table_transform`（选列的列序与不改入参 / 缺列抛异常
 | `AiEndpoint.zan` | 同上 | `AiEndpoint`：base URL → scheme/host/port/path；本地端点识别 |
 | `VectorStore.zan` | 同上 | `VectorStore`：**内存**向量存储（`AiEmbedding` double → `VectorIndex` float 适配、入库/检索/导出导入往返） |
 | `Retriever.zan` | 同上 | `Retriever`：**内存**混合检索（向量 + BM25）+ **RRF 融合**；保留两路原始排名与分数 |
-| `ZanDbRetriever.zan` | 同上 | `ZanDbRetriever`：**持久化**混合检索——文档与索引存 `ZanDb`（事务 + journal + 检查点），走原生 `Collection.SearchHybrid` |
+| `ZanDbRetriever.zan` | 同上 | `ZanDbRetriever`：**本地持久化**混合检索——文档与索引存 `ZanDb`（事务 + journal + 检查点），走原生 `Collection.SearchHybrid` |
+| `RemoteZanDbRetriever.zan` | 同上 | `RemoteZanDbRetriever`：**远端**混合检索——文档与索引在另一台机器的 `ZanDbServer` 上，客户端走 `ZanDbClient` 的 TCP 协议 |
 | `Rag.zan` | 同上 | `Rag`：分块→向量化→入库→检索→拼提示词→生成；`RagAnswer` 带引用溯源 |
 | `Models/*.zan` | `src/System/Ai/Models/` | `AiConfig` / `AiUsage` / `AiPricing` / `AiChunk` / `AiEmbedding` / `RetrieverHit` |
 
@@ -900,24 +901,39 @@ token 估算的 CJK/ASCII 口径与两处一致性；四种分块策略的块数
 变更走 **journal + 检查点**，文档写入与索引更新落在同一事务，不会
 出现"文档写进去了但索引没更新"。
 
-所以分工是：**`VectorStore`/`Retriever` 是内存档（小规模、单写者、
-一次性脚本、测试夹具），`ZanDbRetriever` 是生产档**。两者语义一致
-（同一 RRF 公式 k=60，同一个 `RetrieverHit` 实体），conformance 里
-有一条断言专门盯这个——两个后端对同一批数据给出**完全相同的融合
-分数**（0.032787），所以从内存切到持久化，检索结果不会悄悄变样。
+所以分工是**三档**：
+
+| 档 | 类 | 存储 | 并发写 | 适合 |
+|---|---|---|---|---|
+| 内存 | `VectorStore` + `Retriever` | 进程内存 | **不支持** | 小规模、单写者、一次性脚本、测试夹具 |
+| 本地 | `ZanDbRetriever` | 本地 `ZanDb` 文件 | 支持 | 单机生产 |
+| 远端 | `RemoteZanDbRetriever` | 远端 `ZanDbServer` | 支持 | 多机共享一份知识库 |
+
+三档**语义一致**（同一 RRF 公式 k=60，同一个 `RetrieverHit` 实体），
+conformance 里有一条断言专门盯这个——三个后端对同一批数据给出**完全
+相同的融合分数**（0.032787），所以从内存切到本地、再切到远端，检索
+结果不会悄悄变样。
+
+**远端写入的 request id 语义**（服务端按 id 绑定请求指纹）：一个 id
+只能配一个请求——同一个 id 配不同请求体会被判 `id_conflict`（不是
+静默覆盖，也不是当成两次独立写入）；同一个请求重试要用**同一个**
+id，这才是幂等。实测踩过：建文本索引与向量索引共用一个 id，第二次
+直接被拒 `id_conflict`，连带向量索引没建成、检索报"search index does
+not exist"。所以 `EnsureIndexesAsync` 内部给两个 ensure 派生两个 id。
 
 **`double` → `float` 的精度代价（实测）**：单精度有效位约 7 位十进制。
 embedding 分量（量级 0.01~1）相对误差约 1e-8，余弦相似度偏差约
 1e-9——对检索排序**没有可观察的影响**。但需要与服务端原始向量逐位
 一致时（跨系统精确比对）**不能经过这层**，直接用 `AiEmbedding.vectors`。
 
-**已知边界**：无重排（cross-encoder 重排那一层）、`ZanDbRetriever`
-走的是**进程内**的 `ZanDb`（本地文件，多机共享要靠 `ZanDbServer`
-的远端协议，本包尚未封装）、无 Tool calling、无会话记忆、无评估与
-可观测、无流式的**背压**（回调返回 false 只能停在这一帧之后）、无
-Token 精确计数（要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容
-协议（不做各家私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调
-embedding 服务**（没有本地离线 embedding 模型）。
+**已知边界**：无重排（cross-encoder 重排那一层）、远端档每次操作一次
+网络往返（`ZanDbClient` 每次 `SendAsync` 新建连接，**无连接池化、无
+批量检索**）、`Rag` 编排层目前只接**内存档**的检索器（还没有后端无关
+的检索器接口）、无 Tool calling、无会话记忆、无评估与可观测、无流式
+的**背压**（回调返回 false 只能停在这一帧之后）、无 Token 精确计数
+（要接厂商 tokenizer）、Embeddings 只支持 OpenAI 兼容协议（不做各家
+私有协议）、`Rag.Index` 与 `Rag.Ask` 都要求**在线调 embedding 服务**
+（没有本地离线 embedding 模型）。
 
 ### 1.21 缺失值处理：`Zan.DataFrame`
 
@@ -961,6 +977,51 @@ conformance `missing_values`（66 条断言）：CSV 空字段 → 缺失、空�
 值时不填；写入即"有值"（写值清标记、空串置标记）；CSV 往返保持缺失；
 `AddRow`/`AddColumn` 的新格是缺失；掩码随 `Filter`/`Copy` 传播。
 
+### 1.21 进程内消息总线：`Zan.Messaging`
+
+新包 `packages/Zan.Messaging`，命名空间 `System.Messaging`。补 MassTransit（7,809★）
+那一档的**进程内**那一半：把"这里发生了一件事"和"谁负责处理它"解耦。原 §2 记的
+"进程内事件只有 `Zan.Game` 的 `EventBus`（弱引用、无类型分发）"确实是空白。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `MessageBus.zan` | `MessageBus` | 总线：登记通道 / 广播 / 命令 / 中间件链 / 错误路由 + 计数 |
+| `MessageChannel.zan` | `MessageChannelBase` / `MessageChannel<T>` | 通道：订阅 / 退订 / 广播 / 命令 + 运行期类型判定（构造器定型成委托） |
+| `SubscriptionList.zan` | `SubscriptionList<T>` | 订阅表：订阅 / 退订 / 计数 / 广播（单独成类是为了闭包不捕获 `this` 成环） |
+| `QueryEndpoint.zan` | `QueryEndpointBase` / `QueryEndpoint<T, TResult>` | 请求-响应端点：处理函数 + 结果类型完整保留（值类型不丢） |
+| `MessageMiddleware.zan` | `MessageMiddleware` | 中间件委托：`(object message, Action next)`，必须调 `next` |
+| `MessageDelivery.zan` | `MessageDelivery` | 一次投递的执行体（消息 + 通道表 + 计数） |
+| `MessageError.zan` / `MessageException.zan` | `MessageError` / `MessageException` | 可区分错误码（`NoHandler` / `TooManyHandlers` / `HandlerFailed` / `InvalidHandler` / `InvalidMessage`）+ 原异常保留 |
+| `MessageHolder.zan` / `ValueHolder.zan` | `MessageHolder` / `ValueHolder<T>` | 闭包捕获用的盒子（`object` 形参与泛型形参都不能直接捕获） |
+
+**六条硬取舍**：
+
+1. **通道由使用者建，不由总线按类型自动建**。Zan 没有运行期类型名，总线判断
+   "这个类型是不是已经建过通道"只能靠运行期类型试探，会把同类型消息投两遍。
+   一个类型一个通道、通道由使用者持有，问题就不存在了。
+2. **类型判定在通道的构造器里定型成委托**。**Zan 里泛型类的虚方法体拿不到
+   类型参数**——`message is T` 经基类虚调用恒为 false（实测，见下"编译器缺陷
+   记录"）。所以 `MessageChannel<T>` 的构造器把判定与投递定型成三个委托
+   （`accepts` / `dispatch` / `handlerCount`），基类只调用委托、不碰类型信息。
+3. **消息必须是引用类型（类）**。总线按运行期类型分发，值类型没有运行期类型
+   可言；更根本的是 Zan 的 `object` 目前装不下值类型（显式装箱直接崩进程）。
+4. **订阅者异常默认原样抛出（不吞）**。总线里的异常多半是处理逻辑的 bug，吞掉
+   会让问题变成"消息莫名其妙没到"。登记 `OnError` 之后才改走错误处理器，异常
+   被包装成 `MessageException(HandlerFailed)`，原异常在 `InnerException`。
+5. **中间件必须调用 `next`**，不调用就是"吞掉这条消息"；中间件链包裹的是
+   **一次投递**（一次 `Publish` / `Send` / 查询跑一遍链，不是每个订阅者一遍）。
+6. **查询端点由使用者持有，结果类型完整保留**。把结果擦成 `object` 再转回来
+   这条路在 Zan 里不通（装箱缺陷），端点是泛型类、处理函数是
+   `FuncT<T, TResult>`，结果一路都是具体类型。
+
+conformance `messaging_bus`（类型分发 / 广播顺序 / 退订 / 命令语义 / 中间件顺序
+与吞消息 / 错误路由 / 查询端点值类型结果 / 参数校验）。ARC 守卫干净，
+`--check-leaks` 无泄漏。
+
+**已知边界**：没有跨进程传输；消息与（接总线时的）查询必须是引用类型；没有
+重试 / 死信 / 延迟投递 / 出站箱（持久化语义归 `Zan.Jobs`）；没有订阅者优先级；
+非线程安全。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -979,7 +1040,7 @@ conformance `missing_values`（66 条断言）：CSV 空字段 → 缺失、空�
 | 建议包 | C# 参考 | ★ | 补什么 | 工期 |
 |---|---|---|---|---|
 | `Zan.Mapping` | AutoMapper / Mapster | 10,188 / 5,182 | 全仓 0 命中。做「显式映射函数 + `Gen*` 生成」，**不做反射式自动映射** | 2 周 |
-| `Zan.Messaging` | MassTransit | 7,809 | 进程内发布/订阅、请求-响应、管道中间件 | 1–2 周 |
+| `Zan.Messaging` | MassTransit | 7,809 | ✅ 已落地 `packages/Zan.Messaging`（`System.Messaging`：类型化通道 + 广播 / 命令语义 + 请求-响应端点（结果类型完整保留）+ 中间件管道 + 可区分错误码，无反射，见 §1.21） | — |
 | `Zan.Cli` | Spectre.Console / Terminal.Gui | 11,666 / 11,279 | ✅ 已落地 `packages/Zan.Cli`（`System.Cli`：ANSI 样式 / 宽字符对齐表格 / 进度条 / 交互提示，见 §1.4） | — |
 | `Zan.Jobs` | Hangfire / Quartz.NET | 10,151 / 7,096 | 只有 `Zan.Hosting/Cron.zan` 定时触发；缺持久化任务队列、重试退避、任务存储 | 2–3 周 |
 
@@ -1042,6 +1103,7 @@ conformance `missing_values`（66 条断言）：CSV 空字段 → 缺失、空�
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
+**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` → `Zan.Jobs` → `Zan.Bench`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 
