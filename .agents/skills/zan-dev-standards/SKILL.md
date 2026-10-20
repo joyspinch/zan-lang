@@ -454,6 +454,14 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   只说明编译器知道这个类型的成员签名，不代表它在你的文件里可见。同包的
   另一个文件早就写了那行 `using`，这类"同一个包里一半文件能编一半不能编"
   的报错，先比 `using` 行再怀疑编译器。
+- **同名类跨命名空间时，裸名会绑到"另一个"类**：`Window` 在 `Gui.Backend`、
+  `System.Data`、`System.Automation` 三处都有 public 类。给一个本来能编过的
+  文件加一行 `using 别的包;`，里面的 `Window.GetTickMs()` 就会突然编不过
+  （"not a known variable, type, or namespace"），或绑到 `System.Data.Window`
+  报 "has no member 'GetTickMs'"。坑出处：ddz 加上 `using Game.Cards;` 后
+  `Window` 就绑不到 `Gui.Backend.Window` 了。**对策：用到的类型一律显式
+  import 它自己的命名空间**（`using Gui.Backend;`），别指望 `using Gui;`
+  顺带带出子命名空间——这跟上一条是同一个病的两面。
 - **红灯先按层归因，编译错误会掩盖运行期行为**：一条 conformance 用例可能同时
   有编译期错误与运行期行为差异；先把编译错误清掉再重跑看运行期输出——本轮 22 条
   "编译失败"清掉可见性误伤后，有 3 条露出真正的运行期缺陷（X509 的 CN 回退口径、

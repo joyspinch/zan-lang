@@ -8,6 +8,46 @@
 
 ## 未完成
 
+### [ ] A442 自举后端 `Convert.ToString(<引用类型>)` 输出指针地址——与 C 宿主的诊断不一致
+
+- 现象（2026-10-20 随 A441 一并查实）：C 宿主已改成对引用类型 fail-closed
+  （报 "Convert.ToString: cannot convert 'Box' to a string"），自举后端仍走
+  `src/selfhost/irgen_expr.zan:4036` 的 `Convert.ToString` 特判 → `ToCStr`
+  （同文件 `:933`）→ 非字符串/非数值就落进 `snprintf("%lld", ptr)`，**把对象
+  指针当整数打出来**（例如 "140737488xxxx"）。
+- 影响：同一个源文件，两个后端一个报错、一个输出地址。地址泄露本身也是
+  信息泄露（ASLR 绕过），且用户拿到的是无意义的输出。
+- 方向：`Convert.ToString` 特判里按**静态类型**分流——引用类型与结构体报
+  与宿主一致的诊断；字符串/数值走原有路径。⚠ 与 A441 的 bool 分支、
+  A443 的 stdlib 声明是同一处代码，**建议三件事一起做**（都在
+  `src/selfhost/irgen_expr.zan` + `src/compiler/irgen_call.c` 两处）。
+- 现状：C 宿主那侧已经修好（提交见 git 历史）；自举侧等窗口。
+
+### [ ] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
+
+- 现象：
+  - `stdlib/System/Convert.zan` 里**没有** `ToString`（只有 Base64 / Hex 那几个）；
+  - `src/compiler/builtin_api.c:92-96` 的 `members_convert` 里也只有
+    `ToDouble` / `ToInt32` / `ToInt64`，**没有 `ToString`**；
+  - 但编译器接受 `Convert.ToString(x)`（`src/compiler/irgen_call.c:1878` 的
+    内建特判），而且全仓有 4100 多处调用。
+  - 后果：`zanc --emit-symbols` 导出的 IDE 符号索引里，`Convert` 只有三个成员
+    （实测符号表原文：`M Convert ToDouble M 1 double ToDouble(string text)` …），
+    **IDE 补全补不出 `Convert.ToString`**。
+- 根因：检查器对「作为被调者的成员访问」不报「无此成员」
+  （`src/compiler/checker.c:4024` 的 `in_call_callee` 分支把诊断吞了），于是
+  irgen 的内建特判成了这条 API 的唯一"声明"。
+- 方向：把 `Convert.ToString` 真正声明进 `stdlib/System/Convert.zan`
+  （按实参类型分派：int / long / double / bool / string / object），
+  让公开面住在 stdlib：
+  - 检查器会找到真方法 → 类型定型与重载解析交给常规路径；
+  - 编译器内建特判的 `!zan_type_defines(g, "Convert", "ToString")` 守卫会自动
+    让路（该守卫已经在了）；
+  - IDE 补全随之补齐；
+  - bool 的渲染口径（A441）也能在 stdlib 里一次定死。
+- ⚠ 跨后端：自举后端 `src/selfhost/irgen_expr.zan:4036` 的 `Convert.ToString`
+  特判是**无条件拦截**的（不像 Console 那样有 `LocalIdx("Console") < 0` 守卫），
+  必须同时加上守卫，否则自举侧不会调用 stdlib 方法。两端要同一次落地。
 ### [ ] A441 布尔值→字符串的渲染有三条口径：`true` / `1` / `x1`
 
 - 现象（2026-10-20 探针 `_scratch/bool_str.zan`，C 宿主 `build/zanc.exe` 实测）：
@@ -832,3 +872,41 @@
   3. **明文化限制**：文档写清"类型参数字段不可在擦除上下文访问"，并给检查器
      一条提示级诊断（当前是静默读错值）。
 - 关联：A421（同一族：泛型实例化模型与类型实参的来源）。
+### [ ] A438 裸名 `Window` 会绑到错的类——`Gui.Backend.Window` 与 `System.Data.Window` 同名
+
+- 现象：给一个已经能编过的文件加一行 `using Game.Cards;`（引包）之后，
+  文件里的 `Window.GetTickMs()` 立刻编不过：
+  `unresolved call 'Window.GetTickMs': 'Window' is not a known variable, type, or namespace (is the class imported and registered in the stdlib map?)`。
+  单写 `using System; using Gui;` 的探针文件则把 `Window` 绑到
+  `System.Data.System_Data_Window`（Zan.DataFrame 里的另一个 Window），
+  报 "type 'System.Data.System_Data_Window' has no member 'GetTickMs'"。
+- 根因（未定位到具体代码，先记现象）：裸名解析没有"歧义"概念。
+  `Window` 在 `Gui.Backend`（Zan.Gui）、`System.Data`（Zan.DataFrame）、
+  `System.Automation`（Zan.Desktop）三处都有同名 public 类；而
+  `using Gui;` 这类导入会把子命名空间的类型也算进候选，于是候选集随
+  import 集变化，谁赢取决于解析顺序。之前 `Window.GetTickMs()` 能编过
+  是**兜底命中**（检查器在内建成员表里找到了同名成员），不是真绑到了
+  `Gui.Backend.Window`——irgen 需要类符号时就会露馅。
+- 影响：凡是"同一文件既用 `Window.GetTickMs()` 又 import 别的包命名空间"
+  的程序都会中招。游戏项目普遍用 `Window.GetTickMs()`，所以不是边角。
+- 方向（择一）：
+  1. 裸名多候选时按"成员命中"择优：调用 `X.M` 时先筛出声明了 M 的候选类，
+     唯一命中就用它；仍然多命中才报歧义。
+  2. 显式歧义诊断：裸名命中多个类就报"X 有多个候选（A.B.X / C.D.X）"，
+     要求显式 `using` 或全限定名——比静默绑错强。
+  3. 收窄 `using X;` 的导入面：只导入 X 直属的类型，不含子命名空间
+     （`using Gui;` 不再自动带出 `Gui.Backend`），歧义面自然变小。
+- 现状绕行（已落在 ddz 项目里）：用到 `Window` 的文件显式写
+  `using Gui.Backend;`（仓库里的 trap-cat 模板本来就这么写）。
+- 探针（最小复现，内容直接抄进本条，随时可重建）：
+  ```zan
+  using System;
+  using Gui;
+  public class ProbeWindow {
+      static int Tick() { return Window.GetTickMs(); }
+      static void Main() { Console.WriteLine("tick=" + Convert.ToString(ProbeWindow.Tick())); }
+  }
+  ```
+  编译命令 `zanc <file>.zan --auto-stdlib --package-project . -o out.exe`：
+  不加 `using Gui.Backend;` 绑到 `System.Data.Window` 报错；加上即编过。
+- 关联：无（命名解析族，与 A430~A437 不同族）。

@@ -30,8 +30,10 @@ state, semantic input and scene lifecycle.
 `Game.Board` provides cloneable grids, pathfinding, turns, validated commands,
 snapshots and replay logs for board games, tactics and puzzle games.
 
-`Game.Cards` provides card catalogs, runtime instances, deterministic zones and
-a compact deck-building battle runtime.
+`Game.Cards` provides card catalogs, runtime instances, deterministic zones, a
+compact deck-building battle runtime, and Chinese-style hand-shape rules
+(`ComboType` / `Combo` / `ComboRuleSet` / `ComboRules`: recognise, compare and
+enumerate the legal replies for single/pair/triple/straight/bomb hands).
 
 `Game.Arcade2D` provides geometry, collision queries, animation state, pooled
 entities and path following for tower defense, auto-battlers and lightweight
