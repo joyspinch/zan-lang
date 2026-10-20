@@ -1,0 +1,145 @@
+using System;
+using Gui;
+
+// 窗口类图标（任务栏、Alt+Tab、系统标题栏小图标）必须是程序自己的图标。
+//
+// 背景：窗口类注册时给的图标决定了任务栏按钮与 Alt+Tab 里的样子。
+// 之前给的是系统占位图标，所有应用的任务栏长得一模一样；现在给的是
+// zanc 编译时写进 exe 资源的那份（--icon 指定的或内置默认图标）。
+//
+// 判据：把「窗口类的大/小图标」与「从当前 exe 提取的大/小图标」都
+// 栅格化成像素逐字节比较。**句柄不能比**——两次 ExtractIconEx 得到的
+// 是两个不同的 HICON 对象，像素相等才说明是同一张图。
+//
+// 非 Windows 平台没有窗口类图标这条路径，按 skip 走。
+class AppIconClassCase {
+    static int fails;
+
+    [DllImport("user32", EntryPoint = "GetClassLongPtrW")]
+    static extern nint GetClassLongPtrW(nint hwnd, int index);
+
+    [DllImport("shell32", EntryPoint = "ExtractIconExW")]
+    static extern int ExtractIconExW(nint file, int index, nint large, nint small, int count);
+
+    [DllImport("user32", EntryPoint = "GetIconInfo")]
+    static extern int GetIconInfo(nint hIcon, nint ii);
+
+    [DllImport("user32", EntryPoint = "GetObjectW")]
+    static extern int GetObjectW(nint h, int size, nint buf);
+
+    [DllImport("gdi32", EntryPoint = "GetDIBits")]
+    static extern int GetDIBits(nint hdc, nint hbmp, int start, int lines,
+                                 nint bits, nint bmi, int usage);
+
+    [DllImport("user32", EntryPoint = "GetDC")]
+    static extern nint GetDC(nint hwnd);
+
+    [DllImport("user32", EntryPoint = "ReleaseDC")]
+    static extern int ReleaseDC(nint hwnd, nint hdc);
+
+    static void Fail(string what) {
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    // HICON → ARGB 像素（0xAARRGGBB，顶行优先）。取不到返回 null。
+    //
+    // 走 GDI：GetIconInfo 拿颜色位图，GetDIBits 用 BITMAPV4 头
+    // （BI_BITFIELDS + alpha 掩码）才能把图标自带的透明通道取回来。
+    static int[] IconPixels(nint hIcon) {
+        nint ii = NativeMemory.Alloc(32);
+        nint bmp = NativeMemory.Alloc(32);
+        nint hdr = NativeMemory.Alloc(124);
+        nint bits = 0;
+        try {
+            NativeMemory.Fill(ii, 0, 32);
+            if (GetIconInfo(hIcon, ii) == 0) { return null; }
+            nint hbmColor = new Span<long>(ii + 24, 1)[0];   // x64 ICONINFO
+            if (hbmColor == 0) { return null; }
+            NativeMemory.Fill(bmp, 0, 32);
+            if (GetObjectW(hbmColor, 32, bmp) == 0) { return null; }
+            int w = new Span<int>(bmp + 4, 1)[0];
+            int h = new Span<int>(bmp + 8, 1)[0];
+            if (w <= 0 || h <= 0 || w > 512 || h > 512) { return null; }
+            NativeMemory.Fill(hdr, 0, 124);
+            new Span<int>(hdr, 1)[0] = 124;              // bV4Size
+            new Span<int>(hdr + 4, 1)[0] = w;
+            new Span<int>(hdr + 8, 1)[0] = 0 - h;        // 顶行优先
+            new Span<int>(hdr + 12, 1)[0] = 1 | (32 << 16);
+            new Span<int>(hdr + 16, 1)[0] = 3;           // BI_BITFIELDS
+            new Span<int>(hdr + 40, 1)[0] = 0x00FF0000;
+            new Span<int>(hdr + 44, 1)[0] = 0x0000FF00;
+            new Span<int>(hdr + 48, 1)[0] = 0x000000FF;
+            new Span<int>(hdr + 52, 1)[0] = 0 - 16777216;
+            int count = w * h;
+            bits = NativeMemory.Alloc(count * 4);
+            nint dc = GetDC(0);
+            int lines = GetDIBits(dc, hbmColor, 0, h, bits, hdr, 0);
+            ReleaseDC(0, dc);
+            if (lines != h) { return null; }
+            Span<byte> src = new Span<byte>(bits, count * 4);
+            int[] pixels = new int[count];
+            for (int i = 0; i < count; i = i + 1) {
+                int o = i * 4;
+                pixels[i] = (src[o + 3] << 24) | (src[o + 2] << 16)
+                    | (src[o + 1] << 8) | src[o];
+            }
+            return pixels;
+        } finally {
+            if (bits != 0) { NativeMemory.Free(bits); }
+            NativeMemory.Free(ii);
+            NativeMemory.Free(bmp);
+            NativeMemory.Free(hdr);
+        }
+    }
+
+    // 两个像素数组是否逐字节相同。
+    static bool Same(int[] a, int[] b) {
+        if (a == null || b == null) { return false; }
+        if (a.Length != b.Length) { return false; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    static void Main() {
+        fails = 0;
+        #if WINDOWS
+        App app = new App("app-icon-class", 320, 200);
+        nint hwnd = app.WindowHandle();
+        if (hwnd == 0) {
+            Console.WriteLine("SKIP: no native window in this session");
+            return;
+        }
+
+        // 从当前 exe 取图标组（索引 0）：大/小各一个。
+        string exe = Environment.ProcessPath;
+        nint wpath = Wide.Of(exe);
+        nint slots = NativeMemory.Alloc(16);
+        NativeMemory.Fill(slots, 0, 16);
+        ExtractIconExW(wpath, 0, slots, slots + 8, 1);
+        nint exeBig = new Span<long>(slots, 1)[0];
+        nint exeSmall = new Span<long>(slots + 8, 1)[0];
+        NativeMemory.Free(slots);
+        Wide.Free(wpath);
+
+        // 窗口类上的大/小图标（任务栏、Alt+Tab、系统标题栏小图标）。
+        nint classBig = GetClassLongPtrW(hwnd, -14);    // GCLP_HICON
+        nint classSmall = GetClassLongPtrW(hwnd, -34);  // GCLP_HICONSM
+
+        if (!Same(IconPixels(classBig), IconPixels(exeBig))) {
+            Fail("window class big icon is not the program icon");
+        }
+        if (!Same(IconPixels(classSmall), IconPixels(exeSmall))) {
+            Fail("window class small icon is not the program icon");
+        }
+
+        app.StopLoop();
+        app.window.Close();
+        if (fails == 0) { Console.WriteLine("app-icon-class-ok"); }
+        #else
+        Console.WriteLine("SKIP: window class icon is only provided on Windows");
+        #endif
+    }
+}
