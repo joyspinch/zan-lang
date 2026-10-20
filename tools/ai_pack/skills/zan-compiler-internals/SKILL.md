@@ -334,7 +334,56 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      （lambda 分支直接 `return type_error`；`zan_checker_check_expr` 没有
      `AST_BLOCK` 分支）——所以 lambda 的返回类型检查只能在 irgen 做。
      `object → 具体类` 的下转照旧放行；真装箱（分配带类型描述符的堆对象）是
+
      独立战线。
+26. **泛型值类型与 null 的比较必须在 IR 层折叠，不能直接发 `icmp`**：
+   - 动作：`emit_expr_binary` 里，当一侧是空指针常量、另一侧是**值类型**
+     （struct / int / float）时，`==` 折叠成 false、`!=` 折叠成 true——值类型
+     永远不是 null。两侧都要释放 owned 临时对象。
+     可空聚合体（`zan.nullable.*`）**不按值类型折叠**：它的"是否为 null"由
+     has-value 标记决定。
+   - 理由：泛型形参 `T` 特化成结构体后，`v == null` 的左侧是**聚合值**、
+     右侧是空指针，直接发 `icmp eq %struct.Point, ptr null` → LLVM 校验失败
+     （Both operands to ICmp instruction are not of the same type）→ 编译期
+     崩，且诊断信息指向用户代码而不是编译器缺陷。
+   - 边界：折叠只对**一侧为空指针常量**成立；两个值类型之间的比较照常走
+     值比较路径。语义口径：值类型 `v == null` 恒 false、`v != null` 恒 true；
+     引用类型仍按指针比较。
+   - 判定器：`tests/conformance/generic_value_null_compare.zan`。
+27. **表达式体 Lambda 返回结构体必须按值取出，不能直接 `ret` 求值地址**：
+   - 动作：`emit_lambda_typed` 的表达式体路径，当返回类型是 struct 且不是
+     nullable 聚合时，先按值取出（`coerce_struct_value_arg`）再 `LLVMBuildRet`。
+   - 理由：表达式体求值出的是结构体对象的**地址**，与"按值返回结构体"的
+     签名不符 → `ret ptr %new` 与 `%struct.Point` 不匹配 → LLVM 校验失败
+     （Function return type does not match operand type of return inst）。
+     块体 lambda 因为走按值路径已经正确，**只有表达式体漏**。
+   - 边界：nullable 聚合（`zan.nullable.*`）是另一种形态，跳过。
+   - 判定器：`tests/conformance/lambda_struct_return.zan`。
+28. **catch 退出路径必须先释放异常对象、再释放局部变量；eh_slot 按 LIFO 弹**：
+   - 动作：所有从 catch 块退出的路径（return 带值 / return 无值 / break /
+     continue / goto）都改成**先释放活动 catch 异常、再释放局部变量**；
+     `emit_release_owned_locals_except` 弹 eh_slot 标记时按**逆序（LIFO）**。
+   - 理由：catch 进入时异常对象压在**异常临时栈顶**（`exc.push`）。原顺序先
+     释放局部变量——弹 eh_slot 标记时弹掉的其实是栈顶那个**异常**——于是
+     局部变量的标记滞留在栈上、栈深错位；后续异常展开二次释放同一个对象，
+     读已释放对象头拿到垃圾描述符 → SIGSEGV。定位链：
+     `zan_rt_release_dyn` ← `__zan_eh_tmp_unwind` ← 业务帧。
+   - 边界：catch 块内**正常执行到底**的路径不走这套释放；只有"从 catch
+     里跳出"的路径要成对释放异常与局部变量。
+   - 判定器：`tests/conformance/catch_return_release.zan`。
+29. **委托调用点必须按当前实例替换类型参数，否则与 lambda 的实际签名不一致**：
+   - 动作：`emit_delegate_call` 里，若当前实例非空且委托类型是
+     `TYPE_DELEGATE`，先深替换类型参数（`subst_type_param_deep` +
+     `g->cur_inst`），再用替换后的类型算形参/返回的 LLVM 类型；结构体实参按值
+     规整（`coerce_struct_value_arg`）。
+   - 理由：泛型实例里委托字段的类型是 `Func<TTarget>`。调用点若按**未替换**
+     的类型算签名，得到的是擦除形态（指针）；而实际 lambda 是按**已替换**类型
+     发射的（按值返回结构体）→ 调用点把返回值当指针再 load → 读到 null/垃圾
+     → `mov (%rcx),%eax` 崩溃（rcx=0）。
+   - 边界：替换要**深替换**，嵌套在泛型实参里的类型参数也要换；只换顶层会
+     漏掉 `Func<List<T>>` 这类形态。
+   - 判定器：`tests/conformance/mapping_profile.zan`（结构体目标）、
+     `tests/conformance/mapping_gen.zan`。
 
 ---
 
@@ -421,6 +470,22 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
    - 边界：目录展开必须**按路径字典序排序**——目录遍历的原始顺序在 Windows
      上不确定，而输入顺序影响合并单元里 decl 的先后，可复现构建与差分门都
      要求稳定。
+
+6. **await 的目标必须先判「异步 / 普通」再取帧**：
+   - 动作：代码生成层在取子协程帧之前，先判一次 await 的目标是**异步**还是
+     **普通值**：目标是普通值就原样返回，不进协程帧那套。判定要覆盖六种
+     形态——`Task`/`ValueTask` 类型、async **方法**（看方法原型上的 async
+     标记）、async **委托**（对象是委托 / 被调者本身是委托 / 字段是委托）、
+     **接口方法**（签名在接口上声明）、**类名静态接收者**（类名不是值，
+     类型推断给不出结果，要按名字查符号）。
+   - 理由：普通值往往也是 i8 指针（字符串就是），与子协程帧的指针**同型**，
+     被当成帧去读就静默读出垃圾——不报错，只是结果为空或乱码。实测两种症状：
+     `await` 一个 async 方法拿到空结果（协程帧从没建立），`await` 一个同步
+     委托同样拿到空。网络请求的 await 被误判成普通值时，报的是
+     `request write failed`——离根因十万八千里。
+   - 边界：**不要靠类型推断单独判**。async 方法的返回类型是它的真实返回
+     类型，不是 `Task`——类型上看不出来，只能看方法原型上的 async 标记。
+     同理接口方法、类名静态接收者也都推不出来，必须各自走一条路。
 
 ---
 
