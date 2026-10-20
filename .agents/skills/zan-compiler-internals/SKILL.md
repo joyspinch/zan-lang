@@ -45,6 +45,20 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      `get_virtual_method_index`、`irgen_arc.c` 的 `collect_vslot_decls`、
      `irgen_generics.c` 的 `emit_dispatch_call`）——漏一处，派生类的 override
      会落到别的槽位上，虚分发静默走错方法。
+6. **限定名必须按命名空间解析，不得退化成"取最后一段猜"**：
+   - 动作：`Ns.Type.Member(...)` 这类限定名路径，只能解析到该命名空间（或其
+     子命名空间）里的类型；路径首段是**类**时（`Widget.Tooltip.Flush`）后面
+     才是嵌套成员。解析不到就报 "unresolved call"，不许退化成"拿最后一段去
+     作用域里找同名类"。
+   - 理由：退化之后，限定名写错（`System.Text.Csv.Parse`，Csv 实际住在
+     `System.Csv`）会静默绑到 `using` 引进的同名类上——不报错、返回类型也
+     对不上（`CsvTable` 当 `List<List<string>>` 用），运行期直接踩内存
+     0xC0000005。症状落在业务代码里，根因却在编译器，定位成本极高。
+   - 边界：判据是"路径前缀与类型所在命名空间必须互为祖先"（按命名空间段边界
+     比），外加"路径首段是类 → 嵌套成员"这条例外——少了它
+     `Widget.Tooltip.Flush` 这类嵌套访问会被误杀。回归用例：
+     `tests/diag/qualified_name_wrong_namespace.zan`（必须编译失败）+
+     `tests/conformance/qualified_name_namespace.zan`（合法限定名仍能解析）。
 
 ---
 

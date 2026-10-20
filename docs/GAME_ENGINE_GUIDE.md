@@ -240,6 +240,8 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 导出与回填用 [`scripts/export_game_project.ps1`](../scripts/export_game_project.ps1)：
 它把模板连同测试套件复制到仓库外、改写所有仓库路径引用、退掉模板身份
 （删 manifest、`{{NAME}}` 落实名）、补一份 `PROJECT.md`，并可 `git init` 出独立历史。
+搬出前的版本留在 `archive/game-legend-2026-10-20` 与 `archive/game-wuwei-2026-10-20`
+两个标签上；仓库里已没有源目录，需要重新导出时用 `-SourceRef <标签>` 从标签取源。
 
 完整矩阵（含棋类、街机、平台、益智各品类）见
 [`templates/game/README.md`](../templates/game/README.md)——那里按品类列了每个

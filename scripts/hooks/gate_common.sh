@@ -86,13 +86,16 @@ gate_check_blob_size() {
     _gbs_mode="$1"
     : > "$_ZAN_GATE_TMP/bigblobs"
     if [ "$_gbs_mode" = "staged" ]; then
-        git diff --cached --name-only -z | while IFS= read -r -d '' _gbs_p; do
-            _gbs_sz="$(git cat-file -s ":$_gbs_p" 2>/dev/null)" || continue
-            [ -n "$_gbs_sz" ] || continue
-            if [ "$_gbs_sz" -gt "$GATE_MAX_BLOB_BYTES" ]; then
-                printf '%s %s\n' "$_gbs_sz" "$_gbs_p"
-            fi
-        done >> "$_ZAN_GATE_TMP/bigblobs"
+        # 一次批量查完，不要按路径逐个起 git 进程：搬走一个大型模板就是
+        # 七八千条暂存路径，逐个 cat-file 在 Windows 上要跑几十分钟，
+        # 门禁事实上等于不可用。做法与 pre-push 分支同源：先把暂存路径过一遍
+        # 索引拿到 blob 的 sha，再把 "<sha> <路径>" 喂给 --batch-check，
+        # %(rest) 给出路径，%(objectsize) 给出大小。
+        git diff --cached --raw 2>/dev/null \
+            | awk -F'\t' '{ split($1, a, " "); sha = a[4]; if (sha != "" && sha !~ /^0+$/) print sha " " $2 }' \
+            | git cat-file --batch-check='%(objecttype) %(objectsize) %(objectname) %(rest)' 2>/dev/null \
+            | awk -v max="$GATE_MAX_BLOB_BYTES" '$1 == "blob" && $2 > max { printf "%s %s\n", $2, $4 }' \
+            >> "$_ZAN_GATE_TMP/bigblobs"
         _gbs_label="staged"
     else
         _gbs_remote="$2"

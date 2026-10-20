@@ -110,6 +110,11 @@ tools/agent/impact.ps1 -Symbol 'File.ReadAllText'
 - 改 `stdlib/`、`packages/` 公共面 → 刷地图（`scripts/build_repomap.ps1`）+ 跑模板门。
 - 修好一个可复发的编译错误 → 留一条能拦住它的用例（`tests/conformance/`）。
 - 临时探针、编译产物只进 `_scratch/`，不进根目录。
+- 批量提交（一次暂存几千个文件，例如把一个大型模板搬出仓库）→ 提交门禁的
+  blob 大小检查必须走**批量**（`git diff --cached --raw` + `git cat-file
+  --batch-check`）。逐路径起 `git cat-file -s` 是每路径一个进程：7882 条
+  暂存路径能把一次提交拖到半小时以上，门禁事实上等于不可用；改批量后同样的
+  检查 0.3 秒跑完（冲突标记检查 0.5 秒）。改了钩子就顺手量一下耗时。
 
 ## 7. 红旗（出现即回退）
 

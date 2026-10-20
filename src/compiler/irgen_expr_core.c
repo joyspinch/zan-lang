@@ -138,6 +138,82 @@ static zan_ast_node_t *name_path_head(zan_ast_node_t *node) {
     return (node && node->kind == AST_IDENTIFIER) ? node : NULL;
 }
 
+/* 把成员访问链摊成点号路径："System.Text.Csv"。 */
+static bool qpath_flatten(zan_ast_node_t *n, char *buf, int cap) {
+    if (!n || cap <= 1) return false;
+    if (n->kind == AST_IDENTIFIER) {
+        int len = (int)n->ident.name.len;
+        if (len + 1 > cap) return false;
+        memcpy(buf, n->ident.name.str, (size_t)len);
+        buf[len] = '\0';
+        return true;
+    }
+    if (n->kind == AST_MEMBER_ACCESS) {
+        if (!qpath_flatten(n->member.object, buf, cap)) return false;
+        int len = (int)strlen(buf);
+        int mlen = (int)n->member.name.len;
+        if (len + 1 + mlen + 1 > cap) return false;
+        buf[len] = '.';
+        memcpy(buf + len + 1, n->member.name.str, (size_t)mlen);
+        buf[len + 1 + mlen] = '\0';
+        return true;
+    }
+    return false;
+}
+
+/* 命名空间段边界上的祖先判断：a 是 b 的祖先（"Sys" 是 "System.Text" 的祖先）。 */
+static bool ns_is_ancestor(const char *a, size_t alen, const char *b, size_t blen) {
+    if (alen == 0 || alen > blen) return false;
+    if (memcmp(a, b, alen) != 0) return false;
+    if (alen == blen) return true;
+    return b[alen] == '.';
+}
+
+/* ns 以 suf 结尾且在段边界上（"Gui.Widget" 以 "Widget" 结尾）。 */
+static bool ns_ends_with_seg(const char *ns, size_t nslen, const char *suf, size_t suflen) {
+    if (suflen == 0 || nslen < suflen + 1) return false;
+    if (memcmp(ns + nslen - suflen, suf, suflen) != 0) return false;
+    return ns[nslen - suflen - 1] == '.';
+}
+
+/* 限定名路径必须和候选类型的命名空间对得上。
+ *
+ * 踩过的坑：`System.Text.Csv.Parse(...)`（Csv 其实住在 System.Csv 命名空间）
+ * 以前会**按最后一段**绑到 using 引进的 Csv 类上——不报"未解析"，返回类型
+ * 也不匹配（CsvTable 当成 List<List<string>> 用），运行期直接踩内存
+ * (0xC0000005)。限定名写错就该报错，不能猜。
+ *
+ * 判据分两种：
+ *   - 路径**首段是类**（Widget.Tooltip.Flush）：后面是嵌套成员，按最后一段
+ *     找是合法的，放行；
+ *   - 路径首段是**命名空间**（System.Text.Csv）：路径前缀（去掉最后一段）
+ *     与类型所在命名空间必须互为祖先——
+ *       Csv 在 System.Csv，路径 "System.Csv"          → 前缀是 ns 的祖先 ✔
+ *       Json 在 System.Text.Json，路径 "System.Text.Json" → 前缀是 ns 的祖先 ✔
+ *       Csv 在 System.Csv，路径 "System.Text.Csv"      → 互不为祖先 ✘（拒绝）
+ */
+static bool qpath_ns_ok(zan_irgen_t *g, zan_ast_node_t *path, zan_symbol_t *sym) {
+    if (!sym) return true;
+    if (!sym->decl) return true;  /* 查不到声明的符号（内置/外部）不拦 */
+    zan_ast_node_t *head = name_path_head(path);
+    if (!head) return true;
+    zan_symbol_t *hs = zan_binder_lookup(g->binder, head->ident.name);
+    if (hs && (hs->kind == SYM_CLASS || hs->kind == SYM_STRUCT))
+        return true;              /* 类开头的路径：嵌套成员，放行 */
+    char buf[512];
+    if (!qpath_flatten(path, buf, (int)sizeof(buf))) return true;
+    char *last = strrchr(buf, '.');
+    if (!last) return true;       /* 单段名：using 引进的类，合法 */
+    size_t plen = (size_t)(last - buf);
+    zan_istr_t ns = zan_ast_ns_name(sym->decl);
+    if (ns.len == 0) return false; /* 全局命名空间的类型不能带命名空间前缀 */
+    if (ns.len == plen && memcmp(ns.str, buf, plen) == 0) return true;   /* 完全一致 */
+    if (ns_is_ancestor(buf, plen, ns.str, ns.len)) return true;            /* 前缀是 ns 的祖先 */
+    if (ns_is_ancestor(ns.str, ns.len, buf, plen)) return true;            /* ns 是前缀的祖先（嵌套类） */
+    if (ns_ends_with_seg(ns.str, ns.len, buf, plen)) return true;          /* 相对外层命名空间写（Gui.Widget ← Widget） */
+    return false;
+}
+
 static int conv_rank(zan_type_t *t) {
     if (!t) return 0;
     switch (t->kind) {
@@ -956,6 +1032,16 @@ static int expr_family(zan_irgen_t *g, zan_ast_node_t *e, local_scope_t *locals)
 
 static int concrete_arg_score(zan_irgen_t *g, zan_type_t *pt,
                               zan_ast_node_t *a, local_scope_t *locals) {
+    /* null 字面量实参：推断不出静态类型，只能按"接不接得住 null"判——
+     * 与 checker 共用同一条规则（zan_null_arg_score）。
+     *
+     * 踩过的坑：`Arg.Text(null)` 以前走到 `Text(int)`，null 被当成 0 传
+     * 下去，调用点毫无异常，断言却永远对不上——因为这里对 null 一律给
+     * 0 分，等于所有重载同分，第一个（值类型）就赢了。 */
+    if (a && a->kind == AST_NULL_LITERAL) {
+        int ns = zan_null_arg_score(pt);
+        return ns < 0 ? -1 : ns;
+    }
     zan_type_t *at = infer_expr_type(g, a, locals);
     if (at && !type_mentions_tp(at)) {
         if (types_concrete_equal(pt, at)) return 4;
@@ -1828,7 +1914,8 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                 zan_ast_node_t *head = name_path_head(obj);
                 if (head && !local_find(locals, head->ident.name)) {
                     zan_symbol_t *ts = zan_binder_lookup(g->binder, obj->member.name);
-                    if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT)) {
+                    if (ts && (ts->kind == SYM_CLASS || ts->kind == SYM_STRUCT) &&
+                        qpath_ns_ok(g, obj, ts)) {
                         zan_symbol_t *m = get_method_sym(ts, callee->member.name);
                         if (m) {
                             zan_type_t *gr = generic_method_ret(g, m, e, locals);

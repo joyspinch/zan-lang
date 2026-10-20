@@ -4907,7 +4907,8 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
             zan_ast_node_t *head = name_path_head(obj);
             if (is_name_path(obj) && head && !local_find(locals, head->ident.name)) {
                 zan_symbol_t *type_sym = zan_binder_lookup(g->binder, obj->member.name);
-                if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT)) {
+                if (type_sym && (type_sym->kind == SYM_CLASS || type_sym->kind == SYM_STRUCT) &&
+                    qpath_ns_ok(g, obj, type_sym)) {
                     zan_symbol_t *method_sym = resolve_overload_typed(g, type_sym, callee->member.name, expr, locals);
                     if (method_sym) fill_default_args(g, expr, method_sym);
                     if (method_sym) pack_params_args(g, expr, method_sym, locals);
@@ -5317,6 +5318,11 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                     ? obj->ident.name : obj->member.name;
                 zan_istr_t mn = expr->call.callee->member.name;
                 zan_symbol_t *osym = zan_binder_lookup(g->binder, on);
+                /* 限定名路径与类型命名空间对不上（例如把 System.Csv.Csv 写成
+                 * System.Text.Csv）：当未解析处理，别按最后一段猜一个类。 */
+                if (osym && obj->kind == AST_MEMBER_ACCESS &&
+                    !qpath_ns_ok(g, obj, osym))
+                    osym = NULL;
                 char path[256];
                 int plen = format_name_path(expr->call.callee, path,
                                             (int)sizeof(path));

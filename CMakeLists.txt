@@ -4592,6 +4592,18 @@ add_test(NAME diag_fully_qualified_unresolved
 set_tests_properties(diag_fully_qualified_unresolved PROPERTIES
   WILL_FAIL TRUE TIMEOUT 60)
 
+# A fully-qualified call whose *namespace prefix* is wrong
+# (`System.Whatever.Encoding`, while Encoding lives in System.Text) must be a
+# compile error. The resolver used to fall back to the last path segment and
+# bind the `using`-imported class of the same name: no diagnostic, a mismatched
+# return type, and a 0xC0000005 access violation at run time.
+add_test(NAME diag_qualified_name_wrong_namespace
+  COMMAND zanc ${CMAKE_SOURCE_DIR}/tests/diag/qualified_name_wrong_namespace.zan
+    --auto-stdlib
+    -o ${CMAKE_BINARY_DIR}/diag_qualified_name_wrong_namespace${_exe_ext})
+set_tests_properties(diag_qualified_name_wrong_namespace PROPERTIES
+  WILL_FAIL TRUE TIMEOUT 60)
+
 # A write to a getter-only property (no setter) -- plain `=`, `+=`, `++`, or an
 # object-initializer entry -- must be a compile error, not a silent store into
 # the backing slot that a custom getter never reads back.
