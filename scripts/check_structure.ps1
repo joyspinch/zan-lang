@@ -68,6 +68,24 @@ foreach ($k in $baseline.Keys) {
     if ($stillOver -notcontains $k) { $gone += $k }
 }
 
+# 5) spacing/size discipline: the product shell's stylesheets must not
+# sprinkle raw pixels for padding/margin/gap/radius/font-size. The single
+# source of truth is Space/Radius/WidgetSize (packages/Zan.Gui/src/Gui/
+# Styling), surfaced as CSS tokens; scripts/spacing_audit.py is the gate.
+$spacingAudit = Join-Path $PSScriptRoot "spacing_audit.py"
+if (Test-Path -LiteralPath $spacingAudit) {
+    $py = (Get-Command python -ErrorAction SilentlyContinue)
+    if ($py) {
+        $auditOut = & python $spacingAudit 2>&1
+        $auditCode = $LASTEXITCODE
+        $auditOut | ForEach-Object { Write-Output ("SPACING " + $_) }
+        if ($auditCode -ne 0) {
+            Write-Output "STRUCTURE_FAILED spacing audit"
+            exit 1
+        }
+    }
+}
+
 foreach ($e in $errors) { Write-Output ("STRUCTURE_ERROR " + $e) }
 Write-Output ("[oversize] " + $stillOver.Count + " baselined file(s) still to split")
 if ($gone.Count -gt 0) {

@@ -42,29 +42,46 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
 
 ## 三条尺寸阶梯(硬规则)
 
-token 定义在 `stdlib/Gui/Theme.zan`,由 `Style.zan` 导出为 `:root` 变量,
-皮肤可整体改值——**永远不要写死数字**。
+**唯一真源**是样式包里 `Space`/`Radius`/`WidgetSize` 三个常量类:
+`Theme` 的默认度量从它们取值,`Style.RootFromTheme` 把同一组数导成
+`:root` 变量,皮肤可整体改值——**永远不要写死数字**。
+
+**为什么是硬规则**:同一个语义(比如"卡片内衬")在不同文件里写着不同
+数字(8 / 10 / 18 / 20),相邻表面就永远对不齐——这是"界面看着不精致"
+最主要的原因,比配色和图标明显得多。而且裸像素**不会**跟着皮肤、密度档
+和 DPI 走,主题令牌会:写死数字的表面在换肤/换密度后立刻露馅。
 
 **字号**:`var(--font-size-tiny/small/medium/large/huge)` = 12/13/14/16/20。
 正文 medium(14),辅助/标签 small(13)或 tiny(12),区块标题 large(16),
-页面标题 huge(20)。更大的展示数字用 Tailwind 原子类 `text-xl..text-3xl`,
-但一个画面至多出现一个超档大字。**卡片墙的组头(每卡标题)别挤在
-small-medium 之间**:画廊卡片标题先后用 13/15 都被打回"太小",17 才过
-——密排卡片墙里 caption 与正文只差 1px 等于没分组,组头要么 large(16)
-要么自定义再大一档,和正文拉开两级才算分组。
+页面标题 huge(20)。更大的展示数字用 `var(--font-size-display/hero/mega)`
+= 24/32/56(基线样式表声明),但一个画面至多出现一个超档大字。**卡片墙的
+组头(每卡标题)别挤在 small-medium 之间**:画廊卡片标题先后用 13/15 都被
+打回"太小",17 才过——密排卡片墙里 caption 与正文只差 1px 等于没分组,
+组头要么 large(16)要么自定义再大一档,和正文拉开两级才算分组。
 
-**控件高度**:`var(--height-tiny/small/medium/large)` = 22/28/34/40。
+**控件高度**:`var(--height-tiny/small/medium/large)` = 24/28/32/40
+(`WidgetSize`: Mini 24 / Small 28 / Medium 32 / Large 40)。
 按钮/输入框/选择框用 `.tiny/.small/.medium/.large` 皮肤档位类
-(`skins/base.css` 已消费这些 token)。**同一行的操作控件必须同档**;
+(基线样式表已消费这些 token)。**同一行的操作控件必须同档**;
 整块画面主按钮统一 medium,工具条统一 small,别混。
 
-**间距**:一切间距是 4 的倍数(命中 7/13/17 这类值就是错)。
-- flex/grid 容器的 gap 用档位类:`gap-none/small/medium/large` = 0/6/8/12
-  (值取 `var(--gap-*)`),换肤时整套留白跟着变。
-- padding/margin 用 Tailwind 原子类:`p-2`=8px、`p-3`=12px、`p-4`=16px
-  (刻度 = n×4px;样式引擎原生翻译 Tailwind token,见 `Gui/Tailwind.zan`)。
-- 惯例:卡片内边距 `p-3`/`p-4`,紧凑工具条 `px-2 py-1`,节与节之间
-  `gap-large`(12)再往上只有 16/24,不要发明中间值。
+**圆角**:`var(--radius-small/medium/large)` = 4/8/12,胶囊用
+`var(--radius-full)`。皮肤想要更圆就改自己的 `--border-radius-*`,
+不要在规则里写 `border-radius: 18px`。
+
+**间距**:8pt 网格 0/2/4/8/12/16/24/32/48(`Space`)。命中 7/13/17 这类
+值就是错。
+- 主题内边距 `var(--padding-tiny/small/medium/large)` = 4/8/12/16
+- 主题间距 `var(--gap-small/medium/large)` = 4/8/12
+- 原子类阶梯 `var(--space-xs/s/sm/m/l/xl)` = 4/8/12/16/24/32
+- 图标/指示器 `var(--icon-size-small/medium/large)` = 16/20/24
+- 惯例:卡片内边距 `var(--padding-medium)`/`--padding-large`,紧凑工具条
+  `var(--padding-tiny)`,节与节之间 `var(--gap-large)`(12)再往上只有
+  16/24,不要发明中间值。
+
+**尺寸 ≠ 间距**:width/height 这类控件几何(指示器 12px、滑块点 10px、
+图片 300×220)不套间距阶梯——阶梯管的是"留白",几何管的是"形状"。
+但**留白类属性**(padding/margin/gap/border-radius)只准写令牌。
 
 ## 组件排列整齐与行高间距一致性铁律（美观基本原则）
 
