@@ -15,8 +15,16 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 BUILD = ROOT / "build" / "coreforge-tests"
-LOGIC_MODULES = ("Model.zan", "Factory.zan", "Combat.zan", "Simulation.zan", "Persistence.zan")
-GUI_MODULES = {"main.zan", "Interface.zan", "Renderer.zan", "AutoTest.zan"}
+# 逻辑层已抽成包 packages/Zan.Game.Factory（namespace Game.Factory）：
+# 测试源里一句 `using Game.Factory;` 就会把整个命名空间目录自动带进编译，
+# 因此这里只需喂测试源本身，不必逐个列举包内文件。
+PACKAGE_SRC = ROOT / "packages" / "Zan.Game.Factory" / "src" / "Game" / "Factory"
+TEMPLATE_SRC = ROOT / "templates" / "game" / "coreforge" / "src"
+# 模板目录里只剩"皮肤"（渲染/界面/入口），它们不进逻辑测试。
+GUI_MODULES = {
+    "main.zan", "ForgeInterface.zan", "ForgeRenderer.zan", "ForgeCamera.zan",
+    "CoreforgeHud.zan", "CoreforgeAutoTest.zan",
+}
 ERROR_TEXT = re.compile(r"\berror\b|\bfatal\b|\bpanic\b|\bexception\b|COREFORGE_TESTS_FAIL|ASSERT_FAIL", re.IGNORECASE)
 # The Zan runtime emits CRLF on Windows; tolerate it before the end anchor.
 SUCCESS = re.compile(r"^COREFORGE_TESTS_OK assertions=([1-9][0-9]*)\r?$", re.MULTILINE)
@@ -39,15 +47,18 @@ def run(command: list[str], timeout: int, log: Path) -> subprocess.CompletedProc
 
 
 def verify(compiler: Path, timeout: int) -> None:
-    source_dir = ROOT / "templates" / "game" / "coreforge" / "src"
-    sources = [source_dir / name for name in LOGIC_MODULES]
-    sources.append(Path(__file__).with_name("logic.zan"))
+    sources = [Path(__file__).with_name("logic.zan")]
     for path in [compiler, *sources]:
         if not path.is_file():
             raise RuntimeError(f"Required input is missing: {path}")
-    extra = [path for path in source_dir.rglob("*.zan") if path not in sources and path.name not in GUI_MODULES]
+    # 包的命名空间目录必须存在且有源码：测试靠 `using Game.Factory;` 自动引入它。
+    package_files = sorted(PACKAGE_SRC.glob("*.zan"))
+    if not package_files:
+        raise RuntimeError(f"Package sources are missing: {PACKAGE_SRC}")
+    # 模板目录里不该再有没归类的逻辑源码——它们属于包，不属于模板。
+    extra = [path for path in TEMPLATE_SRC.rglob("*.zan") if path.name not in GUI_MODULES]
     if extra:
-        raise RuntimeError("Unclassified logical sources must be included explicitly: " + ", ".join(map(str, extra)))
+        raise RuntimeError("Unclassified logical sources must live in the package: " + ", ".join(map(str, extra)))
     BUILD.mkdir(parents=True, exist_ok=True)
     saves = BUILD / "test-saves"
     saves.mkdir(exist_ok=True)

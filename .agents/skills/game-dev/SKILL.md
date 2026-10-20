@@ -643,6 +643,17 @@ Post 调用核对编码，别信二手注释。
 - **关卡瓦片：碰撞体水平线段合并优化**：
   - 加载瓦片地图（`TileLayer`）后，严禁为每个 solid tile 创建一个独立碰撞体（易产生接缝卡角且拖慢遍历）。
   - 调用 `layer.ExtractColliders(solidTileId)` 走水平连续瓦片合并算法，合并为宽矩形数组，大幅削减碰撞体开销。
+- **JSON 存档的整数判定用 `JsonValue.IsInt()`，不要查裸字段 `numIsInt`**：
+  - `JsonValue` 的数字有两种形态：`NewInt`/`PutInt` 造出来的树里
+    `numIsInt=true`；而 `JsonValue.Parse` 解析出来的数字带的是原始文本
+    `numRaw`（`numIsInt=false`）。直接查 `value.numIsInt` 会把**每一个**
+    整数判成非整数——症状是"写档成功、读档全失败"，而且异常被 catch
+    吞掉后只表现为读档返回 null，极难定位。
+  - 正确写法：`value.IsNumber() && value.IsInt()`（`IsInt()` 会按
+    `numRaw` 文本判断是否纯整数），取值走 `AsLong` / `AsInt`。
+  - 坑出处：`Zan.Game.Factory` 的存档往返（`templates/game/coreforge`
+    抽出前的 `ForgeSave`）就是这样坏的——抽出成包、把无头测试修好后，
+    240 条断言才第一次真正跑起来。
 
 ## 2D 物理动力学定式（`Zan.Game.Physics2D`）
 

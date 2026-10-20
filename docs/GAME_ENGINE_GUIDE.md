@@ -23,7 +23,7 @@
 ```
 +-------------------------------------------------------------------------+
 |                              游戏应用层                                  |
-| (templates/game/legend, idle, snake, RTS/TD/Card/ARPG 独立游戏工程)     |
+| (templates/game/ 各品类独立游戏工程：街机/棋类/卡牌/塔防/RPG/放置)      |
 +-------------------------------------------------------------------------+
                                     |
                                     v
@@ -224,11 +224,17 @@ powershell -ExecutionPolicy Bypass -File scripts/game_asset_tool.ps1 -Atlas 64 6
 
 | 模板路径 | 游戏类型 | 核心集成引擎特性 |
 |---|---|---|
+| `templates/game/roguelike` | 肉鸽卡牌构筑 (杀戮尖塔 / 肉鸽) | 种子决定地图与奖励三选一 + 三区牌堆 + 能量回合结算 |
+| `templates/game/ddz` | 策略卡牌 (斗地主) | 牌型识别 + AI 对手 + 牌面动画 |
 | `templates/game/rts` | 即时战略 (RTS / 红警 / 魔兽) | `FlowField` 宏观寻路 + `RvoSimulator` 群体避障 + 小地图雷达 + 框选移动 |
+| `templates/game/coreforge` | 工厂自动化塔防 (Mindustry / 异星工厂) | 传送带物流 + 熔炼链 + 多波次塔防（逻辑层已抽为 `Zan.Game.Factory` 包） |
 | `templates/game/legend` | 2.5D 动作 RPG (传奇 / 暗黑) | 八方向朝向 + 5方向镜像 + 纸娃娃图层排序 + 怪物巡逻 + 掉落物散射 |
-| `templates/game/card` | 策略卡牌 (杀戮尖塔 / 炉石) | 卡牌堆栈手牌布局 + 能量点数结算 + 回合流转 + 战斗飘字与抖动反馈 |
-| `templates/game/towerdefense` | 塔防策略 (保卫萝卜 / 兽人) | 多波次刷怪 + 预设路线多段移动 + 防御塔范围自动索敌 + 穿透弹道 |
+| `templates/game/wuwei` | 数据驱动修仙 RPG | HTML 设计稿投影 + 境界成长 + 炼制 + 转生 + 本地存档 |
 | `templates/game/idle` | 放置挂机 (暗黑挂机 / 放置骑士) | `OfflineRewardCalculator` 离线收益 + `SquashAndStretch` 弹性反馈 + `FloatingText` 飘字池 |
+
+完整矩阵（含棋类、街机、平台、益智各品类）见
+[`templates/game/README.md`](../templates/game/README.md)——那里按品类列了每个
+模板对应的引擎模块，新增模板时同步更新那张表。
 
 一键体验与打包发布：
 ```powershell

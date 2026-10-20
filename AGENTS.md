@@ -46,6 +46,7 @@ short, enforceable summary.
 | `src/fmt/`, `src/doc/` | Formatter, doc generator   |
 | `src/selfhost/` | Self-hosted compiler sources (`.zan`)                           |
 | `stdlib/`       | Standard library (`.zan` source + native driver bundles)        |
+| `packages/`     | Reusable packages (`Zan.*`): game engines, SDKs, data formats   |
 | `examples/`     | Curated, runnable example programs (each with its own README)   |
 | `templates/`    | Project templates used by the IDE "New Project" flow            |
 | `tests/`        | Version-controlled test suite                                   |
@@ -210,6 +211,18 @@ positive, stated in the commit message.
       报告 ①↔② 漂移（VARIANT 条目 = 人工维护的变体，需人工比对），
       `-SyncGlobal` 把 ② 字节复制到 ③；② 再由 `publish_ide.ps1` 随
       SDK 进 `dist\ai\skills\`。
+14. **公共机制进包，模板只放"这个游戏"本身。** `templates/` 里出现
+    通用子系统（物流/配方、存档、寻路、成长表、回合规则……）就是放错地方
+    了——判据是"**换个游戏还成立吗**"：成立 → 抽成 `packages/Zan.*` 包，
+    模板只留玩法规则、界面、入口与资源。理由：模板是"怎么做一个游戏"的
+    示范，公共库散在模板里会被每个项目各抄一份，修复无法回流。
+    动手前先查 `packages/` 是否已有同类模块（复用优先，规则 10）；
+    抽包时把配套的无头测试一起搬过去（包的测试跑在包上，不是跑在某个
+    模板上）。坑出处：`templates/game/coreforge` 曾在模板里长出 261KB 的
+    工厂自动化引擎，抽出为 `Zan.Game.Factory` 时顺带发现它的存档读回
+    全线失败（查裸字段 `numIsInt` 判整数，解析出来的 JSON 数字带的是
+    `numRaw` 文本），修好后 240 条断言才真正跑起来——被模板藏起来的
+    腐化，进了包就会被迫面对。
 
 ## Build / dev quickstart
 

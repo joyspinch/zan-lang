@@ -3,7 +3,7 @@
 `Game.Particles` 是统一的粒子系统：对象池化的粒子、按速率/突发的发射器、
 曲线驱动的尺寸与颜色、确定性噪声湍流。
 
-仓库里 13 套游戏模板各自实现了一套粒子（`templates/game/*/src/.../Particle.zan`
+仓库里 16 套游戏模板各自实现了一套粒子（`templates/game/*/src/.../Particle.zan`
 + `idle` 模板的 `ParticleSystem.zan`），逻辑重复且参数口径不一。本包把它们
 收敛成一份可复用实现。
 

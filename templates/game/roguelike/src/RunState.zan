@@ -1,0 +1,127 @@
+using System;
+using System.Collections.Generic;
+using Game.Foundation;
+
+// 一局肉鸽的全部可变状态：种子、层数、生命、牌组、当前层候选节点。
+//
+// 这里是"肉鸽"的核心约定：**一切随机都出自 run.random**，而 run.random
+// 由种子决定。于是同一颗种子必然给出同一张地图、同一批敌人、同一组奖励
+// 三选一——这既让一局可以被复盘/存档，也天然支持每日挑战种子。
+//
+// 牌组只存卡 id（纯数据）：牌面定义在 CardLibrary 里共享，所以存档只要
+// 存这一串字符串 + 种子 + 层数 + 生命就够了。
+public class RunState {
+    // 本局种子。同种子 = 同一局。
+    int seed;
+    // 本局随机源（确定性 PCG）。
+    DeterministicRandom random;
+    // 当前层数，从 1 开始；0 表示还没开局。
+    int floor;
+    // 玩家当前生命与生命上限。
+    int hp;
+    int maxHp;
+    // 累计击杀与金币。
+    int kills;
+    int gold;
+    // 牌组：卡 id 列表。
+    List<string> deck;
+    // 当前层的候选节点。
+    List<MapNode> nodes;
+
+    RunState(int seed, CardLibrary library) {
+        this.seed = seed;
+        this.random = new DeterministicRandom(seed);
+        this.floor = 0;
+        this.maxHp = 60;
+        this.hp = 60;
+        this.kills = 0;
+        this.gold = 0;
+        this.deck = new List<string>();
+        this.nodes = new List<MapNode>();
+        for (int i = 0; i < library.StarterCount(); i = i + 1) {
+            this.deck.Add(library.StarterAt(i));
+        }
+    }
+
+    // 本局种子。
+    int Seed() { return this.seed; }
+    // 当前层数。
+    int Floor() { return this.floor; }
+    // 当前生命。
+    int Hp() { return this.hp; }
+    // 生命上限。
+    int MaxHp() { return this.maxHp; }
+    // 累计击杀。
+    int Kills() { return this.kills; }
+    // 金币。
+    int Gold() { return this.gold; }
+    // 牌组（只读引用，调用方只追加）。
+    List<string> Deck() { return this.deck; }
+    // 当前层候选节点。
+    List<MapNode> Nodes() { return this.nodes; }
+
+    // 推进一层并生成候选节点。
+    //
+    // 层数编排就是肉鸽的难度曲线：第 1 层给"战斗 or 宝箱"的温和取舍，
+    // 第 2 层换成"精英 or 普通"的硬取舍，第 3 层是 Boss。
+    // 两个候选的先后顺序也由种子决定，所以同种子的路线走向完全一致。
+    void BuildFloor() {
+        this.nodes.Clear();
+        this.floor = this.floor + 1;
+        if (this.floor == 1) {
+            this.nodes.Add(new MapNode(0, "沼泽史莱姆", 30, 5));
+            this.nodes.Add(new MapNode(2, "", 0, 0));
+        } else if (this.floor == 2) {
+            this.nodes.Add(new MapNode(1, "骷髅骑士", 48, 8));
+            this.nodes.Add(new MapNode(0, "骷髅兵", 34, 6));
+        } else {
+            this.nodes.Add(new MapNode(3, "深渊守卫", 80, 12));
+        }
+        if (this.nodes.Count == 2 && this.random.NextBelow(2) == 1) {
+            MapNode swap = this.nodes[0];
+            this.nodes[0] = this.nodes[1];
+            this.nodes[1] = swap;
+        }
+    }
+
+    // 往牌组里加一张卡（卡 id）。
+    void AddCard(string cardId) { this.deck.Add(cardId); }
+
+    // 战斗结算后回写生命：残留格挡算进生命（格挡不跨战斗）。
+    void SetHp(int value) {
+        if (value < 0) { value = 0; }
+        if (value > this.maxHp) { value = this.maxHp; }
+        this.hp = value;
+    }
+
+    // 回复生命。
+    void Heal(int amount) { this.SetHp(this.hp + amount); }
+
+    // 记一次击杀。
+    void AddKill(int gold) {
+        this.kills = this.kills + 1;
+        this.gold = this.gold + gold;
+    }
+
+    // 用本局随机源取 [0, bound) 的整数——地图、敌人、奖励全部走这里，
+    // 所以同种子必然给出同一局。随机源不对外暴露，避免别处绕过它。
+    int Roll(int bound) { return this.random.NextBelow(bound); }
+
+    // 抽三张互不相同的奖励卡，写进 choices（先清空）。
+    //
+    // 走的是本局随机源，所以同种子必然给出同一组三选一——这是肉鸽
+    // "可复盘/可分享种子"的地基，也是回归测试能断言的点。
+    void DrawRewards(CardLibrary library, List<string> choices) {
+        choices.Clear();
+        int guard = 0;
+        while (choices.Count < 3 && guard < 64) {
+            guard = guard + 1;
+            string id = library.RewardAt(this.Roll(library.RewardCount()));
+            bool duplicated = false;
+            for (int i = 0; i < choices.Count; i = i + 1) {
+                if (choices[i] == id) { duplicated = true; }
+            }
+            if (!duplicated) { choices.Add(id); }
+        }
+    }
+}

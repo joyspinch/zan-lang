@@ -8,8 +8,10 @@ Zan 原生 2D 工厂自动化 + 塔防游戏：在外星荒原上开采铜铅石
 ## 运行
 
 ```bash
-# App.html 是 HUD 设计稿，必须与 .zan 一起显式列进编译输入
-build/zanc.exe templates/game/coreforge/src/main.zan templates/game/coreforge/src/App.html templates/game/coreforge/src/ForgeInterface.zan templates/game/coreforge/src/CoreforgeAutoTest.zan templates/game/coreforge/src/Model.zan templates/game/coreforge/src/ForgeFactory.zan templates/game/coreforge/src/ForgeCombat.zan templates/game/coreforge/src/ForgeSimulation.zan templates/game/coreforge/src/ForgeSave.zan templates/game/coreforge/src/ForgeRenderer.zan --auto-stdlib -o coreforge.exe
+# App.html 是 HUD 设计稿，必须与 .zan 一起显式列进编译输入；
+# 入口 .zan 放第一个（Main 从首个输入产出）；逻辑层来自包
+# packages/Zan.Game.Factory（using Game.Factory; 自动引入）
+build/zanc.exe templates/game/coreforge/src/main.zan templates/game/coreforge/src/App.html templates/game/coreforge/src/CoreforgeHud.zan templates/game/coreforge/src/ForgeInterface.zan templates/game/coreforge/src/ForgeRenderer.zan templates/game/coreforge/src/ForgeCamera.zan templates/game/coreforge/src/CoreforgeAutoTest.zan --auto-stdlib -o coreforge.exe
 cd templates/game/coreforge && ../../coreforge.exe   # 从模板目录运行，./skins 皮肤才解析得到
 ```
 
@@ -92,16 +94,29 @@ cd templates/game/coreforge && ../../coreforge.exe   # 从模板目录运行，.
 
 ## 架构（src/）
 
+**逻辑层已抽成包 [`Zan.Game.Factory`](../../../packages/Zan.Game.Factory)**：
+物流、配方、电力、波次、存档这些"换个游戏还成立"的机制归包，
+模板只留下这个游戏的皮肤与接线。
+
+包内（`packages/Zan.Game.Factory/src/Game/Factory/`，`namespace Game.Factory`）：
+
 | 文件 | 职责 |
 |------|------|
-| `App.html` | HUD 设计稿（GenForm 编译成 partial class CoreforgeHud 的类型化字段） |
-| `Model.zan` | 目录数据（方块/配方/科技/波次）+ 世界状态 + 建造规则 + 特效池 |
+| `ForgeWorld.zan` / `ForgeGrid.zan` / `ForgeMap.zan` | 世界状态、网格、地图生成 |
+| `ForgeCatalog.zan` | 目录数据（方块/配方/科技/波次/敌人） |
 | `ForgeFactory.zan` | 生产模拟：钻头/传送带/熔炉/装配机/电力/液体/无人机组装 |
 | `ForgeCombat.zan` | 寻路、波次生成（难度缩放 + 预告公式）、敌人、炮塔/棱镜射击、支援三塔、无人机 AI、敌巢、击杀特效与屏震 |
 | `ForgeSimulation.zan` | 固定步长模拟入口（Factory/Combat 编排 + 事件队列） |
 | `ForgeSave.zan` | JSON 存档/读档（v5 含难度与护盾值，兼容 v1–v4 旧档） |
+
+模板内（`src/`）：
+
+| 文件 | 职责 |
+|------|------|
+| `App.html` | HUD 设计稿（GenForm 编译成 partial class CoreforgeHud 的类型化字段） |
 | `ForgeRenderer.zan` | 相机 + 世界渲染（地形/建筑/物品/敌人/粒子，全部程序化绘制） |
 | `ForgeInterface.zan` | HUD code-behind：事件接线 + 每帧回写 + 世界输入遮蔽 + 小地图/波次预告条/边缘预警 |
+| `Model/ForgeCamera.zan` | 相机状态（缩放/震动/视口换算） |
 | `main.zan` | 自有主循环：事件泵 → 固定步长模拟 → 世界直绘 → 控件树叠加 |
 | `CoreforgeAutoTest.zan` | `COREFORGE_AUTOTEST=1` 交互自测（走真实 Input 与 form.Call 路径） |
 

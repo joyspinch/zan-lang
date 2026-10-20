@@ -1,4 +1,8 @@
-# HTML 场景路由演示（scene-router）
+# HTML 场景路由演示（gui-scene-router）
+
+> 这是**场景路由范式**演示，不是游戏品类：它讲的是"一个窗口三个场景
+> （`menu` / `play` / `over`），每场景一个 `.html` + 一个 Zan 场景类"
+> 这套 AI 友好的游戏/多屏应用结构。真正的游戏模板在 `templates/game/`。
 
 一个窗口三个场景（`menu` / `play` / `over`），每个场景 = **一个 `.html`
 文件 + 一个 Zan 场景类**，由 `Game.Foundation.Gui.SceneRouter` 负责切换

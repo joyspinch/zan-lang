@@ -1,0 +1,881 @@
+using System;
+using Game.Core;
+
+namespace Game.Factory;
+
+public class ForgeCombat {
+    ForgeWorld world;
+    SpatialHash2D enemyHash;
+    int[] candidates;
+    int[] seen;
+    int querySequence;
+    int[] distance;
+    int[] nextCell;
+    int[] heap;
+    int[] heapPosition;
+    int heapCount;
+    bool allowOffGrid;
+
+    static int FirstWaveTicks() { return 3500; }
+    static int BetweenWaveTicks() { return 1750; }
+    static int BaseRange() { return 6000; }
+    static int UpgradedRange() { return 7000; }
+    static int HashCellSize() { return 4000; }
+    static int BulletSpeed() { return 650; }
+    static int BulletLifetime() { return 160; }
+    static int AttackRange() { return 900; }
+    static int CopperDamage() { return 24; }
+    static int LeadDamage() { return 36; }
+    static int PoweredCooldown() { return 30; }
+    static int CooledCooldown() { return 22; }
+    static int OffGridCooldown() { return 90; }
+    static int Unreachable() { return 1000000000; }
+    static int BlastRadius() { return 1800; }  // 臼炮溅射半径（世界单位，1.8 格）
+    static int ScatterDamage() { return 16; }
+    static int ScatterCooldown() { return 16; }
+    static int SniperDamage() { return 96; }
+    static int SniperCooldown() { return 120; }
+    static int MortarDamage() { return 44; }
+    static int MortarCooldown() { return 80; }
+    static int DroneSpeed() { return 42; }
+    static int DroneDamage() { return 8; }
+    static int DroneCooldown() { return 22; }
+    static int DroneRange() { return 1300; }
+    static int DroneSeekRange() { return 5600; }  // 守卫模式下无人机的拦截警戒半径
+    static int NestBiteDamage() { return 8; }
+    static int NestStingDamage() { return 18; }  // 巢穴反击拍打无人机的伤害
+    static int NestStingRange() { return 1500; }
+    static int PrismDamage() { return 3; }
+    static int PrismRange() { return 6500; }
+
+    // 四种炮塔共用开火循环；分派差异在弹药/伤害/冷却参数表里。
+    static bool TurretFamily(BlockKind kind) {
+        return kind == BlockKind.Turret || kind == BlockKind.Scatter
+          || kind == BlockKind.Sniper || kind == BlockKind.Mortar;
+    }
+
+    // 拔巢战目标选择：最近的存活巢穴；-1 = 全部拔除（敌军从此不再来犯）。
+    int NearestNest(int x, int y) {
+        int best = -1;
+        long bestSquare = 0;
+        for (int i = 0; i < world.nests.Length; i = i + 1) {
+            ForgeNest n = world.nests[i];
+            if (!n.active) { continue; }
+            int dx = ForgeGrid.Center(n.x) - x;
+            int dy = ForgeGrid.Center(n.y) - y;
+            long square = (long)dx * dx + (long)dy * dy;
+            if (best < 0 || square < bestSquare) { best = i; bestSquare = square; }
+        }
+        return best;
+    }
+
+    ForgeCombat(ForgeWorld state) {
+        world = state;
+        int total = world.width * world.height;
+        distance = new int[total]; nextCell = new int[total];
+        heap = new int[total]; heapPosition = new int[total];
+        seen = new int[world.enemies.Length];
+        enemyHash = SpatialHash2D.Create(ForgeCombat.HashCellSize(), world.enemies.Length);
+        // 空间哈希分桶查询去重：确保目标实体 ID 唯一。
+        int side = ForgeCombat.UpgradedRange() * 2 / ForgeCombat.HashCellSize() + 3;
+        candidates = new int[world.enemies.Length * side * side];
+        allowOffGrid = true; querySequence = 0;
+        world.enemyCount = 0;
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            if (world.enemies[i].active) { world.enemyCount = world.enemyCount + 1; }
+        }
+        RebuildPaths();
+        RebuildHash();
+    }
+
+    int SpawnCell(int lane) { return ForgeMap.SpawnCell(world, lane); }
+    int TurretRange() { return world.researched[3] ? ForgeCombat.UpgradedRange() : ForgeCombat.BaseRange(); }
+
+    bool Solid(BlockKind kind) {
+        return kind != BlockKind.Empty && kind != BlockKind.Belt && kind != BlockKind.Router && kind != BlockKind.Pipe;
+    }
+
+    bool TerrainOpen(int cell) {
+        TerrainKind terrain = world.tiles[cell].terrain;
+        return terrain != TerrainKind.Rock && terrain != TerrainKind.Water;
+    }
+
+    int EntryCost(int cell) {
+        ForgeBuilding b = world.buildings[cell];
+        if (cell == world.coreCell || !Solid(b.kind)) { return 10; }
+        // 可破坏建筑寻路代价加权：封死迷宫返回有限代价路径。
+        return 30 + world.catalog.blocks[(int)b.kind].hp / 12;
+    }
+
+    bool Before(int a, int b) {
+        if (distance[a] == distance[b]) { return a < b; }
+        return distance[a] < distance[b];
+    }
+
+    void HeapOffer(int cell) {
+        int at = heapPosition[cell];
+        if (at == -2) { return; }
+        if (at < 0) {
+            at = heapCount; heapCount = heapCount + 1;
+            heap[at] = cell; heapPosition[cell] = at;
+        }
+        while (at > 0) {
+            int parent = (at - 1) / 2;
+            int other = heap[parent];
+            if (!Before(cell, other)) { break; }
+            heap[at] = other; heapPosition[other] = at;
+            at = parent;
+        }
+        heap[at] = cell; heapPosition[cell] = at;
+    }
+
+    int HeapPop() {
+        int result = heap[0];
+        heapCount = heapCount - 1;
+        heapPosition[result] = -2;
+        if (heapCount == 0) { return result; }
+        int cell = heap[heapCount];
+        int at = 0;
+        while (at * 2 + 1 < heapCount) {
+            int child = at * 2 + 1;
+            if (child + 1 < heapCount && Before(heap[child + 1], heap[child])) { child = child + 1; }
+            int other = heap[child];
+            if (!Before(other, cell)) { break; }
+            heap[at] = other; heapPosition[other] = at;
+            at = child;
+        }
+        heap[at] = cell; heapPosition[cell] = at;
+        return result;
+    }
+
+    void RebuildPaths() {
+        for (int i = 0; i < distance.Length; i = i + 1) {
+            distance[i] = ForgeCombat.Unreachable(); nextCell[i] = -1; heapPosition[i] = -1;
+        }
+        heapCount = 0;
+        distance[world.coreCell] = 0;
+        HeapOffer(world.coreCell);
+        while (heapCount > 0) {
+            int cell = HeapPop();
+            int cost = distance[cell] + EntryCost(cell);
+            for (int d = 0; d < 4; d = d + 1) {
+                int neighbor = world.Neighbor(cell, d);
+                if (neighbor < 0 || !TerrainOpen(neighbor) || cost >= distance[neighbor]) { continue; }
+                distance[neighbor] = cost;
+                nextCell[neighbor] = cell;
+                HeapOffer(neighbor);
+            }
+        }
+        world.pathsDirty = false;
+    }
+
+    void RebuildHash() {
+        enemyHash.Clear();
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            ForgeEnemy e = world.enemies[i];
+            if (e.active && e.hp > 0) { enemyHash.Insert(i, (double)e.x, (double)e.y, 0.0); }
+        }
+    }
+
+    int Strength() {
+        return WaveStrength(world, world.wave);
+    }
+
+    // ---- 波表：20 波内读目录，之后转公式无尽生成 ----
+    // 难度只作用于数量与强度两个乘区；出兵、存档校验与 UI 预告共用同一公式。
+
+    public static int CountScale(int difficulty) {
+        if (difficulty <= 0) { return 85; }
+        if (difficulty >= 2) { return 120; }
+        return 100;
+    }
+
+    public static int StrengthScale(int difficulty) {
+        if (difficulty <= 0) { return 80; }
+        if (difficulty >= 2) { return 130; }
+        return 100;
+    }
+
+    public static int WaveCount(ForgeWorld world, int wave) {
+        int count = wave <= world.catalog.waves.Length
+            ? world.catalog.waves[wave - 1].count
+            : 44 + (wave - world.catalog.waves.Length) * 3;
+        return ForgeGrid.Max(1, count * CountScale(world.difficulty) / 100);
+    }
+
+    public static int WaveInterval(ForgeWorld world, int wave) {
+        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].interval; }
+        return ForgeGrid.Max(10, 33 - (wave - world.catalog.waves.Length));
+    }
+
+    public static int WaveStrength(ForgeWorld world, int wave) {
+        if (wave <= 0) { return 100; }
+        int strength = wave <= world.catalog.waves.Length
+            ? world.catalog.waves[wave - 1].strength
+            // 每波 +12%：无尽模式下敌人的血量与攻击无限爬升。
+            : 100 + wave * 12;
+        return ForgeGrid.Max(1, strength * StrengthScale(world.difficulty) / 100);
+    }
+
+    public static int WaveBoss(ForgeWorld world, int wave) {
+        if (wave <= world.catalog.waves.Length) { return world.catalog.waves[wave - 1].boss; }
+        return wave % 5 == 0 ? 2 : -1;
+    }
+
+    // 下一波构成预告：按 Spawn 的混编公式离线推算各兵种数量。
+    // counts 长度必须为 5（敌方兵种数）；与出兵共用同一公式，预告即真相。
+    public static void Preview(ForgeWorld world, int wave, int[] counts) {
+        for (int i = 0; i < counts.Length; i = i + 1) { counts[i] = 0; }
+        if (wave <= 0) { return; }
+        int total = WaveCount(world, wave);
+        for (int ordinal = 0; ordinal < total; ordinal = ordinal + 1) {
+            int roll = (ordinal * 7 + wave * 3) % 10;
+            int kind = 0;
+            if (wave >= 7 && roll >= 8) { kind = 3; }
+            else if (wave >= 5 && roll >= 6) { kind = 4; }
+            else if (wave >= 3 && (roll >= 4 || (wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
+            counts[kind] = counts[kind] + 1;
+        }
+        int boss = WaveBoss(world, wave);
+        if (boss >= 0) { counts[boss] = counts[boss] + 1; }
+    }
+
+    void StartWave() {
+        if (world.defeated || world.victory || world.waveActive || world.enemyCount > 0) { return; }
+        if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
+        world.wave = world.wave + 1;
+        world.waveActive = true; world.nextWaveTicks = 0;
+        world.spawnRemaining = ForgeCombat.WaveCount(world, world.wave); world.spawnCooldown = 0;
+        world.bossPending = ForgeCombat.WaveBoss(world, world.wave) >= 0;
+        world.events.Emit(ForgeEventKind.WaveStarted, world.coreCell, world.wave, world.tick);
+    }
+
+    int FreeEnemy() {
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            if (!world.enemies[i].active) { return i; }
+        }
+        return -1;
+    }
+
+    // 出兵口 = 存活敌巢所在通道；巢穴被拔除的通道永绝敌人。
+    // 全部巢穴被拔除后无兵可出，当前波次立即判清。
+    int SpawnLane(int ordinal) {
+        int alive = 0;
+        for (int i = 0; i < world.nests.Length; i = i + 1) { if (world.nests[i].active) { alive = alive + 1; } }
+        if (alive == 0) { return -1; }
+        int pick = (ordinal + (world.wave - 1) / 2) % alive;
+        for (int i = 0; i < world.nests.Length; i = i + 1) {
+            if (!world.nests[i].active) { continue; }
+            if (pick == 0) { return i; }
+            pick = pick - 1;
+        }
+        return -1;
+    }
+
+    void Spawn() {
+        if (world.spawnRemaining <= 0 && !world.bossPending) { return; }
+        int slot = FreeEnemy();
+        if (slot < 0) { return; }
+        int ordinal = ForgeCombat.WaveCount(world, world.wave) - world.spawnRemaining;
+        int kind = 0;
+        if (world.spawnRemaining > 0) {
+            // 波次混编（确定性公式）：3 波起混重兽，5 波起混自爆奔兽，
+            // 7 波起混飞虫——迫使防线同时备好对地纵深与对空火力。
+            int roll = (ordinal * 7 + world.wave * 3) % 10;
+            if (world.wave >= 7 && roll >= 8) { kind = 3; }
+            else if (world.wave >= 5 && roll >= 6) { kind = 4; }
+            else if (world.wave >= 3 && (roll >= 4 || (world.wave >= 12 && ordinal % 2 == 1))) { kind = 1; }
+            world.spawnRemaining = world.spawnRemaining - 1;
+        } else {
+            kind = ForgeCombat.WaveBoss(world, world.wave);
+            world.bossPending = false;
+        }
+        int lane = SpawnLane(ordinal);
+        if (lane < 0) { world.spawnRemaining = 0; return; }
+        EnemyDef def = world.catalog.enemies[kind];
+        ForgeEnemy e = world.enemies[slot];
+        int cell = SpawnCell(lane);
+        e.kind = kind; e.active = true;
+        e.generation = e.generation >= 2147483647 ? 1 : e.generation + 1;
+        e.x = ForgeGrid.Center(cell % world.width); e.y = ForgeGrid.Center(cell / world.width);
+        e.maxHp = ForgeGrid.Max(1, def.hp * Strength() / 100); e.hp = e.maxHp; e.cooldown = 0;
+        world.enemyCount = world.enemyCount + 1;
+        world.spawnCooldown = ForgeGrid.Max(1, ForgeCombat.WaveInterval(world, world.wave));
+    }
+
+    void AdvanceWave() {
+        if (!world.waveActive) {
+            if (world.nextWaveTicks > 0) { world.nextWaveTicks = world.nextWaveTicks - 1; }
+            if (world.nextWaveTicks <= 0) { StartWave(); }
+        }
+        if (!world.waveActive) { return; }
+        if (world.spawnCooldown > 0) { world.spawnCooldown = world.spawnCooldown - 1; }
+        if (world.spawnCooldown <= 0) { Spawn(); }
+    }
+
+    void LoseCore() {
+        if (world.defeated) { return; }
+        world.buildings[world.coreCell].hp = 0;
+        world.defeated = true; world.waveActive = false;
+        world.nextWaveTicks = 0; world.spawnRemaining = 0; world.bossPending = false;
+        world.events.Emit(ForgeEventKind.CoreLost, world.coreCell, world.wave, world.tick);
+    }
+
+    void Attack(ForgeEnemy e, int cell) {
+        if (e.cooldown > 0) { return; }
+        ForgeBuilding b = world.buildings[cell];
+        if (!Solid(b.kind)) { return; }
+        EnemyDef def = world.catalog.enemies[e.kind];
+        int damage = ForgeGrid.Max(1, def.damage * Strength() / 100);
+        // 力场优先：目标处在盾圈内时火力先砸在屏障上，余量才落到墙体。
+        damage = Absorb(cell, damage);
+        if (damage > 0) { b.hp = b.hp - damage; }
+        e.cooldown = ForgeGrid.Max(1, def.cooldown);
+        // 受击尘土与震屏：炉心受击最重，玩家必须立刻感知。
+        world.SpawnEffect(1, e.x, e.y, 0, 0, 10, 5, 0xFFC8A06A, 0);
+        for (int i = 0; i < 3; i = i + 1) {
+            int dx = ((world.tick * 31 + i * 61 + cell * 17) % 41 - 20) * 6;
+            int dy = -((world.tick * 17 + i * 43) % 23) * 4 - 10;
+            world.SpawnEffect(3, e.x + dx / 2, e.y, dx, dy, 22 + i * 4, 4 + i, 0xFF8A7F6E, 0);
+        }
+        if (cell == world.coreCell) { world.Shake(4); }
+        else if (def.damage >= 25) { world.Shake(2); }
+        // 奔兽是消耗品：一次撞击后自爆消失，不计击杀与奖励。
+        bool suicide = e.kind == 4;
+        if (suicide) {
+            e.active = false; e.hp = 0;
+            world.enemyCount = ForgeGrid.Max(0, world.enemyCount - 1);
+            world.SpawnEffect(2, e.x, e.y, 0, 0, 16, 10, 0xFFE8935A, 0);
+        }
+        // 受损建筑动态寻路重算：建筑耐久变化使路径缓存失效。
+        world.pathsDirty = true;
+        if (b.hp <= 0) {
+            world.SpawnEffect(2, ForgeGrid.Center(cell % world.width), ForgeGrid.Center(cell / world.width), 0, 0, 18, 10, 0xFFE8B06A, 0);
+            for (int i = 0; i < 6; i = i + 1) {
+                int dx = ((world.tick * 37 + i * 89) % 61 - 30) * 9;
+                int dy = ((world.tick * 53 + i * 47) % 41 - 30) * 9 - 20;
+                world.SpawnEffect(1, ForgeGrid.Center(cell % world.width), ForgeGrid.Center(cell / world.width), dx, dy, 16 + i * 2, 3, 0xFFD9A05A, 0);
+            }
+            if (cell == world.coreCell) { LoseCore(); }
+            else { world.Remove(cell, false); }
+        }
+    }
+
+    void MoveEnemies() {
+        for (int i = 0; i < world.enemies.Length; i = i + 1) {
+            ForgeEnemy e = world.enemies[i];
+            if (!e.active) { continue; }
+            if (e.hp <= 0) { Kill(i); continue; }
+            if (e.cooldown > 0) { e.cooldown = e.cooldown - 1; }
+            int cell = world.Index(ForgeGrid.WorldToCell(e.x), ForgeGrid.WorldToCell(e.y));
+            if (cell < 0) { continue; }
+            if (cell == world.coreCell) {
+                Attack(e, cell);
+                if (world.defeated) { return; }
+                continue;
+            }
+            if (e.kind == 3) {
+                // 掠翼飞虫无视地形与建筑，直线扑向炉心；抵达即啃咬。
+                int tx = ForgeGrid.Center(world.coreCell % world.width);
+                int ty = ForgeGrid.Center(world.coreCell / world.width);
+                int dx = tx - e.x; int dy = ty - e.y;
+                long square = (long)dx * (long)dx + (long)dy * (long)dy;
+                if (square <= 900L * 900L) {
+                    Attack(e, world.coreCell);
+                    if (world.defeated) { return; }
+                    continue;
+                }
+                double length = Math.Sqrt((double)square);
+                int step = ForgeGrid.Max(1, world.catalog.enemies[e.kind].speed);
+                e.x = e.x + (int)((double)dx * (double)step / length);
+                e.y = e.y + (int)((double)dy * (double)step / length);
+                continue;
+            }
+            int target = nextCell[cell];
+            if (target < 0) { continue; }
+            int centerX = ForgeGrid.Center(cell % world.width);
+            int centerY = ForgeGrid.Center(cell / world.width);
+            int tx = ForgeGrid.Center(target % world.width);
+            int ty = ForgeGrid.Center(target / world.width);
+            bool blocked = Solid(world.buildings[target].kind);
+            // 网格转向平滑：完成当前中心线位移后再转向。
+            if ((tx != centerX && e.y != centerY) || (ty != centerY && e.x != centerX)) {
+                tx = centerX; ty = centerY; blocked = false;
+            }
+            int dx = tx - e.x;
+            int dy = ty - e.y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            int reach = blocked ? ForgeCombat.AttackRange() : 0;
+            if (blocked && square <= (long)reach * (long)reach) {
+                Attack(e, target);
+                if (world.defeated) { return; }
+                continue;
+            }
+            double length = Math.Sqrt((double)square);
+            int step = ForgeGrid.Max(1, world.catalog.enemies[e.kind].speed);
+            if (blocked && length - (double)reach < (double)step) { step = ForgeGrid.Max(1, (int)length - reach); }
+            if (length <= (double)step && !blocked) {
+                e.x = tx; e.y = ty;
+            } else if (length > 0.0) {
+                e.x = e.x + (int)((double)dx * (double)step / length);
+                e.y = e.y + (int)((double)dy * (double)step / length);
+            }
+        }
+    }
+
+    void Kill(int slot) {
+        ForgeEnemy e = world.enemies[slot];
+        if (!e.active) { return; }
+        e.active = false; e.hp = 0;
+        world.enemyCount = ForgeGrid.Max(0, world.enemyCount - 1);
+        world.kills = world.kills + 1;
+        int reward = world.catalog.enemies[e.kind].reward;
+        world.resources.Add(0, reward);
+        // 击杀反馈：闪光 + 径向火花 + 烟尘 + 浮动奖励；巨像额外震屏。
+        world.SpawnEffect(2, e.x, e.y, 0, 0, 16, e.kind == 2 ? 16 : 8, 0xFFE8B06A, 0);
+        int sparks = e.kind == 2 ? 10 : 6;
+        for (int i = 0; i < sparks; i = i + 1) {
+            int dx = ((world.tick * 37 + slot * 97 + i * 53) % 71 - 35) * 12;
+            int dy = ((world.tick * 53 + slot * 31 + i * 29) % 61 - 35) * 12 - 30;
+            world.SpawnEffect(1, e.x, e.y, dx, dy, 14 + i * 2, 3, 0xFFE2B078, 0);
+        }
+        for (int i = 0; i < 3; i = i + 1) {
+            int dx = ((world.tick * 29 + i * 67 + slot * 13) % 41 - 20) * 5;
+            world.SpawnEffect(3, e.x + dx, e.y - 100, dx, -18 - i * 5, 30 + i * 8, 5 + i, 0xFF6E675C, 0);
+        }
+        world.SpawnEffect(4, e.x, e.y - 350, 0, -12, 40, 12, 0xFFF2C06A, reward);
+        if (e.kind == 2) { world.Shake(9); }
+        int cell = world.Index(ForgeGrid.WorldToCell(e.x), ForgeGrid.WorldToCell(e.y));
+        world.events.Emit(ForgeEventKind.EnemyKilled, cell, e.kind, world.tick);
+    }
+
+    void MoveBullets() {
+        for (int i = 0; i < world.bullets.Length; i = i + 1) {
+            ForgeBullet b = world.bullets[i];
+            if (!b.active) { continue; }
+            if (b.life <= 0 || b.target < 0 || b.target >= world.enemies.Length) { b.active = false; continue; }
+            ForgeEnemy e = world.enemies[b.target];
+            if (!e.active || e.generation != b.generation || e.hp <= 0) { b.active = false; continue; }
+            b.life = b.life - 1;
+            int dx = e.x - b.x;
+            int dy = e.y - b.y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            int speed = ForgeCombat.BulletSpeed();
+            if (square <= (long)speed * (long)speed) {
+                b.x = e.x; b.y = e.y; b.active = false;
+                e.hp = e.hp - b.damage;
+                // 命中火花：动能方向溅射，热色渐冷。
+                for (int i = 0; i < 3; i = i + 1) {
+                    int sx = ((world.tick * 41 + i * 83) % 31 - 15) * 10;
+                    int sy = ((world.tick * 23 + i * 59) % 27 - 15) * 10 - 12;
+                    world.SpawnEffect(1, e.x, e.y, dx / 4 + sx, dy / 4 + sy, 9 + i * 2, 2 + i % 2, i == 0 ? 0xFFF5D9A0 : 0xFFD98E4A, 0);
+                }
+                if (b.blast > 0) { Splash(b.x, b.y, b.damage / 2, b.target); }
+                if (e.hp <= 0) { Kill(b.target); }
+            } else {
+                double length = Math.Sqrt((double)square);
+                b.x = b.x + (int)((double)dx * (double)speed / length);
+                b.y = b.y + (int)((double)dy * (double)speed / length);
+                if (b.life <= 0) { b.active = false; }
+            }
+        }
+    }
+
+    int FindTarget(int x, int y, int range, int mode, bool antiAir) {
+        if (querySequence >= 2147483647) {
+            for (int i = 0; i < seen.Length; i = i + 1) { seen[i] = 0; }
+            querySequence = 0;
+        }
+        querySequence = querySequence + 1;
+        int count = enemyHash.QueryRange((double)x, (double)y, (double)range, candidates, candidates.Length);
+        int best = -1;
+        long bestDistance = (long)range * (long)range + 1L;
+        int bestHp = 0;
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = candidates[i];
+            if (seen[slot] == querySequence) { continue; }
+            seen[slot] = querySequence;
+            ForgeEnemy e = world.enemies[slot];
+            if (!e.active || e.hp <= 0) { continue; }
+            if (!antiAir && e.kind == 3) { continue; }
+            int dx = e.x - x;
+            int dy = e.y - y;
+            long square = (long)dx * (long)dx + (long)dy * (long)dy;
+            if (square > (long)range * (long)range) { continue; }
+            bool better = best < 0;
+            if (mode == 1 && best >= 0) { better = e.hp < bestHp || (e.hp == bestHp && square < bestDistance); }
+            else if (mode == 2 && best >= 0) { better = e.hp > bestHp || (e.hp == bestHp && square < bestDistance); }
+            else if (best >= 0) { better = square < bestDistance; }
+            if (!better && square == bestDistance && slot < best && (mode == 0 || e.hp == bestHp)) { better = true; }
+            if (better) { best = slot; bestDistance = square; bestHp = e.hp; }
+        }
+        return best;
+    }
+
+    int FreeBullet() {
+        for (int i = 0; i < world.bullets.Length; i = i + 1) {
+            int slot = (world.bulletCursor + i) % world.bullets.Length;
+            if (!world.bullets[slot].active) {
+                world.bulletCursor = (slot + 1) % world.bullets.Length;
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    // 各炮塔的弹药类型：脉冲/散射吃铜铅（铅优先高伤），狙击纯铅，臼炮吃石墨。
+    int AmmoItem(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Sniper) { return (int)ItemKind.Lead; }
+        if (tower.kind == BlockKind.Mortar) { return (int)ItemKind.Graphite; }
+        return tower.stock.Get(1) > 0 ? 1 : 0;
+    }
+
+    int BaseDamage(ForgeBuilding tower, int ammoItem) {
+        if (tower.kind == BlockKind.Scatter) { return ForgeCombat.ScatterDamage(); }
+        if (tower.kind == BlockKind.Sniper) { return ForgeCombat.SniperDamage(); }
+        if (tower.kind == BlockKind.Mortar) { return ForgeCombat.MortarDamage(); }
+        return ammoItem == 1 ? ForgeCombat.LeadDamage() : ForgeCombat.CopperDamage();
+    }
+
+    int BaseCooldown(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Scatter) { return ForgeCombat.ScatterCooldown(); }
+        if (tower.kind == BlockKind.Sniper) { return ForgeCombat.SniperCooldown(); }
+        if (tower.kind == BlockKind.Mortar) { return ForgeCombat.MortarCooldown(); }
+        return ForgeCombat.PoweredCooldown();
+    }
+
+    int IdleCooldown(ForgeBuilding tower) {
+        if (tower.kind == BlockKind.Scatter) { return 24; }
+        if (tower.kind == BlockKind.Sniper) { return 150; }
+        if (tower.kind == BlockKind.Mortar) { return 100; }
+        return ForgeCombat.OffGridCooldown();
+    }
+
+    void FireTurrets() {
+        int range = TurretRange();
+        for (int cell = 0; cell < world.buildings.Length; cell = cell + 1) {
+            ForgeBuilding tower = world.buildings[cell];
+            if (!ForgeCombat.TurretFamily(tower.kind) || tower.hp <= 0) { continue; }
+            if (tower.cooldown > 0) { tower.cooldown = tower.cooldown - 1; }
+            if (tower.cooldown > 0 || world.enemyCount <= 0) { continue; }
+            int power = ForgeGrid.Max(0, ForgeGrid.Min(1000, tower.efficiency));
+            if (world.catalog.blocks[(int)tower.kind].powerUse == 0) { power = 1000; }
+            if (power == 0 && !allowOffGrid) { continue; }
+            int ammo = AmmoItem(tower);
+            if (tower.stock.Get(ammo) <= 0) { continue; }
+            int x = ForgeGrid.Center(cell % world.width);
+            int y = ForgeGrid.Center(cell / world.width);
+            // 臼炮无法对空；其余炮塔一视同仁。
+            bool antiAir = tower.kind != BlockKind.Mortar;
+            int target = FindTarget(x, y, range, tower.targetMode, antiAir);
+            if (target < 0) { continue; }
+            if (!tower.stock.Take(ammo, 1)) { continue; }
+            ForgeEnemy enemy = world.enemies[target];
+            int damage = BaseDamage(tower, ammo);
+            if (world.researched[3]) { damage = damage * 3 / 2; }
+            int shots = tower.kind == BlockKind.Scatter ? 2 : 1;
+            for (int s = 0; s < shots; s = s + 1) {
+                int slot = FreeBullet();
+                if (slot < 0) { break; }
+                ForgeBullet b = world.bullets[slot];
+                b.active = true; b.x = x; b.y = y; b.target = target; b.generation = enemy.generation;
+                b.damage = damage;
+                b.blast = tower.kind == BlockKind.Mortar ? 1 : 0;
+                b.life = ForgeCombat.BulletLifetime();
+            }
+            // 枪口焰：炮口方向的短促亮斑。
+            int mdx = enemy.x - x; int mdy = enemy.y - y;
+            int mlen = ForgeGrid.Max(1, (int)Math.Sqrt((double)mdx * mdx + (double)mdy * mdy));
+            world.SpawnEffect(0, x + mdx * 700 / mlen, y + mdy * 700 / mlen, mdx * 30 / mlen, mdy * 30 / mlen, 5, 5, 0xFFFFE2A0, 0);
+            int powered = BaseCooldown(tower);
+            if (tower.kind == BlockKind.Turret && power > 0 && tower.water >= 2) {
+                tower.water = tower.water - 2; powered = ForgeCombat.CooledCooldown();
+            }
+            tower.cooldown = IdleCooldown(tower) - (IdleCooldown(tower) - powered) * power / 1000;
+        }
+    }
+
+    // 臼炮落点溅射：半径内其他敌人吃一半伤害。hash 是本 tick 开头的快照，
+    // 溅射用它粗查再做圆形精查；桶冲突会重复 ID，沿用 seen 去重。
+    void Splash(int x, int y, int damage, int exclude) {
+        if (querySequence >= 2147483647) {
+            for (int i = 0; i < seen.Length; i = i + 1) { seen[i] = 0; }
+            querySequence = 0;
+        }
+        querySequence = querySequence + 1;
+        int count = enemyHash.QueryRange((double)x, (double)y, (double)ForgeCombat.BlastRadius(), candidates, candidates.Length);
+        long square = (long)ForgeCombat.BlastRadius() * (long)ForgeCombat.BlastRadius();
+        for (int i = 0; i < count; i = i + 1) {
+            int slot = candidates[i];
+            if (slot == exclude || seen[slot] == querySequence) { continue; }
+            seen[slot] = querySequence;
+            ForgeEnemy e = world.enemies[slot];
+            if (!e.active || e.hp <= 0) { continue; }
+            int dx = e.x - x; int dy = e.y - y;
+            if ((long)dx * dx + (long)dy * dy > square) { continue; }
+            e.hp = e.hp - ForgeGrid.Max(1, damage);
+            if (e.hp <= 0) { Kill(slot); }
+        }
+    }
+
+    // 棱镜聚焦塔：持续光束灼蚀单一目标，无弹药纯耗电；每 tick 结算伤害。
+    // 效率不足即熄火，能量是它的弹药。
+    void FirePrisms() {
+        int range = TurretRange();
+        for (int cell = 0; cell < world.buildings.Length; cell = cell + 1) {
+            ForgeBuilding tower = world.buildings[cell];
+            if (tower.kind != BlockKind.Prism || tower.hp <= 0) { continue; }
+            int power = ForgeGrid.Max(0, ForgeGrid.Min(1000, tower.efficiency));
+            if (power == 0 || world.enemyCount <= 0) { continue; }
+            int x = ForgeGrid.Center(cell % world.width);
+            int y = ForgeGrid.Center(cell / world.width);
+            int target = FindTarget(x, y, range, tower.targetMode, true);
+            if (target < 0) { continue; }
+            ForgeEnemy e = world.enemies[target];
+            e.hp = e.hp - ForgeGrid.Max(1, ForgeCombat.PrismDamage() * power / 1000);
+            // 光束端点的灼蚀光斑：紫色系与枪口焰区分。
+            world.SpawnEffect(1, e.x + (world.tick * 17 + cell) % 501 - 250, e.y - 300,
+              (world.tick * 11 + cell * 7) % 401 - 200, -500, 6, 2, 0xFFCF8AF2, 0);
+            if (e.hp <= 0) { Kill(target); }
+        }
+    }
+
+    // 铁蜂 AI：进攻模式飞向最近存活巢穴啃咬；无巢可拔或守卫模式时，
+    // 拦截警戒半径内的来犯敌人；无事可做则绕核心盘旋待命。
+    void StepUnits() {
+        for (int i = 0; i < world.units.Length; i = i + 1) {
+            ForgeUnit u = world.units[i];
+            if (!u.active) { continue; }
+            if (u.hp <= 0) {
+                u.active = false;
+                world.SpawnEffect(2, u.x, u.y, 0, 0, 14, 7, 0xFF9ADCE8, 0);
+                world.SpawnEffect(1, u.x, u.y, (world.tick * 37 + i * 91) % 2400 - 1200, -900, 12, 3, 0xFFBFEAF2, 0);
+                continue;
+            }
+            if (u.cooldown > 0) { u.cooldown = u.cooldown - 1; }
+            if (world.droneMode) {
+                int nest = NearestNest(u.x, u.y);
+                if (nest >= 0) {
+                    ForgeNest n = world.nests[nest];
+                    int dx = ForgeGrid.Center(n.x) - u.x;
+                    int dy = ForgeGrid.Center(n.y) - u.y;
+                    long square = (long)dx * dx + (long)dy * dy;
+                    if (square <= (long)ForgeCombat.DroneRange() * ForgeCombat.DroneRange()) {
+                        if (u.cooldown <= 0) { BiteNest(nest, u); }
+                    } else if (square > 0) {
+                        double length = Math.Sqrt((double)square);
+                        u.x = u.x + (int)((double)dx * ForgeCombat.DroneSpeed() / length);
+                        u.y = u.y + (int)((double)dy * ForgeCombat.DroneSpeed() / length);
+                    }
+                    continue;
+                }
+            }
+            int target = FindTarget(u.x, u.y, ForgeCombat.DroneSeekRange(), 0, true);
+            if (target >= 0) {
+                ForgeEnemy e = world.enemies[target];
+                int dx = e.x - u.x; int dy = e.y - u.y;
+                long square = (long)dx * dx + (long)dy * dy;
+                if (square <= (long)ForgeCombat.DroneRange() * ForgeCombat.DroneRange()) {
+                    if (u.cooldown <= 0) {
+                        u.cooldown = ForgeCombat.DroneCooldown();
+                        FireDroneShot(u, target, e.generation);
+                    }
+                } else if (square > 0) {
+                    double length = Math.Sqrt((double)square);
+                    u.x = u.x + (int)((double)dx * ForgeCombat.DroneSpeed() / length);
+                    u.y = u.y + (int)((double)dy * ForgeCombat.DroneSpeed() / length);
+                }
+            } else {
+                Orbit(u, i);
+            }
+        }
+    }
+
+    void FireDroneShot(ForgeUnit u, int target, int generation) {
+        int slot = FreeBullet();
+        if (slot < 0) { return; }
+        ForgeBullet b = world.bullets[slot];
+        b.active = true; b.x = u.x; b.y = u.y; b.target = target; b.generation = generation;
+        b.damage = ForgeCombat.DroneDamage(); b.blast = 0;
+        b.life = ForgeCombat.BulletLifetime();
+    }
+
+    // 待命航线：核心外的确定性圆轨道，slot 相位错开避免叠成一串。
+    void Orbit(ForgeUnit u, int slot) {
+        int cx = ForgeGrid.Center(world.coreCell % world.width);
+        int cy = ForgeGrid.Center(world.coreCell / world.width);
+        double angle = (double)((world.tick * 3 + slot * 47) % 360) * 3.14159265358979 / 180.0;
+        int radius = 3600 + (slot % 4) * 500;
+        int dx = cx + (int)(Math.Cos(angle) * (double)radius) - u.x;
+        int dy = cy + (int)(Math.Sin(angle) * (double)radius) - u.y;
+        long square = (long)dx * dx + (long)dy * dy;
+        if (square == 0 || square < 400L * 400L) { return; }
+        double length = Math.Sqrt((double)square);
+        u.x = u.x + (int)((double)dx * ForgeCombat.DroneSpeed() / length);
+        u.y = u.y + (int)((double)dy * ForgeCombat.DroneSpeed() / length);
+    }
+
+    void BiteNest(int slot, ForgeUnit u) {
+        ForgeNest n = world.nests[slot];
+        u.cooldown = ForgeCombat.DroneCooldown();
+        n.hp = n.hp - ForgeCombat.NestBiteDamage();
+        world.SpawnEffect(1, ForgeGrid.Center(n.x) + (world.tick * 41 + u.x) % 900 - 450,
+          ForgeGrid.Center(n.y) - 200, (world.tick * 7 + u.y) % 1600 - 800, -700, 9, 3, 0xFFBFEAF2, 0);
+        // 巢穴不是死靶：每第 4 次受击拍打范围内最近的一架无人机。
+        if (world.tick % 4 == 0) { NestSting(slot); }
+        if (n.hp <= 0) { DestroyNest(slot); }
+    }
+
+    void NestSting(int slot) {
+        ForgeNest n = world.nests[slot];
+        int nx = ForgeGrid.Center(n.x);
+        int ny = ForgeGrid.Center(n.y);
+        int best = -1;
+        long bestSquare = 0;
+        for (int i = 0; i < world.units.Length; i = i + 1) {
+            ForgeUnit u = world.units[i];
+            if (!u.active) { continue; }
+            int dx = u.x - nx; int dy = u.y - ny;
+            long square = (long)dx * dx + (long)dy * dy;
+            if (square > (long)ForgeCombat.NestStingRange() * ForgeCombat.NestStingRange()) { continue; }
+            if (best < 0 || square < bestSquare) { best = i; bestSquare = square; }
+        }
+        if (best < 0) { return; }
+        ForgeUnit victim = world.units[best];
+        victim.hp = victim.hp - ForgeCombat.NestStingDamage();
+        world.SpawnEffect(1, victim.x, victim.y, (world.tick * 13) % 1200 - 600, -600, 8, 3, 0xFFE88A5A, 0);
+    }
+
+    void DestroyNest(int slot) {
+        ForgeNest n = world.nests[slot];
+        if (!n.active) { return; }
+        n.active = false; n.hp = 0;
+        int cx = ForgeGrid.Center(n.x);
+        int cy = ForgeGrid.Center(n.y);
+        world.SpawnEffect(2, cx, cy, 0, 0, 24, 20, 0xFFE88A5A, 0);
+        for (int i = 0; i < 10; i = i + 1) {
+            int dx = ((world.tick * 41 + i * 97) % 121 - 60) * 14;
+            int dy = ((world.tick * 29 + i * 61) % 101 - 50) * 14 - 40;
+            world.SpawnEffect(1, cx, cy, dx, dy, 18 + i * 2, 4, 0xFFD9825A, 0);
+        }
+        for (int i = 0; i < 6; i = i + 1) {
+            world.SpawnEffect(3, cx + (world.tick * 31 + i * 53) % 1201 - 600, cy,
+              (world.tick * 13 + i * 37) % 901 - 450, -240 - i * 30, 34 + i * 6, 6 + i, 0xFF6E675C, 0);
+        }
+        // 拔除出兵口的重赏：铜铅应急，钛晶奖励后期扩张。
+        world.resources.Add(0, 100); world.resources.Add(1, 60); world.resources.Add(5, 20);
+        world.SpawnEffect(4, cx, cy - 500, 0, -10, 60, 14, 0xFFB7F2D8, 0);
+        world.Shake(10);
+        world.events.Emit(ForgeEventKind.NestDestroyed, world.Index(n.x, n.y), slot, world.tick);
+    }
+
+    void ClearWave() {
+        if (!world.waveActive || world.spawnRemaining > 0 || world.bossPending || world.enemyCount > 0) { return; }
+        world.waveActive = false;
+        world.resources.Add(0, 20 + world.wave * 3);
+        world.resources.Add(1, 10 + world.wave * 2);
+        world.events.Emit(ForgeEventKind.WaveCleared, world.coreCell, world.wave, world.tick);
+        // 第 20 波清完即远征胜利；无尽坚守选择后不再触发。
+        if (world.wave >= world.catalog.waves.Length && !world.endless) {
+            world.victory = true; world.nextWaveTicks = 0;
+        } else { world.nextWaveTicks = ForgeCombat.BetweenWaveTicks(); }
+    }
+
+    // ---- 支援三塔：修复投影 / 过护投影 / 力场护盾 ----
+    // 覆盖判定统一用欧氏距离（圆形罩），与渲染的范围圈、护盾泡一致。
+
+    bool Powered(ForgeBuilding tower) { return tower.efficiency > 0; }
+
+    bool Covers(ForgeBuilding tower, int towerCell, int cell, int radius) {
+        int dx = cell % world.width - towerCell % world.width;
+        int dy = cell / world.width - towerCell / world.width;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    int ShieldMax(ForgeBuilding tower) { return world.catalog.blocks[(int)BlockKind.Shield].hp * 3; }
+
+    // 把伤害先记在覆盖目标的存活盾上；返回穿透后仍要落在建筑上的余量。
+    int Absorb(int cell, int damage) {
+        int remaining = damage;
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding tower = world.buildings[i];
+            if (tower.kind != BlockKind.Shield || tower.shield <= 0 || !Powered(tower)) { continue; }
+            if (!Covers(tower, i, cell, world.catalog.blocks[(int)BlockKind.Shield].powerRadius)) { continue; }
+            int soaked = ForgeGrid.Min(remaining, tower.shield);
+            tower.shield = tower.shield - soaked;
+            remaining = remaining - soaked;
+            world.SpawnEffect(1, ForgeGrid.Center(cell % world.width), ForgeGrid.Center(cell / world.width),
+                0, -30, 12, 6, 0xFF7ECAEC, 0);
+            if (remaining <= 0) { break; }
+        }
+        return remaining;
+    }
+
+    void StepSupport() {
+        bool healed = false;
+        for (int i = 0; i < world.buildings.Length; i = i + 1) {
+            ForgeBuilding tower = world.buildings[i];
+            if (tower.kind != BlockKind.Repair && tower.kind != BlockKind.Overdrive && tower.kind != BlockKind.Shield) { continue; }
+            if (tower.hp <= 0 || !Powered(tower)) { continue; }
+            int radius = world.catalog.blocks[(int)tower.kind].powerRadius;
+            if (tower.kind == BlockKind.Overdrive) {
+                // 增益写缓存：工厂读 (boostTick, boostPow)；重叠取最大，断供 3 tick 后失效。
+                int pow = 1000 + 650 * tower.efficiency / 1000;
+                int ox = i % world.width; int oy = i / world.width;
+                for (int dy = -radius; dy <= radius; dy = dy + 1) {
+                    int y = oy + dy;
+                    if (y < 0 || y >= world.height) { continue; }
+                    for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                        int x = ox + dx;
+                        if (x < 0 || x >= world.width) { continue; }
+                        if (dx * dx + dy * dy > radius * radius) { continue; }
+                        int cell = y * world.width + x;
+                        if (world.boostPow[cell] < pow) { world.boostPow[cell] = pow; }
+                        world.boostTick[cell] = world.tick;
+                    }
+                }
+            } else if (tower.kind == BlockKind.Repair) {
+                int heal = ForgeGrid.Max(1, 2 * tower.efficiency / 1000);
+                int ox = i % world.width; int oy = i / world.width;
+                for (int dy = -radius; dy <= radius; dy = dy + 1) {
+                    int y = oy + dy;
+                    if (y < 0 || y >= world.height) { continue; }
+                    for (int dx = -radius; dx <= radius; dx = dx + 1) {
+                        int x = ox + dx;
+                        if (x < 0 || x >= world.width) { continue; }
+                        if (dx * dx + dy * dy > radius * radius) { continue; }
+                        int cell = y * world.width + x;
+                        ForgeBuilding b = world.buildings[cell];
+                        if (b.kind == BlockKind.Empty || b.hp <= 0 || b.kind == BlockKind.Repair) { continue; }
+                        int maxHp = b.kind == BlockKind.Core ? world.coreMaxHp : world.catalog.blocks[(int)b.kind].hp;
+                        if (b.hp < maxHp) {
+                            b.hp = ForgeGrid.Min(maxHp, b.hp + heal);
+                            healed = true;
+                        }
+                    }
+                }
+            } else {
+                int maxShield = ShieldMax(tower);
+                if (tower.shield < maxShield) { tower.shield = ForgeGrid.Min(maxShield, tower.shield + 1); }
+            }
+        }
+        // EntryCost 计入建筑耐久：任何修复都会改路径账面，路由必须重算。
+        if (healed) { world.pathsDirty = true; }
+    }
+
+    void Step() {
+        if (world.defeated || world.victory) { return; }
+        if (world.buildings[world.coreCell].hp <= 0) { LoseCore(); return; }
+        if (world.pathsDirty) { RebuildPaths(); }
+        AdvanceWave();
+        MoveEnemies();
+        if (world.defeated) { return; }
+        MoveBullets();
+        RebuildHash();
+        FireTurrets();
+        FirePrisms();
+        StepUnits();
+        StepSupport();
+        ClearWave();
+    }
+}
