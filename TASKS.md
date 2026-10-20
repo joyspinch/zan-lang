@@ -8,6 +8,55 @@
 
 ## 未完成
 
+### [ ] A452 一元运算路径的 `type_error` 哨兵不发诊断——`-s` 落到 LLVM 校验失败，`~s` 把编译器打崩
+
+- 现象（2026-10-21 实测，探针见 `_scratch/probe_unary_types.ps1`）：
+  - `string s = "x"; Console.WriteLine(-s);` → rc=1，报的是
+    `LLVM verification failed in main: Integer arithmetic operators only work with
+    integral types!`——不是人话诊断，用户完全看不出是自己写错了。
+  - `string s = "x"; Console.WriteLine(~s);` → **编译器自己崩**（退出码
+    0xC0000005 访问冲突）。
+  - `string s = "x"; Console.WriteLine(+s);` → rc=0 **静默通过**（恒等，输出字符串）。
+  - 用**不含**本轮改动的共享 `build/zanc.exe` 复测 `~s` 同样崩 → **既有缺陷，
+    不是本轮引入**。
+- 根因：`src/compiler/checker.c:2446-2474` 的 `AST_UNARY` 分支对非数值操作数
+  只 `return c->binder->type_error`，而这个哨兵**本身不发诊断**，调用点也没补
+  "invalid operand type" → 错误一路漏进 irgen：
+  - `-s` → 对字符串指针做整数减法 → LLVM 校验失败；
+  - `~s` → 对字符串指针做 xor → 生成非法 IR 的过程中就把编译器打崩；
+  - `+s` → `src/compiler/irgen_expr.c:4452` `case TK_PLUS: return operand;`
+    恒等 → 静默通过。
+- 影响：写错一个一元运算符，用户拿到的是"编译器崩了"或 LLVM 内部报错，而不是
+  "cannot apply unary '-' to 'string'"。
+- 方向：checker's `AST_UNARY` 分支对非数值 / 非类结构体操作数**就地发诊断**
+  （`zan_diag_emit`），不要只返回 `type_error` 哨兵。自举侧 `src/selfhost/
+  checker.zan:250-253` 同样无条件 `return InferType(e.a)`，且 `GenUnary` 对
+  字符串会生成 `sub i64 0, <指针>` / `xor i64 <指针>, -1` → 两边都要补守卫，
+  否则差分门分叉。
+- ⚠ 跨后端语义改动，必须同一次提交落地两边的守卫；`src/selfhost/irgen_expr.zan`
+  此刻正被另一会话在途修改，改 checker 侧不碰它可以先做，但要重跑差分门。
+
+### [ ] A451 自举后端没有一元运算符重载派发——同一份源码两个后端语义不同
+
+- 现象（2026-10-21 实测，用例 `tests/conformance/unary_plus_overload.zan`，
+  自举 gen1 按差分门同款流程编+链+跑）：
+  - C 宿主：输出 `6 / 8 / 10`——一元 `operator +` 被**派发**，重载把值 +1。
+  - 自举后端：输出 `5 / 7 / 9`——重载**根本没被调用**，操作数原样返回。
+- 根因：`src/selfhost/irgen_expr.zan:156-196` `GenUnary` 只处理 `++/--`、`!`、
+  `~`、`-`（内建），`TK.Plus()` 落到末尾 `return v`（恒等）；自举后端**没有**
+  一元重载派发这一层（C 宿主是 `src/compiler/irgen_expr.c:4352`
+  `emit_unary_op_overload`，按形参个数 1 区分一元）。一元 `-` 打在类/结构体上
+  更糟：`sub i64 0, <指针>` → 非法 IR。
+- 影响：两后端对同一份源码给出不同结果；`operator_unary_overload`（A438 落的
+  用例）与 `unary_plus_overload` 都没进差分门清单，正是因为它们会分叉——
+  差分门目前**看不见**这个缺口。
+- 方向：自举 `GenUnary` 增派发：操作数是类 / 结构体时查 static `op_add` /
+  `op_sub` 且形参个数为 1 的重载，找到就 `call`，找不到就报与宿主同款诊断
+  （`type 'X' does not define a unary '+' operator overload`），两者都不许
+  静默恒等。
+- ⚠ `src/selfhost/irgen_expr.zan` 此刻正被另一会话在途修改，本轮无法同一次
+  提交落地，等窗口。
+
 ### [ ] A446 `packages/Zan.Sdk.Wechat` 引用了不存在的枚举 `WechatMpMediaType`
 
 - 现象（2026-10-21 全包扫描实测）：`packages/Zan.Sdk.Wechat/src/Sdk/Wechat/Mp/
@@ -158,19 +207,6 @@
   （`tests/selfhost/diff_cases.txt`）打红——两个后端当前都输出 "1"，改一边就分叉。
 - 影响面：改完要 grep 全部用 `Convert.ToString(<bool>)` / `<bool>` 参与拼接的
   用例与 golden（现有 golden 已把 "1" 固化在部分用例里）。
-### [ ] A440 一元 `+` 表达式根本解析不了——`+x` 报 "unexpected token '+'"
-
-- 现象：`+a`（一元正号）在**解析期**就被拒：`unexpected token '+' in expression`；
-  解析器的表达式前缀只认 `-` / `!` / `~`。
-- 影响：用户没法写一元正号；`operator +` 重载的**声明**能解析（`parser.c` 把
-  `operator +` 映射成 `op_add`），但**使用端**写不出来 → 一元 `operator +` 永远
-  调不到。
-- 方向：解析器的前缀表达式表加 `TK_PLUS`（注意与二元 `+` 的优先级/结合性
-  区分：一元 `+` 是前缀运算符，绑定比二元 `+` 紧）。编译器侧的一元重载路径
-  （irgen 的 `emit_unary_op_overload`）已经就位，解析器一通就能用。
-- ⚠ 改解析器会动自举后端（`src/selfhost/parser.zan` 的前缀表达式解析），两个
-  后端要同一次落地，否则固定点门不绿。
-
 ### [ ] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
 - 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_asyncvoid.zan`）：

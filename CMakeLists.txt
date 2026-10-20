@@ -1157,6 +1157,27 @@ add_test(NAME diag_unary_operator_no_overload
     "-DEXPECT_REGEX=does not define a unary '-' operator overload"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_operator_no_overload PROPERTIES TIMEOUT 60)
+
+# The same rule for the unary plus sign: the parser used to reject `+a`
+# outright ("unexpected token '+'"), so a one-argument `operator +` overload
+# could be declared but never used. The parser now accepts the prefix, and a
+# class without a unary '+' overload must fail with the same readable wording
+# instead of falling into the built-in integer arithmetic.
+#
+# The sign is spelled .[+]. on purpose: a backslash-escaped \+ does not survive
+# the trip through the test command line (the backslash is eaten, leaving a
+# bare '+' that the regex engine reads as a quantifier, and the case then fails
+# with a diagnostic that is visibly right there in the log).
+add_test(NAME diag_unary_plus_no_overload
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_plus_no_overload.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_plus_no_overload${_exe_ext}
+    "-DEXPECT_REGEX=does not define a unary .[+]. operator overload"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_plus_no_overload PROPERTIES TIMEOUT 60)
+
+
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序
 # 带崩）；结构体则落进整数格式化分支，生成 %struct.T 传给 i64 形参的非法 IR

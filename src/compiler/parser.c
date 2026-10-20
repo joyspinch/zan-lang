@@ -1604,9 +1604,15 @@ static zan_ast_node_t *parse_unary_inner(zan_parser_t *p) {
         return n;
     }
 
+    /* 一元正号 `+x`：数值上是恒等（irgen 的 `case TK_PLUS: return operand`），
+       类/结构体上走 static `operator +` 的重载路径（emit_unary_op_overload）。
+       自举后端的前缀表本来就有 `+`（src/selfhost/parser.zan 的 ParseUnaryInner），
+       宿主侧漏了它 → 两个后端在语法层就已经分叉（宿主报 "unexpected token
+       '+' in expression"，自举照常编译）。`+=` / `++` 是各自独立的 token，
+       前缀位置上的 `+` 只可能是一元正号。 */
     if (parser_check(p, TK_BANG) || parser_check(p, TK_MINUS) ||
-        parser_check(p, TK_TILDE) || parser_check(p, TK_PLUS_PLUS) ||
-        parser_check(p, TK_MINUS_MINUS)) {
+        parser_check(p, TK_PLUS) || parser_check(p, TK_TILDE) ||
+        parser_check(p, TK_PLUS_PLUS) || parser_check(p, TK_MINUS_MINUS)) {
         zan_token_kind_t op = p->current.kind;
         parser_advance(p);
         zan_ast_node_t *operand = parse_unary(p);
