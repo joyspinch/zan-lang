@@ -551,3 +551,36 @@ kernel32、shell32、user32、advapi32、version）。
   得先用 C 宿主跑探针，把字节（`ESC[36m`、`ESC]0;…BEL`）量出来再写。
 - 边界：属性赋值走的是 `StoreTo`（不是 `GenAssign`），读取走的是 `GenMember`
   ——两处都要挂，别只改一处（只改一处会变成"写进去了、读不出来"）。
+## 33. 任务句柄：先镜像**形状**（类型模型），再谈能不能降级
+
+- 动作：C 宿主把 `Task` / `Task<T>` 当**内建类型**（`binder.c` 的
+  `zan_binder_make_task_type`，`TYPE_TASK`），不是标准库里的类。自举的检查器
+  必须照抄这个类型模型，否则任何 Task 形状的声明都被报成
+  `unknown type 'Task'`——一个**关于语言的假陈述**（语言里明明有 Task）。
+- 形状由**实参形态**决定，不是由被调者名字决定（C 宿主
+  `checker.c` 的 `task_run_result_type`）：
+  - `Task.Spawn(...)` → `Task`（脱钩帧，无结果）
+  - `Task.Run(lambda/Action)` → `Task`（action 帧，无结果）
+  - `Task.Run(<无结果调用>)` → `Task`
+  - `Task.Run(<带类型的调用>)` → `Task<T>`（keep_result 帧）
+- 无结果句柄流进 `Task<T>` 的槽位要在**编译期**被拒，诊断与宿主**逐字一致**
+  （`cannot convert 'Task' to 'Task<int>' in initializer: a task started from a
+  lambda/Action carries no result; declare 'Task' (not 'Task<T>') and wait with
+  .Wait()`）。理由是运行期 double free：action 帧由完成路径释放一次，读者再
+  释放一次 → abort。
+- 理由（2026-10-20 对账）：宿主与自举在"任务句柄定型"上分叉，是**并行的两
+  条编译线**之间的语义漂移；差分门一旦收录相关用例就会红。
+- 坑：宿主在**解析期**就把 async 方法的返回类型改写掉
+  （`parser.c` 的 `desugar_async_task_method`：`async Task<int>` → `int`、
+  `async Task` → `void`，无方法体的接口声明还补上 `async` 标记），所以
+  检查器看到的永远是**结果类型**，`ValueTask` 这个名字也从来不需要进 binder。
+  自举的 parser 没有这一步 → 检查器若只"认识 Task"而不按元素类型判
+  "not all code paths return a value"，就会在 stdlib 的 `async Task
+  SleepAsync` 上报**假阳性**。自举侧先在检查器里补一半（async + Task 形状
+  → 用元素类型当方法体的返回类型），parser 侧的改写要连带 ngen 后端
+  （它靠**类型名**认 Task 形状）一起动，不能盲改。
+- 边界：**认识形状 ≠ 能降级**。自举还没有 `Task.Run` / `t.Wait()` /
+  `t.Result` / `t.IsCompleted` 的实现——它们一律报"not supported by the
+  self-hosted compiler yet"（fail-closed），差分门里对应用例记在
+  `tests/selfhost/diff_known_gaps.txt`（**已知缺口**），不要为了"全绿"把它
+  悄悄放过，也不要假装通过。

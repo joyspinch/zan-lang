@@ -725,3 +725,46 @@
 - ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `ConsoleColorGet` /
   `ConsoleColorSet` / `ConsoleTitleSet`，`GenMember`（读）与 `StoreTo`（写）
   两处都挂了；用例 `tests/conformance/console_color.zan` 钉住（字节逐字一致）。
+### [ ] A416 自举的检查器不认识 `Task` / `Task<T>`——任务句柄的定型规则没镜像
+
+- 现象（2026-10-20 对账）：C 宿主 `checker.c` 按**实参形态**给
+  `Task.Run` / `Task.Spawn` 定型——lambda/委托/无结果调用 → 无结果 `Task`，
+  带类型的调用 → `Task<T>`；把无结果句柄当 `Task<T>` 用在编译期被拒
+  （`tests/diag/task_run_action_result_type.zan`，诊断串
+  `carries no result; declare 'Task' (not 'Task<T>')`）。自举的
+  `src/selfhost/checker.zan` 既不认识 `Task` 这个类型（任何 Task 形状的
+  声明都被报成 `unknown type 'Task'`），也没有这条定型规则——宿主与自举
+  在「任务句柄定型」上分叉。
+- 方向：镜像宿主的三件事——① `Task` / `Task<T>` 是内建类型名（宿主的
+  `TYPE_TASK`）；② `Task.Run` / `Task.Spawn` 的结果类型按实参形态定型
+  （宿主 `task_run_result_type`）；③ 无结果句柄流进 `Task<T>` 的槽位时报
+  编译期错误，措辞与宿主逐字一致。
+- ✅ 已修（2026-10-20）：`src/selfhost/checker.zan` 加 `MkTaskType` /
+  `IsTaskTy` / `TaskElemTy` / `TaskCallType` / `CheckTaskNoResult`；
+  `CheckType` 认 `Task`（至多一个类型实参），`InferType` 按宿主口径给
+  `Task.Run`/`Task.Spawn` 定型，`CheckTaskNoResult` 挂在变量初始化、赋值、
+  返回值与实参四处。诊断与宿主**逐字一致**（同一份源，两边输出同一条：
+  `cannot convert 'Task' to 'Task<int>' in initializer: a task started from a
+  lambda/Action carries no result; ...`）。`irgen.zan` 的 `MapType` 显式把
+  `Task` 映成 `i8*`（自举的任务句柄就是协程帧指针）。差分门收录
+  `task_run_action_handle`（宿主能跑、自举还没有 Task API 的降级），按
+  **已知缺口**记账而不是假装通过。
+
+### [ ] A417 自举的 parser 缺宿主的 `desugar_async_task_method`——`ValueTask` 拼写与接口的 Task 形状没被改写
+
+- 现象：宿主在**解析期**就把 async 方法的返回类型改写掉
+  （`src/compiler/parser.c:3375` `desugar_async_task_method`）：
+  `async Task<int>` → `int`、`async Task` → `void`，并给无方法体的
+  （接口/抽象）声明补上 `async` 标记。所以检查器看到的永远是**结果类型**，
+  `ValueTask` 这个名字也从来不需要进 binder（`binder.c` 只认 `Task`）。
+  自举的 parser 没有这一步：`async Task<int> Foo()` 的返回类型原样进了
+  检查器与后端。
+- 方向：照宿主在 parser 里补这一步，并用 `is_task_return` 之类的标记把
+  「这个方法原本是 Task 形状」传给后端——自举的 ngen 后端现在靠**类型名**
+  认 Task 形状（`ngen_async.zan` 的 `IsTaskShapedRetNg`），改写返回类型
+  后必须换成看标记，否则接口的 Task 形状识别会失效。
+- ⚠ 本轮只做了检查器侧的一半（`checker.zan` 的 `CheckMethod` 对 async +
+  Task 形状返回类型改用元素类型当**方法体**的返回类型），够把 stdlib 里
+  `async Task SleepAsync` 的假阳性（`not all code paths return a value`）
+  消掉；parser 侧的改写与其配套的后端标记留到下一轮——它要动 ngen 路径，
+  而 ngen 路径没有差分门覆盖，不能盲改。

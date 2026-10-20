@@ -74,6 +74,36 @@ stdout 逐字相同）。
   `Cancel`、`IsCancellationRequested`、`JoinNew` / `JoinBind` / `JoinWait` /
   `JoinCancel`——这些要走协程帧与调度器，见 TASKS.md 的 A385。
 
+### 任务句柄的**形状**（`Task` / `Task<T>`）
+
+自举的检查器已经认识 `Task` 这个内建类型名，并按 C 宿主
+`checker.c` 的 `task_run_result_type` 给 `Task.Run` / `Task.Spawn` 定型：
+
+| 实参形态 | 句柄类型 | 理由 |
+|---|---|---|
+| `Task.Spawn(...)` | `Task`（无结果） | 脱钩帧：结果由完成路径丢弃 |
+| `Task.Run(lambda/Action)` | `Task`（无结果） | action 帧：没有结果 |
+| `Task.Run(<无结果调用>)` | `Task`（无结果） | 脱钩帧 |
+| `Task.Run(<带类型的调用>)` | `Task<T>` | keep_result 帧：结果由用户侧释放 |
+
+无结果句柄流进 `Task<T>` 的槽位（变量初始化、赋值、返回值、实参）在**编译期**
+被拒，诊断与宿主**逐字一致**：
+
+```
+cannot convert 'Task' to 'Task<int>' in initializer: a task started from a
+lambda/Action carries no result; declare 'Task' (not 'Task<T>') and wait with .Wait()
+```
+
+这条不是洁癖：action 帧由完成路径释放一次，读者再释放一次就是 double free，
+运行期直接 abort（宿主 `checker.c` 的注释与
+`tests/diag/task_run_action_result_type.zan` 是同一个理由）。
+
+**形状认识 ≠ 能降级**：自举还没有 `Task.Run` / `Task.Spawn` / `t.Wait()` /
+`t.Result` / `t.IsCompleted` / `Task.IsDone` 的**实现**——它们一律报
+"not supported by the self-hosted compiler yet"（fail-closed）。差分门里
+`task_run_action_handle` 按**已知缺口**记账
+（`tests/selfhost/diff_known_gaps.txt`），等 A385 的帧布局对齐后再销账。
+
 > 上表说的是**自举的 IR 后端**（`irgen*.zan`，差分门考的就是它）。**ngen 后端**
 > （`ngen*.zan`，直接发机器码）只降级了 `Console.Write` / `WriteLine` /
 > `PrintLine` / `ReadLine`，其余成员**报诊断拒绝**（fail-closed，不给错答案），

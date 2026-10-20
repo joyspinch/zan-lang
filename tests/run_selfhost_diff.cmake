@@ -106,6 +106,11 @@ set(_rejected 0)
 # code has to be non-zero and no IR may be written. It guards a fail-closed
 # boundary -- the self-host must report a diagnostic instead of emitting IR it
 # cannot lower (the C host may accept the same program; that is fine).
+#
+# A reject line may also pin the diagnostic: `name|||expected substring`. The
+# substring is matched literally (not as a regex) against the compiler's
+# output, so a case can assert that the self-host refuses the program for the
+# intended reason -- not for some later, unrelated one.
 set(_rejects)
 if(REJECTS)
   if(NOT EXISTS ${REJECTS})
@@ -192,11 +197,20 @@ foreach(_case IN LISTS _cases)
 endforeach()
 
 foreach(_r IN LISTS _rejects)
-  set(_rsrc "${REJECT_DIR}/${_r}.zan")
+  # `name|||expected substring` pins the diagnostic; a bare `name` only asks
+  # for a refusal.
+  string(REPLACE "|||" ";" _rparts "${_r}")
+  list(LENGTH _rparts _rnp)
+  list(GET _rparts 0 _rname)
+  set(_rtext "")
+  if(_rnp GREATER 1)
+    list(GET _rparts 1 _rtext)
+  endif()
+  set(_rsrc "${REJECT_DIR}/${_rname}.zan")
   if(NOT EXISTS ${_rsrc})
     message(FATAL_ERROR "reject case source not found: ${_rsrc}")
   endif()
-  set(_rll "${OUTDIR}/reject_${_r}.ll")
+  set(_rll "${OUTDIR}/reject_${_rname}.ll")
   file(REMOVE ${_rll})
   execute_process(
     COMMAND ${GEN1} ${_rll} ${_rsrc}
@@ -206,13 +220,22 @@ foreach(_r IN LISTS _rejects)
     ERROR_VARIABLE rej_err)
   if(rej_rc EQUAL 0)
     math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL reject ${_r}: the self-hosted compiler accepted a program it must reject")
+    message(SEND_ERROR "FAIL reject ${_rname}: the self-hosted compiler accepted a program it must reject")
   elseif(EXISTS ${_rll})
     math(EXPR _failures "${_failures} + 1")
-    message(SEND_ERROR "FAIL reject ${_r}: the self-hosted compiler wrote IR for a program it must reject")
+    message(SEND_ERROR "FAIL reject ${_rname}: the self-hosted compiler wrote IR for a program it must reject")
+  elseif(NOT _rtext STREQUAL "")
+    string(FIND "${rej_out}${rej_err}" "${_rtext}" _rhit)
+    if(_rhit EQUAL -1)
+      math(EXPR _failures "${_failures} + 1")
+      message(SEND_ERROR "FAIL reject ${_rname}: the diagnostic does not contain '${_rtext}' -- refused for another reason")
+    else()
+      math(EXPR _rejected "${_rejected} + 1")
+      message(STATUS "REJECT ${_rname}: refused as expected")
+    endif()
   else()
     math(EXPR _rejected "${_rejected} + 1")
-    message(STATUS "REJECT ${_r}: refused as expected")
+    message(STATUS "REJECT ${_rname}: refused as expected")
   endif()
 endforeach()
 

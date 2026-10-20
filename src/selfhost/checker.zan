@@ -45,6 +45,32 @@ public class Checker {
     Node MkType(string name) { Node t = new Node(AK.TypeRef()); t.sval = name; return t; }
     bool HasMod(Node m, int flag) { return (m.mods / flag) - ((m.mods / flag) / 2) * 2 == 1; }
 
+    // ---- Task / Task<T>: the C host's builtin task handle (TYPE_TASK) ----
+    // A bare `Task` is a handle that carries NO result (the frame is released
+    // by the completion path), `Task<T>` a handle that carries one (the
+    // reader releases it). The host models both with one builtin type
+    // (binder.c: zan_binder_make_task_type); the self-hosted checker has to
+    // know the same names, or every Task-typed declaration is rejected with
+    // the bogus "unknown type 'Task'".
+    Node MkTaskType(Node elem) {
+        Node t = MkType("Task");
+        if (elem != null) { t.Add(elem); t.a = elem; }
+        return t;
+    }
+    bool IsTaskTy(Node t) { return t != null && t.sval == "Task"; }
+    // The element type of a Task-shaped return: `Task<T>` -> T, a bare `Task`
+    // -> void (no result).
+    Node TaskElemTy(Node t) {
+        if (!IsTaskTy(t)) { return t; }
+        if (t.kids.Count == 1) { return t.kids[0]; }
+        return MkType("void");
+    }
+    string TaskTyName(Node t) {
+        if (!IsTaskTy(t)) { return "?"; }
+        if (t.kids.Count == 0) { return "Task"; }
+        return "Task<" + t.kids[0].sval + ">";
+    }
+
     // ---- lexical scope ----
     int ScopeMark() { return scopeName.Count; }
     void ScopeTrim(int to) {
@@ -269,6 +295,10 @@ public class Checker {
                     Node m = MethodUp(cls, callee.sval);
                     if (m != null) { return m.type; }
                 }
+                // `Task.Run(...)` / `Task.Spawn(...)`: the handle's shape
+                // follows the argument (the C host's task_run_result_type).
+                Node tr = TaskCallType(e);
+                if (tr != null) { return tr; }
                 return null;
             }
             return null;
@@ -282,6 +312,52 @@ public class Checker {
 
     bool IsStr(Node t) { return t != null && t.sval == "string"; }
 
+    // The result type of `Task.Run(...)` / `Task.Spawn(...)`, mirroring the C
+    // host's task_run_result_type (src/compiler/checker.c):
+    //
+    //   Task.Spawn(...)         -> Task    (a detached frame carries no result)
+    //   Task.Run(lambda/Action) -> Task    (an action frame carries no result)
+    //   Task.Run(<void call>)   -> Task
+    //   Task.Run(<call>)        -> Task<T> (T = the call's result type)
+    //
+    // The distinction is not cosmetic: the action frame is released by the
+    // completion path, so reading it as a result handle releases it twice.
+    Node TaskCallType(Node call) {
+        Node callee = call.a;
+        if (callee == null || callee.kind != AK.MemberAccess()) { return null; }
+        if (callee.a == null || callee.a.kind != AK.Ident()) { return null; }
+        if (callee.a.sval != "Task") { return null; }
+        string mname = callee.sval;
+        if (mname != "Run" && mname != "Spawn") { return null; }
+        if (call.kids.Count != 1) { return null; }
+        Node arg = call.kids[0];
+        if (arg == null) { return null; }
+        if (mname == "Spawn") { return MkTaskType(null); }
+        if (arg.kind == AK.Lambda()) { return MkTaskType(null); }
+        Node at = InferType(arg);
+        if (at == null) { return null; }        // unknown argument: stay permissive
+        if (binder.IsDelegateName(at.sval)) { return MkTaskType(null); }
+        if (at.sval == "void") { return MkTaskType(null); }
+        if (IsTaskTy(at)) {
+            if (at.kids.Count == 1) { return MkTaskType(at.kids[0]); }
+            return MkTaskType(null);
+        }
+        return MkTaskType(at);
+    }
+
+    // The C host rejects a handle that carries no result where a Task<T> is
+    // expected (src/compiler/checker.c: checker_check_assignable): the action
+    // frame would be released twice -- once by the completion path, once by
+    // the reader -- and the double free aborts the process. The self-hosted
+    // checker applies the same rule wherever a value flows into a typed slot.
+    void CheckTaskNoResult(Node target, Node value, string what, int line, int col) {
+        if (!IsTaskTy(target) || !IsTaskTy(value)) { return; }
+        if (target.kids.Count != 1 || value.kids.Count != 0) { return; }
+        diags.Error("cannot convert '" + TaskTyName(value) + "' to '" + TaskTyName(target)
+            + "' in " + what + ": a task started from a lambda/Action carries no result; "
+            + "declare 'Task' (not 'Task<T>') and wait with .Wait()", line, col);
+    }
+
     // A type node resolves if its base name is known. Generic args are checked
     // recursively.
     void CheckType(Node t) {
@@ -292,7 +368,11 @@ public class Checker {
         if (!ok) { ok = binder.IsTypeParam(name); }
         if (!ok) { ok = binder.IsDelegateName(name); }
         if (!ok) { ok = name == "TypeInfo"; }   // builtin reflection handle
+        if (!ok) { ok = name == "Task"; }        // builtin task handle (Task / Task<T>)
         if (!ok) { if (binder.FindType(name) != null) { ok = true; } }
+        if (name == "Task" && binder.FindType(name) == null && t.kids.Count > 1) {
+            diags.Error("Task takes at most one type argument", t.line, t.col);
+        }
         if (!ok) { diags.Error("unknown type '" + name + "'", t.line, t.col); }
         int i = 0;
         while (i < t.kids.Count) { CheckType(t.kids[i]); i = i + 1; }
@@ -329,8 +409,16 @@ public class Checker {
         if (m.type != null) { CheckType(m.type); }
         scopeName = new List<string>(); scopeType = new List<Node>();
         loopDepth = 0;
-        curRet = m.type;
-        curVoid = ctor || m.type == null || m.type.sval == "void";
+        // An async method with a Task-shaped return type returns its RESULT,
+        // not a handle: the C host's parser rewrites `async Task<T>` to `T`
+        // and `async Task` to `void` (desugar_async_task_method) before the
+        // checker runs, so the body is checked against the element type.
+        Node bodyRet = m.type;
+        if (!ctor && HasMod(m, MOD.Async()) && IsTaskTy(bodyRet)) {
+            bodyRet = TaskElemTy(bodyRet);
+        }
+        curRet = bodyRet;
+        curVoid = ctor || bodyRet == null || bodyRet.sval == "void";
         curStatic = !ctor && HasMod(m, MOD.Static());
         int i = 0;
         while (i < m.kids.Count) {
@@ -465,6 +553,9 @@ public class Checker {
         if (k == AK.VarDecl()) {
             CheckType(n.type);
             CheckExpr(n.b);
+            if (n.type != null) {
+                CheckTaskNoResult(n.type, InferType(n.b), "initializer", n.line, n.col);
+            }
             Node ty = n.type;
             if (ty == null) { ty = InferType(n.b); }
             ScopeAdd(n.sval, ty);
@@ -472,6 +563,9 @@ public class Checker {
             while (di < n.kids.Count) {
                 Node d = n.kids[di];
                 CheckExpr(d.b);
+                if (d.type != null) {
+                    CheckTaskNoResult(d.type, InferType(d.b), "initializer", d.line, d.col);
+                }
                 Node dty = d.type;
                 if (dty == null) { dty = InferType(d.b); }
                 ScopeAdd(d.sval, dty);
@@ -499,6 +593,9 @@ public class Checker {
             }
             if (n.a == null && !curVoid) {
                 diags.Error("must return a value", n.line, n.col);
+            }
+            if (n.a != null && curRet != null) {
+                CheckTaskNoResult(curRet, InferType(n.a), "return statement", n.line, n.col);
             }
             return;
         }
@@ -635,7 +732,13 @@ public class Checker {
             }
             return;
         }
-        if (k == AK.Binary() || k == AK.Assignment()) { CheckExpr(n.a); CheckExpr(n.b); return; }
+        if (k == AK.Binary() || k == AK.Assignment()) {
+            CheckExpr(n.a); CheckExpr(n.b);
+            if (k == AK.Assignment()) {
+                CheckTaskNoResult(InferType(n.a), InferType(n.b), "assignment", n.line, n.col);
+            }
+            return;
+        }
         if (k == AK.Unary() || k == AK.PostfixUnary()) { CheckExpr(n.a); return; }
         if (k == AK.Index()) { CheckExpr(n.a); CheckExpr(n.b); return; }
         if (k == AK.CallInit()) { CheckCallInitItems(n); return; }
@@ -765,6 +868,7 @@ public class Checker {
             if (cands != null && !hasNamed && !AcceptsArgc(curClass, callee.sval, argc)) {
                 diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
             }
+            if (!hasNamed) { CheckTaskArgs(cands, n); }
             return;
         }
         if (callee != null && callee.kind == AK.MemberAccess()) {
@@ -779,10 +883,40 @@ public class Checker {
                 } else if (MethodUp(cls, callee.sval) != null && !hasNamed && !AcceptsArgc(cls, callee.sval, argc)) {
                     diags.Error("no overload of '" + callee.sval + "' takes " + argc + " argument(s)", n.line, n.col);
                 }
+                if (!hasNamed) { CheckTaskArgs(MethodUp(cls, callee.sval), n); }
             }
             return;
         }
         CheckObj(callee);
+    }
+
+    // A no-result handle passed where a Task<T> is expected: the same rule as
+    // on the declaration side (the host compares the argument with the formal
+    // parameter type). The parameter list must match the argument count --
+    // the self-hosted checker resolves overloads by name, so a different
+    // overload may be the intended one.
+    void CheckTaskArgs(Node m, Node call) {
+        if (m == null) { return; }
+        int np = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { np = np + 1; }
+            i = i + 1;
+        }
+        if (np != call.kids.Count) { return; }
+        int j = 0;
+        i = 0;
+        while (i < m.kids.Count) {
+            Node p = m.kids[i];
+            if (p.kind == AK.Param()) {
+                Node a = call.kids[j];
+                if (a != null) {
+                    CheckTaskNoResult(p.type, InferType(a), "argument", a.line, a.col);
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
     }
     // 工厂调用延续初始化器的成员写（独立方法：CheckExpr 已在每方法的
     // 局部槽预算边缘，不再往里长）：调用本身照常查，成员写只查右值
