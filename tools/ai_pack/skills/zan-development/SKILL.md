@@ -228,6 +228,21 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   会报 "'PI' is not a known variable, type, or namespace"。
 * **`double` 没有 `IsNaN` / `IsInfinity`**（实证，2026-10-22）：用
   `v != v` 判 NaN、用阈值比较判无穷（`v > 3.4028234663852886e+38`）。
+* **Zan 没有 `char` 类型，stdlib 也没有 `StringBuilder`**（实证，2026-10-23）：
+  字符串是 UTF-8 字节串，"单字符"就是长度为 1 的字符串；`s[i]` 返回**字节**
+  （int）不是字符。`string.Split` 的分隔符是 **string**（`s.Split(".")`；写
+  `s.Split('.')` 编译不过），按字符拆用 `s.ToCharList()`，拼串用 `+`。
+* **泛型方法从数组实参推不出类型参数**（实证，2026-10-23）：
+  `Pick(arr)`（`arr` 是 `string[]`）报 "could not be resolved to any callable"，
+  必须显式 `Pick<string>(arr)`；`List<T>` 实参则能推断（`rng.Pick(list)` 正常）。
+* **泛型 `T` 上调不到 `.Equals`**（实证，2026-10-23）：`List<T>` 元素上写
+  `items[i].Equals(value)` 报 "could not be resolved to any callable"。要按值
+  去重就用 `HashSet<T>`（相等规则：值类型按值、字符串按内容、其他引用类型
+  按身份）。
+* **闭包捕获 `this` 逃逸方法作用域会触发 ARC 警告**（实证，2026-10-23）：
+  `return this.Of<string>(n, i => this.random.String())` 报 "returned closure
+  captures 'this' and escapes method scope"。定式：先把要用的字段拷进局部
+  变量（`Random r = this.random;`），lambda 里只用局部变量，警告消失。
 * **`int` 的十六进制字面量超过 0x7FFFFFFF 要 `unchecked`**：
   `unchecked((int)0x80000000)`；否则溢出编译报错。
 
