@@ -3,6 +3,7 @@
 一个回合制小游戏：点击浅绿色圆点封路，每封一个点，猫沿最短逃生路线走一步。猫到达棋盘边缘就逃脱；切断所有通向边缘的路线即可获胜，即使猫身边仍有空点。
 
 - 9×9 错列圆点棋盘，每点有六个相邻方向。
+- 棋盘铺一张薄荷绿毡布底图（`assets/board.jpg`），圆点改成半透明压在上面——底图是模板自带的美术，缺图时自动藏掉，圆点照旧。
 - 轻松、经典、挑战分别预置 18、12、6 个随机障碍。开局保留猫身边的六个点，并保证存在出口。
 - 悔一步同时撤销封路和猫的移动，胜负结束后也可以悔棋。
 - 点击猫、已封点或结束后的棋盘不会消耗回合。“再来一局”保留当前难度。
@@ -29,6 +30,12 @@ zanc src/TrapCat.html src/{{NAME}}.zan src/TrapCatBoard.zan src/TrapCatSprite.za
 Android 使用竖屏实际客户区，隐藏桌面标题栏；字体跟随设备 DPI，棋盘按屏幕逻辑宽高切换尺寸。`Form.Create` 的 600×760 用于桌面初始尺寸和 Android 竖屏方向，不会把手机表面限制为 600×760。APK 使用工具链自动生成的调试签名。
 
 HTML 是第一个编译输入，兄弟 `.zan` 文件须一起传入。`TrapCat.html` 保留固定文件名，使生成的 `TrapCatHtml` 类不受项目名影响。
+
+**底图怎么接的**（`src/App.zan` 的 `SetupBoardArt`）：`assets/board.jpg` 用
+`Game.Kit.Assets.Find` 定位（以 exe 目录为锚向上找 4 级），找到就写进
+`<img id="BoardBg">` 的 `Src`，找不到就把这个 `img` 藏掉。**引擎的 CSS 背景
+不支持 `url()`**（只有颜色与线性渐变），所以底图只能用 `<img>` 元素叠在
+棋盘底下，不能写 `background-image`。
 
 `src/TrapCatBoard.zan` 只负责规则、BFS 寻路与撤销记录；`src/App.zan` 在生成时改名为项目名，负责事件与状态显示；`src/TrapCat.html` 负责布局和样式；`src/TrapCatSprite.zan` 负责小猫的矢量造型和动画。等长出口采用随机选择，悔棋后重复同一步会保持猫的走法。
 
