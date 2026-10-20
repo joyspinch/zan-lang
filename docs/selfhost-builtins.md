@@ -27,6 +27,13 @@ scripts\selfhost_builtin_sweep.ps1 -Gen1 build\selfhost_diff_gen1.exe
 | `is a built-in type and cannot be used as a value` | 内建**属性**（如 `Console.Title`），自举不降级 |
 | 其它 | 探针本身写错了（不是自举的缺口） |
 
+⚠ **「无诊断」只代表"能编译"，不代表"行为对"**。`Console` 家族就是反例：矩阵里
+`Write` / `WriteLine` / `PrintLine` / `Clear` / `ResetColor` / `ReadLine` 全都
+"无诊断"，可自举当时把每个 `Console.*` 都当成"打印第一个实参"——`Clear()` 打印
+`0`、`ReadLine()` 返回垃圾（取 `.Length` 直接访问冲突崩）、`WriteLine(true)`
+打印 `1`、`WriteLine('x')` 打印 `120`。**行为一律由差分门断言**（同一程序两边
+stdout 逐字相同）。
+
 ## 现状（2026-10-20）
 
 已能降级：
@@ -48,12 +55,28 @@ scripts\selfhost_builtin_sweep.ps1 -Gen1 build\selfhost_diff_gen1.exe
   `String.CompareOrdinal` → `strcmp`、`string.ToBytes()` → `byte[]`、
   `byte[].ToStr(off,len)` → `string`
 
+`Console` 家族是**逐个成员**降级的（照 C 宿主 `irgen_call.c` 的口径）：
+
+| 成员 | 自举的降级 |
+|---|---|
+| `Write` / `WriteLine` / `PrintLine` | 按实参类型分流：string → `%s`；double → 运行时最短往返；bool → `true`/`false`；char → 它的 UTF-8 文本；ulong → `%llu`；其余 → `%lld` |
+| `Clear` | `ESC[2J ESC[H` |
+| `ResetColor` | `ESC[0m` |
+| `ReadLine` | `fgets` + 把精确长度回写字符串头（换行留在值里） |
+| `Read` | `getchar` |
+| `ReadKey` | Windows `_getch`，其它平台 `getchar`（可选的 `intercept` 参数按宿主口径忽略） |
+
 还差：
 
 - `Task`：`Delay`（同步上下文里）、`Yield`、`WhenAll`、`WhenAny`、`IsDone`、
   `Cancel`、`IsCancellationRequested`、`JoinNew` / `JoinBind` / `JoinWait` /
   `JoinCancel`——这些要走协程帧与调度器，见 TASKS.md 的 A385。
 - `Console` 的颜色/标题**属性**：`ForegroundColor` / `BackgroundColor` / `Title`。
+
+> 上表说的是**自举的 IR 后端**（`irgen*.zan`，差分门考的就是它）。**ngen 后端**
+> （`ngen*.zan`，直接发机器码）只降级了 `Console.Write` / `WriteLine` /
+> `PrintLine` / `ReadLine`，其余成员**报诊断拒绝**（fail-closed，不给错答案），
+> 它自己的回归门还没建。
 
 ## 为什么差分门是唯一权威
 

@@ -1028,11 +1028,36 @@ static int lexer_escape_seq(zan_lexer_t *lex, zan_loc_t loc, zan_esc_out_t *out)
     }
 }
 
-static char lexer_escape_char(zan_lexer_t *lex) {
-    zan_esc_out_t out;
-    int n = lexer_escape_seq(lex, lexer_loc(lex), &out);
-    return out.bytes[0];
-    (void)n;
+/* A character literal holds a single Unicode scalar (docs/ABI.md §3.1), so the
+ * escape must yield the code point itself -- not the first byte of its UTF-8
+ * form.  String literals keep using lexer_escape_seq(), which does encode
+ * escapes to UTF-8 bytes. */
+static int64_t lexer_escape_char_cp(zan_lexer_t *lex) {
+    zan_loc_t loc = lexer_loc(lex);
+    char ch = lexer_advance(lex);
+    switch (ch) {
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case '\\': return '\\';
+    case '"': return '"';
+    case '\'': return '\'';
+    case '0': return '\0';
+    case 'x': {
+        int32_t cp = lexer_hex_escape(lex, loc, 'x', 4);
+        if (cp < 0) return 'x';
+        return (int64_t)cp;
+    }
+    case 'u': {
+        int32_t cp = lexer_hex_escape(lex, loc, 'u', 4);
+        if (cp < 0) return 'u';
+        return (int64_t)cp;
+    }
+    default:
+        zan_diag_emit(lex->diag, DIAG_ERROR, loc,
+                      "invalid escape sequence '\\%c'", ch);
+        return (int64_t)(unsigned char)ch;
+    }
 }
 
 typedef struct {
@@ -1121,12 +1146,12 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     zan_loc_t loc = lexer_loc(lex);
     lexer_advance(lex); /* opening ' */
 
-    char ch;
+    int64_t cp;
     if (lexer_peek_ch(lex) == '\\') {
         lexer_advance(lex); /* \ */
-        ch = lexer_escape_char(lex);
+        cp = lexer_escape_char_cp(lex);
     } else {
-        ch = lexer_advance(lex);
+        cp = (int64_t)(unsigned char)lexer_advance(lex);
     }
 
     if (lexer_peek_ch(lex) != '\'') {
@@ -1136,7 +1161,7 @@ static zan_token_t lexer_char(zan_lexer_t *lex) {
     }
 
     zan_token_t tok = lexer_make(lex, TK_CHAR_LIT, loc);
-    tok.int_val = (int64_t)(unsigned char)ch;
+    tok.int_val = cp;
     return tok;
 }
 

@@ -1259,6 +1259,50 @@ static int op_index_param_offset(zan_symbol_t *m) {
     return (m->modifiers & MOD_STATIC) ? 1 : 0;
 }
 
+/* The result type of a member of a built-in type (List<T>, string,
+ * Dictionary, StringBuilder).
+ *
+ * A built-in type has no binder symbol, so the symbol table cannot answer
+ * "what does this member return" -- the built-in table can.  Without it the
+ * type of `list.Contains(x)` was unknown, and the renderer that picks the
+ * text for a bool fell back to the integer path: the same program printed
+ * "true" for `Console.WriteLine(true)` but "1" for
+ * `Console.WriteLine(list.Contains(x))`. */
+static zan_type_t *builtin_member_result_type(zan_irgen_t *g, zan_type_t *rt,
+                                               const char *name, int name_len) {
+    if (!g || !g->binder || !rt || rt->sym || !name || name_len <= 0) return NULL;
+    char tname[64];
+    int n = rt->name.len;
+    if (n <= 0 || n >= (int)sizeof(tname)) return NULL;
+    memcpy(tname, rt->name.str, (size_t)n);
+    tname[n] = 0;
+    const char *res = zan_builtin_member_result(tname, name, name_len);
+    if (!res) return NULL;
+    if (strcmp(res, "string") == 0) return g->binder->type_string;
+    if (strcmp(res, "int") == 0) return g->binder->type_int;
+    if (strcmp(res, "long") == 0) return g->binder->type_long;
+    if (strcmp(res, "double") == 0) return g->binder->type_double;
+    if (strcmp(res, "bool") == 0) return g->binder->type_bool;
+    /* the element type comes from the receiver: List<T>.ToArray -> T[],
+     * Dictionary<K,V>.Keys -> List<K> */
+    if (strcmp(res, "T[]") == 0 && rt->type_arg_count == 1)
+        return zan_binder_make_array_type(g->binder, rt->type_args[0]);
+    if (strcmp(res, "List<K>") == 0 && rt->type_arg_count == 2)
+        return zan_binder_make_list_type(g->binder, rt->type_args[0]);
+    if (strcmp(res, "List<V>") == 0 && rt->type_arg_count == 2)
+        return zan_binder_make_list_type(g->binder, rt->type_args[1]);
+    if (strcmp(res, "List<string>") == 0)
+        return zan_binder_make_list_type(g->binder, g->binder->type_string);
+    return NULL;
+}
+
+/* The static built-in class behind a primitive type name: `string.Format` is
+ * a member of the static String class, not of the instance string type. */
+static const char *builtin_static_class_for(const char *name) {
+    if (strcmp(name, "string") == 0) return "String";
+    return NULL;
+}
+
 static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                                        local_scope_t *locals);
 
@@ -1744,8 +1788,18 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     memcpy(cls, obj->ident.name.str, (size_t)cn);
                     cls[cn] = 0;
                     const zan_builtin_type_t *bt = zan_builtin_find(cls);
+                    const char *bcls = cls;
+                    if (bt && !bt->is_static) {
+                        /* `string.IsNullOrEmpty(x)` is a member of the static
+                         * String class, not of the instance string type */
+                        const char *alias = builtin_static_class_for(cls);
+                        if (alias) {
+                            const zan_builtin_type_t *abt = zan_builtin_find(alias);
+                            if (abt && abt->is_static) { bt = abt; bcls = alias; }
+                        }
+                    }
                     const char *res = bt && bt->is_static
-                        ? zan_builtin_member_result(cls, callee->member.name.str,
+                        ? zan_builtin_member_result(bcls, callee->member.name.str,
                                                     (int)callee->member.name.len)
                         : NULL;
                     if (res) {
@@ -1787,6 +1841,13 @@ static zan_type_t *infer_expr_type_raw(zan_irgen_t *g, zan_ast_node_t *e,
                     if (mt && mt->kind == TYPE_TYPE_PARAM) mt = concretize(g, mt);
                     return mt;
                 }
+            }
+            /* a built-in type (List<T>, string, Dictionary) has no symbol:
+             * its members' result types come from the built-in table */
+            if (rt) {
+                zan_type_t *bt = builtin_member_result_type(g, rt,
+                    callee->member.name.str, (int)callee->member.name.len);
+                if (bt) return bt;
             }
             zan_symbol_t *xm = find_extension_method(g, rt, callee->member.name,
                                                      e->call.args.count,

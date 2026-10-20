@@ -490,3 +490,47 @@ kernel32、shell32、user32、advapi32、version）。
 
 
 
+
+## 30. 内建家族要**逐个成员**降级；"能编译"不等于"行为对"
+
+- 动作：`Console` 家族的每个成员都要按 C 宿主 `irgen_call.c` 的口径**单独**降级，
+  不要留一条"取第一个实参、把它打印出来"的 blanket catch：
+  - `Write` / `WriteLine` / `PrintLine`：按**实参的静态类型**分流——string → `%s`；
+    double → 运行时 `zan_rt_dbl_str` 的最短往返；bool → `true`/`false`；
+    char → 它的 UTF-8 文本；ulong → `%llu`；其余 → `%lld`；
+  - `Clear` → `ESC[2J ESC[H`；`ResetColor` → `ESC[0m`；
+  - `ReadLine` → `fgets` + 把**精确长度**回写托管串的头（换行留在值里，宿主不 trim）；
+  - `Read` → `getchar`；`ReadKey` → Windows `_getch`、其它平台 `getchar`
+    （可选的 `intercept` 参数按宿主口径**忽略**）。
+- 理由（2026-10-20 差分门实测）：自举原来对 `Console.*` 只有一条兜底分支，
+  于是每个成员都被当成"打印第一个实参"：`Clear()` 打印 `0`、`ReadLine()` 打印
+  `0` 并返回垃圾（取 `.Length` 直接访问冲突崩，exit -1073741819）、
+  `WriteLine(true)` 打印 `1`、`WriteLine('x')` 打印 `120`——**一个字诊断都没有**。
+- 连带：能力矩阵里的"ok"只代表**能编译**。Console 家族在矩阵里全是 ok，行为却
+  全错——矩阵是**入口**，差分门才是判据。
+- 边界：`ReadLine` / `Read` / `ReadKey` 要 stdin，**进不了 golden**（差分门不喂
+  stdin）——只能用探针断言，别塞进 conformance 用例。
+
+## 31. C 宿主自己也会不自洽：差分门撞到不一致时，先问"谁对"
+
+- 动作：差分门报出不一致时，**先分清是自举错还是宿主错**——用 C 宿主自己跑
+  探针，看它**自不自洽**：
+  - `char` 字面量：宿主 `lexer.c` 的 `lexer_escape_char` 取 `zan_utf8_encode`
+    结果的**第一个字节**（`'\u4e2d'` 存成 0xE4，不是码点 0x4E2D），而宿主的
+    codegen `emit_char_to_cstr` 按**码点**做完整 UTF-8 编码 → 词法与代码生成
+    两半不自洽；`docs/ABI.md` §3.1 明确 char 是 Unicode scalar。→ 修**宿主**
+    （新增 `lexer_escape_char_cp` 返回码点），自举本来就对。
+  - bool 的渲染：宿主渲染 bool 靠 `expr_is_bool`（**静态类型**），而 irgen 的
+    `infer_expr_type` 对**内建类型的实例调用**（`list.Contains(x)`）和**原始
+    类型名上的静态内建调用**（`string.IsNullOrEmpty(x)`）推不出返回值 → 同一个
+    程序里 `Console.WriteLine(true)` 打印 "true"、
+    `Console.WriteLine(list.Contains(x))` 打印 "1"。→ 修**宿主**的推断：
+    内建类型没有 binder symbol，符号表答不了"这个成员返回什么"，**内建表
+    `builtin_api.c` 才是权威**（`string` 的静态成员在静态类 `String` 下，
+    别名要一并映射）。
+- 理由：差分门的标准是"与 C 宿主一致"，但宿主自己两半不自洽时，**一致地错
+  仍然是错**。先修自相矛盾的那一半，再让两边对上。
+- 连带：改了宿主的**类型推断**后 golden 会变（bool 从 "1" 变 "true"）——这些
+  golden 要**重生成并逐行看**，确认变的是"该变的那几行"。
+- 边界：宿主改的是**核心推断函数**时，影响面比看上去大——至少把整个
+  conformance 集跑一遍，别只看自己碰过的那两个用例。

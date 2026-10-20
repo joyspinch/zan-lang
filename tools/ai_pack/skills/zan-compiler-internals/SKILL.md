@@ -140,6 +140,31 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
 8. **同一块内存有两条释放路径时，先定单一所有者，再谈幂等**：
    - 动作：动手改帧/缓冲区的释放协议前，先把"谁拥有它、什么时候交棒"写在纸上：完成路径与用户路径同时存在时，必须选一个做唯一 owner，另一个改成只观测（等状态、不释放）。把"两边都释放但加了守卫"当解决方案，等于把 double free 换成偶发 UAF。
    - 理由：`Task.Run(lambda)` 的 action 帧此前"完成路径 reap 一次 + 用户侧 reap 一次"，靠时序侥幸没炸；真正的收口是让类型区分两种帧（无结果 action 帧 vs 带结果 keep_result 帧），使误用在编译期被拒。
+9. **集合元素槽位按「字」而非「个」计**：
+   - 动作：`List<T>` 的元素槽步长是 `elem_slot_words(T)` 个 8 字节字（值结构体 >1 字，
+     指针/整型/浮点为 1 字）；任何走槽下标的路径（索引读、Add/Insert/RemoveAt、
+     AddRange、ToArray、Dict.Keys/Values、数组元素赋值）都必须用
+     `slot_word_index(idx, words)` 换算，缓冲区字节数用 `cap * 8 * words`。
+   - 理由：按「每元素 1 字」硬编码的路径在结构体元素上会只搬第一个字，
+     读出来是全零（`List<Vector3>.AddRange` 的元素全 0），且缓冲区会越界写。
+   - 边界：`elem_slot_words` 由结构体的 LLVM 布局算出；布局算不出来时
+     （`llvm_scalar_size` 为 0）必须报错拒绝，而不是悄悄退化成 1 字。
+10. **静态（immortal）对象与堆对象共用头部布局时，哨兵判定必须覆盖每一条 ARC 路径**：
+   - 动作：字符串字面量等编译期常量不是堆对象，它们的引用计数用哨兵值
+     `ZAN_STRING_SENTINEL_RC`（不参与计数）。凡是会读写"对象前 16 字节计数头"
+     （`ZAN_OBJ_RC_OFF = -16`）的 ARC 路径——通用 retain / 通用 release、字符串
+     retain、动态释放——都必须**先判哨兵再动计数**。静态对象在只读段，对它做
+     原子加一/减一就是访问冲突。
+   - 理由：判一半就会崩。字符串 retain 与动态释放都判了哨兵，唯独通用
+     retain/release 漏了；而"字面量存进 `object` 槽"走的正是通用 retain
+     （槽的静态类型是 object 不是 string），于是对只读段做原子加一 → 0xC0000005。
+     实例：三条 conformance 用例（类型三元 / 字符串转 object / 模式变量）
+     同时崩，根因同一。
+   - 排查手法：访问冲突先看**写入目标地址落在哪个映像段**——写 exe 的只读段
+     = 在改静态对象；再看寄存器里的对象指针是不是"目标地址 + 16"（那就是 ARC
+     计数头）。崩溃现场在 `<exe_dir>/zan_crash.log`（含 fault/rip/rax/raw stack），
+     先读它再决定要不要上调试器；最小探针二分（`object o = "字面量"` vs
+     `string s = "字面量"`）通常一步就切到根因。
 
 
 ---

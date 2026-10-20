@@ -585,12 +585,116 @@ partial class Irgen {
         return new ExprVal(s, MkType("string"));
     }
 
+    // A char as text: the C host renders it as its UTF-8 encoding
+    // (emit_char_to_cstr), not as its code point -- 'x' prints "x",
+    // '\u4e2d' prints the three UTF-8 bytes of U+4E2D. The encoding is
+    // emitted inline (the same 1/2/3/4-byte case split the host uses).
+    string CharToStr(string cval) {
+        string cp = NT(); L("  " + cp + " = and i64 " + cval + ", 2097151");
+        // 1 byte: cp < 0x80
+        string lt80 = NT(); L("  " + lt80 + " = icmp ult i64 " + cp + ", 128");
+        // 2 bytes: cp < 0x800
+        string lt800 = NT(); L("  " + lt800 + " = icmp ult i64 " + cp + ", 2048");
+        // 3 bytes: cp < 0x10000
+        string lt10000 = NT(); L("  " + lt10000 + " = icmp ult i64 " + cp + ", 65536");
+        // The payload bits, split the way the UTF-8 encoding splits them:
+        //   low6  = cp & 0x3F          (last byte)
+        //   mid6  = (cp >> 6) & 0x3F   (second-to-last byte)
+        //   c12   = (cp >> 12) & 0x3F  (third byte)
+        string low6 = NT(); L("  " + low6 + " = and i64 " + cp + ", 63");
+        string sh6 = NT(); L("  " + sh6 + " = lshr i64 " + cp + ", 6");
+        string mid6 = NT(); L("  " + mid6 + " = and i64 " + sh6 + ", 63");
+        string sh12 = NT(); L("  " + sh12 + " = lshr i64 " + cp + ", 12");
+        string c12 = NT(); L("  " + c12 + " = and i64 " + sh12 + ", 63");
+        string sh18 = NT(); L("  " + sh18 + " = lshr i64 " + cp + ", 18");
+        // byte 0: the tag plus the leading payload bits
+        //   1 byte: cp
+        //   2 bytes: 0xC0 | (cp >> 6)
+        //   3 bytes: 0xE0 | (cp >> 12)
+        //   4 bytes: 0xF0 | (cp >> 18)
+        // The host ORs the *unmasked* shift into the tag (irgen_generics.c
+        // emit_char_to_cstr): within each length class the shift is narrow
+        // enough that the tag bits never collide.
+        string b0_1 = NT(); L("  " + b0_1 + " = add i64 " + cp + ", 0");
+        string b0_2 = NT(); L("  " + b0_2 + " = or i64 " + sh6 + ", 192");
+        string b0_3 = NT(); L("  " + b0_3 + " = or i64 " + sh12 + ", 224");
+        string b0_4 = NT(); L("  " + b0_4 + " = or i64 " + sh18 + ", 240");
+        // byte 1: 0x80 | payload (absent in the 1-byte form)
+        //   2 bytes: 0x80 | (cp & 0x3F)
+        //   3 bytes: 0x80 | ((cp >> 6) & 0x3F)
+        //   4 bytes: 0x80 | ((cp >> 12) & 0x3F)
+        string b1_2 = NT(); L("  " + b1_2 + " = or i64 " + low6 + ", 128");
+        string b1_3 = NT(); L("  " + b1_3 + " = or i64 " + mid6 + ", 128");
+        string b1_4 = NT(); L("  " + b1_4 + " = or i64 " + c12 + ", 128");
+        // byte 2: 0x80 | payload (absent in the 1- and 2-byte forms)
+        //   3 bytes: 0x80 | (cp & 0x3F)
+        //   4 bytes: 0x80 | ((cp >> 6) & 0x3F)
+        string b2_3 = NT(); L("  " + b2_3 + " = or i64 " + low6 + ", 128");
+        string b2_4 = NT(); L("  " + b2_4 + " = or i64 " + mid6 + ", 128");
+        // byte 3: 0x80 | payload (only in the 4-byte form)
+        string b3_4 = NT(); L("  " + b3_4 + " = or i64 " + low6 + ", 128");
+        // pick the encoding by code point.  The classes are nested, so the
+        // selects have to narrow step by step: a later select must not fall
+        // back to a byte that belongs to a shorter class (that mistake made
+        // the three- and four-byte forms lose their tail).
+        string b0p1 = NT(); L("  " + b0p1 + " = select i1 " + lt80 + ", i64 " + b0_1 + ", i64 " + b0_2);
+        string b0p2 = NT(); L("  " + b0p2 + " = select i1 " + lt800 + ", i64 " + b0p1 + ", i64 " + b0_3);
+        string b0p3 = NT(); L("  " + b0p3 + " = select i1 " + lt10000 + ", i64 " + b0p2 + ", i64 " + b0_4);
+        string b1p1 = NT(); L("  " + b1p1 + " = select i1 " + lt80 + ", i64 0, i64 " + b1_2);
+        string b1p2 = NT(); L("  " + b1p2 + " = select i1 " + lt800 + ", i64 " + b1p1 + ", i64 " + b1_3);
+        string b1p3 = NT(); L("  " + b1p3 + " = select i1 " + lt10000 + ", i64 " + b1p2 + ", i64 " + b1_4);
+        // byte 2 exists from three bytes on
+        string b2p1 = NT(); L("  " + b2p1 + " = select i1 " + lt800 + ", i64 0, i64 " + b2_3);
+        string b2p3 = NT(); L("  " + b2p3 + " = select i1 " + lt10000 + ", i64 " + b2p1 + ", i64 " + b2_4);
+        string b3p3 = NT(); L("  " + b3p3 + " = select i1 " + lt10000 + ", i64 0, i64 " + b3_4);
+        // length: one byte below 0x80, two below 0x800, three below 0x10000,
+        // four otherwise
+        string lenA = NT(); L("  " + lenA + " = select i1 " + lt80 + ", i64 1, i64 2");
+        string lenB = NT(); L("  " + lenB + " = select i1 " + lt800 + ", i64 " + lenA + ", i64 3");
+        string len4 = NT(); L("  " + len4 + " = select i1 " + lt10000 + ", i64 " + lenB + ", i64 4");
+        // the managed string carries the exact length, so the bytes land in
+        // the payload and the NUL terminator follows them
+        string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + len4 + ")");
+        string p0 = NT(); L("  " + p0 + " = getelementptr i8, i8* " + buf + ", i64 0");
+        L("  store i8 " + "0, i8* " + p0);
+        string p1 = NT(); L("  " + p1 + " = getelementptr i8, i8* " + buf + ", i64 1");
+        string p2 = NT(); L("  " + p2 + " = getelementptr i8, i8* " + buf + ", i64 2");
+        string p3 = NT(); L("  " + p3 + " = getelementptr i8, i8* " + buf + ", i64 3");
+        // truncate the stores to the encoded length
+        string h1 = NT(); L("  " + h1 + " = icmp ugt i64 " + len4 + ", 1");
+        string h2 = NT(); L("  " + h2 + " = icmp ugt i64 " + len4 + ", 2");
+        string h3 = NT(); L("  " + h3 + " = icmp ugt i64 " + len4 + ", 3");
+        string t0 = NT(); L("  " + t0 + " = trunc i64 " + b0p3 + " to i8");
+        L("  store i8 " + t0 + ", i8* " + p0);
+        string t1 = NT(); L("  " + t1 + " = trunc i64 " + b1p3 + " to i8");
+        string s1 = NT(); L("  " + s1 + " = select i1 " + h1 + ", i8 " + t1 + ", i8 0");
+        L("  store i8 " + s1 + ", i8* " + p1);
+        string t2 = NT(); L("  " + t2 + " = trunc i64 " + b2p3 + " to i8");
+        string s2 = NT(); L("  " + s2 + " = select i1 " + h2 + ", i8 " + t2 + ", i8 0");
+        L("  store i8 " + s2 + ", i8* " + p2);
+        string t3 = NT(); L("  " + t3 + " = trunc i64 " + b3p3 + " to i8");
+        string s3 = NT(); L("  " + s3 + " = select i1 " + h3 + ", i8 " + t3 + ", i8 0");
+        L("  store i8 " + s3 + ", i8* " + p3);
+        // The host reports length 0 for the NUL character (emit_char_to_cstr
+        // stamps 0 when the code point is 0), so the string header has to
+        // follow -- the bytes are still written, the length is not.
+        string isz = NT(); L("  " + isz + " = icmp eq i64 " + cp + ", 0");
+        string lenRep = NT(); L("  " + lenRep + " = select i1 " + isz + ", i64 0, i64 " + len4);
+        string lp = NT(); L("  " + lp + " = getelementptr i8, i8* " + buf + ", i64 -16");
+        L("  store i64 " + lenRep + ", i64* " + lp);
+        return buf;
+    }
+
     // coerce a value to i8* string form (numbers via snprintf)
     string ToCStr(ExprVal v) {
         if (IsStr(v.ty)) { return v.op; }
         // double -> string (the runtime's shortest round-trip form)
         if (IsDbl(v.ty)) {
             return DblToStr(v.op).op;
+        }
+        // char -> its UTF-8 text (the host's emit_char_to_cstr)
+        if (v.ty != null && v.ty.sval == "char" && v.ty.ival == 0) {
+            return CharToStr(v.op);
         }
         // integer -> string ("%llu" for ulong so the high bit prints unsigned)
         string ifmt = "@.fmt.nn";
@@ -1359,6 +1463,153 @@ partial class Irgen {
         return new ExprVal(r, v.ty);
     }
 
+    // ---- Console.* ----
+    // Every Console member is lowered the way the C host lowers it
+    // (src/compiler/irgen_call.c). The old code had ONE catch-all that
+    // treated every Console member as "print the first argument", so
+    // Console.Clear() printed "0", Console.ReadLine() printed "0" and
+    // returned garbage -- the program got wrong answers without a word.
+    //
+    // Returns null when the member is not a Console builtin (the caller
+    // then reports it).
+    ExprVal GenConsoleCall(string mname, Node e) {
+        int argc = e.kids.Count;
+        // ---- Console.Write / WriteLine / PrintLine ----
+        // The host prints the argument and, for WriteLine/PrintLine, a
+        // newline. The rendering depends on the argument's type:
+        //   string -> the string;  double -> the shortest round-trip form;
+        //   bool -> "true"/"false";  char -> its UTF-8 text;
+        //   ulong -> %llu;  everything else -> %lld.
+        if (mname == "Write" || mname == "WriteLine" || mname == "PrintLine") {
+            bool nl = (mname != "Write");
+            // WriteLine with no argument prints an empty line (the host
+            // calls println with the empty string).
+            if (argc == 0) {
+                if (!nl) { return new ExprVal("0", MkType("void")); }
+                string ep = NT();
+                L("  " + ep + " = call i8* @zstr_new(i64 0)");
+                string gp = NT();
+                L("  " + gp + " = getelementptr inbounds [4 x i8], [4 x i8]* @.fmt.snl, i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + ep + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            if (argc != 1) {
+                diags.Error("Console." + mname + " takes at most one argument", e.line, e.col);
+                return new ExprVal("0", MkType("void"));
+            }
+            ExprVal a = GenExpr(e.kids[0]);
+            // bool -> "true"/"false"
+            if (a.ty != null && a.ty.sval == "bool" && a.ty.ival == 0) {
+                ExprVal ts = GenStr("true");
+                ExprVal fs = GenStr("false");
+                string c = NT(); L("  " + c + " = icmp ne i64 " + a.op + ", 0");
+                string r = NT(); L("  " + r + " = select i1 " + c + ", i8* " + ts.op + ", i8* " + fs.op);
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + r + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // a char is its UTF-8 text, a string is itself, a double is the
+            // shortest round-trip form -- all three print as %s
+            if (IsStr(a.ty) || IsDbl(a.ty) || (a.ty != null && a.ty.sval == "char" && a.ty.ival == 0)) {
+                string sv = a.op;
+                if (IsDbl(a.ty)) { sv = DblToStr(a.op).op; }
+                else if (a.ty.sval == "char") { sv = CharToStr(a.op); }
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + sv + ")");
+                return new ExprVal("0", MkType("void"));
+            }
+            // an integer: %llu for ulong (the high bit is data), %lld else
+            string gp = NT();
+            string fg = "@.fmt.nn"; int fl = 5;
+            if (nl) { fg = "@.fmt.nl"; fl = 6; }
+            if (IsUlong(a.ty)) {
+                fg = "@.fmt.unn"; fl = 5;
+                if (nl) { fg = "@.fmt.unl"; fl = 6; }
+            }
+            L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + a.op + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.Clear() ----
+        // The host emits the ANSI sequence "\033[2J\033[H".
+        if (mname == "Clear" && argc == 0) {
+            string gp = NT();
+            L("  " + gp + " = getelementptr inbounds [8 x i8], [8 x i8]* @.esc.clear, i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.ResetColor() ----
+        // The host emits "\033[0m".
+        if (mname == "ResetColor" && argc == 0) {
+            string gp = NT();
+            L("  " + gp + " = getelementptr inbounds [5 x i8], [5 x i8]* @.esc.reset, i64 0, i64 0");
+            L("  call i32 (i8*, ...) @printf(i8* " + gp + ")");
+            return new ExprVal("0", MkType("void"));
+        }
+        // ---- Console.ReadLine() ----
+        // The host allocates 1024 bytes, NUL-terminates up front and yields
+        // the buffer whatever fgets does (an EOF reads back the empty
+        // string). The trailing newline stays in the value -- the host
+        // does not trim it.
+        if (mname == "ReadLine" && argc == 0) {
+            if (!ExternSeen("fgets")) { externDecls.Add("fgets"); H("declare i8* @fgets(i8*, i32, i8*)"); }
+            string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 1024)");
+            string z = NT(); L("  " + z + " = getelementptr i8, i8* " + buf + ", i64 0");
+            L("  store i8 0, i8* " + z);
+            // stdin: the Windows CRT exposes it through __acrt_iob_func(0),
+            // everywhere else it is the `stdin` global
+            string sp = NT();
+            if (hostWin) {
+                if (!ExternSeen("__acrt_iob_func")) {
+                    externDecls.Add("__acrt_iob_func");
+                    H("declare i8* @__acrt_iob_func(i32)");
+                }
+                L("  " + sp + " = call i8* @__acrt_iob_func(i32 0)");
+            } else {
+                string sg = NT(); L("  " + sg + " = load i8*, i8** @stdin");
+                L("  " + sp + " = bitcast i8* " + sg + " to i8*");
+            }
+            string got = NT();
+            L("  " + got + " = call i8* @fgets(i8* " + buf + ", i32 1024, i8* " + sp + ")");
+            // the exact length of what was read (fgets stops at the NUL)
+            string len = NT(); L("  " + len + " = call i64 @strlen(i8* " + buf + ")");
+            // the value keeps the exact length, so trim the header to it
+            string hdr = NT(); L("  " + hdr + " = getelementptr i8, i8* " + buf + ", i64 -16");
+            L("  store i64 " + len + ", i64* " + hdr);
+            return new ExprVal(buf, MkType("string"));
+        }
+        // ---- Console.Read() ----
+        // The host reads one character with getchar.
+        if (mname == "Read" && argc == 0) {
+            if (!ExternSeen("getchar")) { externDecls.Add("getchar"); H("declare i32 @getchar()"); }
+            string r = NT(); L("  " + r + " = call i32 @getchar()");
+            string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+            return new ExprVal(r64, MkType("int"));
+        }
+        // ---- Console.ReadKey() ----
+        // The host reads one key without echo: _getch on Windows, getchar
+        // elsewhere. The builtin takes an optional bool (intercept) and the
+        // host ignores it.
+        if (mname == "ReadKey" && argc <= 1) {
+            if (hostWin) {
+                if (!ExternSeen("_getch")) { externDecls.Add("_getch"); H("declare i32 @_getch()"); }
+                string r = NT(); L("  " + r + " = call i32 @_getch()");
+                string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+                return new ExprVal(r64, MkType("int"));
+            }
+            if (!ExternSeen("getchar")) { externDecls.Add("getchar"); H("declare i32 @getchar()"); }
+            string r = NT(); L("  " + r + " = call i32 @getchar()");
+            string r64 = NT(); L("  " + r64 + " = sext i32 " + r + " to i64");
+            return new ExprVal(r64, MkType("int"));
+        }
+        return null;
+    }
     ExprVal GenMember(Node e) {
         if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0) {
             Node tc = binder.FindType(e.a.sval);
@@ -3157,42 +3408,17 @@ partial class Irgen {
                 return new ExprVal("0", MkType("void"));
             }
         }
-        // Console.Write / WriteLine
+        // Console.* -- every member is lowered the way the C host lowers it
+        // (src/compiler/irgen_call.c). The old code had ONE catch-all that
+        // treated every Console member as "print the first argument", so
+        // Console.Clear() printed "0", Console.ReadLine() printed "0" and
+        // returned garbage -- the program got wrong answers without a word.
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
-            && callee.a.sval == "Console") {
-            ExprVal arg = new ExprVal("0", MkType("int"));
-            bool has = (e.kids.Count > 0);
-            if (has) { arg = GenExpr(e.kids[0]); }
-            bool nl = (callee.sval == "WriteLine");
-            if (has && IsStr(arg.ty)) {
-                string fg = "@.fmt.sn"; int fl = 3;
-                if (nl) { fg = "@.fmt.snl"; fl = 4; }
-                string gp = NT();
-                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
-                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + arg.op + ")");
-            } else if (has && IsDbl(arg.ty)) {
-                // a double prints in the host's shortest round-trip form
-                ExprVal ds = DblToStr(arg.op);
-                string fg = "@.fmt.sn"; int fl = 3;
-                if (nl) { fg = "@.fmt.snl"; fl = 4; }
-                string gp = NT();
-                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
-                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + ds.op + ")");
-            } else {
-                string fg = "@.fmt.nn"; int fl = 5;
-                if (nl) { fg = "@.fmt.nl"; fl = 6; }
-                if (has && IsUlong(arg.ty)) {
-                    fg = "@.fmt.unn"; fl = 5;
-                    if (nl) { fg = "@.fmt.unl"; fl = 6; }
-                }
-                string gp = NT();
-                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
-                string a0 = "0"; if (has) { a0 = arg.op; }
-                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i64 " + a0 + ")");
-            }
-            return new ExprVal("0", MkType("void"));
+            && callee.a.sval == "Console" && LocalIdx("Console") < 0) {
+            ExprVal cv = GenConsoleCall(callee.sval, e);
+            if (cv != null) { return cv; }
         }
-        // Convert.ToString(x) -> heap string via snprintf; Convert.ToInt32(s) -> atoi
+    // Convert.ToString(x) -> heap string via snprintf; Convert.ToInt32(s) -> atoi
         if (callee.kind == AK.MemberAccess() && callee.a != null && callee.a.kind == AK.Ident()
             && callee.a.sval == "Convert") {
             if (callee.sval == "ToString" && e.kids.Count == 1) {

@@ -592,7 +592,7 @@
 - 方向：用例前置判定剪贴板可用（不可用就跳过并打印 skip 理由），否则在
   CI/agent/无桌面会话的机器上恒红；真要在无头环境测，得走可注入的剪贴板后端。
 
-### [ ] A412 三条 conformance 用例运行期 Access violation（崩溃，不是断言失败）
+### [x] A412 三条 conformance 用例运行期 Access violation（崩溃，不是断言失败）
 
 - 现象：`conformance_ternary_is_type`、`conformance_cast_string_object`、
   `conformance_cs_b05_pattern_var` 三条程序退出码 1，报 `program exited with
@@ -606,3 +606,44 @@
 - 方向：取栈再定位——用 Debug 构建 + 调试器（参考 zanc 间歇性崩溃那次的做法：
   `cdb -hd` 开调试堆），先定位崩在哪个运行时函数，再判断是 ARC 生命周期、
   装箱路径还是类型分派的问题；定位前不要猜。
+
+### [ ] A413 自举：`Console.*` 只有一条 blanket catch——`Clear` 打印 "0"、`ReadLine` 返回垃圾
+
+- 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_console.zan` 等）：
+  - C 宿主 `Console.Clear()` 输出 `ESC[2J ESC[H`、`ResetColor()` 输出 `ESC[0m`；
+    自举两者都打印 `0`。
+  - C 宿主 `Console.WriteLine(true)` → `true`、`WriteLine('x')` → `x`；
+    自举 → `1` / `120`。
+  - C 宿主 `Console.ReadLine()` 返回读到的行（含 `\r\n`）；自举返回垃圾，
+    `line.Length` 直接访问冲突崩（exit -1073741819）。
+- 根因：自举 `irgen_expr.zan` 里 `Console.*` 只有**一条兜底分支**——"取第一个
+  实参，把它打印出来"。于是每个成员都被当成"打印第一个参数"：`Clear()` 打印
+  `0`，`ReadLine()` 打印 `0` 并返回 0。
+- 方向：照 C 宿主 `irgen_call.c` 的口径**逐个成员**降级（按实参静态类型分流
+  `%s` / 最短往返 / `true`-`false` / char 的 UTF-8 / `%llu` / `%lld`；
+  `Clear`、`ResetColor` 发 ANSI 序列；`ReadLine` 用 `fgets` 并回写精确长度；
+  `Read`、`ReadKey` 读一个字符）。
+- ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `GenConsoleCall`（逐成员分流）、
+  `CharToStr`（char → UTF-8 文本），删掉 blanket catch；`irgen.zan` 加两个 ANSI
+  常量。用例 `tests/conformance/console_builtin.zan`（各类型渲染）与
+  `tests/conformance/console_ansi.zan`（ANSI 字节）钉住，都进了差分门。
+
+### [ ] A414 C 宿主自身不自洽：char 字面量只留 UTF-8 首字节，bool 的渲染看"类型推不推得出来"
+
+- 现象 1（char 字面量）：宿主 `lexer.c` 的 `lexer_escape_char` 取
+  `zan_utf8_encode` 结果的**第一个字节**——`'\u4e2d'` 存成 0xE4 而不是码点
+  0x4E2D；可宿主的 codegen `emit_char_to_cstr` 又是按**码点**做完整 UTF-8
+  编码。词法与代码生成两半不自洽（`docs/ABI.md` §3.1 明确 char 是 Unicode
+  scalar）。自举一直是对的。
+- 现象 2（bool 的渲染）：宿主渲染 bool 靠 `expr_is_bool`（**静态类型**），而
+  irgen 的 `infer_expr_type` 对**内建类型的实例调用**（`list.Contains(x)`）和
+  **原始类型名上的静态内建调用**（`string.IsNullOrEmpty(x)`）推不出返回值 →
+  同一个程序里 `Console.WriteLine(true)` 打印 "true"，
+  `Console.WriteLine(list.Contains(x))` 打印 "1"。
+- 方向：修**宿主**——词法层保留码点（新增 `lexer_escape_char_cp`）；类型推断
+  在内建类型上查内建表（`builtin_api.c` 是权威：内建类型没有 binder symbol，
+  符号表答不了"这个成员返回什么"；`string` 的静态成员在静态类 `String` 下，
+  别名要一并映射）。
+- ✅ 已修（2026-10-20）：宿主两处都修好；受影响的 golden 重生成并逐行看过
+  （`lang_fixes`、`list_wide_struct_elements` 的 bool 行从 "1"/"0" 变
+  "true"/"false"）。
