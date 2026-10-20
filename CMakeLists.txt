@@ -2671,6 +2671,26 @@ add_test(NAME selfhost_json_ignore
     -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost.cmake)
 set_tests_properties(selfhost_json_ignore PROPERTIES TIMEOUT 600)
 
+# ---- Self-hosting native backend (ngen) smoke gate ----
+# The ngen path emits machine code directly (arm64 object / wasm). It has no
+# differential gate -- there is no host ngen to compare against -- so this
+# gate asserts the properties that stand on their own: a program the native
+# backend can lower produces a non-empty object, and a program it must
+# refuse (an unknown member, a type error) produces none. The type check
+# runs before the native backend, the way the C host orders it.
+add_test(NAME selfhost_ngen_smoke
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    "-DSELFHOST_SOURCES=${SELFHOST_SOURCES}"
+    -DGEN1=${CMAKE_BINARY_DIR}/selfhost_ngen_gen1${_exe_ext}
+    -DOUTDIR=${CMAKE_BINARY_DIR}/selfhost_ngen
+    -DOK_PROG=${CMAKE_SOURCE_DIR}/tests/selfhost/ngen/ok.zan
+    -DBAD_MEMBER_PROG=${CMAKE_SOURCE_DIR}/tests/selfhost/ngen/bad_member.zan
+    -DBAD_TYPE_PROG=${CMAKE_SOURCE_DIR}/tests/selfhost/ngen/bad_type.zan
+    -P ${CMAKE_SOURCE_DIR}/tests/run_selfhost_ngen.cmake)
+set_tests_properties(selfhost_ngen_smoke PROPERTIES TIMEOUT 600)
+
+
 # ---- Self-hosting fixed point: full gen0->gen1->gen2->gen3 closure, asserting
 #      g2.ll == g3.ll byte-for-byte. Requires clang to link the emitted IR, so
 #      it is only registered when clang is found; the Windows link step needs a

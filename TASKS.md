@@ -1057,3 +1057,24 @@
   原因是**并行的会话在 13:36:57 重建了 `build\zanc.exe`**（对方在改
   `src/compiler/irgen.c`），门禁正好跑到被替换掉的二进制上。单独重跑即绿。
   教训照旧：门禁期间不要有别的构建（AGENTS.md 规则 8）。
+### [x] A425 ngen 路径**不查类型**——用了未定义类型的程序也照发目标码
+
+- 现象：`Undefined x = null;`（不依赖标准库）交给 ngen（`zanc out.obj prog.zan`）
+  → **rc=0，还写出了 66KB 的 .obj**。宿主在编译期就拒（"undefined type
+  'Undefined'"），IR 后端（irgen）也拒（自举的检查器在 IR 路径上跑），只有
+  ngen 路径不查——`main.zan` 的 ngen 分支在创建 Checker **之前**就 return 了。
+- 根因：自举的 ngen 分支跳过了整个检查阶段，而宿主是"先查类型再落后端"。
+- ✅ 已修（2026-10-20）：`main.zan` 的 ngen 分支先跑一遍共享的 Checker
+  （和 IR 路径同一个），有错就报诊断、拒绝、**不写目标码**。现在 ngen 与
+  宿主/IR 路径对同一个程序的判断一致。
+- 顺带补了 ngen 的**最小回归门**（ngen 没有差分门——宿主没有 ngen 后端可比，
+  但缺的是*参照实现*，类型检查不需要参照实现）：`tests/run_selfhost_ngen.cmake`
+  + ctest `selfhost_ngen_smoke`，钉三条：
+  1. 能降级的程序 → 产出非空目标码（带 64 字节下限，空文件不算有产物）；
+  2. 后端不认识的成员 → 拒绝且**不写**目标码（fail closed）；
+  3. 有类型错误的程序 → 拒绝且不写目标码，诊断是 "undefined type"。
+- 验证：新门 0 failures；差分门 39 passed / 0 gaps / 10 rejected / 0 failures；
+  固定点门 g2.ll == g3.ll（18311019 bytes）。
+- 遗留：ngen 目前**编不了依赖标准库的程序**（标准库里的 Vector128 extern
+  返回 ABI 不支持），所以这条门只覆盖不依赖标准库的形状；接口 + async 的
+  组合在 ngen 侧仍只能冒烟（能编出 .obj），没有行为对拍。
