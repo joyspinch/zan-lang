@@ -1,0 +1,121 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test.Mocks;
+
+// 可配置的返回值桩。
+//
+// **它是 Moq 的 `Setup(...).Returns(...)` 的无反射版**：不能按表达式树找
+// 方法，所以"配哪个方法"这件事交给替身自己——替身持有一个 `StubValue<T>`，
+// 在方法体里 `return this.nameStub.Value();`。
+public class StubValue<T> {
+    // 当前值。
+    private T value;
+
+    public StubValue() {
+        // 不显式赋值：泛型字段由运行时零初始化（值类型为 0、引用类型为 null）。
+        // Zan 没有 `default(T)` 语法。
+    }
+
+    public StubValue(T value) {
+        this.value = value;
+    }
+
+    // 当前值。
+    public T Value() { return this.value; }
+
+    // 改值。
+    public void Set(T v) { this.value = v; }
+}
+
+// 序列桩：按顺序返回一组值，用完后重复最后一个。
+//
+// **典型场景**：分页接口第一页返回 3 条、第二页返回 0 条（测"到底了"的
+// 分支）；重试逻辑第一次失败第二次成功。用 `StubValue` 表达不了"第二次
+// 不一样"。
+public class Sequence<T> {
+    // 值序列。
+    private List<T> values;
+    // 当前游标。
+    private int index;
+
+    public Sequence() {
+        this.values = new List<T>();
+        this.index = 0;
+    }
+
+    public Sequence(List<T> values) {
+        this.values = values != null ? values : new List<T>();
+        this.index = 0;
+    }
+
+    // 加一个值（构造后追加）。
+    public Sequence<T> Add(T value) {
+        this.values.Add(value);
+        return this;
+    }
+
+    // 取下一个值。
+    //
+    // 序列用完后**重复最后一个**（不是回到第一个，也不是报错）——
+    // "再来一次还是这个"是多数分页/轮询桩想要的语义；想要严格用完即错
+    // 的语义，自己检查 `Remaining()`。
+    //
+    // 序列**为空**时抛 InvalidOperationException：没有默认值可返回
+    // （Zan 没有 `default(T)`），而且"空序列"一定是配置错误。
+    public T Next() {
+        if (this.values.Count == 0) {
+            throw new InvalidOperationException("Sequence is empty.");
+        }
+        if (this.index >= this.values.Count) {
+            this.index = this.values.Count - 1;
+        }
+        T v = this.values[this.index];
+        this.index = this.index + 1;
+        return v;
+    }
+
+    // 还剩几个没取的值。
+    public int Remaining() {
+        int left = this.values.Count - this.index;
+        return left > 0 ? left : 0;
+    }
+
+    // 游标复位。
+    public void Reset() { this.index = 0; }
+
+    // 序列长度。
+    public int Count() { return this.values.Count; }
+}
+
+// 委托探针：记录回调被调了几次、带着什么参数。
+//
+// **场景**：把一段回调传给被测代码，事后断言"回调确实被调过，且参数是
+// 预期的"。回调本身由调用方给（lambda / 方法），本类只负责记录。
+public class ActionSpy {
+    // 调用日志。
+    private CallLog log;
+
+    public ActionSpy() {
+        this.log = new CallLog();
+    }
+
+    // 调用日志。
+    public CallLog Calls() { return this.log; }
+
+    // 记录一次回调。
+    public void Record(string name) { this.log.Record(name); }
+
+    // 记录一次带参回调（实参需已规范化）。
+    public void Record1(string name, string a1) {
+        List<string> args = new List<string>();
+        args.Add(a1);
+        this.log.Record(name, args);
+    }
+
+    // 某回调被调了几次。
+    public int CallCount(string name) { return this.log.CountOf(name); }
+
+    // 清空。
+    public void Reset() { this.log.Clear(); }
+}

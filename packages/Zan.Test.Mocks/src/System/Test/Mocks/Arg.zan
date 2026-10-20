@@ -1,0 +1,153 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Test.Mocks;
+
+// 参数匹配方式。
+public enum ArgKind {
+    // 任意值都匹配。
+    Any = 0,
+    // 文本相等。
+    Equal = 1,
+    // 文本不等。
+    NotEqual = 2,
+    // 文本包含子串。
+    Contains = 3,
+    // 文本以指定前缀开头。
+    Prefix = 4,
+    // 数值落在区间内。
+    Between = 5,
+}
+
+// 参数匹配器：校验"这次调用的实参"是否符合预期。
+//
+// **为什么要自己写匹配器**：Moq 的 `It.Is<int>(x => x > 3)` 靠表达式树 +
+// 反射求值。Zan 这边没有表达式树，也不想为了测试引入代码生成——
+// 所以匹配建立在**文本**上：`Any` / `Eq` / `NotEq` / `Contains` / `Prefix` /
+// `Between` 六种够覆盖绝大多数断言。
+//
+// **文本化的代价**：double 的相等依赖格式化一致。`Arg.Text(double)` 与
+// 记录实参用的是同一个函数，同一个值必然得到同一串文本，所以
+// `Arg.Eq(0.1)` 与实际传入的 `0.1` 能对上；跨进程/跨平台比较时，
+// 两边都要走 `Arg.Text`。
+public class ArgMatcher {
+    // 匹配方式。
+    public ArgKind kind;
+    // 参与比较的文本。
+    public string text;
+    // 区间下界（Between 用）。
+    public double min;
+    // 区间上界（Between 用）。
+    public double max;
+
+    public ArgMatcher(ArgKind kind, string text) {
+        this.kind = kind;
+        this.text = text != null ? text : "";
+        this.min = 0.0;
+        this.max = 0.0;
+    }
+
+    // 区间匹配器。
+    public static ArgMatcher Between(double min, double max) {
+        ArgMatcher m = new ArgMatcher(ArgKind.Between, "");
+        m.min = min;
+        m.max = max;
+        return m;
+    }
+
+    // 是否匹配实际文本。
+    public bool Matches(string actual) {
+        string a = actual != null ? actual : "";
+        if (this.kind == ArgKind.Any) { return true; }
+        if (this.kind == ArgKind.Equal) { return a == this.text; }
+        if (this.kind == ArgKind.NotEqual) { return a != this.text; }
+        if (this.kind == ArgKind.Contains) { return a.Contains(this.text); }
+        if (this.kind == ArgKind.Prefix) { return a.StartsWith(this.text); }
+        if (this.kind == ArgKind.Between) {
+            double v = Arg.ToDouble(a);
+            if (v != v) { return false; }   // 不是数字
+            return v >= this.min && v <= this.max;
+        }
+        return false;
+    }
+
+    // 可读描述（失败信息用）。
+    public string Describe() {
+        if (this.kind == ArgKind.Any) { return "any"; }
+        if (this.kind == ArgKind.Equal) { return "=" + this.text; }
+        if (this.kind == ArgKind.NotEqual) { return "!=" + this.text; }
+        if (this.kind == ArgKind.Contains) { return "contains(" + this.text + ")"; }
+        if (this.kind == ArgKind.Prefix) { return "startsWith(" + this.text + ")"; }
+        if (this.kind == ArgKind.Between) {
+            return "between(" + Arg.Text(this.min) + "," + Arg.Text(this.max) + ")";
+        }
+        return "?";
+    }
+}
+
+// 参数匹配的工厂 + 文本规范化。
+//
+// **所有实参都要经 `Arg.Text` 规范化后再记录**——替身（fake）不知道实参
+// 的静态类型（没有反射），只能拿到调用方写下的值。用统一的规范化函数
+// 记录，"这次调用传了 3" 与 `Arg.Eq(3)` 才能对上。
+public class Arg {
+    // 整数的规范文本。
+    public static string Text(int v) { return v.ToString(); }
+
+    // 长整数的规范文本。
+    public static string Text(long v) { return v.ToString(); }
+
+    // 双精度的规范文本（用 stdlib 的格式化，保证同平台一致）。
+    public static string Text(double v) { return Encoding.DoubleToString(v); }
+
+    // 布尔的规范文本。
+    public static string Text(bool v) { return v ? "true" : "false"; }
+
+    // 字符串的规范文本（null 归一成空串）。
+    public static string Text(string v) { return v != null ? v : ""; }
+
+    // 文本转数字（非数字返回 NaN，用 `v != v` 判定）。
+    public static double ToDouble(string s) {
+        if (s == null || s.Length == 0) { return 0.0 / 0.0; }
+        return Encoding.ParseDouble(s);
+    }
+
+    // 任意值都匹配。
+    public static ArgMatcher Any() { return new ArgMatcher(ArgKind.Any, ""); }
+
+    // 相等。
+    public static ArgMatcher Eq(int v) { return new ArgMatcher(ArgKind.Equal, Arg.Text(v)); }
+    public static ArgMatcher Eq(long v) { return new ArgMatcher(ArgKind.Equal, Arg.Text(v)); }
+    public static ArgMatcher Eq(double v) { return new ArgMatcher(ArgKind.Equal, Arg.Text(v)); }
+    public static ArgMatcher Eq(bool v) { return new ArgMatcher(ArgKind.Equal, Arg.Text(v)); }
+    public static ArgMatcher Eq(string v) { return new ArgMatcher(ArgKind.Equal, Arg.Text(v)); }
+
+    // 不等。
+    public static ArgMatcher NotEq(string v) { return new ArgMatcher(ArgKind.NotEqual, Arg.Text(v)); }
+
+    // 包含子串。
+    public static ArgMatcher Contains(string needle) {
+        return new ArgMatcher(ArgKind.Contains, Arg.Text(needle));
+    }
+
+    // 以指定前缀开头。
+    public static ArgMatcher Prefix(string p) {
+        return new ArgMatcher(ArgKind.Prefix, Arg.Text(p));
+    }
+
+    // 数值区间（闭区间）。
+    public static ArgMatcher Between(double min, double max) {
+        return ArgMatcher.Between(min, max);
+    }
+
+    // 造 n 个"任意值"匹配器（用于"参数个数是 n、内容不限"）。
+    public static List<ArgMatcher> AnyArgs(int count) {
+        List<ArgMatcher> list = new List<ArgMatcher>();
+        int n = count > 0 ? count : 0;
+        for (int i = 0; i < n; i = i + 1) {
+            list.Add(Arg.Any());
+        }
+        return list;
+    }
+}

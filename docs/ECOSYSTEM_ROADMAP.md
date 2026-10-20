@@ -492,6 +492,47 @@ conformance `netcode_rollback`（校验和确定性与字节敏感性与空输�
 状态字节数必须恒定；回滚窗口 = 环形缓冲容量；延迟补偿只回溯位置，不回溯
 完整世界（技能范围等复杂判定要自行扩展历史）。
 
+### 1.14 接口替身与行为校验：`Zan.Test.Mocks`
+
+新包 `packages/Zan.Test.Mocks`，命名空间 `System.Test.Mocks`。补上 Moq /
+NSubstitute（6,410★）那一档的能力，但走**另一条路**：Moq 靠动态代理凭空
+造接口实现（代码生成 + 表达式树），Zan 没有那套——**替身必须手写**，
+本包提供手写替身缺的那一半：**记录调用与事后校验**。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `Arg.zan` | `ArgMatcher` / `ArgKind` / `Arg` | 实参规范化（int/long/double/bool/string）+ 六种匹配器 |
+| `CallRecord.zan` | `CallRecord` / `Times` | 一次调用记录 + 次数期望（恰好 / 至少 / 至多） |
+| `CallLog.zan` | `CallLog` | 调用日志 + 行为校验（`Verify` / `Never` / `Called`）+ 失败描述 |
+| `MockBase.zan` | `MockBase` | 手写替身基类：`Record0..Record3` / `Calls()` / `ResetCalls` |
+| `Stub.zan` | `StubValue<T>` / `Sequence<T>` / `ActionSpy` | 桩件：固定返回值 / 顺序返回 / 回调探针 |
+| `TaskStub.zan` | `TaskStub` | 异步桩：已完成 / 已失败 / 永不完成的任务 |
+
+**六条硬取舍**：
+
+1. **不生成 mock**：替身手写。代价是每个接口一个替身；收益是没有代码
+   生成、没有代理开销、行为完全可读可断言。
+2. **实参存规范化文本**：替身拿不到实参的静态类型（没有反射），所有实参
+   经 `Arg.Text(...)` 规范化后记录，`Arg.Eq(3)` 才能与实际传入的 3 对上。
+3. **匹配器只有六种**（Any / Eq / NotEq / Contains / Prefix / Between）：
+   Moq 的 `It.Is<int>(x => x > 3)` 靠表达式树求值，这里用区间覆盖最常见
+   的数值范围断言。**实参个数必须相同**才可能匹配。
+4. **断言与本包解耦**：校验返回 `bool`，失败描述由 `Describe()` 给出，
+   用哪个断言库由调用方决定（本包不依赖 `Zan.Test`）。
+5. **记录与断言分开**：替身只记录，不在方法里断言——同一个替身可以先跑
+   一遍，再断言好几条不同的事实。
+6. **序列为空时抛异常**：没有默认值可返回（Zan 没有 `default(T)`），
+   而且"空序列"一定是配置错误。
+
+conformance `test_mocks`（实参规范化含 null 归一、六种匹配器、调用日志的
+记录与计数与查询与清空、行为校验的三种次数模式与带参数匹配与参数个数不匹配、
+`MockBase` 派生替身的记录与计数与重置、桩件的改值与顺序与重复末值与空序列
+抛错与回调探针、异步桩的成功与失败）。
+
+**已知边界**：无运行时生成 mock；不记录属性 setter；无参数化匹配（谓词）；
+double 相等依赖格式化一致；`Sequence<T>` 用完重复末值；`TaskStub.Pending`
+会留下挂起协程。
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -522,7 +563,7 @@ conformance `netcode_rollback`（校验和确定性与字节敏感性与空输�
 | `Zan.Ssh` | SSH.NET | 4,385 | SSH 客户端、SFTP、密钥管理 |
 | `Zan.Barcode` | ZXing.Net | 榜外 | 条码/二维码编解码（补全 Gui 侧扫码） |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | 假数据生成、对象图构造、断言助手 |
-| `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | 接口替身与行为校验（无反射下的替代方案） |
+| `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
 | `Zan.Bench` | BenchmarkDotNet | 11,512 | 基准测试（ARC 无 GC，分配量统计比 .NET 更该做） |
 
 > LiteDB（9,486★）**不做**：嵌入式文档库用现有 ZanDb 覆盖，

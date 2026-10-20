@@ -1,0 +1,319 @@
+using System;
+using System.Collections.Generic;
+using System.Test.Mocks;
+
+// 被测接口：替身要实现的东西。
+public interface IUserRepo {
+    int Save(string name);
+    string FindName(int id);
+    void Flush();
+}
+
+// 被测实体。
+public class UserRecord {
+    public string name;
+    public int id;
+
+    public UserRecord() {
+        this.name = "";
+        this.id = 0;
+    }
+}
+
+// 手写替身：继承 MockBase 拿到记录能力，实现接口拿到被测形状。
+public class FakeUserRepo : MockBase, IUserRepo {
+    private StubValue<int> nextId = new StubValue<int>(1);
+    private Sequence<string> names = new Sequence<string>();
+
+    public FakeUserRepo() {
+        this.names.Add("first");
+        this.names.Add("second");
+    }
+
+    public int Save(string name) {
+        this.Record1("Save", Arg.Text(name));
+        return this.nextId.Value();
+    }
+
+    public string FindName(int id) {
+        this.Record1("Find", Arg.Text(id));
+        return this.names.Next();
+    }
+
+    public void Flush() {
+        this.Record0("Flush");
+    }
+
+    public void SetNextId(int id) { this.nextId.Set(id); }
+}
+
+// 接口替身与行为校验的契约测试。
+//
+// 覆盖的判定点：
+//   - 实参规范化（int/long/double/bool/string，null 归一）；
+//   - 六种匹配器（Any/Eq/NotEq/Contains/Prefix/Between）；
+//   - 调用日志的记录/计数/查询/清空；
+//   - 行为校验：恰好/至少/至多/从未，带参数匹配与不带；
+//   - MockBase：派生替身记录调用、计数、重置；
+//   - 桩件：StubValue 改值、Sequence 顺序与重复末值与复位、ActionSpy；
+//   - 异步桩：Completed 成功、Faulted 抛错。
+//
+// golden 只锁定"全过"那行。
+public class TestMocksTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    /* ---------- 实参规范化 ---------- */
+
+    private static void TestArgText() {
+        Check("arg-text-int", Arg.Text(42) == "42");
+        Check("arg-text-neg", Arg.Text(-7) == "-7");
+        Check("arg-text-long", Arg.Text(9000000000L) == "9000000000");
+        Check("arg-text-double", Arg.Text(1.5) == "1.5");
+        Check("arg-text-bool-true", Arg.Text(true) == "true");
+        Check("arg-text-bool-false", Arg.Text(false) == "false");
+        Check("arg-text-string", Arg.Text("abc") == "abc");
+        // null 字面量在重载调用里解析到引用类型重载（Text(string)）——
+        // 值类型重载接不住 null（编译期就报错），所以这里拿到的是空串。
+        Check("arg-text-null", Arg.Text(null) == "");
+    }
+
+    /* ---------- 匹配器 ---------- */
+
+    private static void TestMatchers() {
+        Check("match-any", Arg.Any().Matches("whatever"));
+        Check("match-any-empty", Arg.Any().Matches(""));
+
+        Check("match-eq-hit", Arg.Eq(3).Matches("3"));
+        Check("match-eq-miss", !Arg.Eq(3).Matches("4"));
+        Check("match-eq-string", Arg.Eq("a").Matches("a"));
+        Check("match-eq-double", Arg.Eq(0.5).Matches("0.5"));
+        Check("match-eq-bool", Arg.Eq(true).Matches("true"));
+
+        Check("match-noteq-hit", Arg.NotEq("x").Matches("y"));
+        Check("match-noteq-miss", !Arg.NotEq("x").Matches("x"));
+
+        Check("match-contains-hit", Arg.Contains("ell").Matches("hello"));
+        Check("match-contains-miss", !Arg.Contains("zzz").Matches("hello"));
+
+        Check("match-prefix-hit", Arg.Prefix("he").Matches("hello"));
+        Check("match-prefix-miss", !Arg.Prefix("lo").Matches("hello"));
+
+        Check("match-between-hit", Arg.Between(1.0, 5.0).Matches("3"));
+        Check("match-between-edge", Arg.Between(1.0, 5.0).Matches("1"));
+        Check("match-between-miss", !Arg.Between(1.0, 5.0).Matches("9"));
+        Check("match-between-nonnumeric", !Arg.Between(1.0, 5.0).Matches("abc"));
+
+        CheckEq("match-any-args", Arg.AnyArgs(3).Count, 3L);
+        Check("match-any-args-all-any", Arg.AnyArgs(3)[0].Matches("x"));
+    }
+
+    /* ---------- 调用日志 ---------- */
+
+    private static void TestCallLog() {
+        CallLog log = new CallLog();
+        List<string> a1 = new List<string>();
+        a1.Add("张三");
+        log.Record("Save", a1);
+        log.Record("Find");
+        List<string> a2 = new List<string>();
+        a2.Add("7");
+        log.Record("Find", a2);
+
+        CheckEq("log-total", log.Total(), 3L);
+        CheckEq("log-count-find", log.CountOf("Find"), 2L);
+        CheckEq("log-count-save", log.CountOf("Save"), 1L);
+        CheckEq("log-count-missing", log.CountOf("Nope"), 0L);
+        CheckEq("log-calls-of", log.CallsOf("Find").Count, 2L);
+        Check("log-last-of", log.LastOf("Find") != null);
+        CallRecord lastFind = log.LastOf("Find");
+        Check("log-last-of-not-null", lastFind != null);
+        if (lastFind != null) {
+            CheckEq("log-last-of-arg-count", lastFind.ArgCount(), 1L);
+            Check("log-last-of-arg-value", lastFind.ArgAt(0) == "7");
+        }
+        Check("log-at-out-of-range", log.At(99) == null);
+        Check("log-describe-not-empty", log.Describe().Length > 0);
+
+        log.Clear();
+        CheckEq("log-clear", log.Total(), 0L);
+        Check("log-clear-describe", log.Describe() == "(no calls)");
+    }
+
+    /* ---------- 行为校验 ---------- */
+
+    private static void TestVerify() {
+        CallLog log = new CallLog();
+        List<string> a1 = new List<string>();
+        a1.Add("张三");
+        log.Record("Save", a1);
+        List<string> a2 = new List<string>();
+        a2.Add("李四");
+        log.Record("Save", a2);
+        log.Record("Flush");
+
+        // 只数次数
+        Check("verify-exactly-once", log.Verify("Flush", Times.Once()));
+        Check("verify-never-true", !log.Verify("Flush", Times.Never()));
+        Check("verify-never-other", log.Verify("Nope", Times.Never()));
+        Check("verify-at-least", log.Verify("Save", Times.AtLeast(2)));
+        Check("verify-at-most", log.Verify("Save", Times.AtMost(3)));
+        Check("verify-exactly-two", log.Verify("Save", Times.Exactly(2)));
+        Check("verify-exactly-wrong", !log.Verify("Save", Times.Exactly(1)));
+
+        // 带参数匹配
+        List<ArgMatcher> zhang = new List<ArgMatcher>();
+        zhang.Add(Arg.Eq("张三"));
+        Check("verify-with-args", log.Verify("Save", zhang, Times.Once()));
+        Check("verify-with-args-miss", !log.Verify("Save", zhang, Times.Exactly(2)));
+
+        List<ArgMatcher> anyName = new List<ArgMatcher>();
+        anyName.Add(Arg.Any());
+        Check("verify-any-args", log.Verify("Save", anyName, Times.Exactly(2)));
+
+        // 实参个数不同 → 不匹配
+        List<ArgMatcher> twoArgs = new List<ArgMatcher>();
+        twoArgs.Add(Arg.Any());
+        twoArgs.Add(Arg.Any());
+        Check("verify-arg-count-mismatch", !log.Verify("Save", twoArgs, Times.AtLeast(1)));
+
+        // 前缀匹配
+        List<ArgMatcher> prefix = new List<ArgMatcher>();
+        prefix.Add(Arg.Prefix("张"));
+        Check("verify-prefix", log.Verify("Save", prefix, Times.Once()));
+
+        Check("verify-called", log.Called("Save"));
+        Check("verify-never-method", log.Never("Nope"));
+    }
+
+    /* ---------- MockBase ---------- */
+
+    private static void TestMockBase() {
+        FakeUserRepo repo = new FakeUserRepo();
+        CheckEq("mock-initial-count", repo.CallCount("Save"), 0L);
+
+        int id = repo.Save("张三");
+        CheckEq("mock-return-value", id, 1L);
+        CheckEq("mock-count", repo.CallCount("Save"), 1L);
+        CheckEq("mock-log-total", repo.Calls().Total(), 1L);
+
+        // 行为校验接在替身上
+        List<ArgMatcher> name = new List<ArgMatcher>();
+        name.Add(Arg.Eq("张三"));
+        Check("mock-verify", repo.Calls().Verify("Save", name, Times.Once()));
+
+        // 改返回值
+        repo.SetNextId(42);
+        CheckEq("mock-stub-value", repo.Save("李四"), 42L);
+
+        // 序列桩
+        Check("mock-sequence-1", repo.FindName(1) == "first");
+        Check("mock-sequence-2", repo.FindName(2) == "second");
+        Check("mock-sequence-repeat-last", repo.FindName(3) == "second");
+
+        // 重置
+        repo.ResetCalls();
+        CheckEq("mock-reset", repo.Calls().Total(), 0L);
+        CheckEq("mock-reset-count", repo.CallCount("Save"), 0L);
+    }
+
+    /* ---------- 桩件 ---------- */
+
+    private static void TestStubs() {
+        StubValue<int> sv = new StubValue<int>(5);
+        CheckEq("stub-value", sv.Value(), 5L);
+        sv.Set(9);
+        CheckEq("stub-value-set", sv.Value(), 9L);
+
+        List<string> vals = new List<string>();
+        vals.Add("a");
+        vals.Add("b");
+        Sequence<string> seq = new Sequence<string>(vals);
+        CheckEq("seq-count", seq.Count(), 2L);
+        CheckEq("seq-remaining", seq.Remaining(), 2L);
+        Check("seq-first", seq.Next() == "a");
+        CheckEq("seq-remaining-after-1", seq.Remaining(), 1L);
+        Check("seq-second", seq.Next() == "b");
+        CheckEq("seq-remaining-after-2", seq.Remaining(), 0L);
+        Check("seq-repeat-last", seq.Next() == "b");
+        seq.Reset();
+        Check("seq-after-reset", seq.Next() == "a");
+
+        Sequence<string> empty = new Sequence<string>();
+        bool emptyThrew = false;
+        try {
+            string nothing = empty.Next();
+        } catch (InvalidOperationException ex) {
+            emptyThrew = true;
+        }
+        Check("seq-empty-throws", emptyThrew);
+
+        // 无参构造的值桩：零初始化
+        StubValue<int> zero = new StubValue<int>();
+        CheckEq("stub-value-default", zero.Value(), 0L);
+
+        ActionSpy spy = new ActionSpy();
+        spy.Record1("onClick", "x");
+        CheckEq("spy-count", spy.CallCount("onClick"), 1L);
+        Check("spy-verify", spy.Calls().Verify("onClick", Times.Once()));
+        spy.Reset();
+        CheckEq("spy-reset", spy.CallCount("onClick"), 0L);
+    }
+
+    /* ---------- 异步桩 ---------- */
+
+    private static async Task<int> TestTaskStub() {
+        int ok = 0;
+
+        int value = await TaskStub.Completed<int>(7);
+        if (value == 7) { ok = ok + 1; }
+
+        bool threw = false;
+        try {
+            int bad = await TaskStub.Faulted<int>("boom");
+        } catch (Exception ex) {
+            threw = true;
+        }
+        if (threw) { ok = ok + 1; }
+
+        return ok;
+    }
+
+    public static void Run() {
+        TestArgText();
+        TestMatchers();
+        TestCallLog();
+        TestVerify();
+        TestMockBase();
+        TestStubs();
+
+        int asyncChecks = await TestTaskStub();
+        CheckEq("task-stub-checks", asyncChecks, 2L);
+
+        if (failures > 0) {
+            Console.WriteLine("TEST MOCKS TESTS FAILED: " + failures.ToString());
+        } else {
+            Console.WriteLine("ALL TEST MOCKS TESTS PASSED");
+        }
+    }
+}
+
+public class TestMocksTestsMain {
+    public static void Main() {
+        TestMocksTests.Run();
+    }
+}

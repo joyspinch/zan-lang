@@ -1,0 +1,134 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Test.Mocks;
+
+// 调用日志：替身记录下来的全部调用 + 行为校验。
+//
+// **它是"行为校验"那一半**：Moq 的 `mock.Verify(x => x.Save(It.IsAny<string>()),
+// Times.Once())` 在没有表达式树的世界里退化成
+// `log.Verify("Save", Arg.AnyArgs(1), Times.Once())`——方法名 + 参数匹配器
+// + 次数期望，三件套。
+//
+// **为什么校验返回 bool 而不是直接抛异常**：断言框架（`System.Test.Assert`）
+// 与本包解耦。本包只回答"满不满足期望"，由调用方决定用哪个断言库、
+// 失败信息怎么写（`Describe()` 给出可读描述）。
+//
+// **匹配语义**：一条调用**满足**匹配器列表，当且仅当实参个数相同且每个
+// 位置都对上。实参个数不同 → 不匹配（不匹配器不"通吃"）。
+//
+// **并发**：非线程安全，替身在测试线程里调用。
+public class CallLog {
+    // 全部调用记录。
+    private List<CallRecord> records;
+    // 调用序号计数。
+    private int sequence;
+
+    public CallLog() {
+        this.records = new List<CallRecord>();
+        this.sequence = 0;
+    }
+
+    // 记录一次调用。
+    public void Record(string method, List<string> args) {
+        this.sequence = this.sequence + 1;
+        this.records.Add(new CallRecord(method, args, this.sequence));
+    }
+
+    // 记录一次无参调用。
+    public void Record(string method) {
+        this.Record(method, new List<string>());
+    }
+
+    // 全部调用次数。
+    public int Total() { return this.records.Count; }
+
+    // 某方法的调用次数。
+    public int CountOf(string method) {
+        int n = 0;
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].method == method) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 第 index 次调用（越界返回 null）。
+    public CallRecord At(int index) {
+        if (index < 0 || index >= this.records.Count) { return null; }
+        return this.records[index];
+    }
+
+    // 某方法的全部调用。
+    public List<CallRecord> CallsOf(string method) {
+        List<CallRecord> list = new List<CallRecord>();
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (this.records[i].method == method) { list.Add(this.records[i]); }
+        }
+        return list;
+    }
+
+    // 某方法的最后一次调用（没有则返回 null）。
+    public CallRecord LastOf(string method) {
+        for (int i = this.records.Count - 1; i >= 0; i = i - 1) {
+            if (this.records[i].method == method) { return this.records[i]; }
+        }
+        return null;
+    }
+
+    // 清空记录。
+    public void Clear() {
+        this.records.Clear();
+        this.sequence = 0;
+    }
+
+    // 校验：某方法被调用了期望的次数（不看参数）。
+    public bool Verify(string method, Times times) {
+        return this.Verify(method, null, times);
+    }
+
+    // 校验：某方法以匹配参数被调用了期望的次数。
+    //
+    // matchers 为 null 表示**不检查参数**（只数次数）。
+    public bool Verify(string method, List<ArgMatcher> matchers, Times times) {
+        if (times == null) { times = Times.AtLeast(1); }
+        int matched = 0;
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            CallRecord rec = this.records[i];
+            if (rec.method != method) { continue; }
+            if (matchers != null && !CallLog.ArgsMatch(rec, matchers)) { continue; }
+            matched = matched + 1;
+        }
+        return times.Accepts(matched);
+    }
+
+    // 某方法一次都没被调用。
+    public bool Never(string method) {
+        return this.CountOf(method) == 0;
+    }
+
+    // 某方法是否至少被调用过（不看参数）。
+    public bool Called(string method) {
+        return this.CountOf(method) > 0;
+    }
+
+    // 匹配器列表是否与这次调用的实参对得上（个数相同且逐个匹配）。
+    public static bool ArgsMatch(CallRecord rec, List<ArgMatcher> matchers) {
+        if (rec == null || matchers == null) { return false; }
+        if (rec.args.Count != matchers.Count) { return false; }
+        for (int i = 0; i < matchers.Count; i = i + 1) {
+            if (!matchers[i].Matches(rec.args[i])) { return false; }
+        }
+        return true;
+    }
+
+    // 可读描述：把全部调用列出来（失败信息用）。
+    public string Describe() {
+        if (this.records.Count == 0) { return "(no calls)"; }
+        string s = "";
+        for (int i = 0; i < this.records.Count; i = i + 1) {
+            if (i > 0) { s = s + ", "; }
+            s = s + this.records[i].Describe();
+        }
+        return s;
+    }
+}
