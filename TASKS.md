@@ -1436,3 +1436,32 @@
 - 影响：没有它，`object` 只能装引用——`Zan.Messaging` 的"统一请求-响应 + 擦除
   结果"做不了，结果类型必须由泛型端点一路保留（`QueryEndpoint<T, TResult>`）。
 - 关联：A449、A434。
+
+### [ ] A472 设计稿根（body）不认 `data-dock`——body 直接子级的停靠全部失效
+
+- 背景（2026-10-21 coreforge 底部建造栏悬在屏幕中间时查实）：CSS
+  `display:block` 在引擎里映射成**块流排版**（`StyleDisplay()==3`，
+  `packages/Zan.Gui/src/Gui/Core/Control.zan` 的 `ArrangeFlow`），而
+  `dock` 是**停靠排版**（`display==0`）的机制，两者是互斥的两条排版路径。
+  设计稿的根是 `Gui.Element`（tag `body`，UA 样式表给了 `body { display:
+  block }`），于是：
+  - body 直接子级的 `data-dock` **全部被忽略**：`dock=5` 的填充层只拿到
+    内容自然高，`dock=2` 的底栏贴在那个小盒子的底——表现就是"工具条跑到
+    屏幕中间"；
+  - 只有 body 这一层是块流：设计稿里的 `<div>`（`Gui.Widget.Panel`，
+    style=3 → CSS 类型选择器 `stack`）走停靠排版，它们的子级 dock 生效。
+- 旁证：`Form.StyleDisplay()` 已被强制成 0，注释写明"确保内部 Dock.Fill
+  占满客户区、Dock.Bottom 稳固贴底，**严禁退化为块流垂直塌陷**"——同一个
+  陷阱在窗口层已修，设计稿根层没修。
+- 波及面（未逐个核实）：`templates/gui/*` 的设计稿都在 body 直接子级上写
+  `data-dock`（ToolStrip=1 / StatusBar=2 / Panel=5），按当前语义它们的
+  StatusBar 同样贴不住窗口底；IDE 的 `src/ide_zan/src/IdeForm.html` 亦然。
+- 不能一刀切改成停靠排版：`tests/gui/genform_contract.html` 这类设计稿的
+  body 里有裸文本与行内元素，需要块流排版（`FlowEntries`）。
+- 可行方向（待定，需评估影响面）：设计稿根按内容自动选排版（body 只有带
+  dock 的元素子项、且无流内文本时走停靠排版）；或给设计稿根一个显式开关
+  （如 `data-root-layout="dock"`）；或让块流排版容器也尊重显式声明了 dock
+  的子项。
+- 已落地的项目侧绕行（不算修复，只是把 coreforge 摆正）：`client/src/
+  main.zan` 把 HUD 根改成 flex 列 + Overlay `flex-grow:1`。
+- 关联：coreforge 外部项目 `D:/project/games/coreforge`（仓库外）。

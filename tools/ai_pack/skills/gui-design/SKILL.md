@@ -1142,6 +1142,18 @@ SetCursorPos/GetCursorPos/GetClientRect 被 OS 按 DPI 虚拟化——拿
   搬 CSS 进 `<style>` 时逐条补单位:`line-height: 72` 是 72 倍行高
   (无单位=倍数),30px 字号配它=3240px 行盒整树顶飞,要 72px 必须
   写 `72px`(详见 references/html-window.md)。
+- **设计稿根（body）是 CSS 块流容器，body 直接子级的 `data-dock` 不生效**：
+  CSS `display:block` 在引擎里映射成块流排版（`StyleDisplay()==3`），子项的
+  dock 被忽略——`dock=5` 的填充层只拿到内容自然高，`dock=2` 的底栏就贴在那个
+  小盒子的底，看着像"跑到屏幕中间去了"（coreforge 底部建造栏悬在屏幕中部）。
+  根要当 HUD 容器用时，改成 flex 列 + 让填充层吃剩余空间：
+  `root.SetProp("style","display:flex;flex-direction:column")` 与填充层
+  `SetProp("style","flex-grow:1")`——**flex 排布只认 CSS 的 `flex-grow`，
+  `Control.Grow()` 那个字段是停靠排版用的，对 flex 无效**。
+  注意层级差异：设计稿里的 `<div>`（`Gui.Widget.Panel`，style=3 → 类型选择器
+  `stack`）走**停靠排版**，它的子级 dock 生效；只有 body 这一层是块流。
+  量坐标别靠截图猜：UiDriver `dump tree`（`ZAN_UI_SCRIPT` 指向脚本**文件**
+  路径、`ZAN_UI_OUT` 指输出目录）直接给出每个控件的 x/y/w/h。
 - **窗口与内容面板贴边纪律与圆角状态契约（Window Margin & Corner Invariant）**：
   ① 桌面窗口根节点（`body` 与 `.designroot`）默认必须 0 外边距与 0 内边距、100% 贴边撑满客户区；留白应由具体业务卡片/内联布局显式决定，根节点绝不强行内缩，禁止机械带出浏览器的 `body { margin: 8px }` 导致主界面悬空漏边；
   ② 通用容器/面板（`panel`）默认必须直角透明无内边距（`border-radius: 0; padding: 0; box-shadow: none`），填满窗口（`Dock.Fill`）时天然贴合无缝咬合；只有明确声明为展示卡片的独立部件（`card` / `panel.card`）才带圆角与投影，禁止普通面板默认带圆角导致贴边时四角切开漏底；
