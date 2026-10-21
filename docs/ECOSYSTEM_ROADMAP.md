@@ -1332,6 +1332,76 @@ JSON 能被自己解析回来）· 基线对比（变快 / 变慢 / 噪声 / 新
 （Zan 是 ARC，**没有 GC**）、不做统计显著性检验、文本报告的浮点格式走
 `Convert.ToString`（机器比对请用 JSON）。
 
+### 1.25 条码与二维码：`Zan.Barcode`
+
+新包 `packages/Zan.Barcode`，命名空间 `System.Barcode`。补 ZXing.Net 那一档的
+**二维码编解码**：编码器从 `Zan.Gui` 迁入（并扩成完整模型 1-40），**新增解码
+器**——能从图片里把码读回来，这是路线图原文「补全 Gui 侧扫码」的缺口。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `BarcodeScanner.zan` | `BarcodeScanner` | 门面：`Scan` / `TryScan`；零配置，给图就行 |
+| `BarcodeResult.zan` | `BarcodeResult` | 结果：文本 + 原始字节 + 版本 + 边长 + 级别 + 掩码 + 模块尺寸 + 四角坐标 |
+| `BarcodeImage.zan` | `BarcodeImage` | 输入：宽高 + 亮度平面；`FromLuminance`（主）/ `FromArgb`（便利） |
+| `BarcodeError.zan` / `BarcodeException.zan` | — | 可区分错误码（无效图 / 没找到 / 码坏了 / 结构不合法 / 模式不支持 / 超长 / 内部）+ 异常 |
+| `QrEncoder.zan` | `QrEncoder` | 编码器：分段（numeric/alnum/byte UTF-8）→ 自动选版本 → 交织 → 八掩码选优 → 矩阵 |
+| `QrDecoder.zan` | `QrDecoder` | 解码器：二值化 → 定位 → 变换 → 采样 → 格式信息 → 去掩码 → 反交织 → RS → 分段 |
+| `QrSpec.zan` | `QrSpec` | ISO 表：每块纠错码字 / 分块数 / 容量 / 对齐位置 + GF(256) + 功能图形地图 + RS 生成多项式 |
+| `QrMatrix.zan` / `QrSegment.zan` / `QrEcl.zan` | — | 模型：模块矩阵（行主序 `bool[]`）/ 编码分段 / 纠错级别 |
+| `QrFormat.zan` | `QrFormat` | 格式信息 BCH(15,5)：编解码 + 从矩阵读出（两份副本取纠错少者） |
+| `QrRsDecoder.zan` | `QrRsDecoder` | RS 解码：扩展欧几里得（Sugiyama）求 Λ/Ω + Chien 定位 + Forney 求幅 |
+| `QrBinarizer.zan` | `QrBinarizer` | Otsu 全局 / 8x8 局部自适应 / 3x3 多数滤波去噪 |
+| `QrFinder.zan` | `QrFinder` / `QrFinderPattern` / `QrScanHit` | 定位图形检测（1:1:3:1:1 扫线 + 竖直交叉验证 + 聚类取中位数）+ 校正图形 5x5 模板匹配 |
+| `QrTransform.zan` | `QrTransform` | 模块坐标 → 图像像素：3 点仿射 / 4 点投影（高斯消元） |
+| `QrBitReader.zan` | `QrBitReader` | 位流读取（分段解析用） |
+| `QrRenderer.zan` | `QrRenderer` | 渲染：模块矩阵 → ARGB 像素（纯算术，不出文件） |
+
+**八条硬取舍**：
+
+1. **编码器只有一份**。实现从 `Zan.Gui` 迁到本包，Gui 侧 `Gui.Widget.QrEncoder`
+   改成薄适配（显式级别映射 + 模块位图直搬），`Gui.Widget.QrMatrix` /
+   `QrEcl` 不动。两份编码器迟早分叉，症状是"同样内容编出不同码"，极难排查。
+2. **定位中心按簇取中位数，不取单次命中**。斜切方块的弦**不关于垂足对称**，
+   3-bar 中点随扫描行线性漂移（速率 tanθ）——15° 时行 39→55 中点从 78.5 漂到
+   74.5，取单次命中会偏半个模块以上，采样全错。命中带关于中心行对称，取
+   中位数正好落在中心（中位数而非平均值：簇里会混进数据区的假命中）。
+3. **聚类键用"横竖配对点"**。左上与左下两个定位图形的 x 完全相同（相隔十几
+   个模块），只按 x 聚类会把它们并成一簇。
+4. **旋转因子显式修正**。图上量到的模块尺寸是"视在"值（斜切时弦长放大
+   1/max(|cosθ|,|sinθ|) 倍），真实边长 s = m·max(|cosθ|,|sinθ|)；θ 由定位三角形
+   的斜边方向给出。不修正则 45° 的码被算成 1.41 倍大，版本直接判错。
+5. **校正图形在符号坐标系里匹配**。轴对齐模板在旋转图上对不上；改用仿射把
+   候选位置投到图上、按模块中心采样，模板跟着码面转。25 格全中才算数。
+6. **RS 解码用扩展欧几里得，不用 BM**。一步同时得 Λ 与 Ω，公式链更短。三个
+   坑写进注释：Ω 用 `u_k(0)` 归一化（不是 `r_k(0)`）、Forney 要乘 X（不是
+   X⁻¹）、特征 2 下负号等于正号。
+7. **预处理是策略不是单一路径**：全局 Otsu → 全局+去噪 → 局部自适应 →
+   局部+去噪。3x3 多数滤波把椒盐噪声的孤立像素抹掉（噪声会把游程劈开，
+   1:1:3:1:1 当场就废），但模块只有 2 像素宽时滤波会抹平整张图，所以是兜底
+   不是默认。
+8. **"没码"与"码坏了"分开报**。`NotFound` 是采集问题（该重扫），
+   `CorrectionFailed` 是图像/码本身的问题（该提示换图）。合成一句话会让
+   调用方没法分支。
+
+conformance `barcode_qr`（42 条断言）：编码指纹（固定输入 → 固定位图）· 往返
+（ASCII / 数字 / URL / UTF-8 中文 / 单字符，文本+版本+边长+级别四项一致）·
+旋转 0/15/45/90/180/270 · 缩放 2..6 像素 · 椒盐噪声 2%/5% · 遮挡一块靠 RS
+还原 · 错误码可区分（损坏→CorrectionFailed / 空白→NotFound / 空图→
+InvalidImage / 超长→TooLong / v40-L Byte 容量边界 2953 卡准）· TryScan 语义。
+编码器与 Gui 原实现逐模块比对过（9 组文本 × 级别，含中文与 URL），搬迁没改
+任何一个模块。
+
+**已知边界**：**不做一维条码**（Code128 / Code39 / EAN 不在范围内）· 不做多码制
+仲裁 · 不做摄像头取流与 UI · 不出 PNG/SVG 文件（只产像素，文件格式归
+`Zan.IO` / GUI 层）· 不支持 Kanji / 结构化追加 / ECI 自定义字符集（解出抛
+`UnsupportedMode`）· 透视矫正依赖校正图形，版本 1 只能退回仿射 · 解码是全图
+扫描，无"大概在哪"的先验 · 一图多码只返回先解成功的那个。
+
+**编译器缺口**：本包把 `QrFinderPattern` / `QrScanHit` 放在**命名空间层**而不是
+`QrFinder` 里——Zan 编译器目前不支持"嵌套类型的数组"（`Outer.Inner[]` 报
+undefined type；命名空间限定的 `System.Text.Encoding[]` 正常）。最小复现与
+根因登记在 `TASKS.md`。
+
 ---
 ---
 
@@ -1361,7 +1431,7 @@ JSON 能被自己解析回来）· 基线对比（变快 / 变慢 / 噪声 / 新
 |---|---|---|---|
 | `Zan.Pdf` | QuestPDF | 14,205 | ✅ 已落地 `packages/Zan.Pdf`（`System.Pdf`：页面 + 线 / 矩形 / 文本 + 标准 14 字体度量 + 表格 + PDF 1.4 写出器（xref / 元数据 / WinAnsi），不嵌字体，见 §1.19） | — |
 | `Zan.Ssh` | SSH.NET | 4,385 | SSH 客户端、SFTP、密钥管理 |
-| `Zan.Barcode` | ZXing.Net | 榜外 | 条码/二维码编解码（补全 Gui 侧扫码） |
+| `Zan.Barcode` | ZXing.Net | 榜外 | ✅ 已落地 `packages/Zan.Barcode`（`System.Barcode`：完整 QR 模型 1-40 编解码器（ISO/IEC 18004：分段 + 自动选版本 + GF(256) RS 交织 + 八掩码罚分）+ 扫描器（二值化 → 定位图形 → 仿射/投影变换 → 采样 → 格式信息 BCH → 去掩码 → 反交织 → RS 纠错 → 分段解析），**任意角度旋转、缩放 2px 起、椒盐噪声 5% 内、遮挡靠纠错还原**；不做一维条码，见 §1.25） | — |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |
 | `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
 | `Zan.Bench` | BenchmarkDotNet | 11,512 | ✅ 已落地 `packages/Zan.Bench`（`System.Bench`：预热 + 重复测量（单调时钟）+ 中位数主导统计 + 泛型参数化用例 + 文本/JSON 报告 + 基线对比（带噪声阈值）；**不提供分配量统计**（根因见 `TASKS.md` A464），见 §1.24） | — |
@@ -1414,7 +1484,7 @@ JSON 能被自己解析回来）· 基线对比（变快 / 变慢 / 噪声 / 新
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
-**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅
+**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

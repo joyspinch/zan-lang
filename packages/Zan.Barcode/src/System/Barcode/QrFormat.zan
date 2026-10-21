@@ -1,0 +1,138 @@
+using System;
+
+namespace System.Barcode;
+
+// 格式信息（ISO/IEC 18004 §8.9）：15 位的 BCH(15,5) 码，携带
+// **纠错级别（2 位）+ 掩码编号（3 位）**，写入后与 0x5412 异或。
+//
+// **为什么格式信息要能纠错**：它只有 15 位，且是整张码里唯一"必须先读对"
+// 的元数据——读错掩码 → 后面全是乱码；读错纠错级别 → 分块结构全错。所以
+// 解码时用**最近码字**（汉明距离 ≤ 3）纠正，而不是"非 0 即错"。
+//
+// 编码侧与解码侧共用这一份：格式信息的两个副本（一份在左上、一份在左下）
+// 可能只被污损了一份，所以解码时两份都读，取能纠回来的那份。
+public class QrFormat {
+
+    // 格式信息里的掩码常量（标准规定）。
+    static int FORMAT_MASK = 0x5412;
+
+    // 纠错级别 -> 格式信息里的 2 位编码。
+    //
+    // **注意与枚举值不一样**：标准规定 L=01 / M=00 / Q=11 / H=10，而
+    // `QrEcl` 的枚举顺序是 L=0 / M=1 / Q=2 / H=3。直接拿枚举值当格式位
+    // 会得到完全错误的码——这正是"看起来能跑、结果全错"的典型坑。
+    public static int EclBits(QrEcl ecl) {
+        if (ecl == QrEcl.L) { return 1; }
+        if (ecl == QrEcl.M) { return 0; }
+        if (ecl == QrEcl.Q) { return 3; }
+        return 2;
+    }
+
+    // 格式信息里的 2 位编码 -> 纠错级别。
+    public static QrEcl EclFromBits(int bits) {
+        if (bits == 1) { return QrEcl.L; }
+        if (bits == 3) { return QrEcl.Q; }
+        if (bits == 2) { return QrEcl.H; }
+        return QrEcl.M;
+    }
+
+    // 编码：纠错级别 + 掩码 -> 15 位格式信息（已异或 0x5412）。
+    public static int EncodeBits(QrEcl ecl, int mask) {
+        int data = (QrFormat.EclBits(ecl) << 3) | (mask & 7);
+        // BCH(15,5) 系统码，生成多项式 0x537
+        int r = data << 10;
+        for (int i = 4; i >= 0; i = i - 1) {
+            if (((r >> (i + 10)) & 1) != 0) { r = r ^ (0x537 << i); }
+        }
+        return ((data << 10) | r) ^ FORMAT_MASK;
+    }
+
+    // 解码的结果：纠错级别 + 掩码 + 纠正了几个比特。
+    public class QrFormatInfo {
+        public QrEcl ecl;
+        public int mask;
+        // 读到的 15 位与最近合法码字的汉明距离（0 = 读到的就是合法码字）。
+        public int errorsCorrected;
+
+        public QrFormatInfo() {
+            this.ecl = QrEcl.M;
+            this.mask = 0;
+            this.errorsCorrected = 0;
+        }
+    }
+
+    // 解码 15 位格式信息：找汉明距离最近的合法码字。
+    // 距离 > 3 返回 null（这 15 位不是格式信息）。
+    //
+    // 合法码字只有 32 个（5 位数据 × 各自的 BCH 校验位），所以直接枚举比对
+    // 就行——不需要查表，也就不会有"表写错了"这类 bug。
+    public static QrFormatInfo DecodeBits(int raw) {
+        int best = -1;
+        int bestDist = 99;
+        for (int data = 0; data < 32; data = data + 1) {
+            int r = data << 10;
+            for (int i = 4; i >= 0; i = i - 1) {
+                if (((r >> (i + 10)) & 1) != 0) { r = r ^ (0x537 << i); }
+            }
+            int code = ((data << 10) | r) ^ FORMAT_MASK;
+            int dist = QrFormat.Hamming15(raw, code);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = data;
+            }
+        }
+        if (best < 0 || bestDist > 3) { return null; }
+        QrFormatInfo info = new QrFormatInfo();
+        info.ecl = QrFormat.EclFromBits((best >> 3) & 3);
+        info.mask = best & 7;
+        info.errorsCorrected = bestDist;
+        return info;
+    }
+
+    // 两个 15 位值的汉明距离。
+    static int Hamming15(int a, int b) {
+        int x = a ^ b;
+        int n = 0;
+        for (int i = 0; i < 15; i = i + 1) {
+            if (((x >> i) & 1) != 0) { n = n + 1; }
+        }
+        return n;
+    }
+
+    // 从矩阵里读格式信息（两份副本）。
+    //
+    // `bits` 长度至少 15，读到的 15 位按下标 0..14 排列（与编码侧写入的
+    // 位序一致）。第一份（左上）：bit i -> (x=8, y=i)，i=0..5；bit 6 ->
+    // (8,7)；bit 7 -> (8,8)；bit 8 -> (7,8)；bit 9..14 -> (x=14-i, y=8)。
+    // 第二份（左下 + 右上）：bit 0..7 -> (x=size-1-i, y=8)；bit 8..14 ->
+    // (x=8, y=size-15+i)。
+    public static QrFormatInfo ReadMatrix(bool[] modules, int size) {
+        int copy1 = 0;
+        for (int i = 0; i <= 5; i = i + 1) {
+            if (modules[i * size + 8]) { copy1 = copy1 | (1 << i); }
+        }
+        if (modules[7 * size + 8]) { copy1 = copy1 | (1 << 6); }
+        if (modules[8 * size + 8]) { copy1 = copy1 | (1 << 7); }
+        if (modules[8 * size + 7]) { copy1 = copy1 | (1 << 8); }
+        for (int i = 9; i < 15; i = i + 1) {
+            if (modules[8 * size + (14 - i)]) { copy1 = copy1 | (1 << i); }
+        }
+
+        int copy2 = 0;
+        for (int i = 0; i < 8; i = i + 1) {
+            if (modules[8 * size + (size - 1 - i)]) { copy2 = copy2 | (1 << i); }
+        }
+        for (int i = 8; i < 15; i = i + 1) {
+            if (modules[(size - 15 + i) * size + 8]) { copy2 = copy2 | (1 << i); }
+        }
+
+        QrFormatInfo a = QrFormat.DecodeBits(copy1);
+        QrFormatInfo b = QrFormat.DecodeBits(copy2);
+        if (a != null && b != null) {
+            // 两份都能纠：取纠正比特少的那个（更可信）。
+            return a.errorsCorrected <= b.errorsCorrected ? a : b;
+        }
+        if (a != null) { return a; }
+        return b;
+    }
+}

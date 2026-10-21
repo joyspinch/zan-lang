@@ -1,0 +1,145 @@
+using System;
+
+namespace System.Barcode;
+
+// 二值化：把灰度图变成"每个像素是深还是浅"。
+//
+// **为什么必须二值化**：二维码的判定是"这个格子是黑还是白"，而照片里的黑
+// 可能是 30 也可能是 90。直接拿固定阈值切，遇到光照不均就整片判错。
+//
+// **两级策略**：
+// 1. **全局 Otsu**：直方图上找"类间方差最大"的阈值。对光照均匀的图（屏幕
+//    截图、扫描件、白底打印）它最稳，而且**没有块边界伪影**。
+// 2. **局部自适应**：按 8x8 块取局部最小/最大值的中间当阈值。应对阴影和
+//    不均匀光照，但块边界会产生伪影。
+//
+// 所以顺序是"先全局，失败再局部"——**先试不会引入新问题的那个**。
+public class QrBinarizer {
+
+    // 局部自适应用的块边长（像素）。
+    static int BLOCK = 8;
+
+    // Otsu 全局阈值。
+    public static int OtsuThreshold(byte[] lum, int width, int height) {
+        int[] hist = new int[256];
+        for (int i = 0; i < 256; i = i + 1) { hist[i] = 0; }
+        int total = width * height;
+        if (total <= 0) { return 128; }
+        for (int i = 0; i < total; i = i + 1) {
+            int v = lum[i] & 255;
+            hist[v] = hist[v] + 1;
+        }
+        long sum = 0;
+        for (int i = 0; i < 256; i = i + 1) {
+            sum = sum + (long)i * hist[i];
+        }
+        long sumB = 0;
+        int wB = 0;
+        double maxVar = -1.0;
+        int threshold = 128;
+        for (int t = 0; t < 256; t = t + 1) {
+            wB = wB + hist[t];
+            if (wB == 0) { continue; }
+            int wF = total - wB;
+            if (wF == 0) { break; }
+            sumB = sumB + (long)t * hist[t];
+            double mB = (double)sumB / (double)wB;
+            double mF = (double)(sum - sumB) / (double)wF;
+            double diff = mB - mF;
+            double variance = (double)wB * (double)wF * diff * diff;
+            if (variance > maxVar) {
+                maxVar = variance;
+                threshold = t;
+            }
+        }
+        return threshold;
+    }
+
+    // 全局阈值二值化：返回 true = 深色。
+    public static bool[] Binarize(byte[] lum, int width, int height, int threshold) {
+        bool[] dark = new bool[width * height];
+        for (int i = 0; i < dark.Length; i = i + 1) {
+            dark[i] = (lum[i] & 255) <= threshold;
+        }
+        return dark;
+    }
+
+    // 局部自适应二值化：8x8 块内取 (min+max)/2 当阈值。
+    //
+    // **块内几乎均匀时退回全局阈值**——纯白/纯黑的块用局部阈值会把整块判成
+    // 深色（阈值 = min = max，`<=` 判定全中），那是块边界伪影的来源。
+    public static bool[] AdaptiveBinarize(byte[] lum, int width, int height,
+                                           int globalThreshold) {
+        bool[] dark = new bool[width * height];
+        int bx = (width + BLOCK - 1) / BLOCK;
+        int by = (height + BLOCK - 1) / BLOCK;
+        for (int bj = 0; bj < by; bj = bj + 1) {
+            for (int bi = 0; bi < bx; bi = bi + 1) {
+                int x0 = bi * BLOCK;
+                int y0 = bj * BLOCK;
+                int x1 = x0 + BLOCK;
+                int y1 = y0 + BLOCK;
+                if (x1 > width) { x1 = width; }
+                if (y1 > height) { y1 = height; }
+                int min = 255;
+                int max = 0;
+                for (int y = y0; y < y1; y = y + 1) {
+                    for (int x = x0; x < x1; x = x + 1) {
+                        int v = lum[y * width + x] & 255;
+                        if (v < min) { min = v; }
+                        if (v > max) { max = v; }
+                    }
+                }
+                int threshold = globalThreshold;
+                if (max - min > 24) {
+                    threshold = (min + max) / 2;
+                }
+                for (int y = y0; y < y1; y = y + 1) {
+                    for (int x = x0; x < x1; x = x + 1) {
+                        dark[y * width + x] = (lum[y * width + x] & 255) <= threshold;
+                    }
+                }
+            }
+        }
+        return dark;
+    }
+
+    // 3x3 多数滤波（去椒盐噪点）。
+    //
+    // **为什么需要**：椒盐噪声是**孤立**的单像素，它会把一条游程从中间劈开，
+    // 1:1:3:1:1 的五段结构当场就废了——定位图形一个都认不出来。多数滤波
+    // 把孤立像素抹掉，模块结构（模块边长 ≥ 3 像素时）原样保留。
+    //
+    // **什么时候用**：只在"原图解不出来"时兜底。模块只有 2 像素宽时滤波会
+    // 把整张图抹平，所以不能无条件用——解码流程把它当成一条策略来试。
+    //
+    // 平票时保留中心像素的取值（不做无依据的翻转）。
+    public static bool[] Denoise(bool[] dark, int width, int height) {
+        bool[] outp = new bool[dark.Length];
+        for (int y = 0; y < height; y = y + 1) {
+            for (int x = 0; x < width; x = x + 1) {
+                int darkCount = 0;
+                int total = 0;
+                for (int dy = -1; dy <= 1; dy = dy + 1) {
+                    int yy = y + dy;
+                    if (yy < 0 || yy >= height) { continue; }
+                    for (int dx = -1; dx <= 1; dx = dx + 1) {
+                        int xx = x + dx;
+                        if (xx < 0 || xx >= width) { continue; }
+                        total = total + 1;
+                        if (dark[yy * width + xx]) { darkCount = darkCount + 1; }
+                    }
+                }
+                bool center = dark[y * width + x];
+                if (darkCount * 2 > total) {
+                    outp[y * width + x] = true;
+                } else if (darkCount * 2 < total) {
+                    outp[y * width + x] = false;
+                } else {
+                    outp[y * width + x] = center;
+                }
+            }
+        }
+        return outp;
+    }
+}

@@ -1,0 +1,253 @@
+using System;
+using System.Barcode;
+
+namespace Conf;
+
+// Zan.Barcode 的 QR 编解码判定器：编码 -> 渲染 -> 解码闭环，外加
+// 旋转 / 缩放 / 噪声 / 遮挡 / 损坏，以及错误码可区分性。
+//
+// 判定依据分三类：
+// 1. **往返**：编出来的码渲染成像素再读回来，文本、版本、级别、边长都要
+//    一致——少任何一样都说明某一层的信息在传递中丢了。
+// 2. **鲁棒**：码歪了、小了、带噪声了、被盖住一块了，都必须读得回来
+//    （盖住一块靠 Reed-Solomon 纠错还原）。
+// 3. **可区分**：没码 / 图坏了 / 码损坏了 / 内容超长，四种失败必须给
+//    不同的错误码，调用方才能区别对待。
+class Program {
+    static int ok = 0;
+    static int bad = 0;
+
+    static void Check(string label, bool cond) {
+        if (cond) {
+            ok = ok + 1;
+            Console.WriteLine("ok   " + label);
+        } else {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    // 绕中心旋转 angle 度（最近邻），画布不变。
+    static int[] Rotate(int[] src, int w, int h, double angle) {
+        double rad = angle * 3.14159265358979 / 180.0;
+        double cs = Math.Cos(rad);
+        double sn = Math.Sin(rad);
+        int[] outp = new int[w * h];
+        for (int i = 0; i < outp.Length; i = i + 1) { outp[i] = 0xFFFFFFFF; }
+        double cx = (w - 1) / 2.0;
+        double cy = (h - 1) / 2.0;
+        for (int y = 0; y < h; y = y + 1) {
+            for (int x = 0; x < w; x = x + 1) {
+                double dx = x - cx;
+                double dy = y - cy;
+                double sx = cs * dx + sn * dy + cx;
+                double sy = -sn * dx + cs * dy + cy;
+                int sxi = (int)(sx + 0.5);
+                int syi = (int)(sy + 0.5);
+                if (sxi < 0 || syi < 0 || sxi >= w || syi >= h) { continue; }
+                outp[y * w + x] = src[syi * w + sxi];
+            }
+        }
+        return outp;
+    }
+
+    // 加椒盐噪声（比例 permille）。
+    static int[] Noise(int[] src, int w, int h, int permille, uint seed) {
+        int[] outp = new int[src.Length];
+        for (int i = 0; i < src.Length; i = i + 1) {
+            seed = seed ^ (seed << 13);
+            seed = seed ^ (seed >> 17);
+            seed = seed ^ (seed << 5);
+            int r = (int)(seed & 1023);
+            if (r < permille) {
+                outp[i] = ((r & 1) == 0) ? 0xFF000000 : 0xFFFFFFFF;
+            } else {
+                outp[i] = src[i];
+            }
+        }
+        return outp;
+    }
+
+    // 深色模块数 + 模块位图校验和（编码器的"指纹"）。
+    static void Fingerprint(string label, QrMatrix mx) {
+        int darkCount = 0;
+        long sum = 0;
+        for (int y = 0; y < mx.size; y = y + 1) {
+            for (int x = 0; x < mx.size; x = x + 1) {
+                if (mx.Get(x, y)) {
+                    darkCount = darkCount + 1;
+                    sum = sum + (long)(y * mx.size + x) * 3 + 1;
+                }
+            }
+        }
+        Console.WriteLine("enc " + label + " v" + mx.version
+            + " size=" + mx.size + " ecl=" + mx.ecl
+            + " dark=" + darkCount + " sum=" + sum);
+    }
+
+    // 往返一次：编码 -> 渲染 -> 解码，逐项核对。
+    static void RoundTrip(string label, string text, QrEcl ecl, int scale) {
+        QrMatrix mx = QrEncoder.Encode(text, ecl);
+        BarcodeImage img = QrRenderer.ToImage(mx, scale, 4);
+        try {
+            BarcodeResult r = BarcodeScanner.Scan(img);
+            Check(label + " text", r.text == text);
+            Check(label + " version", r.version == mx.version);
+            Check(label + " size", r.size == mx.size);
+            Check(label + " ecl", r.ecl == ecl);
+        } catch (BarcodeException e) {
+            Check(label + " decode", false);
+            Console.WriteLine("     " + e.ErrorName() + ": " + e.Message);
+        }
+    }
+
+    static void Main() {
+        // 1) 编码指纹（固定输入 -> 固定位图；编码器一动这里就会变）。
+        QrMatrix m1 = QrEncoder.Encode("HELLO-ZAN-2026", QrEcl.M);
+        Fingerprint("HELLO/M", m1);
+        QrMatrix m2 = QrEncoder.Encode("1234567890", QrEcl.L);
+        Fingerprint("1234567890/L", m2);
+        QrMatrix m3 = QrEncoder.Encode("https://zan-lang.dev/qr", QrEcl.Q);
+        Fingerprint("URL/Q", m3);
+
+        // 2) 往返：文本 / 级别 / 版本各来一遍。
+        RoundTrip("roundtrip-ascii", "HELLO-ZAN-2026", QrEcl.M, 4);
+        RoundTrip("roundtrip-numeric", "1234567890", QrEcl.L, 4);
+        RoundTrip("roundtrip-url", "https://zan-lang.dev/qr", QrEcl.Q, 4);
+        RoundTrip("roundtrip-utf8", "中文测试 Zan 2026", QrEcl.H, 4);
+        RoundTrip("roundtrip-small", "A", QrEcl.M, 4);
+
+        // 3) 旋转：歪的码也必须读得回来。
+        int[] argb = QrRenderer.ToArgb(m1, 8, 4, 0xFF000000, 0xFFFFFFFF);
+        int side = (m1.size + 8) * 8;
+        double[] angles = new double[]{ 0.0, 15.0, 45.0, 90.0, 180.0, 270.0 };
+        for (int i = 0; i < angles.Length; i = i + 1) {
+            int[] rot = Rotate(argb, side, side, angles[i]);
+            BarcodeImage img = BarcodeImage.FromArgb(side, side, rot);
+            string tag = "rot" + Convert.ToString((int)angles[i]);
+            try {
+                BarcodeResult r = BarcodeScanner.Scan(img);
+                Check(tag, r.text == "HELLO-ZAN-2026");
+            } catch (BarcodeException e) {
+                Check(tag, false);
+                Console.WriteLine("     " + e.ErrorName());
+            }
+        }
+
+        // 4) 缩放：模块 2..6 像素都要能读。
+        for (int s = 2; s <= 6; s = s + 1) {
+            BarcodeImage img = QrRenderer.ToImage(m1, s, 4);
+            string tag = "scale" + Convert.ToString(s);
+            try {
+                BarcodeResult r = BarcodeScanner.Scan(img);
+                Check(tag, r.text == "HELLO-ZAN-2026");
+            } catch (BarcodeException e) {
+                Check(tag, false);
+                Console.WriteLine("     " + e.ErrorName());
+            }
+        }
+
+        // 5) 噪声：椒盐噪声会把游程劈开，去噪策略必须兜住。
+        int[] n2 = Noise(argb, side, side, 20, 12345);
+        int[] n5 = Noise(argb, side, side, 50, 999);
+        string[] noiseTag = new string[]{ "noise2", "noise5" };
+        int[] noiseImg = new int[]{ n2.Length, n5.Length };
+        for (int i = 0; i < 2; i = i + 1) {
+            BarcodeImage img = BarcodeImage.FromArgb(side, side,
+                i == 0 ? n2 : n5);
+            try {
+                BarcodeResult r = BarcodeScanner.Scan(img);
+                Check(noiseTag[i], r.text == "HELLO-ZAN-2026");
+            } catch (BarcodeException e) {
+                Check(noiseTag[i], false);
+                Console.WriteLine("     " + e.ErrorName());
+            }
+        }
+
+        // 6) 遮挡：盖住一块靠 Reed-Solomon 纠错还原。
+        int[] occ = new int[argb.Length];
+        for (int i = 0; i < occ.Length; i = i + 1) { occ[i] = argb[i]; }
+        for (int y = side / 3; y < side / 3 + 12; y = y + 1) {
+            for (int x = side / 3; x < side / 3 + 12; x = x + 1) {
+                occ[y * side + x] = 0xFFFFFFFF;
+            }
+        }
+        try {
+            BarcodeResult r = BarcodeScanner.Scan(BarcodeImage.FromArgb(side, side, occ));
+            Check("occluded", r.text == "HELLO-ZAN-2026");
+        } catch (BarcodeException e) {
+            Check("occluded", false);
+            Console.WriteLine("     " + e.ErrorName());
+        }
+
+        // 7) 错误码可区分。
+        // 7a) 数据区大面积损坏：码在，但纠不回来 -> CorrectionFailed
+        //     （不是 NotFound：调用方要知道"这是张坏码"）。
+        QrMatrix broken = QrEncoder.Encode("HELLO-ZAN-2026", QrEcl.M);
+        for (int y = 9; y < broken.size; y = y + 1) {
+            for (int x = 9; x < broken.size; x = x + 1) {
+                broken.modules[y * broken.size + x] = true;
+            }
+        }
+        BarcodeImage brokenImg = QrRenderer.ToImage(broken, 8, 4);
+        Check("corrupt -> CorrectionFailed",
+            QrDecoderError(brokenImg) == "CorrectionFailed");
+
+        // 7b) 空白图 -> NotFound
+        int[] blank = new int[40 * 40];
+        for (int i = 0; i < blank.Length; i = i + 1) { blank[i] = 0xFFFFFFFF; }
+        Check("blank -> NotFound",
+            QrDecoderError(BarcodeImage.FromArgb(40, 40, blank)) == "NotFound");
+
+        // 7c) 空图 -> InvalidImage
+        Check("empty -> InvalidImage",
+            QrDecoderError(BarcodeImage.FromArgb(0, 0, new int[0]))
+                == "InvalidImage");
+
+        // 7d) 内容超长 -> TooLong。
+        //     用**小写字母**（不在字母数字表里，走 Byte 段）打容量边界：
+        //     v40-L 的 Byte 容量正好 2953 字节（ISO 表），2953 装得下、
+        //     2954 装不下。边界要卡准，容量表错了这里就露。
+        StringBuilder fit = new StringBuilder();
+        for (int i = 0; i < 2953; i = i + 1) { fit.Append("a"); }
+        StringBuilder over = new StringBuilder();
+        for (int i = 0; i < 2954; i = i + 1) { over.Append("a"); }
+        bool fits = false;
+        try {
+            QrMatrix mx = QrEncoder.Encode(fit.ToString(), QrEcl.L);
+            fits = mx.version == 40;
+        } catch (BarcodeException e) {
+            fits = false;
+        }
+        Check("capacity 2953 fits v40", fits);
+        bool tooLong = false;
+        try {
+            QrEncoder.Encode(over.ToString(), QrEcl.L);
+        } catch (BarcodeException e) {
+            tooLong = e.error == BarcodeError.TooLong;
+        }
+        Check("too long -> TooLong", tooLong);
+
+        // 8) TryScan：连续扫码时每帧都可能没码，不该抛异常。
+        BarcodeResult[] slot = new BarcodeResult[1];
+        Check("tryscan blank false",
+            !BarcodeScanner.TryScan(BarcodeImage.FromArgb(40, 40, blank), slot));
+        Check("tryscan qr true",
+            BarcodeScanner.TryScan(QrRenderer.ToImage(m1, 4, 4), slot));
+        Check("tryscan slot filled",
+            slot[0] != null && slot[0].text == "HELLO-ZAN-2026");
+
+        Console.WriteLine("summary ok=" + Convert.ToString(ok)
+            + " bad=" + Convert.ToString(bad));
+    }
+
+    // 解码并把错误码名字取出来（成功返回空串）。
+    static string QrDecoderError(BarcodeImage img) {
+        try {
+            BarcodeScanner.Scan(img);
+            return "";
+        } catch (BarcodeException e) {
+            return e.ErrorName();
+        }
+    }
+}

@@ -1,0 +1,186 @@
+using System;
+
+namespace System.Barcode;
+
+// 平面变换：把**模块坐标**映射到**图像像素坐标**。
+//
+// **为什么要一个变换而不是直接算格子位置**：二维码在图里可能是正的、斜的、
+// 缩放过的、拍歪了带透视的。解���要的是"第 (col,row) 个模块在图的哪个
+// 像素"，这正是一个"从码面到图像"的映射。
+//
+// **两种映射**：
+// - **仿射**（3 个点对，6 个未知数）：覆盖平移 + 旋转 + 缩放 + 轻微错切。
+//   三个定位图形中心就够了，**永远可用**。
+// - **投影**（4 个点对，8 个未知数）：再加上透视畸变。第四个点用**右下角
+//   的校正图形**（版本 ≥ 2 才有）；找不到就退回仿射。
+//
+// 投影能纠正"斜拍"，但前提是第四个点找得准——找错了比不做更糟。所以策略
+// 是：**只在明确找到校正图形时才用投影**。
+//
+// 映射公式（齐次坐标除法）：
+//   u = (a·x + b·y + c) / (g·x + h·y + 1)
+//   v = (d·x + e·y + f) / (g·x + h·y + 1)
+public class QrTransform {
+    // 变换系数（见上）。
+    public double a;
+    public double b;
+    public double c;
+    public double d;
+    public double e;
+    public double f;
+    public double g;
+    public double h;
+
+    public QrTransform() {
+        this.a = 1; this.b = 0; this.c = 0;
+        this.d = 0; this.e = 1; this.f = 0;
+        this.g = 0; this.h = 0;
+    }
+
+    // 仿射变换：3 个点对（源坐标 -> 目标坐标）。
+    //
+    // 源点用**模块连续坐标**（第 i 个模块的中心在 i+0.5），所以三个定位
+    // 图形的中心对应 (3.5, 3.5) / (size-3.5, 3.5) / (3.5, size-3.5)。
+    public static QrTransform Affine(
+        double x0, double y0, double u0, double v0,
+        double x1, double y1, double u1, double v1,
+        double x2, double y2, double u2, double v2) {
+        // 6 个未知数 a,b,c,d,e,f -> 6 个方程：
+        //   u = a·x + b·y + c
+        //   v = d·x + e·y + f
+        double[] m = new double[6 * 7];
+        for (int i = 0; i < 6 * 7; i = i + 1) { m[i] = 0; }
+        QrTransform.RowU(m, 0, x0, y0, u0);
+        QrTransform.RowV(m, 1, x0, y0, v0);
+        QrTransform.RowU(m, 2, x1, y1, u1);
+        QrTransform.RowV(m, 3, x1, y1, v1);
+        QrTransform.RowU(m, 4, x2, y2, u2);
+        QrTransform.RowV(m, 5, x2, y2, v2);
+        double[] sol = QrTransform.Solve(m, 6);
+        if (sol == null) { return null; }
+        QrTransform t = new QrTransform();
+        t.a = sol[0]; t.b = sol[1]; t.c = sol[2];
+        t.d = sol[3]; t.e = sol[4]; t.f = sol[5];
+        t.g = 0; t.h = 0;
+        return t;
+    }
+
+    // 投影变换：4 个点对（源坐标 -> 目标坐标）。
+    public static QrTransform Projective(
+        double x0, double y0, double u0, double v0,
+        double x1, double y1, double u1, double v1,
+        double x2, double y2, double u2, double v2,
+        double x3, double y3, double u3, double v3) {
+        // 8 个未知数 a,b,c,d,e,f,g,h -> 8 个方程：
+        //   u·(g·x + h·y + 1) = a·x + b·y + c
+        //   v·(g·x + h·y + 1) = d·x + e·y + f
+        double[] m = new double[8 * 9];
+        for (int i = 0; i < 8 * 9; i = i + 1) { m[i] = 0; }
+        QrTransform.RowP(m, 0, x0, y0, u0, true);
+        QrTransform.RowP(m, 1, x0, y0, v0, false);
+        QrTransform.RowP(m, 2, x1, y1, u1, true);
+        QrTransform.RowP(m, 3, x1, y1, v1, false);
+        QrTransform.RowP(m, 4, x2, y2, u2, true);
+        QrTransform.RowP(m, 5, x2, y2, v2, false);
+        QrTransform.RowP(m, 6, x3, y3, u3, true);
+        QrTransform.RowP(m, 7, x3, y3, v3, false);
+        double[] sol = QrTransform.Solve(m, 8);
+        if (sol == null) { return null; }
+        QrTransform t = new QrTransform();
+        t.a = sol[0]; t.b = sol[1]; t.c = sol[2];
+        t.d = sol[3]; t.e = sol[4]; t.f = sol[5];
+        t.g = sol[6]; t.h = sol[7];
+        return t;
+    }
+
+    // 仿射方程的 u 行：[x, y, 1, 0, 0, 0 | u]
+    static void RowU(double[] m, int row, double x, double y, double rhs) {
+        int rowBase = row * 7;
+        m[rowBase + 0] = x;
+        m[rowBase + 1] = y;
+        m[rowBase + 2] = 1.0;
+        m[rowBase + 6] = rhs;
+    }
+
+    // 仿射方程的 v 行：[0, 0, 0, x, y, 1 | v]
+    static void RowV(double[] m, int row, double x, double y, double rhs) {
+        int rowBase = row * 7;
+        m[rowBase + 3] = x;
+        m[rowBase + 4] = y;
+        m[rowBase + 5] = 1.0;
+        m[rowBase + 6] = rhs;
+    }
+
+    // 投影方程的一行：
+    //   u 方程：[x, y, 1, 0, 0, 0, -u·x, -u·y | u]
+    //   v 方程：[0, 0, 0, x, y, 1, -v·x, -v·y | v]
+    static void RowP(double[] m, int row, double x, double y,
+                     double val, bool forU) {
+        int rowBase = row * 9;
+        if (forU) {
+            m[rowBase + 0] = x;
+            m[rowBase + 1] = y;
+            m[rowBase + 2] = 1.0;
+        } else {
+            m[rowBase + 3] = x;
+            m[rowBase + 4] = y;
+            m[rowBase + 5] = 1.0;
+        }
+        m[rowBase + 6] = -val * x;
+        m[rowBase + 7] = -val * y;
+        m[rowBase + 8] = val;
+    }
+
+    // 高斯消元（部分主元）解 n 元线性方程组。
+    // m 是 n×(n+1) 的行主序矩阵；返回解向量，解不出来返回 null。
+    public static double[] Solve(double[] m, int n) {
+        int width = n + 1;
+        for (int col = 0; col < n; col = col + 1) {
+            // 选主元
+            int piv = col;
+            double best = QrTransform.AbsF(m[col * width + col]);
+            for (int r = col + 1; r < n; r = r + 1) {
+                double v = QrTransform.AbsF(m[r * width + col]);
+                if (v > best) { best = v; piv = r; }
+            }
+            if (best < 1e-9) { return null; }
+            if (piv != col) {
+                for (int c = 0; c < width; c = c + 1) {
+                    double tmp = m[col * width + c];
+                    m[col * width + c] = m[piv * width + c];
+                    m[piv * width + c] = tmp;
+                }
+            }
+            double d = m[col * width + col];
+            for (int c = col; c < width; c = c + 1) {
+                m[col * width + c] = m[col * width + c] / d;
+            }
+            for (int r = 0; r < n; r = r + 1) {
+                if (r == col) { continue; }
+                double f = m[r * width + col];
+                if (f == 0.0) { continue; }
+                for (int c = col; c < width; c = c + 1) {
+                    m[r * width + c] = m[r * width + c] - f * m[col * width + c];
+                }
+            }
+        }
+        double[] sol = new double[n];
+        for (int i = 0; i < n; i = i + 1) { sol[i] = m[i * width + n]; }
+        return sol;
+    }
+
+    // 绝对值。
+    static double AbsF(double v) {
+        if (v < 0.0) { return -v; }
+        return v;
+    }
+
+    // 映射一个点：模块坐标 (x,y) -> 图像像素 (u,v)。
+    // 结果写进 outp[0] / outp[1]（避免每个模块分配一个对象）。
+    public void Map(double x, double y, double[] outp) {
+        double denom = this.g * x + this.h * y + 1.0;
+        if (denom == 0.0) { denom = 1.0; }
+        outp[0] = (this.a * x + this.b * y + this.c) / denom;
+        outp[1] = (this.d * x + this.e * y + this.f) / denom;
+    }
+}

@@ -1,0 +1,281 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Barcode;
+
+// Reed-Solomon 纠错解码（GF(256)，本原多项式 0x11D）。
+//
+// **做什么**：拿到一段"数据码字 + 纠错码字"的码字流，如果它被污损了
+// （污损 = 少数几个码字被改错），把它**修回来**。这是二维码能"一半被挡住
+// 还能读"的原因。
+//
+// **算法：Sugiyama 的扩展欧几里得**（教材上的标准组合）
+// 1. **伴随式**（syndrome）：算出 S_i = r(α^i)。全 0 = 没污损，直接返回。
+// 2. **扩展欧几里得**：对 (x^{nsym}, S(x)) 做带余除法，一路得到一串
+//    (u_k, r_k)。停在第一个 deg(r_k) < nsym/2 的位置，此时
+//    **Λ(x) = u_k / u_k(0)**（错误定位子）、**Ω(x) = r_k / r_k(0)**（错误
+//    求值子）。一步同时拿到两个多项式，比"先 BM 求 Λ、再算 Ω"少一层推导。
+// 3. **Chien 搜索** + **Forney**：Λ 的根给出错在哪些位置（Chien），Forney
+//    公式给出每个位置该改成什么值。
+//
+// **为什么不用 Berlekamp-Massey**：BM 也能求 Λ，但还要另外算 Ω，而且 BM 的
+// 寄存器长度/移位计数 bookkeeping 极易写错（写错了不报错，只是纠不出来）。
+// 扩展欧几里得的每一步都是"带余除法"，语义单一，好推理也好验证。
+//
+// **约定**（与 `QrSpec.RsRemainder` 对齐）：
+// - 码字数组 `block[0..n-1]`，**block[0] 是最高次项**（x^{n-1} 的系数）；
+// - 伴随式 S_i = r(α^i)，i 从 0 开始（生成多项式 g(x) = Π(x - α^i) 的
+//   "b = 0" 形式，QR 就是这一种）；
+// - 出错系数在**升幂**下的次数记作 d（= n-1-j，j 是数组下标），其错误
+//   定位值 X = α^d；Λ(x) = Π(1 + X x)（特征 2，加减同）。
+//
+// **内部多项式一律用升幂表示**（下标 = 次数），这样形式导数、求值、
+// 除法都按"次数"直接写，不用来回换下标。
+public class QrRsDecoder {
+
+    // 纠错一个块。
+    //
+    // `block` 是"数据码字 + 纠错码字"拼起来的完整码字（就地修改）。
+    // 返回 true 表示成功（已就地修正），false 表示**纠正不了**（错误太多
+    // 或数据根本不是合法码字）——调用方此时必须把整张码判为解码失败，
+    // 不能拿半修好的数据继续往下解。
+    public static bool Decode(int[] block, int ecLen) {
+        if (block == null || ecLen <= 0) { return false; }
+        int n = block.Length;
+        if (n <= ecLen) { return false; }
+
+        int[] synd = QrRsDecoder.Syndromes(block, ecLen);
+        bool clean = true;
+        for (int i = 0; i < ecLen; i = i + 1) {
+            if (synd[i] != 0) { clean = false; break; }
+        }
+        if (clean) { return true; }
+
+        // 1) 扩展欧几里得 -> Λ（错误定位子）与 Ω（错误求值子）
+        int[][] eo = QrRsDecoder.ErrorLocatorAndEvaluator(synd, ecLen);
+        if (eo == null) { return false; }
+        int[] lambda = eo[0];
+        int[] omega = eo[1];
+        int nerr = lambda.Length - 1;
+        if (nerr <= 0 || nerr > ecLen / 2) { return false; }
+
+        // 2) Chien 搜索 -> 出错位置（升幂次数 d -> 数组下标 n-1-d）
+        List<int> positions = QrRsDecoder.ErrorPositions(lambda, n, nerr);
+        if (positions == null) { return false; }
+
+        // 3) Forney -> 每个位置的修正值
+        int[] derivative = QrRsDecoder.FormalDerivative(lambda);
+        for (int k = 0; k < positions.Count; k = k + 1) {
+            int j = positions[k];              // 数组下标
+            int d = n - 1 - j;                 // 升幂次数
+            int xLoc = QrSpec.GfAlpha(d);      // 错误定位值 X = α^d
+            int xInv = QrSpec.GfAlpha(-d);     // X^{-1}
+            int num = QrRsDecoder.Eval(omega, xInv);
+            int den = QrRsDecoder.Eval(derivative, xInv);
+            if (den == 0) { return false; }
+            // e = X · Ω(X^{-1}) / Λ'(X^{-1})（特征 2：负号等于正号）
+            int magnitude = QrSpec.GfMul(QrSpec.GfMul(xLoc, num),
+                                         QrSpec.GfInv(den));
+            block[j] = block[j] ^ magnitude;
+        }
+
+        // 复核：修正后伴随式必须全 0，否则说明纠错了不该纠的地方。
+        int[] check = QrRsDecoder.Syndromes(block, ecLen);
+        for (int i = 0; i < ecLen; i = i + 1) {
+            if (check[i] != 0) { return false; }
+        }
+        return true;
+    }
+
+    // 伴随式 S_i = r(α^i)，i = 0..ecLen-1。
+    public static int[] Syndromes(int[] block, int ecLen) {
+        int[] synd = new int[ecLen];
+        for (int i = 0; i < ecLen; i = i + 1) {
+            int x = QrSpec.GfAlpha(i);
+            int s = 0;
+            for (int j = 0; j < block.Length; j = j + 1) {
+                s = QrSpec.GfMul(s, x) ^ block[j];
+            }
+            synd[i] = s;
+        }
+        return synd;
+    }
+
+    // 扩展欧几里得：返回 [Λ, Ω]（都按 u(0) 归一化），失败返回 null。
+    public static int[][] ErrorLocatorAndEvaluator(int[] synd, int ecLen) {
+        // r_prev = x^{ecLen}，r_cur = S(x)；u_prev = 0，u_cur = 1。
+        int[] rPrev = new int[ecLen + 1];
+        for (int i = 0; i < ecLen; i = i + 1) { rPrev[i] = 0; }
+        rPrev[ecLen] = 1;
+        int[] rCur = new int[ecLen];
+        for (int i = 0; i < ecLen; i = i + 1) { rCur[i] = synd[i]; }
+        int[] uPrev = new int[0];
+        int[] uCur = new int[1];
+        uCur[0] = 1;
+
+        int limit = ecLen / 2;
+        while (QrRsDecoder.Deg(rCur) >= limit) {
+            if (QrRsDecoder.Deg(rCur) < 0) { break; }
+            int[][] qr = QrRsDecoder.DivMod(rPrev, rCur);
+            int[] q = qr[0];
+            int[] rem = qr[1];
+            // u_new = u_prev - q · u_cur（特征 2：减 = 加）
+            int[] uNew = QrRsDecoder.Add(uPrev, QrRsDecoder.Mul(q, uCur));
+            rPrev = rCur;
+            rCur = rem;
+            uPrev = uCur;
+            uCur = uNew;
+        }
+        if (QrRsDecoder.Deg(uCur) <= 0) { return null; }
+        // **归一化因子是 u_k(0)，不是 r_k(0)**：扩展欧几里得的恒等式是
+        //   r_k ≡ u_k · S(x)  (mod x^{ecLen})
+        // 而 u_k = Λ·u_k(0)（因 Λ = u_k/u_k(0) 且 Λ(0)=1），代回得
+        //   r_k ≡ Ω·u_k(0)  (mod x^{ecLen})
+        // 所以 Ω = r_k / u_k(0)。用 r_k(0) 归一化会差一个 u_k(0) 因子——
+        // 症状是"位置全对、幅度全错"，纠出来还是坏码。
+        int scale = uCur[0];
+        if (scale == 0) { return null; }
+        int inv = QrSpec.GfInv(scale);
+        if (inv == 0) { return null; }
+        int[] lambda = QrRsDecoder.Normalize(uCur);
+        // omega 用**同一个因子**归一化：omega = r_k / u_k(0)。
+        int[] omega = new int[rCur.Length];
+        for (int i = 0; i < rCur.Length; i = i + 1) {
+            omega[i] = QrSpec.GfMul(rCur[i], inv);
+        }
+        if (lambda == null) { return null; }
+        return new int[][]{ lambda, omega };
+    }
+
+    // 升幂多项式按常数项归一化（除以 p[0]）；常数项为 0 时失败。
+    static int[] Normalize(int[] p) {
+        if (p == null || p.Length == 0) { return null; }
+        if (p[0] == 0) { return null; }
+        int inv = QrSpec.GfInv(p[0]);
+        if (inv == 0) { return null; }
+        int[] outp = new int[p.Length];
+        for (int i = 0; i < p.Length; i = i + 1) {
+            outp[i] = QrSpec.GfMul(p[i], inv);
+        }
+        return outp;
+    }
+
+    // Chien 搜索：找出所有满足 Λ(α^{-d}) = 0 的次数 d，返回对应的**数组
+    // 下标**（n-1-d）。个数与预期不符时返回 null（说明不是合法码字）。
+    public static List<int> ErrorPositions(int[] lambda, int n, int expected) {
+        List<int> outp = new List<int>();
+        for (int d = 0; d < n; d = d + 1) {
+            int p = QrSpec.GfAlpha(-d);
+            if (QrRsDecoder.Eval(lambda, p) == 0) {
+                outp.Add(n - 1 - d);
+            }
+        }
+        if (outp.Count != expected) { return null; }
+        return outp;
+    }
+
+    // 形式导数 Λ'(x)（特征 2：只有奇次项保留，次数降一）。
+    public static int[] FormalDerivative(int[] lambda) {
+        int len = lambda.Length;
+        int[] d = new int[len > 0 ? len - 1 : 0];
+        for (int i = 0; i < d.Length; i = i + 1) { d[i] = 0; }
+        for (int i = 1; i < len; i = i + 1) {
+            if ((i & 1) != 0) { d[i - 1] = lambda[i]; }
+        }
+        return d;
+    }
+
+    // 升幂多项式在点 p 处的值：Σ coeff[i]·p^i。
+    public static int Eval(int[] coeff, int p) {
+        int val = 0;
+        int pw = 1;
+        for (int i = 0; i < coeff.Length; i = i + 1) {
+            if (coeff[i] != 0) { val = val ^ QrSpec.GfMul(coeff[i], pw); }
+            pw = QrSpec.GfMul(pw, p);
+        }
+        return val;
+    }
+
+    // ---- 升幂多项式算术 ---------------------------------------------------
+
+    // 去掉最高次的零系数（返回规范形式；全零返回长度 0 的数组）。
+    static int[] Trim(int[] p) {
+        int len = p.Length;
+        while (len > 0 && p[len - 1] == 0) { len = len - 1; }
+        if (len == p.Length) { return p; }
+        int[] outp = new int[len];
+        for (int i = 0; i < len; i = i + 1) { outp[i] = p[i]; }
+        return outp;
+    }
+
+    // 多项式的次数（长度 0 表示零多项式，次数 -1）。
+    static int Deg(int[] p) {
+        if (p == null) { return -1; }
+        return p.Length - 1;
+    }
+
+    // 多项式加（异或）。
+    static int[] Add(int[] a, int[] b) {
+        int la = a.Length;
+        int lb = b.Length;
+        int n = la > lb ? la : lb;
+        int[] outp = new int[n];
+        for (int i = 0; i < n; i = i + 1) { outp[i] = 0; }
+        for (int i = 0; i < la; i = i + 1) { outp[i] = outp[i] ^ a[i]; }
+        for (int i = 0; i < lb; i = i + 1) { outp[i] = outp[i] ^ b[i]; }
+        return QrRsDecoder.Trim(outp);
+    }
+
+    // 多项式乘。
+    static int[] Mul(int[] a, int[] b) {
+        if (a.Length == 0 || b.Length == 0) { return new int[0]; }
+        int[] outp = new int[a.Length + b.Length - 1];
+        for (int i = 0; i < outp.Length; i = i + 1) { outp[i] = 0; }
+        for (int i = 0; i < a.Length; i = i + 1) {
+            if (a[i] == 0) { continue; }
+            for (int j = 0; j < b.Length; j = j + 1) {
+                if (b[j] == 0) { continue; }
+                outp[i + j] = outp[i + j] ^ QrSpec.GfMul(a[i], b[j]);
+            }
+        }
+        return QrRsDecoder.Trim(outp);
+    }
+
+    // 带余除法：返回 [商, 余]（升幂）。除数为零时返回 [0, a]。
+    static int[][] DivMod(int[] a, int[] b) {
+        if (b.Length == 0 || QrRsDecoder.Deg(b) < 0) {
+            return new int[][]{ new int[0], QrRsDecoder.Trim(a) };
+        }
+        int db = QrRsDecoder.Deg(b);
+        int da = EffectiveDeg(a);
+        int[] rem = QrRsDecoder.Trim(a);
+        int qLen = da - db + 1;
+        if (qLen < 1) { qLen = 1; }
+        int[] quo = new int[qLen];
+        for (int i = 0; i < qLen; i = i + 1) { quo[i] = 0; }
+        int invLead = QrSpec.GfInv(b[db]);
+        if (invLead == 0) {
+            return new int[][]{ new int[0], QrRsDecoder.Trim(a) };
+        }
+        while (true) {
+            int dr = EffectiveDeg(rem);
+            if (dr < db) { break; }
+            int scale = QrSpec.GfMul(rem[dr], invLead);
+            int shift = dr - db;
+            if (shift < qLen) { quo[shift] = quo[shift] ^ scale; }
+            for (int i = 0; i <= db; i = i + 1) {
+                if (b[i] == 0) { continue; }
+                rem[i + shift] = rem[i + shift] ^ QrSpec.GfMul(scale, b[i]);
+            }
+            rem = QrRsDecoder.Trim(rem);
+        }
+        return new int[][]{ QrRsDecoder.Trim(quo), rem };
+    }
+
+    // 规范形式的次数（不改动入参）。
+    static int EffectiveDeg(int[] p) {
+        int len = p.Length;
+        while (len > 0 && p[len - 1] == 0) { len = len - 1; }
+        return len - 1;
+    }
+}

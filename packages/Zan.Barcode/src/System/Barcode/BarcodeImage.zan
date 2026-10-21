@@ -1,0 +1,69 @@
+using System;
+
+namespace System.Barcode;
+
+// 扫码的输入图像：宽高 + 一张**亮度平面**（每像素 1 字节，0 = 最黑，255 = 最白）。
+//
+// **为什么不直接吃 ARGB**：解码真正需要的是亮度，彩色信息只会引入噪声
+// （二维码通常是黑白，但拍歪了会有色偏和阴影）。上层（图像库 / 相机回调）
+// 负责把各自的像素格式转成亮度平面，本包只认一种输入——**接口越窄，越不会
+// 出现"某个调用方传了另一种格式"的错**。
+//
+// **转换在调用方做还是在本包做**：本包提供 `FromArgb`（每像素一个
+// 0xAARRGGBB 整数）作为便利入口，但主入口是 `FromLuminance`——已经有亮度
+// 平面的人（比如自己做过二值化的流水线）不必再转一次。
+public class BarcodeImage {
+    // 宽（像素）。
+    public int width;
+    // 高（像素）。
+    public int height;
+    // 亮度平面，长度 = width * height，行主序。
+    public byte[] luminance;
+
+    public BarcodeImage() {
+        this.width = 0;
+        this.height = 0;
+        this.luminance = new byte[0];
+    }
+
+    // 由亮度平面构造。
+    public static BarcodeImage FromLuminance(int width, int height, byte[] luminance) {
+        BarcodeImage img = new BarcodeImage();
+        img.width = width;
+        img.height = height;
+        img.luminance = luminance != null ? luminance : new byte[0];
+        return img;
+    }
+
+    // 由 ARGB32 像素数组构造（每像素一个 0xAARRGGBB 整数，行主序）。
+    //
+    // 亮度用 ITU-R BT.601 的整数近似：L = (77·R + 150·G + 29·B) >> 8。
+    // **alpha 被丢弃**——透明像素的 RGB 值在很多实现里是 0，混进来会把
+    // 透明区当纯黑；这里按"透明即白"处理（半透明按比例混白），避免透明
+    // 区域被误判成码。
+    public static BarcodeImage FromArgb(int width, int height, int[] argb) {
+        byte[] lum = new byte[width * height];
+        for (int i = 0; i < lum.Length; i = i + 1) {
+            int px = argb != null && i < argb.Length ? argb[i] : 0xFFFFFFFF;
+            int a = (px >> 24) & 255;
+            int r = (px >> 16) & 255;
+            int g = (px >> 8) & 255;
+            int b = px & 255;
+            if (a < 255) {
+                // 透明像素按白底合成
+                r = (r * a + 255 * (255 - a)) / 255;
+                g = (g * a + 255 * (255 - a)) / 255;
+                b = (b * a + 255 * (255 - a)) / 255;
+            }
+            lum[i] = (byte)((77 * r + 150 * g + 29 * b) >> 8);
+        }
+        return BarcodeImage.FromLuminance(width, height, lum);
+    }
+
+    // 校验图像是否可用（尺寸与缓冲区长度自洽）。
+    public bool IsValid() {
+        if (this.width <= 0 || this.height <= 0) { return false; }
+        if (this.luminance == null) { return false; }
+        return this.luminance.Length >= this.width * this.height;
+    }
+}

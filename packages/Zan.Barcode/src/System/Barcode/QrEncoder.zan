@@ -1,0 +1,598 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Barcode;
+
+// 纯 Zan 的 QR Code（模型 1-40）编码器，ISO/IEC 18004：
+// - 输入按 Unicode 码点分成 Numeric / Alphanumeric / Byte(UTF-8) 游程
+// 混合编码（中文等多字节字符原样按 UTF-8 字节进 Byte 段，与系统
+// 码页无关）；短游程（<=8 字符）折回 Byte，省模式切换开销。
+// - 自动选最小版本；L/M/Q/H 四级纠错（GF(256) Reed-Solomon，分块交织）。
+// - 八个掩码全试、按标准罚分四条选优；格式信息 BCH(15,5)、
+// v>=7 版本信息 BCH(18,6)。
+// - 超容量抛 `BarcodeException`（错误码 `BarcodeError.TooLong`）。
+//
+// `Encode(text, ecl)` 返回 `QrMatrix`（不含静区）。渲染/导出由调用方做
+// （`QrMatrix` 只是模块位图，缩放、留白、出 PNG/SVG 都不属于编码）。
+public class QrEncoder {
+
+    // 模式指示符
+    public static int MODE_NUMERIC = 1;
+    public static int MODE_ALNUM = 2;
+    public static int MODE_BYTE = 4;
+
+    static string ALNUM_CHARS =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+
+    // ---- 公开入口 -----------------------------------------------------------
+
+    // 按级别编码文本，返回不含静区的模块矩阵。
+    public static QrMatrix Encode(string text, QrEcl ecl) {
+        List<QrSegment> segs = QrEncoder.MakeQrSegments(text);
+        int ver = QrEncoder.PickVersion(segs, ecl);
+        if (ver < 0) {
+            throw new BarcodeException(BarcodeError.TooLong,
+                "content too long for QR version 40");
+        }
+        int totalCw = QrSpec.TotalCodewords(ver);
+        int[] cw = new int[totalCw];
+        for (int i = 0; i < totalCw; i = i + 1) { cw[i] = 0; }
+        int nDataCw = QrEncoder.WriteQrSegments(segs, ver, ecl, cw);
+        return QrEncoder.BuildMatrix(ver, ecl, cw, nDataCw);
+    }
+
+    // 级别名 -> 枚举（大小写均可）；未知返回 M。
+    public static QrEcl ParseEcl(string s) {
+        if (s == null || s.Length != 1) { return QrEcl.M; }
+        int b = s[0] & 255;
+        if (b == 76 || b == 108) { return QrEcl.L; }  // L/l
+        if (b == 81 || b == 113) { return QrEcl.Q; }  // Q/q
+        if (b == 72 || b == 104) { return QrEcl.H; }  // H/h
+        return QrEcl.M;
+    }
+
+    // ---- 文本 -> 分段 -----------------------------------------------------
+
+    // 字节是否为 ASCII 数字 0-9。
+    static bool IsNumeric(int b) { return b >= 48 && b <= 57; }
+
+    // ASCII 字节在字母数字表中的值（0-44），不在表内时 -1。
+    static int AlnumValueByte(int c) {
+        for (int i = 0; i < 45; i = i + 1) {
+            if (ALNUM_CHARS[i] == c) { return i; }
+        }
+        return -1;
+    }
+
+    // 以 lead 为首字节的 UTF-8 码点字节长度（1-4）。
+    static int SeqByteLen(int lead) {
+        if (lead < 128) { return 1; }
+        if (lead < 224) { return 2; }
+        if (lead < 240) { return 3; }
+        return 4;
+    }
+
+    // 按码点游程切段：数字 / 字母数字 / 字节（UTF-8 原样），再把短的非
+    // Byte 游程折回 Byte（模式切换头 4+cc 位往往比直接写进 UTF-8 更贵）。
+    static List<QrSegment> MakeQrSegments(string text) {
+        List<QrSegment> outp = new List<QrSegment>();
+        if (text == null || text.Length == 0) {
+            return outp;
+        }
+        List<QrSegment> raw = new List<QrSegment>();
+        int len = text.Length;
+        int i = 0;
+        while (i < len) {
+            int runStart = i;
+            int mode = QrEncoder.ModeOfByte(text[i] & 255, text, i);
+            i = i + QrEncoder.SeqByteLen(text[i] & 255);
+            while (i < len) {
+                int m2 = QrEncoder.ModeOfByte(text[i] & 255, text, i);
+                if (m2 != mode) { break; }
+                i = i + QrEncoder.SeqByteLen(text[i] & 255);
+            }
+            string run = text.Substring(runStart, i - runStart);
+            QrSegment s = new QrSegment();
+            s.bits = new List<int>();
+            s.srcPos = runStart;
+            if (mode == MODE_NUMERIC) {
+                s.mode = MODE_NUMERIC;
+                s.chars = run.Length;
+                int j = 0;
+                int n = run.Length;
+                while (j < n) {
+                    int take = n - j;
+                    if (take > 3) { take = 3; }
+                    int v = 0;
+                    for (int k = 0; k < take; k = k + 1) {
+                        v = v * 10 + (run[j + k] - 48);
+                    }
+                    int bits = 4;
+                    if (take == 3) { bits = 10; }
+                    if (take == 2) { bits = 7; }
+                    for (int b2 = bits - 1; b2 >= 0; b2 = b2 - 1) {
+                        s.bits.Add((v >> b2) & 1);
+                    }
+                    j = j + take;
+                }
+            } else if (mode == MODE_ALNUM) {
+                s.mode = MODE_ALNUM;
+                s.chars = run.Length;
+                int j = 0;
+                int n = run.Length;
+                while (j + 2 <= n) {
+                    int v = QrEncoder.AlnumValueByte(run[j] & 255) * 45
+                        + QrEncoder.AlnumValueByte(run[j + 1] & 255);
+                    for (int b2 = 10; b2 >= 0; b2 = b2 - 1) {
+                        s.bits.Add((v >> b2) & 1);
+                    }
+                    j = j + 2;
+                }
+                if (j < n) {
+                    int v = QrEncoder.AlnumValueByte(run[j] & 255);
+                    for (int b2 = 5; b2 >= 0; b2 = b2 - 1) {
+                        s.bits.Add((v >> b2) & 1);
+                    }
+                }
+            } else {
+                s.mode = MODE_BYTE;
+                s.chars = run.Length;  // string 即 UTF-8 字节序列
+                for (int j = 0; j < run.Length; j = j + 1) {
+                    int v = run[j] & 255;
+                    for (int b2 = 7; b2 >= 0; b2 = b2 - 1) {
+                        s.bits.Add((v >> b2) & 1);
+                    }
+                }
+            }
+            raw.Add(s);
+        }
+        // 短游程折回 Byte + 相邻 Byte 段合并。
+        for (int k = 0; k < raw.Count; k = k + 1) {
+            QrSegment s = raw[k];
+            if (s.mode != MODE_BYTE && s.chars <= 8) {
+                // 该游程全部在 ASCII（数字/字母数字表）内：直接按字节走。
+                // 起点用构建时记录的 srcPos——合并会就地改 raw 段的
+                // chars/bits，事后累加求起点就错了。
+                s = QrEncoder.MakeByteRun(text.Substring(s.srcPos, s.chars));
+            }
+            bool merged = false;
+            if (s.mode == MODE_BYTE && outp.Count > 0) {
+                QrSegment p = outp[outp.Count - 1];
+                if (p.mode == MODE_BYTE) {
+                    for (int j = 0; j < s.bits.Count; j = j + 1) {
+                        p.bits.Add(s.bits[j]);
+                    }
+                    p.chars = p.chars + s.chars;
+                    merged = true;
+                }
+            }
+            if (!merged) { outp.Add(s); }
+        }
+        return outp;
+    }
+
+    // 把一段文本编码为 Byte 段（每字节 8 位，高位在前）。
+    static QrSegment MakeByteRun(string run) {
+        QrSegment s = new QrSegment();
+        s.mode = MODE_BYTE;
+        s.chars = run.Length;
+        s.bits = new List<int>();
+        for (int j = 0; j < run.Length; j = j + 1) {
+            int v = run[j] & 255;
+            for (int b = 7; b >= 0; b = b - 1) { s.bits.Add((v >> b) & 1); }
+        }
+        return s;
+    }
+
+    // 字节 b（UTF-8 首字节）-> 该码点的模式。
+    static int ModeOfByte(int b, string text, int pos) {
+        int n = QrEncoder.SeqByteLen(b);
+        if (n == 1) {
+            if (QrEncoder.IsNumeric(b)) { return MODE_NUMERIC; }
+            if (QrEncoder.AlnumValueByte(b) >= 0) { return MODE_ALNUM; }
+        }
+        return MODE_BYTE;
+    }
+
+    // ---- 版本选择 -----------------------------------------------------------
+
+    // 模式指示符后的字符计数字段宽度（按版本 1-9/10-26/27-40 分三档）。
+    static int CharCountBits(int mode, int ver) {
+        int g = 0;
+        if (ver <= 9) { g = 0; } else if (ver <= 26) { g = 1; } else { g = 2; }
+        if (mode == MODE_NUMERIC) { return 10 + 2 * g; }
+        if (mode == MODE_ALNUM) { return 9 + 2 * g; }
+        if (g == 0) { return 8; }
+        return 16;
+    }
+
+    // 能容纳这些分段的最小版本，1..40；放不下返回 -1。
+    static int PickVersion(List<QrSegment> segs, QrEcl ecl) {
+        for (int ver = 1; ver <= 40; ver = ver + 1) {
+            int need = 0;
+            for (int i = 0; i < segs.Count; i = i + 1) {
+                QrSegment s = segs[i];
+                need = need + 4 + QrEncoder.CharCountBits(s.mode, ver) + s.bits.Count;
+            }
+            if (need <= QrSpec.DataCapacity(ver, ecl) * 8) { return ver; }
+        }
+        return -1;
+    }
+
+    // 分段位流 + 终止符 + 填充写入 cw（容量码字），返回实际数据码字数。
+    static int WriteQrSegments(List<QrSegment> segs, int ver, QrEcl ecl,
+                               int[] cw) {
+        List<int> bits = new List<int>();
+        for (int i = 0; i < segs.Count; i = i + 1) {
+            QrSegment s = segs[i];
+            QrEncoder.AppendVal(bits, s.mode, 4);
+            QrEncoder.AppendVal(bits, s.chars, QrEncoder.CharCountBits(s.mode, ver));
+            for (int k = 0; k < s.bits.Count; k = k + 1) {
+                bits.Add(s.bits[k]);
+            }
+        }
+        int cap = QrSpec.DataCapacity(ver, ecl);
+        int capBits = cap * 8;
+        int term = capBits - bits.Count;
+        if (term > 4) { term = 4; }
+        if (term < 0) { term = 0; }
+        for (int i = 0; i < term; i = i + 1) { bits.Add(0); }
+        int nDataCw = (bits.Count + 7) / 8;
+        for (int i = 0; i < bits.Count; i = i + 1) {
+            if (bits[i] != 0) { cw[i / 8] = cw[i / 8] | (1 << (7 - i % 8)); }
+        }
+        for (int i = nDataCw; i < cap; i = i + 1) {
+            cw[i] = (i - nDataCw) % 2 == 0 ? 0xEC : 0x11;
+        }
+        return nDataCw;
+    }
+
+    // 把 val 的低 n 位按高位在前追加进位流。
+    static void AppendVal(List<int> bits, int val, int n) {
+        for (int i = n - 1; i >= 0; i = i - 1) { bits.Add((val >> i) & 1); }
+    }
+
+    // ---- 矩阵构建 ----------------------------------------------------------
+
+    // 标记 (x,y) 为功能模块（不可掩码、不放数据），越界忽略。
+    static void SetFn(bool[] fn, int size, int x, int y) {
+        if (x < 0 || y < 0 || x >= size || y >= size) { return; }
+        fn[y * size + x] = true;
+    }
+
+    // 标记功能模块并置为深色，越界忽略。
+    static void SetDark(bool[] dark, bool[] fn, int size, int x, int y) {
+        if (x < 0 || y < 0 || x >= size || y >= size) { return; }
+        dark[y * size + x] = true;
+        fn[y * size + x] = true;
+    }
+
+    // 定位图形 + 分隔：以 (cx,cy) 为中心的 7x7 环，越界部分丢弃
+    // （Nayuki 的 dist!=2 && dist!=4 画法）。
+    static void DrawFinder(bool[] dark, bool[] fn, int size, int cx, int cy) {
+        for (int dy = -4; dy <= 4; dy = dy + 1) {
+            for (int dx = -4; dx <= 4; dx = dx + 1) {
+                int dist = dx;
+                if (dy * dy > dx * dx) { dist = dy; }
+                if (dist < 0) { dist = -dist; }
+                int x = cx + dx;
+                int y = cy + dy;
+                QrEncoder.SetFn(fn, size, x, y);
+                if (x < 0 || y < 0 || x >= size || y >= size) { continue; }
+                if (dist != 2 && dist != 4) { dark[y * size + x] = true; }
+            }
+        }
+    }
+
+    // 校正图形：以 (cx,cy) 为中心的 5x5 图案（同心环），越界部分丢弃。
+    static void DrawAlign(bool[] dark, bool[] fn, int size, int cx, int cy) {
+        for (int dy = -2; dy <= 2; dy = dy + 1) {
+            for (int dx = -2; dx <= 2; dx = dx + 1) {
+                int dist = dx;
+                if (dy * dy > dx * dx) { dist = dy; }
+                if (dist < 0) { dist = -dist; }
+                int x = cx + dx;
+                int y = cy + dy;
+                QrEncoder.SetFn(fn, size, x, y);
+                if (x < 0 || y < 0 || x >= size || y >= size) { continue; }
+                if (dist != 1) { dark[y * size + x] = true; }
+            }
+        }
+    }
+
+    // 版本信息 18 位：版本号左移 12 位，低位接 BCH(18,6) 纠错位。
+    static int BchVersion(int ver) {
+        int d = ver << 12;
+        // 消去比特 17..12 共 6 位（只循环 5 次会残留高位污染版本信息）
+        for (int i = 0; i <= 5; i = i + 1) {
+            if (((d >> (17 - i)) & 1) != 0) { d = d ^ (0x1F25 << (5 - i)); }
+        }
+        return (ver << 12) | d;
+    }
+
+    // 组装最终矩阵：画功能图形与版本/格式信息区，按 ISO 分块做
+    // RS 纠错并交织，蛇形放入数据模块，再对八个掩码逐一应用、
+    // 按罚分选优。
+    static QrMatrix BuildMatrix(int ver, QrEcl ecl, int[] cw, int nDataCw) {
+        int size = ver * 4 + 17;
+        bool[] dark = new bool[size * size];
+        // 功能图形地图与解码器共用同一份（QrSpec.FunctionMap）——编解码对
+        // "哪些格子不能放数据"的理解必须逐位一致。
+        bool[] fn = QrSpec.FunctionMap(ver);
+        for (int i = 0; i < size * size; i = i + 1) { dark[i] = false; }
+
+        // 定位
+        QrEncoder.DrawFinder(dark, fn, size, 3, 3);
+        QrEncoder.DrawFinder(dark, fn, size, size - 4, 3);
+        QrEncoder.DrawFinder(dark, fn, size, 3, size - 4);
+
+        // 定时
+        for (int i = 8; i <= size - 9; i = i + 1) {
+            if (i % 2 == 0) {
+                dark[6 * size + i] = true;
+                dark[i * size + 6] = true;
+            }
+        }
+
+        // 校正（跳过与定位图形重叠的三个角）
+        int[] pos = QrSpec.AlignPattern(ver);
+        int n = pos.Length - 1;
+        for (int r = 0; r < n; r = r + 1) {
+            for (int c = 0; c < n; c = c + 1) {
+                bool corner = (r == 0 && c == 0)
+                    || (r == 0 && c == n - 1)
+                    || (r == n - 1 && c == 0);
+                if (!corner) {
+                    QrEncoder.DrawAlign(dark, fn, size, pos[c + 1], pos[r + 1]);
+                }
+            }
+        }
+
+        // 版本信息（v >= 7）：左上/右上 6x3 条带
+        if (ver >= 7) {
+            int vinfo = QrEncoder.BchVersion(ver);
+            for (int i = 0; i < 18; i = i + 1) {
+                int bit = (vinfo >> i) & 1;
+                int a = i / 3;
+                int b = i % 3;
+                QrEncoder.SetFn(fn, size, a, size - 11 + b);
+                QrEncoder.SetFn(fn, size, size - 11 + b, a);
+                if (bit != 0) {
+                    dark[(size - 11 + b) * size + a] = true;
+                    dark[a * size + (size - 11 + b)] = true;
+                }
+            }
+        }
+
+        // 格式信息暂存区（含固定深色模块）
+        for (int i = 0; i < 9; i = i + 1) {
+            if (i != 6) {
+                QrEncoder.SetFn(fn, size, 8, i);
+                QrEncoder.SetFn(fn, size, i, 8);
+            }
+        }
+        for (int i = 0; i < 8; i = i + 1) {
+            QrEncoder.SetFn(fn, size, size - 1 - i, 8);
+            if (i != 6) { QrEncoder.SetFn(fn, size, 8, size - 1 - i); }
+        }
+        QrEncoder.SetFn(fn, size, 8, size - 8);
+        dark[8 * size + (size - 8)] = true;  // fixedPos dark module
+
+        // 纠错分块 + 交织。ISO 分块 = numBlocks 块（group1 在前）；交织序：
+        // 第 t 轮依次取每块的第 t 个码字（不足跳过），数据轮完再纠错轮。
+        int[] plan = QrSpec.BlockPlan(ver, ecl);
+        int k1 = plan[0]; int d1 = plan[1]; int k2 = plan[2]; int d2 = plan[3];
+        int numBlocks = k1 + k2;
+        int ecLen = QrSpec.EcPerBlock(ecl, ver);
+        int dataTotal = QrSpec.DataCapacity(ver, ecl);
+        int[] lens = new int[numBlocks];
+        List<int[]> chunks = new List<int[]>();
+        List<int[]> ecs = new List<int[]>();
+        int p = 0;
+        for (int b = 0; b < numBlocks; b = b + 1) {
+            lens[b] = b < k1 ? d1 : d2;
+            int[] chunk = new int[lens[b]];
+            for (int t = 0; t < lens[b]; t = t + 1) {
+                chunk[t] = cw[p];
+                p = p + 1;
+            }
+            int[] gen = QrSpec.RsGenerator(ecLen);
+            chunks.Add(chunk);
+            ecs.Add(QrSpec.RsRemainder(chunk, lens[b], gen));
+        }
+        int[] blockData = new int[dataTotal + numBlocks * ecLen];
+        int w = 0;
+        int maxLen = d1 > d2 ? d1 : d2;
+        for (int t = 0; t < maxLen; t = t + 1) {
+            for (int b = 0; b < numBlocks; b = b + 1) {
+                if (t < lens[b]) {
+                    blockData[w] = chunks[b][t];
+                    w = w + 1;
+                }
+            }
+        }
+        for (int t = 0; t < ecLen; t = t + 1) {
+            for (int b = 0; b < numBlocks; b = b + 1) {
+                blockData[w] = ecs[b][t];
+                w = w + 1;
+            }
+        }
+        // 蛇形放置：码字 bit -> 模块（跳过 fn，未写到则留 0）
+        bool[] finalDark = new bool[size * size];
+        for (int i = 0; i < size * size; i = i + 1) {
+            finalDark[i] = dark[i];
+        }
+        int bit = 0;
+        int totalCw = blockData.Length;
+        for (int right = size - 1; right >= 1; right = right - 2) {
+            int r2 = right;
+            if (right <= 6) { r2 = right - 1; }
+            for (int vert = 0; vert < size; vert = vert + 1) {
+                for (int z = 0; z < 2; z = z + 1) {
+                    int j = r2 - z;
+                    bool upwards = (r2 & 2) == 0;
+                    if (j < 6) { upwards = !upwards; }
+                    int y = upwards ? size - 1 - vert : vert;
+                    int idx = y * size + j;
+                    if (!fn[idx] && bit < totalCw * 8) {
+                        int v = (blockData[bit / 8] >> (7 - bit % 8)) & 1;
+                        finalDark[idx] = v != 0;
+                        bit = bit + 1;
+                    }
+                }
+            }
+        }
+        // 选掩码
+        int bestMask = 0;
+        int bestPenalty = 0x7FFFFFFF;
+        bool[] best = null;
+        for (int m = 0; m < 8; m = m + 1) {
+            bool[] cand = QrEncoder.ApplyMask(finalDark, fn, size, m, ecl);
+            int pen = QrEncoder.Penalty(cand, size);
+            if (pen < bestPenalty) {
+                bestPenalty = pen;
+                bestMask = m;
+                best = cand;
+            }
+        }
+        QrMatrix mx = new QrMatrix();
+        mx.version = ver;
+        mx.size = size;
+        mx.ecl = ecl;
+        mx.modules = best;
+        return mx;
+    }
+
+    // 掩码 + 格式信息写入，返回成品矩阵（new 数组，深拷贝）。
+    static bool[] ApplyMask(bool[] dark, bool[] fn, int size, int mask,
+                            QrEcl ecl) {
+        bool[] outp = new bool[size * size];
+        for (int i = 0; i < size * size; i = i + 1) { outp[i] = dark[i]; }
+        for (int y = 0; y < size; y = y + 1) {
+            for (int x = 0; x < size; x = x + 1) {
+                int idx = y * size + x;
+                if (!fn[idx] && QrEncoder.MaskBit(mask, x, y)) {
+                    outp[idx] = !outp[idx];
+                }
+            }
+        }
+        int bits = QrFormat.EncodeBits(ecl, mask);
+        // 第一拷贝（左上）：bit i -> (col 8, row i)，i=6 跳过定时行，
+        // bit 7 -> (8,8)
+        for (int i = 0; i <= 5; i = i + 1) {
+            outp[i * size + 8] = ((bits >> i) & 1) != 0;
+        }
+        outp[7 * size + 8] = ((bits >> 6) & 1) != 0;
+        outp[8 * size + 8] = ((bits >> 7) & 1) != 0;
+        outp[8 * size + 7] = ((bits >> 8) & 1) != 0;
+        for (int i = 9; i < 15; i = i + 1) {
+            outp[8 * size + (14 - i)] = ((bits >> i) & 1) != 0;
+        }
+        // 第二拷贝（右上 + 左下）
+        for (int i = 0; i < 8; i = i + 1) {
+            outp[8 * size + (size - 1 - i)] = ((bits >> i) & 1) != 0;
+        }
+        for (int i = 8; i < 15; i = i + 1) {
+            outp[(size - 15 + i) * size + 8] = ((bits >> i) & 1) != 0;
+        }
+        outp[8 * size + (size - 8)] = true;  // fixedPos dark
+        return outp;
+    }
+
+    // 掩码 m 在 (x,y) 处是否翻转（ISO 18004 的八种掩码条件）。
+    public static bool MaskBit(int m, int x, int y) {
+        if (m == 0) { return (x + y) % 2 == 0; }
+        if (m == 1) { return y % 2 == 0; }
+        if (m == 2) { return x % 3 == 0; }
+        if (m == 3) { return (x + y) % 3 == 0; }
+        if (m == 4) { return (x / 3 + y / 2) % 2 == 0; }
+        if (m == 5) { return ((x * y) % 2 + (x * y) % 3) == 0; }
+        if (m == 6) { return (((x * y) % 2 + (x * y) % 3) % 2) == 0; }
+        return (((x + y) % 2 + (x * y) % 3) % 2) == 0;
+    }
+
+    // ---- 掩码罚分（ISO 18004 Table 24，与 Nayuki 一致） --------------------
+
+    // 掩码罚分总值（ISO 18004 四条规则：同色游程、2x2 同色块、
+    // 类定位图形 1011101、深色比例偏离 50%）。
+    static int Penalty(bool[] m, int size) {
+        int result = 0;
+        // 规则 1：行/列同色游程 >=5
+        for (int y = 0; y < size; y = y + 1) {
+            result = result + QrEncoder.RunPenaltyLine(m, size, y, true);
+        }
+        for (int x = 0; x < size; x = x + 1) {
+            result = result + QrEncoder.RunPenaltyLine(m, size, x, false);
+        }
+        // 规则 2：2x2 同色块
+        for (int y = 0; y < size - 1; y = y + 1) {
+            for (int x = 0; x < size - 1; x = x + 1) {
+                bool c = m[y * size + x];
+                if (c == m[y * size + x + 1] && c == m[(y + 1) * size + x]
+                    && c == m[(y + 1) * size + x + 1]) { result = result + 3; }
+            }
+        }
+        // 规则 3：行/列中出现的 0000 + 1011101（11 格窗口；模式对称，
+        // 反向窗口必然也是该形状，无需重复统计）
+        for (int y = 0; y < size; y = y + 1) {
+            for (int x = 0; x + 11 <= size; x = x + 1) {
+                if (QrEncoder.Pattern11(m, size, x, y, true)) {
+                    result = result + 40;
+                }
+            }
+        }
+        for (int x = 0; x < size; x = x + 1) {
+            for (int y = 0; y + 11 <= size; y = y + 1) {
+                if (QrEncoder.Pattern11(m, size, x, y, false)) {
+                    result = result + 40;
+                }
+            }
+        }
+        // 规则 4：深色比例
+        int darkCount = 0;
+        for (int i = 0; i < size * size; i = i + 1) {
+            if (m[i]) { darkCount = darkCount + 1; }
+        }
+        int total = size * size;
+        int percent = darkCount * 100 / total;
+        int k = (QrEncoder.AbsInt(percent - 50) + 4) / 5;
+        result = result + k * 10;
+        return result;
+    }
+
+    // 绝对值（整数）。
+    static int AbsInt(int v) {
+        if (v < 0) { return -v; }
+        return v;
+    }
+
+    // 单行/列的同色游程罚分（游程 ≥5 时加 3+(长度-5)）。
+    static int RunPenaltyLine(bool[] m, int size, int line, bool horizontal) {
+        int pen = 0;
+        int runColor = -1;
+        int runLen = 0;
+        for (int i = 0; i < size; i = i + 1) {
+            int idx = horizontal ? line * size + i : i * size + line;
+            int c = m[idx] ? 1 : 0;
+            if (c != runColor) {
+                if (runLen >= 5) { pen = pen + 3 + (runLen - 5); }
+                runColor = c;
+                runLen = 1;
+            } else {
+                runLen = runLen + 1;
+            }
+        }
+        if (runLen >= 5) { pen = pen + 3 + (runLen - 5); }
+        return pen;
+    }
+
+    // 11 格窗口 == 0000 1011101（从 (x,y) 沿 horizontal 方向）。
+    static bool Pattern11(bool[] m, int size, int x, int y, bool horizontal) {
+        for (int k = 0; k < 11; k = k + 1) {
+            int idx = horizontal ? y * size + x + k : (y + k) * size + x;
+            bool want = k == 4 || k == 6 || k == 7 || k == 8 || k == 10;
+            if (m[idx] != want) { return false; }
+        }
+        return true;
+    }
+}

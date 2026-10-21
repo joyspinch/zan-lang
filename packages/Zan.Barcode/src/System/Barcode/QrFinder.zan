@@ -1,0 +1,421 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Barcode;
+
+// 定位图形（finder pattern）与校正图形（alignment pattern）检测。
+//
+// **定位图形是二维码的锚点**：三个 7x7 的同心方块（左上 / 右上 / 左下），
+// 黑白比例固定为 1:1:3:1:1（横竖各五段）。正因为比例固定，才能在任意方向
+// 的图像里"扫"出来——这与码的内容无关。
+//
+// **校正图形**（版本 ≥ 2 才有，在右下角附近）：5x5 的同心方块，比例是
+// 1:1:1:1:1。它是**透视矫正的第四个锚点**——手机斜拍时，前三个定位图形
+// 只能给出仿射变换（平行四边形近似），加上校正图形才能做真正的投影变换。
+//
+// ## 旋转时为什么"扫一行"还能认出定位图形
+//
+// 定位图形是方块。对方块沿任意方向切一条**过中心的直线**，切出来的比例
+// 仍是 1:1:3:1:1（嵌套方块的弦长按同一比例缩短）。所以旋转过的码，横向扫
+// 依然能扫出 1:1:3:1:1。
+//
+// 但**弦的中点不是图案中心**——这是最容易踩的坑。方块绕中心对称，可是
+// 切线**不过中心**时，弦并不关于垂足对称：切线在符号坐标里平移 δ，中点
+// 在图像里就跟着平移 −s·sinθ·δ（横向）或 +s·sinθ·δ（竖向）。换成图像
+// 坐标就是：**3-bar 中点随扫描行线性漂移，速率正好是 tanθ**。
+// 15° 时行 39→55，中点从 78.5 漂到 74.5——正好 4px = tan15°·16 行。
+//
+// 由此得到正确的取中心办法：**对整个命中带取平均**。漂移是线性的，而能
+// 命中 1:1:3:1:1 的那些行关于图案中心行**对称**（判据 |2h·tanθ| ≤ 0.6m
+// 对 h 是偶的），所以平均值的漂移自动抵消，得到的正是图案中心。
+//
+// 还有一条：**从图上量到的模块尺寸 m 是"视在"尺寸**：方块被切时弦长被放大
+// 1/max(|cosθ|,|sinθ|) 倍，所以符号里的真实模块边长
+// **s = m · max(|cosθ|,|sinθ|)**，θ 是符号 x 轴在图像里的角度。
+// 这条由三个定位图形构成的直角三角形给出（斜边方向即符号 x 轴），
+// 于是"边长 = 4·version + 17"这个式子在旋转后依然成立。
+//
+// **检测流程**：
+// 1. 逐行扫游程，找满足比例的五段组合；
+// 2. 对每个命中，在同一列竖直再扫一次；**竖直 3-bar 的跨度必须罩住这一行**
+//    （这一行必须真的穿过 3x3 中心块）才配对成功——横竖都对上才是真图案，
+//    否则数据区里的巧合图案会大量误报；
+// 3. 把配对成功的横向命中**按 x 聚类**（同一图案的命中横向散布不超过
+//    0.6 个模块），每簇取平均位置，得到图案中心。
+// 一个定位图形候选。
+//
+// **放在命名空间层而不是 QrFinder 里**：Zan 的编译器目前不支持"嵌套类型的
+// 数组"（`QrFinder.QrFinderPattern[]` 报 undefined type；命名空间限定的
+// 数组 `System.Text.Encoding[]` 正常）。编译器缺口已登记在 TASKS.md。
+public class QrFinderPattern {
+    // 中心 x（像素）。
+    public double x;
+    // 中心 y（像素）。
+    public double y;
+    // 模块尺寸（像素/模块，**视在**值，见 QrFinder 类注释）。
+    public double moduleSize;
+    // 比例吻合误差（像素）。越小越可信。
+    public double err;
+
+    public QrFinderPattern() {
+        this.x = 0;
+        this.y = 0;
+        this.moduleSize = 0;
+        this.err = 0;
+    }
+}
+
+// 扫描结果：一行/一列上的一次命中。
+public class QrScanHit {
+    // 3-bar（3 模块宽的深色段）的中点，扫描方向上的坐标。
+    public double center;
+    // 模块尺寸估计。
+    public double moduleSize;
+    // 3-bar 的起止（扫描方向）。
+    public double barLo;
+    public double barHi;
+    // 比例吻合误差，越小越准。
+    public double err;
+
+    public QrScanHit() {
+        this.center = 0;
+        this.moduleSize = 0;
+        this.barLo = 0;
+        this.barHi = 0;
+        this.err = 0;
+    }
+}
+
+public class QrFinder {
+
+    // 扫描比例种类。
+    public static int KIND_FINDER = 0;   // 1:1:3:1:1
+    public static int KIND_ALIGN = 1;    // 1:1:1:1:1
+
+    // 一个命中簇：同一个定位图形在多行上的全部命中。
+    //
+    // **必须成簇取平均，不能取单次命中**：3-bar 中点随扫描行线性漂移
+    // （速率 tanθ，见类注释），单次命中的位置会偏半个模块以上。
+    class Group {
+        // 聚类键（横竖配对点）：簇的锚点。
+        public double px;
+        public double py;
+        // 簇内每个命中的原始位置（用来取中位数）。
+        public List<double> xs;
+        public List<double> ys;
+        public List<double> ms;
+        public double minErr;
+
+        public Group() {
+            this.px = 0;
+            this.py = 0;
+            this.xs = new List<double>();
+            this.ys = new List<double>();
+            this.ms = new List<double>();
+            this.minErr = 1e30;
+        }
+    }
+
+    // 中位数（就地排序后取中间值）。
+    //
+    // **为什么用中位数而不是平均**：簇里可能混进数据区的假命中，平均值会被
+    // 拉偏一两个模块（实测噪声 2% 时把右上定位图形拉偏 11px，直接解不出来）；
+    // 中位数对少量离群值免疫。
+    static double Median(List<double> vals) {
+        int n = vals.Count;
+        if (n <= 0) { return 0; }
+        double[] a = new double[n];
+        for (int i = 0; i < n; i = i + 1) { a[i] = vals[i]; }
+        for (int i = 1; i < n; i = i + 1) {
+            double key = a[i];
+            int j = i - 1;
+            while (j >= 0 && a[j] > key) {
+                a[j + 1] = a[j];
+                j = j - 1;
+            }
+            a[j + 1] = key;
+        }
+        if (n % 2 == 1) { return a[n / 2]; }
+        return (a[n / 2 - 1] + a[n / 2]) / 2.0;
+    }
+
+    // 在整幅图里找所有定位图形候选（已聚类）。
+    public static List<QrFinderPattern> Find(bool[] dark, int width, int height) {
+        // 1) 横向扫全图，收集所有命中（记下它们所在的行）。
+        List<QrScanHit> hhits = new List<QrScanHit>();
+        List<int> hrows = new List<int>();
+        List<int> cols = new List<int>();
+        for (int y = 0; y < height; y = y + 1) {
+            List<QrScanHit> hits = new List<QrScanHit>();
+            QrFinder.ScanLine(dark, width, height, y, true, KIND_FINDER, hits);
+            for (int i = 0; i < hits.Count; i = i + 1) {
+                int cx = (int)(hits[i].center + 0.5);
+                if (cx < 0 || cx >= width) { continue; }
+                hhits.Add(hits[i]);
+                hrows.Add(y);
+                bool seen = false;
+                for (int k = 0; k < cols.Count; k = k + 1) {
+                    if (cols[k] == cx) { seen = true; }
+                }
+                if (!seen) { cols.Add(cx); }
+            }
+        }
+        if (hhits.Count == 0) { return new List<QrFinderPattern>(); }
+
+        // 2) 每个相关列竖直扫一次，确认横向命中。
+        //    竖直 3-bar 的跨度必须罩住横向命中所在的那一行：这一行必须真的
+        //    穿过 3x3 中心块，两者才可能是同一个图案。横竖都对上才是真图案，
+        //    否则数据区里的巧合图案会大量误报。
+        //
+        //    每个命中存下配对的竖直命中（竖直中点更接近图案中心：它的偏差
+        //    只有横向偏差的 tan²θ 倍）。
+        List<QrScanHit> vmatch = new List<QrScanHit>();
+        List<int> vmatchIdx = new List<int>();
+        for (int ci = 0; ci < cols.Count; ci = ci + 1) {
+            int cx = cols[ci];
+            List<QrScanHit> vhits = new List<QrScanHit>();
+            QrFinder.ScanLine(dark, width, height, cx, false, KIND_FINDER, vhits);
+            if (vhits.Count == 0) { continue; }
+            for (int i = 0; i < hhits.Count; i = i + 1) {
+                if ((int)(hhits[i].center + 0.5) != cx) { continue; }
+                int row = hrows[i];
+                QrScanHit best = null;
+                for (int k = 0; k < vhits.Count; k = k + 1) {
+                    QrScanHit v = vhits[k];
+                    if (row < v.barLo - 0.5 || row > v.barHi + 0.5) { continue; }
+                    if (QrFinder.AbsF(v.moduleSize - hhits[i].moduleSize)
+                        > hhits[i].moduleSize * 0.4) { continue; }
+                    if (best == null || v.err < best.err) { best = v; }
+                }
+                if (best == null) { continue; }
+                vmatch.Add(best);
+                vmatchIdx.Add(i);
+            }
+        }
+        if (vmatch.Count == 0) { return new List<QrFinderPattern>(); }
+
+        // 3) 聚类。
+        //
+        //    **聚类键用"横竖配对点"**（横向中点 x，竖直中点 y），不是原始命中。
+        //    原因：左上与左下两个定位图形的 **x 完全相同**（相隔十几个模块），
+        //    只按 x 聚类会把它们并成一簇；配上竖直中点之后两点才分得开。
+        //
+        //    同一图案的配对点散布不超过 0.3 个模块（漂移带的一半），所以
+        //    0.8 个模块的窗口足够把一个图案收成一簇。
+        List<Group> groups = new List<Group>();
+        for (int i = 0; i < vmatch.Count; i = i + 1) {
+            int hi = vmatchIdx[i];
+            QrScanHit h = hhits[hi];
+            QrScanHit v = vmatch[i];
+            double px = h.center;
+            double py = v.center;
+            double tol = h.moduleSize * 0.5;
+            if (tol < 1.5) { tol = 1.5; }
+            Group best = null;
+            double bestD = 0;
+            for (int g = 0; g < groups.Count; g = g + 1) {
+                double dx = QrFinder.AbsF(px - groups[g].px);
+                double dy = QrFinder.AbsF(py - groups[g].py);
+                if (dx > tol || dy > tol) { continue; }
+                double d = dx + dy;
+                if (best == null || d < bestD) { best = groups[g]; bestD = d; }
+            }
+            if (best == null) {
+                best = new Group();
+                best.px = px;
+                best.py = py;
+                groups.Add(best);
+            }
+            // 簇里存**原始横向命中**：漂移是线性的、命中带关于中心行对称，
+            // 取中位数正好落在图案中心（取配对点反而会留下残余漂移）。
+            best.xs.Add(h.center);
+            best.ys.Add(hrows[hi]);
+            best.ms.Add(h.moduleSize);
+            if (h.err < best.minErr) { best.minErr = h.err; }
+        }
+
+        // 4) 每簇取中位数位置。
+        List<QrFinderPattern> outp = new List<QrFinderPattern>();
+        for (int g = 0; g < groups.Count; g = g + 1) {
+            Group gr = groups[g];
+            if (gr.xs.Count <= 0) { continue; }
+            QrFinderPattern p = new QrFinderPattern();
+            p.x = QrFinder.Median(gr.xs);
+            p.y = QrFinder.Median(gr.ys);
+            p.moduleSize = QrFinder.Median(gr.ms);
+            p.err = gr.minErr;
+            outp.Add(p);
+        }
+        return outp;
+    }
+
+    // 找校正图形：**在符号坐标系里**匹配 5x5 模板。
+    //
+    // 为什么不在图像坐标系里做模板匹配：模板是轴对齐的，图像一旦旋转，
+    // 模板就对不上；而且数据区里的巧合图案会造成误报。改用"先用仿射把
+    // 候选位置投到图上，再按模块中心采样"，模板就跟着码面一起转——旋转、
+    // 斜拍都能用。
+    //
+    // 搜索范围限制在期望位置附近几个模块内——"右下角那个校正图形"的位置
+    // 是由几何推出来的，不是全图乱找。
+    //
+    // 返回 true 时 outp = 校正图形中心的**图像**坐标。
+    public static bool FindAlignment(QrTransform t, bool[] dark, int width, int height,
+                                     double symX, double symY, double[] outp) {
+        double[] pt = new double[2];
+        int bestBad = 999;
+        bool found = false;
+        for (int dy = -3; dy <= 3; dy = dy + 1) {
+            for (int dx = -3; dx <= 3; dx = dx + 1) {
+                double cx = symX + dx;
+                double cy = symY + dy;
+                int bad = 0;
+                for (int r = -2; r <= 2 && bad < 999; r = r + 1) {
+                    for (int c = -2; c <= 2; c = c + 1) {
+                        t.Map(cx + c, cy + r, pt);
+                        int px = (int)(pt[0] + 0.5);
+                        int py = (int)(pt[1] + 0.5);
+                        if (px < 0 || py < 0 || px >= width || py >= height) {
+                            bad = 999;
+                            break;
+                        }
+                        // 模板（X 深 / . 浅）：
+                        //   X X X X X
+                        //   X . . . X
+                        //   X . X . X
+                        //   X . . . X
+                        //   X X X X X
+                        bool wantDark = (r == -2 || r == 2 || c == -2 || c == 2
+                            || (r == 0 && c == 0));
+                        if (wantDark != dark[py * width + px]) { bad = bad + 1; }
+                    }
+                }
+                if (bad < bestBad) {
+                    bestBad = bad;
+                    found = true;
+                    t.Map(cx, cy, pt);
+                    outp[0] = pt[0];
+                    outp[1] = pt[1];
+                }
+            }
+        }
+        // 25 个格子必须**全中**才算数：数据区里 5x5 巧合图案偶尔会错一格，
+        // 放过一个错的校正图形比没有校正图形更糟（变换会被带歪）。
+        return found && bestBad == 0;
+    }
+
+    // 通用的一维扫描：沿行（horizontal）或列（vertical）走一遍，维护最近
+    // 五段游程，命中就记一笔。
+    //
+    // 五段的比例由 kind 决定：定位图形是 1:1:3:1:1，校正图形是 1:1:1:1:1。
+    // **两种比例的中心算法相同**（中心都在第 3 段深色游程的中点），只有
+    // 模块尺寸的取法不同。
+    public static void ScanLine(bool[] dark, int width, int height, int fixedPos,
+                                 bool horizontal, int kind, List<QrScanHit> outp) {
+        int len = horizontal ? width : height;
+        int[] p = new int[5];
+        int runCount = 0;
+        int color = -1;
+        int runLen = 0;
+        for (int i = 0; i < len; i = i + 1) {
+            bool d = horizontal ? dark[fixedPos * width + i]
+                                 : dark[i * width + fixedPos];
+            int c = d ? 1 : 0;
+            if (c != color) {
+                if (color >= 0) {
+                    // 上一段结束，记账。
+                    for (int k = 0; k < 4; k = k + 1) { p[k] = p[k + 1]; }
+                    p[4] = runLen;
+                    runCount = runCount + 1;
+                    if (runCount >= 5) {
+                        double[] mOut = new double[1];
+                        double[] eOut = new double[1];
+                        if (QrFinder.IsRatio(p, kind, mOut, eOut)) {
+                            int e4 = i;              // 第五段结束位置
+                            int span = p[0] + p[1] + p[2] + p[3] + p[4];
+                            int barLo = i - span + p[0] + p[1];
+                            int barHi = barLo + p[2];
+                            QrScanHit h = new QrScanHit();
+                            h.center = (double)(barLo + barHi) / 2.0;
+                            h.moduleSize = mOut[0];
+                            h.barLo = barLo;
+                            h.barHi = barHi;
+                            h.err = eOut[0];
+                            outp.Add(h);
+                        }
+                    }
+                }
+                color = c;
+                runLen = 1;
+            } else {
+                runLen = runLen + 1;
+            }
+        }
+    }
+
+    // 五段是否满足比例；命中时把模块尺寸写进 outM、误差写进 outErr。
+    //
+    // **模块尺寸从四个"单模块段"取平均**（p0+p1+p3+p4)/4，而不是从 3-bar
+    // 反推：方块被斜切时，3-bar 的弦会被截短（偏心 h 处短 2h·tanθ），
+    // 而四个单模块段是**嵌套方块弦长之差**，截短量互相抵消，恒等于一个
+    // 模块宽。用 p[2]/3 在偏心的行上会低估模块尺寸，旋转时直接算错边长。
+    static bool IsRatio(int[] p, int kind, double[] outM, double[] outErr) {
+        double m = 0;
+        double err = 0;
+        if (kind == KIND_ALIGN) {
+            m = p[2];
+            double tol = m * 0.5;
+            if (tol < 1.0) { tol = 1.0; }
+            for (int i = 0; i < 5; i = i + 1) {
+                double d = QrFinder.AbsF(m - p[i]);
+                if (d > tol) { return false; }
+                if (d > err) { err = d; }
+            }
+        } else {
+            m = (p[0] + p[1] + p[3] + p[4]) / 4.0;
+            if (m < 0.75) { return false; }
+            double tol = m * 0.45;
+            if (tol < 1.0) { tol = 1.0; }
+            double[] four = new double[4];
+            four[0] = p[0]; four[1] = p[1]; four[2] = p[3]; four[3] = p[4];
+            for (int i = 0; i < 4; i = i + 1) {
+                double d = QrFinder.AbsF(four[i] - m);
+                if (d > tol) { return false; }
+                if (d > err) { err = d; }
+            }
+            // 3-bar 应该是三个模块宽；偏心的行会被截短，放宽到 0.6 个模块。
+            double d2 = QrFinder.AbsF(p[2] - 3.0 * m);
+            double tol2 = m * 0.6;
+            if (tol2 < 1.5) { tol2 = 1.5; }
+            if (d2 > tol2) { return false; }
+            if (d2 > err) { err = d2; }
+        }
+        outM[0] = m;
+        outErr[0] = err;
+        return true;
+    }
+
+    // 绝对值（浮点）。
+    public static double AbsF(double v) {
+        if (v < 0.0) { return -v; }
+        return v;
+    }
+
+    // 两点距离。
+    public static double Distance(double x0, double y0, double x1, double y1) {
+        double dx = x1 - x0;
+        double dy = y1 - y0;
+        return QrFinder.Sqrt(dx * dx + dy * dy);
+    }
+
+    // 平方根（牛顿迭代）。
+    public static double Sqrt(double v) {
+        if (v <= 0.0) { return 0.0; }
+        double x = v;
+        if (x > 1.0) { x = v / 2.0; }
+        for (int i = 0; i < 40; i = i + 1) {
+            x = 0.5 * (x + v / x);
+        }
+        return x;
+    }
+}

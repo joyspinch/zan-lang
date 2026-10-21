@@ -1,0 +1,543 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Barcode;
+
+// QR 解码主体：图像 -> 文本。
+//
+// **流水线**（每一步的失败都对应一个可区分的错误码）：
+// 1. 二值化（全局 Otsu，失败再试局部自适应）
+// 2. 找三个定位图形，按几何关系定出左上 / 右上 / 左下
+// 3. 由定位图形间距算出模块尺寸与版本（边长 = 4·version + 17）
+// 4. 建变换（3 点仿射；找到校正图形就用 4 点投影）
+// 5. 按变换把每个模块采样成一个比特
+// 6. 读格式信息（纠错级别 + 掩码）
+// 7. 去掩码，按蛇形顺序取出码字
+// 8. 反交织成分块，逐块 Reed-Solomon 纠错
+// 9. 解析分段（numeric / alphanumeric / byte）得到文本
+public class QrDecoder {
+
+    // 解码结果。
+    public class QrDecodeResult {
+        // 解出的文本（byte 段按 UTF-8 解码）。
+        public string text;
+        // 原始字节（byte 段的原始字节；numeric/alnum 段为空）。
+        public byte[] bytes;
+        // 版本号 1..40。
+        public int version;
+        // 边长（模块数）。
+        public int size;
+        // 纠错级别。
+        public QrEcl ecl;
+        // 掩码编号 0..7。
+        public int mask;
+        // 模块尺寸（像素/模块，符号里的真实边长——旋转不改变边长）。
+        public double moduleSize;
+        // 四个角在图像里的位置（像素）：TL, TR, BR, BL，每点两个数。
+        public double[] corners;
+
+        public QrDecodeResult() {
+            this.text = "";
+            this.bytes = new byte[0];
+            this.version = 0;
+            this.size = 0;
+            this.ecl = QrEcl.M;
+            this.mask = 0;
+            this.moduleSize = 0;
+            this.corners = new double[0];
+        }
+    }
+
+    // 解码一张图。
+    public static QrDecodeResult Decode(BarcodeImage img) {
+        if (img == null || !img.IsValid()) {
+            throw new BarcodeException(BarcodeError.InvalidImage,
+                "image is empty or malformed");
+        }
+        // 依次试几种预处理组合，先成功的算：
+        //   1) 全局阈值（没有块边界伪影）
+        //   2) 全局阈值 + 去噪（椒盐噪声会劈开游程，识别不出定位图形）
+        //   3) 局部自适应（应对阴影和不均匀光照）
+        //   4) 局部自适应 + 去噪
+        //
+        // `stage` 记"最远走到哪一步"：0 = 连定位图形都没找到，1 = 找到了码
+        // 但数据纠错失败。两者必须分开报——"图里没码"和"码在但损坏了"是
+        // 调用方要区别对待的两种情况。
+        int stage = 0;
+        for (int mode = 0; mode < 4; mode = mode + 1) {
+            int[] st = new int[1];
+            QrDecodeResult r = QrDecoder.TryDecode(img, mode, st);
+            if (r != null) { return r; }
+            if (st[0] > stage) { stage = st[0]; }
+        }
+        if (stage == 1) {
+            throw new BarcodeException(BarcodeError.CorrectionFailed,
+                "QR code found but data could not be corrected");
+        }
+        throw new BarcodeException(BarcodeError.NotFound,
+            "no QR code found in image");
+    }
+
+    // 试一次解码；`mode` 决定预处理组合。失败返回 null。
+    //
+    // mode: 0=全局 1=全局+去噪 2=局部 3=局部+去噪
+    // stage（出参）：0=没找到码，1=找到码但后面失败。
+    static QrDecodeResult TryDecode(BarcodeImage img, int mode, int[] stage) {
+        int w = img.width;
+        int h = img.height;
+        int threshold = QrBinarizer.OtsuThreshold(img.luminance, w, h);
+        bool[] dark;
+        if (mode == 2 || mode == 3) {
+            dark = QrBinarizer.AdaptiveBinarize(img.luminance, w, h, threshold);
+        } else {
+            dark = QrBinarizer.Binarize(img.luminance, w, h, threshold);
+        }
+        if (mode == 1 || mode == 3) {
+            dark = QrBinarizer.Denoise(dark, w, h);
+        }
+
+        List<QrFinderPattern> cands = QrFinder.Find(dark, w, h);
+        if (cands.Count < 3) { return null; }
+
+        // 挑出三个定位图形并定序（左上 / 右上 / 左下）。
+        QrFinderPattern[] sel = new QrFinderPattern[3];
+        if (!QrDecoder.SelectAndOrder(cands, sel)) { return null; }
+        // 找到码了：后面再失败就是"码损坏了"，不是"没码"。
+        if (stage != null && stage.Length > 0) { stage[0] = 1; }
+        double[] ordered = new double[6];   // tlX,tlY, trX,trY, blX,blY
+        for (int i = 0; i < 3; i = i + 1) {
+            ordered[i * 2] = sel[i].x;
+            ordered[i * 2 + 1] = sel[i].y;
+        }
+        double moduleSize = (sel[0].moduleSize + sel[1].moduleSize
+            + sel[2].moduleSize) / 3.0;
+
+        // 由定位图形间距推边长（= 4·version + 17）。
+        //
+        // **旋转修正**：从图上量到的模块尺寸 m 是"视在"值——方块被斜切时弦长
+        // 被放大 1/max(|cosθ|,|sinθ|) 倍，符号里的真实边长 s = m·max(...)。
+        // θ 就是符号 x 轴在图像里的角度，由定位三角形的一条直角边给出。
+        // 不做这个修正，45° 的码会被算成 1.41 倍大，版本直接判错。
+        double vx = ordered[2] - ordered[0];
+        double vy = ordered[3] - ordered[1];
+        double distTr = QrFinder.Sqrt(vx * vx + vy * vy);
+        double bx = ordered[4] - ordered[0];
+        double by = ordered[5] - ordered[1];
+        double distBl = QrFinder.Sqrt(bx * bx + by * by);
+        if (moduleSize <= 0.5 || distTr <= 0.0) { return null; }
+        double cosT = vx / distTr;
+        double sinT = vy / distTr;
+        double rot = QrFinder.AbsF(cosT);
+        if (QrFinder.AbsF(sinT) > rot) { rot = QrFinder.AbsF(sinT); }
+        double moduleTrue = moduleSize * rot;
+        if (moduleTrue <= 0.5) { return null; }
+        double dist = (distTr + distBl) / 2.0;
+        double modules = dist / moduleTrue;
+        int size = (int)(modules + 0.5) + 7;
+        int version = (int)(((double)size - 17.0) / 4.0 + 0.5);
+        if (version < 1) { version = 1; }
+        if (version > 40) { version = 40; }
+        size = version * 4 + 17;
+
+        // 建变换：优先投影（带校正图形），退回仿射。
+        QrTransform t = QrDecoder.BuildTransform(dark, w, h, size, version, ordered);
+        if (t == null) { return null; }
+
+        // 采样成模块矩阵。
+        bool[] modules2 = QrDecoder.Sample(t, dark, w, h, size);
+        if (modules2 == null) { return null; }
+
+        // 格式信息（纠错级别 + 掩码）。
+        QrFormat.QrFormatInfo fmt = QrFormat.ReadMatrix(modules2, size);
+        if (fmt == null) { return null; }
+
+        // 去掩码 + 取码字。
+        int totalCw = QrSpec.TotalCodewords(version);
+        int[] codewords = QrDecoder.ReadCodewords(modules2, size, version, fmt.mask, totalCw);
+        if (codewords == null) { return null; }
+
+        // 反交织 + 纠错。
+        int[] data = QrDecoder.DecodeBlocks(codewords, version, fmt.ecl);
+        if (data == null) { return null; }
+
+        // 解析分段。
+        QrDecodeResult res = new QrDecodeResult();
+        res.version = version;
+        res.size = size;
+        res.ecl = fmt.ecl;
+        res.mask = fmt.mask;
+        res.moduleSize = moduleTrue;
+        res.corners = new double[]{
+            ordered[0], ordered[1], ordered[2], ordered[3],
+            ordered[2] + ordered[4] - ordered[0], ordered[3] + ordered[5] - ordered[1],
+            ordered[4], ordered[5]
+        };
+        if (!QrDecoder.ParseSegments(data, version, res)) { return null; }
+        return res;
+    }
+
+    // 从候选里挑三个定位图形并定序，结果写进 sel[0]=左上, sel[1]=右上, sel[2]=左下。
+    //
+    // 三个定位图形构成直角三角形：**离另外两个都近的那个顶点是左上角**
+    // （左上到右上 == 左上到左下），最远的一对是斜边。
+    static bool SelectAndOrder(List<QrFinderPattern> cands,
+                                QrFinderPattern[] sel) {
+        int n = cands.Count;
+        if (n == 3) {
+            return QrDecoder.OrderTriple(cands[0], cands[1], cands[2], sel);
+        }
+        // 候选多于三个：枚举所有三元组，挑"最像直角三角形"的一组。
+        double bestScore = -1e30;
+        QrFinderPattern bt0 = null;
+        QrFinderPattern bt1 = null;
+        QrFinderPattern bt2 = null;
+        for (int i = 0; i < n - 2; i = i + 1) {
+            for (int j = i + 1; j < n - 1; j = j + 1) {
+                for (int k = j + 1; k < n; k = k + 1) {
+                    double score = QrDecoder.TripleScore(cands[i], cands[j], cands[k]);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bt0 = cands[i];
+                        bt1 = cands[j];
+                        bt2 = cands[k];
+                    }
+                }
+            }
+        }
+        if (bt0 == null) { return false; }
+        return QrDecoder.OrderTriple(bt0, bt1, bt2, sel);
+    }
+
+    // 三元组的"像不像二维码"评分：两条直角边等长、斜边 ≈ √2 倍、模块尺寸
+    // 一致。分数越大越像。
+    static double TripleScore(QrFinderPattern p0,
+                              QrFinderPattern p1,
+                              QrFinderPattern p2) {
+        double d01 = QrFinder.Distance(p0.x, p0.y, p1.x, p1.y);
+        double d02 = QrFinder.Distance(p0.x, p0.y, p2.x, p2.y);
+        double d12 = QrFinder.Distance(p1.x, p1.y, p2.x, p2.y);
+        double a = d01;
+        double b = d02;
+        double c = d12;
+        if (b < a) { double tmp = a; a = b; b = tmp; }
+        if (c < b) { double tmp = b; b = c; c = tmp; }
+        if (b < a) { double tmp = a; a = b; b = tmp; }
+        if (a <= 0.0) { return -1e30; }
+        // 两条直角边应等长，斜边应 ≈ a·√2
+        double legErr = QrFinder.AbsF(a - b) / a;
+        double hypErr = QrFinder.AbsF(c - a * 1.41421356) / (a * 1.41421356);
+        double m0 = (p0.moduleSize + p1.moduleSize + p2.moduleSize) / 3.0;
+        double mErr = 0;
+        if (m0 > 0) {
+            mErr = (QrFinder.AbsF(p0.moduleSize - m0)
+                + QrFinder.AbsF(p1.moduleSize - m0)
+                + QrFinder.AbsF(p2.moduleSize - m0)) / (3.0 * m0);
+        }
+        return -(legErr + hypErr + mErr);
+    }
+
+    // 给三个定位图形定序：找出斜边最长的那一对，剩下的顶点是左上角；
+    // 另外两个按叉积定"右上 / 左下"（图像坐标 y 向下，叉积 > 0 时第一个
+    // 是右上角）。
+    //
+    // 叉积的符号在**任意旋转角**下都不变（旋转矩阵行列式为 1），所以这个
+    // 定序对旋转过的码同样成立。
+    static bool OrderTriple(QrFinderPattern p0,
+                            QrFinderPattern p1,
+                            QrFinderPattern p2,
+                            QrFinderPattern[] sel) {
+        double d01 = QrFinder.Distance(p0.x, p0.y, p1.x, p1.y);
+        double d02 = QrFinder.Distance(p0.x, p0.y, p2.x, p2.y);
+        double d12 = QrFinder.Distance(p1.x, p1.y, p2.x, p2.y);
+        QrFinderPattern tl;
+        QrFinderPattern pa;
+        QrFinderPattern pb;
+        if (d12 >= d01 && d12 >= d02) {
+            tl = p0; pa = p1; pb = p2;
+        } else if (d02 >= d01 && d02 >= d12) {
+            tl = p1; pa = p0; pb = p2;
+        } else {
+            tl = p2; pa = p0; pb = p1;
+        }
+        double cross = (pa.x - tl.x) * (pb.y - tl.y) - (pa.y - tl.y) * (pb.x - tl.x);
+        QrFinderPattern tr = pa;
+        QrFinderPattern bl = pb;
+        if (cross < 0) { tr = pb; bl = pa; }
+        sel[0] = tl;
+        sel[1] = tr;
+        sel[2] = bl;
+        return true;
+    }
+
+    // 建变换：优先 4 点投影（用校正图形），否则 3 点仿射。
+    static QrTransform BuildTransform(bool[] dark, int w, int h, int size,
+                                      int version, double[] ordered) {
+        double tlX = ordered[0]; double tlY = ordered[1];
+        double trX = ordered[2]; double trY = ordered[3];
+        double blX = ordered[4]; double blY = ordered[5];
+        // 模块坐标（连续）：定位图形中心在 3.5，右上/左下在 size-3.5。
+        double s1 = 3.5;
+        double s2 = (double)size - 3.5;
+        double s3 = (double)size - 6.5;   // 右下校正图形中心
+
+        // 仿射（永远可用）。三个定位图形中心确定它，**旋转角自动被吸收**：
+        // 仿射包含旋转，斜着放的码照样能建出正确的采样网格。
+        QrTransform affine = QrTransform.Affine(
+            s1, s1, tlX, tlY,
+            s2, s1, trX, trY,
+            s1, s2, blX, blY);
+        if (affine == null) { return null; }
+
+        // **版本 1 没有校正图形**（ISO 18004：校正图形从版本 2 才开始有）。
+        // 去找一个不存在的图形，只会在数据区里撞上巧合图案，把变换带歪——
+        // 所以这里必须按版本关掉。
+        if (version < 2) { return affine; }
+
+        // 投影：找右下校正图形当第四点。
+        // 期望位置 = 平行四边形外推（仿射映射的结果）。
+        double[] found = new double[2];
+        if (QrFinder.FindAlignment(affine, dark, w, h, s3, s3, found)) {
+            QrTransform proj = QrTransform.Projective(
+                s1, s1, tlX, tlY,
+                s2, s1, trX, trY,
+                s1, s2, blX, blY,
+                s3, s3, found[0], found[1]);
+            if (proj != null) { return proj; }
+        }
+        return affine;
+    }
+
+    // 按变换采样出模块矩阵。越界或采样点全白时返回 null。
+    static bool[] Sample(QrTransform t, bool[] dark, int w, int h, int size) {
+        bool[] outp = new bool[size * size];
+        double[] pt = new double[2];
+        for (int row = 0; row < size; row = row + 1) {
+            for (int col = 0; col < size; col = col + 1) {
+                t.Map((double)col + 0.5, (double)row + 0.5, pt);
+                int px = (int)(pt[0] + 0.5);
+                int py = (int)(pt[1] + 0.5);
+                if (px < 0 || py < 0 || px >= w || py >= h) { return null; }
+                outp[row * size + col] = dark[py * w + px];
+            }
+        }
+        return outp;
+    }
+
+    // 去掩码 + 按蛇形顺序取码字。
+    //
+    // 蛇形顺序必须与编码器**完全一致**（右起两列一列，自下而上交替，跳过
+    // 功能图形区与定时列），否则取出来的全是乱码。这里与 `QrEncoder` 的
+    // 放置循环是同一套规则。
+    static int[] ReadCodewords(bool[] modules, int size, int version,
+                                int mask, int totalCw) {
+        bool[] fn = QrSpec.FunctionMap(version);
+        int[] cw = new int[totalCw];
+        for (int i = 0; i < totalCw; i = i + 1) { cw[i] = 0; }
+        int bit = 0;
+        for (int right = size - 1; right >= 1; right = right - 2) {
+            int r2 = right;
+            if (right <= 6) { r2 = right - 1; }
+            for (int vert = 0; vert < size; vert = vert + 1) {
+                for (int z = 0; z < 2; z = z + 1) {
+                    int j = r2 - z;
+                    bool upwards = (r2 & 2) == 0;
+                    if (j < 6) { upwards = !upwards; }
+                    int y = upwards ? size - 1 - vert : vert;
+                    int idx = y * size + j;
+                    if (fn[idx]) { continue; }
+                    if (bit >= totalCw * 8) { break; }
+                    bool v = modules[idx];
+                    if (v && QrEncoder.MaskBit(mask, j, y)) { v = false; }
+                    else if (!v && QrEncoder.MaskBit(mask, j, y)) { v = true; }
+                    if (v) { cw[bit / 8] = cw[bit / 8] | (1 << (7 - bit % 8)); }
+                    bit = bit + 1;
+                }
+            }
+        }
+        return cw;
+    }
+
+    // 反交织成分块 + 逐块纠错。返回数据码字（失败返回 null）。
+    static int[] DecodeBlocks(int[] codewords, int version, QrEcl ecl) {
+        int[] plan = QrSpec.BlockPlan(version, ecl);
+        int k1 = plan[0]; int d1 = plan[1]; int k2 = plan[2]; int d2 = plan[3];
+        int numBlocks = k1 + k2;
+        if (numBlocks <= 0) { return null; }
+        int ecLen = QrSpec.EcPerBlock(ecl, version);
+        int dataTotal = QrSpec.DataCapacity(version, ecl);
+        int[] lens = new int[numBlocks];
+        for (int b = 0; b < numBlocks; b = b + 1) {
+            lens[b] = b < k1 ? d1 : d2;
+        }
+        int maxLen = d1 > d2 ? d1 : d2;
+
+        // 反交织：与编码时同样的轮次顺序取回来。
+        int[][] blockData = new int[numBlocks][];
+        int[][] blockEc = new int[numBlocks][];
+        for (int b = 0; b < numBlocks; b = b + 1) {
+            blockData[b] = new int[lens[b]];
+            blockEc[b] = new int[ecLen];
+        }
+        int w = 0;
+        for (int t = 0; t < maxLen; t = t + 1) {
+            for (int b = 0; b < numBlocks; b = b + 1) {
+                if (t < lens[b]) {
+                    if (w >= codewords.Length) { return null; }
+                    blockData[b][t] = codewords[w];
+                    w = w + 1;
+                }
+            }
+        }
+        for (int t = 0; t < ecLen; t = t + 1) {
+            for (int b = 0; b < numBlocks; b = b + 1) {
+                if (w >= codewords.Length) { return null; }
+                blockEc[b][t] = codewords[w];
+                w = w + 1;
+            }
+        }
+
+        // 拼成"数据 + 纠错"的完整码字，逐块纠错。
+        int[] outp = new int[dataTotal];
+        int o = 0;
+        for (int b = 0; b < numBlocks; b = b + 1) {
+            int n = lens[b] + ecLen;
+            int[] full = new int[n];
+            for (int i = 0; i < lens[b]; i = i + 1) { full[i] = blockData[b][i]; }
+            for (int i = 0; i < ecLen; i = i + 1) { full[lens[b] + i] = blockEc[b][i]; }
+            if (!QrRsDecoder.Decode(full, ecLen)) { return null; }
+            for (int i = 0; i < lens[b]; i = i + 1) {
+                outp[o] = full[i];
+                o = o + 1;
+            }
+        }
+        return outp;
+    }
+
+    // 解析分段（numeric / alphanumeric / byte）。
+    static bool ParseSegments(int[] data, int version, QrDecodeResult res) {
+        QrBitReader br = new QrBitReader(data);
+        StringBuilder sb = new StringBuilder();
+        List<byte> rawBytes = new List<byte>();
+        int guard = 0;
+        while (guard < 10000) {
+            guard = guard + 1;
+            if (!br.HasMore(4)) { break; }
+            int mode = br.Read(4);
+            if (mode == 0) { break; }              // 终止符
+            if (mode == 7) {
+                // ECI：读设计符后跳过（按默认字符集处理后续字节段）
+                if (!br.HasMore(8)) { break; }
+                int first = br.Read(8);
+                if ((first & 128) != 0) {
+                    if ((first & 192) == 128) { br.Read(8); }
+                    else if ((first & 224) == 192) { br.Read(16); }
+                    else { br.Read(24); }
+                }
+                continue;
+            }
+            if (mode == 3) {
+                // 结构化追加：本包不做多段合并，直接判不支持。
+                throw new BarcodeException(BarcodeError.UnsupportedMode,
+                    "structured append is not supported");
+            }
+            if (mode == 8) {
+                throw new BarcodeException(BarcodeError.UnsupportedMode,
+                    "kanji mode is not supported");
+            }
+            int countBits = QrDecoder.CharCountBits(mode, version);
+            if (!br.HasMore(countBits)) { break; }
+            int count = br.Read(countBits);
+            if (mode == 1) {
+                if (!QrDecoder.ReadNumeric(br, sb, count)) { return false; }
+            } else if (mode == 2) {
+                if (!QrDecoder.ReadAlnum(br, sb, count)) { return false; }
+            } else if (mode == 4) {
+                if (!QrDecoder.ReadByte(br, rawBytes, count)) { return false; }
+            } else {
+                throw new BarcodeException(BarcodeError.UnsupportedMode,
+                    "unknown segment mode " + mode);
+            }
+        }
+        res.text = sb.ToString();
+        if (rawBytes.Count > 0) {
+            byte[] bytes = new byte[rawBytes.Count];
+            for (int i = 0; i < rawBytes.Count; i = i + 1) { bytes[i] = rawBytes[i]; }
+            res.bytes = bytes;
+            // byte 段按 UTF-8 解码（Zan 的 string 就是 UTF-8 字节序列）。
+            res.text = res.text + Encoding.UTF8.GetString(bytes);
+        }
+        return true;
+    }
+
+    // 字符计数字段宽度（按版本分三档）。
+    static int CharCountBits(int mode, int version) {
+        int g = 0;
+        if (version <= 9) { g = 0; } else if (version <= 26) { g = 1; } else { g = 2; }
+        if (mode == 1) { return 10 + 2 * g; }
+        if (mode == 2) { return 9 + 2 * g; }
+        if (g == 0) { return 8; }
+        return 16;
+    }
+
+    // numeric 段：每 3 位数字 10 bit，最后 2 位 7 bit、1 位 4 bit。
+    //
+    // **数字是高位在前的**：一组 3 位 "123" 编码成整数 123，解码时必须按
+    // 百位、十位、个位的顺序输出——直接取 %10 会把顺序倒过来（"123" 变
+    // "321"），而且这种错**不会报错**，只会安静地给出错的文本。
+    static bool ReadNumeric(QrBitReader br, StringBuilder sb, int count) {
+        int i = 0;
+        while (i < count) {
+            int take = count - i;
+            if (take > 3) { take = 3; }
+            int bits = 4;
+            if (take == 3) { bits = 10; }
+            if (take == 2) { bits = 7; }
+            if (!br.HasMore(bits)) { return false; }
+            int v = br.Read(bits);
+            int div = 1;
+            for (int k = 0; k < take - 1; k = k + 1) { div = div * 10; }
+            for (int k = 0; k < take; k = k + 1) {
+                sb.Append(QrDecoder.DigitChar((v / div) % 10));
+                div = div / 10;
+            }
+            i = i + take;
+        }
+        return true;
+    }
+
+    // alphanumeric 段：每 2 个字符 11 bit，落单的一个 6 bit。
+    static bool ReadAlnum(QrBitReader br, StringBuilder sb, int count) {
+        string chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+        int i = 0;
+        while (i + 2 <= count) {
+            if (!br.HasMore(11)) { return false; }
+            int v = br.Read(11);
+            sb.Append(chars.Substring(v / 45, 1));
+            sb.Append(chars.Substring(v % 45, 1));
+            i = i + 2;
+        }
+        if (i < count) {
+            if (!br.HasMore(6)) { return false; }
+            int v = br.Read(6);
+            sb.Append(chars.Substring(v, 1));
+        }
+        return true;
+    }
+
+    // byte 段：每字节 8 bit。
+    static bool ReadByte(QrBitReader br, List<byte> outp, int count) {
+        for (int i = 0; i < count; i = i + 1) {
+            if (!br.HasMore(8)) { return false; }
+            outp.Add((byte)br.Read(8));
+        }
+        return true;
+    }
+
+    // 数字 0..9 -> 字符。
+    static string DigitChar(int d) {
+        if (d < 0 || d > 9) { return "?"; }
+        string digits = "0123456789";
+        return digits.Substring(d, 1);
+    }
+}

@@ -356,6 +356,17 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   按**名字**占位（`src/compiler/binder.c` 的类型声明分支用 `scope_find` 查名字，
   **不看类型参数个数**），同名即冲突，与泛型实参无关。要"同一概念的两种形态"
   就让泛型版另起名（如 `BenchCase` / `BenchCaseT`）。
+* **嵌套类型不能做数组元素类型**（实证，2026-10-21）：`Outer.Inner[]` 报
+  `undefined type 'Outer.Inner'`。但 `Outer.Inner` 作**普通类型引用**、作
+  **泛型实参**都正常，**命名空间限定**的数组元素（`System.Text.Encoding[]`）
+  也正常——只有"嵌套类型 + 数组"这一格是坏的。数组路径会先解析"包装节点"自己
+  的名字，解析不到就早退，元素真正的解析（`array_element`）排在它后面。
+  要让嵌套类型进数组/列表元素位置，只能把它提到**命名空间层**。
+* **`Exception.message` 不可写**（实证，2026-10-21）：派生异常不能在构造后补
+  细节——`e.message = "..."` 编译不过。细节要在 `base(...)` 里拼好：把拼接提成
+  静态方法（`static string Combine(string text, string detail)`）再
+  `base(Combine(text, detail))`（base 参数里只能调表达式，提成静态方法才
+  拼得出来）。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
@@ -419,7 +430,9 @@ exe**，于是 A 用例的输出被拿去和 B 用例的 golden 比，报出与 
 文件 0 字节，终端却打出了字（未改动的 conformance 用例同样如此）。要比对
 输出必须走 `tests/run_case.cmake`（cmake `execute_process` 用管道，子进程
 无控制台，捕获正常）或直接 `ctest -R <case>`；拿 PowerShell 重定向判"用例
-没输出"会把通过判成失败。
+没输出"会把通过判成失败。**生成 golden 也只能走这条路**：PowerShell 写文件
+拿到的是 0 字节，得用一段 `cmake -P` 脚本 `execute_process(... OUTPUT_VARIABLE
+...)` 捕获后再 `file(WRITE ...)` 落盘（harness 自己就是这么比对的）。
 
 **`System.Threading.Timer` 构造后不自启**（实证）：`new Timer(50, cb)`
 只是注册，必须再调 `t.Start`，否则共享泵根本不投 tick——全程无任何报错，
