@@ -1481,3 +1481,23 @@
   直接按包拆（建议落 `packages/Zan.Web.Client` 或 `Zan.Desktop.WebHost`，
   模板只留 `web/` 前端源码 + 一份薄配置）。
 - 关联：A472（GUI 排版层的同类结构性遗留）。
+### [x] A474 wuwei 的养成骨架——评估后不按"抽包"处理
+
+- 评估对象：`D:/project/games/wuwei/client/src/Game.zan`（72KB）里的养成
+  核心——境界/层数（`Realm()`/`Layer()`/`RealmName()`）、功法与道艺等级、
+  心魔突破（`HasEpiphany`/`TriggerEpiphany`）、天劫（`InTribulation`/
+  `StartTribulation`/`EndureTribulation`）、奇遇事件（`HasAdventure`/
+  `ResolveAdventure`）、寿元与年龄（`Age()`/`Lifespan()`）。
+- 判据复核（规则 14"换个游戏还成立吗"）：**不成立**。这套机制是修仙/
+  仙侠题材专属（境界突破、天劫心魔、奇遇抉择、道法等级）；抽象成"成长
+  曲线 + 事件"的泛形反而丢掉题材味道，且与包里的通用件重复。
+- 而包里的 `Game.Foundation` 通用件在 wuwei 侧的对应物是**另一层**：
+  `Game.Idle`（BigNum 千进制大数 / Wallet 多资源账本 / Offline 离线收益 /
+  Curves 指数成本）是**放置类增量**数值——实测 wuwei 源码里 `BigNum`/
+  `Wallet` 零命中、数值用 `double` 与字典计数（修仙数值到不了千进制大数
+  档），wuwei 的养成是**回合/事件驱动**而非 idle 增量，两者不重合。
+- **结论：不做抽包**。wuwei 真正该共用的那层（存档基座、设置声明与逻辑
+  层）已经通过 `GameSaveStore` / `GameSettings` / `SettingsModel` 覆盖
+  （wuwei 已在用 `Game.Data`）。"看着像重复"不等于"该抽"——判据是换题材
+  还成不成立。
+- 关联：A473（同类评估：机制成立但只有一个使用者，暂不抽）。
