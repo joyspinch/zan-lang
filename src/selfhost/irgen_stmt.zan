@@ -580,6 +580,106 @@ partial class Irgen {
     // overloads score an exact match instead of tying as ambiguous.
     string ArgTag(Node e) { Node t = ArgTypeNode(e); if (t == null) { return ""; } return TypeTag(t); }
 
+    // The host's types_match_modulo_tp (src/compiler/irgen_expr_core.c:705):
+    // a type parameter matches anything, otherwise the names, the array
+    // ranks and the type arguments must match.
+    bool TypesMatchModuloTP(Node a, Node b) {
+        if (a == null || b == null) { return false; }
+        if (IsErasedType(a) || IsErasedType(b)) { return true; }
+        if (a.sval != b.sval) { return false; }
+        if (a.ival != b.ival) { return false; }
+        if (a.kids.Count != b.kids.Count) { return false; }
+        int i = 0;
+        while (i < a.kids.Count) {
+            if (!TypesMatchModuloTP(a.kids[i], b.kids[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // The host's type_family (src/compiler/irgen_expr_core.c:727): the coarse
+    // kind of a type -- what "compatible enough" means when the exact types
+    // differ.
+    int TypeFamily(Node t) {
+        if (t == null) { return 0; }
+        string n = t.sval;
+        if (n == "bool") { return 1; }
+        if (n == "byte" || n == "short" || n == "int" || n == "long"
+            || n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte"
+            || n == "char") { return 2; }
+        if (n == "float" || n == "double") { return 3; }
+        if (n == "decimal") { return 4; }
+        if (n == "string") { return 5; }
+        if (n == "object") { return 6; }
+        if (n == "List" || n == "Dict" || n == "Dictionary" || n == "StringBuilder"
+            || n == "Span" || n == "ReadOnlySpan") { return 6; }
+        Node d = binder.FindType(n);
+        if (d != null) {
+            if (d.kind == AK.EnumDecl()) { return 2; }
+            return 6;
+        }
+        return 0;
+    }
+
+    // The number of declared parameters of a method.
+    int MethodParamCount(Node m) {
+        int n = 0; int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) { n = n + 1; }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    // The method a METHOD-GROUP argument names: `Cls.Method` where Cls is a
+    // class (not a local) and Method is one of its methods. The C host's
+    // arg_method_group (src/compiler/irgen_expr_core.c:820); `arity` picks
+    // the overload (the delegate's parameter count), -1 for the first one.
+    Node ArgMethodGroup(Node arg, int arity) {
+        if (arg == null || arg.kind != AK.MemberAccess()) { return null; }
+        if (arg.a == null || arg.a.kind != AK.Ident()) { return null; }
+        if (LocalIdx(arg.a.sval) >= 0) { return null; }
+        Node cls = binder.FindType(arg.a.sval);
+        if (cls == null) { return null; }
+        if (cls.kind != AK.ClassDecl() && cls.kind != AK.StructDecl()) { return null; }
+        if (FieldIndex(cls, arg.sval) >= 0) { return null; }
+        if (arity >= 0) {
+            Node c = cls;
+            while (c != null) {
+                int i = 0;
+                while (i < c.kids.Count) {
+                    Node mm = c.kids[i];
+                    if (mm.kind == AK.MethodDecl() && mm.sval == arg.sval
+                        && MethodParamCount(mm) == arity) { return mm; }
+                    i = i + 1;
+                }
+                c = BaseClassOf(c);
+            }
+        }
+        return FindMethodUp(cls, arg.sval);
+    }
+
+    // The C host's method_group_score (src/compiler/irgen_expr_core.c:836):
+    // a method group fits a delegate-typed parameter when the arity matches;
+    // the return types must be compatible (the same type scores higher, a
+    // different family rules the candidate out). -1 means "does not fit".
+    int MethodGroupScore(Node m, Node pt) {
+        if (m == null) { return -1; }
+        if (pt == null || !IsDelegate(pt)) { return -1; }
+        if (DelegParams(pt).Count != MethodParamCount(m)) { return -1; }
+        int score = 2;
+        Node rt = m.type;
+        Node dr = DelegRet(pt);
+        if (rt != null && dr != null && !MentionsTypeParam(rt) && !MentionsTypeParam(dr)) {
+            if (TypeTag(rt) == TypeTag(dr)) { score = score + 2; }
+            else {
+                int rf = TypeFamily(rt); int df = TypeFamily(dr);
+                if (rf != df && rf != 0 && df != 0) { return -1; }
+            }
+        }
+        return score;
+    }
+
     // The explicit type arguments of a call (`M<int>(x)`), if any.
     Node ExplicitTypeArgs(Node e) {
         if (e == null || e.d == null) { return null; }
@@ -622,10 +722,28 @@ partial class Irgen {
                 a = a + 1;
                 continue;
             }
-            string at = ArgTag(arg);
-            if (at != "") {
-                if (at == TypeTag(pt)) { score = score + 4; }
-                else if (MentionsTypeParam(pt)) { score = score + 2; }
+            // a method group (`Cls.Method` used as a value) fits a
+            // delegate-typed parameter: the C host's method_group_score
+            Node paty = pt;
+            int parity = -1;
+            if (paty != null && IsDelegate(paty)) { parity = DelegParams(paty).Count; }
+            Node mg = ArgMethodGroup(arg, parity);
+            if (mg != null) {
+                int ms = MethodGroupScore(mg, paty);
+                if (ms > 0) { score = score + ms; }
+                a = a + 1;
+                continue;
+            }
+            Node atn = ArgTypeNode(arg);
+            if (atn != null) {
+                if (MentionsTypeParam(pt)) {
+                    // a parameter that mentions a type parameter scores only
+                    // when the argument matches it MODULO that parameter
+                    // (the C host's types_match_modulo_tp): `Col<T>` takes
+                    // `Col<Item>`, `List<Col<T>>` does not
+                    if (TypesMatchModuloTP(pt, atn)) { score = score + 3; }
+                }
+                else if (TypeTag(atn) == TypeTag(pt)) { score = score + 4; }
                 else { score = score - 1; }
             }
             a = a + 1;
@@ -776,11 +894,12 @@ partial class Irgen {
     // The C host's constructor selection (src/compiler/irgen_expr_core.c:
     // find_ctor) rules a constructor OUT when an argument does not fit its
     // parameter: a lambda fits only a delegate-typed parameter whose
-    // parameter count matches the lambda's arity -- anything else makes the
-    // whole constructor incompatible. Without that rule a `Bag<T>(List<string>)`
-    // overload swallows the lambda argument of `new Bag<Item>(i => i.name)`,
-    // the lambda's parameter stays untyped and its body does not compile.
-    bool CtorTakesLambda(Node ctor, Node e) {
+    // parameter count matches the lambda's arity, and a method group fits
+    // only a delegate-typed parameter it can be converted to. Without that
+    // rule a `Bag<T>(List<string>)` overload swallows the lambda argument of
+    // `new Bag<Item>(i => i.name)`, the lambda's parameter stays untyped and
+    // its body does not compile.
+    bool CtorArgFits(Node ctor, Node e) {
         int argc = e.kids.Count;
         int j = 0;
         int i = 0;
@@ -789,10 +908,16 @@ partial class Irgen {
             if (p.kind == AK.Param()) {
                 if (j < argc) {
                     Node arg = e.kids[j];
+                    Node pt = p.type;
                     if (arg != null && arg.kind == AK.Lambda()) {
-                        Node pt = p.type;
                         if (pt == null || !IsDelegate(pt)) { return false; }
                         if (DelegParams(pt).Count != LambdaArity(arg)) { return false; }
+                    }
+                    else {
+                        int parity = -1;
+                        if (pt != null && IsDelegate(pt)) { parity = DelegParams(pt).Count; }
+                        Node mg = ArgMethodGroup(arg, parity);
+                        if (mg != null && MethodGroupScore(mg, pt) < 0) { return false; }
                     }
                 }
                 j = j + 1;
@@ -820,7 +945,7 @@ partial class Irgen {
         List<Node> fit = new List<Node>();
         i = 0;
         while (i < cands.Count) {
-            if (CtorFitsStrict(cands[i], argc) && CtorTakesLambda(cands[i], e)) { fit.Add(cands[i]); }
+            if (CtorFitsStrict(cands[i], argc) && CtorArgFits(cands[i], e)) { fit.Add(cands[i]); }
             i = i + 1;
         }
         if (fit.Count == 0) { return null; }

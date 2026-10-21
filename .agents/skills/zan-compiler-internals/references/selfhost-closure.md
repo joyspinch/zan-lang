@@ -1730,3 +1730,28 @@ kernel32、shell32、user32、advapi32、version）。
 - 做法：构造器候选筛选阶段加这条规则（`CtorTakesLambda`）。
 - 通用教训：**"实参类型未知"不等于"实参适配任何形参"**——宿主在实参
   类型推不出来时按**形状**（是不是 lambda、委托的元数）先筛一遍。
+## 89. 重载评分：形参提到类型参数时按"模类型参数"匹配
+
+- 坑（2026-10-21 实测）：`new Bag<Item>(new Col<Item>("Name", Cells.NameOf))`
+  （`Bag<T>` 有 `Bag(List<Col<T>>)`、`Bag(Col<T>)`、`Bag(RowOf<T>)` 三个
+  构造器）在自举里三个候选都拿到同样的 +2（"形参提到了类型参数"就加分）
+  → 打平 → 按声明顺序选中 `Bag(List<Col<T>>)` → 列数不对。
+  宿主只在实参**模掉类型参数**后与形参同形时才加分
+  （`src/compiler/irgen_expr_core.c` 的 `types_match_modulo_tp` → +3）：
+  `Col<T>` 匹配 `Col<Item>`（+3），`List<Col<T>>` 与 `RowOf<T>` 都不匹配
+  （+0）。
+- 做法：`ScoreCand` 把"形参提到类型参数"这一支从"无条件 +2"改成
+  "模类型参数匹配得上 +3，否则 0"（`TypesMatchModuloTP`）。
+- 通用教训：**"提到了类型参数"不等于"匹配"**——泛型形参要比的是**去掉
+  类型参数后的形状**（类名 + 层数 + 其余类型实参），不是"有没有提到"。
+## 90. 方法组实参只匹配委托形参（宿主 arg_method_group）
+
+- 坑（2026-10-21 实测）：`new Bag<Item>(Rows.Of)`（`Rows.Of` 是静态方法，
+  当委托值用）在自举里选中了 `Bag(List<Col<T>>)` → 委托字段是空的 → 崩。
+  宿主把方法组实参**排除**在非委托形参之外（`find_ctor` 的
+  compatible=false 规则 + `method_group_score`：必须是委托形参、参数个数
+  相同、返回类型同族）。
+- 做法：构造器候选筛选加方法组规则（`CtorArgFits`），评分按
+  `MethodGroupScore`（返回类型同族：同型 +2，不同族直接排除）。
+- 通用教训：**"方法名不带括号"是一种实参形状**，要按形状（而不是按
+  "类型未知"）去筛候选。
