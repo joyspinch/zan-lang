@@ -1,13 +1,18 @@
 <#
 .SYNOPSIS
-    外部游戏项目的"商业级四口径"体检。
+    外部游戏项目的"基础设施四口径"体检 + 美术资产盘点。
 
 .DESCRIPTION
-    口径（就这四条，平台侧能力如内购/联网/成就不在范围内）：
+    **先说清这是什么**：下面四条量的是**基础设施**，不是游戏品质。
       1. 能跑     —— 有 client/tools/build.ps1 且能构建出可执行文件；
       2. 有存档   —— 源码里有持久化（写文件 / Save / 存档）；
       3. 有设置   —— 源码里有可改选项（设置 / Settings / Options / Config）；
       4. 单文件发布 —— build.ps1 支持透传 --publish，产出自包含 exe。
+
+    这四条全绿 **只说明"这是个能交付的程序"**，不说明"这是个游戏"——
+    给一个没有玩法的占位骨架加上存档和设置，它同样四条全绿。
+    所以本脚本另起一列 `art`（位图/音频资产数）：**有真实美术资产才谈得
+    上"游戏级"**。两个数一起看：基础设施全绿但 art=0 的，是原型，不是游戏。
 
     静态扫描源码给出"缺口在哪"，不替代实跑；发布能力用
     `-ZancArgs '--publish'` 实跑验证更可靠（脚本会提示）。
@@ -55,9 +60,18 @@ foreach ($p in $projects) {
     $test = Get-ChildItem $p.FullName -Recurse -File -Filter 'test.ps1' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch 'obj' } | Select-Object -First 1
 
+    # 美术资产数：位图 + 音频。**这是"像不像游戏"的第一道硬门槛**——
+    # 四条基础设施全绿但 art=0 的项目只是可运行的原型（几何图形 + TODO）。
+    $art = @(Get-ChildItem $p.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.FullName -notmatch 'build|obj|bin|\.git' -and
+            $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp|wav|ogg|mp3)$'
+        }).Count
+
     $rows += [pscustomobject]@{
         project = $p.Name
         zan = $files.Count
+        art = $art
         save = $save
         setting = $setting
         publish = $publish
@@ -73,13 +87,14 @@ if ($Json) {
 else {
     $rows | Format-Table -AutoSize
     Write-Host ''
-    Write-Host ("projects={0}  build={1}  test={2}  save={3}  setting={4}  publish={5}" -f `
+    Write-Host ("projects={0}  build={1}  test={2}  save={3}  setting={4}  publish={5}  art>0={6}" -f `
             $rows.Count,
             ($rows | Where-Object { $_.build }).Count,
             ($rows | Where-Object { $_.test }).Count,
             ($rows | Where-Object { $_.save }).Count,
             ($rows | Where-Object { $_.setting }).Count,
-            ($rows | Where-Object { $_.publish }).Count)
+            ($rows | Where-Object { $_.publish }).Count,
+            ($rows | Where-Object { $_.art -gt 0 }).Count)
     $missing = $rows | Where-Object { -not $_.publish -or -not $_.save -or -not $_.setting }
     foreach ($m in $missing) {
         $gap = @()
@@ -87,5 +102,12 @@ else {
         if (-not $m.setting) { $gap += '设置' }
         if (-not $m.publish) { $gap += '单文件发布' }
         Write-Host ("GAP {0,-12} {1}" -f $m.project, ($gap -join '/'))
+    }
+    # 基础设施全绿但一件美术资产都没有的：不是游戏，是可运行的原型。
+    $proto = $rows | Where-Object {
+        $_.build -and $_.test -and $_.save -and $_.setting -and $_.publish -and $_.art -eq 0
+    }
+    foreach ($m in $proto) {
+        Write-Host ("PROTO {0,-12} 基础设施四口径全绿但零美术资产 —— 可运行的原型，不是游戏" -f $m.project)
     }
 }
