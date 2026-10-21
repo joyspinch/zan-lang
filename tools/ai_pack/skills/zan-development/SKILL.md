@@ -345,6 +345,14 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
 * **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
   换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
   读回来用 `File.ReadAllText` / `ReadAllLines`。
+* **`var` 是保留字，不能作变量名**（实证，2026-10-21）：局部变量写 `var x = 1;`
+  报 "expected variable name"——和 `out` / `base` 同一类坑：报错措辞完全看不出
+  是保留字撞车，只能靠"换个名字就好了"反推。要类型就显式写类型。
+* **同名泛型与非泛型类型不能共存**（实证，2026-10-21）：同一作用域里写
+  `class Foo` 和 `class Foo<T>` 报 "duplicate type declaration 'Foo'"——绑定器
+  按**名字**占位（`src/compiler/binder.c` 的类型声明分支用 `scope_find` 查名字，
+  **不看类型参数个数**），同名即冲突，与泛型实参无关。要"同一概念的两种形态"
+  就让泛型版另起名（如 `BenchCase` / `BenchCaseT`）。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the

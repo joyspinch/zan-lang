@@ -1255,6 +1255,67 @@ leader 选举；没有内置仪表板；参数是 JSON 文本（强类型靠显�
 不到锁直接报 `StorageFailure`，多实例部署要各给一份存储路径或换数据库实现）；
 存储层全量扫描，任务量到万级需要换实现。
 
+### 1.24 基准测试：`Zan.Bench`
+
+新包 `packages/Zan.Bench`，命名空间 `System.Bench`。补 BenchmarkDotNet
+（11,512★）那一档的**时间基准核心子集**：预热 + 重复测量（单调时钟）+ 中位数
+主导的统计 + 参数化用例 + 文本/JSON 报告 + 基线对比。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `BenchSuite.zan` | `BenchSuite` | 门面：注册用例 / 跑 / 出文本报告 / 出 JSON；重名注册抛 `DuplicateCase` |
+| `BenchRunner.zan` | `BenchRunner` | 执行器：预热 → 测量循环 → 统计；`TicksToNs` / `TicksToMs`（先除后乘避免溢出） |
+| `BenchOptions.zan` | `BenchOptions` | 四个旋钮：预热轮数 / 轮数下限 / 目标时长 / 轮数上限；`Default()` / `Quick()` / `Copy()` |
+| `BenchCase.zan` | `BenchCase` | 无参用例：名字 + `Action` |
+| `BenchCaseT.zan` | `BenchCaseT<TArgs>` | 参数化用例：名字 + `ActionT<TArgs>` + 参数（泛型保类型，零装箱） |
+| `BenchResult.zan` | `BenchResult` | 测量结果：轮数 / 样本 / 总耗时 / 均值 / 中位数 / 最小 / 最大 / 标准差 / ops/s / 相对波动 |
+| `BenchStats.zan` | `BenchStats` | 统计原语：插入排序 / 中位数 / 均值 / 最小最大 / 样本标准差 / 平方根 |
+| `BenchReport.zan` | `BenchReport` | 文本表格（按列宽对齐）+ JSON 报告 + 字符串转义 |
+| `BenchBaseline.zan` | `BenchBaseline` / `BenchDelta` | 基线解析与对比：`faster` / `slower` / `same` / `new` + 变化百分比 + 噪声阈值 |
+| `BenchError.zan` / `BenchException.zan` | — | 可区分错误码（用例非法 / 名字重复 / 基线损坏 / 基线缺项 / 选项非法 / 被测体抛异常）+ 异常 |
+
+**七条硬取舍**：
+
+1. **中位数是主指标，均值只作参考**。基准最常见的失真不是"测不准"，而是被偶发
+   尖峰带偏——一次调度抖动就能把均值抬一大截。中位数对这类噪声不敏感，所以
+   基线比的是中位数。
+2. **预热是显式的一步**，且**预热轮次不计入统计**（`iterations` 是测量轮数，
+   `samples` 里只有测量样本）。冷启动开销不该被算成"这个操作很慢"。
+3. **三个旋钮一起给**：轮数下限（样本够）、目标时长（样本稳）、轮数上限（不过热）。
+   测量循环跑到"满足下限且达到目标时长"就停，但永不超过上限。判定器与 CI 用
+   `BenchOptions.Quick()`（固定 3 轮），轮数确定可复现。
+4. **委托调用开销不掩饰**。`BenchCase` 的被测体是 `Action`，每次测量都过一次
+   委托调用（几十纳秒量级），对极快的操作会主导结果。源码与 README 都写明这层
+   开销；要测更细的东西就把操作内联进循环体手写计时。
+5. **参数化用例用泛型保类型，不用 `object`**。Zan 没有装箱，`object` 装不下
+   异构输入；`BenchCaseT<TArgs>` 把参数类型留在泛型里（调用点零开销），套件层面
+   再擦除成无参委托（参数在注册时固定，是基准的常态）。**注意 Zan 不允许同名
+   泛型与非泛型类型共存**（`BenchCase` + `BenchCase<TArgs>` 会报
+   `duplicate type declaration`），所以泛型版另起名 `BenchCaseT`。
+6. **同名用例注册直接抛错**，不静默覆盖——静默覆盖的后果是"以为测的是 A、
+   其实测的是 B"，基准报告里几乎发现不了。
+7. **基线对比带噪声阈值**（默认 ±3% 判 `same`）。把"变慢了 2%"报成回归，只会
+   让人养成忽略告警的习惯；告警一旦不可信就等于没有告警。
+
+conformance `bench_suite`（74 条断言）：统计原语（中位数奇偶取值 / 均值 / 最小
+最大 / 有序副本不改原数组 / 标准差 / 平方根 / 空样本）· 选项口径（默认值 /
+`Quick` 固定轮数 / `Copy` 不改原件）· 测量循环语义（轮数确定 / 预热不计入统计 /
+样本数 / 被测体调用次数 / 中位数落在最快与最慢之间 / ops/s 为正）· 参数化用例
+（拿到参数、保留参数类型）· 套件（两类用例共存 / 保持注册顺序）· 文本报告
+（表头 / 用例名 / 行数）· JSON 报告（结构 / 名字 / 转义）· 基线往返（生成的
+JSON 能被自己解析回来）· 基线对比（变快 / 变慢 / 噪声 / 新用例 / 自定义阈值）·
+错误可区分（重名 / 空名 / null 用例 / 基线损坏 / 空基线 / 基线缺 benchmarks
+数组）。判定器**只断言结构与关系，不断言具体耗时**——耗时依赖机器，绝对值不是
+契约。
+
+**已知边界**：**不提供分配量统计**（BenchmarkDotNet 的 `Allocated` 列缺席）——
+托管分配的唯一入口是编译器生成的 `zan_rt_alloc`，运行时的 malloc wrap 只在
+`--fast-alloc` 程序里链接、且 stdlib 完全没暴露 `zan_mem_get_stats`，当前语言与
+链接策略做不到，根因与两个方向登记在 `TASKS.md` 的 **A464**；本包只回答"多快"，
+不回答"占了多少"。此外不做进程隔离（用例之间会互相预热）、没有 GC 相关统计
+（Zan 是 ARC，**没有 GC**）、不做统计显著性检验、文本报告的浮点格式走
+`Convert.ToString`（机器比对请用 JSON）。
+
 ---
 ---
 
@@ -1287,7 +1348,7 @@ leader 选举；没有内置仪表板；参数是 JSON 文本（强类型靠显�
 | `Zan.Barcode` | ZXing.Net | 榜外 | 条码/二维码编解码（补全 Gui 侧扫码） |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |
 | `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
-| `Zan.Bench` | BenchmarkDotNet | 11,512 | 基准测试（ARC 无 GC，分配量统计比 .NET 更该做） |
+| `Zan.Bench` | BenchmarkDotNet | 11,512 | ✅ 已落地 `packages/Zan.Bench`（`System.Bench`：预热 + 重复测量（单调时钟）+ 中位数主导统计 + 泛型参数化用例 + 文本/JSON 报告 + 基线对比（带噪声阈值）；**不提供分配量统计**（根因见 `TASKS.md` A464），见 §1.24） | — |
 
 > LiteDB（9,486★）**不做**：嵌入式文档库用现有 ZanDb 覆盖，
 > 不引入第二套持久化语义。
@@ -1337,7 +1398,7 @@ leader 选举；没有内置仪表板；参数是 JSON 文本（强类型靠显�
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
-**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench`
+**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

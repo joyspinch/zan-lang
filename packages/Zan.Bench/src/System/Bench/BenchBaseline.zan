@@ -1,0 +1,131 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+using System.Text;
+
+namespace System.Bench;
+
+// 一次基线对比的结论。
+public class BenchDelta {
+    // 用例名。
+    public string name;
+    // 基线里的中位数（纳秒）；没有基线时为 0。
+    public long baselineMedianNs;
+    // 本次的中位数（纳秒）。
+    public long currentMedianNs;
+    // 变化百分比：正数是变慢，负数是变快；没有基线时为 0。
+    public double percentChange;
+    // 结论：`faster` / `slower` / `same` / `new`（基线里没有这个用例）。
+    public string verdict;
+
+    public BenchDelta() {
+        this.name = "";
+        this.baselineMedianNs = 0;
+        this.currentMedianNs = 0;
+        this.percentChange = 0.0;
+        this.verdict = "new";
+    }
+
+    // 一行摘要。
+    public string Describe() {
+        return this.name
+            + "  baseline=" + this.baselineMedianNs + "ns"
+            + "  current=" + this.currentMedianNs + "ns"
+            + "  change=" + this.percentChange + "%"
+            + "  " + this.verdict;
+    }
+}
+
+// 基线对比：把本次结果和上次的基线比，认出"哪个用例变慢了"。
+//
+// **为什么比中位数而不是均值**：均值会被偶发尖峰带偏，而尖峰往往与代码
+// 改动无关（机器抖动、后台进程）。中位数对这类噪声不敏感。
+//
+// **为什么要有阈值**：基准本身有噪声，±3% 以内一律判 `same`——把噪声
+// 报成"变慢了 2%"只会让人养成忽略告警的习惯。
+public class BenchBaseline {
+    // 默认噪声阈值（百分比）。
+    public static double DefaultThreshold() { return 3.0; }
+
+    // 解析基线 JSON：名字 → 中位数（纳秒）。
+    public static Dictionary<string, long> Parse(string baselineJson) {
+        Dictionary<string, long> map = new Dictionary<string, long>();
+        if (baselineJson == null || baselineJson.Length == 0) {
+            throw new BenchException(BenchError.InvalidBaseline, "baseline json is empty");
+        }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(baselineJson);
+        } catch (Exception e) {
+            throw new BenchException(BenchError.InvalidBaseline, "baseline json is malformed");
+        }
+        if (root == null || !root.IsObject()) {
+            throw new BenchException(BenchError.InvalidBaseline, "baseline json is not an object");
+        }
+        JsonValue list = root.Get("benchmarks");
+        if (list == null || !list.IsArray()) {
+            throw new BenchException(BenchError.InvalidBaseline, "baseline has no benchmarks array");
+        }
+        for (int i = 0; i < list.Count(); i++) {
+            JsonValue item = list.At(i);
+            if (item == null || !item.IsObject()) { continue; }
+            string name = item.Str("name", "");
+            if (name.Length == 0) { continue; }
+            map[name] = item.Long("medianNs", 0);
+        }
+        return map;
+    }
+
+    // 对比（默认阈值）。
+    public static List<BenchDelta> Compare(List<BenchResult> current, string baselineJson) {
+        return BenchBaseline.Compare(current, baselineJson, BenchBaseline.DefaultThreshold());
+    }
+
+    // 对比（自定义噪声阈值百分比）。
+    public static List<BenchDelta> Compare(List<BenchResult> current, string baselineJson,
+                                           double thresholdPercent) {
+        Dictionary<string, long> baselineMap = BenchBaseline.Parse(baselineJson);
+        List<BenchDelta> deltas = new List<BenchDelta>();
+        if (current == null) { return deltas; }
+        for (int i = 0; i < current.Count; i++) {
+            BenchResult r = current[i];
+            BenchDelta d = new BenchDelta();
+            d.name = r.name;
+            d.currentMedianNs = r.medianNs;
+            long baseline = 0;
+            bool found = baselineMap.TryGetValue(r.name, out baseline);
+            if (!found) {
+                d.verdict = "new";
+                deltas.Add(d);
+                continue;
+            }
+            d.baselineMedianNs = baseline;
+            if (baseline <= 0) {
+                d.verdict = "same";
+                d.percentChange = 0.0;
+                deltas.Add(d);
+                continue;
+            }
+            double change = ((double)r.medianNs - (double)baseline) / (double)baseline * 100.0;
+            d.percentChange = change;
+            if (change > thresholdPercent) { d.verdict = "slower"; }
+            else if (change < -thresholdPercent) { d.verdict = "faster"; }
+            else { d.verdict = "same"; }
+            deltas.Add(d);
+        }
+        return deltas;
+    }
+
+    // 对比结果的文本报告。
+    public static string Describe(List<BenchDelta> deltas) {
+        if (deltas == null || deltas.Count == 0) {
+            return "(no comparison)\n";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < deltas.Count; i++) {
+            sb.Append(deltas[i].Describe());
+            sb.Append("\n");
+        }
+        return sb.ToString();
+    }
+}

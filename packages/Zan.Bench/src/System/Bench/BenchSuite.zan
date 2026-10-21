@@ -1,0 +1,88 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Bench;
+
+// 基准套件（门面）：注册用例 → 跑 → 出报告。
+//
+// **为什么要有套件这一层**：单个用例自己也能跑，但"把一组用例跑完、
+// 排成一张表、存成基线、下次跟基线比"是基准测试的日常流程。把这套
+// 流程收在一个门面里，调用方只需要"注册 + 跑 + 看报告"。
+public class BenchSuite {
+    BenchOptions options;
+    BenchRunner runner;
+    List<BenchCase> cases;
+
+    public BenchSuite() {
+        this.options = BenchOptions.Default();
+        this.runner = new BenchRunner(this.options);
+        this.cases = new List<BenchCase>();
+    }
+
+    // 换一组选项（会同时换掉执行器）。
+    public void SetOptions(BenchOptions options) {
+        if (options == null) { return; }
+        this.options = options;
+        this.runner = new BenchRunner(this.options);
+    }
+
+    public BenchOptions Options() {
+        return this.options;
+    }
+
+    // 注册一个无参用例。同名重复注册抛 `DuplicateCase`——
+    // 静默覆盖会让"以为测的是 A、其实测的是 B"。
+    public void Add(BenchCase c) {
+        if (c == null) {
+            throw new BenchException(BenchError.InvalidCase, "case is null");
+        }
+        if (c.name == null || c.name.Length == 0) {
+            throw new BenchException(BenchError.InvalidCase, "case name is empty");
+        }
+        for (int i = 0; i < this.cases.Count; i++) {
+            if (this.cases[i].name == c.name) {
+                throw new BenchException(BenchError.DuplicateCase, c.name,
+                    "case already registered: " + c.name);
+            }
+        }
+        this.cases.Add(c);
+    }
+
+    // 注册一个带参数的用例。
+    //
+    // 参数在**注册时固定**（这是基准的常态：测"对这份输入重复操作"），
+    // 用例被擦除成无参委托存进套件，这样两类用例能一起跑、一起出报告。
+    // 泛型实参类型保留在闭包里，调用点没有装箱开销。
+    public void Add<TArgs>(BenchCaseT<TArgs> c) {
+        if (c == null) {
+            throw new BenchException(BenchError.InvalidCase, "case is null");
+        }
+        Action wrapped = () => { c.Invoke(); };
+        this.Add(new BenchCase(c.name, wrapped));
+    }
+
+    // 已注册的用例数。
+    public int Count() {
+        return this.cases.Count;
+    }
+
+    // 跑全部用例，返回结果（顺序与注册顺序一致）。
+    public List<BenchResult> Run() {
+        List<BenchResult> results = new List<BenchResult>();
+        for (int i = 0; i < this.cases.Count; i++) {
+            results.Add(this.runner.Run(this.cases[i]));
+        }
+        return results;
+    }
+
+    // 跑全部用例并返回文本报告。
+    public string Report() {
+        return BenchReport.Text(this.Run());
+    }
+
+    // 跑全部用例并返回 JSON（可存成基线）。
+    public string ToJson() {
+        return BenchReport.Json(this.Run());
+    }
+}

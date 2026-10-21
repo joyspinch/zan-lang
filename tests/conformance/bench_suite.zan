@@ -1,0 +1,226 @@
+using System;
+using System.Collections.Generic;
+using System.Bench;
+
+// Zan.Bench 判定器：统计原语 / 选项口径 / 测量循环语义 / 参数化用例 /
+// 套件去重 / 文本与 JSON 报告 / 基线对比 / 错误码可区分。
+//
+// **只断言结构与关系，不断言具体耗时**——耗时依赖机器，绝对值不是契约；
+// 契约是"预热不计入统计""轮数确定""中位数落在最快与最慢之间"这类关系。
+class BenchSuiteCase {
+    static int ok = 0;
+    static int bad = 0;
+
+    static void Check(string label, bool cond) {
+        if (cond) { ok = ok + 1; Console.WriteLine("ok   " + label); }
+        else { bad = bad + 1; Console.WriteLine("FAIL " + label); }
+    }
+
+    static int CountLines(string s) {
+        if (s == null) { return 0; }
+        int n = 0;
+        for (int i = 0; i < s.Length; i++) {
+            if (s.Substring(i, 1) == "\n") { n = n + 1; }
+        }
+        return n;
+    }
+
+    static BenchResult MakeResult(string name, long medianNs) {
+        BenchResult r = new BenchResult();
+        r.name = name;
+        r.iterations = 3;
+        r.warmupIterations = 1;
+        r.medianNs = medianNs;
+        r.meanNs = medianNs;
+        r.minNs = medianNs;
+        r.maxNs = medianNs;
+        r.totalNs = medianNs * 3;
+        r.stdDevNs = 0.0;
+        r.opsPerSecond = 1000000000.0 / (double)medianNs;
+        r.samples.Add(medianNs);
+        r.samples.Add(medianNs);
+        r.samples.Add(medianNs);
+        return r;
+    }
+
+    static void Main() {
+        // --- 统计原语 ---
+        long[] samples = new long[] { 30, 10, 20, 40, 50 };
+        Check("median of odd sample count", BenchStats.Median(samples) == 30);
+        Check("median of even sample count", BenchStats.Median(new long[] { 10, 20, 30, 40 }) == 25);
+        Check("min", BenchStats.Min(samples) == 10);
+        Check("max", BenchStats.Max(samples) == 50);
+        Check("mean", BenchStats.Mean(samples) == 30);
+        Check("sorted copy is ordered", BenchStats.SortedCopy(samples)[0] == 10
+            && BenchStats.SortedCopy(samples)[4] == 50);
+        Check("sorted copy does not touch input", samples[0] == 30);
+        Check("flat sample has zero stddev", BenchStats.StdDev(new long[] { 5, 5, 5, 5 }) == 0.0);
+        Check("single sample has zero stddev", BenchStats.StdDev(new long[] { 5 }) == 0.0);
+        double sd = BenchStats.StdDev(new long[] { 1, 3 });
+        Check("stddev of 1 and 3 is about one point four", sd > 1.4 && sd < 1.5);
+        Check("sqrt", BenchStats.Sqrt(16.0) == 4.0);
+        Check("sqrt of zero", BenchStats.Sqrt(0.0) == 0.0);
+        Check("empty sample yields zero median", BenchStats.Median(new long[0]) == 0);
+
+        // --- 选项口径 ---
+        BenchOptions def = BenchOptions.Default();
+        Check("default warmup is three", def.warmupIterations == 3);
+        Check("default min iterations is ten", def.minIterations == 10);
+        Check("default max iterations is one thousand", def.maxIterations == 1000);
+        Check("default target is two hundred ms", def.targetMilliseconds == 200);
+        BenchOptions quick = BenchOptions.Quick();
+        Check("quick warmup is one", quick.warmupIterations == 1);
+        Check("quick iterations are fixed at three", quick.minIterations == 3
+            && quick.maxIterations == 3);
+        Check("quick does not run by time", quick.targetMilliseconds == 0);
+        BenchOptions copy = quick.Copy();
+        copy.warmupIterations = 9;
+        Check("copy does not touch the original", quick.warmupIterations == 1);
+
+        // --- 测量循环语义 ---
+        BenchRunner runner = new BenchRunner(BenchOptions.Quick());
+        int calls = 0;
+        BenchCase c = new BenchCase("inc", () => { calls = calls + 1; });
+        BenchResult r = runner.Run(c);
+        Check("iteration count is fixed", r.iterations == 3);
+        Check("warmup count is recorded", r.warmupIterations == 1);
+        Check("warmup is not counted as a sample", r.samples.Count == 3);
+        Check("body ran warmup plus measured times", calls == 4);
+        Check("case name is kept", r.name == "inc");
+        Check("measured time is positive", r.meanNs > 0);
+        Check("median lies between min and max", r.medianNs >= r.minNs
+            && r.medianNs <= r.maxNs);
+        Check("min is not above max", r.minNs <= r.maxNs);
+        Check("ops per second is positive", r.opsPerSecond > 0.0);
+        Check("total is the sum of samples", r.totalNs >= r.minNs);
+        Check("variance ratio is not negative", r.VarianceRatio() >= 0.0);
+        Check("describe mentions the name", r.Describe().Contains("inc"));
+
+        // --- 参数化用例 ---
+        int total = 0;
+        BenchCaseT<int> typed = new BenchCaseT<int>("sum3", (a) => { total = total + a; }, 3);
+        BenchResult rt = runner.Run(typed);
+        Check("typed case ran", rt.iterations == 3);
+        Check("typed case name is kept", rt.name == "sum3");
+        Check("typed case received its argument", total == 12);
+        BenchCaseT<string> named = new BenchCaseT<string>("named", (a) => { total = total + a.Length; }, "abc");
+        runner.Run(named);
+        Check("typed case keeps its argument type", total == 24);
+
+        // --- 套件 ---
+        BenchSuite suite = new BenchSuite();
+        suite.SetOptions(BenchOptions.Quick());
+        Check("suite options are replaceable", suite.Options().minIterations == 3);
+        suite.Add(new BenchCase("alpha", () => { }));
+        suite.Add(new BenchCaseT<int>("beta", (x) => { }, 1));
+        Check("suite counts both cases", suite.Count() == 2);
+        List<BenchResult> results = suite.Run();
+        Check("suite ran every case", results.Count == 2);
+        Check("suite keeps registration order", results[0].name == "alpha"
+            && results[1].name == "beta");
+
+        // --- 文本报告 ---
+        string report = suite.Report();
+        Check("report has a header line", report.Contains("median(ns)"));
+        Check("report has the ops column", report.Contains("ops/s"));
+        Check("report lists the first case", report.Contains("alpha"));
+        Check("report lists the second case", report.Contains("beta"));
+        Check("report has one line per case plus a header", CountLines(report) == 3);
+        Check("empty report says so", BenchReport.Text(new List<BenchResult>())
+            .Contains("no benchmark cases"));
+
+        // --- JSON 报告 ---
+        string json = suite.ToJson();
+        Check("json has the benchmarks array", json.Contains("\"benchmarks\""));
+        Check("json carries the case names", json.Contains("\"alpha\"")
+            && json.Contains("\"beta\""));
+        Check("json carries the iteration count", json.Contains("\"iterations\""));
+        Check("json carries the median", json.Contains("\"medianNs\""));
+        Check("json escapes quotes in names",
+            BenchReport.Quote("a\"b") == "\"a\\\"b\"");
+
+        // --- 基线往返 ---
+        List<BenchResult> baseList = new List<BenchResult>();
+        baseList.Add(MakeResult("alpha", 100));
+        string baseJson = BenchReport.Json(baseList);
+        Dictionary<string, long> parsed = BenchBaseline.Parse(baseJson);
+        Check("baseline round-trips the median", parsed["alpha"] == 100);
+        Check("baseline knows its case count", parsed.Count == 1);
+
+        // --- 基线对比 ---
+        List<BenchResult> slower = new List<BenchResult>();
+        slower.Add(MakeResult("alpha", 200));
+        List<BenchDelta> dSlower = BenchBaseline.Compare(slower, baseJson);
+        Check("one delta per case", dSlower.Count == 1);
+        Check("double the time is slower", dSlower[0].verdict == "slower");
+        Check("slowdown is one hundred percent", dSlower[0].percentChange == 100.0);
+        Check("baseline value is carried", dSlower[0].baselineMedianNs == 100);
+        Check("current value is carried", dSlower[0].currentMedianNs == 200);
+
+        List<BenchResult> faster = new List<BenchResult>();
+        faster.Add(MakeResult("alpha", 50));
+        List<BenchDelta> dFaster = BenchBaseline.Compare(faster, baseJson);
+        Check("half the time is faster", dFaster[0].verdict == "faster");
+        Check("speedup is minus fifty percent", dFaster[0].percentChange == -50.0);
+
+        List<BenchResult> noise = new List<BenchResult>();
+        noise.Add(MakeResult("alpha", 101));
+        List<BenchDelta> dNoise = BenchBaseline.Compare(noise, baseJson);
+        Check("one percent is noise", dNoise[0].verdict == "same");
+
+        List<BenchResult> fresh = new List<BenchResult>();
+        fresh.Add(MakeResult("gamma", 5));
+        List<BenchDelta> dFresh = BenchBaseline.Compare(fresh, baseJson);
+        Check("a case missing from the baseline is new", dFresh[0].verdict == "new");
+        Check("a new case has no baseline value", dFresh[0].baselineMedianNs == 0);
+
+        List<BenchDelta> dCustom = BenchBaseline.Compare(slower, baseJson, 250.0);
+        Check("a wider threshold swallows the regression", dCustom[0].verdict == "same");
+        Check("comparison can be described", BenchBaseline.Describe(dSlower)
+            .Contains("slower"));
+        Check("empty comparison says so", BenchBaseline.Describe(new List<BenchDelta>())
+            .Contains("no comparison"));
+
+        // --- 错误可区分 ---
+        try {
+            suite.Add(new BenchCase("alpha", () => { }));
+            Check("duplicate case is rejected", false);
+        } catch (BenchException e) {
+            Check("duplicate case is rejected", e.error == BenchError.DuplicateCase);
+        }
+        try {
+            suite.Add(new BenchCase("", () => { }));
+            Check("empty case name is rejected", false);
+        } catch (BenchException e) {
+            Check("empty case name is rejected", e.error == BenchError.InvalidCase);
+        }
+        try {
+            suite.Add(null);
+            Check("null case is rejected", false);
+        } catch (BenchException e) {
+            Check("null case is rejected", e.error == BenchError.InvalidCase);
+        }
+        try {
+            BenchBaseline.Parse("not json");
+            Check("malformed baseline is rejected", false);
+        } catch (BenchException e) {
+            Check("malformed baseline is rejected", e.error == BenchError.InvalidBaseline);
+        }
+        try {
+            BenchBaseline.Parse("{}");
+            Check("baseline without benchmarks is rejected", false);
+        } catch (BenchException e) {
+            Check("baseline without benchmarks is rejected", e.error == BenchError.InvalidBaseline);
+        }
+        try {
+            BenchBaseline.Parse("");
+            Check("empty baseline is rejected", false);
+        } catch (BenchException e) {
+            Check("empty baseline is rejected", e.error == BenchError.InvalidBaseline);
+        }
+        Check("error codes are distinct", (int)BenchError.InvalidCase != (int)BenchError.DuplicateCase
+            && (int)BenchError.DuplicateCase != (int)BenchError.InvalidBaseline);
+
+        Console.WriteLine("ok=" + ok + " bad=" + bad);
+    }
+}

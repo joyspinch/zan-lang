@@ -1,0 +1,107 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Bench;
+
+// 基准执行器：预热 → 反复测量 → 统计。
+//
+// **计时用单调时钟**（`Stopwatch.NowTicks()`，不受墙钟调整影响），
+// 换算到纳秒。测量循环的语义：
+//
+// 1. 先跑 `warmupIterations` 轮**不记录**——把首次调用的代码路径预热、
+//    让数据进缓存，否则第一轮的冷启动开销会被当成"这个操作很慢"。
+// 2. 再跑到满足**轮数下限**且（如果设了目标时长）**达到目标时长**为止，
+//    但不超过轮数上限。轮数下限保证样本够、目标时长保证样本够稳。
+//
+// **委托调用本身有开销**（约几十纳秒），对极快的操作它会主导测量结果。
+// 这是所有委托式基准的共同问题：测出来的"操作耗时"里含一次委托调用。
+// 想测更细的东西就把操作**内联**进循环体（此时应改用 `BenchCase` 的
+// 变体或直接手写计时），本执行器不假装自己没有这层开销。
+public class BenchRunner {
+    BenchOptions options;
+
+    public BenchRunner(BenchOptions options) {
+        this.options = options != null ? options : BenchOptions.Default();
+    }
+
+    public BenchOptions Options() {
+        return this.options;
+    }
+
+    // 跑一个无参用例。
+    public BenchResult Run(BenchCase c) {
+        if (c == null) {
+            throw new BenchException(BenchError.InvalidCase, "case is null");
+        }
+        return this.Measure(c.name, () => { c.Invoke(); });
+    }
+
+    // 跑一个带参数的用例。
+    public BenchResult Run<TArgs>(BenchCaseT<TArgs> c) {
+        if (c == null) {
+            throw new BenchException(BenchError.InvalidCase, "case is null");
+        }
+        return this.Measure(c.name, () => { c.Invoke(); });
+    }
+
+    // 测量循环（内部共用一份逻辑）。
+    BenchResult Measure(string name, Action body) {
+        BenchOptions opt = this.options;
+        for (int i = 0; i < opt.warmupIterations; i++) {
+            body();
+        }
+
+        long freq = Stopwatch.Frequency();
+        List<long> samples = new List<long>();
+        long startTicks = Stopwatch.NowTicks();
+        while (true) {
+            if (samples.Count >= opt.maxIterations) { break; }
+            if (samples.Count >= opt.minIterations
+                && opt.targetMilliseconds <= 0) {
+                break;
+            }
+            long t0 = Stopwatch.NowTicks();
+            body();
+            long t1 = Stopwatch.NowTicks();
+            long delta = t1 - t0;
+            if (delta < 0) { delta = 0; }
+            samples.Add(BenchRunner.TicksToNs(delta, freq));
+            if (opt.targetMilliseconds > 0 && samples.Count >= opt.minIterations) {
+                long elapsedMs = BenchRunner.TicksToMs(Stopwatch.NowTicks() - startTicks, freq);
+                if (elapsedMs >= opt.targetMilliseconds) { break; }
+            }
+        }
+
+        BenchResult r = new BenchResult();
+        r.name = name;
+        r.iterations = samples.Count;
+        r.warmupIterations = opt.warmupIterations;
+        r.samples = samples;
+        long[] arr = r.SampleArray();
+        r.totalNs = 0;
+        for (int i = 0; i < arr.Length; i++) { r.totalNs = r.totalNs + arr[i]; }
+        r.meanNs = BenchStats.Mean(arr);
+        r.medianNs = BenchStats.Median(arr);
+        r.minNs = BenchStats.Min(arr);
+        r.maxNs = BenchStats.Max(arr);
+        r.stdDevNs = BenchStats.StdDev(arr);
+        if (r.meanNs > 0) {
+            r.opsPerSecond = 1000000000.0 / (double)r.meanNs;
+        }
+        return r;
+    }
+
+    // tick 差换算成纳秒（先除后乘，避免长时间测量时溢出）。
+    public static long TicksToNs(long ticks, long freq) {
+        if (freq <= 0) { return 0; }
+        if (ticks < 0) { return 0; }
+        return (ticks / freq) * 1000000000 + (ticks % freq) * 1000000000 / freq;
+    }
+
+    // tick 差换算成毫秒。
+    public static long TicksToMs(long ticks, long freq) {
+        if (freq <= 0) { return 0; }
+        if (ticks < 0) { return 0; }
+        return (ticks / freq) * 1000 + (ticks % freq) * 1000 / freq;
+    }
+}
