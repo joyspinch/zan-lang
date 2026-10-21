@@ -62,16 +62,33 @@ foreach ($p in $projects) {
 
     # 美术资产数：位图 + 音频。**这是"像不像游戏"的第一道硬门槛**——
     # 四条基础设施全绿但 art=0 的项目只是可运行的原型（几何图形 + TODO）。
-    $art = @(Get-ChildItem $p.FullName -Recurse -File -ErrorAction SilentlyContinue |
+    $artFiles = @(Get-ChildItem $p.FullName -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object {
             $_.FullName -notmatch 'build|obj|bin|\.git' -and
             $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp|wav|ogg|mp3)$'
-        }).Count
+        })
+    $art = $artFiles.Count
+    $bitmaps = @($artFiles | Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp|bmp)$' }).Count
+    $audio = @($artFiles | Where-Object { $_.Extension -match '^\.(wav|ogg|mp3)$' }).Count
+
+    # 位图**真的进了渲染路径**吗？资产目录里躺着图、源码里一次都没提过，
+    # 和没有资产是一回事（几何色块 + 摆设素材）。wired 数源码里的图片路径
+    # 字面量：直绘贴图（CDraw.BlitImage）、精灵批（SpriteHandle）、
+    # HTML 面板背景图（CSS background-image）走的都是这条路径。
+    $wired = ($text -match '\.png|\.jpg|\.webp')
+    # 玩法断言用例：有 tests/ 下的 .zan 断言文件，说明玩法被规则锁住了，
+    # 不只是"能跑起来"。
+    $playtest = @(Get-ChildItem $p.FullName -Recurse -File -Filter *.zan -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '[\\/]tests[\\/]' -and $_.FullName -notmatch 'build|obj|bin|\.git' }).Count
 
     $rows += [pscustomobject]@{
         project = $p.Name
         zan = $files.Count
         art = $art
+        bitmap = $bitmaps
+        audio = $audio
+        wired = $wired
+        playtest = $playtest
         save = $save
         setting = $setting
         publish = $publish
@@ -87,14 +104,16 @@ if ($Json) {
 else {
     $rows | Format-Table -AutoSize
     Write-Host ''
-    Write-Host ("projects={0}  build={1}  test={2}  save={3}  setting={4}  publish={5}  art>0={6}" -f `
+    Write-Host ("projects={0}  build={1}  test={2}  save={3}  setting={4}  publish={5}  art>0={6}  wired={7}  playtest={8}" -f `
             $rows.Count,
             ($rows | Where-Object { $_.build }).Count,
             ($rows | Where-Object { $_.test }).Count,
             ($rows | Where-Object { $_.save }).Count,
             ($rows | Where-Object { $_.setting }).Count,
             ($rows | Where-Object { $_.publish }).Count,
-            ($rows | Where-Object { $_.art -gt 0 }).Count)
+            ($rows | Where-Object { $_.art -gt 0 }).Count,
+            ($rows | Where-Object { $_.wired }).Count,
+            ($rows | Where-Object { $_.playtest -gt 0 }).Count)
     $missing = $rows | Where-Object { -not $_.publish -or -not $_.save -or -not $_.setting }
     foreach ($m in $missing) {
         $gap = @()
@@ -103,11 +122,17 @@ else {
         if (-not $m.publish) { $gap += '单文件发布' }
         Write-Host ("GAP {0,-12} {1}" -f $m.project, ($gap -join '/'))
     }
-    # 基础设施全绿但一件美术资产都没有的：不是游戏，是可运行的原型。
+    # 基础设施全绿但不是游戏的：零美术资产（可运行的原型），或者资产
+    # 躺着没进渲染路径（摆设素材），或者没有玩法断言用例（玩法没被锁住）。
     $proto = $rows | Where-Object {
-        $_.build -and $_.test -and $_.save -and $_.setting -and $_.publish -and $_.art -eq 0
+        $_.build -and $_.test -and $_.save -and $_.setting -and $_.publish -and
+        ($_.art -eq 0 -or -not $_.wired -or $_.playtest -eq 0)
     }
     foreach ($m in $proto) {
-        Write-Host ("PROTO {0,-12} 基础设施四口径全绿但零美术资产 —— 可运行的原型，不是游戏" -f $m.project)
+        $why = @()
+        if ($m.art -eq 0) { $why += '零美术资产' }
+        if (-not $m.wired) { $why += '位图没进渲染路径' }
+        if ($m.playtest -eq 0) { $why += '无玩法断言用例' }
+        Write-Host ("PROTO {0,-12} 基础设施四口径全绿但 {1} —— 可运行的原型，不是游戏" -f $m.project, ($why -join '/'))
     }
 }
