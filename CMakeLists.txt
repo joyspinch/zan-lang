@@ -1875,9 +1875,36 @@ add_test(NAME diag_unresolved_call_member_chain
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_call_member_chain.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_call_member_chain${_exe_ext}
-    "-DEXPECT_REGEX=.Thing. has no member .Describe."
+    "-DEXPECT_REGEX=.Thing. has no method .Describe."
+    "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_call_member_chain PROPERTIES TIMEOUT 60)
+
+# 调用一个不存在的成员方法：必须在类型检查阶段就点名报出来。
+# 以前 checker 在调用上下文整段跳过成员存在性检查，错误拖到发码阶段，
+# 只剩一句 "code generation failed"——既看不到方法名，也看不出是哪个类型。
+add_test(NAME diag_call_unknown_method
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_call_unknown_method${_exe_ext}
+    "-DEXPECT_REGEX=type .Diag\\.Thing. has no method .NoSuchMethod."
+    "-DEXPECT_ERROR_COUNT=1"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_call_unknown_method PROPERTIES TIMEOUT 60)
+
+# 同名类型被命名空间解析改写成内部 mangle 名（"DupNsA_Widget"）时，
+# 诊断里要显示原始名 "DupNsA.Widget"，不能把内部符号名漏给用户。
+add_test(NAME diag_call_unknown_method_name
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name.zan
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name_lib_a.zan;${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name_lib_b.zan"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_call_unknown_method_name${_exe_ext}
+    "-DEXPECT_REGEX=type .DupNsA\\.Widget. has no method .NoSuchMethod."
+    "-DEXPECT_ERROR_COUNT=1"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_call_unknown_method_name PROPERTIES TIMEOUT 60)
 
 add_test(NAME diag_method_group_as_receiver
   COMMAND ${CMAKE_COMMAND}
@@ -1922,7 +1949,8 @@ add_test(NAME diag_member_call_qualifies_type
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_call_qualifies_type.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type_lib.zan"
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_call_qualifies_type${_exe_ext}
-    "-DEXPECT_REGEX=type .Shapes\\.Menu. has no member .Show."
+    "-DEXPECT_REGEX=type .Shapes\\.Menu. has no method .Show."
+    "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_call_qualifies_type PROPERTIES TIMEOUT 60)
 
@@ -5415,7 +5443,8 @@ add_test(NAME diag_unresolved_static_chain
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_static_chain.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_static_chain${_exe_ext}
-    "-DEXPECT_REGEX=unresolved call 'Fluent.Create'"
+    "-DEXPECT_REGEX=.Fluent. has no method .Create."
+    "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unresolved_static_chain PROPERTIES TIMEOUT 60)
 

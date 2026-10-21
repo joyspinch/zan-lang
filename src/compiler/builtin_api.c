@@ -502,3 +502,49 @@ int zan_builtin_has_member(const char *type, const char *name, int name_len) {
     }
     return 0;
 }
+
+/* 编译器原生实现的成员。
+ *
+ * 这些成员**不在任何类的成员表里**——实现完全在编译器里，按
+ * 「类型名 + 成员名」分派。判定「某类型上有没有这个方法」时必须
+ * 把它们算进去：成员表里查不到 ≠ 方法不存在，否则合法调用会被
+ * 判成"没有这个方法"。
+ *
+ * 口径与 irgen 的原生分派点逐字对齐：
+ *   - 标量静态方法：irgen_call.c 的 int/long/Int32/Int64/double/float
+ *     的 Parse 分支（按接收者标识符文本匹配，这里按类型规范名匹配，
+ *     更宽松 → 只会放过、不会误报）；
+ *   - string 实例方法：irgen_expr_core.c 的 AsSpan / ToBytes 分支；
+ *   - 非内建类上的原生静态成员：irgen_expr.c 里 await 的原生分派
+ *     （Gate.Park / Socket.RecvOv 这类）。
+ *
+ * 增删原生成员时，本表必须与上述分派点同步。 */
+static const struct { const char *type; const char *name; } native_members[] = {
+    { "int",    "Parse" },
+    { "long",   "Parse" },
+    { "double", "Parse" },
+    { "float",  "Parse" },
+    { "string", "AsSpan" },
+    { "string", "ToBytes" },
+    { "Gate",   "Park" },
+    { "Socket", "ReadReady" },
+    { "Socket", "WriteReady" },
+    { "Socket", "RecvOv" },
+    { "Socket", "RecvToOv" },
+    { "Socket", "AcceptOv" },
+    { "Socket", "ResolveAsync" },
+    { "Socket", "ResolveSockAddr" },
+};
+
+int zan_builtin_has_native_member(const char *type, int type_len,
+                                   const char *name, int name_len) {
+    if (!type || !name || type_len <= 0 || name_len <= 0) return 0;
+    for (size_t i = 0; i < sizeof(native_members) / sizeof(native_members[0]); i++) {
+        size_t tl = strlen(native_members[i].type);
+        size_t nl = strlen(native_members[i].name);
+        if ((int)tl == type_len && memcmp(type, native_members[i].type, tl) == 0 &&
+            (int)nl == name_len && memcmp(name, native_members[i].name, nl) == 0)
+            return 1;
+    }
+    return 0;
+}

@@ -2265,26 +2265,11 @@ static LLVMValueRef emit_guarded_member_object(zan_irgen_t *g,
     return value;
 }
 
-static bool class_implements_iface_depth(zan_symbol_t *cls, zan_symbol_t *iface,
-                                          int depth) {
-    if (!cls || !cls->type || !iface || depth > 512) return false;
-    for (int i = 0; i < cls->type->interface_count; i++) {
-        zan_type_t *it = cls->type->interfaces[i];
-        if (!it || !it->sym) continue;
-        if (it->sym == iface) return true;
-        if (it->sym != cls &&
-            class_implements_iface_depth(it->sym, iface, depth + 1))
-            return true;
-    }
-    if (cls->type->base_type && cls->type->base_type->sym &&
-        cls->type->base_type->sym != cls)
-        return class_implements_iface_depth(cls->type->base_type->sym,
-                                            iface, depth + 1);
-    return false;
-}
-
 static bool class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
-    return class_implements_iface_depth(cls, iface, 0);
+    /* 与 checker 共用 binder 里的同一份判定：两边对"接口方法算不算这个
+     * 类型的成员"必须口径一致，否则 checker 报"没有这个方法"而 irgen
+     * 又能把同一个调用发出去。 */
+    return zan_binder_class_implements_iface(cls, iface);
 }
 
 static zan_symbol_t *get_method_sym(zan_symbol_t *cls, zan_istr_t name);

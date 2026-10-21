@@ -2781,9 +2781,10 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 }
             }
             if (!callee_is_method) {
-                callee_type = type_is_scalar_primitive(recv)
-                    ? c->binder->type_error
-                    : check_member_access(c, expr->call.callee, recv, true);
+                /* 标量原语（string/int/…）也要走成员检查：调用一个不存在
+                 * 的方法应该在类型检查阶段就报出来，而不是拖到发码阶段
+                 * 变成 "code generation failed"（A476）。 */
+                callee_type = check_member_access(c, expr->call.callee, recv, true);
             }
         } else {
             callee_type = zan_checker_check_expr(c, expr->call.callee);
@@ -4193,6 +4194,170 @@ static bool receiver_is_value_expr(zan_checker_t *c, zan_ast_node_t *obj) {
     }
 }
 
+/* ---------- 面向用户的类型名（A476） ---------- */
+
+/* 类型的原始简单名。
+ *
+ * nsresolve 在同名冲突时会把声明名改写成 mangle 后的内部名
+ * （"Gui.Widget.QrEncoder" → "Gui_Widget_QrEncoder"），原始简单名留在
+ * decl 的 meta 里。诊断要给用户看原始名——内部符号名对用户没有意义，
+ * 还会让人以为自己的类被改名了。 */
+static zan_istr_t checker_type_simple_name(zan_type_t *t) {
+    zan_istr_t empty = {NULL, 0};
+    if (!t) return empty;
+    if (t->sym) {
+        if (t->sym->decl) {
+            zan_istr_t on = zan_ast_orig_name(t->sym->decl);
+            if (on.len) return on;
+        }
+        if (t->sym->name.len) return t->sym->name;
+    }
+    return t->name;
+}
+
+/* 报"这个类型上没有这个成员/方法"。
+ *
+ * 措辞分两档：取值位置说"没有这个成员"，调用位置说"没有这个方法"——
+ * 混成一句话，"方法名写错了"和"字段名写错了"就分不开了。 */
+static void checker_report_no_member(zan_checker_t *c, zan_ast_node_t *expr,
+                                     zan_type_t *recv, zan_istr_t name,
+                                     bool is_method) {
+    const char *what = is_method ? "has no method" : "has no member";
+    zan_istr_t ns = {NULL, 0};
+    zan_istr_t simple = checker_type_simple_name(recv);
+    if (recv && recv->sym) ns = access_symbol_ns(recv->sym);
+    if (ns.len) {
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "type '%.*s.%.*s' %s '%.*s'",
+                      (int)ns.len, ns.str,
+                      (int)simple.len, simple.str,
+                      what,
+                      (int)name.len, name.str);
+    } else {
+        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                      "'%.*s' %s '%.*s'",
+                      (int)simple.len, simple.str,
+                      what,
+                      (int)name.len, name.str);
+    }
+}
+
+/* 符号链（类 + 基类）里有没有这个名字的成员 */
+static bool checker_sym_chain_has_member(zan_symbol_t *sym, zan_istr_t name) {
+    for (zan_symbol_t *s = sym; s;
+         s = (s->type && s->type->base_type) ? s->type->base_type->sym : NULL) {
+        for (int i = 0; i < s->member_count; i++) {
+            zan_symbol_t *m = s->members[i];
+            if (m && m->name.len == name.len &&
+                memcmp(m->name.str, name.str, (size_t)name.len) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+/* 类型上有没有这个名字的成员：类链 + 实现的接口（接口继承链也算）。
+ *
+ * 接口必须一起看：抽象接口方法没有 body，不会被拷进实现类的成员表，
+ * 只看类链会把"实现了接口方法"的调用判成"没有这个方法"。
+ * 泛型实例类型不拷贝 interfaces 字段，所以接口从符号的原型类型上取。 */
+static bool checker_type_has_member(zan_type_t *t, zan_istr_t name, int depth) {
+    if (!t || !t->sym || depth > 16) return false;
+    if (checker_sym_chain_has_member(t->sym, name)) return true;
+    zan_type_t *proto = t->sym->type ? t->sym->type : t;
+    for (int i = 0; i < proto->interface_count; i++) {
+        zan_type_t *it = proto->interfaces[i];
+        if (!it) continue;
+        if (it->sym && checker_sym_chain_has_member(it->sym, name)) return true;
+        if (checker_type_has_member(it, name, depth + 1)) return true;
+    }
+    return false;
+}
+
+/* 编译期内建类（Convert/Math/Console/File/…）的成员一半在 stdlib 里声明、
+ * 一半由编译器原生实现（Convert.ToString、File.ReadAllText 这类）。按名字
+ * 枚举成员必然漏掉原生那半边，所以这类接收者一律判不了，不报"没有这个方法"。
+ * 名单直接取 builtin_api 的内建类型表，不另维护一份。 */
+static bool checker_is_builtin_class_name(zan_istr_t n) {
+    int count = 0;
+    const zan_builtin_type_t *tbl = zan_builtin_types(&count);
+    for (int i = 0; i < count; i++) {
+        size_t l = strlen(tbl[i].type);
+        if ((size_t)n.len == l && memcmp(n.str, tbl[i].type, l) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* 内建接收者的成员集。返回 1 = 有，0 = 没有，-1 = 判不了（不报）。 */
+static int checker_builtin_member_state(zan_type_t *t, zan_istr_t name) {
+    if (!t || !name.str || name.len == 0) return -1;
+    const char *bt = NULL;
+    switch (t->kind) {
+    case TYPE_STRING: bt = "string"; break;
+    case TYPE_BOOL: bt = "bool"; break;
+    case TYPE_BYTE: bt = "byte"; break;
+    case TYPE_SBYTE: bt = "sbyte"; break;
+    case TYPE_SHORT: bt = "short"; break;
+    case TYPE_USHORT: bt = "ushort"; break;
+    case TYPE_INT: bt = "int"; break;
+    case TYPE_UINT: bt = "uint"; break;
+    case TYPE_LONG: bt = "long"; break;
+    case TYPE_ULONG: bt = "ulong"; break;
+    case TYPE_FLOAT: bt = "float"; break;
+    case TYPE_DOUBLE: bt = "double"; break;
+    case TYPE_DECIMAL: bt = "decimal"; break;
+    case TYPE_CHAR: bt = "char"; break;
+    case TYPE_NINT: bt = "nint"; break;
+    /* object 的成员集没定死（Equals/GetHashCode 之类），判不了就不报。 */
+    default: return -1;
+    }
+    if (!zan_builtin_find(bt)) return -1;   /* decimal 没进表：判不了 */
+    /* 编译器原生成员（int.Parse / string.AsSpan 这类）不在成员表里，
+     * 但确实存在——成员表查不到 ≠ 方法不存在。 */
+    if (zan_builtin_has_native_member(bt, (int)strlen(bt), name.str, name.len))
+        return 1;
+    return zan_builtin_has_member(bt, name.str, (int)name.len) ? 1 : 0;
+}
+
+/* 调用目标上有没有这个成员。
+ *
+ * 1 = 有；0 = 没有（可以报"没有这个方法"）；-1 = 判不了（保持原样，不报）。
+ *
+ * 口径必须和 irgen 一致：irgen 能发出去的调用，checker 不能判成不存在。
+ * 所以扩展方法（接收者类型上查不到成员，但 recv.Foo() 合法）必须算进去。 */
+static int checker_call_target_member_state(zan_checker_t *c, zan_type_t *t,
+                                            zan_istr_t name) {
+    if (!t || t == c->binder->type_error) return -1;
+    if (!name.str || name.len == 0) return -1;
+    if (zan_binder_has_extension_method(c->binder, t, name)) return 1;
+    switch (t->kind) {
+    case TYPE_CLASS:
+    case TYPE_STRUCT:
+    case TYPE_INTERFACE:
+        /* 内建泛型容器（List/Dict/StringBuilder/Span）没有 sym，
+         * 成员集没定死 —— 判不了就不报，交给 irgen。 */
+        if (!t->sym) return -1;
+        {
+            zan_istr_t simple = checker_type_simple_name(t);
+            /* 内建类（Convert/Math/Console/…）成员一半是编译器原生实现的，
+             * 枚举不全 —— 同样判不了。 */
+            if (checker_is_builtin_class_name(simple)) return -1;
+            /* 编译器原生成员（Gate.Park / Socket.RecvOv 这类）不在类的
+             * 成员表里，但确实存在。 */
+            if (simple.str && simple.len &&
+                zan_builtin_has_native_member(simple.str, simple.len,
+                                              name.str, name.len))
+                return 1;
+        }
+        return checker_type_has_member(t, name, 0) ? 1 : 0;
+    default:
+        break;
+    }
+    if (type_is_scalar_primitive(t)) return checker_builtin_member_state(t, name);
+    return -1;
+}
+
 static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
                                        zan_type_t *obj_type, bool in_call_callee) {
     checker_reject_null_receiver(c, expr);
@@ -4322,28 +4487,35 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
             memcmp(expr->member.name.str, "Length", 6) == 0) {
             return c->binder->type_int;
         }
-        zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                      "type '%.*s' has no member '%.*s'",
-                      (int)obj_type->name.len, obj_type->name.str,
-                      (int)expr->member.name.len, expr->member.name.str);
+        if (!in_call_callee) {
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "type '%.*s' has no member '%.*s'",
+                          (int)obj_type->name.len, obj_type->name.str,
+                          (int)expr->member.name.len, expr->member.name.str);
+            return c->binder->type_error;
+        }
+        /* 调用位置：内建标量的成员集是定死的（builtin_api 表），
+         * 表里没有这个名字 = 这个方法不存在，当场报。扩展方法
+         * （`this string` 接收者）不在内建表里，由统一判定一并算进去。 */
+        if (checker_call_target_member_state(c, obj_type, expr->member.name) == 0) {
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "type '%.*s' has no method '%.*s'",
+                          (int)obj_type->name.len, obj_type->name.str,
+                          (int)expr->member.name.len, expr->member.name.str);
+        }
         return c->binder->type_error;
     }
-    if (!in_call_callee && obj_type &&
+    if (obj_type && obj_type != c->binder->type_error && obj_type->sym &&
         (obj_type->kind == TYPE_CLASS || obj_type->kind == TYPE_STRUCT ||
-         obj_type->kind == TYPE_INTERFACE) &&
-        obj_type != c->binder->type_error && obj_type->sym) {
-        zan_istr_t ns = access_symbol_ns(obj_type->sym);
-        if (ns.len)
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "type '%.*s.%.*s' has no member '%.*s'",
-                          (int)ns.len, ns.str,
-                          (int)obj_type->sym->name.len, obj_type->sym->name.str,
-                          (int)expr->member.name.len, expr->member.name.str);
-        else
-            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "'%.*s' has no member '%.*s'",
-                          (int)obj_type->sym->name.len, obj_type->sym->name.str,
-                          (int)expr->member.name.len, expr->member.name.str);
+         obj_type->kind == TYPE_INTERFACE)) {
+        if (!in_call_callee) {
+            checker_report_no_member(c, expr, obj_type, expr->member.name, false);
+            return c->binder->type_error;
+        }
+        /* 调用位置：这个类型上根本没有这个名字的方法 —— 当场报，
+         * 不用拖到发码阶段变成 "code generation failed"（A476）。 */
+        if (checker_call_target_member_state(c, obj_type, expr->member.name) == 0)
+            checker_report_no_member(c, expr, obj_type, expr->member.name, true);
         return c->binder->type_error;
     }
     return c->binder->type_error;

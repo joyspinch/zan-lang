@@ -1587,6 +1587,26 @@ static bool enum_value_fits_int(int64_t v) {
     return v >= INT32_MIN && v <= INT32_MAX;
 }
 
+/* 扩展方法登记：static + 首参带 `this` 的方法。
+ *
+ * 登记时机在 bind_members 里——那时方法自己的类型参还在作用域内，
+ * 首参类型（`this List<T>` 里的 List<T>）能解析成正确的形状；等
+ * checker/irgen 阶段再回头解析，类型参早就出作用域了。 */
+static void binder_add_ext_method(zan_binder_t *b, zan_symbol_t *m,
+                                  zan_type_t *recv_type) {
+    if (b->ext_method_count >= b->ext_method_cap) {
+        int ncap = b->ext_method_cap ? b->ext_method_cap * 2 : 32;
+        zan_ext_method_t *nm = (zan_ext_method_t *)zan_arena_alloc(
+            b->arena, sizeof(zan_ext_method_t) * (size_t)ncap);
+        for (int i = 0; i < b->ext_method_count; i++) nm[i] = b->ext_methods[i];
+        b->ext_methods = nm;
+        b->ext_method_cap = ncap;
+    }
+    b->ext_methods[b->ext_method_count].method = m;
+    b->ext_methods[b->ext_method_count].recv_type = recv_type;
+    b->ext_method_count++;
+}
+
 static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
     zan_istr_t type_name = type_node->type_decl.name;
     zan_symbol_t *type_sym = scope_find(b->current_scope, type_name);
@@ -1628,9 +1648,11 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
                 member->method_decl.name, ret_type, member,
                 member->method_decl.modifiers);
 
+            zan_type_t *first_param_type = NULL;
             for (int j = 0; j < member->method_decl.params.count; j++) {
                 zan_ast_node_t *param = member->method_decl.params.items[j];
                 zan_type_t *param_type = zan_binder_resolve_type(b, param->param.type);
+                if (j == 0) first_param_type = param_type;
                 zan_symbol_t *param_sym = make_symbol(b->arena, SYM_PARAM,
                     param->param.name, param_type, param, 0);
                 symbol_add_member(b->arena, method_sym, param_sym);
@@ -1638,6 +1660,16 @@ static void bind_members(zan_binder_t *b, zan_ast_node_t *type_node) {
             scope_add(b->arena, b->current_scope, method_sym);
             symbol_add_member(b->arena, type_sym, method_sym);
             check_member_name_clash(b, type_sym, method_sym);
+            /* 扩展方法（首参带 `this`）登记到 binder 的扩展方法表，
+             * 供 checker 判定"调用目标方法不存在"时使用。登记口径与
+             * irgen 的 find_extension_method 一致：只看首参是不是 `this`
+             * 标记，不额外要求 static——两边口径不同就会一边能发、
+             * 一边判成"没有这个方法"。 */
+            if (member->method_decl.params.count > 0 && first_param_type) {
+                zan_ast_node_t *p0 = member->method_decl.params.items[0];
+                if (p0 && p0->kind == AST_PARAM && p0->param.is_this)
+                    binder_add_ext_method(b, method_sym, first_param_type);
+            }
             break;
         }
         case AST_CONSTRUCTOR_DECL: {
@@ -1726,4 +1758,67 @@ void zan_binder_bind(zan_binder_t *b, zan_ast_node_t *unit) {
     validate_interface_contracts(b, &unit->comp_unit.decls);
 
     b->binding_done = true;
+}
+
+/* ---------- 扩展方法查询（A476） ---------- */
+
+static bool binder_class_implements_iface_depth(zan_symbol_t *cls,
+                                                zan_symbol_t *iface, int depth) {
+    if (!cls || !cls->type || !iface || depth > 512) return false;
+    for (int i = 0; i < cls->type->interface_count; i++) {
+        zan_type_t *it = cls->type->interfaces[i];
+        if (!it || !it->sym) continue;
+        if (it->sym == iface) return true;
+        if (it->sym != cls &&
+            binder_class_implements_iface_depth(it->sym, iface, depth + 1))
+            return true;
+    }
+    if (cls->type->base_type && cls->type->base_type->sym &&
+        cls->type->base_type->sym != cls)
+        return binder_class_implements_iface_depth(cls->type->base_type->sym,
+                                                   iface, depth + 1);
+    return false;
+}
+
+bool zan_binder_class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface) {
+    return binder_class_implements_iface_depth(cls, iface, 0);
+}
+
+/* 扩展方法的接收者是接口、接收者实现了它 → 适用。
+ * 口径与 irgen 的 ext_receiver_interface_match 一致。 */
+static bool ext_receiver_interface_match(zan_type_t *pt, zan_type_t *recv_ty) {
+    return pt && recv_ty && pt->kind == TYPE_INTERFACE &&
+           pt->type_arg_count == 0 &&
+           (recv_ty->kind == TYPE_CLASS || recv_ty->kind == TYPE_INTERFACE) &&
+           zan_binder_class_implements_iface(recv_ty->sym, pt->sym);
+}
+
+/* 扩展方法能不能作用于这个接收者类型。口径与 irgen 的
+ * find_extension_method 一致（src/compiler/irgen_expr_core.c）：
+ * 类型参接收者（`this T`）适用任意类型；接口接收者看实现关系；
+ * 其余按 kind + 符号相等判定。 */
+static bool ext_receiver_match(zan_type_t *pt, zan_type_t *recv_ty) {
+    if (!pt || !recv_ty) return false;
+    if (pt->kind == TYPE_TYPE_PARAM) return true;
+    if (ext_receiver_interface_match(pt, recv_ty)) return true;
+    if (pt->kind != recv_ty->kind) return false;
+    if ((pt->kind == TYPE_CLASS || pt->kind == TYPE_STRUCT ||
+         pt->kind == TYPE_INTERFACE || pt->kind == TYPE_ENUM) &&
+        pt->sym != recv_ty->sym)
+        return false;
+    return true;
+}
+
+bool zan_binder_has_extension_method(zan_binder_t *b, zan_type_t *recv_ty,
+                                     zan_istr_t name) {
+    if (!b || !recv_ty || !name.str || name.len == 0) return false;
+    for (int i = 0; i < b->ext_method_count; i++) {
+        zan_symbol_t *m = b->ext_methods[i].method;
+        if (!m || m->name.len != name.len ||
+            memcmp(m->name.str, name.str, (size_t)name.len) != 0)
+            continue;
+        if (!ext_receiver_match(b->ext_methods[i].recv_type, recv_ty)) continue;
+        return true;
+    }
+    return false;
 }

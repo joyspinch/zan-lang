@@ -99,6 +99,21 @@ struct zan_scope {
     int bucket_count;
 };
 
+/* 扩展方法登记项：首参带 `this` 的方法。
+ *
+ * C# 风格的扩展方法在接收者类型上**查不到成员**，但 `recv.Foo()` 合法。
+ * checker 判定"调用目标不存在"时必须把它们算进去，否则会把
+ * `items.Remove(x)` / `s.PadLeft(10)` 误报成"没有这个方法"。
+ *
+ * 登记口径与 irgen 的 find_extension_method 逐字对齐：只看首参是不是
+ * `this` 标记，**不额外要求 static**——两边口径不同就会一边能发、
+ * 一边判成"没有这个方法"。 */
+typedef struct zan_ext_method {
+    zan_symbol_t *method;    /* 方法符号 */
+    zan_type_t *recv_type;   /* 首参（this）的类型——绑定时解析，
+                               * 那时类型参还在作用域里 */
+} zan_ext_method_t;
+
 struct zan_binder {
     zan_arena_t *arena;
     zan_diag_t *diag;
@@ -126,6 +141,11 @@ struct zan_binder {
     zan_type_t *type_typeinfo;
 
     bool binding_done;
+
+    /* 扩展方法登记表（static + 首参 this） */
+    zan_ext_method_t *ext_methods;
+    int ext_method_count;
+    int ext_method_cap;
 
     zan_type_t **tuple_types;
     int tuple_type_count;
@@ -160,6 +180,15 @@ zan_type_t *zan_binder_make_tuple_type(zan_binder_t *b, zan_type_t **elems,
 zan_type_t *zan_binder_subst_named(zan_binder_t *b, zan_type_t *t,
                                    zan_ast_list_t *tps, zan_type_t **args);
 zan_symbol_t *zan_binder_lookup(zan_binder_t *b, zan_istr_t name);
+
+/* 类（含其基类链）是否实现了接口 iface。checker 与 irgen 共用这一份判定，
+ * 免得两边对"接口方法算不算这个类型的成员"口径分叉。 */
+bool zan_binder_class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
+
+/* 名为 name 的扩展方法能否作用于 recv_ty。判定口径与 irgen 的
+ * find_extension_method 一致（src/compiler/irgen_expr_core.c）。 */
+bool zan_binder_has_extension_method(zan_binder_t *b, zan_type_t *recv_ty,
+                                     zan_istr_t name);
 
 /* null 字面量实参 → 形参类型的匹配分。<0 表示不兼容（null 绑不上去）。
  * checker 与 irgen 两侧的重载分解共用这一条规则。 */
