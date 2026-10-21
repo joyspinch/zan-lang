@@ -31,6 +31,22 @@ description: Zan 游戏开发规范——游戏 Gui 美术风格一致性、帧�
   信息层级、文字对比度、命中反馈和目标窗口/DPI 下的清晰度；只看孤立
   控件或只通过功能测试不算美术验收。默认桌面外观可作开发占位，交付前
   必须替换并复核发布后的游戏皮肤与素材是否加载。
+- **皮肤基线由编译器内嵌，磁盘上不要再放一份**：zanc 对 GUI 程序自动把
+  `Gui/skins` 整目录烤进 exe（`src/compiler/main.c` 的 skins 自动内嵌分支），
+  而 `embedres` 的过滤器只作用于 depth-1 的**皮肤包目录**——`base.css` 是
+  文件，照内嵌。运行时 `Skin.BaseCss()` 是**磁盘优先、内嵌兜底**。所以项目
+  只需把**自己的**皮肤包拷到 exe 同级 `skins/<名>/skin.css`（它被过滤器排
+  除在内嵌之外），**不要**手工拷 `base.css`：磁盘那份会盖住 exe 内嵌的新
+  基线，"内嵌兜底到底生效没有"就永远测不出来。
+  坑出处：任务书写成"Gui 只在磁盘上找皮肤、没有内嵌兜底"，被 11 个项目的
+  worker 继承，7 个项目的 build.ps1 照抄进去，还各带一句错注释。
+- **裁源取景只有一条路，源矩形在最后**：`Canvas.BlitImage(key, dx, dy, dw,
+  dh, sx, sy, sw, sh)`（`sw=0,sh=0` 是整幅），key 用
+  `CDraw.BlitSource(c, path)` 换内存键；`CDraw.BlitImage` 只能贴整幅（自带
+  视口映射），要裁源矩形就用 `CDraw.BlitImageSrc`——**目标矩形走视口映射、
+  源矩形按源图像素裁**，两组坐标单位不同，最容易搞错。
+  坑出处：snake 模板调 `CDraw.BlitImageSrc` 而那个方法不存在，模板编译不
+  过；voxel/powder/crawler 又各自己写了一份 BlitSrc，视口映射重写三遍。
 
 ## 帧循环结构：每段有名字，预算算整帧
 
