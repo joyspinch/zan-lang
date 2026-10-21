@@ -1,0 +1,173 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+
+namespace Game.Foundation.Gui;
+
+// 通用设置浮层：把 SettingsModel 的"一行几个档"画成一组按钮，
+// 选档写回并存盘。
+//
+// 判据（换个游戏还成立吗）：任何自管帧循环的 Canvas 游戏都要
+// "按一下键弹出设置 → 点档位改值 → 存盘"这三件事；浮层用标准库控件
+// （Panel/Flex/Label/Button）搭建，不要求项目自绘、也不进项目的美术
+// 风格——项目想换外观时按同一接口整层替换即可。
+//
+// 逻辑层在 SettingsModel（档位计算 + 校验 + 落盘），这里只做"画出来
+// 与点一下"。
+//
+// 用法（宿主侧）：
+//   GameSettings settings = new GameSettings().At(path);
+//   settings.AddOption("difficulty", "难度", "normal", opts);
+//   settings.Load();
+//   SettingsModel model = new SettingsModel(settings);
+//   SettingsOverlay ov = new SettingsOverlay(model);
+//   form.Add(ov.Root());
+//   // 每帧：ov.Tick();        轮询按钮点击 → 写回 + 落盘
+//   // 打开/关闭：ov.Toggle();
+public class SettingsOverlay {
+    SettingsModel model;
+    Panel root;
+    Panel box;
+    Flex col;
+    Label titleLabel;
+    Button closeButton;
+    List<Button> choiceButtons;
+    List<int> choiceRow;
+    List<int> choiceIndex;
+    bool open;
+    bool built;
+    string titleText;
+    string closeText;
+
+    public SettingsOverlay(SettingsModel m) {
+        this.model = m;
+        this.choiceButtons = new List<Button>();
+        this.choiceRow = new List<int>();
+        this.choiceIndex = new List<int>();
+        this.open = false;
+        this.built = false;
+        this.titleText = "设置";
+        this.closeText = "关闭";
+    }
+
+    // 浮层标题与关闭按钮文案（项目按自己的语言改）。
+    public void SetTitle(string t) { this.titleText = t; }
+    public void SetCloseText(string t) { this.closeText = t; }
+
+    // 浮层根控件：宿主挂到窗口上即可（首次调用时构建控件树）。
+    public Panel Root() {
+        this.Build();
+        return this.root;
+    }
+
+    public bool IsOpen() { return this.open; }
+
+    // 打开/关闭。关闭时整层不可见——不可见控件不参与命中，游戏输入
+    // 照常落到画面上。
+    public void SetOpen(bool on) {
+        this.open = on;
+        if (this.built) { this.root.visible = on; }
+    }
+
+    public bool Toggle() {
+        this.SetOpen(!this.open);
+        return this.open;
+    }
+
+    // 每帧调用：轮询按钮点击。Button.WasClicked 是"本帧被点过"的一次性
+    // 信号，轮询式取用（自管帧循环里最省事的一种接线）。
+    public void Tick() {
+        if (!this.open || !this.built) { return; }
+        if (this.closeButton != null && this.closeButton.WasClicked()) {
+            this.SetOpen(false);
+            return;
+        }
+        for (int i = 0; i < this.choiceButtons.Count; i = i + 1) {
+            Button b = this.choiceButtons[i];
+            if (b == null || !b.WasClicked()) { continue; }
+            if (this.model != null) {
+                this.model.Select(this.choiceRow[i], this.choiceIndex[i]);
+            }
+            this.Refresh();
+        }
+    }
+
+    // 刷新高亮：当前档的按钮点亮。**高亮必须 class 驱动**——行内样式
+    // 会被 HTML 构建器合成类规则（与 class 规则同源，比特异性只差一丁
+    // 点），写在 style 里会被后来的规则盖掉；`SetClassIn` 的 group 必须
+    // 含要清除的状态类，否则会留下脏类。
+    public void Refresh() {
+        for (int i = 0; i < this.choiceButtons.Count; i = i + 1) {
+            Button b = this.choiceButtons[i];
+            if (b == null) { continue; }
+            bool on = false;
+            if (this.model != null) {
+                SettingRow row = this.model.RowAt(this.choiceRow[i]);
+                if (row != null) { on = (row.Current == this.choiceIndex[i]); }
+            }
+            b.SetClassIn("primary", on ? "primary" : "");
+        }
+    }
+
+    // 档位按钮总数（诊断与测试用）。
+    public int ButtonCount() { return this.choiceButtons.Count; }
+
+    // 第 i 个档位按钮的类串（诊断与测试用：看高亮是否落在当前档）。
+    public string ButtonClassAt(int i) {
+        if (i < 0 || i >= this.choiceButtons.Count) { return ""; }
+        Button b = this.choiceButtons[i];
+        if (b == null) { return ""; }
+        return b.Class;
+    }
+
+    void Build() {
+        if (this.built) { return; }
+        this.built = true;
+        // 根：铺满窗口的透明宿主。Panel 无参构造是"纯布局宿主"
+        // （类型选择器 stack），不画表面——浮层背景由内容盒的 card 规则给。
+        this.root = new Panel();
+        this.root.Dock(Dock.Fill());
+        // 居中：行向 flex 承担主轴居中，列向 flex 承担交叉轴居中。
+        Flex center = new Flex();
+        center.Dock(Dock.Fill());
+        center.Justify("center");
+        center.Align("center");
+        this.root.Add(center);
+        // 内容盒：带名字的 Panel（类型选择器 panel）才吃 `panel.card`
+        // 的卡片外观（圆角 + 底色 + 内边距）。
+        this.box = new Panel("settingsbox");
+        this.box.Class = "card";
+        this.box.Prefer(320, 0);
+        center.Add(this.box);
+        this.col = Flex.Column();
+        this.col.Gap(10);
+        this.box.Add(this.col);
+        this.titleLabel = new Label(this.titleText);
+        this.col.Add(this.titleLabel);
+        if (this.model != null) {
+            for (int r = 0; r < this.model.Count(); r = r + 1) {
+                SettingRow row = this.model.RowAt(r);
+                if (row == null || row.ChoiceCount() == 0) { continue; }
+                Flex line = new Flex();
+                line.Align("center");
+                line.Gap(6);
+                Label name = new Label(row.Label);
+                name.Prefer(96, 0);
+                line.Add(name);
+                for (int c = 0; c < row.ChoiceCount(); c = c + 1) {
+                    Button b = new Button(row.Choices[c]);
+                    line.Add(b);
+                    this.choiceButtons.Add(b);
+                    this.choiceRow.Add(r);
+                    this.choiceIndex.Add(c);
+                }
+                this.col.Add(line);
+            }
+        }
+        this.closeButton = new Button(this.closeText);
+        this.col.Add(this.closeButton);
+        this.Refresh();
+        this.root.visible = this.open;
+    }
+}

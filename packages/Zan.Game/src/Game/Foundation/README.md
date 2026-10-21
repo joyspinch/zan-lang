@@ -77,6 +77,29 @@ written back and persisted) is shared, because that is the part every
 project would otherwise get subtly wrong. Pinned by
 `tests/conformance/game_settings_model.zan`.
 
+## Settings overlay (standard widgets)
+
+`SettingsOverlay` (in `Game.Foundation.Gui`) is the **generic** view for
+projects that have no art direction of their own yet — a canvas game with a
+hand-written frame loop. It builds the panel from standard widgets (Panel /
+Flex / Label / Button), one button group per `SettingsModel` row, and it
+highlights the current choice with a class (never an inline style).
+
+```zan
+using Game.Foundation;
+using Game.Foundation.Gui;
+
+SettingsModel m = new SettingsModel(settings);
+SettingsOverlay ov = new SettingsOverlay(m);
+form.Add(ov.Root());     // mount the layer
+ov.Tick();               // every frame: poll clicks -> write back + save
+ov.Toggle();             // open / close
+```
+
+Nothing in it is project-specific, so a project that later grows its own
+look replaces the whole layer behind the same three calls. Pinned by
+`tests/conformance/game_settings_overlay.zan`.
+
 ## Combo meter and ring QTE
 
 Two mechanics that every "keep the streak going" game otherwise rewrites
