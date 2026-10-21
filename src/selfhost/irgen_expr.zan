@@ -5262,10 +5262,82 @@ partial class Irgen {
         return best;
     }
 
+    // the result type of a block-bodied lambda: the type of the value its
+    // `return` carries (the C host's stmt_lambda_return_type -- every
+    // return has to agree, the first one decides)
+    Node LambdaBlockRetType(Node block) {
+        if (block == null) { return null; }
+        List<Node> rets = new List<Node>();
+        List<int> mixed = new List<int>();
+        mixed.Add(0);
+        int mark = locName.Count;
+        CollectLambdaReturns(block, rets, mixed);
+        while (locName.Count > mark) {
+            locName.RemoveAt(locName.Count - 1);
+            locType.RemoveAt(locType.Count - 1);
+            locReg.RemoveAt(locReg.Count - 1);
+            if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
+        }
+        if (mixed[0] != 0) { return null; }
+        if (rets.Count == 0) { return null; }
+        Node first = rets[0];
+        int i = 1;
+        while (i < rets.Count) {
+            if (TypeTag(rets[i]) != TypeTag(first)) { return null; }
+            i = i + 1;
+        }
+        return first;
+    }
+
+    // walk a lambda body collecting the types its `return`s carry; `mixed`
+    // is set when the C host gives up too (a bare `return;`, a type it
+    // cannot infer, or a loop/switch/try body)
+    void CollectLambdaReturns(Node s, List<Node> rets, List<int> mixed) {
+        if (s == null || mixed[0] != 0) { return; }
+        int k = s.kind;
+        if (k == AK.ReturnStmt()) {
+            if (s.a == null) { mixed[0] = 1; return; }
+            Node t = ArgTypeNode(s.a);
+            if (t == null) { mixed[0] = 1; return; }
+            rets.Add(t);
+            return;
+        }
+        if (k == AK.Block()) {
+            int i = 0;
+            while (i < s.kids.Count) {
+                CollectLambdaReturns(s.kids[i], rets, mixed);
+                i = i + 1;
+            }
+            return;
+        }
+        if (k == AK.IfStmt()) {
+            CollectLambdaReturns(s.b, rets, mixed);
+            CollectLambdaReturns(s.c, rets, mixed);
+            return;
+        }
+        if (k == AK.VarDecl()) {
+            // `var x = e;` puts x in scope for the returns that follow
+            if (s.b != null) {
+                Node t = ArgTypeNode(s.b);
+                if (t != null) {
+                    locName.Add(s.sval); locType.Add(t); locReg.Add("");
+                    locBox.Add(false); locIter.Add(false); locCell.Add(""); locRef.Add(false);
+                }
+            }
+            return;
+        }
+        if (k == AK.WhileStmt() || k == AK.DoWhileStmt() || k == AK.ForStmt()
+            || k == AK.ForeachStmt() || k == AK.SwitchStmt() || k == AK.TryStmt()) {
+            mixed[0] = 1;
+            return;
+        }
+    }
+
     // score an extension candidate's lambda arguments: bind the method type
-    // parameters from the receiver, then compare each expression-bodied
-    // lambda's inferred result type against the delegate's return type so
-    // same-name overloads differing only in key type resolve correctly
+    // parameters from the receiver, then compare each lambda's inferred
+    // result type against the delegate's return type so same-name overloads
+    // differing only in key type resolve correctly (a block-bodied lambda
+    // counts too -- the C host scores it the same way)
     int LambdaArgScore(Node m, Node recvTy, Node e) {
         List<string> mtps = TParams(m);
         List<string> tns = new List<string>();
@@ -5275,7 +5347,7 @@ partial class Irgen {
         int k = 0;
         while (k < e.kids.Count) {
             Node arg = e.kids[k];
-            if (arg != null && arg.kind == AK.Lambda() && arg.d == null) {
+            if (arg != null && arg.kind == AK.Lambda()) {
                 Node pty = SubstTP(ParamTypeNode(m, k + 1), tns, trs);
                 Node dd = null;
                 if (pty != null) { dd = binder.FindDelegate(pty.sval); }
@@ -5296,7 +5368,9 @@ partial class Irgen {
                             }
                             j = j + 1;
                         }
-                        Node lrt = ArgTypeNode(arg.a);
+                        Node lrt = null;
+                        if (arg.d == null) { lrt = ArgTypeNode(arg.a); }
+                        else { lrt = LambdaBlockRetType(arg.d); }
                         while (locName.Count > mark) {
                             locName.RemoveAt(locName.Count - 1);
                             locType.RemoveAt(locType.Count - 1);
@@ -5304,8 +5378,13 @@ partial class Irgen {
                             if (locRef.Count > mark) { locRef.RemoveAt(locRef.Count - 1); }
                         }
                         if (lrt != null) {
+                            // the C host scores a lambda argument a flat
+                            // base and adds a bonus only when the body's
+                            // type equals the delegate's return type -- a
+                            // mismatch is NOT penalised, so a candidate
+                            // whose body type is unknown still ties with
+                            // a mismatching one (declaration order wins)
                             if (TypeTag(lrt) == TypeTag(drt)) { score = score + 8; }
-                            else { score = score - 4; }
                         }
                     }
                 }
