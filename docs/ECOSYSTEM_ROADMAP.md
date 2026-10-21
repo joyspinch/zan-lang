@@ -932,6 +932,15 @@ Web 框架那一侧（`Zan.Mvc/Framework/Ai`，网页端助手走的就是它）
 （`kind` = delta / error / skip）表达，不用"魔法字符串前缀"让调用方靠
 `StartsWith` 猜。
 
+消费侧也从**轮询**改成**事件驱动**：Web 框架那段原来每 40ms 醒一次问
+一句"有货了吗"——既把每个分片的到达延迟了最多 40ms，又在整条流期间
+白醒（一次长回答 = 几十次空转）。改用 `SseSink.TakeCo()`（挂在事件门上，
+写入或 `Abort` 唤醒）。取消路径的前提是**底层能被外部唤醒**：`Abort()`
+会 `Finish("err: cancelled")` 并 signal，所以挂着 `TakeCo()` 的消费者能
+被叫醒——轮询版每个周期都查取消标志，事件驱动版挂着时不查，不唤醒就
+会永久等待。conformance `sse_sink_take_co` 钉住这三条：有数据才醒、
+增量（分批写 → 消费者醒 ≥2 次）、`Abort` 能唤醒挂着的消费者。
+
 conformance `async_sync_delay`（**非 async 方法里的 `await Task.Delay(ms)`
 必须真的等**：编译器原来在"顶层非异步上下文"分支**只查**模块里的 `Sleep`
 （Win32 API）/ `poll`（libc 符号）——`LLVMGetNamedFunction` 找不到就返回

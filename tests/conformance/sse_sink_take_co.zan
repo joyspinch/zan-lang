@@ -1,0 +1,116 @@
+// SseSink.TakeCo 的契约——AI 流式消费方（Zan.Ai / Zan.Mvc 的 AI 助手）
+// 都靠它把上游数据一段段取出来。
+//
+// 这一条盯的是四件事：
+// 1. **有数据才醒**：消费者在没数据时真的挂起（事件门），不是空转。
+// 2. **增量**：写入方分两批写，消费者至少醒两次——攒完一次给不算增量。
+// 3. **结束标志**：流结束时 TakeCo 返回 finished=true，且最后一批不丢。
+// 4. **Abort 唤醒**：取消路径上消费者正挂在 TakeCo 里，Abort 必须把它
+//    叫醒——否则取消会永久等待。
+//
+// 取数据的循环形状照抄 MVC 的 AI 助手那段（按 \n 切行、收尾补处理残留
+// 半行），这样这条用例验的就是线上那段逻辑。
+using System;
+using System.Net.Http.Client;
+using System.Text;
+using System.Threading;
+
+class Program {
+    static int bad = 0;
+
+    static void Check(string what, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            Program.bad = Program.bad + 1;
+        }
+    }
+
+    // 照抄 MVC 消费循环的形状。
+    static async string Consume(SseSink sink, out bool sawFinish, out int deliveries) {
+        StringBuilder full = new StringBuilder();
+        string pending = "";
+        bool finished = false;
+        int n = 0;
+        while (!finished) {
+            SseDelivery batch = await sink.TakeCo();
+            n = n + 1;
+            string piece = batch.data;
+            finished = batch.finished;
+            if (piece.Length == 0) {
+                if (finished) { break; }
+                continue;
+            }
+            pending = pending + piece;
+            int nl = pending.IndexOf("\n");
+            while (nl >= 0) {
+                string line = pending.Substring(0, nl).Trim();
+                pending = pending.Substring(nl + 1);
+                if (line.StartsWith("data:")) {
+                    full.Append(line.Substring(5).Trim());
+                }
+                nl = pending.IndexOf("\n");
+            }
+        }
+        if (pending.Trim().Length > 0) {
+            string line = pending.Trim();
+            if (line.StartsWith("data:")) { full.Append(line.Substring(5).Trim()); }
+        }
+        sawFinish = finished;
+        deliveries = n;
+        return full.ToString();
+    }
+
+    static async Task Main() {
+        // ---- 1. 边写边读 ----
+        SseSink sink = SseSink.ToMemory();
+        sink.Write("data: A\n");
+        SseDelivery d1 = await sink.TakeCo();
+        Check("first", d1.data == "data: A\n");
+        Check("not-finished", !d1.finished);
+
+        // ---- 2. 挂起时不空转：先写后取，取到的就是刚写的 ----
+        sink.Write("data: B\n");
+        SseDelivery d2 = await sink.TakeCo();
+        Check("second", d2.data == "data: B\n");
+
+        // ---- 3. 结束标志 ----
+        sink.Finish("ok");
+        SseDelivery d3 = await sink.TakeCo();
+        Check("finished", d3.finished);
+
+        // ---- 4. 完整跑一遍消费循环：分两批到，至少醒两次 ----
+        SseSink sink2 = SseSink.ToMemory();
+        Task.Spawn(Program.Run2(sink2));
+        bool fin;
+        int deliveries;
+        string got = await Program.Consume(sink2, out fin, out deliveries);
+        Check("consume", got == "AB");
+        Check("consume-finished", fin);
+        Check("incremental", deliveries >= 2);
+
+        // ---- 5. Abort 会唤醒挂着的消费者 ----
+        SseSink sink3 = SseSink.ToMemory();
+        Task.Spawn(Program.Run3(sink3));
+        SseDelivery d4 = await sink3.TakeCo();
+        Check("abort-wake", d4.finished);
+        Check("abort-marker", sink3.Attempt() == "err: cancelled");
+
+        Console.WriteLine("sse-sink-take-co-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        Environment.Exit(bad == 0 ? 0 : 1);
+    }
+
+    // 写两批，中间停一下（让消费者先醒一次）。
+    static async Task Run2(SseSink sink) {
+        sink.Write("data: A\n");
+        await Task.Delay(120);
+        sink.Write("data: B\n");
+        await Task.Delay(120);
+        sink.Finish("ok");
+    }
+
+    // 什么都不写就 Abort：消费者必须被叫醒，不能永久挂着。
+    static async Task Run3(SseSink sink) {
+        await Task.Delay(120);
+        sink.Abort();
+    }
+}
