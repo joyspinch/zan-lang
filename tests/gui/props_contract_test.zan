@@ -1,5 +1,6 @@
 using System;
 using Gui;
+using Gui.Styling;
 using Gui.Widget;
 using Gui.Hmi;
 using Gui.Component;
@@ -10,8 +11,9 @@ using Gui.Designer;
 // BuiltinPropRows 契约探针：设计器"组件属性"直通表里的每一个
 // (kind, key) 都必须被对应控件真实消费——键在该控件 Props() 的
 // PropSpec（key/alias 应答）里，或 SetProp/GetProp 往返非空
-// （覆写截获键）。基类 fallback 会把不认识的键退化成样式类且
-// GetProp 返回空——那种死键在这里当场 FAIL。
+// （覆写截获键），或是登记表里注明消费处的类修饰键（基类兜底把值
+// 写进 class 名单，控件/皮肤按 class 生效）。基类 fallback 会把不
+// 认识的键退化成样式类且 GetProp 返回空——那种死键在这里当场 FAIL。
 // 控件直接构造（ControlFactory 只注册了 DCE 名单子集，探针作为
 // 测试允许显式引用全部控件类型）。
 class PropsContractTest {
@@ -24,6 +26,7 @@ class PropsContractTest {
     }
 
     static Control Make(string kind) {
+        if (kind == "Button") { return new Button(); }
         if (kind == "Switch") { return new Switch(); }
         if (kind == "Slider") { return new Slider(); }
         if (kind == "Rate") { return new Rate(); }
@@ -78,8 +81,8 @@ class PropsContractTest {
     // 表里已收录的 kind 全集（BuiltinPropRows 覆盖面回归：漏收
     // 的 kind 在这里报"no rows"）。
     static string[] TableKinds() {
-        return new string[47] {
-            "Chart", "Image", "Countdown", "NumberAnimation", "InputOtp",
+        return new string[48] {
+            "Button", "Chart", "Image", "Countdown", "NumberAnimation", "InputOtp",
             "DataGrid", "Panel", "SplitPanel", "Badge", "Carousel", "Progress",
             "Switch", "Slider", "Rate", "SelectBox", "Checkbox", "Radio",
             "Statistic", "Tag", "Avatar", "Result", "Skeleton", "Spin",
@@ -89,6 +92,51 @@ class PropsContractTest {
             "VirtualList", "Calendar", "TreeView", "Collapse", "Empty",
             "Tabs", "Breadcrumb", "Timeline"
         };
+    }
+
+    // 类修饰键登记表：这些键不进属性协议，基类兜底把值写进 class
+    // 名单，控件/皮肤按 class 生效（因此 GetProp 读不回值，属性行
+    // 的当前值来自设计文档本身）。每一行都注明消费处；表里没有的
+    // 类键一律判死键——防止拼错的类名悄悄落地。
+    //   Button|type    → base.css 的 button.primary/.info/.success/
+    //                    .warning/.error 角色类
+    //   Button|round   → Style.ButtonDefaults：Style.Has(cls,"round")
+    //                    → 胶囊圆角（9999）
+    //   Button|circle  → Style.ButtonDefaults 同上 + Button 测量按方
+    //   Button|loading → Button 绘制：Style.Has(Class,"loading") → 转圈
+    static string[] ClassKeys() {
+        return new string[4] {
+            "Button|type", "Button|round", "Button|circle", "Button|loading"
+        };
+    }
+
+    static bool IsClassKey(string kind, string key) {
+        string[] table = ClassKeys();
+        for (int i = 0; i < table.Length; i = i + 1) {
+            if (table[i] == kind + "|" + key) { return true; }
+        }
+        return false;
+    }
+
+    // 类修饰键的写路径：布尔行写 "true"（类名 = 键名），枚举行写
+    // 第一个非空选项（类名 = 选项值；ExtractPropOptions 的第 0 项
+    // 是"缺省/清空"，不是真实类名）。类必须真的落到控件的 class 上。
+    static bool ClassLands(Control c, string kind, string key, string rawLabel) {
+        bool isBool = Designer.IsBoolProp(key, rawLabel, "");
+        List<string> opts = Designer.ExtractPropOptions(rawLabel);
+        string want;
+        if (isBool) {
+            c.SetProp(key, "true");
+            want = key;
+        } else {
+            want = "";
+            for (int i = 0; i < opts.Count; i = i + 1) {
+                if (opts[i] != "") { want = opts[i]; break; }
+            }
+            if (want == "") { return false; }
+            c.SetProp(key, want);
+        }
+        return Style.Has(c.Class, want);
     }
 
     static void Main() {
@@ -109,6 +157,7 @@ class PropsContractTest {
                 string row = rows[i];
                 int bar = row.IndexOf("|");
                 string key = bar > 0 ? row.Substring(0, bar) : row;
+                string rawLabel = bar > 0 ? row.Substring(bar + 1) : "";
                 checks = checks + 1;
                 bool answered = false;
                 List<PropSpec> specs = c.Props();
@@ -120,6 +169,9 @@ class PropsContractTest {
                     // Props() 里：SetProp 写入后 GetProp 非空才算数。
                     c.SetProp(key, "0");
                     answered = c.GetProp(key) != "";
+                    if (!answered && IsClassKey(kind, key)) {
+                        answered = ClassLands(c, kind, key, rawLabel);
+                    }
                 }
                 if (!answered) {
                     Fail(kind + "." + key + ": dead key (not consumed)");

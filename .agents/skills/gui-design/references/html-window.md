@@ -289,9 +289,22 @@ STANDARDS.md §6.7）。
 - **布尔键要读写对称**：只写不读的布尔属性写 `false` 等于没写。`dot`
   的语义是"无计数形态"，写 `false` 至少要留一个计数，否则徽标什么
   都不画。
+- **类修饰键不走属性协议**：按钮的 `type`/`round`/`circle`/`loading`
+  是基类兜底写进 class 名单的（控件/皮肤按 class 生效），`GetProp` 读
+  不回值——契约探针不能拿"读不回"判它死键。这类键要在探针里单列
+  登记并注明消费处（`Style.ButtonDefaults` 认 round/circle、Button
+  绘制认 loading、皮肤有 button.primary 等角色类）；登记表里没有的
+  类键一律判死键，防止拼错的类名悄悄落地。
+- **字段存在 ≠ 属性可达**：`Button.TipSide` 字段在、渲染也用（气泡
+  方位），但没进 `Props()`——设计器那一行写进的是样式类，提示方位
+  纹丝不动。控件里凡是渲染读到的字段，都要在 `Props()` 里声明一
+  行，否则那一行属性是死的。
 - 验收：`conformance_gui_props_contract`——`BuiltinPropRows` 里每个
   键都必须被控件消费（死键当场 FAIL）。这个用例红了就是属性协议漏了
-  键，不是设计器的问题。
+  键，不是设计器的问题。颜色属性另有一条
+  `conformance_gui_designer_color_props`：每个颜色键要同时满足"行表
+  里有这一行 / `IsColorProp` 认它 / 控件写进去读回来还是同一个颜
+  色"——三缺一就是"能改但不变"的哑行。
 
 ## HTML 窗口设计器的所见所得
 

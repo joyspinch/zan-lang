@@ -4822,6 +4822,20 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_color_picker${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 设计器颜色属性行契约：每个颜色键都要有行（面板上点得到）、被
+  # IsColorProp 认（渲染真取色器）、并被控件真消费（SetProp 写进去
+  # 读回来还是同一个颜色）。没被消费的键会退化成样式类——属性行能
+  # 改、画布不变。
+  add_test(NAME conformance_gui_designer_color_props
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_color_props_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_color_props.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_color_props${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_designer_color_props PROPERTIES TIMEOUT 120)
+
 
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略

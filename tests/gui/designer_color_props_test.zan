@@ -1,0 +1,121 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+// 设计器颜色属性行的契约探针。每个颜色键都要同时满足三条，缺一
+// 就是"属性行能改、画布不变"的哑行：
+// 1. 该 kind 的 BuiltinPropRows 里真的有这一行——设计器面板才有
+//    一个可点的色块（没有行的键，用户根本碰不到）。
+// 2. Designer.IsColorProp 认它——认了才渲染真取色器（否则退化成
+//    一个纯文本框，填 CSS 颜色文本是另一条路）。
+// 3. 控件真的消费它：SetProp("#ff8800") 写进去，GetProp 读回来还
+//    是同一个颜色。没被消费的键会被基类兜底当成样式类，值落进
+//    class 名单，颜色永远不变。
+// 另外走一遍设计文档的真实通道：extra["props"] → ApplyFieldProps
+// → 控件字段（画布预览就是这条路）。
+class DesignerColorPropsTest {
+    static int fails;
+    static int checks;
+
+    static void Fail(string what) {
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what);
+    }
+
+    static void Check(string what, bool ok) {
+        checks = checks + 1;
+        if (!ok) { Fail(what); }
+    }
+
+    static void EqInt(string what, int got, int want) {
+        checks = checks + 1;
+        if (got == want) { return; }
+        Fail(what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    // "kind|颜色键" 全表（键全部取自各控件 Props() 的 PropSpec.Color
+    // 声明，与 BuiltinPropRows 的行一一对应）。
+    static string[] Table() {
+        return new string[11] {
+            "Button|color", "Button|textColor",
+            "Panel|surfaceColor",
+            "Progress|color", "Progress|railColor",
+            "Switch|checkedColor", "Switch|uncheckedColor",
+            "Spin|accent",
+            "QrCode|dark", "QrCode|light",
+            "Watermark|color"
+        };
+    }
+
+    static Control Make(string kind) {
+        if (kind == "Button") { return new Button(); }
+        if (kind == "Panel") { return new Panel(); }
+        if (kind == "Progress") { return new Progress(); }
+        if (kind == "Switch") { return new Switch(); }
+        if (kind == "Spin") { return new Spin(); }
+        if (kind == "QrCode") { return new QrCode(); }
+        if (kind == "Watermark") { return new Watermark(); }
+        return null;
+    }
+
+    // 行表里有没有这个键。
+    static bool HasRow(List<string> rows, string key) {
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            if (rows[i].StartsWith(key + "|")) { return true; }
+        }
+        return false;
+    }
+
+    static void TestColorRows() {
+        string hex = "#ff8800";
+        int want = Designer.ParseColorValue(hex).ToARGB();
+        string[] table = Table();
+        for (int ti = 0; ti < table.Length; ti = ti + 1) {
+            string entry = table[ti];
+            int bar = entry.IndexOf("|");
+            string kind = entry.Substring(0, bar);
+            string key = entry.Substring(bar + 1);
+            List<string> rows = Designer.BuiltinPropRows(kind);
+            if (rows == null) {
+                Fail(kind + ": no rows in BuiltinPropRows");
+                continue;
+            }
+            Check(kind + "." + key + ": row exists", HasRow(rows, key));
+            Check(kind + "." + key + ": is color prop",
+                  Designer.IsColorProp(key));
+            Control c = Make(kind);
+            if (c == null) {
+                Fail(kind + ": probe Make returned null");
+                continue;
+            }
+            c.SetProp(key, hex);
+            string got = c.GetProp(key);
+            EqInt(kind + "." + key + ": round trip",
+                  Designer.ParseColorValue(got).ToARGB(), want);
+        }
+    }
+
+    // 设计文档的真实通道：属性行写进 extra["props"]，画布预览经
+    // ApplyFieldProps 落到真控件。
+    static void TestDocChannel() {
+        FormField field = FormField.New(18, 1);
+        Designer.SetCompPropValue(field, "surfaceColor", "#ff8800");
+        Panel p = new Panel();
+        Designer.ApplyFieldProps(p, field);
+        EqInt("panel surfaceColor via doc",
+              Designer.ParseColorValue(p.GetProp("surfaceColor")).ToARGB(),
+              Designer.ParseColorValue("#ff8800").ToARGB());
+    }
+
+    static void Main() {
+        DesignerColorPropsTest.TestColorRows();
+        DesignerColorPropsTest.TestDocChannel();
+        if (DesignerColorPropsTest.fails > 0) {
+            Console.WriteLine("DESIGNER_COLOR_PROPS_FAIL");
+            return;
+        }
+        Console.WriteLine("DESIGNER_COLOR_PROPS_OK");
+    }
+}
