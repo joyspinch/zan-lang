@@ -430,6 +430,13 @@ kernel32、shell32、user32、advapi32、version）。
   lambda 深度与协程帧的上下文（发射 lambda 时把 `current_async_frame` 置空，
   "外层有没有帧" = "外层方法是不是 async"）。自举侧相反：它的 AST 有通用子
   节点表，**检查器**里就能查（`FindAwaitInLambda`）。
+- 坑（连带，2026-10-21 实测）：检查器不下钻 lambda 体，**不止 await 这一条规则**——
+  lambda 体里的**类型错误也全部漏检**：`Func<int> f = () => { int x = "hello";
+  return x; };` 编译通过、运行时 `f()` 返回 `-1065074624`（把字符串指针当 int
+  读出来），而同一段代码放进方法体正常报 `cannot convert 'string' to 'int'`。
+  根因同上（`AST_LAMBDA` 把语句块丢给没有语句分支的 `check_expr`）。要修得让
+  检查器真正走 lambda 的语句体（含形参作用域与返回类型），代价是全仓所有 lambda
+  体一次性进入类型检查——独立战线，见 `TASKS.md` A471。
 - 门：差分门除了"能编且输出逐字一致"的用例，还多了一份 **reject 列表**
   （`tests/selfhost/reject_cases.txt` + `tests/selfhost/reject/<name>.zan`）：
   这些程序自举**必须拒绝**——非零退出**且不落 IR**。fail-closed 的边界要有门
