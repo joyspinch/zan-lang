@@ -1851,3 +1851,28 @@
   `i8* null`（参数类型是已知的），自举把参数类型藏进字符串拼接里，就容易把
   类型丢掉——而拼出来的 IR 只能靠 clang/llvm-as 验证，肉眼看 `null` 完全合理。
 - 关联：A483（同一个测试的前一道坎）、A481 / A482（自举侧同一条战线）。
+
+### [ ] A488 `Zan.Gui` 里有 4 类指向**不存在命名空间**的 `using` —— 编译期打 `ZANPKG_MISSING`
+
+- 现象（2026-10-22 落地 `Zan.Game.Debug` 时撞到）：凡是编译到 `Zan.Gui`
+  的目标，编译器都往 stderr 打四条
+  `ZANPKG_MISSING namespace=Gui/Styling` / `Gui/Rendering` /
+  `System/Text/Json` / `System/Runtime/InteropServices`。
+  只走 stderr，**不影响退出码**，但每个依赖 Gui 的包（`Zan.Gui.Charts`、
+  `Zan.Game.Debug` …）的编译输出都带这四条噪声。
+- 根因：这四个命名空间在仓库里**根本不存在**——
+  - `packages/Zan.Gui/src/Gui/Styling/` 与 `Gui/Rendering/` 只是**目录**，
+    里面文件声明的命名空间是 `Gui`（本仓库的目录与命名空间是解耦的），
+    所以没有 `namespace Gui.Styling;` 可供索引；
+  - `stdlib` 里没有 `System/Text/Json/`（Json 在 `System/Json/`），也没有
+    `System/Runtime/InteropServices/`；
+  - 而 Gui 包里有文件写了 `using Gui.Styling;` / `using Gui.Rendering;` /
+    `using System.Text.Json;` / `using System.Runtime.InteropServices;`。
+  编译器扫到 `using` 就去包里按"命名空间 = 目录"找，找不到就打这条警告
+  （`src/compiler/main.c` 的 `auto_include_namespace`）。
+- 影响：只是噪声，不阻断构建。但它**掩盖真正的缺包警告**，也让"编译输出
+  零警告"这类验收门无法成立。
+- 方向：删掉这四类**无效**的 `using` 声明（先确认文件里没用到对应命名
+  空间的类型——`System.Text.Json` 那两处大概率是想用 `System.Json`）。
+- 关联：`Zan.Game.Debug`（`docs/ECOSYSTEM_ROADMAP.md` §1.29）。
+  `packages/Zan.Gui/**` 在并发会话的在途区域，本轮未动。
