@@ -1,0 +1,182 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Foundation;
+
+// 设置面板的一行：一项设置 + 它的候选档位。
+//
+// 行只描述"这一项有哪些档、当前在第几档"，不碰界面——面板把它画成
+// 按钮组还是 HTML 都由项目决定。
+public class SettingRow {
+    public string Key;
+    public string Label;
+    // 候选的显示文案（"开" / "快" / "入门"）。
+    public List<string> Choices;
+    // 候选对应的写入值（"true" / "300" / "easy"）。
+    public List<string> Values;
+    // 当前档位下标（没有匹配值时为 0）。
+    public int Current;
+
+    public SettingRow(string key, string label) {
+        this.Key = key;
+        this.Label = label;
+        this.Choices = new List<string>();
+        this.Values = new List<string>();
+        this.Current = 0;
+    }
+
+    public int ChoiceCount() { return this.Choices.Count; }
+
+    // 当前档位的显示文案（没有候选时返回空串）。
+    public string CurrentLabel() {
+        if (this.Current < 0 || this.Current >= this.Choices.Count) { return ""; }
+        return this.Choices[this.Current];
+    }
+
+    // 当前档位的写入值。
+    public string CurrentValue() {
+        if (this.Current < 0 || this.Current >= this.Values.Count) { return ""; }
+        return this.Values[this.Current];
+    }
+}
+
+// 设置面板的**逻辑层**：把 GameSettings 的声明翻译成"一行几个档"，
+// 并负责把玩家选的档写回去（校验 + 存盘）。
+//
+// 判据（换个游戏还成立吗）：任何游戏都要"设置项 → 档位按钮组"。
+// 各项目的美术风格不同，**视图**（HTML 设计稿、按钮长相）各写各的；
+// 但"这一项有哪些档、当前在第几档、选哪档怎么写回、怎么存盘"这几件
+// 事容易各写一遍各错一遍，收在这里只有一份真相。
+//
+// 典型用法：
+//   SettingsModel m = new SettingsModel(settings);
+//   m.RowAt(0).Choices;                 // ["入门", "进阶", "大师"]
+//   m.Select(0, 2);                     // 选第三档，写回并存盘
+//   m.ResetAll();                       // 恢复默认并存盘
+public class SettingsModel {
+    GameSettings settings;
+    List<SettingRow> rows;
+    static SettingRow emptyRow;
+
+    public SettingsModel(GameSettings store) {
+        this.settings = store;
+        this.rows = new List<SettingRow>();
+        if (store == null) { return; }
+        for (int i = 0; i < store.Count(); i = i + 1) {
+            SettingRow row = this.BuildRow(store.ItemAt(i));
+            if (row != null) { this.rows.Add(row); }
+        }
+    }
+
+    // 一个声明项 → 一行档位。文本项不生成行（面板是按钮组，没有输入框）。
+    SettingRow BuildRow(SettingItem item) {
+        if (item == null) { return null; }
+        SettingRow row = new SettingRow(item.Key, item.Label);
+        if (item.Kind == SettingItem.KindBool) {
+            row.Values.Add("true");
+            row.Choices.Add("开");
+            row.Values.Add("false");
+            row.Choices.Add("关");
+        } else if (item.Kind == SettingItem.KindInt) {
+            int step = item.IntStep <= 0 ? 1 : item.IntStep;
+            int min = item.IntMin;
+            int max = item.IntMax;
+            if (max <= min) {
+                min = Convert.ToInt32(item.DefaultValue);
+                max = min;
+            }
+            int v = min;
+            while (v <= max) {
+                string s = Convert.ToString(v);
+                row.Values.Add(s);
+                row.Choices.Add(s);
+                v = v + step;
+            }
+        } else if (item.Kind == SettingItem.KindDouble) {
+            double min = item.DoubleMin;
+            double max = item.DoubleMax;
+            if (max <= min) {
+                min = Convert.ToDouble(item.DefaultValue);
+                max = min;
+            }
+            // 双值项取五档：下限、1/4、1/2、3/4、上限。
+            for (int i = 0; i < 5; i = i + 1) {
+                double d = min + (max - min) * i / 4.0;
+                string s = Convert.ToString(d);
+                row.Values.Add(s);
+                row.Choices.Add(s);
+            }
+        } else if (item.Kind == SettingItem.KindOption) {
+            for (int i = 0; i < item.Options.Count; i = i + 1) {
+                row.Values.Add(item.Options[i]);
+                row.Choices.Add(item.Options[i]);
+            }
+        } else {
+            return null;   // 文本项：面板不生成行
+        }
+        this.SyncCurrent(row, item.Value);
+        return row;
+    }
+
+    // 当前值对不上任何候选时（例如配置文件里存了越界值），
+    // 退回第一档——面板上必须有一个确定的高亮。
+    void SyncCurrent(SettingRow row, string value) {
+        for (int i = 0; i < row.Values.Count; i = i + 1) {
+            if (row.Values[i] == value) { row.Current = i; return; }
+        }
+        row.Current = 0;
+    }
+
+    public int Count() { return this.rows.Count; }
+
+    // 第 index 行。**越界不返回 null**，给一个空行（无候选、标签空串）——
+    // 面板逐行渲染时不必每行都判空，空行画出来就是空的一行。
+    public SettingRow RowAt(int index) {
+        if (index < 0 || index >= this.rows.Count) {
+            if (SettingsModel.emptyRow == null) {
+                SettingsModel.emptyRow = new SettingRow("", "");
+            }
+            return SettingsModel.emptyRow;
+        }
+        return this.rows[index];
+    }
+
+    // 按键找行（面板按 key 接线时用）。
+    public int IndexOf(string key) {
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            if (this.rows[i].Key == key) { return i; }
+        }
+        return -1;
+    }
+
+    // 选中某行的第 n 档：写回设置并存盘。非法下标返回 false。
+    public bool Select(int rowIndex, int choiceIndex) {
+        SettingRow row = this.RowAt(rowIndex);
+        if (row == null) { return false; }
+        if (choiceIndex < 0 || choiceIndex >= row.Values.Count) { return false; }
+        if (!this.settings.SetValue(row.Key, row.Values[choiceIndex])) { return false; }
+        row.Current = choiceIndex;
+        this.settings.Save();
+        return true;
+    }
+
+    // 按键 + 值写回（面板按 key 接线时用）。
+    public bool SelectValue(string key, string value) {
+        int idx = this.IndexOf(key);
+        if (idx < 0) { return false; }
+        SettingRow row = this.rows[idx];
+        for (int i = 0; i < row.Values.Count; i = i + 1) {
+            if (row.Values[i] == value) { return this.Select(idx, i); }
+        }
+        return false;
+    }
+
+    // 全部恢复默认并存盘。行上的当前档位同步回默认值。
+    public void ResetAll() {
+        this.settings.Reset();
+        for (int i = 0; i < this.rows.Count; i = i + 1) {
+            this.SyncCurrent(this.rows[i], this.settings.ValueOf(this.rows[i].Key));
+        }
+        this.settings.Save();
+    }
+}

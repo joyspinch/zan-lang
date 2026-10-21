@@ -54,6 +54,29 @@ Two bases that every shipped game would otherwise rewrite by hand:
 Both bases are pinned by `tests/conformance/game_settings_save.zan` in the
 language repository.
 
+## Settings panel logic
+
+`SettingsModel` turns a declared `GameSettings` into **rows of choices**
+("this option has these buttons, this one is selected"), and owns writing a
+chosen button back (validate + save).
+
+```zan
+using Game.Foundation;
+
+SettingsModel m = new SettingsModel(settings);
+m.RowAt(0).Choices;      // ["开", "关"]
+m.Select(0, 1);          // pick the second choice: write it back and save
+m.SelectValue("mode", "hard");
+m.ResetAll();
+```
+
+The split is deliberate: the **view** (the HTML sheet, the button look) is
+per-project, because each game has its own art direction; the **logic**
+(how many choices an option has, which one is current, how a pick is
+written back and persisted) is shared, because that is the part every
+project would otherwise get subtly wrong. Pinned by
+`tests/conformance/game_settings_model.zan`.
+
 ## Combo meter and ring QTE
 
 Two mechanics that every "keep the streak going" game otherwise rewrites
