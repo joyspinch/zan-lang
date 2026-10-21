@@ -841,6 +841,12 @@ endif()
 
 # ---- Tests ----
 enable_testing()
+# ---- 用例产物统一落在 build\cases\ ------------------------------------
+# 每个 conformance / leak / arc 用例都把自己的可执行文件编到 build\ 根下，
+# 一轮测试几百个用例，几百轮之后根目录就被一次性的 exe 淹了（实测 1884 个 /
+# 6 GB），真正的产物只剩 4 个。用例产物从此只有一个去处：build\cases\；
+# 根目录留给真产物与工具链。缓存的保质期与体积上限由 scripts\clean_build.ps1 管。
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/cases)
 
 add_executable(zanrt_sync_test
     tests/runtime/rt_sync_test.c
@@ -1128,7 +1134,7 @@ add_test(NAME diag_invalid_design_kind
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/invalid_design_kind.html
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_invalid_design_kind${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_invalid_design_kind${_exe_ext}
     "-DEXPECT_REGEX=invalid_design_kind\.html: design field 0 requires a valid Zan Control kind"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_invalid_design_kind PROPERTIES TIMEOUT 60)
@@ -1140,7 +1146,7 @@ add_test(NAME diag_ctor_missing_parameterless
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_missing_parameterless.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_missing_parameterless${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ctor_missing_parameterless${_exe_ext}
     "-DEXPECT_REGEX=no constructor of .Box. takes 0 argument"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_missing_parameterless PROPERTIES TIMEOUT 60)
@@ -1153,7 +1159,7 @@ add_test(NAME diag_unary_operator_no_overload
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_operator_no_overload.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_operator_no_overload${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_operator_no_overload${_exe_ext}
     "-DEXPECT_REGEX=does not define a unary '-' operator overload"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_operator_no_overload PROPERTIES TIMEOUT 60)
@@ -1172,7 +1178,7 @@ add_test(NAME diag_unary_plus_no_overload
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_plus_no_overload.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_plus_no_overload${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_plus_no_overload${_exe_ext}
     "-DEXPECT_REGEX=does not define a unary .[+]. operator overload"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_plus_no_overload PROPERTIES TIMEOUT 60)
@@ -1186,7 +1192,7 @@ add_test(NAME diag_unary_minus_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_minus_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_minus_string${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_minus_string${_exe_ext}
     "-DEXPECT_REGEX=cannot apply unary '-' to 'string'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_minus_string PROPERTIES TIMEOUT 60)
@@ -1195,7 +1201,7 @@ add_test(NAME diag_unary_tilde_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_tilde_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_tilde_string${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_tilde_string${_exe_ext}
     "-DEXPECT_REGEX=cannot apply unary '~' to 'string'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
@@ -1207,7 +1213,7 @@ add_test(NAME diag_unary_bang_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_string${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_bang_string${_exe_ext}
     "-DEXPECT_REGEX=cannot apply unary .!. to .string.: the operand must be a bool"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_bang_string PROPERTIES TIMEOUT 60)
@@ -1219,7 +1225,7 @@ add_test(NAME diag_unary_bang_class
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_class.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_class${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_bang_class${_exe_ext}
     "-DEXPECT_REGEX=cannot apply unary .!. to .Box.: the operand must be a bool"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_bang_class PROPERTIES TIMEOUT 60)
@@ -1230,10 +1236,46 @@ add_test(NAME diag_unary_bang_nullable
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_nullable.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_nullable${_exe_ext}
-    "-DEXPECT_REGEX=cannot apply unary .!. to .bool.: the operand must be a bool"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unary_bang_nullable${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary .!. to .bool\\?.: the operand must be a bool"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_bang_nullable PROPERTIES TIMEOUT 60)
+
+# A463: the type named in a diagnostic must be the type the user wrote.
+# The host used to answer with the type's bare name -- for a nullable that
+# name is the *element* type (`bool?` -> "bool"), for an array it is the
+# element type too (`int[]` -> "int"). The reader was then sent to the wrong
+# line. Every diagnostic now renders the type's shape (`T?` / `T[]` /
+# `List<T>`) from one shared source (binder.c: zan_type_display).
+add_test(NAME diag_type_shape_nullable
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/type_shape_nullable.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_type_shape_nullable${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int\\?' to 'int' in initializer"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_type_shape_nullable PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_type_shape_array
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/type_shape_array.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_type_shape_array${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'int' to 'int\\[\\]' in assignment"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_type_shape_array PROPERTIES TIMEOUT 60)
+
+# The nullable member diagnostic spells the nullable out on purpose ("this
+# is `bool?`, not `bool`") -- losing the '?' makes it a statement about a
+# type the user never wrote.
+add_test(NAME diag_type_shape_nullable_member
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/type_shape_nullable_member.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_type_shape_nullable_member${_exe_ext}
+    "-DEXPECT_REGEX=cannot access member 'ToString' directly on nullable type 'bool\\?'"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_type_shape_nullable_member PROPERTIES TIMEOUT 60)
 
 # A type parameter cannot be instantiated: `new T()` had no constructor
 # entry, so the compiler handed out a null reference and the first member
@@ -1242,7 +1284,7 @@ add_test(NAME diag_new_type_param
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/new_type_param.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_new_type_param${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_new_type_param${_exe_ext}
     "-DEXPECT_REGEX=cannot instantiate a type parameter .T."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_new_type_param PROPERTIES TIMEOUT 60)
@@ -1255,7 +1297,7 @@ add_test(NAME diag_await_in_lambda
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_in_lambda.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_in_lambda${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_await_in_lambda${_exe_ext}
     "-DEXPECT_REGEX=.await. inside a lambda is not supported: a lambda is not a coroutine"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_await_in_lambda PROPERTIES TIMEOUT 60)
@@ -1270,7 +1312,7 @@ add_test(NAME diag_await_gate_park_outside_async
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_gate_park_outside_async.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_gate_park_outside_async${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_await_gate_park_outside_async${_exe_ext}
     "-DEXPECT_REGEX=await Gate.Park is only supported inside an async method"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_await_gate_park_outside_async PROPERTIES TIMEOUT 60)
@@ -1279,7 +1321,7 @@ add_test(NAME diag_await_socket_ready_outside_async
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_socket_ready_outside_async.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_socket_ready_outside_async${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_await_socket_ready_outside_async${_exe_ext}
     "-DEXPECT_REGEX=await Socket.ReadReady is only supported inside an async method"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_await_socket_ready_outside_async PROPERTIES TIMEOUT 60)
@@ -1291,7 +1333,7 @@ add_test(NAME diag_lambda_body_type_error
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_body_type_error.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_body_type_error${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_lambda_body_type_error${_exe_ext}
     "-DEXPECT_REGEX=cannot convert .string. to .int. in initializer: no implicit conversion"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_lambda_body_type_error PROPERTIES TIMEOUT 60)
@@ -1305,7 +1347,7 @@ add_test(NAME diag_convert_tostring_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tostring_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tostring_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_convert_tostring_object${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'Box' to a string"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_tostring_object PROPERTIES TIMEOUT 60)
@@ -1314,7 +1356,7 @@ add_test(NAME diag_convert_tostring_struct
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tostring_struct.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tostring_struct${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_convert_tostring_struct${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'Pt' to a string"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_tostring_struct PROPERTIES TIMEOUT 60)
@@ -1338,7 +1380,7 @@ add_test(NAME diag_generic_list_add_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_list_add_wrong_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_list_add_wrong_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_list_add_wrong_type${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_list_add_wrong_type PROPERTIES TIMEOUT 60)
@@ -1347,7 +1389,7 @@ add_test(NAME diag_generic_list_insert_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_list_insert_wrong_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_list_insert_wrong_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_list_insert_wrong_type${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_list_insert_wrong_type PROPERTIES TIMEOUT 60)
@@ -1356,7 +1398,7 @@ add_test(NAME diag_generic_user_class_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_user_class_wrong_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_user_class_wrong_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_user_class_wrong_type${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_user_class_wrong_type PROPERTIES TIMEOUT 60)
@@ -1365,7 +1407,7 @@ add_test(NAME diag_generic_dict_wrong_value_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_dict_wrong_value_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_dict_wrong_value_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_dict_wrong_value_type${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'string' to 'int'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_dict_wrong_value_type PROPERTIES TIMEOUT 60)
@@ -1376,7 +1418,7 @@ add_test(NAME diag_math_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/math_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_math_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_math_object${_exe_ext}
     "-DEXPECT_REGEX=Math.Sqrt requires an int or floating-point argument"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_math_object PROPERTIES TIMEOUT 60)
@@ -1387,7 +1429,7 @@ add_test(NAME diag_math_max_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/math_max_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_math_max_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_math_max_object${_exe_ext}
     "-DEXPECT_REGEX=Math.Max requires numeric arguments"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_math_max_object PROPERTIES TIMEOUT 60)
@@ -1398,7 +1440,7 @@ add_test(NAME diag_convert_tonumber_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_tonumber_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_tonumber_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_convert_tonumber_object${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'Box' to a number"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_tonumber_object PROPERTIES TIMEOUT 60)
@@ -1408,7 +1450,7 @@ add_test(NAME diag_convert_todouble_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/convert_todouble_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_convert_todouble_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_convert_todouble_object${_exe_ext}
     "-DEXPECT_REGEX=Convert.ToDouble: cannot convert 'Box' to a number"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_convert_todouble_object PROPERTIES TIMEOUT 60)
@@ -1418,7 +1460,7 @@ add_test(NAME diag_parse_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/parse_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_parse_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_parse_object${_exe_ext}
     "-DEXPECT_REGEX=int.Parse requires a string argument"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_parse_object PROPERTIES TIMEOUT 60)
@@ -1427,7 +1469,7 @@ add_test(NAME diag_tryparse_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/tryparse_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_tryparse_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_tryparse_object${_exe_ext}
     "-DEXPECT_REGEX=int.TryParse requires a string argument"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_tryparse_object PROPERTIES TIMEOUT 60)
@@ -1440,7 +1482,7 @@ add_test(NAME diag_mixed_sign_compare
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/mixed_sign_compare.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_mixed_sign_compare${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_mixed_sign_compare${_exe_ext}
     "-DEXPECT_REGEX=mixed signed/unsigned comparison needs an explicit cast"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_mixed_sign_compare PROPERTIES TIMEOUT 60)
@@ -1453,7 +1495,7 @@ add_test(NAME diag_void_value
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/void_value.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_void_value${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_void_value${_exe_ext}
     "-DEXPECT_REGEX=cannot use a .void. value in argument 1[a-z: ]*|cannot convert .void. to .int. in initializer"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_void_value PROPERTIES TIMEOUT 60)
@@ -1468,7 +1510,7 @@ add_test(NAME diag_virtual_hides_inherited_virtual
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/virtual_hides_inherited_virtual.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_virtual_hides_inherited_virtual${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_virtual_hides_inherited_virtual${_exe_ext}
     "-DZANC_ARGS=--deny-warnings"
     "-DEXPECT_REGEX=hides an inherited virtual"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1483,7 +1525,7 @@ add_test(NAME diag_virtual_override_overload_clean
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/virtual_override_overload_clean.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/diag/virtual_override_overload_clean.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_virtual_override_overload_clean${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_virtual_override_overload_clean${_exe_ext}
     "-DZANC_ARGS=--deny-warnings"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(diag_virtual_override_overload_clean PROPERTIES TIMEOUT 60)
@@ -1495,7 +1537,7 @@ add_test(NAME diag_ctor_initializer_partial
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_initializer_partial.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_initializer_partial${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ctor_initializer_partial${_exe_ext}
     "-DEXPECT_REGEX=no constructor of .Box. takes 0 argument"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_initializer_partial PROPERTIES TIMEOUT 60)
@@ -1508,7 +1550,7 @@ add_test(NAME diag_concat_reference
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/concat_reference.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_concat_reference${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_concat_reference${_exe_ext}
     "-DEXPECT_REGEX=cannot concatenate 'string' and 'Score'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_concat_reference PROPERTIES TIMEOUT 60)
@@ -1521,7 +1563,7 @@ add_test(NAME diag_delegate_combine
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/delegate_combine.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_delegate_combine${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_delegate_combine${_exe_ext}
     "-DEXPECT_REGEX=delegates are single-cast"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_delegate_combine PROPERTIES TIMEOUT 60)
@@ -1533,7 +1575,7 @@ add_test(NAME diag_async_aggregate_return
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/async_aggregate_return.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_async_aggregate_return${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_async_aggregate_return${_exe_ext}
     "-DEXPECT_REGEX=an async method cannot return an aggregate type"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_async_aggregate_return PROPERTIES TIMEOUT 60)
@@ -1545,7 +1587,7 @@ add_test(NAME diag_int_literal_radix_overflow
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/int_literal_radix_overflow.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_int_literal_radix_overflow${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_int_literal_radix_overflow${_exe_ext}
     "-DEXPECT_REGEX=integer literal is too large for 'ulong'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_int_literal_radix_overflow PROPERTIES TIMEOUT 60)
@@ -1556,7 +1598,7 @@ add_test(NAME diag_int_literal_long_suffix_overflow
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/int_literal_long_suffix_overflow.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_int_literal_long_suffix_overflow${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_int_literal_long_suffix_overflow${_exe_ext}
     "-DEXPECT_REGEX=integer literal is too large for 'long'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_int_literal_long_suffix_overflow PROPERTIES TIMEOUT 60)
@@ -1570,7 +1612,7 @@ add_test(NAME diag_wasm32_struct_extern_call
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/wasm32_struct_extern_call.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_wasm32_struct_extern_call
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_wasm32_struct_extern_call
     "-DZANC_ARGS=--target;wasm32"
     "-DEXPECT_REGEX=call to extern 'Load' passes a struct by value, which has no C ABI classification"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1582,7 +1624,7 @@ add_test(NAME diag_ctor_arg_count
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_arg_count.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_arg_count${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ctor_arg_count${_exe_ext}
     "-DEXPECT_REGEX=no constructor of .Pair. accepts 2 arguments"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_arg_count PROPERTIES TIMEOUT 60)
@@ -1595,7 +1637,7 @@ add_test(NAME diag_null_to_value_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_to_value_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_to_value_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_null_to_value_type${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'null' to 'int'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_null_to_value_type PROPERTIES TIMEOUT 60)
@@ -1608,7 +1650,7 @@ add_test(NAME diag_extern_many_params
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/extern_many_params.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_extern_many_params${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_extern_many_params${_exe_ext}
     "-DEXPECT_REGEX=undefined (reference to|symbol:).*big17"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_extern_many_params PROPERTIES TIMEOUT 60)
@@ -1620,7 +1662,7 @@ add_test(NAME diag_mdarray_rank
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/mdarray_rank.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_mdarray_rank${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_mdarray_rank${_exe_ext}
     "-DEXPECT_REGEX=array rank specifier is too deep"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_mdarray_rank PROPERTIES TIMEOUT 60)
@@ -1631,7 +1673,7 @@ add_test(NAME diag_ulong_literal_narrowing
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ulong_literal_narrowing.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ulong_literal_narrowing${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ulong_literal_narrowing${_exe_ext}
     "-DEXPECT_REGEX=narrowing conversion from .ulong. to .long."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ulong_literal_narrowing PROPERTIES TIMEOUT 60)
@@ -1643,7 +1685,7 @@ add_test(NAME diag_number_exponent_missing_digits
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_exponent_missing_digits.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_exponent_missing_digits${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_number_exponent_missing_digits${_exe_ext}
     "-DEXPECT_REGEX=exponent requires at least one digit after .e."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_number_exponent_missing_digits PROPERTIES TIMEOUT 60)
@@ -1654,7 +1696,7 @@ add_test(NAME diag_number_prefix_missing_digits
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_prefix_missing_digits.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_prefix_missing_digits${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_number_prefix_missing_digits${_exe_ext}
     "-DEXPECT_REGEX=hexadecimal literal requires at least one digit after .0x."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_number_prefix_missing_digits PROPERTIES TIMEOUT 60)
@@ -1665,7 +1707,7 @@ add_test(NAME diag_number_octal_invalid_digit
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/number_octal_invalid_digit.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_number_octal_invalid_digit${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_number_octal_invalid_digit${_exe_ext}
     "-DEXPECT_REGEX=octal literal requires digits 0-7 after .0o."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_number_octal_invalid_digit PROPERTIES TIMEOUT 60)
@@ -1677,7 +1719,7 @@ add_test(NAME diag_expr_nesting_depth
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/expr_nesting_depth.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_expr_nesting_depth${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_expr_nesting_depth${_exe_ext}
     "-DEXPECT_REGEX=expression nesting too deep"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_expr_nesting_depth PROPERTIES TIMEOUT 60)
@@ -1689,7 +1731,7 @@ add_test(NAME diag_pp_nesting_depth
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/pp_nesting_depth.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_pp_nesting_depth${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_pp_nesting_depth${_exe_ext}
     "-DEXPECT_REGEX=conditional-compilation nesting too deep"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_pp_nesting_depth PROPERTIES TIMEOUT 60)
@@ -1702,7 +1744,7 @@ add_test(NAME diag_ctor_builtin_scalar
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ctor_builtin_scalar.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ctor_builtin_scalar${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ctor_builtin_scalar${_exe_ext}
     "-DEXPECT_REGEX=the builtin type 'string' has no constructor"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ctor_builtin_scalar PROPERTIES TIMEOUT 60)
@@ -1715,7 +1757,7 @@ add_test(NAME diag_duplicate_member
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/duplicate_member.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_duplicate_member${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_duplicate_member${_exe_ext}
     "-DEXPECT_REGEX=duplicate method .Val. in .Dup."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_duplicate_member PROPERTIES TIMEOUT 60)
@@ -1726,7 +1768,7 @@ add_test(NAME diag_implicit_ghost_call
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/implicit_ghost_call.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_implicit_ghost_call${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_implicit_ghost_call${_exe_ext}
     "-DEXPECT_REGEX=.Ghost. has no member .MissingHelper."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_implicit_ghost_call PROPERTIES TIMEOUT 60)
@@ -1738,7 +1780,7 @@ add_test(NAME diag_static_path_instance_call
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/static_path_instance_call.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_static_path_instance_call${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_static_path_instance_call${_exe_ext}
     "-DEXPECT_REGEX=cannot call instance method .Widget.Draw. via the type name"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_static_path_instance_call PROPERTIES TIMEOUT 60)
@@ -1750,7 +1792,7 @@ add_test(NAME diag_named_args_gap
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/named_args_gap.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_named_args_gap${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_named_args_gap${_exe_ext}
     "-DEXPECT_REGEX=named arguments must bind to the leading parameters"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_named_args_gap PROPERTIES TIMEOUT 60)
@@ -1762,7 +1804,7 @@ add_test(NAME diag_array_init_count_mismatch
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/array_init_count_mismatch.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_array_init_count_mismatch${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_array_init_count_mismatch${_exe_ext}
     "-DEXPECT_REGEX=array initializer has"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_array_init_count_mismatch PROPERTIES TIMEOUT 60)
@@ -1778,8 +1820,8 @@ add_test(NAME diag_arg_list_to_class
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/arg_list_to_class.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_arg_list_to_class${_exe_ext}
-    "-DEXPECT_REGEX=cannot convert .List. to .Cat. in argument 1 of .Count."
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_arg_list_to_class${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'List<Cat>' to 'Cat' in argument 1 of 'Count'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_arg_list_to_class PROPERTIES TIMEOUT 60)
 
@@ -1787,8 +1829,8 @@ add_test(NAME diag_arg_class_to_list
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/arg_class_to_list.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_arg_class_to_list${_exe_ext}
-    "-DEXPECT_REGEX=cannot convert .Cat. to .List. in argument 1 of .TakeList."
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_arg_class_to_list${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'Cat' to 'List<Cat>' in argument 1 of 'TakeList'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_arg_class_to_list PROPERTIES TIMEOUT 60)
 
@@ -1803,8 +1845,8 @@ add_test(NAME diag_split_into_array
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/split_into_array.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_split_into_array${_exe_ext}
-    "-DEXPECT_REGEX=cannot convert .List. to .string. in initializer"
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_split_into_array${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert 'List<string>' to 'string\\[\\]' in initializer"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_split_into_array PROPERTIES TIMEOUT 60)
 
@@ -1818,7 +1860,7 @@ add_test(NAME diag_access_private_field
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_private_field.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_private_field${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_access_private_field${_exe_ext}
     "-DEXPECT_REGEX=.Vault.secret. is private"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_access_private_field PROPERTIES TIMEOUT 60)
@@ -1827,7 +1869,7 @@ add_test(NAME diag_access_protected_unrelated
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_protected_unrelated.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_protected_unrelated${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_access_protected_unrelated${_exe_ext}
     "-DEXPECT_REGEX=.Base.shield. is protected"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_access_protected_unrelated PROPERTIES TIMEOUT 60)
@@ -1836,7 +1878,7 @@ add_test(NAME diag_access_private_ctor
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_private_ctor.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_private_ctor${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_access_private_ctor${_exe_ext}
     "-DEXPECT_REGEX=.Safe.Safe. is private"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_access_private_ctor PROPERTIES TIMEOUT 60)
@@ -1848,7 +1890,7 @@ add_test(NAME diag_access_internal_module
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/access_internal_module.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/access_internal_module_helper.zan"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_access_internal_module${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_access_internal_module${_exe_ext}
     "-DEXPECT_REGEX=.Core.Tag. is internal to .Acc.Inner."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_access_internal_module PROPERTIES TIMEOUT 60)
@@ -1859,7 +1901,7 @@ add_test(NAME diag_goto_into_try
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/goto_into_try.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_goto_into_try${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_goto_into_try${_exe_ext}
     "-DEXPECT_REGEX=jumps into a try/catch/finally or lock block"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_goto_into_try PROPERTIES TIMEOUT 60)
@@ -1872,7 +1914,7 @@ add_test(NAME diag_cast_no_conversion
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/cast_no_conversion.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_cast_no_conversion${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_cast_no_conversion${_exe_ext}
     "-DEXPECT_REGEX=cannot convert .string. to .int."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_cast_no_conversion PROPERTIES TIMEOUT 60)
@@ -1885,7 +1927,7 @@ add_test(NAME diag_collection_unknown_member
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/collection_unknown_member.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_collection_unknown_member${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_collection_unknown_member${_exe_ext}
     "-DEXPECT_REGEX=.List. has no member .Length."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_collection_unknown_member PROPERTIES TIMEOUT 60)
@@ -1898,7 +1940,7 @@ add_test(NAME diag_unresolved_call_member_chain
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_call_member_chain.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_call_member_chain${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unresolved_call_member_chain${_exe_ext}
     "-DEXPECT_REGEX=.Thing. has no method .Describe."
     "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1911,7 +1953,7 @@ add_test(NAME diag_call_unknown_method
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_call_unknown_method${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_call_unknown_method${_exe_ext}
     "-DEXPECT_REGEX=type .Diag\\.Thing. has no method .NoSuchMethod."
     "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1924,7 +1966,7 @@ add_test(NAME diag_call_unknown_method_name
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name_lib_a.zan;${CMAKE_SOURCE_DIR}/tests/diag/call_unknown_method_name_lib_b.zan"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_call_unknown_method_name${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_call_unknown_method_name${_exe_ext}
     "-DEXPECT_REGEX=type .DupNsA\\.Widget. has no method .NoSuchMethod."
     "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1934,7 +1976,7 @@ add_test(NAME diag_method_group_as_receiver
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/method_group_as_receiver.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_method_group_as_receiver${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_method_group_as_receiver${_exe_ext}
     "-DEXPECT_REGEX=.GetWorker. is a method, not a value; call it as .GetWorker\\(\\)."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_method_group_as_receiver PROPERTIES TIMEOUT 60)
@@ -1943,7 +1985,7 @@ add_test(NAME diag_nonexistent_member_access
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/nonexistent_member_access.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_nonexistent_member_access${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_nonexistent_member_access${_exe_ext}
     "-DEXPECT_REGEX=.Thing. has no member .NonExistent."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_nonexistent_member_access PROPERTIES TIMEOUT 60)
@@ -1959,7 +2001,7 @@ add_test(NAME diag_member_access_qualifies_type
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type_lib.zan"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_access_qualifies_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_member_access_qualifies_type${_exe_ext}
     "-DEXPECT_REGEX=type .Shapes\\.Menu. has no member .visible."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_access_qualifies_type PROPERTIES TIMEOUT 60)
@@ -1972,7 +2014,7 @@ add_test(NAME diag_member_call_qualifies_type
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_call_qualifies_type.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/member_access_qualifies_type_lib.zan"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_call_qualifies_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_member_call_qualifies_type${_exe_ext}
     "-DEXPECT_REGEX=type .Shapes\\.Menu. has no method .Show."
     "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -1986,7 +2028,7 @@ add_test(NAME diag_decimal_literal_narrowing
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/decimal_literal_narrowing.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_decimal_literal_narrowing${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_decimal_literal_narrowing${_exe_ext}
     "-DEXPECT_REGEX=narrowing conversion from .long. to .int."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_decimal_literal_narrowing PROPERTIES TIMEOUT 60)
@@ -1998,7 +2040,7 @@ add_test(NAME diag_control_design_entry
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/control_design_entry.html
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_control_design_entry${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_control_design_entry${_exe_ext}
     "-DEXPECT_REGEX=control_design_entry\.html: a design document with .role.: .control. cannot be the project entry"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_control_design_entry PROPERTIES TIMEOUT 60)
@@ -2010,7 +2052,7 @@ add_test(NAME diag_member_name_clash
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/member_name_clash.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_member_name_clash${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_member_name_clash${_exe_ext}
     "-DEXPECT_REGEX=.Row. is declared both as a field and as a method in .Design."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_member_name_clash PROPERTIES TIMEOUT 60)
@@ -2022,7 +2064,7 @@ add_test(NAME diag_static_field_via_instance
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/static_field_via_instance.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_static_field_via_instance${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_static_field_via_instance${_exe_ext}
     "-DEXPECT_REGEX=.other. is a static field of .Holder."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_static_field_via_instance PROPERTIES TIMEOUT 60)
@@ -2034,7 +2076,7 @@ add_test(NAME diag_unassigned_local
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_local.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_local${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unassigned_local${_exe_ext}
     "-DEXPECT_REGEX=use of unassigned local variable .total."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unassigned_local PROPERTIES TIMEOUT 60)
@@ -2046,7 +2088,7 @@ add_test(NAME diag_unassigned_out_param
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_out_param.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_out_param${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unassigned_out_param${_exe_ext}
     "-DEXPECT_REGEX=out parameter .v. must be assigned before control leaves"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unassigned_out_param PROPERTIES TIMEOUT 60)
@@ -2058,7 +2100,7 @@ foreach(_mode ref out)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_${_mode}_capture.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_${_mode}_capture${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_closure_${_mode}_capture${_exe_ext}
       "-DEXPECT_REGEX=cannot capture a ref or out parameter in a lambda"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_closure_${_mode}_capture PROPERTIES TIMEOUT 60)
@@ -2071,7 +2113,7 @@ add_test(NAME diag_closure_object_capture
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_capture.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_object_capture${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_closure_object_capture${_exe_ext}
     "-DEXPECT_REGEX=cannot capture parameter .value. of type .object.*runtime ownership is not representable yet"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_closure_object_capture PROPERTIES TIMEOUT 60)
@@ -2080,7 +2122,7 @@ add_test(NAME diag_closure_object_local_capture
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/closure_object_local_capture.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_closure_object_local_capture${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_closure_object_local_capture${_exe_ext}
     "-DEXPECT_REGEX=cannot capture local .value. of type .object.*runtime ownership is not representable yet"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_closure_object_local_capture PROPERTIES TIMEOUT 60)
@@ -2092,7 +2134,7 @@ add_test(NAME diag_unassigned_local_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unassigned_local_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unassigned_local_string${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unassigned_local_string${_exe_ext}
     "-DEXPECT_REGEX=use of unassigned local variable .plain."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unassigned_local_string PROPERTIES TIMEOUT 60)
@@ -2188,7 +2230,7 @@ add_test(NAME policy_server_mvc_ai_endpoint
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_endpoint_allowlist.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_server_mvc_ai_endpoint${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_server_mvc_ai_endpoint${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Mvc/src/ZanWeb/Framework/Ai/AiEndpointPolicy.zan"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2203,7 +2245,7 @@ add_test(NAME server_mvc_readonly_action_lease
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/readonly_action_lease.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/readonly_action_lease.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_readonly_action_lease${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_readonly_action_lease${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2218,7 +2260,7 @@ foreach(_mvc_case security_bootstrap security_verify_code security_routes
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.zan
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/${_mvc_case}.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_${_mvc_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_${_mvc_case}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2231,7 +2273,7 @@ add_test(NAME server_mvc_generator_sources
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/generator_sources.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/generator_sources.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_generator_sources${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_generator_sources${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
     -DRUN_ARGS=${CMAKE_BINARY_DIR}
@@ -2244,7 +2286,7 @@ add_test(NAME server_mvc_metrics_flush_retry
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/metrics_flush_retry.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/metrics_flush_retry.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_metrics_flush_retry${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_metrics_flush_retry${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2260,7 +2302,7 @@ add_test(NAME server_mvc_ai_stream_parse
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_stream_parse.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_stream_parse.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_ai_stream_parse${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/server_mvc_ai_stream_parse${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -2281,7 +2323,7 @@ add_test(NAME policy_external_target
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/external_policy.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/external_policy.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_external_target${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_external_target${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_external_target PROPERTIES TIMEOUT 120)
@@ -2291,7 +2333,7 @@ add_test(NAME policy_http_client
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_client_policy.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_client_policy.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_http_client${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_http_client${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_http_client PROPERTIES TIMEOUT 120)
@@ -2301,7 +2343,7 @@ add_test(NAME policy_sse_sink
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/sse_sink_policy.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/sse_sink_policy.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_sse_sink${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_sse_sink${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_sse_sink PROPERTIES TIMEOUT 120)
@@ -2311,7 +2353,7 @@ add_test(NAME policy_http_media
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_media_policy.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/http_media_policy.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_http_media${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_http_media${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_http_media PROPERTIES TIMEOUT 120)
@@ -2324,7 +2366,7 @@ add_test(NAME policy_sdk_wechat
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/sdk/wechat_policy.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/sdk/wechat_policy.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/policy_sdk_wechat${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/policy_sdk_wechat${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(policy_sdk_wechat PROPERTIES TIMEOUT 120)
@@ -2446,7 +2488,7 @@ foreach(_src ${_conf_srcs})
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/${_name}.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_${_name}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}"
       "-DRUN_ARGS=${_run_args}"
@@ -2678,7 +2720,7 @@ foreach(_src ${_gen_srcs})
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gen/${_name}.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/gen_${_name}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/gen_${_name}${_exe_ext}
       -DREPLY=${CMAKE_BINARY_DIR}/gen_${_name}_reply.json
       "-DREPLY_REGEX=${_gen_regex}"
       "-DREPLY_FORBID_REGEX=${_gen_forbid_regex}"
@@ -2770,7 +2812,7 @@ foreach(_src ${_conf_srcs})
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/leak_${_name}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/leak_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}"
       "-DEXPECT_LEAK_SITE=${_expect_leak_site}"
@@ -2842,7 +2884,7 @@ foreach(_src ${_conf_srcs})
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${_src}
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/arc_${_name}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/arc_${_name}${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       "-DZANC_ARGS=${_extra_args}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_arcguard.cmake)
@@ -2858,7 +2900,7 @@ add_test(NAME conformance_multifile
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_multifile${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_multifile${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Cross-file struct field layout: a class field whose type is a struct
@@ -2873,7 +2915,7 @@ add_test(NAME conformance_struct_field_layout
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/types.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/struct_field_layout/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_struct_field_layout${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_struct_field_layout${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- nsresolve enclosing-namespace resolution: a bare name in Gui.Sub
@@ -2887,7 +2929,7 @@ add_test(NAME conformance_nsresolve_ancestor
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/lib.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/sub.zan;--auto-stdlib"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsresolve_ancestor/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsresolve_ancestor${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_nsresolve_ancestor${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_nsresolve_ancestor PROPERTIES TIMEOUT 120)
 
@@ -2905,7 +2947,7 @@ add_test(NAME conformance_gen_pkg_isolation
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation/main.zan
     -DZANC_ARGS=--auto-stdlib
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gen_pkg_isolation${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gen_pkg_isolation${_exe_ext}
     -DWORKDIR=${CMAKE_SOURCE_DIR}/tests/conformance/gen_pkg_isolation
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 set_tests_properties(conformance_gen_pkg_isolation PROPERTIES TIMEOUT 120)
@@ -2919,7 +2961,7 @@ add_test(NAME conformance_argfile
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/main.zan
     "-DEXTRA=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/box.zan;${CMAKE_SOURCE_DIR}/tests/conformance/multifile/util.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_argfile${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_argfile${_exe_ext}
     -DRSP=${CMAKE_BINARY_DIR}/conf_argfile.rsp
     -P ${CMAKE_SOURCE_DIR}/tests/run_argfile.cmake)
 set_tests_properties(conformance_argfile PROPERTIES TIMEOUT 120)
@@ -2935,7 +2977,7 @@ add_test(NAME conformance_dir_input
     -DZANC=$<TARGET_FILE:zanc>
     -DDIR=${CMAKE_SOURCE_DIR}/tests/conformance/multifile
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/multifile/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_dir_input${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_dir_input${_exe_ext}
     -DEMPTYDIR=${CMAKE_BINARY_DIR}/conf_dir_input_empty
     -P ${CMAKE_SOURCE_DIR}/tests/run_dir_input.cmake)
 set_tests_properties(conformance_dir_input PROPERTIES TIMEOUT 120)
@@ -2948,7 +2990,7 @@ add_test(NAME conformance_nsdup
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/beta.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsdup/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsdup${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_nsdup${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- Per-declaration namespace context: a `partial class` split across files
@@ -2961,7 +3003,7 @@ add_test(NAME conformance_nsctx
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/beta.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split1.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/split2.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsctx/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsctx${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_nsctx${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # ---- 导入作用域按文件隔离：同名类分处两个命名空间时，裸名只认**本文件**
@@ -2975,7 +3017,7 @@ add_test(NAME conformance_nsusing
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/main.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/alpha.zan;${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/beta.zan"
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/nsusing/expected.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_nsusing${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_nsusing${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
 # 导入作用域不能互相泄漏：同一次编译里别的文件导入了某个命名空间，
@@ -2987,7 +3029,7 @@ add_test(NAME diag_ns_using_scope_leak
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak.zan
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak_one.zan;${CMAKE_SOURCE_DIR}/tests/diag/ns_using_scope_leak_two.zan"
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_ns_using_scope_leak${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_ns_using_scope_leak${_exe_ext}
     "-DEXPECT_REGEX=ambiguous type .Badge.; qualify it with its namespace"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_ns_using_scope_leak PROPERTIES TIMEOUT 60)
@@ -3417,7 +3459,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       # driver bundle (which may lag behind newly added native exports).
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Layout/Stack.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_stack.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_stack${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_stack${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Closing a tab removes it from the list the strip is iterating; the widget
@@ -3428,7 +3470,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tabs_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/Tabs.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tabs.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tabs${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_tabs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Dynamic tags model bookkeeping: add/remove raise exactly one Change each,
@@ -3440,7 +3482,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/dynamictags_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/DynamicTags.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_dynamictags.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_dynamictags${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_dynamictags${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Switch 增强回归：SizeClsFor 四档映射（tiny 是 Switch 独有的真实
@@ -3454,7 +3496,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/switch_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_switch.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_switch${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_switch${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 滚轮路由回归（用户报告“窗口有滚动条时滚轮跳跃”）：逐格线性不重
@@ -3467,7 +3509,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/wheel_route_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_wheel_route.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_wheel_route${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_wheel_route${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 弹层“按外部关闭”点击穿透回归（用户报告“抽屉/弹出层/下拉/菜单/
@@ -3483,7 +3525,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/overlay_penetrate_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_overlay_penetrate.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_overlay_penetrate${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_overlay_penetrate${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ScrollView 拖拽重锚定回归（用户报告“滚动条滚动时界面卡死/页面自
@@ -3496,7 +3538,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scroll_drag_reanchor_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_scroll_drag_reanchor.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scroll_drag_reanchor${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_scroll_drag_reanchor${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ListView 自带滚动条按住拖动回归：行热区让位（rowW=bw-barW）后
@@ -3508,7 +3550,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/listview_scrollbar_drag_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_listview_scrollbar_drag.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_listview_scrollbar_drag${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_listview_scrollbar_drag${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # UiDriver `clickid @语义名` 回归：命中区注册时带的语义标签在点击
@@ -3522,7 +3564,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/uidriver_label_click_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_uidriver_label_click.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_uidriver_label_click${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_uidriver_label_click${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Ribbon 溢出菜单回归：条带放不下时右端出现「»」，放不下的命令收进
@@ -3536,7 +3578,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ribbon_overflow_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_ribbon_overflow.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_ribbon_overflow${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ribbon_overflow${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ChatView 气泡模式回归（桌面 IM 客户端实机反馈“消息乱码、滚动条方向
@@ -3553,7 +3595,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chatview_bubble_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chatview_bubble.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chatview_bubble${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chatview_bubble${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ListView 禁用行（不可选选项）回归：WithSelectable 的门与模板行
@@ -3565,7 +3607,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/listview_disabled_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_listview_disabled.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_listview_disabled${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_listview_disabled${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # VirtualList template rows: rows are built lazily (never at SetRows, only
@@ -3577,7 +3619,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/virtuallist_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Widget/VirtualList.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_virtuallist.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_virtuallist${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_virtuallist${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The New Project wizard rescales a template's .html designs to the chosen
@@ -3604,7 +3646,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/retarget_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_retarget.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_retarget${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_retarget${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_icon
@@ -3613,7 +3655,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/icon_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Media/Icon.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_icon.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_icon${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_icon${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_image
@@ -3622,7 +3664,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/image_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_image.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_image${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_image${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_countdown
@@ -3631,7 +3673,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/countdown_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_countdown.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_countdown${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_countdown${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 上传组件：模型往返（Kind/15 Props/Events/工厂）、门与状态机
@@ -3650,7 +3692,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/richtext_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_richtext.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_richtext${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_richtext${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_upload
@@ -3659,7 +3701,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/upload_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_upload.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_upload${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_upload${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 分页组件：Element Plus 页码窗口算法（省略号 = 0 占位，领起/
@@ -3672,7 +3714,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/pagination_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_pagination.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_pagination${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_pagination${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 数值滚动动画（countup.js 风格）：ValueAt 插值与 Format 千分位/
@@ -3684,7 +3726,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/numberanimation_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_numberanimation.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_numberanimation${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_numberanimation${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 步骤指示器（Naive UI n-steps）：StatusNorm 白名单、StateClass
@@ -3697,7 +3739,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/steps_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_steps.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_steps${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_steps${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 时间线强化：TimelineItem 构造重载（icon/pending 字段）、SizeClass
@@ -3710,7 +3752,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/timeline_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_timeline.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_timeline${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_timeline${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # DatePicker 十一种形式的文本往返（起止颠倒交换、week 周一起始、
@@ -3723,7 +3765,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datepicker_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datepicker.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datepicker${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datepicker${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_watermark
@@ -3732,7 +3774,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/watermark_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_watermark.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_watermark${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_watermark${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ListItem 两行列表行：测量契约（副标题行/对称留白计入高度、
@@ -3744,7 +3786,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/listitem_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_listitem.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_listitem${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_listitem${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_chart_symbol
@@ -3753,7 +3795,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_symbol_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_symbol.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_symbol${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_symbol${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 图表填充光栅化亚像素 AA 回归（用户报告图表斜线/曲线大量毛刺）：
@@ -3769,7 +3811,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_fillaa_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_fillaa.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_fillaa${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_fillaa${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ChildWindow 保留树 × 宿主阴影带坐标回归：带 SetWindowShadow 的
@@ -3783,7 +3825,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/childwindow_shape_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_childwindow_shape.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_childwindow_shape${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_childwindow_shape${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 子窗口渲染预算与耗时告警回归（A422）：子窗在主帧内同步渲染，单帧
@@ -3797,7 +3839,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/childwindow_budget_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_childwindow_budget.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_childwindow_budget${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_childwindow_budget${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 关闭最大化按钮的窗口：双击标题栏与 SC_MAXIMIZE 必须断路（App
@@ -3810,7 +3852,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/maxbtn_dblclick_test.zan
         "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
         -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_maxbtn_dblclick.out
-        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_maxbtn_dblclick${_exe_ext}
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_maxbtn_dblclick${_exe_ext}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   endif()
 
@@ -3823,7 +3865,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_theme_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_theme.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_theme${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_theme${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # calendar 坐标系回归（此前"整类零实现"：10 个官方 calendar 示例在
@@ -3838,7 +3880,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_calendar_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_calendar.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_calendar${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_calendar${_exe_ext}
       -DRUN_ARGS=${CMAKE_SOURCE_DIR}/examples/gui_charts/options
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -3854,7 +3896,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_stackedarea_aa_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_stackedarea_aa.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_stackedarea_aa${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_stackedarea_aa${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # option 级 backgroundColor 整卡底色回归（账本 A13）：官方
@@ -3871,7 +3913,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_background_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_background.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_background${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_background${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # barMinHeight 最小柱高回归（账本 A5）：ECharts layout/barGrid.ts:456-472
@@ -3887,7 +3929,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_barminheight_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_barminheight.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_barminheight${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_barminheight${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # C5 回归：geo 组件形态（geo-choropleth-scatter / geo-map-scatter /
@@ -3906,7 +3948,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/chart_geodispatch_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_chart_geodispatch.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_chart_geodispatch${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_chart_geodispatch${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_layer
@@ -3915,7 +3957,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/layer_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_layer.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_layer${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_layer${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_text
@@ -3924,7 +3966,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/text_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Text/Text.zan${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_text.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_text${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_text${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor
@@ -3933,7 +3975,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_lsp
@@ -3942,7 +3984,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_lsp_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_lsp.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_lsp${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_lsp${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 签名提示的重载切换（VS 的参数信息「◀ 2/3 ▶」）：全部重载由外部
@@ -3954,7 +3996,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_sig_overload_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_sig_overload.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_sig_overload${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_sig_overload${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 补全候选分层回归（弹窗顶部只剩 for/if/class/try，工程符号被挤出
@@ -3967,7 +4009,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_completion_order_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_completion_order.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_completion_order${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_completion_order${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 语言服务推送的语义诊断（打字即报）回归：诊断按文档路径存放，
@@ -3979,7 +4021,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_semantic_diag_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_semantic_diag.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_semantic_diag${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_semantic_diag${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 代码片段（snippet）回归：模板解析（$1 / ${1:默认值} / ${1|选项|} /
@@ -3991,7 +4033,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_snippet_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_snippet.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_snippet${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_snippet${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_fold
@@ -4000,7 +4042,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_fold_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_fold.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_fold${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_fold${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_ctxmenu
@@ -4009,7 +4051,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_ctxmenu${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_ctxmenu_ui
@@ -4018,7 +4060,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_ui_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu_ui.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_ui${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_ctxmenu_ui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_ctxmenu_vs
@@ -4027,7 +4069,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_ctxmenu_vs_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu_vs.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_vs${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_ctxmenu_vs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_bp_menu_ui
@@ -4036,7 +4078,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_bp_menu_ui_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_bp_menu_ui.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_bp_menu_ui${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_bp_menu_ui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_codeeditor_snippet_picker_ui
@@ -4045,7 +4087,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_snippet_picker_ui_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_snippet_picker_ui.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_snippet_picker_ui${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_codeeditor_snippet_picker_ui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_ui_watchdog
@@ -4054,7 +4096,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/ui_watchdog_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Diagnostics/UiWatchdog.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_ui_watchdog.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_ui_watchdog${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_ui_watchdog${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable
@@ -4063,7 +4105,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_identity
@@ -4072,7 +4114,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_identity_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_identity.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_identity${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_identity${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_query
@@ -4081,7 +4123,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_query${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_topn
@@ -4090,7 +4132,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_topn_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_topn.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_topn${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_topn${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_multisort
@@ -4099,7 +4141,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_multisort_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_multisort.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_multisort${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_multisort${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_sparse_page
@@ -4108,7 +4150,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_sparse_page_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_sparse_page.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_sparse_page${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_sparse_page${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_query_source
@@ -4117,7 +4159,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_source_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_source.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_source${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_query_source${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_local_source
@@ -4126,7 +4168,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_local_source_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_local_source.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_local_source${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_local_source${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_query_plan_contract
@@ -4135,7 +4177,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_plan_contract_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_plan_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_plan_contract${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_query_plan_contract${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_transaction
@@ -4144,7 +4186,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_transaction_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_transaction.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_transaction${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_transaction${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_query_transaction
@@ -4153,7 +4195,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_query_transaction_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_query_transaction.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_query_transaction${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_query_transaction${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_selection_model
@@ -4162,7 +4204,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_selection_model_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_selection_model.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_selection_model${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_selection_model${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_realtime
@@ -4171,7 +4213,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_realtime_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_realtime.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_realtime${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_realtime${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_tree
@@ -4180,7 +4222,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_tree_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_tree.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_tree${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_tree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_filtertree
@@ -4189,7 +4231,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filtertree_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filtertree.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filtertree${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_filtertree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_formula
@@ -4198,7 +4240,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_formula_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_formula.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_formula${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_formula${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_colchooser
@@ -4207,7 +4249,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_colchooser_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_colchooser.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_colchooser${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_colchooser${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_masterdetail
@@ -4216,7 +4258,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_masterdetail_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_masterdetail.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_masterdetail${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_masterdetail${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_filterbar
@@ -4225,7 +4267,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_filterbar_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_filterbar.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_filterbar${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_filterbar${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # i18n: UI strings resolve through Lang (System.Globalization) keyed on the
@@ -4236,7 +4278,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_i18n_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_i18n.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_i18n${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_i18n${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_datatable_multirange
@@ -4245,7 +4287,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_multirange_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_multirange.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_multirange${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_multirange${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Right-click opening the row menu must never narrow an existing
@@ -4257,7 +4299,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_ctxmenu_selection_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_ctxmenu_selection.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_ctxmenu_selection${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_ctxmenu_selection${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Hit-region semantic labels (a11y projection): DataTable registers
@@ -4269,7 +4311,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_a11y_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_a11y.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_a11y${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_a11y${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Chart column (cellType 8): sparkKind bar/line/area forms, sparkColor /
@@ -4282,7 +4324,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_spark_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_spark.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_spark${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_spark${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Export progress modal (ExportUi): the *AsyncUi wrappers surface a centered
@@ -4296,7 +4338,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/datatable_exportui_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.DataTable/src/Gui/Component/DataTable/DataTable.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_datatable_exportui.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_datatable_exportui${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_datatable_exportui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # WEB_GUI_ROADMAP: the designer's HTML storage format is exercised by
@@ -4309,7 +4351,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_control_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_control.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_control.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_control${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_control${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Designer preview and generated HTML share pixels and control rects across
@@ -4320,7 +4362,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_wysiwyg.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_wysiwyg.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_wysiwyg${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_wysiwyg${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4335,7 +4377,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formbuild_contract_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formbuild_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_formbuild_contract${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_formbuild_contract${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4350,7 +4392,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/genform_contract.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_genform_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_genform_contract${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_genform_contract${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4363,7 +4405,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_interaction_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_interaction.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_interaction${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_interaction${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4380,7 +4422,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_prop_reset_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/designer_prop_reset.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_prop_reset${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_prop_reset${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4396,7 +4438,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_field_height_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/designer_field_height.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_field_height${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_field_height${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4413,7 +4455,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_float_band.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_float_band${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_float_band${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4426,7 +4468,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/window_shape_mask_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_window_shape_mask.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_window_shape_mask${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_window_shape_mask${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4440,7 +4482,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/native_window_size_test.zan
         "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
         -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_native_window_size.out
-        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_native_window_size${_exe_ext}
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_native_window_size${_exe_ext}
         -DSTDLIB_STAMP=${_stdlib_stamp}
         -DWORKDIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4456,7 +4498,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_large.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_default.html;${CMAKE_SOURCE_DIR}/tests/gui/design_form_size_small.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_form_size.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_form_size${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_form_size${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The full designer palette generates compiling, constructing code even
@@ -4468,7 +4510,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_palette_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_palette.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_palette.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_palette${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_palette${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The alert-banner family: the palette's serialized kind "Alert"
@@ -4482,7 +4524,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_alert_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_alert.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_alert.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_alert${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_alert${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # A primary design document supplies only a fallback entry point. When a
@@ -4494,7 +4536,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main.html
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/design_explicit_main_test.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_design_explicit_main.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_design_explicit_main${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_design_explicit_main${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Dynamic document primitives (P8): a design doc with <template
@@ -4508,7 +4550,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_dynamic.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_dynamic.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_dynamic${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_dynamic${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Same primitives through the runtime-HTML compiled channel (GenHtml):
@@ -4520,7 +4562,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_runtime${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Runtime-HTML channel with Chinese text and non-Zan bytes (@@) in the
@@ -4534,7 +4576,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_runtime_cjk.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_runtime_cjk.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_runtime_cjk${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_runtime_cjk${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # GenHtml 编译期样式 scoping（Vue <style scoped> 同语义）：两份文档
@@ -4547,7 +4589,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_scope_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_scope.html;${CMAKE_SOURCE_DIR}/tests/gui/html_scope_b.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_scope.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_scope${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_scope${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # <a> 链接导航语义（P5）：运行时 LoadHtmlWith 与 GenHtml 编译通道
@@ -4560,7 +4602,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/html_link_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/html_link.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_html_link.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_html_link${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_html_link${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Declarative typed grid: a DataGrid field with "of" + "columns" projects
@@ -4572,7 +4614,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/form_grid_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/form_grid.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_form_grid.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_form_grid${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_form_grid${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Navigation layer: route table + Tabs-as-outlet (lazy build, keepAlive,
@@ -4583,7 +4625,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/nav_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_nav.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_nav${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_nav${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # FormBuilder.Build runtime path lock: flow cells, caption wrapping,
@@ -4595,7 +4637,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formbuild_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formbuild.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_formbuild${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_formbuild${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # HttpTableSource: loopback HTTP server with a hit counter against the
@@ -4607,7 +4649,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/httpsource_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_httpsource.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_httpsource${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_httpsource${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_httpsource PROPERTIES TIMEOUT 120)
 
@@ -4620,7 +4662,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/compref_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/compref_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BadgeCard.zcomp;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_compref.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_compref${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_compref${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_compref PROPERTIES TIMEOUT 120)
 
@@ -4634,7 +4676,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/compref_designer_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_compref_designer.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_compref_designer${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_compref_designer${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_compref_designer PROPERTIES TIMEOUT 120)
 
@@ -4648,7 +4690,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/props_contract_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_props_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props_contract${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_props_contract${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_props_contract PROPERTIES TIMEOUT 120)
 
@@ -4661,7 +4703,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/events_contract_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_events_contract.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_events_contract${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_events_contract${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_events_contract PROPERTIES TIMEOUT 120)
 
@@ -4673,7 +4715,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/sender_channel_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_sender_channel.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_sender_channel${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_sender_channel${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_sender_channel PROPERTIES TIMEOUT 120)
 
@@ -4686,7 +4728,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/genform_click.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_genform_click${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_genform_click${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_genform_click PROPERTIES TIMEOUT 120)
 
@@ -4701,7 +4743,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/batchjob_app.html;${CMAKE_SOURCE_DIR}/tests/gui/components/BatchJobProgress.zcomp;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_batchjob.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_batchjob${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_batchjob${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_batchjob PROPERTIES TIMEOUT 120)
 
@@ -4718,7 +4760,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.html;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/gui/scene_adapter.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scene_adapter${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_scene_adapter${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   add_test(NAME conformance_gui_props
@@ -4727,7 +4769,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/prop_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_props.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_props${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_props${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # FormGroup/FormRule: caption+control+error-line rows, rule evaluation
@@ -4739,7 +4781,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/formgroup_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_formgroup.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_formgroup${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_formgroup${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Calendar: the pure-logic surface without a window -- strict YYYY-MM-DD
@@ -4753,7 +4795,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/calendar_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_calendar.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_calendar${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_calendar${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The tree invariant every container shares: one place per control, so a
@@ -4765,7 +4807,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/tree_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_tree.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_tree${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_tree${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # CSS flex wrapping and the equal-column Grid are pure geometry: the case
@@ -4779,7 +4821,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/flex_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_flex.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_flex${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_flex${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The Carousel's slide placement is pure geometry: horizontal slides along
@@ -4793,7 +4835,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/carousel_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_carousel.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_carousel${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_carousel${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Rate reserves 2x its star count of hit-test ids: allowHalf paints a
@@ -4809,7 +4851,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/rate_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_rate.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_rate${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_rate${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The Slider's value math is pure computation: step / step="mark"
@@ -4823,7 +4865,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/slider_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_slider.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_slider${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_slider${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 穿梭框的无窗口回归：Bind 实时视图与勾选集合、MoveRight/MoveLeft 的
@@ -4837,7 +4879,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/transfer_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_transfer.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_transfer${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_transfer${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # ColorPicker 的无窗口回归：32 位负打包色的通道提取/构造/比较（
@@ -4853,7 +4895,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/colorpicker_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_colorpicker.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorpicker${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_colorpicker${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   # 设计器颜色属性行接真取色器：kind 4 颜色属性认十进制打包色与 CSS
   # 颜色文本两种形态（只按整数解析的话 "#ff0000" 静默落成 0=没设颜
@@ -4865,7 +4907,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_color_picker_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_color_picker.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_color_picker${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_color_picker${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # 设计器颜色属性行契约：每个颜色键都要有行（面板上点得到）、被
@@ -4878,7 +4920,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_color_props_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_color_props.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_color_props${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_designer_color_props${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_designer_color_props PROPERTIES TIMEOUT 120)
 
@@ -4890,7 +4932,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scene_designer_color_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_scene_designer_color.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scene_designer_color${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_scene_designer_color${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_scene_designer_color PROPERTIES TIMEOUT 120)
 
@@ -4905,7 +4947,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/selectbox_cascade_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_cascade.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_cascade${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_selectbox_cascade${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # SelectBox 弹层选项点击的基线命中回归：弹层「内部控件让行」的
@@ -4918,7 +4960,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/selectbox_popup_hit_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_selectbox_popup_hit.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_selectbox_popup_hit${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_selectbox_popup_hit${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Menu v2 (tree menu): pure-model flatten/default-expand asserts plus a
@@ -4929,7 +4971,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/menu_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_menu.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_menu${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_menu${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # InputNumber's value math is pure computation too: the fixed-point
@@ -4944,7 +4986,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/inputnumber_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_inputnumber.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_inputnumber${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_inputnumber${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # The CSS skin pipeline (Css parser -> StyleSheet -> StyleBox) is pure
@@ -4955,7 +4997,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/Css.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleSheet.zan;${CMAKE_SOURCE_DIR}/packages/Zan.Gui/src/Gui/Styling/StyleBox.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_css${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
@@ -4965,7 +5007,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/css_dpi_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_css_dpi.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_css_dpi${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_css_dpi${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4979,7 +5021,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/${_gui_frame_case}_test.zan
         "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
         -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_${_gui_frame_case}.out
-        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_${_gui_frame_case}${_exe_ext}
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_${_gui_frame_case}${_exe_ext}
         -DSTDLIB_STAMP=${_stdlib_stamp}
         -DWORKDIR=${CMAKE_SOURCE_DIR}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -4993,7 +5035,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/guihost_loop_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/guihost_loop.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_guihost_loop${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_guihost_loop${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -5009,7 +5051,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
         -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/effects_coalesce_test.zan
         "-DZANC_ARGS=--auto-stdlib;--subsystem;console${_gui_driver_tail}"
         -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_effects_coalesce.out
-        -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_effects_coalesce${_exe_ext}
+        -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_effects_coalesce${_exe_ext}
         -DSTDLIB_STAMP=${_stdlib_stamp}
         -DWORKDIR=${_gui_effects_coalesce_workdir}
         -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -5023,7 +5065,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/sprite_cache_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_sprite_cache.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_trap_cat_sprite_cache${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_trap_cat_sprite_cache${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -5036,7 +5078,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/templates/trap-cat/single_tap_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCat.html;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatSprite.zan;${CMAKE_SOURCE_DIR}/templates/game/trap-cat/src/TrapCatBoard.zan;--auto-stdlib;--subsystem;console${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/trap_cat_single_tap.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_trap_cat_single_tap${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_trap_cat_single_tap${_exe_ext}
       -DSTDLIB_STAMP=${_stdlib_stamp}
       -DWORKDIR=${CMAKE_SOURCE_DIR}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -5053,7 +5095,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/webview_interop_test.zan
       "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.Browser/src/Gui/Component/WebView/WebView2.zan;--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_webview_interop.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_webview_interop${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_webview_interop${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   # Button.Color's CSS injection must be idempotent per color per sheet,
@@ -5070,7 +5112,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/colorinject_test.zan
       "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_colorinject.out
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_colorinject${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_gui_colorinject${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
   set_tests_properties(runtime_gui conformance_gui_stack conformance_gui_flex conformance_gui_carousel conformance_gui_text conformance_gui_codeeditor conformance_gui_codeeditor_fold conformance_gui_datatable conformance_gui_css conformance_gui_props conformance_gui_tree conformance_gui_menu conformance_gui_webview_interop conformance_gui_colorinject conformance_gui_calendar conformance_gui_rate PROPERTIES
@@ -5079,7 +5121,7 @@ endif()
 
 add_test(NAME ide_compile_modes
   COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -DZANC=$<TARGET_FILE:zanc>
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/ide_compile_modes${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/ide_compile_modes${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_ide_compile_mode.cmake)
 set_tests_properties(ide_compile_modes PROPERTIES LABELS "full;standard;smoke;ide")
 
@@ -5092,7 +5134,7 @@ add_test(NAME conformance_ide_sse_live_tail
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/sse_live_tail_test.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/sse_live_tail_test.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conformance_ide_sse_live_tail${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conformance_ide_sse_live_tail${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/ai/SseLive.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/ai/SseAnswer.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/AiAgent.Sse.zan;--auto-stdlib"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
@@ -5322,7 +5364,7 @@ foreach(_nint_boundary initializer assignment argument return expr_return async_
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/nint_to_int_${_nint_boundary}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_nint_to_int_${_nint_boundary}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_nint_to_int_${_nint_boundary}${_exe_ext}
       "-DEXPECT_REGEX=narrowing conversion from 'nint' to 'int' in ${_nint_what}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_nint_to_int_${_nint_boundary} PROPERTIES TIMEOUT 60)
@@ -5333,7 +5375,7 @@ foreach(_field_init_kind static instance generic)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/field_initializer_narrowing_${_field_init_kind}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_field_initializer_narrowing_${_field_init_kind}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_field_initializer_narrowing_${_field_init_kind}${_exe_ext}
       "-DEXPECT_REGEX=narrowing conversion from 'nint' to 'int' in field initializer"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_field_initializer_narrowing_${_field_init_kind}
@@ -5347,7 +5389,7 @@ foreach(_ro_case method outside)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/readonly_assign_${_ro_case}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_readonly_assign_${_ro_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_readonly_assign_${_ro_case}${_exe_ext}
       "-DEXPECT_REGEX=cannot assign to readonly field"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_readonly_assign_${_ro_case} PROPERTIES TIMEOUT 60)
@@ -5361,7 +5403,7 @@ foreach(_mismatch int_string string_int)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_where_${_mismatch}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_orm_where_${_mismatch}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_orm_where_${_mismatch}${_exe_ext}
       "-DEXPECT_REGEX=type mismatch"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_orm_where_${_mismatch} PROPERTIES TIMEOUT 60)
@@ -5371,7 +5413,7 @@ add_test(NAME diag_orm_set_string_int
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/orm_set_string_int.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_orm_set_string_int${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_orm_set_string_int${_exe_ext}
     "-DEXPECT_REGEX=type mismatch"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_orm_set_string_int PROPERTIES TIMEOUT 60)
@@ -5382,7 +5424,7 @@ add_test(NAME diag_enum_unknown_member
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/enum_unknown_member.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_enum_unknown_member${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_enum_unknown_member${_exe_ext}
     "-DEXPECT_REGEX=enum type 'Kind' has no member 'NoSuchMember'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_enum_unknown_member PROPERTIES TIMEOUT 60)
@@ -5395,7 +5437,7 @@ add_test(NAME diag_conditional_branch_mismatch
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/conditional_branch_mismatch.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_conditional_branch_mismatch${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_conditional_branch_mismatch${_exe_ext}
     "-DEXPECT_REGEX=share no common type"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_conditional_branch_mismatch PROPERTIES TIMEOUT 60)
@@ -5409,7 +5451,7 @@ add_test(NAME diag_return_type_mismatch
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/return_type_mismatch.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_return_type_mismatch${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_return_type_mismatch${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'int' to 'string' in return statement"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_return_type_mismatch PROPERTIES TIMEOUT 60)
@@ -5423,7 +5465,7 @@ add_test(NAME diag_task_run_action_result_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/task_run_action_result_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_task_run_action_result_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_task_run_action_result_type${_exe_ext}
     "-DEXPECT_REGEX=carries no result"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_task_run_action_result_type PROPERTIES TIMEOUT 60)
@@ -5434,7 +5476,7 @@ add_test(NAME diag_generic_constraint_unknown
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_constraint_unknown.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_constraint_unknown${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_constraint_unknown${_exe_ext}
     "-DEXPECT_REGEX=unknown constraint 'NoSuchConstraint' in 'where T"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_generic_constraint_unknown PROPERTIES TIMEOUT 60)
@@ -5445,7 +5487,7 @@ add_test(NAME diag_sealed_derive
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/sealed_derive.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_sealed_derive${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_sealed_derive${_exe_ext}
     "-DEXPECT_REGEX=cannot derive from sealed type 'Base'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_sealed_derive PROPERTIES TIMEOUT 60)
@@ -5456,7 +5498,7 @@ add_test(NAME diag_null_guard_after_use
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_guard_after_use.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_guard_after_use${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_null_guard_after_use${_exe_ext}
     "-DEXPECT_REGEX=can return null; accessing 'Name' on its result"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_null_guard_after_use PROPERTIES TIMEOUT 60)
@@ -5467,7 +5509,7 @@ foreach(_lock_null_case unguarded after_use later_body later_header locked_resul
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/null_guard_lock.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_null_guard_lock_${_lock_null_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_null_guard_lock_${_lock_null_case}${_exe_ext}
       "-DZANC_ARGS=--no-packages;-D${_lock_null_case}"
       "-DEXPECT_REGEX=can return null; accessing 'Name' on its result"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -5484,7 +5526,7 @@ foreach(_invariant_case arg assign)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/generic_invariant_${_invariant_case}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_generic_invariant_${_invariant_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_generic_invariant_${_invariant_case}${_exe_ext}
       "-DEXPECT_REGEX=generic type arguments are invariant"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_generic_invariant_${_invariant_case} PROPERTIES TIMEOUT 60)
@@ -5498,7 +5540,7 @@ add_test(NAME diag_scalar_member_access
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/scalar_member_access.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_scalar_member_access${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_scalar_member_access${_exe_ext}
     "-DEXPECT_REGEX=type 'string' has no member 'path'"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_scalar_member_access PROPERTIES TIMEOUT 60)
@@ -5512,7 +5554,7 @@ foreach(_member_read_case class_member_read class_member_read_inherited)
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/${_member_read_case}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_${_member_read_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_${_member_read_case}${_exe_ext}
       "-DEXPECT_REGEX=has no member"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_${_member_read_case} PROPERTIES TIMEOUT 60)
@@ -5525,7 +5567,7 @@ add_test(NAME diag_undeclared_member_target
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/undeclared_member_target.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_undeclared_member_target${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_undeclared_member_target${_exe_ext}
     "-DEXPECT_REGEX=undeclared identifier"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_undeclared_member_target PROPERTIES TIMEOUT 60)
@@ -5537,7 +5579,7 @@ add_test(NAME diag_unresolved_static_chain
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unresolved_static_chain.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unresolved_static_chain${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_unresolved_static_chain${_exe_ext}
     "-DEXPECT_REGEX=.Fluent. has no method .Create."
     "-DEXPECT_ERROR_COUNT=1"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -5550,7 +5592,7 @@ add_test(NAME diag_index_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/index_wrong_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_index_wrong_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_index_wrong_type${_exe_ext}
     "-DEXPECT_REGEX=no .Bag. indexer takes an index of type .string."
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_index_wrong_type PROPERTIES TIMEOUT 60)
@@ -5562,7 +5604,7 @@ add_test(NAME diag_reserved_word_as_local_name
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_local_name.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_local_name${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_reserved_word_as_local_name${_exe_ext}
     "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
     -DEXPECT_ERROR_COUNT=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -5572,7 +5614,7 @@ add_test(NAME diag_reserved_word_as_member_name
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_member_name.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_member_name${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_reserved_word_as_member_name${_exe_ext}
     "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
     -DEXPECT_ERROR_COUNT=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -5582,7 +5624,7 @@ add_test(NAME diag_reserved_word_as_field_name
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_field_name.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_field_name${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_reserved_word_as_field_name${_exe_ext}
     "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
     -DEXPECT_ERROR_COUNT=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
@@ -5591,7 +5633,7 @@ add_test(NAME diag_index_write_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/index_write_wrong_type.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_index_write_wrong_type${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_index_write_wrong_type${_exe_ext}
     "-DEXPECT_REGEX=no .Bag. indexer accepts this assignment"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_index_write_wrong_type PROPERTIES TIMEOUT 60)
@@ -5605,7 +5647,7 @@ add_test(NAME diag_box_value_to_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/box_value_to_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_box_value_to_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_box_value_to_object${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'int' to 'object': value types cannot be boxed"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_box_value_to_object PROPERTIES TIMEOUT 60)
@@ -5613,7 +5655,7 @@ add_test(NAME diag_box_generic_value_to_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/box_generic_value_to_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_box_generic_value_to_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_box_generic_value_to_object${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'int' to 'object': value types cannot be boxed"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_box_generic_value_to_object PROPERTIES TIMEOUT 60)
@@ -5626,7 +5668,7 @@ add_test(NAME diag_lambda_return_object
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_return_object.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_return_object${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_lambda_return_object${_exe_ext}
     "-DEXPECT_REGEX=cannot convert 'int' to 'object' in lambda return"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_lambda_return_object PROPERTIES TIMEOUT 60)
@@ -5697,7 +5739,7 @@ foreach(_case ${_new_diag_cases})
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/${_case}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_${_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/diag_${_case}${_exe_ext}
       "-DEXPECT_REGEX=${_diag_regex}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
   set_tests_properties(diag_${_case} PROPERTIES TIMEOUT 60)
@@ -5741,7 +5783,7 @@ foreach(_runtime_case IN ITEMS
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/runtime/${_runtime_case}.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/runtime_${_runtime_case}${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/runtime_${_runtime_case}${_exe_ext}
       "-DEXPECT_REGEX=${_runtime_regex}"
       -P ${CMAKE_SOURCE_DIR}/tests/run_runtime_error.cmake)
   set_tests_properties(runtime_${_runtime_case} PROPERTIES TIMEOUT 60)
@@ -5757,7 +5799,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests/runtime/strict_div_zero.zan")
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
       -DSRC=${CMAKE_SOURCE_DIR}/tests/runtime/strict_div_zero.zan
-      -DOUT_EXE=${CMAKE_BINARY_DIR}/runtime_strict_div_zero${_exe_ext}
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/runtime_strict_div_zero${_exe_ext}
       "-DEXPECT_REGEX=division by zero"
       -DSTRICT=1
       -P ${CMAKE_SOURCE_DIR}/tests/run_runtime_error.cmake)
@@ -5864,7 +5906,7 @@ if(WIN32)
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/main_args.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/main_args.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_publish_main_args${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_publish_main_args${_exe_ext}
     -P ${CMAKE_SOURCE_DIR}/tests/run_publish_main_args.cmake)
   set_tests_properties(conformance_publish_main_args PROPERTIES TIMEOUT 120
     LABELS "smoke;standard;full")
@@ -5881,7 +5923,7 @@ add_test(NAME conformance_arc_net_publish COMMAND ${CMAKE_COMMAND}
   -DZANC=$<TARGET_FILE:zanc>
   -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/arc_net_publish.zan
   -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/arc_net_publish.out
-  -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_arc_net_publish${_exe_ext}
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_arc_net_publish${_exe_ext}
   -P ${CMAKE_SOURCE_DIR}/tests/run_arcnet.cmake)
 set_tests_properties(conformance_arc_net_publish PROPERTIES TIMEOUT 120)
 
@@ -5895,7 +5937,7 @@ add_test(NAME conformance_embed_compress COMMAND ${CMAKE_COMMAND}
   -DZANC=$<TARGET_FILE:zanc>
   -DSRC=${CMAKE_SOURCE_DIR}/tests/conformance/embed_compress.zan
   -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/embed_compress.out
-  -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_embed_compress${_exe_ext}
+  -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/conf_embed_compress${_exe_ext}
   -DWORKDIR=${CMAKE_BINARY_DIR}
   -P ${CMAKE_SOURCE_DIR}/tests/run_embed_compress.cmake)
 set_tests_properties(conformance_embed_compress PROPERTIES TIMEOUT 180)
@@ -6043,7 +6085,7 @@ add_test(NAME tool_genindex
     -DZANC=$<TARGET_FILE:zanc>
     -DSRC=${CMAKE_SOURCE_DIR}/tests/index/genindex_case.zan
     -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/index/genindex.out
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/tool_genindex${_exe_ext}
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/cases/tool_genindex${_exe_ext}
     -DSTDLIB_STAMP=${_stdlib_stamp}
     "-DRUN_ARGS=${CMAKE_SOURCE_DIR}/tests/index/keys.meta.json;${CMAKE_BINARY_DIR}/genindex_out"
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)

@@ -267,6 +267,27 @@ positive, stated in the commit message.
     模板自带的构建/测试脚本常常从没跑通过（wuwei 的 `build.ps1` 只枚举
     `src/*.zan` 顶层，漏掉 `src/Model/` 下的源码，`test.ps1` 又漏带设计稿
     导致 `Menu` 解析错位），搬迁正好逼它们面对——先修根因再搬。
+16. **测试产物必须收口，不许散着堆。** 每个 conformance / leak / arc 用例都
+    把自己的可执行文件编到 `build\` 下——历史上全编在 `build\` 根目录，几百轮
+    测试之后根目录堆了 **1884 个一次性 exe / 6 GB**，真产物只剩 4 个，
+    `ctest` 每跑一次还留一个 `LastTest.log.tmpXXXXXX`。规矩：
+    - **用例产物只有一个去处**：`build\cases\`（`CMakeLists.txt` 里所有
+      `OUT_EXE=${CMAKE_BINARY_DIR}/...` 都指向那里）。`build\` 根只留真产物
+      与工具链。新增用例时不要另开目录，也不要写回根目录。
+    - **它是缓存，不是垃圾**：`run_case.cmake` 靠"源文件/编译器/stdlib stamp
+      没变就复用旧 exe"加速。全删等于每轮重编一千多个程序，所以按
+      **最近使用 + 体积上限** 清扫，别一把删光——`scripts\clean_build.ps1`
+      干这件事（`-KeepDays` / `-MaxCacheMB`）。
+    - **日志合并成一份**：`ctest` 的完整输出归档到
+      `build\test-out\<tier>-<时间>.log`，只留最近 5 份；不要每个用例一个
+      输出文件散在 `build\` 里。
+    - 清扫在 `scripts\test.ps1` 跑完 ctest 后自动执行；手动扫用
+      `scripts\clean_build.ps1`（默认 dry-run，`-Apply` 才删）。
+    - 坑出处：`build\` 根的用例 exe **不是 cmake 编译产物**（没有同名
+      `.dir` 中间态，是 `tests/run_case.cmake` 每次现场编译的），所以删掉
+      安全、下次会重新生成——但 `build\` 根同时躺着 `ld.lld.exe`、
+      `repomap.exe`、`zan-mcp.exe` 等真工具链，**按名字猜着删会踩到它们**，
+      所以保留清单写死在 `clean_build.ps1` 里，不按通配符删。
 
 ## Build / dev quickstart
 

@@ -132,6 +132,40 @@ description: zanc 编译器内部（parser/checker/irgen/runtime/ABI）设计契
      接收者（看实现关系）、其余按 kind + 符号相等；扩展方法的登记时机放在绑定阶段
      （那时方法自己的类型参还在作用域内，首参 `this` 的类型能解析成正确形状），
      登记口径与发码口径逐字对齐（只看首参是不是 `this`，不额外要求 static）。
+11. **类型的"显示名"与"身份名"必须分开**：
+   - 动作：诊断里显示的类型名必须由**一个渲染器**按类型形状现算（可空 `T?`、
+     数组 `T[]`、泛型 `List<T>`）；`zan_type_t.name` 只当身份用（散列、mangle、
+     类型相等判定），**一个字都不许改**。所有诊断共用这一份渲染器
+     （`src/compiler/binder.c` 的 `zan_type_display`）。
+   - 理由：`zan_type_t.name` 对可空类型存的是**元素类型**的名字（`bool?` 的 name
+     就是 `bool`），`?` 没有任何字段承载 → 所有诊断把 `bool?` 说成 `bool`，用户
+     看不出自己写的是可空类型。同一个字段被"身份"和"显示"两种语义共用，是这类
+     失真的通用根因——发现一个字段被两种语义共用，就该拆开，而不是给它打补丁。
+   - 边界：渲染只影响面向用户的显示：tuple 身份（`tuple_sig_type`）、typeof 反射
+     元数据（`render_type_full`）、调试符号（`di_type_name`）、运行时反射字段名
+     （`refl_field_type_name`）、"这是哪个类型"的原始名轴（`checker_type_simple_name`）
+     都不许被形状污染。共享渲染入口的结果要用**线程局部轮转池**承载（语言服务有
+     诊断线程与工作线程两线程），不能让多个诊断的临时缓冲互相踩。
+12. **改公共诊断措辞要改共用入口，不要逐个诊断点手改；宿主与自举必须同一提交改**：
+   - 动作：一个措辞被几十个诊断点共用时（`src/compiler/checker.c` 的 `type_name()`
+     有 45 个调用点），改措辞要**换掉共用入口的实现**（签名不变 → 调用点零改动）；
+     同时**宿主与自举（`src/selfhost/`）必须同一提交改**。
+   - 理由：逐个手改必然漏——漏一处，宿主与自举就分叉，对拍门的三字段用例（宿主与
+     自举必须同措辞）会红，而分叉的措辞让用户看到"两个编译器说法不一样"。实测 45 个
+     调用点共用一个 `type_name()`，改它的实现比改 45 处措辞更省也更安全。
+   - 边界：新增措辞要配一条 `tests/diag/` 用例钉住；自举侧对应措辞在
+     `tests/selfhost/reject_cases.txt` 里钉住（两字段钉自举侧，三字段再钉宿主侧）。
+13. **隔离构建目录必须让 `--auto-stdlib` 找得到 stdlib**：
+   - 动作：Windows 下 `--auto-stdlib` 只找 `zanc.exe` 同级的 `stdlib/`，或 exe 目录
+     **上一级**的 `stdlib/`（`src/compiler/main.c`）。用隔离 build 目录
+     （`_scratch/build-*`）做定向验证时，build 目录要**在源码根下一层**
+     （`repo/build` → 命中 `repo/stdlib`）；放到更深处（`repo/_scratch/build-x`）就
+     自己补一个指向源码根 `stdlib/` 的目录联接（junction）。
+   - 理由：找不到 stdlib 时 `--auto-stdlib` 只打一条 warning，但**凡是用到 `using`
+     的用例全部改写**：报出来是"undefined type 'FuncT'"这类完全不相干的错误，整批
+     测试集体变红，看起来像改坏了编译器，其实是没 stdlib。
+   - 边界：先看输出里有没有 `no stdlib directory found next to the compiler`；有就
+     先补 stdlib，再看别的失败。
 ---
 
 ## 二、LLVM 代码生成与指令下沉（IRGen）

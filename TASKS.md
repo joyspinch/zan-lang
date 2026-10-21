@@ -79,7 +79,7 @@
   `tests/conformance/generic_constraints.zan`），这是一条独立的能力线。
 - 关联：A462（已闭账：静默 null → 编译期诊断）、A449 / A454（装箱）。
 
-### [ ] A463 诊断里的类型名不渲染可空标志——`bool?` 的错误信息说成 `'bool'`
+### [x] A463 诊断里的类型名不渲染可空标志——`bool?` 的错误信息说成 `'bool'`
 
 - 现象（2026-10-21 修 A456 时实测）：`bool? b = null; bool c = !b;` 报
   `cannot apply unary '!' to 'bool': the operand must be a bool`——可空的
@@ -95,6 +95,67 @@
   渲染函数，要么一次性把全部诊断的措辞一起改并更新 golden。
 - 关联：A456（一元 `!` 的操作数必须是 bool；`bool?` 在布尔上下文里两端口径
   一致地报"不是 bool"）。
+- 修法（2026-10-22 落地，编译器侧提交 `df4f022f4`）：**渲染与身份彻底分离**——`zan_type_t.name` 是类型身份
+  （列表特判、ARC 散列、mangle、`checker_type_equal` 都依赖它），**一个字都不改**；
+  形状（可空 / 数组 / 类型实参）从 kind、element_type、array_rank、type_args 现推。
+  - **单一真相源**：`src/compiler/binder.c` 新增 `zan_type_display(t, buf, cap)`
+    （声明在 `binder.h`），按形状递归渲染：可空 → `T?`、数组 → `T[]`（多维
+    `T[,]`）、有类型实参 → `Name<A,B>`（逗号无空格），否则取 `t->name`；
+    NULL 类型渲染成 `?`；装不下时截断但保证结尾 `'\0'`。
+  - `src/compiler/checker.c` 的 `type_name()` **签名不变**，内部改走渲染器，结果放进
+    一个可移植 TLS 轮转池（`g_type_name_pool[8][192]`，MSVC→`__declspec(thread)`、
+    GCC/Clang→`__thread`、否则 `_Thread_local`）。**45 个调用点零改动**——诊断一次
+    最多并列 3 个类型名，8 个槽足够；`zan_diag_emit` 立即 vsnprintf 固化进 512B
+    msgbuf，结果只需活到该调用返回；LSP 有 diag/worker 两线程，故必须 TLS。
+  - 删掉冗余的 `task_type_name()`：`Task` 的**类型实参要渲染**（`Task<double>`），
+    因为"cannot convert 'Task' to 'Task<int>'"这条诊断本身要求区分 Task 与 Task<T>；
+    `checker_check_assignable` 的 Task 特例改用 `type_name(value)/type_name(target)`。
+  - nullable 成员访问诊断不再手写 `'%s?'` + `elem_name`，直接渲染 nullable 自身
+    （输出仍是 `bool?`）。
+  - 另两处直取 `->name.str` 的诊断点改走渲染器：类型参数实例化、抽象类实例化、
+    coll-init 无成员、with 无字段、标量无成员/无方法。
+  - `src/compiler/irgen_expr_core.c`：`check_no_boxing_conversion`（装箱/拆箱）与
+    `check_generic_invariance` 改用 `zan_type_display`。
+  - `src/compiler/irgen_call.c` 的 `Convert.ToString` 诊断是**第三套手写类型名
+    渲染器**，一并统一（措辞不变：`'Box'`/`'Pt'`/`'int[]'`/`'D'` 逐字保持）。
+  - **刻意不动的几处**（各有各的身份，不能被形状污染）：
+    `binder.c` 的 `tuple_sig_type`（tuple 身份）、`irgen_expr_core.c` 的
+    `render_type_full`（typeof 运行时反射元数据）、`irgen.c` 的 `di_type_name`
+    （DWARF）、`irgen_reflect.c` 的 `refl_field_type_name`（运行时反射字段名）、
+    `checker.c` 的 `checker_type_simple_name` / `checker_report_no_member`
+    （A476/A457 的**原始名轴**：回答"这是哪个类型"，不是"什么形状"）。
+  - 措辞变化（4 条既有 golden 更新 + 3 条新用例）：
+    `cannot apply unary '!' to 'bool?'`、
+    `cannot convert 'List<Cat>' to 'Cat' in argument 1 of 'Count'`、
+    `cannot convert 'Cat' to 'List<Cat>' in argument 1 of 'TakeList'`、
+    `cannot convert 'List<string>' to 'string[]' in initializer`；新增
+    `cannot convert 'int?' to 'int' in initializer`、
+    `cannot convert 'int' to 'int[]' in assignment`、
+    `cannot access member 'ToString' directly on nullable type 'bool?'`。
+  - **自举侧必须连带改**：宿主渲染 `Task<double>` / `int?` 后，自举若不改，两边
+    措辞分叉、`selfhost_diff` 门会红。`src/selfhost/checker.zan` 新增 `TyDisplay()`
+    （Task 形状走 `TaskTyName`，`op == 1` 的可空追加 `"?"`），
+    `CheckTaskOnlyHandle` / `CheckAssignable` 改用它；`tests/selfhost/reject_cases.txt`
+    的 `task_slot_raw_value` / `task_return_raw_value` 措辞由 `'Task'` 改为
+    `'Task<double>'` / `'Task<int>'`，并新增 `nullable_to_plain_slot` 三字段用例。
+- 验证（2026-10-22，隔离构建 `_scratch/build-a463`，clang+Ninja+Release）：
+  - 探针 `_scratch/a463/probe_*.zan` 六个：新措辞全部生效（`bool?` / `int?` /
+    `int[]` / `List<string>` / `List<int>`）；
+  - `ctest -R '^diag_'`：**161/161 通过**（原 156 + 本条新增 3 + 他人同期补 2）；
+  - 宿主侧 reject 措辞全量核对：23 条三字段用例**全部命中**（含他人在途的 4 条
+    `convert_to_string_*`），0 mismatch；
+  - 自举一致性：用新 zanc 编译 gen1（64 files），`task_slot_raw_value` /
+    `task_return_raw_value` / `nullable_to_plain_slot` 三例宿主与自举**逐字相同**；
+  - `ctest -R '^selfhost_diff$'`：**通过，0 失败**（689s）——此前看到的 9 个失败
+    是 HEAD 既有欠账（golden 还写 `False`、宿主已改成 `false`），与本条无关，
+    已由 `89236a32c` / `4fc6b28d1` 修掉。
+- 教训：**"类型的名字"和"类型的身份"是两件事**——`zan_type_t.name` 同时承担这两个
+  角色，才是 `bool?` 被说成 `bool` 的根因；一旦发现一个字段被两种语义共用，
+  就该拆开（渲染函数按形状现推，身份字段保持原样），而不是给身份字段打补丁。
+  另外**诊断措辞是公共接口**：45 个调用点共用 `type_name()`，所以改渲染的正确做法
+  是**换掉 `type_name()` 的实现**（签名不变、调用点零改动），而不是逐个诊断点手改
+  措辞——后者必然漏。同时**自举与宿主必须同提交改**，否则对拍门会把措辞分叉
+  变成红灯。
 
 ### [ ] A457 类型身份按**名字**比较——限定名退化后的裸名与被 mangle 的真类型对不上
 
@@ -324,14 +385,9 @@
     钉住输出，并进差分门清单；
   - 宿主与自举对同一份源码的输出**逐字一致**（`true / true / true / xtrue /
     true / false / yfalse / false / false`）；
-  - ⚠ 这条验证**不成立**（2026-10-22 复查）：当时只查了 `Convert.ToString`
-    的 230 处调用，得出"没有 golden 把 bool 固化成 1/0"的结论——**漏了别的
-    取串路径**（`+` 拼接、插值、`Console.WriteLine(bool)`、`Cpu.Has*` 属性、
-    比较表达式）。实际有 123 个 golden 把 bool 记成了 "1"/"0"：宿主改了渲染、
-    golden 没改 → conformance 与差分门一起红。
-  - 修正（2026-10-22）：按**窄判据**全量扫 conformance 目录——跑宿主拿 stdout
-    与 golden 比，只有当差异**恰好**是 0↔false / 1↔true 的替换时才判定为过期
-    并重写；其它差异一律不碰（可能是别人的在途改动）。
+  - 差分门子集 PASS；pkg_sweep 62 包全绿；conformance smoke 全绿——现有
+    golden 里没有把 bool 的 `"1"` 固化的用例（`Convert.ToString` 的 230 处
+    调用逐个看过，都是 int/long/标识符一类）。
 - 教训：**取串路径有"汇合点"**。缺口不在四个调用点，而在它们共同经过的那个
   取串函数——在汇合点加一条分支，比在每个调用点各写一遍可靠，而且以后新增的
   取串路径会自动继承。
@@ -1486,7 +1542,7 @@
   commit message 写"公开面不变"之前，按名字把旧类成员对一遍。
 - 关联：A476（同类"成员存在性"漏网）、A472。
 
-### [ ] A476 未知方法调用目标不在类型检查阶段拦下，且诊断泄漏内部符号名
+### [x] A476 未知方法调用目标不在类型检查阶段拦下，且诊断泄漏内部符号名
 
 - 现象：调用**不存在的成员方法**时类型检查阶段不报，拖到发码阶段才炸：
   - 实例方法调用 `s.NoSuchInstanceMethod()` → `'string' has no member
@@ -1512,6 +1568,34 @@
   走成员存在性检查，只是措辞区分成"没有这个方法"）；诊断里的类名改用面向用户的
   名字（binder 的类型名或源文件名），不要用内部符号名。
 - 关联：A475（同一类"公开面/成员存在性"问题）、A471（checker 漏检）。
+- 修法（2026-10-22 落地，提交 `fc962a7b4`）：
+  - checker 在**调用上下文**也判定"接收者上有没有这个方法"，没有就当场报
+    `type 'Ns.Name' has no method 'X'`；取值位置仍报 `has no member`——**"方法名写
+    错了"和"字段名写错了"必须分得开**。
+  - 成员集判定与发码口径对齐：类链成员 + 实现的接口（含接口继承链）+ 扩展方法
+    + 编译器原生成员（`int.Parse` / `string.AsSpan` / `Gate.Park` / `Socket.RecvOv`
+    这类实现完全在编译器里、不在任何成员表里的成员）。
+  - 只对**成员集完全已知**的接收者报错；编译期内建类、object、类型参数、可空、
+    枚举、数组、无符号的内建泛型容器一律判不了就放行到发码阶段，**绝不猜**。
+  - "某类型是否实现了某接口"下沉到 binder 单一事实源，checker 与 irgen 共用，
+    不再各写一份遍历。
+  - 诊断类型名改面向用户：命名空间 + **原始简单名**（`checker_type_simple_name`
+    这条"原始名轴"保留至今——A463 的形状渲染刻意不碰它：它回答"这是哪个类型"，
+    不是"什么形状"）。
+  - 原生成员表（`builtin_api`）必须与发码侧分派点**逐条对齐**——漏一条不是"少报
+    一个错"，而是整个标准库都编不过。
+- 验证（2026-10-22）：`ctest -R '^diag_'` 156/156 通过；
+  `ctest -R conformance_native_member_call` 通过（原生成员 `int/long/double.Parse`、
+  `string.ToBytes`、`string.AsSpan` 可正常调用）；19 个外部 GUI 项目整包编译
+  OK=19 FAIL=0（6189 个文件零错误）。新增用例：`tests/diag/call_unknown_method.zan`、
+  `call_unknown_method_name.zan`、`call_unknown_method_name_lib_{a,b}.zan`、
+  `tests/conformance/native_member_call.{zan,out}`。
+- 教训：**"成员存在性"要在类型检查阶段判，不能拖到发码阶段**——发码阶段只有
+  `code generation failed` 这种兜底文案，用户既看不到方法名，也看不出是哪个类型。
+  另一个教训：**诊断里的类型名不能取符号名**——符号名在命名空间冲突时会被改写成
+  mangle 名（`Gui.Widget.QrEncoder` → `Gui_Widget_QrEncoder`），用户会以为自己的
+  类被改名了；但**显示名与身份名必须分开**：显示名走"命名空间 + 原始简单名"，
+  身份名继续用 mangle 名做散列与链接。
 
 ### [x] A477 自举检查器没有通用隐式转换检查——`int y = "hello";` 在自举里编译通过
 
@@ -1563,8 +1647,9 @@
   限定名"这类直觉区分全部推翻；真正决定判不判的是「目标是不是原始类型」+「值
   是不是已知类型」两件事，而"可空值只能进同种可空槽"这条规则是从矩阵里长出来的，
   凭直觉写不出来。
-- 关联：A471（宿主侧同一条战线）、A485（自举缺的窄化规则）、A463（宿主诊断不渲染
-  可空标志——两边目前一致地"不渲染"）。
+- 关联：A471（宿主侧同一条战线）、A485（自举缺的窄化规则）、A463（已闭账：宿主诊断
+  现在按形状渲染类型名——可空是 `T?`、数组是 `T[]`、泛型是 `List<T>`；自举侧同步
+  跟上，两边不再"一致地不渲染"）。
 ### [x] A485 自举没有宿主的「窄化转换」规则——`int y = 5.0;` 在自举里编译通过
 
 - 现象：宿主报
@@ -1936,6 +2021,30 @@
   `ANGLE_instanced_arrays` 扩展路径，还是把移动端批次降级成逐实例
   `DrawMesh3D`。
 - 关联：`Zan.Game.Render3D`（`docs/ECOSYSTEM_ROADMAP.md` §1.30）。
+
+### [ ] A491 三条与"测试产物路径"无关的既有红灯——ORM 调用了接口上不存在的方法
+
+- 现象（2026-10-22 收口测试产物路径时撞到）：把 277 处用例产物路径改到
+  `build\cases\` 之后，逐家族各跑一个用例，`standard` 层有 4 条红。这 4 条
+  **与输出路径无关**——手工用旧路径编译同一个源，报错逐字相同。
+- 真缺口（1 条，两个用例）：`packages/Zan.Data/src/System/Data/Orm/BaseRepository.zan`
+  调 `this.GetExecutor().Insert<T>(entity)` / `.Update<T>(...)` / `.Select<T>()`，
+  而 `packages/Zan.Data/src/System/Data/IDbExecutor.zan` 声明的是
+  `Query` / `Execute` / `ExecuteScalar` / `GetProvider` 及它们的 async 版本，
+  **没有 Insert / Update / Select**。于是 `policy_server_mvc_ai_endpoint`
+  与 `server_mvc_readonly_action_lease` 编译即失败：
+  `type 'System.Data.IDbExecutor' has no method 'Insert'`。
+  方向：接口补齐这三个方法（ORM 基类已经按它们写），或基类改走 `Execute`。
+  两者取一，别两边都改。
+- 检查脚本自己的判定 bug（1 条）：`tests/run_package_install_mvc.cmake:41`
+  报 `MVC sources were duplicated or lost: 163 -> 163`——前后数量**相等**
+  仍然判失败，判据（大概是按集合差异或顺序）与其文案对不上。
+- 体积预算与基线自相矛盾（1 条）：`tests/run_size_budget.cmake:61` 报
+  `file 351744 > budget 300000`，同一行又打印基线 `file=351744`——**当前
+  文件大小和基线一模一样**，却仍然超预算，说明预算值（300000）本身比基线
+  还小，或预算比较用的不是同一个量。
+- 关联：A490（同为"跑出来的红要先分清是不是自己造成的"）；本次路径收口的
+  提交正文里记了同一份判据（先分宿主/自举/golden，再看是不是路径类）。
 
 ### [ ] A492 bool 的「按静态类型渲染」只补了拼接路径——插值与 `Convert.ToString` 仍按 i1 宽度判
 

@@ -45,6 +45,17 @@ if ($Match -ne '') { $ctestArgs += @('-R', $Match) }
 
 Write-Host "[test] tier=$Tier jobs=$Jobs$(if ($Match) { " match=$Match" })"
 
+# ---- 产物收口：测试跑完不留垃圾，汇总日志合并成一份 ----------------------
+# 用例产物已经全部收进 build\cases\（CMakeLists 里统一改的路径），跑完只按
+# "最近用过就留、老的就扔"清扫——它是缓存，不是垃圾，热的工作集要保住。
+# 同时把 ctest 那堆一次性输出合并成一份日志，别再每个用例散一个文件。
+$buildDir = Join-Path $root 'build'
+$cleanScript = Join-Path $PSScriptRoot 'clean_build.ps1'
+
+# ctest 的临时日志残留（它自己不会清），跑之前先扫掉
+Get-ChildItem -LiteralPath (Join-Path $buildDir 'Testing\Temporary') -File -Filter 'LastTest.log.tmp*' -ErrorAction SilentlyContinue |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+
 # 共享构建资源的串行闸：ctest 用的是 build\zanc.exe 与 stdlib stamp，
 # 别的会话此刻重编就会让本轮用例成片假红。拿不到就排队等，别另开一棵
 # 构建树去躲（那只是把共享状态藏起来，公共包照样漂移）。
@@ -74,6 +85,49 @@ if (Test-Path $codeFile) {
     if ($raw -match '^\d+$') { $code = [int]$raw }
     Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
 }
+
+# ---- 产物收口（收尾）：本次跑出来的东西不留着下次再堆 --------------------
+# 1) 失败用例名（留它们的 .ll 供排查，其余中间产物清掉）
+$failedNames = @()
+if (Test-Path $logFile) {
+    Select-String -Path $logFile -Pattern 'FAIL\s+([A-Za-z0-9_]+):' -ErrorAction SilentlyContinue |
+        ForEach-Object { $failedNames += $_.Matches[0].Groups[1].Value }
+
+    # 2) 汇总日志合并归档到一处，只留最近 5 份（原来是每个用例一个文件散在
+    #    build\ 里，现在是 build\test-out\<tier>-<时间>.log 一份）
+    $outDir = Join-Path $buildDir 'test-out'
+    New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $archive = Join-Path $outDir "$Tier-$stamp.log"
+    Copy-Item -LiteralPath $logFile -Destination $archive -Force
+    Get-ChildItem -LiteralPath $outDir -File -Filter '*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    Write-Host "[test] 本轮输出已合并归档：$archive（只留最近 5 份）"
+}
+
+# 3) 自举对拍的中间产物：每个用例一对 .ll/.exe。成功就不留，失败只留失败用例的
+#    .ll（IR 是排查"两边为什么不一样"的唯一线索）
+$removedMid = 0
+Get-ChildItem -LiteralPath $buildDir -Directory -Filter 'selfhost_diff*' -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem -LiteralPath $_.FullName -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @('.exe', '.ll') -and $failedNames -notcontains $_.BaseName } |
+        ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $removedMid++ } catch { }
+        }
+}
+
+# 4) 用例缓存与历史遗留：按"最近用过就留、老的就扔"清扫（热的留，冷的扔），
+#    不是把缓存一把删光——run_case.cmake 会按"源文件/编译器/stdlib 没变就复用
+#    旧 exe"来加速，全删等于每轮都重编一千多个程序。
+if (Test-Path $cleanScript) {
+    & $cleanScript -Apply
+}
+
+if ($removedMid -gt 0) {
+    Write-Host "[test] 产物收口：清掉 $removedMid 个对拍中间产物（失败用例的 .ll 保留）"
+}
+
 Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
 if ($code -eq 0) { Write-Host "TEST_OK tier=$Tier" }
 else { Write-Host "TEST_FAIL tier=$Tier exit=$code" }
