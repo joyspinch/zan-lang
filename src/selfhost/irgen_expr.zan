@@ -1646,7 +1646,13 @@ partial class Irgen {
                         string t = NT();
                         L("  " + t + " = sitofp i64 " + v.op + " to " + ity);
                         sv = t;
-                    } else if (ity == "float" && v.ty.sval == "double") {
+                    } else if (ity == "float") {
+                        // the value is a `double` in this model (float and
+                        // double travel as LLVM double), but the span's
+                        // element is a real 32-bit float -- narrow it. The
+                        // value's own type can be `float` as well (a float[]
+                        // element), so the check is on "is a floating value",
+                        // not on the name being exactly "double".
                         string t = NT();
                         L("  " + t + " = fptrunc double " + v.op + " to float");
                         sv = t;
@@ -6467,6 +6473,22 @@ partial class Irgen {
         return new ExprVal(r, MkType("string"));
     }
 
+    // A string argument that the program may spell as a char: the C host
+    // accepts a char wherever it accepts a string (is_string_like_expr in
+    // src/compiler/irgen_call.c) and turns it into the one-character text.
+    // The self-host's string runtime works on managed strings, so the char
+    // is packed the same way -- and the temporary is released with the
+    // statement.
+    ExprVal StrArg(Node e) {
+        ExprVal a = GenExpr(e);
+        if (a.ty != null && a.ty.sval == "char" && a.ty.ival == 0) {
+            string s = CharToStr(a.op);
+            AddTemp(s, MkType("string"));
+            return new ExprVal(s, MkType("string"));
+        }
+        return a;
+    }
+
     ExprVal EmitStrMethod(ExprVal recv, string name, Node e) {
         if (name == "Substring") {
             ExprVal start = GenExpr(e.kids[0]);
@@ -6485,7 +6507,7 @@ partial class Irgen {
         if (name == "Equals" && e.kids.Count == 1) {
             // the C host compares the *exact* lengths and bytes
             // (irgen_call.c -> __zan_str_ocmp), not the C-visible prefix
-            ExprVal o = GenExpr(e.kids[0]);
+            ExprVal o = StrArg(e.kids[0]);
             if (recv.op == "null" || o.op == "null") {
                 // a null operand is never equal to a non-null one
                 string c = NT();
@@ -6514,7 +6536,7 @@ partial class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         if (name == "Contains" && e.kids.Count == 1) {
-            ExprVal sub = GenExpr(e.kids[0]);
+            ExprVal sub = StrArg(e.kids[0]);
             DeclStrstr();
             string hit = NT(); L("  " + hit + " = call i8* @strstr(i8* " + recv.op + ", i8* " + sub.op + ")");
             string r = NT(); L("  " + r + " = icmp ne i8* " + hit + ", null");
@@ -6522,7 +6544,7 @@ partial class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         if (name == "IndexOf" && (e.kids.Count == 1 || e.kids.Count == 2)) {
-            ExprVal sub = GenExpr(e.kids[0]);
+            ExprVal sub = StrArg(e.kids[0]);
             string start = "0";
             if (e.kids.Count == 2) {
                 ExprVal s = GenExpr(e.kids[1]);
@@ -6544,13 +6566,13 @@ partial class Irgen {
             return new ExprVal(r, MkType("int"));
         }
         if (name == "LastIndexOf" && e.kids.Count == 1) {
-            ExprVal sub = GenExpr(e.kids[0]);
+            ExprVal sub = StrArg(e.kids[0]);
             usesStrOps = true;
             string r = NT(); L("  " + r + " = call i64 @zstr_lastidx(i8* " + recv.op + ", i8* " + sub.op + ")");
             return new ExprVal(r, MkType("int"));
         }
         if ((name == "StartsWith" || name == "EndsWith") && e.kids.Count == 1) {
-            ExprVal p = GenExpr(e.kids[0]);
+            ExprVal p = StrArg(e.kids[0]);
             DeclStrncmp();
             string lp = StrCLen(p.op);
             string z = NT();
@@ -6572,8 +6594,8 @@ partial class Irgen {
             return new ExprVal(z, MkType("bool"));
         }
         if (name == "Replace" && e.kids.Count == 2) {
-            ExprVal from = GenExpr(e.kids[0]);
-            ExprVal to = GenExpr(e.kids[1]);
+            ExprVal from = StrArg(e.kids[0]);
+            ExprVal to = StrArg(e.kids[1]);
             usesStrOps = true;
             string r = NT(); L("  " + r + " = call i8* @zstr_replace(i8* " + recv.op + ", i8* " + from.op + ", i8* " + to.op + ")");
             return new ExprVal(r, MkType("string"));
@@ -6590,7 +6612,7 @@ partial class Irgen {
             return new ExprVal(r, MkType("string"));
         }
         if (name == "Split" && e.kids.Count == 1) {
-            ExprVal sep = GenExpr(e.kids[0]);
+            ExprVal sep = StrArg(e.kids[0]);
             usesStrOps = true;
             string r = NT(); L("  " + r + " = call i8* @zstr_split(i8* " + recv.op + ", i8* " + sep.op + ")");
             Node lt = MkType("List");

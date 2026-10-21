@@ -2143,3 +2143,27 @@ kernel32、shell32、user32、advapi32、version）。
   逐字相同"，不是"两边都正确"。遇到宿主明显不合常理的行为（空 triple →
   恒 0），先确认它确实是当前宿主的行为，再照抄，并在注释和 skill 里
   写明"这是宿主的保守回退"，免得后人当成自举的缺陷去"修"。
+## 115. 字符串实参可以是 char；span 的 float 要显式窄化
+
+- 坑（实测）：`s.Split(',')` 在自举里发出
+  `call i8* @zstr_split(i8* %s, i8* 10)`——clang 直接报
+  "integer constant must have integer type"。根因：宿主把"能当字符串用的
+  实参"抽象成 `is_string_like_expr`（`src/compiler/irgen_call.c:536`：
+  是字符串**或** char），char 先被 `emit_char_to_cstr` 变成一个字符的
+  文本；自举只认字符串，把 char 的整数值直接塞进了 `i8*` 形参。
+  同样要照顾 char 的还有 Contains / IndexOf / LastIndexOf / Equals /
+  StartsWith / EndsWith / Replace（Replace 的两个实参都算）。
+- 做法：自举加 `StrArg(e)`——实参类型是 char 时用 `CharToStr` 打包成
+  一个字符的托管字符串（作为语句临时值在语句末尾释放），其余原样。
+- 顺带修的第二个坑：**span 的元素宽度和值的宽度不是一回事**。span 的
+  float 元素在 IR 里是真的 32 位 `float`，而自举的 float 值一律是
+  64 位 `double`（`MapType` 把 float 映成 double），所以往 `Span<float>`
+  里写必须先 `fptrunc`。原来的判断写的是 `v.ty.sval == "double"`，可值
+  本身也可能是 `float`（比如从 `float[]` 里读出来的元素），于是漏掉了
+  窄化，clang 报 "'%t33' defined with type 'double' but expected 'float'"。
+  判据要改成"这个值是不是浮点值"（`IsDbl`），不是"类型名恰好是 double"。
+- 通用教训：**同一个类型名，在"值"和"存储"两层宽度可能不同**。自举的
+  模型是"float 即 double"，凡是遇到真实的 32 位存储（span 元素、原生
+  内存、FFI 结构体），写入前必须显式窄化；而且判断依据要用"类别"
+  （浮点/整数），不要用"类型名相等"——值的声明类型可能是 float 而它的
+  LLVM 形状是 double。
