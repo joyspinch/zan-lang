@@ -4224,9 +4224,13 @@ partial class Irgen {
 
     // A lambda lowers to a hoisted top-level function @__lambda_N(i8* env, ...)
     // plus a heap closure { i8* fn, i8* env } capturing free locals by value.
-    // static method group as a delegate value: emit a thunk with the lambda
-    // ABI (i8* env first) that forwards to the static method, and wrap it in
-    // a {fn, env=null} closure.
+    // static method group as a delegate value: the C host hands the STATIC
+    // method's own function pointer to the delegate value (irgen_expr.c: a
+    // static method reference used as a delegate IS the function -- there is
+    // no closure record). That is what makes a Zan delegate usable as a
+    // NATIVE callback: the C side calls the pointer with the C signature.
+    // A closure would shift the arguments (the self-host's closure ABI puts
+    // the env first), so the callback would see the wrong parameters.
     ExprVal EmitMethodGroup(string clsName, Node cls, Node m) {
         string owner = MethodOwner(cls, m.sval);
         if (owner == "") { owner = clsName; }
@@ -4240,38 +4244,17 @@ partial class Irgen {
         }
         Node retTy = m.type; if (retTy == null) { retTy = MkType("void"); }
         string rt = MapType(retTy);
-        string fname = "@__mg_" + target;
-        string gname = "@__mg_clo_" + target;
-        // one shared closure per target so delegate equality (e.g. `-=`
-        // removal) sees the same value for repeated method-group mentions
-        if (IndexOfStr(mgTargets, target) >= 0) {
-            return new ExprVal(MgClosureValue(gname), DelegTypeOf(retTy, pt));
-        }
-        mgTargets.Add(target);
-        string sig = "define " + rt + " " + fname + "(i8* %env";
+        string fnty = rt + " (";
         int a = 0;
-        while (a < pt.Count) { sig = sig + ", " + MapType(pt[a]) + " %p" + a; a = a + 1; }
-        sig = sig + ") {";
-        deferred.Append(sig); deferred.Append("\n");
-        deferred.Append("entry:\n");
-        string args = "";
-        a = 0;
         while (a < pt.Count) {
-            if (a > 0) { args = args + ", "; }
-            args = args + MapType(pt[a]) + " %p" + a;
+            if (a > 0) { fnty = fnty + ", "; }
+            fnty = fnty + MapType(pt[a]);
             a = a + 1;
         }
-        if (rt == "void") {
-            deferred.Append("  call void @" + target + "(" + args + ")\n");
-            deferred.Append("  ret void\n");
-        } else {
-            deferred.Append("  %r = call " + rt + " @" + target + "(" + args + ")\n");
-            deferred.Append("  ret " + rt + " %r\n");
-        }
-        deferred.Append("}\n");
-        deferred.Append(gname + " = global [2 x i8*] [i8* bitcast ("
-            + LamFnType(retTy, pt) + " " + fname + " to i8*), i8* null]\n");
-        return new ExprVal(MgClosureValue(gname), DelegTypeOf(retTy, pt));
+        fnty = fnty + ")";
+        string fp = NT();
+        L("  " + fp + " = bitcast " + fnty + "* @" + target + " to i8*");
+        return new ExprVal(fp, DelegTypeOf(retTy, pt));
     }
 
     // An INSTANCE method group used as a delegate value (`obj.Method`): the
@@ -6063,13 +6046,12 @@ partial class Irgen {
             if (i == 0 && IsStr(av.ty)) { freeArgIsStr = true; }
             if (i > 0) { args = args + ", "; }
             if (m != null && HasMod(m, MOD.Extern()) && IsDelegate(pty)) {
-                // extern C fn-pointer parameter: pass the closure's code pointer
-                string cprec = UntagClosure(av.op);
-                string cp = NT();
-                L("  " + cp + " = bitcast i8* " + cprec + " to i8**");
-                string fp = NT();
-                L("  " + fp + " = load i8*, i8** " + cp);
-                args = args + "i8* " + fp;
+                // The C host hands the delegate VALUE to the C side (the
+                // argument is passed as the pointer it is -- irgen_call.c).
+                // For a static method group that value IS the function
+                // pointer, so the C side calls it with the C signature: that
+                // is what makes a Zan delegate usable as a native callback.
+                args = args + "i8* " + av.op;
             } else {
                 // an extern (DllImport) callee is C code: it gets the raw
                 // buffer, not a packed copy of it (see CallArg)
