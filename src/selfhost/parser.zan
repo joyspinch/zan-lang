@@ -12,6 +12,7 @@ public class Parser {
     public Diags diags;
     public int lastErrPos;
     public bool attrDll;      // last ParseAttrs saw [DllImport]
+    public bool skipNullable; // last SkipType() saw a nullable marker (`?`)
     public string attrEntry;  // DllImport EntryPoint override ("" if none)
     public bool attrVariadic; // DllImport Variadic = true named argument
     public bool attrThreadEntry; // [ThreadEntry]: safe pthread entry (saves x19-x28)
@@ -702,7 +703,9 @@ public class Parser {
     }
 
     // Scan past a type without building it (for decl lookahead).
+    // Sets skipNullable when the scanned type carries a nullable marker (`?`).
     void SkipType() {
+        skipNullable = false;
         if (At(TK.LParen())) {
             // tuple type: skip the balanced paren group
             Next();
@@ -728,12 +731,25 @@ public class Parser {
                 Next();
             }
         }
-        if (At(TK.Question())) { Next(); }
+        if (At(TK.Question())) { Next(); skipNullable = true; }
         while (At(TK.LBracket())) {
             Next();
             while (!At(TK.RBracket()) && !At(TK.Eof())) { Next(); }
             if (At(TK.RBracket())) { Next(); }
         }
+    }
+
+    // A declaration's name must be followed by `;` or `=`. A **nullable** type
+    // (`T? x`) needs that extra check: the `?` may really be a ternary
+    // operator, and then the statement is an expression (`flag ? a : b`),
+    // not a declaration. The C host draws the same line in its lookahead
+    // (see src/compiler/parser.c, looks_like_var_decl).
+    bool DeclNameFollowed() {
+        int save = pos;
+        Next();                      // the name itself
+        bool ok = At(TK.Semicolon()) || At(TK.Eq());
+        pos = save;
+        return ok;
     }
 
     bool IsDeclStart() {
@@ -754,6 +770,7 @@ public class Parser {
             int save = pos;
             SkipType();
             bool ok = (K() == TK.Ident());
+            if (ok && skipNullable) { ok = DeclNameFollowed(); }
             pos = save;
             return ok;
         }
@@ -761,6 +778,7 @@ public class Parser {
             int save = pos;
             SkipType();
             bool ok = (K() == TK.Ident());
+            if (ok && skipNullable) { ok = DeclNameFollowed(); }
             pos = save;
             return ok;
         }

@@ -1599,3 +1599,70 @@
   token 吃掉，解析才能继续往下走，否则点名诊断下面跟一串噪音，用户还是得逐条
   读。
 - 关联：A476（同类"诊断不说到点上"）、A469 / A479（解析器前瞻与分派）。
+
+### [x] A481 自举把「语句开头的三元表达式」当成声明——`flag ? a : b` 在自举里编译不过
+
+- 现象（2026-10-21 修 A479 时顺带实测，探针 `_scratch/a479_ternary_probe.zan`）：
+  同一个程序，宿主编译并运行通过（输出 `then`），自举 gen1 报三条错：
+
+  ```
+  _scratch/a479_ternary_probe.zan:13:33: error: syntax error: unexpected '.'
+  _scratch/a479_ternary_probe.zan:13:52: error: syntax error: unexpected ':'
+  _scratch/a479_ternary_probe.zan:13:9:  error: undefined type 'flag'
+  ```
+
+  简单名（`flag ? a : b`）与限定名（`Shop.Item.ok ? a : b`）两种写法都炸。
+- 根因：自举的声明前瞻 `src/selfhost/parser.zan` 的 `IsDeclStart()` 只要求
+  「类型后面跟一个标识符」，**不要求后面是 `;` 或 `=`**；而 `SkipType()` 把 `?`
+  一律当可空标记吃掉。于是 `flag ? a : b` 被拆成「类型 `flag?` + 名字 `a`」
+  → 判成声明 → 后面撞上 `:` 与 `.` 就炸。
+  宿主的同一处（`looks_like_var_decl` 的 `TK_QUESTION` 分支）要求
+  「标识符 + `;` 或 `=`」——**是自举比宿主落后一档**（两后端分叉）。
+- 影响：凡是「语句开头就是三元表达式」的代码，自举编不过、宿主能编。典型写法：
+  `ok ? DoA() : DoB();`。差分门里没有这种用例，所以门一直是绿的。
+- 修法：`SkipType()` 报告它是否吃到可空标记（新增 `skipNullable` 字段），
+  `IsDeclStart()` **只在类型带 `?`** 时追加要求「名字后面是 `;` 或 `=`」。
+  类型不带 `?` 的局部函数（`int Add(int a) {}`）走原来的宽松规则，不受影响。
+- 验证：
+  - 自举 64 个源用宿主 zanc 重建 gen1 通过（没把自举自己的源码解析坏）；
+  - 回归：gen1 对 `tests/selfhost/prog1.zan` 生成的 IR **逐字节相同**
+    （改前/改后 SHA256 都是 `9E54D3DC…`）→ 没有代码生成回归；
+  - 自举差分门子集（`stmt_braceless_bodies` / `var_call_initializer` /
+    `for_loopvar_capture` / `static_property` / `type_arity_ok` /
+    `generic_arity_check` / `lambda_value_return` / `const_narrowing` /
+    `array_init_foreach` / `switch_enum_exhaustiveness`）→ 10/10 PASS；
+  - 新增 `tests/conformance/ternary_stmt_start.zan`（简单名 + 限定名两种写法，
+    臂是非 void 的括号赋值，避开 A482）并**加进 `tests/selfhost/diff_cases.txt`**
+    → 差分门跑它：宿主与自举输出逐字相同（`n=1` / `m=3`）。
+- 教训：两个后端的**声明前瞻是同一条战线**——一个认了、另一个没认就是分叉，
+  而差分门只比"能编出来的程序"，看不出"一个能编一个不能"。前瞻规则要写清
+  「什么算声明」：名字后面必须是 `;` 或 `=`；`?` 到底是可空标记还是三元问号，
+  靠这一条区分。
+- 关联：A479（宿主侧同一条战线）、A482（自举 irgen 的 void-phi 洞）、
+  `.agents/skills/zan-compiler-internals/references/frontend-binder.md` §11。
+
+### [ ] A482 自举把「void 臂的三元表达式」降成非法 IR（`phi void`）
+
+- 现象（2026-10-21 修 A481 时被差分门照出来，用例
+  `tests/conformance/nullable_user_type.zan`）：宿主编译运行正常；自举 gen1
+  **解析通过**（A481 修好之后），但生成的 IR 过不了 clang：
+
+  ```
+  build/selfhost_diff_subset/nullable_user_type.ll:1577:15: error: void type only allowed for function results
+    1577 |   %t127 = phi void [ 0, %L1 ], [ 0, %L2 ]
+  ```
+
+- 根因：自举的 irgen 降三元表达式时**无条件**给结果建一个 phi；当两臂是
+  **void 表达式**（`flag ? Console.WriteLine("a") : Console.WriteLine("b");`）
+  时 phi 的类型成了 void → LLVM 不允许 `phi void` → IR 非法，clang 拒绝。
+  宿主没这个问题（void 结果不建 phi）。
+- 影响：自举编不出「语句开头的三元且两臂是 void 调用」的程序——而这正是最
+  常见的一种三元写法（`ok ? Log() : Log2();`）。
+- 方向：自举 irgen 在两臂类型是 void 时**不建 phi**（直接按分支走），
+  或把结果槽降级成 void 的分支合并，与宿主 `irgen` 的 void 处理对齐。
+  - 动手前先定位 `src/selfhost/irgen_expr.zan` 里三元（cond expr）的 phi 生成，
+    对照宿主的同类分支；**`src/selfhost/irgen_expr.zan` 当前有并发会话的在途
+    改动**，动手前先核对工作树，别撞车。
+- 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
+  `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
+- 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
