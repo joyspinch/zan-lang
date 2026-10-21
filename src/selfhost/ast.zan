@@ -99,6 +99,102 @@ public class MOD {
     static int AtomicStore() { return 8388608; } // [AtomicStore]: body -> stlr (seq_cst store)
 }
 
+// String-literal escape decoding. One implementation of the C host's
+// lexer_escape_seq (src/compiler/lexer.c): \n \r \t \\ \" \' \0, plus
+// \xNN (1..4 hex digits) and \uNNNN (exactly 4) as code points encoded as
+// UTF-8. The lexer keeps the raw token text; every consumer decodes it
+// through here so the runtime strings, the attribute literals and the
+// compile-time metadata all agree.
+public class StrEsc {
+    // the decoded literal as UTF-8 bytes
+    public static List<int> DecodeBytes(string raw) {
+        List<int> r = new List<int>();
+        int i = 0;
+        while (i < raw.Length) {
+            int c = (int)raw[i];
+            if (c == 92 && i + 1 < raw.Length) {
+                int nx = (int)raw[i + 1];
+                if (nx == 110) { r.Add(10); i = i + 2; continue; }
+                if (nx == 116) { r.Add(9); i = i + 2; continue; }
+                if (nx == 114) { r.Add(13); i = i + 2; continue; }
+                if (nx == 92) { r.Add(92); i = i + 2; continue; }
+                if (nx == 34) { r.Add(34); i = i + 2; continue; }
+                if (nx == 39) { r.Add(39); i = i + 2; continue; }
+                if (nx == 48) { r.Add(0); i = i + 2; continue; }
+                if (nx == 120 || nx == 117) {
+                    // \x takes 1..4 hex digits, \u exactly 4
+                    int val = 0;
+                    int got = 0;
+                    int j = i + 2;
+                    while (j < raw.Length && got < 4) {
+                        int h = HexVal((int)raw[j]);
+                        if (h < 0) { break; }
+                        val = val * 16 + h;
+                        got = got + 1;
+                        j = j + 1;
+                    }
+                    bool ok = got > 0;
+                    if (nx == 117 && got != 4) { ok = false; }
+                    // a surrogate code point is not a scalar value
+                    if (ok && val >= 55296 && val <= 57343) { ok = false; }
+                    if (ok) {
+                        AddUtf8(r, val);
+                        i = j;
+                        continue;
+                    }
+                    // the host rejects these; keep the letter and carry on
+                    if (nx == 117 && got == 4) { r.Add(nx); i = j; continue; }
+                    r.Add(nx);
+                    i = i + 2;
+                    continue;
+                }
+                r.Add(nx);
+                i = i + 2;
+                continue;
+            }
+            r.Add(c);
+            i = i + 1;
+        }
+        return r;
+    }
+
+    // the decoded literal as text
+    public static string DecodeText(string raw) {
+        List<int> b = DecodeBytes(raw);
+        string s = "";
+        int i = 0;
+        while (i < b.Count) { s = s + ((char)b[i]); i = i + 1; }
+        return s;
+    }
+
+    // encode a code point as UTF-8 (the host's zan_utf8_encode)
+    static void AddUtf8(List<int> r, int cp) {
+        if (cp < 128) { r.Add(cp); return; }
+        if (cp < 2048) {
+            r.Add(192 + (cp >> 6));
+            r.Add(128 + (cp & 63));
+            return;
+        }
+        if (cp < 65536) {
+            r.Add(224 + (cp >> 12));
+            r.Add(128 + ((cp >> 6) & 63));
+            r.Add(128 + (cp & 63));
+            return;
+        }
+        r.Add(240 + (cp >> 18));
+        r.Add(128 + ((cp >> 12) & 63));
+        r.Add(128 + ((cp >> 6) & 63));
+        r.Add(128 + (cp & 63));
+    }
+
+    static int HexVal(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 97 + 10; }
+        if (c >= 65 && c <= 70) { return c - 65 + 10; }
+        return -1;
+    }
+}
+
 // Tagged AST node. A single class with generic child slots (a..d), a child
 // list (kids), a type slot, and scalar payloads. This uniform representation
 // keeps the host requirements to what gen0 already supports (no inheritance
