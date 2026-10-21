@@ -712,8 +712,12 @@ partial class Irgen {
         int i = 0;
         while (i < cands.Count) {
             Node m = cands[i];
-            int s = OpArgScore(ParamTypeNode(m, 0), at0);
-            if (at1 != null) { s = s + OpArgScore(ParamTypeNode(m, 1), at1); }
+            // a STATIC indexer takes the receiver as its explicit first
+            // parameter, so the key is the second one
+            int keyIdx = 0;
+            if (IsStatic(m)) { keyIdx = 1; }
+            int s = OpArgScore(ParamTypeNode(m, keyIdx), at0);
+            if (at1 != null) { s = s + OpArgScore(ParamTypeNode(m, keyIdx + 1), at1); }
             if (s > best) { best = s; pick = m; }
             i = i + 1;
         }
@@ -1570,6 +1574,15 @@ partial class Irgen {
                 L("  store i64 " + ToI64(c.op, MapType(c.ty)) + ", i64* " + p);
                 return;
             }
+            // a NULLABLE element is a pointer slot: the value is boxed
+            // (`a[0] = 5` stores a pointer to 5, `a[1] = null` stores null)
+            if (IsNullableValue(elemTy)) {
+                string bx = BoxFor(v, elemTy);
+                string bi = NT();
+                L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
+                L("  store i64 " + bi + ", i64* " + p);
+                return;
+            }
             if (ArcManaged(v.ty)) { EmitArcRetain(v.op, v.ty); }
             L("  store i64 " + ToI64(v.op, MapType(v.ty)) + ", i64* " + p);
             return;
@@ -1625,9 +1638,14 @@ partial class Irgen {
         // value keep their concrete types
         string sym = MethodSym(owner, m);
         string rtm = MapTypeDecl(m.type, owner);
-        string p0m = MapTypeDecl(ParamTypeNode(m, 0), owner);
+        // a STATIC indexer takes the receiver as its explicit first
+        // parameter (`static int op_index(Cls self, long key)`), so the key
+        // is the SECOND parameter
+        int keyIdx = 0;
+        if (IsStatic(m)) { keyIdx = 1; }
+        Node p0 = ParamTypeNode(m, keyIdx);
+        string p0m = MapTypeDecl(p0, owner);
         Node rty = m.type;
-        Node p0 = ParamTypeNode(m, 0);
         string ss = ClassSpecSym(owner, m, obj.ty);
         if (ss != "") {
             sym = ss;
@@ -1654,8 +1672,12 @@ partial class Irgen {
             thisOp = bc;
         }
         string sym = MethodSym(owner, m);
-        Node p0 = ParamTypeNode(m, 0);
-        Node p1 = ParamTypeNode(m, 1);
+        // a STATIC indexer takes the receiver as its explicit first
+        // parameter: the key is the second one, the value the third
+        int keyIdx = 0;
+        if (IsStatic(m)) { keyIdx = 1; }
+        Node p0 = ParamTypeNode(m, keyIdx);
+        Node p1 = ParamTypeNode(m, keyIdx + 1);
         string p0m = MapTypeDecl(p0, owner);
         string p1m = MapTypeDecl(p1, owner);
         string ss = ClassSpecSym(owner, m, obj.ty);
@@ -2070,6 +2092,32 @@ partial class Irgen {
                 return new ExprVal("0", MkType("void"));
             }
             ExprVal a = GenExpr(e.kids[0]);
+            // a NULLABLE value prints its payload, or an empty line when it
+            // is null (the C host's Nullable.ToString)
+            if (IsNullableValue(a.ty)) {
+                string ult = UnderLL(a.ty);
+                string zp = NT();
+                L("  " + zp + " = getelementptr inbounds [16 x i8], [16 x i8]* @.zeropage, i64 0, i64 0");
+                string isn = NT();
+                L("  " + isn + " = icmp eq i8* " + a.op + ", null");
+                string saf = NT();
+                L("  " + saf + " = select i1 " + isn + ", i8* " + zp + ", i8* " + a.op);
+                string pp = NT();
+                L("  " + pp + " = bitcast i8* " + saf + " to " + ult + "*");
+                string pv = NT();
+                L("  " + pv + " = load " + ult + ", " + ult + "* " + pp);
+                Node pty = MkType(a.ty.sval);
+                string nums = ToCStr(new ExprVal(pv, pty));
+                ExprVal empt = GenStr("");
+                string rs = NT();
+                L("  " + rs + " = select i1 " + isn + ", i8* " + empt.op + ", i8* " + nums);
+                string gp = NT();
+                string fg = "@.fmt.sn"; int fl = 3;
+                if (nl) { fg = "@.fmt.snl"; fl = 4; }
+                L("  " + gp + " = getelementptr inbounds [" + fl + " x i8], [" + fl + " x i8]* " + fg + ", i64 0, i64 0");
+                L("  call i32 (i8*, ...) @printf(i8* " + gp + ", i8* " + rs + ")");
+                return new ExprVal("0", MkType("void"));
+            }
             // bool -> "true"/"false"
             if (a.ty != null && a.ty.sval == "bool" && a.ty.ival == 0) {
                 ExprVal ts = GenStr("true");
@@ -2478,6 +2526,9 @@ partial class Irgen {
         // (a jagged T[][] keeps its remaining levels on the element)
         if (obj.ty != null && obj.ty.ival >= 1) {
             Node et2 = MkType(obj.ty.sval); et2.ival = obj.ty.ival - 1;
+            // the element of a `T?[]` is a NULLABLE value: the flag rides on
+            // the array type, so it has to travel down to the element
+            et2.op = obj.ty.op;
             return FromSlot(v, et2);
         }
         return new ExprVal(v, MkType("int"));
@@ -2507,7 +2558,9 @@ partial class Irgen {
             }
             // the array type of the result: the element name with the rank
             // (the declared type of `new T[n]` does not carry the rank yet)
-            Node at = MkType(ty.sval); at.ival = 1 + e.op;
+            // the element's NULLABLE flag rides along: `new int?[3]` is an
+            // array of nullable ints, not a nullable array of ints
+            Node at = MkType(ty.sval); at.ival = 1 + e.op; at.op = ty.op;
             Node elemTy = ArrElemOf(at);
             int esz = ArrElemSize(elemTy);
             string bytes = NT();
@@ -2533,7 +2586,16 @@ partial class Irgen {
                 int jn = 0;
                 while (jn < e.kids.Count) {
                     ExprVal iv = GenExpr(e.kids[jn]);
-                    string sv = StructElemSlot(iv, et);
+                    string sv = "";
+                    if (IsNullableValue(et)) {
+                        // a nullable element is a pointer slot: box the value
+                        string bx = BoxFor(iv, et);
+                        string bi = NT();
+                        L("  " + bi + " = ptrtoint i8* " + bx + " to i64");
+                        sv = bi;
+                    } else {
+                        sv = StructElemSlot(iv, et);
+                    }
                     if (esz == 1) {
                         string ab = NT();
                         L("  " + ab + " = bitcast i64* " + arr + " to i8*");
@@ -4627,8 +4689,40 @@ partial class Irgen {
         }
         // A call whose callee is neither a member access nor a plain name:
         // the only shape that lowers is a delegate-typed expression
-        // (`filters[f](item)`). Everything else is reported -- a silent 0
-        // would hand the program wrong answers without a word.
+        // (`filters[f](item)`) -- and the invoked-object protocol on a
+        // class-typed expression (`Make()(5)`), which dispatches the
+        // class's op_call with the expression as the receiver.
+        {
+            Node cty = ArgTypeNode(callee);
+            Node ccls = ClassOf(cty);
+            if (ccls != null) {
+                if (FindStaticOpCall(ccls) != null) {
+                    // Cls.op_call(<expr>, args...)
+                    Node ma = new Node(AK.MemberAccess());
+                    Node tn = new Node(AK.Ident());
+                    tn.sval = ccls.sval;
+                    ma.a = tn; ma.sval = "op_call";
+                    ma.line = e.line; ma.col = e.col;
+                    Node call = new Node(AK.Call());
+                    call.a = ma; call.line = e.line; call.col = e.col;
+                    call.Add(callee);
+                    int i = 0;
+                    while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+                    return GenCall(call);
+                }
+                if (FindMethodUp(ccls, "op_call") != null) {
+                    // <expr>.op_call(args...)
+                    Node ma = new Node(AK.MemberAccess());
+                    ma.a = callee; ma.sval = "op_call";
+                    ma.line = e.line; ma.col = e.col;
+                    Node call = new Node(AK.Call());
+                    call.a = ma; call.line = e.line; call.col = e.col;
+                    int i = 0;
+                    while (i < e.kids.Count) { call.Add(e.kids[i]); i = i + 1; }
+                    return GenCall(call);
+                }
+            }
+        }
         ExprVal clo = GenExpr(callee);
         if (clo.ty != null && IsDelegate(clo.ty)) {
             return EmitDelegateCallVal(clo, clo.ty, e);
@@ -5815,12 +5909,18 @@ partial class Irgen {
             L("  " + bc + " = bitcast %" + clsName + "* " + recv.op + " to %" + owner + "*");
             thisOp = bc;
         }
+        // A STATIC method reached through an instance (`Encoding.UTF8.GetString(b)`)
+        // takes no receiver: the C host resolves it as a static member and the
+        // receiver is dropped. Passing it anyway shifts every argument by one
+        // -- the call reads the receiver as the first parameter.
+        bool isStatic = (m != null && IsStatic(m));
         string rt = "i64";
         if (m != null) { rt = MapTypeDecl(m.type, owner); }
         if (spec) { rt = MapTypeDecl(SubstTP(m.type, stns, strs), owner); }
         bool isAsyncCall = (m != null && IsAsync(m));
         if (isAsyncCall) { rt = "i8*"; }
-        string args = "%" + owner + "* " + thisOp;
+        string args = "";
+        if (!isStatic) { args = "%" + owner + "* " + thisOp; }
         List<Node> aargs = OrderArgs(m, e);
         int i = 0;
         while (i < aargs.Count) {
@@ -5830,16 +5930,17 @@ partial class Irgen {
                 && aargs[i].kind == AK.OutArg()) {
                 // the receiver is always the first argument, so the
                 // separator is needed even for the first declared parameter
-                args = args + ", ";
                 string addr;
                 if (aargs[i].type != null) { addr = NewOutLocal(aargs[i]); }
                 else { addr = RefPlacePtr(aargs[i].a, pty); }
+                if (args != "") { args = args + ", "; }
                 args = args + MapTypeDecl(pty, owner) + "* " + addr;
                 i = i + 1;
                 continue;
             }
             ExprVal av = GenArgExpr(aargs[i], pty);
-            args = args + ", " + MapTypeDecl(pty, owner) + " " + CallArg(av, pty);
+            if (args != "") { args = args + ", "; }
+            args = args + MapTypeDecl(pty, owner) + " " + CallArg(av, pty);
             i = i + 1;
         }
         if (rt == "void") {
