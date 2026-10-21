@@ -175,6 +175,17 @@ partial class SceneDesigner {
     public int inpIdClass;
     public Input colorIn;
     public int inpIdColor;
+    // 颜色行的真取色器（Gui.Widget.ColorPicker）：色块是它的触发条，
+    // 点开是 SV/色相面板。跨帧持有——弹层的展开态与拖动状态都在
+    // 控件里，每帧新建会把弹层吃掉。
+    public ColorPicker colorPick;
+    // 取色器上一次的模型值：变了就写回文本框（靠值轮询发现拖动，
+    // 不用事件——弹层在覆盖阶段绘制，事件要等下一帧）。
+    public int colorPickVal;
+    // 文本框上一次的取值：区分"用户改了文本"与"我们写回的文本"——
+    // 两条同步路径共用一个值，没有影子值就会互相顶掉（用户刚挑的色
+    // 被上一帧的旧文本顶回去）。
+    public string colorTextShadow;
 
     public static string HexByte(int b) {
         if (b < 0) { b = 0; }
@@ -2738,43 +2749,8 @@ partial class SceneDesigner {
         this.sel.cssClass = this.classIn.GetText();
         iy = iy + rowH;
 
-        // 染色 Tint (RGB) 与 色块预览/轮换
-        app.canvas.DrawStyledText(
-            Style.Of(app, "label", "secondary small", Style.SNormal()),
-            ix, iy + app.Scale(6), SceneDesigner.T("color", "颜色"),
-            app.theme.textPrimary, app.theme.fontSizeMedium);
-        int swatchW = app.Scale(28);
-        int colorInpW = iw - app.Scale(52) - swatchW - app.Scale(4);
-        this.inpIdColor = this.colorIn.Render(app, ix + app.Scale(52), iy, colorInpW, app.Scale(28));
-        string colStr = this.colorIn.GetText();
-        int curPacked = SceneView.PackColor(this.sel.R(), this.sel.G(), this.sel.B(), 255);
-        int swatchBtnId = new Button { Text = "", Class = "small" }.Render(app,
-            ix + app.Scale(52) + colorInpW + app.Scale(4), iy, swatchW);
-        c.FillRoundRect(ix + app.Scale(52) + colorInpW + app.Scale(7), iy + app.Scale(3), swatchW - app.Scale(6), app.Scale(22), app.Scale(2), curPacked);
-        c.DrawRoundRect(ix + app.Scale(52) + colorInpW + app.Scale(7), iy + app.Scale(3), swatchW - app.Scale(6), app.Scale(22), app.Scale(2), t.borderPrimary, 1);
-        if (Ui.Clicked(app, swatchBtnId)) {
-            string nextC = SceneDesigner.NextPresetHex(colStr);
-            this.colorIn.SetText(nextC);
-            int parsedC = ColorPicker.HexParse(nextC);
-            if (ColorPicker.parseOk) {
-                int pr = (parsedC / 65536) % 256;
-                int pg = (parsedC / 256) % 256;
-                int pb = parsedC % 256;
-                this.sel.Tint(pr, pg, pb, this.sel.A());
-            }
-            app.RequestRedraw();
-        } else if (colStr != "") {
-            int parsedC = ColorPicker.HexParse(colStr);
-            if (ColorPicker.parseOk) {
-                int pr = (parsedC / 65536) % 256;
-                int pg = (parsedC / 256) % 256;
-                int pb = parsedC % 256;
-                if (pr != this.sel.R() || pg != this.sel.G() || pb != this.sel.B()) {
-                    this.sel.Tint(pr, pg, pb, this.sel.A());
-                }
-            }
-        }
-        iy = iy + rowH;
+        // 染色 Tint (RGB)：文本框 + 真取色器
+        iy = iy + this.RenderColorRow(app, c, t, ix, iy, iw);
 
         // 透明度 Alpha (0..255)
         int na = this.StepperHalf(app, c, t, ix, iy, iw, SceneDesigner.T("alpha", "透明度"), this.sel.A(), 15);
@@ -2895,6 +2871,68 @@ partial class SceneDesigner {
     public int CenterType(int want) {
         if (want == this.doc.WinCenter()) { return 1; }
         return 0;
+    }
+
+    // 颜色行（元素属性区）：文本框 + 真取色器（点开是 SV/色相面板）。
+    // 独立成方法，用例能无头渲染这一行，断言两条写回路径（取色器改
+    // 色 → 文本 + 元素染色；手改文本 → 取色器跟随）。
+    // 返回本行占用的高度。
+    public int RenderColorRow(App app, Canvas c, Theme t, int ix, int iy, int iw) {
+        app.canvas.DrawStyledText(
+            Style.Of(app, "label", "secondary small", Style.SNormal()),
+            ix, iy + app.Scale(6), SceneDesigner.T("color", "颜色"),
+            app.theme.textPrimary, app.theme.fontSizeMedium);
+        int swatchW = app.Scale(28);
+        int colorInpW = iw - app.Scale(52) - swatchW - app.Scale(4);
+        this.inpIdColor = this.colorIn.Render(app, ix + app.Scale(52), iy, colorInpW, app.Scale(28));
+        string colStr = this.colorIn.GetText();
+        int curPacked = SceneView.PackColor(this.sel.R(), this.sel.G(), this.sel.B(), 255);
+        // 取色器：色块就是它的触发条（弹层落在色块下方）。透明度不
+        // 由取色器管——下面那行"透明度"步进器才是 alpha 的唯一出处，
+        // 取色器关掉透明度条（alpha 恒 255），写回时保留场景的 alpha。
+        if (this.colorPick == null) {
+            this.colorPick = new ColorPicker(curPacked);
+            this.colorPick.Mode = "hex";
+            this.colorPick.SetShowAlpha(false);
+            this.colorPickVal = this.colorPick.Value();
+        }
+        int swatchX = ix + app.Scale(52) + colorInpW + app.Scale(4);
+        this.colorPick.RenderIn(app, swatchX, iy, swatchW, app.Scale(28));
+        // 文本 → 取色器：只有文本真的被改过（不是我们自己写回的）才
+        // 同步。否则两条路径会互相顶：用户刚在弹层里挑的色，被上一
+        // 帧的旧文本顶回去。
+        if (colStr != this.colorTextShadow) {
+            int parsedC = ColorPicker.HexParse(colStr);
+            if (ColorPicker.parseOk) {
+                this.colorPick.SetColor(parsedC);
+                this.colorPickVal = this.colorPick.Value();
+            }
+            this.colorTextShadow = colStr;
+        }
+        // 取色器 → 文本：用户在弹层里拖了色盘，模型值变了就翻成
+        // hex 写回输入框。
+        int pickVal = this.colorPick.Value();
+        if (pickVal != this.colorPickVal) {
+            this.colorPickVal = pickVal;
+            colStr = this.colorPick.FormatAs("hex");
+            this.colorIn.SetText(colStr);
+            this.colorTextShadow = colStr;
+        }
+        if (colStr != "") {
+            int pv = ColorPicker.HexParse(colStr);
+            if (ColorPicker.parseOk) {
+                // 分量要走 RgbOf 掩码再拆：打包色 alpha≥0x80 时是负
+                // int，裸除会算出负分量（-231 这种），元素颜色直接变花。
+                int rgb = ColorPicker.RgbOf(pv);
+                int pr = (rgb / 65536) % 256;
+                int pg = (rgb / 256) % 256;
+                int pb = rgb % 256;
+                if (pr != this.sel.R() || pg != this.sel.G() || pb != this.sel.B()) {
+                    this.sel.Tint(pr, pg, pb, this.sel.A());
+                }
+            }
+        }
+        return app.Scale(34);
     }
 
     // 渲染底部状态栏：场景设计稿、元素计数与最近一条操作提示 msg。

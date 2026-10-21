@@ -4860,6 +4860,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
     -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
   set_tests_properties(conformance_gui_designer_color_props PROPERTIES TIMEOUT 120)
 
+  # 场景设计器颜色行接真取色器：色块点开是 SV/色相面板，选中即写回
+  # 文本框与元素染色；打包色拆分量走 RgbOf 掩码（裸除会算出负分量）。
+  add_test(NAME conformance_gui_scene_designer_color
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/scene_designer_color_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_scene_designer_color.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_scene_designer_color${_exe_ext}
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_scene_designer_color PROPERTIES TIMEOUT 120)
+
 
   # SelectBox 级联增强：父子指针链（单选路径/重开自动展开/联动关闭
   # 选分支）、多选勾选模型（联动带动、祖链回推、半勾）、勾选策略

@@ -1,0 +1,120 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Game.Scene;
+
+// 场景设计器颜色行的行为回归。此前色块点一下只是循环几个预设色
+// （用户挑不了颜色），现在色块是真取色器（ColorPicker）的触发条：
+// 点开是 SV/色相面板，选中即写回文本框与元素染色。
+//
+// 三件事，缺一就是"看着能点、其实不生效"：
+// 1. 取色器锚点落在色块上——即时模式没有 Arrange，锚点必须由
+//    RenderIn 自己落，否则弹层跑到窗口原点。
+// 2. 取色器 → 元素：用户在弹层里挑了色，元素染色要跟着变。
+// 3. 文本 → 取色器：手改 hex，色块要跟着走（文本是权威）。
+//
+// alpha 不由取色器管——场景的 alpha 是检查器里独立的一行，写回
+// 颜色时必须保留元素原有的 alpha。
+class SceneDesignerColorTest {
+    static int fails;
+
+    static void Fail(string msg) {
+        Console.WriteLine("FAIL: " + msg);
+        fails = fails + 1;
+    }
+
+    static void Check(string desc, bool ok) {
+        if (ok) { return; }
+        Fail(desc);
+    }
+
+    static void EqStr(string desc, string actual, string expected) {
+        if (actual == expected) { return; }
+        Fail(desc + " expected '" + expected + "', got '" + actual + "'");
+    }
+
+    static void EqInt(string desc, int actual, int expected) {
+        if (actual == expected) { return; }
+        Fail(desc + " expected " + Convert.ToString(expected)
+            + ", got " + Convert.ToString(actual));
+    }
+
+    static void Main() {
+        App app = new App("scolor", 900, 640);
+        SceneDesigner d = new SceneDesigner();
+        SceneElement el = new SceneElement("button", "btnTest");
+        el.Tint(24, 144, 255, 128);
+        d.Select(el);
+
+        int ix = 20;
+        int iy = 20;
+        int iw = 280;
+
+        // 帧 1：画一行。取色器以选中元素的颜色为初值。
+        app.BeginFrame();
+        d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
+        app.RunOverlays();
+        Check("color picker is created", d.colorPick != null);
+        if (d.colorPick == null) {
+            Console.WriteLine("SCENE_DESIGNER_COLOR_TEST_FAIL");
+            return;
+        }
+        EqInt("picker seeded from element",
+              ColorPicker.RgbOf(d.colorPick.Value()), ColorPicker.RgbOf(ColorPicker.Opaque(24, 144, 255)));
+        // 锚点必须落在色块上（弹层据此定位）。缩放系数在首帧后才稳
+        // 定，几何期望值必须在帧后算。
+        int lw = app.Scale(52);
+        int sw = app.Scale(28);
+        int gap = app.Scale(4);
+        int inpW = iw - lw - sw - gap;
+        EqInt("picker anchor x", d.colorPick.bx, ix + lw + inpW + gap);
+        EqInt("picker anchor y", d.colorPick.by, iy);
+
+        // 帧 2：用户在弹层里挑了绿色 → 文本框与元素染色都要跟上。
+        d.colorPick.SetColor(ColorPicker.Opaque(0, 255, 0));
+        app.BeginFrame();
+        d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
+        app.RunOverlays();
+        EqStr("text after pick", d.colorIn.GetText(), "#00FF00");
+        EqInt("element R after pick", el.R(), 0);
+        EqInt("element G after pick", el.G(), 255);
+        EqInt("element B after pick", el.B(), 0);
+        EqInt("element alpha kept", el.A(), 128);
+
+        // 帧 3：手改文本 → 取色器跟着走。
+        d.colorIn.SetText("#ff8800");
+        app.BeginFrame();
+        d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
+        app.RunOverlays();
+        EqInt("picker follows text",
+              ColorPicker.RgbOf(d.colorPick.Value()),
+              ColorPicker.RgbOf(ColorPicker.Opaque(255, 136, 0)));
+        EqInt("element R after typing", el.R(), 255);
+        EqInt("element G after typing", el.G(), 136);
+        EqInt("element B after typing", el.B(), 0);
+
+        // 帧 4：弹层展开时 SV 面板必须落在色块下方（不是窗口原点）。
+        d.colorPick.open = true;
+        app.BeginFrame();
+        d.RenderColorRow(app, app.canvas, app.theme, ix, iy, iw);
+        app.RunOverlays();
+        int svId = d.colorPick.wid + ColorPicker.SvPanelOff();
+        int foundY = 0 - 1;
+        for (int y = 0; y < 400; y = y + 1) {
+            if (app.hitTester.HitTest(d.colorPick.bx + app.Scale(20), y) == svId) {
+                foundY = y;
+                break;
+            }
+        }
+        Check("sv panel below swatch", foundY > iy + app.Scale(28));
+        Check("sv panel near swatch", foundY < iy + app.Scale(28) + app.Scale(80));
+        Check("sv panel not at origin", foundY != 0 - 1);
+
+        app.canvas.Destroy();
+        if (fails == 0) {
+            Console.WriteLine("SCENE_DESIGNER_COLOR_TEST_OK");
+            return;
+        }
+        Console.WriteLine("SCENE_DESIGNER_COLOR_TEST_FAIL");
+    }
+}
