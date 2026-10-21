@@ -1,0 +1,187 @@
+using System;
+
+namespace Game.Physics3D;
+
+// 刚体：位置、朝向、速度与质量属性。
+//
+// 约定：
+//   - position 永远是**形状质心**的世界坐标（盒与球的质心都在局部原点）。
+//   - orientation 是四元数（单位），表示刚体姿态。
+//   - 静态体（isStatic）质量无穷：invMass / invInertia 都是 0，求解时不会被
+//     推动，但会挡住别人。
+//   - 转动惯量张量在**局部主轴系**下是对角的，存 invInertiaLocal；世界系下
+//     用 ApplyInvInertia 变换（R·I⁻¹·Rᵀ）。
+public class RigidBody {
+    // 世界内唯一 id（由 PhysicsWorld 分配）。
+    public int id;
+    // 形状（局部几何）。
+    public Shape shape;
+    // 质心世界坐标。
+    public Vec3 position;
+    // 姿态（单位四元数）。
+    public Quat orientation;
+    // 线速度（单位/秒）。
+    public Vec3 velocity;
+    // 角速度（弧度/秒，世界系）。
+    public Vec3 angularVelocity;
+    // 本步累积的力与力矩（每步末清零）。
+    public Vec3 force;
+    public Vec3 torque;
+    // 质量属性。
+    public double mass;
+    public double invMass;
+    // 局部主轴系下的逆惯量（对角张量的三个分量）。
+    public Vec3 invInertiaLocal;
+    // 材质。
+    public double restitution;
+    public double friction;
+    // 是否为静态体。
+    public bool isStatic;
+    // 是否锁死旋转（转动惯量按 0 算）。
+    public bool fixedRotation;
+    // 阻尼（每秒比例：v /= 1 + damping·dt）。
+    public double linearDamping;
+    public double angularDamping;
+    // 分离冲量用的伪速度（位置修正阶段专用，不进入真实速度）。
+    public Vec3 pseudoVelocity;
+    public Vec3 pseudoAngularVelocity;
+
+    public RigidBody(Shape shape, Vec3 position) {
+        this.id = 0;
+        this.shape = shape;
+        this.position = position;
+        this.orientation = Quat.Identity;
+        this.velocity = Vec3.Zero;
+        this.angularVelocity = Vec3.Zero;
+        this.force = Vec3.Zero;
+        this.torque = Vec3.Zero;
+        this.mass = 0.0;
+        this.invMass = 0.0;
+        this.invInertiaLocal = Vec3.Zero;
+        this.restitution = 0.0;
+        this.friction = 0.2;
+        this.isStatic = true;
+        this.fixedRotation = false;
+        this.linearDamping = 0.0;
+        this.angularDamping = 0.0;
+        this.pseudoVelocity = Vec3.Zero;
+        this.pseudoAngularVelocity = Vec3.Zero;
+        this.RecomputeMass();
+    }
+
+    // 动态体：按形状体密度算质量与转动惯量。
+    public static RigidBody Dynamic(Shape shape, Vec3 position, double density) {
+        RigidBody body = new RigidBody(shape, position);
+        body.isStatic = false;
+        body.shape.density = density;
+        body.RecomputeMass();
+        return body;
+    }
+
+    // 动态体：指定姿态。
+    public static RigidBody Dynamic(Shape shape, Vec3 position, Quat rot, double density) {
+        RigidBody body = RigidBody.Dynamic(shape, position, density);
+        body.orientation = rot;
+        return body;
+    }
+
+    // 静态体：不被推动，只挡路。
+    public static RigidBody Static(Shape shape, Vec3 position) {
+        RigidBody body = new RigidBody(shape, position);
+        body.isStatic = true;
+        body.RecomputeMass();
+        return body;
+    }
+
+    // 静态体：指定姿态。
+    public static RigidBody Static(Shape shape, Vec3 position, Quat rot) {
+        RigidBody body = RigidBody.Static(shape, position);
+        body.orientation = rot;
+        return body;
+    }
+
+    // 重新按形状与密度算质量 / 转动惯量（改了 density 或 fixedRotation 后调用）。
+    public void RecomputeMass() {
+        if (this.isStatic) {
+            this.mass = 0.0;
+            this.invMass = 0.0;
+            this.invInertiaLocal = Vec3.Zero;
+            return;
+        }
+        double volume = this.shape.Volume();
+        this.mass = volume * this.shape.density;
+        this.invMass = this.mass > 0.0 ? 1.0 / this.mass : 0.0;
+        Vec3 perMass = this.shape.InertiaPerMass();
+        if (this.fixedRotation) {
+            this.invInertiaLocal = Vec3.Zero;
+            return;
+        }
+        this.invInertiaLocal = new Vec3(
+            perMass.x > 0.0 ? 1.0 / (this.mass * perMass.x) : 0.0,
+            perMass.y > 0.0 ? 1.0 / (this.mass * perMass.y) : 0.0,
+            perMass.z > 0.0 ? 1.0 / (this.mass * perMass.z) : 0.0
+        );
+    }
+
+    // 施加力（累积到本步末）。
+    public void ApplyForce(Vec3 f) {
+        this.force = this.force + f;
+    }
+
+    // 施加力矩（累积到本步末）。
+    public void ApplyTorque(Vec3 t) {
+        this.torque = this.torque + t;
+    }
+
+    // 在世界点施加力（同时产生绕质心的力矩）。
+    public void ApplyForceAtPoint(Vec3 f, Vec3 worldPoint) {
+        this.force = this.force + f;
+        Vec3 r = worldPoint - this.position;
+        this.torque = this.torque + Vec3.Cross(r, f);
+    }
+
+    // 局部点 → 世界点。
+    public Vec3 ToWorld(Vec3 localPoint) {
+        return this.position + this.orientation.Rotate(localPoint);
+    }
+
+    // 世界点 → 局部点。
+    public Vec3 ToLocal(Vec3 worldPoint) {
+        return this.orientation.RotateInverse(worldPoint - this.position);
+    }
+
+    // 世界系下的逆惯量作用：v ↦ R·I⁻¹·Rᵀ·v。
+    public Vec3 ApplyInvInertia(Vec3 v) {
+        Vec3 local = this.orientation.RotateInverse(v);
+        Vec3 scaled = new Vec3(
+            this.invInertiaLocal.x * local.x,
+            this.invInertiaLocal.y * local.y,
+            this.invInertiaLocal.z * local.z
+        );
+        return this.orientation.Rotate(scaled);
+    }
+
+    // 世界点处的速度（含旋转贡献）。
+    public Vec3 VelocityAt(Vec3 worldPoint) {
+        Vec3 r = worldPoint - this.position;
+        return this.velocity + Vec3.Cross(this.angularVelocity, r);
+    }
+
+    // 世界点处的伪速度（位置修正阶段用）。
+    public Vec3 PseudoVelocityAt(Vec3 worldPoint) {
+        Vec3 r = worldPoint - this.position;
+        return this.pseudoVelocity + Vec3.Cross(this.pseudoAngularVelocity, r);
+    }
+
+    // 当前包围盒。
+    public Aabb ComputeAabb() {
+        return this.shape.ComputeAabb(this.position, this.orientation);
+    }
+
+    // 推进姿态（角速度积分 + 归一化）。
+    public void IntegrateOrientation(double h) {
+        Vec3 w = this.angularVelocity;
+        Quat spin = new Quat(w.x * 0.5 * h, w.y * 0.5 * h, w.z * 0.5 * h, 0.0);
+        this.orientation = (spin * this.orientation).Normalized();
+    }
+}

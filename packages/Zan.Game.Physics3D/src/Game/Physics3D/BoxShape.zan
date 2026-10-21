@@ -1,0 +1,72 @@
+using System;
+
+namespace Game.Physics3D;
+
+// 盒（长方体）：局部中心在原点，halfExtents 是**半长**。
+//
+// 惯量张量（均匀密度，绕质心）：
+//   Ixx = m/3·(hy² + hz²)，Iyy = m/3·(hx² + hz²)，Izz = m/3·(hx² + hy²)
+// （全边长为 2hx/2hy/2hz，代入长方体公式 I = m(w² + h²)/12 即得）。
+public class BoxShape : Shape {
+    // 半长（x / y / z）。
+    public double halfX;
+    public double halfY;
+    public double halfZ;
+
+    public BoxShape(double halfX, double halfY, double halfZ) {
+        this.halfX = halfX;
+        this.halfY = halfY;
+        this.halfZ = halfZ;
+        this.density = 1.0;
+    }
+
+    // 便捷构造：按全边长。
+    public static BoxShape FromSize(double sizeX, double sizeY, double sizeZ) {
+        return new BoxShape(sizeX * 0.5, sizeY * 0.5, sizeZ * 0.5);
+    }
+
+    public override double Volume() {
+        return 8.0 * this.halfX * this.halfY * this.halfZ;
+    }
+
+    public override Vec3 Centroid() {
+        return new Vec3(0.0, 0.0, 0.0);
+    }
+
+    public override Vec3 InertiaPerMass() {
+        double xx = (this.halfY * this.halfY + this.halfZ * this.halfZ) / 3.0;
+        double yy = (this.halfX * this.halfX + this.halfZ * this.halfZ) / 3.0;
+        double zz = (this.halfX * this.halfX + this.halfY * this.halfY) / 3.0;
+        return new Vec3(xx, yy, zz);
+    }
+
+    public override Aabb ComputeAabb(Vec3 center, Quat rot) {
+        // 旋转后的半长（把局部三个半长投影到世界轴上）。
+        double[] m = rot.ToMatrix();
+        double ex = Math.Abs(m[0]) * this.halfX + Math.Abs(m[3]) * this.halfY + Math.Abs(m[6]) * this.halfZ;
+        double ey = Math.Abs(m[1]) * this.halfX + Math.Abs(m[4]) * this.halfY + Math.Abs(m[7]) * this.halfZ;
+        double ez = Math.Abs(m[2]) * this.halfX + Math.Abs(m[5]) * this.halfY + Math.Abs(m[8]) * this.halfZ;
+        return new Aabb(
+            center.x - ex, center.y - ey, center.z - ez,
+            center.x + ex, center.y + ey, center.z + ez
+        );
+    }
+
+    public override Vec3 Support(Vec3 dir, Vec3 center, Quat rot) {
+        // dir 是**世界**方向：先转到局部系再挑符号，否则盒子转过姿态后支撑点
+        // 会挑错面（SAT 的最小穿透轴因此会算错）。
+        //
+        // **分量恰为 0 时必须取 0（面中心），不能取 +half**：支撑点只需在方向
+        // 上取极值，零分量的轴上取哪端都行，但取 +half 会把"接触点"挪到盒角
+        // （例如法线是 +y 时支撑点变成 (hx, hy, hz) 而不是 (0, hy, 0)）。接触点
+        // 一旦跑到角上，力臂就大得离谱，有效质量算出来差三个数量级，盒-盒
+        // 接触会直接失效（物体会穿过去）。
+        Vec3 localDir = rot.RotateInverse(dir);
+        Vec3 local = new Vec3(
+            localDir.x > 0.0 ? this.halfX : (localDir.x < 0.0 ? -this.halfX : 0.0),
+            localDir.y > 0.0 ? this.halfY : (localDir.y < 0.0 ? -this.halfY : 0.0),
+            localDir.z > 0.0 ? this.halfZ : (localDir.z < 0.0 ? -this.halfZ : 0.0)
+        );
+        return center + rot.Rotate(local);
+    }
+}

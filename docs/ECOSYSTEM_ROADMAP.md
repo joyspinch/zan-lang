@@ -1483,6 +1483,65 @@ conformance `game_profiler`：严格数值（好/坏输入各一组）· 账单�
 ---
 ---
 
+### 1.27 三维刚体物理：`Zan.Game.Physics3D`
+
+`Game.Physics2D` 解决的是平面上的动力学；三维还缺两样东西：**姿态的表示**
+（欧拉角有万向锁与顺序歧义）和**面-面接触的多点求解**（单点接触在三维里
+必然不稳）。本包补齐这两样：`packages/Zan.Game.Physics3D`
+（`Game.Physics3D`，无依赖，只用 `System` / `System.Collections.Generic`）。
+
+**八条硬取舍**：
+
+1. **double 而不是 float**。物理里累加惯量与冲量时 float 的舍入会让"能量
+   守恒"这类断言在边界上飘——同样的两次运行结果不同就谈不上确定性。物理用
+   double，渲染时再转 float。
+2. **四元数而不是欧拉角**。四元数乘法没有万向锁与顺序歧义，代价是要归一化
+   （每步积分后归一化一次）。复合顺序有语义（先转 b 再转 a），不能当交换律用。
+3. **惯量张量只存局部对角分量**。均匀长方体与球的惯量张量在自身主轴系下是
+   对角的，世界系下按 `R·I⁻¹·Rᵀ` 变换（`RigidBody.ApplyInvInertia`）——盒体
+   绕任意轴的转动惯量自动正确，不用为每种姿态单独存一张张量。
+4. **盒-盒走完整 SAT + 面裁剪**。最小穿透轴是面法线时，把另一个盒朝向它的
+   那一面（入射面）用参考面的 4 个侧面裁剪（Sutherland-Hodgman），最多 4 个
+   接触点；是边-边轴时取两条边的最近点。裁剪出一个点都不剩时退回单点近似，
+   不让这一对刚体穿过彼此。
+5. **多接触点不是为了好看，是稳定性刚需**。单点接触下，滑动摩擦作用在质心
+   下方会产生"把盒子掀翻"的力矩，而单点的法向冲量没法在面内重新分配来抵抗
+   它——盒子会越滑越歪，法向冲量被"分离速度"吃掉，最后沉进地里。多点接触
+   让法向冲量在面上重新分布、抵消倾覆力矩，盒子才能平地跑、三盒堆叠不塌
+   （Box2D / Bullet 稳定堆叠的同一个机制）。这是本包实现过程中踩得最深的一个
+   坑：单点版本下摩擦减速度只有理论值的 1/16。
+6. **接触对按 id 规范化**（低 id → 高 id）。宽相按 minX 排序，两个刚体位置
+   互换时会在接触表里建出**两个方向相反**的接触对——同一对刚体被解两次，
+   法线还打架。规范化后接触键唯一，法线方向恒定。
+7. **确定性**：接触顺序、迭代次数全部固定，没有随机数——同一初始条件 + 同一
+   操作序列必然得到同一结果（回放 / 锁步的前提）。宽相的排序是插入排序，
+   顺序稳定。
+8. **推测接触代替 TOI 扫掠**：分离量在 `speculativeMargin` 以内也建接触，
+   约束把接近速度限制为 `gap / dt`——高速物体在"还没撞上"时就被拦住。
+   真正的 TOI（time of impact）扫掠没有实现。
+
+conformance `physics3d_world`：向量与四元数代数（旋转保长、复合顺序有语义、
+矩阵正交）· 包围盒 · 三种窄相配对的几何（球-球分离量与法线、球-盒法线方向
+两种配对都要对、盒-盒 4 点裁剪与穿透深度）· 自由落体积分 · 落地静止与不漂移
+· 动量守恒 · 能量不增 · 弹性反弹高度 · 偏心碰撞产生角速度（且符号要对）·
+库仑摩擦（减速度与滑行距离对着解析解 `v²/(2μg)` 比，且不掀翻）· 三盒堆叠
+不塌不歪 · 静态体不动 · 高速物体不穿墙 · 移除刚体连带清掉接触 · 同一场景
+跑两遍逐位一致。
+
+**已知边界**：**没有关节**（3D 版没做铰链 / 距离约束，那是独立一块工作量）·
+**没有 TOI 扫掠**（速度极高时仍可能穿薄壁，靠 `substepCount` 与更大的
+`speculativeMargin` 缓解）· **盒-球只有 1 个接触点**（盒面压在球上时盒会慢慢
+歪）· **没有睡眠**（静止物体照样每帧参与求解）· **没有 CCD** · **没有凸包
+形状**（只有球与盒）。
+
+**为什么不是 §2 里的 `Zan.Game.Render3D`**：渲染 3D 要 GPU 后端（8–12 周，
+且本机没有可对拍的硬件路径）；动力学是纯逻辑，能用合成场景完全验证——
+先把能验证的做完。
+
+---
+
+---
+
 ## 2. 通用生态包（按依赖顺序）
 
 ### 第 0 层 · 底座（其它包都依赖它）
@@ -1525,7 +1584,7 @@ conformance `game_profiler`：严格数值（好/坏输入各一组）· 账单�
 |---|---|---|---|---|
 | `Zan.Game.Ecs` | DefaultEcs / Unity ml-agents | 榜外 / 19,771 | ✅ 已落地 `packages/Zan.Game.Ecs`（`Game.Ecs`：类型化组件池 + 延迟销毁 + 分组系统调度 + 稳定序查询，见 §1.5） | — |
 | `Zan.Game.Physics2D` | nphysics / JigglePhysics | 榜外 | ✅ 已落地 `packages/Zan.Game.Physics2D`（`Game.Physics2D`：值语义向量 + 凸多边形/圆窄相 + 顺序冲量动力学 + 距离/旋转关节，见 §1.6） | — |
-| `Zan.Game.Physics3D` | BulletSharp | 榜外 | 无 | 6–8 周 |
+| `Zan.Game.Physics3D` | BulletSharp | 榜外 | ✅ 已落地 `packages/Zan.Game.Physics3D`（`Game.Physics3D`：double 精度向量 + 四元数姿态 + 球/盒形状 + SAT 面裁剪多接触点窄相 + 顺序冲量求解器（热启动 / 双切向摩擦锥 / 分离冲量穿透修正）+ SAP 宽相，见 §1.27）；**不做关节与凸包** | — |
 | `Zan.Game.Pathfinding` | AStarPathFinding | 榜外 | ✅ 已落地 `packages/Zan.Game.Pathfinding`（`Game.Pathfinding`：加权 A* + 跳跃点搜索 + 视线拉直 + 导航网格漏斗平滑，见 §1.7） | — |
 | `Zan.Game.Assets` | SharpGLTF / AssimpNet | 榜外 | ✅ 已落地 `packages/Zan.Game.Assets`（`Game.Assets`：声明式清单 + 依赖图 + 引用计数加载 + 确定性 LRU 预算淘汰 + 资源组，见 §1.9） | — |
 | `Zan.Game.Audio` | NAudio | 6,249 | ✅ 已落地 `packages/Zan.Game.Audio`（`Game.Audio`：采样缓冲 + 波形合成 + ADSR 包络 + 双二阶滤波 + 混音 + 变调 + 纯 Zan WAV 读写，见 §1.10） | — |
@@ -1563,7 +1622,7 @@ conformance `game_profiler`：严格数值（好/坏输入各一组）· 账单�
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 **第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
-**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Debug`（ImGui 口径：帧剖析覆盖层 / 实体检查器；依赖 Gui 整包，等 Gui 编译恢复后落地）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
+**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug`（ImGui 口径：帧剖析覆盖层 / 实体检查器；依赖 Gui 整包，等 Gui 编译恢复后落地）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

@@ -1,0 +1,393 @@
+using System;
+using Game.Physics3D;
+
+// Physics3D 契约测试：向量/四元数代数、窄相几何、求解器动力学、确定性与穿透修正。
+//
+// 断言用容差比较（浮点模拟不可能逐位相等），golden 只锁定"全过"这行——
+// 这样阈值调整不会连带改 golden。
+public class Physics3DTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static void CheckVecNear(string name, Vec3 actual, Vec3 expected, double tolerance) {
+        CheckNear(name + ".x", actual.x, expected.x, tolerance);
+        CheckNear(name + ".y", actual.y, expected.y, tolerance);
+        CheckNear(name + ".z", actual.z, expected.z, tolerance);
+    }
+
+    // 一块静态地面：宽 20、厚 1，顶面在 y = 0。
+    private static RigidBody AddGround(PhysicsWorld world) {
+        BoxShape ground = BoxShape.FromSize(20.0, 1.0, 20.0);
+        return world.AddBody(RigidBody.Static(ground, new Vec3(0.0, -0.5, 0.0)));
+    }
+
+    /* ---------- 向量代数 ---------- */
+    private static void TestVectorAlgebra() {
+        Vec3 a = new Vec3(1.0, 2.0, 3.0);
+        Vec3 b = new Vec3(4.0, 5.0, 6.0);
+        CheckNear("vec dot", Vec3.Dot(a, b), 32.0, 0.000001);
+        CheckVecNear("vec cross", Vec3.Cross(new Vec3(1.0, 0.0, 0.0), new Vec3(0.0, 1.0, 0.0)),
+            new Vec3(0.0, 0.0, 1.0), 0.000001);
+        CheckNear("vec length", new Vec3(3.0, 4.0, 0.0).Length(), 5.0, 0.000001);
+        CheckNear("vec length squared", new Vec3(3.0, 4.0, 0.0).LengthSquared(), 25.0, 0.000001);
+        CheckVecNear("vec normalized", new Vec3(0.0, 5.0, 0.0).Normalized(), new Vec3(0.0, 1.0, 0.0), 0.000001);
+        // 零向量归一化不能除零。
+        CheckVecNear("vec normalized zero", Vec3.Zero.Normalized(), Vec3.Zero, 0.000001);
+        // 叉积与两个操作数都正交。
+        Vec3 cross = Vec3.Cross(a, b);
+        CheckNear("cross orthogonal a", Vec3.Dot(cross, a), 0.0, 0.000001);
+        CheckNear("cross orthogonal b", Vec3.Dot(cross, b), 0.0, 0.000001);
+        Check("vec equality", new Vec3(1.0, 2.0, 3.0) == a);
+        Check("vec inequality", !(new Vec3(1.0, 2.0, 3.5) == a));
+    }
+
+    /* ---------- 四元数：旋转保长、复合顺序 ---------- */
+    private static void TestQuaternion() {
+        Quat q = Quat.FromAxisZ(Math.PI / 2.0);
+        CheckVecNear("quat rotate 90deg", q.Rotate(Vec3.UnitX), new Vec3(0.0, 1.0, 0.0), 0.000001);
+        CheckVecNear("quat inverse rotate", q.RotateInverse(new Vec3(0.0, 1.0, 0.0)), Vec3.UnitX, 0.000001);
+        CheckNear("quat norm", q.NormSquared(), 1.0, 0.000001);
+        // 旋转不改变长度。
+        Vec3 v = new Vec3(1.0, 2.0, 3.0);
+        CheckNear("quat preserves length", q.Rotate(v).Length(), v.Length(), 0.000001);
+        // 非单位四元数归一化后仍是单位四元数。
+        Quat raw = new Quat(0.0, 0.0, 0.0, 5.0);
+        CheckNear("quat normalized", raw.Normalized().NormSquared(), 1.0, 0.000001);
+        // 复合：绕 z 转 90° 再绕 x 转 90°，与反向顺序结果不同（顺序有语义）。
+        Quat z90 = Quat.FromAxisZ(Math.PI / 2.0);
+        Quat x90 = Quat.FromAxisX(Math.PI / 2.0);
+        Vec3 forward = (z90 * x90).Rotate(Vec3.UnitX);
+        Vec3 backward = (x90 * z90).Rotate(Vec3.UnitX);
+        Check("quat composition order matters", !(forward == backward));
+        // 单位四元数的旋转矩阵是正交阵：列向量长度守恒。
+        double[] m = z90.ToMatrix();
+        double colLen = Math.Sqrt(m[0] * m[0] + m[3] * m[3] + m[6] * m[6]);
+        CheckNear("quat matrix column norm", colLen, 1.0, 0.000001);
+    }
+
+    /* ---------- 包围盒 ---------- */
+    private static void TestAabb() {
+        Aabb box = new Aabb(-1.0, -1.0, -1.0, 1.0, 1.0, 1.0);
+        Check("aabb overlaps", box.Overlaps(new Aabb(0.0, 0.0, 0.0, 2.0, 2.0, 2.0)));
+        Check("aabb no overlap", !box.Overlaps(new Aabb(5.0, 5.0, 5.0, 6.0, 6.0, 6.0)));
+        Check("aabb contains", box.Contains(new Vec3(0.5, -0.5, 0.0)));
+        Check("aabb not contains", !box.Contains(new Vec3(2.0, 0.0, 0.0)));
+        CheckVecNear("aabb center", box.Center(), Vec3.Zero, 0.000001);
+    }
+
+    /* ---------- 窄相：球-球 ---------- */
+    private static void TestSphereSphere() {
+        Manifold hit = Collision.Collide(
+            new SphereShape(0.5), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            new SphereShape(0.5), new Vec3(0.9, 0.0, 0.0), Quat.Identity, 0.0);
+        Check("sphere-sphere contact", hit.pointCount == 1);
+        CheckVecNear("sphere-sphere normal", hit.normal, new Vec3(1.0, 0.0, 0.0), 0.000001);
+        CheckNear("sphere-sphere separation", hit.points[0].separation, -0.1, 0.000001);
+
+        Manifold miss = Collision.Collide(
+            new SphereShape(0.5), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            new SphereShape(0.5), new Vec3(2.0, 0.0, 0.0), Quat.Identity, 0.0);
+        Check("sphere-sphere miss", miss.pointCount == 0);
+    }
+
+    /* ---------- 窄相：球-盒（法线方向两种配对都要对） ---------- */
+    private static void TestSphereBox() {
+        // A 是球（x=-1.2）、B 是盒（中心在原点，半长 1）：法线从球指向盒 = +x。
+        // 球心离盒面 0.2，半径 0.5 → 侵入 0.3。
+        Manifold sphereFirst = Collision.Collide(
+            new SphereShape(0.5), new Vec3(-1.2, 0.0, 0.0), Quat.Identity,
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), Quat.Identity, 0.0);
+        Check("sphere-box contact", sphereFirst.pointCount == 1);
+        CheckVecNear("sphere-box normal", sphereFirst.normal, new Vec3(1.0, 0.0, 0.0), 0.000001);
+        CheckNear("sphere-box separation", sphereFirst.points[0].separation, -0.3, 0.000001);
+
+        // A 是盒、B 是球：法线翻过来（-x）。
+        Manifold boxFirst = Collision.Collide(
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            new SphereShape(0.5), new Vec3(-1.2, 0.0, 0.0), Quat.Identity, 0.0);
+        CheckVecNear("box-sphere normal flipped", boxFirst.normal, new Vec3(-1.0, 0.0, 0.0), 0.000001);
+    }
+
+    /* ---------- 窄相：盒-盒（SAT + 面裁剪） ---------- */
+    private static void TestBoxBox() {
+        // 两个 2×2×2 的盒沿 x 轴重叠 0.5：面-面接触裁剪出 4 个点。
+        Manifold hit = Collision.Collide(
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(1.5, 0.0, 0.0), Quat.Identity, 0.0);
+        Check("box-box contact", hit.pointCount == 4);
+        CheckVecNear("box-box normal", hit.normal, new Vec3(1.0, 0.0, 0.0), 0.000001);
+        for (int i = 0; i < hit.points.Count; i = i + 1) {
+            CheckNear("box-box penetration", hit.points[i].separation, -0.5, 0.000001);
+        }
+
+        Manifold miss = Collision.Collide(
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(5.0, 0.0, 0.0), Quat.Identity, 0.0);
+        Check("box-box miss", miss.pointCount == 0);
+
+        // 小盒压在大盒上：入射面完全落在参考面内，仍然是 4 个点。
+        Manifold stacked = Collision.Collide(
+            BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), Quat.Identity,
+            BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(0.0, 1.4, 0.0), Quat.Identity, 0.0);
+        Check("box-box stacked contact", stacked.pointCount == 4);
+        CheckVecNear("box-box stacked normal", stacked.normal, new Vec3(0.0, 1.0, 0.0), 0.000001);
+    }
+
+    /* ---------- 自由落体：积分器与重力 ---------- */
+    private static void TestFreeFall() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        RigidBody body = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(0.0, 5.0, 0.0), 1.0));
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckNear("freefall velocity", body.velocity.y, -10.0, 0.001);
+        // 半隐式欧拉：y = y0 - g·dt²·n(n+1)/2
+        CheckNear("freefall position", body.position.y, 5.0 - 10.0 * 60.0 * 61.0 / 7200.0, 0.01);
+    }
+
+    /* ---------- 落地静止：不穿透、不抖动 ---------- */
+    private static void TestRestOnGround() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        AddGround(world);
+        RigidBody body = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(0.0, 5.0, 0.0), 1.0));
+        for (int i = 0; i < 180; i = i + 1) { world.Step(1.0 / 60.0); }
+        // 球心停在地面顶面 + 半径（允许 slop 量级的容差）
+        CheckNear("rest height", body.position.y, 0.5, 0.02);
+        CheckNear("rest velocity", body.velocity.y, 0.0, 0.05);
+        Check("rest contact kept", world.ContactCount() >= 1);
+        // 再走 60 步不能漂移（静止物体不该慢慢滑走）。
+        double yBefore = body.position.y;
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckNear("rest no drift", body.position.y, yBefore, 0.01);
+    }
+
+    /* ---------- 动量守恒：内力成对施加，总动量不变 ---------- */
+    private static void TestMomentumConservation() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = Vec3.Zero;
+        world.restitutionThreshold = 0.0;
+        RigidBody a = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(-3.0, 0.0, 0.0), 1.0));
+        RigidBody b = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(3.0, 0.0, 0.0), 1.0));
+        a.velocity = new Vec3(5.0, 0.0, 0.0);
+        b.velocity = new Vec3(-5.0, 0.0, 0.0);
+        a.restitution = 1.0;
+        b.restitution = 1.0;
+
+        double momentumBefore = a.mass * a.velocity.x + b.mass * b.velocity.x;
+        for (int i = 0; i < 120; i = i + 1) { world.Step(1.0 / 60.0); }
+        double momentumAfter = a.mass * a.velocity.x + b.mass * b.velocity.x;
+        CheckNear("momentum conserved", momentumAfter, momentumBefore, 0.0001);
+        // 弹性碰撞：等质量对撞 → 各自反向，速度大小不变。
+        CheckNear("elastic a velocity", a.velocity.x, -5.0, 0.05);
+        CheckNear("elastic b velocity", b.velocity.x, 5.0, 0.05);
+    }
+
+    /* ---------- 能量：非弹性碰撞不产生能量 ---------- */
+    private static void TestEnergyNotIncrease() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = Vec3.Zero;
+        world.restitutionThreshold = 0.0;
+        RigidBody a = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(-3.0, 0.0, 0.0), 1.0));
+        RigidBody b = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(3.0, 0.0, 0.0), 1.0));
+        a.velocity = new Vec3(5.0, 0.0, 0.0);
+        b.velocity = new Vec3(-5.0, 0.0, 0.0);
+
+        double energyBefore = 0.5 * a.mass * a.velocity.x * a.velocity.x
+            + 0.5 * b.mass * b.velocity.x * b.velocity.x;
+        for (int i = 0; i < 120; i = i + 1) { world.Step(1.0 / 60.0); }
+        double energyAfter = 0.5 * a.mass * a.velocity.x * a.velocity.x
+            + 0.5 * b.mass * b.velocity.x * b.velocity.x;
+        Check("energy not increased", energyAfter <= energyBefore + 0.000001);
+        Check("energy dissipated", energyAfter < energyBefore * 0.5);
+    }
+
+    /* ---------- 弹性：反弹高度约为落下高度的四分之一 ---------- */
+    private static void TestRestitution() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        AddGround(world);
+        RigidBody body = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(0.0, 4.0, 0.0), 1.0));
+        body.restitution = 0.5;
+        double apex = 0.0;
+        bool bounced = false;
+        for (int i = 0; i < 300; i = i + 1) {
+            world.Step(1.0 / 60.0);
+            // 反弹顶点只在"已经弹起来之后"统计：下落途中的 4.0 不是弹跳高度。
+            if (body.velocity.y > 0.1) { bounced = true; }
+            if (bounced && body.position.y > apex) { apex = body.position.y; }
+        }
+        Check("bounced", bounced);
+        // 反弹顶点 = 落地高度 + e²·(落下高度 - 落地高度)
+        CheckNear("restitution apex", apex, 0.5 + 0.25 * 3.5, 0.15);
+    }
+
+    /* ---------- 偏心碰撞产生角速度 ---------- */
+    private static void TestEccentricAngularVelocity() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = Vec3.Zero;
+        RigidBody box = world.AddBody(
+            RigidBody.Dynamic(BoxShape.FromSize(2.0, 2.0, 2.0), new Vec3(0.0, 0.0, 0.0), 1.0));
+        RigidBody ball = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(-3.0, 0.6, 0.0), 1.0));
+        ball.velocity = new Vec3(8.0, 0.0, 0.0);
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        // 撞击点在盒中心上方 → 力矩绕 z 轴 → 盒获得 z 方向角速度。
+        Check("eccentric spin", Math.Abs(box.angularVelocity.z) > 0.01);
+        // 偏心矩的符号：力沿 +x、作用点在 +y → 角速度沿 -z。
+        Check("eccentric spin sign", box.angularVelocity.z < 0.0);
+    }
+
+    /* ---------- 摩擦：滑动的盒子被地面刹住 ---------- */
+    private static void TestFriction() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        RigidBody ground = AddGround(world);
+        ground.friction = 0.5;
+        RigidBody box = world.AddBody(
+            RigidBody.Dynamic(BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(0.0, 0.5, 0.0), 1.0));
+        box.friction = 0.5;
+        box.velocity = new Vec3(5.0, 0.0, 0.0);
+        for (int i = 0; i < 120; i = i + 1) { world.Step(1.0 / 60.0); }
+        // 摩擦加速度 ≈ μ·g = 5 m/s²，5 m/s 大约 1 秒停住。
+        CheckNear("friction stops box", box.velocity.x, 0.0, 0.05);
+        // 滑行距离 = v²/(2μg) = 25/10 = 2.5（多一步就少一点）。
+        CheckNear("friction slide distance", box.position.x, 2.45, 0.15);
+        // 滑动摩擦在质心下方会产生"掀翻"力矩；多接触点让法向冲量在面上重新
+        // 分布来抵抗它——盒子不该歪。
+        CheckNear("friction no tip", box.angularVelocity.z, 0.0, 0.01);
+        CheckNear("friction stays on ground", box.position.y, 0.5, 0.01);
+    }
+
+    /* ---------- 堆叠：三个盒摞起来不塌不歪 ---------- */
+    private static void TestStack() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        AddGround(world);
+        RigidBody b1 = world.AddBody(
+            RigidBody.Dynamic(BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(0.0, 0.5, 0.0), 1.0));
+        RigidBody b2 = world.AddBody(
+            RigidBody.Dynamic(BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(0.0, 1.5, 0.0), 1.0));
+        RigidBody b3 = world.AddBody(
+            RigidBody.Dynamic(BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(0.0, 2.5, 0.0), 1.0));
+        for (int i = 0; i < 300; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckNear("stack bottom height", b1.position.y, 0.5, 0.02);
+        CheckNear("stack middle height", b2.position.y, 1.5, 0.02);
+        CheckNear("stack top height", b3.position.y, 2.5, 0.02);
+        CheckNear("stack no lateral drift", b3.position.x, 0.0, 0.02);
+        CheckNear("stack no spin", b2.angularVelocity.z, 0.0, 0.01);
+    }
+
+    /* ---------- 静态体不被推动 ---------- */
+    private static void TestStaticBodyFixed() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        RigidBody ground = AddGround(world);
+        Vec3 before = ground.position;
+        for (int i = 0; i < 60; i = i + 1) { world.Step(1.0 / 60.0); }
+        CheckVecNear("static body fixed", ground.position, before, 0.000001);
+        CheckNear("static body no velocity", ground.velocity.Length(), 0.0, 0.000001);
+    }
+
+    /* ---------- 推测接触：高速物体不穿墙 ---------- */
+    private static void TestNoTunneling() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = Vec3.Zero;
+        // 墙薄：半长 0.25。推测距离要盖住一个子步的位移，否则会穿过去。
+        world.speculativeMargin = 0.1;
+        world.substepCount = 10;
+        world.AddBody(RigidBody.Static(
+            BoxShape.FromSize(0.5, 10.0, 10.0), new Vec3(0.0, 0.0, 0.0)));
+        RigidBody ball = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(-5.0, 0.0, 0.0), 1.0));
+        ball.velocity = new Vec3(30.0, 0.0, 0.0);
+        for (int i = 0; i < 120; i = i + 1) { world.Step(1.0 / 60.0); }
+        // 球停在墙的近侧（墙的近侧面在 x = -0.25，球心停在 -0.75 附近）。
+        Check("no tunneling", ball.position.x < 0.0);
+    }
+
+    /* ---------- 确定性：同一初始条件必然同一结果 ---------- */
+    private static void TestDeterminism() {
+        PhysicsWorld w1 = new PhysicsWorld();
+        PhysicsWorld w2 = new PhysicsWorld();
+        for (int w = 0; w < 2; w = w + 1) {
+            PhysicsWorld world = w == 0 ? w1 : w2;
+            world.gravity = new Vec3(0.0, -10.0, 0.0);
+            AddGround(world);
+            RigidBody ball = world.AddBody(
+                RigidBody.Dynamic(new SphereShape(0.5), new Vec3(0.3, 3.0, 0.0), 1.0));
+            ball.velocity = new Vec3(1.0, 0.0, 0.5);
+            ball.restitution = 0.3;
+            RigidBody box = world.AddBody(
+                RigidBody.Dynamic(BoxShape.FromSize(1.0, 1.0, 1.0), new Vec3(2.0, 1.0, 0.0), 1.0));
+            for (int i = 0; i < 200; i = i + 1) { world.Step(1.0 / 60.0); }
+        }
+        CheckVecNear("determinism ball", w1.bodies[1].position, w2.bodies[1].position, 0.000000000001);
+        CheckVecNear("determinism box", w1.bodies[2].position, w2.bodies[2].position, 0.000000000001);
+        CheckVecNear("determinism velocity", w1.bodies[1].velocity, w2.bodies[1].velocity, 0.000000000001);
+    }
+
+    /* ---------- 移除刚体连带清掉它的接触 ---------- */
+    private static void TestRemoveBody() {
+        PhysicsWorld world = new PhysicsWorld();
+        world.gravity = new Vec3(0.0, -10.0, 0.0);
+        RigidBody ground = AddGround(world);
+        RigidBody ball = world.AddBody(
+            RigidBody.Dynamic(new SphereShape(0.5), new Vec3(0.0, 0.6, 0.0), 1.0));
+        for (int i = 0; i < 10; i = i + 1) { world.Step(1.0 / 60.0); }
+        Check("contact before removal", world.ContactCount() >= 1);
+        Check("body removed", world.RemoveBody(ball));
+        Check("contact pruned", world.ContactCount() == 0);
+        Check("missing body not removable", !world.RemoveBody(ball));
+        Check("ground still there", world.bodies.Count == 1);
+    }
+
+    public static void Main() {
+        TestVectorAlgebra();
+        TestQuaternion();
+        TestAabb();
+        TestSphereSphere();
+        TestSphereBox();
+        TestBoxBox();
+        TestFreeFall();
+        TestRestOnGround();
+        TestMomentumConservation();
+        TestEnergyNotIncrease();
+        TestRestitution();
+        TestEccentricAngularVelocity();
+        TestFriction();
+        TestStack();
+        TestStaticBodyFixed();
+        TestNoTunneling();
+        TestDeterminism();
+        TestRemoveBody();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL PHYSICS3D TESTS PASSED");
+        } else {
+            Console.WriteLine("PHYSICS3D FAILURES: " + failures.ToString());
+        }
+    }
+}

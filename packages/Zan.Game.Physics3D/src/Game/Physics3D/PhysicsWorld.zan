@@ -1,0 +1,488 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Physics3D;
+
+// 物理世界：刚体集合 + 宽相 + 窄相 + 顺序冲量求解器。
+//
+// 一个步（Step）内部：
+//   1. 速度积分（重力、外力、阻尼）
+//   2. 宽相 → 窄相 → 接触流形（带推测距离）
+//   3. 接触预备（有效质量、力臂、目标法线速度、两个切向）
+//   4. 热启动（复用上一步的冲量）
+//   5. 速度迭代（法线 + 库仑摩擦，两个切向）
+//   6. 位置积分（位置 + 姿态）
+//   7. 位置迭代（分离冲量修正穿透，不注入能量）
+//   8. 清空外力
+//
+// **确定性**：接触顺序、迭代次数全部固定，没有随机数——同一初始条件 + 同一
+// 操作序列必然得到同一结果（回放 / 锁步的前提）。宽相的排序是插入排序，
+// 顺序稳定。
+public class PhysicsWorld {
+    // 刚体（加入顺序即遍历顺序）。
+    public List<RigidBody> bodies;
+    // 当前接触（常驻对象，热启动的冲量留在里面）。
+    //
+    // 暴露出来是为了诊断：看某个接触累积了多少法线/切线冲量、分离量是多少，
+    // 比从头猜求解器行为快得多。**只读**：改里面的字段不会影响求解器状态。
+    public List<Contact> contacts;
+    // 重力加速度。
+    public Vec3 gravity;
+    // 速度迭代次数。
+    public int velocityIterations;
+    // 位置迭代次数。
+    public int positionIterations;
+    // 子步数（每步再切几段，数值更稳）。
+    public int substepCount;
+    // 允许的穿透容差（小于它不修正，避免抖动）。
+    public double linearSlop;
+    // 穿透修正比例（Baumgarte）。
+    public double baumgarte;
+    // 推测距离：分离量在这个范围内也建接触，高速物体因此不被穿透。
+    public double speculativeMargin;
+    // 弹性触发的接近速度阈值。
+    public double restitutionThreshold;
+
+    private int nextBodyId;
+    private Dictionary<long, int> contactIndex;
+    private List<Aabb> aabbs;
+    private List<int> order;
+    private int stepCounter;
+
+    public PhysicsWorld() {
+        this.bodies = new List<RigidBody>();
+        this.gravity = new Vec3(0.0, -10.0, 0.0);
+        this.velocityIterations = 8;
+        this.positionIterations = 3;
+        this.substepCount = 1;
+        this.linearSlop = 0.005;
+        this.baumgarte = 0.2;
+        this.speculativeMargin = 0.02;
+        this.restitutionThreshold = 1.0;
+        this.nextBodyId = 1;
+        this.contacts = new List<Contact>();
+        this.contactIndex = new Dictionary<long, int>();
+        this.aabbs = new List<Aabb>();
+        this.order = new List<int>();
+        this.stepCounter = 0;
+    }
+
+    // 加入刚体（分配 id）。
+    public RigidBody AddBody(RigidBody body) {
+        body.id = this.nextBodyId;
+        this.nextBodyId = this.nextBodyId + 1;
+        this.bodies.Add(body);
+        this.aabbs.Add(body.ComputeAabb());
+        this.order.Add(this.bodies.Count - 1);
+        return body;
+    }
+
+    // 移除刚体（连同它的接触）。
+    public bool RemoveBody(RigidBody body) {
+        int index = -1;
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            if (this.bodies[i] == body) {
+                index = i;
+                break;
+            }
+        }
+        if (index < 0) { return false; }
+        this.bodies.RemoveAt(index);
+        this.aabbs.RemoveAt(index);
+        // order 里存的是刚体下标，删掉一个之后后面的都要前移。
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            int slot = this.order[i];
+            if (slot == index) {
+                this.order.RemoveAt(i);
+                i = i - 1;
+            } else if (slot > index) {
+                this.order[i] = slot - 1;
+            }
+        }
+        this.PruneContactsOf(body);
+        return true;
+    }
+
+    // 当前接触对数（诊断用）。
+    public int ContactCount() {
+        return this.contacts.Count;
+    }
+
+    // 推进一个时间步（秒）。
+    public void Step(double dt) {
+        if (dt <= 0.0) { return; }
+        int substeps = this.substepCount < 1 ? 1 : this.substepCount;
+        double h = dt / (double)substeps;
+        for (int s = 0; s < substeps; s = s + 1) {
+            this.StepOnce(h);
+        }
+    }
+
+    private void StepOnce(double h) {
+        this.IntegrateVelocities(h);
+        this.UpdateContacts();
+        for (int i = 0; i < this.contacts.Count; i = i + 1) {
+            this.PrepareContact(this.contacts[i], h);
+        }
+        this.WarmStart();
+        for (int i = 0; i < this.velocityIterations; i = i + 1) {
+            for (int j = 0; j < this.contacts.Count; j = j + 1) {
+                this.SolveContactVelocity(this.contacts[j]);
+            }
+        }
+        this.IntegratePositions(h);
+        for (int i = 0; i < this.positionIterations; i = i + 1) {
+            for (int j = 0; j < this.contacts.Count; j = j + 1) {
+                this.SolveContactPosition(this.contacts[j], h);
+            }
+            this.ApplyPseudoPositions(h);
+        }
+        this.ClearForces();
+    }
+
+    // 速度积分：重力 + 外力 + 阻尼。
+    private void IntegrateVelocities(double h) {
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            RigidBody body = this.bodies[i];
+            if (body.isStatic) { continue; }
+            Vec3 accel = this.gravity + body.force * body.invMass;
+            body.velocity = body.velocity + accel * h;
+            if (body.linearDamping > 0.0) {
+                body.velocity = body.velocity * (1.0 / (1.0 + h * body.linearDamping));
+            }
+            body.angularVelocity = body.angularVelocity
+                + body.ApplyInvInertia(body.torque) * h;
+            if (body.angularDamping > 0.0) {
+                body.angularVelocity = body.angularVelocity
+                    * (1.0 / (1.0 + h * body.angularDamping));
+            }
+            body.pseudoVelocity = Vec3.Zero;
+            body.pseudoAngularVelocity = Vec3.Zero;
+        }
+    }
+
+    // 位置积分（真实速度）。
+    private void IntegratePositions(double h) {
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            RigidBody body = this.bodies[i];
+            if (body.isStatic) { continue; }
+            body.position = body.position + body.velocity * h;
+            body.IntegrateOrientation(h);
+        }
+    }
+
+    // 位置积分（伪速度：只用于穿透修正，不进入真实速度）。
+    private void ApplyPseudoPositions(double h) {
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            RigidBody body = this.bodies[i];
+            if (body.isStatic) { continue; }
+            body.position = body.position + body.pseudoVelocity * h;
+            // 伪角速度也走四元数积分（用临时角速度，不动真实姿态）。
+            Vec3 w = body.pseudoAngularVelocity;
+            Quat spin = new Quat(w.x * 0.5 * h, w.y * 0.5 * h, w.z * 0.5 * h, 0.0);
+            body.orientation = (spin * body.orientation).Normalized();
+        }
+    }
+
+    // 清空外力。
+    private void ClearForces() {
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            RigidBody body = this.bodies[i];
+            body.force = Vec3.Zero;
+            body.torque = Vec3.Zero;
+        }
+    }
+
+    // 宽相 + 窄相：更新接触流形。
+    private void UpdateContacts() {
+        this.stepCounter = this.stepCounter + 1;
+        for (int i = 0; i < this.bodies.Count; i = i + 1) {
+            this.aabbs[i] = this.bodies[i].ComputeAabb();
+        }
+        this.SortOrder();
+        for (int i = 0; i < this.contacts.Count; i = i + 1) {
+            this.contacts[i].stamp = 0;
+        }
+        for (int i = 0; i < this.order.Count; i = i + 1) {
+            int ia = this.order[i];
+            for (int j = i + 1; j < this.order.Count; j = j + 1) {
+                int ib = this.order[j];
+                // order 按 minX 排序：一旦后来的盒子起点越过了当前盒子的
+                // 右边界，后面所有盒子也不可能相交。
+                if (this.aabbs[ib].minX > this.aabbs[ia].maxX) { break; }
+                if (!this.aabbs[ia].Overlaps(this.aabbs[ib])) { continue; }
+                RigidBody bodyA = this.bodies[ia];
+                RigidBody bodyB = this.bodies[ib];
+                if (bodyA.isStatic && bodyB.isStatic) { continue; }
+                // **规范化对序**：接触键是 (idA, idB)，若这一帧 SAP 顺序把两个
+                // 刚体排反了，同一对就会建出两个接触对象（法线方向还相反）。
+                // 统一按 id 从小到大排，法线也因此恒定"低 id → 高 id"。
+                if (bodyA.id > bodyB.id) {
+                    RigidBody swap = bodyA;
+                    bodyA = bodyB;
+                    bodyB = swap;
+                }
+                Manifold manifold = Collision.Collide(
+                    bodyA.shape, bodyA.position, bodyA.orientation,
+                    bodyB.shape, bodyB.position, bodyB.orientation,
+                    this.speculativeMargin
+                );
+                if (manifold.pointCount == 0) { continue; }
+                Contact contact = this.FindOrCreateContact(bodyA, bodyB);
+                Manifold previous = contact.manifold;
+                contact.manifold = manifold;
+                contact.UpdateMaterial();
+                contact.AdoptImpulses(previous);
+                contact.stamp = this.stepCounter;
+            }
+        }
+        this.PruneStaleContacts();
+    }
+
+    // 按 minX 给刚体排序（插入排序：上一帧的顺序几乎就是排好的，
+    // 每帧只有小幅移动，接近 O(n)）。
+    private void SortOrder() {
+        for (int i = 1; i < this.order.Count; i = i + 1) {
+            int index = this.order[i];
+            double key = this.aabbs[index].minX;
+            int j = i - 1;
+            while (j >= 0 && this.aabbs[this.order[j]].minX > key) {
+                this.order[j + 1] = this.order[j];
+                j = j - 1;
+            }
+            this.order[j + 1] = index;
+        }
+    }
+
+    // 找到或创建一对刚体之间的接触。
+    private Contact FindOrCreateContact(RigidBody bodyA, RigidBody bodyB) {
+        long key = PhysicsWorld.ContactKey(bodyA.id, bodyB.id);
+        int index;
+        if (this.contactIndex.TryGetValue(key, out index)) {
+            return this.contacts[index];
+        }
+        Contact contact = new Contact(bodyA, bodyB);
+        this.contacts.Add(contact);
+        this.contactIndex[key] = this.contacts.Count - 1;
+        return contact;
+    }
+
+    // 清掉这一步没碰到的接触（分离了）。
+    private void PruneStaleContacts() {
+        bool removed = false;
+        for (int i = this.contacts.Count - 1; i >= 0; i = i - 1) {
+            if (this.contacts[i].stamp == this.stepCounter) { continue; }
+            this.contacts.RemoveAt(i);
+            removed = true;
+        }
+        if (!removed) { return; }
+        this.contactIndex.Clear();
+        for (int j = 0; j < this.contacts.Count; j = j + 1) {
+            long key = PhysicsWorld.ContactKey(this.contacts[j].bodyA.id, this.contacts[j].bodyB.id);
+            this.contactIndex[key] = j;
+        }
+    }
+
+    // 清掉与某个刚体有关的接触。
+    private void PruneContactsOf(RigidBody body) {
+        bool removed = false;
+        for (int i = this.contacts.Count - 1; i >= 0; i = i - 1) {
+            Contact contact = this.contacts[i];
+            if (contact.bodyA != body && contact.bodyB != body) { continue; }
+            this.contacts.RemoveAt(i);
+            removed = true;
+        }
+        if (!removed) { return; }
+        this.contactIndex.Clear();
+        for (int j = 0; j < this.contacts.Count; j = j + 1) {
+            long key = PhysicsWorld.ContactKey(this.contacts[j].bodyA.id, this.contacts[j].bodyB.id);
+            this.contactIndex[key] = j;
+        }
+    }
+
+    // 接触对的键（id 对单调递增，用大基数乘法拼成 long）。
+    private static long ContactKey(int idA, int idB) {
+        return (long)idA * 1000000 + (long)idB;
+    }
+
+    // 接触预备：力臂、有效质量、目标法线速度、两个切向。
+    private void PrepareContact(Contact contact, double h) {
+        Manifold manifold = contact.manifold;
+        Vec3 normal = manifold.normal;
+        Vec3 tangent1;
+        Vec3 tangent2;
+        PhysicsWorld.BuildTangents(normal, out tangent1, out tangent2);
+        for (int i = 0; i < manifold.points.Count; i = i + 1) {
+            ContactPoint point = manifold.points[i];
+            point.r1 = point.position - contact.bodyA.position;
+            point.r2 = point.position - contact.bodyB.position;
+
+            point.normalMass = PhysicsWorld.EffectiveMass(
+                contact.bodyA, point.r1, contact.bodyB, point.r2, normal);
+            point.tangentMass1 = PhysicsWorld.EffectiveMass(
+                contact.bodyA, point.r1, contact.bodyB, point.r2, tangent1);
+            point.tangentMass2 = PhysicsWorld.EffectiveMass(
+                contact.bodyA, point.r1, contact.bodyB, point.r2, tangent2);
+
+            // 目标法线速度：
+            //   - 还差一段距离才碰上（推测接触）→ 接近速度不得超过 gap/h
+            //   - 已经贴上 → 目标是 0；接近速度够快时按弹性系数反弹
+            double target = 0.0;
+            if (point.separation > 0.0) {
+                target = -point.separation / h;
+            } else {
+                Vec3 relative = contact.bodyB.VelocityAt(point.position)
+                    - contact.bodyA.VelocityAt(point.position);
+                double approach = Vec3.Dot(relative, normal);
+                if (approach < -this.restitutionThreshold) {
+                    target = -contact.restitution * approach;
+                }
+            }
+            point.velocityBias = target;
+        }
+    }
+
+    // 沿某方向的有效质量倒数（法线或切线通用）。
+    //
+    // k = 1/mA + 1/mB + (rA×d)·IA⁻¹(rA×d) + (rB×d)·IB⁻¹(rB×d)
+    static double EffectiveMass(RigidBody a, Vec3 rA, RigidBody b, Vec3 rB, Vec3 dir) {
+        double k = a.invMass + b.invMass;
+        Vec3 crossA = Vec3.Cross(rA, dir);
+        Vec3 crossB = Vec3.Cross(rB, dir);
+        k = k + Vec3.Dot(crossA, a.ApplyInvInertia(crossA));
+        k = k + Vec3.Dot(crossB, b.ApplyInvInertia(crossB));
+        return k > 0.0 ? 1.0 / k : 0.0;
+    }
+
+    // 由法线构造两个互相垂直的切向。
+    //
+    // 选**与法线最不平行的坐标轴**来叉：选平行的话叉积为零，切向就没了。
+    static void BuildTangents(Vec3 normal, out Vec3 tangent1, out Vec3 tangent2) {
+        Vec3 axis = Vec3.UnitX;
+        double ax = Math.Abs(normal.x);
+        double ay = Math.Abs(normal.y);
+        double az = Math.Abs(normal.z);
+        if (ay <= ax && ay <= az) { axis = Vec3.UnitY; }
+        else if (az <= ax && az <= ay) { axis = Vec3.UnitZ; }
+        tangent1 = Vec3.Cross(normal, axis).Normalized();
+        tangent2 = Vec3.Cross(normal, tangent1);
+    }
+
+    // 热启动：把上一步累积的冲量先施加一遍。
+    private void WarmStart() {
+        for (int i = 0; i < this.contacts.Count; i = i + 1) {
+            Contact contact = this.contacts[i];
+            Vec3 normal = contact.manifold.normal;
+            Vec3 tangent1;
+            Vec3 tangent2;
+            PhysicsWorld.BuildTangents(normal, out tangent1, out tangent2);
+            for (int j = 0; j < contact.manifold.points.Count; j = j + 1) {
+                ContactPoint point = contact.manifold.points[j];
+                Vec3 impulseVec = normal * point.normalImpulse
+                    + tangent1 * point.tangentImpulse1
+                    + tangent2 * point.tangentImpulse2;
+                contact.bodyA.velocity = contact.bodyA.velocity - impulseVec * contact.bodyA.invMass;
+                contact.bodyA.angularVelocity = contact.bodyA.angularVelocity
+                    - contact.bodyA.ApplyInvInertia(Vec3.Cross(point.r1, impulseVec));
+                contact.bodyB.velocity = contact.bodyB.velocity + impulseVec * contact.bodyB.invMass;
+                contact.bodyB.angularVelocity = contact.bodyB.angularVelocity
+                    + contact.bodyB.ApplyInvInertia(Vec3.Cross(point.r2, impulseVec));
+            }
+        }
+    }
+
+    // 速度迭代：法线约束 + 库仑摩擦（两个切向合成一个摩擦锥）。
+    private void SolveContactVelocity(Contact contact) {
+        Vec3 normal = contact.manifold.normal;
+        Vec3 tangent1;
+        Vec3 tangent2;
+        PhysicsWorld.BuildTangents(normal, out tangent1, out tangent2);
+        for (int i = 0; i < contact.manifold.points.Count; i = i + 1) {
+            ContactPoint point = contact.manifold.points[i];
+
+            // 法线：把相对法线速度拉到目标值。
+            Vec3 relative = contact.bodyB.VelocityAt(point.position)
+                - contact.bodyA.VelocityAt(point.position);
+            double approach = Vec3.Dot(relative, normal);
+            double lambda = point.normalMass * (point.velocityBias - approach);
+            double oldImpulse = point.normalImpulse;
+            point.normalImpulse = oldImpulse + lambda;
+            if (point.normalImpulse < 0.0) { point.normalImpulse = 0.0; }
+            lambda = point.normalImpulse - oldImpulse;
+            this.ApplyImpulse(contact, point, normal * lambda);
+
+            // 摩擦：两个切向各解一次，再把合成的切向冲量夹进摩擦锥。
+            relative = contact.bodyB.VelocityAt(point.position)
+                - contact.bodyA.VelocityAt(point.position);
+            double along1 = Vec3.Dot(relative, tangent1);
+            double lambdaT1 = -point.tangentMass1 * along1;
+            double oldT1 = point.tangentImpulse1;
+            point.tangentImpulse1 = oldT1 + lambdaT1;
+
+            relative = contact.bodyB.VelocityAt(point.position)
+                - contact.bodyA.VelocityAt(point.position);
+            double along2 = Vec3.Dot(relative, tangent2);
+            double lambdaT2 = -point.tangentMass2 * along2;
+            double oldT2 = point.tangentImpulse2;
+            point.tangentImpulse2 = oldT2 + lambdaT2;
+
+            // 库仑锥：|λt| ≤ μ·λn（二维切空间里的圆）。
+            double maxFriction = contact.friction * point.normalImpulse;
+            double mag = Math.Sqrt(
+                point.tangentImpulse1 * point.tangentImpulse1
+                + point.tangentImpulse2 * point.tangentImpulse2);
+            if (mag > maxFriction) {
+                if (mag > 0.000000000001) {
+                    double scale = maxFriction / mag;
+                    point.tangentImpulse1 = point.tangentImpulse1 * scale;
+                    point.tangentImpulse2 = point.tangentImpulse2 * scale;
+                } else {
+                    point.tangentImpulse1 = 0.0;
+                    point.tangentImpulse2 = 0.0;
+                }
+            }
+            double deltaT1 = point.tangentImpulse1 - oldT1;
+            double deltaT2 = point.tangentImpulse2 - oldT2;
+            this.ApplyImpulse(contact, point, tangent1 * deltaT1 + tangent2 * deltaT2);
+        }
+    }
+
+    // 位置迭代：分离冲量（伪速度）修正穿透，不给真实速度加能量。
+    private void SolveContactPosition(Contact contact, double h) {
+        Vec3 normal = contact.manifold.normal;
+        for (int i = 0; i < contact.manifold.points.Count; i = i + 1) {
+            ContactPoint point = contact.manifold.points[i];
+            double error = point.separation;
+            if (error > -this.linearSlop) { continue; }
+            Vec3 relative = contact.bodyB.PseudoVelocityAt(point.position)
+                - contact.bodyA.PseudoVelocityAt(point.position);
+            double separating = Vec3.Dot(relative, normal);
+            // 目标分离速度：按 baumgarte 系数把穿透摊掉。
+            double target = -this.baumgarte * (error + this.linearSlop) / h;
+            double lambda = point.normalMass * (target - separating);
+            double oldImpulse = point.positionImpulse;
+            point.positionImpulse = oldImpulse + lambda;
+            if (point.positionImpulse < 0.0) { point.positionImpulse = 0.0; }
+            lambda = point.positionImpulse - oldImpulse;
+            Vec3 impulseVec = normal * lambda;
+            contact.bodyA.pseudoVelocity = contact.bodyA.pseudoVelocity
+                - impulseVec * contact.bodyA.invMass;
+            contact.bodyA.pseudoAngularVelocity = contact.bodyA.pseudoAngularVelocity
+                - contact.bodyA.ApplyInvInertia(Vec3.Cross(point.r1, impulseVec));
+            contact.bodyB.pseudoVelocity = contact.bodyB.pseudoVelocity
+                + impulseVec * contact.bodyB.invMass;
+            contact.bodyB.pseudoAngularVelocity = contact.bodyB.pseudoAngularVelocity
+                + contact.bodyB.ApplyInvInertia(Vec3.Cross(point.r2, impulseVec));
+        }
+    }
+
+    // 给一对刚体施加接触冲量。
+    private void ApplyImpulse(Contact contact, ContactPoint point, Vec3 impulseVec) {
+        contact.bodyA.velocity = contact.bodyA.velocity - impulseVec * contact.bodyA.invMass;
+        contact.bodyA.angularVelocity = contact.bodyA.angularVelocity
+            - contact.bodyA.ApplyInvInertia(Vec3.Cross(point.r1, impulseVec));
+        contact.bodyB.velocity = contact.bodyB.velocity + impulseVec * contact.bodyB.invMass;
+        contact.bodyB.angularVelocity = contact.bodyB.angularVelocity
+            + contact.bodyB.ApplyInvInertia(Vec3.Cross(point.r2, impulseVec));
+    }
+}

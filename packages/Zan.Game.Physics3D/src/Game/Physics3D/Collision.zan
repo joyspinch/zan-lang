@@ -1,0 +1,416 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Physics3D;
+
+// 窄相：两个形状的精确相交判定，产出接触流形。
+//
+// **v1 支持三种配对**：球-球、球-盒、盒-盒（SAT）。
+//
+// **盒-盒走完整的 SAT + 面裁剪**：最小穿透轴若是某个盒的面法线，就拿这个面
+// 当"参考面"，把另一个盒朝向它的那一面（入射面）裁剪到参考面范围内，最多
+// 得到 4 个接触点；最小穿透轴若是边-边轴，就取两条边的最近点。
+//
+// **为什么盒-盒必须是多接触点**：单点接触下，滑动摩擦作用在质心下方，会
+// 产生一个"把盒子掀翻"的力矩，而单点的法向冲量没法在面内重新分配来抵抗
+// 它——盒子会越滑越歪，最后沉进地里。多点接触让法向冲量在面上重新分布，
+// 抵消倾覆力矩，盒子才能平地跑（这正是 Box2D / Bullet 稳定堆叠的机制）。
+//
+// **法线方向**：流形的法线永远从 A 指向 B。求解器只认这一个方向，所以
+// "球-盒"与"盒-球"要算两遍（第二次把法线翻过来），不能只算一次。
+public class Collision {
+    // 窄相主入口：算两个形状的接触流形（不相交时 pointCount = 0）。
+    public static Manifold Collide(Shape shapeA, Vec3 posA, Quat rotA,
+                                    Shape shapeB, Vec3 posB, Quat rotB,
+                                    double margin) {
+        Manifold manifold = new Manifold();
+
+        if (shapeA is SphereShape && shapeB is SphereShape) {
+            return Collision.CollideSphereSphere(
+                shapeA as SphereShape, posA, shapeB as SphereShape, posB, margin);
+        }
+
+        if (shapeA is SphereShape && shapeB is BoxShape) {
+            return Collision.CollideSphereBox(
+                shapeA as SphereShape, posA, shapeB as BoxShape, posB, rotB, margin, false);
+        }
+
+        if (shapeA is BoxShape && shapeB is SphereShape) {
+            return Collision.CollideSphereBox(
+                shapeB as SphereShape, posB, shapeA as BoxShape, posA, rotA, margin, true);
+        }
+
+        if (shapeA is BoxShape && shapeB is BoxShape) {
+            return Collision.CollideBoxBox(
+                shapeA as BoxShape, posA, rotA, shapeB as BoxShape, posB, rotB, margin);
+        }
+
+        return manifold;
+    }
+
+    // 球-球。
+    static Manifold CollideSphereSphere(SphereShape a, Vec3 posA,
+                                        SphereShape b, Vec3 posB, double margin) {
+        Manifold manifold = new Manifold();
+        Vec3 delta = posB - posA;
+        double dist = delta.Length();
+        double radiusSum = a.radius + b.radius;
+        if (dist > radiusSum + margin) { return manifold; }
+
+        Vec3 normal;
+        if (dist > 0.0000001) {
+            normal = delta / dist;
+        } else {
+            // 完全同心：法线取一个确定的方向（不能随机，否则不可复现）。
+            normal = new Vec3(0.0, 1.0, 0.0);
+        }
+        manifold.normal = normal;
+        // 接触点取 A 表面上离 B 最近的那一点。
+        manifold.AddPoint(posA + normal * a.radius, dist - radiusSum);
+        return manifold;
+    }
+
+    // 球-盒。
+    //
+    // `flip` = true 时 A 是盒、B 是球（法线要反过来）。
+    static Manifold CollideSphereBox(SphereShape sphere, Vec3 spherePos,
+                                     BoxShape box, Vec3 boxPos, Quat boxRot,
+                                     double margin, bool flip) {
+        Manifold manifold = new Manifold();
+
+        // 球心换到盒的局部坐标。
+        Vec3 local = boxRot.RotateInverse(spherePos - boxPos);
+        Vec3 closest = new Vec3(
+            Collision.Clamp(local.x, -box.halfX, box.halfX),
+            Collision.Clamp(local.y, -box.halfY, box.halfY),
+            Collision.Clamp(local.z, -box.halfZ, box.halfZ)
+        );
+        Vec3 delta = local - closest;
+        double dist = delta.Length();
+
+        // outward：盒表面指向球心的方向（局部系）。
+        Vec3 outwardLocal;
+        double separation;
+        bool inside = false;
+        if (dist > 0.0000001) {
+            if (dist > sphere.radius + margin) { return manifold; }
+            outwardLocal = delta / dist;
+            separation = dist - sphere.radius;
+        } else {
+            // 球心在盒内部：找最近的面，穿透深度按"到该面的距离 + 半径"算。
+            inside = true;
+            double dx = box.halfX - Math.Abs(local.x);
+            double dy = box.halfY - Math.Abs(local.y);
+            double dz = box.halfZ - Math.Abs(local.z);
+            if (dx <= dy && dx <= dz) {
+                outwardLocal = new Vec3(local.x >= 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+                separation = -(dx + sphere.radius);
+            } else if (dy <= dz) {
+                outwardLocal = new Vec3(0.0, local.y >= 0.0 ? 1.0 : -1.0, 0.0);
+                separation = -(dy + sphere.radius);
+            } else {
+                outwardLocal = new Vec3(0.0, 0.0, local.z >= 0.0 ? 1.0 : -1.0);
+                separation = -(dz + sphere.radius);
+            }
+        }
+
+        Vec3 outward = boxRot.Rotate(outwardLocal);
+        // 接触点：盒面上的最近点（球心在盒内时取盒面，否则取球面）。
+        Vec3 point;
+        if (inside) {
+            point = boxPos + boxRot.Rotate(closest);
+        } else {
+            point = spherePos + outward * (sphere.radius * -1.0);
+        }
+
+        // 法线从 A 指向 B：A 是球时取 -outward（盒指向球），A 是盒时取 outward。
+        if (flip) {
+            manifold.normal = outward;
+        } else {
+            manifold.normal = outward * -1.0;
+        }
+        manifold.AddPoint(point, separation);
+        return manifold;
+    }
+
+    // 盒-盒（SAT + 面裁剪）。
+    static Manifold CollideBoxBox(BoxShape a, Vec3 posA, Quat rotA,
+                                   BoxShape b, Vec3 posB, Quat rotB,
+                                   double margin) {
+        Manifold manifold = new Manifold();
+        Vec3 centerDelta = posB - posA;
+
+        // ---- 找最小穿透轴 ----
+        // 候选：6 个面法线（A 的 3 个 + B 的 3 个）+ 9 个边×边。
+        double bestOverlap = 0.0;
+        Vec3 bestNormal = Vec3.Zero;
+        // 0 = A 的面，1 = B 的面，2 = 边-边。
+        int bestKind = 0;
+        int bestAxis = 0;
+        int bestEdgeA = 0;
+        int bestEdgeB = 0;
+        bool found = false;
+
+        for (int side = 0; side < 2; side = side + 1) {
+            for (int i = 0; i < 3; i = i + 1) {
+                Vec3 axis = side == 0
+                    ? Collision.BoxAxis(rotA, i)
+                    : Collision.BoxAxis(rotB, i);
+                Vec3 oriented = axis;
+                // 统一方向：法线从 A 指向 B。
+                if (Vec3.Dot(oriented, centerDelta) < 0.0) { oriented = oriented * -1.0; }
+
+                double minA; double maxA; double minB; double maxB;
+                Collision.ProjectBox(a, posA, rotA, oriented, out minA, out maxA);
+                Collision.ProjectBox(b, posB, rotB, oriented, out minB, out maxB);
+                double overlap = (maxA < maxB ? maxA : maxB) - (minA > minB ? minA : minB);
+                if (overlap < -margin) { return manifold; }   // 沿这条轴分开了
+                if (!found || overlap < bestOverlap) {
+                    found = true;
+                    bestOverlap = overlap;
+                    bestNormal = oriented;
+                    bestKind = side;
+                    bestAxis = i;
+                }
+            }
+        }
+
+        for (int i = 0; i < 3; i = i + 1) {
+            for (int j = 0; j < 3; j = j + 1) {
+                Vec3 axis = Vec3.Cross(Collision.BoxAxis(rotA, i), Collision.BoxAxis(rotB, j));
+                if (axis.LengthSquared() <= 0.0000001) { continue; }  // 平行边 → 退化轴
+                Vec3 oriented = axis.Normalized();
+                if (Vec3.Dot(oriented, centerDelta) < 0.0) { oriented = oriented * -1.0; }
+
+                double minA; double maxA; double minB; double maxB;
+                Collision.ProjectBox(a, posA, rotA, oriented, out minA, out maxA);
+                Collision.ProjectBox(b, posB, rotB, oriented, out minB, out maxB);
+                double overlap = (maxA < maxB ? maxA : maxB) - (minA > minB ? minA : minB);
+                if (overlap < -margin) { return manifold; }
+                if (!found || overlap < bestOverlap) {
+                    found = true;
+                    bestOverlap = overlap;
+                    bestNormal = oriented;
+                    bestKind = 2;
+                    bestEdgeA = i;
+                    bestEdgeB = j;
+                }
+            }
+        }
+
+        if (!found) { return manifold; }
+        manifold.normal = bestNormal;
+
+        if (bestKind == 2) {
+            // ---- 边-边：取两条边的最近点 ----
+            Vec3 aDir = Collision.BoxAxis(rotA, bestEdgeA);
+            Vec3 bDir = Collision.BoxAxis(rotB, bestEdgeB);
+            Vec3 aEdge = Collision.EdgeCenter(a, posA, rotA, bestEdgeA, centerDelta);
+            Vec3 bEdge = Collision.EdgeCenter(b, posB, rotB, bestEdgeB, centerDelta * -1.0);
+            double aHalf = Collision.BoxHalf(a, bestEdgeA);
+            double bHalf = Collision.BoxHalf(b, bestEdgeB);
+            Vec3 c1;
+            Vec3 c2;
+            Collision.ClosestPointsSegments(
+                aEdge - aDir * aHalf, aEdge + aDir * aHalf,
+                bEdge - bDir * bHalf, bEdge + bDir * bHalf,
+                out c1, out c2);
+            manifold.AddPoint((c1 + c2) * 0.5, -bestOverlap);
+            return manifold;
+        }
+
+        // ---- 面-面：参考面 + 入射面裁剪 ----
+        bool refIsA = bestKind == 0;
+        BoxShape refBox = refIsA ? a : b;
+        Vec3 refPos = refIsA ? posA : posB;
+        Quat refRot = refIsA ? rotA : rotB;
+        BoxShape incBox = refIsA ? b : a;
+        Vec3 incPos = refIsA ? posB : posA;
+        Quat incRot = refIsA ? rotB : rotA;
+
+        // 参考面的外法线（朝盒外）：参考盒是 A 时朝 B，是 B 时朝 A。
+        Vec3 refFaceNormal = refIsA ? bestNormal : bestNormal * -1.0;
+        int refAxis = bestAxis;
+        double refHalf = Collision.BoxHalf(refBox, refAxis);
+        Vec3 refFaceCenter = refPos + refFaceNormal * refHalf;
+
+        // 参考面的两条切向轴（另外两个局部轴）。
+        int t1 = (refAxis + 1) % 3;
+        int t2 = (refAxis + 2) % 3;
+        Vec3 tan1 = Collision.BoxAxis(refRot, t1);
+        Vec3 tan2 = Collision.BoxAxis(refRot, t2);
+        double tanHalf1 = Collision.BoxHalf(refBox, t1);
+        double tanHalf2 = Collision.BoxHalf(refBox, t2);
+
+        // 入射面：入射盒上最"背对"参考面的那个面（外法线与 refFaceNormal 反向）。
+        //
+        // 每个局部轴有 **两个** 面（外法线 ±u_i），所以要按 |dot| 挑轴，再按
+        // dot 的符号定用哪一面：只按 dot 挑最小值会挑到垂直于参考面的轴上去，
+        // 裁出来的入射面就错了（表现为"重叠的两个盒只有一个接触点"）。
+        int incAxis = 0;
+        double incDot = Vec3.Dot(Collision.BoxAxis(incRot, 0), refFaceNormal);
+        double bestAbs = Math.Abs(incDot);
+        for (int i = 1; i < 3; i = i + 1) {
+            double d = Vec3.Dot(Collision.BoxAxis(incRot, i), refFaceNormal);
+            if (Math.Abs(d) > bestAbs) {
+                bestAbs = Math.Abs(d);
+                incDot = d;
+                incAxis = i;
+            }
+        }
+        double incSign = incDot > 0.0 ? -1.0 : 1.0;
+        Vec3 incNormal = Collision.BoxAxis(incRot, incAxis) * incSign;
+
+        int ia1 = (incAxis + 1) % 3;
+        int ia2 = (incAxis + 2) % 3;
+        Vec3 it1 = Collision.BoxAxis(incRot, ia1) * Collision.BoxHalf(incBox, ia1);
+        Vec3 it2 = Collision.BoxAxis(incRot, ia2) * Collision.BoxHalf(incBox, ia2);
+        Vec3 incFaceCenter = incPos + incNormal * Collision.BoxHalf(incBox, incAxis);
+
+        List<Vec3> poly = new List<Vec3>();
+        poly.Add(incFaceCenter - it1 - it2);
+        poly.Add(incFaceCenter + it1 - it2);
+        poly.Add(incFaceCenter + it1 + it2);
+        poly.Add(incFaceCenter - it1 + it2);
+
+        // 用参考面的 4 个侧面裁剪入射面（Sutherland-Hodgman）。
+        double c1 = Vec3.Dot(refFaceCenter, tan1);
+        double c2 = Vec3.Dot(refFaceCenter, tan2);
+        poly = Collision.ClipHalfSpace(poly, tan1, c1 + tanHalf1);
+        poly = Collision.ClipHalfSpace(poly, tan1 * -1.0, tanHalf1 - c1);
+        poly = Collision.ClipHalfSpace(poly, tan2, c2 + tanHalf2);
+        poly = Collision.ClipHalfSpace(poly, tan2 * -1.0, tanHalf2 - c2);
+
+        for (int i = 0; i < poly.Count; i = i + 1) {
+            Vec3 v = poly[i];
+            // 分离量：相对参考面、沿参考面外法线量。正值 = 还差这么多才碰上。
+            double separation = Vec3.Dot(v - refFaceCenter, refFaceNormal);
+            if (separation > margin) { continue; }
+            manifold.AddPoint(v, separation);
+        }
+
+        if (manifold.pointCount == 0) {
+            // 裁剪后一个点都不剩（入射面完全落在参考面范围外）——退回单点近似，
+            // 不让这一对刚体"穿过"彼此。
+            Vec3 pointA = a.Support(bestNormal, posA, rotA);
+            Vec3 pointB = b.Support(bestNormal * -1.0, posB, rotB);
+            manifold.AddPoint((pointA + pointB) * 0.5, -bestOverlap);
+        }
+        return manifold;
+    }
+
+    // 盒在轴 axis 上的投影区间。
+    static void ProjectBox(BoxShape box, Vec3 center, Quat rot, Vec3 axis,
+                           out double minOut, out double maxOut) {
+        double c = Vec3.Dot(center, axis);
+        Vec3 ex = rot.Rotate(Vec3.UnitX) * box.halfX;
+        Vec3 ey = rot.Rotate(Vec3.UnitY) * box.halfY;
+        Vec3 ez = rot.Rotate(Vec3.UnitZ) * box.halfZ;
+        double r = Math.Abs(Vec3.Dot(ex, axis))
+                 + Math.Abs(Vec3.Dot(ey, axis))
+                 + Math.Abs(Vec3.Dot(ez, axis));
+        minOut = c - r;
+        maxOut = c + r;
+    }
+
+    // 盒的局部轴（世界系）。
+    static Vec3 BoxAxis(Quat rot, int index) {
+        if (index == 0) { return rot.Rotate(Vec3.UnitX); }
+        if (index == 1) { return rot.Rotate(Vec3.UnitY); }
+        return rot.Rotate(Vec3.UnitZ);
+    }
+
+    // 盒在局部轴 index 上的半长。
+    static double BoxHalf(BoxShape box, int index) {
+        if (index == 0) { return box.halfX; }
+        if (index == 1) { return box.halfY; }
+        return box.halfZ;
+    }
+
+    // 盒沿局部轴 index 那条边的中点：边在另外两个轴上，取朝向 `toward` 的那一侧。
+    static Vec3 EdgeCenter(BoxShape box, Vec3 pos, Quat rot, int index, Vec3 toward) {
+        int j = (index + 1) % 3;
+        int k = (index + 2) % 3;
+        Vec3 axJ = Collision.BoxAxis(rot, j);
+        Vec3 axK = Collision.BoxAxis(rot, k);
+        double signJ = Vec3.Dot(axJ, toward) >= 0.0 ? 1.0 : -1.0;
+        double signK = Vec3.Dot(axK, toward) >= 0.0 ? 1.0 : -1.0;
+        return pos + axJ * (signJ * Collision.BoxHalf(box, j))
+                   + axK * (signK * Collision.BoxHalf(box, k));
+    }
+
+    // 用半空间裁剪多边形：保留 dot(p, normal) <= offset 的部分。
+    static List<Vec3> ClipHalfSpace(List<Vec3> poly, Vec3 normal, double offset) {
+        List<Vec3> result = new List<Vec3>();
+        int n = poly.Count;
+        if (n == 0) { return result; }
+        for (int i = 0; i < n; i = i + 1) {
+            Vec3 p = poly[i];
+            Vec3 q = poly[(i + 1) % n];
+            double dp = Vec3.Dot(p, normal) - offset;
+            double dq = Vec3.Dot(q, normal) - offset;
+            bool pIn = dp <= 0.0;
+            bool qIn = dq <= 0.0;
+            if (pIn) { result.Add(p); }
+            if (pIn != qIn) {
+                // 边 p→q 与平面相交：插值出交点。
+                double t = dp / (dp - dq);
+                result.Add(p + (q - p) * t);
+            }
+        }
+        return result;
+    }
+
+    // 两条线段的最近点（Ericson 的算法）。
+    static void ClosestPointsSegments(Vec3 p1, Vec3 q1, Vec3 p2, Vec3 q2,
+                                      out Vec3 closest1, out Vec3 closest2) {
+        Vec3 d1 = q1 - p1;
+        Vec3 d2 = q2 - p2;
+        Vec3 r = p1 - p2;
+        double a = Vec3.Dot(d1, d1);
+        double e = Vec3.Dot(d2, d2);
+        double f = Vec3.Dot(d2, r);
+        double s = 0.0;
+        double t = 0.0;
+        if (a <= 0.000000000001 && e <= 0.000000000001) {
+            closest1 = p1;
+            closest2 = p2;
+            return;
+        }
+        if (a <= 0.000000000001) {
+            s = 0.0;
+            t = Collision.Clamp(f / e, 0.0, 1.0);
+        } else {
+            double c = Vec3.Dot(d1, r);
+            if (e <= 0.000000000001) {
+                t = 0.0;
+                s = Collision.Clamp(-c / a, 0.0, 1.0);
+            } else {
+                double b = Vec3.Dot(d1, d2);
+                double denom = a * e - b * b;
+                if (denom > 0.000000000001) {
+                    s = Collision.Clamp((b * f - c * e) / denom, 0.0, 1.0);
+                } else {
+                    s = 0.0;
+                }
+                t = (b * s + f) / e;
+                if (t < 0.0) {
+                    t = 0.0;
+                    s = Collision.Clamp(-c / a, 0.0, 1.0);
+                } else if (t > 1.0) {
+                    t = 1.0;
+                    s = Collision.Clamp((b - c) / a, 0.0, 1.0);
+                }
+            }
+        }
+        closest1 = p1 + d1 * s;
+        closest2 = p2 + d2 * t;
+    }
+
+    // 夹取到 [lo, hi]。
+    static double Clamp(double value, double lo, double hi) {
+        if (value < lo) { return lo; }
+        if (value > hi) { return hi; }
+        return value;
+    }
+}
