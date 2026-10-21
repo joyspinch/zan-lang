@@ -324,9 +324,14 @@
     钉住输出，并进差分门清单；
   - 宿主与自举对同一份源码的输出**逐字一致**（`true / true / true / xtrue /
     true / false / yfalse / false / false`）；
-  - 差分门子集 PASS；pkg_sweep 62 包全绿；conformance smoke 全绿——现有
-    golden 里没有把 bool 的 `"1"` 固化的用例（`Convert.ToString` 的 230 处
-    调用逐个看过，都是 int/long/标识符一类）。
+  - ⚠ 这条验证**不成立**（2026-10-22 复查）：当时只查了 `Convert.ToString`
+    的 230 处调用，得出"没有 golden 把 bool 固化成 1/0"的结论——**漏了别的
+    取串路径**（`+` 拼接、插值、`Console.WriteLine(bool)`、`Cpu.Has*` 属性、
+    比较表达式）。实际有 123 个 golden 把 bool 记成了 "1"/"0"：宿主改了渲染、
+    golden 没改 → conformance 与差分门一起红。
+  - 修正（2026-10-22）：按**窄判据**全量扫 conformance 目录——跑宿主拿 stdout
+    与 golden 比，只有当差异**恰好**是 0↔false / 1↔true 的替换时才判定为过期
+    并重写；其它差异一律不碰（可能是别人的在途改动）。
 - 教训：**取串路径有"汇合点"**。缺口不在四个调用点，而在它们共同经过的那个
   取串函数——在汇合点加一条分支，比在每个调用点各写一遍可靠，而且以后新增的
   取串路径会自动继承。
