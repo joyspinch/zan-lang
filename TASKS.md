@@ -227,7 +227,7 @@
   `int.Parse` 系列的类型守卫同样**放行 `object`**——`object` 装类实例时，
   这些内建仍会把对象指针当 C 文本去 `strtoll`/`strtod` 解析，静默得到 0。
   与本条同源：object 没有通用 ToString / 值语义就没法正确分流。
-### [ ] A442 自举后端 `Convert.ToString(<引用类型>)` 输出指针地址——与 C 宿主的诊断不一致
+### [x] A442 自举后端 `Convert.ToString(<引用类型>)` 输出指针地址——与 C 宿主的诊断不一致
 
 - 现象（2026-10-20 随 A441 一并查实）：C 宿主已改成对引用类型 fail-closed
   （报 "Convert.ToString: cannot convert 'Box' to a string"），自举后端仍走
@@ -240,7 +240,17 @@
   与宿主一致的诊断；字符串/数值走原有路径。⚠ 与 A441 的 bool 分支、
   A443 的 stdlib 声明是同一处代码，**建议三件事一起做**（都在
   `src/selfhost/irgen_expr.zan` + `src/compiler/irgen_call.c` 两处）。
-- 现状：C 宿主那侧已经修好（提交见 git 历史）；自举侧等窗口。
+- 现状（2026-10-22 已闭账）：自举侧照抄宿主那张**按类型种类**划的白名单——
+  `Convert.ToString` 特判里先按**静态类型**分流：类/结构体/委托/数组报与宿主
+  **逐字一致**的诊断（`cannot convert 'X' to a string -- call .ToString() on the
+  value instead`，位置指向**实参**），文本/数值/枚举/`object`/类型参数走原有
+  路径。实测两侧输出逐字相同（类实例 11:44、委托 8:44、结构体 11:44、数组
+  12:44 一致）。
+- 回归：`tests/selfhost/reject/convert_to_string_{class,struct,array,delegate}.zan`
+  进拒绝用例清单（自举与宿主都拒绝、措辞一致）。
+- 遗留：A443（`Convert.ToString` 仍未进公开面——宿主靠内建特判兜住，标准库里
+  还没有这个声明）、A444（`object` 装类实例时的越界读）仍未闭。
+
 
 ### [ ] A443 `Convert.ToString` 是编译器自造的接口——公开面（stdlib / 内建成员表）里根本没有它
 
@@ -323,7 +333,7 @@
 - 教训：**两个后端当前一致 ≠ 没问题**。这条里两个后端都输出 `"1"`，差分门是
   绿的，但两边都与 C# 语义不符——差分门只保证"两个后端一致"，语义缺口要另外
   对着标准钉。
-- 关联：A442（自举侧 `Convert.ToString(<引用类型>)` 仍吐指针地址，宿主侧已修）、
+- 关联：A442（自举侧 `Convert.ToString(<引用类型>)` 吐指针地址——已随 A442 闭账修好）、
   A443（把 `Convert.ToString` 声明进公开面）。
 ### [x] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
