@@ -597,6 +597,27 @@ server-dev-standards；数据建模见 data-modeling；SQL 细则见 server-db-d
   时由 AI 反向映射并自动安装，而非盲猜重写；③ 编译器内建 `zanc --api <symbol>`
   命令行直达查询，确保即使无 MCP 环境，AI 也能通过单行命令拿到真实类型与方法签名。
 
+- **设置面板接入定式（Game.Foundation 三件套）**：
+  一个项目要"有设置"，不重写存盘与档位计算，只写三样：
+  ① **声明**：`GameSettings` 里声明选项（`AddBool`/`AddIntChoice`/`AddOption`）；
+     离散档位用 `AddIntChoice`（`AddInt` 按 min..max 枚举会摊出几十档，按钮
+     组没法用）。
+  ② **档位逻辑**：`SettingsModel` 把声明翻译成"一行几个档、当前第几档"，
+     选档写回 + 存盘。**视图各项目自绘**（美术风格不同），但这段易错的
+     逻辑只有一份。
+  ③ **接线**：HTML 设计稿里档位按钮的 id 与事件名统一取
+     `opt_<键>_<值>`（如 `opt_aiDiff_hard`）——按语义而不是按行号，增删
+     选项不会让按钮与行错位；场景类遍历 `SettingsModel` 生成同名事件。
+  ④ **高亮必须 class 驱动**：视觉属性写进 `<style>` 的 `.opt` / `.opt.on`，
+     行内 style 只留几何（行内 style 在 HTML 构建器里会合成 `.zgen-N` 规则，
+     会把 class 高亮压掉，详见 gui-design skill）。状态类用
+     `SetClassIn("optstate on", on ? "on" : "")`——group 里必须带上要清除的
+     状态类，否则取消高亮时清不掉。
+  ⑤ **落盘要跑两遍**：设置只在内存里 = 没有设置。测试用例首跑写、次跑
+     （新进程）读回断言，两遍的值必须不同（首跑默认值、次跑上次写的值）。
+  坑出处：五个项目接设置时，高亮不生效的根因是"行内 style 压过 class"
+  （实为没写那条 class 规则），`SetClassIn` 的 group 不含状态类会留下脏 class。
+
 ## 三、验证纪律（实机/无头通用）
 
 ### 探针测量与脚本改文件的三条硬纪律（排查沉淀）
