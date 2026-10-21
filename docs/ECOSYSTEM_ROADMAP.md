@@ -684,8 +684,44 @@ deflate/lz4/zstd"）**已经过期**：`packages/Zan.IO/src/System/IO/Compressio
 按 `Zan.Math` 的先例（并入 `stdlib/System/Numerics`，不另开包），**压缩不再
 单开 `Zan.Compression`**：同一个能力有两个家只会让人不知道该用哪个。
 
-剩下的真空白只有 **zstd**：它的熵编码（FSE + Huffman）解码器体量大，
-编码器可以先做"仅 raw block"的合法子集，但收益有限，暂缓。
+**zstd 已落地（纯解码器）**：`Compression/Zstd*.zan` 九个文件，命名空间仍是
+`System.IO.Compression`，门面 `Zstd`（`Decompress` / `TryDecompress` /
+`IsZstd` / `DecompressFile` / `DecompressFileTo`），错误模型是
+`ZstdException` + `ZstdError` 可区分错误码（`None` 之外 13 个码）。
+
+| 文件 | 内容 |
+|---|---|
+| `Zstd.zan` | 门面：解压 / 试解压 / 魔数判定 / 文件读写 |
+| `ZstdError.zan` | `ZstdError` 错误码枚举 + `ZstdException` |
+| `ZstdBits.zan` | 正向位流（FSE 表描述）/ 反向位流（熵编码码流） |
+| `ZstdFse.zan` | FSE 归一化计数解析 + 解码表构建 + 双状态解码 |
+| `ZstdHuffman.zan` | Huffman 权重解析 + 解码表构建 + 码流解码 |
+| `ZstdSequences.zan` | LL/ML/OF 预定义分布 + 三种序列表模式 + 序列执行 |
+| `ZstdBlock.zan` | 块分发 + 字面量段 + 序列段 + 重复偏移 + 跨块表延续 |
+| `ZstdXxH64.zan` | XXH64（内容校验和） |
+| `ZstdFrame.zan` | 帧头 + 块循环 + 校验和 + 可跳过帧 + 多帧拼接 |
+
+覆盖：帧头（单段帧 / 窗口描述符帧 / 无内容长度 / 带内容校验和）、原始 / RLE /
+压缩三种块、原始 / RLE / 压缩 / treeless 四种字面量段、Huffman 字面量
+（1 流与 4 流）、FSE 与 Huffman 熵编码、序列重复偏移、序列表 predefined /
+RLE / FSE / repeat 四种模式、多帧拼接、可跳过帧、XXH64 内容校验和。
+
+**只做解码，不做编码**：压缩器的取舍空间太大（块划分、字典、熵编码模式的
+选择），"半截实现"最容易在互通时暴露成静默的错误结果；解码侧格式明确、
+可严格验证。**不支持字典**：帧头声明非零 Dictionary ID 时抛
+`DictionaryRequired`，明确报错，不静默按无字典解。
+
+conformance `zstd_decode`：向量由 Python `zstandard` 0.25.0（libzstd）产出，
+期望值用判定器内**独立实现**的 FNV-1a 64 比对（不依赖被测包自身的哈希）；
+覆盖 raw / RLE / compressed / treeless 四种字面量段、1 流与 4 流、
+predefined / RLE / FSE / repeat 四种序列表模式、单段与窗口描述符两种帧头、
+带与不带校验和、多帧拼接、可跳过帧，以及错误路径（非 zstd 数据 / 帧头截断 /
+块内容截断 / 字典 ID / 校验和不符）。RLE 字面量块由手工构造帧覆盖
+（libzstd 亦可解该帧）。
+
+**规范瑕疵留档**：RFC 8878 Table 18 最后两行把"字面量长度为 0 时的偏移取值"
+写成 R1-1，与同规范 §3.1.1.5 正文和 zstd 参考实现矛盾——按正文与参考实现
+实现（两者一致），表格那一处是规范笔误。
 
 ### 1.19 PDF 生成：`Zan.Pdf`
 
@@ -1615,7 +1651,7 @@ conformance `ssh_transport`：线格式（byte / bool / uint32 / string / mpint
 | 建议包 | C# 参考 | ★ | 补什么（实测缺口） | 工期 |
 |---|---|---|---|---|
 | `Zan.Math` | MathNet.Numerics | 3,772 | ✅ 已并入 `stdlib/System/Numerics`（`MathUtil`/`Quaternion`/`Noise`/`RandomExt`/`Spline`，不新建平行包，见 §1.2） | — |
-| `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | ✅ 已在 `packages/Zan.IO` 的 `System.IO.Compression` 内落地（纯 Zan：RFC1951 Deflate / LZ4 block+frame / GZip / BZip2 / Zip / Tar / Crc32，**不新建平行包**，见 §1.18）；剩下的真空白只有 **zstd**（熵编码解码器体量大，暂缓） | — |
+| `Zan.Compression` | SharpZipLib / LZ4 / Zstd | 3,933 | ✅ 已在 `packages/Zan.IO` 的 `System.IO.Compression` 内落地（纯 Zan：RFC1951 Deflate / LZ4 block+frame / GZip / BZip2 / Zip / Tar / Crc32 / **zstd 解码器（RFC 8878）**，**不新建平行包**，见 §1.18）；zstd **编码器**暂缓（压缩侧取舍空间大，"半截实现"容易静默出错） | — |
 | `Zan.Validation` | FluentValidation | 9,765 | ✅ 已落地 `packages/Zan.Validation`（`System.Validation`，规则链 + 错误聚合，编译期绑定取值器、运行期零反射，见 §1.3） | — |
 | `Zan.Logging` | Serilog / NLog | 8,051 / 6,550 | ✅ 已在 `System.Diagnostics` 内落地（见 §1） | — |
 

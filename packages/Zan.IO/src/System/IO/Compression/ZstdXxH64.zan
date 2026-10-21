@@ -1,0 +1,103 @@
+namespace System.IO.Compression;
+
+// XXH64 —— zstd 帧尾内容校验和用的哈希（XXH64，种子 0，取低 32 位）。
+//
+// 只实现流式读取一段字节的版本（帧内容在缓冲里是连续的）。
+public class ZstdXxH64 {
+    // XXH64 的 64 位素数。
+    static long P1 = -7046029288634856825;   // 0x9E3779B185EBCA87
+    static long P2 = -4417276706812531889;   // 0xC2B2AE3D27D4EB4F
+    static long P3 = 1609587929392839161;    // 0x165667B19E3779F9
+    static long P4 = -8796714831421723037;   // 0x85EBCA77C2B2AE63
+    static long P5 = 2870177450012600261;    // 0x27D4EB2F165667C5
+
+    // 64 位循环左移。
+    static long Rotl(long x, int r) {
+        return (x << r) | (x >>> (64 - r));
+    }
+
+    // 读 8 字节（小端）成一个 64 位整数。
+    static long ReadLE64(byte[] d, int p) {
+        long v = 0;
+        for (int i = 7; i >= 0; i = i - 1) {
+            v = (v << 8) | (d[p + i] & 255);
+        }
+        return v;
+    }
+
+    // 读 4 字节（小端）成一个 32 位整数。
+    static long ReadLE32(byte[] d, int p) {
+        long v = 0;
+        for (int i = 3; i >= 0; i = i - 1) {
+            v = (v << 8) | (d[p + i] & 255);
+        }
+        return v;
+    }
+
+    // 一步混合（XXH64 的 round）。
+    static long Round(long acc, long input) {
+        acc = acc + input * ZstdXxH64.P2;
+        acc = ZstdXxH64.Rotl(acc, 31);
+        acc = acc * ZstdXxH64.P1;
+        return acc;
+    }
+
+    // 合并一个累加器（XXH64 的 mergeRound）。
+    static long MergeRound(long acc, long val) {
+        val = ZstdXxH64.Round(0, val);
+        acc = acc ^ val;
+        acc = acc * ZstdXxH64.P1 + ZstdXxH64.P4;
+        return acc;
+    }
+
+    // 计算 d[pos, pos+len) 的 XXH64（种子 0）。
+    public static long Compute(byte[] d, int pos, int len) {
+        long h;
+        int p = pos;
+        int end = pos + len;
+        if (len >= 32) {
+            long v1 = ZstdXxH64.P1 + ZstdXxH64.P2;
+            long v2 = ZstdXxH64.P2;
+            long v3 = 0;
+            long v4 = 0 - ZstdXxH64.P1;
+            int limit = end - 32;
+            while (p <= limit) {
+                v1 = ZstdXxH64.Round(v1, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
+                v2 = ZstdXxH64.Round(v2, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
+                v3 = ZstdXxH64.Round(v3, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
+                v4 = ZstdXxH64.Round(v4, ZstdXxH64.ReadLE64(d, p)); p = p + 8;
+            }
+            h = ZstdXxH64.Rotl(v1, 1) + ZstdXxH64.Rotl(v2, 7)
+                + ZstdXxH64.Rotl(v3, 12) + ZstdXxH64.Rotl(v4, 18);
+            h = ZstdXxH64.MergeRound(h, v1);
+            h = ZstdXxH64.MergeRound(h, v2);
+            h = ZstdXxH64.MergeRound(h, v3);
+            h = ZstdXxH64.MergeRound(h, v4);
+        } else {
+            h = ZstdXxH64.P5;
+        }
+        h = h + len;
+        while (end - p >= 8) {
+            long k1 = ZstdXxH64.Round(0, ZstdXxH64.ReadLE64(d, p));
+            h = h ^ k1;
+            h = ZstdXxH64.Rotl(h, 27) * ZstdXxH64.P1 + ZstdXxH64.P4;
+            p = p + 8;
+        }
+        if (end - p >= 4) {
+            h = h ^ (ZstdXxH64.ReadLE32(d, p) * ZstdXxH64.P1);
+            h = ZstdXxH64.Rotl(h, 23) * ZstdXxH64.P2 + ZstdXxH64.P3;
+            p = p + 4;
+        }
+        while (p < end) {
+            h = h ^ ((d[p] & 255) * ZstdXxH64.P5);
+            h = ZstdXxH64.Rotl(h, 11) * ZstdXxH64.P1;
+            p = p + 1;
+        }
+        h = h ^ (h >>> 33);
+        h = h * ZstdXxH64.P2;
+        h = h ^ (h >>> 29);
+        h = h * ZstdXxH64.P3;
+        h = h ^ (h >>> 32);
+        return h;
+    }
+}

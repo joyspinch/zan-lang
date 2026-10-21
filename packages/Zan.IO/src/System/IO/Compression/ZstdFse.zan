@@ -1,0 +1,237 @@
+namespace System.IO.Compression;
+
+// FSE（Finite State Entropy）解码表。
+//
+// 表长是 2 的幂（表长 = 1 << Accuracy_Log）。每个状态（state）解出一个
+// 符号，并给出"下一个状态"的算法：读 nbBits 位，加上基值 newState。
+public class ZstdFseTable {
+    // 精度（表长 = 1 << tableLog）。
+    public int tableLog;
+    // 每个状态解出的符号。
+    public int[] symbol;
+    // 状态转移要读的位数。
+    public int[] nbBits;
+    // 状态转移的基值（下一状态 = newState + 读到的位）。
+    public int[] newState;
+
+    // 分配一张精度为 log 的解码表。
+    public ZstdFseTable(int log) {
+        int size = 1 << log;
+        this.tableLog = log;
+        this.symbol = new int[size];
+        this.nbBits = new int[size];
+        this.newState = new int[size];
+    }
+}
+
+// FSE 表的构建与解码。
+public class ZstdFse {
+    // FSE 表描述里能出现的最大精度。
+    public static int MAX_TABLE_LOG = 15;
+
+    // 从归一化计数构建解码表。
+    //
+    // counts[0..countLen-1] 是各符号的概率：正数 = 概率点数，-1 = "小于 1"
+    // （占一格、读满精度位做全状态重置）。构建失败（计数凑不出表长）时抛
+    // ZstdException。
+    public static ZstdFseTable Build(int[] counts, int countLen, int tableLog) {
+        int size = 1 << tableLog;
+        if (countLen <= 0 || tableLog <= 0 || tableLog > ZstdFse.MAX_TABLE_LOG) {
+            throw new ZstdException(ZstdError.BadFse, "zstd: FSE table parameters out of range");
+        }
+        ZstdFseTable t = new ZstdFseTable(tableLog);
+        int[] symbolNext = new int[countLen];
+        int high = size - 1;
+        int total = 0;
+        for (int s = 0; s < countLen; s = s + 1) {
+            int c = counts[s];
+            if (c == -1) {
+                // "小于 1" 的符号从表尾往前各占一格
+                t.symbol[high] = s;
+                high = high - 1;
+                symbolNext[s] = 1;
+                total = total + 1;
+            } else if (c < 0) {
+                throw new ZstdException(ZstdError.BadFse, "zstd: invalid FSE normalized count");
+            } else {
+                symbolNext[s] = c;
+                total = total + c;
+            }
+        }
+        if (total != size) {
+            throw new ZstdException(ZstdError.BadFse, "zstd: FSE normalized counts do not fill the table");
+        }
+        int step = (size >> 1) + (size >> 3) + 3;
+        int mask = size - 1;
+        if (high == size - 1) {
+            // 没有 "小于 1" 的符号：按自然顺序铺开
+            int[] spread = new int[size];
+            int sp = 0;
+            for (int s = 0; s < countLen; s = s + 1) {
+                int c = counts[s];
+                for (int i = 0; i < c; i = i + 1) {
+                    spread[sp] = s;
+                    sp = sp + 1;
+                }
+            }
+            int pos = 0;
+            for (int s = 0; s < size; s = s + 2) {
+                t.symbol[pos & mask] = spread[s];
+                t.symbol[(pos + step) & mask] = spread[s + 1];
+                pos = (pos + 2 * step) & mask;
+            }
+        } else {
+            // 有 "小于 1" 的符号：跳过表尾那几格
+            int pos = 0;
+            for (int s = 0; s < countLen; s = s + 1) {
+                int c = counts[s];
+                for (int i = 0; i < c; i = i + 1) {
+                    t.symbol[pos] = s;
+                    pos = (pos + step) & mask;
+                    while (pos > high) {
+                        pos = (pos + step) & mask;
+                    }
+                }
+            }
+            if (pos != 0) {
+                throw new ZstdException(ZstdError.BadFse, "zstd: FSE symbol spread did not cover the table");
+            }
+        }
+        // 建状态转移：低位状态的位宽更大
+        for (int u = 0; u < size; u = u + 1) {
+            int s = t.symbol[u];
+            int ns = symbolNext[s];
+            symbolNext[s] = ns + 1;
+            int nb = tableLog - ZstdBits.HighBit(ns);
+            t.nbBits[u] = nb;
+            t.newState[u] = (ns << nb) - size;
+        }
+        return t;
+    }
+
+    // 解析 FSE 表描述（RFC 8878 §4.1.1）。
+    //
+    // 归一化计数写进 counts（长度 256），精度写进 tableLog，实际符号个数
+    // 写进 countLen。返回消耗的字节数。
+    // 失败抛 ZstdException。
+    public static int ReadNCount(byte[] data, int start, int end, int maxSymbol,
+        int[] counts, ref int tableLog, ref int countLen) {
+        if (end - start < 1) {
+            throw new ZstdException(ZstdError.Truncated, "zstd: FSE table description truncated");
+        }
+        ZstdFwdBits br = new ZstdFwdBits(data, start, end);
+        int accLog = br.Read(4) + 5;
+        if (accLog > ZstdFse.MAX_TABLE_LOG) {
+            throw new ZstdException(ZstdError.BadFse, "zstd: FSE accuracy log too large");
+        }
+        int remaining = (1 << accLog) + 1;
+        int threshold = 1 << accLog;
+        int nbBits = accLog + 1;
+        int charnum = 0;
+        bool previous0 = false;
+        for (int i = 0; i < counts.Length; i = i + 1) {
+            counts[i] = 0;
+        }
+        while (true) {
+            if (previous0) {
+                // 2 位重复标志：0b11 = "再来 3 个零，后面还跟一个标志"
+                while (true) {
+                    int flag = br.Read(2);
+                    if (flag == 3) {
+                        charnum = charnum + 3;
+                        continue;
+                    }
+                    charnum = charnum + flag;
+                    break;
+                }
+                previous0 = false;
+                if (charnum >= maxSymbol + 1) { break; }
+            }
+            int maxV = (2 * threshold - 1) - remaining;
+            int count;
+            int low = br.Peek(nbBits - 1);
+            if (low < maxV) {
+                // 小值少读一位
+                count = low;
+                br.Skip(nbBits - 1);
+            } else {
+                count = br.Read(nbBits);
+                if (count >= threshold) {
+                    count = count - maxV;
+                }
+            }
+            count = count - 1;   // 读到的值 → 概率（0 表示 -1，即"小于 1"）
+            if (count >= 0) {
+                remaining = remaining - count;
+            } else {
+                remaining = remaining + count;
+            }
+            if (charnum > maxSymbol) {
+                throw new ZstdException(ZstdError.BadFse, "zstd: FSE table describes too many symbols");
+            }
+            counts[charnum] = count;
+            charnum = charnum + 1;
+            previous0 = (count == 0);
+            if (remaining <= 1) { break; }
+            if (remaining < threshold) {
+                nbBits = ZstdBits.HighBit(remaining) + 1;
+                threshold = 1 << (nbBits - 1);
+            }
+            if (charnum >= maxSymbol + 1) { break; }
+        }
+        if (remaining != 1) {
+            throw new ZstdException(ZstdError.BadFse, "zstd: FSE normalized counts do not add up");
+        }
+        if (charnum > maxSymbol + 1) {
+            throw new ZstdException(ZstdError.BadFse, "zstd: FSE table describes too many symbols");
+        }
+        tableLog = accLog;
+        countLen = charnum;
+        return br.BytesUsed();
+    }
+
+    // 解码一路"两个状态交替"的 FSE 码流（Huffman 权重就是这么编的）。
+    //
+    // 符号个数不是显式给的，而是由码流耗尽决定：如果更新状态需要的位已经
+    // 不够读，就按"多出来的位是 0"处理，然后把两个状态各自的最后一个符
+    // 号解出来就结束。out 长度需要能装下最多的符号。
+    // 返回解出的符号个数。
+    public static int DecodeTwoStates(byte[] data, int start, int end, int maxLog,
+        ZstdFseTable table, int[] dst, ref int outLen) {
+        ZstdBackBits br = new ZstdBackBits(data, start, end);
+        if (br.Bad()) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: empty FSE bitstream");
+        }
+        int state1 = br.Read(table.tableLog);
+        int state2 = br.Read(table.tableLog);
+        int n = 0;
+        while (true) {
+            int sym = table.symbol[state1];
+            int nb = table.nbBits[state1];
+            if (br.Remaining() < nb) {
+                if (n + 2 > dst.Length) {
+                    throw new ZstdException(ZstdError.BadHuffman, "zstd: FSE weight stream too long");
+                }
+                dst[n] = sym; n = n + 1;
+                dst[n] = table.symbol[state2]; n = n + 1;
+                break;
+            }
+            state1 = table.newState[state1] + br.Read(nb);
+            dst[n] = sym; n = n + 1;
+            sym = table.symbol[state2];
+            nb = table.nbBits[state2];
+            if (br.Remaining() < nb) {
+                if (n + 2 > dst.Length) {
+                    throw new ZstdException(ZstdError.BadHuffman, "zstd: FSE weight stream too long");
+                }
+                dst[n] = sym; n = n + 1;
+                dst[n] = table.symbol[state1]; n = n + 1;
+                break;
+            }
+            state2 = table.newState[state2] + br.Read(nb);
+            dst[n] = sym; n = n + 1;
+        }
+        outLen = n;
+        return n;
+    }
+}

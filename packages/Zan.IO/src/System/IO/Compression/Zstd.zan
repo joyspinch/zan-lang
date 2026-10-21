@@ -1,0 +1,66 @@
+using System;
+using System.IO;
+
+namespace System.IO.Compression;
+
+// zstd（Zstandard）解码门面。
+//
+// **只做解码**：压缩侧请用外部 zstd 工具。理由是压缩器的取舍空间太大
+// （块划分、字典、熵编码模式的选择），"半截实现"最容易在互通时暴露成
+// 静默的错误结果；解码侧则是格式明确定义、可以严格验证的。
+//
+// 典型用法：
+//   byte[] plain = Zstd.Decompress(compressed);   // 失败抛 ZstdException
+//
+//   byte[] plain;
+//   ZstdError err;
+//   if (!Zstd.TryDecompress(compressed, out plain, out err)) {
+//       Console.WriteLine("zstd 解压失败: " + err.ToString());
+//   }
+//
+// 覆盖范围：zstd 帧（RFC 8878）解码、原始/RLE/压缩三种块、原始/RLE/压缩
+// 与 treeless 四种字面量段、FSE 与 Huffman 熵编码、序列的重复偏移、
+// XXH64 内容校验和、多帧拼接与可跳过帧。
+// **不支持字典**（帧头声明了字典 ID 时报 DictionaryRequired）。
+//
+// 线程安全：全部是无状态的静态方法，可并发调用。
+public class Zstd {
+    // 解压 zstd 数据（可以是多个帧首尾相接，也可以夹着可跳过帧）。
+    // 失败抛 ZstdException（带 ZstdError 错误码）。
+    public static byte[] Decompress(byte[] src) {
+        return ZstdFrame.Decode(src);
+    }
+
+    // 尝试解压。成功返回 true 并给出结果；失败返回 false 并给出错误码。
+    public static bool TryDecompress(byte[] src, out byte[] data, out ZstdError error) {
+        data = null;
+        error = ZstdError.None;
+        try {
+            data = ZstdFrame.Decode(src);
+            return true;
+        } catch (ZstdException e) {
+            error = e.Code;
+            data = null;
+            return false;
+        }
+    }
+
+    // 判断是不是 zstd 数据（只看魔数）。
+    public static bool IsZstd(byte[] src) {
+        if (src == null || src.Length < 4) { return false; }
+        return src[0] == ZstdFrame.MAGIC[0] && src[1] == ZstdFrame.MAGIC[1]
+            && src[2] == ZstdFrame.MAGIC[2] && src[3] == ZstdFrame.MAGIC[3];
+    }
+
+    // 从文件解压。
+    public static byte[] DecompressFile(string path) {
+        byte[] raw = File.ReadAllBytes(path);
+        return ZstdFrame.Decode(raw);
+    }
+
+    // 从文件解压并写到另一个文件。
+    public static void DecompressFileTo(string srcPath, string dstPath) {
+        byte[] plain = Zstd.DecompressFile(srcPath);
+        File.WriteAllBytes(dstPath, plain);
+    }
+}

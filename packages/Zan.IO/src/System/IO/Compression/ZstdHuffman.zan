@@ -1,0 +1,192 @@
+namespace System.IO.Compression;
+
+// Huffman 解码表。
+//
+// 表长 2 的幂；每个表项给出"这个状态解出的符号"与"要消费掉多少位"。
+// 解码时窥视表长那么多位，直接查表，再按表项消费位。
+public class ZstdHuffmanTable {
+    // 精度（表长 = 1 << tableLog）。
+    public int tableLog;
+    // 每个表项解出的字面量。
+    public byte[] symbol;
+    // 每个表项要消费的位数。
+    public byte[] nbBits;
+
+    // 分配一张精度为 log 的解码表。
+    public ZstdHuffmanTable(int log) {
+        int size = 1 << log;
+        this.tableLog = log;
+        this.symbol = new byte[size];
+        this.nbBits = new byte[size];
+    }
+}
+
+// Huffman 树的解析与码流解码。
+public class ZstdHuffman {
+    // 规范允许的最大码长（精度）。
+    public static int MAX_TABLE_LOG = 11;
+
+    // 解析 Huffman 树描述并建好解码表（RFC 8878 §4.2.1）。
+    //
+    // 头部一个字节：小于 128 表示权重序列用 FSE 压缩，长度就是它；大于等于
+    // 128 表示权重直接写，4 位一个，符号个数 = 头部字节 - 127。
+    // 返回消耗的字节数（调用方据此知道码流从哪儿开始）。
+    // 失败抛 ZstdException。
+    public static int ReadTree(byte[] data, int start, int end, ZstdHuffmanTable table) {
+        if (end - start < 1) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman tree description truncated");
+        }
+        int hdr = data[start] & 255;
+        int[] weights = new int[256];
+        int count = 0;
+        int used;
+        if (hdr >= 128) {
+            // 直接表示：4 位一个权重
+            count = hdr - 127;
+            used = 1 + (count + 1) / 2;
+            if (start + used > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: Huffman tree description truncated");
+            }
+            for (int i = 0; i < count; i = i + 1) {
+                int b = data[start + 1 + i / 2] & 255;
+                weights[i] = (i & 1) == 0 ? (b >> 4) : (b & 15);
+            }
+        } else {
+            // FSE 压缩的权重序列
+            used = 1 + hdr;
+            if (start + used > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: Huffman tree description truncated");
+            }
+            int[] counts = new int[256];
+            int tableLog = 0;
+            int countLen = 0;
+            int nbytes = ZstdFse.ReadNCount(data, start + 1, start + 1 + hdr, 255,
+                counts, ref tableLog, ref countLen);
+            if (tableLog > 6) {
+                throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman weight FSE accuracy log too large");
+            }
+            ZstdFseTable ft = ZstdFse.Build(counts, countLen, tableLog);
+            int[] w = new int[256];
+            int wlen = 0;
+            ZstdFse.DecodeTwoStates(data, start + 1 + nbytes, start + 1 + hdr, 6, ft, w, ref wlen);
+            if (wlen < 1 || wlen > 255) {
+                throw new ZstdException(ZstdError.BadHuffman, "zstd: bad Huffman weight count");
+            }
+            for (int i = 0; i < wlen; i = i + 1) {
+                weights[i] = w[i];
+            }
+            count = wlen;
+        }
+        ZstdHuffman.BuildTable(weights, count, table);
+        return used;
+    }
+
+    // 由权重序列建解码表。
+    //
+    // 最后一个符号的权重是**隐含**的：把权重总和补到最近的 2 的幂，差值
+    // 就是它的权重。符号按权重从小到大排（同权重按自然顺序），依次分配
+    // 前缀码——权重越大码越短。
+    // 失败抛 ZstdException。
+    public static void BuildTable(int[] weights, int count, ZstdHuffmanTable table) {
+        if (count < 1 || count > 255) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: bad Huffman weight count");
+        }
+        int total = 0;
+        int[] rank = new int[13];
+        for (int i = 0; i < count; i = i + 1) {
+            int w = weights[i];
+            if (w > 12) {
+                throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman weight out of range");
+            }
+            rank[w] = rank[w] + 1;
+            total = total + ((1 << w) >> 1);
+        }
+        if (total == 0) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: empty Huffman tree");
+        }
+        int tableLog = ZstdBits.HighBit(total) + 1;
+        if (tableLog > ZstdHuffman.MAX_TABLE_LOG) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman tree too deep");
+        }
+        int rest = (1 << tableLog) - total;
+        if (rest <= 0 || (rest & (rest - 1)) != 0) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman weights do not complete a tree");
+        }
+        int lastWeight = ZstdBits.HighBit(rest) + 1;
+        // 补上隐含的最后一个符号
+        int[] w2 = new int[count + 1];
+        for (int i = 0; i < count; i = i + 1) {
+            w2[i] = weights[i];
+        }
+        w2[count] = lastWeight;
+        rank[lastWeight] = rank[lastWeight] + 1;
+        if (rank[1] < 2 || (rank[1] & 1) != 0) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: invalid Huffman tree shape");
+        }
+        // 按权重排序（同权重保持自然顺序）
+        //
+        // 注意：权重为 0 的符号是合法的——它表示"这个符号没有出现在码流里"，
+        // 不占码表空间，也不参与铺表（参考实现 HUF_readStats 同样只把权重
+        // 非 0 的符号放进 rank 桶）。所以铺表符号数是"总符号数减去权重为 0
+        // 的那些"。
+        int[] syms = new int[count + 1];
+        int nsym = 0;
+        for (int w = 1; w <= tableLog; w = w + 1) {
+            for (int i = 0; i <= count; i = i + 1) {
+                if (w2[i] == w) {
+                    syms[nsym] = i;
+                    nsym = nsym + 1;
+                }
+            }
+        }
+        if (nsym != count + 1 - rank[0]) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: invalid Huffman tree shape");
+        }
+        // 铺表：权重 w 的符号占 2^(w-1) 个表项，位宽 = tableLog + 1 - w
+        //
+        // 表长由 tableLog 决定，而调用方传进来的表未必是这个尺寸（treeless
+        // 块还会复用上一块的表），所以**先按 tableLog 分配新表再铺**，不要
+        // 往旧表上写——那是越界写。
+        int size = 1 << tableLog;
+        byte[] sym = new byte[size];
+        byte[] nbs = new byte[size];
+        int idx = 0;
+        for (int k = 0; k < nsym; k = k + 1) {
+            int symv = syms[k];
+            int w = w2[symv];
+            int nb = tableLog + 1 - w;
+            int length = (1 << w) >> 1;
+            for (int m = 0; m < length; m = m + 1) {
+                sym[idx] = (byte)symv;
+                nbs[idx] = (byte)nb;
+                idx = idx + 1;
+            }
+        }
+        if (idx != size) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: Huffman table not filled");
+        }
+        table.tableLog = tableLog;
+        table.symbol = sym;
+        table.nbBits = nbs;
+    }
+
+    // 解码一路 Huffman 码流，把 count 个字面量写进 dst 的 dstPos 起。
+    //
+    // 码流是反向的：末字节的结束标记与填充先跳过，然后从高位往低位读。
+    // 失败抛 ZstdException。
+    public static void DecodeStream(ZstdHuffmanTable table, byte[] data, int start, int end,
+        int count, byte[] dst, int dstPos) {
+        ZstdBackBits br = new ZstdBackBits(data, start, end);
+        if (br.Bad()) {
+            throw new ZstdException(ZstdError.BadHuffman, "zstd: empty Huffman bitstream");
+        }
+        int log = table.tableLog;
+        for (int i = 0; i < count; i = i + 1) {
+            int v = br.Peek(log);
+            int sym = table.symbol[v] & 255;
+            int nb = table.nbBits[v] & 255;
+            dst[dstPos + i] = (byte)sym;
+            br.Skip(nb);
+        }
+    }
+}

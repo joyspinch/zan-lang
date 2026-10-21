@@ -1,0 +1,182 @@
+namespace System.IO.Compression;
+
+// zstd 用到的两种位流读取器。
+//
+// **两种方向别搞混**：FSE 表描述（归一化计数）是**正向**读的——从字节流的
+// 开头往后读，字节内低位先读；FSE 码流与 Huffman 码流是**反向**读的——从
+// 字节流的末尾往前读，字节内高位先读。RFC 8878 §4.1 与 §4.2 分别描述了
+// 这两种方向，搞混会得到"能解码但结果全错"的数据。
+//
+// 反向流还有一条容易踩的规矩：最后一个字节的**最高置位 bit 是结束标记**
+// （end mark），它上面的 0 是填充位，两者都要跳过；所以最后一个字节真正
+// 携带数据的是结束标记**下面**的那些位。
+public class ZstdBits {
+    // 返回 floor(log2(v))（v 必须 ≥ 1）。
+    public static int HighBit(int v) {
+        int r = 0;
+        while (v > 1) {
+            v = v >> 1;
+            r = r + 1;
+        }
+        return r;
+    }
+
+    // 把 v 的低 bits 位反转（bits ≤ 32）。
+    public static int Reverse(int v, int bits) {
+        int r = 0;
+        for (int i = 0; i < bits; i = i + 1) {
+            r = (r << 1) | (v & 1);
+            v = v >> 1;
+        }
+        return r;
+    }
+}
+
+// 反向位流读取器（FSE 码流 / Huffman 码流）。
+//
+// 读序：从**最后一个字节**开始往前；每个字节内从 bit7 读到 bit0。
+// **先读到的位是结果值的最高位**。
+//
+// 越界读取不抛异常：缺失的位按 0 处理（与参考实现一致——FSE 权重解码
+// 正是靠"多出来的位当作 0"来判定解码结束），但会记下 Overrun 供调用方
+// 检查"码流是否被读干净"。
+public class ZstdBackBits {
+    byte[] data;
+    int start;
+    int end;
+    int total;   // 可读的总位数
+    int cur;     // 已读位数
+    int p;       // 最后一个字节里结束标记所在的位号
+    bool bad;    // 区间非法（空区间，或末字节为 0——没有结束标记）
+
+    // 建立读取器，区间为 data[start, end)。
+    public ZstdBackBits(byte[] src, int start, int end) {
+        this.data = src;
+        this.start = start;
+        this.end = end;
+        this.total = 0;
+        this.cur = 0;
+        this.p = 0;
+        this.bad = true;
+        if (end > start && end <= src.Length && start >= 0) {
+            int last = src[end - 1] & 255;
+            if (last != 0) {
+                this.p = ZstdBits.HighBit(last);
+                this.total = this.p + (end - start - 1) * 8;
+                this.bad = false;
+            }
+        }
+    }
+
+    // 区间非法（无法作为码流读取）。
+    public bool Bad() {
+        return this.bad;
+    }
+
+    // 剩余可读位数。
+    public int Remaining() {
+        return this.total - this.cur;
+    }
+
+    // 是否读过头（多读过的位按 0 处理）。
+    public bool Overrun() {
+        return this.cur > this.total;
+    }
+
+    // 窥视接下来的 n 位（不推进游标）。n ≤ 32。
+    public int Peek(int n) {
+        if (n <= 0) { return 0; }
+        int val = 0;
+        int left = n;
+        int i = this.cur;
+        // 第一段：最后一个字节里、结束标记下面的那几位（高位先读）。
+        if (i < this.p) {
+            int take = this.p - i;
+            if (take > left) { take = left; }
+            int b = this.data[this.end - 1] & 255;
+            // 先读到的位是 b 的 (p-1-i) 号位，它就是结果值的最高位
+            int part = (b >> (this.p - i - take)) & ((1 << take) - 1);
+            val = part;
+            i = i + take;
+            left = left - take;
+        }
+        // 后续：整字节（高位先读 = 字节的自然顺序）。
+        int j = i - this.p;
+        while (left > 0) {
+            int idx = this.end - 2 - (j >> 3);
+            int b = 0;
+            if (idx >= this.start) { b = this.data[idx] & 255; }
+            int off = j & 7;
+            int avail = 8 - off;
+            int take = left < avail ? left : avail;
+            // 读到的位是本字节的 (7-off) 号位往下 take 位，高位在前
+            int part = (b >> (8 - off - take)) & ((1 << take) - 1);
+            val = (val << take) | part;
+            j = j + take;
+            left = left - take;
+        }
+        return val;
+    }
+
+    // 跳过 n 位。
+    public void Skip(int n) {
+        this.cur = this.cur + n;
+    }
+
+    // 读 n 位（先读到的位是最高位）。
+    public int Read(int n) {
+        int v = this.Peek(n);
+        this.cur = this.cur + n;
+        return v;
+    }
+}
+
+// 正向位流读取器（FSE 表描述）。
+//
+// 读序：从区间开头往后；每个字节内**低位先读**；先读到的位是结果值的
+// **最低位**。
+public class ZstdFwdBits {
+    byte[] data;
+    int pos;
+    int end;
+    int bit;   // 已读的绝对位偏移
+
+    // 建立读取器，区间为 data[start, end)。
+    public ZstdFwdBits(byte[] src, int start, int end) {
+        this.data = src;
+        this.pos = start;
+        this.end = end;
+        this.bit = 0;
+    }
+
+    // 窥视接下来的 n 位（不推进游标）。n ≤ 24。
+    public int Peek(int n) {
+        int val = 0;
+        for (int i = 0; i < n; i = i + 1) {
+            int idx = this.pos + ((this.bit + i) >> 3);
+            int b = 0;
+            if (idx < this.end && idx >= 0) {
+                b = (this.data[idx] >> ((this.bit + i) & 7)) & 1;
+            }
+            val = val | (b << i);
+        }
+        return val;
+    }
+
+    // 跳过 n 位。
+    public void Skip(int n) {
+        this.bit = this.bit + n;
+    }
+
+    // 读 n 位（先读到的位是最低位）。
+    public int Read(int n) {
+        int v = this.Peek(n);
+        this.bit = this.bit + n;
+        return v;
+    }
+
+    // 已消耗的字节数（向上取整——最后一个字节里没用完的位算作已消耗）。
+    public int BytesUsed() {
+        return (this.bit + 7) / 8;
+    }
+}

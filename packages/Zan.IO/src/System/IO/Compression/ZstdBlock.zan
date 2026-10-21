@@ -1,0 +1,526 @@
+namespace System.IO.Compression;
+
+// 可增长的输出缓冲。
+public class ZstdBuffer {
+    byte[] buf;
+    int len;
+    int cap;
+
+    // 新建一个空缓冲。
+    public ZstdBuffer() {
+        this.cap = 4096;
+        this.buf = new byte[this.cap];
+        this.len = 0;
+    }
+
+    // 已写入的字节数。
+    public int Length() {
+        return this.len;
+    }
+
+    // 预留 extra 字节的空间。
+    public void Ensure(int extra) {
+        if (this.len + extra <= this.cap) { return; }
+        int ncap = this.cap;
+        while (ncap < this.len + extra) {
+            ncap = ncap * 2;
+        }
+        byte[] nb = new byte[ncap];
+        ZstdBuffer.Copy(this.buf, 0, nb, 0, this.len);
+        this.buf = nb;
+        this.cap = ncap;
+    }
+
+    // 字节拷贝（源与目标不重叠）。
+    public static void Copy(byte[] src, int srcOff, byte[] dst, int dstOff, int n) {
+        for (int i = 0; i < n; i = i + 1) {
+            dst[dstOff + i] = src[srcOff + i];
+        }
+    }
+
+    // 在缓冲内部拷贝（源与目标不重叠）。
+    public void CopyWithin(int src, int dst, int n) {
+        ZstdBuffer.Copy(this.buf, src, this.buf, dst, n);
+    }
+
+    // 把已写长度推进 n 字节（配合 CopyWithin 使用）。
+    public void Advance(int n) {
+        this.len = this.len + n;
+    }
+
+    // 追加一个字节。
+    public void Put(byte b) {
+        this.Ensure(1);
+        this.buf[this.len] = b;
+        this.len = this.len + 1;
+    }
+
+    // 追加一段字节。
+    public void PutBlock(byte[] src, int off, int n) {
+        this.Ensure(n);
+        ZstdBuffer.Copy(src, off, this.buf, this.len, n);
+        this.len = this.len + n;
+    }
+
+    // 追加 n 个相同字节。
+    public void PutRepeat(byte b, int n) {
+        this.Ensure(n);
+        for (int i = 0; i < n; i = i + 1) {
+            this.buf[this.len + i] = b;
+        }
+        this.len = this.len + n;
+    }
+
+    // 读回第 i 个字节。
+    public byte At(int i) {
+        return this.buf[i];
+    }
+
+    // 覆盖第 i 个字节。
+    public void Set(int i, byte b) {
+        this.buf[i] = b;
+    }
+
+    // 取出已写入的内容。
+    public byte[] ToArray() {
+        byte[] r = new byte[this.len];
+        ZstdBuffer.Copy(this.buf, 0, r, 0, this.len);
+        return r;
+    }
+
+    // 内部数组（供校验和之类的连续读取用；不要改长度）。
+    public byte[] Raw() {
+        return this.buf;
+    }
+}
+
+// 一个 zstd 帧内的块解码上下文。
+//
+// 跨块延续的状态：最近三个偏移、上一块的 Huffman 表、上一块的 FSE 序列
+// 表（"重复模式"要用）。这些状态**只在帧内延续**——新帧要重新开始。
+public class ZstdBlockDecoder {
+    // 输出缓冲。
+    public ZstdBuffer sink;
+    // 本帧输出在缓冲里的起点（偏移不能越过它往回取）。
+    public int frameStart;
+    // 窗口大小：偏移的上限。
+    public long windowSize;
+    // 最近三个偏移（按新近程度排序）。
+    public int rep0;
+    public int rep1;
+    public int rep2;
+    // 上一块用的 Huffman 表（treeless 字面量块要用）。
+    public ZstdHuffmanTable huf;
+    public bool hufValid;
+    // 上一块用的 FSE 序列表（"重复模式"要用）。
+    public ZstdSeqTable llTab;
+    public ZstdSeqTable ofTab;
+    public ZstdSeqTable mlTab;
+    public bool seqTabValid;
+
+    byte[] literals;   // 当前块的字面量
+    int litLen;        // 字面量个数
+    int litPos;        // 已消耗的字面量位置
+
+    // 构造块解码上下文。
+    public ZstdBlockDecoder(ZstdBuffer sink, int frameStart, long windowSize) {
+        this.sink = sink;
+        this.frameStart = frameStart;
+        this.windowSize = windowSize;
+        this.rep0 = 1;
+        this.rep1 = 4;
+        this.rep2 = 8;
+        this.huf = null;
+        this.hufValid = false;
+        this.llTab = null;
+        this.ofTab = null;
+        this.mlTab = null;
+        this.seqTabValid = false;
+        this.literals = new byte[131072];
+        this.litLen = 0;
+        this.litPos = 0;
+    }
+
+    // 解码一个块（块头已读过；type/size 见调用方）。
+    // type 0=原始 1=RLE 2=压缩 3=保留（非法）。
+    public void DecodeBlock(byte[] data, int start, int size, int type, int blockMax) {
+        if (type == 0) {
+            if (start + size > data.Length) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: raw block truncated");
+            }
+            if (size > blockMax) {
+                throw new ZstdException(ZstdError.BadBlock, "zstd: block larger than the frame allows");
+            }
+            this.sink.PutBlock(data, start, size);
+            return;
+        }
+        if (type == 1) {
+            if (start + 1 > data.Length) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: RLE block truncated");
+            }
+            if (size > blockMax) {
+                throw new ZstdException(ZstdError.BadBlock, "zstd: block larger than the frame allows");
+            }
+            this.sink.PutRepeat(data[start], size);
+            return;
+        }
+        if (type == 2) {
+            if (start + size > data.Length) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: compressed block truncated");
+            }
+            this.DecodeCompressed(data, start, start + size, blockMax);
+            return;
+        }
+        throw new ZstdException(ZstdError.BadBlock, "zstd: reserved block type");
+    }
+
+    // 解码一个压缩块：字面量段 + 序列段。
+    void DecodeCompressed(byte[] data, int start, int end, int blockMax) {
+        int used = this.DecodeLiterals(data, start, end, blockMax);
+        this.DecodeSequences(data, start + used, end);
+    }
+
+    // 解码字面量段。返回消耗的字节数。
+    int DecodeLiterals(byte[] data, int start, int end, int blockMax) {
+        if (start >= end) {
+            throw new ZstdException(ZstdError.Truncated, "zstd: literals section missing");
+        }
+        int b0 = data[start] & 255;
+        int litType = b0 & 3;
+        int szf = (b0 >> 2) & 3;
+        if (litType == 0 || litType == 1) {
+            int lh;
+            int regen;
+            if (szf == 0 || szf == 2) {
+                lh = 1;
+                regen = b0 >> 3;
+            } else if (szf == 1) {
+                lh = 2;
+                if (start + 2 > end) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+                }
+                regen = (data[start] & 255) | ((data[start + 1] & 255) << 8);
+                regen = regen >> 4;
+            } else {
+                lh = 3;
+                if (start + 3 > end) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+                }
+                regen = (data[start] & 255) | ((data[start + 1] & 255) << 8)
+                    | ((data[start + 2] & 255) << 16);
+                regen = regen >> 4;
+            }
+            if (regen > blockMax || regen > this.literals.Length) {
+                throw new ZstdException(ZstdError.BadLiterals, "zstd: literals larger than the block allows");
+            }
+            this.litLen = regen;
+            this.litPos = 0;
+            if (litType == 0) {
+                if (start + lh + regen > end) {
+                    throw new ZstdException(ZstdError.Truncated, "zstd: raw literals truncated");
+                }
+                ZstdBuffer.Copy(data, start + lh, this.literals, 0, regen);
+                return lh + regen;
+            }
+            // RLE：一个字节重复 regen 次
+            if (start + lh + 1 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: RLE literals truncated");
+            }
+            byte v = data[start + lh];
+            for (int i = 0; i < regen; i = i + 1) {
+                this.literals[i] = v;
+            }
+            return lh + 1;
+        }
+        // 压缩 / treeless 字面量
+        int lh2;
+        int regen2;
+        int csize;
+        bool single;
+        if (szf == 0) {
+            lh2 = 3; single = true;
+            if (start + 3 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+            }
+            int v = (data[start] & 255) | ((data[start + 1] & 255) << 8)
+                | ((data[start + 2] & 255) << 16);
+            regen2 = (v >> 4) & 0x3FF;
+            csize = (v >> 14) & 0x3FF;
+        } else if (szf == 1) {
+            lh2 = 3; single = false;
+            if (start + 3 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+            }
+            int v = (data[start] & 255) | ((data[start + 1] & 255) << 8)
+                | ((data[start + 2] & 255) << 16);
+            regen2 = (v >> 4) & 0x3FF;
+            csize = (v >> 14) & 0x3FF;
+        } else if (szf == 2) {
+            lh2 = 4; single = false;
+            if (start + 4 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+            }
+            int v = (data[start] & 255) | ((data[start + 1] & 255) << 8)
+                | ((data[start + 2] & 255) << 16) | ((data[start + 3] & 255) << 24);
+            regen2 = (v >> 4) & 0x3FFF;
+            csize = (v >> 18) & 0x3FFF;
+        } else {
+            lh2 = 5; single = false;
+            if (start + 5 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: literals header truncated");
+            }
+            int v = (data[start] & 255) | ((data[start + 1] & 255) << 8)
+                | ((data[start + 2] & 255) << 16) | ((data[start + 3] & 255) << 24);
+            regen2 = (v >> 4) & 0x3FFFF;
+            // Compressed_Size 占 18 位：低 10 位在 v 的 bit22..31，高 8 位在第 5 字节。
+            // v 是有符号 int，算术右移会把符号位带进来，**必须掩掉高 22 位**。
+            csize = ((v >> 22) & 0x3FF) | ((data[start + 4] & 255) << 10);
+        }
+        if (regen2 > blockMax || regen2 > this.literals.Length) {
+            throw new ZstdException(ZstdError.BadLiterals, "zstd: literals larger than the block allows");
+        }
+        int body = start + lh2;
+        if (body + csize > end) {
+            throw new ZstdException(ZstdError.Truncated, "zstd: literals section truncated");
+        }
+        int bodyEnd = body + csize;
+        int treeUsed = 0;
+        if (litType == 2) {
+            // 带树描述：读树并重建表
+            if (!this.hufValid) {
+                this.huf = new ZstdHuffmanTable(0);
+            }
+            treeUsed = ZstdHuffman.ReadTree(data, body, bodyEnd, this.huf);
+            this.hufValid = true;
+        } else {
+            // treeless：沿用上一块的树
+            if (!this.hufValid) {
+                throw new ZstdException(ZstdError.BadHuffman, "zstd: treeless literals without a previous Huffman tree");
+            }
+        }
+        int streams = body + treeUsed;
+        if (single) {
+            ZstdHuffman.DecodeStream(this.huf, data, streams, bodyEnd, regen2, this.literals, 0);
+        } else {
+            if (streams + 6 > bodyEnd) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: literals jump table truncated");
+            }
+            int s1 = (data[streams] & 255) | ((data[streams + 1] & 255) << 8);
+            int s2 = (data[streams + 2] & 255) | ((data[streams + 3] & 255) << 8);
+            int s3 = (data[streams + 4] & 255) | ((data[streams + 5] & 255) << 8);
+            int total = bodyEnd - streams - 6;
+            if (s1 + s2 + s3 > total) {
+                throw new ZstdException(ZstdError.BadLiterals, "zstd: literals jump table inconsistent");
+            }
+            int s4 = total - s1 - s2 - s3;
+            int seg = (regen2 + 3) / 4;
+            int last = regen2 - 3 * seg;
+            if (last < 0) {
+                throw new ZstdException(ZstdError.BadLiterals, "zstd: literals size inconsistent");
+            }
+            int p = streams + 6;
+            ZstdHuffman.DecodeStream(this.huf, data, p, p + s1, seg, this.literals, 0);
+            p = p + s1;
+            ZstdHuffman.DecodeStream(this.huf, data, p, p + s2, seg, this.literals, seg);
+            p = p + s2;
+            ZstdHuffman.DecodeStream(this.huf, data, p, p + s3, seg, this.literals, 2 * seg);
+            p = p + s3;
+            ZstdHuffman.DecodeStream(this.huf, data, p, p + s4, last, this.literals, 3 * seg);
+        }
+        this.litLen = regen2;
+        this.litPos = 0;
+        return lh2 + csize;
+    }
+
+    // 解码序列段并执行。
+    void DecodeSequences(byte[] data, int start, int end) {
+        if (start >= end) {
+            throw new ZstdException(ZstdError.Truncated, "zstd: sequences section missing");
+        }
+        int b0 = data[start] & 255;
+        int nbSeq;
+        int pos = start + 1;
+        if (b0 == 0) {
+            nbSeq = 0;
+        } else if (b0 < 128) {
+            nbSeq = b0;
+        } else if (b0 < 255) {
+            if (pos >= end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: sequence count truncated");
+            }
+            nbSeq = ((b0 - 128) << 8) + (data[pos] & 255);
+            pos = pos + 1;
+        } else {
+            if (pos + 2 > end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: sequence count truncated");
+            }
+            nbSeq = (data[pos] & 255) + ((data[pos + 1] & 255) << 8) + 0x7F00;
+            pos = pos + 2;
+        }
+        if (nbSeq == 0) {
+            // 没有序列：整块内容就是字面量；FSE 表不更新
+            this.CopyLiterals(this.litLen - this.litPos);
+            return;
+        }
+        if (pos >= end) {
+            throw new ZstdException(ZstdError.Truncated, "zstd: sequence modes missing");
+        }
+        int modes = data[pos] & 255;
+        if ((modes & 3) != 0) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: reserved bits set in sequence modes");
+        }
+        int llMode = (modes >> 6) & 3;
+        int ofMode = (modes >> 4) & 3;
+        int mlMode = (modes >> 2) & 3;
+        pos = pos + 1;
+        int used = 0;
+        this.llTab = this.BuildSeqTable(ZstdSequences.LL, llMode, data, pos, end, ref used);
+        pos = pos + used;
+        this.ofTab = this.BuildSeqTable(ZstdSequences.OF, ofMode, data, pos, end, ref used);
+        pos = pos + used;
+        this.mlTab = this.BuildSeqTable(ZstdSequences.ML, mlMode, data, pos, end, ref used);
+        pos = pos + used;
+        this.seqTabValid = true;
+        this.RunSequences(data, pos, end, nbSeq);
+    }
+
+    // 按模式建（或复用）一张序列码表；返回本次消耗的字节数。
+    ZstdSeqTable BuildSeqTable(int kind, int mode, byte[] data, int pos, int end, ref int used) {
+        if (mode == ZstdSequences.MODE_PREDEFINED) {
+            used = 0;
+            return ZstdSequences.Predefined(kind);
+        }
+        if (mode == ZstdSequences.MODE_RLE) {
+            if (pos >= end) {
+                throw new ZstdException(ZstdError.Truncated, "zstd: RLE sequence table truncated");
+            }
+            used = 1;
+            return ZstdSequences.Rle(kind, data[pos] & 255);
+        }
+        if (mode == ZstdSequences.MODE_FSE) {
+            int n = 0;
+            ZstdSeqTable t = ZstdSequences.Fse(kind, data, pos, end, ref n);
+            used = n;
+            return t;
+        }
+        // 重复模式：沿用上一块的表
+        if (!this.seqTabValid) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: repeat mode without a previous sequence table");
+        }
+        used = 0;
+        if (kind == ZstdSequences.LL) { return this.llTab; }
+        if (kind == ZstdSequences.OF) { return this.ofTab; }
+        return this.mlTab;
+    }
+
+    // 解码并执行 nbSeq 条序列。
+    void RunSequences(byte[] data, int start, int end, int nbSeq) {
+        ZstdBackBits br = new ZstdBackBits(data, start, end);
+        if (br.Bad()) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: empty sequence bitstream");
+        }
+        ZstdFseTable llFse = this.llTab.fse;
+        ZstdFseTable ofFse = this.ofTab.fse;
+        ZstdFseTable mlFse = this.mlTab.fse;
+        int llState = br.Read(llFse.tableLog);
+        int ofState = br.Read(ofFse.tableLog);
+        int mlState = br.Read(mlFse.tableLog);
+        for (int i = 0; i < nbSeq; i = i + 1) {
+            int llCode = llFse.symbol[llState];
+            int mlCode = mlFse.symbol[mlState];
+            int ofCode = ofFse.symbol[ofState];
+            int llBits = this.llTab.addBits[llCode];
+            int mlBits = this.mlTab.addBits[mlCode];
+            int ofBits = this.ofTab.addBits[ofCode];
+            int ll0 = this.llTab.baseVal[llCode] == 0 ? 1 : 0;
+            int offset;
+            if (ofBits > 1) {
+                // 普通偏移：offset = 基值 + 读到的位
+                offset = this.ofTab.baseVal[ofCode] + br.Read(ofBits);
+                this.rep2 = this.rep1;
+                this.rep1 = this.rep0;
+                this.rep0 = offset;
+            } else if (ofBits == 0) {
+                // 偏移值 1：重复最近（或次近）的偏移
+                offset = ll0 == 1 ? this.rep1 : this.rep0;
+                if (ll0 == 1) {
+                    this.rep1 = this.rep0;
+                }
+                this.rep0 = offset;
+            } else {
+                // 偏移码 1：偏移值 2/3（字面量长度为 0 时整体右移一位）
+                int v = this.ofTab.baseVal[ofCode] + ll0 + br.Read(1);
+                int temp;
+                if (v == 3) {
+                    temp = this.rep0 - 1;   // 重复码 3 且字面量长度为 0：最近偏移减 1
+                } else if (v == 1) {
+                    temp = this.rep1;
+                } else {
+                    temp = this.rep2;
+                }
+                if (temp <= 0) {
+                    throw new ZstdException(ZstdError.BadOffset, "zstd: invalid repeat offset");
+                }
+                if (v != 1) {
+                    this.rep2 = this.rep1;
+                }
+                this.rep1 = this.rep0;
+                this.rep0 = temp;
+                offset = temp;
+            }
+            if (offset <= 0) {
+                throw new ZstdException(ZstdError.BadOffset, "zstd: invalid offset");
+            }
+            int matchLen = this.mlTab.baseVal[mlCode];
+            if (mlBits > 0) {
+                matchLen = matchLen + br.Read(mlBits);
+            }
+            int litLen = this.llTab.baseVal[llCode];
+            if (llBits > 0) {
+                litLen = litLen + br.Read(llBits);
+            }
+            if (i < nbSeq - 1) {
+                // 状态更新：字面量长度 → 匹配长度 → 偏移
+                llState = llFse.newState[llState] + br.Read(llFse.nbBits[llState]);
+                mlState = mlFse.newState[mlState] + br.Read(mlFse.nbBits[mlState]);
+                ofState = ofFse.newState[ofState] + br.Read(ofFse.nbBits[ofState]);
+            }
+            this.CopyLiterals(litLen);
+            this.CopyMatch(offset, matchLen);
+        }
+        // 剩下的字面量直接追加
+        this.CopyLiterals(this.litLen - this.litPos);
+    }
+
+    // 从字面量缓冲复制 n 字节到输出。
+    void CopyLiterals(int n) {
+        if (n < 0 || this.litPos + n > this.litLen) {
+            throw new ZstdException(ZstdError.BadSequences, "zstd: literals exhausted");
+        }
+        if (n > 0) {
+            this.sink.PutBlock(this.literals, this.litPos, n);
+            this.litPos = this.litPos + n;
+        }
+    }
+
+    // 从输出里复制 matchLen 字节（源在 offset 之前，可能与目标重叠）。
+    void CopyMatch(int offset, int matchLen) {
+        int dst = this.sink.Length();
+        int src = dst - offset;
+        if ((long)offset > this.windowSize || src < this.frameStart) {
+            throw new ZstdException(ZstdError.BadOffset, "zstd: offset points outside the window");
+        }
+        this.sink.Ensure(matchLen);
+        int n = matchLen;
+        int d = dst;
+        int s = src;
+        while (n > 0) {
+            int k = offset < n ? offset : n;
+            this.sink.CopyWithin(s, d, k);
+            d = d + k;
+            s = s + k;
+            n = n - k;
+        }
+        this.sink.Advance(matchLen);
+    }
+}
