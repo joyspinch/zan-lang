@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace Game.Foundation;
+
+// 一个存档槽的元信息。
+public class SaveSlotInfo {
+    public int Index;
+    public bool Exists;
+    public long SavedAt;
+    public int Version;
+}
+
+// 存档基座：多槽位 JSON 存档。
+//
+// 三件事游戏项目不该各写一遍：
+//   1. **原子写**——先写临时文件再替换正式文件，断电/崩溃不会留下半截存档；
+//   2. **备份回退**——覆盖前把旧档存成 .bak，正式档坏了自动读备份；
+//   3. **版本号**——存档结构变了能认出来，不把旧档当新档读。
+//
+// 数据用 System.Json 的 JsonValue，项目的存档内容由项目自己组织；
+// 基座只管"存到哪、写得稳、读得回"。
+public class GameSaveStore {
+    string dir;
+    string gameId;
+    int version;
+
+    public GameSaveStore(string dir, string gameId, int version) {
+        this.dir = dir;
+        this.gameId = gameId;
+        this.version = version;
+    }
+
+    // 槽位文件路径。
+    public string PathOf(int slot) {
+        return this.dir + "/" + this.gameId + "_slot" + Convert.ToString(slot) + ".json";
+    }
+
+    string BackupPathOf(int slot) { return this.PathOf(slot) + ".bak"; }
+
+    public bool Has(int slot) { return File.Exists(this.PathOf(slot)); }
+
+    public int Version() { return this.version; }
+
+    // 存一档。data 为 null 视为删除该槽。
+    public bool Save(int slot, JsonValue data) {
+        if (data == null) { return this.Delete(slot); }
+        JsonValue root = JsonValue.NewObject();
+        root.PutInt("version", this.version);
+        root.PutInt("savedAt", DateTime.GetCurrentUnixMilliseconds());
+        root.Put("data", data);
+        string target = this.PathOf(slot);
+        string tmp = target + ".tmp";
+        try {
+            Directory.CreateDirectory(this.dir);
+            // 旧档留一份备份：正式档写坏时还能读回来。
+            if (File.Exists(target)) {
+                string bak = this.BackupPathOf(slot);
+                if (File.Exists(bak)) { File.Delete(bak); }
+                File.Copy(target, bak);
+            }
+            File.WriteAllText(tmp, root.ToJson());
+            if (File.Exists(target)) { File.Delete(target); }
+            File.Move(tmp, target);
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    // 读一档。读不到 / 解析失败 / 备份也坏 → 返回 null（当"没有存档"处理）。
+    public JsonValue Load(int slot) {
+        JsonValue root = this.ReadFile(this.PathOf(slot));
+        if (root == null) { root = this.ReadFile(this.BackupPathOf(slot)); }
+        if (root == null) { return null; }
+        return root.Get("data");
+    }
+
+    // 读一档的元信息（时间戳 / 版本），没有则返回 null。
+    public SaveSlotInfo Info(int slot) {
+        JsonValue root = this.ReadFile(this.PathOf(slot));
+        if (root == null) { root = this.ReadFile(this.BackupPathOf(slot)); }
+        if (root == null) { return null; }
+        SaveSlotInfo info = new SaveSlotInfo();
+        info.Index = slot;
+        info.Exists = true;
+        info.SavedAt = root.Int("savedAt", 0);
+        info.Version = root.Int("version", 0);
+        return info;
+    }
+
+    public bool Delete(int slot) {
+        string target = this.PathOf(slot);
+        if (!File.Exists(target)) { return true; }
+        try {
+            File.Delete(target);
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+
+    // 列出 0..count-1 号槽的状态。
+    public List<SaveSlotInfo> Slots(int count) {
+        List<SaveSlotInfo> slots = new List<SaveSlotInfo>();
+        for (int i = 0; i < count; i = i + 1) {
+            SaveSlotInfo info = this.Info(i);
+            if (info == null) {
+                info = new SaveSlotInfo();
+                info.Index = i;
+                info.Exists = false;
+                info.SavedAt = 0;
+                info.Version = 0;
+            }
+            slots.Add(info);
+        }
+        return slots;
+    }
+
+    JsonValue ReadFile(string path) {
+        if (!File.Exists(path)) { return null; }
+        string text = "";
+        try {
+            text = File.ReadAllText(path);
+        } catch (Exception) {
+            return null;
+        }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(text);
+        } catch (Exception) {
+            return null;
+        }
+        if (root == null || !root.IsObject()) { return null; }
+        if (!root.Has("data")) { return null; }
+        return root;
+    }
+}

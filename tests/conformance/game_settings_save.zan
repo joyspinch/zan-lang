@@ -1,0 +1,95 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using Game.Foundation;
+
+namespace Tests.GameSettingsSave;
+
+// 设置基座 + 存档基座的契约测试：
+//   设置 —— 声明、默认值、越界/非法值忽略、存盘读回、坏配置不炸；
+//   存档 —— 存/读、槽位元信息、覆盖留备份、坏档自动回退、删除。
+class Program {
+    static void Main() {
+        string dir = "game_settings_save_test";
+        Directory.CreateDirectory(dir);
+        string cfg = dir + "/settings.json";
+        if (File.Exists(cfg)) { File.Delete(cfg); }
+
+        List<string> modes = new List<string> { "easy", "hard" };
+
+        GameSettings s = new GameSettings();
+        s.At(cfg);
+        s.AddBool("sound", "音效", true);
+        s.AddInt("difficulty", "难度", 2, 1, 3, 1);
+        s.AddDouble("volume", "音量", 0.5, 0.0, 1.0);
+        s.AddText("name", "昵称", "玩家");
+        s.AddOption("mode", "模式", "easy", modes);
+
+        Console.WriteLine("defaults=" + Convert.ToString(s.GetBool("sound"))
+            + "," + Convert.ToString(s.GetInt("difficulty"))
+            + "," + s.GetText("name")
+            + "," + s.GetText("mode"));
+
+        // 越界值与候选外取值必须被忽略（保持旧值）
+        s.SetInt("difficulty", 9);
+        s.SetDouble("volume", 2.0);
+        s.SetOption("mode", "nightmare");
+        Console.WriteLine("guarded=" + Convert.ToString(s.GetInt("difficulty"))
+            + "," + Convert.ToString(s.GetDouble("volume"))
+            + "," + s.GetText("mode"));
+
+        // 合法写入生效
+        s.SetOption("mode", "hard");
+        s.SetDouble("volume", 0.25);
+        Console.WriteLine("applied=" + s.GetText("mode")
+            + "," + Convert.ToString(s.GetDouble("volume")));
+
+        // 存盘 → 新实例读回
+        s.SetText("name", "阿青");
+        Console.WriteLine("saved=" + Convert.ToString(s.Save()));
+        GameSettings s2 = new GameSettings();
+        s2.At(cfg);
+        s2.AddBool("sound", "音效", true);
+        s2.AddInt("difficulty", "难度", 2, 1, 3, 1);
+        s2.AddDouble("volume", "音量", 0.5, 0.0, 1.0);
+        s2.AddText("name", "昵称", "玩家");
+        s2.AddOption("mode", "模式", "easy", modes);
+        Console.WriteLine("loaded=" + Convert.ToString(s2.Load())
+            + "," + s2.GetText("name")
+            + "," + s2.GetText("mode")
+            + "," + Convert.ToString(s2.GetInt("difficulty")));
+
+        // 坏配置：读不成就保持默认值，别让游戏起不来
+        File.WriteAllText(cfg, "{ this is not json");
+        GameSettings s3 = new GameSettings();
+        s3.At(cfg);
+        s3.AddInt("difficulty", "难度", 2, 1, 3, 1);
+        Console.WriteLine("badcfg=" + Convert.ToString(s3.Load())
+            + "," + Convert.ToString(s3.GetInt("difficulty")));
+
+        // 存档：存 / 读 / 槽位元信息
+        GameSaveStore store = new GameSaveStore(dir, "testgame", 1);
+        JsonValue data = JsonValue.NewObject();
+        data.PutInt("score", 42);
+        Console.WriteLine("slotSaved=" + Convert.ToString(store.Save(0, data)));
+        JsonValue back = store.Load(0);
+        Console.WriteLine("slotLoaded=" + (back != null ? Convert.ToString(back.Int("score", -1)) : "null"));
+        SaveSlotInfo info = store.Info(0);
+        Console.WriteLine("slotInfo=" + (info != null ? Convert.ToString(info.Exists ? 1 : 0) : "null")
+            + "," + (info != null ? Convert.ToString(info.Version) : "-1")
+            + "," + (info != null ? Convert.ToString(info.SavedAt > 0 ? 1 : 0) : "-1"));
+
+        // 覆盖一次产生备份；主档写坏后自动回退到备份
+        JsonValue second = JsonValue.NewObject();
+        second.PutInt("score", 7);
+        store.Save(0, second);
+        File.WriteAllText(store.PathOf(0), "broken");
+        JsonValue fallback = store.Load(0);
+        Console.WriteLine("fallback=" + (fallback != null ? Convert.ToString(fallback.Int("score", -1)) : "null"));
+
+        // 删除
+        Console.WriteLine("deleted=" + Convert.ToString(store.Delete(0))
+            + "," + Convert.ToString(store.Has(0)));
+    }
+}

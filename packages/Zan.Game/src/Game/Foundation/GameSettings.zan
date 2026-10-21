@@ -1,0 +1,228 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+
+namespace Game.Foundation;
+
+// 一个设置项：键、界面标签、类型、当前值、默认值与约束。
+// 值统一存成字符串（按类型解析）——加新类型不用迁移旧配置文件。
+public class SettingItem {
+    public const int KindBool = 0;
+    public const int KindInt = 1;
+    public const int KindDouble = 2;
+    public const int KindText = 3;
+    public const int KindOption = 4;
+
+    public string Key;
+    public string Label;
+    public int Kind;
+    public string Value;
+    public string DefaultValue;
+    public int IntMin;
+    public int IntMax;
+    public int IntStep;
+    public double DoubleMin;
+    public double DoubleMax;
+    public List<string> Options;
+
+    public SettingItem(string key, string label, int kind, string def) {
+        this.Key = key;
+        this.Label = label;
+        this.Kind = kind;
+        this.DefaultValue = def;
+        this.Value = def;
+        this.IntMin = 0;
+        this.IntMax = 0;
+        this.IntStep = 1;
+        this.DoubleMin = 0.0;
+        this.DoubleMax = 0.0;
+        this.Options = new List<string>();
+    }
+}
+
+// 设置基座：项目声明选项（键 / 标签 / 类型 / 默认值 / 约束），
+// 基座负责取值、校验、持久化。
+//
+// **只管数据，不管界面**：面板可以用代码控件，也可以用 HTML 设计稿，
+// 读写的都是这里的键值。这样"有设置"这条商业级口径不必每个项目重写一遍
+// 存盘、校验、默认值回退。
+//
+// 值以字符串存储、按类型解析：加新类型不会让旧配置文件作废。
+public class GameSettings {
+    List<SettingItem> items;
+    string path;
+
+    public GameSettings() {
+        this.items = new List<SettingItem>();
+        this.path = "";
+    }
+
+    // 指定持久化文件（不指定则只在内存里）。
+    public GameSettings At(string file) {
+        this.path = file;
+        return this;
+    }
+
+    public void AddBool(string key, string label, bool def) {
+        this.items.Add(new SettingItem(key, label, SettingItem.KindBool,
+            def ? "true" : "false"));
+    }
+
+    public void AddInt(string key, string label, int def, int min, int max, int step) {
+        SettingItem item = new SettingItem(key, label, SettingItem.KindInt,
+            Convert.ToString(def));
+        item.IntMin = min;
+        item.IntMax = max;
+        item.IntStep = step <= 0 ? 1 : step;
+        this.items.Add(item);
+    }
+
+    public void AddDouble(string key, string label, double def, double min, double max) {
+        SettingItem item = new SettingItem(key, label, SettingItem.KindDouble,
+            Convert.ToString(def));
+        item.DoubleMin = min;
+        item.DoubleMax = max;
+        this.items.Add(item);
+    }
+
+    public void AddText(string key, string label, string def) {
+        this.items.Add(new SettingItem(key, label, SettingItem.KindText, def));
+    }
+
+    // 枚举项：候选列表里挑一个。
+    public void AddOption(string key, string label, string def, List<string> options) {
+        SettingItem item = new SettingItem(key, label, SettingItem.KindOption, def);
+        for (int i = 0; i < options.Count; i = i + 1) { item.Options.Add(options[i]); }
+        this.items.Add(item);
+    }
+
+    public int Count() { return this.items.Count; }
+
+    public SettingItem ItemAt(int i) { return this.items[i]; }
+
+    public SettingItem Find(string key) {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            if (this.items[i].Key == key) { return this.items[i]; }
+        }
+        return null;
+    }
+
+    public bool Has(string key) { return this.Find(key) != null; }
+
+    public bool GetBool(string key) {
+        SettingItem item = this.Find(key);
+        if (item == null) { return false; }
+        return item.Value == "true";
+    }
+
+    public int GetInt(string key) {
+        SettingItem item = this.Find(key);
+        if (item == null) { return 0; }
+        return Convert.ToInt32(item.Value);
+    }
+
+    public double GetDouble(string key) {
+        SettingItem item = this.Find(key);
+        if (item == null) { return 0.0; }
+        return Convert.ToDouble(item.Value);
+    }
+
+    public string GetText(string key) {
+        SettingItem item = this.Find(key);
+        if (item == null) { return ""; }
+        return item.Value;
+    }
+
+    // 写值前按类型校验；不合法（越界 / 候选外 / 类型不符）就**忽略**，
+    // 保持旧值——设置面板上的滑杆拖过头也不该把配置写坏。
+    public void SetBool(string key, bool value) {
+        SettingItem item = this.Find(key);
+        if (item == null || item.Kind != SettingItem.KindBool) { return; }
+        item.Value = value ? "true" : "false";
+    }
+
+    public void SetInt(string key, int value) {
+        SettingItem item = this.Find(key);
+        if (item == null || item.Kind != SettingItem.KindInt) { return; }
+        if (item.IntMax > item.IntMin && (value < item.IntMin || value > item.IntMax)) { return; }
+        item.Value = Convert.ToString(value);
+    }
+
+    public void SetDouble(string key, double value) {
+        SettingItem item = this.Find(key);
+        if (item == null || item.Kind != SettingItem.KindDouble) { return; }
+        if (item.DoubleMax > item.DoubleMin
+            && (value < item.DoubleMin || value > item.DoubleMax)) { return; }
+        item.Value = Convert.ToString(value);
+    }
+
+    public void SetText(string key, string value) {
+        SettingItem item = this.Find(key);
+        if (item == null || item.Kind != SettingItem.KindText) { return; }
+        item.Value = value;
+    }
+
+    public void SetOption(string key, string value) {
+        SettingItem item = this.Find(key);
+        if (item == null || item.Kind != SettingItem.KindOption) { return; }
+        for (int i = 0; i < item.Options.Count; i = i + 1) {
+            if (item.Options[i] == value) { item.Value = value; return; }
+        }
+    }
+
+    // 全部回默认值。
+    public void Reset() {
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            this.items[i].Value = this.items[i].DefaultValue;
+        }
+    }
+
+    // 读配置文件：文件不存在或解析失败都**保持默认值**并返回 false
+    // （配置坏了不该让游戏起不来）。
+    public bool Load() {
+        if (this.path == "" || !File.Exists(this.path)) { return false; }
+        string text = "";
+        try {
+            text = File.ReadAllText(this.path);
+        } catch (Exception) {
+            return false;
+        }
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(text);
+        } catch (Exception) {
+            return false;
+        }
+        if (root == null || !root.IsObject()) { return false; }
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            SettingItem item = this.items[i];
+            if (!root.Has(item.Key)) { continue; }
+            string raw = root.Str(item.Key, "");
+            if (raw == "" && item.Kind != SettingItem.KindText) {
+                // 类型不对（布尔存成了空串之类）→ 保留默认值。
+                continue;
+            }
+            item.Value = raw;
+        }
+        return true;
+    }
+
+    // 写配置文件。路径为空则什么都不做（内存模式）。
+    public bool Save() {
+        if (this.path == "") { return false; }
+        JsonValue root = JsonValue.NewObject();
+        for (int i = 0; i < this.items.Count; i = i + 1) {
+            SettingItem item = this.items[i];
+            root.PutStr(item.Key, item.Value);
+        }
+        try {
+            string dir = Path.GetDirectoryName(this.path);
+            if (dir != "") { Directory.CreateDirectory(dir); }
+            File.WriteAllText(this.path, root.ToJson());
+            return true;
+        } catch (Exception) {
+            return false;
+        }
+    }
+}
