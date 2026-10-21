@@ -2379,6 +2379,23 @@ partial class Irgen {
                 if (e.sval == "ForegroundColor") { return ConsoleColorGet(false); }
                 if (e.sval == "BackgroundColor") { return ConsoleColorGet(true); }
             }
+            // Math.PI: the C host folds the member into a compile-time
+            // double constant (src/compiler/irgen_expr.c:6783). The very
+            // same digits, so a program that prints it prints the same
+            // string under both compilers.
+            if (e.a.sval == "Math" && e.sval == "PI") {
+                return new ExprVal("3.14159265358979323846", MkType("double"));
+            }
+            // Cpu.HasXxx: the C host lowers these to its compiler-internal
+            // __zan_cpu_feature() (src/compiler/irgen_expr.c:6651-6667).
+            // On a native build the host's target triple is empty, so that
+            // helper takes its "neither x86 nor arm" fallback and reports
+            // NO feature at all -- the emitted IR is a plain `ret i32 0`.
+            // The self-host has no cross-compile target either, so it
+            // answers the same "no".
+            if (e.a.sval == "Cpu" && LocalIdx("Cpu") < 0 && CpuFeatureId(e.sval) > 0) {
+                return new ExprVal("0", MkType("bool"));
+            }
             Node tc = binder.FindType(e.a.sval);
             // Vector128/256 static members (Zero, AllBitsSet) are values, not
             // storage — lower them inline instead of loading a static field
@@ -4382,6 +4399,18 @@ partial class Irgen {
         return false;
     }
 
+    // The feature id the C host's __zan_cpu_feature() takes
+    // (src/compiler/irgen_expr.c:1497-1502); 0 means "not a feature".
+    int CpuFeatureId(string name) {
+        if (name == "HasPopcnt") { return 1; }
+        if (name == "HasLzcnt") { return 2; }
+        if (name == "HasSse42") { return 3; }
+        if (name == "HasAvx2") { return 4; }
+        if (name == "HasAesNi") { return 5; }
+        if (name == "HasNeon") { return 6; }
+        return 0;
+    }
+
     // "Cls.Name" -- the name a diagnostic quotes for a call the self-host
     // cannot lower.
     string CallLabel(Node recv, string mname) {
@@ -4520,6 +4549,14 @@ partial class Irgen {
             if (cn == "Task" && mn != "Delay") {
                 diags.Error("call to 'Task." + mn + "' is not supported by the self-hosted "
                     + "compiler yet", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
+            // Cpu.CpuFeature(id): the C host lowers it to its internal
+            // __zan_cpu_feature() (src/compiler/irgen_expr.c:1488-1493).
+            // On a native build that helper reports no feature at all, so
+            // the call answers 0 -- the same value the Has* properties
+            // report.
+            if (cn == "Cpu" && mn == "CpuFeature" && e.kids.Count == 1) {
                 return new ExprVal("0", MkType("int"));
             }
             if (cn == "Environment" && mn == "ArgCount") {

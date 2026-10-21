@@ -2116,3 +2116,30 @@ kernel32、shell32、user32、advapi32、version）。
   byte[]→string 在托管语言里通常是拷贝，但 C 的出参缓冲区是**给 C
   写的**（句柄、长度、指针都往里塞），一复制就等于把结果写进临时
   对象。判据：实参那块内存**会不会被 C 侧写**——会，就不能复制。
+## 114. 宿主把 `Math.PI` 和 `Cpu.*` 当内建：自举照抄，连宿主的"恒 0"一起照抄
+
+- 坑（实测）：`packages/Zan.Gui` 里的 `Math.PI` 和
+  `stdlib` 里的 `Cpu.HasSse42` 让自举**直接拒绝编译**两个用例
+  （"Math is a built-in type and cannot be used as a value" +
+  "unresolved identifier 'Cpu'"）。宿主这边：
+  - `Math.PI` 被折成**编译期 double 常量**（`src/compiler/irgen_expr.c:6783`，
+    3.14159265358979323846），压根不走成员查找；
+  - `Cpu.HasXxx` / `Cpu.CpuFeature(id)` 被降成编译器内部的
+    `__zan_cpu_feature()`（`irgen_expr.c:1488` 调用、`irgen_expr.c:6651`
+    属性），**完全绕开 stdlib 的 `System.Runtime.Intrinsics.Cpu` 类**。
+- 关键事实：原生构建时 `g->target_triple` 是**空串**（只有 `--target`
+  交叉编译才填，`src/compiler/irgen.c:1568`），而 `cpu_feature_fn` 用
+  `strstr(triple, "x86")` 判架构——空串既不是 x86 也不是 arm → 走
+  "其它平台"回退 → 发射出来的 IR 就是
+  `define internal i32 @__zan_cpu_feature(i32) { ret i32 0 }`。
+  于是宿主在**任何机器上**都报"没有 popcnt / sse42 / avx2"，
+  `Cpu.CpuFeature(n)` 恒为 0。同一文件里的 `emit_target_is_x86`
+  反而正确处理了空串——两个函数对空串的判断不一致，宿主选了保守的那个。
+- 做法：自举照抄这个行为——`Math.PI` 折成同一个 double（打印出来是
+  `3.141592653589793`），`Cpu.HasXxx` 折成 `false`，
+  `Cpu.CpuFeature(n)` 折成 `0`。**不要**去问真正的 CPU：自举若走 stdlib 的
+  `zan_cpu_feature` 会拿到真实值（1），和宿主对不上。
+- 通用教训：**"宿主是规格"包括宿主的 bug**。自举对齐的目标是"两边输出
+  逐字相同"，不是"两边都正确"。遇到宿主明显不合常理的行为（空 triple →
+  恒 0），先确认它确实是当前宿主的行为，再照抄，并在注释和 skill 里
+  写明"这是宿主的保守回退"，免得后人当成自举的缺陷去"修"。
