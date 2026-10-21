@@ -1,0 +1,217 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Profiler;
+
+// 帧分析器：把一批帧样本变成可读的结论。
+//
+// **三个问题，三个函数**：
+//   - `Stats`——整体什么水平？（均值/中位/p95、超预算占比、卡顿连片）
+//   - `Hotspots`——谁在吃时间？（按累计耗时排，不按单帧最慢排）
+//   - `OverBudgetAttribution`——卡掉的那几帧，是谁吃掉的？（只统计超预算帧）
+//
+// 最后一个最有用：整体热点常常是"稳定开销"（每帧都在付的税），而真正让玩家
+// 觉得卡的，是**超预算帧里的那个大头**。两者常常不是同一个分段。
+public class FrameAnalyzer {
+    // 整体统计。
+    public static FrameStats Stats(List<FrameSample> frames, FrameBudget budget) {
+        if (frames == null || frames.Count == 0) {
+            throw new ProfilerException(ProfError.EmptySample, "no frames to analyze");
+        }
+        int n = frames.Count;
+        List<double> totals = new List<double>();
+        double sum = 0.0;
+        for (int i = 0; i < n; i = i + 1) {
+            double t = frames[i].totalMs;
+            totals.Add(t);
+            sum = sum + t;
+        }
+        List<double> sorted = ProfSort.SortDoubles(totals);
+
+        FrameStats st = new FrameStats();
+        st.count = n;
+        st.totalMs = sum;
+        st.meanMs = sum / (double)n;
+        st.minMs = sorted[0];
+        st.maxMs = sorted[n - 1];
+        st.medianMs = Percentile(sorted, 0.50);
+        st.p90Ms = Percentile(sorted, 0.90);
+        st.p95Ms = Percentile(sorted, 0.95);
+        st.p99Ms = Percentile(sorted, 0.99);
+
+        if (budget != null) {
+            int over = 0;
+            for (int i = 0; i < n; i = i + 1) {
+                if (frames[i].totalMs > budget.ms) { over = over + 1; }
+            }
+            st.overBudgetCount = over;
+            st.overBudgetRatio = (double)over / (double)n;
+            List<StutterRun> runs = StutterRuns(frames, budget);
+            st.stutterRunCount = runs.Count;
+            int longest = 0;
+            for (int i = 0; i < runs.Count; i = i + 1) {
+                if (runs[i].count > longest) { longest = runs[i].count; }
+            }
+            st.longestStutterRun = longest;
+        }
+        return st;
+    }
+
+    // 最近秩分位数：p = ceil(q × n)（1 基），取该位的样本。
+    //
+    // 不用插值：插值出来的 p95 是"某个不存在的帧"的虚构耗时，看报告的人会去
+    // 找那一帧。最近秩给的是**真实出现过的某一帧**。
+    public static double Percentile(List<double> sorted, double q) {
+        int n = sorted.Count;
+        if (n <= 0) { return 0.0; }
+        double exact = (double)n * q;
+        int rank = (int)exact;
+        if ((double)rank < exact) { rank = rank + 1; }   // 向上取整
+        if (rank < 1) { rank = 1; }
+        if (rank > n) { rank = n; }
+        return sorted[rank - 1];
+    }
+
+    // 热点（按累计耗时降序；耗时相同的按名字升序，保证输出确定）。
+    // topN <= 0 表示全给。
+    public static List<Hotspot> Hotspots(List<FrameSample> frames, int topN) {
+        if (frames == null || frames.Count == 0) {
+            throw new ProfilerException(ProfError.EmptySample, "no frames to analyze");
+        }
+        // 所有出现过的分段名（保持首次出现顺序）。
+        List<string> names = new List<string>();
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            FrameSample f = frames[i];
+            for (int j = 0; j < f.ScopeCount(); j = j + 1) {
+                string nm = f.ScopeAt(j).name;
+                if (!names.Contains(nm)) { names.Add(nm); }
+            }
+        }
+
+        double frameTotal = 0.0;
+        for (int i = 0; i < frames.Count; i = i + 1) { frameTotal = frameTotal + frames[i].totalMs; }
+
+        List<Hotspot> list = new List<Hotspot>();
+        for (int i = 0; i < names.Count; i = i + 1) {
+            list.Add(BuildHotspot(names[i], frames, frameTotal));
+        }
+        list = SortHotspots(list);
+        if (topN > 0 && list.Count > topN) {
+            List<Hotspot> trimmed = new List<Hotspot>();
+            for (int i = 0; i < topN; i = i + 1) { trimmed.Add(list[i]); }
+            return trimmed;
+        }
+        return list;
+    }
+
+    // 超预算帧的归因：只统计超预算的帧，看是谁吃掉了这些帧的时间。
+    public static List<Hotspot> OverBudgetAttribution(List<FrameSample> frames,
+                                                       FrameBudget budget, int topN) {
+        if (frames == null || frames.Count == 0) {
+            throw new ProfilerException(ProfError.EmptySample, "no frames to analyze");
+        }
+        if (budget == null) {
+            throw new ProfilerException(ProfError.InvalidBudget, "budget is required for attribution");
+        }
+        List<FrameSample> over = new List<FrameSample>();
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            if (frames[i].totalMs > budget.ms) { over.Add(frames[i]); }
+        }
+        if (over.Count == 0) { return new List<Hotspot>(); }
+        return Hotspots(over, topN);
+    }
+
+    // 连续超预算的帧段。
+    public static List<StutterRun> StutterRuns(List<FrameSample> frames, FrameBudget budget) {
+        List<StutterRun> runs = new List<StutterRun>();
+        if (frames == null || frames.Count == 0 || budget == null) { return runs; }
+        StutterRun cur = null;
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            FrameSample f = frames[i];
+            if (f.totalMs > budget.ms) {
+                if (cur == null) {
+                    cur = new StutterRun();
+                    cur.startFrame = f.frameNo;
+                    cur.count = 0;
+                    cur.worstMs = 0.0;
+                    cur.excessMs = 0.0;
+                }
+                cur.count = cur.count + 1;
+                cur.endFrame = f.frameNo;
+                if (f.totalMs > cur.worstMs) { cur.worstMs = f.totalMs; }
+                cur.excessMs = cur.excessMs + (f.totalMs - budget.ms);
+                if (cur.count == 1) { runs.Add(cur); }
+            } else {
+                cur = null;
+            }
+        }
+        return runs;
+    }
+
+    // 没被任何分段覆盖的时间占比（0..1）——"帧为什么卡"最常见的答案就是这个
+    // 数很大：说明有代码没插桩。
+    public static double UntrackedShare(List<FrameSample> frames) {
+        if (frames == null || frames.Count == 0) { return 0.0; }
+        double untracked = 0.0;
+        double total = 0.0;
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            untracked = untracked + frames[i].untrackedMs;
+            total = total + frames[i].totalMs;
+        }
+        if (total == 0.0) { return 0.0; }
+        return untracked / total;
+    }
+
+    // 汇总一个分段的热点数据。
+    static Hotspot BuildHotspot(string name, List<FrameSample> frames, double frameTotal) {
+        List<double> values = new List<double>();
+        int calls = 0;
+        double total = 0.0;
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            FrameSample f = frames[i];
+            for (int j = 0; j < f.ScopeCount(); j = j + 1) {
+                ScopeSample s = f.ScopeAt(j);
+                if (s.name != name) { continue; }
+                values.Add(s.ms);
+                total = total + s.ms;
+                calls = calls + s.calls;
+            }
+        }
+        List<double> sorted = ProfSort.SortDoubles(values);
+        Hotspot h = new Hotspot();
+        h.name = name;
+        h.framesPresent = values.Count;
+        h.callsTotal = calls;
+        h.totalMs = total;
+        if (values.Count > 0) {
+            h.meanMs = total / (double)values.Count;
+            h.medianMs = Percentile(sorted, 0.50);
+            h.p95Ms = Percentile(sorted, 0.95);
+            h.maxMs = sorted[values.Count - 1];
+        }
+        if (frameTotal > 0.0) { h.share = total / frameTotal; }
+        return h;
+    }
+
+    // 热点排序：累计耗时降序，相同的按名字升序（输出必须确定）。
+    static List<Hotspot> SortHotspots(List<Hotspot> input) {
+        List<Hotspot> pool = new List<Hotspot>();
+        for (int i = 0; i < input.Count; i = i + 1) { pool.Add(input[i]); }
+        List<Hotspot> outp = new List<Hotspot>();
+        while (pool.Count > 0) {
+            int best = 0;
+            for (int i = 1; i < pool.Count; i = i + 1) {
+                if (HotspotBetter(pool[i], pool[best])) { best = i; }
+            }
+            outp.Add(pool[best]);
+            pool.RemoveAt(best);
+        }
+        return outp;
+    }
+
+    // 谁该排在前面。
+    static bool HotspotBetter(Hotspot a, Hotspot b) {
+        if (a.totalMs != b.totalMs) { return a.totalMs > b.totalMs; }
+        return a.name < b.name;
+    }
+}

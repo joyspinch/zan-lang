@@ -1,0 +1,73 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Profiler;
+
+// 最近 N 帧的环形缓冲。
+//
+// **为什么要环形**：剖析是长跑的——一直往 List 里塞帧会把内存吃光（每秒 60
+// 帧，一天就是 500 万个样本）。只留最近 N 帧，内存是常量。
+//
+// **覆盖最老的一帧**：满了以后新帧覆盖最老的（head 前进），而不是"满了就
+// 停采"——停了就没法看"刚才那一下卡在哪"。
+public class FrameRing {
+    // 容量（保留多少帧）。
+    public int capacity;
+    // 物理存储（容量固定，head 指向最老的一帧）。
+    private List<FrameSample> buf;
+    // 下一个写入位（物理）；满了以后它就是最老帧的位置。
+    private int head;
+    // 当前有效帧数。
+    private int count;
+
+    public FrameRing(int capacity) {
+        if (capacity <= 0) {
+            throw new ProfilerException(ProfError.InvalidBudget, "ring capacity must be > 0");
+        }
+        this.capacity = capacity;
+        this.buf = new List<FrameSample>();
+        this.head = 0;
+        this.count = 0;
+    }
+
+    // 当前有效帧数。
+    public int Count() { return this.count; }
+
+    // 塞一帧（满了就覆盖最老的一帧）。
+    public void Add(FrameSample f) {
+        if (f == null) { return; }
+        if (this.buf.Count < this.capacity) {
+            this.buf.Add(f);
+            this.count = this.buf.Count;
+            return;
+        }
+        this.buf[this.head] = f;
+        this.head = (this.head + 1) % this.capacity;
+    }
+
+    // 按逻辑顺序取帧（0 = 最老的一帧，越界返回 null）。
+    public FrameSample At(int i) {
+        if (i < 0 || i >= this.count) { return null; }
+        int physical = (this.head + i) % this.capacity;
+        return this.buf[physical];
+    }
+
+    // 最新的一帧（没有帧时返回 null）。
+    public FrameSample Latest() { return this.At(this.count - 1); }
+
+    // 按时间顺序摊平成一个列表（喂给分析器）。
+    public List<FrameSample> ToList() {
+        List<FrameSample> outp = new List<FrameSample>();
+        for (int i = 0; i < this.count; i = i + 1) {
+            FrameSample f = this.At(i);
+            if (f != null) { outp.Add(f); }
+        }
+        return outp;
+    }
+
+    public void Clear() {
+        this.buf.Clear();
+        this.head = 0;
+        this.count = 0;
+    }
+}

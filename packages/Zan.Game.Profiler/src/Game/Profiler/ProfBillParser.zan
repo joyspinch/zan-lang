@@ -1,0 +1,120 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Profiler;
+
+// 账单解析器：把 stdout 上的账单文本变成结构化的帧样本。
+//
+// **容错策略**（账单是诊断数据，不是协议报文）：
+//   - 不是 "prof " 开头的行 → 忽略（游戏自己的日志混在里面是常态）；
+//   - 是 "prof " 开头但格式不对 → **跳过并计数**，好行照常解析；
+//   - 同一个帧号的多个分段 → 合并（同名分段累加耗时与次数）。
+//
+// **为什么不用 Convert.ToDouble**：它对 "abc" 静默返回 0，账单里一个写坏的
+// 毫秒数会变成"0 毫秒"——错的值比没有值更坏，还会把热点排序带偏。这里用
+// `ProfNum.TryParse` 严格校验。
+public class ProfBillParser {
+    // 解析一份账单。
+    public static ProfParseResult Parse(string bill) {
+        ProfParseResult res = new ProfParseResult();
+        if (bill == null || bill.Length == 0) { return res; }
+
+        List<string> lines = bill.Split("\n");
+        Dictionary<long, FrameSample> byFrame = new Dictionary<long, FrameSample>();
+        List<long> order = new List<long>();
+
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.Length == 0) { continue; }
+            if (!line.StartsWith(ProfBill.Prefix())) { continue; }
+            if (!ParseLine(line, res, byFrame, order)) {
+                res.skipped = res.skipped + 1;
+                if (res.firstError == ProfError.None) {
+                    res.firstError = ProfError.MalformedLine;
+                }
+            }
+        }
+
+        // 帧号升序（账单一般是顺序打的，但解析器不假设这一点）。
+        List<long> sorted = ProfSort.SortLongs(order);
+        for (int i = 0; i < sorted.Count; i = i + 1) {
+            FrameSample fs = byFrame[sorted[i]];
+            // 账单没给 total 时，整帧耗时按分段之和推——否则这一帧的耗时是 0，
+            // 统计会把它当成"一帧 0ms"，把均值和分位数整个带偏。
+            if (!fs.hasTotal) { fs.totalMs = fs.scopeMs; }
+            res.frames.Add(fs);
+        }
+        return res;
+    }
+
+    // 解析一行。成功返回 true；格式不对返回 false（调用方计数）。
+    static bool ParseLine(string line, ProfParseResult res,
+                          Dictionary<long, FrameSample> byFrame, List<long> order) {
+        string rest = line.Substring(ProfBill.Prefix().Length);
+        List<string> toks = rest.Split(" ");
+
+        long frame = 0;
+        bool hasFrame = false;
+        string scope = null;
+        string msText = null;
+        string totalText = null;
+
+        for (int i = 0; i < toks.Count; i = i + 1) {
+            string tok = toks[i];
+            if (tok.Length == 0) { continue; }
+            int eq = tok.IndexOf("=");
+            if (eq <= 0) { return false; }              // 不是 key=value
+            string key = tok.Substring(0, eq);
+            string val = tok.Substring(eq + 1);
+            if (key == "frame") {
+                long f = 0;
+                if (!ProfNum.TryParseLong(val, out f)) { return false; }
+                frame = f;
+                hasFrame = true;
+            } else if (key == "scope") {
+                scope = val;
+            } else if (key == "ms") {
+                msText = val;
+            } else if (key == "total") {
+                totalText = val;
+            }
+            // 未知 key：忽略（前向兼容）。
+        }
+
+        if (!hasFrame) { return false; }
+
+        bool hasScope = scope != null;
+        bool hasMs = msText != null;
+        bool hasTotal = totalText != null;
+
+        if (hasScope && hasMs) {
+            if (hasTotal) { return false; }             // 一行两种语义，歧义
+            if (!ProfBill.IsScopeName(scope)) { return false; }
+            double ms = 0.0;
+            if (!ProfNum.TryParse(msText, out ms)) { return false; }
+            FrameSample fs = EnsureFrame(byFrame, order, frame);
+            fs.AddScope(scope, ms);
+            return true;
+        }
+
+        if (hasTotal && !hasScope && !hasMs) {
+            double t = 0.0;
+            if (!ProfNum.TryParse(totalText, out t)) { return false; }
+            FrameSample fs = EnsureFrame(byFrame, order, frame);
+            fs.SetTotal(t);
+            return true;
+        }
+
+        return false;
+    }
+
+    // 取（必要时建）某帧的样本，并记住帧号出现顺序。
+    static FrameSample EnsureFrame(Dictionary<long, FrameSample> byFrame,
+                                   List<long> order, long frame) {
+        if (byFrame.ContainsKey(frame)) { return byFrame[frame]; }
+        FrameSample fs = new FrameSample(frame);
+        byFrame.Add(frame, fs);
+        order.Add(frame);
+        return fs;
+    }
+}

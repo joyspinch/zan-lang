@@ -1,0 +1,463 @@
+using System;
+using System.Collections.Generic;
+using Game.Profiler;
+
+// 帧剖析契约测试：账单格式 / 解析 / 帧预算分析 / 环形缓冲 / 采集走廊 / 报告。
+//
+// 覆盖的判定点：
+//   - 严格数值：坏输入必须判失败（不能用 Convert.ToDouble 那种"静默返回 0"）；
+//   - 账单解析：好行解析、坏行跳过并计数、非账单行忽略、未知 key 前向兼容、
+//     帧号排序、同名分段合并、没给 total 时按分段和推；
+//   - 统计：均值 / 中位 / p90 / p95 / p99（最近秩）、超预算计数与占比、
+//     卡顿连片（连续帧合并成一段）、最长连片；
+//   - 热点：按累计耗时降序、同耗时按名字升序、出现帧数 / 次数 / 中位 / p95；
+//   - 归因：只统计超预算帧（整体热点与卡顿元凶常常不是同一个分段）；
+//   - 环形缓冲：容量固定、覆盖最老的一帧、逻辑顺序；
+//   - 采集走廊：环境变量门控、关着时空操作、开着时产出**自己能解析**的账单、
+//     分段没闭合 / 分段名非法 / 帧没开 / 帧重开各有各的错误码；
+//   - 报告：文本与 JSON 的关键字段。
+//
+// golden 只锁定"全过"那行。
+public class GameProfilerTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckEq(string name, long actual, long expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double eps) {
+        double d = actual - expected;
+        if (d < 0.0) { d = -d; }
+        if (d > eps) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static void CheckStr(string name, string actual, string expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=[" + actual + "] expected=[" + expected + "]");
+        }
+    }
+
+    // 干净账单：5 帧，每帧 update + render + total。
+    //
+    // 帧耗时：16 / 18 / 30 / 14 / 16（预算 16ms → 第 2、3 帧超预算，且相邻
+    // → 一段长度 2 的卡顿连片）。
+    private static string CleanBill() {
+        string b = "";
+        b = b + "prof frame=1 scope=update ms=4.000\n";
+        b = b + "prof frame=1 scope=render ms=8.000\n";
+        b = b + "prof frame=1 total=16.000\n";
+        b = b + "prof frame=2 scope=update ms=5.000\n";
+        b = b + "prof frame=2 scope=render ms=9.000\n";
+        b = b + "prof frame=2 total=18.000\n";
+        b = b + "prof frame=3 scope=update ms=6.000\n";
+        b = b + "prof frame=3 scope=render ms=20.000\n";
+        b = b + "prof frame=3 total=30.000\n";
+        b = b + "prof frame=4 scope=update ms=4.000\n";
+        b = b + "prof frame=4 scope=render ms=10.000\n";
+        b = b + "prof frame=4 total=14.000\n";
+        b = b + "prof frame=5 scope=update ms=5.000\n";
+        b = b + "prof frame=5 scope=render ms=9.000\n";
+        b = b + "prof frame=5 total=16.000\n";
+        return b;
+    }
+
+    public static void Main() {
+        TestNum();
+        TestParse();
+        TestStats();
+        TestHotspots();
+        TestAttribution();
+        TestRing();
+        TestCorridor();
+        TestReport();
+        TestErrors();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL GAME PROFILER TESTS PASSED");
+        }
+    }
+
+    // ---- 严格数值 ----
+    private static void TestNum() {
+        double v = 0.0;
+        Check("num/ok", ProfNum.TryParse("3.210", out v));
+        CheckNear("num/ok/value", v, 3.21, 1e-9);
+        Check("num/neg", ProfNum.TryParse("-1.5", out v));
+        CheckNear("num/neg/value", v, -1.5, 1e-9);
+        Check("num/exp", ProfNum.TryParse("1e2", out v));
+        CheckNear("num/exp/value", v, 100.0, 1e-9);
+        Check("num/plus", ProfNum.TryParse("+7", out v));
+        CheckNear("num/plus/value", v, 7.0, 1e-9);
+        // 坏输入必须判失败（静默返回 0 会把账单带偏）。
+        Check("num/word", !ProfNum.TryParse("abc", out v));
+        Check("num/trailing", !ProfNum.TryParse("12x", out v));
+        Check("num/empty", !ProfNum.TryParse("", out v));
+        Check("num/dot", !ProfNum.TryParse(".", out v));
+        Check("num/exp-bad", !ProfNum.TryParse("1e", out v));
+        Check("num/space", !ProfNum.TryParse(" 1", out v));
+
+        long lv = 0;
+        Check("num/long-ok", ProfNum.TryParseLong("42", out lv));
+        CheckEq("num/long-ok/value", lv, 42);
+        Check("num/long-bad", !ProfNum.TryParseLong("4x2", out lv));
+        Check("num/long-empty", !ProfNum.TryParseLong("", out lv));
+
+        CheckStr("num/fixed", ProfNum.Fixed(16.6666666, 3), "16.667");
+        CheckStr("num/fixed-pad", ProfNum.Fixed(0.5, 2), "0.50");
+        CheckStr("num/fixed-int", ProfNum.Fixed(7.0, 0), "7");
+        CheckStr("num/percent", ProfNum.Percent(1.0, 3.0, 1), "33.3%");
+        CheckStr("num/percent-zero", ProfNum.Percent(1.0, 0.0, 1), "0.0%");
+    }
+
+    // ---- 账单解析 ----
+    private static void TestParse() {
+        ProfParseResult res = ProfBillParser.Parse(CleanBill());
+        CheckEq("parse/frames", res.FrameCount(), 5);
+        CheckEq("parse/skipped", res.skipped, 0);
+        Check("parse/error-none", res.firstError == ProfError.None);
+        CheckEq("parse/frame-no", res.frames[0].frameNo, 1);
+        CheckEq("parse/frame-order", res.frames[4].frameNo, 5);
+        CheckNear("parse/total", res.frames[0].totalMs, 16.0, 1e-9);
+        CheckNear("parse/scope-ms", res.frames[0].ScopeMs("update"), 4.0, 1e-9);
+        Check("parse/has-scope", res.frames[0].HasScope("render"));
+        Check("parse/no-scope", !res.frames[0].HasScope("audio"));
+        CheckEq("parse/scope-count", res.frames[0].ScopeCount(), 2);
+        // 未覆盖部分 = total - 分段和 = 16 - 12 = 4
+        CheckNear("parse/untracked", res.frames[0].untrackedMs, 4.0, 1e-9);
+
+        // 坏行与杂音：非账单行忽略、坏行计数、未知 key 前向兼容。
+        string dirty = "";
+        dirty = dirty + "game log: hello\n";
+        dirty = dirty + "prof frame=1 scope=update ms=4.000\n";
+        dirty = dirty + "prof frame=1 total=16.000\n";
+        dirty = dirty + "prof frame=2 scope=update ms=abc\n";
+        dirty = dirty + "prof frame=3 scope=update ms=5.000\n";
+        dirty = dirty + "prof frame=3 scope=render extra=1 ms=6.000\n";
+        dirty = dirty + "prof frame=3 total=11.000\n";
+        dirty = dirty + "prof frame=4\n";
+        ProfParseResult d = ProfBillParser.Parse(dirty);
+        CheckEq("parse/dirty-frames", d.FrameCount(), 2);
+        CheckEq("parse/dirty-skipped", d.skipped, 2);
+        Check("parse/dirty-error", d.firstError == ProfError.MalformedLine);
+        // 未知 key 被忽略，render 分段照样解析出来。
+        CheckNear("parse/forward-compat", d.frames[1].ScopeMs("render"), 6.0, 1e-9);
+        CheckNear("parse/forward-compat-total", d.frames[1].totalMs, 11.0, 1e-9);
+
+        // 帧号乱序 + 同名分段合并。
+        string odd = "";
+        odd = odd + "prof frame=3 scope=x ms=1.000\n";
+        odd = odd + "prof frame=1 scope=x ms=2.000\n";
+        odd = odd + "prof frame=3 scope=x ms=3.000\n";
+        ProfParseResult o = ProfBillParser.Parse(odd);
+        CheckEq("parse/odd-frames", o.FrameCount(), 2);
+        CheckEq("parse/odd-order", o.frames[0].frameNo, 1);
+        CheckEq("parse/odd-order2", o.frames[1].frameNo, 3);
+        CheckNear("parse/odd-merged", o.frames[1].ScopeMs("x"), 4.0, 1e-9);
+        CheckEq("parse/odd-calls", o.frames[1].ScopeAt(0).calls, 2);
+
+        // 没有 total 行：整帧耗时按分段和推（否则这一帧是 0ms，会带偏统计）。
+        string noTotal = "prof frame=7 scope=a ms=1.000\nprof frame=7 scope=b ms=2.000\n";
+        ProfParseResult nt = ProfBillParser.Parse(noTotal);
+        CheckEq("parse/nototal-frames", nt.FrameCount(), 1);
+        CheckNear("parse/nototal-total", nt.frames[0].totalMs, 3.0, 1e-9);
+        CheckNear("parse/nototal-untracked", nt.frames[0].untrackedMs, 0.0, 1e-9);
+
+        // 空账单：不是错误，是"没有数据"。
+        ProfParseResult empty = ProfBillParser.Parse("");
+        CheckEq("parse/empty-frames", empty.FrameCount(), 0);
+        CheckEq("parse/empty-skipped", empty.skipped, 0);
+    }
+
+    // ---- 统计 ----
+    private static void TestStats() {
+        ProfParseResult res = ProfBillParser.Parse(CleanBill());
+        FrameBudget budget = new FrameBudget(16.0);
+        FrameStats st = FrameAnalyzer.Stats(res.frames, budget);
+        CheckEq("stats/count", st.count, 5);
+        CheckNear("stats/total", st.totalMs, 94.0, 1e-9);
+        CheckNear("stats/mean", st.meanMs, 18.8, 1e-9);
+        CheckNear("stats/min", st.minMs, 14.0, 1e-9);
+        CheckNear("stats/max", st.maxMs, 30.0, 1e-9);
+        // 最近秩：p50 → ceil(0.5*5)=3 → 排序后第 3 个 = 16
+        CheckNear("stats/median", st.medianMs, 16.0, 1e-9);
+        // p90 → ceil(4.5)=5 → 30
+        CheckNear("stats/p90", st.p90Ms, 30.0, 1e-9);
+        CheckNear("stats/p95", st.p95Ms, 30.0, 1e-9);
+        CheckNear("stats/p99", st.p99Ms, 30.0, 1e-9);
+        // 预算 16ms：18 与 30 超；16.000 不算超（严格大于）。
+        CheckEq("stats/over-count", st.overBudgetCount, 2);
+        CheckNear("stats/over-ratio", st.overBudgetRatio, 0.4, 1e-9);
+        // 第 2、3 帧相邻 → 一段长度 2 的连片。
+        CheckEq("stats/stutter-runs", st.stutterRunCount, 1);
+        CheckEq("stats/longest-run", st.longestStutterRun, 2);
+
+        List<StutterRun> runs = FrameAnalyzer.StutterRuns(res.frames, budget);
+        CheckEq("stutter/count", runs.Count, 1);
+        CheckEq("stutter/start", runs[0].startFrame, 2);
+        CheckEq("stutter/end", runs[0].endFrame, 3);
+        CheckEq("stutter/len", runs[0].count, 2);
+        CheckNear("stutter/worst", runs[0].worstMs, 30.0, 1e-9);
+        // 超出量 = (18-16) + (30-16) = 16
+        CheckNear("stutter/excess", runs[0].excessMs, 16.0, 1e-9);
+
+        // 未覆盖部分占比 = (4+4+4+0+2) / 94 = 14/94
+        CheckNear("stats/untracked-share", FrameAnalyzer.UntrackedShare(res.frames), 14.0 / 94.0, 1e-9);
+    }
+
+    // ---- 热点 ----
+    private static void TestHotspots() {
+        ProfParseResult res = ProfBillParser.Parse(CleanBill());
+        List<Hotspot> hs = FrameAnalyzer.Hotspots(res.frames, 0);
+        CheckEq("hot/count", hs.Count, 2);
+        // render 累计 56 > update 累计 24 → render 在前。
+        CheckStr("hot/first", hs[0].name, "render");
+        CheckStr("hot/second", hs[1].name, "update");
+        CheckNear("hot/render-total", hs[0].totalMs, 56.0, 1e-9);
+        CheckNear("hot/render-mean", hs[0].meanMs, 11.2, 1e-9);
+        // render 值 8,9,20,10,9 → 排序 8,9,9,10,20 → 中位(第3)=9，p95(第5)=20
+        CheckNear("hot/render-median", hs[0].medianMs, 9.0, 1e-9);
+        CheckNear("hot/render-p95", hs[0].p95Ms, 20.0, 1e-9);
+        CheckNear("hot/render-max", hs[0].maxMs, 20.0, 1e-9);
+        CheckEq("hot/render-frames", hs[0].framesPresent, 5);
+        CheckEq("hot/render-calls", hs[0].callsTotal, 5);
+        CheckNear("hot/render-share", hs[0].share, 56.0 / 94.0, 1e-9);
+        CheckNear("hot/update-total", hs[1].totalMs, 24.0, 1e-9);
+        // update 值 4,5,6,4,5 → 排序 4,4,5,5,6 → 中位 5
+        CheckNear("hot/update-median", hs[1].medianMs, 5.0, 1e-9);
+        CheckNear("hot/update-p95", hs[1].p95Ms, 6.0, 1e-9);
+
+        // 截断：topN=1 只给一个。
+        List<Hotspot> one = FrameAnalyzer.Hotspots(res.frames, 1);
+        CheckEq("hot/topn", one.Count, 1);
+        CheckStr("hot/topn-name", one[0].name, "render");
+
+        // 同耗时按名字升序（输出必须确定，不能靠字典遍历顺序）。
+        string tie = "";
+        tie = tie + "prof frame=1 scope=beta ms=5.000\n";
+        tie = tie + "prof frame=1 scope=alpha ms=5.000\n";
+        tie = tie + "prof frame=1 total=10.000\n";
+        ProfParseResult tr = ProfBillParser.Parse(tie);
+        List<Hotspot> th = FrameAnalyzer.Hotspots(tr.frames, 0);
+        CheckStr("hot/tie-first", th[0].name, "alpha");
+        CheckStr("hot/tie-second", th[1].name, "beta");
+    }
+
+    // ---- 超预算归因 ----
+    private static void TestAttribution() {
+        ProfParseResult res = ProfBillParser.Parse(CleanBill());
+        FrameBudget budget = new FrameBudget(16.0);
+        List<Hotspot> at = FrameAnalyzer.OverBudgetAttribution(res.frames, budget, 0);
+        // 只有第 2、3 两帧（18 / 30）进归因。
+        CheckEq("attr/count", at.Count, 2);
+        CheckStr("attr/first", at[0].name, "render");
+        CheckEq("attr/frames", at[0].framesPresent, 2);
+        // render 9 + 20 = 29；update 5 + 6 = 11
+        CheckNear("attr/render-total", at[0].totalMs, 29.0, 1e-9);
+        CheckNear("attr/update-total", at[1].totalMs, 11.0, 1e-9);
+        // 归因里的占比以"超预算帧的总耗时"为分母（18+30=48），不是全部帧。
+        CheckNear("attr/share", at[0].share, 29.0 / 48.0, 1e-9);
+        // 没有超预算帧时给空表（不是错误）。
+        FrameBudget loose = new FrameBudget(1000.0);
+        CheckEq("attr/none", FrameAnalyzer.OverBudgetAttribution(res.frames, loose, 0).Count, 0);
+    }
+
+    // ---- 环形缓冲 ----
+    private static void TestRing() {
+        FrameRing ring = new FrameRing(3);
+        CheckEq("ring/count0", ring.Count(), 0);
+        for (int i = 1; i <= 5; i = i + 1) {
+            FrameSample f = new FrameSample(i);
+            f.SetTotal((double)i);
+            ring.Add(f);
+        }
+        CheckEq("ring/count", ring.Count(), 3);
+        // 满了以后覆盖最老的：留下 3、4、5。
+        FrameSample oldest = ring.At(0);
+        FrameSample middle = ring.At(1);
+        FrameSample newest = ring.At(2);
+        Check("ring/oldest-not-null", oldest != null);
+        Check("ring/middle-not-null", middle != null);
+        Check("ring/newest-not-null", newest != null);
+        if (oldest != null) { CheckEq("ring/oldest", oldest.frameNo, 3); }
+        if (middle != null) { CheckEq("ring/middle", middle.frameNo, 4); }
+        if (newest != null) { CheckEq("ring/newest", newest.frameNo, 5); }
+        FrameSample latest = ring.Latest();
+        Check("ring/latest-not-null", latest != null);
+        if (latest != null) { CheckEq("ring/latest", latest.frameNo, 5); }
+        Check("ring/out-of-range", ring.At(3) == null);
+        CheckEq("ring/tolist", ring.ToList().Count, 3);
+        CheckEq("ring/tolist-order", ring.ToList()[0].frameNo, 3);
+        ring.Clear();
+        CheckEq("ring/cleared", ring.Count(), 0);
+    }
+
+    // ---- 采集走廊 ----
+    private static void TestCorridor() {
+        // 关着的时候：所有调用都是空操作，账单为空。
+        ProfCorridor off = new ProfCorridor("GAME_PROF_TEST_NEVER_SET", false);
+        Check("corridor/off-disabled", !off.enabled);
+        off.BeginFrame();
+        off.BeginScope("update");
+        off.EndScope();
+        off.EndFrame();
+        CheckStr("corridor/off-bill", off.Bill(), "");
+        CheckEq("corridor/off-frames", off.FrameCount(), 0);
+
+        // 环境变量门控。
+        Check("corridor/env-unset", !ProfCorridor.EnvOn("GAME_PROF_TEST_NEVER_SET"));
+        Check("corridor/env-empty-name", !ProfCorridor.EnvOn(""));
+        Environment.SetEnvironmentVariable("GAME_PROF_TEST_GATE", "1");
+        Check("corridor/env-on", ProfCorridor.EnvOn("GAME_PROF_TEST_GATE"));
+        Environment.SetEnvironmentVariable("GAME_PROF_TEST_GATE", "0");
+        Check("corridor/env-zero-off", !ProfCorridor.EnvOn("GAME_PROF_TEST_GATE"));
+        Environment.SetEnvironmentVariable("GAME_PROF_TEST_GATE", null);
+
+        // 开着的时候：产出**自己能解析**的账单。
+        ProfCorridor c = new ProfCorridor("GAME_PROF_TEST", true);
+        c.echo = false;
+        c.BeginFrame();
+        c.BeginScope("update");
+        c.BeginScope("inner");
+        c.EndScope();
+        c.EndScope();
+        c.EndFrame();
+        CheckEq("corridor/frames", c.FrameCount(), 1);
+        string bill = c.Bill();
+        Check("corridor/bill-not-empty", bill.Length > 0);
+        ProfParseResult back = ProfBillParser.Parse(bill);
+        CheckEq("corridor/roundtrip-frames", back.FrameCount(), 1);
+        CheckEq("corridor/roundtrip-skipped", back.skipped, 0);
+        Check("corridor/roundtrip-update", back.frames[0].HasScope("update"));
+        Check("corridor/roundtrip-inner", back.frames[0].HasScope("inner"));
+        Check("corridor/roundtrip-total", back.frames[0].hasTotal);
+        Check("corridor/roundtrip-has-frame", bill.Contains("frame=1"));
+        Check("corridor/roundtrip-has-scope", bill.Contains("scope=update"));
+    }
+
+    // ---- 报告 ----
+    private static void TestReport() {
+        ProfParseResult res = ProfBillParser.Parse(CleanBill());
+        FrameBudget budget = new FrameBudget(16.0);
+        ProfileReport rep = ProfileReport.Analyze(res.frames, budget, 5);
+        CheckEq("report/frames", rep.frameCount, 5);
+        CheckNear("report/budget", rep.budgetMs, 16.0, 1e-9);
+        CheckEq("report/hotspots", rep.hotspots.Count, 2);
+        CheckEq("report/attribution", rep.attribution.Count, 2);
+        CheckEq("report/stutters", rep.stutters.Count, 1);
+        CheckNear("report/untracked", rep.untrackedShare, 14.0 / 94.0, 1e-9);
+
+        string text = rep.ToText();
+        Check("report/text-frames", text.Contains("frames=5"));
+        Check("report/text-budget", text.Contains("budget=16.000ms"));
+        Check("report/text-over", text.Contains("over budget: 2/5"));
+        Check("report/text-stutter", text.Contains("stutter runs: 1"));
+        Check("report/text-untracked", text.Contains("untracked: 14.9%"));
+        Check("report/text-hotspots", text.Contains("hotspots:"));
+        Check("report/text-attribution", text.Contains("over-budget attribution:"));
+        Check("report/text-render-total", text.Contains("total=56.000ms"));
+
+        string json = rep.ToJson();
+        Check("report/json-frames", json.Contains("\"frames\":5"));
+        Check("report/json-budget", json.Contains("\"budgetMs\":16"));
+        Check("report/json-over", json.Contains("\"overBudgetCount\":2"));
+        Check("report/json-render", json.Contains("\"name\":\"render\""));
+        Check("report/json-update", json.Contains("\"name\":\"update\""));
+        Check("report/json-stutter", json.Contains("\"startFrame\":2"));
+    }
+
+    // ---- 错误码可区分 ----
+    private static void TestErrors() {
+        ProfilerException e = new ProfilerException(ProfError.InvalidBudget, "bad");
+        CheckStr("err/name", e.ErrorName(), "InvalidBudget");
+        Check("err/code", e.error == ProfError.InvalidBudget);
+        Check("err/msg", e.Message == "bad");
+        ProfilerException e2 = new ProfilerException(ProfError.MalformedLine, "bad", "line=3");
+        CheckStr("err/name2", e2.ErrorName(), "MalformedLine");
+        Check("err/detail", e2.Message.Contains("line=3"));
+
+        // 预算不合法。
+        bool threw = false;
+        try {
+            FrameBudget bad = new FrameBudget(0.0);
+        } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/budget-code", ex.error == ProfError.InvalidBudget);
+        }
+        Check("err/budget-throws", threw);
+
+        // 分段没闭合 / 分段名非法 / 帧没开 / 帧重开。
+        ProfCorridor c = new ProfCorridor("GAME_PROF_TEST", true);
+        c.echo = false;
+        threw = false;
+        try { c.EndScope(); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/scope-code", ex.error == ProfError.ScopeNotClosed);
+        }
+        Check("err/scope-throws", threw);
+
+        threw = false;
+        try { c.EndFrame(); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/frame-code", ex.error == ProfError.FrameNotOpen);
+        }
+        Check("err/frame-throws", threw);
+
+        threw = false;
+        try { c.BeginScope("update"); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/noscope-frame-code", ex.error == ProfError.FrameNotOpen);
+        }
+        Check("err/noscope-frame-throws", threw);
+
+        // 帧开着的时候，分段名非法才是 InvalidScopeName。
+        c.BeginFrame();
+        threw = false;
+        try { c.BeginScope("bad name"); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/name-code", ex.error == ProfError.InvalidScopeName);
+        }
+        Check("err/name-throws", threw);
+
+        threw = false;
+        try { c.BeginFrame(); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/reopen-code", ex.error == ProfError.FrameAlreadyOpen);
+        }
+        Check("err/reopen-throws", threw);
+
+        // 帧里还开着分段就关帧 → ScopeNotClosed。
+        c.BeginScope("update");
+        threw = false;
+        try { c.EndFrame(); } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/open-code", ex.error == ProfError.ScopeNotClosed);
+        }
+        Check("err/open-throws", threw);
+
+        // 空样本分析 → EmptySample。
+        threw = false;
+        try {
+            FrameAnalyzer.Stats(new List<FrameSample>(), FrameBudget.Sixty());
+        } catch (ProfilerException ex) {
+            threw = true;
+            Check("err/empty-code", ex.error == ProfError.EmptySample);
+        }
+        Check("err/empty-throws", threw);
+    }
+}

@@ -367,6 +367,20 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   静态方法（`static string Combine(string text, string detail)`）再
   `base(Combine(text, detail))`（base 参数里只能调表达式，提成静态方法才
   拼得出来）。
+* **`Convert.ToDouble` / `Convert.ToInt64` 对坏输入静默返回 0**（实证，
+  2026-10-21）：`Convert.ToDouble("abc")` 给 0 且**不抛异常**——拿它当校验用，
+  坏输入会被当成"值就是 0"。诊断数据（账单 / 日志 / 外部 CSV）里一个写坏的
+  值因此变成"0 毫秒"而不是"这一行坏了"，把排序和统计整个带偏；诊断数据里
+  **错的值比没有值更坏**（人会照着假数据去优化）。要校验就自己严格解析：只接受
+  `[+-]?digits[.digits][(e|E)[+-]?digits]`，失败判失败（由调用方决定"跳过并
+  计数"还是"报错"）。坑出处：`packages/Zan.Game/src/Game/Data/README.md` 记过
+  一次（DataValues 的严格数值解析），`Zan.Game.Profiler` 的账单解析又踩一次。
+* **`JsonValue.SetAt(i, v)` 只替换已有元素，不追加**（实证，2026-10-21）：它内部
+  是 `if (i < items.Count) items[i] = v;`——对 `NewArray()` 建出来的空数组调
+  `SetAt(0, ...)` **静默什么也不做**，序列化出来是 `[]`。追加元素要用
+  `Append(v)`（另有 `AppendStr` / `AppendInt` / `AppendDouble` / `AppendBool`）。
+  症状是"JSON 报告里数组永远是空的"，而 `Set` 写对象字段是好的——同一个类里
+  一半正常一半为空，很容易怀疑是自己数据结构写错了。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the

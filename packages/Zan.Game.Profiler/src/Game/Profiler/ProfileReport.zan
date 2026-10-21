@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using System.Json;
+
+namespace Game.Profiler;
+
+// 剖析报告：文本（人看）+ JSON（机器看）。
+//
+// **两种输出同一份数据**：文本给"看报告的人"，JSON 给"CI / 看板 / 回归"。
+// 数字格式统一走 `ProfNum.Fixed`（固定小数位），不然每次生成的报告长度都
+// 不一样，diff 起来全是噪声。
+public class ProfileReport {
+    // 参与统计的帧数。
+    public int frameCount;
+    // 帧预算（毫秒）。
+    public double budgetMs;
+    // 整体统计。
+    public FrameStats stats;
+    // 热点（累计耗时降序）。
+    public List<Hotspot> hotspots;
+    // 超预算帧的归因（谁吃掉了卡顿的帧）。
+    public List<Hotspot> attribution;
+    // 连续超预算的帧段。
+    public List<StutterRun> stutters;
+    // 没被任何分段覆盖的时间占比（0..1）。
+    public double untrackedShare;
+
+    public ProfileReport() {
+        this.frameCount = 0;
+        this.budgetMs = 0.0;
+        this.stats = new FrameStats();
+        this.hotspots = new List<Hotspot>();
+        this.attribution = new List<Hotspot>();
+        this.stutters = new List<StutterRun>();
+        this.untrackedShare = 0.0;
+    }
+
+    // 一次性分析：帧样本 → 报告。
+    public static ProfileReport Analyze(List<FrameSample> frames, FrameBudget budget, int topN) {
+        ProfileReport rep = new ProfileReport();
+        if (frames == null || frames.Count == 0) {
+            throw new ProfilerException(ProfError.EmptySample, "no frames to analyze");
+        }
+        rep.frameCount = frames.Count;
+        rep.budgetMs = budget != null ? budget.ms : 0.0;
+        rep.stats = FrameAnalyzer.Stats(frames, budget);
+        rep.hotspots = FrameAnalyzer.Hotspots(frames, topN);
+        if (budget != null) {
+            rep.attribution = FrameAnalyzer.OverBudgetAttribution(frames, budget, topN);
+            rep.stutters = FrameAnalyzer.StutterRuns(frames, budget);
+        }
+        rep.untrackedShare = FrameAnalyzer.UntrackedShare(frames);
+        return rep;
+    }
+
+    // 文本报告（给人看）。
+    public string ToText() {
+        StringBuilder sb = new StringBuilder();
+        sb.Append("frames=" + this.frameCount.ToString());
+        sb.Append(" budget=" + ProfNum.Fixed(this.budgetMs, 3) + "ms");
+        sb.Append("\n");
+        sb.Append("total=" + ProfNum.Fixed(this.stats.totalMs, 3) + "ms");
+        sb.Append(" mean=" + ProfNum.Fixed(this.stats.meanMs, 3));
+        sb.Append(" median=" + ProfNum.Fixed(this.stats.medianMs, 3));
+        sb.Append(" p90=" + ProfNum.Fixed(this.stats.p90Ms, 3));
+        sb.Append(" p95=" + ProfNum.Fixed(this.stats.p95Ms, 3));
+        sb.Append(" p99=" + ProfNum.Fixed(this.stats.p99Ms, 3));
+        sb.Append(" max=" + ProfNum.Fixed(this.stats.maxMs, 3));
+        sb.Append("\n");
+        sb.Append("over budget: " + this.stats.overBudgetCount.ToString() + "/"
+                  + this.frameCount.ToString());
+        sb.Append(" (" + ProfNum.Percent((double)this.stats.overBudgetCount,
+                                         (double)this.frameCount, 1) + ")");
+        sb.Append("  stutter runs: " + this.stats.stutterRunCount.ToString());
+        sb.Append(" (longest " + this.stats.longestStutterRun.ToString() + ")");
+        sb.Append("\n");
+        sb.Append("untracked: " + ProfNum.Percent(this.untrackedShare, 1.0, 1) + " of total");
+        sb.Append("\n");
+        sb.Append("hotspots:");
+        for (int i = 0; i < this.hotspots.Count; i = i + 1) {
+            sb.Append("\n  " + this.hotspots[i].name);
+            sb.Append("  total=" + ProfNum.Fixed(this.hotspots[i].totalMs, 3) + "ms");
+            sb.Append(" share=" + ProfNum.Percent(this.hotspots[i].share, 1.0, 1));
+            sb.Append(" median=" + ProfNum.Fixed(this.hotspots[i].medianMs, 3));
+            sb.Append(" p95=" + ProfNum.Fixed(this.hotspots[i].p95Ms, 3));
+            sb.Append(" frames=" + this.hotspots[i].framesPresent.ToString());
+            sb.Append(" calls=" + this.hotspots[i].callsTotal.ToString());
+        }
+        if (this.attribution.Count > 0) {
+            sb.Append("\n");
+            sb.Append("over-budget attribution:");
+            for (int i = 0; i < this.attribution.Count; i = i + 1) {
+                sb.Append("\n  " + this.attribution[i].name);
+                sb.Append("  total=" + ProfNum.Fixed(this.attribution[i].totalMs, 3) + "ms");
+                sb.Append(" share=" + ProfNum.Percent(this.attribution[i].share, 1.0, 1));
+                sb.Append(" median=" + ProfNum.Fixed(this.attribution[i].medianMs, 3));
+                sb.Append(" p95=" + ProfNum.Fixed(this.attribution[i].p95Ms, 3));
+                sb.Append(" frames=" + this.attribution[i].framesPresent.ToString());
+            }
+        }
+        if (this.stutters.Count > 0) {
+            sb.Append("\n");
+            sb.Append("stutter runs:");
+            for (int i = 0; i < this.stutters.Count; i = i + 1) {
+                sb.Append("\n  frames " + this.stutters[i].startFrame.ToString()
+                          + "-" + this.stutters[i].endFrame.ToString());
+                sb.Append(" count=" + this.stutters[i].count.ToString());
+                sb.Append(" worst=" + ProfNum.Fixed(this.stutters[i].worstMs, 3) + "ms");
+                sb.Append(" excess=" + ProfNum.Fixed(this.stutters[i].excessMs, 3) + "ms");
+            }
+        }
+        return sb.ToString();
+    }
+
+    // JSON 报告（给 CI / 看板 / 回归）。
+    public string ToJson() {
+        JsonValue root = JsonValue.NewObject();
+        root.Set("frames", JsonValue.NewInt((long)this.frameCount));
+        root.Set("budgetMs", JsonValue.NewDouble(this.budgetMs));
+
+        JsonValue st = JsonValue.NewObject();
+        st.Set("count", JsonValue.NewInt((long)this.stats.count));
+        st.Set("totalMs", JsonValue.NewDouble(this.stats.totalMs));
+        st.Set("meanMs", JsonValue.NewDouble(this.stats.meanMs));
+        st.Set("medianMs", JsonValue.NewDouble(this.stats.medianMs));
+        st.Set("p90Ms", JsonValue.NewDouble(this.stats.p90Ms));
+        st.Set("p95Ms", JsonValue.NewDouble(this.stats.p95Ms));
+        st.Set("p99Ms", JsonValue.NewDouble(this.stats.p99Ms));
+        st.Set("minMs", JsonValue.NewDouble(this.stats.minMs));
+        st.Set("maxMs", JsonValue.NewDouble(this.stats.maxMs));
+        st.Set("overBudgetCount", JsonValue.NewInt((long)this.stats.overBudgetCount));
+        st.Set("overBudgetRatio", JsonValue.NewDouble(this.stats.overBudgetRatio));
+        st.Set("stutterRunCount", JsonValue.NewInt((long)this.stats.stutterRunCount));
+        st.Set("longestStutterRun", JsonValue.NewInt((long)this.stats.longestStutterRun));
+        root.Set("stats", st);
+
+        root.Set("untrackedShare", JsonValue.NewDouble(this.untrackedShare));
+        root.Set("hotspots", HotspotsToJson(this.hotspots));
+        root.Set("attribution", HotspotsToJson(this.attribution));
+
+        JsonValue stutters = JsonValue.NewArray();
+        for (int i = 0; i < this.stutters.Count; i = i + 1) {
+            JsonValue r = JsonValue.NewObject();
+            r.Set("startFrame", JsonValue.NewInt(this.stutters[i].startFrame));
+            r.Set("endFrame", JsonValue.NewInt(this.stutters[i].endFrame));
+            r.Set("count", JsonValue.NewInt((long)this.stutters[i].count));
+            r.Set("worstMs", JsonValue.NewDouble(this.stutters[i].worstMs));
+            r.Set("excessMs", JsonValue.NewDouble(this.stutters[i].excessMs));
+            stutters.Append(r);
+        }
+        root.Set("stutters", stutters);
+        return JsonSerializer.Serialize(root);
+    }
+
+    // 热点列表转 JSON 数组。
+    static JsonValue HotspotsToJson(List<Hotspot> list) {
+        JsonValue arr = JsonValue.NewArray();
+        for (int i = 0; i < list.Count; i = i + 1) {
+            Hotspot h = list[i];
+            JsonValue o = JsonValue.NewObject();
+            o.Set("name", JsonValue.NewStr(h.name));
+            o.Set("framesPresent", JsonValue.NewInt((long)h.framesPresent));
+            o.Set("callsTotal", JsonValue.NewInt((long)h.callsTotal));
+            o.Set("totalMs", JsonValue.NewDouble(h.totalMs));
+            o.Set("meanMs", JsonValue.NewDouble(h.meanMs));
+            o.Set("medianMs", JsonValue.NewDouble(h.medianMs));
+            o.Set("p95Ms", JsonValue.NewDouble(h.p95Ms));
+            o.Set("maxMs", JsonValue.NewDouble(h.maxMs));
+            o.Set("share", JsonValue.NewDouble(h.share));
+            arr.Append(o);
+        }
+        return arr;
+    }
+}

@@ -1,0 +1,162 @@
+using System;
+
+namespace Game.Profiler;
+
+// 严格数值解析 + 定点格式化。
+//
+// **为什么不用 Convert.ToDouble**：Zan 的 `Convert.ToDouble("abc")` 静默返回 0
+// （仓库已记过这个坑，见 `packages/Zan.Game/src/Game/Data/README.md`）。账单
+// 解析不能用它——一个拼错的毫秒数会变成"0 毫秒"，把热点排序整个带偏，而账单
+// 恰恰是"机器写、给人看"的诊断数据，**错的值比没有值更坏**。
+//
+// 这里自己严格校验：只接受 `[+-]?digits[.digits][(e|E)[+-]?digits]`，其余一律
+// 判失败。失败**不抛异常**——账单里混进别的日志是常态，调用方按"跳过并计数"
+// 处理（见 `ProfBillParser`）。
+public class ProfNum {
+    // 严格解析一个十进制数。成功返回 true 且 value 为结果；失败返回 false，
+    // value 置 0（失败时 value 无意义，调用方必须看返回值）。
+    public static bool TryParse(string text, out double value) {
+        value = 0.0;
+        if (text == null || text.Length == 0) { return false; }
+        int i = 0;
+        int n = text.Length;
+        bool neg = false;
+        int c0 = text[i] & 255;
+        if (c0 == 43 || c0 == 45) {          // '+' / '-'
+            neg = c0 == 45;
+            i = i + 1;
+        }
+        double mant = 0.0;
+        int digits = 0;
+        while (i < n) {
+            int c = text[i] & 255;
+            if (c < 48 || c > 57) { break; }  // 不是数字
+            mant = mant * 10.0 + (double)(c - 48);
+            i = i + 1;
+            digits = digits + 1;
+        }
+        if (i < n) {
+            int cd = text[i] & 255;
+            if (cd == 46) {                   // '.'
+                i = i + 1;
+                double scale = 0.1;
+                while (i < n) {
+                    int c = text[i] & 255;
+                    if (c < 48 || c > 57) { break; }
+                    mant = mant + (double)(c - 48) * scale;
+                    scale = scale * 0.1;
+                    i = i + 1;
+                    digits = digits + 1;
+                }
+            }
+        }
+        if (digits == 0) { return false; }     // 没有任何数字位
+        if (i < n) {
+            int ce = text[i] & 255;
+            if (ce == 101 || ce == 69) {       // 'e' / 'E'
+                i = i + 1;
+                bool eneg = false;
+                if (i < n) {
+                    int cs = text[i] & 255;
+                    if (cs == 43 || cs == 45) {
+                        eneg = cs == 45;
+                        i = i + 1;
+                    }
+                }
+                int edigits = 0;
+                int ev = 0;
+                while (i < n) {
+                    int c = text[i] & 255;
+                    if (c < 48 || c > 57) { break; }
+                    ev = ev * 10 + (c - 48);
+                    i = i + 1;
+                    edigits = edigits + 1;
+                }
+                if (edigits == 0) { return false; }
+                if (eneg) { ev = -ev; }
+                double p = 1.0;
+                int k = ev;
+                while (k > 0) { p = p * 10.0; k = k - 1; }
+                while (k < 0) { p = p * 0.1; k = k + 1; }
+                mant = mant * p;
+            }
+        }
+        if (i != n) { return false; }           // 还有没吃完的字符
+        value = neg ? -mant : mant;
+        return true;
+    }
+
+    // 严格解析一个整数（帧号用）。成功返回 true；失败返回 false，value 置 0。
+    //
+    // 同样不用 Convert.ToInt64——它对坏输入也是静默返回 0，帧号 0 和"帧号写
+    // 坏了"分不开。
+    public static bool TryParseLong(string text, out long value) {
+        value = 0;
+        if (text == null || text.Length == 0) { return false; }
+        int i = 0;
+        int n = text.Length;
+        bool neg = false;
+        int c0 = text[i] & 255;
+        if (c0 == 43 || c0 == 45) {
+            neg = c0 == 45;
+            i = i + 1;
+        }
+        if (i >= n) { return false; }
+        long v = 0;
+        int digits = 0;
+        while (i < n) {
+            int c = text[i] & 255;
+            if (c < 48 || c > 57) { break; }
+            v = v * 10 + (long)(c - 48);
+            i = i + 1;
+            digits = digits + 1;
+        }
+        if (digits == 0) { return false; }
+        if (i != n) { return false; }
+        value = neg ? -v : v;
+        return true;
+    }
+
+    // 定点格式化：把 double 打成固定小数位的字符串（"16.667"）。
+    //
+    // **为什么自己打**：报告里的数字要**逐字可回归**（golden 比对）。默认的
+    // double.ToString() 给出的是最短往返表示（16.666666666666668），位数随
+    // 值漂；自己按"四舍五入到 N 位 + 补零"打，输出才稳定。
+    public static string Fixed(double v, int decimals) {
+        if (decimals < 0) { decimals = 0; }
+        if (decimals > 9) { decimals = 9; }
+        bool neg = v < 0.0;
+        double av = neg ? -v : v;
+        long scale = 1;
+        for (int i = 0; i < decimals; i = i + 1) { scale = scale * 10; }
+        double scaled = av * (double)scale;
+        // 四舍五入（远离零方向取整）。
+        long units = (long)(scaled + 0.5);
+        long ip = units / scale;
+        long fp = units % scale;
+        string outp = LongToString(ip);
+        if (decimals > 0) {
+            outp = outp + "." + PadLeft(LongToString(fp), decimals);
+        }
+        if (neg && units != 0) { outp = "-" + outp; }
+        return outp;
+    }
+
+    // 百分比（0..1 之间的小数 → "12.3%"），分母为 0 时给 "0.0%"。
+    public static string Percent(double part, double whole, int decimals) {
+        if (whole == 0.0) { return Fixed(0.0, decimals) + "%"; }
+        return Fixed(part / whole * 100.0, decimals) + "%";
+    }
+
+    // 整数转字符串（整数自带 ToString，负号由它处理）。
+    static string LongToString(long v) {
+        return v.ToString();
+    }
+
+    // 左补零到指定位数。
+    static string PadLeft(string s, int width) {
+        string pad = "";
+        for (int i = s.Length; i < width; i = i + 1) { pad = pad + "0"; }
+        return pad + s;
+    }
+}

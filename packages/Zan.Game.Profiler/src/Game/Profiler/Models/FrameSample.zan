@@ -1,0 +1,89 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Profiler;
+
+// 一帧的剖析样本。
+//
+// **帧耗时 vs 分段之和**：账单给的是两件事——`total`（整帧多久）和各分段
+// （update/render/... 各多久）。两者的差就是 **untracked**（没被任何分段记到
+// 的部分：GC、驱动、等待、没插桩的代码）。这个差值往往才是"帧为什么卡"的
+// 答案——全部分段都很快但整帧很慢，说明时间没记在任何地方（漏插桩）。
+public class FrameSample {
+    // 帧号。
+    public long frameNo;
+    // 整帧耗时（毫秒）。
+    public double totalMs;
+    // 账单里是否给了显式 total（没给时 totalMs 由分段之和推得）。
+    public bool hasTotal;
+    // 本帧的分段（同名已合并）。
+    public List<ScopeSample> scopes;
+    // 各分段耗时之和。
+    public double scopeMs;
+    // 没被任何分段覆盖的部分（total - scopeMs）。
+    public double untrackedMs;
+
+    public FrameSample(long frameNo) {
+        this.frameNo = frameNo;
+        this.totalMs = 0.0;
+        this.hasTotal = false;
+        this.scopes = new List<ScopeSample>();
+        this.scopeMs = 0.0;
+        this.untrackedMs = 0.0;
+    }
+
+    // 设置整帧耗时。
+    public void SetTotal(double ms) {
+        this.totalMs = ms;
+        this.hasTotal = true;
+        this.Recalc();
+    }
+
+    // 加一个分段（同名合并）。
+    public void AddScope(string name, double ms) {
+        for (int i = 0; i < this.scopes.Count; i = i + 1) {
+            if (this.scopes[i].name == name) {
+                this.scopes[i].Add(ms);
+                this.Recalc();
+                return;
+            }
+        }
+        this.scopes.Add(new ScopeSample(name, ms));
+        this.Recalc();
+    }
+
+    // 某个分段的耗时（本帧没有这个分段时给 0）。
+    public double ScopeMs(string name) {
+        for (int i = 0; i < this.scopes.Count; i = i + 1) {
+            if (this.scopes[i].name == name) { return this.scopes[i].ms; }
+        }
+        return 0.0;
+    }
+
+    // 本帧有没有这个分段（按存在与否判断，不看耗时是否为 0——0 毫秒的分段
+    // 也是"被记到了"，这正是"漏插桩"与"这段真不花时间"的区别）。
+    public bool HasScope(string name) {
+        for (int i = 0; i < this.scopes.Count; i = i + 1) {
+            if (this.scopes[i].name == name) { return true; }
+        }
+        return false;
+    }
+
+    public int ScopeCount() { return this.scopes.Count; }
+
+    public ScopeSample ScopeAt(int i) { return this.scopes[i]; }
+
+    // 重算派生量（分段之和 / 未覆盖部分）。
+    public void Recalc() {
+        double sum = 0.0;
+        for (int i = 0; i < this.scopes.Count; i = i + 1) {
+            sum = sum + this.scopes[i].ms;
+        }
+        this.scopeMs = sum;
+        if (this.hasTotal) {
+            this.untrackedMs = this.totalMs - sum;
+        } else {
+            this.untrackedMs = 0.0;
+        }
+    }
+}

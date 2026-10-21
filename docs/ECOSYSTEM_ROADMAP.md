@@ -1417,6 +1417,60 @@ InvalidImage / 超长→TooLong / v40-L Byte 容量边界 2953 卡准）· TrySc
 undefined type；命名空间限定的 `System.Text.Encoding[]` 正常）。最小复现与
 根因登记在 `TASKS.md`。
 
+### 1.26 帧剖析：`Zan.Game.Profiler`
+
+prof 走廊逐帧打出来的**分段账单**只往 stdout 打，人只能肉眼看：没有格式契约，
+账单进不了 CI、不能回归、也读不出结论。本包给账单一个稳定格式（写端与读端
+共用同一份定义），并把账单变成**帧预算分析**：`packages/Zan.Game.Profiler`
+（`Game.Profiler`，无依赖，只用 `System` / `System.Collections.Generic` /
+`System.Json`）。
+
+**八条硬取舍**：
+
+1. **账单格式是契约**。`prof frame=12 scope=update ms=3.210` /
+   `prof frame=12 total=16.700`：前缀固定、key=value、空格分隔；`frame` 必填；
+   一行要么是分段（`scope`+`ms`）要么是整帧（`total`），不能同时；分段名限
+   `[A-Za-z0-9_.:-]`（账单按空格分隔，名字带空格就解析不开）；**未知 key 忽略**
+   （以后加 key 不用改旧解析器）；毫秒固定 3 位小数（账单与报告要能对上）。
+2. **坏行跳过并计数，不让整份账单作废**。不是 `prof ` 开头的行忽略（游戏自己
+   的日志混在里面是常态）；是 `prof ` 开头但格式不对的跳过并计数（`skipped` +
+   `firstError`），好行照常解析。
+3. **数值解析自己写**。Zan 的 `Convert.ToDouble("abc")` **静默返回 0**（仓库
+   已记过这个坑）——账单里一个写坏的毫秒数会变成"0 毫秒"，把热点排序整个
+   带偏；账单是"机器写、给人看"的诊断数据，错的值比没有值更坏。`ProfNum`
+   严格校验 `[+-]?digits[.digits][(e|E)[+-]?digits]`，失败一律判失败。
+4. **分位数用最近秩，不用插值**。`p = ceil(q × n)` 的那个样本——插值出来的
+   p95 是"某个不存在的帧"的虚构耗时，看报告的人会去找那一帧。
+5. **热点按累计耗时排，不按单帧最慢排**。单帧最慢常常是一次异常（首次进场的
+   资源加载、GC），它不告诉你"每帧都在花时间的是谁"；累计耗时才是每帧都要付
+   的税。`median` 与 `p95` 一起看：median 低而 p95 高 = 偶发尖刺，两者都高 =
+   稳定开销。同耗时按名字升序（输出必须确定）。
+6. **归因只看超预算的帧**。整体热点常常是"稳定开销"，真正让玩家觉得卡的是
+   超预算帧里的那个大头，两者常常不是同一个分段。
+7. **未覆盖部分单独报**。`untracked = total - 各分段之和`；这个数大就说明
+   **有代码没插桩**——全部分段都很快但整帧很慢，答案通常就在这个差值里。
+8. **走廊关着时所有调用都是空操作**。`GAME_PROF=1` 才开；调用点不必写
+   `if (prof.Enabled)`（写漏一个就插桩不一致，账单对不上）。开着的代价是每个
+   分段两次取单调钟，比被测的分段本身小得多。
+
+conformance `game_profiler`：严格数值（好/坏输入各一组）· 账单解析（坏行
+计数 / 杂音忽略 / 未知 key 前向兼容 / 帧号乱序 / 同名分段合并 / 缺 total 时
+按分段和推）· 统计（mean/median/p90/p95/p99 最近秩、超预算计数与占比、卡顿
+连片合并与超出量）· 热点（排序、同耗时按名字、出现帧数与次数）· 归因（只算
+超预算帧、占比分母是超预算帧的总耗时）· 环形缓冲（容量固定、覆盖最老、逻辑
+顺序）· 走廊（环境变量门控、关着时空操作、开着的账单能被自己解析回来、七种
+错误码各自可区分）· 报告（文本关键行 + JSON 关键字段）。
+
+**已知边界**：**不做分配热点**（运行期分配量统计缺一环，见 `TASKS.md` A464，
+`Zan.Bench` 同样不提供分配量列）· **不做硬件指标**（CPU/内存/温度要 OS 原生
+读数）· **不做火焰图 UI**（只出文本与 JSON 报告）· **不做采样器**（只分析显
+式插桩出来的分段）· **不依赖引擎**（不碰 `Zan.Game` 的任何类型）。
+
+**为什么不是 §2 里的 `Zan.Game.Debug`**：Debug 要帧剖析覆盖层与实体检查器，
+依赖 `Zan.Gui` 整包；本包落地时 Gui 整包正在改、且部分用例编译不通过，无法
+验证。Profiler 是纯逻辑，可以独立验证，而且它的输出（账单 + 报告）正是 Debug
+覆盖层要画的东西——先有数据，再有面板。
+
 ---
 ---
 
@@ -1473,7 +1527,7 @@ undefined type；命名空间限定的 `System.Text.Encoding[]` 正常）。最�
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
 | `Zan.Game.Debug` | ImGui.NET | 榜外 | 无 → 帧剖析覆盖层、实体检查器、内存精灵缓存可视化 | 2–3 周 |
 | `Zan.Game.Common` | — | — | ✅ 已落地 `packages/Zan.Game.Common`（`Game.Common`：版本化存档 + 飘字 + 血条残影 + 冷却条充能 + 背包堆叠 + 小地图投影，见 §1.12） | — |
-| `Zan.Game.Profiler` | LiteMonitor / LibreHardwareMonitor | 6,682 / 9,236 | prof 走廊只打 stdout → 帧预算分析器、分配热点、硬件指标面板 | 2 周 |
+| `Zan.Game.Profiler` | LiteMonitor / LibreHardwareMonitor | 6,682 / 9,236 | ✅ 已落地 `packages/Zan.Game.Profiler`（`Game.Profiler`：prof 走廊账单格式契约 + 严格解析 + 帧预算分析（最近秩分位数 / 超预算占比 / 卡顿连片 / 热点按累计耗时 / 超预算帧归因 / 未覆盖占比）+ 文本与 JSON 报告 + 环境变量门控的采集走廊；**不做分配热点**（A464）与硬件指标，见 §1.26） | — |
 
 ---
 
@@ -1500,6 +1554,7 @@ undefined type；命名空间限定的 `System.Text.Encoding[]` 正常）。最�
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 **第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
+**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Debug`（ImGui 口径：帧剖析覆盖层 / 实体检查器；依赖 Gui 整包，等 Gui 编译恢复后落地）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

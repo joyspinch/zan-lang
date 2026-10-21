@@ -1,0 +1,167 @@
+using System;
+using System.Collections.Generic;
+
+namespace Game.Profiler;
+
+// 采集端：逐帧分段计时，按账单格式产出。
+//
+// **环境变量开关**（沿用 prof 走廊的既有做法）：`GAME_PROF=1` 才开。关着的
+// 时候所有调用都是**空操作**——调用点不必写 `if (prof.Enabled)`，省得每个
+// 分段都写一遍条件（写漏一个就插桩不一致，账单对不上）。
+//
+// **开着的代价**：每个分段两次取单调钟（`Stopwatch.GetMicroseconds`），
+// 一次分段大约几十纳秒——比被测的分段本身小得多，所以可以放心开着。
+//
+// **分段可以嵌套**：同一帧里同名分段多次出现会合并（耗时累加、次数累加）。
+public class ProfCorridor {
+    // 环境变量名。
+    public string envName;
+    // 是否开启（构造时判定）。
+    public bool enabled;
+    // 打到 stdout（关掉时只攒在内存里）。
+    public bool echo;
+
+    private long frameNo;
+    private bool frameOpen;
+    private long frameStartUs;
+    // 本帧开着的分段栈（支持嵌套）。
+    private List<string> openNames;
+    private List<long> openStartUs;
+    // 本帧已结束的分段：名字 → 累计耗时（首次出现顺序）。
+    private List<string> scopeOrder;
+    private List<double> scopeMs;
+    // 累积的账单文本。
+    private string bill;
+
+    // 按环境变量判定是否开启。
+    public ProfCorridor(string envName) {
+        this.envName = envName;
+        this.enabled = ProfCorridor.EnvOn(envName);
+        this.echo = true;
+        this.frameNo = 0;
+        this.frameOpen = false;
+        this.frameStartUs = 0;
+        this.openNames = new List<string>();
+        this.openStartUs = new List<long>();
+        this.scopeOrder = new List<string>();
+        this.scopeMs = new List<double>();
+        this.bill = "";
+    }
+
+    // 显式指定开/关（测试与"临时强制开"用；跳过环境变量）。
+    public ProfCorridor(string envName, bool enabled) {
+        this.envName = envName;
+        this.enabled = enabled;
+        this.echo = true;
+        this.frameNo = 0;
+        this.frameOpen = false;
+        this.frameStartUs = 0;
+        this.openNames = new List<string>();
+        this.openStartUs = new List<long>();
+        this.scopeOrder = new List<string>();
+        this.scopeMs = new List<double>();
+        this.bill = "";
+    }
+
+    // 环境变量是否把走廊打开（非空且不为 "0"）。
+    public static bool EnvOn(string name) {
+        if (name == null || name.Length == 0) { return false; }
+        string v = Environment.GetEnvironmentVariable(name);
+        if (v == null || v.Length == 0) { return false; }
+        if (v == "0") { return false; }
+        return true;
+    }
+
+    // 开一帧。
+    public void BeginFrame() {
+        if (!this.enabled) { return; }
+        if (this.frameOpen) {
+            throw new ProfilerException(ProfError.FrameAlreadyOpen,
+                "previous frame was not closed", "frame=" + this.frameNo.ToString());
+        }
+        this.frameNo = this.frameNo + 1;
+        this.frameOpen = true;
+        this.frameStartUs = Stopwatch.GetMicroseconds();
+        this.openNames.Clear();
+        this.openStartUs.Clear();
+        this.scopeOrder.Clear();
+        this.scopeMs.Clear();
+    }
+
+    // 开一个分段（可嵌套）。
+    public void BeginScope(string name) {
+        if (!this.enabled) { return; }
+        if (!this.frameOpen) {
+            throw new ProfilerException(ProfError.FrameNotOpen,
+                "BeginScope before BeginFrame", "scope=" + (name == null ? "" : name));
+        }
+        if (!ProfBill.IsScopeName(name)) {
+            throw new ProfilerException(ProfError.InvalidScopeName,
+                "scope name must match [A-Za-z0-9_.:-]", "scope=" + (name == null ? "" : name));
+        }
+        this.openNames.Add(name);
+        this.openStartUs.Add(Stopwatch.GetMicroseconds());
+    }
+
+    // 关一个分段（关掉最近开着的那个）。
+    public void EndScope() {
+        if (!this.enabled) { return; }
+        if (this.openNames.Count == 0) {
+            throw new ProfilerException(ProfError.ScopeNotClosed,
+                "EndScope without a matching BeginScope");
+        }
+        long now = Stopwatch.GetMicroseconds();
+        int last = this.openNames.Count - 1;
+        string name = this.openNames[last];
+        long startUs = this.openStartUs[last];
+        this.openNames.RemoveAt(last);
+        this.openStartUs.RemoveAt(last);
+        this.AddScopeMs(name, (double)(now - startUs) / 1000.0);
+    }
+
+    // 关一帧，产出这一帧的账单行。
+    public void EndFrame() {
+        if (!this.enabled) { return; }
+        if (!this.frameOpen) {
+            throw new ProfilerException(ProfError.FrameNotOpen, "EndFrame without BeginFrame");
+        }
+        if (this.openNames.Count > 0) {
+            throw new ProfilerException(ProfError.ScopeNotClosed,
+                "frame closed with open scopes",
+                "open=" + this.openNames[this.openNames.Count - 1]);
+        }
+        long now = Stopwatch.GetMicroseconds();
+        double totalMs = (double)(now - this.frameStartUs) / 1000.0;
+        this.frameOpen = false;
+
+        for (int i = 0; i < this.scopeOrder.Count; i = i + 1) {
+            this.Append(ProfBill.ScopeLine(this.frameNo, this.scopeOrder[i], this.scopeMs[i]));
+        }
+        this.Append(ProfBill.TotalLine(this.frameNo, totalMs));
+    }
+
+    // 已采集的帧数。
+    public long FrameCount() { return this.frameNo; }
+
+    // 累积的账单文本（可以直接喂给 `ProfBillParser`）。
+    public string Bill() { return this.bill; }
+
+    // 把账单行塞进累积文本（并按需打到 stdout）。
+    void Append(string line) {
+        if (this.bill.Length > 0) { this.bill = this.bill + "\n"; }
+        this.bill = this.bill + line;
+        if (this.echo) { Console.WriteLine(line); }
+    }
+
+    // 累加一个分段的耗时（同名合并）。
+    void AddScopeMs(string name, double ms) {
+        for (int i = 0; i < this.scopeOrder.Count; i = i + 1) {
+            if (this.scopeOrder[i] == name) {
+                this.scopeMs[i] = this.scopeMs[i] + ms;
+                return;
+            }
+        }
+        this.scopeOrder.Add(name);
+        this.scopeMs.Add(ms);
+    }
+}
