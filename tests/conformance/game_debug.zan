@@ -1,0 +1,217 @@
+// zstd 之外的调试工具包：Zan.Game.Debug 的 conformance。
+//
+// 覆盖：实体快照行与格式化 · 实体过滤（id 前缀 / 标签子串 / 大小写 / 只看存活）
+// · 组件按字段值过滤 · 排序（升序降序 + 同键按 id 兜底的确定性）
+// · 帧剖析覆盖层（帧条占比与超预算判定 / 热点条 / 统计行 / 空帧）
+// · 文本呈现 · Gui 面板构建。
+using System;
+using System.Collections.Generic;
+using Game.Debug;
+using Game.Profiler;
+
+class Program {
+    static int bad;
+
+    static void Check(bool ok, string label) {
+        if (!ok) { Console.WriteLine("FAIL " + label); bad = bad + 1; }
+        else { Console.WriteLine("ok " + label); }
+    }
+
+    static bool Same(string a, string b) { return a == b; }
+
+    static DebugEntityRow Entity(int id, string tag, double x, int comps) {
+        DebugEntityRow e = new DebugEntityRow();
+        e.id = id;
+        e.tag = tag;
+        e.x = x;
+        e.componentCount = comps;
+        e.alive = true;
+        e.active = true;
+        return e;
+    }
+
+    static List<DebugEntityRow> Sample() {
+        List<DebugEntityRow> es = new List<DebugEntityRow>();
+        es.Add(Entity(2, "player", 10.0, 3));
+        es.Add(Entity(11, "enemy", 20.0, 1));
+        es.Add(Entity(21, "Player2", 5.0, 2));
+        es.Add(Entity(33, "prop", 30.0, 0));
+        return es;
+    }
+
+    static void EntityRow() {
+        DebugEntityRow e = Entity(7, "boss", 12.25, 4);
+        Check(Same(e.Summary(), "#7 boss @(12.3,0.0) 0.0x0.0 c=4 alive"), "entity-summary");
+        Check(Same(DebugEntityRow.Fixed(0.05), "0.1"), "entity-fixed-round");
+        Check(Same(DebugEntityRow.Fixed(-2.5), "-2.5"), "entity-fixed-negative");
+        Check(Same(DebugEntityRow.Fixed(3.0), "3.0"), "entity-fixed-whole");
+    }
+
+    static void Filtering() {
+        EntityInspector insp = new EntityInspector();
+        insp.SetEntities(Sample());
+        Check(insp.Visible("").Count == 4, "filter-empty");
+        Check(insp.Visible("2").Count == 2, "filter-id-prefix");
+        Check(insp.Visible("en").Count == 1, "filter-tag-substring");
+        Check(insp.Visible("PLAY").Count == 2, "filter-case-insensitive");
+        insp.aliveOnly = true;
+        Check(insp.Visible("").Count == 4, "filter-alive-only-all-alive");
+        DebugEntityRow dead = Entity(44, "corpse", 0.0, 0);
+        dead.alive = false;
+        List<DebugEntityRow> more = Sample();
+        more.Add(dead);
+        insp.SetEntities(more);
+        Check(insp.Visible("").Count == 4, "filter-alive-only-hides-dead");
+        insp.aliveOnly = false;
+        Check(insp.Visible("").Count == 5, "filter-all");
+    }
+
+    static void ComponentFiltering() {
+        EntityInspector insp = new EntityInspector();
+        List<DebugComponentRow> cs = new List<DebugComponentRow>();
+        DebugComponentRow health = new DebugComponentRow("Health");
+        health.Add("hp", "30");
+        health.Add("max", "100");
+        cs.Add(health);
+        DebugComponentRow sprite = new DebugComponentRow("Sprite");
+        sprite.Add("atlas", "hero");
+        cs.Add(sprite);
+        insp.Select(2, cs);
+        Check(insp.VisibleComponents("").Count == 2, "component-all");
+        Check(insp.VisibleComponents("hp").Count == 1, "component-by-field-name");
+        Check(insp.VisibleComponents("30").Count == 1, "component-by-field-value");
+        Check(insp.VisibleComponents("hero").Count == 1, "component-by-other-value");
+        Check(insp.VisibleComponents("nothing").Count == 0, "component-none");
+        Check(Same(cs[0].Summary(), "Health\n  hp: 30\n  max: 100"), "component-summary");
+        cs[0].expanded = false;
+        Check(Same(cs[0].Summary(), "Health"), "component-collapsed-summary");
+    }
+
+    static void Sorting() {
+        List<DebugEntityRow> es = Sample();
+        List<DebugEntityRow> byId = EntityInspector.Sort(es, DebugEntitySort.Id, false);
+        Check(byId[0].id == 2 && byId[3].id == 33, "sort-by-id");
+        List<DebugEntityRow> byX = EntityInspector.Sort(es, DebugEntitySort.X, false);
+        Check(byX[0].id == 21 && byX[3].id == 33, "sort-by-x");
+        List<DebugEntityRow> byXDesc = EntityInspector.Sort(es, DebugEntitySort.X, true);
+        Check(byXDesc[0].id == 33 && byXDesc[3].id == 21, "sort-by-x-desc");
+        // 同键兜底：两个实体组件数相同，按 id 升序（降序也保持 id 升序）。
+        List<DebugEntityRow> same = new List<DebugEntityRow>();
+        same.Add(Entity(9, "b", 0.0, 2));
+        same.Add(Entity(4, "a", 0.0, 2));
+        same.Add(Entity(7, "c", 0.0, 2));
+        List<DebugEntityRow> byComps = EntityInspector.Sort(same, DebugEntitySort.ComponentCount, false);
+        Check(byComps[0].id == 4 && byComps[1].id == 7 && byComps[2].id == 9, "sort-same-key-id-fallback");
+        List<DebugEntityRow> byCompsDesc = EntityInspector.Sort(same, DebugEntitySort.ComponentCount, true);
+        Check(byCompsDesc[0].id == 4 && byCompsDesc[2].id == 9, "sort-same-key-id-fallback-desc");
+        List<DebugEntityRow> byTag = EntityInspector.Sort(es, DebugEntitySort.Tag, false);
+        Check(byTag[0].tag == "Player2" && byTag[3].tag == "prop", "sort-by-tag");
+        // 排序不改传入的列表。
+        Check(es[0].id == 2 && es[3].id == 33, "sort-does-not-mutate-input");
+    }
+
+    static FrameSample Frame(long no, double total) {
+        FrameSample f = new FrameSample(no);
+        f.SetTotal(total);
+        return f;
+    }
+
+    static void Overlay() {
+        ProfileOverlay ov = new ProfileOverlay(FrameBudget.Sixty());
+        List<DebugOverlayRow> rows = ov.Build();
+        Check(rows.Count == 1 && rows[0].label == "no frames", "overlay-empty");
+
+        ov.Push(Frame(1, 20.0));
+        ov.Push(Frame(2, 5.0));
+        rows = ov.Build();
+        bool headerOk = false;
+        bool overOk = false;
+        bool underOk = false;
+        double overShare = 0.0;
+        double underShare = 0.0;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            DebugOverlayRow r = rows[i];
+            if (r.kind == DebugOverlayKind.Header && r.label == "frames") { headerOk = true; }
+            if (r.kind == DebugOverlayKind.Bar && r.label == "f1") {
+                overOk = r.overBudget;
+                overShare = r.share;
+            }
+            if (r.kind == DebugOverlayKind.Bar && r.label == "f2") {
+                underOk = !r.overBudget;
+                underShare = r.share;
+            }
+        }
+        Check(headerOk, "overlay-frames-header");
+        Check(overOk, "overlay-over-budget-marked");
+        Check(underOk, "overlay-under-budget-unmarked");
+        // 20ms / 16.667ms = 1.2（超预算），5ms / 16.667ms = 0.3。
+        Check(overShare > 1.19 && overShare < 1.21, "overlay-over-share");
+        Check(underShare > 0.29 && underShare < 0.31, "overlay-under-share");
+    }
+
+    static void OverlayHotspotAndStats() {
+        ProfileOverlay ov = new ProfileOverlay(FrameBudget.Sixty());
+        FrameSample f = Frame(1, 20.0);
+        f.AddScope("update", 12.0);
+        f.AddScope("draw", 8.0);
+        ov.Push(f);
+        List<DebugOverlayRow> rows = ov.Build();
+        bool sawHotspot = false;
+        bool sawUpdate = false;
+        bool sawAvg = false;
+        bool sawOver = false;
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            DebugOverlayRow r = rows[i];
+            if (r.kind == DebugOverlayKind.Header && r.label == "hotspots") { sawHotspot = true; }
+            if (r.kind == DebugOverlayKind.Bar && r.label == "update") { sawUpdate = true; }
+            if (r.kind == DebugOverlayKind.Text && r.label == "avg") { sawAvg = true; }
+            if (r.kind == DebugOverlayKind.Text && r.label == "over") { sawOver = true; }
+        }
+        Check(sawHotspot, "overlay-hotspots-header");
+        Check(sawUpdate, "overlay-hotspot-row");
+        Check(sawAvg, "overlay-stats-avg");
+        Check(sawOver, "overlay-stats-over");
+    }
+
+    static void TextRendering() {
+        DebugOverlayRow bar = new DebugOverlayRow(DebugOverlayKind.Bar, "update", "12.000ms");
+        bar.share = 0.6;
+        Check(Same(bar.SummaryWithBar(), "update 12.000ms  [############]"), "text-bar");
+        DebugOverlayRow over = new DebugOverlayRow(DebugOverlayKind.Bar, "f1", "20.000ms");
+        over.share = 1.2;
+        over.overBudget = true;
+        Check(Same(over.SummaryWithBar(), "f1 20.000ms ![####################]"), "text-bar-over");
+        DebugOverlayRow head = new DebugOverlayRow(DebugOverlayKind.Header, "frames", "");
+        Check(Same(DebugPanel.LineText(head), "[frames]"), "text-header");
+        List<DebugOverlayRow> rows = new List<DebugOverlayRow>();
+        rows.Add(head);
+        rows.Add(bar);
+        Check(Same(DebugText.OverlayText(rows), "[frames]\nupdate 12.000ms  [############]"), "text-overlay-joined");
+        List<string> lines = DebugText.Overlay(rows);
+        Check(lines.Count == 2, "text-overlay-lines");
+    }
+
+    static void PanelBuilding() {
+        List<DebugOverlayRow> rows = new List<DebugOverlayRow>();
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Header, "frames", ""));
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "avg", "16.0ms"));
+        Check(DebugPanel.BuildOverlay(rows) != null, "panel-overlay-built");
+        EntityInspector insp = new EntityInspector();
+        insp.SetEntities(Sample());
+        List<DebugComponentRow> cs = new List<DebugComponentRow>();
+        cs.Add(new DebugComponentRow("Health").Add("hp", "30"));
+        Check(DebugPanel.BuildInspector(insp.Visible(""), cs) != null, "panel-inspector-built");
+    }
+
+    static void Main() {
+        EntityRow();
+        Filtering();
+        ComponentFiltering();
+        Sorting();
+        Overlay();
+        OverlayHotspotAndStats();
+        TextRendering();
+        PanelBuilding();
+        if (bad == 0) { Console.WriteLine("game-debug-done"); }
+    }
+}

@@ -1,0 +1,92 @@
+using System.Collections.Generic;
+using Game.Profiler;
+
+namespace Game.Debug;
+
+// 帧剖析覆盖层：把 Profiler 的帧样本算成一行行能画的东西。
+//
+// **数据与绘制分开**：这里只产出"行"（标签 / 数值 / 占比 / 是否超预算），
+// 画成像素是绘制层的活。好处是这层**不依赖 Gui**，能在无头环境里逐条
+// 断言（conformance 断的就是它），而覆盖层最该被测的恰恰是"哪一行被
+// 标成超预算、占比算对没有"——这些都不需要像素。
+//
+// 数据源是 `Game.Profiler`：账单格式、统计与热点分析都在那边，这里不重复
+// 实现一遍。
+public class ProfileOverlay {
+    // 最近若干帧的环形缓冲（复用 Profiler 的容器）。
+    public FrameRing ring;
+    // 热点显示条数。
+    public int topN;
+    // 帧预算（超预算的判据跟着屏幕走，不写死 16.67）。
+    public FrameBudget budget;
+
+    public ProfileOverlay(FrameBudget budget) {
+        this.ring = new FrameRing(120);
+        this.topN = 5;
+        this.budget = budget;
+    }
+
+    // 喂一帧（每帧结束时调一次）。
+    public void Push(FrameSample frame) {
+        this.ring.Add(frame);
+    }
+
+    // 清空（切场景时重置）。
+    public void Clear() {
+        this.ring.Clear();
+    }
+
+    // 构建覆盖层行：帧条 → 热点条 → 统计。
+    public List<DebugOverlayRow> Build() {
+        List<DebugOverlayRow> rows = new List<DebugOverlayRow>();
+        List<FrameSample> frames = this.ring.ToList();
+        if (frames.Count == 0) {
+            rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "no frames", ""));
+            return rows;
+        }
+        double budgetMs = this.budget.ms;
+
+        // 帧条：每帧一条，条长 = 帧耗时 / 预算。
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Header, "frames", ""));
+        for (int i = 0; i < frames.Count; i = i + 1) {
+            FrameSample f = frames[i];
+            DebugOverlayRow r = new DebugOverlayRow(DebugOverlayKind.Bar,
+                "f" + f.frameNo.ToString(), ProfNum.Fixed(f.totalMs, 3) + "ms");
+            r.share = budgetMs > 0.0 ? f.totalMs / budgetMs : 0.0;
+            r.overBudget = f.totalMs > budgetMs;
+            rows.Add(r);
+        }
+
+        // 热点条：占比是"占全部帧耗时"的比例。
+        //
+        // 这里的 overBudget 语义与帧条**不同**：帧条是"这一帧超了"，热点是
+        // "这个分段**累计**烧掉的时间超过一帧预算"——那才是真正的卡顿来源
+        // （单帧 3ms 不卡，每帧都烧 3ms 才卡）。
+        List<Hotspot> hotspots = FrameAnalyzer.Hotspots(frames, this.topN);
+        if (hotspots.Count > 0) {
+            rows.Add(new DebugOverlayRow(DebugOverlayKind.Header, "hotspots", ""));
+            for (int i = 0; i < hotspots.Count; i = i + 1) {
+                Hotspot h = hotspots[i];
+                DebugOverlayRow r = new DebugOverlayRow(DebugOverlayKind.Bar,
+                    h.name, ProfNum.Fixed(h.totalMs, 3) + "ms");
+                r.share = h.share;
+                r.overBudget = h.totalMs > budgetMs;
+                rows.Add(r);
+            }
+        }
+
+        // 统计：平均值 / p95 / 超预算帧占比 / 未覆盖占比。
+        FrameStats stats = FrameAnalyzer.Stats(frames, this.budget);
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Header, "stats", ""));
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "avg",
+            ProfNum.Fixed(stats.meanMs, 3) + "ms"));
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "p95",
+            ProfNum.Fixed(stats.p95Ms, 3) + "ms"));
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "over",
+            stats.overBudgetCount.ToString() + " ("
+            + ProfNum.Percent(stats.overBudgetRatio, 1.0, 1) + ")"));
+        rows.Add(new DebugOverlayRow(DebugOverlayKind.Text, "budget",
+            ProfNum.Fixed(budgetMs, 3) + "ms"));
+        return rows;
+    }
+}

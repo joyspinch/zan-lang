@@ -1,0 +1,126 @@
+using System.Collections.Generic;
+
+namespace Game.Debug;
+
+// 实体检查器：组织、过滤、搜索、排序实体与组件快照。
+//
+// **检查器不反射**：Zan 没有反射，拿不到引擎对象的字段。实体快照与组件
+// 字段由调用方（游戏代码）显式填好后交给检查器，检查器负责的是
+// "怎么组织、怎么筛、怎么排、怎么画"。
+//
+// 数据层不依赖 Gui —— 覆盖层与检查器的可见部分都是"行"，画成像素是绘制
+// 层的活（见 `DebugPanel`）。这样这一层能在无头环境里逐条断言。
+public class EntityInspector {
+    // 全部实体快照。
+    public List<DebugEntityRow> entities;
+    // 当前选中实体的组件行。
+    public List<DebugComponentRow> components;
+    // 当前选中的实体 id（-1 = 没选）。
+    public int selectedId;
+    // 只显示存活实体。
+    public bool aliveOnly;
+
+    public EntityInspector() {
+        this.entities = new List<DebugEntityRow>();
+        this.components = new List<DebugComponentRow>();
+        this.selectedId = -1;
+        this.aliveOnly = false;
+    }
+
+    // 灌入一批实体快照（换场景时整体替换）。
+    public void SetEntities(List<DebugEntityRow> rows) {
+        this.entities = new List<DebugEntityRow>();
+        if (rows == null) { return; }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            this.entities.Add(rows[i]);
+        }
+    }
+
+    // 选中一个实体并设置它的组件行。
+    public void Select(int entityId, List<DebugComponentRow> rows) {
+        this.selectedId = entityId;
+        this.components = new List<DebugComponentRow>();
+        if (rows == null) { return; }
+        for (int i = 0; i < rows.Count; i = i + 1) {
+            this.components.Add(rows[i]);
+        }
+    }
+
+    // 可见的实体行：按过滤串 + 只看存活过滤。
+    //
+    // 过滤串同时命中 id 前缀与标签子串（见 `DebugEntityRow.Matches`）。
+    public List<DebugEntityRow> Visible(string query) {
+        List<DebugEntityRow> out2 = new List<DebugEntityRow>();
+        for (int i = 0; i < this.entities.Count; i = i + 1) {
+            DebugEntityRow e = this.entities[i];
+            if (this.aliveOnly && !e.alive) { continue; }
+            if (!e.Matches(query)) { continue; }
+            out2.Add(e);
+        }
+        return out2;
+    }
+
+    // 可见的组件行：按过滤串过滤组件名与字段内容。
+    public List<DebugComponentRow> VisibleComponents(string query) {
+        List<DebugComponentRow> out2 = new List<DebugComponentRow>();
+        for (int i = 0; i < this.components.Count; i = i + 1) {
+            if (!this.components[i].Matches(query)) { continue; }
+            out2.Add(this.components[i]);
+        }
+        return out2;
+    }
+
+    // 排序（返回**新列表**，不改传入的列表）。
+    //
+    // 排序是**确定的**：主键相同时按 id 升序兜底。调试工具的输出顺序
+    // 不能飘——同一场景两次打开看到不同的顺序，人就没法对比了。
+    public static List<DebugEntityRow> Sort(List<DebugEntityRow> rows,
+        DebugEntitySort key, bool descending) {
+        int n = rows.Count;
+        if (n <= 1) {
+            List<DebugEntityRow> same = new List<DebugEntityRow>();
+            for (int i = 0; i < n; i = i + 1) { same.Add(rows[i]); }
+            return same;
+        }
+        int half = n / 2;
+        List<DebugEntityRow> left = new List<DebugEntityRow>();
+        List<DebugEntityRow> right = new List<DebugEntityRow>();
+        for (int i = 0; i < n; i = i + 1) {
+            if (i < half) { left.Add(rows[i]); } else { right.Add(rows[i]); }
+        }
+        List<DebugEntityRow> l = EntityInspector.Sort(left, key, descending);
+        List<DebugEntityRow> r = EntityInspector.Sort(right, key, descending);
+        List<DebugEntityRow> merged = new List<DebugEntityRow>();
+        int i = 0;
+        int j = 0;
+        while (i < l.Count && j < r.Count) {
+            if (EntityInspector.Compare(l[i], r[j], key, descending) <= 0) { merged.Add(l[i]); i = i + 1; }
+            else { merged.Add(r[j]); j = j + 1; }
+        }
+        while (i < l.Count) { merged.Add(l[i]); i = i + 1; }
+        while (j < r.Count) { merged.Add(r[j]); j = j + 1; }
+        return merged;
+    }
+
+    // 比较两行：主键比较；主键相同按 id 升序兜底（保证顺序确定）。
+    //
+    // 降序只翻转**主键**——兜底的 id 始终升序，于是"同主键的一组"在
+    // 升序降序下都是 id 递增，人扫的时候顺序是稳定的。
+    static int Compare(DebugEntityRow a, DebugEntityRow b, DebugEntitySort key, bool descending) {
+        int c = 0;
+        if (key == DebugEntitySort.Tag) {
+            string ta = a.tag == null ? "" : a.tag;
+            string tb = b.tag == null ? "" : b.tag;
+            c = ta.CompareTo(tb);
+        } else if (key == DebugEntitySort.X) {
+            if (a.x < b.x) { c = -1; }
+            else if (a.x > b.x) { c = 1; }
+        } else if (key == DebugEntitySort.ComponentCount) {
+            c = a.componentCount - b.componentCount;
+        } else {
+            c = a.id - b.id;
+        }
+        if (c != 0) { return descending ? 0 - c : c; }
+        return a.id - b.id;
+    }
+}
