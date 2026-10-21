@@ -177,15 +177,14 @@ public class Checker {
     }
 
     // ---- overload arity ----
-    // The overload of `name` a call with `argc` arguments reaches. The
-    // candidates are the whole class chain; the C host resolves an overload
-    // by the argument types, but the argument COUNT already tells the
-    // overloads apart in the common case -- `Description()` must not pick
-    // `Description(string desc)` just because it is declared first (the
-    // by-name pick handed the caller the setter's `Result` type).
-    // The lookup stays conservative: when several candidates take the same
-    // number of arguments the first one wins, exactly as before.
-    Node MethodUpArity(Node cls, string name, int argc) {
+    // The overload of `name` a call reaches. The candidates are the whole
+    // class chain; the C host resolves an overload by the argument types
+    // (the backend scores the candidates the same way -- irgen_stmt.zan's
+    // ScoreCand), so the checker has to pick the same one: the argument
+    // COUNT alone cannot tell `Description()` from `Description(string)`,
+    // and it cannot tell `OnMessage(MessageHandler)` from
+    // `OnMessage(string)` either -- only the argument type can.
+    Node MethodUpCall(Node cls, string name, Node call) {
         if (cls == null) { return null; }
         List<Node> cands = new List<Node>();
         Node c = cls;
@@ -203,18 +202,63 @@ public class Checker {
         }
         if (cands.Count == 0) { return null; }
         if (cands.Count == 1) { return cands[0]; }
-        Node hit = null;
-        int hits = 0;
+        int argc = 0;
+        if (call != null) { argc = call.kids.Count; }
+        List<Node> fit = new List<Node>();
         int i = 0;
         while (i < cands.Count) {
-            if (AcceptsArgcOf(cands[i], argc)) {
-                hit = cands[i];
-                hits = hits + 1;
+            if (AcceptsArgcOf(cands[i], argc)) { fit.Add(cands[i]); }
+            i = i + 1;
+        }
+        if (fit.Count == 0) { return cands[0]; }
+        if (fit.Count == 1) { return fit[0]; }
+        Node pick = fit[0];
+        int best = CallScore(fit[0], call);
+        i = 1;
+        while (i < fit.Count) {
+            int s = CallScore(fit[i], call);
+            if (s > best) { best = s; pick = fit[i]; }
+            i = i + 1;
+        }
+        return pick;
+    }
+    // How well the candidate's parameter types match the call's arguments:
+    // +4 for an exact type match, -1 for a known mismatch (an implicit
+    // conversion may still apply, so a mismatch only ranks the candidate
+    // lower). Unknown types are neutral.
+    int CallScore(Node cand, Node call) {
+        if (cand == null || call == null) { return 0; }
+        int score = 0;
+        int a = 0;
+        while (a < call.kids.Count) {
+            Node p = ParamAtNode(cand, a);
+            if (p == null) { break; }
+            Node pty = p.type;
+            Node aty = InferType(call.kids[a]);
+            if (pty != null && aty != null && pty.sval != "" && aty.sval != "") {
+                if (pty.sval == aty.sval) { score = score + 4; }
+                else {
+                    int pc2 = PrimCat(pty.sval);
+                    int ac2 = PrimCat(aty.sval);
+                    if (pc2 != 0 && ac2 != 0 && pc2 != ac2) { score = score - 1; }
+                }
+            }
+            a = a + 1;
+        }
+        return score;
+    }
+    // The n-th parameter of a method declaration.
+    Node ParamAtNode(Node m, int idx) {
+        int n = 0;
+        int i = 0;
+        while (i < m.kids.Count) {
+            if (m.kids[i].kind == AK.Param()) {
+                if (n == idx) { return m.kids[i]; }
+                n = n + 1;
             }
             i = i + 1;
         }
-        if (hits == 1) { return hit; }
-        return cands[0];
+        return null;
     }
     // Does this one method take `argc` positional arguments? A `params` tail
     // takes the arguments the fixed parameters do not.
@@ -360,7 +404,7 @@ public class Checker {
         if (k == AK.Call()) {
             Node callee = e.a;
             if (callee != null && callee.kind == AK.Ident()) {
-                Node m = MethodUpArity(curClass, callee.sval, e.kids.Count);
+                Node m = MethodUpCall(curClass, callee.sval, e);
                 if (m != null) { return m.type; }
                 return null;
             }
@@ -368,7 +412,7 @@ public class Checker {
                 Node ot = InferType(callee.a);
                 Node cls = ClassOf(ot);
                 if (cls != null) {
-                    Node m = MethodUpArity(cls, callee.sval, e.kids.Count);
+                    Node m = MethodUpCall(cls, callee.sval, e);
                     if (m != null) { return m.type; }
                 }
                 // `Task.Run(...)` / `Task.Spawn(...)`: the handle's shape
@@ -499,7 +543,7 @@ public class Checker {
         if (n == "int" || n == "long" || n == "byte" || n == "short" ||
             n == "uint" || n == "ulong" || n == "ushort" || n == "sbyte" ||
             n == "nint") { return 1; }
-        if (n == "float" || n == "double" || n == "decimal") { return 2; }
+        if (n == "float" || n == "double") { return 2; }
         if (n == "bool") { return 3; }
         if (n == "string") { return 4; }
         if (n == "char") { return 5; }
@@ -513,6 +557,34 @@ public class Checker {
         return 0;
     }
 
+    // A user-defined implicit conversion: the value's class declares
+    // `implicit operator T` (the parser lowers it to a method `op_implicit`
+    // whose result type is T and whose parameter is the source type). The
+    // C host applies such a conversion in an assignment, an argument, a
+    // return and a cast -- so `double d = feet;` is legal.
+    bool HasImplicitConv(Node valueTy, string target) {
+        if (valueTy == null || target == "") { return false; }
+        Node c = binder.FindType(valueTy.sval);
+        int cg = 0;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == "op_implicit"
+                    && m.type != null && m.type.sval == target) {
+                    Node p = ParamAtNode(m, 0);
+                    if (p == null || p.type == null || p.type.sval == valueTy.sval) {
+                        return true;
+                    }
+                }
+                i = i + 1;
+            }
+            c = binder.FindType(c.sval2);
+            cg = cg + 1;
+            if (cg > 512) { c = null; }
+        }
+        return false;
+    }
     // ---- narrowing conversions ----
     //
     // The C host judges narrowing BEFORE the general assignability check
@@ -612,6 +684,8 @@ public class Checker {
         if (binder.IsTypeParam(vn)) { return; }
         int vcat = PrimCat(vn);
         if (vcat == 0) { return; }
+        // a user-defined implicit conversion makes the assignment legal:
+        // `double d = feet;` where Feet declares `implicit operator double`
         bool vnull = (valueTy.op == 1);
         if (vnull && !tnull) {
             // a nullable value only lands in a nullable slot
@@ -619,6 +693,7 @@ public class Checker {
                 + ": no implicit conversion", line, col);
             return;
         }
+        if (!vnull && HasImplicitConv(valueTy, tn)) { return; }
         bool ok = false;
         if (tnull) {
             if (vnull) {

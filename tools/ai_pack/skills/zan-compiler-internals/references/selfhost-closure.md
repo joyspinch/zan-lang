@@ -2217,6 +2217,51 @@ kernel32、shell32、user32、advapi32、version）。
 - 通用教训：**两个后端要"逐字一致"的规则，先把对面的行为量成表**。矩阵比对给出的
   三个数（误报 / 漏报 / 措辞差）比任何单条探针都有说服力——而且漏报的每一格都要
   能说清"为什么这次不判"，那才是能进台账的结论。
+
+## 118. 向量层：宿主的每一个运算都在"字节道"上
+
+- 坑（2026-10-21 实测）：自举把 `Vector128`/`Vector256` 当成"两个 64 位槽"来算，
+  宿主却是**在字节道上定义每一个运算**（`src/compiler/irgen_expr.c:1995-2436`）：
+  值是 `{ i64, i64 }` 结构，运算前转成 `<16 x i8>`（256 位是 `<32 x i8>`），算完再
+  转回来。于是自举的 `AddSaturate` / `Average` / `Equals` / `Unpack` / `Shuffle` /
+  `ConditionalSelect` / `ExtractMostSignificantBits` 逐字节对不上；`Multiply` /
+  `AddFloat` / `SubtractFloat` / `Sqrt` / `MultiplyAdd` 走的又是 `<4 x float>` 另一条道。
+- 照抄宿主时踩到的五个具体的坑：
+  - `Shuffle`（pshufb）的可移植实现是**逐字节查表**：掩码字节最高位为 1 → 该道清零，
+    否则取 `a[掩码 & 0x0F]`（宿主 `emit_pshufb_portable`，`irgen_expr.c:1951`）。
+  - `Average`（pavgb）是 `(a&b) + ((a^b)>>1) + ((a^b)&1)`——**向量加法逐道回绕**，
+    道与道之间不进位，所以这三步就够了。我们多加了一次 `odd`，答案从 150 变成 0。
+  - `ConditionalSelect` 是 `(c&l) | (~c&r)`，取反的掩码是 **0xFF**，不是 1——用 1 会
+    得到 `0xFE & r`，答案差一位（42 变成 106）。
+  - `UnpackLow/High` 用的是 `shufflevector` **指令**（掩码是 `<16 x i32>` 常量），不是
+    intrinsic。`llvm.shufflevector.v16i8.v16i8` 这个 intrinsic 根本不存在，链接期才
+    报 `use of undefined value`——IR 文本看着完全合理。
+  - `Create(float)` 要先 `fptrunc` 到 float 再进 float 道；自举的 float 值是 double，
+    不窄化就发出 `insertelement <4 x float> ..., float %double` 的坏 IR。
+  - `Prefetch` 发 `llvm.prefetch.p0`（指针 + 三个 i32 参数），不是调用一个同名函数。
+- 通用教训：**照抄宿主的"道"**。宿主把值拆到哪条道上运算，自举必须拆到同一条道；
+  先把宿主那段代码（`emit_vector128_call`）读完再动手，别照着 API 名字猜语义。
+
+## 119. 窄化的时机、重载的选择、裸 return：都是宿主行为的一部分
+
+- 坑（2026-10-21 实测），三条"宿主有、自举没有"的规则：
+  1. 裸 `return;` 在**非 void** 函数里返回**结果类型的零值**
+     （`src/compiler/irgen_stmt.c:1739-1742`），不是 `ret void`。自举一律发 `ret void`，
+     生成的 IR 过不了 LLVM 校验（`value doesn't match function result type`）。
+  2. `Convert.ToInt32` **不做** 32 位窄化：宿主用 strtoll 解析文本、fptosi 截断浮点、
+     整数原样返回（`src/compiler/irgen_call.c:1937-1981`），**窄化发生在值进入有类型的
+     位置时**（int 槽是 i32），不在调用里。所以 `Console.WriteLine(Convert.ToInt32(v))`
+     打的是完整的 64 位值，而 `int x = Convert.ToInt32(v);` 打的是窄化后的 32 位值。
+  3. 自举检查器的重载选择原来只按**名字**取第一个：`Description()` 会撞上
+     `Description(string desc)`，`OnMessage(message)` 会撞上 `OnMessage(MessageHandler cb)`
+     ——推出来的返回类型是另一个重载的，检查器据此报错（宿主与后端都按**实参类型**
+     打分选重载，见后端的 `ScoreCand`）。自举检查器也要按实参类型打分：精确匹配 +4、
+     已知不匹配 -1、未知中性。
+  4. 顺带：可赋值性检查要认**用户自定义的隐式转换**（`implicit operator T`，解析器
+     落成 `op_implicit` 方法），否则 `double d = feet;` 会被误判成不能转换。
+- 通用教训：**"逐字一致"不只是诊断措辞**。同一个表达式的**求值时机**（在哪一步窄化、
+  谁来选重载、裸 return 返回什么）同样是宿主行为的一部分；照抄时要把宿主那段代码
+  读到底，再决定自举在哪一步做这件事。
 ## 120. 窄化是独立的一条规则：浮点进整型槽、常量越界，措辞还不一样
 
 - 坑（实测，A485）：宿主判可赋值性时**先**判窄化，窄化有自己的措辞：
