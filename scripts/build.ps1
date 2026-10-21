@@ -46,12 +46,38 @@ $doConfigure = {
 }
 
 $doBuild = {
-    if ($Target -ne '') {
-        & cmake --build $buildDir --target $Target
-    } else {
-        & cmake --build $buildDir
+    # 链接 zanc.exe 时它可能正被别的进程执行着（仓库外的游戏项目拿
+    # $ZAN_HOME\build\zanc.exe 当编译器）。Windows 上运行中的 exe 不可被
+    # 替换，lld 会报 "permission denied" 并**先删掉输出**——于是：
+    #   一边是这次构建失败，另一边是下一个调用者拿到"文件不存在"。
+    # 占用者通常几百毫秒就退出（一次编译而已），所以等一下重试即可。
+    # 只对"被占用"这一种失败重试，真实编译错误照常立刻失败。
+    $maxTry = 6
+    for ($try = 1; $try -le $maxTry; $try++) {
+        # 这一次调用把 ErrorActionPreference 临时降为 Continue：native 命令把
+        # stderr 写进管道时，Stop 会把它当成终止性错误直接抛出——那样就永远
+        # 走不到下面的"被占用就重试"分支了。构建失败与否由退出码判定。
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & cmake --build $buildDir $(if ($Target -ne '') { @('--target', $Target) }) 2>&1
+            $rc = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
+        if ($rc -eq 0) { $out | Write-Host; return }
+
+        $text = ($out | Out-String)
+        $busy = ($text -match 'permission denied') -or ($text -match 'unable to remove file') -or
+                ($text -match 'being used by another process') -or ($text -match 'text file is busy')
+        if (-not $busy -or $try -eq $maxTry) {
+            $out | Write-Host
+            throw "cmake --build 失败 exit=$rc"
+        }
+        $out | Select-Object -Last 4 | Write-Host
+        Write-Host "[build] zanc.exe 正被占用（第 $try/$maxTry 次），2 秒后重试……" -ForegroundColor Yellow
+        Start-Sleep -Seconds 2
     }
-    if ($LASTEXITCODE -ne 0) { throw "cmake --build 失败 exit=$LASTEXITCODE" }
 }
 
 if ($SkipGate) {
@@ -61,19 +87,29 @@ if ($SkipGate) {
     exit $LASTEXITCODE
 }
 
-# 闸的锁名与 test.ps1 共用同一把 "build" 锁吗？不——用独立的 'compile'
-# 锁，因为"编译"和"跑测试"可以并行：测试用的是已经编好的产物，只要没人
-# 正在重编就安全。真正互斥的是**两个编译**之间，以及**编译 vs 测试**
-# （后者靠 test.ps1 在自己的锁上等待，见 build_gate.ps1 的说明）。
+# 闸的锁名与 test.ps1 共用同一把 'build' 锁——编译与测试必须互斥：
+# 编译持锁时测试排队，测试持锁时编译排队。粒度粗一点，但正确性优先——
+# 假红的排查成本远高于多等一会儿。
 #
-# 但这里有个必须堵住的洞：ctest 用 build\zanc.exe，编译会替换它。所以
-# 编译与测试必须互斥。这里用同一把锁 'build'，两个脚本都取它：
-# 编译持锁期间测试排队，测试持锁期间编译排队。粒度粗一点，但正确性
-# 优先——假红的排查成本远高于多等一会儿。
+# 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
+# （各自的 script scope），闭包里的 $LASTEXITCODE 同样出不来。
+$gate = Join-Path $PSScriptRoot 'build_gate.ps1'
+$codeFile = Join-Path $env:TEMP "zan_build_code_$PID.txt"
 & $gate -Name 'build' -Script {
     if ($Configure) { & $doConfigure }
     & $doBuild
+    Set-Content -Path $codeFile -Value $LASTEXITCODE -Encoding ASCII
 }.GetNewClosure()
+
+$code = 1
+if (Test-Path $codeFile) {
+    $raw = (Get-Content $codeFile -Raw).Trim()
+    if ($raw -match '^\d+$') { $code = [int]$raw }
+    Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
+}
+if ($code -eq 0) { Write-Host "[build] OK" -ForegroundColor Green }
+else { Write-Host "[build] FAILED exit=$code" -ForegroundColor Red }
+exit $code
 
 Write-Host "[build] OK" -ForegroundColor Green
 exit 0
