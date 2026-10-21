@@ -2499,6 +2499,21 @@ partial class Irgen {
     bool enumFoldOk;
     long enumFoldVal;
 
+    // The enum is folded once per member access, so a bad member would be
+    // reported once per access. The host reports it once (at bind time), so
+    // the report is remembered per member.
+    List<Node> enumBadReported = new List<Node>();
+
+    void EnumReportBad(Node mem, string msg) {
+        int i = 0;
+        while (i < enumBadReported.Count) {
+            if (enumBadReported[i] == mem) { return; }
+            i = i + 1;
+        }
+        enumBadReported.Add(mem);
+        diags.Error(msg, mem.line, mem.col);
+    }
+
     List<long> EnumMemberValues(Node tc) {
         List<long> vals = new List<long>();
         enumFoldNames = new List<string>();
@@ -2521,24 +2536,27 @@ partial class Irgen {
                         // enum_value_fits_int -- only the EXPLICIT values are
                         // checked, the continuation ones are not)
                         if (v < -2147483648L || v > 2147483647L) {
-                            diags.Error("enum member '" + mem.sval + "' value " + v
-                                + " does not fit in 'int' (enum members are 32-bit)",
-                                mem.line, mem.col);
+                            EnumReportBad(mem, "enum member '" + mem.sval + "' value " + v
+                                + " does not fit in 'int' (enum members are 32-bit)");
                         }
                     } else {
                         // the host refuses the program ("must be an integer
                         // constant expression"); say the same instead of
                         // answering with the ordinal
-                        diags.Error("enum member '" + mem.sval
-                            + "' initializer must be an integer constant expression",
-                            mem.line, mem.col);
+                        EnumReportBad(mem, "enum member '" + mem.sval
+                            + "' initializer must be an integer constant expression");
                         v = run;
                     }
                 }
                 enumFoldNames.Add(mem.sval);
                 enumFoldVals.Add(v);
-                // the host emits the member's value zero-extended from 32 bits
-                vals.Add(v & 4294967295L);
+                // the folded value keeps its SIGNED 64-bit shape here: the
+                // host compares the runtime value against the signed value
+                // (irgen_call.c) and stores the signed value through the out
+                // address of TryParse. The member CONSTANT is a different
+                // domain -- it is emitted zero-extended from 32 bits (the
+                // emission site does that).
+                vals.Add(v);
                 run = v + 1;
             }
             i = i + 1;
@@ -2557,6 +2575,7 @@ partial class Irgen {
             long v = enumFoldVal;
             if (e.op == TK.Minus()) { enumFoldVal = 0 - v; return; }
             if (e.op == TK.Plus()) { enumFoldVal = v; return; }
+            if (e.op == TK.Tilde()) { enumFoldVal = ~v; return; }
             enumFoldOk = false;
             return;
         }
@@ -2571,7 +2590,14 @@ partial class Irgen {
             if (op == TK.Plus()) { enumFoldVal = l + r; return; }
             if (op == TK.Minus()) { enumFoldVal = l - r; return; }
             if (op == TK.Star()) { enumFoldVal = l * r; return; }
-            if (op == TK.Slash()) { if (r == 0) { enumFoldOk = false; return; } enumFoldVal = l / r; return; }
+            if (op == TK.Slash()) {
+                // the host refuses the two undefined divisions
+                if (r == 0) { enumFoldOk = false; return; }
+                if (l == (-9223372036854775807L - 1) && r == -1) { enumFoldOk = false; return; }
+                enumFoldVal = l / r;
+                return;
+            }
+            if (op == TK.LessLess()) { enumFoldVal = l << (r & 63); return; }
             if (op == TK.Amp()) { enumFoldVal = l & r; return; }
             if (op == TK.Pipe()) { enumFoldVal = l | r; return; }
             enumFoldOk = false;
@@ -2592,6 +2618,82 @@ partial class Irgen {
             return;
         }
         enumFoldOk = false;
+    }
+
+    // the enum declaration a type name names, or null
+    Node EnumDeclOf(string tname) {
+        if (tname == null || tname == "") { return null; }
+        Node d = binder.FindType(tname);
+        if (d == null || d.kind != AK.EnumDecl()) { return null; }
+        return d;
+    }
+
+    // enum x.ToString(): the name of the FIRST member whose folded value
+    // equals the runtime value (the host's irgen_call.c compares the members
+    // in declaration order, so a value two members share answers with the
+    // earlier one); a value that matches no member prints as its number.
+    //
+    // The comparison uses the member's SIGNED folded value while the value
+    // itself travels zero-extended from 32 bits (the host emits the member
+    // constants as (uint64)(uint32)v), so a negative member answers with its
+    // number -- exactly what the host prints.
+    ExprVal EmitEnumToString(ExprVal recv, Node en) {
+        List<long> vals = EnumMemberValues(en);
+        List<string> names = enumFoldNames;
+        string cur = ToCStr(recv);          // the numeric fallback
+        int i = names.Count - 1;
+        while (i >= 0) {
+            string c = NT();
+            L("  " + c + " = icmp eq i64 " + recv.op + ", " + vals[i]);
+            ExprVal nm = GenStr(names[i]);
+            string r = NT();
+            L("  " + r + " = select i1 " + c + ", i8* " + nm.op + ", i8* " + cur);
+            cur = r;
+            i = i - 1;
+        }
+        return new ExprVal(cur, MkType("string"));
+    }
+
+    // EnumType.TryParse(text, out value): a case-sensitive probe over the
+    // member names in declaration order (the host's irgen_call.c). A hit
+    // stores the member's folded value through the out address and answers
+    // true; a miss stores 0 and answers false.
+    ExprVal EmitEnumTryParse(Node e, Node en) {
+        List<long> vals = EnumMemberValues(en);
+        List<string> names = enumFoldNames;
+        ExprVal txt = GenExpr(e.kids[0]);
+        // the out address
+        Node oa = e.kids[1];
+        string outp = "";
+        if (oa.type != null) {
+            outp = AddLocal(oa.sval, oa.type);
+            EA(outp, MapType(oa.type));
+        } else {
+            string onm = oa.sval;
+            if (onm == "" && oa.a != null && oa.a.kind == AK.Ident()) { onm = oa.a.sval; }
+            int li = LocalIdx(onm);
+            if (li >= 0) { outp = locReg[li]; }
+        }
+        // the answer: 1 on a hit, 0 on a miss -- the first match wins
+        string res = "0";
+        string val = "0";
+        int i = names.Count - 1;
+        while (i >= 0) {
+            ExprVal nm = GenStr(names[i]);
+            string c = NT();
+            L("  " + c + " = call i32 @strcmp(i8* " + txt.op + ", i8* " + nm.op + ")");
+            string eq = NT();
+            L("  " + eq + " = icmp eq i32 " + c + ", 0");
+            string r1 = NT();
+            L("  " + r1 + " = select i1 " + eq + ", i64 1, i64 " + res);
+            string r2 = NT();
+            L("  " + r2 + " = select i1 " + eq + ", i64 " + vals[i] + ", i64 " + val);
+            res = r1;
+            val = r2;
+            i = i - 1;
+        }
+        if (outp != "") { L("  store i64 " + val + ", i64* " + outp); }
+        return new ExprVal(res, MkType("bool"));
     }
 
     ExprVal GenMember(Node e) {
@@ -2675,7 +2777,9 @@ partial class Irgen {
                     Node mem = tc.kids[j];
                     if (mem.kind == AK.EnumMember()) {
                         if (mem.sval == e.sval) {
-                            if (k < vals.Count) { return new ExprVal("" + vals[k], MkType("int")); }
+                            // the member constant is emitted zero-extended
+                            // from 32 bits (the host: (uint64)(uint32)value)
+                            if (k < vals.Count) { return new ExprVal("" + (vals[k] & 4294967295L), MkType("int")); }
                             return new ExprVal("0", MkType("int"));
                         }
                         k = k + 1;
@@ -4988,6 +5092,13 @@ partial class Irgen {
             string prn = callee.a.sval;
             bool intRecv = prn == "int" || prn == "long" || prn == "Int32" || prn == "Int64";
             bool dblRecv = prn == "double" || prn == "float" || prn == "Double" || prn == "Single";
+            // EnumType.TryParse(text, out value): the member-name probe (the
+            // host lowers it in irgen_call.c -- a case-sensitive strcmp over
+            // the members in declaration order)
+            Node en = EnumDeclOf(prn);
+            if (en != null && callee.sval == "TryParse" && e.kids.Count == 2) {
+                return EmitEnumTryParse(e, en);
+            }
             if ((intRecv || dblRecv) && callee.sval == "Parse" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
                 string r = NT();
@@ -5208,6 +5319,21 @@ partial class Irgen {
                 string buf = NT(); L("  " + buf + " = call i8* @zstr_new(i64 " + n + ")");
                 L("  call i8* @memcpy(i8* " + buf + ", i8* " + recv.op + ", i64 " + n + ")");
                 return new ExprVal(buf, MkType("string"));
+            }
+            // enum ToString(): the name of the member the value stands for
+            // (the host compares the value against the members in
+            // declaration order, so a duplicate value answers with the
+            // earlier member)
+            if (mname == "ToString" && e.kids.Count == 0) {
+                Node en = null;
+                if (recv.ty != null) { en = EnumDeclOf(recv.ty.sval); }
+                if (en == null && obj.kind == AK.MemberAccess() && obj.a != null
+                    && obj.a.kind == AK.Ident() && LocalIdx(obj.a.sval) < 0) {
+                    // a member CONSTANT (`Color.Green.ToString()`): the
+                    // constant carries the number, the enum carries the names
+                    en = EnumDeclOf(obj.a.sval);
+                }
+                if (en != null) { return EmitEnumToString(recv, en); }
             }
             // scalar ToString: bool -> "true"/"false", numbers via snprintf
             if (mname == "ToString" && e.kids.Count == 0 && !IsStr(recv.ty)
