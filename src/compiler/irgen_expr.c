@@ -10004,6 +10004,12 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * 改法与 irgen.c 里 zan_io_pump_timeout 一致：**声明**符号
              * （LLVMAddFunction）而不是只查——声明进模块后链接期由系统库
              * 解析，符号一定找得到。
+             *
+             * 代价：同步休眠**占住调用线程**。这段代码在 async 协程内部被
+             * 调用时，该 worker 线程上的其它协程要等休眠结束才能派发（单
+             * worker 下实测：200ms 的定时器被拖到 550ms 才到期；多 worker
+             * 不受影响）。同步方法里没有协程帧可挂起，语义上只能如此——
+             * 但这比"静默不等待"好：等待时间是对的。登记为 A470。
              */
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
             if (g->target_is_windows) {
