@@ -1515,7 +1515,7 @@ conformance `game_profiler`：严格数值（好/坏输入各一组）· 账单�
 **为什么不是 §2 里的 `Zan.Game.Debug`**：Debug 要帧剖析覆盖层与实体检查器，
 依赖 `Zan.Gui` 整包；本包落地时 Gui 整包正在改、且部分用例编译不通过，无法
 验证。Profiler 是纯逻辑，可以独立验证，而且它的输出（账单 + 报告）正是 Debug
-覆盖层要画的东西——先有数据，再有面板。（Debug 后来也落地了，见 §1.29。）
+覆盖层要画的东西——先有数据，再有面板。
 
 ---
 ---
@@ -1643,57 +1643,6 @@ conformance `ssh_transport`：线格式（byte / bool / uint32 / string / mpint
 
 ---
 
-### 1.29 游戏调试工具：`Zan.Game.Debug`
-
-prof 走廊（§1.26）已经把帧耗时算成了账单与报告，可账单只往 stdout 打；
-引擎里的实体、组件、字段更是没人看得见。本包把这两件事变成**看得见的
-面板**：`packages/Zan.Game.Debug`（`Game.Debug`，依赖 `Zan.Game.Profiler`
-与 `Zan.Gui`）。
-
-**八条硬取舍**：
-
-1. **数据与绘制分层**。除 `DebugPanel.zan` 外**全部零 Gui 依赖**——检查器
-   与覆盖层先算成"行"（标签 / 数值 / 占比 / 是否超预算），绘制层只负责摆
-   控件。为什么：覆盖层最该被测的恰恰是"哪一行被标成超预算、占比算对
-   没有"——这些**不需要像素**，可以在无头环境里逐条断言；反过来去比像素，
-   断言既脆又测不到逻辑。
-2. **不反射**。Zan 没有反射，引擎对象的字段拿不到——实体快照与组件字段由
-   调用方显式填好后交给检查器。检查器负责的是"组织、过滤、搜索、排序、
-   呈现"，不是"知道引擎里有什么"。
-3. **排序是确定的**。主键相同时按 id 升序兜底；降序只翻转主键，兜底 id
-   始终升序。调试工具的输出顺序不能飘——同一场景两次打开看到不同顺序，
-   人就没法对比了。
-4. **帧剖析数据不重做**。账单格式、统计与热点分析都在 `Zan.Game.Profiler`，
-   本包只把它的报告算成行。
-5. **占比语义分两种**。帧条的 `overBudget` 是"这一帧超了预算"；热点条是
-   "这个分段**累计**烧掉的时间超过一帧预算"——单帧 3ms 不卡，每帧都烧
-   3ms 才卡。
-6. **过滤串命中 id 前缀与标签子串**（大小写不敏感）。id 用前缀而不是子串：
-   "1" 不该命中 "21"，子串匹配会让实体一多就满屏都是"看起来相关"的行。
-   组件过滤则连**字段值**一起命中——组件名是写死的，值才是变化的。
-7. **文本呈现与图形呈现读同一份行模型**：`DebugText` 让同一份行在 stdout /
-   日志 / CI 里有等价呈现（带条的行用字符条，占比信息不丢）。两套各算一遍
-   迟早对不上。
-8. **用现成的 Gui 控件，不自绘**：`DebugPanel` 只用 `Panel` + `Label` 摆行，
-   挂载方式与 HUD 相同（`HudLayer.Add`）。
-
-conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id 前缀 / 标签
-子串 / 大小写 / 只看存活）· 组件按字段值过滤 · 排序四种键与升降序与同键
-兜底 · 覆盖层帧条占比与超预算判定 · 热点条 · 统计行 · 空帧 · 文本呈现 ·
-面板构建。
-
-**已知边界**：**不做内存精灵缓存可视化**（那要 `Zan.Game.Assets` 的缓存
-统计，是另一件事）· **不做火焰图 / 采样器 / 硬件指标**（只分析显式插桩
-出来的分段）· **不接 ECS 的类型化组件池**（`World` 没有"按实体枚举组件"
-的接口，且 Zan 无反射，检查器吃的是调用方填好的快照）· 编译时会带
-`Zan.Gui` 自身的 4 条 `ZANPKG_MISSING` 警告（根因与修法见 `TASKS.md`）。
-
-**为什么不是 §2 表里写的"2–3 周"**：ImGui 口径的"即时模式浮层"在保留模式
-的 Zan Gui 上没有对应物——能做的是"面板 + 行"。所以本包给的是可挂载的面板
-与可断言的行，而不是自绘的即时模式窗口。
-
----
-
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -1747,7 +1696,7 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
 | `Zan.Game.Animation` | Unity Animation Rigging | 榜外 | ✅ 已落地 `packages/Zan.Game.Animation`（`Game.Animation`：TRS 变换 + 骨骼层级 + 线性混合蒙皮 + 关键帧片段 + 播放器 + 状态机交叉淡化 + 两骨解析 IK，见 §1.16） | — |
 | `Zan.Game.Render3D` | Silk.NET / OpenTK | 5,242 / 3,543 | `Mesh3D` 很薄；**GPU 后端只接 WGL/GLX，Android/OHOS 是 stub**（`SetRenderBackend(1)` 返回 0 是预期行为）→ 相机/材质/光照/shader/后处理 + 补齐跨平台 GPU 后端 | 8–12 周 |
 | `Zan.Game.Procgen` | WaveFunctionCollapse / MarkovJunior | 25,416 / 8,443 | ✅ 已落地 `packages/Zan.Game.Procgen`（`Game.Procgen`：WFC 波函数坍缩 + 有向邻接规则 + 关卡拼接 + 房间走廊 MST 布局，见 §1.11） | — |
-| `Zan.Game.Debug` | ImGui.NET | 榜外 | ✅ 已落地 `packages/Zan.Game.Debug`（`Game.Debug`：数据与绘制分层的帧剖析覆盖层 + 实体检查器；不反射，字段由调用方喂；见 §1.29）；**不做内存精灵缓存可视化** | — |
+| `Zan.Game.Debug` | ImGui.NET | 榜外 | 无 → 帧剖析覆盖层、实体检查器、内存精灵缓存可视化 | 2–3 周 |
 | `Zan.Game.Common` | — | — | ✅ 已落地 `packages/Zan.Game.Common`（`Game.Common`：版本化存档 + 飘字 + 血条残影 + 冷却条充能 + 背包堆叠 + 小地图投影，见 §1.12） | — |
 | `Zan.Game.Profiler` | LiteMonitor / LibreHardwareMonitor | 6,682 / 9,236 | ✅ 已落地 `packages/Zan.Game.Profiler`（`Game.Profiler`：prof 走廊账单格式契约 + 严格解析 + 帧预算分析（最近秩分位数 / 超预算占比 / 卡顿连片 / 热点按累计耗时 / 超预算帧归因 / 未覆盖占比）+ 文本与 JSON 报告 + 环境变量门控的采集走廊；**不做分配热点**（A464）与硬件指标，见 §1.26） | — |
 
@@ -1776,7 +1725,7 @@ conformance `game_debug`（44 项断言）：实体行格式化 · 过滤（id �
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 **第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
-**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug` ✅（帧剖析覆盖层 / 实体检查器；数据与绘制分层，见 §1.29）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
+**第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug`（ImGui 口径：帧剖析覆盖层 / 实体检查器；依赖 Gui 整包，等 Gui 编译恢复后落地）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
 **第 7 批（协议层）**：`Zan.Ssh` ✅（传输层 + 认证 + exec 通道；SFTP 与更多算法另算，见 §1.28）
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放

@@ -382,17 +382,6 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `Append(v)`（另有 `AppendStr` / `AppendInt` / `AppendDouble` / `AppendBool`）。
   症状是"JSON 报告里数组永远是空的"，而 `Set` 写对象字段是好的——同一个类里
   一半正常一半为空，很容易怀疑是自己数据结构写错了。
-* **`List<T>` 没有 `Sort`**（实证，2026-10-22）：编译器内建成员表里没有它，
-  `list.Sort(...)` / `list.Sort((a, b) => ...)` 都不存在。要排序就自己写
-  **稳定归并排序**（读—改—写，不用原地交换的下标赋值语义），返回**新列表**
-  不改传入的列表——调用方的顺序往往带语义（"帧的时间顺序"），被排序函数改了
-  就没法再按时间看了。坑出处：`Zan.Game.Profiler` 的 `ProfSort` 已经踩过并
-  写好了可复用的实现；`Zan.Game.Debug` 的实体排序照它的路子写。
-* **`Convert.ToString` 不存在**（实证，2026-10-22）：`Convert` 里只有
-  Base64 / Hex 那几个（`ToBase64String` / `FromHexString` / `ToHexString`），
-  **没有 `ToString` 重载**——`Convert.ToString(5)` 编译不过。数字转文本直接用
-  数字自带的 `ToString()`（`5.ToString()`、`v.ToString()`）。浮点要定点格式
-  就自己写（`ProfNum.Fixed` 那种），别指望 `Convert.ToString(double)`。
 ## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
