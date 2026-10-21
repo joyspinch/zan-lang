@@ -1,0 +1,112 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Media;
+using Game.Kit;
+
+namespace Game.Foundation;
+
+// 游戏音效库：按名字加载 WAV，按事件播放。
+//
+// 判据（换个游戏还成立吗）：任何游戏都要"加载几个音效 + 事件触发播放 +
+// 没有音频设备时不崩"。这三件事不该每个游戏各写一遍：
+//   - **加载**：磁盘优先 + 内嵌兜底（发布后资源在 exe 里，读盘找不到就
+//     从内嵌表读）；
+//   - **播放**：带限频（同一个音效在冷却期内只响一次，否则连打/多敌人
+//     同时触发会爆音）；
+//   - **降级**：没有音频设备（无头 CI、没有声卡、驱动缺失）时整个库静默
+//     失效——游戏照常跑，不崩、不卡。
+//
+// 项目侧只留"这个游戏有哪些音效名、什么事件播哪个"（一行一个音效）。
+public class SfxBank {
+    AudioBus bus;
+    Dictionary<string, AudioClip> clips;
+    bool deviceOk;
+    int defaultCooldownMs;
+
+    public SfxBank(AudioBus bus) {
+        this.bus = bus;
+        this.clips = new Dictionary<string, AudioClip>();
+        this.deviceOk = false;
+        this.defaultCooldownMs = 40;
+        try {
+            this.deviceOk = Audio.Open();
+        } catch (Exception) {
+            this.deviceOk = false;
+        }
+    }
+
+    // 音频设备可用（不可用时所有播放都是空操作）。
+    public bool Available() { return this.deviceOk; }
+
+    // 已加载的音效数量（诊断与测试用）。
+    public int Count() { return this.clips.Count; }
+
+    // 某个音效是否在库里。
+    public bool Has(string name) {
+        if (clips == null || name == null) { return false; }
+        return clips.ContainsKey(name);
+    }
+
+    // 默认限频（毫秒）。0 = 不限频。
+    public void SetCooldown(int ms) { this.defaultCooldownMs = ms; }
+
+    // 从目录批量加载：<dir>/<名字>.wav。加载不到的直接跳过（不报错——
+    // 少一个音效不该让游戏起不来）。
+    public void LoadAll(string dir, string[] names) {
+        if (names == null) { return; }
+        for (int i = 0; i < names.Length; i = i + 1) {
+            AudioClip c = SfxBank.LoadWav(dir + "/" + names[i] + ".wav");
+            if (c != null && c.IsValid()) { this.clips[names[i]] = c; }
+        }
+    }
+
+    // 磁盘优先 + 内嵌兜底地加载一个 WAV。
+    public static AudioClip LoadWav(string rel) {
+        AudioClip c = null;
+        try {
+            string p = Assets.Find(rel);
+            c = AudioClip.LoadWav(p);
+            if (c != null && c.IsValid()) { return c; }
+            if (File.EmbedExists(rel)) {
+                byte[] b = File.ReadAllBytes(rel);
+                c = AudioClip.LoadWavFromMem(b.ToStr(0, b.Length), b.Length);
+            }
+        } catch (Exception) {
+            return null;
+        }
+        return c;
+    }
+
+    // 播一个音效（默认增益 + 默认限频）。
+    public void Play(string name) {
+        this.Play(name, 1.0, this.defaultCooldownMs);
+    }
+
+    // 播一个音效（指定增益）。
+    public void Play(string name, double gain) {
+        this.Play(name, gain, this.defaultCooldownMs);
+    }
+
+    // 播一个音效（指定增益与限频；冷却期内不重复响）。
+    public void Play(string name, double gain, int cooldownMs) {
+        if (!this.deviceOk || this.clips == null || name == null) { return; }
+        if (!this.clips.ContainsKey(name)) { return; }
+        AudioClip c = this.clips[name];
+        if (c == null || !c.IsValid()) { return; }
+        if (this.bus != null) {
+            this.bus.PlaySfxThrottled(name, c, cooldownMs, gain);
+            return;
+        }
+        c.Play(gain, 0);
+    }
+
+    // 释放全部采样（退出时用）。
+    public void Dispose() {
+        if (this.clips == null) { return; }
+        foreach (AudioClip c in this.clips.Values) {
+            if (c != null) { c.Close(); }
+        }
+        this.clips.Clear();
+    }
+}
