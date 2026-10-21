@@ -39,6 +39,9 @@ long long zan_timer_next_timeout(void);
 long long zan_co_quantum_ms(void);
 long long zan_co_precise_us(void);
 long long zan_timer_dispatch_due(void);
+/* 等到能派发为止再派发一轮（与上面的区别：别的线程正派发时等它结束，
+ * 而不是跳过）。同步上下文里的定时等待用它——跳过就等于没修。 */
+long long zan_timer_dispatch_due_wait(void);
 long long zan_timer_pending(void);
 
 long long zan_timer_tick(long long interval, zan_timer_callback_t callback);

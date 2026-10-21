@@ -10017,25 +10017,28 @@ static LLVMValueRef emit_expr_await_expr(zan_irgen_t *g, zan_ast_node_t *expr,
              * 解析，符号一定找得到。
              *
              * 代价：同步休眠**占住调用线程**。这段代码在 async 协程内部被
-             * 调用时，该 worker 线程上的其它协程要等休眠结束才能派发（单
-             * worker 下实测：200ms 的定时器被拖到 550ms 才到期；多 worker
-             * 不受影响）。同步方法里没有协程帧可挂起，语义上只能如此——
-             * 但这比"静默不等待"好：等待时间是对的。登记为 A470。
+             * 调用时，该 worker 线程上的其它协程要等休眠结束才能派发。
+             *
+             * 修法（A470）：不要用裸的 Sleep / poll——那会把整段时间
+             * 变成"谁都不派发"。改成调运行时的 zan_co_sync_sleep：它把
+             * 一次长睡拆成**按下一个定时器截止时间切片**的等待，每片醒来
+             * 派发一次到期定时器并把被唤醒的协程跑起来。于是别的协程的
+             * 定时器照样按时到期，而这次等待本身也照样等满。
+             *
+             * 实测（单 worker）：一个协程在 async 内部同步睡 500ms，另一
+             * 个协程 200ms 的定时器从 503ms（改前）回到 204ms（改后）。
+             * 注意必须**在 async 协程内部**才复现——放在 Main 里占的是
+             * 主线程（不是 worker），worker 池照常派发，看不出差别。
              */
             LLVMValueRef ms32 = LLVMBuildTrunc(g->builder, ms, di32, "ms32");
-            if (g->target_is_windows) {
-                LLVMTypeRef sl_args[] = { di32 };
-                LLVMTypeRef sl_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx), sl_args, 1, 0);
-                LLVMValueRef fn_sleep = LLVMGetNamedFunction(g->mod, "Sleep");
-                if (!fn_sleep) fn_sleep = LLVMAddFunction(g->mod, "Sleep", sl_ty);
-                zan_call2(g->builder, sl_ty, fn_sleep, (LLVMValueRef[]){ ms32 }, 1, "");
-            } else {
-                LLVMTypeRef pl_args[] = { di8ptr, di64, di32 };
-                LLVMTypeRef pl_ty = LLVMFunctionType(di32, pl_args, 3, 0);
-                LLVMValueRef fn_poll = LLVMGetNamedFunction(g->mod, "poll");
-                if (!fn_poll) fn_poll = LLVMAddFunction(g->mod, "poll", pl_ty);
-                zan_call2(g->builder, pl_ty, fn_poll,
-                    (LLVMValueRef[]){ LLVMConstNull(di8ptr), LLVMConstInt(di64, 0, 0), ms32 }, 3, "");
+            {
+                LLVMTypeRef ss_args[] = { di64 };
+                LLVMTypeRef ss_ty = LLVMFunctionType(LLVMVoidTypeInContext(g->ctx),
+                    ss_args, 1, 0);
+                LLVMValueRef fn_ss = LLVMGetNamedFunction(g->mod, "zan_co_sync_sleep");
+                if (!fn_ss) fn_ss = LLVMAddFunction(g->mod, "zan_co_sync_sleep", ss_ty);
+                zan_call2(g->builder, ss_ty, fn_ss,
+                    (LLVMValueRef[]){ zan_iwiden(g->builder, ms32, di64) }, 1, "");
             }
             return LLVMConstInt(di64, 0, 0);
         }

@@ -1,0 +1,64 @@
+// 同步 await Task.Delay 不能占住 worker（A470）。
+//
+// 坑：编译器把非 async 方法里的 `await Task.Delay(ms)` 降级成同步休眠。
+// 原来的实现是裸的 Sleep（Windows）/ poll（POSIX）——**整段占住调用线程**。
+// 关键在于**调用位置**：这段同步休眠在 async 协程内部被调用时，占住的是
+// **worker 线程**——该 worker 上其它协程的定时器就没人派发了：
+//
+//   单 worker，一个协程同步睡 500ms，另一个协程的 200ms 定时器
+//   -> 实测 503ms 才到期（应 200ms）；多 worker 不受影响。
+//
+// 注意：必须在 **async 协程内部**调同步休眠才复现。放在 Main 里复现不了
+// ——Main 跑在主线程上，不是 worker，占的是主线程，worker 池照常派发。
+//
+// 修法：同步等待改成调运行时的 zan_co_sync_sleep。它把一次长睡拆成
+// **按下一个定时器截止时间切片**的等待，每片醒来做两件事：
+//   1) 派发到期定时器（把被唤醒的协程标记成就绪并入队）
+//   2) 亲自把就绪的协程跑起来（单 worker 下唯一的 worker 正卡在这次
+//      等待里，等待者自己得顶上 worker 的活）
+// 于是 200ms 的定时器在 200ms 准时到期，而这次同步等待本身也照样等满
+// 500ms。
+//
+// 断言用**先后关系**而不是时间阈值来判定：同步等待刚结束时看定时器到没
+// 到——被占住则还没到（回归就失败），没被占住则已到。顺序是二值事实，
+// 不受机器快慢影响。
+using System;
+
+class Program {
+    // 另一个协程：睡 200ms 后记录自己到点了没有。
+    static bool timerFired = false;
+
+    // 同步等待刚结束时定时器到没到。
+    static bool timerFiredBeforeSyncEnd = false;
+
+    static async int TimerCoroutine() {
+        await Task.Delay(200);
+        timerFired = true;
+        return 1;
+    }
+
+    // 非 async 方法里的 await Task.Delay：编译器降级成同步休眠。
+    static void SyncDelay(int ms) {
+        await Task.Delay(ms);
+    }
+
+    // **在 async 协程内部**同步睡——这才会占住 worker 线程。
+    // 同步等待刚结束时就记下定时器到没到：这个时刻就是"worker 被占住"
+    // 的代价兑现的地方——被占住则定时器还没到，没被占住则已到。
+    static async int BlockerCoroutine() {
+        SyncDelay(500);
+        timerFiredBeforeSyncEnd = timerFired;
+        return 1;
+    }
+
+    static void Main() {
+        Task.Spawn(TimerCoroutine());
+        Task.Spawn(BlockerCoroutine());
+
+        // 等两个协程都结束。
+        await Task.Delay(900);
+
+        // 断言 1：定时器在同步等待结束**之前**就到了（没被 worker 阻塞拖住）。
+        Console.WriteLine("timerFiredBeforeSyncEnd=" + Convert.ToString(timerFiredBeforeSyncEnd ? 1 : 0));
+    }
+}

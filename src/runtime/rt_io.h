@@ -92,6 +92,12 @@ int32_t zan_io_pump(void);
 /* 定时器感知的空闲调度桥接：在超时时间内轮询 IO 事件并驱动定时任务 */
 int32_t zan_io_pump_timeout(int64_t timeout_ms);
 
+/* 同步上下文里的定时等待：等 ms 毫秒，期间**继续派发到期定时器**。
+ * 编译器把非 async 方法里的 `await Task.Delay(ms)` 降级成这个调用
+ * （A470）：裸的 Sleep/poll 会把整段时间变成"谁都不派发"，别的协程的
+ * 定时器会被拖到等待结束才到期。 */
+void zan_co_sync_sleep(long long ms);
+
 
 /* 挂起当前协程直至 fd 可读：成功返回 0，失败返回 -1 */
 int64_t zan_io_wait_readable(intptr_t fd);

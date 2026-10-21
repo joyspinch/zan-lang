@@ -2456,6 +2456,13 @@ set_tests_properties(conformance_async_finally_ir_scaling PROPERTIES TIMEOUT 360
 set_tests_properties(conformance_async_preempt_hotloop PROPERTIES
   ENVIRONMENT "ZAN_CO_WORKERS=1")
 
+# A470: a synchronous `await Task.Delay` inside an async coroutine occupies
+# the worker thread it runs on. With ONE worker the other coroutine's timer
+# cannot be dispatched until the sync wait ends -- so the case is only
+# observable with a single worker. Pin the pool down for this one case.
+set_tests_properties(conformance_async_sync_delay_timer PROPERTIES
+  ENVIRONMENT "ZAN_CO_WORKERS=1")
+
 # ---- wasm32 try/catch: cross-compile to a linked module --------------------
 # try/catch on wasm32 lowers to WebAssembly exception handling (catchswitch /
 # invoke / __cxa_throw + zanrt_ehtag.o). The suite cannot RUN a wasm module, so

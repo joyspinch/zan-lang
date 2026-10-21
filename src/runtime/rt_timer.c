@@ -437,6 +437,16 @@ static void (*g_ready_hook)(void *frame, zan_timer_step_t step);
 static zan_timer_entry *g_dispatching;
 static unsigned long g_dispatch_tid;
 static volatile long long g_live;
+/* 派发互斥：zan_timer_dispatch_due 不是可重入的（g_dispatching /
+ * g_dispatch_tid 是普通静态量），两个线程同时派发会把状态搅乱。
+ * worker 池里靠 rt_io.c 的 g_timer_owner 保护，但同步上下文里的
+ * 定时等待（A470 的 zan_co_sync_sleep）也在派发——它可能跑在**另一个**
+ * 线程上。所以保护下沉到这里，让所有派发路径都受约束。 */
+static volatile int g_dispatch_busy;
+/* 持锁线程的精确标记：g_dispatch_tid 只在派发 delay 定时器时更新，派发
+ * public 定时器时是旧值——拿它判"是不是我自己持有的"会漏判，导致等自己
+ * 持有的互斥而死锁。用线程局部变量精确记录。 */
+static __thread int g_dispatch_owned;
 
 #if defined(ZAN_BARE_METAL)
 __attribute__((weak))
@@ -695,7 +705,9 @@ long long zan_timer_next_timeout(void) {
     return timeout;
 }
 
-long long zan_timer_dispatch_due(void) {
+/* 派发主循环。调用方必须已持有 g_dispatch_busy（CAS 拿到），
+ * 返回时互斥由本函数释放。 */
+static long long timer_dispatch_due_locked(void) {
     size_t dispatched = 0;
     for (;;) {
         long long now = zan_co_precise_us();
@@ -703,6 +715,8 @@ long long zan_timer_dispatch_due(void) {
         while (g_heap_len > 0 && g_heap[0]->removed) free(heap_pop());
         if (g_heap_len == 0 || g_heap[0]->due_us > now) {
             timer_unlock();
+            __atomic_store_n(&g_dispatch_busy, 0, __ATOMIC_RELEASE);
+            g_dispatch_owned = 0;
             return dispatched;
         }
         zan_timer_entry *entry = heap_pop();
@@ -763,6 +777,46 @@ long long zan_timer_dispatch_due(void) {
             free(entry);
         }
     }
+    __atomic_store_n(&g_dispatch_busy, 0, __ATOMIC_RELEASE);
+    g_dispatch_owned = 0;
+    return dispatched;
+}
+
+long long zan_timer_dispatch_due(void) {
+    /* 派发互斥：已有线程在派发就跳过（那一轮会把到期的都派完）。
+     * 用 CAS 而不是锁：派发里会回调用户代码（协程就绪钩子、public
+     * 定时器回调），持锁回调有死锁风险。 */
+    if (!__sync_bool_compare_and_swap(&g_dispatch_busy, 0, 1)) {
+        return 0;
+    }
+    g_dispatch_owned = 1;
+    return timer_dispatch_due_locked();
+}
+
+/* 等到能派发为止再派发一轮。
+ *
+ * 与 zan_timer_dispatch_due 的区别：后者在别的线程正派发时**直接跳过**
+ * （worker 池里那是对的——对方会把到期的都派完）。但同步上下文里的定时
+ * 等待（A470 的 zan_co_sync_sleep）必须保证"这段时间里到期的定时器确实
+ * 被派发"，跳过就等于没修。所以这里**等到互斥空出来**再派。
+ */
+long long zan_timer_dispatch_due_wait(void) {
+    /* 重入保护：派发里会恢复协程（entry->step），那个协程完全可能又
+     * 走到同步等待里再来一次派发。此时互斥被**当前线程**持有，等它
+     * 释放就是等自己——死锁。识别出"我就是持有者"就直接返回：这一轮
+     * 派发（外层）会把到期的都处理掉，不差这一次。 */
+    if (g_dispatch_owned) {
+        return 0;
+    }
+    for (;;) {
+        /* 抢到互斥才走；抢不到说明别的线程正在派发，让出 CPU 再试。 */
+        if (__sync_bool_compare_and_swap(&g_dispatch_busy, 0, 1)) {
+            break;
+        }
+        timer_yield();
+    }
+    g_dispatch_owned = 1;
+    return timer_dispatch_due_locked();
 }
 
 long long zan_timer_pending(void) {

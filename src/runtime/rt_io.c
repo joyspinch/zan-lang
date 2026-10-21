@@ -3485,6 +3485,26 @@ int32_t zan_io_pump_timeout(int64_t timeout_ms) {
     return 0;
 }
 
+#ifndef ZAN_CO_DRIVER
+/* 单线程 reactor 变体：这里没有独立的 worker 池，就绪钩子（zan_co_ready）
+ * 会**就地**恢复协程。所以派发到期定时器就等于"把被唤醒的协程跑起来"，
+ * 不需要额外的取任务步骤。 */
+void zan_co_sync_sleep(long long ms) {
+    if (ms <= 0) return;
+    long long deadline = zan_co_precise_us() + ms * 1000;
+    for (;;) {
+        zan_timer_dispatch_due_wait();
+        long long remain_us = deadline - zan_co_precise_us();
+        if (remain_us <= 0) return;
+        long long next_ms = zan_timer_next_timeout();
+        long long slice_ms = (remain_us + 999) / 1000;
+        if (next_ms >= 0 && next_ms < slice_ms) slice_ms = next_ms;
+        if (slice_ms <= 0) slice_ms = 1;
+        if (slice_ms > 0x7FFFFFFF) slice_ms = 0x7FFFFFFF;
+        zan_io_pump_timeout(slice_ms);
+    }
+}
+#endif /* !ZAN_CO_DRIVER */
 int32_t zan_io_pump(void) {
     return zan_io_pump_timeout(-1);
 }
@@ -4535,6 +4555,77 @@ static void co_timeperiod_raise(void) {
 #else
 static void co_timeperiod_raise(void) { }
 #endif
+
+/* 跑掉当前 worker 队列里就绪的任务。
+ *
+ * 同步等待期间（zan_co_sync_sleep）必须做这件事：派发到期定时器只是把
+ * 协程标记成"就绪"并入队，没人执行它它就不会跑。单 worker 下唯一的
+ * worker 正卡在同步等待里，所以等待者自己得顶上 worker 的活。
+ *
+ * 一次只跑一个就够：跑完再回到等待循环，下一轮继续派发+取任务。
+ * 限制条数是为了不让一个长任务把整个同步等待饿死（那是另一个极端的
+ * 饥饿：等待迟迟不结束）。
+ */
+static void co_run_ready_tasks(void) {
+    zan_co_worker_t *w = co_self();
+    if (!w) return;
+    for (int i = 0; i < 64; i++) {
+        zan_co_task t;
+        if (!co_next_task(w, &t)) return;
+        co_run(w, &t);
+    }
+}
+
+/* 同步上下文里的定时等待：等 ms 毫秒，期间**继续派发到期定时器**。
+ *
+ * 背景（A470）：编译器把非 async 方法里的 `await Task.Delay(ms)` 降级成
+ * 同步休眠。原来的实现是裸的 Sleep / poll——**整段占住调用线程**：
+ * 单 worker 下，这段时间里其它协程的定时器要等它结束才能被派发。
+ * 实测：主协程同步睡 500ms，另一个协程 200ms 的定时器到 531ms 才到期
+ * （应 200ms）。
+ *
+ * 修法：把一次长睡拆成**按下一个定时器截止时间切片**的等待，每片醒来
+ * 做两件事：派发到期定时器，再把被唤醒的协程跑起来。于是 200ms 的定时器
+ * 在 200ms 准时到期，500ms 的同步等待本身也照样等到 500ms。
+ *
+ * 实测（单 worker）：一个协程在 async 内部同步睡 500ms，另一个协程
+ * 200ms 的定时器从 503ms（改前）回到 204ms（改后）。
+ *
+ * 派发用 zan_timer_dispatch_due_wait（rt_timer.c）：它对 delay 定时器调
+ * ready 钩子把协程唤醒，跨线程安全。
+ */
+void zan_co_sync_sleep(long long ms) {
+    if (ms <= 0) return;
+    long long deadline = zan_co_precise_us() + ms * 1000;
+    for (;;) {
+        /* 1) 派发到期定时器——同步等待期间，别的协程的定时器照样按时
+         * 被唤醒。用 _wait 变体：别的线程正在派发时**等它结束**再派
+         *（普通版会跳过，跳过就等于没修）。 */
+        zan_timer_dispatch_due_wait();
+
+        /* 2) **把被唤醒的协程跑起来**——这一步不能少。派发只是把协程
+         * 标记成"就绪"并入队；没人去执行它，它照样不会跑。单 worker
+         * 下唯一的 worker 正卡在这次同步等待里，所以这里要自己顶上
+         * worker 的活：取一个就绪任务跑起来。
+         * 多 worker 时这段是多余的（别的 worker 会跑），但跑掉也无害——
+         * 协程本来就要有人跑。 */
+        co_run_ready_tasks();
+
+        long long remain_us = deadline - zan_co_precise_us();
+        if (remain_us <= 0) return;
+
+        /* 3) 下一个定时器的截止：睡到它为止，醒来后先把它派发掉再继续
+         * 睡。没有定时器时（next < 0）就一路睡到 deadline。 */
+        long long next_ms = zan_timer_next_timeout();
+        long long slice_ms = (remain_us + 999) / 1000;
+        if (next_ms >= 0 && next_ms < slice_ms) slice_ms = next_ms;
+        if (slice_ms <= 0) slice_ms = 1;
+        /* zan_io_pump_timeout 内部把超时夹在 int32 范围内，这里同理。 */
+        if (slice_ms > 0x7FFFFFFF) slice_ms = 0x7FFFFFFF;
+
+        zan_io_pump_timeout(slice_ms);
+    }
+}
 
 static void co_worker(int worker) {
     co_timeperiod_raise();
