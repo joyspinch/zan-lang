@@ -1991,18 +1991,14 @@ static LLVMValueRef emit_expr_call(zan_irgen_t *g, zan_ast_node_t *expr,
                         LLVMTypeRef i64 = LLVMInt64TypeInContext(g->ctx);
                         zan_type_t *at = infer_expr_type(g, expr->call.args.items[0], locals);
                         if (!type_is_textual_or_numeric(at)) {
-                            char tname[128];
-                            if (at->kind == TYPE_ARRAY && at->element_type &&
-                                at->element_type->name.len) {
-                                snprintf(tname, sizeof(tname), "%.*s[]",
-                                         (int)at->element_type->name.len,
-                                         at->element_type->name.str);
-                            } else if (at->name.len) {
-                                snprintf(tname, sizeof(tname), "%.*s",
-                                         (int)at->name.len, at->name.str);
-                            } else {
+                            /* A463: the type is named the way the user wrote
+                               it -- the shape comes along (`int[]`, `Box`,
+                               `D`). One renderer for every diagnostic, so
+                               this one cannot drift from the checker's. */
+                            char tname[256];
+                            zan_type_display(at, tname, sizeof(tname));
+                            if (!tname[0])
                                 snprintf(tname, sizeof(tname), "<value>");
-                            }
                             zan_diag_emit(g->diag, DIAG_ERROR,
                                 expr->call.args.items[0]->loc,
                                 "Convert.ToString: cannot convert '%s' to a "

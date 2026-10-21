@@ -499,6 +499,66 @@ zan_type_t *zan_binder_make_task_type(zan_binder_t *b, zan_type_t *elem) {
     return t;
 }
 
+/* ---------- 面向用户的类型名渲染（A463） ---------- */
+
+/* 往 buf 尾部追加一段文本。装不下就截断，但始终给结尾的 '\0' 留位置。 */
+static size_t display_append(char *buf, size_t cap, size_t used,
+                             const char *s, size_t n) {
+    if (cap == 0) return 0;
+    for (size_t i = 0; i < n; i++) {
+        if (used + 1 >= cap) break;
+        buf[used++] = s[i];
+    }
+    buf[used] = '\0';
+    return used;
+}
+
+/* 递归渲染：可空 → `T?`，数组 → `T[]`（多维 `T[,]`），泛型 → `Name<A,B>`。
+ * 名字本身取 t->name——那才是类型身份（`List`、`Task`、`Box`）。 */
+static size_t type_display_rec(const zan_type_t *t, char *buf, size_t cap,
+                               size_t used) {
+    if (!t) return used;
+    if (t->kind == TYPE_NULLABLE) {
+        if (t->element_type)
+            used = type_display_rec(t->element_type, buf, cap, used);
+        else if (t->name.str)
+            used = display_append(buf, cap, used, t->name.str, t->name.len);
+        return display_append(buf, cap, used, "?", 1);
+    }
+    if (t->kind == TYPE_ARRAY) {
+        if (t->element_type)
+            used = type_display_rec(t->element_type, buf, cap, used);
+        else if (t->name.str)
+            used = display_append(buf, cap, used, t->name.str, t->name.len);
+        used = display_append(buf, cap, used, "[", 1);
+        int rank = t->array_rank > 1 ? t->array_rank : 1;
+        for (int r = 1; r < rank; r++)
+            used = display_append(buf, cap, used, ",", 1);
+        return display_append(buf, cap, used, "]", 1);
+    }
+    if (t->name.str)
+        used = display_append(buf, cap, used, t->name.str, t->name.len);
+    if (t->type_arg_count > 0 && t->type_args) {
+        used = display_append(buf, cap, used, "<", 1);
+        for (int i = 0; i < t->type_arg_count; i++) {
+            if (i > 0) used = display_append(buf, cap, used, ",", 1);
+            used = type_display_rec(t->type_args[i], buf, cap, used);
+        }
+        used = display_append(buf, cap, used, ">", 1);
+    }
+    return used;
+}
+
+size_t zan_type_display(const zan_type_t *t, char *buf, size_t cap) {
+    if (!buf || cap == 0) return 0;
+    buf[0] = '\0';
+    if (!t) {
+        display_append(buf, cap, 0, "?", 1);
+        return 1;
+    }
+    return type_display_rec(t, buf, cap, 0);
+}
+
 static bool tuple_sig_type(zan_type_t *t, char *buf, size_t cap) {
     if (!t || cap == 0) return true;
     size_t used = strlen(buf);

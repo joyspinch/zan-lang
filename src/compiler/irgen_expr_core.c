@@ -386,18 +386,23 @@ static void check_no_boxing_conversion(zan_irgen_t *g, zan_type_t *dst,
     bool dst_ref = irgen_type_is_ref_kind(dst);
     bool src_ref = irgen_type_is_ref_kind(src);
     if (dst_ref == src_ref) return;
+    /* 类型名按形状渲染（`T?` / `T[]` / `List<T>`）——与 checker 共用
+     * binder 的 zan_type_display，两边不各说各话（A463）。 */
+    char sbuf[128], dbuf[128];
+    zan_type_display(src, sbuf, sizeof sbuf);
+    zan_type_display(dst, dbuf, sizeof dbuf);
+    const char *sname = sbuf[0] ? sbuf : "?";
+    const char *dname = dbuf[0] ? dbuf : "?";
     if (dst_ref) {
         zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
                       "cannot convert '%s' to '%s' in %s: value types cannot be "
                       "boxed into a reference type",
-                      src->name.str ? src->name.str : "?",
-                      dst->name.str ? dst->name.str : "?", what);
+                      sname, dname, what);
     } else {
         zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
                       "cannot convert '%s' to '%s' in %s: a reference type cannot "
                       "be converted to a value type",
-                      src->name.str ? src->name.str : "?",
-                      dst->name.str ? dst->name.str : "?", what);
+                      sname, dname, what);
     }
 }
 
@@ -469,9 +474,11 @@ static void check_generic_invariance(zan_irgen_t *g, zan_type_t *dst, zan_type_t
         zan_type_t *b = src->type_arg_count > i ? src->type_args[i] : NULL;
         if (!a || !b) return;
         if (!type_full_equal(a, b)) {
-            char dbuf[96], sbuf[96];
-            render_type_full(dst, dbuf, sizeof(dbuf));
-            render_type_full(src, sbuf, sizeof(sbuf));
+            /* 与 checker 共用 zan_type_display：泛型实参的可空/数组形状
+             * 也要说出来（`List<int?>`），不能只报个裸名字（A463）。 */
+            char dbuf[128], sbuf[128];
+            zan_type_display(dst, dbuf, sizeof(dbuf));
+            zan_type_display(src, sbuf, sizeof(sbuf));
             zan_diag_emit(g->diag, DIAG_ERROR, at->loc,
                           "cannot convert '%s' to '%s' in %s: generic type "
                           "arguments are invariant and must match exactly",

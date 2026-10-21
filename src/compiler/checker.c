@@ -10,6 +10,29 @@
 
 static const char *type_name(zan_type_t *t);
 
+/* 线程局部存储。LSP 进程里诊断线程与工作线程各跑各的 checker
+ * （src/lsp/lsp_main.c），类型名缓冲池不能共用。写法抄 runtime 的
+ * rt_sched.c。 */
+#if defined(_MSC_VER)
+#define ZAN_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define ZAN_TLS __thread
+#else
+#define ZAN_TLS _Thread_local
+#endif
+
+/* 类型名缓冲池。
+ *
+ * type_name() 的返回值只活到本次 zan_diag_emit 返回——diag 立刻
+ * vsnprintf 固化进 512 字节的 msgbuf，之后指针就没用了。但一条诊断里
+ * 最多并列三个类型名（'cannot convert X to Y in Z'），所以要几个槽位
+ * 轮转，不能只用一个。 */
+#define TYPE_NAME_SLOTS 8
+#define TYPE_NAME_SLOT_SIZE 192
+
+static ZAN_TLS char g_type_name_pool[TYPE_NAME_SLOTS][TYPE_NAME_SLOT_SIZE];
+static ZAN_TLS int g_type_name_slot;
+
 /* `Task.<method>(...)` 的静态调用识别：与 irgen 的 is_call_to 同口径
  * （按接收者标识符的字面名判定，不依赖类型解析结果）。 */
 static bool checker_is_task_call(zan_ast_node_t *expr, const char *method) {
@@ -24,6 +47,7 @@ static bool checker_is_task_call(zan_ast_node_t *expr, const char *method) {
            method_name.len == (int)strlen(method) &&
            memcmp(method_name.str, method, (size_t)method_name.len) == 0;
 }
+
 
 /* Task.Run / Task.Spawn 的结果类型按实参形态区分，与 irgen 的帧形态一一对应：
  *
@@ -798,9 +822,20 @@ static void check_generic_constraints(zan_checker_t *c, zan_type_t *t,
 }
 
 
+/* 类型名：按形状渲染（`T?` / `T[]` / `List<T>`）。
+ *
+ * 不能直接返回 t->name.str：可空类型与数组类型的 name 就是元素类型的
+ * 名字，`bool?` 的 name 是 "bool"——诊断里会把 `bool?` 说成 `bool`
+ * （A463）。渲染交给 binder 的 zan_type_display，全仓只有这一份真相源。
+ * 名字里的 mangle（nsresolve 同名冲突改写过的内部名）在这一层拿不到，
+ * 那是 A476 的另一条轴（checker_type_simple_name 走 decl 的原始名）。 */
 static const char *type_name(zan_type_t *t) {
     if (!t) return "<unknown>";
-    return t->name.str;
+    int slot = g_type_name_slot;
+    g_type_name_slot = (g_type_name_slot + 1) % TYPE_NAME_SLOTS;
+    char *buf = g_type_name_pool[slot];
+    zan_type_display(t, buf, TYPE_NAME_SLOT_SIZE);
+    return buf;
 }
 
 static bool checker_weak_target_is_arc_ref(zan_type_t *t) {
@@ -1495,17 +1530,6 @@ static bool checker_cast_is_valid(zan_checker_t *c, zan_type_t *dst,
 static zan_symbol_t *expr_method_group(zan_checker_t *c, zan_ast_node_t *e);
 static void reject_method_group(zan_checker_t *c, zan_ast_node_t *e);
 
-/* 打印带类型实参的类型名（诊断里要区分 Task 与 Task<T>） */
-static const char *task_type_name(zan_type_t *t, char *buf, size_t cap) {
-    if (!t || t->type_arg_count != 1 || !t->type_args || !t->type_args[0]) {
-        snprintf(buf, cap, "%s", type_name(t));
-        return buf;
-    }
-    snprintf(buf, cap, "%.*s<%s>", (int)t->name.len, t->name.str,
-             type_name(t->type_args[0]));
-    return buf;
-}
-
 static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
                                      zan_type_t *value, zan_ast_node_t *expr,
                                      zan_loc_t loc, const char *what) {
@@ -1564,13 +1588,11 @@ static void checker_check_assignable(zan_checker_t *c, zan_type_t *target,
     if (checker_has_user_conversion(c, target, value)) return;
     if (target->kind == TYPE_TASK && value->kind == TYPE_TASK &&
         target->type_arg_count == 1 && value->type_arg_count == 0) {
-        char tb[160], vb[160];
         zan_diag_emit(c->diag, DIAG_ERROR, loc,
                       "cannot convert '%s' to '%s' in %s: a task started from a "
                       "lambda/Action carries no result; declare 'Task' (not "
                       "'Task<T>') and wait with .Wait()",
-                      task_type_name(value, vb, sizeof vb),
-                      task_type_name(target, tb, sizeof tb), what);
+                      type_name(value), type_name(target), what);
         return;
     }
     zan_diag_emit(c->diag, DIAG_ERROR, loc,
@@ -2021,9 +2043,9 @@ static void checker_user_generic_call_args(zan_checker_t *c,
             if (zan_null_arg_score(pt) < 0) {
                 zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                               "cannot convert 'null' to '%s' in argument %d of "
-                              "'%.*s.%.*s': no implicit conversion",
-                              type_name(pt), i + 1, (int)recv->name.len,
-                              recv->name.str, (int)name.len, name.str);
+                              "'%s.%.*s': no implicit conversion",
+                              type_name(pt), i + 1,
+                              type_name(recv), (int)name.len, name.str);
             }
             continue;
         }
@@ -2036,9 +2058,9 @@ static void checker_user_generic_call_args(zan_checker_t *c,
         }
         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                       "cannot convert '%s' to '%s' in argument %d of "
-                      "'%.*s.%.*s': no implicit conversion",
-                      type_name(at), type_name(pt), i + 1, (int)recv->name.len,
-                      recv->name.str, (int)name.len, name.str);
+                      "'%s.%.*s': no implicit conversion",
+                      type_name(at), type_name(pt), i + 1,
+                      type_name(recv), (int)name.len, name.str);
     }
 }
 
@@ -2080,9 +2102,9 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
             if (zan_null_arg_score(pt) < 0) {
                 zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                               "cannot convert 'null' to '%s' in argument %d of "
-                              "'%.*s.%.*s': no implicit conversion",
-                              type_name(pt), i + 1, (int)recv->name.len,
-                              recv->name.str, (int)name.len, name.str);
+                              "'%s.%.*s': no implicit conversion",
+                              type_name(pt), i + 1,
+                              type_name(recv), (int)name.len, name.str);
             }
             continue;
         }
@@ -2100,9 +2122,9 @@ static void check_builtin_generic_call_args(zan_checker_t *c,
         }
         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
                       "cannot convert '%s' to '%s' in argument %d of "
-                      "'%.*s.%.*s': no implicit conversion",
-                      type_name(at), type_name(pt), i + 1, (int)recv->name.len,
-                      recv->name.str, (int)name.len, name.str);
+                      "'%s.%.*s': no implicit conversion",
+                      type_name(at), type_name(pt), i + 1,
+                      type_name(recv), (int)name.len, name.str);
     }
 }
 
@@ -3136,15 +3158,15 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                真要"由类型参数造对象"，只能把工厂交给调用方。 */
             if (type && type->kind == TYPE_TYPE_PARAM) {
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                              "cannot instantiate a type parameter '%.*s'",
-                              (int)type->name.len, type->name.str);
+                              "cannot instantiate a type parameter '%s'",
+                              type_name(type));
             }
             check_generic_constraints(c, type, expr->loc);
             if (type && type->kind == TYPE_CLASS && type->sym &&
                 checker_class_is_abstract(type->sym)) {
                 zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                    "cannot instantiate abstract class '%.*s'",
-                    (int)type->name.len, type->name.str);
+                    "cannot instantiate abstract class '%s'",
+                    type_name(type));
             }
             check_ctor_available(c, type, expr);
         }
@@ -3219,8 +3241,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 if (arg->kind == AST_COLL_INIT) {
                     if (!field || !field->type) {
                         zan_diag_emit(c->diag, DIAG_ERROR, arg->loc,
-                                      "'%.*s' has no member '%.*s'",
-                                      (int)type->name.len, type->name.str,
+                                      "'%s' has no member '%.*s'",
+                                      type_name(type),
                                       (int)mname.len, mname.str);
                     } else {
                         zan_istr_t add_istr = {(char *)"Add", 3};
@@ -3570,8 +3592,8 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
                 ? checker_find_field(rt->sym, fname) : NULL;
             if (!field || !field->type) {
                 zan_diag_emit(c->diag, DIAG_ERROR, asg->loc,
-                    "'%.*s' has no field '%.*s' for 'with'",
-                    (int)rt->name.len, rt->name.str,
+                    "'%s' has no field '%.*s' for 'with'",
+                    type_name(rt),
                     (int)fname.len, fname.str);
                 zan_checker_check_expr(c, asg->binary.right);
                 continue;
@@ -3603,6 +3625,25 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_AWAIT_EXPR:
         {
+            /* 非 async 方法里的 await **是合法的**，判据是"**这个 await 目标
+             * 需不需要真挂起**"，不是"外层方法是不是 async"。
+             *
+             * 能同步降级的几类在非 async 方法里语义都正确：
+             *   - await 一个普通值     → 原样求值（不是协程帧）
+             *   - await 一个 async 调用 → 根驱动：分配子帧，让当前线程驱动到完成
+             *   - await Task.Delay      → 同步休眠
+             *   - await Task.JoinWait   → 事件汇合
+             *   - await Task.Yield      → 同步上下文里没有协程可让出，退化成空操作
+             * 自举侧也是这么判的（src/selfhost/checker.zan："an 'await' in a
+             * *synchronous* method is fine ... Only the *operand* has to be a
+             * coroutine frame"）。
+             *
+             * **必须真挂起**的目标（Gate.Park、Socket.ReadReady / WriteReady /
+             * RecvOv / RecvToOv / AcceptOv / ResolveAsync / ResolveSockAddr）要
+             * 把恢复函数挂到协程帧的状态槽上，没有帧就无路可走——这类由 irgen
+             * 在降级处逐个报更具体的诊断（"await Gate.Park is only supported
+             * inside an async method"），判据在那边，名单也只有一份。
+             */
             zan_type_t *inner = zan_checker_check_expr(c, expr->await_expr.expr);
             if (inner && inner->kind == TYPE_TASK) {
                 return inner->type_arg_count == 1 ? inner->type_args[0]
@@ -4409,10 +4450,12 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         if (mn.len == 17 && memcmp(mn.str, "GetValueOrDefault", 17) == 0) {
             return obj_type->element_type ? obj_type->element_type : c->binder->type_error;
         }
-        const char *elem_name = obj_type->element_type ? type_name(obj_type->element_type) : "T";
+        /* 可空类型整体渲染（自带 '?'），不再手写 '?' 拼在元素名后面——
+         * 元素名本身也可能是带形状的（`bool?` 的元素是 `bool`，
+         * 但嵌套形态要靠渲染器统一给）。 */
         zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                      "cannot access member '%.*s' directly on nullable type '%s?'; access via '.Value' or check '.HasValue' first",
-                      (int)mn.len, mn.str, elem_name);
+                      "cannot access member '%.*s' directly on nullable type '%s'; access via '.Value' or check '.HasValue' first",
+                      (int)mn.len, mn.str, type_name(obj_type));
         return c->binder->type_error;
     }
     if (obj_type && obj_type->sym) {
@@ -4489,8 +4532,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
         }
         if (!in_call_callee) {
             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "type '%.*s' has no member '%.*s'",
-                          (int)obj_type->name.len, obj_type->name.str,
+                          "type '%s' has no member '%.*s'",
+                          type_name(obj_type),
                           (int)expr->member.name.len, expr->member.name.str);
             return c->binder->type_error;
         }
@@ -4499,8 +4542,8 @@ static zan_type_t *check_member_access(zan_checker_t *c, zan_ast_node_t *expr,
          * （`this string` 接收者）不在内建表里，由统一判定一并算进去。 */
         if (checker_call_target_member_state(c, obj_type, expr->member.name) == 0) {
             zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
-                          "type '%.*s' has no method '%.*s'",
-                          (int)obj_type->name.len, obj_type->name.str,
+                          "type '%s' has no method '%.*s'",
+                          type_name(obj_type),
                           (int)expr->member.name.len, expr->member.name.str);
         }
         return c->binder->type_error;

@@ -190,6 +190,19 @@ bool zan_binder_class_implements_iface(zan_symbol_t *cls, zan_symbol_t *iface);
 bool zan_binder_has_extension_method(zan_binder_t *b, zan_type_t *recv_ty,
                                      zan_istr_t name);
 
+/* 面向用户的类型名：按类型的"形状"渲染 —— `T?` / `T[]` / `List<T>`。
+ *
+ * 为什么不能直接拿 t->name：可空类型与数组类型的 name 就是元素类型的
+ * 名字（`bool?` 的 name 是 "bool"），诊断里会把 `bool?` 说成 `bool`
+ * （A463）。而 name 字段是类型身份的一部分（列表特判、ARC 散列、
+ * mangle 都靠它），不能为了好看去改写 —— 渲染与身份彻底分开。
+ *
+ * 形状信息本来就全在类型里（kind / element_type / array_rank /
+ * type_args），不需要新增字段，也不会与类型同一性分叉。
+ *
+ * 返回写入的字节数（不含结尾 '\0'）；buf 装不下时截断并保证结尾 '\0'。 */
+size_t zan_type_display(const zan_type_t *t, char *buf, size_t cap);
+
 /* null 字面量实参 → 形参类型的匹配分。<0 表示不兼容（null 绑不上去）。
  * checker 与 irgen 两侧的重载分解共用这一条规则。 */
 int zan_null_arg_score(zan_type_t *pt);

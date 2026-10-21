@@ -2498,6 +2498,22 @@ static LLVMValueRef emit_to_cstr_of(zan_irgen_t *g, LLVMValueRef val,
             }
         }
     }
+    /* bool 的语义类型优先于 LLVM 值的宽度。泛型实例化的方法返回值
+       （List<Big>.Contains 这类）被提升成 i64，按宽度判就掉进 itoa，
+       渲染成 "1"——同一个 bool 在不同上下文里长得不一样（"x" + b -> "x1"，
+       而 b.ToString() -> "true"）。C# 的口径是 true/false，两边都得是它。 */
+    if (ast && val) {
+        zan_type_t *bt = infer_expr_type(g, ast, locals);
+        if (bt && bt->kind == TYPE_BOOL) {
+            LLVMTypeRef vk = LLVMTypeOf(val);
+            if (LLVMGetTypeKind(vk) == LLVMIntegerTypeKind) {
+                if (LLVMGetIntTypeWidth(vk) == 1) return emit_bool_to_cstr(g, val);
+                LLVMValueRef nz = LLVMBuildICmp(g->builder, LLVMIntNE, val,
+                                               LLVMConstInt(vk, 0, 0), "b2s.nz");
+                return emit_bool_to_cstr(g, nz);
+            }
+        }
+    }
     if (ast && val && LLVMGetTypeKind(LLVMTypeOf(val)) == LLVMPointerTypeKind) {
         zan_type_t *t = infer_expr_type(g, ast, locals);
         LLVMTypeRef want = t ? map_type(g, t) : NULL;
