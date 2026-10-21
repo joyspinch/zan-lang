@@ -39,13 +39,42 @@ if (($Tier -eq 'standard' -or $Tier -eq 'full') -and $Match -eq '' -and -not $Re
     exit 1
 }
 
-$args = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release',
-          '-j', $Jobs, '--output-on-failure', '-L', $Tier)
-if ($Match -ne '') { $args += @('-R', $Match) }
+$ctestArgs = @('--test-dir', (Join-Path $root 'build'), '-C', 'Release',
+               '-j', $Jobs, '--output-on-failure', '-L', $Tier)
+if ($Match -ne '') { $ctestArgs += @('-R', $Match) }
 
 Write-Host "[test] tier=$Tier jobs=$Jobs$(if ($Match) { " match=$Match" })"
-& ctest @args
-$code = $LASTEXITCODE
+
+# 共享构建资源的串行闸：ctest 用的是 build\zanc.exe 与 stdlib stamp，
+# 别的会话此刻重编就会让本轮用例成片假红。拿不到就排队等，别另开一棵
+# 构建树去躲（那只是把共享状态藏起来，公共包照样漂移）。
+# 锁名与 scripts/build.ps1 相同（'build'）——编译与测试必须互斥：
+# 编译持锁时测试排队，测试持锁时编译排队。
+# 详见 scripts/build_gate.ps1 顶部的说明。
+#
+# 退出码经临时文件回传：`& $gate` 在子作用域里跑，$script: 变量穿不过去
+# （各自的 script scope），而闭包里的 $LASTEXITCODE 同样出不来。
+$gate = Join-Path $PSScriptRoot 'build_gate.ps1'
+$codeFile = Join-Path $env:TEMP "zan_ctest_code_$PID.txt"
+$logFile  = Join-Path $env:TEMP "zan_ctest_log_$PID.txt"
+& $gate -Name 'build' -Script {
+    & ctest @ctestArgs 2>&1 | Tee-Object -FilePath $logFile
+    $ct = $LASTEXITCODE
+    # ctest 遇到"没匹配到任何用例"时返回 0，但那不是"验证通过"，是
+    # "什么都没跑"。把它判成失败——否则一次拼错的 -Match 会伪装成绿灯。
+    if ($ct -eq 0 -and (Select-String -Path $logFile -Pattern 'No tests were found' -Quiet)) {
+        $ct = 1
+    }
+    Set-Content -Path $codeFile -Value $ct -Encoding ASCII
+}.GetNewClosure()
+
+$code = 1
+if (Test-Path $codeFile) {
+    $raw = (Get-Content $codeFile -Raw).Trim()
+    if ($raw -match '^\d+$') { $code = [int]$raw }
+    Remove-Item -LiteralPath $codeFile -Force -ErrorAction SilentlyContinue
+}
+Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
 if ($code -eq 0) { Write-Host "TEST_OK tier=$Tier" }
 else { Write-Host "TEST_FAIL tier=$Tier exit=$code" }
 exit $code

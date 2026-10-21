@@ -92,6 +92,7 @@ positive, stated in the commit message.
    dry-run by default) — run it when `_scratch` grows past a few GB.
 3. **Build only out-of-source into `build/`** via `cmake -B build && cmake --build build`.
    Never copy build products into the source tree or root.
+   **并发时走 `scripts/build.ps1`，不要裸跑 `cmake --build`**（见规则 8a）。
 4. **Tests go in `tests/`** and are committed. One-off memory/leak probes are
    NOT tests — put them in `_scratch/`.
 5. **Use `gh` / the PR template** to open PRs. Do not generate `mkpr*.py`,
@@ -126,6 +127,27 @@ positive, stated in the commit message.
    **Nothing else may build while tests run**: the cases share
    `build\zanc.exe` and the stdlib stamp, so a concurrent
    `build_gallery`/`build_ide` makes unrelated cases fail en masse.
+8a. **共享构建资源要串行拿，不要另开一份。** 多会话同时用一个 `build/` 时，
+   编译与测试必须互斥——机制已落地，不用靠自觉：
+   - 构建：`pwsh -File scripts/build.ps1`（**不要裸跑 `cmake --build build`**）
+   - 测试：`pwsh -File scripts/test.ps1 <tier> [-Match <name>]`
+   - 两把脚本共用一把跨进程锁（`scripts/build_gate.ps1`）。拿不到就**排队等**
+     （默认 30 分钟超时，超时报错而不是静默绕过）。
+   - 看当前谁占着锁：`pwsh -File scripts/build_gate.ps1 -Status`
+   **为什么是"等"而不是"另建一棵构建树"**：另建（`build_mine`、
+   `build-zancprobe`、`zan-pkgs`…）是用磁盘换隔离——代价是几百 MB 到 2 GB
+   的重复构建，而且公共包一改副本就漂移，副本并没有让共享状态消失，只是
+   把它藏起来了，漂移照旧。实测一次并发就多出 2.7 GB 重复构建树 + 一个
+   247 MB 仓库副本，而公共包仍旧不同步。**共享资源冲突时的正确动作是排队
+   等，不是复制一份。** 同理，公共包**不要用 worktree 副本**——直接用主仓库
+   `packages/`（编译时 `--package-project zan-lang`），worktree 会漂移且
+   规则 9 禁分支。
+   坑出处：15 个游戏 worker 并发时，一个因公共包副本被删而自建 247 MB
+   仓库副本顶上（副本停在旧 commit，公共包改动永远追不上）；另一个为抓
+   一个 40 帧闪光反复调采样间隔，296K token 花在代码逻辑里已经写明的结论
+   上——"分支走了→flashTimer 被赋值→闪光没画出来"，问题是渲染不是采样。
+   **能用断言钉住的行为不要靠截图反推**；抓帧只用于"好不好看"这类断言不了
+   的东西，且一次抓完批量分析，别边抓边猜时序。
 9. **Never create branches.** Do NOT create local or remote branches; commit
    directly to `main` and push. Delete any stray branch you find after making
    sure its commits are merged into `main`. Content check, not name check:
@@ -255,9 +277,13 @@ up TDM-GCC from PATH cannot link zanc, and the failed link deletes
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build            # zanc, zan-lsp, zan-dap, tools
+pwsh -File scripts/build.ps1        # 构建（受串行闸保护，多会话时用这个）
 # IDE (self-hosted) is built from src/ide_zan/ZanIDE.zan by zanc.
 ```
+
+**并发时不要裸跑 `cmake --build build`** —— 它没有闸，多会话会互踩 `build\zanc.exe`，
+让别人的测试成片假红。`scripts/build.ps1` 与 `scripts/test.ps1` 共用一把跨进程锁：
+拿不到就排队等，不另建构建树（见规则 8a）。
 
 Compile a single program: `build/zanc <file.zan> --auto-stdlib -o out.exe`
 Release build of a program: `build/zanc <file.zan> --auto-stdlib --publish -o out.exe`
