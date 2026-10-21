@@ -4205,6 +4205,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_designer_interaction PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  # Designer's "restore default" (VS property-grid semantics): a property
+  # whose value differs from the type default offers a reset entry, and the
+  # reset writes the type default back into the model through the
+  # before-change hook (undo stack).
+  add_test(NAME conformance_gui_designer_prop_reset
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_prop_reset_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/designer_prop_reset.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_prop_reset${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_designer_prop_reset PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   add_test(NAME conformance_gui_window_shape_mask
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>
