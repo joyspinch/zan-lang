@@ -4879,6 +4879,42 @@ void zan_co_sched_run(void) {
 
 void zan_co_sched_run_until(const volatile int *done) {
     if ((g_co_pool_live || g_co_pool_fg) && done != NULL) {
+        /* 从 worker 线程进来：这个调用点在等一个**子协程**跑完（根驱动
+         * await：非 async 方法里 await 一个 async 调用，编译器分配子帧后
+         * 让当前线程把它驱动到完成）。
+         *
+         * 这里**不能自旋等 done**。子协程是 co_submit 提交的，而 co_submit
+         * 从 worker 线程提交时把任务放进**调用者自己那个 worker 的 LIFO
+         * 槽**（w->lifo）——别的 worker 偷不到（co_steal 偷的是别人的
+         * 队列，不偷 lifo 槽）。当前 worker 正卡在这个自旋里，压根没机会
+         * 去取那个 LIFO 槽，于是子协程永远跑不起来，done 永远不置位：
+         * 死锁。worker 数再多也一样（实测 1/2/4/8 全卡）。
+         *
+         * 正确做法：等的时候**自己顶上 worker 的活**——就地取就绪任务跑
+         * 起来（同 co_run_ready_tasks 的思路，A470 的 zan_co_sync_sleep
+         * 就是这么等的）。子协程跑完，done 置位，等待结束。
+         *
+         * 非 worker 线程（主线程）进来时没有自己的队列，自旋是对的：
+         * 子协程会被别的 worker 跑掉。 */
+        zan_co_worker_t *w = co_self();
+        if (w) {
+            int spins = 0;
+            for (;;) {
+                if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
+                /* 就地跑就绪任务：子协程多半就在本 worker 的 LIFO 槽里 */
+                zan_co_task t;
+                if (co_next_task(w, &t)) {
+                    co_run(w, &t);
+                    spins = 0;
+                    continue;
+                }
+                /* 队列空：派发到期定时器（子协程可能在等定时器） */
+                if (zan_timer_pending() > 0) co_pump_timers();
+                if (__atomic_load_n(done, __ATOMIC_ACQUIRE) != 0) return;
+                if (spins < 512) { Sleep(0); spins++; }
+                else Sleep(1);
+            }
+        }
         int spins = 0;
         while (__atomic_load_n(done, __ATOMIC_ACQUIRE) == 0) {
             if (spins < 512) { Sleep(0); spins++; }

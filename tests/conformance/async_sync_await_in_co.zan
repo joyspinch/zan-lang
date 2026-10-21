@@ -1,0 +1,87 @@
+// 非 async 方法里的 `await` 在**协程上下文**里不能死锁。
+//
+// 背景：编译器对非 async 方法里的 `await` 有三条降级路径——
+//   1) await 一个普通值   → 原样求值
+//   2) await 一个 async 调用 → 根驱动：分配子协程帧，让当前线程把它驱动到完成
+//   3) await Task.Delay   → 同步休眠（A470）
+// 这三条在**主线程**上都是对的（async_sync_delay.zan 已经钉住）。
+//
+// 坑：第 2 条（根驱动）从**worker 线程**进来时死锁。根驱动等的是
+// `zan_co_sched_run_until`，它原来只**自旋等 done 标志**，指望别的线程
+// 跑子协程。可子协程是 co_submit 提交的，而 co_submit 从 worker 线程
+// 提交时把任务塞进**调用者自己那个 worker 的 LIFO 槽**（w->lifo）——
+// 别的 worker 偷不到（co_steal 偷的是别人的队列，不偷 lifo 槽）。当前
+// worker 正卡在自旋里，压根没机会去取那个槽，于是子协程永远跑不起来，
+// done 永远不置位：**死锁**。worker 数再多也一样（实测 1/2/4/8 全卡）。
+//
+// 修法：`zan_co_sched_run_until` 从 worker 线程进来时，等候期间**自己
+// 顶上 worker 的活**——就地取就绪任务跑起来（同 A470 的 zan_co_sync_sleep
+// 的思路）。子协程跑完，done 置位，等待结束。
+//
+// 断言只卡**二值事实**（值对不对 / 有没有跑完），不卡耗时——死锁会让
+// 用例超时失败，这本身就是最强的断言。
+using System;
+
+class Program {
+    static async int Leaf(int x) {
+        await Task.Delay(5);
+        return x + 1;
+    }
+
+    static int Double(int x) {
+        return x * 2;
+    }
+
+    // 根驱动：非 async 方法里 await 一个 async 调用
+    static int SyncAwaitAsync(int x) {
+        int r = await Leaf(x);
+        return r;
+    }
+
+    // 原样求值：非 async 方法里 await 一个普通值
+    static int SyncAwaitPlain(int x) {
+        int r = await Double(x);
+        return r;
+    }
+
+    // 同步休眠：非 async 方法里 await Task.Delay
+    static int SyncAwaitDelay(int x) {
+        await Task.Delay(30);
+        return x;
+    }
+
+    // 嵌套：根驱动里再套一层根驱动
+    static int Nest1(int x) {
+        int r = await SyncAwaitAsync(x);
+        return r;
+    }
+
+    static int Nest2(int x) {
+        int r = await Nest1(x);
+        return r;
+    }
+
+    // 在协程内部调用——这才是死锁的触发条件。
+    // 放在 Main（主线程）里调同样的方法不会死锁：主线程没有自己的队列，
+    // 子协程会被 worker 跑掉。
+    static async int InsideCo() {
+        int a = SyncAwaitAsync(41);
+        Console.WriteLine("asyncAwait=" + Convert.ToString(a));
+
+        int p = SyncAwaitPlain(21);
+        Console.WriteLine("plainAwait=" + Convert.ToString(p));
+
+        int d = SyncAwaitDelay(7);
+        Console.WriteLine("delayAwait=" + Convert.ToString(d));
+
+        int n = Nest2(10);
+        Console.WriteLine("nested=" + Convert.ToString(n));
+
+        return 0;
+    }
+
+    static void Main() {
+        int r = await InsideCo();
+        Console.WriteLine("done=" + Convert.ToString(r));
+    }
+}
