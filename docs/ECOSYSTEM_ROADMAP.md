@@ -684,12 +684,13 @@ deflate/lz4/zstd"）**已经过期**：`packages/Zan.IO/src/System/IO/Compressio
 按 `Zan.Math` 的先例（并入 `stdlib/System/Numerics`，不另开包），**压缩不再
 单开 `Zan.Compression`**：同一个能力有两个家只会让人不知道该用哪个。
 
-**zstd 已落地（纯解码器）**：`Compression/Zstd*.zan` 九个文件，命名空间仍是
-`System.IO.Compression`，门面 `Zstd`（`Decompress` / `TryDecompress` /
+**zstd 已落地（纯解码器）**：`Compression/Zstd/` 九个文件（一个算法族一个
+子目录，命名空间仍声明为 `System.IO.Compression`——目录路径与命名空间解耦，
+调用方写法不变），门面 `Zstd`（`Decompress` / `TryDecompress` /
 `IsZstd` / `DecompressFile` / `DecompressFileTo`），错误模型是
 `ZstdException` + `ZstdError` 可区分错误码（`None` 之外 13 个码）。
 
-| 文件 | 内容 |
+| 文件（均在 `Compression/Zstd/` 下） | 内容 |
 |---|---|
 | `Zstd.zan` | 门面：解压 / 试解压 / 魔数判定 / 文件读写 |
 | `ZstdError.zan` | `ZstdError` 错误码枚举 + `ZstdException` |

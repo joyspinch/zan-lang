@@ -24,7 +24,7 @@
 | `Compression/Zip.zan` | Zip 读写（Zip/ZipEntry/ZipWriter） |
 | `Compression/BZip2.zan` | BZip2（BZip2Decoder） |
 | `Compression/Tar.zan` | Tar 打包/解包（保留 unix mode 位） |
-| `Compression/Zstd*.zan` | zstd（Zstandard）解码器（RFC 8878，纯解码） |
+| `Compression/Zstd/*.zan` | zstd（Zstandard）解码器（RFC 8878，纯解码） |
 
 ## zstd（Zstandard）解码
 
