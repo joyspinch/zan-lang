@@ -1,0 +1,81 @@
+using System;
+
+namespace System.Ssh;
+
+// 版本交换（RFC 4253 §4.2）。
+//
+// 双方的识别串长这样：
+//
+//     SSH-protoversion-softwareversion SP comments CR LF
+//
+// **protoversion 必须是 "2.0"**；softwareversion 只能用可打印 US-ASCII
+// （空白与减号除外）；整串（含 CR LF）不超过 255 字节。
+//
+// **服务端可以在自己的识别串之前先发若干行别的**（TCP wrapper 的欢迎语之类），
+// 这些行不以 "SSH-" 开头，客户端要能跳过它们；但反过来，"SSH-" 开头的行
+// 一定是识别串，不能当噪声丢掉——**跳过噪声与识别串的界线就是 "SSH-" 前缀**，
+// 认错了就会把真正的识别串当成噪声，然后对着二进制包去读版本号。
+//
+// **1.99 是兼容模式的老服务端**：protoversion 写成 "1.99" 表示"其实是 2.0"，
+// 而且**不发 CR**。客户端要认。
+public class SshVersion {
+    // 识别串前缀（protoversion 2.0）。
+    public static string Prefix = "SSH-2.0-";
+
+    // 识别串最大长度（含 CR LF，RFC 4253 §4.2）。
+    public static int MaxLength = 255;
+
+    // 造自己的识别串（含结尾的 CR LF）。
+    public static string Build(string software) {
+        if (software == null || software.Length == 0) {
+            throw new SshException(SshError.Internal, "software version is empty");
+        }
+        string ident = SshVersion.Prefix + software + "\r\n";
+        if (ident.Length > SshVersion.MaxLength) {
+            throw new SshException(SshError.Internal, "identification string too long",
+                ident.Length.ToString() + " > " + SshVersion.MaxLength.ToString());
+        }
+        return ident;
+    }
+
+    // 这一行是不是识别串（以 "SSH-" 开头）。
+    public static bool IsIdentification(string line) {
+        return line != null && line.Length >= 4 && line.StartsWith("SSH-");
+    }
+
+    // 从识别串里取出 softwareversion；不合法就抛 BadVersion。
+    //
+    // **校验要严**：protoversion 不是 2.0 / 1.99、softwareversion 里有控制字符
+    // 或空白、空的——都要当场拒绝。对端发来的字符串是要进日志、进错误消息的，
+    // 带着控制字符（尤其是 ESC）进日志就是终端注入。
+    public static string ParseSoftware(string line) {
+        if (line == null || line.Length == 0) {
+            throw new SshException(SshError.BadVersion, "empty identification string");
+        }
+        if (!line.StartsWith("SSH-")) {
+            throw new SshException(SshError.BadVersion, "identification string must start with SSH-");
+        }
+        // 找第二个 '-'：protoversion 与 softwareversion 之间。
+        string rest = line.Substring(4);
+        int dash = rest.IndexOf("-");
+        if (dash < 0) {
+            throw new SshException(SshError.BadVersion, "identification string has no software version");
+        }
+        string proto = rest.Substring(0, dash);
+        if (proto != "2.0" && proto != "1.99") {
+            throw new SshException(SshError.BadVersion, "unsupported SSH protocol version", proto);
+        }
+        string software = rest.Substring(dash + 1);
+        if (software.Length == 0) {
+            throw new SshException(SshError.BadVersion, "empty software version");
+        }
+        // softwareversion 允许 SP 分隔 comments，但不允许控制字符。
+        for (int i = 0; i < software.Length; i = i + 1) {
+            int c = software[i] & 255;
+            if (c < 32 || c > 126) {
+                throw new SshException(SshError.BadVersion, "software version has a control character");
+            }
+        }
+        return software;
+    }
+}

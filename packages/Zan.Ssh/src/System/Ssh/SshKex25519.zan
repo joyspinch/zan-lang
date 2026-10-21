@@ -1,0 +1,102 @@
+using System;
+using System.Security.Cryptography;
+
+namespace System.Ssh;
+
+// curve25519-sha256 密钥交换（RFC 8731）。
+//
+// 流程（与 RFC 5656 的 ECDH 同构，只是编码不同）：
+//
+//   1. 客户端生成临时密钥对，把 32 字节公钥 Q_C 发过去（SSH_MSG_KEX_ECDH_INIT）。
+//   2. 服务端生成临时密钥对，把主机密钥 K_S、自己的 32 字节公钥 Q_S 与
+//      **对交换哈希 H 的签名**发回去（SSH_MSG_KEX_ECDH_REPLY）。
+//   3. 双方各自算出共享密钥 K = X25519(本地私钥, 对端公钥)，再算交换哈希：
+//
+//          H = SHA256( string V_C || string V_S || string I_C || string I_S
+//                     || string K_S || string Q_C || string Q_S || mpint K )
+//
+//      客户端验签，服务端自己签名——**两边算出来的 H 必须一样**，不一样就说明
+//      有人篡改了握手内容。
+//
+// **K 的编码有个反直觉的地方**（RFC 8731 §3.1）：X25519 输出的 32 字节是
+// 小端标量表示，但 SSH 把它当作**大端无符号整数**解释，再按 mpint 编码。
+// 直接把 32 字节塞进哈希会算错 H——而且这个错误只在跟别的实现互通时才暴露。
+//
+// **必须检查共享密钥不是全零**（RFC 8731 §3 明确要求）：全零说明对端发了
+// 一个落在小子群里的点。底层库会抛异常，这里把它换成 SSH 自己的错误码。
+public class SshKex25519 {
+    // 算法名。
+    public static string Algorithm = "curve25519-sha256";
+
+    // 公钥长度（字节）。
+    public static int KeyLength = 32;
+
+    // 生成临时密钥对（私钥 32 字节，公钥 32 字节）。
+    public static void GenerateKeyPair(out byte[] privateKey, out byte[] publicKey) {
+        privateKey = Curve25519.GenerateKeyPair(out publicKey);
+        if (privateKey == null || privateKey.Length != SshKex25519.KeyLength || publicKey == null) {
+            throw new SshException(SshError.KexFailed, "X25519 key generation failed");
+        }
+    }
+
+    // 算共享密钥（32 字节）；对端公钥长度不对或结果全零就抛异常。
+    public static byte[] SharedSecret(byte[] privateKey, byte[] peerPublicKey) {
+        if (privateKey == null || privateKey.Length != SshKex25519.KeyLength) {
+            throw new SshException(SshError.KexFailed, "invalid X25519 private key length");
+        }
+        if (peerPublicKey == null || peerPublicKey.Length != SshKex25519.KeyLength) {
+            throw new SshException(SshError.KexFailed, "invalid X25519 public key length");
+        }
+        byte[] shared = null;
+        try {
+            shared = Curve25519.DeriveSharedSecret(privateKey, peerPublicKey);
+        } catch (ArgumentException ex) {
+            // 底层库对"全零共享密钥"抛的是 ArgumentException；SSH 这层要
+            // 换成自己的错误码，调用方才好按原因分支。
+            throw new SshException(SshError.KexFailed, "X25519 shared secret is all zero", ex.Message);
+        }
+        if (shared == null || shared.Length != SshKex25519.KeyLength) {
+            throw new SshException(SshError.KexFailed, "X25519 produced no shared secret");
+        }
+        return shared;
+    }
+
+    // 算交换哈希 H（SHA-256）。
+    //
+    // 参数全是"已经定好的字节串"：V_C / V_S 是识别串（**不含 CR LF**），
+    // I_C / I_S 是 KEXINIT 载荷，K_S 是主机密钥 blob，Q_C / Q_S 是临时公钥，
+    // K 是共享密钥的 32 字节原始值（mpint 编码在这里做）。
+    //
+    // **I_C / I_S 必须带上消息号字节**（20）：RFC 4253 §7.1 把
+    // 「byte SSH_MSG_KEXINIT」和后面的字段一起列成一条消息，§8 说的
+    // "the payload of the client's SSH_MSG_KEXINIT" 指的就是这条消息的
+    // 载荷（消息号 + 字段）。OpenSSH 的实现写得很直白——注释就叫
+    // "fake header: len+SSH2_MSG_KEXINIT"；paramiko 也把 cMSG_KEXINIT
+    // 拼在最前面。只哈希字段不算消息号 → H 对不上 → 验签失败，
+    // 而且**两边都这么写的时候自洽测试照样全绿**，只有真互通才暴露。
+    public static byte[] ExchangeHash(byte[] versionC, byte[] versionS,
+                                      byte[] kexInitC, byte[] kexInitS,
+                                      byte[] hostKey, byte[] publicC, byte[] publicS,
+                                      byte[] sharedSecret) {
+        SshWriter w = new SshWriter(512);
+        w.WriteString(versionC);
+        w.WriteString(versionS);
+        w.WriteString(SshKex25519.WithMessageNumber(kexInitC));
+        w.WriteString(SshKex25519.WithMessageNumber(kexInitS));
+        w.WriteString(hostKey);
+        w.WriteString(publicC);
+        w.WriteString(publicS);
+        w.WriteMpint(sharedSecret);
+        byte[] data = w.ToArray();
+        return Sha256.Hash(data);
+    }
+
+    // KEXINIT 参与交换哈希的字节：消息号字节 + 载荷。
+    public static byte[] WithMessageNumber(byte[] payload) {
+        if (payload == null) { payload = new byte[0]; }
+        byte[] outb = new byte[1 + payload.Length];
+        outb[0] = (byte)SshMessage.KexInit;
+        for (int i = 0; i < payload.Length; i = i + 1) { outb[1 + i] = payload[i]; }
+        return outb;
+    }
+}

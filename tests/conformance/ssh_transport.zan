@@ -1,0 +1,622 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Ssh;
+using System.Threading;
+
+// SSH 契约测试：线格式、版本串、算法协商、主机密钥与 known_hosts、
+// 密钥派生、以及**完整的客户端↔服务端握手 + 认证 + exec**。
+//
+// 端到端那一段用**内存管道**把两端接在同一个进程里（客户端在主线程，
+// 服务端在一个线程上）。本机没有 sshd，没有 docker，靠外部服务端验证就得
+// 靠"装一个 sshd"这种不可控的前置条件——内存管道让握手的两端在同一份
+// 代码上互相对拍，任何一边算错哈希、编码错 mpint、切错加密时机，都会立刻
+// 对不上。
+public class SshTests {
+    private static int failures = 0;
+
+    private static void Check(string name, bool ok) {
+        if (!ok) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name);
+        }
+    }
+
+    private static void CheckNear(string name, double actual, double expected, double tolerance) {
+        double diff = actual - expected;
+        if (diff < 0.0) { diff = -diff; }
+        if (diff > tolerance) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual.ToString()
+                + " expected=" + expected.ToString());
+        }
+    }
+
+    private static void CheckEq(string name, string actual, string expected) {
+        if (actual != expected) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " actual=" + actual + " expected=" + expected);
+        }
+    }
+
+    /* ---------- 线格式（RFC 4251 §5） ---------- */
+    private static void TestWire() {
+        SshWriter w = new SshWriter();
+        w.WriteByte(0x42);
+        w.WriteBool(true);
+        w.WriteU32(0x01020304);
+        w.WriteText("hello");
+        byte[] raw = w.ToArray();
+
+        SshReader r = new SshReader(raw);
+        CheckEq("wire byte", r.ReadByte().ToString(), "66");
+        Check("wire bool", r.ReadBool());
+        CheckEq("wire u32", r.ReadU32().ToString(), "16909060");
+        CheckEq("wire text", r.ReadText(), "hello");
+        CheckEq("wire drained", r.Remaining().ToString(), "0");
+
+        // mpint：最高位是 1 必须补前导 0，否则会被读成负数。
+        SshWriter mp = new SshWriter();
+        byte[] big = new byte[] { 0x80, 0x01 };
+        mp.WriteMpint(big);
+        byte[] mpBytes = mp.ToArray();
+        CheckEq("mpint pad length", mpBytes.Length.ToString(), "7");
+        int mpPad = mpBytes[4] & 255;
+        CheckEq("mpint pad byte", mpPad.ToString(), "0");
+        byte[] back = new SshReader(mpBytes).ReadMpint();
+        CheckEq("mpint roundtrip length", back.Length.ToString(), "2");
+        int mpFirst = back[0] & 255;
+        CheckEq("mpint roundtrip first", mpFirst.ToString(), "128");
+
+        // mpint：零是零长度。
+        SshWriter zero = new SshWriter();
+        zero.WriteMpint(new byte[] { 0x00, 0x00 });
+        CheckEq("mpint zero length", zero.ToArray().Length.ToString(), "4");
+        CheckEq("mpint zero value", new SshReader(zero.ToArray()).ReadMpint().Length.ToString(), "0");
+
+        // mpint：前导 0 要被去掉（不是规范编码，但读端要能吃）。
+        SshReader raw0 = new SshReader(new byte[] { 0, 0, 0, 2, 0, 5 });
+        CheckEq("mpint strips leading zeros", raw0.ReadMpint().Length.ToString(), "1");
+
+        // 负数 mpint 必须被拒。
+        bool negativeRejected = false;
+        try {
+            new SshReader(new byte[] { 0, 0, 0, 1, 0xFF }).ReadMpint();
+        } catch (SshException ex) {
+            negativeRejected = (ex.error == SshError.Malformed);
+        }
+        Check("mpint negative rejected", negativeRejected);
+
+        // name-list：空名字非法。
+        bool emptyNameRejected = false;
+        try {
+            List<string> bad = new List<string>();
+            bad.Add("a");
+            bad.Add("");
+            SshWriter lw = new SshWriter();
+            lw.WriteNameList(bad);
+        } catch (SshException ex) {
+            emptyNameRejected = (ex.error == SshError.Malformed);
+        }
+        Check("name-list empty name rejected", emptyNameRejected);
+
+        // 超长 string 必须被拒（否则畸形长度能把读端撑爆）。
+        bool tooLongRejected = false;
+        try {
+            SshReader lr = new SshReader(new byte[] { 0x7F, 0xFF, 0xFF, 0xFF });
+            lr.ReadString();
+        } catch (SshException ex) {
+            tooLongRejected = (ex.error == SshError.Malformed);
+        }
+        Check("oversized string rejected", tooLongRejected);
+    }
+
+    /* ---------- 版本串（RFC 4253 §4.2） ---------- */
+    private static void TestVersion() {
+        CheckEq("version build", SshVersion.Build("Zan_1.0"), "SSH-2.0-Zan_1.0\r\n");
+        CheckEq("version parse", SshVersion.ParseSoftware("SSH-2.0-OpenSSH_9.6"), "OpenSSH_9.6");
+        // 1.99 是老服务端的兼容模式，要当成 2.0。
+        CheckEq("version 1.99", SshVersion.ParseSoftware("SSH-1.99-OpenSSH_3.9"), "OpenSSH_3.9");
+        Check("version detection", SshVersion.IsIdentification("SSH-2.0-x"));
+        Check("version banner detection", !SshVersion.IsIdentification("Welcome to the server"));
+
+        bool badProto = false;
+        try {
+            SshVersion.ParseSoftware("SSH-1.5-ancient");
+        } catch (SshException ex) {
+            badProto = (ex.error == SshError.BadVersion);
+        }
+        Check("version bad proto rejected", badProto);
+
+        bool controlChar = false;
+        try {
+            SshVersion.ParseSoftware("SSH-2.0-badesc");
+        } catch (SshException ex) {
+            controlChar = (ex.error == SshError.BadVersion);
+        }
+        Check("version control char rejected", controlChar);
+    }
+
+    /* ---------- 算法协商（RFC 4253 §7.1） ---------- */
+    private static void TestNegotiation() {
+        List<string> client = new List<string>();
+        client.Add("aes256-gcm@openssh.com");
+        client.Add("aes128-gcm@openssh.com");
+        List<string> server = new List<string>();
+        server.Add("aes128-gcm@openssh.com");
+        server.Add("aes256-gcm@openssh.com");
+        // 规则是"客户端列表里第一个也在服务端列表里的"——不是服务端的顺序。
+        CheckEq("negotiation is client-first",
+            SshNegotiation.Choose(client, server), "aes256-gcm@openssh.com");
+
+        List<string> other = new List<string>();
+        other.Add("3des-cbc");
+        Check("negotiation no overlap", SshNegotiation.Choose(client, other) == null);
+    }
+
+    /* ---------- 主机密钥与指纹 ---------- */
+    private static void TestHostKey() {
+        byte[] d32 = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { d32[i] = (byte)(i + 1); }
+        SshHostKey key = SshHostKey.FromPrivate(d32);
+        Check("host key blob", key.blob.Length > 90);
+        // 指纹是 OpenSSH 口径：SHA256: + base64（无补位）。
+        string fp = SshHostKey.Fingerprint(key.blob);
+        Check("fingerprint prefix", fp.StartsWith("SHA256:"));
+        Check("fingerprint no padding", !fp.Contains("="));
+
+        byte[] message = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { message[i] = (byte)(i * 7); }
+        byte[] signature = key.Sign(message);
+        Check("host key signature verifies", SshHostKey.Verify(key.blob, message, signature));
+        // 改一个字节，验签必须失败。
+        message[5] = (byte)(message[5] ^ 1);
+        Check("host key signature rejects tampering", !SshHostKey.Verify(key.blob, message, signature));
+
+        // **签名 blob 的结构**（RFC 5656 §3.1.2）：
+        //     string "ecdsa-sha2-nistp256"
+        //     string ( mpint r || mpint s )
+        // 算法名后面跟的是"一个装着两个 mpint 的 string"，不是两个 mpint 平铺。
+        // 结构错了，对端解析出的 r/s 全是垃圾——而且报错只会说"验签失败"，
+        // 完全指不到真正的原因。OpenSSH 与 paramiko 都是 RFC 写法。
+        SshReader sig = new SshReader(signature);
+        CheckEq("signature algorithm name", sig.ReadText(), "ecdsa-sha2-nistp256");
+        byte[] sigBlob = sig.ReadString();
+        SshReader inner = new SshReader(sigBlob);
+        byte[] rVal = inner.ReadMpint();
+        byte[] sVal = inner.ReadMpint();
+        Check("signature blob holds two mpints", rVal.Length > 0 && sVal.Length > 0);
+        CheckEq("signature blob fully consumed", inner.Remaining().ToString(), "0");
+    }
+
+    /* ---------- 交换哈希（RFC 4253 §8 / RFC 8731 §3） ---------- */
+    private static void TestExchangeHash() {
+        // **已知答案测试**：定值按 OpenSSH 的 kex_gen_hash 布局算出来：
+        //     H = SHA256( string V_C || string V_S || string I_C || string I_S
+        //                  || string K_S || string Q_C || string Q_S || mpint K )
+        // 其中 **I_C / I_S 是"消息号字节 20 + KEXINIT 载荷"**。
+        //
+        // 少算消息号 → H 对不上 → 验签失败；**而且两端都少算的时候自洽测试
+        // 照样全绿**，只有跟别的实现互通才暴露。所以这条定值必须钉死。
+        byte[] vc = Encoding.UTF8.GetBytes("SSH-2.0-Client_1.0");
+        byte[] vs = Encoding.UTF8.GetBytes("SSH-2.0-Server_1.0");
+        byte[] ic = new byte[16 + 8];
+        for (int i = 0; i < 16; i = i + 1) { ic[i] = (byte)i; }
+        byte[] icText = Encoding.UTF8.GetBytes("kex-list");
+        for (int i = 0; i < 8; i = i + 1) { ic[16 + i] = icText[i]; }
+        byte[] isPayload = new byte[16 + 9];
+        for (int i = 0; i < 16; i = i + 1) { isPayload[i] = (byte)(i + 16); }
+        byte[] isText = Encoding.UTF8.GetBytes("kex-list2");
+        for (int i = 0; i < 9; i = i + 1) { isPayload[16 + i] = isText[i]; }
+        byte[] ks = Encoding.UTF8.GetBytes("host-key-blob");
+        byte[] qc = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { qc[i] = (byte)i; }
+        byte[] qs = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { qs[i] = (byte)(i + 32); }
+        byte[] k = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { k[i] = (byte)(i + 64); }
+
+        byte[] hash = SshKex25519.ExchangeHash(vc, vs, ic, isPayload, ks, qc, qs, k);
+        CheckEq("exchange hash known answer", SshBytes.ToHex(hash),
+            "d706e09604d6abf07bdab7b33593204a700d9fe1361b504b5117a56f633962a1");
+    }
+
+    /* ---------- known_hosts ---------- */
+    private static void TestKnownHosts() {
+        byte[] d32 = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { d32[i] = (byte)(i + 1); }
+        SshHostKey key = SshHostKey.FromPrivate(d32);
+        string b64 = System.Convert.ToBase64String(key.blob);
+        string content = "example.com,10.0.0.1 ecdsa-sha2-nistp256 " + b64 + "\n"
+                       + "*.wild.com ecdsa-sha2-nistp256 " + b64 + "\n"
+                       + "# a comment\n"
+                       + "\n";
+
+        SshKnownHosts known = SshKnownHosts.Parse(content);
+        CheckEq("known hosts entries", known.entries.Count.ToString(), "2");
+        CheckEq("known host match",
+            known.Check("example.com", key.blob), SshKnownHosts.MatchKnown);
+        CheckEq("known host second name",
+            known.Check("10.0.0.1", key.blob), SshKnownHosts.MatchKnown);
+        CheckEq("known host wildcard",
+            known.Check("a.wild.com", key.blob), SshKnownHosts.MatchKnown);
+        CheckEq("known host unknown",
+            known.Check("other.com", key.blob), SshKnownHosts.MatchUnknown);
+
+        // 同名但密钥不同 → 必须是 Mismatch（不是 Unknown）。
+        byte[] other = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { other[i] = (byte)(200 - i); }
+        SshHostKey otherKey = SshHostKey.FromPrivate(other);
+        CheckEq("known host mismatch",
+            known.Check("example.com", otherKey.blob), SshKnownHosts.MatchMismatch);
+
+        // 通配符匹配规则。
+        Check("wildcard star", SshKnownHosts.WildcardMatch("*.example.com", "a.example.com"));
+        Check("wildcard question", SshKnownHosts.WildcardMatch("a?c.com", "abc.com"));
+        Check("wildcard no match", !SshKnownHosts.WildcardMatch("*.example.com", "a.example.org"));
+    }
+
+    /* ---------- 密钥派生（RFC 4253 §7.2） ---------- */
+    private static void TestKeyDerivation() {
+        // **已知答案测试**：下面的定值是按 RFC 4253 §7.2 算出来的
+        // （K1 = SHA256(mpint(K) || H || 'A' || session_id)），
+        // 其中 mpint(K) = **4 字节长度前缀 + 数值体**。
+        //
+        // 这组定值是"钥匙"：少了长度前缀（只喂数值体）算出来的结果完全
+        // 不同，而症状是"握手成功、第一个加密包解不开"——光看代码看不出
+        // 哪里错。KDF 必须喂**完整 mpint**。
+        byte[] shared = new byte[] { 0x01, 0x02, 0x03 };
+        byte[] hash = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { hash[i] = (byte)i; }
+        byte[] iv = SshKeys.Derive(shared, hash, hash, 65, 12);
+        CheckEq("derived iv length", iv.Length.ToString(), "12");
+        CheckEq("derived iv known answer", SshBytes.ToHex(iv),
+            "7feac9fb1f73e36df4ecccc5");
+        byte[] ivB = SshKeys.Derive(shared, hash, hash, 66, 12);
+        CheckEq("derived iv B known answer", SshBytes.ToHex(ivB),
+            "bab83a6c2647fa3f78d6eeaa");
+        // 不同字母必须派生出不同的材料。
+        Check("derived differs by label", !SshBytes.Equal(iv, ivB));
+        // 确定性：同样的输入必须得到同样的输出。
+        byte[] ivAgain = SshKeys.Derive(shared, hash, hash, 65, 12);
+        Check("derived is deterministic", SshBytes.Equal(iv, ivAgain));
+        // 材料不够长时按 K1||K2 续接。
+        byte[] longKey = SshKeys.Derive(shared, hash, hash, 67, 40);
+        CheckEq("derived long length", longKey.Length.ToString(), "40");
+        CheckEq("derived long known answer", SshBytes.ToHex(longKey),
+            "a4ecc3bd1d6955e315990b44439c913e32f95d4dd59c12bb843e2c261155e4908e4020a4c30014f2");
+        Check("derived long extends", !SshBytes.Equal(iv, longKey));
+    }
+
+    /* ---------- 端到端：客户端 ↔ 服务端 ---------- */
+    private static void TestEndToEnd() {
+        SshMemoryLink link = new SshMemoryLink();
+        byte[] hostPrivate = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { hostPrivate[i] = (byte)(i + 3); }
+        SshHostKey hostKey = SshHostKey.FromPrivate(hostPrivate);
+
+        SshServerState.pipe = link.serverEnd;
+        SshServerState.hostKey = hostKey;
+        SshServerState.password = "s3cret";
+        SshServerState.error = "";
+        SshServerState.finished = false;
+
+        bool started = Thread.Start(SshServer.Run);
+        Check("server thread started", started);
+
+        SshClient client = new SshClient("example.com", 22, "alice");
+        client.options.knownHostsContent = SshServerState.knownHosts(hostKey);
+        client.UsePipe(link.clientEnd);
+        client.Handshake();
+        CheckEq("negotiated kex", client.negotiatedKex, "curve25519-sha256");
+        CheckEq("negotiated host key", client.negotiatedHostKey, "ecdsa-sha2-nistp256");
+        CheckEq("negotiated cipher", client.negotiatedCipher, "aes256-gcm@openssh.com");
+        Check("session id present", client.sessionId != null && client.sessionId.Length == 32);
+        Check("peer host key present", client.peerHostKey != null);
+
+        client.RequestUserAuthService();
+        bool authed = client.AuthenticatePassword("s3cret");
+        Check("password auth accepted", authed);
+
+        SshExecResult result = client.Exec("echo hello");
+        CheckEq("exec stdout", result.stdout, "hello from the server");
+        CheckEq("exec stderr", result.stderr, "");
+        CheckEq("exec exit code", result.exitCode.ToString(), "7");
+
+        client.Close();
+        // 等服务端线程收尾（最多 2 秒）。
+        SshTests.WaitServer();
+        CheckEq("server side clean", SshServerState.error, "");
+    }
+
+    /* ---------- 主机密钥策略：不认识 / 变了都要拒绝 ---------- */
+    private static void TestHostKeyPolicy() {
+        byte[] hostPrivate = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) { hostPrivate[i] = (byte)(i + 9); }
+        SshHostKey hostKey = SshHostKey.FromPrivate(hostPrivate);
+
+        // 已知主机但指纹不对 → 必须报 HostKeyMismatch。
+        SshMemoryLink link = new SshMemoryLink();
+        SshServerState.pipe = link.serverEnd;
+        SshServerState.hostKey = hostKey;
+        SshServerState.password = "pw";
+        SshServerState.error = "";
+        SshServerState.finished = false;
+        Thread.Start(SshServer.Run);
+
+        SshClient client = new SshClient("example.com", 22, "bob");
+        client.options.pinnedFingerprint = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        client.UsePipe(link.clientEnd);
+        string error = "";
+        try {
+            client.Handshake();
+        } catch (SshException ex) {
+            error = ex.ErrorName();
+        }
+        CheckEq("pinned fingerprint mismatch rejected", error, "HostKeyMismatch");
+        client.Close();
+        // 等服务端线程收尾：主线程先退出的话，线程栈上的对象在退出时还
+        // 可达，leakcheck 会把它们算成"没释放"，而且**每次跑的数还不一样**
+        // （退出期的静态释放与泄漏检查有先后）。
+        SshTests.WaitServer();
+    }
+
+    public static void Main() {
+        Run("wire", TestWire);
+        Run("version", TestVersion);
+        Run("negotiation", TestNegotiation);
+        Run("hostkey", TestHostKey);
+        Run("exchange_hash", TestExchangeHash);
+        Run("known_hosts", TestKnownHosts);
+        Run("keyderivation", TestKeyDerivation);
+        Run("endtoend", TestEndToEnd);
+        Run("hostkey_policy", TestHostKeyPolicy);
+
+        // 清掉跨线程的静态状态：它们在退出时还可达的话，leakcheck 会算成
+        // "没释放"（退出期的静态释放与泄漏检查有先后，计数会飘）。
+        SshServerState.Clear();
+
+        if (failures == 0) {
+            Console.WriteLine("ALL SSH TESTS PASSED");
+        } else {
+            Console.WriteLine("SSH FAILURES: " + failures.ToString());
+        }
+    }
+
+    // 等服务端线程收尾（最多 2 秒）。
+    public static void WaitServer() {
+        int waited = 0;
+        while (!SshServerState.finished && waited < 2000) {
+            Thread.Sleep(10);
+            waited = waited + 10;
+        }
+    }
+
+    // 每一段单独兜异常：否则一段抛出去，后面的段全都不跑，
+    // 而且异常前的输出还会被缓冲吞掉，排查时只看到"Unhandled exception"。
+    private static void Run(string name, Action body) {
+        try {
+            body();
+        } catch (SshException ex) {
+            failures = failures + 1;
+            Console.WriteLine("FAIL " + name + " threw " + ex.ErrorName() + ": " + ex.Message);
+        }
+    }
+}
+
+// 服务端对端的状态（跨线程用静态字段传）。
+public class SshServerState {
+    public static SshBytePipe pipe;
+    public static SshHostKey hostKey;
+    public static string password;
+    public static string error;
+    public static bool finished;
+
+    // 造一份 known_hosts（客户端与服务端共用的那份"信任"）。
+    public static string knownHosts(SshHostKey key) {
+        return "example.com ecdsa-sha2-nistp256 "
+            + System.Convert.ToBase64String(key.blob) + "\n";
+    }
+
+    // 清空静态状态（退出前调用）。
+    //
+    // 静态字段持有的对象在退出时仍然可达，leakcheck 会把它们算成"没释放"。
+    // 而退出期的静态释放与泄漏检查有先后，计数还会飘（实测同一份代码
+    // 跑出来 8 / 1 / 0 三种结果）——所以测试自己把状态清干净。
+    public static void Clear() {
+        pipe = null;
+        hostKey = null;
+        password = null;
+        error = null;
+        finished = false;
+    }
+}
+
+// 测试里的服务端：把客户端的握手走完，再回应认证与 exec。
+//
+// 它用**包自己的**底层件（包层、密钥派生、curve25519、主机密钥），
+// 所以客户端与服务端在交换哈希、密钥派生、加密上任何一处算错，都会当场
+// 对不上——这正是端到端测试要抓的东西。
+public class SshServer {
+    public static void Run() {
+        try {
+            SshServer.Serve();
+        } catch (Exception ex) {
+            SshServerState.error = ex.Message;
+        }
+        if (SshServerState.pipe != null) {
+            SshServerState.pipe.Close();
+        }
+        SshServerState.finished = true;
+    }
+
+    private static void Serve() {
+        SshBytePipe pipe = SshServerState.pipe;
+        SshPacketLayer packets = new SshPacketLayer(pipe);
+
+        // 版本交换。
+        string clientIdent = SshServer.ReadIdentification(pipe);
+        string serverIdent = "SSH-2.0-SshTestServer_1.0\r\n";
+        byte[] serverRaw = Encoding.UTF8.GetBytes(serverIdent);
+        pipe.WriteExact(serverRaw, 0, serverRaw.Length);
+
+        // KEXINIT。
+        SshKexInit init = new SshKexInit();
+        init.kexAlgorithms.Add("curve25519-sha256");
+        init.hostKeyAlgorithms.Add("ecdsa-sha2-nistp256");
+        init.encryptionC2S.Add("aes256-gcm@openssh.com");
+        init.encryptionS2C.Add("aes256-gcm@openssh.com");
+        init.macC2S.Add("hmac-sha2-256");
+        init.macS2C.Add("hmac-sha2-256");
+        init.compressionC2S.Add("none");
+        init.compressionS2C.Add("none");
+        byte[] localPayload = init.ToPayload();
+        SshServer.Send(packets, SshMessage.KexInit, localPayload);
+
+        byte[] remotePayload = SshServer.Recv(packets, SshMessage.KexInit);
+        byte[] localVersion = Encoding.UTF8.GetBytes("SSH-2.0-SshTestServer_1.0");
+        byte[] remoteVersion = Encoding.UTF8.GetBytes(clientIdent);
+
+        // 密钥交换。
+        byte[] clientPublic = SshServer.ReadString(packets, SshMessage.KexEcdhInit);
+        byte[] privateKey;
+        byte[] publicKey;
+        SshKex25519.GenerateKeyPair(out privateKey, out publicKey);
+        byte[] shared = SshKex25519.SharedSecret(privateKey, clientPublic);
+        byte[] hash = SshKex25519.ExchangeHash(
+            remoteVersion, localVersion,
+            remotePayload, localPayload,
+            SshServerState.hostKey.blob, clientPublic, publicKey, shared);
+        byte[] signature = SshServerState.hostKey.Sign(hash);
+
+        SshWriter reply = new SshWriter(512);
+        reply.WriteString(SshServerState.hostKey.blob);
+        reply.WriteString(publicKey);
+        reply.WriteString(signature);
+        SshServer.Send(packets, SshMessage.KexEcdhReply, reply.ToArray());
+
+        // NEWKEYS 与密钥切换。
+        SshServer.Send(packets, SshMessage.NewKeys, new byte[0]);
+        SshServer.Recv(packets, SshMessage.NewKeys);
+
+        SshCipherState outState = new SshCipherState();
+        outState.Init(SshKeys.Derive(shared, hash, hash, 68, 32),
+                      SshKeys.Derive(shared, hash, hash, 66, 12));
+        SshCipherState inState = new SshCipherState();
+        inState.Init(SshKeys.Derive(shared, hash, hash, 67, 32),
+                     SshKeys.Derive(shared, hash, hash, 65, 12));
+        packets.outCipher = outState;
+        packets.inCipher = inState;
+
+        // userauth 服务。
+        SshServer.Recv(packets, SshMessage.ServiceRequest);
+        SshWriter accept = new SshWriter(32);
+        accept.WriteText("ssh-userauth");
+        SshServer.Send(packets, SshMessage.ServiceAccept, accept.ToArray());
+
+        // 口令认证。
+        byte[] authPayload = SshServer.Recv(packets, SshMessage.UserAuthRequest);
+        SshReader ar = new SshReader(authPayload);
+        ar.ReadText();                       // 用户名
+        ar.ReadText();                       // 服务名
+        string method = ar.ReadText();
+        ar.ReadBool();                       // 有没有布尔标志
+        string password = ar.ReadText();
+        bool ok = (method == "password" && password == SshServerState.password);
+        if (ok) {
+            SshServer.Send(packets, SshMessage.UserAuthSuccess, new byte[0]);
+        } else {
+            SshWriter failure = new SshWriter(64);
+            failure.WriteText("none");
+            failure.WriteBool(false);
+            SshServer.Send(packets, SshMessage.UserAuthFailure, failure.ToArray());
+            return;
+        }
+
+        // 通道：session + exec。
+        byte[] openPayload = SshServer.Recv(packets, SshMessage.ChannelOpen);
+        SshReader open = new SshReader(openPayload);
+        open.ReadText();                     // 通道类型
+        long clientChannel = (long)open.ReadU32();
+        open.ReadU32();                      // 初始窗口
+        open.ReadU32();                      // 最大包
+        SshWriter confirm = new SshWriter(64);
+        confirm.WriteU32(clientChannel);     // 对端通道号
+        confirm.WriteU32(0);                 // 本端通道号
+        confirm.WriteU32(2097152);
+        confirm.WriteU32(32768);
+        SshServer.Send(packets, SshMessage.ChannelOpenConfirmation, confirm.ToArray());
+
+        byte[] reqPayload = SshServer.Recv(packets, SshMessage.ChannelRequest);
+        SshReader req = new SshReader(reqPayload);
+        req.ReadU32();                       // 通道号
+        req.ReadText();                      // 请求类型
+        req.ReadBool();                      // 要不要回执
+
+        // **顺序按真实实现来**：paramiko（以及不少服务端）是先把输出和
+        // exit-status 发出来，**最后才回 CHANNEL_SUCCESS**，而且发完就不
+        // 关通道了。RFC 4254 §5.4 要求 SUCCESS 在数据之前，现实中未必。
+        // 客户端要是"下一条必须是 SUCCESS"，就会把数据当成"应答不对"报错，
+        // 或者等一个永远不来的 CLOSE。
+        SshWriter data = new SshWriter(128);
+        data.WriteU32(clientChannel);
+        byte[] text = Encoding.UTF8.GetBytes("hello from the server");
+        data.WriteString(text);
+        SshServer.Send(packets, SshMessage.ChannelData, data.ToArray());
+
+        SshWriter exit = new SshWriter(64);
+        exit.WriteU32(clientChannel);
+        exit.WriteText("exit-status");
+        exit.WriteBool(false);
+        exit.WriteU32(7);
+        SshServer.Send(packets, SshMessage.ChannelRequest, exit.ToArray());
+
+        SshServer.Send(packets, SshMessage.ChannelSuccess, new byte[0]);
+    }
+
+    // 读一整行识别串（到 \n）。
+    static string ReadIdentification(SshBytePipe pipe) {
+        List<byte> bytes = new List<byte>();
+        while (true) {
+            byte[] one = new byte[1];
+            pipe.ReadExact(one, 0, 1);
+            int c = one[0] & 255;
+            if (c == 10) { break; }
+            bytes.Add(one[0]);
+        }
+        string line = "";
+        for (int i = 0; i < bytes.Count; i = i + 1) {
+            line = line + (char)(bytes[i] & 255);
+        }
+        if (line.Length > 0 && line[line.Length - 1] == 13) {
+            line = line.Substring(0, line.Length - 1);
+        }
+        return line;
+    }
+
+    static void Send(SshPacketLayer packets, int message, byte[] payload) {
+        byte[] full = new byte[1 + payload.Length];
+        full[0] = (byte)(message & 255);
+        for (int i = 0; i < payload.Length; i = i + 1) { full[1 + i] = payload[i]; }
+        packets.Send(full);
+    }
+
+    static byte[] Recv(SshPacketLayer packets, int expected) {
+        while (true) {
+            byte[] payload = packets.Recv();
+            int message = payload[0] & 255;
+            if (message == SshMessage.Ignore || message == SshMessage.Debug) { continue; }
+            if (message != expected) {
+                throw new SshException(SshError.UnexpectedMessage, "server expected a different message",
+                    SshMessage.Name(expected) + " != " + SshMessage.Name(message));
+            }
+            byte[] body = new byte[payload.Length - 1];
+            for (int i = 0; i < body.Length; i = i + 1) { body[i] = payload[1 + i]; }
+            return body;
+        }
+    }
+
+    static byte[] ReadString(SshPacketLayer packets, int expected) {
+        return new SshReader(Recv(packets, expected)).ReadString();
+    }
+}

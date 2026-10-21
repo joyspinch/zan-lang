@@ -1,0 +1,322 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace System.Ssh;
+
+// 一个方向的加密状态（AES-GCM）。
+//
+// **GCM 模式的包结构**（draft-ietf-secsh-aes-gcm）：
+//
+//     long  packet_length     ← 不加密，作为 GCM 的 AAD
+//     byte    padding_length    ┐
+//     byte[]  payload           ├ 加密
+//     byte[]  random padding    ┘
+//     byte[16] tag              ← GCM 认证标签（就是这里的"完整性"）
+//
+// 和普通 SSH 包的两点差别：
+//   1. **长度字段不加密**（它是 AAD）——所以要先读 4 字节才知道后面有多长。
+//   2. **没有单独的 MAC**：GCM 标签本身就是完整性校验，协商出来的 MAC
+//      算法（如 hmac-sha2-256）在 GCM 下不参与计算。
+//
+// **IV 是 12 字节**：4 字节固定字段 + 8 字节调用计数器（大端）。
+// 固定字段来自密钥派生，计数器**的初值就是派生 IV 的后 8 字节**。
+//
+// **初值不是 0**——这是最容易错的一处：RFC 5647 §7.1 说"调用计数器字段
+// 按 64 位整数处理，每次调用 GCM 之后递增"，而这个计数器的**起始值**就是
+// 密钥派生出来的 IV 里那 8 字节。OpenSSH 与 paramiko 都是这么做的
+// （OpenSSH 把整个派生 IV 交给 OpenSSL 的 GCM 固定 IV 模式，
+// paramiko 直接拿派生 IV 当 IV，加密完再把末 8 字节加一）。
+// 把计数器当成从 0 开始，两边算出来的 IV 就差一个偏移——
+// 表现为"密钥派生看着没问题，但第一个加密包解不开"。
+//
+// **加密部分的长度必须是 16 的倍数**（AES 块长），这是 GCM 模式与普通
+// SSH 包（8 的倍数）的唯一差别——填错填充长度，对端会直接拒绝整条流。
+public class SshCipherState {
+    // 密钥（16 或 32 字节）。
+    public byte[] key;
+    // GCM 的 4 字节固定 IV。
+    public byte[] fixedIv;
+    // 8 字节调用计数器的初值（派生 IV 的后 8 字节）。
+    public byte[] counterSeed;
+    // 已经用掉的包数（每包递增）。
+    public long counter;
+
+    public SshCipherState() {
+        this.key = null;
+        this.fixedIv = null;
+        this.counterSeed = null;
+        this.counter = 0;
+    }
+
+    // 初始化（key 16/32 字节，iv 12 字节）。
+    public void Init(byte[] keyBytes, byte[] ivBytes) {
+        if (keyBytes == null || (keyBytes.Length != 16 && keyBytes.Length != 32)) {
+            throw new SshException(SshError.Internal, "AES-GCM key must be 16 or 32 bytes");
+        }
+        if (ivBytes == null || ivBytes.Length != 12) {
+            throw new SshException(SshError.Internal, "AES-GCM IV must be 12 bytes");
+        }
+        this.key = keyBytes;
+        this.fixedIv = new byte[4];
+        this.counterSeed = new byte[8];
+        for (int i = 0; i < 4; i = i + 1) { this.fixedIv[i] = ivBytes[i]; }
+        for (int i = 0; i < 8; i = i + 1) { this.counterSeed[i] = ivBytes[4 + i]; }
+        this.counter = 0;
+    }
+
+    // 当前包的 IV（计数器 = 初值 + 已用包数）。
+    private byte[] BuildIv() {
+        if (this.counter >= 0xFFFFFFFFL) {
+            throw new SshException(SshError.Internal, "AES-GCM invocation counter overflow");
+        }
+        byte[] iv = new byte[12];
+        for (int i = 0; i < 4; i = i + 1) { iv[i] = this.fixedIv[i]; }
+        // 初值 + 已用包数（8 字节大端加法）。
+        long add = this.counter;
+        for (int i = 7; i >= 0; i = i - 1) {
+            int sum = (this.counterSeed[i] & 255) + (int)(add & 255);
+            iv[4 + i] = (byte)(sum & 255);
+            add = (add >> 8) + (sum >> 8);
+        }
+        if (add != 0) {
+            throw new SshException(SshError.Internal, "AES-GCM invocation counter overflow");
+        }
+        this.counter = this.counter + 1;
+        return iv;
+    }
+
+    // 加密（返回 密文 || 16 字节 tag）。
+    public byte[] Encrypt(byte[] plaintext, byte[] aad) {
+        if (this.key == null) {
+            throw new SshException(SshError.Internal, "cipher state is not initialised");
+        }
+        byte[] iv = this.BuildIv();
+        string keyStr = this.key.ToStr(0, this.key.Length);
+        string ivStr = iv.ToStr(0, iv.Length);
+        string ptStr = plaintext.ToStr(0, plaintext.Length);
+        string aadStr = "";
+        int aadLen = 0;
+        if (aad != null && aad.Length > 0) {
+            aadStr = aad.ToStr(0, aad.Length);
+            aadLen = aad.Length;
+        }
+        byte[] tag = new byte[16];
+        byte[] ct = AesGcm.Encrypt(keyStr, this.key.Length, ivStr, aadStr, aadLen,
+            ptStr, plaintext.Length, tag);
+        if (ct == null) {
+            throw new SshException(SshError.Internal, "AES-GCM encryption failed");
+        }
+        return SshBytes.Concat(ct, tag);
+    }
+
+    // 解密（ciphertext 与 tag 分开传）。
+    public byte[] Decrypt(byte[] aad, byte[] ciphertext, byte[] tag) {
+        if (this.key == null) {
+            throw new SshException(SshError.Internal, "cipher state is not initialised");
+        }
+        byte[] iv = this.BuildIv();
+        string keyStr = this.key.ToStr(0, this.key.Length);
+        string ivStr = iv.ToStr(0, iv.Length);
+        string ctStr = ciphertext.ToStr(0, ciphertext.Length);
+        string tagStr = tag.ToStr(0, tag.Length);
+        string aadStr = "";
+        int aadLen = 0;
+        if (aad != null && aad.Length > 0) {
+            aadStr = aad.ToStr(0, aad.Length);
+            aadLen = aad.Length;
+        }
+        List<int> ok = new List<int>();
+        ok.Add(0);
+        byte[] plain = AesGcm.Decrypt(keyStr, this.key.Length, ivStr, aadStr, aadLen,
+            ctStr, ciphertext.Length, tagStr, ok);
+        if (ok[0] != -1 || plain == null) {
+            throw new SshException(SshError.IntegrityFailed,
+                "AES-GCM authentication failed (packet tampered or key mismatch)");
+        }
+        return plain;
+    }
+}
+
+// 二进制包协议（RFC 4253 §6）。
+//
+// 一个包长这样：
+//
+//     long  packet_length     不含自身与 MAC
+//     byte    padding_length
+//     byte[]  payload
+//     byte[]  random padding    至少 4 字节，最多 255 字节
+//     byte[]  mac               （GCM 模式下就是 16 字节 tag）
+//
+// **填充不是可选的**：整包长度（4 + packet_length）必须是 max(块长, 8) 的
+// 倍数，且填充至少 4 字节。少一个字节，对端就会把下一个包的第一个字节当成
+// 填充长度——整条流错位，而且**不会立刻报错**，要等到解出乱七八糟的载荷
+// 才看得出来。
+public class SshPacketLayer {
+    // 底层通道。
+    private SshBytePipe pipe;
+    // 收缓冲。
+    private byte[] inBuf;
+    private int inLen;
+    private int inPos;
+    // 发送方向的加密状态（null = 明文）。
+    public SshCipherState outCipher;
+    // 接收方向的加密状态（null = 明文）。
+    public SshCipherState inCipher;
+    // 发送包序号（RFC 4253 §6.4：从 0 开始，每包加一，永不重置）。
+    public long seqOut;
+    // 接收包序号。
+    public long seqIn;
+    // 单包最大长度（RFC 4253 §6.1 要求至少能处理 35000 字节的整包）。
+    public static int MaxPacket = 35000;
+
+    public SshPacketLayer(SshBytePipe pipe) {
+        this.pipe = pipe;
+        this.inBuf = new byte[65536];
+        this.inLen = 0;
+        this.inPos = 0;
+        this.outCipher = null;
+        this.inCipher = null;
+        this.seqOut = 0;
+        this.seqIn = 0;
+    }
+
+    // 发一个包（载荷是消息号 + 消息体）。
+    public void Send(byte[] payload) {
+        if (this.outCipher == null) {
+            byte[] block = SshPacketLayer.BuildPlainBlock(payload);
+            this.pipe.WriteExact(block, 0, block.Length);
+            this.seqOut = this.seqOut + 1;
+            return;
+        }
+        // GCM：长度字段是 AAD，加密部分是 padding_length || payload || padding。
+        int blockSize = 16;
+        int paddingLen = SshPacketLayer.PaddingLength(payload.Length, blockSize, 4);
+        int packetLength = 1 + payload.Length + paddingLen;
+        byte[] header = new byte[4];
+        SshPacketLayer.WriteU32(header, 0, packetLength);
+        byte[] plain = new byte[1 + payload.Length + paddingLen];
+        plain[0] = (byte)paddingLen;
+        for (int i = 0; i < payload.Length; i = i + 1) { plain[1 + i] = payload[i]; }
+        byte[] padding = SshBytes.RandomBytes(paddingLen);
+        for (int i = 0; i < paddingLen; i = i + 1) { plain[1 + payload.Length + i] = padding[i]; }
+        byte[] sealedBytes = this.outCipher.Encrypt(plain, header);
+        byte[] wire = SshBytes.Concat(header, sealedBytes);
+        this.pipe.WriteExact(wire, 0, wire.Length);
+        this.seqOut = this.seqOut + 1;
+    }
+
+    // 收一个包（返回载荷：消息号 + 消息体）。
+    public byte[] Recv() {
+        if (this.inCipher == null) {
+            byte[] header = new byte[4];
+            this.pipe.ReadExact(header, 0, 4);
+            long packetLength = SshPacketLayer.ReadU32(header, 0);
+            SshPacketLayer.CheckPacketLength(packetLength);
+            byte[] block = new byte[packetLength];
+            this.pipe.ReadExact(block, 0, (int)packetLength);
+            this.seqIn = this.seqIn + 1;
+            return SshPacketLayer.ParsePlainBlock(block);
+        }
+        byte[] aad = new byte[4];
+        this.pipe.ReadExact(aad, 0, 4);
+        long packetLength = SshPacketLayer.ReadU32(aad, 0);
+        SshPacketLayer.CheckPacketLength(packetLength);
+        // GCM：加密部分的长度必须是 16 的倍数（RFC 5647 §7.2）。
+        if (packetLength % 16 != 0) {
+            throw new SshException(SshError.Malformed, "SSH packet length is not block aligned");
+        }
+        byte[] ct = new byte[packetLength];
+        this.pipe.ReadExact(ct, 0, (int)packetLength);
+        byte[] tag = new byte[16];
+        this.pipe.ReadExact(tag, 0, 16);
+        byte[] plain = this.inCipher.Decrypt(aad, ct, tag);
+        this.seqIn = this.seqIn + 1;
+        int paddingLen = plain[0] & 255;
+        if (paddingLen < 4 || paddingLen + 1 > plain.Length) {
+            throw new SshException(SshError.Malformed, "invalid SSH padding length");
+        }
+        int payloadLen = plain.Length - paddingLen - 1;
+        byte[] payload = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i = i + 1) { payload[i] = plain[1 + i]; }
+        return payload;
+    }
+
+    // 明文包的整包字节（长度字段 + 块）。
+    static byte[] BuildPlainBlock(byte[] payload) {
+        int blockSize = 8;
+        int paddingLen = SshPacketLayer.PaddingLength(payload.Length, blockSize, 0);
+        int packetLength = 1 + payload.Length + paddingLen;
+        byte[] outb = new byte[4 + packetLength];
+        SshPacketLayer.WriteU32(outb, 0, packetLength);
+        outb[4] = (byte)paddingLen;
+        for (int i = 0; i < payload.Length; i = i + 1) { outb[5 + i] = payload[i]; }
+        byte[] padding = SshBytes.RandomBytes(paddingLen);
+        for (int i = 0; i < paddingLen; i = i + 1) { outb[5 + payload.Length + i] = padding[i]; }
+        return outb;
+    }
+
+    // 解析明文包（返回载荷）。
+    static byte[] ParsePlainBlock(byte[] block) {
+        if (block.Length < 5) {
+            throw new SshException(SshError.Malformed, "SSH packet is too short");
+        }
+        int paddingLen = block[0] & 255;
+        if (paddingLen < 4 || paddingLen + 1 > block.Length) {
+            throw new SshException(SshError.Malformed, "invalid SSH padding length");
+        }
+        // 整包长度（4 + packet_length）必须是 8 的倍数（没有加密时）。
+        if ((block.Length + 4) % 8 != 0) {
+            throw new SshException(SshError.Malformed, "SSH packet length is not block aligned");
+        }
+        int payloadLen = block.Length - paddingLen - 1;
+        byte[] payload = new byte[payloadLen];
+        for (int i = 0; i < payloadLen; i = i + 1) { payload[i] = block[1 + i]; }
+        return payload;
+    }
+
+    // 填充长度。
+    //
+    // **两种模式的对齐基准不一样，这是最容易踩的坑**：
+    //
+    //   明文包（RFC 4253 §6）：`(4 + packet_length) % 块长 == 0`，
+    //       也就是「长度字段 + 加密部分」一起对齐到块长（无加密时块长 8）。
+    //
+    //   GCM 包（RFC 5647 §7.2）：长度字段**不加密**（它是 AAD），
+    //       对齐的是**加密部分**：`packet_length % 16 == 0`。
+    //
+    // 两种模式差的就是那 4 字节长度字段。写成同一个公式，明文包会恒差
+    // 4 字节——对端在 `ParsePlainBlock` 的对齐检查处直接拒绝整条流，
+    // 症状是"握手毫无理由地卡住"。
+    //
+    // 参数 aadLen 就是这 4 字节：GCM 传 4，明文传 0。
+    static int PaddingLength(int payloadLen, int blockSize, int aadLen) {
+        // 对齐基准 = 4（长度字段）+ 1（padding_length 字节）+ payload - aadLen。
+        int alignLen = 5 + payloadLen - aadLen;
+        int padding = blockSize - (alignLen % blockSize);
+        if (padding < 4) { padding = padding + blockSize; }
+        return padding;
+    }
+
+    // 长度上限检查（防止畸形长度把读端撑爆）。
+    static void CheckPacketLength(long packetLength) {
+        if (packetLength < 5 || packetLength > SshPacketLayer.MaxPacket) {
+            throw new SshException(SshError.PacketTooLarge, "invalid SSH packet length",
+                packetLength.ToString());
+        }
+    }
+
+    static void WriteU32(byte[] buf, int offset, long value) {
+        buf[offset] = (byte)((value >> 24) & 255);
+        buf[offset + 1] = (byte)((value >> 16) & 255);
+        buf[offset + 2] = (byte)((value >> 8) & 255);
+        buf[offset + 3] = (byte)(value & 255);
+    }
+
+    static long ReadU32(byte[] buf, int offset) {
+        return ((long)(buf[offset] & 255) << 24)
+             | ((long)(buf[offset + 1] & 255) << 16)
+             | ((long)(buf[offset + 2] & 255) << 8)
+             | (long)(buf[offset + 3] & 255);
+    }
+}

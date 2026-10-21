@@ -1540,6 +1540,72 @@ conformance `physics3d_world`：向量与四元数代数（旋转保长、复合
 
 ---
 
+### 1.28 SSH 客户端：`Zan.Ssh`
+
+`packages/Zan.Ssh/src/System/Ssh/`（命名空间 `System.Ssh`，依赖 `Zan.Security`
+的 Curve25519/SHA-256/ECDSA/AES-GCM 与 `Zan.Net` 的 Socket/TcpClient）是 SSH
+**传输层客户端**：RFC 4251 线格式编解码、RFC 4253 二进制包协议、版本交换、
+算法协商、密钥交换、主机密钥校验、口令 / 公钥认证、exec 通道。
+
+**八条硬取舍**：
+
+1. **只做一条算法链，但做对**：curve25519-sha256 密钥交换（RFC 8731）+
+   ecdsa-sha2-nistp256 主机密钥 + aes256-gcm@openssh.com 加密。其余算法
+   **明确报 `Unsupported`**，而不是"能协商、握手时才炸"。SSH 的算法面很大，
+   半吊子实现比不支持更难排查。
+2. **抽象出 `SshBytePipe`**：握手是"客户端说一句、服务端答一句"的多轮交互。
+   绑死 TCP 就只能在有 sshd 的机器上验证；抽象成字节管道之后，同一进程里
+   就能跑两端握手（`SshMemoryLink`），任何一边算错哈希、编码错 mpint、
+   切错加密时机都会立刻对不上。
+3. **主机密钥默认"不认识就拒绝"**（`acceptUnknownHostKey = false`）。把
+   "第一次见"当成"可以接受"是 SSH 客户端最经典的漏洞。known_hosts 匹配区分
+   **Known / Mismatch / Unknown** 三态——把 Mismatch 当 Unknown 处理等于把
+   中间人攻击重新打开。
+4. **异常 + 错误码两个通道**：人看 `Message`，程序看 `error`（18 个取值的
+   `SshError`）。"主机密钥变了"要停下来问人，"认证被拒"可以换凭据重试，
+   "没有共同算法"是版本问题——三种必须能被程序分开处理。
+5. **mpint 只有一个编码器**（`SshWriter.WriteMpint`）。实现过程中有过第二份
+   编码（只返回数值体、不带长度前缀），结果是密钥派生少算 4 个字节、派生出来
+   的密钥全不一样，症状是"握手成功、第一个包解不开"。同一个概念不允许存在
+   两套编码。
+6. **已知答案测试（KAT）必须用第三方实现的定值**：交换哈希与密钥派生各钉了
+   一条定值，定值是照 OpenSSH / paramiko 的字节布局算出来的。这类"差一个
+   字节"的规则，自对拍永远查不出来。
+7. **互通验证不是可选项**（`tests/interop/ssh/`，paramiko 4.0 作对端）：
+   链路走完版本交换 → 协商 → 密钥交换 → 主机密钥验签 → AES-GCM 切换 →
+   口令认证 → 开通道 → exec → 取 stdout 与退出码。它查出了 5 个自对拍查不
+   出来的真 bug（见下）。
+8. **通道消息顺序按现实来**：paramiko 等实现是**先把输出和 exit-status 发出来、
+   最后才回 `CHANNEL_SUCCESS`**，而且发完就不关通道。客户端"下一条必须是
+   SUCCESS"会把数据当成"应答不对"报错；等 CLOSE 收尾会永远挂着。命令结束
+   的判据取 **exit-status**（RFC 4254 §6.10），不是 CLOSE。
+
+**互通验证查出的 5 个真 bug**（自对拍全绿，只有真互通才炸）：
+
+| 坑 | 症状 |
+|---|---|
+| 明文包的填充对齐基准搞错（`(4+packet_length)` 与 `(1+payload+padding)` 差 4 字节） | 对端直接拒绝整条流，"握手毫无理由地卡住" |
+| GCM 的 IV 计数器初值用了 0（应为派生 IV 的后 8 字节） | 第一个加密包解不开 |
+| 交换哈希里的 KEXINIT **没算消息号** | 主机密钥验签失败 |
+| 密钥派生里的 mpint **少了 4 字节长度前缀** | 握手成功、第一个包解不开 |
+| ECDSA 签名 blob **少了一层 string**（RFC 5656 §3.1.2） | 验签失败，报错完全指不到原因 |
+
+conformance `ssh_transport`：线格式（byte / bool / uint32 / string / mpint
+的补前导零与零长度与剥前导零与拒负数 / name-list 拒空名）· 版本串 · 算法
+协商按客户端顺序 · 主机密钥 blob 与指纹（OpenSSH 口径）与签名验签与篡改
+必失败 · **签名 blob 的结构** · **交换哈希的已知答案** · **密钥派生的已知
+答案** · known_hosts 的通配符 / 哈希主机名 / 三态 · 端到端（内存管道 + 线程，
+完整握手 → 认证 → exec，服务端按真实实现的消息顺序发）· 指纹不匹配必须报
+`HostKeyMismatch`。
+
+**已知边界**：**没有 SFTP**（只有 exec 通道）· **只支持一种主机密钥算法**
+（ecdsa-sha2-nistp256，OpenSSH 默认的 ed25519 / rsa 不支持）· **公钥认证只做
+最小路径**（不读 OpenSSH 私钥文件格式）· **没有重密钥（rekey）** ·
+**没有 zlib 压缩** · **没有 PTY / shell / 端口转发 / agent 转发 / X11 转发** ·
+**known_hosts 只读不写**。
+
+---
+
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -1567,7 +1633,7 @@ conformance `physics3d_world`：向量与四元数代数（旋转保长、复合
 | 建议包 | C# 参考 | ★ | 补什么 |
 |---|---|---|---|
 | `Zan.Pdf` | QuestPDF | 14,205 | ✅ 已落地 `packages/Zan.Pdf`（`System.Pdf`：页面 + 线 / 矩形 / 文本 + 标准 14 字体度量 + 表格 + PDF 1.4 写出器（xref / 元数据 / WinAnsi），不嵌字体，见 §1.19） | — |
-| `Zan.Ssh` | SSH.NET | 4,385 | SSH 客户端、SFTP、密钥管理 |
+| `Zan.Ssh` | SSH.NET | 4,385 | ✅ 已落地 `packages/Zan.Ssh`（`System.Ssh`：RFC 4251 线格式 + RFC 4253 包协议（AES-GCM）+ 版本交换 + 算法协商 + curve25519 密钥交换（RFC 8731）+ 主机密钥指纹与 known_hosts 三态校验 + 口令/公钥认证 + exec 通道；**已与 paramiko 真实互通验证**，见 §1.28）；**不做 SFTP** | — |
 | `Zan.Barcode` | ZXing.Net | 榜外 | ✅ 已落地 `packages/Zan.Barcode`（`System.Barcode`：完整 QR 模型 1-40 编解码器（ISO/IEC 18004：分段 + 自动选版本 + GF(256) RS 交织 + 八掩码罚分）+ 扫描器（二值化 → 定位图形 → 仿射/投影变换 → 采样 → 格式信息 BCH → 去掩码 → 反交织 → RS 纠错 → 分段解析），**任意角度旋转、缩放 2px 起、椒盐噪声 5% 内、遮挡靠纠错还原**；不做一维条码，见 §1.25） | — |
 | `Zan.Test.Fixtures` | AutoFixture / Bogus | 3,539 / 9,747 | ✅ 已落地 `packages/Zan.Test.Fixtures`（`System.Test.Fixtures`：定长种子随机源 + 语义化假数据（人名 / 邮箱 / 地址 / 句子 / 颜色 / 保留测试卡号）+ 集合假数据（唯一性有上限保证）+ 显式装配取值器，无反射，见 §1.17） | — |
 | `Zan.Test.Mocks` | Moq / NSubstitute | 6,410 | ✅ 已落地 `packages/Zan.Test.Mocks`（`System.Test.Mocks`：调用记录 + 六种参数匹配 + 次数期望 + 手写替身基类 + 桩件与异步桩，无反射无代码生成，见 §1.14） | — |
@@ -1623,6 +1689,7 @@ conformance `physics3d_world`：向量与四元数代数（旋转保长、复合
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
 **第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench` ✅ → `Zan.Barcode` ✅
 **第 6 批（游戏工具链）**：`Zan.Game.Profiler` ✅ → `Zan.Game.Physics3D` ✅ → `Zan.Game.Debug`（ImGui 口径：帧剖析覆盖层 / 实体检查器；依赖 Gui 整包，等 Gui 编译恢复后落地）→ `Zan.Game.Render3D`（含跨平台 GPU 后端，8–12 周）
+**第 7 批（协议层）**：`Zan.Ssh` ✅（传输层 + 认证 + exec 通道；SFTP 与更多算法另算，见 §1.28）
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

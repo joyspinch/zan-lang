@@ -1,0 +1,64 @@
+using System;
+using System.Ssh;
+
+// Zan SSH 客户端 ↔ paramiko 服务端的互通探针。
+//
+// 用法：ssh_interop.exe <host> <port> <fingerprint>
+//
+// 指纹是 paramiko 服务端打印出来的那一串（SHA256:...）。用固定指纹而不是
+// "接受未知主机"，是为了让这条链路顺带验一遍主机密钥的指纹计算。
+public class SshInterop {
+    public static void Main(string[] args) {
+        if (args == null || args.Length < 3) {
+            Console.WriteLine("usage: ssh_interop <host> <port> <fingerprint>");
+            Environment.Exit(2);
+            return;
+        }
+        string host = args[0];
+        int port = Convert.ToInt32(args[1]);
+        string fingerprint = args[2];
+
+        SshClient client = new SshClient(host, port, "alice");
+        client.options.pinnedFingerprint = fingerprint;
+        int failures = 0;
+        try {
+            client.Connect();
+            client.Handshake();
+            Console.WriteLine("kex=" + client.negotiatedKex);
+            Console.WriteLine("hostkey=" + client.negotiatedHostKey);
+            Console.WriteLine("cipher=" + client.negotiatedCipher);
+            if (client.sessionId == null || client.sessionId.Length != 32) {
+                Console.WriteLine("FAIL session id");
+                failures = failures + 1;
+            }
+            client.RequestUserAuthService();
+            if (!client.AuthenticatePassword("s3cret")) {
+                Console.WriteLine("FAIL authentication");
+                failures = failures + 1;
+            }
+            SshExecResult result = client.Exec("echo hello");
+            if (result.stdout != "hello from the server\n") {
+                Console.WriteLine("FAIL stdout=[" + result.stdout + "]");
+                failures = failures + 1;
+            }
+            if (result.stderr != "") {
+                Console.WriteLine("FAIL stderr=[" + result.stderr + "]");
+                failures = failures + 1;
+            }
+            if (result.exitCode != 7) {
+                Console.WriteLine("FAIL exit=" + result.exitCode.ToString());
+                failures = failures + 1;
+            }
+            client.Close();
+        } catch (SshException ex) {
+            Console.WriteLine("FAIL " + ex.ErrorName() + ": " + ex.Message);
+            failures = failures + 1;
+        }
+        if (failures == 0) {
+            Console.WriteLine("INTEROP OK");
+        } else {
+            Console.WriteLine("INTEROP FAILURES: " + failures.ToString());
+            Environment.Exit(1);
+        }
+    }
+}

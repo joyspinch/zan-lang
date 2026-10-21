@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Ssh;
+
+// SSH_MSG_KEXINIT 的载荷（RFC 4253 §7.1）与算法协商。
+//
+// 载荷结构（**载荷不含消息号那个字节**——交换哈希算的是"载荷"，不含
+// 消息号；把消息号也算进去，两边算出来的 H 就不一样了）：
+//
+//     byte[16]     cookie
+//     name-list    kex_algorithms
+//     name-list    server_host_key_algorithms
+//     name-list    encryption_algorithms_client_to_server
+//     name-list    encryption_algorithms_server_to_client
+//     name-list    mac_algorithms_client_to_server
+//     name-list    mac_algorithms_server_to_client
+//     name-list    compression_algorithms_client_to_server
+//     name-list    compression_algorithms_server_to_client
+//     name-list    languages_client_to_server
+//     name-list    languages_server_to_client
+//     boolean      first_kex_packet_follows
+//     uint32       0（保留）
+//
+// **cookie 必须是随机 16 字节**：它的作用是让双方都没法提前算出密钥与会话
+// 标识符。用固定值（比如全 0）等于把这层保护去掉。
+public class SshKexInit {
+    // 随机 cookie（16 字节）。
+    public byte[] cookie;
+    // 密钥交换算法。
+    public List<string> kexAlgorithms;
+    // 服务端主机密钥算法。
+    public List<string> hostKeyAlgorithms;
+    // 客户端到服务端的加密算法。
+    public List<string> encryptionC2S;
+    // 服务端到客户端的加密算法。
+    public List<string> encryptionS2C;
+    // 客户端到服务端的 MAC 算法。
+    public List<string> macC2S;
+    // 服务端到客户端的 MAC 算法。
+    public List<string> macS2C;
+    // 客户端到服务端的压缩算法。
+    public List<string> compressionC2S;
+    // 服务端到客户端的压缩算法。
+    public List<string> compressionS2C;
+    // 客户端到服务端的语言标签。
+    public List<string> languagesC2S;
+    // 服务端到客户端的语言标签。
+    public List<string> languagesS2C;
+    // 是否紧跟着一个"猜测的"密钥交换包。
+    public bool firstKexPacketFollows;
+
+    public SshKexInit() {
+        this.cookie = SshBytes.RandomBytes(16);
+        this.kexAlgorithms = new List<string>();
+        this.hostKeyAlgorithms = new List<string>();
+        this.encryptionC2S = new List<string>();
+        this.encryptionS2C = new List<string>();
+        this.macC2S = new List<string>();
+        this.macS2C = new List<string>();
+        this.compressionC2S = new List<string>();
+        this.compressionS2C = new List<string>();
+        this.languagesC2S = new List<string>();
+        this.languagesS2C = new List<string>();
+        this.firstKexPacketFollows = false;
+    }
+
+    // 序列化成载荷（不含消息号）。
+    public byte[] ToPayload() {
+        SshWriter w = new SshWriter(256);
+        w.WriteRaw(this.cookie);
+        w.WriteNameList(this.kexAlgorithms);
+        w.WriteNameList(this.hostKeyAlgorithms);
+        w.WriteNameList(this.encryptionC2S);
+        w.WriteNameList(this.encryptionS2C);
+        w.WriteNameList(this.macC2S);
+        w.WriteNameList(this.macS2C);
+        w.WriteNameList(this.compressionC2S);
+        w.WriteNameList(this.compressionS2C);
+        w.WriteNameList(this.languagesC2S);
+        w.WriteNameList(this.languagesS2C);
+        w.WriteBool(this.firstKexPacketFollows);
+        w.WriteU32(0);
+        return w.ToArray();
+    }
+
+    // 解析载荷。
+    public static SshKexInit FromPayload(byte[] payload) {
+        SshReader r = new SshReader(payload);
+        SshKexInit init = new SshKexInit();
+        init.cookie = r.ReadBytes(16);
+        init.kexAlgorithms = r.ReadNameList();
+        init.hostKeyAlgorithms = r.ReadNameList();
+        init.encryptionC2S = r.ReadNameList();
+        init.encryptionS2C = r.ReadNameList();
+        init.macC2S = r.ReadNameList();
+        init.macS2C = r.ReadNameList();
+        init.compressionC2S = r.ReadNameList();
+        init.compressionS2C = r.ReadNameList();
+        init.languagesC2S = r.ReadNameList();
+        init.languagesS2C = r.ReadNameList();
+        init.firstKexPacketFollows = r.ReadBool();
+        long reserved = r.ReadU32();
+        if (reserved != 0) {
+            // 保留字段非 0：RFC 说要忽略，但忽略一个非 0 的保留字段意味着
+            // 对端在用我们不认识的扩展——按"不认识就断开"的规矩处理更安全。
+            throw new SshException(SshError.Malformed, "KEXINIT reserved field is not zero");
+        }
+        return init;
+    }
+}
+
+// 算法协商（RFC 4253 §7.1）。
+//
+// **规则只有一条，但方向很重要**：选的是"**客户端列表里第一个、同时也在服务端
+// 列表里**的算法"——不是"服务端列表里第一个客户端也支持的"。客户端列表代表
+// 客户端的偏好顺序，服务端列表代表服务端支持什么。两条规则选出来的算法可能
+// 不同，RFC 明确以客户端顺序为准。
+//
+// 密钥交换算法多一条约束：它需要的**主机密钥算法**也必须是双方都支持的
+// （例如要求"可签名"的主机密钥，就得在双方的主机密钥算法里找到一个可签名的）。
+public class SshNegotiation {
+    // 选一个双方都支持的算法；没有交集返回 null。
+    public static string Choose(List<string> clientList, List<string> serverList) {
+        if (clientList == null || serverList == null) { return null; }
+        for (int i = 0; i < clientList.Count; i = i + 1) {
+            string name = clientList[i];
+            for (int j = 0; j < serverList.Count; j = j + 1) {
+                if (serverList[j] == name) { return name; }
+            }
+        }
+        return null;
+    }
+
+    // 主机密钥算法要求"可签名"（本包支持的主机密钥算法全都是可签名的，
+    // 所以这条约束退化成"双方有交集"）。
+    public static string ChooseHostKey(List<string> clientList, List<string> serverList) {
+        return SshNegotiation.Choose(clientList, serverList);
+    }
+}

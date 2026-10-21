@@ -1,0 +1,327 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+
+namespace System.Ssh;
+
+// SSH 的线格式编解码（RFC 4251 §5）。
+//
+// **基本类型**（全部是大端）：
+//   byte     一个字节
+//   boolean  一个字节，0 假 1 真
+//   uint32   4 字节无符号
+//   uint64   8 字节无符号
+//   string   4 字节长度 + 长度个字节的任意二进制
+//   mpint    变长二进制补码整数（见 SshWriter.WriteMpint）
+//   name-list 逗号分隔的名字列表（整体当 string 存）
+//
+// **写端与读端共用这一份定义**：SSH 的每一个字段都是这七种类型的排列，
+// 写端和读端各写一套必然漂移（长度前缀忘了、mpint 少一个前导零，读端
+// 就会把后面的字段整体错位——症状是"莫名其妙解析出乱码"，极难定位）。
+//
+// **mpint 的坑**：正整数如果最高位是 1，必须**补一个前导 0 字节**，否则
+// 会被读成负数；负数的编码是补码；零是**零长度**的 string，不是 "\0"。
+public class SshWriter {
+    // 缓冲区。
+    public byte[] buf;
+    // 已写入的长度。
+    public int len;
+
+    public SshWriter() {
+        this.buf = new byte[64];
+        this.len = 0;
+    }
+
+    public SshWriter(int capacity) {
+        if (capacity < 16) { capacity = 16; }
+        this.buf = new byte[capacity];
+        this.len = 0;
+    }
+
+    // 扩容（按倍数翻，避免每写一个字节就扩一次）。
+    private void Ensure(int extra) {
+        if (this.len + extra <= this.buf.Length) { return; }
+        int cap = this.buf.Length;
+        while (cap < this.len + extra) { cap = cap * 2; }
+        byte[] next = new byte[cap];
+        for (int i = 0; i < this.len; i = i + 1) { next[i] = this.buf[i]; }
+        this.buf = next;
+    }
+
+    // 写一个字节。
+    public void WriteByte(int value) {
+        this.Ensure(1);
+        this.buf[this.len] = (byte)(value & 255);
+        this.len = this.len + 1;
+    }
+
+    // 写布尔（0 / 1）。
+    public void WriteBool(bool value) {
+        this.WriteByte(value ? 1 : 0);
+    }
+
+    // 写 4 字节无符号（大端）。
+    public void WriteU32(long value) {
+        this.Ensure(4);
+        this.buf[this.len] = (byte)((value >> 24) & 255);
+        this.buf[this.len + 1] = (byte)((value >> 16) & 255);
+        this.buf[this.len + 2] = (byte)((value >> 8) & 255);
+        this.buf[this.len + 3] = (byte)(value & 255);
+        this.len = this.len + 4;
+    }
+
+    // 写 8 字节无符号（大端）。
+    public void WriteU64(long value) {
+        this.Ensure(8);
+        for (int i = 0; i < 8; i = i + 1) {
+            this.buf[this.len + i] = (byte)((value >> (56 - 8 * i)) & 255);
+        }
+        this.len = this.len + 8;
+    }
+
+    // 写原始字节（不带长度前缀）。
+    public void WriteRaw(byte[] data) {
+        if (data == null || data.Length == 0) { return; }
+        this.Ensure(data.Length);
+        for (int i = 0; i < data.Length; i = i + 1) {
+            this.buf[this.len + i] = data[i];
+        }
+        this.len = this.len + data.Length;
+    }
+
+    // 写原始字节的一段。
+    public void WriteRaw(byte[] data, int offset, int count) {
+        if (data == null || count <= 0) { return; }
+        this.Ensure(count);
+        for (int i = 0; i < count; i = i + 1) {
+            this.buf[this.len + i] = data[offset + i];
+        }
+        this.len = this.len + count;
+    }
+
+    // 写 string（4 字节长度 + 内容）。
+    public void WriteString(byte[] data) {
+        if (data == null) {
+            this.WriteU32(0);
+            return;
+        }
+        this.WriteU32(data.Length);
+        this.WriteRaw(data);
+    }
+
+    // 写 text 字段（UTF-8 编码的 string）。
+    public void WriteText(string text) {
+        if (text == null) {
+            this.WriteU32(0);
+            return;
+        }
+        this.WriteString(Encoding.UTF8.GetBytes(text));
+    }
+
+    // 写 name-list（逗号分隔；空列表写成零长度 string）。
+    //
+    // **空名字不合法**（RFC 4251 §5：names MUST NOT be empty）——写出去之前
+    // 就该拦住：把 "a,,b" 这种列表发出去，对端解析要么报错要么当成三个名字，
+    // 两种解释都跟发送方的本意不一样。
+    public void WriteNameList(List<string> names) {
+        if (names == null || names.Count == 0) {
+            this.WriteU32(0);
+            return;
+        }
+        string joined = "";
+        for (int i = 0; i < names.Count; i = i + 1) {
+            string one = names[i];
+            if (one == null || one.Length == 0) {
+                throw new SshException(SshError.Malformed, "name-list contains an empty name");
+            }
+            if (i > 0) { joined = joined + ","; }
+            joined = joined + one;
+        }
+        this.WriteText(joined);
+    }
+
+    // 写 mpint（正整数，大端无符号字节序列）。
+    //
+    // 规则（RFC 4251 §5）：
+    //   1. 去掉高位的前导 0 字节；
+    //   2. 空 → 零长度 string；
+    //   3. 最高位是 1 → **补一个前导 0 字节**（否则会被读成负数）。
+    //
+    // 只支持非负数：SSH 用到的 mpint（共享密钥 K、ECDSA 的 r/s）都是非负的，
+    // 负数没有出现的地方。
+    public void WriteMpint(byte[] magnitude) {
+        if (magnitude == null || magnitude.Length == 0) {
+            this.WriteU32(0);
+            return;
+        }
+        int start = 0;
+        while (start < magnitude.Length && magnitude[start] == 0) { start = start + 1; }
+        if (start >= magnitude.Length) {
+            this.WriteU32(0);
+            return;
+        }
+        int count = magnitude.Length - start;
+        bool needPad = (magnitude[start] & 128) != 0;
+        this.WriteU32(count + (needPad ? 1 : 0));
+        if (needPad) { this.WriteByte(0); }
+        this.WriteRaw(magnitude, start, count);
+    }
+
+    // 已写入的字节数。
+    public int Length() {
+        return this.len;
+    }
+
+    // 取已写入内容的副本。
+    public byte[] ToArray() {
+        byte[] outb = new byte[this.len];
+        for (int i = 0; i < this.len; i = i + 1) { outb[i] = this.buf[i]; }
+        return outb;
+    }
+}
+
+// SSH 的线格式读取器（RFC 4251 §5）。
+//
+// **越界一律抛异常，不返回"半个值"**：SSH 的字段是层层套着的（string 里面
+// 又是 string），读端一旦在某处少读了字节，后面的字段会整体错位——错位之后
+// 解析出来的"长度"可能是几 MB，直接拿它开缓冲区就是一个越界写。宁可当场
+// 抛 `Truncated`，也不要拿着错位的数据继续走。
+public class SshReader {
+    // 数据。
+    public byte[] data;
+    // 读位置。
+    public int pos;
+    // 可读区间的末尾（不含）。
+    public int limit;
+
+    public SshReader(byte[] data) {
+        this.data = data;
+        this.pos = 0;
+        this.limit = data == null ? 0 : data.Length;
+    }
+
+    public SshReader(byte[] data, int offset, int length) {
+        this.data = data;
+        this.pos = offset;
+        this.limit = offset + length;
+    }
+
+    // 剩余字节数。
+    public int Remaining() {
+        return this.limit - this.pos;
+    }
+
+    // 至少还剩 n 个字节吗。
+    public bool Has(int count) {
+        return this.pos + count <= this.limit;
+    }
+
+    private void Need(int count) {
+        if (this.pos + count > this.limit) {
+            throw new SshException(SshError.Truncated, "SSH payload truncated",
+                "need " + count.ToString() + " byte(s), have " + this.Remaining().ToString());
+        }
+    }
+
+    // 读一个字节。
+    public int ReadByte() {
+        this.Need(1);
+        int v = this.data[this.pos] & 255;
+        this.pos = this.pos + 1;
+        return v;
+    }
+
+    // 读布尔。
+    public bool ReadBool() {
+        return this.ReadByte() != 0;
+    }
+
+    // 读 4 字节无符号。
+    public long ReadU32() {
+        this.Need(4);
+        long v = ((long)(this.data[this.pos] & 255) << 24)
+               | ((long)(this.data[this.pos + 1] & 255) << 16)
+               | ((long)(this.data[this.pos + 2] & 255) << 8)
+               | (long)(this.data[this.pos + 3] & 255);
+        this.pos = this.pos + 4;
+        return v;
+    }
+
+    // 读 8 字节无符号。
+    public long ReadU64() {
+        this.Need(8);
+        long v = 0;
+        for (int i = 0; i < 8; i = i + 1) {
+            v = (v << 8) | (long)(this.data[this.pos + i] & 255);
+        }
+        this.pos = this.pos + 8;
+        return v;
+    }
+
+    // 读 n 个原始字节。
+    public byte[] ReadBytes(int count) {
+        if (count < 0) {
+            throw new SshException(SshError.Malformed, "negative byte count");
+        }
+        this.Need(count);
+        byte[] outb = new byte[count];
+        for (int i = 0; i < count; i = i + 1) { outb[i] = this.data[this.pos + i]; }
+        this.pos = this.pos + count;
+        return outb;
+    }
+
+    // 读 string（4 字节长度 + 内容）。
+    //
+    // 长度上限 256 KB：RFC 4251 §6.1 要求实现至少能处理 32 KB 的载荷，
+    // 更大的要先协商。读端必须自己设限——否则一个畸形的长度字段就能让
+    // 读端去开一个几 GB 的数组。
+    public byte[] ReadString() {
+        long len = this.ReadU32();
+        if (len > 262144) {
+            throw new SshException(SshError.Malformed, "SSH string too long",
+                len.ToString() + " byte(s)");
+        }
+        return this.ReadBytes((int)len);
+    }
+
+    // 读 text 字段（UTF-8）。
+    public string ReadText() {
+        byte[] raw = this.ReadString();
+        return Encoding.UTF8.GetString(raw, 0, raw.Length);
+    }
+
+    // 读 name-list（逗号分隔）。
+    public List<string> ReadNameList() {
+        string joined = this.ReadText();
+        List<string> names = new List<string>();
+        if (joined.Length == 0) { return names; }
+        List<string> parts = joined.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            string one = parts[i];
+            if (one.Length == 0) {
+                throw new SshException(SshError.Malformed, "name-list contains an empty name");
+            }
+            names.Add(one);
+        }
+        return names;
+    }
+
+    // 读 mpint（返回去掉前导 0 后的正数大端字节）。
+    //
+    // 负数直接拒绝：SSH 里用到的 mpint 都是非负的（共享密钥、ECDSA 的 r/s），
+    // 收到最高位为 1 的首字节就是负数——要么是对方实现有问题，要么是在试探
+    // 解析器的边界。
+    public byte[] ReadMpint() {
+        byte[] raw = this.ReadString();
+        if (raw.Length == 0) { return new byte[0]; }
+        if ((raw[0] & 128) != 0) {
+            throw new SshException(SshError.Malformed, "negative mpint is not supported");
+        }
+        int start = 0;
+        while (start < raw.Length && raw[start] == 0) { start = start + 1; }
+        if (start >= raw.Length) { return new byte[0]; }
+        byte[] outb = new byte[raw.Length - start];
+        for (int i = 0; i < outb.Length; i = i + 1) { outb[i] = raw[start + i]; }
+        return outb;
+    }
+}

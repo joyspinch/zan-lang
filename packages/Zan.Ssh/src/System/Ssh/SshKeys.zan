@@ -1,0 +1,98 @@
+using System;
+using System.Security.Cryptography;
+
+namespace System.Ssh;
+
+// 密钥派生（RFC 4253 §7.2）。
+//
+// 一次密钥交换产出的 K（共享密钥）与 H（交换哈希）要派生出一堆材料：
+//
+//     K1 = HASH(K || H || 'A' || session_id)   初始 IV   客户端→服务端
+//     K2 = HASH(K || H || 'B' || session_id)   初始 IV   服务端→客户端
+//     K3 = HASH(K || H || 'C' || session_id)   加密密钥 客户端→服务端
+//     K4 = HASH(K || H || 'D' || session_id)   加密密钥 服务端→客户端
+//     K5 = HASH(K || H || 'E' || session_id)   完整性密钥 客户端→服务端
+//     K6 = HASH(K || H || 'F' || session_id)   完整性密钥 服务端→客户端
+//
+// **K 是 mpint 编码的**（不是裸的 32 字节），**session_id 就是第一次交换
+// 哈希 H**。这两处编码差一个字节，派生出来的密钥就完全不同——而且症状是
+// "握手成功但第一个数据包解不开"，非常难查。
+//
+// 材料不够长时按 K1、K2 = HASH(K || H || K1)、K3 = HASH(K || H || K1 || K2)
+// 继续接，截取前 N 字节。
+public class SshKeys {
+    // 派生指定长度的密钥材料。
+    //
+    // `letter` 是 'A'..'F' 之一（ASCII 码）；`sharedSecret` 是**原始的共享
+    // 密钥字节**（X25519 输出的 32 字节）；`sessionId` 是第一次交换哈希。
+    //
+    // **mpint 编码在这里做，不要从外面传进来**：KDF 里的 K 是**完整的 mpint**
+    // ——4 字节长度前缀 + 数值体。OpenSSH（`sshbuf_put_bignum2_bytes` 写的
+    // 就是 u32 长度 + 体）和 paramiko（`Message.add_mpint`）都把完整 mpint
+    // 喂进哈希。少一个长度前缀，派生出来的密钥全不一样，症状是
+    // "握手成功、第一个数据包解不开"——最难查的那种。
+    public static byte[] Derive(byte[] sharedSecret, byte[] exchangeHash,
+                                byte[] sessionId, int letter, int length) {
+        if (length <= 0) {
+            throw new SshException(SshError.Internal, "key length must be positive");
+        }
+        byte[] k = SshKeys.MpintBytes(sharedSecret);
+        byte[] label = new byte[1];
+        label[0] = (byte)(letter & 255);
+        byte[] first = SshKeys.Hash(k, exchangeHash, label, sessionId);
+        if (length <= first.Length) {
+            byte[] outb = new byte[length];
+            for (int i = 0; i < length; i = i + 1) { outb[i] = first[i]; }
+            return outb;
+        }
+        // 不够长：K2 = HASH(K || H || K1)，K3 = HASH(K || H || K1 || K2)……
+        List<byte[]> blocks = new List<byte[]>();
+        blocks.Add(first);
+        int have = first.Length;
+        while (have < length) {
+            byte[] prev = SshKeys.ConcatBlocks(blocks);
+            byte[] next = SshKeys.Hash(k, exchangeHash, null, prev);
+            blocks.Add(next);
+            have = have + next.Length;
+        }
+        byte[] all = SshBytes.Concat(blocks.ToArray());
+        byte[] result = new byte[length];
+        for (int i = 0; i < length; i = i + 1) { result[i] = all[i]; }
+        return result;
+    }
+
+    // 完整 mpint（4 字节长度前缀 + 体）。
+    //
+    // 用的是 SshWriter.WriteMpint——**和交换哈希里那一份是同一个编码器**。
+    // 同一个"mpint"概念存在两套编码，是这类库里最难查的坑之一。
+    static byte[] MpintBytes(byte[] magnitude) {
+        SshWriter w = new SshWriter(64);
+        w.WriteMpint(magnitude);
+        return w.ToArray();
+    }
+
+    // HASH(K || H || label || session_id)；label 为 null 时是 HASH(K || H || prev)。
+    static byte[] Hash(byte[] k, byte[] exchangeHash, byte[] label, byte[] tail) {
+        SshWriter w = new SshWriter(256);
+        w.WriteRaw(k);
+        w.WriteRaw(exchangeHash);
+        if (label != null) { w.WriteRaw(label); }
+        w.WriteRaw(tail);
+        byte[] data = w.ToArray();
+        return Sha256.Hash(data);
+    }
+
+    // 把已经派生出来的块接起来。
+    static byte[] ConcatBlocks(List<byte[]> blocks) {
+        int total = 0;
+        for (int i = 0; i < blocks.Count; i = i + 1) { total = total + blocks[i].Length; }
+        byte[] outb = new byte[total];
+        int at = 0;
+        for (int i = 0; i < blocks.Count; i = i + 1) {
+            byte[] one = blocks[i];
+            for (int j = 0; j < one.Length; j = j + 1) { outb[at + j] = one[j]; }
+            at = at + one.Length;
+        }
+        return outb;
+    }
+}

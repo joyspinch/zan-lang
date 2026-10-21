@@ -1,0 +1,115 @@
+using System;
+
+namespace System.Ssh;
+
+// 字节数组的小工具（随机、拼接、比较、十六进制）。
+//
+// **随机字节要自己取精确长度**：`RandomNumberGenerator.GetBytes(n)` 按契约
+// 返回 **n+1** 字节（末尾多一个 NUL，给"期望 NUL 结尾字符串"的场景用），
+// 直接把它当定长字段（KEXINIT 的 cookie、公钥、IV）用就会多出一字节——
+// 线格式当场错位，而且错的位置在报文中间，排查起来极其费劲。
+public class SshBytes {
+    // 取 n 个安全随机字节（精确 n 个）。
+    public static byte[] RandomBytes(int n) {
+        if (n <= 0) {
+            throw new SshException(SshError.Internal, "random byte count must be positive");
+        }
+        byte[] b = new byte[n];
+        int got = RandomNumberGenerator.Fill(b, n);
+        if (got < n) {
+            throw new SshException(SshError.Internal, "CSPRNG did not deliver the requested bytes");
+        }
+        return b;
+    }
+
+    // 拼接两个字节数组。
+    public static byte[] Concat(byte[] a, byte[] b) {        int na = a == null ? 0 : a.Length;
+        int nb = b == null ? 0 : b.Length;
+        byte[] outb = new byte[na + nb];
+        for (int i = 0; i < na; i = i + 1) { outb[i] = a[i]; }
+        for (int i = 0; i < nb; i = i + 1) { outb[na + i] = b[i]; }
+        return outb;
+    }
+
+    // 拼接三个字节数组。
+    public static byte[] Concat(byte[] a, byte[] b, byte[] c) {
+        return SshBytes.Concat(SshBytes.Concat(a, b), c);
+    }
+
+    // 拼接一批字节数组。
+    public static byte[] Concat(byte[][] parts) {
+        if (parts == null) { return new byte[0]; }
+        int total = 0;
+        for (int i = 0; i < parts.Length; i = i + 1) {
+            if (parts[i] != null) { total = total + parts[i].Length; }
+        }
+        byte[] outb = new byte[total];
+        int at = 0;
+        for (int i = 0; i < parts.Length; i = i + 1) {
+            byte[] one = parts[i];
+            if (one == null) { continue; }
+            for (int j = 0; j < one.Length; j = j + 1) { outb[at + j] = one[j]; }
+            at = at + one.Length;
+        }
+        return outb;
+    }
+
+    // 字节数组相等（逐字节比，不看长度以外的任何东西）。
+    public static bool Equal(byte[] a, byte[] b) {
+        if (a == null || b == null) { return a == b; }
+        if (a.Length != b.Length) { return false; }
+        int diff = 0;
+        for (int i = 0; i < a.Length; i = i + 1) { diff = diff | (a[i] ^ b[i]); }
+        return diff == 0;
+    }
+
+    // **mpint 编码不在这里**。
+    //
+    // 曾经这里有一个 `EncodeMpint`，返回的是 mpint 的**数值体**（去前导 0、
+    // 最高位是 1 就补一个 0 字节），**不带 4 字节长度前缀**。而密钥派生
+    // （RFC 4253 §7.2）要的是**完整 mpint**（长度前缀 + 体）——差的就是
+    // 那 4 个字节，派生出来的密钥全不一样，症状是"握手成功、第一个数据包
+    // 解不开"。
+    //
+    // 现在只有一个编码器：`SshWriter.WriteMpint`（见 SshWire.zan），
+    // 交换哈希与密钥派生共用它。同一个概念不允许存在两套编码。
+
+    // 十六进制（小写）。
+    public static string ToHex(byte[] data) {        if (data == null) { return ""; }
+        string digits = "0123456789abcdef";
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < data.Length; i = i + 1) {
+            int v = data[i] & 255;
+            sb.Append(digits.Substring((v >> 4) & 15, 1));
+            sb.Append(digits.Substring(v & 15, 1));
+        }
+        return sb.ToString();
+    }
+
+    // 从十六进制解析（非法字符报错）。
+    public static byte[] FromHex(string hex) {
+        if (hex == null) { return new byte[0]; }
+        string clean = hex.Trim();
+        if (clean.Length % 2 != 0) {
+            throw new SshException(SshError.Malformed, "hex string has an odd length");
+        }
+        byte[] outb = new byte[clean.Length / 2];
+        for (int i = 0; i < outb.Length; i = i + 1) {
+            int hi = SshBytes.HexDigit(clean[i * 2]);
+            int lo = SshBytes.HexDigit(clean[i * 2 + 1]);
+            if (hi < 0 || lo < 0) {
+                throw new SshException(SshError.Malformed, "hex string has a non-hex character");
+            }
+            outb[i] = (byte)((hi << 4) | lo);
+        }
+        return outb;
+    }
+
+    // 单个十六进制字符的值（-1 = 非法）。
+    static int HexDigit(int c) {
+        if (c >= 48 && c <= 57) { return c - 48; }
+        if (c >= 97 && c <= 102) { return c - 87; }
+        if (c >= 65 && c <= 70) { return c - 55; }
+        return -1;
+    }
+}

@@ -1,0 +1,719 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Text;
+
+namespace System.Ssh;
+
+// SSH 客户端的连接选项。
+//
+// **主机密钥策略是这里最重要的一项**：默认**任何不认识的主机密钥都拒绝连接**
+// （`acceptUnknownHostKey = false`）。把"第一次见"当成"可以接受"是 SSH 客户端
+// 最经典的漏洞——中间人只要抢在真服务器之前握手就能拿到会话密钥。
+public class SshOptions {
+    // 自己的软件版本（会出现在识别串里）。
+    public string softwareVersion;
+    // known_hosts 的内容（可选；也可以只给指纹）。
+    public string knownHostsContent;
+    // 固定的主机密钥指纹（"SHA256:..."，可选；给了就优先用它）。
+    public string pinnedFingerprint;
+    // 是否接受第一次见到的主机密钥（默认 false —— 不接受）。
+    public bool acceptUnknownHostKey;
+    // 连接超时（毫秒）。
+    public int connectTimeoutMs;
+    // 调试输出（打印协商结果与各阶段耗时）。
+    public bool verbose;
+
+    public SshOptions() {
+        this.softwareVersion = "ZanSsh_1.0";
+        this.knownHostsContent = null;
+        this.pinnedFingerprint = null;
+        this.acceptUnknownHostKey = false;
+        this.connectTimeoutMs = 15000;
+        this.verbose = false;
+    }
+}
+
+// 一次远程命令的执行结果。
+public class SshExecResult {
+    // 退出码（对端没给就当 -1）。
+    public int exitCode;
+    // 标准输出。
+    public string stdout;
+    // 标准错误。
+    public string stderr;
+
+    public SshExecResult() {
+        this.exitCode = -1;
+        this.stdout = "";
+        this.stderr = "";
+    }
+}
+
+// SSH 客户端：连接 → 握手 → 认证 → 执行命令。
+//
+// 一次握手的完整流程（客户端视角）：
+//
+//   1. 发自己的识别串 "SSH-2.0-<软件>\r\n"（**明文**，不是包）。
+//   2. 读服务端的识别串（前面可能有若干行不是识别串的横幅，要跳过）。
+//   3. 发 KEXINIT，收 KEXINIT → 协商算法。
+//   4. 发 KEX_ECDH_INIT（自己的临时公钥），收 KEX_ECDH_REPLY（主机密钥、
+//      服务端临时公钥、对交换哈希的签名）→ 算共享密钥与交换哈希 → 验签 →
+//      校验主机密钥。
+//   5. 发 NEWKEYS，收 NEWKEYS → 派生密钥 → **从下一个包起改用加密**。
+//   6. SERVICE_REQUEST("ssh-userauth") → SERVICE_ACCEPT。
+//   7. 用户认证（口令 / 公钥）。
+//
+// **第 5 步的切换点最容易出错**：NEWKEYS 本身是用**旧密钥**（明文）发的，
+// 收完对端的 NEWKEYS 之后才切。切早了，收到的包解不开；切晚了，发出去的
+// 包对端解不开——两边都表现为"握手卡住"。
+public class SshClient {
+    // 主机。
+    public string host;
+    // 端口。
+    public int port;
+    // 用户名。
+    public string user;
+    // 选项。
+    public SshOptions options;
+
+    // TCP 客户端。
+    private TcpClient tcp;
+    // 字节通道。
+    private SshBytePipe pipe;
+    // 包层。
+    private SshPacketLayer packets;
+    // 读缓冲（读识别串用）。
+    private byte[] readBuf;
+    private int readLen;
+    private int readPos;
+    // 识别串（不含 CR LF）。
+    private byte[] localVersion;
+    private byte[] remoteVersion;
+    // 服务端的软件版本。
+    public string remoteSoftware;
+    // KEXINIT 载荷（**不含消息号**，交换哈希算的是这个）。
+    private byte[] kexInitLocal;
+    private byte[] kexInitRemote;
+    // 会话标识（第一次交换哈希）。
+    public byte[] sessionId;
+    // 对端的主机密钥。
+    public SshHostKey peerHostKey;
+    // 协商结果（诊断用）。
+    public string negotiatedKex;
+    public string negotiatedHostKey;
+    public string negotiatedCipher;
+    // 通道号（客户端这边用 0）。
+    private long localChannel;
+    private long remoteChannel;
+    private long remoteWindow;
+    private long remoteMaxPacket;
+    // 已经消费掉的数据量（用来决定什么时候补窗口）。
+    private long windowConsumed;
+    // 已经读出来、但还没处理的消息（对端把数据发在应答之前时用得上）。
+    private List<byte[]> pending;
+
+    public SshClient(string host, int port, string user) {
+        this.host = host;
+        this.port = port;
+        this.user = user;
+        this.options = new SshOptions();
+        this.tcp = null;
+        this.pipe = null;
+        this.packets = null;
+        this.readBuf = new byte[4096];
+        this.readLen = 0;
+        this.readPos = 0;
+        this.localVersion = null;
+        this.remoteVersion = null;
+        this.remoteSoftware = "";
+        this.kexInitLocal = null;
+        this.kexInitRemote = null;
+        this.sessionId = null;
+        this.peerHostKey = null;
+        this.negotiatedKex = "";
+        this.negotiatedHostKey = "";
+        this.negotiatedCipher = "";
+        this.localChannel = 0;
+        this.remoteChannel = 0;
+        this.remoteWindow = 0;
+        this.remoteMaxPacket = 32768;
+        this.pending = new List<byte[]>();
+    }
+
+    // 连上（TCP 层）。
+    public void Connect() {
+        this.tcp = TcpClient.Connect(this.host, this.port);
+        if (this.tcp == null || !this.tcp.IsConnected()) {
+            throw new SshException(SshError.IoError, "cannot connect to SSH server",
+                this.host + ":" + this.port.ToString());
+        }
+        this.pipe = SshSocketPipe.FromClient(this.tcp);
+        this.packets = new SshPacketLayer(this.pipe);
+    }
+
+    // 用一条已建好的通道（测试与回放用）。
+    public void UsePipe(SshBytePipe pipe) {
+        this.pipe = pipe;
+        this.packets = new SshPacketLayer(pipe);
+    }
+
+    /* ---------- 握手 ---------- */
+
+    // 版本交换 + 算法协商 + 密钥交换 + 切换加密。
+    public void Handshake() {
+        this.ExchangeVersions();
+        SshKexInit local = this.BuildKexInit();
+        this.kexInitLocal = local.ToPayload();
+        this.SendMessage(SshMessage.KexInit, this.kexInitLocal);
+        byte[] remotePayload = this.RecvMessage(SshMessage.KexInit);
+        this.kexInitRemote = remotePayload;
+        SshKexInit remote = SshKexInit.FromPayload(remotePayload);
+        this.Negotiate(local, remote);
+        this.RunKex();
+        this.SwitchToEncrypted();
+    }
+
+    // 交换识别串。
+    private void ExchangeVersions() {
+        string ident = SshVersion.Build(this.options.softwareVersion);
+        byte[] raw = Encoding.UTF8.GetBytes(ident);
+        this.pipe.WriteExact(raw, 0, raw.Length);
+        // 识别串不含 CR LF（交换哈希里用的是去掉 CR LF 的版本串）。
+        this.localVersion = Encoding.UTF8.GetBytes(SshVersion.Prefix + this.options.softwareVersion);
+
+        // 服务端可能先发若干行横幅（不以 "SSH-" 开头），要跳过。
+        int guard = 0;
+        while (true) {
+            string line = this.ReadLine();
+            guard = guard + 1;
+            if (guard > 64) {
+                throw new SshException(SshError.BadVersion, "server sent too many banner lines");
+            }
+            if (line.Length == 0) { continue; }
+            if (SshVersion.IsIdentification(line)) {
+                this.remoteSoftware = SshVersion.ParseSoftware(line);
+                this.remoteVersion = Encoding.UTF8.GetBytes(line);
+                return;
+            }
+        }
+    }
+
+    // 造自己的 KEXINIT（偏好顺序即列表顺序）。
+    private SshKexInit BuildKexInit() {
+        SshKexInit init = new SshKexInit();
+        // **两个名字都要报**：libssh.org 那个是历史名，paramiko/libssh 至今
+        // 只认它；现代 OpenSSH 两个都认，且两个名字走**同一套编码**
+        // （共享密钥一律按带长度前缀的 mpint 进交换哈希），所以这里不需要
+        // 按名字切换编码逻辑。
+        init.kexAlgorithms.Add("curve25519-sha256");
+        init.kexAlgorithms.Add("curve25519-sha256@libssh.org");
+        init.hostKeyAlgorithms.Add("ecdsa-sha2-nistp256");
+        init.encryptionC2S.Add("aes256-gcm@openssh.com");
+        init.encryptionS2C.Add("aes256-gcm@openssh.com");
+        init.macC2S.Add("hmac-sha2-256");
+        init.macS2C.Add("hmac-sha2-256");
+        init.compressionC2S.Add("none");
+        init.compressionS2C.Add("none");
+        return init;
+    }
+
+    // 协商算法。
+    private void Negotiate(SshKexInit local, SshKexInit remote) {
+        this.negotiatedKex = SshNegotiation.Choose(local.kexAlgorithms, remote.kexAlgorithms);
+        if (this.negotiatedKex == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common key exchange algorithm");
+        }
+        if (this.negotiatedKex != "curve25519-sha256"
+            && this.negotiatedKex != "curve25519-sha256@libssh.org") {
+            throw new SshException(SshError.Unsupported, "unsupported key exchange algorithm",
+                this.negotiatedKex);
+        }
+        this.negotiatedHostKey = SshNegotiation.ChooseHostKey(local.hostKeyAlgorithms, remote.hostKeyAlgorithms);
+        if (this.negotiatedHostKey == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common host key algorithm");
+        }
+        string encC2S = SshNegotiation.Choose(local.encryptionC2S, remote.encryptionC2S);
+        string encS2C = SshNegotiation.Choose(local.encryptionS2C, remote.encryptionS2C);
+        if (encC2S == null || encS2C == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common encryption algorithm");
+        }
+        if (encC2S != "aes256-gcm@openssh.com" || encS2C != "aes256-gcm@openssh.com") {
+            throw new SshException(SshError.Unsupported, "unsupported encryption algorithm", encC2S);
+        }
+        this.negotiatedCipher = encC2S;
+        string macC2S = SshNegotiation.Choose(local.macC2S, remote.macC2S);
+        if (macC2S == null) {
+            throw new SshException(SshError.NoCommonAlgorithm, "no common MAC algorithm");
+        }
+        string compC2S = SshNegotiation.Choose(local.compressionC2S, remote.compressionC2S);
+        string compS2C = SshNegotiation.Choose(local.compressionS2C, remote.compressionS2C);
+        if (compC2S != "none" || compS2C != "none") {
+            throw new SshException(SshError.Unsupported, "compression is not supported");
+        }
+    }
+
+    // 密钥交换（curve25519-sha256）。
+    private void RunKex() {
+        byte[] privateKey;
+        byte[] publicKey;
+        SshKex25519.GenerateKeyPair(out privateKey, out publicKey);
+
+        SshWriter initMsg = new SshWriter(64);
+        initMsg.WriteString(publicKey);
+        this.SendMessage(SshMessage.KexEcdhInit, initMsg.ToArray());
+
+        SshReader reply = new SshReader(this.RecvMessage(SshMessage.KexEcdhReply));
+        byte[] hostKeyBlob = reply.ReadString();
+        byte[] serverPublic = reply.ReadString();
+        byte[] signature = reply.ReadString();
+
+        byte[] shared = SshKex25519.SharedSecret(privateKey, serverPublic);
+        byte[] hash = SshKex25519.ExchangeHash(
+            this.localVersion, this.remoteVersion,
+            this.kexInitLocal, this.kexInitRemote,
+            hostKeyBlob, publicKey, serverPublic, shared);
+
+        // 验签：签名是对交换哈希做的，验不过就说明握手被篡改。
+        if (!SshHostKey.Verify(hostKeyBlob, hash, signature)) {
+            throw new SshException(SshError.KexFailed, "host key signature verification failed");
+        }
+        this.peerHostKey = SshHostKey.Parse(hostKeyBlob);
+        this.VerifyHostKey(hostKeyBlob);
+        this.sessionId = hash;
+        // 共享密钥按 mpint 编码参与密钥派生（不是裸字节）。
+        this.sharedSecret = shared;
+        this.exchangeHash = hash;
+    }
+
+    // 共享密钥的原始字节（mpint 编码由密钥派生那一步自己做）。
+    private byte[] sharedSecret;
+    // 交换哈希。
+    private byte[] exchangeHash;
+
+    // 切换到加密（NEWKEYS 之后）。
+    private void SwitchToEncrypted() {
+        // 先用明文发 NEWKEYS，再用明文收对端的 NEWKEYS。
+        this.SendMessage(SshMessage.NewKeys, new byte[0]);
+        this.RecvMessage(SshMessage.NewKeys);
+
+        byte[] ivC2S = SshKeys.Derive(this.sharedSecret, this.exchangeHash, this.sessionId, 65, 12);
+        byte[] ivS2C = SshKeys.Derive(this.sharedSecret, this.exchangeHash, this.sessionId, 66, 12);
+        byte[] keyC2S = SshKeys.Derive(this.sharedSecret, this.exchangeHash, this.sessionId, 67, 32);
+        byte[] keyS2C = SshKeys.Derive(this.sharedSecret, this.exchangeHash, this.sessionId, 68, 32);
+
+        SshCipherState outState = new SshCipherState();
+        outState.Init(keyC2S, ivC2S);
+        SshCipherState inState = new SshCipherState();
+        inState.Init(keyS2C, ivS2C);
+        this.packets.outCipher = outState;
+        this.packets.inCipher = inState;
+    }
+
+    // 校验主机密钥（known_hosts / 固定指纹）。
+    private void VerifyHostKey(byte[] hostKeyBlob) {
+        string fingerprint = SshHostKey.Fingerprint(hostKeyBlob);
+        if (this.options.pinnedFingerprint != null && this.options.pinnedFingerprint.Length > 0) {
+            if (this.options.pinnedFingerprint != fingerprint) {
+                throw new SshException(SshError.HostKeyMismatch,
+                    "host key fingerprint mismatch", "expected " + this.options.pinnedFingerprint
+                    + ", got " + fingerprint);
+            }
+            return;
+        }
+        if (this.options.knownHostsContent != null && this.options.knownHostsContent.Length > 0) {
+            SshKnownHosts known = SshKnownHosts.Parse(this.options.knownHostsContent);
+            string result = known.Check(this.KnownHostName(), hostKeyBlob);
+            if (result == SshKnownHosts.MatchKnown) { return; }
+            if (result == SshKnownHosts.MatchMismatch) {
+                throw new SshException(SshError.HostKeyMismatch,
+                    "host key changed for " + this.KnownHostName(), fingerprint);
+            }
+            // 第一次见。
+            if (!this.options.acceptUnknownHostKey) {
+                throw new SshException(SshError.HostKeyUnknown,
+                    "unknown host key for " + this.KnownHostName(), fingerprint);
+            }
+            return;
+        }
+        if (!this.options.acceptUnknownHostKey) {
+            throw new SshException(SshError.HostKeyUnknown,
+                "no host key policy configured (refusing to accept an unknown host key)",
+                fingerprint);
+        }
+    }
+
+    // known_hosts 口径的主机名：默认端口写主机名，非默认端口写 [主机]:端口。
+    public string KnownHostName() {
+        if (this.port == 22) { return this.host; }
+        return "[" + this.host + "]:" + this.port.ToString();
+    }
+
+    /* ---------- 认证 ---------- */
+
+    // 请求 userauth 服务。
+    public void RequestUserAuthService() {
+        SshWriter w = new SshWriter(32);
+        w.WriteText("ssh-userauth");
+        this.SendMessage(SshMessage.ServiceRequest, w.ToArray());
+        this.RecvMessage(SshMessage.ServiceAccept);
+    }
+
+    // 口令认证。
+    public bool AuthenticatePassword(string password) {
+        SshWriter w = new SshWriter(128);
+        w.WriteText(this.user);
+        w.WriteText("ssh-connection");
+        w.WriteText("password");
+        w.WriteBool(false);
+        w.WriteText(password);
+        this.SendMessage(SshMessage.UserAuthRequest, w.ToArray());
+        return this.WaitAuthResult();
+    }
+
+    // 公钥认证（ecdsa-sha2-nistp256）。
+    public bool AuthenticatePublicKey(byte[] privateKey) {
+        SshHostKey key = SshHostKey.FromPrivate(privateKey);
+        // 先问服务端同不同意用这把钥匙（RFC 4252 §7：带签名试探）。
+        SshWriter probe = new SshWriter(256);
+        probe.WriteText(this.user);
+        probe.WriteText("ssh-connection");
+        probe.WriteText("publickey");
+        probe.WriteBool(false);
+        probe.WriteText(key.algorithm);
+        probe.WriteString(key.blob);
+        this.SendMessage(SshMessage.UserAuthRequest, probe.ToArray());
+
+        byte[] payload = this.RecvAnyAuthMessage();
+        int message = payload[0] & 255;
+        SshReader r = new SshReader(payload, 1, payload.Length - 1);
+        if (message == SshMessage.UserAuthSuccess) { return true; }
+        if (message != SshMessage.UserAuthPkOk) {
+            if (message == SshMessage.UserAuthFailure) { return false; }
+            throw new SshException(SshError.UnexpectedMessage,
+                "unexpected message during public key authentication",
+                SshMessage.Name(message));
+        }
+        // 服务端认可这把钥匙 → 带签名再发一次。
+        SshReader pk = new SshReader(payload, 1, payload.Length - 1);
+        string signedAlg = pk.ReadText();
+        byte[] signedKeyBlob = pk.ReadString();
+        SshWriter signed2 = new SshWriter(512);
+        signed2.WriteString(this.sessionId);
+        signed2.WriteText(signedAlg);
+        signed2.WriteString(signedKeyBlob);
+        byte[] signature = key.Sign(signed2.ToArray());
+
+        SshWriter real = new SshWriter(512);
+        real.WriteText(this.user);
+        real.WriteText("ssh-connection");
+        real.WriteText("publickey");
+        real.WriteBool(true);
+        real.WriteText(key.algorithm);
+        real.WriteString(key.blob);
+        real.WriteString(signature);
+        this.SendMessage(SshMessage.UserAuthRequest, real.ToArray());
+        return this.WaitAuthResult();
+    }
+
+    // 等认证结果（成功 / 失败 / 需要改口令）。
+    private bool WaitAuthResult() {
+        byte[] payload = this.RecvAnyAuthMessage();
+        int message = payload[0] & 255;
+        if (message == SshMessage.UserAuthSuccess) { return true; }
+        if (message == SshMessage.UserAuthFailure) { return false; }
+        if (message == SshMessage.UserAuthPasswdChangeReq) {
+            throw new SshException(SshError.Unsupported, "server requires a password change");
+        }
+        throw new SshException(SshError.UnexpectedMessage, "unexpected authentication response",
+            SshMessage.Name(message));
+    }
+
+    // 收一条认证相关的消息（跳过横幅）。
+    private byte[] RecvAnyAuthMessage() {
+        while (true) {
+            byte[] payload = this.packets.Recv();
+            int message = payload[0] & 255;
+            if (message == SshMessage.UserAuthBanner) { continue; }
+            if (message == SshMessage.Disconnect) {
+                SshReader r = new SshReader(payload, 1, payload.Length - 1);
+                long reason = r.ReadU32();
+                string text = r.ReadText();
+                throw new SshException(SshError.Disconnected, "server disconnected", text);
+            }
+            return payload;
+        }
+    }
+
+    /* ---------- 通道与命令 ---------- */
+
+    // 执行一条命令，等它跑完。
+    public SshExecResult Exec(string command) {
+        this.OpenSessionChannel();
+        SshExecResult result = new SshExecResult();
+        StringBuilder outBuf = new StringBuilder();
+        StringBuilder errBuf = new StringBuilder();
+        this.ExecRequest(command);
+        this.CollectChannelOutput(result, outBuf, errBuf);
+        this.CloseChannel();
+        return result;
+    }
+
+    // 关掉通道（发 EOF + CLOSE，让服务端知道这边收完了）。
+    public void CloseChannel() {
+        SshWriter eof = new SshWriter(16);
+        eof.WriteU32(this.remoteChannel);
+        this.SendMessage(SshMessage.ChannelEof, eof.ToArray());
+        SshWriter close = new SshWriter(16);
+        close.WriteU32(this.remoteChannel);
+        this.SendMessage(SshMessage.ChannelClose, close.ToArray());
+    }
+
+    // 开一个 session 通道。
+    public void OpenSessionChannel() {
+        this.localChannel = 0;
+        SshWriter w = new SshWriter(64);
+        w.WriteText("session");
+        w.WriteU32(this.localChannel);
+        w.WriteU32(2097152);      // 初始窗口 2 MB
+        w.WriteU32(32768);        // 最大包 32 KB
+        this.SendMessage(SshMessage.ChannelOpen, w.ToArray());
+        byte[] payload = this.packets.Recv();
+        int message = payload[0] & 255;
+        SshReader r = new SshReader(payload, 1, payload.Length - 1);
+        if (message == SshMessage.ChannelOpenFailure) {
+            long reason = r.ReadU32();
+            string text = r.ReadText();
+            throw new SshException(SshError.ChannelOpenFailed, "cannot open session channel", text);
+        }
+        if (message != SshMessage.ChannelOpenConfirmation) {
+            throw new SshException(SshError.UnexpectedMessage, "unexpected reply to channel open",
+                SshMessage.Name(message));
+        }
+        r.ReadU32();              // 本端通道号（对端回声）
+        this.remoteChannel = r.ReadU32();
+        this.remoteWindow = r.ReadU32();
+        this.remoteMaxPacket = r.ReadU32();
+    }
+
+    // 在通道上发 exec 请求。
+    //
+    // **应答不保证是下一条消息**：RFC 4254 §5.4 要求服务端先回
+    // CHANNEL_SUCCESS 再发数据，但 paramiko 是**先把数据发出来、最后才补
+    // SUCCESS**。所以这里一直读到 SUCCESS/FAILURE 为止，中间读到的其它
+    // 消息原样放回队列，交给后面的输出收集处理——
+    // 否则"收到数据"会被当成"应答不对"直接报错。
+    public void ExecRequest(string command) {
+        SshWriter w = new SshWriter(256);
+        w.WriteU32(this.remoteChannel);
+        w.WriteText("exec");
+        w.WriteBool(true);
+        w.WriteText(command);
+        this.SendMessage(SshMessage.ChannelRequest, w.ToArray());
+        this.Trace("exec request sent");
+        // 暂存：应答之前先到的消息（数据、exit-status 等）。
+        //
+        // **不能直接塞回 this.pending**——下一轮 NextMessage() 会把刚塞进去的
+        // 那条又取出来，于是同一条消息被反复读成"应答"，变成死循环。
+        // 所以先攒在局部列表里，确认拿到应答后再按原序放回队首。
+        List<byte[]> deferred = new List<byte[]>();
+        while (true) {
+            byte[] payload = this.NextMessage();
+            int message = payload[0] & 255;
+            this.Trace("exec reply: " + SshMessage.Name(message));
+            if (message == SshMessage.ChannelSuccess) {
+                this.PrependPending(deferred);
+                return;
+            }
+            if (message == SshMessage.ChannelFailure) {
+                throw new SshException(SshError.ChannelOpenFailed, "exec request rejected");
+            }
+            if (message == SshMessage.ChannelClose) {
+                throw new SshException(SshError.ChannelOpenFailed,
+                    "exec request was not confirmed (channel closed)");
+            }
+            if (message == SshMessage.Disconnect) {
+                SshReader r = new SshReader(payload, 1, payload.Length - 1);
+                r.ReadU32();
+                string text = r.ReadText();
+                throw new SshException(SshError.Disconnected, "server disconnected", text);
+            }
+            deferred.Add(payload);
+        }
+    }
+
+    // 把暂存的消息按原序放回队首。
+    private void PrependPending(List<byte[]> msgs) {
+        if (msgs.Count == 0) { return; }
+        List<byte[]> merged = new List<byte[]>();
+        for (int i = 0; i < msgs.Count; i = i + 1) { merged.Add(msgs[i]); }
+        for (int i = 0; i < this.pending.Count; i = i + 1) { merged.Add(this.pending[i]); }
+        this.pending = merged;
+    }
+
+    // 收完通道数据（直到关闭），顺带取退出码。
+    private void CollectChannelOutput(SshExecResult result, StringBuilder outBuf, StringBuilder errBuf) {
+        this.windowConsumed = 0;
+        while (true) {
+            byte[] payload = this.NextMessage();
+            int message = payload[0] & 255;
+            this.Trace("channel recv: " + SshMessage.Name(message));
+            SshReader r = new SshReader(payload, 1, payload.Length - 1);
+            if (message == SshMessage.ChannelSuccess) {
+                continue;
+            }
+            if (message == SshMessage.ChannelFailure) {
+                throw new SshException(SshError.ChannelOpenFailed, "exec request rejected");
+            }
+            if (message == SshMessage.ChannelData) {
+                r.ReadU32();
+                byte[] data = r.ReadString();
+                outBuf.Append(data.ToStr(0, data.Length));
+                this.windowConsumed = this.windowConsumed + (long)data.Length;
+                this.MaybeAdjustWindow();
+                continue;
+            }
+            if (message == SshMessage.ChannelExtendedData) {
+                r.ReadU32();
+                r.ReadU32();
+                byte[] data = r.ReadString();
+                errBuf.Append(data.ToStr(0, data.Length));
+                this.windowConsumed = this.windowConsumed + (long)data.Length;
+                this.MaybeAdjustWindow();
+                continue;
+            }
+            if (message == SshMessage.ChannelRequest) {
+                r.ReadU32();
+                string kind = r.ReadText();
+                bool wantReply = r.ReadBool();
+                if (kind == "exit-status") {
+                    result.exitCode = (int)r.ReadU32();
+                    // **exit-status 就是命令结束的标志**（RFC 4254 §6.10：
+                    // 服务端在命令终止时发它，此前数据已经发完）。
+                    // 不能只等 CHANNEL_CLOSE——不少服务端（包括 paramiko
+                    // 的服务端模式）发完 exit-status 就不关通道了，
+                    // 等 CLOSE 会一直挂到超时。
+                    break;
+                }
+                continue;
+            }
+            if (message == SshMessage.ChannelWindowAdjust) {
+                r.ReadU32();
+                this.remoteWindow = this.remoteWindow + r.ReadU32();
+                continue;
+            }
+            if (message == SshMessage.ChannelEof) {
+                continue;
+            }
+            if (message == SshMessage.ChannelClose) {
+                break;
+            }
+            if (message == SshMessage.Disconnect) {
+                r.ReadU32();
+                string text = r.ReadText();
+                throw new SshException(SshError.Disconnected, "server disconnected", text);
+            }
+            // 其它消息（全局请求、调试信息…）忽略。
+        }
+        result.stdout = outBuf.ToString();
+        result.stderr = errBuf.ToString();
+    }
+
+    // 消费过半就把窗口补回去（否则跑久了会被服务端挂起）。
+    private void MaybeAdjustWindow() {
+        if (this.windowConsumed < 1048576) { return; }
+        SshWriter w = new SshWriter(16);
+        w.WriteU32(this.remoteChannel);
+        w.WriteU32(this.windowConsumed);
+        this.SendMessage(SshMessage.ChannelWindowAdjust, w.ToArray());
+        this.windowConsumed = 0;
+    }
+
+    /* ---------- 底层收发 ---------- */
+
+    // 调试输出（verbose = true 时打印各阶段进展）。
+    private void Trace(string text) {
+        if (this.options == null || !this.options.verbose) { return; }
+        Console.WriteLine("[ssh] " + text);
+    }
+
+    // 取下一条消息（优先用已经读出来、但还没处理的那条）。
+    private byte[] NextMessage() {
+        if (this.pending.Count > 0) {
+            byte[] first = this.pending[0];
+            this.pending.RemoveAt(0);
+            return first;
+        }
+        return this.packets.Recv();
+    }
+
+    // 发一条消息（消息号 + 载荷）。
+    private void SendMessage(int message, byte[] payload) {
+        byte[] full = new byte[1 + payload.Length];
+        full[0] = (byte)(message & 255);
+        for (int i = 0; i < payload.Length; i = i + 1) { full[1 + i] = payload[i]; }
+        this.packets.Send(full);
+    }
+
+    // 收一条指定类型的消息。
+    private byte[] RecvMessage(int expected) {
+        while (true) {
+            byte[] payload = this.packets.Recv();
+            int message = payload[0] & 255;
+            if (message == SshMessage.Ignore) { continue; }
+            if (message == SshMessage.Debug) { continue; }
+            if (message == SshMessage.Disconnect) {
+                SshReader r = new SshReader(payload, 1, payload.Length - 1);
+                long reason = r.ReadU32();
+                string text = r.ReadText();
+                throw new SshException(SshError.Disconnected, "peer disconnected", text);
+            }
+            if (message != expected) {
+                throw new SshException(SshError.UnexpectedMessage, "unexpected SSH message",
+                    "expected " + SshMessage.Name(expected) + ", got " + SshMessage.Name(message));
+            }
+            byte[] body = new byte[payload.Length - 1];
+            for (int i = 0; i < body.Length; i = i + 1) { body[i] = payload[1 + i]; }
+            return body;
+        }
+    }
+
+    // 读一行（到 \n 为止，含 \n）。
+    private string ReadLine() {
+        StringBuilder sb = new StringBuilder();
+        while (true) {
+            if (this.readPos >= this.readLen) {
+                this.readLen = this.pipe.Read(this.readBuf, 0, this.readBuf.Length);
+                this.readPos = 0;
+                if (this.readLen <= 0) {
+                    throw new SshException(SshError.IoError, "connection closed during version exchange");
+                }
+            }
+            int c = this.readBuf[this.readPos] & 255;
+            this.readPos = this.readPos + 1;
+            if (c == 10) { break; }
+            sb.Append((char)c);
+        }
+        string line = sb.ToString();
+        // 去掉结尾的 CR。
+        if (line.Length > 0 && line[line.Length - 1] == 13) {
+            line = line.Substring(0, line.Length - 1);
+        }
+        if (line.Length > SshVersion.MaxLength) {
+            throw new SshException(SshError.BadVersion, "identification string is too long");
+        }
+        return line;
+    }
+
+    // 关闭连接。
+    public void Close() {
+        if (this.pipe != null) {
+            this.pipe.Close();
+            this.pipe = null;
+        }
+        if (this.tcp != null) {
+            this.tcp.Close();
+            this.tcp = null;
+        }
+    }
+}

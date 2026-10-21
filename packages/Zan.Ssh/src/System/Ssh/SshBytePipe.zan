@@ -1,0 +1,171 @@
+using System;
+using System.Collections.Generic;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace System.Ssh;
+
+// 字节通道：SSH 传输层只认"往里写字节 / 从里读字节"。
+//
+// **抽象出来不是为了好看**：握手是"客户端说一句、服务端答一句"的多轮交互，
+// 要把它测透就得能**在同一个进程里跑两端的握手**（用内存管道对接），而且
+// 逐字节可控。绑死在 TCP 上就只能靠外部 sshd 才能验——本机没有 sshd，
+// 这条路直接堵死。
+public abstract class SshBytePipe {
+    // 写；返回实际写入的字节数。
+    public abstract int Write(byte[] data, int offset, int count);
+
+    // 读；返回读到的字节数，0 表示对端已关闭（EOF）。
+    public abstract int Read(byte[] data, int offset, int count);
+
+    // 关闭。
+    public abstract void Close();
+
+    // 读满 count 个字节（不够就继续读）；对端关闭时抛出截断错误。
+    public void ReadExact(byte[] data, int offset, int count) {
+        int got = 0;
+        while (got < count) {
+            int n = this.Read(data, offset + got, count - got);
+            if (n <= 0) {
+                throw new SshException(SshError.Truncated, "connection closed while reading",
+                    "wanted " + count.ToString() + " byte(s), got " + got.ToString());
+            }
+            got = got + n;
+        }
+    }
+
+    // 写满 count 个字节（写少了就继续写）。
+    public void WriteExact(byte[] data, int offset, int count) {
+        int sent = 0;
+        while (sent < count) {
+            int n = this.Write(data, offset + sent, count - sent);
+            if (n <= 0) {
+                throw new SshException(SshError.IoError, "connection closed while writing");
+            }
+            sent = sent + n;
+        }
+    }
+}
+
+// 内存管道的一端（测试与回放用）。
+//
+// 两个端点各有一个**入站队列**和一个**出站队列**：A 端写进 B 端的入站队列，
+// B 端写进 A 端的入站队列。读阻塞在队列上（对端还没写就等着），
+// 写满一包就唤醒。
+public class SshMemoryPipe : SshBytePipe {
+    // 别人写给我、我从这里读。
+    private BlockingQueue<byte[]> inbox;
+    // 我写给别人、别人从那里读。
+    private BlockingQueue<byte[]> outbox;
+    // 还没读完的半包。
+    private byte[] pending;
+    private int pendingLen;
+    private int pendingPos;
+    private bool closed;
+
+    public SshMemoryPipe(BlockingQueue<byte[]> inbox, BlockingQueue<byte[]> outbox) {
+        this.inbox = inbox;
+        this.outbox = outbox;
+        this.pending = null;
+        this.pendingLen = 0;
+        this.pendingPos = 0;
+        this.closed = false;
+    }
+
+    public override int Write(byte[] data, int offset, int count) {
+        if (this.closed || count <= 0) { return 0; }
+        byte[] copy = new byte[count];
+        for (int i = 0; i < count; i = i + 1) { copy[i] = data[offset + i]; }
+        this.outbox.Enqueue(copy);
+        return count;
+    }
+
+    public override int Read(byte[] data, int offset, int count) {
+        if (this.closed) { return 0; }
+        if (this.pending == null || this.pendingPos >= this.pendingLen) {
+            byte[] chunk = this.inbox.Dequeue();
+            if (chunk == null) { return 0; }
+            this.pending = chunk;
+            this.pendingLen = chunk.Length;
+            this.pendingPos = 0;
+        }
+        int n = this.pendingLen - this.pendingPos;
+        if (n > count) { n = count; }
+        for (int i = 0; i < n; i = i + 1) { data[offset + i] = this.pending[this.pendingPos + i]; }
+        this.pendingPos = this.pendingPos + n;
+        return n;
+    }
+
+    public override void Close() {
+        if (this.closed) { return; }
+        this.closed = true;
+        this.outbox.Complete();
+    }
+}
+
+// 一对内存管道的两端（测试里一端给客户端、一端给服务端）。
+public class SshMemoryLink {
+    // 客户端端点。
+    public SshMemoryPipe clientEnd;
+    // 服务端端点。
+    public SshMemoryPipe serverEnd;
+
+    public SshMemoryLink() {
+        BlockingQueue<byte[]> toClient = new BlockingQueue<byte[]>();
+        BlockingQueue<byte[]> toServer = new BlockingQueue<byte[]>();
+        this.clientEnd = new SshMemoryPipe(toClient, toServer);
+        this.serverEnd = new SshMemoryPipe(toServer, toClient);
+    }
+}
+
+// TCP 管道（真实连接）。
+//
+// **必须用带长度的 Socket.Send**：Socket.SendString 走的是 strlen，遇到 NUL
+// 就截断——SSH 的载荷里 NUL 到处都是（长度域、随机填充、加密后的字节），
+// 用 SendString 发出去就是半个包，对端永远等不齐。
+public class SshSocketPipe : SshBytePipe {
+    // 套接字句柄。
+    private nint sock;
+    private bool closed;
+
+    public SshSocketPipe(nint sock) {
+        this.sock = sock;
+        this.closed = false;
+    }
+
+    // 用已连接的 TcpClient 建管道。
+    public static SshSocketPipe FromClient(TcpClient client) {
+        if (client == null) {
+            throw new SshException(SshError.IoError, "null TCP client");
+        }
+        return new SshSocketPipe(client.GetSocket());
+    }
+
+    public override int Write(byte[] data, int offset, int count) {
+        if (this.closed || count <= 0) { return 0; }
+        string chunk = data.ToStr(offset, count);
+        int n = Socket.Send(this.sock, chunk, count);
+        if (n < 0) {
+            throw new SshException(SshError.IoError, "socket write failed");
+        }
+        return n;
+    }
+
+    public override int Read(byte[] data, int offset, int count) {
+        if (this.closed) { return 0; }
+        string got = Socket.Receive(this.sock, count);
+        if (got == null || got.Length == 0) { return 0; }
+        byte[] raw = got.ToBytes();
+        int n = raw.Length;
+        if (n > count) { n = count; }
+        for (int i = 0; i < n; i = i + 1) { data[offset + i] = raw[i]; }
+        return n;
+    }
+
+    public override void Close() {
+        if (this.closed) { return; }
+        this.closed = true;
+        Socket.ShutdownBoth(this.sock);
+        Socket.Close(this.sock);
+    }
+}

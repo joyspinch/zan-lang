@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace System.Ssh;
+
+// known_hosts 的解析与匹配。
+//
+// 一行长这样：
+//
+//     hostname[,hostname2...] keytype base64key [comment]
+//
+// **主机名可以带通配符**（`*` 匹配任意串、`?` 匹配单字符），也可以是
+// **哈希形式** `|1|<base64 salt>|<base64 hash>`——后者是 OpenSSH 默认的
+// 写法，哈希 = HMAC-SHA1(key = salt, data = 主机名)，不泄露主机名。
+//
+// **匹配结果必须区分三种**（这是安全边界，不能合成一句话）：
+//   - Known    主机名匹配且密钥一致 → 认。
+//   - Mismatch 主机名匹配但密钥不同 → **主机密钥变了**（可能是中间人）。
+//   - Unknown  主机名没匹配上 → 第一次见。
+//
+// 把 Mismatch 当成 Unknown 处理（"不认识就接受"）等于把中间人攻击的门
+// 打开了——这是 SSH 客户端最经典的实现漏洞。
+public class SshKnownHosts {
+    // 一条记录。
+    public class Entry {
+        // 主机名模式（或哈希形式）。
+        public string hostPattern;
+        // 密钥类型（"ecdsa-sha2-nistp256" 等）。
+        public string keyType;
+        // 密钥 blob（base64 解码后的原始字节）。
+        public byte[] keyBlob;
+
+        public Entry() {
+            this.hostPattern = "";
+            this.keyType = "";
+            this.keyBlob = null;
+        }
+    }
+
+    // 所有记录。
+    public List<Entry> entries;
+
+    public SshKnownHosts() {
+        this.entries = new List<Entry>();
+    }
+
+    // 解析 known_hosts 的文本内容。
+    //
+    // **坏行跳过，不让整份文件作废**：known_hosts 是用户手写的，可能有
+    // 空行、注释行、手滑写错的行。一行坏了就丢掉整份文件的话，用户会
+    // 以为"所有主机都不认识了"，反而更危险。
+    public static SshKnownHosts Parse(string content) {
+        SshKnownHosts known = new SshKnownHosts();
+        if (content == null) { return known; }
+        List<string> lines = content.Split("\n");
+        for (int i = 0; i < lines.Count; i = i + 1) {
+            string line = lines[i].Trim();
+            if (line.Length == 0 || line[0] == '#') { continue; }
+            // 字段按空白切：主机名 密钥类型 base64密钥 [注释...]
+            List<string> fields = SshKnownHosts.SplitFields(line);
+            if (fields.Count < 3) { continue; }
+            Entry entry = new Entry();
+            entry.hostPattern = fields[0];
+            entry.keyType = fields[1];
+            byte[] blob = SshKnownHosts.DecodeBase64(fields[2]);
+            if (blob == null) { continue; }
+            entry.keyBlob = blob;
+            known.entries.Add(entry);
+        }
+        return known;
+    }
+
+    // 按空白切字段（连续空白当一个）。
+    static List<string> SplitFields(string line) {
+        List<string> fields = new List<string>();
+        int i = 0;
+        while (i < line.Length) {
+            while (i < line.Length && SshKnownHosts.IsSpace(line[i])) { i = i + 1; }
+            if (i >= line.Length) { break; }
+            int start = i;
+            while (i < line.Length && !SshKnownHosts.IsSpace(line[i])) { i = i + 1; }
+            fields.Add(line.Substring(start, i - start));
+        }
+        return fields;
+    }
+
+    static bool IsSpace(int c) {
+        return c == 32 || c == 9 || c == 13;
+    }
+
+    // base64 解码（失败返回 null）。
+    static byte[] DecodeBase64(string text) {
+        try {
+            return Encoding.Base64Decode(text);
+        } catch (Exception ex) {
+            return null;
+        }
+    }
+
+    // 匹配结果。
+    public static string MatchKnown = "Known";
+    public static string MatchMismatch = "Mismatch";
+    public static string MatchUnknown = "Unknown";
+
+    // 检查一个主机密钥。
+    //
+    // `host` 应当是 OpenSSH 的口径：默认端口写主机名，非默认端口写
+    // `[hostname]:port`。
+    public string Check(string host, byte[] keyBlob) {
+        bool hostMatched = false;
+        for (int i = 0; i < this.entries.Count; i = i + 1) {
+            Entry entry = this.entries[i];
+            if (!SshKnownHosts.HostMatches(entry.hostPattern, host)) { continue; }
+            hostMatched = true;
+            if (SshBytes.Equal(entry.keyBlob, keyBlob)) {
+                return SshKnownHosts.MatchKnown;
+            }
+        }
+        if (hostMatched) {
+            // 主机名见过，但密钥对不上 —— 主机密钥变了。
+            return SshKnownHosts.MatchMismatch;
+        }
+        return SshKnownHosts.MatchUnknown;
+    }
+
+    // 主机名模式是否匹配（支持通配符与哈希形式）。
+    public static bool HostMatches(string pattern, string host) {
+        if (pattern == null || host == null) { return false; }
+        if (pattern.StartsWith("|1|")) {
+            return SshKnownHosts.HashedHostMatches(pattern, host);
+        }
+        List<string> parts = pattern.Split(",");
+        for (int i = 0; i < parts.Count; i = i + 1) {
+            if (SshKnownHosts.WildcardMatch(parts[i], host)) { return true; }
+        }
+        return false;
+    }
+
+    // 哈希主机名匹配：`|1|<base64 salt>|<base64 hash>`。
+    static bool HashedHostMatches(string pattern, string host) {
+        List<string> parts = pattern.Split("|");
+        if (parts.Count != 4) { return false; }
+        byte[] salt = SshKnownHosts.DecodeBase64(parts[2]);
+        byte[] expected = SshKnownHosts.DecodeBase64(parts[3]);
+        if (salt == null || expected == null) { return false; }
+        byte[] key = salt.ToStr(0, salt.Length);
+        byte[] msg = host.ToBytes();
+        byte[] mac = Hmac.Sha1(key, msg);
+        if (mac == null) { return false; }
+        return SshBytes.Equal(mac, expected);
+    }
+
+    // 通配符匹配（`*` 任意串、`?` 单字符）。
+    public static bool WildcardMatch(string pattern, string text) {
+        if (pattern == null || text == null) { return false; }
+        return SshKnownHosts.MatchHere(pattern, 0, text, 0);
+    }
+
+    static bool MatchHere(string pattern, int pi, string text, int ti) {
+        while (pi < pattern.Length) {
+            char pc = pattern[pi];
+            if (pc == '*') {
+                // 跳过连续的 '*'，然后对剩下的每个位置试一次。
+                while (pi + 1 < pattern.Length && pattern[pi + 1] == '*') { pi = pi + 1; }
+                if (pi == pattern.Length - 1) { return true; }
+                for (int k = ti; k <= text.Length; k = k + 1) {
+                    if (SshKnownHosts.MatchHere(pattern, pi + 1, text, k)) { return true; }
+                }
+                return false;
+            }
+            if (ti >= text.Length) { return false; }
+            if (pc != '?' && pc != text[ti]) { return false; }
+            pi = pi + 1;
+            ti = ti + 1;
+        }
+        return ti == text.Length;
+    }
+}

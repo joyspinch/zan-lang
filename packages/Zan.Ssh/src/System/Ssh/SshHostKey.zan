@@ -1,0 +1,210 @@
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace System.Ssh;
+
+// 主机密钥（host key）的 blob、指纹与签名。
+//
+// **blob 格式**（RFC 5656 §3.1，本包支持 ecdsa-sha2-nistp256）：
+//
+//     string  "ecdsa-sha2-nistp256"
+//     string  "nistp256"
+//     string  Q            65 字节未压缩点：0x04 || X(32) || Y(32)
+//
+// **签名 blob 格式**（RFC 5656 §3.1.2）：
+//
+//     string  "ecdsa-sha2-nistp256"
+//     string  ecdsa_signature_blob
+//
+// 而 ecdsa_signature_blob 里面才是：
+//
+//     mpint   r
+//     mpint   s
+//
+// **注意外面那层 string**：算法名后面跟的是"一个装着两个 mpint 的 string"，
+// 不是两个 mpint 直接紧挨着。写成扁平形式，对端解析出来的 r/s 全是垃圾——
+// 而且长度对不上时才报错，长度凑巧对上就变成"验签失败"，报错信息完全指不到
+// 真正的原因。OpenSSH（sshbuf_put_stringb(bb)）与 paramiko 都是 RFC 写法。
+//
+// **指纹**用 OpenSSH 的口径：`SHA256:` + base64(SHA256(blob))，**去掉补位
+// 的 '='**。这是 `ssh-keygen -lf` 与 known_hosts 里用户看到的那一串，
+// 口径不一致就没法和用户手上的指纹对上。
+public class SshHostKey {
+    // 算法名。
+    public static string EcdsaP256 = "ecdsa-sha2-nistp256";
+    // 曲线标识。
+    public static string NistP256 = "nistp256";
+
+    // 算法名。
+    public string algorithm;
+    // 曲线标识（ECDSA 才有）。
+    public string curveName;
+    // 公钥点（ECDSA：65 字节未压缩点）。
+    public byte[] point;
+    // 整个 blob（握手里传输的就是它）。
+    public byte[] blob;
+    // 私钥标量（服务端签名用；客户端侧为 null）。
+    public byte[] privateKey;
+
+    public SshHostKey() {
+        this.algorithm = SshHostKey.EcdsaP256;
+        this.curveName = SshHostKey.NistP256;
+        this.point = null;
+        this.blob = null;
+        this.privateKey = null;
+    }
+
+    // 从 blob 解析（只支持 ecdsa-sha2-nistp256）。
+    public static SshHostKey Parse(byte[] blob) {
+        if (blob == null || blob.Length == 0) {
+            throw new SshException(SshError.Malformed, "empty host key blob");
+        }
+        SshReader r = new SshReader(blob);
+        string algorithm = r.ReadText();
+        if (algorithm != SshHostKey.EcdsaP256) {
+            throw new SshException(SshError.Unsupported, "unsupported host key algorithm", algorithm);
+        }
+        string curve = r.ReadText();
+        if (curve != SshHostKey.NistP256) {
+            throw new SshException(SshError.Unsupported, "unsupported EC curve", curve);
+        }
+        byte[] point = r.ReadString();
+        if (point.Length != 65 || (point[0] & 255) != 4) {
+            throw new SshException(SshError.Malformed, "invalid ECDSA public point");
+        }
+        if (!Ecdsa.ValidPublicKey(point, 65)) {
+            throw new SshException(SshError.Malformed, "ECDSA public point is not on the curve");
+        }
+        SshHostKey key = new SshHostKey();
+        key.algorithm = algorithm;
+        key.curveName = curve;
+        key.point = point;
+        key.blob = blob;
+        return key;
+    }
+
+    // 从 32 字节私钥造一个主机密钥（服务端用）。
+    public static SshHostKey FromPrivate(byte[] privateKey) {
+        if (privateKey == null || privateKey.Length != 32) {
+            throw new SshException(SshError.Internal, "invalid ECDSA private key length");
+        }
+        byte[] point = Ecdsa.PublicKeyOf(privateKey);
+        if (point == null) {
+            throw new SshException(SshError.Internal, "ECDSA public key derivation failed");
+        }
+        SshWriter w = new SshWriter(128);
+        w.WriteText(SshHostKey.EcdsaP256);
+        w.WriteText(SshHostKey.NistP256);
+        w.WriteString(point);
+        SshHostKey key = new SshHostKey();
+        key.point = point;
+        key.blob = w.ToArray();
+        key.privateKey = privateKey;
+        return key;
+    }
+
+    // OpenSSH 口径的指纹：SHA256:<base64 去补位>。
+    public static string Fingerprint(byte[] blob) {
+        if (blob == null) {
+            throw new SshException(SshError.Internal, "cannot fingerprint a null blob");
+        }
+        byte[] digest = Sha256.Hash(blob);
+        string b64 = Encoding.Base64EncodeBytes(digest, digest.Length);
+        // 去掉 base64 的补位 '='：OpenSSH 的指纹不带补位。
+        string trimmed = b64;
+        while (trimmed.Length > 0 && trimmed[trimmed.Length - 1] == '=') {
+            trimmed = trimmed.Substring(0, trimmed.Length - 1);
+        }
+        return "SHA256:" + trimmed;
+    }
+
+    // 对消息（交换哈希）签名，返回 SSH 签名 blob。
+    public byte[] Sign(byte[] message) {
+        if (this.privateKey == null) {
+            throw new SshException(SshError.Internal, "host key has no private key");
+        }
+        if (message == null || message.Length == 0) {
+            throw new SshException(SshError.Internal, "cannot sign an empty message");
+        }
+        List<int> outLen = new List<int>();
+        outLen.Add(0);
+        string msg = message;
+        byte[] der = Ecdsa.SignSha256Det(msg, message.Length, this.privateKey, outLen);
+        if (der == null) {
+            throw new SshException(SshError.Internal, "ECDSA signing failed");
+        }
+        List<BigInt> rs = new List<BigInt>();
+        if (!Ecdsa.ParseSigDer(der, outLen[0], rs) || rs.Count != 2) {
+            throw new SshException(SshError.Internal, "cannot parse the ECDSA signature");
+        }
+        byte[] rBytes = rs[0].ToBytesBE(32);
+        byte[] sBytes = rs[1].ToBytesBE(32);
+        // 两个 mpint 装在一个 string 里（RFC 5656 §3.1.2）。
+        SshWriter blob = new SshWriter(80);
+        blob.WriteMpint(rBytes);
+        blob.WriteMpint(sBytes);
+        SshWriter w = new SshWriter(160);
+        w.WriteText(this.algorithm);
+        w.WriteString(blob.ToArray());
+        return w.ToArray();
+    }
+
+    // 验签：SSH 签名 blob + 消息 → 是否是这把主机密钥签的。
+    public static bool Verify(byte[] hostKeyBlob, byte[] message, byte[] signatureBlob) {
+        if (hostKeyBlob == null || message == null || signatureBlob == null) {
+            return false;
+        }
+        SshHostKey key = SshHostKey.Parse(hostKeyBlob);
+        SshReader r = new SshReader(signatureBlob);
+        string algorithm = r.ReadText();
+        if (algorithm != key.algorithm) {
+            return false;
+        }
+        byte[] rBytes = null;
+        byte[] sBytes = null;
+        // RFC 写法：算法名后面是一个装着两个 mpint 的 string。
+        try {
+            byte[] blob = r.ReadString();
+            SshReader inner = new SshReader(blob);
+            byte[] rr = inner.ReadMpint();
+            byte[] ss = inner.ReadMpint();
+            if (inner.Remaining() == 0) { rBytes = rr; sBytes = ss; }
+        } catch (SshException ex) {
+            rBytes = null;
+            sBytes = null;
+        }
+        if (rBytes == null || sBytes == null) {
+            // 兜底：兼容"算法名后直接跟两个 mpint"的扁平写法。
+            try {
+                SshReader flat = new SshReader(signatureBlob);
+                flat.ReadText();
+                rBytes = flat.ReadMpint();
+                sBytes = flat.ReadMpint();
+            } catch (SshException ex) {
+                return false;
+            }
+        }
+        if (rBytes.Length == 0 || sBytes.Length == 0) { return false; }
+        // ECDSA 验签要 DER 编码的签名，这里把 SSH 的 (r, s) 装回 DER。
+        string rStr = rBytes;
+        string sStr = sBytes;
+        BigInt rv = BigInt.FromBytesBE(rStr, rBytes.Length);
+        BigInt sv = BigInt.FromBytesBE(sStr, sBytes.Length);
+        List<int> outLen = new List<int>();
+        outLen.Add(0);
+        byte[] der = Ecdsa.EncodeSigDer(rv, sv, outLen);
+        if (der == null) {
+            return false;
+        }
+        byte[] px = new byte[32];
+        byte[] py = new byte[32];
+        for (int i = 0; i < 32; i = i + 1) {
+            px[i] = key.point[1 + i];
+            py[i] = key.point[33 + i];
+        }
+        string msg = message;
+        return Ecdsa.VerifySha256(msg, message.Length, der, outLen[0], px, py);
+    }
+}
