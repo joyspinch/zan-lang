@@ -12,10 +12,21 @@ using System.Threading;
 class Program {
     static Worker srv;
     static List<SseConnection> subs;
+    // 订阅者回调在服务端的 IO 线程上跑，客户端那条线在协程里跑——两行
+    // stdout 谁先落地是**不确定的**。原来直接各打各的，golden 里又写死了
+    // "subscriber on" 在 "client connected" 之前，于是这条用例大约三次里
+    // 挂一次。
+    //
+    // 改法不是"调一调顺序碰运气"，而是**建立真实的先后关系**：订阅者
+    // 回调跑起来才 signal 这扇门，客户端等门开了再打 "client connected"。
+    // 这样那两行之间的顺序是**协议保证的**（握手完成必然早于连接回报），
+    // 不是碰运气。
+    static Gate subscribed;
 
     static async void OnSubscriber(SseConnection c) {
         Console.WriteLine("subscriber on " + c.Path());
         subs.Add(c);
+        subscribed.Signal();
         await c.SendAsync("tick", "hello");
         await c.PingAsync();
         await c.SendAsync("multi", "line1\nline2");
@@ -26,6 +37,7 @@ class Program {
     static async int Run() {
         Socket.Initialize();
         subs = new List<SseConnection>();
+        subscribed = new Gate();
         srv = new Worker("sse", "127.0.0.1", 9510);
         // sse 编解码按需编译，且回调移到分片静态字段
         // （Worker.zan 的回调表注明 shard static）——装分片、挂静态。
@@ -38,6 +50,10 @@ class Program {
         Task.Spawn(Worker.RunAllLoopsOnSockets(socks));
 
         SseClient c = await SseClient.ConnectAsync("127.0.0.1", 9510, "/events");
+        // 等订阅者回调真的跑起来，再打 "client connected"——这样那两行的
+        // 先后是**协议保证**的（握手完成必然早于连接回报），不是两个线程
+        // 抢 stdout 的运气。
+        await subscribed.Wait(5000);
         Console.WriteLine("client connected: " + Convert.ToString(c.IsConnected()));
         int n = 0;
         while (true) {

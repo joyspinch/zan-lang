@@ -1535,8 +1535,12 @@ static void emit_arc_trace_call(zan_irgen_t *g, LLVMValueRef ev_fn,
     LLVMTypeRef i64t = LLVMInt64TypeInContext(g->ctx);
     LLVMTypeRef i32t = LLVMInt32TypeInContext(g->ctx);
     LLVMTypeRef ra_ty = LLVMFunctionType(i8p, (LLVMTypeRef[]){ i32t }, 1, 0);
+    /* 声明而不是只查：只查的话，查不到就整段 return——ARC trace 事件被
+     * 静默丢弃，而编译一个字都不说。当前靠「调用点都在 check_leaks 分支
+     * 里、那里已声明过该 intrinsic」才不出事，但那是跨函数的隐式耦合：
+     * 将来把调用点挪到别处，trace 就会无声地少一串记录。 */
     LLVMValueRef ra_fn = LLVMGetNamedFunction(g->mod, "llvm.returnaddress");
-    if (!ra_fn) return;
+    if (!ra_fn) ra_fn = LLVMAddFunction(g->mod, "llvm.returnaddress", ra_ty);
     LLVMValueRef ra_arg = LLVMConstInt(i32t, 0, 0);
     LLVMValueRef ra = zan_call2(g->builder, ra_ty, ra_fn, &ra_arg, 1, "tra");
     LLVMValueRef tagc = zan_irgen_intern_string(g, tag);
