@@ -151,6 +151,7 @@ public class PropertyGrid : Control {
             }
             r.minusId = WidgetId.Next();
             r.plusId = WidgetId.Next();
+            r.resetId = WidgetId.Next();
             rows.Add(r);
         }
         hitRow = 0 - 1;
@@ -259,6 +260,38 @@ public class PropertyGrid : Control {
         app.RequestRedraw();
     }
 
+    // 该行是否需要"恢复默认值"入口（当前值与声明的默认值不同）。
+    bool RowNeedsReset(int i) {
+        if (i < 0 || i >= data.Count) { return false; }
+        PropSpec p = data[i];
+        if (!p.hasDef) { return false; }
+        return p.Read() != p.defVal;
+    }
+
+    // 把第 i 行复位到默认值（VS 的"恢复默认值"）：写回模型、
+    // 同步编辑器、广播改动（经 BeforeChange 走撤销栈钩子）。
+    void ResetToDefault(int i) {
+        if (i < 0 || i >= data.Count) { return; }
+        PropSpec p = data[i];
+        if (!p.hasDef || !p.IsBound()) { return; }
+        if (this.BeforeChange != null) {
+            this.BeforeChange(p.key);
+        }
+        p.Write(p.defVal);
+        if (i < rows.Count) {
+            this.Load(i, p.defVal);
+            rows[i].shadow = p.Read();
+        }
+        hitRow = i;
+        Change.PostS(this);
+    }
+
+    // 绘制期复位：写回模型并立即请求重绘（按钮随值复位而消失）。
+    void Reset(App app, int i) {
+        this.ResetToDefault(i);
+        app.RequestRedraw();
+    }
+
     // 画一个步进小按钮（方形，中间一个字符字形），注册命中区，
     // 返回本帧是否被点击。
     bool StepBtn(App app, int id, int x, int y, int sz, string glyph,
@@ -320,10 +353,27 @@ public class PropertyGrid : Control {
         int eh = app.Scale(24);
         int ey = cy + (ch - eh) / 2;
 
+        // "恢复默认值"（VS 口径）：当前值与默认值不同的行才给复位入口，
+        // 画在属性名右侧——VS 的属性下拉箭头也在那个位置。
+        bool showReset = this.RowNeedsReset(i);
+        int resetSz = app.Scale(14);
+        int labelTextW = flabelW - t.gapSmall;
+        if (showReset) { labelTextW = labelTextW - resetSz - app.Scale(4); }
         c.DrawText(cx, Canvas.CenterTextY(cy, ch, fs),
-            Ellipsis.Fit(p.label, flabelW - t.gapSmall, fs),
+            Ellipsis.Fit(p.label, labelTextW, fs),
             valueStyle.FgOr(0), fs);
-
+        if (showReset) {
+            int rx = cx + flabelW - resetSz - app.Scale(2);
+            int ry = cy + (ch - resetSz) / 2;
+            app.hitTester.RegisterRect(r.resetId, rx, ry, resetSz, resetSz, 0);
+            if (Ui.Over(app, rx, ry, resetSz, resetSz)) {
+                c.FillRoundRect(rx - app.Scale(2), ry - app.Scale(2),
+                    resetSz + app.Scale(4), resetSz + app.Scale(4),
+                    app.Scale(3), rowHoverStyle.BgOr(0));
+            }
+            c.DrawGlyph("refresh", rx, ry, resetSz, valueStyle.FgOr(0));
+            if (Ui.Clicked(app, r.resetId)) { this.Reset(app, i); }
+        }
         if (p.kind == 2) {
             int swH = app.Scale(18);
             int swY = cy + (ch - swH) / 2;
