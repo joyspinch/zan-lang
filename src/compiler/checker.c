@@ -320,6 +320,20 @@ static void checker_add_local(zan_checker_t *c, zan_istr_t name,
     c->locals = l;
 }
 
+/* 把名字放进作用域，**不**因为类型未知而丢弃：类型未知时记成 error 类型，
+ * 让引用它的检查安静降级（而不是落到"同名类字段"上去）。 */
+static void checker_add_local_permissive(zan_checker_t *c, zan_istr_t name,
+                                         zan_type_t *type) {
+    struct checker_local *l = (struct checker_local *)
+        zan_arena_alloc(c->arena, sizeof(struct checker_local));
+    l->name = name;
+    l->type = (type && type != c->binder->type_error) ? type
+                                                       : c->binder->type_error;
+    l->null_src = NULL;
+    l->next = c->locals;
+    c->locals = l;
+}
+
 static void checker_mark_local_null_src(zan_checker_t *c, zan_ast_node_t *decl) {
     zan_ast_node_t *init = decl->var_decl.initializer;
     if (!init || init->kind != AST_CALL || init != c->last_call_node) return;
@@ -3327,9 +3341,47 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
 
     case AST_LAMBDA:
         no_runtime_reject(c, expr->loc, "a lambda");
-        for (int i = 0; i < expr->lambda.params.count; i++) {
+        /* lambda 体要过类型检查：它有自己的作用域（形参 + 局部变量），并且
+         * **不受外层方法的返回类型约束**——lambda 的返回类型在检查器这里还
+         * 不知道（委托类型是从使用现场推出来的），拿外层方法的返回类型去判
+         * lambda 里的 `return` 会误报。自举侧同口径（checker.zan 的
+         * AK.Lambda 分支把 curRet 置空）。 */
+        {
+            /* 作用域是**嵌套**的：lambda 体看得见外层的局部与形参（Zan 的
+             * 闭包会捕获它们），lambda 自己的形参与局部加在前面遮住同名；
+             * 出 lambda 时把链头还原，外层的作用域原样留着。 */
+            struct checker_local *saved_locals = c->locals;
+            zan_type_t *saved_ret = c->current_return_type;
+            c->current_return_type = NULL;
+            zan_ast_node_t *saved_body = c->current_body;
+            c->current_body = expr->lambda.body;
+            for (int i = 0; i < expr->lambda.params.count; i++) {
+                zan_ast_node_t *p = expr->lambda.params.items[i];
+                if (p && p->kind == AST_PARAM) {
+                    zan_type_t *pt = p->param.type
+                        ? zan_binder_resolve_type(c->binder, p->param.type)
+                        : NULL;
+                    /* 无类型的 lambda 形参（`x => ...`，类型由使用现场的委托
+                     * 定型）**也要进作用域**：不进的话，体里的 `x` 会落到
+                     * `checker_find_field`——解析成外层类的同名字段，类型对不上
+                     * 就是一条假阳性（例如类里有 `string count` 字段、lambda
+                     * 形参也叫 `count`）。类型先记成 error：委托的形参类型是
+                     * 在使用现场推出来的，检查器这里不知道，error 类型让
+                     * 后续检查安静降级（`checker_check_assignable` 见到
+                     * error 就直接返回）。 */
+                    checker_add_local_permissive(c, p->param.name, pt);
+                }
+            }
+            if (expr->lambda.body) {
+                if (expr->lambda.body->kind == AST_BLOCK)
+                    zan_checker_check_stmt(c, expr->lambda.body);
+                else
+                    zan_checker_check_expr(c, expr->lambda.body);
+            }
+            c->current_body = saved_body;
+            c->current_return_type = saved_ret;
+            c->locals = saved_locals;
         }
-        zan_checker_check_expr(c, expr->lambda.body);
         return c->binder->type_error;
 
     case AST_THIS_EXPR:

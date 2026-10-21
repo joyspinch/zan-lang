@@ -442,6 +442,14 @@ kernel32、shell32、user32、advapi32、version）。
     `return` 会误报（自举侧同口径：`curRet = null`，见 §36）。
   - **`c->current_body` 换成 lambda 的体**：可空接收者规则的空值守卫分析
     （`node_guards_null`）要在 **lambda 自己的体**里找守卫，不该翻外层方法体。
+- ⚠ **别把自举当成同款受害者**：自举的检查器**本来就下钻 lambda 体**
+  （`src/selfhost/checker.zan` 的 `AK.Lambda` 分支在 **`CheckExpr`** 里——不是
+  `CheckStmt`：`ScopeMark` → 形参入作用域 → `curRet = null` → `CheckExpr(n.a)`
+  （表达式体）+ `CheckStmt(n.d)`（块体）→ 还原）。实测自举会报 lambda 体里的
+  "undefined identifier"。A471 的洞**只在宿主**这边。
+  顺带：自举的检查器是**部分实现**——它没有宿主那种通用隐式转换检查
+  （`int y = "hello";` 在自举的**方法体**里也不报），所以"lambda 里的类型错误
+  静默通过"这个症状在自举侧压根不成立。
 - 坑（连带，2026-10-21 实测）：检查器不下钻 lambda 体，**不止 await 这一条规则**——
   lambda 体里的**类型错误也全部漏检**：`Func<int> f = () => { int x = "hello";
   return x; };` 编译通过、运行时 `f()` 返回 `-1065074624`（把字符串指针当 int

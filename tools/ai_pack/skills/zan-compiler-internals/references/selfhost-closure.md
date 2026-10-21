@@ -423,20 +423,41 @@ kernel32、shell32、user32、advapi32、version）。
   supported: a lambda is not a coroutine`。边界：**同步方法**里的同样写法合法
   （外面没有协程，根驱动等得到）——判据是"外层有没有协程帧"，不是"外面是不是
   lambda"。
-- 坑（实测）：这条诊断**做不进检查器**——检查器**不遍历 lambda 的函数体**
-  （`AST_LAMBDA` 分支把体丢给 `check_expr`，而体是语句块，`check_expr` 没有
-  语句分支 → 体根本没被走；`current_return_type` 也还是外层方法的，走进去会把
-  lambda 的 `return` 拿外层返回类型判，误报）。宿主侧要落在 **irgen**：那里有
-  lambda 深度与协程帧的上下文（发射 lambda 时把 `current_async_frame` 置空，
-  "外层有没有帧" = "外层方法是不是 async"）。自举侧相反：它的 AST 有通用子
-  节点表，**检查器**里就能查（`FindAwaitInLambda`）。
+- 坑（2026-10-21 修 A471 时改掉）：这条诊断**曾经做不进检查器**——检查器
+  **不遍历 lambda 的函数体**（`AST_LAMBDA` 分支把体丢给 `check_expr`，而体是
+  语句块，`check_expr` 没有语句分支 → 体根本没被走）。现在检查器**下钻 lambda
+  体**了（见下一条），但这条 await 规则**仍留在 irgen**：判据是"外层有没有
+  协程帧"，这个上下文只有发码时才知道（发射 lambda 时按 `saved_async_frame !=
+  NULL` 判；检查器那边根本没有"当前方法是不是 async"的概念——`async Task<T>` 的
+  返回类型是解析器改写掉的）。自举侧相反：它的 AST 有通用子节点表，**检查器**里
+  就能查（`FindAwaitInLambda`）。
+- 做法（A471，2026-10-21）：`checker.c` 的 `AST_LAMBDA` 分支按**体的形态**分派
+  （`AST_BLOCK` → `zan_checker_check_stmt`，否则 → `zan_checker_check_expr`），
+  并且三件事必须配套：
+  - **作用域是嵌套的**：`c->locals` 链头存起来，lambda 的**形参**加在链头
+    （闭包要捕获外层的局部与形参，它们必须**可见**），出 lambda 还原链头；把
+    `c->locals` 置空会误报"未定义"。
+  - **`c->current_return_type = NULL`**：lambda 的返回类型在检查器这里**不知道**
+    （委托类型是从使用现场推出来的），拿外层方法的返回类型去判 lambda 的
+    `return` 会误报（自举侧同口径：`curRet = null`，见 §36）。
+  - **`c->current_body` 换成 lambda 的体**：可空接收者规则的空值守卫分析
+    （`node_guards_null`）要在 **lambda 自己的体**里找守卫，不该翻外层方法体。
+- ⚠ **别把自举当成同款受害者**：自举的检查器**本来就下钻 lambda 体**
+  （`src/selfhost/checker.zan` 的 `AK.Lambda` 分支在 **`CheckExpr`** 里——不是
+  `CheckStmt`：`ScopeMark` → 形参入作用域 → `curRet = null` → `CheckExpr(n.a)`
+  （表达式体）+ `CheckStmt(n.d)`（块体）→ 还原）。实测自举会报 lambda 体里的
+  "undefined identifier"。A471 的洞**只在宿主**这边。
+  顺带：自举的检查器是**部分实现**——它没有宿主那种通用隐式转换检查
+  （`int y = "hello";` 在自举的**方法体**里也不报），所以"lambda 里的类型错误
+  静默通过"这个症状在自举侧压根不成立。
 - 坑（连带，2026-10-21 实测）：检查器不下钻 lambda 体，**不止 await 这一条规则**——
   lambda 体里的**类型错误也全部漏检**：`Func<int> f = () => { int x = "hello";
   return x; };` 编译通过、运行时 `f()` 返回 `-1065074624`（把字符串指针当 int
   读出来），而同一段代码放进方法体正常报 `cannot convert 'string' to 'int'`。
-  根因同上（`AST_LAMBDA` 把语句块丢给没有语句分支的 `check_expr`）。要修得让
-  检查器真正走 lambda 的语句体（含形参作用域与返回类型），代价是全仓所有 lambda
-  体一次性进入类型检查——独立战线，见仓库任务台账 A471。
+  根因同上（`AST_LAMBDA` 把语句块丢给没有语句分支的 `check_expr`）。A471 修完
+  后这类漏检归零，但**代价是全仓所有 lambda 体一次性进入类型检查**——被新规则
+  抓出来的多是**真 null-deref**（`WxNet.DataOf(x).Str(...)`：应答里没有 `data`
+  节点时 `DataOf` 返回 null），修法是"先存局部量再判空"，不是放宽规则。
 - 门：差分门除了"能编且输出逐字一致"的用例，还多了一份 **reject 列表**
   （`tests/selfhost/reject_cases.txt` + `tests/selfhost/reject/<name>.zan`）：
   这些程序自举**必须拒绝**——非零退出**且不落 IR**。fail-closed 的边界要有门
@@ -671,6 +692,9 @@ kernel32、shell32、user32、advapi32、version）。
   型），所以函数体里的 `return` **不查**（既不查"void 方法不能返回值"，也不
   查"必须返回值"）。实现上给检查器加一个 `curRetKnown` 标志：方法体为
   true，lambda 体为 false。
+- 宿主侧同口径的等价做法（A471，2026-10-21）：`checker.c` 下钻 lambda 体时把
+  `c->current_return_type` 置空（不是"设成 void"，是**置空**——置成 void 会把
+  "void 方法不能返回值"那条误报又请回来）。
 - 为什么值得单独记：这条假阳性会**挡掉**别的诊断对齐——`Task.Run(delegate ()
   { return 5; })` 在宿主侧报的是 Task.Run 专属的那条（"Task.Run delegate
   must be a parameterless void body (an Action); pass an async call for

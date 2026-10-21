@@ -1260,6 +1260,18 @@ add_test(NAME diag_await_in_lambda
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_await_in_lambda PROPERTIES TIMEOUT 60)
 
+# lambda 体里的类型错误必须被类型检查抓到：改前 `AST_LAMBDA` 分支把体当
+# 表达式交给 check_expr，而块体 lambda 的体是语句块 → 整块体从来没进过类型
+# 检查，`int x = "hello"` 编译期一个字都不说，运行期把字符串指针当 int 读。
+add_test(NAME diag_lambda_body_type_error
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/lambda_body_type_error.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_lambda_body_type_error${_exe_ext}
+    "-DEXPECT_REGEX=cannot convert .string. to .int. in initializer: no implicit conversion"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_lambda_body_type_error PROPERTIES TIMEOUT 60)
+
 
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
 # 拿 strlen 去量对象指针，越界读进程内存（打印出进程映像里的符号名并把程序

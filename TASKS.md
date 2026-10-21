@@ -33,39 +33,6 @@
 - 关联：A468（await 的宿主/自举口径）、§26（await 判据）。
 
 
-### [ ] A471 类型检查器不下钻 lambda 体——lambda 里的类型错误全部静默通过
-
-- 现象（2026-10-21 查 `await` 规则时实测）：**块体 lambda 的函数体完全不过类型检查**。
-  同一段代码放在方法体里报错，放进 lambda 里编译通过：
-
-  ```zan
-  int y = "hello";                    // 方法体：error: cannot convert 'string' to 'int'
-  Func<int> f = () => { int x = "hello"; return x; };   // lambda 体：无任何诊断
-  ```
-
-  实测该程序 `f()` 返回 `-1065074624`（把字符串指针当 int 读出来），编译期一个字都不说。
-- 根因：`src/compiler/checker.c` 的 `AST_LAMBDA` 分支把 **lambda 体当表达式**交给
-  `zan_checker_check_expr`；而块体 lambda 的 `lambda.body` 是 `AST_BLOCK` **语句**节点
-  （`parser.c` 的 `parse_block`），`zan_checker_check_expr` 的 `default:` 分支直接
-  `return c->binder->type_error`、**不下钻** → 整块 lambda 体的语句从来没进过类型检查。
-  未定义变量仍会报错，但那是 `nsresolve.c` 的名字解析阶段抓的，不是类型检查。
-- 连带影响（比"漏报"更严重）：**凡是挂在 checker 的 `AST_LAMBDA` 分支上的语义规则都
-  永远不会触发**。2026-10-21 那条「async 方法里 lambda 内部的 await 要拒绝」最初就
-  挂在 checker（用 `lambda_depth` 计数），结果一条都报不出来——程序继续走到 irgen，
-  生成跨函数的 `br`，LLVM 校验直接失败（"Referring to a basic block in another
-  function"），只吐一句 "code generation failed"，看不出是哪个 await 的问题。同一条
-  规则挪到 irgen（发码阶段才知道外层是不是协程）才真正报得出来。自举那边同样不下钻
-  lambda 体——它找 lambda 里的 await 靠的是**语法遍历**（`FindAwaitInLambda`），
-  不是类型检查。
-- 方向：`AST_LAMBDA` 分支按体的形态分派——`AST_BLOCK` 走 `zan_checker_check_stmt`
-  （并给 lambda 建自己的作用域：形参 + 局部变量），表达式体走 `zan_checker_check_expr`；
-  同时把 lambda 的返回类型与 `current_type_sym` 摆好。**代价**：这一步会一次性打开
-  全仓（stdlib + packages + templates + examples）所有 lambda 体的类型检查，之前被
-  吞掉的类型错误会成批冒出来——属于独立战线，要单独做、单独扫，不能顺手带。
-- 关联：`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26
-  （await 的判据与 lambda 内 await 的落点）、自举 `src/selfhost/checker.zan` 的
-  `CheckAwaits` / `FindAwaitInLambda`。
-
 ### [ ] A469 编译器不支持「嵌套类型的数组」——`Outer.Inner[]` 报 undefined type
 
 - 现象（2026-10-21 落地 `Zan.Barcode` 时实测）：**嵌套类型**做数组元素类型
@@ -1553,3 +1520,28 @@
   走成员存在性检查，只是措辞区分成"没有这个方法"）；诊断里的类名改用面向用户的
   名字（binder 的类型名或源文件名），不要用内部符号名。
 - 关联：A475（同一类"公开面/成员存在性"问题）、A471（checker 漏检）。
+
+### [ ] A477 自举检查器没有通用隐式转换检查——`int y = "hello";` 在自举里编译通过
+
+- 现象（2026-10-21 修 A471 时实测，探针 `_scratch/sh_method_conv_probe.zan`，
+  gen1 直接跑 `build\selfhost_gen1.exe out.ll probe.zan`）：自举的检查器**不实现
+  宿主那种通用的隐式转换检查**——`int y = "hello";` 放在**方法体**里，宿主报
+  `cannot convert 'string' to 'int' in initializer: no implicit conversion`，
+  **自举一个字都不说**（gen1 退出码 0，IR 照写）。
+- 机制：自举 `src/selfhost/checker.zan` 的 `CheckStmt(AK.VarDecl)` 只做两条
+  **Task 专属**的检查（`CheckTaskNoResult` / `CheckTaskOnlyHandle`），没有通用的
+  "目标类型 vs 值类型"比较；整个文件里 "cannot convert" 的措辞只出现在那两条
+  Task 规则里。
+- 影响：自举编译出来的编译器**放得过宽**——把字符串指针当 int 用这类问题要到运行期
+  才炸（宿主侧同类程序实测 `f()` 返回 `-1065074624`）。A471 修完后宿主在 **lambda
+  体里**也查了，自举仍然放过 → 同一段代码两边判定开始分叉（宿主拒、自举收）。
+- ⚠ 顺带纠正一个**误传**：A471 的旧描述说"自举那边同样不下钻 lambda 体"——**不对**。
+  自举的 `AK.Lambda` 分支在 `CheckExpr` 里（不是 `CheckStmt`）：`ScopeMark` →
+  形参入作用域 → `curRet = null` → `CheckExpr(n.a)`（表达式体）+ `CheckStmt(n.d)`
+  （块体）→ 还原。实测自举会报 lambda 体里的 `undefined identifier`（探针
+  `_scratch/sh_lambda_undef_probe.zan`）。**A471 的洞只在宿主这边。**
+- 方向：给自举的 `CheckStmt(AK.VarDecl)` / `CheckStmt(AK.ReturnStmt)` 补一条通用的
+  可赋值性检查，措辞与宿主**逐字一致**（`cannot convert 'X' to 'Y' in initializer:
+  no implicit conversion`），并给 `tests/selfhost/reject_cases.txt` 加三段式拒绝用例
+  （`name|||自举措辞|||宿主措辞`）把这条边界钉住。
+- 关联：A471（宿主侧同一条战线）、`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26/§36。
