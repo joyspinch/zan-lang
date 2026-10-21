@@ -290,6 +290,7 @@ public class Ai {
         StringBuilder full = new StringBuilder();
         string pending = "";
         bool finished = false;
+        string streamError = "";
         while (!finished) {
             string piece = sink.Take();
             if (piece.Length == 0) {
@@ -309,11 +310,17 @@ public class Ai {
             while (nl >= 0) {
                 string line = pending.Substring(0, nl).Trim();
                 pending = pending.Substring(nl + 1);
-                string delta = Delta(line);
-                if (delta.Length > 0) {
-                    full.Append(delta);
+                AiStreamFrame f = Delta(line);
+                if (f.kind == "error") {
+                    /* 流内错误帧：不是"用户断开"，也不是传输层错误。 */
+                    streamError = f.text;
+                    finished = true;
+                    break;
+                }
+                if (f.kind == "delta") {
+                    full.Append(f.text);
                     AiDeltaDoc d = new AiDeltaDoc();
-                    d.text = delta;
+                    d.text = f.text;
                     if (!await ctx.SseSend("delta",
                     Json.Serialize<AiDeltaDoc>(d))) {
                         /* 用户关闭面板：先让 producer 在安全的 transport
@@ -327,6 +334,30 @@ public class Ai {
                 }
                 nl = pending.IndexOf("\n");
             }
+            if (finished) { break; }
+        }
+
+        /* 流结束时可能还剩半行：对端把最后一帧发了但**没以换行收尾**
+         * （SSE 允许这样收尾，最后一个事件不必有空行）。这半行要按
+         * 完整的一行处理，否则最后一个分片会被**静默丢掉**——收流
+         * 正常结束、内容却少一截，且没有任何错误提示。 */
+        if (streamError.Length == 0 && pending.Trim().Length > 0) {
+            AiStreamFrame f = Delta(pending.Trim());
+            if (f.kind == "error") {
+                streamError = f.text;
+            } else if (f.kind == "delta") {
+                full.Append(f.text);
+                AiDeltaDoc d = new AiDeltaDoc();
+                d.text = f.text;
+                if (!await ctx.SseSend("delta",
+                Json.Serialize<AiDeltaDoc>(d))) {
+                    sink.Abort();
+                    await WaitStreamProducer(producer);
+                    sink.Dispose();
+                    http.Close();
+                    return AiReply.Bad("客户端已断开");
+                }
+            }
         }
         await WaitStreamProducer(producer);
         string outcome = sink.Attempt();
@@ -334,6 +365,9 @@ public class Ai {
         sink.Dispose();
         /* 关掉连接池里的 keep-alive 连接（流式结束后上游已读完）。 */
         http.Close();
+        if (streamError.Length > 0) {
+            return AiReply.Bad("请求 AI 服务失败：" + streamError);
+        }
         if (text.Length == 0) {
             if (outcome.StartsWith("err:")) {
                 return AiReply.Bad("请求 AI 服务失败：" + outcome.Substring(4).Trim());
@@ -343,22 +377,41 @@ public class Ai {
         return AiReply.Good(text);
     }
 
-    /* 从 OpenAI 流式 `data:` 行提取增量文本，keep-alive/终止行返回空串。 */
-    private static string Delta(string line) {
-        if (!line.StartsWith("data:")) { return ""; }
+    /* 从 OpenAI 流式 `data:` 行解析出增量文本 / 流内错误 / 空行。
+     *
+     * provider 可以在 SSE **数据里**报错（HTTP 状态码仍是 200）。这种
+     * 帧必须报给调用方——否则调用方拿到半截内容 + 空错误，看起来像
+     * "正常结束"，实际是上游炸了。
+     */
+    public static AiStreamFrame Delta(string line) {
+        if (!line.StartsWith("data:")) { return AiStreamFrame.Skip(); }
         string payload = line.Substring(5).Trim();
-        if (payload.Length == 0 || payload == "[DONE]") { return ""; }
-        JsonValue v = JsonValue.Parse(payload);
-        if (v == null) { return ""; }
+        if (payload.Length == 0 || payload == "[DONE]") { return AiStreamFrame.Skip(); }
+        JsonValue v = null;
+        try {
+            v = JsonValue.Parse(payload);
+        } catch (Exception e) {
+            /* 坏帧跳过，不让整条流断掉。 */
+            return AiStreamFrame.Skip();
+        }
+        if (v == null) { return AiStreamFrame.Skip(); }
+        JsonValue frameError = v.Get("error");
+        if (frameError != null && !frameError.IsNull()) {
+            string reason = frameError.Str("message", "");
+            if (reason.Length == 0) { reason = "流内错误帧"; }
+            return AiStreamFrame.Error(reason);
+        }
         JsonValue choices = v.Get("choices");
         if (choices == null || !choices.IsArray() || choices.Count() == 0) {
-            return "";
+            return AiStreamFrame.Skip();
         }
         JsonValue first = choices.At(0);
-        if (first == null) { return ""; }
+        if (first == null) { return AiStreamFrame.Skip(); }
         JsonValue delta = first.Get("delta");
-        if (delta == null) { return ""; }
-        return delta.Str("content", "");
+        if (delta == null) { return AiStreamFrame.Skip(); }
+        string piece = delta.Str("content", "");
+        if (piece.Length == 0) { return AiStreamFrame.Skip(); }
+        return AiStreamFrame.Delta(piece);
     }
 
     /* 读取服务商 /models 端点返回的模型列表。 */

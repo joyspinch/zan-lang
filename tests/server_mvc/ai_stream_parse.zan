@@ -1,0 +1,77 @@
+// MVC 层 AI 流式解析的边界行为。
+//
+// 这里盯的是 `Ai.Delta` 这一行解析函数——MVC 的 AI 流式对话（网页端
+// 助手）走的就是它。三个曾经真实存在的缺陷全在这一层：
+//
+// 1. **坏帧直接抛异常**：`JsonValue.Parse` 遇到坏 JSON 是抛异常的，
+//    不是返回 null。原来这里直接调它，一个畸形帧就炸掉整条流——
+//    用户看到的是"AI 助手崩了"，而不是"这一帧没认出来"。
+//
+// 2. **流内错误帧被跳过**：provider 可以在 SSE **数据里**报错（HTTP
+//    状态码仍是 200）。这种帧没有 choices、没有 delta，被当成"没有
+//    增量"跳过——调用方拿到半截内容 + 空错误，看起来像"正常结束"，
+//    实际是上游炸了。
+//
+// 3. **收尾不靠换行**：SSE 允许最后一帧**不以换行收尾**（最后一个事件
+//    不必带空行）。只在遇到 "\n" 时才处理行的解析器，流结束时缓冲区
+//    里剩下的那半行会被**静默丢掉**——收流正常结束、内容却少一截，
+//    且没有任何错误提示。
+//
+// 第 3 条不在本用例里直接断言（它属于行缓冲那一层），但坏帧与流内
+// 错误帧在这里逐条钉住。
+using System;
+using ZanWeb.Ai;
+
+class Program {
+    static int bad = 0;
+
+    static void Check(string what, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            Program.bad = Program.bad + 1;
+        }
+    }
+
+    static void Main() {
+        // ---- 1. 正常增量 ----
+        AiStreamFrame f = Ai.Delta(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
+        Check("kind", f.kind == "delta");
+        Check("text", f.text == "Hello");
+
+        // ---- 2. keep-alive / [DONE] / 非 data 行 → skip ----
+        Check("empty", Ai.Delta("").kind == "skip");
+        Check("keepalive", Ai.Delta(": ping").kind == "skip");
+        Check("done", Ai.Delta("data: [DONE]").kind == "skip");
+        Check("event", Ai.Delta("event: message").kind == "skip");
+        Check("nodelta", Ai.Delta("data: {\"choices\":[]}").kind == "skip");
+        Check("nchoices", Ai.Delta("data: {\"foo\":1}").kind == "skip");
+        // content 为 null 的首帧（真实 provider 常见）→ skip，不算错
+        Check("nullcontent", Ai.Delta(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\","
+            + "\"content\":null}}]}").kind == "skip");
+
+        // ---- 3. 坏帧 → skip，**不能抛异常** ----
+        // 这是最关键的一条：原来这里直接 Parse，坏 JSON 抛异常，
+        // 整条流就此断掉。
+        Check("badjson", Ai.Delta("data: {不是 JSON").kind == "skip");
+        Check("badjson2", Ai.Delta("data: ").kind == "skip");
+        Check("badjson3", Ai.Delta("data: {\"a\":").kind == "skip");
+        // 坏帧之后的正常帧仍要能解析（跳过不等于断流）
+        Check("afterbad", Ai.Delta(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}").text == "A");
+
+        // ---- 4. 流内错误帧 → error，带可读原因 ----
+        AiStreamFrame e = Ai.Delta(
+            "data: {\"error\":{\"message\":\"upstream exploded\","
+            + "\"type\":\"server_error\"}}");
+        Check("errkind", e.kind == "error");
+        Check("errtext", e.text == "upstream exploded");
+        // 没有 message 的错误帧也要给得出原因，不能是空串
+        Check("errmsg", Ai.Delta("data: {\"error\":{}}").kind == "error");
+        Check("errmsg2", Ai.Delta("data: {\"error\":{}}").text.Length > 0);
+
+        Console.WriteLine("mvc-ai-stream-parse-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        Environment.Exit(bad == 0 ? 0 : 1);
+    }
+}

@@ -923,6 +923,15 @@ false → 主动停止**（中止上游、返回已收到的全文，且**主动
 是半截内容 + 空 `lastError`，看起来像"正常结束"，实际是上游炸了——错误
 之前收到的内容仍交回，但 `lastError` 一定有原因））。
 
+Web 框架那一侧（`Zan.Mvc/Framework/Ai`，网页端助手走的就是它）曾有
+**同样的三个缺陷**，现已修掉并由 `server_mvc_ai_stream_parse` 钉住：
+**坏帧直接抛异常**（`JsonValue.Parse` 遇坏 JSON 是抛异常而非返回 null，
+一个畸形帧就炸掉整条流——用户看到"AI 助手崩了"而不是"这帧没认出来"）、
+**流内错误帧被跳过**（调用方拿到半截内容 + 空错误）、**收尾不靠换行**
+（残留半行被静默丢掉）。三态结果用实体 `AiStreamFrame`
+（`kind` = delta / error / skip）表达，不用"魔法字符串前缀"让调用方靠
+`StartsWith` 猜。
+
 conformance `async_sync_delay`（**非 async 方法里的 `await Task.Delay(ms)`
 必须真的等**：编译器原来在"顶层非异步上下文"分支**只查**模块里的 `Sleep`
 （Win32 API）/ `poll`（libc 符号）——`LLVMGetNamedFunction` 找不到就返回

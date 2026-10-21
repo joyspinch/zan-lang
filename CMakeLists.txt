@@ -2187,6 +2187,22 @@ add_test(NAME server_mvc_metrics_flush_retry
 set_tests_properties(server_mvc_metrics_flush_retry PROPERTIES TIMEOUT 180
   LABELS "full;standard;smoke")
 
+# The web AI chat parses SSE lines in ZanWeb.Ai.Ai.Delta. Three defects
+# lived there: a malformed frame threw (killing the whole stream), a
+# mid-stream error frame was skipped (caller saw a half answer and no
+# error), and the trailing half-line was dropped.
+add_test(NAME server_mvc_ai_stream_parse
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_stream_parse.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/server_mvc/ai_stream_parse.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/server_mvc_ai_stream_parse${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${_mvc_readonly_sources};--auto-stdlib"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(server_mvc_ai_stream_parse PROPERTIES TIMEOUT 180
+  LABELS "full;standard;smoke")
+
 add_test(NAME package_install_mvc
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
