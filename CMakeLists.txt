@@ -3865,6 +3865,15 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_vs${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  add_test(NAME conformance_gui_codeeditor_bp_menu_ui
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_bp_menu_ui_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/packages/Zan.Gui.CodeEditor/src/Gui/Component/CodeEditor/CodeEditor.zan;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_bp_menu_ui.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_bp_menu_ui${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   add_test(NAME conformance_gui_codeeditor_snippet_picker_ui
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

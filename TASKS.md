@@ -54,6 +54,28 @@
   `tests/conformance/generic_constraints.zan`），这是一条独立的能力线。
 - 关联：A462（已闭账：静默 null → 编译期诊断）、A449 / A454（装箱）。
 
+### [ ] A466 设计器属性面板没有"恢复默认值"——改坏的属性回不去
+
+- 现象（2026-10-21 对齐 VS 设计器体感时盘点）：VS 的属性网格里每个属性都能
+  "重置"回控件默认值（属性下拉里的一项），我们没有这条入口——把 Text、尺寸、
+  边距改坏之后只能一个一个手动改回去。
+- 现状：属性面板的每一行由 `PropertyGrid` 渲染，而 `PropSpec`
+  （`packages/Zan.Gui/src/Gui/Core/PropSpec.zan`）只描述"标签 + 绑定 + 编辑
+  方式"，**没有"默认值"概念**；设计器画布上的控件实例是
+  `Gui.Widget.FormField`（用 ftype 区分类型），默认值散在
+  `FormField.DefaultHFor` 之类的静态函数里，没有一张"属性 → 默认值"的表。
+- 方向（方案已想清，等编译恢复后落地）：
+  1. `PropSpec` 加默认值字符串 + `Default(v)` 链式方法，复位 = 写回默认值；
+  2. `PropertyGrid` 行尾画复位按钮（仅当当前值 ≠ 默认值时出现），点击写回
+     并走 `BeforeChange`（撤销栈），VS 口径；
+  3. 设计器侧给默认值：按 ftype 造一个"干净的 FormField"当默认实例，按属性
+     key 取其字段值；自定义组件（customKind 非空）没有默认实例 → 不显示按钮。
+- 阻塞（2026-10-21 登记时）：`packages/Zan.Gui` 整包当时编译不过——编译器新加
+  的"`await` 只能在 async 方法里"诊断暴露了 `UploadJob.zan:94` 的真实缺陷
+  （await 被丢掉 → 上传从串行变并发），另有泛型委托匹配的改动让
+  `packages/Zan.Linq` 报错。设计器依赖 UploadJob，设计器/IDE 相关用例
+  （`conformance_gui_form*`）全红，这条线暂时无法验证。
+
 ### [ ] A463 诊断里的类型名不渲染可空标志——`bool?` 的错误信息说成 `'bool'`
 
 - 现象（2026-10-21 修 A456 时实测）：`bool? b = null; bool c = !b;` 报

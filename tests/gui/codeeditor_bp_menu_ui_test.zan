@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using Gui;
+using Gui.Widget;
+using Gui.Component.CodeEditor;
+
+// 行号槽右键 = 断点菜单（VS 口径）的端到端回归：
+// 真右键落在行号槽 → 弹的是断点菜单（不是文本区主菜单）→
+// 点"切换断点"打在该行 → 点"删除所有断点"清干净。
+class CodeEditorBpMenuUiTest {
+    static int fails;
+    static App app;
+    static CodeEditor ed;
+
+    static void EqStr(string what, string got, string want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got '" + got + "' want '" + want + "'");
+    }
+
+    static void EqInt(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    static void Body() {
+        ed.Render(app, new Rect(40, 60, 640, 400));
+        ed.RenderCtxMenu(app);
+    }
+
+    static void Frame() {
+        app.PumpGuarded();
+        app.FrameGuarded(CodeEditorBpMenuUiTest.Body);
+    }
+
+    static void Frames(int n) {
+        for (int i = 0; i < n; i = i + 1) { Frame(); }
+    }
+
+    // 菜单里第 `index` 项的点击坐标（与编辑器自绘菜单的几何一致）。
+    static int ItemY(List<ContextMenuItem> items, int index) {
+        int fontSize = Style.FontFallback(app, "medium");
+        int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
+        int sepH = app.Scale(7);
+        int mH = app.Scale(6);
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == 0) { mH = mH + sepH; } else { mH = mH + lineH; }
+        }
+        int mY = ed.CtxAnchorY();
+        if (mY + mH > app.canvas.Height()) { mY = app.canvas.Height() - mH - app.Scale(4); }
+        if (mY < app.titlebarH) { mY = app.titlebarH; }
+        int y = mY + app.Scale(3);
+        for (int i = 0; i < index; i = i + 1) {
+            if (items[i].action == 0) { y = y + sepH; } else { y = y + lineH; }
+        }
+        return y;
+    }
+
+    static int IndexOfAction(List<ContextMenuItem> items, int action) {
+        for (int i = 0; i < items.Count; i = i + 1) {
+            if (items[i].action == action) { return i; }
+        }
+        return -1;
+    }
+
+    static void Main() {
+        fails = 0;
+        app = new App("bp-menu-ui", 1200, 900);
+        app.Show();
+        app.RequestAnimationFrame(16);
+
+        ed = new CodeEditor();
+        ed.documentPath = "probe.zan";
+        ed.LoadText("class Program {\n    static void Main() { }\n}\n");
+        Frames(2);
+
+        UiDriver.app = app;
+        UiDriver.resultsPath = "build/bp_menu_ui_results.log";
+        UiDriver.probes = new List<UiProbe>();
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+
+        // ---- 行号槽右键 → 断点菜单 ----
+        int gutter = ed.GutterWidth();
+        EqInt("gutter width known", gutter > 0 ? 1 : 0, 1);
+        bool ok = UiDriver.Exec("rclick 50 120");
+        EqInt("rclick accepted", ok ? 1 : 0, 1);
+        Frames(5);
+        EqInt("menu open", ed.CtxMenuOpen() ? 1 : 0, 1);
+        EqInt("breakpoint menu (not the editor menu)", ed.CtxMenuMode(), 1);
+
+        List<ContextMenuItem> items = ed.BuildBreakpointMenuItems();
+        int toggleIdx = IndexOfAction(items, 30);
+        int clearIdx = IndexOfAction(items, 31);
+        EqInt("toggle item in menu", toggleIdx >= 0 ? 1 : 0, 1);
+        EqInt("clear item in menu", clearIdx >= 0 ? 1 : 0, 1);
+
+        int bpLine = ed.CtxBreakpointLine();
+        EqInt("menu targets a line", bpLine >= 0 ? 1 : 0, 1);
+
+        // ---- 点「切换断点」→ 该行被打上断点 ----
+        int y = ItemY(items, toggleIdx);
+        int x = ed.CtxAnchorX() + 10;
+        bool ok2 = UiDriver.Exec("click " + Convert.ToString(x) + " " + Convert.ToString(y));
+        EqInt("click accepted", ok2 ? 1 : 0, 1);
+        Frames(5);
+        EqInt("menu closed", ed.CtxMenuOpen() ? 1 : 0, 0);
+        EqInt("breakpoint set on the targeted line", ed.HasBreakpoint(bpLine) ? 1 : 0, 1);
+
+        // ---- 再开菜单，点「删除所有断点」→ 断点清空 ----
+        ok = UiDriver.Exec("rclick 50 120");
+        Frames(5);
+        EqInt("menu reopened", ed.CtxMenuOpen() ? 1 : 0, 1);
+        items = ed.BuildBreakpointMenuItems();
+        clearIdx = IndexOfAction(items, 31);
+        int y2 = ItemY(items, clearIdx);
+        bool ok3 = UiDriver.Exec("click " + Convert.ToString(x) + " " + Convert.ToString(y2));
+        EqInt("second click accepted", ok3 ? 1 : 0, 1);
+        Frames(5);
+        int stillThere = 0;
+        if (ed.HasBreakpoint(bpLine)) { stillThere = 1; }
+        EqInt("all breakpoints removed", stillThere, 0);
+
+        if (File.Exists(UiDriver.resultsPath)) { File.Delete(UiDriver.resultsPath); }
+        Console.WriteLine(fails == 0 ? "OK" : "FAILS " + Convert.ToString(fails));
+    }
+}

@@ -280,6 +280,15 @@ partial class CodeEditor {
     string ctxCmd;          // 宿主 IDE 必须处理的命令（"find"/"gotoline"）
     // 宿主追加的右键菜单项（action 落在宿主段 >= 100）。
     List<ContextMenuItem> hostCtxItems;
+    // 右键菜单的种类：0 = 文本区主菜单，1 = 行号槽的断点菜单
+    // （VS 里点行号槽右键出的是断点菜单，不是编辑菜单）。
+    int ctxMenuMode;
+    // 断点菜单针对的行（右键命中的行号槽行，0 起）。
+    int ctxBpLine;
+    // 上一帧的行号槽宽度（宿主/测试按它算行号槽的命中区域）。
+    int gutterWLast;
+    // 宿主追加的断点菜单项（条件断点等 IDE 能力）。
+    List<ContextMenuItem> hostBreakpointItems;
 
     // ---- 外观（字体 + 语法颜色），由宿主经 ApplyTheme 设置 ----
     // edFont 是代码字号；0 表示"使用 UI 主题的中等字号"。
@@ -489,6 +498,9 @@ partial class CodeEditor {
         this.ctxY = 0;
         this.ctxCmd = "";
         this.hostCtxItems = new List<ContextMenuItem>();
+        this.ctxMenuMode = 0;
+        this.ctxBpLine = 0;
+        this.hostBreakpointItems = new List<ContextMenuItem>();
     }
 
     // 按 '\n' 把字符串拆分为行（去除 '\r'）。实现移至
@@ -1735,6 +1747,43 @@ partial class CodeEditor {
         return "";
     }
 
+    // 注入断点菜单的宿主项（条件断点等 IDE 能力）。断点菜单与
+    // 文本区主菜单是两种菜单，宿主项各挂各的。
+    void SetHostBreakpointItems(List<ContextMenuItem> items) {
+        if (items == null) {
+            this.hostBreakpointItems = new List<ContextMenuItem>();
+            return;
+        }
+        this.hostBreakpointItems = items;
+    }
+
+    // 断点菜单的宿主段动作 id → 命令名；没有对应项时返回空串。
+    string HostBreakpointCmd(int act) {
+        if (hostBreakpointItems == null) { return ""; }
+        for (int i = 0; i < hostBreakpointItems.Count; i = i + 1) {
+            if (hostBreakpointItems[i].action == act) { return hostBreakpointItems[i].cmd; }
+        }
+        return "";
+    }
+
+    // 行号槽右键弹出的断点菜单（VS 口径：切换断点 / 条件断点 /
+    // 删除所有断点）。条件断点属 IDE 能力，由宿主注入。
+    List<ContextMenuItem> BuildBreakpointMenuItems() {
+        List<ContextMenuItem> items = new List<ContextMenuItem>();
+        items.Add(new ContextMenuItem(
+            CodeEditor.T("Toggle Breakpoint", "切换断点"), "F9", 30));
+        if (hostBreakpointItems != null && hostBreakpointItems.Count > 0) {
+            items.Add(new ContextMenuItem("", "", 0));
+            for (int hi = 0; hi < hostBreakpointItems.Count; hi = hi + 1) {
+                items.Add(hostBreakpointItems[hi]);
+            }
+        }
+        items.Add(new ContextMenuItem("", "", 0));
+        items.Add(new ContextMenuItem(
+            CodeEditor.T("Remove All Breakpoints", "删除所有断点"), "", 31));
+        return items;
+    }
+
     // 最近一次右键点击位置：宿主弹层（代码动作菜单）的锚点。
     int CtxAnchorX() { return ctxX; }
     int CtxAnchorY() { return ctxY; }
@@ -1850,6 +1899,8 @@ partial class CodeEditor {
         else if (act == 23) { this.ToggleFold(curLine); }
         else if (act == 24) { this.ExpandFoldAt(curLine); }
         else if (act == 25) { this.UnfoldAll(); }
+        else if (act == 30) { this.ToggleBreakpoint(ctxBpLine); }
+        else if (act == 31) { this.ClearBreakpoints(); }
         else if (act >= 100) {
             string hc = HostCtxCmd(act);
             if (hc.Length > 0) { ctxCmd = hc; }
@@ -1859,6 +1910,15 @@ partial class CodeEditor {
 
     // 右键菜单当前是否打开。
     bool CtxMenuOpen() { return ctxOpen; }
+
+    // 右键菜单的种类：0 = 文本区主菜单，1 = 行号槽的断点菜单。
+    public int CtxMenuMode() { return ctxMenuMode; }
+
+    // 断点菜单针对的行（0 起）。
+    public int CtxBreakpointLine() { return ctxBpLine; }
+
+    // 上一帧的行号槽宽度（逻辑像素）。
+    public int GutterWidth() { return gutterWLast; }
 
     // 将右键菜单绘制为顶层浮层（限制在整个
     // 窗口而非编辑器矩形内），并处理菜单项点击。必须在
@@ -1872,7 +1932,8 @@ partial class CodeEditor {
         int lineH = Canvas.FontHeight(fontSize) + app.Scale(4);
         if (lineH < 1) { lineH = 1; }
 
-        List<ContextMenuItem> menuItems = this.BuildCtxMenuItems();
+        List<ContextMenuItem> menuItems = ctxMenuMode == 1
+            ? this.BuildBreakpointMenuItems() : this.BuildCtxMenuItems();
         int itemH = lineH;
         int sepH = app.Scale(7);
         int mW = app.Scale(150);
