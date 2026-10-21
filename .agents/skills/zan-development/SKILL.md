@@ -347,7 +347,8 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   显式序列化委托"这种没有反射也能做的设计成立。
 * **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
   换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
-  读回来用 `File.ReadAllText` / `ReadAllLines`。## 4. Edit
+  读回来用 `File.ReadAllText` / `ReadAllLines`。
+## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
 default, because it needs the snippet and not the file. `old` must occur once,
