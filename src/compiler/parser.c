@@ -2248,6 +2248,30 @@ static bool looks_like_var_decl(zan_parser_t *p) {
                 if (r < n && s[r] == ']') return true;
                 return false;
             }
+            if (q < n && s[q] == '?') {
+                /* 限定名的可空标记：`A.B? x` / `A.B?[] x`。没有这一段时，
+                 * `System.Text.Encoding? e = null;` 会被当成三元表达式，
+                 * 解析器一路报 "expected ':'"。
+                 * 收紧到「标识符 + ';' 或 '='」：`A.B ? c : d` 这种**限定名开头
+                 * 的三元表达式**不能被当成声明。 */
+                q++;
+                while (q < n && ZAN_WS(s[q])) q++;
+                if (q < n && s[q] == '[') {
+                    /* 可空数组：秩后缀（方括号里只允许空白与逗号） */
+                    size_t r = q + 1;
+                    while (r < n && (ZAN_WS(s[r]) || s[r] == ',')) r++;
+                    if (r >= n || s[r] != ']') return false;
+                    q = r + 1;
+                    while (q < n && ZAN_WS(s[q])) q++;
+                }
+                if (q < n && ZAN_IDSTART(s[q])) {
+                    while (q < n && ZAN_IDCONT(s[q])) q++;
+                    while (q < n && ZAN_WS(s[q])) q++;
+                    return q < n && (s[q] == ';' ||
+                        (s[q] == '=' && (q + 1 >= n || s[q + 1] != '=')));
+                }
+                return false;
+            }
             if (q < n && ZAN_IDSTART(s[q])) {
                 char w[8]; size_t wl = 0; size_t r = q;
                 while (r < n && ZAN_IDCONT(s[r]) && wl < sizeof w - 1) w[wl++] = s[r++];
@@ -2273,8 +2297,20 @@ static bool looks_like_var_decl(zan_parser_t *p) {
             while (q < n && ZAN_NQ_WS(s[q])) q++;
             if (q < n && s[q] == '?') {
                 q++;
-                if (q < n && s[q] != '?' && s[q] != '.' && s[q] != '[') {
+                if (q < n && s[q] != '?' && s[q] != '.') {
                     while (q < n && ZAN_NQ_WS(s[q])) q++;
+                    /* 可空数组：`T?[]` 的秩后缀。方括号里只允许空白与逗号，
+                     * 所以 `cond ? [1,2] : x`（数组字面量）不会被误判成声明。 */
+                    if (q < n && s[q] == '[') {
+                        size_t r = q + 1;
+                        while (r < n && (ZAN_NQ_WS(s[r]) || s[r] == ',')) r++;
+                        if (r < n && s[r] == ']') {
+                            q = r + 1;
+                            while (q < n && ZAN_NQ_WS(s[q])) q++;
+                        }
+                        /* 不是秩后缀（`cond ? [1,2] : x` 里的数组字面量）→
+                         * q 停在 '[' 上，后面的标识符检查自然不成立。 */
+                    }
                     if (q < n && ZAN_NQ_IDSTART(s[q])) {
                         while (q < n && ZAN_NQ_IDCONT(s[q])) q++;
                         while (q < n && ZAN_NQ_WS(s[q])) q++;
