@@ -2491,6 +2491,16 @@ set_tests_properties(conformance_async_preempt_hotloop PROPERTIES
 set_tests_properties(conformance_async_sync_delay_timer PROPERTIES
   ENVIRONMENT "ZAN_CO_WORKERS=1")
 
+# A470 follow-up: the sync wait runs ready tasks from inside the coroutine,
+# so co_run nests. The nested run must not clobber the outer worker's `cur`
+# -- zan_co_ready reads it to tell "woken myself" (CO_SELFQ = yield, goes to
+# the ring tail) from "woken by someone else" (LIFO cell = run me next).
+# Clobbering it turns Task.Yield into a no-op: the yielder grabs the LIFO
+# cell and queued coroutines stay stuck. The nested run only happens on a
+# worker thread, so pin the pool down to make the case observable.
+set_tests_properties(conformance_async_nested_yield PROPERTIES
+  ENVIRONMENT "ZAN_CO_WORKERS=1")
+
 # ---- wasm32 try/catch: cross-compile to a linked module --------------------
 # try/catch on wasm32 lowers to WebAssembly exception handling (catchswitch /
 # invoke / __cxa_throw + zanrt_ehtag.o). The suite cannot RUN a wasm module, so

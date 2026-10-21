@@ -1,0 +1,65 @@
+// 同步等待里的**嵌套 co_run**不能吃掉外层协程的让出语义。
+//
+// 背景（A470 的副产品）：非 async 方法里的 `await Task.Delay(ms)` 被
+// 降级成同步等待 zan_co_sync_sleep。单 worker 下唯一的 worker 正卡在
+// 这次等待里，所以等待者必须**自己顶上 worker 的活**——把被定时器唤醒
+// 的协程取出来跑起来。于是 co_run 出现了**嵌套**：
+//
+//   外层 co_run(Outer) → Outer 的 step → zan_co_sync_sleep
+//                                        → co_run_ready_tasks
+//                                        → co_run(Inner)   ← 嵌套
+//
+// 坑：co_run 原本把 w->cur 设成自己的帧、跑完清成 NULL。嵌套时，内层
+// 把 w->cur 覆盖成内层帧、跑完清成 NULL——**外层的 w->cur 丢了**。
+// 而 zan_co_ready 判断"是不是自己唤醒自己"靠的正是
+// (sw->cur == frame)：命中才挂 CO_SELFQ（走环尾 = 让出），
+// 没命中就当普通唤醒塞进 LIFO cell（下一个就跑自己 = 没让出）。
+//
+// 于是外层协程在嵌套之后 await Task.Yield() 时：自唤醒被误判成普通
+// 唤醒 → 抢到 LIFO cell → 紧接着自己又跑 → **Yield 没让出**，排队等
+// 着的协程全被压住。
+//
+// 断言：Yield 返回前，排队中的任务应该已经跑掉一批（说明确实让出了）。
+// 只卡"有没有跑掉一批"这个二值事实，不卡具体数字——数字跟机器速度、
+// 嵌套批大小有关，卡死会 flaky。
+using System;
+
+class Program {
+    // 排队等着跑的任务计数
+    static int queued = 0;
+    // Yield 那一刻的计数
+    static int atYield = 0;
+
+    static void SyncDelay(int ms) {
+        await Task.Delay(ms);
+    }
+
+    // 内层协程：撒一批任务，嵌套运行一轮跑不完，剩下的排队。
+    static async int Inner() {
+        for (int i = 0; i < 300; i = i + 1) {
+            Task.Spawn(Queued());
+        }
+        return 1;
+    }
+
+    static async int Queued() {
+        queued = queued + 1;
+        return 1;
+    }
+
+    static async int Yielder() {
+        Task.Spawn(Inner());
+        // 同步等待：制造嵌套 co_run
+        SyncDelay(150);
+        atYield = queued;
+        await Task.Yield();
+        // 让出之后才继续——这中间排队的任务应该插进来跑过
+        Console.WriteLine("yieldLetOthersRun=" + Convert.ToString(queued > atYield ? 1 : 0));
+        return 1;
+    }
+
+    static void Main() {
+        Task.Spawn(Yielder());
+        await Task.Delay(1500);
+    }
+}

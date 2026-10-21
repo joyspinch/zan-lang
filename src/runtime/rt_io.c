@@ -4394,10 +4394,27 @@ static void co_run(zan_co_worker_t *w, zan_co_task *t) {
     w->st.ran++;
     co_trace("run", t->frame);
     co_pump_timers();
+    /* 嵌套运行要保住外层的 cur 与 slice_start_us。
+     *
+     * cur：zan_co_ready 用 (sw->cur == frame) 判断"是不是自己唤醒自己"
+     *   —— 命中挂 CO_SELFQ（重排走环尾 = 真让出），没命中当普通唤醒塞进
+     *   LIFO cell（下一个就跑自己 = 没让出）。内层 co_run 若把 cur 清成
+     *   NULL，外层协程的自唤醒就被误判成普通唤醒，Task.Yield 变成空转，
+     *   排队的协程被压住。
+     *
+     * slice_start_us：抢占配额的起点。内层覆盖后，外层任务已跑的时长
+     *   被清零，配额判定跟着失真（外层再也攒不满时间片）。恢复成外层
+     *   自己的起点，与"非嵌套时一次设定、整个任务期间不变"的语义一致。
+     *
+     * 嵌套是会发生的：同步等待 zan_co_sync_sleep 要在协程内部顶上 worker
+     * 的活（把被定时器唤醒的协程取出来跑），见 co_run_ready_tasks。 */
+    void *prev_cur = w->cur;
+    long long prev_slice = w->slice_start_us;
     w->slice_start_us = zan_co_precise_us();
     w->cur = t->frame;
     t->step(t->frame);
-    w->cur = NULL;
+    w->cur = prev_cur;
+    w->slice_start_us = prev_slice;
     co_trace("done", t->frame);
     for (;;) {
         s = __atomic_load_n(&h->sched, __ATOMIC_ACQUIRE);
