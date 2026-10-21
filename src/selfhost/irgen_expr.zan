@@ -9,7 +9,7 @@ partial class Irgen {
     ExprVal GenExpr(Node e) {
         if (e == null) { return new ExprVal("0", MkType("int")); }
         int k = e.kind;
-        if (k == AK.IntLit()) { return new ExprVal("" + e.ival, MkType("int")); }
+        if (k == AK.IntLit()) { return new ExprVal("" + e.IntLitValue(), MkType(e.IntLitTypeName())); }
         if (k == AK.FloatLit()) { return new ExprVal(FloatConst(e.sval), MkType("double")); }
         if (k == AK.BoolLit()) { return new ExprVal("" + e.ival, MkType("bool")); }
         if (k == AK.CharLit()) { return new ExprVal("" + e.ival, MkType("char")); }
@@ -333,7 +333,7 @@ partial class Irgen {
     }
 
     long EvalConstInt(Node e) {
-        if (e.kind == AK.IntLit()) { return e.ival; }
+        if (e.kind == AK.IntLit()) { return e.IntLitValue(); }
         if (e.kind == AK.Unary()) { return 0 - EvalConstInt(e.a); }
         long a = EvalConstInt(e.a);
         long b = EvalConstInt(e.b);
@@ -826,9 +826,12 @@ partial class Irgen {
     // in the self-host, so the AST node is needed for the refinement.
     Node OperandType(Node ast, ExprVal v) {
         if (ast != null && ast.kind == AK.IntLit()) {
-            if (ast.suffix == 1) { return MkType("long"); }
-            if (ast.suffix == 2) { return MkType("uint"); }
-            if (ast.suffix == 3) { return MkType("ulong"); }
+            // the radix folds into the same field, so the type suffix is the
+            // low three bits (`0x1FL` is a long, like `1L`)
+            int sfx = ast.LitTypeSuffix();
+            if (sfx == 1) { return MkType("long"); }
+            if (sfx == 2) { return MkType("uint"); }
+            if (sfx == 3) { return MkType("ulong"); }
         }
         return v.ty;
     }
@@ -5055,6 +5058,18 @@ partial class Irgen {
             if (dli >= 0) {
                 ExprVal oc = TryGenOpCall(callee, e);
                 if (oc != null) { return oc; }
+            }
+            // a STATIC delegate field of this class, invoked without a
+            // qualifier (`cloneTree(root)` where `cloneTree` is a static
+            // field): the field is a module global, not a method -- without
+            // this the call went to a method symbol that does not exist
+            // (`@App_cloneTree`), and the link failed.
+            Node scls2 = binder.FindType(curClass);
+            if (scls2 != null && FindMethodUp(scls2, name) == null) {
+                Node sfd = FindStaticField(scls2, name);
+                if (sfd != null && sfd.type != null && IsDelegate(sfd.type)) {
+                    return EmitDelegateCall(callee, sfd.type, e);
+                }
             }
             if (curHasThis) {
                 Node cls = binder.FindType(curClass);

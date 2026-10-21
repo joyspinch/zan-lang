@@ -440,17 +440,7 @@ public class Checker {
     // lit_suffix), and the diagnostics name the type -- `bool b = 5L;` says
     // "cannot convert 'long' to 'bool'", not "'int'".
     string IntLitTypeName(Node e) {
-        int sfx = e.suffix % 8;
-        if (sfx == 1) { return "long"; }
-        if (sfx == 2) { return "uint"; }
-        if (sfx == 3) { return "ulong"; }
-        // a literal that does not fit in int is a long in the host: the
-        // diagnostics name the type, so `int v = 3000000000;` says
-        // "narrowing conversion from 'long' to 'int'"
-        if (sfx == 0 && (e.ival > 2147483647L || e.ival < -2147483648L)) {
-            return "long";
-        }
-        return "int";
+        return e.IntLitTypeName();
     }
     string FloatLitTypeName(Node e) {
         if (e.suffix == 1) { return "float"; }
@@ -616,18 +606,85 @@ public class Checker {
         return 0 - e.a.ival;
     }
 
-    // Does the constant fit the target's range? The host compares against
-    // the target's own bounds (`integral_conversion_is_safe`); the long
-    // targets are wide enough for every constant that reaches them.
-    bool FitsTarget(string tn, long v) {
-        if (tn == "byte") { return v >= 0 && v <= 255; }
-        if (tn == "sbyte") { return v >= -128 && v <= 127; }
-        if (tn == "short") { return v >= -32768 && v <= 32767; }
-        if (tn == "ushort") { return v >= 0 && v <= 65535; }
-        if (tn == "char") { return v >= 0 && v <= 65535; }
-        if (tn == "int") { return v >= -2147483648L && v <= 2147483647L; }
-        if (tn == "uint") { return v >= 0 && v <= 4294967295L; }
-        return true;
+    // The signed 64-bit minimum as a bit pattern (0x8000000000000000 read as
+    // a signed integer). The literal cannot be written out (it does not fit a
+    // signed literal), so it is computed.
+    long Int64MinBits() { return 0 - 9223372036854775807L - 1L; }
+
+    // The integral range of a type name, the host's `integral_range`
+    // (src/compiler/checker.c). A type that is not integral (or an unknown
+    // name) is reported as "no range" -- the host then treats the conversion
+    // as safe.
+    bool IsIntegralType(string tn) {
+        if (tn == "sbyte" || tn == "byte" || tn == "short" || tn == "ushort" ||
+            tn == "char" || tn == "int" || tn == "uint" || tn == "long" ||
+            tn == "nint" || tn == "ulong") { return true; }
+        // an enum is an int in the host's range table
+        Node d = binder.FindType(tn);
+        if (d != null && d.kind == AK.EnumDecl()) { return true; }
+        return false;
+    }
+    long IntegralMin(string tn) {
+        if (tn == "sbyte") { return -128; }
+        if (tn == "byte") { return 0; }
+        if (tn == "short") { return -32768; }
+        if (tn == "ushort") { return 0; }
+        if (tn == "char") { return 0; }
+        if (tn == "int") { return -2147483648L; }
+        if (tn == "uint") { return 0; }
+        if (tn == "long" || tn == "nint") { return Int64MinBits(); }
+        if (tn == "ulong") { return 0; }
+        return -2147483648L;    // an enum
+    }
+    long IntegralMax(string tn) {
+        if (tn == "sbyte") { return 127; }
+        if (tn == "byte") { return 255; }
+        if (tn == "short") { return 32767; }
+        if (tn == "ushort") { return 65535; }
+        if (tn == "char") { return 65535; }
+        if (tn == "int") { return 2147483647L; }
+        if (tn == "uint") { return 4294967295L; }
+        if (tn == "long" || tn == "nint") { return 9223372036854775807L; }
+        if (tn == "ulong") { return 9223372036854775807L; }
+        return 2147483647L;    // an enum
+    }
+    bool IntegralUnsigned(string tn) {
+        if (tn == "byte" || tn == "ushort" || tn == "char" || tn == "uint" ||
+            tn == "ulong") { return true; }
+        return false;
+    }
+
+    // The host's `integral_conversion_is_safe`: the value type's own range
+    // must fit the target's range, or -- for a constant -- the constant
+    // itself must. `expr` is the value expression (the host needs it to
+    // tell an int literal from a folded expression).
+    bool IntegralConvSafe(string tn, string vn, Node expr, long constant) {
+        if (!IsIntegralType(tn) || !IsIntegralType(vn)) { return true; }
+        long tmin = IntegralMin(tn); long tmax = IntegralMax(tn);
+        bool tu = IntegralUnsigned(tn);
+        long vmin = IntegralMin(vn); long vmax = IntegralMax(vn);
+        bool vu = IntegralUnsigned(vn);
+        if ((!vu || tu) && vmin >= tmin && vmax <= tmax) { return true; }
+        // an unsigned value in a signed slot: only a non-negative constant
+        // that fits the target is safe
+        if (vu && !tu) {
+            // the host's one exception: -(0x8000000000000000) is the signed
+            // 64-bit minimum and lands in a signed slot
+            if (expr != null && expr.kind == AK.Unary() && expr.op == TK.Minus() &&
+                expr.a != null && expr.a.kind == AK.IntLit() &&
+                expr.a.ival == Int64MinBits()) {
+                return constant >= tmin;
+            }
+            if (constant < 0) { return false; }
+            if (expr != null && expr.kind == AK.IntLit()) { return expr.ival <= tmax; }
+            return constant <= tmax;
+        }
+        if (constant < tmin) { return false; }
+        if (tu) {
+            if (constant < 0) { return false; }
+            return constant <= tmax;
+        }
+        return constant <= tmax;
     }
 
     void CheckNarrowing(Node target, Node valueExpr, Node valueTy,
@@ -649,8 +706,18 @@ public class Checker {
                 + "' in " + what + " needs an explicit cast (C# rules)", line, col);
             return;
         }
+        // an integral value in an integral slot
+        if (vcat != 1 && vcat != 5 && vcat != 6) { return; }
+        // a native handle only lands in a long or a nint slot
+        if (vn == "nint" && tn != "long" && tn != "nint") {
+            diags.Error("narrowing conversion from '" + vn + "' to '" + tn
+                + "' in " + what + " needs an explicit cast (C# rules)", line, col);
+            return;
+        }
+        // a ulong slot takes any int literal
+        if (tn == "ulong" && valueExpr.kind == AK.IntLit()) { return; }
         if (!IsConstIntExpr(valueExpr)) { return; }
-        if (FitsTarget(tn, ConstIntExpr(valueExpr))) { return; }
+        if (IntegralConvSafe(tn, vn, valueExpr, ConstIntExpr(valueExpr))) { return; }
         // an integral constant that does not fit the target's range
         diags.Error("narrowing conversion from '" + vn + "' to '" + tn
             + "' in " + what + " needs an explicit cast (C# rules)", line, col);

@@ -204,7 +204,8 @@ public class Node {
     public int op;        // operator token kind for Binary/Unary/Assignment
     public long ival;     // int/char/bool literal value
     public int suffix;    // int-literal suffix (0=none 1=L 2=U 3=UL); radix
-                          // folds into bit 4 (16 = hex, 8 = binary)
+                          // folds into the same field (8 = binary, 16 = hex,
+                          // 24 = octal) -- the type suffix is `suffix % 8`
     public string sval;   // name / string literal / member name
     public string sval2;  // secondary name (e.g. base class)
     public Node a;
@@ -252,4 +253,50 @@ public class Node {
     }
 
     public void Add(Node n) { kids.Add(n); }
+
+    // ---- int-literal helpers ----
+    //
+    // The parser folds the radix into the same field as the type suffix
+    // (8 = binary, 16 = hex), so the type suffix is `suffix % 8` and the
+    // radix is `suffix >= 8`. The C host keeps them apart (lit_suffix /
+    // lit_radix) and both matter:
+    //
+    //   * the TYPE of a radix-2/8/16 literal in the uint range is an int
+    //     (checker.c: AST_INT_LITERAL -> lit_radix), so `int x = 0xFFFFFFFF;`
+    //     is legal -- and the VALUE is the int-domain one (-1), because the
+    //     host emits the literal as an int (irgen_expr.c).
+    //   * a decimal literal in the same range is a long, so `int x =
+    //     4294967295;` is a narrowing error.
+    public int LitTypeSuffix() { return suffix % 8; }
+    public int LitRadix() {
+        if (suffix >= 24) { return 8; }
+        if (suffix >= 16) { return 16; }
+        if (suffix >= 8) { return 2; }
+        return 10;
+    }
+    // The literal's runtime value: an unsuffixed radix literal in the uint
+    // range is an int, so its value is the int-domain (two's-complement) one.
+    public long IntLitValue() {
+        long v = ival;
+        if (LitTypeSuffix() == 0 && LitRadix() != 10 && v > 2147483647L && v <= 4294967295L) {
+            v = v - 4294967296L;
+        }
+        return v;
+    }
+    // The literal's own type (the host's checker.c, AST_INT_LITERAL ->
+    // lit_suffix / lit_radix): the suffix decides it, then the radix -- an
+    // unsuffixed radix-2/8/16 literal in the uint range is an int (its value
+    // is the int-domain one), a decimal literal out of int32 is a long.
+    public string IntLitTypeName() {
+        int sfx = LitTypeSuffix();
+        if (sfx == 1) { return "long"; }
+        if (sfx == 2) {
+            if (ival < 0 || ival > 4294967295L) { return "ulong"; }
+            return "uint";
+        }
+        if (sfx == 3) { return "ulong"; }
+        if (sfx == 0 && LitRadix() != 10 && ival >= 0 && ival <= 4294967295L) { return "int"; }
+        if (sfx == 0 && (ival > 2147483647L || ival < -2147483648L)) { return "long"; }
+        return "int";
+    }
 }

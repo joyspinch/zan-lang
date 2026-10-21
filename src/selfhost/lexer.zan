@@ -22,6 +22,13 @@ public class Lexer {
     public int ppTop;            // logical conditional-stack depth (no List.RemoveAt)
     string peSrc; int pePos; int peN;   // scratch for #if expression evaluation
 
+    // integer-literal accumulation (the host's strtoull path): the value, a
+    // flag for "it outgrew a signed 64-bit integer" and the significant digit
+    // count (the leading zeros do not count).
+    long numVal;
+    bool numBig;
+    int numDigits;
+
     public Lexer(string s) {
         src = s; pos = 0; n = s.Length; line = 1; col = 1;
         ppName = new List<string>();
@@ -371,10 +378,10 @@ public class Lexer {
 
     Token Number(int startLine, int startCol) {
         int start = pos;
-        long val = 0;
         bool isFloat = false;
         bool isHex = false;
         bool isBin = false;
+        numVal = 0; numBig = false; numDigits = 0;
         if (Peek() == 48 && (Peek2() == 120 || Peek2() == 88)) {
             // hex
             isHex = true;
@@ -386,7 +393,7 @@ public class Lexer {
                     if (c >= 48 && c <= 57) { d = c - 48; }
                     else if (c >= 97 && c <= 102) { d = c - 97 + 10; }
                     else { d = c - 65 + 10; }
-                    val = val * 16 + d;
+                    NumDigit(d, 16);
                 }
                 Adv();
             }
@@ -397,7 +404,7 @@ public class Lexer {
             Adv(); Adv();
             while (pos < n && (Peek() == 48 || Peek() == 49 || Peek() == 95)) {
                 int c = Peek();
-                if (c != 95) { val = val * 2 + (c - 48); }
+                if (c != 95) { NumDigit(c - 48, 2); }
                 Adv();
             }
         }
@@ -409,14 +416,14 @@ public class Lexer {
             Adv(); Adv();
             while (pos < n && ((Peek() >= 48 && Peek() <= 55) || Peek() == 95)) {
                 int c = Peek();
-                if (c != 95) { val = val * 8 + (c - 48); }
+                if (c != 95) { NumDigit(c - 48, 8); }
                 Adv();
             }
         }
         if (!isHex && !isBin && !isOct) {
             while (pos < n && (IsDigit(Peek()) || Peek() == 95)) {
                 int c = Peek();
-                if (c != 95) { val = val * 10 + (c - 48); }
+                if (c != 95) { NumDigit(c - 48, 10); }
                 Adv();
             }
             if (Peek() == 46 && IsDigit(Peek2())) {
@@ -463,9 +470,21 @@ public class Lexer {
             Adv();
             if (pos < n && (Peek() == 76 || Peek() == 108)) { litSuffix = 3; Adv(); }
         }
-        Token it = new Token(TK.IntLit(), t, val, startLine, startCol);
+        Token it = new Token(TK.IntLit(), t, numVal, startLine, startCol);
         it.litSuffix = litSuffix;
+        it.litBig = numBig;
+        it.litDigits = numDigits;
         return it;
+    }
+
+    // Accumulate one digit of an integer literal (the host's strtoull path):
+    // the value wraps like an unsigned 64-bit one, and the flags say whether
+    // it outgrew a signed 64-bit integer and how many significant digits it
+    // has (the leading zeros do not count).
+    void NumDigit(int d, int radix) {
+        if (numVal > (9223372036854775807L - d) / radix) { numBig = true; }
+        numVal = numVal * radix + d;
+        if (d != 0 || numDigits > 0) { numDigits = numDigits + 1; }
     }
 
     int EscapeChar(int c) {
