@@ -270,6 +270,33 @@ partial class Irgen {
     }
 
     bool IsStr(Node ty) { if (ty == null) { return false; } return ty.sval == "string" && ty.ival == 0; }
+    // The type name Convert.ToString must refuse: a class instance, an array,
+    // a delegate or a struct. "" means the value is acceptable.
+    //
+    // The C host's whitelist (irgen_call.c type_is_textual_or_numeric) covers
+    // the textual and the numeric types, the enums, `object` and the type
+    // parameters; everything else is refused. An array names its ELEMENT with
+    // the rank in `ival`, so the element's name is what gets printed.
+    string ConvertToStringBadType(Node ty) {
+        if (ty == null) { return ""; }
+        if (ty.ival >= 1) { return ty.sval + "[]"; }
+        string n = ty.sval;
+        if (n == "" || n == "var" || n == "string" || n == "bool" || n == "char" ||
+            n == "object" || n == "void") { return ""; }
+        if (n == "int" || n == "long" || n == "short" || n == "byte" ||
+            n == "sbyte" || n == "uint" || n == "ushort" || n == "ulong" ||
+            n == "float" || n == "double" || n == "decimal" || n == "nint") {
+            return "";
+        }
+        if (binder.IsTypeParam(n)) { return ""; }
+        // A delegate is refused too, and the binder keeps it OUT of `types`
+        // (it lives in `delegates`), so FindType would not see it.
+        if (binder.IsDelegateName(n)) { return n; }
+        Node d = binder.FindType(n);
+        if (d == null) { return ""; }          // unknown: stay permissive
+        if (d.kind == AK.EnumDecl()) { return ""; }
+        return n;                              // class / struct
+    }
     // ulong is the one integer type whose value can set the high bit of the i64
     // slot, so it selects unsigned division/remainder/shift/compare and %llu.
     bool IsUlong(Node ty) { if (ty == null) { return false; } return ty.sval == "ulong" && ty.ival == 0; }
@@ -2401,6 +2428,172 @@ partial class Irgen {
         return FindStaticField(cls, name) != null;
     }
 
+    // The built-in scalar type constants (int.MaxValue, uint.MinValue,
+    // double.NaN, float.Epsilon, ...). The C host folds them into
+    // compile-time constants (src/compiler/irgen_expr.c:6796-6870); the
+    // self-host keeps the same values in its own value model: the integers
+    // in the i64 slot (the host's int is 32 bits, but the value is the same
+    // number), the doubles as doubles (the host's float is an f32 -- the
+    // float constants are the f32 values widened, so float.Epsilon is exact).
+    // Returns null when the type or the member is not one of them.
+    ExprVal PrimTypeConst(string tn, string m) {
+        if (tn == "int") {
+            if (m == "MaxValue") { return new ExprVal("2147483647", MkType("int")); }
+            if (m == "MinValue") { return new ExprVal("-2147483648", MkType("int")); }
+        }
+        if (tn == "uint") {
+            if (m == "MaxValue") { return new ExprVal("4294967295", MkType("uint")); }
+        }
+        if (tn == "long") {
+            if (m == "MaxValue") { return new ExprVal("9223372036854775807", MkType("long")); }
+            if (m == "MinValue") { return new ExprVal("-9223372036854775808", MkType("long")); }
+        }
+        if (tn == "ulong") {
+            // the host's ulong.MaxValue is the all-ones bit pattern
+            if (m == "MaxValue") { return new ExprVal("-1", MkType("ulong")); }
+        }
+        if (tn == "short") {
+            if (m == "MaxValue") { return new ExprVal("32767", MkType("short")); }
+            if (m == "MinValue") { return new ExprVal("-32768", MkType("short")); }
+        }
+        if (tn == "ushort") {
+            if (m == "MaxValue") { return new ExprVal("65535", MkType("ushort")); }
+        }
+        if (tn == "byte") {
+            if (m == "MaxValue") { return new ExprVal("255", MkType("byte")); }
+        }
+        if (tn == "sbyte") {
+            if (m == "MaxValue") { return new ExprVal("127", MkType("sbyte")); }
+            if (m == "MinValue") { return new ExprVal("-128", MkType("sbyte")); }
+        }
+        if (tn == "char") {
+            if (m == "MaxValue") { return new ExprVal("65535", MkType("char")); }
+        }
+        if (tn == "double") {
+            if (m == "MaxValue") { return new ExprVal("1.7976931348623157E+308", MkType("double")); }
+            if (m == "MinValue") { return new ExprVal("-1.7976931348623157E+308", MkType("double")); }
+            if (m == "NaN") { return new ExprVal("0x7FF8000000000000", MkType("double")); }
+            if (m == "PositiveInfinity") { return new ExprVal("0x7FF0000000000000", MkType("double")); }
+            if (m == "NegativeInfinity") { return new ExprVal("0xFFF0000000000000", MkType("double")); }
+        }
+        if (tn == "float") {
+            // the f32 values widened to a double (the self-host's float is a
+            // double): Epsilon is 2^-149, the extremes are the f32 bounds
+            if (m == "Epsilon") { return new ExprVal("0x36A0000000000000", MkType("float")); }
+            if (m == "MaxValue") { return new ExprVal("0x47EFFFFFE0000000", MkType("float")); }
+            if (m == "MinValue") { return new ExprVal("0xC7EFFFFFE0000000", MkType("float")); }
+            if (m == "NaN") { return new ExprVal("0x7FF8000000000000", MkType("float")); }
+            if (m == "PositiveInfinity") { return new ExprVal("0x7FF0000000000000", MkType("float")); }
+            if (m == "NegativeInfinity") { return new ExprVal("0xFFF0000000000000", MkType("float")); }
+        }
+        return null;
+    }
+
+    // The enum member values, folded in declaration order. The C host binds
+    // the members in order and folds each value expression
+    // (src/compiler/binder.c: fold_enum_member_value): a literal, a unary
+    // +/- , a binary + - * / & |, or a reference to an ALREADY folded member.
+    // So `Red = -5, Green, Blue = Red + 10` is -5, -4, 5 -- not the ordinals.
+    List<string> enumFoldNames;   // the members folded so far
+    List<long> enumFoldVals;
+    bool enumFoldOk;
+    long enumFoldVal;
+
+    List<long> EnumMemberValues(Node tc) {
+        List<long> vals = new List<long>();
+        enumFoldNames = new List<string>();
+        enumFoldVals = new List<long>();
+        long run = 0;   // the running value: the next member continues from it
+        int i = 0;
+        while (i < tc.kids.Count) {
+            Node mem = tc.kids[i];
+            if (mem.kind == AK.EnumMember()) {
+                long v = 0;
+                if (mem.a == null) {
+                    v = run;
+                } else {
+                    enumFoldOk = true;
+                    enumFoldVal = 0;
+                    EnumFold(mem.a);
+                    if (enumFoldOk) {
+                        v = enumFoldVal;
+                        // the enum members are 32-bit (the host's
+                        // enum_value_fits_int -- only the EXPLICIT values are
+                        // checked, the continuation ones are not)
+                        if (v < -2147483648L || v > 2147483647L) {
+                            diags.Error("enum member '" + mem.sval + "' value " + v
+                                + " does not fit in 'int' (enum members are 32-bit)",
+                                mem.line, mem.col);
+                        }
+                    } else {
+                        // the host refuses the program ("must be an integer
+                        // constant expression"); say the same instead of
+                        // answering with the ordinal
+                        diags.Error("enum member '" + mem.sval
+                            + "' initializer must be an integer constant expression",
+                            mem.line, mem.col);
+                        v = run;
+                    }
+                }
+                enumFoldNames.Add(mem.sval);
+                enumFoldVals.Add(v);
+                // the host emits the member's value zero-extended from 32 bits
+                vals.Add(v & 4294967295L);
+                run = v + 1;
+            }
+            i = i + 1;
+        }
+        return vals;
+    }
+
+    // Fold one enum member value expression (the host's
+    // fold_enum_member_value, src/compiler/binder.c).
+    void EnumFold(Node e) {
+        if (e == null) { enumFoldOk = false; return; }
+        if (e.kind == AK.IntLit()) { enumFoldVal = e.ival; return; }
+        if (e.kind == AK.Unary()) {
+            EnumFold(e.a);
+            if (!enumFoldOk) { return; }
+            long v = enumFoldVal;
+            if (e.op == TK.Minus()) { enumFoldVal = 0 - v; return; }
+            if (e.op == TK.Plus()) { enumFoldVal = v; return; }
+            enumFoldOk = false;
+            return;
+        }
+        if (e.kind == AK.Binary()) {
+            EnumFold(e.a);
+            if (!enumFoldOk) { return; }
+            long l = enumFoldVal;
+            EnumFold(e.b);
+            if (!enumFoldOk) { return; }
+            long r = enumFoldVal;
+            int op = e.op;
+            if (op == TK.Plus()) { enumFoldVal = l + r; return; }
+            if (op == TK.Minus()) { enumFoldVal = l - r; return; }
+            if (op == TK.Star()) { enumFoldVal = l * r; return; }
+            if (op == TK.Slash()) { if (r == 0) { enumFoldOk = false; return; } enumFoldVal = l / r; return; }
+            if (op == TK.Amp()) { enumFoldVal = l & r; return; }
+            if (op == TK.Pipe()) { enumFoldVal = l | r; return; }
+            enumFoldOk = false;
+            return;
+        }
+        if (e.kind == AK.Ident()) {
+            // an earlier member of the same enum (the host only finds the
+            // members that are already bound)
+            int k = 0;
+            while (k < enumFoldNames.Count) {
+                if (enumFoldNames[k] == e.sval) {
+                    enumFoldVal = enumFoldVals[k];
+                    return;
+                }
+                k = k + 1;
+            }
+            enumFoldOk = false;
+            return;
+        }
+        enumFoldOk = false;
+    }
+
     ExprVal GenMember(Node e) {
         if (e.a.kind == AK.Ident() && LocalIdx(e.a.sval) < 0 && !ShadowsTypeName(e.a.sval)) {
             // Console.ForegroundColor / Console.BackgroundColor: the current
@@ -2426,6 +2619,13 @@ partial class Irgen {
             if (e.a.sval == "Cpu" && LocalIdx("Cpu") < 0 && CpuFeatureId(e.sval) > 0) {
                 return new ExprVal("0", MkType("bool"));
             }
+            // the built-in scalar type constants (int.MaxValue, double.NaN,
+            // ...): the C host folds them into compile-time constants
+            // (src/compiler/irgen_expr.c:6796-6870). The self-host keeps the
+            // same values in its own value model (the integers in the i64
+            // slot, the doubles as doubles).
+            ExprVal pc = PrimTypeConst(e.a.sval, e.sval);
+            if (pc != null) { return pc; }
             Node tc = binder.FindType(e.a.sval);
             // Vector128/256 static members (Zero, AllBitsSet) are values, not
             // storage — lower them inline instead of loading a static field
@@ -2464,16 +2664,21 @@ partial class Irgen {
                     return EmitStaticCall(tc.sval, "get_" + e.sval, sc);
                 }
             }
-            // enum member constant: Color.Red -> its ordinal (or explicit value)
+            // enum member constant: Color.Red -> its folded value (the host
+            // folds the member values in declaration order, so a member may
+            // refer to an EARLIER one: `Blue = Red + 10`)
             if (tc != null && tc.kind == AK.EnumDecl()) {
-                int cur = 0;
+                List<long> vals = EnumMemberValues(tc);
+                int k = 0;
                 int j = 0;
                 while (j < tc.kids.Count) {
                     Node mem = tc.kids[j];
                     if (mem.kind == AK.EnumMember()) {
-                        if (mem.a != null && mem.a.kind == AK.IntLit()) { cur = mem.a.ival; }
-                        if (mem.sval == e.sval) { return new ExprVal("" + cur, MkType("int")); }
-                        cur = cur + 1;
+                        if (mem.sval == e.sval) {
+                            if (k < vals.Count) { return new ExprVal("" + vals[k], MkType("int")); }
+                            return new ExprVal("0", MkType("int"));
+                        }
+                        k = k + 1;
                     }
                     j = j + 1;
                 }
@@ -3105,7 +3310,10 @@ partial class Irgen {
         }
         // unsigned / small-width targets share the i64 slot, so their cast is a
         // wrap-to-width mask (zero-extend for uint/ushort, sign-extend from 8
-        // bits for sbyte) applied to the i64 value.
+        // bits for sbyte) applied to the i64 value. The host lowers the same
+        // casts by truncating to the target's own width and widening back
+        // (irgen_expr.c: emit_expr_cast_expr): byte/uint/ushort zero-extend,
+        // sbyte/short/int sign-extend, char/long/ulong keep the whole 64 bits.
         if (!toD && !fromD && tgt != null && MapType(v.ty) == "i64") {
             string tn = tgt.sval;
             if (tn == "uint") {
@@ -3118,11 +3326,32 @@ partial class Irgen {
                 L("  " + t + " = and i64 " + v.op + ", 65535");
                 return new ExprVal(t, tgt);
             }
+            if (tn == "byte") {
+                string t = NT();
+                L("  " + t + " = and i64 " + v.op + ", 255");
+                return new ExprVal(t, tgt);
+            }
             if (tn == "sbyte") {
                 string s1 = NT();
                 L("  " + s1 + " = shl i64 " + v.op + ", 56");
                 string s2 = NT();
                 L("  " + s2 + " = ashr i64 " + s1 + ", 56");
+                return new ExprVal(s2, tgt);
+            }
+            if (tn == "short") {
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 48");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 48");
+                return new ExprVal(s2, tgt);
+            }
+            if (tn == "int") {
+                // the host's int is 32 bits: a cast to int keeps the low 32
+                // bits and sign-extends them
+                string s1 = NT();
+                L("  " + s1 + " = shl i64 " + v.op + ", 32");
+                string s2 = NT();
+                L("  " + s2 + " = ashr i64 " + s1 + ", 32");
                 return new ExprVal(s2, tgt);
             }
         }
@@ -4691,6 +4920,20 @@ partial class Irgen {
             && callee.a.sval == "Convert") {
             if (callee.sval == "ToString" && e.kids.Count == 1) {
                 ExprVal a = GenExpr(e.kids[0]);
+                // The C host only accepts values that really have a string form
+                // (src/compiler/irgen_call.c, type_is_textual_or_numeric): a
+                // class instance / array / delegate / struct does not -- its
+                // pointer read as a C string walks off into the image and
+                // prints whatever it finds there. The host reports it; the
+                // self-host used to print the ADDRESS (an information leak
+                // and a useless answer), so the rule is mirrored here.
+                string bad = ConvertToStringBadType(a.ty);
+                if (bad != "") {
+                    diags.Error("Convert.ToString: cannot convert '" + bad
+                        + "' to a string -- call .ToString() on the value instead",
+                        e.kids[0].line, e.kids[0].col);
+                    return new ExprVal("0", MkType("string"));
+                }
                 string s = ToCStr(a);
                 return new ExprVal(s, MkType("string"));
             }
