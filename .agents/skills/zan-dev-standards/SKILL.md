@@ -1365,6 +1365,28 @@ description: Zan 开发规范总纲——可落地的标准与纪律，供 AI �
   必然卡死"的错误结论。引用前先确认三件事：产物版本、探针口径（平均/最差/
   强制重绘）、机器规格；口径不同的两份数据不可比。基线过期比没有基线更危险，
   因为它带着数字，看起来可信。
+- **纯 Canvas 直绘的游戏接"存档 + 设置"有定式，别各写一遍**
+  （arena 等十个阶段一骨架项目，坑出处）：
+  - **存档**用包里的 `Game.Foundation.GameSaveStore`（原子写 + .bak 备份 +
+    版本号），项目只写"这个游戏存哪几个字段"；存档目录用
+    `%LOCALAPPDATA%/<游戏名>`，并让环境变量可覆盖（测试脚本靠它落在临时目录，
+    不污染玩家机器）。
+  - **设置**分两层：`GameSettings`（声明）+ `SettingsModel`（档位计算/校验/
+    落盘）在包里；视图用包里的通用 `Game.Foundation.Gui.SettingsOverlay`
+    （标准库控件搭的卡片：一行一个档位按钮组 + 关闭按钮），有自己美术风格的
+    项目自绘视图、接口不变。**设置项必须真的影响玩法**，否则是摆设。
+  - **接线三件套**：`form.Add(overlay.Root())` 挂载 → 每帧 `overlay.Tick()`
+    （轮询按钮点击）→ 渲染顺序把控件树叠在直绘之上：
+    `form.MeasureTree(app)` → `form.Arrange(...)` → `form.RenderTree(app)`，
+    放在自己的 `Render()` 之后、`RenderChrome()` 之前。
+  - **键盘开关必须判事件真的发生过**：条件里要有 `got == 1`（事件确实来
+    了），否则会拿上一帧残留的键码反复开关——表现为"按一次闪一下"或根本
+    开不了。
+  - **落盘必须跑两遍验证**：第一遍写、第二遍是**新进程**读回（局数 1 → 2），
+    只跑一遍看不出"写了但读不回"；断言要同时查日志行与存档文件存在。
+  - 包 API 不要凭印象写：`Environment.GetCurrentDirectory()` 不存在（用
+    `Directory.GetCurrentDirectory()`），`GameSaveStore.Save` 收 `JsonValue`
+    （`JsonValue.NewObject()` + `PutInt`）——先读 .zan 确认真实签名。
 
 ## 四、经验沉淀纪律（skill 的准入标准）
 
