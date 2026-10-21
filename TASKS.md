@@ -1666,3 +1666,22 @@
 - 验证：把 `tests/conformance/nullable_user_type.zan`（void 臂）加进
   `tests/selfhost/diff_cases.txt`，差分门跑它应 PASS。
 - 关联：A481（自举侧同一条战线的前瞻洞）、A469 / A479（宿主侧解析）。
+
+### [ ] A483 `selfhost_gen1` 这个 ctest 链接不过——它的 stage 3 没带运行时对象
+
+- 现象：`ctest -R "^selfhost_gen1$"` 失败在 stage 3（clang 链接 gen1 产出的 IR）：
+  `LNK2019: 无法解析的外部符号 zan_rt_dbl_str`（连带 zan_hw_base64_encode 等）。
+  stage 1（用宿主 zanc 重建 gen1）与 stage 2（gen1 编译 prog1.zan 出 IR）**都过**，
+  挂的只是最后的链接 + 运行 + 对 stdout。
+- 根因：`tests/run_selfhost.cmake` 的 stage 3 只 `clang ${OUTLL} -o exe`，**没有把
+  运行时对象带进去**；而差分门 `tests/run_selfhost_diff.cmake` 是带
+  `${RTOBJS} ${SYSLIBS}` 的。运行时拆成独立 bundle 之后，这个 ctest 就再没人
+  修过 → 它一直红着，且红的原因跟自举正确性无关。
+- 修法：stage 3 与差分门对齐——把 `zanrt_selfhost_bundle` 产出的对象与系统库
+  一起传给 clang（CMakeLists 侧 `zanrt_selfhost_bundle` 已经在建这些对象，
+  `_sh_rt_objs` 就在那里）。
+- 备注：**差分门（`selfhost_diff`）本身是好的**，只是它的 bundle 对象曾经是陈的
+  —— 重建 `zanrt_selfhost_diff_bundle` 之后差分门能跑通（本轮实测子集 10/10 PASS，
+  含新增的 `ternary_stmt_start`）。也就是说，差分门此前很可能长期在用**旧对象**
+  评估新自举。
+- 关联：A481（自举侧同一条战线）、A482（自举 irgen 的 void-phi 洞）。
