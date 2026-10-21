@@ -1,0 +1,82 @@
+using System;
+using Gui;
+using Game.Kit;
+
+// CDraw.BlitImageSrc 的契约：裁源矩形取景（"按 cover 铺背景 / 九宫格切图 /
+// 精灵表取帧"共用的那一条）。
+//
+// 背景：引擎的画布只有"裁源矩形"这一个能力（Canvas.BlitImage 的 9 参重载，
+// 源矩形在最后），而 Game.Kit.CDraw 此前只暴露了整幅贴图（CDraw.BlitImage）。
+// 于是这三件事每个项目都要自己重写一遍视口映射（voxel/powder/crawler 各写了
+// 一份 BlitSrc），而 ship 出去的 snake 模板直接调 CDraw.BlitImageSrc——
+// 那个方法此前根本不存在，模板编译不过。
+//
+// 判据（本 API 最容易搞错的就是两组坐标的单位）：
+//   1. 目标矩形 (dx,dy,dw,dh) 是**逻辑坐标**，走视口映射；
+//   2. 源矩形 (sx,sy,sw,sh) 是**源图像素**，不映射——缩放的是取景，不是源。
+//
+// 夹具：4x4 PNG，四象限各一色（红/绿/蓝/黄），随用例内嵌为
+// "cdrawfx/src.png"（见 CMakeLists 的 --embed 分支）。盘上没有这个路径，
+// 走 File.ReadAllBytes 的内嵌兜底。
+class Program {
+    static int fails;
+
+    static void Eq(string what, int got, int want) {
+        if (got == want) { return; }
+        fails = fails + 1;
+        Console.WriteLine("FAIL " + what + ": got " + Convert.ToString(got)
+            + " want " + Convert.ToString(want));
+    }
+
+    // 取像素的 RGB（0xRRGGBB）。
+    static int Px(Canvas c, int x, int y) {
+        return c.GetPixel(x, y) & 0x00FFFFFF;
+    }
+
+    static void Main() {
+        fails = 0;
+
+        App app = new App("cdraw-blit-src", 64, 64);
+        app.BeginFrame();
+        Canvas c = app.canvas;
+        if (c == null || c.Width() <= 0 || c.Height() <= 0) {
+            // 没有可用表面（无显示环境）：按 harness 的 SKIP 约定退出。
+            Console.WriteLine("SKIP: no GUI surface in this session");
+            return;
+        }
+
+        string src = "cdrawfx/src.png";
+        // 逻辑原点归零、视口 1:1（默认态）：先钉住最朴素的一组行为。
+        CDraw.Origin(0, 0);
+
+        // ---- 1. 裁源取景：四个象限各自贴到目标四分之一 ----
+        c.FillRect(0, 0, 64, 64, 0xFF101010);
+        CDraw.BlitImageSrc(c, src, 0, 0, 32, 32, 0, 0, 2, 2);     // 源左上 → 红
+        Eq("crop tl", Px(c, 8, 8), 0xFF0000);
+        Eq("crop tl inner", Px(c, 28, 28), 0xFF0000);
+        Eq("crop tl edge", Px(c, 1, 1), 0xFF0000);
+        // 目标矩形之外仍是底色：说明没溢出到邻块。
+        Eq("untouched", Px(c, 40, 40), 0x101010);
+
+        CDraw.BlitImageSrc(c, src, 32, 0, 32, 32, 2, 0, 2, 2);    // 源右上 → 绿
+        CDraw.BlitImageSrc(c, src, 0, 32, 32, 32, 0, 2, 2, 2);    // 源左下 → 蓝
+        CDraw.BlitImageSrc(c, src, 32, 32, 32, 32, 2, 2, 2, 2);  // 源右下 → 黄
+        Eq("crop tr", Px(c, 40, 8), 0x00FF00);
+        Eq("crop bl", Px(c, 8, 40), 0x0000FF);
+        Eq("crop br", Px(c, 40, 40), 0xFFFF00);
+
+        // ---- 2. 目标矩形走视口映射，源矩形不走 ----
+        // StageViewport 把 64x64 的画布按 32x32 的设计尺寸铺开 = 2 倍缩放，
+        // 于是逻辑 (0,0,16,16) 落在设备 (0,0,32,32)。
+        CDraw.StageViewport(c, 0, 32, 32, 0xFF202020);
+        CDraw.BlitImageSrc(c, src, 0, 0, 16, 16, 0, 0, 2, 2);
+        Eq("viewport scaled", Px(c, 8, 8), 0xFF0000);
+        Eq("viewport scaled inner", Px(c, 24, 24), 0xFF0000);
+        // 目标矩形只占设备 32x32：再往外是 StageViewport 铺的底色。
+        Eq("viewport outside", Px(c, 40, 40), 0x202020);
+        // 源矩形若也跟着放大，2x2 会变成 4x4（整幅图），颜色就不再是纯红——
+        // 上面两行取到纯红，正说明源矩形按源图像素裁、不被视口缩放。
+
+        if (fails == 0) { Console.WriteLine("cdraw-blit-src-ok"); }
+    }
+}
