@@ -8,6 +8,49 @@
 
 ## 未完成
 
+### [ ] A467 宿主缺「`await` 写在 lambda 里」的诊断——自举有，宿主没有
+
+- 现象（2026-10-21 盘点 await 规则时实测）：自举的检查器报
+  `'await' inside a lambda is not lowered by the self-hosted compiler (a lambda
+  is not a coroutine)`（`src/selfhost/checker.zan:631-648`）；**宿主没有任何对应
+  诊断**——`src/compiler/checker.c:3551-3559` 的 `AST_AWAIT_EXPR` 只做类型推导
+  （目标是 `Task` 就解包，否则原样返回），不看 await 落在哪儿。
+- 根因：lambda 体在 irgen 里发射时把 `g->current_async_frame` 置空
+  （`src/compiler/irgen_expr.c:12499`），于是 lambda 里的 `await` 走"根驱动
+  阻塞"那条路（`irgen_expr.c:10463-10490`：自己 `co_ready` + 跑调度器直到子
+  协程完成）。**若这个 lambda 是在 async 方法里被调用**，根驱动就是在**正在
+  运行的协程内部**再驱动一次调度器 → 调度器重入。
+- 影响：同一个程序，宿主接受、自举拒绝——差分门只比"能编且 stdout 一致"的
+  用例，这类程序会直接分叉，且 `tests/selfhost/diff_known_gaps.txt` 里没有
+  记录（那不是"输出不一致"，是"一个能编一个不能编"）。
+- 方向：宿主检查方法体时，若方法是 async 且方法体里出现**位于 lambda 内的
+  await**，报编译期诊断。措辞要与自举对齐——注意自举那句带"self-hosted
+  compiler"字样，两个后端要么统一措辞，要么各自说明自己降级不到。
+- 判据提醒：**只**在 async 方法里报。同步方法里的 lambda 内 await 没有重入
+  风险（外面没有正在运行的协程），自举的口径也是"只在 async 方法里查"。
+- 关联：§26（`.agents/skills/zan-compiler-internals/references/selfhost-closure.md`
+  的 await 口径）、A468（同一个 await 位置问题的另一半）。
+
+### [ ] A468 宿主与自举在「`await` 一个非协程操作数」上分叉
+
+- 现象：宿主把 `await <非协程>` **静默降级成普通求值**
+  （`src/compiler/irgen_expr.c:10350-10358`，注释写明"不是帧就原样返回"——
+  普通值往往也是 i8 指针，当成帧去读会读出面元指针的垃圾值，而且不报错）；
+  自举则**直接报错**：`'await' expects an async call in the self-hosted
+  compiler -- this operand is not lowered as a coroutine frame`
+  （`src/selfhost/irgen_async.zan:618-632`）。
+- 这**不是**宿主缺陷：宿主的行为被 golden 用例钉住
+  （`tests/conformance/async_await_sync_delegate.zan:23` await 一个**同步委托**，
+  文件头注释明写"await 的目标分两类——异步目标与普通目标"）。缺的是自举侧的
+  表达能力：自举目前只能降级 async 调用，碰到普通值没有对应的"原样求值"形态。
+- 方向（择一）：
+  1. 自举补上"await 一个普通值 → 原样求值"这条降级路径（与宿主一致，差分门
+     才不需要给这类程序开缺口）；
+  2. 或者把这条分歧写进 `tests/selfhost/diff_known_gaps.txt` 并注明理由——
+     但差分门只比"能编且 stdout 一致"的用例，"宿主能编、自举不能编"这类要
+     另开一个 reject 清单条目才看得见。
+- 关联：A467（await 位置的另一半）、§26（await 判据）。
+
 ### [ ] A464 运行期分配量统计缺失——托管分配没有可读的计数入口
 
 - 现象（2026-10-21 落地 Zan.Bench 时撞到）：基准测试要报"这次操作分配了
