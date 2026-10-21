@@ -136,13 +136,29 @@ public class Ai {
 
     /* 构造 messages 数组：系统提示词 + 历史（最多 20 轮）+ 当前问题。
     树构建 + ToJson 产出，转义交给 Encoding.JsonEscape（Q 不再需要）。 */
-    private static string Messages(AiAgent agent, string historyJson, string question) {
+    /* 拼 messages：系统提示词 + 最多 20 轮历史 + 本轮提问。
+     *
+     * historyJson 是**客户端**传来的（AssistantController 里 this.In("history")），
+     * 所以坏 JSON 必须兜住——解析不了就当没有历史，这一轮照样能问。
+     * JsonValue.Parse 遇坏 JSON 是**抛**异常，不接住就是 500。
+     *
+     * 公开是为了能单独测（它是个纯函数，不碰数据库）。
+     */
+    public static string Messages(AiAgent agent, string historyJson, string question) {
         JsonValue msgs = JsonValue.NewArray();
         JsonValue sys = JsonValue.NewObject();
         sys.PutStr("role", "system");
         sys.PutStr("content", agent.prompt);
         msgs.Append(sys);
-        JsonValue hist = JsonValue.Parse(historyJson);
+        JsonValue hist = null;
+        try {
+            hist = JsonValue.Parse(historyJson);
+        } catch (Exception e) {
+            /* history 是**客户端**传来的（见 AssistantController 的 this.In），
+             * 坏 JSON 不该把请求炸成 500。解析不了就当没有历史——这一轮
+             * 照样能问，只是没有上文。Parse 遇坏 JSON 是抛异常。 */
+            hist = null;
+        }
         if (hist != null && hist.IsArray()) {
             int keep = hist.Count();
             int start = 0;
@@ -234,7 +250,16 @@ public class Ai {
         }
         if (raw == null || raw.Length == 0) { return AiReply.Bad("AI 服务没有返回内容"); }
 
-        JsonValue root = JsonValue.Parse(raw);
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            /* 坏 JSON 不该把整个请求炸成 500：上游返回的可能是代理的
+             * HTML 错误页、截断的响应体、网关插的一行日志。Parse 遇坏
+             * JSON 是**抛**异常（不是返回 null），这里接住，报成"无法解析"
+             * ——下面那行 "内容无法解析" 的分支本来就是这个意思。 */
+            return AiReply.Bad("AI 服务返回的内容无法解析");
+        }
         if (root == null) { return AiReply.Bad("AI 服务返回的内容无法解析"); }
         JsonValue err = root.Get("error");
         if (err != null && err.IsObject()) {
@@ -438,7 +463,15 @@ public class Ai {
         }
         http.Close();
         if (raw == null || raw.Length == 0) { return ids; }
-        JsonValue root = JsonValue.Parse(raw);
+        JsonValue root = null;
+        try {
+            root = JsonValue.Parse(raw);
+        } catch (Exception e) {
+            /* 拿不到模型列表不是致命错误：返回空列表，让调用方按"没有可用
+             * 模型"处理。Parse 遇坏 JSON 是抛异常，不接住的话整个列表请求
+             * 会炸掉——而模型列表只是下拉框的候选项。 */
+            return ids;
+        }
         if (root == null) { return ids; }
         JsonValue data = root.Get("data");
         if (data == null || !data.IsArray()) { return ids; }
