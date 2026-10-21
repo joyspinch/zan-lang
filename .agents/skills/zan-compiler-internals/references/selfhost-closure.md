@@ -416,6 +416,20 @@ kernel32、shell32、user32、advapi32、version）。
   **async 方法**是合法的（C 宿主也接受）：自举的 `tests/selfhost/prog1.zan` 靠
   `int av = await P.AsTwice(21);` 跑出 42——同步上下文会把被 await 的协程跑完
   再取结果。判据是**操作数是不是帧**，不是**方法是不是 async**。
+- **await 落在哪儿也要管**：async 方法里、await 写在 **lambda 体内** → 拒绝
+  （lambda 不是协程，没有自己的帧可挂；硬降级会把它挂到**外层协程**的块上，
+  发出跨函数的 br，LLVM 校验直接失败：`Referring to a basic block in another
+  function`）。两个后端**同一句措辞**：`'await' inside a lambda is not
+  supported: a lambda is not a coroutine`。边界：**同步方法**里的同样写法合法
+  （外面没有协程，根驱动等得到）——判据是"外层有没有协程帧"，不是"外面是不是
+  lambda"。
+- 坑（实测）：这条诊断**做不进检查器**——检查器**不遍历 lambda 的函数体**
+  （`AST_LAMBDA` 分支把体丢给 `check_expr`，而体是语句块，`check_expr` 没有
+  语句分支 → 体根本没被走；`current_return_type` 也还是外层方法的，走进去会把
+  lambda 的 `return` 拿外层返回类型判，误报）。宿主侧要落在 **irgen**：那里有
+  lambda 深度与协程帧的上下文（发射 lambda 时把 `current_async_frame` 置空，
+  "外层有没有帧" = "外层方法是不是 async"）。自举侧相反：它的 AST 有通用子
+  节点表，**检查器**里就能查（`FindAwaitInLambda`）。
 - 门：差分门除了"能编且输出逐字一致"的用例，还多了一份 **reject 列表**
   （`tests/selfhost/reject_cases.txt` + `tests/selfhost/reject/<name>.zan`）：
   这些程序自举**必须拒绝**——非零退出**且不落 IR**。fail-closed 的边界要有门
@@ -1869,3 +1883,39 @@ kernel32、shell32、user32、advapi32、version）。
   走接收者求值——`Task` 是类型不是值，只会多出一条误导性的错误）。
 - 通用教训：**测试用例钉住的是"边界"，不是"某个具体函数名"**——实现推进
   时边界要跟着搬家，否则会出现"实现变好 → 门变红"的反向激励。
+## 100. struct 有隐式无参构造器（宿主对 struct 跳过构造器检查）
+
+- 坑（2026-10-21 实测）：`new Matrix4x4()`（`Matrix4x4` 是 **struct**，只有
+  一个 16 个 float 的构造器）在自举里报 "no constructor of 'Matrix4x4' takes 0
+  argument(s); a class that declares constructors has no implicit parameterless
+  one"，宿主却编译通过。根因：宿主检查器的构造器可用性检查第一句就是
+  `if (type->kind != TYPE_CLASS || !type->sym) return;`
+  （`src/compiler/checker.c: check_ctor_available`）——**struct 根本不做这个
+  检查**，于是 `new Vector3("x")`（1 个 string 传给 3 个 float 的构造器）在
+  宿主也合法，产物里就是一个全零的 struct。
+- 做法：自举在 `new` 的降级里，当没有构造器匹配时，若目标是 **struct** 就不
+  报错——按"隐式无参构造器"处理（实例已经分配好且已清零，字段初始化器照跑）。
+  "class 声明了构造器就没有隐式无参构造器"这条规则只对 class 成立。
+- 通用教训：**"隐式无参构造器"是 class 与 struct 的分水岭**——照抄别家的
+  报错文案时，要先确认那条规则的对象是"类型"还是"类"。
+## 101. 浮点字面量的 `f` 后缀决定类型（宿主 lit_suffix ? float : double）
+
+- 坑（2026-10-21 实测）：`Vector4.Multiply(a, 2.0f)` 在自举里选中了
+  `Multiply(Vector4, Vector4)` 重载，把 `2.0f` 当成一个 Vector4 传下去 →
+  clang 报 "floating point constant invalid for type"。根因：自举的词法器把
+  `f/F/m/M` 后缀**吃掉**了（只留在文本之外），于是 `2.0f` 与 `2.0` 在类型
+  眼里都是 double；候选里只有 `Multiply(Vector4, float)` 的形参是 float，
+  精确匹配拿不到分，两个候选打平 → 取第一个。
+- 做法：词法器把浮点后缀记进 token（`litSuffix`：1=f/F，2=m/M），解析器放进
+  节点的 `suffix`，**后端的实参定型**（`ArgTypeNode` → `FloatLitType`）按后缀
+  给 "float" 或 "double"。
+- 通用教训：**后缀不是装饰**——它决定字面量的类型，而类型决定重载选择；
+  词法器"顺手吃掉"后缀时，后面所有按类型选候选的逻辑都会悄悄偏一格。
+## 102. float 与 double 互相可隐式转换：重载评分不算"不匹配"
+
+- 坑（2026-10-21 实测）：`Foo(double)` 与 `Foo(float)` 两个重载，传 `2.0f`
+  时若按"名字不同即不匹配"扣分，float 那个重载会被判成不可用。
+- 做法：`ScoreCand` 里 float/double 这一对不再扣分（只是拿不到精确匹配的
+  加分）——宿主允许 float 实参进 double 形参（加宽），也允许反向。
+- 通用教训：**"不匹配"和"不是精确匹配"是两件事**：能隐式转换的类型对不该
+  被判出局，只是排序靠后。
