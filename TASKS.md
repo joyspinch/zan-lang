@@ -1509,6 +1509,74 @@
   凭直觉写不出来。
 - 关联：A471（宿主侧同一条战线）、A485（自举缺的窄化规则）、A463（宿主诊断不渲染
   可空标志——两边目前一致地"不渲染"）。
+### [x] A485 自举没有宿主的「窄化转换」规则——`int y = 5.0;` 在自举里编译通过
+
+- 现象：宿主报
+  `narrowing conversion from 'double' to 'int' in initializer needs an explicit cast (C# rules)`；
+  自举一个字都不说（浮点值直接进整型槽）。
+- 机制：宿主在 `checker_check_assignable` 里**先**判窄化（常量还要看是否越界：
+  `byte b = 200;` 合法、`byte b = 300;` 非法），**再**判通用可赋值性；自举现在
+  只有后者（A477），且**刻意跳过**了"浮点进整型槽"这一格——怕措辞对不上。
+- 影响：自举仍放得过宽；两边对同一个程序的分歧还在（一条报窄化、一条不报）。
+- 修法（2026-10-21 落地）：`src/selfhost/checker.zan`
+  - 新增 `CheckNarrowing(target, valueExpr, valueTy, what, line, col)`，在
+    `CheckStmt(AK.VarDecl)`（含逗号续列）与 `CheckStmt(AK.ReturnStmt)` 上调用；
+  - 两个触发形状：**浮点值进整型槽**（char 槽、枚举槽也算整型槽，`Color c = 5.0`
+    报窄化）与**整型常量越界**（`byte b = 300` 报，`byte b = 200` 不报）；
+  - 常量取值靠字面量节点的 `ival`（`IsConstIntExpr` / `ConstIntExpr`，一元负号
+    也算），目标范围表 `FitsTarget` 对齐 byte/sbyte/short/ushort/char/int/uint；
+  - 措辞与宿主**逐字一致**：`narrowing conversion from 'X' to 'Y' in <what>
+    needs an explicit cast (C# rules)`（`what` 取 `initializer` /
+    `return statement`）；
+  - 顺带把整型字面量的类型名补准：超 int 范围的字面量在宿主是 `long`
+    （`int v = 3000000000` 报 `narrowing conversion from 'long' to 'int'`），
+    自举原来一律当 `int`。
+- **判据是先量后写**（同 A477）：先用 98 组矩阵 + 4 组边界探针把宿主的判定表
+  量出来，再照着实现。量出来的结论有三条是凭直觉写不出来的：
+  1. `decimal` **不是**浮点：`int v = 5.0m` 宿主报的是 *cannot convert* 而不是
+     *narrowing*（宿主的窄化分支只认 float/double）；
+  2. **可空槽不窄化**：`int? x = 5.0` 宿主一声不吭；
+  3. **非常量不窄化**：`byte b = someLong` 宿主也不报，只有常量越界才报。
+- 验证：
+  - 98 组矩阵 + 4 组边界逐条对照宿主：**误报 0、措辞差 0**；
+  - 漏报 16 条，全部落在两类已知缺口（见 A486 / A487），没有第三类；
+  - 自举 64 个源用宿主 zanc 重建 gen1 通过（自举自己的源码没有被误伤）；
+  - 新增 4 条拒绝用例 `tests/selfhost/reject/narrowing_*.zan` 进
+    `tests/selfhost/reject_cases.txt`（三段式：自举措辞 + 宿主措辞），宿主与
+    自举逐字相同（含枚举目标与 return 路径）。
+- 教训：**"看起来一样"的两种类型可能不是一回事**。自举把 `decimal` 类型映射到
+  `double`（`parser.zan`），第一版按"能区分"实现，结果把
+  `decimal d = 5.0m;`（合法）判成了错——**误报比漏报贵得多**：漏报只是放过一个
+  该拒的程序，误报是拒绝一个该过的程序。宁可把两边都放过。
+- 关联：A477（同一处检查的另一半）、A486、A487、A463。
+
+### [ ] A486 自举不判「枚举目标」的通用可赋值性——`Color c = "x";` 在自举里编译通过
+
+- 现象：宿主报
+  `cannot convert 'string' to 'Color' in initializer: no implicit conversion`；
+  自举不报（枚举目标在自举的 `CheckAssignable` 里直接 return）。
+- 机制：A477 把枚举目标划到"用户类型"一类（宿主靠类层次判定，自举的类型模型
+  没有层次），于是枚举目标**整类**不参与通用可赋值性判定——连明显不匹配的
+  `string` / `bool` 值也放过了。
+- 影响：自举对枚举槽比宿主宽；同一个程序两边判定分叉。
+- 方向：枚举目标可以单独判**原始类型**的值（string / bool / 浮点等），不必建模
+  类层次——但要避开宿主的一个例外：`Color c = 5.0m;`（decimal 值）宿主**不报**，
+  所以判的时候要把 decimal 排除掉。
+- 关联：A485（枚举目标在窄化那一档已经判了）、A477。
+
+### [ ] A487 自举把 `decimal` 类型映射成 `double`——目标侧无法区分 `decimal` 与 `double`
+
+- 现象：宿主有真正的 `decimal` 类型，与 `double` **互不隐式转换**
+  （`double d = 5.0m` 报 *cannot convert*，`decimal d = 5.0` 也报）；
+  自举的 `parser.zan` 把 `TK.Decimal()` 映射成 `"double"`，AST 里 `decimal`
+  目标与 `double` 目标**是同一个东西**。
+- 影响：A485 的 16 条漏报里有 12 条来自这里：目标侧一旦涉及 decimal，自举就
+  分不清该按 `double` 规则（拒 decimal 值）还是按 `decimal` 规则（收 decimal 值）。
+- 方向：要么让自举保留 `decimal` 这个类型名（parser 不再映射，irgen 侧仍按
+  double 发射但类型名留着），要么明确接受"decimal 目标侧一律放行"这条边界。
+  前者更彻底，但会牵动 irgen 的类型判定。
+- 关联：A485（本次的漏报清单）、A463（诊断里类型名不渲染可空标志，同属
+  "自举的类型名比宿主粗"这一类）。
 ### [x] A478 「标题栏浮动组件忽略标题栏高度」——浮动件的基准没让开父容器的顶部停靠带
 
 - 现象（用户 2026-10-21 报）：「标题栏浮动组件会忽略标题栏高度」。现场确认为
