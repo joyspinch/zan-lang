@@ -1774,3 +1774,93 @@ kernel32、shell32、user32、advapi32、version）。
   把 `this` 按基类指针转换后直调基类方法。
 - 通用教训：**"基类调用"不是"虚调用的另一种写法"**——它绕过虚表，语义
   与 `this.M()` 相反，实现时不能复用虚分发那条路。
+## 93. async 泛型方法按实例特化（与同步泛型方法同一套）
+
+- 坑（实测）：`await s.Echo<int>(42)`（async 泛型方法）在自举里
+  报 "not supported by the self-hosted compiler yet"——`CanSpecialize` 里
+  一句 `if (IsAsync(m)) return false;` 把所有 async 方法挡在特化之外，
+  调用点只能打到**擦除**的共享体（`async U Echo<U>(U x)` 的 `U` 是 i64 槽）。
+  宿主对 async 方法一样按实例特化（与普通泛型方法同一条路）。
+- 做法：放开 `CanSpecialize` 的 async 限制；克隆体的符号是克隆自己的名字
+  （`Owner_M__SPint`），`GenAsyncMethod` 用 `MethodSym(cls.sval, clone)` 算
+  出来正好等于 `SpecQueue` 交给调用点的那个符号——两边天然对齐；调用点的
+  **awaited 结果类型**要用代入后的返回类型（`tt.a = SubstTP(m.type, ...)`）。
+- 通用教训：**"特化"是按调用点的类型实参做的 monomorphization，与方法
+  是不是 async 无关**；async 只是把"结果类型"藏在了协程帧里，别把它当成
+  不能特化的理由。
+## 94. 调用点的返回类型要代入类型实参（接收者实例化 + 显式类型实参）
+
+- 坑（实测）：`await ps.Get<int>(1)`（`Pool<string>` 的方法，
+  返回 `T`）在自举里把结果打成了一串指针数字（`140698019280840`）而不是
+  `hello`：await 临时量的类型来自 `AwaitCallTy` → 克隆方法**声明的**返回
+  类型 `T`（擦除），没有代入。宿主在检查器里就代入了
+  （`src/compiler/checker.c:2880`：`binder_subst_named(ret, tps, targs)`）。
+- 做法：加 `SubstCallType`（接收者的具体实例化绑定**类**的类型参数，
+  显式类型实参绑定**方法**的类型参数）+ `CallResultType`；`ArgTypeNode` 的
+  call/await 分支与 `AwaitCallTy` 都走它。宿主还有一条：接收者的实例化
+  决定成员类型（`Pool<string>.item` 是 `string` 不是 `T`）。
+- 通用教训：**"声明的返回类型"和"这次调用的返回类型"是两回事**——凡是
+  返回类型里出现类型参数的地方，都要问"这次调用把它代入成什么了"。
+## 95. 方法签名含**类型参数个数**（泛型重载与普通重载并存）
+
+- 坑（实测）：`b.GetAsync<User>("k")` 与 `b.GetAsync("k")`
+  指向同一对重载（`GetAsync(string)` 与 `GetAsync<T>(string)`），自举的
+  候选去重按**参数类型标签**（`ParamTags`）判"同签名"，于是泛型那个被当
+  成重复候选丢掉 → 显式类型实参选不到它。C# 的方法签名含类型参数的
+  **元数**，`M<T>(string)` 与 `M(string)` 是两个签名。
+- 做法：去重改用 `SigTags`（类型参数个数 + 参数类型标签）；显式类型实参
+  另外按宿主的规则筛候选（`checker.c:1681`：候选的类型参数个数与调用点
+  的类型实参个数不同的**不是候选**），`AwaitTarget` 也要同一条。
+- 通用教训：**"重载"要按语言定义的签名判，不是按参数列表判**；参数
+  列表相同但类型参数元数不同的两个方法，在 C# 里是两个重载。
+## 96. `Task.Cancel` = 帧上的取消标志 + resume 时中止
+
+- 坑（实测）：自举对 `Task.Cancel(handle)` 报 "not supported"，
+  根因是自举把任务句柄降级成**自己的扁平帧**（句柄就是帧指针），而帧头
+  里没有取消标志这一格。宿主在协程帧头里有 `ASYNC_FRAME_CANCEL`，取消
+  时置位（`src/compiler/irgen_async.c` 的 `get_co_cancel_fn`），帧在
+  **下一次 resume** 时检查它并走完成路径（`emit_async_cancel_check`）。
+- 做法：自举的帧头扩一格（槽 10 = cancel，帧体整体后移一格）；帧的 resume
+  入口检查该标志，置位则**不跑函数体**，直接释放帧自己拥有的引用、标记
+  完成、唤醒 awaiter（帧本身由 awaiter 回收，所以取消路径不能自己
+  `__zan_co_frame_free`）。
+- 通用教训：**"取消"是协作式的**——置标志 + 在恢复点检查，而不是立刻
+  杀线程；标志放在**帧**上（不是全局表）才能随帧一起被复用与回收。
+## 97. async 跨帧异常：longjmp 的目标帧可能已经死了（已知缺口）
+
+- 坑（实测）：`await s.Thrown()`（被 await 的 async 方法里
+  `throw`）在自举里**堆损坏**（0xC0000374），宿主正常。原因：自举的
+  异常传播是 `longjmp` 到**外层** try 的 setjmp 缓冲，而那个 setjmp 是在
+  awaiter **上一次** resume 调用里下的——那次调用在挂起时已经返回，栈帧
+  死了，longjmp 恢复到一段已复用的栈上。
+- 宿主的两条机制（`src/compiler/irgen_async.c`）：异常**经帧传递**（子任务
+  的异常存在帧里，awaiter 恢复后在自己的帧里重新抛出），且**每次 resume
+  都重新挂载**处理器（帧的处理器栈 + resume 入口的 re-arm 段）。
+- 通用教训：**协程里的 setjmp 目标必须是"还活着"的栈帧**——要么把异常
+  变成帧上的数据（由恢复方在自己的栈里重抛），要么在每次恢复时重新
+  下 setjmp；只把 jmp_buf 放进全局数组**不够**（缓冲活着，里面存的
+  rsp/rip 仍然指向死栈）。
+## 98. 取消要沿"等待关系"下传（自举与宿主的已知差异）
+
+- 坑（实测）：宿主的 `__zan_co_cancel` 不止置目标帧的
+  `ASYNC_FRAME_CANCEL`，还沿帧头的 `ASYNC_FRAME_CHILD` 链把**后代帧**
+  一起置位；自举的 `Task.Cancel` 只置目标帧的槽 10——父帧没有"当前正在
+  等的那个子帧"这一格可循。
+- 现状：自举的帧是"每个 await 点一个子帧槽"，父帧不保存"当前子帧"，
+  因此取消无法沿链下传：被取消的任务若正卡在一次 `await` 上，要等它被
+  恢复时才会看到标志。
+- 通用教训：**"取消"在协程里是沿"等待关系"传播的**，只置目标帧等于只取消
+  了"自己那一层"；要补齐得先有"当前子帧"指针（父帧记住正在等的子帧）。
+## 99. reject 用例的"钉子"会随实现推进失效——要改钉，不是删用例
+
+- 坑（实测）：`reject_cases.txt` 里的
+  `unsupported_builtin_call` 拿 `Task.Cancel` 当"自举还没实现的 C 宿主
+  内建"的钉子；自举把 `Task.Cancel` 实现之后，这条用例反而**编译通过了**
+  → 差分门判 "the self-hosted compiler accepted a program it must reject"。
+- 做法：实现一个内建前先看它是不是别处的钉子；是的话把钉子**改钉**到
+  另一个仍未实现的内建（同一个"仍不支持"诊断措辞），而不是删用例或放弃
+  实现。钉子的作用是守住 fail-closed 边界，边界本身不能消失。
+  顺带把"未支持的 `Task.X` 静态成员"做成一条干净的诊断分支（不要再往下
+  走接收者求值——`Task` 是类型不是值，只会多出一条误导性的错误）。
+- 通用教训：**测试用例钉住的是"边界"，不是"某个具体函数名"**——实现推进
+  时边界要跟着搬家，否则会出现"实现变好 → 门变红"的反向激励。

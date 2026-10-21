@@ -253,14 +253,26 @@ partial class Irgen {
     // Is a method with the same parameter signature already in the list? A
     // derived member hides a base member with the same signature, so the base
     // one is not a separate candidate.
+    //
+    // The signature includes the TYPE-PARAMETER COUNT (C#: `M<T>(string)` and
+    // `M(string)` are different signatures -- the generic one does not hide
+    // the plain one). Without it the plain overload swallowed the generic one
+    // and `b.GetAsync<User>("k")` reached the non-generic method.
     bool HasSameSig(List<Node> cands, Node m) {
-        string tags = ParamTags(m);
+        string tags = SigTags(m);
         int i = 0;
         while (i < cands.Count) {
-            if (ParamTags(cands[i]) == tags) { return true; }
+            if (SigTags(cands[i]) == tags) { return true; }
             i = i + 1;
         }
         return false;
+    }
+
+    // The signature of a method: its type-parameter count plus its parameter
+    // types. Used for the hiding rule only -- the emitted symbols keep their
+    // own naming (MethodSym).
+    string SigTags(Node m) {
+        return "T" + TParams(m).Count + ParamTags(m);
     }
 
     // Does the method accept this many positional arguments? A `params` tail
@@ -472,6 +484,93 @@ partial class Irgen {
     }
 
     // ---- non-emitting argument typer (for overload resolution only) ----
+    // The method's return type with the type arguments applied: the receiver's
+    // concrete instantiation binds the CLASS's type parameters (`Pool<string>`
+    // -> T = string), the explicit type arguments bind the METHOD's
+    // (`Get<int>(x)` -> U = int). The C host's checker substitutes the same
+    // way (checker.c:2880) -- without it an awaited `T` stayed erased and the
+    // value was printed as an integer.
+    Node SubstCallType(Node m, Node recvTy, Node e) {
+        if (m == null) { return null; }
+        List<string> tns = new List<string>();
+        List<Node> trs = new List<Node>();
+        if (recvTy != null && recvTy.kids.Count > 0) {
+            Node cls = binder.FindType(recvTy.sval);
+            if (cls != null) {
+                List<string> ctps = TParams(cls);
+                int i = 0;
+                while (i < ctps.Count && i < recvTy.kids.Count) {
+                    tns.Add(ctps[i]); trs.Add(recvTy.kids[i]);
+                    i = i + 1;
+                }
+            }
+        }
+        Node targs = ExplicitTypeArgs(e);
+        if (targs != null) {
+            List<string> mtps = TParams(m);
+            int i = 0;
+            while (i < mtps.Count && i < targs.kids.Count) {
+                if (IndexOfStr(tns, mtps[i]) < 0) { tns.Add(mtps[i]); trs.Add(targs.kids[i]); }
+                i = i + 1;
+            }
+        }
+        return SubstTP(m.type, tns, trs);
+    }
+
+    // The overload a call with EXPLICIT type arguments names: the candidate
+    // whose type-parameter count matches them (the C host's rule,
+    // checker.c:1681: a candidate whose method type-parameter count differs
+    // from the call's type-argument count is not a candidate at all).
+    Node MethodForTypeArgs(Node cls, string name, Node e) {
+        Node targs = ExplicitTypeArgs(e);
+        if (targs == null || cls == null) { return null; }
+        int n = targs.kids.Count;
+        Node c = cls;
+        while (c != null) {
+            int i = 0;
+            while (i < c.kids.Count) {
+                Node m = c.kids[i];
+                if (m.kind == AK.MethodDecl() && m.sval == name && TParams(m).Count == n) { return m; }
+                i = i + 1;
+            }
+            c = BaseClassOf(c);
+        }
+        return null;
+    }
+
+    // The result type of a call: the callee's return type with the type
+    // arguments applied.
+    Node CallResultType(Node e) {
+        if (e == null) { return null; }
+        Node callee = e.a;
+        if (callee == null) { return null; }
+        Node m = null; Node recvTy = null;
+        if (callee.kind == AK.MemberAccess()) {
+            recvTy = ArgTypeNode(callee.a);
+            Node rc = ClassOf(recvTy);
+            if (rc != null) {
+                m = MethodForTypeArgs(rc, callee.sval, e);
+                if (m == null) { m = FindMethodUp(rc, callee.sval); }
+            }
+            // a static call through a class name: `Sha1.Hash(...)`
+            if (m == null && callee.a != null && callee.a.kind == AK.Ident()) {
+                Node tc = binder.FindType(callee.a.sval);
+                if (tc != null) {
+                    m = MethodForTypeArgs(tc, callee.sval, e);
+                    if (m == null) { m = FindMethodUp(tc, callee.sval); }
+                }
+            }
+        } else if (callee.kind == AK.Ident()) {
+            Node cls = binder.FindType(curClass);
+            if (cls != null) {
+                m = MethodForTypeArgs(cls, callee.sval, e);
+                if (m == null) { m = FindMethodUp(cls, callee.sval); }
+            }
+        }
+        if (m == null) { return null; }
+        return SubstCallType(m, recvTy, e);
+    }
+
     // Yields the static type of an argument expression without generating any
     // IR. Returns null when the type cannot be determined; callers treat that
     // as "compatible with anything" so nothing is mis-resolved.
@@ -546,32 +645,13 @@ partial class Irgen {
             // like `b.Data()` types as "unknown", and every overload scores
             // the same -- `Sha1.Hash(bytes, len)` then tied with
             // `Sha1.Hash(string, len)` and the call was refused.
-            Node callee = e.a;
-            if (callee == null) { return null; }
-            if (callee.kind == AK.MemberAccess()) {
-                Node rc = ClassOf(ArgTypeNode(callee.a));
-                if (rc != null) {
-                    Node m = FindMethodUp(rc, callee.sval);
-                    if (m != null) { return m.type; }
-                }
-                // a static call through a class name: `Sha1.Hash(...)`
-                if (callee.a != null && callee.a.kind == AK.Ident()) {
-                    Node tc = binder.FindType(callee.a.sval);
-                    if (tc != null) {
-                        Node m = FindMethodUp(tc, callee.sval);
-                        if (m != null) { return m.type; }
-                    }
-                }
-                return null;
-            }
-            if (callee.kind == AK.Ident()) {
-                Node cls = binder.FindType(curClass);
-                if (cls != null) {
-                    Node m = FindMethodUp(cls, callee.sval);
-                    if (m != null) { return m.type; }
-                }
-            }
-            return null;
+            // The type arguments are applied: `GetAsync<User>(k)` is a User,
+            // not the erased type parameter.
+            return CallResultType(e);
+        }
+        if (k == AK.AwaitExpr()) {
+            // the awaited value's type: the awaited call's result type
+            return CallResultType(e.a);
         }
         return null;
     }

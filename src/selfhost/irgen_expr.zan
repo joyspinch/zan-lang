@@ -4274,6 +4274,21 @@ partial class Irgen {
             if (cn == "Task" && mn == "IsDone" && e.kids.Count == 1) {
                 return EmitTaskIsDone(e);
             }
+            if (cn == "Task" && mn == "Cancel" && e.kids.Count == 1) {
+                return EmitTaskCancel(e);
+            }
+            // A static member of `Task` the self-hosted backend cannot lower
+            // (Task.IsCancellationRequested, Task.Join*): the C host has them
+            // (src/compiler/builtin_api.c: members_task), the self-host does
+            // not. Fail closed with a diagnostic -- the receiver (`Task`) is a
+            // type, not a value, so evaluating it would only add a second,
+            // misleading error. `Task.Delay` is left alone: the await path
+            // lowers it before it reaches here.
+            if (cn == "Task" && mn != "Delay") {
+                diags.Error("call to 'Task." + mn + "' is not supported by the self-hosted "
+                    + "compiler yet", e.line, e.col);
+                return new ExprVal("0", MkType("int"));
+            }
             if (cn == "Environment" && mn == "ArgCount") {
                 string a = NT(); L("  " + a + " = load i32, i32* @__zan_argc");
                 string a64 = NT(); L("  " + a64 + " = sext i32 " + a + " to i64");
@@ -5359,7 +5374,16 @@ partial class Irgen {
             L("  " + res + " = select i1 " + isn + ", i8* null, i8* " + TagClosure(clo));
             return new ExprVal(res, m.type);
         }
-        if (isAsyncCall) { Node tt = MkType("__task"); tt.a = m.type; return AsyncFrame(t, tt); }
+        // an async call hands back the coroutine FRAME; the awaited value's
+        // type is the method's RETURN type -- substituted when the call
+        // specialized the method (`await s.Echo<int>(42)` awaits an int, not
+        // the erased type parameter)
+        if (isAsyncCall) {
+            Node tt = MkType("__task");
+            tt.a = m.type;
+            if (spec) { tt.a = SubstTP(m.type, stns, strs); }
+            return AsyncFrame(t, tt);
+        }
         if (spec) {
             Node srt = SubstTP(m.type, stns, strs);
             AddTemp(t, srt);
@@ -5830,7 +5854,10 @@ partial class Irgen {
     bool CanSpecialize(Node m) {
         if (m == null || m.d == null) { return false; }
         if (HasMod(m, MOD.Extern())) { return false; }
-        if (IsAsync(m)) { return false; }
+        // an async method specializes like any other: the clone is lowered by
+        // GenAsyncMethod, whose symbol is the clone's own name (`Owner_M__SPint`)
+        // -- the same one SpecQueue hands to the call site. The awaited RESULT
+        // type comes from the clone's substituted return type.
         return true;
     }
 
@@ -5991,7 +6018,16 @@ partial class Irgen {
         }
         string t = NT();
         L("  " + t + " = call " + rt + " @" + sym + "(" + args + ")");
-        if (isAsyncCall) { Node tt = MkType("__task"); tt.a = m.type; return AsyncFrame(t, tt); }
+        // an async call hands back the coroutine FRAME; the awaited value's
+        // type is the method's RETURN type -- substituted when the call
+        // specialized the method (`await s.Echo<int>(42)` awaits an int, not
+        // the erased type parameter)
+        if (isAsyncCall) {
+            Node tt = MkType("__task");
+            tt.a = m.type;
+            if (spec) { tt.a = SubstTP(m.type, stns, strs); }
+            return AsyncFrame(t, tt);
+        }
         if (spec) {
             Node srt = SubstTP(m.type, stns, strs);
             AddTemp(t, srt);

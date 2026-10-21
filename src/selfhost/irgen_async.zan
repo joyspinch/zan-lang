@@ -196,7 +196,7 @@ partial class Irgen {
         if (callee == null) { return null; }
         if (callee.kind == AK.Ident()) {
             Node mm = AwaitTarget(cls, callee.sval, m, callExpr, false);
-            if (mm != null) { return mm.type; }
+            if (mm != null) { return SubstCallType(mm, CurThisTy(), callExpr); }
             return null;
         }
         if (callee.kind == AK.MemberAccess()) {
@@ -204,14 +204,14 @@ partial class Irgen {
             if (r == null) { return null; }
             if (r.kind == AK.ThisExpr()) {
                 Node mt = AwaitTarget(cls, callee.sval, m, callExpr, false);
-                if (mt != null) { return mt.type; }
+                if (mt != null) { return SubstCallType(mt, CurThisTy(), callExpr); }
                 return null;
             }
             if (r.kind == AK.Ident()) {
                 Node rc = binder.FindType(r.sval);
                 if (rc != null) {
                     Node ms = AwaitTarget(rc, callee.sval, m, callExpr, true);
-                    if (ms != null) { return ms.type; }
+                    if (ms != null) { return SubstCallType(ms, null, callExpr); }
                     return null;
                 }
                 Node vt = DeclTypeOf(m, r.sval);
@@ -219,7 +219,9 @@ partial class Irgen {
                     Node rc2 = binder.FindType(vt.sval);
                     if (rc2 != null) {
                         Node mi = AwaitTarget(rc2, callee.sval, m, callExpr, true);
-                        if (mi != null) { return mi.type; }
+                        // the receiver's own instantiation binds the class's
+                        // type parameters (`Pool<string>` -> T = string)
+                        if (mi != null) { return SubstCallType(mi, vt, callExpr); }
                     }
                 }
             }
@@ -248,9 +250,16 @@ partial class Irgen {
         }
         if (cands.Count == 0) { return null; }
         int argc = callExpr.kids.Count;
+        // explicit type arguments pick the overload: a candidate whose
+        // type-parameter count differs from the call's type-argument count is
+        // not a candidate at all (the C host's rule, checker.c:1681)
+        Node targs = ExplicitTypeArgs(callExpr);
+        int targc = 0;
+        if (targs != null) { targc = targs.kids.Count; }
         List<Node> fit = new List<Node>();
         int i = 0;
         while (i < cands.Count) {
+            if (targc > 0 && TParams(cands[i]).Count != targc) { i = i + 1; continue; }
             if (AcceptsArity(cands[i], argc)) { fit.Add(cands[i]); }
             i = i + 1;
         }
@@ -851,7 +860,9 @@ partial class Irgen {
         List<Node> ltypes = new List<Node>();
         if (m.d != null) { PrescanAsyncLocals(m.d, lnames, ltypes); }
         int awaitCount = 0; if (m.d != null) { awaitCount = CountAwaits(m.d); }
-        int header = 10;
+        int header = 11;
+        // 0=sched 1=sched_step 2=state 3=done 4=awaiter 5=awaiter_step
+        // 6=result 7=cleanup 8=hcount 9=own_resume 10=cancel
         int thisSlot = header;
         int paramBase = header + thisExtra;
         int localBase = paramBase + pn.Count;
@@ -984,6 +995,18 @@ partial class Irgen {
         }
         string st = NT();
         L("  " + st + " = load i64, i64* " + FrameGep("%ff", 2));
+        // A CANCELLED frame aborts at its next resume: the C host sets the
+        // frame's cancel flag (irgen_call.c: get_co_cancel_fn) and the resume
+        // path checks it before running the body (irgen_async.c:
+        // emit_async_cancel_check). The flag lives in the frame's slot 10.
+        string cfl = NT();
+        L("  " + cfl + " = load i64, i64* " + FrameGep("%ff", 10));
+        string cfc = NT();
+        L("  " + cfc + " = icmp ne i64 " + cfl + ", 0");
+        int lCancel = NL();
+        L("  br i1 " + cfc + ", label %L" + lCancel + ", label %co.go");
+        L("co.go:");
+        term = false; curLbl = "co.go";
         string sw = "  switch i64 " + st + ", label %co.start [ i64 0, label %co.start";
         int a2 = 1;
         while (a2 <= awaitCount) { sw = sw + " i64 " + a2 + ", label %resume_" + a2; a2 = a2 + 1; }
@@ -993,6 +1016,12 @@ partial class Irgen {
         EmitAsyncReloadSlots();
         if (m.d != null) { GenStmt(m.d); }
         if (!term) { EmitAsyncEpilogue(); EmitAsyncComplete("0"); }
+        // the cancelled path: the body does not run -- the frame releases what
+        // it owns, marks itself done and wakes its awaiter. The frame itself
+        // is NOT freed here: the awaiter reads the result and frees it.
+        Label(lCancel);
+        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, paramBase, lnames, ltypes, localBase, false);
+        EmitAsyncComplete("0");
         L("}");
         obody.Append(entryAllocas.ToString());
         obody.Append(body.ToString());
@@ -1009,12 +1038,24 @@ partial class Irgen {
         L("define internal void @" + sym + "$cleanup(i8* %fp) {");
         L("entry:");
         L("  %ff = bitcast i8* %fp to i64*");
-        if (!stat && ArcManaged(thisTy)) {
+        EmitAsyncFrameRelease(!stat, thisTy, thisSlot, pn, pt, paramBase, lnames, ltypes, localBase, true);
+        L("  ret void");
+        L("}");
+    }
+
+    // Release the values a frame owns (the receiver, the params and the
+    // locals), reading them from the frame's slots -- the frame is the
+    // authority across a suspension. `freeFrame` also releases the frame
+    // itself: the cleanup function does, the cancelled path does not (its
+    // awaiter still reads the result and frees the frame).
+    void EmitAsyncFrameRelease(bool hasThis, Node thisTy, int thisSlot, List<string> pn, List<Node> pt,
+        int paramBase, List<string> lnames, List<Node> ltypes, int localBase, bool freeFrame) {
+        if (hasThis && thisTy != null && ArcManaged(thisTy)) {
             string ctp = FrameGep("%ff", thisSlot);
             string cti = NT(); L("  " + cti + " = load i64, i64* " + ctp);
             EmitArcRelease(FromI64(cti, MapType(thisTy)), thisTy);
         }
-        j = 0;
+        int j = 0;
         while (j < pn.Count) {
             if (ArcManaged(pt[j])) {
                 string cpp = FrameGep("%ff", paramBase + j);
@@ -1043,9 +1084,7 @@ partial class Irgen {
             }
             j = j + 1;
         }
-        L("  call void @__zan_co_frame_free(i8* %fp)");
-        L("  ret void");
-        L("}");
+        if (freeFrame) { L("  call void @__zan_co_frame_free(i8* %fp)"); }
     }
     // Directory listing + exe-path helpers (Windows host). @zan_dir_list
     // returns the file names matching a glob pattern joined by '\n' (empty
@@ -1658,6 +1697,24 @@ partial class Irgen {
         diags.Error("member '" + mname + "' of type 'Task' is not supported by the self-hosted "
             + "compiler yet", e.line, e.col);
         return new ExprVal("0", MkType("int"));
+    }
+
+    // Task.Cancel(handle): mark the frame cancelled. The frame aborts at its
+    // next resume (the C host sets the frame's cancel flag and the resume
+    // path checks it -- irgen_call.c: get_co_cancel_fn, irgen_async.c:
+    // emit_async_cancel_check). The handle IS the frame pointer.
+    ExprVal EmitTaskCancel(Node e) {
+        ExprVal h = GenExpr(e.kids[0]);
+        string fp;
+        if (MapType(h.ty) == "i64") {
+            fp = NT(); L("  " + fp + " = inttoptr i64 " + h.op + " to i8*");
+        } else {
+            fp = h.op;
+        }
+        string fph = TaskFrameHeader(fp);
+        string cp = FrameGep(fph, 10);
+        L("  store i64 1, i64* " + cp);
+        return new ExprVal("0", MkType("void"));
     }
 
     // Task.IsDone(handle)：裸句柄是否已经跑完。
