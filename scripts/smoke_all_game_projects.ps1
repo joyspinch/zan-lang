@@ -19,11 +19,15 @@ param(
         'platformer', 'powder', 'racekart', 'rail', 'voxel'),
     # zan-lang 仓库根（编译器与公共包在它下面）
     [string]$ZanHome = 'D:\project\zan-lang',
+    # 公共包解析根（默认 = zan-lang 仓库根；公共包正被并行改动时，
+    # 可指向一个干净的 git worktree，避免用半改动的包树编译）
+    [string]$PackageProject = '',
     [switch]$Json
 )
 
 $ErrorActionPreference = 'Continue'
 $env:ZAN_HOME = $ZanHome
+if (-not $PackageProject) { $PackageProject = $ZanHome }
 $results = New-Object System.Collections.Generic.List[object]
 
 foreach ($p in $Projects) {
@@ -35,7 +39,7 @@ foreach ($p in $Projects) {
         continue
     }
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $out = & pwsh -NoProfile -File $test 2>&1
+    $out = & pwsh -NoProfile -File $test -PackageProject $PackageProject 2>&1
     $sw.Stop()
     $text = ($out | ForEach-Object { $_.ToString() }) -join "`n"
     $ok = $LASTEXITCODE -eq 0 -and $text -match '_SMOKE_OK'
