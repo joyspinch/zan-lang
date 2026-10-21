@@ -33,6 +33,39 @@
 - 关联：A468（await 的宿主/自举口径）、§26（await 判据）。
 
 
+### [ ] A471 类型检查器不下钻 lambda 体——lambda 里的类型错误全部静默通过
+
+- 现象（2026-10-21 查 `await` 规则时实测）：**块体 lambda 的函数体完全不过类型检查**。
+  同一段代码放在方法体里报错，放进 lambda 里编译通过：
+
+  ```zan
+  int y = "hello";                    // 方法体：error: cannot convert 'string' to 'int'
+  Func<int> f = () => { int x = "hello"; return x; };   // lambda 体：无任何诊断
+  ```
+
+  实测该程序 `f()` 返回 `-1065074624`（把字符串指针当 int 读出来），编译期一个字都不说。
+- 根因：`src/compiler/checker.c` 的 `AST_LAMBDA` 分支把 **lambda 体当表达式**交给
+  `zan_checker_check_expr`；而块体 lambda 的 `lambda.body` 是 `AST_BLOCK` **语句**节点
+  （`parser.c` 的 `parse_block`），`zan_checker_check_expr` 的 `default:` 分支直接
+  `return c->binder->type_error`、**不下钻** → 整块 lambda 体的语句从来没进过类型检查。
+  未定义变量仍会报错，但那是 `nsresolve.c` 的名字解析阶段抓的，不是类型检查。
+- 连带影响（比"漏报"更严重）：**凡是挂在 checker 的 `AST_LAMBDA` 分支上的语义规则都
+  永远不会触发**。2026-10-21 那条「async 方法里 lambda 内部的 await 要拒绝」最初就
+  挂在 checker（用 `lambda_depth` 计数），结果一条都报不出来——程序继续走到 irgen，
+  生成跨函数的 `br`，LLVM 校验直接失败（"Referring to a basic block in another
+  function"），只吐一句 "code generation failed"，看不出是哪个 await 的问题。同一条
+  规则挪到 irgen（发码阶段才知道外层是不是协程）才真正报得出来。自举那边同样不下钻
+  lambda 体——它找 lambda 里的 await 靠的是**语法遍历**（`FindAwaitInLambda`），
+  不是类型检查。
+- 方向：`AST_LAMBDA` 分支按体的形态分派——`AST_BLOCK` 走 `zan_checker_check_stmt`
+  （并给 lambda 建自己的作用域：形参 + 局部变量），表达式体走 `zan_checker_check_expr`；
+  同时把 lambda 的返回类型与 `current_type_sym` 摆好。**代价**：这一步会一次性打开
+  全仓（stdlib + packages + templates + examples）所有 lambda 体的类型检查，之前被
+  吞掉的类型错误会成批冒出来——属于独立战线，要单独做、单独扫，不能顺手带。
+- 关联：`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26
+  （await 的判据与 lambda 内 await 的落点）、自举 `src/selfhost/checker.zan` 的
+  `CheckAwaits` / `FindAwaitInLambda`。
+
 ### [ ] A469 编译器不支持「嵌套类型的数组」——`Outer.Inner[]` 报 undefined type
 
 - 现象（2026-10-21 落地 `Zan.Barcode` 时实测）：**嵌套类型**做数组元素类型
