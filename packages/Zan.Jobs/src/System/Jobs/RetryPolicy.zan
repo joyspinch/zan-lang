@@ -1,0 +1,78 @@
+using System;
+
+namespace System.Jobs;
+
+// 重试与退避策略。
+//
+// **为什么退避要有抖动**：多个任务同时失败（下游一起挂）时，如果都按
+// 固定间隔重试，它们会**同时**再失败、同时再重试，形成尖峰把下游二次
+// 打垮。抖动把重试时刻摊开，是限流的一部分，不是装饰。
+//
+// 语义：
+// - `maxAttempts` 是**总尝试次数**（含第一次）。1 = 不重试。
+// - `DelayFor(n)` 里 n 是"已经失败了几次"（第一次失败后 n=1），
+//   返回第 n 次失败后要等多久。
+// - 延迟 = `baseDelayMs * multiplier^(n-1)`，上限 `maxDelayMs`。
+public class RetryPolicy {
+    // 总尝试次数（含第一次）；<= 1 表示不重试。
+    public int maxAttempts;
+    // 第一次失败后的基础延迟（毫秒）。
+    public long baseDelayMs;
+    // 指数系数（2.0 = 每次翻倍）。
+    public double multiplier;
+    // 单次延迟上限（毫秒）。
+    public long maxDelayMs;
+    // 是否加抖动。
+    public bool jitter;
+    // 抖动用的随机源。
+    Random rng;
+
+    public RetryPolicy(int maxAttempts, long baseDelayMs, double multiplier,
+                       long maxDelayMs, bool jitter) {
+        this.maxAttempts = maxAttempts;
+        this.baseDelayMs = baseDelayMs;
+        this.multiplier = multiplier;
+        this.maxDelayMs = maxDelayMs;
+        this.jitter = jitter;
+        this.rng = new Random();
+    }
+
+    // 不重试：失败即死信。
+    public static RetryPolicy None() {
+        return new RetryPolicy(1, 0, 1.0, 0, false);
+    }
+
+    // 默认：最多 3 次尝试（首次 + 2 次重试），1 秒起、每次翻倍、
+    // 单次不超过 5 分钟、带抖动。
+    public static RetryPolicy Default() {
+        return new RetryPolicy(3, 1000, 2.0, 300000, true);
+    }
+
+    // 固定间隔重试（不指数增长）。
+    public static RetryPolicy Fixed(int maxAttempts, long delayMs) {
+        return new RetryPolicy(maxAttempts, delayMs, 1.0, delayMs, false);
+    }
+
+    // 已经失败 failedAttempts 次之后，下一次要等的毫秒数。
+    public long DelayFor(int failedAttempts) {
+        if (failedAttempts < 1) { failedAttempts = 1; }
+        if (this.baseDelayMs <= 0) { return 0; }
+        double delay = (double)this.baseDelayMs;
+        for (int i = 1; i < failedAttempts; i++) {
+            delay = delay * this.multiplier;
+            if (delay > (double)this.maxDelayMs && this.maxDelayMs > 0) { break; }
+        }
+        if (this.maxDelayMs > 0 && delay > (double)this.maxDelayMs) {
+            delay = (double)this.maxDelayMs;
+        }
+        long ms = (long)delay;
+        if (ms < 0) { ms = 0; }
+        if (this.jitter && ms > 0) {
+            // 抖动到 [0.5x, 1.5x]：既可能略早也可能略晚，但不会挤在一起。
+            double factor = 0.5 + this.rng.NextDouble();
+            ms = (long)((double)ms * factor);
+            if (ms < 0) { ms = 0; }
+        }
+        return ms;
+    }
+}

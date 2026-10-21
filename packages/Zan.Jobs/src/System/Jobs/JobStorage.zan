@@ -1,0 +1,65 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Jobs;
+
+// 任务存储的抽象契约。
+//
+// **为什么是基类 + 虚方法而不是接口**：Zan 的接口方法在多态位置上
+// 已经能正确派发，但**存储层要能在构造时拿到具体实现**（文件存储要在
+// 构造里做 replay），基类 + 虚方法让"构造时就能确定实现"这件事自然。
+//
+// 存储层只做两件事：
+// - `Append`：追加一条状态变更（存储自己决定怎么折叠成当前状态）。
+// - `Snapshot` / `Find` / `Filter`：读回当前状态。
+//
+// **并发边界**：实现必须保证"进程内多线程安全"；跨进程是否安全由实现
+// 自己声明（`FileJobStorage` 用文件锁做到跨进程单写者）。
+public class JobStorage {
+    // 追加一条状态变更。
+    public virtual void Append(JobRecord record) {
+        if (record == null) {
+            throw new JobException(JobError.InvalidArgs, "record is null");
+        }
+    }
+
+    // 当前状态的全量快照。
+    public virtual List<JobRecord> Snapshot() {
+        return new List<JobRecord>();
+    }
+
+    // 按 id 找任务；找不到返回 null。
+    public virtual JobRecord Find(string id) {
+        if (id == null) { return null; }
+        List<JobRecord> all = this.Snapshot();
+        for (int i = 0; i < all.Count; i++) {
+            if (all[i].id == id) { return all[i]; }
+        }
+        return null;
+    }
+
+    // 过滤查询：name 为空表示不限名字；state < 0 表示不限状态；
+    // limit <= 0 表示不限条数。
+    public virtual List<JobRecord> Filter(string name, int state, int limit) {
+        List<JobRecord> items = new List<JobRecord>();
+        List<JobRecord> all = this.Snapshot();
+        for (int i = 0; i < all.Count; i++) {
+            JobRecord r = all[i];
+            if (name != null && name.Length > 0 && r.name != name) { continue; }
+            if (state >= 0 && (int)r.state != state) { continue; }
+            items.Add(r);
+            if (limit > 0 && items.Count >= limit) { break; }
+        }
+        return items;
+    }
+
+    // 某个状态的任务条数。
+    public virtual int CountByState(JobState st) {
+        return this.Filter(null, (int)st, 0).Count;
+    }
+
+    // 压实存储（把历史折叠成当前状态，去掉已终结任务的旧版本）。
+    // 默认什么都不做——内存实现本来就只有当前状态。
+    public virtual void Compact() {
+    }
+}

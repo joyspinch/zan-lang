@@ -44,8 +44,13 @@ foreach ($p in $projects) {
     $build = Get-ChildItem $p.FullName -Recurse -File -Filter 'build.ps1' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch 'obj' } | Select-Object -First 1
     $publish = $false
+    $passthrough = $false
     if ($build) {
-        $publish = ([IO.File]::ReadAllText($build.FullName) -match '--publish')
+        $bt = [IO.File]::ReadAllText($build.FullName)
+        # 发布能力看编译命令行里有没有 --publish（硬编码或经 -ZancArgs 透传都算）。
+        # 另记"有没有参数透传口"：没有的话要发布只能改脚本，命令行调不出来。
+        $publish = ($bt -match '--publish')
+        $passthrough = ($bt -match '\+=\s*\$ZancArgs|@ZancArgs')
     }
     $test = Get-ChildItem $p.FullName -Recurse -File -Filter 'test.ps1' -ErrorAction SilentlyContinue |
         Where-Object { $_.FullName -notmatch 'obj' } | Select-Object -First 1
@@ -56,6 +61,7 @@ foreach ($p in $projects) {
         save = $save
         setting = $setting
         publish = $publish
+        passthrough = $passthrough
         build = [bool]$build
         test = [bool]$test
     }

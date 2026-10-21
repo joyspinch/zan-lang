@@ -1,0 +1,110 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Jobs;
+
+// 任务处理器注册表：任务名 → 处理器的显式映射。
+//
+// **为什么不用反射按名字找方法**：Zan 没有运行期反射，也没有"从字符串
+// 构造对象"的能力。想让"持久化下来的任务名"在重启后还能找到处理代码，
+// 唯一的办法是**启动时显式注册**——这也是 Hangfire / Quartz 在没有 DI
+// 容器时采用的做法。好处是接线错误在启动时就能暴露（重复注册、未注册
+// 的任务名），而不是等到半夜某个任务静默失败。
+//
+// **线程安全**：注册通常在启动时一次性完成；运行期注册也安全（写操作
+// 走互斥锁）。
+public class JobRegistry {
+    Dictionary<string, JobHandler> handlers;
+
+    public JobRegistry() {
+        this.handlers = new Dictionary<string, JobHandler>();
+    }
+
+    // 注册一个"参数是 JSON 文本"的处理器。同名重复注册会抛
+    // `JobError.DuplicateHandler`——静默覆盖会让旧任务被新代码吃掉。
+    public void Register(string name, FuncT<string, JobResult> run) {
+        this.RegisterHandler(new JobHandler(name, run));
+    }
+
+    // 注册一个带参数规范化委托的处理器。
+    public void Register(string name, FuncT<string, JobResult> run,
+                         FuncT<string, string> normalize) {
+        this.RegisterHandler(new JobHandler(name, run, normalize));
+    }
+
+    // 注册强类型处理器。
+    //
+    // `handler` 吃强类型参数、`toJson` 把参数写成 JSON、`fromJson` 把
+    // JSON 读回强类型参数。**三个委托都要显式给**——没有反射就没有
+    // 自动推导，任何"少给一个委托"的做法都会退化成"按名猜字段"。
+    //
+    // 强类型参数走的是**泛型**通道：`TArgs` 由调用点推断或显式写出。
+    public void RegisterTyped<TArgs>(string name, FuncT<TArgs, JobResult> handler,
+                                    FuncT<TArgs, string> toJson,
+                                    FuncT<string, TArgs> fromJson) {
+        if (handler == null || toJson == null || fromJson == null) {
+            throw new JobException(JobError.InvalidArgs, "handler delegates are null");
+        }
+        FuncT<string, JobResult> run = (argsJson) => {
+            TArgs a = fromJson(argsJson);
+            return handler(a);
+        };
+        FuncT<string, string> normalize = (argsJson) => {
+            TArgs a = fromJson(argsJson);
+            return toJson(a);
+        };
+        this.RegisterHandler(new JobHandler(name, run, normalize));
+    }
+
+    // 注册一个已经构造好的处理器对象。
+    public void RegisterHandler(JobHandler handler) {
+        if (handler == null) {
+            throw new JobException(JobError.InvalidArgs, "handler is null");
+        }
+        if (handler.name == null || handler.name.Length == 0) {
+            throw new JobException(JobError.InvalidName, "handler name is empty");
+        }
+        if (handler.run == null) {
+            throw new JobException(JobError.InvalidArgs, handler.name, "handler run is null");
+        }
+        if (this.handlers.ContainsKey(handler.name)) {
+            throw new JobException(JobError.DuplicateHandler, handler.name,
+                "handler already registered: " + handler.name);
+        }
+        this.handlers[handler.name] = handler;
+    }
+
+    // 按名字找处理器；没注册返回 null。
+    public JobHandler Find(string name) {
+        if (name == null) { return null; }
+        JobHandler h = null;
+        if (this.handlers.TryGetValue(name, out h)) { return h; }
+        return null;
+    }
+
+    // 是否注册过。
+    public bool Has(string name) {
+        return this.Find(name) != null;
+    }
+
+    // 已注册的任务名。
+    public List<string> Names() {
+        List<string> names = new List<string>();
+        List<string> keys = this.handlers.Keys;
+        for (int i = 0; i < keys.Count; i++) { names.Add(keys[i]); }
+        return names;
+    }
+
+    // 已注册的任务数。
+    public int Count() {
+        return this.handlers.Count;
+    }
+
+    // 注销一个处理器；原来没注册返回 false。
+    public bool Unregister(string name) {
+        if (name == null) { return false; }
+        if (!this.handlers.ContainsKey(name)) { return false; }
+        this.handlers.Remove(name);
+        return true;
+    }
+}

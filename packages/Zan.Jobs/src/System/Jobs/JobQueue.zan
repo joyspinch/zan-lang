@@ -1,0 +1,113 @@
+using System;
+
+namespace System.Jobs;
+
+// 任务队列（生产者侧）：把任务放进存储。
+//
+// **生产者与消费者分开**：入队方（Web 请求、主流程）只管写任务就走，
+// 执行方（worker）另起线程慢慢跑。两边不共享内存状态，所以"入队成功"
+// 意味着"任务已经落盘"，而不是"任务已经跑完"——这是后台任务的基本
+// 语义，也是它比"在请求线程里直接跑"强的地方（请求不用等下游）。
+public class JobQueue {
+    // 进程级全局 id 计数器。
+    //
+    // **为什么必须是全局的而不是实例级**：一个进程里通常有不止一个
+    // JobQueue（调度器一个、worker 一个——worker 要给周期任务续命）。
+    // 计数器是实例级时，两个队列在同一毫秒会生成**同一个 id**（前缀相同、
+    // 序号相同），新记录就把旧记录覆盖了：任务看起来"又变回排队中"，
+    // 历史和成功状态一起消失。全局计数器 + 前缀 + 时间戳保证唯一。
+    static long idCounter = 0;
+    static System.Threading.Mutex idLock = new System.Threading.Mutex();
+
+    JobStorage storage;
+    string idPrefix;
+
+    public JobQueue(JobStorage storage) {
+        this.storage = storage;
+        this.idPrefix = "job";
+    }
+
+    // 任务 id 前缀（不同业务用不同前缀便于排查）。
+    public void SetIdPrefix(string prefix) {
+        this.idPrefix = prefix != null && prefix.Length > 0 ? prefix : "job";
+    }
+
+    // 生成一个任务 id（时间戳 + 进程级自增序号，保证全局不重复）。
+    public string NextId() {
+        idLock.WaitOne();
+        long seq = 0;
+        try {
+            idCounter = idCounter + 1;
+            seq = idCounter;
+        } finally {
+            idLock.ReleaseMutex();
+        }
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        return this.idPrefix + "-" + now + "-" + seq;
+    }
+
+    // 立即执行的任务。返回任务 id。
+    public string Enqueue(string name, string argsJson) {
+        return this.EnqueueWithId(this.NextId(), name, argsJson);
+    }
+
+    // 带指定 id 入队（幂等键）。**id 已存在时抛 `DuplicateId`**——
+    // 静默"已存在就跳过"会让调用方以为提交成功，其实任务被丢了。
+    public string EnqueueWithId(string id, string name, string argsJson) {
+        if (name == null || name.Length == 0) {
+            throw new JobException(JobError.InvalidName, "job name is empty");
+        }
+        if (id == null || id.Length == 0) {
+            throw new JobException(JobError.InvalidArgs, "job id is empty");
+        }
+        JobRecord exist = this.storage.Find(id);
+        if (exist != null) {
+            throw new JobException(JobError.DuplicateId, id, "job id already exists: " + id);
+        }
+        JobRecord r = new JobRecord();
+        r.id = id;
+        r.name = name;
+        r.args = argsJson != null ? argsJson : "{}";
+        r.state = JobState.Enqueued;
+        r.createAt = DateTime.GetCurrentUnixMilliseconds();
+        r.runAt = r.createAt;
+        this.storage.Append(r);
+        return r.id;
+    }
+
+    // 延迟到 `runAtUnixMs`（unix 毫秒）执行。
+    public string Schedule(string name, string argsJson, long runAtUnixMs) {
+        string id = this.NextId();
+        JobRecord r = new JobRecord();
+        r.id = id;
+        r.name = name;
+        r.args = argsJson != null ? argsJson : "{}";
+        r.state = JobState.Scheduled;
+        r.createAt = DateTime.GetCurrentUnixMilliseconds();
+        r.runAt = runAtUnixMs;
+        this.storage.Append(r);
+        return r.id;
+    }
+
+    // 周期任务：每 `intervalMs` 毫秒执行一次。首次立即执行。
+    //
+    // **周期任务怎么续命**：每次执行成功后由 worker 排下一次（新 id），
+    // 所以周期任务在存储里是一条条独立记录——好处是"每次执行的历史"
+    // 都在，坏处是记录会变多（用 `Compact()` 或定期清理终结记录）。
+    public string EnqueueRecurring(string name, string argsJson, long intervalMs) {
+        if (intervalMs <= 0) {
+            throw new JobException(JobError.InvalidArgs, "interval must be positive");
+        }
+        string id = this.NextId();
+        JobRecord r = new JobRecord();
+        r.id = id;
+        r.name = name;
+        r.args = argsJson != null ? argsJson : "{}";
+        r.state = JobState.Enqueued;
+        r.createAt = DateTime.GetCurrentUnixMilliseconds();
+        r.runAt = r.createAt;
+        r.interval = intervalMs;
+        this.storage.Append(r);
+        return r.id;
+    }
+}

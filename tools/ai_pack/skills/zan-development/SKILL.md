@@ -304,6 +304,7 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   `class Ch<T> : Base` 覆写 `Base.Accepts(object)` 并写 `return m is T;`，
   经基类引用的虚调用现在判定正确（每个实例化一张 vtable）。早年的绕行
   "把类型判定挪进派生类构造器、定型成委托再交给基类调用" 现在**不必**了，
+  但保留也无害。
 * **`default(T)`、顶层函数、`List<T>.At()` 都不存在**（实证，2026-10-28）：
   `default(int)` 报 "unexpected token 'default' in expression"；文件级
   函数报 "expected type declaration (class, struct, interface, enum, or
@@ -317,11 +318,33 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   （已登记 TASKS.md A462，尚未修。）
 * **结构体是值语义，成员赋值改的是副本**（实证，2026-10-28）：`Pt q = h.P;
   q.X = 99;` 之后 `h.P.X` 仍是原值——`q` 是副本。凡是"变换/映射/原地更新"
-  类 API，签名必须**交还新值**（`FuncT<TSource, TTarget, TTarget>`），就地
+  类 API，签名必须**交还新值**（`FuncT2<TSource, TTarget, TTarget>`），就地
   改成员改的是副本、调用方看不到。（`Zan.Mapping` 的成员规则按这条设计。）
-  但保留也无害。
-
-## 4. Edit
+* **委托家族只有四件套，没有 `FuncT3`**（实证，2026-10-29）：stdlib 提供
+  `Action`（0 参）、`ActionT<T>`（1 参）、`ActionT2<T1,T2>`（2 参）、
+  `FuncT<T,TResult>`（**1 参** + 返回值）、`FuncT2<T1,T2,TResult>`（**2 参** +
+  返回值）。**三参数要用 `FuncT2`（它就是三个类型参数）或自己声明委托**——
+  写 `FuncT<A,B,C>` 报 "requires 2 type arguments"。看签名时数清楚
+  "参数个数 + 1"。
+* **`Thread.Start` 是静态方法**（实证，2026-10-29）：没有 `new Thread(body)`，
+  也没有实例 `Start()`——写法是 `Thread.Start(() => { ... })`（`ThreadStart`
+  委托在 `System.Threading`）。它是**分离后台线程**，没有 `Join()`，要等结果
+  就自己用原子变量 / 队列交接。
+* **`File.TryLock(path)` 是跨进程文件锁**（实证，2026-10-29）：返回非 0 是拿到
+  句柄，返回 **0 是拿不到**（别的进程或别的句柄正持有）。同进程内第二次调用
+  同样返回 0——所以它能当"单写者"闸门用，但**不要在同进程里嵌套调用**。
+  配 `File.Unlock(handle)` 释放。
+* **`Dictionary` 是内建类型，不在 stdlib 目录里**（实证，2026-10-29）：
+  `src/compiler/builtin_api.c` 的 `members_dict`（同 `List<T>` / `StringBuilder`）。
+  `Count` / `Keys` / `Values` 都是**属性**不是方法，写 `map.Count()` 报
+  "'Dictionary<K,V>.Count' is a property, not a method"。
+* **泛型方法里可以创建捕获泛型形参的闭包**（实证，2026-10-29）：
+  `void Register<T>(...)` 里把 `fromJson(argsJson)` 写进 lambda 再赋给
+  `FuncT<string, R>` 能正常工作（`T` 在闭包里可用）。这条让"泛型强类型 +
+  显式序列化委托"这种没有反射也能做的设计成立。
+* **`File.AppendAllText` 不加 BOM**（实证，2026-10-29）：追加的内容原样写入，
+  换行按传入的字符串来（自己带 `\n`），不会替你补 BOM 或转成 CRLF。
+  读回来用 `File.ReadAllText` / `ReadAllLines`。## 4. Edit
 
 `edit_file(path, old, new)` (MCP) replaces an exact snippet in place — the
 default, because it needs the snippet and not the file. `old` must occur once,

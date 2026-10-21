@@ -1,0 +1,132 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+
+namespace System.Jobs;
+
+// 文件任务存储：追加式事件日志 + 启动时重放成当前状态。
+//
+// **为什么用追加日志而不是"整表重写"**：整表重写在每次状态变更时都要
+// 读全量、折叠、写全量，任务多的时候是 O(n) 每次；而追加日志只写一行，
+// 崩溃时最多丢最后一行（前面的行都还在）。启动时重放一遍即可恢复——
+// 代价是文件会变长，所以提供 `Compact()` 把历史折叠掉。
+//
+// **并发边界**：
+// - 进程内：所有写操作走同一把静态互斥锁（`FileJobStorage` 的多个实例
+//   也共享），所以同一进程里的多个 worker 不会写坏文件。
+// - 跨进程：写之前用 `File.TryLock` 拿文件锁——拿不到说明别的进程正在
+//   写同一份存储，直接报 `StorageFailure`（**不做等待重试**：后台任务
+//   存储的另一个进程通常是另一个服务实例，宁可让这次入队失败重试，
+//   也不要两个进程互相覆盖数据）。
+public class FileJobStorage : JobStorage {
+    // 所有实例共享的进程内写锁（同进程多实例也串行）。
+    static Mutex writeLock = new Mutex();
+
+    string path;
+    string lockPath;
+    Dictionary<string, JobRecord> index;
+
+    // 用 `path` 作为存储文件；同目录下的 `path + ".lock"` 是跨进程锁文件。
+    public FileJobStorage(string path) {
+        if (path == null || path.Length == 0) {
+            throw new JobException(JobError.StorageFailure, "storage path is empty");
+        }
+        this.path = path;
+        this.lockPath = path + ".lock";
+        this.index = new Dictionary<string, JobRecord>();
+        this.Reload();
+    }
+
+    // 存储文件路径。
+    public string Path() {
+        return this.path;
+    }
+
+    // 重新读一遍存储文件（外部改了文件、或要丢弃内存状态时用）。
+    public void Reload() {
+        Dictionary<string, JobRecord> fresh = new Dictionary<string, JobRecord>();
+        if (File.Exists(this.path)) {
+            List<string> lines = File.ReadAllLines(this.path);
+            for (int i = 0; i < lines.Count; i++) {
+                JobRecord r = JobRecord.FromJson(lines[i]);
+                if (r == null) { continue; }
+                if (r.id == null || r.id.Length == 0) { continue; }
+                fresh[r.id] = r;
+            }
+        }
+        this.index = fresh;
+    }
+
+    public override void Append(JobRecord record) {
+        if (record == null) {
+            throw new JobException(JobError.InvalidArgs, "record is null");
+        }
+        writeLock.WaitOne();
+        try {
+            long handle = File.TryLock(this.lockPath);
+            if (handle == 0) {
+                throw new JobException(JobError.StorageFailure, record.id,
+                    "storage is locked by another process: " + this.path);
+            }
+            try {
+                File.AppendAllText(this.path, record.ToJson() + "\n");
+            } finally {
+                File.Unlock(handle);
+            }
+            this.index[record.id] = record;
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    public override List<JobRecord> Snapshot() {
+        List<JobRecord> items = new List<JobRecord>();
+        List<string> keys = this.index.Keys;
+        for (int i = 0; i < keys.Count; i++) {
+            JobRecord r;
+            if (this.index.TryGetValue(keys[i], out r)) {
+                items.Add(r);
+            }
+        }
+        return items;
+    }
+
+    public override JobRecord Find(string id) {
+        if (id == null) { return null; }
+        JobRecord r = null;
+        if (this.index.TryGetValue(id, out r)) { return r; }
+        return null;
+    }
+
+    // 压实：把历史折叠成"每个 id 一行"，只保留当前状态。
+    // 写临时文件再原子替换，避免中途崩溃把存储写坏。
+    public override void Compact() {
+        writeLock.WaitOne();
+        try {
+            long handle = File.TryLock(this.lockPath);
+            if (handle == 0) {
+                throw new JobException(JobError.StorageFailure,
+                    "storage is locked by another process: " + this.path);
+            }
+            try {
+                StringBuilder sb = new StringBuilder();
+                List<JobRecord> all = this.Snapshot();
+                for (int i = 0; i < all.Count; i++) {
+                    sb.Append(all[i].ToJson());
+                    sb.Append("\n");
+                }
+                string tmp = this.path + ".tmp";
+                File.WriteAllText(tmp, sb.ToString());
+                if (File.Exists(this.path)) {
+                    File.Delete(this.path);
+                }
+                File.Move(tmp, this.path);
+            } finally {
+                File.Unlock(handle);
+            }
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+}

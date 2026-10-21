@@ -1195,6 +1195,67 @@ conformance `mapping_profile`（链式注册 / 成员名列表 / 类目标 / 列
 元数据）；生成器按**名字**配对，同名类型族会让配对挑花眼；结构体目标要求规则
 交还新值；档案非线程安全；没有嵌套映射 / 集合映射 / 循环引用检测。
 
+### 1.23 后台任务：`Zan.Jobs`
+
+新包 `packages/Zan.Jobs`，命名空间 `System.Jobs`。补 Hangfire（10,151★）/
+Quartz.NET（7,096★）那一档的**后台任务核心子集**：持久化任务存储 + 显式处理器
+注册 + 重试退避 + 延迟/周期调度 + 死信与人工重排 + 状态统计。
+
+| 文件 | 类型 | 内容 |
+|---|---|---|
+| `JobScheduler.zan` | `JobScheduler` | 门面：注册 / 入队 / 延迟 / 周期 / 起 worker / 状态统计 / 死信重排 / 删除 |
+| `JobQueue.zan` | `JobQueue` | 生产者侧：`Enqueue` / `EnqueueWithId`（幂等键）/ `Schedule` / `EnqueueRecurring` / `NextId` |
+| `JobWorker.zan` | `JobWorker` | 消费者侧：`Start` / `Stop` / `ProcessOnce`（同步跑一轮）/ `ProcessJob` |
+| `JobRegistry.zan` | `JobRegistry` | 任务名 → 处理器的显式映射；`Register` / `RegisterTyped<TArgs>` / `Find` / `Names` |
+| `JobHandler.zan` | `JobHandler` | 一个处理器：`Name` + `Run`（JSON 文本 → `JobResult`）+ `Normalize` |
+| `JobStorage.zan` | `JobStorage` | 存储抽象契约（基类 + 虚方法）：`Append` / `Snapshot` / `Find` / `Filter` / `CountByState` / `Compact` |
+| `FileJobStorage.zan` | `FileJobStorage` | 追加式事件日志 + 启动重放 + 压实（临时文件 + 原子替换）+ 跨进程文件锁 |
+| `InMemoryJobStorage.zan` | `InMemoryJobStorage` | 只留当前状态的内存实现 |
+| `RetryPolicy.zan` | `RetryPolicy` | 重试退避：总尝试次数 / 基础延迟 / 指数系数 / 延迟上限 / 抖动；`None` / `Default` / `Fixed` |
+| `JobResult.zan` | `JobResult` | 处理器返回值：`Success` / `Retry`（可重试失败）/ `Fail`（不可重试失败） |
+| `JobRecord.zan` | `JobRecord` | 任务记录（id / 名字 / 状态 / 参数 / 时间戳 / 重试次数 / 错误 / worker / 周期间隔）+ JSON 往返 |
+| `JobState.zan` | `JobState` / `JobStates` | 状态机与状态名（`Enqueued` / `Scheduled` / `Processing` / `Succeeded` / `Failed` / `Dead` / `Deleted`） |
+| `JobStats.zan` | `JobStats` | 状态计数快照 + 一行摘要 |
+| `JobError.zan` / `JobException.zan` | — | 可区分错误码（未注册 / id 冲突 / 存储失败 / 已在运行 / 找不到 / 非法结果 …）+ 异常 |
+
+**六条硬取舍**：
+
+1. **显式注册，不做反射式派发**。Zan 没有运行期反射，也没有"从字符串构造对象"
+   的能力——持久化下来的任务名要在重启后找回处理代码，唯一办法是**启动时显式
+   注册**。接线错误因此在启动时暴露（重复注册 → `DuplicateHandler`），而不是等
+   某个任务半夜静默失败。强类型参数走**泛型 + 显式序列化委托**（`RegisterTyped`）：
+   没有反射也能同时拿到类型安全与可持久化，代价是三个委托都得显式给。
+2. **处理器返回结果，不靠抛异常表达重试意图**。抛异常只能表达"失败了"，而后台
+   任务还要回答"还要不要重试"——网络抖动重试有意义，参数非法重试一万次也没意义。
+   所以 `JobResult.Success` / `Retry` / `Fail` 由处理器自己说清楚；处理器**真的抛了
+   异常**时按"可重试"处理，且 worker 不会因此死掉。
+3. **存储用追加日志，不是整表重写**。整表重写是每次变更 O(n)，追加只写一行，
+   崩溃时最多丢最后一行；启动重放一遍折叠成当前状态。代价是文件会变长，所以
+   提供 `Compact()`（写临时文件再原子替换）。
+4. **核心逻辑是同步方法**。worker 的核心是同步的 `ProcessOnce()`，后台线程只是
+   它的薄包装——后台线程的执行时刻不确定，判定器没法稳定复现"重试了几次"
+   "退避多久"；同步入口让测试能精确驱动，也让你能"我就是想同步跑一遍"。
+5. **入队时校验任务名**。没注册的处理器在入队那一刻就抛 `UnknownJob`，而不是
+   让任务在队列里躺到被 worker 捡起来才变成死信。
+6. **状态机分得清"暂时没跑"和"永远跑不动"**。`Failed`（还会重试）与 `Dead`
+   （死信，要人工介入）是两个状态——告警因此能分级。`RetryDead(id)` 让人工介入
+   之后重排；幂等键 `EnqueueWithId` 在 id 重复时**抛 `DuplicateId`**（静默跳过
+   会让调用方以为提交成功，其实任务被丢了）。
+
+conformance `jobs_scheduler`（38 条断言）：成功路径 / 未注册任务名在入队时拒绝 /
+幂等 id 冲突 / 可重试失败走 Failed→退避→重试→超上限 Dead / 不可重试直接 Dead /
+处理器抛异常按可重试处理 / 延迟任务不到点不跑 / 周期任务自动续命 / 死信人工重排 /
+删除 / 状态统计 / 指数退避数值与上限 / 强类型注册往返 / 持久化重启后继续处理 /
+压实后状态不丢。
+
+**已知边界**：没有 cron 表达式语言（周期用固定间隔，要 cron 就用
+`System.Hosting.Cron` 算下次时间再调 `Schedule`）；没有集群调度 / 分布式锁 /
+leader 选举；没有内置仪表板；参数是 JSON 文本（强类型靠显式委托）；周期任务
+每次执行一条独立记录（历史完整但记录会变多）；文件存储是**单写者**（跨进程拿
+不到锁直接报 `StorageFailure`，多实例部署要各给一份存储路径或换数据库实现）；
+存储层全量扫描，任务量到万级需要换实现。
+
+---
 ---
 
 ## 2. 通用生态包（按依赖顺序）
@@ -1215,7 +1276,7 @@ conformance `mapping_profile`（链式注册 / 成员名列表 / 类目标 / 列
 | `Zan.Mapping` | AutoMapper / Mapster | 10,188 / 5,182 | ✅ 已落地 `packages/Zan.Mapping`（`System.Mapping`：运行期 `MapProfile` 显式成员规则 + 生成期 `GenMapping` 按约定配对生成源码（**无反射**）+ 可区分错误码与成员归因，见 §1.22） | — |
 | `Zan.Messaging` | MassTransit | 7,809 | ✅ 已落地 `packages/Zan.Messaging`（`System.Messaging`：类型化通道 + 广播 / 命令语义 + 请求-响应端点（结果类型完整保留）+ 中间件管道 + 可区分错误码，无反射，见 §1.21） | — |
 | `Zan.Cli` | Spectre.Console / Terminal.Gui | 11,666 / 11,279 | ✅ 已落地 `packages/Zan.Cli`（`System.Cli`：ANSI 样式 / 宽字符对齐表格 / 进度条 / 交互提示，见 §1.4） | — |
-| `Zan.Jobs` | Hangfire / Quartz.NET | 10,151 / 7,096 | 只有 `Zan.Hosting/Cron.zan` 定时触发；缺持久化任务队列、重试退避、任务存储 | 2–3 周 |
+| `Zan.Jobs` | Hangfire / Quartz.NET | 10,151 / 7,096 | ✅ 已落地 `packages/Zan.Jobs`（`System.Jobs`：持久化任务存储（追加日志 + 重放 + 压实）+ 显式注册（无反射）+ 重试退避（含抖动）+ 延迟/周期调度 + 死信人工重排 + 状态统计，见 §1.23） | — |
 
 ### 第 2 层 · 领域
 
@@ -1276,7 +1337,7 @@ conformance `mapping_profile`（链式注册 / 成员名列表 / 类目标 / 列
 **第 2 批（游戏纵深）**：`Zan.Game.Ecs` ✅ → `Zan.Game.Physics2D` ✅ → `Zan.Game.Pathfinding` ✅ → `Zan.Game.Particles` ✅
 **第 3 批（内容生产）**：`Zan.Game.Assets` ✅ → `Zan.Game.Audio` ✅ → `Zan.Game.Procgen` ✅ → `Zan.Game.Common` ✅
 **第 4 批（重型）**：`Zan.Game.Netcode` ✅ → `Zan.Game.Animation` ✅ → `Zan.Game.Render3D`（含跨平台 GPU 后端）→ `Zan.Pdf`
-**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` → `Zan.Bench`
+**第 5 批（生态纵深）**：`Zan.Test.Mocks` ✅ → `Zan.Test.Fixtures` ✅ → `Zan.Messaging` ✅ → `Zan.Mapping` ✅ → `Zan.Jobs` ✅ → `Zan.Bench`
 
 ## 7. 已知缺陷：包级 static 持有 rc 集合在退出时不释放
 

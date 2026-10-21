@@ -1,0 +1,50 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+
+namespace System.Jobs;
+
+// 内存任务存储：只保留当前状态，不落盘。
+//
+// **用途**：测试、单机短任务、或者"任务丢了也无所谓"的场景。
+// 进程重启即丢——这是它的定义，不是缺陷，所以名字里带 InMemory。
+//
+// **并发安全**：进程内多线程安全（写操作走互斥锁）。
+public class InMemoryJobStorage : JobStorage {
+    static Mutex writeLock = new Mutex();
+
+    Dictionary<string, JobRecord> index;
+
+    public InMemoryJobStorage() {
+        this.index = new Dictionary<string, JobRecord>();
+    }
+
+    public override void Append(JobRecord record) {
+        if (record == null) {
+            throw new JobException(JobError.InvalidArgs, "record is null");
+        }
+        writeLock.WaitOne();
+        try {
+            this.index[record.id] = record;
+        } finally {
+            writeLock.ReleaseMutex();
+        }
+    }
+
+    public override List<JobRecord> Snapshot() {
+        List<JobRecord> items = new List<JobRecord>();
+        List<string> keys = this.index.Keys;
+        for (int i = 0; i < keys.Count; i++) {
+            JobRecord r = null;
+            if (this.index.TryGetValue(keys[i], out r)) { items.Add(r); }
+        }
+        return items;
+    }
+
+    public override JobRecord Find(string id) {
+        if (id == null) { return null; }
+        JobRecord r = null;
+        if (this.index.TryGetValue(id, out r)) { return r; }
+        return null;
+    }
+}

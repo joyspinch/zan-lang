@@ -1,0 +1,190 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Jobs;
+
+// 任务执行器（消费者侧）：从存储取任务、执行、写回终态。
+//
+// **为什么核心逻辑是同步方法 `ProcessOnce` 而不是只有后台线程**：后台线程
+// 的执行时刻不确定，判定器没法稳定复现"重试了几次""退避多久"。把
+// "处理一轮"做成同步方法，测试可以精确驱动；后台线程只是它的薄包装
+// （`Start()` 起了个循环，反复调 `ProcessOnce`）。
+//
+// **一次失败不会拖垮 worker**：处理器抛异常会被捕获，按"可重试失败"
+// 处理，而不是让 worker 线程死掉。
+public class JobWorker {
+    JobStorage storage;
+    JobRegistry registry;
+    RetryPolicy policy;
+    JobQueue queue;
+    string workerId;
+    int pollMs;
+    bool running;
+
+    public JobWorker(JobStorage storage, JobRegistry registry, RetryPolicy policy) {
+        this.storage = storage;
+        this.registry = registry;
+        this.policy = policy != null ? policy : RetryPolicy.Default();
+        this.queue = new JobQueue(storage);
+        this.workerId = "w1";
+        this.pollMs = 200;
+        this.running = false;
+    }
+
+    // 换掉用于生成周期任务下一次 id 的队列（让 worker 与调度器共用
+    // 同一个队列，前缀一致）。
+    public void SetQueue(JobQueue q) {
+        if (q != null) { this.queue = q; }
+    }
+
+    // worker 标识（写进任务记录，便于知道是谁跑的）。
+    public void SetWorkerId(string id) {
+        if (id != null && id.Length > 0) { this.workerId = id; }
+    }
+
+    public string WorkerId() {
+        return this.workerId;
+    }
+
+    // 轮询间隔（毫秒）。
+    public void SetPollMs(int ms) {
+        if (ms > 0) { this.pollMs = ms; }
+    }
+
+    // 是否在跑。
+    public bool IsRunning() {
+        return this.running;
+    }
+
+    // 起后台线程执行任务。已经在跑返回 false（`AlreadyRunning`）。
+    public bool Start() {
+        if (this.running) { return false; }
+        this.running = true;
+        System.Threading.Thread.Start(() => {
+            this.Loop();
+        });
+        return true;
+    }
+
+    // 请求停止（当前这一轮做完就退出）。
+    public void Stop() {
+        this.running = false;
+    }
+
+    // 后台循环。
+    void Loop() {
+        while (this.running) {
+            try {
+                this.ProcessOnce();
+            } catch (Exception e) {
+                // 单轮失败不能让 worker 死掉：记一笔，继续下一轮。
+                // 这里刻意不写存储（写存储也可能失败），只保证线程活着。
+            }
+            System.Threading.Thread.Sleep(this.pollMs);
+        }
+    }
+
+    // 处理一轮：把当前到期的任务跑一遍，返回处理条数。
+    public int ProcessOnce() {
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        List<JobRecord> all = this.storage.Snapshot();
+        int handled = 0;
+        for (int i = 0; i < all.Count; i++) {
+            JobRecord r = all[i];
+            if (!JobWorker.IsRunnable(r, now)) { continue; }
+            this.ProcessJob(r);
+            handled = handled + 1;
+        }
+        return handled;
+    }
+
+    // 这条任务现在该不该被执行。
+    static bool IsRunnable(JobRecord r, long now) {
+        if (r == null) { return false; }
+        if (r.state != JobState.Enqueued && r.state != JobState.Failed
+            && r.state != JobState.Scheduled) {
+            return false;
+        }
+        if (r.runAt > now) { return false; }
+        return true;
+    }
+
+    // 执行一个任务，返回写回存储后的终态记录。
+    public JobRecord ProcessJob(JobRecord source) {
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        JobRecord rec = source.Copy();
+        rec.state = JobState.Processing;
+        rec.startAt = now;
+        rec.attempts = source.attempts + 1;
+        rec.worker = this.workerId;
+        rec.error = "";
+        this.storage.Append(rec);
+
+        JobHandler handler = this.registry.Find(rec.name);
+        if (handler == null) {
+            // 名字没注册：重试也没用（注册表不会自己变出处理器），
+            // 直接进死信，把原因写清楚。
+            rec.state = JobState.Dead;
+            rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+            rec.error = "no handler registered for job: " + rec.name;
+            this.storage.Append(rec);
+            return rec;
+        }
+
+        JobResult result = null;
+        try {
+            result = handler.run(handler.Normalize(rec.args));
+        } catch (Exception e) {
+            // 处理器抛异常按"可重试"处理——多数异常是临时的（网络、锁），
+            // 真正不可重试的情况让处理器自己返回 JobResult.Fail。
+            result = JobResult.Retry(e.Message != null ? e.Message : "handler threw");
+        }
+        if (result == null) {
+            rec.state = JobState.Dead;
+            rec.endAt = DateTime.GetCurrentUnixMilliseconds();
+            rec.error = "handler returned null result";
+            this.storage.Append(rec);
+            return rec;
+        }
+
+        long finishedAt = DateTime.GetCurrentUnixMilliseconds();
+        if (result.ok) {
+            rec.state = JobState.Succeeded;
+            rec.endAt = finishedAt;
+            rec.error = "";
+            this.storage.Append(rec);
+            if (rec.interval > 0) {
+                this.ScheduleNext(rec, finishedAt);
+            }
+            return rec;
+        }
+
+        rec.endAt = finishedAt;
+        rec.error = result.message;
+        if (result.retryable && rec.attempts < this.policy.maxAttempts) {
+            rec.state = JobState.Failed;
+            rec.retry = rec.attempts;
+            rec.runAt = finishedAt + this.policy.DelayFor(rec.attempts);
+            this.storage.Append(rec);
+            return rec;
+        }
+        rec.state = JobState.Dead;
+        rec.retry = rec.attempts;
+        this.storage.Append(rec);
+        return rec;
+    }
+
+    // 周期任务：成功后排下一次。
+    void ScheduleNext(JobRecord rec, long now) {
+        JobRecord next = rec.Copy();
+        next.id = this.queue.NextId();
+        next.state = JobState.Enqueued;
+        next.runAt = now + rec.interval;
+        next.retry = 0;
+        next.attempts = 0;
+        next.startAt = 0;
+        next.endAt = 0;
+        next.error = "";
+        this.storage.Append(next);
+    }
+}

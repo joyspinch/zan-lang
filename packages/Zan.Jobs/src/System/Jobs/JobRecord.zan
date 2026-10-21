@@ -1,0 +1,126 @@
+using System;
+using System.Json;
+
+namespace System.Jobs;
+
+// 一条任务记录（当前状态的快照）。
+//
+// **记录是"当前状态"而不是"事件"**：存储层负责把历史折叠成当前状态
+// （见 `FileJobStorage`），上层只关心"这个任务现在什么样"。
+//
+// 字段语义：
+// - `id`        任务唯一 id（幂等键）
+// - `name`      任务名，对应注册表里的处理器
+// - `state`     当前状态
+// - `args`      参数（JSON 文本；由调用方或注册时的序列化委托产出）
+// - `createAt`  入队时间（unix 毫秒）
+// - `runAt`     下次可执行时间（unix 毫秒）；退避重试就是改这个字段
+// - `startAt` / `endAt` 最近一次执行的起止时间（unix 毫秒，0 = 没有）
+// - `retry`     已经失败过几次
+// - `attempts`  总共尝试过几次
+// - `error`     最近一次失败的说明
+// - `worker`    最近一次执行它的 worker 标识
+// - `interval`  周期任务的间隔毫秒（0 = 不是周期任务）
+public class JobRecord {
+    public string id;
+    public string name;
+    public JobState state;
+    public string args;
+    public long createAt;
+    public long runAt;
+    public long startAt;
+    public long endAt;
+    public int retry;
+    public int attempts;
+    public string error;
+    public string worker;
+    public long interval;
+
+    public JobRecord() {
+        this.id = "";
+        this.name = "";
+        this.state = JobState.Enqueued;
+        this.args = "{}";
+        this.createAt = 0;
+        this.runAt = 0;
+        this.startAt = 0;
+        this.endAt = 0;
+        this.retry = 0;
+        this.attempts = 0;
+        this.error = "";
+        this.worker = "";
+        this.interval = 0;
+    }
+
+    // 复制一份（改副本，不改原件——记录是引用语义，但调用方常要"改一个字段
+    // 再存回去"，直接给副本可以避免半改状态被并发看到）。
+    public JobRecord Copy() {
+        JobRecord c = new JobRecord();
+        c.id = this.id;
+        c.name = this.name;
+        c.state = this.state;
+        c.args = this.args;
+        c.createAt = this.createAt;
+        c.runAt = this.runAt;
+        c.startAt = this.startAt;
+        c.endAt = this.endAt;
+        c.retry = this.retry;
+        c.attempts = this.attempts;
+        c.error = this.error;
+        c.worker = this.worker;
+        c.interval = this.interval;
+        return c;
+    }
+
+    // 序列化成一行 JSON（存储层按行追加）。
+    public string ToJson() {
+        JsonValue o = JsonValue.NewObject();
+        o.Set("id", JsonValue.NewStr(this.id));
+        o.Set("name", JsonValue.NewStr(this.name));
+        o.Set("state", JsonValue.NewStr(JobStates.Name(this.state)));
+        o.Set("args", JsonValue.NewStr(this.args));
+        o.Set("createAt", JsonValue.NewInt(this.createAt));
+        o.Set("runAt", JsonValue.NewInt(this.runAt));
+        o.Set("startAt", JsonValue.NewInt(this.startAt));
+        o.Set("endAt", JsonValue.NewInt(this.endAt));
+        o.Set("retry", JsonValue.NewInt(this.retry));
+        o.Set("attempts", JsonValue.NewInt(this.attempts));
+        o.Set("error", JsonValue.NewStr(this.error));
+        o.Set("worker", JsonValue.NewStr(this.worker));
+        o.Set("interval", JsonValue.NewInt(this.interval));
+        return o.ToJson();
+    }
+
+    // 从一行 JSON 还原；解析失败返回 null（坏行不该让整份存储读不出来）。
+    public static JobRecord FromJson(string line) {
+        if (line == null) { return null; }
+        string trimmed = line.Trim();
+        if (trimmed.Length == 0) { return null; }
+        JsonValue o = null;
+        try {
+            o = JsonValue.Parse(trimmed);
+        } catch (Exception e) {
+            return null;
+        }
+        if (o == null || !o.IsObject()) { return null; }
+        JobRecord r = new JobRecord();
+        r.id = o.Str("id", "");
+        r.name = o.Str("name", "");
+        JobState st = JobState.Enqueued;
+        if (!JobStates.TryParse(o.Str("state", "Enqueued"), out st)) {
+            return null;
+        }
+        r.state = st;
+        r.args = o.Str("args", "{}");
+        r.createAt = o.Long("createAt", 0);
+        r.runAt = o.Long("runAt", 0);
+        r.startAt = o.Long("startAt", 0);
+        r.endAt = o.Long("endAt", 0);
+        r.retry = o.Int("retry", 0);
+        r.attempts = o.Int("attempts", 0);
+        r.error = o.Str("error", "");
+        r.worker = o.Str("worker", "");
+        r.interval = o.Long("interval", 0);
+        return r;
+    }
+}

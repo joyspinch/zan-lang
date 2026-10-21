@@ -1,0 +1,212 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Json;
+using System.Jobs;
+using System.Threading;
+
+// 后台任务队列：持久化任务存储 / 显式注册 / 重试退避 / 延迟与周期调度 /
+// 死信与人工重试 / 状态统计。
+//
+// 输出是确定性的：只打印固定标签，不打印带时间戳的任务 id。
+class JobsConformance {
+    static int ok = 0;
+    static int bad = 0;
+
+    static void Check(string label, bool cond) {
+        if (cond) {
+            ok = ok + 1;
+            Console.WriteLine("ok   " + label);
+        } else {
+            bad = bad + 1;
+            Console.WriteLine("FAIL " + label);
+        }
+    }
+
+    static void Main() {
+        // ---- 成功路径 ----
+        InMemoryJobStorage mem = new InMemoryJobStorage();
+        JobScheduler sc = new JobScheduler(mem, RetryPolicy.Fixed(3, 20));
+        int ran = 0;
+        sc.Register("greet", (args) => {
+            ran = ran + 1;
+            return JobResult.Success();
+        });
+        string id = sc.Enqueue("greet", "{\"who\":\"bob\"}");
+        Check("enqueue returns an id", id != null && id.Length > 0);
+        Check("one job processed", sc.ProcessOnce() == 1);
+        Check("handler ran once", ran == 1);
+        JobRecord rec = sc.Get(id);
+        Check("state is Succeeded", rec != null && rec.state == JobState.Succeeded);
+        Check("attempts counted", rec != null && rec.attempts == 1);
+        Check("no error recorded", rec != null && rec.error.Length == 0);
+
+        // ---- 未注册的任务名在入队时就被拒 ----
+        try {
+            sc.Enqueue("nope", "{}");
+            Check("unregistered job rejected", false);
+        } catch (JobException e) {
+            Check("unregistered job rejected", e.error == JobError.UnknownJob);
+        }
+
+        // ---- 幂等：同一个 id 重复入队 ----
+        try {
+            sc.EnqueueWithId("fixed-1", "greet", "{}");
+            sc.EnqueueWithId("fixed-1", "greet", "{}");
+            Check("duplicate id rejected", false);
+        } catch (JobException e) {
+            Check("duplicate id rejected", e.error == JobError.DuplicateId);
+        }
+
+        // ---- 可重试失败：Failed -> 退避 -> 再试 -> 超过上限 Dead ----
+        int attempts = 0;
+        JobScheduler sc2 = new JobScheduler(new InMemoryJobStorage(), RetryPolicy.Fixed(3, 20));
+        sc2.Register("flaky", (args) => {
+            attempts = attempts + 1;
+            return JobResult.Retry("downstream down");
+        });
+        string fid = sc2.Enqueue("flaky", "{}");
+        sc2.ProcessOnce();
+        JobRecord f1 = sc2.Get(fid);
+        Check("retryable failure -> Failed", f1 != null && f1.state == JobState.Failed);
+        Check("retry count recorded", f1 != null && f1.retry == 1);
+        Check("failure message kept", f1 != null && f1.error == "downstream down");
+        Check("backoff is respected", sc2.ProcessOnce() == 0 && attempts == 1);
+        Thread.Sleep(120);
+        sc2.ProcessOnce();
+        JobRecord f2 = sc2.Get(fid);
+        Check("second attempt -> Failed again", f2 != null && f2.state == JobState.Failed
+            && f2.retry == 2 && attempts == 2);
+        Thread.Sleep(120);
+        sc2.ProcessOnce();
+        JobRecord f3 = sc2.Get(fid);
+        Check("attempt cap -> Dead", f3 != null && f3.state == JobState.Dead
+            && f3.attempts == 3);
+
+        // ---- 不可重试失败直接进死信 ----
+        JobScheduler sc3 = new JobScheduler(new InMemoryJobStorage(), RetryPolicy.Fixed(5, 10));
+        sc3.Register("bad", (args) => { return JobResult.Fail("bad input"); });
+        string bid = sc3.Enqueue("bad", "{}");
+        sc3.ProcessOnce();
+        JobRecord b1 = sc3.Get(bid);
+        Check("non-retryable -> Dead", b1 != null && b1.state == JobState.Dead
+            && b1.attempts == 1);
+
+        // ---- 处理器抛异常按可重试处理，worker 不死 ----
+        JobScheduler scThrow = new JobScheduler(new InMemoryJobStorage(), RetryPolicy.Fixed(2, 20));
+        scThrow.Register("boom", (args) => { throw new InvalidOperationException("kaboom"); });
+        string tid2 = scThrow.Enqueue("boom", "{}");
+        scThrow.ProcessOnce();
+        JobRecord th = scThrow.Get(tid2);
+        Check("thrown exception -> retryable failure", th != null
+            && th.state == JobState.Failed);
+
+        // ---- 延迟任务：没到时间不跑，到点才跑 ----
+        JobScheduler sc4 = new JobScheduler(new InMemoryJobStorage(), RetryPolicy.Fixed(3, 20));
+        int late = 0;
+        sc4.Register("later", (args) => { late = late + 1; return JobResult.Success(); });
+        long now = DateTime.GetCurrentUnixMilliseconds();
+        string lid = sc4.Schedule("later", "{}", now + 300);
+        JobRecord l1 = sc4.Get(lid);
+        Check("scheduled state recorded", l1 != null && l1.state == JobState.Scheduled);
+        sc4.ProcessOnce();
+        Check("not run before its time", late == 0);
+        Thread.Sleep(400);
+        sc4.ProcessOnce();
+        Check("ran after its time", late == 1);
+
+        // ---- 周期任务：成功后自动排下一次 ----
+        JobScheduler sc5 = new JobScheduler(new InMemoryJobStorage(), RetryPolicy.Fixed(3, 20));
+        int ticks = 0;
+        sc5.Register("tick", (args) => { ticks = ticks + 1; return JobResult.Success(); });
+        string tid = sc5.EnqueueRecurring("tick", "{}", 60000);
+        sc5.ProcessOnce();
+        Check("recurring job ran once", ticks == 1);
+        List<JobRecord> all = sc5.List("tick", -1, 0);
+        Check("recurring job requeued", all.Count == 2);
+        bool sawNext = false;
+        for (int i = 0; i < all.Count; i++) {
+            if (all[i].id != tid && all[i].interval == 60000
+                && all[i].state == JobState.Enqueued) {
+                sawNext = true;
+            }
+        }
+        Check("next occurrence is pending", sawNext);
+
+        // ---- 死信人工重试 ----
+        string rid = sc3.RetryDead(bid);
+        JobRecord r1 = sc3.Get(rid);
+        Check("dead job requeued", r1 != null && r1.state == JobState.Enqueued);
+        sc3.ProcessOnce();
+        JobRecord r2 = sc3.Get(rid);
+        Check("requeued job ends dead again", r2 != null && r2.state == JobState.Dead);
+
+        // ---- 删除 ----
+        Check("delete marks the job deleted", sc3.Delete(rid));
+        JobRecord d1 = sc3.Get(rid);
+        Check("deleted state recorded", d1 != null && d1.state == JobState.Deleted);
+
+        // ---- 统计 ----
+        JobStats st = sc5.Stats();
+        Check("stats total", st.total == 2);
+        Check("stats succeeded", st.succeeded == 1);
+        Check("stats enqueued", st.enqueued == 1);
+        Check("stats describe is stable",
+            st.Describe() == "total=2 enqueued=1 scheduled=0 processing=0 succeeded=1"
+                + " failed=0 dead=0 deleted=0");
+
+        // ---- 退避数值：指数增长 ----
+        RetryPolicy expo = new RetryPolicy(5, 100, 2.0, 10000, false);
+        Check("backoff grows exponentially",
+            expo.DelayFor(1) == 100 && expo.DelayFor(2) == 200 && expo.DelayFor(3) == 400);
+        RetryPolicy capped = new RetryPolicy(5, 100, 2.0, 250, false);
+        Check("backoff is capped", capped.DelayFor(4) == 250);
+
+        // ---- 强类型注册（泛型 + 显式序列化委托）----
+        JobRegistry reg = new JobRegistry();
+        reg.RegisterTyped<Payload>("typed", (p) => {
+            if (p.times > 1) { return JobResult.Retry("again"); }
+            return JobResult.Success();
+        },
+        (p) => "{\"times\":" + p.times + "}",
+        (json) => {
+            Payload p = new Payload();
+            JsonValue v = JsonValue.Parse(json);
+            if (v == null) { return p; }
+            p.times = v.Int("times", 0);
+            return p;
+        });
+        JobHandler h = reg.Find("typed");
+        Check("typed handler registered", h != null);
+        if (h != null) {
+            Check("typed handler round-trips args", h.Normalize("{\"times\":3}") == "{\"times\":3}");
+            JobResult tr = h.run("{\"times\":3}");
+            Check("typed handler result is retryable", tr != null && !tr.ok && tr.retryable);
+        }
+
+        // ---- 持久化：重启后任务还在，worker 接着处理 ----
+        string dir = "_scratch/jobs_conformance";
+        Directory.CreateDirectoryRecursive(dir);
+        string path = dir + "/store.jsonl";
+        if (File.Exists(path)) { File.Delete(path); }
+        FileJobStorage fs = new FileJobStorage(path);
+        JobScheduler sc6 = new JobScheduler(fs, RetryPolicy.Fixed(3, 20));
+        int persisted = 0;
+        sc6.Register("persisted", (args) => { persisted = persisted + 1; return JobResult.Success(); });
+        sc6.Enqueue("persisted", "{\"k\":1}");
+        JobScheduler sc7 = new JobScheduler(new FileJobStorage(path), RetryPolicy.Fixed(3, 20));
+        sc7.Register("persisted", (args) => { persisted = persisted + 1; return JobResult.Success(); });
+        Check("job survived a restart", sc7.ProcessOnce() == 1 && persisted == 1);
+        FileJobStorage fs2 = new FileJobStorage(path);
+        Check("store replayed from disk", fs2.Snapshot().Count == 1);
+        fs2.Compact();
+        FileJobStorage fs3 = new FileJobStorage(path);
+        Check("compaction keeps the state", fs3.Snapshot().Count == 1);
+
+        Console.WriteLine("ok=" + ok + " bad=" + bad);
+    }
+}
+
+class Payload {
+    public int times;
+}

@@ -1,0 +1,172 @@
+using System;
+using System.Collections.Generic;
+
+namespace System.Jobs;
+
+// 任务调度器（门面）：把存储、注册表、队列、执行器接在一起。
+//
+// **门面上只做"常用路径"**：注册处理器、入队、起 worker、看状态。
+// 需要更细控制的调用方直接用 `JobQueue` / `JobWorker` / `JobStorage`。
+//
+// **入队前校验任务名**：没注册的处理器会在入队时直接抛
+// `JobError.UnknownJob`——接线错误在调用那一刻就暴露，而不是让任务
+// 在队列里躺到被 worker 捡起来才变成死信。
+public class JobScheduler {
+    JobStorage storage;
+    JobRegistry registry;
+    RetryPolicy policy;
+    JobQueue queue;
+    JobWorker worker;
+
+    // 用给定的存储建一个调度器（重试策略用默认）。
+    public JobScheduler(JobStorage storage) {
+        this.storage = storage;
+        this.registry = new JobRegistry();
+        this.policy = RetryPolicy.Default();
+        this.queue = new JobQueue(storage);
+        this.worker = new JobWorker(storage, this.registry, this.policy);
+        this.worker.SetQueue(this.queue);
+    }
+
+    // 用给定的存储与重试策略建一个调度器。
+    public JobScheduler(JobStorage storage, RetryPolicy policy) {
+        this.storage = storage;
+        this.registry = new JobRegistry();
+        this.policy = policy != null ? policy : RetryPolicy.Default();
+        this.queue = new JobQueue(storage);
+        this.worker = new JobWorker(storage, this.registry, this.policy);
+        this.worker.SetQueue(this.queue);
+    }
+
+    public JobStorage Storage() { return this.storage; }
+    public JobRegistry Registry() { return this.registry; }
+    public JobQueue Queue() { return this.queue; }
+    public JobWorker Worker() { return this.worker; }
+    public RetryPolicy Policy() { return this.policy; }
+
+    // 注册一个"参数是 JSON 文本"的处理器。
+    public void Register(string name, FuncT<string, JobResult> run) {
+        this.registry.Register(name, run);
+    }
+
+    // 注册强类型处理器（序列化委托必须显式给，无反射就没有自动推导）。
+    public void RegisterTyped<TArgs>(string name, FuncT<TArgs, JobResult> handler,
+                                    FuncT<TArgs, string> toJson,
+                                    FuncT<string, TArgs> fromJson) {
+        this.registry.RegisterTyped<TArgs>(name, handler, toJson, fromJson);
+    }
+
+    // 立即执行的任务；返回任务 id。
+    public string Enqueue(string name, string argsJson) {
+        this.RequireHandler(name);
+        return this.queue.Enqueue(name, argsJson);
+    }
+
+    // 带幂等 id 入队；id 重复抛 `DuplicateId`。
+    public string EnqueueWithId(string id, string name, string argsJson) {
+        this.RequireHandler(name);
+        return this.queue.EnqueueWithId(id, name, argsJson);
+    }
+
+    // 延迟到指定时刻执行。
+    public string Schedule(string name, string argsJson, long runAtUnixMs) {
+        this.RequireHandler(name);
+        return this.queue.Schedule(name, argsJson, runAtUnixMs);
+    }
+
+    // 周期任务。
+    public string EnqueueRecurring(string name, string argsJson, long intervalMs) {
+        this.RequireHandler(name);
+        return this.queue.EnqueueRecurring(name, argsJson, intervalMs);
+    }
+
+    // 起后台 worker；已经在跑返回 false。
+    public bool StartWorker(int pollMs) {
+        this.worker.SetPollMs(pollMs);
+        return this.worker.Start();
+    }
+
+    // 停止 worker。
+    public void StopWorker() {
+        this.worker.Stop();
+    }
+
+    // 手动处理一轮（不依赖后台线程；测试与"我就是想同步跑一遍"用）。
+    public int ProcessOnce() {
+        return this.worker.ProcessOnce();
+    }
+
+    // 状态统计。
+    public JobStats Stats() {
+        JobStats st = new JobStats();
+        List<JobRecord> all = this.storage.Snapshot();
+        for (int i = 0; i < all.Count; i++) {
+            JobRecord r = all[i];
+            st.total = st.total + 1;
+            if (r.state == JobState.Enqueued) { st.enqueued = st.enqueued + 1; }
+            else if (r.state == JobState.Scheduled) { st.scheduled = st.scheduled + 1; }
+            else if (r.state == JobState.Processing) { st.processing = st.processing + 1; }
+            else if (r.state == JobState.Succeeded) { st.succeeded = st.succeeded + 1; }
+            else if (r.state == JobState.Failed) { st.failed = st.failed + 1; }
+            else if (r.state == JobState.Dead) { st.dead = st.dead + 1; }
+            else if (r.state == JobState.Deleted) { st.deleted = st.deleted + 1; }
+        }
+        return st;
+    }
+
+    // 过滤查询：name 为空不限名字；state < 0 不限状态；limit <= 0 不限条数。
+    public List<JobRecord> List(string name, int state, int limit) {
+        return this.storage.Filter(name, state, limit);
+    }
+
+    // 按 id 查任务；查不到返回 null。
+    public JobRecord Get(string id) {
+        return this.storage.Find(id);
+    }
+
+    // 把一条死信重新排回队列（人工介入后重跑）。返回新任务 id；
+    // 原任务不是死信时抛 `NotFound` 之外的 `InvalidResult`。
+    public string RetryDead(string id) {
+        JobRecord r = this.storage.Find(id);
+        if (r == null) {
+            throw new JobException(JobError.NotFound, id, "job not found: " + id);
+        }
+        if (r.state != JobState.Dead) {
+            throw new JobException(JobError.InvalidResult, id,
+                "job is not dead (state=" + JobStates.Name(r.state) + ")");
+        }
+        this.RequireHandler(r.name);
+        JobRecord next = r.Copy();
+        next.id = this.queue.NextId();
+        next.state = JobState.Enqueued;
+        next.runAt = DateTime.GetCurrentUnixMilliseconds();
+        next.retry = 0;
+        next.attempts = 0;
+        next.startAt = 0;
+        next.endAt = 0;
+        next.error = "";
+        this.storage.Append(next);
+        return next.id;
+    }
+
+    // 删除一个任务（写一条 Deleted 状态覆盖它）。
+    public bool Delete(string id) {
+        JobRecord r = this.storage.Find(id);
+        if (r == null) { return false; }
+        JobRecord rec = r.Copy();
+        rec.state = JobState.Deleted;
+        this.storage.Append(rec);
+        return true;
+    }
+
+    // 校验任务名已注册；没注册抛 `UnknownJob`。
+    void RequireHandler(string name) {
+        if (name == null || name.Length == 0) {
+            throw new JobException(JobError.InvalidName, "job name is empty");
+        }
+        if (!this.registry.Has(name)) {
+            throw new JobException(JobError.UnknownJob, name,
+                "no handler registered for job: " + name);
+        }
+    }
+}
