@@ -65,6 +65,16 @@ public class Control {
     // 文档声明尺寸均为逻辑像素，度量时统一按 DPI 缩放换算。
     int logW;
     int logH;
+    // 作者（设计文档）声明的高度（换算后的设备像素，0 = 未声明）。
+    // 声明高度优先于样式表的 height（CSS：内联 > 样式表）：
+    // 否则设计文档里的字段高度被皮肤的默认高度（`input { height: 32px }`）
+    // 压住——设计器里改了高度不生效，行高也按样式表的高度排，
+    // 多行文本 / 上传这类"皮肤不定高"的类型被压成一行高，
+    // 和下一行叠在一起。
+    // 只有走 DeclareHeight 通道（设计文档 → 运行时/预览）才置位：
+    // 代码里手搭的 logH/logW 仍按"测量偏好"处理，尺寸档照旧说话。
+    int declaredH;
+    bool authorSized;
     int logGap;
     int logPad;
     int logMar;
@@ -915,6 +925,12 @@ public class Control {
     // 生效高度：在 `avail` 像素包含块内解析样式声明的高度
     // （百分比、min/max 同 StyleWidthIn），未声明时回退 prefH。
     int StyleHeightIn(int avail) {
+        // 作者声明的高度优先于样式表（CSS：内联 > 样式表）：设计文档里
+        // 的字段高度不该被皮肤的默认高度（`input { height: 32px }`）压住，
+        // 否则设计器里改了高度不生效、行高按样式表排，字段互相叠。
+        // 声明高度是边框盒外框尺寸（设计器画布就是按它画框的），
+        // 因此直接返回，不再套 content-box 的"内容高 + 内边距"换算。
+        if (this.declaredH > 0) { return this.declaredH; }
         if (computedStyle == null) { return prefH; }
         int h = computedStyle.ClampHIn(avail, computedStyle.HeightIn(avail, prefH));
         if (computedStyle.boxSizing == 1 && computedStyle.height >= 0) {
@@ -1560,11 +1576,26 @@ public class Control {
         events.Add(new EventBinding(evt, h));
     }
 
+    // 作者声明控件高度（设计文档的 fh，逻辑像素）。走这条通道的
+    // 高度优先于样式表的 height：文档是设计器的唯一真相，样式表
+    // 的默认高度（`input { height: 32px }`）不该把作者定下的行高
+    // 压回去——那正是"改了高度不生效、行与行叠在一起"的根源。
+    // 代码里手搭控件时直接用 logH / SetSize，走的是"测量偏好"通道，
+    // 尺寸档（tiny/small/medium/large）依然说了算。
+    void DeclareHeight(int h) {
+        if (h <= 0) { return; }
+        this.logH = h;
+        this.authorSized = true;
+    }
+
     // 让节点自下而上从主题设置首选尺寸（子节点
     // 优先）。子类重写 OnMeasure。在 Arrange 之前运行。
     void ApplyDeclaredUnits(App app) {
         if (logW > 0) { prefW = app.Scale(logW); prefSet = true; }
         if (logH > 0) { prefH = app.Scale(logH); prefSet = true; }
+        // 作者声明的高度只认 DeclareHeight 通道：代码里手搭的
+        // logH 只是"测量偏好"，样式表（尺寸档）仍然说话。
+        declaredH = (logH > 0 && authorSized) ? prefH : 0;
         if (logGap >= 0) { gap = app.Scale(logGap); }
         if (logPad >= 0) { this.Pad(app.Scale(logPad)); }
         if (logMar >= 0) { this.Margin(app.Scale(logMar)); }

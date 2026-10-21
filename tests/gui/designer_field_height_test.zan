@@ -1,0 +1,140 @@
+using System;
+using Gui;
+using Gui.Widget;
+using Gui.Designer;
+
+// 设计器的字段高度契约（框架层）：
+//  1. 文档声明的高度优先于皮肤的默认高度（`input { height: 32px }`）——
+//     以前声明被样式表压住，改高度不生效，行高也按 32 排；
+//  2. 内容型控件（多行文本 / 附件 / 表格…）没有样式表默认高度，设计
+//     文档一律带上类型标准行高（FormField.DefaultHFor），否则它们
+//     塌成一行高、和下一行叠在一起；
+//  3. 皮肤定高的类型（输入框/下拉/开关…）归尺寸档管、容器（面板/
+//     卡片…）按内容自适应，文档都不写高度；
+//  4. 旧文档里给每个字段写死的 fh=32 是历史默认，不是作者的意思：
+//     容器不能被钉死在 32 行高（内容溢出、与下一行叠）；
+//  5. 流式行的行高要装得下最高的字段，相邻两行不得重叠。
+class DesignerFieldHeightTest {
+    static int fails;
+
+    static void Fail(string msg) {
+        Console.WriteLine("FAIL: " + msg);
+        fails = fails + 1;
+    }
+
+    static void AssertTrue(bool cond, string desc) {
+        if (!cond) { Fail(desc); }
+    }
+
+    static void AssertEqInt(int actual, int expected, string desc) {
+        if (actual != expected) {
+            Fail(desc + " expected " + Convert.ToString(expected)
+                + ", got " + Convert.ToString(actual));
+        }
+    }
+
+    static FormField Find(List<FormField> fields, string name) {
+        for (int i = 0; i < fields.Count; i = i + 1) {
+            if (fields[i].fname == name) { return fields[i]; }
+            FormField nested = DesignerFieldHeightTest.Find(fields[i].kids, name);
+            if (nested != null) { return nested; }
+        }
+        return null;
+    }
+
+    static Control Preview(Designer d, FormField f) {
+        DesignPreviewNode node = d.PreviewNode(f);
+        if (node == null) { return null; }
+        return node.control;
+    }
+
+    // 声明的高度赢过皮肤默认；内容型控件按标准行高；行不重叠。
+    static void TestFieldHeights() {
+        Designer d = new Designer();
+        d.layoutMode = 0;
+        FormField tall = FormField.New(0, 1);
+        tall.fh = 48;
+        d.fields.Add(tall);
+        FormField area = FormField.New(1, 2);   // Textarea
+        d.fields.Add(area);
+        FormField tall2 = FormField.New(0, 3);
+        tall2.fh = 64;
+        d.fields.Add(tall2);
+
+        App host = App.CreateOffscreen("designer field height", 1120, 850);
+        host.freezeAnimClock = true;
+        host.nowMs = 10000;
+        host.lastFrameMs = 10000;
+        d.PrepareDesignPreview(host);
+
+        Control cTall = Preview(d, tall);
+        Control cArea = Preview(d, area);
+        Control cTall2 = Preview(d, tall2);
+        AssertTrue(cTall != null && cArea != null && cTall2 != null, "preview nodes exist");
+        if (cTall == null || cArea == null || cTall2 == null) { return; }
+
+        // 1. 声明的高度生效（皮肤的 input 高度是 32，声明 48 要赢）。
+        AssertEqInt(cTall.bh, 48, "declared height 48 wins over the skin height");
+        AssertEqInt(cTall2.bh, 64, "declared height 64 wins over the skin height");
+
+        // 2. 内容型控件按标准行高（多行文本 62）。
+        AssertEqInt(cArea.bh, FormField.DefaultHFor(1), "textarea uses the type row height");
+
+        // 3. 相邻两行不重叠：上一行的底 <= 下一行的顶。
+        AssertTrue(cTall.by + cTall.bh <= cArea.by, "row 1 does not overlap row 2");
+        AssertTrue(cArea.by + cArea.bh <= cTall2.by, "row 2 does not overlap row 3");
+    }
+
+    // 文档里不写"与类型默认相同"的高度（否则会压掉皮肤的尺寸档），
+    // 用户改过的高度要写进去，内容型控件一律写。
+    static void TestDocumentHeight() {
+        Designer d = new Designer();
+        d.layoutMode = 0;
+        FormField plain = FormField.New(0, 1);
+        d.fields.Add(plain);
+        FormField custom = FormField.New(0, 2);
+        custom.fh = 48;
+        d.fields.Add(custom);
+        FormField area = FormField.New(1, 3);
+        d.fields.Add(area);
+
+        string json = d.SaveJson();
+        AssertTrue(json.Contains("\"fh\": 48"), "custom height is written to the document");
+        // 输入框的类型默认行高不该出现在文档里（尺寸档仍然说话）。
+        int plainH = FormField.DefaultHFor(0);
+        string plainMark = "\"fh\": " + Convert.ToString(plainH);
+        AssertTrue(!json.Contains(plainMark), "type default height is not written to the document");
+        // 内容型控件（多行文本）必须带高度，否则运行时塌成一行高。
+        AssertTrue(json.Contains("\"fh\": " + Convert.ToString(FormField.DefaultHFor(1))),
+            "content type height is written to the document");
+    }
+
+    // 旧文档写死的 fh=32 是历史默认，不是作者的意思：容器不能被钉死在
+    // 32 行高（内容溢出、和下一行叠），内容型控件还原成标准行高。
+    static void TestLegacyDefaultHeight() {
+        Designer d = new Designer();
+        d.LoadHtmlText("<html><body data-zan-design id=\"Legacy\">"
+            + "<div id=\"Box\" data-kind=\"Panel\" data-fh=\"32\"></div>"
+            + "<textarea id=\"Note\" data-kind=\"TextArea\" data-fh=\"32\"></textarea>"
+            + "</body></html>");
+        FormField box = Find(d.fields, "Box");
+        FormField note = Find(d.fields, "Note");
+        AssertTrue(box != null && note != null, "legacy fields loaded");
+        if (box == null || note == null) { return; }
+        AssertEqInt(box.fh, 0, "legacy container height 32 is not an authored height");
+        AssertEqInt(note.fh, FormField.DefaultHFor(1), "legacy content height falls back to the type row height");
+        string json = d.SaveJson();
+        AssertTrue(!json.Contains("\"fh\": 32"), "legacy default height is not written back");
+    }
+
+    static void Main() {
+        TestFieldHeights();
+        TestDocumentHeight();
+        TestLegacyDefaultHeight();
+        if (fails == 0) {
+            Console.WriteLine("DESIGNER_FIELD_HEIGHT_TEST_OK");
+        } else {
+            Console.WriteLine("DESIGNER_FIELD_HEIGHT_TEST_FAIL (fails=" + Convert.ToString(fails) + ")");
+        }
+    }
+}

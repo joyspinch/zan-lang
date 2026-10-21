@@ -1507,4 +1507,51 @@
   （`name|||自举措辞|||宿主措辞`）把这条边界钉住。
 - 关联：A471（宿主侧同一条战线）、`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26/§36。
 
+### [ ] A478 「标题栏浮动组件忽略标题栏高度」——复现界面未定，暂未定位到缺陷点
+
+- 现象（用户 2026-10-21 报）：「标题栏浮动组件会忽略标题栏高度」——浮动组件
+  像是按"整窗客户区"定位的，没有让开自定义标题栏（`titlebarH`）的高度。
+- 已核查（本轮逐路径读过，**都没找到忽略 titlebarH 的地方**）：
+  - `Gui/Core/Form.zan` `RenderFrame`：内容根排布于 `app.ContentTop()`（= titlebarH）；
+  - `Gui/Core/ChildWindow.zan` `RenderContent`：排布于
+    `host.ContentTop() + ShapeOffY + pad`；
+  - `Gui/Core/OverlayPopup.zan`、`Gui/Widget/Layer.zan`、`Widget/Models/LayerState.zan`、
+    `Widget/ContextMenu.zan`、`Widget/Tooltip.zan`：浮层一律用
+    `app.titlebarH` / `ContentTop()` 做钳制；
+  - IDE 外壳 `src/ide_zan/src/shell/ZanIDE.zan` `PaintFrame`：`int top = app.titlebarH;`，
+    ribbon 从 top 起画；
+  - 设计器自由画布 `Designer.PlaceFree`（注释「新浮动组件的位置以真实父内容框
+    为参考」）：定位基于父**内容框**原点，`DesignRootContentHeight` 在 winChrome
+    时按 `winH - 32` 扣掉标题栏。
+- 实测（探针 `_scratch/designer_layout_probe.zan`）：设计器预览里
+  `position=1, fy=0` 的浮动组件落在 `y = App.ContentTop()`（titlebarH=32），
+  **这条路径并没有忽略标题栏高度**。
+- 待办：需要用户给出**具体复现界面**（IDE 设计器画布 / 生成程序窗口 /
+  IDE 面板 / HTML 表单）与复现步骤，才好定位到真正忽略 titlebarH 的那条路径；
+  定位前不凭猜测改这条线（改错地方会连带影响已正确的四条路径）。
+- 关联：本轮的"行高/重叠"已按框架层修完，两条线互不依赖。
+
 ### [ ] A479 声明前瞻不认「限定名 + 可空标记 + 数组」——`System.Text.Encoding?[] a` 解析不了
+
+- 现象（2026-10-21 修 A469 时实测，探针 `_scratch/a469_probe4.zan`）：
+
+  ```zan
+  Encoding?[] a = new Encoding?[2];     // error: unexpected token '[' in expression
+  ```
+
+  拆开看，每一块单独都正常，**只有这个组合炸**：
+  - `Encoding? e = null;`（限定名 + 可空标记，无数组）→ **OK**；
+  - `string?[] a = new string?[2];`（**简单名** + 可空标记 + 数组）→ **OK**；
+  - `NsX.Host.Leaf[] a = ...;`（限定名 + 数组，无可空标记）→ **OK**（A469 修完后）。
+
+  解析器把 `Encoding?` 当成三元表达式的问号，后面跟 `[]` 就炸了。
+- 定位到的位置：声明前瞻 `src/compiler/parser.c` 的 `looks_like_var_decl`。
+  它的**限定名分支**（`TK_DOT`）扫完点号链之后只认 `<...>`（泛型实参）与 `[]`
+  （数组）两种后缀，**没有处理可空标记 `?`**；简单名走的是 `TK_QUESTION` 分支，
+  另一套规则。（到底哪一步把 `Encoding?` 判成表达式，待查——先记现象与边界。）
+- 影响：命名空间里的引用类型想要一个**可空数组**就写不出来，只能退回 `Encoding[]`
+  （丢掉可空）或给类型换个本地名字。属于**语法层**缺口：差分门看不见（它比的是
+  能编出来的程序），但用户直接撞墙。
+- 方向：声明前瞻的限定名分支补 `?`（以及 `?` 之后的 `[]`）：扫完点号链后允许一个
+  `?`，再允许数组后缀，最后要求后面是标识符。改完用上面三条探针一起回归。
+- 关联：A469（数组的元素类型要过名字解析）、§2（语法解析器分派契约）。
