@@ -4875,6 +4875,22 @@ add_test(NAME ide_compile_modes
     -P ${CMAKE_SOURCE_DIR}/tests/run_ide_compile_mode.cmake)
 set_tests_properties(ide_compile_modes PROPERTIES LABELS "full;standard;smoke;ide")
 
+# The IDE's live SSE preview folds a half line left over from the last chunk.
+# SSE may end without a newline, so that half line has to be folded on Finish
+# -- otherwise the preview loses the last fragment (the final message, parsed
+# from the full text, is right -- so the preview disagrees with it).
+add_test(NAME conformance_ide_sse_live_tail
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/ide/sse_live_tail_test.zan
+    -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/ide/sse_live_tail_test.out
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/conformance_ide_sse_live_tail${_exe_ext}
+    -DSTDLIB_STAMP=${_stdlib_stamp}
+    "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/ai/SseLive.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/models/ai/SseAnswer.zan;${CMAKE_SOURCE_DIR}/src/ide_zan/src/services/AiAgent.Sse.zan;--auto-stdlib"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+set_tests_properties(conformance_ide_sse_live_tail PROPERTIES
+  TIMEOUT 180 LABELS "full;standard;smoke;ide")
+
 # ---- Policy: components own their drawing, examples only use them ----
 # A gauge drawn a second time inside a demo drifts from the component the moment
 # the component is fixed -- so the arc/sector primitives a dial is made of are

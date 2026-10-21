@@ -1,0 +1,79 @@
+// IDE 端 SSE 增量预览的收尾行为。
+//
+// `SseLive` 是**增量**喂的：每次只喂新到的那一段，一行事件常常被切在
+// 两段之间，所以没等到换行的那半行留在 `pend` 里，跟下一段拼起来。
+//
+// 问题：SSE 允许最后一帧**不以换行收尾**（最后一个事件不必带空行）。
+// 流结束了就没有"下一段"了，那半行就永远折不进来——预览里最后一个分片
+// 凭空消失。最终那条消息是从全文用 `AiAgent.ParseSse` 重新解析的，所以
+// 那条是对的：于是预览比最终消息少一截，看着像"又抽风了一下"。
+//
+// `Finish()` 把残留的半行按完整的一行折进来。
+using System;
+
+class SseLiveTest {
+    static int bad = 0;
+
+    static void Check(string what, bool ok) {
+        if (!ok) {
+            Console.WriteLine("FAIL " + what);
+            SseLiveTest.bad = SseLiveTest.bad + 1;
+        }
+    }
+
+    // 一条 SSE 事件：data: {"choices":[{"delta":{"content":"X"}}]}
+    static string Frame(string text) {
+        return "data: {\"choices\":[{\"delta\":{\"content\":\"" + text + "\"}}]}\n\n";
+    }
+
+    static void Main() {
+        // ---- 1. 正常：两帧都以换行收尾 ----
+        SseLive live = new SseLive();
+        live.FeedTail(1, Frame("A") + Frame("B"));
+        Check("content", live.Content() == "AB");
+
+        // ---- 2. 最后一帧**没有**换行：Flush 之后要把半行折进来 ----
+        SseLive live2 = new SseLive();
+        live2.FeedTail(1, Frame("A") + "data: {\"choices\":[{\"delta\":"
+            + "{\"content\":\"B\"}}]}");
+        // 还没 Flush 时，B 还在 pend 里（此时不该出现）。
+        Check("before-finish", live2.Content() == "A");
+        live2.Finish();
+        // Flush 之后 B 必须出现——否则预览比最终消息少一截。
+        Check("after-finish", live2.Content() == "AB");
+
+        // ---- 3. 跨 chunk 的半行：切在两段之间 ----
+        SseLive live3 = new SseLive();
+        string whole = Frame("A") + Frame("B");
+        live3.FeedTail(1, whole.Substring(0, whole.Length / 2));
+        live3.FeedTail(1, whole.Substring(whole.Length / 2));
+        Check("split", live3.Content() == "AB");
+
+        // ---- 4. 切在两段之间，且最后一段**没有**换行 ----
+        SseLive live4 = new SseLive();
+        string last = "data: {\"choices\":[{\"delta\":{\"content\":\"C\"}}]}";
+        string mixed = Frame("A") + last;
+        live4.FeedTail(1, mixed.Substring(0, mixed.Length - 5));
+        live4.FeedTail(1, mixed.Substring(mixed.Length - 5));
+        live4.Finish();
+        Check("split-tail", live4.Content() == "AC");
+
+        // ---- 5. Flush 幂等：调两次不能把内容折两遍 ----
+        SseLive live5 = new SseLive();
+        live5.FeedTail(1, Frame("A") + "data: {\"choices\":[{\"delta\":"
+            + "{\"content\":\"B\"}}]}");
+        live5.Finish();
+        live5.Finish();
+        live5.Finish();
+        Check("idempotent", live5.Content() == "AB");
+
+        // ---- 6. 空输入不炸 ----
+        SseLive live6 = new SseLive();
+        live6.FeedTail(1, "");
+        live6.Finish();
+        Check("empty", live6.Content() == "");
+
+        Console.WriteLine("ide-sse-live-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
+        Environment.Exit(bad == 0 ? 0 : 1);
+    }
+}

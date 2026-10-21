@@ -1,0 +1,63 @@
+using System;
+using System.Text;
+using System.Json;
+
+// SSE 帧的折叠：把一帧 JSON 里的增量文本 / 错误 / 用量折进 SseAnswer。
+//
+// 单独成文件（而不是塞在 AiAgent.Context.zan 里）是为了能**单独编译**：
+// Context.zan 里的其它方法依赖整个 IDE（ZanIDE 的成员、设置表、数据库），
+// 而这一段是纯函数——只依赖 JsonValue 与 SseAnswer。拆出来就能给它写
+// 独立的用例，不必把整个 IDE 拖进来。
+partial class AiAgent {
+    // 去首尾空白（空格 / 换行 / 回车 / 制表）。SSE 的 `data:` 载荷前后
+    // 常常有空白，解析前要剪掉。放在这个文件里是为了让 SSE 相关的那几
+    // 个文件（AiAgent.Sse / SseLive）能单独编译、单独写用例。
+    static string Trim(string s) {
+        int a = 0;
+        for (a = 0; a < s.Length; a = a + 1) {
+            string ch = s.Substring(a, 1);
+            if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { break; }
+        }
+        int b = s.Length;
+        for (b = s.Length; b > a; b = b - 1) {
+            string ch = s.Substring(b - 1, 1);
+            if (ch != " " && ch != "\n" && ch != "\r" && ch != "\t") { break; }
+        }
+        return s.Substring(a, b - a);
+    }
+
+    static void FoldChunk(SseAnswer a, StringBuilder c, StringBuilder r,
+            JsonValue v, string raw) {
+        if (v == null) { return; }
+        JsonValue err = v.Get("error");
+        if (err != null && a.error == "") {
+            if (err.IsObject()) { a.error = err.Str("message", raw); }
+            else { a.error = err.AsString(raw); }
+        }
+        JsonValue ch = v.Get("choices");
+        if (ch != null && ch.IsArray() && ch.Count() > 0) {
+            JsonValue delta = ch.At(0).Get("delta");
+            if (delta != null) {
+                c.Append(delta.Str("content", ""));
+                r.Append(delta.Str("reasoning_content", ""));
+            } else {
+                JsonValue full = ch.At(0).Get("message");
+                if (full != null) {
+                    c.Append(full.Str("content", ""));
+                    r.Append(full.Str("reasoning_content", ""));
+                }
+            }
+        }
+        JsonValue us = v.Get("usage");
+        if (us != null && us.IsObject()) {
+            a.promptTokens = us.Int("prompt_tokens", a.promptTokens);
+            a.completionTokens = us.Int("completion_tokens", a.completionTokens);
+            a.totalTokens = us.Int("total_tokens", a.totalTokens);
+            a.cachedTokens = us.Int("prompt_cache_hit_tokens", a.cachedTokens);
+            JsonValue pd = us.Get("prompt_tokens_details");
+            if (pd != null && pd.IsObject()) {
+                a.cachedTokens = pd.Int("cached_tokens", a.cachedTokens);
+            }
+        }
+    }
+}
