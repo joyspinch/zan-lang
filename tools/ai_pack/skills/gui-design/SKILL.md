@@ -376,6 +376,20 @@ description: Zan GUI (stdlib/Gui) 审美与排版规范——对齐、间距、�
   stdlib 基线内嵌,基线层丢了 flex 全退化成叠矩形(wuwei 百艺页签全叠)。
 - 游戏帧循环:菜单/面板可嵌(脏区门控,实测均值 3ms);每帧热路径 HUD
   仍走代码直绘,不进 DOM。
+- **HTML 里"当前选中项"高亮必须 class 驱动,行内 style 只留几何**:
+  HTML 的 `style="..."` 不是浏览器那套"内联样式优先"——构建器会把它合成
+  一条专属类规则 `.zgen-N { ... }` 并给控件挂上 `zgen-N` 这个类,所以它和
+  作者写的 class 规则**同源**,最终由 CSS 特异性决胜:`.opt.on`(0,2,0) >
+  `.opt`(0,1,0) = `.zgen-N`(0,1,0)。踩过的坑:把背景/边框/颜色写在行内,
+  `.opt.on` 高亮怎么加都不生效——不是优先级被压,是那条高亮规则压根没写。
+  规范做法:
+  1. 视觉属性(background/color/border/border-radius)全部搬进 `<style>` 里的
+     `.opt` / `.opt.on` 规则;行内只留 `font-size`/`padding` 这类几何。
+  2. 状态类用 `SetClassIn("optstate on", on ? "on" : "")`:`SetClassIn` 只清
+     **group 里列出**的类,group 必须把要清除的状态类也写进去。写成
+     `SetClassIn("opt", "opt on")` 会把 "on" 留下(取消高亮时清不掉)。
+  3. 改 `Class` 不必手动 invalidate——样式缓存键含 Class 串
+    (`Control.ResolveStyleCached`),Class 一变缓存自动失效重算。
 
 完整声明面/切页三路/验证定式:`references/html-window.md`(写 .html
 窗口前先读)。
