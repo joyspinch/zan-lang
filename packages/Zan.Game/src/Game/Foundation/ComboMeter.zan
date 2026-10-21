@@ -1,0 +1,112 @@
+using System;
+
+namespace Game.Foundation;
+
+// 连击计：把"连击数 → 倍率 → 超时衰减 → 表现强度"这条链收在一处。
+//
+// 判据（换个游戏还成立）：任何"连续命中就滚雪球"的游戏都要这一套——
+// 挖矿的抓价物、跑酷的连续躲闪、割草的连杀、消除游戏的连段。
+// 表现层（描边、光晕、HUD 文本）由游戏自己画，本类只给数值：
+//   - 倍率只在这里算，别在两处各算一遍（分数与 HUD 会不一致）；
+//   - 超时清零只在这里判，别在 Update 与加分两处各判一次。
+//
+// 典型用法：
+//   ComboMeter m = new ComboMeter().WithTimeout(3200).WithStep(0.1).WithMax(2.0);
+//   m.Hit(nowMs);          // 命中一次
+//   m.Expire(nowMs);       // 每帧调用，超时自动清零
+//   int score = (int)(base * m.multiplier);
+public class ComboMeter {
+    // 当前连击数（0 表示没有连击）。
+    public int count = 0;
+    // 当前倍率（1.0 = 无加成）。
+    public double multiplier = 1.0;
+    // 最近一次命中的时间戳（毫秒）。
+    public long lastHitMs = 0;
+
+    int timeoutMs = 3000;
+    double step = 0.1;
+    double maxMultiplier = 2.0;
+    int feverAt = 3;
+    int feverGlow = 200;
+    int glowPerCombo = 40;
+
+    // 连击超时窗口（毫秒）：超过这个时间没命中就清零。
+    public ComboMeter WithTimeout(int milliseconds) {
+        this.timeoutMs = milliseconds;
+        return this;
+    }
+
+    // 每次命中给倍率加多少（倍率 = 1 + step × 连击数）。
+    public ComboMeter WithStep(double multiplierStep) {
+        this.step = multiplierStep;
+        return this;
+    }
+
+    // 倍率上限。
+    public ComboMeter WithMax(double max) {
+        this.maxMultiplier = max;
+        return this;
+    }
+
+    // 热身档：连击到 at 时表现强度直接给 glowAt，否则按 glowPerCombo 逐连击涨。
+    // 这两个值只影响"该画多亮"，不影响倍率与判定。
+    public ComboMeter WithFever(int at, int glowAt, int glowPerComboValue) {
+        this.feverAt = at;
+        this.feverGlow = glowAt;
+        this.glowPerCombo = glowPerComboValue;
+        return this;
+    }
+
+    // 命中一次：连击 +1，倍率按连击数重算并封顶。
+    public void Hit(long nowMilliseconds) {
+        this.count = this.count + 1;
+        this.lastHitMs = nowMilliseconds;
+        double m = 1.0 + this.step * this.count;
+        if (m > this.maxMultiplier) { m = this.maxMultiplier; }
+        if (m < 1.0) { m = 1.0; }
+        this.multiplier = m;
+    }
+
+    // 每帧调用：超时未命中则清零，返回是否刚刚清零（用于播"连击断了"）。
+    public bool Expire(long nowMilliseconds) {
+        if (this.count <= 0) { return false; }
+        if (this.timeoutMs <= 0) { return false; }
+        if (nowMilliseconds - this.lastHitMs <= this.timeoutMs) { return false; }
+        this.count = 0;
+        this.multiplier = 1.0;
+        return true;
+    }
+
+    // 主动中断（抓到垃圾、踩雷等"这一下不算数"的情况）。
+    public void Break() {
+        this.count = 0;
+        this.multiplier = 1.0;
+    }
+
+    // 全清（含超时状态）。
+    public void Reset() {
+        this.count = 0;
+        this.multiplier = 1.0;
+        this.lastHitMs = 0;
+    }
+
+    // 是否进入"热"档。
+    public bool IsFever() { return this.count >= this.feverAt; }
+
+    // 表现强度目标值（0..255）：热档给 feverGlow，否则按连击数线性涨。
+    // 插值（渐亮/渐暗）由表现层自己做，这里只给目标。
+    public int GlowTarget() {
+        if (this.IsFever()) { return this.feverGlow; }
+        int g = this.count * this.glowPerCombo;
+        if (g > this.feverGlow) { g = this.feverGlow; }
+        return g;
+    }
+
+    // 距超时还剩多少毫秒（无连击时返回 0）。
+    public int RemainingMs(long nowMilliseconds) {
+        if (this.count <= 0) { return 0; }
+        long left = this.timeoutMs - (nowMilliseconds - this.lastHitMs);
+        if (left < 0) { return 0; }
+        return (int)left;
+    }
+}

@@ -54,3 +54,42 @@ Two bases that every shipped game would otherwise rewrite by hand:
 Both bases are pinned by `tests/conformance/game_settings_save.zan` in the
 language repository.
 
+## Combo meter and ring QTE
+
+Two mechanics that every "keep the streak going" game otherwise rewrites
+with its own off-by-one:
+
+- `ComboMeter` — the streak count, the score multiplier, the timeout that
+  breaks the streak, and the brightness target the HUD glows towards. The
+  multiplier is computed **in one place**: score and HUD can never disagree.
+
+  ```zan
+  using Game.Foundation;
+
+  ComboMeter m = new ComboMeter()
+      .WithTimeout(3200).WithStep(0.1).WithMax(2.0).WithFever(3, 200, 40);
+  m.Hit(nowMs);        // streak +1, multiplier recomputed
+  m.Expire(nowMs);     // per frame: clears the streak when it timed out
+  int score = (int)(base * m.multiplier);
+  ```
+
+  `GlowTarget()` only returns a number — the game decides how to draw it.
+
+- `RingQte` — a ring that shrinks towards the centre; a press counts as a
+  hit while the ring is inside the hit window, a miss resets the ring.
+  Timing, radius and the required number of hits are parameters.
+
+  ```zan
+  RingQte q = new RingQte()
+      .WithTiming(96.0, 14.0, 340.0, 34.0, 54.0).WithNeed(3);
+  q.Update(dtMs);          // advance the shrink
+  if (q.Hit()) { ... }     // press: hit only inside the window
+  if (q.Complete()) { ... }
+  ```
+
+  The package owns the **judgement**; the game still draws the ring, the
+  progress dots and the sparks.
+
+Both are pinned by `tests/conformance/game_combo_qte.zan` in the language
+repository.
+
