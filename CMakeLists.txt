@@ -5383,6 +5383,7 @@ add_test(NAME diag_reserved_word_as_local_name
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_local_name.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_local_name${_exe_ext}
     "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
+    -DEXPECT_ERROR_COUNT=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_reserved_word_as_local_name PROPERTIES TIMEOUT 60)
 
@@ -5392,8 +5393,19 @@ add_test(NAME diag_reserved_word_as_member_name
     -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_member_name.zan
     -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_member_name${_exe_ext}
     "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
+    -DEXPECT_ERROR_COUNT=1
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_reserved_word_as_member_name PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_reserved_word_as_field_name
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/reserved_word_as_field_name.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_reserved_word_as_field_name${_exe_ext}
+    "-DEXPECT_REGEX='base' is a reserved word and cannot be used as a name"
+    -DEXPECT_ERROR_COUNT=1
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_reserved_word_as_field_name PROPERTIES TIMEOUT 60)
 add_test(NAME diag_index_write_wrong_type
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>

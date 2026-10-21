@@ -27,3 +27,15 @@ if(NOT compile_log MATCHES "${EXPECT_REGEX}")
   message(FATAL_ERROR
     "compiler failed without the expected diagnostic '${EXPECT_REGEX}':\n${compile_log}")
 endif()
+# 可选：锁住错误条数。用来防"诊断点名了，但后面还跟着一串级联报错"——
+# 级联报错会把真正的原因淹没。留空则不检查条数。
+if(DEFINED EXPECT_ERROR_COUNT)
+  if(NOT compile_log MATCHES "([0-9]+) error\\(s\\)")
+    message(FATAL_ERROR
+      "compiler output has no error count line:\n${compile_log}")
+  endif()
+  if(NOT CMAKE_MATCH_1 STREQUAL "${EXPECT_ERROR_COUNT}")
+    message(FATAL_ERROR
+      "expected ${EXPECT_ERROR_COUNT} error(s), got ${CMAKE_MATCH_1}:\n${compile_log}")
+  endif()
+endif()

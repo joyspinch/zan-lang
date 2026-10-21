@@ -197,9 +197,9 @@ Without MCP the same index is a file: `knowledge/symbols.json` next to the SDK
   只去两端；渲染表格/日志时想去掉行尾空白得用扩展方法。
 * **保留字坑**：`out`、`fixed`、`base` 都不能作变量名/参数名/字段名。编译器
   现在会**直接点名**：报 "'base' is a reserved word and cannot be used as a
-  name here"（改前是 "expected variable name" / "expected ')'" 这类通用消息，
-  还跟一串级联报错，只能靠"换个名字就好了"反推）。写"分批解析"这类代码
-  时容易撞上，起名用 `baseIndex` 之类。
+  name here"，而且**只报这一条**（改前是 "expected variable name" /
+  "expected ')'" 这类通用消息，还跟一串级联报错，只能靠"换个名字就好了"
+  反推）。写"分批解析"这类代码时容易撞上，起名用 `baseIndex` 之类。
 * **泛型容器的两条现状**（实证，2026-10-21）：
   - 泛型类里的 `List<T>`（T 是类级类型参数）**装结构体元素**现在可用了：
     元素类型会按实例替换，写入读回原样（`Zan.Game.Ecs` 的组件池就靠它）。
