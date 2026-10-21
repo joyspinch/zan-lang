@@ -1596,24 +1596,31 @@
   - `src/compiler/lexer.c` 新增 `zan_lexer_keyword_text(kind)`：拿关键字表
     （`s_keywords`）反查词面，不是关键字返回 NULL——**关键字表是唯一事实源**，
     不在编译器里另抄一份保留字清单；
-  - `src/compiler/parser.c` 新增 `parser_at_reserved_word` /
-    `parser_diag_expected_name`，把 12 处"这里应该是个名字"的位置改走该
-    helper：撞上保留字就点名，否则退回原来的通用消息；
-  - `parse_parameter` 的静默名字槽补一条：撞上保留字时点名**并吃掉 token**
-    （留着的话外层还会补一条 `expected ')'`，把真正的错盖住）；**没有**给
-    "无名字参数"新增任何诊断——避免给既有合法代码引入新报错。
+  - `src/compiler/parser.c` 新增 `parser_take_reserved_word`：名字槽撞上保留字
+    就**点名 + 吃掉 token**（词面留作占位名，让解析继续往下走），把 12 处
+    "这里应该是个名字"的位置都改走它；不是保留字就走原来的通用消息；
+  - **吃掉 token 是关键**：留着的话外层会接着补一串级联报错——字段那条会变成
+    "expected type" + "expected member name"（第一条还不说是什么错），成员
+    访问那条会变成四条 "expected ')'"。吃掉之后每个保留字**只报一条**点名
+    诊断。
 - 边界（刻意不动）：保留字在 `base` 有合法语义——`base(...)` 构造器初始化器与
   `base.Method()` 表达式（`AST_BASE_EXPR`）照旧；本次只改"这里应该是个名字"的
   位置。没改编译器的关键字规则本身（`base` / `out` 是 C# 风格保留字，自首版
-  `4a5809755` 起即存在）。
+  `4a5809755` 起即存在）。参数位**没有**给"无名字参数"新增任何诊断——避免给
+  既有合法代码引入新报错。
 - 验证：
-  - 4 个探针（局部变量 / 字段 / 成员访问 / 参数名）改前全是通用消息，改后全部
-    点名，参数那条的 `expected ')'` 级联消失；
-  - `ctest -R "diag_reserved_word"` → 2/2 Passed（新增
-    `tests/diag/reserved_word_as_local_name.zan` /
-    `tests/diag/reserved_word_as_member_name.zan` 两条用例锁住措辞）；
+  - 9 个探针（局部变量 / 字段 / 字段逗号续列 / 成员访问 / 参数名 / 类型名 /
+    for 变量 / 局部变量逗号续列 / 局部函数）逐个跑：每个保留字出现点**恰好
+    一条**点名诊断，零级联（改前字段那条 5 条、成员访问那条 6 条）；
+  - `base` 的两种合法用法照旧可用（构造器初始化器 `base()` + `base.Method()`，
+    探针 `_scratch/reserved/k_baseok.zan` 编译并运行通过，输出 2）；
+  - `ctest -R "diag_reserved_word"` → 3/3 Passed（新增
+    `tests/diag/reserved_word_as_field_name.zan`；`tests/run_compile_error.cmake`
+    新增可选 `EXPECT_ERROR_COUNT`，把"只有一条错误"也锁住）；
   - 19 个外部 GUI 项目全量回归 → OK=19 / FAIL=0，5872 个编译单元 0 error。
 - 教训：诊断要说"是什么错"，不是"哪里不合语法"。通用语法消息在语法**确实**
   坏掉时够用，但撞保留字这类**词法层**问题会把它变成噪音——一条能点名的诊断
-  省掉的是"逐个试改名"的那一轮。
+  省掉的是"逐个试改名"的那一轮。**点名之后还得收级联**：错误恢复时把错位的
+  token 吃掉，解析才能继续往下走，否则点名诊断下面跟一串噪音，用户还是得逐条
+  读。
 - 关联：A476（同类"诊断不说到点上"）、A469 / A479（解析器前瞻与分派）。
