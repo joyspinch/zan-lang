@@ -104,6 +104,42 @@ class Prog {
         return false;
     }
 
+    // 服务端（第三阶段用）：最后一帧**不以换行收尾**。
+    //
+    // SSE 允许这样收尾——最后一个事件不必带空行。客户端若只在遇到
+    // "\n" 时才处理行，流结束时缓冲区里剩下的那半行就会被**静默丢掉**：
+    // 收流正常结束、内容却少一截，而且**没有任何错误提示**。
+    static async void ServeNoTrailingNewline(int port) {
+        TcpListener listener = new TcpListener("127.0.0.1", port);
+        listener.Start();
+        Prog.SignalReady();
+        nint c = await listener.AcceptAsync();
+        string head = await Socket.RecvAsync(c, 8192);
+        int hb = Prog.Find(head, "\r\n\r\n");
+        if (hb >= 0) {
+            int cl = Prog.ContentLengthOf(head.Substring(0, hb));
+            string body = head.Substring(hb + 4, head.Length - hb - 4);
+            while (body.Length < cl) {
+                string piece = await Socket.RecvAsync(c, 8192);
+                if (piece.Length == 0) { break; }
+                body = body + piece;
+            }
+        }
+        int _h = await Socket.SendStringAsync(c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+            + "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        string f1 = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\n";
+        int _c1 = await Socket.SendStringAsync(c,
+            Prog.Hex(f1.Length) + "\r\n" + f1 + "\r\n");
+        // 最后一帧：**没有**行尾换行。
+        string f2 = "data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}";
+        int _c2 = await Socket.SendStringAsync(c,
+            Prog.Hex(f2.Length) + "\r\n" + f2 + "\r\n");
+        int _e = await Socket.SendStringAsync(c, "0\r\n\r\n");
+        Socket.Close(c);
+        listener.Stop();
+    }
+
     static async int Main() {
         int bad = 0;
         Task.Spawn(Prog.Serve(Prog.PORT));
@@ -139,6 +175,7 @@ class Prog {
 
         // ---- 2. 回调返回 false → 主动停止 ----
         Prog.ResetAck();
+        Prog.ResetReady();
         Prog.DeltaCount = 0;
         Prog.Deltas.Clear();
         Task.Spawn(Prog.Serve(Prog.PORT + 1));
@@ -164,6 +201,37 @@ class Prog {
             bad = bad + 1;
         }
         client2.Close();
+
+        // ---- 3. 最后一帧没有换行收尾 ----
+        //
+        // 客户端只在遇到 "\n" 时才处理行，所以流结束时缓冲区里剩下的
+        // 那半行必须**按完整的一行补处理**，否则最后一个分片被静默
+        // 丢掉：收流正常结束（无错误）、内容却少一截。
+        Prog.ResetAck();
+        Prog.ResetReady();
+        Prog.DeltaCount = 0;
+        Prog.Deltas.Clear();
+        Task.Spawn(Prog.ServeNoTrailingNewline(Prog.PORT + 2));
+        if (!Prog.WaitReady(5000)) {
+            Console.WriteLine("server3 not ready");
+            return 1;
+        }
+        AiConfig cfg3 = new AiConfig("http://127.0.0.1:"
+            + Convert.ToString(Prog.PORT + 2), "k", "m");
+        cfg3.connectTimeoutMs = 3000;
+        cfg3.readTimeoutMs = 5000;
+        cfg3.totalTimeoutMs = 10000;
+        cfg3.maxAttempts = 1;
+        AiClient client3 = new AiClient(cfg3);
+        string full3 = await client3.Stream(msgs, 0.0, Prog.OnDelta);
+        Console.WriteLine("tail full=" + full3);
+        if (full3 != "AB") { bad = bad + 1; }
+        if (Prog.DeltaCount != 2) { bad = bad + 1; }
+        if (client3.lastError.Length > 0) {
+            Console.WriteLine("tail err=" + client3.lastError);
+            bad = bad + 1;
+        }
+        client3.Close();
 
         Console.WriteLine("ai-stream-ok: " + Convert.ToString(bad == 0 ? 1 : 0));
         return bad == 0 ? 0 : 1;
@@ -218,6 +286,14 @@ class Prog {
         Prog.AckCount = 0;
         Prog.AckLock.ReleaseMutex();
         Prog.ServerTimedOut = false;
+    }
+
+    // 就绪计数也要复位：第二、三阶段各自起一个服务端，不复位的话
+    // WaitReady 会因为上一阶段的计数直接返回 true，跳过真正的等待。
+    static void ResetReady() {
+        Prog.AckLock.WaitOne();
+        Prog.ReadyCount = 0;
+        Prog.AckLock.ReleaseMutex();
     }
 
     static int Find(string s, string needle) {
