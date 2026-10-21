@@ -1260,6 +1260,30 @@ add_test(NAME diag_await_in_lambda
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_await_in_lambda PROPERTIES TIMEOUT 60)
 
+# `await` 能不能放在非 async 方法里，判据是"**这个 await 目标需不需要真挂起**"，
+# 不是"外层方法是不是 async"。能同步降级的几类（普通值原样求值、async 调用
+# 走根驱动、Task.Delay 同步休眠、Task.JoinWait 事件汇合）语义都正确，不该报错
+# ——那一半由 conformance 的 async_sync_await_in_co / async_sync_delay 钉住。
+# 必须真挂起的那一族（Gate.Park / Socket.*）要把恢复函数挂到协程帧的状态槽上，
+# 没有帧就无路可走 → 必须报错。诊断由 irgen 在降级处发出，判据与名单都在那边。
+add_test(NAME diag_await_gate_park_outside_async
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_gate_park_outside_async.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_gate_park_outside_async${_exe_ext}
+    "-DEXPECT_REGEX=await Gate.Park is only supported inside an async method"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_await_gate_park_outside_async PROPERTIES TIMEOUT 60)
+
+add_test(NAME diag_await_socket_ready_outside_async
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/await_socket_ready_outside_async.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_await_socket_ready_outside_async${_exe_ext}
+    "-DEXPECT_REGEX=await Socket.ReadReady is only supported inside an async method"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_await_socket_ready_outside_async PROPERTIES TIMEOUT 60)
+
 # lambda 体里的类型错误必须被类型检查抓到：改前 `AST_LAMBDA` 分支把体当
 # 表达式交给 check_expr，而块体 lambda 的体是语句块 → 整块体从来没进过类型
 # 检查，`int x = "hello"` 编译期一个字都不说，运行期把字符串指针当 int 读。

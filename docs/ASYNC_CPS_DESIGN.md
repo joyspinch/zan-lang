@@ -282,6 +282,67 @@ Non-async callers that `await` an async call are handled the same way at the
 nearest async boundary; a synchronous function that calls an async one without
 awaiting just receives the task handle.
 
+## Where `await` may appear (the criterion)
+
+`await` is **legal in a non-async method**. The question is not "is the
+enclosing method `async`" but "**does this await target need to actually
+suspend**".
+
+Targets that degrade synchronously — legal anywhere:
+
+| Target | Behaviour outside an async method |
+|---|---|
+| a plain (non-async) value | evaluated as-is; it is not a coroutine frame |
+| an async call | **root-driven**: the compiler allocates a child frame and drives it to completion on the current thread |
+| `Task.Delay(ms)` | a real synchronous sleep (see `zan_co_sync_sleep`) |
+| `Task.JoinWait(entry)` | the synchronous join path (`zan_join_wait2` with a null frame) |
+| `Task.Yield()` | no coroutine to yield to in a sync context, so it degenerates to a no-op — **not** a dropped await |
+
+Targets that **must** suspend — these need a coroutine frame to hang their
+resumption on, so they are rejected outside an async method with a precise
+diagnostic:
+
+`Gate.Park`, `Socket.ReadReady`, `Socket.WriteReady`, `Socket.RecvOv`,
+`Socket.RecvToOv`, `Socket.AcceptOv`, `Socket.ResolveAsync`,
+`Socket.ResolveSockAddr`.
+
+The criterion is applied **at the lowering site** (irgen), not in the checker:
+irgen already reports each of those eight with a specific message ("await
+Gate.Park is only supported inside an async method"), so there is exactly one
+list of frame-requiring targets and it cannot drift. The checker does not
+duplicate it. The self-hosted compiler agrees — `src/selfhost/checker.zan` says
+"an `await` in a *synchronous* method is fine ... Only the *operand* has to be
+a coroutine frame".
+
+Tests: `tests/diag/await_gate_park_outside_async.zan` and
+`tests/diag/await_socket_ready_outside_async.zan` pin the rejection;
+`tests/conformance/async_sync_await_in_co.zan` and `async_sync_delay.zan` pin
+the cases that must **not** be rejected.
+
+### Root-driven await from inside a coroutine
+
+Root-driven await (awaiting an async call from a non-async method) allocates a
+child coroutine frame and drives it to completion. When the caller is the
+**main thread**, the pool's workers run the child and the caller waits for the
+completion flag — fine.
+
+When the caller is a **worker thread**, it used to deadlock. `zan_co_sched_run_until`
+waited by spinning on the completion flag, expecting *some other* thread to run
+the child. But the child is submitted through `co_submit`, and submitting from
+a worker puts the task in **that worker's own LIFO slot** (`w->lifo`) — which no
+other worker can steal (`co_steal` steals queues, not LIFO slots). The waiting
+worker is inside the spin loop and never gets to drain its own slot, so the
+child never runs and the flag is never set. Worker count is irrelevant
+(observed deadlocked at 1, 2, 4 and 8 workers) — the symptom is that *no*
+worker will ever pick up that slot.
+
+The fix: while waiting, a worker **does the worker's job itself** — it pops
+ready tasks and runs them inline, the same approach `zan_co_sync_sleep` takes.
+A non-worker caller keeps the spin, because there the child is picked up by a
+pool worker. Note the symptom depends on the calling context, so testing from
+`Main` cannot reproduce it — the call has to happen inside a coroutine.
+
+
 ## Implementation history
 The original staged plan has landed:
 - **S1 runtime — complete**: cooperative ready queue and scheduler ABI.
