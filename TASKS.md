@@ -33,45 +33,6 @@
 - 关联：A468（await 的宿主/自举口径）、§26（await 判据）。
 
 
-### [ ] A469 编译器不支持「嵌套类型的数组」——`Outer.Inner[]` 报 undefined type
-
-- 现象（2026-10-21 落地 `Zan.Barcode` 时实测）：**嵌套类型**做数组元素类型
-  解析不了，普通限定名（命名空间限定）却正常：
-
-  ```zan
-  public class Outer {
-      public class Inner { public int v; public Inner() { this.v = 0; } }
-  }
-  Outer.Inner i = new Outer.Inner();       // OK
-  List<Outer.Inner> l = new List<Outer.Inner>();  // OK（泛型实参）
-  Outer.Inner[] a = new Outer.Inner[3];    // error: undefined type 'Outer.Inner'
-  Encoding[] e = new Encoding[2];          // OK（命名空间限定，using System.Text）
-  ```
-
-  报 undefined type 的位置是**声明处与 `new` 处各一次**（两处都走类型解析）。
-- 已定位的机制：解析器把数组元素类型包进一个**合成的 `AST_TYPE_REF` 节点**，
-  节点上带着元素类型的名字（`src/compiler/parser.c:372-385`）；绑定期先按这个
-  名字解析**基准类型**（`src/compiler/binder.c:833` 的 `scope_find`），解析不到
-  就直接报 `undefined type` 并早退（`binder.c:837-841`）——**元素真正的解析
-  （`array_element`，`binder.c:984-993`）排在它后面，压根走不到**。
-  嵌套类型不是作用域符号：解析器把它提升到单元级，绑定期再按节点指针挂回宿主
-  的成员表（`binder.c:1110-1123`，见 A344 / 提交 8febca9cb），所以
-  `scope_find` 看不见 "Outer.Inner"。
-- **尚未确认**：普通限定名（`Outer.Inner`）究竟在哪一步解析成功的——是作用域
-  里恰好存在最后一段的符号，还是另有走成员表的路径。这决定了修复点落在
-  数组路径还是名字解析路径。
-- 影响：想让"某个类的内部类型"出现在数组/列表元素位置就必须把它提到命名空间
-  层。`Zan.Barcode` 因此把 `QrFinderPattern` / `QrScanHit` 放在命名空间层而
-  不是 `QrFinder` 里（`packages/Zan.Barcode/src/System/Barcode/QrFinder.zan`
-  顶部有说明）。这是绕开的写法，不是想要的形态。
-- 方向（择一）：
-  1. 数组路径**先解析元素**再决定要不要报基准名解析失败——数组包装节点的
-     名字本来就是元素的名字，基准名解析不了不代表元素解析不了；
-  2. 或者让限定名解析支持"最后一段 + 宿主成员表"这条路径（与 A344 的成员表
-     挂接配套），普通引用与数组元素走同一套。
-- 最小复现：见上（`_scratch` 里的探针，落地时已随包清理；按上面的片段可重建）。
-- 关联：A344（嵌套类型的成员表挂接）、§1.25（`Zan.Barcode` 里的绕开写法）。
-
 ### [ ] A468 宿主与自举在「`await` 一个非协程操作数」上分叉
 
 - 现象：宿主把 `await <非协程>` **静默降级成普通求值**
@@ -1545,3 +1506,5 @@
   no implicit conversion`），并给 `tests/selfhost/reject_cases.txt` 加三段式拒绝用例
   （`name|||自举措辞|||宿主措辞`）把这条边界钉住。
 - 关联：A471（宿主侧同一条战线）、`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26/§36。
+
+### [ ] A479 声明前瞻不认「限定名 + 可空标记 + 数组」——`System.Text.Encoding?[] a` 解析不了

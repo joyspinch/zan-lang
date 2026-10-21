@@ -172,6 +172,10 @@ typedef struct {
     nr_index_t by_full;
     nr_index_t by_simple;
     zp_refs_t *refs;
+    /* 数组的元素类型节点与外层的包装节点**同名**：包装节点已经报过
+     * "ambiguous type"，元素节点再报一遍就是同一条诊断出现两次。解析元素
+     * 节点时把这个标志置上，抑制重复的那一条。 */
+    bool quiet_ambiguity;
 } nr_ctx_t;
 
 static void nr_index_build(nr_index_t *ix, nr_type_t *items, int count,
@@ -447,7 +451,8 @@ static void resolve_ref(nr_ctx_t *c, zan_ast_node_t *tr,
     }
     if (c->refs) zan_refs_add(c->refs, R, c->arena);
 
-    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R) && c->diag) {
+    if (count_simple_matching(c, R, tr) >= 2 && !find_full(c, R) && c->diag &&
+        !c->quiet_ambiguity) {
         zan_diag_emit(c->diag, DIAG_ERROR, tr->loc,
                       "ambiguous type '%.*s'; qualify it with its namespace",
                       (int)R.len, R.str);
@@ -744,6 +749,17 @@ static void nr_walk(nr_ctx_t *c, zan_ast_node_t *n,
     case AST_TYPE_REF:
         resolve_ref(c, n, ns, usings);
         nr_walk_list(c, &n->type_ref.type_args, ns, usings);
+        /* 数组的元素类型是**另一个**类型节点（解析器把元素包进一个合成的
+         * AST_TYPE_REF，元素本体挂在 array_element 上）。不下钻的话，元素
+         * 节点的名字从没被改写过——限定名（`Outer.Inner`）就保持原样，绑定期
+         * 的 scope_find 查不到 → "undefined type 'Outer.Inner'"。
+         * 元素节点与包装节点同名，"ambiguous type" 只由包装节点报一次。 */
+        if (n->type_ref.array_element) {
+            bool saved = c->quiet_ambiguity;
+            c->quiet_ambiguity = true;
+            nr_walk(c, n->type_ref.array_element, ns, usings);
+            c->quiet_ambiguity = saved;
+        }
         break;
 
     case AST_CLASS_DECL:
@@ -994,6 +1010,7 @@ void zan_nsresolve_run(zan_ast_node_t *unit, zan_arena_t *arena, zan_diag_t *dia
     c.diag = diag;
     c.count = 0;
     c.refs = NULL;
+    c.quiet_ambiguity = false;
     c.shadow.items = NULL;
     c.shadow.count = 0;
     c.shadow.cap = 0;
