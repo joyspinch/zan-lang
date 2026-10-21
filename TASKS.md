@@ -37,20 +37,22 @@
      器发射（需要检查器 / 绑定器支持泛型约束，见 `generic_constraints` 用例）。
 - 关联：A449（装箱）；泛型约束的现状见 `tests/conformance/generic_constraints.zan`。
 
-### [ ] A456 一元 `!` 不检查操作数类型——`!s`（字符串）静默通过
+### [ ] A463 诊断里的类型名不渲染可空标志——`bool?` 的错误信息说成 `'bool'`
 
-- 现象（2026-10-21 修 A452 时实测）：`string s = "x"; Console.WriteLine(!s);`
-  → rc=0 **静默通过**（`!` 一律返回 bool）。二元侧 `&&` / `||` 是查类型的
-  （"cannot apply logical operator to 'X' and 'Y': both operands must be bool"），
-  一元 `!` 这边没查。
-- 与已闭账的 A452（一元算术的操作数守卫）的区别：`!` 打在字符串上生成的是
-  `icmp eq i64 <指针>, 0`——**合法 IR**，只是语义荒唐（拿指针和 0 比）；
-  A452 那边是**非法 IR / 编译器崩溃**。所以它没有跟着 A452 一起改。
-- 影响：写 `!someString` 得到一个恒为 false 的 bool，不报错也不提示。
-- 方向：与 A452 同款守卫——`!` 的操作数必须是 bool。但这一条**影响面比 A452
-  大**：`!0` / `!someInt` 这种 C 风格写法在仓库里可能存在（C# 里本来就该
-  报错），改之前要全包扫描 + 差分门确认没有存量代码踩坑。
-- ⚠ 与 A452 同属"检查器放行"这一族；修的时候两个后端同一次落地。
+- 现象（2026-10-21 修 A456 时实测）：`bool? b = null; bool c = !b;` 报
+  `cannot apply unary '!' to 'bool': the operand must be a bool`——可空的
+  `bool?` 被报成 `bool`，用户看不出自己写的是可空类型。
+- 根因：host 的 `type_name()`（`src/compiler/checker.c`）直接返回
+  `t->name.str`；可空类型的 `name` 是**元素类型**的名字，`T?` 的 `?` 没有任何
+  字段承载，所以所有诊断都把 `bool?` 写成 `bool`。
+- 影响面：不止 `!`——凡是拿可空类型当操作数/实参的诊断（`cannot convert
+  'bool' to ...`、算术、比较）都会少一个 `?`，用户容易误判成"我写的是 bool"。
+- 方向：给 `zan_type_t` 补一个可空标志（或让 `type_name` 走一个
+  `type_display()`，按 kind 渲染 `T?` / `T[]` / `List<T>`）。**注意**：`type_name`
+  被大量诊断共用，改渲染会动到很多措辞——要么单独加一个只给新诊断用的
+  渲染函数，要么一次性把全部诊断的措辞一起改并更新 golden。
+- 关联：A456（一元 `!` 的操作数必须是 bool；`bool?` 在布尔上下文里两端口径
+  一致地报"不是 bool"）。
 
 ### [ ] A457 类型身份按**名字**比较——限定名退化后的裸名与被 mangle 的真类型对不上
 

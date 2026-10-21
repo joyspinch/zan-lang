@@ -1200,28 +1200,40 @@ add_test(NAME diag_unary_tilde_string
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
 set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
 
-# A unary '-' / '~' on a string: the operand is neither numeric nor a type
-# with a matching overload. The checker used to return a bare `type_error`
-# sentinel -- which emits no diagnostic of its own -- so the error leaked
-# into irgen: `-s` built an integer subtraction on a string pointer (LLVM
-# verifier error) and `~s` took the compiler down with it (0xC0000005).
-add_test(NAME diag_unary_minus_string
+# A unary `!` on a non-bool operand: the binary `&&` / `||` already require
+# bool ("both operands must be bool"), the unary one did not -- so `!s` on a
+# string silently became "compare the pointer with 0".
+add_test(NAME diag_unary_bang_string
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_minus_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_minus_string${_exe_ext}
-    "-DEXPECT_REGEX=cannot apply unary '-' to 'string'"
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_string.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_string${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary .!. to .string.: the operand must be a bool"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_unary_minus_string PROPERTIES TIMEOUT 60)
+set_tests_properties(diag_unary_bang_string PROPERTIES TIMEOUT 60)
 
-add_test(NAME diag_unary_tilde_string
+# `!` has no operator-overload path (there is no `operator !`), so a class
+# instance is as wrong as a string -- the lowering was "compare the reference
+# with 0".
+add_test(NAME diag_unary_bang_class
   COMMAND ${CMAKE_COMMAND}
     -DZANC=$<TARGET_FILE:zanc>
-    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_tilde_string.zan
-    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_tilde_string${_exe_ext}
-    "-DEXPECT_REGEX=cannot apply unary '~' to 'string'"
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_class.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_class${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary .!. to .Box.: the operand must be a bool"
     -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
-set_tests_properties(diag_unary_tilde_string PROPERTIES TIMEOUT 60)
+set_tests_properties(diag_unary_bang_class PROPERTIES TIMEOUT 60)
+
+# A nullable bool is not a bool: the binary `&&` / `||` reject it too
+# ("both operands must be bool"), so the unary one must as well.
+add_test(NAME diag_unary_bang_nullable
+  COMMAND ${CMAKE_COMMAND}
+    -DZANC=$<TARGET_FILE:zanc>
+    -DSRC=${CMAKE_SOURCE_DIR}/tests/diag/unary_bang_nullable.zan
+    -DOUT_EXE=${CMAKE_BINARY_DIR}/diag_unary_bang_nullable${_exe_ext}
+    "-DEXPECT_REGEX=cannot apply unary .!. to .bool.: the operand must be a bool"
+    -P ${CMAKE_SOURCE_DIR}/tests/run_compile_error.cmake)
+set_tests_properties(diag_unary_bang_nullable PROPERTIES TIMEOUT 60)
 
 
 # Convert.ToString 的实参必须有字符串形态。类实例不是 C 字符串：此前编译器
@@ -3831,6 +3843,7 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_ctxmenu_ui.out
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_ctxmenu_ui${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
 
   add_test(NAME conformance_gui_ui_watchdog
     COMMAND ${CMAKE_COMMAND}

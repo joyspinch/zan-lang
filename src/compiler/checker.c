@@ -2679,7 +2679,17 @@ zan_type_t *zan_checker_check_expr(zan_checker_t *c, zan_ast_node_t *expr) {
             check_unary_operand_type(c, expr, operand, '+');
             return c->binder->type_error;
         case TK_BANG:
-            return c->binder->type_bool;
+            /* `!` 的操作数必须是 bool——与二元 `&&` / `||` 的口径一致
+               （"cannot apply logical operator to 'X' and 'Y': both operands
+               must be bool"）。原来这里无条件返回 bool，`!someString` 就
+               静默变成"拿指针和 0 比"的恒假值。 */
+            if (operand->kind == TYPE_BOOL) return c->binder->type_bool;
+            if (operand->kind == TYPE_ERROR || operand->kind == TYPE_TYPE_PARAM)
+                return c->binder->type_bool;
+            zan_diag_emit(c->diag, DIAG_ERROR, expr->loc,
+                          "cannot apply unary '!' to '%s': the operand must be a bool",
+                          type_name(operand));
+            return c->binder->type_error;
         case TK_TILDE:
             if (type_is_integral(operand)) return operand;
             check_unary_operand_type(c, expr, operand, '~');
