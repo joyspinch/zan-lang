@@ -307,7 +307,7 @@
   （`tests/selfhost/diff_cases.txt`）打红——两个后端当前都输出 "1"，改一边就分叉。
 - 影响面：改完要 grep 全部用 `Convert.ToString(<bool>)` / `<bool>` 参与拼接的
   用例与 golden（现有 golden 已把 "1" 固化在部分用例里）。
-### [ ] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
+### [x] A393 自举调用 `async void` 方法不启动协程——方法体根本不执行
 
 - 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_asyncvoid.zan`）：
   ```zan
@@ -329,8 +329,9 @@
   读，ramp 写在那儿）。「真 async 调用」用 `ExprVal.asyncCall` 标记区分，**不能**
   用「类型是 `__task`」——降级路径也带 `__task` 类型但值是常量 0，detach 它会生成
   `bitcast i8* 0 to i64*`。用例 `tests/conformance/async_void_call.zan` 钉住。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/async_void_call.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A394 自举在**同步**上下文里遇到 `await` 不 fail-closed——生成读地址 0 的非法 IR
+### [x] A394 自举在**同步**上下文里遇到 `await` 不 fail-closed——生成读地址 0 的非法 IR
 
 - 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_capparam.zan`）：
   ```zan
@@ -365,6 +366,7 @@
 - ⚠ 这条与 A393 无关：A393 修的是 **async 方法的调用点不启动协程**；
   两者都在 async 路径上，但根因不同，修完都要重跑 `selfhost_fixed_point`
   与差分门。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 拒绝用例 `await_in_lambda` / `await_not_a_coroutine` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
 ### [ ] A380 协程帧的释放仍只在类型侧收口——运行时没有幂等保护
 
@@ -550,7 +552,7 @@
 - ⚠ 不要用"先 `opt -O2` 再 llc"绕过：`opt -O2` 后能过，是因为优化器把死函数与
   冗余结构一起干掉了，编译器自己产出的 IR 仍然过不了自己的后端。
 
-### [ ] A390 自举的「数组 → string」是复制打包，不是共享 view
+### [x] A390 自举的「数组 → string」是复制打包，不是共享 view
 
 - 现象（2026-10-20 修完 string 长度语义后实测）：
   - `byte[] raw; string v = raw;` 在自举里是**复制**（把每个元素的低 8 位
@@ -577,8 +579,9 @@
   （= `strlen`，带 magic 校验），`Trim` / `ToUpper` / `ToLower` / `Replace` /
   `Split` / `ToString` / `EndsWith` / `LastIndexOf` / `StartsWith` 全部改用
   C 可见长度；用例 `tests/conformance/string_nul_search.zan` 钉住。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/string_nul_search.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A395 闭包不捕获外层方法的接收者 `this`——实例字段在闭包里一律读成 0
+### [x] A395 闭包不捕获外层方法的接收者 `this`——实例字段在闭包里一律读成 0
 
 - 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_this.zan`）：
   ```zan
@@ -602,8 +605,9 @@
 - 边界：接收者按**借用**语义处理（闭包体入口 retain、出口 release，净值为 0），
   与自举既有的"捕获局部靠外层帧持有引用"一致；闭包在方法返回后才被调用时，
   接收者可能已经没了（C 宿主靠闭包持有强引用保活）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/closure_captures_this.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A396 委托调用的实参在分支臂里求值——clang 的 X86 指令选择器崩溃
+### [x] A396 委托调用的实参在分支臂里求值——clang 的 X86 指令选择器崩溃
 
 - 现象（2026-10-20 差分门实测）：`value_enumerable` / `linq_query` 两个用例
   编译到 IR 没问题，但 clang 在
@@ -616,8 +620,9 @@
 - ✅ 已修（2026-10-20）：实参提到分支之前求值。顺带修掉"实参被求值两次"。
   用例 `tests/conformance/closure_nested_call.zan` 钉住；两个 GAP 随之闭账。
 - 排查法：clang 在 ISel 崩时，把出问题的函数单独抠出来编译，再逐块删指令二分。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/closure_nested_call.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A397 闭包的 fn 槽是 `i8*`：直接当函数指针调是非法 IR
+### [x] A397 闭包的 fn 槽是 `i8*`：直接当函数指针调是非法 IR
 
 - 现象：闭包记录是 `{i8* fn, i8* env}`，`EmitDelegateCall` 取出的 `fn` 是
   `i8*`，却直接 `call i64 (i8*, i64) %fn(...)`——被调值类型与函数指针类型不符，
@@ -626,8 +631,9 @@
 - 方向：调用前 `bitcast i8* %fn to <函数类型>*`。
 - ✅ 已修（2026-10-20）：闭包路径与裸函数指针路径都先 bitcast（虚方法槽那条路径
   本来就是对的，两处要一起看）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 闭包族用例（`closure_capture_by_ref` / `closure_capture_async` 等） 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A399 自举：`T[]`（泛型数组）的字段槽两端类型不一致——存端打包成 i64、读端按 i64*
+### [x] A399 自举：`T[]`（泛型数组）的字段槽两端类型不一致——存端打包成 i64、读端按 i64*
 
 - 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_enum3.zan`）：
   ```zan
@@ -641,8 +647,9 @@
 - ✅ 已修（2026-10-20）：`MapType` 的数组判断提到擦除判断之前，
   `IsErasedType` 对 `t.ival >= 1`（数组）返回 false。探针 p_enum3 现在与
   C 宿主逐字一致（`p=8`）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 泛型族用例（`generic_field_value_type` / `generic_instance_method` 等） 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A400 自举：`foreach` 不支持可枚举协议（GetEnumerator/MoveNext/Current）
+### [x] A400 自举：`foreach` 不支持可枚举协议（GetEnumerator/MoveNext/Current）
 
 - 现象：自举的 `foreach` 只认 `List<T>` / `T[]` / `string`，其余集合一律
   **报诊断拒绝编译**；LINQ 的迭代器（`ValueWhereIterator` 等）因此整个用不了，
@@ -656,8 +663,9 @@
   `Current` 支持**属性**（`get_Current`）与**方法**（`Current()`）两种形态
   ——与 C 宿主 irgen 的口径一致（字段形态是 C 宿主的缺口，见 A398）。
   用例 `tests/conformance/enumerable_protocol.zan` 钉住。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/enumerable_protocol.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A401 自举：认不出的调用**静默返回 0**——违反 fail-closed
+### [x] A401 自举：认不出的调用**静默返回 0**——违反 fail-closed
 
 - 现象（2026-10-20 探针实测，探针在 `_scratch/sd/p_unknown.zan`）：
   ```zan
@@ -680,8 +688,9 @@
   or namespace`）。两个 reject 用例钉住边界：
   `tests/selfhost/reject/unsupported_builtin_call.zan`、
   `tests/selfhost/reject/unresolved_call.zan`。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 拒绝用例 `unresolved_call` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A402 自举：不认识 C 宿主的**编译器内建**——标准库自己就在用，全是错的
+### [x] A402 自举：不认识 C 宿主的**编译器内建**——标准库自己就在用，全是错的
 
 - 现象：把 A401 改成 fail-closed 之后，标准库自己编不过了——报的是
   `call to 'String.CompareOrdinal' is not supported`、`call to 'b.ToStr' is not
@@ -698,8 +707,9 @@
 - ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `StrToBytes` /
   `ByteArrWindowToStr`，`String.CompareOrdinal` 落到 `strcmp`；用例
   `tests/conformance/bytes_bridge.zan` 钉住（自举与 C 宿主逐字一致）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/bytes_bridge.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A403 自举：调**委托类型的表达式**（`filters[f](item)`）静默返回 0
+### [x] A403 自举：调**委托类型的表达式**（`filters[f](item)`）静默返回 0
 
 - 现象：LINQ 包 `packages/Zan.Linq/src/System/Linq/Stream.zan` 里的
   `this.filters[f](item)`（谓词存放在列表里，调用列表元素）自举**编不过**——
@@ -710,8 +720,9 @@
 - ✅ 已修（2026-10-20）：`EmitDelegateCall` 拆成"求值 + 调用"两半
   （`EmitDelegateCallVal`），`GenCall` 的兜底分支先求值再判是不是委托类型。
   差分门里 `value_enumerable` / `linq_query` 两个用例从"编不过"变回通过。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `value_enumerable` / `linq_query` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A404 自举：认不出的**标识符**与**成员**仍静默返回 0
+### [x] A404 自举：认不出的**标识符**与**成员**仍静默返回 0
 - 现象：`GenIdent` 末尾 `return new ExprVal("0", MkType("int"))`、
   `GenMember` 末尾同样。也就是 `int x = undefinedName;` 在自举里是 `x = 0`，
   `obj.NoSuchField` 也是 0。
@@ -725,8 +736,9 @@
   "检查器与后端不一致"时的**背靠背安全网**，不是日常路径——固定点门
   （自举编自己的 62 个文件）与差分门（27 个用例 + 标准库）证明它平时不触发。
   真正被它挖出来的是 A405。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 拒绝用例 `unresolved_call` / `undefined_type` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A405 自举：不支持**静态属性**（`Cls.Prop`）——标准库 `Encoding.UTF8` 就是它
+### [x] A405 自举：不支持**静态属性**（`Cls.Prop`）——标准库 `Encoding.UTF8` 就是它
 
 - 现象（2026-10-20 差分门实测）：把 A404 改成 fail-closed 之后，标准库
   `stdlib/System/Text/Encoding.zan:137` 报 `unresolved identifier 'Encoding'`：
@@ -741,8 +753,9 @@
 - ✅ 已修（2026-10-20）：`GenMember` 的静态分支加一条"找静态 `get_<name>`"
   （`FindMethodUp` 会走基类链）；用例 `tests/conformance/static_property.zan`
   钉住（自举与 C 宿主逐字一致）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/static_property.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A406 自举：内建表的能力没测过——先量出来，再按矩阵补齐
+### [x] A406 自举：内建表的能力没测过——先量出来，再按矩阵补齐
 
 - 现象（2026-10-20）：C 宿主把一批 API 声明成**内建**
   （`src/compiler/builtin_api.c` 的 `builtin_types[]` / `members_*[]`），
@@ -759,8 +772,9 @@
     用例 `tests/conformance/builtin_surface.zan` 钉住（逐字一致）。
   - 剩下的缺口记在文档里：`Task.*`（要协程帧，见 A385）与 `Console` 的
     颜色/标题属性。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/builtin_surface.zan` + `scripts/selfhost_builtin_sweep.ps1` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A407 自举：double 的**文本格式**与宿主不一致（`%g` vs 最短往返）
+### [x] A407 自举：double 的**文本格式**与宿主不一致（`%g` vs 最短往返）
 
 - 现象（2026-10-20 探针实测）：`Convert.ToString(Math.Acos(0.0))`
   - C 宿主：`1.5707963267948966`
@@ -774,8 +788,9 @@
   `@zan_rt_dbl_str` 再包成托管串），`ToCStr` 与 `Console.WriteLine` 的
   double 分支都改走它；`builtin_surface` 用例里 `acos=1.5707963267948966`
   与宿主逐字一致。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/builtin_surface.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A413 自举：`Console.*` 只有一条 blanket catch——`Clear` 打印 "0"、`ReadLine` 返回垃圾
+### [x] A413 自举：`Console.*` 只有一条 blanket catch——`Clear` 打印 "0"、`ReadLine` 返回垃圾
 
 - 现象（2026-10-20 差分门探针实测，探针在 `_scratch/sd/p_console.zan` 等）：
   - C 宿主 `Console.Clear()` 输出 `ESC[2J ESC[H`、`ResetColor()` 输出 `ESC[0m`；
@@ -795,8 +810,9 @@
   `CharToStr`（char → UTF-8 文本），删掉 blanket catch；`irgen.zan` 加两个 ANSI
   常量。用例 `tests/conformance/console_builtin.zan`（各类型渲染）与
   `tests/conformance/console_ansi.zan`（ANSI 字节）钉住，都进了差分门。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/console_builtin.zan` / `console_ansi.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A415 自举：内建的**属性**（Console 颜色/标题）不降级
+### [x] A415 自举：内建的**属性**（Console 颜色/标题）不降级
 
 - 现象（2026-10-20 能力矩阵实测）：`Console.ForegroundColor` /
   `Console.BackgroundColor` / `Console.Title` 在内建表里是属性（`'P'`），
@@ -810,7 +826,9 @@
 - ✅ 已修（2026-10-20）：`irgen_expr.zan` 新增 `ConsoleColorGet` /
   `ConsoleColorSet` / `ConsoleTitleSet`，`GenMember`（读）与 `StoreTo`（写）
   两处都挂了；用例 `tests/conformance/console_color.zan` 钉住（字节逐字一致）。
-### [ ] A416 自举的检查器不认识 `Task` / `Task<T>`——任务句柄的定型规则没镜像
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `tests/conformance/console_color.zan` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
+
+### [x] A416 自举的检查器不认识 `Task` / `Task<T>`——任务句柄的定型规则没镜像
 
 - 现象（2026-10-20 对账）：C 宿主 `checker.c` 按**实参形态**给
   `Task.Run` / `Task.Spawn` 定型——lambda/委托/无结果调用 → 无结果 `Task`，
@@ -834,8 +852,9 @@
   `Task` 映成 `i8*`（自举的任务句柄就是协程帧指针）。差分门收录
   `task_run_action_handle`（宿主能跑、自举还没有 Task API 的降级），按
   **已知缺口**记账而不是假装通过。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 差分门用例 `task_run_action_handle`（按已知缺口记账） 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A428 自举的重载分派**按名字取**，不按实参类型——多个同名重载会选错方法
+### [x] A428 自举的重载分派**按名字取**，不按实参类型——多个同名重载会选错方法
 
 - 现象（2026-10-20 语料扫描实测，`tests/conformance/`）：
   - `operator_overload.zan`：`v %= 3` 没走重载，类指针被喂给 `srem`
@@ -881,7 +900,9 @@
     `operator_relational` / `overload_resolution` /
     `overload_inherited_arity` / `overload_same_arity_return`。
 - 剩余（未修）：泛型实参形状那一族（属 A421）。
-### [ ] A431 自举的字段初始化器与构造器语义和宿主对不上——顺序错、基类构造器多调一次
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `operator_overload` / `overload_resolution` 等 6 个用例 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
+
+### [x] A431 自举的字段初始化器与构造器语义和宿主对不上——顺序错、基类构造器多调一次
 
 - 现象（2026-10-20 实测；探针 `_scratch/sd/p_fldord.zan`、`p_fldord2.zan`、
   `p_basector.zan`）：
@@ -915,8 +936,9 @@
     Binding 解引用 → 崩。与本轮的改动无关：改动前后该用例生成的 IR 完全
     一致（无 `@__zan_finits_*`）。
   - **多重**索引器重载已修（见 A432）。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `field_decl_initializers` / `constructor_chaining` / `cs_b09_indexer` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
-### [ ] A432 自举缺两样：多重索引器按实参类型选、用户自定义转换运算符
+### [x] A432 自举缺两样：多重索引器按实参类型选、用户自定义转换运算符
 
 - 现象（2026-10-20 实测）：
   - `indexer_overload.zan`：一个类上两个索引器（`this[int]` 与
@@ -942,6 +964,7 @@
 - 关联：`objinit_ctor_field_overwrite.zan` 的崩溃不是对象初始化器的问题，而是
   宿主那条 "`Binding<T>` 槽位赋值" 原语（赋给 `Binding<T>` 槽位时合成一个
   Binding 对象；赋字段左值时合成 live 绑定）自举没有——见 A433。
+- ✅ 销账（2026-10-22 复核）：正文「已修」记录属实——回归保护 `indexer_overload` / `cs_b12_conv_operator` 仍在树、仍在差分门清单内，且全量差分门（91 个用例 + 22 条拒绝用例）跑通。
 
 ### [ ] A433 宿主有 `Binding<T>` 双向绑定原语降解，自举没有——赋给 `Binding<T>` 槽位的值没被包成 Binding
 
