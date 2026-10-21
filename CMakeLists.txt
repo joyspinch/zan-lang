@@ -4286,6 +4286,23 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
   set_tests_properties(conformance_gui_designer_field_height PROPERTIES
     TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+  # Float placement band (framework level): a float's origin clears the
+  # container's topmost docked band (title bar / tool strip), so fy=0 no
+  # longer lands on the title bar; containers without a band are unchanged,
+  # and the designer preview and the generated runtime agree.
+  add_test(NAME conformance_gui_designer_float_band
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band_test.zan
+      "-DZANC_ARGS=${CMAKE_SOURCE_DIR}/tests/gui/designer_float_band.html;--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_designer_float_band.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_designer_float_band${_exe_ext}
+      -DSTDLIB_STAMP=${_stdlib_stamp}
+      -DWORKDIR=${CMAKE_SOURCE_DIR}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+  set_tests_properties(conformance_gui_designer_float_band PROPERTIES
+    TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
   add_test(NAME conformance_gui_window_shape_mask
     COMMAND ${CMAKE_COMMAND}
       -DZANC=$<TARGET_FILE:zanc>

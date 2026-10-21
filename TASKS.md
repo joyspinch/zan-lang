@@ -1482,29 +1482,26 @@
   （`name|||自举措辞|||宿主措辞`）把这条边界钉住。
 - 关联：A471（宿主侧同一条战线）、`.agents/skills/zan-compiler-internals/references/selfhost-closure.md` §26/§36。
 
-### [ ] A478 「标题栏浮动组件忽略标题栏高度」——复现界面未定，暂未定位到缺陷点
+### [x] A478 「标题栏浮动组件忽略标题栏高度」——浮动件的基准没让开父容器的顶部停靠带
 
-- 现象（用户 2026-10-21 报）：「标题栏浮动组件会忽略标题栏高度」——浮动组件
-  像是按"整窗客户区"定位的，没有让开自定义标题栏（`titlebarH`）的高度。
-- 已核查（本轮逐路径读过，**都没找到忽略 titlebarH 的地方**）：
-  - `Gui/Core/Form.zan` `RenderFrame`：内容根排布于 `app.ContentTop()`（= titlebarH）；
-  - `Gui/Core/ChildWindow.zan` `RenderContent`：排布于
-    `host.ContentTop() + ShapeOffY + pad`；
-  - `Gui/Core/OverlayPopup.zan`、`Gui/Widget/Layer.zan`、`Widget/Models/LayerState.zan`、
-    `Widget/ContextMenu.zan`、`Widget/Tooltip.zan`：浮层一律用
-    `app.titlebarH` / `ContentTop()` 做钳制；
-  - IDE 外壳 `src/ide_zan/src/shell/ZanIDE.zan` `PaintFrame`：`int top = app.titlebarH;`，
-    ribbon 从 top 起画；
-  - 设计器自由画布 `Designer.PlaceFree`（注释「新浮动组件的位置以真实父内容框
-    为参考」）：定位基于父**内容框**原点，`DesignRootContentHeight` 在 winChrome
-    时按 `winH - 32` 扣掉标题栏。
-- 实测（探针 `_scratch/designer_layout_probe.zan`）：设计器预览里
-  `position=1, fy=0` 的浮动组件落在 `y = App.ContentTop()`（titlebarH=32），
-  **这条路径并没有忽略标题栏高度**。
-- 待办：需要用户给出**具体复现界面**（IDE 设计器画布 / 生成程序窗口 /
-  IDE 面板 / HTML 表单）与复现步骤，才好定位到真正忽略 titlebarH 的那条路径；
-  定位前不凭猜测改这条线（改错地方会连带影响已正确的四条路径）。
-- 关联：本轮的"行高/重叠"已按框架层修完，两条线互不依赖。
+- 现象（用户 2026-10-21 报）：「标题栏浮动组件会忽略标题栏高度」。现场确认为
+  **生成出来的程序窗口：自定义标题栏 + 浮动组件叠在标题栏上**。
+- 根因：浮动（绝对定位）件的定位基准是父容器的**内容框上沿**，而作者自绘的
+  标题栏是父容器的一个 `dock=Top` 子项，占掉了内容区上沿一条——基准没让开它，
+  `fy=0` 的浮动件就正好压在标题栏上。这条与框架自带 chrome 无关：自带标题栏
+  走 `App.ContentTop()`，此前逐路径核查过，各路径本来就正确。
+- 修法（框架层，一处口径两处实现）：
+  - 运行时 `Control.ArrangePositioned`：浮动件基准 = 内容区上沿 + **父容器最上面
+    那条**顶部停靠带（`dock=Top`、可见、非浮动件、非布局内部流式容器）的高度。
+  - 设计器 `Designer.DesignSlotOriginY` 用同一口径，并按"正在编辑的字段"排除
+    该字段自己的停靠带——否则流式→浮动的转换那一帧基准变一次，控件跳一格。
+  - 只让开最上面那一条：浮动件本来就浮在内容之上，让开全部停靠带会把它推到
+    内容底部，作者 `fy=0` 的意图全丢。
+- 验收：新增 `tests/gui/designer_float_band_test.zan`
+  （`conformance_gui_designer_float_band`）——浮动件落在标题栏下沿、没有停靠带
+  的容器里仍贴内容区上沿、设计器预览与生成运行时矩形一致。
+- 教训沉淀：`.agents/skills/gui-design/references/html-window.md`
+  《浮动件的定位基准：让开父容器最上面那条停靠带（框架层硬规则）》。
 
 ### [x] A479 声明前瞻不认「可空标记 + 数组」与「限定名 + 可空标记」
 
