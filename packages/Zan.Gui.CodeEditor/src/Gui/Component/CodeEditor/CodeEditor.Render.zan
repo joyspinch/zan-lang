@@ -826,6 +826,25 @@ partial class CodeEditor {
             app.RequestRedraw();
         }
 
+        // 签名条上的重载箭头（VS 的「◀ 2/3 ▶」）：点击即切换重载，
+        // 光标不动——箭头在浮层里，不在文本行上。
+        if (app.EventKind() == 2 && app.window.EventButton() == 0 && ptrFree
+                && this.sigPrevW > 0) {
+            int sigDelta = 0;
+            if (app.mouseX >= this.sigPrevX && app.mouseX < this.sigPrevX + this.sigPrevW
+                && app.mouseY >= this.sigPrevY && app.mouseY < this.sigPrevY + this.sigPrevH) {
+                sigDelta = -1;
+            } else if (app.mouseX >= this.sigNextX && app.mouseX < this.sigNextX + this.sigNextW
+                && app.mouseY >= this.sigNextY && app.mouseY < this.sigNextY + this.sigNextH) {
+                sigDelta = 1;
+            }
+            if (sigDelta != 0) {
+                this.SigSwitchOverload(sigDelta);
+                app.RequestRedraw();
+                return id;
+            }
+        }
+
         // 点击缩略图或滚动条（右侧）：跳到对应行。
         int minimapW = app.Scale(56);
         if (area.width < app.Scale(360)) { minimapW = 0; }
@@ -1952,12 +1971,29 @@ partial class CodeEditor {
         List<int> argOut = new List<int>();
         string callee = CallAtCaret(argOut);
         if (callee.Length == 0 || argOut.Count == 0) { return; }
-        string sig = SigHelpFor(callee);
+        // 有重载列表就按列表显示（VS 的「◀ 2/3 ▶」），否则退回单条签名。
+        List<CodeSignatureItem> overloads = this.SigOverloadsFor(callee);
+        int overloadIdx = 0;
+        string sig = "";
+        string overloadDoc = "";
+        if (overloads != null && overloads.Count > 0) {
+            overloadIdx = this.SigOverloadIndex(argOut[0]);
+            sig = overloads[overloadIdx].label;
+            overloadDoc = overloads[overloadIdx].doc;
+        } else {
+            sig = SigHelpFor(callee);
+        }
         if (sig.Length == 0) { return; }
         Canvas c = app.canvas;
         Gui.Theme t = app.theme;
         EditorPalette pal = EditorPalette.For(t);
-        string doc = this.SigDocFor(callee);
+        string doc = "";
+        if (this.sigPinnedCallee == callee && overloadDoc.Length > 0) {
+            doc = overloadDoc;
+        } else {
+            doc = this.SigDocFor(callee);
+            if (doc.Length == 0) { doc = overloadDoc; }
+        }
         if (doc.Length == 0) { doc = CodeEditor.DescDoc(callee); }
         int pad = app.Scale(8);
         int fh = Canvas.FontHeight(fontSize);
@@ -1989,7 +2025,16 @@ partial class CodeEditor {
         int minInnerW = app.Scale(160);
         if (widest < minInnerW) { widest = minInnerW; }
         if (widest > maxInnerW) { widest = maxInnerW; }
+        // 重载计数（VS 的「◀ 2/3 ▶」）占浮层右侧一块，不压在签名文字上。
+        string counter = "";
+        int counterW = 0;
+        if (overloads != null && overloads.Count > 1) {
+            counter = "◀ " + Convert.ToString(overloadIdx + 1)
+                + "/" + Convert.ToString(overloads.Count) + " ▶";
+            counterW = Canvas.MeasureText(counter, Style.FontFallback(app, "small"));
+        }
         int boxW = widest + pad * 2;
+        if (counterW > 0) { boxW = boxW + counterW + app.Scale(10); }
 
         int boxH = pad * 2 + siglines.Count * fh;
         if (doclines.Count > 0) {
@@ -2039,6 +2084,22 @@ partial class CodeEditor {
                 c.DrawText(px + pad, ty, slTxt, pal.signature, fontSize);
             }
             ty = ty + fh;
+        }
+
+        // 重载计数画在浮层右上角：左右箭头可点（VS 的「◀ 2/3 ▶」）。
+        if (counterW > 0) {
+            int cFont = Style.FontFallback(app, "small");
+            int ccx = px + boxW - pad - counterW;
+            int ccy = py + pad;
+            c.DrawText(ccx, ccy, counter, pal.muted, cFont);
+            int third = counterW / 3;
+            if (third < app.Scale(6)) { third = app.Scale(6); }
+            this.sigPrevX = ccx; this.sigPrevY = ccy;
+            this.sigPrevW = third; this.sigPrevH = sfh;
+            this.sigNextX = ccx + counterW - third; this.sigNextY = ccy;
+            this.sigNextW = third; this.sigNextH = sfh;
+        } else {
+            this.sigPrevW = 0; this.sigNextW = 0;
         }
 
         if (doclines.Count > 0) {

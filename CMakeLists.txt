@@ -3861,6 +3861,18 @@ if(ZAN_BUILD_GUI_TESTS AND ZAN_GUI_AVAILABLE)
       -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_lsp${_exe_ext}
       -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
 
+  # 签名提示的重载切换（VS 的参数信息「◀ 2/3 ▶」）：全部重载由外部
+  # 提供者给出，编辑器按当前实参自动挑一条，手动切换后保持选择，
+  # 浮层画出重载计数且箭头可点。
+  add_test(NAME conformance_gui_codeeditor_sig_overload
+    COMMAND ${CMAKE_COMMAND}
+      -DZANC=$<TARGET_FILE:zanc>
+      -DSRC=${CMAKE_SOURCE_DIR}/tests/gui/codeeditor_sig_overload_test.zan
+      "-DZANC_ARGS=--auto-stdlib${_gui_driver_tail}"
+      -DEXPECTED=${CMAKE_SOURCE_DIR}/tests/conformance/gui_codeeditor_sig_overload.out
+      -DOUT_EXE=${CMAKE_BINARY_DIR}/conf_gui_codeeditor_sig_overload${_exe_ext}
+      -P ${CMAKE_SOURCE_DIR}/tests/run_case.cmake)
+
   # 补全候选分层回归（弹窗顶部只剩 for/if/class/try，工程符号被挤出
   # 前 80 条）：按 VS 口径分层——局部变量/参数 > 属性 > 字段 > 方法 >
   # 枚举 > 类型 > 关键字 > 代码片段，裸词沉底；工程符号必须排在片段与

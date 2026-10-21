@@ -1,0 +1,136 @@
+using System;
+using Gui;
+using Gui.Backend;
+using Gui.Component;
+
+// 签名提示的重载切换（VS 的参数信息「◀ 2/3 ▶」）：
+//  - 全部重载由外部提供者给出，编辑器按当前实参下标自动挑一条；
+//  - 手动切换后在整个调用期间保持选择，换一次调用才重置；
+//  - 浮层画出重载计数，箭头可点。
+class Program {
+    static void Assert(bool condition, string message) {
+        if (!condition) { Console.WriteLine("FAIL: " + message); Environment.Exit(1); }
+    }
+
+    static List<CodeSignatureItem> Overloads() {
+        List<CodeSignatureItem> list = new List<CodeSignatureItem>();
+        list.Add(new CodeSignatureItem("void Write(string text)", "写文本"));
+        list.Add(new CodeSignatureItem("void Write(int count)", "写计数"));
+        list.Add(new CodeSignatureItem("void Write(string text, int count)", "写文本与计数"));
+        return list;
+    }
+
+    static void TestOverloadSelection() {
+        CodeEditor e = new CodeEditor();
+        e.documentPath = "sig.zan";
+        e.LoadText("Write(");
+        e.curCol = 6;
+        int calls = 0;
+        e.externalSignatureList = (string path, int line, int col, string callee) => {
+            calls = calls + 1;
+            return Program.Overloads();
+        };
+        List<CodeSignatureItem> list = e.SigOverloadsFor("Write");
+        Assert(list != null && list.Count == 3, "provider list");
+        Assert(calls == 1, "provider called once");
+        Assert(e.SigOverloadsFor("Write") != null && calls == 1, "list memoized");
+        // 第一个实参下标 0：参数够用的第一条（Write(string)）被选中。
+        Assert(e.SigOverloadIndex(0) == 0, "auto picks first overload");
+        // 第二个实参下标 1：只有三参那条吃得住。
+        Assert(e.SigOverloadIndex(1) == 2, "auto picks overload that fits arguments");
+
+        // 手动切换：循环，且在整个调用期间保持。
+        Assert(e.SigSwitchOverload(1) && e.sigOverloadIndex == 0, "switch is cyclic");
+        Assert(e.SigSwitchOverload(1) && e.sigOverloadIndex == 1, "switch to next");
+        Assert(e.SigOverloadIndex(0) == 1, "manual choice survives argument change");
+        Assert(e.SigSwitchOverload(-1) && e.sigOverloadIndex == 0, "switch back");
+        Assert(e.SigSwitchOverload(-1) && e.sigOverloadIndex == 2, "switch wraps to last");
+
+        // 换一次调用：手动选择重置，回到自动挑选。
+        e.sigPinnedCallee = "";
+        Assert(e.SigOverloadIndex(0) == 0, "different call resets manual choice");
+
+        // 没有重载可切时不动。
+        CodeEditor single = new CodeEditor();
+        single.documentPath = "one.zan";
+        single.LoadText("Write(");
+        single.curCol = 6;
+        single.externalSignatureList = (string path, int line, int col, string callee) => {
+            List<CodeSignatureItem> one = new List<CodeSignatureItem>();
+            one.Add(new CodeSignatureItem("void Write(string text)", ""));
+            return one;
+        };
+        List<CodeSignatureItem> one = single.SigOverloadsFor("Write");
+        Assert(one != null && one.Count == 1, "single overload");
+        Assert(!single.SigSwitchOverload(1) && single.sigOverloadIndex == 0, "nothing to switch");
+    }
+
+    static void TestParamCount() {
+        Assert(CodeEditor.ParamCount("void Write()") == 0, "no parameters");
+        Assert(CodeEditor.ParamCount("void Write(string text)") == 1, "one parameter");
+        Assert(CodeEditor.ParamCount("void Write(string text, int count)") == 2, "two parameters");
+        Assert(CodeEditor.ParamCount("void Write(Dict<string, int> map, int n)") == 2,
+            "generic comma is not a separator");
+        Assert(CodeEditor.ParamCount("void Write(Func<int, int> f)") == 1,
+            "lambda parameter list is not a separator");
+    }
+
+    static App guiApp;
+    static CodeEditor guiEditor;
+    static Rect guiArea;
+
+    static void GuiFrame() {
+        // 编辑器不在宿主控件树里，自己渲染时要用固定的 id 段：
+        // 否则每帧拿到的即时模式 id 都变，焦点永远落不进来。
+        guiApp.focus.PushIds(1000);
+        guiEditor.Render(guiApp, guiArea);
+        guiApp.focus.PopIds();
+    }
+
+    static void GuiEvent(int kind, int x, int y, int code, int mods) {
+        guiApp.window.InjectEvent(kind, x, y, 0, code, mods);
+        guiApp.SetPollEventMode();
+        Assert(guiApp.PumpGuarded(), "GUI event pump");
+        GuiFrame();
+    }
+
+    static void TestSignaturePopupCounter() {
+        guiApp = new App("codeeditor-overload", 500, 300);
+        guiApp.SetBackdropFx(false);
+        guiApp.FreezeAnimClock(10000);
+        guiApp.Show();
+        for (int i = 0; i < 256 && guiApp.window.PollEvent() == 0; i = i + 1) { }
+        guiArea = new Rect(0, 0, 480, 260);
+        guiEditor = new CodeEditor();
+        guiEditor.documentPath = "popup.zan";
+        guiEditor.LoadText("Write(");
+        guiEditor.curCol = 6;
+        guiEditor.externalSignatureList = (string path, int line, int col, string callee) => {
+            return Program.Overloads();
+        };
+        // 先动一次指针：编辑器据此登记自己的控件 id，焦点才能落进去。
+        GuiEvent(1, 400, 220, 0, 0);
+        guiApp.focus.SetFocused(guiEditor.LastWidgetId());
+        GuiFrame();
+        // 浮层画出重载计数，箭头有命中矩形。
+        Assert(guiEditor.sigPrevW > 0 && guiEditor.sigNextW > 0, "overload arrows hit rects");
+        Assert(guiEditor.sigOverloadIndex == 0, "first overload shown");
+        // 点下一个箭头：切到第二条重载，光标不动。
+        int colBefore = guiEditor.curCol;
+        GuiEvent(2, guiEditor.sigNextX + 2, guiEditor.sigNextY + 2, 0, 0);
+        Assert(guiEditor.sigOverloadIndex == 1, "click next arrow switches overload");
+        Assert(guiEditor.curCol == colBefore, "clicking arrow keeps caret");
+        // 点上一个箭头：回到第一条。
+        GuiEvent(2, guiEditor.sigPrevX + 2, guiEditor.sigPrevY + 2, 0, 0);
+        Assert(guiEditor.sigOverloadIndex == 0, "click prev arrow switches back");
+        guiApp.UnfreezeAnimClock();
+        guiApp.window.Destroy();
+    }
+
+    static void Main() {
+        Program.TestOverloadSelection();
+        Program.TestParamCount();
+        Program.TestSignaturePopupCounter();
+        Console.WriteLine("CODEEDITOR_SIG_OVERLOAD_OK");
+    }
+}

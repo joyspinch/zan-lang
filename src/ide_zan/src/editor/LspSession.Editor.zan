@@ -137,6 +137,20 @@ partial class LspSession {
         return sh.signatures[actSig].label;
     }
 
+    // 全部重载签名（VS 参数信息里的「◀ 2/3 ▶」）：编辑器据此显示
+    // 重载计数并允许逐条切换。
+    static List<CodeSignatureItem> SignatureItems(LspSignatureHelp sh) {
+        if (sh == null || sh.signatures == null || sh.signatures.Count == 0) { return null; }
+        List<CodeSignatureItem> res = new List<CodeSignatureItem>();
+        for (int i = 0; i < sh.signatures.Count; i = i + 1) {
+            LspSignatureInformation info = sh.signatures[i];
+            if (info == null) { continue; }
+            res.Add(new CodeSignatureItem(info.label,
+                LspSession.MarkupText(info.documentation)));
+        }
+        return res;
+    }
+
     // 签名条第二区：正在输入的那个参数的文档。取活动签名下的
     // activeParameter；越界回退到签名自身的 documentation。
     static string SignatureDoc(LspSignatureHelp sh) {
@@ -144,6 +158,25 @@ partial class LspSession {
         int actSig = sh.activeSignature;
         if (actSig < 0 || actSig >= sh.signatures.Count) { actSig = 0; }
         LspSignatureInformation info = sh.signatures[actSig];
+        if (info == null) { return ""; }
+        int actParam = sh.activeParameter;
+        if (info.parameters != null && info.parameters.Count > 0) {
+            if (actParam < 0 || actParam >= info.parameters.Count) { actParam = 0; }
+            LspParameterInformation param = info.parameters[actParam];
+            if (param != null && param.documentation != null) {
+                string doc = LspSession.MarkupText(param.documentation);
+                if (doc.Length > 0) { return doc; }
+            }
+        }
+        if (info.documentation != null) { return LspSession.MarkupText(info.documentation); }
+        return "";
+    }
+
+    // 同上，但取用户手动选中的那个重载（VS：切了重载，第二区跟着换）。
+    static string SignatureDocAt(LspSignatureHelp sh, int idx) {
+        if (sh == null || sh.signatures == null || sh.signatures.Count == 0) { return ""; }
+        if (idx < 0 || idx >= sh.signatures.Count) { return LspSession.SignatureDoc(sh); }
+        LspSignatureInformation info = sh.signatures[idx];
         if (info == null) { return ""; }
         int actParam = sh.activeParameter;
         if (info.parameters != null && info.parameters.Count > 0) {
@@ -166,6 +199,7 @@ partial class LspSession {
         boundEditor.ResetSemanticProviders();
         boundEditor.externalCompletion = null;
         boundEditor.externalSignature = null;
+        boundEditor.externalSignatureList = null;
         boundEditor.externalSignatureDoc = null;
         boundEditor.externalHover = null;
         boundEditor = null;
@@ -217,7 +251,18 @@ partial class LspSession {
             if (editor.documentPath != path || editor.TextStamp() != stamp
                 || editor.CurLine() != line0 || editor.CurCol() != col0
                 || editor.GetText() != text) { return ""; }
-            return request != null ? LspSession.SignatureDoc(request.signature) : "";
+            // 用户手动切过重载时，第二区跟着切到那个重载的参数文档。
+            int idx = editor.SigCurrentOverloadIndex();
+            return request != null ? LspSession.SignatureDocAt(request.signature, idx) : "";
+        };
+        editor.externalSignatureList = (string path, int line0, int col0, string callee) => {
+            string text = editor.GetText();
+            int stamp = editor.TextStamp();
+            LspPendingRequest request = self.CachedRequest(editor, "textDocument/signatureHelp", path, line0, col0, callee);
+            if (editor.documentPath != path || editor.TextStamp() != stamp
+                || editor.CurLine() != line0 || editor.CurCol() != col0
+                || editor.GetText() != text) { return null; }
+            return request != null ? LspSession.SignatureItems(request.signature) : null;
         };
         editor.externalHover = (string path, int line0, int col0, string word) => {
             string text = editor.GetText();
